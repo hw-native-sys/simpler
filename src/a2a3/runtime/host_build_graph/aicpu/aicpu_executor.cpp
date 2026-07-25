@@ -16,12 +16,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #ifdef __linux__
 #include <sys/mman.h>
 #endif
 
+#include "aicpu/l3_l2_message_queue.h"
 #include "aicpu/device_time.h"
 #include "callable_protocol.h"
+#include "host_graph_token_stream.h"
 #include "pto2_dispatch_payload.h"
 #include "runtime.h"
 #include "spin_hint.h"
@@ -77,6 +80,75 @@ static int32_t read_pto2_runtime_status(Runtime *runtime) {
 }
 
 static PTO2Runtime *rt{nullptr};
+
+namespace {
+
+constexpr uint64_t kHostGraphTokenQueueTimeoutNs = 5000000000ULL;
+using HostGraphTokenQueue = L3L2QueueEndpoint<1>;
+
+class HostGraphTokenPublisher {
+public:
+    explicit HostGraphTokenPublisher(Runtime *runtime) {
+        const ChipStorageTaskArgs &args = runtime->get_orch_args();
+        int32_t scalar_count = args.scalar_count();
+        if (scalar_count < PTO2_HOST_GRAPH_TOKEN_STREAM_TRAILER_SCALARS) return;
+
+        int32_t trailer = scalar_count - PTO2_HOST_GRAPH_TOKEN_STREAM_TRAILER_SCALARS;
+        if (args.scalar(trailer) != PTO2_HOST_GRAPH_TOKEN_STREAM_MAGIC_VERSION) return;
+
+        request_id_ = args.scalar(trailer + 1);
+        L3L2OrchRegionDesc desc{
+            args.scalar(trailer + 2), args.scalar(trailer + 3), args.scalar(trailer + 4),
+            args.scalar(trailer + 5), args.scalar(trailer + 6), args.scalar(trailer + 7),
+        };
+        L3L2QueueArgs queue_args{
+            args.scalar(trailer + 8),  args.scalar(trailer + 9),  args.scalar(trailer + 10),
+            args.scalar(trailer + 11), args.scalar(trailer + 12), args.scalar(trailer + 13),
+        };
+        queue_ = new (queue_storage_) HostGraphTokenQueue(desc, queue_args);
+        enabled_ = true;
+    }
+
+    ~HostGraphTokenPublisher() {
+        if (queue_ != nullptr) queue_->~HostGraphTokenQueue();
+    }
+
+    HostGraphTokenPublisher(const HostGraphTokenPublisher &) = delete;
+    HostGraphTokenPublisher &operator=(const HostGraphTokenPublisher &) = delete;
+
+    bool valid() const { return !enabled_ || (queue_ != nullptr && queue_->error().kind == L3L2QueueErrorKind::NONE); }
+
+    bool publish(uint64_t epoch, bool final_epoch) {
+        if (!enabled_) return true;
+        if (!valid()) return false;
+
+        L3L2QueueOutputReservation output{};
+        if (!queue_->output().reserve(sizeof(PTO2HostGraphTokenPacket), kHostGraphTokenQueueTimeoutNs, output)) {
+            return false;
+        }
+
+        PTO2HostGraphTokenPacket packet{
+            PTO2_HOST_GRAPH_TOKEN_STREAM_MAGIC_VERSION,
+            request_id_,
+            epoch,
+            static_cast<int64_t>(epoch),
+            PTO2_HOST_GRAPH_TOKEN_SYNTHETIC | (final_epoch ? PTO2_HOST_GRAPH_TOKEN_FINAL : 0U),
+            0,
+        };
+        void *payload = reinterpret_cast<void *>(static_cast<uintptr_t>(output.payload.gm_addr));
+        memcpy(payload, &packet, sizeof(packet));
+        cache_flush_range(payload, sizeof(packet));
+        return queue_->output().publish(output, L3L2QueueOpcode::DATA);
+    }
+
+private:
+    alignas(HostGraphTokenQueue) uint8_t queue_storage_[sizeof(HostGraphTokenQueue)]{};
+    HostGraphTokenQueue *queue_{nullptr};
+    uint64_t request_id_{0};
+    bool enabled_{false};
+};
+
+}  // namespace
 
 struct AicpuExecutor {
     int32_t sched_thread_num_;
@@ -225,15 +297,36 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     int32_t run_rc = 0;
     LOG_INFO_V0("Thread %d: Start (exec_idx=%d)", thread_idx, affinity_exec_idx);
 
-    // Boot thread (thread N-1): host_build_graph host-orch boot. The
-    // orchestrator already ran on the host, which also relocated every
-    // cross-task pointer to its final device address before H2D — so the
-    // SM/arena this thread sees are already fully device-addressed. This thread
-    // attaches the prebuilt arena, points the SM handle's ring-header pointers
-    // at the device SM WITHOUT resetting the host-populated data, releases the
-    // scheduler threads, and hands the host-computed task count to the
-    // scheduler. It owns no AICore cores, so it does not dispatch.
+    // Boot thread (thread N-1): attach the HostGraph image without resetting
+    // its host-populated SM. Whole-graph runs consume one prebuilt image;
+    // streaming runs observe and release epoch images as the host publishes
+    // them. This thread owns no AICore cores and never dispatches tasks itself.
     if (thread_idx >= sched_thread_num_) {
+        void *sm_ptr = runtime->get_gm_sm_ptr();
+        auto *pending_header = static_cast<PTO2SharedMemoryHeader *>(sm_ptr);
+        const bool async_host_orch = runtime->host_total_tasks < 0;
+        if (async_host_orch) {
+            uint64_t publish_epoch =
+                pending_header->host_graph_epochs.host_publish_epoch.load(std::memory_order_acquire);
+            const uint64_t wait_start = get_sys_cnt_aicpu();
+            while (publish_epoch == 0) {
+                if (pending_header->orch_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE ||
+                    pending_header->host_graph_epochs.failed_epoch.load(std::memory_order_acquire) != 0) {
+                    LOG_ERROR("Thread %d: HostGraph failed before final publication", thread_idx);
+                    runtime_init_ready_.store(true, std::memory_order_release);
+                    return -1;
+                }
+                if (get_sys_cnt_aicpu() - wait_start > SCHEDULER_TIMEOUT_CYCLES) {
+                    LOG_ERROR("Thread %d: timed out waiting for final HostGraph publication", thread_idx);
+                    pending_header->orch_error_code.store(PTO2_ERROR_FLOW_CONTROL_DEADLOCK, std::memory_order_release);
+                    runtime_init_ready_.store(true, std::memory_order_release);
+                    return -1;
+                }
+                SPIN_WAIT_HINT();
+                publish_epoch = pending_header->host_graph_epochs.host_publish_epoch.load(std::memory_order_acquire);
+            }
+        }
+
         void *prebuilt_arena = runtime->get_prebuilt_arena_base();
         size_t off_runtime = runtime->get_prebuilt_runtime_offset();
         if (prebuilt_arena == nullptr) {
@@ -245,7 +338,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         rt = reinterpret_cast<PTO2Runtime *>(static_cast<char *>(prebuilt_arena) + off_runtime);
         runtime_wire_arena_pointers(runtime_arena_, rt->prebuilt_layout, rt);
 
-        void *sm_ptr = runtime->get_gm_sm_ptr();
         uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size_per_ring(rt->prebuilt_layout.task_window_sizes);
         memset(rt->sm_handle, 0, sizeof(*rt->sm_handle));
         if (!rt->sm_handle->attach_populated(sm_ptr, sm_size, rt->prebuilt_layout.task_window_sizes)) {
@@ -261,25 +353,148 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
         sched_ctx_.bind_runtime(rt);
 
-        // Latch the host-built task count (on_orchestration_done sets total_tasks_)
-        // BEFORE the runtime_init_ready_ release below — that store is the barrier
-        // that unblocks the scheduler threads. Otherwise they would acquire
-        // runtime_init_ready_ with total_tasks_=0 and race to an early exit before
-        // the host task count is visible (host-orch has no concurrent orchestrator
-        // to keep them alive).
-        // NOTE: do NOT call rt_orchestration_done(rt) here. The HOST already
-        // called it in run_host_orchestration; the orchestrator's own
-        // task-allocator pointers are intentionally NOT relocated (only the
-        // SM cross-task pointers and the host-built fanout adjacency —
-        // dep_pool / ready queues / fanout_head — were), so they still hold
-        // host addresses and mark_done()'s active_count() read would
-        // dereference host memory and fault the AICPU. on_orchestration_done
-        // only needs total_tasks and the scalar
-        // orchestrator.inline_completed_tasks, both already valid.
-        sched_ctx_.on_orchestration_done(runtime, rt, thread_idx, runtime->host_total_tasks);
+        if (async_host_orch) {
+            PTO2SharedMemoryHeader *header = rt->sm_handle->header;
+            PTO2HostGraphEpochControl &control = header->host_graph_epochs;
+            uint64_t released_epoch = 0;
+            uint64_t completed_epoch = 0;
+            int32_t released_task_end = 0;
+            bool schedulers_started = false;
+            HostGraphTokenPublisher token_publisher(runtime);
+            if (!token_publisher.valid()) {
+                LOG_ERROR("Thread %d: invalid HostGraph token stream descriptor", thread_idx);
+                header->orch_error_code.store(PTO2_ERROR_INVALID_ARGS, std::memory_order_release);
+                runtime_init_ready_.store(true, std::memory_order_release);
+                return -1;
+            }
 
-        runtime_init_ready_.store(true, std::memory_order_release);
-        LOG_INFO_V0("Thread %d: host-orch boot complete (%d tasks)", thread_idx, runtime->host_total_tasks);
+            auto mark_epoch_complete = [&]() {
+                if (released_epoch == 0 || sched_ctx_.completed_tasks_count() < released_task_end) return false;
+                if (completed_epoch >= released_epoch) return true;
+                size_t slot_index =
+                    static_cast<size_t>((released_epoch - 1) % static_cast<uint64_t>(PTO2_HOST_GRAPH_EPOCH_SLOT_COUNT));
+                PTO2HostGraphEpochSlot &completed_slot = control.slots[slot_index];
+                if (!token_publisher.publish(released_epoch, completed_slot.range.final_epoch != 0)) {
+                    header->sched_error_code.store(PTO2_ERROR_EXPLICIT_ORCH_FATAL, std::memory_order_release);
+                    return false;
+                }
+                control.device_exec_done_epoch.store(released_epoch, std::memory_order_release);
+                control.device_buffer_free_epoch.store(released_epoch, std::memory_order_release);
+                completed_epoch = released_epoch;
+                return true;
+            };
+
+            while (true) {
+                uint64_t publish_epoch = control.host_publish_epoch.load(std::memory_order_acquire);
+                uint64_t wait_start = get_sys_cnt_aicpu();
+                while (publish_epoch <= released_epoch) {
+                    (void)mark_epoch_complete();
+                    if (header->orch_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE ||
+                        header->sched_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE ||
+                        control.failed_epoch.load(std::memory_order_acquire) != 0) {
+                        LOG_ERROR(
+                            "Thread %d: HostGraph failed while waiting for epoch=%" PRIu64, thread_idx,
+                            released_epoch + 1
+                        );
+                        runtime_init_ready_.store(true, std::memory_order_release);
+                        return -1;
+                    }
+                    if (get_sys_cnt_aicpu() - wait_start > SCHEDULER_TIMEOUT_CYCLES) {
+                        LOG_ERROR(
+                            "Thread %d: timed out waiting for HostGraph epoch=%" PRIu64, thread_idx, released_epoch + 1
+                        );
+                        header->orch_error_code.store(PTO2_ERROR_FLOW_CONTROL_DEADLOCK, std::memory_order_release);
+                        runtime_init_ready_.store(true, std::memory_order_release);
+                        return -1;
+                    }
+                    SPIN_WAIT_HINT();
+                    publish_epoch = control.host_publish_epoch.load(std::memory_order_acquire);
+                }
+                if (publish_epoch != released_epoch + 1) {
+                    LOG_ERROR(
+                        "Thread %d: HostGraph skipped publication epoch (released=%" PRIu64 " published=%" PRIu64 ")",
+                        thread_idx, released_epoch, publish_epoch
+                    );
+                    header->orch_error_code.store(PTO2_ERROR_INVALID_ARGS, std::memory_order_release);
+                    runtime_init_ready_.store(true, std::memory_order_release);
+                    return -1;
+                }
+
+                size_t slot_index =
+                    static_cast<size_t>((publish_epoch - 1) % static_cast<uint64_t>(PTO2_HOST_GRAPH_EPOCH_SLOT_COUNT));
+                PTO2HostGraphEpochSlot &slot = control.slots[slot_index];
+                if (slot.owner_epoch.load(std::memory_order_acquire) != publish_epoch ||
+                    slot.range.task_begin != released_task_end || slot.range.task_end <= slot.range.task_begin) {
+                    LOG_ERROR(
+                        "Thread %d: invalid HostGraph epoch=%" PRIu64 " range=[%d,%d) expected_begin=%d", thread_idx,
+                        publish_epoch, slot.range.task_begin, slot.range.task_end, released_task_end
+                    );
+                    header->orch_error_code.store(PTO2_ERROR_INVALID_ARGS, std::memory_order_release);
+                    runtime_init_ready_.store(true, std::memory_order_release);
+                    return -1;
+                }
+
+                sched_ctx_.on_host_graph_published(
+                    runtime, rt, thread_idx, slot.range.task_end, slot.range.inline_completed,
+                    slot.range.final_epoch != 0
+                );
+                control.device_release_epoch.store(publish_epoch, std::memory_order_release);
+                released_epoch = publish_epoch;
+                released_task_end = slot.range.task_end;
+                LOG_INFO_V9(
+                    "Thread %d: observed HostGraph epoch=%" PRIu64 " tasks=[%d,%d) inline=%d final=%d", thread_idx,
+                    publish_epoch, slot.range.task_begin, slot.range.task_end, slot.range.inline_completed,
+                    slot.range.final_epoch
+                );
+
+                if (!schedulers_started) {
+                    runtime_init_ready_.store(true, std::memory_order_release);
+                    schedulers_started = true;
+                }
+
+                // Classify the newly published range against the monotonic
+                // completion flags. Cross-epoch consumers wait on the first
+                // incomplete producer and are reclassified when it completes.
+                for (int32_t task_id = slot.range.task_begin; task_id < slot.range.task_end; ++task_id) {
+                    PTO2TaskSlotState &task_slot = header->ring.get_slot_state_by_task_id(task_id);
+                    if (task_slot.task_state.load(std::memory_order_acquire) >= PTO2_TASK_COMPLETED) continue;
+                    int32_t fanin_state = rt->scheduler.classify_fanin_state(&task_slot);
+                    if (fanin_state < 0) {
+                        rt->scheduler.push_ready_routed(&task_slot);
+                    } else {
+                        rt->scheduler.register_wake(
+                            &header->ring.get_slot_state_by_task_id(task_slot.payload->fanin_local_ids[fanin_state]),
+                            &task_slot
+                        );
+                    }
+                }
+                if (slot.range.final_epoch == 0) continue;
+
+                uint64_t complete_wait_start = get_sys_cnt_aicpu();
+                while (!mark_epoch_complete()) {
+                    if (header->sched_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
+                        LOG_ERROR("Thread %d: failed to publish final HostGraph token", thread_idx);
+                        return -1;
+                    }
+                    if (get_sys_cnt_aicpu() - complete_wait_start > SCHEDULER_TIMEOUT_CYCLES) {
+                        LOG_ERROR("Thread %d: timed out waiting for final HostGraph completion", thread_idx);
+                        header->sched_error_code.store(PTO2_ERROR_SCHEDULER_TIMEOUT, std::memory_order_release);
+                        return -1;
+                    }
+                    SPIN_WAIT_HINT();
+                }
+                break;
+            }
+            LOG_INFO_V9(
+                "Thread %d: streaming host-orch boot complete (%d tasks, epochs=%" PRIu64 ")", thread_idx,
+                released_task_end, released_epoch
+            );
+        } else {
+            int32_t total_tasks = runtime->host_total_tasks;
+            sched_ctx_.on_orchestration_done(runtime, rt, thread_idx, total_tasks);
+            runtime_init_ready_.store(true, std::memory_order_release);
+            LOG_INFO_V9("Thread %d: host-orch boot complete (%d tasks)", thread_idx, total_tasks);
+        }
     }
 
     // Scheduler thread (orchestrator threads skip dispatch when orch_to_sched_ is false)

@@ -155,6 +155,12 @@ public:
     }
     /** Set the callable hash for spans emitted on this thread. */
     static void set_hid(uint64_t h) { hid() = h; }
+    /** Propagate an invocation onto an auxiliary worker thread. */
+    static void set_context(unsigned invocation, uint64_t h) {
+        inv() = invocation;
+        hid() = h;
+        depth() = 0;
+    }
     /** Current invocation id / callable hash for this thread (for emit_span_at). */
     static unsigned current_inv() { return inv(); }
     static uint64_t current_hid() { return hid(); }
@@ -202,9 +208,14 @@ emit_span_at(const char *name, long long ts_ns, long long dur_ns, int depth, con
 #define STRACE_NEW_INV() ::simpler::strace::StraceScope::next_inv()
 /** Set the callable hash for subsequent spans on this thread. */
 #define STRACE_SET_HID(h) ::simpler::strace::StraceScope::set_hid(h)
+/** Propagate the active invocation/hash onto an auxiliary thread. */
+#define STRACE_SET_CONTEXT(inv, h) ::simpler::strace::StraceScope::set_context((inv), (h))
 /** Emit a device-domain span (device-clock start `ts_ns` + measured `dur_ns`). */
 #define STRACE_DEV_SPAN_AT(name, ts_ns, dur_ns, depth) \
     ::simpler::strace::emit_span_at((name), (ts_ns), (dur_ns), (depth))
+/** Emit a host steady-clock span measured outside an RAII scope. */
+#define STRACE_HOST_SPAN_AT(name, ts_ns, dur_ns, depth, attrs) \
+    ::simpler::strace::emit_span_at((name), (ts_ns), (dur_ns), (depth), (attrs))
 
 #else  // !SIMPLER_HOST_STRACE
 
@@ -212,7 +223,9 @@ emit_span_at(const char *name, long long ts_ns, long long dur_ns, int depth, con
 #define STRACE_A(name, attrs) ((void)0)
 #define STRACE_NEW_INV() ((void)0)
 #define STRACE_SET_HID(h) ((void)0)
+#define STRACE_SET_CONTEXT(inv, h) ((void)0)
 #define STRACE_DEV_SPAN_AT(name, ts_ns, dur_ns, depth) ((void)0)
+#define STRACE_HOST_SPAN_AT(name, ts_ns, dur_ns, depth, attrs) ((void)0)
 
 #endif  // SIMPLER_HOST_STRACE
 

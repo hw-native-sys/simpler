@@ -10,6 +10,8 @@
  */
 #include "common.h"
 
+#include <pthread.h>
+
 #ifdef __linux__
 #include <cxxabi.h>
 #include <dlfcn.h>
@@ -32,20 +34,39 @@ struct PTO2Runtime;
 extern "C" void unified_log_error(const char *func, const char *fmt, ...);
 
 namespace {
-// Plain global (not thread_local) to avoid glibc TLSDESC stale-resolution
-// crash (BZ #32412) when the orchestration SO is dlclose'd/re-dlopen'd
-// between execution rounds.  All orchestrator threads bind the same rt
-// value, so per-thread storage is unnecessary.
-PTO2Runtime *g_current_runtime = nullptr;
+// HostGraph requests can orchestrate concurrently. POSIX TLS keeps each Host
+// job on its own Runtime without using C++ thread_local, whose TLSDESC entries
+// can stay stale when an orchestration SO is dlclose'd/re-dlopen'd.
+pthread_key_t g_current_runtime_key;
+pthread_once_t g_current_runtime_once = PTHREAD_ONCE_INIT;
+bool g_current_runtime_key_ready = false;
+
+void create_current_runtime_key() {
+    if (pthread_key_create(&g_current_runtime_key, nullptr) == 0) {
+        g_current_runtime_key_ready = true;
+    }
+}
+
+__attribute__((destructor)) void destroy_current_runtime_key() {
+    if (g_current_runtime_key_ready) {
+        pthread_key_delete(g_current_runtime_key);
+        g_current_runtime_key_ready = false;
+    }
+}
 }  // namespace
 
 extern "C" __attribute__((visibility("default"))) void framework_bind_runtime(PTO2Runtime *rt) {
-    g_current_runtime = rt;
+    pthread_once(&g_current_runtime_once, create_current_runtime_key);
+    if (g_current_runtime_key_ready) pthread_setspecific(g_current_runtime_key, rt);
 }
 
 // Keep current_runtime local to this .so so orchestration helpers do not
 // accidentally bind to the AICPU binary's same-named symbol.
-extern "C" __attribute__((visibility("hidden"))) PTO2Runtime *framework_current_runtime() { return g_current_runtime; }
+extern "C" __attribute__((visibility("hidden"))) PTO2Runtime *framework_current_runtime() {
+    pthread_once(&g_current_runtime_once, create_current_runtime_key);
+    return g_current_runtime_key_ready ? static_cast<PTO2Runtime *>(pthread_getspecific(g_current_runtime_key)) :
+                                         nullptr;
+}
 
 /**
  * Use addr2line to convert an address to file:line information.

@@ -29,6 +29,7 @@
 #include <functional>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -218,6 +219,13 @@ private:
     // force_reset_device()). This flag fails run() fast and drives that
     // recovery. See run() and recover_device_or_mark_unusable().
     bool device_unusable_{false};
+
+    // Gate B: one Device S phase at a time for this runner. Host Stage1 uses
+    // independent resource banks and remains outside this gate.
+    std::mutex device_run_mutex_;
+
+    int launch_run(Runtime &runtime, int num_aicore, int launch_aicpu_num);
+    int reap_run();
 
     // On an AICore launch/sync error, best-effort drain the device so a later
     // run() on the same DeviceRunner can recover in place; if the drain itself

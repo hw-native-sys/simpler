@@ -47,6 +47,7 @@ Runtime::Runtime() {
     orch_args_storage_.clear();
     prebuilt_arena_base_ = nullptr;
     prebuilt_runtime_offset_ = 0;
+    host_orch_job_ = nullptr;
 
     active_callable_id_ = -1;
     dev_orch_so_addr_ = 0;
@@ -81,6 +82,14 @@ void Runtime::set_prebuilt_arena(void *arena_base, size_t runtime_off) {
 }
 void *Runtime::get_prebuilt_arena_base() const { return prebuilt_arena_base_; }
 size_t Runtime::get_prebuilt_runtime_offset() const { return prebuilt_runtime_offset_; }
+
+void Runtime::set_host_orch_job(void *job) { host_orch_job_ = job; }
+
+void *Runtime::take_host_orch_job() {
+    void *job = host_orch_job_;
+    host_orch_job_ = nullptr;
+    return job;
+}
 
 // Orchestration metadata written by the platform host (DeviceRunner) at
 // callable registration. host_build_graph runs the orchestrator on the host so

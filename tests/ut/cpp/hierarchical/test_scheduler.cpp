@@ -57,6 +57,7 @@ struct MockMailboxWorker {
     struct Record {
         uint8_t callable_hash0;
         uint64_t tensor_key;  // first tensor's `data` field (unique per submit in tests)
+        uint64_t generation;
     };
 
     alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
@@ -70,6 +71,7 @@ struct MockMailboxWorker {
     std::string next_error_msg;
     std::atomic<bool> is_running{false};
     std::atomic<bool> stop_flag{false};
+    std::atomic<bool> protocol_valid{true};
     std::thread loop_thread;
 
     void start() {
@@ -146,6 +148,11 @@ private:
             if (stop_flag.load(std::memory_order_acquire)) return;
             MailboxState s = read_state();
             if (s == MailboxState::TASK_READY) {
+                uint64_t protocol = 0;
+                std::memcpy(&protocol, mailbox.data() + MAILBOX_OFF_PROTOCOL, sizeof(uint64_t));
+                protocol_valid.store(protocol == MAILBOX_PROTOCOL_MAGIC_VERSION, std::memory_order_release);
+                uint64_t generation = 0;
+                std::memcpy(&generation, mailbox.data() + MAILBOX_OFF_GENERATION, sizeof(uint64_t));
                 uint8_t callable_hash0 = static_cast<uint8_t>(mailbox[MAILBOX_OFF_TASK_CALLABLE_HASH]);
                 int32_t t_count = 0;
                 std::memcpy(&t_count, mailbox.data() + MAILBOX_OFF_TASK_ARGS_BLOB, sizeof(int32_t));
@@ -159,7 +166,7 @@ private:
                 }
                 {
                     std::lock_guard<std::mutex> lk(dispatched_mu);
-                    dispatched.push_back({callable_hash0, tensor_key});
+                    dispatched.push_back({callable_hash0, tensor_key, generation});
                 }
                 is_running.store(true, std::memory_order_release);
 
@@ -209,12 +216,13 @@ private:
 
 class FakeEndpoint final : public WorkerEndpoint {
 public:
-    explicit FakeEndpoint(int32_t worker_id, std::atomic<int> *prepare_count = nullptr) :
+    explicit FakeEndpoint(int32_t worker_id, std::atomic<int> *prepare_count = nullptr, uint32_t max_in_flight = 1) :
         prepare_count_(prepare_count) {
         caps_.kind = WorkerEndpointKind::REMOTE_L3;
         caps_.worker_id = worker_id;
         caps_.remote = true;
         caps_.transport = "test-remote";
+        caps_.max_in_flight = max_in_flight;
     }
 
     const WorkerEndpointCaps &caps() const override { return caps_; }
@@ -235,6 +243,127 @@ public:
 private:
     WorkerEndpointCaps caps_;
     std::atomic<int> *prepare_count_{nullptr};
+};
+
+class BlockingEndpoint final : public WorkerEndpoint {
+public:
+    BlockingEndpoint() {
+        caps_.kind = WorkerEndpointKind::REMOTE_L3;
+        caps_.worker_id = 9;
+        caps_.max_in_flight = 2;
+    }
+
+    const WorkerEndpointCaps &caps() const override { return caps_; }
+
+    WorkerCompletion run(Ring *, const WorkerDispatch &dispatch) override {
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            ++entered_;
+            cv_.notify_all();
+            cv_.wait(lk, [this] {
+                return released_;
+            });
+        }
+        return WorkerCompletion{dispatch.task_slot, dispatch.group_index, EndpointOutcome::SUCCESS, ""};
+    }
+
+    bool wait_entered(int expected, int timeout_ms = 500) {
+        std::unique_lock<std::mutex> lk(mu_);
+        return cv_.wait_for(lk, std::chrono::milliseconds(timeout_ms), [this, expected] {
+            return entered_ >= expected;
+        });
+    }
+
+    void release() {
+        std::lock_guard<std::mutex> lk(mu_);
+        released_ = true;
+        cv_.notify_all();
+    }
+
+private:
+    WorkerEndpointCaps caps_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    int entered_{0};
+    bool released_{false};
+};
+
+class TwoSlotMailboxChild {
+public:
+    alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
+
+    void start() {
+        for (size_t slot = 0; slot < MAILBOX_TASK_SLOT_COUNT; ++slot) {
+            write_state(slot, MailboxState::IDLE);
+            threads_.emplace_back(&TwoSlotMailboxChild::loop, this, slot);
+        }
+    }
+
+    ~TwoSlotMailboxChild() {
+        stop_.store(true, std::memory_order_release);
+        release();
+        for (auto &thread : threads_) {
+            if (thread.joinable()) thread.join();
+        }
+    }
+
+    void *mailbox_ptr() { return mailbox.data(); }
+
+    bool wait_active(int expected, int timeout_ms = 500) {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        while (active_.load(std::memory_order_acquire) < expected && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return active_.load(std::memory_order_acquire) >= expected;
+    }
+
+    void release() { released_.store(true, std::memory_order_release); }
+    uint32_t seen_mask() const { return seen_mask_.load(std::memory_order_acquire); }
+    bool protocol_valid() const { return protocol_valid_.load(std::memory_order_acquire); }
+
+private:
+    std::vector<std::thread> threads_;
+    std::atomic<bool> stop_{false};
+    std::atomic<bool> released_{false};
+    std::atomic<int> active_{0};
+    std::atomic<uint32_t> seen_mask_{0};
+    std::atomic<bool> protocol_valid_{true};
+
+    char *frame(size_t slot) { return mailbox.data() + slot * MAILBOX_TASK_SLOT_SIZE; }
+
+    MailboxState read_state(size_t slot) const {
+        const char *base = mailbox.data() + slot * MAILBOX_TASK_SLOT_SIZE;
+        const auto *ptr = reinterpret_cast<const volatile int32_t *>(base + MAILBOX_OFF_STATE);
+        return static_cast<MailboxState>(__atomic_load_n(ptr, __ATOMIC_ACQUIRE));
+    }
+
+    void write_state(size_t slot, MailboxState state) {
+        auto *ptr = reinterpret_cast<volatile int32_t *>(frame(slot) + MAILBOX_OFF_STATE);
+        __atomic_store_n(ptr, static_cast<int32_t>(state), __ATOMIC_RELEASE);
+    }
+
+    void loop(size_t slot) {
+        while (!stop_.load(std::memory_order_acquire)) {
+            if (read_state(slot) != MailboxState::TASK_READY) {
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                continue;
+            }
+            uint64_t protocol = 0;
+            std::memcpy(&protocol, frame(slot) + MAILBOX_OFF_PROTOCOL, sizeof(protocol));
+            if (protocol != MAILBOX_PROTOCOL_MAGIC_VERSION) {
+                protocol_valid_.store(false, std::memory_order_release);
+            }
+            seen_mask_.fetch_or(1u << slot, std::memory_order_acq_rel);
+            active_.fetch_add(1, std::memory_order_acq_rel);
+            while (!released_.load(std::memory_order_acquire) && !stop_.load(std::memory_order_acquire)) {
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
+            int32_t zero_error = 0;
+            std::memcpy(frame(slot) + MAILBOX_OFF_ERROR, &zero_error, sizeof(zero_error));
+            active_.fetch_sub(1, std::memory_order_acq_rel);
+            write_state(slot, MailboxState::TASK_DONE);
+        }
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -374,6 +503,75 @@ TEST(WorkerManagerTest, ControlPrepareUsesStableNextLevelWorkerId) {
     EXPECT_EQ(worker3_prepares.load(std::memory_order_relaxed), 1);
 }
 
+TEST(WorkerThreadTest, EndpointCreditsRunTwoDispatchesConcurrently) {
+    Ring allocator;
+    allocator.init(/*heap_bytes=*/0);
+    WorkerThread worker;
+    auto endpoint = std::make_unique<BlockingEndpoint>();
+    BlockingEndpoint *endpoint_ptr = endpoint.get();
+    std::atomic<int> completed{0};
+
+    worker.start(
+        &allocator, nullptr,
+        [&completed](WorkerCompletion) {
+            completed.fetch_add(1, std::memory_order_release);
+        },
+        std::move(endpoint)
+    );
+    EXPECT_EQ(worker.capacity(), 2u);
+    worker.dispatch(WorkerDispatch{1, 0});
+    worker.dispatch(WorkerDispatch{2, 0});
+    EXPECT_TRUE(endpoint_ptr->wait_entered(2));
+    EXPECT_FALSE(worker.idle());
+
+    endpoint_ptr->release();
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (completed.load(std::memory_order_acquire) != 2 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(completed.load(std::memory_order_acquire), 2);
+    EXPECT_TRUE(worker.idle());
+    worker.stop();
+    allocator.shutdown();
+}
+
+TEST(LocalMailboxEndpointTest, TwoTaskSlotsCompleteConcurrently) {
+    Ring allocator;
+    allocator.init(/*heap_bytes=*/0);
+    std::array<TaskSlot, 2> slots{};
+    for (size_t i = 0; i < slots.size(); ++i) {
+        AllocResult result = allocator.alloc();
+        ASSERT_NE(result.slot, INVALID_SLOT);
+        slots[i] = result.slot;
+        TaskSlotState *state = allocator.slot_state(result.slot);
+        ASSERT_NE(state, nullptr);
+        state->callable = C(static_cast<uint8_t>(40 + i));
+        state->task_args = single_tensor_args(0x1000 + i, TensorArgType::OUTPUT);
+    }
+
+    TwoSlotMailboxChild child;
+    child.start();
+    LocalMailboxEndpoint endpoint(0, child.mailbox_ptr(), 2);
+    std::array<WorkerCompletion, 2> completions{};
+    std::array<std::thread, 2> dispatchers;
+    for (size_t i = 0; i < dispatchers.size(); ++i) {
+        dispatchers[i] = std::thread([&, i]() {
+            completions[i] = endpoint.run(&allocator, WorkerDispatch{slots[i], 0});
+        });
+    }
+
+    bool both_active = child.wait_active(2);
+    child.release();
+    for (auto &thread : dispatchers)
+        thread.join();
+    EXPECT_TRUE(both_active);
+    EXPECT_TRUE(child.protocol_valid());
+    EXPECT_EQ(child.seen_mask(), 0x3u);
+    for (const auto &completion : completions)
+        EXPECT_EQ(completion.outcome, EndpointOutcome::SUCCESS);
+    allocator.shutdown();
+}
+
 TEST_F(SchedulerFixture, IndependentTaskDispatchedAndConsumed) {
     auto args_a = single_tensor_args(0xCAFE, TensorArgType::OUTPUT);
     auto res = orch.submit_next_level(C(42), args_a, cfg, 0);
@@ -383,6 +581,8 @@ TEST_F(SchedulerFixture, IndependentTaskDispatchedAndConsumed) {
     ASSERT_GE(mock_worker.dispatched_count(), 1);
     EXPECT_EQ(mock_worker.dispatched[0].tensor_key, 0xCAFEu);
     EXPECT_EQ(mock_worker.dispatched[0].callable_hash0, 42u);
+    EXPECT_TRUE(mock_worker.protocol_valid.load(std::memory_order_acquire));
+    EXPECT_GT(mock_worker.dispatched[0].generation, 0u);
 
     mock_worker.complete();
     wait_consumed(slot);
@@ -406,6 +606,7 @@ TEST_F(SchedulerFixture, DependentTaskDispatchedAfterProducerCompletes) {
     }
     ASSERT_GE(mock_worker.dispatched_count(), 2);
     EXPECT_EQ(mock_worker.dispatched[1].callable_hash0, 11u);
+    EXPECT_EQ(mock_worker.dispatched[1].generation, mock_worker.dispatched[0].generation + 1);
 
     mock_worker.complete();  // B done
     wait_consumed(b.task_slot);

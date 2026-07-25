@@ -57,6 +57,12 @@ extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_replay_emit_d
     return -1;
 }
 
+extern "C" __attribute__((weak, visibility("hidden"))) int release_async_host_graph_pipeline(
+    Runtime * /*runtime*/
+) {
+    return 0;
+}
+
 DeviceRunner::~DeviceRunner() { finalize(); }
 
 int DeviceRunner::ensure_binaries_loaded() {
@@ -207,6 +213,10 @@ int DeviceRunner::invoke_device_register(const RegisterCallableArgs &reg_args) {
 }
 
 int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
+    // Match onboard Gate B: two pipeline slots may finish Host O concurrently,
+    // but one shared runner cannot mutate its per-run state from both slots.
+    std::unique_lock<std::mutex> device_run_lock(device_run_mutex_);
+
     apply_call_config(config);
     int block_dim = config.block_dim;
     const int launch_aicpu_num = config.aicpu_thread_num;
@@ -472,6 +482,12 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
     }
     if (enable_scope_stats_) {
         scope_stats_collector_.start(thread_factory);
+    }
+
+    rc = release_async_host_graph_pipeline(&runtime);
+    if (rc != 0) {
+        LOG_ERROR("release_async_host_graph_pipeline failed: %d", rc);
+        return rc;
     }
 
     constexpr int over_launch = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;

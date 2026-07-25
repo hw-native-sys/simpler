@@ -34,6 +34,7 @@
 
 #include <stddef.h>
 
+#include "host_graph_epoch.h"
 #include "utils/device_arena.h"
 #include "pto_runtime2_types.h"
 
@@ -156,12 +157,18 @@ struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
     std::atomic<uint32_t> sched_error_bitmap;  // Bit X set = thread X had error
     std::atomic<int32_t> sched_error_code;     // Last scheduler error code (last-writer-wins)
     std::atomic<int32_t> sched_error_thread;   // Thread index of last error writer
+
+    PTO2HostGraphEpochControl host_graph_epochs;
 };
 
-static_assert(sizeof(PTO2SharedMemoryHeader) == 320, "PTO2SharedMemoryHeader layout drift");
 static_assert(offsetof(PTO2SharedMemoryHeader, total_size) == 264, "PTO2SharedMemoryHeader total_size layout drift");
 static_assert(
     offsetof(PTO2SharedMemoryHeader, orch_error_code) == 272, "PTO2SharedMemoryHeader orch_error_code layout drift"
+);
+static_assert(offsetof(PTO2SharedMemoryHeader, host_graph_epochs) == 320, "HostGraph epoch control layout drift");
+static_assert(
+    (sizeof(PTO2SharedMemoryHeader) % PTO2_ALIGN_SIZE == 0) && (sizeof(PTO2SharedMemoryHeader) < 4096),
+    "PTO2SharedMemoryHeader should be aligned and reasonably sized"
 );
 
 // =============================================================================

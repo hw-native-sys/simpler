@@ -934,6 +934,26 @@ class TestLevel2Lifecycle:
         # fixed at teardown entry.
         assert captured["remaining"] > 0.7
 
+    def test_comm_reap_deadline_covers_native_destroy_budget(self, monkeypatch):
+        import types  # noqa: PLC0415
+
+        import simpler.worker as worker_mod  # noqa: PLC0415
+
+        monkeypatch.setattr(worker_mod, "_ROLLBACK_GRACEFUL_TIMEOUT_S", 1.0)
+        monkeypatch.setattr(worker_mod, "_COMM_REAP_GRACEFUL_TIMEOUT_S", 3.0)
+        w = Worker(level=3, num_sub_workers=0)
+        w._worker = types.SimpleNamespace(close=lambda: None)
+        w._comm_base_ready = True
+        captured = {}
+
+        def capture_reap(groups, deadline):
+            captured["remaining"] = deadline - time.monotonic()
+
+        monkeypatch.setattr(Worker, "_reap_child_groups", staticmethod(capture_reap))
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            w._teardown_ready_tree()
+        assert captured["remaining"] > 2.7
+
     def test_reap_child_groups_stuck_child_no_starvation(self, monkeypatch):
         # A stuck child in one group must not starve the reap of healthy children
         # in another. With every group SHUTDOWN up front, the interleaved reap

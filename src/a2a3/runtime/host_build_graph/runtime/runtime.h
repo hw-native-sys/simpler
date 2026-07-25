@@ -270,6 +270,8 @@ public:
     void set_prebuilt_arena(void *arena_base, size_t runtime_off);
     void *get_prebuilt_arena_base() const;
     size_t get_prebuilt_runtime_offset() const;
+    void set_host_orch_job(void *job);
+    void *take_host_orch_job();
 
     // Orchestration metadata written by the platform host (DeviceRunner) at
     // callable registration. Shared ABI with tensormap_and_ringbuffer; the
@@ -314,6 +316,7 @@ public:
     // garbage, identical to host_api above. No fixed cap — grows with the
     // chip-level entry-tensor count.
     std::vector<TensorPair> tensor_pairs_;
+    void *host_orch_job_{nullptr};
 };
 
 // Number of bytes of the Runtime image that must be copied to the device.

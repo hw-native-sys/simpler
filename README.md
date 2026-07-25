@@ -73,6 +73,7 @@ export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest
 | [Orchestrator](docs/orchestrator.md) | DAG submission internals: submit flow, TensorMap, Scope, Ring, task state machine |
 | [Scheduler](docs/scheduler.md) | DAG dispatch internals: wiring/ready/completion queues, dispatch loop |
 | [Worker Manager](docs/worker-manager.md) | Worker pool, WorkerThread, THREAD/PROCESS modes, fork + mailbox mechanics |
+| [Streaming Request Sessions](docs/request-session.md) | Bounded multi-flight runs, per-request token streams, and two-slot HostGraph execution |
 | [Getting Started](docs/getting-started.md) | Setup, prerequisites, build process, configuration |
 | [Developer Guide](docs/developer-guide.md) | Directory structure, role ownership, conventions |
 | [Testing Guide](docs/testing.md) | CI pipeline, test types, writing new tests |

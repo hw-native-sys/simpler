@@ -876,6 +876,22 @@ NB_MODULE(_task_interface, m) {
         .def("tensor_count", &TaskArgs::tensor_count)
         .def("scalar_count", &TaskArgs::scalar_count)
 
+        .def(
+            "_write_blob",
+            [](const TaskArgs &self, uint64_t dst_ptr, size_t capacity) {
+                const size_t needed = task_args_blob_size(self);
+                if (dst_ptr == 0 || needed > capacity) {
+                    throw std::runtime_error(
+                        "TaskArgs._write_blob: need " + std::to_string(needed) + ", capacity " +
+                        std::to_string(capacity)
+                    );
+                }
+                write_blob(reinterpret_cast<uint8_t *>(dst_ptr), self);
+                return needed;
+            },
+            nb::arg("dst_ptr"), nb::arg("capacity"), "Serialize this TaskArgs into caller-owned shared memory."
+        )
+
         .def("clear", &TaskArgs::clear)
 
         .def(
@@ -1235,6 +1251,23 @@ NB_MODULE(_task_interface, m) {
     // --- CallConfig ---
     nb::class_<CallConfig>(m, "CallConfig")
         .def(nb::init<>())
+        .def_prop_ro_static(
+            "_blob_size",
+            [](nb::handle) {
+                return sizeof(CallConfig);
+            }
+        )
+        .def(
+            "_write_blob",
+            [](const CallConfig &self, uint64_t dst_ptr, size_t capacity) {
+                if (dst_ptr == 0 || capacity < sizeof(CallConfig)) {
+                    throw std::runtime_error("CallConfig._write_blob: destination is null or too small");
+                }
+                std::memcpy(reinterpret_cast<void *>(dst_ptr), &self, sizeof(CallConfig));
+                return sizeof(CallConfig);
+            },
+            nb::arg("dst_ptr"), nb::arg("capacity"), "Serialize the CallConfig POD into shared memory."
+        )
         .def_rw("block_dim", &CallConfig::block_dim)
         .def_rw("aicpu_thread_num", &CallConfig::aicpu_thread_num)
         // runtime_env returns an internal reference so `cfg.runtime_env.ring_heap = X`
@@ -1424,7 +1457,7 @@ NB_MODULE(_task_interface, m) {
         .def(
             "run_from_blob",
             [](ChipWorker &self, int32_t callable_id, uint64_t args_blob_ptr, size_t blob_capacity,
-               const CallConfig &config) {
+               const CallConfig &config, unsigned pipeline_slot, uint64_t accepted_state_addr) {
                 // The mailbox region is the on-wire format `write_blob` produced;
                 // `read_blob` is the matching reader that returns a zero-copy
                 // TaskArgsView into the caller-owned bytes. Forwards to the
@@ -1432,9 +1465,14 @@ NB_MODULE(_task_interface, m) {
                 // loops never re-implement the tensor/scalar layout in Python
                 // (where it has historically dropped fields like child_memory).
                 TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(args_blob_ptr), blob_capacity);
-                self.run(callable_id, view, config);
+                ChipStorageTaskArgs storage = view_to_chip_storage(view);
+                self.run(
+                    callable_id, &storage, config, pipeline_slot,
+                    reinterpret_cast<volatile int32_t *>(accepted_state_addr)
+                );
             },
             nb::arg("callable_id"), nb::arg("args_blob_ptr"), nb::arg("blob_capacity"), nb::arg("config"),
+            nb::arg("pipeline_slot") = 0, nb::arg("accepted_state_addr") = 0, nb::call_guard<nb::gil_scoped_release>(),
             "Launch a callable_id from a raw mailbox-blob pointer + capacity "
             "(used by chip-child mailbox loops to avoid Python-side re-deserialisation "
             "of the per-task tensor/scalar layout). The blob must be in the format "
@@ -1452,6 +1490,14 @@ NB_MODULE(_task_interface, m) {
         )
         .def_prop_ro("device_id", &ChipWorker::device_id)
         .def_prop_ro("initialized", &ChipWorker::initialized)
+        .def_prop_ro(
+            "pipeline_slot_count", &ChipWorker::pipeline_slot_count,
+            "Pipeline depth declared by the bound runtime's resource contract."
+        )
+        .def_prop_ro(
+            "arena_bank_count", &ChipWorker::arena_bank_count,
+            "Number of independently filled arena banks declared by the bound runtime."
+        )
         .def_prop_ro(
             "aicpu_dlopen_count", &ChipWorker::aicpu_dlopen_count,
             "Number of distinct callable entries the AICPU has dlopened for on the "

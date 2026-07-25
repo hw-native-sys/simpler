@@ -258,14 +258,23 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     }
 
     // The orchestrator (top thread, tidx == nthreads-1) does not dispatch to
-    // cores, so it skips the handshake entirely and returns to
-    // run() immediately to build the graph — overlapping the schedulers' handshake.
+    // cores, so it skips the handshake entirely. The non-DFX path returns to
+    // run() immediately to build the graph, overlapping the schedulers' handshake.
+    // DFX must wait for the scheduler leader to initialize the shared collectors;
+    // otherwise the first submit can race dep_gen_aicpu_init() and disappear from
+    // tasks[] while later tensor-map edges still reference it.
     // Core counts it needs are derived from cores_total_num_ (fixed 1:2 ratio) in
     // run(). The remaining (nthreads-1) threads re-partition ALL cores among
     // themselves, so every core still gets its register window opened.
     const bool decouple_orch = (nthreads > 1) && !serial_orch_sched_;
     const bool is_orchestrator = (tidx == nthreads - 1);
     if (decouple_orch && is_orchestrator) {
+#if SIMPLER_DFX
+        while (!init_done_.load(std::memory_order_acquire)) {
+            if (init_failed_.load(std::memory_order_acquire)) return -1;
+        }
+        if (init_failed_.load(std::memory_order_acquire)) return -1;
+#endif
         return 0;  // do NOT touch the handshake or hs_arrived_ barrier
     }
     const int32_t hs_nthreads = decouple_orch ? (nthreads - 1) : nthreads;

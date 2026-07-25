@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <vector>
 #include "acl/acl.h"
@@ -58,6 +59,20 @@ extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_replay_emit_d
 ) {
     LOG_DEBUG("dep_gen replay not implemented for this runtime — deps.json skipped");
     return -1;
+}
+
+// host_build_graph overrides this hook to release its Host O worker only after
+// per-run profiling collectors are live. Other runtimes keep the no-op.
+extern "C" __attribute__((weak, visibility("hidden"))) int release_async_host_graph_pipeline(
+    Runtime * /*runtime*/
+) {
+    return 0;
+}
+
+// host_build_graph opens its Host Stage1 worker before Gate B so the build can
+// overlap the prior request's Device S. Other runtimes keep the no-op.
+extern "C" __attribute__((weak, visibility("hidden"))) int open_async_host_graph_pipeline(Runtime * /*runtime*/) {
+    return 0;
 }
 
 // =============================================================================
@@ -192,6 +207,17 @@ int DeviceRunner::destroy_comm_stream(void *stream) {
 // `src/common/platform/onboard/host/device_runner_base.cpp`.
 
 int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
+    int rc = open_async_host_graph_pipeline(&runtime);
+    if (rc != 0) {
+        LOG_ERROR("open_async_host_graph_pipeline failed: %d", rc);
+        return rc;
+    }
+
+    // Gate B covers every runner-owned per-run object, not only KernelLaunch.
+    // The HBG Host Stage1 worker was opened above and uses its banked image, so
+    // it can continue while this request waits for the prior Device S + reap.
+    std::unique_lock<std::mutex> device_run_lock(device_run_mutex_);
+
     // Latch this run's diagnostic enables onto the runner before the collector
     // paths below read them; block_dim/aicpu_thread_num are consumed locally.
     apply_call_config(config);
@@ -216,7 +242,7 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
     }
     if (validate_launch_aicpu_num(launch_aicpu_num) != 0) return -1;
 
-    int rc = ensure_device_initialized();
+    rc = ensure_device_initialized();
     if (rc != 0) {
         LOG_ERROR("ensure_device_initialized failed: %d", rc);
         return rc;
@@ -428,6 +454,30 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         l2_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
     }
 
+    rc = release_async_host_graph_pipeline(&runtime);
+    if (rc != 0) {
+        LOG_ERROR("release_async_host_graph_pipeline failed: %d", rc);
+        return rc;
+    }
+
+    rc = launch_run(runtime, num_aicore, launch_aicpu_num);
+    if (rc != 0) return rc;
+
+    rc = reap_run();
+    if (rc != 0) return rc;
+
+    // Print handshake results (reads from device memory, must be before free)
+    print_handshake_results();
+
+    return 0;
+}
+
+int DeviceRunner::launch_run(Runtime &runtime, int num_aicore, int launch_aicpu_num) {
+    // KernelLaunch is the pipeline boundary: this method clears the handshake
+    // consumed by the launch and submits exactly the AICore and AICPU kernels.
+    // It intentionally performs no stream synchronization or per-run cleanup.
+    int rc = 0;
+
     // Launch the AICore worker BEFORE the AICPU Run task — mirrors the a5 path
     // so the two arches stay symmetric. First-launch latency optimization +
     // op-timeout-family defense-in-depth: with the AICPU Run task launched first
@@ -453,7 +503,7 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
 
     LOG_INFO_V0("=== launch_aicore_kernel ===");
     // Launch AICore kernel (pass device copy of KernelArgs)
-    rc = launch_aicore_kernel(stream_aicore_, kernel_args_.device_k_args_);
+    rc = launch_aicore_kernel(run_stream_aicore(), kernel_args_.device_k_args_);
     if (rc != 0) {
         LOG_ERROR("launch_aicore_kernel failed: %d", rc);
         recover_device_or_mark_unusable(rc);
@@ -462,7 +512,7 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
 
     LOG_INFO_V0("=== launch_aicpu_kernel %s ===", host::KernelNames::RunName);
     int aicpu_launch_n = (runtime.get_aicpu_launch_count() > 0) ? runtime.get_aicpu_launch_count() : launch_aicpu_num;
-    rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, host::KernelNames::RunName, aicpu_launch_n);
+    rc = launch_aicpu_kernel(run_stream_aicpu(), &kernel_args_.args, host::KernelNames::RunName, aicpu_launch_n);
     if (rc != 0) {
         LOG_ERROR("launch_aicpu_kernel (main) failed: %d", rc);
         // The AICore worker was already launched above and is now spinning in
@@ -474,7 +524,16 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         return rc;
     }
 
-    rc = sync_run_streams();
+    // Both launches are now accepted by the runtime. Publish the flight ACK
+    // before reap blocks on stream completion; TASK_DONE is written later by
+    // the child loop after validation.
+    publish_task_accepted();
+
+    return 0;
+}
+
+int DeviceRunner::reap_run() {
+    int rc = sync_run_streams();
     if (rc != 0) {
         // sync_run_streams surfaces the AICore op-timeout (STARS-reaped op ->
         // 507000/507018/507046 at AICPU/AICore stream sync). The op-timeout
@@ -512,9 +571,6 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
             }
         }
     }
-
-    // Print handshake results (reads from device memory, must be before free)
-    print_handshake_results();
 
     return 0;
 }

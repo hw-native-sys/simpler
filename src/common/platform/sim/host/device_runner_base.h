@@ -47,6 +47,8 @@
 #include "common/unified_log.h"
 #include "host/memory_allocator.h"
 #include "host/l2_swimlane_collector.h"
+#include <array>
+
 #include "host/args_dump_collector.h"
 #include "host/pmu_collector.h"
 #include "host/scope_stats_collector.h"
@@ -99,6 +101,7 @@ public:
     void get_retained_temp_buffer(void **addr, size_t *size);
     void set_retained_temp_buffer(void *addr, size_t size);
     void clear_temporary_buffer();
+    int select_pipeline_slot(unsigned slot);
 
     // On sim, allocate_tensor returns a plain host pointer, so the "device"
     // address is already host-readable — register is identity, unregister a
@@ -216,8 +219,8 @@ protected:
     std::vector<uint8_t> aicore_kernel_binary_;
 
     MemoryAllocator mem_alloc_;
-    void *retained_temp_addr_ = nullptr;
-    size_t retained_temp_size_ = 0;
+    std::array<void *, 2> retained_temp_addrs_{{nullptr, nullptr}};
+    std::array<size_t, 2> retained_temp_sizes_{{0, 0}};
 
     // Three independent per-Worker arenas, each backing a single pooled
     // region (PTO2 GM heap / PTO2 shared memory / trb prebuilt runtime

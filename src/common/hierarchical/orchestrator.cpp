@@ -68,6 +68,7 @@ TaskSlotState &Orchestrator::slot_state(TaskSlot s) {
 uint64_t Orchestrator::output_alloc_bytes(const Tensor &t) { return align_up(t.nbytes(), HEAP_ALIGN); }
 
 Tensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype) {
+    std::lock_guard<std::mutex> submit_lk(submit_mu_);
     if (shape.empty()) {
         // Rank-0 tensors are not supported across the ABI (Tensor enforces
         // ndims > 0). Reject here so we never allocate + register a buffer in
@@ -189,6 +190,7 @@ SubmitResult Orchestrator::submit_impl(
     std::vector<int32_t> target_worker_ids, std::vector<std::vector<int32_t>> eligible_worker_ids,
     std::vector<RemoteTaskArgsSidecar> remote_sidecars
 ) {
+    std::lock_guard<std::mutex> submit_lk(submit_mu_);
     if (args_list.empty()) throw std::invalid_argument("Orchestrator: args_list must not be empty");
     config.validate();
     validate_worker_eligibility(worker_type, args_list.size(), target_worker_ids, eligible_worker_ids);
@@ -629,9 +631,13 @@ void Orchestrator::infer_deps(
 // Scope
 // =============================================================================
 
-void Orchestrator::scope_begin() { scope_->scope_begin(); }
+void Orchestrator::scope_begin() {
+    std::lock_guard<std::mutex> submit_lk(submit_mu_);
+    scope_->scope_begin();
+}
 
 void Orchestrator::scope_end() {
+    std::lock_guard<std::mutex> submit_lk(submit_mu_);
     scope_->scope_end([this](TaskSlot slot) {
         release_ref(slot);
     });

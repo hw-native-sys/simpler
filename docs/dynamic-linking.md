@@ -179,6 +179,7 @@ uses `pthread_key_t` (POSIX TLS) for per-thread state in framework SOs.
 | `s_orch_thread_idx` | `__thread int` | AICPU SO | Profiling thread index (profiling off by default) |
 | `g_platform_phase_base` | plain global + `extern "C"` setter | AICPU SO | Device-phase buffer base; published by host (onboard kernel.cpp / sim dlsym), read by the `[STRACE]` phase stamps. Per-thread slotting via the affinity pthread-key index, not TLS. |
 | strace `inv`/`depth`/`hid` | `pthread_key_t` (`ThreadState`) | host runtime SO | Per-thread `[STRACE]` host-trace state (was C++ `thread_local`, converted per this rule). |
+| active arena bank | `pthread_key_t` | onboard host platform SO | Per-thread Host O arena selection for overlapping requests. |
 | `execution_context` | `thread_local` | Kernel SO (PTO ISA) | Per-thread execution context (fallback, cached values only) |
 | `NPUMemoryModel::instance` | `thread_local` | Kernel SO (PTO ISA) | Per-core memory model simulation |
 

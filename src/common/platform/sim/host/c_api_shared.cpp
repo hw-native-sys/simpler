@@ -32,6 +32,7 @@
 #include <dlfcn.h>
 #include <pthread.h>
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <new>
@@ -63,6 +64,23 @@ static void create_runner_key() { pthread_key_create(&g_runner_key, nullptr); }
 
 static SimDeviceRunnerBase *current_runner() {
     return static_cast<SimDeviceRunnerBase *>(pthread_getspecific(g_runner_key));
+}
+
+static void *capture_thread_context() { return current_runner(); }
+
+static int bind_thread_context(void *context) {
+    auto *runner = static_cast<SimDeviceRunnerBase *>(context);
+    if (runner == nullptr) return -1;
+    pthread_once(&g_runner_key_once, create_runner_key);
+    pthread_setspecific(g_runner_key, runner);
+    int rc = runner->attach_current_thread(runner->device_id());
+    if (rc != 0) pthread_setspecific(g_runner_key, nullptr);
+    return rc;
+}
+
+static void unbind_thread_context() {
+    pto_cpu_sim_bind_device(-1);
+    pthread_setspecific(g_runner_key, nullptr);
 }
 
 /* ===========================================================================
@@ -101,6 +119,18 @@ static int copy_from_device(void *host_ptr, const void *dev_ptr, size_t size) {
     } catch (...) {
         return -1;
     }
+}
+
+static int store_u64_release_to_device(void *dev_ptr, uint64_t value) {
+    if (dev_ptr == nullptr) return -1;
+    reinterpret_cast<std::atomic<uint64_t> *>(dev_ptr)->store(value, std::memory_order_release);
+    return 0;
+}
+
+static int load_u64_acquire_from_device(uint64_t *value, const void *dev_ptr) {
+    if (value == nullptr || dev_ptr == nullptr) return -1;
+    *value = reinterpret_cast<const std::atomic<uint64_t> *>(dev_ptr)->load(std::memory_order_acquire);
+    return 0;
 }
 
 static void *register_device_memory_to_host(void *dev_ptr, size_t bytes) {
@@ -219,10 +249,15 @@ extern "C" int prewarm_config_impl(
 );
 
 static const HostApi g_host_api = {
+    .capture_thread_context = capture_thread_context,
+    .bind_thread_context = bind_thread_context,
+    .unbind_thread_context = unbind_thread_context,
     .device_malloc = device_malloc,
     .device_free = device_free,
     .copy_to_device = copy_to_device,
     .copy_from_device = copy_from_device,
+    .store_u64_release_to_device = store_u64_release_to_device,
+    .load_u64_acquire_from_device = load_u64_acquire_from_device,
     .register_device_memory_to_host = register_device_memory_to_host,
     .unregister_device_memory_from_host = unregister_device_memory_from_host,
     .device_memset = device_memset,
@@ -277,6 +312,28 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
     } catch (...) {
         return -1;
     }
+}
+
+int select_pipeline_slot_ctx(DeviceContextHandle ctx, unsigned pipeline_slot) {
+    if (ctx == NULL) return -1;
+    try {
+        return static_cast<SimDeviceRunnerBase *>(ctx)->select_pipeline_slot(pipeline_slot);
+    } catch (...) {
+        return -1;
+    }
+}
+
+int select_arena_bank_ctx(DeviceContextHandle ctx, unsigned arena_bank) {
+    if (ctx == NULL || arena_bank > 1) return -1;
+    return 0;
+}
+
+int set_task_accepted_state_ctx(DeviceContextHandle ctx, volatile int32_t *state, int32_t accepted_value) {
+    // Sim has no asynchronous KernelLaunch boundary. Keep the ABI uniform;
+    // TASK_DONE remains its completion signal.
+    (void)state;
+    (void)accepted_value;
+    return ctx == NULL ? -1 : 0;
 }
 
 int finalize_device(DeviceContextHandle ctx) {

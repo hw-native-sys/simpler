@@ -6,18 +6,18 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Unit tests for the module-level ``_ensure_prepared`` helper.
+"""Unit tests for the module-level ``_ensure_registered`` helper.
 
-``_ensure_prepared`` is the ``_CTRL_PREPARE`` registration path: it stages a
-callable's slot exactly once. There is no lazy/run-time preparation — the run
-path (``_TASK_READY``) only consumes an already-prepared slot and raises if it
+``_ensure_registered`` is the ``_CTRL_PREPARE`` registration path: it stages a
+callable's slot exactly once. There is no lazy run-time registration: the run
+path (``_TASK_READY``) only consumes an already-registered slot and raises if it
 is missing, so that behavior is covered by the chip-loop tests, not here.
 """
 
 from unittest.mock import MagicMock
 
 import pytest
-from simpler.worker import _ensure_prepared
+from simpler.worker import _ensure_registered
 
 
 class TestEnsurePrepared:
@@ -25,24 +25,24 @@ class TestEnsurePrepared:
         cw = MagicMock()
         callable_obj = object()
         registry = {2: callable_obj}
-        prepared: set[int] = set()
+        registered: set[int] = set()
 
-        _ensure_prepared(cw, registry, prepared, 2, device_id=0)
+        _ensure_registered(cw, registry, registered, 2, device_id=0)
 
         cw._register_callable_at_slot.assert_called_once_with(2, callable_obj)
-        assert prepared == {2}
+        assert registered == {2}
         # Preparation is a normal control-flow step now — no warning is emitted.
         assert capsys.readouterr().err == ""
 
-    def test_already_prepared_short_circuits(self):
+    def test_already_registered_short_circuits(self):
         cw = MagicMock()
-        # cid is already in `prepared`; helper must skip lookup and
-        # slot preparation entirely.  Pass an empty registry to prove the
+        # cid is already in `registered`; helper must skip lookup and
+        # slot registration entirely. Pass an empty registry to prove the
         # lookup never happens (otherwise registry.get would return None
         # and the helper would raise).
-        _ensure_prepared(cw, {}, {5}, 5, device_id=0)
+        _ensure_registered(cw, {}, {5}, 5, device_id=0)
         cw._register_callable_at_slot.assert_not_called()
 
     def test_missing_cid_raises(self):
         with pytest.raises(RuntimeError, match="cid 9 not in registry"):
-            _ensure_prepared(MagicMock(), {}, set(), 9, device_id=0)
+            _ensure_registered(MagicMock(), {}, set(), 9, device_id=0)

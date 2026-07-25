@@ -37,6 +37,14 @@ T load_symbol(void *handle, const char *name) {
     return reinterpret_cast<T>(sym);
 }
 
+template <typename T>
+T load_optional_symbol(void *handle, const char *name) {
+    dlerror();
+    void *sym = dlsym(handle, name);
+    if (dlerror() != nullptr) return nullptr;
+    return reinterpret_cast<T>(sym);
+}
+
 std::vector<uint8_t> read_binary_file(const std::string &path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) {
@@ -105,6 +113,11 @@ void ChipWorker::init(
         simpler_init_fn_ = load_symbol<SimplerInitFn>(handle, "simpler_init");
         register_callable_fn_ = load_symbol<SimplerRegisterCallableFn>(handle, "simpler_register_callable");
         run_fn_ = load_symbol<SimplerRunFn>(handle, "simpler_run");
+        select_arena_bank_fn_ = load_optional_symbol<SelectArenaBankFn>(handle, "select_arena_bank_ctx");
+        select_pipeline_slot_fn_ = load_optional_symbol<SelectPipelineSlotFn>(handle, "select_pipeline_slot_ctx");
+        set_task_accepted_state_fn_ =
+            load_optional_symbol<SetTaskAcceptedStateFn>(handle, "set_task_accepted_state_ctx");
+        get_pipeline_contract_fn_ = load_optional_symbol<GetPipelineContractFn>(handle, "get_pipeline_contract");
         unregister_callable_fn_ = load_symbol<SimplerUnregisterCallableFn>(handle, "simpler_unregister_callable");
         get_aicpu_dlopen_count_fn_ = load_symbol<GetAicpuDlopenCountFn>(handle, "get_aicpu_dlopen_count");
         get_host_dlopen_count_fn_ = load_symbol<GetAicpuDlopenCountFn>(handle, "get_host_dlopen_count");
@@ -136,6 +149,19 @@ void ChipWorker::init(
 
     lib_handle_ = handle;
 
+    if (get_pipeline_contract_fn_ != nullptr) {
+        const PipelineContract *contract = get_pipeline_contract_fn_();
+        if (contract == nullptr || contract->abi_version != PTO_PIPELINE_CONTRACT_ABI_VERSION ||
+            contract->resource_count > PTO_PIPELINE_MAX_RESOURCES || contract->pipeline_slots == 0 ||
+            contract->pipeline_slots > PTO_PIPELINE_MAX_SLOTS || contract->arena_banks == 0 ||
+            contract->arena_banks > contract->pipeline_slots) {
+            dlclose(handle);
+            lib_handle_ = nullptr;
+            throw std::runtime_error("host runtime returned an invalid PipelineContract");
+        }
+        pipeline_contract_ = *contract;
+    }
+
     device_ctx_ = create_device_context_fn_();
     if (device_ctx_ == nullptr) {
         dlclose(handle);
@@ -143,7 +169,10 @@ void ChipWorker::init(
         throw std::runtime_error("create_device_context returned null");
     }
 
-    runtime_buf_.resize(get_runtime_size_fn_());
+    const size_t runtime_size = get_runtime_size_fn_();
+    for (auto &runtime_buf : runtime_bufs_) {
+        runtime_buf.resize(runtime_size);
+    }
 
     // One-shot platform-side init: attach the calling thread to `device_id`
     // (rtSetDevice on onboard, sim bind+acquire on sim), transfer ownership
@@ -191,6 +220,10 @@ void ChipWorker::init(
         simpler_init_fn_ = nullptr;
         register_callable_fn_ = nullptr;
         run_fn_ = nullptr;
+        select_arena_bank_fn_ = nullptr;
+        select_pipeline_slot_fn_ = nullptr;
+        set_task_accepted_state_fn_ = nullptr;
+        get_pipeline_contract_fn_ = nullptr;
         unregister_callable_fn_ = nullptr;
         get_aicpu_dlopen_count_fn_ = nullptr;
         get_host_dlopen_count_fn_ = nullptr;
@@ -207,7 +240,8 @@ void ChipWorker::init(
         comm_release_domain_windows_fn_ = nullptr;
         comm_barrier_fn_ = nullptr;
         comm_destroy_fn_ = nullptr;
-        runtime_buf_.clear();
+        for (auto &runtime_buf : runtime_bufs_)
+            runtime_buf.clear();
         throw;
     }
     if (init_rc != 0) {
@@ -230,6 +264,10 @@ void ChipWorker::init(
         simpler_init_fn_ = nullptr;
         register_callable_fn_ = nullptr;
         run_fn_ = nullptr;
+        select_arena_bank_fn_ = nullptr;
+        select_pipeline_slot_fn_ = nullptr;
+        set_task_accepted_state_fn_ = nullptr;
+        get_pipeline_contract_fn_ = nullptr;
         unregister_callable_fn_ = nullptr;
         get_aicpu_dlopen_count_fn_ = nullptr;
         get_host_dlopen_count_fn_ = nullptr;
@@ -247,7 +285,8 @@ void ChipWorker::init(
         comm_release_domain_windows_fn_ = nullptr;
         comm_barrier_fn_ = nullptr;
         comm_destroy_fn_ = nullptr;
-        runtime_buf_.clear();
+        for (auto &runtime_buf : runtime_bufs_)
+            runtime_buf.clear();
         throw std::runtime_error("simpler_init failed with code " + std::to_string(init_rc));
     }
 
@@ -295,6 +334,10 @@ void ChipWorker::finalize() {
     get_runtime_size_fn_ = nullptr;
     register_callable_fn_ = nullptr;
     run_fn_ = nullptr;
+    select_arena_bank_fn_ = nullptr;
+    select_pipeline_slot_fn_ = nullptr;
+    set_task_accepted_state_fn_ = nullptr;
+    get_pipeline_contract_fn_ = nullptr;
     unregister_callable_fn_ = nullptr;
     get_aicpu_dlopen_count_fn_ = nullptr;
     get_host_dlopen_count_fn_ = nullptr;
@@ -312,7 +355,9 @@ void ChipWorker::finalize() {
     comm_release_domain_windows_fn_ = nullptr;
     comm_barrier_fn_ = nullptr;
     comm_destroy_fn_ = nullptr;
-    runtime_buf_.clear();
+    for (auto &runtime_buf : runtime_bufs_)
+        runtime_buf.clear();
+    pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 1, 1, {}};
     initialized_ = false;
     device_id_ = -1;
     finalized_ = true;
@@ -332,23 +377,112 @@ void ChipWorker::register_callable(int32_t callable_id, const void *callable) {
 }
 
 void ChipWorker::run(int32_t callable_id, TaskArgsView args, const CallConfig &config) {
+    run(callable_id, args, config, 0);
+}
+
+void ChipWorker::run(int32_t callable_id, TaskArgsView args, const CallConfig &config, unsigned pipeline_slot) {
     ChipStorageTaskArgs chip_storage = view_to_chip_storage(args);
-    run(callable_id, &chip_storage, config);
+    run(callable_id, &chip_storage, config, pipeline_slot);
 }
 
 void ChipWorker::run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config) {
+    run(callable_id, args, config, 0);
+}
+
+void ChipWorker::run(
+    int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, unsigned pipeline_slot
+) {
+    run(callable_id, args, config, pipeline_slot, nullptr);
+}
+
+void ChipWorker::run(
+    int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, unsigned pipeline_slot,
+    volatile int32_t *accepted_state
+) {
     config.validate();
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
 
-    void *rt = runtime_buf_.data();
+    if (pipeline_slot >= pipeline_contract_.pipeline_slots) {
+        throw std::runtime_error("run pipeline slot is outside the runtime PipelineContract");
+    }
+    const unsigned arena_bank = pipeline_slot % pipeline_contract_.arena_banks;
+    if (pipeline_slot != 0 && select_pipeline_slot_fn_ == nullptr) {
+        throw std::runtime_error("bound runtime does not support nonzero pipeline slots");
+    }
+    if (arena_bank != 0 && select_arena_bank_fn_ == nullptr) {
+        throw std::runtime_error("bound runtime does not support nonzero arena banks");
+    }
+    void *rt = runtime_bufs_[pipeline_slot].data();
     // Per-stage timing is emitted by the platform as `[STRACE]` log markers, not
     // returned (see chip_worker.h::run). CallConfig is threaded through to the C
     // ABI as a single pointer rather than unpacked into per-field args.
-    int rc = run_fn_(device_ctx_, rt, callable_id, args, &config);
+    if (select_pipeline_slot_fn_ != nullptr && select_pipeline_slot_fn_(device_ctx_, pipeline_slot) != 0) {
+        throw std::runtime_error("select_pipeline_slot_ctx failed");
+    }
+    if (select_arena_bank_fn_ != nullptr && select_arena_bank_fn_(device_ctx_, arena_bank) != 0) {
+        throw std::runtime_error("select_arena_bank_ctx failed");
+    }
+    if (accepted_state != nullptr) {
+        if (set_task_accepted_state_fn_ == nullptr ||
+            set_task_accepted_state_fn_(device_ctx_, accepted_state, 8) != 0) {
+            throw std::runtime_error("set_task_accepted_state_ctx failed");
+        }
+    }
+
+    const bool reuse_admitted = has_shared_reuse_resource();
+    if (reuse_admitted) {
+        acquire_reuse_resource(config.runtime_env);
+    }
+
+    int rc = 0;
+    try {
+        rc = run_fn_(device_ctx_, rt, callable_id, args, &config);
+        if (set_task_accepted_state_fn_ != nullptr) {
+            (void)set_task_accepted_state_fn_(device_ctx_, nullptr, 0);
+        }
+    } catch (...) {
+        if (set_task_accepted_state_fn_ != nullptr) {
+            (void)set_task_accepted_state_fn_(device_ctx_, nullptr, 0);
+        }
+        if (reuse_admitted) {
+            release_reuse_resource();
+        }
+        throw;
+    }
+    if (reuse_admitted) {
+        release_reuse_resource();
+    }
     if (rc != 0) {
         throw std::runtime_error("run failed with code " + std::to_string(rc));
+    }
+}
+
+bool ChipWorker::has_shared_reuse_resource() const {
+    if (pipeline_contract_.arena_banks >= pipeline_contract_.pipeline_slots) return false;
+    for (uint32_t i = 0; i < pipeline_contract_.resource_count; ++i) {
+        if (pipeline_contract_.resources[i].resource_class == PTO_PIPELINE_REUSE_MEM) return true;
+    }
+    return false;
+}
+
+void ChipWorker::acquire_reuse_resource(const RuntimeEnv &runtime_env) {
+    std::unique_lock<std::mutex> lock(reuse_resource_mutex_);
+    reuse_resource_cv_.wait(lock, [&]() {
+        return active_reuse_runs_ == 0 ||
+               std::memcmp(&active_reuse_runtime_env_, &runtime_env, sizeof(RuntimeEnv)) == 0;
+    });
+    if (active_reuse_runs_ == 0) {
+        active_reuse_runtime_env_ = runtime_env;
+    }
+    ++active_reuse_runs_;
+}
+
+void ChipWorker::release_reuse_resource() {
+    std::lock_guard<std::mutex> lock(reuse_resource_mutex_);
+    if (--active_reuse_runs_ == 0) {
+        reuse_resource_cv_.notify_all();
     }
 }
 

@@ -31,6 +31,10 @@
 #include "task_args.h"
 #include "utils/elf_build_id.h"
 
+namespace {
+thread_local unsigned g_pipeline_slot = 0;
+}
+
 namespace simpler::common::sim_host {
 
 namespace {
@@ -267,21 +271,29 @@ int SimDeviceRunnerBase::device_memset(void *dev_ptr, int value, size_t bytes) {
 }
 
 void SimDeviceRunnerBase::get_retained_temp_buffer(void **addr, size_t *size) {
-    if (addr != nullptr) *addr = retained_temp_addr_;
-    if (size != nullptr) *size = retained_temp_size_;
+    if (addr != nullptr) *addr = retained_temp_addrs_[g_pipeline_slot];
+    if (size != nullptr) *size = retained_temp_sizes_[g_pipeline_slot];
 }
 
 void SimDeviceRunnerBase::set_retained_temp_buffer(void *addr, size_t size) {
-    retained_temp_addr_ = addr;
-    retained_temp_size_ = size;
+    retained_temp_addrs_[g_pipeline_slot] = addr;
+    retained_temp_sizes_[g_pipeline_slot] = size;
 }
 
 void SimDeviceRunnerBase::clear_temporary_buffer() {
-    if (retained_temp_addr_ != nullptr) {
-        mem_alloc_.free(retained_temp_addr_);
-        retained_temp_addr_ = nullptr;
-        retained_temp_size_ = 0;
+    for (size_t slot = 0; slot < retained_temp_addrs_.size(); ++slot) {
+        if (retained_temp_addrs_[slot] != nullptr) {
+            mem_alloc_.free(retained_temp_addrs_[slot]);
+            retained_temp_addrs_[slot] = nullptr;
+            retained_temp_sizes_[slot] = 0;
+        }
     }
+}
+
+int SimDeviceRunnerBase::select_pipeline_slot(unsigned slot) {
+    if (slot > 1) return -1;
+    g_pipeline_slot = slot;
+    return 0;
 }
 
 int SimDeviceRunnerBase::stamp_orch_so(Runtime &runtime, int32_t cid) {
