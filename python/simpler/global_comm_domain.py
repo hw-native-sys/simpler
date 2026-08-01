@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 GLOBAL_DOMAIN_VERSION = 1
 GLOBAL_DOMAIN_MAX_RANKS = 64
+GLOBAL_DOMAIN_MAX_BUFFERS = 64
 GLOBAL_DOMAIN_HANDLE_BYTES = 256
 GLOBAL_DOMAIN_DESCRIPTOR = struct.Struct("<IIIIQII256s")
 GLOBAL_DOMAIN_DESCRIPTOR_BYTES = GLOBAL_DOMAIN_DESCRIPTOR.size
@@ -392,6 +393,8 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:
         raise ValueError("global domain command name must be non-empty")
     if command.profile not in GLOBAL_DOMAIN_PROFILE_IDS:
         raise ValueError(f"unsupported global domain profile {command.profile!r}")
+    if len(command.buffers) > GLOBAL_DOMAIN_MAX_BUFFERS:
+        raise ValueError("global domain command buffer count exceeds maximum")
     if len({buffer.name for buffer in command.buffers}) != len(command.buffers):
         raise ValueError("global domain command contains duplicate buffer names")
     if any(not buffer.name or buffer.nbytes <= 0 for buffer in command.buffers):
@@ -450,7 +453,7 @@ def decode_domain_command(data: bytes) -> GlobalDomainCommand:
         raise ValueError("global domain command member count exceeds maximum")
     members = tuple(_read_member(reader) for _ in range(member_count))
     buffer_count = reader.u32()
-    if buffer_count > GLOBAL_DOMAIN_MAX_RANKS:
+    if buffer_count > GLOBAL_DOMAIN_MAX_BUFFERS:
         raise ValueError("global domain command buffer count exceeds maximum")
     buffers = tuple(GlobalDomainBuffer(reader.string("buffer.name"), reader.u64()) for _ in range(buffer_count))
     descriptor_count = reader.u32()

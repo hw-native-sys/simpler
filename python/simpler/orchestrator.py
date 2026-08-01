@@ -247,6 +247,10 @@ class Orchestrator:
 
         ``workers`` contains the exact stable NEXT_LEVEL worker id for each
         member. For L3 chip dispatch, these are the existing chip worker ids.
+        When ``workers`` is the complete worker-id set of one MPI L3 group,
+        ``args_list`` becomes one per-rank mailbox request: MPI rank
+        ``workers[i]`` executes only ``args_list[i]``. A single worker id remains
+        directed and is never silently widened to the whole group.
         """
         cfg = config if config is not None else CallConfig()
         worker_ids = [_require_next_level_worker_id(value, argument="workers entries") for value in workers]

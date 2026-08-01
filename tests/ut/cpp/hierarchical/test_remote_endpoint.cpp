@@ -624,3 +624,97 @@ TEST(RemoteEndpoint, BareHostPointerWithoutSidecarIsEndpointFailure) {
     EXPECT_TRUE(transport->last_frame.empty());
     ring.shutdown();
 }
+
+namespace {
+
+std::vector<uint8_t> ready_mpi_mailbox(int32_t world_size) {
+    using namespace mpi_group_mailbox;
+    std::vector<uint8_t> mailbox(MAILBOX_BYTES, 0);
+    std::memcpy(mailbox.data() + OFF_MAGIC, MAGIC, sizeof(MAGIC));
+    const uint32_t version = PROTOCOL_VERSION;
+    const uint32_t header_bytes = HEADER_BYTES;
+    const uint64_t mailbox_bytes = MAILBOX_BYTES;
+    const uint32_t size = static_cast<uint32_t>(world_size);
+    const int32_t ready = static_cast<int32_t>(GroupState::READY);
+    const int32_t idle = static_cast<int32_t>(RequestState::IDLE);
+    std::memcpy(mailbox.data() + OFF_PROTOCOL_VERSION, &version, sizeof(version));
+    std::memcpy(mailbox.data() + OFF_HEADER_BYTES, &header_bytes, sizeof(header_bytes));
+    std::memcpy(mailbox.data() + OFF_MAILBOX_BYTES, &mailbox_bytes, sizeof(mailbox_bytes));
+    std::memcpy(mailbox.data() + OFF_WORLD_SIZE, &size, sizeof(size));
+    std::memcpy(mailbox.data() + OFF_GROUP_STATE, &ready, sizeof(ready));
+    std::memcpy(mailbox.data() + OFF_REQUEST_STATE, &idle, sizeof(idle));
+    return mailbox;
+}
+
+int32_t mailbox_state(const std::vector<uint8_t> &mailbox, size_t offset) {
+    int32_t value = 0;
+    __atomic_load(reinterpret_cast<const int32_t *>(mailbox.data() + offset), &value, __ATOMIC_ACQUIRE);
+    return value;
+}
+
+void set_mailbox_state(std::vector<uint8_t> &mailbox, size_t offset, int32_t value) {
+    __atomic_store(reinterpret_cast<int32_t *>(mailbox.data() + offset), &value, __ATOMIC_RELEASE);
+}
+
+void respond_with_payloads(std::vector<uint8_t> &mailbox, const std::vector<std::vector<uint8_t>> &payloads) {
+    using namespace mpi_group_mailbox;
+    while (mailbox_state(mailbox, OFF_REQUEST_STATE) != static_cast<int32_t>(RequestState::REQUEST_READY)) {}
+    const uint32_t count = static_cast<uint32_t>(payloads.size());
+    std::memcpy(mailbox.data() + RESPONSE_OFFSET, &count, sizeof(count));
+    size_t offset = RESPONSE_OFFSET + 4;
+    size_t response_bytes = 4 + 4 * payloads.size();
+    for (const auto &payload : payloads) {
+        const uint32_t size = static_cast<uint32_t>(payload.size());
+        std::memcpy(mailbox.data() + offset, &size, sizeof(size));
+        offset += 4;
+        response_bytes += payload.size();
+    }
+    for (const auto &payload : payloads) {
+        if (!payload.empty()) std::memcpy(mailbox.data() + offset, payload.data(), payload.size());
+        offset += payload.size();
+    }
+    std::memcpy(mailbox.data() + OFF_RESPONSE_COUNT, &count, sizeof(count));
+    const uint32_t encoded_bytes = static_cast<uint32_t>(response_bytes);
+    std::memcpy(mailbox.data() + OFF_RESPONSE_BYTES, &encoded_bytes, sizeof(encoded_bytes));
+    set_mailbox_state(mailbox, OFF_REQUEST_STATE, static_cast<int32_t>(mpi_group_mailbox::RequestState::TASK_DONE));
+}
+
+}  // namespace
+
+TEST(MpiGroupMailboxChannel, FullGroupTaskUsesOnePerRankEnvelope) {
+    using namespace mpi_group_mailbox;
+    auto mailbox = ready_mpi_mailbox(2);
+    MpiGroupMailboxChannel channel(mailbox.data(), mailbox.size(), 2, -1, 2.0);
+    std::vector<uint8_t> reply0;
+    std::vector<uint8_t> reply1;
+    std::thread rank0([&]() {
+        reply0 = channel.exchange_group_task({0x10}, 0, 7, 2);
+    });
+    std::thread rank1([&]() {
+        reply1 = channel.exchange_group_task({0x20}, 1, 7, 2);
+    });
+
+    while (mailbox_state(mailbox, OFF_REQUEST_STATE) != static_cast<int32_t>(RequestState::REQUEST_READY)) {}
+    uint32_t target = 0;
+    uint32_t request_count = 0;
+    std::memcpy(&target, mailbox.data() + OFF_TARGET, sizeof(target));
+    std::memcpy(&request_count, mailbox.data() + OFF_REQUEST_COUNT, sizeof(request_count));
+    EXPECT_EQ(target, static_cast<uint32_t>(Target::PER_RANK));
+    EXPECT_EQ(request_count, 2U);
+    respond_with_payloads(mailbox, {{0xA0}, {0xA1}});
+
+    rank0.join();
+    rank1.join();
+    EXPECT_EQ(reply0, std::vector<uint8_t>({0xA0}));
+    EXPECT_EQ(reply1, std::vector<uint8_t>({0xA1}));
+    EXPECT_EQ(mailbox_state(mailbox, OFF_REQUEST_STATE), static_cast<int32_t>(RequestState::IDLE));
+}
+
+TEST(MpiGroupMailboxChannel, TimeoutMakesGroupTerminal) {
+    using namespace mpi_group_mailbox;
+    auto mailbox = ready_mpi_mailbox(1);
+    MpiGroupMailboxChannel channel(mailbox.data(), mailbox.size(), 1, -1, 0.01);
+    EXPECT_THROW(channel.exchange_group_task({0x10}, 0, 9, 1), std::runtime_error);
+    EXPECT_TRUE(channel.terminal());
+    EXPECT_EQ(mailbox_state(mailbox, OFF_GROUP_STATE), static_cast<int32_t>(GroupState::TERMINAL));
+}

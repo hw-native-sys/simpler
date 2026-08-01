@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <poll.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -355,6 +356,13 @@ void validate_owner_buffer_handle(const RemoteBufferHandle &handle, size_t reque
 
 }  // namespace
 
+std::vector<uint8_t>
+RemoteL3Transport::exchange_group_task(const std::vector<uint8_t> &frame, uint64_t, int32_t, int32_t) {
+    const auto decoded = remote_l3::decode_frame(frame);
+    submit_frame(frame);
+    return wait_for_reply(remote_l3::FrameType::COMPLETION, decoded.header.sequence);
+}
+
 RemoteL3SocketTransport::RemoteL3SocketTransport(
     std::string host, uint16_t port, std::string health_host, uint16_t health_port, double attach_timeout_s,
     double runtime_timeout_s
@@ -612,21 +620,441 @@ std::vector<uint8_t> RemoteL3SocketTransport::wait_for_reply(remote_l3::FrameTyp
 
 void RemoteL3SocketTransport::shutdown() { close_socket(); }
 
+MpiGroupMailboxChannel::MpiGroupMailboxChannel(
+    void *mailbox, size_t mailbox_bytes, int32_t world_size, int mpirun_pid, double runtime_timeout_s
+) :
+    mailbox_(static_cast<uint8_t *>(mailbox)),
+    mailbox_bytes_(mailbox_bytes),
+    world_size_(world_size),
+    mpirun_pid_(mpirun_pid),
+    runtime_timeout_s_(runtime_timeout_s) {
+    using namespace mpi_group_mailbox;
+    if (mailbox_ == nullptr) throw std::invalid_argument("MpiGroupMailboxChannel: null mailbox");
+    if (mailbox_bytes_ < MAILBOX_BYTES) throw std::invalid_argument("MpiGroupMailboxChannel: mailbox is too small");
+    if (world_size_ <= 0) throw std::invalid_argument("MpiGroupMailboxChannel: world_size must be positive");
+    if (!(runtime_timeout_s_ > 0.0)) {
+        throw std::invalid_argument("MpiGroupMailboxChannel: runtime_timeout_s must be positive");
+    }
+    if (std::memcmp(mailbox_ + OFF_MAGIC, MAGIC, sizeof(MAGIC)) != 0) {
+        throw std::invalid_argument("MpiGroupMailboxChannel: mailbox magic mismatch");
+    }
+    if (read_u32(OFF_PROTOCOL_VERSION) != PROTOCOL_VERSION || read_u32(OFF_HEADER_BYTES) != HEADER_BYTES) {
+        throw std::invalid_argument("MpiGroupMailboxChannel: mailbox protocol mismatch");
+    }
+    if (read_u64(OFF_MAILBOX_BYTES) != MAILBOX_BYTES ||
+        read_u32(OFF_WORLD_SIZE) != static_cast<uint32_t>(world_size_)) {
+        throw std::invalid_argument("MpiGroupMailboxChannel: mailbox layout or world size mismatch");
+    }
+}
+
+int32_t MpiGroupMailboxChannel::load_i32(size_t offset) const {
+    int32_t value = 0;
+    __atomic_load(reinterpret_cast<const int32_t *>(mailbox_ + offset), &value, __ATOMIC_ACQUIRE);
+    return value;
+}
+
+void MpiGroupMailboxChannel::store_i32(size_t offset, int32_t value) {
+    __atomic_store(reinterpret_cast<int32_t *>(mailbox_ + offset), &value, __ATOMIC_RELEASE);
+}
+
+uint32_t MpiGroupMailboxChannel::read_u32(size_t offset) const {
+    uint32_t value = 0;
+    std::memcpy(&value, mailbox_ + offset, sizeof(value));
+    return value;
+}
+
+uint64_t MpiGroupMailboxChannel::read_u64(size_t offset) const {
+    uint64_t value = 0;
+    std::memcpy(&value, mailbox_ + offset, sizeof(value));
+    return value;
+}
+
+void MpiGroupMailboxChannel::write_u32(size_t offset, uint32_t value) {
+    std::memcpy(mailbox_ + offset, &value, sizeof(value));
+}
+
+void MpiGroupMailboxChannel::write_u64(size_t offset, uint64_t value) {
+    std::memcpy(mailbox_ + offset, &value, sizeof(value));
+}
+
+std::string MpiGroupMailboxChannel::terminal_reason() const {
+    using namespace mpi_group_mailbox;
+    const size_t size = std::min(static_cast<size_t>(read_u32(OFF_ERROR_BYTES)), ERROR_BYTES);
+    return std::string(reinterpret_cast<const char *>(mailbox_ + ERROR_OFFSET), size);
+}
+
+void MpiGroupMailboxChannel::mark_terminal(const std::string &reason) {
+    using namespace mpi_group_mailbox;
+    const size_t size = std::min(reason.size(), ERROR_BYTES);
+    if (size > 0) std::memcpy(mailbox_ + ERROR_OFFSET, reason.data(), size);
+    write_u32(OFF_ERROR_BYTES, static_cast<uint32_t>(size));
+    store_i32(OFF_GROUP_STATE, static_cast<int32_t>(GroupState::TERMINAL));
+    store_i32(OFF_REQUEST_STATE, static_cast<int32_t>(RequestState::TASK_FAILED));
+}
+
+void MpiGroupMailboxChannel::kill_mpirun_group() const {
+    if (mpirun_pid_ <= 0) return;
+    (void)::kill(-mpirun_pid_, SIGKILL);
+    (void)::kill(mpirun_pid_, SIGKILL);
+}
+
+bool MpiGroupMailboxChannel::terminal() const {
+    return load_i32(mpi_group_mailbox::OFF_GROUP_STATE) ==
+           static_cast<int32_t>(mpi_group_mailbox::GroupState::TERMINAL);
+}
+
+std::vector<std::vector<uint8_t>> MpiGroupMailboxChannel::run_exchange(
+    const std::vector<std::vector<uint8_t>> &frames, mpi_group_mailbox::Opcode opcode, mpi_group_mailbox::Target target,
+    int32_t target_rank
+) {
+    using namespace mpi_group_mailbox;
+    if (frames.empty()) throw std::invalid_argument("MpiGroupMailboxChannel: request requires a payload");
+    if (target == Target::PER_RANK && frames.size() != static_cast<size_t>(world_size_)) {
+        throw std::invalid_argument("MpiGroupMailboxChannel: per-rank request must include every rank");
+    }
+    if (target != Target::PER_RANK && frames.size() != 1) {
+        throw std::invalid_argument("MpiGroupMailboxChannel: rank/group request requires one payload");
+    }
+    size_t encoded_request_bytes = 4 + 4 * frames.size();
+    for (const auto &frame : frames) {
+        if (frame.size() > UINT32_MAX || frame.size() > PAYLOAD_BYTES ||
+            encoded_request_bytes > PAYLOAD_BYTES - frame.size()) {
+            throw std::invalid_argument("MpiGroupMailboxChannel: request frame vector exceeds mailbox capacity");
+        }
+        encoded_request_bytes += frame.size();
+    }
+    if (target == Target::RANK && (target_rank < 0 || target_rank >= world_size_)) {
+        throw std::invalid_argument("MpiGroupMailboxChannel: target rank is outside the group");
+    }
+    const auto group_state = static_cast<GroupState>(load_i32(OFF_GROUP_STATE));
+    if (group_state == GroupState::TERMINAL) {
+        throw std::runtime_error("MpiGroupMailboxChannel: group is terminal: " + terminal_reason());
+    }
+    if (group_state != GroupState::READY) {
+        throw std::runtime_error("MpiGroupMailboxChannel: group is not ready");
+    }
+    if (static_cast<RequestState>(load_i32(OFF_REQUEST_STATE)) != RequestState::IDLE) {
+        throw std::runtime_error("MpiGroupMailboxChannel: request lane is not idle");
+    }
+
+    const uint64_t sequence = next_sequence_++;
+    const uint32_t count = static_cast<uint32_t>(frames.size());
+    std::memcpy(mailbox_ + REQUEST_OFFSET, &count, sizeof(count));
+    size_t request_offset = REQUEST_OFFSET + 4;
+    for (const auto &frame : frames) {
+        const uint32_t frame_size = static_cast<uint32_t>(frame.size());
+        std::memcpy(mailbox_ + request_offset, &frame_size, sizeof(frame_size));
+        request_offset += 4;
+    }
+    for (const auto &frame : frames) {
+        if (!frame.empty()) std::memcpy(mailbox_ + request_offset, frame.data(), frame.size());
+        request_offset += frame.size();
+    }
+    write_u64(OFF_SEQUENCE_ID, sequence);
+    write_u32(OFF_OPCODE, static_cast<uint32_t>(opcode));
+    write_u32(OFF_TARGET, static_cast<uint32_t>(target));
+    std::memcpy(mailbox_ + OFF_TARGET_RANK, &target_rank, sizeof(target_rank));
+    write_u32(OFF_REQUEST_COUNT, count);
+    write_u32(OFF_REQUEST_BYTES, static_cast<uint32_t>(encoded_request_bytes));
+    write_u32(OFF_RESPONSE_COUNT, 0);
+    write_u32(OFF_RESPONSE_BYTES, 0);
+    write_u32(OFF_ERROR_BYTES, 0);
+    const RequestState ready_state =
+        opcode == Opcode::SHUTDOWN ? RequestState::SHUTDOWN_READY : RequestState::REQUEST_READY;
+    store_i32(OFF_REQUEST_STATE, static_cast<int32_t>(ready_state));
+
+    const Deadline deadline = deadline_from_now(runtime_timeout_s_);
+    uint32_t poll_spins = 0;
+    while (true) {
+        const auto state = static_cast<RequestState>(load_i32(OFF_REQUEST_STATE));
+        if (state == RequestState::TASK_DONE) {
+            const uint32_t response_count = read_u32(OFF_RESPONSE_COUNT);
+            const size_t response_bytes = read_u32(OFF_RESPONSE_BYTES);
+            const uint32_t expected_count = target == Target::PER_RANK ? static_cast<uint32_t>(world_size_) : 1U;
+            const size_t prefix_bytes = 4 + 4 * static_cast<size_t>(response_count);
+            if (response_count != expected_count || response_bytes < prefix_bytes || response_bytes > PAYLOAD_BYTES) {
+                mark_terminal("MPI group mailbox returned an invalid response vector");
+                kill_mpirun_group();
+                throw std::runtime_error("MpiGroupMailboxChannel: invalid response vector");
+            }
+            uint32_t encoded_count = 0;
+            std::memcpy(&encoded_count, mailbox_ + RESPONSE_OFFSET, sizeof(encoded_count));
+            if (encoded_count != response_count) {
+                mark_terminal("MPI group mailbox response vector length mismatch");
+                kill_mpirun_group();
+                throw std::runtime_error("MpiGroupMailboxChannel: response vector length mismatch");
+            }
+            std::vector<uint32_t> payload_sizes(response_count);
+            size_t total_payload_bytes = 0;
+            for (uint32_t i = 0; i < response_count; ++i) {
+                std::memcpy(
+                    &payload_sizes[i], mailbox_ + RESPONSE_OFFSET + 4 + 4 * static_cast<size_t>(i),
+                    sizeof(payload_sizes[i])
+                );
+                total_payload_bytes += payload_sizes[i];
+            }
+            if (prefix_bytes + total_payload_bytes != response_bytes) {
+                mark_terminal("MPI group mailbox response vector length mismatch");
+                kill_mpirun_group();
+                throw std::runtime_error("MpiGroupMailboxChannel: response vector length mismatch");
+            }
+            std::vector<std::vector<uint8_t>> responses;
+            responses.reserve(response_count);
+            size_t response_offset = RESPONSE_OFFSET + prefix_bytes;
+            for (uint32_t payload_size : payload_sizes) {
+                std::vector<uint8_t> response(payload_size);
+                if (payload_size > 0) {
+                    std::memcpy(response.data(), mailbox_ + response_offset, payload_size);
+                }
+                response_offset += payload_size;
+                responses.push_back(std::move(response));
+            }
+            store_i32(OFF_REQUEST_STATE, static_cast<int32_t>(RequestState::IDLE));
+            return responses;
+        }
+        if (state == RequestState::SHUTDOWN_DONE) {
+            store_i32(OFF_REQUEST_STATE, static_cast<int32_t>(RequestState::IDLE));
+            return {{}};
+        }
+        if (state == RequestState::TASK_FAILED || terminal()) {
+            const std::string reason = terminal_reason();
+            if (!terminal()) store_i32(OFF_REQUEST_STATE, static_cast<int32_t>(RequestState::IDLE));
+            throw std::runtime_error(
+                "MpiGroupMailboxChannel: MPI group request failed" + (reason.empty() ? std::string() : ": " + reason)
+            );
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            mark_terminal("MPI group mailbox request timed out at sequence " + std::to_string(sequence));
+            kill_mpirun_group();
+            throw std::runtime_error("MpiGroupMailboxChannel: request timed out");
+        }
+        if (++poll_spins >= 64) {
+            std::this_thread::yield();
+            poll_spins = 0;
+        }
+    }
+}
+
+std::vector<uint8_t> MpiGroupMailboxChannel::exchange(const std::vector<uint8_t> &frame, int32_t target_rank) {
+    std::lock_guard<std::mutex> lock(lane_mu_);
+    const auto decoded = remote_l3::decode_frame(frame);
+    mpi_group_mailbox::Opcode opcode = mpi_group_mailbox::Opcode::CONTROL;
+    mpi_group_mailbox::Target target = mpi_group_mailbox::Target::RANK;
+    if (decoded.header.frame_type == remote_l3::FrameType::TASK) {
+        opcode = mpi_group_mailbox::Opcode::TASK;
+    } else if (decoded.header.frame_type == remote_l3::FrameType::HEALTH) {
+        opcode = mpi_group_mailbox::Opcode::PING;
+        target = mpi_group_mailbox::Target::GROUP;
+        target_rank = -1;
+    } else if (decoded.header.frame_type == remote_l3::FrameType::CONTROL) {
+        const auto control = remote_l3::decode_control(decoded.payload.data(), decoded.payload.size());
+        if (control.control_name == remote_l3::ControlName::ALLOC_DOMAIN ||
+            control.control_name == remote_l3::ControlName::RELEASE_DOMAIN) {
+            target = mpi_group_mailbox::Target::GROUP;
+            target_rank = -1;
+        }
+    } else {
+        throw std::runtime_error("MpiGroupMailboxChannel: unsupported request frame type");
+    }
+    auto responses = run_exchange({frame}, opcode, target, target_rank);
+    return std::move(responses.front());
+}
+
+std::vector<uint8_t> MpiGroupMailboxChannel::exchange_group_task(
+    const std::vector<uint8_t> &frame, int32_t target_rank, uint64_t task_slot, int32_t group_size
+) {
+    if (group_size != world_size_) {
+        // Existing submit_next_level_group permits subsets. Keep that behavior
+        // as ordered rank-targeted requests; only a full MPI group is batched
+        // into one PER_RANK mailbox envelope.
+        return exchange(frame, target_rank);
+    }
+    if (target_rank < 0 || target_rank >= world_size_) {
+        throw std::invalid_argument("MpiGroupMailboxChannel: group task target rank is outside the group");
+    }
+
+    const Deadline deadline = deadline_from_now(runtime_timeout_s_);
+    bool leader = false;
+    std::vector<std::vector<uint8_t>> frames;
+    {
+        std::unique_lock<std::mutex> lock(group_mu_);
+        while (group_active_ && group_task_slot_ != task_slot) {
+            if (group_cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+                lock.unlock();
+                mark_terminal("MPI group task batching timed out waiting for the prior task");
+                kill_mpirun_group();
+                throw std::runtime_error("MpiGroupMailboxChannel: group task batching timed out");
+            }
+        }
+        if (!group_active_) {
+            group_active_ = true;
+            group_done_ = false;
+            group_task_slot_ = task_slot;
+            group_arrived_ = 0;
+            group_departed_ = 0;
+            group_frames_.assign(static_cast<size_t>(world_size_), {});
+            group_replies_.clear();
+            group_error_ = nullptr;
+        }
+        auto &rank_frame = group_frames_[static_cast<size_t>(target_rank)];
+        if (!rank_frame.empty()) {
+            throw std::runtime_error("MpiGroupMailboxChannel: duplicate rank in one MPI group task");
+        }
+        rank_frame = frame;
+        ++group_arrived_;
+        if (group_arrived_ == world_size_) {
+            leader = true;
+            frames = group_frames_;
+        } else {
+            while (!group_done_) {
+                if (group_cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+                    group_error_ = std::make_exception_ptr(std::runtime_error("MPI group task batching timed out"));
+                    group_done_ = true;
+                    ++group_departed_;
+                    lock.unlock();
+                    mark_terminal("MPI group task batching timed out waiting for all rank payloads");
+                    kill_mpirun_group();
+                    group_cv_.notify_all();
+                    throw std::runtime_error("MpiGroupMailboxChannel: group task batching timed out");
+                }
+            }
+        }
+    }
+
+    if (leader) {
+        try {
+            std::lock_guard<std::mutex> lane_lock(lane_mu_);
+            auto replies =
+                run_exchange(frames, mpi_group_mailbox::Opcode::TASK, mpi_group_mailbox::Target::PER_RANK, -1);
+            std::lock_guard<std::mutex> group_lock(group_mu_);
+            group_replies_ = std::move(replies);
+            group_done_ = true;
+        } catch (...) {
+            std::lock_guard<std::mutex> group_lock(group_mu_);
+            group_error_ = std::current_exception();
+            group_done_ = true;
+        }
+        group_cv_.notify_all();
+    }
+
+    std::unique_lock<std::mutex> lock(group_mu_);
+    while (!group_done_) {
+        if (group_cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+            group_error_ = std::make_exception_ptr(std::runtime_error("MPI group task dispatch timed out"));
+            group_done_ = true;
+            ++group_departed_;
+            lock.unlock();
+            mark_terminal("MPI group task dispatch timed out");
+            kill_mpirun_group();
+            group_cv_.notify_all();
+            throw std::runtime_error("MpiGroupMailboxChannel: group task dispatch timed out");
+        }
+    }
+    std::exception_ptr error = group_error_;
+    std::vector<uint8_t> reply;
+    if (error == nullptr) {
+        if (group_replies_.size() != static_cast<size_t>(world_size_)) {
+            error = std::make_exception_ptr(
+                std::runtime_error("MpiGroupMailboxChannel: MPI group task reply count mismatch")
+            );
+        } else {
+            reply = group_replies_[static_cast<size_t>(target_rank)];
+        }
+    }
+    ++group_departed_;
+    if (group_departed_ == world_size_) {
+        group_active_ = false;
+        group_done_ = false;
+        group_frames_.clear();
+        group_replies_.clear();
+        group_error_ = nullptr;
+        group_cv_.notify_all();
+    }
+    lock.unlock();
+    if (error != nullptr) std::rethrow_exception(error);
+    return reply;
+}
+
+void MpiGroupMailboxChannel::shutdown(const std::vector<uint8_t> &frame) {
+    std::lock_guard<std::mutex> lock(lane_mu_);
+    if (shutdown_sent_ || terminal()) return;
+    shutdown_sent_ = true;
+    (void)run_exchange({frame}, mpi_group_mailbox::Opcode::SHUTDOWN, mpi_group_mailbox::Target::GROUP, -1);
+}
+
+MpiGroupMailboxTransport::MpiGroupMailboxTransport(
+    std::shared_ptr<MpiGroupMailboxChannel> channel, int32_t target_rank
+) :
+    channel_(std::move(channel)),
+    target_rank_(target_rank) {
+    if (!channel_) throw std::invalid_argument("MpiGroupMailboxTransport: null channel");
+    if (target_rank_ < 0) throw std::invalid_argument("MpiGroupMailboxTransport: target rank must be non-negative");
+}
+
+void MpiGroupMailboxTransport::submit_frame(const std::vector<uint8_t> &frame) {
+    if (pending_) throw std::runtime_error("MpiGroupMailboxTransport: a request is already pending");
+    pending_frame_ = frame;
+    pending_ = true;
+}
+
+std::vector<uint8_t> MpiGroupMailboxTransport::wait_for_reply(remote_l3::FrameType frame_type, uint64_t sequence) {
+    if (!pending_) throw std::runtime_error("MpiGroupMailboxTransport: no request is pending");
+    auto frame = std::move(pending_frame_);
+    pending_frame_.clear();
+    pending_ = false;
+    auto reply = channel_->exchange(frame, target_rank_);
+    auto decoded = remote_l3::decode_frame(reply);
+    if (decoded.header.frame_type != frame_type || decoded.header.sequence != sequence) {
+        throw std::runtime_error("MpiGroupMailboxTransport: reply frame type or sequence mismatch");
+    }
+    return reply;
+}
+
+std::vector<uint8_t> MpiGroupMailboxTransport::exchange_group_task(
+    const std::vector<uint8_t> &frame, uint64_t task_slot, int32_t, int32_t group_size
+) {
+    const auto request = remote_l3::decode_frame(frame);
+    auto reply = channel_->exchange_group_task(frame, target_rank_, task_slot, group_size);
+    const auto decoded = remote_l3::decode_frame(reply);
+    if (decoded.header.frame_type != remote_l3::FrameType::COMPLETION ||
+        decoded.header.sequence != request.header.sequence) {
+        throw std::runtime_error("MpiGroupMailboxTransport: group task reply frame type or sequence mismatch");
+    }
+    return reply;
+}
+
+void MpiGroupMailboxTransport::shutdown() {
+    if (!pending_) return;
+    auto frame = std::move(pending_frame_);
+    pending_frame_.clear();
+    pending_ = false;
+    channel_->shutdown(frame);
+}
+
 RemoteL3Endpoint::RemoteL3Endpoint(
-    int32_t worker_id, uint64_t session_id, std::string transport_name, std::unique_ptr<RemoteL3Transport> transport
+    int32_t worker_id, uint64_t session_id, std::string transport_name, std::unique_ptr<RemoteL3Transport> transport,
+    WorkerEndpointKind endpoint_kind
 ) :
     session_id_(session_id),
     transport_(std::move(transport)) {
     if (worker_id < 0) throw std::invalid_argument("RemoteL3Endpoint: worker_id must be non-negative");
     if (session_id == 0) throw std::invalid_argument("RemoteL3Endpoint: session_id must be non-zero");
     if (!transport_) throw std::invalid_argument("RemoteL3Endpoint: null transport");
-    caps_.kind = WorkerEndpointKind::REMOTE_L3;
+    caps_.kind = endpoint_kind;
     caps_.worker_id = worker_id;
     caps_.remote = true;
     caps_.supports_task_dispatch = true;
     caps_.supports_control = true;
     caps_.transport = std::move(transport_name);
 }
+
+MpiGroupMailboxEndpoint::MpiGroupMailboxEndpoint(
+    int32_t worker_id, uint64_t session_id, int32_t rank, std::shared_ptr<MpiGroupMailboxChannel> channel
+) :
+    RemoteL3Endpoint(
+        worker_id, session_id, "mpi-group-mailbox",
+        std::make_unique<MpiGroupMailboxTransport>(std::move(channel), rank), WorkerEndpointKind::MPI_GROUP_MAILBOX
+    ) {}
 
 remote_l3::TaskPayloadWire RemoteL3Endpoint::build_task_payload(const TaskSlotState &slot, int32_t group_index) const {
     remote_l3::TaskPayloadWire payload;
@@ -683,9 +1111,16 @@ WorkerCompletion RemoteL3Endpoint::run(Ring *ring, const WorkerDispatch &dispatc
         header.session_id = session_id_;
         header.worker_id = caps_.worker_id;
         header.sequence = sequence;
-        transport_->submit_frame(remote_l3::encode_frame(header, payload));
-
-        auto reply_bytes = transport_->wait_for_reply(remote_l3::FrameType::COMPLETION, sequence);
+        auto frame = remote_l3::encode_frame(header, payload);
+        std::vector<uint8_t> reply_bytes;
+        if (slot.is_group() && transport_->supports_group_batch()) {
+            reply_bytes = transport_->exchange_group_task(
+                frame, static_cast<uint64_t>(dispatch.task_slot), dispatch.group_index, slot.group_size()
+            );
+        } else {
+            transport_->submit_frame(frame);
+            reply_bytes = transport_->wait_for_reply(remote_l3::FrameType::COMPLETION, sequence);
+        }
         auto reply = remote_l3::decode_frame(reply_bytes);
         if (reply.header.frame_type != remote_l3::FrameType::COMPLETION) {
             throw std::runtime_error("RemoteL3Endpoint::run: expected COMPLETION reply");

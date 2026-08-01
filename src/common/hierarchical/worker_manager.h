@@ -195,6 +195,7 @@ struct WorkerDispatch;
 enum class WorkerEndpointKind : int32_t {
     LOCAL_MAILBOX = 0,
     REMOTE_L3 = 1,
+    MPI_GROUP_MAILBOX = 2,
 };
 
 struct WorkerEndpointCaps {

@@ -268,7 +268,7 @@ def test_run_session_bounds_command_accept_by_startup_deadline_not_session_timeo
     monkeypatch.setattr(remote_l3_session, "Worker", FakeWorker)
     monkeypatch.setattr(remote_l3_session, "_install_manifest_dispatcher_registry", lambda manifest: {})
     monkeypatch.setattr(remote_l3_session, "_install_manifest_inner_registry", lambda manifest, worker: {})
-    monkeypatch.setattr(remote_l3_session, "_bind_listener", lambda host: sockets.pop(0))
+    monkeypatch.setattr(remote_l3_session, "_bind_listener", lambda _host, _port=0: sockets.pop(0))
     monkeypatch.setattr(remote_l3_session, "_health_loop", lambda *args: None)
 
     try:
@@ -343,7 +343,7 @@ def test_run_session_forces_command_conn_blocking_for_idle(monkeypatch):
     monkeypatch.setattr(remote_l3_session, "Worker", FakeWorker)
     monkeypatch.setattr(remote_l3_session, "_install_manifest_dispatcher_registry", lambda manifest: {})
     monkeypatch.setattr(remote_l3_session, "_install_manifest_inner_registry", lambda manifest, worker: {})
-    monkeypatch.setattr(remote_l3_session, "_bind_listener", lambda host: sockets.pop(0))
+    monkeypatch.setattr(remote_l3_session, "_bind_listener", lambda _host, _port=0: sockets.pop(0))
     monkeypatch.setattr(remote_l3_session, "_health_loop", lambda *args: None)
     monkeypatch.setattr(remote_l3_session, "_run_command_loop", lambda *args, **kwargs: None)
 
@@ -403,7 +403,7 @@ def test_run_session_bounds_subtree_by_startup_remaining_not_session_timeout(mon
     monkeypatch.setattr(remote_l3_session, "Worker", FakeWorker)
     monkeypatch.setattr(remote_l3_session, "_install_manifest_dispatcher_registry", lambda manifest: {})
     monkeypatch.setattr(remote_l3_session, "_install_manifest_inner_registry", lambda manifest, worker: {})
-    monkeypatch.setattr(remote_l3_session, "_bind_listener", lambda host: sockets.pop(0))
+    monkeypatch.setattr(remote_l3_session, "_bind_listener", lambda _host, _port=0: sockets.pop(0))
     monkeypatch.setattr(remote_l3_session, "_health_loop", lambda *args: None)
 
     try:
@@ -464,7 +464,7 @@ def test_run_session_builds_deadline_before_registry_install(monkeypatch):
     monkeypatch.setattr(remote_l3_session, "Worker", FakeWorker)
     monkeypatch.setattr(remote_l3_session, "_install_manifest_dispatcher_registry", slow_dispatch_registry)
     monkeypatch.setattr(remote_l3_session, "_install_manifest_inner_registry", lambda manifest, worker: {})
-    monkeypatch.setattr(remote_l3_session, "_bind_listener", lambda host: sockets.pop(0))
+    monkeypatch.setattr(remote_l3_session, "_bind_listener", lambda _host, _port=0: sockets.pop(0))
     monkeypatch.setattr(remote_l3_session, "_health_loop", lambda *args: None)
 
     try:
@@ -524,7 +524,7 @@ def test_run_session_uses_daemon_absolute_deadline_verbatim(monkeypatch):
     monkeypatch.setattr(remote_l3_session, "Worker", FakeWorker)
     monkeypatch.setattr(remote_l3_session, "_install_manifest_dispatcher_registry", slow_dispatch_registry)
     monkeypatch.setattr(remote_l3_session, "_install_manifest_inner_registry", lambda manifest, worker: {})
-    monkeypatch.setattr(remote_l3_session, "_bind_listener", lambda host: sockets.pop(0))
+    monkeypatch.setattr(remote_l3_session, "_bind_listener", lambda _host, _port=0: sockets.pop(0))
     monkeypatch.setattr(remote_l3_session, "_health_loop", lambda *args: None)
 
     try:

@@ -93,6 +93,26 @@ void Worker::add_remote_l3_socket(
     );
 }
 
+void Worker::add_mpi_group_mailbox(
+    const std::vector<int32_t> &worker_ids, const std::vector<uint64_t> &session_ids, void *mailbox,
+    size_t mailbox_bytes, int mpirun_pid, double runtime_timeout_s
+) {
+    if (initialized_) throw std::runtime_error("Worker: add_mpi_group_mailbox after init");
+    if (worker_ids.empty() || worker_ids.size() != session_ids.size()) {
+        throw std::invalid_argument("Worker: MPI group worker_ids and session_ids must have the same non-zero size");
+    }
+    auto channel = std::make_shared<MpiGroupMailboxChannel>(
+        mailbox, mailbox_bytes, static_cast<int32_t>(worker_ids.size()), mpirun_pid, runtime_timeout_s
+    );
+    for (size_t rank = 0; rank < worker_ids.size(); ++rank) {
+        manager_.add_next_level_endpoint(
+            std::make_unique<MpiGroupMailboxEndpoint>(
+                worker_ids[rank], session_ids[rank], static_cast<int32_t>(rank), channel
+            )
+        );
+    }
+}
+
 void Worker::init() {
     if (initialized_) throw std::runtime_error("Worker: already initialized");
 

@@ -92,8 +92,8 @@ It is updated as each documented feature is completed and verified.
   descriptors are collected by L3, assembled by L4, returned to every L3/L2
   for import, and released after the L4 DAG drain by default. Domains created
   with `retain_after_run=True` remain live for a later run until explicitly
-  released or the Worker closes. Sim shm and A3 Fabric V2 use the same
-  descriptor ABI.
+  released or the Worker closes. The sim shm and `a3-fabric-v1` profiles use
+  the same descriptor ABI.
 - Added startup-manifest delivery for pre-registered inner `CHIP_CALLABLE`
   payloads, allowing remote sessions to resolve installed chip callables
   before task dispatch.

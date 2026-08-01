@@ -1105,8 +1105,8 @@ class GlobalCommDomainHandle:
     def release(self) -> None:
         if self._released:
             return
-        self._release_fn(self)
         self._released = True
+        self._release_fn(self)
 
     def __enter__(self) -> GlobalCommDomainHandle:
         return self

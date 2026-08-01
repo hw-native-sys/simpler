@@ -9,6 +9,7 @@ Detailed protocol, buffer, transport, and rollout notes live in:
 
 - [protocol.md](remote-l3-worker-design/protocol.md)
 - [buffers-and-transports.md](remote-l3-worker-design/buffers-and-transports.md)
+- [MPI L3 group mailbox](mpi-l3-mailbox.md)
 - [implementation-plan.md](remote-l3-worker-design/implementation-plan.md)
 - [pr-split-and-audit-plan.md][split-audit-plan]
 
@@ -63,6 +64,10 @@ Implemented:
 - Socket-backed simulation remote sessions via `simpler-remote-worker` and
   `simpler-remote-l3-session`, including `HELLO READY`, TASK/COMPLETION,
   CONTROL/CONTROL_REPLY, SHUTDOWN, and an independent health lane.
+- MPI L3 groups use one rank-0 named shared-memory mailbox plus ordered MPI
+  collectives for task, control, health, Global CommDomain, error, and shutdown
+  handling. They do not create Simpler command or health TCP sockets; ordinary
+  non-MPI Remote L3 sessions retain the socket transport.
 - Simulation remote buffer allocation, copy, export, import, release-import,
   imported-handle scheduling eligibility, and deferred owner free.
 - Registry-scope-aware remote callable manifest/control install for dispatcher

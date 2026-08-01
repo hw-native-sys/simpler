@@ -25,6 +25,7 @@ from simpler.global_comm_domain import (
     CTRL_GLOBAL_DOMAIN_PREPARE,
     CTRL_GLOBAL_DOMAIN_RELEASE,
     GLOBAL_DOMAIN_DESCRIPTOR_BYTES,
+    GLOBAL_DOMAIN_MAX_BUFFERS,
     GLOBAL_DOMAIN_PROFILE_IDS,
     GLOBAL_DOMAIN_VERSION,
     GlobalCommInitCommand,
@@ -174,6 +175,22 @@ def test_global_domain_wire_round_trips_topology_and_descriptor_table():
     assert GLOBAL_DOMAIN_DESCRIPTOR_BYTES == 288
 
 
+def test_global_domain_encode_rejects_too_many_buffers():
+    command = GlobalDomainCommand(
+        phase=GlobalDomainPhase.PREPARE_EXPORT,
+        domain_id=11,
+        generation=1,
+        name="tp",
+        profile="sim",
+        window_size=GLOBAL_DOMAIN_MAX_BUFFERS + 1,
+        members=_members(),
+        buffers=tuple(GlobalDomainBuffer(f"payload-{index}", 1) for index in range(GLOBAL_DOMAIN_MAX_BUFFERS + 1)),
+    )
+
+    with pytest.raises(ValueError, match="buffer count exceeds maximum"):
+        encode_domain_command(command)
+
+
 def test_global_domain_node_import_records_window_and_buffer_extents():
     from simpler.global_comm_domain import LOCAL_DOMAIN_MAGIC, LOCAL_IMPORT_REPLY  # noqa: PLC0415
     from simpler.worker import Worker, _GlobalNodeDomainState  # noqa: PLC0415
@@ -286,8 +303,6 @@ def _mpi_static_worker():
         MpiL3GroupSpec(
             hosts=("127.0.0.1", "127.0.0.1"),
             platform="a2a3sim",
-            command_port_base=21073,
-            health_port_base=22073,
             device_ids_by_rank=((0,), (0,)),
             comm_profile="sim",
             global_device_ranks_by_rank=((0,), (1,)),
@@ -396,9 +411,15 @@ def test_mpirun_group_global_domain_uses_mpi_prepare_commit_without_l4_import(mo
         assert handle.members[1].global_device_rank == 1
         counts = Counter(phase for phase, _worker_id in calls)
         assert counts["COMM_INIT"] == 2
-        assert counts[GlobalDomainPhase.PREPARE_EXPORT] == 2
-        assert counts[GlobalDomainPhase.COMMIT] == 2
+        assert counts[GlobalDomainPhase.PREPARE_EXPORT] == 1
+        assert counts[GlobalDomainPhase.COMMIT] == 1
         assert counts[GlobalDomainPhase.IMPORT] == 0
+        group_phases = [
+            worker_id
+            for phase, worker_id in calls
+            if phase in (GlobalDomainPhase.PREPARE_EXPORT, GlobalDomainPhase.COMMIT)
+        ]
+        assert group_phases == [node_ids[0], node_ids[0]]
         assert worker._live_global_domains["mpi-static"] is handle
         assert resources.live_global_domains["mpi-static"] is handle
     finally:
@@ -527,7 +548,7 @@ def test_global_domain_descriptor_table_rejects_different_mapping_sizes():
         validate_descriptor_table(tuple(descriptors), rank_count=2, profile="sim")
 
 
-def test_global_domain_release_retries_after_callback_failure():
+def test_global_domain_release_stays_released_after_callback_failure():
     from simpler.task_interface import GlobalCommDomainHandle  # noqa: PLC0415
 
     attempts = 0
@@ -535,8 +556,7 @@ def test_global_domain_release_retries_after_callback_failure():
     def release_fn(_handle):
         nonlocal attempts
         attempts += 1
-        if attempts == 1:
-            raise RuntimeError("transient release failure")
+        raise RuntimeError("release failure")
 
     handle = GlobalCommDomainHandle(
         name="retry",
@@ -549,13 +569,12 @@ def test_global_domain_release_retries_after_callback_failure():
         _release_fn=release_fn,
     )
 
-    with pytest.raises(RuntimeError, match="transient release failure"):
+    with pytest.raises(RuntimeError, match="release failure"):
         handle.release()
 
-    assert not handle.released
-    handle.release()
     assert handle.released
-    assert attempts == 2
+    handle.release()
+    assert attempts == 1
 
 
 def test_global_domain_handle_repr_reports_lifecycle_state():
@@ -579,61 +598,45 @@ def test_global_domain_handle_repr_reports_lifecycle_state():
     assert repr(handle) == "GlobalCommDomainHandle(name='repr', members=0, freed)"
 
 
-def test_mpi_global_domain_collective_timeout_releases_local_state(monkeypatch):
+def test_mpi_global_domain_collective_uses_pickle_allgather():
     from simpler.mpi_l3_session import MpiGlobalDomainExchange  # noqa: PLC0415
 
-    class _PendingRequest:
-        @staticmethod
-        def test():
-            return False, None
-
     class _Comm:
-        aborted = False
+        payloads = []
 
         @staticmethod
         def Get_rank():
             return 0
 
-        @staticmethod
-        def iallgather(_payload):
-            return _PendingRequest()
+        def allgather(self, payload):
+            self.payloads.append(payload)
+            return [payload, b"peer"]
 
-        def Abort(self, _error_code):
-            self.aborted = True
-            raise RuntimeError("fake MPI abort")
-
-    now = iter((0.0, 2.0))
-    monkeypatch.setattr("simpler.mpi_l3_session.time.monotonic", lambda: next(now))
     comm = _Comm()
     exchange = MpiGlobalDomainExchange(comm, group_worker_ids=(7,), timeout_s=1.0)
-    releases = []
 
-    with pytest.raises(TimeoutError, match="prepare timed out"):
-        exchange._allgather(b"payload", operation="prepare", on_timeout=lambda: releases.append(True))
+    gathered = exchange._allgather(
+        b"payload",
+        operation="prepare",
+        on_timeout=lambda: pytest.fail("blocking allgather must use the outer group watchdog"),
+    )
 
-    assert releases == [True]
-    assert comm.aborted
+    assert gathered == [b"payload", b"peer"]
+    assert comm.payloads == [b"payload"]
 
 
 def test_mpi_global_domain_prepare_failure_releases_before_collective():
     from simpler.mpi_l3_session import MpiGlobalDomainExchange  # noqa: PLC0415
     from simpler.worker import Worker  # noqa: PLC0415
 
-    class _CompletedRequest:
-        def __init__(self, payload):
-            self._payload = payload
-
-        def test(self):
-            return True, [self._payload]
-
     class _Comm:
         @staticmethod
         def Get_rank():
             return 0
 
         @staticmethod
-        def iallgather(payload):
-            return _CompletedRequest(payload)
+        def allgather(payload):
+            return [payload]
 
     class _InnerWorker:
         released = False

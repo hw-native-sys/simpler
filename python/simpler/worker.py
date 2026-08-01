@@ -516,18 +516,25 @@ class RemoteWorkerSpec:
 
 @dataclass(frozen=True)
 class MpiL3GroupSpec:
-    """Describes a group of L3 workers launched by one parent-owned ``mpirun``."""
+    """Describes L3 workers launched by one parent-owned ``mpirun``.
+
+    ``command_port_base``, ``health_port_base``, ``session_listen_hosts``,
+    ``connect_hosts``, ``allow_wildcard_session_bind``, ``ready_host``, and
+    ``ready_port`` are accepted only for source compatibility with PR #1623.
+    MPI groups ignore them and use the local named mailbox plus MPI collectives.
+    Non-MPI ``RemoteWorkerSpec`` continues to use its TCP fields.
+    """
 
     hosts: tuple[str, ...]
     platform: str
-    command_port_base: int
-    health_port_base: int
     device_ids_by_rank: tuple[tuple[int, ...], ...]
     runtime: str = "tensormap_and_ringbuffer"
     num_sub_workers_by_rank: tuple[int, ...] = ()
     transport: str = "sim"
     comm_profile: str = "sim"
     global_device_ranks_by_rank: tuple[tuple[int, ...], ...] = ()
+    command_port_base: int | None = None
+    health_port_base: int | None = None
     session_listen_hosts: tuple[str, ...] = ()
     connect_hosts: tuple[str, ...] = ()
     allow_wildcard_session_bind: bool = False
@@ -573,28 +580,25 @@ class MpiL3GroupSpec:
                 )
             if any(rank < 0 for rank in global_ranks) or len(set(global_ranks)) != len(global_ranks):
                 raise ValueError("MpiL3GroupSpec.global_device_ranks_by_rank entries must be unique non-negative ranks")
-        session_listen_hosts = (
-            hosts if not self.session_listen_hosts else tuple(str(host) for host in self.session_listen_hosts)
-        )
-        connect_hosts = hosts if not self.connect_hosts else tuple(str(host) for host in self.connect_hosts)
-        if len(session_listen_hosts) != len(hosts):
+        session_listen_hosts = tuple(str(host) for host in self.session_listen_hosts)
+        connect_hosts = tuple(str(host) for host in self.connect_hosts)
+        if session_listen_hosts and len(session_listen_hosts) != len(hosts):
             raise ValueError("MpiL3GroupSpec.session_listen_hosts must match hosts length")
-        if len(connect_hosts) != len(hosts):
+        if connect_hosts and len(connect_hosts) != len(hosts):
             raise ValueError("MpiL3GroupSpec.connect_hosts must match hosts length")
         if any(not host for host in session_listen_hosts) or any(not host for host in connect_hosts):
             raise ValueError("MpiL3GroupSpec host fields must be non-empty")
-        command_port_base = int(self.command_port_base)
-        health_port_base = int(self.health_port_base)
-        last_command_port = command_port_base + len(hosts) - 1
-        last_health_port = health_port_base + len(hosts) - 1
-        if command_port_base <= 0 or health_port_base <= 0 or last_command_port > 65535 or last_health_port > 65535:
-            raise ValueError("MpiL3GroupSpec command/health port ranges must be within 1..65535")
+        command_port_base = None if self.command_port_base is None else int(self.command_port_base)
+        health_port_base = None if self.health_port_base is None else int(self.health_port_base)
+        for name, value in (("command_port_base", command_port_base), ("health_port_base", health_port_base)):
+            if value is not None and (value <= 0 or value + len(hosts) - 1 > 65535):
+                raise ValueError(f"MpiL3GroupSpec.{name} deprecated port range must be within 1..65535")
         ready_host = str(self.ready_host)
         ready_port = int(self.ready_port)
         if ready_port < 0 or ready_port > 65535:
             raise ValueError("MpiL3GroupSpec.ready_port must be within 0..65535")
         if self.transport != "sim":
-            raise ValueError("MpiL3GroupSpec.transport must be 'sim' for the TCP control plane")
+            raise ValueError("MpiL3GroupSpec.transport must be 'sim'")
         if self.comm_profile not in GLOBAL_DOMAIN_PROFILE_IDS:
             raise ValueError(f"MpiL3GroupSpec.comm_profile {self.comm_profile!r} is not supported")
         if self.comm_profile == "a3-fabric-v1" and not self.platform.startswith("a2a3"):
@@ -637,15 +641,23 @@ class _RemoteSession:
 
 
 @dataclass(frozen=True)
+class _MpiL3RankSpec:
+    platform: str
+    runtime: str
+    device_ids: tuple[int, ...]
+    num_sub_workers: int
+    transport: str
+    comm_profile: str
+    global_device_ranks: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class _MpiL3RankRuntime:
     group_id: str
     rank: int
     worker_id: int
-    spec: RemoteWorkerSpec
-    command_host: str
-    command_port: int
-    health_host: str
-    health_port: int
+    session_id: int
+    spec: _MpiL3RankSpec
 
 
 @dataclass
@@ -656,6 +668,9 @@ class _MpiL3GroupRuntime:
     process: subprocess.Popen[Any] | None = None
     manifest_path: str | None = None
     ready_dir: str | None = None
+    mailbox: Any | None = None
+    monitor_thread: threading.Thread | None = None
+    closing: bool = False
 
 
 @dataclass
@@ -3151,10 +3166,9 @@ class Worker:
     def add_mpirun_worker_group(self, spec: MpiL3GroupSpec) -> tuple[int, ...]:
         """Register L3 workers that will be launched by one parent-owned ``mpirun``.
 
-        The returned ids are ordinary NEXT_LEVEL worker ids for dispatch and
-        Global CommDomain membership. They must be used as a complete set for
-        the v1 MPI descriptor-exchange path; partial groups fall back to the
-        existing L4 descriptor broker.
+        A single named mailbox is created for the group during ``init()``.
+        The returned ids remain exact NEXT_LEVEL targets, but all of them route
+        through that group mailbox and the MPI collective dispatcher.
         """
         with self._hierarchical_start_cv:
             if self._lifecycle is not _Lifecycle.NEW:
@@ -3163,33 +3177,12 @@ class Worker:
                 raise TypeError("Worker.add_mpirun_worker_group: MPI L3 groups require a level >= 4 parent")
             if not isinstance(spec, MpiL3GroupSpec):
                 raise TypeError("Worker.add_mpirun_worker_group expects a MpiL3GroupSpec")
-            for host in spec.connect_hosts:
-                self._validate_numeric_endpoint_host(host)
-            if spec.ready_host:
-                self._validate_numeric_endpoint_host(spec.ready_host)
-            seen_listeners: set[tuple[str, int]] = set()
-            for rank, listen_host in enumerate(spec.session_listen_hosts):
-                if self._is_wildcard_session_host(listen_host):
-                    if not spec.allow_wildcard_session_bind:
-                        raise ValueError(
-                            "MpiL3GroupSpec wildcard session bind requires allow_wildcard_session_bind=True"
-                        )
-                else:
-                    self._validate_numeric_endpoint_host(listen_host)
-                for port in (spec.command_port_base + rank, spec.health_port_base + rank):
-                    key = (listen_host, int(port))
-                    if key in seen_listeners:
-                        raise ValueError("MpiL3GroupSpec command/health ports overlap on the same listen host")
-                    seen_listeners.add(key)
 
             group_id = uuid.uuid4().hex
             ranks: list[_MpiL3RankRuntime] = []
-            for rank, connect_host in enumerate(spec.connect_hosts):
+            for rank in range(len(spec.hosts)):
                 worker_id = self._allocate_next_level_worker_id()
-                command_port = spec.command_port_base + rank
-                health_port = spec.health_port_base + rank
-                rank_spec = RemoteWorkerSpec(
-                    endpoint=f"{connect_host}:{command_port}",
+                rank_spec = _MpiL3RankSpec(
                     platform=spec.platform,
                     runtime=spec.runtime,
                     device_ids=spec.device_ids_by_rank[rank],
@@ -3197,18 +3190,13 @@ class Worker:
                     transport=spec.transport,
                     comm_profile=spec.comm_profile,
                     global_device_ranks=spec.global_device_ranks_by_rank[rank],
-                    session_listen_host=spec.session_listen_hosts[rank],
-                    allow_wildcard_session_bind=spec.allow_wildcard_session_bind,
                 )
                 runtime = _MpiL3RankRuntime(
                     group_id=group_id,
                     rank=rank,
                     worker_id=worker_id,
+                    session_id=self._new_remote_session_id(),
                     spec=rank_spec,
-                    command_host=connect_host,
-                    command_port=command_port,
-                    health_host=connect_host,
-                    health_port=health_port,
                 )
                 ranks.append(runtime)
                 self._mpi_worker_ids.append(worker_id)
@@ -3358,7 +3346,7 @@ class Worker:
             )
         return entries
 
-    def _inner_registry_entries_for_spec(self, spec: RemoteWorkerSpec) -> list[dict[str, Any]]:
+    def _inner_registry_entries_for_spec(self, spec: RemoteWorkerSpec | _MpiL3RankSpec) -> list[dict[str, Any]]:
         from .remote_l3_protocol import (  # noqa: PLC0415
             ChipCallableBlobLocation,
             RemoteChipCallablePayload,
@@ -3561,6 +3549,37 @@ class Worker:
             "feature_flags": [],
         }
 
+    def _build_mpi_rank_manifest(
+        self,
+        *,
+        rank: _MpiL3RankRuntime,
+        startup_remaining_s: float,
+    ) -> dict[str, Any]:
+        spec = rank.spec
+        runtime = self._resolved_global_nodes()[int(rank.worker_id)]
+        return {
+            "session_id": int(rank.session_id),
+            "parent_worker_level": int(self.level),
+            "remote_worker_level": 3,
+            "worker_id": int(rank.worker_id),
+            "platform": spec.platform,
+            "runtime": spec.runtime,
+            "device_ids": list(spec.device_ids),
+            "num_sub_workers": int(spec.num_sub_workers),
+            "heap_ring_size": self._config.get("remote_heap_ring_size", None),
+            "transport": spec.transport,
+            "comm_profile": spec.comm_profile,
+            "cluster_id": self._global_cluster_id,
+            "node_rank": runtime.node_rank,
+            "node_count": runtime.node_count,
+            "global_device_ranks": list(runtime.global_device_ranks),
+            "session_timeout_s": self._remote_session_timeout_s(),
+            "startup_remaining_s": float(startup_remaining_s),
+            "remote_task_dispatcher": self._remote_dispatcher_entries_for_worker(rank.worker_id),
+            "inner_l3_worker": self._inner_registry_entries_for_spec(spec),
+            "feature_flags": ["mpi-group-mailbox-v1"],
+        }
+
     def _open_remote_session(
         self, *, spec: RemoteWorkerSpec, worker_id: int, session_id: int, deadline: float
     ) -> _RemoteSession:
@@ -3619,99 +3638,30 @@ class Worker:
         return any(arg in host_args or arg.startswith("--host=") or arg.startswith("--hostfile=") for arg in args)
 
     @staticmethod
-    def _mpi_ready_path(ready_dir: str, rank: int) -> str:
-        return os.path.join(ready_dir, f"rank-{int(rank)}.json")
-
-    def _wait_mpi_ready_files(self, group: _MpiL3GroupRuntime, deadline: float) -> dict[int, dict[str, Any]]:
-        if group.ready_dir is None:
-            raise RuntimeError("MPI L3 group has no ready directory")
-        pending = {rank.rank for rank in group.ranks}
-        ready: dict[int, dict[str, Any]] = {}
-        while pending:
-            if group.process is not None and group.process.poll() is not None:
-                raise RuntimeError(
-                    f"MPI L3 group {group.group_id} exited before ranks became ready "
-                    f"(status {group.process.returncode})"
-                )
-            for rank in list(pending):
-                path = self._mpi_ready_path(group.ready_dir, rank)
-                try:
-                    with open(path, encoding="utf-8") as f:
-                        payload = json.load(f)
-                except FileNotFoundError:
-                    continue
-                if not payload.get("ok", False):
-                    raise RuntimeError(f"MPI L3 rank {rank} startup failed: {payload.get('error')}")
-                ready[rank] = payload
-                pending.remove(rank)
-            if pending:
-                remaining = self._remaining_until(deadline, "MPI L3 group ready")
-                time.sleep(min(0.05, remaining))
-        return ready
-
-    @staticmethod
-    def _open_mpi_ready_listener(host: str, port: int) -> socket.socket:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind((host, int(port)))
-            sock.listen()
-            return sock
-        except BaseException:
-            sock.close()
-            raise
-
-    def _wait_mpi_ready_tcp(
-        self,
+    def _close_mpirun_group(  # noqa: PLR0912 -- cleanup reports every independent process/resource failure
         group: _MpiL3GroupRuntime,
-        ready_sock: socket.socket,
-        ready_token: str,
-        deadline: float,
-    ) -> dict[int, dict[str, Any]]:
-        pending = {rank.rank for rank in group.ranks}
-        ready: dict[int, dict[str, Any]] = {}
-        while pending:
-            if group.process is not None and group.process.poll() is not None:
-                raise RuntimeError(
-                    f"MPI L3 group {group.group_id} exited before ranks became ready "
-                    f"(status {group.process.returncode})"
-                )
-            ready_sock.settimeout(min(0.2, self._remaining_until(deadline, "MPI L3 TCP ready")))
-            try:
-                conn, _addr = ready_sock.accept()
-            except TimeoutError:
-                continue
-            except socket.timeout:
-                continue
-            with conn:
-                payload = self._recv_remote_daemon_json(conn, deadline)
-            rank_value = int(payload.get("mpi_rank", -1))
-            if payload.get("ready_token") != ready_token:
-                raise RuntimeError("MPI L3 rank published ready with an unexpected token")
-            if rank_value not in pending:
-                raise RuntimeError(f"MPI L3 rank published duplicate or unexpected ready rank={rank_value}")
-            if not payload.get("ok", False):
-                raise RuntimeError(f"MPI L3 rank {rank_value} startup failed: {payload.get('error')}")
-            ready[rank_value] = payload
-            pending.remove(rank_value)
-        return ready
-
-    @staticmethod
-    def _close_mpirun_group(group: _MpiL3GroupRuntime, *, timeout_s: float) -> list[str]:
+        *,
+        timeout_s: float,
+    ) -> list[str]:
         failures: list[str] = []
+        group.closing = True
         proc = group.process
         if proc is not None:
             try:
                 if proc.poll() is None:
                     try:
-                        proc.terminate()
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
                     except BaseException as exc:  # noqa: BLE001
                         failures.append(f"terminate: {exc}")
                 try:
                     proc.wait(timeout=timeout_s)
                 except subprocess.TimeoutExpired:
                     try:
-                        proc.kill()
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
                     except BaseException as exc:  # noqa: BLE001
                         failures.append(f"kill: {exc}")
                     try:
@@ -3722,6 +3672,16 @@ class Worker:
                     failures.append(f"wait after terminate: {exc}")
             finally:
                 group.process = None
+        if group.monitor_thread is not None:
+            group.monitor_thread.join(timeout=timeout_s)
+            group.monitor_thread = None
+        if group.mailbox is not None:
+            try:
+                group.mailbox.close(unlink=True)
+            except BaseException as exc:  # noqa: BLE001
+                failures.append(f"close mailbox: {exc}")
+            finally:
+                group.mailbox = None
         try:
             if group.ready_dir is not None:
                 shutil.rmtree(group.ready_dir)
@@ -3749,38 +3709,43 @@ class Worker:
             if not suppress_errors:
                 raise RuntimeError(failures[0])
 
+    @staticmethod
+    def _monitor_mpirun_group(group: _MpiL3GroupRuntime, proc: subprocess.Popen[Any]) -> None:
+        returncode = proc.wait()
+        if group.closing or group.mailbox is None:
+            return
+        with contextlib.suppress(BaseException):
+            group.mailbox.mark_terminal(f"mpirun exited unexpectedly with status {returncode}")
+
+    @staticmethod
+    def _mark_mpirun_groups_closing(groups: list[_MpiL3GroupRuntime]) -> None:
+        for group in groups:
+            group.closing = True
+
     def _activate_mpirun_worker_groups(self, deadline: float) -> None:
         if not self._mpi_l3_groups:
             return
+        from .mpi_group_mailbox import MAILBOX_SIZE as MPI_MAILBOX_SIZE  # noqa: PLC0415
+        from .mpi_group_mailbox import MailboxGroupState, MpiGroupMailbox  # noqa: PLC0415
+
         session_timeout = self._remote_session_timeout_s()
         assert self._worker is not None
         for group in self._mpi_l3_groups:
-            ready_dir = tempfile.mkdtemp(prefix="simpler-mpirun-ready-")
+            ready_dir = tempfile.mkdtemp(prefix="simpler-mpirun-manifest-")
             manifest_path = os.path.join(ready_dir, "group.json")
             group.ready_dir = ready_dir
             group.manifest_path = manifest_path
-            ready_sock: socket.socket | None = None
-            ready_token = uuid.uuid4().hex
-            ready_host = group.spec.ready_host
-            ready_port = 0
-            if ready_host:
-                ready_sock = self._open_mpi_ready_listener(ready_host, group.spec.ready_port)
-                ready_port = int(ready_sock.getsockname()[1])
+            mailbox = MpiGroupMailbox.create(world_size=len(group.ranks))
+            group.mailbox = mailbox
             rank_manifests: list[dict[str, Any]] = []
-            sessions: dict[int, _RemoteSession] = {}
             startup_remaining_s = self._remaining_until(deadline, "MPI L3 group manifest")
             for rank in group.ranks:
-                session_id = self._new_remote_session_id()
-                manifest = self._build_remote_manifest(
-                    spec=rank.spec,
-                    worker_id=rank.worker_id,
-                    session_id=session_id,
+                manifest = self._build_mpi_rank_manifest(
+                    rank=rank,
                     startup_remaining_s=startup_remaining_s,
                 )
                 manifest.update(
                     {
-                        "command_port": rank.command_port,
-                        "health_port": rank.health_port,
                         "mpi_group_id": group.group_id,
                         "mpi_rank": rank.rank,
                         "mpi_world_size": len(group.ranks),
@@ -3789,23 +3754,11 @@ class Worker:
                     }
                 )
                 rank_manifests.append(manifest)
-                sessions[rank.rank] = _RemoteSession(
-                    worker_id=rank.worker_id,
-                    session_id=session_id,
-                    command_host=rank.command_host,
-                    command_port=rank.command_port,
-                    health_host=rank.health_host,
-                    health_port=rank.health_port,
-                    pid=0,
-                )
             group_manifest = {
                 "group_id": group.group_id,
                 "world_size": len(group.ranks),
                 "worker_ids": [rank.worker_id for rank in group.ranks],
-                "ready_dir": ready_dir,
-                "ready_host": ready_host,
-                "ready_port": ready_port,
-                "ready_token": ready_token,
+                "mailbox": mailbox.manifest(),
                 "rank_manifests": rank_manifests,
             }
             with open(manifest_path, "w", encoding="utf-8") as f:
@@ -3825,33 +3778,31 @@ class Worker:
                     manifest_path,
                 ]
             )
-            group.process = subprocess.Popen(cmd)
-            try:
-                if ready_sock is None:
-                    ready = self._wait_mpi_ready_files(group, deadline)
-                else:
-                    ready = self._wait_mpi_ready_tcp(group, ready_sock, ready_token, deadline)
-            finally:
-                if ready_sock is not None:
-                    ready_sock.close()
-            for rank in group.ranks:
-                payload = ready[rank.rank]
-                if int(payload["command_port"]) != rank.command_port or int(payload["health_port"]) != rank.health_port:
-                    raise RuntimeError(f"MPI L3 rank {rank.rank} published unexpected command/health ports")
-                session = sessions[rank.rank]
-                self._remote_sessions.append(session)
-                remaining = self._remaining_until(deadline, "MPI L3 endpoint attach")
-                self._worker.add_remote_l3_socket(
-                    session.worker_id,
-                    session.session_id,
-                    rank.spec.comm_profile,
-                    str(payload.get("command_host", rank.command_host)),
-                    int(payload["command_port"]),
-                    str(payload.get("health_host", rank.health_host)),
-                    int(payload["health_port"]),
-                    remaining,
-                    session_timeout,
-                )
+            group.process = subprocess.Popen(cmd, start_new_session=True)
+            while mailbox.group_state is MailboxGroupState.INITIALIZING:
+                if group.process.poll() is not None:
+                    raise RuntimeError(
+                        f"MPI L3 group {group.group_id} exited before READY (status {group.process.returncode})"
+                    )
+                self._remaining_until(deadline, "MPI L3 mailbox READY")
+                time.sleep(_STARTUP_POLL_INTERVAL_S)
+            if mailbox.group_state is not MailboxGroupState.READY:
+                raise RuntimeError(f"MPI L3 group {group.group_id} failed before READY: {mailbox.terminal_reason()}")
+            self._worker.add_mpi_group_mailbox(
+                [rank.worker_id for rank in group.ranks],
+                [rank.session_id for rank in group.ranks],
+                mailbox.address,
+                MPI_MAILBOX_SIZE,
+                group.process.pid,
+                session_timeout,
+            )
+            group.monitor_thread = threading.Thread(
+                target=self._monitor_mpirun_group,
+                args=(group, group.process),
+                daemon=True,
+                name=f"simpler-mpirun-monitor-{group.group_id[:8]}",
+            )
+            group.monitor_thread.start()
         if time.monotonic() >= deadline:
             raise RuntimeError("MPI L3 activation: startup deadline exceeded after attach")
 
@@ -6085,6 +6036,7 @@ class Worker:
         remote_sessions = list(self._remote_sessions)
         if self._worker is not None:
             try:
+                self._mark_mpirun_groups_closing(self._mpi_l3_groups)
                 self._worker.close()
             except BaseException:  # noqa: BLE001
                 pass
@@ -7088,67 +7040,6 @@ class Worker:
             return self._local_global_domain_control(worker_id, control_name, payload)
         raise ValueError(f"Global CommDomain worker {worker_id} is not a registered L3 worker")
 
-    def _global_domain_control_many(
-        self,
-        worker_ids: tuple[int, ...],
-        control_name: int,
-        payload: bytes,
-        *,
-        mpi_group: _MpiL3GroupRuntime,
-    ) -> dict[int, bytes]:
-        replies: dict[int, bytes] = {}
-        errors: list[tuple[int, BaseException]] = []
-        completed = threading.Condition()
-
-        def _send(worker_id: int) -> None:
-            try:
-                reply = self._global_domain_control(worker_id, control_name, payload)
-            except BaseException as exc:  # noqa: BLE001
-                with completed:
-                    errors.append((worker_id, exc))
-                    completed.notify_all()
-                return
-            with completed:
-                replies[worker_id] = reply
-                completed.notify_all()
-
-        threads = [
-            (int(worker_id), threading.Thread(target=_send, args=(int(worker_id),), daemon=True))
-            for worker_id in worker_ids
-        ]
-        for _worker_id, thread in threads:
-            thread.start()
-        deadline = time.monotonic() + self._py_control_timeout_s
-        with completed:
-            while len(replies) + len(errors) < len(worker_ids) and not errors:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                completed.wait(timeout=remaining)
-
-        pending = [worker_id for worker_id, thread in threads if thread.is_alive()]
-        if pending:
-            cleanup_failures = self._close_mpirun_group(
-                mpi_group,
-                timeout_s=min(1.0, self._py_control_timeout_s),
-            )
-            if cleanup_failures:
-                sys.stderr.write(
-                    "\n".join(f"[worker pid={os.getpid()}] WARN: {failure}" for failure in cleanup_failures) + "\n"
-                )
-                sys.stderr.flush()
-            for _worker_id, thread in threads:
-                thread.join(timeout=1.0)
-        if errors:
-            worker_id, exc = errors[0]
-            raise RuntimeError(f"Global CommDomain control fanout failed on worker {worker_id}: {exc}") from exc
-        if pending:
-            raise TimeoutError(f"Global CommDomain control fanout timed out on workers {pending}")
-        missing = sorted(set(worker_ids) - replies.keys())
-        if missing:
-            raise RuntimeError(f"Global CommDomain control fanout returned no reply for workers {missing}")
-        return replies
-
     def _mpi_group_for_involved_nodes(self, involved_nodes: tuple[int, ...]) -> _MpiL3GroupRuntime | None:
         involved = set(int(worker_id) for worker_id in involved_nodes)
         for group in self._mpi_l3_groups:
@@ -7157,23 +7048,17 @@ class Worker:
                 return group
         return None
 
-    @staticmethod
-    def _descriptor_table_from_mpi_replies(
-        replies: dict[int, bytes],
-        *,
-        rank_count: int,
-        profile: str,
-    ) -> tuple[GlobalDomainDescriptor, ...]:
-        tables = tuple(decode_descriptor_table(payload) for payload in replies.values())
-        if not tables:
-            raise RuntimeError("MPI Global CommDomain prepare returned no descriptor tables")
-        first = tables[0]
-        validate_descriptor_table(first, rank_count=rank_count, profile=profile)
-        for table in tables[1:]:
-            validate_descriptor_table(table, rank_count=rank_count, profile=profile)
-            if table != first:
-                raise RuntimeError("MPI Global CommDomain prepare returned inconsistent descriptor tables")
-        return first
+    def _mpi_group_control(
+        self,
+        group: _MpiL3GroupRuntime,
+        control_name: int,
+        payload: bytes,
+    ) -> bytes:
+        if not group.ranks:
+            raise RuntimeError(f"MPI L3 group {group.group_id} has no ranks")
+        # One L4 request enters the rank-0 mailbox. The endpoint marks group-wide
+        # controls as GROUP, so every MPI rank receives the same envelope.
+        return self._global_domain_control(group.ranks[0].worker_id, control_name, payload)
 
     def _allocate_global_domain(  # noqa: PLR0912 -- transaction validation and prepare/import/commit rollback stay ordered
         self,
@@ -7274,6 +7159,7 @@ class Worker:
         )
 
         prepared_nodes: list[int] = []
+        mpi_group: _MpiL3GroupRuntime | None = None
         try:
             for node_worker_id in involved_nodes:
                 node = nodes[node_worker_id]
@@ -7299,17 +7185,12 @@ class Worker:
             mpi_group = self._mpi_group_for_involved_nodes(involved_nodes)
             if mpi_group is not None:
                 prepared_nodes.extend(involved_nodes)
-                replies = self._global_domain_control_many(
-                    involved_nodes,
+                reply = self._mpi_group_control(
+                    mpi_group,
                     ControlName.ALLOC_DOMAIN,
                     encode_domain_command(base_command),
-                    mpi_group=mpi_group,
                 )
-                descriptors = self._descriptor_table_from_mpi_replies(
-                    replies,
-                    rank_count=len(domain_members_tuple),
-                    profile=profile,
-                )
+                descriptors = decode_descriptor_table(reply)
             else:
                 descriptor_by_rank: dict[int, GlobalDomainDescriptor] = {}
                 for node_worker_id in involved_nodes:
@@ -7340,11 +7221,10 @@ class Worker:
                 descriptors=descriptors,
             )
             if mpi_group is not None:
-                self._global_domain_control_many(
-                    involved_nodes,
+                self._mpi_group_control(
+                    mpi_group,
                     ControlName.ALLOC_DOMAIN,
                     encode_domain_command(commit_command),
-                    mpi_group=mpi_group,
                 )
             else:
                 import_command = GlobalDomainCommand(
@@ -7381,13 +7261,21 @@ class Worker:
                 members=domain_members_tuple,
                 buffers=global_buffers,
             )
-            for node_worker_id in prepared_nodes:
+            if mpi_group is not None and prepared_nodes:
                 with contextlib.suppress(BaseException):
-                    self._global_domain_control(
-                        node_worker_id,
+                    self._mpi_group_control(
+                        mpi_group,
                         ControlName.ALLOC_DOMAIN,
                         encode_domain_command(abort_command),
                     )
+            else:
+                for node_worker_id in prepared_nodes:
+                    with contextlib.suppress(BaseException):
+                        self._global_domain_control(
+                            node_worker_id,
+                            ControlName.ALLOC_DOMAIN,
+                            encode_domain_command(abort_command),
+                        )
             raise
 
         handle = GlobalCommDomainHandle(
@@ -7451,11 +7339,19 @@ class Worker:
 
         command = encode_release_command(GlobalDomainReleaseCommand(handle.domain_id, handle.generation))
         errors: list[BaseException] = []
-        for node_worker_id in dict.fromkeys(member.node_worker_id for member in handle.members):
+        involved_nodes = tuple(dict.fromkeys(member.node_worker_id for member in handle.members))
+        mpi_group = self._mpi_group_for_involved_nodes(involved_nodes)
+        if mpi_group is not None:
             try:
-                self._global_domain_control(node_worker_id, ControlName.RELEASE_DOMAIN, command)
+                self._mpi_group_control(mpi_group, ControlName.RELEASE_DOMAIN, command)
             except BaseException as exc:  # noqa: BLE001
                 errors.append(exc)
+        else:
+            for node_worker_id in involved_nodes:
+                try:
+                    self._global_domain_control(node_worker_id, ControlName.RELEASE_DOMAIN, command)
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
         if errors:
             raise RuntimeError(f"Global CommDomain release failed: {errors[0]}") from errors[0]
         if self._live_global_domains.get(handle.name) is handle:
@@ -8781,6 +8677,7 @@ class Worker:
 
             def _close_worker() -> None:
                 if self._worker:
+                    self._mark_mpirun_groups_closing(self._mpi_l3_groups)
                     self._worker.close()
                     self._worker = None
                     self._orch = None
