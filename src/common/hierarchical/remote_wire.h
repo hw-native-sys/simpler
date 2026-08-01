@@ -63,7 +63,11 @@ enum class ControlName : uint32_t {
     COMM_INIT = 13,
     ALLOC_DOMAIN = 14,
     RELEASE_DOMAIN = 15,
+    COPY_TO_DOMAIN = 16,
+    COPY_FROM_DOMAIN = 17,
 };
+
+bool valid_control_name(uint32_t value);
 
 enum class ReadyState : uint32_t {
     NOT_READY = 0,

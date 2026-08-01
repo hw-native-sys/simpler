@@ -26,6 +26,11 @@ import threading
 import time
 from typing import Any
 
+from .global_comm_domain import (
+    GLOBAL_DOMAIN_PROFILE_A3_FABRIC,
+    GLOBAL_DOMAIN_PROFILE_IDS,
+    GLOBAL_DOMAIN_PROFILE_SIM,
+)
 from .remote_l3_protocol import HOST_TCP_TRANSPORT_PROFILE
 
 
@@ -66,6 +71,23 @@ def _validate_manifest(manifest: dict[str, Any]) -> None:
         raise ValueError("manifest platform must be non-empty")
     if str(manifest["transport"]) != HOST_TCP_TRANSPORT_PROFILE:
         raise ValueError(f"only {HOST_TCP_TRANSPORT_PROFILE} transport is accepted by simpler-remote-worker")
+    comm_profile = str(manifest.get("comm_profile", GLOBAL_DOMAIN_PROFILE_SIM))
+    if comm_profile not in GLOBAL_DOMAIN_PROFILE_IDS:
+        raise ValueError("manifest comm_profile is not supported")
+    if comm_profile == GLOBAL_DOMAIN_PROFILE_A3_FABRIC and not str(manifest["platform"]).startswith("a2a3"):
+        raise ValueError("manifest a3-fabric-v1 comm_profile requires an a2a3 platform")
+    if comm_profile == GLOBAL_DOMAIN_PROFILE_A3_FABRIC and str(manifest["platform"]).endswith("sim"):
+        raise ValueError("manifest a3-fabric-v1 comm_profile requires real A3 devices")
+    node_rank = int(manifest.get("node_rank", 0))
+    node_count = int(manifest.get("node_count", 1))
+    if node_count <= 0 or node_rank < 0 or node_rank >= node_count:
+        raise ValueError("manifest node identity is invalid")
+    device_ids = [int(device_id) for device_id in manifest.get("device_ids", [])]
+    global_device_ranks = [int(rank) for rank in manifest.get("global_device_ranks", range(len(device_ids)))]
+    if len(global_device_ranks) != len(device_ids):
+        raise ValueError("manifest global_device_ranks must match device_ids length")
+    if any(rank < 0 for rank in global_device_ranks) or len(set(global_device_ranks)) != len(global_device_ranks):
+        raise ValueError("manifest global_device_ranks must be unique and non-negative")
 
 
 def _session_timeout_s(manifest: dict[str, Any]) -> float:
