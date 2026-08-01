@@ -48,6 +48,71 @@ allocation: if `sum(b.nbytes) > window_size`, `allocate_domain` raises
 Kernels read peer windows through `device_ctx` (which holds every rank's
 window base, local + imported peer); `buffer_ptrs[name]` is the local slice.
 
+### Global CommDomain across local and remote L3 nodes
+
+An L4 worker can build the same `CommContext` shape across any combination of
+forked local L3 workers (`add_worker`) and TCP-connected L3 workers
+(`add_remote_worker`) without `mpirun`:
+
+```python
+with orch.allocate_global_domain(
+    name="tp",
+    members=[(node0_worker_id, 0), (node1_worker_id, 0)],
+    window_size=4096,
+    buffers=[CommBufferSpec("payload", "uint8", 4096, 4096)],
+) as domain:
+    ...
+```
+
+Each member is `(l3_worker_id, local_l2_worker_id)`. The order defines dense
+domain ranks. A remote node reads `comm_profile` and `global_device_ranks`
+from `RemoteWorkerSpec`; a local L3 reads the same fields from its `Worker`
+configuration. All participating nodes must use the same profile.
+
+An MPI-launched group registered with `add_mpirun_worker_group` uses the same
+member contract. Rank 0 writes the group manifest before launch, every MPI rank
+must publish READY before the L4 parent exposes the returned worker ids, and
+the `MpiL3GroupSpec.hosts` order defines node ranks. Global CommDomain members
+must include the complete returned group; their order still defines dense
+domain ranks.
+
+Global CommDomain capability follows the backend that the node actually
+loads: a platform ending in `sim` supports the `sim` profile, and a real
+`a2a3` platform supports `a3-fabric-v1`. Real A5 and any other
+platform/profile combination currently reject allocation before `PREPARE`.
+Each local or remote L3 repeats the same check during `COMM_INIT`, so an
+unsupported backend never advertises a usable descriptor capability.
+
+The control flow is:
+
+1. L4 sends `COMM_INIT` with cluster, node, global-device, and domain-rank
+   identities.
+2. Each L3 asks its participating L2 children to create a local window and
+   export a transport descriptor.
+3. L4 validates and assembles one complete rank-ordered descriptor table.
+4. L4 returns that table to every L3, which forwards it to each L2 for import.
+5. L4 commits only after all imports succeed. Any earlier failure sends
+   `ABORT` and releases every prepared local window.
+
+The descriptor reports the backend's actual mapped size. A3 Fabric may align
+the requested size to its VMM granularity; bounds checks against the mapped
+window use the returned mapping size, while named-buffer offsets and limits use
+each buffer's `nbytes`. The L4 `GlobalCommDomainHandle` exposes only topology
+and buffer metadata. L3-local `ChipDomainContext` objects retain device context
+and pointers for kernel submission. Remote orchestration code calls
+`orch.get_global_domain(domain_id)` to obtain only its committed L3-local
+contexts.
+
+`copy_to_global_domain` and `copy_from_global_domain` provide bounded
+control-plane staging and smoke checks. Normal communication still runs in
+L2 kernels through the imported `CommContext`.
+
+By default a live Global CommDomain is swept after the current `Worker.run`
+drains. Set `retain_after_run=True` when a communication kernel writes results
+into the window and a second L4 run must inspect them. The later run should
+call `domain.release()` after copying the results; `Worker.close()` is the
+final safety net.
+
 ---
 
 ## 2. Lifetime model

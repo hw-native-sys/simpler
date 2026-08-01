@@ -129,6 +129,7 @@ nav:
       - L3-L2 Message Queue: l3-l2-message-queue.md
       - Directed NEXT_LEVEL Scheduling: directed-next-level-scheduling.md
       - Remote L3 Worker Design: remote-l3-worker-design.md
+      - MPI L3 group mailbox: mpi-l3-mailbox.md
   - Profiling and DFX:
       - Overview: dfx/README.md
       - Profiling Framework: dfx/profiling-framework.md

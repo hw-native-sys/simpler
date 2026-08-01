@@ -195,6 +195,7 @@ struct WorkerDispatch;
 enum class WorkerEndpointKind : int32_t {
     LOCAL_MAILBOX = 0,
     REMOTE_L3 = 1,
+    MPI_GROUP_MAILBOX = 2,
 };
 
 struct WorkerEndpointCaps {
@@ -252,6 +253,8 @@ public:
         int32_t importer_worker_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
     );
     virtual void control_remote_release_import(const RemoteBufferHandle &handle);
+    virtual std::vector<uint8_t>
+    control_remote_domain(remote_l3::ControlName control_name, const std::vector<uint8_t> &command_bytes);
     virtual void control_generic(
         uint64_t sub_cmd, const char *shm_name, size_t payload_size, double timeout_s, const uint8_t *digest
     );
@@ -452,6 +455,8 @@ public:
         int32_t importer_worker_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
     );
     void control_remote_release_import(const RemoteBufferHandle &handle);
+    std::vector<uint8_t>
+    control_remote_domain(remote_l3::ControlName control_name, const std::vector<uint8_t> &command_bytes);
     void control_generic(
         uint64_t sub_cmd, const char *shm_name, size_t payload_size, double timeout_s, const uint8_t *digest
     );
@@ -538,6 +543,9 @@ public:
     void control_l3_l2_region_release(int worker_id, uint64_t region_id);
     ControlResult
     control_digest_only(WorkerType type, int worker_id, uint64_t sub_cmd, const uint8_t *digest, double timeout_s);
+    std::vector<uint8_t> control_payload(
+        WorkerType type, int worker_id, uint64_t sub_cmd, const void *payload, size_t payload_size, double timeout_s
+    );
     ControlResult control_remote_prepare_register(
         int worker_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const void *payload,
         size_t payload_size, const uint8_t *digest
@@ -566,6 +574,9 @@ public:
         int32_t importer_worker_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
     );
     void control_remote_release_import(const RemoteBufferHandle &handle);
+    std::vector<uint8_t> control_remote_domain(
+        int worker_id, remote_l3::ControlName control_name, const std::vector<uint8_t> &command_bytes
+    );
 
     // Broadcast CTRL_REGISTER for `digest` to every NEXT_LEVEL worker in
     // parallel. Stages `blob_size` bytes from `blob_ptr` into a per-call

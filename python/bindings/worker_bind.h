@@ -445,6 +445,20 @@ inline void bind_worker(nb::module_ &m) {
             nb::arg("health_host"), nb::arg("health_port"), nb::arg("attach_timeout_s") = 30.0,
             nb::arg("runtime_timeout_s") = 30.0, "Register a REMOTE_L3 endpoint after the session reports HELLO READY."
         )
+        .def(
+            "add_mpi_group_mailbox",
+            [](Worker &self, const std::vector<int32_t> &worker_ids, const std::vector<uint64_t> &session_ids,
+               uint64_t mailbox_ptr, size_t mailbox_bytes, int mpirun_pid, double runtime_timeout_s) {
+                nb::gil_scoped_release release;
+                self.add_mpi_group_mailbox(
+                    worker_ids, session_ids, reinterpret_cast<void *>(mailbox_ptr), mailbox_bytes, mpirun_pid,
+                    runtime_timeout_s
+                );
+            },
+            nb::arg("worker_ids"), nb::arg("session_ids"), nb::arg("mailbox_ptr"), nb::arg("mailbox_bytes"),
+            nb::arg("mpirun_pid"), nb::arg("runtime_timeout_s") = 30.0,
+            "Register one shared-memory MPI group endpoint for each worker id."
+        )
 
         // Release the GIL while starting the Scheduler thread so another Python
         // thread can run during it — e.g. a concurrent close() observing
@@ -702,6 +716,28 @@ inline void bind_worker(nb::module_ &m) {
             nb::arg("import_id"), "Release an imported remote buffer mapping."
         )
         .def(
+            "remote_domain_control",
+            [](Worker &self, int worker_id, uint32_t control_name, nb::bytes command) {
+                if (!remote_l3::valid_control_name(control_name)) {
+                    throw nb::value_error("control_name is not supported");
+                }
+                std::vector<uint8_t> command_bytes(
+                    reinterpret_cast<const uint8_t *>(command.c_str()),
+                    reinterpret_cast<const uint8_t *>(command.c_str()) + command.size()
+                );
+                std::vector<uint8_t> result;
+                {
+                    nb::gil_scoped_release release;
+                    result = self.control_remote_domain(
+                        worker_id, static_cast<remote_l3::ControlName>(control_name), command_bytes
+                    );
+                }
+                return nb::bytes(reinterpret_cast<const char *>(result.data()), result.size());
+            },
+            nb::arg("worker_id"), nb::arg("control_name"), nb::arg("command"),
+            "Send one Global CommDomain control to a remote L3 endpoint."
+        )
+        .def(
             "broadcast_unregister_all",
             [](Worker &self, nb::object digest) {
                 std::string digest_bytes = bytes_from_digest_arg(digest);
@@ -741,6 +777,25 @@ inline void bind_worker(nb::module_ &m) {
             "Broadcast an arbitrary CONTROL_REQUEST to the selected worker pool. "
             "If payload is a Python buffer, C++ stages it in POSIX shm and writes the shm name "
             "into the mailbox. Returns per-child ControlResult entries."
+        )
+        .def(
+            "control_payload",
+            [](Worker &self, WorkerType worker_type, int worker_id, uint64_t sub_cmd, nb::object payload,
+               nb::object timeout_s) {
+                std::string payload_bytes = buffer_to_string(payload, "payload");
+                double timeout_val = timeout_s.is_none() ? -1.0 : nb::cast<double>(timeout_s);
+                std::vector<uint8_t> result;
+                {
+                    nb::gil_scoped_release release;
+                    result = self.control_payload(
+                        worker_type, worker_id, sub_cmd, payload_bytes.data(), payload_bytes.size(), timeout_val
+                    );
+                }
+                return nb::bytes(reinterpret_cast<const char *>(result.data()), result.size());
+            },
+            nb::arg("worker_type"), nb::arg("worker_id"), nb::arg("sub_cmd"), nb::arg("payload"),
+            nb::arg("timeout_s") = nb::none(),
+            "Drive one local worker control with a mutable staged payload and return its final bytes."
         )
         .def(
             "control_alloc_domain", &Worker::control_alloc_domain, nb::arg("worker_id"), nb::arg("request_shm_name"),

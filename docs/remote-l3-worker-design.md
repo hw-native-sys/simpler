@@ -9,6 +9,7 @@ Detailed protocol, buffer, transport, and rollout notes live in:
 
 - [protocol.md](remote-l3-worker-design/protocol.md)
 - [buffers-and-transports.md](remote-l3-worker-design/buffers-and-transports.md)
+- [MPI L3 group mailbox](mpi-l3-mailbox.md)
 - [implementation-plan.md](remote-l3-worker-design/implementation-plan.md)
 - [pr-split-and-audit-plan.md][split-audit-plan]
 
@@ -63,15 +64,26 @@ Implemented:
 - Socket-backed simulation remote sessions via `simpler-remote-worker` and
   `simpler-remote-l3-session`, including `HELLO READY`, TASK/COMPLETION,
   CONTROL/CONTROL_REPLY, SHUTDOWN, and an independent health lane.
+- MPI L3 groups use one rank-0 named shared-memory mailbox plus ordered MPI
+  collectives for task, control, health, Global CommDomain, error, and shutdown
+  handling. They do not create Simpler command or health TCP sockets; ordinary
+  non-MPI Remote L3 sessions retain the socket transport.
 - Simulation remote buffer allocation, copy, export, import, release-import,
   imported-handle scheduling eligibility, and deferred owner free.
 - Registry-scope-aware remote callable manifest/control install for dispatcher
   `PYTHON_IMPORT`, inner `PYTHON_IMPORT`, and inner inline `CHIP_CALLABLE`.
+  Pre-init `ChipCallable` registrations on an L4 worker are serialized into
+  each remote session manifest and installed on that L3's L2 children.
+- A no-`mpirun` A3 TCP smoke that keeps a Global CommDomain across two L4
+  runs, executes peer `TLOAD` from each remote L2, and verifies the reduced
+  values before release.
+- Two-server hardware validation covers L4-brokered peer `TLOAD`, one L2
+  compute followed by cross-machine communication, and two-NPU-per-node
+  remote L3 group compute.
 
 Still pending:
 
 - A2 RoCE, A3 HCCS, and A5 UB HCOMM profiles.
-- Remote `CommDomain` allocation/import and hardware-gated validation.
 - Negotiated `PYTHON_SERIALIZED` remote callable payloads and staged
   `CHIP_CALLABLE` blob adapters.
 
@@ -449,10 +461,9 @@ Session execution rules:
   the current one-`WorkerThread`-per-child local scheduling model and keeps
   ordering, buffer lifetime, and callable visibility simple.
 - State-changing CONTROL frames such as register, unregister, buffer free,
-  copy, export/import, and import release serialize with TASK execution on the
-  ordered command lane. They are not applied concurrently with a running TASK
-  on the same endpoint. Future Remote CommDomain controls follow the same
-  ordering rule when they enter scope.
+  copy, export/import, import release, and Global CommDomain transactions
+  serialize with TASK execution on the ordered command lane. They are not
+  applied concurrently with a running TASK on the same endpoint.
 - Bulk data movement may use a separate data plane, but the state change that
   makes staged bytes, callable payloads, or imported handles visible is ordered
   by the command lane.
