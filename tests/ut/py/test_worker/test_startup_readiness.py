@@ -941,8 +941,10 @@ class TestLevel2Lifecycle:
         monkeypatch.setattr(Worker, "_release_all_host_buffers", lambda self: time.sleep(0.6))
         captured: dict = {}
 
-        def capture_reap(groups, deadline):
+        def capture_reap(groups, deadline, *, kill_survivors=False, kill_process_groups=False):
             captured["remaining"] = deadline - time.monotonic()
+            captured["kill_survivors"] = kill_survivors
+            captured["kill_process_groups"] = kill_process_groups
 
         monkeypatch.setattr(Worker, "_reap_child_groups", staticmethod(capture_reap))
         with _hard_timeout(_TEST_WALL_BUDGET_S):
@@ -950,6 +952,8 @@ class TestLevel2Lifecycle:
         # The reap got ~full grace (1.0s), not 1.0 - 0.6 left over from a deadline
         # fixed at teardown entry.
         assert captured["remaining"] > 0.7
+        assert captured["kill_survivors"] is True
+        assert captured["kill_process_groups"] is True
 
     def test_reap_child_groups_stuck_child_no_starvation(self, monkeypatch):
         # A stuck child in one group must not starve the reap of healthy children
@@ -993,6 +997,49 @@ class TestLevel2Lifecycle:
         assert sub_pids == [stuck_pid] and len(sub_shms) == 1
         # ...but the healthy children were reaped, freed, and removed.
         assert chip_pids == [] and chip_shms == [] and next_pids == [] and next_shms == []
+
+    def test_reap_child_groups_force_kills_and_reaps_survivor(self, monkeypatch):
+        # A READY-tree close first gives children the full graceful budget, then
+        # force-kills only the survivors. Once waitpid confirms the forced exit,
+        # the child's mailbox can be safely freed and close need not leak/fail.
+        import simpler.worker as worker_mod  # noqa: PLC0415
+
+        class _FakeShm:
+            def __init__(self):
+                self.closed = False
+                self.unlinked = False
+
+            def close(self):
+                self.closed = True
+
+            def unlink(self):
+                self.unlinked = True
+
+        pid = 90004
+        killed: list[tuple[int, int]] = []
+
+        def fake_kill(target, sig):
+            killed.append((target, sig))
+
+        def fake_waitpid(target, _flags):
+            if killed:
+                return (target, signal.SIGKILL)
+            return (0, 0)
+
+        monkeypatch.setattr(worker_mod.os, "kill", fake_kill)
+        monkeypatch.setattr(worker_mod.os, "waitpid", fake_waitpid)
+        shm = _FakeShm()
+        shms, pids = [shm], [pid]
+        groups = [(shms, pids)]
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            Worker._reap_child_groups(
+                groups,  # type: ignore[arg-type]
+                time.monotonic() - 1.0,
+                kill_survivors=True,
+            )
+        assert killed == [(pid, signal.SIGKILL)]
+        assert pids == [] and shms == []
+        assert shm.closed and shm.unlinked
 
     def test_non_owner_close_of_ready_raises(self, monkeypatch):
         # A READY worker holds same-thread-only native objects, so a close() from

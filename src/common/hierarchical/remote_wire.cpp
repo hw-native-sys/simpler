@@ -130,7 +130,7 @@ bool valid_frame_type(uint32_t v) {
     return false;
 }
 
-bool valid_control_name(uint32_t v) {
+bool valid_control_name_impl(uint32_t v) {
     switch (static_cast<ControlName>(v)) {
     case ControlName::UNREGISTER_CALLABLE:
     case ControlName::PREPARE_REGISTER_CALLABLE:
@@ -147,6 +147,8 @@ bool valid_control_name(uint32_t v) {
     case ControlName::COMM_INIT:
     case ControlName::ALLOC_DOMAIN:
     case ControlName::RELEASE_DOMAIN:
+    case ControlName::COPY_TO_DOMAIN:
+    case ControlName::COPY_FROM_DOMAIN:
         return true;
     }
     return false;
@@ -232,6 +234,8 @@ void validate_desc_against_inline_payload(const RemoteTensorDesc &desc, size_t i
 }
 
 }  // namespace
+
+bool valid_control_name(uint32_t value) { return valid_control_name_impl(value); }
 
 std::vector<uint8_t> encode_frame(const FrameHeader &header, const std::vector<uint8_t> &payload) {
     ensure(payload.size() <= MAX_FRAME_PAYLOAD_BYTES, "remote_wire: frame payload exceeds maximum");

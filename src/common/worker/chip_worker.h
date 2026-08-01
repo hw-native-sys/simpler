@@ -14,9 +14,12 @@
 
 #include <cstdint>
 #include <string>
+#include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
+#include "../platform_comm/comm.h"
 #include "../task_interface/call_config.h"
 #include "../task_interface/task_args.h"
 #include "pipeline_slot_pool.h"
@@ -155,6 +158,11 @@ public:
     /// inside the backend's per-allocation record).
     void
     comm_release_domain_windows(uint64_t comm_handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank);
+    std::tuple<std::vector<uint8_t>, uint64_t, size_t> comm_global_domain_prepare(
+        uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile
+    );
+    uint64_t comm_global_domain_import(uint64_t domain_id, const std::vector<uint8_t> &descriptors);
+    void comm_global_domain_release(uint64_t domain_id);
     void comm_barrier(uint64_t comm_handle);
     void comm_destroy(uint64_t comm_handle);
     void comm_destroy_all();
@@ -216,6 +224,10 @@ private:
     using CommAllocDomainWindowsFn =
         int (*)(void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint64_t *, uint64_t *);
     using CommReleaseDomainWindowsFn = int (*)(void *, uint64_t, size_t, uint32_t);
+    using CommGlobalDomainPrepareFn =
+        int (*)(uint64_t, uint32_t, uint32_t, size_t, uint32_t, CommGlobalDomainDescriptor *, uint64_t *);
+    using CommGlobalDomainImportFn = int (*)(uint64_t, const CommGlobalDomainDescriptor *, size_t, uint64_t *);
+    using CommGlobalDomainReleaseFn = int (*)(uint64_t);
     using CommBarrierFn = int (*)(void *);
     using CommDestroyFn = int (*)(void *);
 
@@ -269,11 +281,15 @@ private:
     CommDeriveContextFn comm_derive_context_fn_ = nullptr;
     CommAllocDomainWindowsFn comm_alloc_domain_windows_fn_ = nullptr;
     CommReleaseDomainWindowsFn comm_release_domain_windows_fn_ = nullptr;
+    CommGlobalDomainPrepareFn comm_global_domain_prepare_fn_ = nullptr;
+    CommGlobalDomainImportFn comm_global_domain_import_fn_ = nullptr;
+    CommGlobalDomainReleaseFn comm_global_domain_release_fn_ = nullptr;
     CommBarrierFn comm_barrier_fn_ = nullptr;
     CommDestroyFn comm_destroy_fn_ = nullptr;
     void *device_ctx_ = nullptr;
     std::vector<CommSession> comm_sessions_;
     std::unordered_map<uint64_t, size_t> comm_session_index_;
+    std::unordered_set<uint64_t> global_domain_ids_;
     uint64_t base_comm_handle_ = 0;
 
     // Slot 0 with no generation bookkeeping: an unleased run is a caller that
