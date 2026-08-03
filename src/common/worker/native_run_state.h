@@ -13,8 +13,10 @@
 #define SRC_COMMON_WORKER_NATIVE_RUN_STATE_H_
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <thread>
 
 #include "call_config.h"
@@ -57,6 +59,19 @@ struct NativeRunState {
         if (snapshot != nullptr) runner->adopt_native_run_thread_state(snapshot);
     }
 
+    void publish_execution_complete(int rc) noexcept {
+        execution_rc.store(rc, std::memory_order_relaxed);
+        execution_done.store(true, std::memory_order_release);
+        execution_cv.notify_all();
+    }
+
+    void wait_for_execution_complete() {
+        std::unique_lock<std::mutex> lock(execution_mu);
+        execution_cv.wait(lock, [this]() {
+            return execution_done.load(std::memory_order_acquire);
+        });
+    }
+
     uint64_t magic{kMagic};
     Runner *runner{nullptr};
     CallConfig config{};
@@ -67,6 +82,8 @@ struct NativeRunState {
     std::thread executor{};
     std::atomic<int> execution_rc{-1};
     std::atomic<bool> execution_done{false};
+    std::mutex execution_mu{};
+    std::condition_variable execution_cv{};
     std::atomic<NativeRunPhase> phase{NativeRunPhase::Prepared};
     NativeRunLaunchSignal launch_signal{};
     void *host_thread_state{nullptr};

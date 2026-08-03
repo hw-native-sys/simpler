@@ -35,7 +35,7 @@ TEST(PipelineContract, AcceptsADeclarationThisBuildCanHonor) {
     EXPECT_TRUE(is_valid_pipeline_contract(&c));
 }
 
-// Runtime loading requires a contract; this helper still rejects malformed null values.
+// A runtime that exports no contract is handled by the caller, not here.
 TEST(PipelineContract, RejectsNull) { EXPECT_FALSE(is_valid_pipeline_contract(nullptr)); }
 
 TEST(PipelineContract, AcceptsAnEmptyResourceList) {
@@ -240,6 +240,24 @@ TEST(PipelineSlotPool, StaleGenerationCannotAccessOrReleaseAReusedSlot) {
     EXPECT_FALSE(pool.release(first));
     EXPECT_TRUE(pool.owns(replacement));
     EXPECT_TRUE(pool.release(replacement));
+}
+
+TEST(PipelineSlotGenerationFilter, CompatibilityPreviewDoesNotConsumeGeneration) {
+    PipelineSlotGenerationFilter filter;
+    const PipelineSlotLease retried{1, 0, 2};
+
+    EXPECT_TRUE(filter.is_admissible(retried));
+    EXPECT_TRUE(filter.admit(PipelineSlotLease{1, 0, 1}));
+    EXPECT_TRUE(filter.admit(retried));
+}
+
+TEST(PipelineSlotGenerationFilter, CommitRechecksGenerationAfterCompatibilityPreview) {
+    PipelineSlotGenerationFilter filter;
+    const PipelineSlotLease delayed{0, 0, 1};
+
+    EXPECT_TRUE(filter.is_admissible(delayed));
+    EXPECT_TRUE(filter.admit(PipelineSlotLease{0, 0, 2}));
+    EXPECT_FALSE(filter.admit(delayed));
 }
 
 }  // namespace

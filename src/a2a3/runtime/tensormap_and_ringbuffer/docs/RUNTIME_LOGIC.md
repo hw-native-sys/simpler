@@ -110,6 +110,40 @@ The platform side is deliberately thin: `DeviceRunnerBase` only remembers a
 allocator; all grow/pack/slice logic lives in `runtime_maker.cpp`
 (`RetainedTempBump`).
 
+Prepared whole-run admission may stage the inactive slot while the current run
+uses the one shared arena bank. Before an overlapping native prepare, TMR
+resolves the full per-ring sizing key and requires it to match the existing
+prebuilt-arena cache. A miss never rebuilds the active run's heap, shared
+memory, or runtime image. It reports a depth-one fallback to the endpoint,
+which retains the successor's FIFO position and immutable frame and retries
+native preparation after the predecessor fence.
+
+The compatibility key is the resolved four-ring `task_window`, `heap`, and
+`dep_pool` layout after per-call overrides, environment values, and defaults.
+It does not include the callable symbol or code image. Each compatible or
+fallback run still creates a fresh run-owned AICore stream during prepare;
+AICPU streams and retained argument buffers remain slot-owned.
+
+The overlap boundary follows the resource owner, rather than treating all TMR
+initialization alike:
+
+- safe during predecessor execution: the successor's slot-owned TaskArgs,
+  retained tensor staging, Host descriptors, Runtime object, and fresh AICore
+  stream; a cache hit only reads the already-stable shared-arena identity and
+  binds its device addresses;
+- device-exclusive: a cache miss or arena resize/rebuild, launch, SDMA and
+  completion publication, and any mutation of shared scheduler scratch; these
+  wait for the active device fence;
+- completion-only retirement: finalizing the completed Runtime, destroying its
+  run-owned AICore stream, and releasing its slot generation. The slot is not
+  reusable until these operations finish.
+
+Consequently, the single-entry prebuilt-arena cache needs no concurrent writer
+path: overlapping preparation is admitted only after a matching cache lookup,
+and the matching bind performs another lookup without rebuilding. Cache
+mutation is restricted to depth-one preparation, prewarm, and final teardown,
+all of which are outside an active/prepared overlap window.
+
 On each trb bind, `RetainedTempBump`:
 
 - packs the run's non-child, non-empty tensors to a required size, aligning

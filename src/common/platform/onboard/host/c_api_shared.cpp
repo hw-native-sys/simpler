@@ -68,6 +68,12 @@ extern "C" {
 int register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const void *), CallableArtifacts *out);
 int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc);
 __attribute__((weak)) int concurrent_native_prepare_supported_impl(void) { return 0; }
+__attribute__((weak)) int prepared_run_config_compatible_impl(
+    const HostApi * /*api*/, const uint64_t * /*ring_task_window*/, const uint64_t * /*ring_heap*/,
+    const uint64_t * /*ring_dep_pool*/
+) {
+    return 1;
+}
 
 /* ===========================================================================
  * Per-thread DeviceRunnerBase binding (set by simpler_register_callable / simpler_run)
@@ -708,6 +714,24 @@ int simpler_prepare_run(
         int rc = runner->attach_current_thread(runner->device_id());
         if (rc != 0) return cleanup_failed_prepare(state, rc, true);
 
+        if (overlaps_active_run) {
+            int compatibility_rc = 0;
+            {
+                STRACE("simpler_run.bind.compatibility");
+                compatibility_rc = prepared_run_config_compatible_impl(
+                    &g_host_api, config->runtime_env.ring_task_window, config->runtime_env.ring_heap,
+                    config->runtime_env.ring_dep_pool
+                );
+            }
+            if (compatibility_rc <= 0) {
+                if (compatibility_rc == 0) {
+                    LOG_INFO("successor RuntimeEnv requires depth-one native preparation");
+                    compatibility_rc = PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE;
+                }
+                return cleanup_failed_prepare(state, compatibility_rc, true);
+            }
+        }
+
         state->runner_resources_owned = true;
         rc = runner->provision_native_run_resources(state->pipeline_slot);
         if (rc != 0) return cleanup_failed_prepare(state, rc, true);
@@ -716,8 +740,8 @@ int simpler_prepare_run(
         if (rc != 0) return cleanup_failed_prepare(state, rc, true);
 
         // Diagnostic binding reads runner-global collector configuration. It
-        // is depth-one, while concurrent HBG preparation must leave the active
-        // run's configuration untouched until launch.
+        // is depth-one, while concurrent successor preparation must leave the
+        // active run's configuration untouched until launch.
         if (!overlaps_active_run) runner->apply_call_config(state->config);
 
         {
@@ -771,11 +795,15 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     state->phase.store(NativeRunPhase::Launching, std::memory_order_release);
 
     try {
-        // The compatibility backend uses one blocking executor per run. The
-        // prepare-through-finalize runner claim limits it to one per context.
-        state->executor = state->runner->create_thread([state, ctx]() {
+        const DeviceRunnerBase::NativeRunThreadSelection execution_selection =
+            state->runner->capture_native_run_thread_selection();
+        // The runner owns one persistent blocking execution thread. The
+        // endpoint remains the sole FIFO/progress owner and polls this run's
+        // completion state without creating a host thread for every launch.
+        const bool submitted = state->runner->submit_native_execution([state, ctx, execution_selection]() {
             pthread_once(&g_runner_key_once, create_runner_key);
             pthread_setspecific(g_runner_key, ctx);
+            state->runner->restore_native_run_thread_selection(execution_selection);
             STRACE_CONTEXT(state->trace_inv, state->trace_hid, 1);
             int rc = -1;
             bool entered_run = false;
@@ -807,10 +835,13 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
                 if (rc == 0) rc = resources_rc;
             }
             pthread_setspecific(g_runner_key, nullptr);
-            state->execution_rc.store(rc, std::memory_order_relaxed);
-            state->execution_done.store(true, std::memory_order_release);
+            // Completion permits finalize to destroy `state`. Keep the launch
+            // fallback notification before that publication so the persistent
+            // executor never dereferences run-owned storage after done=true.
             state->launch_signal.notify();
+            state->publish_execution_complete(rc);
         });
+        if (!submitted) throw std::runtime_error("native execution thread is occupied");
     } catch (...) {
         state->runner->release_native_run(state);
         state->runner_claimed = false;
@@ -844,7 +875,7 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     if (state == nullptr) return -1;
     NativeRunPhase phase = state->phase.load(std::memory_order_acquire);
     if (phase == NativeRunPhase::Prepared || phase == NativeRunPhase::Launching) return -1;
-    if (state->executor.joinable()) state->executor.join();
+    state->wait_for_execution_complete();
     state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
     return state->execution_rc.load(std::memory_order_relaxed);
 }
@@ -883,7 +914,7 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     int execution_rc = -1;
     const bool launched = phase != NativeRunPhase::Prepared;
     if (launched) {
-        if (state->executor.joinable()) state->executor.join();
+        state->wait_for_execution_complete();
         execution_rc = state->execution_rc.load(std::memory_order_relaxed);
     }
 
@@ -1036,6 +1067,15 @@ size_t get_run_stream_set_create_count(DeviceContextHandle ctx) {
     if (ctx == NULL) return 0;
     try {
         return static_cast<DeviceRunnerBase *>(ctx)->run_stream_set_create_count();
+    } catch (...) {
+        return 0;
+    }
+}
+
+size_t get_native_execution_thread_create_count(DeviceContextHandle ctx) {
+    if (ctx == NULL) return 0;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->native_execution_thread_create_count();
     } catch (...) {
         return 0;
     }

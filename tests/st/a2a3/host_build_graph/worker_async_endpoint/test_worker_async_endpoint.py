@@ -210,10 +210,10 @@ class TestWorkerAsyncEndpoint(SceneTestCase):
                     assert accepted == 0, "the successor crossed its launch fence before activation"
                     saw_staged = True
                     break
-                assert accepted == 0, "the successor crossed FIFO activation while its predecessor run remained open"
+                assert accepted == 0, "the successor launched while its predecessor was still active"
                 time.sleep(0.001)
 
-            assert saw_staged, "the successor did not reach FRAME_STAGED while its predecessor run remained open"
+            assert saw_staged, "the successor did not reach FRAME_STAGED behind its predecessor"
             assert not first.done, "the predecessor escaped its SubTask fence"
 
             _SUB_RELEASE.set()

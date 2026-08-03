@@ -421,6 +421,51 @@ std::thread DeviceRunnerBase::create_thread(std::function<void()> fn) {
     });
 }
 
+bool DeviceRunnerBase::submit_native_execution(std::function<void()> fn) {
+    std::lock_guard<std::mutex> lock(native_execution_mu_);
+    if (native_execution_stop_ || native_execution_task_) return false;
+
+    if (!native_execution_thread_.joinable()) {
+        native_execution_thread_ = create_thread([this]() {
+            std::unique_lock<std::mutex> lock(native_execution_mu_);
+            while (true) {
+                native_execution_cv_.wait(lock, [this]() {
+                    return native_execution_stop_ || static_cast<bool>(native_execution_task_);
+                });
+                if (native_execution_stop_ && !native_execution_task_) return;
+
+                std::function<void()> task = std::move(native_execution_task_);
+                native_execution_active_ = true;
+                lock.unlock();
+                task();
+                lock.lock();
+                native_execution_active_ = false;
+                native_execution_cv_.notify_all();
+            }
+        });
+        native_execution_thread_create_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    native_execution_task_ = std::move(fn);
+    native_execution_cv_.notify_one();
+    return true;
+}
+
+void DeviceRunnerBase::shutdown_native_execution() {
+    {
+        std::lock_guard<std::mutex> lock(native_execution_mu_);
+        native_execution_stop_ = true;
+        native_execution_cv_.notify_all();
+    }
+    if (native_execution_thread_.joinable()) native_execution_thread_.join();
+    {
+        std::lock_guard<std::mutex> lock(native_execution_mu_);
+        native_execution_task_ = {};
+        native_execution_active_ = false;
+        native_execution_stop_ = false;
+    }
+}
+
 int DeviceRunnerBase::attach_current_thread(int device_id) {
     if (device_id < 0) {
         LOG_ERROR("Invalid device_id: %d", device_id);
@@ -1646,8 +1691,7 @@ bool DeviceRunnerBase::try_reserve_native_run(
     const NativeRunReservation *existing = nullptr;
     for (const NativeRunReservation &reservation : native_run_reservations_) {
         if (reservation.owner == nullptr) continue;
-        if (reservation.owner == owner || reservation.pipeline_slot == pipeline_slot ||
-            reservation.arena_bank == arena_bank) {
+        if (reservation.owner == owner || reservation.pipeline_slot == pipeline_slot) {
             return false;
         }
         ++occupied;

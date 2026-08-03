@@ -479,5 +479,84 @@ class TestWorkerAsyncWholeRunFifo(SceneTestCase):
                     st_worker.free_host_buffer(buffer)
 
 
+@scene_test(level=3, runtime="tensormap_and_ringbuffer")
+class TestWorkerAsyncWholeRunFifoTmr(TestWorkerAsyncWholeRunFifo):
+    """TMR uses the common FIFO with shared-arena compatibility fallback."""
+
+    def test_incompatible_runtime_env_falls_back_to_depth_one(self, st_platform, st_worker):
+        if st_platform != "a2a3":
+            pytest.skip("TMR prepared-state validation requires an a2a3 onboard worker")
+
+        _SUB_ENTERED.clear()
+        _SUB_RELEASE.clear()
+        buffers = []
+        tensors = []
+        first = None
+        second = None
+        try:
+            for value in (2.0, 3.0, 0.0, 5.0, 7.0, 0.0):
+                buffer, tensor = self._tensor_from_host_buffer(st_worker, value)
+                buffers.append(buffer)
+                tensors.append(tensor)
+            first_a, first_b, first_out, second_a, second_b, second_out = tensors
+            vector_handle = type(self)._st_chip_handles["vector"]
+            vector_signature = type(self)._st_chip_handles["vector_sig"]
+            sub_handle = type(self)._st_sub_handles["wait_for_release"]
+
+            def submit_vector(orch, a, b, out, config, *, spin_iters=0, hold_open=False):
+                builder = TaskArgsBuilder(
+                    Tensor("a", a), Tensor("b", b), Tensor("f", out), Scalar("spin_iters", spin_iters)
+                )
+                chip_args, _ = _build_l3_task_args(builder, vector_signature)
+                orch.submit_next_level(vector_handle, chip_args, config, worker=0)
+                if hold_open:
+                    orch.submit_sub(sub_handle)
+
+            default_config = self._build_config(self.CASES[0]["config"])
+            incompatible_config = self._build_config(
+                {
+                    **self.CASES[0]["config"],
+                    "runtime_env": {"ring_heap": [128 * 1024 * 1024] * 4},
+                }
+            )
+            first = st_worker.submit(
+                lambda orch, _args, _cfg: submit_vector(
+                    orch,
+                    first_a,
+                    first_b,
+                    first_out,
+                    default_config,
+                    spin_iters=_DEVICE_SPIN_ITERS,
+                    hold_open=True,
+                )
+            )
+            _wait_for_active_device_run(st_worker, 10.0)
+            assert _SUB_ENTERED.wait(10.0)
+
+            second = st_worker.submit(
+                lambda orch, _args, _cfg: submit_vector(orch, second_a, second_b, second_out, incompatible_config)
+            )
+            _wait_for_backend_prepared_successor(st_worker, 10.0)
+            assert torch.count_nonzero(second_out).item() == 0
+
+            _SUB_RELEASE.set()
+            first.wait(30.0)
+            second.wait(30.0)
+            assert torch.allclose(first_out, first_a + first_b + _CHAIN_LENGTH)
+            assert torch.allclose(second_out, second_a + second_b + _CHAIN_LENGTH)
+        finally:
+            _SUB_RELEASE.set()
+            for handle in (first, second):
+                if handle is not None:
+                    with suppress(Exception):
+                        handle.wait(30.0)
+            tensors.clear()
+            tensor = None
+            first_a = first_b = first_out = second_a = second_b = second_out = None
+            if all(handle is None or handle.done for handle in (first, second)):
+                for buffer in buffers:
+                    st_worker.free_host_buffer(buffer)
+
+
 if __name__ == "__main__":
     SceneTestCase.run_module(__name__)

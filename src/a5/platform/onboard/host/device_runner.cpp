@@ -642,6 +642,8 @@ int DeviceRunner::finalize() {
         return 0;
     }
 
+    shutdown_native_execution();
+
     int rc = attach_current_thread(device_id_);
     if (rc != 0) {
         LOG_ERROR("Failed to attach finalize thread to device %d: %d", device_id_, rc);

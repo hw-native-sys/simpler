@@ -177,6 +177,8 @@ void ChipWorker::init(
         get_host_dlopen_count_fn_ = load_symbol<GetAicpuDlopenCountFn>(handle, "get_host_dlopen_count");
         get_run_stream_set_create_count_fn_ =
             load_symbol<GetAicpuDlopenCountFn>(handle, "get_run_stream_set_create_count");
+        get_native_execution_thread_create_count_fn_ =
+            load_symbol<GetAicpuDlopenCountFn>(handle, "get_native_execution_thread_create_count");
         simpler_provision_dma_workspace_fn_ =
             load_symbol<SimplerProvisionDmaWorkspaceFn>(handle, "simpler_provision_dma_workspace");
         finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "finalize_device");
@@ -310,6 +312,7 @@ void ChipWorker::init(
         get_aicpu_dlopen_count_fn_ = nullptr;
         get_host_dlopen_count_fn_ = nullptr;
         get_run_stream_set_create_count_fn_ = nullptr;
+        get_native_execution_thread_create_count_fn_ = nullptr;
         simpler_provision_dma_workspace_fn_ = nullptr;
         finalize_device_fn_ = nullptr;
         ensure_acl_ready_fn_ = nullptr;
@@ -364,6 +367,7 @@ void ChipWorker::init(
         get_aicpu_dlopen_count_fn_ = nullptr;
         get_host_dlopen_count_fn_ = nullptr;
         get_run_stream_set_create_count_fn_ = nullptr;
+        get_native_execution_thread_create_count_fn_ = nullptr;
         simpler_provision_dma_workspace_fn_ = nullptr;
         finalize_device_fn_ = nullptr;
         ensure_acl_ready_fn_ = nullptr;
@@ -449,6 +453,7 @@ void ChipWorker::finalize() {
     get_aicpu_dlopen_count_fn_ = nullptr;
     get_host_dlopen_count_fn_ = nullptr;
     get_run_stream_set_create_count_fn_ = nullptr;
+    get_native_execution_thread_create_count_fn_ = nullptr;
     simpler_provision_dma_workspace_fn_ = nullptr;
     finalize_device_fn_ = nullptr;
     ensure_acl_ready_fn_ = nullptr;
@@ -676,7 +681,11 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
                 "prepare_native_run already owns a prepared successor " + format_native_run_identity(run_identity)
             );
         }
-        if (!pipeline_generations_.admit(PipelineSlotLease{slot_id, 0, generation})) {
+        // A compatibility probe may reject this prepare while the predecessor
+        // is still active. Merely attempting that probe must not consume the
+        // lease generation, because the same lease is retried at the ordered
+        // depth-one handoff boundary.
+        if (!pipeline_generations_.is_admissible(PipelineSlotLease{slot_id, 0, generation})) {
             throw std::runtime_error(
                 "native-run pipeline lease generation is stale " + format_native_run_identity(run_identity)
             );
@@ -710,6 +719,11 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
         if (state.run_epoch == run_epoch && state.phase == NativeRunPhase::PREPARING) {
             state = NativeRunSlotState{};
         }
+        if (rc == PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE) {
+            throw std::runtime_error(
+                "native prepare requires depth-one fallback " + format_native_run_identity(run_identity)
+            );
+        }
         throw std::runtime_error(
             "prepare_native_run failed with code " + std::to_string(rc) + " " + format_native_run_identity(run_identity)
         );
@@ -723,6 +737,14 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
             (void)finalize_run_fn_(device_ctx_, runtime_bufs_[slot_id].data());
             state = NativeRunSlotState{};
             throw std::runtime_error("native-run identity changed while prepare was in progress");
+        }
+        if (!pipeline_generations_.admit(PipelineSlotLease{slot_id, 0, generation})) {
+            (void)finalize_run_fn_(device_ctx_, runtime_bufs_[slot_id].data());
+            state = NativeRunSlotState{};
+            throw std::runtime_error(
+                "native-run pipeline lease generation became stale while prepare was in progress " +
+                format_native_run_identity(run_identity)
+            );
         }
         state.phase = NativeRunPhase::PREPARED;
     }
@@ -937,6 +959,13 @@ size_t ChipWorker::run_stream_set_create_count() const {
         return 0;
     }
     return get_run_stream_set_create_count_fn_(device_ctx_);
+}
+
+size_t ChipWorker::native_execution_thread_create_count() const {
+    if (!initialized_) {
+        return 0;
+    }
+    return get_native_execution_thread_create_count_fn_(device_ctx_);
 }
 
 void *ChipWorker::create_comm_stream_checked(const char *op_name) {

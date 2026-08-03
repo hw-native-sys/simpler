@@ -31,7 +31,7 @@ public:
 
     void notify() {
         {
-            std::lock_guard<std::mutex> lock(mutex_);
+            std::scoped_lock<std::mutex> lock(mutex_);
             notified_ = true;
         }
         cv_.notify_one();

@@ -862,6 +862,12 @@ size_t get_run_stream_set_create_count(DeviceContextHandle ctx) {
     return 0;
 }
 
+size_t get_native_execution_thread_create_count(DeviceContextHandle ctx) {
+    // Simulation retains its compatibility execution path.
+    (void)ctx;
+    return 0;
+}
+
 size_t committed_device_memory_ctx(DeviceContextHandle ctx) {
     if (ctx == NULL) return 0;
     try {

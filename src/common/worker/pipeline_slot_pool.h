@@ -113,6 +113,12 @@ private:
  */
 class PipelineSlotGenerationFilter {
 public:
+    bool is_admissible(const PipelineSlotLease &lease) {
+        if (lease.slot_id >= newest_.size()) return false;
+        std::lock_guard<std::mutex> lock(mu_);
+        return lease.generation >= newest_[lease.slot_id];
+    }
+
     bool admit(const PipelineSlotLease &lease) {
         if (lease.slot_id >= newest_.size()) return false;
         std::lock_guard<std::mutex> lock(mu_);

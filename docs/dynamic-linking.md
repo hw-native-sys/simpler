@@ -291,16 +291,11 @@ ChipWorker.init(device_id, bins)                       # Python wrapper
   ctypes.CDLL(libcpu_sim_context.so, RTLD_GLOBAL)      # sim only, once per process
   _ChipWorker.init(host_path, aicpu_path, aicore_path, device_id)   # C++
     dlopen(host_runtime.so, RTLD_LOCAL)
-    dlsym every required export declared in pto_runtime_c_api.h, including:
-           create_device_context, destroy_device_context, simpler_init,
+    dlsym: create_device_context, destroy_device_context, simpler_init,
            get_runtime_size, get_runtime_alignment, simpler_register_callable,
            simpler_prepare_run, simpler_launch_run, simpler_poll_run,
            simpler_wait_run, simpler_finalize_run, simpler_run,
-           simpler_unregister_callable, get_pipeline_contract,
-           supports_concurrent_native_prepare_ctx,
-           set_native_run_identity_ctx, set_task_accepted_state_ctx,
-           get_arena_bank_gm_heap_base_ctx, get_retained_temp_addr_ctx,
-           finalize_device
+           simpler_unregister_callable, finalize_device
     create_device_context() → DeviceContextHandle
     allocate zeroed, aligned, stable native-run storage per pipeline slot
     simpler_init(ctx, device_id, aicpu*, aicpu_size, aicore*, aicore_size)

@@ -139,7 +139,7 @@ class TestRunStreamReuseHbg(SceneTestCase):
             f"{after_first} -> {st_worker.run_stream_set_create_count}"
         )
 
-    def _run_registered(self, worker, handle, *, subtract):
+    def _run_registered(self, worker, handle, *, subtract, unleased=False):
         params = self.CASES[0]["params"]
         test_args = self.generate_args(params)
         chip_args, output_names = _build_chip_task_args(test_args, self.CALLABLE["orchestration"]["signature"])
@@ -147,7 +147,12 @@ class TestRunStreamReuseHbg(SceneTestCase):
         a, b = golden_args.a, golden_args.b
         base = a - b if subtract else a + b
         golden_args.f[:] = (base + 1) * (base + 2)
-        worker.run(handle, chip_args, config=self._build_config(self.CASES[0]["config"]))
+        config = self._build_config(self.CASES[0]["config"])
+        if unleased:
+            state = worker._resolve_handle(handle)
+            worker._chip_worker._run_slot(state.slot_id, chip_args, config=config)
+        else:
+            worker.run(handle, chip_args, config=config)
         _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
     # The st_worker fixture is shared by every test in this class, and so is the
@@ -258,7 +263,7 @@ class TestRunStreamReuseHbg(SceneTestCase):
             handle = other.register(self.build_callable(st_platform))
             try:
                 for _ in range(3):
-                    self._run_registered(other, handle, subtract=False)
+                    self._run_registered(other, handle, subtract=False, unleased=True)
                 self._run_registered_with_lease(other, handle, slot_id=0, generation=1)
             finally:
                 other.unregister(handle)
@@ -285,3 +290,35 @@ class TestRunStreamReuseHbg(SceneTestCase):
             assert st_worker.run_stream_set_create_count == stream_sets
         finally:
             st_worker.unregister(add_handle)
+
+
+@scene_test(level=2, runtime="tensormap_and_ringbuffer")
+class TestRunStreamFreshTmr(SceneTestCase):
+    """TMR preparation keeps the same fresh run-owned AICore stream rule."""
+
+    CALLABLE = TestRunStreamReuseHbg.CALLABLE
+    CASES = TestRunStreamReuseHbg.CASES
+
+    generate_args = TestRunStreamReuseHbg.generate_args
+    compute_golden = TestRunStreamReuseHbg.compute_golden
+
+    def test_every_run_creates_its_own_aicore_stream(self, st_platform, st_worker):
+        if st_platform != "a2a3":
+            pytest.skip("run stream sets are an a2a3 onboard resource")
+
+        callable_obj = self.build_callable(st_platform)
+        self._run_and_validate_l2(st_worker, callable_obj, self.CASES[0], rounds=1)
+        after_first = st_worker.run_stream_set_create_count
+        rounds = _REPEATED_RUNS - 1
+        self._run_and_validate_l2(st_worker, callable_obj, self.CASES[0], rounds=rounds)
+        assert st_worker.run_stream_set_create_count == after_first + rounds
+
+    def test_native_execution_thread_is_persistent(self, st_platform, st_worker):
+        if st_platform != "a2a3":
+            pytest.skip("persistent native execution is an a2a3 onboard resource")
+
+        callable_obj = self.build_callable(st_platform)
+        self._run_and_validate_l2(st_worker, callable_obj, self.CASES[0], rounds=1)
+        assert st_worker.native_execution_thread_create_count == 1
+        self._run_and_validate_l2(st_worker, callable_obj, self.CASES[0], rounds=_REPEATED_RUNS)
+        assert st_worker.native_execution_thread_create_count == 1

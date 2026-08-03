@@ -41,6 +41,7 @@
 #include <array>
 #include <atomic>
 #include <cstddef>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -121,7 +122,9 @@ public:
     /**
      * Reserve caller-owned native-run storage before binding starts. A
      * concurrent reservation is admitted only while the first reservation
-     * owns the execution claim and selects distinct per-run resources.
+     * owns the execution claim and selects a distinct pipeline slot. A backend
+     * that shares an arena bank must reject or defer incompatible preparation
+     * before mutating that bank.
      */
     bool try_reserve_native_run(
         const void *owner, uint32_t pipeline_slot, uint32_t arena_bank, bool allow_prepared_successor
@@ -234,6 +237,16 @@ public:
      * rtSetDevice(device_id) on entry.
      */
     std::thread create_thread(std::function<void()> fn);
+
+    /** Submit blocking device execution to this runner's persistent host thread. */
+    bool submit_native_execution(std::function<void()> fn);
+
+    /** Stop the persistent execution thread after all native runs have retired. */
+    void shutdown_native_execution();
+
+    size_t native_execution_thread_create_count() const {
+        return native_execution_thread_create_count_.load(std::memory_order_relaxed);
+    }
 
     /**
      * Attach the current host thread to the target device.
@@ -500,9 +513,9 @@ public:
     size_t host_dlopen_count() const { return host_dlopen_total_; }
 
     /**
-     * Number of run stream generations this runner has created. AICPU streams
-     * belong to pipeline slots, while an AICore stream is reused only for the
-     * same AICore image. Arches whose runs use the persistent pair report 0.
+     * Number of run-owned AICore streams this runner has created. AICPU streams
+     * belong to pipeline slots, while every native prepare provisions a fresh
+     * AICore stream. Arches whose runs use the persistent pair report 0.
      */
     virtual size_t run_stream_set_create_count() const { return 0; }
 
@@ -952,6 +965,13 @@ protected:
     std::array<NativeRunReservation, PTO_PIPELINE_MAX_DEPTH> native_run_reservations_{};
     std::atomic<const void *> active_native_run_{nullptr};
     NativeRunLaunchSignal *native_launch_signal_{nullptr};
+    std::mutex native_execution_mu_;
+    std::condition_variable native_execution_cv_;
+    std::thread native_execution_thread_;
+    std::function<void()> native_execution_task_;
+    bool native_execution_active_{false};
+    bool native_execution_stop_{false};
+    std::atomic<size_t> native_execution_thread_create_count_{0};
 
     // ---- State shared by both a2a3 and a5 ---------------------------------
     //

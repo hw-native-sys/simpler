@@ -118,10 +118,10 @@ public:
      * the token, and the caller must still finalize it. The blocking composition
      * performs that cleanup internally on every exit.
      *
-     * Onboard HBG may prepare one distinct-slot successor while another run
-     * owns the execution claim. Diagnostics and backends without the explicit
-     * capability remain depth-one. The slot/lease-generation/process-unique-
-     * run-epoch token prevents a delayed phase call from touching reused
+     * A capable backend may prepare one distinct-slot successor while another
+     * run owns the execution claim. Diagnostics and backends without that
+     * explicit capability remain depth-one. The slot/lease-generation/process-
+     * unique-run-epoch token prevents a delayed phase call from touching reused
      * storage, including another run under the same pipeline lease or on
      * another ChipWorker.
      */
@@ -161,6 +161,9 @@ public:
     /// created AICore stream, so this advances once per run. Platforms using
     /// the persistent bootstrap pair report 0.
     size_t run_stream_set_create_count() const;
+
+    /// Number of persistent native execution threads created by the runner.
+    size_t native_execution_thread_create_count() const;
 
     uint64_t malloc(size_t size);
     void free(uint64_t ptr);
@@ -322,6 +325,7 @@ private:
     GetAicpuDlopenCountFn get_aicpu_dlopen_count_fn_ = nullptr;
     GetAicpuDlopenCountFn get_host_dlopen_count_fn_ = nullptr;
     GetAicpuDlopenCountFn get_run_stream_set_create_count_fn_ = nullptr;
+    GetAicpuDlopenCountFn get_native_execution_thread_create_count_fn_ = nullptr;
     SimplerProvisionDmaWorkspaceFn simpler_provision_dma_workspace_fn_ = nullptr;
     FinalizeDeviceFn finalize_device_fn_ = nullptr;
     EnsureAclReadyFn ensure_acl_ready_fn_ = nullptr;

@@ -1365,7 +1365,9 @@ class ChipWorker:
             setattr(config, k, v)
         self._impl._run_with_pipeline_lease(int(callable_id), args, config, int(slot_id), int(generation))
 
-    def _prepare_native_run_with_pipeline_lease(self, callable_id, args, slot_id, generation, config=None, **kwargs):
+    def _prepare_native_run_with_pipeline_lease(
+        self, callable_id, args, slot_id, generation, config=None, *, run_id=0, dispatch_id=0, **kwargs
+    ):
         """Prepare one native run without crossing its device launch fence.
 
         Private B3a seam for the hierarchical endpoint. The returned token is
@@ -1379,7 +1381,7 @@ class ChipWorker:
         for k, v in kwargs.items():
             setattr(config, k, v)
         return self._impl._prepare_native_run_with_pipeline_lease(
-            int(callable_id), args, config, int(slot_id), int(generation)
+            int(callable_id), args, config, int(slot_id), int(generation), int(run_id), int(dispatch_id)
         )
 
     def _launch_native_run(self, run):
@@ -1413,12 +1415,21 @@ class ChipWorker:
         return self._impl.run_stream_set_create_count
 
     @property
+    def native_execution_thread_create_count(self):
+        """Number of persistent native execution threads created by the runner."""
+        return self._impl.native_execution_thread_create_count
+
+    @property
     def pipeline_depth(self):
         return self._impl.pipeline_depth
 
     @property
     def runtime_slot_count(self):
         return self._impl.runtime_slot_count
+
+    @property
+    def supports_concurrent_native_prepare(self):
+        return bool(self._impl.supports_concurrent_native_prepare)
 
     @property
     def runtime_buffer_addrs(self):

@@ -238,40 +238,31 @@ successor: IDLE -> PREPARE_READY -> FRAME_STAGED -> ACTIVATE
 
 `FRAME_STAGED` means the child validated the frame identity and arguments,
 resolved the callable digest, rewrote any mapped host addresses, and retained
-an immutable snapshot. The state does not by itself distinguish validation-only
-staging from completed native preparation. When both an HBG successor and its
-already-active predecessor are non-diagnostic, the child prepares a
-generation-bound native token in the successor's leased inactive bank before
-publishing `FRAME_STAGED`. A successor that arrives before any active claim
-publishes validation-only, allowing the parent to activate it; native prepare
-follows that activation or a later predecessor claim without another mailbox
-state transition. HBG tasks adjacent to diagnostic state and all TMR tasks keep
-the same two-frame protocol but defer native prepare because their shared
-diagnostic or device-scratch state cannot be rewritten while another run is
-active.
+an immutable snapshot. It does not by itself say whether the runtime-specific
+native run is prepared. A backend with the explicit concurrent-prepare
+capability may prepare one non-diagnostic successor in a distinct leased slot
+while the predecessor is active. Unsupported backends and diagnostic runs keep
+validation-only staging and defer native prepare until the predecessor is
+polled and finalized. Neither path launches or accepts the successor before
+FIFO activation.
 
-An HBG token remains unlaunched and unaccepted until activation, and no backend
-launches a successor until the predecessor is polled and finalized. Shutdown,
-stale activation, and pre-launch failure finalize any unlaunched token exactly
-once.
+HBG opts into concurrent preparation using its two lease-selected
+`HOST_PER_RUN` banks. Preparation binds the successor and creates its fresh
+AICore stream in the inactive bank while leaving the active bank immutable.
+A frame that arrives before any active claim publishes validation-only and may
+gain its native token later without another mailbox state transition.
 
 Activation is sticky on the parent side: FIFO promotion may be observed before
 the child reaches `FRAME_STAGED`. The endpoint records that permission and
 publishes `ACTIVATE` only by a compare/exchange from the matching
-`FRAME_STAGED` state. The child validates all newly visible frame metadata
-before choosing the next active frame by `dispatch_id`; capable native prepare
-starts for that frame first, and a successor prepares only after the selected
-predecessor owns the active claim. Frame index therefore cannot let a later
-dispatch bypass an earlier eligible dispatch.
+`FRAME_STAGED` state. The child chooses activated frames by `dispatch_id`, so a
+later frame cannot bypass an earlier eligible dispatch.
 
 Task-frame publication briefly shares the base control mutex so it has a
 defined order relative to a control request. Once published, ordinary controls
 may run while the device task is active. Registry-mutating controls are
 deferred until active and backend-prepared native state is finalized; final
 unregister also waits for every published frame using that digest to retire.
-The default unbounded control wait follows child liveness through this
-deferral. A finite timeout includes the deferral interval and poisons the
-endpoint if it expires with completion uncertain.
 
 Each task frame is bound to its pipeline lease slot and carries a protocol
 trailer with `{run_id, slot_id, generation, dispatch_id}`. Parent and child

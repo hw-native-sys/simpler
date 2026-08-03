@@ -689,6 +689,13 @@ class TestApiLinearizationDuringInit:
 class _FakeChipOk:
     """Stand-in for a ChipWorker whose init succeeds — no NPU touched."""
 
+    pipeline_depth = 1
+    supports_concurrent_native_prepare = False
+
+    def __init__(self):
+        self.events = []
+        self.complete = False
+
     def init(self, *_a, **_k):
         pass
 
@@ -697,6 +704,28 @@ class _FakeChipOk:
 
     def _run_slot(self, *_a, **_k):
         pass
+
+    def _prepare_native_run_with_pipeline_lease(
+        self, callable_id, args, slot_id, generation, config, *, run_id, dispatch_id
+    ):
+        del args, config
+        token = (callable_id, slot_id, generation, run_id, dispatch_id)
+        self.events.append(("prepare", token))
+        return token
+
+    def _launch_native_run(self, token):
+        self.events.append(("launch", token))
+
+    def _poll_native_run(self, token):
+        self.events.append(("poll", token))
+        return self.complete
+
+    def _wait_native_run(self, token):
+        self.events.append(("wait", token))
+        self.complete = True
+
+    def _finalize_native_run(self, token):
+        self.events.append(("finalize", token))
 
     def finalize(self):
         pass
@@ -761,7 +790,7 @@ class TestLevel2Lifecycle:
             # A second close is a clean no-op (does not re-block on the epoch cv).
             w.close()
 
-    def test_l2_submit_returns_completed_handle(self, monkeypatch):
+    def test_l2_submit_returns_live_handle_and_wait_finalizes_it(self, monkeypatch):
         from simpler.task_interface import ChipCallable  # noqa: PLC0415
 
         w = self._make_l2(monkeypatch)
@@ -771,8 +800,18 @@ class TestLevel2Lifecycle:
             w.init()
             run_handle = w.submit(callable_handle)
             assert isinstance(run_handle, RunHandle)
-            assert run_handle.done
+            assert not run_handle.done
             assert run_handle.wait() is None
+            assert run_handle.done
+            chip_worker = w._chip_worker
+            assert chip_worker is not None
+            assert [event[0] for event in chip_worker.events] == [
+                "prepare",
+                "launch",
+                "poll",
+                "wait",
+                "finalize",
+            ]
             w.close()
 
     def test_l2_close_without_init_is_noop(self, monkeypatch):

@@ -17,7 +17,7 @@ namespace {
 
 constexpr uint64_t kAdd = 0;
 constexpr uint64_t kAddScalar = 1;
-constexpr int kChainLength = 64;
+constexpr int kChainLength = 512;
 
 }  // namespace
 

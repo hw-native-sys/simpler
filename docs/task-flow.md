@@ -69,9 +69,9 @@ follows `CallConfig`, and the 32-byte digest prefixes the args blob. SUB,
 nested/remote L3, simulation, A5, and depth-one fallbacks carry that payload in
 the base compatibility frame. A direct A2/A3 onboard chip child can instead
 use either of two task frames after the base control frame, with
-`PREPARE_READY -> FRAME_STAGED -> ACTIVATE` separating endpoint preparation
-from native launch. The receiving child resolves the digest in its own address
-space in both forms.
+`PREPARE_READY -> FRAME_STAGED -> ACTIVATE` separating validation from native
+launch. The receiving child resolves the digest in its own address space in
+both forms.
 
 The proposed remote L3 path keeps the same callable identity contract, but
 sends it in a versioned TASK frame. The remote endpoint resolves the digest
@@ -348,11 +348,22 @@ finalize`, and the existing `simpler_run` / `ChipWorker.run` surface is the
 blocking composition of those phases. `prepare` constructs and binds the
 per-run `Runtime` without crossing the device launch fence; `launch` returns
 after the backend has actually submitted its execution; `finalize` owns
-validation, copy-back, DFX, and Runtime destruction. A backend that advertises
-concurrent native preparation may own one active token and one prepared but
-unlaunched and unaccepted successor token in separate lease-selected banks.
-Other backends permit only one unfinished native run, including a
-prepared-but-not-launched run.
+validation, copy-back, DFX, and Runtime destruction. One runner still permits
+one device-launch owner. A backend that explicitly advertises concurrent native
+preparation may additionally own one distinct-slot, prepared-but-unlaunched
+successor. Backends without that capability and diagnostic configurations keep
+the depth-one native lifecycle.
+
+Direct L2 `Worker.submit()` composes the same phases asynchronously: it returns
+after launch instead of device completion, and its `RunHandle` drives the
+ordered wait/finalize handoff. At depth two the second handle may own a prepared
+successor; a third submission backpressures before preparing or reusing a slot.
+
+On onboard runners, blocking CANN execution is carried by one persistent host
+thread per runner. Launch wakes that thread through a condition variable, while
+the endpoint or direct-L2 owner continues to drive FIFO preparation, polling,
+and finalization. Runs do not create or destroy host execution threads, and an
+idle runner consumes no polling CPU.
 
 #### Two-frame endpoint staging lane
 
@@ -371,28 +382,27 @@ IDLE -> PREPARE_READY -> FRAME_STAGED -> ACTIVATE -> TASK_LAUNCHED
                                                -> TASK_DONE | TASK_FAILED
 ```
 
-`FRAME_STAGED` means that the child owns an immutable frame snapshot; it does
-not by itself distinguish validation-only staging from completed native
-preparation. For a `host_build_graph` successor whose own configuration and
-active predecessor are both non-diagnostic, the child constructs a
-generation-bound native run in the leased inactive arena bank while the
-predecessor executes. If the predecessor is already active, that preparation
-finishes before `FRAME_STAGED` publication. A successor that reaches the child
-before any predecessor owns the active claim publishes validation-only, so the
-parent can activate it without deadlock; native prepare follows activation or
-a later predecessor claim without another mailbox state transition. HBG tasks
-adjacent to diagnostic state and all
-`tensormap_and_ringbuffer` tasks also use this as a validation-only state:
-native prepare waits for the predecessor's complete device fence because their
-shared diagnostic or device-scratch state is not safe to rewrite early.
-Backend and per-run capabilities, rather than the mailbox protocol, select
-between these meanings.
+`FRAME_STAGED` means the child validated and owns an immutable frame snapshot;
+the mailbox state does not distinguish validation-only staging from completed
+native preparation. A capable backend may prepare a non-diagnostic successor
+in its leased slot while the predecessor is active. Otherwise native prepare is
+deferred until the predecessor has polled complete and finalized. In both cases
+the successor remains unlaunched and unaccepted until FIFO activation.
 
-An HBG successor's prepared token remains unlaunched and unaccepted until
-`ACTIVATE`, and activation still cannot launch it until the predecessor has
-polled complete and finalized. The sticky acceptance word therefore remains
-zero throughout preparation. Shutdown, stale activation, and pre-launch
-failure finalize the token exactly once before the frame becomes terminal.
+`host_build_graph` advertises this capability because each lease selects an
+independent `HOST_PER_RUN` arena bank. Once the predecessor owns the active
+claim, the child binds the successor into the inactive bank and provisions its
+fresh AICore stream before publishing `FRAME_STAGED`. The active bank remains
+immutable, and launch still waits for predecessor completion and finalization.
+
+`tensormap_and_ringbuffer` stages slot-private task arguments and Host
+descriptors while sharing arena bank 0. Concurrent native preparation requires
+the successor's resolved runtime sizing key to match the active prebuilt arena.
+An incompatible successor remains staged in FIFO order and retries preparation
+after the active device fence; it is not rejected. Both paths keep a fresh
+AICore stream per run and persistent slot-owned AICPU streams.
+Diagnostics retain validation-only staging because their collectors are
+runner-global.
 
 The scheduler stages only the first eligible single NEXT_LEVEL task from the
 prepared FIFO successor. Tasks from the active run use only the active lane, so
@@ -401,12 +411,6 @@ remain on their normal queue and dispatch synchronously after FIFO promotion.
 Remote, SUB, A5, simulation, nested-worker, and single-frame endpoints retain
 the blocking compatibility path.
 
-The child validates newly visible metadata from both frames before selecting
-the next active `dispatch_id`. It prepares that active token first; preparation
-of an ordinary HBG successor starts only after the selected predecessor owns
-the native active claim. Physical frame order therefore cannot reorder native
-prepare or launch.
-
 Every task frame carries protocol, run, lease slot, generation, dispatch, and
 callable identity. Its sticky acceptance word is separate from the state word
 and is set only by the real native launch marker. `FRAME_STAGED` never satisfies
@@ -414,12 +418,8 @@ the launch fence. A terminal pre-launch failure may conservatively retire the
 run-level acceptance waiter, but it does not set the frame's acceptance word.
 The parent clears that word only immediately before reusing an `IDLE` frame.
 Control commands continue to use a separate base frame, so they cannot
-overwrite either staged task frame. Callable prepare/register/unregister
-commands defer while an active or backend-prepared token owns runtime state.
-The default unbounded control wait therefore follows child liveness through a
-long run; a finite control timeout includes this deferral interval, and expiry
-poisons the local endpoint because the pending command's completion is
-uncertain.
+overwrite either staged task frame. Registry mutation is deferred while an
+active or backend-prepared token still owns runtime state.
 
 #### TRB temporary buffer
 
@@ -727,8 +727,8 @@ Step-by-step (one chip worker):
 | 3 | `Orchestrator::submit_next_level` | `slot = ring.alloc()`; move `chip_args` into `slot.task_args`; walk tags → `tensormap.lookup(a.data)`, `tensormap.lookup(b.data)`, `tensormap.insert(c.data, slot)`; push ready |
 | 4 | Scheduler thread | pop `slot` from worker 0's FIFO; resolve stable worker ID 0 to WT_chip_0; dispatch |
 | 5 | WT_chip_0 parent side | encode one leased task frame: write `config`, digest prefix, and the args blob; publish `TASK_READY` for the active lane or `PREPARE_READY` for a staged successor |
-| 6 | chip_0 child process | validate the frame and resolve its digest; ordinary HBG with an active predecessor also prepares the leased inactive arena bank before publishing `FRAME_STAGED`, while a frame with no active predecessor, diagnostic HBG, and TMR publish after validation and defer native prepare |
-| 7 | chip_0 native-run path | after activation and the predecessor's finalization fence, launch an already-prepared HBG run or finish deferred native preparation and then launch; poll it to completion and finalize it before another staged frame may launch. Compatibility endpoints perform the equivalent operation through blocking `ChipWorker::run` |
+| 6 | chip_0 child process | validate the frame and resolve its digest, then publish `FRAME_STAGED`; a successor waits for `ACTIVATE`, while the active frame may proceed immediately |
+| 7 | chip_0 native-run path | after activation, prepare and launch the native run; poll it to completion and finalize it before another staged frame may launch. Compatibility endpoints perform the equivalent operation through blocking `ChipWorker::run` |
 | 8 | runtime.so | translate host ptrs → device ptrs; dispatch AICPU / AICore; write output into `c`'s shm |
 | 9 | chip_0 child | native finalization returns; write `TASK_DONE` |
 | 10 | WT_chip_0 parent | observe `TASK_DONE`; push success completion |
