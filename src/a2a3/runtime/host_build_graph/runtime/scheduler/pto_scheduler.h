@@ -15,7 +15,7 @@
  * The Scheduler is responsible for:
  * 1. Maintaining per-resource-shape ready queues
  * 2. Polling-completion dependency resolution: a task is ready when every
- *    producer named in its inline fanin has set its completion_flags byte;
+ *    producer named in its inline fanin has set its completion_flags entry;
  *    a producer publishes completion + drains its wake list on finish
  * 3. Publishing the host-visible task_state mirror (PENDING -> COMPLETED) and
  *    advancing the per-ring completed_watermark (consumer-retirement signal)
@@ -30,8 +30,12 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
+#include <cstdlib>
+#include <functional>
 
+#include "common.h"  // always_assert
 #include "common/core_type.h"
 #include "common/memory_barrier.h"
 #include "utils/device_arena.h"
@@ -50,6 +54,10 @@
         acc += (_st1 - _st0);       \
         _st0 = _st1;                \
     } while (0)
+#endif
+
+#ifndef unlikely
+#define unlikely(x) __builtin_expect(!!(x), 0)
 #endif
 
 // =============================================================================
@@ -463,6 +471,48 @@ struct PTO2SchedulerState {
     // the dispatch loop and completed inline -- never goes to AICore.
     PTO2ReadyQueue dummy_ready_queue;
 
+    // POD dynamic min-heap: entries/count/capacity all start at 0 under the
+    // arena's memset — a valid empty state, unlike std::vector's non-trivial
+    // constructor. Grows via realloc on push instead of a fixed cap.
+    // destroy() frees the buffer; PTO2SchedulerState::destroy() must reach
+    // every thread's instance or the buffer leaks.
+    struct FailedCompletionFlagHeap {
+        int32_t *entries = nullptr;
+        int32_t count = 0;
+        int32_t capacity = 0;
+
+        void push(int32_t task_id) {
+            if (count == capacity) {
+                int32_t new_capacity = capacity == 0 ? 8 : capacity * 2;
+                int32_t *grown =
+                    static_cast<int32_t *>(realloc(entries, static_cast<size_t>(new_capacity) * sizeof(int32_t)));
+                always_assert(grown != nullptr);
+                entries = grown;
+                capacity = new_capacity;
+            }
+            entries[count++] = task_id;
+            std::push_heap(entries, entries + count, std::greater<>{});
+        }
+
+        int32_t pop_min() {
+            std::pop_heap(entries, entries + count, std::greater<>{});
+            return entries[--count];
+        }
+
+        bool empty() const { return count == 0; }
+
+        void destroy() {
+            free(entries);
+            entries = nullptr;
+            count = 0;
+            capacity = 0;
+        }
+    };
+
+    // Heap of tasks for which setting the completion flag failed. Should always
+    // be empty. This only exists as a failsafe.
+    FailedCompletionFlagHeap failed_heap_of_set_completion_flag[PLATFORM_MAX_AICPU_THREADS];
+
     alignas(64) AsyncWaitList async_wait_list;
 
     // Statistics (cold path, isolated from hot-path fields)
@@ -493,14 +543,14 @@ struct PTO2SchedulerState {
 
     // ---- Polling completion primitives (single-ring hbg) ----------------------
     // Readiness: a task is ready iff every producer named in its inline fanin has
-    // set its completion_flags byte. Single-ring: all producers are ring 0, so
+    // set its completion_flags entry. Single-ring: all producers are ring 0, so
     // there is no per-edge ring indirection.
 
-    bool fanin_satisfied(const PTO2TaskSlotState *s) const {
+    bool fanin_satisfied(int32_t thread_idx, const PTO2TaskSlotState *s) const {
         const PTO2TaskPayload &p = *s->payload;
         const PTO2SharedMemoryRingHeader &ring = *ring_sched_state.ring;
         for (int32_t i = 0; i < p.fanin_count; i++) {
-            if (!ring.is_completion_flag_set(p.fanin_local_ids[i])) return false;
+            if (!ring.is_completion_flag_set(thread_idx, p.fanin_local_ids[i])) return false;
         }
         return true;
     }
@@ -509,11 +559,11 @@ struct PTO2SchedulerState {
     // or the index of the first unmet fanin (register on that producer's wake
     // list). The decision is terminal: tasks are never re-polled; a producer's
     // completion re-scans its waiters via on_mixed_task_complete's wake drain.
-    int classify_fanin_state(const PTO2TaskSlotState *s) const {
+    int classify_fanin_state(int32_t thread_idx, const PTO2TaskSlotState *s) const {
         const PTO2TaskPayload &p = *s->payload;
         const PTO2SharedMemoryRingHeader &ring = *ring_sched_state.ring;
         for (int32_t i = 0; i < p.fanin_count; i++) {
-            if (!ring.is_completion_flag_set(p.fanin_local_ids[i])) return i;
+            if (!ring.is_completion_flag_set(thread_idx, p.fanin_local_ids[i])) return i;
         }
         return -1;
     }
@@ -522,7 +572,7 @@ struct PTO2SchedulerState {
     // completed (head == SENTINEL), re-classify against ALL fanins: route to
     // ready only when every fanin is met, else re-target the next unmet producer
     // and retry. Monotonic completion_flags guarantee termination.
-    void register_wake(PTO2TaskSlotState *producer, PTO2TaskSlotState *consumer) {
+    void register_wake(int32_t thread_idx, PTO2TaskSlotState *producer, PTO2TaskSlotState *consumer) {
         PTO2SharedMemoryRingHeader &ring = *ring_sched_state.ring;
         while (true) {
             PTO2TaskSlotState *expected = producer->wake_list_head.load(std::memory_order_relaxed);
@@ -534,7 +584,7 @@ struct PTO2SchedulerState {
                     return;
                 }
             }
-            int32_t state = classify_fanin_state(consumer);
+            int32_t state = classify_fanin_state(thread_idx, consumer);
             if (state < 0) {
                 push_ready_routed(consumer);
                 return;
@@ -543,20 +593,17 @@ struct PTO2SchedulerState {
         }
     }
 
-    // Producer completion under polling: publish the host-visible task_state
-    // mirror + the device-visible completion_flags byte, drain the wake list
-    // (route/re-register each waiter), then CAS-advance the monotonic
-    // completed_watermark (load-bearing: the host wait_for_consumers gates on
-    // watermark >= producer.last_consumer_local_id). Whole-graph-resident hbg
-    // has no device slot reclaim, so no advance_ring_pointers here.
-    void on_mixed_task_complete(PTO2TaskSlotState &slot_state) {
-        const int32_t task_id = static_cast<int32_t>(slot_state.task->task_id.local());
+    // Drains `producer`'s wake list, reclassifying and routing each waiter.
+    // Only valid to call once `producer`'s own completion_flags entry is
+    // durably set: this is what lets a reclassified multi-fanin waiter trust
+    // is_completion_flag_set on `producer` itself. on_mixed_task_complete
+    // calls this inline when try_set_completion_flag succeeds immediately;
+    // when it doesn't, the drain is deferred to whichever
+    // retry_set_completion_flags call later gets that store to succeed —
+    // never run against a producer whose flag write is still pending.
+    void drain_wake_list(int32_t thread_idx, PTO2TaskSlotState &producer) {
         PTO2SharedMemoryRingHeader &ring = *ring_sched_state.ring;
-
-        slot_state.mark_completed();  // host-visible mirror (task_state = COMPLETED)
-        ring.set_completion_flag(task_id);
-
-        PTO2TaskSlotState *waiter = slot_state.wake_list_head.exchange(WAKE_LIST_SENTINEL, std::memory_order_acq_rel);
+        PTO2TaskSlotState *waiter = producer.wake_list_head.exchange(WAKE_LIST_SENTINEL, std::memory_order_acq_rel);
         while (waiter != nullptr && waiter != WAKE_LIST_SENTINEL) {
             PTO2TaskSlotState *next = waiter->next_in_wake_list;
             if (waiter->payload->fanin_count == 1) {
@@ -564,28 +611,83 @@ struct PTO2SchedulerState {
                 waiter = next;
                 continue;
             }
-            int state = classify_fanin_state(waiter);
+            int state = classify_fanin_state(thread_idx, waiter);
             if (state < 0) {
                 push_ready_routed(waiter);
             } else {
-                register_wake(&ring.get_slot_state_by_task_id(waiter->payload->fanin_local_ids[state]), waiter);
+                register_wake(
+                    thread_idx, &ring.get_slot_state_by_task_id(waiter->payload->fanin_local_ids[state]), waiter
+                );
             }
             waiter = next;
         }
+    }
 
-        // completed_watermark = highest id such that every task in [0, watermark]
-        // has its completion_flags byte set. The host wait_for_consumers gates on
-        // watermark >= producer.last_consumer_local_id, so the walk must extend to
-        // the full contiguous completed prefix — NOT cap at task_id. Capping at task_id
-        // makes the final value order-dependent: a low-id task completing after a
-        // higher one would leave the watermark stuck below the true prefix, hanging
-        // any wait_for_consumers whose last_consumer sits in the gap.
-        ring.update_completed_watermark();
+    // Producer completion under polling: publish the host-visible task_state
+    // mirror, try to publish the device-visible completion_flags entry (see
+    // try_set_completion_flag). On success, drain the wake list (route/
+    // re-register each waiter) and CAS-advance the monotonic
+    // completed_watermark (load-bearing: the host wait_for_consumers gates on
+    // watermark > producer.last_consumer_local_id). On failure, the store is
+    // queued for retry and the wake list is left untouched — draining it here
+    // with the flag still unset would let a multi-fanin waiter re-register on
+    // this same, now-permanently-SENTINEL producer and spin forever; the
+    // eventual successful retry_set_completion_flags call drains it instead.
+    // Whole-graph-resident hbg has no device slot reclaim, so no
+    // advance_ring_pointers here.
+    void on_mixed_task_complete(int32_t thread_idx, PTO2TaskSlotState &slot_state) {
+        const int32_t task_id = static_cast<int32_t>(slot_state.task->task_id.local());
+        PTO2SharedMemoryRingHeader &ring = *ring_sched_state.ring;
+
+        slot_state.mark_completed();  // host-visible mirror (task_state = COMPLETED)
+        if (unlikely(not ring.try_set_completion_flag(thread_idx, task_id))) {
+            failed_heap_of_set_completion_flag[thread_idx].push(task_id);
+            return;
+        }
+
+        drain_wake_list(thread_idx, slot_state);
+
+        // completed_watermark = lowest id not yet guaranteed complete: every task
+        // in [0, watermark) has its completion_flags entry set. This bounded
+        // advance publishes at most task_id + 1 — low-latency unblocking for a
+        // wait_for_consumers whose last_consumer_local_id is exactly this task.
+        // The uncapped full-prefix walk that keeps the watermark order-independent
+        // (needed when a low-id task completes after a higher one already
+        // advanced it partway) is in resolve_and_dispatch (scheduler_dispatch.cpp),
+        // called once per scheduler loop iteration after that iteration's
+        // dispatch phase.
+        ring.weak_update_completed_watermark(thread_idx, task_id + 1);
+    }
+
+    // Retries deferred completion_flags stores in ascending task-id order.
+    // earlier_task (see try_set_completion_flag) grows with local_id, so the
+    // heap's minimum has the loosest watermark requirement of any pending
+    // entry: if it still can't write, no larger id in the heap can either,
+    // which is what makes stopping at the first failure correct rather than
+    // merely cheap. Each success drains that task's wake list immediately
+    // (see drain_wake_list) — this is the only place a deferred entry's
+    // waiters ever get released.
+    void retry_set_completion_flags(int32_t thread_idx) {
+        PTO2SharedMemoryRingHeader &ring = *ring_sched_state.ring;
+        FailedCompletionFlagHeap &heap = failed_heap_of_set_completion_flag[thread_idx];
+
+        while (unlikely(not heap.empty())) {
+            int32_t min_task = heap.entries[0];
+            if (not ring.try_set_completion_flag(thread_idx, min_task)) {
+                break;
+            }
+            heap.pop_min();
+
+            drain_wake_list(thread_idx, ring.get_slot_state_by_task_id(min_task));
+            // Same low-latency completed_watermark bump on_mixed_task_complete's
+            // tail does for the immediate-success case — see there for why.
+            ring.weak_update_completed_watermark(thread_idx, min_task + 1);
+        }
     }
 
     // Polling: there is no ready-claim CAS (a producer routes each waiter exactly
     // once via the wake-list drain) and no per-producer consumer/scope refcount.
-    // Consumer retirement is observed by the host through completed_watermark >=
+    // Consumer retirement is observed by the host through completed_watermark >
     // producer.last_consumer_local_id, not by bumping a producer refcount.
 
     // Early-dispatch release. If the now-ready task was pre-staged
@@ -818,7 +920,7 @@ struct PTO2SchedulerState {
 
     // Polling: scope-end takes no per-producer action. Under the wiring model
     // this bumped each task's scope refcount (PTO2_FANOUT_SCOPE_BIT); reclaim now
-    // gates on completed_watermark >= last_consumer_local_id, which needs no
+    // gates on completed_watermark > last_consumer_local_id, which needs no
     // scope reference. Kept as a no-op so the orchestrator call site is unchanged.
     void on_scope_end(PTO2TaskSlotState ** /*task_slot_states*/, int32_t /*count*/) {}
 
@@ -852,20 +954,13 @@ struct PTO2SchedulerState {
 #else
     uint32_t
 #endif
-    on_task_complete(
-        PTO2TaskSlotState &slot_state
-#if SIMPLER_SCHED_PROFILING
-        ,
-        int thread_idx
-#endif
-    ) {
+    on_task_complete(PTO2TaskSlotState &slot_state, int32_t thread_idx) {
         // Polling completion: publish the host-visible task_state mirror + the
-        // device-visible completion_flags byte, drain the wake list (route or
+        // device-visible completion_flags entry, drain the wake list (route or
         // re-register each waiter), and advance the watermark. Replaces the
         // fanout-list walk + fanin_refcount decrements of the wiring model.
-        on_mixed_task_complete(slot_state);
+        on_mixed_task_complete(thread_idx, slot_state);
 #if SIMPLER_SCHED_PROFILING
-        (void)thread_idx;
         // Resolved-successor accounting is not tracked on the polling path (the
         // producer no longer enumerates its consumers); report 0 for the DFX bar.
         return CompletionStats{0, 0, 0, true};
@@ -922,31 +1017,21 @@ inline bool
 AsyncWaitList::try_inline_complete_locked(AsyncWaitList::DrainCompletionSink &sink, PTO2TaskSlotState &slot_state) {
     // Return value (CompletionStats / consumer-walk count) discarded:
     // async-wait drain path has no Resolve swimlane bar attached.
-#if SIMPLER_SCHED_PROFILING
     (void)sink.sched->on_task_complete(slot_state, sink.thread_idx);
-#else
-    (void)sink.sched->on_task_complete(slot_state);
-#endif
     sink.inline_completed++;
     return true;
 }
 
 template <bool Profiling>
 inline AsyncPollResult AsyncWaitList::poll_and_complete(
-    AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched
-#if SIMPLER_SCHED_PROFILING
-    ,
-    int thread_idx
-#endif
+    AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched, int32_t thread_idx
 ) {
     AsyncPollResult result;
     if (!try_lock()) return result;
 
     AsyncWaitList::DrainCompletionSink sink{};
     sink.sched = sched;
-#if SIMPLER_SCHED_PROFILING
     sink.thread_idx = thread_idx;
-#endif
 
     int32_t drain_err = PTO2_ERROR_NONE;
     drain_aicore_completion_mailbox_locked(aicore_mailbox, sink, drain_err);
@@ -987,11 +1072,7 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
         if (entry.normal_done && entry.waiting_completion_count <= 0) {
             // Return value (CompletionStats / consumer-walk count) discarded:
             // deferred-completion drain has no Resolve swimlane bar attached.
-#if SIMPLER_SCHED_PROFILING
             (void)sched->on_task_complete(*entry.slot_state, thread_idx);
-#else
-            (void)sched->on_task_complete(*entry.slot_state);
-#endif
             // Polling: completion is fully published inline; no deferred release.
             result.completed++;
 

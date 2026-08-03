@@ -193,6 +193,9 @@ void PTO2SchedulerState::wire_arena_pointers(const PTO2SchedulerLayout &layout, 
 void PTO2SchedulerState::destroy() {
     PTO2SchedulerState *sched = this;
     sched->ring_sched_state.destroy();
+    for (int i = 0; i < PLATFORM_MAX_AICPU_THREADS; i++) {
+        sched->failed_heap_of_set_completion_flag[i].destroy();
+    }
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         ready_queue_destroy(&sched->ready_queues[i]);
     }

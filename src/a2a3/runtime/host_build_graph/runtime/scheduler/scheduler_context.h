@@ -37,57 +37,6 @@ class Runtime;
 struct Handshake;
 struct PTO2Runtime;
 
-// SPSC ring carrying completed-but-unresolved task slots from one scheduler (S)
-// thread to the dedicated resolution (P) thread. Whole-graph-resident hbg never
-// reclaims a slot, so the queued PTO2TaskSlotState* stays valid until P reads it.
-// Single producer (the owning S thread) / single consumer (P): plain
-// acquire/release on head/tail, no CAS. Capacity is a power of two sized to the
-// in-flight bound (min of total tasks and the ring window), so a producer does
-// not spin on a full queue in practice; the spin is a correctness backstop only
-// (P drains independently, so it always makes progress). The std::atomic cursors
-// make this type non-copyable / non-movable, so `buf` cannot be double-freed
-// through an accidental copy.
-struct CompletedTaskQueue {
-    PTO2TaskSlotState **buf{nullptr};
-    uint64_t cap{0};
-    uint64_t mask{0};
-    alignas(64) std::atomic<uint64_t> head{0};  // consumer (P) cursor
-    alignas(64) std::atomic<uint64_t> tail{0};  // producer (S) cursor
-
-    void init(uint64_t capacity_pow2) {
-        debug_assert(capacity_pow2 != 0 && (capacity_pow2 & (capacity_pow2 - 1)) == 0);
-        cap = capacity_pow2;
-        mask = capacity_pow2 - 1;
-        buf = new PTO2TaskSlotState *[capacity_pow2];
-        head.store(0, std::memory_order_relaxed);
-        tail.store(0, std::memory_order_relaxed);
-    }
-    void destroy() {
-        delete[] buf;
-        buf = nullptr;
-    }
-    // Producer (S). Spins only if the ring is full — sized so this never fires.
-    void push(PTO2TaskSlotState *s) {
-        uint64_t t = tail.load(std::memory_order_relaxed);
-        while (t - head.load(std::memory_order_acquire) >= cap) {
-            SPIN_WAIT_HINT();
-        }
-        buf[t & mask] = s;
-        tail.store(t + 1, std::memory_order_release);
-    }
-    // Consumer (P). Returns nullptr when empty.
-    PTO2TaskSlotState *pop() {
-        uint64_t h = head.load(std::memory_order_relaxed);
-        if (h == tail.load(std::memory_order_acquire)) {
-            return nullptr;
-        }
-        PTO2TaskSlotState *s = buf[h & mask];
-        head.store(h + 1, std::memory_order_release);
-        return s;
-    }
-    uint64_t size() const { return tail.load(std::memory_order_acquire) - head.load(std::memory_order_acquire); }
-};
-
 /**
  * SchedulerContext: owns all scheduler-side state and methods.
  *
@@ -135,16 +84,6 @@ public:
 
     // Main scheduler thread entry: poll completion + dispatch ready tasks.
     int32_t resolve_and_dispatch(Runtime *runtime, int32_t thread_idx);
-
-    // Dedicated resolution (P) thread entry (3S+1P). Owns no cores: drains the
-    // per-S CompletedTaskQueues and runs on_task_complete for each finished task
-    // (completion_flags publish + wake-list drain + watermark advance), making P
-    // the sole producer of the ready queues. Owns completed_tasks_ / termination.
-    int32_t run_resolution_thread(Runtime *runtime, int32_t thread_idx);
-
-    // Index of the dedicated resolution (P) thread — the last AICPU thread.
-    // host_build_graph always reserves it (aicpu_thread_num >= 2 is required).
-    int32_t p_thread_idx() const { return p_thread_idx_; }
 
     // Shutdown AICore registers for this thread's assigned cores.
     // Also runs PMU finalize (SIMPLER_DFX) before deinit when enabled.
@@ -225,15 +164,6 @@ private:
     int32_t active_sched_threads_{0};
     int32_t aicpu_thread_num_{0};
     int32_t cores_total_num_{0};
-
-    // --- 3S+1P dedicated resolution thread ---
-    // The AICPU threads split into (aicpu_thread_num_ - 1) core-owning schedulers
-    // (S) plus one core-less resolution thread (P) at index p_thread_idx_ =
-    // aicpu_thread_num_ - 1. host_build_graph requires aicpu_thread_num_ >= 2 (one
-    // S + one P). Each S thread hands its finished tasks to P through
-    // sp_queues_[its_thread_idx].
-    int32_t p_thread_idx_{-1};
-    CompletedTaskQueue sp_queues_[MAX_AICPU_THREADS];
 
     // Cluster-ordered worker_id lists, populated by post_handshake_init().
     int32_t aic_worker_ids_[RUNTIME_MAX_WORKER]{};

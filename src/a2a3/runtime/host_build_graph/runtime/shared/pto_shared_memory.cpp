@@ -57,7 +57,7 @@ void PTO2SharedMemoryHandle::setup_pointers_per_ring(const uint64_t task_window_
     ring.task_descriptors = (PTO2TaskDescriptor *)(base + off.descriptors);
     ring.task_payloads = (PTO2TaskPayload *)(base + off.payloads);
     ring.slot_states = (PTO2TaskSlotState *)(base + off.slot_states);
-    ring.completion_flags = (std::atomic<uint8_t> *)(base + off.completion_flags);
+    ring.completion_flags = (std::atomic<int32_t> *)(base + off.completion_flags);
 }
 
 void PTO2SharedMemoryHandle::setup_pointers(uint64_t task_window_size) {
@@ -91,8 +91,7 @@ bool PTO2SharedMemoryHandle::init_per_ring(
     sm_size = sm_size_arg;
     is_owner = false;
     setup_pointers_per_ring(task_window_sizes);
-    init_header_per_ring(task_window_sizes, heap_sizes);
-    return true;
+    return init_header_per_ring(task_window_sizes, heap_sizes);
 }
 
 bool PTO2SharedMemoryHandle::attach_populated(
@@ -138,25 +137,43 @@ void PTO2SharedMemoryHandle::destroy() {
 // =============================================================================
 //
 // no need init data in pool, init pool data when used
-void PTO2SharedMemoryHandle::init_header(uint64_t task_window_size, uint64_t heap_size) {
+bool PTO2SharedMemoryHandle::init_header(uint64_t task_window_size, uint64_t heap_size) {
     uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH];
     uint64_t heap_sizes[PTO2_MAX_RING_DEPTH];
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         task_window_sizes[r] = task_window_size;
         heap_sizes[r] = heap_size;
     }
-    init_header_per_ring(task_window_sizes, heap_sizes);
+    return init_header_per_ring(task_window_sizes, heap_sizes);
 }
 
-void PTO2SharedMemoryHandle::init_header_per_ring(
+bool PTO2SharedMemoryHandle::init_header_per_ring(
     const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]
 ) {
+    // flag_index() shifts a value left by shuffle_higher_bits; task_window_size must
+    // contribute at least shuffle_lower_bits trailing zero bits or that shift amount
+    // goes negative, which is undefined behavior. Checked here, at the single
+    // point that assigns header->ring.task_window_size below, so every caller
+    // (init_per_ring, init_header) is covered without duplicating the guard.
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        if (__builtin_ctzll(task_window_sizes[r]) < PTO2SharedMemoryRingHeader::shuffle_lower_bits) return false;
+    }
+
     // Flow control (starts at 0)
     header->ring.fc.init();
 
-    // Polling completion: -1 = "no task completed yet"; the first task to
-    // complete (local_id 0) advances the watermark to 0.
-    header->ring.completed_watermark.store(-1, std::memory_order_relaxed);
+    // Polling completion: 0 = "no task completed yet"; the first task to
+    // complete (local_id 0) advances the watermark to 1.
+    header->ring.completed_watermark.store(0, std::memory_order_relaxed);
+
+    // Per-thread cache of the last-observed completed_watermark (including the
+    // host's own slot at index PLATFORM_MAX_AICPU_THREADS). Shared memory is
+    // not guaranteed zero on device; a stale nonzero entry would make
+    // is_completion_flag_set's cache short-circuit report a not-yet-completed
+    // local_id as done.
+    for (auto &cached : header->ring.cached_completed_watermark) {
+        cached.val_ = 0;
+    }
 
     header->orchestrator_done.store(0, std::memory_order_relaxed);
 
@@ -164,6 +181,7 @@ void PTO2SharedMemoryHandle::init_header_per_ring(
     uint64_t offset = PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
     header->ring.task_window_size = task_window_sizes[0];
     header->ring.task_window_mask = static_cast<int32_t>(task_window_sizes[0] - 1);
+    header->ring.shuffle_higher_bits = __builtin_ctzll(task_window_sizes[0]) - header->ring.shuffle_lower_bits;
     header->ring.heap_size = heap_sizes[0];
     header->ring.task_descriptors_offset = offset;
     offset += PTO2_ALIGN_UP(task_window_sizes[0] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
@@ -190,10 +208,13 @@ void PTO2SharedMemoryHandle::init_header_per_ring(
         ring.slot_states[i].active_mask = ActiveMask{};
     }
 
-    // Polling completion flags: 0 = pending. Shared memory is not guaranteed
-    // zero on device; stale non-zero bytes would make consumers observe a
-    // producer as already completed. Zero the whole per-ring array once.
-    __builtin_memset((void *)ring.completion_flags, 0, task_window_sizes[0] * sizeof(std::atomic<uint8_t>));
+    // Polling completion flags: -1 = pending (0 is a valid completion stamp —
+    // local_id 0 — so it cannot double as the pending sentinel). Shared memory
+    // is not guaranteed zero on device; stale bytes would make consumers
+    // observe a producer as already completed. 0xFF fills every int32 slot
+    // with -1 regardless of endianness. Set the whole per-ring array once.
+    __builtin_memset((void *)ring.completion_flags, 0xFF, task_window_sizes[0] * sizeof(std::atomic<int32_t>));
+    return true;
 }
 
 // =============================================================================

@@ -301,7 +301,7 @@ static bool append_fanin_or_fail(
     // Skip a stale/reused producer slot: the cached owner id no longer resolves
     // to this producer (defensive — whole-graph-resident hbg does not reuse slots
     // at build time). A COMPLETED producer IS a real fanin edge under polling (its
-    // completion_flags byte is set), so it is not skipped.
+    // completion_flags entry is set), so it is not skipped.
     if (prod_state->task == nullptr || prod_state->task->task_id.local() != producer_task_id.local()) {
         return true;
     }
@@ -316,7 +316,7 @@ static bool append_fanin_or_fail(
     fanin_builder->payload->fanin_local_ids[fanin_builder->count++] = static_cast<int32_t>(producer_task_id.local());
 
     // Reclaim gate: record this task as a consumer of the producer. The producer
-    // slot retires once the per-ring completed_watermark reaches this consumer id.
+    // slot retires once the per-ring completed_watermark exceeds this consumer id.
     if (fanin_builder->self_local > prod_state->last_consumer_local_id) {
         prod_state->last_consumer_local_id = fanin_builder->self_local;
     }
@@ -434,9 +434,9 @@ static bool prepare_task(
     out->slot_state->active_mask = active_mask;
     out->slot_state->task_attrs = task_attrs;
     // Reclaim gate: seed last_consumer to self, so a producer with no consumers
-    // is retirable once completed_watermark >= its own id. Each fanin edge bumps
-    // it in append_fanin_or_fail. completion_flags for this slot are already 0
-    // (zeroed once at init; whole-graph-resident hbg never reuses a slot).
+    // is retirable once completed_watermark > its own id. Each fanin edge bumps
+    // it in append_fanin_or_fail. completion_flags for this slot are already -1
+    // (set once at init; whole-graph-resident hbg never reuses a slot).
     out->slot_state->last_consumer_local_id = static_cast<int32_t>(out->task_id.local());
     // payload.fanin_count is set in submit_task_common's STEP 6.
     scope_tasks_push(orch, out->slot_state);
@@ -1061,15 +1061,19 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
         // unconditionally.
         prepared.slot_state->task_attrs.set_early_resolve(true);
         prepared.slot_state->mark_completed();  // host-visible task_state mirror
-        // Polling: pre-set the device-visible completion_flags byte in the H2D
+        // Polling: pre-set the device-visible completion_flags entry in the H2D
         // image. Consumers poll completion_flags (not task_state), so a hidden-alloc
         // producer completed here on the host must publish its flag too — otherwise
         // every consumer register_wakes on a producer that never runs on device and
         // the run hangs. (The device watermark walk transparently steps past this
         // pre-set flag when a later on-device task completes.)
+        // Runs on the host, before any AICPU scheduler thread exists — pass
+        // PLATFORM_MAX_AICPU_THREADS (one past the last valid device thread
+        // index) as the thread_idx, marking this store as host-originated.
         PTO2SharedMemoryRingHeader &done_ring = orch->sm_header->ring;
         int32_t done_local = static_cast<int32_t>(prepared.task_id.local());
-        done_ring.set_completion_flag(done_local);
+        done_ring.set_completion_flag(PLATFORM_MAX_AICPU_THREADS, done_local);
+        done_ring.weak_update_completed_watermark(PLATFORM_MAX_AICPU_THREADS, done_local + 1);
     }
     orch->inline_completed_tasks++;
 

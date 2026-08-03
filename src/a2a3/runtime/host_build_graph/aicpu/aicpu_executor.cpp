@@ -335,11 +335,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             LOG_ERROR("Thread %d: rt is null after orchestrator error, skipping dispatch", thread_idx);
         } else {
             sched_ctx_.bind_runtime(rt);
-            // 3S+1P: the last thread is the core-less resolution (P) thread; the
-            // rest are core-owning schedulers (S).
-            int32_t completed = (thread_idx == sched_ctx_.p_thread_idx()) ?
-                                    sched_ctx_.run_resolution_thread(runtime, thread_idx) :
-                                    sched_ctx_.resolve_and_dispatch(runtime, thread_idx);
+            int32_t completed = sched_ctx_.resolve_and_dispatch(runtime, thread_idx);
             if (completed < 0) {
                 LOG_ERROR("Thread %d: Scheduler failed with rc=%d", thread_idx, completed);
                 run_rc = completed;
