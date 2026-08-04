@@ -7,17 +7,8 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""SDMA deferred-completion smoke test for onboard a5.
+"""Cross-architecture deferred-completion communication test."""
 
-Each rank stages its input inside the communication window. The deferred
-producer fetches the peer rank's input into local ``out`` and registers its
-async event. The consumer depends on that output and writes
-``result = out + 1``.
-"""
-
-import os
-
-import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import ChipTensor, CommBufferSpec, DataType, TaskArgs, TensorArgType
@@ -28,84 +19,70 @@ from simpler_setup.torch_interop import make_tensor_arg
 N = 128 * 128
 NRANKS = 2
 DTYPE_NBYTES = 4
-_URMA_WORKSPACE_ENV = "SIMPLER_ENABLE_PTO_URMA_WORKSPACE"
-_WORKSPACE_TRUTHY = {"1", "ON", "TRUE", "YES"}
 
 
-def _urma_workspace_enabled():
-    return os.environ.get(_URMA_WORKSPACE_ENV, "").upper() in _WORKSPACE_TRUTHY
-
-
-def _require_sdma_workspace():
-    if _urma_workspace_enabled():
-        raise RuntimeError(
-            "sdma_async_completion_demo requires the default SDMA backend; "
-            f"unset {_URMA_WORKSPACE_ENV} and rebuild simpler."
-        )
-
-
-def sdma_async_completion_orch_fn(orch, callables, task_args, config):
-    _require_sdma_workspace()
-    input_nbytes = N * DTYPE_NBYTES
+def deferred_notify_orch_fn(orch, callables, task_args, config):
+    mailbox_nbytes = N * DTYPE_NBYTES
     with orch.allocate_domain(
         name="default",
         workers=list(range(NRANKS)),
-        window_size=max(input_nbytes, 4 * 1024),
-        buffers=[CommBufferSpec(name="input_window", dtype="float32", count=N, nbytes=input_nbytes)],
+        window_size=max(mailbox_nbytes + DTYPE_NBYTES, 4 * 1024),
+        buffers=[
+            CommBufferSpec(name="mailbox", dtype="float32", count=N, nbytes=mailbox_nbytes),
+            CommBufferSpec(name="notify_counter", dtype="int32", count=1, nbytes=DTYPE_NBYTES),
+        ],
     ) as handle:
-        for rank in range(NRANKS):
-            orch.copy_to(
-                rank,
-                dst=handle[rank].buffer_ptrs["input_window"],
-                src=getattr(task_args, f"in_{rank}").data_ptr(),
-                size=input_nbytes,
-            )
         for rank in range(NRANKS):
             domain = handle[rank]
             args = TaskArgs()
+            args.add_tensor(make_tensor_arg(getattr(task_args, f"partial_{rank}")), TensorArgType.INPUT)
             args.add_tensor(
                 ChipTensor.make(
-                    data=domain.buffer_ptrs["input_window"],
+                    data=domain.buffer_ptrs["mailbox"],
                     shapes=(N,),
                     dtype=DataType.FLOAT32,
                     child_memory=True,
                 ),
+                TensorArgType.INOUT,
+            )
+            args.add_tensor(make_tensor_arg(getattr(task_args, f"result_{rank}")), TensorArgType.OUTPUT_EXISTING)
+            args.add_tensor(
+                ChipTensor.make(
+                    data=domain.buffer_ptrs["notify_counter"],
+                    shapes=(1,),
+                    dtype=DataType.INT32,
+                    child_memory=True,
+                ),
                 TensorArgType.INPUT,
             )
-            args.add_tensor(make_tensor_arg(getattr(task_args, f"out_{rank}")), TensorArgType.OUTPUT_EXISTING)
-            args.add_tensor(make_tensor_arg(getattr(task_args, f"result_{rank}")), TensorArgType.OUTPUT_EXISTING)
             args.add_scalar(domain.device_ctx)
-            orch.submit_next_level(callables.sdma_async_completion, args, config, worker=rank)
+            orch.submit_next_level(callables.deferred_notify, args, config, worker=rank)
 
 
-@pytest.mark.sdma
-@pytest.mark.skipif(
-    _urma_workspace_enabled(),
-    reason="SDMA demo requires the default SDMA backend; unset SIMPLER_ENABLE_PTO_URMA_WORKSPACE and rebuild simpler.",
-)
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")
-class TestSdmaAsyncCompletionDemo(SceneTestCase):
+class TestDeferredNotifyDemo(SceneTestCase):
     CALLABLE = {
-        "orchestration": sdma_async_completion_orch_fn,
+        "orchestration": deferred_notify_orch_fn,
         "callables": [
             {
-                "name": "sdma_async_completion",
+                "name": "deferred_notify",
                 "orchestration": {
-                    "source": "kernels/orchestration/sdma_async_completion_orch.cpp",
-                    "function_name": "sdma_async_completion_orchestration",
-                    "signature": [D.IN, D.OUT, D.OUT, D.IN],
+                    "source": "kernels/orchestration/deferred_notify_orch.cpp",
+                    "function_name": "deferred_notify_orchestration",
+                    "signature": [D.IN, D.INOUT, D.OUT, D.IN],
                 },
                 "incores": [
                     {
                         "func_id": func_id,
                         "source": source,
                         "core_type": "aiv",
-                        "signature": [D.IN, D.OUT, D.OUT, D.IN],
+                        "signature": [D.IN, D.INOUT, D.OUT, D.IN],
                     }
                     for func_id, source in enumerate(
                         [
-                            "kernels/aiv/kernel_sdma_tget_async.cpp",
+                            "kernels/aiv/kernel_producer.cpp",
                             "kernels/aiv/kernel_consumer.cpp",
+                            "kernels/aiv/kernel_notify_wait.cpp",
                         ]
                     )
                 ],
@@ -114,23 +91,21 @@ class TestSdmaAsyncCompletionDemo(SceneTestCase):
     }
     CASES = [
         {
-            "name": "peer_fetch",
-            "platforms": ["a5"],
+            "name": "peer_notification",
+            "platforms": ["a2a3", "a2a3sim", "a5sim"],
             "config": {"device_count": NRANKS, "num_sub_workers": 0},
             "params": {},
         }
     ]
     RTOL = 0.0
-    ATOL = 1e-3
+    ATOL = 1e-6
 
     def generate_args(self, params):
         specs = []
         for rank in range(NRANKS):
-            inp = torch.tensor([float(rank * 1000 + (i % 251)) / 10.0 for i in range(N)], dtype=torch.float32)
             specs.extend(
                 [
-                    Tensor(f"in_{rank}", inp),
-                    Tensor(f"out_{rank}", torch.zeros(N, dtype=torch.float32)),
+                    Tensor(f"partial_{rank}", torch.full((N,), float(rank + 1), dtype=torch.float32)),
                     Tensor(f"result_{rank}", torch.zeros(N, dtype=torch.float32)),
                 ]
             )
@@ -138,9 +113,7 @@ class TestSdmaAsyncCompletionDemo(SceneTestCase):
 
     def compute_golden(self, args, params):
         for rank in range(NRANKS):
-            expected_out = getattr(args, f"in_{1 - rank}")
-            getattr(args, f"out_{rank}").copy_(expected_out)
-            getattr(args, f"result_{rank}").copy_(expected_out + 1.0)
+            getattr(args, f"result_{rank}").copy_(getattr(args, f"partial_{(rank + 1) % NRANKS}"))
 
 
 if __name__ == "__main__":

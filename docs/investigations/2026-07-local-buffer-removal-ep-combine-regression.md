@@ -124,7 +124,8 @@ removal is correct; it merely unmasked a missing `dcci` in the example kernel.
 In `examples/workers/l3/ep_dispatch_combine/kernels/aiv/dispatch.cpp`, after the
 `recv_count_out[e] = sum;` loop, flush the written range to HBM with `dcci`
 (pattern already used in `qwen3_14b_decode/fa_work_build.cpp` and
-`deferred_notify_demo/kernel_producer.cpp`: `dcci(ptr, ENTIRE_DATA_CACHE,
+`tests/st/worker/comm_domain/deferred_notify/kernels/aiv/kernel_producer.cpp`:
+`dcci(ptr, ENTIRE_DATA_CACHE,
 CACHELINE_OUT)` / `dcci(ptr, SINGLE_CACHE_LINE, CACHELINE_OUT)`). The runtime's
 completion-before-dispatch invariant then carries the flushed value to
 local_expert correctly. Codegen-owned area (`examples/`); no runtime change.

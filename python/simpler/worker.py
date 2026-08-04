@@ -1235,6 +1235,29 @@ class _NoHostBufferChildrenError(RuntimeError):
     """The Worker has no process child that can attach a host buffer."""
 
 
+def _translate_registered_host_addr(
+    addr: int,
+    ranges: list[tuple[int, int, int]],
+    *,
+    nbytes: int | None = None,
+) -> int:
+    """Translate a registered parent host VA to this child's mapping.
+
+    When ``nbytes`` is provided, reject a copy that starts inside a registered
+    buffer but crosses its end. Unregistered addresses stay unchanged because a
+    fork-inherited host allocation legitimately uses the same VA in the child.
+    """
+    for parent_lo, parent_hi, child_base in ranges:
+        if parent_lo <= addr < parent_hi:
+            if nbytes is not None and addr + nbytes > parent_hi:
+                raise RuntimeError(
+                    f"Host copy 0x{addr:x} (+{nbytes} B) overruns its registered host buffer "
+                    f"0x{parent_lo:x} (+{parent_hi - parent_lo} B)"
+                )
+            return child_base + (addr - parent_lo)
+    return addr
+
+
 def _rewrite_blob_host_addrs(buf: memoryview, blob_off: int, ranges: list[tuple[int, int, int]]) -> None:
     """Redirect registered host pointers in a task-args blob to child mappings.
 
@@ -1257,10 +1280,7 @@ def _rewrite_blob_host_addrs(buf: memoryview, blob_off: int, ranges: list[tuple[
         if buf[addr_off + CHIP_TENSOR_CHILD_MEMORY_OFFSET]:
             continue
         addr = struct.unpack_from("<Q", buf, addr_off)[0]
-        for parent_lo, parent_hi, child_base in ranges:
-            if parent_lo <= addr < parent_hi:
-                struct.pack_into("<Q", buf, addr_off, child_base + (addr - parent_lo))
-                break
+        struct.pack_into("<Q", buf, addr_off, _translate_registered_host_addr(addr, ranges))
 
 
 def _read_ctrl_staged_shm_name(buf: memoryview) -> str:
@@ -2351,12 +2371,12 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                 dst = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
                 src = struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0]
                 n = struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0]
-                cw.copy_to(dst, src, n)
+                cw.copy_to(dst, _translate_registered_host_addr(src, host_buf_ranges, nbytes=n), n)
             elif sub_cmd == _CTRL_COPY_FROM:
                 dst = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
                 src = struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0]
                 n = struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0]
-                cw.copy_from(dst, src, n)
+                cw.copy_from(_translate_registered_host_addr(dst, host_buf_ranges, nbytes=n), src, n)
             elif sub_cmd == _CTRL_PREPARE:
                 digest = _read_control_digest(buf)
                 cid = identity_table.get(digest)
