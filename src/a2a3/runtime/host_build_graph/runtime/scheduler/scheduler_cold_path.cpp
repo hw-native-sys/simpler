@@ -240,7 +240,7 @@ void SchedulerContext::log_stall_diagnostics(
                 if (slot_state.payload != nullptr) {
                     for (int32_t k = 0; k < fi; k++) {
                         int32_t pid = slot_state.payload->fanin_local_ids[k];
-                        if (ring.is_completion_flag_set(pid, std::memory_order_relaxed)) rc++;
+                        if (ring.is_completion_flag_set(thread_idx, pid, std::memory_order_relaxed)) rc++;
                     }
                 }
                 int32_t kid_aic = slot_state.task->kernel_id[0];
@@ -699,21 +699,7 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
 bool SchedulerContext::assign_cores_to_threads() {
     // Cluster-aligned round-robin assignment: cluster ci -> sched thread ci % active_sched_threads_.
     // Each cluster = 1 AIC + 2 adjacent AIV; the triple is always kept together.
-    //
-    // 3S+1P: the last AICPU thread is the core-less resolution thread (P); cores
-    // partition across the remaining (aicpu_thread_num_ - 1) scheduler threads
-    // only, so P never owns a cluster and never polls a COND register. P is
-    // mandatory — like tmr's scheduler + orchestrator split, host_build_graph
-    // needs at least two AICPU threads (one S + one P); one thread cannot own
-    // cores and resolve on a dedicated thread at once.
-    if (aicpu_thread_num_ < 2) {
-        LOG_ERROR(
-            "host_build_graph requires aicpu_thread_num >= 2 (1 scheduler + 1 resolution); got %d", aicpu_thread_num_
-        );
-        return false;
-    }
-    p_thread_idx_ = aicpu_thread_num_ - 1;
-    active_sched_threads_ = aicpu_thread_num_ - 1;
+    active_sched_threads_ = aicpu_thread_num_;
     int32_t cluster_count = aic_count_;
 
     // Max clusters any single sched thread can hold: ceil(cluster_count / active_sched_threads_).
@@ -1055,29 +1041,6 @@ void SchedulerContext::on_orchestration_done(
 
     total_tasks_ = total_tasks;
 
-    // Allocate the per-S CompletedTaskQueues here on the boot leader, before it
-    // releases runtime_init_ready_ — no scheduler thread can push until then.
-    // Completed-but-unresolved tasks in flight are bounded by BOTH the total task
-    // count and the ring's task window (a task must occupy a ring slot to run and
-    // complete), so size to the tighter of the two, rounded up to a power of two
-    // and floored at 256. The window already caps this, so there is no artificial
-    // ceiling and a producer never has to spin on a full queue.
-    uint64_t sp_bound = static_cast<uint64_t>(total_tasks);
-    if (sched_->ring_sched_state.ring != nullptr) {
-        uint64_t window = static_cast<uint64_t>(sched_->ring_sched_state.ring->task_window_mask) + 1;
-        if (window < sp_bound) {
-            sp_bound = window;
-        }
-    }
-    uint64_t sp_cap = 256;
-    while (sp_cap < sp_bound) {
-        sp_cap <<= 1;
-    }
-    for (int32_t t = 0; t < active_sched_threads_; t++) {
-        sp_queues_[t].destroy();  // free a prior run's buffer before re-alloc
-        sp_queues_[t].init(sp_cap);
-    }
-
     // Fold tasks completed inline during orchestration
     int32_t inline_completed = static_cast<int32_t>(rt->orchestrator.inline_completed_tasks);
     if (inline_completed > 0) {
@@ -1144,16 +1107,16 @@ void SchedulerContext::classify_partition(int32_t thread_idx, int32_t nthreads) 
     const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(submitted) * thread_idx) / nthreads);
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(submitted) * (thread_idx + 1)) / nthreads);
     for (int32_t id = lo; id < hi; id++) {
-        if (ring.is_completion_flag_set(id)) {
+        if (ring.is_completion_flag_set(thread_idx, id)) {
             continue;  // completed on the host (hidden alloc); nothing to dispatch
         }
         PTO2TaskSlotState &s = ring.get_slot_state_by_task_id(id);
-        int32_t state = sched_->classify_fanin_state(&s);
+        int32_t state = sched_->classify_fanin_state(thread_idx, &s);
         if (state < 0) {
             sched_->push_ready_routed(&s);
         } else {
             int32_t prod_local = s.payload->fanin_local_ids[state];
-            sched_->register_wake(&ring.get_slot_state_by_task_id(prod_local), &s);
+            sched_->register_wake(thread_idx, &ring.get_slot_state_by_task_id(prod_local), &s);
         }
     }
 }

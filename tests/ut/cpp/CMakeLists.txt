@@ -697,6 +697,34 @@ add_a2a3_test(test_acl_hal_device common/test_acl_hal_device.cpp)
 add_a2a3_runtime_test(test_task_allocator   a2a3/test_task_allocator.cpp)
 add_a2a3_runtime_test(test_scope_deadlock_detection common/test_scope_deadlock_detection.cpp)
 add_a2a3_hbg_runtime_test(test_hbg_task_allocator a2a3/test_task_allocator.cpp)
+
+# host_build_graph's pto_shared_memory.cpp is not part of add_a2a3_hbg_runtime_test's
+# sources (only test_task_allocator needs that helper today, and pto_ring_buffer.h is
+# header-only), so this test compiles it directly alongside the gtest source.
+add_executable(test_hbg_shared_memory
+    a2a3/test_hbg_shared_memory.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/host_build_graph/runtime/shared/pto_shared_memory.cpp
+    ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
+)
+target_include_directories(test_hbg_shared_memory PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/host_build_graph/orchestration
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/host_build_graph/runtime
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/host_build_graph/common
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/aicpu
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+)
+target_link_libraries(test_hbg_shared_memory PRIVATE
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    pthread
+)
+add_test(NAME test_hbg_shared_memory COMMAND test_hbg_shared_memory)
+set_tests_properties(test_hbg_shared_memory PROPERTIES LABELS "no_hardware")
 add_a2a3_hbg_runtime_test(test_hbg_tensormap a2a3/test_hbg_tensormap.cpp)
 add_a2a3_hbg_runtime_test(test_hbg_dep_gen_host_graph a2a3/test_dep_gen_host_graph.cpp)
 add_a2a3_hbg_runtime_test(test_hbg_tensor_access a2a3/test_hbg_tensor_access.cpp)

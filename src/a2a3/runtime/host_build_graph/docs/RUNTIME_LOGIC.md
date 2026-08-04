@@ -238,9 +238,10 @@ local-ids:
 
 - `fanin_local_ids[fanin_count]` — the local-ids of this task's direct producers
   (`fanin_count <= PTO2_MAX_FANIN`; there is no spill, so an overflow is fatal).
-- A per-slot `completion_flags[id]` byte in the ring header is the device-side
-  readiness truth: a task is ready iff every id in its `fanin_local_ids` has its
-  `completion_flags` byte set (see §8.2).
+- A per-slot `completion_flags[id]` entry (`int32`: `-1` pending, else the id
+  itself) in the ring header is the device-side readiness truth: a task is
+  ready iff every id in its `fanin_local_ids` has its `completion_flags` entry
+  set to its own id (see §8.2).
 
 Because the fanin is integer ids rather than pointers, the host→device image
 needs no fanout/dep-pool relocation — only the per-slot `task` / `payload`
@@ -407,7 +408,7 @@ slot state, not the payload; the host consumer-wait gates on it (§8.4).
 ### 6.2 Task State Machine
 
 `task_state` is the **host-visible mirror** of completion; the device-side
-readiness truth is the per-slot `completion_flags` byte (§8.2). The host polls
+readiness truth is the per-slot `completion_flags` entry (§8.2). The host polls
 `task_state` in `wait_for_tensor_ready`, the allocator deadlock detector, and
 the cold-path stall dump.
 
@@ -457,10 +458,12 @@ Key members:
 
 > **Note**: There is no fanout adjacency, dep-pool, or per-producer lock. A
 > producer inline-completed on the host (e.g. a hidden-alloc task) pre-sets its
-> own `completion_flags[id] = 1` in the H2D image so device consumers see it as
-> already satisfied. The only cross-task pointers the image carries are the
-> per-slot `task` / `payload` pointers, which `relocate_host_orch_image` shifts
-> to device addresses before H2D.
+> own `completion_flags[id] = id` in the H2D image so device consumers see it as
+> already satisfied, and calls `update_completed_watermark` itself right after —
+> the frontier-gating in §8.4 means no later on-device completion can advance the
+> watermark past this task on its behalf. The only cross-task pointers the image
+> carries are the per-slot `task` / `payload` pointers, which
+> `relocate_host_orch_image` shifts to device addresses before H2D.
 
 ### 7.3 Dependency Recording and Relocation
 
@@ -572,25 +575,78 @@ Each scheduler thread runs a tight loop with two main phases:
 - When `TASK_FIN_STATE` detected: call `on_subtask_complete`; when
   `completed_subtasks == total_required_subtasks`, call `on_mixed_task_complete`,
   which:
-  1. mirrors `task_state = COMPLETED` (host-visible) and sets the device
-     readiness truth `completion_flags[my_id] = 1` (release);
-  2. drains this task's intrusive **wake list** — `wake_list_head.exchange(SENTINEL)`
-     — reclassifying each waiter: a waiter whose remaining fanin is now all met
-     is pushed via `push_ready_routed`; otherwise it re-registers on its next
-     unmet producer. After the exchange the head is `SENTINEL`, so a consumer
-     registering concurrently re-checks the flags instead of being lost;
-  3. CAS-advances `completed_watermark` over the contiguous completed prefix
-     (§8.4).
+  1. mirrors `task_state = COMPLETED` (host-visible);
+  2. calls `try_set_completion_flag` to set the device readiness truth
+     `completion_flags[my_id] = my_id` (release). On failure (the previous
+     occupant of `my_id`'s flag-slot isn't yet certified, see **Flag-slot
+     reuse** below) it pushes `my_id` onto
+     `failed_heap_of_set_completion_flag[thread_idx]` and returns immediately
+     — steps 3 and 4 below are skipped and become `my_id`'s one deferred
+     chance, taken later by `retry_set_completion_flags`;
+  3. on success, drains this task's intrusive **wake list** —
+     `wake_list_head.exchange(SENTINEL)` — via the shared `drain_wake_list`
+     helper, reclassifying each waiter: a waiter whose remaining fanin is now
+     all met is pushed via `push_ready_routed`; otherwise it re-registers on
+     its next unmet producer. After the exchange the head is `SENTINEL`, so a
+     consumer registering concurrently re-checks the flags instead of being
+     lost;
+  4. calls `update_completed_watermark(thread_idx, my_id)`, which CAS-advances
+     `completed_watermark` over the contiguous completed prefix if — and only
+     if — `my_id` is exactly the current watermark (§8.4).
 
 **Readiness / wake registration.** A task is ready iff every id in its
-`fanin_local_ids` has its `completion_flags` byte set (`fanin_satisfied` /
-`classify_fanin_state`, acquire loads). A not-yet-ready task registers itself on
-its **first unmet** producer's wake list (`register_wake`); that producer's
-completion re-drives the classification. The decision is terminal — tasks are
-never re-polled — because `completion_flags` are monotonic. This wake machinery
-is seeded by the device **boot classify** (`on_orchestration_done`), which scans
-the submitted tasks once and either pushes the fanin-free ones to the ready
-queue or registers each remaining task on its first unmet producer.
+`fanin_local_ids` has its `completion_flags` entry set to its own id
+(`fanin_satisfied` / `classify_fanin_state`, acquire loads). A not-yet-ready
+task registers itself on its **first unmet** producer's wake list
+(`register_wake`); that producer's completion re-drives the classification.
+The decision is terminal — tasks are never re-polled — because
+`completion_flags` are monotonic. This wake machinery is seeded by the device
+**boot classify** (`on_orchestration_done`), which scans the submitted tasks
+once and either pushes the fanin-free ones to the ready queue or registers
+each remaining task on its first unmet producer.
+
+**Flag-slot reuse.** `completion_flags` holds `task_window_size` entries,
+indexed by `flag_index(local_id)` rather than the raw `local_id &
+task_window_mask`: `flag_index` swaps the low `shuffle_lower_bits` bits of
+`local_id & task_window_mask` into the high position (and the remaining high
+bits down into the low position), so consecutive `local_id`s land on
+different cachelines instead of packing `64 / sizeof(int32_t)` consecutive
+ids onto the same one — the layout `update_completed_watermark` scans
+linearly. This is a bijection on `[0, task_window_size)`, so the reuse
+period is unchanged: the array does not grow with the number of tasks a run
+submits, and the slot written for `local_id` is later reused for `local_id +
+task_window_size`. The number of tasks a run may submit is therefore not
+bounded by the array's size — only the reuse of a given slot is ordered: a
+write for `local_id` must not land before `completed_watermark` certifies
+`local_id - task_window_size` (the slot's previous occupant) complete.
+
+The device scheduler enforces this without blocking. `on_mixed_task_complete`
+calls `try_set_completion_flag`: it stores the flag and returns `true` when
+the previous occupant is already certified, or leaves the slot untouched and
+returns `false` otherwise. On `false` the thread pushes `task_id` onto
+`failed_heap_of_set_completion_flag[thread_idx]` (a per-thread min-heap)
+instead of spinning, and returns without draining `task_id`'s wake list or
+touching the watermark — both stay `task_id`'s one deferred chance until
+the dispatch loop's per-iteration call to `retry_set_completion_flags`
+retries the smallest pending id. Once that retry succeeds for `min_task`,
+`retry_set_completion_flags` drains `min_task`'s wake list (the same
+`drain_wake_list` routing `on_mixed_task_complete` uses on its success path)
+and then calls `update_completed_watermark(thread_idx, min_task)` (§8.4 — so
+each id still gets exactly one wake-list drain and one
+`update_completed_watermark` call, made right after its flag is actually
+set, whether that happens inline or later via retry). This replaces the
+older requirement — task `t` must finish before task `t + task_window_size`
+— with a weaker one: task `t` must not depend on a task with id `>= t +
+task_window_size`. That holds automatically whenever task ids follow a
+topological order of the dependency graph (the normal case — a task's fanins
+always carry smaller ids than the task itself), so the heap is expected to
+drain on its very next retry and exists only as a failsafe.
+
+`is_completion_flag_set` stays correct across reuse — whether or not an
+entry is currently sitting unresolved in the failed-heap — by falling back
+to `completed_watermark`: once a task's id is behind the watermark it is
+reported complete regardless of what a later lap has since written into its
+slot.
 
 **Early staging status.** Early producer propagation is currently disabled in
 HBG: `propagate_dispatch_fanin` is a stub, so the polling path does not populate
@@ -621,15 +677,47 @@ Ready queues use a lock-free bounded MPMC (Vyukov) design:
 
 ### 8.4 Completion Watermark (host consumer-wait gate)
 
-`completed_watermark` is the highest id such that every task in
-`[0, completed_watermark]` has its `completion_flags` byte set. The tail of
-`on_mixed_task_complete` CAS-advances it over the **full contiguous completed
-prefix** (bounded by `current_task_index`, not by the completing task's own id)
-— capping at `my_id` would make the final value completion-order-dependent and
-strand it below the true prefix.
+`completed_watermark` is the lowest id not yet guaranteed complete: every task
+in `[0, completed_watermark)` has its `completion_flags` entry set.
+
+Every completer calls `update_completed_watermark(thread_idx, my_id)` exactly
+once, and only *after* `my_id`'s own `completion_flags` entry is actually
+set — never before. The host orchestrator's inline-completed hidden-alloc
+task (§7.2) gets this for free: it calls the blocking `set_completion_flag`,
+which cannot return before the store lands, immediately followed by
+`update_completed_watermark`. The device path (`on_mixed_task_complete`)
+calls `try_set_completion_flag` (**Flag-slot reuse**, §8.2); when that
+returns `true` it calls `update_completed_watermark` right after, same as
+the host path. When it returns `false` (deferred to
+`failed_heap_of_set_completion_flag`), `on_mixed_task_complete` skips the
+`update_completed_watermark` call entirely — `task_id`'s one chance moves to
+`retry_set_completion_flags`, which calls
+`update_completed_watermark(thread_idx, min_task)` right after the retried
+`try_set_completion_flag` finally succeeds. Either way, the call that
+"belongs" to an id is made exactly once, and only once that id's flag is
+genuinely visible — a task's `update_completed_watermark` call must never
+run before the store its own walk trusts as already-set, since the walk
+skips re-checking `my_id`'s own `completion_flags` entry, so calling too
+early could advance the watermark past `my_id` before that write is
+visible.
+
+The call is **eager but frontier-gated**: every completer makes it (promptly
+on the host and the common device case, or after a deferred retry in the
+failed-heap case — §8.2), but `update_completed_watermark` is a no-op unless `my_id` equals the watermark
+it currently observes. Only the completer landing exactly at the frontier
+does the work, CAS-advancing over the **full contiguous completed prefix**
+(bounded by `current_task_index`, not by `my_id`) — capping at `my_id` would
+make the final value completion-order-dependent and strand it below the true
+prefix. A completer that finishes out of order (its id ahead of the
+watermark) defers: it does not retry or block, it relies on whichever thread
+later completes the frontier task to walk forward through its already-set
+flag. This is why the call cannot be skipped or deferred for *any* completion
+path, including host-side ones — a task sitting at the frontier with no
+completer ever calling `update_completed_watermark` for it stalls the
+watermark permanently.
 
 It is **load-bearing**: the host `wait_for_tensor_ready(..., wait_for_consumers)`
-gates on `completed_watermark >= producer.last_consumer_local_id` to observe
+gates on `completed_watermark > producer.last_consumer_local_id` to observe
 "every consumer of this producer has retired" — replacing the wiring model's
 `fanout_refcount == fanout_count` check.
 

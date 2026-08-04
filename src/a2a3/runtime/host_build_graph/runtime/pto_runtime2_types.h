@@ -444,7 +444,7 @@ static_assert(
  */
 struct alignas(64) PTO2TaskSlotState {
     // Highest local task id among this slot's consumers. Reclaim gate: the slot
-    // is safe to retire once the per-ring completed_watermark reaches this id.
+    // is safe to retire once the per-ring completed_watermark exceeds this id.
     // Whole-graph-resident hbg never reclaims at runtime, so this is
     // inert-but-scaffolded for parity. Seeded to own local_id in prepare_task;
     // bumped via max() at submit for each consumer.

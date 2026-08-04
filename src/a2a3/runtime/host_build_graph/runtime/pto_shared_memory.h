@@ -33,7 +33,9 @@
 #pragma once
 
 #include <stddef.h>
+#include <array>
 
+#include "common/platform_config.h"
 #include "utils/device_arena.h"
 #include "pto_runtime2_types.h"
 
@@ -80,17 +82,36 @@ static_assert(sizeof(PTO2RingFlowControl) == 128, "PTO2RingFlowControl must be e
 struct alignas(64) PTO2SharedMemoryRingHeader {
     PTO2RingFlowControl fc;
 
-    // Highest task_id such that every task with id in [0, completed_watermark]
-    // has its completion_flags byte set. Advanced over the full contiguous
-    // completed prefix at task-completion time (on_mixed_task_complete). The host
-    // consumer-wait gates on it: a producer slot P's consumers have all retired
-    // once completed_watermark >= P.last_consumer_local_id. On its own cache line
-    // (concurrent CAS-advance by completing threads).
+    // Lowest task_id not yet guaranteed complete: every task with id in
+    // [0, completed_watermark) has its completion_flags entry set. Every completer
+    // (device on_mixed_task_complete, or the host orchestrator for an inline-completed
+    // hidden-alloc task) calls update_completed_watermark exactly once, right after its
+    // own flag is actually set — never before. When on_mixed_task_complete's
+    // try_set_completion_flag fails, the call moves to retry_set_completion_flags, which
+    // makes it once the retried try_set_completion_flag succeeds instead (docs/
+    // RUNTIME_LOGIC.md §8.4); only the one landing exactly at the current watermark walks
+    // it forward over the contiguous completed prefix. The host consumer-wait gates on it: a producer
+    // slot P's consumers have all retired once completed_watermark >
+    // P.last_consumer_local_id. On its own cache line (concurrent CAS-advance by
+    // completing threads).
     alignas(64) std::atomic<int32_t> completed_watermark;
+
+    struct alignas(64) AlignedInt32 {
+        int32_t val_{0u};
+        int8_t pad_[64 - sizeof(int32_t)];
+    };
+
+    // Embedded by value, not behind a unique_ptr: this header is placed by
+    // memset over raw arena/shared memory (PTO2SharedMemoryHandle::init_header,
+    // create_and_init_default), never via a constructor call, so a smart-pointer
+    // member's default initializer would never run and would dereference null.
+    alignas(64) mutable std::array<AlignedInt32, PLATFORM_MAX_AICPU_THREADS + 1> cached_completed_watermark;
 
     // Layout metadata (set once at init)
     alignas(64) uint64_t task_window_size;
     int32_t task_window_mask;
+    static constexpr int32_t shuffle_lower_bits{4};  // At least 0 and at most log_2(task_window_size)
+    int32_t shuffle_higher_bits;                     // log_2(task_window_size) - shuffle_lower_bits
     uint64_t heap_size;
     uint64_t task_descriptors_offset;  // Offset from SM base, in bytes
 
@@ -99,43 +120,135 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     PTO2TaskPayload *task_payloads;
     PTO2TaskSlotState *slot_states;
 
-    // Polling-completion state (device-addressed array, one byte per slot).
-    // 0 = pending, 1 = task fully COMPLETED. Writer = the task's completer at
-    // on_mixed_task_complete; reader = consumer fanin polling (is_completion_flag_set).
-    // Zeroed host-side at init. Indexed by local_id & task_window_mask.
-    std::atomic<uint8_t> *completion_flags;
+    // Polling-completion state (device-addressed array, one int32 per slot,
+    // task_window_size slots total). -1 = pending, local_id = task fully
+    // COMPLETED. -1 (not 0) is the pending sentinel because local_id 0 is a
+    // valid completion stamp (the first task ever submitted) and must stay
+    // distinguishable from "not yet completed". Writer = the task's completer
+    // at on_mixed_task_complete; reader = consumer fanin polling
+    // (is_completion_flag_set). Set to -1 host-side at init. Indexed by
+    // flag_index(local_id), a bit-reindexing of local_id & task_window_mask
+    // (same task_window_size-entry period, different physical slot — see
+    // flag_index), so the entry for local_id is reused by local_id +
+    // task_window_size once the run submits more tasks than the array has
+    // slots for — see set_completion_flag / try_set_completion_flag for the
+    // ordering this reuse requires.
+    std::atomic<int32_t> *completion_flags;
 
-    bool is_completion_flag_set(int32_t local_id, std::memory_order order = std::memory_order_acquire) const {
-        return completion_flags[local_id & task_window_mask].load(order) != 0;
+    // To have subsequent tasks on different cachelines one needs shuffle_higher_bits >= 4 (because 64 / sizeof(int32_t)
+    // = 2^4) and shuffle_lower_bits >= 1. Every 2^shuffle_lower_bits will typically be on the same cacheline which is
+    // good for update_completion_watermark
+    constexpr int32_t flag_index(const int32_t local_id) const {
+        int32_t low_bits = local_id & ((static_cast<int32_t>(1) << shuffle_lower_bits) - static_cast<int32_t>(1));
+        low_bits <<= shuffle_higher_bits;
+
+        int32_t high_bits = local_id & task_window_mask;
+        high_bits >>= shuffle_lower_bits;
+
+        return low_bits | high_bits;
     }
 
-    void set_completion_flag(int32_t local_id, std::memory_order order = std::memory_order_release) const {
-        completion_flags[local_id & task_window_mask].store(1, order);
+    // Once local_id falls behind completed_watermark it is reported set for
+    // the rest of the run, even after a later lap overwrites its slot: the
+    // watermark fallback is itself monotonic and outlives the raw slot value.
+    bool is_completion_flag_set(
+        const int32_t thread_idx, const int32_t local_id, std::memory_order order = std::memory_order_acquire
+    ) const {
+        int32_t &cached_cw = cached_completed_watermark[thread_idx].val_;
+        return (local_id < cached_cw) || (completion_flags[flag_index(local_id)].load(order) == local_id) ||
+               (local_id < (cached_cw = completed_watermark.load(std::memory_order_acquire)));
     }
 
-    // set completion flag first before updating the watermark (logic requirement)
-    void update_completed_watermark() {
+    // local_id and local_id - task_window_size share a slot (flag_index wraps
+    // modulo task_window_size). earlier_task is one past that slot's previous
+    // occupant, so the wait below blocks the store until completed_watermark
+    // certifies the previous occupant complete: task t must complete before
+    // task t + task_window_size may publish its own entry into the shared
+    // slot. This bounds how far a slot can be reused ahead of retirement, not
+    // how many tasks a run may submit in total.
+    // Must be followed by a call to update_completed_watermark with same thread_idx and local_id (logical requirement)
+    // Only the host orchestrator's inline hidden-alloc completion path (submit_task,
+    // §7.2) still calls this blocking form; the device scheduler uses
+    // try_set_completion_flag below instead.
+    void set_completion_flag(
+        const int32_t thread_idx, const int32_t local_id, std::memory_order order = std::memory_order_release
+    ) const {
+        const int32_t earlier_task = local_id - task_window_mask;
+        int32_t &cached_cw = cached_completed_watermark[thread_idx].val_;
+        while ((cached_cw < earlier_task) &&
+               ((cached_cw = completed_watermark.load(std::memory_order_acquire)) < earlier_task)) {
+            SPIN_WAIT_HINT();
+        }
+        completion_flags[flag_index(local_id)].store(local_id, order);
+    }
+
+    // Non-blocking counterpart to set_completion_flag: same slot-reuse condition
+    // (the previous occupant of local_id's aliased slot must be certified by
+    // completed_watermark first), but returns false instead of spinning when it
+    // is not yet certified, leaving completion_flags untouched. The device
+    // scheduler defers a false return to failed_heap_of_set_completion_flag and
+    // retries later rather than blocking the dispatch loop — see
+    // docs/RUNTIME_LOGIC.md "Flag-slot reuse" (§8.2) for the relaxed
+    // correctness argument this relies on. Must be followed by a call to
+    // update_completed_watermark with the same thread_idx and local_id only when
+    // this returns true — on false, the caller must defer that call to whichever
+    // retry finally succeeds (never call it against a local_id whose flag isn't
+    // set yet, §8.4).
+    bool try_set_completion_flag(
+        const int32_t thread_idx, const int32_t local_id, std::memory_order order = std::memory_order_release
+    ) {
+        const int32_t earlier_task = local_id - task_window_mask;
+        int32_t &cached_cw = cached_completed_watermark[thread_idx].val_;
+        if (cached_cw < earlier_task) {
+            cached_cw = completed_watermark.load(std::memory_order_acquire);
+            if (cached_cw < earlier_task) {
+                return false;
+            }
+        }
+        completion_flags[flag_index(local_id)].store(local_id, order);
+        return true;
+    }
+
+    // Must be called for `local_id` only after set_completion_flag(thread_idx, local_id):
+    // the walk below never checks local_id's own completion_flags entry, it trusts the
+    // caller already set it, so calling out of order could advance the watermark past
+    // local_id before that write is actually visible.
+    void update_completed_watermark(const int32_t thread_idx, const int32_t local_id) {
+        // Thread fence required such that setting the flag of task local_id is written to GM before completed_watermark
+        // is read
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+
         int32_t curr_watermark = completed_watermark.load(std::memory_order_acquire);
+        // No-op unless this call sits exactly at the frontier: every completer calls this
+        // eagerly, but only the one whose own local_id equals the current watermark performs
+        // the advance walk below. A completer that finishes out of order (local_id ahead of
+        // the watermark) defers to whichever thread later completes the frontier task.
+        if (curr_watermark != local_id) {
+            cached_completed_watermark[thread_idx].val_ = curr_watermark;
+            return;
+        }
+
         const int32_t submitted = fc.current_task_index.load(std::memory_order_acquire);
 
-        int32_t next = curr_watermark;
+        int32_t next = local_id + 1;
         while (true) {
-            while (next + 1 < submitted && is_completion_flag_set(next + 1)) {
+            while (next < submitted && is_completion_flag_set(thread_idx, next)) {
                 ++next;
             }
-            if (next == curr_watermark) {
-                return;
-            }
 
-            if (completed_watermark.compare_exchange_strong(
+            if (not completed_watermark.compare_exchange_strong(
                     curr_watermark, next, std::memory_order_acq_rel, std::memory_order_acquire
                 )) {
-                curr_watermark = next;
-            } else {
-                // The acquire release semantics of the successful CAS guarantee that in the case of failure this thread
-                // also synchronises with the thread reporting the completion through the intermediary thread(s).
-                next = std::max(next, curr_watermark);
+                // In case of failure, we hand off the update responsibility to the thread who succeeded
+                cached_completed_watermark[thread_idx].val_ = curr_watermark;
+                break;
             }
+            // Thread fence required such that completed_watermark is written to GM before the next flag is read
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            if (not(next < submitted && is_completion_flag_set(thread_idx, next))) {
+                break;
+            }
+            curr_watermark = next++;
         }
     }
 
@@ -158,9 +271,9 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     }
 };
 
-static_assert(sizeof(PTO2SharedMemoryRingHeader) == 256, "PTO2SharedMemoryRingHeader layout drift");
+static_assert(sizeof(PTO2SharedMemoryRingHeader) == 576, "PTO2SharedMemoryRingHeader layout drift");
 static_assert(
-    offsetof(PTO2SharedMemoryRingHeader, task_descriptors_offset) == 216,
+    offsetof(PTO2SharedMemoryRingHeader, task_descriptors_offset) == 536,
     "PTO2SharedMemoryRingHeader task_descriptors_offset layout drift"
 );
 
@@ -192,10 +305,10 @@ struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
     std::atomic<int32_t> sched_error_thread;   // Thread index of last error writer
 };
 
-static_assert(sizeof(PTO2SharedMemoryHeader) == 320, "PTO2SharedMemoryHeader layout drift");
-static_assert(offsetof(PTO2SharedMemoryHeader, total_size) == 264, "PTO2SharedMemoryHeader total_size layout drift");
+static_assert(sizeof(PTO2SharedMemoryHeader) == 640, "PTO2SharedMemoryHeader layout drift");
+static_assert(offsetof(PTO2SharedMemoryHeader, total_size) == 584, "PTO2SharedMemoryHeader total_size layout drift");
 static_assert(
-    offsetof(PTO2SharedMemoryHeader, orch_error_code) == 272, "PTO2SharedMemoryHeader orch_error_code layout drift"
+    offsetof(PTO2SharedMemoryHeader, orch_error_code) == 592, "PTO2SharedMemoryHeader orch_error_code layout drift"
 );
 
 // =============================================================================
@@ -251,8 +364,8 @@ struct PTO2SharedMemoryHandle {
     bool validate();
 
 private:
-    void init_header(uint64_t task_window_size, uint64_t heap_size);
-    void init_header_per_ring(
+    bool init_header(uint64_t task_window_size, uint64_t heap_size);
+    bool init_header_per_ring(
         const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]
     );
     void setup_pointers(uint64_t task_window_size);
@@ -308,7 +421,7 @@ struct PTO2RingSegmentOffsets {
     uint64_t descriptors;
     uint64_t payloads;
     uint64_t slot_states;
-    uint64_t completion_flags;  // polling-completion byte array (1 byte/slot)
+    uint64_t completion_flags;  // polling-completion flag array (1 int32/slot)
     uint64_t end;               // offset just past completion_flags (total SM size)
 };
 
@@ -328,7 +441,7 @@ inline PTO2RingSegmentOffsets ring_segment_offsets(uint64_t task_window_size) no
     o.slot_states = off;
     off += PTO2_ALIGN_UP(task_window_size * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
     o.completion_flags = off;
-    off += PTO2_ALIGN_UP(task_window_size * sizeof(std::atomic<uint8_t>), PTO2_ALIGN_SIZE);
+    off += PTO2_ALIGN_UP(task_window_size * sizeof(std::atomic<int32_t>), PTO2_ALIGN_SIZE);
     o.end = off;
     return o;
 }
@@ -348,9 +461,9 @@ inline PTO2TaskSlotState *ring_slot_states_addr(void *sm_dev_base, uint64_t task
     );
 }
 
-// Device address of the polling completion_flags byte array.
-inline std::atomic<uint8_t> *ring_completion_flags_addr(void *sm_dev_base, uint64_t task_window_size) noexcept {
-    return reinterpret_cast<std::atomic<uint8_t> *>(
+// Device address of the polling completion_flags array.
+inline std::atomic<int32_t> *ring_completion_flags_addr(void *sm_dev_base, uint64_t task_window_size) noexcept {
+    return reinterpret_cast<std::atomic<int32_t> *>(
         static_cast<char *>(sm_dev_base) + ring_segment_offsets(task_window_size).completion_flags
     );
 }

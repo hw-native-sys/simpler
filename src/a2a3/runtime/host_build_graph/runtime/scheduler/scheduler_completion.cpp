@@ -82,7 +82,7 @@ SlotTransition SchedulerContext::decide_slot_transition(
 // Complete one slot's task: subtask counting, mixed completion, deferred release, profiling.
 void SchedulerContext::complete_slot_task(
     PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, [[maybe_unused]] PTO2SubtaskSlot subslot,
-    int32_t thread_idx, int32_t core_id, Handshake *hank, [[maybe_unused]] int32_t &completed_this_turn
+    int32_t thread_idx, int32_t core_id, Handshake *hank, int32_t &completed_this_turn
 #if SIMPLER_DFX
     ,
     uint64_t dispatch_ts, uint64_t finish_ts
@@ -183,15 +183,46 @@ void SchedulerContext::complete_slot_task(
             );
         }
 #endif
-        // 3S+1P: hand the finished task to the dedicated resolution (P) thread.
-        // P publishes completion_flags, drains the wake list, and advances the
-        // watermark — and owns completed_tasks_, so this scheduler thread neither
-        // resolves nor bumps completed_this_turn. (The Resolve swimlane bar is
-        // emitted by P, not here.)
-        sp_queues_[thread_idx].push(&slot_state);
 #if SIMPLER_DFX
+        // Time Resolve (walk the consumer list, decrement each consumer's
+        // fanin, push the newly-ready ones, ring doorbells for early-dispatch
+        // hits) so it renders as a child bar nested inside this iteration's
+        // Complete bar. The 1 µs floor below filters out the ~88% of tasks
+        // with 1-2 consumers (~500 ns Resolve) so only the long broadcast /
+        // reduction walks stand out on the lane.
+        uint64_t resolve_t0 = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
+#endif
+        // [[maybe_unused]] silences -Werror=unused-but-set-variable on the
+        // profiling-flags-smoke build path where SIMPLER_DFX is OFF and
+        // the Resolve emit below is excluded.
+        [[maybe_unused]] uint32_t consumers_resolved = 0;
+#if SIMPLER_SCHED_PROFILING
+        // SCHED_PROFILING variant returns CompletionStats whose `fanout_edges`
+        // is the consumer-walk count.
+        consumers_resolved = sched_->on_task_complete(slot_state, thread_idx).fanout_edges;
+#else
+        consumers_resolved = sched_->on_task_complete(slot_state, thread_idx);
+#endif
+#if SIMPLER_DFX
+        if (resolve_t0 != 0) {
+            uint64_t resolve_t1 = get_sys_cnt_aicpu();
+            // Filter: drop Resolve bars under 1 µs so the lane shows only
+            // resolves that did meaningful work (high consumer counts or
+            // doorbells). 50 cycles @ 50 MHz = 1 µs (PLATFORM_PROF_SYS_CNT_FREQ
+            // is the device sys-cnt frequency).
+            constexpr uint64_t RESOLVE_EMIT_MIN_CYCLES = PLATFORM_PROF_SYS_CNT_FREQ / 1'000'000;  // 1 µs
+            if (resolve_t1 - resolve_t0 >= RESOLVE_EMIT_MIN_CYCLES) {
+                l2_swimlane_aicpu_record_sched_phase(
+                    thread_idx, L2SwimlaneSchedPhaseKind::Resolve, resolve_t0, resolve_t1, l2_swimlane.sched_loop_count,
+                    consumers_resolved
+                );
+            }
+        }
         l2_swimlane.phase_complete_count++;
 #endif
+        // Polling: on_task_complete published completion + drained the wake list
+        // inline; no deferred producer-release step.
+        completed_this_turn++;
     }
 
 #if SIMPLER_DFX
