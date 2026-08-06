@@ -1089,7 +1089,7 @@ struct PTO2SchedulerState {
 #if SIMPLER_SCHED_PROFILING
     CompletionStats
 #else
-    void
+    uint32_t
 #endif
     on_task_complete(
         PTO2TaskSlotState &slot_state
@@ -1100,6 +1100,8 @@ struct PTO2SchedulerState {
     ) {
 #if SIMPLER_SCHED_PROFILING
         CompletionStats stats = {0, 0, 0, true};
+#else
+        uint32_t consumer_walk_count = 0;
 #endif
 #if SIMPLER_SCHED_PROFILING
         extern uint64_t g_sched_lock_cycle[], g_sched_fanout_cycle[];
@@ -1138,6 +1140,7 @@ struct PTO2SchedulerState {
                 stats.tasks_enqueued++;
             }
 #else
+            consumer_walk_count++;
             release_fanin_and_check_ready(consumer_slot, &rel_sink);
 #endif
             current = current->next;
@@ -1151,6 +1154,8 @@ struct PTO2SchedulerState {
         g_sched_push_wait_cycle[thread_idx] += push_wait;
         PTO2_SCHED_CYCLE_LAP(g_sched_fanout_cycle[thread_idx]);
         return stats;
+#else
+        return consumer_walk_count;
 #endif
     }
 

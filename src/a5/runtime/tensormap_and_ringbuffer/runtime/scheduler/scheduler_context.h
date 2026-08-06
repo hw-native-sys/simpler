@@ -401,7 +401,13 @@ private:
     SyncStartStageResult stage_sync_start_cores(
         PTO2TaskSlotState *slot_state, int32_t block_num, int32_t thread_idx, bool gated, bool record_drain_phases
     );
-    void handle_drain_mode(int32_t thread_idx, uint64_t *out_stage_wall_cycles = nullptr);
+    void handle_drain_mode(
+        int32_t thread_idx, uint64_t *out_stage_wall_cycles = nullptr, int32_t *out_staged_blocks = nullptr
+    );
+
+    void flush_deferred_releases(
+        int32_t thread_idx, PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
+    );
 
     // =========================================================================
     // Cold path: exit checks, stall diagnostics, profiling (scheduler_cold_path.cpp)

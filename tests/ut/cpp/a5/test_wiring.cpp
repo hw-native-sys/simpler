@@ -411,7 +411,12 @@ TEST_F(WiringTest, OnMixedTaskCompleteNotifiesConsumers) {
     dep_entries[1].next = &dep_entries[0];
     producer.fanout_head = &dep_entries[1];
 
-    sched.on_task_complete(producer);
+#if SIMPLER_SCHED_PROFILING
+    auto completion_stats = sched.on_task_complete(producer, /*thread_idx=*/0);
+    EXPECT_EQ(completion_stats.fanout_edges, 2U);
+#else
+    EXPECT_EQ(sched.on_task_complete(producer), 2U);
+#endif
 
     // Producer should be COMPLETED
     EXPECT_EQ(producer.task_state.load(), PTO2_TASK_COMPLETED);
