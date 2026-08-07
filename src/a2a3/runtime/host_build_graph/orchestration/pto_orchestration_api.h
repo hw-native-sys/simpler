@@ -94,7 +94,7 @@ typedef struct PTO2RuntimeOps {
     int32_t (*available_cluster_count)(PTO2Runtime *rt);
     int32_t (*available_aiv_count)(PTO2Runtime *rt);
     GraphScopeResult (*graph_begin)(PTO2Runtime *rt, uint64_t graph_key, const CoreTaskArgs &args);
-    void (*graph_end)(PTO2Runtime *rt);
+    bool (*graph_end)(PTO2Runtime *rt);
     void (*graph_commit)(PTO2Runtime *rt);
 
     // Stash the call-site of the next PTO2ScopeGuard so the [ScopeStats]
@@ -221,12 +221,17 @@ static inline GraphScopeResult rt_graph_begin(uint64_t graph_key, const CoreTask
     return rt->ops->graph_begin(rt, graph_key, args);
 }
 
-static inline void rt_graph_end() {
+// Finish the recording pass. Returns true when the recorded sub-DAG was emitted
+// as a single outer GRAPH task (the body must not run again); false when the
+// recording was unsupported and the caller must re-run the body on the ordinary
+// path. A fatal runtime is terminal, so it reports true to suppress a pointless
+// re-run.
+static inline bool rt_graph_end() {
     PTO2Runtime *rt = current_runtime();
     if (rt->ops->is_fatal(rt) || rt->ops->graph_end == nullptr) {
-        return;
+        return true;
     }
-    rt->ops->graph_end(rt);
+    return rt->ops->graph_end(rt);
 }
 
 static inline void rt_graph_commit() {
@@ -410,10 +415,17 @@ static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const C
         return GraphSubmitResult{};
     }
     GraphScopeResult result = rt_graph_begin(graph_key, args);
-    if (result.execute_block) invoke();
     if (result.recording) {
-        rt_graph_end();
+        // First invocation: record the sub-DAG off the ring, then emit one outer
+        // GRAPH task. If the recording hit an unsupported construct, fall back and
+        // run the body on the ordinary path so its work is still submitted.
+        invoke();
+        if (!rt_graph_end()) invoke();
+    } else if (result.execute_block) {
+        // Un-cacheable at begin, or the Definition cache is full: ordinary path.
+        invoke();
     }
+    // Cache hit: execute_block and recording are both false; the body is skipped.
     rt_graph_commit();
     return result;
 }

@@ -103,9 +103,7 @@ static GraphScopeResult graph_begin_impl(PTO2Runtime *rt, uint64_t graph_key, co
     return rt->orchestrator.graph_begin(graph_key, args, rt->active_callable_hash);
 }
 
-static void graph_end_impl(PTO2Runtime *rt) {
-    if (rt != nullptr) rt->orchestrator.graph_end();
-}
+static bool graph_end_impl(PTO2Runtime *rt) { return rt != nullptr && rt->orchestrator.graph_end(); }
 
 static void graph_commit_impl(PTO2Runtime *rt) {
     if (rt != nullptr) rt->orchestrator.graph_commit();
