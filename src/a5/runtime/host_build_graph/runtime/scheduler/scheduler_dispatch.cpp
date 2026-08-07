@@ -907,15 +907,17 @@ int32_t SchedulerContext::run_resolution_thread(Runtime *runtime, int32_t thread
         }
 
         int32_t resolved_this_pass = 0;
+        bool resolved_any = false;
         for (int32_t s = 0; s < active_sched_threads_; s++) {
             PTO2TaskSlotState *slot;
             while ((slot = sp_queues_[s].pop()) != nullptr) {
 #if SIMPLER_SCHED_PROFILING
-                (void)sched_->on_task_complete(*slot, thread_idx);
+                PTO2SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(*slot, thread_idx);
 #else
-                (void)sched_->on_task_complete(*slot);
+                PTO2SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(*slot);
 #endif
-                resolved_this_pass++;
+                resolved_this_pass += outcome.stream_tasks_completed;
+                resolved_any = true;
             }
         }
 
@@ -943,6 +945,7 @@ int32_t SchedulerContext::run_resolution_thread(Runtime *runtime, int32_t thread
                 break;
             }
             resolved_this_pass += poll_result.completed;
+            resolved_any = resolved_any || poll_result.completed > 0;
         }
 
         // Dependency-only tasks (empty active_mask, or a predicate that failed)
@@ -956,23 +959,28 @@ int32_t SchedulerContext::run_resolution_thread(Runtime *runtime, int32_t thread
             while ((dummy_got = sched_->dummy_ready_queue.pop_batch(dummy_batch, DUMMY_DRAIN_BATCH)) > 0) {
                 for (int di = 0; di < dummy_got; di++) {
 #if SIMPLER_SCHED_PROFILING
-                    (void)sched_->on_task_complete(*dummy_batch[di], thread_idx);
+                    PTO2SchedulerState::TaskCompletionOutcome outcome =
+                        sched_->complete_task(*dummy_batch[di], thread_idx);
 #else
-                    (void)sched_->on_task_complete(*dummy_batch[di]);
+                    PTO2SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(*dummy_batch[di]);
 #endif
-                    resolved_this_pass++;
+                    resolved_this_pass += outcome.stream_tasks_completed;
+                    resolved_any = true;
                 }
             }
         }
 
-        if (resolved_this_pass > 0) {
-            int32_t new_total =
-                completed_tasks_.fetch_add(resolved_this_pass, std::memory_order_relaxed) + resolved_this_pass;
+        if (resolved_any) {
+            int32_t new_total = completed_tasks_.load(std::memory_order_relaxed);
+            if (resolved_this_pass > 0) {
+                new_total =
+                    completed_tasks_.fetch_add(resolved_this_pass, std::memory_order_relaxed) + resolved_this_pass;
 #if SIMPLER_SCHED_PROFILING
-            // P owns the completion accounting, so it owns the profiling mirror too
-            // (the S threads' completed_this_turn no longer feeds it in P mode).
-            sched_->tasks_completed.fetch_add(resolved_this_pass, std::memory_order_relaxed);
+                // P owns the completion accounting, so it owns the profiling mirror too
+                // (the S threads' completed_this_turn no longer feeds it in P mode).
+                sched_->tasks_completed.fetch_add(resolved_this_pass, std::memory_order_relaxed);
 #endif
+            }
             last_progress_ts = get_sys_cnt_aicpu();
             if (total_tasks_ > 0 && new_total >= total_tasks_) {
                 completed_.store(true, std::memory_order_release);
@@ -1274,6 +1282,94 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             handle_drain_mode(thread_idx);
 #endif
             continue;
+        }
+
+        // Graph control work never consumes an AICore. External dependency
+        // readiness and bounded definition materialization progress
+        // independently, then meet at GraphSubmission::activation_gate.
+        //
+        // Keep this ahead of dummy/regular dispatch so a ready Graph can expose
+        // its root nodes without waiting for an otherwise unrelated dispatch
+        // pass. Limiting the work to one activation and one bounded prepare
+        // slice per loop prevents a large definition from monopolizing a
+        // scheduler thread.
+        if (thread_idx < active_sched_threads_) {
+            PTO2TaskSlotState *graph_slot = sched_->graph_ready_queue.pop();
+            if (graph_slot != nullptr) {
+                if (graph_slot->task != nullptr && graph_slot->task_kind == TaskKind::GRAPH) {
+                    (void)sched_->activate_graph_task(*graph_slot);
+                    made_progress = true;
+                } else {
+                    int32_t expected = PTO2_ERROR_NONE;
+                    if (header->sched_error_code.compare_exchange_strong(
+                            expected, PTO2_ERROR_INVALID_ARGS, std::memory_order_acq_rel, std::memory_order_acquire
+                        )) {
+                        header->sched_error_thread.store(thread_idx, std::memory_order_release);
+                    }
+                    header->sched_error_bitmap.fetch_or(
+                        1U << static_cast<uint32_t>(thread_idx), std::memory_order_acq_rel
+                    );
+                    completed_.store(true, std::memory_order_release);
+                    break;
+                }
+            }
+
+            uint64_t prepare_task_id = 0;
+            PTO2TaskSlotState *prepare_slot = sched_->graph_prepare_queue.pop_tagged(&prepare_task_id);
+            if (prepare_slot != nullptr) {
+                const bool valid_slot = prepare_slot->task != nullptr && prepare_slot->task_kind == TaskKind::GRAPH &&
+                                        prepare_slot->task->task_id.raw == prepare_task_id;
+                if (!valid_slot) {
+                    int32_t expected = PTO2_ERROR_NONE;
+                    if (header->sched_error_code.compare_exchange_strong(
+                            expected, PTO2_ERROR_INVALID_ARGS, std::memory_order_acq_rel, std::memory_order_acquire
+                        )) {
+                        header->sched_error_thread.store(thread_idx, std::memory_order_release);
+                    }
+                    header->sched_error_bitmap.fetch_or(
+                        1U << static_cast<uint32_t>(thread_idx), std::memory_order_acq_rel
+                    );
+                    completed_.store(true, std::memory_order_release);
+                    break;
+                }
+#if SIMPLER_DFX
+                uint64_t graph_prepare_t0 =
+                    chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES ? get_sys_cnt_aicpu() : 0;
+#endif
+                int32_t nodes_materialized = 0;
+                GraphMaterializeResult result =
+                    sched_->prepare_graph_task(*prepare_slot, GRAPH_MATERIALIZE_SLICE_NODES, &nodes_materialized);
+                if (result == GraphMaterializeResult::PENDING || result == GraphMaterializeResult::BUSY) {
+                    while (!sched_->graph_prepare_queue.push_tagged(prepare_slot, prepare_task_id)) {
+                        SPIN_WAIT_HINT();
+                    }
+                } else if (result == GraphMaterializeResult::INVALID) {
+                    int32_t expected = PTO2_ERROR_NONE;
+                    if (header->sched_error_code.compare_exchange_strong(
+                            expected, PTO2_ERROR_INVALID_ARGS, std::memory_order_acq_rel, std::memory_order_acquire
+                        )) {
+                        header->sched_error_thread.store(thread_idx, std::memory_order_release);
+                    }
+                    header->sched_error_bitmap.fetch_or(
+                        1U << static_cast<uint32_t>(thread_idx), std::memory_order_acq_rel
+                    );
+                    completed_.store(true, std::memory_order_release);
+                    break;
+                }
+                if (nodes_materialized > 0 || result == GraphMaterializeResult::PREPARED) {
+                    made_progress = true;
+                }
+#if SIMPLER_DFX
+                if (graph_prepare_t0 != 0) {
+                    uint64_t graph_prepare_t1 = get_sys_cnt_aicpu();
+                    chip_swimlane_aicpu_record_graph_prepare(
+                        thread_idx, graph_prepare_t0, graph_prepare_t1, chip_swimlane.sched_loop_count, prepare_task_id,
+                        static_cast<uint32_t>(nodes_materialized)
+                    );
+                    _t0_phase = graph_prepare_t1;
+                }
+#endif
+            }
         }
 
         // Phase 3 (dependency-only dummy / predicate-failed retirement) runs on

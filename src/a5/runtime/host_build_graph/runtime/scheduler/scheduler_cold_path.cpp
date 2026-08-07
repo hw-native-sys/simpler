@@ -1120,20 +1120,10 @@ void SchedulerContext::on_orchestration_done(
 }
 
 // Polling initial classify (device boot), partitioned across all AICPU threads.
-// The host built the whole graph and no producer has executed yet — every
-// completion_flags byte is 0 except the hidden-alloc tasks the host completed
-// inline (pre-set to 1). Each thread classifies its contiguous slice of the
-// submitted-task range exactly once: route roots (all fanin met) to the ready
-// queues and register the rest on their first unmet producer's wake list.
-//
-// This is the same work the wiring model deferred to a device queue, now run
-// N-way parallel. push_ready_routed (MPMC ready queues) and register_wake
-// (lock-free wake-list CAS) are the same concurrency-safe primitives the
-// scheduler threads use during the run, and at boot no producer has completed
-// (wake_list heads are nullptr, never SENTINEL), so registration never
-// re-classifies. The caller barriers all threads here BEFORE any of them
-// publishes runtime_init_ready_, so the whole ready-set / wake-list graph is
-// fully seeded before the first dispatch.
+// Each thread classifies its contiguous slice of the submitted-task range
+// exactly once. Graph tasks additionally enter the bounded preparation queue;
+// their external fanin follows the same ready/wake classification as any other
+// outer task.
 void SchedulerContext::classify_partition(int32_t thread_idx, int32_t nthreads) {
     if (completed_.load(std::memory_order_acquire) || sched_->ring_sched_state.ring == nullptr) {
         return;
@@ -1148,13 +1138,18 @@ void SchedulerContext::classify_partition(int32_t thread_idx, int32_t nthreads) 
         if (ring.is_completion_flag_set(id)) {
             continue;  // completed on the host (hidden alloc); nothing to dispatch
         }
-        PTO2TaskSlotState &s = ring.get_slot_state_by_task_id(id);
-        int32_t state = sched_->classify_fanin_state(&s);
+        PTO2TaskSlotState &slot = ring.get_slot_state_by_task_id(id);
+        if (slot.task_kind == TaskKind::GRAPH) {
+            while (!sched_->graph_prepare_queue.push_tagged(&slot, slot.task->task_id.raw)) {
+                SPIN_WAIT_HINT();
+            }
+        }
+        int32_t state = sched_->classify_fanin_state(&slot);
         if (state < 0) {
-            sched_->push_ready_routed(&s);
+            sched_->push_ready_routed(&slot);
         } else {
-            int32_t prod_local = s.payload->fanin_local_ids[state];
-            sched_->register_wake(&ring.get_slot_state_by_task_id(prod_local), &s);
+            int32_t prod_local = slot.payload->fanin_local_ids[state];
+            sched_->register_wake(&ring.get_slot_state_by_task_id(prod_local), &slot);
         }
     }
 }

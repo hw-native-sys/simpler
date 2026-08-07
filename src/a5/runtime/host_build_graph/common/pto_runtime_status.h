@@ -38,6 +38,7 @@
 #define PTO2_ERROR_ASYNC_COMPLETION_INVALID 101
 #define PTO2_ERROR_ASYNC_WAIT_OVERFLOW 102
 #define PTO2_ERROR_ASYNC_REGISTRATION_FAILED 103
+#define PTO2_ERROR_READY_QUEUE_OVERFLOW 104  // push into a ready queue found no free slot (full, or window > capacity)
 
 static inline int32_t runtime_status_from_error_codes(int32_t orch_error_code, int32_t sched_error_code) {
     if (orch_error_code != PTO2_ERROR_NONE) {

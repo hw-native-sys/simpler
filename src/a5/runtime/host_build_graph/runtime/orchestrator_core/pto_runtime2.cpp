@@ -98,6 +98,19 @@ static TaskOutputTensors submit_dummy_task_impl(PTO2Runtime *rt, const CoreTaskA
     return rt->orchestrator.submit_dummy_task(args);
 }
 
+static GraphScopeResult graph_begin_impl(PTO2Runtime *rt, uint64_t graph_key, const CoreTaskArgs &args) {
+    if (rt == nullptr) return GraphScopeResult{};
+    return rt->orchestrator.graph_begin(graph_key, args, rt->active_callable_hash);
+}
+
+static void graph_end_impl(PTO2Runtime *rt) {
+    if (rt != nullptr) rt->orchestrator.graph_end();
+}
+
+static void graph_commit_impl(PTO2Runtime *rt) {
+    if (rt != nullptr) rt->orchestrator.graph_commit();
+}
+
 void rt_scope_begin(PTO2Runtime *rt) {
     PTO2ScopeMode mode = rt->pending_scope_mode;
     rt->pending_scope_mode = PTO2ScopeMode::AUTO;
@@ -369,6 +382,9 @@ static const PTO2RuntimeOps s_runtime_ops = {
     .submit_dummy_task = submit_dummy_task_impl,
     .available_cluster_count = available_cluster_count_impl,
     .available_aiv_count = available_aiv_count_impl,
+    .graph_begin = graph_begin_impl,
+    .graph_end = graph_end_impl,
+    .graph_commit = graph_commit_impl,
 #if SIMPLER_DFX
     .scope_set_site = scope_set_site_impl,
 #else

@@ -164,6 +164,13 @@ struct PTO2TaskAllocResult {
     bool failed() const { return task_id < 0; }
 };
 
+enum class TaskKind : uint8_t {
+    KERNEL = 0,
+    DUMMY = 1,
+    GRAPH = 2,
+    GRAPH_NODE = 3,
+};
+
 struct PTO2OutputLayout {
     uint64_t offsets[MAX_TENSOR_ARGS] = {};
     uint64_t buffer_sizes[MAX_TENSOR_ARGS] = {};
@@ -479,7 +486,7 @@ struct alignas(64) PTO2TaskSlotState {
     // MPSC-deferred completion. The release write is sequenced before
     // on_subtask_complete's acq_rel fetch_add and the acquire read after.
     std::atomic<bool> any_subtask_deferred{false};
-    uint8_t _async_pad{0};
+    TaskKind task_kind{TaskKind::KERNEL};
 
     std::atomic<int16_t> completed_subtasks{0};  // Each core completion increments by 1
     int16_t total_required_subtasks{0};          // = logical_block_num * popcount(active_mask)
@@ -488,6 +495,11 @@ struct alignas(64) PTO2TaskSlotState {
     // can run concurrently after a partial staged release. All paths claim
     // ranges through claim_block_range().
     std::atomic<int16_t> next_block_idx{0};
+
+    // Graph scheduling metadata occupies the slot's tail padding. Ordinary
+    // ring tasks keep the index invalid and the context null.
+    int32_t graph_node_index{-1};
+    void *graph_context{nullptr};
 
     int32_t claim_block_range(int32_t block_limit, int32_t max_count, int32_t &start) {
         int16_t current = next_block_idx.load(std::memory_order_relaxed);
@@ -523,17 +535,24 @@ struct alignas(64) PTO2TaskSlotState {
 
     /**
      * Reset dynamic scheduling fields to their pristine values. Runs once per
-     * slot at init (pto_shared_memory.cpp) — whole-graph-resident hbg has no
-     * execution-time slot recycle. Skips payload/task (bound once) and
+     * slot at init (pto_shared_memory.cpp) and again during affine Graph replay;
+     * whole-graph-resident hbg has no execution-time slot recycle. Skips
+     * payload/task (bound once) and
      * task_state (the orchestrator sets PENDING when it populates the slot).
      * wake_list_head starts nullptr (open for registration), NOT SENTINEL.
+     * Affine Graph replay preserves the node's retained execution binding.
      */
-    void reset_for_reuse() {
+    void reset_for_reuse(bool preserve_graph_binding = false) {
         wake_list_head.store(nullptr, std::memory_order_relaxed);
         next_in_wake_list = nullptr;
         any_subtask_deferred.store(false, std::memory_order_relaxed);
         completed_subtasks.store(0, std::memory_order_relaxed);
         next_block_idx.store(0, std::memory_order_relaxed);
+        if (!preserve_graph_binding) {
+            graph_node_index = -1;
+            graph_context = nullptr;
+            task_kind = TaskKind::KERNEL;
+        }
         // Note: active_mask and task_attrs are per-submit-constant fields
         // rewritten in prepare_task on every reuse, so they are not reset here.
         // last_consumer_local_id is seeded in prepare_task once the id is known.
