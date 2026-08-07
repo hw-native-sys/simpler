@@ -25,7 +25,7 @@
 // (it pulls in Handshake which we only forward-declare).  Mirror the
 // authoritative values so the class layout compiles standalone.
 #ifndef RUNTIME_MAX_WORKER
-#define RUNTIME_MAX_WORKER 108
+#define RUNTIME_MAX_WORKER PLATFORM_MAX_CORES
 #endif
 #ifndef RUNTIME_MAX_FUNC_ID
 #define RUNTIME_MAX_FUNC_ID 1024
