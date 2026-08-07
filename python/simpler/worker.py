@@ -84,10 +84,13 @@ from typing import Any, cast
 import cloudpickle
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     CHIP_TENSOR_CHILD_MEMORY_OFFSET,
+    HOST_STRACE_ENABLED,
     MAX_REGISTERED_CALLABLE_IDS,
     PTO_PIPELINE_MAX_DEPTH,
     RUNTIME_ENV_RING_COUNT,
     WorkerType,
+    _bind_host_span_sink,
+    _emit_host_span,
     _l3_child_onboard_region_close,
     _l3_child_onboard_region_create,
     _mailbox_load_i32,
@@ -136,6 +139,7 @@ from .task_interface import (
     RemoteBufferExport,
     RemoteBufferHandle,
     TaskArgs,
+    _initialize_simpler_log,
     _Worker,
 )
 from .worker_chip_orch_comm import (
@@ -3979,6 +3983,7 @@ class Worker:
         # Level-3+ internals
         self._worker: _Worker | None = None
         self._orch: Orchestrator | None = None
+        self._host_trace_enabled: bool = False
         self._chip_shms: list[SharedMemory] = []
         self._chip_pids: list[int] = []
         self._sub_shms: list[SharedMemory] = []
@@ -6467,6 +6472,14 @@ class Worker:
             # invocation is `os.fork()` + direct function call, so no pickle
             # barrier — the bins object is just a Python value passed through.
             self._l3_bins = binaries
+            if HOST_STRACE_ENABLED:
+                # The parent and every later fork inherit one RTLD_GLOBAL logger
+                # and the binding's resolved sink pointer. Loading it after the
+                # first fork would silently lose child-process host spans.
+                _initialize_simpler_log(binaries)
+                if not _bind_host_span_sink():
+                    raise RuntimeError("libsimpler_log.so does not export simpler_log_emit_host_span")
+                self._host_trace_enabled = True
 
             # Allocate chip mailboxes (unified layout, MAILBOX_SIZE each).
             for i, _dev_id in enumerate(device_ids):
@@ -8746,7 +8759,23 @@ class Worker:
             self._orch._scope_begin()
             scope_open = True
             with _callback_run(run_id, self):
-                callable(self._orch, args, cfg)
+                if HOST_STRACE_ENABLED and self._host_trace_enabled:
+                    graph_start_ns = time.monotonic_ns()
+                    try:
+                        callable(self._orch, args, cfg)
+                    finally:
+                        graph_end_ns = time.monotonic_ns()
+                        _emit_host_span(
+                            "l3.graph_build",
+                            run_id,
+                            0,
+                            0,
+                            graph_start_ns,
+                            graph_end_ns - graph_start_ns,
+                            f"run_id={run_id} role=facade",
+                        )
+                else:
+                    callable(self._orch, args, cfg)
             scope_open = False
             self._orch._scope_end()
             self._orch._close_run_submission(run_id)

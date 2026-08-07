@@ -18,6 +18,7 @@ list(TRANSFORM BINDING_SOURCES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
 set(HIERARCHICAL_SRC ${CMAKE_SOURCE_DIR}/src/common/hierarchical)
 
 set(HIERARCHICAL_SOURCES
+    ${HIERARCHICAL_SRC}/host_trace.cpp
     ${HIERARCHICAL_SRC}/types.cpp
     ${HIERARCHICAL_SRC}/tensormap.cpp
     ${HIERARCHICAL_SRC}/ring.cpp
@@ -63,6 +64,7 @@ target_include_directories(_task_interface PRIVATE
     ${CMAKE_SOURCE_DIR}/src/common/hierarchical
     ${CMAKE_SOURCE_DIR}/src/common/platform/include/common
     ${CMAKE_SOURCE_DIR}/src/common/platform/include/host
+    ${CMAKE_SOURCE_DIR}/src/common/log/include
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 

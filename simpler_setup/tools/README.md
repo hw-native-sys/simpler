@@ -328,6 +328,9 @@ python -m simpler_setup.tools.strace_timing path/to/log --tree
 # Also emit a Chrome-trace / Perfetto JSON (one named lane per invocation, with
 # separate host and device(clk=dev) tracks; nested by span containment)
 python -m simpler_setup.tools.strace_timing path/to/log --trace-out strace.json
+
+# L3/L4 host scheduler timeline (real OS pid/tid lanes + cross-thread flows)
+python -m simpler_setup.tools.strace_timing path/to/log --swimlane host_swimlane.json
 ```
 
 Groups spans by `(pid, inv)`, rebuilds each invocation's tree from `depth`,
@@ -351,6 +354,15 @@ device log needed. The scene test only *emits* the markers to stderr; tee a run
 to a file (`python test_*.py … --rounds N > run.log 2>&1`) and pass `run.log`
 here. Because grouping is per `(pid, inv)`, this captures **L3 multi-round**
 (every chip-child invocation), not just round 0.
+
+`--swimlane` consumes both the `l3.*` scheduler markers and child
+`simpler_run` markers. Host lanes retain their OS pid/tid. Because Chrome Trace
+JSON has one visible timestamp axis, raw device-domain `clk=dev` slices are
+stored in the top-level `unalignedDeviceSpans` array rather than placed beside
+the unrelated host clock and stretching Perfetto into an empty-looking
+multi-day viewport. Their ns timestamps remain unchanged; no clock offset is
+invented. This does not alter the established per-invocation `--trace-out`
+view.
 
 ---
 

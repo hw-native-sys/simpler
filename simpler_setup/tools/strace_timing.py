@@ -35,8 +35,10 @@ Outputs:
     * a per-callable TPOT table (each invocation's simpler_run dur + the mean
       of each sub-stage across invocations), and
     * optionally a Chrome-trace / Perfetto JSON (``--trace-out``): one ``ph:"X"``
-      event per span, lane = pid, so the host call tree renders as nested
-      slices (L3 parent and each L2 child get their own pid lane).
+      event per span on a synthetic per-invocation lane, so each host call tree
+      renders as nested slices, or
+    * a host scheduler swimlane (``--swimlane``) whose host lanes retain the
+      real OS pid/tid and whose cross-thread handoffs are Chrome flow events.
 """
 
 from __future__ import annotations
@@ -135,6 +137,17 @@ def parse_spans(lines):
                 dur=int(m["dur"]),
                 attrs=m["attrs"].strip(),
             )
+
+
+def legacy_spans(spans):
+    """Return spans belonging to the established ``simpler_run`` views.
+
+    L3/L4 host-scheduler markers share the STRACE grammar but answer a
+    different question. Keeping them out of invocation grouping preserves the
+    TPOT, rounds, tree, and ``--trace-out`` contracts when a log contains both
+    marker families.
+    """
+    return [span for span in spans if span.name == "simpler_run" or span.name.startswith("simpler_run.")]
 
 
 def group_invocations(spans):
@@ -396,6 +409,167 @@ def to_chrome_trace(invocations, buckets=None):
     return {"traceEvents": events, "displayTimeUnit": "ms"}
 
 
+def _parsed_attrs(span):
+    attrs = {}
+    for attribute in span.attrs.split():
+        key, separator, value = attribute.partition("=")
+        if not separator:
+            continue
+        if re.fullmatch(r"-?\d+", value):
+            attrs[key] = int(value)
+        else:
+            attrs[key] = value
+    return attrs
+
+
+def _host_thread_name(span, attrs):
+    role = attrs.get("role")
+    if role == "facade" or span.name in {"l3.graph_build", "l3.submit"}:
+        return "orchestrator / facade"
+    if role == "scheduler":
+        return "scheduler"
+    if role == "worker" or span.name.startswith("l3."):
+        worker_id = attrs.get("worker_id")
+        return f"worker {worker_id}" if worker_id is not None else "worker"
+    if span.name == "simpler_run" or span.name.startswith("simpler_run."):
+        return "chip child"
+    return f"tid {span.tid}"
+
+
+def _flow_key(span, attrs):
+    run_id = attrs.get("run_id")
+    task_slot = attrs.get("task_slot", attrs.get("slot"))
+    if run_id is None or task_slot is None:
+        return None
+    return span.pid, run_id, task_slot
+
+
+def to_host_swimlane(spans):
+    """Build a real-pid/tid host scheduling timeline for Perfetto.
+
+    Host timestamps remain on their shared CLOCK_MONOTONIC axis. Chrome Trace
+    JSON has one timestamp axis, so raw ``clk=dev`` events cannot be rendered
+    alongside host events without either a false clock alignment or a huge
+    empty interval. Keep those raw events in ``unalignedDeviceSpans`` for
+    inspection, but do not add them to Perfetto's visible ``traceEvents``.
+    """
+    spans = list(spans)
+    events = []
+    attrs_by_id = {id(span): _parsed_attrs(span) for span in spans}
+
+    host_spans = [span for span in spans if not span.is_device]
+    device_spans = [span for span in spans if span.is_device]
+    host_pids = sorted({span.pid for span in host_spans})
+    host_threads = sorted({(span.pid, span.tid) for span in host_spans})
+
+    for pid in host_pids:
+        process_spans = [span for span in host_spans if span.pid == pid]
+        role = "host" if any(span.name.startswith("l3.") for span in process_spans) else "chip child"
+        events.append(
+            {
+                "ph": "M",
+                "name": "process_name",
+                "pid": pid,
+                "tid": 0,
+                "args": {"name": f"simpler {role} (pid={pid})"},
+            }
+        )
+    for pid, tid in host_threads:
+        representative = next(span for span in host_spans if span.pid == pid and span.tid == tid)
+        events.append(
+            {
+                "ph": "M",
+                "name": "thread_name",
+                "pid": pid,
+                "tid": tid,
+                "args": {"name": _host_thread_name(representative, attrs_by_id[id(representative)])},
+            }
+        )
+    for span in sorted(host_spans, key=lambda item: (item.ts, item.pid, item.tid, item.name)):
+        parsed = attrs_by_id[id(span)]
+        event_args = {"inv": span.inv, "hid": span.hid, "depth": span.depth, "attrs": span.attrs, **parsed}
+        events.append(
+            {
+                "name": span.name,
+                "ph": "X",
+                "ts": span.ts / 1000.0,
+                "dur": span.dur / 1000.0,
+                "pid": span.pid,
+                "tid": span.tid,
+                "args": event_args,
+            }
+        )
+
+    submits = {}
+    for span in host_spans:
+        if span.name != "l3.submit":
+            continue
+        attrs = attrs_by_id[id(span)]
+        key = _flow_key(span, attrs)
+        if key is not None:
+            submits[key] = span
+    dispatches = []
+    for span in host_spans:
+        if span.name != "l3.dispatch":
+            continue
+        attrs = attrs_by_id[id(span)]
+        key = _flow_key(span, attrs)
+        source = submits.get(key) if key is not None else None
+        if source is None:
+            continue
+        dispatches.append((source, span, attrs))
+
+    for source, destination, attrs in sorted(dispatches, key=lambda item: item[1].ts):
+        flow_id = (
+            f"dispatch:{source.pid}:{attrs['run_id']}:{attrs.get('task_slot', attrs.get('slot'))}:"
+            f"{attrs.get('group_index', -1)}:{attrs.get('worker_id', -1)}:{attrs.get('dispatch_id', 0)}"
+        )
+        events.append(
+            {
+                "name": "task dispatch",
+                "cat": "host.scheduler",
+                "ph": "s",
+                "id": flow_id,
+                "ts": min(source.ts + source.dur, destination.ts) / 1000.0,
+                "pid": source.pid,
+                "tid": source.tid,
+            }
+        )
+        events.append(
+            {
+                "name": "task dispatch",
+                "cat": "host.scheduler",
+                "ph": "f",
+                "id": flow_id,
+                "ts": destination.ts / 1000.0,
+                "pid": destination.pid,
+                "tid": destination.tid,
+            }
+        )
+
+    unaligned_device_spans = []
+    for span in sorted(device_spans, key=lambda item: (item.pid, item.inv, item.ts, item.tid, item.name)):
+        unaligned_device_spans.append(
+            {
+                "name": span.name,
+                "ts_ns": span.ts,
+                "dur_ns": span.dur,
+                "pid": span.pid,
+                "tid": span.tid,
+                "inv": span.inv,
+                "hid": span.hid,
+                "depth": span.depth,
+                "attrs": {"raw": span.attrs, **attrs_by_id[id(span)]},
+            }
+        )
+
+    return {
+        "traceEvents": events,
+        "displayTimeUnit": "ms",
+        "unalignedDeviceSpans": unaligned_device_spans,
+    }
+
+
 def _print_agg_tree(invs, stream=sys.stdout):
     """Print a callable's spans as a nested tree built from the dotted span
     names (so e.g. ``simpler_run.bind.args`` nests under ``simpler_run.bind``),
@@ -496,6 +670,10 @@ def main(argv=None):
         "--trace-out", help="write a Chrome-trace/Perfetto JSON here (load in chrome://tracing or perfetto)"
     )
     ap.add_argument(
+        "--swimlane",
+        help="write a real-pid/tid L3/L4 host swimlane JSON here (load in chrome://tracing or perfetto)",
+    )
+    ap.add_argument(
         "--rounds-table",
         action="store_true",
         help="print a per-round Host/Device/Orch/Sched table (the format tools/benchmark_rounds.sh "
@@ -523,7 +701,8 @@ def main(argv=None):
             "excluded from the timing below",
             file=sys.stderr,
         )
-    invocations = group_invocations(spans)
+    legacy = legacy_spans(spans)
+    invocations = group_invocations(legacy)
     buckets = bucket_by_hid(invocations)
 
     if args.rounds_table:
@@ -536,7 +715,16 @@ def main(argv=None):
     if args.trace_out:
         with open(args.trace_out, "w", encoding="utf-8") as f:
             json.dump(to_chrome_trace(invocations, buckets), f)
-        print(f"Wrote Chrome trace: {args.trace_out} ({len(spans)} spans)")
+        print(f"Wrote Chrome trace: {args.trace_out} ({len(legacy)} spans)")
+
+    if args.swimlane:
+        with open(args.swimlane, "w", encoding="utf-8") as f:
+            json.dump(to_host_swimlane(spans), f)
+        host_count = sum(not span.is_device for span in spans)
+        print(
+            f"Wrote host swimlane: {args.swimlane} "
+            f"({host_count} host spans, {len(spans) - host_count} unaligned device spans)"
+        )
 
     return 0
 

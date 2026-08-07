@@ -82,21 +82,54 @@ including time the caller spends polling or doing other host work; blocking
 | 2 | `simpler_run.bind.args`, `simpler_run.bind.prebuilt`, `simpler_run.runner_run.device_wall` |
 | 3 | `simpler_run.runner_run.device_wall.{preamble,so_load,graph_build,config_validate,arena_wire,sm_reset,post_orch,orch,sched,task_slot_*}` |
 
+## L3/L4 host scheduler spans
+
+A hierarchical worker with direct local chip children also emits these spans
+through the same process-global `libsimpler_log.so` sink:
+
+| Span | Host decision point |
+| ---- | ------------------- |
+| `l3.graph_build` | serialized Python graph callback |
+| `l3.submit` | next-level task publication after slot allocation |
+| `l3.dispatch` | scheduler handoff to a worker thread |
+| `l3.frame_submit` | local child mailbox-frame publication |
+| `l3.activate` | prepared-frame activation |
+| `l3.complete` | terminal child progress handling |
+
+Their attributes carry the available `run_id`, `task_slot`, `group_index`,
+`worker_id`, `dispatch_id`, and endpoint kind. The logger is loaded
+and the fixed host-span ABI is resolved before local children are forked, so
+parent and child markers reach one sink. Topologies without a local chip binary
+path do not initialize this bridge and continue without scheduler markers.
+
 ## Reading the markers — `strace_timing.py`
 
 ```bash
 # TPOT table (per-callable, decode = most-invoked hid bucket)
 python -m simpler_setup.tools.strace_timing path/to/host_or_device.log
 
-# also emit a Chrome-trace / Perfetto JSON (lane = pid → host call tree)
+# also emit the established per-invocation call-tree JSON
 python -m simpler_setup.tools.strace_timing path/to/log --trace-out strace.json
+
+# emit the L3/L4 host scheduler timeline on real OS pid/tid lanes
+python -m simpler_setup.tools.strace_timing path/to/log --swimlane host_swimlane.json
 ```
 
 The tool groups by `(pid, inv)`, rebuilds each invocation's tree from `depth`,
 buckets by `hid`, and prints each callable's mean `simpler_run` plus per-stage
-means. With `--trace-out` it writes one `ph:"X"` event per span keyed by pid, so
-the L3 parent and each L2 child render as separate lanes in
+means. With `--trace-out` it writes one `ph:"X"` event per span on a synthetic
+per-invocation lane, so each call renders as an isolated nested tree in
 [Perfetto](https://ui.perfetto.dev) / `chrome://tracing`.
+
+`--swimlane` is a separate view. Host slices keep their real OS pid/tid, and
+task submission-to-dispatch handoffs render as flow arrows. Chrome Trace JSON
+has only one visible timestamp axis, so putting the raw per-invocation device
+clock beside `CLOCK_MONOTONIC` would create a multi-day empty interval. The
+converter therefore keeps `clk=dev` records, with their original ns timestamps,
+in the top-level `unalignedDeviceSpans` array instead of `traceEvents`; it does
+not guess a clock offset. Perfetto opens directly on the host activity, while
+the existing tables, tree, and `--trace-out` still provide the device-phase
+timing views.
 
 ## Why markers, not a return value
 

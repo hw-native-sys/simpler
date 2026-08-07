@@ -202,6 +202,7 @@ set(HIERARCHICAL_SRC_DIR ${CMAKE_SOURCE_DIR}/../../../src/common/hierarchical)
 set(WORKER_SRC_DIR ${CMAKE_SOURCE_DIR}/../../../src/common/worker)
 
 add_library(hierarchical_objs OBJECT
+    ${HIERARCHICAL_SRC_DIR}/host_trace.cpp
     ${HIERARCHICAL_SRC_DIR}/types.cpp
     ${HIERARCHICAL_SRC_DIR}/tensormap.cpp
     ${HIERARCHICAL_SRC_DIR}/ring.cpp
@@ -225,6 +226,7 @@ add_library(hierarchical_objs OBJECT
 target_include_directories(hierarchical_objs PUBLIC
     ${HIERARCHICAL_SRC_DIR}
     ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
     ${WORKER_SRC_DIR}
 )
 
@@ -236,6 +238,7 @@ function(add_hierarchical_test name src)
         ${GTEST_MAIN_LIB}
         ${GTEST_LIB}
         pthread
+        ${CMAKE_DL_LIBS}
     )
     # worker_manager.cpp uses shm_open/shm_unlink; librt on glibc < 2.34, libSystem on macOS.
     if(UNIX AND NOT APPLE)
@@ -391,6 +394,7 @@ add_hierarchical_test(test_ring  hierarchical/test_ring.cpp)
 add_hierarchical_test(test_scope      hierarchical/test_scope.cpp)
 add_hierarchical_test(test_orchestrator hierarchical/test_orchestrator.cpp)
 add_hierarchical_test(test_scheduler  hierarchical/test_scheduler.cpp)
+set_target_properties(test_scheduler PROPERTIES ENABLE_EXPORTS ON)
 add_hierarchical_test(test_remote_wire hierarchical/test_remote_wire.cpp)
 add_hierarchical_test(test_remote_endpoint hierarchical/test_remote_endpoint.cpp)
 add_hierarchical_test(test_pipeline_contract hierarchical/test_pipeline_contract.cpp)
