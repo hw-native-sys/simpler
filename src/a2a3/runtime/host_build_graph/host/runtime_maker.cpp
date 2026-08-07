@@ -417,8 +417,8 @@ bool upload_graph_submissions(Runtime *runtime, const HostApi *api, GraphHostSta
         if (definition == nullptr || definition->full_key != submission->graph_key || definition->task_count == 0 ||
             definition->task_count > GRAPH_MAX_NODES ||
             !graph_execution_storage_bytes(
-                static_cast<int32_t>(definition->task_count), definition->tensor_arg_count, definition->total_bytes,
-                &execution_bytes
+                static_cast<int32_t>(definition->task_count), definition->tensor_arg_count,
+                definition->scalar_arg_count, definition->total_bytes, &execution_bytes
             )) {
             LOG_ERROR("host-orch: invalid Graph execution storage request");
             return false;

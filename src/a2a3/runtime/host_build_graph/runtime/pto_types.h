@@ -28,6 +28,8 @@
 #include <stdint.h>
 #include <string.h>
 
+#include <algorithm>
+#include <array>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -284,6 +286,8 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
 
     void clear() {
         Base::clear();
+        scalar_sources_.fill(nullptr);
+        scalar_sources_invalidated_.fill(false);
 #if SIMPLER_DFX
         dump_arg_selection_.clear();
 #endif
@@ -446,6 +450,8 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
             return;
         }
         memcpy(&scalars_[scalar_count_], values, count * sizeof(uint64_t));
+        std::fill_n(scalar_sources_.begin() + scalar_count_, count, nullptr);
+        std::fill_n(scalar_sources_invalidated_.begin() + scalar_count_, count, false);
 #if SIMPLER_DFX
         dump_arg_selection_.clear_scalar_metadata(scalar_count_, count);
 #endif
@@ -481,6 +487,8 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
             dst[i] = static_cast<uint64_t>(static_cast<uint32_t>(values[i]));
         }
 #endif
+        std::fill_n(scalar_sources_.begin() + scalar_count_, count, nullptr);
+        std::fill_n(scalar_sources_invalidated_.begin() + scalar_count_, count, false);
 #if SIMPLER_DFX
         dump_arg_selection_.clear_scalar_metadata(scalar_count_, count);
 #endif
@@ -501,10 +509,38 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
             return;
         }
         memcpy(&scalars_[scalar_count_], &src.scalars_[src_offset], count * sizeof(uint64_t));
+        for (int i = 0; i < count; ++i) {
+            const int src_index = src_offset + i;
+            scalar_sources_[scalar_count_ + i] = src.scalar_sources_[src_index] != nullptr ?
+                                                     src.scalar_sources_[src_index] :
+                                                     static_cast<const void *>(&src.scalars_[src_index]);
+            scalar_sources_invalidated_[scalar_count_ + i] = src.scalar_sources_invalidated_[src_index];
+        }
 #if SIMPLER_DFX
         dump_arg_selection_.copy_scalar_dtypes_from(src.dump_arg_selection_, scalar_count_, src_offset, count);
 #endif
         scalar_count_ += count;
+    }
+
+    const uint64_t &scalar(int32_t i) const { return scalars_[i]; }
+    uint64_t &scalar(int32_t i) {
+        // A mutable reference may escape and be written later. Conservatively
+        // invalidate inherited Graph-boundary provenance as soon as it is requested.
+        scalar_sources_invalidated_[i] = scalar_sources_[i] != nullptr;
+        return scalars_[i];
+    }
+    const void *scalar_source(int32_t i) const { return scalar_sources_invalidated_[i] ? nullptr : scalar_sources_[i]; }
+    const void *invalidated_scalar_source(int32_t i) const {
+        return scalar_sources_invalidated_[i] ? scalar_sources_[i] : nullptr;
+    }
+    // Graph recording starts before its function runs. Anchor the host-only
+    // provenance at that point so every boundary slot has a unique identity,
+    // even when multiple slots were initialized from the same lvalue.
+    void anchor_scalar_sources() const {
+        for (int32_t i = 0; i < scalar_count_; ++i) {
+            scalar_sources_[i] = static_cast<const void *>(&scalars_[i]);
+            scalar_sources_invalidated_[i] = false;
+        }
     }
 
 #if SIMPLER_DFX
@@ -514,6 +550,12 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
 #endif
 
 private:
+    // In-process recording metadata only; it is never copied into a task payload
+    // or any host-device wire image.
+    mutable std::array<const void *, MaxS> scalar_sources_{};
+    // Kept separately so invalidated boundary ancestry can reject Graph caching
+    // instead of being mistaken for an unrelated static scalar.
+    mutable std::array<bool, MaxS> scalar_sources_invalidated_{};
     // Caller-owned dependency array; lifetime must extend through submit.
 #if SIMPLER_DFX
     DumpArgSelection dump_arg_selection_;
@@ -542,11 +584,14 @@ private:
     template <typename T>
     void add_scalar_one(T &&value) {
         scalars_[scalar_count_] = to_u64(value);
+        scalar_sources_[scalar_count_] = nullptr;
+        scalar_sources_invalidated_[scalar_count_] = false;
+        if constexpr (std::is_lvalue_reference_v<T>) {
+            scalar_sources_[scalar_count_] = static_cast<const void *>(&value);
+        }
 #if SIMPLER_DFX
         uintptr_t scalar_source_ptr = 0;
-        if constexpr (std::is_lvalue_reference_v<T>) {
-            scalar_source_ptr = reinterpret_cast<uintptr_t>(&value);
-        }
+        scalar_source_ptr = reinterpret_cast<uintptr_t>(scalar_sources_[scalar_count_]);
         dump_arg_selection_.record_scalar_source(
             scalar_count_, scalar_source_ptr, dtype_of<std::remove_cv_t<std::remove_reference_t<T>>>()
         );

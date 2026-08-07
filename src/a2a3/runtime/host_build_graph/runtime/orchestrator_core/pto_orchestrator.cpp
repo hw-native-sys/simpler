@@ -278,6 +278,17 @@ struct GraphRecordedTensorSourceRef {
     uint64_t packed_offset{0};
 };
 
+enum class GraphRecordedScalarSource : uint8_t {
+    STATIC_VALUE,
+    BOUNDARY,
+    INVALIDATED_BOUNDARY,
+};
+
+struct GraphRecordedScalarSourceRef {
+    GraphRecordedScalarSource source{GraphRecordedScalarSource::STATIC_VALUE};
+    size_t source_index{0};
+};
+
 struct GraphRecordedNode {
     std::array<int32_t, PTO2_SUBTASK_SLOT_COUNT> kernel_ids{};
     ActiveMask active_mask{};
@@ -289,6 +300,7 @@ struct GraphRecordedNode {
     std::vector<ChipTensor> tensors;
     std::vector<GraphRecordedTensorSourceRef> tensor_sources;
     std::vector<uint64_t> scalars;
+    std::vector<GraphRecordedScalarSourceRef> scalar_sources;
     std::vector<size_t> internal_fanins;
 };
 
@@ -300,6 +312,8 @@ struct GraphRecording {
     std::vector<size_t> current_fanins;
     std::vector<ChipTensor> boundary_tensors;
     std::vector<TensorArgType> boundary_types;
+    const CoreTaskArgs *boundary_args{nullptr};
+    std::vector<bool> boundary_scalar_used;
     std::vector<GraphRecordedNode> nodes;
 };
 
@@ -359,6 +373,30 @@ bool graph_tensor_from_boundary(
         return true;
     }
     return false;
+}
+
+GraphRecordedScalarSourceRef
+graph_classify_scalar(const GraphRecording &recording, const CoreTaskArgs &args, int32_t scalar_index) {
+    if (recording.boundary_args == nullptr) return {};
+    if (&args == recording.boundary_args && scalar_index < recording.boundary_args->scalar_count()) {
+        return GraphRecordedScalarSourceRef{GraphRecordedScalarSource::BOUNDARY, static_cast<size_t>(scalar_index)};
+    }
+
+    const void *source = args.scalar_source(scalar_index);
+    const void *invalidated_source = args.invalidated_scalar_source(scalar_index);
+    if (source == nullptr && invalidated_source == nullptr) return {};
+    for (int32_t i = 0; i < recording.boundary_args->scalar_count(); ++i) {
+        const void *boundary_source = static_cast<const void *>(&recording.boundary_args->scalar(i));
+        if (source == boundary_source) {
+            return GraphRecordedScalarSourceRef{GraphRecordedScalarSource::BOUNDARY, static_cast<size_t>(i)};
+        }
+        if (invalidated_source == boundary_source) {
+            return GraphRecordedScalarSourceRef{
+                GraphRecordedScalarSource::INVALIDATED_BOUNDARY, static_cast<size_t>(i)
+            };
+        }
+    }
+    return {};
 }
 
 bool graph_classify_tensor(
@@ -474,6 +512,11 @@ void graph_record_task(
     node.tensors.assign(payload.tensors, payload.tensors + payload.tensor_count);
     node.tensor_sources.resize(static_cast<size_t>(payload.tensor_count));
     node.scalars.assign(payload.scalars, payload.scalars + payload.scalar_count);
+    node.scalar_sources.resize(static_cast<size_t>(payload.scalar_count));
+    if (args.scalar_count() != payload.scalar_count) {
+        recording.unsupported = true;
+        return;
+    }
     for (int32_t i = 0; i < payload.tensor_count; ++i) {
         if (!graph_classify_tensor(
                 recording, node, task_index, payload.tensors[i], &node.tensor_sources[static_cast<size_t>(i)]
@@ -481,6 +524,21 @@ void graph_record_task(
             recording.unsupported = true;
             return;
         }
+    }
+    for (int32_t i = 0; i < payload.scalar_count; ++i) {
+        GraphRecordedScalarSourceRef source = graph_classify_scalar(recording, args, i);
+        if (source.source == GraphRecordedScalarSource::INVALIDATED_BOUNDARY) {
+            recording.unsupported = true;
+            return;
+        }
+        if (source.source == GraphRecordedScalarSource::BOUNDARY) {
+            if (source.source_index >= recording.boundary_scalar_used.size()) {
+                recording.unsupported = true;
+                return;
+            }
+            recording.boundary_scalar_used[source.source_index] = true;
+        }
+        node.scalar_sources[static_cast<size_t>(i)] = source;
     }
     for (size_t producer : recording.current_fanins) {
         if (producer >= static_cast<size_t>(task_index)) {
@@ -543,10 +601,30 @@ std::optional<GraphTensorSourceRef> graph_pack_tensor_source(const GraphRecorded
     return packed;
 }
 
+std::optional<GraphScalarSourceRef> graph_pack_scalar_source(const GraphRecordedScalarSourceRef &source) {
+    if (source.source == GraphRecordedScalarSource::INVALIDATED_BOUNDARY || source.source_index > UINT16_MAX) {
+        return std::nullopt;
+    }
+
+    GraphScalarSourceRef packed{};
+    packed.source = source.source == GraphRecordedScalarSource::BOUNDARY ?
+                        static_cast<uint8_t>(GraphScalarSource::BOUNDARY) :
+                        static_cast<uint8_t>(GraphScalarSource::STATIC_VALUE);
+    packed.source_index = static_cast<uint16_t>(source.source_index);
+    return packed;
+}
+
 bool graph_build_definition(const GraphRecording &recording, std::vector<std::byte> *image) {
     if (image == nullptr || recording.unsupported || recording.nodes.empty() ||
         recording.nodes.size() > GRAPH_MAX_NODES || recording.boundary_tensors.size() > UINT16_MAX ||
-        recording.boundary_tensors.size() != recording.boundary_types.size() ||
+        recording.boundary_tensors.size() != recording.boundary_types.size() || recording.boundary_args == nullptr ||
+        recording.boundary_scalar_used.size() != static_cast<size_t>(recording.boundary_args->scalar_count()) ||
+        std::any_of(
+            recording.boundary_scalar_used.begin(), recording.boundary_scalar_used.end(),
+            [](bool used) {
+                return !used;
+            }
+        ) ||
         std::any_of(recording.boundary_tensors.begin(), recording.boundary_tensors.end(), [](const ChipTensor &tensor) {
             return tensor.ndims > MAX_TENSOR_DIMS;
         })) {
@@ -562,6 +640,7 @@ bool graph_build_definition(const GraphRecording &recording, std::vector<std::by
     std::vector<GraphTensor> tensors;
     std::vector<GraphTensorSourceRef> tensor_sources;
     std::vector<uint64_t> scalars;
+    std::vector<GraphScalarSourceRef> scalar_sources;
 
     uint64_t required_heap = 0;
     uint32_t edge_count = 0;
@@ -571,9 +650,11 @@ bool graph_build_definition(const GraphRecording &recording, std::vector<std::by
             source.tensors.size() > static_cast<size_t>(INT32_MAX) ||
             source.scalars.size() > static_cast<size_t>(INT32_MAX) || source.internal_fanins.size() > UINT16_MAX ||
             source.tensors.size() != source.tensor_sources.size() ||
+            source.scalars.size() != source.scalar_sources.size() ||
             tensors.size() > UINT32_MAX - source.tensors.size() ||
             tensor_sources.size() > UINT32_MAX - source.tensor_sources.size() ||
             scalars.size() > UINT32_MAX - source.scalars.size() ||
+            scalar_sources.size() > UINT32_MAX - source.scalar_sources.size() ||
             std::any_of(source.tensors.begin(), source.tensors.end(), [](const ChipTensor &tensor) {
                 return tensor.ndims > MAX_TENSOR_DIMS;
             })) {
@@ -611,7 +692,21 @@ bool graph_build_definition(const GraphRecording &recording, std::vector<std::by
             if (!packed_source.has_value()) return false;
             tensor_sources.push_back(*packed_source);
         }
-        scalars.insert(scalars.end(), source.scalars.begin(), source.scalars.end());
+        for (size_t scalar_index = 0; scalar_index < source.scalars.size(); ++scalar_index) {
+            std::optional<GraphScalarSourceRef> packed_source =
+                graph_pack_scalar_source(source.scalar_sources[scalar_index]);
+            if (!packed_source.has_value() ||
+                (packed_source->source == static_cast<uint8_t>(GraphScalarSource::BOUNDARY) &&
+                 packed_source->source_index >= recording.boundary_args->scalar_count())) {
+                return false;
+            }
+            scalar_sources.push_back(*packed_source);
+            scalars.push_back(
+                packed_source->source == static_cast<uint8_t>(GraphScalarSource::BOUNDARY) ?
+                    0 :
+                    source.scalars[scalar_index]
+            );
+        }
     }
 
     std::vector<uint32_t> fanout_offsets(recording.nodes.size() + 1, 0);
@@ -649,6 +744,7 @@ bool graph_build_definition(const GraphRecording &recording, std::vector<std::by
     definition.edge_count = edge_count;
     definition.root_count = static_cast<uint32_t>(roots.size());
     definition.boundary_count = static_cast<uint32_t>(signatures.size());
+    definition.boundary_scalar_count = static_cast<uint32_t>(recording.boundary_args->scalar_count());
     definition.tensor_arg_count = static_cast<uint32_t>(tensors.size());
     definition.scalar_arg_count = static_cast<uint32_t>(scalars.size());
     definition.off_fanout_offsets = graph_append_section(image, fanout_offsets);
@@ -661,12 +757,14 @@ bool graph_build_definition(const GraphRecording &recording, std::vector<std::by
     definition.off_tensors = graph_append_section(image, tensors);
     definition.off_tensor_sources = graph_append_section(image, tensor_sources);
     definition.off_scalars = graph_append_section(image, scalars);
+    definition.off_scalar_sources = graph_append_section(image, scalar_sources);
     definition.off_boundary_signatures = graph_append_section(image, signatures);
     if (definition.off_fanout_offsets == 0 || definition.off_fanin_offsets == 0 || definition.off_node_offsets == 0 ||
         definition.off_nodes == 0 || definition.off_boundary_signatures == 0 ||
         (!tensors.empty() && definition.off_tensors == 0) ||
         (!tensor_sources.empty() && definition.off_tensor_sources == 0) ||
         (!scalars.empty() && definition.off_scalars == 0) ||
+        (!scalar_sources.empty() && definition.off_scalar_sources == 0) ||
         (!fanout_indices.empty() && definition.off_fanout_indices == 0) ||
         (!fanin_indices.empty() && definition.off_fanin_indices == 0) ||
         (!roots.empty() && definition.off_root_indices == 0)) {
@@ -1344,11 +1442,12 @@ static TaskOutputTensors submit_task_common(
 namespace {
 
 bool graph_boundary_matches(const GraphDefinition &definition, const CoreTaskArgs &args) {
-    if (args.scalar_count() != 0 || args.explicit_dep_count() != 0 ||
-        args.tensor_count() != static_cast<int32_t>(definition.boundary_count)) {
+    if (args.scalar_count() != static_cast<int32_t>(definition.boundary_scalar_count) ||
+        args.explicit_dep_count() != 0 || args.tensor_count() != static_cast<int32_t>(definition.boundary_count)) {
         LOG_WARN(
-            "[GraphExecution] fixed boundary contract mismatch: tensors=%d/%u scalars=%d explicit_deps=%u",
-            args.tensor_count(), definition.boundary_count, args.scalar_count(), args.explicit_dep_count()
+            "[GraphExecution] fixed boundary contract mismatch: tensors=%d/%u scalars=%d/%u explicit_deps=%u",
+            args.tensor_count(), definition.boundary_count, args.scalar_count(), definition.boundary_scalar_count,
+            args.explicit_dep_count()
         );
         return false;
     }
@@ -1426,11 +1525,25 @@ bool graph_build_submission_image(
     if (definition_offset > UINT32_MAX || tensors_offset > UINT32_MAX || tensors_offset > UINT32_MAX - tensor_bytes) {
         return false;
     }
-    submission_image->assign(tensors_offset + tensor_bytes, std::byte{0});
+    const size_t tensors_end = tensors_offset + tensor_bytes;
+    const size_t scalar_bytes = static_cast<size_t>(args.scalar_count()) * sizeof(uint64_t);
+    const size_t scalars_offset = args.scalar_count() == 0 ? 0 : PTO2_ALIGN_UP(tensors_end, alignof(uint64_t));
+    const size_t total_bytes = args.scalar_count() == 0 ? tensors_end : scalars_offset + scalar_bytes;
+    if ((args.scalar_count() != 0 && (scalars_offset > UINT32_MAX || scalars_offset > UINT32_MAX - scalar_bytes)) ||
+        total_bytes > UINT32_MAX) {
+        return false;
+    }
+    submission_image->assign(total_bytes, std::byte{0});
     std::memcpy(submission_image->data() + definition_offset, definition_image.data(), definition_image.size());
     auto *tensors = reinterpret_cast<GraphTensor *>(submission_image->data() + tensors_offset);
     for (int32_t i = 0; i < args.tensor_count(); ++i)
         tensors[i] = graph_tensor_pack(args.tensor(i).ref());
+    if (args.scalar_count() != 0) {
+        std::memcpy(
+            submission_image->data() + scalars_offset, args.scalar_data(),
+            static_cast<size_t>(args.scalar_count()) * sizeof(uint64_t)
+        );
+    }
 
     const GraphDefinition &definition = *graph_definition(definition_image);
     GraphSubmission submission{};
@@ -1439,6 +1552,8 @@ bool graph_build_submission_image(
     submission.definition_offset = static_cast<uint32_t>(definition_offset);
     submission.tensors_offset = static_cast<uint32_t>(tensors_offset);
     submission.tensor_count = static_cast<uint32_t>(args.tensor_count());
+    submission.scalars_offset = static_cast<uint32_t>(scalars_offset);
+    submission.scalar_count = static_cast<uint32_t>(args.scalar_count());
     std::memcpy(submission_image->data(), &submission, sizeof(submission));
     return true;
 }
@@ -1526,7 +1641,6 @@ PTO2OrchestratorState::graph_begin(uint64_t graph_key, const CoreTaskArgs &args,
     GraphScopeResult result;
     GraphHostState *state = graph_state_from(orch);
     if (state == nullptr || !rt_graph_args_cacheable(args) || args.explicit_dep_count() != 0) {
-        debug_assert(args.scalar_count() == 0 && "Graph execution scalars are not supported in step 1");
         debug_assert(args.explicit_dep_count() == 0 && "Graph boundary explicit dependencies are not supported");
         return result;
     }
@@ -1567,6 +1681,9 @@ PTO2OrchestratorState::graph_begin(uint64_t graph_key, const CoreTaskArgs &args,
     auto recording = std::make_unique<GraphRecording>();
     recording->full_key = full_key;
     recording->start_local_task_id = orch->ring.task_allocator.active_count();
+    args.anchor_scalar_sources();
+    recording->boundary_args = &args;
+    recording->boundary_scalar_used.resize(static_cast<size_t>(args.scalar_count()), false);
     recording->boundary_tensors.reserve(static_cast<size_t>(args.tensor_count()));
     recording->boundary_types.reserve(static_cast<size_t>(args.tensor_count()));
     for (int32_t i = 0; i < args.tensor_count(); ++i) {

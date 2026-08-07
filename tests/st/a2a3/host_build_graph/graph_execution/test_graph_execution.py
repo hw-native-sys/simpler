@@ -7,7 +7,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Graph Execution records once and replays topology with dynamic CoreTaskArgs tensors."""
+"""Graph Execution replays dynamic tensor and scalar bindings across config-keyed definitions."""
 
 import torch
 from simpler.task_interface import ArgDirection as D
@@ -75,11 +75,9 @@ class TestGraphExecutionHostBuildGraph(SceneTestCase):
 
     def compute_golden(self, args, params):
         base = args.a + args.b
-        ndim_delta = 0.0 if args.a.ndim == 1 else 2.0
-        expected = (base + 1.0 + ndim_delta) * (base + 2.0 + ndim_delta)
-        args.output_1[:] = expected
-        args.output_3[:] = expected
-        args.output_5[:] = expected
+        args.output_1[:] = (base + 1.0) * (base + 2.0)
+        args.output_3[:] = (base + 100.0) * (base + 4.0)
+        args.output_5[:] = (base + 5.0) * (base + 6.0)
 
 
 if __name__ == "__main__":

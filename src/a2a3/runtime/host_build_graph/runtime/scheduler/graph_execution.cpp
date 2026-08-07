@@ -27,16 +27,18 @@ void destroy_execution_nodes(GraphExecution *execution) {
 }
 
 void reset_execution(
-    GraphExecution *execution, int32_t node_count, uint32_t tensor_patch_count, uint64_t graph_key,
-    uint64_t definition_hash
+    GraphExecution *execution, int32_t node_count, uint32_t tensor_patch_count, uint32_t scalar_patch_count,
+    uint64_t graph_key, uint64_t definition_hash
 ) {
     size_t nodes_offset = 0;
     size_t tensor_patches_offset = 0;
+    size_t scalar_patches_offset = 0;
     size_t definition_offset = 0;
     size_t bytes = 0;
     if (!graph_execution_storage_layout(
-            execution->node_capacity, execution->tensor_patch_capacity, execution->definition_capacity, &nodes_offset,
-            &tensor_patches_offset, &definition_offset, &bytes
+            execution->node_capacity, execution->tensor_patch_capacity, execution->scalar_patch_capacity,
+            execution->definition_capacity, &nodes_offset, &tensor_patches_offset, &scalar_patches_offset,
+            &definition_offset, &bytes
         )) {
         return;
     }
@@ -44,6 +46,7 @@ void reset_execution(
                                          execution->materialized_definition_hash == definition_hash &&
                                          execution->materialized_node_count == node_count &&
                                          execution->materialized_tensor_patch_count == tensor_patch_count &&
+                                         execution->materialized_scalar_patch_count <= scalar_patch_count &&
                                          execution->constructed_nodes >= node_count;
     execution->state.store(GraphExecutionState::SUBMITTED, std::memory_order_relaxed);
     execution->materialize_busy.store(0, std::memory_order_relaxed);
@@ -52,6 +55,7 @@ void reset_execution(
     execution->node_count = node_count;
     execution->materialized_nodes = 0;
     execution->materialized_tensor_patches = 0;
+    execution->materialized_scalar_patches = 0;
     execution->allocation_bytes = bytes;
     execution->graph_key = graph_key;
     execution->definition_hash = definition_hash;
@@ -61,6 +65,8 @@ void reset_execution(
         reinterpret_cast<GraphNodeStorage *>(reinterpret_cast<uint8_t *>(execution) + nodes_offset);
     execution->tensor_patches =
         reinterpret_cast<GraphTensorAddressPatch *>(reinterpret_cast<uint8_t *>(execution) + tensor_patches_offset);
+    execution->scalar_patches =
+        reinterpret_cast<GraphScalarPatch *>(reinterpret_cast<uint8_t *>(execution) + scalar_patches_offset);
     execution->definition_storage = reinterpret_cast<uint8_t *>(execution) + definition_offset;
     if (!execution->definition_affine_reuse) {
         execution->definition = nullptr;
@@ -69,13 +75,17 @@ void reset_execution(
     }
     execution->boundary_tensors = nullptr;
     execution->boundary_tensor_count = 0;
+    execution->boundary_scalars = nullptr;
+    execution->boundary_scalar_count = 0;
 }
 
 bool reusable_execution_header_valid(const GraphExecution &execution, size_t storage_bytes) {
     if (execution.storage_magic != GRAPH_EXECUTION_STORAGE_MAGIC || execution.node_capacity <= 0 ||
         execution.node_capacity > static_cast<int32_t>(GRAPH_MAX_NODES) || execution.definition_capacity == 0 ||
         execution.tensor_patch_capacity > GRAPH_MAX_NODES * MAX_TENSOR_ARGS ||
+        execution.scalar_patch_capacity > GRAPH_MAX_NODES * MAX_SCALAR_ARGS ||
         execution.materialized_tensor_patch_count > execution.tensor_patch_capacity ||
+        execution.materialized_scalar_patch_count > execution.scalar_patch_capacity ||
         execution.constructed_nodes < 0 || execution.constructed_nodes > execution.node_capacity ||
         execution.node_count <= 0 || execution.node_count > execution.node_capacity ||
         execution.state.load(std::memory_order_acquire) != GraphExecutionState::COMPLETED ||
@@ -84,14 +94,15 @@ bool reusable_execution_header_valid(const GraphExecution &execution, size_t sto
     }
     size_t expected_bytes = 0;
     return graph_execution_storage_bytes(
-               execution.node_capacity, execution.tensor_patch_capacity, execution.definition_capacity, &expected_bytes
+               execution.node_capacity, execution.tensor_patch_capacity, execution.scalar_patch_capacity,
+               execution.definition_capacity, &expected_bytes
            ) &&
            execution.allocation_bytes == expected_bytes && expected_bytes <= storage_bytes;
 }
 
 GraphExecution *acquire_host_execution_storage(
     GraphSubmission &submission, int32_t node_count, uint64_t graph_key, uint64_t definition_hash,
-    uint32_t tensor_patch_count, size_t definition_bytes
+    uint32_t tensor_patch_count, uint32_t scalar_patch_count, size_t definition_bytes
 ) {
     if (node_count <= 0 || node_count > static_cast<int32_t>(GRAPH_MAX_NODES) || definition_bytes == 0 ||
         submission.execution_storage == 0 || submission.execution_storage_bytes > SIZE_MAX ||
@@ -100,7 +111,9 @@ GraphExecution *acquire_host_execution_storage(
     }
     const size_t storage_bytes = static_cast<size_t>(submission.execution_storage_bytes);
     size_t required_bytes = 0;
-    if (!graph_execution_storage_bytes(node_count, tensor_patch_count, definition_bytes, &required_bytes) ||
+    if (!graph_execution_storage_bytes(
+            node_count, tensor_patch_count, scalar_patch_count, definition_bytes, &required_bytes
+        ) ||
         required_bytes > storage_bytes) {
         return nullptr;
     }
@@ -113,16 +126,18 @@ GraphExecution *acquire_host_execution_storage(
     if (has_existing_execution && !valid_header) return nullptr;
     const bool capacities_fit = valid_header && execution->node_capacity >= node_count &&
                                 execution->tensor_patch_capacity >= tensor_patch_count &&
+                                execution->scalar_patch_capacity >= scalar_patch_count &&
                                 execution->definition_capacity >= definition_bytes;
     if (!capacities_fit) {
         if (valid_header) destroy_execution_nodes(execution);
         execution = new (execution) GraphExecution{};
         execution->node_capacity = node_count;
         execution->tensor_patch_capacity = tensor_patch_count;
+        execution->scalar_patch_capacity = scalar_patch_count;
         execution->definition_capacity = definition_bytes;
         execution->allocation_bytes = required_bytes;
     }
-    reset_execution(execution, node_count, tensor_patch_count, graph_key, definition_hash);
+    reset_execution(execution, node_count, tensor_patch_count, scalar_patch_count, graph_key, definition_hash);
     execution->storage_magic = GRAPH_EXECUTION_STORAGE_MAGIC;
     return execution;
 }
@@ -145,6 +160,7 @@ void reset_graph_payload(PTO2TaskPayload &payload) {
 bool bind_graph_topology(GraphExecution &execution) {
     if (execution.definition == nullptr) return false;
     const GraphDefinition &definition = *execution.definition;
+    if (definition.boundary_scalar_count > MAX_SCALAR_ARGS) return false;
     const uint32_t *fanin_offsets =
         graph_definition_array<uint32_t>(definition, definition.off_fanin_offsets, definition.task_count + 1);
     const uint16_t *fanin_indices =
@@ -266,11 +282,16 @@ GraphExecution *graph_execution_localize(PTO2TaskSlotState &outer_slot) {
 
     const GraphDefinition *definition = graph_submission_definition(*submission);
     const GraphTensor *boundary_tensors = graph_submission_tensors(*submission);
+    const uint64_t *boundary_scalars = graph_submission_scalars(*submission);
+    const size_t boundary_tensor_end = static_cast<size_t>(submission->tensors_offset) +
+                                       static_cast<size_t>(submission->tensor_count) * sizeof(GraphTensor);
     if (definition == nullptr || definition->total_bytes == 0 || definition->task_count == 0 ||
         definition->task_count > GRAPH_MAX_NODES ||
         definition->total_bytes > submission->total_bytes - submission->definition_offset ||
         submission->graph_key != definition->full_key || submission->tensor_count != definition->boundary_count ||
-        boundary_tensors == nullptr ||
+        submission->scalar_count != definition->boundary_scalar_count || boundary_tensors == nullptr ||
+        (submission->scalar_count != 0 && boundary_scalars == nullptr) ||
+        (submission->scalar_count != 0 && submission->scalars_offset < boundary_tensor_end) ||
         submission->tensors_offset < submission->definition_offset + definition->total_bytes ||
         !graph_definition_hash_matches(*definition) || outer_slot.task == nullptr ||
         outer_slot.task->packed_buffer_base == nullptr || outer_slot.task->packed_buffer_end == nullptr) {
@@ -295,7 +316,7 @@ GraphExecution *graph_execution_localize(PTO2TaskSlotState &outer_slot) {
 
     GraphExecution *execution = acquire_host_execution_storage(
         *submission, static_cast<int32_t>(definition->task_count), submission->graph_key, definition->content_hash,
-        definition->tensor_arg_count, definition->total_bytes
+        definition->tensor_arg_count, definition->scalar_arg_count, definition->total_bytes
     );
     if (execution == nullptr) {
         __atomic_store_n(&submission->local_execution, 0, __ATOMIC_RELEASE);
@@ -314,6 +335,8 @@ GraphExecution *graph_execution_localize(PTO2TaskSlotState &outer_slot) {
     }
     execution->boundary_tensors = boundary_tensors;
     execution->boundary_tensor_count = submission->tensor_count;
+    execution->boundary_scalars = boundary_scalars;
+    execution->boundary_scalar_count = submission->scalar_count;
     execution->outer_slot = &outer_slot;
 
     const uint64_t desired = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(execution));
@@ -327,7 +350,8 @@ GraphMaterializeResult graph_execution_materialize_slice(
     if (nodes_materialized != nullptr) *nodes_materialized = 0;
     if (outer_slot.task_kind != TaskKind::GRAPH || outer_slot.task == nullptr ||
         outer_slot.task->packed_buffer_base == nullptr || max_nodes <= 0 || execution.definition == nullptr ||
-        execution.node_storage == nullptr || execution.tensor_patches == nullptr) {
+        execution.node_storage == nullptr || execution.tensor_patches == nullptr ||
+        execution.scalar_patches == nullptr) {
         return GraphMaterializeResult::INVALID;
     }
 
@@ -362,6 +386,7 @@ GraphMaterializeResult graph_execution_materialize_slice(
     const GraphTensor *definition_tensors = nullptr;
     const GraphTensorSourceRef *tensor_sources = nullptr;
     const uint64_t *definition_scalars = nullptr;
+    const GraphScalarSourceRef *scalar_sources = nullptr;
     if (!affine_reuse) {
         nodes = graph_definition_array<GraphNodeDefinition>(definition, definition.off_nodes, definition.task_count);
         node_offsets = graph_definition_array<uint64_t>(definition, definition.off_node_offsets, definition.task_count);
@@ -378,9 +403,14 @@ GraphMaterializeResult graph_execution_materialize_slice(
             definition.scalar_arg_count == 0 ?
                 nullptr :
                 graph_definition_array<uint64_t>(definition, definition.off_scalars, definition.scalar_arg_count);
+        scalar_sources = definition.scalar_arg_count == 0 ?
+                             nullptr :
+                             graph_definition_array<GraphScalarSourceRef>(
+                                 definition, definition.off_scalar_sources, definition.scalar_arg_count
+                             );
         if (nodes == nullptr || node_offsets == nullptr ||
             (definition.tensor_arg_count != 0 && (definition_tensors == nullptr || tensor_sources == nullptr)) ||
-            (definition.scalar_arg_count != 0 && definition_scalars == nullptr)) {
+            (definition.scalar_arg_count != 0 && (definition_scalars == nullptr || scalar_sources == nullptr))) {
             execution.materialize_busy.store(0, std::memory_order_release);
             return GraphMaterializeResult::INVALID;
         }
@@ -513,11 +543,25 @@ GraphMaterializeResult graph_execution_materialize_slice(
                 execution.tensor_patches[execution.materialized_tensor_patches++] = patch;
                 graph_tensor_unpack(rebound, &tensor);
             }
-            if (source.scalar_count > 0) {
-                std::memcpy(
-                    payload.scalars, definition_scalars + source.scalar_offset,
-                    static_cast<size_t>(source.scalar_count) * sizeof(uint64_t)
-                );
+            for (int32_t j = 0; j < source.scalar_count; ++j) {
+                const uint32_t scalar_index = source.scalar_offset + static_cast<uint32_t>(j);
+                const GraphScalarSourceRef &ref = scalar_sources[scalar_index];
+                if (ref.source == static_cast<uint8_t>(GraphScalarSource::STATIC_VALUE)) {
+                    payload.scalars[j] = definition_scalars[scalar_index];
+                } else if (ref.source == static_cast<uint8_t>(GraphScalarSource::BOUNDARY)) {
+                    if (ref.source_index >= execution.boundary_scalar_count || execution.boundary_scalars == nullptr ||
+                        execution.materialized_scalar_patches >= execution.scalar_patch_capacity) {
+                        execution.materialize_busy.store(0, std::memory_order_release);
+                        return GraphMaterializeResult::INVALID;
+                    }
+                    payload.scalars[j] = execution.boundary_scalars[ref.source_index];
+                    execution.scalar_patches[execution.materialized_scalar_patches++] = GraphScalarPatch{
+                        static_cast<uint16_t>(i), static_cast<uint8_t>(j), static_cast<uint8_t>(ref.source_index)
+                    };
+                } else {
+                    execution.materialize_busy.store(0, std::memory_order_release);
+                    return GraphMaterializeResult::INVALID;
+                }
             }
         } else {
             for (int32_t j = 0; j < payload.tensor_count; ++j) {
@@ -528,6 +572,18 @@ GraphMaterializeResult graph_execution_materialize_slice(
                 } else {
                     payload.tensors[j].buffer.addr = outer_base + patch.address_offset;
                 }
+            }
+            while (execution.materialized_scalar_patches < execution.materialized_scalar_patch_count) {
+                const GraphScalarPatch &patch = execution.scalar_patches[execution.materialized_scalar_patches];
+                if (patch.node_index != static_cast<uint16_t>(i)) break;
+                if (patch.node_scalar_index >= payload.scalar_count ||
+                    patch.boundary_scalar_index >= execution.boundary_scalar_count ||
+                    execution.boundary_scalars == nullptr) {
+                    execution.materialize_busy.store(0, std::memory_order_release);
+                    return GraphMaterializeResult::INVALID;
+                }
+                payload.scalars[patch.node_scalar_index] = execution.boundary_scalars[patch.boundary_scalar_index];
+                execution.materialized_scalar_patches++;
             }
         }
         reset_graph_payload(payload);
@@ -550,6 +606,10 @@ GraphMaterializeResult graph_execution_materialize_slice(
         execution.materialize_busy.store(0, std::memory_order_release);
         return GraphMaterializeResult::INVALID;
     }
+    if (affine_reuse && execution.materialized_scalar_patches != execution.materialized_scalar_patch_count) {
+        execution.materialize_busy.store(0, std::memory_order_release);
+        return GraphMaterializeResult::INVALID;
+    }
 
     // nodes is published before PREPARED. An activator that acquires the state
     // may therefore route saved roots without observing partially built nodes.
@@ -558,6 +618,7 @@ GraphMaterializeResult graph_execution_materialize_slice(
     execution.materialized_definition_hash = execution.definition_hash;
     execution.materialized_node_count = execution.node_count;
     execution.materialized_tensor_patch_count = execution.materialized_tensor_patches;
+    execution.materialized_scalar_patch_count = execution.materialized_scalar_patches;
     execution.materialized_outer_base = outer_base;
     execution.state.store(GraphExecutionState::PREPARED, std::memory_order_release);
     execution.materialize_busy.store(0, std::memory_order_release);
