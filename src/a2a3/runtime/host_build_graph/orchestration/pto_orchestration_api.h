@@ -391,10 +391,8 @@ template <typename Invoke>
 static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const CoreTaskArgs &args, Invoke invoke) {
     debug_assert(!args.has_error && "Graph boundary CoreTaskArgs construction failed");
     debug_assert(
-        args.tensor_count() <= static_cast<int32_t>(GRAPH_MAX_TENSOR_ARGS) &&
-        "Graph boundary exceeds the step-1 tensor limit"
+        args.tensor_count() <= static_cast<int32_t>(GRAPH_MAX_TENSOR_ARGS) && "Graph boundary exceeds the tensor limit"
     );
-    debug_assert(args.scalar_count() == 0 && "Dynamic Graph boundary scalars are not supported in step 1");
     debug_assert(
         args.explicit_dep_count() == 0 && "Explicit dependencies crossing the Graph boundary are not supported"
     );

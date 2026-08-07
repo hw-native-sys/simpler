@@ -46,10 +46,8 @@ constexpr uint64_t graph_const_hash_impl(const char *s, uint64_t h) {
 constexpr uint64_t GRAPH_KEY(const char *s) { return graph_const_hash_impl(s, 1469598103934665603ULL); }
 
 inline bool rt_graph_args_cacheable(const CoreTaskArgs &args) {
-    // Step 1 supports dynamic tensor addresses only. Kernel scalars are
-    // literals inside the Graph function and become immutable Definition data.
     if (args.has_error || args.tensor_count() <= 0 ||
-        args.tensor_count() > static_cast<int32_t>(GRAPH_MAX_TENSOR_ARGS) || args.scalar_count() != 0) {
+        args.tensor_count() > static_cast<int32_t>(GRAPH_MAX_TENSOR_ARGS)) {
         return false;
     }
     for (int32_t i = 0; i < args.tensor_count(); ++i) {

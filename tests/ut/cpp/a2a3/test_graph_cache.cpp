@@ -73,7 +73,10 @@ std::vector<std::byte> make_test_definition(uint64_t graph_key, uint64_t boundar
     tensor_sources[0].source = static_cast<uint8_t>(GraphTensorSource::BOUNDARY_EXACT);
     tensor_sources[1].source = static_cast<uint8_t>(GraphTensorSource::INTERNAL);
     tensor_sources[1].packed_offset = 16;
-    std::vector<uint64_t> scalars{17, 18};
+    std::vector<uint64_t> scalars{0, 18};
+    std::vector<GraphScalarSourceRef> scalar_sources(2);
+    scalar_sources[0].source = static_cast<uint8_t>(GraphScalarSource::BOUNDARY);
+    scalar_sources[1].source = static_cast<uint8_t>(GraphScalarSource::STATIC_VALUE);
 
     GraphDefinition definition{};
     definition.full_key = graph_key;
@@ -82,6 +85,7 @@ std::vector<std::byte> make_test_definition(uint64_t graph_key, uint64_t boundar
     definition.edge_count = 1;
     definition.root_count = 1;
     definition.boundary_count = 1;
+    definition.boundary_scalar_count = 1;
     definition.tensor_arg_count = 2;
     definition.scalar_arg_count = 2;
     definition.off_fanin_offsets = append_section(image, fanin_offsets);
@@ -94,6 +98,7 @@ std::vector<std::byte> make_test_definition(uint64_t graph_key, uint64_t boundar
     definition.off_tensors = append_section(image, tensors);
     definition.off_tensor_sources = append_section(image, tensor_sources);
     definition.off_scalars = append_section(image, scalars);
+    definition.off_scalar_sources = append_section(image, scalar_sources);
     definition.total_bytes = static_cast<uint32_t>(image.size());
     std::memcpy(image.data(), &definition, sizeof(definition));
 
@@ -103,15 +108,18 @@ std::vector<std::byte> make_test_definition(uint64_t graph_key, uint64_t boundar
 }
 
 std::vector<std::byte> make_test_submission(
-    uint64_t graph_key, uint64_t boundary_address, uint64_t execution_storage, size_t execution_storage_bytes
+    uint64_t graph_key, uint64_t boundary_address, uint64_t boundary_scalar, uint64_t execution_storage,
+    size_t execution_storage_bytes
 ) {
     const std::vector<std::byte> definition = make_test_definition(graph_key, boundary_address);
     const size_t definition_offset = PTO2_ALIGN_UP(sizeof(GraphSubmission), alignof(GraphDefinition));
     const size_t tensors_offset = PTO2_ALIGN_UP(definition_offset + definition.size(), alignof(GraphTensor));
-    std::vector<std::byte> image(tensors_offset + sizeof(GraphTensor));
+    const size_t scalars_offset = PTO2_ALIGN_UP(tensors_offset + sizeof(GraphTensor), alignof(uint64_t));
+    std::vector<std::byte> image(scalars_offset + sizeof(uint64_t));
     std::memcpy(image.data() + definition_offset, definition.data(), definition.size());
     const GraphTensor boundary = make_test_tensor(boundary_address);
     std::memcpy(image.data() + tensors_offset, &boundary, sizeof(boundary));
+    std::memcpy(image.data() + scalars_offset, &boundary_scalar, sizeof(boundary_scalar));
 
     GraphSubmission submission{};
     submission.graph_key = graph_key;
@@ -121,6 +129,8 @@ std::vector<std::byte> make_test_submission(
     submission.definition_offset = static_cast<uint32_t>(definition_offset);
     submission.tensors_offset = static_cast<uint32_t>(tensors_offset);
     submission.tensor_count = 1;
+    submission.scalars_offset = static_cast<uint32_t>(scalars_offset);
+    submission.scalar_count = 1;
     std::memcpy(image.data(), &submission, sizeof(submission));
     return image;
 }
@@ -151,24 +161,78 @@ TEST(GraphCache, RejectsEmptyBoundary) {
     EXPECT_FALSE(rt_graph_args_cacheable(args));
 }
 
+TEST(GraphCache, AcceptsBoundaryScalars) {
+    std::array<uint8_t, 64> boundary{};
+    const GraphTensor packed = make_test_tensor(reinterpret_cast<uint64_t>(boundary.data()));
+    ChipTensor tensor{};
+    graph_tensor_unpack(packed, &tensor);
+
+    CoreTaskArgs args;
+    args.add_input(tensor);
+    args.add_scalar(uint32_t{17});
+
+    EXPECT_TRUE(rt_graph_args_cacheable(args));
+}
+
+TEST(GraphCache, ConfigValuesSelectDifferentDefinitions) {
+    constexpr uint64_t GRAPH_ID = 0x1234;
+
+    EXPECT_NE(rt_graph_make_key(GRAPH_ID, 0), rt_graph_make_key(GRAPH_ID, 1));
+    EXPECT_EQ(rt_graph_make_key(GRAPH_ID, 0), rt_graph_make_key(GRAPH_ID, 0));
+}
+
+TEST(GraphScalarProvenance, ForwardedScalarRetainsBoundarySource) {
+    uint32_t value = 17;
+    CoreTaskArgs boundary_args;
+    boundary_args.add_scalar(value, value);
+    boundary_args.anchor_scalar_sources();
+    CoreTaskArgs forwarded_args;
+    forwarded_args.copy_scalars_from(boundary_args, 1, 1);
+    CoreTaskArgs node_args;
+
+    node_args.copy_scalars_from(forwarded_args, 0, 1);
+
+    EXPECT_EQ(node_args.scalar_source(0), static_cast<const void *>(&std::as_const(boundary_args).scalar(1)));
+}
+
+TEST(GraphScalarProvenance, MutableAccessInvalidatesForwardedSource) {
+    CoreTaskArgs boundary_args;
+    boundary_args.add_scalar(uint32_t{17});
+    boundary_args.anchor_scalar_sources();
+    CoreTaskArgs node_args;
+    node_args.copy_scalars_from(boundary_args, 0, 1);
+    ASSERT_NE(node_args.scalar_source(0), nullptr);
+
+    node_args.scalar(0) = 18;
+
+    EXPECT_EQ(node_args.scalar_source(0), nullptr);
+    EXPECT_EQ(
+        node_args.invalidated_scalar_source(0), static_cast<const void *>(&std::as_const(boundary_args).scalar(0))
+    );
+}
+
 TEST(GraphExecutionStorage, ComputesAlignedExactSize) {
     constexpr int32_t NODE_COUNT = 7;
     constexpr size_t DEFINITION_BYTES = 321;
     constexpr uint32_t TENSOR_PATCH_COUNT = 11;
+    constexpr uint32_t SCALAR_PATCH_COUNT = 5;
     size_t nodes_offset = 0;
     size_t tensor_patches_offset = 0;
+    size_t scalar_patches_offset = 0;
     size_t definition_offset = 0;
     size_t storage_bytes = 0;
 
     ASSERT_TRUE(graph_execution_storage_layout(
-        NODE_COUNT, TENSOR_PATCH_COUNT, DEFINITION_BYTES, &nodes_offset, &tensor_patches_offset, &definition_offset,
-        &storage_bytes
+        NODE_COUNT, TENSOR_PATCH_COUNT, SCALAR_PATCH_COUNT, DEFINITION_BYTES, &nodes_offset, &tensor_patches_offset,
+        &scalar_patches_offset, &definition_offset, &storage_bytes
     ));
     EXPECT_EQ(nodes_offset % alignof(GraphNodeStorage), 0U);
     EXPECT_EQ(tensor_patches_offset % alignof(GraphTensorAddressPatch), 0U);
+    EXPECT_EQ(scalar_patches_offset % alignof(GraphScalarPatch), 0U);
     EXPECT_EQ(definition_offset % alignof(GraphDefinition), 0U);
     EXPECT_GE(tensor_patches_offset, nodes_offset + NODE_COUNT * sizeof(GraphNodeStorage));
-    EXPECT_GE(definition_offset, tensor_patches_offset + TENSOR_PATCH_COUNT * sizeof(GraphTensorAddressPatch));
+    EXPECT_GE(scalar_patches_offset, tensor_patches_offset + TENSOR_PATCH_COUNT * sizeof(GraphTensorAddressPatch));
+    EXPECT_GE(definition_offset, scalar_patches_offset + SCALAR_PATCH_COUNT * sizeof(GraphScalarPatch));
     EXPECT_GE(storage_bytes, definition_offset + DEFINITION_BYTES);
     EXPECT_EQ(storage_bytes % alignof(GraphNodeStorage), 0U);
 }
@@ -176,8 +240,8 @@ TEST(GraphExecutionStorage, ComputesAlignedExactSize) {
 TEST(GraphExecutionStorage, RejectsInvalidCapacity) {
     size_t storage_bytes = 0;
 
-    EXPECT_FALSE(graph_execution_storage_bytes(0, 0, sizeof(GraphDefinition), &storage_bytes));
-    EXPECT_FALSE(graph_execution_storage_bytes(1, 0, SIZE_MAX, &storage_bytes));
+    EXPECT_FALSE(graph_execution_storage_bytes(0, 0, 0, sizeof(GraphDefinition), &storage_bytes));
+    EXPECT_FALSE(graph_execution_storage_bytes(1, 0, 0, SIZE_MAX, &storage_bytes));
 }
 
 TEST(GraphExecutionReplay, AffineHitRefreshesOnlyDynamicFields) {
@@ -190,10 +254,10 @@ TEST(GraphExecutionReplay, AffineHitRefreshesOnlyDynamicFields) {
     const std::vector<std::byte> definition =
         make_test_definition(GRAPH_KEY_VALUE, reinterpret_cast<uint64_t>(first_boundary.data()));
     size_t execution_bytes = 0;
-    ASSERT_TRUE(graph_execution_storage_bytes(2, 2, definition.size(), &execution_bytes));
+    ASSERT_TRUE(graph_execution_storage_bytes(2, 2, 2, definition.size(), &execution_bytes));
     AlignedStorage execution_storage(execution_bytes);
     std::vector<std::byte> submission_image = make_test_submission(
-        GRAPH_KEY_VALUE, reinterpret_cast<uint64_t>(first_boundary.data()),
+        GRAPH_KEY_VALUE, reinterpret_cast<uint64_t>(first_boundary.data()), 17,
         reinterpret_cast<uint64_t>(execution_storage.data()), execution_storage.size()
     );
     auto &submission = *reinterpret_cast<GraphSubmission *>(submission_image.data());
@@ -213,6 +277,8 @@ TEST(GraphExecutionReplay, AffineHitRefreshesOnlyDynamicFields) {
     GraphNodeStorage &node = execution->node_storage[0];
     ASSERT_EQ(node.payload.scalar_count, 1);
     ASSERT_EQ(node.payload.tensor_count, 1);
+    EXPECT_EQ(node.payload.scalars[0], 17U);
+    EXPECT_EQ(execution->node_storage[1].payload.scalars[0], 18U);
 
     graph_execution_mark_completed(*execution);
     execution->retired_nodes.store(2, std::memory_order_release);
@@ -222,6 +288,8 @@ TEST(GraphExecutionReplay, AffineHitRefreshesOnlyDynamicFields) {
     outer_task.packed_buffer_end = second_heap.data() + second_heap.size();
     auto *boundary = reinterpret_cast<GraphTensor *>(submission_image.data() + submission.tensors_offset);
     boundary->buffer_addr = reinterpret_cast<uint64_t>(second_boundary.data());
+    auto *boundary_scalar = reinterpret_cast<uint64_t *>(submission_image.data() + submission.scalars_offset);
+    *boundary_scalar = 99;
 
     execution = graph_execution_localize(outer_slot);
     ASSERT_NE(execution, nullptr);
@@ -233,6 +301,7 @@ TEST(GraphExecutionReplay, AffineHitRefreshesOnlyDynamicFields) {
     node.task.kernel_id[0] = 314;
     node.slot.active_mask = ActiveMask(3);
     node.payload.scalars[0] = 2718;
+    execution->node_storage[1].payload.scalars[0] = 31415;
     node.payload.tensors[0].version = 1618;
     node.slot.completed_subtasks.store(1, std::memory_order_relaxed);
     node.payload.dispatch_fanin.store(1, std::memory_order_relaxed);
@@ -240,7 +309,8 @@ TEST(GraphExecutionReplay, AffineHitRefreshesOnlyDynamicFields) {
     EXPECT_EQ(graph_execution_materialize_slice(outer_slot, *execution, 2), GraphMaterializeResult::PREPARED);
     EXPECT_EQ(node.task.kernel_id[0], 314);
     EXPECT_EQ(node.slot.active_mask.raw(), 3);
-    EXPECT_EQ(node.payload.scalars[0], 2718U);
+    EXPECT_EQ(node.payload.scalars[0], 99U);
+    EXPECT_EQ(execution->node_storage[1].payload.scalars[0], 31415U);
     EXPECT_EQ(node.payload.tensors[0].version, 1618);
     EXPECT_EQ(node.task.task_id, PTO2TaskId::make(1, (8U << 10U)));
     EXPECT_EQ(node.task.packed_buffer_base, second_heap.data());

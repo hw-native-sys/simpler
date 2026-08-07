@@ -21,11 +21,10 @@
 
 namespace {
 
-void layer(const CoreTaskArgs &args, float left_delta, float right_delta) {
+void layer(const CoreTaskArgs &args, int variant) {
     const ChipTensor &a = args.tensor(0).ref();
     const ChipTensor &b = args.tensor(1).ref();
     const ChipTensor &output = args.tensor(2).ref();
-    const float ndim_delta = b.ndims == 1 ? 0.0F : 2.0F;
 
     const std::array<uint32_t, 1> shape{a.shapes[0]};
     TensorCreateInfo intermediate(shape.data(), static_cast<uint32_t>(shape.size()), DataType::FLOAT32);
@@ -45,7 +44,11 @@ void layer(const CoreTaskArgs &args, float left_delta, float right_delta) {
     CoreTaskArgs left_args;
     left_args.add_input(sum);
     left_args.add_output(intermediate);
-    left_args.add_scalar(left_delta + ndim_delta);
+    if (variant == 0) {
+        left_args.add_scalar(args.scalar(0));
+    } else {
+        left_args.add_scalar(100.0F);
+    }
     left_args.set_allow_early_resolve(true);
     TaskOutputTensors left_outputs = rt_submit_aiv_task(FUNC_ADD_SCALAR, left_args);
     ChipTensor left = left_outputs.get_ref(0);
@@ -53,7 +56,7 @@ void layer(const CoreTaskArgs &args, float left_delta, float right_delta) {
     CoreTaskArgs right_args;
     right_args.add_input(sum);
     right_args.add_output(intermediate);
-    right_args.add_scalar(right_delta + ndim_delta);
+    right_args.add_scalar(args.scalar(variant == 0 ? 1 : 0));
     TaskOutputTensors right_outputs = rt_submit_aiv_task(FUNC_ADD_SCALAR, right_args);
     ChipTensor right = right_outputs.get_ref(0);
 
@@ -63,7 +66,7 @@ void layer(const CoreTaskArgs &args, float left_delta, float right_delta) {
     rt_submit_aiv_task(FUNC_MUL, mul_args);
 }
 
-void submit_layer(const CoreTaskArgs &args) { rt_submit_graph(&layer, args, 1.0F, 2.0F); }
+void submit_layer(const CoreTaskArgs &args, int variant) { rt_submit_graph(&layer, args, variant); }
 
 }  // namespace
 
@@ -89,11 +92,19 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     TaskOutputTensors seed_outputs = rt_submit_aiv_task(FUNC_ADD_SCALAR, seed_args);
     ChipTensor seeded_a = seed_outputs.get_ref(0);
 
-    for (int32_t output_index = 2; output_index < 5; ++output_index) {
+    const std::array<float, 3> left_deltas{1.0F, 3.0F, 5.0F};
+    const std::array<float, 3> right_deltas{2.0F, 4.0F, 6.0F};
+    const std::array<int, 3> variants{0, 1, 0};
+    for (size_t layer = 0; layer < variants.size(); ++layer) {
         CoreTaskArgs layer_args;
         layer_args.add_input(seeded_a, b);
-        layer_args.add_output(args.tensor(output_index).ref());
-        submit_layer(layer_args);  // first call records; later calls submit one Graph task
+        layer_args.add_output(args.tensor(static_cast<int32_t>(layer) + 2).ref());
+        if (variants[layer] == 0) {
+            layer_args.add_scalar(left_deltas[layer], right_deltas[layer]);
+        } else {
+            layer_args.add_scalar(right_deltas[layer]);
+        }
+        submit_layer(layer_args, variants[layer]);
     }
 }
 
