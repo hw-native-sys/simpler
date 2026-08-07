@@ -800,7 +800,7 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
 // set instead of a contiguous slice.
 void SchedulerContext::handshake_owned_clusters(Runtime *runtime, int32_t tidx, int32_t active_threads) {
     Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
-    const int32_t aic_n = cores_total_num_ / 3;
+    const int32_t aic_n = cores_total_num_ / PLATFORM_CORES_PER_BLOCKDIM;
 
     int32_t owned[RUNTIME_MAX_WORKER];
     int32_t own_n = 0;
@@ -900,7 +900,7 @@ void SchedulerContext::handshake_owned_clusters(Runtime *runtime, int32_t tidx, 
 // right after handshaking its own clusters, with no all-thread barrier.
 // =============================================================================
 void SchedulerContext::assign_own_clusters(int32_t tidx) {
-    const int32_t aic_n = cores_total_num_ / 3;
+    const int32_t aic_n = cores_total_num_ / PLATFORM_CORES_PER_BLOCKDIM;
     const int32_t active = active_sched_threads_;
 
     CoreTracker &tracker = core_trackers_[tidx];
@@ -1151,8 +1151,11 @@ int32_t SchedulerContext::pre_handshake_init(
     // AIV cores [3*(N/3), N) in no cluster — unhandshaked, their windows never open,
     // and the run hangs at the op-execute timeout. assign_cores_to_threads pairs
     // aiv_worker_ids_[2*ci]/[2*ci+1] on the serial path too, so this holds for both.
-    if (cores_total_num_ % 3 != 0) {
-        LOG_ERROR("cores_total_num %d is not a multiple of 3 (blocked 1 AIC : 2 AIV layout)", cores_total_num_);
+    if (cores_total_num_ % PLATFORM_CORES_PER_BLOCKDIM != 0) {
+        LOG_ERROR(
+            "cores_total_num %d is not a multiple of %d (blocked 1 AIC : 2 AIV layout)", cores_total_num_,
+            PLATFORM_CORES_PER_BLOCKDIM
+        );
         return -1;
     }
     // Blocked core layout ([0,N/3) AIC, [N/3,N) AIV) with a fixed 1:2 AIC:AIV

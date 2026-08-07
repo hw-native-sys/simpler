@@ -1025,7 +1025,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // signalled inline here. The ready queue is MPMC, and the fanout path
         // uses per-slot locks/atomics, so multiple scheduler threads can share
         // the dependency-only resolve work.
-        if (thread_idx < 4) {
+        if (thread_idx < PLATFORM_MAX_AICPU_THREADS - 1) {
             constexpr int DUMMY_DRAIN_BATCH = 8;
             PTO2TaskSlotState *dummy_batch[DUMMY_DRAIN_BATCH];
             int dummy_got = sched_->dummy_ready_queue.pop_batch(dummy_batch, DUMMY_DRAIN_BATCH);
