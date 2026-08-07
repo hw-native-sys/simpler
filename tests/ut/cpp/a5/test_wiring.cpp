@@ -493,6 +493,56 @@ TEST_F(WiringTest, AdvanceRingPointersScansConsumed) {
     EXPECT_EQ(ring->fc.last_task_alive.load(), 3);
 }
 
+TEST_F(WiringTest, AdvanceRingPointersBatchesSharedMemoryPublication) {
+    auto &rss = sched.ring_sched_states[0];
+    auto *ring = rss.ring;
+
+    ring->fc.current_task_index.store(18, std::memory_order_release);
+    for (int i = 0; i < 17; i++) {
+        ring->get_slot_state_by_task_id(i).task_state.store(PTO2_TASK_CONSUMED);
+    }
+
+    rss.advance_ring_pointers();
+    EXPECT_EQ(rss.last_task_alive, 17);
+    EXPECT_EQ(ring->fc.last_task_alive.load(), 17);
+
+    ring->fc.last_task_alive.store(0);
+    rss.last_task_alive = 0;
+    rss.last_published_to_sm = 0;
+    for (int advances : {1, 15, 16, 17}) {
+        for (int i = 0; i < advances; i++) {
+            ring->get_slot_state_by_task_id(i).task_state.store(PTO2_TASK_CONSUMED);
+        }
+        ring->get_slot_state_by_task_id(advances).task_state.store(PTO2_TASK_COMPLETED);
+        rss.advance_ring_pointers();
+        EXPECT_EQ(ring->fc.last_task_alive.load(), advances >= 16 ? advances : 0);
+
+        ring->fc.last_task_alive.store(0);
+        rss.last_task_alive = 0;
+        rss.last_published_to_sm = 0;
+    }
+}
+
+TEST_F(WiringTest, AdvanceRingPointersPublishesDrainedTail) {
+    auto &rss = sched.ring_sched_states[0];
+    auto *ring = rss.ring;
+
+    for (int advances : {1, 15, 16, 17}) {
+        ring->fc.current_task_index.store(advances, std::memory_order_release);
+        for (int i = 0; i < advances; i++) {
+            ring->get_slot_state_by_task_id(i).task_state.store(PTO2_TASK_CONSUMED);
+        }
+
+        rss.advance_ring_pointers();
+        EXPECT_EQ(rss.last_task_alive, advances);
+        EXPECT_EQ(ring->fc.last_task_alive.load(), advances);
+
+        ring->fc.last_task_alive.store(0);
+        rss.last_task_alive = 0;
+        rss.last_published_to_sm = 0;
+    }
+}
+
 TEST_F(WiringTest, AdvanceRingPointersStopsAtNonConsumed) {
     auto &rss = sched.ring_sched_states[0];
     auto *ring = rss.ring;

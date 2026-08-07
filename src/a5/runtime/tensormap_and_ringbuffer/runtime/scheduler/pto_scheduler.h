@@ -442,6 +442,9 @@ struct PTO2SchedulerState {
         // --- Cache Line 0: ring pointer (read-only) + hot path (read-write) ---
         PTO2SharedMemoryRingHeader *ring;
         int32_t last_task_alive;
+        // Shared-memory publication trails local reclamation by at most 15
+        // live tasks while the ring has pending work.
+        int32_t last_published_to_sm{0};
         std::atomic<int32_t> advance_lock;  // multi-thread CAS
 
         // --- Cache Line 1+: Orch-side wiring dep_pool ---
@@ -461,7 +464,13 @@ struct PTO2SchedulerState {
         void reset_for_reuse(void *sm_dev_base, int32_t ring_id, std::atomic<int32_t> *orch_err);
         void destroy();
 
-        void sync_to_sm() { ring->fc.last_task_alive.store(last_task_alive, std::memory_order_release); }
+        void sync_to_sm(bool force = false) {
+            constexpr int32_t PUBLISH_INTERVAL_K = 16;
+            if (last_task_alive == last_published_to_sm) return;
+            if (!force && last_task_alive - last_published_to_sm < PUBLISH_INTERVAL_K) return;
+            ring->fc.last_task_alive.store(last_task_alive, std::memory_order_release);
+            last_published_to_sm = last_task_alive;
+        }
 
 #if SIMPLER_DFX
         void publish_dep_pool_snapshot() {
@@ -497,7 +506,7 @@ struct PTO2SchedulerState {
                 ring->get_slot_state_by_task_id(id).reset_for_reuse();
             }
 
-            sync_to_sm();
+            sync_to_sm(last_task_alive == current_task_index);
         }
     } ring_sched_states[PTO2_MAX_RING_DEPTH];
 
