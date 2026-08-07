@@ -76,6 +76,7 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from multiprocessing import resource_tracker
 from multiprocessing.shared_memory import SharedMemory
@@ -612,6 +613,60 @@ class HostBuffer:
 # it takes is not re-entrant — but the re-entrance is per Worker: a call that
 # reaches a *different* Worker owes that Worker its own reservation.
 _CONTROL_RESERVATION = threading.local()
+
+
+class _SharedExclusiveLock:
+    """Held by many in shared mode, or by one alone in exclusive mode.
+
+    Run admission and device control both need ordering against each other, but
+    not the same amount of it. A control command that belongs to no run needs
+    "no run may be admitted while I run" — a property of the worker. Two such
+    commands on different chips do not need to exclude *each other*, and making
+    them do so serializes every mailbox round-trip in the tree behind one
+    mutex. Admission takes this exclusively, control takes it shared.
+
+    Writer-preferring: once a submit is waiting, new shared holders queue behind
+    it, so a stream of control commands cannot starve admission.
+    """
+
+    def __init__(self) -> None:
+        self._cv = threading.Condition()
+        self._shared = 0
+        self._exclusive = False
+        self._waiting_exclusive = 0
+
+    @contextlib.contextmanager
+    def shared(self) -> Iterator[None]:
+        """Admit alongside other shared holders; excludes exclusive holders."""
+        with self._cv:
+            while self._exclusive or self._waiting_exclusive:
+                self._cv.wait()
+            self._shared += 1
+        try:
+            yield
+        finally:
+            with self._cv:
+                self._shared -= 1
+                if self._shared == 0:
+                    self._cv.notify_all()
+
+    @contextlib.contextmanager
+    def exclusive(self) -> Iterator[None]:
+        """Admit alone: waits out every shared holder and excludes new ones."""
+        with self._cv:
+            self._waiting_exclusive += 1
+            try:
+                while self._exclusive or self._shared:
+                    self._cv.wait()
+            finally:
+                self._waiting_exclusive -= 1
+            self._exclusive = True
+        try:
+            yield
+        finally:
+            with self._cv:
+                self._exclusive = False
+                self._cv.notify_all()
 
 
 def _held_control_reservations() -> set[int]:
@@ -3928,7 +3983,9 @@ class Worker:
         # may be admitted at once is the depth the child backends negotiated.
         # This gate serialises graph construction itself, which stays
         # synchronous on the submitting caller at any depth.
-        self._submit_mu = threading.Lock()
+        # Exclusive for run admission, shared for control that belongs to no run:
+        # such a command must exclude admission, but not other chips' commands.
+        self._submit_mu = _SharedExclusiveLock()
         # Guarded by _hierarchical_start_cv. Handles are installed before their
         # orchestration callback can enqueue work and retired after fence-owned
         # cleanup, so close() can drain the exact accepted set.
@@ -4044,6 +4101,11 @@ class Worker:
         # interrupted op never leaves a freed address live. Cleared on close().
         self._child_alloc_prov: dict[tuple[int, int], _ChildProvEntry] = {}
         self._child_prov_lock = threading.Lock()
+        # Per-worker locks for the *native* half of a provenance-guarded device op.
+        # ``_child_prov_lock`` stays the bookkeeping lock (short, process-wide); the
+        # long native call (malloc / free / copy) is serialized per worker instead, so
+        # ops on different chips overlap while same-worker ordering is unchanged.
+        self._child_prov_worker_locks: dict[int, threading.Lock] = {}
 
         # Post-fork zero-copy host buffers (``create_host_buffer``). Keyed by the
         # born-shared shm's mapped base (== the buffer's data_ptr); each entry maps
@@ -7896,6 +7958,19 @@ class Worker:
     # successful native alloc; revoke before the native free.
     # ------------------------------------------------------------------
 
+    def _child_prov_worker_lock(self, worker_id: int) -> threading.Lock:
+        """Return the lock serializing native device ops on *worker_id* alone.
+
+        Acquired *before* ``_child_prov_lock`` wherever both are needed; never the
+        other way round, so the two can never deadlock.
+        """
+        with self._child_prov_lock:
+            lock = self._child_prov_worker_locks.get(int(worker_id))
+            if lock is None:
+                lock = threading.Lock()
+                self._child_prov_worker_locks[int(worker_id)] = lock
+            return lock
+
     def _child_prov_record_malloc(self, worker_id: int, ptr: int, size: int) -> None:
         """Mark ``(worker_id, ptr)`` as a live malloc base spanning ``size`` bytes
         (after a successful malloc)."""
@@ -8548,7 +8623,7 @@ class Worker:
             self._chip_worker._run_slot(state.slot_id, args, cfg)
             return RunHandle._completed(self)
 
-        with self._submit_mu:
+        with self._submit_mu.exclusive():
             # Graph callbacks stay serialized, so a predecessor's callback has
             # always returned by the time we get here — which is what makes the
             # decision below a fact about that run rather than a guess about
@@ -8686,7 +8761,9 @@ class Worker:
         sampled check leaves the caller free to send its mailbox command after a
         submit admitted a run behind its back, so this takes the serializer
         submission itself holds — no run can be admitted between the check and
-        the command. Re-entrant per thread: one control call may be built out of
+        the command. It takes it *shared*: what the command needs is that no run
+        is admitted while it runs, which two commands on different chips can
+        guarantee at the same time. Re-entrant per thread: one control call may be built out of
         others (a queue out of a region), and the second must join the
         reservation rather than deadlock on it.
         """
@@ -8694,7 +8771,7 @@ class Worker:
         if id(self) in held:
             yield
             return
-        with self._submit_mu:
+        with self._submit_mu.shared():
             with self._hierarchical_start_cv:
                 if self._ordered_cleanup_error is not None:
                     raise RuntimeError(

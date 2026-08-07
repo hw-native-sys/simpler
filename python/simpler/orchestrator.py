@@ -607,9 +607,10 @@ class Orchestrator:
             wid, sz = int(worker_id), int(size)
             if self._worker is None:
                 return int(self._o.malloc(wid, sz))
-            with self._worker._child_prov_lock:
+            with self._worker._child_prov_worker_lock(wid):
                 ptr = int(self._o.malloc(wid, sz))
-                self._worker._child_prov_record_malloc(wid, ptr, sz)
+                with self._worker._child_prov_lock:
+                    self._worker._child_prov_record_malloc(wid, ptr, sz)
                 return ptr
 
     def committed_device_memory(self, worker_id: int) -> int:
@@ -633,7 +634,7 @@ class Orchestrator:
 
     def _free_locked(self, wid: int, p: int) -> None:
         assert self._worker is not None
-        with self._worker._child_prov_lock:
+        with self._worker._child_prov_worker_lock(wid):
             # Safety-first commit barrier: revoke provenance BEFORE the native
             # free. If the native free succeeds and an async unwind (e.g. a
             # KeyboardInterrupt delivered after the binding returns) fires before
@@ -641,8 +642,9 @@ class Orchestrator:
             # later copy/dispatch would re-authorize it — a UAF. Revoking first
             # turns a native-free failure into a terminal leak (recoverable) but
             # never re-authorizes a maybe-freed address.
-            self._worker._child_prov_require_malloc_base(wid, p, api="free")
-            self._worker._child_prov_clear_malloc(wid, p)
+            with self._worker._child_prov_lock:
+                self._worker._child_prov_require_malloc_base(wid, p, api="free")
+                self._worker._child_prov_clear_malloc(wid, p)
             self._o.free(wid, p)
 
     def copy_to(self, worker_id: int, dst: int, src: int, size: int) -> None:
@@ -652,8 +654,9 @@ class Orchestrator:
             if self._worker is None:
                 self._o.copy_to(wid, d, int(src), int(size))
                 return
-            with self._worker._child_prov_lock:
-                self._worker._child_prov_require_live_range(wid, d, int(size), api="copy_to")
+            with self._worker._child_prov_worker_lock(wid):
+                with self._worker._child_prov_lock:
+                    self._worker._child_prov_require_live_range(wid, d, int(size), api="copy_to")
                 self._o.copy_to(wid, d, int(src), int(size))
 
     def copy_from(self, worker_id: int, dst: int, src: int, size: int) -> None:
@@ -663,8 +666,9 @@ class Orchestrator:
             if self._worker is None:
                 self._o.copy_from(wid, int(dst), s, int(size))
                 return
-            with self._worker._child_prov_lock:
-                self._worker._child_prov_require_live_range(wid, s, int(size), api="copy_from")
+            with self._worker._child_prov_worker_lock(wid):
+                with self._worker._child_prov_lock:
+                    self._worker._child_prov_require_live_range(wid, s, int(size), api="copy_from")
                 self._o.copy_from(wid, int(dst), s, int(size))
 
     def alloc(self, shape: Sequence[int], dtype: DataType) -> ChipTensor:
