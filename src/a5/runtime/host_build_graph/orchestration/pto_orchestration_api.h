@@ -30,10 +30,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <cstring>
 #include <type_traits>
 
 // Type headers needed by orchestration
 #include "common.h"              // framework_bind_runtime / framework_current_runtime
+#include "graph_cache.h"         // Graph Execution key and result helpers
 #include "pto_runtime2_types.h"  // PTO2_ERROR_*
 #include "pto_submit_types.h"    // MixedKernels, INVALID_KERNEL_ID, subtask slots
 #include "pto_types.h"           // Arg, TaskOutputTensors, TensorArgType
@@ -91,6 +93,9 @@ typedef struct PTO2RuntimeOps {
     // (one AIC each) and standalone AIV cores.
     int32_t (*available_cluster_count)(PTO2Runtime *rt);
     int32_t (*available_aiv_count)(PTO2Runtime *rt);
+    GraphScopeResult (*graph_begin)(PTO2Runtime *rt, uint64_t graph_key, const CoreTaskArgs &args);
+    void (*graph_end)(PTO2Runtime *rt);
+    void (*graph_commit)(PTO2Runtime *rt);
 
     // Stash the call-site of the next PTO2ScopeGuard so the [ScopeStats]
     // collector can log it. Always present to keep ops-table layout stable
@@ -206,6 +211,30 @@ static inline TaskOutputTensors rt_submit_dummy_task(const CoreTaskArgs &args) {
         return TaskOutputTensors{};
     }
     return rt->ops->submit_dummy_task(rt, args);
+}
+
+static inline GraphScopeResult rt_graph_begin(uint64_t graph_key, const CoreTaskArgs &args) {
+    PTO2Runtime *rt = current_runtime();
+    if (rt->ops->is_fatal(rt) || rt->ops->graph_begin == nullptr) {
+        return GraphScopeResult{};
+    }
+    return rt->ops->graph_begin(rt, graph_key, args);
+}
+
+static inline void rt_graph_end() {
+    PTO2Runtime *rt = current_runtime();
+    if (rt->ops->is_fatal(rt) || rt->ops->graph_end == nullptr) {
+        return;
+    }
+    rt->ops->graph_end(rt);
+}
+
+static inline void rt_graph_commit() {
+    PTO2Runtime *rt = current_runtime();
+    if (rt->ops->is_fatal(rt) || rt->ops->graph_commit == nullptr) {
+        return;
+    }
+    rt->ops->graph_commit(rt);
 }
 
 static inline void rt_scope_begin(PTO2ScopeMode mode = PTO2ScopeMode::AUTO) {
@@ -342,6 +371,80 @@ public:
 private:
     PTO2Runtime *rt_;
 };
+
+using GraphFunction = void (*)(const CoreTaskArgs &);
+
+template <typename Function>
+static inline uint64_t rt_graph_function_id(Function function) {
+    static_assert(std::is_pointer_v<Function>, "Graph function identity requires a function pointer");
+    static_assert(sizeof(function) <= sizeof(uint64_t), "Graph function pointer must fit in a 64-bit identity");
+    uint64_t function_id = 0;
+    std::memcpy(&function_id, &function, sizeof(function));
+    return function_id;
+}
+
+template <typename Invoke>
+static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const CoreTaskArgs &args, Invoke invoke) {
+    debug_assert(!args.has_error && "Graph boundary CoreTaskArgs construction failed");
+    debug_assert(
+        args.tensor_count() <= static_cast<int32_t>(GRAPH_MAX_TENSOR_ARGS) &&
+        "Graph boundary exceeds the step-1 tensor limit"
+    );
+    debug_assert(args.scalar_count() == 0 && "Dynamic Graph boundary scalars are not supported in step 1");
+    debug_assert(
+        args.explicit_dep_count() == 0 && "Explicit dependencies crossing the Graph boundary are not supported"
+    );
+    for (int32_t i = 0; i < args.tensor_count(); ++i) {
+        debug_assert(
+            args.tag(i) != TensorArgType::OUTPUT &&
+            "Runtime-allocated TensorCreateInfo is not supported at the Graph boundary"
+        );
+    }
+    if (!rt_graph_args_cacheable(args)) {
+        invoke();
+        rt_graph_commit();
+        return GraphSubmitResult{};
+    }
+    GraphScopeResult result = rt_graph_begin(graph_key, args);
+    if (result.execute_block) invoke();
+    if (result.recording) {
+        rt_graph_end();
+    }
+    rt_graph_commit();
+    return result;
+}
+
+static inline GraphSubmitResult rt_submit_graph(uint64_t graph_id, GraphFunction function, const CoreTaskArgs &args) {
+    debug_assert(function != nullptr && "Graph function must not be null");
+    if (function == nullptr) return GraphSubmitResult{};
+    return rt_submit_graph_impl(rt_graph_make_key(graph_id), args, [&]() {
+        function(args);
+    });
+}
+
+static inline GraphSubmitResult rt_submit_graph(GraphFunction function, const CoreTaskArgs &args) {
+    return rt_submit_graph(rt_graph_function_id(function), function, args);
+}
+
+template <typename... Config>
+using GraphFunctionWithConfig = void (*)(const CoreTaskArgs &, Config...);
+
+template <typename... Config>
+static inline GraphSubmitResult rt_submit_graph(
+    uint64_t graph_id, GraphFunctionWithConfig<Config...> function, const CoreTaskArgs &args, Config... config
+) {
+    debug_assert(function != nullptr && "Graph function must not be null");
+    if (function == nullptr) return GraphSubmitResult{};
+    return rt_submit_graph_impl(rt_graph_make_key(graph_id, config...), args, [&]() {
+        function(args, config...);
+    });
+}
+
+template <typename... Config>
+static inline GraphSubmitResult
+rt_submit_graph(GraphFunctionWithConfig<Config...> function, const CoreTaskArgs &args, Config... config) {
+    return rt_submit_graph(rt_graph_function_id(function), function, args, config...);
+}
 
 #define _PTO2_CONCATENATE_IMPL(x, y) x##y
 #define _PTO2_CONCATENATE(x, y) _PTO2_CONCATENATE_IMPL(x, y)

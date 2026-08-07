@@ -183,6 +183,10 @@ static_assert(sizeof(ActiveMask) == 1, "ActiveMask must be exactly 1 byte");
 class TaskAttrs {
 public:
     constexpr TaskAttrs() = default;
+    constexpr explicit TaskAttrs(uint8_t raw) :
+        raw_(raw) {}
+
+    uint8_t raw() const { return raw_; }
 
     bool allow_early_resolve() const { return (raw_ & BIT_EARLY_RESOLVE) != 0; }
     void set_early_resolve(bool v) {

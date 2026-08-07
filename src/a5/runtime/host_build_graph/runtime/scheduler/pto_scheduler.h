@@ -37,6 +37,7 @@
 #include "utils/device_arena.h"
 #include "aicpu/platform_regs.h"  // get_reg_ptr / RegId for the early-dispatch doorbell
 #include "pto_async_wait.h"
+#include "graph_execution.h"
 #include "pto_ring_buffer.h"
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
@@ -418,6 +419,8 @@ struct PTO2SchedulerLayout {
     size_t off_ready_queue_slots[PTO2_NUM_RESOURCE_SHAPES];
     size_t off_ready_sync_queue_slots[PTO2_NUM_RESOURCE_SHAPES];
     size_t off_dummy_ready_queue_slots;
+    size_t off_graph_ready_queue_slots;
+    size_t off_graph_prepare_queue_slots;
     size_t off_early_dispatch_queue_slots[PTO2_NUM_RESOURCE_SHAPES];
     size_t off_early_sync_start_queue_slots;
     uint64_t ready_queue_capacity;
@@ -463,6 +466,12 @@ struct PTO2SchedulerState {
     // the dispatch loop and completed inline -- never goes to AICore.
     PTO2ReadyQueue dummy_ready_queue;
 
+    // An outer Graph is control work, never an AICore task. External dependency
+    // readiness and bounded materialization progress independently and meet at
+    // the submission's single atomic activation gate.
+    PTO2ReadyQueue graph_ready_queue;
+    PTO2ReadyQueue graph_prepare_queue;
+
     alignas(64) AsyncWaitList async_wait_list;
 
     // Statistics (cold path, isolated from hot-path fields)
@@ -480,14 +489,31 @@ struct PTO2SchedulerState {
     // the per-shape ready_sync_queues[] (drained as Tier-0); everything else to
     // ready_queues[].
     void push_ready_routed(PTO2TaskSlotState *slot_state) {
+        if (slot_state->task_kind == TaskKind::GRAPH) {
+            graph_ready_queue.push(slot_state);
+            return;
+        }
         PTO2ResourceShape shape = slot_state->active_mask.to_shape();
+        bool pushed;
         if (shape == PTO2ResourceShape::DUMMY ||
             (slot_state->task_attrs.has_predicate() && !slot_state->payload->predicate.pass())) {
-            dummy_ready_queue.push(slot_state);
+            pushed = dummy_ready_queue.push(slot_state);
         } else if (slot_state->task_attrs.requires_sync_start()) {
-            ready_sync_queues[static_cast<int32_t>(shape)].push(slot_state);
+            pushed = ready_sync_queues[static_cast<int32_t>(shape)].push(slot_state);
         } else {
-            ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+            pushed = ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+        }
+        // A queue is sized for the whole task window and each task is routed to one
+        // queue exactly once, so push cannot legitimately fail. A false return means
+        // the target slot fell outside the shipped prefix, or the window genuinely
+        // exceeds queue capacity — either way the task is dropped and the run would
+        // otherwise stall. Latch a named error so it surfaces as READY_QUEUE_OVERFLOW
+        // rather than an anonymous forward-progress timeout.
+        if (!pushed) {
+            int32_t expected = PTO2_ERROR_NONE;
+            sm_header->sched_error_code.compare_exchange_strong(
+                expected, PTO2_ERROR_READY_QUEUE_OVERFLOW, std::memory_order_acq_rel, std::memory_order_acquire
+            );
         }
     }
 
@@ -822,6 +848,165 @@ struct PTO2SchedulerState {
     // scope reference. Kept as a no-op so the orchestrator call site is unchanged.
     void on_scope_end(PTO2TaskSlotState ** /*task_slot_states*/, int32_t /*count*/) {}
 
+    // Orch owns dependency discovery and saves the immutable fanin wire.
+    // Scheduler polling only chooses which already-wired producer a consumer
+    // waits on at this instant; it never recomputes producer relationships.
+    int32_t graph_first_unmet_producer(const GraphExecution &execution, const PTO2TaskSlotState &consumer) const {
+        const uint32_t node_index = static_cast<uint32_t>(consumer.graph_node_index);
+        const uint32_t begin = execution.fanin_offsets[node_index];
+        const uint32_t end = execution.fanin_offsets[node_index + 1];
+        for (uint32_t edge = begin; edge < end; ++edge) {
+            const uint16_t producer_index = execution.fanin_indices[edge];
+            const PTO2TaskSlotState &producer = execution.nodes[producer_index].slot;
+            if (producer.task_state.load(std::memory_order_acquire) != PTO2_TASK_COMPLETED) {
+                return static_cast<int32_t>(producer_index);
+            }
+        }
+        return -1;
+    }
+
+    void register_graph_wake(GraphExecution &execution, PTO2TaskSlotState *producer, PTO2TaskSlotState *consumer) {
+        while (true) {
+            PTO2TaskSlotState *expected = producer->wake_list_head.load(std::memory_order_relaxed);
+            while (expected != WAKE_LIST_SENTINEL) {
+                consumer->next_in_wake_list = expected;
+                if (producer->wake_list_head.compare_exchange_weak(
+                        expected, consumer, std::memory_order_acq_rel, std::memory_order_relaxed
+                    )) {
+                    return;
+                }
+            }
+
+            // The producer completed between fanin classification and the CAS.
+            // Retry against acquire-loaded task states until cache coherence
+            // exposes the completed producer, then route or retarget the waiter.
+            const int32_t unmet_producer = graph_first_unmet_producer(execution, *consumer);
+            if (unmet_producer < 0) {
+                push_ready_routed(consumer);
+                return;
+            }
+            producer = &execution.nodes[unmet_producer].slot;
+        }
+    }
+
+    uint32_t drain_graph_wake_list(GraphExecution &execution, PTO2TaskSlotState &producer) {
+        uint32_t consumers_rescanned = 0;
+        PTO2TaskSlotState *waiter = producer.wake_list_head.exchange(WAKE_LIST_SENTINEL, std::memory_order_acq_rel);
+        while (waiter != nullptr && waiter != WAKE_LIST_SENTINEL) {
+            PTO2TaskSlotState *next = waiter->next_in_wake_list;
+            const int32_t unmet_producer = graph_first_unmet_producer(execution, *waiter);
+            if (unmet_producer < 0) {
+                push_ready_routed(waiter);
+            } else {
+                register_graph_wake(execution, &execution.nodes[unmet_producer].slot, waiter);
+            }
+            consumers_rescanned++;
+            waiter = next;
+        }
+        return consumers_rescanned;
+    }
+
+    int32_t activate_prepared_graph(GraphExecution &execution) {
+        GraphExecutionState expected = GraphExecutionState::PREPARED;
+        if (!execution.state.compare_exchange_strong(
+                expected, GraphExecutionState::ACTIVE, std::memory_order_acq_rel, std::memory_order_acquire
+            )) {
+            return 0;
+        }
+        const GraphDefinition &definition = *execution.definition;
+        const uint16_t *roots =
+            graph_definition_array<uint16_t>(definition, definition.off_root_indices, definition.root_count);
+        if (roots == nullptr) return 0;
+        int32_t routed = 0;
+        for (uint32_t i = 0; i < definition.root_count; ++i) {
+            const uint16_t node_index = roots[i];
+            if (node_index >= static_cast<uint32_t>(execution.node_count)) continue;
+            // Roots have zero internal fanin and are routed only here. Every
+            // non-root is registered on one saved producer at a time.
+            push_ready_routed(&execution.nodes[node_index].slot);
+            routed++;
+        }
+        return routed;
+    }
+
+    GraphMaterializeResult prepare_graph_task(
+        PTO2TaskSlotState &outer_slot, int32_t max_nodes = GRAPH_MATERIALIZE_SLICE_NODES,
+        int32_t *nodes_materialized = nullptr
+    ) {
+        GraphSubmission *submission = graph_submission_from_slot(outer_slot);
+        if (submission == nullptr) return GraphMaterializeResult::INVALID;
+        GraphExecution *execution = graph_execution_localize(outer_slot);
+        if (execution == nullptr) {
+            return graph_submission_execution_initializing(*submission) ? GraphMaterializeResult::BUSY :
+                                                                          GraphMaterializeResult::INVALID;
+        }
+        const GraphMaterializeResult result =
+            graph_execution_materialize_slice(outer_slot, *execution, max_nodes, nodes_materialized);
+        if (result == GraphMaterializeResult::PREPARED && graph_submission_signal(*submission, 0x1)) {
+            activate_prepared_graph(*execution);
+        }
+        return result;
+    }
+
+    int32_t activate_graph_task(PTO2TaskSlotState &outer_slot) {
+        GraphSubmission *submission = graph_submission_from_slot(outer_slot);
+        if (submission == nullptr || !graph_submission_signal(*submission, 0x2)) return 0;
+        GraphExecution *execution = graph_submission_local_execution(*submission);
+        return execution == nullptr ? 0 : activate_prepared_graph(*execution);
+    }
+
+    struct TaskCompletionOutcome {
+        uint32_t fanout_edges{0};
+        int32_t stream_tasks_completed{0};
+    };
+
+    TaskCompletionOutcome complete_task(
+        PTO2TaskSlotState &slot_state
+#if SIMPLER_SCHED_PROFILING
+        ,
+        int thread_idx
+#endif
+    ) {
+        TaskCompletionOutcome outcome;
+        if (slot_state.task_kind != TaskKind::GRAPH_NODE) {
+#if SIMPLER_SCHED_PROFILING
+            CompletionStats stats = on_task_complete(slot_state, thread_idx);
+            outcome.fanout_edges = static_cast<uint32_t>(stats.fanout_edges);
+#else
+            outcome.fanout_edges = on_task_complete(slot_state);
+#endif
+            outcome.stream_tasks_completed = 1;
+            return outcome;
+        }
+
+        GraphExecution *execution = graph_execution_from_slot(slot_state);
+        if (execution == nullptr || execution->definition == nullptr || execution->nodes == nullptr) return outcome;
+        const int32_t saved_node_index = slot_state.graph_node_index;
+        if (saved_node_index < 0) return outcome;
+        const uint32_t node_index = static_cast<uint32_t>(saved_node_index);
+        if (node_index >= static_cast<uint32_t>(execution->node_count)) return outcome;
+
+        // Publish completion before closing the wake list. A consumer that
+        // loses registration to the sentinel acquires this state when it
+        // rescans the Orch-built fanin wire, so no wakeup can be lost.
+        slot_state.mark_completed();
+        outcome.fanout_edges = drain_graph_wake_list(*execution, slot_state);
+
+        const bool graph_completed = graph_execution_complete_node(*execution);
+        graph_execution_retire_node(*execution);
+        if (!graph_completed) return outcome;
+
+        // Internal nodes count as zero stream tasks. The final node publishes
+        // the outer ring task exactly once, waking external consumers and
+        // contributing the one task the host actually submitted.
+        if (execution->outer_slot != nullptr) {
+            on_mixed_task_complete(*execution->outer_slot);
+            outcome.stream_tasks_completed = 1;
+        }
+        graph_execution_mark_completed(*execution);
+        return outcome;
+    }
+
     /**
      * Subtask completion: atomic counter model.
      * Called when a single subtask (AIC, AIV0, or AIV1) finishes on any block.
@@ -923,11 +1108,11 @@ AsyncWaitList::try_inline_complete_locked(AsyncWaitList::DrainCompletionSink &si
     // Return value (CompletionStats / consumer-walk count) discarded:
     // async-wait drain path has no Resolve swimlane bar attached.
 #if SIMPLER_SCHED_PROFILING
-    (void)sink.sched->on_task_complete(slot_state, sink.thread_idx);
+    PTO2SchedulerState::TaskCompletionOutcome outcome = sink.sched->complete_task(slot_state, sink.thread_idx);
 #else
-    (void)sink.sched->on_task_complete(slot_state);
+    PTO2SchedulerState::TaskCompletionOutcome outcome = sink.sched->complete_task(slot_state);
 #endif
-    sink.inline_completed++;
+    sink.inline_completed += outcome.stream_tasks_completed;
     return true;
 }
 
@@ -988,12 +1173,12 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
             // Return value (CompletionStats / consumer-walk count) discarded:
             // deferred-completion drain has no Resolve swimlane bar attached.
 #if SIMPLER_SCHED_PROFILING
-            (void)sched->on_task_complete(*entry.slot_state, thread_idx);
+            PTO2SchedulerState::TaskCompletionOutcome outcome = sched->complete_task(*entry.slot_state, thread_idx);
 #else
-            (void)sched->on_task_complete(*entry.slot_state);
+            PTO2SchedulerState::TaskCompletionOutcome outcome = sched->complete_task(*entry.slot_state);
 #endif
             // Polling: completion is fully published inline; no deferred release.
-            result.completed++;
+            result.completed += outcome.stream_tasks_completed;
 
             int32_t last = count - 1;
             if (i != last) entries[i] = entries[last];

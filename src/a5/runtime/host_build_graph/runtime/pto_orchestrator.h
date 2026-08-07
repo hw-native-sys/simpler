@@ -31,12 +31,15 @@
 #include "common/chip_swimlane_profiling.h"
 #include "utils/device_arena.h"
 #include "pto_ring_buffer.h"
+#include "graph_cache.h"
 #include "pto_runtime2_types.h"
 #include "pto_submit_types.h"
 #include "scheduler/pto_scheduler.h"
 #include "pto_shared_memory.h"
 #include "pto_tensormap.h"
 #include "pto_types.h"
+
+struct GraphHostState;
 
 /**
  * Layout descriptor produced by PTO2OrchestratorState::reserve_layout(). Holds
@@ -113,6 +116,10 @@ struct PTO2OrchestratorState {
     // after orchestration finishes so shutdown/profiling totals remain closed.
     int64_t inline_completed_tasks{0};
 
+    // This host-only state is cleared before the arena/shared-memory image
+    // crosses to the device.
+    GraphHostState *graph_host_state{nullptr};
+
     // === STATISTICS ===
 #if SIMPLER_DFX
     int64_t tasks_submitted;
@@ -154,6 +161,9 @@ struct PTO2OrchestratorState {
     TaskOutputTensors submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args);
     TaskOutputTensors submit_dummy_task(const CoreTaskArgs &args);
     TaskOutputTensors alloc_tensors(const CoreTaskArgs &args);
+    GraphScopeResult graph_begin(uint64_t graph_key, const CoreTaskArgs &args, uint64_t callable_hash);
+    void graph_end();
+    void graph_commit();
     void mark_done();
 };
 

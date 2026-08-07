@@ -14,6 +14,8 @@ Two runtime implementations live under `src/a5/runtime/`, each providing a diffe
 ## host_build_graph
 
 See [host_build_graph/docs/RUNTIME_LOGIC.md](../runtime/host_build_graph/docs/RUNTIME_LOGIC.md).
+Graph recording and replay are documented in
+[GRAPH_EXECUTION.md](../runtime/host_build_graph/docs/GRAPH_EXECUTION.md).
 
 ## tensormap_and_ringbuffer (PTO2)
 
