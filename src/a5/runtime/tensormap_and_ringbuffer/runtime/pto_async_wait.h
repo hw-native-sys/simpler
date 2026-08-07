@@ -74,10 +74,12 @@ inline CompletionPollResult counter_poll_op(const CompletionCondition &cond) {
 inline void counter_retire_op(CompletionCondition & /*cond*/) {}
 
 inline CompletionPollResult sdma_event_record_poll_op(const CompletionCondition &cond) {
-    return poll_sdma_event_record(cond.addr);
+    return poll_sdma_post_done_record(cond.addr, cond.backend_cookie);
 }
 
-inline void sdma_event_record_retire_op(CompletionCondition &cond) { retire_sdma_event_record(cond.addr); }
+inline void sdma_event_record_retire_op(CompletionCondition &cond) {
+    retire_sdma_post_done_record(cond.addr, cond.backend_cookie);
+}
 
 inline CompletionPollResult urma_event_handle_poll_op(const CompletionCondition &cond) {
     return pto2::urma_backend::poll_urma_event_handle(cond.addr, cond.backend_cookie);

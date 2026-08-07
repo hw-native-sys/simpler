@@ -308,7 +308,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // its row loop. Flush the one cache line ([L=16,1] INT32 = 64 B) so its HBM
     // value is visible regardless of dispatch/consumer timing. (recv_x/recv_w/
     // recv_idx go out via TSTORE and need no dcci.)
-    dcci((__gm__ void *)recv_count_out, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    dcci((__gm__ void *)recv_count_out, cache_line_t::SINGLE_CACHE_LINE, dcci_dst_t::CACHELINE_OUT);
 
     // ------------------------------------------------------------------
     // payload_push: push x / weight / idx payloads via TPUT.

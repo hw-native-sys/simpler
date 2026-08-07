@@ -194,6 +194,29 @@ def test_land_on_commit_fetches_when_commit_is_missing(tmp_path, monkeypatch):
     assert pto_isa._land_on_commit(tmp_path, PIN_A, verbose=False)
     assert calls == [
         (["checkout", "--detach", "--force", PIN_A], tmp_path, False),
+        (["fetch", "--no-tags", "origin", PIN_A], tmp_path, False),
+        (["checkout", "--detach", "--force", PIN_A], tmp_path, False),
+    ]
+
+
+def test_land_on_commit_falls_back_when_exact_fetch_is_unsupported(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run_git(args, cwd=None, timeout=30, check=False):
+        calls.append((args, cwd, check))
+        if args == ["checkout", "--detach", "--force", PIN_A] and len([c for c in calls if c[0] == args]) == 1:
+            return subprocess.CompletedProcess(["git", *args], returncode=1, stdout="", stderr="missing")
+        if args == ["fetch", "--no-tags", "origin", PIN_A]:
+            return subprocess.CompletedProcess(["git", *args], returncode=1, stdout="", stderr="not our ref")
+        return subprocess.CompletedProcess(["git", *args], returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(pto_isa, "_run_git", fake_run_git)
+    monkeypatch.setattr(pto_isa, "get_pto_isa_head", lambda root: PIN_A)
+
+    assert pto_isa._land_on_commit(tmp_path, PIN_A, verbose=False)
+    assert calls == [
+        (["checkout", "--detach", "--force", PIN_A], tmp_path, False),
+        (["fetch", "--no-tags", "origin", PIN_A], tmp_path, False),
         (["fetch", "origin"], tmp_path, False),
         (["checkout", "--detach", "--force", PIN_A], tmp_path, False),
     ]

@@ -28,6 +28,7 @@ struct CompletionToken {
     uint32_t expected_value;
     uint32_t engine;
     int32_t completion_type;
+    // Backend-specific 64-bit metadata (for example, an SDMA post ID).
     uint64_t backend_cookie;
 };
 

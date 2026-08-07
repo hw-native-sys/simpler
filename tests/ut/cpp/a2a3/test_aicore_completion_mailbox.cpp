@@ -156,10 +156,11 @@ TEST(AICoreCompletionMailbox, ConditionAttachesToExistingEntry) {
 
     constexpr uint64_t kAddr1 = 0x1000;
     constexpr uint64_t kAddr2 = 0x2000;
+    constexpr uint64_t kPostId = (uint64_t{1} << 40) + 17;
     ASSERT_TRUE(mb->try_push_condition(token, kAddr1, /*expected=*/3, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER));
-    ASSERT_TRUE(
-        mb->try_push_condition(token, kAddr2, /*expected=*/0, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_SDMA_EVENT_RECORD)
-    );
+    ASSERT_TRUE(mb->try_push_condition(
+        token, kAddr2, kPostId, /*expected=*/0, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_SDMA_EVENT_RECORD
+    ));
 
     int32_t err = PTO2_ERROR_NONE;
     AsyncWaitList::DrainCompletionSink sink{};
@@ -171,12 +172,32 @@ TEST(AICoreCompletionMailbox, ConditionAttachesToExistingEntry) {
     EXPECT_EQ(wait_list.entries[0].conditions[0].expected_value, 3u);
     EXPECT_EQ(wait_list.entries[0].conditions[0].completion_type, COMPLETION_TYPE_COUNTER);
     EXPECT_EQ(wait_list.entries[0].conditions[1].addr, kAddr2);
+    EXPECT_EQ(wait_list.entries[0].conditions[1].backend_cookie, kPostId);
     EXPECT_EQ(wait_list.entries[0].conditions[1].completion_type, COMPLETION_TYPE_SDMA_EVENT_RECORD);
     // SDMA_EVENT_RECORD conditions don't bind counter_addr.
     EXPECT_EQ(wait_list.entries[0].conditions[1].counter_addr, nullptr);
     EXPECT_EQ(wait_list.entries[0].waiting_completion_count, 2);
 
     destroy_mailbox(mb);
+}
+
+TEST(AICoreCompletionMailbox, SdmaPostDoneRecordUsesMonotonicPostId) {
+    alignas(PTO2_ALIGN_SIZE) uint64_t completed_post_id = (uint64_t{1} << 40) + 16;
+    CompletionCondition cond{};
+    cond.completion_type = COMPLETION_TYPE_SDMA_EVENT_RECORD;
+    cond.addr = reinterpret_cast<uint64_t>(&completed_post_id);
+    cond.backend_cookie = completed_post_id + 1;
+
+    EXPECT_EQ(cond.test().state, CompletionPollState::PENDING);
+    completed_post_id += 1;
+    EXPECT_EQ(cond.test().state, CompletionPollState::READY);
+    completed_post_id += 1;
+    EXPECT_EQ(cond.test().state, CompletionPollState::READY);
+    EXPECT_EQ(poll_sdma_post_done_record(/*record_addr=*/0, cond.backend_cookie).state, CompletionPollState::FAILED);
+    EXPECT_EQ(poll_sdma_post_done_record(cond.addr, /*expected_post_id=*/0).state, CompletionPollState::FAILED);
+
+    cond.retire();
+    EXPECT_EQ(completed_post_id, (uint64_t{1} << 40) + 18);
 }
 
 // =============================================================================

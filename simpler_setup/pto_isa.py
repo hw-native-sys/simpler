@@ -334,6 +334,9 @@ def _land_on_commit(clone_path: Path, commit: str, verbose: bool) -> bool:
     would be overwritten." Forcing discards that pseudo-dirt and lands exactly on
     the pin. A full clone already carries every branch's history, but keep a
     fetch fallback in case the pin is not reachable from the default fetch.
+    Fetch the exact pin first so a stale remote-ref advertisement cannot make a
+    newly-pushed commit invisible; fall back to the advertised refs for servers
+    that do not allow fetching a reachable object by SHA.
     """
     try:
         result = _run_git_resilient(
@@ -341,8 +344,17 @@ def _land_on_commit(clone_path: Path, commit: str, verbose: bool) -> bool:
         )
         if result.returncode != 0:
             if verbose:
-                logger.info(f"pto-isa commit {commit} missing locally, fetching origin...")
-            _run_git_resilient(["fetch", "origin"], cwd=clone_path, timeout=120, check=True, verbose=verbose)
+                logger.info(f"pto-isa commit {commit} missing locally, fetching the exact pin from origin...")
+            fetch_result = _run_git_resilient(
+                ["fetch", "--no-tags", "origin", commit],
+                cwd=clone_path,
+                timeout=120,
+                verbose=verbose,
+            )
+            if fetch_result.returncode != 0:
+                if verbose:
+                    logger.info("Exact PTO-ISA pin fetch failed; falling back to advertised origin refs...")
+                _run_git_resilient(["fetch", "origin"], cwd=clone_path, timeout=120, check=True, verbose=verbose)
             _run_git_resilient(
                 ["checkout", "--detach", "--force", commit], cwd=clone_path, timeout=30, check=True, verbose=verbose
             )

@@ -40,7 +40,7 @@ static_assert(
 // carries the slot_state pointer in `addr` so the consumer can finalize the
 // AsyncWaitEntry.slot_state binding for tasks whose conditions arrived
 // before the FIN thread saw task_complete. New kinds may be added in future
-// without growing the message — the `_pad[5]` slack is reserved for
+// without growing the message — the `_pad[3]` slack is reserved for
 // kind-specific payload extension.
 #define MSG_KIND_CONDITION 0u
 #define MSG_KIND_TASK_NORMAL_DONE 1u
@@ -52,15 +52,16 @@ struct AICoreCompletionMailboxMessage {
     // other fields below as a side effect, so they stay plain.
     std::atomic<uint64_t> seq;
     PTO2TaskId task_token;
-    // CONDITION: completion observation addr (counter / SDMA event record).
+    // CONDITION: completion observation addr (counter / backend record).
     // TASK_NORMAL_DONE: PTO2TaskSlotState pointer carried over to the consumer
     //   so it can finalize the AsyncWaitEntry.slot_state binding.
     uint64_t addr;
+    uint64_t backend_cookie;
     uint32_t expected_value;
     uint32_t engine;
     int32_t completion_type;
     uint32_t kind;
-    uint32_t _pad[5];
+    uint32_t _pad[3];
 };
 
 static_assert(sizeof(AICoreCompletionMailboxMessage) == PTO2_ALIGN_SIZE, "AICoreCompletionMailboxMessage layout drift");
@@ -79,6 +80,7 @@ static_assert(
 struct AICoreCompletionMsgView {
     PTO2TaskId task_token{PTO2TaskId::invalid()};
     uint64_t addr{0};
+    uint64_t backend_cookie{0};
     uint32_t expected_value{0};
     uint32_t engine{0};
     int32_t completion_type{0};
@@ -116,6 +118,13 @@ struct AICoreCompletionMailbox {
     bool try_push_condition(
         PTO2TaskId task_token, uint64_t addr, uint32_t expected_value, uint32_t engine, int32_t completion_type
     ) {
+        return try_push_condition(task_token, addr, 0, expected_value, engine, completion_type);
+    }
+
+    bool try_push_condition(
+        PTO2TaskId task_token, uint64_t addr, uint64_t backend_cookie, uint32_t expected_value, uint32_t engine,
+        int32_t completion_type
+    ) {
         while (true) {
             uint64_t h = head.load(std::memory_order_relaxed);
             uint64_t t = tail.load(std::memory_order_acquire);
@@ -125,6 +134,7 @@ struct AICoreCompletionMailbox {
                 AICoreCompletionMailboxMessage *slot = &entries[h & AICORE_COMPLETION_MAILBOX_MASK];
                 slot->task_token.raw = task_token.raw;
                 slot->addr = addr;
+                slot->backend_cookie = backend_cookie;
                 slot->expected_value = expected_value;
                 slot->engine = engine;
                 slot->completion_type = completion_type;
@@ -149,6 +159,7 @@ struct AICoreCompletionMailbox {
                 AICoreCompletionMailboxMessage *slot = &entries[h & AICORE_COMPLETION_MAILBOX_MASK];
                 slot->task_token.raw = task_token.raw;
                 slot->addr = slot_state_addr;
+                slot->backend_cookie = 0;
                 slot->expected_value = 0;
                 slot->engine = 0;
                 slot->completion_type = 0;
@@ -173,6 +184,7 @@ struct AICoreCompletionMailbox {
         if (slot->seq.load(std::memory_order_acquire) != t + 1) return false;
         out.task_token.raw = slot->task_token.raw;
         out.addr = slot->addr;
+        out.backend_cookie = slot->backend_cookie;
         out.expected_value = slot->expected_value;
         out.engine = slot->engine;
         out.completion_type = slot->completion_type;

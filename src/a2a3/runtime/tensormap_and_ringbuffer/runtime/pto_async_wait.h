@@ -54,6 +54,7 @@ struct CompletionCondition {
     bool retired{false};
     volatile uint32_t *counter_addr{nullptr};
     uint64_t addr{0};
+    uint64_t backend_cookie{0};
     uint32_t expected_value{0};
 
     CompletionPollResult test() const;
@@ -76,10 +77,12 @@ inline CompletionPollResult counter_poll_op(const CompletionCondition &cond) {
 inline void counter_retire_op(CompletionCondition & /*cond*/) {}
 
 inline CompletionPollResult sdma_event_record_poll_op(const CompletionCondition &cond) {
-    return poll_sdma_event_record(cond.addr);
+    return poll_sdma_post_done_record(cond.addr, cond.backend_cookie);
 }
 
-inline void sdma_event_record_retire_op(CompletionCondition &cond) { retire_sdma_event_record(cond.addr); }
+inline void sdma_event_record_retire_op(CompletionCondition &cond) {
+    retire_sdma_post_done_record(cond.addr, cond.backend_cookie);
+}
 
 inline const CompletionBackendOps *completion_backend_ops_for(int completion_type) {
     static const CompletionBackendOps kOps[] = {
@@ -226,8 +229,8 @@ struct AsyncWaitList {
                     entry->normal_done = false;
                 }
                 if (!append_condition_locked(
-                        *entry, msg.addr, msg.expected_value, static_cast<AsyncEngine>(msg.engine), msg.completion_type,
-                        error_code
+                        *entry, msg.addr, msg.backend_cookie, msg.expected_value, static_cast<AsyncEngine>(msg.engine),
+                        msg.completion_type, error_code
                     )) {
                     return drained;
                 }
@@ -271,8 +274,8 @@ struct AsyncWaitList {
     }
 
     bool append_condition_locked(
-        AsyncWaitEntry &entry, uint64_t addr, uint32_t expected_value, AsyncEngine engine, int32_t completion_type,
-        int32_t &error_code
+        AsyncWaitEntry &entry, uint64_t addr, uint64_t backend_cookie, uint32_t expected_value, AsyncEngine engine,
+        int32_t completion_type, int32_t &error_code
     ) {
         if (entry.condition_count >= MAX_COMPLETIONS_PER_TASK) {
             error_code = PTO2_ERROR_ASYNC_REGISTRATION_FAILED;
@@ -284,6 +287,7 @@ struct AsyncWaitList {
         cond.satisfied = false;
         cond.retired = false;
         cond.addr = addr;
+        cond.backend_cookie = backend_cookie;
         cond.counter_addr = completion_type == COMPLETION_TYPE_COUNTER ?
                                 reinterpret_cast<volatile uint32_t *>(static_cast<uintptr_t>(addr)) :
                                 nullptr;
