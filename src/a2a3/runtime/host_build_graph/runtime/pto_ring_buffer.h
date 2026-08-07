@@ -250,6 +250,26 @@ public:
         return (heap_top_ + heap_size_ - heap_tail_) % heap_size_;
     }
 
+    // Reserve output-buffer bytes without claiming a task-window slot. Graph
+    // recording gives each internal node a disjoint, valid heap address so
+    // tensor-source classification works, then releases the whole range with
+    // restore_heap_top() once the consolidated outer GRAPH task reclaims it as a
+    // single block. During host graph construction last_task_alive never
+    // advances, so heap_tail_ is fixed and the heap only bumps forward — the
+    // reservation is a plain forward bump with no wrap. Returns nullptr on heap
+    // exhaustion; a zero size returns the current position without advancing.
+    void *reserve_heap_scratch(int32_t output_size) {
+        uint64_t aligned_size =
+            output_size > 0 ? PTO2_ALIGN_UP(static_cast<uint64_t>(output_size), PTO2_ALIGN_SIZE) : 0;
+        return try_bump_heap(aligned_size);
+    }
+
+    // Roll the heap allocation pointer back to a value previously returned by
+    // heap_top(). Valid only while no allocation has been consumed since the
+    // snapshot (heap_tail_ unchanged), which holds throughout host graph
+    // construction.
+    void restore_heap_top(uint64_t top) { heap_top_ = top; }
+
 private:
     // --- Task Ring ---
     PTO2TaskDescriptor *descriptors_ = nullptr;

@@ -4,10 +4,18 @@ Graph Execution is available only in the `host_build_graph` runtime. A Graph is
 a composite incore task: it is submitted and completed once like an AIC, AIV,
 MIX, or SPMD task, but contains a recorded task DAG.
 
-The first invocation executes normally and records the DAG. A later invocation
-places one `GRAPH` task in the host task window. The device Scheduler expands
-the saved topology and dispatches its internal nodes; the Host Orchestrator does
-not submit those nodes again.
+Every invocation places exactly one `GRAPH` task in the host task window. The
+first invocation records the DAG off the ring — its internal submissions build
+host-only node metadata and reserve scratch output buffers instead of consuming
+task-window slots — then emits the outer `GRAPH` task from the freshly built
+Definition. Later invocations reuse the cached Definition and emit the same one
+`GRAPH` task directly. In both cases the device Scheduler expands the saved
+topology and dispatches the internal nodes; the Host Orchestrator never submits
+those nodes as ring tasks.
+
+A recording that hits an unsupported construct is discarded and the body re-runs
+on the ordinary task-submit path so its work is still submitted; the internal
+nodes then occupy the ring only for that one fallback invocation.
 
 ## Step-1 API
 
@@ -153,10 +161,11 @@ void decode_three_layers(
 }
 ```
 
-The first layer records ordinary task submissions. Layers two and three submit
-one Graph task each when their ChipTensor metadata matches. A per-layer or
-per-token scalar is not dynamic in step 1; use ordinary submission or a
-different fixed Graph function/key until dynamic scalar support is added.
+All three layers submit one Graph task each: the first records the sub-DAG off
+the ring and emits its Graph task, layers two and three replay the cached
+Definition once their ChipTensor metadata matches. A per-layer or per-token
+scalar is not dynamic in step 1; use ordinary submission or a different fixed
+Graph function/key until dynamic scalar support is added.
 
 ## Definition
 
