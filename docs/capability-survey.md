@@ -219,7 +219,7 @@ values yield `PTO2_ERROR_ASYNC_COMPLETION_INVALID`.
 
 | Engine | a2a3 | a5 | Status |
 | ------ | ---- | -- | ------ |
-| COUNTER (default) | registered | registered | **Shipped** — `async_notify_demo` runs onboard on both arches and `deferred_notify_demo` runs in sim on both, through the `st-onboard-*` / `st-sim-*` jobs in `ci.yml`. Routed by `@pytest.mark.platforms`, no `skipif` |
+| COUNTER (default) | registered | registered | **Shipped** — `async_notify_demo` runs onboard on both arches and `deferred_notify_demo` runs in sim on both, through the `st-onboard-*` / `st-sim-*` jobs in `ci.yml`. Routed by `CASES[*]["platforms"]`, no `skipif` |
 | SDMA | build macro forced ON; runtime opt-in | `option(... OFF)` | a2a3 **Shipped** (the "SDMA pytest (a2a3)" step in `ci.yml`); a5 not built |
 | URMA | absent | full implementation | **Gated** — see below |
 | ROCE, CCU | enum only | enum only | **Name only** |

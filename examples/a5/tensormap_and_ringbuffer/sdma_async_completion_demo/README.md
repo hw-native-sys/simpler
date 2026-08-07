@@ -20,12 +20,12 @@ Every rank's window is laid out identically, so an offset is rank-independent.
 
 ## Requirements
 
-The a5 host runtime includes the PTO async-SDMA workspace by default:
+The a5 host runtime includes the async-SDMA workspace by default:
 
 | Gate | Effect |
 | ---- | ------ |
-| `@pytest.mark.platforms(["a5"])` | deselected on any other `--platform` |
-| `@pytest.mark.device_count(2)` | needs two dies |
+| `CASES[*]["platforms"] = ["a5"]` | deselected on any other `--platform` |
+| `CASES[*]["config"]["device_count"] = 2` | needs two dies |
 | `@pytest.mark.skipif(_urma_workspace_enabled())` | skipped when `SIMPLER_ENABLE_PTO_URMA_WORKSPACE` selects the URMA backend |
 
 URMA replaces SDMA in a URMA build. Rebuild without

@@ -54,10 +54,10 @@ was not built in.
 
 | Gate | Effect |
 | ---- | ------ |
-| `@pytest.mark.platforms(["a5"])` | deselected on any other `--platform` |
-| `@pytest.mark.device_count(2)` | needs two dies |
+| `CASES[*]["platforms"] = ["a5"]` | deselected on any other `--platform` |
+| `CASES[*]["config"]["device_count"] = 2` | needs two dies |
 | `@pytest.mark.skipif(not _urma_workspace_enabled())` | skipped unless `SIMPLER_ENABLE_PTO_URMA_WORKSPACE` is one of `1` / `ON` / `TRUE` / `YES` in the environment |
-| `run()` raises | if `platform != "a5"` or the device count is not 2, and re-checks the env var before doing any work |
+| `urma_deferred_completion_orch_fn()` raises | re-checks the env var immediately before allocating the communication domain |
 
 Since the URMA CMake option defaults `OFF`, a stock build skips this test even on a5
 hardware. **A green CI run says nothing about URMA.** Treat it as a manual

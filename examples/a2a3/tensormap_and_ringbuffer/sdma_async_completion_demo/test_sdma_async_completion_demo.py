@@ -7,203 +7,119 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""SDMA deferred completion smoke test for onboard a2a3.
+"""SDMA deferred-completion smoke test for onboard a2a3.
 
-Each rank stages its input inside the HCCL window.  The deferred producer
-TGET_ASYNCs the peer rank's input into local ``out`` and registers the PTO
-AsyncEvent through ``defer_pto_async_event``.  The consumer depends on the
-producer output and writes ``result = out + 1``.  Correct ``out`` and
-``result`` therefore validate both the SDMA completion polling and the
-deferred-release dependency path.
+Each rank stages its input inside the HCCL window. The deferred producer fetches
+the peer rank's input into local ``out`` and registers its async event. The
+consumer depends on that output and writes ``result = out + 1``.
 """
-
-from __future__ import annotations
-
-import argparse
-import os
 
 import pytest
 import torch
-from simpler.task_interface import (
-    ArgDirection,
-    CallConfig,
-    ChipCallable,
-    ChipTensor,
-    CommBufferSpec,
-    CoreCallable,
-    DataType,
-    TaskArgs,
-    TensorArgType,
-)
-from simpler.worker import Worker
+from simpler.task_interface import ArgDirection as D
+from simpler.task_interface import ChipTensor, CommBufferSpec, DataType, TaskArgs, TensorArgType
 
-from simpler_setup.elf_parser import extract_text_section
-from simpler_setup.kernel_compiler import KernelCompiler
-from simpler_setup.pto_isa import ensure_pto_isa_root
+from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
 from simpler_setup.torch_interop import make_tensor_arg
 
-HERE = os.path.dirname(os.path.abspath(__file__))
 N = 128 * 128
+NRANKS = 2
 DTYPE_NBYTES = 4
 
 
-def parse_device_range(spec: str) -> list[int]:
-    if "," in spec:
-        return [int(x) for x in spec.split(",") if x]
-    if "-" in spec:
-        lo, hi = (int(x) for x in spec.split("-"))
-        return list(range(lo, hi + 1))
-    return [int(spec)]
-
-
-def build_chip_callable(platform: str) -> ChipCallable:
-    kc = KernelCompiler(platform=platform)
-    runtime = "tensormap_and_ringbuffer"
-    pto_isa_root = ensure_pto_isa_root()
-    include_dirs = kc.get_orchestration_include_dirs(runtime)
-    extra_includes = list(include_dirs) + [str(kc.project_root / "src" / "common")]
-
-    children = []
-    for func_id, rel in [
-        (0, "kernels/aiv/kernel_sdma_tget_async.cpp"),
-        (1, "kernels/aiv/kernel_consumer.cpp"),
-    ]:
-        kernel = kc.compile_incore(
-            source_path=os.path.join(HERE, rel),
-            core_type="aiv",
-            pto_isa_root=pto_isa_root,
-            extra_include_dirs=extra_includes,
-        )
-        if not platform.endswith("sim"):
-            kernel = extract_text_section(kernel)
-        children.append(
-            (
-                func_id,
-                CoreCallable.build(
-                    signature=[ArgDirection.IN, ArgDirection.OUT, ArgDirection.OUT, ArgDirection.IN],
-                    binary=kernel,
-                ),
-            )
-        )
-
-    orch = kc.compile_orchestration(
-        runtime_name=runtime,
-        source_path=os.path.join(HERE, "kernels/orchestration/sdma_async_completion_orch.cpp"),
-        extra_include_dirs=[str(kc.project_root / "src" / "common")],
-    )
-    return ChipCallable.build(
-        signature=[ArgDirection.IN, ArgDirection.OUT, ArgDirection.OUT, ArgDirection.IN],
-        func_name="sdma_async_completion_orchestration",
-        binary=orch,
-        children=children,
-    )
-
-
-def run(
-    platform: str = "a2a3",
-    device_ids: list[int] | None = None,
-) -> int:
-    if device_ids is None:
-        device_ids = [0, 1]
-    nranks = len(device_ids)
-    if nranks != 2:
-        raise ValueError(f"sdma_async_completion_demo needs exactly 2 devices, got {device_ids}")
-    if platform.endswith("sim"):
-        raise ValueError("sdma_async_completion_demo requires onboard a2a3 hardware")
-
+def sdma_async_completion_orch_fn(orch, callables, task_args, config):
     input_nbytes = N * DTYPE_NBYTES
-    window_size = max(input_nbytes, 4 * 1024)
-
-    # `inputs` must live in shared memory: `orch.copy_to` stages each rank's
-    # data into its HCCL window from the forked chip child, which reads `src`
-    # out of its own address space.
-    inputs = [
-        torch.tensor([float(rank * 1000 + (i % 251)) / 10.0 for i in range(N)], dtype=torch.float32).share_memory_()
-        for rank in range(nranks)
-    ]
-    out = [torch.zeros(N, dtype=torch.float32).share_memory_() for _ in range(nranks)]
-    result = [torch.zeros(N, dtype=torch.float32).share_memory_() for _ in range(nranks)]
-
-    chip_callable = build_chip_callable(platform)
-    worker = Worker(
-        level=3,
-        platform=platform,
-        runtime="tensormap_and_ringbuffer",
-        device_ids=device_ids,
-        num_sub_workers=0,
-        enable_sdma=True,
-    )
-    chip_handle = worker.register(chip_callable)
-    try:
-        worker.init()
-
-        def orch_fn(orch, _args, cfg):
-            with orch.allocate_domain(
-                name="default",
-                workers=list(range(nranks)),
-                window_size=window_size,
-                buffers=[
-                    CommBufferSpec(name="input_window", dtype="float32", count=N, nbytes=input_nbytes),
-                ],
-            ) as handle:
-                # Stage every rank's input window before submitting any kernel:
-                # each producer TGET_ASYNCs the *peer* rank's window, so all
-                # windows must hold real data before execution begins.
-                for rank in range(nranks):
-                    orch.copy_to(
-                        rank,
-                        dst=handle[rank].buffer_ptrs["input_window"],
-                        src=inputs[rank].data_ptr(),
-                        size=input_nbytes,
-                    )
-                for rank in range(nranks):
-                    domain = handle[rank]
-                    args = TaskArgs()
-                    args.add_tensor(
-                        ChipTensor.make(
-                            data=domain.buffer_ptrs["input_window"],
-                            shapes=(N,),
-                            dtype=DataType.FLOAT32,
-                            child_memory=True,
-                        ),
-                        TensorArgType.INPUT,
-                    )
-                    args.add_tensor(make_tensor_arg(out[rank]), TensorArgType.OUTPUT_EXISTING)
-                    args.add_tensor(make_tensor_arg(result[rank]), TensorArgType.OUTPUT_EXISTING)
-                    args.add_scalar(domain.device_ctx)
-                    orch.submit_next_level(chip_handle, args, cfg, worker=rank)
-
-        worker.run(orch_fn, args=None, config=CallConfig())
-
-        ok = True
-        for rank in range(nranks):
-            peer = 1 - rank
-            expected_out = inputs[peer]
-            expected_result = expected_out + 1.0
-            max_out = float(torch.max(torch.abs(out[rank] - expected_out)))
-            max_result = float(torch.max(torch.abs(result[rank] - expected_result)))
-            print(f"[sdma_async_completion_demo] rank {rank}: max_out={max_out:.3e} max_result={max_result:.3e}")
-            ok = ok and max_out <= 1e-3 and max_result <= 1e-3
-        return 0 if ok else 1
-    finally:
-        worker.close()
+    with orch.allocate_domain(
+        name="default",
+        workers=list(range(NRANKS)),
+        window_size=max(input_nbytes, 4 * 1024),
+        buffers=[CommBufferSpec(name="input_window", dtype="float32", count=N, nbytes=input_nbytes)],
+    ) as handle:
+        for rank in range(NRANKS):
+            orch.copy_to(
+                rank,
+                dst=handle[rank].buffer_ptrs["input_window"],
+                src=getattr(task_args, f"in_{rank}").data_ptr(),
+                size=input_nbytes,
+            )
+        for rank in range(NRANKS):
+            domain = handle[rank]
+            args = TaskArgs()
+            args.add_tensor(
+                ChipTensor.make(
+                    data=domain.buffer_ptrs["input_window"],
+                    shapes=(N,),
+                    dtype=DataType.FLOAT32,
+                    child_memory=True,
+                ),
+                TensorArgType.INPUT,
+            )
+            args.add_tensor(make_tensor_arg(getattr(task_args, f"out_{rank}")), TensorArgType.OUTPUT_EXISTING)
+            args.add_tensor(make_tensor_arg(getattr(task_args, f"result_{rank}")), TensorArgType.OUTPUT_EXISTING)
+            args.add_scalar(domain.device_ctx)
+            orch.submit_next_level(callables.sdma_async_completion, args, config, worker=rank)
 
 
 @pytest.mark.sdma
-@pytest.mark.platforms(["a2a3"])
-@pytest.mark.runtime("tensormap_and_ringbuffer")
-@pytest.mark.device_count(2)
-def test_sdma_async_completion_demo(st_device_ids, st_platform) -> None:
-    assert run(st_platform, [int(d) for d in st_device_ids]) == 0
+@scene_test(level=3, runtime="tensormap_and_ringbuffer")
+class TestSdmaAsyncCompletionDemo(SceneTestCase):
+    CALLABLE = {
+        "orchestration": sdma_async_completion_orch_fn,
+        "callables": [
+            {
+                "name": "sdma_async_completion",
+                "orchestration": {
+                    "source": "kernels/orchestration/sdma_async_completion_orch.cpp",
+                    "function_name": "sdma_async_completion_orchestration",
+                    "signature": [D.IN, D.OUT, D.OUT, D.IN],
+                },
+                "incores": [
+                    {
+                        "func_id": func_id,
+                        "source": source,
+                        "core_type": "aiv",
+                        "signature": [D.IN, D.OUT, D.OUT, D.IN],
+                    }
+                    for func_id, source in enumerate(
+                        [
+                            "kernels/aiv/kernel_sdma_tget_async.cpp",
+                            "kernels/aiv/kernel_consumer.cpp",
+                        ]
+                    )
+                ],
+            }
+        ],
+    }
+    CASES = [
+        {
+            "name": "peer_fetch",
+            "platforms": ["a2a3"],
+            "config": {"device_count": NRANKS, "num_sub_workers": 0},
+            "params": {},
+        }
+    ]
+    RTOL = 0.0
+    ATOL = 1e-3
 
+    def generate_args(self, params):
+        specs = []
+        for rank in range(NRANKS):
+            inp = torch.tensor([float(rank * 1000 + (i % 251)) / 10.0 for i in range(N)], dtype=torch.float32)
+            specs.extend(
+                [
+                    Tensor(f"in_{rank}", inp),
+                    Tensor(f"out_{rank}", torch.zeros(N, dtype=torch.float32)),
+                    Tensor(f"result_{rank}", torch.zeros(N, dtype=torch.float32)),
+                ]
+            )
+        return TaskArgsBuilder(*specs)
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", default="a2a3")
-    parser.add_argument("-d", "--device", default="0-1")
-    args = parser.parse_args()
-    return run(args.platform, parse_device_range(args.device))
+    def compute_golden(self, args, params):
+        for rank in range(NRANKS):
+            expected_out = getattr(args, f"in_{1 - rank}")
+            getattr(args, f"out_{rank}").copy_(expected_out)
+            getattr(args, f"result_{rank}").copy_(expected_out + 1.0)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    SceneTestCase.run_module(__name__)
