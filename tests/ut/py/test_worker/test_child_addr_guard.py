@@ -529,9 +529,14 @@ class TestProvenanceTransactions:
             o.free(0, 0x1000)
 
     def test_free_holds_lock_across_native_free(self):
-        # Deterministic mutual-exclusion check: the native free runs while
-        # _child_prov_lock is held, so a concurrent free/copy/dispatch cannot
-        # interleave with a half-completed free.
+        # Deterministic mutual-exclusion check, now per worker: the native free
+        # runs while *that worker's* lock is held, so a concurrent free / copy /
+        # dispatch on the same worker still cannot interleave with a
+        # half-completed free. `_child_prov_lock` is released before the native
+        # call so other chips are not blocked behind it, which is safe because
+        # provenance is keyed by (worker_id, ptr) and the revoke commits first:
+        # a concurrent dispatch reads the table under `_child_prov_lock` and
+        # finds this address already gone, or is about a different chip.
         w = _l3()
         fake = MagicMock()
         fake.malloc.return_value = 0x1000
@@ -540,14 +545,22 @@ class TestProvenanceTransactions:
         held = {}
 
         def _sf(wid, p):
-            acquired = w._child_prov_lock.acquire(blocking=False)
-            held["locked_during_native"] = not acquired
-            if acquired:
+            worker_lock = w._child_prov_worker_lock(0)
+            acquired_worker = worker_lock.acquire(blocking=False)
+            held["worker_locked_during_native"] = not acquired_worker
+            if acquired_worker:
+                worker_lock.release()
+            acquired_prov = w._child_prov_lock.acquire(blocking=False)
+            held["prov_locked_during_native"] = not acquired_prov
+            if acquired_prov:
                 w._child_prov_lock.release()
+            held["revoked_before_native"] = (0, 0x1000) not in w._child_alloc_prov
 
         fake.free.side_effect = _sf
         o.free(0, 0x1000)
-        assert held["locked_during_native"] is True
+        assert held["worker_locked_during_native"] is True
+        assert held["prov_locked_during_native"] is False
+        assert held["revoked_before_native"] is True
 
     def test_capture_refs_after_provenance_analysis(self, _fake_handle, monkeypatch):
         # blocker: the kind4 provenance analysis must run BEFORE remote slot refs
