@@ -2446,6 +2446,23 @@ class TestRunHandle:
         assert not worker._accepted_run_handles
         assert worker._ordered_cleanup_error is None
 
+    def test_graph_failure_still_emits_graph_build_span(self, monkeypatch):
+        worker, _events = self._submission_failure_worker(failures=0)
+        emitted = []
+        timestamps = iter((100, 275))
+        worker._host_trace_enabled = True
+        monkeypatch.setattr(worker_mod, "HOST_STRACE_ENABLED", True)
+        monkeypatch.setattr(worker_mod.time, "monotonic_ns", lambda: next(timestamps))
+        monkeypatch.setattr(worker_mod, "_emit_host_span", lambda *args: emitted.append(args))
+
+        def bad_graph(*_args):
+            raise ValueError("bad graph")
+
+        with pytest.raises(ValueError, match="bad graph"):
+            worker._submit_l3_locked(bad_graph, None, cast(Any, object()))
+
+        assert emitted == [("l3.graph_build", 1, 0, 0, 100, 175, "run_id=1 role=facade")]
+
     def test_unsettled_graph_cancellation_abandons_the_handle_before_close(self):
         worker, events = self._submission_failure_worker(failures=2)
         graph_error = ValueError("bad graph")

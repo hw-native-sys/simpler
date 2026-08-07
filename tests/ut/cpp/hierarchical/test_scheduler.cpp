@@ -37,6 +37,8 @@
 #include <vector>
 
 #include "call_config.h"
+#include "common/host_span.h"
+#include "host_trace.h"
 #include "orchestrator.h"
 #include "ring.h"
 #include "scheduler.h"
@@ -45,6 +47,30 @@
 #include "types.h"
 #include "worker_manager.h"
 #include "task_args.h"
+
+namespace {
+
+std::mutex captured_host_spans_mu;
+std::vector<std::string> captured_host_span_names;
+
+void reset_captured_host_spans() {
+    std::lock_guard<std::mutex> lk(captured_host_spans_mu);
+    captured_host_span_names.clear();
+}
+
+bool captured_host_span(const std::string &name) {
+    std::lock_guard<std::mutex> lk(captured_host_spans_mu);
+    return std::find(captured_host_span_names.begin(), captured_host_span_names.end(), name) !=
+           captured_host_span_names.end();
+}
+
+}  // namespace
+
+extern "C" void simpler_log_emit_host_span(const SimplerHostSpan *span) {
+    if (span == nullptr || span->name == nullptr) return;
+    std::lock_guard<std::mutex> lk(captured_host_spans_mu);
+    captured_host_span_names.emplace_back(span->name);
+}
 
 // ---------------------------------------------------------------------------
 // MockMailboxWorker: in-process stand-in for the forked Python child loop.
@@ -932,6 +958,48 @@ TEST(WorkerManagerTest, IdleCallbackFollowsTheLanePublicationOnBlockingEndpoints
     allocator.shutdown();
 }
 
+TEST(WorkerManagerTest, SingleFramePathEmitsFrameAndCompletionSpans) {
+    ASSERT_TRUE(simpler::host_trace::bind_process_sink());
+    reset_captured_host_spans();
+
+    Ring allocator;
+    allocator.init(/*heap_bytes=*/0);
+    TaskSlot slot = make_progress_slot(allocator, /*run_id=*/73, /*pipeline_slot=*/0, /*generation=*/1);
+    ASSERT_NE(slot, INVALID_SLOT);
+
+    MockMailboxWorker child;
+    child.start();
+    WorkerThread worker;
+    std::mutex completion_mu;
+    std::condition_variable completion_cv;
+    bool completed = false;
+    worker.start(
+        &allocator,
+        [&](WorkerCompletion) {
+            std::lock_guard<std::mutex> lk(completion_mu);
+            completed = true;
+            completion_cv.notify_all();
+        },
+        [](WorkerDispatch) {}, {}, std::make_unique<LocalMailboxEndpoint>(0, child.mailbox_ptr())
+    );
+
+    worker.dispatch(WorkerDispatch{slot, 0});
+    child.wait_running();
+    EXPECT_TRUE(child.is_running.load(std::memory_order_acquire));
+    child.complete();
+    {
+        std::unique_lock<std::mutex> lk(completion_mu);
+        EXPECT_TRUE(completion_cv.wait_for(lk, std::chrono::seconds(3), [&] {
+            return completed;
+        }));
+    }
+
+    worker.stop();
+    EXPECT_TRUE(captured_host_span("l3.frame_submit"));
+    EXPECT_TRUE(captured_host_span("l3.complete"));
+    allocator.shutdown();
+}
+
 TEST(WorkerManagerTest, IdleCallbackFollowsTheLanePublicationOnProgressEndpoints) {
     Ring allocator;
     allocator.init(/*heap_bytes=*/0);
@@ -1136,6 +1204,9 @@ TEST(WorkerManagerTest, AdmissionRejectionsCompleteClaimedDispatchesWithoutThrow
 }
 
 TEST(WorkerManagerTest, TwoFrameLeaseSlotsDoNotDefineFifoOrAcceptance) {
+    ASSERT_TRUE(simpler::host_trace::bind_process_sink());
+    reset_captured_host_spans();
+
     alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
     Ring allocator;
     allocator.init(/*heap_bytes=*/0);
@@ -1174,6 +1245,8 @@ TEST(WorkerManagerTest, TwoFrameLeaseSlotsDoNotDefineFifoOrAcceptance) {
     ASSERT_TRUE(endpoint.poll_progress(progress));
     EXPECT_EQ(progress.kind, WorkerProgressKind::ACCEPTED);
     EXPECT_EQ(progress.dispatch.dispatch_id, 42u);
+    EXPECT_TRUE(captured_host_span("l3.frame_submit"));
+    EXPECT_TRUE(captured_host_span("l3.activate"));
     allocator.shutdown();
 }
 

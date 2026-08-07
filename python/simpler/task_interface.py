@@ -1086,6 +1086,24 @@ def _preload_global(path: str) -> ctypes.CDLL:
     return handle
 
 
+def _initialize_simpler_log(bins: Any, log_level: int | None = None) -> ctypes.CDLL:
+    """Load and seed the process-global logger before runtime use or fork."""
+    if log_level is None:
+        from . import _log  # noqa: PLC0415
+
+        log_level = _log.get_current_config()
+    if not bins.simpler_log_path:
+        raise ValueError("ChipWorker.init: bins.simpler_log_path is required")
+
+    log_handle = _preload_global(str(bins.simpler_log_path))
+    log_handle.simpler_log_init.argtypes = [ctypes.c_int]
+    log_handle.simpler_log_init.restype = ctypes.c_int
+    rc = log_handle.simpler_log_init(int(log_level))
+    if rc != 0:
+        raise RuntimeError(f"simpler_log_init failed with code {rc}")
+    return log_handle
+
+
 class ChipWorker:
     """Unified execution interface wrapping the host runtime C API.
 
@@ -1166,20 +1184,8 @@ class ChipWorker:
             self._init_in_progress = True
 
         try:
-            if log_level is None:
-                from . import _log  # noqa: PLC0415
-
-                log_level = _log.get_current_config()
-
             # 1. libsimpler_log.so — RTLD_GLOBAL singleton, before host_runtime.so.
-            if not bins.simpler_log_path:
-                raise ValueError("ChipWorker.init: bins.simpler_log_path is required")
-            log_handle = _preload_global(str(bins.simpler_log_path))
-            log_handle.simpler_log_init.argtypes = [ctypes.c_int]
-            log_handle.simpler_log_init.restype = ctypes.c_int
-            rc = log_handle.simpler_log_init(int(log_level))
-            if rc != 0:
-                raise RuntimeError(f"simpler_log_init failed with code {rc}")
+            _initialize_simpler_log(bins, log_level)
 
             # 2. libcpu_sim_context.so — sim platforms only.
             if bins.sim_context_path:

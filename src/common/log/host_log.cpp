@@ -26,6 +26,12 @@
 
 #include <unistd.h>
 
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
+
+#include "common/host_span.h"
+
 using simpler::log::LogLevel;
 
 namespace {
@@ -86,6 +92,14 @@ void write_stderr(const char *record, size_t size) {
             break;
         }
     }
+}
+
+long host_trace_tid() {
+#if defined(__linux__) && defined(SYS_gettid)
+    return static_cast<long>(syscall(SYS_gettid));
+#else
+    return static_cast<long>(getpid());
+#endif
 }
 
 }  // namespace
@@ -204,4 +218,19 @@ extern "C" int simpler_log_init(int log_level) {
     }
     HostLogger::get_instance().set_level(static_cast<LogLevel>(log_level));
     return 0;
+}
+
+extern "C" void simpler_log_emit_host_span(const SimplerHostSpan *span) {
+    if (span == nullptr || span->abi_version != SIMPLER_HOST_SPAN_ABI_VERSION ||
+        span->struct_size < sizeof(SimplerHostSpan) || span->name == nullptr) {
+        return;
+    }
+    HostLogger::get_instance().log(
+        LogLevel::TIMING, "emit_host_span",
+        "[STRACE] v=1 pid=%d tid=%ld inv=%llu hid=%llx depth=%d name=%s ts=%lld dur=%lld %s",
+        static_cast<int>(getpid()), host_trace_tid(), static_cast<unsigned long long>(span->invocation_id),
+        static_cast<unsigned long long>(span->callable_hash), span->depth, span->name,
+        static_cast<long long>(span->timestamp_ns), static_cast<long long>(span->duration_ns),
+        span->attributes == nullptr ? "" : span->attributes
+    );
 }

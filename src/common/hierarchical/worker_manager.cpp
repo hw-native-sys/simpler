@@ -22,12 +22,14 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
+#include "host_trace.h"
 #include "ring.h"
 
 namespace {
@@ -54,6 +56,43 @@ std::string format_digest(const uint8_t *digest) {
     }
     return out;
 }
+
+#if SIMPLER_HOST_STRACE
+const char *endpoint_kind_name(WorkerEndpointKind kind) {
+    switch (kind) {
+    case WorkerEndpointKind::LOCAL_MAILBOX:
+        return "local_mailbox";
+    case WorkerEndpointKind::REMOTE_L3:
+        return "remote_l3";
+    }
+    return "unknown";
+}
+
+RunId trace_run_id(Ring *ring, TaskSlot task_slot) {
+    if (ring == nullptr) return INVALID_RUN_ID;
+    TaskSlotState *state = ring->slot_state(task_slot);
+    return state == nullptr ? INVALID_RUN_ID : state->run_id;
+}
+
+uint64_t trace_callable_hash(Ring *ring, TaskSlot task_slot) {
+    if (ring == nullptr) return 0;
+    TaskSlotState *state = ring->slot_state(task_slot);
+    if (state == nullptr) return 0;
+    uint64_t hash = 0;
+    std::memcpy(&hash, state->callable.digest.data(), sizeof(hash));
+    return hash;
+}
+
+std::string
+trace_dispatch_attrs(Ring *ring, const WorkerDispatch &dispatch, const WorkerEndpointCaps &caps, const char *role) {
+    std::ostringstream attrs;
+    attrs << "run_id=" << trace_run_id(ring, dispatch.task_slot) << " task_slot=" << dispatch.task_slot
+          << " group_index=" << dispatch.group_index << " worker_id=" << caps.worker_id
+          << " dispatch_id=" << dispatch.dispatch_id << " endpoint_kind=" << endpoint_kind_name(caps.kind)
+          << " prepare_only=" << static_cast<int>(dispatch.prepare_only) << " role=" << role;
+    return attrs.str();
+}
+#endif
 
 // Wall-clock period between child liveness samples. Every mailbox wait spins,
 // so an iteration count would not map to a bounded wall time.
@@ -391,7 +430,10 @@ void WorkerThread::dispatch_prepared(WorkerDispatch d) {
 }
 
 WorkerThread::EnqueueDispatchResult WorkerThread::enqueue_dispatch(WorkerDispatch d, RunId staged_run_id) {
-    std::lock_guard<std::mutex> lk(mu_);
+#if SIMPLER_HOST_STRACE
+    const int64_t trace_start_ns = simpler::host_trace::now_ns();
+#endif
+    std::unique_lock<std::mutex> lk(mu_);
     if (shutdown_.load(std::memory_order_acquire)) {
         return EnqueueDispatchResult::STOPPING;
     }
@@ -421,6 +463,16 @@ WorkerThread::EnqueueDispatchResult WorkerThread::enqueue_dispatch(WorkerDispatc
     ++next_dispatch_id_;
     inflight_.fetch_add(1, std::memory_order_release);
     cv_.notify_one();
+    lk.unlock();
+#if SIMPLER_HOST_STRACE
+    const int64_t trace_end_ns = simpler::host_trace::now_ns();
+    const RunId run_id = trace_run_id(ring_, d.task_slot);
+    const std::string attrs = trace_dispatch_attrs(ring_, d, endpoint_->caps(), "scheduler");
+    simpler::host_trace::emit(
+        "l3.dispatch", run_id, trace_callable_hash(ring_, d.task_slot), 0, trace_start_ns,
+        trace_end_ns - trace_start_ns, attrs.c_str()
+    );
+#endif
     return EnqueueDispatchResult::QUEUED;
 }
 
@@ -627,6 +679,15 @@ void WorkerThread::loop() {
             }
         }
 
+#if SIMPLER_HOST_STRACE
+        const RunId trace_run = trace_run_id(ring_, d.task_slot);
+        std::string complete_attrs = trace_dispatch_attrs(ring_, d, endpoint_->caps(), "worker");
+        complete_attrs += " outcome=" + std::to_string(static_cast<int32_t>(completion.outcome));
+        simpler::host_trace::SpanScope complete_trace(
+            "l3.complete", trace_run, trace_callable_hash(ring_, d.task_slot), 0, std::move(complete_attrs)
+        );
+#endif
+
         // on_complete_ runs before the lane state is published so a stopping
         // scheduler cannot read this worker as no longer busy while its final
         // completion is still unqueued. That leaves the reverse window — the
@@ -660,6 +721,15 @@ void WorkerThread::finish_progress_dispatch(const WorkerEndpointProgress &progre
         }
         return;
     }
+
+#if SIMPLER_HOST_STRACE
+    const RunId trace_run = trace_run_id(ring_, dispatch.task_slot);
+    std::string complete_attrs = trace_dispatch_attrs(ring_, dispatch, endpoint_->caps(), "worker");
+    complete_attrs += " outcome=" + std::to_string(static_cast<int32_t>(progress.completion.outcome));
+    simpler::host_trace::SpanScope complete_trace(
+        "l3.complete", trace_run, trace_callable_hash(ring_, dispatch.task_slot), 0, std::move(complete_attrs)
+    );
+#endif
 
     WorkerCompletion completion = progress.completion;
     if (accepted_dispatch_ids_.erase(dispatch.dispatch_id) == 0) {
@@ -743,6 +813,12 @@ WorkerCompletion LocalMailboxEndpoint::run_with_accept(
     WorkerCompletion completion;
     completion.task_slot = dispatch.task_slot;
     completion.group_index = group_index;
+#if SIMPLER_HOST_STRACE
+    const RunId trace_run = s.run_id;
+    const uint64_t trace_hash = trace_callable_hash(ring, dispatch.task_slot);
+    const std::string trace_attrs = trace_dispatch_attrs(ring, dispatch, caps_, "worker");
+    const int64_t frame_submit_start_ns = simpler::host_trace::now_ns();
+#endif
     // Hold mailbox_mu_ for the entire round trip (write payload + state +
     // spin-poll TASK_DONE + reset to IDLE). Any control_* request from the
     // orch thread waits for the dispatch to finish before claiming the
@@ -803,6 +879,13 @@ WorkerCompletion LocalMailboxEndpoint::run_with_accept(
 
     // Signal child process.
     write_mailbox_state(MailboxState::TASK_READY);
+#if SIMPLER_HOST_STRACE
+    const int64_t frame_submit_end_ns = simpler::host_trace::now_ns();
+    simpler::host_trace::emit(
+        "l3.frame_submit", trace_run, trace_hash, 0, frame_submit_start_ns, frame_submit_end_ns - frame_submit_start_ns,
+        trace_attrs.c_str()
+    );
+#endif
 
     // Spin-poll until child signals TASK_DONE, observing the sticky launch ACK
     // on the way. The task's latency runs through this wait, so it never sleeps
@@ -877,6 +960,13 @@ void LocalMailboxEndpoint::submit_progress(Ring *ring, const WorkerDispatch &dis
             std::to_string(MAILBOX_ARGS_CAPACITY)
         );
     }
+
+#if SIMPLER_HOST_STRACE
+    simpler::host_trace::SpanScope frame_submit_trace(
+        "l3.frame_submit", state.run_id, trace_callable_hash(ring, dispatch.task_slot), 0,
+        trace_dispatch_attrs(ring, dispatch, caps_, "worker")
+    );
+#endif
 
     const size_t frame_index = state.pipeline_lease.slot_id;
     // Linearize task-frame publication against base-frame controls. The
@@ -1117,14 +1207,24 @@ bool LocalMailboxEndpoint::poll_progress(WorkerEndpointProgress &progress) {
 }
 
 bool LocalMailboxEndpoint::activate_progress(RunId run_id) {
-    std::lock_guard<std::mutex> lk(progress_mu_);
+    std::unique_lock<std::mutex> lk(progress_mu_);
     if (endpoint_poisoned_) return false;
     for (size_t index = 0; index < task_frame_count_; ++index) {
         FrameRecord &record = frames_[index];
         if (!record.occupied || !record.dispatch.prepare_only || record.run_id != run_id) continue;
+#if SIMPLER_HOST_STRACE
+        std::ostringstream activate_attrs;
+        activate_attrs << "run_id=" << run_id << " task_slot=" << record.dispatch.task_slot
+                       << " group_index=" << record.dispatch.group_index << " worker_id=" << caps_.worker_id
+                       << " dispatch_id=" << record.dispatch.dispatch_id
+                       << " endpoint_kind=" << endpoint_kind_name(caps_.kind)
+                       << " prepare_only=" << static_cast<int>(record.dispatch.prepare_only) << " role=worker";
+        simpler::host_trace::SpanScope activate_trace("l3.activate", run_id, 0, 0, activate_attrs.str());
+#endif
         record.activation_requested = true;
         char *frame = task_frame(index);
         (void)try_publish_activation(record, frame);
+        lk.unlock();
         return true;
     }
     return false;

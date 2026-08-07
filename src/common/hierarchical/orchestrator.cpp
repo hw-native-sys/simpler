@@ -14,10 +14,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <limits>
+#include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_set>
 
+#include "host_trace.h"
 #include "worker_manager.h"
 
 void Orchestrator::init(
@@ -751,6 +755,20 @@ SubmitResult Orchestrator::submit_impl(
         throw std::runtime_error("Orchestrator: allocator shutdown");
     }
     TaskSlot slot = ar.slot;
+
+#if SIMPLER_HOST_STRACE
+    std::optional<simpler::host_trace::SpanScope> submit_trace;
+    if (worker_type == WorkerType::NEXT_LEVEL) {
+        uint64_t trace_callable_hash = 0;
+        std::memcpy(&trace_callable_hash, callable.digest.data(), sizeof(trace_callable_hash));
+        std::ostringstream trace_attrs;
+        trace_attrs << "run_id=" << run->id << " task_slot=" << slot
+                    << " group_index=" << (args_list.size() == 1 ? 0 : -1) << " group_size=" << args_list.size();
+        if (target_worker_ids.size() == 1) trace_attrs << " worker_id=" << target_worker_ids.front();
+        trace_attrs << " role=facade";
+        submit_trace.emplace("l3.submit", run->id, trace_callable_hash, 0, trace_attrs.str());
+    }
+#endif
 
     TaskSlotState &s = slot_state(slot);
     s.reset();
