@@ -4166,6 +4166,11 @@ class Worker:
 
         # Level-2 internals
         self._chip_worker: ChipWorker | None = None
+        # Live direct-chip runs by the run id their RunHandle carries. The lane
+        # is the admission authority and holds its own FIFO; this only maps a
+        # handle back to its run so waiting and finalization can find it.
+        self._chip_runs: dict[int, Any] = {}
+        self._chip_run_seq: int = 0
 
         # Level-3+ internals
         self._worker: _Worker | None = None
@@ -9705,8 +9710,7 @@ class Worker:
         if self.level == 2:
             assert self._chip_worker is not None
             state = self._resolve_handle(callable, expected_namespace="LOCAL_CHIP")
-            self._run_l2_materialized(state.slot_id, args, cfg)
-            return RunHandle._completed(self)
+            return self._submit_l2_locked(state.slot_id, args, cfg)
 
         with self._submit_mu:
             # Graph callbacks stay serialized, so a predecessor's callback has
@@ -9900,6 +9904,29 @@ class Worker:
                     return handle
         return None
 
+    def _submit_l2_locked(self, callable_id: int, args, cfg: CallConfig) -> RunHandle:
+        """Admit one direct-chip run and return a handle to it while it runs.
+
+        The lane is the sole admission authority and takes runs at capacity one:
+        submitting drains the predecessor first, so a second submit blocks here
+        rather than overlapping device work. What the handle adds is that the
+        *first* submit no longer waits — the caller owns the completion fence
+        through :meth:`RunHandle.wait`.
+        """
+        assert self._chip_worker is not None
+        chip_args = self._materialize_l2_args(args)
+        chip_run = self._chip_worker._impl._submit_chip_run_direct(callable_id, chip_args, cfg)
+        self._chip_run_seq += 1
+        run_id = self._chip_run_seq
+        self._chip_runs[run_id] = chip_run
+        # chip_args is kept alive by the handle: the lane copies the args into
+        # its own storage, but the keepalive also pins the buffers the resolved
+        # descriptors point at for as long as the run can still read them.
+        return RunHandle(self, run_id, (callable_id, args, cfg, chip_args))
+
+    def _chip_run_for(self, run_id: int) -> Any | None:
+        return self._chip_runs.get(run_id)
+
     def _submit_l3_locked(self, callable, args, cfg: CallConfig) -> RunHandle:
         assert self._orch is not None
         assert self._worker is not None
@@ -9957,10 +9984,18 @@ class Worker:
         return handle
 
     def _run_handle_done(self, run_id: int) -> bool:
+        chip_run = self._chip_run_for(run_id)
+        if chip_run is not None:
+            return chip_run.done()
         assert self._orch is not None
         return self._orch._run_done(run_id)
 
     def _wait_run_handle(self, run_id: int, timeout: float | None) -> bool:
+        chip_run = self._chip_run_for(run_id)
+        if chip_run is not None:
+            # Negative means "no deadline" to the binding, which then blocks on
+            # the device instead of polling.
+            return chip_run.wait(-1.0 if timeout is None else max(0.0, timeout))
         assert self._orch is not None
         if timeout is None:
             self._orch._wait_run(run_id)
@@ -9980,6 +10015,16 @@ class Worker:
         _after_step: Any | None = None,
     ) -> BaseException | None:
         """Run fence-owned cleanup exactly once and return the cached result."""
+        # A direct-chip run owns no orchestration state: the lane finalized the
+        # native run as part of reaching terminal, and this worker built no
+        # domains, remote slots or chip regions for it. Retiring the lane entry
+        # is the whole of its cleanup, so it never enters the cursor below —
+        # driving those steps here would report a cleanup failure for state that
+        # was never created.
+        if run_id in self._chip_runs:
+            del self._chip_runs[run_id]
+            return native_error
+
         # Two different failures, deliberately not merged. A task that failed is
         # this run's business and says nothing about the worker; a cleanup that
         # failed leaves collective device state nobody can describe, and poisons
@@ -10081,8 +10126,8 @@ class Worker:
         # the reason the worker is now shut.
         return handle._finalization_error
 
-    def _run_l2_materialized(self, callable_id: int, args, cfg) -> None:
-        """Materialize an L2 leaf's tensor args to a chip-POD blob in-process and run the kernel.
+    def _materialize_l2_args(self, args) -> Any:
+        """Resolve an L2 leaf's tensor args to a chip-POD blob in this process.
 
         The user builds args as ``TaskArgs`` (``Tensor``) at every level; an L2 leaf is the consumer of
         its own args, so it does exactly what a chip child does — resolve each ref's embedded descriptor
@@ -10102,7 +10147,11 @@ class Worker:
         if args is None:
             args = TaskArgs()
         resolved = registry.materialize_args(args)
-        chip_args = materialize_task_args(args, resolved)
+        return materialize_task_args(args, resolved)
+
+    def _run_l2_materialized(self, callable_id: int, args, cfg) -> None:
+        """Materialize an L2 leaf's tensor args and run the kernel to completion."""
+        chip_args = self._materialize_l2_args(args)
         assert self._chip_worker is not None
         self._chip_worker._impl.run_materialized(callable_id, chip_args, cfg)
 
@@ -10693,6 +10742,27 @@ class Worker:
 
             def _finalize_chip() -> None:
                 if self._chip_worker:
+                    # Close the lane before finalizing the worker: a handle the
+                    # caller never waited on still owns device work, and the
+                    # lane drains it here while the device is still up.
+                    #
+                    # The lane rethrows its poison on close. Whether that is
+                    # news depends on who has already seen it: waiting on a
+                    # handle delivers the run's error and retires its entry, so
+                    # a remaining entry is a run whose failure nobody has been
+                    # told about, and only then is close the first report. With
+                    # every run waited, the poison is the error those waits
+                    # already raised, and re-raising it here would turn a
+                    # handled run failure into an unhandled close failure.
+                    impl = getattr(self._chip_worker, "_impl", None)
+                    if impl is not None:
+                        undelivered = bool(self._chip_runs)
+                        try:
+                            impl._close_chip_run_lane()
+                        except Exception:
+                            if undelivered:
+                                raise
+                    self._chip_runs.clear()
                     self._chip_worker.finalize()
                     self._chip_worker = None
 

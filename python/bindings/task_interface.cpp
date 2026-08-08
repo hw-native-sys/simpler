@@ -2023,6 +2023,19 @@ NB_MODULE(_task_interface, m) {
         .def_prop_ro("lane_poisoned", &ChipRun::lane_poisoned)
         .def_prop_ro("preparation_disposition", &ChipRun::preparation_disposition)
         .def(
+            "wait",
+            [](ChipRun &self, double timeout) {
+                if (timeout < 0) return self.wait_until(ChipRun::Deadline::max());
+                return self.wait_until(
+                    ChipRun::Clock::now() +
+                    std::chrono::duration_cast<ChipRun::Clock::duration>(std::chrono::duration<double>(timeout))
+                );
+            },
+            nb::arg("timeout") = -1.0, nb::call_guard<nb::gil_scoped_release>(),
+            "Wait for this run's completion fence. A negative timeout waits without a deadline and blocks on the "
+            "device rather than polling. Returns whether the run reached terminal; raises the run's error."
+        )
+        .def(
             "_raise_if_failed",
             [](ChipRun &self) {
                 if (!self.done()) throw std::logic_error("ChipRun is not terminal");
@@ -2133,6 +2146,15 @@ NB_MODULE(_task_interface, m) {
         .def(
             "_close_chip_run_lane", &ChipWorker::close_chip_run_lane, nb::call_guard<nb::gil_scoped_release>(),
             "Drain active native ownership, abandon unlaunched work, and close the chip run lane."
+        )
+        .def(
+            "_submit_chip_run_direct",
+            [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config) {
+                return self.submit_chip_run(callable_id, args, config);
+            },
+            nb::arg("callable_id"), nb::arg("args"), nb::arg("config"), nb::call_guard<nb::gil_scoped_release>(),
+            "Submit materialized task args to the chip native-run lane without a pipeline lease and return the live "
+            "run. The lane admits at capacity one: this call drains its predecessor before admitting."
         )
         .def(
             "_prepare_native_run_materialized",
