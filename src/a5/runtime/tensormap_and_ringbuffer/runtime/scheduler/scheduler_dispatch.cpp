@@ -41,6 +41,22 @@ namespace {
 inline constexpr int32_t PTO2_DEFERRED_RELEASE_CAP = 256;
 }
 
+void SchedulerContext::flush_deferred_releases(
+    [[maybe_unused]] int32_t thread_idx, PTO2TaskSlotState *deferred_release_slot_states[],
+    int32_t &deferred_release_count
+) {
+    // Keep phase emission at the no-progress call site below, matching A2/A3.
+    // Capacity and final-cleanup flushes may run inside Complete/Dummy spans
+    // and intentionally do not create nested Release bars.
+    while (deferred_release_count > 0) {
+#if SIMPLER_SCHED_PROFILING
+        (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
+#else
+        sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
+#endif
+    }
+}
+
 // AICore materializes args[] from src_payload on the gated path using these
 // offsets; pin them against the live PTO2TaskPayload layout.
 static_assert(offsetof(PTO2TaskPayload, tensor_count) == PTO2_TASKPAYLOAD_TENSOR_COUNT_OFFSET);
@@ -1014,7 +1030,20 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         // Phase 2 drain check
         if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
+#if SIMPLER_DFX
+            uint64_t drain_t0 = (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
+            uint64_t drain_stage_wall = 0;
+            int32_t drain_staged_blocks = 0;
+            handle_drain_mode(thread_idx, &drain_stage_wall, &drain_staged_blocks);
+            if (drain_t0 != 0 && drain_stage_wall != 0) {
+                chip_swimlane_aicpu_record_sched_phase(
+                    thread_idx, ChipSwimlaneSchedPhaseKind::Drain, drain_t0, get_sys_cnt_aicpu(),
+                    chip_swimlane.sched_loop_count, static_cast<uint32_t>(drain_staged_blocks)
+                );
+            }
+#else
             handle_drain_mode(thread_idx);
+#endif
             continue;
         }
 
@@ -1042,12 +1071,21 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                     (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
 #endif
 #if SIMPLER_SCHED_PROFILING
-                sched_->on_task_complete(dummy_slot, thread_idx);
+                [[maybe_unused]] uint32_t consumers_resolved =
+                    sched_->on_task_complete(dummy_slot, thread_idx).fanout_edges;
 #else
-                sched_->on_task_complete(dummy_slot);
+                [[maybe_unused]] uint32_t consumers_resolved = sched_->on_task_complete(dummy_slot);
 #endif
 #if SIMPLER_DFX
                 if (dummy_resolve_t0 != 0) {
+                    uint64_t resolve_t1 = get_sys_cnt_aicpu();
+                    constexpr uint64_t RESOLVE_EMIT_MIN_CYCLES = PLATFORM_PROF_SYS_CNT_FREQ / 1'000'000;
+                    if (resolve_t1 - dummy_resolve_t0 >= RESOLVE_EMIT_MIN_CYCLES) {
+                        chip_swimlane_aicpu_record_sched_phase(
+                            thread_idx, ChipSwimlaneSchedPhaseKind::Resolve, dummy_resolve_t0, resolve_t1,
+                            chip_swimlane.sched_loop_count, consumers_resolved
+                        );
+                    }
                     if (dummy_slot.task_attrs.has_predicate()) {
                         chip_swimlane_aicpu_record_predicated_skip(
                             thread_idx, dummy_resolve_t0, sched_chip_swimlane_[thread_idx].sched_loop_count,
@@ -1066,15 +1104,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 // reach CONSUMED once all consumers drain.
                 deferred_release_slot_states[deferred_release_count++] = &dummy_slot;
                 if (deferred_release_count >= PTO2_DEFERRED_RELEASE_CAP) {
-                    while (deferred_release_count > 0) {
-#if SIMPLER_SCHED_PROFILING
-                        (void)sched_->on_task_release(
-                            *deferred_release_slot_states[--deferred_release_count], thread_idx
-                        );
-#else
-                        sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
-#endif
-                    }
+                    flush_deferred_releases(thread_idx, deferred_release_slot_states, deferred_release_count);
                 }
                 int32_t prev = completed_tasks_.fetch_add(1, std::memory_order_relaxed);
                 last_progress_count = prev + 1;
@@ -1172,13 +1202,22 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             idle_iterations = 0;
             last_progress_ts = get_sys_cnt_aicpu();
         } else {
-            while (deferred_release_count > 0) {
-#if SIMPLER_SCHED_PROFILING
-                (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
-#else
-                sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
+#if SIMPLER_DFX
+            uint64_t release_t0 =
+                (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES && deferred_release_count > 0) ?
+                    get_sys_cnt_aicpu() :
+                    0;
+            uint32_t released_count = static_cast<uint32_t>(deferred_release_count);
 #endif
+            flush_deferred_releases(thread_idx, deferred_release_slot_states, deferred_release_count);
+#if SIMPLER_DFX
+            if (release_t0 != 0) {
+                chip_swimlane_aicpu_record_sched_phase(
+                    thread_idx, ChipSwimlaneSchedPhaseKind::Release, release_t0, get_sys_cnt_aicpu(),
+                    chip_swimlane.sched_loop_count, released_count
+                );
             }
+#endif
             // Deferred consumed-head advances retry from the no-progress path.
             // During a ring-heap stall, a CONSUMED head with its pending bit
             // still set means no retry has acquired advance_lock and cleared
@@ -1254,13 +1293,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     // last iteration made progress can leave entries un-released. Drop them
     // here so every consumed producer slot completes its on_task_release
     // regardless of which loop-exit path fired.
-    while (deferred_release_count > 0) {
-#if SIMPLER_SCHED_PROFILING
-        (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
-#else
-        sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
-#endif
-    }
+    flush_deferred_releases(thread_idx, deferred_release_slot_states, deferred_release_count);
 
 #if SIMPLER_DFX
     // Final-drain: emit any pop_hit / pop_miss accrued since the last
