@@ -509,8 +509,7 @@ void ChipWorker::run(
     int32_t accepted_value
 ) {
     if (args == nullptr) throw std::runtime_error("run requires task args");
-    if (run_lane_ == nullptr) throw std::runtime_error("ChipWorker run lane is not initialized");
-    ChipRun run = run_lane_->submit(callable_id, *args, config, accepted_state, accepted_value);
+    ChipRun run = submit_chip_run(callable_id, *args, config, accepted_state, accepted_value);
     (void)run.wait_until(ChipRun::Deadline::max());
 }
 
@@ -708,6 +707,14 @@ ChipRun ChipWorker::submit_chip_run(
     return run_lane_->submit(
         callable_id, args, config, lease, run_id, dispatch_id, accepted_state, accepted_value, activated
     );
+}
+
+ChipRun ChipWorker::submit_chip_run(
+    int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, volatile int32_t *accepted_state,
+    int32_t accepted_value
+) {
+    if (run_lane_ == nullptr) throw std::runtime_error("ChipWorker run lane is not initialized");
+    return run_lane_->submit(callable_id, args, config, accepted_state, accepted_value);
 }
 
 void ChipWorker::close_chip_run_lane() {

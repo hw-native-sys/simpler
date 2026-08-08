@@ -136,6 +136,13 @@ public:
         uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0,
         bool activated = true
     );
+    // Direct submission: no pipeline lease, so the lane admits at capacity one
+    // by draining its predecessor before this run enters the FIFO. run() is the
+    // blocking composition of this call and ChipRun::wait_until.
+    ChipRun submit_chip_run(
+        int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
+        volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0
+    );
     void close_chip_run_lane();
 
     // Per-callable_id preparation. Requires init() first and a callable_id

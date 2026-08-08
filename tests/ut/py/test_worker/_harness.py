@@ -102,6 +102,39 @@ def chip_callable(func_name: str = "x", binary: bytes = b"\x00") -> ChipCallable
     return ChipCallable.build(signature=[], func_name=func_name, binary=binary, children=[])
 
 
+class _FakeChipRun:
+    """The live handle a direct submit returns (native ``_ChipRun``).
+
+    A fake chip never executes its payload, so the run is already at its
+    completion fence; what it still has to model is that the handle is the
+    caller's, and that waiting on it is idempotent.
+    """
+
+    def __init__(self) -> None:
+        self.wait_count = 0
+
+    def done(self) -> bool:
+        return True
+
+    def wait(self, timeout: float = -1.0) -> bool:
+        self.wait_count += 1
+        return True
+
+    def activate(self) -> None:
+        pass
+
+    def abandon(self) -> None:
+        pass
+
+    @property
+    def launched(self) -> bool:
+        return True
+
+    @property
+    def lane_poisoned(self) -> bool:
+        return False
+
+
 class _FakeChipImpl:
     """The native-handle half of :class:`FakeChipWorker` (``cw._impl``)."""
 
@@ -109,6 +142,12 @@ class _FakeChipImpl:
 
     def __init__(self, register_error: str | None = None) -> None:
         self._register_error = register_error
+        self.submitted: list[tuple[int, Any]] = []
+        self.lane_closed = False
+        self.finalized = False
+        # Set when _close_chip_run_lane ran while the device was still up.
+        # Draining after finalize would wait on a device that is already gone.
+        self.lane_closed_before_finalize: bool | None = None
 
     def register_callable_from_blob(self, cid: int, addr: int) -> None:
         if self._register_error is not None:
@@ -116,6 +155,17 @@ class _FakeChipImpl:
 
     def run_materialized(self, *_a, **_k) -> None:
         """An L2 submit reaches the native handle here, with its args already materialized."""
+
+    def _submit_chip_run_direct(self, cid: int, args: Any, cfg: Any) -> _FakeChipRun:
+        """A direct submit admits at capacity one and returns the run while it runs."""
+        run = _FakeChipRun()
+        self.submitted.append((cid, run))
+        return run
+
+    def _close_chip_run_lane(self) -> None:
+        self.lane_closed = True
+        if self.lane_closed_before_finalize is None:
+            self.lane_closed_before_finalize = not self.finalized
 
 
 class FakeChipWorker:
@@ -175,7 +225,7 @@ class FakeChipWorker:
         pass
 
     def finalize(self) -> None:
-        pass
+        self._impl.finalized = True
 
 
 def fake_chip_worker(*, script: str = "ok", register_error: str | None = None):
