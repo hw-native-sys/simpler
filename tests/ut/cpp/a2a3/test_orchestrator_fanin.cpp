@@ -221,6 +221,220 @@ TEST_F(OrchestratorFaninTest, AllCompletedFastPathReleasesWaitOnlyPin) {
     EXPECT_EQ(producer_slot.fanout_refcount.load(), rc_before + 1);
 }
 
+// 1-hop transitive reduction: A -> B -> C plus a direct A -> C (both retention).
+// The direct A -> C WAIT is ordered via A -> B -> C, so reduction clears it,
+// leaving A -> C RETAIN-only while B -> C stays WAIT|RETAIN.
+TEST_F(OrchestratorFaninTest, DiamondReducesRedundantWaitToRetainOnly) {
+    orch.begin_scope();
+
+    CoreTaskArgs a_args;
+    TaskOutputTensors a = orch.submit_dummy_task(a_args);
+    ASSERT_TRUE(a.task_id().is_valid());
+
+    PTO2TaskId b_deps[] = {a.task_id()};  // A -> B
+    CoreTaskArgs b_args;
+    b_args.set_dependencies(b_deps, 1);
+    TaskOutputTensors b = orch.submit_dummy_task(b_args);
+    ASSERT_TRUE(b.task_id().is_valid());
+
+    PTO2TaskId c_deps[] = {a.task_id(), b.task_id()};  // A -> C, B -> C
+    CoreTaskArgs c_args;
+    c_args.set_dependencies(c_deps, 2);
+    TaskOutputTensors c = orch.submit_dummy_task(c_args);
+    ASSERT_TRUE(c.task_id().is_valid());
+
+    auto &a_slot = sm_handle->header->rings[a.task_id().ring()].get_slot_state_by_task_id(a.task_id().local());
+    auto &b_slot = sm_handle->header->rings[b.task_id().ring()].get_slot_state_by_task_id(b.task_id().local());
+    auto &c_slot = sm_handle->header->rings[c.task_id().ring()].get_slot_state_by_task_id(c.task_id().local());
+    ASSERT_NE(c_slot.payload, nullptr);
+    EXPECT_EQ(c_slot.payload->fanin_actual_count, 2);  // both edges kept in storage
+    EXPECT_EQ(c_slot.payload->fanin_wait_count, 1);    // only B gates readiness after reduction
+
+    DepFlags a_flags = DEP_NONE, b_flags = DEP_NONE;
+    for (int i = 0; i < c_slot.payload->fanin_actual_count; i++) {
+        auto &e = c_slot.payload->fanin_inline_edges[i];
+        if (e.slot_state() == &a_slot) a_flags = e.flags();
+        else if (e.slot_state() == &b_slot) b_flags = e.flags();
+    }
+    EXPECT_EQ(a_flags, DEP_RETAIN);             // A -> C reduced to RETAIN-only (lifetime kept)
+    EXPECT_EQ(b_flags, DEP_WAIT | DEP_RETAIN);  // B -> C unchanged
+}
+
+// Same diamond but the direct A -> C is ordering-only (add_dep_wait). Reduction
+// clears its only flag, dropping the edge to DEP_NONE.
+TEST_F(OrchestratorFaninTest, DiamondDropsRedundantWaitOnlyEdge) {
+    orch.begin_scope();
+
+    CoreTaskArgs a_args;
+    TaskOutputTensors a = orch.submit_dummy_task(a_args);
+    ASSERT_TRUE(a.task_id().is_valid());
+
+    PTO2TaskId b_deps[] = {a.task_id()};  // A -> B (WAIT|RETAIN)
+    CoreTaskArgs b_args;
+    b_args.set_dependencies(b_deps, 1);
+    TaskOutputTensors b = orch.submit_dummy_task(b_args);
+    ASSERT_TRUE(b.task_id().is_valid());
+
+    PTO2TaskId c_deps[] = {a.task_id(), b.task_id()};
+    DepFlags c_kinds[] = {DEP_WAIT, DEP_WAIT | DEP_RETAIN};  // A -> C ordering-only, B -> C retain
+    CoreTaskArgs c_args;
+    c_args.set_dependencies_with_kinds(c_deps, c_kinds, 2);
+    TaskOutputTensors c = orch.submit_dummy_task(c_args);
+    ASSERT_TRUE(c.task_id().is_valid());
+
+    auto &a_slot = sm_handle->header->rings[a.task_id().ring()].get_slot_state_by_task_id(a.task_id().local());
+    auto &c_slot = sm_handle->header->rings[c.task_id().ring()].get_slot_state_by_task_id(c.task_id().local());
+    ASSERT_NE(c_slot.payload, nullptr);
+    EXPECT_EQ(c_slot.payload->fanin_wait_count, 1);  // only B gates readiness
+
+    DepFlags a_flags = DEP_WAIT;  // sentinel != NONE
+    for (int i = 0; i < c_slot.payload->fanin_actual_count; i++) {
+        auto &e = c_slot.payload->fanin_inline_edges[i];
+        if (e.slot_state() == &a_slot) a_flags = e.flags();
+    }
+    EXPECT_EQ(a_flags, DEP_NONE);  // A -> C dropped entirely
+}
+
+// A -> C with no bypassing producer is not reduced (no A -> ? -> C path).
+TEST_F(OrchestratorFaninTest, IndependentProducersAreNotReduced) {
+    orch.begin_scope();
+
+    CoreTaskArgs a_args;
+    TaskOutputTensors a = orch.submit_dummy_task(a_args);
+    ASSERT_TRUE(a.task_id().is_valid());
+    CoreTaskArgs b_args;
+    TaskOutputTensors b = orch.submit_dummy_task(b_args);  // independent of A
+    ASSERT_TRUE(b.task_id().is_valid());
+
+    PTO2TaskId c_deps[] = {a.task_id(), b.task_id()};
+    CoreTaskArgs c_args;
+    c_args.set_dependencies(c_deps, 2);
+    TaskOutputTensors c = orch.submit_dummy_task(c_args);
+    ASSERT_TRUE(c.task_id().is_valid());
+
+    auto &c_slot = sm_handle->header->rings[c.task_id().ring()].get_slot_state_by_task_id(c.task_id().local());
+    ASSERT_NE(c_slot.payload, nullptr);
+    EXPECT_EQ(c_slot.payload->fanin_actual_count, 2);
+    EXPECT_EQ(c_slot.payload->fanin_wait_count, 2);  // no reduction: both keep WAIT
+}
+
+// The covering edge A -> B must carry RETAIN for A -> C to be reduced. With A -> B
+// ordering-only, A's pin is released at B's wiring and its slot may be rebound, so
+// the (ring, slot) identity check cannot prove A -> B -> C still holds. A -> C keeps
+// its WAIT — a redundant edge conservatively retained, never an ordering edge lost.
+TEST_F(OrchestratorFaninTest, WaitOnlyCoveringEdgeDoesNotReduce) {
+    orch.begin_scope();
+
+    CoreTaskArgs a_args;
+    TaskOutputTensors a = orch.submit_dummy_task(a_args);
+    ASSERT_TRUE(a.task_id().is_valid());
+
+    PTO2TaskId b_deps[] = {a.task_id()};
+    DepFlags b_kinds[] = {DEP_WAIT};  // A -> B ordering-only (no RETAIN)
+    CoreTaskArgs b_args;
+    b_args.set_dependencies_with_kinds(b_deps, b_kinds, 1);
+    TaskOutputTensors b = orch.submit_dummy_task(b_args);
+    ASSERT_TRUE(b.task_id().is_valid());
+
+    PTO2TaskId c_deps[] = {a.task_id(), b.task_id()};  // A -> C, B -> C
+    CoreTaskArgs c_args;
+    c_args.set_dependencies(c_deps, 2);
+    TaskOutputTensors c = orch.submit_dummy_task(c_args);
+    ASSERT_TRUE(c.task_id().is_valid());
+
+    auto &a_slot = sm_handle->header->rings[a.task_id().ring()].get_slot_state_by_task_id(a.task_id().local());
+    auto &c_slot = sm_handle->header->rings[c.task_id().ring()].get_slot_state_by_task_id(c.task_id().local());
+    ASSERT_NE(c_slot.payload, nullptr);
+    EXPECT_EQ(c_slot.payload->fanin_wait_count, 2);  // A -> C not reduced away
+
+    DepFlags a_flags = DEP_NONE;
+    for (int i = 0; i < c_slot.payload->fanin_actual_count; i++) {
+        auto &e = c_slot.payload->fanin_inline_edges[i];
+        if (e.slot_state() == &a_slot) a_flags = e.flags();
+    }
+    EXPECT_EQ(a_flags, DEP_WAIT | DEP_RETAIN);  // A -> C keeps its WAIT
+}
+
+// A completed covering producer B is not used for reduction: once B has run
+// on_task_release its fanin pointer to A may resolve to a reused slot, so the
+// (ring, slot) identity check is no longer generation-safe. A -> C keeps its WAIT.
+TEST_F(OrchestratorFaninTest, CompletedCoveringProducerIsNotUsed) {
+    orch.begin_scope();
+
+    CoreTaskArgs a_args;
+    TaskOutputTensors a = orch.submit_dummy_task(a_args);
+    ASSERT_TRUE(a.task_id().is_valid());
+
+    PTO2TaskId b_deps[] = {a.task_id()};  // A -> B (WAIT|RETAIN)
+    CoreTaskArgs b_args;
+    b_args.set_dependencies(b_deps, 1);
+    TaskOutputTensors b = orch.submit_dummy_task(b_args);
+    ASSERT_TRUE(b.task_id().is_valid());
+
+    // Drive B past execution so reduce_wait_edges must treat its fanin as stale.
+    auto &b_slot = sm_handle->header->rings[b.task_id().ring()].get_slot_state_by_task_id(b.task_id().local());
+    b_slot.task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
+
+    PTO2TaskId c_deps[] = {a.task_id(), b.task_id()};  // A -> C, B -> C
+    CoreTaskArgs c_args;
+    c_args.set_dependencies(c_deps, 2);
+    TaskOutputTensors c = orch.submit_dummy_task(c_args);
+    ASSERT_TRUE(c.task_id().is_valid());
+
+    auto &a_slot = sm_handle->header->rings[a.task_id().ring()].get_slot_state_by_task_id(a.task_id().local());
+    auto &c_slot = sm_handle->header->rings[c.task_id().ring()].get_slot_state_by_task_id(c.task_id().local());
+    ASSERT_NE(c_slot.payload, nullptr);
+
+    DepFlags a_flags = DEP_NONE;
+    for (int i = 0; i < c_slot.payload->fanin_actual_count; i++) {
+        auto &e = c_slot.payload->fanin_inline_edges[i];
+        if (e.slot_state() == &a_slot) a_flags = e.flags();
+    }
+    EXPECT_EQ(a_flags, DEP_WAIT | DEP_RETAIN);  // completed B not used as cover; A -> C keeps WAIT
+}
+
+// Acceptance #2 lifetime: a reduced RETAIN-only A -> C keeps A pinned until C
+// releases it, not merely until wiring. A WAIT-only edge would have dropped its
+// pin at wiring; here A's pin survives and is dropped only by on_task_release(C).
+TEST_F(OrchestratorFaninTest, ReducedRetainOnlyEdgeHoldsProducerUntilConsumerRelease) {
+    orch.begin_scope();
+
+    CoreTaskArgs a_args;
+    TaskOutputTensors a = orch.submit_dummy_task(a_args);
+    ASSERT_TRUE(a.task_id().is_valid());
+
+    PTO2TaskId b_deps[] = {a.task_id()};  // A -> B (WAIT|RETAIN)
+    CoreTaskArgs b_args;
+    b_args.set_dependencies(b_deps, 1);
+    TaskOutputTensors b = orch.submit_dummy_task(b_args);
+    ASSERT_TRUE(b.task_id().is_valid());
+
+    PTO2TaskId c_deps[] = {a.task_id(), b.task_id()};  // A -> C, B -> C
+    CoreTaskArgs c_args;
+    c_args.set_dependencies(c_deps, 2);
+    TaskOutputTensors c = orch.submit_dummy_task(c_args);
+    ASSERT_TRUE(c.task_id().is_valid());
+
+    auto &a_slot = sm_handle->header->rings[a.task_id().ring()].get_slot_state_by_task_id(a.task_id().local());
+    auto &c_slot = sm_handle->header->rings[c.task_id().ring()].get_slot_state_by_task_id(c.task_id().local());
+
+    // A -> C was reduced to RETAIN-only, so C's submit->wire pin on A is still held
+    // after wiring — a WAIT-only edge would have released it already.
+    DepFlags a_flags = DEP_NONE;
+    for (int i = 0; i < c_slot.payload->fanin_actual_count; i++) {
+        auto &e = c_slot.payload->fanin_inline_edges[i];
+        if (e.slot_state() == &a_slot) a_flags = e.flags();
+    }
+    ASSERT_EQ(a_flags, DEP_RETAIN);
+
+    int32_t rc_before = a_slot.fanout_refcount.load();
+    c_slot.task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
+    sched.on_task_release(c_slot);
+    // on_task_release(C) is what finally drops the retained pin on A — proving A
+    // outlived wiring and stays alive until its consumer releases it.
+    EXPECT_EQ(a_slot.fanout_refcount.load(), rc_before + 1);
+}
+
 TEST_F(OrchestratorFaninTest, SubmitPathHeapDeadlockLogReportsRingAndRealHeapState) {
     std::vector<TensorCreateInfo> create_infos;
     create_infos.reserve(8);
