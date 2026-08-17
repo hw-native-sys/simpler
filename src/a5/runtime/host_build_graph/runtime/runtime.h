@@ -105,6 +105,11 @@ struct Handshake {
  * ChipTensor pair for tracking host-device memory mappings.
  * Used for copy-back during finalize.
  */
+enum class TensorReleaseKind {
+    Free,        // device_malloc'd for this run — free in validate
+    BufferNoop,  // slice of HBG runner-owned per-slot staging — live across runs
+};
+
 struct TensorPair {
     void *host_ptr;
     void *dev_ptr;
@@ -113,6 +118,7 @@ struct TensorPair {
     // so the end-of-run D2H copy-back is skipped. OUTPUT/INOUT/unknown
     // keep the safe default of copying back.
     bool needs_copy_back = true;
+    TensorReleaseKind release_kind = TensorReleaseKind::Free;
 };
 
 /**
@@ -298,6 +304,11 @@ public:
     // device code must not inspect. No fixed cap — grows with the chip-level
     // entry-tensor count.
     std::vector<TensorPair> tensor_pairs_;
+
+    // Runner-owned retained staging metadata is published only after this
+    // run and every required INOUT copy-back complete successfully.
+    std::vector<uint64_t> retained_temp_population_key_;
+    bool retained_temp_population_needs_copy_back_{false};
 };
 
 // Number of bytes of the Runtime image that must be copied to the device.

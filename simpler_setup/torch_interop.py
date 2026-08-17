@@ -30,12 +30,18 @@ Requires torch >= 2.3 (for ``torch.uint16`` / ``torch.uint32``).
 
 from __future__ import annotations
 
+import itertools
+import threading
+import weakref
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from simpler.task_interface import ChipTensor, DataType
 
 _TORCH_DTYPE_MAP = None
+_TORCH_CONTENT_GENERATIONS = itertools.count(1)
+_TORCH_CONTENT_STATES = {}
+_TORCH_CONTENT_STATES_LOCK = threading.Lock()
 
 
 def _ensure_torch_map():
@@ -81,6 +87,45 @@ def torch_dtype_to_datatype(dt) -> DataType:
     return _TORCH_DTYPE_MAP[dt]  # pyright: ignore[reportOptionalSubscript]
 
 
+def torch_content_generation(tensor) -> int:
+    """Return a nonzero freshness generation for a torch tensor.
+
+    The token is stable for one tensor object while PyTorch's ``_version`` is
+    unchanged, and advances for both a new tensor object and a tracked in-place
+    mutation. Object identity matters because CPU allocators can reuse a freed
+    tensor's data pointer while the new tensor starts again at ``_version == 0``.
+    Weak references prevent the identity table from retaining tensors.
+    """
+    try:
+        version = getattr(tensor, "_version", None)
+    except (AttributeError, RuntimeError):
+        return 0
+    if not isinstance(version, int) or version < 0:
+        return 0
+
+    tensor_id = id(tensor)
+
+    def _forget_tensor(ref, *, expected_id=tensor_id):
+        with _TORCH_CONTENT_STATES_LOCK:
+            state = _TORCH_CONTENT_STATES.get(expected_id)
+            if state is not None and state[0] is ref:
+                del _TORCH_CONTENT_STATES[expected_id]
+
+    with _TORCH_CONTENT_STATES_LOCK:
+        state = _TORCH_CONTENT_STATES.get(tensor_id)
+        if state is not None and state[0]() is tensor and state[1] == version:
+            return state[2]
+        try:
+            tensor_ref = weakref.ref(tensor, _forget_tensor)
+        except TypeError:
+            return 0
+        generation = next(_TORCH_CONTENT_GENERATIONS)
+        if generation >= 1 << 64:
+            return 0
+        _TORCH_CONTENT_STATES[tensor_id] = (tensor_ref, version, generation)
+        return generation
+
+
 def make_chip_tensor_arg(tensor) -> ChipTensor:
     """Create a ``ChipTensor`` — the materialized chip POD — from a torch.Tensor.
 
@@ -116,7 +161,12 @@ def make_chip_tensor_arg(tensor) -> ChipTensor:
             "contiguous); call tensor.contiguous() before passing it."
         )
     shapes = tuple(int(s) for s in tensor.shape)
-    return ChipTensor.make(tensor.data_ptr(), shapes, dt)
+    return ChipTensor.make(
+        tensor.data_ptr(),
+        shapes,
+        dt,
+        host_content_generation=torch_content_generation(tensor),
+    )
 
 
 def make_tensor_arg(worker, tensor):

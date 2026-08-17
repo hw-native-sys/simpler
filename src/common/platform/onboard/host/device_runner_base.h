@@ -143,6 +143,8 @@ public:
     int device_memset(void *dev_ptr, int value, std::size_t bytes);
     void get_retained_temp_buffer(uint32_t pipeline_slot, void **addr, std::size_t *size);
     void set_retained_temp_buffer(uint32_t pipeline_slot, void *addr, std::size_t size);
+    bool retained_temp_metadata_matches(uint32_t pipeline_slot, const void *key_data, std::size_t key_size) const;
+    void set_retained_temp_metadata(uint32_t pipeline_slot, const void *key_data, std::size_t key_size);
     void *acquire_graph_execution_buffer(
         uint32_t pipeline_slot, uint64_t graph_key, uint32_t occurrence, std::size_t bytes, std::size_t alignment
     );
@@ -1055,12 +1057,14 @@ protected:
     host::LoadAicpuOp load_aicpu_op_;
 
     MemoryAllocator mem_alloc_;
-    // Retained temporary buffer for TRB device-arg staging, one per pipeline
+    // Retained temporary buffer for runtime device-arg staging, one per pipeline
     // slot (see HostApi get/set_retained_temp_buffer). Just a remembered
     // {addr, size} that the slot reuses across its runs and finalize frees;
-    // the grow/pack logic lives in trb bind.
+    // the grow/pack logic lives in runtime bind. Metadata describes which
+    // producer content currently populates the buffer and shares its lifetime.
     std::array<void *, PTO_PIPELINE_MAX_DEPTH> retained_temp_addrs_{};
     std::array<std::size_t, PTO_PIPELINE_MAX_DEPTH> retained_temp_sizes_{};
+    std::array<std::vector<uint8_t>, PTO_PIPELINE_MAX_DEPTH> retained_temp_metadata_{};
     struct RetainedGraphExecutionBuffer {
         void *allocation{nullptr};
         void *aligned_addr{nullptr};

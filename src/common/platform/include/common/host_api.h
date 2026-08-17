@@ -39,18 +39,27 @@ struct HostApiOps {
     // Set a device buffer to a byte value (device-side, no PCIe). Used to
     // zero-init pure OUTPUT buffers in lieu of an H2D copy-in.
     int (*device_memset)(void *runner_ctx, void *dev_ptr, int value, size_t size);
-    // Runner-scoped retained temporary buffer for TRB device-arg staging.
+    // Runner-scoped retained temporary buffer for runtime device-arg staging.
     // This is NOT an allocator — it is a single {addr, size} slot that lives
-    // across runs on the DeviceRunner. trb bind reads the slot, and if the
+    // across runs on the DeviceRunner. A runtime bind reads the slot, and if the
     // retained buffer is too small for this run's packed temporary size it
     // device_free's the old one, device_malloc's a bigger one, and writes the
-    // new {addr, size} back. The grow/pack/slice logic lives in trb bind
+    // new {addr, size} back. The grow/pack/slice logic lives in runtime bind
     // (runtime_maker); the platform only remembers the slot so it can be reused
     // by later runs and freed at finalize. The slot is per pipeline slot, so
     // two runs in different slots never share a staging buffer. `get` returns
     // {nullptr, 0} when nothing is retained yet.
     void (*get_retained_temp_buffer)(void *runner_ctx, uint32_t pipeline_slot, void **addr, size_t *size);
     void (*set_retained_temp_buffer)(void *runner_ctx, uint32_t pipeline_slot, void *addr, size_t size);
+    // Opaque validity key for the retained buffer's contents. The key is owned
+    // by the DeviceRunner alongside the buffer, compared byte-for-byte, and
+    // released at runner finalization. Replacing the retained buffer clears
+    // the key. Runtimes invalidate before mutating a non-matching population
+    // and publish a new key only after every required copy succeeds.
+    bool (*retained_temp_metadata_matches)(
+        void *runner_ctx, uint32_t pipeline_slot, const void *key_data, size_t key_size
+    );
+    void (*set_retained_temp_metadata)(void *runner_ctx, uint32_t pipeline_slot, const void *key_data, size_t key_size);
     // Runner-owned Graph execution storage. The platform keeps one grow-only
     // block per (pipeline slot, Graph key, occurrence index), allocates it
     // through the tracked device MemoryAllocator, and releases every block at
@@ -149,6 +158,15 @@ public:
     void set_retained_temp_buffer(void *addr, size_t size) const {
         ops_->set_retained_temp_buffer(runner_ctx_, pipeline_slot_, addr, size);
     }
+    bool retained_temp_metadata_matches(const void *key_data, size_t key_size) const {
+        return ops_->retained_temp_metadata_matches != nullptr &&
+               ops_->retained_temp_metadata_matches(runner_ctx_, pipeline_slot_, key_data, key_size);
+    }
+    void set_retained_temp_metadata(const void *key_data, size_t key_size) const {
+        if (ops_->set_retained_temp_metadata != nullptr) {
+            ops_->set_retained_temp_metadata(runner_ctx_, pipeline_slot_, key_data, key_size);
+        }
+    }
     void *
     acquire_graph_execution_buffer(uint64_t graph_key, uint32_t occurrence, size_t bytes, size_t alignment) const {
         if (ops_->acquire_graph_execution_buffer == nullptr) return nullptr;
@@ -183,6 +201,11 @@ public:
     uint64_t upload_chip_callable_buffer(const void *callable) const {
         return ops_->upload_chip_callable_buffer(runner_ctx_, callable);
     }
+
+    // Identity of this run's DeviceRunner + pipeline slot (for host-side caches
+    // that must not share state across depth>1 slots).
+    void *runner_ctx() const { return runner_ctx_; }
+    uint32_t pipeline_slot() const { return pipeline_slot_; }
 
 private:
     void *runner_ctx_{nullptr};

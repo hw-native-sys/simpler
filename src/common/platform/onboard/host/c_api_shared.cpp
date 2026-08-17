@@ -156,6 +156,25 @@ static void set_retained_temp_buffer(void *runner_ctx, uint32_t pipeline_slot, v
     } catch (...) {}
 }
 
+static bool
+retained_temp_metadata_matches(void *runner_ctx, uint32_t pipeline_slot, const void *key_data, size_t key_size) {
+    if (runner_ctx == nullptr) return false;
+    try {
+        return static_cast<DeviceRunnerBase *>(runner_ctx)
+            ->retained_temp_metadata_matches(pipeline_slot, key_data, key_size);
+    } catch (...) {
+        return false;
+    }
+}
+
+static void
+set_retained_temp_metadata(void *runner_ctx, uint32_t pipeline_slot, const void *key_data, size_t key_size) {
+    if (runner_ctx == nullptr) return;
+    try {
+        static_cast<DeviceRunnerBase *>(runner_ctx)->set_retained_temp_metadata(pipeline_slot, key_data, key_size);
+    } catch (...) {}
+}
+
 static void *acquire_graph_execution_buffer(
     void *runner_ctx, uint32_t pipeline_slot, uint64_t graph_key, uint32_t occurrence, size_t bytes, size_t alignment
 ) {
@@ -266,6 +285,8 @@ static const HostApiOps g_host_api_ops = {
     .device_memset = device_memset,
     .get_retained_temp_buffer = get_retained_temp_buffer,
     .set_retained_temp_buffer = set_retained_temp_buffer,
+    .retained_temp_metadata_matches = retained_temp_metadata_matches,
+    .set_retained_temp_metadata = set_retained_temp_metadata,
     .acquire_graph_execution_buffer = acquire_graph_execution_buffer,
     .setup_static_arena = setup_static_arena_wrapper,
     .acquire_pooled_gm_heap = acquire_pooled_gm_heap_wrapper,

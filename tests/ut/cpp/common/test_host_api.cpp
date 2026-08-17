@@ -24,22 +24,37 @@ namespace {
 
 struct FakeRunner {
     void record_pipeline_slot(uint32_t slot) {
-        std::lock_guard<std::mutex> lock(mutex);
+        std::scoped_lock lock(mutex);
         pipeline_slots.push_back(slot);
     }
 
     void record_arena_bank(uint32_t bank) {
-        std::lock_guard<std::mutex> lock(mutex);
+        std::scoped_lock lock(mutex);
         arena_banks.push_back(bank);
+    }
+
+    void record_metadata_slot(uint32_t slot) {
+        std::scoped_lock lock(mutex);
+        metadata_slots.push_back(slot);
     }
 
     std::mutex mutex;
     std::vector<uint32_t> pipeline_slots;
     std::vector<uint32_t> arena_banks;
+    std::vector<uint32_t> metadata_slots;
 };
 
 void set_retained_temp_buffer(void *runner_ctx, uint32_t pipeline_slot, void *, size_t) {
     static_cast<FakeRunner *>(runner_ctx)->record_pipeline_slot(pipeline_slot);
+}
+
+bool retained_temp_metadata_matches(void *runner_ctx, uint32_t pipeline_slot, const void *, size_t) {
+    static_cast<FakeRunner *>(runner_ctx)->record_metadata_slot(pipeline_slot);
+    return true;
+}
+
+void set_retained_temp_metadata(void *runner_ctx, uint32_t pipeline_slot, const void *, size_t) {
+    static_cast<FakeRunner *>(runner_ctx)->record_metadata_slot(pipeline_slot);
 }
 
 int setup_static_arena(void *runner_ctx, uint32_t arena_bank, size_t, size_t, size_t) {
@@ -51,6 +66,8 @@ const HostApiOps &fake_ops() {
     static const HostApiOps ops = []() {
         HostApiOps result{};
         result.set_retained_temp_buffer = set_retained_temp_buffer;
+        result.retained_temp_metadata_matches = retained_temp_metadata_matches;
+        result.set_retained_temp_metadata = set_retained_temp_metadata;
         result.setup_static_arena = setup_static_arena;
         return result;
     }();
@@ -102,6 +119,7 @@ TEST(HostApiTest, BoundRunnerSlotAndBankSurviveConcurrentCrossThreadCalls) {
         start_gate.arrive_and_wait();
         for (int i = 0; i < kCallsPerThread; ++i) {
             api_a.set_retained_temp_buffer(nullptr, 0);
+            api_a.set_retained_temp_metadata(nullptr, 0);
             api_b.setup_static_arena(0, 0, 0);
         }
     });
@@ -109,6 +127,7 @@ TEST(HostApiTest, BoundRunnerSlotAndBankSurviveConcurrentCrossThreadCalls) {
         start_gate.arrive_and_wait();
         for (int i = 0; i < kCallsPerThread; ++i) {
             api_b.set_retained_temp_buffer(nullptr, 0);
+            (void)api_b.retained_temp_metadata_matches("key", 3);
             api_a.setup_static_arena(0, 0, 0);
         }
     });
@@ -118,10 +137,14 @@ TEST(HostApiTest, BoundRunnerSlotAndBankSurviveConcurrentCrossThreadCalls) {
 
     EXPECT_EQ(runner_a.pipeline_slots.size(), kCallsPerThread);
     EXPECT_EQ(runner_a.arena_banks.size(), kCallsPerThread);
+    EXPECT_EQ(runner_a.metadata_slots.size(), kCallsPerThread);
     EXPECT_EQ(runner_b.pipeline_slots.size(), kCallsPerThread);
     EXPECT_EQ(runner_b.arena_banks.size(), kCallsPerThread);
+    EXPECT_EQ(runner_b.metadata_slots.size(), kCallsPerThread);
     EXPECT_TRUE(all_equal(runner_a.pipeline_slots, kRunnerASlot));
     EXPECT_TRUE(all_equal(runner_a.arena_banks, kRunnerABank));
+    EXPECT_TRUE(all_equal(runner_a.metadata_slots, kRunnerASlot));
     EXPECT_TRUE(all_equal(runner_b.pipeline_slots, kRunnerBSlot));
     EXPECT_TRUE(all_equal(runner_b.arena_banks, kRunnerBBank));
+    EXPECT_TRUE(all_equal(runner_b.metadata_slots, kRunnerBSlot));
 }

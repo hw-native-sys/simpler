@@ -45,10 +45,12 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "../common/pto_runtime_status.h"
@@ -63,10 +65,12 @@
 #include "../runtime/pto_types.h"
 #include "../runtime/runtime.h"
 #include "../../../../common/runtime_status/error_log.h"
+#include "../../../../common/host_build_graph/retained_arg_staging.h"
 #include "../../../../common/task_interface/call_config.h"
 #include "../../../../common/worker/pto_runtime_c_api.h"
 #include "callable.h"
 #include "common/platform_config.h"
+#include "common/strace.h"
 #include "common/unified_log.h"
 #include "utils/device_arena.h"
 #include "prepare_callable_common.h"
@@ -402,6 +406,35 @@ static bool relocate_host_orch_image(
 }
 
 bool upload_graph_submissions(Runtime *runtime, const HostApi *api, GraphHostState &graph_state) {
+    // Reuse per-(graph_key, occurrence) device POD buffers across runs so steady
+    // rounds pay H2D only — not device_malloc/device_free for every layer.
+    struct RetainedSubmission {
+        void *ptr = nullptr;
+        size_t bytes = 0;
+    };
+    static std::mutex sub_mu;
+    static std::unordered_map<uint64_t, RetainedSubmission> retained_subs;
+
+    auto acquire_submission = [&](uint64_t graph_key, uint32_t occurrence, size_t bytes) -> void * {
+        const uint64_t key = (graph_key << 32) ^ static_cast<uint64_t>(occurrence);
+        std::scoped_lock lock(sub_mu);
+        RetainedSubmission &slot = retained_subs[key];
+        if (slot.ptr != nullptr && slot.bytes == bytes) {
+            return slot.ptr;
+        }
+        if (slot.ptr != nullptr) {
+            api->device_free(slot.ptr);
+            slot.ptr = nullptr;
+            slot.bytes = 0;
+        }
+        slot.ptr = api->device_malloc(bytes);
+        if (slot.ptr == nullptr) {
+            return nullptr;
+        }
+        slot.bytes = bytes;
+        return slot.ptr;
+    };
+
     std::unordered_map<uint64_t, uint32_t> occurrences;
     const size_t count = graph_host_upload_count(graph_state);
     for (size_t index = 0; index < count; ++index) {
@@ -444,18 +477,20 @@ bool upload_graph_submissions(Runtime *runtime, const HostApi *api, GraphHostSta
         submission->local_execution = 0;
         submission->activation_gate = 0;
 
-        void *device_submission = api->device_malloc(upload->bytes);
+        void *device_submission = acquire_submission(submission->graph_key, occurrence, upload->bytes);
         if (device_submission == nullptr) {
             LOG_ERROR("host-orch: failed to allocate %zu bytes for Graph submission", upload->bytes);
             return false;
         }
         if (api->copy_to_device(device_submission, upload->data, upload->bytes) != 0) {
             LOG_ERROR("host-orch: failed to upload Graph submission POD image");
-            api->device_free(device_submission);
             return false;
         }
         upload->outer_slot->graph_context = device_submission;
-        runtime->tensor_pairs_.push_back({nullptr, device_submission, upload->bytes, false});
+        // Buffer lives in retained_subs until Worker finalize frees the allocator.
+        runtime->tensor_pairs_.push_back(
+            {nullptr, device_submission, upload->bytes, false, TensorReleaseKind::BufferNoop}
+        );
     }
     return true;
 }
@@ -484,8 +519,20 @@ int32_t run_host_orchestration(
     // orch::prepare_task and shipped bounded to total_tasks below.
     const pto2_sm_layout::PTO2RingSegmentOffsets sm_segs =
         pto2_sm_layout::ring_segment_offsets(eff_task_window_sizes[0]);
-    std::unique_ptr<uint8_t[]> host_sm_buf(new uint8_t[sm_size]);
-    void *host_sm = host_sm_buf.get();
+    // Retain the host SM mirror across runs — steady rounds only need a header
+    // memset, not a fresh multi‑MB allocation each bind.
+    static std::mutex host_sm_mu;
+    static std::unique_ptr<uint8_t[]> retained_host_sm;
+    static size_t retained_host_sm_bytes = 0;
+    void *host_sm = nullptr;
+    {
+        std::scoped_lock lock(host_sm_mu);
+        if (retained_host_sm_bytes < sm_size) {
+            retained_host_sm.reset(new uint8_t[sm_size]);
+            retained_host_sm_bytes = sm_size;
+        }
+        host_sm = retained_host_sm.get();
+    }
     std::memset(host_sm, 0, sm_segs.descriptors);
 
     // Re-point the orchestrator half at the host SM (scheduler keeps device SM).
@@ -749,71 +796,92 @@ extern "C" int bind_callable_to_runtime_impl(
     // the point at which a task could make it stale.
     HostTensorAccessor tensor_access(api);
 
+    HbgRetainedArgStaging staging;
+    if (!staging.begin(api, orch_args, signature, sig_count)) {
+        return -1;
+    }
+    const bool reuse_inputs = staging.reuses_inputs();
+
     int64_t t_args_start = _now_ms();
-    for (int i = 0; i < tensor_count; i++) {
-        ChipTensor t = orch_args->tensor(i);
+    {
+        STRACE_A("simpler_run.bind.args", reuse_inputs ? "reuse=1" : "reuse=0");
+        for (int i = 0; i < tensor_count; i++) {
+            ChipTensor t = orch_args->tensor(i);
 
-        if (t.is_device_memory()) {
-            LOG_DEBUG("  ChipTensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.buffer.addr);
-            device_args.add_tensor(t);
-            continue;
-        }
+            if (t.is_device_memory()) {
+                LOG_DEBUG("  ChipTensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.buffer.addr);
+                device_args.add_tensor(t);
+                continue;
+            }
 
-        void *host_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(t.buffer.addr));
-        size_t size = static_cast<size_t>(t.nbytes());
+            void *host_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(t.buffer.addr));
+            size_t size = static_cast<size_t>(t.nbytes());
+            if (size == 0) {
+                t.buffer.addr = 0;
+                device_args.add_tensor(t);
+                continue;
+            }
 
-        void *dev_ptr = api->device_malloc(size);
-        if (dev_ptr == nullptr) {
-            LOG_ERROR("Failed to allocate device memory for tensor %d", i);
-            return -1;
-        }
-
-        // Pure write-only OUTPUT buffers are never read by the kernel and hold
-        // no meaningful host content, so they need no device staging — the
-        // kernel defines what it writes and any unwritten bytes are undefined.
-        // IN / INOUT (read-before-write) are staged H2D.
-        bool is_pure_output = (signature != nullptr && i < sig_count && signature[i] == ArgDirection::OUT);
-        if (!is_pure_output) {
-            int rc = api->copy_to_device(dev_ptr, host_ptr, size);
-            if (rc != 0) {
-                LOG_ERROR("Failed to stage tensor %d to device", i);
-                api->device_free(dev_ptr);
+            void *dev_ptr = staging.acquire(size);
+            if (dev_ptr == nullptr) {
+                LOG_ERROR("Failed to acquire retained staging for tensor %d", i);
                 return -1;
             }
-        }
-        // Read-only INPUT tensors are never written by the kernel, so there is
-        // no point copying them back D2H at the end. Index the signature
-        // by the orch tensor index `i` (device-space tensors are skipped above
-        // but do not consume a separate signature slot — scalars follow the
-        // tensor entries). Anything not provably IN keeps the safe default of
-        // copying back.
-        bool needs_copy_back = !(signature != nullptr && i < sig_count && signature[i] == ArgDirection::IN);
-        runtime->tensor_pairs_.push_back({host_ptr, dev_ptr, size, needs_copy_back});
-        LOG_DEBUG("  ChipTensor %d: %zu bytes at %p", i, size, dev_ptr);
 
-        // host_build_graph runs the orchestrator on the host, which may read
-        // control tensors (e.g. paged_attention's context_lens/block_table) via
-        // get_tensor_data to shape the graph. Give it a host view of this
-        // buffer: the device buffer itself where the platform can map it into
-        // the host address space (released in validate_runtime_impl before
-        // device_free), otherwise the staging copy, which holds the same bytes
-        // for the whole orchestration window and whose writes are pushed back
-        // to the device. A tensor with neither is not host-accessible, so the
-        // prepare fails here rather than the orchestrator dereferencing a
-        // device address.
-        if (!tensor_access.add(reinterpret_cast<uint64_t>(dev_ptr), size, host_ptr)) {
-            LOG_ERROR("host-orch: no host view for tensor %d (dev_ptr %p, %zu bytes)", i, dev_ptr, size);
-            return -1;
-        }
+            // Pure write-only OUTPUT buffers are never read by the kernel and hold
+            // no meaningful host content, so they need no device staging — the
+            // kernel defines what it writes and any unwritten bytes are undefined.
+            // IN/INOUT tensors without producer freshness are always copied.
+            // A read tensor is skipped only when its nonzero content generation
+            // and the complete staging layout match runner-owned metadata from a
+            // fully successful prior run (including required INOUT copy-back).
+            const bool copy_h2d = staging.copy_to_device_required(i);
+            if (copy_h2d) {
+                int rc = api->copy_to_device(dev_ptr, host_ptr, size);
+                if (rc != 0) {
+                    LOG_ERROR("Failed to stage tensor %d to device", i);
+                    return -1;
+                }
+            }
+            // Read-only INPUT tensors are never written by the kernel, so there is
+            // no point copying them back D2H at the end. Index the signature
+            // by the orch tensor index `i` (device-space tensors are skipped above
+            // but do not consume a separate signature slot — scalars follow the
+            // tensor entries). Anything not provably IN keeps the safe default of
+            // copying back.
+            bool needs_copy_back = !(signature != nullptr && i < sig_count && signature[i] == ArgDirection::IN);
+            runtime->tensor_pairs_.push_back({host_ptr, dev_ptr, size, needs_copy_back, TensorReleaseKind::BufferNoop});
+            LOG_DEBUG("  ChipTensor %d: %zu bytes at %p (h2d=%s)", i, size, dev_ptr, copy_h2d ? "copy" : "skip");
 
-        t.buffer.addr = reinterpret_cast<uint64_t>(dev_ptr);
-        device_args.add_tensor(t);
-    }
-    for (int i = 0; i < scalar_count; i++) {
-        device_args.add_scalar(orch_args->scalar(i));
+            // host_build_graph runs the orchestrator on the host, which may read
+            // control tensors (e.g. paged_attention's context_lens/block_table) via
+            // get_tensor_data to shape the graph. Give it a host view of this
+            // buffer: the device buffer itself where the platform can map it into
+            // the host address space (released in validate_runtime_impl before
+            // device_free), otherwise the staging copy, which holds the same bytes
+            // for the whole orchestration window and whose writes are pushed back
+            // to the device. A tensor with neither is not host-accessible, so the
+            // prepare fails here rather than the orchestrator dereferencing a
+            // device address.
+            if (!tensor_access.add(reinterpret_cast<uint64_t>(dev_ptr), size, host_ptr)) {
+                LOG_ERROR("host-orch: no host view for tensor %d (dev_ptr %p, %zu bytes)", i, dev_ptr, size);
+                return -1;
+            }
+
+            t.buffer.addr = reinterpret_cast<uint64_t>(dev_ptr);
+            device_args.add_tensor(t);
+        }
+        for (int i = 0; i < scalar_count; i++) {
+            device_args.add_scalar(orch_args->scalar(i));
+        }
+        staging.finish_population(
+            &runtime->retained_temp_population_key_, &runtime->retained_temp_population_needs_copy_back_
+        );
     }
     int64_t t_args_end = _now_ms();
-
+    LOG_INFO(
+        "TIMING: args_malloc_copy = %" PRId64 "ms (reuse_inputs=%d)", t_args_end - t_args_start, reuse_inputs ? 1 : 0
+    );
     // Lay out the per-Worker static device arena. GM heap, PTO2 shared memory,
     // and the prebuilt runtime arena use three independent pooled device
     // allocations committed together by setup_static_arena.
@@ -1004,8 +1072,15 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
         LOG_RUNTIME_FAILURE(orch_error_code, sched_error_code, runtime_status);
     }
 
+    const char *skip_copy_back_env = std::getenv("SIMPLER_SKIP_TENSOR_COPY_BACK");
+    const bool copy_back_disabled =
+        skip_copy_back_env != nullptr && skip_copy_back_env[0] != '\0' && skip_copy_back_env[0] != '0';
     if (skip_tensor_copy_back) {
         LOG_WARN("Skipping tensor copy-back because execution failed");
+    } else if (copy_back_disabled) {
+        // Perf / multi-round timing: INOUT D2H of multi‑GiB KV dominates Host wall
+        // and is unused when golden compare is off.
+        LOG_INFO("Skipping tensor copy-back (SIMPLER_SKIP_TENSOR_COPY_BACK)");
     } else {
         for (int i = 0; i < tensor_pair_count; i++) {
             const TensorPair &pair = tensor_pairs[i];
@@ -1040,14 +1115,22 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
         }
     }
 
-    // Cleanup device tensors
+    // Cleanup device tensors that this run owns. Retained-temp slices
+    // (BufferNoop) stay alive for the next bind — DeviceRunner frees them at
+    // finalize.
     LOG_INFO("=== Cleaning Up ===");
+    int freed = 0;
     for (int i = 0; i < tensor_pair_count; i++) {
-        if (tensor_pairs[i].dev_ptr != nullptr) {
-            api->device_free(tensor_pairs[i].dev_ptr);
+        if (tensor_pairs[i].dev_ptr == nullptr) {
+            continue;
         }
+        if (tensor_pairs[i].release_kind == TensorReleaseKind::BufferNoop) {
+            continue;
+        }
+        api->device_free(tensor_pairs[i].dev_ptr);
+        ++freed;
     }
-    LOG_INFO("Freed %d device allocations", tensor_pair_count);
+    LOG_INFO("Freed %d device allocations (%d retained-temp slices kept)", freed, tensor_pair_count - freed);
 
     // Clear the per-run dispatch-table entries staged by register_callable_impl.
     // The underlying chip-callable device buffer is pool-managed by
@@ -1063,6 +1146,17 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
         LOG_INFO("Cleared %d kernel dispatch-table entries", kernel_count);
     }
     runtime->clear_registered_kernels();
+
+    const bool population_valid = execution_rc == 0 && runtime_status == 0 && rc == 0 &&
+                                  (!runtime->retained_temp_population_needs_copy_back_ || !copy_back_disabled);
+    if (population_valid && !runtime->retained_temp_population_key_.empty()) {
+        api->set_retained_temp_metadata(
+            runtime->retained_temp_population_key_.data(),
+            runtime->retained_temp_population_key_.size() * sizeof(runtime->retained_temp_population_key_[0])
+        );
+    }
+    runtime->retained_temp_population_key_.clear();
+    runtime->retained_temp_population_needs_copy_back_ = false;
 
     // Clear tensor pairs
     runtime->tensor_pairs_.clear();

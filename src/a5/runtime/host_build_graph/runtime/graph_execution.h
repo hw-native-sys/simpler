@@ -191,7 +191,9 @@ inline void graph_tensor_unpack(const GraphTensor &packed, ChipTensor *tensor) {
         tensor->shapes[i] = packed.shapes[i];
         tensor->strides[i] = packed.strides[i];
     }
-    for (uint8_t &byte : tensor->_pad_cl2)
+    tensor->_pad_cl2_prefix = 0;
+    tensor->host_content_generation = 0;
+    for (uint8_t &byte : tensor->_pad_cl2_tail)
         byte = 0;
 }
 

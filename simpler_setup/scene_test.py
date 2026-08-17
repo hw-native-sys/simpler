@@ -475,7 +475,7 @@ def _build_l2_ref_args(test_args: TaskArgsBuilder, orch_signature: list, worker)
     """
     from simpler.task_interface import ArgDirection, TaskArgs, TensorArgType, scalar_to_uint64  # noqa: PLC0415
 
-    from simpler_setup.torch_interop import make_tensor_arg  # noqa: PLC0415
+    from simpler_setup.torch_interop import make_tensor_arg, torch_content_generation  # noqa: PLC0415
 
     dir2tag = {
         ArgDirection.IN: TensorArgType.INPUT,
@@ -494,7 +494,11 @@ def _build_l2_ref_args(test_args: TaskArgsBuilder, orch_signature: list, worker)
                     f"Update CALLABLE['orchestration']['signature'] to match generate_args()."
                 )
             direction = orch_signature[tensor_idx]
-            args.add_tensor(make_tensor_arg(worker, spec.value), dir2tag.get(direction, TensorArgType.INPUT))
+            args.add_tensor(
+                make_tensor_arg(worker, spec.value),
+                dir2tag.get(direction, TensorArgType.INPUT),
+                host_content_generation=torch_content_generation(spec.value),
+            )
             if direction in (ArgDirection.OUT, ArgDirection.INOUT):
                 output_names.append(spec.name)
             tensor_idx += 1

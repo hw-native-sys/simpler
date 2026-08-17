@@ -789,7 +789,12 @@ def _storage_for_remote_task_args(args: TaskArgs) -> _RemoteTaskArgsStorage:
         return storage
 
 
-def _task_args_add_tensor(self: TaskArgs, tensor, tag: TensorArgType = TensorArgType.INPUT) -> None:
+def _task_args_add_tensor(
+    self: TaskArgs,
+    tensor,
+    tag: TensorArgType = TensorArgType.INPUT,
+    host_content_generation: int = 0,
+) -> None:
     """Add a task arg. ``tensor`` is a ``simpler.buffer.Tensor`` (packable) or its packed
     bytes. A RemoteTensorRef (arg destined for a remote worker) is rewritten to a REMOTE_SIDECAR
     ``Tensor`` (no local backing) with its remote descriptor tracked in the sidecar."""
@@ -812,10 +817,12 @@ def _task_args_add_tensor(self: TaskArgs, tensor, tag: TensorArgType = TensorArg
                 AddressSpace.DEVICE if handle.address_space == RemoteAddressSpace.REMOTE_DEVICE else AddressSpace.HOST
             ),
         )
-        _TASK_ARGS_ADD_TENSOR(self, placeholder, tag)
+        # A remote sidecar does not provide a local-host dirty generation at
+        # this boundary, so it remains conservatively unknown.
+        _TASK_ARGS_ADD_TENSOR(self, placeholder, tag, 0)
         storage.sidecars.append(_sidecar_from_ref(storage, tensor))
         return
-    _TASK_ARGS_ADD_TENSOR(self, tensor, tag)
+    _TASK_ARGS_ADD_TENSOR(self, tensor, tag, host_content_generation)
     with _REMOTE_TASK_ARGS_STORAGE_LOCK:
         storage = _REMOTE_TASK_ARGS_STORAGE.get(self)
         if storage is not None:

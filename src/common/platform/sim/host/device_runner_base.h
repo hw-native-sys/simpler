@@ -193,6 +193,8 @@ public:
     int device_memset(void *dev_ptr, int value, size_t bytes);
     void get_retained_temp_buffer(uint32_t pipeline_slot, void **addr, size_t *size);
     void set_retained_temp_buffer(uint32_t pipeline_slot, void *addr, size_t size);
+    bool retained_temp_metadata_matches(uint32_t pipeline_slot, const void *key_data, size_t key_size) const;
+    void set_retained_temp_metadata(uint32_t pipeline_slot, const void *key_data, size_t key_size);
     void *acquire_graph_execution_buffer(
         uint32_t pipeline_slot, uint64_t graph_key, uint32_t occurrence, size_t bytes, size_t alignment
     );
@@ -326,6 +328,7 @@ protected:
     MemoryAllocator mem_alloc_;
     std::array<void *, PTO_PIPELINE_MAX_DEPTH> retained_temp_addrs_{};
     std::array<size_t, PTO_PIPELINE_MAX_DEPTH> retained_temp_sizes_{};
+    std::array<std::vector<uint8_t>, PTO_PIPELINE_MAX_DEPTH> retained_temp_metadata_{};
     struct RetainedGraphExecutionBuffer {
         void *allocation{nullptr};
         void *aligned_addr{nullptr};
