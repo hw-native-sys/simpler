@@ -902,9 +902,17 @@ struct PTO2SchedulerState {
         p.unlock_fanout();
         for (; edge != nullptr; edge = edge->next) {
             PTO2TaskSlotState *c = edge->slot_state;
-            if (c->task_attrs.has_predicate()) continue;
+            if (c->task_attrs.has_predicate()) continue;  // predicated consumers never early-dispatch
+            // Compare to fanin_wait_count (the DEP_WAIT edge count), NOT fanin_count
+            // (= fanin_wait_count + 1, a self/wiring +1 dispatch_fanin does not get)
+            // and NOT fanin_actual_count (the TOTAL, which also counts RETAIN-only
+            // edges that never notify here). Only DEP_WAIT producers reach this walk
+            // (only they link onto fanout_head), so reaching fanin_wait_count means
+            // every WAIT producer is flagged-and-fully-published or was pre-completed.
+            // An unflagged producer leaves the seed short and never bumps, so this
+            // stays unreachable for that consumer.
             int32_t nf = c->payload->dispatch_fanin.fetch_add(1, std::memory_order_acq_rel) + 1;
-            if (nf != c->payload->fanin_actual_count) continue;
+            if (nf != c->payload->fanin_wait_count) continue;
             try_enqueue_early_dispatch_candidate(*c);
         }
     }

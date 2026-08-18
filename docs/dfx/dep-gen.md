@@ -75,6 +75,17 @@ inputs to each submit are captured and the graph is reconstructed afterwards.
   immediately and know to update the annotated mirror.
 - **Output.** `<output_prefix>/deps.json` — strided-Tensor schema with
   `tasks[]`, `tensors[]`, and tensor-annotated `edges[]` (see §4).
+- **Edges are as-constructed, not as-reduced.** Both passes replay the same
+  fanin construction: the oracle drives `compute_task_fanin`, and the annotated
+  pass mirrors its steps. The runtime's 1-hop transitive reduction
+  (`reduce_wait_edges`, applied when the builder flushes in `submit_task`) runs
+  *after* construction and clears the `wait` flag on a direct edge already
+  covered by a two-hop `wait` path through another of the consumer's own
+  producers. `deps.json` records the pre-reduction edge set, so a diamond
+  `A→B→C` + `A→C` still shows `A→C` with its constructed flags. The
+  differential gate is unaffected — both passes replay the same construction —
+  and the reduction changes runtime readiness enforcement only; `deps.json`
+  retains the constructed logical edge.
 
 ### 2.2 Host orchestration (`host_build_graph`)
 
@@ -214,7 +225,7 @@ Each edge is `{pred, succ}` plus annotation. Fields:
 | `pred`, `succ` | uint64 (string) | always | `PTO2TaskId::raw` of producer and consumer |
 | `arg` | int32 | always | Consumer's arg-slot index; `-1` for `explicit` source |
 | `source` | string | always | `explicit` (from `explicit_deps[]`), `creator` (`owner_task_id` retention), or `tensormap` (overlap lookup hit) |
-| `flags` | string array | always | Subset of `["wait", "retain"]` — the edge's `DepFlags`. `wait` = ordering (readiness); `retain` = producer lifetime held until the consumer releases. `creator` edges are `["wait","retain"]`; `tensormap` edges `["wait"]`. `explicit` edges are **always recorded as `["wait","retain"]`**: the `DepGenRecord` does not carry per-dep kinds, so a replayed explicit dep cannot distinguish the ordering-only `CoreTaskArgsWithDeps::add_dep_wait()` API from the default. The differential gate is unaffected (both passes read the same constant). At runtime an `add_dep_wait()` edge is genuinely `["wait"]`; that distinction is a known replay limitation, not written to `deps.json`. |
+| `flags` | string array | always | Subset of `["wait", "retain"]` — the edge's `DepFlags`. `wait` = ordering (readiness); `retain` = producer lifetime held until the consumer releases. `creator` edges are `["wait","retain"]`; `tensormap` edges `["wait"]`. `explicit` edges are **always recorded as `["wait","retain"]`**: the `DepGenRecord` does not carry per-dep kinds, so a replayed explicit dep cannot distinguish the ordering-only `CoreTaskArgsWithDeps::add_dep_wait()` API from the default. The differential gate is unaffected (both passes read the same constant). At runtime an `add_dep_wait()` edge is genuinely `["wait"]`; that distinction is a known replay limitation, not written to `deps.json`. Flags are the **as-constructed** set: the runtime's 1-hop `wait` reduction (§2.1) is not modeled here, so an edge may show `wait` that the device later dropped from readiness. |
 | `overlap` | string | `source=tensormap` | `covered` (producer slice fully contains consumer slice) or `other` |
 | `tensor_id` | uint64 (string) | not `explicit` | Identity of the underlying tensor; cross-references `tensors[]` |
 | `consumer_dtype` | string | not `explicit` | Element type the consumer reads as |

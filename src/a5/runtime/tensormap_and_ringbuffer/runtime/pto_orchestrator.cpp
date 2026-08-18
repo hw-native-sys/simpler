@@ -406,6 +406,89 @@ static bool append_fanin_or_fail(
     return true;
 }
 
+// 1-hop transitive reduction over the WAIT graph, run once per submit after the
+// task's fanin is fully built and before wiring. This task's direct producers Q are
+// pinned (append_fanin_or_fail claimed each under its fanout_lock), so Q's slot and
+// payload are stable to read here. For an edge P -> C, if some other producer Q of C
+// retains P as a DEP_WAIT producer (P -> Q -> C, P -> Q carrying RETAIN), C's own
+// P -> C WAIT is redundant and is cleared: a creator edge becomes RETAIN-only, a
+// modifier edge becomes DEP_NONE (dropped). Only C's own fanin is modified — never a
+// producer's — so every transitive ordering path survives; clearing a strict subset
+// of the redundant edges is always sound on a DAG.
+//
+// Identity of P across the two-hop path holds under slot reuse because Q's fanin
+// stores only a (ring, slot) pointer, not a generation. Two conditions together
+// prove the walked P is the same task Q recorded: (1) Q is still live — a completed
+// Q has run on_task_release and dropped its RETAIN pins, so its fanin pointers may
+// resolve to reused slots; (2) P -> Q carries RETAIN — a live Q therefore still pins
+// P, so P is not consumed and its slot not rebound. Reuse of P's slot requires all
+// of P's pins released, and Q holds one until it completes, so a live Q is the
+// invariant that keeps P's identity valid.
+//
+// Bounded to inline-fitting fanin so the AICPU submit path stays
+// O(count^2 * producer_fanin); denser fanins skip reduction.
+static void reduce_wait_edges(PTO2OrchestratorState *orch, PTO2FaninBuilder *b) {
+    if (b->count < 2 || b->count > PTO2_FANIN_INLINE_CAP) {
+        return;
+    }
+    // A producer of C is marked in fanin_seen_epoch for this submit's epoch; a
+    // producer slot pointer maps back to (ring, slot) with ring_id (per-slot
+    // invariant) + a base subtraction, no dereference of a possibly-reused slot.
+    // slot is bounded on both sides before indexing the per-ring epoch array.
+    auto is_this_task_producer = [&](PTO2TaskSlotState *p) -> bool {
+        uint8_t r = p->ring_id;
+        if (r >= PTO2_MAX_RING_DEPTH) return false;
+        int32_t slot = static_cast<int32_t>(p - orch->sm_header->rings[r].slot_states);
+        return slot >= 0 && static_cast<uint64_t>(slot) < orch->sm_header->rings[r].task_window_size &&
+               orch->fanin_seen_epoch[r][slot] == b->seen_epoch;
+    };
+
+    PTO2TaskSlotState *redundant[PTO2_FANIN_INLINE_CAP];
+    int32_t n_red = 0;
+    for (int32_t i = 0; i < b->count; i++) {
+        if (!dep_has_wait(b->inline_slots[i].flags())) continue;
+        PTO2TaskSlotState *q = b->inline_slots[i].slot_state();
+        // A completed Q has already run on_task_release and dropped its RETAIN pins,
+        // so its recorded fanin slot pointers may now resolve to reused slots. Skip
+        // it. This loses no useful reduction: Q completing implies its producer P
+        // completed (Q depends on P), so C's P -> C WAIT is already satisfied and
+        // clearing it changes no readiness. Only a still-live Q provably still pins
+        // its RETAIN producers, and slot reuse of such a P implies Q already
+        // completed — so a live Q guarantees P's (ring, slot) identity below.
+        if (q->task_state.load(std::memory_order_acquire) >= PTO2_TASK_COMPLETED) {
+            continue;
+        }
+        // The covering edge P -> Q must be DEP_RETAIN, not merely DEP_WAIT: a RETAIN
+        // edge keeps the live Q's pin on P, so P is not consumed and its slot is not
+        // rebound — the (ring, slot) identity read below is provably the same task P
+        // that Q depends on. A WAIT-only P -> Q released its pin at Q's wiring, so P's
+        // slot may have been reused by an unrelated task that C happens to depend on;
+        // matching it would clear a WAIT no transitive path implies. p == q guards the
+        // degenerate self-match a reused slot could otherwise produce.
+        for_each_fanin_slot_state(*q->payload, [&](PTO2TaskSlotState *p, DepFlags qf) {
+            if (!dep_has_wait(qf) || !dep_has_retain(qf) || p == q || !is_this_task_producer(p)) return;
+            for (int32_t k = 0; k < n_red; k++) {
+                if (redundant[k] == p) return;  // already marked
+            }
+            if (n_red < PTO2_FANIN_INLINE_CAP) redundant[n_red++] = p;
+        });
+    }
+    if (n_red == 0) return;
+
+    for (int32_t i = 0; i < b->count; i++) {
+        DepFlags f = b->inline_slots[i].flags();
+        if (!dep_has_wait(f)) continue;
+        PTO2TaskSlotState *p = b->inline_slots[i].slot_state();
+        for (int32_t k = 0; k < n_red; k++) {
+            if (redundant[k] == p) {
+                b->inline_slots[i].set(p, static_cast<DepFlags>(f & ~DEP_WAIT));
+                b->wait_count--;
+                break;
+            }
+        }
+    }
+}
+
 static bool all_claimed_fanin_completed(const PTO2FaninBuilder &fanin_builder) {
     if (fanin_builder.count == 0) return true;
     // Only DEP_WAIT edges gate readiness; a retention-only edge never blocks
@@ -467,12 +550,11 @@ void PTO2OrchestratorState::wire_fanin_task(PTO2TaskSlotState &slot_state, int32
             }
             producer->unlock_fanout();
         }
-        // The submit->wire pin protects an ordering-only edge only until the
-        // consumer is linked. With the consumer now on fanout_head (or already
-        // seen as completed), release it so the producer can be CONSUMED without
-        // waiting for this consumer. A DEP_RETAIN edge keeps the pin until the
-        // consumer's on_task_release.
-        if (dep_has_wait(flags) && !dep_has_retain(flags)) {
+        // Any edge without DEP_RETAIN drops its submit->wire pin here: an
+        // ordering-only (DEP_WAIT) edge once the consumer is linked, and a
+        // reduction-dropped (DEP_NONE) edge that carries neither flag. Only a
+        // DEP_RETAIN edge keeps the pin until the consumer's on_task_release.
+        if (!dep_has_retain(flags)) {
             // Wiring-phase atomics (this release, plus the lock_fanout / dep_pool.prepend /
             // fanin_refcount ops around it) are not bucketed: g_orch_args_atomic_count
             // covers the submit/dep-claim phase only, whose g_orch_args_cycle window has
@@ -488,7 +570,7 @@ void PTO2OrchestratorState::wire_fanin_task(PTO2TaskSlotState &slot_state, int32
         int32_t dispatch_fanin = payload->dispatch_fanin.fetch_add(early_seed, std::memory_order_acq_rel) + early_seed;
         // Fully pre-completed fanin routes normally. If any producer was live,
         // the exact-full increment must enqueue the early candidate.
-        if (completed_fanin != payload->fanin_actual_count && dispatch_fanin == payload->fanin_actual_count) {
+        if (completed_fanin != payload->fanin_wait_count && dispatch_fanin == payload->fanin_wait_count) {
             sched->try_enqueue_early_dispatch_candidate(slot_state);
         }
     }
@@ -1019,19 +1101,16 @@ static TaskOutputTensors submit_task_common(
     // the producer's fanout_lock. Doing it there (rather than a separate pass
     // here) is what prevents a producer from transitioning to CONSUMED between
     // the dependency decision and the claim.
+    // Transitive reduction runs on the fully-built fanin, before it is flushed to
+    // the payload and wired, so RETAIN-only / dropped edges are reflected downstream.
+    reduce_wait_edges(orch, &fanin_builder);
     int32_t inline_count = std::min(fanin_builder.count, PTO2_FANIN_INLINE_CAP);
-    // Every fanin edge produced here carries DEP_WAIT (creator = WAIT|RETAIN,
-    // modifier = WAIT, explicit defaults to WAIT|RETAIN or opts into WAIT), so
-    // wait_count == count. fanin_actual_count therefore doubles as the WAIT-edge
-    // count that the early-dispatch threshold (dispatch_fanin, which counts only
-    // WAIT producers) is compared against. A future RETAIN-only edge would break
-    // that equality and must carry its own WAIT-edge count for that comparison.
-    always_assert(
-        fanin_builder.wait_count == fanin_builder.count &&
-        "fanin_actual_count is the early-dispatch WAIT denominator; a non-WAIT edge needs a separate count"
-    );
-    // Store fanin metadata in payload for scheduler to iterate
+    // Store fanin metadata in payload for the scheduler to iterate. fanin_actual_count
+    // is the TOTAL edge count (for_each / on_task_release walk every edge, including
+    // RETAIN-only ones); fanin_wait_count is the readiness/early-dispatch WAIT-edge
+    // count after reduction.
     payload.fanin_actual_count = fanin_builder.count;
+    payload.fanin_wait_count = fanin_builder.wait_count;
     // fanin_builder.count is finalized here and submit runs once per task, so
     // each dense consumer emits one debug message when enabled. This checks >
     // THRESHOLD because the count lands at its final total here.
@@ -1098,14 +1177,15 @@ static TaskOutputTensors submit_task_common(
         int32_t ready_seed = fanin_builder.wait_count + 1;
         cur_slot_state.fanin_count = ready_seed;
         if (all_claimed_fanin_allow_early_resolve(fanin_builder)) {
-            payload.dispatch_fanin.store(fanin_builder.count, std::memory_order_release);
+            payload.dispatch_fanin.store(fanin_builder.wait_count, std::memory_order_release);
         }
         cur_slot_state.fanin_refcount.store(ready_seed, std::memory_order_release);
-        // wire_fanin_task is skipped here, so its ordering-only pin release runs
-        // on this path too: an edge without retention drops its submit->wire pin
-        // so the (already completed) producer can be CONSUMED.
+        // wire_fanin_task is skipped here, so its pin release runs on this path
+        // too: an edge without retention (ordering-only or reduction-dropped)
+        // drops its submit->wire pin so the (already completed) producer can be
+        // CONSUMED.
         for_each_fanin_slot_state(payload, [&](PTO2TaskSlotState *producer, DepFlags flags) {
-            if (dep_has_wait(flags) && !dep_has_retain(flags)) {
+            if (!dep_has_retain(flags)) {
                 sched->release_producer(*producer);  // wiring-phase atomic, not bucketed (see wire_fanin_task)
             }
         });
@@ -1306,6 +1386,7 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const CoreTaskArgs &args)
     outputs.set_task_id(prepared.task_id);
     payload.init(args, outputs, prepared.alloc_result, layout);
     payload.fanin_actual_count = 0;
+    payload.fanin_wait_count = 0;
     payload.fanin_spill_start = 0;
     payload.fanin_spill_pool = &orch->rings[prepared.task_id.ring()].fanin_pool;
     CYCLE_COUNT_LAP(g_orch_args_cycle);

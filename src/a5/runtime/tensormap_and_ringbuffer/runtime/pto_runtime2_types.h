@@ -293,7 +293,8 @@ struct PTO2TaskPayload {
     // Candidate detection is the event-driven dual of fanin_refcount. Wiring
     // seeds producers already complete, and flagged producers increment the
     // count only after all logical blocks are launch-visible. Equality with
-    // fanin_actual_count makes the consumer eligible for early dispatch.
+    // fanin_wait_count (only DEP_WAIT producers notify) makes the consumer
+    // eligible for early dispatch.
     std::atomic<int32_t> dispatch_fanin{0};  // CONSUMER side: fully-published + pre-completed producers
     // Claimed-but-unpublished blocks are not launch-visible. Seq_cst updates
     // pair with early_dispatch_state so final publication cannot be lost when
@@ -316,6 +317,13 @@ struct PTO2TaskPayload {
     // records that producer release observed the owner; only cancellation clears
     // ownership before payload reinitialization.
     std::atomic<uint8_t> early_sync_drain_state{PTO2_EARLY_SYNC_DRAIN_NONE};
+    // Number of DEP_WAIT fanin edges (readiness-bearing), <= fanin_actual_count.
+    // fanin_actual_count is the TOTAL edge count for for_each iteration and
+    // release; this is the WAIT-edge count the early-dispatch threshold compares
+    // dispatch_fanin against. They differ once transitive reduction produces
+    // RETAIN-only / dropped edges that carry no DEP_WAIT. Sits in the padding
+    // before the 64B-aligned predicate, so the layout is unchanged.
+    int32_t fanin_wait_count{0};
     // === Cache line 9 (byte 576) — dispatch predicate (AICPU-only) ===
     // Offset is a fixed 576, independent of MAX_TENSOR_ARGS / MAX_SCALAR_ARGS.
     // AICore never reads it — args are materialized from the tensor_count / tensors
@@ -396,6 +404,11 @@ struct PTO2TaskPayload {
         early_dispatch_launch_state.store(PTO2_EARLY_DISPATCH_LAUNCH_NONE, std::memory_order_relaxed);
         running_slot_count.store(0, std::memory_order_relaxed);
         early_sync_drain_state.store(PTO2_EARLY_SYNC_DRAIN_NONE, std::memory_order_relaxed);
+        // fanin_actual_count and fanin_wait_count are intentionally absent: they are
+        // fanin metadata written by the submit flush after this init runs (via
+        // alloc_tensors zeroing them, then the flush storing the final totals), not
+        // consumer-side dispatch state a flagged producer could touch. Resetting them
+        // here would race the flush and is the init-order trap #1375 warned about.
     }
 };
 
