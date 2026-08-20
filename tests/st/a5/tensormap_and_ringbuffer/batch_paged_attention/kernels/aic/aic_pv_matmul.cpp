@@ -14,9 +14,10 @@
 // Processes batch_count batches in a single kernel invocation.
 // Per-batch addresses are computed from global tensor bases + block_table lookup.
 //
-// Supports two tile configurations via runtime dispatch:
+// Supports three tile configurations via runtime dispatch:
 //   Case1: (16, 128) @ (128, 128) -> (16, 128)
 //   Case2: (64,  64) @ ( 64, 128) -> (64, 128)
+//   Case3: (64,  64) @ ( 64, 256) -> (64, 256)
 //
 // Template: M=q_tile, K=block_size, N=head_dim
 
@@ -119,6 +120,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
 
     uint64_t q_tile_size = static_cast<uint64_t>(pij_batch->shapes[0] / batch_count);
     uint64_t block_size = static_cast<uint64_t>(pij_batch->shapes[1]);
+    uint64_t head_dim = static_cast<uint64_t>(oi_new_batch->shapes[1]);
 
     if (q_tile_size == 16 && block_size <= 16) {
         pv_matmul_batch_impl<16, 16, 16>(
@@ -126,6 +128,10 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
         );
     } else if (q_tile_size == 16) {
         pv_matmul_batch_impl<16, 128, 128>(
+            pij_batch, value_cache, block_table_t, oi_new_batch, batch_count, block_idx, block_num, batch_start
+        );
+    } else if (head_dim == 256) {
+        pv_matmul_batch_impl<64, 64, 256>(
             pij_batch, value_cache, block_table_t, oi_new_batch, batch_count, block_idx, block_num, batch_start
         );
     } else {

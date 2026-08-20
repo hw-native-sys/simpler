@@ -26,9 +26,10 @@
 //   - Canonical 3-stage pipeline: TLOAD(MTE2) → TMOV(MTE1) → TMATMUL(M)
 //   - Reverse-dependency events ensure buffer safety across iterations
 //
-// Supports two tile configurations via runtime dispatch:
+// Supports three tile configurations via runtime dispatch:
 //   Case1: (16, 128) @ (128, 128) -> (16, 128)
 //   Case2: (64,  64) @ ( 64, 128) -> (64, 128)
+//   Case3: (64,  64) @ ( 64, 256) -> (64, 256)
 //
 // pij is bfloat16 (from softmax_prepare TCVT).
 // vj is stored as (K, N) = (block_size, head_dim) in row-major (ND) layout.
@@ -158,9 +159,12 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ int32_t *bt = reinterpret_cast<__gm__ int32_t *>(block_table_t->buffer.addr);
 
     uint64_t q_tile_size = static_cast<uint64_t>(pij_buf->shapes[0]);
+    uint64_t head_dim = static_cast<uint64_t>(oi_new->shapes[1]);
 
     if (q_tile_size == 16) {
         pv_matmul_n_impl<16, 128, 128>(pij_base, val_base, oi_base, n_blocks, bt, bt_offset);
+    } else if (head_dim == 256) {
+        pv_matmul_n_impl<64, 64, 256>(pij_base, val_base, oi_base, n_blocks, bt, bt_offset);
     } else {
         pv_matmul_n_impl<64, 64, 128>(pij_base, val_base, oi_base, n_blocks, bt, bt_offset);
     }

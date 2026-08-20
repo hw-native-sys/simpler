@@ -21,9 +21,10 @@
 //   - qi TLOAD hoisted before the loop (constant across all iterations)
 //   - Double-buffered L1 B tiles: prefetch next kj during current TMATMUL+TSTORE
 //
-// Supports two tile configurations via runtime dispatch:
+// Supports three tile configurations via runtime dispatch:
 //   Case1: (16, 128) @ (128, 128).T -> (16, 128)
 //   Case2: (64, 128) @ (128,  64).T -> (64,  64)
+//   Case3: (64, 256) @ (256,  64).T -> (64,  64)
 //
 // Template: M=q_tile, K=head_dim, N=block_size
 
@@ -146,9 +147,12 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ int32_t *bt = reinterpret_cast<__gm__ int32_t *>(block_table_t->buffer.addr);
 
     uint64_t q_tile_size = static_cast<uint64_t>(qi->shapes[0]);
+    uint64_t head_dim = static_cast<uint64_t>(qi->shapes[1]);
 
     if (q_tile_size == 16) {
         qk_matmul_n_impl<16, 128, 128>(qi_base, key_base, sij_base, n_blocks, bt, bt_offset);
+    } else if (head_dim == 256) {
+        qk_matmul_n_impl<64, 256, 64>(qi_base, key_base, sij_base, n_blocks, bt, bt_offset);
     } else {
         qk_matmul_n_impl<64, 128, 64>(qi_base, key_base, sij_base, n_blocks, bt, bt_offset);
     }

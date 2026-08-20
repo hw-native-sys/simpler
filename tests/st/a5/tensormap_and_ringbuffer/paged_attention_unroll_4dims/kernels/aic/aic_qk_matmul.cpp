@@ -21,9 +21,10 @@
 // Optimizations:
 //   - qi TLOAD hoisted before the loop (constant across all iterations)
 //
-// Supports two tile configurations via runtime dispatch:
+// Supports three tile configurations via runtime dispatch:
 //   Case1: (16, 128) @ (128, 128).T -> (16, 128)
 //   Case2: (64, 128) @ (128,  64).T -> (64,  64)
+//   Case3: (64, 256) @ (256,  64).T -> (64,  64)
 //
 // Template: M=q_tile, K=head_dim, N=block_size
 
@@ -128,9 +129,12 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
 
     // qi is a 4D view (batch, q_len, num_heads_tile, head_dim); decode fixes batch=q_len=1.
     uint64_t q_tile_size = static_cast<uint64_t>(qi->shapes[2]);
+    uint64_t head_dim = static_cast<uint64_t>(qi->shapes[3]);
 
     if (q_tile_size == 16) {
         qk_matmul_n_impl<16, 128, 128>(qi, key_cache, block_table_t, sij_buf, n_blocks, bt_offset);
+    } else if (head_dim == 256) {
+        qk_matmul_n_impl<64, 256, 64>(qi, key_cache, block_table_t, sij_buf, n_blocks, bt_offset);
     } else {
         qk_matmul_n_impl<64, 128, 64>(qi, key_cache, block_table_t, sij_buf, n_blocks, bt_offset);
     }
