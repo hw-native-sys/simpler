@@ -48,14 +48,15 @@ protected:
     void SetUp() override {
         sm_handle = PTO2SharedMemoryHandle::create_and_init_default(sm_arena);
         ASSERT_NE(sm_handle, nullptr);
-        gm_heap.resize(HEAP_BYTES * PTO2_MAX_RING_DEPTH);
+        gm_heap.resize(HEAP_BYTES);
 
-        orch_layout = PTO2OrchestratorState::reserve_layout(runtime_arena, static_cast<int32_t>(PTO2_TASK_WINDOW_SIZE));
+        orch_layout =
+            PTO2OrchestratorState::reserve_layout(runtime_arena, static_cast<int32_t>(HBG_DEFAULT_TASK_CAPACITY));
         sched_layout = PTO2SchedulerState::reserve_layout(runtime_arena);
         ASSERT_NE(runtime_arena.commit(), nullptr);
 
         ASSERT_TRUE(orch.init_data_from_layout(
-            orch_layout, runtime_arena, sm_handle->sm_base, gm_heap.data(), HEAP_BYTES, PTO2_TASK_WINDOW_SIZE
+            orch_layout, runtime_arena, sm_handle->sm_base, gm_heap.data(), HEAP_BYTES, HBG_DEFAULT_TASK_CAPACITY
         ));
         ASSERT_TRUE(sched.init_data_from_layout(sched_layout, runtime_arena, sm_handle->sm_base));
         sched.wire_arena_pointers(sched_layout, runtime_arena);
@@ -76,6 +77,28 @@ protected:
     }
 };
 
+TEST_F(HbgGraphSubmitFailureTest, ExplicitDependencyRejectsNonzeroRingId) {
+    orch.begin_scope();
+
+    CoreTaskArgs producer_args;
+    const TaskOutputTensors producer = orch.submit_dummy_task(producer_args);
+    ASSERT_TRUE(producer.task_id().is_valid());
+
+    const PTO2TaskId invalid_dep = PTO2TaskId::make(1, producer.task_id().local());
+    CoreTaskArgs consumer_args;
+    consumer_args.set_dependencies(&invalid_dep, 1);
+    orch.submit_dummy_task(consumer_args);
+
+    EXPECT_TRUE(orch.fatal);
+    EXPECT_EQ(
+        sm_handle->header->orch_error_code.load(std::memory_order_acquire),
+        static_cast<int32_t>(PTO2_ERROR_INVALID_ARGS)
+    );
+    const PTO2TaskSlotState &producer_slot =
+        sm_handle->header->ring.get_slot_state_by_task_id(static_cast<int32_t>(producer.task_id().local()));
+    EXPECT_EQ(producer_slot.last_consumer_local_id, static_cast<int32_t>(producer.task_id().local()));
+}
+
 TEST_F(HbgGraphSubmitFailureTest, InFlightGraphSubmissionsReserveHeapOnlyAtCommit) {
     std::array<uint32_t, 16> storage{};
     uint32_t shape[] = {static_cast<uint32_t>(storage.size())};
@@ -92,7 +115,7 @@ TEST_F(HbgGraphSubmitFailureTest, InFlightGraphSubmissionsReserveHeapOnlyAtCommi
     EXPECT_FALSE(second.execute_block);
     ASSERT_TRUE(second.task_id.is_valid());
     EXPECT_EQ(second.task_id.local(), first.task_id.local() + 1);
-    EXPECT_EQ(orch.ring.task_allocator.heap_top(), 0u);
+    EXPECT_EQ(orch.task_allocator.heap_top(), 0u);
     EXPECT_EQ(graph_host_upload_count(*graph_state), 2u);
 
     ASSERT_TRUE(orch.graph_prepare(first.recording_handle, boundary_args));
@@ -102,11 +125,11 @@ TEST_F(HbgGraphSubmitFailureTest, InFlightGraphSubmissionsReserveHeapOnlyAtCommi
     node_args.add_output(recorded_output);
     ASSERT_TRUE(orch.submit_dummy_task(node_args).task_id().is_valid());
     ASSERT_TRUE(orch.graph_end());
-    EXPECT_EQ(orch.ring.task_allocator.heap_top(), 0u);
+    EXPECT_EQ(orch.task_allocator.heap_top(), 0u);
 
     orch.graph_commit();
     EXPECT_FALSE(orch.fatal);
-    EXPECT_GT(orch.ring.task_allocator.heap_top(), 0u);
+    EXPECT_GT(orch.task_allocator.heap_top(), 0u);
     const std::optional<GraphHostUpload> first_upload = graph_host_upload(*graph_state, 0);
     const std::optional<GraphHostUpload> second_upload = graph_host_upload(*graph_state, 1);
     ASSERT_TRUE(first_upload.has_value());
@@ -226,7 +249,7 @@ TEST_F(HbgGraphSubmitFailureTest, WorkerRecordsWhileMainThreadSubmitsSameHashShe
     ASSERT_TRUE(third.task_id.is_valid());
     EXPECT_EQ(second.task_id.local(), first.task_id.local() + 1);
     EXPECT_EQ(third.task_id.local(), first.task_id.local() + 2);
-    EXPECT_EQ(orch.ring.task_allocator.heap_top(), 0u) << "no shell may take heap before commit";
+    EXPECT_EQ(orch.task_allocator.heap_top(), 0u) << "no shell may take heap before commit";
 
     orch.graph_commit();
     ASSERT_FALSE(orch.fatal);
@@ -367,13 +390,13 @@ TEST_F(HbgGraphSubmitFailureTest, FaninFailureLatchesFatalWithoutPartialUpload) 
     node_args.add_input(boundary);
     TensorCreateInfo recorded_output(shape, 1, DataType::UINT32);
     node_args.add_output(recorded_output);
-    const uint64_t heap_top_before_record = orch.ring.task_allocator.heap_top();
+    const uint64_t heap_top_before_record = orch.task_allocator.heap_top();
     ASSERT_TRUE(orch.submit_dummy_task(node_args).task_id().is_valid());
-    EXPECT_EQ(orch.ring.task_allocator.heap_top(), heap_top_before_record);
+    EXPECT_EQ(orch.task_allocator.heap_top(), heap_top_before_record);
     ASSERT_TRUE(orch.graph_end());
-    EXPECT_EQ(orch.ring.task_allocator.heap_top(), heap_top_before_record);
+    EXPECT_EQ(orch.task_allocator.heap_top(), heap_top_before_record);
     orch.graph_commit();
-    EXPECT_GT(orch.ring.task_allocator.heap_top(), heap_top_before_record);
+    EXPECT_GT(orch.task_allocator.heap_top(), heap_top_before_record);
     ASSERT_FALSE(orch.fatal);
     const size_t uploads_before_failure = graph_host_upload_count(*graph_state);
 
@@ -393,7 +416,7 @@ TEST_F(HbgGraphSubmitFailureTest, FaninFailureLatchesFatalWithoutPartialUpload) 
     EXPECT_EQ(graph_host_upload_count(*graph_state), uploads_before_failure);
 }
 
-TEST_F(HbgGraphSubmitFailureTest, CachedGraphUsesFinalTaskWindowSlot) {
+TEST_F(HbgGraphSubmitFailureTest, CachedGraphUsesFinalTaskCapacitySlot) {
     std::array<uint32_t, 16> storage{};
     uint32_t shape[] = {static_cast<uint32_t>(storage.size())};
     ChipTensor boundary = make_tensor_external(storage.data(), shape, 1);
@@ -409,10 +432,10 @@ TEST_F(HbgGraphSubmitFailureTest, CachedGraphUsesFinalTaskWindowSlot) {
     node_args.add_input(boundary);
     ASSERT_TRUE(orch.submit_dummy_task(node_args).task_id().is_valid());
     ASSERT_TRUE(orch.graph_end());
-    ASSERT_EQ(orch.ring.task_allocator.active_count(), 1);
+    ASSERT_EQ(orch.task_allocator.active_count(), 1);
 
-    PTO2TaskAllocator &allocator = orch.ring.task_allocator;
-    while (allocator.active_count() < allocator.window_size() - 1) {
+    PTO2TaskAllocator &allocator = orch.task_allocator;
+    while (allocator.active_count() < allocator.task_capacity() - 1) {
         ASSERT_FALSE(allocator.alloc(0).failed());
     }
 
@@ -420,9 +443,9 @@ TEST_F(HbgGraphSubmitFailureTest, CachedGraphUsesFinalTaskWindowSlot) {
 
     EXPECT_FALSE(replay.execute_block);
     ASSERT_TRUE(replay.task_id.is_valid());
-    EXPECT_EQ(replay.task_id.local(), static_cast<uint32_t>(allocator.window_size() - 1));
-    EXPECT_EQ(allocator.active_count(), allocator.window_size());
-    EXPECT_EQ(sm_handle->header->ring.fc.current_task_index.load(std::memory_order_acquire), allocator.window_size());
+    EXPECT_EQ(replay.task_id.local(), static_cast<uint32_t>(allocator.task_capacity() - 1));
+    EXPECT_EQ(allocator.active_count(), allocator.task_capacity());
+    EXPECT_EQ(sm_handle->header->ring.fc.current_task_index.load(std::memory_order_acquire), allocator.task_capacity());
     EXPECT_EQ(sm_handle->header->orch_error_code.load(std::memory_order_acquire), PTO2_ERROR_NONE);
 }
 
@@ -676,7 +699,7 @@ TEST_F(HbgGraphSubmitFailureTest, ACachedGraphReplaysWhileAnotherKeyRecords) {
     ASSERT_TRUE(replay.task_id.is_valid());
     // A replay off the cache carries its own heap, unlike the zero-heap shells
     // key B is still deferring.
-    EXPECT_GT(orch.ring.task_allocator.heap_top(), 0u);
+    EXPECT_GT(orch.task_allocator.heap_top(), 0u);
 
     ASSERT_TRUE(orch.graph_prepare(second.recording_handle, args_b));
     CoreTaskArgs node_b;
@@ -704,7 +727,7 @@ TEST_F(HbgGraphSubmitFailureTest, AnOrdinaryAllocationInterleavesWithADeferredSh
     orch.begin_scope();
     const GraphScopeResult graph = orch.graph_begin(0x1905, boundary_args, 0x1736);
     ASSERT_TRUE(graph.recording);
-    EXPECT_EQ(orch.ring.task_allocator.heap_top(), 0u) << "the shell defers its heap";
+    EXPECT_EQ(orch.task_allocator.heap_top(), 0u) << "the shell defers its heap";
 
     // The ordinary task goes first, from the base of the heap.
     CoreTaskArgs ordinary_args;
@@ -712,7 +735,7 @@ TEST_F(HbgGraphSubmitFailureTest, AnOrdinaryAllocationInterleavesWithADeferredSh
     ordinary_args.add_output(ordinary_output);
     const TaskOutputTensors ordinary = orch.alloc_tensors(ordinary_args);
     ASSERT_TRUE(ordinary.task_id().is_valid());
-    const uint64_t heap_after_ordinary = orch.ring.task_allocator.heap_top();
+    const uint64_t heap_after_ordinary = orch.task_allocator.heap_top();
     EXPECT_GT(heap_after_ordinary, 0u);
 
     // Only then does the recording finish and the shell claim its block.
@@ -725,7 +748,7 @@ TEST_F(HbgGraphSubmitFailureTest, AnOrdinaryAllocationInterleavesWithADeferredSh
     orch.graph_commit();
 
     EXPECT_FALSE(orch.fatal);
-    EXPECT_GT(orch.ring.task_allocator.heap_top(), heap_after_ordinary)
+    EXPECT_GT(orch.task_allocator.heap_top(), heap_after_ordinary)
         << "the shell's block sits above the ordinary task's, not before it";
     PTO2SharedMemoryRingHeader &ring = sm_handle->header->ring;
     const int32_t shell_slot = ring.get_slot_by_task_id(static_cast<int32_t>(graph.task_id.local()));

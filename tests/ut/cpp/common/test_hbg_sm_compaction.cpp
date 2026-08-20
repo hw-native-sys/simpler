@@ -63,8 +63,8 @@ public:
         const auto off = pto2_sm_layout::ring_segment_offsets(WINDOW);
         auto *header = reinterpret_cast<PTO2SharedMemoryHeader *>(image_.base());
         auto &ring = header->ring;
-        ring.task_window_size = WINDOW;
-        ring.task_window_mask = static_cast<int32_t>(WINDOW - 1);
+        ring.task_capacity = WINDOW;
+        ring.task_capacity_mask = static_cast<int32_t>(WINDOW - 1);
         ring.fc.current_task_index.store(static_cast<int32_t>(SUBMITTED), std::memory_order_relaxed);
         ring.task_descriptors = descriptors();
         ring.task_payloads = payloads();
@@ -171,7 +171,7 @@ TEST(HbgSmCompaction, CarriesEveryLiveSlotsContent) {
     // The header's pitch-independent fields come across; the mirror slot past the
     // prefix does not.
     auto &ring = reinterpret_cast<const PTO2SharedMemoryHeader *>(compacted.image.base())->ring;
-    EXPECT_EQ(ring.task_window_size, WINDOW);
+    EXPECT_EQ(ring.task_capacity, WINDOW);
     EXPECT_EQ(ring.fc.current_task_index.load(std::memory_order_relaxed), static_cast<int32_t>(SUBMITTED));
 }
 
@@ -228,7 +228,7 @@ TEST(HbgSmCompaction, ZeroSubmittedShipsTheHeaderAlone) {
 
     EXPECT_EQ(compacted.bytes, pto2_sm_layout::ring_segment_offsets(1).end);
     auto &ring = reinterpret_cast<const PTO2SharedMemoryHeader *>(compacted.image.base())->ring;
-    EXPECT_EQ(ring.task_window_size, WINDOW);
+    EXPECT_EQ(ring.task_capacity, WINDOW);
     EXPECT_EQ(ring.task_descriptors, nullptr);
 }
 

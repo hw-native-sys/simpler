@@ -110,7 +110,7 @@ the run.
 
 `host_build_graph` is whole-graph-resident. Task slots, heap bytes, fanin IDs,
 and TensorMap entries are not reclaimed while the graph is executing. The graph
-must fit the configured task window, heap, and TensorMap pool before launch.
+must fit the configured task capacity, heap, and TensorMap pool before launch.
 
 ## Validation
 

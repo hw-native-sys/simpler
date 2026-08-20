@@ -58,8 +58,9 @@ worker.run(handle, args, cfg)
 ```
 
 In a `@scene_test`, per-case knobs live under `"config"`, including
-`aicpu_thread_num` and — on `tensormap_and_ringbuffer` — `runtime_env` ring
-sizing (`ring_task_window`, `ring_heap`, `ring_dep_pool`).
+`aicpu_thread_num` and `runtime_env` sizing. HBG interprets
+`ring_task_window[0]` and `ring_heap[0]` as its whole-graph task capacity and
+heap size. `tensormap_and_ringbuffer` uses all slots and `ring_dep_pool`.
 
 ## Reading the results
 

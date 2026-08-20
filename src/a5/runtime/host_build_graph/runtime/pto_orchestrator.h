@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * PTO Runtime2 - Orchestrator Interface
+ * Host-build-graph orchestrator interface.
  *
  * The Orchestrator is responsible for:
  * 1. Executing the orchestration function (Turing-complete control flow)
@@ -18,11 +18,7 @@
  * 4. Building the dependency graph using TensorMap
  * 5. Managing buffer scopes for lifecycle control
  *
- * The Orchestrator can run on either:
- * - Host CPU (lower latency for complex control, easier debugging)
- * - Device AI_CPU (lower latency for task submission)
- *
- * Based on: docs/RUNTIME_LOGIC.md
+ * HBG runs the orchestrator to completion on the host before device execution.
  */
 
 #pragma once
@@ -42,8 +38,8 @@ struct GraphHostState;
 
 /**
  * Layout descriptor produced by PTO2OrchestratorState::reserve_layout(). Holds
- * arena offsets for every sub-region the orchestrator owns (per-ring fanin
- * pools, scope arrays, plus the nested PTO2TensorMap layout).
+ * arena offsets for every sub-region the orchestrator owns (fanin
+ * deduplication, scope arrays, plus the nested PTO2TensorMap layout).
  */
 struct PTO2OrchestratorLayout {
     size_t off_fanin_seen_epoch;
@@ -67,8 +63,8 @@ struct PTO2OrchestratorState {
     // === SHARED MEMORY ACCESS ===
     PTO2SharedMemoryHeader *sm_header;
 
-    // === RING RESOURCES (single ring) ===
-    PTO2RingSet ring;
+    // === GRAPH STORAGE ===
+    PTO2TaskAllocator task_allocator;
     uint32_t *fanin_seen_epoch;
     uint32_t fanin_seen_current_epoch{1};
 
@@ -98,7 +94,7 @@ struct PTO2OrchestratorState {
 
     // === GM HEAP (for output buffers) ===
     void *gm_heap_base;     // Base address of GM heap
-    uint64_t gm_heap_size;  // Total size of GM heap (all rings)
+    uint64_t gm_heap_size;  // Total size of the GM heap
 
     // === FATAL ERROR ===
     // Fatal error flag (single-thread access by orchestrator, no atomic needed)
@@ -126,23 +122,23 @@ struct PTO2OrchestratorState {
 
     // === Cold-path API (defined in pto_orchestrator.cpp) ===
 
-    // Phase 1: declare every sub-region (per-ring fanin pool, scope arrays,
-    // tensor_map sub-layout) on the supplied arena. task_window_sizes feeds
+    // Phase 1: declare every sub-region (fanin deduplication, scope arrays,
+    // tensor_map sub-layout) on the supplied arena. task_capacity feeds
     // the nested tensor_map layout. Returned layout is consumed by
     // init_from_layout.
-    static PTO2OrchestratorLayout reserve_layout(DeviceArena &arena, int32_t task_window_size);
+    static PTO2OrchestratorLayout reserve_layout(DeviceArena &arena, int32_t task_capacity);
 
     // Phase 3a: write everything *except* arena-internal pointer fields.
     // sm_dev_base is the SM device address (only stored, never dereferenced);
-    // task_window_size feeds the SM address arithmetic. Safe to call on a host
+    // task_capacity feeds the SM address arithmetic. Safe to call on a host
     // arena that holds the prebuilt image.
     bool init_data_from_layout(
         const PTO2OrchestratorLayout &layout, DeviceArena &arena, void *sm_dev_base, void *gm_heap, uint64_t heap_size,
-        uint64_t task_window_size
+        uint64_t task_capacity
     );
 
-    // Phase 3b: write the arena-internal pointer fields (scope_tasks,
-    // scope_begins, ring.fanin_pool.base, tensor_map.{buckets,entry_pool,
+    // Phase 3b: write the arena-internal pointer fields (fanin_seen_epoch,
+    // scope_tasks, scope_begins, tensor_map.{buckets,entry_pool,
     // free_entry_list,task_entry_heads}, scheduler reference).
     // Idempotent — host runs once on the image, AICPU runs once after attach.
     void wire_arena_pointers(const PTO2OrchestratorLayout &layout, DeviceArena &arena, PTO2SchedulerState *scheduler);

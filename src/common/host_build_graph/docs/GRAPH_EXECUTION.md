@@ -4,19 +4,19 @@ Graph Execution is available only in the `host_build_graph` runtime. A Graph is
 a composite incore task: it is submitted and completed once like an AIC, AIV,
 MIX, or SPMD task, but contains a recorded task DAG.
 
-Every invocation places exactly one `GRAPH` task in the host task window. On a
+Every invocation consumes exactly one slot from HBG's task capacity. On a
 first miss, the caller immediately submits an outer task shell keyed by Graph
-identity while a recording thread records the DAG off the ring. Internal
-submissions build host-only node metadata and assign output addresses from a
-private bit-63 virtual range instead of consuming task-window slots or heap.
-Later calls for the same in-flight identity submit more shells without waiting
-for recording, and a call for a *different* identity opens its own recording on
-its own thread rather than waiting. At orchestration completion, the caller joins
-every recording and fills each shell's heap range and Definition content hash.
-Cached invocations submit the same one `GRAPH` task directly — a cache hit never
-waits on a recording. In both cases the device Scheduler expands the saved
-topology and dispatches the internal nodes; the Host Orchestrator never submits
-those nodes as ring tasks.
+identity while a recording thread records the DAG outside shared task storage.
+Internal submissions build host-only node metadata and assign output addresses
+from a private bit-63 virtual range instead of consuming task-capacity slots or
+heap. Later calls for the same in-flight identity submit more shells without
+waiting for recording, and a call for a *different* identity opens its own
+recording on its own thread rather than waiting. At orchestration completion,
+the caller joins every recording and fills each shell's heap range and
+Definition content hash. Cached invocations submit the same one `GRAPH` task
+directly; a cache hit never waits on a recording. In both cases the device
+Scheduler expands the saved topology and dispatches the internal nodes; the
+Host Orchestrator never submits those nodes as shared tasks.
 
 Boundary contracts are checked before an in-flight shell is accepted. Once a
 shell has entered the task/dependency sequence, an unsupported construct found
@@ -354,7 +354,7 @@ persistent-format version would currently have no effect.
 For a cache hit, the Host Orchestrator:
 
 1. validates the fixed boundary contract;
-2. reserves one task-window slot;
+2. reserves one task-capacity slot;
 3. reserves one heap block large enough for every internal intermediate, plus
    the Definition's `execution_storage_bytes` for the execution the device
    materializes into;
@@ -362,7 +362,7 @@ For a cache hit, the Host Orchestrator:
 5. emits one outer `GRAPH` task;
 6. stages the exact-size POD submission image for upload after orchestration.
 
-Internal nodes consume no ring task-window slots. Their descriptor, payload,
+Internal nodes consume no HBG task-capacity slots. Their descriptor, payload,
 and slot state live in the tail of the outer `GRAPH` task's own heap block,
 past `required_heap`: one `PTO2TaskAllocator::alloc` covers both halves the
 task owns, so the storage is reclaimed with the task's packed outputs and
@@ -387,7 +387,7 @@ is patched on the way: a slot state names its payload and descriptor by a delta
 from its own address, so the bytes the Host wrote are the bytes the device
 schedules.
 
-All AICPU threads classify disjoint slices of the completed task window behind
+All AICPU threads classify disjoint slices of the submitted task range behind
 one startup barrier. A Graph task enters preparation and external-fanin
 classification during that scan, so Graph execution is interleaved with other
 ready tasks at the same scheduling level once the Scheduler starts.
@@ -421,7 +421,7 @@ dependency wiring remains an Orchestrator responsibility:
 - materialization registers each non-root on one producer selected from its
   saved fanin CSR;
 - a node's release/acquire `task_state` is its Graph-local completion flag, so
-  internal nodes need neither ring completion flags nor task-window slots;
+  internal nodes need neither outer-task completion flags nor task-capacity slots;
 - producer completion closes and drains only its current wake-list rather than
   traversing the saved fanout CSR;
 - a woken consumer scans its saved fanin CSR and either enters its shape queue
@@ -461,7 +461,7 @@ Conditions detected before an outer shell is accepted use the ordinary path:
 - runtime-allocated boundary outputs;
 - more than 32 boundary Tensors;
 - more than 16 Definitions;
-- insufficient task-window or known cache-hit heap capacity.
+- insufficient task-capacity or known cache-hit heap capacity.
 
 The following constructs are discovered only while a thread records the
 first Definition. Because its outer shell is already in the task/dependency

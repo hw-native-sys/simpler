@@ -127,7 +127,7 @@ takes a device pointer; `DataType` carries the element types.
 | `enable_dep_gen` | `0` | Emit the dependency graph |
 | `enable_scope_stats` | `0` | Writes `<output_prefix>/scope_stats/scope_stats.jsonl` |
 | `output_prefix` | `""` | **Required whenever any diagnostic is enabled** |
-| `runtime_env` | — | `ring_task_window`, `ring_heap`, `ring_dep_pool`; `tensormap_and_ringbuffer` only |
+| `runtime_env` | — | Runtime sizing. HBG uses `ring_task_window[0]` as its whole-graph task capacity and reads `ring_heap[0]`; `tensormap_and_ringbuffer` uses all slots and `ring_dep_pool` |
 
 `validate()` runs at every submit/run entry point and throws if a diagnostic is
 on without `output_prefix`, or if a ring override breaks the ring's constraints.

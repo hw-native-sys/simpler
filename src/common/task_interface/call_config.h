@@ -57,8 +57,8 @@ inline constexpr int RUNTIME_ENV_UINT64_FIELD_COUNT = RUNTIME_ENV_FIELD_GROUPS *
 // Per-task runtime-environment overrides — the programmatic equivalent of the
 // `PTO2_RING_*` env vars, grouped under their own sub-struct so they read as a
 // distinct configuration tier from the top-level `aicpu_thread_num` knob.
-// Consumed by tensormap_and_ringbuffer only; other runtimes
-// ignore them.
+// HBG consumes ring_task_window[0] as its whole-graph task capacity and reads ring_heap[0];
+// tensormap_and_ringbuffer consumes every slot and ring_dep_pool.
 //
 // Each resource is a per-scope-depth-ring array (index 0..3). A 0 entry is
 // unset and falls through to the next precedence tier: per-ring entry >

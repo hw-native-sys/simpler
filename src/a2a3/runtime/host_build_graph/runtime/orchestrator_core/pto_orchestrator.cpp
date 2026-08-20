@@ -944,9 +944,7 @@ GraphHostDefinitionList graph_host_definitions(GraphHostState &state) {
 static uint32_t next_fanin_seen_epoch(PTO2OrchestratorState *orch) {
     uint32_t next = orch->fanin_seen_current_epoch + 1;
     if (next == 0) {
-        memset(
-            orch->fanin_seen_epoch, 0, static_cast<size_t>(orch->sm_header->ring.task_window_size) * sizeof(uint32_t)
-        );
+        memset(orch->fanin_seen_epoch, 0, static_cast<size_t>(orch->sm_header->ring.task_capacity) * sizeof(uint32_t));
         next = 1;
     }
     orch->fanin_seen_current_epoch = next;
@@ -972,10 +970,7 @@ struct PTO2FaninBuilder {
     int32_t self_local{0};
     PTO2TaskPayload *payload{nullptr};
 
-    bool mark_seen(uint8_t prod_ring, int32_t prod_slot) {
-        if (prod_ring >= PTO2_MAX_RING_DEPTH || prod_slot < 0) {
-            return false;
-        }
+    bool mark_seen(int32_t prod_slot) {
         uint32_t *seen = orch->fanin_seen_epoch;
         uint32_t slot = static_cast<uint32_t>(prod_slot);
         if (seen[slot] == seen_epoch) {
@@ -986,19 +981,27 @@ struct PTO2FaninBuilder {
     }
 };
 
-static bool append_fanin_or_fail(
-    PTO2OrchestratorState *orch, uint8_t prod_ring, int32_t prod_slot, PTO2TaskSlotState *prod_state,
-    PTO2TaskId producer_task_id, PTO2FaninBuilder *fanin_builder
-) {
+static bool
+append_fanin_or_fail(PTO2OrchestratorState *orch, PTO2TaskId producer_task_id, PTO2FaninBuilder *fanin_builder) {
+    if (!producer_task_id.is_valid() || producer_task_id.ring() != 0) {
+        orch->report_fatal(PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "HBG dependencies require valid ring-zero task ids");
+        return false;
+    }
+
+    PTO2SharedMemoryRingHeader &ring = orch->sm_header->ring;
+    const int32_t producer_local = static_cast<int32_t>(producer_task_id.local());
+    const int32_t prod_slot = ring.get_slot_by_task_id(producer_local);
+    PTO2TaskSlotState *prod_state = &ring.get_slot_state_by_slot(prod_slot);
+
     // Skip a stale/reused producer slot: the cached owner id no longer resolves
     // to this producer (defensive — whole-graph-resident hbg does not reuse slots
     // at build time). A COMPLETED producer IS a real fanin edge under polling (its
     // completion_flags byte is set), so it is not skipped.
-    if (prod_state->task == nullptr || prod_state->task->task_id.local() != producer_task_id.local()) {
+    if (prod_state->task == nullptr || prod_state->task->task_id != producer_task_id) {
         return true;
     }
-    // Dedup by (ring, slot). Single-ring hbg: prod_ring is always 0.
-    if (fanin_builder->mark_seen(prod_ring, prod_slot)) {
+    // Dedup by slot; HBG has one task-capacity domain.
+    if (fanin_builder->mark_seen(prod_slot)) {
         return true;
     }
     if (fanin_builder->count >= PTO2_MAX_FANIN) {
@@ -1018,7 +1021,7 @@ static bool append_fanin_or_fail(
     fanin_builder->payload->fanin_local_ids[fanin_builder->count++] = static_cast<int32_t>(producer_task_id.local());
 
     // Reclaim gate: record this task as a consumer of the producer. The producer
-    // slot retires once the per-ring completed_watermark reaches this consumer id.
+    // slot retires once completed_watermark reaches this consumer id.
     if (fanin_builder->self_local > prod_state->last_consumer_local_id) {
         prod_state->last_consumer_local_id = fanin_builder->self_local;
     }
@@ -1054,8 +1057,7 @@ static bool prepare_task(
     TaskAttrs task_attrs, PTO2PreparedTask *out
 ) {
     always_assert(orch->scope_stack_top >= 0 && "Cannot submit task outside a scope");
-    uint8_t ring_id = 0;
-    auto &allocator = orch->ring.task_allocator;
+    auto &allocator = orch->task_allocator;
 
     int16_t block_num = args.launch_spec.block_num();
     int32_t active_subtasks_per_block = __builtin_popcount(active_mask.core_mask());
@@ -1075,7 +1077,7 @@ static bool prepare_task(
         return false;
     }
 
-    out->task_id = PTO2TaskId::make(ring_id, static_cast<uint32_t>(out->alloc_result.task_id));
+    out->task_id = PTO2TaskId::make(0, static_cast<uint32_t>(out->alloc_result.task_id));
     out->slot_state = &orch->sm_header->ring.get_slot_state_by_slot(out->alloc_result.slot);
     out->task = &orch->sm_header->ring.task_descriptors[out->alloc_result.slot];
     out->payload = &orch->sm_header->ring.task_payloads[out->alloc_result.slot];
@@ -1092,7 +1094,7 @@ static bool prepare_task(
 
     // Re-bind payload/task pointers each submit. Value is per-slot constant
     // (same as &task_payloads[slot] / &task_descriptors[slot]), but writing
-    // here lets RingSchedState::init() skip the O(window_size) bind loop.
+    // here lets RingSchedState::init() skip the O(task_capacity) bind loop.
     // Both writes hit the same 64B slot_state cache line we're about to
     // dirty below, so the extra cost is two stores on an already-hot line.
     // Must precede the Orch-side wiring publish at the end of
@@ -1137,12 +1139,11 @@ static void scope_tasks_push(PTO2OrchestratorState *orch, PTO2TaskSlotState *tas
     if (orch->scope_tasks_size >= orch->scope_tasks_capacity) {
         // scope_tasks lives in the per-Worker arena (single backing allocation),
         // so realloc is not legal. Capacity is the total in-flight slot budget
-        // (the runtime task window; see reserve_layout) — hitting it means the
-        // ring is saturated, so no further push could succeed regardless of
-        // buffer growth.
+        // (the runtime task capacity; see reserve_layout). Once saturated, no
+        // further push can succeed regardless of buffer growth.
         orch->report_fatal(
-            PTO2_ERROR_SCOPE_TASKS_OVERFLOW, __FUNCTION__,
-            "scope_tasks buffer saturated at %d entries (all rings full)", orch->scope_tasks_capacity
+            PTO2_ERROR_SCOPE_TASKS_OVERFLOW, __FUNCTION__, "scope_tasks buffer saturated at %d entries",
+            orch->scope_tasks_capacity
         );
         return;
     }
@@ -1197,11 +1198,11 @@ void PTO2OrchestratorState::begin_scope(PTO2ScopeMode mode) {
     // task/heap start-end and tensormap usage at the scope boundary.
     if (is_scope_stats_enabled()) {
         uint8_t ring_id = 0;
-        auto &alloc = orch->ring.task_allocator;
+        auto &alloc = orch->task_allocator;
         // Polling: no dep_pool to report (readiness is via completion_flags).
         int32_t dep_pool_tail = 0;
         int32_t dep_pool_top = 0;
-        // Both rings are forward-only here, so their reclaim ends stay at 0.
+        // Task and heap allocation frontiers are forward-only, so their reclaim ends stay at 0.
         scope_stats_begin(
             ring_id, /*task_start=*/0, alloc.task_head(), /*heap_start=*/0, alloc.heap_top(), dep_pool_tail,
             dep_pool_top, orch->tensor_map.current_used()
@@ -1236,11 +1237,11 @@ void PTO2OrchestratorState::end_scope() {
     // emits the end-boundary record and tears down bookkeeping.
     if (is_scope_stats_enabled()) {
         uint8_t ring_id = 0;
-        auto &alloc = orch->ring.task_allocator;
+        auto &alloc = orch->task_allocator;
         // Polling: no dep_pool to report (readiness is via completion_flags).
         int32_t dep_pool_tail = 0;
         int32_t dep_pool_top = 0;
-        // Both rings are forward-only here, so their reclaim ends stay at 0.
+        // Task and heap allocation frontiers are forward-only, so their reclaim ends stay at 0.
         scope_stats_end(
             ring_id, /*task_start=*/0, alloc.task_head(), /*heap_start=*/0, alloc.heap_top(), dep_pool_tail,
             dep_pool_top, orch->tensor_map.current_used()
@@ -1361,21 +1362,16 @@ static TaskOutputTensors submit_task_common(
 
     for (uint32_t i = 0; i < args.explicit_dep_count(); i++) {
         PTO2TaskId dep_task_id = args.explicit_dep(i);
-        if (!dep_task_id.is_valid()) {
+        if (!dep_task_id.is_valid() || dep_task_id.ring() != 0) {
             orch->report_fatal(
-                PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "Arg.set_dependencies(...) requires valid task ids"
+                PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "Arg.set_dependencies(...) requires valid ring-zero task ids"
             );
             return result;
         }
         if (capture_dep_graph) {
             dep_gen_host_graph_add_explicit_edge(dep_task_id.raw);
         }
-        uint8_t dep_ring_id = dep_task_id.ring();
-        PTO2SharedMemoryRingHeader &dep_ring = orch->sm_header->ring;
-        int32_t dep_local_task_id = static_cast<int32_t>(dep_task_id.local());
-        int32_t dep_slot = dep_ring.get_slot_by_task_id(dep_local_task_id);
-        PTO2TaskSlotState *producer_slot_state = &dep_ring.get_slot_state_by_slot(dep_slot);
-        if (!append_fanin_or_fail(orch, dep_ring_id, dep_slot, producer_slot_state, dep_task_id, &fanin_builder)) {
+        if (!append_fanin_or_fail(orch, dep_task_id, &fanin_builder)) {
             return result;
         }
     }
@@ -1387,11 +1383,7 @@ static TaskOutputTensors submit_task_common(
     };
 
     auto runtime_emit = [&](PTO2TaskId producer_task_id) -> bool {
-        uint8_t prod_ring = producer_task_id.ring();
-        PTO2SharedMemoryRingHeader &producer_ring = orch->sm_header->ring;
-        int32_t prod_slot = producer_ring.get_slot_by_task_id(static_cast<int32_t>(producer_task_id.local()));
-        PTO2TaskSlotState *prod_state = &producer_ring.get_slot_state_by_slot(prod_slot);
-        return append_fanin_or_fail(orch, prod_ring, prod_slot, prod_state, producer_task_id, &fanin_builder);
+        return append_fanin_or_fail(orch, producer_task_id, &fanin_builder);
     };
 
     // The capture branch instantiates compute_task_fanin with a live Annotate;
@@ -1652,10 +1644,10 @@ bool graph_submit_outer(
     bool defer_heap, const GraphTaskArgs &args, PTO2TaskId *submitted_id
 ) {
     always_assert(orch->scope_stack_top >= 0 && "Cannot submit Graph outside a scope");
-    auto &allocator = orch->ring.task_allocator;
-    if (allocator.active_count() >= allocator.window_size() ||
+    auto &allocator = orch->task_allocator;
+    if (allocator.active_count() >= allocator.task_capacity() ||
         (!defer_heap && static_cast<uint64_t>(owned_heap) > allocator.heap_available())) {
-        LOG_WARN("%s", "[GraphExecution] task-window/heap preflight failed; using ordinary path");
+        LOG_WARN("%s", "[GraphExecution] task-capacity/heap preflight failed; using ordinary path");
         return false;
     }
 
@@ -1706,10 +1698,7 @@ bool graph_submit_outer(
 
     PTO2FaninBuilder fanin_builder(orch, &payload, static_cast<int32_t>(task_id.local()), next_fanin_seen_epoch(orch));
     auto emit = [&](PTO2TaskId producer_id) -> bool {
-        const int32_t producer_local = static_cast<int32_t>(producer_id.local());
-        const int32_t producer_slot = ring.get_slot_by_task_id(producer_local);
-        PTO2TaskSlotState *producer = &ring.get_slot_state_by_slot(producer_slot);
-        return append_fanin_or_fail(orch, producer_id.ring(), producer_slot, producer, producer_id, &fanin_builder);
+        return append_fanin_or_fail(orch, producer_id, &fanin_builder);
     };
     // An outer GRAPH task is a ring task like any other, so the dependency graph
     // has to carry it: without this the whole Graph — and every edge into it —
@@ -1797,9 +1786,7 @@ bool graph_finalize_pending_submissions(PTO2OrchestratorState *orch, GraphHostSt
         }
         void *packed_base = nullptr;
         void *packed_end = nullptr;
-        if (!orch->ring.task_allocator.reserve_deferred_heap(
-                static_cast<int32_t>(owned_heap), &packed_base, &packed_end
-            )) {
+        if (!orch->task_allocator.reserve_deferred_heap(static_cast<int32_t>(owned_heap), &packed_base, &packed_end)) {
             if (failed_key != nullptr) *failed_key = submission->graph_key;
             return false;
         }
@@ -1812,10 +1799,10 @@ bool graph_finalize_pending_submissions(PTO2OrchestratorState *orch, GraphHostSt
 }
 
 // Record one internal Graph node during the recording pass without consuming a
-// ring task-window slot. Builds the node's metadata and materialized outputs
+// shared task slot. Builds the node's metadata and materialized outputs
 // exactly as submit_task_common would, but assigns output buffers from the
 // bit-63 virtual address range and derives internal fanins from tensor-source
-// classification — so no ring slot, tensormap entry, fanin-pool entry, or upload
+// classification — so no shared task slot, tensormap entry, fanin-pool entry, or upload
 // is produced for the node. The resulting Definition is later attached to the
 // outer GRAPH shells already submitted by the main thread. The returned
 // TaskOutputTensors borrow the node's own tensor storage; moving the node into
@@ -2144,7 +2131,7 @@ PTO2OrchestratorState::graph_begin(uint64_t graph_key, const GraphTaskArgs &args
 
     auto recording = std::make_unique<GraphRecording>();
     recording->full_key = full_key;
-    recording->start_local_task_id = orch->ring.task_allocator.active_count();
+    recording->start_local_task_id = orch->task_allocator.active_count();
     if (!graph_recording_init_tensor_map(*recording)) {
         LOG_WARN("[GraphExecution] recording hazard map allocation failed; using ordinary path");
         return result;
@@ -2572,11 +2559,9 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const CoreTaskArgs &args)
 
 void PTO2OrchestratorState::mark_done() {
     auto *orch = this;
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        int32_t total_tasks = orch->ring.task_allocator.active_count();
-        if (total_tasks > 0) {
-            LOG_DEBUG("=== [Orchestrator] ring %d: total_tasks=%d ===", r, total_tasks);
-        }
+    int32_t total_tasks = orch->task_allocator.active_count();
+    if (total_tasks > 0) {
+        LOG_DEBUG("=== [Orchestrator] total_tasks=%d ===", total_tasks);
     }
     orch->sm_header->orchestrator_done.store(1, std::memory_order_release);
     orch->scope_tasks_size = 0;

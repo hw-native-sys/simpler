@@ -167,7 +167,7 @@ pins the invariant that makes that safe.
 
 ### 3.2 Bounded H2D Upload
 
-The shared-memory mirror is sized to ring capacity (task window) but a run only
+The shared-memory mirror is sized to the configured task capacity, but a run only
 writes `[0, total_tasks)`, and the device boots scheduler-only and reads no SM slot
 past `total_tasks`. So the SM H2D shipped each run is bounded, not capacity-sized —
 the contract that keeps `bind` proportional to the workload.
@@ -200,7 +200,7 @@ image.
 
 ### 4.1 Allocation Failure
 
-The graph must fit the configured task window, heap, fanin capacity, and
+The graph must fit the configured task capacity, heap, fanin capacity, and
 TensorMap pool. Because nothing is reclaimed, a request that does not fit can
 never become satisfiable — the allocator names the exhausted resource and fails
 on the spot. There is no wait and no timeout.
@@ -209,8 +209,8 @@ Representative allocator output is:
 
 ```text
 FATAL: Graph Heap Exhausted!
-The whole graph must fit the configured ring; nothing is reclaimed mid-run.
-  Task window: used=.../...
+The whole graph must fit the configured capacities; nothing is reclaimed mid-run.
+  Task capacity: used=.../...
   Graph heap:  used=.../..., available=...
   Requested:   ... bytes + 1 task slot
 ```

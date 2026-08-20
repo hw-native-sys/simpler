@@ -55,13 +55,13 @@ class HbgTensorMapTest : public ::testing::Test {
 protected:
     static constexpr int32_t NUM_BUCKETS = 16;
     static constexpr int32_t POOL_SIZE = 64;
-    static constexpr int32_t WINDOW_SIZE = 32;
+    static constexpr int32_t TASK_CAPACITY = 32;
 
     PTO2TensorMap tmap{};
     DeviceArena arena;
 
     void SetUp() override {
-        auto layout = PTO2TensorMap::reserve_layout(arena, NUM_BUCKETS, POOL_SIZE, WINDOW_SIZE);
+        auto layout = PTO2TensorMap::reserve_layout(arena, NUM_BUCKETS, POOL_SIZE, TASK_CAPACITY);
         ASSERT_NE(arena.commit(), nullptr);
         ASSERT_TRUE(tmap.init_data_from_layout(layout, arena));
         tmap.wire_arena_pointers(layout, arena);
@@ -98,9 +98,9 @@ TEST_F(HbgTensorMapTest, EveryProducerOfARegionStaysVisible) {
 // slot reuse is not retirement.
 TEST_F(HbgTensorMapTest, SlotAliasingTasksBothKeepTheirEntries) {
     ChipTensor t = make_test_tensor(0x1000, 256);
-    // Task 0 and task 0 + WINDOW_SIZE share slot 0 (local_id & (WINDOW_SIZE-1)).
+    // Task 0 and task 0 + TASK_CAPACITY share slot 0 (local_id & (TASK_CAPACITY-1)).
     tmap.insert(t, PTO2TaskId::make(0, 0));
-    tmap.insert(t, PTO2TaskId::make(0, WINDOW_SIZE));
+    tmap.insert(t, PTO2TaskId::make(0, TASK_CAPACITY));
 
     EXPECT_EQ(tmap.valid_count(), 2);
     TestLookupResult result;
@@ -111,7 +111,7 @@ TEST_F(HbgTensorMapTest, SlotAliasingTasksBothKeepTheirEntries) {
         producers.push_back(e.entry->producer_task_id);
     }
     EXPECT_NE(std::find(producers.begin(), producers.end(), PTO2TaskId::make(0, 0)), producers.end());
-    EXPECT_NE(std::find(producers.begin(), producers.end(), PTO2TaskId::make(0, WINDOW_SIZE)), producers.end());
+    EXPECT_NE(std::find(producers.begin(), producers.end(), PTO2TaskId::make(0, TASK_CAPACITY)), producers.end());
 }
 
 // Without an explicit semantic removal, direct inserts consume one pool entry
@@ -134,7 +134,7 @@ TEST_F(HbgTensorMapTest, PoolOccupancyOnlyGrows) {
 // waiting for asynchronous reclaim that HBG does not have.
 TEST_F(HbgTensorMapTest, ExhaustedPoolStaysExhausted) {
     for (int32_t i = 0; i < POOL_SIZE; i++) {
-        tmap.insert(make_test_tensor(0x10000 + 0x100 * i, 64), PTO2TaskId::make(0, i % WINDOW_SIZE));
+        tmap.insert(make_test_tensor(0x10000 + 0x100 * i, 64), PTO2TaskId::make(0, i % TASK_CAPACITY));
     }
     EXPECT_EQ(tmap.current_used(), POOL_SIZE);
     EXPECT_EQ(tmap.free_entries(), 0);

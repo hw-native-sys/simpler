@@ -9,25 +9,11 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * PTO Runtime2 - Ring Buffer Data Structures
+ * host_build_graph task and heap allocation.
  *
- * Implements ring buffer designs for zero-overhead memory management:
- *
- * 1. TaskAllocator - Unified task slot + output buffer allocation
- *    - Combines task ring (slot allocation) and heap ring (output buffer allocation)
- *    - O(1) forward bump allocation for both task slots and heap buffers
- *    - Neither resource is reclaimed during a run, so exhaustion of either is a
- *      capacity error reported on the spot, never back-pressure to wait on
- *
- * 2. FaninPool - Fanin spill entry allocation
- *    - Ring buffer for spilled fanin entries
- *    - O(1) append allocation
- *    - Implicit reclamation with task ring
- *
- * 3. DepListPool - Dependency list entry allocation
- *    - Ring buffer for linked list entries
- *    - O(1) prepend operation
- *    - Implicit reclamation with task ring
+ * PTO2TaskAllocator combines task-slot and output-buffer allocation. Both are
+ * forward-only bump allocators because the whole graph remains resident for
+ * the run.
  *
  * Based on: docs/RUNTIME_LOGIC.md
  */
@@ -69,14 +55,14 @@ inline constexpr uint64_t GRAPH_RECORD_VIRTUAL_BASE = 1ULL << 63;
  *
  * host_build_graph is whole-graph-resident: the device runs only after the host
  * has built the entire graph, so no task slot or heap byte is ever reclaimed
- * while allocation is in progress. Both rings are therefore forward-only, and a
+ * while allocation is in progress. Both allocators are therefore forward-only, and a
  * request that does not fit can never become satisfiable by waiting — alloc()
  * reports the exhausted resource and fails on the spot.
  */
 class PTO2TaskAllocator {
 public:
     /**
-     * Initialize the allocator with task ring and heap ring resources.
+     * Initialize the allocator with task-capacity and heap resources.
      *
      * All pointer arguments are device addresses (live in SM / GM heap); this
      * function only stores them, no dereferences, so it is safe to invoke
@@ -85,15 +71,15 @@ public:
      * The ring starts at task id 0, matching the SM flow-control counter that
      * current_index_ptr points at (PTO2RingFlowControl::init() runs on the AICPU
      * during SM reset), so local_task_id_ stays in sync without reading the SM.
-     * Because ids are never reclaimed, alloc() caps them at window_size — they
+     * Because ids are never reclaimed, alloc() caps them at task_capacity — they
      * cannot run away toward INT32_MAX.
      */
     void init(
-        int32_t window_size, std::atomic<int32_t> *current_index_ptr, void *heap_base, uint64_t heap_size,
+        int32_t task_capacity, std::atomic<int32_t> *current_index_ptr, void *heap_base, uint64_t heap_size,
         std::atomic<int32_t> *error_code_ptr
     ) {
-        window_size_ = window_size;
-        window_mask_ = window_size - 1;
+        task_capacity_ = task_capacity;
+        task_capacity_mask_ = task_capacity - 1;
         current_index_ptr_ = current_index_ptr;
         heap_base_ = heap_base;
         heap_size_ = heap_size;
@@ -132,7 +118,7 @@ public:
         }
 
         // Check both resources; commit only if both are available.
-        if (local_task_id_ >= window_size_) {
+        if (local_task_id_ >= task_capacity_) {
             report_capacity_exhausted(/*heap_blocked=*/false, aligned_size);
             return {-1, -1, nullptr, nullptr};
         }
@@ -142,7 +128,7 @@ public:
             return {-1, -1, nullptr, nullptr};
         }
         int32_t task_id = commit_task();
-        return {task_id, task_id & window_mask_, heap_ptr, static_cast<char *>(heap_ptr) + aligned_size};
+        return {task_id, task_id & task_capacity_mask_, heap_ptr, static_cast<char *>(heap_ptr) + aligned_size};
     }
 
     bool reserve_deferred_heap(int32_t output_size, void **packed_base, void **packed_end) {
@@ -169,7 +155,7 @@ public:
 
     int32_t task_head() const { return local_task_id_; }
 
-    int32_t window_size() const { return window_size_; }
+    int32_t task_capacity() const { return task_capacity_; }
 
     uint64_t heap_available() const { return heap_size_ - heap_top_; }
 
@@ -178,9 +164,9 @@ public:
     uint64_t heap_used_bytes() const { return heap_top_; }
 
 private:
-    // --- Task Ring ---
-    int32_t window_size_ = 0;
-    int32_t window_mask_ = 0;
+    // --- Task capacity ---
+    int32_t task_capacity_ = 0;
+    int32_t task_capacity_mask_ = 0;
     std::atomic<int32_t> *current_index_ptr_ = nullptr;
 
     // --- Heap ---
@@ -241,11 +227,11 @@ private:
         if (heap_blocked) {
             LOG_ERROR("FATAL: Graph Heap Exhausted!");
         } else {
-            LOG_ERROR("FATAL: Task Window Exhausted!");
+            LOG_ERROR("FATAL: Task Capacity Exhausted!");
         }
         LOG_ERROR("========================================");
-        LOG_ERROR("The whole graph must fit the configured ring; nothing is reclaimed mid-run.");
-        LOG_ERROR("  Task window: used=%d/%d", local_task_id_, window_size_);
+        LOG_ERROR("The whole graph must fit the configured capacities; nothing is reclaimed mid-run.");
+        LOG_ERROR("  Task capacity: used=%d/%d", local_task_id_, task_capacity_);
         LOG_ERROR(
             "  Graph heap:  used=%" PRIu64 "/%" PRIu64 ", available=%" PRIu64, heap_top_, heap_size_, heap_available()
         );
@@ -258,8 +244,8 @@ private:
             );
         } else {
             LOG_ERROR(
-                "  Increase task window (current: %d); env PTO2_RING_TASK_WINDOW=<pow2> (e.g. %d)", window_size_,
-                window_size_ * 2
+                "  Increase task capacity (current: %d); env PTO2_RING_TASK_WINDOW=<pow2> (e.g. %d)", task_capacity_,
+                task_capacity_ * 2
             );
         }
         LOG_ERROR("========================================");
@@ -268,16 +254,4 @@ private:
             error_code_ptr_->store(code, std::memory_order_release);
         }
     }
-};
-
-// =============================================================================
-// Ring Set (per-depth aggregate)
-// =============================================================================
-
-/**
- * Groups the per-depth allocator state into one unit; PTO2_MAX_RING_DEPTH
- * instances exist, one per scope depth.
- */
-struct PTO2RingSet {
-    PTO2TaskAllocator task_allocator;
 };

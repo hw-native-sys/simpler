@@ -40,7 +40,7 @@
 
 class HbgTaskAllocatorTest : public ::testing::Test {
 protected:
-    static constexpr int32_t WINDOW_SIZE = 16;
+    static constexpr int32_t TASK_CAPACITY = 16;
     static constexpr uint64_t HEAP_SIZE = 4096;
 
     alignas(64) uint8_t heap_buf[HEAP_SIZE]{};
@@ -52,7 +52,7 @@ protected:
         std::memset(heap_buf, 0, sizeof(heap_buf));
         current_index.store(0);
         error_code.store(PTO2_ERROR_NONE);
-        allocator.init(WINDOW_SIZE, &current_index, heap_buf, HEAP_SIZE, &error_code);
+        allocator.init(TASK_CAPACITY, &current_index, heap_buf, HEAP_SIZE, &error_code);
     }
 };
 
@@ -61,7 +61,7 @@ protected:
 // =============================================================================
 
 TEST_F(HbgTaskAllocatorTest, InitialState) {
-    EXPECT_EQ(allocator.window_size(), WINDOW_SIZE);
+    EXPECT_EQ(allocator.task_capacity(), TASK_CAPACITY);
     EXPECT_EQ(allocator.active_count(), 0);
     EXPECT_EQ(allocator.heap_top(), 0u);
     EXPECT_EQ(allocator.heap_capacity(), HEAP_SIZE);
@@ -90,7 +90,7 @@ TEST_F(HbgTaskAllocatorTest, SequentialTaskIds) {
         auto result = allocator.alloc(0);
         ASSERT_FALSE(result.failed()) << "Alloc failed at i=" << i;
         EXPECT_EQ(result.task_id, prev_id + 1) << "Task IDs must be monotonically increasing";
-        EXPECT_EQ(result.slot, result.task_id & (WINDOW_SIZE - 1));
+        EXPECT_EQ(result.slot, result.task_id & (TASK_CAPACITY - 1));
         prev_id = result.task_id;
     }
     EXPECT_EQ(allocator.active_count(), 5);
@@ -110,13 +110,13 @@ TEST_F(HbgTaskAllocatorTest, OutputSizeAlignment) {
 
 TEST_F(HbgTaskAllocatorTest, SlotMappingPowerOfTwoWindow) {
     std::set<int32_t> slots;
-    for (int i = 0; i < WINDOW_SIZE; i++) {
+    for (int i = 0; i < TASK_CAPACITY; i++) {
         auto r = allocator.alloc(0);
         ASSERT_FALSE(r.failed());
-        EXPECT_EQ(r.slot, r.task_id & (WINDOW_SIZE - 1));
+        EXPECT_EQ(r.slot, r.task_id & (TASK_CAPACITY - 1));
         slots.insert(r.slot);
     }
-    EXPECT_EQ(slots.size(), static_cast<size_t>(WINDOW_SIZE)) << "Every configured slot is usable exactly once";
+    EXPECT_EQ(slots.size(), static_cast<size_t>(TASK_CAPACITY)) << "Every configured slot is usable exactly once";
 }
 
 // Zero-size allocs return the same address and don't advance the top.
@@ -182,20 +182,20 @@ TEST_F(HbgTaskAllocatorTest, AllocLargerThanHeap) {
     EXPECT_EQ(error_code.load(), PTO2_ERROR_HEAP_RING_DEADLOCK);
 }
 
-TEST_F(HbgTaskAllocatorTest, TaskWindowSaturates) {
-    for (int i = 0; i < WINDOW_SIZE; i++) {
+TEST_F(HbgTaskAllocatorTest, TaskCapacitySaturates) {
+    for (int i = 0; i < TASK_CAPACITY; i++) {
         auto r = allocator.alloc(0);
         ASSERT_FALSE(r.failed()) << "Alloc failed at i=" << i;
         EXPECT_EQ(r.task_id, i);
     }
-    EXPECT_EQ(allocator.active_count(), WINDOW_SIZE);
-    EXPECT_EQ(current_index.load(), WINDOW_SIZE);
+    EXPECT_EQ(allocator.active_count(), TASK_CAPACITY);
+    EXPECT_EQ(current_index.load(), TASK_CAPACITY);
 
     auto overflow = allocator.alloc(0);
     EXPECT_TRUE(overflow.failed());
     EXPECT_EQ(error_code.load(), PTO2_ERROR_FLOW_CONTROL_DEADLOCK);
-    EXPECT_EQ(allocator.active_count(), WINDOW_SIZE);
-    EXPECT_EQ(current_index.load(), WINDOW_SIZE) << "A rejected allocation must not publish a new task";
+    EXPECT_EQ(allocator.active_count(), TASK_CAPACITY);
+    EXPECT_EQ(current_index.load(), TASK_CAPACITY) << "A rejected allocation must not publish a new task";
 }
 
 // A failing alloc leaves the heap pointer untouched, so the reported figures
@@ -242,7 +242,7 @@ TEST_F(HbgTaskAllocatorTest, ReserveDeferredHeapCarvesAfterLaterAllocations) {
     EXPECT_EQ(base, static_cast<void *>(heap_buf + top_before));
     EXPECT_EQ(end, static_cast<void *>(heap_buf + top_before + 512));
     EXPECT_EQ(allocator.heap_top(), top_before + 512);
-    EXPECT_EQ(allocator.active_count(), 2) << "A deferred reservation claims no task-window slot";
+    EXPECT_EQ(allocator.active_count(), 2) << "A deferred reservation claims no task-capacity slot";
 }
 
 TEST_F(HbgTaskAllocatorTest, ReserveDeferredHeapZeroSizeReturnsCurrentTop) {
@@ -284,9 +284,9 @@ TEST_F(HbgTaskAllocatorTest, LatchedFatalShortCircuitsReserveDeferredHeap) {
 TEST_F(HbgTaskAllocatorTest, InitRejectsAHeapOverlappingTheRecordingVirtualRange) {
     PTO2TaskAllocator overlapping{};
     auto *base = reinterpret_cast<void *>(GRAPH_RECORD_VIRTUAL_BASE);
-    EXPECT_THROW(overlapping.init(WINDOW_SIZE, &current_index, base, HEAP_SIZE, &error_code), AssertionError);
+    EXPECT_THROW(overlapping.init(TASK_CAPACITY, &current_index, base, HEAP_SIZE, &error_code), AssertionError);
 
     PTO2TaskAllocator straddling{};
     auto *just_below = reinterpret_cast<void *>(GRAPH_RECORD_VIRTUAL_BASE - 64);
-    EXPECT_THROW(straddling.init(WINDOW_SIZE, &current_index, just_below, HEAP_SIZE, &error_code), AssertionError);
+    EXPECT_THROW(straddling.init(TASK_CAPACITY, &current_index, just_below, HEAP_SIZE, &error_code), AssertionError);
 }
