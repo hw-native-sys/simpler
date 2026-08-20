@@ -51,7 +51,9 @@ GraphTensor make_test_tensor(uint64_t address) {
     return tensor;
 }
 
-std::vector<std::byte> make_test_definition(uint64_t graph_key, uint64_t boundary_address) {
+std::vector<std::byte> make_test_definition(
+    uint64_t graph_key, uint64_t boundary_address, uint32_t boundary_count = 1, uint32_t boundary_scalar_count = 1
+) {
     std::vector<std::byte> image(sizeof(GraphDefinition));
 
     std::vector<uint32_t> fanin_offsets{0, 0, 1};
@@ -94,8 +96,8 @@ std::vector<std::byte> make_test_definition(uint64_t graph_key, uint64_t boundar
     definition.task_count = 2;
     definition.edge_count = 1;
     definition.root_count = 1;
-    definition.boundary_count = 1;
-    definition.boundary_scalar_count = 1;
+    definition.boundary_count = boundary_count;
+    definition.boundary_scalar_count = boundary_scalar_count;
     definition.tensor_arg_count = 2;
     definition.scalar_arg_count = 2;
     definition.off_fanin_offsets = append_section(image, fanin_offsets);
@@ -120,23 +122,21 @@ std::vector<std::byte> make_test_definition(uint64_t graph_key, uint64_t boundar
     return image;
 }
 
-std::vector<std::byte> make_test_submission(uint64_t graph_key, uint64_t boundary_address, uint64_t boundary_scalar) {
-    const size_t tensors_offset = PTO2_ALIGN_UP(sizeof(GraphSubmission), alignof(GraphTensor));
-    const size_t scalars_offset = PTO2_ALIGN_UP(tensors_offset + sizeof(GraphTensor), alignof(uint64_t));
-    std::vector<std::byte> image(scalars_offset + sizeof(uint64_t));
-    const GraphTensor boundary = make_test_tensor(boundary_address);
-    std::memcpy(image.data() + tensors_offset, &boundary, sizeof(boundary));
-    std::memcpy(image.data() + scalars_offset, &boundary_scalar, sizeof(boundary_scalar));
-
+std::vector<std::byte> make_test_submission(uint64_t graph_key) {
+    std::vector<std::byte> image(sizeof(GraphSubmission));
     GraphSubmission submission{};
     submission.graph_key = graph_key;
-    submission.total_bytes = static_cast<uint32_t>(image.size());
-    submission.tensors_offset = static_cast<uint32_t>(tensors_offset);
-    submission.tensor_count = 1;
-    submission.scalars_offset = static_cast<uint32_t>(scalars_offset);
-    submission.scalar_count = 1;
     std::memcpy(image.data(), &submission, sizeof(submission));
     return image;
+}
+
+// The boundary args of a replay, where graph_execution_localize reads them: the
+// outer GRAPH task's own payload, in ChipTensor form like any other task's args.
+void set_test_boundary(PTO2TaskPayload *payload, uint64_t boundary_address, uint64_t boundary_scalar) {
+    payload->tensor_count = 1;
+    payload->scalar_count = 1;
+    graph_tensor_unpack(make_test_tensor(boundary_address), &payload->tensors[0]);
+    payload->scalars[0] = boundary_scalar;
 }
 
 // A Definition device object exactly as upload_graph_submissions builds it:
@@ -217,6 +217,100 @@ private:
 };
 
 }  // namespace
+
+TEST(GraphTaskPayloadSpace, Dsv4BoundaryArgsRoundTrip) {
+    constexpr int32_t TENSOR_COUNT = 118;
+    constexpr int32_t SCALAR_COUNT = 31;
+    size_t payload_bytes = 0;
+    size_t scalars_offset = 0;
+    ASSERT_TRUE(graph_task_payload_layout(TENSOR_COUNT, SCALAR_COUNT, &payload_bytes, &scalars_offset));
+    EXPECT_GT(payload_bytes, sizeof(PTO2TaskPayload));
+    EXPECT_EQ(scalars_offset, sizeof(PTO2TaskPayload) + (TENSOR_COUNT - MAX_TENSOR_ARGS) * sizeof(ChipTensor));
+
+    AlignedStorage storage(payload_bytes);
+    auto &payload = *reinterpret_cast<PTO2TaskPayload *>(storage.data());
+    payload.tensor_count = TENSOR_COUNT;
+    payload.scalar_count = SCALAR_COUNT;
+    for (uint32_t i = 0; i < TENSOR_COUNT; ++i) {
+        ChipTensor *tensor = graph_task_payload_tensor(payload, i);
+        ASSERT_NE(tensor, nullptr);
+        tensor->buffer.addr = 0x1000 + i * 0x100;
+        tensor->start_offset = i * 4;
+    }
+    for (uint32_t i = 0; i < SCALAR_COUNT; ++i) {
+        uint64_t *scalar = graph_task_payload_scalar(payload, i);
+        ASSERT_NE(scalar, nullptr);
+        *scalar = 0xABC000 + i;
+    }
+
+    const PTO2TaskPayload &const_payload = payload;
+    for (uint32_t i = 0; i < TENSOR_COUNT; ++i) {
+        const ChipTensor *tensor = graph_task_payload_tensor(const_payload, i);
+        ASSERT_NE(tensor, nullptr);
+        EXPECT_EQ(tensor->buffer.addr, 0x1000U + i * 0x100U);
+        EXPECT_EQ(tensor->start_offset, i * 4U);
+    }
+    for (uint32_t i = 0; i < SCALAR_COUNT; ++i) {
+        const uint64_t *scalar = graph_task_payload_scalar(const_payload, i);
+        ASSERT_NE(scalar, nullptr);
+        EXPECT_EQ(*scalar, 0xABC000U + i);
+    }
+}
+
+TEST(GraphTaskPayloadSpace, Dsv4BoundaryCountsLocalizeAndMaterialize) {
+    constexpr uint64_t GRAPH_KEY_VALUE = 0xD5F4;
+    constexpr int32_t TENSOR_COUNT = 118;
+    constexpr int32_t SCALAR_COUNT = 31;
+    std::array<uint8_t, 64> boundary{};
+    const std::vector<std::byte> definition =
+        make_test_definition(GRAPH_KEY_VALUE, reinterpret_cast<uint64_t>(boundary.data()), TENSOR_COUNT, SCALAR_COUNT);
+    const TestDefinitionObject definition_object(definition);
+    OuterHeap heap(definition);
+    std::vector<std::byte> submission_image = make_test_submission(GRAPH_KEY_VALUE);
+    auto &submission = *reinterpret_cast<GraphSubmission *>(submission_image.data());
+    submission.definition_addr = definition_object.address();
+    submission.definition_hash = definition_object.hash();
+
+    size_t payload_bytes = 0;
+    ASSERT_TRUE(graph_task_payload_layout(TENSOR_COUNT, SCALAR_COUNT, &payload_bytes));
+    AlignedStorage payload_storage(payload_bytes);
+    auto &payload = *reinterpret_cast<PTO2TaskPayload *>(payload_storage.data());
+    payload.tensor_count = TENSOR_COUNT;
+    payload.scalar_count = SCALAR_COUNT;
+    graph_tensor_unpack(
+        make_test_tensor(reinterpret_cast<uint64_t>(boundary.data())), graph_task_payload_tensor(payload, 0)
+    );
+    *graph_task_payload_scalar(payload, 0) = 17;
+
+    PTO2TaskDescriptor outer_task{};
+    outer_task.task_id = PTO2TaskId::make(1, 7);
+    outer_task.packed_buffer_base = heap.base();
+    outer_task.packed_buffer_end = heap.end();
+    PTO2TaskSlotState outer_slot{};
+    outer_slot.task_kind = TaskKind::GRAPH;
+    outer_slot.task = &outer_task;
+    outer_slot.payload = &payload;
+    outer_slot.graph_context = &submission;
+
+    GraphExecution *execution = graph_execution_localize(outer_slot);
+    ASSERT_NE(execution, nullptr);
+    EXPECT_EQ(graph_execution_materialize_slice(outer_slot, *execution, 2), GraphMaterializeResult::PREPARED);
+    EXPECT_EQ(execution->node_storage[0].payload.scalars[0], 17U);
+    EXPECT_EQ(execution->node_storage[0].payload.tensors[0].buffer.addr, reinterpret_cast<uint64_t>(boundary.data()));
+}
+
+TEST(GraphTaskPayloadSpace, RelativePayloadReferenceSurvivesWholeImageMove) {
+    struct alignas(64) PayloadImage {
+        PTO2TaskPayload payload{};
+        PTO2TaskSlotState slot{};
+    };
+    PayloadImage source{};
+    source.slot.bind_buffers(&source.payload, nullptr);
+    alignas(PayloadImage) std::array<std::byte, sizeof(PayloadImage)> moved_bytes{};
+    std::memcpy(moved_bytes.data(), &source, sizeof(source));
+    auto *moved = reinterpret_cast<PayloadImage *>(moved_bytes.data());
+    EXPECT_EQ(moved->slot.payload.get(), &moved->payload);
+}
 
 TEST(GraphCache, RejectsEmptyBoundary) {
     GraphTaskArgs args;
@@ -305,8 +399,7 @@ TEST(GraphExecutionReplay, ResubmissionRebuildsFromDefinition) {
         make_test_definition(GRAPH_KEY_VALUE, reinterpret_cast<uint64_t>(first_boundary.data()));
     const TestDefinitionObject definition_object(definition);
     OuterHeap heap(definition, 0xAA);
-    std::vector<std::byte> submission_image =
-        make_test_submission(GRAPH_KEY_VALUE, reinterpret_cast<uint64_t>(first_boundary.data()), 17);
+    std::vector<std::byte> submission_image = make_test_submission(GRAPH_KEY_VALUE);
     auto &submission = *reinterpret_cast<GraphSubmission *>(submission_image.data());
     submission.definition_addr = definition_object.address();
     submission.definition_hash = definition_object.hash();
@@ -315,9 +408,12 @@ TEST(GraphExecutionReplay, ResubmissionRebuildsFromDefinition) {
     outer_task.task_id = PTO2TaskId::make(1, 7);
     outer_task.packed_buffer_base = heap.base();
     outer_task.packed_buffer_end = heap.end();
+    auto outer_payload = std::make_unique<PTO2TaskPayload>();
+    set_test_boundary(outer_payload.get(), reinterpret_cast<uint64_t>(first_boundary.data()), 17);
     PTO2TaskSlotState outer_slot{};
     outer_slot.task_kind = TaskKind::GRAPH;
     outer_slot.task = &outer_task;
+    outer_slot.payload = outer_payload.get();
     outer_slot.graph_context = &submission;
 
     GraphExecution *execution = graph_execution_localize(outer_slot);
@@ -340,10 +436,7 @@ TEST(GraphExecutionReplay, ResubmissionRebuildsFromDefinition) {
     execution->retired_nodes.store(2, std::memory_order_release);
     submission.local_execution = 0;
     outer_task.task_id = PTO2TaskId::make(1, 8);
-    auto *boundary = reinterpret_cast<GraphTensor *>(submission_image.data() + submission.tensors_offset);
-    boundary->buffer_addr = reinterpret_cast<uint64_t>(second_boundary.data());
-    auto *boundary_scalar = reinterpret_cast<uint64_t *>(submission_image.data() + submission.scalars_offset);
-    *boundary_scalar = 99;
+    set_test_boundary(outer_payload.get(), reinterpret_cast<uint64_t>(second_boundary.data()), 99);
 
     // Poison every field the rebuild is responsible for restoring. A replay that
     // preserved any of them would leave the poison observable.
@@ -384,8 +477,7 @@ TEST(GraphDefinitionObject, RejectsDefinitionBeyondRetainedBytes) {
     ASSERT_GT(definition.size(), sizeof(GraphDefinition));
     const TestDefinitionObject definition_object(definition, sizeof(GraphDefinition));
     OuterHeap heap(definition);
-    std::vector<std::byte> submission_image =
-        make_test_submission(GRAPH_KEY_VALUE, reinterpret_cast<uint64_t>(boundary.data()), 17);
+    std::vector<std::byte> submission_image = make_test_submission(GRAPH_KEY_VALUE);
     auto &submission = *reinterpret_cast<GraphSubmission *>(submission_image.data());
     submission.definition_addr = definition_object.address();
     submission.definition_hash = definition_object.hash();
@@ -394,23 +486,25 @@ TEST(GraphDefinitionObject, RejectsDefinitionBeyondRetainedBytes) {
     outer_task.task_id = PTO2TaskId::make(1, 7);
     outer_task.packed_buffer_base = heap.base();
     outer_task.packed_buffer_end = heap.end();
+    auto outer_payload = std::make_unique<PTO2TaskPayload>();
+    set_test_boundary(outer_payload.get(), reinterpret_cast<uint64_t>(boundary.data()), 17);
     PTO2TaskSlotState outer_slot{};
     outer_slot.task_kind = TaskKind::GRAPH;
     outer_slot.task = &outer_task;
+    outer_slot.payload = outer_payload.get();
     outer_slot.graph_context = &submission;
 
     EXPECT_EQ(graph_execution_localize(outer_slot), nullptr);
     EXPECT_EQ(definition_object.verify_state(), GraphDefinitionVerifyState::INVALID);
 }
 
-TEST(GraphSubmissionWire, RequiresExactAvailableSize) {
-    constexpr uint64_t GRAPH_KEY_VALUE = 0x4567;
-    std::vector<std::byte> image = make_test_submission(GRAPH_KEY_VALUE, 0x1000, 17);
-    const auto &submission = *reinterpret_cast<const GraphSubmission *>(image.data());
-
-    EXPECT_TRUE(graph_submission_wire_size_valid(submission, image.size()));
-    EXPECT_FALSE(graph_submission_wire_size_valid(submission, image.size() - 1));
-    EXPECT_FALSE(graph_submission_wire_size_valid(submission, image.size() + 1));
+// The submission is a fixed-size Definition reference: it carries no arg region,
+// so its wire size does not depend on the args and nothing indexes into it.
+TEST(GraphSubmissionWire, CarriesNoArgRegion) {
+    std::vector<std::byte> few = make_test_submission(0x4567);
+    std::vector<std::byte> many = make_test_submission(0x89AB);
+    EXPECT_EQ(few.size(), sizeof(GraphSubmission));
+    EXPECT_EQ(few.size(), many.size());
 }
 
 TEST(GraphSubmissionActivationGate, ActivatesExactlyOnceUnderContention) {
@@ -543,8 +637,7 @@ TEST(GraphExecutionMaterialize, DirtyStorageYieldsValidExecution) {
         make_test_definition(GRAPH_KEY_VALUE, reinterpret_cast<uint64_t>(boundary.data()));
     const TestDefinitionObject definition_object(definition);
     OuterHeap heap(definition, 0xAA);
-    std::vector<std::byte> submission_image =
-        make_test_submission(GRAPH_KEY_VALUE, reinterpret_cast<uint64_t>(boundary.data()), 17);
+    std::vector<std::byte> submission_image = make_test_submission(GRAPH_KEY_VALUE);
     auto &submission = *reinterpret_cast<GraphSubmission *>(submission_image.data());
     submission.definition_addr = definition_object.address();
     submission.definition_hash = definition_object.hash();
@@ -553,9 +646,12 @@ TEST(GraphExecutionMaterialize, DirtyStorageYieldsValidExecution) {
     outer_task.task_id = PTO2TaskId::make(1, 5);
     outer_task.packed_buffer_base = heap.base();
     outer_task.packed_buffer_end = heap.end();
+    auto outer_payload = std::make_unique<PTO2TaskPayload>();
+    set_test_boundary(outer_payload.get(), reinterpret_cast<uint64_t>(boundary.data()), 17);
     PTO2TaskSlotState outer_slot{};
     outer_slot.task_kind = TaskKind::GRAPH;
     outer_slot.task = &outer_task;
+    outer_slot.payload = outer_payload.get();
     outer_slot.graph_context = &submission;
 
     GraphExecution *execution = graph_execution_localize(outer_slot);

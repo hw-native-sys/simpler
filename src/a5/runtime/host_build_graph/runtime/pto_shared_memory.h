@@ -143,9 +143,11 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
         return task_descriptors[get_slot_by_task_id(local_id)];
     }
 
-    PTO2TaskPayload &get_payload_by_slot(int32_t slot) { return task_payloads[slot]; }
+    PTO2TaskPayload &get_payload_by_slot(int32_t slot) { return *slot_states[slot].payload; }
 
-    PTO2TaskPayload &get_payload_by_task_id(int32_t local_id) { return task_payloads[get_slot_by_task_id(local_id)]; }
+    PTO2TaskPayload &get_payload_by_task_id(int32_t local_id) {
+        return get_payload_by_slot(get_slot_by_task_id(local_id));
+    }
 
     PTO2TaskSlotState &get_slot_state_by_slot(int32_t slot) { return slot_states[slot]; }
 

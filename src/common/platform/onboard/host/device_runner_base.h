@@ -14,8 +14,8 @@
  *
  * This module owns the host-side state and methods that are identical
  * between the two onboard arches today:
- *   - The `MemoryAllocator` and the three `DeviceArena`s (gm heap, PTO2
- *     SM, runtime arena) backing the per-Worker pooled regions.
+ *   - The `MemoryAllocator` and arena-bank-owned `DeviceArena`s backing GM
+ *     heap, PTO2 SM, runtime arena, and the per-run GraphBlock.
  *   - The trivial tensor-memory wrappers (`allocate_tensor`,
  *     `free_tensor`, `copy_*_device`).
  *   - The arena-pool accessors (`acquire_pooled_gm_heap`, etc.).
@@ -144,8 +144,7 @@ public:
     int device_memset(void *dev_ptr, int value, std::size_t bytes);
     void get_retained_temp_buffer(uint32_t pipeline_slot, void **addr, std::size_t *size);
     void set_retained_temp_buffer(uint32_t pipeline_slot, void *addr, std::size_t size);
-    void *
-    acquire_graph_definition_buffer(uint32_t pipeline_slot, uint64_t key, std::size_t bytes, std::size_t alignment);
+    void *acquire_graph_block(uint32_t arena_bank, std::size_t bytes, std::size_t alignment);
     void clear_temporary_buffer();
     /**
      * Map a device buffer into the host address space and return a
@@ -954,7 +953,7 @@ protected:
      *   - aicore_bin_handle_ + binaries_loaded_ reset
      *   - chip_callable_buffers_ free + clear
      *   - callables_ dlclose-on-hbg + clear + aicpu counter reset
-     *   - 3 arenas release + cached size reset
+     *   - arena-bank regions release + cached size reset
      *   - device_wall_dev_ptr_ free (before mem_alloc_.finalize)
      *   - mem_alloc_.finalize
      *   - block_dim_, worker_count_, aicore_kernel_binary_ reset
@@ -968,17 +967,6 @@ protected:
      * @return 0 on success, first nonzero rc encountered otherwise.
      */
     int finalize_common();
-    void release_graph_definition_buffers();
-
-    /**
-     * Drop the retained graph-definition buffers without freeing them.
-     *
-     * The fatal counterpart of release_graph_definition_buffers(): a force reset
-     * has already invalidated every allocation, so only the host-side map is
-     * cleared.
-     */
-    void abandon_graph_definition_buffers();
-
     /**
      * Clear host-side ownership after a fatal device failure without issuing
      * per-resource RTS calls. The caller must first attempt a force reset.
@@ -1133,21 +1121,7 @@ protected:
     // the grow/pack logic lives in trb bind.
     std::array<void *, PTO_PIPELINE_MAX_DEPTH> retained_temp_addrs_{};
     std::array<std::size_t, PTO_PIPELINE_MAX_DEPTH> retained_temp_sizes_{};
-    // One retained device block: the raw allocation plus the aligned address
-    // handed out. Backs the Graph Definition cache below.
-    struct RetainedGraphBuffer {
-        void *allocation{nullptr};
-        void *aligned_addr{nullptr};
-        std::size_t capacity{0};
-    };
-    // Graph Definition storage, one retained block per (pipeline slot,
-    // definition key) — see HostApi acquire_graph_definition_buffer. Keyed by
-    // content identity rather than occurrence: every submission of one run
-    // references the same device-resident Definition.
-    using GraphDefinitionBufferMap = std::unordered_map<uint64_t, RetainedGraphBuffer>;
-    std::array<GraphDefinitionBufferMap, PTO_PIPELINE_MAX_DEPTH> graph_definition_buffers_{};
-
-    // One independently committed set of the three pooled device regions. A
+    // One independently committed set of pooled device regions. A
     // run reaches its set through the arena bank its lease selects, so
     // preparing one bank never mutates a region the active run is executing
     // out of. `cached_*` back `setup_static_arena`'s "fits" check: a later
@@ -1157,14 +1131,17 @@ protected:
         ArenaBank(DeviceArena::AllocFn alloc, DeviceArena::FreeFn free_fn, void *ctx) :
             gm_heap(alloc, free_fn, ctx),
             gm_sm(alloc, free_fn, ctx),
-            runtime_pool(alloc, free_fn, ctx) {}
+            runtime_pool(alloc, free_fn, ctx),
+            graph_block(alloc, free_fn, ctx) {}
 
         DeviceArena gm_heap;
         DeviceArena gm_sm;
         DeviceArena runtime_pool;
+        DeviceArena graph_block;
         size_t cached_gm_heap_size{0};
         size_t cached_gm_sm_size{0};
         size_t cached_runtime_arena_size{0};
+        size_t cached_graph_block_size{0};
     };
     // Held by pointer because DeviceArena is non-copyable and non-movable, so
     // the array cannot be brace-initialised without naming every bank.

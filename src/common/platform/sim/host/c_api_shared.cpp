@@ -142,13 +142,10 @@ static void set_retained_temp_buffer(void *runner_ctx, uint32_t pipeline_slot, v
     } catch (...) {}
 }
 
-static void *acquire_graph_definition_buffer(
-    void *runner_ctx, uint32_t pipeline_slot, uint64_t key, size_t bytes, size_t alignment
-) {
+static void *acquire_graph_block(void *runner_ctx, uint32_t arena_bank, size_t bytes, size_t alignment) {
     if (runner_ctx == nullptr) return nullptr;
     try {
-        return static_cast<SimDeviceRunnerBase *>(runner_ctx)
-            ->acquire_graph_definition_buffer(pipeline_slot, key, bytes, alignment);
+        return static_cast<SimDeviceRunnerBase *>(runner_ctx)->acquire_graph_block(arena_bank, bytes, alignment);
     } catch (...) {
         return nullptr;
     }
@@ -268,7 +265,7 @@ static const HostApiOps g_host_api_ops = {
     .device_memset = device_memset,
     .get_retained_temp_buffer = get_retained_temp_buffer,
     .set_retained_temp_buffer = set_retained_temp_buffer,
-    .acquire_graph_definition_buffer = acquire_graph_definition_buffer,
+    .acquire_graph_block = acquire_graph_block,
     .setup_static_arena = setup_static_arena_wrapper,
     .acquire_pooled_gm_heap = acquire_pooled_gm_heap_wrapper,
     .acquire_pooled_gm_sm = acquire_pooled_gm_sm_wrapper,

@@ -450,6 +450,50 @@ static_assert(
     "PTO2TaskPayload size = metadata(576) + predicate cache line(64) + tensors + scalars"
 );
 
+// Position-independent reference used inside relocatable runtime images. The
+// payload and its slot move by the same delta from host DDR to device GM, so a
+// relative offset remains valid without a per-slot relocation pass.
+template <typename T>
+struct PTO2RelativePtr {
+    int64_t offset{0};
+
+    T *get() const {
+        if (offset == 0) return nullptr;
+        const intptr_t self = reinterpret_cast<intptr_t>(this);
+        return reinterpret_cast<T *>(self + offset);
+    }
+
+    void reset(T *pointer = nullptr) {
+        offset = pointer == nullptr ? 0 : reinterpret_cast<intptr_t>(pointer) - reinterpret_cast<intptr_t>(this);
+    }
+
+    PTO2RelativePtr &operator=(T *pointer) {
+        reset(pointer);
+        return *this;
+    }
+
+    operator T *() const { return get(); }
+    T *operator->() const { return get(); }
+    T &operator*() const { return *get(); }
+    explicit operator bool() const { return offset != 0; }
+
+    bool operator==(std::nullptr_t) const { return offset == 0; }
+    bool operator!=(std::nullptr_t) const { return offset != 0; }
+};
+
+template <typename T>
+inline bool operator==(std::nullptr_t, const PTO2RelativePtr<T> &pointer) {
+    return pointer == nullptr;
+}
+
+template <typename T>
+inline bool operator!=(std::nullptr_t, const PTO2RelativePtr<T> &pointer) {
+    return pointer != nullptr;
+}
+
+static_assert(sizeof(PTO2RelativePtr<PTO2TaskPayload>) == sizeof(uint64_t));
+static_assert(std::is_trivially_copyable_v<PTO2RelativePtr<PTO2TaskPayload>>);
+
 /**
  * Per-task slot scheduling state (scheduler-private, NOT in shared memory)
  *
@@ -478,7 +522,7 @@ struct alignas(64) PTO2TaskSlotState {
     std::atomic<PTO2TaskState> task_state;
 
     // --- Per-slot constant, re-bound by orch::prepare_task each submit ---
-    PTO2TaskPayload *payload;
+    PTO2RelativePtr<PTO2TaskPayload> payload;
     PTO2TaskDescriptor *task;
 
     // --- Wake list: last-fanin notification (intrusive, lock-free) ---
@@ -538,7 +582,7 @@ struct alignas(64) PTO2TaskSlotState {
     }
 
     void bind_buffers(PTO2TaskPayload *p, PTO2TaskDescriptor *t) {
-        payload = p;
+        payload.reset(p);
         task = t;
     }
 

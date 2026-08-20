@@ -142,8 +142,8 @@ TEST_F(HbgSubmitPoisonTest, EveryDeviceReadFieldIsWrittenOverPoison) {
         SCOPED_TRACE(testing::Message() << "slot local_id=" << local);
         const int32_t slot = ring.get_slot_by_task_id(local);
         const PTO2TaskDescriptor &desc = ring.task_descriptors[slot];
-        const PTO2TaskPayload &pl = ring.task_payloads[slot];
         const PTO2TaskSlotState &st = ring.slot_states[slot];
+        const PTO2TaskPayload &pl = *st.payload;
 
         // Descriptor: the task id is written to this exact local id.
         EXPECT_EQ(desc.task_id.local(), static_cast<uint32_t>(local));
@@ -170,8 +170,9 @@ TEST_F(HbgSubmitPoisonTest, EveryDeviceReadFieldIsWrittenOverPoison) {
     }
 
     // Field-specific coverage on the real task: tensors, scalar, packed output buffer.
-    const PTO2TaskDescriptor &root_desc = ring.task_descriptors[ring.get_slot_by_task_id(root.task_id().local())];
-    const PTO2TaskPayload &root_pl = ring.task_payloads[ring.get_slot_by_task_id(root.task_id().local())];
+    const int32_t root_slot = ring.get_slot_by_task_id(root.task_id().local());
+    const PTO2TaskDescriptor &root_desc = ring.task_descriptors[root_slot];
+    const PTO2TaskPayload &root_pl = *ring.slot_states[root_slot].payload;
     EXPECT_EQ(root_pl.tensor_count, 1);
     EXPECT_EQ(root_pl.scalar_count, 1);
     EXPECT_EQ(root_pl.dump_metadata.dump_arg_mask, (uint64_t{1} << 0) | (uint64_t{1} << 1));
@@ -182,7 +183,8 @@ TEST_F(HbgSubmitPoisonTest, EveryDeviceReadFieldIsWrittenOverPoison) {
     EXPECT_EQ(root_desc.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)], 0);
 
     // The consumer's fanin is written: two duplicate deps dedupe to one.
-    const PTO2TaskPayload &cons_pl = ring.task_payloads[ring.get_slot_by_task_id(consumer.task_id().local())];
+    const int32_t consumer_slot = ring.get_slot_by_task_id(consumer.task_id().local());
+    const PTO2TaskPayload &cons_pl = *ring.slot_states[consumer_slot].payload;
     EXPECT_EQ(cons_pl.fanin_count, 1);
     EXPECT_EQ(cons_pl.fanin_local_ids[0], static_cast<int32_t>(root.task_id().local()));
 }

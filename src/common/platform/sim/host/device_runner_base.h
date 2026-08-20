@@ -194,7 +194,7 @@ public:
     int device_memset(void *dev_ptr, int value, size_t bytes);
     void get_retained_temp_buffer(uint32_t pipeline_slot, void **addr, size_t *size);
     void set_retained_temp_buffer(uint32_t pipeline_slot, void *addr, size_t size);
-    void *acquire_graph_definition_buffer(uint32_t pipeline_slot, uint64_t key, size_t bytes, size_t alignment);
+    void *acquire_graph_block(uint32_t arena_bank, size_t bytes, size_t alignment);
     void clear_temporary_buffer();
 
     // On sim, allocate_tensor returns a plain host pointer, so the "device"
@@ -313,7 +313,6 @@ protected:
     // Bulk-free the shared callable / chip-callable / orch-SO state. Subclass
     // finalize() calls this before mem_alloc_.finalize(). Idempotent.
     void release_callable_state();
-    void release_graph_definition_buffers();
 
     // --- Shared state (protected so subclass execution / init_* / finalize()
     // can read or write directly) ----------------------------------------
@@ -334,20 +333,8 @@ protected:
     MemoryAllocator mem_alloc_;
     std::array<void *, PTO_PIPELINE_MAX_DEPTH> retained_temp_addrs_{};
     std::array<size_t, PTO_PIPELINE_MAX_DEPTH> retained_temp_sizes_{};
-    // One retained device block: the raw allocation plus the aligned address
-    // handed out. Backs the Graph Definition cache below.
-    struct RetainedGraphBuffer {
-        void *allocation{nullptr};
-        void *aligned_addr{nullptr};
-        size_t capacity{0};
-    };
-    // Graph Definition storage, one retained block per (pipeline slot,
-    // definition key) — see HostApi acquire_graph_definition_buffer.
-    using GraphDefinitionBufferMap = std::unordered_map<uint64_t, RetainedGraphBuffer>;
-    std::array<GraphDefinitionBufferMap, PTO_PIPELINE_MAX_DEPTH> graph_definition_buffers_{};
-
-    // Each arena bank backs the three pooled regions (PTO2 GM heap / PTO2
-    // shared memory / trb prebuilt runtime arena) for one pipeline slot. They
+    // Each arena bank backs the pooled regions (PTO2 GM heap / PTO2 shared
+    // memory / trb prebuilt runtime arena / HBG GraphBlock) for one pipeline slot. They
     // are separate allocations because the combined size can exceed the device
     // allocator's largest contiguous block. Released explicitly in finalize()
     // before mem_alloc_.finalize().
@@ -369,14 +356,17 @@ protected:
         ArenaBank(DeviceArena::AllocFn alloc, DeviceArena::FreeFn free_fn, void *ctx) :
             gm_heap(alloc, free_fn, ctx),
             gm_sm(alloc, free_fn, ctx),
-            runtime_pool(alloc, free_fn, ctx) {}
+            runtime_pool(alloc, free_fn, ctx),
+            graph_block(alloc, free_fn, ctx) {}
 
         DeviceArena gm_heap;
         DeviceArena gm_sm;
         DeviceArena runtime_pool;
+        DeviceArena graph_block;
         size_t cached_gm_heap_size{0};
         size_t cached_gm_sm_size{0};
         size_t cached_runtime_arena_size{0};
+        size_t cached_graph_block_size{0};
     };
     std::array<std::unique_ptr<ArenaBank>, PTO_PIPELINE_MAX_DEPTH> arena_banks_;
     ArenaBank &arena_bank(uint32_t bank_id) { return *arena_banks_[bank_id]; }

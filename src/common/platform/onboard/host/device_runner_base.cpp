@@ -173,53 +173,28 @@ void DeviceRunnerBase::set_retained_temp_buffer(uint32_t pipeline_slot, void *ad
     retained_temp_sizes_[pipeline_slot] = size;
 }
 
-void *DeviceRunnerBase::acquire_graph_definition_buffer(
-    uint32_t pipeline_slot, uint64_t key, size_t bytes, size_t alignment
-) {
-    if (pipeline_slot >= graph_definition_buffers_.size() || bytes == 0 || alignment == 0 ||
-        (alignment & (alignment - 1)) != 0 || bytes > SIZE_MAX - (alignment - 1)) {
+void *DeviceRunnerBase::acquire_graph_block(uint32_t arena_bank, size_t bytes, size_t alignment) {
+    if (arena_bank >= arena_banks_.size() || bytes == 0 || alignment == 0 || (alignment & (alignment - 1)) != 0) {
         return nullptr;
     }
-    RetainedGraphBuffer &buffer = graph_definition_buffers_[pipeline_slot][key];
-    if (buffer.aligned_addr != nullptr && buffer.capacity >= bytes &&
-        reinterpret_cast<uintptr_t>(buffer.aligned_addr) % alignment == 0) {
-        return buffer.aligned_addr;
+    const size_t base_alignment =
+        alignment > DeviceArena::kDefaultBaseAlign ? alignment : DeviceArena::kDefaultBaseAlign;
+    if (bytes > SIZE_MAX - (base_alignment - 1)) return nullptr;
+    ArenaBank &bank = this->arena_bank(arena_bank);
+    if (bank.graph_block.is_committed() && bytes <= bank.cached_graph_block_size &&
+        reinterpret_cast<uintptr_t>(bank.graph_block.base()) % alignment == 0) {
+        return bank.graph_block.base();
     }
 
-    const size_t allocation_bytes = bytes + alignment - 1;
-    void *allocation = mem_alloc_.alloc(allocation_bytes);
-    if (allocation == nullptr) return nullptr;
-    const uintptr_t raw = reinterpret_cast<uintptr_t>(allocation);
-    if (raw > UINTPTR_MAX - (alignment - 1)) {
-        mem_alloc_.free(allocation);
+    bank.graph_block.release();
+    bank.cached_graph_block_size = 0;
+    bank.graph_block.reserve(bytes, alignment);
+    if (bank.graph_block.commit(base_alignment) == nullptr) {
+        bank.graph_block.release();
         return nullptr;
     }
-    void *aligned_addr = reinterpret_cast<void *>((raw + alignment - 1) & ~(alignment - 1));
-    if (device_memset(aligned_addr, 0, bytes) != 0) {
-        mem_alloc_.free(allocation);
-        return nullptr;
-    }
-    if (buffer.allocation != nullptr && mem_alloc_.free(buffer.allocation) != 0) {
-        mem_alloc_.free(allocation);
-        return nullptr;
-    }
-    buffer = RetainedGraphBuffer{allocation, aligned_addr, bytes};
-    return aligned_addr;
-}
-
-void DeviceRunnerBase::release_graph_definition_buffers() {
-    for (GraphDefinitionBufferMap &by_key : graph_definition_buffers_) {
-        for (auto &entry : by_key) {
-            if (entry.second.allocation != nullptr) mem_alloc_.free(entry.second.allocation);
-        }
-        by_key.clear();
-    }
-}
-
-void DeviceRunnerBase::abandon_graph_definition_buffers() {
-    for (GraphDefinitionBufferMap &by_key : graph_definition_buffers_) {
-        by_key.clear();
-    }
+    bank.cached_graph_block_size = bytes;
+    return bank.graph_block.base();
 }
 
 void DeviceRunnerBase::clear_temporary_buffer() {
@@ -1424,10 +1399,12 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
             bank->gm_heap.abandon_after_device_failure();
             bank->gm_sm.abandon_after_device_failure();
             bank->runtime_pool.abandon_after_device_failure();
+            bank->graph_block.abandon_after_device_failure();
         } else {
             bank->gm_heap.release();
             bank->gm_sm.release();
             bank->runtime_pool.release();
+            bank->graph_block.release();
         }
     }
     prebuilt_runtime_arena_cache_valid_ = false;
@@ -1438,11 +1415,9 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     prebuilt_runtime_arena_cache_image_.clear();
 
     if (abandon_device_resources) {
-        abandon_graph_definition_buffers();
         retained_temp_addrs_.fill(nullptr);
         retained_temp_sizes_.fill(0);
     } else {
-        release_graph_definition_buffers();
         clear_temporary_buffer();
     }
 
@@ -1474,6 +1449,7 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
         bank->cached_gm_heap_size = 0;
         bank->cached_gm_sm_size = 0;
         bank->cached_runtime_arena_size = 0;
+        bank->cached_graph_block_size = 0;
     }
     if (abandon_device_resources) {
         LOG_WARN("Fatal teardown: host-side ownership cleared without further device calls");

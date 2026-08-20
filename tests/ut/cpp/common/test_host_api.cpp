@@ -47,10 +47,16 @@ int setup_static_arena(void *runner_ctx, uint32_t arena_bank, size_t, size_t, si
     return 0;
 }
 
+void *acquire_graph_block(void *runner_ctx, uint32_t arena_bank, size_t, size_t) {
+    static_cast<FakeRunner *>(runner_ctx)->record_arena_bank(arena_bank);
+    return runner_ctx;
+}
+
 const HostApiOps &fake_ops() {
     static const HostApiOps ops = []() {
         HostApiOps result{};
         result.set_retained_temp_buffer = set_retained_temp_buffer;
+        result.acquire_graph_block = acquire_graph_block;
         result.setup_static_arena = setup_static_arena;
         return result;
     }();
@@ -103,6 +109,7 @@ TEST(HostApiTest, BoundRunnerSlotAndBankSurviveConcurrentCrossThreadCalls) {
         for (int i = 0; i < kCallsPerThread; ++i) {
             api_a.set_retained_temp_buffer(nullptr, 0);
             api_b.setup_static_arena(0, 0, 0);
+            (void)api_b.acquire_graph_block(64, 8);
         }
     });
     std::thread second([&]() {
@@ -110,6 +117,7 @@ TEST(HostApiTest, BoundRunnerSlotAndBankSurviveConcurrentCrossThreadCalls) {
         for (int i = 0; i < kCallsPerThread; ++i) {
             api_b.set_retained_temp_buffer(nullptr, 0);
             api_a.setup_static_arena(0, 0, 0);
+            (void)api_a.acquire_graph_block(64, 8);
         }
     });
 
@@ -117,9 +125,9 @@ TEST(HostApiTest, BoundRunnerSlotAndBankSurviveConcurrentCrossThreadCalls) {
     second.join();
 
     EXPECT_EQ(runner_a.pipeline_slots.size(), kCallsPerThread);
-    EXPECT_EQ(runner_a.arena_banks.size(), kCallsPerThread);
+    EXPECT_EQ(runner_a.arena_banks.size(), 2 * kCallsPerThread);
     EXPECT_EQ(runner_b.pipeline_slots.size(), kCallsPerThread);
-    EXPECT_EQ(runner_b.arena_banks.size(), kCallsPerThread);
+    EXPECT_EQ(runner_b.arena_banks.size(), 2 * kCallsPerThread);
     EXPECT_TRUE(all_equal(runner_a.pipeline_slots, kRunnerASlot));
     EXPECT_TRUE(all_equal(runner_a.arena_banks, kRunnerABank));
     EXPECT_TRUE(all_equal(runner_b.pipeline_slots, kRunnerBSlot));

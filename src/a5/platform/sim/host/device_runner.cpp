@@ -735,18 +735,19 @@ int DeviceRunner::finalize() {
     release_callable_state();
 
     unload_executor_binaries();
-    release_graph_definition_buffers();
 
     for (auto &bank : arena_banks_) {
         bank->gm_heap.release();
         bank->gm_sm.release();
         bank->runtime_pool.release();
+        bank->graph_block.release();
     }
     clear_temporary_buffer();
     for (auto &bank : arena_banks_) {
         bank->cached_gm_heap_size = 0;
         bank->cached_gm_sm_size = 0;
         bank->cached_runtime_arena_size = 0;
+        bank->cached_graph_block_size = 0;
     }
     prebuilt_runtime_arena_cache_valid_ = false;
     prebuilt_runtime_arena_cache_key_.clear();
