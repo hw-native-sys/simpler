@@ -166,6 +166,9 @@ struct GraphDefinition {
     // required_heap + this, and the execution lives at
     // packed_buffer_base + required_heap.
     uint32_t execution_storage_bytes;
+    // Distance between consecutive GraphNodeStorage entries. Every entry is a
+    // complete C++ object, so valid Definitions carry sizeof(GraphNodeStorage).
+    uint32_t node_stride;
     uint32_t off_fanout_offsets;
     uint32_t off_fanout_indices;
     uint32_t off_fanin_offsets;
@@ -195,11 +198,7 @@ struct GraphSubmission {
     uint64_t definition_addr;
     uint64_t definition_hash;
     uint32_t activation_gate;
-    uint32_t total_bytes;
-    uint32_t tensors_offset;
-    uint32_t tensor_count;
-    uint32_t scalars_offset;
-    uint32_t scalar_count;
+    uint32_t reserved;
 };
 
 static_assert(std::is_trivially_copyable_v<GraphTensorSourceRef>);
@@ -301,31 +300,57 @@ inline GraphSubmission *graph_submission_from_slot(PTO2TaskSlotState &slot) {
     return slot.task_kind == TaskKind::GRAPH ? static_cast<GraphSubmission *>(slot.graph_context) : nullptr;
 }
 
-inline bool graph_submission_wire_size_valid(const GraphSubmission &submission, size_t available_bytes) {
-    return available_bytes >= sizeof(GraphSubmission) && submission.total_bytes == available_bytes;
+// Graph tasks share the ordinary scheduling payload prefix. Boundary args that
+// exceed the AICore ABI capacities continue in the same TaskPayloadSpace record:
+// [PTO2TaskPayload][extra ChipTensor...][extra uint64_t...], rounded to a cache
+// line. Ordinary kernel payloads remain exactly sizeof(PTO2TaskPayload).
+inline bool graph_task_payload_layout(
+    int32_t tensor_count, int32_t scalar_count, size_t *payload_bytes, size_t *extra_scalars_offset = nullptr
+) {
+    if (payload_bytes == nullptr || tensor_count < 0 || scalar_count < 0 ||
+        tensor_count > static_cast<int32_t>(GRAPH_MAX_TENSOR_ARGS) ||
+        scalar_count > static_cast<int32_t>(GRAPH_MAX_SCALAR_ARGS)) {
+        return false;
+    }
+    const size_t extra_tensors =
+        tensor_count > MAX_TENSOR_ARGS ? static_cast<size_t>(tensor_count - MAX_TENSOR_ARGS) : 0;
+    const size_t extra_scalars =
+        scalar_count > MAX_SCALAR_ARGS ? static_cast<size_t>(scalar_count - MAX_SCALAR_ARGS) : 0;
+    if (extra_tensors > (SIZE_MAX - sizeof(PTO2TaskPayload)) / sizeof(ChipTensor)) return false;
+    const size_t scalars_offset = sizeof(PTO2TaskPayload) + extra_tensors * sizeof(ChipTensor);
+    if (extra_scalars > (SIZE_MAX - scalars_offset) / sizeof(uint64_t)) return false;
+    const size_t end = scalars_offset + extra_scalars * sizeof(uint64_t);
+    if (end > SIZE_MAX - (alignof(PTO2TaskPayload) - 1)) return false;
+    *payload_bytes = PTO2_ALIGN_UP(end, alignof(PTO2TaskPayload));
+    if (extra_scalars_offset != nullptr) *extra_scalars_offset = scalars_offset;
+    return true;
 }
 
-inline const GraphTensor *graph_submission_tensors(const GraphSubmission &submission) {
-    if (submission.tensors_offset == 0 || submission.tensors_offset % alignof(GraphTensor) != 0 ||
-        submission.tensors_offset > submission.total_bytes ||
-        submission.tensor_count > (submission.total_bytes - submission.tensors_offset) / sizeof(GraphTensor)) {
-        return nullptr;
-    }
-    return reinterpret_cast<const GraphTensor *>(
-        reinterpret_cast<const uint8_t *>(&submission) + submission.tensors_offset
-    );
+inline ChipTensor *graph_task_payload_tensor(PTO2TaskPayload &payload, uint32_t index) {
+    if (payload.tensor_count < 0 || index >= static_cast<uint32_t>(payload.tensor_count)) return nullptr;
+    if (index < MAX_TENSOR_ARGS) return &payload.tensors[index];
+    auto *extra = reinterpret_cast<ChipTensor *>(reinterpret_cast<std::byte *>(&payload) + sizeof(payload));
+    return &extra[index - MAX_TENSOR_ARGS];
 }
 
-inline const uint64_t *graph_submission_scalars(const GraphSubmission &submission) {
-    if (submission.scalar_count == 0) return nullptr;
-    if (submission.scalars_offset == 0 || submission.scalars_offset % alignof(uint64_t) != 0 ||
-        submission.scalars_offset > submission.total_bytes ||
-        submission.scalar_count > (submission.total_bytes - submission.scalars_offset) / sizeof(uint64_t)) {
+inline const ChipTensor *graph_task_payload_tensor(const PTO2TaskPayload &payload, uint32_t index) {
+    return graph_task_payload_tensor(const_cast<PTO2TaskPayload &>(payload), index);
+}
+
+inline uint64_t *graph_task_payload_scalar(PTO2TaskPayload &payload, uint32_t index) {
+    if (payload.scalar_count < 0 || index >= static_cast<uint32_t>(payload.scalar_count)) return nullptr;
+    if (index < MAX_SCALAR_ARGS) return &payload.scalars[index];
+    size_t payload_bytes = 0;
+    size_t scalars_offset = 0;
+    if (!graph_task_payload_layout(payload.tensor_count, payload.scalar_count, &payload_bytes, &scalars_offset)) {
         return nullptr;
     }
-    return reinterpret_cast<const uint64_t *>(
-        reinterpret_cast<const uint8_t *>(&submission) + submission.scalars_offset
-    );
+    auto *extra = reinterpret_cast<uint64_t *>(reinterpret_cast<std::byte *>(&payload) + scalars_offset);
+    return &extra[index - MAX_SCALAR_ARGS];
+}
+
+inline const uint64_t *graph_task_payload_scalar(const PTO2TaskPayload &payload, uint32_t index) {
+    return graph_task_payload_scalar(const_cast<PTO2TaskPayload &>(payload), index);
 }
 
 enum class GraphExecutionState : uint8_t {
@@ -345,8 +370,8 @@ enum class GraphMaterializeResult : uint8_t {
 
 struct alignas(64) GraphNodeStorage {
     PTO2TaskDescriptor task;
-    PTO2TaskPayload payload;
     PTO2TaskSlotState slot;
+    PTO2TaskPayload payload;
 };
 
 inline constexpr uint64_t GRAPH_EXECUTION_INITIALIZING = 1;
@@ -370,13 +395,23 @@ struct GraphExecution {
     PTO2TaskSlotState *outer_slot{nullptr};
     GraphNodeStorage *nodes{nullptr};
     GraphNodeStorage *node_storage{nullptr};
+    // Kept in the wire Definition for validation; every entry is one complete
+    // GraphNodeStorage object.
+    size_t node_stride{sizeof(GraphNodeStorage)};
     const GraphDefinition *definition{nullptr};
     const uint32_t *fanin_offsets{nullptr};
     const uint16_t *fanin_indices{nullptr};
-    const GraphTensor *boundary_tensors{nullptr};
+    // Borrowed for the replay lifetime; accessors resolve its fixed prefix and
+    // variable overflow tail without requiring the args to be contiguous.
+    const PTO2TaskPayload *boundary_payload{nullptr};
     uint32_t boundary_tensor_count{0};
-    const uint64_t *boundary_scalars{nullptr};
     uint32_t boundary_scalar_count{0};
+
+    GraphNodeStorage &node_at(int32_t index) const {
+        return *reinterpret_cast<GraphNodeStorage *>(
+            reinterpret_cast<uint8_t *>(node_storage) + static_cast<size_t>(index) * node_stride
+        );
+    }
 };
 
 static_assert(std::is_trivially_destructible_v<GraphNodeStorage>);
@@ -384,9 +419,14 @@ static_assert(std::is_trivially_destructible_v<GraphExecution>);
 
 // The execution occupies [GraphExecution][GraphNodeStorage x node_count] at the
 // tail of the outer GRAPH task's heap allocation.
-inline bool graph_execution_storage_layout(int32_t node_count, size_t *nodes_offset, size_t *storage_bytes) {
+inline constexpr size_t graph_node_stride_floor() noexcept { return sizeof(GraphNodeStorage); }
+
+inline size_t graph_node_stride(int32_t) noexcept { return sizeof(GraphNodeStorage); }
+
+inline bool
+graph_execution_storage_layout(int32_t node_count, size_t node_stride, size_t *nodes_offset, size_t *storage_bytes) {
     if (nodes_offset == nullptr || storage_bytes == nullptr || node_count <= 0 ||
-        node_count > static_cast<int32_t>(GRAPH_MAX_NODES)) {
+        node_count > static_cast<int32_t>(GRAPH_MAX_NODES) || node_stride != sizeof(GraphNodeStorage)) {
         return false;
     }
     constexpr size_t ALIGNMENT = alignof(GraphNodeStorage);
@@ -395,9 +435,9 @@ inline bool graph_execution_storage_layout(int32_t node_count, size_t *nodes_off
     return true;
 }
 
-inline bool graph_execution_storage_bytes(int32_t node_count, size_t *storage_bytes) {
+inline bool graph_execution_storage_bytes(int32_t node_count, size_t node_stride, size_t *storage_bytes) {
     size_t nodes_offset = 0;
-    return graph_execution_storage_layout(node_count, &nodes_offset, storage_bytes);
+    return graph_execution_storage_layout(node_count, node_stride, &nodes_offset, storage_bytes);
 }
 
 GraphExecution *graph_execution_localize(PTO2TaskSlotState &outer_slot);

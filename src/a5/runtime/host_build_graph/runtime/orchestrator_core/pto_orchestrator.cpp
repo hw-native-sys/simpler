@@ -786,11 +786,16 @@ bool graph_build_definition(const GraphRecording &recording, std::vector<std::by
     definition.tensor_arg_count = static_cast<uint32_t>(tensors.size());
     definition.scalar_arg_count = static_cast<uint32_t>(scalars.size());
     definition.predicate_count = static_cast<uint32_t>(predicates.size());
+    const size_t node_stride = sizeof(GraphNodeStorage);
     size_t execution_storage_bytes = 0;
-    if (!graph_execution_storage_bytes(static_cast<int32_t>(definition.task_count), &execution_storage_bytes) ||
+    if (node_stride > UINT32_MAX ||
+        !graph_execution_storage_bytes(
+            static_cast<int32_t>(definition.task_count), node_stride, &execution_storage_bytes
+        ) ||
         execution_storage_bytes > UINT32_MAX) {
         return false;
     }
+    definition.node_stride = static_cast<uint32_t>(node_stride);
     definition.execution_storage_bytes = static_cast<uint32_t>(execution_storage_bytes);
     // Every section's byte count is known now, so the image grows once instead of
     // resizing eleven times. Each append aligns its start, hence the per-section
@@ -972,6 +977,28 @@ struct PTO2PreparedTask {
     PTO2TaskSlotState *slot_state = nullptr;
 };
 
+static PTO2TaskPayload *allocate_task_payload(PTO2OrchestratorState *orch, size_t requested_bytes) {
+    if (orch == nullptr || orch->sm_header == nullptr || requested_bytes < sizeof(PTO2TaskPayload)) return nullptr;
+    PTO2SharedMemoryRingHeader &ring = orch->sm_header->ring;
+    constexpr uint64_t alignment = alignof(PTO2TaskPayload);
+    const uint64_t capacity = ring.task_window_size * sizeof(PTO2TaskPayload);
+    const uint64_t cursor = orch->task_payload_space_used_bytes;
+    if (cursor > UINT64_MAX - (alignment - 1) || requested_bytes > UINT64_MAX - (alignment - 1)) return nullptr;
+    const uint64_t offset = PTO2_ALIGN_UP(cursor, alignment);
+    const uint64_t bytes = PTO2_ALIGN_UP(static_cast<uint64_t>(requested_bytes), alignment);
+    if (offset > capacity || bytes > capacity - offset) {
+        orch->report_fatal(
+            PTO2_ERROR_FLOW_CONTROL_DEADLOCK, __FUNCTION__,
+            "TaskPayloadSpace exhausted: used=%" PRIu64 " requested=%" PRIu64 " capacity=%" PRIu64, cursor, bytes,
+            capacity
+        );
+        return nullptr;
+    }
+    orch->task_payload_space_used_bytes = offset + bytes;
+    auto *base = reinterpret_cast<std::byte *>(ring.task_payloads);
+    return reinterpret_cast<PTO2TaskPayload *>(base + offset);
+}
+
 static PTO2OutputLayout calculate_output_layout(const CoreTaskArgs &args) {
     PTO2OutputLayout layout;
     for (int32_t i = 0; i < args.tensor_count(); i++) {
@@ -1015,7 +1042,10 @@ static bool prepare_task(
     out->task_id = PTO2TaskId::make(ring_id, static_cast<uint32_t>(out->alloc_result.task_id));
     out->slot_state = &orch->sm_header->ring.get_slot_state_by_slot(out->alloc_result.slot);
     out->task = &orch->sm_header->ring.task_descriptors[out->alloc_result.slot];
-    out->payload = &orch->sm_header->ring.task_payloads[out->alloc_result.slot];
+    out->payload = allocate_task_payload(orch, sizeof(PTO2TaskPayload));
+    if (out->payload == nullptr) {
+        return false;
+    }
 
     // Init-on-write: this slot's dynamic scheduling fields and completion flag are
     // initialized here, as the orchestrator claims the slot. whole-graph-resident
@@ -1027,9 +1057,8 @@ static bool prepare_task(
 
     out->payload->prefetch(args.tensor_count(), args.scalar_count());
 
-    // Re-bind payload/task pointers each submit. Value is per-slot constant
-    // (same as &task_payloads[slot] / &task_descriptors[slot]), but writing
-    // here lets RingSchedState::init() skip the O(window_size) bind loop.
+    // Bind the payload record selected from TaskPayloadSpace. Its relative
+    // reference remains valid when the complete SM image moves to device GM.
     // Both writes hit the same 64B slot_state cache line we're about to
     // dirty below, so the extra cost is two stores on an already-hot line.
     // Must precede the Orch-side wiring publish at the end of
@@ -1384,9 +1413,9 @@ static TaskOutputTensors submit_task_common(
     // push_ready_routed; otherwise the returned index selects the producer passed
     // to register_wake. Wake retargeting in register_wake may reclassify a task
     // when the selected producer is already complete.
-    // The initial scan happens before the scheduler dispatch loop starts. Because
-    // fanin is a flat array of position-independent integers, none of this needs
-    // host->device pointer relocation.
+    // The initial scan happens before the scheduler dispatch loop starts. Fanin is
+    // a flat array of position-independent integers, so it crosses to the device
+    // unchanged.
     payload.fanin_count = fanin_builder.count;
     (void)sched;
 
@@ -1523,40 +1552,13 @@ void graph_reset_outer_payload(PTO2TaskPayload &payload) {
 }
 
 bool graph_prepare_submission_image(
-    uint64_t full_key, const GraphTaskArgs &args, std::vector<std::byte> *submission_image
+    uint64_t full_key, uint64_t definition_hash, std::vector<std::byte> *submission_image
 ) {
     if (submission_image == nullptr) return false;
-    const size_t tensors_offset = PTO2_ALIGN_UP(sizeof(GraphSubmission), alignof(GraphTensor));
-    const size_t tensor_bytes = static_cast<size_t>(args.tensor_count()) * sizeof(GraphTensor);
-    if (tensors_offset > UINT32_MAX || tensors_offset > UINT32_MAX - tensor_bytes) {
-        return false;
-    }
-    const size_t tensors_end = tensors_offset + tensor_bytes;
-    const size_t scalar_bytes = static_cast<size_t>(args.scalar_count()) * sizeof(uint64_t);
-    const size_t scalars_offset = args.scalar_count() == 0 ? 0 : PTO2_ALIGN_UP(tensors_end, alignof(uint64_t));
-    const size_t total_bytes = args.scalar_count() == 0 ? tensors_end : scalars_offset + scalar_bytes;
-    if ((args.scalar_count() != 0 && (scalars_offset > UINT32_MAX || scalars_offset > UINT32_MAX - scalar_bytes)) ||
-        total_bytes > UINT32_MAX) {
-        return false;
-    }
-    submission_image->assign(total_bytes, std::byte{0});
-    auto *tensors = reinterpret_cast<GraphTensor *>(submission_image->data() + tensors_offset);
-    for (int32_t i = 0; i < args.tensor_count(); ++i)
-        tensors[i] = graph_tensor_pack(args.tensor(i).ref());
-    if (args.scalar_count() != 0) {
-        std::memcpy(
-            submission_image->data() + scalars_offset, args.scalar_data(),
-            static_cast<size_t>(args.scalar_count()) * sizeof(uint64_t)
-        );
-    }
-
     GraphSubmission submission{};
     submission.graph_key = full_key;
-    submission.total_bytes = static_cast<uint32_t>(submission_image->size());
-    submission.tensors_offset = static_cast<uint32_t>(tensors_offset);
-    submission.tensor_count = static_cast<uint32_t>(args.tensor_count());
-    submission.scalars_offset = static_cast<uint32_t>(scalars_offset);
-    submission.scalar_count = static_cast<uint32_t>(args.scalar_count());
+    submission.definition_hash = definition_hash;
+    submission_image->assign(sizeof(submission), std::byte{0});
     std::memcpy(submission_image->data(), &submission, sizeof(submission));
     return true;
 }
@@ -1574,8 +1576,7 @@ bool graph_submit_outer(
     }
 
     GraphPendingUpload pending;
-    if (!graph_prepare_submission_image(full_key, args, &pending.image)) return false;
-    reinterpret_cast<GraphSubmission *>(pending.image.data())->definition_hash = definition_hash;
+    if (!graph_prepare_submission_image(full_key, definition_hash, &pending.image)) return false;
     pending.deferred_heap = defer_heap;
 
     DepInputs boundary_inputs{
@@ -1591,10 +1592,22 @@ bool graph_submit_outer(
     const PTO2TaskId task_id = PTO2TaskId::make(0, static_cast<uint32_t>(allocation.task_id));
     PTO2SharedMemoryRingHeader &ring = orch->sm_header->ring;
     PTO2TaskDescriptor &task = ring.task_descriptors[allocation.slot];
-    PTO2TaskPayload &payload = ring.task_payloads[allocation.slot];
+    size_t payload_bytes = 0;
+    if (!graph_task_payload_layout(args.tensor_count(), args.scalar_count(), &payload_bytes)) return false;
+    PTO2TaskPayload *payload_ptr = allocate_task_payload(orch, payload_bytes);
+    if (payload_ptr == nullptr) return false;
+    PTO2TaskPayload &payload = *payload_ptr;
     PTO2TaskSlotState &slot = ring.get_slot_state_by_slot(allocation.slot);
 
-    slot.bind_buffers(&payload, &task);
+    // Init-on-write, as in prepare_task: this slot's dynamic scheduling fields and
+    // completion flag are established here, at the claim, because nothing else
+    // writes them. A stale wake_list_head of WAKE_LIST_SENTINEL would close the
+    // list against every consumer, and a stale completion flag would report the
+    // Graph done before it ran.
+    slot.reset_for_reuse();
+    ring.completion_flags[allocation.slot].store(0, std::memory_order_relaxed);
+
+    slot.bind_buffers(payload_ptr, &task);
     slot.task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
     slot.last_consumer_local_id = static_cast<int32_t>(task_id.local());
     slot.active_mask = ActiveMask{};
@@ -1602,7 +1615,6 @@ bool graph_submit_outer(
     slot.total_required_subtasks = 0;
     slot.logical_block_num = 1;
     slot.task_kind = TaskKind::GRAPH;
-    slot.graph_context = nullptr;
     scope_tasks_push(orch, &slot);
 
     task.task_id = task_id;
@@ -1610,6 +1622,18 @@ bool graph_submit_outer(
     task.packed_buffer_base = allocation.packed_base;
     task.packed_buffer_end = allocation.packed_end;
     graph_reset_outer_payload(payload);
+    payload.tensor_count = args.tensor_count();
+    payload.scalar_count = args.scalar_count();
+    for (int32_t i = 0; i < args.tensor_count(); ++i) {
+        ChipTensor *destination = graph_task_payload_tensor(payload, static_cast<uint32_t>(i));
+        if (destination == nullptr) return false;
+        *destination = args.tensor(i).ref();
+    }
+    for (int32_t i = 0; i < args.scalar_count(); ++i) {
+        uint64_t *destination = graph_task_payload_scalar(payload, static_cast<uint32_t>(i));
+        if (destination == nullptr) return false;
+        *destination = args.scalar_data()[i];
+    }
 
     PTO2FaninBuilder fanin_builder(orch, &payload, static_cast<int32_t>(task_id.local()), next_fanin_seen_epoch(orch));
     auto emit = [&](PTO2TaskId producer_id) -> bool {
@@ -1684,7 +1708,7 @@ bool graph_submit_pending_definition(
 bool graph_finalize_pending_submissions(PTO2OrchestratorState *orch, GraphHostState *state, uint64_t *failed_key) {
     for (GraphPendingUpload &pending : state->pending_uploads) {
         if (!pending.deferred_heap) continue;
-        if (pending.image.size() < sizeof(GraphSubmission)) return false;
+        if (pending.image.size() != sizeof(GraphSubmission)) return false;
         auto *submission = reinterpret_cast<GraphSubmission *>(pending.image.data());
         auto definition_it = state->definitions.find(submission->graph_key);
         const GraphDefinition *definition =
@@ -1692,8 +1716,7 @@ bool graph_finalize_pending_submissions(PTO2OrchestratorState *orch, GraphHostSt
         if (definition == nullptr || definition->execution_storage_bytes == 0 ||
             definition->required_heap > UINT64_MAX - definition->execution_storage_bytes ||
             pending.outer_slot == nullptr || pending.outer_slot->task == nullptr ||
-            pending.outer_slot->task_kind != TaskKind::GRAPH ||
-            !graph_submission_wire_size_valid(*submission, pending.image.size())) {
+            pending.outer_slot->task_kind != TaskKind::GRAPH) {
             if (failed_key != nullptr) *failed_key = submission->graph_key;
             return false;
         }
@@ -2072,7 +2095,7 @@ void PTO2OrchestratorState::graph_abort(void *recording_handle) {
     auto *entry = static_cast<GraphInflightRecording *>(recording_handle);
     if (state == nullptr || entry == nullptr) return;
     {
-        std::lock_guard<std::mutex> lock(state->recording_mutex);
+        std::scoped_lock lock(state->recording_mutex);
         entry->recording.reset();
         entry->set_status(GraphRecordingStatus::FAILED);
     }
@@ -2109,7 +2132,7 @@ bool PTO2OrchestratorState::graph_end() {
     );
     bool ready = false;
     {
-        std::lock_guard<std::mutex> lock(state->recording_mutex);
+        std::scoped_lock lock(state->recording_mutex);
         if (entry->status() != GraphRecordingStatus::RECORDING || entry->full_key != header->full_key) {
             entry->set_status(GraphRecordingStatus::FAILED);
         } else {

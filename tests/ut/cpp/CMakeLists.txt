@@ -846,6 +846,8 @@ add_a2a3_hbg_runtime_test(test_hbg_core_tracker common/test_hbg_core_tracker.cpp
 # shared init TU (and the orchestrator/SM members that TU refers to).
 add_a2a3_hbg_runtime_test(test_hbg_ready_queue_seed common/test_hbg_ready_queue_seed.cpp)
 add_a2a3_hbg_runtime_test(test_hbg_mailbox_init common/test_hbg_mailbox_init.cpp)
+add_a2a3_hbg_runtime_test(test_hbg_self_relative_ptr common/test_hbg_self_relative_ptr.cpp)
+add_a2a3_hbg_runtime_test(test_hbg_sm_compaction common/test_hbg_sm_compaction.cpp)
 target_sources(test_hbg_ready_queue_seed PRIVATE
     ${HBG_RUNTIME_DIR}/orchestrator_core/pto_orchestrator.cpp
     ${HBG_RUNTIME_DIR}/orchestrator_core/pto_ring_buffer.cpp
@@ -878,6 +880,18 @@ target_sources(test_hbg_graph_submit_failure PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
 )
 add_a2a3_hbg_runtime_test(test_hbg_graph_async_submit common/test_hbg_graph_async_submit.cpp)
+# Drives the real orchestrator submit and Graph placement paths, so it links the
+# same out-of-line members as the graph-submit test.
+add_a2a3_hbg_runtime_test(test_hbg_slot_claim common/test_hbg_slot_claim.cpp)
+target_sources(test_hbg_slot_claim PRIVATE
+    ${HBG_RUNTIME_DIR}/orchestrator_core/pto_orchestrator.cpp
+    ${HBG_RUNTIME_DIR}/orchestrator_core/pto_ring_buffer.cpp
+    ${HBG_RUNTIME_DIR}/shared/pto_shared_memory.cpp
+    ${HBG_RUNTIME_DIR}/shared/pto_tensormap.cpp
+    ${HBG_RUNTIME_DIR}/shared/pto_runtime2_init.cpp
+    ${HBG_RUNTIME_DIR}/shared/runtime.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
+)
 add_a5_hbg_runtime_test(test_a5_hbg_graph_submit_failure common/test_hbg_graph_submit_failure.cpp)
 target_sources(test_a5_hbg_graph_submit_failure PRIVATE
     ${A5_HBG_RUNTIME_DIR}/orchestrator_core/pto_orchestrator.cpp
@@ -889,9 +903,21 @@ target_sources(test_a5_hbg_graph_submit_failure PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
 )
 add_a5_hbg_runtime_test(test_a5_hbg_graph_async_submit common/test_hbg_graph_async_submit.cpp)
+add_a5_hbg_runtime_test(test_a5_hbg_slot_claim common/test_hbg_slot_claim.cpp)
+target_sources(test_a5_hbg_slot_claim PRIVATE
+    ${A5_HBG_RUNTIME_DIR}/orchestrator_core/pto_orchestrator.cpp
+    ${A5_HBG_RUNTIME_DIR}/orchestrator_core/pto_ring_buffer.cpp
+    ${A5_HBG_RUNTIME_DIR}/shared/pto_shared_memory.cpp
+    ${A5_HBG_RUNTIME_DIR}/shared/pto_tensormap.cpp
+    ${A5_HBG_RUNTIME_DIR}/shared/pto_runtime2_init.cpp
+    ${A5_HBG_RUNTIME_DIR}/shared/runtime.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
+)
 add_a5_hbg_runtime_test(test_a5_hbg_core_tracker common/test_hbg_core_tracker.cpp)
 add_a5_hbg_runtime_test(test_a5_hbg_ready_queue_seed common/test_hbg_ready_queue_seed.cpp)
 add_a5_hbg_runtime_test(test_a5_hbg_mailbox_init common/test_hbg_mailbox_init.cpp)
+add_a5_hbg_runtime_test(test_a5_hbg_self_relative_ptr common/test_hbg_self_relative_ptr.cpp)
+add_a5_hbg_runtime_test(test_a5_hbg_sm_compaction common/test_hbg_sm_compaction.cpp)
 target_sources(test_a5_hbg_ready_queue_seed PRIVATE
     ${A5_HBG_RUNTIME_DIR}/orchestrator_core/pto_orchestrator.cpp
     ${A5_HBG_RUNTIME_DIR}/orchestrator_core/pto_ring_buffer.cpp

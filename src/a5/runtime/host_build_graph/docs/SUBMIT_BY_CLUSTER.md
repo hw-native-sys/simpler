@@ -33,8 +33,9 @@ The shared graph image separates stable task identity from scheduling state:
 - `PTO2TaskSlotState` contains the active mask, task attributes, logical block
   count, subtask counters, completion state, and descriptor/payload bindings.
 
-This image is built on the host, relocated once, and copied to the device. It
-contains no fanout adjacency or dependency-pool pointers.
+This image is built on the host and copied to the device verbatim. It contains
+no fanout adjacency or dependency-pool pointers, and its descriptor/payload
+bindings are deltas from the slot state's own address rather than pointers.
 
 ## Resource Shapes
 

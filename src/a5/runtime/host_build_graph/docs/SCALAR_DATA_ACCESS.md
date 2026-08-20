@@ -38,7 +38,7 @@ The execution order is:
 
 1. The host loads and calls the orchestration shared object.
 2. Orchestration builds the entire task graph and returns.
-3. The host relocates and copies the graph image to device memory.
+3. The host copies the graph image to device memory.
 4. AICPU schedulers boot and dispatch the graph.
 
 A producer submitted in step 1 cannot become `COMPLETED` until step 4. Waiting

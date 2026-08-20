@@ -802,9 +802,8 @@ int DeviceRunner::finalize() {
     release_callable_state();
 
     unload_executor_binaries();
-    release_graph_definition_buffers();
 
-    // Release the three per-Worker pooled arenas. Must precede mem_alloc_.finalize()
+    // Release the arena-bank regions. Must precede mem_alloc_.finalize()
     // so the arenas free through the still-live allocator, not after it.
     for (auto &bank : arena_banks_) {
         bank->gm_heap.release();

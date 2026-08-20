@@ -34,6 +34,8 @@
 
 #include <stddef.h>
 
+#include <cstring>
+
 #include "utils/device_arena.h"
 #include "pto_runtime2_types.h"
 
@@ -143,9 +145,11 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
         return task_descriptors[get_slot_by_task_id(local_id)];
     }
 
-    PTO2TaskPayload &get_payload_by_slot(int32_t slot) { return task_payloads[slot]; }
+    PTO2TaskPayload &get_payload_by_slot(int32_t slot) { return *slot_states[slot].payload; }
 
-    PTO2TaskPayload &get_payload_by_task_id(int32_t local_id) { return task_payloads[get_slot_by_task_id(local_id)]; }
+    PTO2TaskPayload &get_payload_by_task_id(int32_t local_id) {
+        return get_payload_by_slot(get_slot_by_task_id(local_id));
+    }
 
     PTO2TaskSlotState &get_slot_state_by_slot(int32_t slot) { return slot_states[slot]; }
 
@@ -240,7 +244,17 @@ struct PTO2SharedMemoryHandle {
     // Used by host_build_graph host-orch, where the host orchestrator populated
     // the SM and H2D'd it; the device must re-point at its own SM base without
     // wiping the contents (unlike init_per_ring, which also resets the header).
-    bool attach_populated(void *sm_base, uint64_t sm_size, const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]);
+    //
+    // `live_slots` is the pitch the uploaded arrays were laid out with — the
+    // number of slots the host actually submitted, not the ring capacity. It must
+    // match what the host used or every segment past the descriptors resolves to
+    // the wrong address, so both sides derive it from the same submitted count.
+    // The capacity and mask in the header are unchanged, and `local_id & mask`
+    // yields `local_id`, which is below `live_slots` for every ring task.
+    bool attach_populated(
+        void *sm_base, uint64_t sm_size, const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], uint64_t live_slots,
+        uint64_t payload_bytes
+    );
 
     void destroy();
     void print_layout();
@@ -252,7 +266,13 @@ private:
         const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]
     );
     void setup_pointers(uint64_t task_window_size);
-    void setup_pointers_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]);
+    // `pitch` is the slot count the arrays are dimensioned for. init_per_ring
+    // passes the ring capacity (the mirror the orchestrator writes into);
+    // attach_populated passes the submitted count (the compacted image that
+    // shipped).
+    void setup_pointers_per_ring(
+        const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], uint64_t pitch, uint64_t payload_bytes
+    );
 };
 
 // =============================================================================
@@ -293,6 +313,17 @@ inline std::atomic<int32_t> *ring_current_task_index_addr(void *sm_dev_base) noe
 // Byte offsets (from the SM base) of the ring's three segments. The layout is:
 // header, then descriptors -> payloads -> slot_states, every segment
 // PTO2_ALIGN_UP-padded.
+//
+// Two parameters, and the host mirror and the shipped image differ in both.
+//
+// The *pitch* is how many slots the arrays are dimensioned for: the mirror uses the
+// ring capacity, the image uses the submitted count, which is what makes the four
+// live prefixes contiguous and the upload one copy.
+//
+// The *payload stride* is how far apart consecutive payloads sit. The mirror uses
+// sizeof(PTO2TaskPayload), whose tensor array is dimensioned for the widest task the
+// API allows. The image uses the widest task in this bind — the array is the last
+// field, so anything past that task's entries is read by nobody.
 struct PTO2RingSegmentOffsets {
     uint64_t descriptors;
     uint64_t payloads;
@@ -307,13 +338,14 @@ struct PTO2RingSegmentOffsets {
 // `sm_dev_base`). Adding or reordering a segment is a one-line edit here; every
 // consumer follows automatically, so the layout walk can never silently
 // disagree across call sites.
-inline PTO2RingSegmentOffsets ring_segment_offsets(uint64_t task_window_size) noexcept {
+inline PTO2RingSegmentOffsets
+ring_segment_offsets_with_payload_bytes(uint64_t task_window_size, uint64_t payload_bytes) noexcept {
     uint64_t off = PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
     PTO2RingSegmentOffsets o{};
     o.descriptors = off;
     off += PTO2_ALIGN_UP(task_window_size * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
     o.payloads = off;
-    off += PTO2_ALIGN_UP(task_window_size * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
+    off += PTO2_ALIGN_UP(payload_bytes, PTO2_ALIGN_SIZE);
     o.slot_states = off;
     off += PTO2_ALIGN_UP(task_window_size * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
     o.completion_flags = off;
@@ -322,25 +354,82 @@ inline PTO2RingSegmentOffsets ring_segment_offsets(uint64_t task_window_size) no
     return o;
 }
 
-// Device address of the task_descriptors array.
-inline PTO2TaskDescriptor *ring_task_descriptors_addr(void *sm_dev_base, uint64_t task_window_size) noexcept {
-    return reinterpret_cast<PTO2TaskDescriptor *>(
-        static_cast<char *>(sm_dev_base) + ring_segment_offsets(task_window_size).descriptors
-    );
+inline PTO2RingSegmentOffsets ring_segment_offsets(uint64_t task_window_size) noexcept {
+    return ring_segment_offsets_with_payload_bytes(task_window_size, task_window_size * sizeof(PTO2TaskPayload));
 }
 
-// Device address of the slot_states array used by host/device pointer wiring.
-inline PTO2TaskSlotState *ring_slot_states_addr(void *sm_dev_base, uint64_t task_window_size) noexcept {
-    return reinterpret_cast<PTO2TaskSlotState *>(
-        static_cast<char *>(sm_dev_base) + ring_segment_offsets(task_window_size).slot_states
-    );
+// The pitch the shipped image uses for a given submitted task count. A bind that
+// submits nothing still ships its header and still attaches, and a zero-length
+// array has no layout, so the pitch never drops below one slot.
+inline uint64_t live_slot_pitch(uint64_t submitted_tasks) noexcept {
+    return submitted_tasks == 0 ? 1 : submitted_tasks;
 }
 
-// Device address of the polling completion_flags byte array.
-inline std::atomic<uint8_t> *ring_completion_flags_addr(void *sm_dev_base, uint64_t task_window_size) noexcept {
-    return reinterpret_cast<std::atomic<uint8_t> *>(
-        static_cast<char *>(sm_dev_base) + ring_segment_offsets(task_window_size).completion_flags
-    );
+// The stride a shipped payload array uses for a given widest task. The tensor array
+// is the payload's last field, so a task reads nothing past its own entries and the
+// stride need only cover them — but every payload in the image shares one stride, so
+// it is the widest task that sets it.
+//
+// Rounded up to PTO2_ALIGN_SIZE because PTO2TaskPayload's own alignment is 64 and the
+// image places consecutive payloads at multiples of the stride.
+// Restack the live prefix of every ring segment from the ring-pitched mirror the
+// orchestrator wrote into an image pitched to `submitted_tasks`, where the four
+// prefixes are contiguous and can travel as one copy.
+//
+// `out_base` must be PTO2_ALIGN_SIZE-aligned and hold
+// `ring_segment_offsets_with_payload_bytes(live_slot_pitch(submitted_tasks),
+// payload_bytes).end` bytes. Returns that byte count.
+//
+// Two things the restack has to fix up, both because the image is not the mirror:
+//
+//   - the ring header's data pointers name the mirror's arrays, so they leave as
+//     null rather than carrying host addresses into device memory (the device
+//     resolves them in attach_populated);
+//   - a slot state names its payload and descriptor by a delta from its own
+//     address, and the restack changed those distances, so each binding is
+//     re-taken against the image.
+inline uint64_t compact_live_image(
+    const char *mirror_base, uint64_t task_window_size, uint64_t submitted_tasks, uint64_t payload_bytes, char *out_base
+) noexcept {
+    // The mirror is pitched to the capacity and to the type, so a larger live count
+    // or a wider stride reads past the segment it is copying from and ships a corrupt
+    // image. attach_populated tests the same two bounds on the device side.
+    always_assert(submitted_tasks <= task_window_size);
+    always_assert(payload_bytes <= task_window_size * sizeof(PTO2TaskPayload));
+    const PTO2RingSegmentOffsets from = ring_segment_offsets(task_window_size);
+    const PTO2RingSegmentOffsets to =
+        ring_segment_offsets_with_payload_bytes(live_slot_pitch(submitted_tasks), payload_bytes);
+
+    // The header and the descriptors offset are pitch-independent, so the header
+    // lands where it already was.
+    std::memcpy(out_base, mirror_base, to.descriptors);
+    auto &out_ring = reinterpret_cast<PTO2SharedMemoryHeader *>(out_base)->ring;
+    out_ring.task_descriptors = nullptr;
+    out_ring.task_payloads = nullptr;
+    out_ring.slot_states = nullptr;
+    out_ring.completion_flags = nullptr;
+
+    const uint64_t nt = submitted_tasks;
+    std::memcpy(out_base + to.descriptors, mirror_base + from.descriptors, nt * sizeof(PTO2TaskDescriptor));
+    // Per payload, because the source and destination strides differ: the mirror is
+    // pitched to the type, the image to the widest task in this bind.
+    std::memcpy(out_base + to.payloads, mirror_base + from.payloads, payload_bytes);
+    std::memcpy(out_base + to.slot_states, mirror_base + from.slot_states, nt * sizeof(PTO2TaskSlotState));
+    std::memcpy(out_base + to.completion_flags, mirror_base + from.completion_flags, nt * sizeof(std::atomic<uint8_t>));
+
+    auto *out_slots = reinterpret_cast<PTO2TaskSlotState *>(out_base + to.slot_states);
+    auto *out_descriptors = reinterpret_cast<PTO2TaskDescriptor *>(out_base + to.descriptors);
+    const auto *source_slots = reinterpret_cast<const PTO2TaskSlotState *>(mirror_base + from.slot_states);
+    const char *source_payload_base = mirror_base + from.payloads;
+    for (uint64_t i = 0; i < nt; ++i) {
+        const char *source_payload = reinterpret_cast<const char *>(source_slots[i].payload.get());
+        always_assert(source_payload >= source_payload_base);
+        const uint64_t payload_offset = static_cast<uint64_t>(source_payload - source_payload_base);
+        always_assert(payload_offset + sizeof(PTO2TaskPayload) <= payload_bytes);
+        auto *out_payload = reinterpret_cast<PTO2TaskPayload *>(out_base + to.payloads + payload_offset);
+        out_slots[i].bind_buffers(out_payload, &out_descriptors[i]);
+    }
+    return to.end;
 }
 
 }  // namespace pto2_sm_layout

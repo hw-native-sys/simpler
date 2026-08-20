@@ -694,7 +694,7 @@ TEST_F(HbgGraphSubmitFailureTest, AnOrdinaryAllocationInterleavesWithADeferredSh
         << "the shell's block sits above the ordinary task's, not before it";
     PTO2SharedMemoryRingHeader &ring = sm_handle->header->ring;
     const int32_t shell_slot = ring.get_slot_by_task_id(static_cast<int32_t>(graph.task_id.local()));
-    const PTO2TaskDescriptor *shell = ring.slot_states[shell_slot].task;
+    const PTO2TaskDescriptor *shell = ring.slot_states[shell_slot].task.get();
     ASSERT_NE(shell, nullptr);
     ASSERT_NE(shell->packed_buffer_base, nullptr);
     EXPECT_GE(

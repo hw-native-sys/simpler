@@ -71,6 +71,9 @@ struct PTO2OrchestratorState {
     PTO2RingSet ring;
     uint32_t *fanin_seen_epoch;
     uint32_t fanin_seen_current_epoch{1};
+    // Live bytes in the packed task-payload segment. Payload records are
+    // appended in submission order and may have different lengths.
+    uint64_t task_payload_space_used_bytes{0};
 
     // === TENSOR MAP (Private) ===
     PTO2TensorMap tensor_map;  // Producer lookup

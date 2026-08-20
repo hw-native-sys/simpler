@@ -121,23 +121,36 @@ struct PTO2RuntimeArenaLayout {
     size_t off_scheduler{0};
     size_t off_runtime{0};
     size_t off_mailbox{0};
-    // The arena is reserved in three zones and the offsets above land in exactly
-    // one of them:
+    // The arena is reserved in zones, in this order, and the offsets above land in
+    // exactly one of them:
     //
-    //   host-only    the orchestrator block. Dep-computation scratch the AICPU
-    //                never reads, so it is never copied.
+    //   device-only  sm_handle, the AICore mailbox, the scheduler state and its
+    //                queue slot arrays. Reachable storage whose content is a
+    //                function of the layout, not of the run, so the device writes
+    //                it at boot instead of receiving an initialization pattern
+    //                over PCIe.
     //   copied       [off_copied_begin, off_copied_end). Every byte carries this
     //                run's own content, so bind ships the whole zone as one
     //                contiguous range.
-    //   device-only  sm_handle, the scheduler state and its queue slot arrays.
-    //                Reachable storage whose content is a function of the layout,
-    //                not of the run, so the device writes it at boot instead of
-    //                receiving an initialization pattern over PCIe.
     //
-    // Placing the copied zone in the middle is what keeps the upload a single
-    // range: the two zones that are not copied sit on either side of it.
+    // off_copied_end is where the shared part of the layout stops. Past it the two
+    // sides carry different tails, and neither reads the other's:
+    //
+    //   host tail    the orchestrator block. Dep-computation scratch no device code
+    //                reads, so it is neither copied nor allocated on the device.
+    //   device tail  the compact shared-memory image followed by Graph Definitions
+    //                and submissions. Their sizes are not known until orchestration
+    //                ends, so bind commits the device region only after planning them.
+    //
+    // The copied zone is padded to a PTO2_ALIGN_SIZE boundary, so the device tail
+    // begins exactly at off_copied_end: the copied zone, shared-memory image, and
+    // Graph block are adjacent on the device and travel as one copy.
     size_t off_copied_begin{0};
     size_t off_copied_end{0};
+
+    // Byte length of the device region before its shared-memory tail. The host
+    // arena is arena_size, which instead covers the orchestrator block there.
+    size_t device_bytes{0};
 
     // Cached parameters (re-used by init_data + wire stages).
     uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]{};
@@ -244,15 +257,33 @@ PTO2Runtime *runtime_init_data_from_layout(
 );
 
 /**
- * Phase 3 — wire every arena-internal pointer field (rt->sm_handle,
- * rt->aicore_mailbox, orchestrator.{scope_tasks, scope_begins, scheduler,
- * tensor_map.*, ring.fanin_pool.base}, scheduler.{ready_queues,
- * ready_sync_queues, early_dispatch_queues, dep_pool}) so each holds
- * arena.base() + offset. Idempotent — runs on
- * both host (writing host-mirror addresses) and AICPU (writing device
- * addresses) sides.
+ * Phase 3 — wire the arena-internal pointer fields that exist on both sides
+ * (rt->sm_handle, rt->aicore_mailbox, rt->scheduler and
+ * scheduler.{ready_queues, ready_sync_queues, early_dispatch_queues}) so each
+ * holds arena.base() + offset. Idempotent — runs on both host (writing
+ * host-mirror addresses) and AICPU (writing device addresses) sides.
  */
 void runtime_wire_arena_pointers(DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2Runtime *rt);
+
+/**
+ * Phase 3b — wire the orchestrator's pointers into the host-only zone
+ * (orchestrator.{scope_tasks, scope_begins, scheduler, tensor_map.*,
+ * ring.fanin_pool.base}).
+ *
+ * Host-only by construction: that zone is past layout.device_bytes and so is not
+ * allocated on the device, which makes the addresses this writes unrepresentable
+ * there. Requires rt->scheduler, so it follows runtime_wire_arena_pointers.
+ */
+void runtime_wire_host_only_pointers(DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2Runtime *rt);
+
+/**
+ * Drop the pointers Phase 3b wrote, so the runtime header can be copied to the
+ * device without carrying host addresses into it. The device reads one
+ * orchestrator field, inline_completed_tasks, which this leaves alone.
+ *
+ * Call after orchestration finishes and before the copied zone is uploaded.
+ */
+void runtime_clear_host_only_pointers(PTO2Runtime *rt);
 
 /**
  * AICPU-only Phase 4 — fill in the few fields the host could not know at

@@ -45,14 +45,17 @@ uint64_t PTO2SharedMemoryHandle::calculate_size_per_ring(const uint64_t task_win
 // Creation and Destruction
 // =============================================================================
 
-void PTO2SharedMemoryHandle::setup_pointers_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]) {
+void PTO2SharedMemoryHandle::setup_pointers_per_ring(
+    const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], uint64_t pitch, uint64_t payload_bytes
+) {
+    (void)task_window_sizes;
     char *base = (char *)sm_base;
     header = (PTO2SharedMemoryHeader *)base;
 
     // Per-ring descriptors / payloads / slot_states — offsets from the single
     // source of truth (pto2_sm_layout::ring_segment_offsets), so this setup and
     // the device-address helpers cannot drift.
-    auto off = pto2_sm_layout::ring_segment_offsets(task_window_sizes[0]);
+    auto off = pto2_sm_layout::ring_segment_offsets_with_payload_bytes(pitch, payload_bytes);
     auto &ring = header->ring;
     ring.task_descriptors = (PTO2TaskDescriptor *)(base + off.descriptors);
     ring.task_payloads = (PTO2TaskPayload *)(base + off.payloads);
@@ -65,7 +68,7 @@ void PTO2SharedMemoryHandle::setup_pointers(uint64_t task_window_size) {
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         task_window_sizes[r] = task_window_size;
     }
-    setup_pointers_per_ring(task_window_sizes);
+    setup_pointers_per_ring(task_window_sizes, task_window_size, task_window_size * sizeof(PTO2TaskPayload));
 }
 
 bool PTO2SharedMemoryHandle::init(
@@ -90,21 +93,30 @@ bool PTO2SharedMemoryHandle::init_per_ring(
     sm_base = sm_base_arg;
     sm_size = sm_size_arg;
     is_owner = false;
-    setup_pointers_per_ring(task_window_sizes);
+    setup_pointers_per_ring(task_window_sizes, task_window_sizes[0], task_window_sizes[0] * sizeof(PTO2TaskPayload));
     init_header_per_ring(task_window_sizes, heap_sizes);
     return true;
 }
 
 bool PTO2SharedMemoryHandle::attach_populated(
-    void *sm_base_arg, uint64_t sm_size_arg, const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]
+    void *sm_base_arg, uint64_t sm_size_arg, const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], uint64_t live_slots,
+    uint64_t payload_bytes
 ) {
     if (!sm_base_arg || sm_size_arg == 0) return false;
-    if (sm_size_arg < calculate_size_per_ring(task_window_sizes)) return false;
-
+    // A pitch above the capacity would name a slot the ring cannot address, and one
+    // below what the host used would place every segment past the descriptors
+    // short. This is the whole contract between the two sides, checked once at
+    // attach rather than trusted.
+    if (live_slots == 0 || live_slots > task_window_sizes[0]) return false;
+    if (payload_bytes > task_window_sizes[0] * sizeof(PTO2TaskPayload)) return false;
+    // The region holds the compacted image, so that is what has to fit — the ring
+    // capacity is no longer its size.
+    const uint64_t image_end = pto2_sm_layout::ring_segment_offsets_with_payload_bytes(live_slots, payload_bytes).end;
+    if (sm_size_arg < image_end) return false;
     sm_base = sm_base_arg;
     sm_size = sm_size_arg;
     is_owner = false;
-    setup_pointers_per_ring(task_window_sizes);
+    setup_pointers_per_ring(task_window_sizes, live_slots, payload_bytes);
     // Deliberately NO init_header_per_ring: the SM already holds the host
     // orchestrator's task graph (descriptors, slot states, ring counters).
     return true;

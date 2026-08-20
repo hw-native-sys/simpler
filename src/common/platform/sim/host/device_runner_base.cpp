@@ -374,49 +374,6 @@ void SimDeviceRunnerBase::set_retained_temp_buffer(uint32_t pipeline_slot, void 
     retained_temp_sizes_[pipeline_slot] = size;
 }
 
-void *SimDeviceRunnerBase::acquire_graph_definition_buffer(
-    uint32_t pipeline_slot, uint64_t key, size_t bytes, size_t alignment
-) {
-    if (pipeline_slot >= graph_definition_buffers_.size() || bytes == 0 || alignment == 0 ||
-        (alignment & (alignment - 1)) != 0 || bytes > SIZE_MAX - (alignment - 1)) {
-        return nullptr;
-    }
-    RetainedGraphBuffer &buffer = graph_definition_buffers_[pipeline_slot][key];
-    if (buffer.aligned_addr != nullptr && buffer.capacity >= bytes &&
-        reinterpret_cast<uintptr_t>(buffer.aligned_addr) % alignment == 0) {
-        return buffer.aligned_addr;
-    }
-
-    const size_t allocation_bytes = bytes + alignment - 1;
-    void *allocation = mem_alloc_.alloc(allocation_bytes);
-    if (allocation == nullptr) return nullptr;
-    const uintptr_t raw = reinterpret_cast<uintptr_t>(allocation);
-    if (raw > UINTPTR_MAX - (alignment - 1)) {
-        mem_alloc_.free(allocation);
-        return nullptr;
-    }
-    void *aligned_addr = reinterpret_cast<void *>((raw + alignment - 1) & ~(alignment - 1));
-    if (device_memset(aligned_addr, 0, bytes) != 0) {
-        mem_alloc_.free(allocation);
-        return nullptr;
-    }
-    if (buffer.allocation != nullptr && mem_alloc_.free(buffer.allocation) != 0) {
-        mem_alloc_.free(allocation);
-        return nullptr;
-    }
-    buffer = RetainedGraphBuffer{allocation, aligned_addr, bytes};
-    return aligned_addr;
-}
-
-void SimDeviceRunnerBase::release_graph_definition_buffers() {
-    for (GraphDefinitionBufferMap &by_key : graph_definition_buffers_) {
-        for (auto &entry : by_key) {
-            if (entry.second.allocation != nullptr) mem_alloc_.free(entry.second.allocation);
-        }
-        by_key.clear();
-    }
-}
-
 void SimDeviceRunnerBase::clear_temporary_buffer() {
     for (size_t slot = 0; slot < retained_temp_addrs_.size(); ++slot) {
         if (retained_temp_addrs_[slot] == nullptr) continue;

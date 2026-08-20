@@ -173,6 +173,9 @@ public:
     // the boot thread reads this instead of counting SM ring heads.
     int32_t host_total_tasks;
 
+    // Live TaskPayloadSpace byte count in the shipped shared-memory image.
+    uint64_t sm_payload_bytes;
+
 private:
     // Kernel binary tracking for cleanup
 

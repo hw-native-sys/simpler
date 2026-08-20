@@ -29,6 +29,7 @@
 #include <stdint.h>
 
 #include <atomic>
+#include <cstddef>
 
 #include "profiling_config.h"
 #include "pto_constants.h"
@@ -331,10 +332,10 @@ struct PTO2TaskPayload {
     // dispatch.
     alignas(64) DispatchPredicate predicate;
     ArgsDumpTaskMetadata dump_metadata;
-    // === Cache lines 10-73 (4096B) — tensors (alignas(64) forces alignment) ===
+    // === Cache lines 10-73 (4096B) — tensors ===
     ChipTensor tensors[MAX_TENSOR_ARGS];
     // === Cache lines 74-75 (128B) — scalars ===
-    uint64_t scalars[MAX_SCALAR_ARGS];
+    alignas(64) uint64_t scalars[MAX_SCALAR_ARGS];
 
     // Layout verification (size checks that don't need offsetof).
     static_assert(sizeof(ChipTensor) == 128, "ChipTensor must be 2 cache lines");
@@ -431,7 +432,7 @@ struct PTO2TaskPayload {
 static_assert(offsetof(PTO2TaskPayload, fanin_local_ids) == 12, "inline fanin id array must follow fanin_count");
 static_assert(
     offsetof(PTO2TaskPayload, predicate) == 576,
-    "dispatch predicate occupies cache line 9 at fixed byte 576 (before tensors, never moves)"
+    "dispatch predicate occupies cache line 9 at fixed byte 576 (before the arg arrays, never moves)"
 );
 static_assert(
     offsetof(PTO2TaskPayload, dump_metadata) + sizeof(ArgsDumpTaskMetadata) <= 640,
@@ -448,6 +449,50 @@ static_assert(
     sizeof(PTO2TaskPayload) == 640 + MAX_TENSOR_ARGS * sizeof(ChipTensor) + MAX_SCALAR_ARGS * sizeof(uint64_t),
     "PTO2TaskPayload size = metadata(576) + predicate cache line(64) + tensors + scalars"
 );
+
+// Position-independent reference used inside relocatable runtime images. The
+// payload and its slot move by the same delta from host DDR to device GM, so a
+// relative offset remains valid without a per-slot relocation pass.
+template <typename T>
+struct PTO2RelativePtr {
+    int64_t offset{0};
+
+    T *get() const {
+        if (offset == 0) return nullptr;
+        const intptr_t self = reinterpret_cast<intptr_t>(this);
+        return reinterpret_cast<T *>(self + offset);
+    }
+
+    void reset(T *pointer = nullptr) {
+        offset = pointer == nullptr ? 0 : reinterpret_cast<intptr_t>(pointer) - reinterpret_cast<intptr_t>(this);
+    }
+
+    PTO2RelativePtr &operator=(T *pointer) {
+        reset(pointer);
+        return *this;
+    }
+
+    operator T *() const { return get(); }
+    T *operator->() const { return get(); }
+    T &operator*() const { return *get(); }
+    explicit operator bool() const { return offset != 0; }
+
+    bool operator==(std::nullptr_t) const { return offset == 0; }
+    bool operator!=(std::nullptr_t) const { return offset != 0; }
+};
+
+template <typename T>
+inline bool operator==(std::nullptr_t, const PTO2RelativePtr<T> &pointer) {
+    return pointer == nullptr;
+}
+
+template <typename T>
+inline bool operator!=(std::nullptr_t, const PTO2RelativePtr<T> &pointer) {
+    return pointer != nullptr;
+}
+
+static_assert(sizeof(PTO2RelativePtr<PTO2TaskPayload>) == sizeof(uint64_t));
+static_assert(std::is_trivially_copyable_v<PTO2RelativePtr<PTO2TaskPayload>>);
 
 /**
  * Per-task slot scheduling state (scheduler-private, NOT in shared memory)
@@ -477,8 +522,10 @@ struct alignas(64) PTO2TaskSlotState {
     std::atomic<PTO2TaskState> task_state;
 
     // --- Per-slot constant, re-bound by orch::prepare_task each submit ---
-    PTO2TaskPayload *payload;
-    PTO2TaskDescriptor *task;
+    // Self-relative, so the SM image needs no pointer fix-up on its way to the
+    // device: both targets sit in the same block as this field.
+    PTO2RelativePtr<PTO2TaskPayload> payload;
+    PTO2RelativePtr<PTO2TaskDescriptor> task;
 
     // --- Wake list: last-fanin notification (intrusive, lock-free) ---
     // A pending consumer whose fanin scan finds an unmet producer registers on
@@ -534,8 +581,8 @@ struct alignas(64) PTO2TaskSlotState {
     }
 
     void bind_buffers(PTO2TaskPayload *p, PTO2TaskDescriptor *t) {
-        payload = p;
-        task = t;
+        payload.reset(p);
+        task.reset(t);
     }
 
     // Host-visible completion mirror. The device readiness truth

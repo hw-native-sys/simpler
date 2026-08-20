@@ -229,9 +229,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
     // Boot: the last AICPU thread (aicpu_thread_num_ - 1) performs the one-time
     // host-orch attach. host_build_graph's orchestrator already ran on the host,
-    // which also relocated every cross-task pointer to its final device address
-    // before H2D — so the SM/arena this thread sees are already fully
-    // device-addressed. This thread attaches the prebuilt arena, points the SM
+    // and every cross-task reference it wrote is an offset from its own block, so
+    // the SM/arena this thread sees need no address fixup. This thread attaches
+    // the prebuilt arena, points the SM
     // handle's ring-header pointers at the device SM WITHOUT resetting the
     // host-populated data, hands the host-computed task count to the scheduler,
     // and releases the other threads. It then falls through and schedules its own
@@ -264,14 +264,24 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             runtime_wire_arena_pointers(runtime_arena_, rt->prebuilt_layout, rt);
 
             void *sm_ptr = runtime->get_gm_sm_ptr();
-            uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size_per_ring(rt->prebuilt_layout.task_window_sizes);
+            // The image the host shipped is pitched to the submitted task count,
+            // not to the ring capacity, and the device region holds exactly that
+            // image — so its size comes from the same pitch. attach_populated
+            // rejects a pitch outside (0, capacity] and a region too small for it.
+            const uint64_t live_slots =
+                pto2_sm_layout::live_slot_pitch(static_cast<uint64_t>(runtime->host_total_tasks));
+            const uint64_t payload_bytes = runtime->sm_payload_bytes;
+            const uint64_t sm_size =
+                pto2_sm_layout::ring_segment_offsets_with_payload_bytes(live_slots, payload_bytes).end;
             // sm_handle and the scheduler state are the device-only zone: their
             // bytes never travel, so they start as whatever the pooled arena last
             // held. Zeroing the handle first is what makes attach_populated's
             // assignment of every field checkable here rather than by inspecting
             // attach_populated.
             memset(rt->sm_handle, 0, sizeof(*rt->sm_handle));
-            if (!rt->sm_handle->attach_populated(sm_ptr, sm_size, rt->prebuilt_layout.task_window_sizes)) {
+            if (!rt->sm_handle->attach_populated(
+                    sm_ptr, sm_size, rt->prebuilt_layout.task_window_sizes, live_slots, payload_bytes
+                )) {
                 LOG_ERROR("Thread %d: host-orch: sm_handle->attach_populated failed", thread_idx);
                 rt = nullptr;
                 run_rc = -1;
@@ -306,8 +316,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // to keep them alive).
             // NOTE: do NOT call rt_orchestration_done(rt) here. The HOST already
             // called it in run_host_orchestration; the orchestrator's own
-            // task-allocator pointers are intentionally NOT relocated, so they
-            // still hold host addresses and mark_done() would fault the AICPU.
+            // task-allocator pointers name host memory the device never reads, so
+            // mark_done() would fault the AICPU.
             sched_ctx_.on_orchestration_done(runtime, rt, thread_idx, runtime->host_total_tasks);
             LOG_INFO("Thread %d: host-orch boot complete (%d tasks)", thread_idx, runtime->host_total_tasks);
         }

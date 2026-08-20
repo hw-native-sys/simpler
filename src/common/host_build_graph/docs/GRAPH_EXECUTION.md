@@ -355,8 +355,29 @@ For a cache hit, the Host Orchestrator:
    the Definition's `execution_storage_bytes` for the execution the device
    materializes into;
 4. computes only external fanin and boundary tensormap effects;
-5. emits one outer `GRAPH` task;
-6. stages the exact-size POD submission image for upload after orchestration.
+5. emits one outer `GRAPH` task, whose payload carries the boundary args exactly
+   as any other task's payload carries its own;
+6. stages a fixed-size POD submission for the run's GraphBlock.
+
+The submission image is a Definition reference — key, content hash, device
+address, the activation gate and the word the device CASes to publish its local
+execution — and nothing else. The boundary args are not on it: the compact SM segment already
+ships every task's payload, so putting them there sends them once instead of
+twice, and the device reads them from `outer_slot.payload` in the same
+`ChipTensor` form the dispatch path uses everywhere else. They arrive through the
+channel that path already trusts, so the Scheduler validates the pairing — their
+counts against the Definition's boundary counts — rather than re-checking each
+tensor.
+
+After orchestration completes, the Host first computes a contiguous GraphBlock
+layout: every distinct `[GraphDefinitionHeader][Definition]` object in order,
+then every fixed-size submission. Submissions store device addresses derived
+from `GraphBlock base + Definition offset`. Only after all sizes and offsets are
+known does the Host append that block to the current arena bank's runtime
+region, which reuses an equal-or-larger allocation from that bank. The complete
+bind image is overwritten with exactly one H2D copy on every run; there is no
+content-based copy skip and no per-Definition or per-submission device
+allocation.
 
 Internal nodes consume no ring task-window slots. Their descriptor, payload,
 and slot state live in the tail of the outer `GRAPH` task's own heap block,
@@ -376,10 +397,11 @@ bytes it starts from are whatever that heap region last held.
 ## Scheduler flow
 
 Host orchestration builds the complete task image before device execution. At
-the end of orchestration, the Host uploads every exact-size Graph POD image,
-relocates the task and payload pointers in the shared-memory image, copies the
-complete shared-memory/runtime-arena image to the device, and then launches the
-resident Scheduler.
+the end of orchestration, the Host stages the copied runtime zone, the compacted
+shared-memory image, Graph Definitions, and submissions into one arena-owned
+bind image and uploads it once before launching the resident Scheduler. Slot
+states name their TaskPayloadSpace record and descriptor by self-relative
+offsets, so compaction rebinds them without shipping host pointers.
 
 All AICPU threads classify disjoint slices of the completed task window behind
 one startup barrier. A Graph task enters preparation and external-fanin

@@ -906,7 +906,7 @@ struct PTO2SchedulerState {
         const uint32_t end = execution.fanin_offsets[node_index + 1];
         for (uint32_t edge = begin; edge < end; ++edge) {
             const uint16_t producer_index = execution.fanin_indices[edge];
-            const PTO2TaskSlotState &producer = execution.nodes[producer_index].slot;
+            const PTO2TaskSlotState &producer = execution.node_at(producer_index).slot;
             if (producer.task_state.load(std::memory_order_acquire) != PTO2_TASK_COMPLETED) {
                 return static_cast<int32_t>(producer_index);
             }
@@ -934,7 +934,7 @@ struct PTO2SchedulerState {
                 push_ready_routed(consumer);
                 return;
             }
-            producer = &execution.nodes[unmet_producer].slot;
+            producer = &execution.node_at(unmet_producer).slot;
         }
     }
 
@@ -947,7 +947,7 @@ struct PTO2SchedulerState {
             if (unmet_producer < 0) {
                 push_ready_routed(waiter);
             } else {
-                register_graph_wake(execution, &execution.nodes[unmet_producer].slot, waiter);
+                register_graph_wake(execution, &execution.node_at(unmet_producer).slot, waiter);
             }
             consumers_rescanned++;
             waiter = next;
@@ -978,7 +978,7 @@ struct PTO2SchedulerState {
                 continue;
             }
             if (execution.fanin_offsets[i] == execution.fanin_offsets[i + 1]) {
-                push_ready_routed(&execution.node_storage[i].slot);
+                push_ready_routed(&execution.node_at(i).slot);
                 routed++;
             }
         }
@@ -996,12 +996,12 @@ struct PTO2SchedulerState {
     void graph_incremental_publish(GraphExecution &execution, int32_t first, int32_t last) {
         for (int32_t i = first; i < last; ++i) {
             if (execution.fanin_offsets[i] == execution.fanin_offsets[i + 1]) continue;  // root
-            PTO2TaskSlotState &node = execution.node_storage[i].slot;
+            PTO2TaskSlotState &node = execution.node_at(i).slot;
             const int32_t unmet = graph_first_unmet_producer(execution, node);
             if (unmet < 0) {
                 push_ready_routed(&node);
             } else {
-                register_graph_wake(execution, &execution.nodes[unmet].slot, &node);
+                register_graph_wake(execution, &execution.node_at(unmet).slot, &node);
             }
         }
         execution.published_nodes.store(last, std::memory_order_release);
