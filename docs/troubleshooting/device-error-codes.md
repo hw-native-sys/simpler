@@ -39,8 +39,12 @@ above.
 At most one of `orch_error_code` (1-11) and `sched_error_code` (100+) is ever
 non-zero. `runtime_status` is just the latched code negated.
 
-The exception you see (`RuntimeError: run failed with code <rc>`) is **not** always
-the same number:
+The native-run exception normally has the form
+`RuntimeError: <phase>_native_run failed with code <rc>`, where `<phase>` is
+`prepare`, `launch`, `poll`, or `finalize`. When that failure leaves the run lane
+terminally poisoned, the same error may carry a
+`chip run lane is poisoned:` prefix. The reported `<rc>` is **not** always the
+same number:
 
 | Environment | `<rc>` |
 | ----------- | ------ |
