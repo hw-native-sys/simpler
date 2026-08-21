@@ -25,8 +25,9 @@ from __future__ import annotations
 
 import ctypes
 import os
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from multiprocessing.shared_memory import SharedMemory
 from typing import Any
 
@@ -42,13 +43,14 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     read_args_from_blob,
 )
 
-from .comm_endpoints import RegionAccessReasonCode
+from .comm_endpoints import AdapterKind, AdapterProfile, RegionAccessReasonCode
 
 __all__ = [
     "AccessMode",
     "AddressSpace",
     "BackendKind",
     "Buffer",
+    "BufferCapability",
     "BufferDescriptor",
     "CanonicalIdentity",
     "ImportContext",
@@ -57,6 +59,7 @@ __all__ = [
     "MappedArg",
     "MappedArgs",
     "Tensor",
+    "capabilities_for_adapter",
     "create_host_shared_buffer",
     "host_ptr_nbytes",
     "intern_worker_path",
@@ -292,6 +295,7 @@ def remote_sidecar_tensor(
     buffer_id: int,
     generation: int,
     address_space: AddressSpace,
+    byte_offset: int = 0,
 ) -> Tensor:
     """Build a ``REMOTE_SIDECAR`` ``Tensor`` for a task arg destined for a remote worker.
 
@@ -302,6 +306,8 @@ def remote_sidecar_tensor(
     (``owner_worker_id`` folded into the opaque nonce, plus ``buffer_id`` / ``generation``) so
     dependency inference and routing stay stable across the hop.
 
+    ``nbytes`` is the whole backing length and ``byte_offset`` is the view origin, matching the
+    ordinary local Tensor ABI. The view's transport range is carried separately in the sidecar.
     This placeholder is what the remote L3 wire carries verbatim as the task's per-argument record.
     """
     descriptor = BufferDescriptor(
@@ -310,13 +316,15 @@ def remote_sidecar_tensor(
         address_space=address_space,
         access=AccessMode.READWRITE,
         backend_kind=BackendKind.REMOTE_SIDECAR,
+        # The placeholder follows the normal Tensor ABI: this is the whole backing length. The
+        # remote sidecar carries the transport view range separately.
         nbytes=nbytes,
         body=b"",
     )
     shapes = tuple(shapes)
     return Tensor(
         buffer=descriptor,
-        byte_offset=0,
+        byte_offset=byte_offset,
         shapes=shapes,
         strides=_row_major_strides(shapes),
         dtype=int(dtype),
@@ -461,9 +469,226 @@ def _descriptor_delta(a: BufferDescriptor, b: BufferDescriptor) -> str:
     return ", ".join(diff) if diff else "no field differs"
 
 
+class BufferCapability(str, Enum):
+    """An operation an endpoint is allowed to perform on an attached backing.
+
+    This is intentionally distinct from :class:`~simpler.comm_endpoints.AdapterKind`: the latter
+    names the mechanism used to attach, while this type records the resulting access rights.  One
+    adapter can afford several rights and the same right can be afforded by several mechanisms.
+
+    Load and store are separate rights because a backing can afford one without the other: a
+    ``FORK_COW`` backing is dereferenceable in the child, yet a store there splits into a private
+    copy the owner never sees, which is why its descriptor carries ``AccessMode.READ``.
+    """
+
+    DIRECT_LOAD = "DIRECT_LOAD"
+    DIRECT_STORE = "DIRECT_STORE"
+    COPY_TO = "COPY_TO"
+    COPY_FROM = "COPY_FROM"
+    DEVICE_PEER_ACCESS = "DEVICE_PEER_ACCESS"
+
+
+# The rights that write to the backing, and the ones that read it. `AccessMode` withholds one
+# group or the other, so every capability belongs to exactly one of them (`DEVICE_PEER_ACCESS`
+# names a device-side attachment rather than a direction, so it survives either restriction).
+_WRITE_CAPABILITIES = frozenset({BufferCapability.DIRECT_STORE, BufferCapability.COPY_TO})
+_READ_CAPABILITIES = frozenset({BufferCapability.DIRECT_LOAD, BufferCapability.COPY_FROM})
+
+_CAPABILITIES_BY_ADAPTER: dict[AdapterKind, frozenset[BufferCapability]] = {
+    AdapterKind.DIRECT_MAP: frozenset(
+        {
+            BufferCapability.DIRECT_LOAD,
+            BufferCapability.DIRECT_STORE,
+            BufferCapability.COPY_TO,
+            BufferCapability.COPY_FROM,
+        }
+    ),
+    AdapterKind.DEVICE_PEER: frozenset(
+        {
+            BufferCapability.DEVICE_PEER_ACCESS,
+            BufferCapability.COPY_TO,
+            BufferCapability.COPY_FROM,
+        }
+    ),
+    AdapterKind.OWNER_DELEGATED_COPY: frozenset({BufferCapability.COPY_TO, BufferCapability.COPY_FROM}),
+    # These mechanisms create/use a different backing or describe an operation, so they do not
+    # grant an attachment capability on the source backing.
+    AdapterKind.EXPLICIT_TRANSFER: frozenset(),
+    AdapterKind.COLLECTIVE: frozenset(),
+}
+
+
+def capabilities_for_adapter(
+    kind: AdapterKind | str, access: AccessMode | int | None = None
+) -> frozenset[BufferCapability]:
+    """Return the access rights afforded by ``kind``, narrowed to what ``access`` permits.
+
+    The mechanism sets the ceiling and the backing's own ``AccessMode`` lowers it: a mechanism
+    that could dereference both ways still grants no write right over a READ backing.  Passing no
+    ``access`` asks for the mechanism's ceiling alone.
+
+    Unknown values fail closed with an empty set.  That is important at this boundary: a new
+    adapter must not silently acquire direct access until its capability mapping is deliberate.
+    """
+
+    try:
+        normalized = AdapterKind(kind)
+    except (TypeError, ValueError):
+        return frozenset()
+    granted = _CAPABILITIES_BY_ADAPTER.get(normalized, frozenset())
+    if access is None:
+        return granted
+    try:
+        mode = AccessMode(access)
+    except (TypeError, ValueError):
+        return frozenset()
+    if mode is AccessMode.READ:
+        return granted - _WRITE_CAPABILITIES
+    if mode is AccessMode.WRITE:
+        return granted - _READ_CAPABILITIES
+    return granted
+
+
+# The consumer-side mechanism each wire backend resolves through in this process. Two backends
+# share a mechanism wherever they resolve the same way and differ only in what the descriptor says
+# about them: FORK_SHM/FORK_COW are both a VA inherited across the fork (they differ in `access`),
+# and DEVICE_MALLOC/VMM_WINDOW are both a VA valid only on the chip that owns them.
+_PROFILE_BY_BACKEND: dict[BackendKind, AdapterProfile] = {
+    BackendKind.FORK_SHM: AdapterProfile.FORK_INHERITED_VA,
+    BackendKind.FORK_COW: AdapterProfile.FORK_INHERITED_VA,
+    BackendKind.POSIX_SHM: AdapterProfile.HOST_SHM_MAP,
+    BackendKind.DEVICE_MALLOC: AdapterProfile.DEVICE_LOCAL,
+    BackendKind.VMM_WINDOW: AdapterProfile.DEVICE_LOCAL,
+}
+
+# How a host endpoint reaches a chip-owned device backing it cannot map: by asking the chip that
+# owns it to perform the copy. Keyed on the backend because that is what the two moments of this
+# vocabulary have in common -- region planning already names the `VMM_WINDOW` half `HOST_VMM_COPY`
+# for a host region consumer, and never sees a `DEVICE_MALLOC` at all.
+_DELEGATED_PROFILE_BY_BACKEND: dict[BackendKind, AdapterProfile] = {
+    BackendKind.DEVICE_MALLOC: AdapterProfile.OWNER_DEVICE_COPY,
+    BackendKind.VMM_WINDOW: AdapterProfile.HOST_VMM_COPY,
+}
+
+
+def select_adapter(desc: BufferDescriptor, context: ImportContext) -> tuple[AdapterKind, AdapterProfile]:
+    """The mechanism ``context``'s endpoint reaches ``desc``'s backing by -- mapping or not.
+
+    The capability judgment at its per-tensor evaluation moment, and the counterpart of the region
+    planner's ``_adapter_candidates``. Two of the four axes that planner ranges over are bound to
+    constants here rather than absent: connectivity is fixed local because the consumer *is* this
+    process and transport has already happened, and the consumer's deployment arrived as the
+    ``ImportContext`` the owner handed down at fork.
+
+    **Not being able to map a backing is not the same as not being allowed to touch it.** A host
+    endpoint cannot hold a device VA, but the Worker that owns the chip can still reach that
+    backing by asking the chip to copy -- which is what ``Worker.copy_to`` / ``copy_from`` do. So a
+    device backing at a host endpoint resolves to ``OWNER_DELEGATED_COPY`` when this endpoint has a
+    delegation channel to its owner, and is refused only when it has none (a SUB child, or another
+    Worker's backing entirely). ``materialize`` is what narrows this to the mapping subset, because
+    a local base is what *it* has to return -- the narrowing belongs there and not here.
+
+    The owner-nonce check is Worker-grained, not chip-grained (see ``ImportContext``): it cannot by
+    itself tell apart two chips forked from the same multi-device Worker. The exact-chip half is
+    the dispatch guard's (``Worker._child_prov_check_dispatch``, which compares the registered
+    handle's ``owner_worker_id``); this is the backstop for a path that arrives without one.
+    """
+    if desc.backend_kind == BackendKind.REMOTE_SIDECAR:
+        raise _refuse(
+            RegionAccessReasonCode.UNSUPPORTED_BACKEND_KIND,
+            f"REMOTE_SIDECAR ({desc.identity}) names a backing on another machine; the remote "
+            f"session resolves it against its own registry, so it is never reached from here",
+        )
+    if desc.address_space == AddressSpace.DEVICE:
+        # One nonce comparison for both endpoint kinds; `is_host_endpoint` then says whether being
+        # related to that Worker means being one of its chips or owning them.
+        if context.device_owner_instance_id != bytes(desc.identity.owner_instance_id):
+            raise _refuse(
+                RegionAccessReasonCode.UNSUPPORTED_ENDPOINT_RELATION,
+                f"DEVICE backing ({desc.identity}) belongs to a Worker this endpoint is unrelated "
+                f"to: it is neither one of that Worker's chips nor the owner of them",
+            )
+        if context.is_host_endpoint:
+            delegated = _DELEGATED_PROFILE_BY_BACKEND.get(desc.backend_kind)
+            if delegated is None:
+                raise _refuse(
+                    RegionAccessReasonCode.UNSUPPORTED_BACKEND_KIND,
+                    f"no delegated-copy mechanism for backend {desc.backend_kind!r} ({desc.identity})",
+                )
+            return AdapterKind.OWNER_DELEGATED_COPY, delegated
+    profile = _PROFILE_BY_BACKEND.get(desc.backend_kind)
+    if profile is None:
+        raise _refuse(
+            RegionAccessReasonCode.UNSUPPORTED_BACKEND_KIND,
+            f"no local materialization mechanism for backend {desc.backend_kind!r} ({desc.identity})",
+        )
+    return AdapterKind.DIRECT_MAP, profile
+
+
+def _refuse(code: RegionAccessReasonCode, message: str) -> ValueError:
+    """A materialization refusal tagged with the reason vocabulary the region planner reports.
+
+    Every refusal on this path carries one, so a caller can tell an endpoint-relation verdict from
+    an unsupported backing without parsing prose, and so both evaluation moments of the capability
+    judgment answer in the same terms.
+    """
+    return ValueError(f"ImportRegistry: [{code.value}] {message}")
+
+
+def _resolve_body_as_va(desc: BufferDescriptor) -> tuple[int, SharedMemory | None]:
+    """The body is the base pointer (u64 LE), already valid in this process — no mapping.
+
+    FORK_SHM / FORK_COW: a host VA inherited across the fork, so the child already holds the same
+    address (they differ in write semantics, not in how they resolve). DEVICE_MALLOC / VMM_WINDOW:
+    a device pointer valid on the chip that allocated / carved it (the tensor must only reach that
+    chip — a topology invariant). ``select_adapter`` enforces the owning-Worker half of that; the
+    exact-chip half for a Worker with several chips is submit-time's job, not this cache's.
+    """
+    return int.from_bytes(desc.body, "little"), None
+
+
+def _resolve_host_shm_map(desc: BufferDescriptor) -> tuple[int, SharedMemory | None]:
+    """Map the named POSIX shm object into this process."""
+    name = desc.body.decode("utf-8")
+    try:
+        shm = SharedMemory(name=name)
+    except FileNotFoundError as exc:
+        # The owner unlinks on release, so a missing name is the expected shape of "this identity
+        # was released", not a corrupt descriptor. Naming both the identity and that reading
+        # separates it from a genuinely bad name at a glance.
+        raise FileNotFoundError(
+            f"ImportRegistry: shm object {name!r} for {desc.identity} does not exist — its "
+            f"owner has released the buffer, or it was never created"
+        ) from exc
+    # A mapping post-condition, not a capability: `validate_tensor` admits a view when
+    # byte_offset + extent <= nbytes, so a backing smaller than the nbytes its own descriptor
+    # advertises turns every one of those checks into a comparison against a number no memory
+    # stands behind. The object's real size is the only thing here the owner cannot overstate.
+    if shm.size < desc.nbytes:
+        shm.close()
+        raise ValueError(
+            f"ImportRegistry: shm object {name!r} is {shm.size} bytes, short of the {desc.nbytes} its descriptor claims"
+        )
+    return _shm_base_addr(shm), shm
+
+
+# One resolver per mechanism, so a mechanism shared by several backends is carried out once.
+_RESOLVERS: dict[AdapterProfile, Callable[[BufferDescriptor], tuple[int, SharedMemory | None]]] = {
+    AdapterProfile.FORK_INHERITED_VA: _resolve_body_as_va,
+    AdapterProfile.DEVICE_LOCAL: _resolve_body_as_va,
+    AdapterProfile.HOST_SHM_MAP: _resolve_host_shm_map,
+}
+
+
 @dataclass
 class ImportedBuffer:
-    """A buffer materialized into the consumer's address space: identity -> local base."""
+    """A buffer materialized into the consumer's address space: identity -> local base.
+
+    ``profile`` names the materialization mechanism and ``capabilities`` names the operations this
+    endpoint may perform through it.  They are deliberately separate from the wire
+    ``BackendKind`` and from ``AdapterKind``: a backend is a producer-side representation, while a
+    profile is the consumer-side mechanism and capabilities are the resulting access rights.
+    """
 
     identity: CanonicalIdentity
     base: int
@@ -476,6 +701,8 @@ class ImportedBuffer:
     # mapping is not. Keeping it is what lets `materialize` detect that instead of silently handing
     # back the earlier mapping.
     descriptor: BufferDescriptor | None = None
+    profile: AdapterProfile | None = None
+    capabilities: frozenset[BufferCapability] = frozenset()
 
 
 @dataclass
@@ -544,37 +771,46 @@ class MappedArgs(Sequence):
 
 @dataclass(frozen=True)
 class ImportContext:
-    """What owner nonce this endpoint may materialize a DEVICE ``address_space`` backing under.
+    """Which Worker's device memory this endpoint is related to, and how.
 
-    A host endpoint (Python SUB, or any host-process consumer) may never materialize a DEVICE
-    backing — no device VA is ever valid there. A device (chip) endpoint may materialize one only
-    if the descriptor's ``owner_instance_id`` matches ``owning_chip_instance_id``.
+    ``device_owner_instance_id`` names that Worker; ``is_host_endpoint`` says which side of it this
+    endpoint sits on, and those two answer every DEVICE-backing question ``select_adapter`` asks:
 
-    This is a Worker-level check, not a chip-level one: ``owner_instance_id`` is minted once per
-    Worker incarnation (in ``Worker.init()``), not once per chip, so a Worker with more than one
-    entry in ``device_ids`` gives every one of its chip children the same nonce here — the wire
-    ``BufferDescriptor`` has no field that distinguishes sibling chips (``owner_worker_id`` is
-    host-side-only free/copy provenance, never serialized). A DEVICE backing minted for chip 0
-    of such a Worker therefore also passes this check on sibling chip 1. It still rejects a
-    *different* Worker's device buffer, and any host endpoint outright. The exact-chip half of
-    the endpoint x address_space matrix is enforced at submit time by the
-    ``(target_worker_id, ptr)`` check in ``orchestrator.py``; this is a backstop for a path that
-    reaches ``materialize`` without going through it, not a replacement for that check.
+    ===================  =================  =========================================
+    endpoint             is_host_endpoint   relation to a backing carrying that nonce
+    ===================  =================  =========================================
+    chip child           False              it IS one of that Worker's chips -> DIRECT_MAP
+    the Worker itself    True               it OWNS those chips -> OWNER_DELEGATED_COPY
+    Python SUB child     True (nonce None)  no relation at all -> refused
+    ===================  =================  =========================================
 
-    ``materialize()``'s DEVICE-backing rejections are tagged with
-    ``RegionAccessReasonCode.UNSUPPORTED_ENDPOINT_RELATION`` (``comm_endpoints.py``) — the same
-    reason code the domain-scoped ``EndpointRegistry``/``RegionAccessService`` capability engine
-    reports for the same question at region-planning time. The two mechanisms share only this
-    rejection vocabulary, not a live registry object: this context is built inside forked child
-    processes (and at L2's same-process lazy-materialize point), both of which run before
-    ``EndpointRegistry.from_snapshot()``'s ``_require_ready_for_region_planning()`` precondition
-    can be assumed to hold. ``EndpointRegistry``'s topology snapshot also carries no per-chip
-    identity (only per-Worker), so it could not close this class's own Worker-grained-not-chip-
-    grained limit even where it is reachable.
+    The two host rows are the distinction the nonce carries and the boolean cannot: neither can
+    hold a device VA, and only one of them can still reach the backing, by driving the control
+    mailbox of the chip that owns it. A nonce that does not match is a different Worker's device
+    memory, refused from every endpoint here.
+
+    This is Worker-grained, not chip-grained: the nonce is minted once per Worker incarnation (in
+    ``Worker.init()``), not once per chip, so a Worker with several ``device_ids`` gives all its
+    chip children the same one — the wire ``BufferDescriptor`` has no field that distinguishes
+    siblings (``owner_worker_id`` is owner-side free/copy provenance, never serialized). A backing
+    minted for chip 0 therefore also passes here on sibling chip 1. The exact-chip half is
+    ``Worker._child_prov_check_dispatch``, which compares the registered handle's
+    ``owner_worker_id`` against the submitted target; this is the backstop for a path that arrives
+    without having gone through it, not a replacement for it.
+
+    DEVICE-backing refusals are tagged ``RegionAccessReasonCode.UNSUPPORTED_ENDPOINT_RELATION``
+    (``comm_endpoints.py``) — the same reason code the domain-scoped
+    ``EndpointRegistry``/``RegionAccessService`` engine reports for the same question at
+    region-planning time. The two mechanisms share only that vocabulary, not a live registry
+    object: this context is built inside forked child processes (and at L2's same-process
+    lazy-materialize point), both of which run before ``EndpointRegistry.from_snapshot()``'s
+    ``_require_ready_for_region_planning()`` precondition can be assumed to hold. That registry's
+    topology snapshot also carries no per-chip identity, so it could not close the
+    Worker-grained-not-chip-grained limit above even where it is reachable.
     """
 
     is_host_endpoint: bool
-    owning_chip_instance_id: bytes | None = None
+    device_owner_instance_id: bytes | None = None
 
 
 class ImportRegistry:
@@ -608,11 +844,11 @@ class ImportRegistry:
         POSIX shm object smaller than the ``nbytes`` its descriptor claims — every view bound check
         is computed against that number, so an unverified one makes them all vacuous.
 
-        A DEVICE backing is rejected unless ``context`` names this endpoint's owning Worker: the
-        endpoint x ``address_space`` matrix's materialize-side half, the backstop for a path that
-        reaches here without going through submit-time dispatch. This check is Worker-grained, not
-        chip-grained (see ``ImportContext``) — it cannot by itself tell apart two chips forked from
-        the same multi-device Worker.
+        Selection is the capability judgment: ``select_adapter`` either names the mechanism that
+        reaches this backing from this endpoint or refuses, and the resolver below only carries the
+        named mechanism out. Nothing after selection looks at ``backend_kind`` again. A mechanism
+        that reaches the backing without producing an address is refused *here* rather than there --
+        this returns a mapping, and that is the only narrowing it applies to the judgment.
         """
         key = desc.identity
         cached = self._by_identity.get(key)
@@ -628,60 +864,27 @@ class ImportRegistry:
                     f"this is refused"
                 )
             return cached
-        if desc.address_space == AddressSpace.DEVICE:
-            if self._context.is_host_endpoint:
-                raise ValueError(
-                    f"ImportRegistry: [{RegionAccessReasonCode.UNSUPPORTED_ENDPOINT_RELATION.value}] "
-                    f"refusing to materialize a DEVICE backing ({desc.identity}) on a host endpoint"
-                )
-            if bytes(desc.identity.owner_instance_id) != self._context.owning_chip_instance_id:
-                raise ValueError(
-                    f"ImportRegistry: [{RegionAccessReasonCode.UNSUPPORTED_ENDPOINT_RELATION.value}] "
-                    f"refusing to materialize a DEVICE backing ({desc.identity}) "
-                    f"minted for a different chip's owner"
-                )
-        if desc.backend_kind in (
-            BackendKind.FORK_SHM,
-            BackendKind.FORK_COW,
-            BackendKind.DEVICE_MALLOC,
-            BackendKind.VMM_WINDOW,
-        ):
-            # The body is the base pointer (u64 LE), already valid in this process — no mapping.
-            # FORK_SHM / FORK_COW: a host VA inherited across the fork, so the child already holds
-            # the same address (they differ in write semantics, not in how they resolve).
-            # DEVICE_MALLOC / VMM_WINDOW: a device pointer valid on the chip that allocated / carved
-            # it (the tensor must only reach that chip — a topology invariant). The check above
-            # enforces the owning-Worker half of that (see ImportContext); the exact-chip half for
-            # a Worker with several chips is submit-time's job, not this cache's.
-            base = int.from_bytes(desc.body, "little")
-            imported = ImportedBuffer(desc.identity, base, desc.nbytes, desc.address_space, None, desc)
-        elif desc.backend_kind == BackendKind.POSIX_SHM:
-            name = desc.body.decode("utf-8")
-            try:
-                shm = SharedMemory(name=name)
-            except FileNotFoundError as exc:
-                # The owner unlinks on release, so a missing name is the expected shape of "this
-                # identity was released", not a corrupt descriptor. Naming both the identity and
-                # that reading separates it from a genuinely bad name at a glance.
-                raise FileNotFoundError(
-                    f"ImportRegistry: shm object {name!r} for {desc.identity} does not exist — its "
-                    f"owner has released the buffer, or it was never created"
-                ) from exc
-            # `validate_tensor` admits a view when byte_offset + extent <= nbytes, so a backing
-            # smaller than the nbytes its own descriptor advertises turns every one of those checks
-            # into a comparison against a number no memory stands behind. The object's real size is
-            # the only thing here the owner cannot overstate.
-            if shm.size < desc.nbytes:
-                shm.close()
-                raise ValueError(
-                    f"ImportRegistry: shm object {desc.body.decode('utf-8')!r} is {shm.size} bytes, "
-                    f"short of the {desc.nbytes} its descriptor claims"
-                )
-            imported = ImportedBuffer(desc.identity, _shm_base_addr(shm), desc.nbytes, desc.address_space, shm, desc)
-        elif desc.backend_kind == BackendKind.REMOTE_SIDECAR:
-            raise ValueError("ImportRegistry: REMOTE_SIDECAR backend is reserved for P2")
-        else:
-            raise NotImplementedError(f"ImportRegistry: backend {desc.backend_kind!r} not supported in P1-B")
+        kind, profile = select_adapter(desc, self._context)
+        resolver = _RESOLVERS.get(profile)
+        if resolver is None:
+            raise _refuse(
+                RegionAccessReasonCode.NO_IMPLEMENTED_DIRECT_MAP_PROBE,
+                f"{desc.identity} is reachable from this endpoint by {kind.value} ({profile.value}), "
+                f"which produces no local address; materialize returns a mapping, so ask "
+                f"`select_adapter` what this endpoint may do and issue the operation through the "
+                f"backing's owner",
+            )
+        base, shm = resolver(desc)
+        imported = ImportedBuffer(
+            desc.identity,
+            base,
+            desc.nbytes,
+            desc.address_space,
+            shm,
+            desc,
+            profile,
+            capabilities_for_adapter(kind, desc.access),
+        )
         self._by_identity[key] = imported
         return imported
 
@@ -718,9 +921,34 @@ class ImportRegistry:
     def resolve(self, identity: CanonicalIdentity) -> ImportedBuffer:
         """The already-materialized import for ``identity``. Raises ``KeyError`` if this endpoint has
         not materialized that backing — resolution never maps as a side effect."""
+        return self.require(identity)
+
+    def require(
+        self,
+        identity: CanonicalIdentity,
+        need: BufferCapability | str | None = None,
+    ) -> ImportedBuffer:
+        """Return a live materialization, optionally requiring one capability.
+
+        This is a pure lookup: it never maps as a side effect.  Missing identity and insufficient
+        capability are intentionally different failures so callers can choose between materializing
+        the backing and selecting a different operation adapter.
+        """
+
         imported = self._by_identity.get(identity)
         if imported is None:
             raise KeyError(f"ImportRegistry: no buffer registered for {identity}")
+        if need is None:
+            return imported
+        try:
+            capability = BufferCapability(need)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"ImportRegistry: unknown buffer capability {need!r}") from exc
+        if capability not in imported.capabilities:
+            raise ValueError(
+                f"ImportRegistry: identity {identity} materialized with profile "
+                f"{imported.profile!r} does not grant {capability.value}"
+            )
         return imported
 
     def unregister(self, identity: CanonicalIdentity) -> None:

@@ -178,10 +178,13 @@ zero are never on the wire.
 Every argument's `remote_desc[i]` is present and names a remote buffer,
 imported peer buffer, UB mapping, or allowed small `HOST_INLINE` payload. That
 sidecar is the sole authority for the argument's backing, so `tensors[i]` must
-carry no backing of its own: its `backend_kind` is `REMOTE_SIDECAR` and its
-`byte_offset` is zero, both rejected otherwise on encode and on decode. Bare
-host pointers are rejected for remote endpoints unless an explicit staging API
-has produced a remote handle and sidecar descriptor.
+carry no materialized backing of its own: its `backend_kind` is
+`REMOTE_SIDECAR` and its body is empty. The Tensor still follows the ordinary
+local ABI: `BufferDescriptor.nbytes` is the whole wire backing and
+`byte_offset` is the view origin within that backing; a non-zero offset is
+valid when the common Tensor validator and the session's sidecar range check
+accept it. Bare host pointers are rejected for remote endpoints unless an
+explicit staging API has produced a remote handle and sidecar descriptor.
 
 `HOST_INLINE` is for small payloads that should travel inside the TASK frame.
 It still requires a `RemoteTensorDescWire` with `address_space=HOST_INLINE`;
@@ -760,7 +763,8 @@ The frame codec must reject:
 - `HOST_INLINE` payload offsets or lengths outside the inline byte arena;
 - non-`HOST_INLINE` descriptors with non-zero inline payload lengths;
 - a remote TASK argument that carries a local backing (any `backend_kind` other
-  than `REMOTE_SIDECAR`) or a non-zero `TensorWire.byte_offset`;
+  than `REMOTE_SIDECAR`), or a Tensor whose `byte_offset + extent` exceeds its
+  whole backing;
 - stale generations;
 - unknown control names or control versions;
 - completion sequence mismatch;

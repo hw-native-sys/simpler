@@ -100,7 +100,7 @@ from .remote_l3_protocol import (
     read_frame,
     send_frame,
 )
-from .task_interface import ChipCallable, TaskArgs
+from .task_interface import ChipCallable, TaskArgs, get_element_size
 from .worker import Worker, _NoBufferConsumerError
 
 sys.modules.setdefault("simpler.remote_l3_session", sys.modules[__name__])
@@ -605,17 +605,18 @@ def _materialize_task_args(
             desc = sidecar.desc
             if desc is None:
                 raise ValueError("remote TASK descriptor is marked present but missing")
-            if desc.nbytes != tensor.buffer.nbytes:
-                raise ValueError("remote TASK descriptor nbytes does not match the tensor's backing")
-            # The sidecar is the sole authority for where the view sits in the backing, so the
-            # placeholder's own descriptor spans exactly the view and its byte_offset is zero.
-            if tensor.byte_offset != 0:
-                raise ValueError("remote TASK tensor must carry no byte_offset of its own")
+            view_extent = _tensor_extent_bytes(tensor)
+            if view_extent > desc.nbytes:
+                raise ValueError("remote TASK descriptor nbytes is smaller than the tensor view extent")
+            if tensor.byte_offset + desc.nbytes > tensor.buffer.nbytes:
+                raise ValueError("remote TASK descriptor view range exceeds the wire backing")
             if desc.address_space == RemoteAddressSpace.HOST_INLINE:
                 backing, byte_offset = _materialize_inline_payload(args, desc, mint_inline_buffer)
                 inline_backings.append(backing)
             else:
                 backing, byte_offset = _resolve_session_backing(desc, buffers, worker_id)
+            if int(tensor.byte_offset) != int(byte_offset):
+                raise ValueError("remote TASK tensor byte_offset disagrees with its sidecar range")
             task_args.add_tensor(
                 backing.tensor(tensor.shapes, tensor.dtype, strides=tensor.strides, byte_offset=byte_offset)
             )
@@ -629,6 +630,14 @@ def _materialize_task_args(
     for scalar in args.scalars:
         task_args.add_scalar(int(scalar))
     return task_args, inline_backings
+
+
+def _tensor_extent_bytes(tensor) -> int:
+    """Return the validated Tensor view extent, including gaps from explicit strides."""
+    last_element = 0
+    for shape, stride in zip(tensor.shapes, tensor.strides):
+        last_element += (int(shape) - 1) * int(stride)
+    return (last_element + 1) * int(get_element_size(tensor.dtype))
 
 
 def _materialize_inline_payload(

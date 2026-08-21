@@ -212,16 +212,18 @@ public:
         wt->control_free(ptr);
     }
     // Both ends of a copy are handles: the child resolves each descriptor through its
-    // ImportRegistry, so neither side is described by an address the parent minted.
-    void copy_to(int worker_id, const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes) {
+    // ImportRegistry, so neither side is described by an address the parent minted. `span` says
+    // which byte range of each backing the copy covers, so a partial update names the whole
+    // allocation and an offset into it rather than an address part-way in.
+    void copy_to(int worker_id, const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span) {
         auto *wt = manager_.get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
         if (!wt) throw std::runtime_error("Worker::copy_to: invalid worker_id");
-        wt->control_copy_to(dst, src, nbytes);
+        wt->control_copy_to(dst, src, span);
     }
-    void copy_from(int worker_id, const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes) {
+    void copy_from(int worker_id, const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span) {
         auto *wt = manager_.get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
         if (!wt) throw std::runtime_error("Worker::copy_from: invalid worker_id");
-        wt->control_copy_from(dst, src, nbytes);
+        wt->control_copy_from(dst, src, span);
     }
 
     // Broadcast CTRL_REGISTER / CTRL_UNREGISTER for a ChipCallable digest to

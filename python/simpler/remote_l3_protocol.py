@@ -26,10 +26,10 @@ from .buffer import (
 )
 from .task_interface import MAX_TENSOR_DIMS, CallConfig, DataType
 
-# 3: a TASK's per-argument record is the self-describing wire ``Tensor`` — the embedded
+# 4: a TASK's per-argument record is the self-describing wire ``Tensor`` — the embedded
 # BufferDescriptor plus the strided view. Both ends of a run come from one ``pip install``,
 # so this constant is a mismatch alarm at the frame header, not a dual-decode selector.
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 MAX_FRAME_PAYLOAD_BYTES = 16 * 1024 * 1024
 MAX_STRING_BYTES = 1024
 MAX_ERROR_BYTES = 4096
@@ -472,10 +472,6 @@ def decode_tensor(reader: _Reader) -> Tensor:
     owner_worker_path_id = reader.u32()
     body = reader.blob(MAX_BUFFER_DESCRIPTOR_BODY_BYTES, "BufferDescriptor.body")
     byte_offset = reader.u64()
-    # The sidecar's own offset is where the view sits in the backing, so the record's view spans
-    # exactly the backing its descriptor advertises.
-    if byte_offset != 0:
-        raise ValueError("remote_wire: a remote TASK tensor must carry no byte_offset")
     ndims = reader.u32()
     if ndims == 0 or ndims > MAX_TENSOR_DIMS:
         raise ValueError("remote_wire: tensor ndims out of range")

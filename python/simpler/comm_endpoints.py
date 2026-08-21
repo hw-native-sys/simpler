@@ -482,12 +482,38 @@ class AdapterKind(str, Enum):
 
 
 class AdapterProfile(str, Enum):
+    """How a consumer reaches a backing — the mechanism, not the wire backend tag.
+
+    One vocabulary evaluated at two moments, so a value's provenance is either region planning
+    (`_adapter_candidates`), tensor materialization (`buffer.select_adapter`), or both.
+    The partition is a consequence of what each moment can see, not a gap to be filled:
+    `_backend_kind_for_provider` gives a region exactly two backings — `VMM_WINDOW` for a device
+    provider and `POSIX_SHM` for a host one — so the fork-inherited and device-local mechanisms
+    below are unreachable from planning by construction, and `_adapter_candidates` is complete
+    without them.
+    """
+
+    # region planning only. `HOST_SVM_MAP` is the exception with no producer at all:
+    # `_adapter_candidates` stopped offering a direct map over a VMM backing, and the value stays
+    # because `DefaultRegionAccessService` still has to refuse it should another backing ever route
+    # one here.
     HOST_SVM_MAP = "HOST_SVM_MAP"
     HOST_VMM_COPY = "HOST_VMM_COPY"
     DEVICE_VMM_PEER_IMPORT = "DEVICE_VMM_PEER_IMPORT"
     DEVICE_FABRIC_V2_PEER_IMPORT = "DEVICE_FABRIC_V2_PEER_IMPORT"
-    HOST_SHM_MAP = "HOST_SHM_MAP"
     REMOTE_COPY = "REMOTE_COPY"
+    # both moments. `HOST_VMM_COPY` is how a host endpoint reaches a VMM window it cannot map, at
+    # either moment: the planner names it for a host region consumer, and `select_adapter` names it
+    # for a host endpoint holding a VMM-backed tensor.
+    HOST_SHM_MAP = "HOST_SHM_MAP"
+    # tensor materialization only. These never travel in a `GlobalDomainCommand`, which is why
+    # `global_comm_domain._ADAPTER_PROFILE_IDS` does not number them.
+    FORK_INHERITED_VA = "FORK_INHERITED_VA"
+    DEVICE_LOCAL = "DEVICE_LOCAL"
+    # A host endpoint reaching a chip-owned `DEVICE_MALLOC` by asking that chip to copy. The
+    # planner has no counterpart because `_backend_kind_for_provider` never gives a region a
+    # `DEVICE_MALLOC` backing; the `VMM_WINDOW` half of the same relation is `HOST_VMM_COPY`.
+    OWNER_DEVICE_COPY = "OWNER_DEVICE_COPY"
 
 
 class RegionAccessReasonCode(str, Enum):

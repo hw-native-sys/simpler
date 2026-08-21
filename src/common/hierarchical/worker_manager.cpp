@@ -138,10 +138,10 @@ uint64_t WorkerEndpoint::control_committed_device_memory() {
     throw_unsupported_control("control_committed_device_memory");
 }
 void WorkerEndpoint::control_free(uint64_t) { throw_unsupported_control("control_free"); }
-void WorkerEndpoint::control_copy_to(const BufferDescriptor &, const BufferDescriptor &, uint64_t) {
+void WorkerEndpoint::control_copy_to(const BufferDescriptor &, const BufferDescriptor &, const CopySpan &) {
     throw_unsupported_control("control_copy_to");
 }
-void WorkerEndpoint::control_copy_from(const BufferDescriptor &, const BufferDescriptor &, uint64_t) {
+void WorkerEndpoint::control_copy_from(const BufferDescriptor &, const BufferDescriptor &, const CopySpan &) {
     throw_unsupported_control("control_copy_from");
 }
 void WorkerEndpoint::control_prepare(const uint8_t *) { throw_unsupported_control("control_prepare"); }
@@ -1383,17 +1383,19 @@ void LocalMailboxEndpoint::control_free(uint64_t ptr) {
     run_control_command("control_free");
 }
 
-void LocalMailboxEndpoint::control_copy_to(const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes) {
+void LocalMailboxEndpoint::control_copy_to(
+    const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span
+) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
-    write_control_copy_request(mbox(), CTRL_COPY_TO, dst, src, nbytes);
+    write_control_copy_request(mbox(), CTRL_COPY_TO, dst, src, span);
     run_control_command("control_copy_to");
 }
 
 void LocalMailboxEndpoint::control_copy_from(
-    const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes
+    const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span
 ) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
-    write_control_copy_request(mbox(), CTRL_COPY_FROM, dst, src, nbytes);
+    write_control_copy_request(mbox(), CTRL_COPY_FROM, dst, src, span);
     run_control_command("control_copy_from");
 }
 
@@ -1579,14 +1581,14 @@ void WorkerThread::control_free(uint64_t ptr) {
     endpoint_->control_free(ptr);
 }
 
-void WorkerThread::control_copy_to(const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes) {
+void WorkerThread::control_copy_to(const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span) {
     if (!endpoint_) throw std::runtime_error("control_copy_to: null endpoint");
-    endpoint_->control_copy_to(dst, src, nbytes);
+    endpoint_->control_copy_to(dst, src, span);
 }
 
-void WorkerThread::control_copy_from(const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes) {
+void WorkerThread::control_copy_from(const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span) {
     if (!endpoint_) throw std::runtime_error("control_copy_from: null endpoint");
-    endpoint_->control_copy_from(dst, src, nbytes);
+    endpoint_->control_copy_from(dst, src, span);
 }
 
 void WorkerThread::control_alloc_domain(const char *request_shm_name, const char *reply_shm_name) {
