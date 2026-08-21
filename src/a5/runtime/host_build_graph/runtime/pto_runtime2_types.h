@@ -10,9 +10,9 @@
  */
 
 /**
- * PTO Runtime2 - Core Type Definitions
+ * host_build_graph runtime core type definitions.
  *
- * This header defines all fundamental types used by the PTO Runtime2 system:
+ * This header defines the fundamental types used by host_build_graph:
  * - Configuration constants
  * - Worker types and task states
  * - ChipTensor regions and task parameters
@@ -68,33 +68,17 @@
 // =============================================================================
 
 // Task management
-// NOTE: PTO2_TASK_WINDOW_SIZE is now a per-ring default value.
-// Actual window size is passed at runtime to runtime_create_from_sm().
-// Use pto2_task_slot(sched, task_id) for slot calculation.
-#define PTO2_TASK_WINDOW_SIZE 16384  // Default per-ring task window size (power of 2)
+// Default maximum number of tasks in a whole-graph-resident HBG run.
+// The effective capacity is resolved before the runtime image is built.
+#define HBG_DEFAULT_TASK_CAPACITY 16384  // Power of 2
 
-// Single ring. host_build_graph is host-orch: the whole graph is built on the
-// host, fits one ring, and the device runs it once without reclaim (see stages
-// 1-2 — execution-time recycle removed). The multi-ring design existed only to
-// let inner scopes reclaim independently under small rings; with no reclaim and
-// a whole-graph-resident ring, per-depth isolation is moot, so all scope depths
-// map to the single ring 0 (0 == 0).
-#define PTO2_MAX_RING_DEPTH 1
-
-// Memory pools (total = value, single ring)
+// Memory pools
 #define PTO2_HEAP_SIZE (256 * 1024 * 1024)  // 256MB
 #define PTO2_TENSORMAP_POOL_SIZE (65536)    // TensorMap entry pool
 #define PTO2_TENSORMAP_NUM_BUCKETS 4096     // Power of 2 for fast hash (4096×8B=32KB fits L1)
 
 // Scope management
 #define PTO2_MAX_SCOPE_DEPTH 64  // Maximum nesting depth
-// Hard cap for the scope_tasks buffer. Equals the total in-flight ring slot
-// budget (PTO2_TASK_WINDOW_SIZE × PTO2_MAX_RING_DEPTH): once every ring slot
-// is in flight, no more tasks can ever be pushed regardless of buffer size.
-// scope_tasks_push fatals on overflow rather than growing the arena-owned
-// buffer (which would be UB on the arena's malloc'd backing).
-#define PTO2_SCOPE_TASKS_CAP (PTO2_TASK_WINDOW_SIZE * PTO2_MAX_RING_DEPTH)
-
 // Per-shape ready-queue capacity (power of two). This is a ring buffer that
 // bounds peak CONCURRENT occupancy (enqueue_pos - dequeue_pos), not total task
 // count: slots recycle, so capacity need only exceed the most tasks ever
@@ -147,7 +131,7 @@ constexpr uint64_t PTO2_TENSOR_DATA_TIMEOUT_MS = 15000;  // 15 s
  * Conditions:
  *   PENDING->COMPLETED:   all subtasks finish (set by scheduler) or task is a
  *                         hidden alloc completed inline by the orchestrator
- *   COMPLETED->CONSUMED:  per-ring completed_watermark >= last_consumer_local_id
+ *   COMPLETED->CONSUMED:  completed_watermark >= last_consumer_local_id
  */
 typedef enum {
     PTO2_TASK_PENDING = 0,    // Submitted; awaiting fanin, queued, or dispatched
@@ -160,7 +144,7 @@ typedef enum {
  */
 struct PTO2TaskAllocResult {
     int32_t task_id;    // Absolute task ID (not wrapped)
-    int32_t slot;       // task_id & (window_size - 1)
+    int32_t slot;       // task_id & (task_capacity - 1)
     void *packed_base;  // Heap allocation result (nullptr if failure)
     void *packed_end;   // packed_base + aligned output_size
 
@@ -208,7 +192,7 @@ struct PTO2TaskDescriptor {
 
     // Packed output buffer (all outputs packed into single contiguous buffer)
     void *packed_buffer_base;  // Start of packed buffer in GM Heap
-    void *packed_buffer_end;   // End of packed buffer (for heap reclamation)
+    void *packed_buffer_end;   // End of packed buffer
 };
 
 // A 4-byte alignment pad follows kernel_id[3]; the scheduler and shared-memory
@@ -224,8 +208,7 @@ static_assert(offsetof(PTO2TaskDescriptor, packed_buffer_base) == 24, "packed_bu
  * Task payload data (cold path - only accessed during orchestration and dispatch)
  *
  * Layout: metadata + inline fanin packed in the first 9 cache lines, followed
- * by bulk tensor and scalar data. Small fanins stay fully inline; larger
- * fanins spill into a per-ring ring buffer slice.
+ * by bulk tensor and scalar data. Fanin is hard-capped at PTO2_MAX_FANIN.
  */
 // Early-dispatch claim states for PTO2TaskPayload::early_dispatch_state.
 enum PTO2EarlyDispatchState : uint8_t {
@@ -544,7 +527,7 @@ private:
  */
 struct alignas(64) PTO2TaskSlotState {
     // Highest local task id among this slot's consumers. Reclaim gate: the slot
-    // is safe to retire once the per-ring completed_watermark reaches this id.
+    // is safe to retire once completed_watermark reaches this id.
     // Whole-graph-resident hbg never reclaims at runtime, so this is
     // inert-but-scaffolded for parity. Seeded to own local_id in prepare_task;
     // bumped via max() at submit for each consumer.

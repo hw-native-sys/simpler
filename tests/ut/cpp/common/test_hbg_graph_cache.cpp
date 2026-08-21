@@ -441,7 +441,7 @@ TEST(GraphExecutionReplay, LocalizesBoundaryScalarPoolWiderThanTaskPayload) {
     outer_task.packed_buffer_end = heap.end();
     PTO2TaskSlotState outer_slot{};
     outer_slot.task_kind = TaskKind::GRAPH;
-    outer_slot.task = &outer_task;
+    outer_slot.task.set(&outer_task);
     outer_slot.graph_context = &submission;
 
     GraphExecution *execution = graph_execution_localize(outer_slot);
@@ -471,7 +471,7 @@ TEST(GraphExecutionReplay, RejectsBoundaryScalarPoolBeyondContract) {
     outer_task.packed_buffer_end = heap.end();
     PTO2TaskSlotState outer_slot{};
     outer_slot.task_kind = TaskKind::GRAPH;
-    outer_slot.task = &outer_task;
+    outer_slot.task.set(&outer_task);
     outer_slot.graph_context = &submission;
 
     EXPECT_EQ(graph_execution_localize(outer_slot), nullptr);

@@ -830,6 +830,12 @@ add_a2a3_runtime_test(test_task_allocator   a2a3/test_task_allocator.cpp)
 add_a2a3_runtime_test(test_scope_deadlock_detection common/test_scope_deadlock_detection.cpp)
 set(HBG_RUNTIME_DIR ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/host_build_graph/runtime)
 set(A5_HBG_RUNTIME_DIR ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/host_build_graph/runtime)
+add_a2a3_hbg_runtime_test(test_hbg_single_ring_layout common/test_hbg_single_ring_layout.cpp)
+target_sources(test_hbg_single_ring_layout PRIVATE
+    ${HBG_RUNTIME_DIR}/shared/pto_shared_memory.cpp)
+add_a5_hbg_runtime_test(test_a5_hbg_single_ring_layout common/test_hbg_single_ring_layout.cpp)
+target_sources(test_a5_hbg_single_ring_layout PRIVATE
+    ${A5_HBG_RUNTIME_DIR}/shared/pto_shared_memory.cpp)
 add_a2a3_hbg_runtime_test(test_hbg_task_allocator a2a3/test_hbg_task_allocator.cpp)
 add_a2a3_hbg_runtime_test(test_hbg_tensormap a2a3/test_hbg_tensormap.cpp)
 add_a2a3_hbg_runtime_test(test_hbg_dep_gen_host_graph a2a3/test_dep_gen_host_graph.cpp)

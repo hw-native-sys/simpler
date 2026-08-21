@@ -10,7 +10,7 @@
  */
 
 /**
- * PTO Runtime2 - TensorMap Interface
+ * Host-build-graph TensorMap interface.
  *
  * TensorMap provides producer lookup for dependency discovery:
  * - Maps ChipTensor -> producer task ID
@@ -80,7 +80,7 @@ struct PTO2TensorMapLayout {
     size_t off_task_entry_heads;
     int32_t num_buckets;
     int32_t pool_size;
-    int32_t task_window_size;
+    int32_t task_capacity;
 };
 
 // TensorMap Lookup Profiling (must precede inline lookup/insert methods).
@@ -371,11 +371,11 @@ struct PTO2TensorMap {
     int32_t free_num;        // free entry number in entry pool
 
     // Per-task entry tracking for O(1) unlinking of covered producers.
-    // Indexed by [local_id & (task_window_size - 1)]
+    // Indexed by [local_id & (task_capacity - 1)]
     PTO2TensorMapEntry **task_entry_heads;
-    int32_t task_window_size;  // Task window size (for slot masking)
+    int32_t task_capacity;  // Power-of-two capacity used for slot masking
 
-    uint32_t get_task_local_id_slot(uint32_t task_local_id) const { return task_local_id & (task_window_size - 1); }
+    uint32_t get_task_local_id_slot(uint32_t task_local_id) const { return task_local_id & (task_capacity - 1); }
 
     // Accessors read by scope_stats_collector. Declared unconditionally so the
     // collector .cpp compiles at SIMPLER_DFX=0 (collector is unconditional —
@@ -439,19 +439,19 @@ struct PTO2TensorMap {
     // =============================================================================
 
     /**
-     * Phase 1: reserve every sub-region (buckets, entry_pool, free list, per-ring
+     * Phase 1: reserve every sub-region (buckets, entry_pool, free list, per-task
      * task_entry_heads) on the supplied arena. Records the resulting offsets in
      * the returned layout descriptor. Must be called before the arena is
      * committed.
      */
     static PTO2TensorMapLayout
-    reserve_layout(DeviceArena &arena, int32_t num_buckets, int32_t pool_size, int32_t task_window_size);
+    reserve_layout(DeviceArena &arena, int32_t num_buckets, int32_t pool_size, int32_t task_capacity);
 
     /**
      * Same as reserve_layout() with default sizes (PTO2_TENSORMAP_NUM_BUCKETS,
      * PTO2_TENSORMAP_POOL_SIZE).
      */
-    static PTO2TensorMapLayout reserve_layout_default(DeviceArena &arena, int32_t task_window_size);
+    static PTO2TensorMapLayout reserve_layout_default(DeviceArena &arena, int32_t task_capacity);
 
     /**
      * Phase 3a: write everything *except* arena-internal pointer fields
@@ -577,7 +577,7 @@ struct PTO2TensorMap {
 #endif
         uint32_t bucket_index = hash(addr);
         auto local_id = producer_task_id.local();
-        int32_t task_slot = local_id & (task_window_size - 1);
+        int32_t task_slot = local_id & (task_capacity - 1);
 
         entry->producer_task_id = producer_task_id;
 
@@ -615,7 +615,7 @@ struct PTO2TensorMap {
         if (entry.prev_in_task == nullptr) {
             // Entry is the head of its task chain, update task_entry_heads
             int32_t local_id = static_cast<int32_t>(entry.producer_task_id.local());
-            int32_t task_slot = local_id & (task_window_size - 1);
+            int32_t task_slot = local_id & (task_capacity - 1);
             task_entry_heads[task_slot] = entry.next_in_task;
         } else {
             entry.prev_in_task->next_in_task = entry.next_in_task;

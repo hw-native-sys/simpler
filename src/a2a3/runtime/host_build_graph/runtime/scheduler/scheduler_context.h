@@ -121,7 +121,7 @@ public:
     // (partitioned by tidx/nthreads). Each core is touched by exactly one thread.
     void handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads);
     // Leader-only, after the handshake barrier: build worker-id lists, assign
-    // cores, init profiling subsystems, read task counts, init payloads.
+    // cores, initialize profiling subsystems and payloads.
     int32_t post_handshake_init(Runtime *runtime);
 
     // Reset all SchedulerContext-owned state to its post-construction defaults.
@@ -152,7 +152,7 @@ public:
 
     // Run all post-orchestration scheduler bookkeeping:
     //  - publishes core assignments to the perf collector (SIMPLER_DFX)
-    //  - latches submitted task count from PTO2 shared memory
+    //  - latches the submitted task count supplied by the host runtime
     //  - folds inline_completed_tasks into completed_tasks_
     //    (skipped on fatal error — emergency_shutdown runs instead)
     // Callers must invoke rt_orchestration_done(rt) before this — that

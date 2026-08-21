@@ -11,8 +11,8 @@
 /**
  * Poison test for the "every device-read SM field is written at submit" contract.
  *
- * host_build_graph no longer zero-fills the shared-memory task window (init-on-write):
- * init_header_per_ring writes only the header, and each slot's device-read fields are
+ * host_build_graph no longer zero-fills the shared-memory task-slot storage (init-on-write):
+ * init_header writes only the header, and each slot's device-read fields are
  * written per task at submit (prepare_task + submit_task_common + PTO2TaskPayload::init).
  * Nothing else clears the window, so a device-read field a submit forgets to write would
  * read as 0 only by allocator accident — passing every zero-backed test and failing
@@ -56,14 +56,15 @@ protected:
     void SetUp() override {
         sm_handle = PTO2SharedMemoryHandle::create_and_init_default(sm_arena);
         ASSERT_NE(sm_handle, nullptr);
-        gm_heap.resize(4096 * PTO2_MAX_RING_DEPTH);
+        gm_heap.resize(4096);
 
-        orch_layout = PTO2OrchestratorState::reserve_layout(runtime_arena, static_cast<int32_t>(PTO2_TASK_WINDOW_SIZE));
+        orch_layout =
+            PTO2OrchestratorState::reserve_layout(runtime_arena, static_cast<int32_t>(HBG_DEFAULT_TASK_CAPACITY));
         sched_layout = PTO2SchedulerState::reserve_layout(runtime_arena);
         ASSERT_NE(runtime_arena.commit(), nullptr);
 
         ASSERT_TRUE(orch.init_data_from_layout(
-            orch_layout, runtime_arena, sm_handle->sm_base, gm_heap.data(), 4096, PTO2_TASK_WINDOW_SIZE
+            orch_layout, runtime_arena, sm_handle->sm_base, gm_heap.data(), 4096, HBG_DEFAULT_TASK_CAPACITY
         ));
         ASSERT_TRUE(sched.init_data_from_layout(sched_layout, runtime_arena, sm_handle->sm_base));
         sched.wire_arena_pointers(sched_layout, runtime_arena);
@@ -81,11 +82,11 @@ protected:
     }
 
     // Fill the per-slot window (descriptors / payloads / slot_states / completion_flags)
-    // with poison. init_header_per_ring wrote only the header, so this is the state the
+    // with poison. init_header wrote only the header, so this is the state the
     // window is in before any submit writes it — modelling the never-zeroed device SM.
     void poison_window() {
         auto &ring = sm_handle->header->ring;  // host_build_graph is single-ring
-        const size_t n = static_cast<size_t>(ring.task_window_mask) + 1;
+        const size_t n = static_cast<size_t>(ring.task_capacity_mask) + 1;
         std::memset(ring.task_descriptors, POISON, n * sizeof(PTO2TaskDescriptor));
         std::memset(ring.task_payloads, POISON, n * sizeof(PTO2TaskPayload));
         std::memset(ring.slot_states, POISON, n * sizeof(PTO2TaskSlotState));

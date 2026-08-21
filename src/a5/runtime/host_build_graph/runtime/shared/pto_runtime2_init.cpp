@@ -22,27 +22,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <limits>
-
 #include "pto_orchestrator.h"
 #include "pto_runtime2.h"
 #include "pto_ring_buffer.h"
 #include "pto_shared_memory.h"
 #include "pto_tensormap.h"
 #include "scheduler/pto_scheduler.h"
-
-static bool sum_ring_heap_sizes(const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH], uint64_t *total) {
-    uint64_t sum = 0;
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        if (heap_sizes[r] > std::numeric_limits<uint64_t>::max() - sum) {
-            LOG_ERROR("Total ring heap size overflows uint64_t");
-            return false;
-        }
-        sum += heap_sizes[r];
-    }
-    *total = sum;
-    return true;
-}
 
 // =============================================================================
 // Ready queue
@@ -215,34 +200,31 @@ void PTO2SchedulerState::destroy() {
 // Orchestrator
 // =============================================================================
 
-PTO2OrchestratorLayout PTO2OrchestratorState::reserve_layout(DeviceArena &arena, int32_t task_window_size) {
+PTO2OrchestratorLayout PTO2OrchestratorState::reserve_layout(DeviceArena &arena, int32_t task_capacity) {
     PTO2OrchestratorLayout layout{};
     // scope_tasks holds every task in the open scope, so its cap is the real
-    // in-flight budget = the (runtime) task window. Using the compile-time
-    // PTO2_SCOPE_TASKS_CAP instead under-sized the buffer when ring_task_window
-    // was enlarged past the default (premature SCOPE_TASKS_OVERFLOW) and
-    // over-allocated it when shrunk. See issue #1188.
-    always_assert(task_window_size > 0);
-    layout.scope_tasks_cap = task_window_size;
+    // in-flight budget = the runtime task capacity.
+    always_assert(task_capacity > 0);
+    layout.scope_tasks_cap = task_capacity;
     layout.scope_stack_capacity = PTO2_MAX_SCOPE_DEPTH;
 
     // Polling: no fanin-spill pool — producer ids are inline on the payload.
-    always_assert(task_window_size > 0 && (task_window_size & (task_window_size - 1)) == 0);
+    always_assert(task_capacity > 0 && (task_capacity & (task_capacity - 1)) == 0);
     const size_t seen_epoch_bytes =
-        PTO2_ALIGN_UP(static_cast<size_t>(task_window_size) * sizeof(uint32_t), PTO2_ALIGN_SIZE);
+        PTO2_ALIGN_UP(static_cast<size_t>(task_capacity) * sizeof(uint32_t), PTO2_ALIGN_SIZE);
     layout.off_fanin_seen_epoch = arena.reserve(seen_epoch_bytes, PTO2_ALIGN_SIZE);
 
     layout.off_scope_tasks =
         arena.reserve(static_cast<size_t>(layout.scope_tasks_cap) * sizeof(uintptr_t), alignof(PTO2TaskSlotState *));
     layout.off_scope_begins =
         arena.reserve(static_cast<size_t>(layout.scope_stack_capacity) * sizeof(int32_t), alignof(int32_t));
-    layout.tensor_map = PTO2TensorMap::reserve_layout_default(arena, task_window_size);
+    layout.tensor_map = PTO2TensorMap::reserve_layout_default(arena, task_capacity);
     return layout;
 }
 
 bool PTO2OrchestratorState::init_data_from_layout(
     const PTO2OrchestratorLayout &layout, DeviceArena &arena, void *sm_dev_base, void *gm_heap, uint64_t heap_size,
-    uint64_t task_window_size
+    uint64_t task_capacity
 ) {
     auto *orch = this;
     *orch = PTO2OrchestratorState{};
@@ -255,10 +237,10 @@ bool PTO2OrchestratorState::init_data_from_layout(
     auto *orch_err = pto2_sm_layout::orch_error_code_addr(sm_dev_base);
     auto *cur_idx_dev = pto2_sm_layout::ring_current_task_index_addr(sm_dev_base);
 
-    orch->ring.task_allocator.init(static_cast<int32_t>(task_window_size), cur_idx_dev, gm_heap, heap_size, orch_err);
+    orch->task_allocator.init(static_cast<int32_t>(task_capacity), cur_idx_dev, gm_heap, heap_size, orch_err);
 
     const size_t seen_epoch_bytes =
-        PTO2_ALIGN_UP(static_cast<size_t>(layout.tensor_map.task_window_size) * sizeof(uint32_t), PTO2_ALIGN_SIZE);
+        PTO2_ALIGN_UP(static_cast<size_t>(layout.tensor_map.task_capacity) * sizeof(uint32_t), PTO2_ALIGN_SIZE);
     auto *seen_epoch = static_cast<uint32_t *>(arena.region_ptr(layout.off_fanin_seen_epoch));
     memset(seen_epoch, 0, seen_epoch_bytes);
     orch->fanin_seen_epoch = seen_epoch;
@@ -301,26 +283,9 @@ void PTO2OrchestratorState::set_scheduler(PTO2SchedulerState *scheduler) { this-
 // Top-level runtime arena
 // =============================================================================
 
-PTO2RuntimeArenaLayout runtime_reserve_layout(DeviceArena &arena, uint64_t task_window_size) {
-    uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH];
-    uint64_t heap_sizes[PTO2_MAX_RING_DEPTH];
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        task_window_sizes[r] = task_window_size;
-        heap_sizes[r] = 0;
-    }
-    return runtime_reserve_layout(arena, task_window_sizes, heap_sizes);
-}
-
-PTO2RuntimeArenaLayout runtime_reserve_layout(
-    DeviceArena &arena, const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH],
-    const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]
-) {
+PTO2RuntimeArenaLayout runtime_reserve_layout(DeviceArena &arena, uint64_t task_capacity) {
     PTO2RuntimeArenaLayout layout{};
-
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        layout.task_window_sizes[r] = task_window_sizes[r];
-        layout.heap_sizes[r] = heap_sizes[r];
-    }
+    layout.task_capacity = task_capacity;
 
     // Reservation order is the zone partition (see PTO2RuntimeArenaLayout):
     // everything the device initializes itself, then the one copied range. Each
@@ -341,21 +306,10 @@ PTO2RuntimeArenaLayout runtime_reserve_layout(
     layout.off_copied_end = arena.total_size();
 
     layout.device_bytes = arena.total_size();
-    layout.orch = PTO2OrchestratorState::reserve_layout(arena, static_cast<int32_t>(task_window_sizes[0]));
+    layout.orch = PTO2OrchestratorState::reserve_layout(arena, static_cast<int32_t>(task_capacity));
 
     layout.arena_size = arena.total_size();
     return layout;
-}
-
-PTO2Runtime *runtime_init_data_from_layout(
-    DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2RuntimeMode mode, void *sm_dev_base,
-    uint64_t /*sm_size*/, void *gm_heap_dev_base, uint64_t heap_size
-) {
-    uint64_t heap_sizes[PTO2_MAX_RING_DEPTH];
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        heap_sizes[r] = heap_size;
-    }
-    return runtime_init_data_from_layout(arena, layout, mode, sm_dev_base, 0, gm_heap_dev_base, heap_sizes);
 }
 
 /**
@@ -372,7 +326,7 @@ PTO2Runtime *runtime_init_data_from_layout(
  */
 PTO2Runtime *runtime_init_data_from_layout(
     DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2RuntimeMode mode, void *sm_dev_base,
-    uint64_t /*sm_size*/, void *gm_heap_dev_base, const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]
+    uint64_t /*sm_size*/, void *gm_heap_dev_base, uint64_t heap_size
 ) {
     PTO2Runtime *rt = static_cast<PTO2Runtime *>(arena.region_ptr(layout.off_runtime));
     memset(rt, 0, sizeof(*rt));
@@ -380,11 +334,7 @@ PTO2Runtime *runtime_init_data_from_layout(
     // rt->ops is filled by the AICPU at boot.
     rt->mode = mode;
     rt->gm_heap = gm_heap_dev_base;
-    uint64_t total_heap_size = 0;
-    if (!sum_ring_heap_sizes(heap_sizes, &total_heap_size)) {
-        return nullptr;
-    }
-    rt->gm_heap_size = total_heap_size;
+    rt->gm_heap_size = heap_size;
     rt->gm_heap_owned = false;
     rt->total_cycles = 0;
     rt->active_callable_hash = 0;

@@ -30,7 +30,7 @@
 #define PTO2_ERROR_REQUIRE_SYNC_START_INVALID 7
 #define PTO2_ERROR_TENSOR_WAIT_TIMEOUT 8
 #define PTO2_ERROR_EXPLICIT_ORCH_FATAL 9
-#define PTO2_ERROR_SCOPE_TASKS_OVERFLOW 10  // scope_tasks buffer saturated (all rings full)
+#define PTO2_ERROR_SCOPE_TASKS_OVERFLOW 10  // scope_tasks buffer saturated
 #define PTO2_ERROR_TENSORMAP_OVERFLOW 11    // graph registers more outputs than the tensormap entry pool holds
 
 // Scheduler errors (100+): detected in scheduler threads

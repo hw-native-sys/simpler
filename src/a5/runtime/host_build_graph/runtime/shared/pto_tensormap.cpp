@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * PTO Runtime2 - TensorMap Implementation
+ * Host-build-graph TensorMap implementation.
  *
  * Implements TensorMap with a fixed-capacity arena pool. Task completion does
  * not invalidate entries; dependency computation explicitly removes only
@@ -49,7 +49,7 @@ uint64_t g_insert_count = 0;
 // =============================================================================
 
 PTO2TensorMapLayout PTO2TensorMap::reserve_layout(
-    DeviceArena &arena, int32_t new_num_buckets, int32_t new_pool_size, int32_t new_task_window_size
+    DeviceArena &arena, int32_t new_num_buckets, int32_t new_pool_size, int32_t new_task_capacity
 ) {
     // num_buckets must be a power of two for the hash truncation to work.
     always_assert((new_num_buckets & (new_num_buckets - 1)) == 0);
@@ -57,7 +57,7 @@ PTO2TensorMapLayout PTO2TensorMap::reserve_layout(
     PTO2TensorMapLayout layout{};
     layout.num_buckets = new_num_buckets;
     layout.pool_size = new_pool_size;
-    layout.task_window_size = new_task_window_size;
+    layout.task_capacity = new_task_capacity;
 
     layout.off_buckets = arena.reserve(
         static_cast<size_t>(new_num_buckets) * sizeof(PTO2TensorMapEntry *), alignof(PTO2TensorMapEntry *)
@@ -67,13 +67,13 @@ PTO2TensorMapLayout PTO2TensorMap::reserve_layout(
     layout.off_free_entry_list =
         arena.reserve(static_cast<size_t>(new_pool_size) * sizeof(PTO2TensorMapEntry *), alignof(PTO2TensorMapEntry *));
     layout.off_task_entry_heads = arena.reserve(
-        static_cast<size_t>(new_task_window_size) * sizeof(PTO2TensorMapEntry *), alignof(PTO2TensorMapEntry *)
+        static_cast<size_t>(new_task_capacity) * sizeof(PTO2TensorMapEntry *), alignof(PTO2TensorMapEntry *)
     );
     return layout;
 }
 
-PTO2TensorMapLayout PTO2TensorMap::reserve_layout_default(DeviceArena &arena, int32_t new_task_window_size) {
-    return reserve_layout(arena, PTO2_TENSORMAP_NUM_BUCKETS, PTO2_TENSORMAP_POOL_SIZE, new_task_window_size);
+PTO2TensorMapLayout PTO2TensorMap::reserve_layout_default(DeviceArena &arena, int32_t new_task_capacity) {
+    return reserve_layout(arena, PTO2_TENSORMAP_NUM_BUCKETS, PTO2_TENSORMAP_POOL_SIZE, new_task_capacity);
 }
 
 /**
@@ -83,7 +83,7 @@ PTO2TensorMapLayout PTO2TensorMap::reserve_layout_default(DeviceArena &arena, in
  * insert/lookup). Clears the bucket heads and the per-task entry heads and
  * resets the pool cursors (next_entry_idx / free_num); the entry pool itself is
  * left untouched and initialized on write by new_entry(), so this is
- * O(num_buckets + task_window_size), not O(pool_size).
+ * O(num_buckets + task_capacity), not O(pool_size).
  */
 bool PTO2TensorMap::init_data_from_layout(const PTO2TensorMapLayout &layout, DeviceArena &arena) {
     num_buckets = layout.num_buckets;
@@ -111,10 +111,10 @@ bool PTO2TensorMap::init_data_from_layout(const PTO2TensorMapLayout &layout, Dev
     free_num = 0;
 
     auto *heads_arena = static_cast<PTO2TensorMapEntry **>(arena.region_ptr(layout.off_task_entry_heads));
-    for (int32_t i = 0; i < layout.task_window_size; i++) {
+    for (int32_t i = 0; i < layout.task_capacity; i++) {
         heads_arena[i] = nullptr;
     }
-    task_window_size = layout.task_window_size;
+    task_capacity = layout.task_capacity;
 
     return true;
 }

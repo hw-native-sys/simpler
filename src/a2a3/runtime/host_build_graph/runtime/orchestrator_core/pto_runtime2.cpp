@@ -232,7 +232,7 @@ wait_for_tensor_ready(PTO2Runtime *rt, const ChipTensor &tensor, bool wait_for_c
         int32_t local_id = slot.task->task_id.local();
         uint64_t t0 = get_sys_cnt_aicpu();
         int32_t spin_count = 0;
-        // Polling: all consumers of this producer have retired once the per-ring
+        // Polling: all consumers of this producer have retired once the
         // completed_watermark reaches the producer's highest consumer id (set at
         // submit in append_fanin_or_fail). Replaces the fanout_refcount ==
         // fanout_count wiring check, which polling removes.

@@ -455,7 +455,9 @@ public:
      * @param api               Context-bound platform device-memory hooks.
      * @param orch_args         const ChipStorageTaskArgs* for this run (void* to
      *                          keep task_interface headers out of this header).
-     * @param ring_task_window  Per-ring overrides (trb); ignored by hbg.
+     * @param ring_task_window  Task-window sizing. HBG reads slot 0; TRB reads per-ring values.
+     * @param ring_heap         Heap sizing. HBG reads slot 0; TRB reads per-ring values.
+     * @param ring_dep_pool     Per-ring dependency-pool sizing for TRB; ignored by HBG.
      * @return 0 on success, non-zero on failure (unregistered id, out-of-range
      *         func_id, or the underlying bind_callable_to_runtime_impl rc).
      */

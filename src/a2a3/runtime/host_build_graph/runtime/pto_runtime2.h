@@ -9,30 +9,17 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * PTO Runtime2 - Main Interface
+ * host_build_graph runtime interface.
  *
- * This is the main header for the PTO Runtime2 system.
- * It provides a unified API for task graph construction and execution.
- *
- * Key Features:
- * - Ring buffer based memory management (zero allocation overhead)
- * - Lazy invalidation TensorMap for dependency discovery
- * - Scope-based buffer lifecycle management
- * - Per-task spinlocks for concurrent fanout updates
- * - Orchestrator-Scheduler decoupling via shared memory
- *
- * Usage:
- *   1. Create runtime: PTO2Runtime create methods
- *   2. Build task graph in orchestration function:
- *      - begin_scope() / end_scope()
- *      - submit_task()
- *   3. Mark orchestration complete: mark_done()
- *   4. Destroy runtime
+ * Defines the host-built graph image, runtime operations and lifecycle APIs
+ * shared by the host orchestrator and the AICPU scheduler.
  *
  * Based on: docs/RUNTIME_LOGIC.md
  */
 
 #pragma once
+
+#include <type_traits>
 
 #include "utils/device_arena.h"
 #include "pto_runtime2_types.h"
@@ -151,17 +138,22 @@ struct PTO2RuntimeArenaLayout {
     // arena is arena_size, which instead covers the orchestrator block there.
     size_t device_bytes{0};
 
-    // Cached parameters (re-used by init_data + wire stages).
-    uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]{};
-    uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]{};
+    // Cached parameter used to reserve host-only state and when the AICPU
+    // attaches the populated SM image.
+    uint64_t task_capacity{0};
 
     // Total arena byte size post-commit. Used by host to size the prebuilt
     // image buffer and as the rtMemcpy length.
     size_t arena_size{0};
 };
 
+static_assert(
+    std::is_trivially_copyable_v<PTO2RuntimeArenaLayout> && std::is_standard_layout_v<PTO2RuntimeArenaLayout>,
+    "PTO2RuntimeArenaLayout must remain a device-copyable POD layout"
+);
+
 /**
- * PTO Runtime2 context
+ * host_build_graph runtime context.
  *
  * Contains all state for orchestration and scheduling.
  * In simulated mode, runs in single process with shared address space.
@@ -222,11 +214,7 @@ struct PTO2Runtime {
  * Returns the layout descriptor; caller commits/attaches the arena before
  * Phase 2/3.
  */
-PTO2RuntimeArenaLayout runtime_reserve_layout(DeviceArena &arena, uint64_t task_window_size);
-PTO2RuntimeArenaLayout runtime_reserve_layout(
-    DeviceArena &arena, const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH],
-    const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]
-);
+PTO2RuntimeArenaLayout runtime_reserve_layout(DeviceArena &arena, uint64_t task_capacity);
 
 /**
  * Phase 2 — write the data half of the runtime arena: standalone fields,
@@ -249,10 +237,6 @@ PTO2RuntimeArenaLayout runtime_reserve_layout(
 PTO2Runtime *runtime_init_data_from_layout(
     DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2RuntimeMode mode, void *sm_dev_base, uint64_t sm_size,
     void *gm_heap_dev_base, uint64_t heap_size
-);
-PTO2Runtime *runtime_init_data_from_layout(
-    DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2RuntimeMode mode, void *sm_dev_base, uint64_t sm_size,
-    void *gm_heap_dev_base, const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]
 );
 
 /**

@@ -10,7 +10,7 @@
  */
 
 /**
- * PTO Runtime2 - Scheduler Interface
+ * Host-build-graph scheduler interface.
  *
  * The Scheduler is responsible for:
  * 1. Maintaining per-resource-shape ready queues
@@ -18,7 +18,7 @@
  *    producer named in its inline fanin has set its completion_flags byte;
  *    a producer publishes completion + drains its wake list on finish
  * 3. Publishing the host-visible task_state mirror (PENDING -> COMPLETED) and
- *    advancing the per-ring completed_watermark (consumer-retirement signal)
+ *    advancing completed_watermark (consumer-retirement signal)
  * 4. Two-stage mixed-task completion (subtask done bits -> mixed-task complete)
  *
  * The Scheduler runs on Device AI_CPU. host_build_graph is scheduler-only (the
@@ -474,14 +474,14 @@ struct PTO2SchedulerState {
     // Shared memory access
     PTO2SharedMemoryHeader *sm_header;
 
-    // Per-ring state
+    // Task-window scheduling state
     struct alignas(64) RingSchedState {
         // --- Cache Line 0: ring pointer (read-only) + hot path (read-write) ---
         PTO2SharedMemoryRingHeader *ring;
         std::atomic<int32_t> advance_lock;  // multi-thread CAS
 
-        // Polling: no per-ring dep_pool. Readiness is derived from the SM ring's
-        // completion_flags; there is no arena-side wiring pool to reserve or wire.
+        // Polling: readiness is derived from completion_flags in SM; there is no
+        // arena-side dependency pool to reserve or wire.
         // The `ring` field stores the device address of the SM ring header —
         // computed via offset arithmetic, no SM dereference.
         bool init_data_from_layout(void *sm_dev_base);
@@ -1173,14 +1173,13 @@ struct PTO2SchedulerState {
 
     // on_task_release is gone under polling. It existed to bump each producer's
     // fanout_refcount so the host wait_for_consumers could observe consumer
-    // retirement; that signal is now the per-ring completed_watermark advanced by
+    // retirement; that signal is now completed_watermark advanced by
     // on_mixed_task_complete. There is likewise no self CONSUMED flip (host-orch
     // never reclaimed slots on device).
 
     // === Cold-path API (defined in pto_scheduler.cpp) ===
 
-    // Phase 1: declare every sub-region (ready_queue slots, dummy queue slots,
-    // per-ring dep_pool entries) on the supplied arena.
+    // Phase 1: declare every queue sub-region on the supplied arena.
     // Capacities are baked into the returned layout; init_data_from_layout uses
     // the same values.
     static PTO2SchedulerLayout reserve_layout(DeviceArena &arena);
@@ -1189,9 +1188,9 @@ struct PTO2SchedulerState {
     // `sm_dev_base` is the device address of the SM (only stored, never
     // dereferenced here). Safe to call on a host arena that holds the
     // prebuilt image buffer. (The orchestrator counterpart takes
-    // task_window_size for ring task_descriptors address arithmetic; the
+    // task_capacity for ring task_descriptors address arithmetic; the
     // scheduler only needs the SM header / ring header base addresses,
-    // both window-size-independent.)
+    // both capacity-independent.)
     bool init_data_from_layout(const PTO2SchedulerLayout &layout, DeviceArena &arena, void *sm_dev_base);
 
     // Phase 3b: write the arena-internal pointer fields

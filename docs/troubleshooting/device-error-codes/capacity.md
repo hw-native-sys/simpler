@@ -15,7 +15,7 @@ resource and determines how strong that diagnosis is:
 - `No reclaim progress for ~500 ms` or `cannot reclaim space after ~500 ms` is
   the backstop. It proves that reclaim remained stalled, but not whether the root
   cause is undersizing, a stuck consumer, or a stalled scheduler.
-- `Task Window Exhausted` / `Graph Heap Exhausted` / `Fanin Capacity Exhausted`
+- `Task Capacity Exhausted` / `Graph Heap Exhausted` / `Fanin Capacity Exhausted`
   / `TensorMap Entry Pool Exhausted` is HBG, and it is unambiguous: that runtime
   builds a whole-graph-resident image on the host, so the graph simply does not
   fit. These checks return immediately; there is no concurrent scheduler
@@ -38,7 +38,7 @@ that trips the code.
 
 | Runtime | Bottleneck resource | Code | Fix |
 | ------- | ------------------- | ---- | --- |
-| HBG | task window | 3 | raise `ring_task_window` (`PTO2_RING_TASK_WINDOW`), or shrink the graph |
+| HBG | task capacity | 3 | raise `ring_task_window` (`PTO2_RING_TASK_WINDOW`), or shrink the graph |
 | HBG | graph heap | 2 | raise `ring_heap` (`PTO2_RING_HEAP`), or shrink intermediate tensors |
 | HBG | inline fanin | 4 | reduce distinct producers to `PTO2_MAX_FANIN` (currently 128) or less; HBG has no `PTO2_RING_DEP_POOL` |
 | HBG | TensorMap entries | 11 | increase `PTO2_TENSORMAP_POOL_SIZE`, or reduce registered outputs |
