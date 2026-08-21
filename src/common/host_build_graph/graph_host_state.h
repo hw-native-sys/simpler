@@ -30,8 +30,8 @@ using GraphHostStatePtr = std::unique_ptr<GraphHostState, GraphHostStateDeleter>
 
 struct GraphHostUpload {
     PTO2TaskSlotState *outer_slot;
-    std::byte *data;
-    size_t bytes;
+    uint64_t full_key;
+    uint64_t definition_hash;
 };
 
 // The run's distinct Definition images (already deduplicated by the host-side

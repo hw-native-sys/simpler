@@ -957,17 +957,13 @@ struct PTO2SchedulerState {
     }
 
     // Push every materialized-and-published root that has not been routed yet,
-    // once the outer Graph task's external dependency gate (0x2) has opened.
+    // once the outer Graph task's external dependencies are ready.
     // route_cursor makes this idempotent, so it composes across the per-slice
     // calls during materialization and the final call at the activation meet;
     // each root reaches the ready queue exactly once. Non-roots are never pushed
     // here — they reach the ready queue through their producers' wake list.
     int32_t graph_route_ready_roots(GraphExecution &execution) {
-        if (execution.outer_slot == nullptr) return 0;
-        GraphSubmission *submission = graph_submission_from_slot(*execution.outer_slot);
-        if (submission == nullptr || (__atomic_load_n(&submission->activation_gate, __ATOMIC_ACQUIRE) & 0x2u) == 0) {
-            return 0;
-        }
+        if (execution.outer_slot == nullptr || !graph_execution_external_ready(execution)) return 0;
         const int32_t published = execution.published_nodes.load(std::memory_order_acquire);
         int32_t routed = 0;
         while (true) {
@@ -1010,10 +1006,7 @@ struct PTO2SchedulerState {
     }
 
     int32_t activate_prepared_graph(GraphExecution &execution) {
-        GraphExecutionState expected = GraphExecutionState::PREPARED;
-        if (!execution.state.compare_exchange_strong(
-                expected, GraphExecutionState::ACTIVE, std::memory_order_acq_rel, std::memory_order_acquire
-            )) {
+        if (!graph_execution_transition(execution, GraphExecutionState::PREPARED, GraphExecutionState::ACTIVE)) {
             return 0;
         }
         return graph_route_ready_roots(execution);
@@ -1023,30 +1016,25 @@ struct PTO2SchedulerState {
         PTO2TaskSlotState &outer_slot, int32_t max_nodes = GRAPH_MATERIALIZE_SLICE_NODES,
         int32_t *nodes_materialized = nullptr
     ) {
-        GraphSubmission *submission = graph_submission_from_slot(outer_slot);
-        if (submission == nullptr) return GraphMaterializeResult::INVALID;
-        GraphExecution *execution = graph_execution_localize(outer_slot);
-        if (execution == nullptr) {
-            return graph_submission_execution_initializing(*submission) ? GraphMaterializeResult::BUSY :
-                                                                          GraphMaterializeResult::INVALID;
-        }
+        GraphExecution *execution = graph_execution_from_outer_slot(outer_slot);
+        if (execution == nullptr) return GraphMaterializeResult::INVALID;
         const int32_t before = execution->materialized_nodes;
         const GraphMaterializeResult result =
             graph_execution_materialize_slice(outer_slot, *execution, max_nodes, nodes_materialized);
         if (result == GraphMaterializeResult::PENDING || result == GraphMaterializeResult::PREPARED) {
             graph_incremental_publish(*execution, before, execution->materialized_nodes);
         }
-        if (result == GraphMaterializeResult::PREPARED && graph_submission_signal(*submission, 0x1)) {
+        if (result == GraphMaterializeResult::PREPARED && graph_execution_external_ready(*execution)) {
             activate_prepared_graph(*execution);
         }
         return result;
     }
 
     int32_t activate_graph_task(PTO2TaskSlotState &outer_slot) {
-        GraphSubmission *submission = graph_submission_from_slot(outer_slot);
-        if (submission == nullptr || !graph_submission_signal(*submission, 0x2)) return 0;
-        GraphExecution *execution = graph_submission_local_execution(*submission);
-        return execution == nullptr ? 0 : activate_prepared_graph(*execution);
+        GraphExecution *execution = graph_execution_from_outer_slot(outer_slot);
+        if (execution == nullptr) return 0;
+        graph_execution_signal_external_ready(*execution);
+        return activate_prepared_graph(*execution);
     }
 
     struct TaskCompletionOutcome {
@@ -1081,9 +1069,9 @@ struct PTO2SchedulerState {
         }
         // Incremental activation routes a node before the graph reaches ACTIVE, so a
         // node can legitimately complete while the graph is still MATERIALIZING or
-        // PREPARED. Only SUBMITTED (execution not yet localized) and COMPLETED
+        // PREPARED. Only SUBMITTED (execution not yet bound) and COMPLETED
         // (execution already retired) are invalid states for a node completion.
-        const GraphExecutionState graph_state = execution->state.load(std::memory_order_acquire);
+        const GraphExecutionState graph_state = graph_execution_state(*execution);
         if (graph_state < GraphExecutionState::MATERIALIZING || graph_state > GraphExecutionState::ACTIVE) {
             outcome.error_code = PTO2_ERROR_INVALID_ARGS;
             return outcome;

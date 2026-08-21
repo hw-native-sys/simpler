@@ -1142,6 +1142,7 @@ void SchedulerContext::classify_partition(int32_t thread_idx, int32_t nthreads) 
         }
         PTO2TaskSlotState &slot = ring.get_slot_state_by_task_id(id);
         if (slot.task_kind == TaskKind::GRAPH) {
+            if (graph_execution_localize(slot) == nullptr) slot.graph_context = nullptr;
             if (!sched_->push_graph_prepare(&slot, slot.task->task_id.raw, thread_idx)) return;
         }
         int32_t state = sched_->classify_fanin_state(&slot);

@@ -1298,7 +1298,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         // Graph control work never consumes an AICore. External dependency
         // readiness and bounded definition materialization progress
-        // independently, then meet at GraphSubmission::activation_gate.
+        // independently, then meet in GraphExecution::state.
         //
         // Keep this ahead of dummy/regular dispatch so a ready Graph can expose
         // its root nodes without waiting for an otherwise unrelated dispatch
