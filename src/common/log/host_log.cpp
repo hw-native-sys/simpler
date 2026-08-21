@@ -153,6 +153,57 @@ long host_trace_tid() {
 #endif
 }
 
+struct HostSpanFileSink {
+    std::mutex mutex;
+    FILE *stream = nullptr;
+    pid_t pid = -1;
+    std::string directory;
+};
+
+HostSpanFileSink &host_span_file_sink() {
+    static HostSpanFileSink sink;
+    return sink;
+}
+
+bool write_host_span_file(
+    const char *directory, const SimplerHostSpan &span, long tid, const std::string &name, const std::string &attributes
+) {
+    HostSpanFileSink &sink = host_span_file_sink();
+    std::scoped_lock lock(sink.mutex);
+    const pid_t pid = getpid();
+    const bool inherited = sink.stream != nullptr && sink.pid != pid;
+    const bool changed_directory = sink.stream != nullptr && sink.directory != directory;
+    if (inherited) {
+        sink.stream = nullptr;
+        sink.pid = -1;
+        sink.directory.clear();
+    } else if (changed_directory) {
+        std::fclose(sink.stream);
+        sink.stream = nullptr;
+        sink.pid = -1;
+        sink.directory.clear();
+    }
+    if (sink.stream == nullptr) {
+        char path[PATH_MAX];
+        const int length = std::snprintf(path, sizeof(path), "%s/host-strace.%d.log", directory, pid);
+        if (length <= 0 || static_cast<size_t>(length) >= sizeof(path)) return false;
+        sink.stream = std::fopen(path, "a");
+        if (sink.stream == nullptr) return false;
+        std::setvbuf(sink.stream, nullptr, _IOFBF, 1U << 20U);
+        sink.pid = pid;
+        sink.directory = directory;
+    }
+    const int written = std::fprintf(
+        sink.stream,
+        "[STRACE] v=1 pid=%d tid=%ld inv=%" PRIu64 " hid=%" PRIx64 " depth=%d name=%s ts=%" PRId64 " dur=%" PRId64
+        " %s\n",
+        static_cast<int>(pid), tid, span.invocation_id, span.callable_hash, span.depth, name.c_str(), span.timestamp_ns,
+        span.duration_ns, attributes.c_str()
+    );
+    if (written < 0) return false;
+    return span.depth != 0 || std::fflush(sink.stream) == 0;
+}
+
 }  // namespace
 
 namespace {
@@ -320,6 +371,11 @@ void HostLogger::log_host_span(const SimplerHostSpan *span) {
     const std::string name = encode_host_span_field(span->name, kHostSpanNameCapacity, false);
     const std::string attributes =
         encode_host_span_field(span->attributes == nullptr ? "" : span->attributes, kHostSpanAttributesCapacity, true);
+    const char *directory = std::getenv("SIMPLER_HOST_STRACE_DIR");
+    if (directory != nullptr && directory[0] != '\0' &&
+        write_host_span_file(directory, *span, host_trace_tid(), name, attributes)) {
+        return;
+    }
     log(LogLevel::TIMING, "emit_host_span",
         "[STRACE] v=1 pid=%d tid=%ld inv=%" PRIu64 " hid=%" PRIx64 " depth=%d name=%s ts=%" PRId64 " dur=%" PRId64
         " %s",

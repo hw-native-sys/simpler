@@ -18,6 +18,7 @@
 #include <limits.h>
 #include <algorithm>
 #include <cerrno>
+#include <fstream>
 #include <sstream>
 #include <set>
 #include <string>
@@ -350,6 +351,37 @@ TEST(HostLogTest, HostSpanEscapesDelimitersAndFitsAtomicPipeRecord) {
     EXPECT_LE(record.size(), static_cast<size_t>(_POSIX_PIPE_BUF));
     ASSERT_GE(record.size(), 2u);
     EXPECT_EQ(record[record.size() - 2], '~');
+}
+
+TEST(HostLogTest, HostSpanDirectoryWritesOneBufferedFilePerProcess) {
+    char directory_template[] = "/tmp/simpler-host-strace-XXXXXX";
+    char *directory = mkdtemp(directory_template);
+    ASSERT_NE(directory, nullptr);
+    ASSERT_EQ(setenv("SIMPLER_HOST_STRACE_DIR", directory, 1), 0);
+
+    const SimplerHostSpan nested{
+        SIMPLER_HOST_SPAN_ABI_VERSION, sizeof(SimplerHostSpan), 7, 0x1234, 1, 0, 100, 25, "chip.run.bind", "run_id=7"
+    };
+    const SimplerHostSpan root{
+        SIMPLER_HOST_SPAN_ABI_VERSION, sizeof(SimplerHostSpan), 7, 0x1234, 0, 0, 90, 50, "chip.run", "run_id=7"
+    };
+    const auto captured = run_with_config(LogLevel::TIMING, [&] {
+        unified_log_host_span(&nested);
+        unified_log_host_span(&root);
+    });
+    ASSERT_EQ(unsetenv("SIMPLER_HOST_STRACE_DIR"), 0);
+    EXPECT_EQ(captured.err.find("[STRACE]"), std::string::npos);
+
+    const std::string path =
+        std::string(directory) + "/host-strace." + std::to_string(static_cast<int>(getpid())) + ".log";
+    std::ifstream input(path);
+    ASSERT_TRUE(input.good());
+    const std::string contents((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    EXPECT_NE(contents.find("name=chip.run.bind"), std::string::npos);
+    EXPECT_NE(contents.find("name=chip.run"), std::string::npos);
+    EXPECT_EQ(std::count(contents.begin(), contents.end(), '\n'), 2);
+    EXPECT_EQ(unlink(path.c_str()), 0);
+    EXPECT_EQ(rmdir(directory), 0);
 }
 
 TEST(HostLogTest, DisabledHostSpanProducesNoRecord) {

@@ -24,6 +24,14 @@ constructing span attributes; `WARN`, `ERROR`, and `NUL` therefore disable the
 instrumentation work as well as the output. Device logging still uses the
 initialization-time policy described in [logging.md](../logging.md).
 
+Set `SIMPLER_HOST_STRACE_DIR` to an existing directory to write host span
+records to `host-strace.<pid>.log` instead of stderr. Each process uses a
+fully-buffered private file and flushes it when a depth-zero invocation record
+is emitted. Ordinary log records and the clock anchor remain on stderr. If the
+file cannot be opened, host spans fall back to stderr. This diagnostic sink is
+useful for multi-process profiling where synchronous writes to one shared pipe
+would perturb the short host phases being measured.
+
 ## Marker grammar
 
 Every host log record starts with a `CLOCK_MONOTONIC` nanosecond timestamp:
