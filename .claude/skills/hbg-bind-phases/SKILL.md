@@ -24,8 +24,8 @@ MARK="outputs/.bind_start"; : >"$MARK"   # fixed mtime; "$LOG" keeps being appen
 
 ENVS="SIMPLER_HBG_BIND_BREAKDOWN_ENABLE=1 SIMPLER_LOG_LEVEL=TIMING \
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 SIMPLER_SKIP_DEVICE_RUN=1"          # + mode delta
-CASE="examples/.../test_<case>.py -p a2a3 --manual only \
---case <Class>:: --skip-golden"                                      # + level, per case
+CASE="examples/.../test_<case>.py -p a2a3 \
+--case <Class>:: --skip-golden"                       # + manual mode and level, per case
 TAIL="--rounds 6"                                                    # per mode
 
 .claude/skills/onboard-arch-precheck/check.sh a2a3 || exit 1
@@ -46,6 +46,7 @@ comparable. Never hand-edit one arm's command without the other's.
 | `--device-num` | 2 | 1 |
 | `CASE` example | `examples/a2a3/host_build_graph/deepseek_v4_flash_decode/test_deepseek_v4_flash_decode.py` | `examples/a2a3/host_build_graph/qwen3_14b_decode/test_qwen3_14b_decode.py` |
 | `--case` | `TestDeepseekV4FlashDecodeHostBuildGraph::` | `TestQwen314BDecodeHostBuildGraph::` |
+| manual mode | none | **add** `--manual only` |
 | level | `level=3`, so **add** `--runtime host_build_graph --level 3` | `level=2`, add nothing |
 | timeout | 3600 (cold compile is minutes) | 2400 |
 

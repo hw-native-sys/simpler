@@ -36,8 +36,8 @@ CI terms: the harvested distributed program compiles, both ranks' graphs
 dispatch, the cross-die window protocol (TPUT/TNOTIFY arrivals, LM-head
 all-gather) drains, and the run terminates cleanly.
 
-It is marked `manual`: compiling 368 incore kernels plus the 7.8k-line chip
-orchestration takes several minutes, so it does not run in the default sweep.
+The case participates in the default Per-PR collection; compiling its 368
+incore kernels plus the 7.8k-line chip orchestration takes several minutes.
 
 The six buffer initializations formerly expressed as orchestration-side
 `set_initial_value(0)` calls now run on device. Each of the five
@@ -81,37 +81,25 @@ it has a value before the network runs, and it feeds `set_block_num` — a launc
 parameter a predicate cannot express, because a predicate decides whether a task
 dispatches, not how wide it is.
 
-## Status: blocked on the #1644 pto-isa pin bump
+## Status: full-device completion on the current pin
 
-The case PASSES on every runtime from the wire-ABI cutover (#1729, the earliest
-commit whose scene-test plumbing can host it) through #1771 — all of which pin
-pto-isa `83d01313`, the commit these kernels were generated against. From
-`7a1b9b11` ("CI: bump pinned pto-isa for PTOAS v0.55", pto-isa -> `0cefc9a5`)
-onward, including current main, both ranks stall mid-network: two kernels spin
-forever on comm-window arrival counters and the scheduler exits
-`S1:running-stalled`. (The orchestrator's own `TENSOR_WAIT_TIMEOUT` on
-`recv_count_out` was a consequence of that stall — the read waited on a producer
-the stalled network never ran — and can no longer occur now that the count is
-read by the scheduler at the dispatch point.) The stall layer moves with fixture
-content (a timing-dependent miss, not a fixed logic error), and the identical
-program + content passes under pypto's own runner against pto-isa `83d01313`
-even with every weight streamed as a host tensor. Bisect evidence: PASS at
-PR #1771 and FAIL at PR #1644 on otherwise identical simpler code. Candidate
-pto-isa changes in `83d01313..0cefc9a5` touch exactly the GM-polling path
-these kernels spin on
-(`6ffe3221` "Qualify dcci cache line arguments", `2d9d4288` "normalize cache
-line constants").
+The original bring-up recorded a timing-dependent mid-network stall after the
+pto-isa pin bump in #1644. That status is historical: the current case completes
+on the repository pin `cd4a3d3f7a1a27fcfe536f617e9bca3008929664`. The device
+verification in #1939 passed both the TMR and HBG variants on two A2A3 dies. The
+Per-PR run for #1949 then exercised both full device bodies in the ordinary
+scene-test sweep: TMR passed in 299.25 seconds and HBG in 303.09 seconds.
 
 ## Running
 
 ```bash
 # standalone (2 dies; wrap in task-submit on a shared box)
 python examples/a2a3/tensormap_and_ringbuffer/deepseek_v4_flash_decode/test_deepseek_v4_flash_decode.py \
-    -p a2a3 -d <d0>,<d1> --manual only
+    -p a2a3 -d <d0>,<d1>
 
 # pytest
 pytest examples/a2a3/tensormap_and_ringbuffer/deepseek_v4_flash_decode \
-    --platform a2a3 --device <d0>,<d1> --manual only
+    --platform a2a3 --device <d0>,<d1>
 ```
 
 The fixture materializes on the order of 100 GiB of host tensors (weights for

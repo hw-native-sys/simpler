@@ -511,6 +511,10 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers",
+        "resource_last: run this test in the final Resource subphase after L2",
+    )
+    config.addinivalue_line(
+        "markers",
         "runtime(name): runtime this standalone test targets; used by runtime-isolation subprocess "
         "filtering so non-@scene_test tests only run under their matching runtime",
     )
@@ -765,6 +769,7 @@ class _ResourceJob(typing.NamedTuple):
     label: str  # class name for "l3", function name for "standalone"
     runtime: str
     device_count: int
+    run_last: bool
 
 
 def _collect_st_runtimes(items, level=None):
@@ -822,7 +827,12 @@ def _collect_resource_jobs(items, platform, manual_mode="exclude"):
             max_dev = max(max_dev, int(case.get("config", {}).get("device_count", 1)))
         if saw_case:
             l3_by_nodeid[item.nodeid] = _ResourceJob(
-                kind="l3", nodeid=item.nodeid, label=cls.__name__, runtime=rt, device_count=max_dev
+                kind="l3",
+                nodeid=item.nodeid,
+                label=cls.__name__,
+                runtime=rt,
+                device_count=max_dev,
+                run_last=item.get_closest_marker("resource_last") is not None,
             )
     jobs.extend(l3_by_nodeid.values())
 
@@ -849,6 +859,7 @@ def _collect_resource_jobs(items, platform, manual_mode="exclude"):
             label=item.name,
             runtime=rt_marker.args[0],
             device_count=dev_count,
+            run_last=item.get_closest_marker("resource_last") is not None,
         )
     jobs.extend(standalone_by_nodeid.values())
 
@@ -960,14 +971,60 @@ def _emit_resource_failure_summary(
         print("  full output is in the Resource child group above", flush=True)
 
 
+def _run_resource_phase(resource_specs, device_ids, max_parallel, fail_fast, platform, manual_mode, cwd, heading):
+    jobs = []
+    for spec in resource_specs:
+        label = f"{spec.kind} {spec.label} (rt={spec.runtime}, dev={spec.device_count})"
+
+        def _build(ids, _spec=spec):
+            return _resource_child_command(_spec, ids, platform, manual_mode)
+
+        jobs.append(
+            _ps.Job(
+                label=label,
+                device_count=spec.device_count,
+                build_cmd=_build,
+                cwd=str(cwd),
+                nodeid=spec.nodeid,
+            )
+        )
+
+    def _on_done(res):
+        tag = "PASS" if res.returncode == 0 else f"FAIL rc={res.returncode}"
+        nodeid = res.nodeid or "<unknown>"
+        header = f"{res.label} nodeid={nodeid} [{tag} {res.duration_s:.1f}s, devices={res.device_ids}]"
+        _emit_group(header, res.output)
+        if res.returncode != 0:
+            print(
+                f"*** FAIL: {nodeid} ({res.label}, devices={res.device_ids}) — expand group above ***",
+                flush=True,
+            )
+
+    print(
+        f"\n{heading}: {len(jobs)} case(s), pool={device_ids}, max_parallel={max_parallel}",
+        flush=True,
+    )
+    results = _ps.run_jobs(
+        jobs,
+        device_ids,
+        max_parallel=max_parallel,
+        fail_fast=fail_fast,
+        on_job_done=_on_done,
+    )
+    if any(r.returncode == TIMEOUT_EXIT_CODE for r in results):
+        print(f"\n*** {heading}: TIMED OUT ***\n", flush=True)
+        os._exit(TIMEOUT_EXIT_CODE)
+    return results
+
+
 def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
-    """Run Resource → L2 phases.
+    """Run Resource → L2 → final Resource phases.
 
     The Resource phase dispatches every item that needs a dedicated
     device-allocating subprocess — L3 ``SceneTestCase`` classes *and*
     standalone functions marked with ``@pytest.mark.device_count`` +
-    ``@pytest.mark.runtime``. They share the same ``run_jobs`` bin-pack
-    and fail-fast gate, so they are one phase, not two.
+    ``@pytest.mark.runtime``. Items marked ``resource_last`` run after L2 in
+    the same pytest invocation and enclosing device allocation.
 
     ``resource_specs`` is pre-collected by ``pytest_runtestloop`` (which
     already has to inspect the list to decide whether to dispatch) so
@@ -984,58 +1041,23 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
 
     base_args = _base_pytest_argv(session, strip_options=("--exclude-level",))
     cwd = session.config.invocation_params.dir
+    ordinary_resource_specs = [spec for spec in resource_specs if not spec.run_last]
+    final_resource_specs = [spec for spec in resource_specs if spec.run_last]
 
     # ----- Phase 1: Resource (L3 classes + standalone resource functions) -----
     resource_failed = False
     resource_results: list[_ps.JobResult] = []
-    if resource_specs:
-        jobs = []
-        for spec in resource_specs:
-            label = f"{spec.kind} {spec.label} (rt={spec.runtime}, dev={spec.device_count})"
-
-            def _build(ids, _spec=spec):
-                # Narrow the child to the specific nodeid, not the inherited
-                # directory args (examples tests/st). Passing the directories
-                # would re-collect every SceneTestCase and run them alongside
-                # this job in the same subprocess, which has only this job's
-                # allocated devices — e.g. TestL3Group (needs 2) would fail
-                # inside TestL3ChildMemory's 1-device subprocess.
-                return _resource_child_command(_spec, ids, platform, manual_mode)
-
-            jobs.append(
-                _ps.Job(
-                    label=label,
-                    device_count=spec.device_count,
-                    build_cmd=_build,
-                    cwd=str(cwd),
-                    nodeid=spec.nodeid,
-                )
-            )
-
-        def _on_done(res):
-            tag = "PASS" if res.returncode == 0 else f"FAIL rc={res.returncode}"
-            nodeid = res.nodeid or "<unknown>"
-            header = f"{res.label} nodeid={nodeid} [{tag} {res.duration_s:.1f}s, devices={res.device_ids}]"
-            _emit_group(header, res.output)
-            if res.returncode != 0:
-                # Out-of-group summary so a reviewer scanning the collapsed
-                # log still sees the failure without having to expand.
-                print(
-                    f"*** FAIL: {nodeid} ({res.label}, devices={res.device_ids}) — expand group above ***",
-                    flush=True,
-                )
-
-        print(
-            f"\nResource phase: {len(jobs)} case(s), pool={device_ids}, max_parallel={max_parallel}",
-            flush=True,
-        )
+    if ordinary_resource_specs:
         try:
-            results = _ps.run_jobs(
-                jobs,
+            results = _run_resource_phase(
+                ordinary_resource_specs,
                 device_ids,
-                max_parallel=max_parallel,
-                fail_fast=fail_fast,
-                on_job_done=_on_done,
+                max_parallel,
+                fail_fast,
+                platform,
+                manual_mode,
+                cwd,
+                "Resource phase",
             )
         except ValueError as e:
             print(f"\n*** Resource phase ABORTED: {e} ***\n", flush=True)
@@ -1045,9 +1067,6 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
         resource_failed = any(r.returncode != 0 for r in results)
         if resource_failed:
             _emit_resource_failure_summary(results)
-        if any(r.returncode == TIMEOUT_EXIT_CODE for r in results):
-            print("\n*** Resource phase: TIMED OUT ***\n", flush=True)
-            os._exit(TIMEOUT_EXIT_CODE)
 
         # Fail-fast: stop before L2 phase if any Resource job failed.
         if resource_failed and fail_fast:
@@ -1124,6 +1143,29 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
             print(f"*** FAIL: L2 {rt} — expand group above ***", flush=True)
             if fail_fast:
                 break
+
+    # ----- Phase 3: Resource jobs that must leave no ordinary ST successor -----
+    if final_resource_specs and not (l2_failed and fail_fast):
+        try:
+            results = _run_resource_phase(
+                final_resource_specs,
+                device_ids,
+                max_parallel,
+                fail_fast,
+                platform,
+                manual_mode,
+                cwd,
+                "Final Resource phase",
+            )
+        except ValueError as e:
+            print(f"\n*** Final Resource phase ABORTED: {e} ***\n", flush=True)
+            session.testsfailed = 1
+            return True
+        resource_results.extend(results)
+        final_resource_failed = any(r.returncode != 0 for r in results)
+        resource_failed = resource_failed or final_resource_failed
+        if final_resource_failed:
+            _emit_resource_failure_summary(results, heading="Final Resource phase failed")
 
     if resource_failed:
         _emit_resource_failure_summary(

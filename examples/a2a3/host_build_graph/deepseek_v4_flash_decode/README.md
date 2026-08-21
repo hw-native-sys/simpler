@@ -153,15 +153,15 @@ This gap is independent of the `hc_head_linear` MTE fault:
 ```bash
 # standalone (2 dies; wrap in task-submit on a shared box)
 python examples/a2a3/host_build_graph/deepseek_v4_flash_decode/\
-test_deepseek_v4_flash_decode.py -p a2a3 -d <d0>,<d1> --manual only
+test_deepseek_v4_flash_decode.py -p a2a3 -d <d0>,<d1>
 
 # pytest
 pytest examples/a2a3/host_build_graph/deepseek_v4_flash_decode \
-    --platform a2a3 --device <d0>,<d1> --manual only
+    --platform a2a3 --device <d0>,<d1>
 ```
 
-`manual` because the 368-kernel compile takes minutes; `skip_golden` because the
-routing is stood in, not computed.
+The case participates in the default Per-PR collection. It remains
+`skip_golden` because no full-network torch reference exists upstream.
 
 To exercise only the host side without launching the device body, set
 `SIMPLER_SKIP_DEVICE_RUN=1`. `simpler_launch_run` then completes the run before

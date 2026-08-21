@@ -68,7 +68,7 @@ device lock for the whole job (see
 | Graph replays | 40, of a 277-node Definition | 20, of a 743-node Definition |
 | Graph boundary | 26 tensors | 118 tensors, 31 scalars |
 | First-run compile | seconds | **minutes** (369 kernel sources + an 11.6k-line orchestration) |
-| Marked | `manual` | `manual`, `skip_golden` |
+| Marked | `manual` | `skip_golden` |
 
 The level decides how a case's output is captured, which is what the recipe below
 has to work around.

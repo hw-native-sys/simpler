@@ -29,15 +29,15 @@ in either repo. The case validates that the harvested distributed program —
 dispatches across both dies, drives the comm-window protocol to completion,
 and terminates cleanly.
 
-The case is marked ``manual`` (compiling 368 kernels takes several minutes);
-run it explicitly:
+The case participates in the default Per-PR collection. To run it explicitly:
 
     python examples/a2a3/tensormap_and_ringbuffer/deepseek_v4_flash_decode/\
-test_deepseek_v4_flash_decode.py -p a2a3 -d <d0>,<d1> --manual only
+test_deepseek_v4_flash_decode.py -p a2a3 -d <d0>,<d1>
 
 See README.md for provenance pins and the regeneration recipe.
 """
 
+import pytest
 from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import CommBufferSpec, DataType, TaskArgs, TensorArgType
 
@@ -580,6 +580,7 @@ def _decode_fwd_orch_fn(orch, callables, task_args, config):
             orch.submit_next_level(callables.decode_fwd, args, config, worker=rank)
 
 
+@pytest.mark.resource_last
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")
 class TestDeepseekV4FlashDecode(SceneTestCase):
     CALLABLE = {
@@ -609,7 +610,6 @@ class TestDeepseekV4FlashDecode(SceneTestCase):
         {
             "name": "DecodeFwdEP2TP2",
             "platforms": ["a2a3"],
-            "manual": True,
             "skip_golden": True,
             "config": {
                 "device_count": N_RANKS,

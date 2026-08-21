@@ -31,7 +31,7 @@ For the `Worker` API underneath the framework, see
 | [`paged_attention_ringbuffer/`](paged_attention_ringbuffer/) | Deliberately undersized rings, driven per case through `config.runtime_env` (`ring_task_window` / `ring_heap` / `ring_dep_pool`) rather than process-global env. A stress test for rotation and reclamation. |
 | [`merge_pipeline_barrier/`](merge_pipeline_barrier/) | Three pipeline stages merged into **one** `block_num=8` SPMD task, ordered by an intra-task cross-core barrier instead of by three scheduled tasks. |
 | [`qwen3_14b_decode/`](qwen3_14b_decode/README.md) | The whole Qwen3-14B 40-layer decode stack as a single fused dispatch, using CANN fused attention. The largest example in the repo. |
-| [`deepseek_v4_flash_decode/`](deepseek_v4_flash_decode/README.md) | The whole DeepSeek-V4 FLASH 43-layer decode network on **2 dies** (EP2 expert-parallel MoE + TP2 LM head through a comm domain). The first pypto-harvested distributed network; `manual` + `skip_golden` (completion smoke, like upstream). |
+| [`deepseek_v4_flash_decode/`](deepseek_v4_flash_decode/README.md) | The whole DeepSeek-V4 FLASH 43-layer decode network on **2 dies** (EP2 expert-parallel MoE + TP2 LM head through a comm domain). The first pypto-harvested distributed network; Per-PR `skip_golden` completion smoke, like upstream. |
 
 ## Asynchronous completion and cross-card transfer
 

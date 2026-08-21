@@ -371,6 +371,14 @@ This matters on CPU-constrained CI runners. Example: an L3 case needs `device_co
 
 A single file can declare both L2 and L3 classes; they're grouped by `(runtime, level)` internally. L3 classes run in the Resource phase (subprocess-per-case, alongside standalone resource-marked functions), L2 classes run in the L2 phase (shared Worker per device).
 
+### Resource-phase tail ordering
+
+Mark an L3 class or standalone resource test with
+`@pytest.mark.resource_last` when it must run after every ordinary Resource and
+L2 job. The dispatcher runs marked jobs in a final Resource subphase inside the
+same pytest invocation, so the enclosing `task-submit` allocation remains held
+and no second queue submission is needed.
+
 ### Profiling under parallelism
 
 Each test case sets its own `CallConfig.output_prefix` (chosen by `scene_test.py::_build_output_prefix` as `outputs/<ClassName>_<case>_<YYYYMMDD_HHMMSS>/`). The C++ runtime writes all diagnostic artifacts under that prefix with fixed filenames:
