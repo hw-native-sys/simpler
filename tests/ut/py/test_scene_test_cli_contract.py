@@ -99,6 +99,63 @@ def test_swimlane_overhead_allocates_a_diagnostic_output_prefix(monkeypatch) -> 
     assert captured["output_prefix"] == str(output_prefix)
 
 
+def test_run_class_cases_reports_the_failing_case_name() -> None:
+    class FailingScene:
+        def _run_and_validate(self, *_args, **_kwargs):
+            raise ValueError("device run failed")
+
+    case = {"name": "large_bf16", "params": {"batch": 64, "dtype": "bfloat16"}}
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"SceneTest case failed: FailingScene::large_bf16: device run failed$",
+    ) as failure:
+        run_class_cases(
+            object(),
+            FailingScene(),
+            [case],
+            callable_obj=object(),
+            sub_handles={},
+            rounds=1,
+            skip_golden=False,
+            enable_chip_swimlane=0,
+            enable_dump_args=0,
+            enable_pmu=0,
+            enable_dep_gen=False,
+            enable_scope_stats=False,
+        )
+
+    assert isinstance(failure.value.__cause__, ValueError)
+    assert str(failure.value.__cause__) == "device run failed"
+
+
+def test_run_class_cases_keeps_device_error_visible_to_poison_classifier() -> None:
+    conftest = importlib.import_module("conftest")
+
+    class FailingScene:
+        def _run_and_validate(self, *_args, **_kwargs):
+            raise RuntimeError("run_prepared failed with code 507018")
+
+    with pytest.raises(RuntimeError) as failure:
+        run_class_cases(
+            object(),
+            FailingScene(),
+            [{"name": "device_error"}],
+            callable_obj=object(),
+            sub_handles={},
+            rounds=1,
+            skip_golden=False,
+            enable_chip_swimlane=0,
+            enable_dump_args=0,
+            enable_pmu=0,
+            enable_dep_gen=False,
+            enable_scope_stats=False,
+        )
+
+    excinfo = SimpleNamespace(type=type(failure.value), value=failure.value)
+    assert conftest._is_device_runtime_error(excinfo)
+
+
 def test_standalone_dispatch_forwards_every_diagnostic_flag(monkeypatch) -> None:
     scene_class = type("StandaloneDiagnosticScene", (), {"_st_level": 2, "_st_runtime": "tensormap_and_ringbuffer"})
     args = SimpleNamespace(

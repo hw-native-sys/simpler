@@ -1155,7 +1155,8 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     """Execute a pre-filtered list of cases for one class (layers 5-6).
 
     Caller is responsible for platform/selector/manual filtering. Profiling
-    snapshots wrap each case. Validation failures propagate; caller decides
+    snapshots wrap each case. Execution failures carry the class and case name,
+    with the original exception preserved as their cause; the caller decides
     fail-fast vs collect semantics.
     """
     cls_name = type(cls_inst).__name__
@@ -1190,6 +1191,8 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
                 enable_scope_stats=enable_scope_stats,
                 output_prefix=str(prefix) if diagnostics_on else "",
             )
+        except Exception as exc:
+            raise RuntimeError(f"SceneTest case failed: {cls_name}::{case['name']}: {exc}") from exc
         finally:
             if enable_chip_swimlane:
                 _convert_case_swimlane(
