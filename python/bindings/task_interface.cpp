@@ -909,7 +909,7 @@ nb::tuple dims_tuple(const uint32_t *dims, uint32_t ndims) {
 // Resolve one wire tensor onto a local base and build the address-bearing device POD.
 // `resolved` maps CanonicalIdentity -> (local_base, address_space); the caller populates it by
 // materializing each embedded descriptor.
-ChipTensor materialize_one(const Tensor &r, nb::dict resolved) {
+ChipTensor materialize_one(const Tensor &r, nb::dict resolved, uint64_t host_content_generation = 0) {
     uint64_t elem = get_element_size(r.dtype);
     if (elem == 0) {
         throw std::runtime_error("materialize: unknown dtype");
@@ -928,7 +928,7 @@ ChipTensor materialize_one(const Tensor &r, nb::dict resolved) {
     // non-row-major layout (transpose / permute / step-slice), which ChipTensor expresses natively.
     return make_tensor_strided(
         reinterpret_cast<void *>(static_cast<uintptr_t>(base + r.byte_offset)), r.shapes, r.strides, r.ndims, r.dtype,
-        /*manual_dep=*/false, /*version=*/0, static_cast<AddressSpace>(addr_space)
+        /*manual_dep=*/false, /*version=*/0, static_cast<AddressSpace>(addr_space), host_content_generation
     );
 }
 
@@ -1294,7 +1294,8 @@ NB_MODULE(_task_interface, m) {
 
         .def_static(
             "make",
-            [](uint64_t data, nb::tuple shapes, DataType dtype, bool child_memory) -> ChipTensor {
+            [](uint64_t data, nb::tuple shapes, DataType dtype, bool child_memory,
+               uint64_t host_content_generation) -> ChipTensor {
                 size_t n = nb::len(shapes);
                 if (n == 0 || n > MAX_TENSOR_DIMS)
                     throw std::invalid_argument("ChipTensor.make: shapes length must be in [1, MAX_TENSOR_DIMS]");
@@ -1305,16 +1306,19 @@ NB_MODULE(_task_interface, m) {
                 // start_offset == 0, buffer.size == numel * element_size.
                 return make_tensor_external(
                     reinterpret_cast<void *>(static_cast<uintptr_t>(data)), shp, static_cast<uint32_t>(n), dtype,
-                    /*manual_dep=*/false, /*version=*/0, child_memory ? AddressSpace::DEVICE : AddressSpace::HOST
+                    /*manual_dep=*/false, /*version=*/0, child_memory ? AddressSpace::DEVICE : AddressSpace::HOST,
+                    host_content_generation
                 );
             },
             // The keyword stays `child_memory` while the C++ field is `address_space`: it is the
             // name of a u8 on the remote-L3 tensor wire (see remote_wire.cpp encode_tensor), which
             // renaming here would not change and which this constructor decodes into.
             nb::arg("data"), nb::arg("shapes"), nb::arg("dtype"), nb::arg("child_memory") = false,
+            nb::arg("host_content_generation") = 0,
             "Create a contiguous ChipTensor over pre-allocated memory. Set child_memory=True when "
             "data is a device pointer allocated by the child process (skips H2D copy in "
-            "init_runtime_impl)."
+            "init_runtime_impl). A nonzero host_content_generation must change whenever the "
+            "reachable host bytes change and enables safe retained H2D reuse."
         )
 
         // `data` is the tensor's memory address — i.e. ChipTensor::buffer.addr.
@@ -1351,10 +1355,12 @@ NB_MODULE(_task_interface, m) {
                 for (size_t i = 0; i < n; ++i)
                     numel *= shp[i];
                 // Re-establish a contiguous layout over the same buffer base.
+                const uint64_t host_content_generation = self.host_content_generation;
                 self.init_external(
                     reinterpret_cast<void *>(self.buffer.addr), numel * get_element_size(self.dtype), shp,
                     static_cast<uint32_t>(n), self.dtype, self.version, self.manual_dep, self.address_space
                 );
+                self.host_content_generation = host_content_generation;
             }
         )
 
@@ -1410,6 +1416,11 @@ NB_MODULE(_task_interface, m) {
             [](const ChipTensor &self) -> bool {
                 return self.is_contiguous;
             }
+        )
+
+        .def_ro(
+            "host_content_generation", &ChipTensor::host_content_generation,
+            "Producer freshness generation for retained host-to-device staging; zero means unknown."
         )
 
         .def(
@@ -1510,14 +1521,15 @@ NB_MODULE(_task_interface, m) {
 
         .def(
             "add_tensor",
-            [](TaskArgs &self, const Tensor &t, TensorArgType tag) {
+            [](TaskArgs &self, const Tensor &t, TensorArgType tag, uint64_t host_content_generation) {
                 validate_tensor(t);
                 check_access_subset(t.buffer.access, tag);
-                self.add_tensor(t, tag);
+                self.add_tensor(t, tag, host_content_generation);
             },
-            nb::arg("t"), nb::arg("tag") = TensorArgType::INPUT,
+            nb::arg("t"), nb::arg("tag") = TensorArgType::INPUT, nb::arg("host_content_generation") = 0,
             "Add a Tensor arg (the self-describing wire view built by Buffer.tensor) with an "
-            "optional TensorArgType tag (default INPUT)."
+            "optional TensorArgType tag (default INPUT). A nonzero host_content_generation is a "
+            "producer guarantee that changes whenever the reachable host bytes change."
         )
 
         .def(
@@ -1550,6 +1562,16 @@ NB_MODULE(_task_interface, m) {
                 return self.tag(i);
             },
             nb::arg("i"), "Return the TensorArgType tag for the tensor at index i."
+        )
+
+        .def(
+            "host_content_generation",
+            [](const TaskArgs &self, int32_t i) -> uint64_t {
+                if (i < 0 || i >= self.tensor_count())
+                    throw std::out_of_range("TaskArgs host-content generation index out of range");
+                return self.host_content_generation(i);
+            },
+            nb::arg("i"), "Return the producer freshness generation for tensor i; zero means unknown."
         )
 
         .def(
@@ -2413,7 +2435,7 @@ NB_MODULE(_task_interface, m) {
         [](const TaskArgs &args, nb::dict resolved) -> ChipStorageTaskArgs {
             ChipStorageTaskArgs out;
             for (int32_t i = 0; i < args.tensor_count(); i++) {
-                out.add_tensor(materialize_one(args.tensor(i), resolved));
+                out.add_tensor(materialize_one(args.tensor(i), resolved, args.host_content_generation(i)));
             }
             for (int32_t i = 0; i < args.scalar_count(); i++) {
                 out.add_scalar(args.scalar(i));

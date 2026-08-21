@@ -141,6 +141,7 @@ inline void init_tensor_from_create_info(ChipTensor &t, const TensorCreateInfo &
         s *= t.shapes[i];
     }
     t.extent_elem_cache = s;
+    t.host_content_generation = 0;
     if (ci.has_initial_value) {
         fill_tensor_initial_value(t, ci.initial_value);
     }

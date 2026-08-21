@@ -64,10 +64,16 @@ struct TensorTagMixin {
 template <typename TensorTag>
 struct TensorTagMixin<TensorTag, 0> {
     std::vector<TensorTag> tags_;
+    // Host-side freshness provenance for materializing this TaskArgs directly
+    // into ChipStorageTaskArgs. It is intentionally stripped with tags when a
+    // task crosses a mailbox boundary; zero means the receiving producer has
+    // supplied no freshness guarantee.
+    std::vector<uint64_t> host_content_generations_;
 
     const TensorTag &tag(int32_t i) const { return tags_[static_cast<size_t>(i)]; }
     TensorTag &tag(int32_t i) { return tags_[static_cast<size_t>(i)]; }
     const TensorTag *tag_data() const { return tags_.data(); }
+    uint64_t host_content_generation(int32_t i) const { return host_content_generations_[static_cast<size_t>(i)]; }
 };
 
 // Empty: TensorTag == void, static (zero overhead)
@@ -134,6 +140,7 @@ struct TaskArgsTpl<T, S, 0, 0, TensorTag> : TensorTagMixin<TensorTag, 0> {
         tensors_.push_back(t);
         if constexpr (!std::is_void_v<TensorTag>) {
             this->tags_.push_back(TensorTag{});
+            this->host_content_generations_.push_back(0);
         }
     }
 
@@ -143,6 +150,18 @@ struct TaskArgsTpl<T, S, 0, 0, TensorTag> : TensorTagMixin<TensorTag, 0> {
         if (!scalars_.empty()) throw std::logic_error("TaskArgs: cannot add tensor after scalar");
         tensors_.push_back(t);
         this->tags_.push_back(tag);
+        this->host_content_generations_.push_back(0);
+    }
+
+    // Tagged host-local overload with producer freshness provenance. The
+    // generation is materialized into ChipTensor and is not part of the
+    // Tensor mailbox wire format.
+    template <typename Tag = TensorTag, typename = std::enable_if_t<!std::is_void_v<Tag>>>
+    void add_tensor(const T &t, Tag tag, uint64_t host_content_generation) {
+        if (!scalars_.empty()) throw std::logic_error("TaskArgs: cannot add tensor after scalar");
+        tensors_.push_back(t);
+        this->tags_.push_back(tag);
+        this->host_content_generations_.push_back(host_content_generation);
     }
 
     void add_scalar(S s) { scalars_.push_back(s); }
@@ -164,6 +183,7 @@ struct TaskArgsTpl<T, S, 0, 0, TensorTag> : TensorTagMixin<TensorTag, 0> {
         scalars_.clear();
         if constexpr (!std::is_void_v<TensorTag>) {
             this->tags_.clear();
+            this->host_content_generations_.clear();
         }
     }
 };

@@ -235,10 +235,12 @@ class TestRunStreamReuseHbg(SceneTestCase):
             assert bank0 != 0 and bank1 != 0, f"a served bank is uncommitted: {bank0:#x}, {bank1:#x}"
             assert bank0 != bank1, f"both arena banks resolve to one GM heap: {bank0:#x}"
 
-            # hbg stages device args directly, never through the retained
-            # temporary buffer, so neither slot should hold one.
-            assert chip_worker.retained_temp_addr(0) == 0
-            assert chip_worker.retained_temp_addr(1) == 0
+            # HBG retains argument staging per pipeline slot. Both slots must
+            # be populated and independent, just like their arena banks.
+            temp0 = chip_worker.retained_temp_addr(0)
+            temp1 = chip_worker.retained_temp_addr(1)
+            assert temp0 != 0 and temp1 != 0, f"a served slot has no retained staging: {temp0:#x}, {temp1:#x}"
+            assert temp0 != temp1, f"both pipeline slots resolve to one retained staging buffer: {temp0:#x}"
         finally:
             st_worker.unregister(add_handle)
 

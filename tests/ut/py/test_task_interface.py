@@ -32,6 +32,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     arg_direction_name,
     get_dtype_name,
     get_element_size,
+    materialize_task_args,
 )
 from simpler.buffer import (
     AccessMode,
@@ -237,6 +238,19 @@ class TestTorchInterop:
         assert arg.shapes == (4, 8)
         assert arg.dtype == DataType.FLOAT32
         assert arg.nbytes() == 4 * 8 * 4
+        initial_generation = arg.host_content_generation
+        assert initial_generation != 0
+        assert make_chip_tensor_arg(t).host_content_generation == initial_generation
+
+        # A distinct tensor needs a distinct token even with the same PyTorch
+        # _version. Its allocator may later reuse this tensor's data pointer.
+        other = torch.zeros(4, 8, dtype=torch.float32)
+        assert make_chip_tensor_arg(other).host_content_generation != initial_generation
+
+        t.add_(1)
+        updated = make_chip_tensor_arg(t)
+        assert updated.host_content_generation != 0
+        assert updated.host_content_generation != initial_generation
 
     def test_torch_dtype_fp8_fp4_and_make_chip_tensor_arg(self):
         import torch  # pyright: ignore[reportMissingImports]
@@ -471,6 +485,21 @@ class TestTaskArgs:
         args = TaskArgs()
         args.add_tensor(_dev_ref(0xBEEF, (4, 8), DataType.FLOAT32), TensorArgType.OUTPUT)
         assert args.tag(0) == TensorArgType.OUTPUT
+
+    def test_host_content_generation_materializes_into_chip_tensor(self):
+        ref = _dev_ref(0xBEEF, (4,), DataType.FLOAT32)
+        args = TaskArgs()
+        args.add_tensor(ref, TensorArgType.INPUT, host_content_generation=7)
+        assert args.host_content_generation(0) == 7
+
+        resolved = {ref.buffer.identity: (0xCAFE, int(AddressSpace.HOST))}
+        chip_args = materialize_task_args(args, resolved)
+        assert chip_args.tensor(0).host_content_generation == 7
+
+    def test_host_content_generation_defaults_to_unknown(self):
+        args = TaskArgs()
+        args.add_tensor(_dev_ref(0xBEEF, (4,), DataType.FLOAT32))
+        assert args.host_content_generation(0) == 0
 
     def test_multiple_refs_with_tags(self):
         args = TaskArgs()

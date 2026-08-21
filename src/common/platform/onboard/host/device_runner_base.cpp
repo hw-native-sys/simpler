@@ -166,8 +166,30 @@ void DeviceRunnerBase::get_retained_temp_buffer(uint32_t pipeline_slot, void **a
 
 void DeviceRunnerBase::set_retained_temp_buffer(uint32_t pipeline_slot, void *addr, size_t size) {
     if (pipeline_slot >= retained_temp_addrs_.size()) return;
+    if (retained_temp_addrs_[pipeline_slot] != addr || retained_temp_sizes_[pipeline_slot] != size) {
+        retained_temp_metadata_[pipeline_slot].clear();
+    }
     retained_temp_addrs_[pipeline_slot] = addr;
     retained_temp_sizes_[pipeline_slot] = size;
+}
+
+bool DeviceRunnerBase::retained_temp_metadata_matches(
+    uint32_t pipeline_slot, const void *key_data, size_t key_size
+) const {
+    if (pipeline_slot >= retained_temp_metadata_.size() || key_data == nullptr || key_size == 0) return false;
+    const std::vector<uint8_t> &metadata = retained_temp_metadata_[pipeline_slot];
+    return metadata.size() == key_size && std::memcmp(metadata.data(), key_data, key_size) == 0;
+}
+
+void DeviceRunnerBase::set_retained_temp_metadata(uint32_t pipeline_slot, const void *key_data, size_t key_size) {
+    if (pipeline_slot >= retained_temp_metadata_.size()) return;
+    std::vector<uint8_t> &metadata = retained_temp_metadata_[pipeline_slot];
+    if (key_data == nullptr || key_size == 0) {
+        metadata.clear();
+        return;
+    }
+    const auto *bytes = static_cast<const uint8_t *>(key_data);
+    metadata.assign(bytes, bytes + key_size);
 }
 
 void *DeviceRunnerBase::acquire_graph_execution_buffer(
@@ -229,6 +251,7 @@ void DeviceRunnerBase::clear_temporary_buffer() {
         mem_alloc_.free(retained_temp_addrs_[slot]);
         retained_temp_addrs_[slot] = nullptr;
         retained_temp_sizes_[slot] = 0;
+        retained_temp_metadata_[slot].clear();
     }
 }
 

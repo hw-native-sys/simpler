@@ -110,7 +110,14 @@ struct alignas(64) ChipTensor {
     // to avoid 4B padding between them (sizeof(ChipTensor) must stay 128).
     uint64_t extent_elem_cache;         // Cached extent_elem (see extent_elem()); maintained by ops
     uint32_t strides[MAX_TENSOR_DIMS];  // Element stride per dimension; ALWAYS > 0 (type-enforced)
-    uint8_t _pad_cl2[36];               // Reserved for future extension
+    uint32_t _pad_cl2_prefix;           // Keeps host_content_generation naturally aligned
+    // Producer-supplied host-content generation. Zero means the producer
+    // cannot prove freshness, so a host runtime must copy H2D. A nonzero value
+    // must change whenever bytes reachable through this host tensor change.
+    // This is host staging provenance only; it does not participate in device
+    // dependency/version semantics.
+    uint64_t host_content_generation;
+    uint8_t _pad_cl2_tail[24];  // Reserved for future extension
 
     // Default construction is public: ChipTensor doubles as the wire / TaskArgs
     // storage type (TaskArgsTpl<ChipTensor> arrays, ChipStorageTaskArgs POD, blob
@@ -191,6 +198,7 @@ struct alignas(64) ChipTensor {
         address_space = in_address_space;
         start_offset = 0;
         owner_task_id = PTO2TaskId::invalid();
+        host_content_generation = 0;
         // Single reverse pass: write shapes, accumulate row-major stride, and
         // track numel — `s` ends as prod(shapes) which is also extent_elem
         // for a contiguous view.
@@ -205,12 +213,12 @@ struct alignas(64) ChipTensor {
 
     /// Deep copy with contiguous fast-path optimization.
     ///
-    /// Always copies cache line 1 (always needed: buffer, shapes, dtype, ...).
+    /// Always copies cache line 1 and the host-content generation.
     /// When `other` is in canonical contiguous form (is_contiguous &&
-    /// start_offset == 0), cache line 2 (stride / extent_elem_cache) is fully
-    /// derivable from line 1, so we **skip reading other's cache line 2** and
-    /// write dst's line 2 from the local shapes instead. Non-contiguous source
-    /// pays one line 2 read; contiguous source does not.
+    /// start_offset == 0), the cache-line-2 geometry (stride /
+    /// extent_elem_cache) is fully derivable from line 1. We therefore read
+    /// only the provenance field from that line and derive the geometry from
+    /// the local shapes.
     void init_from(const ChipTensor &other) {
         init_from_line1(other);
         if (other.is_contiguous && other.start_offset == 0) {
@@ -226,17 +234,18 @@ struct alignas(64) ChipTensor {
             for (uint32_t i = 0; i < other.ndims; i++) {
                 strides[i] = other.strides[i];
             }
-            // _pad_cl2 left stale on purpose — reserved bytes are not
-            // semantically read by any consumer.
+            // Reserved bytes are intentionally left stale.
         }
     }
 
-    /// View ops use this: copy cache line 1 only, leaving cache line 2 (stride,
-    /// extent_elem_cache) untouched. The op then mutates shapes / start_offset
-    /// in place and calls `refresh_derived()` to recompute line 2 once. This
-    /// avoids the wasted line 2 writes that `init_from()` would do just before
-    /// the op overwrites them.
-    void init_from_line1(const ChipTensor &other) { memcpy(this, &other, 64); }
+    /// View ops use this: copy cache line 1 plus the host-content generation,
+    /// leaving the derived cache-line-2 geometry untouched. The op then mutates
+    /// shapes / start_offset and calls `refresh_derived()` to recompute the
+    /// geometry once.
+    void init_from_line1(const ChipTensor &other) {
+        memcpy(this, &other, 64);
+        host_content_generation = other.host_content_generation;
+    }
 
     /// Backward-compat alias used by orchestrator hot paths that need a full
     /// deep copy. Equivalent to `init_from(other)`.
@@ -473,11 +482,11 @@ private:
     friend struct PTO2TaskPayload;
     friend inline ChipTensor make_tensor_external(
         void *addr, const uint32_t shapes[], uint32_t ndims, DataType dtype, bool manual_dep, int32_t version,
-        AddressSpace address_space
+        AddressSpace address_space, uint64_t host_content_generation
     );
     friend inline ChipTensor make_tensor_strided(
         void *addr, const uint32_t shapes[], const uint32_t strides[], uint32_t ndims, DataType dtype, bool manual_dep,
-        int32_t version, AddressSpace address_space
+        int32_t version, AddressSpace address_space, uint64_t host_content_generation
     );
 };
 
@@ -496,6 +505,7 @@ static_assert(offsetof(ChipTensor, address_space) == 43, "address_space must be 
 static_assert(offsetof(ChipTensor, shapes) == 44, "shapes must start at byte 44 (cacheline 1)");
 static_assert(offsetof(ChipTensor, extent_elem_cache) == 64, "extent_elem_cache must start at byte 64 (cacheline 2)");
 static_assert(offsetof(ChipTensor, strides) == 72);
+static_assert(offsetof(ChipTensor, host_content_generation) == 96);
 
 // =============================================================================
 // ChipTensor factory — canonical construction entry for pre-allocated external
@@ -506,13 +516,15 @@ static_assert(offsetof(ChipTensor, strides) == 72);
 // =============================================================================
 inline ChipTensor make_tensor_external(
     void *addr, const uint32_t shapes[], uint32_t ndims, DataType dtype = DataType::FLOAT32, bool manual_dep = false,
-    int32_t version = 0, AddressSpace address_space = AddressSpace::HOST
+    int32_t version = 0, AddressSpace address_space = AddressSpace::HOST, uint64_t host_content_generation = 0
 ) {
     uint64_t total = 1;
     for (uint32_t i = 0; i < ndims; i++) {
         total *= shapes[i];
     }
-    return {addr, total * get_element_size(dtype), shapes, ndims, dtype, version, manual_dep, address_space};
+    ChipTensor tensor{addr, total * get_element_size(dtype), shapes, ndims, dtype, version, manual_dep, address_space};
+    tensor.host_content_generation = host_content_generation;
+    return tensor;
 }
 
 // =============================================================================
@@ -524,7 +536,8 @@ inline ChipTensor make_tensor_external(
 // =============================================================================
 inline ChipTensor make_tensor_strided(
     void *addr, const uint32_t shapes[], const uint32_t strides[], uint32_t ndims, DataType dtype = DataType::FLOAT32,
-    bool manual_dep = false, int32_t version = 0, AddressSpace address_space = AddressSpace::HOST
+    bool manual_dep = false, int32_t version = 0, AddressSpace address_space = AddressSpace::HOST,
+    uint64_t host_content_generation = 0
 ) {
     always_assert(ndims > 0 && ndims <= MAX_TENSOR_DIMS);
     ChipTensor t{};
@@ -536,6 +549,7 @@ inline ChipTensor make_tensor_strided(
     t.address_space = address_space;
     t.start_offset = 0;
     t.owner_task_id = PTO2TaskId::invalid();
+    t.host_content_generation = host_content_generation;
     for (uint32_t i = 0; i < ndims; i++) {
         t.shapes[i] = shapes[i];
         t.strides[i] = strides[i];
