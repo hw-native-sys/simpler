@@ -17,6 +17,7 @@ registry and the Buffer constructors that are genuinely defined there.
 """
 
 import ctypes
+import re
 from multiprocessing.shared_memory import SharedMemory
 from unittest.mock import patch
 
@@ -26,19 +27,24 @@ from simpler.buffer import (
     AccessMode,
     AddressSpace,
     BackendKind,
+    BufferCapability,
     BufferDescriptor,
     CanonicalIdentity,
     ImportContext,
     ImportRegistry,
     MappedArg,
     Tensor,
+    capabilities_for_adapter,
     create_host_shared_buffer,
     intern_worker_path,
     mint_owner_instance_id,
     re_export,
+    select_adapter,
     wrap_device_malloc,
     wrap_fork_inherited,
+    wrap_vmm_window,
 )
+from simpler.comm_endpoints import AdapterKind, AdapterProfile, RegionAccessReasonCode
 from simpler.task_interface import ChipTensor
 
 _OID = bytes(range(0xA0, 0xA0 + OWNER_INSTANCE_ID_BYTES))
@@ -144,6 +150,193 @@ def test_create_export_import_resolve_zero_copy():
         assert consumer_buf is not None
         owner_buf[:4] = b"\xde\xad\xbe\xef"
         assert bytes(consumer_buf[:4]) == b"\xde\xad\xbe\xef"
+    finally:
+        reg.close()
+        buffer.close()
+
+
+def test_materialize_records_host_mechanism_and_capabilities():
+    buffer = create_host_shared_buffer(nbytes=64, owner_instance_id=mint_owner_instance_id(), buffer_id=1)
+    reg = ImportRegistry(ImportContext(is_host_endpoint=True))
+    try:
+        imported = reg.materialize(buffer.to_descriptor())
+        assert imported.profile is AdapterProfile.HOST_SHM_MAP
+        assert imported.capabilities == capabilities_for_adapter(AdapterKind.DIRECT_MAP)
+        assert BufferCapability.DIRECT_LOAD in imported.capabilities
+        assert BufferCapability.DIRECT_STORE in imported.capabilities
+    finally:
+        reg.close()
+        buffer.close()
+
+
+def test_materialize_records_fork_and_device_mechanisms():
+    data = ctypes.create_string_buffer(64)
+    forked = wrap_fork_inherited(
+        ctypes.addressof(data),
+        len(data),
+        mint_owner_instance_id(),
+        buffer_id=1,
+        backend_kind=BackendKind.FORK_SHM,
+        access=AccessMode.READWRITE,
+    )
+    host_reg = ImportRegistry(ImportContext(is_host_endpoint=True))
+    assert host_reg.materialize(forked.to_descriptor()).profile is AdapterProfile.FORK_INHERITED_VA
+
+    owner = mint_owner_instance_id()
+    device = wrap_device_malloc(0xDEAD0000, 64, owner, buffer_id=2)
+    chip_reg = ImportRegistry(ImportContext(is_host_endpoint=False, device_owner_instance_id=owner))
+    imported = chip_reg.materialize(device.to_descriptor())
+    assert imported.profile is AdapterProfile.DEVICE_LOCAL
+    assert imported.capabilities == capabilities_for_adapter(AdapterKind.DIRECT_MAP)
+
+
+def test_capabilities_are_access_rights_not_adapter_names():
+    direct = capabilities_for_adapter(AdapterKind.DIRECT_MAP)
+    delegated = capabilities_for_adapter(AdapterKind.OWNER_DELEGATED_COPY)
+    peer = capabilities_for_adapter(AdapterKind.DEVICE_PEER)
+    assert delegated < direct
+    assert BufferCapability.DIRECT_LOAD not in delegated
+    assert BufferCapability.DEVICE_PEER_ACCESS in peer
+    assert capabilities_for_adapter(AdapterKind.EXPLICIT_TRANSFER) == frozenset()
+    assert capabilities_for_adapter("future-adapter") == frozenset()
+
+
+def test_access_mode_narrows_what_the_mechanism_affords():
+    # The mechanism sets the ceiling, the backing's own AccessMode lowers it. A mechanism that can
+    # dereference both ways still grants no write right over a READ backing -- otherwise the
+    # capability set would claim a direction MappedArg.buffer already refuses to hand out.
+    direct = capabilities_for_adapter(AdapterKind.DIRECT_MAP)
+    read_only = capabilities_for_adapter(AdapterKind.DIRECT_MAP, AccessMode.READ)
+    write_only = capabilities_for_adapter(AdapterKind.DIRECT_MAP, AccessMode.WRITE)
+    assert read_only == {BufferCapability.DIRECT_LOAD, BufferCapability.COPY_FROM}
+    assert write_only == {BufferCapability.DIRECT_STORE, BufferCapability.COPY_TO}
+    assert capabilities_for_adapter(AdapterKind.DIRECT_MAP, AccessMode.READWRITE) == direct
+
+
+def test_a_read_only_fork_backing_grants_no_write_right():
+    # FORK_COW is dereferenceable in the child, but a store there splits into a private copy the
+    # owner never sees -- which is exactly what its READ access mode records.
+    data = ctypes.create_string_buffer(64)
+    cow = wrap_fork_inherited(
+        ctypes.addressof(data),
+        len(data),
+        mint_owner_instance_id(),
+        buffer_id=1,
+        backend_kind=BackendKind.FORK_COW,
+        access=AccessMode.READ,
+    )
+    reg = ImportRegistry(ImportContext(is_host_endpoint=True))
+    imported = reg.materialize(cow.to_descriptor())
+    assert imported.profile is AdapterProfile.FORK_INHERITED_VA
+    assert BufferCapability.DIRECT_LOAD in imported.capabilities
+    assert BufferCapability.DIRECT_STORE not in imported.capabilities
+    assert BufferCapability.COPY_TO not in imported.capabilities
+
+
+def test_every_materialize_refusal_carries_a_region_access_reason_code():
+    # Both evaluation moments of the capability judgment answer in one vocabulary, refusals
+    # included: a caller can tell an endpoint-relation verdict from an unsupported backing without
+    # parsing prose.
+    oid = mint_owner_instance_id()
+    host_reg = ImportRegistry(ImportContext(is_host_endpoint=True))
+    device = wrap_device_malloc(0xDEAD0000, 64, oid, buffer_id=1)
+    with pytest.raises(ValueError, match=re.escape(RegionAccessReasonCode.UNSUPPORTED_ENDPOINT_RELATION.value)):
+        host_reg.materialize(device.to_descriptor())
+
+    sidecar = BufferDescriptor(
+        identity=_identity(),
+        address_space=AddressSpace.HOST,
+        access=AccessMode.READWRITE,
+        backend_kind=BackendKind.REMOTE_SIDECAR,
+        nbytes=8,
+    )
+    with pytest.raises(ValueError, match=re.escape(RegionAccessReasonCode.UNSUPPORTED_BACKEND_KIND.value)):
+        host_reg.materialize(sidecar)
+
+
+def _delegating_host_context(owner: bytes) -> ImportContext:
+    """A Worker: a host endpoint that owns ``owner``'s chip children, so it can delegate a copy."""
+    return ImportContext(is_host_endpoint=True, device_owner_instance_id=owner)
+
+
+def test_a_device_backing_at_a_delegating_host_endpoint_is_reachable_not_refused():
+    # Being unable to MAP a backing is not being unable to touch it. A Worker holds no device VA,
+    # but it drives the mailbox of the chip that owns the allocation, so the copy rights are real.
+    owner = mint_owner_instance_id()
+    device = wrap_device_malloc(0xDEAD0000, 64, owner, buffer_id=1)
+
+    kind, profile = select_adapter(device.to_descriptor(), _delegating_host_context(owner))
+    assert (kind, profile) == (AdapterKind.OWNER_DELEGATED_COPY, AdapterProfile.OWNER_DEVICE_COPY)
+
+    granted = capabilities_for_adapter(kind, device.access)
+    assert BufferCapability.COPY_TO in granted and BufferCapability.COPY_FROM in granted
+    assert BufferCapability.DIRECT_LOAD not in granted  # no address in this process to load from
+
+
+def test_a_vmm_window_at_a_delegating_host_endpoint_matches_the_region_planner():
+    # The planner already gives a host region consumer OWNER_DELEGATED_COPY/HOST_VMM_COPY
+    # (`_adapter_candidates`); the per-tensor moment must not disagree with it about the same
+    # relation.
+    owner = mint_owner_instance_id()
+    window = wrap_vmm_window(0xBEEF0000, 4096, owner, buffer_id=2)
+    assert select_adapter(window.to_descriptor(), _delegating_host_context(owner)) == (
+        AdapterKind.OWNER_DELEGATED_COPY,
+        AdapterProfile.HOST_VMM_COPY,
+    )
+
+
+def test_materialize_refuses_a_delegated_mechanism_for_having_no_address():
+    # `materialize` returns a mapping, so it narrows the judgment to the mechanisms that produce
+    # one -- and its refusal names the mechanism that DOES reach the backing, rather than reporting
+    # no relation. That distinction is the whole point: the endpoint may touch this backing, just
+    # not by holding an address to it.
+    owner = mint_owner_instance_id()
+    device = wrap_device_malloc(0xDEAD0000, 64, owner, buffer_id=1)
+    reg = ImportRegistry(_delegating_host_context(owner))
+    with pytest.raises(ValueError, match=re.escape(RegionAccessReasonCode.NO_IMPLEMENTED_DIRECT_MAP_PROBE.value)):
+        reg.materialize(device.to_descriptor())
+    with pytest.raises(ValueError, match="OWNER_DELEGATED_COPY"):
+        reg.materialize(device.to_descriptor())
+
+
+def test_a_host_endpoint_with_no_delegation_channel_still_has_no_relation():
+    # A SUB child is the other host endpoint: it cannot map a device backing and owns no chip that
+    # could copy for it, so there is genuinely no mechanism -- distinct from the Worker's case.
+    owner = mint_owner_instance_id()
+    device = wrap_device_malloc(0xDEAD0000, 64, owner, buffer_id=1)
+    with pytest.raises(ValueError, match=re.escape(RegionAccessReasonCode.UNSUPPORTED_ENDPOINT_RELATION.value)):
+        select_adapter(device.to_descriptor(), ImportContext(is_host_endpoint=True))
+    # Nor a different Worker's device backing, even for an endpoint that can delegate to its own.
+    with pytest.raises(ValueError, match=re.escape(RegionAccessReasonCode.UNSUPPORTED_ENDPOINT_RELATION.value)):
+        select_adapter(device.to_descriptor(), _delegating_host_context(mint_owner_instance_id()))
+
+
+def test_a_mappable_backing_still_maps_once_and_carries_the_direct_rights():
+    # The mapping subset is unchanged by the judgment being able to name non-mapping mechanisms:
+    # a host shm backing still resolves to one cached mapping with the direct-map rights.
+    buffer = create_host_shared_buffer(nbytes=64, owner_instance_id=mint_owner_instance_id(), buffer_id=1)
+    reg = ImportRegistry(ImportContext(is_host_endpoint=True))
+    try:
+        kind, profile = select_adapter(buffer.to_descriptor(), ImportContext(is_host_endpoint=True))
+        assert (kind, profile) == (AdapterKind.DIRECT_MAP, AdapterProfile.HOST_SHM_MAP)
+        imported = reg.materialize(buffer.to_descriptor())
+        assert imported.capabilities == capabilities_for_adapter(AdapterKind.DIRECT_MAP, buffer.access)
+        assert reg.materialize(buffer.to_descriptor()) is imported  # map-once
+    finally:
+        reg.close()
+        buffer.close()
+
+
+def test_require_distinguishes_missing_and_insufficient_capabilities():
+    buffer = create_host_shared_buffer(nbytes=64, owner_instance_id=mint_owner_instance_id(), buffer_id=1)
+    reg = ImportRegistry(ImportContext(is_host_endpoint=True))
+    try:
+        with pytest.raises(KeyError):
+            reg.require(buffer.identity, BufferCapability.COPY_TO)
+        reg.materialize(buffer.to_descriptor())
+        assert reg.require(buffer.identity, BufferCapability.COPY_TO).identity == buffer.identity
+        with pytest.raises(ValueError, match="DEVICE_PEER_ACCESS"):
+            reg.require(buffer.identity, BufferCapability.DEVICE_PEER_ACCESS)
     finally:
         reg.close()
         buffer.close()
@@ -350,7 +543,7 @@ def test_device_malloc_wrap_materialize():
     assert h.backend_kind == BackendKind.DEVICE_MALLOC
     assert h.address_space == AddressSpace.DEVICE
     assert h.shm is None and h.base == 0xDEAD0000
-    reg = ImportRegistry(ImportContext(is_host_endpoint=False, owning_chip_instance_id=oid))
+    reg = ImportRegistry(ImportContext(is_host_endpoint=False, device_owner_instance_id=oid))
     imp = reg.materialize(h.to_descriptor())
     assert imp.base == 0xDEAD0000
     assert imp.address_space == AddressSpace.DEVICE
@@ -364,7 +557,7 @@ def test_materialize_args_scopes_the_returned_map_to_this_calls_tensors():
     import simpler.task_interface as ti  # noqa: PLC0415
 
     oid = mint_owner_instance_id()
-    reg = ImportRegistry(ImportContext(is_host_endpoint=False, owning_chip_instance_id=oid))
+    reg = ImportRegistry(ImportContext(is_host_endpoint=False, device_owner_instance_id=oid))
     h1 = wrap_device_malloc(0xDEAD0000, 4096, oid, buffer_id=1)
     h2 = wrap_device_malloc(0xBEEF0000, 4096, oid, buffer_id=2)
 
@@ -406,7 +599,7 @@ def test_materialize_rejects_a_conflicting_descriptor_for_a_live_identity():
     # carrying the same identity and a different nbytes describes something the existing mapping is
     # not, so returning that mapping would hand back a base under a size nothing stands behind.
     oid = mint_owner_instance_id()
-    reg = ImportRegistry(ImportContext(is_host_endpoint=False, owning_chip_instance_id=oid))
+    reg = ImportRegistry(ImportContext(is_host_endpoint=False, device_owner_instance_id=oid))
     first = reg.materialize(_device_descriptor(oid, 1, nbytes=4096))
 
     for conflicting in (
@@ -426,7 +619,7 @@ def test_conflict_error_names_only_the_fields_that_differ():
     # A whole repr of both descriptors would carry a 32-byte body twice for what is usually a
     # one-field disagreement, and leave the reader to diff them by eye.
     oid = mint_owner_instance_id()
-    reg = ImportRegistry(ImportContext(is_host_endpoint=False, owning_chip_instance_id=oid))
+    reg = ImportRegistry(ImportContext(is_host_endpoint=False, device_owner_instance_id=oid))
     reg.materialize(_device_descriptor(oid, 1, nbytes=4096))
     with pytest.raises(ValueError) as excinfo:
         reg.materialize(_device_descriptor(oid, 1, nbytes=8192))

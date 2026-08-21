@@ -62,8 +62,14 @@ else raises. Remote-worker and remote-memory calls require `level >= 4`.
 | ------ | ----- |
 | `malloc(size, worker_id=0) -> int` | Returns a device pointer as an integer |
 | `free(ptr, worker_id=0)` | |
-| `copy_to(dst, src)` | H2D; `dst` is a device `Buffer`, `src` a host `Buffer` from `create_buffer` (at L2, also any torch tensor or writable buffer). `dst` may be a `base + offset` interior handle as long as `[dst, dst + size)` lies within one live allocation (partial update of a persistent buffer) |
-| `copy_from(dst, src)` | D2H; `dst` is the host `Buffer` (at L2, also any writable buffer). `src` may be an interior handle whose `[src, src + size)` lies within one live device allocation |
+| `copy_to(dst, src, *, dst_offset=0, src_offset=0, nbytes=None)` | H2D; `dst` is a device `Buffer`, `src` a host `Buffer` from `create_buffer` (at L2, also any torch tensor or writable buffer). `nbytes` defaults to the rest of the host side after `src_offset`, so `copy_to(dst, src)` transfers the whole host backing |
+| `copy_from(dst, src, *, dst_offset=0, src_offset=0, nbytes=None)` | D2H; `dst` is the host `Buffer` (at L2, also any writable buffer). Same defaulting, measured from `dst_offset` on the host side |
+
+A partial update names the **whole allocation plus an offset** — `copy_to(dev, src,
+dst_offset=32, nbytes=16)`. A handle rebuilt at `base + 32` is not an interior view of that
+allocation; it is a different canonical identity that names no allocation at all, and is refused.
+Both offsets are bounded together with the length against the *registered* extent, so an offset
+cannot walk a legal-looking length past the end.
 | `create_buffer(nbytes) -> Buffer` / `Buffer.close()` | Shared host backing this Worker owns; build a view over `handle.shm.buf`, name it on the wire with `handle.tensor(shapes, dtype)` |
 | `remote_malloc` / `remote_free` / `remote_copy_to` / `remote_copy_from` / `remote_export` / `remote_import` / `remote_release_import` | L4 only |
 

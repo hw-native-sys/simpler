@@ -798,13 +798,16 @@ def _task_args_add_tensor(self: TaskArgs, tensor, tag: TensorArgType = TensorArg
         placeholder = remote_sidecar_tensor(
             shapes=tuple(int(s) for s in tensor.shape),
             dtype=int(tensor.dtype.value),
-            nbytes=int(nbytes),
+            # A remote placeholder is still a normal Tensor record on the wire: its descriptor
+            # spans the complete handle backing, while the sidecar records this view's nbytes.
+            nbytes=int(handle.nbytes),
             owner_worker_id=0 if inline else int(handle.owner_worker_id),
             buffer_id=0 if inline else int(handle._buffer_id),
             generation=0 if inline else int(handle._generation),
             address_space=(
                 AddressSpace.DEVICE if handle.address_space == RemoteAddressSpace.REMOTE_DEVICE else AddressSpace.HOST
             ),
+            byte_offset=int(tensor.offset),
         )
         _TASK_ARGS_ADD_TENSOR(self, placeholder, tag)
         storage.sidecars.append(_sidecar_from_ref(storage, tensor))

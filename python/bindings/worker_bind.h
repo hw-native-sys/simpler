@@ -444,22 +444,26 @@ inline void bind_worker(nb::module_ &m) {
         )
         .def(
             "copy_to",
-            [](Worker &self, int worker_id, const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes) {
-                self.copy_to(worker_id, dst, src, nbytes);
+            [](Worker &self, int worker_id, const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes,
+               uint64_t dst_offset, uint64_t src_offset) {
+                self.copy_to(worker_id, dst, src, CopySpan{nbytes, dst_offset, src_offset});
             },
-            nb::arg("worker_id"), nb::arg("dst"), nb::arg("src"), nb::arg("nbytes"),
-            nb::call_guard<nb::gil_scoped_release>(),
-            "H2D copy: host `src` into device `dst`, both named by descriptor. The child resolves each "
-            "through its ImportRegistry, so neither end is an address minted in this process."
+            nb::arg("worker_id"), nb::arg("dst"), nb::arg("src"), nb::arg("nbytes"), nb::arg("dst_offset") = 0,
+            nb::arg("src_offset") = 0, nb::call_guard<nb::gil_scoped_release>(),
+            "H2D copy: `nbytes` from `src_offset` in host `src` into `dst_offset` in device `dst`, both "
+            "named by descriptor. The child resolves each through its ImportRegistry and applies the "
+            "offset itself, so neither end is an address minted in this process."
         )
         .def(
             "copy_from",
-            [](Worker &self, int worker_id, const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes) {
-                self.copy_from(worker_id, dst, src, nbytes);
+            [](Worker &self, int worker_id, const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes,
+               uint64_t dst_offset, uint64_t src_offset) {
+                self.copy_from(worker_id, dst, src, CopySpan{nbytes, dst_offset, src_offset});
             },
-            nb::arg("worker_id"), nb::arg("dst"), nb::arg("src"), nb::arg("nbytes"),
-            nb::call_guard<nb::gil_scoped_release>(),
-            "D2H copy: device `src` into host `dst`, both named by descriptor."
+            nb::arg("worker_id"), nb::arg("dst"), nb::arg("src"), nb::arg("nbytes"), nb::arg("dst_offset") = 0,
+            nb::arg("src_offset") = 0, nb::call_guard<nb::gil_scoped_release>(),
+            "D2H copy: `nbytes` from `src_offset` in device `src` into `dst_offset` in host `dst`, both "
+            "named by descriptor."
         )
         .def(
             "add_remote_l3_socket",
@@ -976,10 +980,13 @@ inline void bind_worker(nb::module_ &m) {
         "_read_control_copy_request",
         [](uint64_t frame_addr) {
             ControlCopyRequest request = read_control_copy_request(reinterpret_cast<const char *>(frame_addr));
-            return nb::make_tuple(request.dst, request.src, request.nbytes);
+            return nb::make_tuple(
+                request.dst, request.src, request.span.nbytes, request.span.dst_offset, request.span.src_offset
+            );
         },
         nb::arg("frame_addr"),
         "Decode the CTRL_COPY_TO / CTRL_COPY_FROM payload on the control frame at `frame_addr` into "
-        "`(dst_descriptor, src_descriptor, nbytes)`. Both descriptors are validated on the way out."
+        "`(dst_descriptor, src_descriptor, nbytes, dst_offset, src_offset)`. Both descriptors are "
+        "validated on the way out, and each offset+length is bounded against the backing it arrived with."
     );
 }

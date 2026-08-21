@@ -250,7 +250,7 @@ Status for the local PR #866 cut:
 | Remote import eligibility | Imported peer handle makes only the importer worker eligible. |
 | Remote import dep key | Owner and imported views use the same owner-based TensorMap key. |
 | Raw pointer rejection | Unstaged host pointer fails before slot commit. |
-| Wire backing-free | A remote TASK tensor carrying a local backing or a non-zero `byte_offset` is rejected on encode and on decode. |
+| Wire backing-free | A remote TASK tensor carrying a local backing is rejected on encode and on decode; its Tensor `byte_offset` is a normal view offset and must fit the whole backing and the sidecar range. |
 | HOST_INLINE desc | Inline payloads require a descriptor and bounds checks. |
 | Remote buffer copy | Host stages input, remote writes output, host pulls. |
 | Input-only free deferral | Released input buffer survives queued consumers. |

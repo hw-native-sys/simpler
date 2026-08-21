@@ -137,26 +137,28 @@ TEST(RemoteWire, TaskPayloadRejectsAnArgWithALocalBacking) {
     EXPECT_THROW((void)remote_l3::encode_task_payload(payload), std::runtime_error);
 }
 
-TEST(RemoteWire, TensorRecordRejectsAByteOffsetOnEncodeAndOnDecode) {
+TEST(RemoteWire, TensorRecordCarriesWholeBackingAndByteOffset) {
     Tensor arg = remote_arg_tensor();
     arg.buffer.nbytes = 8;
     arg.byte_offset = 4;
     arg.shapes[0] = 4;
     validate_tensor(arg);
-    // The sidecar carries where the view sits in the backing, so a record naming its own origin
-    // fails at the sender rather than after transport.
-    EXPECT_THROW((void)remote_l3::encode_tensor(arg), std::runtime_error);
-
-    arg.byte_offset = 0;
     auto encoded = remote_l3::encode_tensor(arg);
     // byte_offset follows the 39-byte descriptor head of a record whose backend body is empty:
     // identity nonce(8) + buffer_id(8) + generation(4) + address_space/access/backend(3) +
     // nbytes(8) + owner_worker_path_id(4) + body_len(4).
     constexpr size_t kByteOffsetPos = 39;
     ASSERT_GT(encoded.size(), kByteOffsetPos + sizeof(uint64_t));
-    encoded[kByteOffsetPos] = 4;
 
     size_t offset = 0;
+    const Tensor decoded = remote_l3::decode_tensor(encoded.data(), encoded.size(), offset);
+    EXPECT_EQ(decoded.buffer.nbytes, 8u);
+    EXPECT_EQ(decoded.byte_offset, 4u);
+
+    // A malformed record whose offset is moved past the backing is still rejected by the common
+    // Tensor validator, rather than by a remote-wire-only rule.
+    encoded[kByteOffsetPos] = 8;
+    offset = 0;
     EXPECT_THROW((void)remote_l3::decode_tensor(encoded.data(), encoded.size(), offset), std::runtime_error);
 }
 

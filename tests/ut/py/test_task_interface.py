@@ -74,7 +74,7 @@ def _ref_addr(ref: Tensor) -> int:
     return int.from_bytes(bytes(ref.buffer.body)[:8], "little")
 
 
-def _remote_arg_tensor(shapes, nbytes, owner_worker_id=2, buffer_id=9, generation=1):
+def _remote_arg_tensor(shapes, nbytes, owner_worker_id=2, buffer_id=9, generation=1, byte_offset=0):
     """The per-argument record a remote L3 TASK carries: the submitter's REMOTE_SIDECAR placeholder."""
     return remote_sidecar_tensor(
         shapes=tuple(shapes),
@@ -84,6 +84,7 @@ def _remote_arg_tensor(shapes, nbytes, owner_worker_id=2, buffer_id=9, generatio
         buffer_id=buffer_id,
         generation=generation,
         address_space=AddressSpace.HOST,
+        byte_offset=int(byte_offset),
     )
 
 
@@ -584,7 +585,7 @@ class TestRemoteTaskArgsSidecar:
         assert not hasattr(task_interface_module, "RemoteTaskArgs")
         assert "RemoteTaskArgs" not in task_interface_module.__all__
 
-    def test_remote_buffer_ref_adds_zero_metadata_and_sidecar(self):
+    def test_remote_buffer_ref_uses_whole_backing_and_sidecar_view(self):
         handle = RemoteBufferHandle._from_remote_allocation(
             worker_id=3,
             buffer_id=11,
@@ -603,6 +604,8 @@ class TestRemoteTaskArgsSidecar:
         assert args.tensor_count() == 1
         # An arg destined for a remote worker carries a REMOTE_SIDECAR placeholder ref (no local backing).
         assert args.tensor(0).buffer.backend_kind == BackendKind.REMOTE_SIDECAR
+        assert args.tensor(0).buffer.nbytes == 64
+        assert args.tensor(0).byte_offset == 8
         assert args.tag(0) == TensorArgType.OUTPUT
         assert args.scalar(0) == 9
 
@@ -867,7 +870,7 @@ class TestRemoteL3SessionTaskArgsMaterialization:
         try:
             ctypes.memmove(backing.base, b"01234567", 8)
             entry = _RemoteBufferEntry(backing, 8, 1, WireRemoteAddressSpace.REMOTE_DEVICE)
-            tensor = _remote_arg_tensor((4,), nbytes=4)
+            tensor = _remote_arg_tensor((4,), nbytes=8, byte_offset=2)
             desc = RemoteTensorDesc(
                 address_space=WireRemoteAddressSpace.REMOTE_DEVICE,
                 owner_worker_id=2,
@@ -928,9 +931,10 @@ class TestRemoteL3SessionTaskArgsMaterialization:
                     flags=0,
                 )
 
-            tensor = _remote_arg_tensor((4,), nbytes=4)
+            tensor = _remote_arg_tensor((4,), nbytes=8)
+            tensor_second = _remote_arg_tensor((4,), nbytes=8, byte_offset=4)
             wire = RemoteTaskArgsWire(
-                (tensor, tensor),
+                (tensor, tensor_second),
                 (RemoteTensorSidecar(True, sub_range(0)), RemoteTensorSidecar(True, sub_range(4))),
                 (),
                 b"",
@@ -942,6 +946,41 @@ class TestRemoteL3SessionTaskArgsMaterialization:
 
             assert args.tensor(0).buffer.identity == args.tensor(1).buffer.identity
             assert (args.tensor(0).byte_offset, args.tensor(1).byte_offset) == (0, 4)
+        finally:
+            backing.close()
+
+    def test_materialize_rejects_a_wire_offset_that_disagrees_with_the_sidecar(self):
+        from simpler.remote_l3_protocol import (
+            RemoteAddressSpace as WireRemoteAddressSpace,
+        )
+        from simpler.remote_l3_protocol import (
+            RemoteTaskArgsWire,
+            RemoteTensorDesc,
+            RemoteTensorSidecar,
+        )
+        from simpler.remote_l3_session import _materialize_task_args, _RemoteBufferEntry
+
+        backing = create_host_shared_buffer(8, mint_owner_instance_id(), buffer_id=9)
+        try:
+            entry = _RemoteBufferEntry(backing, 8, 1, WireRemoteAddressSpace.REMOTE_DEVICE)
+            tensor = _remote_arg_tensor((4,), nbytes=8, byte_offset=0)
+            desc = RemoteTensorDesc(
+                address_space=WireRemoteAddressSpace.REMOTE_DEVICE,
+                owner_worker_id=2,
+                buffer_id=9,
+                offset=2,
+                nbytes=4,
+                remote_addr=entry.addr,
+                rkey_or_token=0,
+                generation=1,
+                inline_payload_offset=0,
+                inline_payload_len=0,
+                flags=0,
+            )
+            wire = RemoteTaskArgsWire((tensor,), (RemoteTensorSidecar(True, desc),), (), b"")
+
+            with pytest.raises(ValueError, match="byte_offset disagrees"):
+                _materialize_task_args(wire, {(9, 1): entry}, worker_id=2, mint_inline_buffer=_session_buffer_minter())
         finally:
             backing.close()
 
@@ -974,7 +1013,7 @@ class TestRemoteL3SessionTaskArgsMaterialization:
                 flags=0,
             )
             wire = RemoteTaskArgsWire(
-                (_remote_arg_tensor((4,), nbytes=4),), (RemoteTensorSidecar(True, desc),), (), b""
+                (_remote_arg_tensor((4,), nbytes=8),), (RemoteTensorSidecar(True, desc),), (), b""
             )
 
             args, _inline_backings = _materialize_task_args(

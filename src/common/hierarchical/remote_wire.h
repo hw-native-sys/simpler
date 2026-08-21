@@ -23,10 +23,10 @@
 
 namespace remote_l3 {
 
-// 3: a TASK's per-argument record is the self-describing wire `Tensor` — the embedded
+// 4: a TASK's per-argument record is the self-describing wire `Tensor` — the embedded
 // BufferDescriptor plus the strided view. Both ends of a run come from one `pip install`,
 // so this constant is a mismatch alarm at the frame header, not a dual-decode selector.
-static constexpr uint32_t PROTOCOL_VERSION = 3;
+static constexpr uint32_t PROTOCOL_VERSION = 4;
 inline constexpr size_t FRAME_HEADER_BYTES = 40;
 static constexpr uint32_t MAX_FRAME_PAYLOAD_BYTES = 16U * 1024U * 1024U;
 static constexpr uint32_t MAX_STRING_BYTES = 1024U;
