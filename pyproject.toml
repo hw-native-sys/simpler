@@ -20,6 +20,7 @@ dependencies = ["cloudpickle>=2.2"]
 [project.scripts]
 simpler-remote-worker = "simpler.remote_l3_worker:main"
 simpler-remote-l3-session = "simpler.remote_l3_session:main"
+simpler-mpi-direct = "simpler.mpi_direct_supervisor:main"
 
 [project.optional-dependencies]
 # ``torch>=2.3`` is required by ``simpler_setup.torch_interop`` (uses
@@ -27,6 +28,7 @@ simpler-remote-l3-session = "simpler.remote_l3_session:main"
 # torch via a custom index URL and does not rely on this pin; it is here
 # so ``pip install -e '.[test]'`` resolves a usable version for local devs.
 test = ["pytest>=6.0", "pytest-timeout>=2.3", "pytest-xdist>=3.0", "PyYAML>=6.0", "torch>=2.3"]
+mpi = ["mpi4py>=3.1"]
 
 [tool.ruff]
 line-length = 120

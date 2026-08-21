@@ -59,6 +59,7 @@ from simpler.task_interface import ChipWorker
 from simpler.orchestrator import Orchestrator
 from simpler_setup.runtime_builder import RuntimeBuilder
 from simpler_setup.runtime_compiler import RuntimeCompiler
+from simpler_setup.environment import PROJECT_ROOT
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.elf_parser import extract_text_section
 from simpler_setup.platform_info import parse_platform, discover_runtimes
@@ -74,6 +75,11 @@ for rel in ('pipe_sync.h', os.path.join('common', 'dma_workspace.h')):
     assert any(os.path.isfile(os.path.join(d, rel)) for d in inc_dirs), \
         'incore helper not shipped: ' + rel + '; include dirs: ' + repr(inc_dirs)
 print('incore helpers OK:', inc_dirs)
+# RuntimeCompiler passes this directory to every host-side CMake configure.
+for name in ('host_log_sources.cmake', 'profiling_config.cmake', 'sanitizers.cmake'):
+    path = PROJECT_ROOT / 'cmake' / name
+    assert path.is_file(), 'shared CMake module not shipped: ' + str(path)
+print('shared CMake modules OK:', PROJECT_ROOT / 'cmake')
 "
     )
     echo "::endgroup::"

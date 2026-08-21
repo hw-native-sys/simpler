@@ -61,6 +61,7 @@ from simpler.worker import (
     RunHandle,
     Worker,
     _buffer_field_addr,
+    _close_fork_child_fds,
     _mailbox_addr,
     _mailbox_load_i32,
     _mailbox_store_i32,
@@ -86,6 +87,15 @@ def _make_shared_counter():
 
 def _read_counter(buf) -> int:
     return struct.unpack_from("i", buf, 0)[0]
+
+
+def test_close_fork_child_fds_ignores_invalid_entries(monkeypatch):
+    closed: list[int] = []
+    monkeypatch.setattr(worker_mod.os, "close", closed.append)
+
+    _close_fork_child_fds(["invalid", 2, 7, object()])
+
+    assert closed == [7]
 
 
 def _increment_counter(buf) -> None:

@@ -21,6 +21,7 @@
 #include <utility>
 
 #include "remote_endpoint.h"
+#include "mpi_direct_transport.h"
 
 // ---------------------------------------------------------------------------
 // Fork hygiene
@@ -159,6 +160,18 @@ void Worker::add_mpi_group_mailbox(
             )
         );
     }
+}
+
+void Worker::add_remote_l3_mpi(
+    int32_t worker_id, uint64_t session_id, const std::string &transport_name,
+    const std::shared_ptr<MpiDirectTransportHub> &hub, double attach_timeout_s, double runtime_timeout_s
+) {
+    if (initialized_) throw std::runtime_error("Worker: add_remote_l3_mpi after init");
+    auto transport = std::make_unique<MpiDirectTransport>(hub, worker_id, attach_timeout_s, runtime_timeout_s);
+    transport->expect_hello_ready();
+    manager_.add_next_level_endpoint(
+        std::make_unique<RemoteL3Endpoint>(worker_id, session_id, transport_name, std::move(transport))
+    );
 }
 
 void Worker::init() {

@@ -25,16 +25,19 @@
 #pragma once
 
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
 #include "ring.h"
+#include "mpi_direct_transport.h"
 #include "mpi_group_mailbox.h"
 #include "orchestrator.h"
 #include "types.h"
@@ -235,6 +238,61 @@ inline void mailbox_store_i32(uint64_t addr, int32_t v) {
 }
 
 inline void bind_worker(nb::module_ &m) {
+    nb::enum_<MpiDirectTag>(m, "_MpiDirectTag")
+        .value("COMMAND_REQUEST", MpiDirectTag::COMMAND_REQUEST)
+        .value("COMMAND_REPLY", MpiDirectTag::COMMAND_REPLY)
+        .value("HEALTH", MpiDirectTag::HEALTH)
+        .value("LIFECYCLE", MpiDirectTag::LIFECYCLE);
+
+    nb::class_<MpiDirectTransportHub>(m, "_MpiDirectTransportHub")
+        .def(nb::init<size_t>(), nb::arg("max_pending_frame_bytes"))
+        .def(
+            "register_route", &MpiDirectTransportHub::register_route, nb::arg("worker_id"), nb::arg("mpi_rank"),
+            nb::arg("session_id"), nb::arg("comm_profile")
+        )
+        .def(
+            "poll_outbound",
+            [](MpiDirectTransportHub &self, double timeout_s) -> nb::object {
+                std::optional<MpiDirectOutboundFrame> result;
+                {
+                    nb::gil_scoped_release release;
+                    result = self.poll_outbound(timeout_s);
+                }
+                if (!result.has_value()) return nb::none();
+                const auto &frame = result->frame;
+                return nb::make_tuple(
+                    result->ticket, result->target_rank, static_cast<int32_t>(result->tag),
+                    nb::bytes(reinterpret_cast<const char *>(frame.data()), frame.size())
+                );
+            },
+            nb::arg("timeout_s") = 0.0
+        )
+        .def(
+            "complete_outbound", &MpiDirectTransportHub::complete_outbound, nb::arg("ticket"),
+            nb::call_guard<nb::gil_scoped_release>()
+        )
+        .def(
+            "deliver",
+            [](MpiDirectTransportHub &self, int32_t source_rank, int32_t raw_tag, nb::bytes frame) {
+                if (raw_tag < static_cast<int32_t>(MpiDirectTag::COMMAND_REQUEST) ||
+                    raw_tag > static_cast<int32_t>(MpiDirectTag::LIFECYCLE)) {
+                    throw std::invalid_argument("MPI direct tag is outside the fixed transport lanes");
+                }
+                const auto *begin = reinterpret_cast<const uint8_t *>(frame.c_str());
+                std::vector<uint8_t> native_frame(begin, begin + frame.size());
+                {
+                    nb::gil_scoped_release release;
+                    self.deliver(source_rank, static_cast<MpiDirectTag>(raw_tag), native_frame);
+                }
+            },
+            nb::arg("source_rank"), nb::arg("tag"), nb::arg("frame")
+        )
+        .def("fail", &MpiDirectTransportHub::fail, nb::arg("message"))
+        .def("close", &MpiDirectTransportHub::close)
+        .def_prop_ro("pending_frame_bytes", &MpiDirectTransportHub::pending_frame_bytes)
+        .def_prop_ro("terminal", &MpiDirectTransportHub::terminal)
+        .def_prop_ro("terminal_error", &MpiDirectTransportHub::terminal_error);
+
     // --- WorkerType ---
     nb::enum_<WorkerType>(m, "WorkerType").value("NEXT_LEVEL", WorkerType::NEXT_LEVEL).value("SUB", WorkerType::SUB);
 
@@ -490,13 +548,24 @@ inline void bind_worker(nb::module_ &m) {
             nb::arg("mpirun_pid"), nb::arg("runtime_timeout_s") = 30.0,
             "Register one shared-memory MPI group endpoint for each worker id."
         )
+        .def(
+            "add_remote_l3_mpi",
+            [](Worker &self, int32_t worker_id, uint64_t session_id, const std::string &transport_name,
+               const std::shared_ptr<MpiDirectTransportHub> &hub, double attach_timeout_s, double runtime_timeout_s) {
+                nb::gil_scoped_release release;
+                self.add_remote_l3_mpi(worker_id, session_id, transport_name, hub, attach_timeout_s, runtime_timeout_s);
+            },
+            nb::arg("worker_id"), nb::arg("session_id"), nb::arg("transport_name"), nb::arg("hub"),
+            nb::arg("attach_timeout_s") = 30.0, nb::arg("runtime_timeout_s") = 30.0,
+            "Register a directed MPI-backed REMOTE_L3 endpoint after HELLO READY."
+        )
 
         // Release the GIL while starting the Scheduler thread so another Python
         // thread can run during it — e.g. a concurrent close() observing
         // INITIALIZING and failing fast. init/close remain same-thread-only
         // (enforced by Worker.close()).
         .def("init", &Worker::init, nb::call_guard<nb::gil_scoped_release>(), "Start the Scheduler thread.")
-        .def("close", &Worker::close, "Stop the Scheduler thread.")
+        .def("close", &Worker::close, nb::call_guard<nb::gil_scoped_release>(), "Stop the Scheduler thread.")
 
         .def(
             "get_orchestrator", &Worker::get_orchestrator, nb::rv_policy::reference_internal,

@@ -1383,7 +1383,12 @@ void RemoteL3Endpoint::request_progress_stop() noexcept {
         progress_stop_requested_ = true;
         progress_stop_reason_ = "RemoteL3Endpoint progress stopped";
         command_cv_.notify_all();
-        transport_->shutdown();
+        // Worker::close() stops Scheduler progress before WorkerManager owns
+        // child shutdown. Keep an idle transport alive across that handoff so
+        // shutdown_child() can still submit the lifecycle SHUTDOWN frame. An
+        // in-flight task cannot be drained by normal shutdown and still needs
+        // transport cancellation to terminalize its progress lane.
+        if (pending_task_.occupied) transport_->shutdown();
     } catch (...) {}
 }
 

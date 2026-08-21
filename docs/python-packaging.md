@@ -31,6 +31,7 @@ simpler_setup/            ← test framework + build/runtime assembly (simpler_s
     paged_attention.py    attention reference (used by multiple paged_attention tests)
   _assets/                (wheel-only, populated by CMake install)
     src/                  source tree mirror
+    cmake/                shared modules used by runtime compilation
     build/lib/            pre-built per-arch/platform/runtime .so/.o
 
 _task_interface.*.so      nanobind extension at site-packages root
@@ -69,10 +70,10 @@ NPU hardware (`a2a3`/`a5` with CANN toolkit).
 
 `simpler_setup.environment.PROJECT_ROOT` auto-detects between:
 
-- **Wheel install**: `simpler_setup/_assets/` exists → `PROJECT_ROOT = .../site-packages/simpler_setup/_assets`. The wheel's bundled `_assets/src/` and `_assets/build/lib/` provide everything needed at runtime.
+- **Wheel install**: `simpler_setup/_assets/` exists → `PROJECT_ROOT = .../site-packages/simpler_setup/_assets`. The wheel's bundled `_assets/src/`, `_assets/cmake/`, and `_assets/build/lib/` provide everything needed at runtime.
 - **Source tree / editable install**: `_assets/` doesn't exist → `PROJECT_ROOT = repo root`. Live `src/` and `build/lib/` are used.
 
-Anything that needs to find `src/`, `build/lib/`, or `build/cache/` MUST go through `simpler_setup.environment.PROJECT_ROOT` — never `Path(__file__).parent.parent...`.
+Anything that needs to find `src/`, `cmake/`, `build/lib/`, or `build/cache/` MUST go through `simpler_setup.environment.PROJECT_ROOT` — never `Path(__file__).parent.parent...`.
 
 ## Import rules
 

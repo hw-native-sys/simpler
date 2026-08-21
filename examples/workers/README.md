@@ -38,6 +38,7 @@ workers/
     global_tload_mixed_l3/  # Global CommDomain build + cross-machine peer TLOAD on both ranks
     compute_then_tload_mixed_l3/  # compute round on both L2s, then peer TLOAD through the same domain
     global_tload_mpirun_l3/ # one mpirun launches an L3 rank per machine; MPI descriptor exchange
+    vector_add_mpi_direct_l3/ # L4 joins MPI rank 0 and controls both real L3 ranks through direct P2P
 ```
 
 Why no `tensormap_and_ringbuffer/` layer? Because every example here hard-codes
@@ -66,6 +67,11 @@ parent owns a single `mpirun` that launches an L3 rank on each machine
 (`add_mpirun_worker_group`), so no daemon runs on the peer — see that
 example's README for its extra prerequisites (`mpirun` + `mpi4py` on both
 machines).
+
+`vector_add_mpi_direct_l3` is the direct-MPI alternative: one supervisor
+launches L4 as MPI rank 0 and the two real L3 workers as ranks 1 and 2. It also
+needs `mpirun` and `mpi4py` on both machines, but task/control traffic is P2P
+between L4 and each L3 rather than passing through the PR2 group mailbox.
 
 ### What a new L4 example needs
 

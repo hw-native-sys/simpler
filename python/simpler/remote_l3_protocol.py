@@ -24,13 +24,13 @@ from .buffer import (
     CanonicalIdentity,
     Tensor,
 )
+from .remote_l3_limits import FRAME_HEADER_BYTES, MAX_FRAME_PAYLOAD_BYTES
 from .task_interface import MAX_TENSOR_DIMS, CallConfig, DataType
 
 # 3: a TASK's per-argument record is the self-describing wire ``Tensor`` — the embedded
 # BufferDescriptor plus the strided view. Both ends of a run come from one ``pip install``,
 # so this constant is a mismatch alarm at the frame header, not a dual-decode selector.
 PROTOCOL_VERSION = 3
-MAX_FRAME_PAYLOAD_BYTES = 16 * 1024 * 1024
 MAX_STRING_BYTES = 1024
 MAX_ERROR_BYTES = 4096
 MAX_TENSORS = 4096
@@ -48,8 +48,6 @@ REMOTE_BUFFER_ACCESS_READ = 1 << 0
 REMOTE_BUFFER_ACCESS_WRITE = 1 << 1
 REMOTE_BUFFER_ACCESS_READ_WRITE = REMOTE_BUFFER_ACCESS_READ | REMOTE_BUFFER_ACCESS_WRITE
 CALLABLE_HASH_DIGEST_BYTES = 32
-FRAME_HEADER_BYTES = 40
-
 # FrameHeader.flags bit: the caller addresses every member of the target's
 # worker group, not just the worker named in the header. Only group-capable
 # transports (the MPI mailbox) act on it; point-to-point transports ignore it.

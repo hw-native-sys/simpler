@@ -1133,6 +1133,14 @@ void WorkerManager::stop_workers() {
 
 void WorkerManager::stop() {
     stop_workers();
+    // Stop admission on every endpoint before asking any child to exit.  In
+    // particular, direct-MPI L3 ranks have no out-of-band session owner: their
+    // command loops leave only after this lifecycle SHUTDOWN reaches them.
+    // Notify every lane before destroying any endpoint or its transport.
+    for (auto &wt : next_level_threads_)
+        wt->shutdown_child();
+    for (auto &wt : sub_threads_)
+        wt->shutdown_child();
     next_level_threads_.clear();
     sub_threads_.clear();
 }

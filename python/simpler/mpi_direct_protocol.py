@@ -6,21 +6,16 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Centralized path management.
+"""Fixed MPI tag lanes for the direct-MPI transport."""
 
-PROJECT_ROOT auto-resolves between two layouts:
-  - wheel install: simpler_setup/_assets/{src,cmake,build/lib} populated by CMakeLists install()
-  - source tree / editable: repo root with src/ and build/lib/ in original positions
-"""
+import enum
 
-from pathlib import Path
+MPI_DIRECT_STARTUP_TOKEN_ENV = "SIMPLER_MPI_DIRECT_STARTUP_TOKEN"
+MPI_DIRECT_GATE_MAX_BYTES = 64 * 1024
 
 
-def _resolve_project_root() -> Path:
-    assets = Path(__file__).resolve().parent / "_assets"
-    if (assets / "src").is_dir():
-        return assets
-    return Path(__file__).resolve().parent.parent
-
-
-PROJECT_ROOT = _resolve_project_root()
+class MpiDirectTag(enum.IntEnum):
+    COMMAND_REQUEST = 1
+    COMMAND_REPLY = 2
+    HEALTH = 3
+    LIFECYCLE = 4

@@ -97,6 +97,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     _l3_child_onboard_region_create,
     _mailbox_load_i32,
     _mailbox_store_i32,
+    _MpiDirectTransportHub,
     _read_control_copy_request,
     _set_host_span_level_prefix,
     _worker_host_mapped_region_ack_cleanup_error,
@@ -841,6 +842,22 @@ class MpiL3GroupSpec:
         object.__setattr__(self, "mpirun_path", str(self.mpirun_path))
         object.__setattr__(self, "mpirun_args", tuple(str(arg) for arg in self.mpirun_args))
         object.__setattr__(self, "python_executable", str(self.python_executable))
+
+
+@dataclass(frozen=True)
+class _MpiDirectWorkerSpec:
+    worker_id: int
+    mpi_rank: int
+    session_id: int
+    host: str
+    comm_profile: str
+    platform: str
+    runtime: str
+    device_ids: tuple[int, ...]
+    global_device_ranks: tuple[int, ...]
+    hub: _MpiDirectTransportHub
+    attach_timeout_s: float
+    runtime_timeout_s: float
 
 
 @dataclass(frozen=True)
@@ -1753,6 +1770,8 @@ def _chip_descriptor_context(worker: Worker) -> tuple[str, str]:
         contexts.append((str(spec.platform), str(spec.runtime)))
     for rank in getattr(worker, "_mpi_rank_by_worker_id", {}).values():
         contexts.append((str(rank.spec.platform), str(rank.spec.runtime)))
+    for spec in getattr(worker, "_mpi_direct_worker_specs", []):
+        contexts.append((str(spec.platform), str(spec.runtime)))
     if not contexts:
         return "", ""
     first = contexts[0]
@@ -4384,6 +4403,17 @@ def _forked_child_main(buf: memoryview, label: str, setup, serve, make_group_lea
     os._exit(0)
 
 
+def _close_fork_child_fds(fds) -> None:
+    for raw_fd in fds:
+        try:
+            fd = int(raw_fd)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if fd >= 3:
+            with contextlib.suppress(OSError, OverflowError):
+                os.close(fd)
+
+
 # ---------------------------------------------------------------------------
 # Worker factory
 # ---------------------------------------------------------------------------
@@ -4576,6 +4606,8 @@ class Worker:
         self._mpi_l3_groups: list[_MpiL3GroupRuntime] = []
         self._mpi_worker_ids: list[int] = []
         self._mpi_rank_by_worker_id: dict[int, _MpiL3RankRuntime] = {}
+        self._mpi_direct_worker_specs: list[_MpiDirectWorkerSpec] = []
+        self._mpi_direct_worker_ids: list[int] = []
         self._next_level_worker_id_count: int = 0
         # Fallback ownership for private helpers used outside Worker.submit.
         # Normal orchestration-owned refs live in RunHandle._resources.
@@ -4784,7 +4816,23 @@ class Worker:
             return tuple(rank.worker_id for rank in ranks)
 
     def _remote_like_worker_ids(self) -> set[int]:
-        return set(self._remote_worker_ids) | set(self._mpi_worker_ids)
+        return set(self._remote_worker_ids) | set(self._mpi_worker_ids) | set(self._mpi_direct_worker_ids)
+
+    def _add_mpi_direct_worker(self, spec: _MpiDirectWorkerSpec) -> int:
+        with self._hierarchical_start_cv:
+            if self._lifecycle is not _Lifecycle.NEW:
+                raise RuntimeError("Worker._add_mpi_direct_worker after init")
+            if self.level < 4:
+                raise TypeError("direct MPI L3 workers require a level >= 4 parent")
+            if not isinstance(spec, _MpiDirectWorkerSpec):
+                raise TypeError("Worker._add_mpi_direct_worker expects an MPI direct worker spec")
+            expected_id = self._next_level_worker_id_count
+            if spec.worker_id != expected_id:
+                raise ValueError("MPI direct worker ids must match dense NEXT_LEVEL allocation order")
+            worker_id = self._allocate_next_level_worker_id()
+            self._mpi_direct_worker_specs.append(spec)
+            self._mpi_direct_worker_ids.append(worker_id)
+            return worker_id
 
     @staticmethod
     def _parse_remote_endpoint(endpoint: str) -> tuple[str, int]:
@@ -4924,7 +4972,9 @@ class Worker:
             )
         return entries
 
-    def _inner_registry_entries_for_spec(self, spec: RemoteWorkerSpec | _MpiL3RankSpec) -> list[dict[str, Any]]:
+    def _inner_registry_entries_for_spec(
+        self, spec: RemoteWorkerSpec | _MpiL3RankSpec | _MpiDirectWorkerSpec
+    ) -> list[dict[str, Any]]:
         from .remote_l3_protocol import (  # noqa: PLC0415
             ChipCallableBlobLocation,
             RemoteChipCallablePayload,
@@ -5002,6 +5052,17 @@ class Worker:
                     rank.spec.platform,
                     rank.spec.comm_profile,
                     tuple(rank.spec.global_device_ranks),
+                    True,
+                )
+            )
+        for spec in self._mpi_direct_worker_specs:
+            configs.append(
+                (
+                    int(spec.worker_id),
+                    tuple(spec.device_ids),
+                    spec.platform,
+                    spec.comm_profile,
+                    tuple(spec.global_device_ranks),
                     True,
                 )
             )
@@ -5390,6 +5451,78 @@ class Worker:
             group.monitor_thread.start()
         if time.monotonic() >= deadline:
             raise RuntimeError("MPI L3 activation: startup deadline exceeded after attach")
+
+    def _activate_mpi_direct_workers(self, deadline: float) -> None:
+        if not self._mpi_direct_worker_specs:
+            return
+        assert self._worker is not None
+        session_timeout = self._remote_session_timeout_s()
+        for spec in self._mpi_direct_worker_specs:
+            remaining = self._remaining_until(deadline, "direct MPI L3 endpoint attach")
+            self._worker.add_remote_l3_mpi(
+                spec.worker_id,
+                spec.session_id,
+                spec.comm_profile,
+                spec.hub,
+                remaining,
+                min(session_timeout, spec.runtime_timeout_s),
+            )
+
+    def _publish_initial_mpi_direct_callables(self) -> None:
+        if not self._mpi_direct_worker_specs:
+            return
+        assert self._worker is not None
+        direct_worker_ids = {spec.worker_id for spec in self._mpi_direct_worker_specs}
+        with self._registry_lock:
+            states = tuple(self._identity_registry.values())
+        for state in states:
+            if state.target_namespace == "REMOTE_TASK_DISPATCHER":
+                targets = tuple(worker_id for worker_id in state.eligible_worker_ids if worker_id in direct_worker_ids)
+                if not targets:
+                    continue
+                registration = _build_callable_registration(self, state.target, workers=list(state.eligible_worker_ids))
+                target_registry = "REMOTE_TASK_DISPATCHER"
+                callable_kind = registration.kind
+                payloads = {worker_id: registration.payload or b"" for worker_id in targets}
+            elif state.target_namespace == "LOCAL_CHIP":
+                targets = tuple(spec.worker_id for spec in self._mpi_direct_worker_specs)
+                target_registry = "INNER_L3_WORKER"
+                callable_kind = "CHIP_CALLABLE"
+                payloads = {}
+                for spec in self._mpi_direct_worker_specs:
+                    entries = self._inner_registry_entries_for_spec(spec)
+                    entry = next((item for item in entries if item["hashid"] == state.digest.hex()), None)
+                    if entry is None:
+                        raise RuntimeError(f"direct MPI inner chip hashid {state.hashid} was not serialised")
+                    payloads[spec.worker_id] = bytes.fromhex(str(entry["payload_hex"]))
+            else:
+                continue
+            prepared: list[int] = []
+            committed: list[int] = []
+            try:
+                for worker_id in targets:
+                    result = self._worker.remote_prepare_register(
+                        worker_id, target_registry, callable_kind, payloads[worker_id], state.digest
+                    )
+                    if not result.ok:
+                        raise RuntimeError(result.error_message)
+                    prepared.append(worker_id)
+                for worker_id in targets:
+                    result = self._worker.remote_commit_register(
+                        worker_id, target_registry, callable_kind, state.digest
+                    )
+                    if not result.ok:
+                        raise RuntimeError(result.error_message)
+                    committed.append(worker_id)
+            except BaseException:
+                uncommitted = [worker_id for worker_id in prepared if worker_id not in committed]
+                for worker_id in uncommitted:
+                    with contextlib.suppress(BaseException):
+                        self._worker.remote_abort_register(worker_id, target_registry, callable_kind, state.digest)
+                for worker_id in committed:
+                    with contextlib.suppress(BaseException):
+                        self._worker.remote_unregister(worker_id, target_registry, callable_kind, state.digest)
+                raise
 
     def _require_remote_worker_started(self, worker_id: int) -> None:
         """Argument + resource gate for the public remote-memory APIs. Admission
@@ -6396,6 +6529,11 @@ class Worker:
             mpi_path = _format_worker_path(3, parent_path=path, index=int(child_index))
             entries.append(_EndpointTopologyEntry(mpi_path, HOST_CPU, mpi_node_identity))
             self._append_device_endpoint_topology(entries, mpi_path, rank.spec.device_ids, mpi_node_identity)
+        for spec in worker._mpi_direct_worker_specs:
+            mpi_node_identity = _normalize_node_identity(spec.host)
+            mpi_path = _format_worker_path(3, parent_path=path, index=int(spec.worker_id))
+            entries.append(_EndpointTopologyEntry(mpi_path, HOST_CPU, mpi_node_identity))
+            self._append_device_endpoint_topology(entries, mpi_path, spec.device_ids, mpi_node_identity)
 
     def _append_device_endpoint_topology(
         self,
@@ -6497,7 +6635,7 @@ class Worker:
             raise TypeError("Worker.register: level 2 only supports ChipCallable targets")
         reg = _build_callable_registration(self, target, workers=workers)
         if isinstance(target, RemoteCallable):
-            if not self._remote_worker_specs and not self._mpi_l3_groups:
+            if not self._remote_worker_specs and not self._mpi_l3_groups and not self._mpi_direct_worker_specs:
                 raise RuntimeError("Worker.register(RemoteCallable): add at least one remote worker first")
             remote_worker_ids = self._remote_like_worker_ids()
             for worker_id in reg.eligible_worker_ids:
@@ -7441,6 +7579,8 @@ class Worker:
                     return True
                 if any(rank.spec.device_ids for rank in worker._mpi_rank_by_worker_id.values()):
                     return True
+                if any(spec.device_ids for spec in worker._mpi_direct_worker_specs):
+                    return True
                 return any(has_chip_target(child) for child in worker._next_level_workers)
 
             return None if has_chip_target(self) else "a chip device (device_ids)"
@@ -7638,7 +7778,7 @@ class Worker:
         # startup resource (mailbox shm, pre-fork _Worker mmap, child fork,
         # daemon socket) exists, so an invalid value fails without a
         # partially-built subtree to roll back.
-        if self._remote_worker_specs or self._mpi_l3_groups:
+        if self._remote_worker_specs or self._mpi_l3_groups or self._mpi_direct_worker_specs:
             self._remote_session_timeout_s()
 
         # 1. Allocate sub-worker mailboxes (unified layout, MAILBOX_SIZE each).
@@ -7823,6 +7963,7 @@ class Worker:
             if pid == 0:
                 buf = self._sub_shms[i].buf
                 assert buf is not None
+                _close_fork_child_fds(self._config.get("fork_child_close_fds", ()))
 
                 def _setup():
                     return _make_local_identity_tables(
@@ -7860,6 +8001,7 @@ class Worker:
                     if self._is_startup_root:
                         with contextlib.suppress(OSError):
                             os.setpgid(0, 0)
+                    _close_fork_child_fds(self._config.get("fork_child_close_fds", ()))
                     # _chip_process_loop publishes INIT_READY/INIT_FAILED itself
                     # (around cw.init + ChipCallable prepare). This guard only
                     # ensures the child exits rather than unwinding into the
@@ -7931,6 +8073,7 @@ class Worker:
             if pid == 0:
                 buf = self._next_level_shms[idx].buf
                 assert buf is not None
+                _close_fork_child_fds(self._config.get("fork_child_close_fds", ()))
 
                 def _setup(inner=inner_worker):
                     # Propagate the fork-constant prewarm sizing and the shared
@@ -7981,6 +8124,7 @@ class Worker:
         # the RemoteL3Endpoint health thread, so both must follow every local
         # fork. Each remote consumes this process's remaining startup budget.
         self._activate_mpirun_worker_groups(deadline)
+        self._activate_mpi_direct_workers(deadline)
         self._activate_remote_sessions(deadline)
 
         # _Worker was constructed in _init_hierarchical (pre-fork) so children
@@ -8017,6 +8161,8 @@ class Worker:
         dw.init()
 
         self._orch = Orchestrator(dw.get_orchestrator(), self)
+
+        self._publish_initial_mpi_direct_callables()
 
         # Every ChipCallable in the startup snapshot was already uploaded by its
         # chip child before that child published INIT_READY (see

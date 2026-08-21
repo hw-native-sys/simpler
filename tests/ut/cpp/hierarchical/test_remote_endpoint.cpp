@@ -317,9 +317,14 @@ public:
     remote_l3::ControlName last_control_name{remote_l3::ControlName::PREPARE_CALLABLE};
     remote_l3::RemoteRegistryTarget last_target_registry{remote_l3::RemoteRegistryTarget::REMOTE_TASK_DISPATCHER};
     CallableKind last_callable_kind{CallableKind::PYTHON_IMPORT};
+    int shutdown_calls{0};
 
-    void submit_frame(const std::vector<uint8_t> &frame) override { last_frame = frame; }
+    void submit_frame(const std::vector<uint8_t> &frame) override {
+        if (shutdown_calls != 0) throw std::runtime_error("FakeRemoteTransport: submit after shutdown");
+        last_frame = frame;
+    }
     void submit_progress_frame(const std::vector<uint8_t> &frame) override { submit_frame(frame); }
+    void shutdown() override { ++shutdown_calls; }
 
     bool poll_progress_reply(remote_l3::FrameType frame_type, uint64_t sequence, std::vector<uint8_t> &reply) override {
         if (progress_polls_before_ready > 0) {
@@ -481,6 +486,19 @@ TEST(RemoteEndpoint, ProgressStopReleasesWaitingControl) {
     ASSERT_EQ(control.wait_for(std::chrono::milliseconds(500)), std::future_status::ready);
     EXPECT_THROW(control.get(), std::runtime_error);
     ring.shutdown();
+}
+
+TEST(RemoteEndpoint, IdleProgressStopDefersTransportShutdownUntilLifecycleFrame) {
+    auto *transport = new FakeRemoteTransport();
+    RemoteL3Endpoint endpoint(3, 99, "fake", std::unique_ptr<RemoteL3Transport>(transport));
+
+    endpoint.request_progress_stop();
+    EXPECT_EQ(transport->shutdown_calls, 0);
+
+    endpoint.shutdown_child();
+    ASSERT_FALSE(transport->last_frame.empty());
+    EXPECT_EQ(remote_l3::decode_frame(transport->last_frame).header.frame_type, remote_l3::FrameType::SHUTDOWN);
+    EXPECT_EQ(transport->shutdown_calls, 1);
 }
 
 TEST(RemoteEndpoint, RemoteTaskErrorMapsToTaskFailure) {

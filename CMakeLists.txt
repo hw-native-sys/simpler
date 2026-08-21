@@ -67,6 +67,8 @@ add_custom_target(build_package_sim
 if(SKBUILD_MODE)
     install(DIRECTORY ${CMAKE_SOURCE_DIR}/src/
             DESTINATION simpler_setup/_assets/src)
+    install(DIRECTORY ${CMAKE_SOURCE_DIR}/cmake/
+            DESTINATION simpler_setup/_assets/cmake)
     install(DIRECTORY ${CMAKE_SOURCE_DIR}/build/lib/
             DESTINATION simpler_setup/_assets/build/lib
             OPTIONAL

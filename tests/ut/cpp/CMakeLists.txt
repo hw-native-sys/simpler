@@ -209,6 +209,7 @@ add_library(hierarchical_objs OBJECT
     ${HIERARCHICAL_SRC_DIR}/scope.cpp
     ${HIERARCHICAL_SRC_DIR}/remote_wire.cpp
     ${HIERARCHICAL_SRC_DIR}/remote_endpoint.cpp
+    ${HIERARCHICAL_SRC_DIR}/mpi_direct_transport.cpp
     ${HIERARCHICAL_SRC_DIR}/orchestrator.cpp
     ${HIERARCHICAL_SRC_DIR}/worker_manager.cpp
     ${HIERARCHICAL_SRC_DIR}/scheduler.cpp
@@ -410,6 +411,7 @@ add_hierarchical_test(test_scheduler hierarchical/test_scheduler.cpp CUSTOM_HOST
 add_hierarchical_test(test_chip_run_lane hierarchical/test_chip_run_lane.cpp)
 add_hierarchical_test(test_remote_wire hierarchical/test_remote_wire.cpp)
 add_hierarchical_test(test_remote_endpoint hierarchical/test_remote_endpoint.cpp)
+add_hierarchical_test(test_mpi_direct_transport hierarchical/test_mpi_direct_transport.cpp)
 add_hierarchical_test(test_pipeline_contract hierarchical/test_pipeline_contract.cpp)
 
 # Run-stream pair state machine: publication-aware AICore stream reuse,

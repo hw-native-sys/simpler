@@ -91,6 +91,10 @@ public:
         const std::vector<int32_t> &worker_ids, const std::vector<uint64_t> &session_ids, void *mailbox,
         size_t mailbox_bytes, int mpirun_pid, double runtime_timeout_s
     );
+    void add_remote_l3_mpi(
+        int32_t worker_id, uint64_t session_id, const std::string &transport_name,
+        const std::shared_ptr<class MpiDirectTransportHub> &hub, double attach_timeout_s, double runtime_timeout_s
+    );
 
     // Start the scheduler thread. Must be called AFTER the parent has forked
     // any child workers — init() spins up threads in the parent that would
