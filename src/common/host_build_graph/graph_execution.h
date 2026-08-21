@@ -51,9 +51,9 @@ struct GraphTensor {
     uint8_t reserved[3];
 };
 
-// Everything from GraphTensorSourceRef through GraphSubmission is copied
-// across the host-device boundary. Keep it pointer-free, fixed-width and
-// position-independent: every reference is an offset from its owning header.
+// Definition records are copied across the host-device boundary. Keep them
+// pointer-free, fixed-width and position-independent: every reference is an
+// offset from its owning header.
 struct GraphTensorSourceRef {
     uint8_t source;
     uint8_t reserved;
@@ -159,12 +159,9 @@ struct GraphDefinition {
     uint32_t tensor_arg_count;
     uint32_t scalar_arg_count;
     uint32_t predicate_count;
-    // Bytes an execution of this Definition needs for its GraphExecution header,
-    // node storage and patch arrays. Derived from task_count / tensor_arg_count /
-    // scalar_arg_count, so host and device read one value instead of each
-    // computing it. The outer GRAPH task's heap allocation covers
-    // required_heap + this, and the execution lives at
-    // packed_buffer_base + required_heap.
+    // Bytes the GraphExecution header, node array and node argument pools need in
+    // the outer GRAPH task's heap tail. Invocation boundaries live in the outer
+    // task payload's compact argument-pool regions instead.
     uint32_t execution_storage_bytes;
     uint32_t off_fanout_offsets;
     uint32_t off_fanout_indices;
@@ -181,27 +178,6 @@ struct GraphDefinition {
     uint32_t off_predicates;
 };
 
-// One submission of a Graph. The static Definition is a shared device object
-// this references by address; the execution storage is not referenced at all —
-// it sits at outer_slot.task->packed_buffer_base + definition->required_heap,
-// so both sides derive it from the Definition rather than carrying it on the
-// wire.
-struct GraphSubmission {
-    uint64_t graph_key;
-    uint64_t local_execution;
-    // Device GM address of the shared Definition object this replay references
-    // (an integer-typed absolute address per the wire rules) plus the content
-    // hash the host computed for it.
-    uint64_t definition_addr;
-    uint64_t definition_hash;
-    uint32_t activation_gate;
-    uint32_t total_bytes;
-    uint32_t tensors_offset;
-    uint32_t tensor_count;
-    uint32_t scalars_offset;
-    uint32_t scalar_count;
-};
-
 static_assert(std::is_trivially_copyable_v<GraphTensorSourceRef>);
 static_assert(std::is_standard_layout_v<GraphTensorSourceRef>);
 static_assert(std::is_trivially_copyable_v<GraphTensor>);
@@ -216,8 +192,6 @@ static_assert(std::is_trivially_copyable_v<GraphBoundarySignature>);
 static_assert(std::is_standard_layout_v<GraphBoundarySignature>);
 static_assert(std::is_trivially_copyable_v<GraphDefinition>);
 static_assert(std::is_standard_layout_v<GraphDefinition>);
-static_assert(std::is_trivially_copyable_v<GraphSubmission>);
-static_assert(std::is_standard_layout_v<GraphSubmission>);
 
 inline GraphTensor graph_tensor_pack(const ChipTensor &tensor) {
     GraphTensor packed{};
@@ -297,37 +271,6 @@ inline const T *graph_definition_ptr(const GraphDefinition &definition, uint32_t
     return graph_definition_array<T>(definition, offset, 1);
 }
 
-inline GraphSubmission *graph_submission_from_slot(PTO2TaskSlotState &slot) {
-    return slot.task_kind == TaskKind::GRAPH ? static_cast<GraphSubmission *>(slot.graph_context) : nullptr;
-}
-
-inline bool graph_submission_wire_size_valid(const GraphSubmission &submission, size_t available_bytes) {
-    return available_bytes >= sizeof(GraphSubmission) && submission.total_bytes == available_bytes;
-}
-
-inline const GraphTensor *graph_submission_tensors(const GraphSubmission &submission) {
-    if (submission.tensors_offset == 0 || submission.tensors_offset % alignof(GraphTensor) != 0 ||
-        submission.tensors_offset > submission.total_bytes ||
-        submission.tensor_count > (submission.total_bytes - submission.tensors_offset) / sizeof(GraphTensor)) {
-        return nullptr;
-    }
-    return reinterpret_cast<const GraphTensor *>(
-        reinterpret_cast<const uint8_t *>(&submission) + submission.tensors_offset
-    );
-}
-
-inline const uint64_t *graph_submission_scalars(const GraphSubmission &submission) {
-    if (submission.scalar_count == 0) return nullptr;
-    if (submission.scalars_offset == 0 || submission.scalars_offset % alignof(uint64_t) != 0 ||
-        submission.scalars_offset > submission.total_bytes ||
-        submission.scalar_count > (submission.total_bytes - submission.scalars_offset) / sizeof(uint64_t)) {
-        return nullptr;
-    }
-    return reinterpret_cast<const uint64_t *>(
-        reinterpret_cast<const uint8_t *>(&submission) + submission.scalars_offset
-    );
-}
-
 enum class GraphExecutionState : uint8_t {
     SUBMITTED = 0,
     MATERIALIZING = 1,
@@ -346,18 +289,17 @@ enum class GraphMaterializeResult : uint8_t {
 struct alignas(64) GraphNodeStorage {
     PTO2TaskDescriptor task;
     PTO2TaskSlotState slot;
-    // Last on purpose, and it must stay last: the payload's own tensor array is its
-    // final field, so a node reads only a prefix of this struct, and the execution
-    // storage can be strided by the widest node in the graph instead of by the type.
-    // The slot reaches it by a delta from the slot's own address, so the order is
-    // free.
     PTO2TaskPayload payload;
 };
 
-inline constexpr uint64_t GRAPH_EXECUTION_INITIALIZING = 1;
+inline constexpr uint8_t GRAPH_EXECUTION_STATE_MASK = 0x7;
+inline constexpr uint8_t GRAPH_EXECUTION_EXTERNAL_READY = 0x8;
 
 struct GraphExecution {
-    std::atomic<GraphExecutionState> state{GraphExecutionState::SUBMITTED};
+    // The low bits hold GraphExecutionState. EXTERNAL_READY shares this byte so
+    // dependency readiness can arrive before materialization without a separate
+    // per-submission gate object.
+    std::atomic<uint8_t> state{static_cast<uint8_t>(GraphExecutionState::SUBMITTED)};
     std::atomic<uint8_t> materialize_busy{0};
     std::atomic<int32_t> remaining_nodes{0};
     std::atomic<int32_t> retired_nodes{0};
@@ -392,19 +334,25 @@ struct GraphExecution {
 };
 
 static_assert(std::is_trivially_destructible_v<GraphNodeStorage>);
-// The tensor pool starts right after the node array, so the node stride has to carry
-// ChipTensor's alignment; the scalar pool then starts after a whole number of
-// ChipTensors. Neither holds by construction — both are properties of the two types.
+// The tensor pool starts right after the node array, and the scalar pool starts
+// after a whole number of ChipTensors.
 static_assert(
     alignof(GraphNodeStorage) % alignof(ChipTensor) == 0,
     "a node entry must be at least ChipTensor-aligned: the tensor pool follows the node array"
 );
 static_assert(sizeof(ChipTensor) % alignof(uint64_t) == 0, "the tensor stride must keep the scalar pool aligned");
 static_assert(std::is_trivially_destructible_v<GraphExecution>);
+static_assert(std::is_trivially_copyable_v<GraphExecution>);
+static_assert(sizeof(GraphTensor) <= sizeof(ChipTensor));
 
-// The execution occupies
+inline size_t graph_boundary_tensor_pool_slots(uint32_t tensor_count) {
+    const size_t bytes = static_cast<size_t>(tensor_count) * sizeof(GraphTensor);
+    return (bytes + sizeof(ChipTensor) - 1) / sizeof(ChipTensor);
+}
+
+// The outer GRAPH task's heap tail occupies
 // [GraphExecution][GraphNodeStorage x node_count][ChipTensor x tensor_arg_count]
-// [uint64_t x scalar_arg_count] at the tail of the outer GRAPH task's heap allocation.
+// [uint64_t x scalar_arg_count].
 //
 // The last two regions are the node payloads' argument pools, indexed by the
 // Definition's own tensor_offset / scalar_offset — which is why the Definition's
@@ -454,30 +402,60 @@ inline GraphExecution *graph_execution_from_slot(PTO2TaskSlotState &slot) {
     return slot.task_kind == TaskKind::GRAPH_NODE ? static_cast<GraphExecution *>(slot.graph_context) : nullptr;
 }
 
+inline GraphExecution *graph_execution_from_outer_slot(PTO2TaskSlotState &slot) {
+    return slot.task_kind == TaskKind::GRAPH ? static_cast<GraphExecution *>(slot.graph_context) : nullptr;
+}
+
+inline GraphExecutionState
+graph_execution_state(const GraphExecution &execution, std::memory_order order = std::memory_order_acquire) {
+    return static_cast<GraphExecutionState>(execution.state.load(order) & GRAPH_EXECUTION_STATE_MASK);
+}
+
+inline bool
+graph_execution_external_ready(const GraphExecution &execution, std::memory_order order = std::memory_order_acquire) {
+    return (execution.state.load(order) & GRAPH_EXECUTION_EXTERNAL_READY) != 0;
+}
+
+inline void graph_execution_set_state(
+    GraphExecution &execution, GraphExecutionState next, std::memory_order order = std::memory_order_release
+) {
+    uint8_t observed = execution.state.load(std::memory_order_relaxed);
+    const uint8_t next_state = static_cast<uint8_t>(next);
+    while (!execution.state.compare_exchange_weak(
+        observed, static_cast<uint8_t>((observed & ~GRAPH_EXECUTION_STATE_MASK) | next_state), order,
+        std::memory_order_relaxed
+    )) {}
+}
+
+inline bool graph_execution_transition(
+    GraphExecution &execution, GraphExecutionState expected_state, GraphExecutionState next_state
+) {
+    uint8_t observed = execution.state.load(std::memory_order_acquire);
+    while ((observed & GRAPH_EXECUTION_STATE_MASK) == static_cast<uint8_t>(expected_state)) {
+        const uint8_t desired =
+            static_cast<uint8_t>((observed & ~GRAPH_EXECUTION_STATE_MASK) | static_cast<uint8_t>(next_state));
+        if (execution.state.compare_exchange_weak(
+                observed, desired, std::memory_order_acq_rel, std::memory_order_acquire
+            )) {
+            return true;
+        }
+    }
+    return false;
+}
+
+inline bool graph_execution_signal_external_ready(GraphExecution &execution) {
+    return (execution.state.fetch_or(GRAPH_EXECUTION_EXTERNAL_READY, std::memory_order_acq_rel) &
+            GRAPH_EXECUTION_EXTERNAL_READY) == 0;
+}
+
 inline bool graph_execution_complete_node(GraphExecution &execution) {
     return execution.remaining_nodes.fetch_sub(1, std::memory_order_acq_rel) == 1;
 }
 
 inline void graph_execution_mark_completed(GraphExecution &execution) {
-    execution.state.store(GraphExecutionState::COMPLETED, std::memory_order_release);
+    graph_execution_set_state(execution, GraphExecutionState::COMPLETED);
 }
 
 inline void graph_execution_retire_node(GraphExecution &execution) {
     execution.retired_nodes.fetch_add(1, std::memory_order_release);
-}
-
-inline bool graph_submission_signal(GraphSubmission &submission, uint32_t bit) {
-    constexpr uint32_t BOTH = 0x3;
-    uint32_t observed = __atomic_fetch_or(&submission.activation_gate, bit, __ATOMIC_ACQ_REL);
-    return observed != BOTH && (observed | bit) == BOTH;
-}
-
-inline GraphExecution *graph_submission_local_execution(GraphSubmission &submission) {
-    uint64_t raw = __atomic_load_n(&submission.local_execution, __ATOMIC_ACQUIRE);
-    if (raw <= GRAPH_EXECUTION_INITIALIZING) return nullptr;
-    return reinterpret_cast<GraphExecution *>(static_cast<uintptr_t>(raw));
-}
-
-inline bool graph_submission_execution_initializing(const GraphSubmission &submission) {
-    return __atomic_load_n(&submission.local_execution, __ATOMIC_ACQUIRE) == GRAPH_EXECUTION_INITIALIZING;
 }

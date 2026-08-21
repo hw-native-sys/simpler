@@ -411,7 +411,8 @@ struct GraphRecording {
 
 struct GraphPendingUpload {
     PTO2TaskSlotState *outer_slot{nullptr};
-    std::vector<std::byte> image;
+    uint64_t full_key{0};
+    uint64_t definition_hash{0};
     bool deferred_heap{false};
 };
 
@@ -920,8 +921,8 @@ size_t graph_host_upload_count(const GraphHostState &state) { return state.pendi
 std::optional<GraphHostUpload> graph_host_upload(GraphHostState &state, size_t index) {
     if (index >= state.pending_uploads.size()) return std::nullopt;
     GraphPendingUpload &upload = state.pending_uploads[index];
-    if (upload.outer_slot == nullptr || upload.image.empty()) return std::nullopt;
-    return GraphHostUpload{upload.outer_slot, upload.image.data(), upload.image.size()};
+    if (upload.outer_slot == nullptr) return std::nullopt;
+    return GraphHostUpload{upload.outer_slot, upload.full_key, upload.definition_hash};
 }
 
 GraphHostDefinitionList graph_host_definitions(GraphHostState &state) {
@@ -1631,45 +1632,6 @@ void graph_reset_outer_payload(PTO2TaskPayload &payload) {
     payload.early_sync_drain_state.store(PTO2_EARLY_SYNC_DRAIN_NONE, std::memory_order_relaxed);
 }
 
-bool graph_prepare_submission_image(
-    uint64_t full_key, const GraphTaskArgs &args, std::vector<std::byte> *submission_image
-) {
-    if (submission_image == nullptr) return false;
-    const size_t tensors_offset = PTO2_ALIGN_UP(sizeof(GraphSubmission), alignof(GraphTensor));
-    const size_t tensor_bytes = static_cast<size_t>(args.tensor_count()) * sizeof(GraphTensor);
-    if (tensors_offset > UINT32_MAX || tensors_offset > UINT32_MAX - tensor_bytes) {
-        return false;
-    }
-    const size_t tensors_end = tensors_offset + tensor_bytes;
-    const size_t scalar_bytes = static_cast<size_t>(args.scalar_count()) * sizeof(uint64_t);
-    const size_t scalars_offset = args.scalar_count() == 0 ? 0 : PTO2_ALIGN_UP(tensors_end, alignof(uint64_t));
-    const size_t total_bytes = args.scalar_count() == 0 ? tensors_end : scalars_offset + scalar_bytes;
-    if ((args.scalar_count() != 0 && (scalars_offset > UINT32_MAX || scalars_offset > UINT32_MAX - scalar_bytes)) ||
-        total_bytes > UINT32_MAX) {
-        return false;
-    }
-    submission_image->assign(total_bytes, std::byte{0});
-    auto *tensors = reinterpret_cast<GraphTensor *>(submission_image->data() + tensors_offset);
-    for (int32_t i = 0; i < args.tensor_count(); ++i)
-        tensors[i] = graph_tensor_pack(args.tensor(i).ref());
-    if (args.scalar_count() != 0) {
-        std::memcpy(
-            submission_image->data() + scalars_offset, args.scalar_data(),
-            static_cast<size_t>(args.scalar_count()) * sizeof(uint64_t)
-        );
-    }
-
-    GraphSubmission submission{};
-    submission.graph_key = full_key;
-    submission.total_bytes = static_cast<uint32_t>(submission_image->size());
-    submission.tensors_offset = static_cast<uint32_t>(tensors_offset);
-    submission.tensor_count = static_cast<uint32_t>(args.tensor_count());
-    submission.scalars_offset = static_cast<uint32_t>(scalars_offset);
-    submission.scalar_count = static_cast<uint32_t>(args.scalar_count());
-    std::memcpy(submission_image->data(), &submission, sizeof(submission));
-    return true;
-}
-
 bool graph_submit_outer(
     PTO2OrchestratorState *orch, GraphHostState *state, uint64_t full_key, uint64_t definition_hash, int32_t owned_heap,
     bool defer_heap, const GraphTaskArgs &args, PTO2TaskId *submitted_id
@@ -1683,8 +1645,8 @@ bool graph_submit_outer(
     }
 
     GraphPendingUpload pending;
-    if (!graph_prepare_submission_image(full_key, args, &pending.image)) return false;
-    reinterpret_cast<GraphSubmission *>(pending.image.data())->definition_hash = definition_hash;
+    pending.full_key = full_key;
+    pending.definition_hash = definition_hash;
     pending.deferred_heap = defer_heap;
 
     DepInputs boundary_inputs{
@@ -1712,10 +1674,21 @@ bool graph_submit_outer(
     ring.completion_flags[allocation.slot].store(0, std::memory_order_relaxed);
 
     slot.bind_buffers(&payload, &task);
-    // An outer GRAPH task holds a real ring slot, so its fanin comes from the pool like
-    // any other task's. It has no tensor or scalar region: its boundary travels inside
-    // the submission image, and graph_reset_outer_payload zeroes both counts below.
-    payload.bind_regions(nullptr, nullptr, orch->fanin_pool + orch->fanin_pool_cursor);
+    // Graph boundaries use the same compact argument pools as ordinary tasks. The
+    // outer payload carries the invocation data; graph_context only names the
+    // shared Definition until device initialization replaces it with GraphExecution.
+    const uint64_t window = ring.task_window_size;
+    const int32_t tensor_slots =
+        static_cast<int32_t>(graph_boundary_tensor_pool_slots(static_cast<uint32_t>(args.tensor_count())));
+    const int32_t scalar_span = PTO2_ALIGN_UP(args.scalar_count(), ARG_POOL_ALIGN / (int32_t)sizeof(uint64_t));
+    debug_assert(static_cast<uint64_t>(orch->tensor_pool_cursor) + tensor_slots <= window * MAX_TENSOR_ARGS);
+    debug_assert(static_cast<uint64_t>(orch->scalar_pool_cursor) + scalar_span <= window * MAX_SCALAR_ARGS);
+    payload.bind_regions(
+        orch->tensor_pool + orch->tensor_pool_cursor, orch->scalar_pool + orch->scalar_pool_cursor,
+        orch->fanin_pool + orch->fanin_pool_cursor
+    );
+    orch->tensor_pool_cursor += tensor_slots;
+    orch->scalar_pool_cursor += scalar_span;
     slot.task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
     slot.last_consumer_local_id = static_cast<int32_t>(task_id.local());
     slot.active_mask = ActiveMask{};
@@ -1730,6 +1703,17 @@ bool graph_submit_outer(
     task.packed_buffer_base = allocation.packed_base;
     task.packed_buffer_end = allocation.packed_end;
     graph_reset_outer_payload(payload);
+    payload.tensor_count = args.tensor_count();
+    payload.scalar_count = args.scalar_count();
+    auto *boundary_tensors = reinterpret_cast<GraphTensor *>(payload.tensor_data());
+    for (int32_t i = 0; i < args.tensor_count(); ++i)
+        new (&boundary_tensors[i]) GraphTensor{graph_tensor_pack(args.tensor(i).ref())};
+    if (args.scalar_count() != 0) {
+        std::memcpy(
+            payload.scalar_data(), args.scalar_data(),
+            PTO2_ALIGN_UP(static_cast<size_t>(args.scalar_count()) * sizeof(uint64_t), ARG_POOL_ALIGN)
+        );
+    }
 
     PTO2FaninBuilder fanin_builder(orch, &payload, static_cast<int32_t>(task_id.local()), next_fanin_seen_epoch(orch));
     auto emit = [&](PTO2TaskId producer_id) -> bool {
@@ -1773,7 +1757,7 @@ bool graph_submit_outer(
     orch->fanin_pool_cursor += PTO2_ALIGN_UP(fanin_builder.count, ARG_POOL_ALIGN / (int32_t)sizeof(int32_t));
 
     pending.outer_slot = &slot;
-    state->pending_uploads.push_back(std::move(pending));
+    state->pending_uploads.push_back(pending);
     if (submitted_id != nullptr) *submitted_id = task_id;
 #if SIMPLER_DFX
     orch->tasks_submitted++;
@@ -1809,22 +1793,19 @@ bool graph_submit_pending_definition(
 bool graph_finalize_pending_submissions(PTO2OrchestratorState *orch, GraphHostState *state, uint64_t *failed_key) {
     for (GraphPendingUpload &pending : state->pending_uploads) {
         if (!pending.deferred_heap) continue;
-        if (pending.image.size() < sizeof(GraphSubmission)) return false;
-        auto *submission = reinterpret_cast<GraphSubmission *>(pending.image.data());
-        auto definition_it = state->definitions.find(submission->graph_key);
+        auto definition_it = state->definitions.find(pending.full_key);
         const GraphDefinition *definition =
             definition_it == state->definitions.end() ? nullptr : graph_definition(definition_it->second);
         if (definition == nullptr || definition->execution_storage_bytes == 0 ||
             definition->required_heap > UINT64_MAX - definition->execution_storage_bytes ||
             pending.outer_slot == nullptr || pending.outer_slot->task == nullptr ||
-            pending.outer_slot->task_kind != TaskKind::GRAPH ||
-            !graph_submission_wire_size_valid(*submission, pending.image.size())) {
-            if (failed_key != nullptr) *failed_key = submission->graph_key;
+            pending.outer_slot->task_kind != TaskKind::GRAPH) {
+            if (failed_key != nullptr) *failed_key = pending.full_key;
             return false;
         }
         const uint64_t owned_heap = definition->required_heap + definition->execution_storage_bytes;
         if (owned_heap > static_cast<uint64_t>(INT32_MAX)) {
-            if (failed_key != nullptr) *failed_key = submission->graph_key;
+            if (failed_key != nullptr) *failed_key = pending.full_key;
             return false;
         }
         void *packed_base = nullptr;
@@ -1832,12 +1813,12 @@ bool graph_finalize_pending_submissions(PTO2OrchestratorState *orch, GraphHostSt
         if (!orch->ring.task_allocator.reserve_deferred_heap(
                 static_cast<int32_t>(owned_heap), &packed_base, &packed_end
             )) {
-            if (failed_key != nullptr) *failed_key = submission->graph_key;
+            if (failed_key != nullptr) *failed_key = pending.full_key;
             return false;
         }
         pending.outer_slot->task->packed_buffer_base = packed_base;
         pending.outer_slot->task->packed_buffer_end = packed_end;
-        submission->definition_hash = definition->content_hash;
+        pending.definition_hash = definition->content_hash;
         pending.deferred_heap = false;
     }
     return true;

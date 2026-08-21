@@ -15,6 +15,14 @@ dominant costs outside pure orchestration:
 Both trace to one design choice: the Definition travels *inside* every
 submission image.
 
+The follow-up Graph execution layout now removes the per-occurrence
+`GraphSubmission` object entirely. Boundary values use the outer task's existing
+compact payload pools, while `GraphExecution` and node storage are initialized
+in the outer Graph task's heap tail on device. The outer slot's existing
+`graph_context` points first to the shared Definition and then to the localized
+execution. The measurements below describe the earlier shared-Definition step
+and remain its historical baseline.
+
 ## Change
 
 `254f924e` (measured by `4d434174`/`b8095e39`, enabled by `f868ac52`):

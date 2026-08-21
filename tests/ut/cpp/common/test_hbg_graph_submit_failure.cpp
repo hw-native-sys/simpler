@@ -76,7 +76,7 @@ protected:
     }
 };
 
-TEST_F(HbgGraphSubmitFailureTest, InFlightGraphSubmissionsReserveHeapOnlyAtCommit) {
+TEST_F(HbgGraphSubmitFailureTest, InFlightGraphInvocationsReserveHeapOnlyAtCommit) {
     std::array<uint32_t, 16> storage{};
     uint32_t shape[] = {static_cast<uint32_t>(storage.size())};
     ChipTensor boundary = make_tensor_external(storage.data(), shape, 1);
@@ -111,10 +111,8 @@ TEST_F(HbgGraphSubmitFailureTest, InFlightGraphSubmissionsReserveHeapOnlyAtCommi
     const std::optional<GraphHostUpload> second_upload = graph_host_upload(*graph_state, 1);
     ASSERT_TRUE(first_upload.has_value());
     ASSERT_TRUE(second_upload.has_value());
-    const auto *first_submission = reinterpret_cast<const GraphSubmission *>(first_upload->data);
-    const auto *second_submission = reinterpret_cast<const GraphSubmission *>(second_upload->data);
-    EXPECT_NE(first_submission->definition_hash, 0u);
-    EXPECT_EQ(second_submission->definition_hash, first_submission->definition_hash);
+    EXPECT_NE(first_upload->definition_hash, 0u);
+    EXPECT_EQ(second_upload->definition_hash, first_upload->definition_hash);
     // Distinct bases alone would still pass if finalization handed out a wrong
     // extent, so pin the length the Definition asks for and the disjointness two
     // shells of one Graph must have.
@@ -124,7 +122,7 @@ TEST_F(HbgGraphSubmitFailureTest, InFlightGraphSubmissionsReserveHeapOnlyAtCommi
     const auto *second_end = static_cast<const char *>(second_upload->outer_slot->task->packed_buffer_end);
     const GraphHostDefinitionList definitions = graph_host_definitions(*graph_state);
     ASSERT_EQ(definitions.entries.size(), 1u);
-    ASSERT_EQ(definitions.entries[0].full_key, first_submission->graph_key);
+    ASSERT_EQ(definitions.entries[0].full_key, first_upload->full_key);
     const auto *definition = reinterpret_cast<const GraphDefinition *>(definitions.entries[0].data);
     const uint64_t expected_extent =
         PTO2_ALIGN_UP(definition->required_heap + definition->execution_storage_bytes, PTO2_ALIGN_SIZE);
@@ -242,8 +240,7 @@ TEST_F(HbgGraphSubmitFailureTest, WorkerRecordsWhileMainThreadSubmitsSameHashShe
     for (size_t i = 0; i < 3; ++i) {
         const std::optional<GraphHostUpload> upload = graph_host_upload(*graph_state, i);
         ASSERT_TRUE(upload.has_value());
-        const auto *submission = reinterpret_cast<const GraphSubmission *>(upload->data);
-        EXPECT_EQ(submission->definition_hash, definition->content_hash) << "shell " << i;
+        EXPECT_EQ(upload->definition_hash, definition->content_hash) << "shell " << i;
         const auto *base = static_cast<const char *>(upload->outer_slot->task->packed_buffer_base);
         const auto *end = static_cast<const char *>(upload->outer_slot->task->packed_buffer_end);
         EXPECT_EQ(static_cast<uint64_t>(end - base), expected_extent) << "shell " << i;
@@ -626,8 +623,7 @@ TEST_F(HbgGraphSubmitFailureTest, ConcurrentDefinitionsFinalizeInSubmissionOrder
     for (size_t i = 0; i < kGraphCount; ++i) {
         const std::optional<GraphHostUpload> upload = graph_host_upload(*graph_state, i);
         ASSERT_TRUE(upload.has_value()) << "Graph " << i;
-        const auto *submission = reinterpret_cast<const GraphSubmission *>(upload->data);
-        EXPECT_NE(submission->definition_hash, 0u) << "Graph " << i;
+        EXPECT_NE(upload->definition_hash, 0u) << "Graph " << i;
         const auto *base = static_cast<const char *>(upload->outer_slot->task->packed_buffer_base);
         const auto *end = static_cast<const char *>(upload->outer_slot->task->packed_buffer_end);
         ASSERT_NE(base, nullptr) << "Graph " << i;

@@ -128,7 +128,7 @@ TEST_F(GraphActivationTest, IncrementalPublishRoutesCompletedDepsAndWakeChainsPe
 
 // Incremental activation dispatches a node before the graph reaches ACTIVE, so
 // complete_task must accept a node completion while the graph is MATERIALIZING or
-// PREPARED, and reject it only for SUBMITTED (not yet localized) or COMPLETED
+// PREPARED, and reject it only for SUBMITTED (not yet bound) or COMPLETED
 // (already retired).
 TEST_F(GraphActivationTest, CompleteTaskAcceptsCompletionBeforeActive) {
     GraphDefinition definition{};
@@ -146,7 +146,7 @@ TEST_F(GraphActivationTest, CompleteTaskAcceptsCompletionBeforeActive) {
         exec.node_count = 1;
         exec.remaining_nodes.store(1);
         exec.outer_slot = nullptr;
-        exec.state.store(state);
+        graph_execution_set_state(exec, state);
         node[0].slot.graph_context = &exec;
 #if SIMPLER_SCHED_PROFILING
         return sched.complete_task(node[0].slot, 0).error_code;

@@ -356,17 +356,23 @@ For a cache hit, the Host Orchestrator:
 1. validates the fixed boundary contract;
 2. reserves one task-window slot;
 3. reserves one heap block large enough for every internal intermediate, plus
-   the Definition's `execution_storage_bytes` for the execution the device
-   materializes into;
+   the Definition's `execution_storage_bytes` for node storage and its argument
+   pools;
 4. computes only external fanin and boundary tensormap effects;
 5. emits one outer `GRAPH` task;
-6. stages the exact-size POD submission image for upload after orchestration.
+6. stores boundary values in the outer task's ordinary compact argument pools.
+
+The outer Graph's tensor region is counted in `ChipTensor` pool slots but holds
+densely packed `GraphTensor` wire values. Graph scheduling never dispatches the
+outer payload as a kernel payload; device localization reads the compact values
+directly, so boundary metadata does not need to expand to full `ChipTensor`
+records on either side of H2D.
 
 Internal nodes consume no ring task-window slots. Their descriptor, payload, slot
-state, and argument pools live in the tail of the outer `GRAPH` task's own heap
-block, past `required_heap`: one `PTO2TaskAllocator::alloc` covers both halves the
-task owns, so the storage is reclaimed with the task's packed outputs and needs no
-separate device allocation, retention keying or release path.
+state, and argument pools live in the tail of the outer `GRAPH` task's own heap block,
+past `required_heap`: `[GraphExecution][GraphNodeStorage...][tensor pool][scalar pool]`. One
+`PTO2TaskAllocator::alloc` covers both the packed outputs and this execution storage,
+so they are reclaimed together without a separate device allocation or release path.
 
 A node payload holds no argument array of its own — it names each region by a delta,
 like any other payload. Its pools are the last two regions of the execution storage,
@@ -376,24 +382,23 @@ span in the pool as in the Definition's arg table. There is no fanin region: nod
 dependencies come from the Definition's fanin CSR, so a node's `fanin_count` stays 0
 and its fanin delta unbound.
 
-The execution address is therefore not on the wire — both sides compute
-`packed_buffer_base + required_heap` and read the size from the Definition. The
-Scheduler validates that the region lies inside the outer task's allocation and
-then placement-constructs `GraphExecution` there; it never allocates execution
-storage from the AICPU process heap, and it never reads the block's prior
-contents. Every submission materializes from the Definition, so a resubmission
-of the same Graph rebuilds rather than replaying the previous expansion: the
-bytes it starts from are whatever that heap region last held.
+The Host computes the execution-storage size before allocating the outer task's
+heap. It points the outer slot's existing `graph_context` at the shared device
+Definition and compacts the outer payload's tensor/scalar regions with every
+other task's argument pools. The copied arena zone and compact shared-memory
+image travel in one H2D. During the parallel initial classify, the Scheduler
+constructs `GraphExecution` in the outer heap tail, binds it to that Definition
+and the outer payload, and replaces `graph_context` with the execution pointer.
+Node storage remains untouched until bounded materialization begins.
 
 ## Scheduler flow
 
 Host orchestration builds the complete task image before device execution. At
-the end of orchestration, the Host stages each Graph POD image into the runtime
-arena's device region alongside the compacted shared-memory image, copies that
-one bind image to the device, and then launches the resident Scheduler. Nothing
-is patched on the way: a slot state names its payload and descriptor by a delta
-from its own address, so the bytes the Host wrote are the bytes the device
-schedules.
+the end of orchestration, the Host copies one bind image containing the
+compacted shared-memory task window and argument pools, then launches the
+resident Scheduler. Slot task and payload references remain self-relative;
+`graph_context` is the absolute address of the retained Definition object until
+initial classification localizes the execution in the outer heap.
 
 All AICPU threads classify disjoint slices of the completed task window behind
 one startup barrier. A Graph task enters preparation and external-fanin

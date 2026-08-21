@@ -690,13 +690,11 @@ using CoreTaskArgs = Arg<MAX_TENSOR_ARGS, MAX_SCALAR_ARGS>;
 inline constexpr uint32_t GRAPH_MAX_TENSOR_ARGS = 128;
 inline constexpr uint32_t GRAPH_MAX_SCALAR_ARGS = 64;
 
-// Boundary arguments of a Graph. Sized independently of CoreTaskArgs because a
-// Graph boundary never becomes a task payload — graph_reset_outer_payload zeroes
-// the outer GRAPH task's tensor_count. The boundary ships to the device inside
-// the submission image; materialize stages each node's own arguments from it,
-// bounded per node by CoreTaskArgs capacity, and bind_graph_topology bounds the
-// pool itself by these constants. Widening them costs orchestration stack and
-// submission-image bytes, not PTO2TaskPayload.
+// Boundary arguments of a Graph. Sized independently of CoreTaskArgs because the
+// outer GRAPH payload carries the whole boundary, while materialize stages only
+// one node's arguments at a time. The compact boundary values live in that
+// payload's argument-pool regions, so widening these caps costs pool bytes only
+// for Graphs that use them; PTO2TaskPayload itself stays fixed-size.
 using GraphTaskArgs = Arg<GRAPH_MAX_TENSOR_ARGS, GRAPH_MAX_SCALAR_ARGS>;
 
 // ChipTaskArgs — chip-level entry-arg holding the orchestration entry's
