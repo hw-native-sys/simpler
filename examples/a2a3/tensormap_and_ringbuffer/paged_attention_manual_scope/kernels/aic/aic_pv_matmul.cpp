@@ -10,9 +10,10 @@
  */
 // PV Matmul Kernel: pij(M, K) @ vj(K, N) -> oi_new(M, N)
 //
-// Supports two tile configurations via runtime dispatch:
+// Supports three tile configurations via runtime dispatch:
 //   Case1: (16, 128) @ (128, 128) -> (16, 128)
 //   Case2: (64,  64) @ ( 64, 128) -> (64, 128)
+//   Case3: (64,  64) @ ( 64, 256) -> (64, 256)
 //
 // pij is bfloat16 (converted from fp32 in softmax_prepare via TCVT).
 // vj is stored as (K, N) = (block_size, head_dim) in row-major (ND) layout.
@@ -103,11 +104,14 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ ChipTensor *vj = reinterpret_cast<__gm__ ChipTensor *>(args[1]);
     __gm__ ChipTensor *oi_new = reinterpret_cast<__gm__ ChipTensor *>(args[2]);
     uint64_t q_tile_size = static_cast<uint64_t>(pij->shapes[0]);
+    uint64_t head_dim = static_cast<uint64_t>(oi_new->shapes[1]);
 
     if (q_tile_size == 16 && pij->shapes[1] <= 16) {
         pv_matmul_impl<16, 16, 16>(pij, vj, oi_new);
     } else if (q_tile_size == 16) {
         pv_matmul_impl<16, 128, 128>(pij, vj, oi_new);
+    } else if (head_dim == 256) {
+        pv_matmul_impl<64, 64, 256>(pij, vj, oi_new);
     } else {
         pv_matmul_impl<64, 64, 128>(pij, vj, oi_new);
     }

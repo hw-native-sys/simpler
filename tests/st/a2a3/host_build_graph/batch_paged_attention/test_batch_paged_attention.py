@@ -62,8 +62,6 @@ class TestBatchPagedAttentionHostBuildGraph(SceneTestCase):
         ],
     }
 
-    # The shared head_dim=256 kernels fail golden on both runtimes, so Case3
-    # is not a valid cross-runtime benchmark.
     CASES = [
         {
             "name": "Case1",
@@ -91,6 +89,22 @@ class TestBatchPagedAttentionHostBuildGraph(SceneTestCase):
                 "num_heads": 64,
                 "kv_head_num": 1,
                 "head_dim": 128,
+                "block_size": 64,
+                "context_len": 8192,
+                "max_model_len": 32768,
+                "dtype": "bfloat16",
+            },
+        },
+        {
+            "name": "Case3",
+            "platforms": ["a2a3"],
+            "manual": True,
+            "config": {"runtime_env": {"ring_heap": 1024 * 1024 * 1024}},
+            "params": {
+                "batch": 64,
+                "num_heads": 64,
+                "kv_head_num": 1,
+                "head_dim": 256,
                 "block_size": 64,
                 "context_len": 8192,
                 "max_model_len": 32768,

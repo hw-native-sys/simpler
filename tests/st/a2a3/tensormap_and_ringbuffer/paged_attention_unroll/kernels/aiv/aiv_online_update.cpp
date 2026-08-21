@@ -10,9 +10,10 @@
  */
 // Online Softmax Update + Normalize Kernel (AIV)
 //
-// Operates on full tiles where M=q_tile_size, N=head_dim (128):
+// Operates on full tiles where M=q_tile_size and N=head_dim:
 //   Case1: oi/oi_new are (16, 128), mij/lij/mi/li are 16-element vectors
 //   Case2: oi/oi_new are (64, 128), mij/lij/mi/li are 64-element vectors
+//   Case3: oi/oi_new are (64, 256), mij/lij/mi/li are 64-element vectors
 //
 // Scalar layout strategy using TRESHAPE (zero-copy UB reshape):
 //   Scalars loaded as DN ColMajor (M, 1) for TROWEXPANDMUL/TROWEXPANDDIV.
@@ -246,10 +247,12 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     uint64_t is_first = static_cast<uint64_t>(args[7]);
     uint64_t is_last = static_cast<uint64_t>(args[8]);
     uint64_t q_tile_size = static_cast<uint64_t>(mij->shapes[0]);
-    // args[10] = head_dim (128)
+    uint64_t head_dim = static_cast<uint64_t>(oi_new->shapes[1]);
 
     if (q_tile_size == 16) {
         online_update_impl<16, 128>(mij, lij, oi_new, mi, li, oi, is_first, is_last, dst);
+    } else if (head_dim == 256) {
+        online_update_impl<64, 256>(mij, lij, oi_new, mi, li, oi, is_first, is_last, dst);
     } else {
         online_update_impl<64, 128>(mij, lij, oi_new, mi, li, oi, is_first, is_last, dst);
     }

@@ -14,9 +14,10 @@
 // For each batch b, updates accumulators mi/li/oi with new block's mij/lij/oi_new.
 // On is_last, normalizes and writes to the output tensor at the correct batch offset.
 //
-// Supports two tile configurations via runtime dispatch:
+// Supports three tile configurations via runtime dispatch:
 //   Case1: (16, 128) -- q_tile=16, head_dim=128
 //   Case2: (64, 128) -- q_tile=64, head_dim=128
+//   Case3: (64, 256) -- q_tile=64, head_dim=256
 //
 // Scalar layout strategy:
 //   M scalar floats stored contiguously in GM can be loaded as either:
@@ -208,6 +209,11 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
         );
     } else if (q_tile_size == 16) {
         online_update_batch_impl<16, 128>(
+            mij_batch, lij_batch, oi_new_batch, mi_batch, li_batch, oi_batch, out, is_first, is_last, batch_count,
+            q_offset, num_heads, batch_start
+        );
+    } else if (head_dim == 256) {
+        online_update_batch_impl<64, 256>(
             mij_batch, lij_batch, oi_new_batch, mi_batch, li_batch, oi_batch, out, is_first, is_last, batch_count,
             q_offset, num_heads, batch_start
         );
