@@ -120,7 +120,7 @@ make_test_definition(uint64_t graph_key, uint64_t boundary_address, uint32_t bou
     definition.total_bytes = static_cast<uint32_t>(image.size());
     std::memcpy(image.data(), &definition, sizeof(definition));
 
-    definition.content_hash = graph_hash_bytes(1469598103934665603ULL, image.data(), image.size());
+    definition.content_hash = graph_definition_content_hash(image.data(), image.size());
     std::memcpy(image.data(), &definition, sizeof(definition));
     return image;
 }
@@ -229,6 +229,18 @@ private:
 };
 
 }  // namespace
+
+TEST(GraphDefinitionHash, IgnoresOnlyEmbeddedContentHash) {
+    std::vector<std::byte> image = make_test_definition(23, 0x1000);
+    const uint64_t expected = graph_definition_content_hash(image.data(), image.size());
+
+    const uint64_t replacement = 0x0123456789abcdefULL;
+    std::memcpy(image.data() + offsetof(GraphDefinition, content_hash), &replacement, sizeof(replacement));
+    EXPECT_EQ(graph_definition_content_hash(image.data(), image.size()), expected);
+
+    image.back() ^= std::byte{1};
+    EXPECT_NE(graph_definition_content_hash(image.data(), image.size()), expected);
+}
 
 TEST(GraphCache, RejectsEmptyBoundary) {
     GraphTaskArgs args;

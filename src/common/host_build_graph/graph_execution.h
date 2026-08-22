@@ -181,6 +181,97 @@ struct GraphDefinition {
     uint32_t off_predicates;
 };
 
+inline uint64_t graph_definition_hash_rotl(uint64_t value, uint32_t shift) {
+    return (value << shift) | (value >> (64U - shift));
+}
+
+inline uint64_t graph_definition_hash_round(uint64_t accumulator, uint64_t input) {
+    constexpr uint64_t PRIME2 = 14029467366897019727ULL;
+    constexpr uint64_t PRIME1 = 11400714785074694791ULL;
+    accumulator += input * PRIME2;
+    accumulator = graph_definition_hash_rotl(accumulator, 31);
+    return accumulator * PRIME1;
+}
+
+inline uint64_t graph_definition_hash_word(const uint8_t *bytes, size_t offset) {
+    constexpr size_t CONTENT_HASH_OFFSET = offsetof(GraphDefinition, content_hash);
+    static_assert(CONTENT_HASH_OFFSET % sizeof(uint64_t) == 0);
+    if (offset == CONTENT_HASH_OFFSET) return 0;
+    uint64_t word = 0;
+    __builtin_memcpy(&word, bytes + offset, sizeof(word));
+    return word;
+}
+
+// The Definition hash follows XXH64's four-lane structure so large images do
+// not serialize one multiply per word. content_hash is treated as zero on both
+// host and device, allowing verification without mutating the uploaded image.
+// Definitions are rebuilt and rehashed by the same runtime version, so this is
+// an integrity checksum rather than a persisted wire-format identifier.
+inline uint64_t graph_definition_content_hash(const void *data, size_t size) {
+    constexpr uint64_t SEED = 1469598103934665603ULL;
+    constexpr uint64_t PRIME1 = 11400714785074694791ULL;
+    constexpr uint64_t PRIME2 = 14029467366897019727ULL;
+    constexpr uint64_t PRIME3 = 1609587929392839161ULL;
+    constexpr uint64_t PRIME4 = 9650029242287828579ULL;
+    constexpr uint64_t PRIME5 = 2870177450012600261ULL;
+    const auto *bytes = static_cast<const uint8_t *>(data);
+    size_t offset = 0;
+    uint64_t hash = 0;
+
+    if (size >= 32) {
+        uint64_t lane1 = SEED + PRIME1 + PRIME2;
+        uint64_t lane2 = SEED + PRIME2;
+        uint64_t lane3 = SEED;
+        uint64_t lane4 = SEED - PRIME1;
+        const size_t stripes_end = size - 32;
+        do {
+            lane1 = graph_definition_hash_round(lane1, graph_definition_hash_word(bytes, offset));
+            lane2 = graph_definition_hash_round(lane2, graph_definition_hash_word(bytes, offset + 8));
+            lane3 = graph_definition_hash_round(lane3, graph_definition_hash_word(bytes, offset + 16));
+            lane4 = graph_definition_hash_round(lane4, graph_definition_hash_word(bytes, offset + 24));
+            offset += 32;
+        } while (offset <= stripes_end);
+        hash = graph_definition_hash_rotl(lane1, 1) + graph_definition_hash_rotl(lane2, 7) +
+               graph_definition_hash_rotl(lane3, 12) + graph_definition_hash_rotl(lane4, 18);
+        hash ^= graph_definition_hash_round(0, lane1);
+        hash = hash * PRIME1 + PRIME4;
+        hash ^= graph_definition_hash_round(0, lane2);
+        hash = hash * PRIME1 + PRIME4;
+        hash ^= graph_definition_hash_round(0, lane3);
+        hash = hash * PRIME1 + PRIME4;
+        hash ^= graph_definition_hash_round(0, lane4);
+        hash = hash * PRIME1 + PRIME4;
+    } else {
+        hash = SEED + PRIME5;
+    }
+
+    hash += size;
+    while (offset + sizeof(uint64_t) <= size) {
+        const uint64_t mixed = graph_definition_hash_round(0, graph_definition_hash_word(bytes, offset));
+        hash ^= mixed;
+        hash = graph_definition_hash_rotl(hash, 27) * PRIME1 + PRIME4;
+        offset += sizeof(uint64_t);
+    }
+    if (offset + sizeof(uint32_t) <= size) {
+        uint32_t word = 0;
+        __builtin_memcpy(&word, bytes + offset, sizeof(word));
+        hash ^= static_cast<uint64_t>(word) * PRIME1;
+        hash = graph_definition_hash_rotl(hash, 23) * PRIME2 + PRIME3;
+        offset += sizeof(uint32_t);
+    }
+    while (offset < size) {
+        hash ^= static_cast<uint64_t>(bytes[offset]) * PRIME5;
+        hash = graph_definition_hash_rotl(hash, 11) * PRIME1;
+        ++offset;
+    }
+    hash ^= hash >> 33;
+    hash *= PRIME2;
+    hash ^= hash >> 29;
+    hash *= PRIME3;
+    hash ^= hash >> 32;
+    return hash;
+}
+
 // One submission of a Graph. The static Definition is a shared device object
 // this references by address; the execution storage is not referenced at all —
 // it sits at outer_slot.task->packed_buffer_base + definition->required_heap,
