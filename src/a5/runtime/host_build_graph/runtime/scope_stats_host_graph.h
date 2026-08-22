@@ -8,15 +8,17 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-#include "aicpu/scope_stats_collector_aicpu.h"
 
-// Minimal host-orchestrator link targets omit the host capture implementation.
-__attribute__((weak, visibility("hidden"))) void
-scope_stats_begin(int, int32_t, int32_t, uint64_t, uint64_t, int32_t, int32_t, int32_t) {}
+#pragma once
 
-__attribute__((weak, visibility("hidden"))) void
-scope_stats_end(int, int32_t, int32_t, uint64_t, uint64_t, int32_t, int32_t, int32_t) {}
+#include <cstdint>
 
-__attribute__((weak, visibility("hidden"))) void scope_stats_on_fatal() {}
+// Reset host-side capture after the HBG orchestrator has initialized its
+// resource pools and before the outer executor scope begins.
+void scope_stats_host_graph_begin_capture(int32_t task_window_cap, uint64_t heap_cap, int32_t tensormap_cap);
 
-__attribute__((weak, visibility("hidden"))) void scope_stats_set_pending_site(const char *, int) {}
+extern "C" {
+bool scope_stats_host_graph_active();
+void scope_stats_host_graph_set_enabled(bool enabled);
+int scope_stats_host_graph_write_jsonl(const char *output_dir);
+}

@@ -63,6 +63,7 @@
 #include "../runtime/pto_shared_memory.h"
 #include "../runtime/pto_types.h"
 #include "../runtime/runtime.h"
+#include "../runtime/scope_stats_host_graph.h"
 #include "../../../../common/runtime_status/error_log.h"
 #include "../../../../common/task_interface/call_config.h"
 #include "../../../../common/worker/pto_runtime_c_api.h"
@@ -561,6 +562,11 @@ int32_t run_host_orchestration(
         return -1;
     }
     rt->orchestrator.wire_arena_pointers(layout.orch, host_arena, rt->scheduler);
+
+    auto &scope_alloc = rt->orchestrator.ring.task_allocator;
+    scope_stats_host_graph_begin_capture(
+        scope_alloc.window_size(), scope_alloc.heap_capacity(), rt->orchestrator.tensor_map.pool_capacity()
+    );
 
     PTO2SharedMemoryHandle host_sm_handle;
     if (!host_sm_handle.init_per_ring(host_sm, sm_size, eff_task_window_sizes, eff_heap_sizes)) {

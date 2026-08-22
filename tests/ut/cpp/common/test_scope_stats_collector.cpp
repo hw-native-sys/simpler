@@ -10,6 +10,7 @@
  */
 
 #include "host/scope_stats_collector.h"
+#include "host/scope_stats_host_capture.h"
 
 #include <gtest/gtest.h>
 
@@ -110,4 +111,72 @@ TEST(ScopeStatsCollectorTest, ReconcileRecoversUnflushedCurrentBuffer) {
 
     std::filesystem::remove_all(out_dir);
     collector.finalize(nullptr, test_free);
+}
+
+TEST(ScopeStatsHostCaptureTest, DisabledCaptureProducesNoRecords) {
+    ScopeStatsHostCapture capture;
+    capture.begin_capture(/*task_window_cap=*/128, /*heap_cap=*/4096, /*tensormap_cap=*/256);
+    capture.set_pending_site("disabled.cpp", 17);
+    capture.begin(0, 0, 0, 0, 0, 0, 0, 0);
+    capture.end(0, 0, 1, 0, 64, 0, 0, 1);
+
+    EXPECT_TRUE(capture.records().empty());
+    EXPECT_EQ(capture.write_jsonl("/tmp"), -3);
+}
+
+TEST(ScopeStatsHostCaptureTest, NestedCapturePreservesSitesCapacitiesWrapsAndFatal) {
+    ScopeStatsHostCapture capture;
+    capture.set_enabled(true);
+    capture.begin_capture(/*task_window_cap=*/128, /*heap_cap=*/4096, /*tensormap_cap=*/256);
+
+    capture.begin(0, 0, 0, 0, 0, 0, 0, 0);
+    capture.set_pending_site("/tmp/source/nested_scope.cpp", 42);
+    capture.begin(0, 0, 1, 0, 1024, 0, 0, 1);
+    capture.note_heap_wrap(SCOPE_STATS_HEAP_SIDE_ALLOC);
+    capture.note_heap_wrap(SCOPE_STATS_HEAP_SIDE_ALLOC);
+    capture.end(0, 0, 5, 0, 512, 0, 0, 3);
+    capture.on_fatal();
+    capture.end(0, 0, 5, 0, 512, 0, 0, 3);
+
+    const auto &records = capture.records();
+    ASSERT_EQ(records.size(), 4u);
+    EXPECT_EQ(records[0].depth, 0);
+    EXPECT_EQ(records[1].depth, 1);
+    EXPECT_EQ(records[1].phase, SCOPE_STATS_PHASE_BEGIN);
+    EXPECT_EQ(records[2].phase, SCOPE_STATS_PHASE_END);
+    EXPECT_STREQ(records[1].site_file_basename, "nested_scope.cpp");
+    EXPECT_EQ(records[1].site_line, 42);
+    EXPECT_EQ(records[2].heap_end, 2 * 4096 + 512);
+
+    const auto &header = capture.header();
+    EXPECT_EQ(header.task_window_cap[0], 128);
+    EXPECT_EQ(header.heap_cap[0], 4096u);
+    EXPECT_EQ(header.dep_pool_cap[0], 0);
+    EXPECT_EQ(header.tensormap_cap, 256);
+    EXPECT_EQ(header.fatal_latched, 1u);
+
+    std::filesystem::path out_dir =
+        std::filesystem::temp_directory_path() / ("scope_stats_host_capture_test_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(out_dir);
+    ASSERT_EQ(capture.write_jsonl(out_dir.c_str()), 0);
+    std::string jsonl = read_file(out_dir / "scope_stats" / "scope_stats.jsonl");
+    EXPECT_NE(jsonl.find("\"fatal\": true"), std::string::npos);
+    EXPECT_NE(jsonl.find("\"total\": 4"), std::string::npos);
+    EXPECT_NE(jsonl.find("\"site\": \"nested_scope.cpp:42\""), std::string::npos);
+    std::filesystem::remove_all(out_dir);
+}
+
+TEST(ScopeStatsHostCaptureTest, BeginCaptureClearsPriorRunState) {
+    ScopeStatsHostCapture capture;
+    capture.set_enabled(true);
+    capture.begin_capture(64, 2048, 32);
+    capture.begin(0, 0, 0, 0, 0, 0, 0, 0);
+    capture.end(0, 0, 1, 0, 128, 0, 0, 1);
+    ASSERT_EQ(capture.records().size(), 2u);
+
+    capture.begin_capture(32, 1024, 16);
+    EXPECT_TRUE(capture.records().empty());
+    EXPECT_EQ(capture.header().task_window_cap[0], 32);
+    EXPECT_EQ(capture.header().heap_cap[0], 1024u);
+    EXPECT_EQ(capture.header().fatal_latched, 0u);
 }

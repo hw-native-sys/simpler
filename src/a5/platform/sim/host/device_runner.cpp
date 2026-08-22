@@ -330,7 +330,7 @@ int DeviceRunner::prepare_execution(
     if (enable_dep_gen_) {
         SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DEP_GEN);
     }
-    if (enable_scope_stats_) {
+    if (enable_scope_stats_ && !scope_stats_uses_host_capture()) {
         SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_SCOPE_STATS);
     }
 
@@ -394,7 +394,7 @@ int DeviceRunner::prepare_execution(
         }
     }
 
-    if (enable_scope_stats_) {
+    if (enable_scope_stats_ && !scope_stats_uses_host_capture()) {
         rc = init_scope_stats(launch_aicpu_num);
         if (rc != 0) {
             LOG_ERROR("init_scope_stats failed: %d", rc);
@@ -483,7 +483,7 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 set_pmu_enabled_func_(enable_pmu_);
                 set_platform_dep_gen_base_func_(kernel_args_.dep_gen_data_base);
                 set_dep_gen_enabled_func_(enable_dep_gen_);
-                set_scope_stats_enabled_func_(enable_scope_stats_);
+                set_scope_stats_enabled_func_(enable_scope_stats_ && !scope_stats_uses_host_capture());
                 set_platform_scope_stats_base_func_(kernel_args_.scope_stats_data_base);
 
                 auto thread_factory = [this](std::function<void()> fn) {
@@ -493,7 +493,9 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 if (enable_dump_args_) dump_collector_.start(thread_factory);
                 if (enable_pmu_) pmu_collector_.start(thread_factory);
                 if (enable_dep_gen_) dep_gen_collector_.start(thread_factory);
-                if (enable_scope_stats_) scope_stats_collector_.start(thread_factory);
+                if (enable_scope_stats_ && !scope_stats_uses_host_capture()) {
+                    scope_stats_collector_.start(thread_factory);
+                }
 
                 if (kernel_args_.device_wall_data_base != 0) {
                     *reinterpret_cast<uint64_t *>(kernel_args_.device_wall_data_base) = 0;
@@ -660,9 +662,16 @@ int DeviceRunner::drain_execution(ActiveExecution &) {
     }
 
     if (enable_scope_stats_) {
-        scope_stats_collector_.stop();
-        scope_stats_collector_.reconcile_counters();
-        scope_stats_collector_.write_jsonl(output_prefix_);
+        if (scope_stats_uses_host_capture()) {
+            int rc = write_host_scope_stats();
+            if (rc != 0) {
+                LOG_ERROR("scope_stats host graph emit failed (%d) — scope_stats.jsonl not produced", rc);
+            }
+        } else {
+            scope_stats_collector_.stop();
+            scope_stats_collector_.reconcile_counters();
+            scope_stats_collector_.write_jsonl(output_prefix_);
+        }
     }
 
     print_handshake_results();

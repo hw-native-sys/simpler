@@ -53,8 +53,7 @@
  *            "tensormap":int}
  */
 
-#ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_SCOPE_STATS_COLLECTOR_H_
-#define SRC_COMMON_PLATFORM_INCLUDE_HOST_SCOPE_STATS_COLLECTOR_H_
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
@@ -145,6 +144,11 @@ using ScopeStatsRegisterCallback = profiling_common::ProfRegisterCallback;
 using ScopeStatsUnregisterCallback = profiling_common::ProfUnregisterCallback;
 using ScopeStatsFreeCallback = profiling_common::ProfFreeCallback;
 
+int write_scope_stats_jsonl(
+    const std::string &output_dir, const ScopeStatsDataHeader &header, uint32_t dropped_record_count,
+    uint32_t total_record_count, const std::vector<ScopeStatsRecord> &records
+);
+
 // ---------------------------------------------------------------------------
 // ScopeStatsCollector
 // ---------------------------------------------------------------------------
@@ -207,5 +211,3 @@ private:
 
     void append_buffer_records(const void *buf_host_ptr);
 };
-
-#endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_SCOPE_STATS_COLLECTOR_H_

@@ -284,7 +284,9 @@ public:
         enable_pmu_ = (enable_pmu > 0);
         pmu_event_type_ = resolve_pmu_event_type(enable_pmu);
     }
-    void set_scope_stats_enabled(bool enable) { enable_scope_stats_ = enable; }
+    void set_scope_stats_enabled(bool enable);
+    bool scope_stats_uses_host_capture() const;
+    int write_host_scope_stats() const;
     // Diagnostic artifact root directory (CallConfig::validate() enforces non-empty
     // upstream when any diagnostic is enabled).
     void set_output_prefix(const char *prefix) { output_prefix_ = (prefix != nullptr) ? prefix : ""; }

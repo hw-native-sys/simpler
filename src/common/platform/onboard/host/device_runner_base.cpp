@@ -1191,6 +1191,23 @@ extern "C" __attribute__((weak)) int prewarm_config_impl(
     return 0;
 }
 
+extern "C" __attribute__((weak, visibility("hidden"))) bool scope_stats_host_graph_active() { return false; }
+extern "C" __attribute__((weak, visibility("hidden"))) void scope_stats_host_graph_set_enabled(bool) {}
+extern "C" __attribute__((weak, visibility("hidden"))) int scope_stats_host_graph_write_jsonl(const char *) {
+    return -1;
+}
+
+void DeviceRunnerBase::set_scope_stats_enabled(bool enable) {
+    enable_scope_stats_ = enable;
+    scope_stats_host_graph_set_enabled(enable);
+}
+
+bool DeviceRunnerBase::scope_stats_uses_host_capture() const { return scope_stats_host_graph_active(); }
+
+int DeviceRunnerBase::write_host_scope_stats() const {
+    return scope_stats_host_graph_write_jsonl(output_prefix_.c_str());
+}
+
 void DeviceRunnerBase::apply_call_config(const CallConfig &config) {
     set_chip_swimlane_enabled(config.enable_chip_swimlane);
     set_dump_args_enabled(config.enable_dump_args);
@@ -1809,7 +1826,7 @@ void DeviceRunnerBase::start_shared_collectors_for_run() {
     if (enable_pmu_) {
         pmu_collector_.start(thread_factory);
     }
-    if (enable_scope_stats_) {
+    if (enable_scope_stats_ && !scope_stats_uses_host_capture()) {
         scope_stats_collector_.start(thread_factory);
     }
 }
@@ -1856,9 +1873,16 @@ void DeviceRunnerBase::teardown_shared_collectors_after_run(bool device_executio
     }
 
     if (enable_scope_stats_) {
-        scope_stats_collector_.stop();
-        scope_stats_collector_.reconcile_counters();
-        scope_stats_collector_.write_jsonl(output_prefix_);
+        if (scope_stats_uses_host_capture()) {
+            int rc = write_host_scope_stats();
+            if (rc != 0) {
+                LOG_ERROR("scope_stats host graph emit failed (%d) — scope_stats.jsonl not produced", rc);
+            }
+        } else {
+            scope_stats_collector_.stop();
+            scope_stats_collector_.reconcile_counters();
+            scope_stats_collector_.write_jsonl(output_prefix_);
+        }
     }
 }
 

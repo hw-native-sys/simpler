@@ -661,6 +661,23 @@ extern "C" __attribute__((weak)) int prewarm_config_impl(
     return 0;
 }
 
+extern "C" __attribute__((weak, visibility("hidden"))) bool scope_stats_host_graph_active() { return false; }
+extern "C" __attribute__((weak, visibility("hidden"))) void scope_stats_host_graph_set_enabled(bool) {}
+extern "C" __attribute__((weak, visibility("hidden"))) int scope_stats_host_graph_write_jsonl(const char *) {
+    return -1;
+}
+
+void SimDeviceRunnerBase::set_scope_stats_enabled(bool enable) {
+    enable_scope_stats_ = enable;
+    scope_stats_host_graph_set_enabled(enable);
+}
+
+bool SimDeviceRunnerBase::scope_stats_uses_host_capture() const { return scope_stats_host_graph_active(); }
+
+int SimDeviceRunnerBase::write_host_scope_stats() const {
+    return scope_stats_host_graph_write_jsonl(output_prefix_.c_str());
+}
+
 void SimDeviceRunnerBase::apply_call_config(const CallConfig &config) {
     set_chip_swimlane_enabled(config.enable_chip_swimlane);
     set_dump_args_enabled(config.enable_dump_args);

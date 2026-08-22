@@ -251,9 +251,10 @@ bool ScopeStatsCollector::reconcile_counters() {
 // NDJSON export
 // ---------------------------------------------------------------------------
 
-int ScopeStatsCollector::write_jsonl(const std::string &output_dir) {
-    if (!initialized_ || shm_host_ == nullptr) return 0;
-
+int write_scope_stats_jsonl(
+    const std::string &output_dir, const ScopeStatsDataHeader &header, uint32_t dropped_record_count,
+    uint32_t total_record_count, const std::vector<ScopeStatsRecord> &records
+) {
     std::filesystem::path dir = std::filesystem::path(output_dir) / "scope_stats";
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
@@ -268,9 +269,6 @@ int ScopeStatsCollector::write_jsonl(const std::string &output_dir) {
         return -1;
     }
 
-    const ScopeStatsDataHeader *hdr = scope_stats_header();
-    const ScopeStatsBufferState *state = scope_stats_state(0);
-
     // Line 1: run metadata. Per-ring capacities and the tensormap capacity are
     // run-constants, so they live here once rather than on every record.
     std::string task_window_max;
@@ -278,11 +276,11 @@ int ScopeStatsCollector::write_jsonl(const std::string &output_dir) {
     std::string dep_pool_max;
     for (int r = 0; r < PTO2_SCOPE_STATS_MAX_RING_DEPTH; r++) {
         char buf[32];
-        std::snprintf(buf, sizeof(buf), "%s%d", r == 0 ? "" : ", ", hdr->task_window_cap[r]);
+        std::snprintf(buf, sizeof(buf), "%s%d", r == 0 ? "" : ", ", header.task_window_cap[r]);
         task_window_max += buf;
-        std::snprintf(buf, sizeof(buf), "%s%" PRIu64, r == 0 ? "" : ", ", hdr->heap_cap[r]);
+        std::snprintf(buf, sizeof(buf), "%s%" PRIu64, r == 0 ? "" : ", ", header.heap_cap[r]);
         heap_max += buf;
-        std::snprintf(buf, sizeof(buf), "%s%d", r == 0 ? "" : ", ", hdr->dep_pool_cap[r]);
+        std::snprintf(buf, sizeof(buf), "%s%d", r == 0 ? "" : ", ", header.dep_pool_cap[r]);
         dep_pool_max += buf;
     }
     std::fprintf(
@@ -291,18 +289,17 @@ int ScopeStatsCollector::write_jsonl(const std::string &output_dir) {
         // wrapping ring offsets in v5) — see docs/dfx/scope-stats.md.
         "{\"version\": 6, \"fatal\": %s, \"dropped\": %u, \"total\": %u, "
         "\"task_window_max\": [%s], \"heap_max\": [%s], \"dep_pool_max\": [%s], \"tensormap_max\": %d}\n",
-        hdr->fatal_latched ? "true" : "false", state->dropped_record_count, state->total_record_count,
-        task_window_max.c_str(), heap_max.c_str(), dep_pool_max.c_str(), hdr->tensormap_cap
+        header.fatal_latched ? "true" : "false", dropped_record_count, total_record_count, task_window_max.c_str(),
+        heap_max.c_str(), dep_pool_max.c_str(), header.tensormap_cap
     );
 
     // Serialize every record into one in-memory buffer, then a single fwrite.
     // The hot loop is one snprintf per record (not 6 fprintf): stdio format
     // parsing + per-call FILE locking on ~6×N calls was the dominant host cost.
-    std::scoped_lock lock(records_mutex_);
     std::string out;
-    out.reserve(records_.size() * 384);
+    out.reserve(records.size() * 384);
     char line[512];
-    for (const ScopeStatsRecord &rec : records_) {
+    for (const ScopeStatsRecord &rec : records) {
         const int site_len = static_cast<int>(strnlen(rec.site_file_basename, sizeof(rec.site_file_basename)));
         const char *phase = (rec.phase == SCOPE_STATS_PHASE_BEGIN) ? "begin" : "end";
         int n = std::snprintf(
@@ -321,10 +318,21 @@ int ScopeStatsCollector::write_jsonl(const std::string &output_dir) {
     std::fclose(fp);
 
     LOG_INFO(
-        "scope_stats: wrote %lu records (dropped=%u) to %s", static_cast<unsigned long>(records_.size()),
-        state->dropped_record_count, path.c_str()
+        "scope_stats: wrote %lu records (dropped=%u) to %s", static_cast<unsigned long>(records.size()),
+        dropped_record_count, path.c_str()
     );
     return 0;
+}
+
+int ScopeStatsCollector::write_jsonl(const std::string &output_dir) {
+    if (!initialized_ || shm_host_ == nullptr) return 0;
+
+    const ScopeStatsDataHeader *header = scope_stats_header();
+    const ScopeStatsBufferState *state = scope_stats_state(0);
+    std::scoped_lock lock(records_mutex_);
+    return write_scope_stats_jsonl(
+        output_dir, *header, state->dropped_record_count, state->total_record_count, records_
+    );
 }
 
 // ---------------------------------------------------------------------------

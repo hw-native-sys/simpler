@@ -7,9 +7,9 @@ high-water mark. When a model runs out of task windows, heap, or
 tensormap / dependency-list entries, the failure tells you *which* resource is exhausted
 but not *where*; scope stats gives you the where.
 
-It is a diagnostic-only, opt-in feature for the
-**tensormap_and_ringbuffer (T&R)** runtime. When disabled (the default)
-it costs a single bool load per probe.
+It is a diagnostic-only, opt-in feature for both
+**tensormap_and_ringbuffer (T&R)** and **host_build_graph (HBG)**. When
+disabled (the default) it costs a single bool load per probe.
 
 This guide also covers the background behind the feature, the T&R
 resource/ring_depth/scope model, and the data flow behind the HTML report.
@@ -21,7 +21,7 @@ resulting `scope_stats/scope_stats.jsonl` into an HTML report.
 
 ### Step 1 — Run with `--enable-scope-stats`
 
-Pass the flag to any T&R example or scene test:
+Pass the flag to a T&R or HBG example or scene test:
 
 ```bash
 CASE=...
@@ -29,9 +29,9 @@ NAME=...
 python "tests/st/${CASE}/test_${NAME}.py" -p a2a3 -d 0 --enable-scope-stats
 ```
 
-The flag is bit 4 of `enable_profiling_flag`; on a T&R run it turns on
-per-scope peak tracking. On other runtimes the flag is accepted but
-produces no records.
+The flag is bit 4 of `enable_profiling_flag` on the device-orchestrated
+T&R path. HBG consumes the same flag before graph construction and records
+the host orchestrator's scope boundaries directly.
 
 ### Step 2 — Locate the output
 
@@ -68,6 +68,8 @@ PY
 The three arrays are indexed by `ring` (`0..3`) and should match the effective
 runtime configuration. Per-sample `ring` values show which scope-depth rings
 were actually touched by the run; they are scope records, not task counts.
+HBG is whole-graph-resident with one polling ring and no dependency-list pool,
+so only index 0 is populated and `dep_pool_max[0]` is zero.
 
 ### Step 3 — Visualize with `scope_stats_plot.py`
 
@@ -310,15 +312,16 @@ render `used/cap` without a second device→host query.
 | chip swimlane | platform only | all runtimes | reads AICore ring buffers |
 | dep_gen | platform only | all runtimes | traces `submit_task` |
 | args dump | platform only | all runtimes | dumps argument data |
-| **scope stats** | **platform API + runtime call sites** | **T&R only** | runtime extracts values, platform tracks peaks |
+| **scope stats** | **platform API + runtime call sites** | **all runtimes** | T&R streams from AICPU; HBG records during host graph construction |
 
 ### 4.4 Symbol resolution
 
-`kernel.cpp` (platform, shared by all runtimes) always calls
-`set_scope_stats_enabled` / `set_platform_scope_stats_base`, so the
-collector symbols resolve into every AICPU `.so`. Only the T&R runtime
-adds the `begin`/`end`/capacity call sites, so only it produces records;
-host_build_graph links the collector but never invokes it.
+`kernel.cpp` (platform, shared by all runtimes) calls
+`set_scope_stats_enabled` / `set_platform_scope_stats_base` for the
+device-backed T&R collector. HBG resolves the same begin/end probes to a
+host capture implementation. Its runner turns the device flag off, avoids
+allocating an unused device buffer pool, and emits the captured host records
+after execution completes.
 
 ### 4.5 Data flow
 
@@ -347,9 +350,12 @@ A worked example is in
 — it runs the `vector_example` orchestration with `--enable-scope-stats`
 and asserts the resulting NDJSON.
 
-### 4.6 Future: cross-runtime support
+### 4.6 Host-build-graph capture
 
-If host_build_graph adds scope-like concepts, extending scope_stats only
-requires adding the same platform call sites in HBG — no platform
-changes. The collector is already runtime-agnostic: it accepts plain
-values and has no knowledge of T&R types.
+HBG runs its complete orchestration during `bind_callable_to_runtime`, before
+`prepare_execution` creates any device collectors. Its begin/end probes
+therefore write to a thread-local host recorder. The recorder captures the
+same `ScopeStatsRecord` values and calls the shared JSONL serializer, so the
+version 6 schema and plotting tool are identical across runtime variants.
+The capture is reset once per host orchestration and emitted by the same
+progress thread, matching HBG's host-direct `dep_gen` lifecycle.

@@ -746,7 +746,9 @@ public:
         enable_pmu_ = (enable_pmu > 0);
         pmu_event_type_ = resolve_pmu_event_type(enable_pmu);
     }
-    void set_scope_stats_enabled(bool enable) { enable_scope_stats_ = enable; }
+    void set_scope_stats_enabled(bool enable);
+    bool scope_stats_uses_host_capture() const;
+    int write_host_scope_stats() const;
 
     /**
      * Latch this run's per-run diagnostic config onto the runner's `enable_*_`
