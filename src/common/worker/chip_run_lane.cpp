@@ -41,6 +41,7 @@ struct ChipRunState {
     bool crossed_launch_fence{false};
     bool depth_one_fallback{false};
     std::exception_ptr error;
+    std::exception_ptr poison_error;
 };
 
 struct ChipRunLaneState {
@@ -48,21 +49,25 @@ struct ChipRunLaneState {
         worker(&worker),
         generations(worker.pipeline_depth(), 0) {}
 
-    void require_usable() const {
-        if (closed) throw std::runtime_error("chip run lane is closed");
-        if (poison != nullptr) {
-            try {
-                std::rethrow_exception(poison);
-            } catch (const std::exception &e) {
-                throw std::runtime_error(std::string("chip run lane is poisoned: ") + e.what());
-            } catch (...) {
-                throw std::runtime_error("chip run lane is poisoned by an unknown native failure");
-            }
+    [[noreturn]] static void rethrow_as_poisoned(const std::exception_ptr &error) {
+        try {
+            std::rethrow_exception(error);
+        } catch (const std::exception &e) {
+            throw std::runtime_error(std::string("chip run lane is poisoned: ") + e.what());
+        } catch (...) {
+            throw std::runtime_error("chip run lane is poisoned by an unknown native failure");
         }
     }
 
-    static void rethrow_run_error(const std::shared_ptr<ChipRunState> &run) {
-        if (run->error != nullptr) std::rethrow_exception(run->error);
+    void require_usable() const {
+        if (closed) throw std::runtime_error("chip run lane is closed");
+        if (poison != nullptr) rethrow_as_poisoned(poison);
+    }
+
+    void rethrow_run_error(const std::shared_ptr<ChipRunState> &run) const {
+        if (run->error == nullptr) return;
+        if (run->poison_error != nullptr) rethrow_as_poisoned(run->poison_error);
+        std::rethrow_exception(run->error);
     }
 
     bool permits_native_successor(const ChipRunState &predecessor, const CallConfig &successor_config) const {
@@ -83,7 +88,8 @@ struct ChipRunLaneState {
         run->disposition = ChipRunPreparationDisposition::NATIVE_PREPARED;
     }
 
-    void poison_with(std::exception_ptr error) {
+    void poison_with(const std::shared_ptr<ChipRunState> &run, std::exception_ptr error) {
+        if (run->poison_error == nullptr) run->poison_error = error;
         if (poison == nullptr) poison = error;
     }
 
@@ -91,8 +97,9 @@ struct ChipRunLaneState {
         try {
             worker->finalize_native_run(run->native_run);
         } catch (...) {
-            if (run->error == nullptr) run->error = std::current_exception();
-            poison_with(std::current_exception());
+            const std::exception_ptr finalize_error = std::current_exception();
+            if (run->error == nullptr) run->error = finalize_error;
+            poison_with(run, finalize_error);
         }
         run->phase = ChipRunState::Phase::TERMINAL;
         if (!fifo.empty() && fifo.front() == run) fifo.pop_front();
@@ -109,9 +116,11 @@ struct ChipRunLaneState {
         if (poison != nullptr) {
             if (run->phase == ChipRunState::Phase::PREPARED) {
                 run->error = poison;
+                run->poison_error = poison;
                 finish(run);
             } else if (run->phase == ChipRunState::Phase::QUEUED) {
                 run->error = poison;
+                run->poison_error = poison;
                 run->phase = ChipRunState::Phase::TERMINAL;
                 fifo.pop_front();
             }
@@ -179,7 +188,7 @@ struct ChipRunLaneState {
             const std::exception_ptr poll_error = std::current_exception();
             finish(target);
             if (target->error == nullptr) target->error = poll_error;
-            poison_with(target->error);
+            poison_with(target, target->error);
             launch_front();
             return true;
         }
@@ -193,6 +202,7 @@ struct ChipRunLaneState {
         const auto run = fifo.front();
         if (poison != nullptr && run->phase == ChipRunState::Phase::QUEUED) {
             run->error = poison;
+            run->poison_error = poison;
             run->phase = ChipRunState::Phase::TERMINAL;
             fifo.pop_front();
             return;
@@ -205,7 +215,10 @@ struct ChipRunLaneState {
         launch_front();
         if (run->phase == ChipRunState::Phase::TERMINAL) return;
         if (run->phase == ChipRunState::Phase::PREPARED && (!run->activated || poison != nullptr)) {
-            if (poison != nullptr && run->error == nullptr) run->error = poison;
+            if (poison != nullptr && run->error == nullptr) {
+                run->error = poison;
+                run->poison_error = poison;
+            }
             finish(run);
             return;
         }
@@ -214,7 +227,7 @@ struct ChipRunLaneState {
                 worker->wait_native_run(run->native_run);
             } catch (...) {
                 run->error = std::current_exception();
-                poison_with(run->error);
+                poison_with(run, run->error);
             }
             finish(run);
         }
@@ -235,7 +248,7 @@ struct ChipRunLaneState {
         } catch (...) {
             const std::exception_ptr wait_error = std::current_exception();
             if (front->error == nullptr) front->error = wait_error;
-            poison_with(front->error);
+            poison_with(front, front->error);
         }
         finish(front);
         launch_front();
@@ -268,7 +281,7 @@ bool ChipRun::wait_until(Deadline deadline) {
         {
             std::lock_guard<std::mutex> lk(lane_->mu);
             if (lane_->progress(run_)) {
-                ChipRunLaneState::rethrow_run_error(run_);
+                lane_->rethrow_run_error(run_);
                 return true;
             }
             // An unbounded waiter has no deadline to end its loop, so polling
@@ -284,7 +297,7 @@ void ChipRun::activate() {
     if (lane_ == nullptr || run_ == nullptr) throw std::runtime_error("empty ChipRun handle");
     std::lock_guard<std::mutex> lk(lane_->mu);
     if (run_->phase == ChipRunState::Phase::TERMINAL) {
-        ChipRunLaneState::rethrow_run_error(run_);
+        lane_->rethrow_run_error(run_);
         return;
     }
     run_->activated = true;
@@ -308,7 +321,7 @@ void ChipRun::abandon() {
             lane_->worker->finalize_native_run(run_->native_run);
         } catch (...) {
             run_->error = std::current_exception();
-            lane_->poison_with(run_->error);
+            lane_->poison_with(run_, run_->error);
         }
     }
     run_->phase = ChipRunState::Phase::TERMINAL;

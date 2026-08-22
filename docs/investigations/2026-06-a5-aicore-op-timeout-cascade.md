@@ -103,9 +103,9 @@ verified:
 
 This is what the **force-reset recovery** fix below builds on.
 
-## Fix
+## Initial containment fix
 
-Two independent guards, both landed:
+Two independent guards landed before force-reset recovery:
 
 1. **Driver fail-fast (root-cause containment)** —
    `src/a5/platform/onboard/host/device_runner.{h,cpp}`. On any
@@ -118,19 +118,18 @@ Two independent guards, both landed:
    fails immediately at the run() guard (`code -1`, "Rebuild the Worker"),
    not at `halResMap`.
 
-2. **Fixture rebuild-then-skip (CI containment)** — `conftest.py`. A
-   `pytest_runtest_makereport` hook stashes the call-phase exception; the
-   `st_worker` L2 path heals **only** on a device-runtime `RuntimeError`
-   (`simpler_run failed …` / `register_callable failed …` / `DeviceRunner
-   marked unusable` / `simpler_init failed …`), never on golden mismatches.
-   The heal `close()`s the pooled `Worker` and drops it so the next test
-   **rebuilds**. Because the a5 rebuild's `Worker.init()` then fails (device
-   still poisoned — see above), the create path catches that device error,
-   marks the runtime poisoned (`_l2_poisoned`), and `pytest.skip`s — that
-   test and every later one for the runtime — with a clear reason. On an
-   arch where in-process re-init *does* work, the rebuild succeeds and tests
-   continue; on a5 they skip cleanly. Either way the worker-wide 507899
-   failure storm is gone.
+2. **Fixture rebuild-then-skip (initial CI containment)** — `conftest.py`. A
+   `pytest_runtest_makereport` hook stashes the call-phase exception. The error
+   spellings used by the initial classifier have since been replaced by
+   `prepare_native_run`, `launch_native_run`, `poll_native_run`, and
+   `finalize_native_run` failure messages plus the
+   `chip run lane is poisoned: …` prefix. In both versions, the L2 path retires
+   the pooled Worker only for a terminal device/Worker failure, never for golden
+   mismatches. Before force-reset recovery landed, the next a5 `Worker.init()`
+   still failed on the poisoned device, so the create path marked the runtime
+   poisoned (`_l2_poisoned`) and skipped the remaining tests. This contained
+   the worker-wide 507899 failure storm; the follow-up recovery below lets those
+   tests run in the same process when the force reset succeeds.
 
 Verification (pooled L2 cascade through the real `st_worker` fixture: a hang
 class poisons, a noop class follows on the same pool key; plus a normal L2
@@ -145,11 +144,11 @@ class for no-regression):
 Each "after" run is "1 failed, 1 skipped": the one real failure
 (TestAHangPoison) stands, every later test is a clean skip.
 
-The skip carries its reason, e.g.: *"L2 Worker.init for runtime
-'tensormap_and_ringbuffer' failed with a device-runtime error (simpler_init
-failed with code 507899); the device context is not recoverable in-process
-after an earlier AICore error — skipping remaining 'tensormap_and_ringbuffer'
-L2 tests (a fresh worker process recovers)."*
+At this historical containment stage, the skip carried a reason such as:
+*"L2 Worker.init for runtime 'tensormap_and_ringbuffer' failed with a
+device-runtime error (simpler_init failed with code 507899); the device context
+is not recoverable in-process after an earlier AICore error — skipping remaining
+'tensormap_and_ringbuffer' L2 tests (a fresh worker process recovers)."*
 
 ## Force-reset recovery (2026-06-09)
 

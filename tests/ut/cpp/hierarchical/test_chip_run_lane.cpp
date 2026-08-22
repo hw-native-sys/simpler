@@ -490,13 +490,69 @@ TEST(ChipRunLaneTest, FinalizeFailurePoisonsAdmissionAndCloseReportsIt) {
     g_complete[0] = true;
     g_finalize_rc[0] = -7;
     EXPECT_TRUE(first.done());
-    EXPECT_THROW(first.wait_until(ChipRunLane::Clock::time_point::max()), std::runtime_error);
+    try {
+        (void)first.wait_until(ChipRunLane::Clock::time_point::max());
+        FAIL() << "expected the poisoned-lane error";
+    } catch (const std::runtime_error &e) {
+        EXPECT_NE(std::string(e.what()).find("chip run lane is poisoned"), std::string::npos);
+        EXPECT_NE(std::string(e.what()).find("finalize_native_run failed with code -7"), std::string::npos);
+    }
     EXPECT_TRUE(lane.poisoned());
 
     ChipStorageTaskArgs args{};
     EXPECT_THROW(
         lane.submit(1, args, CallConfig{}, PipelineSlotLease{1, 0, 102}, 102, 102, nullptr, 0, true), std::runtime_error
     );
+    EXPECT_THROW(lane.close(), std::runtime_error);
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, LaunchFailureWhoseFinalizeFailsReportsThePoisonedLane) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    g_launch_rc[0] = -6;
+    g_finalize_rc[0] = -7;
+
+    ChipRun failed = submit(lane, 101, 0);
+    EXPECT_TRUE(failed.done());
+    try {
+        (void)failed.wait_until(ChipRunLane::Deadline::max());
+        FAIL() << "expected the poisoned-lane error";
+    } catch (const std::runtime_error &e) {
+        EXPECT_NE(std::string(e.what()).find("chip run lane is poisoned"), std::string::npos);
+        EXPECT_NE(std::string(e.what()).find("finalize_native_run failed with code -7"), std::string::npos);
+    }
+    EXPECT_TRUE(lane.poisoned());
+    EXPECT_THROW(lane.close(), std::runtime_error);
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, EarlierFailedRunRetainsItsErrorAfterLaterRunPoisonsLane) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    g_prepare_rc[0] = -5;
+
+    ChipRun earlier = submit(lane, 101, 0);
+    EXPECT_TRUE(earlier.done());
+    EXPECT_FALSE(lane.poisoned());
+
+    ChipRun poisoner = submit(lane, 102, 1);
+    g_complete[1] = true;
+    g_finalize_rc[1] = -7;
+    EXPECT_TRUE(poisoner.done());
+    EXPECT_TRUE(lane.poisoned());
+
+    try {
+        (void)earlier.wait_until(ChipRunLane::Deadline::max());
+        FAIL() << "expected the earlier run's prepare error";
+    } catch (const std::runtime_error &e) {
+        EXPECT_NE(std::string(e.what()).find("prepare_native_run failed with code -5"), std::string::npos);
+        EXPECT_EQ(std::string(e.what()).find("chip run lane is poisoned"), std::string::npos);
+        EXPECT_EQ(std::string(e.what()).find("finalize_native_run failed with code -7"), std::string::npos);
+    }
+
     EXPECT_THROW(lane.close(), std::runtime_error);
     worker.finalize();
 }
@@ -515,6 +571,7 @@ TEST(ChipRunLaneTest, PollFailureReportsTheTerminalNativeError) {
         run.wait_until(ChipRunLane::Deadline::max());
         FAIL() << "expected the terminal native error";
     } catch (const std::runtime_error &e) {
+        EXPECT_NE(std::string(e.what()).find("chip run lane is poisoned"), std::string::npos);
         EXPECT_NE(std::string(e.what()).find("finalize_native_run failed with code 507015"), std::string::npos);
     }
     EXPECT_TRUE(lane.poisoned());

@@ -88,7 +88,7 @@ def _exercise_aicore_timeout(st_platform, st_device_ids, monkeypatch, tmp_path, 
         # Acceptable error codes for the STARS-killed AICore op. Device status
         # takes precedence when finalization can read it; otherwise the host
         # falls back to whichever stream-sync error surfaced first:
-        #   -100   = PTO2 scheduler timeout — the device classified the stalled
+        #   -100   = scheduler timeout — the device classified the stalled
         #            AIC task before finalization read the shared header.
         #   507046 = ACL_ERROR_RT_STREAM_SYNC_TIMEOUT — AICore stream's 4 s
         #            sync budget fires before AICPU sync notices.
@@ -107,7 +107,8 @@ def _exercise_aicore_timeout(st_platform, st_device_ids, monkeypatch, tmp_path, 
             # CANN 9.0.0/driver 26.0.rc1 containment deliberately stops the
             # SDMA run stream early so reset precedes DEV_RUNNING_DOWN.
             error_codes = r"(-100|507(046|018|015|000))"
-        with pytest.raises(RuntimeError, match=rf"run failed with code {error_codes}"):
+        native_run_error = rf"finalize_native_run failed with code {error_codes}\b"
+        with pytest.raises(RuntimeError, match=native_run_error):
             worker.run(handle, None, config)
         elapsed = time.monotonic() - t0
 

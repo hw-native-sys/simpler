@@ -1213,19 +1213,17 @@ def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
 # physical device. The Worker records actual SDMA dispatch attempts; merely
 # registering an unused SDMA callable does not rotate the pool.
 #
-# The driver-side guard
-# (``DeviceRunner::run`` fail-fast on ``device_unusable_``) keeps that cascade
-# from wedging, but the Worker stays poisoned.
-#
-# On a5 the poison survives close()+device-reset for the life of the process
-# (an in-process Worker.init rebuild fails with rtStreamCreate 507899; a
-# force-reset is unsafe on this shared box), so there is no in-process
-# recovery — only a fresh worker process gets a clean device. The native status
-# query tells the ``st_worker`` finalizer when to drop a poisoned or
-# SDMA-exposed pooled Worker; the hook below also stashes setup/call exceptions
-# as a diagnostic fallback. The L2 branch rebuilds where the arch allows it and otherwise
-# skips the remaining tests for that runtime (``_l2_poisoned``). Golden
-# mismatches / ordinary assertions leave a non-SDMA Worker reusable.
+# The driver-side guard (``DeviceRunner::run`` fail-fast on
+# ``device_unusable_``) keeps that cascade from wedging. Fatal onboard teardown
+# force-resets the exclusively allocated card with ``aclrtResetDeviceForce``
+# and probes the new device generation before confirming recovery. A successful
+# reset lets the next Worker initialize in the same process; an unconfirmed
+# reset or failed rebuild marks the runtime in ``_l2_poisoned`` and falls back
+# to a fresh-process retry. For runtime failures, the hook below preserves the
+# setup/call exception text and the ``st_worker`` finalizer uses the retirement
+# classifier below to decide whether the pooled Worker can be reused. Exception
+# wording is therefore part of that decision input, not merely diagnostic.
+# Golden mismatches and ordinary assertions leave a non-SDMA Worker reusable.
 # ---------------------------------------------------------------------------
 
 # Plain attribute name on the test item — NOT pytest.StashKey()/item.stash,
@@ -1242,18 +1240,17 @@ def pytest_runtest_makereport(item, call):
     yield
     # A fixture that depends on st_worker may dispatch during setup. Preserve
     # that error before st_worker's teardown finalizer decides whether its
-    # Worker can return to the session pool. Native lifecycle status below is
-    # authoritative; this text classification remains a diagnostic fallback.
+    # Worker can return to the session pool; its retirement decision consumes
+    # this exception text through the classifier below.
     if call.when in {"setup", "call"} and call.excinfo is not None:
         setattr(item, _ST_CALL_EXCINFO, call.excinfo)
 
 
-# Only these error codes mean the device/ACL context is sticky-errored — i.e.
-# the worker is poisoned and must be rebuilt/skipped. Matching on the bare
-# "<op> failed with code" prefix would also catch ordinary kernel/run failures
-# (every non-zero rc is wrapped that way), turning a normal failing test into a
-# spurious worker rebuild and, downstream, a misleading runtime-wide skip. So
-# we extract the trailing <N> and match only the known poison codes:
+# Code-bearing native/init failures retire a Worker only when the code identifies
+# a sticky device/ACL context. Matching every "<op> failed with code" message
+# would also catch ordinary run failures and turn them into spurious rebuilds.
+# This code allowlist is separate from the retirement markers below, which
+# identify a non-reusable Worker independently of the originating status code:
 #   207001 ACL_ERROR_RT_MEMORY_ALLOCATION  (the CI cascade trigger)
 #   507000 ACL_ERROR_RT_INTERNAL_ERROR  (a5 op-timeout at AICPU stream sync)
 #   507015 ACL_ERROR_RT_AICORE_EXCEPTION
@@ -1264,16 +1261,24 @@ def pytest_runtest_makereport(item, call):
 # The names above are CANN's own (acl/error_codes/rt_error_codes.h); what each one
 # means and how to chase it is in docs/troubleshooting/device-error-codes.md, and the
 # host log now prints that meaning next to the code.
-# Worker surfaces these as "run/run_prepared/prepare_callable/simpler_init
-# failed with code <N>" — never as an AssertionError, so golden mismatches are
-# already excluded.
+# Worker surfaces these as phase-specific "*_native_run failed with code <N>"
+# messages or "simpler_init failed with code <N>" — never as an AssertionError,
+# so golden mismatches are already excluded.
 _DEVICE_POISON_CODES = frozenset({207001, 507000, 507015, 507018, 507046, 507899, -1})
-_DEVICE_ERROR_CODE_RE = re.compile(r"\b(?:run|run_prepared|prepare_callable|simpler_init) failed with code (-?\d+)\b")
-_DEVICE_QUARANTINE_MARKERS = (
+_DEVICE_ERROR_CODE_RE = re.compile(
+    r"(?:(?:prepare|launch|poll|finalize)_native_run|simpler_init) failed with code (-?\d+)\b"
+)
+_L2_WORKER_RETIREMENT_MARKERS = (
     "device is quarantined after a prior Worker could not confirm reset",
     "device is already owned by another live ChipWorker in this process",
     "device reset was not confirmed, so this process quarantined the device",
     "cleanup could not confirm device reset, so this process quarantined the device",
+    # Poll and finalize failures poison the chip run lane independently of their
+    # runtime status code. A poisoned lane rejects every later submit on the same
+    # Worker.
+    "poll_native_run failed with code",
+    "finalize_native_run failed with code",
+    "chip run lane is poisoned",
 )
 
 
@@ -1308,24 +1313,25 @@ class _L2WorkerPool(dict):
 _L2_TERMINAL_RETAINED_WORKERS: list[object] = []
 
 
-def _is_device_runtime_error_msg(msg: str) -> bool:
+def _requires_l2_worker_retirement_msg(msg: str) -> bool:
     match = _DEVICE_ERROR_CODE_RE.search(msg)
     return (match is not None and int(match.group(1)) in _DEVICE_POISON_CODES) or any(
-        marker in msg for marker in _DEVICE_QUARANTINE_MARKERS
+        marker in msg for marker in _L2_WORKER_RETIREMENT_MARKERS
     )
 
 
-def _is_device_runtime_error(excinfo) -> bool:
+def _requires_l2_worker_retirement(excinfo) -> bool:
     if excinfo is None or not issubclass(excinfo.type, RuntimeError):
         return False
-    return _is_device_runtime_error_msg(str(excinfo.value))
+    return _requires_l2_worker_retirement_msg(str(excinfo.value))
 
 
 def _register_l2_pool_recycle(request, pool, key, poisoned_runtimes):
-    """Drop + close a pooled L2 Worker after a device-runtime error.
+    """Drop + close a pooled L2 Worker after a terminal runtime/lane error.
 
-    Recycling prevents a poisoned-context cascade. A passing test and a
-    non-device failure (golden mismatch, assertion) keep the Worker pooled.
+    Recycling prevents a poisoned-context or poisoned-lane cascade. A passing
+    test and a non-terminal failure (golden mismatch, assertion) keep the Worker
+    pooled.
 
     NOTE: an AICore op-timeout poisons the device context. `DeviceRunner::
     finalize()` force-resets the card (`aclrtResetDeviceForce`, per-card safe
@@ -1343,8 +1349,8 @@ def _register_l2_pool_recycle(request, pool, key, poisoned_runtimes):
         worker = pool.get(key)
         if worker is None:
             return
-        device_error = _is_device_runtime_error(getattr(request.node, _ST_CALL_EXCINFO, None))
-        if not device_error:
+        retirement_required = _requires_l2_worker_retirement(getattr(request.node, _ST_CALL_EXCINFO, None))
+        if not retirement_required:
             return
         try:
             pool.retire(key)
@@ -1637,7 +1643,7 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
         try:
             w.init()
         except RuntimeError as e:
-            if _is_device_runtime_error_msg(str(e)):
+            if _requires_l2_worker_retirement_msg(str(e)):
                 _l2_poisoned.add(runtime)
                 _register_l2_poison_skip(request.node)
                 try:
