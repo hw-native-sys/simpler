@@ -87,6 +87,8 @@ struct CompletedTaskQueue {
     uint64_t size() const { return tail.load(std::memory_order_acquire) - head.load(std::memory_order_acquire); }
 };
 
+class SchedulerContextTestPeer;
+
 /**
  * SchedulerContext: owns all scheduler-side state and methods.
  *
@@ -177,6 +179,8 @@ public:
     int32_t aiv_count() const { return aiv_count_; }
     bool is_completed() const { return completed_.load(std::memory_order_acquire); }
     int32_t completed_tasks_count() const { return completed_tasks_.load(std::memory_order_acquire); }
+
+    friend class SchedulerContextTestPeer;
 
 private:
     // =========================================================================
