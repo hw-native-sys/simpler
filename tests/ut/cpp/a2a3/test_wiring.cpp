@@ -129,6 +129,7 @@ TEST_F(WiringTest, NoFaninTaskBecomesReady) {
 
     init_slot(task_slot, CHIP_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 0;
+    payload.fanin_wait_count = 0;
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
@@ -164,6 +165,7 @@ TEST_F(WiringTest, WireTaskAllProducersEarlyFinished) {
     // Consumer task with 2 fanins
     init_slot(task_slot, CHIP_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 2;
+    payload.fanin_wait_count = 2;
     payload.fanin_inline_edges[0].set(&producer_slots[0], DEP_WAIT | DEP_RETAIN);
     payload.fanin_inline_edges[1].set(&producer_slots[1], DEP_WAIT | DEP_RETAIN);
 
@@ -201,6 +203,7 @@ TEST_F(WiringTest, WireTaskProducersPendingTaskNotReady) {
 
     init_slot(task_slot, CHIP_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 2;
+    payload.fanin_wait_count = 2;
     payload.fanin_inline_edges[0].set(&producer_slots[0], DEP_WAIT | DEP_RETAIN);
     payload.fanin_inline_edges[1].set(&producer_slots[1], DEP_WAIT | DEP_RETAIN);
     task_slot.payload = &payload;
@@ -263,6 +266,7 @@ TEST_F(WiringTest, WireTaskMixedProducerStates) {
 
     init_slot(task_slot, CHIP_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 3;
+    payload.fanin_wait_count = 3;
     for (int i = 0; i < 3; i++) {
         payload.fanin_inline_edges[i].set(&producers[i], DEP_WAIT | DEP_RETAIN);
     }
@@ -306,6 +310,7 @@ TEST_F(WiringTest, WireTaskAllFlaggedPrecompletedSeedsDispatchFanin) {
 
     init_slot(task_slot, CHIP_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 2;
+    payload.fanin_wait_count = 2;
     payload.fanin_inline_edges[0].set(&producer_slots[0], DEP_WAIT | DEP_RETAIN);
     payload.fanin_inline_edges[1].set(&producer_slots[1], DEP_WAIT | DEP_RETAIN);
     task_slot.payload = &payload;
@@ -334,6 +339,7 @@ TEST_F(WiringTest, WireTaskUnflaggedPrecompletedProducerDoesNotSeed) {
 
     init_slot(task_slot, CHIP_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 1;
+    payload.fanin_wait_count = 1;
     payload.fanin_inline_edges[0].set(&producer, DEP_WAIT | DEP_RETAIN);
     task_slot.payload = &payload;
     task_slot.task = &desc;
@@ -359,6 +365,7 @@ TEST_F(WiringTest, WireTaskOneUnflaggedProducerDisqualifiesSeed) {
 
     init_slot(task_slot, CHIP_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 2;
+    payload.fanin_wait_count = 2;
     payload.fanin_inline_edges[0].set(&producers[0], DEP_WAIT | DEP_RETAIN);
     payload.fanin_inline_edges[1].set(&producers[1], DEP_WAIT | DEP_RETAIN);
     task_slot.payload = &payload;
@@ -367,6 +374,73 @@ TEST_F(WiringTest, WireTaskOneUnflaggedProducerDisqualifiesSeed) {
     wire_fanin(task_slot, 2);
 
     EXPECT_EQ(payload.dispatch_fanin.load(), 0);  // disqualified: seed stays 0
+}
+
+// Post-reduction twin of EarlyDispatchBlockedByUnflaggedProducer: reduction
+// demoted the unflagged producer's edge out of fanin_wait_count, so
+// early_dispatch_blocked carries the unit it used to hold and the flagged
+// producer alone still cannot reach early_dispatch_target().
+TEST_F(WiringTest, ReducedEdgeToUnflaggedProducerStillBlocksEarlyDispatch) {
+    alignas(64) ChipTaskSlotState task_slot;
+    alignas(64) ChipTaskSlotState p_flagged, q_unflagged;
+    alignas(64) TaskPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    TaskDescriptor desc{};
+
+    init_slot(p_flagged, CHIP_TASK_PENDING, 1, 1);
+    p_flagged.task_attrs.set_early_resolve(true);
+    init_slot(q_unflagged, CHIP_TASK_PENDING, 1, 1);
+    q_unflagged.task_attrs.set_early_resolve(false);
+
+    init_slot(task_slot, CHIP_TASK_PENDING, 0, 1);
+    payload.fanin_actual_count = 2;
+    payload.fanin_wait_count = 1;        // q's WAIT was cleared by reduction
+    payload.early_dispatch_blocked = 1;  // ... and q does not allow early resolve
+    payload.fanin_inline_edges[0].set(&p_flagged, DEP_WAIT | DEP_RETAIN);
+    payload.fanin_inline_edges[1].set(&q_unflagged, DEP_NONE);
+    task_slot.payload = &payload;
+    task_slot.task = &desc;
+
+    wire_fanin(task_slot, 1);
+    sched.record_published_blocks(p_flagged, p_flagged.logical_block_num);
+    sched.propagate_dispatch_fanin(p_flagged);
+
+    EXPECT_EQ(payload.early_dispatch_target(), 2);
+    EXPECT_EQ(payload.dispatch_fanin.load(), 1);  // p alone can never reach 2
+    EXPECT_EQ(payload.early_dispatch_state.load(), EARLY_DISPATCH_NONE);
+}
+
+// Control for the pair above: the same reduced shape whose reduced-away producer
+// IS flagged leaves the target at fanin_wait_count, so reduction does not cost
+// this consumer its early-dispatch candidacy.
+TEST_F(WiringTest, ReducedEdgeToFlaggedProducerKeepsEarlyDispatch) {
+    alignas(64) ChipTaskSlotState task_slot;
+    alignas(64) ChipTaskSlotState p_flagged, q_flagged;
+    alignas(64) TaskPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    TaskDescriptor desc{};
+
+    init_slot(p_flagged, CHIP_TASK_PENDING, 1, 1);
+    p_flagged.task_attrs.set_early_resolve(true);
+    init_slot(q_flagged, CHIP_TASK_PENDING, 1, 1);
+    q_flagged.task_attrs.set_early_resolve(true);
+
+    init_slot(task_slot, CHIP_TASK_PENDING, 0, 1);
+    payload.fanin_actual_count = 2;
+    payload.fanin_wait_count = 1;
+    payload.early_dispatch_blocked = 0;  // reduction saw no unflagged producer
+    payload.fanin_inline_edges[0].set(&p_flagged, DEP_WAIT | DEP_RETAIN);
+    payload.fanin_inline_edges[1].set(&q_flagged, DEP_NONE);
+    task_slot.payload = &payload;
+    task_slot.task = &desc;
+
+    wire_fanin(task_slot, 1);
+    sched.record_published_blocks(p_flagged, p_flagged.logical_block_num);
+    sched.propagate_dispatch_fanin(p_flagged);
+
+    EXPECT_EQ(payload.early_dispatch_target(), 1);
+    EXPECT_EQ(payload.dispatch_fanin.load(), 1);
+    EXPECT_EQ(payload.early_dispatch_state.load(), EARLY_DISPATCH_STAGING);
 }
 
 TEST_F(WiringTest, EarlyDispatchWaitsForAllProducerBlocksPublished) {
@@ -385,6 +459,7 @@ TEST_F(WiringTest, EarlyDispatchWaitsForAllProducerBlocksPublished) {
 
     init_slot(task_slot, CHIP_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 1;
+    payload.fanin_wait_count = 1;
     payload.fanin_inline_edges[0].set(&producer, DEP_WAIT | DEP_RETAIN);
     task_slot.payload = &payload;
     task_slot.task = &desc;
@@ -516,6 +591,7 @@ TEST_F(WiringTest, LateWiredFullyPublishedProducerStillSeedsEarlyDispatch) {
 
     init_slot(consumer, CHIP_TASK_PENDING, 0, 1);
     consumer_payload.fanin_actual_count = 1;
+    consumer_payload.fanin_wait_count = 1;
     consumer_payload.fanin_inline_edges[0].set(&producer, DEP_WAIT | DEP_RETAIN);
     consumer.payload = &consumer_payload;
     consumer.task = &consumer_desc;
@@ -544,6 +620,7 @@ TEST_F(WiringTest, WiringSeedEnqueuesAfterConcurrentPropagation) {
 
     init_slot(consumer, CHIP_TASK_PENDING, 0, 1);
     consumer_payload.fanin_actual_count = 3;
+    consumer_payload.fanin_wait_count = 3;
     for (int i = 0; i < 3; i++)
         consumer_payload.fanin_inline_edges[i].set(&producers[i], DEP_WAIT | DEP_RETAIN);
     consumer.payload = &consumer_payload;
@@ -1006,6 +1083,7 @@ TEST_F(WiringTest, EarlyDispatchBlockedByUnflaggedProducer) {
 
     init_slot(task_slot, CHIP_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 2;
+    payload.fanin_wait_count = 2;
     payload.fanin_inline_edges[0].set(&p_flagged, DEP_WAIT | DEP_RETAIN);
     payload.fanin_inline_edges[1].set(&q_unflagged, DEP_WAIT | DEP_RETAIN);
     task_slot.payload = &payload;
@@ -1036,6 +1114,7 @@ TEST_F(WiringTest, UnflaggedProducerDoesNotPropagate) {
     init_slot(consumer, CHIP_TASK_PENDING, 1, 1);
     consumer.payload = &cons_payload;
     cons_payload.fanin_actual_count = 1;
+    cons_payload.fanin_wait_count = 1;
 
     DepListEntry dep{};
     dep.slot_state = &consumer;
@@ -1067,6 +1146,7 @@ TEST_F(WiringTest, FlaggedPrecompletedCreatorTransparentToEarlyDispatch) {
 
     init_slot(task_slot, CHIP_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 2;
+    payload.fanin_wait_count = 2;
     payload.fanin_inline_edges[0].set(&creator, DEP_WAIT | DEP_RETAIN);
     payload.fanin_inline_edges[1].set(&compute, DEP_WAIT | DEP_RETAIN);
     task_slot.payload = &payload;
@@ -1148,6 +1228,7 @@ TEST_F(WiringTest, OnTaskReleaseReleasesProducers) {
 
     init_slot(task_slot, CHIP_TASK_COMPLETED, 3, 1);
     payload.fanin_actual_count = 2;
+    payload.fanin_wait_count = 2;
     payload.fanin_inline_edges[0].set(&producers[0], DEP_WAIT | DEP_RETAIN);
     payload.fanin_inline_edges[1].set(&producers[1], DEP_WAIT | DEP_RETAIN);
     // Need a valid fanin_spill_pool even though we don't spill
@@ -1191,6 +1272,7 @@ TEST_F(WiringTest, OrderingOnlyReleasedAtWiringRetentionHeldUntilRelease) {
 
     init_slot(task_slot, CHIP_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 2;
+    payload.fanin_wait_count = 2;
     payload.fanin_inline_edges[0].set(&wait_producer, DEP_WAIT);
     payload.fanin_inline_edges[1].set(&retain_producer, DEP_WAIT | DEP_RETAIN);
     FaninPool dummy_pool{};
@@ -1244,6 +1326,8 @@ TEST_F(WiringTest, ReleaseHonorsRetainFlagInSpillRegion) {
     e->set(&spill_retain, DEP_WAIT | DEP_RETAIN);
 
     payload.fanin_actual_count = CHIP_FANIN_INLINE_CAP + 1;
+
+    payload.fanin_wait_count = CHIP_FANIN_INLINE_CAP + 1;
     payload.fanin_spill_start = spill_start;
     payload.fanin_spill_pool = &spill_pool;
     task_slot.payload = &payload;
@@ -1330,6 +1414,7 @@ TEST_F(WiringTest, NoEdgePublishRecordsDepPoolMark) {
 
     init_slot(task_slot, CHIP_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 0;
+    payload.fanin_wait_count = 0;
     task_slot.payload = &payload;
     task_slot.task = &desc;
 

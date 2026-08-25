@@ -963,8 +963,13 @@ struct SchedulerState {
         for (; edge != nullptr; edge = edge->next) {
             ChipTaskSlotState *c = edge->slot_state;
             if (c->task_attrs.has_predicate()) continue;
+            // early_dispatch_target() is the WAIT-edge count plus any unit held
+            // by a reduced-away unflagged producer: only DEP_WAIT producers link
+            // onto fanout_head and bump dispatch_fanin, so RETAIN-only and
+            // reduction-dropped edges (still counted by fanin_actual_count) stay
+            // out of the count while still being able to hold the target short.
             int32_t nf = c->payload->dispatch_fanin.fetch_add(1, std::memory_order_acq_rel) + 1;
-            if (nf != c->payload->fanin_actual_count) continue;
+            if (nf != c->payload->early_dispatch_target()) continue;
             try_enqueue_early_dispatch_candidate(*c);
         }
     }

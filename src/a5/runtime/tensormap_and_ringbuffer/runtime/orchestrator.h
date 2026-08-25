@@ -45,6 +45,7 @@
 struct OrchestratorLayout {
     size_t off_fanin_pool[CHIP_MAX_RING_DEPTH];
     size_t off_fanin_seen_epoch[CHIP_MAX_RING_DEPTH];
+    size_t off_wait_reach[CHIP_MAX_RING_DEPTH];
     size_t off_scope_tasks;
     size_t off_scope_begins;
     ChipTensorMapLayout tensor_map;
@@ -70,6 +71,18 @@ struct OrchestratorState {
     ChipRingSet rings[CHIP_MAX_RING_DEPTH];
     uint32_t *fanin_seen_epoch[CHIP_MAX_RING_DEPTH];
     uint32_t fanin_seen_current_epoch{1};
+
+    // Per-slot frozen WAIT-ancestor reachability (bitmap + submit seq),
+    // indexed [ring][slot]. Orchestrator-private runtime-arena storage, never
+    // read by scheduler threads. A slot's entry is valid only while the slot
+    // holds the task that published it: every consumer that reads a producer's
+    // entry holds that producer's submit-claim pin (fanout_count), so the slot
+    // cannot be rebound under the read.
+    WaitReachEntry *wait_reach[CHIP_MAX_RING_DEPTH];
+
+    // Global submission sequence. Assigned once per prepared task across all
+    // rings; unsigned subtraction preserves recent distances across uint64 wrap.
+    uint64_t submit_seq{0};
 
     // === TENSOR MAP (Private) ===
     ChipTensorMap tensor_map;  // Producer lookup

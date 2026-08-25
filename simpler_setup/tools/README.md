@@ -17,6 +17,7 @@ no repo checkout required.
 - **[hbg_bind_phases](#hbg_bind_phases)** — `host_build_graph` `bind`-stage phases from `bind phase=` log markers → per-phase min/median/max plus the control-plane total
 - **[dump_viewer](#dump_viewer)** — inspect / export args dumps (see [docs/args-dump.md](../../docs/dfx/args-dump.md) for full workflow)
 - **[deps_viewer](#deps_viewer)** — `deps.json` (dep_gen) → text or pan/zoom HTML dependency graph
+- **[wait_reduction_sim](#wait_reduction_sim)** — `deps.json` (dep_gen) → bounded-bitmap WAIT reduction coverage vs the full-DAG upper bound, per BL
 
 For CLIs that allow an omitted input, auto-detection paths
 (`outputs/*/chip_swimlane_records.json`, `outputs/*/args_dump/`) are resolved
@@ -588,6 +589,57 @@ python -m simpler_setup.tools.dump_viewer --task 0x0000000200000a00 --stage befo
 # Export a specific arg by index (always exports)
 python -m simpler_setup.tools.dump_viewer outputs/<case>_<ts>/args_dump/ --index 42
 ```
+
+---
+
+## wait_reduction_sim
+
+Measure how many redundant WAIT edges the `tensormap_and_ringbuffer`
+runtime's bounded reachability bitmap reduction would remove from a real
+dependency graph, against the exact full-DAG transitive reduction as the
+upper bound (issue #1376 acceptance #9). Decides the production bitmap
+window (BL) from data instead of guesswork.
+
+### Overview
+
+`wait_reduction_sim` reads the same `deps.json` the
+[`deps_viewer`](#deps_viewer) consumes (edges are as-constructed, i.e.
+pre-reduction, so one capture serves baseline and comparison alike). It
+reconstructs the global submission order from the `tasks[]` record order,
+OR-accumulates edge flags per `(pred, succ)` pair, and runs two models over
+the WAIT subgraph:
+
+- **Full reduction** — exact transitive reachability over the whole DAG:
+  the upper bound any reducer could reach.
+- **Online bitmap** — a faithful mirror of the runtime's
+  `reduce_wait_edges` (frozen per-task `R[t]`, two-pass `direct`/`via`
+  fold, `d > BL` window misses kept) at each requested window size.
+
+The report includes per-BL removal counts, `WAIT|RETAIN → RETAIN` demotions
+vs pure WAIT drops, window and cross-ring misses, the producer→consumer
+submission-distance CDF, and the estimated reduction in readiness fanout
+nodes / dependency-pool entries. `DepGenRecord` does not preserve explicit
+dependency kinds yet (#1827), so removal counts are accurate while the report
+marks affected demote-vs-drop classifications as uncertain.
+
+### Usage
+
+```bash
+# Capture once (dep_gen records pre-construction edges; see docs/dfx/dep-gen.md)
+pytest examples/a5/tensormap_and_ringbuffer/qwen3_14b_decode --platform a5 --enable-dep-gen
+
+# Compare BL=64/128/256 (default) against the upper bound
+python -m simpler_setup.tools.wait_reduction_sim outputs/<case>_<ts>/deps.json
+
+# Machine-readable output, e.g. to diff two captures
+python -m simpler_setup.tools.wait_reduction_sim deps_a.json deps_b.json --json report.json
+```
+
+Reading the output: when `BL=64 removed ≈ upper_bound`, the single-word
+window already saturates the graph's redundancy and larger windows buy
+nothing; when the `pct_pairs_within_window` column is well below 100 for a
+BL, the graph has far-apart producer/consumer pairs that only a wider
+window could cover.
 
 ---
 

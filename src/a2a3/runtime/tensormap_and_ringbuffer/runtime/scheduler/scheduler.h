@@ -957,7 +957,7 @@ struct SchedulerState {
     // FLAGGED producer `p` publishes blocks (normal dispatch, early-dispatch release, or
     // sync_start staging), but no-ops until every logical block is launch-visible. Only then
     // does it walk p's fanout and bump each consumer's
-    // dispatch_fanin. A consumer whose dispatch_fanin reaches fanin_actual_count (= every
+    // dispatch_fanin. A consumer whose dispatch_fanin reaches early_dispatch_target() (= every
     // producer is flagged-and-fully-dispatched, or was already complete when the consumer was
     // wired) is an early-dispatch candidate: CAS NONE->STAGING (exactly-once) and push to
     // early_dispatch_queues[shape] (or early_sync_start_queue for a require_sync_start cohort)
@@ -997,15 +997,21 @@ struct SchedulerState {
         for (; edge != nullptr; edge = edge->next) {
             ChipTaskSlotState *c = edge->slot_state;
             if (c->task_attrs.has_predicate()) continue;  // predicated consumers never early-dispatch
-            // Compare to fanin_actual_count (the real producer-edge count), NOT
-            // fanin_count: fanin_count = fanin_actual_count + 1 (a self/wiring +1 that
-            // ready_fanin gets but dispatch_fanin does not). dispatch_fanin starts at
-            // the wiring-time flagged-pre-completed seed and is bumped here by flagged
-            // producers; reaching fanin_actual_count means every producer is
-            // flagged-and-fully-published or was pre-completed. An unflagged producer leaves the
-            // seed short and never bumps, so this stays unreachable for that consumer.
+            // Compare to early_dispatch_target(), NOT fanin_count or
+            // fanin_actual_count: fanin_count = fanin_wait_count + 1 (a
+            // self/wiring +1 that ready_fanin gets but dispatch_fanin does not),
+            // and fanin_actual_count also counts RETAIN-only and
+            // reduction-dropped edges, which never link onto fanout_head and so
+            // never bump dispatch_fanin. dispatch_fanin starts at the
+            // wiring-time flagged-pre-completed seed and is bumped here by
+            // flagged producers; reaching the target means every WAIT producer
+            // is flagged-and-fully-published or was pre-completed. An unflagged
+            // producer leaves the seed short and never bumps -- whether it is
+            // still a WAIT producer or was reduced away and left its unit in
+            // early_dispatch_blocked -- so this stays unreachable for that
+            // consumer either way.
             int32_t nf = c->payload->dispatch_fanin.fetch_add(1, std::memory_order_acq_rel) + 1;
-            if (nf != c->payload->fanin_actual_count) continue;
+            if (nf != c->payload->early_dispatch_target()) continue;
             try_enqueue_early_dispatch_candidate(*c);
         }
     }

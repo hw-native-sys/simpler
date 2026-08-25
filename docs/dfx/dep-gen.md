@@ -75,6 +75,23 @@ inputs to each submit are captured and the graph is reconstructed afterwards.
   immediately and know to update the annotated mirror.
 - **Output.** `<output_prefix>/deps.json` — strided-Tensor schema with
   `tasks[]`, `tensors[]`, and tensor-annotated `edges[]` (see §4).
+- **Edges are as-constructed, not as-reduced.** Both passes replay the same
+  fanin construction, so `deps.json` records the pre-reduction edge set.
+  The `tensormap_and_ringbuffer` runtime's bounded bitmap transitive
+  reduction (`reduce_wait_edges`, applied when the builder flushes in
+  `submit_task_common`) runs *after* construction and clears the `wait`
+  flag on a direct edge already covered by a WAIT path through the
+  producer's own transitive ancestors. A diamond `A→B→C` + `A→C` still
+  shows `A→C` with its constructed flags. The differential gate is
+  unaffected — both passes replay the same construction. What the
+  reduction changes is the edge's flags: a redundant `WAIT|RETAIN` edge
+  demotes to RETAIN-only and a redundant `WAIT`-only edge drops to
+  `DEP_NONE`, with the entry kept either way, so retention and
+  pin-release accounting are preserved and only readiness enforcement
+  is relaxed.
+  [`wait_reduction_sim`](../../simpler_setup/tools/README.md#wait_reduction_sim)
+  replays the reduction offline over a capture to measure its coverage
+  against the full-DAG upper bound.
 
 ### 2.2 Host orchestration (`host_build_graph`)
 

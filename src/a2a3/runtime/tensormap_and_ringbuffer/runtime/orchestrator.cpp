@@ -246,6 +246,9 @@ struct FaninBuilder {
         spill_pool(spill_pool) {}
     int32_t count{0};       // total fanin edges (all flag combinations)
     int32_t wait_count{0};  // edges carrying DEP_WAIT — sizes readiness accounting
+    // Set when reduction cleared DEP_WAIT on an edge to a producer that does
+    // not allow early resolve; flushed to TaskPayload::early_dispatch_blocked.
+    bool reduced_unflagged_producer{false};
     int32_t spill_start{0};
     OrchestratorState *orch{nullptr};
     uint32_t seen_epoch{0};
@@ -255,6 +258,15 @@ struct FaninBuilder {
     template <typename Fn>
     FaninForEachReturn<Fn> for_each(Fn &&fn) const {
         return for_each_fanin_storage(inline_slots, count, spill_start, spill_pool, static_cast<Fn &&>(fn));
+    }
+
+    // Mutating walk over the same edges for_each visits, handing the callback
+    // the entry itself so flags can be rewritten (used by the reduction pass).
+    template <typename Fn>
+    void for_each_entry(Fn &&fn) {
+        for (int32_t i = 0; i < count; i++) {
+            fn(entry_at(i));
+        }
     }
 
     bool mark_seen(uint8_t prod_ring, int32_t prod_slot) {
@@ -436,6 +448,100 @@ static bool all_claimed_fanin_allow_early_resolve(const FaninBuilder &fanin_buil
     });
 }
 
+// Publish this task's frozen WAIT-ancestor bitmap. Runs once per submit, before
+// the slot becomes a producer of any later submit (single orchestrator thread),
+// so a reader always observes the entry of the task generation that owns the
+// slot.
+static void publish_wait_reach(OrchestratorState *orch, uint8_t ring, int32_t slot, uint64_t ancestors) {
+    orch->wait_reach[ring][slot].ancestors = ancestors;
+}
+
+// Resolve a producer slot pointer to its (ring, slot) index. ring_id is
+// per-slot invariant; pointer subtraction from the ring's slot_states base
+// never dereferences a possibly-reused slot.
+static bool slot_index_of(const OrchestratorState *orch, ChipTaskSlotState *p, uint8_t &ring, int32_t &slot) {
+    ring = p->ring_id;
+    if (ring >= CHIP_MAX_RING_DEPTH) return false;
+    const SharedMemoryRingHeader &r = orch->sm_header->rings[ring];
+    slot = static_cast<int32_t>(p - r.slot_states);
+    return slot >= 0 && static_cast<uint64_t>(slot) < r.task_window_size;
+}
+
+// Two-pass bounded transitive reduction of the WAIT graph, run once per submit
+// on the fully-built fanin, before it is flushed to the payload and wired.
+//
+// Pass 1 folds `direct` (this task's WAIT producers, one bit each at distance
+// d-1) and `via` (ancestors reachable through another direct WAIT producer q:
+// R[q] << d, distance addition), then publishes R[t] = direct | via. Pass 2
+// clears DEP_WAIT on any tracked candidate whose bit is set in `via` — some
+// direct producer proves a WAIT path p -> ... -> q -> t — demoting
+// WAIT|RETAIN to RETAIN and WAIT-only to DEP_NONE (the entry stays in storage
+// so its submit-claim pin is released by the !DEP_RETAIN paths). Both passes
+// recompute d from the same seqs and fold with OR, so candidate enumeration
+// order (creator vs tensormap vs explicit) cannot change the result.
+//
+// Only DEP_WAIT edges participate in reachability: a RETAIN-only candidate
+// sets no bit and merges no ancestors, because the last hop to t must be a
+// WAIT edge for the path to carry ordering. A candidate with
+// d > WAIT_REACH_WINDOW keeps its WAIT and contributes nothing to R[t] — it
+// and all its ancestors are unrepresentable in the window. d == WAIT_REACH_
+// WINDOW sets only the direct bit: the shift would be undefined and every
+// ancestor of that producer already lies outside t's window.
+//
+// Every producer in the builder is pinned for this submit: append_fanin_or_fail
+// claimed it with fanout_count++ under the producer's fanout_lock, atomically
+// with the consumed/generation check, for every edge regardless of DepFlags.
+// Slot rebind requires the CONSUMED flip (which requires
+// fanout_refcount == fanout_count) plus allocator reclaim, so a pinned
+// producer's slot — and therefore its wait_reach entry and seq — still belongs
+// to the claimed task for the whole reduction pass. The bitmap is a frozen
+// value published at the producer's own submit, so unlike a fanin-pointer
+// walk there is no staleness dimension beyond slot identity, and slot identity
+// is settled by the pin.
+static void reduce_wait_edges(OrchestratorState *orch, FaninBuilder *b, uint8_t ring, int32_t slot, uint64_t seq_t) {
+    uint64_t direct = 0;
+    uint64_t via = 0;
+    b->for_each([&](ChipTaskSlotState *p, DepFlags flags) {
+        if (!dep_has_wait(flags)) return;
+        uint8_t pring;
+        int32_t pslot;
+        if (!slot_index_of(orch, p, pring, pslot)) return;
+        const WaitReachEntry &entry = orch->wait_reach[pring][pslot];
+        uint64_t d = seq_t - entry.seq;  // global seq: ring-independent, unsigned-exact
+        if (d == 0 || d > static_cast<uint64_t>(WAIT_REACH_WINDOW)) return;
+        direct |= 1ull << (d - 1);
+        if (d < static_cast<uint64_t>(WAIT_REACH_WINDOW)) {
+            via |= entry.ancestors << d;
+        }
+    });
+    // A via bit lands at index (i + d) for ancestor bit i >= 0 of a producer at
+    // distance d >= 1, so index 0 is unreachable: the nearest direct producer
+    // can never be proven redundant. A set bit 0 means the shift-merge has
+    // drifted (the classic form is shifting by d - 1) and reduction is about to
+    // drop an edge nothing covers.
+    always_assert((via & 1ull) == 0 && "via bit 0 set: distance-1 producers are not reducible");
+    publish_wait_reach(orch, ring, slot, direct | via);
+    if (via == 0) return;
+    b->for_each_entry([&](FaninSpillEntry &entry) {
+        DepFlags f = entry.flags();
+        if (!dep_has_wait(f)) return;
+        uint8_t pring;
+        int32_t pslot;
+        if (!slot_index_of(orch, entry.slot_state(), pring, pslot)) return;
+        uint64_t d = seq_t - orch->wait_reach[pring][pslot].seq;
+        if (d == 0 || d > static_cast<uint64_t>(WAIT_REACH_WINDOW)) return;
+        if ((via & (1ull << (d - 1))) == 0) return;
+        // A producer that does not allow early resolve never propagates
+        // dispatch_fanin. Record that before the edge leaves wait_count, so the
+        // early-dispatch target keeps the unit this producer used to hold.
+        if (!entry.slot_state()->task_attrs.allow_early_resolve()) {
+            b->reduced_unflagged_producer = true;
+        }
+        entry.set(entry.slot_state(), static_cast<DepFlags>(f & ~DEP_WAIT));
+        b->wait_count--;
+    });
+}
+
 void OrchestratorState::mark_dep_pool_position(ChipTaskSlotState &slot_state) {
     SchedulerState *sched = scheduler;
     auto &rss = sched->ring_sched_states[slot_state.ring_id];
@@ -463,6 +569,9 @@ void OrchestratorState::wire_fanin_task(ChipTaskSlotState &slot_state, int32_t w
         if (dep_has_wait(flags)) {
             producer->lock_fanout();
             int32_t pstate = producer->task_state.load(std::memory_order_acquire);
+            // Only WAIT producers reach this check. An unflagged producer whose
+            // edge reduction demoted is not one of them, and is accounted for by
+            // early_dispatch_blocked raising early_dispatch_target instead.
             if (!early_disqualified && !producer->task_attrs.allow_early_resolve()) {
                 early_disqualified = true;
             }
@@ -482,8 +591,9 @@ void OrchestratorState::wire_fanin_task(ChipTaskSlotState &slot_state, int32_t w
         // consumer is linked. With the consumer now on fanout_head (or already
         // seen as completed), release it so the producer can be CONSUMED without
         // waiting for this consumer. A DEP_RETAIN edge keeps the pin until the
-        // consumer's on_task_release.
-        if (dep_has_wait(flags) && !dep_has_retain(flags)) {
+        // consumer's on_task_release. A reduction-dropped (DEP_NONE) edge is
+        // released here too: it never links, so wiring is its only release point.
+        if (!dep_has_retain(flags)) {
             // Wiring-phase atomics (this release, plus the lock_fanout / dep_pool.prepend /
             // fanin_refcount ops around it) are not bucketed: g_orch_args_atomic_count
             // covers the submit/dep-claim phase only, whose g_orch_args_cycle window has
@@ -500,7 +610,8 @@ void OrchestratorState::wire_fanin_task(ChipTaskSlotState &slot_state, int32_t w
         int32_t dispatch_fanin = payload->dispatch_fanin.fetch_add(early_seed, std::memory_order_acq_rel) + early_seed;
         // A fully pre-completed fanin routes normally. If any producer was live,
         // the exact-full increment must enqueue the early candidate.
-        if (completed_fanin != payload->fanin_actual_count && dispatch_fanin == payload->fanin_actual_count) {
+        int32_t target = payload->early_dispatch_target();
+        if (completed_fanin != target && dispatch_fanin == target) {
             sched->try_enqueue_early_dispatch_candidate(slot_state);
         }
     }
@@ -548,6 +659,7 @@ struct PreparedTask {
     TaskDescriptor *task = nullptr;
     TaskPayload *payload = nullptr;
     ChipTaskSlotState *slot_state = nullptr;
+    uint64_t seq = 0;  // global submission sequence assigned in prepare_task
 };
 
 static OutputLayout calculate_output_layout(const CoreTaskArgs &args) {
@@ -631,6 +743,20 @@ static bool prepare_task(
     out->slot_state->bind_ring(ring_id);
     out->slot_state->reset_for_reuse();
     out->slot_state->fanin_count = 0;
+
+    // Assign the global submission sequence and stamp the slot's side entry
+    // before any consumer can observe the slot: every task-consuming path runs
+    // on this single thread, and a later submit reaches this slot as a
+    // producer only after this submit returns. alloc_tensors shares this
+    // path, so hidden alloc tasks get a seq without entering
+    // submit_task_common.
+    //
+    // Both fields are written together so the entry always describes one task
+    // generation. An empty bitmap contributes no `via` bit, so a slot whose
+    // submit fails between here and reduce_wait_edges' publication carries a
+    // conservative entry rather than the previous generation's ancestors.
+    out->seq = orch->submit_seq++;
+    orch->wait_reach[ring_id][out->alloc_result.slot] = WaitReachEntry{0, out->seq};
 
     out->payload->prefetch(args.tensor_count(), args.scalar_count());
 
@@ -1037,19 +1163,28 @@ static TaskOutputTensors submit_task_common(
     // the producer's fanout_lock. Doing it there (rather than a separate pass
     // here) is what prevents a producer from transitioning to CONSUMED between
     // the dependency decision and the claim.
+    //
+    // Bounded transitive reduction runs on the fully-built fanin, before it is
+    // flushed to the payload and wired, so RETAIN-only and dropped edges are
+    // reflected in every downstream count. Publication of R[t] happens inside,
+    // so every slot that can later be read as a producer carries its own
+    // bitmap.
+    reduce_wait_edges(orch, &fanin_builder, ring_id, prepared.alloc_result.slot, prepared.seq);
     int32_t inline_count = std::min(fanin_builder.count, CHIP_FANIN_INLINE_CAP);
-    // Every fanin edge produced here carries DEP_WAIT (creator = WAIT|RETAIN,
-    // modifier = WAIT, explicit defaults to WAIT|RETAIN or opts into WAIT), so
-    // wait_count == count. fanin_actual_count therefore doubles as the WAIT-edge
-    // count that the early-dispatch threshold (dispatch_fanin, which counts only
-    // WAIT producers) is compared against. A future RETAIN-only edge would break
-    // that equality and must carry its own WAIT-edge count for that comparison.
+    // fanin_actual_count is the TOTAL edge count (for_each iteration and
+    // on_task_release walk every edge, including RETAIN-only and
+    // reduction-dropped ones); fanin_wait_count is the readiness WAIT-edge count
+    // after reduction, always <= fanin_actual_count. The early-dispatch
+    // denominator is early_dispatch_target(), which re-adds the unit a
+    // reduced-away unflagged producer used to hold.
     always_assert(
-        fanin_builder.wait_count == fanin_builder.count &&
-        "fanin_actual_count is the early-dispatch WAIT denominator; a non-WAIT edge needs a separate count"
+        fanin_builder.wait_count <= fanin_builder.count &&
+        "fanin_wait_count is the readiness WAIT denominator and never exceeds the edge total"
     );
     // Store fanin metadata in payload for scheduler to iterate
     payload.fanin_actual_count = fanin_builder.count;
+    payload.fanin_wait_count = fanin_builder.wait_count;
+    payload.early_dispatch_blocked = fanin_builder.reduced_unflagged_producer ? 1 : 0;
     // fanin_builder.count is finalized here and submit runs once per task, so
     // each dense consumer emits one debug message when enabled. This checks >
     // THRESHOLD because the count lands at its final total here.
@@ -1117,14 +1252,15 @@ static TaskOutputTensors submit_task_common(
         int32_t ready_seed = fanin_builder.wait_count + 1;
         cur_slot_state.fanin_count = ready_seed;
         if (all_claimed_fanin_allow_early_resolve(fanin_builder)) {
-            payload.dispatch_fanin.store(fanin_builder.count, std::memory_order_release);
+            payload.dispatch_fanin.store(fanin_builder.wait_count, std::memory_order_release);
         }
         cur_slot_state.fanin_refcount.store(ready_seed, std::memory_order_release);
         // wire_fanin_task is skipped here, so its ordering-only pin release runs
-        // on this path too: an edge without retention drops its submit->wire pin
-        // so the (already completed) producer can be CONSUMED.
+        // on this path too: an edge without retention — including a
+        // reduction-dropped DEP_NONE edge — drops its submit->wire pin so the
+        // (already completed) producer can be CONSUMED.
         for_each_fanin_slot_state(payload, [&](ChipTaskSlotState *producer, DepFlags flags) {
-            if (dep_has_wait(flags) && !dep_has_retain(flags)) {
+            if (!dep_has_retain(flags)) {
                 sched->release_producer(*producer);  // wiring-phase atomic, not bucketed (see wire_fanin_task)
             }
         });
@@ -1327,8 +1463,15 @@ TaskOutputTensors OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
     outputs.set_task_id(prepared.task_id);
     payload.init(args, outputs, prepared.alloc_result, layout);
     payload.fanin_actual_count = 0;
+    payload.fanin_wait_count = 0;
+    payload.early_dispatch_blocked = 0;
     payload.fanin_spill_start = 0;
     payload.fanin_spill_pool = &orch->rings[simpler::tmr::task_ring(prepared.task_id)].fanin_pool;
+    // A hidden alloc task has no WAIT predecessors: its reachability bitmap is
+    // empty and its seq was stamped by prepare_task, so a consumer reading it
+    // as a creator producer sees a valid, conservative entry rather than a
+    // stale slot generation.
+    publish_wait_reach(orch, simpler::tmr::task_ring(prepared.task_id), prepared.alloc_result.slot, 0);
     CYCLE_COUNT_LAP(g_orch_args_cycle);
 
     if (prepared.slot_state != nullptr) {

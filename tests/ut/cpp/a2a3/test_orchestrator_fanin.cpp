@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -236,6 +237,667 @@ TEST_F(OrchestratorFaninTest, AllCompletedFastPathReleasesWaitOnlyPin) {
 
     // The fast path released the ordering-only pin.
     EXPECT_EQ(producer_slot.fanout_refcount.load(), rc_before + 1);
+}
+
+// Bounded reachability bitmap reduction (issue #1376)
+// ---------------------------------------------------------------------------
+
+// Helper: fetch a task's slot state from the SM handle.
+static ChipTaskSlotState &slot_of(SharedMemoryHandle *sm, const TaskOutputTensors &t) {
+    return sm->header->rings[simpler::tmr::task_ring(t.task_id())].get_slot_state_by_task_id(
+        static_cast<int32_t>(simpler::tmr::task_local_id(t.task_id()))
+    );
+}
+
+// Diamond A -> B -> C plus direct A -> C, all conservative RETAIN edges: the
+// direct A -> C WAIT is covered by the transitive path, so it demotes to
+// RETAIN-only and drops out of the readiness count.
+TEST_F(OrchestratorFaninTest, DiamondReducesRedundantWaitToRetainOnly) {
+    orch.begin_scope();
+
+    CoreTaskArgs a_args;
+    TaskOutputTensors a = orch.submit_dummy_task(a_args);
+    ASSERT_TRUE(a.task_id().is_valid());
+    TaskId ab[] = {a.task_id()};
+    CoreTaskArgs b_args;
+    b_args.set_dependencies(ab, 1);
+    TaskOutputTensors b = orch.submit_dummy_task(b_args);
+    ASSERT_TRUE(b.task_id().is_valid());
+
+    TaskId ac[] = {a.task_id(), b.task_id()};
+    CoreTaskArgs c_args;
+    c_args.set_dependencies(ac, 2);
+    TaskOutputTensors c = orch.submit_dummy_task(c_args);
+    ASSERT_TRUE(c.task_id().is_valid());
+
+    auto &a_slot = slot_of(sm_handle, a);
+    auto &b_slot = slot_of(sm_handle, b);
+    TaskPayload *payload = slot_of(sm_handle, c).payload;
+    ASSERT_NE(payload, nullptr);
+    EXPECT_EQ(payload->fanin_actual_count, 2);
+    EXPECT_EQ(payload->fanin_wait_count, 1);
+    bool saw_retain_only = false, saw_wait_retain = false;
+    for (int i = 0; i < payload->fanin_actual_count; i++) {
+        ChipTaskSlotState *p = payload->fanin_inline_edges[i].slot_state();
+        DepFlags f = payload->fanin_inline_edges[i].flags();
+        if (p == &a_slot) {
+            EXPECT_EQ(f, DEP_RETAIN);
+            saw_retain_only = true;
+        } else if (p == &b_slot) {
+            EXPECT_EQ(f, DEP_WAIT | DEP_RETAIN);
+            saw_wait_retain = true;
+        }
+    }
+    EXPECT_TRUE(saw_retain_only);
+    EXPECT_TRUE(saw_wait_retain);
+}
+
+// Same diamond but the direct A -> C is ordering-only: the cleared edge becomes
+// DEP_NONE and stays in storage (fanin_actual_count unchanged) so its
+// submit-claim pin is still released by the !DEP_RETAIN paths.
+TEST_F(OrchestratorFaninTest, DiamondDropsRedundantWaitOnlyEdge) {
+    orch.begin_scope();
+
+    CoreTaskArgs a_args;
+    TaskOutputTensors a = orch.submit_dummy_task(a_args);
+    ASSERT_TRUE(a.task_id().is_valid());
+    TaskId ab[] = {a.task_id()};
+    CoreTaskArgs b_args;
+    b_args.set_dependencies(ab, 1);
+    TaskOutputTensors b = orch.submit_dummy_task(b_args);
+    ASSERT_TRUE(b.task_id().is_valid());
+
+    TaskId ac[] = {b.task_id(), a.task_id()};
+    DepFlags kinds[] = {DEP_WAIT | DEP_RETAIN, DEP_WAIT};
+    CoreTaskArgs c_args;
+    c_args.set_dependencies_with_kinds(ac, kinds, 2);
+    TaskOutputTensors c = orch.submit_dummy_task(c_args);
+    ASSERT_TRUE(c.task_id().is_valid());
+
+    auto &a_slot = slot_of(sm_handle, a);
+    TaskPayload *payload = slot_of(sm_handle, c).payload;
+    ASSERT_NE(payload, nullptr);
+    EXPECT_EQ(payload->fanin_actual_count, 2);
+    EXPECT_EQ(payload->fanin_wait_count, 1);
+    EXPECT_EQ(payload->fanin_inline_edges[1].slot_state(), &a_slot);
+    EXPECT_EQ(payload->fanin_inline_edges[1].flags(), DEP_NONE);
+}
+
+// Early-dispatch accounting survives reduction. submit_dummy_task tasks do not
+// allow early resolve, so the diamond's reduced A -> C edge points at an
+// unflagged producer: C keeps the unit that producer held in fanin_wait_count,
+// leaving early_dispatch_target() unreachable exactly as it was before
+// reduction.
+TEST_F(OrchestratorFaninTest, ReducedEdgeToUnflaggedProducerBlocksEarlyDispatch) {
+    orch.begin_scope();
+
+    CoreTaskArgs a_args;
+    TaskOutputTensors a = orch.submit_dummy_task(a_args);
+    ASSERT_TRUE(a.task_id().is_valid());
+    TaskId ab[] = {a.task_id()};
+    CoreTaskArgs b_args;
+    b_args.set_dependencies(ab, 1);
+    TaskOutputTensors b = orch.submit_dummy_task(b_args);
+    ASSERT_TRUE(b.task_id().is_valid());
+
+    TaskId ac[] = {b.task_id(), a.task_id()};
+    CoreTaskArgs c_args;
+    c_args.set_dependencies(ac, 2);
+    TaskOutputTensors c = orch.submit_dummy_task(c_args);
+    ASSERT_TRUE(c.task_id().is_valid());
+
+    TaskPayload *payload = slot_of(sm_handle, c).payload;
+    ASSERT_NE(payload, nullptr);
+    EXPECT_EQ(payload->fanin_actual_count, 2);
+    EXPECT_EQ(payload->fanin_wait_count, 1);
+    EXPECT_EQ(payload->early_dispatch_blocked, 1);
+    EXPECT_EQ(payload->early_dispatch_target(), 2);
+}
+
+// The same diamond with a producer that DOES allow early resolve: reduction
+// costs the consumer nothing, because that producer would have propagated.
+TEST_F(OrchestratorFaninTest, ReducedEdgeToFlaggedProducerLeavesEarlyDispatchOpen) {
+    orch.begin_scope();
+
+    CoreTaskArgs a_args;
+    TaskOutputTensors a = orch.submit_dummy_task(a_args);
+    ASSERT_TRUE(a.task_id().is_valid());
+    slot_of(sm_handle, a).task_attrs.set_early_resolve(true);
+
+    TaskId ab[] = {a.task_id()};
+    CoreTaskArgs b_args;
+    b_args.set_dependencies(ab, 1);
+    TaskOutputTensors b = orch.submit_dummy_task(b_args);
+    ASSERT_TRUE(b.task_id().is_valid());
+
+    TaskId ac[] = {b.task_id(), a.task_id()};
+    CoreTaskArgs c_args;
+    c_args.set_dependencies(ac, 2);
+    TaskOutputTensors c = orch.submit_dummy_task(c_args);
+    ASSERT_TRUE(c.task_id().is_valid());
+
+    TaskPayload *payload = slot_of(sm_handle, c).payload;
+    ASSERT_NE(payload, nullptr);
+    EXPECT_EQ(payload->fanin_wait_count, 1);
+    EXPECT_EQ(payload->early_dispatch_blocked, 0);
+    EXPECT_EQ(payload->early_dispatch_target(), 1);
+}
+
+// A -> B -> C -> D plus direct A -> D (no A -> C, no B -> D): the covering path
+// is longer than one hop, so only the transitive bitmap can prove A redundant.
+TEST_F(OrchestratorFaninTest, Depth3ChainReducesBeyondOneHop) {
+    orch.begin_scope();
+
+    CoreTaskArgs a_args;
+    TaskOutputTensors a = orch.submit_dummy_task(a_args);
+    ASSERT_TRUE(a.task_id().is_valid());
+    TaskId ab[] = {a.task_id()};
+    CoreTaskArgs b_args;
+    b_args.set_dependencies(ab, 1);
+    TaskOutputTensors b = orch.submit_dummy_task(b_args);
+    ASSERT_TRUE(b.task_id().is_valid());
+    TaskId bc[] = {b.task_id()};
+    CoreTaskArgs c_args;
+    c_args.set_dependencies(bc, 1);
+    TaskOutputTensors c = orch.submit_dummy_task(c_args);
+    ASSERT_TRUE(c.task_id().is_valid());
+
+    TaskId ad[] = {a.task_id(), c.task_id()};
+    CoreTaskArgs d_args;
+    d_args.set_dependencies(ad, 2);
+    TaskOutputTensors d = orch.submit_dummy_task(d_args);
+    ASSERT_TRUE(d.task_id().is_valid());
+
+    auto &a_slot = slot_of(sm_handle, a);
+    TaskPayload *payload = slot_of(sm_handle, d).payload;
+    ASSERT_NE(payload, nullptr);
+    EXPECT_EQ(payload->fanin_wait_count, 1);
+    for (int i = 0; i < payload->fanin_actual_count; i++) {
+        if (payload->fanin_inline_edges[i].slot_state() == &a_slot) {
+            EXPECT_EQ(payload->fanin_inline_edges[i].flags(), DEP_RETAIN);
+        }
+    }
+}
+
+// Two producers with no path between them: nothing to prove, both WAITs stay.
+TEST_F(OrchestratorFaninTest, IndependentProducersAreNotReduced) {
+    orch.begin_scope();
+
+    CoreTaskArgs a_args, b_args;
+    TaskOutputTensors a = orch.submit_dummy_task(a_args);
+    TaskOutputTensors b = orch.submit_dummy_task(b_args);
+    ASSERT_TRUE(a.task_id().is_valid());
+    ASSERT_TRUE(b.task_id().is_valid());
+
+    TaskId deps[] = {a.task_id(), b.task_id()};
+    CoreTaskArgs c_args;
+    c_args.set_dependencies(deps, 2);
+    TaskOutputTensors c = orch.submit_dummy_task(c_args);
+    ASSERT_TRUE(c.task_id().is_valid());
+
+    TaskPayload *payload = slot_of(sm_handle, c).payload;
+    ASSERT_NE(payload, nullptr);
+    EXPECT_EQ(payload->fanin_actual_count, 2);
+    EXPECT_EQ(payload->fanin_wait_count, 2);
+    EXPECT_EQ(payload->fanin_inline_edges[0].flags(), DEP_WAIT | DEP_RETAIN);
+    EXPECT_EQ(payload->fanin_inline_edges[1].flags(), DEP_WAIT | DEP_RETAIN);
+}
+
+// A -> B ordered by a WAIT-only (ordering-only) edge still puts A in R[B]: any
+// WAIT edge carries ordering, so the covering path proves reachability and the
+// direct A -> C is reduced. (The reduction's reachability semantics differ
+// from a fanin-pointer walk here — WAIT-only cover is a valid witness.)
+TEST_F(OrchestratorFaninTest, WaitOnlyCoveringEdgeStillProvesReachability) {
+    orch.begin_scope();
+
+    CoreTaskArgs a_args;
+    TaskOutputTensors a = orch.submit_dummy_task(a_args);
+    ASSERT_TRUE(a.task_id().is_valid());
+    TaskId ab[] = {a.task_id()};
+    DepFlags wait_kind[] = {DEP_WAIT};
+    CoreTaskArgs b_args;
+    b_args.set_dependencies_with_kinds(ab, wait_kind, 1);
+    TaskOutputTensors b = orch.submit_dummy_task(b_args);
+    ASSERT_TRUE(b.task_id().is_valid());
+
+    TaskId ac[] = {a.task_id(), b.task_id()};
+    CoreTaskArgs c_args;
+    c_args.set_dependencies(ac, 2);
+    TaskOutputTensors c = orch.submit_dummy_task(c_args);
+    ASSERT_TRUE(c.task_id().is_valid());
+
+    auto &a_slot = slot_of(sm_handle, a);
+    TaskPayload *payload = slot_of(sm_handle, c).payload;
+    ASSERT_NE(payload, nullptr);
+    EXPECT_EQ(payload->fanin_wait_count, 1);
+    for (int i = 0; i < payload->fanin_actual_count; i++) {
+        if (payload->fanin_inline_edges[i].slot_state() == &a_slot) {
+            EXPECT_EQ(payload->fanin_inline_edges[i].flags(), DEP_RETAIN);
+        }
+    }
+}
+
+// A producer farther back than WAIT_REACH_WINDOW submissions keeps its WAIT:
+// the window cannot represent it, so the edge is retained conservatively.
+TEST_F(OrchestratorFaninTest, WindowMissBeyondBlKeepsWait) {
+    orch.begin_scope();
+
+    CoreTaskArgs a_args;
+    TaskOutputTensors a = orch.submit_dummy_task(a_args);
+    ASSERT_TRUE(a.task_id().is_valid());
+    TaskId ab[] = {a.task_id()};
+    CoreTaskArgs b_args;
+    b_args.set_dependencies(ab, 1);
+    TaskOutputTensors b = orch.submit_dummy_task(b_args);
+    ASSERT_TRUE(b.task_id().is_valid());
+
+    // Fillers push seq(A) out of the window: seq distance to C exceeds 64.
+    CoreTaskArgs filler_args;
+    for (int i = 0; i < WAIT_REACH_WINDOW; i++) {
+        TaskOutputTensors f = orch.submit_dummy_task(filler_args);
+        ASSERT_TRUE(f.task_id().is_valid());
+    }
+
+    TaskId ac[] = {a.task_id(), b.task_id()};
+    CoreTaskArgs c_args;
+    c_args.set_dependencies(ac, 2);
+    TaskOutputTensors c = orch.submit_dummy_task(c_args);
+    ASSERT_TRUE(c.task_id().is_valid());
+
+    auto &a_slot = slot_of(sm_handle, a);
+    TaskPayload *payload = slot_of(sm_handle, c).payload;
+    ASSERT_NE(payload, nullptr);
+    EXPECT_EQ(payload->fanin_wait_count, 2);
+    for (int i = 0; i < payload->fanin_actual_count; i++) {
+        if (payload->fanin_inline_edges[i].slot_state() == &a_slot) {
+            EXPECT_EQ(payload->fanin_inline_edges[i].flags(), DEP_WAIT | DEP_RETAIN);
+        }
+    }
+}
+
+// d(A -> C) == WAIT_REACH_WINDOW exactly: the direct bit is the last window
+// bit, and the close covering producer B (d == 1, with A at bit 62 of R[B])
+// still shifts A's bit onto it, so the edge reduces. Proves the
+// d == WAIT_REACH_WINDOW guard does not block valid boundary reduction.
+TEST_F(OrchestratorFaninTest, BoundaryAtBlStillReducesViaCloseProducer) {
+    orch.begin_scope();
+
+    CoreTaskArgs a_args;
+    TaskOutputTensors a = orch.submit_dummy_task(a_args);
+    ASSERT_TRUE(a.task_id().is_valid());
+    TaskId ab[] = {a.task_id()};
+    CoreTaskArgs b_args;
+    b_args.set_dependencies(ab, 1);
+    TaskOutputTensors b = orch.submit_dummy_task(b_args);
+    ASSERT_TRUE(b.task_id().is_valid());
+
+    // 62 fillers: seq(A)=0, seq(B)=1, fillers 2..63, C=64 -> d(A->C)=64.
+    CoreTaskArgs filler_args;
+    for (int i = 0; i < WAIT_REACH_WINDOW - 2; i++) {
+        TaskOutputTensors f = orch.submit_dummy_task(filler_args);
+        ASSERT_TRUE(f.task_id().is_valid());
+    }
+
+    TaskId ac[] = {a.task_id(), b.task_id()};
+    CoreTaskArgs c_args;
+    c_args.set_dependencies(ac, 2);
+    TaskOutputTensors c = orch.submit_dummy_task(c_args);
+    ASSERT_TRUE(c.task_id().is_valid());
+
+    auto &a_slot = slot_of(sm_handle, a);
+    TaskPayload *payload = slot_of(sm_handle, c).payload;
+    ASSERT_NE(payload, nullptr);
+    EXPECT_EQ(payload->fanin_wait_count, 1);
+    for (int i = 0; i < payload->fanin_actual_count; i++) {
+        if (payload->fanin_inline_edges[i].slot_state() == &a_slot) {
+            EXPECT_EQ(payload->fanin_inline_edges[i].flags(), DEP_RETAIN);
+        }
+    }
+}
+
+// Unsigned sequence subtraction preserves recent distances across uint64 wrap.
+TEST_F(OrchestratorFaninTest, SequenceWrapPreservesRecentReachability) {
+    orch.submit_seq = std::numeric_limits<uint64_t>::max() - 1;
+    orch.begin_scope();
+
+    CoreTaskArgs a_args;
+    TaskOutputTensors a = orch.submit_dummy_task(a_args);
+    ASSERT_TRUE(a.task_id().is_valid());
+    TaskId ab[] = {a.task_id()};
+    CoreTaskArgs b_args;
+    b_args.set_dependencies(ab, 1);
+    TaskOutputTensors b = orch.submit_dummy_task(b_args);
+    ASSERT_TRUE(b.task_id().is_valid());
+
+    TaskId ac[] = {a.task_id(), b.task_id()};
+    CoreTaskArgs c_args;
+    c_args.set_dependencies(ac, 2);
+    TaskOutputTensors c = orch.submit_dummy_task(c_args);
+    ASSERT_TRUE(c.task_id().is_valid());
+
+    auto &a_slot = slot_of(sm_handle, a);
+    TaskPayload *payload = slot_of(sm_handle, c).payload;
+    ASSERT_NE(payload, nullptr);
+    EXPECT_EQ(payload->fanin_wait_count, 1);
+    for (int i = 0; i < payload->fanin_actual_count; i++) {
+        if (payload->fanin_inline_edges[i].slot_state() == &a_slot) {
+            EXPECT_EQ(payload->fanin_inline_edges[i].flags(), DEP_RETAIN);
+        }
+    }
+}
+
+// Nested scopes move tasks onto different rings; the global submission
+// sequence makes cross-ring candidates participate in the same window.
+TEST_F(OrchestratorFaninTest, CrossRingCandidateUsesGlobalSequence) {
+    orch.begin_scope();  // ring 0
+
+    CoreTaskArgs a_args;
+    TaskOutputTensors a = orch.submit_dummy_task(a_args);
+    ASSERT_TRUE(a.task_id().is_valid());
+    ASSERT_EQ(simpler::tmr::task_ring(a.task_id()), 0);
+
+    orch.begin_scope();  // ring 1
+    ASSERT_EQ(orch.current_ring_id(), 1);
+    TaskId ab[] = {a.task_id()};
+    CoreTaskArgs b_args;
+    b_args.set_dependencies(ab, 1);
+    TaskOutputTensors b = orch.submit_dummy_task(b_args);
+    ASSERT_TRUE(b.task_id().is_valid());
+    ASSERT_EQ(simpler::tmr::task_ring(b.task_id()), 1);
+
+    TaskId ac[] = {a.task_id(), b.task_id()};
+    CoreTaskArgs c_args;
+    c_args.set_dependencies(ac, 2);
+    TaskOutputTensors c = orch.submit_dummy_task(c_args);
+    ASSERT_TRUE(c.task_id().is_valid());
+
+    auto &a_slot = slot_of(sm_handle, a);
+    TaskPayload *payload = slot_of(sm_handle, c).payload;
+    ASSERT_NE(payload, nullptr);
+    EXPECT_EQ(payload->fanin_wait_count, 1);
+    for (int i = 0; i < payload->fanin_actual_count; i++) {
+        if (payload->fanin_inline_edges[i].slot_state() == &a_slot) {
+            EXPECT_EQ(payload->fanin_inline_edges[i].flags(), DEP_RETAIN);
+        }
+    }
+}
+
+// alloc_tensors' hidden task never enters submit_task_common; it must still
+// publish an empty reachability bitmap so a consumer reading it as a creator
+// producer sees a conservative entry, never a stale slot generation.
+TEST_F(OrchestratorFaninTest, AllocTensorProducerPublishesEmptyReach) {
+    orch.begin_scope();
+
+    std::vector<TensorCreateInfo> create_infos;
+    CoreTaskArgs alloc_args;
+    add_runtime_output_arg(alloc_args, create_infos, 4);
+    TaskOutputTensors alloc = orch.alloc_tensors(alloc_args);
+    ASSERT_TRUE(alloc.task_id().is_valid());
+
+    // Consumer depends on the alloc task explicitly; a second consumer chain
+    // through the first proves distances stay correct across the alloc entry.
+    TaskId deps[] = {alloc.task_id()};
+    CoreTaskArgs b_args;
+    b_args.set_dependencies(deps, 1);
+    TaskOutputTensors b = orch.submit_dummy_task(b_args);
+    ASSERT_TRUE(b.task_id().is_valid());
+    ASSERT_FALSE(orch.fatal);
+
+    TaskId cd[] = {alloc.task_id(), b.task_id()};
+    CoreTaskArgs c_args;
+    c_args.set_dependencies(cd, 2);
+    TaskOutputTensors c = orch.submit_dummy_task(c_args);
+    ASSERT_TRUE(c.task_id().is_valid());
+    ASSERT_FALSE(orch.fatal);
+
+    auto &alloc_slot = slot_of(sm_handle, alloc);
+    TaskPayload *payload = slot_of(sm_handle, c).payload;
+    ASSERT_NE(payload, nullptr);
+    EXPECT_EQ(payload->fanin_wait_count, 1);
+    for (int i = 0; i < payload->fanin_actual_count; i++) {
+        if (payload->fanin_inline_edges[i].slot_state() == &alloc_slot) {
+            EXPECT_EQ(payload->fanin_inline_edges[i].flags(), DEP_RETAIN);
+        }
+    }
+}
+
+// Runtime reuse leaves the side array uncleared; publication by the new slot
+// owner replaces stale bits before a later consumer can read them.
+TEST_F(OrchestratorFaninTest, RuntimeReuseOverwritesStaleSlotBitmap) {
+    orch.wait_reach[0][0].ancestors = std::numeric_limits<uint64_t>::max();
+    orch.wait_reach[0][0].seq = 1234;
+
+    ASSERT_TRUE(sm_handle->init(sm_handle->sm_base, sm_handle->sm_size, CHIP_TASK_WINDOW_SIZE, 4096));
+    uint64_t heap_sizes[CHIP_MAX_RING_DEPTH];
+    uint64_t task_window_sizes[CHIP_MAX_RING_DEPTH];
+    for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
+        heap_sizes[r] = 4096;
+        task_window_sizes[r] = CHIP_TASK_WINDOW_SIZE;
+    }
+    ASSERT_TRUE(orch.reset_for_reuse(orch_layout, sm_handle->sm_base, gm_heap.data(), heap_sizes, task_window_sizes));
+    sched.reset_for_reuse(sched_layout, sm_handle->sm_base);
+
+    EXPECT_EQ(orch.wait_reach[0][0].ancestors, std::numeric_limits<uint64_t>::max());
+    orch.begin_scope();
+    CoreTaskArgs a_args;
+    TaskOutputTensors a = orch.submit_dummy_task(a_args);
+    ASSERT_TRUE(a.task_id().is_valid());
+    ASSERT_EQ(simpler::tmr::task_local_id(a.task_id()), 0u);
+    EXPECT_EQ(orch.wait_reach[0][0].ancestors, 0);
+    EXPECT_EQ(orch.wait_reach[0][0].seq, 0);
+
+    TaskId ab[] = {a.task_id()};
+    CoreTaskArgs b_args;
+    b_args.set_dependencies(ab, 1);
+    TaskOutputTensors b = orch.submit_dummy_task(b_args);
+    ASSERT_TRUE(b.task_id().is_valid());
+    TaskId ac[] = {a.task_id(), b.task_id()};
+    CoreTaskArgs c_args;
+    c_args.set_dependencies(ac, 2);
+    TaskOutputTensors c = orch.submit_dummy_task(c_args);
+    ASSERT_TRUE(c.task_id().is_valid());
+    EXPECT_EQ(slot_of(sm_handle, c).payload->fanin_wait_count, 1);
+}
+
+// Acceptance #5: candidate discovery order must not change the reduced graph.
+// Same diamond with the dependency arrays in both orders.
+TEST_F(OrchestratorFaninTest, DiscoveryOrderDoesNotChangeReduction) {
+    for (int reverse = 0; reverse < 2; reverse++) {
+        orch.begin_scope();
+
+        CoreTaskArgs a_args;
+        TaskOutputTensors a = orch.submit_dummy_task(a_args);
+        ASSERT_TRUE(a.task_id().is_valid());
+        TaskId ab[] = {a.task_id()};
+        CoreTaskArgs b_args;
+        b_args.set_dependencies(ab, 1);
+        TaskOutputTensors b = orch.submit_dummy_task(b_args);
+        ASSERT_TRUE(b.task_id().is_valid());
+
+        TaskId ac[] = {a.task_id(), b.task_id()};
+        TaskId ca[] = {b.task_id(), a.task_id()};
+        CoreTaskArgs c_args;
+        c_args.set_dependencies(reverse ? ca : ac, 2);
+        TaskOutputTensors c = orch.submit_dummy_task(c_args);
+        ASSERT_TRUE(c.task_id().is_valid());
+
+        auto &a_slot = slot_of(sm_handle, a);
+        auto &b_slot = slot_of(sm_handle, b);
+        TaskPayload *payload = slot_of(sm_handle, c).payload;
+        ASSERT_NE(payload, nullptr);
+        EXPECT_EQ(payload->fanin_actual_count, 2);
+        EXPECT_EQ(payload->fanin_wait_count, 1);
+        for (int i = 0; i < payload->fanin_actual_count; i++) {
+            ChipTaskSlotState *p = payload->fanin_inline_edges[i].slot_state();
+            if (p == &a_slot) {
+                EXPECT_EQ(payload->fanin_inline_edges[i].flags(), DEP_RETAIN);
+            } else if (p == &b_slot) {
+                EXPECT_EQ(payload->fanin_inline_edges[i].flags(), DEP_WAIT | DEP_RETAIN);
+            }
+        }
+
+        orch.end_scope();
+    }
+}
+
+// The reduction covers spill-region candidates too — no inline cap. The
+// redundant pair lands past CHIP_FANIN_INLINE_CAP so the cleared edge lives in
+// the spill pool.
+TEST_F(OrchestratorFaninTest, SpillRegionCandidatesAreReduced) {
+    orch.begin_scope();
+
+    constexpr int kOldProducers = CHIP_FANIN_INLINE_CAP + 1;
+    std::vector<TaskOutputTensors> old_producers;
+    old_producers.reserve(kOldProducers);
+    for (int i = 0; i < kOldProducers; i++) {
+        CoreTaskArgs args;
+        old_producers.push_back(orch.submit_dummy_task(args));
+        ASSERT_TRUE(old_producers.back().task_id().is_valid());
+    }
+
+    CoreTaskArgs a_args;
+    TaskOutputTensors a = orch.submit_dummy_task(a_args);
+    ASSERT_TRUE(a.task_id().is_valid());
+    TaskId ab[] = {a.task_id()};
+    CoreTaskArgs b_args;
+    b_args.set_dependencies(ab, 1);
+    TaskOutputTensors b = orch.submit_dummy_task(b_args);
+    ASSERT_TRUE(b.task_id().is_valid());
+
+    std::vector<TaskId> deps;
+    std::vector<DepFlags> kinds;
+    deps.reserve(kOldProducers + 2);
+    kinds.reserve(kOldProducers + 2);
+    for (auto &producer : old_producers) {
+        deps.push_back(producer.task_id());
+        kinds.push_back(DEP_WAIT | DEP_RETAIN);
+    }
+    deps.push_back(b.task_id());
+    kinds.push_back(DEP_WAIT | DEP_RETAIN);
+    deps.push_back(a.task_id());  // redundant, lands in the spill region
+    kinds.push_back(DEP_WAIT | DEP_RETAIN);
+
+    CoreTaskArgs c_args;
+    c_args.set_dependencies_with_kinds(deps.data(), kinds.data(), static_cast<uint32_t>(deps.size()));
+    TaskOutputTensors c = orch.submit_dummy_task(c_args);
+    ASSERT_TRUE(c.task_id().is_valid());
+
+    auto &a_slot = slot_of(sm_handle, a);
+    TaskPayload *payload = slot_of(sm_handle, c).payload;
+    ASSERT_NE(payload, nullptr);
+    EXPECT_EQ(payload->fanin_actual_count, kOldProducers + 2);
+    EXPECT_EQ(payload->fanin_wait_count, kOldProducers + 1);
+    ASSERT_NE(payload->fanin_spill_pool, nullptr);
+    bool found = false;
+    auto check = [&](ChipTaskSlotState *p, DepFlags f) {
+        if (p == &a_slot) {
+            EXPECT_EQ(f, DEP_RETAIN);
+            found = true;
+        }
+    };
+    FaninPool &pool = *payload->fanin_spill_pool;
+    int32_t spill_count = payload->fanin_actual_count - CHIP_FANIN_INLINE_CAP;
+    ASSERT_GT(spill_count, 0);
+    for (int i = 0; i < spill_count; i++) {
+        FaninSpillEntry &e = pool.base[(payload->fanin_spill_start % pool.capacity + i) % pool.capacity];
+        check(e.slot_state(), e.flags());
+    }
+    EXPECT_TRUE(found);
+}
+
+// A reduction-dropped (DEP_NONE) edge on the all-completed fast path releases
+// its submit-claim pin exactly once — there, not again at on_task_release.
+TEST_F(OrchestratorFaninTest, AllCompletedFastPathReleasesDroppedEdgePin) {
+    orch.begin_scope();
+
+    CoreTaskArgs a_args;
+    TaskOutputTensors a = orch.submit_dummy_task(a_args);
+    ASSERT_TRUE(a.task_id().is_valid());
+    TaskId ab[] = {a.task_id()};
+    DepFlags wait_kind[] = {DEP_WAIT};
+    CoreTaskArgs b_args;
+    b_args.set_dependencies_with_kinds(ab, wait_kind, 1);
+    TaskOutputTensors b = orch.submit_dummy_task(b_args);
+    ASSERT_TRUE(b.task_id().is_valid());
+
+    auto &a_slot = slot_of(sm_handle, a);
+    auto &b_slot = slot_of(sm_handle, b);
+    // Both completed: the consumer takes the all-completed fast path.
+    a_slot.task_state.store(CHIP_TASK_COMPLETED, std::memory_order_release);
+    b_slot.task_state.store(CHIP_TASK_COMPLETED, std::memory_order_release);
+    int32_t a_rc_before = a_slot.fanout_refcount.load();
+
+    // Direct A -> C is ordering-only so the reduction drops it to DEP_NONE.
+    TaskId ac[] = {b.task_id(), a.task_id()};
+    DepFlags kinds[] = {DEP_WAIT | DEP_RETAIN, DEP_WAIT};
+    CoreTaskArgs c_args;
+    c_args.set_dependencies_with_kinds(ac, kinds, 2);
+    TaskOutputTensors c = orch.submit_dummy_task(c_args);
+    ASSERT_TRUE(c.task_id().is_valid());
+
+    TaskPayload *payload = slot_of(sm_handle, c).payload;
+    ASSERT_NE(payload, nullptr);
+    EXPECT_EQ(payload->fanin_wait_count, 1);
+    // The dropped edge's pin was released by the fast path.
+    EXPECT_EQ(a_slot.fanout_refcount.load(), a_rc_before + 1);
+}
+
+// A RETAIN-only survivor of the reduction keeps its producer pinned past
+// wiring: only the consumer's on_task_release drops that pin.
+TEST_F(OrchestratorFaninTest, ReducedRetainOnlyEdgeHoldsProducerUntilConsumerRelease) {
+    orch.begin_scope();
+
+    CoreTaskArgs a_args;
+    TaskOutputTensors a = orch.submit_dummy_task(a_args);
+    ASSERT_TRUE(a.task_id().is_valid());
+    TaskId ab[] = {a.task_id()};
+    CoreTaskArgs b_args;
+    b_args.set_dependencies(ab, 1);
+    TaskOutputTensors b = orch.submit_dummy_task(b_args);
+    ASSERT_TRUE(b.task_id().is_valid());
+
+    TaskId ac[] = {a.task_id(), b.task_id()};
+    CoreTaskArgs c_args;
+    c_args.set_dependencies(ac, 2);
+    TaskOutputTensors c = orch.submit_dummy_task(c_args);
+    ASSERT_TRUE(c.task_id().is_valid());
+
+    auto &a_slot = slot_of(sm_handle, a);
+    auto &c_slot = slot_of(sm_handle, c);
+    TaskPayload *payload = c_slot.payload;
+    ASSERT_NE(payload, nullptr);
+    EXPECT_EQ(payload->fanin_wait_count, 1);
+
+    int32_t a_rc_before = a_slot.fanout_refcount.load();
+    sched.on_task_release(c_slot);
+    // The RETAIN-only edge's pin is released by on_task_release.
+    EXPECT_EQ(a_slot.fanout_refcount.load(), a_rc_before + 1);
+}
+
+// Zero-fanin and single-fanin tasks still publish their (mostly empty)
+// bitmaps; a later chain consuming them must reduce normally.
+TEST_F(OrchestratorFaninTest, ZeroFaninTaskPublishesEmptyBitmap) {
+    orch.begin_scope();
+
+    CoreTaskArgs a_args;
+    TaskOutputTensors a = orch.submit_dummy_task(a_args);  // zero fanin -> R=0
+    ASSERT_TRUE(a.task_id().is_valid());
+    TaskId ab[] = {a.task_id()};
+    CoreTaskArgs b_args;
+    b_args.set_dependencies(ab, 1);  // single fanin
+    TaskOutputTensors b = orch.submit_dummy_task(b_args);
+    ASSERT_TRUE(b.task_id().is_valid());
+
+    TaskId ac[] = {a.task_id(), b.task_id()};
+    CoreTaskArgs c_args;
+    c_args.set_dependencies(ac, 2);
+    TaskOutputTensors c = orch.submit_dummy_task(c_args);
+    ASSERT_TRUE(c.task_id().is_valid());
+    ASSERT_FALSE(orch.fatal);
+
+    TaskPayload *payload = slot_of(sm_handle, c).payload;
+    ASSERT_NE(payload, nullptr);
+    EXPECT_EQ(payload->fanin_wait_count, 1);
 }
 
 TEST_F(OrchestratorFaninTest, SubmitPathHeapDeadlockLogReportsRingAndRealHeapState) {
