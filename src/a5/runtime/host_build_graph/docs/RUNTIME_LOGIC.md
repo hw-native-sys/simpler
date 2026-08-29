@@ -113,7 +113,8 @@ a boundary from which region happens to be reserved first —
 
 **Why the orchestrator is not in the arena at all.** hbg has no device-side
 orchestrator, so nothing on the device reads its state: not the `fanin_seen_epoch`
-table, not the scope arrays, not the TensorMap (~9.3 MB between them). It is
+or `fanin_reach` tables, not the scope arrays, not the TensorMap (~9.4 MB between
+them). It is
 therefore a plain host object that owns those arrays — `OrchestratorState::init`
 allocates them — and `RuntimeContext` reaches it through a pointer that `bind` drops
 before the copied zone is uploaded, so no host address crosses the boundary. A
@@ -275,11 +276,68 @@ TensorMap maps tensor regions to producer task IDs. For every task:
 1. INPUT/INOUT regions look up overlapping producers.
 2. Explicit and discovered producers are deduplicated into the payload's fanin
    region.
-3. OUTPUT/INOUT regions register the new task as producer.
-4. Each producer tracks its highest consumer local ID for completion metadata.
+3. Transitive reduction drops the producers another producer already reaches.
+4. OUTPUT/INOUT regions register the new task as producer.
+5. Each producer tracks its highest consumer local ID for completion metadata.
 
 There is no fanout adjacency or dependency pool. A per-slot completion flag is
 the readiness truth on device.
+
+#### Bounded transitive reduction
+
+Step 3 removes edges the rest of the fanin already orders. When a consumer names
+both `P` and `Q`, and `Q` is itself reachable from `P`, the chain
+`P -> ... -> Q -> consumer` orders the consumer behind `P` on its own, so the
+direct `P` edge decides nothing. Dropping it shortens the region the boot scan
+and every wake-list reclassification walk, at the cost of two words of work per
+submit on the host.
+
+Each task publishes one 64-bit word of ancestors, indexed by task local id: bit
+`i` of task `t` is set when the task `i + 1` ids before `t` reaches it. A submit
+folds its producers' words -- shifted by each producer's distance, which is
+distance addition -- into its own, then drops every producer whose bit the fold
+produced. Because a producer's word is already its own closure, a chain of any
+length inside the window collapses in one pass, not one hop at a time.
+
+Two host_build_graph properties keep this to a single word of state. A task id
+is its slot index, handed out by a forward-only bump allocator and never
+reclaimed, so it doubles as the global submission order and a distance is a
+subtraction; and a producer's word, published by its own submit, is never
+rewritten, so reading it needs no proof that the slot still holds the task that
+wrote it. `FANIN_REACH_WINDOW` bounds how far back a proof can reach: a producer
+further back keeps its edge, since neither it nor its ancestors fit the word.
+
+Reduction rewrites readiness only. Buffer lifetime rides
+`last_consumer_local_id`, raised when the edge was appended and never lowered, so
+a producer whose edge is dropped still waits for that consumer to retire before
+the host may overwrite it. A `SIMPLER_DFX` build reports the edges built and the
+edges dropped once per orchestration.
+
+#### Inside a recorded Graph body
+
+A Graph body's edges live in the Definition's own fanin CSR, not in a task table,
+and they are reduced where they are recorded -- once, before any replay reads
+them. `graph_reduce_recorded_fanin` runs on each recorded task as its producers
+are settled, and shortens the CSR the same way.
+
+The resolution differs, and the difference is the point. The global path runs on
+every submit against a table with no fixed bound, so one word of ancestors is
+what it can afford. A body is capped at `MAX_IN_GRAPH_TASKS`, so a row is a fixed
+128 B and the whole array 128 KiB of recorder scratch; and the fold is paid once
+against however many times that Graph is replayed. The recording path therefore
+carries the **exact** closure and has no window: a producer arbitrarily far back
+in the body is still reduced.
+
+The two compose without either knowing about the other. A body's tasks are
+ordered against everything before the Graph by the outer Graph task's own fanin,
+which the global path reduced; a producer outside the recording window contributes
+no in-body edge at all. So reducing inside a body cannot change how the body is
+ordered against the rest of the run.
+
+Recorded bodies need no retention argument: a body's buffers come out of the
+Graph's own heap and are released when the Graph completes, never per task, so a
+dropped edge holds no lifetime. Each Definition logs its shipped and reduced edge
+counts at DEBUG as it is laid out.
 
 ## 6. Boot Classification and Wake Lists
 

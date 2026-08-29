@@ -236,6 +236,17 @@ bool OrchestratorState::init(
     }
     memset(orch->fanin_seen_epoch.get(), 0, slots * sizeof(uint32_t));
 
+    // One ancestor word per task slot: 8 B each, 128 KiB at the default 16,384-task
+    // table, linear in runtime_env.ring_task_window. Zeroed here so a slot claimed
+    // by a submit that fails before publishing its own entry reads as "no known
+    // ancestors", which keeps reduction conservative rather than wrong.
+    orch->fanin_reach.reset(new (std::nothrow) uint64_t[slots]);
+    if (orch->fanin_reach == nullptr) {
+        LOG_ERROR("Orchestrator scratch allocation failed (max_tasks=%" PRIu64 ")", max_tasks);
+        return false;
+    }
+    memset(orch->fanin_reach.get(), 0, slots * sizeof(uint64_t));
+
     if (!orch->tensor_map.init_default(static_cast<int32_t>(max_tasks))) {
         return false;
     }

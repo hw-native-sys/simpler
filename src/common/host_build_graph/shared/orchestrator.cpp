@@ -402,6 +402,9 @@ struct GraphBoundary {
     std::vector<TensorArgType> types;
 };
 
+// Words per row of GraphRecording::task_reach — one bit per task a body may hold.
+inline constexpr size_t GRAPH_REACH_WORDS = (MAX_IN_GRAPH_TASKS + 63) / 64;
+
 // Storage for one recorded body, owned by the recorder thread and reset per
 // recording rather than allocated per recording — see recorder_recording().
 struct GraphRecording {
@@ -437,6 +440,22 @@ struct GraphRecording {
     std::vector<GraphRecordedScalarSourceRef> scalar_sources;
     std::vector<size_t> internal_fanins;
     std::vector<GraphRecordedOutputRange> output_ranges;
+    // Exact ancestor closure per recorded task, GRAPH_REACH_WORDS words each, indexed
+    // by task index within the body. Bit j of task i's row is set when task j reaches
+    // task i through the body's internal edges.
+    //
+    // This is a full bitset rather than the one-word window the global submit path
+    // carries, and the two limits are what make that affordable here: a body holds at
+    // most MAX_IN_GRAPH_TASKS tasks, so a row is a fixed 128 B and the whole array
+    // 128 KiB next to this recording's 4 MB tensor pool; and a Graph is recorded once
+    // and then replayed, so the fold is paid once for every replay that reads the
+    // reduced edge set. No window means no edge is kept merely because its producer
+    // sat too far back.
+    std::vector<uint64_t> task_reach;
+    // Edges this body's reduction removed, reported against the shipped edge count
+    // when the Definition is laid out. A Graph is recorded once, so this is where a
+    // body's redundancy is read off a run.
+    size_t reduced_edges{0};
     // Indexed by RecordedInGraphTask::predicate_index; only predicated tasks
     // contribute an entry.
     std::vector<GraphRecordedPredicate> predicates;
@@ -774,6 +793,9 @@ bool graph_recording_reserve_storage(GraphRecording &recording) {
     recording.scalar_sources.reserve(kInGraphTaskCap * static_cast<size_t>(CORE_MAX_SCALAR_ARGS));
     recording.output_ranges.reserve(kInGraphTaskCap);
     recording.predicates.reserve(kInGraphTaskCap);
+    // Sized rather than reserved: a row is read by index, and every row a body can
+    // reach must exist before the first task is recorded.
+    recording.task_reach.assign(kInGraphTaskCap * GRAPH_REACH_WORDS, 0);
     return true;
 }
 
@@ -836,6 +858,11 @@ bool graph_recording_reset(GraphRecording &recording, const GraphInflightRecordi
     recording.internal_fanins.clear();
     recording.output_ranges.clear();
     recording.predicates.clear();
+    // Cleared whole rather than per task, so a row left by the previous body cannot be
+    // read as this one's: a task that bails out mid-record never writes its own row,
+    // and a later task of the same body would otherwise fold a stale ancestor set.
+    std::fill(recording.task_reach.begin(), recording.task_reach.end(), uint64_t{0});
+    recording.reduced_edges = 0;
     return true;
 }
 
@@ -1028,6 +1055,11 @@ std::optional<GraphDefinition> graph_layout_definition(const GraphRecording &rec
         return std::nullopt;
     }
     definition.total_bytes = static_cast<uint32_t>(image_bytes);
+    LOG_DEBUG(
+        "[GraphExecution] Definition key=%#llx: %u tasks, %u edges shipped, %zu reduced away",
+        static_cast<unsigned long long>(definition.full_key), definition.task_count, definition.edge_count,
+        recording.reduced_edges
+    );
     return definition;
 }
 
@@ -1345,6 +1377,86 @@ static bool append_fanin_or_fail(
         prod_state->last_consumer_local_id = self_local;
     }
     return true;
+}
+
+// Bounded transitive reduction of one task's fanin, run once per submit on the
+// fully-appended edge list and before the count is published.
+//
+// Pass 1 folds two words over the edges. `direct` carries one bit per producer, at
+// its distance d = self - producer; `via` is the union of each producer's own
+// ancestor word shifted by that same d, which is distance addition — an ancestor
+// a hops behind producer p is a + d hops behind this task. Their union is this
+// task's ancestor set, published for its own consumers to walk. Pass 2 then drops
+// every producer whose bit appears in `via`: some other producer already reaches
+// it, so the direct edge orders nothing the chain does not, and the reduced edge
+// list has the same reachability closure as the full one.
+//
+// Two properties of host_build_graph make the walk trivially sound, and both are
+// why this is one word of state rather than the pinning protocol a ring runtime
+// needs. A task id is its slot index, handed out by a forward-only bump allocator
+// and never reclaimed, so it doubles as the global submission order — the distance
+// is a subtraction, with no sequence number to carry. And a producer's entry was
+// published by its own submit and is never rewritten, so reading it needs no proof
+// that the slot still holds the task that wrote it.
+//
+// Dropping an edge does not shorten any buffer's lifetime. Retention rides
+// last_consumer_local_id, which append_fanin_or_fail already raised to this task
+// when the edge was appended and which nothing here lowers: a producer whose edge
+// is dropped still waits for this task before the host may overwrite it.
+//
+// A producer further back than FANIN_REACH_WINDOW keeps its edge and contributes
+// nothing — it and all its ancestors are unrepresentable in the window. At exactly
+// FANIN_REACH_WINDOW only the direct bit is set: the shift would be undefined, and
+// every ancestor of that producer already lies outside the window.
+static void reduce_redundant_fanin(OrchestratorState *orch, TaskId self_task_id, int32_t *fanin_slots, int32_t &count) {
+    const int32_t self = static_cast<int32_t>(simpler::hbg::task_local_id(self_task_id));
+    uint64_t *reach = orch->fanin_reach.get();
+
+    uint64_t direct = 0;
+    uint64_t via = 0;
+    for (int32_t i = 0; i < count; i++) {
+        // A producer is always submitted before its consumer, so the distance is
+        // positive; a non-positive one would name this task or an unsubmitted slot,
+        // and is skipped rather than indexed.
+        const int32_t d = self - fanin_slots[i];
+        debug_assert(d > 0 && "a fanin producer is submitted before its consumer");
+        if (d <= 0 || d > FANIN_REACH_WINDOW) continue;
+        direct |= uint64_t{1} << (d - 1);
+        if (d < FANIN_REACH_WINDOW) via |= reach[fanin_slots[i]] << d;
+    }
+    // A via bit lands at index (i + d) for ancestor bit i >= 0 of a producer at
+    // distance d >= 1, so index 0 is unreachable: the immediately preceding task can
+    // never be proven redundant. A set bit 0 means the shift-merge has drifted (the
+    // classic form shifts by d - 1) and the pass is about to drop an edge nothing
+    // covers.
+    always_assert((via & uint64_t{1}) == 0 && "via bit 0 set: a distance-1 producer is not reducible");
+    reach[self] = direct | via;
+
+#if SIMPLER_DFX
+    orch->fanin_edges_seen += count;
+#endif
+    if (via == 0) return;
+
+    // Compact in place, preserving order: classify_fanin_state scans the region from
+    // the back for the latest-submitted unmet producer, so the surviving edges must
+    // stay in the order they were appended.
+    int32_t kept = 0;
+    for (int32_t i = 0; i < count; i++) {
+        const int32_t d = self - fanin_slots[i];
+        if (d > 0 && d <= FANIN_REACH_WINDOW && (via & (uint64_t{1} << (d - 1))) != 0) continue;
+        fanin_slots[kept++] = fanin_slots[i];
+    }
+    // Every dropped producer is reachable from some other producer, and that covering
+    // producer's local id is strictly larger, so following the cover relation up
+    // terminates at one that nothing covers. A task with producers therefore always
+    // keeps at least one edge. Emptying the region instead would make the device's
+    // boot scan classify this task as a root and dispatch it against its unfinished
+    // producers — a data race, not a hang, so it is worth catching here.
+    always_assert(kept > 0 && "reduction emptied a non-empty fanin: no producer survived as a maximal element");
+#if SIMPLER_DFX
+    orch->fanin_edges_reduced += count - kept;
+#endif
+    count = kept;
 }
 
 struct PreparedTask {
@@ -1736,6 +1848,11 @@ static TaskOutputTensors submit_task_common(
     // The initial scan happens before the scheduler dispatch loop starts. Fanin is
     // a flat array of position-independent integers, so it crosses to the device
     // unchanged.
+    //
+    // Reduction runs first, on the complete edge list and before anything reads the
+    // count: it both publishes this task's ancestor word for later submits and
+    // settles which edges the region actually holds.
+    reduce_redundant_fanin(orch, task_id, fanin_slots, payload.fanin_count);
     // The region's length is settled, so the cursor closes it at the real count. The
     // equality holds only while nothing between the bind and here bound another fanin
     // region, which is what makes the deferred advance safe.
@@ -2008,6 +2125,10 @@ bool graph_submit_outer(
         return false;
     }
     register_task_outputs(boundary_inputs, task_id, orch->tensor_map, orch->in_manual_scope());
+    // An outer Graph task takes reduction on the same terms as an ordinary one: it
+    // completes only once its whole replayed body has, so it composes with the
+    // ancestor walk exactly as a single task does.
+    reduce_redundant_fanin(orch, task_id, fanin_slots, payload.fanin_count);
     // The region's length is settled, so the cursor closes it at the real count. The
     // equality holds only while nothing between the bind and here bound another fanin
     // region, which is what makes the deferred advance safe.
@@ -2075,6 +2196,74 @@ bool graph_finalize_pending_submissions(OrchestratorState *orch, GraphHostState 
         pending.deferred_heap = false;
     }
     return true;
+}
+
+// Exact transitive reduction of one recorded task's internal fanin, run once the
+// task's producers are all appended and before its fanin_count is taken.
+//
+// Same idea as the global submit path's reduction, at full resolution. `via` is the
+// union of the producers' own ancestor rows: every task reachable through one of
+// them, and therefore already ordered before this task by the chain. A producer
+// whose bit `via` carries adds no ordering of its own and is dropped. The published
+// row is `via` plus a bit for every producer — kept or dropped, since dropping an
+// edge does not stop the producer being an ancestor.
+//
+// The full bitset is what a recorded body buys over the global path's one-word
+// window: a producer arbitrarily far back in the body is still covered, and because
+// each row is already a closure, a chain of any length collapses in this one pass.
+// A Graph is recorded once and replayed thereafter, so the fold is amortized over
+// every replay that reads the shortened CSR.
+//
+// This rewrites readiness only. A body's buffers come out of the Graph's own heap
+// and are released when the Graph completes, not per task, so there is no lifetime
+// an edge could have been holding.
+//
+// An over-cap task index, or a recording whose storage never stood up, has already
+// been marked unsupported and its Definition will be refused; either is left alone
+// rather than indexed past the row array.
+void graph_reduce_recorded_fanin(GraphRecording &recording, size_t task_index, size_t fanin_offset) {
+    if (task_index >= MAX_IN_GRAPH_TASKS ||
+        recording.task_reach.size() < static_cast<size_t>(MAX_IN_GRAPH_TASKS) * GRAPH_REACH_WORDS) {
+        return;
+    }
+    const size_t end = recording.internal_fanins.size();
+    if (end == fanin_offset) {
+        return;  // a body root: nothing to fold, and its row is already clear
+    }
+
+    uint64_t via[GRAPH_REACH_WORDS] = {};
+    uint64_t direct[GRAPH_REACH_WORDS] = {};
+    for (size_t i = fanin_offset; i < end; ++i) {
+        const uint64_t *producer_row = &recording.task_reach[recording.internal_fanins[i] * GRAPH_REACH_WORDS];
+        for (size_t w = 0; w < GRAPH_REACH_WORDS; ++w) {
+            via[w] |= producer_row[w];
+        }
+    }
+
+    // Compact in place, preserving order: the surviving producers keep the order the
+    // recording appended them in, which is the order materialize writes to the CSR.
+    size_t kept = fanin_offset;
+    for (size_t i = fanin_offset; i < end; ++i) {
+        const size_t producer = recording.internal_fanins[i];
+        direct[producer / 64] |= uint64_t{1} << (producer % 64);
+        if ((via[producer / 64] >> (producer % 64) & uint64_t{1}) != 0) {
+            continue;
+        }
+        recording.internal_fanins[kept++] = producer;
+    }
+    // Each dropped producer is reached from another producer whose index is strictly
+    // larger, so following the cover relation up terminates at one nothing covers: a
+    // task with producers always keeps an edge. Emptying the list instead would make
+    // materialize record this task as a body root and replay it against unfinished
+    // producers.
+    always_assert(kept > fanin_offset && "reduction emptied a recorded task's fanin");
+    recording.reduced_edges += end - kept;
+    recording.internal_fanins.resize(kept);
+
+    uint64_t *self = &recording.task_reach[task_index * GRAPH_REACH_WORDS];
+    for (size_t w = 0; w < GRAPH_REACH_WORDS; ++w) {
+        self[w] = via[w] | direct[w];
+    }
 }
 
 // Record one in-graph task while recording, without consuming a task-table
@@ -2352,6 +2541,9 @@ TaskOutputTensors graph_record_submit_in_graph_task(
         add_fanin(static_cast<size_t>(dep_index));
     }
 
+    // Runs on the complete producer list and before the count is taken, so the count
+    // and the CSR materialize writes both describe the reduced edge set.
+    graph_reduce_recorded_fanin(recording, task_index, task.fanin_offset);
     task.fanin_count = static_cast<uint32_t>(recording.internal_fanins.size() - task.fanin_offset);
     if (task.record_packed_base != 0 && task.total_output_size != 0 &&
         task.total_output_size <= UINTPTR_MAX - task.record_packed_base) {
@@ -2872,6 +3064,10 @@ TaskOutputTensors OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
     outputs.set_task_id(prepared.task_id);
     payload.init(args, outputs, prepared.alloc_result, layout);
     payload.fanin_count = 0;  // hidden-alloc tasks have no producer dependencies
+    // With no producers there is nothing to reduce, but the slot is still a producer
+    // for later submits, so its ancestor word has to say so: empty, not whatever the
+    // allocation left there.
+    orch->fanin_reach[simpler::hbg::task_local_id(prepared.task_id)] = 0;
     CYCLE_COUNT_LAP(g_orch_args_cycle);
 
     if (prepared.slot_state != nullptr) {
@@ -2928,6 +3124,13 @@ void OrchestratorState::mark_done() {
     int32_t total_tasks = orch->task_allocator.active_count();
     if (total_tasks > 0) {
         LOG_DEBUG("=== [Orchestrator] total_tasks=%d ===", total_tasks);
+#if SIMPLER_DFX
+        LOG_DEBUG(
+            "=== [Orchestrator] fanin edges: %lld built, %lld reduced (window=%d) ===",
+            static_cast<long long>(orch->fanin_edges_seen), static_cast<long long>(orch->fanin_edges_reduced),
+            FANIN_REACH_WINDOW
+        );
+#endif
     }
     orch->sm_header->orchestrator_done.store(1, std::memory_order_release);
     orch->scope_stack_top = -1;
