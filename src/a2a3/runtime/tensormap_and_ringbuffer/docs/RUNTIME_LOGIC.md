@@ -392,7 +392,9 @@ When `OrchestratorState::submit_task` processes parameters:
 | `is_tensor[16]` | Whether each parameter is tensor or scalar |
 | `param_count` | Number of valid parameters |
 | `fanin_slot_states[]` | Producer slot state pointers (used by `on_task_release`) |
-| `fanin_actual_count` | Actual fanin count |
+| `fanin_actual_count` | Total fanin edge count (all flag combinations, including RETAIN-only and reduction-dropped entries) |
+| `fanin_wait_count` | DEP_WAIT edge count after reduction — the readiness denominator |
+| `early_dispatch_blocked` | set when reduction dropped an edge to a producer that does not allow early resolve; `early_dispatch_target()` = `fanin_wait_count` + this, so that producer keeps this task ineligible for early dispatch exactly as it did before reduction |
 
 ### 6.2 Task State Machine
 
@@ -426,6 +428,7 @@ Key members:
 - `scope_tasks[]`, `scope_begins[]`, `scope_stack_top`: scope nesting stack (flat buffer partitioned by level)
 - `scheduler`: pointer to scheduler state (for Orch-side wiring helpers and ready queue access)
 - `gm_heap_base`, `gm_heap_size`: GM heap for output buffers
+- `wait_reach[CHIP_MAX_RING_DEPTH]`, `submit_seq`: per-slot frozen WAIT-ancestor bitmap plus its global submission sequence (`WaitReachEntry`, 16 B per slot), backing the step-5.5 bounded reduction. Orchestrator-private runtime-arena storage, never read by scheduler threads. Costs `16 B x window_size` per ring — **1 MiB** at the default 4 rings x 16384 slots, and linear in `runtime_env.ring_task_window` if a ring is enlarged.
 
 ### 7.2 Task Submission Flow (`OrchestratorState::submit_task`)
 
@@ -437,7 +440,8 @@ Key members:
 | 3 | **Lookup**: for each INPUT/INOUT param, search TensorMap for producers; collect producer pointers in `FaninBuilder` |
 | 4 | **Insert**: register OUTPUT/INOUT args in TensorMap |
 | 5 | **Record fanin metadata**: store producer edges (slot pointer + `DepFlags` packed in the low bits) in `payload->fanin_inline_edges[]` (+ spill pool if >64); claim each live producer by incrementing `fanout_count` under that producer's `fanout_lock`. Creator edges are `DEP_WAIT\|DEP_RETAIN`, tensormap-modifier edges `DEP_WAIT`. This step runs **before** `payload.init()`. |
-| 6 | **Orch-side wiring / ready publish**: the orchestrator wires live fanout edges into the per-ring dep_pool; zero-fanin and already-completed fanin tasks publish directly to ready queues. Only `DEP_WAIT` edges gate readiness — they count toward `fanin_count` and are linked onto the producer's `fanout_head` for completion notification. A `DEP_WAIT`-only edge releases its submit→wire retention pin **at wiring** (and on the already-completed fast path), so its producer can be CONSUMED without waiting for this consumer; a `DEP_RETAIN` edge keeps the pin until this consumer's `on_task_release`. A hypothetical `RETAIN`-only edge (none exist yet) would neither gate readiness nor link a fanout node — it only holds the lifetime pin. |
+| 5.5 | **Bounded transitive reduction** (`reduce_wait_edges`, issue #1376): publish this task's frozen 64-bit WAIT-ancestor bitmap over the last `WAIT_REACH_WINDOW` global submissions, then clear `DEP_WAIT` on any direct edge already covered by a WAIT path through another producer's transitive ancestors (`WAIT\|RETAIN` demotes to RETAIN-only; `WAIT`-only drops to `DEP_NONE`, the entry stays for pin accounting). Candidates beyond the window keep their WAIT. Runs before the payload flush, so `fanin_wait_count` reflects the reduced readiness set. |
+| 6 | **Orch-side wiring / ready publish**: the orchestrator wires live fanout edges into the per-ring dep_pool; zero-fanin and already-completed fanin tasks publish directly to ready queues. Only `DEP_WAIT` edges gate readiness — they count toward `fanin_count` and are linked onto the producer's `fanout_head` for completion notification. A `DEP_WAIT`-only edge releases its submit→wire retention pin **at wiring** (and on the already-completed fast path), so its producer can be CONSUMED without waiting for this consumer; a `DEP_RETAIN` edge keeps the pin until this consumer's `on_task_release`. A `RETAIN`-only edge — produced by step 5.5 when it demotes a redundant `WAIT\|RETAIN` edge — neither gates readiness nor links a fanout node; it only holds the lifetime pin until this consumer's `on_task_release`. |
 
 > **Note**: Fanout wiring is now completed before publish in the orchestrator submit path.
 > Scheduler threads consume ready queues directly.

@@ -14,6 +14,7 @@ Invoke via ``python -m simpler_setup.tools.<name>``:
 - ``sched_overhead_analysis``: scheduler overhead deep-dive
 - ``critical_path``          : chip swimlane critical-path compute/stall analysis
 - ``deps_viewer``           : deps.json -> text or pan/zoom HTML dependency graph
+- ``wait_reduction_sim``   : deps.json -> bounded-bitmap WAIT reduction coverage vs full-DAG bound
 - ``dump_viewer``           : inspect args dumps
 - ``strace_timing``         : per-stage / per-round timing from [STRACE] log markers
 - ``hbg_bind_phases``       : per-phase host_build_graph bind statistics from `bind phase=` markers

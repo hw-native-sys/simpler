@@ -96,6 +96,12 @@
 // Fanin storage
 #define CHIP_FANIN_INLINE_CAP 64
 
+// Bounded WAIT-ancestor reachability window, in tasks. One native word; the
+// shift-merge in reduce_wait_edges relies on WAIT_REACH_WINDOW == 64 (a
+// d == WAIT_REACH_WINDOW shift would be undefined behavior, and every ancestor
+// of such a producer is already outside the window anyway).
+inline constexpr int WAIT_REACH_WINDOW = 64;
+
 // Dependency-degree diagnostic: log once at debug level when a task's fanin or
 // a producer's fanout first exceeds this degree, so dense dependency graphs can
 // be inspected without adding noise to normal runtime logs.
@@ -192,6 +198,17 @@ struct FaninSpillEntry {
     void clear() { packed = 0; }
 };
 static_assert(sizeof(FaninSpillEntry) == sizeof(uintptr_t));
+
+// Per-slot frozen WAIT-ancestor reachability. `ancestors` bit i set means the
+// task with submit_seq == seq - i - 1 has a WAIT path to this slot's task;
+// published once at the owning submit, immutable for the slot's task
+// generation. `seq` is the global submission sequence of that task. Both
+// fields are written by the orchestrator thread only.
+struct WaitReachEntry {
+    uint64_t ancestors;
+    uint64_t seq;
+};
+static_assert(sizeof(WaitReachEntry) == 16, "WaitReachEntry is one 16B stride");
 
 /**
  * Dependency list entry (singly-linked list node)
@@ -299,7 +316,8 @@ struct TaskPayload {
     // Candidate detection is the event-driven dual of fanin_refcount. Wiring
     // seeds producers already complete, and flagged producers increment the
     // count only after all logical blocks are launch-visible. Equality with
-    // fanin_actual_count makes the consumer eligible for early dispatch.
+    // fanin_wait_count (only DEP_WAIT producers link onto fanout_head and bump
+    // it) makes the consumer eligible for early dispatch.
     std::atomic<int32_t> dispatch_fanin{0};  // CONSUMER side: fully-published + pre-completed producers
     // Claimed-but-unpublished blocks are not launch-visible. Seq_cst updates
     // pair with early_dispatch_state so final publication cannot be lost when
@@ -322,6 +340,30 @@ struct TaskPayload {
     // records that producer release observed the owner; only cancellation clears
     // ownership before payload reinitialization.
     std::atomic<uint8_t> early_sync_drain_state{EARLY_SYNC_DRAIN_NONE};
+    // Set when transitive reduction cleared DEP_WAIT on an edge whose producer
+    // does not allow early resolve. Such a producer never propagates
+    // dispatch_fanin, so while it was in fanin_wait_count the count was
+    // permanently short and this task could not early-dispatch. Reduction takes
+    // it out of that count, so the unreachable unit is carried here instead --
+    // see early_dispatch_target(). Occupies alignment padding ahead of
+    // fanin_wait_count, so the payload layout is unchanged.
+    uint8_t early_dispatch_blocked{0};
+    // Number of DEP_WAIT fanin edges (readiness-bearing), <= fanin_actual_count.
+    // fanin_actual_count is the TOTAL edge count that for_each iteration and
+    // on_task_release walk (including RETAIN-only and reduction-dropped edges);
+    // this is the WAIT-edge count the early-dispatch threshold compares
+    // dispatch_fanin against. They differ once transitive reduction produces
+    // RETAIN-only or dropped edges that carry no DEP_WAIT. Occupies the padding
+    // between the early-dispatch block and the 64B-aligned predicate, so the
+    // payload layout is unchanged.
+    int32_t fanin_wait_count{0};
+    // The count dispatch_fanin must hit for this task to be an early-dispatch
+    // candidate. Only producers linked onto a fanout_head ever bump
+    // dispatch_fanin, so it can reach at most fanin_wait_count: a nonzero
+    // early_dispatch_blocked therefore makes this target permanently
+    // unreachable, which is exactly what the reduced-away producer did while it
+    // was still counted.
+    int32_t early_dispatch_target() const { return fanin_wait_count + early_dispatch_blocked; }
     // === Cache line 9 (byte 576) — dispatch predicate (AICPU-only) ===
     // Offset is a fixed 576, independent of MAX_TENSOR_ARGS / MAX_SCALAR_ARGS.
     // AICore never reads it — args are materialized from the tensor_count / tensors
@@ -415,6 +457,13 @@ struct TaskPayload {
 // TaskPayload layout verification (offsetof requires complete type).
 static_assert(offsetof(TaskPayload, fanin_spill_pool) == 16, "spill pool pointer layout drift");
 static_assert(offsetof(TaskPayload, fanin_inline_edges) == 24, "inline fanin array must follow spill metadata");
+static_assert(
+    offsetof(TaskPayload, fanin_wait_count) >=
+            offsetof(TaskPayload, early_sync_drain_state) + sizeof(TaskPayload::early_sync_drain_state) &&
+        offsetof(TaskPayload, fanin_wait_count) + sizeof(TaskPayload::fanin_wait_count) <=
+            offsetof(TaskPayload, predicate),
+    "fanin_wait_count occupies the padding between the early-dispatch block and the 64B-aligned predicate"
+);
 static_assert(
     offsetof(TaskPayload, predicate) == 576,
     "dispatch predicate occupies cache line 9 at fixed byte 576 (before tensors, never moves)"

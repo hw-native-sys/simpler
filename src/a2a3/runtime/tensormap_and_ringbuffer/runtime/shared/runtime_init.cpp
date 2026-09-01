@@ -333,6 +333,10 @@ OrchestratorLayout OrchestratorState::reserve_layout(
         const size_t seen_epoch_bytes =
             CHIP_ALIGN_UP(static_cast<size_t>(task_window_sizes[r]) * sizeof(uint32_t), CHIP_ALIGN_SIZE);
         layout.off_fanin_seen_epoch[r] = arena.reserve(seen_epoch_bytes, CHIP_ALIGN_SIZE);
+
+        const size_t wait_reach_bytes =
+            CHIP_ALIGN_UP(static_cast<size_t>(task_window_sizes[r]) * sizeof(WaitReachEntry), CHIP_ALIGN_SIZE);
+        layout.off_wait_reach[r] = arena.reserve(wait_reach_bytes, CHIP_ALIGN_SIZE);
     }
     layout.off_scope_tasks =
         arena.reserve(static_cast<size_t>(layout.scope_tasks_cap) * sizeof(uintptr_t), alignof(ChipTaskSlotState *));
@@ -399,6 +403,13 @@ bool OrchestratorState::init_data_from_layout(
         auto *seen_epoch = static_cast<uint32_t *>(arena.region_ptr(layout.off_fanin_seen_epoch[r]));
         memset(seen_epoch, 0, seen_epoch_bytes);
         orch->fanin_seen_epoch[r] = seen_epoch;
+
+        const size_t wait_reach_bytes = CHIP_ALIGN_UP(
+            static_cast<size_t>(layout.tensor_map.task_window_sizes[r]) * sizeof(WaitReachEntry), CHIP_ALIGN_SIZE
+        );
+        auto *wait_reach = static_cast<WaitReachEntry *>(arena.region_ptr(layout.off_wait_reach[r]));
+        memset(wait_reach, 0, wait_reach_bytes);
+        orch->wait_reach[r] = wait_reach;
     }
 
     if (!orch->tensor_map.init_data_from_layout(layout.tensor_map, arena)) {
@@ -428,6 +439,10 @@ bool OrchestratorState::reset_for_reuse(
     orch->gm_heap_size = total_heap_size;
     orch->fatal = false;
     orch->inline_completed_tasks = 0;
+    // The wait_reach entries are not cleared here: every slot publishes its
+    // bitmap before any submit can read it as a producer, so entries left from
+    // a previous run are unreachable.
+    orch->submit_seq = 0;
 
     uint32_t next_epoch = orch->fanin_seen_current_epoch + 1;
     if (next_epoch == 0) {
@@ -481,6 +496,7 @@ void OrchestratorState::wire_arena_pointers(
     for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
         orch->rings[r].fanin_pool.base = static_cast<FaninSpillEntry *>(arena.region_ptr(layout.off_fanin_pool[r]));
         orch->fanin_seen_epoch[r] = static_cast<uint32_t *>(arena.region_ptr(layout.off_fanin_seen_epoch[r]));
+        orch->wait_reach[r] = static_cast<WaitReachEntry *>(arena.region_ptr(layout.off_wait_reach[r]));
     }
     orch->tensor_map.wire_arena_pointers(layout.tensor_map, arena);
     orch->scope_tasks = static_cast<ChipTaskSlotState **>(arena.region_ptr(layout.off_scope_tasks));
@@ -494,6 +510,7 @@ void OrchestratorState::destroy() {
     for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
         orch->rings[r].fanin_pool.base = nullptr;
         orch->fanin_seen_epoch[r] = nullptr;
+        orch->wait_reach[r] = nullptr;
     }
     orch->scope_tasks = nullptr;
     orch->scope_begins = nullptr;
