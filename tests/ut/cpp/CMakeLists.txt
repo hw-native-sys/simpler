@@ -963,6 +963,13 @@ target_sources(test_hbg_graph_recording_bounds PRIVATE
     ${HBG_ORCH_SHARED_SOURCES}
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
 )
+# Reads the published fanin region back after real submits, so it links the same
+# out-of-line orchestrator members.
+add_a2a3_hbg_runtime_test(test_hbg_fanin_reduction common/test_hbg_fanin_reduction.cpp)
+target_sources(test_hbg_fanin_reduction PRIVATE
+    ${HBG_ORCH_SHARED_SOURCES}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
+)
 add_a5_hbg_runtime_test(test_a5_hbg_graph_recording_bounds common/test_hbg_graph_recording_bounds.cpp)
 target_sources(test_a5_hbg_graph_recording_bounds PRIVATE
     ${HBG_ORCH_SHARED_SOURCES}
@@ -981,6 +988,11 @@ target_sources(test_a5_hbg_graph_definition_arena PRIVATE
 )
 add_a5_hbg_runtime_test(test_a5_hbg_slot_claim common/test_hbg_slot_claim.cpp)
 target_sources(test_a5_hbg_slot_claim PRIVATE
+    ${HBG_ORCH_SHARED_SOURCES}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
+)
+add_a5_hbg_runtime_test(test_a5_hbg_fanin_reduction common/test_hbg_fanin_reduction.cpp)
+target_sources(test_a5_hbg_fanin_reduction PRIVATE
     ${HBG_ORCH_SHARED_SOURCES}
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
 )

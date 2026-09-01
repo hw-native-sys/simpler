@@ -68,6 +68,14 @@ struct OrchestratorState {
     std::unique_ptr<uint32_t[]> fanin_seen_epoch;
     uint32_t fanin_seen_current_epoch{1};
 
+    // Frozen dependency-ancestor reachability, one word per task, indexed by local
+    // id. Bit i of entry `t` is set when the task with local id `t - i - 1` reaches
+    // `t` through a chain of fanin edges. Published once by t's own submit and never
+    // rewritten: a task id is also its slot index and hbg reclaims neither, so an
+    // entry describes the same task for the whole run. Orchestrator scratch like
+    // fanin_seen_epoch — host-only, and nothing on the device reads it.
+    std::unique_ptr<uint64_t[]> fanin_reach;
+
     // === TENSOR MAP (Private) ===
     ChipTensorMap tensor_map;  // Producer lookup
 
@@ -138,6 +146,11 @@ struct OrchestratorState {
     int64_t tasks_submitted;
     int64_t buffers_allocated;
     int64_t bytes_allocated;
+    // Fanin edges transitive reduction dropped, and the edges that reached it. Both
+    // count the whole run and are reported once by mark_done, which is how a change
+    // to the window or to a workload's shape is read off a run.
+    int64_t fanin_edges_seen;
+    int64_t fanin_edges_reduced;
 #endif
 
     bool is_fatal() const { return fatal_code.load(std::memory_order_acquire) != SIMPLER_ERROR_NONE; }

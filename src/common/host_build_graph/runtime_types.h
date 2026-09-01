@@ -143,6 +143,15 @@ inline constexpr uint64_t READY_QUEUE_CAPACITY_LIMIT = 32768;
 // fanin of any workload (paged_attention is the densest).
 #define CHIP_MAX_FANIN 128
 
+// How far back transitive reduction can prove one fanin edge redundant, measured
+// in task local ids. One native word, so a task's whole ancestor set is a single
+// uint64 and the shift-merge in reduce_redundant_fanin is one instruction; the
+// pass relies on that width, since a shift by FANIN_REACH_WINDOW would be
+// undefined and every ancestor of a producer that far back is out of the window
+// anyway. Raising it means widening the entry to several words and shifting
+// across them, not editing this number.
+inline constexpr int32_t FANIN_REACH_WINDOW = 64;
+
 // Alignment of every per-task region inside an argument pool. Each region starts
 // and ends on a cache line so TaskPayload::init's round-up scalar memcpy stays
 // inside the task's own region — see its comment. simpler::hbg::Tensor is already 2 cache
