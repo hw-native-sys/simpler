@@ -11,13 +11,17 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <utility>
 
-#include "aicpu/worker_chip_message_queue.h"
+#include "aicpu/cache_maintenance.h"
+#include "aicpu/device_time.h"
+#include "aicpu/region_instance_view.h"
+#include "common/region_template.h"
 #include "orchestration_api.h"  // NOLINT(build/include_subdir)
 
 namespace {
 
-constexpr int kExpectedArgCount = 12;
+constexpr int kExpectedArgCount = static_cast<int>(spsc_queue::kSpscQueueEndpointBindingScalarCount);
 constexpr uint32_t kInputWindowComputeFuncId = 0;
 constexpr uint64_t kQueueTimeoutNs = 5000000000ULL;
 constexpr uint64_t kInputWindow = 4;
@@ -46,54 +50,50 @@ struct OutputHeader {
     uint64_t aux;
 };
 
+using QueueEndpoint = spsc_queue::SpscQueueEndpoint<RegionInstanceView, kInputWindow>;
+
 struct ActiveRequest {
-    WorkerChipQueueInputHandle handle;
+    spsc_queue::SpscQueueInputHandle handle;
     InputHeader header;
 };
 
-using QueueEndpoint = WorkerChipQueueEndpoint<kInputWindow>;
+uint64_t spsc_queue_now_ns() { return sys_cnt_ticks_to_ns(device_time_now_ticks(), device_time_frequency_hz()); }
 
 void report_queue_error(const QueueEndpoint &queue) {
-    const WorkerChipQueueError &err = queue.error();
-    rt_report_fatal(
-        SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, "L3-L2 queue error op=%s kind=%u region=%llu msg=%s",
-        worker_chip_queue_op_to_string(err.op), static_cast<unsigned>(err.kind),
-        static_cast<unsigned long long>(err.region_id), err.message
-    );
+    rt_report_fatal(SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, "%s", queue.error().message);
 }
 
-bool has_queue_error(const QueueEndpoint &queue) { return queue.error().kind != WorkerChipQueueErrorKind::NONE; }
+bool has_queue_error(const QueueEndpoint &queue) { return queue.error().kind != spsc_queue::SpscQueueErrorKind::NONE; }
 
-bool parse_input_header(const WorkerChipQueueInputHandle &input, InputHeader *header) {
+bool parse_input_header(const spsc_queue::SpscQueueInputHandle &input, InputHeader *header) {
     if (header == nullptr || input.payload_nbytes != kInputHeaderBytes + kTileBytes) {
         return false;
     }
-    memcpy(header, reinterpret_cast<const void *>(static_cast<uintptr_t>(input.payload.gm_addr)), sizeof(*header));
+    memcpy(header, reinterpret_cast<const void *>(static_cast<uintptr_t>(input.payload.local_addr)), sizeof(*header));
     return true;
 }
 
-simpler::tmr::Tensor make_input_values_tensor(const WorkerChipQueueInputHandle &input) {
+simpler::tmr::Tensor make_input_values_tensor(const spsc_queue::SpscQueueInputHandle &input) {
     uint32_t shape[2] = {kTileRows, kTileCols};
-    void *values = reinterpret_cast<void *>(static_cast<uintptr_t>(input.payload.gm_addr + kInputHeaderBytes));
+    void *values = reinterpret_cast<void *>(static_cast<uintptr_t>(input.payload.local_addr + kInputHeaderBytes));
     return simpler::tmr::make_tensor_external(values, shape, 2, DataType::FLOAT32);
 }
 
 bool publish_aiv_output(
-    QueueEndpoint &queue, const WorkerChipQueueInputHandle &first, const WorkerChipQueueInputHandle &second,
+    QueueEndpoint &queue, const spsc_queue::SpscQueueInputHandle &first, const spsc_queue::SpscQueueInputHandle &second,
     uint64_t request_id, uint64_t kind, uint64_t aux, InputWindowOp op, float scalar
 ) {
     uint64_t nbytes = kOutputHeaderBytes + kTileBytes;
-    WorkerChipQueueOutputReservation output{};
+    spsc_queue::SpscQueueOutputReservation output{};
     if (!queue.output().reserve(nbytes, kQueueTimeoutNs, output)) {
         report_queue_error(queue);
         return false;
     }
 
     OutputHeader header{request_id, kind, aux};
-    uint8_t *dst = reinterpret_cast<uint8_t *>(static_cast<uintptr_t>(output.payload.gm_addr));
+    uint8_t *dst = reinterpret_cast<uint8_t *>(static_cast<uintptr_t>(output.payload.local_addr));
     memset(dst, 0, kOutputHeaderBytes);
     memcpy(dst, &header, sizeof(header));
-    cache_flush_range(dst, kOutputHeaderBytes);
 
     simpler::tmr::Tensor first_tensor = make_input_values_tensor(first);
     simpler::tmr::Tensor second_tensor = make_input_values_tensor(second);
@@ -111,15 +111,16 @@ bool publish_aiv_output(
 
     uint32_t first_output_index[2] = {0, 0};
     (void)get_tensor_data<float>(output_tensor, 2, first_output_index);
+    cache_flush_range(dst, nbytes);
 
-    if (!queue.output().publish(output, WorkerChipQueueOpcode::DATA)) {
+    if (!queue.output().publish(output, spsc_queue::SpscQueueOpcode::DATA)) {
         report_queue_error(queue);
         return false;
     }
     return true;
 }
 
-bool release_input(QueueEndpoint &queue, const WorkerChipQueueInputHandle &input) {
+bool release_input(QueueEndpoint &queue, const spsc_queue::SpscQueueInputHandle &input) {
     if (!queue.input().release(input)) {
         report_queue_error(queue);
         return false;
@@ -127,7 +128,7 @@ bool release_input(QueueEndpoint &queue, const WorkerChipQueueInputHandle &input
     return true;
 }
 
-bool process_first_pair(QueueEndpoint &queue, ActiveRequest *active, const WorkerChipQueueInputHandle &input) {
+bool process_first_pair(QueueEndpoint &queue, ActiveRequest *active, const spsc_queue::SpscQueueInputHandle &input) {
     active[1].handle = input;
     if (!parse_input_header(input, &active[1].header) || active[0].header.request_id == 0) {
         rt_report_fatal(SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, "invalid L3-L2 queue example request");
@@ -158,7 +159,7 @@ bool process_first_pair(QueueEndpoint &queue, ActiveRequest *active, const Worke
 }
 
 bool remember_input_for_pair(
-    ActiveRequest *active, const WorkerChipQueueInputHandle &input, const InputHeader &header
+    ActiveRequest *active, const spsc_queue::SpscQueueInputHandle &input, const InputHeader &header
 ) {
     if (active[2].header.request_id == 0) {
         active[2].handle = input;
@@ -174,7 +175,7 @@ bool remember_input_for_pair(
     return false;
 }
 
-bool process_data_message(QueueEndpoint &queue, const WorkerChipQueueInputHandle &input, ActiveRequest *active) {
+bool process_data_message(QueueEndpoint &queue, const spsc_queue::SpscQueueInputHandle &input, ActiveRequest *active) {
     InputHeader header{};
     if (!parse_input_header(input, &header)) {
         rt_report_fatal(SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, "invalid L3-L2 queue example request");
@@ -239,23 +240,31 @@ __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_c
 }
 
 __attribute__((visibility("default"))) void worker_chip_message_queue_orchestration(const ChipTaskArgs &orch_args) {
-    WorkerChipOrchRegionDesc desc{
-        orch_args.scalar(0), orch_args.scalar(1), orch_args.scalar(2),
-        orch_args.scalar(3), orch_args.scalar(4), orch_args.scalar(5),
-    };
-    WorkerChipQueueArgs queue_args{
-        orch_args.scalar(6), orch_args.scalar(7),  orch_args.scalar(8),
-        orch_args.scalar(9), orch_args.scalar(10), orch_args.scalar(11),
-    };
-    QueueEndpoint queue(desc, queue_args);
-    if (has_queue_error(queue)) {
+    uint64_t scalars[spsc_queue::kSpscQueueEndpointBindingScalarCount];
+    for (size_t i = 0; i < spsc_queue::kSpscQueueEndpointBindingScalarCount; ++i) {
+        scalars[i] = orch_args.scalar(static_cast<int32_t>(i));
+    }
+    spsc_queue::SpscQueueEndpointBinding binding{};
+    if (!spsc_queue::decode_endpoint_binding(scalars, spsc_queue::kSpscQueueEndpointBindingScalarCount, &binding)) {
+        rt_report_fatal(
+            SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, "SPSC queue endpoint error op=init kind=2 msg=invalid queue binding"
+        );
+        return;
+    }
+    RegionInstanceView view(
+        RegionPartLocalSpan{binding.payload_base, binding.payload_bytes},
+        RegionPartLocalSpan{binding.counter_base, binding.counter_bytes}
+    );
+    spsc_queue::MonotonicClock clock{&spsc_queue_now_ns};
+    QueueEndpoint queue(binding, std::move(view), clock);
+    if (!queue.live()) {
         report_queue_error(queue);
         return;
     }
 
     ActiveRequest active[kInputWindow]{};
     for (;;) {
-        WorkerChipQueueInputHandle input{};
+        spsc_queue::SpscQueueInputHandle input{};
         if (!queue.input().peek(kQueueTimeoutNs, input)) {
             if (has_queue_error(queue)) {
                 report_queue_error(queue);
@@ -263,7 +272,7 @@ __attribute__((visibility("default"))) void worker_chip_message_queue_orchestrat
             }
             continue;
         }
-        if (input.opcode == WorkerChipQueueOpcode::STOP) {
+        if (input.opcode == spsc_queue::SpscQueueOpcode::STOP) {
             if (!finish_pending_inputs(queue, active)) {
                 return;
             }
@@ -276,7 +285,7 @@ __attribute__((visibility("default"))) void worker_chip_message_queue_orchestrat
             }
             return;
         }
-        if (input.opcode != WorkerChipQueueOpcode::DATA) {
+        if (input.opcode != spsc_queue::SpscQueueOpcode::DATA) {
             rt_report_fatal(
                 SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, "L3-L2 queue example unexpected input opcode=%llu",
                 static_cast<unsigned long long>(input.opcode)

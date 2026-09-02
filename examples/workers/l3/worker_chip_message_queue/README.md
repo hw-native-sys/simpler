@@ -5,8 +5,11 @@ submits it, and waits. Here the host submits **one long-lived L2 task** and then
 feeds it a stream of requests while it runs, reading results back as they
 appear — a serving loop, not a batch.
 
-The transport is the L3-L2 message queue: two arenas (input and output) plus a
-descriptor the L2 orchestration receives as plain scalars. See
+The transport is the L3-L2 SPSC queue (`SPSQ` ABI 1.0): two arenas (input and
+output) plus a 10-scalar endpoint binding the L2 orchestration receives as
+plain `TaskArgs` scalars starting at offset 0. Binaries built against the
+previous `L3Q2` 12-scalar layout must be recompiled. This example is a smoke
+path, not the formal Queue Acceptance record. See
 [`docs/l3-l2-message-queue.md`](../../../../docs/l3-l2-message-queue.md) for
 the channel's design.
 
@@ -15,7 +18,7 @@ the channel's design.
 | Concept | How |
 | ------- | --- |
 | **Creating the channel** | `orch.create_worker_chip_queue(worker_id=0, depth=8, input_arena_bytes=..., output_arena_bytes=...)`. |
-| **Handing it to L2** | `queue.chip_task_arg_scalars()` packs the descriptor into `TaskArgs` as scalars — the L2 side needs no other setup. |
+| **Handing it to L2** | `queue.chip_task_arg_scalars()` packs the `SPSQ` 1.0 binding into `TaskArgs` as exactly 10 scalars — the L2 side needs no other setup. |
 | **Full-duplex, decoupled** | The host enqueues two requests, drains **three** responses, then enqueues two more. Requests and responses are not paired one-to-one. |
 | **Zero-copy reads** | `queue.output.peek(timeout)` → `read_into(message, buf)` → `release(message)`. `release` is what returns arena space; skipping it stalls the producer once the queue fills. |
 | **Cooperative shutdown** | `queue.request_stop(timeout)` lets the L2 side finish work already accepted. Responses queued before the stop are still drained afterwards. |

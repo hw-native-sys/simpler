@@ -174,6 +174,7 @@ def run_worker_chip_message_queue_example(platform: str, device_id: int) -> None
             )
 
             task_args = TaskArgs()
+            # Binding occupies TaskArgs scalars [0, 10).
             for scalar in queue.chip_task_arg_scalars():
                 task_args.add_scalar(int(scalar))
             orch_handle.submit_next_level(handle, task_args, cfg, worker=0)
