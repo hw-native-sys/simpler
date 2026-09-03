@@ -8,11 +8,9 @@ The runtime uses a hierarchical profiling system with compile-time macros to con
 
 > **A5 HBG scheduler selection.** Diagnostic flags never select the scheduler.
 > Ordinary DAGs remain on the A5 HBG AICore Scheduler, while Graph replay
-> remains on its explicit legacy compatibility path. Until AICore Scheduler
-> profiling lands, chip-swimlane, PMU, and argument-dump collection for
-> ordinary DAGs is best-effort; artifacts may be absent or incomplete and must
-> not be used as evidence of AICore Scheduler behavior or as a profiling-on
-> performance baseline.
+> remains on its explicit AICPU compatibility path. Both producers export the
+> same `scheduler_records` schema; stream metadata identifies `producer` so
+> tools never apply AICPU scheduling assumptions to AICore intervals.
 > **host_build_graph (host-orch) note.** The profiling **macros** below
 > (`SIMPLER_DFX`, `SIMPLER_ORCH_PROFILING`, …) are shared with
 > `tensormap_and_ringbuffer`. But the orchestrator-timing **device-log lines**
@@ -173,7 +171,7 @@ Thread X: Scheduler summary: total_time=XXXus, loops=XXX, tasks_scheduled=XXX
 ```
 
 Per-thread fanout / fanin edge counts and ready-queue pop hit / miss
-stats live in `aicpu_scheduler_phases[]` (in `chip_swimlane_records.json`
+stats live in `scheduler_records.streams[]` (in `chip_swimlane_records.json`
 captured at chip_swimlane_level >= 3) and `deps.json`; consume them via
 `simpler_setup/tools/sched_overhead_analysis.py`.
 
@@ -415,13 +413,16 @@ mirrors the PMU pattern — two independent channels (one binary, one int):
 
 - **Binary on/off** — `KernelArgs::enable_profiling_flag` bit1
   (`SIMPLER_DFX_FLAG_CHIP_SWIMLANE`). Set by the host whenever level > 0; read
-  by AICore (which only needs on/off to decide whether to write timing) and
-  by AICPU kernel entry via `set_chip_swimlane_enabled(bool)`.
+  by AICore for the initial profiler activation and by AICPU kernel entry via
+  `set_chip_swimlane_enabled(bool)`.
 - **Granular level (0–4)** — `ChipSwimlaneDataHeader::chip_swimlane_level`
   (shared memory). Host writes it in `ChipSwimlaneCollector::initialize`; AICPU
   promotes it from the header in `chip_swimlane_aicpu_init` and exposes it via
   `get_chip_swimlane_level()` (typed `ChipSwimlaneLevel`) for
-  `>= SCHEDULE_TIMING / SCHED_PHASES / ORCH_PHASES` gates.
+  `>= SCHEDULE_TIMING / SCHED_PHASES / ORCH_PHASES` gates. The A5 HBG host also
+  copies the level into `SchedulerRunControl`, where the AICore Scheduler reads
+  it once and gates task timing, per-task scheduling timing, and phase timing
+  independently.
 
 On sim, the binary on/off travels via the dlsym'd `set_chip_swimlane_enabled`
 entry point; the granular level still goes through the shared-memory
@@ -434,6 +435,23 @@ header just like on onboard.
 | 2 | + Scheduler per-task dispatch_time, finish_time |
 | 3 | + Scheduler phases (`SCHED_*`) |
 | 4 | + Orchestrator phases (full) |
+
+The A5 HBG AICore Scheduler records the same per-task timing contract as the
+AICPU Scheduler: `dispatch_time` is the end of dispatch publication and
+`finish_time` is when the Scheduler starts processing the completion. The raw
+`scheduler_tasks.producer` field identifies which Scheduler produced these
+timestamps. At level 2 and above, A5 HBG also exports AICPU lifecycle timestamps
+for handshake, topology/configuration, context publication, bootstrap wait,
+register release, and exit; these are supplemental control-plane records.
+
+At level 3 and above, A5 HBG AICore Scheduler task intervals reuse the per-task
+trace. Consecutive taskless scheduler-loop iterations are coalesced into one
+`idle` interval and stored in one fixed-capacity, no-wrap buffer per Scheduler;
+overflow increments `capture.dropped` and sets `capture.truncated`. Coalescing
+keeps capture size dependent on idle-to-active transitions instead of Host CPU
+speed in simulation. The buffer is not allocated below level 3. Interval
+endpoints are captured at operation entry and exit; no interval is synthesized
+from aggregate durations.
 
 At level 1 the AICore record carries the full `task_token_raw`
 (a `TaskId::raw`; see `src/common/host_build_graph/task_id.h`), read straight from

@@ -70,7 +70,7 @@ inline __aicore__ bool scheduler_normal_aiv_worker_precedes(
 inline __aicore__ bool scheduler_fill_cluster_normal_slots(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *scheduler,
     __gm__ SchedulerRunControl *run_control, uint64_t *ready_victim_cursors, SchedulerReadyStats *ready_stats,
-    bool trace_enabled, uint64_t skip_slot_mask = 0, SchedulerNormalDispatchTiming *timing = nullptr,
+    uint64_t profiling_level, uint64_t skip_slot_mask = 0, SchedulerNormalDispatchTiming *timing = nullptr,
     SchedulerDeferredAivQueue *deferred_aiv = nullptr, __gm__ SchedulerReadyOwnerState *owner_state = nullptr,
     bool *failed = nullptr
 ) {
@@ -104,7 +104,7 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
                 SchedulerReadyClaim ready{};
                 if (!scheduler_claim_ready_for_slot(
                         graph, scheduler_state_base, scheduler, run_control, scheduler->scheduler_count, aic_core_type,
-                        &ready_victim_cursors[aic_core_type], ready_stats, &ready, owner_state, trace_enabled
+                        &ready_victim_cursors[aic_core_type], ready_stats, &ready, owner_state, profiling_level
                     )) {
                     if (failed != nullptr) *failed = true;
                     return progress;
@@ -126,7 +126,7 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
                 );
                 SchedulerDispatchFillTiming fill_timing{};
                 if (!scheduler_fill_dispatch_slot(
-                        graph, scheduler_state_base, scheduler, run_control, claim, ready, trace_enabled,
+                        graph, scheduler_state_base, scheduler, run_control, claim, ready, profiling_level,
                         timing == nullptr ? nullptr : &fill_timing
                     )) {
                     if (failed != nullptr) *failed = true;
@@ -226,7 +226,7 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
             SchedulerReadyClaim ready{};
             if (!scheduler_claim_ready_for_slot(
                     graph, scheduler_state_base, scheduler, run_control, scheduler->scheduler_count, aiv_core_type,
-                    &ready_victim_cursors[aiv_core_type], ready_stats, &ready, owner_state, trace_enabled
+                    &ready_victim_cursors[aiv_core_type], ready_stats, &ready, owner_state, profiling_level
                 )) {
                 scheduler_gm_store(
                     slot->publication,
@@ -252,7 +252,7 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
             }
             SchedulerDispatchFillTiming fill_timing{};
             if (!scheduler_fill_dispatch_slot(
-                    graph, scheduler_state_base, scheduler, run_control, claim, ready, trace_enabled,
+                    graph, scheduler_state_base, scheduler, run_control, claim, ready, profiling_level,
                     timing == nullptr ? nullptr : &fill_timing
                 )) {
                 if (failed != nullptr) *failed = true;
@@ -317,7 +317,7 @@ scheduler_deferred_aiv_peer_lane(__gm__ void *scheduler_state_base, __gm__ Sched
 inline __aicore__ bool scheduler_drain_deferred_aiv_to_peer(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *scheduler,
     __gm__ SchedulerRunControl *run_control, SchedulerDeferredAivQueue *queue, SchedulerWakeStats *wake_stats,
-    SchedulerReadyStats *ready_stats, SchedulerCompletionStats *completion_stats, bool trace_enabled,
+    SchedulerReadyStats *ready_stats, SchedulerCompletionStats *completion_stats, uint64_t profiling_level,
     SchedulerCompletionServiceTiming *completion_timing = nullptr,
     SchedulerNormalDispatchTiming *dispatch_timing = nullptr, __gm__ SchedulerReadyOwnerState *owner_state = nullptr
 ) {
@@ -353,7 +353,7 @@ inline __aicore__ bool scheduler_drain_deferred_aiv_to_peer(
                 if (!scheduler_fill_dispatch_slot(
                         graph, scheduler_state_base, scheduler, run_control,
                         SchedulerFreeSlotClaim{peer_worker_id, pending_slot, generation}, queue->entries[0].ready,
-                        trace_enabled, dispatch_timing == nullptr ? nullptr : &fill_timing
+                        profiling_level, dispatch_timing == nullptr ? nullptr : &fill_timing
                     ))
                     return false;
                 if (dispatch_timing != nullptr) {
@@ -372,7 +372,7 @@ inline __aicore__ bool scheduler_drain_deferred_aiv_to_peer(
                 if (!scheduler_service_cluster_completion_slot(
                         graph, scheduler_state_base, scheduler, run_control, static_cast<uint32_t>(peer_lane),
                         pending_slot, completed_generation, wake_stats, ready_stats, completion_stats, nullptr,
-                        trace_enabled, &queue->entries[0].ready, &refilled, completion_timing, owner_state
+                        profiling_level, &queue->entries[0].ready, &refilled, completion_timing, owner_state
                     ) ||
                     !refilled)
                     return false;
@@ -389,7 +389,7 @@ inline __aicore__ bool scheduler_drain_deferred_aiv_to_peer(
 
 inline __aicore__ bool scheduler_publish_deferred_aiv_local(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *scheduler,
-    __gm__ SchedulerRunControl *run_control, SchedulerDeferredAivQueue *queue, bool trace_enabled,
+    __gm__ SchedulerRunControl *run_control, SchedulerDeferredAivQueue *queue, uint64_t profiling_level,
     uint32_t *published_slot, SchedulerNormalDispatchTiming *timing = nullptr
 ) {
     if (published_slot != nullptr) *published_slot = UINT32_MAX;
@@ -420,7 +420,7 @@ inline __aicore__ bool scheduler_publish_deferred_aiv_local(
     const uint32_t aiv_core_type = static_cast<uint32_t>(CoreType::AIV);
     SchedulerDispatchFillTiming fill_timing{};
     if (!scheduler_fill_dispatch_slot(
-            graph, scheduler_state_base, scheduler, run_control, entry.reserved_slot, entry.ready, trace_enabled,
+            graph, scheduler_state_base, scheduler, run_control, entry.reserved_slot, entry.ready, profiling_level,
             timing == nullptr ? nullptr : &fill_timing
         ))
         return false;

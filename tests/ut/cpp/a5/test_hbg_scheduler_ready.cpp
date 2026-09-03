@@ -173,6 +173,77 @@ struct FixtureStorage {
     uint64_t *callable_addresses{nullptr};
 };
 
+TEST(SchedulerActivityBuffer, IsAllocatedOnlyWhenRequestedAndNeverWraps) {
+    AicoreSchedulerLayout disabled{};
+    ASSERT_TRUE(scheduler_plan_layout(1, 1, 0, &disabled));
+    EXPECT_EQ(disabled.activity_buffers_offset, 0u);
+
+    AicoreSchedulerLayout enabled{};
+    ASSERT_TRUE(scheduler_plan_layout(1, 1, 0, &enabled, true));
+    ASSERT_NE(enabled.activity_buffers_offset, 0u);
+    EXPECT_EQ(
+        enabled.total_size - disabled.total_size,
+        static_cast<uint64_t>(SCHEDULER_CLUSTER_CAPACITY) * sizeof(SchedulerActivityBuffer)
+    );
+    SchedulerStateBuffer storage(enabled);
+    auto *contexts = scheduler_state_at<SchedulerWorkerContext>(storage.base(), enabled.worker_contexts_offset);
+    auto *buffers = scheduler_state_at<SchedulerActivityBuffer>(storage.base(), enabled.activity_buffers_offset);
+    contexts[0].worker_index = SCHEDULER_WORKER_CAPACITY - 1;
+    contexts[0].is_scheduler = 1;
+    contexts[0].scheduler_index = SCHEDULER_CLUSTER_CAPACITY - 1;
+    contexts[0].profiling_loop_iter = 17;
+    SchedulerActivityBuffer &buffer = buffers[SCHEDULER_CLUSTER_CAPACITY - 1];
+    buffer.committed = SCHEDULER_ACTIVITY_CAPACITY - 1;
+
+    scheduler_append_idle_activity(storage.base(), &contexts[0], 10, 20);
+    scheduler_append_idle_activity(storage.base(), &contexts[0], 30, 40);
+
+    EXPECT_EQ(buffer.committed, SCHEDULER_ACTIVITY_CAPACITY);
+    EXPECT_EQ(buffer.dropped, 1u);
+    const SchedulerIdleRecord &last = buffer.records[SCHEDULER_ACTIVITY_CAPACITY - 1];
+    EXPECT_EQ(last.start_time, 10u);
+    EXPECT_EQ(last.end_time, 20u);
+    EXPECT_EQ(last.loop_iter, 17u);
+}
+
+TEST(SchedulerActivityBuffer, RejectsCorruptCommittedCountOnHost) {
+    EXPECT_TRUE(scheduler_activity_record_count_valid(SCHEDULER_ACTIVITY_CAPACITY));
+    EXPECT_FALSE(scheduler_activity_record_count_valid(SCHEDULER_ACTIVITY_CAPACITY + 1));
+}
+
+TEST(SchedulerProfilingLevel, EnablesOnlyTheRequestedGranularity) {
+    EXPECT_FALSE(scheduler_task_timing_enabled(0));
+    EXPECT_TRUE(scheduler_task_timing_enabled(SCHEDULER_PROFILING_TASK_TIMING_LEVEL));
+    EXPECT_FALSE(scheduler_schedule_timing_enabled(SCHEDULER_PROFILING_TASK_TIMING_LEVEL));
+    EXPECT_TRUE(scheduler_schedule_timing_enabled(SCHEDULER_PROFILING_SCHEDULE_TIMING_LEVEL));
+    EXPECT_FALSE(scheduler_phase_timing_enabled(SCHEDULER_PROFILING_SCHEDULE_TIMING_LEVEL));
+    EXPECT_TRUE(scheduler_phase_timing_enabled(SCHEDULER_PROFILING_SCHED_PHASES_LEVEL));
+}
+
+TEST(SchedulerProfilingLevel, DispatchWritesTaskIdentityBeforePhaseDetails) {
+    for (uint64_t level = 0; level <= SCHEDULER_PROFILING_SCHED_PHASES_LEVEL; ++level) {
+        FixtureStorage storage(1, 2);
+        GraphBuffer graph(1);
+        graph.executable(0, 0);
+        storage.contexts[1].core_type = static_cast<int32_t>(CoreType::AIC);
+        SchedulerReadyClaim ready_claim{};
+        ready_claim.task_id = 0;
+        ready_claim.claim_start_cycles = 123;
+        ready_claim.claim_end_cycles = 456;
+
+        ASSERT_TRUE(scheduler_fill_dispatch_slot(
+            graph.graph(), storage.scheduler_state->base(), &storage.contexts[1], storage.run_control,
+            SchedulerFreeSlotClaim{1, 0, 0}, ready_claim, level
+        ));
+        auto *traces =
+            scheduler_state_at<SchedulerTaskTrace>(storage.scheduler_state->base(), storage.layout.trace_cells_offset);
+        EXPECT_EQ(traces[0].worker_id, level == 0 ? 0u : storage.contexts[1].worker_index);
+        EXPECT_EQ(traces[0].task_id, 0u);
+        EXPECT_EQ(traces[0].claim_start_cycles, level >= SCHEDULER_PROFILING_SCHED_PHASES_LEVEL ? 123u : 0u);
+        EXPECT_EQ(traces[0].claim_end_cycles, level >= SCHEDULER_PROFILING_SCHED_PHASES_LEVEL ? 456u : 0u);
+    }
+}
+
 TEST(SchedulerBootstrap, RegistersOnlyOnFirstExecutableProducer) {
     FixtureStorage storage(4, 2);
     GraphBuffer graph(4);

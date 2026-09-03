@@ -41,6 +41,8 @@ uint64_t resident_scheduler_timeout_cycles() {
                             SCHEDULER_TIMEOUT_CYCLES;
 }
 
+bool lifecycle_timing_enabled() { return get_chip_swimlane_level() >= ChipSwimlaneLevel::SCHEDULE_TIMING; }
+
 void record_lifecycle_timeout(Runtime *runtime, SchedulerErrorSite error_site) {
     SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
     if (context == nullptr) return;
@@ -69,10 +71,9 @@ int32_t AicoreLifecycle::pre_handshake_init(Runtime *runtime, int32_t aicpu_thre
     handshake_failed_.store(false, std::memory_order_release);
 
     const bool chip_swimlane_enabled = is_chip_swimlane_enabled();
-    if (chip_swimlane_enabled || is_pmu_enabled() || is_dump_args_enabled()) {
+    if (is_pmu_enabled() || is_dump_args_enabled()) {
         LOG_WARN(
-            "A5 HBG AICore Scheduler diagnostics are best-effort: artifacts may be absent or incomplete and do not "
-            "yet describe Scheduler scheduling"
+            "A5 HBG AICore Scheduler PMU/argument diagnostics are best-effort: artifacts may be absent or incomplete"
         );
     }
     if (chip_swimlane_enabled) chip_swimlane_aicpu_init(core_count_);
@@ -121,7 +122,7 @@ void AicoreLifecycle::handshake_partition(Runtime *runtime, int32_t tidx, int32_
             }
             ready[ready_count++] = {
                 i, physical_core_id, regs[physical_core_id], handshake->core_type,
-                is_chip_swimlane_enabled() ? get_sys_cnt_aicpu() : 0
+                lifecycle_timing_enabled() ? get_sys_cnt_aicpu() : 0
             };
         }
         if (scheduler_watchdog_expired(wait_start, get_sys_cnt_aicpu(), timeout_cycles)) {
@@ -138,7 +139,7 @@ void AicoreLifecycle::handshake_partition(Runtime *runtime, int32_t tidx, int32_
                                   nullptr,       core.handshake_observed_cycles, 0};
         physical_core_ids_[core.worker_id] = core.physical_core_id;
     }
-    const uint64_t partition_complete_cycles = is_chip_swimlane_enabled() ? get_sys_cnt_aicpu() : 0;
+    const uint64_t partition_complete_cycles = lifecycle_timing_enabled() ? get_sys_cnt_aicpu() : 0;
     for (int32_t i = lo; i < hi; ++i)
         cores_[i].handshake_partition_complete_cycles = partition_complete_cycles;
 }
@@ -150,8 +151,8 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
         return -1;
     cache_invalidate_range(bootstrap_context, 256);
     void *scheduler_state_base = aicore_scheduler_state_base(bootstrap_context);
-    const bool trace_enabled = is_chip_swimlane_enabled();
-    const uint64_t config_start_cycles = trace_enabled ? get_sys_cnt_aicpu() : 0;
+    const bool record_lifecycle_timing = lifecycle_timing_enabled();
+    const uint64_t config_start_cycles = record_lifecycle_timing ? get_sys_cnt_aicpu() : 0;
 
     auto *run_control = aicore_scheduler_run_control(bootstrap_context);
     if (scheduler_state_base == nullptr || run_control == nullptr) return -1;
@@ -296,7 +297,7 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
         run_control->bootstrap_complete = 1;
     }
 
-    const uint64_t topology_complete_cycles = trace_enabled ? get_sys_cnt_aicpu() : 0;
+    const uint64_t topology_complete_cycles = record_lifecycle_timing ? get_sys_cnt_aicpu() : 0;
     for (int32_t i = 0; i < core_count_; ++i)
         lifecycle_traces[i].topology_complete_cycles = topology_complete_cycles;
 
@@ -325,7 +326,7 @@ void AicoreLifecycle::publish_context_partition(Runtime *runtime, int32_t thread
     }
     if (hi > lo) cache_flush_range(&handshakes[lo], static_cast<size_t>(hi - lo) * sizeof(Handshake));
     wmb();
-    const uint64_t publish_complete_cycles = is_chip_swimlane_enabled() ? get_sys_cnt_aicpu() : 0;
+    const uint64_t publish_complete_cycles = lifecycle_timing_enabled() ? get_sys_cnt_aicpu() : 0;
     for (int32_t i = lo; i < hi; ++i) {
         if (cores_[i].trace != nullptr) cores_[i].trace->context_publish_complete_cycles = publish_complete_cycles;
     }
@@ -337,8 +338,8 @@ int32_t AicoreLifecycle::wait_bootstrap_complete(Runtime *runtime) {
     cache_invalidate_range(context, 128);
     auto *run_control = aicore_scheduler_run_control(context);
     if (run_control == nullptr) return -1;
-    const bool trace_enabled = is_chip_swimlane_enabled();
-    const uint64_t wait_start_cycles = trace_enabled ? get_sys_cnt_aicpu() : 0;
+    const bool record_lifecycle_timing = lifecycle_timing_enabled();
+    const uint64_t wait_start_cycles = record_lifecycle_timing ? get_sys_cnt_aicpu() : 0;
     const uint64_t watchdog_start = get_sys_cnt_aicpu();
     const uint64_t timeout_cycles = resident_scheduler_timeout_cycles();
     uint32_t error_poll_count = 0;
@@ -361,7 +362,7 @@ int32_t AicoreLifecycle::wait_bootstrap_complete(Runtime *runtime) {
         }
         SPIN_WAIT_HINT();
     }
-    const uint64_t complete_cycles = trace_enabled ? get_sys_cnt_aicpu() : 0;
+    const uint64_t complete_cycles = record_lifecycle_timing ? get_sys_cnt_aicpu() : 0;
     for (int32_t i = 0; i < core_count_; ++i) {
         if (cores_[i].trace == nullptr) continue;
         cores_[i].trace->bootstrap_wait_start_cycles = wait_start_cycles;

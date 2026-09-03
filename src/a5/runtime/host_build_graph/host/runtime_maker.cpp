@@ -49,6 +49,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <unordered_map>
@@ -74,6 +75,7 @@
 #include "../../../../common/task_interface/call_config.h"
 #include "../../../../common/worker/runtime_c_api.h"
 #include "callable.h"
+#include "common/chip_swimlane_profiling.h"
 #include "common/host_log_binding.h"
 #include "common/host_phase_kind.h"
 #include "common/platform_config.h"
@@ -94,6 +96,12 @@ static_assert(
     SIMPLER_ERROR_READY_QUEUE_OVERFLOW <= PTO_RUNTIME_LATCHED_CODE_MAX &&
         PTO_RUNTIME_ERR_BASE < -PTO_RUNTIME_LATCHED_CODE_MAX,
     "host-side C API codes must stay below the negation of every latched device code"
+);
+static_assert(
+    SCHEDULER_PROFILING_TASK_TIMING_LEVEL == static_cast<uint64_t>(ChipSwimlaneLevel::TASK_TIMING) &&
+        SCHEDULER_PROFILING_SCHEDULE_TIMING_LEVEL == static_cast<uint64_t>(ChipSwimlaneLevel::SCHEDULE_TIMING) &&
+        SCHEDULER_PROFILING_SCHED_PHASES_LEVEL == static_cast<uint64_t>(ChipSwimlaneLevel::SCHED_PHASES),
+    "AICore Scheduler profiling levels must match the chip-swimlane contract"
 );
 
 extern "C" const PipelineContract *get_pipeline_contract(void) {
@@ -372,10 +380,298 @@ struct SchedulerStateOwner {
     void *state_base;
     uint64_t allocation_size;
     AicoreSchedulerLayout layout;
+    const HostApi *api;
 };
 
 std::mutex scheduler_state_owners_mutex;
 std::unordered_map<Runtime *, SchedulerStateOwner> scheduler_state_owners;
+
+struct SchedulerJsonRecord {
+    uint64_t start_cycles;
+    uint64_t end_cycles;
+    uint64_t loop_iter;
+    const char *kind;
+    uint64_t tasks_processed;
+    uint64_t task_id;
+    bool has_task;
+};
+
+const char *scheduler_core_type_name(int32_t core_type) {
+    return core_type == static_cast<int32_t>(CoreType::AIC) ? "aic" : "aiv";
+}
+
+void append_scheduler_record(
+    std::vector<SchedulerJsonRecord> *records, uint64_t start_cycles, uint64_t end_cycles, uint64_t loop_iter,
+    const char *kind, uint64_t tasks_processed, uint64_t task_id = 0, bool has_task = true
+) {
+    if (records == nullptr || start_cycles == 0 || end_cycles < start_cycles) return;
+    records->push_back({start_cycles, end_cycles, loop_iter, kind, tasks_processed, task_id, has_task});
+}
+
+bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
+    const uint32_t level = api->chip_swimlane_level();
+    if (level == 0) return true;
+
+    SchedulerStateOwner owner{};
+    {
+        std::scoped_lock lock(scheduler_state_owners_mutex);
+        auto it = scheduler_state_owners.find(runtime);
+        if (it == scheduler_state_owners.end()) return true;
+        owner = it->second;
+    }
+
+    std::vector<uint8_t> storage(static_cast<size_t>(owner.layout.total_size + SCHEDULER_STATE_ALIGNMENT - 1));
+    const uintptr_t aligned_address = (reinterpret_cast<uintptr_t>(storage.data()) + SCHEDULER_STATE_ALIGNMENT - 1) &
+                                      ~(static_cast<uintptr_t>(SCHEDULER_STATE_ALIGNMENT) - 1);
+    void *host_base = reinterpret_cast<void *>(aligned_address);
+    if (api->copy_from_device(host_base, owner.state_base, static_cast<size_t>(owner.layout.total_size)) != 0) {
+        LOG_WARN("A5 HBG: failed to copy AICore Scheduler profiling state");
+        return false;
+    }
+
+    const auto *contexts = scheduler_state_at<SchedulerWorkerContext>(host_base, owner.layout.worker_contexts_offset);
+    const auto *traces = scheduler_state_at<SchedulerTaskTrace>(host_base, owner.layout.trace_cells_offset);
+    const auto *controls = scheduler_state_at<SchedulerTaskControl>(host_base, owner.layout.task_controls_offset);
+
+    std::ostringstream tasks_json;
+    tasks_json << "[";
+    bool first_task = true;
+    for (uint64_t task_id = 0; task_id < owner.layout.task_count; ++task_id) {
+        const SchedulerTaskTrace &trace = traces[task_id];
+        if (trace.valid == 0 || trace.kernel_start_cycles == 0 || trace.kernel_end_cycles < trace.kernel_start_cycles ||
+            trace.worker_id >= SCHEDULER_WORKER_CAPACITY)
+            continue;
+        const uint64_t receive_to_start =
+            trace.ready_observe_cycles != 0 && trace.kernel_start_cycles >= trace.ready_observe_cycles ?
+                trace.kernel_start_cycles - trace.ready_observe_cycles :
+                0;
+        if (!first_task) tasks_json << ",";
+        tasks_json << "\n    [" << trace.worker_id << ", " << task_id << ", " << task_id << ", "
+                   << trace.kernel_start_cycles << ", " << trace.kernel_end_cycles << ", " << receive_to_start << "]";
+        first_task = false;
+    }
+    if (!first_task) tasks_json << "\n  ";
+    tasks_json << "]";
+    const std::string task_payload = tasks_json.str();
+    if (!api->publish_chip_swimlane_extension(
+            ChipSwimlaneExtensionSection::AicoreTasks, task_payload.c_str(), task_payload.size()
+        )) {
+        LOG_WARN("A5 HBG: failed to publish AICore task records");
+        return false;
+    }
+
+    if (level >= static_cast<uint32_t>(ChipSwimlaneLevel::SCHEDULE_TIMING)) {
+        std::ostringstream scheduler_tasks_json;
+        scheduler_tasks_json << "{\n    \"schema_version\": 1,\n    \"producer\": \"aicore\",\n    \"records\": [";
+        bool first_scheduler_task = true;
+        for (uint64_t task_id = 0; task_id < owner.layout.task_count; ++task_id) {
+            const SchedulerTaskTrace &trace = traces[task_id];
+            if (trace.valid == 0 || trace.kernel_start_cycles == 0 ||
+                trace.kernel_end_cycles < trace.kernel_start_cycles || trace.worker_id >= SCHEDULER_WORKER_CAPACITY)
+                continue;
+            if (trace.dispatch_end_cycles == 0 || trace.complete_start_cycles < trace.kernel_end_cycles) {
+                LOG_WARN("A5 HBG: incomplete Scheduler task timing for task id=%" PRIu64, task_id);
+                return false;
+            }
+            if (!first_scheduler_task) scheduler_tasks_json << ",";
+            scheduler_tasks_json << "\n      [" << trace.worker_id << ", " << task_id << ", "
+                                 << trace.dispatch_end_cycles << ", " << trace.complete_start_cycles << "]";
+            first_scheduler_task = false;
+        }
+        if (!first_scheduler_task) scheduler_tasks_json << "\n    ";
+        scheduler_tasks_json << "]\n  }";
+        const std::string scheduler_tasks_payload = scheduler_tasks_json.str();
+        if (!api->publish_chip_swimlane_extension(
+                ChipSwimlaneExtensionSection::SchedulerTasks, scheduler_tasks_payload.c_str(),
+                scheduler_tasks_payload.size()
+            )) {
+            LOG_WARN("A5 HBG: failed to publish AICore Scheduler task timing");
+            return false;
+        }
+
+        const auto *lifecycle =
+            scheduler_state_at<AicpuCoreLifecycleTrace>(host_base, owner.layout.aicpu_lifecycle_traces_offset);
+        std::ostringstream lifecycle_json;
+        lifecycle_json << "[";
+        bool first = true;
+        for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
+            const AicpuCoreLifecycleTrace &trace = lifecycle[worker];
+            if (trace.handshake_observed_cycles == 0) continue;
+            if (!first) lifecycle_json << ",";
+            lifecycle_json << "\n    {\"worker_id\": " << trace.worker_id
+                           << ", \"aicpu_thread_id\": " << trace.aicpu_thread_id << ", \"core_type\": \""
+                           << scheduler_core_type_name(static_cast<int32_t>(trace.core_type))
+                           << "\", \"physical_core_id\": " << trace.physical_core_id
+                           << ", \"handshake_observed_cycles\": " << trace.handshake_observed_cycles
+                           << ", \"handshake_partition_complete_cycles\": " << trace.handshake_partition_complete_cycles
+                           << ", \"config_start_cycles\": " << trace.config_start_cycles
+                           << ", \"topology_complete_cycles\": " << trace.topology_complete_cycles
+                           << ", \"context_publish_complete_cycles\": " << trace.context_publish_complete_cycles
+                           << ", \"bootstrap_wait_start_cycles\": " << trace.bootstrap_wait_start_cycles
+                           << ", \"bootstrap_complete_cycles\": " << trace.bootstrap_complete_cycles
+                           << ", \"register_release_cycles\": " << trace.register_release_cycles
+                           << ", \"exit_signal_cycles\": " << trace.exit_signal_cycles
+                           << ", \"exit_ack_cycles\": " << trace.exit_ack_cycles << "}";
+            first = false;
+        }
+        if (!first) lifecycle_json << "\n  ";
+        lifecycle_json << "]";
+        const std::string lifecycle_payload = lifecycle_json.str();
+        if (!api->publish_chip_swimlane_extension(
+                ChipSwimlaneExtensionSection::AicpuLifecycleRecords, lifecycle_payload.c_str(), lifecycle_payload.size()
+            )) {
+            LOG_WARN("A5 HBG: failed to publish AICPU lifecycle records");
+            return false;
+        }
+    }
+
+    if (level < static_cast<uint32_t>(ChipSwimlaneLevel::SCHED_PHASES)) return true;
+
+    std::vector<std::vector<SchedulerJsonRecord>> records(SCHEDULER_WORKER_CAPACITY);
+    for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
+        const SchedulerWorkerContext &context = contexts[worker];
+        if (context.is_scheduler == 0 || context.worker_index >= SCHEDULER_WORKER_CAPACITY) continue;
+        append_scheduler_record(
+            &records[context.worker_index], context.bootstrap_start_cycles, context.bootstrap_end_cycles, 0,
+            "bootstrap", context.bootstrap_task_count, 0, false
+        );
+    }
+    for (uint64_t task_id = 0; task_id < owner.layout.task_count; ++task_id) {
+        const SchedulerTaskTrace &trace = traces[task_id];
+        if (trace.fanin_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
+            append_scheduler_record(
+                &records[trace.fanin_scheduler_worker_id], trace.fanin_start_cycles, trace.fanin_end_cycles,
+                trace.fanin_loop_iter, "fanin", 1, task_id
+            );
+        }
+        if (trace.claim_worker_id < SCHEDULER_WORKER_CAPACITY) {
+            append_scheduler_record(
+                &records[trace.claim_worker_id], trace.claim_start_cycles, trace.claim_end_cycles,
+                trace.claim_loop_iter,
+                trace.ready_source == static_cast<uint64_t>(SchedulerReadySource::STOLEN) ? "ready_steal" :
+                                                                                            "ready_claim",
+                1, task_id
+            );
+        }
+        if (trace.dispatch_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
+            append_scheduler_record(
+                &records[trace.dispatch_scheduler_worker_id], trace.dispatch_start_cycles, trace.dispatch_end_cycles,
+                trace.dispatch_loop_iter, "dispatch", 1, task_id
+            );
+        }
+        if (trace.complete_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
+            append_scheduler_record(
+                &records[trace.complete_scheduler_worker_id], trace.complete_start_cycles, trace.complete_end_cycles,
+                trace.complete_loop_iter, "complete", 1, task_id
+            );
+        }
+        if (trace.refill_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
+            append_scheduler_record(
+                &records[trace.refill_scheduler_worker_id], trace.refill_start_cycles, trace.refill_end_cycles,
+                trace.refill_loop_iter, "direct_refill", 1, trace.refill_task_id
+            );
+        }
+        const SchedulerTaskControl &control = controls[task_id];
+        if (control.scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
+            append_scheduler_record(
+                &records[control.scheduler_worker_id], control.completion_resolve_start_cycles,
+                control.completion_resolve_end_cycles, control.completion_resolve_loop_iter, "resolve", 1, task_id
+            );
+        }
+    }
+
+    std::vector<uint32_t> dropped_by_worker(SCHEDULER_WORKER_CAPACITY);
+    if (owner.layout.activity_buffers_offset != 0) {
+        const auto *activity =
+            scheduler_state_at<SchedulerActivityBuffer>(host_base, owner.layout.activity_buffers_offset);
+        for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
+            const SchedulerWorkerContext &context = contexts[worker];
+            if (context.is_scheduler == 0) continue;
+            if (context.scheduler_index >= SCHEDULER_CLUSTER_CAPACITY) {
+                LOG_WARN(
+                    "A5 HBG: invalid Scheduler activity index for worker=%" PRIu64 ": %" PRIu64, worker,
+                    context.scheduler_index
+                );
+                return false;
+            }
+            const SchedulerActivityBuffer &buffer = activity[context.scheduler_index];
+            const uint32_t committed = buffer.committed;
+            if (!scheduler_activity_record_count_valid(committed)) {
+                LOG_WARN("A5 HBG: invalid Scheduler activity count for worker=%" PRIu64 ": %u", worker, committed);
+                return false;
+            }
+            for (uint32_t index = 0; index < committed; ++index) {
+                const SchedulerIdleRecord &record = buffer.records[index];
+                append_scheduler_record(
+                    &records[worker], record.start_time, record.end_time, record.loop_iter, "idle", 0, 0, false
+                );
+            }
+            dropped_by_worker[worker] = buffer.dropped;
+        }
+    }
+
+    std::ostringstream scheduler_json;
+    scheduler_json << "{\n    \"schema_version\": 1,\n    \"streams\": [";
+    bool first_stream = true;
+    for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
+        const SchedulerWorkerContext &context = contexts[worker];
+        const uint32_t dropped = dropped_by_worker[worker];
+        if (context.is_scheduler == 0 || (records[worker].empty() && dropped == 0)) continue;
+        std::sort(records[worker].begin(), records[worker].end(), [](const auto &lhs, const auto &rhs) {
+            if (lhs.start_cycles != rhs.start_cycles) return lhs.start_cycles < rhs.start_cycles;
+            if (lhs.end_cycles != rhs.end_cycles) return lhs.end_cycles < rhs.end_cycles;
+            return std::strcmp(lhs.kind, rhs.kind) < 0;
+        });
+        if (!first_stream) scheduler_json << ",";
+        scheduler_json << "\n      {\"platform\": \"a5\", \"runtime\": \"host_build_graph\", "
+                          "\"producer\": \"aicore\", \"scheduler_id\": "
+                       << context.scheduler_index << ", \"worker_id\": " << worker << ", \"core_type\": \""
+                       << scheduler_core_type_name(context.core_type)
+                       << "\", \"physical_core_id\": " << context.physical_core_id
+                       << ", \"capture\": {\"committed\": " << records[worker].size() << ", \"dropped\": " << dropped
+                       << ", \"truncated\": " << (dropped == 0 ? "false" : "true") << "}, \"records\": [";
+        for (size_t index = 0; index < records[worker].size(); ++index) {
+            const SchedulerJsonRecord &record = records[worker][index];
+            if (index != 0) scheduler_json << ",";
+            scheduler_json << "\n        {\"start_cycles\": " << record.start_cycles
+                           << ", \"end_cycles\": " << record.end_cycles << ", \"loop_iter\": " << record.loop_iter
+                           << ", \"kind\": \"" << record.kind << "\", \"tasks_processed\": " << record.tasks_processed
+                           << ", \"task_id\": ";
+            if (record.has_task) scheduler_json << record.task_id;
+            else scheduler_json << "null";
+            scheduler_json << "}";
+        }
+        if (!records[worker].empty()) scheduler_json << "\n      ";
+        scheduler_json << "], \"metrics\": []}";
+        first_stream = false;
+    }
+    if (!first_stream) scheduler_json << "\n    ";
+    scheduler_json << "]\n  }";
+    const std::string scheduler_payload = scheduler_json.str();
+    if (!api->publish_chip_swimlane_extension(
+            ChipSwimlaneExtensionSection::SchedulerRecords, scheduler_payload.c_str(), scheduler_payload.size()
+        )) {
+        LOG_WARN("A5 HBG: failed to publish AICore Scheduler records");
+        return false;
+    }
+    return true;
+}
+
+extern "C" bool publish_runtime_chip_swimlane_extensions(Runtime *runtime) noexcept {
+    try {
+        if (runtime == nullptr) return true;
+        const HostApi *api = nullptr;
+        {
+            std::scoped_lock lock(scheduler_state_owners_mutex);
+            auto it = scheduler_state_owners.find(runtime);
+            if (it == scheduler_state_owners.end()) return true;
+            api = it->second.api;
+        }
+        return api != nullptr && publish_aicore_scheduler_profiling(runtime, api);
+    } catch (...) {
+        return false;
+    }
+}
 
 // host_build_graph is host-orchestration-first: the HOST dlopens the
 // orchestration .so and runs it to completion. Every cross-task reference the
@@ -816,7 +1112,10 @@ bool create_scheduler_state(
     }
 
     AicoreSchedulerLayout layout{};
-    if (!scheduler_plan_layout(static_cast<uint64_t>(total_tasks), aic_task_count, aiv_task_count, &layout) ||
+    if (!scheduler_plan_layout(
+            static_cast<uint64_t>(total_tasks), aic_task_count, aiv_task_count, &layout,
+            api->chip_swimlane_level() >= static_cast<uint32_t>(ChipSwimlaneLevel::SCHED_PHASES)
+        ) ||
         layout.total_size > std::numeric_limits<uint64_t>::max() - (SCHEDULER_STATE_ALIGNMENT - 1)) {
         LOG_ERROR("A5 HBG AICore scheduler: scheduler state layout overflow");
         return false;
@@ -877,6 +1176,7 @@ bool create_scheduler_state(
     run_control->aiv_task_count = aiv_task_count;
     run_control->aic_worker_demand = aic_worker_demand;
     run_control->aiv_worker_demand = aiv_worker_demand;
+    run_control->chip_swimlane_level = api->chip_swimlane_level();
     run_control->dispatch_payloads_offset = layout.dispatch_payloads_offset;
     run_control->task_metadata_offset = layout.task_metadata_offset;
     run_control->ready_inboxes_offset = layout.ready_inboxes_offset;
@@ -943,7 +1243,8 @@ bool create_scheduler_state(
     {
         std::scoped_lock lock(scheduler_state_owners_mutex);
         scheduler_state_owners.emplace(
-            runtime, SchedulerStateOwner{allocation, reinterpret_cast<void *>(aligned_address), allocation_size, layout}
+            runtime,
+            SchedulerStateOwner{allocation, reinterpret_cast<void *>(aligned_address), allocation_size, layout, api}
         );
     }
     LOG_INFO("A5 HBG: selected AICore Scheduler for %d tasks", total_tasks);

@@ -147,6 +147,7 @@ struct FixtureStorage {
             metadata[task].logical_block_num = 1;
             metadata[task].total_required_subtasks = 1;
             metadata[task].flags = SCHEDULER_TASK_EXECUTABLE;
+            metadata[task].timing_slot = -1;
         }
     }
 
@@ -218,6 +219,31 @@ void occupy_normal_slot(
     );
 }
 
+SchedulerDispatchSlot *
+prepare_completed_normal_slot(FixtureStorage &storage, SchedulerWorkerContext &scheduler, uint64_t worker_id = 0) {
+    scheduler.is_scheduler = 1;
+    scheduler.scheduler_index = 0;
+    scheduler.scheduler_count = 1;
+    scheduler.inbox_index = 0;
+    scheduler.cluster_worker_ids[0] = worker_id;
+    scheduler.cluster_worker_ids[1] = scheduler.worker_index;
+    scheduler.cluster_worker_ids[2] = UINT64_MAX;
+    storage.run_control->scheduler_count = 1;
+    auto *slot = scheduler_dispatch_slot_at(storage.scheduler_state->base(), &scheduler, worker_id, 0);
+    scheduler_initialize_free_slot(slot);
+    slot->task_id = 0;
+    slot->subtask_slot = 0;
+    slot->gang = 0;
+    scheduler_gm_store(
+        slot->publication, scheduler_dispatch_publication(slot->generation, SchedulerDispatchSlotState::READY)
+    );
+    auto *completion_line = scheduler_completion_inbox_at(storage.scheduler_state->base(), &scheduler, worker_id);
+    completion_line->completed_generations[0] = slot->generation;
+    auto *control = scheduler_task_control_at(storage.scheduler_state->base(), &scheduler, 0);
+    control->state = static_cast<int64_t>(SchedulerTaskState::READY);
+    return slot;
+}
+
 TEST(SchedulerCompletionInbox, PacksBothGenerationSlotsInOneDeviceWord) {
     alignas(uint64_t) volatile uint32_t generations[SCHEDULER_PENDING_SLOT_COUNT] = {
         UINT32_C(0x11223344), UINT32_C(0x55667788)
@@ -242,6 +268,10 @@ TEST(SchedulerClusterCompletion, SpscGenerationCompletesNormalTask) {
     scheduler_initialize_free_slot(slot);
     slot->task_id = 0;
     slot->gang = 0;
+    slot->executor_trace.generation = slot->generation;
+    slot->executor_trace.kernel_start_cycles = 100;
+    slot->executor_trace.kernel_end_cycles = 200;
+    storage.metadata[0].timing_slot = 0;
     scheduler_gm_store(
         slot->publication, scheduler_dispatch_publication(slot->generation, SchedulerDispatchSlotState::READY)
     );
@@ -261,6 +291,11 @@ TEST(SchedulerClusterCompletion, SpscGenerationCompletesNormalTask) {
     EXPECT_EQ(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
     EXPECT_EQ(control->wake_list_head, SCHEDULER_WAKE_LIST_CLOSED);
     EXPECT_EQ(storage.run_control->resolved_task_count, 1u);
+    auto *traces =
+        scheduler_state_at<SchedulerTaskTrace>(storage.scheduler_state->base(), storage.layout.trace_cells_offset);
+    EXPECT_EQ(traces[0].kernel_start_cycles, 100u);
+    EXPECT_EQ(traces[0].kernel_end_cycles, 200u);
+    EXPECT_EQ(traces[0].valid, 0u);
 }
 
 TEST(SchedulerClusterCompletion, RejectsStaleCompletionGenerationAtNamedSite) {
@@ -318,6 +353,64 @@ TEST(SchedulerClusterCompletion, RejectsUnexpectedGangSlotAtNamedSite) {
     );
 }
 
+TEST(SchedulerClusterCompletion, AccountsCompletedTaskWhenResolveFails) {
+    FixtureStorage storage(1, 2);
+    GraphBuffer graph(1);
+    graph.executable(0, 0);
+    SchedulerWorkerContext &scheduler = storage.contexts[1];
+    SchedulerDispatchSlot *slot = prepare_completed_normal_slot(storage, scheduler);
+
+    EXPECT_FALSE(scheduler_service_cluster_completion_slot(
+        graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, 0, 0, slot->generation,
+        nullptr, nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, nullptr
+    ));
+    EXPECT_EQ(storage.run_control->resolved_task_count, 1u);
+    EXPECT_NE(storage.run_control->scheduler_error, 0u);
+    EXPECT_EQ(storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::COMPLETION_RESOLVE_FAILED));
+}
+
+TEST(SchedulerClusterCompletion, AccountsCompletedTaskWhenRefillClaimFails) {
+    FixtureStorage storage(1, 2);
+    GraphBuffer graph(1);
+    graph.executable(0, 0);
+    SchedulerWorkerContext &scheduler = storage.contexts[1];
+    SchedulerDispatchSlot *slot = prepare_completed_normal_slot(storage, scheduler);
+    SchedulerReadyOwnerState &owner_state = storage.owner_states[scheduler.inbox_index];
+    owner_state.queues[0].pending_endpoints = scheduler_ready_pending_pack(SCHEDULER_INBOX_EMPTY, 0);
+    uint64_t ready_victim_cursors[SCHEDULER_CORE_TYPE_COUNT]{};
+
+    EXPECT_FALSE(scheduler_service_cluster_completion_slot(
+        graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, 0, 0, slot->generation,
+        nullptr, nullptr, nullptr, ready_victim_cursors, 0, nullptr, nullptr, nullptr, &owner_state
+    ));
+    EXPECT_EQ(storage.run_control->resolved_task_count, 1u);
+    EXPECT_NE(storage.run_control->scheduler_error, 0u);
+    EXPECT_EQ(
+        storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::COMPLETION_REFILL_CLAIM_FAILED)
+    );
+}
+
+TEST(SchedulerClusterCompletion, AccountsCompletedTaskWhenRefillDispatchFails) {
+    FixtureStorage storage(1, 2);
+    GraphBuffer graph(1);
+    graph.executable(0, 0);
+    SchedulerWorkerContext &scheduler = storage.contexts[1];
+    SchedulerDispatchSlot *slot = prepare_completed_normal_slot(storage, scheduler);
+    SchedulerReadyClaim replacement{};
+    replacement.task_id = 1;
+
+    EXPECT_FALSE(scheduler_service_cluster_completion_slot(
+        graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, 0, 0, slot->generation,
+        nullptr, nullptr, nullptr, nullptr, 0, &replacement, nullptr, nullptr,
+        &storage.owner_states[scheduler.inbox_index]
+    ));
+    EXPECT_EQ(storage.run_control->resolved_task_count, 1u);
+    EXPECT_NE(storage.run_control->scheduler_error, 0u);
+    EXPECT_EQ(
+        storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::COMPLETION_REFILL_DISPATCH_FAILED)
+    );
+}
+
 TEST(SchedulerClusterCompletion, PropagatesTraceToCompletionAndWokenTask) {
     FixtureStorage storage(2, 3);
     GraphBuffer graph(2);
@@ -342,6 +435,9 @@ TEST(SchedulerClusterCompletion, PropagatesTraceToCompletionAndWokenTask) {
     auto *slot = scheduler_dispatch_slot_at(storage.scheduler_state->base(), &scheduler, 0, 0);
     scheduler_initialize_free_slot(slot);
     slot->task_id = 0;
+    slot->executor_trace.generation = slot->generation;
+    slot->executor_trace.kernel_start_cycles = 100;
+    slot->executor_trace.kernel_end_cycles = 200;
     scheduler_gm_store(
         slot->publication, scheduler_dispatch_publication(slot->generation, SchedulerDispatchSlotState::READY)
     );
@@ -358,12 +454,16 @@ TEST(SchedulerClusterCompletion, PropagatesTraceToCompletionAndWokenTask) {
     SchedulerCompletionStats completion_stats{};
     ASSERT_TRUE(scheduler_service_cluster_completions(
         graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, &wake_stats, &ready_stats,
-        &completion_stats, nullptr, true, nullptr, nullptr, &storage.owner_states[scheduler.inbox_index]
+        &completion_stats, nullptr, SCHEDULER_PROFILING_SCHED_PHASES_LEVEL, nullptr, nullptr,
+        &storage.owner_states[scheduler.inbox_index]
     ));
     EXPECT_EQ(producer->completion_resolve_start_cycles, 0u);
     EXPECT_EQ(producer->completion_resolve_end_cycles, 0u);
     EXPECT_EQ(producer->scheduler_worker_id, scheduler.worker_index);
     EXPECT_EQ(traces[1].ready_transition_cycles, 0u);
+    EXPECT_EQ(traces[0].valid, 1u);
+    EXPECT_EQ(traces[0].kernel_start_cycles, 100u);
+    EXPECT_EQ(traces[0].kernel_end_cycles, 200u);
     auto *waiter = scheduler_task_control_at(storage.scheduler_state->base(), &scheduler, 1);
     EXPECT_EQ(waiter->state, static_cast<int64_t>(SchedulerTaskState::READY));
 }

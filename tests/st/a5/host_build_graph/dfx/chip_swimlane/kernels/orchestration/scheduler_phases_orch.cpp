@@ -15,7 +15,9 @@
 
 namespace {
 
-constexpr int kNoopKernel = 0;
+constexpr int kWriteKernel = 0;
+constexpr int kEmptyKernel = 1;
+constexpr int kFanout = 32;
 
 }  // namespace
 
@@ -29,13 +31,26 @@ __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_c
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &args) {
     const simpler::hbg::Tensor &input = args.tensor(0).ref();
 
-    CoreTaskArgs normal_args;
-    normal_args.add_inout(input);
-    normal_args.launch_spec.set_block_num(1);
-    const TaskId normal_task = rt_submit_aiv_task(kNoopKernel, normal_args).task_id();
+    CoreTaskArgs root_args;
+    root_args.launch_spec.set_block_num(1);
+    const TaskId root = rt_submit_aiv_task(kEmptyKernel, root_args).task_id();
+
+    TaskId children[kFanout];
+    for (int child = 0; child < kFanout; ++child) {
+        CoreTaskArgs child_args;
+        child_args.set_dependencies(&root, 1);
+        child_args.launch_spec.set_block_num(1);
+        children[child] = rt_submit_aiv_task(kEmptyKernel, child_args).task_id();
+    }
+
+    CoreTaskArgs final_args;
+    final_args.add_inout(input);
+    final_args.set_dependencies(children, kFanout);
+    final_args.launch_spec.set_block_num(1);
+    const TaskId final_task = rt_submit_aiv_task(kWriteKernel, final_args).task_id();
 
     CoreTaskArgs dummy_args;
-    dummy_args.set_dependencies(&normal_task, 1);
+    dummy_args.set_dependencies(&final_task, 1);
     rt_submit_dummy_task(dummy_args);
 }
 

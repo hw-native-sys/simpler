@@ -116,7 +116,19 @@ jobs:
       - name: chip_swimlane smoke (a5 host_build_graph)
         if: inputs.include_dfx_smokes
         run: |
-          .venv/bin/python -m pytest tests/st/a5/host_build_graph/dfx/chip_swimlane/ \
+          for level in 1 2; do
+            .venv/bin/python -m pytest \
+              tests/st/a5/host_build_graph/dfx/chip_swimlane/test_scheduler_phases.py \
+              --case TestSchedulerPhases::resolve_dummy \
+              --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+              --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" \
+              --enable-chip-swimlane "$level"
+          done
+          .venv/bin/python -m pytest \
+            tests/st/a5/host_build_graph/dfx/chip_swimlane/test_scheduler_phases.py \
+            tests/st/a5/host_build_graph/single_core_dag/test_single_core_dag.py \
+            --case TestSchedulerPhases::resolve_dummy \
+            --case TestHbgSingleCoreDag::mixed_multi_root_64 \
             --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
             --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" \
             --enable-chip-swimlane 3
