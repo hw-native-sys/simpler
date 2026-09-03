@@ -1437,6 +1437,23 @@ target_link_libraries(test_a5_aicpu_topology_fallback PRIVATE
 add_test(NAME test_a5_aicpu_topology_fallback COMMAND test_a5_aicpu_topology_fallback)
 set_tests_properties(test_a5_aicpu_topology_fallback PROPERTIES LABELS "no_hardware")
 
+add_executable(test_a5_affinity_allowed_file
+    a5/test_affinity_allowed_file.cpp
+    ${A5_ONBOARD_HOST_DIR}/affinity_allowed_file.cpp
+)
+target_include_directories(test_a5_affinity_allowed_file PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${A5_ONBOARD_HOST_DIR}
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/include
+)
+target_link_libraries(test_a5_affinity_allowed_file PRIVATE
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    pthread
+)
+add_test(NAME test_a5_affinity_allowed_file COMMAND test_a5_affinity_allowed_file)
+set_tests_properties(test_a5_affinity_allowed_file PROPERTIES LABELS "no_hardware")
+
 # Hardware-gated tests.  Block is only entered when the project is configured
 # with -DSIMPLER_ENABLE_HARDWARE_TESTS=ON.  CI's no-hw `ut` job does not pass
 # this flag, so nothing here is compiled there — this is the structural

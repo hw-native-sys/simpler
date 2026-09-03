@@ -60,6 +60,7 @@ list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${PTO_ISA_ROOT}/include")
 set(HOST_RUNTIME_SOURCES "")
 list(APPEND HOST_RUNTIME_SOURCES ${SIMPLER_HOST_LOG_SOURCES})
 list(APPEND HOST_RUNTIME_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/affinity_allowed_file.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/aicpu_topology_probe.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/device_runner.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/memory_allocator.cpp"

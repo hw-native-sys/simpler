@@ -184,6 +184,35 @@ bool enumerate_cpus_from_occupy(uint64_t occupy, std::vector<AicpuLogicalCpu> &o
     return !out_user_cpus.empty();
 }
 
+bool build_complete_topology_user_pool(const AicpuTopology &topology, std::vector<int32_t> &out_cpu_ids) {
+    out_cpu_ids.clear();
+    if (topology.source == AicpuTopologySource::kOccupyFallback || !topology.device_occupancy.occupy_valid ||
+        topology.device_occupancy.occupy == 0) {
+        return false;
+    }
+    std::vector<AicpuLogicalCpu> occupy_cpus;
+    if (!enumerate_cpus_from_occupy(topology.device_occupancy.occupy, occupy_cpus) ||
+        occupy_cpus.size() > static_cast<size_t>(PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH)) {
+        return false;
+    }
+    out_cpu_ids.reserve(topology.os_schedulable_cpus.size());
+    for (const auto &cpu : topology.os_schedulable_cpus)
+        out_cpu_ids.push_back(cpu.cpu_id);
+    std::sort(out_cpu_ids.begin(), out_cpu_ids.end());
+    if (std::unique(out_cpu_ids.begin(), out_cpu_ids.end()) != out_cpu_ids.end() ||
+        out_cpu_ids.size() != occupy_cpus.size()) {
+        out_cpu_ids.clear();
+        return false;
+    }
+    for (size_t idx = 0; idx < occupy_cpus.size(); ++idx) {
+        if (out_cpu_ids[idx] != occupy_cpus[idx].cpu_id) {
+            out_cpu_ids.clear();
+            return false;
+        }
+    }
+    return true;
+}
+
 namespace {
 bool validate_cpu_topology(const std::vector<AicpuLogicalCpu> &cpus);
 bool validate_cpu_ids(const std::vector<AicpuLogicalCpu> &cpus);
