@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import copy
+import ctypes
 import inspect
 import pickle
 import struct
@@ -61,6 +62,8 @@ from simpler.comm_region_template import (
     _BoundSpscQueue,
     _checked_add_u64,
     _checked_mul_u64,
+    _counter_low32,
+    _payload_expected_offset,
     _RegionTemplateCoordinator,
     _RegionTemplatePlacementRequest,
     _require_distinct_initiator_peer,
@@ -344,8 +347,29 @@ def test_binding_rejects_bool_range_and_version_mismatch():
         SpscQueueEndpointBinding.from_scalars(wrong_minor)
 
 
+def test_binding_rejects_zero_transaction_id_and_keeps_zero_session_bits():
+    with pytest.raises(ValueError, match="nonzero"):
+        SpscQueueEndpointBinding(*(_BINDING_GOLDEN[:2] + (0,) + _BINDING_GOLDEN[3:]))
+    zero = list(_BINDING_GOLDEN)
+    zero[2] = 0
+    with pytest.raises(ValueError, match="nonzero"):
+        SpscQueueEndpointBinding.from_scalars(zero)
+    session_zero = list(_BINDING_GOLDEN)
+    session_zero[1] = 0
+    binding = SpscQueueEndpointBinding.from_scalars(session_zero)
+    assert binding.session_instance_id_bits == 0
+    assert binding.transaction_id == 42
+    assert binding.to_scalars()[2] == 42
+
+
 class _UnknownTemplateSlot(Enum):
     EXTRA = "extra"
+
+
+def _require_signed_int32(value: object) -> int:
+    if type(value) is not int or value < -2147483648 or value > 2147483647:
+        raise OverflowError("signed int32 counter operand out of range")
+    return value
 
 
 def _compare_counter(observed: int, operand: int, cmp: WaitCmp) -> bool:
@@ -370,26 +394,30 @@ class _MemoryCounter:
         self._offset = int(offset)
 
     def test(self, cmp_value: int, cmp: WaitCmp) -> SignalTestResult:
-        observed = int(self._region.counters.get(self._offset, 0))
-        return SignalTestResult(matched=_compare_counter(observed, int(cmp_value), WaitCmp(cmp)), observed=observed)
+        operand = _require_signed_int32(cmp_value)
+        observed = ctypes.c_int32(int(self._region.counters.get(self._offset, 0)) & 0xFFFFFFFF).value
+        return SignalTestResult(matched=_compare_counter(observed, operand, WaitCmp(cmp)), observed=observed)
 
     def wait(self, cmp_value: int, cmp: WaitCmp, timeout: float) -> int:
+        operand = _require_signed_int32(cmp_value)
         if timeout is None or float(timeout) <= 0:
             raise ValueError("region counter wait requires a positive timeout")
         if self._region.on_wait is not None:
             self._region.on_wait(self._offset)
-        result = self.test(cmp_value, cmp)
+        result = self.test(operand, cmp)
         if result.matched:
             return int(result.observed)
         raise TimeoutError(f"queue counter wait timed out; observed={result.observed}")
 
     def notify(self, value: int, op: NotifyOp = NotifyOp.Set) -> None:
+        operand = _require_signed_int32(value)
         if self._region.fail_notify is not None:
             raise self._region.fail_notify
         if op is NotifyOp.Add:
-            self._region.counters[self._offset] = int(self._region.counters.get(self._offset, 0)) + int(value)
+            current = ctypes.c_int32(int(self._region.counters.get(self._offset, 0)) & 0xFFFFFFFF).value
+            self._region.counters[self._offset] = ctypes.c_int32((current + operand) & 0xFFFFFFFF).value
         else:
-            self._region.counters[self._offset] = int(value) & 0xFFFF_FFFF
+            self._region.counters[self._offset] = operand
 
 
 @dataclass
@@ -621,6 +649,146 @@ def test_bind_rejects_layout_mismatch_and_incomplete_identity():
         plan._bind(region, slots)
 
 
+def test_spsc_plan_rejects_role_mismatch_after_consume():
+    session, host, peer, _extra, registry = _endpoint_bundle()
+    plan = _SpscQueueTemplate().plan(_SpscQueueConfig(4, 128, 128))
+    members = registry.resolve_members((at("L3", HOST_CPU), at("L3/L2[1]", DEVICE_AICPU)))
+    slots = _resolve_template_slots(
+        registry, members, _queue_placement(host, peer).slot_bindings, _SpscQueueTemplate.required_slots
+    )
+    swapped = _MemoryRegion(plan.region_layout, consumer=peer, provider=host, session=session, transaction_id=7)
+    with pytest.raises(ValueError, match="INITIATOR slot does not match"):
+        plan._bind(swapped, slots)
+    assert plan._state is _SpscQueuePlanState.CONSUMED
+    with pytest.raises(RuntimeError, match="already consumed"):
+        plan._bind(swapped, slots)
+
+
+class _GenericTemplateSlot(Enum):
+    ALPHA = "alpha"
+    BETA = "beta"
+    GAMMA = "gamma"
+
+
+class _GenericTemplatePlan:
+    def __init__(self, region_layout: RegionLayoutSpec, *, fail_bind: bool = False) -> None:
+        self._region_layout = region_layout
+        self._fail_bind = fail_bind
+        self._state = _SpscQueuePlanState.AVAILABLE
+        self._bind_lock = threading.Lock()
+        self.bound: dict[str, object] | None = None
+
+    @property
+    def region_layout(self) -> RegionLayoutSpec:
+        return self._region_layout
+
+    def _consume_for_bind(self) -> None:
+        with self._bind_lock:
+            if self._state is not _SpscQueuePlanState.AVAILABLE:
+                raise RuntimeError("queue plan bind token is already consumed")
+            self._state = _SpscQueuePlanState.CONSUMED
+
+    def _bind(self, instance: object, slots: object) -> dict[str, object]:
+        self._consume_for_bind()
+        alpha = slots.endpoint(_GenericTemplateSlot.ALPHA)
+        beta = slots.endpoint(_GenericTemplateSlot.BETA)
+        gamma = slots.endpoint(_GenericTemplateSlot.GAMMA)
+        if alpha.identity == beta.identity:
+            raise ValueError("ALPHA and BETA must bind different endpoint identities")
+        if self._fail_bind:
+            raise RuntimeError("injected generic bind failure")
+        self.bound = {"instance": instance, "alpha": alpha, "beta": beta, "gamma": gamma}
+        return self.bound
+
+
+class _GenericTemplate:
+    required_slots = (
+        _GenericTemplateSlot.ALPHA,
+        _GenericTemplateSlot.BETA,
+        _GenericTemplateSlot.GAMMA,
+    )
+
+    def __init__(self, *, fail_bind: bool = False) -> None:
+        self._fail_bind = fail_bind
+        self.last_plan: _GenericTemplatePlan | None = None
+
+    def plan(self, config: object) -> _GenericTemplatePlan:
+        if not isinstance(config, RegionLayoutSpec):
+            raise TypeError("generic template.plan requires RegionLayoutSpec")
+        self.last_plan = _GenericTemplatePlan(config, fail_bind=self._fail_bind)
+        return self.last_plan
+
+
+def _generic_placement(host: EndpointRecord, peer: EndpointRecord) -> _RegionTemplatePlacementRequest:
+    return _RegionTemplatePlacementRequest(
+        members=(at(host.path, host.deployment), at(peer.path, peer.deployment)),
+        topology=SingleOwner(provider=at(peer.path, peer.deployment)),
+        slot_bindings=(
+            _TemplateSlotBindingRequest(_GenericTemplateSlot.ALPHA, at(host.path, host.deployment)),
+            _TemplateSlotBindingRequest(_GenericTemplateSlot.BETA, at(peer.path, peer.deployment)),
+            _TemplateSlotBindingRequest(_GenericTemplateSlot.GAMMA, at(host.path, host.deployment)),
+        ),
+    )
+
+
+def test_generic_template_slot_resolve_enforces_required_slots_and_same_endpoint_policy():
+    _session, host, peer, _extra, registry = _endpoint_bundle()
+    members = registry.resolve_members((at("L3", HOST_CPU), at("L3/L2[1]", DEVICE_AICPU)))
+    required = _GenericTemplate.required_slots
+    with pytest.raises(ValueError, match="missing"):
+        _resolve_template_slots(
+            registry,
+            members,
+            (
+                _TemplateSlotBindingRequest(_GenericTemplateSlot.ALPHA, at("L3", HOST_CPU)),
+                _TemplateSlotBindingRequest(_GenericTemplateSlot.BETA, at("L3/L2[1]", DEVICE_AICPU)),
+            ),
+            required,
+        )
+    with pytest.raises(ValueError, match="duplicate"):
+        _resolve_template_slots(
+            registry,
+            members,
+            (
+                _TemplateSlotBindingRequest(_GenericTemplateSlot.ALPHA, at("L3", HOST_CPU)),
+                _TemplateSlotBindingRequest(_GenericTemplateSlot.ALPHA, at("L3/L2[1]", DEVICE_AICPU)),
+                _TemplateSlotBindingRequest(_GenericTemplateSlot.BETA, at("L3/L2[1]", DEVICE_AICPU)),
+                _TemplateSlotBindingRequest(_GenericTemplateSlot.GAMMA, at("L3", HOST_CPU)),
+            ),
+            required,
+        )
+    with pytest.raises(ValueError, match="unknown"):
+        _resolve_template_slots(
+            registry,
+            members,
+            (
+                *_generic_placement(host, peer).slot_bindings,
+                _TemplateSlotBindingRequest(_UnknownTemplateSlot.EXTRA, at("L3/L2[0]", DEVICE_AICPU)),
+            ),
+            required,
+        )
+    slots = _resolve_template_slots(registry, members, _generic_placement(host, peer).slot_bindings, required)
+    plan = _GenericTemplate().plan(RegionLayoutSpec(64, 128))
+    bound = plan._bind(_MemoryRegion(plan.region_layout, host, peer, _session, 9), slots)
+    assert bound["alpha"] is host
+    assert bound["beta"] is peer
+    assert bound["gamma"] is host
+    same = _resolve_template_slots(
+        registry,
+        registry.resolve_members((at("L3", HOST_CPU),)),
+        (
+            _TemplateSlotBindingRequest(_GenericTemplateSlot.ALPHA, at("L3", HOST_CPU)),
+            _TemplateSlotBindingRequest(_GenericTemplateSlot.BETA, at("L3", HOST_CPU)),
+            _TemplateSlotBindingRequest(_GenericTemplateSlot.GAMMA, at("L3", HOST_CPU)),
+        ),
+        required,
+    )
+    rejected = _GenericTemplate().plan(RegionLayoutSpec(64, 128))
+    with pytest.raises(ValueError, match="ALPHA and BETA"):
+        rejected._bind(_MemoryRegion(rejected.region_layout, host, host, _session, 9), same)
+    assert rejected._state is _SpscQueuePlanState.CONSUMED
+
+
 def test_bound_queue_refuses_copy_and_does_not_own_physical_cleanup():
     _plan, region, _slots, queue = _bind_memory_queue()
     with pytest.raises(TypeError, match="cannot be copied"):
@@ -676,8 +844,9 @@ def test_duplex_data_zero_byte_wrap_replay_stop_and_error():
     queue.output.release(handle)
 
     data2 = b"more"
-    desc2 = encode_spsc_queue_descriptor(2, SpscQueueOpcode.DATA, out_offset, 4)
-    region.payload[out_offset : out_offset + 4] = data2
+    desc2_offset = out_offset + 8
+    region.payload[desc2_offset : desc2_offset + 4] = data2
+    desc2 = encode_spsc_queue_descriptor(2, SpscQueueOpcode.DATA, desc2_offset, 4)
     region.payload[queue._layout.output_desc_offset + 32 : queue._layout.output_desc_offset + 64] = desc2
     region.counters[queue._layout.output_desc_tail_offset] = 2
     handle = queue.output.try_peek()
@@ -723,6 +892,21 @@ def test_output_handle_ownership_and_wait_timeout_abort_failure():
     region.fail_payload = RuntimeError("payload write failed")
     region.fail_notify = RuntimeError("abort notify failed")
     with pytest.raises(RuntimeError, match="payload write failed") as excinfo:
+        queue.input.try_enqueue(b"hi", 2)
+    assert queue._state is _SpscQueueState.POISONED_LOCAL
+    assert queue._first_error is excinfo.value
+    notes = getattr(excinfo.value, "__notes__", [])
+    assert any("abort notify failed" in note for note in notes)
+
+
+def test_poison_attaches_abort_notify_note_without_add_note():
+    class _LegacyError(RuntimeError):
+        add_note = None
+
+    _plan, region, _slots, queue = _bind_memory_queue()
+    region.fail_payload = _LegacyError("payload write failed")
+    region.fail_notify = RuntimeError("abort notify failed")
+    with pytest.raises(_LegacyError, match="payload write failed") as excinfo:
         queue.input.try_enqueue(b"hi", 2)
     assert queue._state is _SpscQueueState.POISONED_LOCAL
     assert queue._first_error is excinfo.value
@@ -1015,6 +1199,115 @@ def test_coordinator_cleanup_failure_records_unreclaimable_and_keeps_first_error
     assert worker._ordered_cleanup_error is not None
 
 
+def test_coordinator_creates_generic_three_slot_template(region_worker):
+    worker, calls, _leases = region_worker()
+    _session, host, peer, _extra, _registry = _endpoint_bundle()
+    template = _GenericTemplate()
+    result = _RegionTemplateCoordinator(worker).create(
+        template=template,
+        config=RegionLayoutSpec(64, 128),
+        placement=_generic_placement(host, peer),
+        result_projector=lambda bound: bound,
+    )
+    assert result["alpha"].path == "L3"
+    assert result["beta"].path == "L3/L2[1]"
+    assert result["gamma"].path == "L3"
+    assert result["alpha"].identity == result["gamma"].identity
+    assert result["instance"] is not None
+    assert template.last_plan is not None
+    assert template.last_plan._state is _SpscQueuePlanState.CONSUMED
+    assert ("allocate", 64, 128) in calls
+    assert not any(item[0] == "release" for item in calls)
+
+
+def test_coordinator_generic_missing_slot_does_not_materialize(region_worker):
+    worker, calls, _leases = region_worker()
+    host_sel = at("L3", HOST_CPU)
+    peer_sel = at("L3/L2[1]", DEVICE_AICPU)
+    placement = _RegionTemplatePlacementRequest(
+        members=(host_sel, peer_sel),
+        topology=SingleOwner(provider=peer_sel),
+        slot_bindings=(
+            _TemplateSlotBindingRequest(_GenericTemplateSlot.ALPHA, host_sel),
+            _TemplateSlotBindingRequest(_GenericTemplateSlot.BETA, peer_sel),
+        ),
+    )
+    with pytest.raises(ValueError, match="missing"):
+        _RegionTemplateCoordinator(worker).create(
+            template=_GenericTemplate(),
+            config=RegionLayoutSpec(64, 128),
+            placement=placement,
+            result_projector=lambda bound: bound,
+        )
+    assert not any(item[0] == "allocate" for item in calls)
+
+
+def test_coordinator_generic_bind_failure_rolls_back_and_consumes_plan(region_worker):
+    worker, calls, _leases = region_worker()
+    _session, host, peer, _extra, _registry = _endpoint_bundle()
+    template = _GenericTemplate(fail_bind=True)
+    with pytest.raises(RuntimeError, match="injected generic bind failure"):
+        _RegionTemplateCoordinator(worker).create(
+            template=template,
+            config=RegionLayoutSpec(64, 128),
+            placement=_generic_placement(host, peer),
+            result_projector=lambda bound: bound,
+        )
+    assert template.last_plan is not None
+    assert template.last_plan._state is _SpscQueuePlanState.CONSUMED
+    assert any(item[0] == "release" for item in calls)
+    assert worker._region_instance_registry._instances == {}
+
+
+def test_coordinator_generic_cleanup_failure_keeps_first_error(region_worker):
+    worker, calls, _leases = region_worker(fail_mapping_close=True)
+    _session, host, peer, _extra, _registry = _endpoint_bundle()
+    with pytest.raises(RuntimeError, match="injected generic bind failure") as excinfo:
+        _RegionTemplateCoordinator(worker).create(
+            template=_GenericTemplate(fail_bind=True),
+            config=RegionLayoutSpec(64, 128),
+            placement=_generic_placement(host, peer),
+            result_projector=lambda bound: bound,
+        )
+    assert str(excinfo.value) == "injected generic bind failure"
+    assert worker._ordered_cleanup_error is not None
+    assert any(item[0] == "release" for item in calls)
+
+
+def test_coordinator_spsc_role_mismatch_consumes_plan_and_rolls_back(region_worker):
+    worker, calls, _leases = region_worker()
+    host_sel = at("L3", HOST_CPU)
+    peer_sel = at("L3/L2[1]", DEVICE_AICPU)
+    placement = _RegionTemplatePlacementRequest(
+        members=(host_sel, peer_sel),
+        topology=SingleOwner(provider=peer_sel),
+        slot_bindings=(
+            _TemplateSlotBindingRequest(_SpscQueueSlot.INITIATOR, peer_sel),
+            _TemplateSlotBindingRequest(_SpscQueueSlot.PEER, host_sel),
+        ),
+    )
+    with pytest.raises(ValueError, match="INITIATOR slot does not match"):
+        _RegionTemplateCoordinator(worker).create(
+            template=_SpscQueueTemplate(),
+            config=_SpscQueueConfig(4, 64, 64),
+            placement=placement,
+            result_projector=lambda bound: bound,
+        )
+    assert any(item[0] == "allocate" for item in calls)
+    assert any(item[0] == "release" for item in calls)
+    assert worker._region_instance_registry._instances == {}
+
+
+def test_coordinator_source_has_no_spsc_roles():
+    source = inspect.getsource(_RegionTemplateCoordinator)
+    assert "_SpscQueueSlot" not in source
+    assert "_prove_initiator_peer_access" not in source
+    assert "_require_distinct_initiator_peer" not in source
+    assert "INITIATOR" not in source
+    assert "PEER" not in source
+    assert "consumer/provider" not in source
+
+
 def test_production_facade_uses_coordinator():
     from simpler import worker_chip_message_queue
     from simpler.worker_chip_message_queue import create_worker_chip_queue
@@ -1025,3 +1318,131 @@ def test_production_facade_uses_coordinator():
     module_source = inspect.getsource(worker_chip_message_queue)
     assert "time.sleep" not in module_source
     assert "orch.alloc" not in module_source
+
+
+def _plant_output_descriptor(region, queue, seq, opcode, payload_offset, payload=b""):
+    if payload:
+        begin = int(payload_offset)
+        region.payload[begin : begin + len(payload)] = payload
+    slot_index = (int(seq) - 1) & (queue._layout.depth - 1)
+    slot = queue._layout.output_desc_offset + slot_index * _SPSC_QUEUE_DESCRIPTOR_BYTES
+    region.payload[slot : slot + 32] = encode_spsc_queue_descriptor(seq, opcode, payload_offset, len(payload))
+    region.counters[queue._layout.output_desc_tail_offset] = int(seq)
+
+
+def test_payload_expected_offset_matches_native_boundaries():
+    arena_offset = 128
+    arena_bytes = 64
+    assert _payload_expected_offset(0, 8, arena_offset, arena_bytes) == 128
+    assert _payload_expected_offset(8, 8, arena_offset, arena_bytes) == 136
+    assert _payload_expected_offset(56, 8, arena_offset, arena_bytes) == 184
+    assert _payload_expected_offset(56, 16, arena_offset, arena_bytes) == 128
+    assert _payload_expected_offset(64, 8, arena_offset, arena_bytes) == 128
+    assert _payload_expected_offset(0, 64, arena_offset, arena_bytes) == 128
+    assert _payload_expected_offset(0, 0, arena_offset, arena_bytes) == 128
+    assert _counter_low32(0x7FFFFFFF) == 2147483647
+    assert _counter_low32(0x80000000) == -2147483648
+    assert _counter_low32(0xFFFFFFFF) == -1
+    assert _counter_low32(1 << 32) == 0
+
+
+def test_output_early_wrap_poisons_once_without_committing_head():
+    _plan, region, _slots, queue = _bind_memory_queue(depth=4, input_arena_bytes=64, output_arena_bytes=64)
+    out = queue._layout.output_arena_offset
+    _plant_output_descriptor(region, queue, 1, SpscQueueOpcode.DATA, out, b"abcdefgh")
+    handle = queue.output.try_peek()
+    assert handle is not None
+    assert queue._layout.output_desc_head_offset not in region.counters
+    queue.output.release(handle)
+    assert region.counters[queue._layout.output_desc_head_offset] == 1
+    assert queue._output_payload_head == 8
+    _plant_output_descriptor(region, queue, 2, SpscQueueOpcode.DATA, out, b"xxxxxxxx")
+    with pytest.raises(RuntimeError, match="payload replay offset mismatch") as excinfo:
+        queue.output.try_peek()
+    assert queue._state is _SpscQueueState.POISONED_LOCAL
+    assert queue._first_error is excinfo.value
+    assert queue._output_payload_head == 8
+    assert queue._output_head == 1
+    assert region.counters[queue._layout.initiator_abort_offset] == 1
+    with pytest.raises(RuntimeError, match="payload replay offset mismatch"):
+        queue.output.try_peek()
+    assert region.counters[queue._layout.initiator_abort_offset] == 1
+
+
+def test_output_exact_fit_true_wrap_and_zero_byte_replay():
+    _plan, region, _slots, queue = _bind_memory_queue(depth=4, input_arena_bytes=64, output_arena_bytes=64)
+    out = queue._layout.output_arena_offset
+    _plant_output_descriptor(region, queue, 1, SpscQueueOpcode.DATA, out, b"x" * 56)
+    handle = queue.output.try_peek()
+    queue.output.release(handle)
+    _plant_output_descriptor(region, queue, 2, SpscQueueOpcode.DATA, out + 56, b"yz123456")
+    handle = queue.output.try_peek()
+    assert handle is not None
+    assert handle.payload_offset == out + 56
+    queue.output.release(handle)
+    assert queue._output_payload_head == 64
+    _plant_output_descriptor(region, queue, 3, SpscQueueOpcode.DATA, out, b"w" * 16)
+    handle = queue.output.try_peek()
+    assert handle is not None
+    assert handle.payload_offset == out
+    queue.output.release(handle)
+    _plant_output_descriptor(region, queue, 4, SpscQueueOpcode.DATA, 0, b"")
+    handle = queue.output.try_peek()
+    assert handle is not None
+    assert handle.payload_nbytes == 0
+    assert handle.payload_offset == 0
+    queue.output.release(handle)
+    assert queue._output_payload_head == 80
+
+
+def test_input_release_replay_rejects_early_wrap_and_preserves_abort_failure():
+    _plan, region, _slots, queue = _bind_memory_queue(depth=4, input_arena_bytes=64, output_arena_bytes=64)
+    assert queue.input.try_enqueue(b"abcdefgh", 8) is True
+    slot = queue._layout.input_desc_offset
+    region.payload[slot : slot + 32] = encode_spsc_queue_descriptor(
+        1, SpscQueueOpcode.DATA, queue._layout.input_arena_offset + 8, 8
+    )
+    region.counters[queue._layout.input_desc_head_offset] = 1
+    region.fail_notify = RuntimeError("abort notify failed")
+    with pytest.raises(RuntimeError, match="payload replay offset mismatch") as excinfo:
+        queue.input.try_enqueue(b"xxxxxxxx", 8)
+    assert queue._state is _SpscQueueState.POISONED_LOCAL
+    assert queue._first_error is excinfo.value
+    notes = getattr(excinfo.value, "__notes__", [])
+    assert any("abort notify failed" in note for note in notes)
+    assert queue._input_tail == 1
+    assert region.counters[queue._layout.input_desc_tail_offset] == 1
+
+
+def test_signed_int32_counter_operands_cross_bit31_and_wrap_to_zero():
+    _plan, region, _slots, queue = _bind_memory_queue(depth=4, input_arena_bytes=64, output_arena_bytes=64)
+    queue._input_head = 0x7FFFFFFF
+    queue._input_tail = 0x7FFFFFFF
+    region.counters[queue._layout.input_desc_head_offset] = 2147483647
+    assert queue.input.try_enqueue(None, 0) is True
+    assert region.counters[queue._layout.input_desc_tail_offset] == -2147483648
+
+    _plan, region, _slots, queue = _bind_memory_queue(depth=4, input_arena_bytes=64, output_arena_bytes=64)
+    queue._input_head = 0xFFFFFFFF
+    queue._input_tail = 0xFFFFFFFF
+    region.counters[queue._layout.input_desc_head_offset] = -1
+    assert queue.input.try_enqueue(None, 0) is True
+    assert region.counters[queue._layout.input_desc_tail_offset] == 0
+
+    _plan, region, _slots, queue = _bind_memory_queue(depth=4, input_arena_bytes=64, output_arena_bytes=64)
+    queue._output_tail = 0x7FFFFFFF
+    region.counters[queue._layout.output_desc_tail_offset] = -2147483648
+    _plant_output_descriptor(region, queue, 1, SpscQueueOpcode.DATA, 0, b"")
+    region.counters[queue._layout.output_desc_tail_offset] = -2147483648
+    handle = queue.output.try_peek()
+    assert handle is not None
+    assert handle.seq == 1
+    assert queue._output_tail == 0x80000000
+
+    _plan, region, _slots, queue = _bind_memory_queue(depth=4, input_arena_bytes=64, output_arena_bytes=64)
+    queue._output_head = 0x80000000
+    queue._output_tail = 0x80000000
+    region.counters[queue._layout.output_desc_tail_offset] = -2147483648
+    with pytest.raises(TimeoutError, match="timed out"):
+        queue.output.peek(0.01)
+    assert queue._state is _SpscQueueState.LIVE

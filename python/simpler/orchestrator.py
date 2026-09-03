@@ -665,10 +665,10 @@ class Orchestrator:
 
         return create_worker_chip_queue(
             self,
-            worker_id=int(worker_id),
-            depth=int(depth),
-            input_arena_bytes=int(input_arena_bytes),
-            output_arena_bytes=int(output_arena_bytes),
+            worker_id=worker_id,
+            depth=depth,
+            input_arena_bytes=input_arena_bytes,
+            output_arena_bytes=output_arena_bytes,
         )
 
     # ------------------------------------------------------------------

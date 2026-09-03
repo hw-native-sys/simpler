@@ -73,6 +73,17 @@ class SpscQueueOpcode(IntEnum):
     ERROR = 3
 
 
+def _counter_low32(value: int) -> int:
+    return ctypes.c_int32(int(value) & 0xFFFFFFFF).value
+
+
+def _payload_expected_offset(cursor: int, nbytes: int, arena_offset: int, arena_bytes: int) -> int:
+    arena_pos = int(cursor) % int(arena_bytes)
+    if arena_pos + int(nbytes) > int(arena_bytes):
+        return int(arena_offset)
+    return int(arena_offset) + arena_pos
+
+
 def _require_exact_u64(name: str, value: object) -> int:
     if type(value) is not int:
         raise TypeError(f"{name} must be an exact int")
@@ -243,6 +254,8 @@ class SpscQueueEndpointBinding:
         )
         if self.magic_version != _SPSC_QUEUE_MAGIC_VERSION:
             raise ValueError("binding magic_version is not SPSQ ABI 1.0")
+        if self.transaction_id == 0:
+            raise ValueError("transaction_id must be nonzero")
 
     def to_scalars(self) -> tuple[int, ...]:
         return (
@@ -269,6 +282,8 @@ class SpscQueueEndpointBinding:
         values = tuple(_require_exact_u64(f"binding[{index}]", scalars[index]) for index in range(count))
         if values[0] != _SPSC_QUEUE_MAGIC_VERSION:
             raise ValueError("binding magic_version is not SPSQ ABI 1.0")
+        if values[2] == 0:
+            raise ValueError("transaction_id must be nonzero")
         return cls(
             magic_version=values[0],
             session_instance_id_bits=values[1],
@@ -335,6 +350,8 @@ class _ResolvedTemplateSlots:
 
 
 class _RegionTemplate(Protocol):
+    required_slots: Sequence[Enum]
+
     def plan(self, config: object) -> _RegionTemplatePlan: ...
 
 
@@ -347,6 +364,18 @@ class _RegionTemplatePlan(Protocol):
 
 def _reject_copy(obj: object) -> NoReturn:
     raise TypeError(f"{type(obj).__name__} cannot be copied")
+
+
+def _attach_exception_note(error: BaseException, note: str) -> None:
+    adder = getattr(error, "add_note", None)
+    if callable(adder):
+        adder(note)
+        return
+    notes = getattr(error, "__notes__", None)
+    if isinstance(notes, list):
+        notes.append(note)
+        return
+    object.__setattr__(error, "__notes__", [note])
 
 
 def _resolve_template_slots(
@@ -431,7 +460,11 @@ class _SpscQueuePlan:
             raise ValueError("region payload_bytes do not match the queue plan")
         if int(layout.counter_bytes) != int(self._layout.counter_bytes):
             raise ValueError("region counter_bytes do not match the queue plan")
-        _require_distinct_initiator_peer(slots)
+        initiator, peer = _require_distinct_initiator_peer(slots)
+        if instance.consumer.identity != initiator.identity:
+            raise ValueError("INITIATOR slot does not match the materialized consumer access endpoint")
+        if instance.provider.identity != peer.identity:
+            raise ValueError("PEER slot does not match the materialized provider-local view endpoint")
         payload_view = instance.local_view(RegionPartKind.PAYLOAD)
         counter_view = instance.local_view(RegionPartKind.COUNTER)
         if payload_view is None or counter_view is None:
@@ -503,11 +536,9 @@ class _RegionTemplateCoordinator:
             plan = template.plan(config)
             registry = worker._get_endpoint_registry()
             resolved_region = registry.resolve_region_spec(placement.members, placement.topology)
-            required = tuple(getattr(template, "required_slots", ()))
-            if not required:
-                required = tuple(binding.slot for binding in placement.slot_bindings)
-            slots = _resolve_template_slots(registry, resolved_region.members, placement.slot_bindings, required)
-            _require_distinct_initiator_peer(slots)
+            slots = _resolve_template_slots(
+                registry, resolved_region.members, placement.slot_bindings, tuple(template.required_slots)
+            )
             backend_plan = BackendResolver(registry, worker._get_region_access_service()).plan(
                 resolved_region, plan.region_layout
             )
@@ -526,7 +557,6 @@ class _RegionTemplateCoordinator:
                     layout=plan.region_layout,
                 )
             )
-            self._prove_initiator_peer_access(instance, slots)
             bound = plan._bind(instance, slots)
             projected = result_projector(bound)
             published = True
@@ -535,13 +565,6 @@ class _RegionTemplateCoordinator:
             if instance is not None and not published:
                 self._rollback_unpublished(instance)
             raise
-
-    def _prove_initiator_peer_access(self, instance: object, slots: _ResolvedTemplateSlots) -> None:
-        initiator, peer = _require_distinct_initiator_peer(slots)
-        if instance.consumer.identity != initiator.identity:
-            raise ValueError("INITIATOR slot does not match the materialized consumer access endpoint")
-        if instance.provider.identity != peer.identity:
-            raise ValueError("PEER slot does not match the materialized provider-local view endpoint")
 
     def _rollback_unpublished(self, instance: object) -> None:
         try:
@@ -637,9 +660,7 @@ class _BoundSpscQueue:
         try:
             self._instance.counter(self._layout.initiator_abort_offset).notify(1, NotifyOp.Set)
         except BaseException as abort_error:
-            adder = getattr(error, "add_note", None)
-            if callable(adder):
-                adder(f"initiator abort notify failed: {abort_error}")
+            _attach_exception_note(error, f"initiator abort notify failed: {abort_error}")
 
     def _run_primitive(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         self._ensure_usable()
@@ -652,10 +673,10 @@ class _BoundSpscQueue:
             raise
 
     def _signal_test(self, offset: int, cmp_value: int, cmp: WaitCmp) -> Any:
-        return self._run_primitive(lambda: self._instance.counter(offset).test(int(cmp_value), cmp))
+        return self._run_primitive(lambda: self._instance.counter(offset).test(_counter_low32(cmp_value), cmp))
 
     def _signal_notify(self, offset: int, value: int) -> None:
-        self._run_primitive(lambda: self._instance.counter(offset).notify(int(value), NotifyOp.Set))
+        self._run_primitive(lambda: self._instance.counter(offset).notify(_counter_low32(value), NotifyOp.Set))
 
     def _sample_peer_abort(self) -> None:
         result = self._signal_test(self._layout.peer_abort_offset, 1, WaitCmp.GE)
@@ -664,7 +685,7 @@ class _BoundSpscQueue:
             raise RuntimeError("SPSC queue remote abort observed")
 
     def _refresh_counter(self, offset: int, local_value: int) -> int:
-        result = self._signal_test(offset, local_value & 0xFFFF_FFFF, WaitCmp.NE)
+        result = self._signal_test(offset, local_value, WaitCmp.NE)
         if not result.matched:
             return local_value
         observed = int(result.observed) & 0xFFFF_FFFF
@@ -690,7 +711,7 @@ class _BoundSpscQueue:
             raise TimeoutError("SPSC queue operation timed out")
         try:
             self._run_primitive(
-                lambda: self._instance.counter(offset).wait(local_value & 0xFFFF_FFFF, WaitCmp.NE, remaining)
+                lambda: self._instance.counter(offset).wait(_counter_low32(local_value), WaitCmp.NE, remaining)
             )
         except TimeoutError:
             self._sample_peer_abort()
@@ -736,13 +757,14 @@ class _BoundSpscQueue:
     ) -> int:
         if payload_nbytes == 0:
             return cursor
-        expected_offset = arena_offset + (cursor % arena_bytes)
+        expected_offset = _payload_expected_offset(cursor, payload_nbytes, arena_offset, arena_bytes)
         if expected_offset != payload_offset:
-            if payload_offset != arena_offset:
-                error = RuntimeError("SPSC queue payload replay offset mismatch")
-                self._poison_local(error)
-                raise error
-            cursor += arena_bytes - (cursor % arena_bytes)
+            error = RuntimeError("SPSC queue payload replay offset mismatch")
+            self._poison_local(error)
+            raise error
+        arena_pos = cursor % arena_bytes
+        if arena_pos + payload_nbytes > arena_bytes:
+            cursor += arena_bytes - arena_pos
         return cursor + payload_nbytes
 
     def _replay_released_input_descriptors(self, old_head: int, new_head: int) -> None:
@@ -765,13 +787,16 @@ class _BoundSpscQueue:
             cursor += 1
 
     def _reserve_input_payload(self, nbytes: int, next_payload_tail: int) -> tuple[int, int] | None:
-        arena_pos = next_payload_tail % self._layout.input_arena_bytes
-        if arena_pos + nbytes > self._layout.input_arena_bytes:
-            next_payload_tail += self._layout.input_arena_bytes - arena_pos
-            arena_pos = 0
-        if next_payload_tail + nbytes - self._input_payload_head > self._layout.input_arena_bytes:
+        arena_bytes = self._layout.input_arena_bytes
+        expected_offset = _payload_expected_offset(
+            next_payload_tail, nbytes, self._layout.input_arena_offset, arena_bytes
+        )
+        arena_pos = next_payload_tail % arena_bytes
+        if arena_pos + nbytes > arena_bytes:
+            next_payload_tail += arena_bytes - arena_pos
+        if next_payload_tail + nbytes - self._input_payload_head > arena_bytes:
             return None
-        return self._layout.input_arena_offset + arena_pos, next_payload_tail
+        return expected_offset, next_payload_tail
 
     def __copy__(self) -> _BoundSpscQueue:
         _reject_copy(self)

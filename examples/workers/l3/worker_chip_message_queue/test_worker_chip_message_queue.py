@@ -111,20 +111,20 @@ def _add_tiles(left: list[float], right: list[float]) -> list[float]:
 def _input_payloads() -> list[bytes]:
     inputs = _input_tiles()
     return [
-        _pack_input(101, 1, inputs[0]),
-        _pack_input(102, 2, inputs[1]),
-        _pack_input(103, 3, inputs[2]),
-        _pack_input(104, 3, inputs[3]),
+        _pack_input(0, 1, inputs[0]),
+        _pack_input(0, 2, inputs[1]),
+        _pack_input(0, 3, inputs[2]),
+        _pack_input(7, 3, inputs[3]),
     ]
 
 
 def _expected_outputs() -> list[bytes]:
     inputs = _input_tiles()
     return [
-        _pack_output(102, 20, 0, _add_scalar(inputs[1], 20.0)),
-        _pack_output(101, 10, 0, _add_scalar(inputs[0], 10.0)),
-        _pack_output(101, 11, 0, _add_scalar(inputs[0], 11.0)),
-        _pack_output(103, 30, 104, _add_tiles(inputs[2], inputs[3])),
+        _pack_output(0, 20, 0, _add_scalar(inputs[1], 20.0)),
+        _pack_output(0, 10, 0, _add_scalar(inputs[0], 10.0)),
+        _pack_output(0, 11, 0, _add_scalar(inputs[0], 11.0)),
+        _pack_output(0, 30, 7, _add_tiles(inputs[2], inputs[3])),
     ]
 
 

@@ -55,6 +55,7 @@ using QueueEndpoint = spsc_queue::SpscQueueEndpoint<RegionInstanceView, kInputWi
 struct ActiveRequest {
     spsc_queue::SpscQueueInputHandle handle;
     InputHeader header;
+    bool occupied;
 };
 
 uint64_t spsc_queue_now_ns() { return sys_cnt_ticks_to_ns(device_time_now_ticks(), device_time_frequency_hz()); }
@@ -129,20 +130,17 @@ bool release_input(QueueEndpoint &queue, const spsc_queue::SpscQueueInputHandle 
 }
 
 bool process_first_pair(QueueEndpoint &queue, ActiveRequest *active, const spsc_queue::SpscQueueInputHandle &input) {
-    active[1].handle = input;
-    if (!parse_input_header(input, &active[1].header) || active[0].header.request_id == 0) {
+    InputHeader header{};
+    if (!parse_input_header(input, &header) || !active[0].occupied) {
         rt_report_fatal(SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, "invalid L3-L2 queue example request");
         return false;
     }
-    if (!publish_aiv_output(
-            queue, active[1].handle, active[1].handle, active[1].header.request_id, 20, 0, ADD_SCALAR, 20.0F
-        )) {
+    if (!publish_aiv_output(queue, input, input, header.request_id, 20, 0, ADD_SCALAR, 20.0F)) {
         return false;
     }
-    if (!release_input(queue, active[1].handle)) {
+    if (!release_input(queue, input)) {
         return false;
     }
-    active[1] = {};
     if (!publish_aiv_output(
             queue, active[0].handle, active[0].handle, active[0].header.request_id, 10, 0, ADD_SCALAR, 10.0F
         ) ||
@@ -161,14 +159,16 @@ bool process_first_pair(QueueEndpoint &queue, ActiveRequest *active, const spsc_
 bool remember_input_for_pair(
     ActiveRequest *active, const spsc_queue::SpscQueueInputHandle &input, const InputHeader &header
 ) {
-    if (active[2].header.request_id == 0) {
+    if (!active[2].occupied) {
         active[2].handle = input;
         active[2].header = header;
+        active[2].occupied = true;
         return true;
     }
-    if (active[3].header.request_id == 0) {
+    if (!active[3].occupied) {
         active[3].handle = input;
         active[3].header = header;
+        active[3].occupied = true;
         return true;
     }
     rt_report_fatal(SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, "L3-L2 queue example input window is full");
@@ -182,7 +182,7 @@ bool process_data_message(QueueEndpoint &queue, const spsc_queue::SpscQueueInput
         return false;
     }
     if (header.mode == 1) {
-        if (active[0].header.request_id != 0) {
+        if (active[0].occupied) {
             rt_report_fatal(
                 SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, "L3-L2 queue example received mode=1 while a request is pending"
             );
@@ -190,6 +190,7 @@ bool process_data_message(QueueEndpoint &queue, const spsc_queue::SpscQueueInput
         }
         active[0].handle = input;
         active[0].header = header;
+        active[0].occupied = true;
         return true;
     }
     if (header.mode == 2) {
@@ -206,10 +207,10 @@ bool process_data_message(QueueEndpoint &queue, const spsc_queue::SpscQueueInput
 }
 
 bool finish_pending_inputs(QueueEndpoint &queue, ActiveRequest *active) {
-    if (active[2].header.request_id == 0 && active[3].header.request_id == 0) {
+    if (!active[2].occupied && !active[3].occupied) {
         return true;
     }
-    if (active[2].header.request_id == 0 || active[3].header.request_id == 0) {
+    if (!active[2].occupied || !active[3].occupied) {
         rt_report_fatal(SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, "L3-L2 queue example missing paired input");
         return false;
     }

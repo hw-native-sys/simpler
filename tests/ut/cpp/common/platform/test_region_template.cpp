@@ -72,11 +72,9 @@ TEST(RegionTemplateTest, PackedMagicVersionIsSpsqAbi10) {
 TEST(RegionTemplateTest, LayoutGoldenVectors) {
     for (const auto &test_case : kLayoutGolden) {
         spsc_queue::SpscQueueLayout layout{};
-        ASSERT_TRUE(
-            spsc_queue::SpscQueueLayout::create(
-                test_case.depth, test_case.input_arena_bytes, test_case.output_arena_bytes, &layout
-            )
-        );
+        ASSERT_TRUE(spsc_queue::SpscQueueLayout::create(
+            test_case.depth, test_case.input_arena_bytes, test_case.output_arena_bytes, &layout
+        ));
         EXPECT_EQ(layout.input_desc_offset, 0u);
         EXPECT_EQ(layout.output_desc_offset, test_case.output_desc_offset);
         EXPECT_EQ(layout.input_arena_offset, test_case.input_arena_offset);
@@ -331,8 +329,7 @@ struct FakeRegionView {
 
         bool read(uint64_t offset, uint64_t nbytes, spsc_queue::SpscQueuePayloadView &out) {
             out = spsc_queue::SpscQueuePayloadView{0, 0};
-            view_->state->log.push_back(
-                FakeAccess{FakeAccessKind::PayloadRead, offset, nbytes, 0, RegionWaitCmp::EQ, 0}
+            view_->state->log.push_back(FakeAccess{FakeAccessKind::PayloadRead, offset, nbytes, 0, RegionWaitCmp::EQ, 0}
             );
             if (view_->state->sticky_failed) {
                 return false;
@@ -555,6 +552,16 @@ bool has_notify(const std::vector<FakeAccess> &log, uint64_t offset) {
         }
     }
     return false;
+}
+
+size_t count_notify(const std::vector<FakeAccess> &log, uint64_t offset) {
+    size_t n = 0;
+    for (const auto &entry : log) {
+        if (entry.kind == FakeAccessKind::CounterNotify && entry.offset == offset) {
+            n += 1;
+        }
+    }
+    return n;
 }
 
 }  // namespace
@@ -898,4 +905,252 @@ TEST(RegionTemplateTest, OutputWrapReplayDoesNotFlushBorrowedPayload) {
             EXPECT_LT(entry.offset, layout.output_arena_offset);
         }
     }
+}
+
+TEST(RegionTemplateTest, EncodeRejectsZeroTransactionWithoutWritingOutput) {
+    spsc_queue::SpscQueueEndpointBinding binding{};
+    ASSERT_TRUE(spsc_queue::decode_endpoint_binding(kBindingGolden.data(), kBindingGolden.size(), &binding));
+    binding.transaction_id = 0;
+    std::array<uint64_t, 10> encoded{};
+    encoded.fill(0x1111111111111111ull);
+    auto before = encoded;
+    EXPECT_FALSE(spsc_queue::encode_endpoint_binding(binding, encoded.data(), encoded.size()));
+    EXPECT_EQ(encoded, before);
+}
+
+TEST(RegionTemplateTest, DecodeRejectsZeroTransactionWithoutWritingTarget) {
+    spsc_queue::SpscQueueEndpointBinding original{
+        7, 11, 13, 17, 19, 23, 29, 31, 37, 41,
+    };
+    spsc_queue::SpscQueueEndpointBinding decoded = original;
+    std::array<uint64_t, 10> scalars = kBindingGolden;
+    scalars[2] = 0;
+    EXPECT_FALSE(spsc_queue::decode_endpoint_binding(scalars.data(), scalars.size(), &decoded));
+    EXPECT_EQ(decoded.magic_version, original.magic_version);
+    EXPECT_EQ(decoded.session_instance_id_bits, original.session_instance_id_bits);
+    EXPECT_EQ(decoded.transaction_id, original.transaction_id);
+    EXPECT_EQ(decoded.payload_base, original.payload_base);
+    EXPECT_EQ(decoded.depth, original.depth);
+}
+
+TEST(RegionTemplateTest, DecodeAcceptsAllZeroSessionBits) {
+    std::array<uint64_t, 10> scalars = kBindingGolden;
+    scalars[1] = 0;
+    spsc_queue::SpscQueueEndpointBinding binding{};
+    ASSERT_TRUE(spsc_queue::decode_endpoint_binding(scalars.data(), scalars.size(), &binding));
+    EXPECT_EQ(binding.session_instance_id_bits, 0u);
+    EXPECT_EQ(binding.transaction_id, 42u);
+}
+
+TEST(RegionTemplateTest, ConstructRejectsZeroTransactionWithoutViewClockOrIdentity) {
+    reset_clock();
+    auto layout = make_layout(2, 64, 64);
+    FakeRegionView view(layout.payload_bytes);
+    auto state = view.state;
+    auto binding = make_binding(view, layout);
+    binding.transaction_id = 0;
+    uint64_t now_before = g_now_ns;
+    Queue1 queue(binding, std::move(view), test_clock());
+    EXPECT_FALSE(queue.live());
+    EXPECT_EQ(queue.error().kind, spsc_queue::SpscQueueErrorKind::BAD_BINDING);
+    EXPECT_FALSE(has_session_marker(queue.error().message));
+    EXPECT_EQ(std::string(queue.error().message).find("transaction="), std::string::npos);
+    EXPECT_EQ(queue.error().transaction_id, 0u);
+    EXPECT_TRUE(state->log.empty());
+    EXPECT_EQ(g_now_ns, now_before);
+}
+
+TEST(RegionTemplateTest, CounterLow32PreservesSignedBitPattern) {
+    EXPECT_EQ(spsc_queue::counter_low32(0x7fffffffull), 2147483647);
+    EXPECT_EQ(spsc_queue::counter_low32(0x80000000ull), static_cast<int32_t>(0x80000000u));
+    EXPECT_EQ(spsc_queue::counter_low32(0xffffffffull), -1);
+    EXPECT_EQ(spsc_queue::counter_low32(0x100000000ull), 0);
+    uint64_t local = 0x7fffffffull;
+    ASSERT_TRUE(spsc_queue::reconstruct_counter(spsc_queue::counter_low32(0x80000000ull), 4, &local));
+    EXPECT_EQ(local, 0x80000000ull);
+    local = 0xffffffffull;
+    ASSERT_TRUE(spsc_queue::reconstruct_counter(0, 4, &local));
+    EXPECT_EQ(local, 0x100000000ull);
+}
+
+TEST(RegionTemplateTest, ZeroTimeoutPeekAndReserveAreNoAttempt) {
+    reset_clock();
+    auto layout = make_layout(4, 64, 64);
+    FakeRegionView view(layout.payload_bytes);
+    auto state = view.state;
+    auto binding = make_binding(view, layout);
+    Queue1 queue(binding, std::move(view), test_clock());
+    ASSERT_TRUE(queue.live());
+    const char payload[] = "abcdefgh";
+    plant_input(state.get(), layout, 1, spsc_queue::SpscQueueOpcode::DATA, 8, payload);
+    size_t log_before = state->log.size();
+    uint64_t now_before = g_now_ns;
+    spsc_queue::SpscQueueInputHandle peek_out{};
+    peek_out.seq = 7;
+    EXPECT_FALSE(queue.input().peek(0, peek_out));
+    EXPECT_EQ(peek_out.seq, 0u);
+    EXPECT_EQ(queue.error().kind, spsc_queue::SpscQueueErrorKind::NONE);
+    EXPECT_TRUE(queue.live());
+    EXPECT_EQ(state->log.size(), log_before);
+    EXPECT_EQ(g_now_ns, now_before);
+
+    spsc_queue::SpscQueueOutputReservation reserve_out{};
+    reserve_out.seq = 9;
+    EXPECT_FALSE(queue.output().reserve(8, 0, reserve_out));
+    EXPECT_FALSE(reserve_out.valid);
+    EXPECT_EQ(reserve_out.seq, 0u);
+    EXPECT_EQ(queue.error().kind, spsc_queue::SpscQueueErrorKind::NONE);
+    EXPECT_TRUE(queue.live());
+    EXPECT_EQ(state->log.size(), log_before);
+    EXPECT_EQ(g_now_ns, now_before);
+
+    spsc_queue::SpscQueueInputHandle ready{};
+    ASSERT_TRUE(queue.input().try_peek(ready));
+    EXPECT_EQ(ready.seq, 1u);
+    ASSERT_TRUE(queue.input().release(ready));
+}
+
+TEST(RegionTemplateTest, ZeroTimeoutReserveLeavesActiveReservationAndSkipsOversize) {
+    reset_clock();
+    auto layout = make_layout(4, 64, 64);
+    FakeRegionView view(layout.payload_bytes);
+    auto state = view.state;
+    auto binding = make_binding(view, layout);
+    Queue1 queue(binding, std::move(view), test_clock());
+    ASSERT_TRUE(queue.live());
+    spsc_queue::SpscQueueOutputReservation first{};
+    ASSERT_TRUE(queue.output().try_reserve(8, first));
+    size_t log_before = state->log.size();
+    spsc_queue::SpscQueueOutputReservation ignored{};
+    EXPECT_FALSE(queue.output().reserve(8, 0, ignored));
+    EXPECT_FALSE(ignored.valid);
+    EXPECT_EQ(queue.error().kind, spsc_queue::SpscQueueErrorKind::NONE);
+    EXPECT_TRUE(queue.live());
+    EXPECT_EQ(state->log.size(), log_before);
+    EXPECT_TRUE(first.valid);
+    ASSERT_TRUE(queue.output().publish(first, spsc_queue::SpscQueueOpcode::DATA));
+
+    FakeRegionView view2(layout.payload_bytes);
+    auto state2 = view2.state;
+    auto binding2 = make_binding(view2, layout);
+    Queue1 queue2(binding2, std::move(view2), test_clock());
+    spsc_queue::SpscQueueOutputReservation oversize{};
+    EXPECT_FALSE(queue2.output().reserve(layout.output_arena_bytes + 1, 0, oversize));
+    EXPECT_FALSE(oversize.valid);
+    EXPECT_EQ(queue2.error().kind, spsc_queue::SpscQueueErrorKind::NONE);
+    EXPECT_TRUE(queue2.live());
+    EXPECT_TRUE(state2->log.empty());
+    spsc_queue::SpscQueueOutputReservation ok{};
+    ASSERT_TRUE(queue2.output().try_reserve(8, ok));
+}
+
+TEST(RegionTemplateTest, ZeroTimeoutPreservesPreexistingTerminalError) {
+    reset_clock();
+    auto layout = make_layout(4, 64, 64);
+    FakeRegionView view(layout.payload_bytes);
+    auto state = view.state;
+    auto binding = make_binding(view, layout);
+    Queue1 queue(binding, std::move(view), test_clock());
+    plant_input(state.get(), layout, 1, spsc_queue::SpscQueueOpcode::ERROR, 0, nullptr);
+    spsc_queue::SpscQueueInputHandle handle{};
+    EXPECT_FALSE(queue.input().try_peek(handle));
+    EXPECT_EQ(queue.error().kind, spsc_queue::SpscQueueErrorKind::INVALID_DESCRIPTOR);
+    size_t log_before = state->log.size();
+    EXPECT_FALSE(queue.input().peek(0, handle));
+    spsc_queue::SpscQueueOutputReservation reserved{};
+    EXPECT_FALSE(queue.output().reserve(8, 0, reserved));
+    EXPECT_EQ(queue.error().kind, spsc_queue::SpscQueueErrorKind::INVALID_DESCRIPTOR);
+    EXPECT_NE(std::string(queue.error().message).find("invalid input opcode"), std::string::npos);
+    EXPECT_EQ(state->log.size(), log_before);
+}
+
+TEST(RegionTemplateTest, PublishStopPoisonsWithoutTailAdvance) {
+    reset_clock();
+    auto layout = make_layout(4, 64, 64);
+    FakeRegionView view(layout.payload_bytes);
+    auto state = view.state;
+    auto binding = make_binding(view, layout);
+    Queue1 queue(binding, std::move(view), test_clock());
+    spsc_queue::SpscQueueOutputReservation reserved{};
+    ASSERT_TRUE(queue.output().try_reserve(8, reserved));
+    EXPECT_FALSE(queue.output().publish(reserved, spsc_queue::SpscQueueOpcode::STOP));
+    EXPECT_EQ(queue.error().kind, spsc_queue::SpscQueueErrorKind::INVALID_DESCRIPTOR);
+    EXPECT_NE(std::string(queue.error().message).find("invalid output opcode"), std::string::npos);
+    EXPECT_EQ(count_notify(state->log, spsc_queue::kPeerAbortOffset), 1u);
+    EXPECT_FALSE(has_notify(state->log, layout.output_desc_tail_offset));
+    EXPECT_EQ(load_counter(state.get(), layout.output_desc_tail_offset), 0);
+    EXPECT_FALSE(queue.output().publish(reserved, spsc_queue::SpscQueueOpcode::DATA));
+    EXPECT_EQ(count_notify(state->log, spsc_queue::kPeerAbortOffset), 1u);
+    EXPECT_NE(std::string(queue.error().message).find("invalid output opcode"), std::string::npos);
+}
+
+TEST(RegionTemplateTest, InputPayloadOutsideArenaPoisonsWithoutPayloadRead) {
+    reset_clock();
+    auto layout = make_layout(4, 64, 64);
+    FakeRegionView view(layout.payload_bytes);
+    auto state = view.state;
+    auto binding = make_binding(view, layout);
+    Queue1 queue(binding, std::move(view), test_clock());
+    uint64_t outside = layout.input_arena_offset + layout.input_arena_bytes;
+    plant_descriptor(state.get(), layout.input_desc_offset, 1, spsc_queue::SpscQueueOpcode::DATA, outside, 8);
+    store_counter(state.get(), layout.input_desc_tail_offset, 1);
+    spsc_queue::SpscQueueInputHandle handle{};
+    handle.seq = 11;
+    EXPECT_FALSE(queue.input().try_peek(handle));
+    EXPECT_EQ(handle.seq, 0u);
+    EXPECT_EQ(queue.error().kind, spsc_queue::SpscQueueErrorKind::INVALID_DESCRIPTOR);
+    EXPECT_NE(std::string(queue.error().message).find("input payload out of arena"), std::string::npos);
+    for (const auto &entry : state->log) {
+        if (entry.kind == FakeAccessKind::PayloadRead) {
+            EXPECT_NE(entry.offset, outside);
+        }
+    }
+    EXPECT_EQ(count_notify(state->log, spsc_queue::kPeerAbortOffset), 1u);
+    EXPECT_FALSE(has_notify(state->log, layout.input_desc_head_offset));
+    EXPECT_FALSE(queue.input().try_peek(handle));
+    EXPECT_EQ(count_notify(state->log, spsc_queue::kPeerAbortOffset), 1u);
+}
+
+TEST(RegionTemplateTest, SecondNoncanonicalInputReplayPoisonsAndAbortNotifyFailureIsSecondary) {
+    reset_clock();
+    auto layout = make_layout(4, 64, 64);
+    FakeRegionView view(layout.payload_bytes);
+    auto state = view.state;
+    state->fail_peer_abort_notify = true;
+    auto binding = make_binding(view, layout);
+    Queue2 queue(binding, std::move(view), test_clock());
+    const char first[] = "12345678";
+    plant_input(state.get(), layout, 1, spsc_queue::SpscQueueOpcode::DATA, 8, first);
+    spsc_queue::SpscQueueInputHandle acquired{};
+    ASSERT_TRUE(queue.input().try_peek(acquired));
+    EXPECT_EQ(acquired.payload_offset, layout.input_arena_offset);
+    plant_descriptor(
+        state.get(), layout.input_desc_offset + spsc_queue::kDescriptorBytes, 2, spsc_queue::SpscQueueOpcode::DATA,
+        layout.input_arena_offset, 8
+    );
+    store_counter(state.get(), layout.input_desc_tail_offset, 2);
+    size_t arena_reads_before = 0;
+    for (const auto &entry : state->log) {
+        if (entry.kind == FakeAccessKind::PayloadRead && entry.offset == layout.input_arena_offset) {
+            arena_reads_before += 1;
+        }
+    }
+    spsc_queue::SpscQueueInputHandle second{};
+    EXPECT_FALSE(queue.input().try_peek(second));
+    EXPECT_EQ(second.seq, 0u);
+    EXPECT_EQ(queue.error().kind, spsc_queue::SpscQueueErrorKind::INVALID_DESCRIPTOR);
+    EXPECT_NE(std::string(queue.error().message).find("payload replay offset mismatch"), std::string::npos);
+    EXPECT_NE(std::string(queue.error().message).find("abort notify failed"), std::string::npos);
+    size_t arena_reads_after = 0;
+    for (const auto &entry : state->log) {
+        if (entry.kind == FakeAccessKind::PayloadRead && entry.offset == layout.input_arena_offset) {
+            arena_reads_after += 1;
+        }
+    }
+    EXPECT_EQ(arena_reads_after, arena_reads_before);
+    EXPECT_EQ(count_notify(state->log, spsc_queue::kPeerAbortOffset), 1u);
+    EXPECT_FALSE(has_notify(state->log, layout.input_desc_head_offset));
+    EXPECT_FALSE(queue.input().try_peek(second));
+    EXPECT_EQ(count_notify(state->log, spsc_queue::kPeerAbortOffset), 1u);
+    EXPECT_NE(std::string(queue.error().message).find("payload replay offset mismatch"), std::string::npos);
 }

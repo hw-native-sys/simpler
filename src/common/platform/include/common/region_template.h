@@ -232,7 +232,7 @@ inline bool decode_descriptor(const uint8_t *src, size_t nbytes, SpscQueueDescri
 
 inline bool encode_endpoint_binding(const SpscQueueEndpointBinding &binding, uint64_t *out, size_t count) {
     if (out == nullptr || count != kSpscQueueEndpointBindingScalarCount ||
-        binding.magic_version != kSpscQueueMagicVersion) {
+        binding.magic_version != kSpscQueueMagicVersion || binding.transaction_id == 0) {
         return false;
     }
     out[0] = binding.magic_version;
@@ -250,7 +250,7 @@ inline bool encode_endpoint_binding(const SpscQueueEndpointBinding &binding, uin
 
 inline bool decode_endpoint_binding(const uint64_t *scalars, size_t count, SpscQueueEndpointBinding *out) {
     if (scalars == nullptr || out == nullptr || count != kSpscQueueEndpointBindingScalarCount ||
-        scalars[0] != kSpscQueueMagicVersion) {
+        scalars[0] != kSpscQueueMagicVersion || scalars[2] == 0) {
         return false;
     }
     SpscQueueEndpointBinding decoded{
@@ -429,10 +429,6 @@ public:
                 return false;
             }
             if (timeout_ns == 0) {
-                parent_->set_error(
-                    SpscQueueErrorKind::BAD_ARGUMENT, SpscQueueOp::INPUT_TRY_PEEK,
-                    "blocking operations require a positive timeout"
-                );
                 return false;
             }
             uint64_t now = parent_->clock_.now_ns();
@@ -702,14 +698,10 @@ public:
             if (!parent_->ensure_live()) {
                 return false;
             }
-            if (nbytes > parent_->layout_.output_arena_bytes) {
+            if (timeout_ns == 0) {
                 return false;
             }
-            if (timeout_ns == 0) {
-                parent_->set_error(
-                    SpscQueueErrorKind::BAD_ARGUMENT, SpscQueueOp::OUTPUT_TRY_RESERVE,
-                    "blocking operations require a positive timeout"
-                );
+            if (nbytes > parent_->layout_.output_arena_bytes) {
                 return false;
             }
             uint64_t now = parent_->clock_.now_ns();
@@ -900,7 +892,7 @@ private:
     uint64_t owner_cookie() const { return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(this)); }
 
     void construct(const SpscQueueEndpointBinding &binding) {
-        if (binding.magic_version != kSpscQueueMagicVersion) {
+        if (binding.magic_version != kSpscQueueMagicVersion || binding.transaction_id == 0) {
             identity_trusted_ = false;
             set_error(SpscQueueErrorKind::BAD_BINDING, SpscQueueOp::INIT, "invalid queue binding");
             return;

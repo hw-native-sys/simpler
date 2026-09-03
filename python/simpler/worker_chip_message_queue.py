@@ -10,8 +10,10 @@
 
 from __future__ import annotations
 
+import operator
 from typing import Any
 
+from .buffer import AccessMode, Buffer
 from .comm_endpoints import DEVICE_AICPU, HOST_CPU, SingleOwner, _format_worker_path, at
 from .comm_provider import RegionPartKind
 from .comm_region_template import (
@@ -42,12 +44,76 @@ WorkerChipQueueMessage = _SpscQueueMessage
 WorkerChipQueueLayout = _SpscQueueLayout
 
 
+def _require_worker_chip_id(value: object) -> int:
+    if type(value) is bool:
+        raise TypeError("worker_id must not be bool")
+    try:
+        return operator.index(value)
+    except TypeError as exc:
+        raise TypeError("worker_id must support operator.index()") from exc
+
+
+def _admit_bytes_like(obj: object, nbytes: int, *, writable: bool) -> object:
+    try:
+        view = memoryview(obj)
+    except TypeError as exc:
+        raise ValueError("worker-chip queue requires a registered HOST Buffer or contiguous host buffer") from exc
+    if not view.c_contiguous:
+        raise ValueError("worker-chip queue ordinary host buffer must be C-contiguous")
+    if writable and view.readonly:
+        raise ValueError("worker-chip queue output target must be writable")
+    if int(view.nbytes) < int(nbytes):
+        raise ValueError(
+            f"worker-chip queue nbytes={int(nbytes)} exceeds ordinary host buffer size {int(view.nbytes)}"
+        )
+    return obj
+
+
+def _admit_registered_buffer(worker: Any, obj: Buffer, nbytes: int, *, writable: bool) -> Buffer:
+    if obj.closed:
+        raise ValueError("worker-chip queue buffer is closed")
+    worker._validate_worker_chip_orch_comm_host_buffer(obj)
+    needed = AccessMode.WRITE if writable else AccessMode.READ
+    if obj.access not in (needed, AccessMode.READWRITE):
+        raise ValueError(
+            f"worker-chip queue buffer grants {obj.access.name} but this direction needs {needed.name}"
+        )
+    if int(obj.nbytes) < int(nbytes):
+        raise ValueError(f"worker-chip queue nbytes={int(nbytes)} exceeds registered buffer size {int(obj.nbytes)}")
+    return obj
+
+
+def _admit_worker_chip_payload(
+    worker: Any, obj: object, nbytes: int, *, writable: bool, allow_none: bool
+) -> object:
+    if int(nbytes) == 0:
+        if allow_none:
+            if obj is not None:
+                raise ValueError("worker-chip queue zero-byte payload requires buffer == None")
+            return None
+    if obj is None:
+        raise ValueError("worker-chip queue nonzero payload requires a host buffer")
+    if isinstance(obj, Buffer):
+        return _admit_registered_buffer(worker, obj, nbytes, writable=writable)
+    return _admit_bytes_like(obj, nbytes, writable=writable)
+
+
+def _admit_worker_chip_payload_kind(worker: Any, obj: object, *, writable: bool) -> None:
+    if obj is None:
+        return
+    _admit_worker_chip_payload(worker, obj, 0, writable=writable, allow_none=False)
+
+
+def _require_live_bound_queue(lane: Any) -> None:
+    lane._queue._ensure_usable()
+
+
 def make_worker_chip_queue_layout(depth: int, input_arena_bytes: int, output_arena_bytes: int) -> _SpscQueueLayout:
     return _SpscQueueLayout.create(
         _SpscQueueConfig(
-            depth=int(depth),
-            input_arena_bytes=int(input_arena_bytes),
-            output_arena_bytes=int(output_arena_bytes),
+            depth=depth,
+            input_arena_bytes=input_arena_bytes,
+            output_arena_bytes=output_arena_bytes,
         )
     )
 
@@ -55,15 +121,16 @@ def make_worker_chip_queue_layout(depth: int, input_arena_bytes: int, output_are
 def create_worker_chip_queue(
     orch: Any,
     *,
-    worker_id: int,
-    depth: int,
-    input_arena_bytes: int,
-    output_arena_bytes: int,
+    worker_id: object,
+    depth: object,
+    input_arena_bytes: object,
+    output_arena_bytes: object,
 ) -> WorkerChipQueue:
     worker = orch._worker
-    worker._validate_worker_chip_id(int(worker_id))
+    worker_id = _require_worker_chip_id(worker_id)
+    worker._validate_worker_chip_id(worker_id)
     root_path = _format_worker_path(int(worker.level))
-    provider_path = _format_worker_path(2, parent_path=root_path, index=int(worker_id))
+    provider_path = _format_worker_path(2, parent_path=root_path, index=worker_id)
     host = at(root_path, HOST_CPU)
     peer = at(provider_path, DEVICE_AICPU)
     placement = _RegionTemplatePlacementRequest(
@@ -75,9 +142,9 @@ def create_worker_chip_queue(
         ),
     )
     config = _SpscQueueConfig(
-        depth=int(depth),
-        input_arena_bytes=int(input_arena_bytes),
-        output_arena_bytes=int(output_arena_bytes),
+        depth=depth,
+        input_arena_bytes=input_arena_bytes,
+        output_arena_bytes=output_arena_bytes,
     )
     return _RegionTemplateCoordinator(worker).create(
         template=_SpscQueueTemplate(),
@@ -97,15 +164,82 @@ def _project_worker_chip_queue(worker: Any, bound: object) -> WorkerChipQueue:
         raise RuntimeError("worker-chip queue projector requires PAYLOAD and COUNTER local views")
     desc = worker_chip_orch_region_desc_from_local_views(instance.provider_resource_id, payload_view, counter_view)
     region = WorkerChipOrchRegion(worker, instance, desc)
-    return WorkerChipQueue(bound, region)
+    return WorkerChipQueue(worker, bound, region)
+
+
+class _WorkerChipQueueInput:
+    def __init__(self, worker: Any, bound: _BoundSpscQueue) -> None:
+        self._worker = worker
+        self._lane = bound.input
+
+    def try_enqueue(self, buffer_or_none: object, nbytes: int) -> bool:
+        _require_live_bound_queue(self._lane)
+        admitted = _admit_worker_chip_payload(
+            self._worker, buffer_or_none, nbytes, writable=False, allow_none=True
+        )
+        return self._lane.try_enqueue(admitted, nbytes)
+
+    def enqueue(self, buffer_or_none: object, nbytes: int, timeout: float) -> None:
+        _require_live_bound_queue(self._lane)
+        admitted = _admit_worker_chip_payload(
+            self._worker, buffer_or_none, nbytes, writable=False, allow_none=True
+        )
+        self._lane.enqueue(admitted, nbytes, timeout)
+
+
+class _WorkerChipQueueOutput:
+    def __init__(self, worker: Any, bound: _BoundSpscQueue) -> None:
+        self._worker = worker
+        self._lane = bound.output
+
+    def try_peek(self) -> _SpscQueueMessage | None:
+        return self._lane.try_peek()
+
+    def peek(self, timeout: float) -> _SpscQueueMessage:
+        return self._lane.peek(timeout)
+
+    def read_into(self, handle: _SpscQueueMessage, buffer: object) -> None:
+        _require_live_bound_queue(self._lane)
+        self._lane._require_active_handle(handle, ownership_violation=True)
+        admitted = _admit_worker_chip_payload(
+            self._worker, buffer, handle.payload_nbytes, writable=True, allow_none=True
+        )
+        self._lane.read_into(handle, admitted)
+
+    def release(self, handle: _SpscQueueMessage) -> None:
+        self._lane.release(handle)
+
+    def dequeue_into(self, buffer: object, timeout: float) -> _SpscQueueMessage:
+        _require_live_bound_queue(self._lane)
+        _admit_worker_chip_payload_kind(self._worker, buffer, writable=True)
+        handle = self._lane.peek(timeout)
+        admitted = _admit_worker_chip_payload(
+            self._worker, buffer, handle.payload_nbytes, writable=True, allow_none=True
+        )
+        self._lane.read_into(handle, admitted)
+        self._lane.release(handle)
+        return handle
+
+    def try_dequeue_into(self, buffer: object) -> _SpscQueueMessage | None:
+        _require_live_bound_queue(self._lane)
+        _admit_worker_chip_payload_kind(self._worker, buffer, writable=True)
+        handle = self._lane.try_peek()
+        if handle is None:
+            return None
+        admitted = _admit_worker_chip_payload(
+            self._worker, buffer, handle.payload_nbytes, writable=True, allow_none=True
+        )
+        self._lane.read_into(handle, admitted)
+        self._lane.release(handle)
+        return handle
 
 
 class WorkerChipQueue:
-    def __init__(self, bound: _BoundSpscQueue, region: WorkerChipOrchRegion) -> None:
+    def __init__(self, worker: Any, bound: _BoundSpscQueue, region: WorkerChipOrchRegion) -> None:
         self._bound = bound
         self._region = region
-        self.input = bound.input
-        self.output = bound.output
+        self.input = _WorkerChipQueueInput(worker, bound)
+        self.output = _WorkerChipQueueOutput(worker, bound)
 
     @property
     def region(self) -> WorkerChipOrchRegion:
