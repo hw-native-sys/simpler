@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import operator
-from typing import Any
+from typing import Any, SupportsIndex, cast
 
 from .buffer import AccessMode, Buffer
 from .comm_endpoints import DEVICE_AICPU, HOST_CPU, SingleOwner, _format_worker_path, at
@@ -48,12 +48,12 @@ def _require_worker_chip_id(value: object) -> int:
     if type(value) is bool:
         raise TypeError("worker_id must not be bool")
     try:
-        return operator.index(value)
+        return operator.index(cast(SupportsIndex, value))
     except TypeError as exc:
         raise TypeError("worker_id must support operator.index()") from exc
 
 
-def _admit_bytes_like(obj: object, nbytes: int, *, writable: bool) -> object:
+def _admit_bytes_like(obj: Any, nbytes: int, *, writable: bool) -> object:
     try:
         view = memoryview(obj)
     except TypeError as exc:
@@ -63,9 +63,7 @@ def _admit_bytes_like(obj: object, nbytes: int, *, writable: bool) -> object:
     if writable and view.readonly:
         raise ValueError("worker-chip queue output target must be writable")
     if int(view.nbytes) < int(nbytes):
-        raise ValueError(
-            f"worker-chip queue nbytes={int(nbytes)} exceeds ordinary host buffer size {int(view.nbytes)}"
-        )
+        raise ValueError(f"worker-chip queue nbytes={int(nbytes)} exceeds ordinary host buffer size {int(view.nbytes)}")
     return obj
 
 
@@ -75,17 +73,13 @@ def _admit_registered_buffer(worker: Any, obj: Buffer, nbytes: int, *, writable:
     worker._validate_worker_chip_orch_comm_host_buffer(obj)
     needed = AccessMode.WRITE if writable else AccessMode.READ
     if obj.access not in (needed, AccessMode.READWRITE):
-        raise ValueError(
-            f"worker-chip queue buffer grants {obj.access.name} but this direction needs {needed.name}"
-        )
+        raise ValueError(f"worker-chip queue buffer grants {obj.access.name} but this direction needs {needed.name}")
     if int(obj.nbytes) < int(nbytes):
         raise ValueError(f"worker-chip queue nbytes={int(nbytes)} exceeds registered buffer size {int(obj.nbytes)}")
     return obj
 
 
-def _admit_worker_chip_payload(
-    worker: Any, obj: object, nbytes: int, *, writable: bool, allow_none: bool
-) -> object:
+def _admit_worker_chip_payload(worker: Any, obj: object, nbytes: int, *, writable: bool, allow_none: bool) -> object:
     if int(nbytes) == 0:
         if allow_none:
             if obj is not None:
@@ -108,7 +102,9 @@ def _require_live_bound_queue(lane: Any) -> None:
     lane._queue._ensure_usable()
 
 
-def make_worker_chip_queue_layout(depth: int, input_arena_bytes: int, output_arena_bytes: int) -> _SpscQueueLayout:
+def make_worker_chip_queue_layout(
+    depth: object, input_arena_bytes: object, output_arena_bytes: object
+) -> _SpscQueueLayout:
     return _SpscQueueLayout.create(
         _SpscQueueConfig(
             depth=depth,
@@ -174,16 +170,12 @@ class _WorkerChipQueueInput:
 
     def try_enqueue(self, buffer_or_none: object, nbytes: int) -> bool:
         _require_live_bound_queue(self._lane)
-        admitted = _admit_worker_chip_payload(
-            self._worker, buffer_or_none, nbytes, writable=False, allow_none=True
-        )
+        admitted = _admit_worker_chip_payload(self._worker, buffer_or_none, nbytes, writable=False, allow_none=True)
         return self._lane.try_enqueue(admitted, nbytes)
 
     def enqueue(self, buffer_or_none: object, nbytes: int, timeout: float) -> None:
         _require_live_bound_queue(self._lane)
-        admitted = _admit_worker_chip_payload(
-            self._worker, buffer_or_none, nbytes, writable=False, allow_none=True
-        )
+        admitted = _admit_worker_chip_payload(self._worker, buffer_or_none, nbytes, writable=False, allow_none=True)
         self._lane.enqueue(admitted, nbytes, timeout)
 
 

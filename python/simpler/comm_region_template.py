@@ -154,9 +154,9 @@ def decode_spsc_queue_descriptor(data: bytes) -> tuple[int, int, int, int]:
 
 @dataclass(frozen=True)
 class _SpscQueueConfig:
-    depth: int
-    input_arena_bytes: int
-    output_arena_bytes: int
+    depth: object
+    input_arena_bytes: object
+    output_arena_bytes: object
 
 
 @dataclass(frozen=True)
@@ -350,7 +350,8 @@ class _ResolvedTemplateSlots:
 
 
 class _RegionTemplate(Protocol):
-    required_slots: Sequence[Enum]
+    @property
+    def required_slots(self) -> Sequence[Enum]: ...
 
     def plan(self, config: object) -> _RegionTemplatePlan: ...
 
@@ -420,7 +421,7 @@ def _require_distinct_initiator_peer(slots: _ResolvedTemplateSlots) -> tuple[End
 
 
 class _SpscQueueTemplate:
-    required_slots = (_SpscQueueSlot.INITIATOR, _SpscQueueSlot.PEER)
+    required_slots: Sequence[Enum] = (_SpscQueueSlot.INITIATOR, _SpscQueueSlot.PEER)
 
     def plan(self, config: object) -> _SpscQueuePlan:
         if not isinstance(config, _SpscQueueConfig):

@@ -657,7 +657,9 @@ class Orchestrator:
         with self._control_admission("create_worker_chip_region"):
             return self._worker._create_worker_chip_region(int(worker_id), int(payload_bytes), int(counter_bytes))
 
-    def create_worker_chip_queue(self, *, worker_id: int, depth: int, input_arena_bytes: int, output_arena_bytes: int):
+    def create_worker_chip_queue(
+        self, *, worker_id: object, depth: object, input_arena_bytes: object, output_arena_bytes: object
+    ):
         """Create an L3-L2 message queue on one NEXT_LEVEL chip worker."""
         if self._worker is None:
             raise RuntimeError("create_worker_chip_queue requires an Orchestrator bound to a Worker")

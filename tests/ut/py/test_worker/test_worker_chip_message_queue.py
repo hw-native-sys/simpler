@@ -1098,9 +1098,7 @@ def test_layout_and_factory_reject_non_exact_ints_before_materialization(monkeyp
         with pytest.raises(TypeError):
             orch.create_worker_chip_queue(worker_id=0, depth=4.0, input_arena_bytes=128, output_arena_bytes=128)
         with pytest.raises(TypeError):
-            orch.create_worker_chip_queue(
-                worker_id=0, depth=_IntOnly(), input_arena_bytes=128, output_arena_bytes=128
-            )
+            orch.create_worker_chip_queue(worker_id=0, depth=_IntOnly(), input_arena_bytes=128, output_arena_bytes=128)
         with pytest.raises(TypeError):
             orch.create_worker_chip_queue(
                 worker_id=0, depth=_IndexOnly(4), input_arena_bytes=128, output_arena_bytes=128
@@ -1223,9 +1221,7 @@ def test_payload_admission_preserves_terminal_and_ownership_errors():
 
         orch2, worker2, shm2, fake_client2 = _make_orchestrator()
         try:
-            queue2 = orch2.create_worker_chip_queue(
-                worker_id=0, depth=4, input_arena_bytes=128, output_arena_bytes=128
-            )
+            queue2 = orch2.create_worker_chip_queue(worker_id=0, depth=4, input_arena_bytes=128, output_arena_bytes=128)
             _publish_output(fake_client2, queue2, payload=b"abcdefghijklmnop")
             handle = queue2.output.peek(timeout=0.001)
             forged = WorkerChipQueueMessage(handle.seq, handle.opcode, handle.payload_offset, handle.payload_nbytes)

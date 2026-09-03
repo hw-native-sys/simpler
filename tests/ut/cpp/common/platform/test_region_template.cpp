@@ -72,9 +72,11 @@ TEST(RegionTemplateTest, PackedMagicVersionIsSpsqAbi10) {
 TEST(RegionTemplateTest, LayoutGoldenVectors) {
     for (const auto &test_case : kLayoutGolden) {
         spsc_queue::SpscQueueLayout layout{};
-        ASSERT_TRUE(spsc_queue::SpscQueueLayout::create(
-            test_case.depth, test_case.input_arena_bytes, test_case.output_arena_bytes, &layout
-        ));
+        ASSERT_TRUE(
+            spsc_queue::SpscQueueLayout::create(
+                test_case.depth, test_case.input_arena_bytes, test_case.output_arena_bytes, &layout
+            )
+        );
         EXPECT_EQ(layout.input_desc_offset, 0u);
         EXPECT_EQ(layout.output_desc_offset, test_case.output_desc_offset);
         EXPECT_EQ(layout.input_arena_offset, test_case.input_arena_offset);
@@ -329,7 +331,8 @@ struct FakeRegionView {
 
         bool read(uint64_t offset, uint64_t nbytes, spsc_queue::SpscQueuePayloadView &out) {
             out = spsc_queue::SpscQueuePayloadView{0, 0};
-            view_->state->log.push_back(FakeAccess{FakeAccessKind::PayloadRead, offset, nbytes, 0, RegionWaitCmp::EQ, 0}
+            view_->state->log.push_back(
+                FakeAccess{FakeAccessKind::PayloadRead, offset, nbytes, 0, RegionWaitCmp::EQ, 0}
             );
             if (view_->state->sticky_failed) {
                 return false;

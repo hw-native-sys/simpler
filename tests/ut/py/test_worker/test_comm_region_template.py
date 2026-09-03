@@ -16,6 +16,7 @@ import inspect
 import pickle
 import struct
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -702,7 +703,7 @@ class _GenericTemplatePlan:
 
 
 class _GenericTemplate:
-    required_slots = (
+    required_slots: Sequence[Enum] = (
         _GenericTemplateSlot.ALPHA,
         _GenericTemplateSlot.BETA,
         _GenericTemplateSlot.GAMMA,
@@ -1209,6 +1210,7 @@ def test_coordinator_creates_generic_three_slot_template(region_worker):
         placement=_generic_placement(host, peer),
         result_projector=lambda bound: bound,
     )
+    assert isinstance(result, dict)
     assert result["alpha"].path == "L3"
     assert result["beta"].path == "L3/L2[1]"
     assert result["gamma"].path == "L3"
@@ -1374,6 +1376,7 @@ def test_output_exact_fit_true_wrap_and_zero_byte_replay():
     out = queue._layout.output_arena_offset
     _plant_output_descriptor(region, queue, 1, SpscQueueOpcode.DATA, out, b"x" * 56)
     handle = queue.output.try_peek()
+    assert handle is not None
     queue.output.release(handle)
     _plant_output_descriptor(region, queue, 2, SpscQueueOpcode.DATA, out + 56, b"yz123456")
     handle = queue.output.try_peek()
