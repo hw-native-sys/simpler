@@ -244,6 +244,7 @@ def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
             {},
             {},
             worker_mod.mint_owner_instance_id(),
+            {},
             platform="a2a3",
             runtime="tensormap_and_ringbuffer",
         )
@@ -1855,6 +1856,122 @@ def _unique_chip_callable(index: int):
 # ---------------------------------------------------------------------------
 # Test: lifecycle (init / close without submitting any tasks)
 # ---------------------------------------------------------------------------
+
+
+class TestChipControlExtensions:
+    def test_registration_is_idempotent_only_for_the_same_handler(self, monkeypatch):
+        monkeypatch.setattr(worker_mod, "_chip_control_extensions", {})
+
+        def first(_chip_worker, _payload, _device_id):
+            return None
+
+        def second(_chip_worker, _payload, _device_id):
+            return None
+
+        worker_mod.register_chip_control_extension("test.extension", first)
+        worker_mod.register_chip_control_extension("test.extension", first)
+        with pytest.raises(ValueError, match="already registered"):
+            worker_mod.register_chip_control_extension("test.extension", second)
+
+    @pytest.mark.parametrize("level", (2, 4))
+    def test_only_level_three_is_supported(self, level):
+        worker = Worker(level=level)
+        with pytest.raises(TypeError, match="level-3 Worker"):
+            worker.run_chip_control_extension("test.extension", b"")
+
+    def test_default_timeout_and_child_errors_are_forwarded(self, monkeypatch):
+        calls = []
+
+        class FakeWorker:
+            def broadcast_control_all(self, worker_type, sub_cmd, payload, digest, timeout_s):
+                calls.append((worker_type, sub_cmd, payload, digest, timeout_s))
+                return [_FakeControlResult("NEXT_LEVEL", 0, False, "injected extension failure")]
+
+        worker = Worker(level=3, py_control_timeout_s=7.25)
+        worker._lifecycle = worker_mod._Lifecycle.READY
+        worker._worker = FakeWorker()
+        worker._chip_control_extension_names = frozenset({"test.extension"})
+        monkeypatch.setattr(
+            worker,
+            "_device_control_admission",
+            lambda _api: worker_mod.contextlib.nullcontext(),
+        )
+
+        with pytest.raises(RuntimeError, match="injected extension failure"):
+            worker.run_chip_control_extension("test.extension", b"payload")
+
+        assert calls[0][0] is WorkerType.NEXT_LEVEL
+        assert calls[0][1] == worker_mod._CTRL_CHIP_EXTENSION
+        assert calls[0][3] is None
+        assert calls[0][4] == 7.25
+        name_size = worker_mod._CHIP_EXTENSION_HEADER.unpack_from(calls[0][2])[0]
+        name_start = worker_mod._CHIP_EXTENSION_HEADER.size
+        assert calls[0][2][name_start : name_start + name_size] == b"test.extension"
+        assert calls[0][2][name_start + name_size :] == b"payload"
+
+    def test_rejects_unbounded_timeout(self, monkeypatch):
+        worker = Worker(level=3)
+        worker._lifecycle = worker_mod._Lifecycle.READY
+        worker._worker = cast(Any, object())
+        worker._chip_control_extension_names = frozenset({"test.extension"})
+        monkeypatch.setattr(
+            worker,
+            "_device_control_admission",
+            lambda _api: worker_mod.contextlib.nullcontext(),
+        )
+
+        for timeout_s in (0.0, -1.0, float("inf"), float("nan")):
+            with pytest.raises(ValueError, match="positive finite"):
+                worker.run_chip_control_extension("test.extension", b"payload", timeout_s=timeout_s)
+
+    @requires_sim_binaries
+    def test_registered_handler_runs_in_every_chip_child_and_registry_is_frozen(self, monkeypatch):
+        monkeypatch.setattr(worker_mod, "_chip_control_extensions", {})
+        observed = SharedMemory(create=True, size=8)
+        observed_buf = observed.buf
+        assert observed_buf is not None
+        observed_buf[:] = bytes(8)
+
+        try:
+            with fake_chip_l3(monkeypatch, device_ids=(0, 1), init=False) as worker:
+
+                def handler(chip_worker, payload, device_id):
+                    if chip_worker.pipeline_depth != 1 or payload != b"payload":
+                        return "handler arguments did not match"
+                    struct.pack_into("i", observed_buf, int(device_id) * 4, int(device_id) + 1)
+                    return None
+
+                worker_mod.register_chip_control_extension("test.inherited", handler)
+                worker.init()
+                worker.run_chip_control_extension("test.inherited", b"payload")
+                assert struct.unpack_from("ii", observed_buf) == (1, 2)
+
+                worker_mod.register_chip_control_extension("test.late", handler)
+                with pytest.raises(KeyError, match="before this Worker.init"):
+                    worker.run_chip_control_extension("test.late", b"payload")
+        finally:
+            observed_buf.release()
+            observed.close()
+            observed.unlink()
+
+    @requires_sim_binaries
+    def test_handler_return_and_exception_propagate_from_chip_child(self, monkeypatch):
+        monkeypatch.setattr(worker_mod, "_chip_control_extensions", {})
+
+        def returns_error(_chip_worker, _payload, _device_id):
+            return "returned extension failure"
+
+        def raises_error(_chip_worker, _payload, _device_id):
+            raise RuntimeError("raised extension failure")
+
+        with fake_chip_l3(monkeypatch, init=False) as worker:
+            worker_mod.register_chip_control_extension("test.return", returns_error)
+            worker_mod.register_chip_control_extension("test.raise", raises_error)
+            worker.init()
+            with pytest.raises(RuntimeError, match="returned extension failure"):
+                worker.run_chip_control_extension("test.return", b"payload")
+            with pytest.raises(RuntimeError, match="raised extension failure"):
+                worker.run_chip_control_extension("test.raise", b"payload")
 
 
 class TestLifecycle:

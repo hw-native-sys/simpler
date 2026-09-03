@@ -14,7 +14,7 @@ types live in `simpler.task_interface`. Both resolve on first access, so
 extension.
 
 ```python
-from simpler import Worker           # or: from simpler.worker import Worker
+from simpler import Worker, register_chip_control_extension
 from simpler.task_interface import (
     ArgDirection, CallConfig, ChipCallable, ChipStorageTaskArgs,
     ChipTensor, CoreCallable, DataType, TaskArgs, TaskHandle,
@@ -38,6 +38,7 @@ into `**config` and validated later. The recognized keys:
 | `device_id` | L2 | the single chip this worker drives |
 | `device_ids` | L3+ | one chip child process per entry |
 | `num_sub_workers` | L3+ | host-side Python callables to fork |
+| `py_control_timeout_s` | L3+ | finite timeout for Python control-plane operations; defaults to 30 seconds |
 | `enable_sdma` | a2a3 | provisions the SDMA workspace; defaults to `False` |
 | `heap_ring_size` | all | heap ring sizing |
 | `remote_heap_ring_size`, `remote_session_timeout_s` | L4 | remote-session sizing and timeout |
@@ -55,6 +56,41 @@ else raises. Remote-worker and remote-memory calls require `level >= 4`.
 | `add_remote_worker(spec: RemoteWorkerSpec) -> int` | L4; see the remote-L3 design doc |
 | `init(prewarm_config=None)` | Resolves runtime binaries, opens the device, forks children. First place setup errors appear |
 | `close()` | Releases the device and reaps children. Put it in a `finally` — a skipped `close()` leaves the device held |
+
+### Chip-control extensions
+
+Chip-control extensions let a trusted integration run a short synchronous
+control operation inside every chip-child process owned by one L3 Worker. They
+are not available on L2 or L4+ Workers.
+
+```python
+def handler(chip_worker, payload: bytes, device_id: int):
+    ...
+    return None
+
+register_chip_control_extension("my-extension", handler)
+worker = Worker(level=3, ..., py_control_timeout_s=30.0)
+worker.init()
+worker.run_chip_control_extension("my-extension", b"request")
+```
+
+Registration must happen before that Worker's `init()`. The Worker snapshots
+the process-wide registry when startup begins, and every chip child receives
+the same snapshot. Registering another name later affects only Workers whose
+`init()` has not started.
+
+The handler receives the child-local `ChipWorker`, an immutable payload, and
+the physical device id. Returning `None` or another false value succeeds;
+returning a true value reports its string form as an error. Raising also fails
+the operation. Handlers run synchronously while ordinary runs are excluded, so
+they must return promptly or move long-running work to an asynchronous service.
+`timeout_s=None` uses the Worker's finite `py_control_timeout_s`; an explicit
+timeout must also be positive and finite.
+
+The call broadcasts concurrently and returns only after every chip child has
+responded. If some handlers succeed and another fails, the successful effects
+are not rolled back; the caller receives one aggregated `RuntimeError` naming
+the first reported child error.
 
 ### Memory
 

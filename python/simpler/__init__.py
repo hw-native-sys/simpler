@@ -37,6 +37,7 @@ from ._log import (
 __all__ = [
     "DEFAULT_THRESHOLD",
     "Worker",
+    "register_chip_control_extension",
     "NUL",
     "TIMING",
     "get_current_config",
@@ -46,7 +47,13 @@ __all__ = [
 ]
 
 # name -> (module, attribute). Resolved by __getattr__ on first access.
-_LAZY_ATTRS = {"Worker": (f"{__name__}.worker", "Worker")}
+_LAZY_ATTRS = {
+    "Worker": (f"{__name__}.worker", "Worker"),
+    "register_chip_control_extension": (
+        f"{__name__}.worker",
+        "register_chip_control_extension",
+    ),
+}
 _LAZY_SUBMODULES = ("comm_endpoints", "task_interface")
 
 

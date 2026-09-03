@@ -630,6 +630,26 @@ _CTRL_DELEGATED_REGION = 26
 _LOCAL_GLOBAL_CONTROL_HEADER = struct.Struct("<IIQ")
 _CTRL_OP_NAMES[_CTRL_GLOBAL_DOMAIN_NODE] = "global_domain"
 _CTRL_OP_NAMES[_CTRL_DELEGATED_REGION] = "delegated_region"
+_CTRL_CHIP_EXTENSION = 27
+_CTRL_OP_NAMES[_CTRL_CHIP_EXTENSION] = "chip_extension"
+
+_CHIP_EXTENSION_HEADER = struct.Struct("!H")
+_chip_control_extensions: dict[str, Any] = {}
+_chip_control_extensions_lock = threading.Lock()
+
+
+def register_chip_control_extension(name: str, handler) -> None:
+    """Register a trusted handler for level-3 Workers created by a later ``init()``."""
+    if not isinstance(name, str) or not name or len(name.encode("utf-8")) > 255:
+        raise ValueError("chip control extension name must contain 1 to 255 UTF-8 bytes")
+    if not callable(handler):
+        raise TypeError("chip control extension handler must be callable")
+    with _chip_control_extensions_lock:
+        existing = _chip_control_extensions.get(name)
+        if existing is not None and existing is not handler:
+            raise ValueError(f"chip control extension {name!r} is already registered")
+        _chip_control_extensions[name] = handler
+
 
 # Layout of the CTRL_COMM_INIT request shm.
 _COMM_INIT_HEADER = struct.Struct("<II")  # rank (u32), nranks (u32)
@@ -1683,6 +1703,34 @@ def _read_ctrl_staged_shm_name(buf: memoryview) -> str:
     raw = bytes(buf[_OFF_ARGS : _OFF_ARGS + _CTRL_SHM_NAME_BYTES])
     nul = raw.find(b"\x00")
     return raw[: nul if nul >= 0 else _CTRL_SHM_NAME_BYTES].decode("utf-8", "replace")
+
+
+def _read_ctrl_staged_payload(buf: memoryview) -> bytes:
+    staged, payload, payload_size = _open_ctrl_payload(buf, what="chip control extension")
+    try:
+        return bytes(payload[:payload_size])
+    finally:
+        payload.release()
+        staged.close()
+
+
+def _handle_chip_control_extension(
+    cw: ChipWorker, buf: memoryview, device_id: int, extensions: dict[str, Any]
+) -> None:
+    envelope = _read_ctrl_staged_payload(buf)
+    if len(envelope) < _CHIP_EXTENSION_HEADER.size:
+        raise ValueError("chip control extension envelope is truncated")
+    (name_size,) = _CHIP_EXTENSION_HEADER.unpack_from(envelope)
+    name_end = _CHIP_EXTENSION_HEADER.size + name_size
+    if name_size == 0 or name_end > len(envelope):
+        raise ValueError("chip control extension name is invalid")
+    name = envelope[_CHIP_EXTENSION_HEADER.size : name_end].decode("utf-8")
+    handler = extensions.get(name)
+    if handler is None:
+        raise KeyError(f"chip control extension {name!r} was not registered before Worker.init()")
+    error = handler(cw, envelope[name_end:], device_id)
+    if error:
+        raise RuntimeError(str(error))
 
 
 def _allocate_local_slot(registry: dict[int, Any]) -> int:
@@ -2797,6 +2845,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
     identity_table: dict[bytes, int],
     identity_refs: dict[bytes, int],
     owner_instance_id: bytes,
+    chip_control_extensions: dict[str, Any],
     *,
     chip_platform: str,
     chip_runtime: str = "",
@@ -3006,6 +3055,8 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             elif sub_cmd == _CTRL_DEVICE_MEMORY_INFO:
                 info = cw.device_memory_info()
                 _DEVICE_MEMORY_INFO.pack_into(buf, _CTRL_OFF_RESULT, info.free_bytes, info.total_bytes)
+            elif sub_cmd == _CTRL_CHIP_EXTENSION:
+                _handle_chip_control_extension(cw, buf, device_id, chip_control_extensions)
             elif sub_cmd == _CTRL_IMPORT_RELEASE:
                 import_registry.unregister(_unpack_identity_wire(_read_control_digest(buf)))
             elif sub_cmd == CTRL_GLOBAL_DOMAIN_PREPARE:
@@ -3306,6 +3357,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     identity_table: dict[bytes, int],
     identity_refs: dict[bytes, int],
     owner_instance_id: bytes,
+    chip_control_extensions: dict[str, Any],
     log_level: int = 25,
     platform: str = "",
     runtime: str = "",
@@ -3384,6 +3436,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             identity_table,
             identity_refs,
             owner_instance_id,
+            chip_control_extensions,
             chip_platform=platform,
             chip_runtime=runtime,
             prepared=prepared,
@@ -4526,6 +4579,7 @@ class Worker:
         self._registry_lock = threading.Lock()
         self._pending_unregister_cids: set[int] = set()
         self._pending_remote_unregister_hashids: set[bytes] = set()
+        self._chip_control_extension_names: frozenset[str] = frozenset()
         self._py_control_timeout_s = float(config.get("py_control_timeout_s", _PY_CONTROL_TIMEOUT_S))
         # Upper bound on how long the readiness barrier waits for a forked child
         # to report INIT_READY/INIT_FAILED before treating it as hung. Must be
@@ -7890,6 +7944,12 @@ class Worker:
                 (digest, state.target, state.ref_count, state.kind, state.target_namespace)
                 for digest, state in self._identity_registry.items()
             ]
+        if self.level == 3:
+            with _chip_control_extensions_lock:
+                chip_control_extensions = dict(_chip_control_extensions)
+            self._chip_control_extension_names = frozenset(chip_control_extensions)
+        else:
+            chip_control_extensions = {}
 
         # Seed this process's logger before the first fork: the spans its own
         # scheduler emits obey the Python logger level, and every child inherits
@@ -7986,6 +8046,7 @@ class Worker:
                                 target_namespace="LOCAL_CHIP",
                             ),
                             self._owner_instance_id,
+                            chip_control_extensions,
                             log_level=chip_log_level,
                             platform=str(self._config["platform"]),
                             runtime=str(self._config["runtime"]),
@@ -10583,6 +10644,39 @@ class Worker:
         nbytes = max(0, host_nbytes - host_offset) if nbytes is None else int(nbytes)
         _require_copy_span(host_nbytes, host_offset, nbytes, side=host_side, api=api)
         return device_offset, host_offset, nbytes
+
+    def run_chip_control_extension(
+        self,
+        name: str,
+        payload: bytes,
+        *,
+        timeout_s: float | None = None,
+    ) -> None:
+        """Run a registered extension synchronously in every level-3 chip child."""
+        if self.level != 3:
+            raise TypeError("chip control extensions require a level-3 Worker")
+        with self._operation_lease("run_chip_control_extension"):
+            assert self._worker is not None
+            if name not in self._chip_control_extension_names:
+                raise KeyError(f"chip control extension {name!r} was not registered before this Worker.init()")
+            name_bytes = name.encode("utf-8")
+            envelope = _CHIP_EXTENSION_HEADER.pack(len(name_bytes)) + name_bytes + bytes(payload)
+            effective_timeout_s = self._py_control_timeout_s if timeout_s is None else float(timeout_s)
+            if not (effective_timeout_s > 0 and math.isfinite(effective_timeout_s)):
+                raise ValueError("chip control extension timeout_s must be a positive finite number of seconds")
+            with self._device_control_admission("run_chip_control_extension"):
+                results = self._worker.broadcast_control_all(
+                    WorkerType.NEXT_LEVEL,
+                    _CTRL_CHIP_EXTENSION,
+                    envelope,
+                    None,
+                    timeout_s=effective_timeout_s,
+                )
+            errors = self._control_errors(list(results))
+            if errors:
+                raise RuntimeError(
+                    f"chip control extension {name!r} failed on {len(errors)} child workers; first error: {errors[0]}"
+                )
 
     @staticmethod
     def _require_device_end(handle: Buffer, *, api: str) -> None:
