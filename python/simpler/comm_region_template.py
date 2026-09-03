@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Internal Region Template types and the duplex SPSC queue ABI."""
+"""Internal Region Template types and the duplex SPSC queue binding."""
 
 from __future__ import annotations
 
@@ -253,7 +253,7 @@ class SpscQueueEndpointBinding:
             self, "output_arena_bytes", _require_exact_u64("output_arena_bytes", self.output_arena_bytes)
         )
         if self.magic_version != _SPSC_QUEUE_MAGIC_VERSION:
-            raise ValueError("binding magic_version is not SPSQ ABI 1.0")
+            raise ValueError("unsupported SPSQ version")
         if self.transaction_id == 0:
             raise ValueError("transaction_id must be nonzero")
 
@@ -281,7 +281,7 @@ class SpscQueueEndpointBinding:
             raise ValueError("binding requires exactly 10 uint64 scalars")
         values = tuple(_require_exact_u64(f"binding[{index}]", scalars[index]) for index in range(count))
         if values[0] != _SPSC_QUEUE_MAGIC_VERSION:
-            raise ValueError("binding magic_version is not SPSQ ABI 1.0")
+            raise ValueError("unsupported SPSQ version")
         if values[2] == 0:
             raise ValueError("transaction_id must be nonzero")
         return cls(

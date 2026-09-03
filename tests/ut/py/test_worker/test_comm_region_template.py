@@ -336,15 +336,15 @@ def test_binding_rejects_bool_range_and_version_mismatch():
         SpscQueueEndpointBinding.from_scalars(over)
     wrong_magic = list(_BINDING_GOLDEN)
     wrong_magic[0] = 0x4C33513200010001
-    with pytest.raises(ValueError, match="SPSQ ABI 1.0"):
+    with pytest.raises(ValueError, match="unsupported SPSQ version"):
         SpscQueueEndpointBinding.from_scalars(wrong_magic)
     wrong_major = list(_BINDING_GOLDEN)
     wrong_major[0] = (_SPSC_QUEUE_MAGIC << 32) | (2 << 16) | 0
-    with pytest.raises(ValueError, match="SPSQ ABI 1.0"):
+    with pytest.raises(ValueError, match="unsupported SPSQ version"):
         SpscQueueEndpointBinding.from_scalars(wrong_major)
     wrong_minor = list(_BINDING_GOLDEN)
     wrong_minor[0] = (_SPSC_QUEUE_MAGIC << 32) | (1 << 16) | 1
-    with pytest.raises(ValueError, match="SPSQ ABI 1.0"):
+    with pytest.raises(ValueError, match="unsupported SPSQ version"):
         SpscQueueEndpointBinding.from_scalars(wrong_minor)
 
 
