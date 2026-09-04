@@ -308,9 +308,16 @@ STOP drain, and returns only after `queue.input().drained()`. Application
 request IDs in that example are payload-header fields `0, 0, 0, 7`; the
 transport `seq` is not used as a request ID.
 
-That example is a smoke path. It is not a formal Queue Acceptance record, and
-it does not demonstrate wrap, `ERROR` opcode delivery, or dedicated
-HostVmmCopyAccess/cache instrumentation.
+That example is a smoke path. The formal Queue Acceptance record is:
+
+```text
+tests/st/worker/comm_region/templates/spsc_queue/
+```
+
+The example does not replace that record. Template ST covers wrap, `ERROR`
+delivery, descriptor-full backpressure, STOP-then-output, and logical free.
+HostVmmCopyAccess is exercised by queue payload copies on `a2a3` onboard; there
+is no extra cache-probe instrumentation.
 
 Recorded evidence at commit `c87f0bad`, CI run
 [33740884796](https://github.com/hw-native-sys/simpler/actions/runs/33740884796):
@@ -322,8 +329,11 @@ Recorded evidence at commit `c87f0bad`, CI run
 | `a2a3` onboard example ST | PASS (`test_worker_chip_message_queue`, 8.1s, device 0, CI `st-onboard-a2a3`) |
 | `a5` onboard example ST | PASS (`test_worker_chip_message_queue`, 7.0s, device 4, CI `st-onboard-a5`) |
 | Python / C++ UT | PASS (CI `ut`, `ut-a2a3`, `ut-a5`) |
-| Template-level ST under `tests/st/worker/comm_region/templates/queue/` | pending; directory is not in the tree |
-| Dedicated wrap / `ERROR` / HostVmmCopyAccess instrumentation | not recorded |
+| Template-level ST under `tests/st/worker/comm_region/templates/spsc_queue/` | directory is in the tree |
+| `a2a3sim` template ST | PASS (local; 6 cases; `path_has_hdy: False`) |
+| `a5sim` template ST | pending |
+| `a2a3` onboard template ST | pending |
+| `a5` onboard template ST | pending |
 
 Simulation evidence does not stand in for hardware cache or HostVMM copy
-behavior. Hardware rows above are example ST pass/fail only.
+behavior. Example hardware rows above are example ST pass/fail only.

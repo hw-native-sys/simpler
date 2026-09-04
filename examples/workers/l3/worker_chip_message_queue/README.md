@@ -48,8 +48,9 @@ Recorded platform evidence at commit `c87f0bad`, CI run
 [33740884796](https://github.com/hw-native-sys/simpler/actions/runs/33740884796):
 example ST PASS on `a2a3sim`, `a5sim`, `a2a3` onboard (device 0), and `a5`
 onboard (device 4). Simulation does not stand in for hardware cache or
-HostVMM copy behavior. The evidence table, including pending template-level
-ST, is in
+HostVMM copy behavior. The formal Queue Acceptance record is
+[`tests/st/worker/comm_region/templates/spsc_queue/`](../../../../tests/st/worker/comm_region/templates/spsc_queue/).
+Platform evidence for that record is in
 [`docs/l3-l2-message-queue.md`](../../../../docs/l3-l2-message-queue.md).
 
 The test file is also the example — `run_worker_chip_message_queue_example(platform,
