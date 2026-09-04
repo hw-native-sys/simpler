@@ -1,8 +1,6 @@
 # SPSC queue Region Template scene tests
 
-Private L3→L2 ST for the bound SPSC queue. This directory is the formal Queue
-Acceptance record. The example under
-`examples/workers/l3/worker_chip_message_queue/` remains a smoke path.
+L3→L2 scene tests for the bound SPSC queue.
 
 | Test | Topologies | Platforms |
 | ---- | ---------- | --------- |
@@ -29,8 +27,8 @@ binds the SPSC template; it does not call `create_worker_chip_region()`.
   are not Python exception text. Those cases do not stand in for hardware cache
   or HostVmmCopyAccess.
 
-A2/A3 onboard covers HostVmmCopyAccess through queue payload copies. A5 is
-CI-only. Fault cases stay on sim.
+Success cases run on simulation and onboard platforms. Fault cases stay on
+simulation.
 
 ## Run
 

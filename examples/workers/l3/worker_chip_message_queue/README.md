@@ -7,8 +7,7 @@ appear — a serving loop, not a batch.
 
 The transport is the L3-L2 SPSC queue (`SPSQ` binding): two arenas (input and
 output) plus a 10-scalar endpoint binding the L2 orchestration receives as
-plain `TaskArgs` scalars starting at offset 0. This example is a smoke path,
-not the formal Queue Acceptance record. See
+plain `TaskArgs` scalars starting at offset 0. See
 [`docs/l3-l2-message-queue.md`](../../../../docs/l3-l2-message-queue.md) for
 the channel's current design.
 
@@ -38,20 +37,14 @@ request 1's two. That is the point — a queue, not a call stack.
 
 ## Run
 
-Single device. Local simulation:
+Single device:
 
 ```bash
 pytest examples/workers/l3/worker_chip_message_queue --platform a2a3sim
+pytest examples/workers/l3/worker_chip_message_queue --platform a5sim
+pytest examples/workers/l3/worker_chip_message_queue --platform a2a3 --device <id>
+pytest examples/workers/l3/worker_chip_message_queue --platform a5 --device <id>
 ```
-
-Recorded platform evidence at commit `c87f0bad`, CI run
-[33740884796](https://github.com/hw-native-sys/simpler/actions/runs/33740884796):
-example ST PASS on `a2a3sim`, `a5sim`, `a2a3` onboard (device 0), and `a5`
-onboard (device 4). Simulation does not stand in for hardware cache or
-HostVMM copy behavior. The formal Queue Acceptance record is
-[`tests/st/worker/comm_region/templates/spsc_queue/`](../../../../tests/st/worker/comm_region/templates/spsc_queue/).
-Platform evidence for that record is in
-[`docs/l3-l2-message-queue.md`](../../../../docs/l3-l2-message-queue.md).
 
 The test file is also the example — `run_worker_chip_message_queue_example(platform,
 device_id)` is importable directly.

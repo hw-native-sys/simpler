@@ -125,7 +125,7 @@ if (!queue.live()) {
 }
 ```
 
-The default endpoint allows one active L2 DATA/ERROR input handle at a time.
+The default endpoint allows one active L2 DATA input handle at a time.
 L2 can opt into a larger input window with a compile-time parameter:
 
 ```cpp
@@ -137,7 +137,7 @@ creation and does not change the shared layout or the ten-scalar binding. The
 valid range is `1 <= MaxInflight <= depth`. Invalid combinations report
 `BAD_ARGUMENT` without setting the L2 abort flag. STOP does not count against
 `MaxInflight`; the endpoint keeps one extra slot so a STOP handle can remain
-pending behind earlier DATA/ERROR handles.
+pending behind earlier DATA handles.
 
 ## 2. Layout And Descriptor
 
@@ -250,10 +250,10 @@ On L3 output, `peek()` returns a handle that remains active until
 `release(handle)`. While a handle is active, repeated `try_peek()` returns the
 same handle. Releasing the wrong handle poisons the queue.
 
-On L2 input, the default endpoint keeps one active DATA/ERROR handle. L2 must
+On L2 input, the default endpoint keeps one active DATA handle. L2 must
 not call `peek()` again before releasing that handle, except that STOP may also
 be acquired into the extra STOP slot. With `SpscQueueEndpoint<View, N>`, L2
-may hold up to `N` active DATA or ERROR inputs. `release(handle)` is logical
+may hold up to `N` active DATA inputs. `release(handle)` is logical
 completion; the queue physically advances the shared input head only for the
 completed FIFO prefix. If input 2 is released before input 1, input 2 remains
 physically owned until input 1 is also released.
@@ -269,9 +269,9 @@ dequeue outputs that L2 publishes before returning. `request_stop(timeout)`
 waits only until the `STOP` descriptor is published; it does not wait for L2
 exit and does not drain outputs.
 
-With an input window, STOP may be acquired while earlier DATA or ERROR inputs
+With an input window, STOP may be acquired while earlier DATA inputs
 are still active. After STOP is acquired, the input queue enters draining mode
-and does not acquire later DATA or ERROR descriptors. Earlier active inputs
+and does not acquire later DATA descriptors. Earlier active inputs
 may still produce outputs. STOP is physically released only after all earlier
 active inputs are physically released. `queue.input().drained()` returns true
 only after STOP has been physically released. If L2 observes a published input
@@ -290,9 +290,9 @@ ownership. A local poison sets the local abort flag for the peer. Observing
 the peer abort flag reports remote abort but does not set the local flag.
 After poison, normal queue operations reject. Cleanup remains valid.
 
-## 5. Example And Platform Evidence
+## 5. Example
 
-The shipped smoke example lives at:
+The shipped example lives at:
 
 ```text
 examples/workers/l3/worker_chip_message_queue/
@@ -307,33 +307,3 @@ multiple outputs for one input, combines two inputs into one output during
 STOP drain, and returns only after `queue.input().drained()`. Application
 request IDs in that example are payload-header fields `0, 0, 0, 7`; the
 transport `seq` is not used as a request ID.
-
-That example is a smoke path. The formal Queue Acceptance record is:
-
-```text
-tests/st/worker/comm_region/templates/spsc_queue/
-```
-
-The example does not replace that record. Template ST covers wrap, `ERROR`
-delivery, descriptor-full backpressure, STOP-then-output, and logical free.
-HostVmmCopyAccess is exercised by queue payload copies on `a2a3` onboard; there
-is no extra cache-probe instrumentation.
-
-Recorded evidence at commit `c87f0bad`, CI run
-[33740884796](https://github.com/hw-native-sys/simpler/actions/runs/33740884796):
-
-| Surface | Result |
-| ------- | ------ |
-| `a2a3sim` example ST | PASS (CI `st-sim-a2a3`; also reproduced locally) |
-| `a5sim` example ST | PASS (CI `st-sim-a5`) |
-| `a2a3` onboard example ST | PASS (`test_worker_chip_message_queue`, 8.1s, device 0, CI `st-onboard-a2a3`) |
-| `a5` onboard example ST | PASS (`test_worker_chip_message_queue`, 7.0s, device 4, CI `st-onboard-a5`) |
-| Python / C++ UT | PASS (CI `ut`, `ut-a2a3`, `ut-a5`) |
-| Template-level ST under `tests/st/worker/comm_region/templates/spsc_queue/` | directory is in the tree |
-| `a2a3sim` template ST | PASS (local; 6 cases; `path_has_hdy: False`) |
-| `a5sim` template ST | pending |
-| `a2a3` onboard template ST | pending |
-| `a5` onboard template ST | pending |
-
-Simulation evidence does not stand in for hardware cache or HostVMM copy
-behavior. Example hardware rows above are example ST pass/fail only.
