@@ -318,6 +318,10 @@ extern "C" int prewarm_config_impl(
     const HostApi *api, const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool
 );
 
+// Weak default rejects non-zero flags; TMR links the strong implementation.
+// A null Runtime is a capability probe used before acquiring run resources.
+extern "C" int configure_native_run_flags_impl(Runtime *runtime, uint32_t flags);
+
 static const HostApiOps g_host_api_ops = {
     .device_malloc = device_malloc,
     .device_free = device_free,
@@ -642,10 +646,11 @@ static SimNativeRunContext *native_run_context(DeviceContextHandle ctx, RuntimeH
     return state;
 }
 
-static void emit_native_run_host_wall(uint64_t trace_inv, uint64_t trace_hid, long long trace_start_ns) {
+static void
+emit_native_run_host_wall(uint64_t trace_inv, uint64_t trace_hid, long long trace_start_ns, bool prewarm = false) {
     const long long end_ns = STRACE_NOW_NS();
     STRACE_CONTEXT(trace_inv, trace_hid, 0);
-    STRACE_HOST_SPAN_AT("chip.run", trace_start_ns, end_ns - trace_start_ns, 0);
+    STRACE_HOST_SPAN_AT(prewarm ? "chip.prewarm.run" : "chip.run", trace_start_ns, end_ns - trace_start_ns, 0);
 }
 
 static void emit_native_run_runner_wall(SimNativeRunContext *state) {
@@ -675,8 +680,9 @@ static int cleanup_failed_prepare(SimNativeRunContext *state, int execution_rc, 
         state->runner->release_native_run(state);
         state->runner_claimed = false;
     }
+    const bool prewarm = (state->descriptor.flags & PTO_NATIVE_RUN_FLAG_INTERNAL_PREWARM) != 0;
     destroy_native_run_context(state);
-    emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns);
+    emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns, prewarm);
     return validation_rc != 0 ? validation_rc : execution_rc;
 }
 
@@ -706,6 +712,8 @@ int simpler_prepare_run(
         LOG_ERROR("simpler_prepare_run: runner is poisoned by an uncertain partial launch");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    const int flags_rc = configure_native_run_flags_impl(nullptr, descriptor->flags);
+    if (flags_rc != 0) return flags_rc;
     uint64_t magic = 0;
     std::memcpy(&magic, runtime, sizeof(magic));
     if (magic == SimNativeRunContext::kMagic) {
@@ -723,6 +731,10 @@ int simpler_prepare_run(
     const long long trace_start_ns = STRACE_NOW_NS();
     try {
         state = new (runtime) SimNativeRunContext(runner, *config, trace_hid, *descriptor, &g_host_api_ops);
+        if (configure_native_run_flags_impl(&state->runtime, descriptor->flags) != 0) {
+            destroy_native_run_context(state);
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
         if (!runner->try_acquire_native_run(state, state->identity(), &state->launch_permit)) {
             LOG_ERROR("simpler_prepare_run: another native run is active on this device context");
             destroy_native_run_context(state);
@@ -915,8 +927,9 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         state->runner->release_native_run(state);
         state->runner_claimed = false;
     }
+    const bool prewarm = (state->descriptor.flags & PTO_NATIVE_RUN_FLAG_INTERNAL_PREWARM) != 0;
     destroy_native_run_context(state);
-    emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns);
+    emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns, prewarm);
     if (validation_rc != 0) return validation_rc;
     return launched ? execution_rc : 0;
 }

@@ -57,6 +57,7 @@
 
 // Default ready queue shards: one shard per worker thread (total minus orchestrator)
 constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 1;
+constexpr uint32_t RUNTIME_RUN_FLAG_INTERNAL_PREWARM = 1u << 0;
 
 // =============================================================================
 // Data Structures
@@ -215,6 +216,10 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // Per-callable_id dispatch. AICPU dispatches via
     // `orch_so_table_[active_callable_id_]`.
     int32_t active_callable_id_;
+
+    // Copied from NativeRunDescriptor.flags during prepare. Device scheduler
+    // reads this to force function_bin_addr=0 for the internal prewarm task.
+    uint32_t run_flags{0};
 };
 
 // =============================================================================
@@ -265,6 +270,8 @@ public:
     size_t aicpu_allowed_cpus_capacity() const {
         return sizeof(dev.aicpu_allowed_cpus) / sizeof(dev.aicpu_allowed_cpus[0]);
     }
+    uint32_t get_run_flags() const { return dev.run_flags; }
+    void set_run_flags(uint32_t flags) { dev.run_flags = flags; }
 
     // =========================================================================
     // Performance Profiling

@@ -898,6 +898,13 @@ extern "C" int prewarm_config_impl(
     return build_and_cache_prebuilt_arena(api, sizing) ? 0 : PTO_RUNTIME_ERR_INTERNAL;
 }
 
+extern "C" int configure_native_run_flags_impl(Runtime *runtime, uint32_t flags) {
+    static_assert(RUNTIME_RUN_FLAG_INTERNAL_PREWARM == PTO_NATIVE_RUN_FLAG_INTERNAL_PREWARM);
+    if ((flags & ~RUNTIME_RUN_FLAG_INTERNAL_PREWARM) != 0) return PTO_RUNTIME_ERR_UNSUPPORTED;
+    if (runtime != nullptr) runtime->set_run_flags(flags);
+    return 0;
+}
+
 /**
  * Validate runtime results and cleanup.
  *
@@ -931,7 +938,8 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
 
     LOG_INFO("ChipTensor leases to process: %d", tensor_lease_count);
 
-    bool skip_tensor_copy_back = execution_rc != 0;
+    const bool internal_prewarm = (runtime->get_run_flags() & RUNTIME_RUN_FLAG_INTERNAL_PREWARM) != 0;
+    bool skip_tensor_copy_back = execution_rc != 0 || internal_prewarm;
     int32_t runtime_status = 0;
     SharedMemoryHeader host_header;
     memset(&host_header, 0, sizeof(host_header));
@@ -964,7 +972,11 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
     }
 
     if (skip_tensor_copy_back) {
-        LOG_WARN("Skipping tensor copy-back because execution failed");
+        if (internal_prewarm) {
+            LOG_DEBUG("Skipping tensor copy-back for the internal TMR prewarm task");
+        } else {
+            LOG_WARN("Skipping tensor copy-back because execution failed");
+        }
     } else {
         for (int i = 0; i < tensor_lease_count; i++) {
             const TensorLease &lease = tensor_leases[i];

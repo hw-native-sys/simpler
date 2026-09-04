@@ -714,6 +714,14 @@ extern "C" __attribute__((weak)) int prewarm_config_impl(
     return 0;
 }
 
+// Runtime-specific NativeRunDescriptor flag hook. The shared platform layer is
+// also linked with host_build_graph, which deliberately does not implement the
+// internal TMR task warm-up. Passing nullptr is a capability probe; a non-null
+// runtime applies the already-probed flags to the per-run device descriptor.
+extern "C" __attribute__((weak)) int configure_native_run_flags_impl(Runtime * /*runtime*/, uint32_t flags) {
+    return flags == 0 ? 0 : PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
 void SimDeviceRunnerBase::apply_call_config(const CallConfig &config) {
     set_chip_swimlane_enabled(config.enable_chip_swimlane);
     set_dump_args_enabled(config.enable_dump_args);

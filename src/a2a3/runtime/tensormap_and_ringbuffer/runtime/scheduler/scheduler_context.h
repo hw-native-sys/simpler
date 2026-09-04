@@ -181,6 +181,7 @@ private:
     std::atomic<bool> completed_{false};
     std::atomic<bool> fatal_shutdown_started_{false};
     uint64_t *func_id_to_addr_{nullptr};
+    uint32_t run_flags_{0};
 
     // --- Thread/core configuration ---
     int32_t active_sched_threads_{0};
