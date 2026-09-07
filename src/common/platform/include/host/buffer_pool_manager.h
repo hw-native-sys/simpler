@@ -69,8 +69,7 @@
  * SVM path).
  */
 
-#ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_BUFFER_POOL_MANAGER_H_
-#define SRC_COMMON_PLATFORM_INCLUDE_HOST_BUFFER_POOL_MANAGER_H_
+#pragma once
 
 #include <algorithm>
 #include <array>
@@ -83,6 +82,7 @@
 #include <functional>
 #include <limits>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
@@ -428,6 +428,7 @@ public:
      * HAL mappings are not touched.
      */
     void clear_mappings() {
+        std::unique_lock<std::shared_mutex> lock(mapping_mutex_);
         for (auto &kv : dev_to_host_) {
             if (kv.second != nullptr && malloc_shadows_.erase(kv.second) > 0) {
                 std::free(kv.second);
@@ -454,6 +455,7 @@ public:
      */
     template <typename ReleaseFn>
     void release_all_owned(const ReleaseFn &release_fn) {
+        std::unique_lock<std::shared_mutex> lock(mapping_mutex_);
         for (auto &shard_pools : recycled_) {
             for (auto &pool : shard_pools)
                 pool.clear();
@@ -759,7 +761,7 @@ public:
         }
         *host_ptr_out = host_ptr;
         {
-            std::scoped_lock<std::mutex> lock(mapping_mutex_);
+            std::unique_lock<std::shared_mutex> lock(mapping_mutex_);
             dev_to_host_[dev_ptr] = host_ptr;
             block_ranges_.push_back(
                 BlockRange{
@@ -783,7 +785,7 @@ public:
         void *host_ptr = nullptr;
         bool free_host_shadow = false;
         {
-            std::scoped_lock<std::mutex> lock(mapping_mutex_);
+            std::unique_lock<std::shared_mutex> lock(mapping_mutex_);
             auto it = dev_to_host_.find(release_ptr);
             host_ptr = (it != dev_to_host_.end()) ? it->second : nullptr;
             if (it != dev_to_host_.end()) {
@@ -804,7 +806,7 @@ public:
             ops_.free_(release_ptr);
         }
         {
-            std::scoped_lock<std::mutex> lock(mapping_mutex_);
+            std::unique_lock<std::shared_mutex> lock(mapping_mutex_);
             released_allocations_.erase(release_ptr);
         }
         if (free_host_shadow) {
@@ -814,11 +816,12 @@ public:
 
     /**
      * Resolve a device pointer to the host-mapped pointer recorded at
-     * alloc_and_register_block / register_mapping time. Mappings are built
-     * during init/proactive refill and are immutable while mgmt/collector
-     * threads run, so this hot path is read-only and lock-free.
+     * alloc_and_register_block / register_mapping time. Runtime replenishment
+     * may grow the exact and range mappings while drain shards resolve buffers,
+     * so readers hold a shared lock across both lookups.
      */
     void *resolve_host_ptr(void *dev_ptr) const {
+        std::shared_lock<std::shared_mutex> lock(mapping_mutex_);
         const auto &exact_mappings = dev_to_host_;
         auto it = exact_mappings.find(dev_ptr);
         if (it != exact_mappings.end()) return it->second;
@@ -835,7 +838,7 @@ public:
      * to be able to resolve them later.
      */
     void register_mapping(void *dev_ptr, void *host_ptr) {
-        std::scoped_lock<std::mutex> lock(mapping_mutex_);
+        std::unique_lock<std::shared_mutex> lock(mapping_mutex_);
         dev_to_host_[dev_ptr] = host_ptr;
     }
 
@@ -847,7 +850,7 @@ public:
      */
     void add_malloc_shadow(void *host_ptr) {
         if (host_ptr != nullptr) {
-            std::scoped_lock<std::mutex> lock(mapping_mutex_);
+            std::unique_lock<std::shared_mutex> lock(mapping_mutex_);
             malloc_shadows_.insert(host_ptr);
         }
     }
@@ -966,7 +969,7 @@ public:
      * the pointer itself.
      */
     void *release_pointer_for(void *dev_ptr) const {
-        std::scoped_lock<std::mutex> lock(mapping_mutex_);
+        std::shared_lock<std::shared_mutex> lock(mapping_mutex_);
         return allocation_base_for_locked(dev_ptr);
     }
 
@@ -976,7 +979,7 @@ public:
      */
     bool claim_release_pointer(void *dev_ptr, void **release_ptr_out) {
         if (release_ptr_out == nullptr) return false;
-        std::scoped_lock<std::mutex> lock(mapping_mutex_);
+        std::unique_lock<std::shared_mutex> lock(mapping_mutex_);
         void *release_ptr = tracked_allocation_base_for_locked(dev_ptr);
         if (release_ptr == nullptr) {
             *release_ptr_out = nullptr;
@@ -1108,7 +1111,7 @@ private:
     std::array<DoneQueueShard, kMaxCollectorShards> done_shards_;
 
     // Host-side pointer mappings are shared across all collector shards.
-    mutable std::mutex mapping_mutex_;
+    mutable std::shared_mutex mapping_mutex_;
 
     // dev → host exact mappings plus block ranges for carved buffers.
     std::unordered_map<void *, void *> dev_to_host_;
@@ -1130,5 +1133,3 @@ private:
 };
 
 }  // namespace profiling_common
-
-#endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_BUFFER_POOL_MANAGER_H_
