@@ -51,7 +51,7 @@ struct TensorData {
     uint8_t ndims;                     // Number of dimensions used; MAX_TENSOR_DIMS bounds it
     DataType dtype;                    // Data type of tensor elements
     bool manual_dep;                   // True when dependency tracking is creator-only (skip OverlapMap lookup/insert)
-    bool is_contiguous;                // Cached: strides[] == row_major_stride(shapes)
+    bool is_contiguous;                // Cached row-major contiguity, ignoring singleton strides
     AddressSpace address_space;        // Physical location after argument binding
     uint32_t shapes[MAX_TENSOR_DIMS];  // Current view shape per dimension (elements)
 
