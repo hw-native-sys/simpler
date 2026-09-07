@@ -26,7 +26,7 @@ from __future__ import annotations
 import ctypes
 import os
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from multiprocessing.shared_memory import SharedMemory
 from typing import Any
@@ -165,11 +165,26 @@ class Buffer:
     # which is the derivation gate — a close() whose unlink raised leaves this false so a retry
     # attempts the unlink again.
     unlinked: bool = False
+    # Set only on a Buffer whose descriptor fields are final for the rest of its life — the private
+    # snapshot `Worker._record_device_alloc` registers. `init=False` keeps `replace()` from carrying
+    # it onto a copy, so a handle a caller still holds derives a fresh descriptor on every call and
+    # a field it changes stays visible to the provenance comparison that rejects it.
+    _descriptor: BufferDescriptor | None = field(default=None, init=False, compare=False, repr=False)
+
+    def freeze_descriptor(self) -> None:
+        """Derive the descriptor once and answer every later `to_descriptor()` from it.
+
+        Valid only on a Buffer no other reference can reach: a field changed afterwards would not
+        reach the descriptor.
+        """
+        self._descriptor = self.to_descriptor()
 
     def to_descriptor(self) -> BufferDescriptor:
         """The wire descriptor for this backing — what a consumer needs to resolve it."""
         if self.closed:
             raise ValueError(f"Buffer: cannot derive a descriptor from a released buffer ({self.identity})")
+        if self._descriptor is not None:
+            return self._descriptor
         return BufferDescriptor(
             identity=self.identity,
             address_space=self.address_space,

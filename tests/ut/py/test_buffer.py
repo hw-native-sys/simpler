@@ -18,6 +18,7 @@ registry and the Buffer constructors that are genuinely defined there.
 
 import ctypes
 import re
+from dataclasses import replace
 from multiprocessing.shared_memory import SharedMemory
 from unittest.mock import patch
 
@@ -404,6 +405,44 @@ def test_closed_buffer_refuses_to_derive_a_tensor():
         buffer.to_descriptor()
     with pytest.raises(ValueError, match="released buffer"):
         buffer.tensor(shapes=(16,), dtype=DataType.FLOAT32)
+
+
+def test_an_unfrozen_buffer_derives_a_fresh_descriptor_every_time():
+    # The provenance guard compares a Tensor's embedded descriptor against the registry snapshot's,
+    # so a handle a caller can still reach has to keep reporting the fields it currently holds.
+    buffer = wrap_device_malloc(0x1000, 64, mint_owner_instance_id(), 1, "L3")
+    assert buffer.to_descriptor().nbytes == 64
+    buffer.nbytes = 128
+    assert buffer.to_descriptor().nbytes == 128
+
+
+def test_a_frozen_buffer_answers_from_the_descriptor_it_froze():
+    buffer = wrap_device_malloc(0x1000, 64, mint_owner_instance_id(), 1, "L3")
+    buffer.freeze_descriptor()
+    first = buffer.to_descriptor()
+    assert buffer.to_descriptor() is first
+    # Freezing is for a snapshot no one else holds; a change after it does not reach the descriptor.
+    buffer.nbytes = 128
+    assert buffer.to_descriptor().nbytes == 64
+
+
+def test_a_frozen_buffer_still_refuses_to_derive_once_released():
+    buffer = create_host_shared_buffer(nbytes=64, owner_instance_id=mint_owner_instance_id(), buffer_id=1)
+    buffer.freeze_descriptor()
+    buffer.close()
+    with pytest.raises(ValueError, match="released buffer"):
+        buffer.to_descriptor()
+
+
+def test_replacing_a_buffer_does_not_carry_the_frozen_descriptor():
+    # `Worker._record_device_alloc` freezes the copy, not the caller's handle; a copy that inherited
+    # the freeze would hide a later change to the field it was taken from.
+    buffer = wrap_device_malloc(0x1000, 64, mint_owner_instance_id(), 1, "L3")
+    buffer.freeze_descriptor()
+    copy = replace(buffer)
+    assert copy._descriptor is None  # noqa: SLF001
+    copy.nbytes = 128
+    assert copy.to_descriptor().nbytes == 128
 
 
 def test_resolve_unregistered_raises():

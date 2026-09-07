@@ -10255,7 +10255,9 @@ class Worker:
         every execution field, so changing a public handle can never change the worker id, address,
         extent, access mode, or descriptor used by a later operation.
         """
-        self._child_alloc[handle.identity] = replace(handle)
+        snapshot = replace(handle)
+        snapshot.freeze_descriptor()
+        self._child_alloc[handle.identity] = snapshot
         if domain_allocation_id is not None:
             self._domain_members.setdefault(domain_allocation_id, set()).add(handle.identity)
 
