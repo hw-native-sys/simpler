@@ -113,11 +113,11 @@ struct ChipTensor {
         return last + 1;
     }
 
-    /// PyTorch-style contiguity: strides[i] == prod(shapes[i+1..ndims-1]).
+    /// PyTorch-style contiguity: only dimensions of size > 1 must have row-major strides.
     [[nodiscard]] bool is_contiguous() const {
         uint64_t expected = 1;
         for (int32_t i = static_cast<int32_t>(ndims) - 1; i >= 0; --i) {
-            if (strides[i] != expected) return false;
+            if (shapes[i] != 1 && strides[i] != expected) return false;
             expected *= shapes[i];
         }
         return true;

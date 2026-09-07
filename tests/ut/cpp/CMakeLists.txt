@@ -517,6 +517,14 @@ add_task_interface_test(test_buffer types/test_buffer.cpp)
 add_task_interface_test(test_child_memory types/test_child_memory.cpp)
 add_task_interface_test(test_chip_max_tensor_args types/test_chip_max_tensor_args.cpp)
 add_task_interface_test(test_call_config types/test_call_config.cpp)
+add_task_interface_test(test_tmr_tensor_contiguity types/test_tmr_tensor_contiguity.cpp)
+target_include_directories(test_tmr_tensor_contiguity PRIVATE ${CMAKE_SOURCE_DIR}/../../../src/common)
+add_task_interface_test(test_tensor_contiguity types/test_tensor_contiguity.cpp)
+target_include_directories(test_tensor_contiguity PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/host_build_graph
+)
 
 # Contract test for upload_chip_callable_buffer caller-buffer immutability.
 # Pulls both task_interface (callable.h) and src/common (utils/fnv1a_64.h),
