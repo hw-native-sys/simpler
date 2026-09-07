@@ -1004,7 +1004,24 @@ protected:
         int launch_aicpu_num{0};
     };
 
-    /** True once collectors are built and this run's counts differ from theirs. */
+    /**
+     * True once collectors are built and this run's counts differ from theirs,
+     * i.e. their pools must be released and rebuilt before this run seeds them.
+     *
+     * The release frees device memory the collectors are holding, so it is only
+     * safe while no other run is executing against them. Nothing here enforces
+     * that. What guarantees it today is the diagnostics depth-1 gate: with any
+     * diagnostic on, `allow_prepared_successor` is false, so a successor cannot
+     * even reserve while a predecessor is in flight, and a stale shape is only
+     * ever seen between runs.
+     *
+     * **Whoever lifts that gate must move this rebuild inside the execution
+     * claim.** Do not reach for `native_run_active()` as the guard — it is not a
+     * usable predicate at this point: onboard takes the claim in
+     * `simpler_launch_run`, but sim takes it in `simpler_prepare_run`, so on sim
+     * it is already true for the run being prepared and the check fires on its
+     * own run.
+     */
     bool collector_shape_is_stale(int num_aicore, int aicpu_thread_num, int launch_aicpu_num) const {
         return collector_shape_.latched &&
                (collector_shape_.num_aicore != num_aicore || collector_shape_.aicpu_thread_num != aicpu_thread_num ||
