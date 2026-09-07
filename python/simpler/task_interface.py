@@ -799,11 +799,20 @@ def _sidecar_from_ref(storage: _RemoteTaskArgsStorage, ref: RemoteTensorRef) -> 
 
 
 def _storage_for_remote_task_args(args: TaskArgs) -> _RemoteTaskArgsStorage:
+    """``args``' sidecar storage, extended to cover every arg added so far.
+
+    ``sidecars`` is indexed by arg position and covers a prefix of the list: a local arg names no
+    remote memory, so it occupies a ``None`` slot, and the positions past the last remote ref carry
+    no slot at all. The caller appends this ref's own sidecar after adding its placeholder, so
+    padding here is what puts that append at the placeholder's index.
+    """
     with _REMOTE_TASK_ARGS_STORAGE_LOCK:
         storage = _REMOTE_TASK_ARGS_STORAGE.get(args)
-        if storage is None or len(storage.sidecars) != args.tensor_count():
-            storage = _RemoteTaskArgsStorage([None for _ in range(args.tensor_count())], bytearray())
+        if storage is None:
+            storage = _RemoteTaskArgsStorage([], bytearray())
             _REMOTE_TASK_ARGS_STORAGE[args] = storage
+        while len(storage.sidecars) < args.tensor_count():
+            storage.sidecars.append(None)
         return storage
 
 
@@ -837,10 +846,6 @@ def _task_args_add_tensor(self: TaskArgs, tensor, tag: TensorArgType = TensorArg
         storage.sidecars.append(_sidecar_from_ref(storage, tensor))
         return
     _TASK_ARGS_ADD_TENSOR(self, tensor, tag)
-    with _REMOTE_TASK_ARGS_STORAGE_LOCK:
-        storage = _REMOTE_TASK_ARGS_STORAGE.get(self)
-        if storage is not None:
-            storage.sidecars.append(None)
 
 
 def _task_args_clear(self: TaskArgs) -> None:
@@ -867,10 +872,14 @@ def _remote_sidecar_for(args: TaskArgs) -> _RemoteTaskArgsSidecar | None:
         storage = _REMOTE_TASK_ARGS_STORAGE.get(args)
         if storage is None:
             return None
-        if len(storage.sidecars) != args.tensor_count():
+        # The wire form is one slot per arg; local args added after the last remote ref are the
+        # tail `sidecars` does not reach. More slots than args is storage for a different arg list.
+        missing = args.tensor_count() - len(storage.sidecars)
+        if missing < 0:
             _REMOTE_TASK_ARGS_STORAGE.pop(args, None)
             return None
-        return _RemoteTaskArgsSidecar(tuple(storage.sidecars), bytes(storage.inline_payload))
+        tensors = tuple(storage.sidecars) + (None,) * missing
+        return _RemoteTaskArgsSidecar(tensors, bytes(storage.inline_payload))
 
 
 def _remote_access_label(flags: int) -> str:

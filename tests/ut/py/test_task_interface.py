@@ -638,6 +638,32 @@ class TestRemoteTaskArgsSidecar:
         assert desc.remote_addr == 0xCAFE
         assert desc.rkey_or_token == 0xBEEF
 
+    def test_local_tensor_after_remote_ref_keeps_sidecar_indices_aligned(self):
+        # A sidecar list is indexed by tensor position, so a local arg added after a remote one
+        # occupies a slot of its own. Without it, the trailing remote ref would be read as the
+        # descriptor for the local arg.
+        handle = RemoteBufferHandle._from_remote_allocation(
+            worker_id=3,
+            buffer_id=11,
+            generation=2,
+            address_space=RemoteAddressSpace.REMOTE_DEVICE,
+            nbytes=64,
+            remote_addr=0xCAFE,
+            rkey_or_token=0xBEEF,
+        )
+
+        args = TaskArgs()
+        args.add_tensor(_dev_ref(0x1000, (4,), DataType.UINT8), TensorArgType.INPUT)
+        args.add_tensor(RemoteTensorRef(handle=handle, shape=(4,), dtype=DataType.UINT8), TensorArgType.INPUT)
+        args.add_tensor(_dev_ref(0x2000, (4,), DataType.UINT8), TensorArgType.INPUT)
+
+        sidecar = _remote_sidecar_for(args)
+        assert sidecar is not None
+        assert len(sidecar.tensors) == args.tensor_count() == 3
+        assert sidecar.tensors[0] is None
+        assert sidecar.tensors[1] is not None and sidecar.tensors[1].present
+        assert sidecar.tensors[2] is None
+
     def test_remote_sidecar_storage_is_bound_to_task_args_lifetime(self):
         gc.collect()
         before_count = len(task_interface_module._REMOTE_TASK_ARGS_STORAGE)  # noqa: SLF001
