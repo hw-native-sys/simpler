@@ -500,14 +500,15 @@ def pytest_configure(config):
         "fixtures and standalone runners build its Worker with enable_sdma=True "
         "unless worker_workspace=False selects a platform-provisioned "
         "communication-domain workspace. "
-        "Worker-global provisioning creates 48 "
+        "On onboard a2a3, worker-global provisioning creates 48 "
         "device-only STARS streams that sit in the device fault domain, which "
         "makes a later AICore fault on that device cost minutes instead of "
         "~0.3 s (#1425). Two consequences follow from the one marker: such a "
         "test never shares an L2 Worker (the pool key carries the flag) and it "
         "sorts after every ordinary test, so fault-injection cases run on a "
         "device that has never provisioned. The a2a3 CI additionally runs them "
-        "in a step of their own via -m sdma until #1425 is fixed",
+        "in a step of their own via -m sdma until #1425 is fixed. On sim platforms, "
+        "the workspace is inert scratch and no hardware streams are created.",
     )
     config.addinivalue_line(
         "markers",

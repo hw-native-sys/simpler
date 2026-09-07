@@ -7,21 +7,28 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Single-card TPREFETCH_ASYNC smoke test for onboard a2a3.
+"""Single-card TPREFETCH_ASYNC smoke test.
 
 Exercises the runtime-injected SDMA workspace: a Worker created with
-``enable_sdma=True`` provisions the PTO-ISA async-SDMA workspace once at init and
-injects its address into every kernel's GlobalContext, so the kernel obtains it
-via ``get_dma_workspace(args, DMA_WORKSPACE_SDMA)`` -- no workspace is threaded
-as a user arg. A Worker without ``enable_sdma`` creates no SDMA streams and its
+``enable_sdma=True`` provisions the workspace once at init and injects its
+address into every kernel's GlobalContext, so the kernel obtains it via
+``get_dma_workspace(args, DMA_WORKSPACE_SDMA)`` -- no workspace is threaded as a
+user arg. A Worker without ``enable_sdma`` creates no SDMA streams and its
 kernels read a zero workspace address.
 The kernel prefetches ``in`` into L2, waits on the returned event, then copies
 ``in`` to ``out``.
 
 The prefetch is a pure cache hint that changes no value, so ``out == in``
 bit-exactly is the property under test -- together with the event wait actually
-completing rather than hanging. The device log (``[SDMA] Created 48 STARS
-streams OK``) confirms the real SDMA path ran rather than the skip branch.
+completing rather than hanging. Because the kernel returns without writing
+``out`` on a null workspace, that equality also proves the address it read was
+live.
+
+Onboard a2a3 runs the real engine; the device log (``[SDMA] Created 48 STARS
+streams OK``) confirms the real SDMA path ran rather than the skip branch. On
+a2a3sim the workspace is inert scratch and ``TPREFETCH_ASYNC`` is a no-op
+(pto-isa ``cpu/TPrefetchAsync.hpp``), so what the sim case covers is the
+injection path: a live address reaches the kernel.
 
 Unlike the SDMA completion demo this needs no comm domain: the workspace is a
 runtime-owned per-device resource, so a single device is enough.
@@ -65,7 +72,7 @@ class TestPrefetchAsyncDemo(SceneTestCase):
     CASES = [
         {
             "name": "prefetch_copy",
-            "platforms": ["a2a3"],
+            "platforms": ["a2a3sim", "a2a3"],
             "config": {},
             "params": {},
         },

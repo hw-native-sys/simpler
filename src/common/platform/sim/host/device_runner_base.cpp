@@ -301,6 +301,46 @@ int SimDeviceRunnerBase::ensure_device_initialized() {
     return ensure_binaries_loaded();
 }
 
+int SimDeviceRunnerBase::ensure_dma_workspace_provisioned() {
+    if (dma_workspace_handle_ != nullptr) {
+        return 0;
+    }
+    const uint32_t supported = dma_workspace_supported_mask();
+    constexpr uint32_t kSdmaBit = uint32_t{1} << DMA_WORKSPACE_SDMA;
+    if (sdma_requested_ && (supported & kSdmaBit) == 0) {
+        LOG_ERROR("dma workspace: SDMA requested where unsupported (supported=0x%x)", supported);
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    }
+
+    const uint32_t required_mask = sdma_requested_ ? supported : (supported & ~kSdmaBit);
+    if (required_mask == 0) {
+        return 0;
+    }
+    if ((required_mask & (required_mask - 1)) != 0) {
+        LOG_ERROR(
+            "dma workspace: mask=0x%x names %d engines; one handle owns one provider", required_mask,
+            __builtin_popcount(required_mask)
+        );
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    }
+
+    for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind) {
+        dma_workspace_addr_[kind] = 0;
+    }
+
+    int rc =
+        dma_workspace_provision(required_mask, dma_workspace_addr_, DMA_WORKSPACE_KIND_COUNT, &dma_workspace_handle_);
+    if (rc != 0) {
+        LOG_ERROR("dma workspace: mask=0x%x failed: %d", required_mask, rc);
+        for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind) {
+            dma_workspace_addr_[kind] = 0;
+        }
+        dma_workspace_handle_ = nullptr;
+        return rc;
+    }
+    return 0;
+}
+
 int SimDeviceRunnerBase::prepare_launch_shape(Runtime &runtime, const CallConfig &config) {
     if (config.aicpu_thread_num == 1 || config.aicpu_thread_num < 0 ||
         config.aicpu_thread_num > PLATFORM_MAX_AICPU_THREADS) {

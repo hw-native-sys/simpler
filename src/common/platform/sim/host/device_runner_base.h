@@ -51,8 +51,10 @@
 #include "common/kernel_args.h"
 #include "common/device_phase.h"
 #include "common/chip_swimlane_profiling.h"
+#include "common/dma_workspace.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
+#include "platform_comm/comm.h"
 #include "host/memory_allocator.h"
 #include "host/chip_swimlane_collector.h"
 #include "host/host_phase_records.h"
@@ -251,6 +253,16 @@ public:
         aicpu_so_binary_ = std::move(aicpu_so_binary);
         aicore_kernel_binary_ = std::move(aicore_kernel_binary);
     }
+
+    /**
+     * Record whether this Worker asked for an async-DMA workspace.
+     */
+    void set_dma_workspace_request(bool enable_sdma) { sdma_requested_ = enable_sdma; }
+    int ensure_dma_workspace_provisioned();
+    uint64_t dma_workspace_addr(int kind) const {
+        if (kind < 0 || kind >= DMA_WORKSPACE_KIND_COUNT) return 0;
+        return dma_workspace_addr_[kind];
+    }
     int device_id() const { return device_id_; }
     uint64_t last_device_wall_ns() const { return device_wall_ns_; }
     // Per-phase AICPU wall (ns) from the most recent run; RunWall aliases
@@ -338,6 +350,10 @@ protected:
     // owned for the rest of the runner's lifetime.
     std::vector<uint8_t> aicpu_so_binary_;
     std::vector<uint8_t> aicore_kernel_binary_;
+
+    bool sdma_requested_{false};
+    void *dma_workspace_handle_{nullptr};
+    uint64_t dma_workspace_addr_[DMA_WORKSPACE_KIND_COUNT]{};
 
     MemoryAllocator mem_alloc_;
     std::array<void *, PTO_PIPELINE_MAX_DEPTH> retained_temp_addrs_{};

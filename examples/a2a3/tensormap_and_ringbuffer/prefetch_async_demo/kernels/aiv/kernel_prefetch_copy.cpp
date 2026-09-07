@@ -62,8 +62,9 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     GlobalData in_global(in);
     GlobalData out_global(out);
 
-    // Runtime-injected SDMA workspace -- no user arg. The host refuses this
-    // marked callable unless SDMA is supported and provisioning succeeded.
+    // Runtime-injected SDMA workspace -- no user arg. On supported platforms
+    // (including sim, which provides inert scratch), get_dma_workspace returns
+    // a non-null address when the Worker requested SDMA; nullptr means injection failed.
     __gm__ uint8_t *sdma_workspace = get_dma_workspace(args, DMA_WORKSPACE_SDMA);
     if (sdma_workspace == nullptr) {
         pipe_barrier(PIPE_ALL);

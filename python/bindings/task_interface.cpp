@@ -2927,7 +2927,7 @@ NB_MODULE(_task_interface, m) {
             "given, its ring sizing is built + cached inside init (fork-constant, no "
             "cross-process control command). A no-op for runtimes without a prebuilt arena. "
             "When enable_sdma is True, provisions the async-DMA (SDMA) workspace at init so "
-            "kernels can use get_dma_workspace; init raises if the platform lacks SDMA."
+            "kernels can use get_dma_workspace; init raises if the platform lacks support for the requested workspace."
         )
         .def("finalize", &ChipWorker::finalize)
         .def(

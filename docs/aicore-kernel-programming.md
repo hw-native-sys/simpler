@@ -73,7 +73,7 @@ and the runtime provisions the SDMA workspace once at init, latches its address
 into `KernelArgs`, and injects it into every run's `GlobalContext`. A Worker
 that does not opt in creates no SDMA streams, and `get_dma_workspace` returns
 `nullptr`. Provisioning fails fast (Worker init raises) on a platform/runtime
-without SDMA support. Every event submitted through the workspace must be waited
+without support for the requested workspace kind. Every event submitted through the workspace must be waited
 before the kernel returns or registered with the runtime's deferred-completion
 mechanism.
 An invalid kind or unprovisioned slot returns `nullptr` and must not be used to

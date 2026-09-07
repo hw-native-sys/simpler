@@ -385,19 +385,24 @@ int simpler_init(
     // and the dispatcher / preinstall load path on sim isn't taken anyway.
     (void)dispatcher_binary;
     (void)dispatcher_size;
-    // Simulation provides no async-DMA workspaces, so there is nothing for a
-    // warmup ELF to warm either.
+    // Simulation drives no SDMA control path, so the warmup ELF has nothing to
+    // walk.
     (void)sdma_warmup_binary;
     (void)sdma_warmup_size;
 
     if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
-    // Opting into SDMA fails here rather than at the first kernel read, so such
-    // a Worker cannot come up on sim at all.
-    if (enable_sdma != 0) return PTO_RUNTIME_ERR_UNSUPPORTED;
 
     SimDeviceRunnerBase *runner = static_cast<SimDeviceRunnerBase *>(ctx);
+    runner->set_dma_workspace_request(enable_sdma != 0);
 
     int rc;
+    try {
+        rc = runner->ensure_dma_workspace_provisioned();
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (rc != 0) return rc;
+
     try {
         rc = runner->attach_current_thread(device_id);
     } catch (...) {

@@ -33,6 +33,7 @@
 #include "aicpu/platform_aicpu_affinity.h"
 #include "call_config.h"
 #include "callable_protocol.h"
+#include "common/dma_workspace.h"
 #include "common/host_log_binding.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
@@ -203,6 +204,16 @@ int DeviceRunner::ensure_binaries_loaded() {
             return PTO_RUNTIME_ERR_INTERNAL;
         if (!load_sym("set_platform_scope_stats_base", reinterpret_cast<void **>(&set_platform_scope_stats_base_func_)))
             return PTO_RUNTIME_ERR_INTERNAL;
+
+        // Publish provisioned DMA workspace addresses into the resident AICPU SO.
+        using SetDmaWorkspaceAddrFunc = void (*)(int, unsigned long long);
+        SetDmaWorkspaceAddrFunc set_dma_workspace_addr_func = nullptr;
+        if (!load_sym("set_dma_workspace_addr", reinterpret_cast<void **>(&set_dma_workspace_addr_func))) {
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind) {
+            set_dma_workspace_addr_func(kind, dma_workspace_addr_[kind]);
+        }
 
         // The AICPU sim SO binds its private HostLogger before the compatibility
         // level setter can emit a clock anchor.
@@ -801,6 +812,14 @@ int DeviceRunner::finalize() {
     prebuilt_runtime_arena_cache_sm_base_ = nullptr;
     prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
     prebuilt_runtime_arena_cache_image_.clear();
+
+    if (dma_workspace_handle_ != nullptr) {
+        dma_workspace_release(dma_workspace_handle_);
+        dma_workspace_handle_ = nullptr;
+    }
+    for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind) {
+        dma_workspace_addr_[kind] = 0;
+    }
 
     mem_alloc_.finalize();
     clear_cpu_sim_shared_storage();
