@@ -79,8 +79,8 @@ def detect_buildable_platforms() -> list:
         platforms.extend(["a2a3sim", "a5sim"])
 
     # Onboard platforms: need ccec + cross-compiler from ASCEND_HOME_PATH.
-    # a2a3 and a5 use the same toolchain and produce identical artifacts;
-    # the difference is runtime-only, so always build both.
+    # a2a3 and a5 share toolchain prerequisites but build separate artifacts
+    # with architecture-specific AICore targets (dav-c220 and dav-c310).
     has_ccec = shutil.which("ccec") is not None
 
     ascend_home = os.environ.get("ASCEND_HOME_PATH", "")

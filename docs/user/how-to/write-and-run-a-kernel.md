@@ -99,84 +99,26 @@ for the full `CallConfig` field list.
 
 ## Option B — the `Worker` API directly
 
-Use this when you need to see the stages, or when your program is not a test.
-The canonical worked example is
-[`examples/workers/l2/vector_add/main.py`](../../../examples/workers/l2/vector_add/main.py);
-the shape is:
+Use the runnable
+[`examples/workers/l2/vector_add/main.py`](../../../examples/workers/l2/vector_add/main.py)
+example to follow compilation, callable construction, registration, device
+allocation, copies, execution, and golden comparison in one place:
 
-```python
-from simpler.task_interface import (
-    ArgDirection, CallConfig, ChipCallable, CoreCallable,
-    DataType, TaskArgs, TensorArgType,
-)
-from simpler.worker import Worker
-
-from simpler_setup.kernel_compiler import KernelCompiler
-from simpler_setup.pto_isa import ensure_pto_isa_root
-
-# 1. Compile. pto_isa_root is the managed sibling header checkout.
-kc = KernelCompiler(platform=platform)
-kernel_bytes = kc.compile_incore(
-    source_path=".../kernels/aiv/my_kernel.cpp",
-    core_type="aiv",
-    pto_isa_root=ensure_pto_isa_root(),
-    extra_include_dirs=kc.get_orchestration_include_dirs("tensormap_and_ringbuffer"),
-)
-# On real hardware only, extract .text before wrapping:
-if not platform.endswith("sim"):
-    from simpler_setup.elf_parser import extract_text_section
-    kernel_bytes = extract_text_section(kernel_bytes)
-
-orch_bytes = kc.compile_orchestration(
-    runtime_name="tensormap_and_ringbuffer",
-    source_path=".../kernels/orchestration/my_orch.cpp",
-)
-
-# 2. Wrap into callables. children maps func_id -> CoreCallable.
-core = CoreCallable.build(
-    signature=[ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT],
-    binary=kernel_bytes,
-)
-chip = ChipCallable.build(
-    signature=[ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT],
-    func_name="my_orchestration",
-    binary=orch_bytes,
-    children=[(0, core)],
-)
-
-# 3. Register and initialize the worker.
-worker = Worker(level=2, platform=platform,
-                runtime="tensormap_and_ringbuffer", device_id=device_id)
-handle = worker.register(chip)
-worker.init()
-try:
-    # 4. Device memory + H2D.
-    dev_a = worker.malloc(nbytes)
-    dev_b = worker.malloc(nbytes)
-    dev_out = worker.malloc(nbytes)
-    worker.copy_to(dev_a, host_a)
-    worker.copy_to(dev_b, host_b)
-
-    # 5. Task args, in the same order as the signature.
-    args = TaskArgs()
-    args.add_tensor(dev_a.tensor((rows, cols), DataType.FLOAT32), TensorArgType.INPUT)
-    args.add_tensor(dev_b.tensor((rows, cols), DataType.FLOAT32), TensorArgType.INPUT)
-    args.add_tensor(dev_out.tensor((rows, cols), DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
-
-    # 6. Run, then D2H.
-    worker.run(handle, args, CallConfig())
-    worker.copy_from(host_out, dev_out)
-    worker.free(dev_a)
-    worker.free(dev_b)
-    worker.free(dev_out)
-finally:
-    worker.close()          # always; a leaked device stays locked
+```bash
+python examples/workers/l2/vector_add/main.py -p a2a3sim -d 0
 ```
 
-Here `host_a`, `host_b`, and `host_out` are contiguous CPU torch tensors of
-shape `(rows, cols)` and dtype `torch.float32`; `nbytes = rows * cols * 4`.
-Allocations return `Buffer` handles. For partial copies, pass `nbytes`,
-`src_offset`, and `dst_offset` by keyword.
+The same implementation is exercised by
+[`test_vector_add.py`](../../../examples/workers/l2/vector_add/test_vector_add.py).
+Its cases are manual; run the simulator case with:
+
+```bash
+pytest examples/workers/l2/vector_add/test_vector_add.py --platform a2a3sim --manual include
+```
+
+The example uses contiguous CPU torch tensors of shape `(128, 128)` and dtype
+`torch.float32`. Device allocations return `Buffer` handles. For partial copies,
+pass `nbytes`, `src_offset`, and `dst_offset` by keyword.
 
 Lifecycle and argument rules:
 
