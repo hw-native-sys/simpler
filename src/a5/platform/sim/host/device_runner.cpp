@@ -74,6 +74,14 @@ extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_host_graph_em
     return -1;
 }
 
+// Each host_runtime.so links one runtime source set. A5 HBG replaces this
+// no-op with the publisher for its resident scheduler state.
+extern "C" __attribute__((weak, visibility("hidden"))) bool publish_runtime_chip_swimlane_extensions(
+    Runtime * /*runtime*/
+) noexcept {
+    return true;
+}
+
 // a5 sim: malloc / free wrappers shared by the four profiling subsystems'
 // init_* methods. Plain function pointers convert implicitly into the
 // framework's std::function alloc / free shapes. Kept on the subclass (not
@@ -677,6 +685,9 @@ int DeviceRunner::drain_execution(ActiveExecution &) {
         chip_swimlane_collector_.read_phase_header_metadata();
         chip_swimlane_collector_.reconcile_counters();
         publish_host_phase_records_to_swimlane();
+        if (!publish_runtime_chip_swimlane_extensions(active_run_->runtime)) {
+            LOG_WARN("Runtime chip-swimlane extension publication failed");
+        }
         chip_swimlane_collector_.export_swimlane_json();
     }
 

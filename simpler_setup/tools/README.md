@@ -272,30 +272,10 @@ accurately alongside the swimlane capture. Run
 [`sched_overhead_analysis`](#sched_overhead_analysis) manually with both
 artifacts to get the scheduler-starvation / critical-path report.
 
-### Integration with run_example.py
-
-When running a test with profiling enabled, the converter is invoked automatically:
-
-```bash
-# Run the test with profiling enabled - merged_swimlane.json is generated automatically after the test passes
-python examples/scripts/run_example.py \
-    -k examples/host_build_graph/vector_example/kernels \
-    -g examples/host_build_graph/vector_example/golden.py \
-    --enable-chip-swimlane
-```
-
-After the test passes, the tool will:
-
-1. Auto-detect the latest `chip_swimlane_records_*.json` in outputs/
-2. Load function names from the kernel_config.py specified via `-k`
-3. Produce `merged_swimlane_*.json` for visualization
-4. Print the task statistics and scheduler overhead deep-dive report to the console
-
----
-
 ## sched_overhead_analysis
 
-Answer **"is the AICPU scheduler the bottleneck, or is it starved?"** by
+Answer **"is the scheduler the bottleneck, or is it starved?"** for either an
+AICPU or AICore scheduler by
 measuring, dependency- and MIX-aware, how much of the makespan a free core has
 ready, undispatched work — vs. legitimately busy or dependency-limited. Full
 model: [docs/dfx/sched-overhead-model.md](../../docs/dfx/sched-overhead-model.md).
@@ -305,9 +285,10 @@ model: [docs/dfx/sched-overhead-model.md](../../docs/dfx/sched-overhead-model.md
 `sched_overhead_analysis` needs **two artifacts, captured in SEPARATE runs**
 (co-running the flags perturbs timing — `dep_gen` adds per-submit overhead):
 
-1. **Perf profiling data** (`chip_swimlane_records_*.json`, level >= 3) from a
-   `--enable-chip-swimlane` run — per-task dispatch/start/end/finish +
-   `aicpu_scheduler_phases`.
+1. **Perf profiling data** (`chip_swimlane_records_*.json`, level >= 2) from a
+   `--enable-chip-swimlane` run — per-task dispatch/start/end/finish. Level >= 3
+   also supplies `scheduler_records` for the phase breakdown (legacy artifacts
+   with `aicpu_scheduler_phases` remain readable).
 2. **`deps.json`** (the task DAG) from a separate `--enable-dep-gen` run. It
    drives `ready(C) = max(producer.end)`, which is what separates scheduler
    bubbles from dependency stalls. **Required** — the tool errors without it.
@@ -333,7 +314,7 @@ python -m simpler_setup.tools.sched_overhead_analysis \
 
 | Option | Description |
 | ------ | ----------- |
-| `--chip-swimlane-records-json` | Path to the chip_swimlane_records_*.json file (level >= 3). If omitted, the latest under outputs/ is auto-selected. |
+| `--chip-swimlane-records-json` | Path to the chip_swimlane_records_*.json file (level >= 2). If omitted, the latest under outputs/ is auto-selected. |
 | `--deps-json` | Path to deps.json from a `--enable-dep-gen` run. **Required.** Falls back to a `deps.json` sibling of the perf JSON if present. |
 
 ### Outputs
@@ -343,10 +324,11 @@ Emitted in six parts:
 - **Part 1: Overhead verdict** — per-engine overhead (idle T-core *and* a ready, undispatched T-task, MIX-aware) + system `all_overhead` / `has_overhead`, all as % of makespan. An engine with no ready work is not overhead (dependency-mandated idle, not waste).
 - **Part 2: aicore switch** — the pre-dispatched pickup gap (`dispatch < prev_end`), reported **per core** (min/mean/max, ~0.8 µs each), the overhead-vs-independent split, and the makespan switch bound `[min over cores, sum of per-engine minima]`.
 - **Part 3 / 4: Head / Tail OH distributions** — P10–P99 + mean + total (per-task pickup and detect-latency magnitude).
-- **Part 5: AICPU scheduler loop breakdown** — per-thread loops, ns/loop, complete/dispatch/idle phase ratios, pop_hit / pop_miss, fanout / fanin, + the tail-vs-loop cause analysis.
+- **Part 5: Scheduler phase breakdown** — Level >= 3 reports the producer's phases. AICPU includes per-thread loop, queue-pop, fanout/fanin, and tail-vs-loop metrics; AICore reports its bootstrap/fanin/ready/dispatch/complete/refill/resolve/idle phase totals without applying AICPU-only queue formulas. At Level 2 this section is explicitly marked unavailable while Parts 1–4 and 6 remain available.
 - **Part 6: Critical-path latency attribution** — along the makespan path, scheduler-injected µs vs compute µs ("scheduler adds X% to the critical path").
 
-The perf JSON must be captured at chip_swimlane_level >= 3 so that `aicpu_scheduler_phases` is non-empty (rerun the case with `--enable-chip-swimlane` if the tool reports the field is missing).
+The common dependency-aware analysis works at chip_swimlane_level >= 2 for
+both scheduler producers. Capture level >= 3 when phase attribution is needed.
 
 ---
 
@@ -711,9 +693,13 @@ not from the perf JSON. See [`swimlane_converter --deps-json`](#swimlane_convert
 Top-level layout depends on `chip_swimlane_level`:
 
 - All levels: `chip_swimlane_level`, `tasks[]` (per-task fields above).
-- `>= 3`: also `aicpu_scheduler_phases[]` (per-thread phase records:
-  scan / complete / dispatch / idle) and `core_to_thread[]` (core_id →
-  scheduler thread index).
+- A5 HBG `>= 2`: also `aicpu_lifecycle_records[]`; the converter renders the
+  real handshake, topology/configuration, context-publication, bootstrap-wait,
+  register-release, and exit timestamps under `AICPU Lifecycle`.
+- `>= 3`: also `scheduler_records.streams[]`. Every Record has the common
+  `start_cycles`, `end_cycles`, `loop_iter`, `kind`, `tasks_processed`, and
+  nullable `task_id` fields. Stream metadata selects the AICPU or AICore
+  interpretation; producer-specific counters live in `metrics[]`.
 - `>= 4`: also `aicpu_orchestrator_phases[]` (per-task orchestrator
   phase records).
 

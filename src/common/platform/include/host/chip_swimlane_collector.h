@@ -25,12 +25,14 @@
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
 
+#include "common/chip_swimlane_extension.h"
 #include "common/chip_swimlane_profiling.h"
 #include "host/clock_correlation.h"
 #include "common/memory_barrier.h"
@@ -398,8 +400,8 @@ public:
 
     /**
      * Start a run's collection window: bind its artifact configuration, drop the
-     * previous run's records and counters, and — once the region exists —
-     * republish the level the device reads.
+     * previous run's records, counters, and runtime extensions, and — once the
+     * region exists — republish the level the device reads.
      *
      * The collector initializes once and serves every run, so this is the only
      * point at which a run's records, counters and device level are established;
@@ -415,9 +417,12 @@ public:
     void begin_run(const std::string &output_prefix, ChipSwimlaneLevel chip_swimlane_level) {
         output_prefix_ = output_prefix;
         chip_swimlane_level_ = chip_swimlane_level;
+        json_extensions_.fill({});
         reset_collector_shards();
         publish_run_config();
     }
+
+    bool set_json_extension(ChipSwimlaneExtensionSection section, const std::string &json_value);
 
     /**
      * Per-buffer callback invoked by ProfilerBase's poll loop. Dispatches on
@@ -593,6 +598,7 @@ private:
     // Per-task output directory captured at initialize() time. Consumed by
     // export_swimlane_json() to build <prefix>/chip_swimlane_records.json.
     std::string output_prefix_;
+    std::array<std::string, static_cast<size_t>(ChipSwimlaneExtensionSection::Count)> json_extensions_{};
 
     // Merged data, populated from per-collector shards after collector threads join.
     std::vector<std::vector<ChipSwimlaneAicpuTaskRecord>> collected_perf_records_;

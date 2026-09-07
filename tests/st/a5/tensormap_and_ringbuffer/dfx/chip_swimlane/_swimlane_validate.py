@@ -39,7 +39,7 @@ _REQUIRED_TASK_FIELDS = (
     "start_time_us",
     "end_time_us",
     # receive_time_us / local_setup_us are populated unconditionally by the
-    # AICore-side capture (v3 schema). propagation_us requires AICPU dispatch_ts
+    # AICore-side capture (v3 schema). propagation_us requires Scheduler dispatch_ts
     # and is therefore only present at level≥2 — not in this required-set.
     "receive_time_us",
     "local_setup_us",
@@ -80,15 +80,19 @@ def validate_perf_artifact(
     out_dir = max(matches, key=lambda p: p.stat().st_mtime)
     perf = out_dir / "chip_swimlane_records.json"
     assert perf.exists(), f"chip_swimlane_records.json missing under {out_dir} — swimlane capture failed?"
+    raw = json.loads(perf.read_text())
 
     # Read via the swimlane_converter loader so v2 host JSON gets joined into
     # the v1-shaped dict the rest of this validator (and the differential
     # oracle below) expects. Direct json.load(perf) would see only raw
-    # aicore_tasks / aicpu_tasks arrays under v2.
+    # aicore_tasks / scheduler_tasks raw streams.
     data = read_perf_data(perf)
-    assert data.get("chip_swimlane_level") in (1, 2, 3, 4), (
-        f"unexpected chip_swimlane_level: {data.get('chip_swimlane_level')}"
-    )
+    level = data.get("chip_swimlane_level")
+    assert level in (1, 2, 3, 4), f"unexpected chip_swimlane_level: {level}"
+    if level >= 2:
+        assert data.get("scheduler_task_producer") == "aicpu"
+        assert raw["scheduler_tasks"]["schema_version"] == 1
+        assert raw["scheduler_tasks"]["producer"] == "aicpu"
     tasks = data.get("tasks")
     assert isinstance(tasks, list), "tasks field missing or not a list"
     assert len(tasks) > 0, f"perf records empty under {perf}"

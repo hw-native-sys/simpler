@@ -190,6 +190,13 @@ static uint32_t get_chip_swimlane_level(void *runner_ctx) {
     return static_cast<SimDeviceRunnerBase *>(runner_ctx)->chip_swimlane_level();
 }
 
+static bool publish_chip_swimlane_extension(
+    void *runner_ctx, ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size
+) {
+    return runner_ctx != nullptr && static_cast<SimDeviceRunnerBase *>(runner_ctx)
+                                        ->publish_chip_swimlane_extension(section, json_value, json_size);
+}
+
 static void *host_phase_pool_arm(void *runner_ctx, int producer_wants_records) {
     if (runner_ctx == nullptr) return nullptr;
     return static_cast<SimDeviceRunnerBase *>(runner_ctx)->host_phase_pool_arm(producer_wants_records != 0);
@@ -302,6 +309,7 @@ static const HostApiOps g_host_api_ops = {
     .get_chip_swimlane_level = get_chip_swimlane_level,
     .host_phase_pool_arm = host_phase_pool_arm,
     .host_phase_pool_finish = host_phase_pool_finish,
+    .publish_chip_swimlane_extension = publish_chip_swimlane_extension,
 };
 
 /* ===========================================================================

@@ -472,6 +472,31 @@ set_tests_properties(test_native_run_acceptance PROPERTIES LABELS "no_hardware")
 # callers invoke it from different host threads.
 add_common_utils_test(test_host_api common/test_host_api.cpp)
 
+# Runtime extension payloads are per-run state even though the collector's
+# shared-memory resources remain resident across runs.
+add_executable(test_chip_swimlane_collector
+    common/test_chip_swimlane_collector.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/chip_swimlane_collector.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/clock_correlation.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/sim/host/profiling_copy.cpp
+    ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
+)
+target_compile_definitions(test_chip_swimlane_collector PRIVATE SIMPLER_RUNTIME_NAME="test_runtime")
+target_include_directories(test_chip_swimlane_collector PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+)
+target_link_libraries(test_chip_swimlane_collector PRIVATE
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    pthread
+)
+add_test(NAME test_chip_swimlane_collector COMMAND test_chip_swimlane_collector)
+set_tests_properties(test_chip_swimlane_collector PROPERTIES LABELS "no_hardware")
+
 # Sim kernel threads publish one sticky completion state. A gated unit test
 # proves submission and completion are separate without relying on kernel
 # duration or host scheduling.

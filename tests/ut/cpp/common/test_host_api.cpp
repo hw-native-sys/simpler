@@ -15,10 +15,12 @@
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
 #include "common/host_api.h"
+#include "common/chip_swimlane_extension.h"
 
 namespace {
 
@@ -83,6 +85,10 @@ bool all_equal(const std::vector<uint32_t> &values, uint32_t expected) {
     });
 }
 
+bool throwing_extension_callback(void *, ChipSwimlaneExtensionSection, const char *, size_t) {
+    throw std::runtime_error("publication failed");
+}
+
 }  // namespace
 
 TEST(HostApiTest, BoundRunnerSlotAndBankSurviveConcurrentCrossThreadCalls) {
@@ -124,4 +130,34 @@ TEST(HostApiTest, BoundRunnerSlotAndBankSurviveConcurrentCrossThreadCalls) {
     EXPECT_TRUE(all_equal(runner_a.arena_banks, kRunnerABank));
     EXPECT_TRUE(all_equal(runner_b.pipeline_slots, kRunnerBSlot));
     EXPECT_TRUE(all_equal(runner_b.arena_banks, kRunnerBBank));
+}
+
+TEST(HostApiTest, PublicationExceptionsBecomeFailureResults) {
+    HostApiOps ops{};
+    ops.publish_chip_swimlane_extension = throwing_extension_callback;
+    const HostApi api(nullptr, 0, 0, &ops);
+
+    EXPECT_FALSE(api.publish_chip_swimlane_extension(ChipSwimlaneExtensionSection::SchedulerRecords, "{}", 2));
+}
+
+TEST(ChipSwimlaneExtensionTest, ExposesOnlyFixedSectionNamesAndShapes) {
+    EXPECT_STREQ(chip_swimlane_extension_section_name(ChipSwimlaneExtensionSection::AicoreTasks), "aicore_tasks");
+    EXPECT_STREQ(
+        chip_swimlane_extension_section_name(ChipSwimlaneExtensionSection::SchedulerRecords), "scheduler_records"
+    );
+    EXPECT_STREQ(chip_swimlane_extension_section_name(ChipSwimlaneExtensionSection::SchedulerTasks), "scheduler_tasks");
+    EXPECT_STREQ(
+        chip_swimlane_extension_section_name(ChipSwimlaneExtensionSection::AicpuLifecycleRecords),
+        "aicpu_lifecycle_records"
+    );
+    EXPECT_TRUE(chip_swimlane_extension_section_is_object(ChipSwimlaneExtensionSection::SchedulerTasks));
+    EXPECT_TRUE(chip_swimlane_extension_section_is_object(ChipSwimlaneExtensionSection::SchedulerRecords));
+    EXPECT_FALSE(chip_swimlane_extension_section_is_object(ChipSwimlaneExtensionSection::AicoreTasks));
+    EXPECT_FALSE(chip_swimlane_extension_section_is_valid(ChipSwimlaneExtensionSection::Count));
+    EXPECT_EQ(chip_swimlane_extension_section_name(ChipSwimlaneExtensionSection::Count), nullptr);
+    EXPECT_TRUE(chip_swimlane_extension_has_expected_root(ChipSwimlaneExtensionSection::SchedulerRecords, " {} "));
+    EXPECT_TRUE(chip_swimlane_extension_has_expected_root(ChipSwimlaneExtensionSection::SchedulerTasks, " {} "));
+    EXPECT_TRUE(chip_swimlane_extension_has_expected_root(ChipSwimlaneExtensionSection::AicoreTasks, " [] "));
+    EXPECT_FALSE(chip_swimlane_extension_has_expected_root(ChipSwimlaneExtensionSection::SchedulerRecords, "[]"));
+    EXPECT_FALSE(chip_swimlane_extension_has_expected_root(ChipSwimlaneExtensionSection::AicoreTasks, "{}"));
 }

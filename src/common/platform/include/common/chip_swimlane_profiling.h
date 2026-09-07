@@ -62,6 +62,7 @@
 #include "common/dfx_backpressure_device.h"
 #include "common/host_phase_kind.h"
 #include "common/platform_config.h"
+#include "common/scheduler_profiling.h"
 
 // =============================================================================
 // chip swimlane_level — granularity ladder for the chip swimlane profiler.
@@ -483,133 +484,6 @@ static_assert(sizeof(ChipSwimlaneDataHeader) % 64 == 0, "ChipSwimlaneDataHeader 
 //   splits live in the device cold-path log as cumulative counters
 //   (`g_orch_*_cycle`) — they answer "which sub-step dominates overall";
 //   the per-submit envelope answers "which submit was slow".
-
-/** Discriminator for the SCHED phase records (the orch side has no kind).
- *
- * Three role classes, but they share one enum so the on-device record carries
- * a single discriminator byte:
- *
- *   OUTER (mutually time-exclusive within an iter; emit advances _t0_phase):
- *     Complete, Dispatch, Release, Dummy, EarlyDispatch, AsyncPoll, Drain,
- *     GraphPrepare.
- *     Every iter is a sequence of zero-or-more outer bars + optional gap.
- *
- *   INNER (no anchor advance; Perfetto auto-nests by time containment):
- *     Resolve in the tensormap_and_ringbuffer runtime, plus DrainPrepare and
- *     DrainPublish. Resolve is contained by Complete or Dummy there.
- *
- *   HBG RESOLUTION-THREAD OUTER:
- *     ResolveStandalone, AsyncPoll, and Dummy. The host_build_graph runtime
- *     hands FIN'd slots from S threads to a dedicated P thread, so these are
- *     standalone, mutually exclusive P-thread bars rather than nested
- *     S-thread work.
- *
- *   SEPARATE-LANE (converter routes to Worker View pid=4, not the sched lane):
- *     DummyTask and PredicatedSkip. One zero-width marker per dependency-only
- *     completion keeps the DAG node visible on its handling AICPU's lane; the
- *     surrounding Dummy outer bar (sched lane) carries the actual drain time,
- *     and Resolve inside that bar carries the consumer-release work.
- */
-enum class ChipSwimlaneSchedPhaseKind : uint32_t {
-    // Outer
-    Complete = 0,       // check_running_cores_for_completion: observe FINs +
-                        // run on_task_complete inline. tasks_processed = FIN'd
-                        // subtasks + sub-block retires this iter.
-    Dispatch = 1,       // dispatch_ready_tasks: publish ready tasks to AICore.
-                        // tasks_processed = subtasks published this iter.
-    Release = 2,        // Deferred-release drain (on_task_release work).
-                        // tasks_processed = slots released this iter.
-    Dummy = 4,          // dummy_drain outer bar: covers explicit dummies and
-                        // false-predicate tasks popped this iter.
-                        // tasks_processed = dummy_got count.
-    EarlyDispatch = 5,  // try_early_dispatch: early-dispatch pre-staging
-                        // of a flagged producer's consumer's gated blocks.
-                        // tasks_processed = blocks staged this pass.
-    // Inner in tensormap_and_ringbuffer (parent: Complete | Dummy).
-    Resolve = 6,  // Complete ready work after FIN observation. tasks_processed
-                  // is consumers visited.
-    // Separate-lane (Worker View pid=4 AICPU_N)
-    DummyTask = 7,      // Per-dummy identity marker (zero-width). phase_data.dummy_task
-                        // carries the local/ring components of the full task identity.
-    Drain = 8,          // handle_drain_mode outer: the sync_start stop-the-world drain
-                        // (ack barrier + availability + parallel stage + finalize).
-                        // One bar per dispatch-loop iteration that enters the drain,
-                        // so retries show as multiple bars. Otherwise this time is a
-                        // swimlane blind spot (the loop `continue`s past all records).
-    DrainPrepare = 9,   // inner: this thread's global sync_start staging prepare pass
-                        // (cluster scan + build_payload). tasks_processed = subtasks.
-    DrainPublish = 10,  // inner: this thread's global sync_start staging publish pass
-                        // (MMIO write_reg per subtask). tasks_processed = subtasks.
-    // Outer (sched lane): async-wait completion polling, split out of Complete
-    // so async-engine (SDMA/RoCE/URMA/CCU) wait time is attributed to its own
-    // bar. tasks_processed = async subtasks completed this iter.
-    AsyncPoll = 11,
-    // Separate-lane (Worker View pid=4 AICPU_N)
-    PredicatedSkip = 12,  // Per-task marker for a real task retired inline because
-                          // its dispatch predicate evaluated false. Uses the same
-                          // phase_data.dummy_task identity payload as DummyTask.
-    // Outer (sched lane): one bounded Graph Definition materialization slice.
-    // phase_data.graph_task identifies the ring-0 outer Graph task and
-    // tasks_processed is the number of in-graph tasks patched in this slice.
-    GraphPrepare = 13,
-    // Outer on host_build_graph's dedicated P thread. Kept distinct from the
-    // nested TMR Resolve so post-processing never infers the role from rounded
-    // timestamps. tasks_processed is completed SPSC slots.
-    ResolveStandalone = 14,
-};
-
-/** Index layout of the queue-depth snapshot arrays below: AIC=0, AIV=1, MIX=2.
- *  Must match ResourceShape's first three values (see submit_types.h).
- *  Hardcoded here rather than included to keep this header runtime-independent. */
-constexpr int CHIP_SWIMLANE_NUM_QUEUE_SHAPES = 3;
-
-/**
- * AICPU scheduler phase record (64 bytes).
- *
- * Position in the per-thread buffer is the identity — no thread_id field.
- *
- * phase_data is tagged by kind: Dispatch uses its ready-queue counters and
- * DummyTask and PredicatedSkip use the local/ring components of the full task
- * id. Other kinds store zero in the Dispatch view.
- *
- * Queue-depth snapshots (shared_depth_*) record the per-shape scheduler ready
- * queue occupancy at phase boundaries. They surface the dep-release-then-
- * discovery latency that head OH alone can't distinguish from register-write
- * latency. Filled with 0 below SCHED_PHASES.
- */
-struct ChipSwimlaneAicpuSchedPhaseRecord {
-    uint64_t start_time;              // Phase start timestamp
-    uint64_t end_time;                // Phase end timestamp
-    uint32_t loop_iter;               // Scheduler-loop iteration number on this thread
-    ChipSwimlaneSchedPhaseKind kind;  // see enum above
-    uint32_t tasks_processed;         // Tasks processed in this phase batch
-    union {
-        struct {
-            uint32_t pop_hit;   // Ready-queue hit delta since the previous Dispatch emit
-            uint32_t pop_miss;  // Ready-queue miss delta since the previous Dispatch emit
-        } dispatch;
-        struct {
-            uint32_t local_id;  // task_id bits [31:0]
-            uint32_t ring_id;   // task_id bits [63:32]
-        } dummy_task;
-        struct {
-            uint32_t local_id;  // outer Graph task_id bits [31:0]
-            uint32_t ring_id;   // outer Graph task_id bits [63:32]
-        } graph_task;
-    } phase_data;
-    int16_t shared_depth_at_start[CHIP_SWIMLANE_NUM_QUEUE_SHAPES];  // sched->ready_queues[shape].size()
-    int16_t shared_depth_at_end[CHIP_SWIMLANE_NUM_QUEUE_SHAPES];
-    uint32_t _pad[4];  // 64B alignment padding
-};
-static_assert(
-    sizeof(decltype(ChipSwimlaneAicpuSchedPhaseRecord::phase_data)) == 8,
-    "ChipSwimlaneAicpuSchedPhaseRecord phase data must remain 8 bytes"
-);
-static_assert(
-    offsetof(ChipSwimlaneAicpuSchedPhaseRecord, phase_data) == 28,
-    "ChipSwimlaneAicpuSchedPhaseRecord phase data offset drift"
-);
-static_assert(sizeof(ChipSwimlaneAicpuSchedPhaseRecord) == 64, "ChipSwimlaneAicpuSchedPhaseRecord layout drift");
 
 /**
  * AICPU orchestrator phase record (32 bytes).

@@ -78,6 +78,14 @@ extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_host_graph_em
     return -1;
 }
 
+// Each host_runtime.so links one runtime source set. A5 HBG replaces this
+// no-op with the publisher for its resident scheduler state.
+extern "C" __attribute__((weak, visibility("hidden"))) bool publish_runtime_chip_swimlane_extensions(
+    Runtime * /*runtime*/
+) noexcept {
+    return true;
+}
+
 // =============================================================================
 // DeviceRunner Implementation
 // =============================================================================
@@ -624,11 +632,17 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
         recover_device_or_mark_unusable(rc);
         // Emergency shutdown may already have flushed diagnostics. Export the
         // manifest on the error path exactly once.
+        if (enable_chip_swimlane_ && !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
+            LOG_WARN("Runtime chip-swimlane extension publication failed");
+        }
         teardown_shared_collectors_after_run(false);
         return rc;
     }
 
     read_device_wall_ns();
+    if (enable_chip_swimlane_ && !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
+        LOG_WARN("Runtime chip-swimlane extension publication failed");
+    }
     teardown_shared_collectors_after_run(true);
 
     // a5-specific dep_gen teardown: host-orch emits the graph its orchestration

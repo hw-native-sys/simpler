@@ -282,7 +282,7 @@ legacy_aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type
             //   - reg_task_id is `task_id` (= reg_val, the per-core dispatch
             //     token AICore just read from DATA_MAIN_BASE). Per-dispatch
             //     unique within this core; host uses it as the join key
-            //     against the AICPU record stream. Required for correctness
+            //     against the Scheduler task record stream. Required for correctness
             //     under SPMD (block_num > num_cores) and MIX cluster spread,
             //     where multiple dispatches of the same task share the same
             //     task_token_raw.

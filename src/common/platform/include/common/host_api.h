@@ -13,6 +13,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "common/chip_swimlane_extension.h"
+
 /**
  * Host API function pointers for device memory operations.
  * Allows a runtime to use pluggable device-memory backends.
@@ -145,6 +147,9 @@ struct HostApiOps {
     uint32_t (*get_chip_swimlane_level)(void *runner_ctx);
     void *(*host_phase_pool_arm)(void *runner_ctx, int producer_wants_records);
     void (*host_phase_pool_finish)(void *runner_ctx, uint64_t submitted_tasks, uint64_t invocation_id);
+    bool (*publish_chip_swimlane_extension)(
+        void *runner_ctx, ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size
+    );
 };
 
 /**
@@ -251,6 +256,18 @@ public:
     void host_phase_pool_finish(uint64_t submitted_tasks, uint64_t invocation_id) const noexcept {
         if (ops_->host_phase_pool_finish != nullptr) {
             ops_->host_phase_pool_finish(runner_ctx_, submitted_tasks, invocation_id);
+        }
+    }
+    bool publish_chip_swimlane_extension(
+        ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size
+    ) const noexcept {
+        if (ops_->publish_chip_swimlane_extension == nullptr || !chip_swimlane_extension_section_is_valid(section) ||
+            json_value == nullptr)
+            return false;
+        try {
+            return ops_->publish_chip_swimlane_extension(runner_ctx_, section, json_value, json_size);
+        } catch (...) {
+            return false;
         }
     }
 

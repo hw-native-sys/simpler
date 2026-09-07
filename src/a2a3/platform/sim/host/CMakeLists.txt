@@ -100,7 +100,13 @@ target_compile_options(host_runtime
 
 # Platform name baked into the shared get_platform() impl in
 # src/common/platform/shared/host/platform_compile_info.cpp.
-target_compile_definitions(host_runtime PRIVATE SIMPLER_PLATFORM_NAME="a2a3sim")
+if(NOT DEFINED SIMPLER_RUNTIME_NAME OR SIMPLER_RUNTIME_NAME STREQUAL "")
+    message(FATAL_ERROR "host_runtime requires -DSIMPLER_RUNTIME_NAME=<runtime>")
+endif()
+target_compile_definitions(host_runtime PRIVATE
+    SIMPLER_PLATFORM_NAME="a2a3sim"
+    SIMPLER_RUNTIME_NAME="${SIMPLER_RUNTIME_NAME}"
+)
 
 # Include directories
 target_include_directories(host_runtime

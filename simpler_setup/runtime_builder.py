@@ -389,6 +389,11 @@ class RuntimeBuilder:
                     pto_root = ensure_pto_isa_root(verbose=True)
                 defines["PTO_ISA_ROOT"] = pto_root
             if target == "host":
+                # host_runtime.so is built once per runtime implementation, so
+                # bake that immutable artifact identity into the shared host
+                # platform code.  Runtime code must not grow a virtual/static
+                # API merely to report the directory it was compiled from.
+                defines["SIMPLER_RUNTIME_NAME"] = name
                 if build_pto_isa_commit:
                     defines["SIMPLER_PTO_ISA_BUILD_COMMIT"] = build_pto_isa_commit
                 for opt_in_define in ("SIMPLER_ENABLE_PTO_URMA_WORKSPACE",):

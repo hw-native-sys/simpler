@@ -11,8 +11,9 @@
 
 Inputs (BOTH required, captured in SEPARATE runs — do not co-run the flags, as
 dep_gen perturbs the swimlane timing):
-  1. Per-task perf profiling data (chip_swimlane_records_*.json) with
-     ``aicpu_scheduler_phases``, from a ``--enable-chip-swimlane`` (level >= 3) run.
+  1. Per-task perf profiling data (chip_swimlane_records_*.json) from a
+     ``--enable-chip-swimlane`` level >= 2 run. Level >= 3 additionally supplies
+     ``scheduler_records`` for the producer-specific phase breakdown.
   2. deps.json (the task DAG) from a separate ``--enable-dep-gen`` run. It drives
      ready(C) = max(producer.end), which separates scheduler bubbles from
      dependency stalls. Required — the report errors without it.
@@ -20,7 +21,7 @@ dep_gen perturbs the swimlane timing):
 Report (see docs/dfx/sched-overhead-model.md for the model):
   Part 1 Overhead verdict (per-engine + system all/has overhead, % of makespan) |
   Part 2 aicore switch (per-core pickup totals + makespan bound) |
-  Part 3/4 Head/Tail OH distributions | Part 5 scheduler loop budget |
+  Part 3/4 Head/Tail OH distributions | Part 5 scheduler phase budget |
   Part 6 critical-path attribution.
 
 Usage:
@@ -178,12 +179,14 @@ def auto_select_chip_swimlane_records_json():
 
 
 def parse_scheduler_from_json_phases(data):  # noqa: PLR0912
-    """Extract scheduler Phase breakdown from chip_swimlane_records JSON.
+    """Extract Scheduler phase breakdown from decoded swimlane data.
 
     Computes per-thread loop counts, logical task counts, FIN/retire counts,
-    and phase totals from aicpu_scheduler_phases records (present at
-    chip_swimlane_level >= 3). Complete.tasks_processed is a FIN/retire count;
-    logical task counts are reconstructed from the final finish row per task.
+    and phase totals from the normalized ``scheduler_records`` stream lists
+    produced by ``swimlane_converter._decode_perf_data``. These records are
+    present at chip_swimlane_level >= 3. Complete.tasks_processed is a
+    FIN/retire count; logical task counts are reconstructed from the final
+    finish row per task.
 
     Returns:
         dict: Thread data keyed by thread index, with per-phase us / pct,
@@ -191,7 +194,7 @@ def parse_scheduler_from_json_phases(data):  # noqa: PLR0912
               and finishes_per_loop. Returns
               empty dict if phase data is not available.
     """
-    phases_by_thread = data.get("aicpu_scheduler_phases", [])
+    phases_by_thread = data.get("scheduler_records") or data.get("aicpu_scheduler_phases", [])
     if not phases_by_thread:
         return {}
 
@@ -320,6 +323,60 @@ def parse_scheduler_from_json_phases(data):  # noqa: PLR0912
         threads[tid] = t
 
     return threads
+
+
+def print_aicore_scheduler_phase_breakdown(data):
+    """Print AICore Scheduler phase totals without AICPU queue assumptions."""
+    scheduler_records = data.get("scheduler_records") or []
+    scheduler_streams = data.get("scheduler_streams") or []
+    totals = defaultdict(float)
+    counts = defaultdict(int)
+    dropped = 0
+    for stream_index, records in enumerate(scheduler_records):
+        for record in records:
+            kind = canonical_sched_phase(record.get("phase", "unknown"))
+            totals[kind] += max(0.0, record.get("end_time_us", 0.0) - record.get("start_time_us", 0.0))
+            counts[kind] += 1
+        if stream_index < len(scheduler_streams):
+            capture = scheduler_streams[stream_index].get("capture") or {}
+            dropped += int(capture.get("dropped") or 0)
+
+    print("=" * 90)
+    print("Part 5: AICore scheduler phase breakdown")
+    print("=" * 90)
+    if not scheduler_records:
+        print("  (phase records unavailable at chip-swimlane Level 2; capture Level >= 3 for this section)")
+        print("=" * 90)
+        return
+
+    print(f"  Scheduler streams: {len(scheduler_records)}")
+    print("  Phase time is summed over AICore scheduler streams and can exceed wall-clock time.")
+    print()
+    for kind in sorted(totals):
+        print(f"  {kind:<16} records={counts[kind]:>6} total={totals[kind]:>10.3f} us")
+    print(f"  dropped={dropped}")
+    print("  Queue-pop and AICPU polling-loop metrics are producer-specific and are omitted.")
+    print("=" * 90)
+
+
+def print_critical_path(preds_by_id, end_by_id, finish_by_id, start_by_id, dispatch_by_id, w0):
+    """Print dependency-aware critical-path latency attribution."""
+    cp = compute_critical_path(preds_by_id, end_by_id, finish_by_id, start_by_id, dispatch_by_id, w0)
+    print()
+    print("=" * 90)
+    print("Part 6: Critical-path latency attribution")
+    print("=" * 90)
+    if cp and cp["span"] > 0:
+        sched_pct = cp["sched"] / cp["span"] * 100
+        exec_pct = cp["exec"] / cp["span"] * 100
+        print(f"  Makespan-determining path: {cp['hops']} hops, span {cp['span']:.1f} us")
+        print(f"    Compute (exec) on path : {cp['exec']:.1f} us ({exec_pct:.1f}%)")
+        print(f"    Scheduler injected     : {cp['sched']:.1f} us ({sched_pct:.1f}%)")
+        print(f"    Other (dep wait on path): {max(0.0, cp['span'] - cp['exec'] - cp['sched']):.1f} us")
+        print(f"  -> scheduler adds ~{sched_pct:.1f}% to the critical path's end-to-end latency.")
+    else:
+        print("  (could not resolve a critical path from the DAG)")
+    print("=" * 90)
 
 
 def _summarize_scheduler_loops(threads):
@@ -686,8 +743,12 @@ def compute_critical_path(preds_by_id, end_by_id, finish_by_id, start_by_id, dis
         exec_total += max(0.0, end_by_id.get(cur, 0.0) - start_by_id.get(cur, 0.0))
         if not preds:
             # root: dispatch->start head
-            sched_total += max(0.0, start_by_id.get(cur, w0) - dispatch_by_id.get(cur, w0))
-            path_start = min(path_start, start_by_id.get(cur, w0))
+            root_dispatch = dispatch_by_id.get(cur, start_by_id.get(cur, w0))
+            sched_total += max(0.0, start_by_id.get(cur, w0) - root_dispatch)
+            # The root's dispatch->start delay is part of scheduler latency,
+            # so the path span must begin at dispatch as well. Starting at the
+            # kernel start made scheduler+compute exceed 100% of the span.
+            path_start = min(path_start, root_dispatch)
             break
         pend, p = max(preds)
         sched_total += max(0.0, start_by_id.get(cur, 0.0) - pend)  # producer.end -> consumer.start
@@ -743,11 +804,20 @@ def run_analysis(  # noqa: PLR0912, PLR0915
     else:
         # Lazy import to avoid an import cycle: swimlane_converter imports
         # run_analysis from this module at top level. read_perf_data does the
-        # AICore↔AICPU join — direct json.load would see only the raw
-        # aicore_tasks / aicpu_tasks arrays.
+        # AICore↔Scheduler join; direct json.load sees only the raw streams.
         from .swimlane_converter import read_perf_data  # noqa: PLC0415
 
         data = read_perf_data(chip_swimlane_records_path)
+    scheduler_producers = {
+        stream.get("producer") for stream in data.get("scheduler_streams", []) if stream.get("producer")
+    }
+    task_producer = data.get("scheduler_task_producer")
+    if task_producer:
+        scheduler_producers.add(task_producer)
+    if len(scheduler_producers) > 1:
+        print("Error: mixed AICPU/AICore scheduler producers are unsupported", file=sys.stderr)
+        return 1
+    scheduler_producer = next(iter(scheduler_producers), "aicpu")
     tasks = data["tasks"]
     n_total = len(tasks)
 
@@ -895,15 +965,23 @@ def run_analysis(  # noqa: PLR0912, PLR0915
     print_distribution("Tail OH", tails)
     print()
 
-    # === Part 5: AICPU scheduler loop breakdown (+ tail-vs-loop cause analysis) ===
+    # === Part 5: producer-specific scheduler phase breakdown ===
+    # Parts 1-4 and 6 are based on the common per-task dispatch/start/end/finish
+    # contract and therefore apply equally to AICPU and AICore schedulers.
+    if scheduler_producer == "aicore":
+        print_aicore_scheduler_phase_breakdown(data)
+        print_critical_path(preds_by_id, end_by_id, finish_by_id, start_by_id, dispatch_by_id, w0)
+        return 0
+
     threads = parse_scheduler_from_json_phases(data)
     if not threads:
-        print(
-            "Error: perf JSON has no aicpu_scheduler_phases — rerun the case "
-            "with --enable-chip-swimlane so phase data is captured.",
-            file=sys.stderr,
-        )
-        return 1
+        print("=" * 90)
+        print("Part 5: AICPU scheduler loop breakdown")
+        print("=" * 90)
+        print("  (phase records unavailable at chip-swimlane Level 2; capture Level >= 3 for this section)")
+        print("=" * 90)
+        print_critical_path(preds_by_id, end_by_id, finish_by_id, start_by_id, dispatch_by_id, w0)
+        return 0
 
     # Per-thread fanout / fanin from the (already-loaded, required) deps.json.
     dag_stats_available = True
@@ -1057,22 +1135,7 @@ def run_analysis(  # noqa: PLR0912, PLR0915
     print("=" * 90)
 
     # === Part 6: Critical-path latency attribution ===
-    cp = compute_critical_path(preds_by_id, end_by_id, finish_by_id, start_by_id, dispatch_by_id, w0)
-    print()
-    print("=" * 90)
-    print("Part 6: Critical-path latency attribution")
-    print("=" * 90)
-    if cp and cp["span"] > 0:
-        sched_pct = cp["sched"] / cp["span"] * 100
-        exec_pct = cp["exec"] / cp["span"] * 100
-        print(f"  Makespan-determining path: {cp['hops']} hops, span {cp['span']:.1f} us")
-        print(f"    Compute (exec) on path : {cp['exec']:.1f} us ({exec_pct:.1f}%)")
-        print(f"    Scheduler injected     : {cp['sched']:.1f} us ({sched_pct:.1f}%)")
-        print(f"    Other (dep wait on path): {max(0.0, cp['span'] - cp['exec'] - cp['sched']):.1f} us")
-        print(f"  -> scheduler adds ~{sched_pct:.1f}% to the critical path's end-to-end latency.")
-    else:
-        print("  (could not resolve a critical path from the DAG)")
-    print("=" * 90)
+    print_critical_path(preds_by_id, end_by_id, finish_by_id, start_by_id, dispatch_by_id, w0)
 
     return 0
 

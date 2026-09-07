@@ -709,8 +709,8 @@ def _load_task_meta(deps_path, func_names=None):
     if not perf_path.exists():
         return {}
     try:
-        # Route through swimlane_converter.read_perf_data so v2 raw on-disk
-        # JSON (aicore_tasks/aicpu_tasks flat tuples in cycle domain) gets
+        # Route through swimlane_converter.read_perf_data so raw on-disk
+        # JSON (AICore and Scheduler tuples in the cycle domain) gets
         # joined into the v1-shape dict this function expects. Direct
         # json.load would see no top-level `tasks` array on v2 and silently
         # return {} — leaving every node uncolored / unlabeled.

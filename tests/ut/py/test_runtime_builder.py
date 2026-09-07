@@ -397,7 +397,10 @@ class TestRuntimeBuilderGetBinaries:
             "SIMPLER_TENSORMAP_PROFILING": "0",
         }
         for call in mock_instance.compile.call_args_list:
-            assert call.kwargs["cmake_defines"] == expected_defaults
+            expected = dict(expected_defaults)
+            if call.args[0] == "host":
+                expected["SIMPLER_RUNTIME_NAME"] = "test_rt"
+            assert call.kwargs["cmake_defines"] == expected
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_reuses_prebuilt_shared_libraries(self, MockCompiler, tmp_path, default_test_platform, test_arch):
@@ -434,7 +437,10 @@ class TestRuntimeBuilderGetBinaries:
 
         assert mock_instance.compile.call_count == 3
         for call in mock_instance.compile.call_args_list:
-            assert call.kwargs["cmake_defines"] == config
+            expected = dict(config)
+            if call.args[0] == "host":
+                expected["SIMPLER_RUNTIME_NAME"] = "test_rt"
+            assert call.kwargs["cmake_defines"] == expected
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_resolves_paths_relative_to_config(self, MockCompiler, tmp_path, default_test_platform, test_arch):
@@ -527,6 +533,7 @@ class TestRuntimeBuilderGetBinaries:
             **profiling,
             "PTO_ISA_ROOT": "/tmp/pto-isa",
             "SIMPLER_PTO_ISA_BUILD_COMMIT": pin,
+            "SIMPLER_RUNTIME_NAME": "test_rt",
         }
         # aicore needs the checkout path too, for the SDMA warmup kernel's
         # vector-only target, but not the commit stamp (that keys the host ccache).

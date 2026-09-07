@@ -733,6 +733,11 @@ public:
         enable_chip_swimlane_ = (chip_swimlane_level_ != ChipSwimlaneLevel::DISABLED);
     }
     uint32_t chip_swimlane_level() const { return static_cast<uint32_t>(chip_swimlane_level_); }
+    bool
+    publish_chip_swimlane_extension(ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size) {
+        return json_value != nullptr &&
+               chip_swimlane_collector_.set_json_extension(section, std::string(json_value, json_size));
+    }
     HostPhaseRecordPool *host_phase_pool_arm(bool producer_wants_records) noexcept;
     void host_phase_pool_finish(uint64_t submitted_tasks, uint64_t invocation_id) noexcept {
         host_phase_records_.finish(submitted_tasks, invocation_id);
