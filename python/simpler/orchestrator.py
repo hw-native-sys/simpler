@@ -348,18 +348,13 @@ class Orchestrator:
         # Provenance validation precedes run ownership publication. Once a remote
         # ref is published, only the run fence may release it because the native
         # submit can commit before an exception reaches Python.
-        device_args = worker._device_identities_in_args(c_args) if worker is not None else []
+        needs_prov = worker is not None and worker._names_device_allocation(c_args)
         prov_guard: Any = contextlib.nullcontext()
-        if device_args and worker is not None:
+        if needs_prov:
             prov_guard = worker._child_prov_lock
         with prov_guard:
-            if device_args and worker is not None:
-                worker._child_prov_check_dispatch_locked(
-                    device_args,
-                    cpp_worker_id,
-                    args=c_args,
-                    api="submit_next_level",
-                )
+            if needs_prov:
+                worker._child_prov_check_dispatch_locked(c_args, cpp_worker_id, api="submit_next_level")
             if worker is not None:
                 worker._adopt_remote_sidecar_refs((remote_sidecar,))
                 worker._record_touched_identities(c_args)
@@ -456,24 +451,18 @@ class Orchestrator:
         # must be live on that member's exact submitted target.
         # Run this fallible analysis before publishing remote-ref ownership.
         worker = self._worker
-        member_checks: list[tuple[list[tuple[CanonicalIdentity, int]], int, TaskArgs]] = []
+        member_checks: list[tuple[int, TaskArgs]] = []
         if worker is not None:
             for g, c_args in enumerate(c_args_list):
-                device_args = worker._device_identities_in_args(c_args)
-                if device_args:
-                    member_checks.append((device_args, worker_ids[g], c_args))
+                if worker._names_device_allocation(c_args):
+                    member_checks.append((worker_ids[g], c_args))
         prov_guard: Any = (
             worker._child_prov_lock if (worker is not None and member_checks) else contextlib.nullcontext()
         )
         with prov_guard:
-            for device_args, target_worker_id, c_args in member_checks:
+            for target_worker_id, c_args in member_checks:
                 assert worker is not None
-                worker._child_prov_check_dispatch_locked(
-                    device_args,
-                    target_worker_id,
-                    args=c_args,
-                    api="submit_next_level_group",
-                )
+                worker._child_prov_check_dispatch_locked(c_args, target_worker_id, api="submit_next_level_group")
             if worker is not None and remote_sidecars is not None:
                 worker._adopt_remote_sidecar_refs(remote_sidecars)
             if worker is not None:

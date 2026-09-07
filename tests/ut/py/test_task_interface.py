@@ -47,6 +47,9 @@ from simpler.buffer import (
     wrap_fork_inherited,
 )
 from simpler.task_interface import (
+    PROV_DESCRIPTOR_MISMATCH,
+    PROV_NOT_LIVE,
+    ProvenanceTable,
     RemoteAddressSpace,
     RemoteBufferExport,
     RemoteBufferHandle,
@@ -69,6 +72,22 @@ def _dev_ref(addr, shapes, dtype, tag=None):
     return wrap_device_malloc(addr, nbytes, mint_owner_instance_id(), next(_REF_BID), "L2").tensor(
         tuple(shapes), int(dtype.value)
     )
+
+
+def _fork_ref(addr, shapes, dtype):
+    """A host-backed (FORK_SHM) ``Tensor``: names memory the owner allocation table does not hold."""
+    nbytes = get_element_size(dtype)
+    for s in shapes:
+        nbytes *= int(s)
+    return wrap_fork_inherited(
+        addr,
+        nbytes,
+        mint_owner_instance_id(),
+        next(_REF_BID),
+        "L2",
+        access=AccessMode.READWRITE,
+        backend_kind=BackendKind.FORK_SHM,
+    ).tensor(tuple(shapes), int(dtype.value))
 
 
 def _ref_addr(ref: Tensor) -> int:
@@ -475,6 +494,35 @@ class TestTaskArgs:
         args.add_tensor(_dev_ref(0xBEEF, (4, 8), DataType.FLOAT32), TensorArgType.OUTPUT)
         assert args.tag(0) == TensorArgType.OUTPUT
 
+    def test_identities_are_in_argument_order_and_keep_duplicates(self):
+        # The run's touched set is built from this; two views of one backing share an identity, and
+        # dropping the repeat here would make the list disagree with tensor_count().
+        one = _dev_ref(0x1, (4,), DataType.INT32)
+        args = TaskArgs()
+        args.add_tensor(one)
+        args.add_tensor(_dev_ref(0x2, (4,), DataType.INT32))
+        args.add_tensor(one)
+
+        identities = args.identities()
+        assert len(identities) == args.tensor_count() == 3
+        assert identities[0] == one.buffer.identity
+        assert identities[2] == one.buffer.identity
+        assert identities[1] != one.buffer.identity
+
+    def test_has_device_backed_tensor_sees_only_memory_behind_a_chip(self):
+        empty = TaskArgs()
+        assert not empty.has_device_backed_tensor()
+
+        host = TaskArgs()
+        host.add_tensor(_fork_ref(0x1000, (4,), DataType.INT32))
+        assert not host.has_device_backed_tensor()
+
+        # Any one device-backed arg is enough: the whole list then has to be authorized.
+        mixed = TaskArgs()
+        mixed.add_tensor(_fork_ref(0x2000, (4,), DataType.INT32))
+        mixed.add_tensor(_dev_ref(0x3, (4,), DataType.INT32))
+        assert mixed.has_device_backed_tensor()
+
     def test_multiple_refs_with_tags(self):
         args = TaskArgs()
         args.add_tensor(_dev_ref(0x1, (2,), DataType.INT32), TensorArgType.INPUT)
@@ -592,6 +640,89 @@ class TestTaskArgs:
         for i in range(200):
             args.add_scalar(i)
         assert args.scalar_count() == 200
+
+
+class TestProvenanceTable:
+    """The dispatch-path device-allocation table.
+
+    `Worker._child_prov_check_dispatch_locked` turns the reported failure into the ValueError a
+    caller sees; these cover what the table itself decides.
+    """
+
+    @staticmethod
+    def _registered(table, addr=0x1000, owner_worker_id=0):
+        buffer = wrap_device_malloc(addr, 64, mint_owner_instance_id(), next(_REF_BID), "L3")
+        table.insert(buffer.to_descriptor(), owner_worker_id)
+        return buffer
+
+    def test_a_live_allocation_on_its_own_worker_passes(self):
+        table = ProvenanceTable()
+        buffer = self._registered(table, owner_worker_id=2)
+        args = TaskArgs()
+        args.add_tensor(buffer.tensor((16,), int(DataType.FLOAT32.value)))
+
+        assert table.check_dispatch(args, 2) is None
+
+    def test_an_allocation_on_another_worker_is_not_live_here(self):
+        table = ProvenanceTable()
+        buffer = self._registered(table, owner_worker_id=0)
+        args = TaskArgs()
+        args.add_tensor(buffer.tensor((16,), int(DataType.FLOAT32.value)))
+
+        assert table.check_dispatch(args, 1) == (0, PROV_NOT_LIVE)
+
+    def test_an_unregistered_identity_is_not_live(self):
+        table = ProvenanceTable()
+        stray = wrap_device_malloc(0x2000, 64, mint_owner_instance_id(), next(_REF_BID), "L3")
+        args = TaskArgs()
+        args.add_tensor(stray.tensor((16,), int(DataType.FLOAT32.value)))
+
+        assert table.check_dispatch(args, 0) == (0, PROV_NOT_LIVE)
+
+    def test_a_same_identity_descriptor_that_changed_is_rejected(self):
+        table = ProvenanceTable()
+        buffer = self._registered(table)
+        # The identity still resolves; the extent reaching native does not match the registered one.
+        buffer.nbytes = 32
+        args = TaskArgs()
+        args.add_tensor(buffer.tensor((8,), int(DataType.FLOAT32.value)))
+
+        assert table.check_dispatch(args, 0) == (0, PROV_DESCRIPTOR_MISMATCH)
+
+    def test_the_first_failing_argument_is_the_one_reported(self):
+        table = ProvenanceTable()
+        good = self._registered(table)
+        stray = wrap_device_malloc(0x3000, 64, mint_owner_instance_id(), next(_REF_BID), "L3")
+        args = TaskArgs()
+        args.add_tensor(good.tensor((16,), int(DataType.FLOAT32.value)))
+        args.add_tensor(_fork_ref(0x4000, (4,), DataType.INT32))
+        args.add_tensor(stray.tensor((16,), int(DataType.FLOAT32.value)))
+
+        assert table.check_dispatch(args, 0) == (2, PROV_NOT_LIVE)
+
+    def test_host_backed_args_name_nothing_the_table_holds(self):
+        table = ProvenanceTable()
+        args = TaskArgs()
+        args.add_tensor(_fork_ref(0x5000, (4,), DataType.INT32))
+
+        assert table.check_dispatch(args, 0) is None
+
+    def test_erase_revokes_and_clear_empties(self):
+        table = ProvenanceTable()
+        buffer = self._registered(table)
+        args = TaskArgs()
+        args.add_tensor(buffer.tensor((16,), int(DataType.FLOAT32.value)))
+        assert buffer.identity in table
+        assert len(table) == 1
+
+        table.erase(buffer.identity)
+        assert buffer.identity not in table
+        assert table.check_dispatch(args, 0) == (0, PROV_NOT_LIVE)
+
+        table.erase(buffer.identity)  # revoking twice is not an error
+        self._registered(table)
+        table.clear()
+        assert len(table) == 0
 
 
 class TestRemoteTaskArgsSidecar:

@@ -138,6 +138,42 @@ def _is_live(w: Worker, ptr: int, wid: int = 0) -> bool:
 
 
 class TestDeviceAllocationTable:
+    @staticmethod
+    def _both_forms_agree(w: Worker) -> bool:
+        """Whether the snapshot registry and the dispatch table hold the same identities.
+
+        The snapshot answers lifetime and capability questions and the table answers the dispatch
+        check, so an identity live in one and absent from the other either authorizes memory that is
+        gone or refuses memory that is live.
+        """
+        alloc = w._child_alloc
+        return all(h.identity in alloc._table for h in alloc.values()) and len(alloc) == len(alloc._table)  # noqa: SLF001
+
+    def test_registering_and_revoking_move_both_forms_together(self):
+        w = _l3()
+        assert self._both_forms_agree(w)
+
+        first = _record_malloc(w, 0, 0x1000)
+        second = _record_malloc(w, 1, 0x2000)
+        assert self._both_forms_agree(w)
+        assert len(w._child_alloc) == 2
+
+        with w._child_prov_lock:
+            w._drop_device_alloc(first.identity)
+        assert self._both_forms_agree(w)
+        assert len(w._child_alloc) == 1
+
+        # Revoking an identity that is not registered leaves both forms alone.
+        with w._child_prov_lock:
+            w._drop_device_alloc(_dev_handle(0xDEAD).identity)
+        assert self._both_forms_agree(w)
+        assert len(w._child_alloc) == 1
+
+        w._clear_child_prov()
+        assert self._both_forms_agree(w)
+        assert len(w._child_alloc) == 0
+        assert second.identity not in w._child_alloc
+
     def test_a_registered_allocation_is_live_until_dropped(self):
         w = _l3()
         handle = _record_malloc(w, 0, 0x1000)
@@ -253,17 +289,13 @@ class TestDispatchResolution:
         w = _l3()
         handle = _record_malloc(w, 0, 0x1000)
         with w._child_prov_lock:
-            w._child_prov_check_dispatch_locked(
-                [(handle.identity, 0)], 0, args=_child_args(handle), api="submit_next_level"
-            )
+            w._child_prov_check_dispatch_locked(_child_args(handle), 0, api="submit_next_level")
 
     def test_unique_target_but_wrong_worker_rejected(self):
         w = _l3()
         handle = _record_malloc(w, 0, 0x1000)  # lives on worker 0
         with pytest.raises(ValueError, match="not a live allocation on target worker 1"), w._child_prov_lock:
-            w._child_prov_check_dispatch_locked(
-                [(handle.identity, 0)], 1, args=_child_args(handle), api="submit_next_level"
-            )
+            w._child_prov_check_dispatch_locked(_child_args(handle), 1, api="submit_next_level")
 
 
 # ----------------------------------------------------------------------------
@@ -749,7 +781,7 @@ class TestProvenanceTransactions:
         nw.malloc.side_effect = RuntimeError("device OOM")
         with pytest.raises(RuntimeError, match="device OOM"):
             w.alloc_child_tensor(0, (64,), DataType.UINT8)
-        assert w._child_alloc == {}
+        assert len(w._child_alloc) == 0
 
     def test_free_revokes_before_native_free(self):
         # Safety-first commit barrier: provenance is revoked BEFORE the native
@@ -813,7 +845,7 @@ class TestProvenanceTransactions:
         # free forever).
         w = _l3()
         o = Orchestrator(MagicMock(), w)
-        monkeypatch.setattr(w, "_device_identities_in_args", MagicMock(side_effect=RuntimeError("boom")))
+        monkeypatch.setattr(w, "_names_device_allocation", MagicMock(side_effect=RuntimeError("boom")))
         adopt = MagicMock()
         monkeypatch.setattr(w, "_adopt_remote_sidecar_refs", adopt)
         with pytest.raises(RuntimeError, match="boom"):
@@ -828,7 +860,7 @@ class TestProvenanceTransactions:
         w._lifecycle = _Lifecycle.READY
         with pytest.raises(RuntimeError, match="device OOM"):
             w.malloc(64)
-        assert w._child_alloc == {}
+        assert len(w._child_alloc) == 0
 
 
 # ----------------------------------------------------------------------------
@@ -884,9 +916,7 @@ class TestDomainReleaseOrdering:
             # would.
             try:
                 with w._child_prov_lock:
-                    w._child_prov_check_dispatch_locked(
-                        [(bufs[0].identity, 0)], 0, args=_child_args(bufs[0]), api="submit_next_level"
-                    )
+                    w._child_prov_check_dispatch_locked(_child_args(bufs[0]), 0, api="submit_next_level")
                 outcome["dispatch"] = "allowed"
             except ValueError:
                 outcome["dispatch"] = "rejected"

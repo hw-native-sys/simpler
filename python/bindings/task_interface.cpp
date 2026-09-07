@@ -1682,6 +1682,24 @@ ChipTensor materialize_one(const Tensor &r, nb::dict resolved) {
     );
 }
 
+// Which device allocations a dispatch's operands may name: the private snapshot of every live
+// child allocation, keyed by the identity that resolves it. The owner-side Python registry is the
+// source of truth for lifetime; this mirror exists so the per-argument dispatch check reads the
+// registered descriptor without materializing one Python object per argument.
+struct ProvenanceEntry {
+    BufferDescriptor descriptor;
+    int32_t owner_worker_id;
+};
+
+struct ProvenanceTable {
+    std::unordered_map<CanonicalIdentity, ProvenanceEntry, CanonicalIdentityHash> entries;
+};
+
+// Why one argument failed the dispatch check. The caller names the argument and raises: the
+// identity's rendering and the api name live on the Python side, and the failure path is cold.
+constexpr int PROV_NOT_LIVE = 0;
+constexpr int PROV_DESCRIPTOR_MISMATCH = 1;
+
 // The same rule the submit point enforces, applied early so a mistake surfaces at the offending
 // add_tensor call rather than at submit. A tag can change afterwards, which is why submit re-checks.
 void check_access_subset(uint8_t granted, TensorArgType tag) {
@@ -2464,6 +2482,31 @@ NB_MODULE(_task_interface, m) {
         .def("tensor_count", &TaskArgs::tensor_count)
         .def("scalar_count", &TaskArgs::scalar_count)
 
+        .def(
+            "identities",
+            [](const TaskArgs &self) {
+                const int32_t n = self.tensor_count();
+                nb::list out;
+                for (int32_t i = 0; i < n; ++i)
+                    out.append(nb::cast(self.tensor(i).buffer.identity));
+                return out;
+            },
+            "Every tensor arg's buffer identity, in argument order."
+        )
+
+        .def(
+            "has_device_backed_tensor",
+            [](const TaskArgs &self) {
+                const int32_t n = self.tensor_count();
+                for (int32_t i = 0; i < n; ++i) {
+                    const auto backend = static_cast<BackendKind>(self.tensor(i).buffer.backend_kind);
+                    if (backend == BackendKind::DEVICE_MALLOC || backend == BackendKind::VMM_WINDOW) return true;
+                }
+                return false;
+            },
+            "Whether any arg names memory behind a chip boundary, which a dispatch must authorize."
+        )
+
         .def("clear", &TaskArgs::clear)
 
         .def(
@@ -2472,6 +2515,75 @@ NB_MODULE(_task_interface, m) {
                 return self.tensor_count() + self.scalar_count();
             },
             "Return total number of arguments (tensors + scalars)."
+        );
+
+    // --- ProvenanceTable ---
+    // The owner's live child device allocations, as the dispatch path consumes them. The Python
+    // Worker writes it alongside its own registry and reads it back only through `check_dispatch`.
+    m.attr("PROV_NOT_LIVE") = PROV_NOT_LIVE;
+    m.attr("PROV_DESCRIPTOR_MISMATCH") = PROV_DESCRIPTOR_MISMATCH;
+
+    nb::class_<ProvenanceTable>(m, "ProvenanceTable")
+        .def(nb::init<>())
+
+        .def(
+            "insert",
+            [](ProvenanceTable &self, const BufferDescriptor &descriptor, int32_t owner_worker_id) {
+                self.entries[descriptor.identity] = ProvenanceEntry{descriptor, owner_worker_id};
+            },
+            nb::arg("descriptor"), nb::arg("owner_worker_id"),
+            "Register one allocation, keyed by its descriptor's identity."
+        )
+
+        .def(
+            "erase",
+            [](ProvenanceTable &self, const CanonicalIdentity &identity) {
+                self.entries.erase(identity);
+            },
+            nb::arg("identity"), "Revoke one allocation; absent identities are ignored."
+        )
+
+        .def(
+            "clear",
+            [](ProvenanceTable &self) {
+                self.entries.clear();
+            }
+        )
+
+        .def(
+            "__len__",
+            [](const ProvenanceTable &self) {
+                return self.entries.size();
+            }
+        )
+
+        .def(
+            "__contains__",
+            [](const ProvenanceTable &self, const CanonicalIdentity &identity) {
+                return self.entries.find(identity) != self.entries.end();
+            }
+        )
+
+        .def(
+            "check_dispatch",
+            [](const ProvenanceTable &self, const TaskArgs &args, int32_t target_worker_id) -> nb::object {
+                const int32_t n = args.tensor_count();
+                for (int32_t i = 0; i < n; ++i) {
+                    const BufferDescriptor &d = args.tensor(i).buffer;
+                    const auto backend = static_cast<BackendKind>(d.backend_kind);
+                    if (backend != BackendKind::DEVICE_MALLOC && backend != BackendKind::VMM_WINDOW) continue;
+                    auto it = self.entries.find(d.identity);
+                    if (it == self.entries.end() || it->second.owner_worker_id != target_worker_id) {
+                        return nb::make_tuple(i, PROV_NOT_LIVE);
+                    }
+                    // Authorization and execution consume the same Buffer, so a same-identity
+                    // descriptor with a changed body/backend/extent/access is a different value.
+                    if (!(d == it->second.descriptor)) return nb::make_tuple(i, PROV_DESCRIPTOR_MISMATCH);
+                }
+                return nb::none();
+            },
+            nb::arg("args"), nb::arg("target_worker_id"),
+            "None when every device arg is live on target_worker_id, else (arg_index, reason)."
         );
 
     // --- ArgDirection enum ---

@@ -79,7 +79,7 @@ import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field, replace
 from multiprocessing import resource_tracker
 from multiprocessing.shared_memory import SharedMemory
@@ -266,6 +266,7 @@ from .task_interface import (
     MAILBOX_PREPARATION_DISPOSITION_VALUES,
     MAILBOX_SIZE,
     MAILBOX_STATE_VALUES,
+    PROV_NOT_LIVE,
     CallConfig,
     ChipCallable,
     ChipDomainContext,
@@ -275,6 +276,7 @@ from .task_interface import (
     DeviceMemoryInfo,
     GlobalCommDomainHandle,
     GlobalCommDomainView,
+    ProvenanceTable,
     RemoteAddressSpace,
     RemoteBufferExport,
     RemoteBufferHandle,
@@ -4560,6 +4562,59 @@ def attach_exception_note(error: BaseException, note: str) -> None:
     object.__setattr__(error, "__notes__", [note])
 
 
+class _DeviceAllocations:
+    """Every live child device allocation, in both forms a dispatch consumes.
+
+    The snapshot answers lifetime, ownership and capability questions; the native table answers the
+    per-argument dispatch check, which walks a whole argument list and would otherwise materialize a
+    Python object per argument. One object owns both, so an allocation cannot be live in one and
+    absent from the other -- the register / revoke / clear methods here are the only way to change
+    either, and each writes both.
+
+    Not a lock: the caller holds ``Worker._child_prov_lock`` across every method.
+    """
+
+    __slots__ = ("_snapshots", "_table")
+
+    def __init__(self) -> None:
+        self._snapshots: dict[CanonicalIdentity, Buffer] = {}
+        self._table = ProvenanceTable()
+
+    def register(self, snapshot: Buffer) -> None:
+        """Make ``snapshot`` nameable by an operand. It must be a Buffer no caller can still reach,
+        so that neither form can drift from the descriptor registered here."""
+        self._snapshots[snapshot.identity] = snapshot
+        self._table.insert(snapshot.to_descriptor(), int(snapshot.owner_worker_id))
+
+    def revoke(self, identity: CanonicalIdentity) -> None:
+        """Drop one allocation; an identity that is not registered is left alone."""
+        self._snapshots.pop(identity, None)
+        self._table.erase(identity)
+
+    def clear(self) -> None:
+        self._snapshots.clear()
+        self._table.clear()
+
+    def get(self, identity: CanonicalIdentity) -> Buffer | None:
+        """The registered snapshot for ``identity``, or None."""
+        return self._snapshots.get(identity)
+
+    def values(self) -> Iterable[Buffer]:
+        """Every registered snapshot."""
+        return self._snapshots.values()
+
+    def check_dispatch(self, args: Any, target_worker_id: int) -> tuple[int, int] | None:
+        """None when every device arg in ``args`` is live on ``target_worker_id``, else the first
+        offending ``(arg_index, reason)``."""
+        return self._table.check_dispatch(args, target_worker_id)
+
+    def __contains__(self, identity: CanonicalIdentity) -> bool:
+        return identity in self._snapshots
+
+    def __len__(self) -> int:
+        return len(self._snapshots)
+
+
 class Worker:
     """Unified worker for all hierarchy levels.
 
@@ -4801,30 +4856,7 @@ class Worker:
         self._region_instance_registry = RegionInstanceRegistry()
         self._worker_chip_orch_comm_host_buffers: dict[int, int] = {}
 
-        # Live device allocations, keyed by the identity that names one. Membership authorizes an
-        # operand; it does not own the memory. Nothing in this table releases anything -- a malloc'd
-        # allocation is freed by `free`, a domain's window by its collective release -- which is the
-        # contract `self._buffers` does NOT have, where membership means "close() me".
-        # Ordering is safety-first: an entry is recorded only after the native alloc succeeds, and
-        # revoked BEFORE the native free (and before a domain's backend release), so an interrupted
-        # op never leaves an identity resolving to memory that is already gone. Cleared on close().
-        self._child_alloc: dict[CanonicalIdentity, Buffer] = {}
-        # Which identities each CommDomain allocation minted, so its release revokes them together.
-        self._domain_members: dict[int, set[CanonicalIdentity]] = {}
-        # Guards both device-allocation tables. Entry points take it (`_require_device_capability`,
-        # `_device_worker_for`, `_child_prov_check_dispatch`, `_drop_domain_allocs`); the `_locked`
-        # helpers and the record/drop-one helpers assume the caller holds it. It is not reentrant,
-        # so an entry point must never be called with it already held -- including indirectly
-        # through `_child_prov_worker_lock`, which takes it to reach the per-worker lock table.
-        # Authorization is fenced by that per-worker lock, not by this one: an op holds its chip's
-        # lock across both the check and the native call, and every revoker of an allocation on
-        # that chip takes the same lock before revoking.
-        self._child_prov_lock = threading.Lock()
-        # Per-worker locks for the *native* half of a provenance-guarded device op.
-        # ``_child_prov_lock`` stays the bookkeeping lock (short, process-wide); the
-        # long native call (malloc / free / copy) is serialized per worker instead, so
-        # ops on different chips overlap while same-worker ordering is unchanged.
-        self._child_prov_worker_locks: dict[int, threading.Lock] = {}
+        self._init_device_allocation_tables()
 
         # Owner-side Buffer state (P1-B): a per-incarnation opaque nonce, a monotonic buffer_id
         # (0 reserved), and the live handles this Worker owns. create_buffer allocates a handle whose
@@ -10246,6 +10278,33 @@ class Worker:
                 self._child_prov_worker_locks[int(worker_id)] = lock
             return lock
 
+    def _init_device_allocation_tables(self) -> None:
+        """The device-allocation tables and the locks that fence them."""
+        # Live device allocations, keyed by the identity that names one. Membership authorizes an
+        # operand; it does not own the memory. Nothing in this table releases anything -- a malloc'd
+        # allocation is freed by `free`, a domain's window by its collective release -- which is the
+        # contract `self._buffers` does NOT have, where membership means "close() me".
+        # Ordering is safety-first: an entry is recorded only after the native alloc succeeds, and
+        # revoked BEFORE the native free (and before a domain's backend release), so an interrupted
+        # op never leaves an identity resolving to memory that is already gone. Cleared on close().
+        self._child_alloc = _DeviceAllocations()
+        # Which identities each CommDomain allocation minted, so its release revokes them together.
+        self._domain_members: dict[int, set[CanonicalIdentity]] = {}
+        # Guards every device-allocation table. Entry points take it (`_require_device_capability`,
+        # `_device_worker_for`, `_child_prov_check_dispatch`, `_drop_domain_allocs`); the `_locked`
+        # helpers and the record/drop-one helpers assume the caller holds it. It is not reentrant,
+        # so an entry point must never be called with it already held -- including indirectly
+        # through `_child_prov_worker_lock`, which takes it to reach the per-worker lock table.
+        # Authorization is fenced by that per-worker lock, not by this one: an op holds its chip's
+        # lock across both the check and the native call, and every revoker of an allocation on
+        # that chip takes the same lock before revoking.
+        self._child_prov_lock = threading.Lock()
+        # Per-worker locks for the *native* half of a provenance-guarded device op.
+        # ``_child_prov_lock`` stays the bookkeeping lock (short, process-wide); the
+        # long native call (malloc / free / copy) is serialized per worker instead, so
+        # ops on different chips overlap while same-worker ordering is unchanged.
+        self._child_prov_worker_locks: dict[int, threading.Lock] = {}
+
     def _record_device_alloc(self, handle: Buffer, *, domain_allocation_id: int | None = None) -> None:
         """Make ``handle`` a live device allocation operands may name. Caller holds ``_child_prov_lock``.
 
@@ -10257,7 +10316,7 @@ class Worker:
         """
         snapshot = replace(handle)
         snapshot.freeze_descriptor()
-        self._child_alloc[handle.identity] = snapshot
+        self._child_alloc.register(snapshot)
         if domain_allocation_id is not None:
             self._domain_members.setdefault(domain_allocation_id, set()).add(handle.identity)
 
@@ -10267,7 +10326,7 @@ class Worker:
         Called BEFORE the native free (safety-first), so an interrupted free never leaves an
         identity resolvable to an address that is already gone.
         """
-        self._child_alloc.pop(identity, None)
+        self._child_alloc.revoke(identity)
 
     def _drop_domain_allocs(self, allocation_id: int) -> None:
         """Revoke every identity a CommDomain allocation minted. Caller holds neither lock.
@@ -10303,10 +10362,10 @@ class Worker:
                     for identity in tuple(self._domain_members.get(allocation_id, ())):
                         handle = self._child_alloc.get(identity)
                         if handle is not None and int(handle.owner_worker_id) == worker_id:
-                            self._child_alloc.pop(identity, None)
+                            self._drop_device_alloc(identity)
         with self._child_prov_lock:
             for identity in self._domain_members.pop(allocation_id, set()):
-                self._child_alloc.pop(identity, None)
+                self._drop_device_alloc(identity)
 
     def _require_freeable(self, handle: Buffer, *, api: str) -> Buffer:
         """The registered allocation ``handle`` names, provided ``free`` is what releases it.
@@ -10433,25 +10492,20 @@ class Worker:
             return self._require_device_capability_locked(identity, capability, nbytes, offset=offset, api=api)
 
     @staticmethod
-    def _device_identities_in_args(args: Any) -> list[tuple[CanonicalIdentity, int]]:
-        """``(identity, arg_index)`` for every arg that names a child device allocation.
+    def _names_device_allocation(args: Any) -> bool:
+        """Whether any arg names a child device allocation, and so needs authorizing.
 
         A ``DEVICE_MALLOC`` (worker device malloc) or ``VMM_WINDOW`` (domain-carved) ref names an
         allocation behind a chip boundary, so its identity is what the owner can resolve.
         Host-backed refs (POSIX/fork shm) name nothing the owner allocation table holds and
         contribute nothing.
         """
-        out: list[tuple[CanonicalIdentity, int]] = []
-        for i in range(args.tensor_count()):
-            desc = args.tensor(i).buffer
-            if desc.backend_kind in (BackendKind.DEVICE_MALLOC, BackendKind.VMM_WINDOW):
-                out.append((desc.identity, i))
-        return out
+        return args.has_device_backed_tensor()
 
     @staticmethod
     def _identities_in_args(args: Any) -> set[CanonicalIdentity]:
         """Every tensor arg's identity in ``args``."""
-        return {args.tensor(i).buffer.identity for i in range(args.tensor_count())}
+        return set(args.identities())
 
     def _record_touched_identities(self, args: Any) -> None:
         """Add every tensor arg's identity in ``args`` to the current run's touched set.
@@ -10476,14 +10530,7 @@ class Worker:
             return
         resources.touched_identities.update(self._identities_in_args(args))
 
-    def _child_prov_check_dispatch_locked(
-        self,
-        device_args: list[tuple[CanonicalIdentity, int]],
-        target_worker_id: int,
-        *,
-        args: Any,
-        api: str,
-    ) -> None:
+    def _child_prov_check_dispatch_locked(self, args: Any, target_worker_id: int, *, api: str) -> None:
         """Validate device args against the worker they are dispatched to.
 
         The caller holds ``_child_prov_lock`` and keeps holding it through the native submit, which
@@ -10495,19 +10542,25 @@ class Worker:
         must also match the private allocation snapshot exactly: authorization and execution consume
         the same Buffer, so a same-identity descriptor with a changed body/backend/extent/access is
         rejected before the submit can commit.
+
+        The walk itself runs in ``ProvenanceTable``: one dispatch names every argument, and reading
+        each one's descriptor back into Python costs more than comparing it. Only the refusal
+        returns here, where naming the argument is worth an object.
         """
-        for identity, arg_index in device_args:
-            handle = self._child_alloc.get(identity)
-            if handle is None or int(handle.owner_worker_id) != target_worker_id:
-                raise ValueError(
-                    f"orch.{api}: device argument (arg {arg_index}, {identity}) is not a live "
-                    f"allocation on target worker {target_worker_id} (wrong worker, or stale)"
-                )
-            if args.tensor(arg_index).buffer != handle.to_descriptor():
-                raise ValueError(
-                    f"orch.{api}: device argument (arg {arg_index}, {identity}) does not match "
-                    "the descriptor registered for that allocation"
-                )
+        failure = self._child_alloc.check_dispatch(args, target_worker_id)
+        if failure is None:
+            return
+        arg_index, reason = failure
+        identity = args.tensor(arg_index).buffer.identity
+        if reason == PROV_NOT_LIVE:
+            raise ValueError(
+                f"orch.{api}: device argument (arg {arg_index}, {identity}) is not a live "
+                f"allocation on target worker {target_worker_id} (wrong worker, or stale)"
+            )
+        raise ValueError(
+            f"orch.{api}: device argument (arg {arg_index}, {identity}) does not match "
+            "the descriptor registered for that allocation"
+        )
 
     def _require_local_next_level_target(self, worker_id: int, *, api: str) -> None:
         """Reject a local callable pinned to a remote NEXT_LEVEL worker.
