@@ -1598,9 +1598,52 @@ void region_vmm_test_set_unmap_already_gone() {
 
 // The int wire value of a dtype given either a DataType enumerator or its int value. The nanobind
 // DataType enum is not arithmetic, so a caller holding one has only `.value`; accept both forms.
-uint8_t datatype_wire_value(nb::object dtype) {
-    if (nb::hasattr(dtype, "value")) dtype = dtype.attr("value");
+// The enumerator is tried first as a type check: `hasattr` costs an attribute lookup, and on an int
+// it costs a raised-and-cleared AttributeError as well.
+uint8_t datatype_wire_value(nb::handle dtype) {
+    if (nb::isinstance<DataType>(dtype)) return static_cast<uint8_t>(nb::cast<DataType>(dtype));
+    if (nb::hasattr(dtype, "value")) return nb::cast<uint8_t>(nb::getattr(dtype, "value"));
     return nb::cast<uint8_t>(dtype);
+}
+
+// Write a view's `ndims` / `shapes` / `strides` into `t`. A `strides` of None is contiguous
+// (row-major): strides[i] = prod(shapes[i+1:]). The two ways to build a Tensor from Python — the
+// constructor and `BufferDescriptor.tensor` — share this so a view means the same thing in both.
+// Bounds only; `validate_tensor` is the gate on the finished Tensor.
+void fill_view(Tensor *t, nb::handle shapes, nb::handle strides) {
+    // PySequence_Fast hands back a tuple or list unchanged, so the common call reads its elements
+    // straight out of the caller's own object.
+    PyObject *raw_shapes = PySequence_Fast(shapes.ptr(), "Tensor shapes must be a sequence");
+    if (raw_shapes == nullptr) throw nb::python_error();
+    nb::object shapes_fast = nb::steal(raw_shapes);
+    const Py_ssize_t ndims = PySequence_Fast_GET_SIZE(raw_shapes);
+    if (ndims == 0 || ndims > static_cast<Py_ssize_t>(MAX_TENSOR_DIMS)) {
+        throw std::invalid_argument(
+            "Tensor ndims must be in [1, " + std::to_string(MAX_TENSOR_DIMS) + "], got " + std::to_string(ndims)
+        );
+    }
+    PyObject **shape_items = PySequence_Fast_ITEMS(raw_shapes);
+    t->ndims = static_cast<uint32_t>(ndims);
+    for (Py_ssize_t i = 0; i < ndims; ++i)
+        t->shapes[i] = nb::cast<uint32_t>(nb::handle(shape_items[i]));
+
+    if (strides.is_none()) {
+        uint32_t acc = 1;
+        for (Py_ssize_t i = ndims; i-- > 0;) {
+            t->strides[i] = acc;
+            acc *= t->shapes[i];
+        }
+        return;
+    }
+    PyObject *raw_strides = PySequence_Fast(strides.ptr(), "Tensor strides must be a sequence");
+    if (raw_strides == nullptr) throw nb::python_error();
+    nb::object strides_fast = nb::steal(raw_strides);
+    if (PySequence_Fast_GET_SIZE(raw_strides) != ndims) {
+        throw std::invalid_argument("Tensor shapes and strides must have equal length");
+    }
+    PyObject **stride_items = PySequence_Fast_ITEMS(raw_strides);
+    for (Py_ssize_t i = 0; i < ndims; ++i)
+        t->strides[i] = nb::cast<uint32_t>(nb::handle(stride_items[i]));
 }
 
 // The leading `ndims` entries of a wire shapes[] / strides[] array as a Python tuple. The trailing
@@ -2004,6 +2047,22 @@ NB_MODULE(_task_interface, m) {
                 return a != b;
             }
         )
+        .def(
+            "tensor",
+            [](const BufferDescriptor &self, nb::sequence shapes, nb::object dtype, nb::object strides,
+               uint64_t byte_offset) -> Tensor {
+                Tensor t{};
+                t.buffer = self;
+                t.byte_offset = byte_offset;
+                t.dtype = static_cast<DataType>(datatype_wire_value(dtype));
+                fill_view(&t, shapes, strides);
+                validate_tensor(t);
+                return t;
+            },
+            nb::arg("shapes"), nb::arg("dtype"), nb::arg("strides") = nb::none(), nb::arg("byte_offset") = 0,
+            "A Tensor viewing this backing. `strides` default to contiguous (row-major) element strides."
+        )
+
         .def("__repr__", [](const BufferDescriptor &self) -> std::string {
             std::ostringstream os;
             os << "BufferDescriptor(buffer_id=" << self.identity.buffer_id
@@ -2026,25 +2085,11 @@ NB_MODULE(_task_interface, m) {
             "__init__",
             [](Tensor *self, const BufferDescriptor &buffer, uint64_t byte_offset, nb::sequence shapes,
                nb::sequence strides, nb::object dtype) {
-                const size_t ndims = nb::len(shapes);
-                if (ndims != nb::len(strides)) {
-                    throw std::invalid_argument("Tensor shapes and strides must have equal length");
-                }
-                if (ndims == 0 || ndims > static_cast<size_t>(MAX_TENSOR_DIMS)) {
-                    throw std::invalid_argument(
-                        "Tensor ndims must be in [1, " + std::to_string(MAX_TENSOR_DIMS) + "], got " +
-                        std::to_string(ndims)
-                    );
-                }
                 new (self) Tensor{};
                 self->buffer = buffer;
                 self->byte_offset = byte_offset;
-                self->ndims = static_cast<uint32_t>(ndims);
-                for (size_t i = 0; i < ndims; ++i) {
-                    self->shapes[i] = nb::cast<uint32_t>(shapes[i]);
-                    self->strides[i] = nb::cast<uint32_t>(strides[i]);
-                }
                 self->dtype = static_cast<DataType>(datatype_wire_value(dtype));
+                fill_view(self, shapes, strides);
                 validate_tensor(*self);
             },
             nb::arg("buffer"), nb::arg("byte_offset"), nb::arg("shapes"), nb::arg("strides"), nb::arg("dtype")

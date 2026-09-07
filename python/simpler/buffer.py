@@ -115,14 +115,6 @@ BufferDescriptor.owner_worker_path = property(
 )
 
 
-def _row_major_strides(shapes: tuple[int, ...]) -> tuple[int, ...]:
-    """Contiguous (row-major) element strides for ``shapes``: strides[i] = prod(shapes[i+1:])."""
-    strides = [1] * len(shapes)
-    for i in range(len(shapes) - 2, -1, -1):
-        strides[i] = strides[i + 1] * shapes[i + 1]
-    return tuple(strides)
-
-
 def mint_owner_instance_id() -> bytes:
     """A fresh opaque nonce, unique per owner incarnation (defends identity against ABA).
 
@@ -209,15 +201,7 @@ class Buffer:
         ``byte_offset`` must be a multiple of the dtype size (checked at materialization).
         ``dtype`` accepts a ``DataType`` enum or its int value.
         """
-        shapes = tuple(shapes)
-        strides = _row_major_strides(shapes) if strides is None else tuple(strides)
-        return Tensor(
-            buffer=self.to_descriptor(),
-            byte_offset=byte_offset,
-            shapes=shapes,
-            strides=strides,
-            dtype=dtype,
-        )
+        return self.to_descriptor().tensor(shapes, dtype, strides, byte_offset)
 
     def close(self) -> None:
         """Release the backing. The owner unlinks it, so a later consumer map fails rather than
@@ -348,14 +332,7 @@ def remote_sidecar_tensor(
         nbytes=nbytes,
         body=b"",
     )
-    shapes = tuple(shapes)
-    return Tensor(
-        buffer=descriptor,
-        byte_offset=byte_offset,
-        shapes=shapes,
-        strides=_row_major_strides(shapes),
-        dtype=int(dtype),
-    )
+    return descriptor.tensor(shapes, int(dtype), None, byte_offset)
 
 
 def wrap_fork_inherited(
