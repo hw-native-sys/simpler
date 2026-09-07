@@ -96,7 +96,7 @@ pytest tests/st/<case> --platform a5sim --dump-args 2
 # a5 host_build_graph has no examples — use the scene test
 pytest tests/st/a5/host_build_graph/dump_args --platform a5sim --dump-args 2
 pytest tests/st/<case> --platform a2a3sim --dump-args 2
-pytest examples/a2a3/host_build_graph/vector_example --platform a2a3sim --dump-args 2
+pytest tests/st/a2a3/host_build_graph/vector_example --platform a2a3sim --manual include --dump-args 2
 ```
 
 The level sets `CallConfig::enable_dump_args` (0/1/2/3). The host then

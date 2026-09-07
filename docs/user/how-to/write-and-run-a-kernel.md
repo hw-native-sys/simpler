@@ -93,8 +93,8 @@ python examples/my_example/test_my_example.py -p a2a3sim
 in `CASES`**, not on the decorator. Ordinary cases should omit `"config"` and
 use the architecture's automatic AICPU thread count. Add `aicpu_thread_num`
 only when a test specifically depends on a thread-count or scheduler-topology
-behavior; `runtime_env` holds ring-sizing overrides for
-`tensormap_and_ringbuffer`. See the [Python API reference](../reference/python-api.md)
+behavior. `runtime_env` holds TRB ring-sizing overrides; HBG also reads
+`ring_task_window[0]` to size its graph task table. See the [Python API reference](../reference/python-api.md)
 for the full `CallConfig` field list.
 
 ## Option B — the `Worker` API directly
@@ -106,8 +106,8 @@ the shape is:
 
 ```python
 from simpler.task_interface import (
-    ArgDirection, CallConfig, ChipCallable, ChipStorageTaskArgs,
-    CoreCallable, DataType, Tensor,
+    ArgDirection, CallConfig, ChipCallable, CoreCallable,
+    DataType, TaskArgs, TensorArgType,
 )
 from simpler.worker import Worker
 
@@ -144,33 +144,46 @@ chip = ChipCallable.build(
     children=[(0, core)],
 )
 
-# 3. Register BEFORE init(), then init.
+# 3. Register and initialize the worker.
 worker = Worker(level=2, platform=platform,
                 runtime="tensormap_and_ringbuffer", device_id=device_id)
 handle = worker.register(chip)
 worker.init()
 try:
     # 4. Device memory + H2D.
-    dev_a, dev_out = worker.malloc(nbytes), worker.malloc(nbytes)
-    worker.copy_to(dev_a, host_a.data_ptr(), nbytes)
+    dev_a = worker.malloc(nbytes)
+    dev_b = worker.malloc(nbytes)
+    dev_out = worker.malloc(nbytes)
+    worker.copy_to(dev_a, host_a)
+    worker.copy_to(dev_b, host_b)
 
     # 5. Task args, in the same order as the signature.
-    args = ChipStorageTaskArgs()
-    args.add_tensor(Tensor.make(dev_a, (rows, cols), DataType.FLOAT32))
-    args.add_tensor(Tensor.make(dev_out, (rows, cols), DataType.FLOAT32))
+    args = TaskArgs()
+    args.add_tensor(dev_a.tensor((rows, cols), DataType.FLOAT32), TensorArgType.INPUT)
+    args.add_tensor(dev_b.tensor((rows, cols), DataType.FLOAT32), TensorArgType.INPUT)
+    args.add_tensor(dev_out.tensor((rows, cols), DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
 
     # 6. Run, then D2H.
     worker.run(handle, args, CallConfig())
-    worker.copy_from(host_out.data_ptr(), dev_out, nbytes)
-    worker.free(dev_a); worker.free(dev_out)
+    worker.copy_from(host_out, dev_out)
+    worker.free(dev_a)
+    worker.free(dev_b)
+    worker.free(dev_out)
 finally:
     worker.close()          # always; a leaked device stays locked
 ```
 
-Ordering rules that are not optional:
+Here `host_a`, `host_b`, and `host_out` are contiguous CPU torch tensors of
+shape `(rows, cols)` and dtype `torch.float32`; `nbytes = rows * cols * 4`.
+Allocations return `Buffer` handles. For partial copies, pass `nbytes`,
+`src_offset`, and `dst_offset` by keyword.
 
-- **`register()` happens before `init()`.** Construction only stashes config;
-  `init()` is where runtime binaries are resolved and the device is opened.
+Lifecycle and argument rules:
+
+- **Register before use.** Registration before `init()` enters the startup
+  snapshot. Registration after `init()` installs and prewarms the callable
+  before returning; at L3+ it also publishes to eligible live children. The
+  worker topology must be established before `init()`.
 - **`close()` belongs in a `finally`.** Skipping it leaves the device held, and
   the next job on that device hangs.
 - **Task-arg order must match the callable `signature`**, positionally.

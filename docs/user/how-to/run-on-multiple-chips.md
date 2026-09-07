@@ -21,7 +21,7 @@ worker = Worker(
     num_sub_workers=1,        # optional host-side Python callables
 )
 
-# Register everything BEFORE init(): chip callables and any sub-worker callable.
+# These registrations enter the children's startup snapshot.
 chip_handle = worker.register(chip_callable)
 postprocess = worker.register(lambda args: print("post-process got", args))
 
@@ -45,8 +45,10 @@ Three differences from L2 that trip people up:
 - **The orchestration function is Python and runs on the host.** At L2 the
   orchestration is a compiled `.cpp`; at L3 the top-level orchestration is a
   Python callable that hands compiled `ChipCallable`s down to the children.
-- **Register before `init()`.** `init()` is the fork point, so registration
-  afterwards does not reach children that already exist.
+- **Register before use.** `init()` is the fork point. Earlier registrations
+  enter the startup snapshot; later registrations are installed through the
+  control plane on eligible live children before `register()` returns. Set up
+  the worker topology before `init()`.
 
 To direct a task at one specific child rather than any free one, see
 [Directed NEXT_LEVEL Scheduling](../../directed-next-level-scheduling.md).
@@ -88,8 +90,10 @@ implementations.
 
 - **Collectives are single-host, multi-card.** Both backends state this
   explicitly; there is no cross-node collective path today.
-- **`--enable-chip-swimlane` does not work on L3.** It is rejected up front. To
-  get a swimlane, scope the run to one chip with `--level 2`.
+- **Same-host L3 supports `--enable-chip-swimlane`.** Each chip child writes
+  under `rankN/dN`; cross-rank merging requires detail level `4` (the bare
+  flag's default). Automatic merging across NETWORK1/L4 is rejected because
+  those captures need a node namespace. See [Chip Swimlane Profiling](../../dfx/chip-swimlane-profiling.md).
 - **Multi-host (L4) remote L3 uses the shipped host_tcp data plane.** You
   can register a remote worker, the remote side builds a genuine L3 subtree,
   and remote buffers move through the host TCP session. The RoCE / HCCS / UB

@@ -35,9 +35,11 @@ pytest examples/my_example --platform a2a3 --device 4 --dump-args
 `--enable-swimlane-overhead` requires `--enable-chip-swimlane` plus a `deps.json`;
 if it is absent, re-run adding `--enable-dep-gen`.
 
-**For single-round runs, `--enable-chip-swimlane` is L2-only.** Asking for it
-on an L3 test is rejected up front — scope to a single chip with `--level 2`,
-or drop the flag.
+**Single-round chip-swimlane capture supports L2 and same-host L3.** L3 chip
+children write separate `rankN/dN` captures; cross-rank merging requires
+detail level `4` on every rank (the bare flag's default). NETWORK1/L4 is
+rejected by the automatic capture path because it needs a node namespace.
+See [multi-rank output](../../dfx/chip-swimlane-profiling.md#32-output) for the layout.
 
 Use `--rounds N` for repeated non-diagnostic timing. All diagnostic flags above
 are disabled when `N > 1`; warm up separately, then collect diagnostics with a
@@ -58,8 +60,9 @@ worker.run(handle, args, cfg)
 ```
 
 In a `@scene_test`, per-case knobs live under `"config"`, including
-`aicpu_thread_num` and — on `tensormap_and_ringbuffer` — `runtime_env` ring
-sizing (`ring_task_window`, `ring_heap`, `ring_dep_pool`).
+`aicpu_thread_num` and `runtime_env`. TRB uses `ring_task_window`, `ring_heap`,
+and `ring_dep_pool`; HBG reads `ring_task_window[0]` for graph task capacity
+and sizes its graph heap after orchestration.
 
 ## Reading the results
 

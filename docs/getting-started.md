@@ -32,8 +32,8 @@ The test framework automatically handles PTO-ISA setup:
 Just run your example. PTO-ISA will be cloned automatically on first run:
 
 ```bash
-python examples/a2a3/host_build_graph/vector_example/test_vector_example.py \
-  -p a2a3sim
+python tests/st/a2a3/host_build_graph/vector_example/test_vector_example.py \
+  -p a2a3sim --manual include
 ```
 
 **Manual Setup** (if auto-setup fails or you prefer manual control):
@@ -150,28 +150,19 @@ host_binary = compiler.compile("host", include_dirs, source_dirs)        # → .
 
 ```bash
 # Simulation platform (no hardware required)
-python examples/a2a3/host_build_graph/vector_example/test_vector_example.py -p a2a3sim
+python tests/st/a2a3/host_build_graph/vector_example/test_vector_example.py -p a2a3sim --manual include
 
 # Hardware platform (requires Ascend device)
-python examples/a2a3/host_build_graph/vector_example/test_vector_example.py -p a2a3 -d 0
+python tests/st/a2a3/host_build_graph/vector_example/test_vector_example.py -p a2a3 -d 0
 
 # Or as a pytest batch:
-pytest examples/a2a3/host_build_graph/vector_example --platform a2a3sim
+pytest tests/st/a2a3/host_build_graph/vector_example --platform a2a3sim --manual include
 ```
 
-Expected output:
-
-```text
-=== Building Runtime: host_build_graph (platform: a2a3sim) ===
-...
-=== Comparing Results ===
-Comparing f: shape=(16384,), dtype=float32
-  f: PASS (16384/16384 elements matched)
-
-============================================================
-TEST PASSED
-============================================================
-```
+The simulator case is marked manual, so include `--manual include` to run it.
+It computes `f = (a + b + 1) * (a + b + 2)` for 16,384 elements with `a=2`
+and `b=3`, then compares every output against the golden value `42`. A
+successful run exits with status 0; the pytest form reports a passed test.
 
 ### Python API Example
 
@@ -198,15 +189,27 @@ Reach for the high-level `Worker` first. Public registration returns a
 
 ## Configuration
 
-### Compile-time Configuration (Runtime Limits)
+### Graph capacity and runtime limits
 
-In `src/common/host_build_graph/runtime.h`:
+For `host_build_graph`, the graph task table defaults to
+`CHIP_DEFAULT_GRAPH_TASKS=16384` in `src/common/host_build_graph/runtime_types.h`.
+Override it per run through `CallConfig.runtime_env.ring_task_window[0]`.
+In Python, assign the whole property because its getter returns a list copy:
 
-```cpp
-#define RUNTIME_MAX_TASKS 131072   // Maximum number of tasks
-#define RUNTIME_MAX_ARGS 16        // Maximum arguments per task
-#define RUNTIME_MAX_FANOUT 512     // Maximum successors per task
+```python
+cfg = CallConfig()
+cfg.runtime_env.ring_task_window = [32768, 0, 0, 0]
+worker.run(handle, orch_args, cfg)
 ```
+
+HBG sizes and commits its graph heap after orchestration; `ring_heap` and
+`ring_dep_pool` are TRB settings, not HBG capacity controls.
+
+The HBG orchestration-entry limit is `RUNTIME_MAX_ARGS=128` in
+`src/common/host_build_graph/runtime.h`. Per-task fanin is capped at
+`CHIP_MAX_FANIN=128`; there is no `RUNTIME_MAX_FANOUT` knob. See
+[capacity errors](troubleshooting/device-error-codes/capacity.md) for the
+resource-specific limits and diagnostics.
 
 ### Runtime Configuration
 
@@ -229,7 +232,7 @@ Programmatic users select the runtime when constructing `Worker` and may pass a
 Device selection is done via CLI flag:
 
 ```bash
-python examples/a2a3/host_build_graph/vector_example/test_vector_example.py -p a2a3 --device 0
+python tests/st/a2a3/host_build_graph/vector_example/test_vector_example.py -p a2a3 --device 0
 ```
 
 ## Notes

@@ -41,7 +41,7 @@ rounds stay uninstrumented. The harness warns for each one it switches off.
 
 | Flag | Meaning |
 | ---- | ------- |
-| `--enable-chip-swimlane` | Per-task timing. Bare flag = level 4 (full); `1` AICore timing, `2` + dispatch/fanout, `3` + scheduler phases, `4` + orchestration. **L2 only** |
+| `--enable-chip-swimlane` | Per-task timing. Bare flag = level 4 (full); `1` AICore timing, `2` + dispatch/fanout, `3` + scheduler phases, `4` + orchestration. **L2 and same-host L3**; cross-rank merging requires level `4` |
 | `--enable-swimlane-overhead` | Adds the 8 Overhead Analysis counter tracks. Requires `--enable-chip-swimlane` **and** a `deps.json` — add `--enable-dep-gen` if absent |
 | `--enable-pmu` | AICore hardware counters. Bare flag = `PIPE_UTILIZATION` (2); pass an event type to override, e.g. `--enable-pmu 4` |
 | `--dump-args` | Capture per-task arguments. `0` off; `1` partial; `2` full; `3` hybrid (all metadata plus payload selected via `Arg::dump(...)`) |

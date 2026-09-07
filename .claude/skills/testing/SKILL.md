@@ -91,11 +91,11 @@ pytest examples tests/st --exclude-level 4 --platform a5 --device <range> \
 pytest examples tests/st --platform a2a3sim --runtime host_build_graph
 
 # Single example (pytest, uses pre-built binaries)
-pytest examples/a2a3/host_build_graph/vector_example --platform a2a3sim
+pytest tests/st/a2a3/host_build_graph/vector_example --platform a2a3sim --manual include
 
 # Single example (standalone; re-run `pip install --no-build-isolation -e .` first if runtime C++ changed)
-python examples/a2a3/host_build_graph/vector_example/test_vector_example.py \
-    -p a2a3sim
+python tests/st/a2a3/host_build_graph/vector_example/test_vector_example.py \
+    -p a2a3sim --manual include
 ```
 
 ## Pre-Commit Testing Strategy

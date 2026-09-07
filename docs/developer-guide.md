@@ -33,10 +33,10 @@ pto-runtime/
 │       ├── worker.py                  # Unified Worker (L2 single-chip, L3 distributed)
 │       ├── task_interface.py          # Python re-exports of nanobind types + helpers
 │       ├── env_manager.py             # Environment variable management
-│       ├── kernel_compiler.py         # [transitional, NOT in wheel — use simpler_setup version]
-│       ├── runtime_compiler.py        # [transitional, NOT in wheel — use simpler_setup version]
-│       ├── elf_parser.py              # [transitional, NOT in wheel — use simpler_setup version]
-│       └── toolchain.py               # [transitional, NOT in wheel — use simpler_setup version]
+│       ├── kernel_compiler.py         # Transitional, ships in wheel; use simpler_setup version
+│       ├── runtime_compiler.py        # Transitional, ships in wheel; use simpler_setup version
+│       ├── elf_parser.py              # Transitional, ships in wheel; use simpler_setup version
+│       └── toolchain.py               # Transitional, ships in wheel; use simpler_setup version
 │
 ├── simpler_setup/                     # Test framework + authoritative compilers (packaged in wheel)
 │   ├── scene_test.py                  # SceneTestCase + @scene_test decorator
@@ -93,7 +93,12 @@ Runtime binaries (host `.so`, aicpu `.so`, aicore `.o`) are pre-built during `pi
 
 Persistent cmake build directories under `build/cache/` enable incremental compilation — only changed files are recompiled.
 
-**Architecture note:** a2a3 and a5 differ only at runtime (device selection, block dimensions, etc.). The compiled binaries are architecture-independent — the same toolchain and flags produce artifacts that work on both chips. Therefore `pip install .` should build **all** architectures (both a2a3 and a5, both onboard and sim) whenever the corresponding toolchain is available. Toolchain detection (`build_runtimes.py`):
+**Architecture note:** binaries are built separately for each architecture and
+backend. The onboard AICore targets are `dav-c220-cube/vec` for a2a3 and
+`dav-c310-cube/vec` for a5, so their artifacts are not interchangeable.
+`pip install .` builds both architectures when their toolchain is available;
+build-tool availability does not imply that the host has both kinds of NPU.
+Toolchain detection (`build_runtimes.py`):
 
 - **sim** (a2a3sim, a5sim): requires `gcc` + `g++` in `PATH`
 - **onboard** (a2a3, a5): requires `ccec` in `PATH` + cross-compiler under `ASCEND_HOME_PATH`
@@ -119,12 +124,11 @@ The resolver uses `importlib.resources.files("simpler_setup") / "_assets"`. If `
 
 | Package | Where on disk | What it ships in wheel |
 | ------- | ------------- | ---------------------- |
-| `simpler` | `python/simpler/` | Stable user API: `task_interface`, `worker`, `env_manager`, `__init__` |
-| `simpler` (excluded) | same dir | `kernel_compiler`, `runtime_compiler`, `toolchain`, `elf_parser` are **transitional** — present in source tree but excluded from wheel via `pyproject.toml::wheel.exclude` |
+| `simpler` | `python/simpler/` | Every module, including the runtime API and the four transitional compiler/toolchain modules |
 | `simpler_setup` | `simpler_setup/` | Test framework + authoritative copies of the four transitional files |
 | `_task_interface` | built from `python/bindings/` | Top-level nanobind extension (.so) |
 
-**Migration direction:** existing `from simpler.{kernel_compiler,runtime_compiler,toolchain,elf_parser} import ...` should move to `from simpler_setup.{kernel_compiler,...} import ...`. Once all callers migrate, the four transitional files in `python/simpler/` can be deleted and `wheel.exclude` cleaned up.
+**Migration direction:** existing `from simpler.{kernel_compiler,runtime_compiler,toolchain,elf_parser} import ...` should move to `from simpler_setup.{kernel_compiler,...} import ...`. The `simpler_setup` copies are authoritative. Both copies ship because `wheel.packages` includes both packages and there is no `wheel.exclude`; deletion of the transitional modules requires migrating their callers.
 
 ## Cross-Platform Preprocessor Convention
 
@@ -170,7 +174,7 @@ pip install --no-build-isolation -e .
 
 `--no-build-isolation` is required: scikit-build-core needs the system `nanobind` and `cmake` (and any other build dep already in the venv); build isolation would hide them. The flag is also faster — no temporary build venv per install.
 
-This builds the nanobind `_task_interface` extension **and** pre-builds all runtime binaries for available toolchains into `build/lib/`. Sim platforms (a2a3sim, a5sim) are built when `gcc`/`g++` are available; onboard platforms (a2a3, a5) are built when `ccec` and the cross-compiler under `ASCEND_HOME_PATH` are available. Since a2a3 and a5 share the same compilation — differing only at runtime — both architectures are always built together when their toolchain is present.
+This builds the nanobind `_task_interface` extension **and** pre-builds runtime binaries for available toolchains into `build/lib/`. Sim platforms (a2a3sim, a5sim) are built when `gcc`/`g++` are available; onboard platforms (a2a3, a5) are built when `ccec` and the cross-compiler under `ASCEND_HOME_PATH` are available. Each architecture has its own sources, compiler target, and output directory.
 
 ### No rebuild on import
 

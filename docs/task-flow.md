@@ -1,6 +1,6 @@
 # Task Flow — Callable / TaskArgs / CallConfig Pass-Through
 
-Callable identity update: public Python submit APIs now accept
+Public Python submit APIs accept
 `CallableHandle` objects returned by `Worker.register`, and hierarchical task
 mailboxes carry the handle's 32-byte hash digest. Target-local integer slots
 remain private to the receiving worker. Older `cid` references in this document
@@ -34,7 +34,7 @@ Every task flowing through any level carries exactly three pieces of data:
 | Handle | Type | What it is |
 | ------ | ---- | ---------- |
 | `CallableHandle` / `CallableIdentity` | hash digest + kind + namespace | What the target worker should execute; targets resolve the digest to a local slot |
-| `TaskArgs` | user builder class | ChipTensors + scalars + per-tensor tags (IN/OUT/INOUT/etc.) |
+| `TaskArgs` | user builder class | Self-describing Tensor views + scalars + per-tensor tags (IN/OUT/INOUT/etc.) |
 | `CallConfig` | small POD | Execution knobs (aicpu_thread_num, profiling/dump/PMU flags, …) |
 
 Everything else in the engine is either plumbing (slots, ring, tensormap,
@@ -73,7 +73,7 @@ use either of two task frames after the base control frame, with
 from native launch. The receiving child resolves the digest in its own address
 space in both forms.
 
-The proposed remote L3 path keeps the same callable identity contract, but
+The remote L3 path keeps the same callable identity contract, but
 sends it in a versioned TASK frame. The remote endpoint resolves the digest
 against its own registry after it has reported `HELLO READY`.
 
@@ -101,112 +101,102 @@ One user-facing class. Its contents appear in four different physical
 representations across a task's lifetime — these are **phases**, not
 hierarchy levels.
 
+The canonical C++ builder is declared in
+[`task_args_wire.h`](../src/common/task_interface/task_args_wire.h):
+
 ```cpp
-class TaskArgs {
-    std::vector<ChipTensor> tensors_;
-    std::vector<TensorArgType>    tags_;     // per-tensor: INPUT/OUTPUT/INOUT/OUTPUT_EXISTING/NO_DEP
-    std::vector<uint64_t>         scalars_;
-    std::vector<TaskHandle>       explicit_deps_;  // parent graph only
-public:
-    void add_tensor(const ChipTensor&, TensorArgType tag = TensorArgType::INPUT);
-    void add_scalar(uint64_t);
-    void add_dep(const TaskHandle&);
-    void add_dep_wait(const TaskHandle&);
-    TaskArgsView view() const;
-    int32_t tensor_count() const;
-    int32_t scalar_count() const;
-    TensorArgType tag(int32_t i) const;    // only Orchestrator reads tags
-};
+using TaskArgs = TaskArgsTpl<Tensor, uint64_t, 0, 0, TensorArgType>;
 ```
 
-`TensorArgType` has five values (matches existing `tensor.h:45-51`):
-`INPUT`, `OUTPUT`, `INOUT`, `OUTPUT_EXISTING`, `NO_DEP`.
+It stores vectors of `Tensor` records, scalar values, tensor tags, and
+`ExplicitTaskDependency` records. `add_dep` adds a retaining dependency;
+`add_dep_wait` adds an ordering-only dependency. Tensors must be added before
+scalars. `TensorArgType` has five values: `INPUT`, `OUTPUT`, `INOUT`,
+`OUTPUT_EXISTING`, and `NO_DEP`.
 
-For remote L3 submits, public Python still uses the same `TaskArgs` builder.
-`TaskArgs.add_tensor(RemoteTensorRef(...), tag)` appends a normal
-`ChipTensor` metadata entry with `data == 0` plus a hidden remote
-sidecar at the same tensor index. The local mailbox path rejects non-empty
-remote sidecars; the remote framed path encodes the sidecar as a
-`RemoteTensorDescWire`.
+Each `Tensor` embeds its `BufferDescriptor` and a strided view. It carries no
+materialized address. `ChipTensor` is the device descriptor produced only at
+the L2 boundary; it is not the element stored in user-facing `TaskArgs`.
+See [Buffer Memory Model](buffer-abi.md) for identity, access, and lifetime.
+
+For remote L3 submits, `TaskArgs.add_tensor(RemoteTensorRef(...), tag)`
+creates a `Tensor` with a `REMOTE_SIDECAR` backend and keeps the remote
+reference in a sidecar at the same tensor index. The local mailbox path rejects
+remote sidecars; remote dispatch encodes the reference in its framed protocol.
 
 ### Representation at each phase
 
 | Phase | Form | Backing memory | Who writes | Who reads |
 | ----- | ---- | -------------- | ---------- | --------- |
-| **① User submit** | `TaskArgs` object (builder) | Python/C++ parent heap | user orch fn | Orchestrator |
-| **② Slot storage** | `TaskArgs` object (inside `slot.task_args`) | parent heap | Orchestrator.submit moves it here | WorkerThread at dispatch |
-| **③ Dispatch wire (PROCESS only)** | length-prefixed blob | shm mailbox (MAP_SHARED) | parent WorkerThread encodes | forked child decodes |
-| **④ L2 ABI edge** | `ChipStorageTaskArgs` POD | child stack | `ChipWorker::run` assembles | `simpler_run` consumes |
+| **① User submit** | `TaskArgs` builder with `Tensor` records | parent heap | user orchestration | Orchestrator |
+| **② Slot storage** | `TaskArgs` inside the task slot | parent heap | Orchestrator | endpoint at dispatch |
+| **③ Dispatch wire (PROCESS only)** | counts, `Tensor` records, scalars | shm mailbox | endpoint blob encoder | child decoder and ImportRegistry |
+| **④ L2 ABI edge** | `ChipStorageTaskArgs` containing `ChipTensor` records | child-owned materialization | child materializer | native chip runtime |
 
 ### Tags and explicit dependencies stay parent-side
 
-Tags are consumed by `Orchestrator::submit_*` to derive TensorMap dependencies
-and `TaskHandle` dependencies are consumed to add task-to-task ordering edges.
-Neither reaches phases ③ or ④ — scheduler dispatch payloads, child workers,
-and runtime.so do not receive them.
+Tags drive TensorMap dependency inference, and explicit handles add
+host-graph task edges. Neither is serialized into the dispatch blob or copied
+into the L2 argument POD.
 
 ### Blob byte layout (phase ③)
 
 ```text
-offset 0:            int32  tensor_count = T
-offset 4:            int32  scalar_count = S
-offset 8:            ChipTensor tensors[T]    // 128 B each
-offset 8 + 128T:      uint64_t scalars[S]            // 8 B each
-total used:          8 + 128T + 8S
+offset 0:            int32 tensor_count = T
+offset 4:            int32 scalar_count = S
+offset 8:            Tensor tensors[T]       // 144 bytes each
+offset 8 + 144T:     uint64_t scalars[S]      // 8 bytes each
+total used:          8 + 144T + 8S
 ```
 
-No tags, no pickle, no schema versioning — pure memcpy.
+`task_args_blob_size` and `write_blob` use `sizeof(Tensor)`, whose 144-byte
+size is guarded in [`buffer.h`](../src/common/task_interface/buffer.h).
+`read_blob` validates the counts against the available bytes. The blob has no
+outer schema version; each tensor contains a descriptor validated on access.
 
 ### TaskArgsView — the interface type
 
-The parent-side encoder (from `TaskArgs::view()`) and the child-side
-decoder (over the mailbox blob bytes) yield the same view type:
+`read_blob` returns a non-owning view over the encoded bytes:
 
 ```cpp
 struct TaskArgsView {
     int32_t tensor_count;
     int32_t scalar_count;
-    const ChipTensor *tensors;   // T items
-    const uint64_t         *scalars;   // S items
+    const uint8_t *tensor_bytes;
+    const uint64_t *scalars;
+
+    Tensor tensors(int32_t i) const;
 };
 ```
 
-24 bytes, POD, passable by value. Where the pointed-to arrays live depends on
-mode:
-
-- **THREAD**: `tensors` points into the `std::vector<ChipTensor>` heap
-  backing inside `slot.task_args`
-- **PROCESS**: `tensors` points into the shm mailbox blob region
-
-View does **not** own memory. Valid for the duration of a single
-`ChipWorker::run` call in the forked child.
+On a 64-bit host the view is 24 bytes. `tensors(i)` bounds-checks the index,
+copies the record to aligned local storage, and validates its descriptor and
+view. The tensor region starts after the 8-byte blob header, so readers must
+not reinterpret it as an aligned `Tensor*`. The referenced storage must remain
+alive while the view is consumed; a staged endpoint owns an immutable frame
+snapshot for that purpose.
 
 ### Conversion diagram
 
 ```text
-① TaskArgs (user)                    — parent heap (vectors)
-     │
-     │ Orchestrator::submit_next_level (tags consumed)
+① TaskArgs (Tensor views, scalars, tags, explicit dependencies)
+     │ Orchestrator consumes tags and explicit dependencies
      ▼
-② slot.task_args: TaskArgs           — parent heap, stored in slot
-     │
-     │ LocalMailboxEndpoint::run: memcpy into shm mailbox blob
-     │   layout = [int32 T][int32 S][ChipTensor × T][uint64 × S]
+② slot.task_args (parent heap)
+     │ write_blob: [int32 T][int32 S][Tensor × T][uint64 × S]
      ▼
-③ shm mailbox bytes (MAP_SHARED)     — visible to forked child
-     │
-     │ child decodes header → builds TaskArgsView over the blob bytes
+③ mailbox bytes → child-owned args
+     │ ImportRegistry resolves each descriptor to a consumer-local base
+     │ materialize_task_args builds the chip representation
      ▼
-    child resolves digest -> local slot
-    ChipWorker::run(local_slot, view, config)  (in the forked child)
-
-     │ (L2 ABI edge)
+④ ChipStorageTaskArgs (ChipTensor records + scalars)
+     │ native run or prepare/launch/poll/finalize lifecycle
      ▼
-④ ChipStorageTaskArgs POD — child stack
-     │ memcpy view.tensors, view.scalars into struct
-     ▼
-    simpler_run(local_slot, &chip_storage, &config)
+    chip runtime stages host-backed data or uses owned device memory
 ```
+
+A public L2 `Worker.run()` performs the same materialization in its own
+process, without a mailbox. It accepts `TaskArgs`, not `ChipStorageTaskArgs`.
 
 ---
 
@@ -221,8 +211,8 @@ struct CallConfig {
     int32_t enable_dep_gen = 0;
     int32_t enable_scope_stats = 0;
     int32_t capture_clock_anchors = 0; // set by the ChipWorker child, not by callers
+    RuntimeEnv runtime_env;      // three arrays of four uint64_t overrides
     char    output_prefix[1024] = {};
-    // future fields here - same POD used at all levels
 };
 ```
 
@@ -250,23 +240,17 @@ concrete leaves, each consumed by its own Python child loop.
 
 ### `ChipWorker` (NEXT_LEVEL, L2 leaf)
 
-Wraps a dlsym'd `runtime.so`. `_chip_process_loop` instantiates one
-`ChipWorker` per chip child and calls its `run` on every dispatch.
-`run()` assembles a `ChipStorageTaskArgs` POD from the decoded view and
-calls `simpler_run`:
+The Python chip child resolves the callable digest to a local slot, decodes
+`TaskArgs`, and resolves each `Tensor` through its `ImportRegistry`.
+`materialize_task_args` builds `ChipStorageTaskArgs` at the resolved bases.
+The child then calls the native `run_materialized` binding, or submits a native
+run token for the staged prepare/launch/poll/finalize path.
 
-```cpp
-void ChipWorker::run(int32_t local_slot, TaskArgsView view, const CallConfig &config) {
-    ChipStorageTaskArgs chip_storage;
-    chip_storage.tensor_count_ = view.tensor_count;
-    chip_storage.scalar_count_ = view.scalar_count;
-    memcpy(chip_storage.tensors_, view.tensors, view.tensor_count * sizeof(ChipTensor));
-    memcpy(chip_storage.scalars_, view.scalars, view.scalar_count * sizeof(uint64_t));
-    simpler_run(local_slot, &chip_storage, &config);
-}
-```
-
-One memcpy of a few KB per task; negligible.
+This boundary is a descriptor resolution and materialization step, not a
+memcpy from the mailbox tensor array into `ChipTensor[]`. Host-backed arguments
+may need device staging and output copy-back; device-backed arguments must
+resolve to allocations owned by the target chip. The native `ChipWorker`
+consumes the resulting POD and invokes the runtime's execution lifecycle.
 
 #### Pipeline resource leases
 
@@ -466,20 +450,17 @@ run fails before device argument staging. See the runtime's `RUNTIME_LOGIC.md`
 
 ### SUB-type child loop (Python callable leaf)
 
-SUB execution is handled entirely in Python. The forked child process
-runs `_sub_worker_loop` which reads the args blob from the shared-memory
-mailbox, decodes it into a `TaskArgs` object, and passes it to the
-registered callable:
+SUB execution is handled in Python. `_sub_worker_loop` resolves the callable
+digest and uses `ImportRegistry.mapped_args_from_blob` to create a `MappedArgs`
+object whose tensor data is mapped into the child's address space:
 
 ```python
-fn(args)    # args: TaskArgs decoded from the mailbox blob
+fn(args)    # args: MappedArgs with mapped tensors and scalars
 ```
 
-The callable receives the same `TaskArgs` that was submitted via
-`orch.submit_sub(handle, args)`, with tags stripped (tags are consumed by
-the Orchestrator at submit time). There is no C++ class for SUB workers
-— the Python child loop and callable registry are the entire
-implementation; the child inherits the Python registry through fork COW.
+The submitted tensor descriptors and scalars cross the mailbox; dependency
+tags stay parent-side. Pre-start registrations enter the fork snapshot;
+post-start registrations reach the live child through the control plane.
 
 ### L4+ recursion — no extra leaf type
 
@@ -618,8 +599,9 @@ that completion through `Scheduler::worker_done`.
 
 At this point:
 
-- ChipTensor output data is already written to shm (kernel wrote via
-  `ChipTensor.data` pointer → shm page visible to parent)
+- Host-backed output data has been copied back during native finalization
+  and is visible through the shared backing. Device-backed output stays on
+  its owning chip until the caller requests a copy
 - Control returns to the Scheduler, which marks the slot `COMPLETED` on
   success or `FAILED` on task/endpoint failure, then releases fanout refs and
   either wakes or poisons downstream consumers
@@ -723,29 +705,41 @@ diagnostic label.
 
 ## 10. Worked example — one L3 chip task
 
-User code:
+Given a compiled `chip_callable` with signature `(IN, IN, OUT)` that accepts
+three float32 tensors of shape `(N,)`:
 
 ```python
-a = torch.randn(N).share_memory_()
-b = torch.randn(N).share_memory_()
-c = torch.zeros(N).share_memory_()
+import torch
+from simpler import Worker
+from simpler.task_interface import CallConfig, DataType, TaskArgs, TensorArgType
 
-args = TaskArgs()
-args.add_tensor(make_ct(a), IN)
-args.add_tensor(make_ct(b), IN)
-args.add_tensor(make_ct(c), OUT)
+w3 = Worker(level=3, device_ids=[0], platform="a2a3sim",
+            runtime="tensormap_and_ringbuffer")
+chip_handle = w3.register(chip_callable)
+w3.init()
+try:
+    a_buf = w3.create_buffer(N * 4)
+    b_buf = w3.create_buffer(N * 4)
+    c_buf = w3.create_buffer(N * 4)
+    a = torch.frombuffer(a_buf.shm.buf, dtype=torch.float32, count=N)
+    b = torch.frombuffer(b_buf.shm.buf, dtype=torch.float32, count=N)
+    c = torch.frombuffer(c_buf.shm.buf, dtype=torch.float32, count=N)
+    a.fill_(2)
+    b.fill_(3)
+    c.zero_()
 
-def my_orch(orch, view, cfg):
-    chip_args = TaskArgs()
-    for i in range(view.tensor_count):
-        chip_args.add_tensor(view.tensors[i], IN if i < 2 else OUT)
-    orch.submit_next_level(chip_kernel_handle, chip_args, cfg, worker=0)
+    args = TaskArgs()
+    args.add_tensor(a_buf.tensor((N,), DataType.FLOAT32), TensorArgType.INPUT)
+    args.add_tensor(b_buf.tensor((N,), DataType.FLOAT32), TensorArgType.INPUT)
+    args.add_tensor(c_buf.tensor((N,), DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
 
-w3 = Worker(level=3, child_mode=PROCESS)
-w3.add_worker(NEXT_LEVEL, chip_worker_0)
-w3.init()    # fork chip_0 here
+    def my_orch(orch, task_args, cfg):
+        orch.submit_next_level(chip_handle, task_args, cfg, worker=0)
 
-w3.run(my_orch, args, CallConfig(aicpu_thread_num=0))
+    w3.run(my_orch, args, CallConfig())
+    # Read c here, while its backing is live.
+finally:
+    w3.close()
 ```
 
 Step-by-step (one chip worker):
@@ -753,13 +747,13 @@ Step-by-step (one chip worker):
 | Step | Where | What happens |
 | ---- | ----- | ------------ |
 | 1 | parent Python | user builds `args: TaskArgs`, calls `w3.run(my_orch, args, config)` |
-| 2 | `Worker::run` | `scope_begin` → call `my_orch(&orch_, args.view(), cfg)` |
-| 3 | `Orchestrator::submit_next_level` | `slot = ring.alloc()`; move `chip_args` into `slot.task_args`; walk tags → `tensormap.lookup(a.data)`, `tensormap.lookup(b.data)`, `tensormap.insert(c.data, slot)`; push ready |
+| 2 | `Worker::run` | invoke the Python orchestration callback with its Orchestrator facade, args, and config |
+| 3 | `Orchestrator::submit_next_level` | allocate a task slot; store its args; infer dependencies using canonical buffer identities and overlapping views; enqueue ready work |
 | 4 | Scheduler thread | pop `slot` from worker 0's FIFO; resolve stable worker ID 0 to WT_chip_0; dispatch |
 | 5 | WT_chip_0 parent side | encode one leased task frame: write `config`, digest prefix, and the args blob; publish `TASK_READY` for the active lane or `PREPARE_READY` for a staged successor |
 | 6 | chip_0 child process | validate the frame and resolve its digest; ordinary HBG with an active predecessor also prepares the leased inactive arena bank before publishing `FRAME_STAGED`, while a frame with no active predecessor, diagnostic HBG, and TMR publish after validation and defer native prepare |
 | 7 | chip_0 native-run path | after activation and the predecessor's finalization fence, launch an already-prepared HBG run or finish deferred native preparation and then launch; poll it to completion and finalize it before another staged frame may launch. Compatibility endpoints perform the equivalent operation through blocking `ChipWorker::run` |
-| 8 | runtime.so | translate host ptrs → device ptrs; dispatch AICPU / AICore; write output into `c`'s shm |
+| 8 | runtime.so | stage resolved host-backed tensors on the device; dispatch AICPU / AICore; copy output back to `c` during finalization |
 | 9 | chip_0 child | native finalization returns; write `TASK_DONE` |
 | 10 | WT_chip_0 parent | observe `TASK_DONE`; push success completion |
 | 11 | Scheduler | mark slot COMPLETED; fanout release (none in this DAG); scope_end will release scope ref |
@@ -788,9 +782,9 @@ runtime: `ChipStorageTaskArgs` (`task_args.h`) is already declared with
 
 ### Why no `WorkerPayload` wrapper
 
-`ChipWorker::run` takes `(local_slot, TaskArgsView, const CallConfig&)`
-directly. Wrapping them in a struct added no value and made mailbox serialization
-indirect. The scheduler's parent-private `TaskSlot` is held by WorkerThread for
+The chip child resolves the local slot and materializes the args before
+calling the native ChipWorker with the chip POD and `CallConfig`. The
+scheduler's parent-private `TaskSlot` is held by WorkerThread for
 the completion callback and is not passed into the child. The distinct,
 generation-safe `PipelineSlotLease.slot_id` does cross the mailbox boundary.
 
@@ -815,11 +809,10 @@ time.
 
 ### Why `TaskArgsView` is just pointers + counts
 
-View is constructed at both ends of the mailbox handshake (from
-`TaskArgs::view()` on the parent side for encoding, from a decoded
-mailbox blob on the child side). Making it POD (24 B) lets it pass by
-value through `ChipWorker::run`. The underlying `ChipTensor[]`
-lives in the mailbox blob bytes on the child side — view doesn't care.
+`read_blob` constructs a non-owning view over the encoded `Tensor` and scalar
+records. Counts allow bounds checks; byte storage plus the copying `tensors(i)`
+accessor avoids assuming tensor alignment in the mailbox. Native chip execution
+consumes materialized `ChipStorageTaskArgs`, not this view.
 
 ---
 

@@ -41,12 +41,21 @@ _task_interface.*.so      nanobind extension at site-packages root
 
 | Concern | `simpler` | `simpler_setup` |
 | ------- | --------- | --------------- |
-| What it is | Stable user-facing runtime API | Test/build infrastructure |
-| Imported by user code? | Yes — `from simpler.worker import Worker` | Sometimes — test framework uses it |
-| Imported by other packages? | Yes — `simpler_setup` imports `simpler.env_manager` | No — leaf consumer |
-| Lifecycle | Slow-changing public API | Fast-changing internal helpers |
+| What it is | Runtime API | Kernel compilation, runtime assembly, scene tests, and analysis tools |
+| Imported by user code? | Yes — `from simpler.worker import Worker` | Yes — for example, `KernelCompiler`, `TensorArg`, and `SceneTestCase` |
+| Imported by the other package? | `simpler_setup` uses `simpler.env_manager` and task types | `Worker` lazily imports `RuntimeBuilder` during chip setup |
 
-Internal coupling: `simpler_setup.toolchain`, `simpler_setup.kernel_compiler`, and `simpler_setup.runtime_compiler` import `simpler.env_manager`. This is the only direction allowed (`simpler_setup → simpler`); never the reverse. `simpler` must not depend on `simpler_setup`.
+The packages ship together. `simpler_setup.toolchain`, `kernel_compiler`, and
+`runtime_compiler` import `simpler.env_manager`. In the other direction,
+`Worker._init_level2` and hierarchical chip-child setup lazily import
+`simpler_setup.runtime_builder.RuntimeBuilder` to resolve runtime binaries.
+Keep that runtime-assembly dependency lazy: importing `simpler` alone does not
+load the native extension or initialize a worker.
+
+The transitional `kernel_compiler`, `runtime_compiler`, `toolchain`, and
+`elf_parser` modules under `python/simpler/` also ship in the wheel. New
+callers should use their authoritative `simpler_setup` equivalents;
+`wheel.packages` includes both packages without excluding those modules.
 
 ### Dependencies
 
