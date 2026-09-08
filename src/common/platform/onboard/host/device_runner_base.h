@@ -966,8 +966,9 @@ protected:
      *
      * Each spawned thread is bound to `device_id_` via `create_thread`.
      *
-     * Subclasses with arch-specific collectors (a2a3's
-     * `dep_gen_collector_`) call this helper and then start their own.
+     * Subclasses with arch-specific collectors (`dep_gen_collector_`) call
+     * this helper and then start their own. The sim base carries the same
+     * split.
      */
     void start_shared_collectors_for_run();
 
@@ -980,9 +981,9 @@ protected:
      * writes dump files; `pmu` has no export step beyond reconcile;
      * `scope_stats` writes JSONL).
      *
-     * Subclasses with arch-specific collectors (a2a3's
-     * `dep_gen_collector_` + its `dep_gen_replay_emit_deps_json` export)
-     * inline their own teardown after calling this helper.
+     * Subclasses with arch-specific collectors (`dep_gen_collector_` + its
+     * `dep_gen_replay_emit_deps_json` export) inline their own teardown after
+     * calling this helper. The sim base carries the same split.
      */
     void teardown_shared_collectors_after_run(bool device_execution_complete);
 

@@ -40,7 +40,6 @@
 #include "common/unified_log.h"
 #include "cpu_sim_context.h"
 #include "host_log.h"
-#include "host/host_phase_records_artifact.h"
 #include "host/raii_scope_guard.h"
 #include "host/runtime_timeout_config.h"
 #include "runtime.h"
@@ -554,17 +553,13 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 set_scope_stats_enabled_func_(enable_scope_stats_);
                 set_platform_scope_stats_base_func_(kernel_args_.scope_stats_data_base);
 
-                auto thread_factory = [this](std::function<void()> fn) {
-                    return create_thread(std::move(fn));
-                };
-                if (enable_chip_swimlane_) {
-                    if (capture_clock_anchors_) begin_clock_correlation_session_if_needed();
-                    chip_swimlane_collector_.start(thread_factory);
+                start_shared_collectors_for_run();
+                if (enable_dep_gen_ && !dep_gen_host_graph_active()) {
+                    auto thread_factory = [this](std::function<void()> fn) {
+                        return create_thread(std::move(fn));
+                    };
+                    dep_gen_collector_.start(thread_factory);
                 }
-                if (enable_dump_args_) dump_collector_.start(thread_factory);
-                if (enable_pmu_) pmu_collector_.start(thread_factory);
-                if (enable_dep_gen_ && !dep_gen_host_graph_active()) dep_gen_collector_.start(thread_factory);
-                if (enable_scope_stats_) scope_stats_collector_.start(thread_factory);
 
                 if (kernel_args_.device_wall_data_base != 0) {
                     *reinterpret_cast<uint64_t *>(kernel_args_.device_wall_data_base) = 0;
@@ -688,30 +683,7 @@ int DeviceRunner::drain_execution(ActiveExecution &) {
         return runtime_rc;
     }
 
-    // Tear down collectors. stop() joins mgmt then collector in the only safe
-    // order (mgmt's final-drain pass into L2 has poll as its consumer).
-    finish_clock_correlation_session(true);
-    if (enable_chip_swimlane_) {
-        chip_swimlane_collector_.quiesce();
-        chip_swimlane_collector_.read_phase_header_metadata();
-        chip_swimlane_collector_.reconcile_counters();
-        publish_host_phase_records_to_swimlane();
-        if (!publish_runtime_chip_swimlane_extensions(active_run_->runtime)) {
-            LOG_WARN("Runtime chip-swimlane extension publication failed");
-        }
-        chip_swimlane_collector_.export_swimlane_json();
-    }
-
-    if (enable_dump_args_) {
-        dump_collector_.quiesce();
-        dump_collector_.reconcile_counters();
-        dump_collector_.export_dump_files();
-    }
-
-    if (enable_pmu_) {
-        pmu_collector_.quiesce();
-        pmu_collector_.reconcile_counters();
-    }
+    teardown_shared_collectors_after_run(true);
 
     // Device-orch shape: the collector stops, the ring reconciles, and the
     // records replay. The host-orch shape emits at the end of bind instead, where
@@ -726,20 +698,6 @@ int DeviceRunner::drain_execution(ActiveExecution &) {
                 LOG_ERROR("dep_gen replay failed (%d) — deps.json not produced", replay_rc);
             }
         }
-    }
-
-    // Per-event view of the prepare path. Keyed on output_prefix_ rather than a
-    // flag because it is non-empty exactly when this run produces diagnostic
-    // artifacts, and on the store having finished a pass, which is what a
-    // host-orchestrating runtime leaves behind.
-    if (!output_prefix_.empty() && host_phase_records_.finished()) {
-        (void)host_phase_records_.write_records_jsonl(make_host_phase_records_path(output_prefix_));
-    }
-
-    if (enable_scope_stats_) {
-        scope_stats_collector_.quiesce();
-        scope_stats_collector_.reconcile_counters();
-        scope_stats_collector_.write_jsonl(output_prefix_);
     }
 
     print_handshake_results();
@@ -859,6 +817,13 @@ int DeviceRunner::finalize() {
 // =============================================================================
 // Performance Profiling Implementation
 // =============================================================================
+
+void DeviceRunner::publish_chip_swimlane_runtime_extensions() {
+    if (active_run_ == nullptr) return;
+    if (!publish_runtime_chip_swimlane_extensions(active_run_->runtime)) {
+        LOG_WARN("Runtime chip-swimlane extension publication failed");
+    }
+}
 
 void DeviceRunner::finalize_collectors() {
     clear_collector_shape();

@@ -293,6 +293,33 @@ public:
     const simpler::dfx::HostPhaseRecordStore &host_phase_records() const { return host_phase_records_; }
     /** Hand this pass's records to the swimlane reader, just before its export. */
     void publish_host_phase_records_to_swimlane();
+    /**
+     * Publish arch-specific runtime metadata into the swimlane export, between
+     * the host-phase handoff and the export itself — the only point at which the
+     * collector holds this run's records but has not yet serialized them. a5
+     * overrides it; every other arch has nothing to add.
+     */
+    virtual void publish_chip_swimlane_runtime_extensions() {}
+    /**
+     * Start collector mgmt + poll threads for the four shared diagnostics
+     * collectors that are enabled. Mirrors the onboard base. Subclasses with
+     * arch-specific collectors (`dep_gen_collector_`) call this and then start
+     * their own.
+     */
+    void start_shared_collectors_for_run();
+    /** Write this pass's per-event host phase records, if it collected any. */
+    void write_host_phase_records_artifact();
+    /**
+     * Tear down the four shared diagnostics collectors after the launched
+     * kernels have synced, in the one order their couplings allow: the clock
+     * correlation session closes before the swimlane export reads it, and each
+     * collector drains before it reconciles before it exports.
+     *
+     * Subclasses with arch-specific collectors (`dep_gen_collector_` + its
+     * `dep_gen_replay_emit_deps_json` export) inline their own teardown after
+     * calling this helper, as on onboard.
+     */
+    void teardown_shared_collectors_after_run(bool device_execution_complete);
     /** Start the level-4 Host/Device clock correlation once per run. */
     void begin_clock_correlation_session_if_needed() noexcept;
     void finish_clock_correlation_session(bool capture_device_complete) noexcept;

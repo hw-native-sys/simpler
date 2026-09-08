@@ -29,6 +29,7 @@
 #include "chip_callable_layout.h"
 #include "common/host_api.h"
 #include "cpu_sim_context.h"
+#include "host/host_phase_records_artifact.h"
 #include "host/raii_scope_guard.h"
 #include "task_args_wire.h"
 #include "utils/elf_build_id.h"
@@ -821,6 +822,73 @@ void SimDeviceRunnerBase::publish_host_phase_records_to_swimlane() {
         host_phase_records_.submitted_tasks(), host_phase_records_.total_records(),
         host_phase_records_.dropped_records()
     );
+}
+
+void SimDeviceRunnerBase::start_shared_collectors_for_run() {
+    auto thread_factory = [this](std::function<void()> fn) {
+        return create_thread(std::move(fn));
+    };
+    if (enable_chip_swimlane_) {
+        if (capture_clock_anchors_) begin_clock_correlation_session_if_needed();
+        chip_swimlane_collector_.start(thread_factory);
+    }
+    if (enable_dump_args_) {
+        dump_collector_.start(thread_factory);
+    }
+    if (enable_pmu_) {
+        pmu_collector_.start(thread_factory);
+    }
+    if (enable_scope_stats_) {
+        scope_stats_collector_.start(thread_factory);
+    }
+}
+
+void SimDeviceRunnerBase::write_host_phase_records_artifact() {
+    // Every phase this records is produced on the host during bind and the store
+    // is finished before launch, so it touches no device state and is callable
+    // from any point after bind — including a path that never launched.
+    // `output_prefix_` is non-empty exactly when this run produces diagnostic
+    // artifacts, and the store writes a pass at most once.
+    if (!output_prefix_.empty() && host_phase_records_.finished()) {
+        (void)host_phase_records_.write_records_jsonl(make_host_phase_records_path(output_prefix_));
+    }
+}
+
+void SimDeviceRunnerBase::teardown_shared_collectors_after_run(bool device_execution_complete) {
+    // The order is fixed by three couplings, not by preference: the clock
+    // correlation session closes before the swimlane export reads it, the host
+    // phase records reach the collector before that same export serializes them,
+    // and each collector drains before it reconciles before it exports.
+    // Diagnostic exports use the per-task `output_prefix_` directory the user set
+    // on CallConfig (CallConfig::validate() enforces non-empty upstream).
+    finish_clock_correlation_session(device_execution_complete);
+    if (enable_chip_swimlane_) {
+        chip_swimlane_collector_.quiesce();
+        chip_swimlane_collector_.read_phase_header_metadata();
+        chip_swimlane_collector_.reconcile_counters();
+        publish_host_phase_records_to_swimlane();
+        publish_chip_swimlane_runtime_extensions();
+        chip_swimlane_collector_.export_swimlane_json();
+    }
+
+    write_host_phase_records_artifact();
+
+    if (enable_dump_args_) {
+        dump_collector_.quiesce();
+        dump_collector_.reconcile_counters();
+        dump_collector_.export_dump_files();
+    }
+
+    if (enable_pmu_) {
+        pmu_collector_.quiesce();
+        pmu_collector_.reconcile_counters();
+    }
+
+    if (enable_scope_stats_) {
+        scope_stats_collector_.quiesce();
+        scope_stats_collector_.reconcile_counters();
+        scope_stats_collector_.write_jsonl(output_prefix_);
+    }
 }
 
 void SimDeviceRunnerBase::finish_clock_correlation_session(bool capture_device_complete) noexcept {

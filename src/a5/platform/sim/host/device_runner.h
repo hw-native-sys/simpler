@@ -67,6 +67,12 @@ private:
     // can re-init collectors on the next enqueue. Matches a2a3 sim.
     void finalize_collectors();
 
+    // a5 publishes runtime-derived swimlane metadata that the other arches do
+    // not have; the base calls this between the host-phase handoff and the
+    // export, the only point where the collector holds this run's records and
+    // has not yet serialized them.
+    void publish_chip_swimlane_runtime_extensions() override;
+
     // a5 sim's dlsym'd function-pointer table. Loaded once via
     // ensure_binaries_loaded(), nulled on unload_executor_binaries().
     int (*aicpu_execute_func_)(Runtime *){nullptr};
