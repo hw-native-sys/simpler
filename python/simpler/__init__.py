@@ -37,6 +37,11 @@ from ._log import (
 __all__ = [
     "DEFAULT_THRESHOLD",
     "Worker",
+    "ExternalBufferRange",
+    "ExternalTransferHandle",
+    "ExternalTransferRequest",
+    "ExternalTransferResult",
+    "register_external_transfer_provider",
     "register_chip_control_extension",
     "NUL",
     "TIMING",
@@ -55,6 +60,15 @@ _LAZY_ATTRS = {
     ),
 }
 _LAZY_SUBMODULES = ("comm_endpoints", "task_interface")
+
+for _name in (
+    "ExternalBufferRange",
+    "ExternalTransferHandle",
+    "ExternalTransferRequest",
+    "ExternalTransferResult",
+    "register_external_transfer_provider",
+):
+    _LAZY_ATTRS[_name] = (f"{__name__}.external_transfer", _name)
 
 
 def __getattr__(name: str) -> Any:

@@ -253,6 +253,9 @@ class FakeChipWorker:
     def free(self, ptr: int) -> None:
         self._blocks.pop(int(ptr), None)
 
+    def _bind_external_transfer_thread(self) -> None:
+        pass
+
     def copy_to(self, dst: int, src: int, size: int) -> None:
         ctypes.memmove(dst, src, size)
 

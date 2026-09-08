@@ -102,6 +102,8 @@ _OCCUPIED_WORKER_CONTROL_COMMANDS = frozenset(
         24,  # _CTRL_GLOBAL_DOMAIN_NODE
         25,  # _CTRL_DEVICE_MEMORY_INFO
         26,  # _CTRL_DELEGATED_REGION
+        27,  # _CTRL_CHIP_EXTENSION
+        28,  # _CTRL_EXTERNAL_TRANSFER
     }
 )
 _ALLOCATE_SUCCESS_OUTCOME = bytes.fromhex(
@@ -1370,6 +1372,8 @@ def test_control_command_26_is_delegated_region_and_16_17_remain_retired():
             "_CTRL_GLOBAL_DOMAIN_NODE",
             "_CTRL_DEVICE_MEMORY_INFO",
             "_CTRL_DELEGATED_REGION",
+            "_CTRL_CHIP_EXTENSION",
+            "_CTRL_EXTERNAL_TRANSFER",
         }
     }
     assert set(command_ids.values()) == _OCCUPIED_WORKER_CONTROL_COMMANDS

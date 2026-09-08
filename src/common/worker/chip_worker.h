@@ -182,6 +182,8 @@ public:
     void free(uint64_t ptr);
     void copy_to(uint64_t dst, uint64_t src, size_t size);
     void copy_from(uint64_t dst, uint64_t src, size_t size);
+    // Binds a runtime-owned transfer thread; callers must retain the worker until it exits.
+    void bind_external_transfer_thread();
 
     /// Distributed communication primitives (optional — only available when
     /// the bound runtime exports comm_*).  Wraps the backend-neutral C API

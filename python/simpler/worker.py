@@ -59,6 +59,7 @@ Usage::
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import ctypes
 import enum
@@ -209,6 +210,15 @@ from .comm_region import (
     materialize_region_instance,
     project_region_allocation_spec,
     validate_single_owner_region_shape,
+)
+from .external_transfer import (
+    ExternalBufferRange,
+    ExternalTransferHandle,
+    ExternalTransferSpan,
+    ExternalTransferSubmissionError,
+    _ExternalTransferPool,
+    _snapshot_providers,
+    _start_chip_transfer,
 )
 from .global_comm_domain import (
     CTRL_GLOBAL_DOMAIN_COPY_FROM,
@@ -632,6 +642,8 @@ _CTRL_OP_NAMES[_CTRL_GLOBAL_DOMAIN_NODE] = "global_domain"
 _CTRL_OP_NAMES[_CTRL_DELEGATED_REGION] = "delegated_region"
 _CTRL_CHIP_EXTENSION = 27
 _CTRL_OP_NAMES[_CTRL_CHIP_EXTENSION] = "chip_extension"
+_CTRL_EXTERNAL_TRANSFER = 28
+_CTRL_OP_NAMES[_CTRL_EXTERNAL_TRANSFER] = "external_transfer"
 
 _CHIP_EXTENSION_HEADER = struct.Struct("!H")
 _chip_control_extensions: dict[str, Any] = {}
@@ -1714,9 +1726,7 @@ def _read_ctrl_staged_payload(buf: memoryview) -> bytes:
         staged.close()
 
 
-def _handle_chip_control_extension(
-    cw: ChipWorker, buf: memoryview, device_id: int, extensions: dict[str, Any]
-) -> None:
+def _handle_chip_control_extension(cw: ChipWorker, buf: memoryview, device_id: int, extensions: dict[str, Any]) -> None:
     envelope = _read_ctrl_staged_payload(buf)
     if len(envelope) < _CHIP_EXTENSION_HEADER.size:
         raise ValueError("chip control extension envelope is truncated")
@@ -2852,6 +2862,8 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
     on_task_done_success=None,
     prepared: set[int] | None = None,
     task_frame_count: int = 1,
+    external_transfer_providers: dict | None = None,
+    external_transfer_signals: tuple = (),
 ) -> None:
     """Chip-process handlers for `_run_mailbox_loop`.
 
@@ -3057,6 +3069,19 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                 _DEVICE_MEMORY_INFO.pack_into(buf, _CTRL_OFF_RESULT, info.free_bytes, info.total_bytes)
             elif sub_cmd == _CTRL_CHIP_EXTENSION:
                 _handle_chip_control_extension(cw, buf, device_id, chip_control_extensions)
+            elif sub_cmd == _CTRL_EXTERNAL_TRANSFER:
+                staged, staged_buf, size = _open_ctrl_payload(buf, what="external transfer")
+                try:
+                    _start_chip_transfer(
+                        bytes(staged_buf[:size]),
+                        device_id,
+                        external_transfer_providers or {},
+                        external_transfer_signals,
+                        cw._bind_external_transfer_thread,
+                    )
+                finally:
+                    staged_buf.release()
+                    staged.close()
             elif sub_cmd == _CTRL_IMPORT_RELEASE:
                 import_registry.unregister(_unpack_identity_wire(_read_control_digest(buf)))
             elif sub_cmd == CTRL_GLOBAL_DOMAIN_PREPARE:
@@ -3363,6 +3388,8 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     runtime: str = "",
     prewarm_config=None,
     enable_sdma: bool = False,
+    external_transfer_providers: dict | None = None,
+    external_transfer_signals: tuple = (),
 ) -> None:
     """Runs in forked child process. Loads host_runtime.so in own address space.
 
@@ -3426,6 +3453,12 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     sys.stderr.flush()
 
     try:
+        external_transfer_kwargs = {}
+        if external_transfer_signals:
+            external_transfer_kwargs = {
+                "external_transfer_providers": external_transfer_providers,
+                "external_transfer_signals": external_transfer_signals,
+            }
         _run_chip_main_loop(
             cw,
             buf,
@@ -3441,6 +3474,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             chip_runtime=runtime,
             prepared=prepared,
             task_frame_count=_local_task_frame_count(platform, runtime, int(cw.pipeline_depth)),
+            **external_transfer_kwargs,
         )
     finally:
         cw.finalize()
@@ -4579,8 +4613,7 @@ class Worker:
         self._registry_lock = threading.Lock()
         self._pending_unregister_cids: set[int] = set()
         self._pending_remote_unregister_hashids: set[bytes] = set()
-        self._chip_control_extension_names: frozenset[str] = frozenset()
-        self._py_control_timeout_s = float(config.get("py_control_timeout_s", _PY_CONTROL_TIMEOUT_S))
+        self._init_chip_control_state(config)
         # Upper bound on how long the readiness barrier waits for a forked child
         # to report INIT_READY/INIT_FAILED before treating it as hung. Must be
         # finite, else the deadline can never trip and the "bounded startup"
@@ -7944,12 +7977,7 @@ class Worker:
                 (digest, state.target, state.ref_count, state.kind, state.target_namespace)
                 for digest, state in self._identity_registry.items()
             ]
-        if self.level == 3:
-            with _chip_control_extensions_lock:
-                chip_control_extensions = dict(_chip_control_extensions)
-            self._chip_control_extension_names = frozenset(chip_control_extensions)
-        else:
-            chip_control_extensions = {}
+        chip_control_extensions = self._snapshot_chip_integrations()
 
         # Seed this process's logger before the first fork: the spans its own
         # scheduler emits obey the Python logger level, and every child inherits
@@ -8047,6 +8075,10 @@ class Worker:
                             ),
                             self._owner_instance_id,
                             chip_control_extensions,
+                            external_transfer_providers=self._external_transfer_providers,
+                            external_transfer_signals=(
+                                self._external_transfers.signals if self._external_transfers is not None else ()
+                            ),
                             log_level=chip_log_level,
                             platform=str(self._config["platform"]),
                             runtime=str(self._config["runtime"]),
@@ -10645,6 +10677,147 @@ class Worker:
         _require_copy_span(host_nbytes, host_offset, nbytes, side=host_side, api=api)
         return device_offset, host_offset, nbytes
 
+    def _init_chip_control_state(self, config: dict) -> None:
+        self._chip_control_extension_names: frozenset[str] = frozenset()
+        self._external_transfer_providers: dict = {}
+        self._external_transfers: _ExternalTransferPool | None = None
+        self._py_control_timeout_s = float(config.get("py_control_timeout_s", _PY_CONTROL_TIMEOUT_S))
+
+    def _snapshot_chip_integrations(self) -> dict:
+        if self.level != 3:
+            return {}
+        with _chip_control_extensions_lock:
+            extensions = dict(_chip_control_extensions)
+        self._chip_control_extension_names = frozenset(extensions)
+        self._snapshot_external_transfers()
+        return extensions
+
+    def _snapshot_external_transfers(self) -> None:
+        self._external_transfer_providers = _snapshot_providers()
+        if self._external_transfer_providers:
+            count = self._config.get("external_transfer_max_pending", 2)
+            max_bytes = self._config.get("external_transfer_max_bytes", 1024 * 1024 * 1024)
+            if type(count) is not int or count <= 0 or type(max_bytes) is not int or max_bytes <= 0:
+                raise ValueError("external transfer limits must be positive integers")
+            self._external_transfers = _ExternalTransferPool(count, max_bytes, self._retire_external_transfer)
+
+    def submit_external_transfer(
+        self,
+        provider: str,
+        buffers: tuple[ExternalBufferRange, ...],
+        payload: bytes = b"",
+        *,
+        timeout_s: float | None = None,
+    ) -> ExternalTransferHandle:
+        """Submit trusted external access to one local chip's DEVICE_MALLOC buffers.
+
+        The control timeout bounds submission acknowledgement, not DMA. An
+        uncertain submission raises ExternalTransferSubmissionError carrying
+        the retained handle. Compute and device control are excluded until
+        all external handles have confirmed quiescence through wait()/done().
+        """
+        if self.level != 3:
+            raise TypeError("external transfers require a level-3 Worker")
+        if _callback_frame_for(self) is not None or id(self) in _held_control_reservations():
+            raise RuntimeError("external transfers must be submitted outside orchestration/control callbacks")
+        effective_timeout = self._py_control_timeout_s if timeout_s is None else float(timeout_s)
+        if not (effective_timeout > 0 and math.isfinite(effective_timeout)):
+            raise ValueError("external transfer timeout_s must be positive and finite")
+        if not isinstance(payload, bytes) or len(payload) > 1024 * 1024:
+            raise ValueError("external transfer payload must be bytes of at most 1 MiB")
+        ranges = tuple(buffers)
+        if not ranges or len(ranges) > 65536 or any(not isinstance(r, ExternalBufferRange) for r in ranges):
+            raise ValueError("external transfer requires 1..65536 ExternalBufferRange entries")
+        with self._operation_lease("submit_external_transfer"), self._submit_mu.exclusive():
+            self._require_no_ordered_cleanup_failure("submit_external_transfer")
+            if provider not in self._external_transfer_providers or self._external_transfers is None:
+                raise KeyError(f"external transfer provider {provider!r} was not registered before Worker.init()")
+            with self._hierarchical_start_cv:
+                if self._accepted_run_handles or self._abandoned_run_handles:
+                    raise RuntimeError("external transfer requires all compute runs to have completed")
+            spans, worker_id = self._external_transfer_spans(ranges)
+            with self._hierarchical_start_cv:
+                handle = self._external_transfers.reserve(spans, worker_id)
+            try:
+                command = json.dumps(
+                    {
+                        "provider": provider,
+                        "slot": handle._slot,
+                        "completion": handle._shm.name,
+                        "spans": [(s.address, s.nbytes, int(s.access)) for s in spans],
+                        "payload": base64.b64encode(payload).decode("ascii"),
+                    }
+                ).encode("utf-8")
+                assert self._worker is not None
+                self._worker.control_payload(
+                    WorkerType.NEXT_LEVEL,
+                    worker_id,
+                    _CTRL_EXTERNAL_TRANSFER,
+                    command,
+                    effective_timeout,
+                )
+            except BaseException as exc:
+                raise ExternalTransferSubmissionError(handle) from exc
+            return handle
+
+    def _external_transfer_spans(
+        self,
+        ranges: tuple[ExternalBufferRange, ...],
+    ) -> tuple[tuple[ExternalTransferSpan, ...], int]:
+        spans = []
+        worker_ids = set()
+        with self._child_prov_lock:
+            for region in ranges:
+                if region.buffer.closed:
+                    raise ValueError("external transfer buffer is closed")
+                capabilities = []
+                if region.access in (AccessMode.READ, AccessMode.READWRITE):
+                    capabilities.append(BufferCapability.COPY_FROM)
+                if region.access in (AccessMode.WRITE, AccessMode.READWRITE):
+                    capabilities.append(BufferCapability.COPY_TO)
+                for capability in capabilities:
+                    registered = self._require_device_capability_locked(
+                        region.buffer.identity,
+                        capability,
+                        region.nbytes,
+                        offset=region.offset,
+                        api="submit_external_transfer",
+                    )
+                if registered.backend_kind != BackendKind.DEVICE_MALLOC:
+                    raise ValueError("external transfers currently require DEVICE_MALLOC, not communication windows")
+                worker_ids.add(int(registered.owner_worker_id))
+                spans.append(ExternalTransferSpan(int(registered.base) + region.offset, region.nbytes, region.access))
+        if len(worker_ids) != 1:
+            raise ValueError("one external transfer must target exactly one chip worker")
+        worker_id = worker_ids.pop()
+        self._check_chip_worker_id(worker_id)
+        return tuple(spans), worker_id
+
+    def _retire_external_transfer(self, handle: ExternalTransferHandle) -> None:
+        with self._hierarchical_start_cv:
+            assert self._external_transfers is not None
+            if self._external_transfers.pending.get(handle._slot) is handle:
+                self._external_transfers.pending.pop(handle._slot)
+            self._hierarchical_start_cv.notify_all()
+
+    def _require_no_external_transfers(self, api: str) -> None:
+        with self._hierarchical_start_cv:
+            if self._external_transfers is not None and self._external_transfers.pending:
+                raise RuntimeError(
+                    f"Worker.{api}: external transfer(s) still in flight; observe their completion first"
+                )
+
+    def _drain_external_transfers(self, deadline: float) -> None:
+        with self._hierarchical_start_cv:
+            handles = tuple(self._external_transfers.pending.values()) if self._external_transfers else ()
+        for handle in handles:
+            try:
+                handle.wait(max(0.0, deadline - _monotonic()))
+            except RuntimeError:
+                with self._hierarchical_start_cv:
+                    if self._external_transfers is not None and handle in self._external_transfers.pending.values():
+                        raise
+
     def run_chip_control_extension(
         self,
         name: str,
@@ -11159,6 +11332,7 @@ class Worker:
             # mailbox control that the whole-run FIFO cannot order against this
             # run's control, so we wait for that teardown and this worker
             # degrades to depth one for exactly those runs.
+            self._require_no_external_transfers("submit")
             predecessor = self._cleanup_bearing_predecessor()
             if predecessor is not None:
                 predecessor._wait_for_handoff()
@@ -11325,6 +11499,7 @@ class Worker:
             yield
             return
         with self._submit_mu.shared():
+            self._require_no_external_transfers(api)
             with self._hierarchical_start_cv:
                 if self._ordered_cleanup_error is not None:
                     raise RuntimeError(
@@ -11735,6 +11910,7 @@ class Worker:
         pending remote frees/import-releases."""
         return (
             self._has_native_tree()
+            or bool(self._external_transfers and self._external_transfers.pending)
             or bool(self._sub_pids or self._chip_pids or self._next_level_pids)
             or bool(self._sub_shms or self._chip_shms or self._next_level_shms)
             or any(group.process is not None or group.ready_dir is not None for group in self._mpi_l3_groups)
@@ -11751,6 +11927,8 @@ class Worker:
         """One-line inventory of the resource categories still present, for the
         terminal-close error synthesized when teardown leaves a residual."""
         parts: list[str] = []
+        if self._external_transfers and self._external_transfers.pending:
+            parts.append(f"{len(self._external_transfers.pending)} external transfer(s)")
         if self._has_native_tree():
             parts.append("native tree")
         n_pids = len(self._sub_pids) + len(self._chip_pids) + len(self._next_level_pids)
@@ -11941,6 +12119,7 @@ class Worker:
                 # drained, so this is the complete accepted set. Wait outside
                 # the lifecycle CV: handle retirement acquires the same lock.
                 assert drain_deadline is not None
+                self._drain_external_transfers(drain_deadline)
                 for handle in handles_to_drain:
                     remaining = drain_deadline - _monotonic()
                     if remaining <= 0:

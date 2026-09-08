@@ -1105,6 +1105,16 @@ void ChipWorker::copy_from(uint64_t dst, uint64_t src, size_t size) {
     }
 }
 
+void ChipWorker::bind_external_transfer_thread() {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    int rc = ensure_acl_ready_fn_(device_ctx_, device_id_);
+    if (rc != 0) {
+        throw std::runtime_error("external transfer thread binding failed with code " + std::to_string(rc));
+    }
+}
+
 uint64_t ChipWorker::comm_init(int rank, int nranks, const std::string &rootinfo_path) {
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");

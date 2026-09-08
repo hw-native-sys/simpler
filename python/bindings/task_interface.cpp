@@ -3193,6 +3193,7 @@ NB_MODULE(_task_interface, m) {
         .def("free", &ChipWorker::free, nb::arg("ptr"))
         .def("copy_to", &ChipWorker::copy_to, nb::arg("dst"), nb::arg("src"), nb::arg("size"))
         .def("copy_from", &ChipWorker::copy_from, nb::arg("dst"), nb::arg("src"), nb::arg("size"))
+        .def("_bind_external_transfer_thread", &ChipWorker::bind_external_transfer_thread)
         .def(
             "comm_init", &ChipWorker::comm_init, nb::arg("rank"), nb::arg("nranks"), nb::arg("rootinfo_path"),
             "Initialize a communicator for this rank.  ChipWorker owns ACL + stream "

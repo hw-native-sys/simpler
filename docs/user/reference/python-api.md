@@ -39,6 +39,8 @@ into `**config` and validated later. The recognized keys:
 | `device_ids` | L3+ | one chip child process per entry |
 | `num_sub_workers` | L3+ | host-side Python callables to fork |
 | `py_control_timeout_s` | L3+ | finite timeout for Python control-plane operations; defaults to 30 seconds |
+| `external_transfer_max_pending` | L3 | maximum unretired external transfers across all local chips; defaults to 2 |
+| `external_transfer_max_bytes` | L3 | maximum sum of in-flight transfer span lengths; defaults to 1 GiB |
 | `enable_sdma` | a2a3 | provisions the SDMA workspace; defaults to `False` |
 | `heap_ring_size` | all | heap ring sizing |
 | `remote_heap_ring_size`, `remote_session_timeout_s` | L4 | remote-session sizing and timeout |
@@ -91,6 +93,87 @@ The call broadcasts concurrently and returns only after every chip child has
 responded. If some handlers succeed and another fails, the successful effects
 are not rolled back; the caller receives one aggregated `RuntimeError` naming
 the first reported child error.
+
+Asynchronous device access must use the managed external-transfer API below.
+A chip-control extension's admission fence ends when its handler returns; it
+does not protect background DMA launched by that handler.
+
+### Managed external transfers
+
+An external transfer names registered allocations, not caller-supplied device
+pointers. The Runtime validates ownership, access rights, and byte extents,
+routes to the allocation's chip, binds the transfer thread to that device,
+and retains the operation until the provider certifies that device access has
+stopped. Only local L3 `DEVICE_MALLOC` allocations are supported; communication
+windows and remote workers are rejected.
+
+```python
+from simpler import (
+    ExternalBufferRange, ExternalTransferResult,
+    register_external_transfer_provider,
+)
+from simpler.buffer import AccessMode
+
+def storage_provider(request, cancellation):
+    if cancellation.requested:
+        return ExternalTransferResult(False, error="cancelled before access")
+    # A trusted adapter performs and fences its device access here.
+    # request.buffers contains checked address/nbytes/access spans.
+    # request.payload contains adapter-specific metadata, not KV bytes.
+    return ExternalTransferResult()
+
+register_external_transfer_provider("storage", storage_provider)  # before worker.init()
+# After initialization and allocation of kv_buffer:
+transfer = worker.submit_external_transfer(
+    "storage",
+    (ExternalBufferRange(kv_buffer, offset=0, nbytes=4096, access=AccessMode.WRITE),),
+    payload=b"object metadata",
+)
+transfer.wait(timeout=30)
+```
+
+The provider is trusted native integration code, **not a sandbox**. It receives
+no `ChipWorker`, allocator, or runtime stream. It must not reset the device,
+change its runtime-owned context/streams, free supplied memory, or retain
+addresses/registrations beyond its result. Adapter-owned streams, memory
+registration and SDK work must be drained and released before returning.
+Internal SDK memory is not included in Runtime's committed-memory accounting.
+
+| Event | Resource semantics |
+| ----- | ------------------ |
+| `ExternalTransferResult(succeeded=True)` | All access stopped; `wait()` returns the bytes payload |
+| `ExternalTransferResult(succeeded=False, error=...)` | All access stopped; `wait()` raises `RuntimeError` |
+| Unexpected exception or invalid result | Quiescence unconfirmed; `wait()` raises `ExternalTransferUnconfirmedError`, buffers stay retained |
+| `wait(timeout=...)` expires | Only the wait expires; buffers stay retained |
+| `request_cancel()` | Cooperative flag only; no thread interruption or DMA cancellation |
+| Submission acknowledgement is lost | `ExternalTransferSubmissionError.handle` retains the operation; do not blindly resubmit |
+
+The two exception types are available from `simpler.external_transfer`.
+`done()` checks completion without blocking and retires a confirmed result;
+it returns `False` for unconfirmed quiescence. `result()` aliases `wait()`.
+Handles remain observable after `Worker.close()` has begun. Close drains them
+within its existing cleanup budget; if access is still outstanding it leaves
+the tree intact and CLOSED. A later close can retry after confirmed completion.
+An unconfirmed provider exception requires external recovery; this API does
+not force-reset a device or pretend a stopped Python thread proves DMA stopped.
+
+Submission must occur outside orchestration callbacks and after compute runs
+complete. While any transfer remains unretired, compute submission and device
+control (including copy/free and legacy chip extensions) fail fast. Transfers
+may overlap one another across different chips or nonconflicting ranges;
+overlapping reads are allowed, overlapping access involving a write is refused.
+Serving still owns KV page pinning and reuse. This conservative implementation
+does not provide compute/transfer overlap or automatic prefix-cache scheduling.
+
+Capacity checks reject submissions before dispatch. The byte limit counts
+submitted span lengths, not whole pinned allocations or SDK staging memory.
+Each bounded slot has a fork-inherited event; completion uses a small
+shared-memory result and a wakeup, without mailbox polling or KV host staging.
+Payloads are limited to 1 MiB, results to 4096 bytes, and requests to 65536 spans.
+`timeout_s` bounds the control acknowledgement only and defaults to
+`py_control_timeout_s`; it is not a backend DMA deadline. A Mooncake adapter
+must translate backend failures into a result only when it can certify no
+further access, and publish a cache manifest only after every shard succeeds.
 
 ### Memory
 

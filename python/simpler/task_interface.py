@@ -1778,3 +1778,6 @@ class ChipWorker:
     def device_memory_info(self) -> DeviceMemoryInfo:
         """Device-wide ACL_HBM_MEM free/total byte snapshot."""
         return self._impl.device_memory_info()
+
+    def _bind_external_transfer_thread(self) -> None:
+        self._impl._bind_external_transfer_thread()

@@ -1052,6 +1052,7 @@ class _TwoFrameLoopHarness:
                 self.identity_table,
                 self.identity_refs,
                 worker_mod.mint_owner_instance_id(),
+                {},
             ),
             kwargs={
                 "chip_platform": "a2a3",
@@ -8069,7 +8070,7 @@ class TestChipMainLoopDigestRegister:
             identity_refs = {}
         t = threading.Thread(
             target=_run_chip_main_loop,
-            args=(cw, buf, 0, state_addr, 0, registry, identity_table, identity_refs, mint_owner_instance_id()),
+            args=(cw, buf, 0, state_addr, 0, registry, identity_table, identity_refs, mint_owner_instance_id(), {}),
             kwargs={"chip_platform": ""},
             daemon=True,
         )
