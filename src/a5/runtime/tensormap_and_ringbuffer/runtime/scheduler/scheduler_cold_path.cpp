@@ -381,6 +381,10 @@ void SchedulerContext::log_shutdown_stall_snapshot(
             t, total_tasks_, trigger_idle_iterations, trigger_last_progress_count, StallDumpReport::Shutdown
         );
     }
+    if (sched_ != nullptr) {
+        AICoreCompletionMailbox *mailbox = rt_ != nullptr ? rt_->aicore_mailbox : nullptr;
+        sched_->async_wait_list.log_diagnostics(mailbox);
+    }
 }
 
 SchedulerContext::StallClassification SchedulerContext::classify_stall_reason() const {
