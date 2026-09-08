@@ -216,7 +216,7 @@ symmetric window is realized:
 | Window memory | POSIX shm + `ftruncate`, mmap'd per rank | a2a3: Fabric V2 handle exchange (`ACL_MEM_SHARE_HANDLE_TYPE_FABRIC`), falling back to VMM + shareable-handle IPC where Fabric is unsupported. a5: VMM shareable handles only. Cross-card P2P via `aclrtDeviceEnablePeerAccess` on both |
 | Subset barrier | shm-header atomic, `allocation_id`-scoped | file barriers, `allocation_id`-scoped |
 | Window init | window zeroed before the subset barrier (`memset`) | window zeroed before the handle is announced (`aclrtMemset`) |
-| Async-DMA workspace | opt-in per Worker (`enable_sdma`, provisions inert 16 KiB scratch without STARS streams) | a2a3: opt-in per Worker (`enable_sdma`); a5: SDMA by default, URMA as an opt-in alternative |
+| Async-DMA workspace | opt-in per Worker (`enable_sdma`, provisions inert 16 KiB scratch without STARS streams) | a2a3: opt-in per Worker (`enable_sdma`); a5: SDMA by default, URMA or RDMA as an opt-in alternative |
 
 The window is zero-initialized on both backends so scratch/signal protocols see
 a known starting state (matching the historical static-path contract).
@@ -277,6 +277,17 @@ kernel's `get_dma_workspace` is unverified rather than closed. Simulation, a5,
 and provider-disabled builds fail Worker init fast when it is set. A5 provisions
 its communication-context SDMA workspace by default; this is separate from
 the Worker-level workspace mechanism controlled by `enable_sdma`.
+
+On a5, `SIMPLER_ENABLE_PTO_RDMA_WORKSPACE=ON` selects the HNS1825 RDMA
+workspace overlay instead. RDMA is mutually exclusive with the SDMA and URMA
+overlays because `CommContext` exposes a single `workSpace`/`workSpaceSize`
+pair. The first RDMA integration only supports `orch.allocate_domain()`
+dynamic domains; it does not support `comm_derive_context()`, sim platforms,
+a2a3, or `host_build_graph`. RDMA kernels derive remote WQE addresses from the
+RDMA workspace peer MR base plus a local-window offset, not from
+`CommContext::windowsIn[peer]` — the symmetric window is a low-GM-segment
+`aclrtMalloc` buffer the HNS1825 NIC can DMA to, and peers are reached over
+RoCE by rkey + VA.
 
 ---
 

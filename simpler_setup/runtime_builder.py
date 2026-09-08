@@ -396,9 +396,24 @@ class RuntimeBuilder:
                 defines["SIMPLER_RUNTIME_NAME"] = name
                 if build_pto_isa_commit:
                     defines["SIMPLER_PTO_ISA_BUILD_COMMIT"] = build_pto_isa_commit
-                for opt_in_define in ("SIMPLER_ENABLE_PTO_URMA_WORKSPACE",):
+                # Forward the async-workspace overlay env selects to host CMake.
+                # URMA is the default overlay; an explicit SDMA or RDMA overlay
+                # turns it off so the CMake mutual-exclusion check stays clear.
+                overlay_defines = {}
+                for opt_in_define in (
+                    "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE",
+                    "SIMPLER_ENABLE_PTO_URMA_WORKSPACE",
+                    "SIMPLER_ENABLE_PTO_RDMA_WORKSPACE",
+                ):
                     if os.environ.get(opt_in_define, "").upper() in {"1", "ON", "TRUE", "YES"}:
-                        defines[opt_in_define] = "ON"
+                        overlay_defines[opt_in_define] = "ON"
+                if overlay_defines:
+                    defines.update(overlay_defines)
+                    if (
+                        "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE" in overlay_defines
+                        or "SIMPLER_ENABLE_PTO_RDMA_WORKSPACE" in overlay_defines
+                    ) and "SIMPLER_ENABLE_PTO_URMA_WORKSPACE" not in overlay_defines:
+                        defines["SIMPLER_ENABLE_PTO_URMA_WORKSPACE"] = "OFF"
             cmake_defines = defines or None
             # compile() adds a {target}/ subdirectory inside build_dir
             cache_dir = self._CACHE_DIR / arch / variant / name

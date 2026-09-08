@@ -80,6 +80,19 @@ def _executable_cache_identity(executable: str) -> dict[str, object]:
         return {"name": os.path.basename(executable), "error": type(error).__name__}
 
 
+def _cmake_bool_env_enabled(name: str, default: bool = False) -> bool:
+    """Interpret a CMake-style boolean env var (ON/OFF/1/0/TRUE/FALSE/YES/NO)."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().upper()
+    if normalized in {"1", "ON", "TRUE", "YES", "Y"}:
+        return True
+    if normalized in {"0", "OFF", "FALSE", "NO", "N"}:
+        return False
+    return default
+
+
 class KernelCompiler:
     """
     Compiler for PTO kernels and orchestration functions.
@@ -214,6 +227,60 @@ class KernelCompiler:
             str(Path(__file__).resolve().parent / "incore"),
             str(self.project_root / "src" / "common" / "platform" / "include"),
         ]
+
+    def _incore_feature_defines(self) -> list[str]:
+        """Feature macros forwarded to incore compiles for the RDMA overlay."""
+        if self.platform == "a5" and _cmake_bool_env_enabled("SIMPLER_ENABLE_PTO_RDMA_WORKSPACE", default=False):
+            return ["-DPTO_RDMA_SUPPORTED", "-DPTO_RDMA_BACKEND_HNS_1825_SUPPORTED"]
+        return []
+
+    @staticmethod
+    def _pto_isa_include_dirs(pto_isa_root: str) -> list[str]:
+        """PTO-ISA include roots; RDMA intrinsics live under pkg_inc."""
+        include_dirs = [os.path.join(pto_isa_root, "include")]
+        pkg_inc = os.path.join(pto_isa_root, "pkg_inc")
+        if os.path.isdir(pkg_inc):
+            include_dirs.append(pkg_inc)
+        return include_dirs
+
+    def get_ascend_incore_include_dirs(self) -> list[str]:
+        """CANN device headers used by PTO-ISA backend-only includes."""
+        ascend_home = env_manager.get("ASCEND_HOME_PATH")
+        if not ascend_home:
+            return []
+        roots = [Path(ascend_home)]
+        roots += [Path(ascend_home) / arch for arch in ("aarch64-linux", "x86_64-linux")]
+
+        candidates: list[Path] = []
+        for root in roots:
+            candidates.extend(
+                [
+                    root / "include",
+                    root / "include" / "external",
+                    root / "include" / "c_api",
+                    root / "include" / "c_api" / "internal",
+                    root / "asc" / "include",
+                    root / "asc" / "include" / "interface",
+                    root / "asc" / "include" / "basic_api",
+                    root / "asc" / "include" / "basic_api" / "interface",
+                    root / "ascendc" / "include",
+                    root / "ascendc" / "include" / "basic_api",
+                    root / "ascendc" / "include" / "basic_api" / "interface",
+                ]
+            )
+        for header in ("kernel_operator_sys_var_intf.h", "kernel_operator_sys_var_intf_impl.h"):
+            try:
+                candidates.extend(path.parent for path in Path(ascend_home).rglob(header))
+            except OSError:
+                continue
+
+        include_dirs = []
+        seen = set()
+        for path in candidates:
+            if path.is_dir() and path not in seen:
+                include_dirs.append(str(path))
+                seen.add(path)
+        return include_dirs
 
     def _get_orchestration_config(self, runtime_name: str) -> tuple[list[str], list[str]]:
         """
@@ -504,9 +571,6 @@ class KernelCompiler:
         if pto_isa_root is None:
             raise ValueError("pto_isa_root is required for incore compilation")
 
-        pto_include = os.path.join(pto_isa_root, "include")
-        pto_pto_include = os.path.join(pto_isa_root, "include", "pto")
-
         # Generate output path
         output_path = self._make_temp_path(
             prefix=f"{os.path.basename(source_path)}.incore_", suffix=".o", build_dir=build_dir
@@ -514,9 +578,15 @@ class KernelCompiler:
 
         # Build command from toolchain
         cmd = [self.ccec.cxx_path, *self.ccec.get_compile_flags(core_type=core_type)]
-        cmd.extend([f"-I{compiler_visible_path(pto_include)}", f"-I{compiler_visible_path(pto_pto_include)}"])
+        cmd += self._incore_feature_defines()
+        for include_dir in self._pto_isa_include_dirs(pto_isa_root):
+            cmd.append(f"-I{compiler_visible_path(include_dir)}")
+            cmd.append(f"-I{compiler_visible_path(os.path.join(include_dir, 'pto'))}")
 
         for inc_dir in self.get_incore_include_dirs():
+            cmd.append(f"-I{compiler_visible_path(inc_dir)}")
+
+        for inc_dir in self.get_ascend_incore_include_dirs():
             cmd.append(f"-I{compiler_visible_path(inc_dir)}")
 
         if extra_include_dirs:
