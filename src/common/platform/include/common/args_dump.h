@@ -43,7 +43,6 @@
 #include <cstdint>
 
 #include "common/args_dump_task_metadata.h"
-#include "common/dfx_backpressure_device.h"
 #include "common/platform_config.h"
 
 // =============================================================================
@@ -253,8 +252,6 @@ struct DumpDataHeader {
     uint64_t arena_size_per_thread;
     uint32_t magic;
     uint32_t dump_args_level;  // DumpArgsLevel: 0=off, 1=partial, 2=full, 3=hybrid
-    // DFX backpressure coordination (unified across all DFX subsystems).
-    DfxBackpressureHeader backpressure;
 } __attribute__((aligned(64)));
 
 // =============================================================================

@@ -232,16 +232,14 @@ TEST_F(ArgsDumpTest, ArenaBackpressureChecksBeforePayloadOverwrite) {
     info.buffer_addr = reinterpret_cast<uint64_t>(first_data);
     ASSERT_EQ(dump_arg_record(0, info), 0);
 
+    // The arena barrier is per-lane: the device waits only on this thread's own
+    // completed_payload_count reaching what this thread published. Synchronize on
+    // that publish, which the device performs before it starts waiting.
     std::atomic<bool> payload_preserved_before_ack{false};
-    std::thread host([header, state, &arena, first_data, &payload_preserved_before_ack] {
-        while (header->backpressure.fq_contended == 0) {
+    std::thread host([state, &arena, first_data, &payload_preserved_before_ack] {
+        while (state->published_payload_count == 0) {
             std::this_thread::yield();
         }
-        header->backpressure.fq_freeze_active = 1;
-        wmb();
-        header->backpressure.fq_contended = 0;
-        header->backpressure.fq_freeze_active = 0;
-        wmb();
         payload_preserved_before_ack.store(
             *reinterpret_cast<const uint64_t *>(arena) == first_data[0], std::memory_order_release
         );

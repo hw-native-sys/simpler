@@ -14,7 +14,7 @@ Analysis CLIs that consume these outputs are documented in
 | [Profiling Framework](profiling-framework.md) | Collector architecture, host/device split, how perf levels gate collection |
 | [Profiling / DFX Configuration Naming Rules](profiling-config-naming.md) | Naming conventions every new DFX knob must follow |
 | [Profiling Name Map](profiling-name-map.md) | `func_id` → human-readable name mapping consumed by the trace tools |
-| [Global DFX Backpressure](global-backpressure-design.md) | Block-on-contention and dual-signal freeze across collectors |
+| [DFX Backpressure](backpressure-design.md) | Per-lane block-on-contention across collectors |
 | [DFX Buffer Capacity Audit (a2a3)](dfx-buffer-capacity-audit.md) | Per-buffer capacity accounting and overflow behavior |
 
 ## Timing and scheduling

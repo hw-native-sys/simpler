@@ -14,9 +14,25 @@
 #include <cstdint>
 
 #include "aicpu/device_time.h"
-#include "common/dfx_backpressure_device.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
+
+// SPIN_WAIT_HINT() is the repo-wide AICPU spin-wait relax used by every
+// resource-wait spin (ring/dep-pool full, lock_fanout ticket locks, scheduler
+// dispatch). It is platform-tiered: onboard silicon expands to a no-op (AICPU
+// owns its A55 core), sim adds sched_yield() so the oversubscribed host cores
+// don't starve the AICore threads running real kernels.
+//
+// Reuse whatever the platform already provides; only supply the fallback — for
+// pure host, struct-only builds where spin_hint.h is off the path and the spin
+// templates are never instantiated — when nobody else has defined it.
+#ifndef SPIN_WAIT_HINT
+#if __has_include("spin_hint.h")
+#include "spin_hint.h"
+#else
+#define SPIN_WAIT_HINT() ((void)0)
+#endif
+#endif
 
 namespace profiling_device {
 
@@ -26,15 +42,17 @@ namespace profiling_device {
 // ready-entry/drop hooks; this engine owns the queue handoff and buffer-switch
 // control flow.
 //
-// The push/pop gates here implement the device half of the block-on-contention
-// backpressure protocol: on a full ready queue or empty free queue the writer
-// parks at its buffer-switch gate (via dfx_backpressure_device.h) until the host
-// clears the freeze. A pre-publication queue wait reports failure when the
-// 30-second host-crash backstop (Module::kBackpressureWaitCycles) trips. A
-// post-publication push-gate timeout leaves the enqueue successful because the
-// ready-queue tail already transferred buffer ownership to the host. Full design
-// — dual-signal freeze, conjunction release, (0,0) escape-window and
-// deadlock-freedom arguments — in docs/dfx/global-backpressure-design.md.
+// The push/pop gates here implement the device half of the per-lane
+// block-on-contention backpressure protocol: on a full ready queue or empty free
+// queue the writer spins at its own buffer-switch gate until the host drains that
+// queue or refills it, and no peer lane is involved. Each gate carries one
+// `Module::kBackpressureWaitCycles` budget across the whole wait — a 30-second
+// backstop against a spin the host will never end, not a normal-path wait — and
+// reports failure only while
+// ownership is still on the device, so the caller can account the affected records
+// dropped. Full design — per-lane recovery, the single-writer free-queue
+// invariant, and the deadlock-freedom argument — in
+// docs/dfx/backpressure-design.md.
 template <typename Module>
 struct DeviceProfilerEngine {
     using Context = typename Module::Context;
@@ -48,33 +66,22 @@ struct DeviceProfilerEngine {
             return false;
         }
 
-        // Push gate with incremental release support:
-        // 1. Check RQ slot availability (unified check, no duplication)
-        // 2. If slot exists, allow use even during freeze (incremental release)
-        // 3. Gate control happens in enqueue_ready() after push operation
-        // 4. No slot: mark contention and spin (triggers backpressure mechanism)
-        // Timeout-protected to prevent infinite spin on host crash or hardware failure
-        bool contended_signalled = false;
+        // Push gate. Recovery is entirely local: the one drain shard that serves
+        // this thread's ready queue advances its head, so spinning here until a
+        // slot appears needs no peer lane to stop and no host handshake. The
+        // budget only bounds a drain that never makes progress.
         const uint64_t start = get_sys_cnt_aicpu();
         do {
-            // Unified RQ slot check (check once, use result for both freeze and non-freeze)
             uint32_t current_tail = header->queue_tails[thread_idx];
             uint32_t current_head = header->queue_heads[thread_idx];
             uint32_t next_tail = (current_tail + 1) % Module::kReadyQueueSize;
 
             if (next_tail != current_head) {
-                // Slot available - return for both freeze and non-freeze cases
-                // enqueue_ready will handle the push and then wait for gate if needed
                 *tail_out = current_tail;
                 *head_out = current_head;
                 return true;
             }
 
-            // No slot available - mark contention and spin
-            // This triggers backpressure: freeze may open, RQ may drain
-            dfx_backpressure::mark_rq_contended(header, &contended_signalled);
-
-            // Timeout protection
             if (get_sys_cnt_aicpu() - start >= Module::kBackpressureWaitCycles) {
                 break;  // timeout — fall through to the single failure exit below
             }
@@ -84,33 +91,20 @@ struct DeviceProfilerEngine {
         return false;
     }
 
-    static bool
-    wait_for_free_queue_entry(DataHeader *header, FreeQueue *free_queue, uint32_t *head_out, uint32_t *tail_out) {
+    static bool wait_for_free_queue_entry(FreeQueue *free_queue, uint32_t *head_out, uint32_t *tail_out) {
         if (free_queue == nullptr) {
             return false;
         }
 
-        // Pop gate. The loop, not any single call, is what holds a starved lane:
-        // 1. FQ slot available -> take it and return.
-        // 2. FQ empty -> raise fq_contended (leader signal, once per wait).
-        // 3. pop_freeze_barrier parks only while the host holds fq_freeze open.
-        //    Raising fq_contended does not itself park this lane: until the host
-        //    observes the signal and opens the freeze, the barrier sees
-        //    fq_freeze_active==0 and returns at once, so this loop re-checks and
-        //    bridges the host round-trip. Once frozen, the barrier spins here
-        //    until release.
-        // 4. Freeze released -> loop re-checks and picks up the refilled slot.
+        // Pop gate. This lane's own drain shard refills this free_queue from its
+        // shard-local recycled pool, which the replenish thread keeps stocked
+        // independently, so a dry lane recovers without any peer lane parking.
         //
-        // The barrier's own timeout covers only step 3's park, so it cannot bound
-        // a wait the host never freezes at all. `wait_start` is this wait's single
-        // budget across every iteration, matching the ready-queue gate above, and
-        // is what makes the give-up unconditional: a host that dies before it ever
-        // answers the leader signal leaves fq_freeze_active at 0 forever.
-        bool contended_signalled = false;
-        const uint64_t wait_start = get_sys_cnt_aicpu();
-
+        // The budget spans the whole wait rather than one iteration: it must
+        // measure "the host stopped making progress", so re-arming it per attempt
+        // would let a permanently short pool spin here forever.
+        const uint64_t start = get_sys_cnt_aicpu();
         do {
-            // Step 1: Check FQ slot availability
             uint32_t head = free_queue->head;
             uint32_t tail = free_queue->tail;
             if (head != tail) {
@@ -120,21 +114,10 @@ struct DeviceProfilerEngine {
                 return true;
             }
 
-            // Step 2: No slot available - mark contention
-            dfx_backpressure::mark_fq_contended(header, &contended_signalled);
-
-            // Step 3: Park while the host holds the freeze open; returns at once
-            // when it is not open.
-            if (!dfx_backpressure::pop_freeze_barrier(header, Module::kBackpressureWaitCycles)) {
-                break;  // gate timeout — fall through to the single failure exit below
+            if (get_sys_cnt_aicpu() - start >= Module::kBackpressureWaitCycles) {
+                break;  // timeout — fall through to the single failure exit below
             }
-
-            if (get_sys_cnt_aicpu() - wait_start >= Module::kBackpressureWaitCycles) {
-                break;  // whole-wait deadline — same exit
-            }
-
-            // Step 4: Gate not held (never opened yet, or released) — re-check the
-            // free queue; an open→drain→refill cycle leaves a slot to pick up here.
+            SPIN_WAIT_HINT();
         } while (true);
 
         return false;
@@ -153,15 +136,6 @@ struct DeviceProfilerEngine {
         Module::write_ready_entry(ctx, current_tail, buffer_ptr, buffer_seq);
         wmb();  // publish: entry fields visible before the tail advance
         header->queue_tails[q] = next_tail;
-
-        // Push-gate global-sync park: the held buffer is now flushed (nothing in
-        // hand), so blocking here is a clean, hostage-free stop. Every lane that
-        // reaches its push gate during rq_freeze converges here → one aligned
-        // common-mode gap; production resumes only after the host clears the
-        // freeze (conjunction release).
-        // The tail advance transfers ownership to the host and cannot be rolled
-        // back. A gate timeout must not make callers clear or reuse this buffer.
-        (void)dfx_backpressure::push_freeze_barrier(header, Module::kBackpressureWaitCycles);
         return 0;
     }
 
@@ -214,7 +188,7 @@ struct DeviceProfilerEngine {
         FreeQueue *free_queue = Module::free_queue(state);
         uint32_t head = 0;
         uint32_t tail = 0;
-        if (!wait_for_free_queue_entry(Module::header(ctx), free_queue, &head, &tail)) {
+        if (!wait_for_free_queue_entry(free_queue, &head, &tail)) {
             return nullptr;
         }
         return claim_free(ctx, state, free_queue, head, next_seq);

@@ -154,7 +154,7 @@ nav:
       - Args dump: dfx/args-dump.md
       - dep_gen: dfx/dep-gen.md
       - Scope stats: dfx/scope-stats.md
-      - Global backpressure: dfx/global-backpressure-design.md
+      - Backpressure: dfx/backpressure-design.md
       - Buffer capacity audit: dfx/dfx-buffer-capacity-audit.md
   - Build and test:
       - Developer Guide: developer-guide.md

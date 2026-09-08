@@ -45,7 +45,6 @@
 #include <type_traits>
 
 #include "arg_direction.h"  // CORE_MAX_TENSOR_ARGS
-#include "common/dfx_backpressure_device.h"
 #include "common/platform_config.h"
 
 // =============================================================================
@@ -311,8 +310,6 @@ struct DepGenDataHeader {
     volatile uint32_t queue_heads[PLATFORM_MAX_AICPU_THREADS];  // Host reads (consumer)
     volatile uint32_t queue_tails[PLATFORM_MAX_AICPU_THREADS];  // AICPU writes (producer)
     uint32_t num_instances;                                     // Always 1 for now
-    // DFX backpressure coordination (unified across all DFX subsystems).
-    DfxBackpressureHeader backpressure;
 } __attribute__((aligned(64)));
 
 // =============================================================================

@@ -9,7 +9,6 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#include "common/dfx_backpressure_device.h"
 #include "host/buffer_pool_manager.h"
 #include "host/profiler_base.h"
 
@@ -77,7 +76,6 @@ struct AlgorithmFreeQueue {
 
 struct AlgorithmHeader {
     AlgorithmFreeQueue free_queue;
-    DfxBackpressureHeader backpressure;
 };
 
 struct AlgorithmReadyEntry {
@@ -847,6 +845,73 @@ TEST(BufferPoolManagerShardingTest, ReplenishRecycledPoolsUsesSlotSizedBatchForS
     manager.clear_mappings();
 }
 
+// A lane that has run dry recovers on its own drain shard, with no global
+// coordination: process_entry reports the site it could not fill, and the retry
+// publishes into that same free_queue once the shard's recycled lane is stocked.
+// Without the report the lane would wait forever — the top-up is entry-driven,
+// and a lane holding no buffer has nothing left to publish.
+TEST(BufferPoolManagerShardingTest, ShortTopUpIsReportedAndRetryRefillsTheSameLane) {
+    using Alg = profiling_common::ProfilerAlgorithms<AlgorithmModule>;
+    using Manager = profiling_common::BufferPoolManager<AlgorithmModule>;
+
+    Manager manager;
+    AlgorithmHeader header{};
+    header.free_queue.head = 0;
+    header.free_queue.tail = 0;  // empty: this lane is starved
+    void *dev_ptr = ptr(0x8000);
+    manager.register_mapping(dev_ptr, dev_ptr);
+    manager.set_memory_context(profiling_common::MemoryOps{}, nullptr, &header, sizeof(header), 0);
+
+    ASSERT_EQ(manager.recycled_count(0, 0), 0u);
+
+    profiling_common::EntrySite<AlgorithmModule> short_site{};
+    short_site.free_queue = nullptr;
+    Alg::process_entry(manager, &header, 0, AlgorithmReadyEntry{reinterpret_cast<uint64_t>(dev_ptr)}, &short_site);
+
+    // The recycled lane was dry, so the site comes back for a retry and the
+    // queue is still empty.
+    ASSERT_EQ(short_site.free_queue, &header.free_queue);
+    EXPECT_EQ(header.free_queue.tail, 0u);
+
+    // Retrying while still dry must not claim the site as filled.
+    EXPECT_FALSE(Alg::retry_short_site(manager, short_site, 0));
+
+    // A collector-finished buffer reaches this shard's recycled lane, and the
+    // retry hands it straight to the starved lane.
+    void *recycled = ptr(0x8100);
+    manager.register_mapping(recycled, recycled);
+    ASSERT_TRUE(manager.push_recycled(0, recycled, 0));
+
+    EXPECT_TRUE(Alg::retry_short_site(manager, short_site, 0));
+    EXPECT_EQ(header.free_queue.tail, 1u);
+    EXPECT_EQ(header.free_queue.buffer_ptrs[0], reinterpret_cast<uint64_t>(recycled));
+    EXPECT_EQ(manager.recycled_count(0, 0), 0u);
+
+    manager.clear_mappings();
+}
+
+// Per-lane recovery only works if a returning buffer lands in the recycled lane
+// of the shard that needs it: the drain path pops only its own lane
+// (pop_recycled(kind, shard)) and cannot steal from a sibling. A buffer's origin
+// shard is the collector shard that consumed it, which is the shard that drained
+// the starved lane's entry, and origin wins ties in the deficit routing.
+TEST(BufferPoolManagerShardingTest, DoneBufferReturnsToTheRecycledLaneItsShardCanPop) {
+    using Manager = profiling_common::BufferPoolManager<AlgorithmModule>;
+
+    Manager manager;
+    AlgorithmHeader header{};
+    manager.set_memory_context(profiling_common::MemoryOps{}, nullptr, &header, sizeof(header), 0);
+
+    void *dev_ptr = ptr(0x8200);
+    ASSERT_TRUE(manager.notify_copy_done(dev_ptr, 0, 0));
+    EXPECT_EQ(manager.drain_done_into_recycled(), 1u);
+
+    EXPECT_EQ(manager.recycled_count(0, 0), 1u);
+    EXPECT_EQ(manager.pop_recycled(0, 0), dev_ptr);
+
+    manager.clear_mappings();
+}
+
 TEST(BufferPoolManagerShardingTest, ProcessEntryWaitsForReadySpaceInsteadOfRetiringBuffer) {
     using Manager = profiling_common::BufferPoolManager<AlgorithmModule>;
     using namespace std::chrono_literals;
@@ -874,7 +939,7 @@ TEST(BufferPoolManagerShardingTest, ProcessEntryWaitsForReadySpaceInsteadOfRetir
     std::future<void> process_done = process_done_promise.get_future();
     std::thread management([&]() {
         profiling_common::ProfilerAlgorithms<AlgorithmModule>::process_entry(
-            manager, &header, 0, AlgorithmReadyEntry{reinterpret_cast<uint64_t>(dev_ptr)}
+            manager, &header, 0, AlgorithmReadyEntry{reinterpret_cast<uint64_t>(dev_ptr)}, nullptr
         );
         process_done_promise.set_value();
     });

@@ -291,8 +291,12 @@ public:
      */
     void *get_dump_shm_device_ptr() const { return dump_shared_mem_dev_; }
 
-    /** Return whether an active args-dump freeze may release. An idle call returns false. */
-    bool backpressure_release_ready() const;
+    /**
+     * Publish, per AICPU thread, how many of that thread's payloads have reached
+     * args.bin. The device blocks on this watermark before overwriting arena
+     * bytes. Called once per replenish tick; a no-op before initialize().
+     */
+    void publish_arena_acks();
 
 private:
     struct alignas(64) CollectorShardCounters {

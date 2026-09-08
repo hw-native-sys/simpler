@@ -644,17 +644,14 @@ void ArgsDumpCollector::writer_loop() {
     }
 }
 
-bool ArgsDumpCollector::backpressure_release_ready() const {
+void ArgsDumpCollector::publish_arena_acks() {
     if (shm_host_ == nullptr || dump_shared_mem_dev_ == nullptr) {
-        return true;
+        return;
     }
-    const DumpDataHeader *header = get_dump_header(shm_host_);
-    // A freeze opened later in this management tick remains active until the
-    // next tick evaluates the payload counts.
-    if (header->backpressure.rq_freeze_active == 0 && header->backpressure.fq_freeze_active == 0) {
-        return false;
-    }
-    std::array<uint64_t, PLATFORM_MAX_AICPU_THREADS> published_payload_counts{};
+    // Per lane, and independently of every other lane: each AICPU thread owns its
+    // own arena, so thread t may reuse its arena bytes as soon as thread t's own
+    // payloads have reached args.bin. Holding t behind a sibling's writer
+    // progress would serialize unrelated arenas for no safety gain.
     for (int t = 0; t < num_dump_threads_; t++) {
         DumpBufferState *host_state = get_dump_buffer_state(shm_host_, t);
         DumpBufferState *device_state = get_dump_buffer_state(dump_shared_mem_dev_, t);
@@ -662,31 +659,23 @@ bool ArgsDumpCollector::backpressure_release_ready() const {
                 &host_state->published_payload_count, &device_state->published_payload_count,
                 sizeof(host_state->published_payload_count)
             ) != 0) {
-            return false;
-        }
-        published_payload_counts[t] = host_state->published_payload_count;
-    }
-    for (int t = 0; t < num_dump_threads_; t++) {
-        if (written_payload_counts_[t].load(std::memory_order_acquire) != published_payload_counts[t]) {
-            return false;
-        }
-    }
-    for (int t = 0; t < num_dump_threads_; t++) {
-        DumpBufferState *host_state = get_dump_buffer_state(shm_host_, t);
-        DumpBufferState *device_state = get_dump_buffer_state(dump_shared_mem_dev_, t);
-        const uint64_t completed_payload_count = published_payload_counts[t];
-        if (host_state->completed_payload_count == completed_payload_count) {
             continue;
         }
-        if (profiling_copy_to_device(
-                &device_state->completed_payload_count, &completed_payload_count, sizeof(completed_payload_count)
-            ) != 0) {
-            return false;
+        const uint64_t published = host_state->published_payload_count;
+        // The writer thread bumps written_payload_counts_[t] only after args.bin
+        // has accepted the bytes, so equality is the proof the device needs.
+        if (written_payload_counts_[t].load(std::memory_order_acquire) != published) {
+            continue;
         }
-        host_state->completed_payload_count = completed_payload_count;
+        if (host_state->completed_payload_count == published) {
+            continue;
+        }
+        if (profiling_copy_to_device(&device_state->completed_payload_count, &published, sizeof(published)) != 0) {
+            continue;
+        }
+        host_state->completed_payload_count = published;
         wmb();
     }
-    return true;
 }
 
 int ArgsDumpCollector::export_dump_files() {

@@ -100,7 +100,7 @@ TEST(ArgsDumpCollectorTest, MergesConcurrentShardRecordsIntoManifest) {
     std::filesystem::remove_all(test_dir);
 }
 
-TEST(ArgsDumpCollectorTest, BackpressureReleaseWaitsForAllPublishedPayloads) {
+TEST(ArgsDumpCollectorTest, ArenaAckAdvancesOnlyForThreadsWhosePayloadsLanded) {
     const std::filesystem::path test_dir =
         std::filesystem::temp_directory_path() / ("args_dump_count_test_" + std::to_string(::getpid()));
     std::filesystem::remove_all(test_dir);
@@ -116,10 +116,6 @@ TEST(ArgsDumpCollectorTest, BackpressureReleaseWaitsForAllPublishedPayloads) {
     ASSERT_NE(device_base, nullptr);
     auto *host_base = collector.get_dump_shm_host_ptr();
     ASSERT_NE(host_base, nullptr);
-    DumpDataHeader *header = get_dump_header(host_base);
-    ASSERT_NE(header, nullptr);
-    EXPECT_FALSE(collector.backpressure_release_ready());
-    header->backpressure.fq_freeze_active = 1;
     std::vector<DumpMetaBuffer> buffers(kArenaCount);
     for (int arena_index = 0; arena_index < kArenaCount; arena_index++) {
         DumpBufferState *state = get_dump_buffer_state(device_base, arena_index);
@@ -145,30 +141,30 @@ TEST(ArgsDumpCollectorTest, BackpressureReleaseWaitsForAllPublishedPayloads) {
         record.payload_size = kPayloadSize;
     }
 
-    EXPECT_FALSE(collector.backpressure_release_ready());
+    // Nothing has reached args.bin yet, so no lane may reuse its arena.
+    collector.publish_arena_acks();
+    for (int arena_index = 0; arena_index < kArenaCount; arena_index++) {
+        EXPECT_EQ(get_dump_buffer_state(device_base, arena_index)->completed_payload_count, 0u);
+    }
 
+    // Both lanes published one payload, but only thread 0's is collected and
+    // written. Each arena belongs to one thread, so thread 0 is acked and may
+    // wrap while thread 1 — still outstanding — must not be.
     DumpReadyBufferInfo first{};
     first.thread_index = 0;
     first.host_buffer_ptr = &buffers[0];
     collector.on_buffer_collected(first, 0);
-    EXPECT_FALSE(collector.backpressure_release_ready());
-
-    DumpReadyBufferInfo second{};
-    second.thread_index = 1;
-    second.host_buffer_ptr = &buffers[1];
-    collector.on_buffer_collected(second, 1);
     ASSERT_EQ(collector.export_dump_files(), 0);
-    EXPECT_TRUE(collector.backpressure_release_ready());
-    for (int arena_index = 0; arena_index < kArenaCount; arena_index++) {
-        DumpBufferState *state = get_dump_buffer_state(device_base, arena_index);
-        EXPECT_EQ(state->completed_payload_count, state->published_payload_count);
-    }
+
+    collector.publish_arena_acks();
+    EXPECT_EQ(get_dump_buffer_state(device_base, 0)->completed_payload_count, 1u);
+    EXPECT_EQ(get_dump_buffer_state(device_base, 1)->completed_payload_count, 0u);
 
     collector.finalize(nullptr, test_free);
     std::filesystem::remove_all(test_dir);
 }
 
-TEST(ArgsDumpCollectorTest, BackpressureReleaseDoesNotOffsetPayloadsAcrossThreads) {
+TEST(ArgsDumpCollectorTest, ArenaAckDoesNotOffsetPayloadsAcrossThreads) {
     const std::filesystem::path test_dir =
         std::filesystem::temp_directory_path() / ("args_dump_thread_count_test_" + std::to_string(::getpid()));
     std::filesystem::remove_all(test_dir);
@@ -182,9 +178,6 @@ TEST(ArgsDumpCollectorTest, BackpressureReleaseDoesNotOffsetPayloadsAcrossThread
     ASSERT_NE(device_base, nullptr);
     auto *host_base = collector.get_dump_shm_host_ptr();
     ASSERT_NE(host_base, nullptr);
-    DumpDataHeader *header = get_dump_header(host_base);
-    ASSERT_NE(header, nullptr);
-    header->backpressure.fq_freeze_active = 1;
     DumpBufferState *thread0_state = get_dump_buffer_state(device_base, 0);
     DumpBufferState *thread1_state = get_dump_buffer_state(device_base, 1);
     ASSERT_NE(thread0_state, nullptr);
@@ -212,12 +205,13 @@ TEST(ArgsDumpCollectorTest, BackpressureReleaseDoesNotOffsetPayloadsAcrossThread
     collector.on_buffer_collected(info, 0);
     ASSERT_EQ(collector.export_dump_files(), 0);
 
-    // Model a skewed global snapshot: one payload was written for thread 0,
-    // while the sampled publication belongs to thread 1. Equal totals must
-    // not acknowledge either thread.
+    // One payload was written, for thread 0, but the outstanding publication
+    // belongs to thread 1. Matching totals must not be read as either lane
+    // being caught up: thread 0 published nothing to ack, and thread 1's
+    // payload has not been written.
     thread0_state->published_payload_count = 0;
     thread1_state->published_payload_count = 1;
-    EXPECT_FALSE(collector.backpressure_release_ready());
+    collector.publish_arena_acks();
     EXPECT_EQ(thread0_state->completed_payload_count, 0u);
     EXPECT_EQ(thread1_state->completed_payload_count, 0u);
 

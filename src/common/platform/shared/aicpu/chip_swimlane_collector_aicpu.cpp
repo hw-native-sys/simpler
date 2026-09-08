@@ -243,7 +243,7 @@ static ChipSwimlaneTaskDeviceModule::Context l2_task_context(
 }
 
 static bool wait_for_free_queue_entry(ChipSwimlaneFreeQueue *free_queue, uint32_t *head_out, uint32_t *tail_out) {
-    return ChipSwimlaneTaskEngine::wait_for_free_queue_entry(s_chip_swimlane_header, free_queue, head_out, tail_out);
+    return ChipSwimlaneTaskEngine::wait_for_free_queue_entry(free_queue, head_out, tail_out);
 }
 
 /**

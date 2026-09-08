@@ -31,7 +31,6 @@
 #include <cstddef>
 
 #include "common/core_type.h"
-#include "common/dfx_backpressure_device.h"
 #include "common/platform_config.h"
 
 // DAV_2201 hardware counter count.
@@ -229,8 +228,6 @@ struct PmuDataHeader {
     volatile uint32_t queue_tails[PLATFORM_MAX_AICPU_THREADS];  // AICPU writes (producer)
     uint32_t num_cores;
     uint32_t event_type;  // PmuEventType value, written by host at init
-    // DFX backpressure coordination (unified across all DFX subsystems).
-    DfxBackpressureHeader backpressure;
 } __attribute__((aligned(64)));
 
 // =============================================================================

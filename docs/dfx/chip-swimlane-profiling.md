@@ -766,9 +766,8 @@ ChipSwimlaneDataHeader                               (host init, device R/W)
 ├── queue_heads / queue_tails  (per-thread)
 ├── num_cores / chip_swimlane_level                   (host writes at init)
 ├── num_sched_phase_threads / num_orch_phase_threads  (AICPU writes at phase
-├── num_phase_cores / core_to_thread[]                 init; host gates on
-│                                                      the two counts)
-└── backpressure                (DfxBackpressureHeader)
+└── num_phase_cores / core_to_thread[]                 init; host gates on
+                                                       the two counts)
 
 Every pool below is the same 192B shape — one ChipSwimlaneActiveHead (64B)
 plus one ChipSwimlaneFreeQueue (128B). Only the buffer payload type differs,

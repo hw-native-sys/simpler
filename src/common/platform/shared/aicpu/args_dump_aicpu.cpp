@@ -468,13 +468,15 @@ static bool ensure_dump_arena_capacity(int thread_idx, DumpBufferState *state, u
         }
     }
 
+    // Per-lane arena barrier. `target_payload_count` is snapshotted after the
+    // publish above, so it names exactly the payloads this thread has handed to
+    // the host; the arena bytes about to be overwritten are safe once the host
+    // has written all of them to args.bin and acked with an equal
+    // `completed_payload_count`. Both counters are per-thread and the arena is
+    // this thread's alone, so no peer lane is involved. The budget is the
+    // host-crash backstop only.
     const uint64_t target_payload_count = state->published_payload_count;
     const uint64_t wait_start = get_sys_cnt_aicpu();
-    bool signalled = false;
-    dfx_backpressure::mark_fq_contended(s_dump_header, &signalled);
-    if (!dfx_backpressure::wait_for_release(s_dump_header, wait_start, kDumpQueueBackpressureWaitCycles)) {
-        return false;
-    }
     while (state->completed_payload_count < target_payload_count) {
         if (get_sys_cnt_aicpu() - wait_start >= kDumpQueueBackpressureWaitCycles) {
             return false;
