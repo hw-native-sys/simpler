@@ -450,6 +450,22 @@ add_hierarchical_test(test_remote_wire hierarchical/test_remote_wire.cpp)
 add_hierarchical_test(test_remote_endpoint hierarchical/test_remote_endpoint.cpp)
 add_hierarchical_test(test_pipeline_contract hierarchical/test_pipeline_contract.cpp)
 
+# Exercise ChipWorker's actual dlopen/dlsym admission before a sentinel factory,
+# then the four built sim runtimes through the unchanged public kernel ABI.
+add_library(pipeline_contract_runtime SHARED stubs/pipeline_contract_runtime.cpp)
+target_include_directories(pipeline_contract_runtime PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+)
+add_hierarchical_test(test_pipeline_contract_loader hierarchical/test_pipeline_contract_loader.cpp)
+add_dependencies(test_pipeline_contract_loader pipeline_contract_runtime)
+target_compile_definitions(test_pipeline_contract_loader PRIVATE
+    PIPELINE_FIXTURE_PATH="$<TARGET_FILE:pipeline_contract_runtime>"
+    SIM_CONTEXT_PATH="${CMAKE_SOURCE_DIR}/../../../build/lib/libcpu_sim_context.so"
+    RUNTIME_LIBRARY_ROOT="${CMAKE_SOURCE_DIR}/../../../build/lib"
+)
+
 # Run-stream pair state machine: publication-aware AICore stream reuse,
 # submitter-gated retirement, and failed-destroy ownership. Header-only with
 # injected create/destroy, so it needs no runtime objects and no device.

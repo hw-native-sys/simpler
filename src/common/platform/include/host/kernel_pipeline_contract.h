@@ -11,9 +11,9 @@
 
 #pragma once
 
-typedef enum SimplerExecutionMode {
-    /* Exclusive-device execution. */
-    SIMPLER_MODE_PROGRAM = 0,
-    /* Caller-stream execution on a borrowed device. */
-    SIMPLER_MODE_KERNEL = 1,
-} SimplerExecutionMode;
+#include "worker/runtime_c_api.h"
+
+// Internal host-runtime hook, not a dlsym lifecycle API. Input is borrowed and
+// immutable during the call; output is caller-exclusive and unchanged on error.
+// No device resources are acquired or retained. Separate calls may run concurrently.
+extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *config, PipelineContract *out);
