@@ -49,7 +49,7 @@ TEST(ArgsDumpCollectorTest, MergesConcurrentShardRecordsIntoManifest) {
     constexpr int kShardCount = DumpModule::kMaxCollectorThreads;
     ArgsDumpCollector collector;
     collector.begin_run(test_dir.string(), DumpArgsLevel::HYBRID);
-    ASSERT_EQ(collector.initialize(kShardCount, 0, test_alloc, nullptr, test_free), 0);
+    ASSERT_EQ(collector.initialize(kShardCount, 0, DumpArgsLevel::HYBRID, test_alloc, nullptr, test_free), 0);
 
     std::vector<DumpMetaBuffer> buffers(kShardCount);
     std::atomic<int> ready_workers{0};
@@ -110,7 +110,7 @@ TEST(ArgsDumpCollectorTest, ArenaAckAdvancesOnlyForThreadsWhosePayloadsLanded) {
     constexpr uint64_t kPayloadSize = sizeof(uint64_t);
     TestArgsDumpCollector collector;
     collector.begin_run(test_dir.string(), DumpArgsLevel::FULL);
-    ASSERT_EQ(collector.initialize(kArenaCount, 0, test_alloc, nullptr, test_free), 0);
+    ASSERT_EQ(collector.initialize(kArenaCount, 0, DumpArgsLevel::FULL, test_alloc, nullptr, test_free), 0);
 
     auto *device_base = collector.get_dump_shm_device_ptr();
     ASSERT_NE(device_base, nullptr);
@@ -172,7 +172,7 @@ TEST(ArgsDumpCollectorTest, ArenaAckDoesNotOffsetPayloadsAcrossThreads) {
 
     TestArgsDumpCollector collector;
     collector.begin_run(test_dir.string(), DumpArgsLevel::FULL);
-    ASSERT_EQ(collector.initialize(2, 0, test_alloc, nullptr, test_free), 0);
+    ASSERT_EQ(collector.initialize(2, 0, DumpArgsLevel::FULL, test_alloc, nullptr, test_free), 0);
 
     auto *device_base = collector.get_dump_shm_device_ptr();
     ASSERT_NE(device_base, nullptr);

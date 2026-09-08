@@ -390,12 +390,14 @@ public:
     // that outlives a run holds pools shaped for those two counts, and the
     // caller rebuilds it when a later run changes them.
     //
-    // Per-run configuration (artifact prefix, level) is bound separately by
-    // begin_run(), which must run before this on the first run: the level
-    // selects the orch phase pool here.
+    // The level is taken here because it selects the orch phase pool, and the
+    // pools are built once for every run this collector serves. The rest of a
+    // run's configuration is bound by begin_run(), which runs once per run and
+    // may run either side of this.
     int initialize(
-        int num_aicore, int aicpu_thread_num, int device_id, const ChipSwimlaneAllocCallback &alloc_cb,
-        ChipSwimlaneRegisterCallback register_cb, const ChipSwimlaneFreeCallback &free_cb
+        int num_aicore, int aicpu_thread_num, int device_id, ChipSwimlaneLevel chip_swimlane_level,
+        const ChipSwimlaneAllocCallback &alloc_cb, ChipSwimlaneRegisterCallback register_cb,
+        const ChipSwimlaneFreeCallback &free_cb
     );
 
     /**
@@ -411,8 +413,8 @@ public:
      * stays on whichever level the first run asked for.
      *
      * Before the first initialize() there is no region and no shard storage yet;
-     * reset_collector_shards() is then a no-op over empty extents, and
-     * initialize() picks the level up from the member this sets.
+     * reset_collector_shards() is then a no-op over empty extents and
+     * publish_run_config() has no header to write.
      */
     void begin_run(const std::string &output_prefix, ChipSwimlaneLevel chip_swimlane_level) {
         output_prefix_ = output_prefix;

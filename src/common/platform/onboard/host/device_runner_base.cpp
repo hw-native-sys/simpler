@@ -1275,13 +1275,9 @@ extern "C" __attribute__((weak)) int prewarm_config_impl(
 
 void DeviceRunnerBase::apply_call_config(const CallConfig &config) {
     set_chip_swimlane_enabled(config.enable_chip_swimlane);
-    set_dump_args_enabled(config.enable_dump_args);
-    set_pmu_enabled(config.enable_pmu);
     // Virtual: a2a3 and a5 wire through to their enable_dep_gen_; an arch
     // without dep_gen falls through to the base no-op.
     set_dep_gen_enabled(config.enable_dep_gen != 0);
-    set_scope_stats_enabled(config.enable_scope_stats != 0);
-    capture_clock_anchors_ = config.capture_clock_anchors != 0;
     set_output_prefix(config.output_prefix);
 }
 
@@ -1885,49 +1881,56 @@ int DeviceRunnerBase::init_runtime_args_with_metadata(Runtime &runtime, KernelAr
     return 0;
 }
 
-void DeviceRunnerBase::start_shared_collectors_for_run() {
-    // Start collector mgmt + poll threads now, just before kernels launch.
-    // Starting earlier wastes CPU on empty queues and risks tripping
-    // ProfilerBase's poll-loop idle-timeout if device-side init is slow.
+void DeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &dfx) {
+    // Open each enabled collector's window and start its mgmt + poll threads
+    // now, just before kernels launch. Both halves belong here: begin_run()
+    // drops the previous run's records and republishes the device level, which
+    // is only safe while this run holds the execution claim, and starting
+    // earlier wastes CPU on empty queues and risks tripping ProfilerBase's
+    // poll-loop idle-timeout if device-side init is slow.
     auto thread_factory = [this](std::function<void()> fn) {
         return create_thread(std::move(fn));
     };
-    if (enable_chip_swimlane_) {
-        if (capture_clock_anchors_) begin_clock_correlation_session_if_needed();
+    if (dfx.chip_swimlane_enabled()) {
+        chip_swimlane_collector_.begin_run(dfx.output_prefix, dfx.chip_swimlane_level);
+        if (dfx.capture_clock_anchors) begin_clock_correlation_session_if_needed();
         chip_swimlane_collector_.start(thread_factory);
     }
-    if (enable_dump_args_) {
+    if (dfx.dump_args_enabled()) {
+        dump_collector_.begin_run(dfx.output_prefix, dfx.dump_args_level);
         dump_collector_.start(thread_factory);
     }
-    if (enable_pmu_) {
+    if (dfx.pmu_enabled) {
+        pmu_collector_.begin_run(make_pmu_csv_path(dfx.output_prefix), dfx.pmu_event_type);
         pmu_collector_.start(thread_factory);
     }
-    if (enable_scope_stats_) {
+    if (dfx.scope_stats_enabled) {
+        scope_stats_collector_.begin_run();
         scope_stats_collector_.start(thread_factory);
     }
 }
 
-void DeviceRunnerBase::write_host_phase_records_artifact() {
+void DeviceRunnerBase::write_host_phase_records_artifact(const std::string &output_prefix) {
     // Per-event view of the prepare path. Every phase it records is produced on
     // the host during bind, and the store is finished before launch, so this
     // touches no device state and is callable from any point after bind --
-    // including a path that never launches. Keyed on output_prefix_ because it is
-    // non-empty exactly when this run produces diagnostic artifacts, and on the
-    // store having finished a pass, which is what a host-orchestrating runtime
-    // leaves behind. The store writes a pass at most once, so every path that can
-    // end a run calls this unconditionally.
-    if (!output_prefix_.empty() && host_phase_records_.finished()) {
-        (void)host_phase_records_.write_records_jsonl(make_host_phase_records_path(output_prefix_));
+    // including a path that never launches. Keyed on the run's output_prefix
+    // because it is non-empty exactly when this run produces diagnostic
+    // artifacts, and on the store having finished a pass, which is what a
+    // host-orchestrating runtime leaves behind. The store writes a pass at most
+    // once, so every path that can end a run calls this unconditionally.
+    if (!output_prefix.empty() && host_phase_records_.finished()) {
+        (void)host_phase_records_.write_records_jsonl(make_host_phase_records_path(output_prefix));
     }
 }
 
-void DeviceRunnerBase::teardown_shared_collectors_after_run(bool device_execution_complete) {
+void DeviceRunnerBase::teardown_shared_collectors_after_run(const DfxRunConfig &dfx, bool device_execution_complete) {
     // Tear down collectors. stop() joins mgmt then collector in the only safe
     // order (mgmt's final-drain pass into L2 has poll as its consumer).
-    // Diagnostic exports use the per-task `output_prefix_` directory the user
-    // set on CallConfig (CallConfig::validate() enforces non-empty upstream).
+    // Diagnostic exports use the per-task output prefix the user set on
+    // CallConfig (CallConfig::validate() enforces non-empty upstream).
     finish_clock_correlation_session(device_execution_complete, !can_accept_run());
-    if (enable_chip_swimlane_) {
+    if (dfx.chip_swimlane_enabled()) {
         chip_swimlane_collector_.quiesce();
         chip_swimlane_collector_.read_phase_header_metadata();
         chip_swimlane_collector_.reconcile_counters();
@@ -1935,23 +1938,23 @@ void DeviceRunnerBase::teardown_shared_collectors_after_run(bool device_executio
         chip_swimlane_collector_.export_swimlane_json();
     }
 
-    write_host_phase_records_artifact();
+    write_host_phase_records_artifact(dfx.output_prefix);
 
-    if (enable_dump_args_) {
+    if (dfx.dump_args_enabled()) {
         dump_collector_.quiesce();
         dump_collector_.reconcile_counters();
         dump_collector_.export_dump_files();
     }
 
-    if (enable_pmu_) {
+    if (dfx.pmu_enabled) {
         pmu_collector_.quiesce();
         pmu_collector_.reconcile_counters();
     }
 
-    if (enable_scope_stats_) {
+    if (dfx.scope_stats_enabled) {
         scope_stats_collector_.quiesce();
         scope_stats_collector_.reconcile_counters();
-        scope_stats_collector_.write_jsonl(output_prefix_);
+        scope_stats_collector_.write_jsonl(dfx.output_prefix);
     }
 }
 

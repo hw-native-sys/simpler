@@ -64,6 +64,7 @@
 #include "device_runner_helpers.h"
 #include "aicpu_loader/host/load_aicpu_op.h"
 #include "host/chip_swimlane_collector.h"
+#include "host/dfx_run_config.h"
 #include "host/host_phase_records.h"
 #include "host/memory_allocator.h"
 #include "host/pmu_collector.h"
@@ -558,6 +559,7 @@ public:
             identity(identity_in),
             runtime(&runtime_in),
             config(config_in),
+            dfx(DfxRunConfig::from(config_in)),
             pipeline_slot(pipeline_slot_in) {}
         PreparedExecution(const PreparedExecution &) = delete;
         PreparedExecution &operator=(const PreparedExecution &) = delete;
@@ -565,6 +567,7 @@ public:
             identity(other.identity),
             runtime(std::exchange(other.runtime, nullptr)),
             config(other.config),
+            dfx(std::move(other.dfx)),
             pipeline_slot(other.pipeline_slot),
             num_aicore(other.num_aicore),
             launch_aicpu_num(other.launch_aicpu_num),
@@ -576,6 +579,18 @@ public:
         NativeRunIdentity identity{};
         Runtime *runtime{nullptr};
         CallConfig config{};
+        /**
+         * This run's diagnostics configuration, resolved from its own config.
+         *
+         * Every phase of the run reads its DFX configuration from here rather
+         * than from the runner's members: prepare because it can overlap a
+         * predecessor whose configuration is still the one bound on the runner,
+         * and launch/drain so that one run answers for its whole lifetime from a
+         * single value. A run that degrades a channel (a5 disables PMU when its
+         * init fails) writes that here, where it reaches this run's arming and
+         * teardown and no other run's.
+         */
+        DfxRunConfig dfx{};
         uint32_t pipeline_slot{PTO_PIPELINE_MAX_DEPTH};
         int num_aicore{0};
         int launch_aicpu_num{0};
@@ -722,16 +737,14 @@ public:
 
     /**
      * Enablement setters for the four shared diagnostics sub-features.
-     * Applied from the per-run CallConfig by `apply_call_config()` before prepare;
-     * downstream execution paths read the corresponding `enable_*_`
-     * members directly.
+     * Applied from the per-run CallConfig by `apply_call_config()` before
+     * prepare. Execution paths do not read these: a run's own diagnostics
+     * configuration reaches them on its `PreparedExecution::dfx`, and the runner
+     * keeps only what a device-context query answers from.
      *
      * `set_dep_gen_enabled` is a2a3-only and lives on the subclass.
      */
-    void set_chip_swimlane_enabled(int level) {
-        chip_swimlane_level_ = static_cast<ChipSwimlaneLevel>(level);
-        enable_chip_swimlane_ = (chip_swimlane_level_ != ChipSwimlaneLevel::DISABLED);
-    }
+    void set_chip_swimlane_enabled(int level) { chip_swimlane_level_ = static_cast<ChipSwimlaneLevel>(level); }
     uint32_t chip_swimlane_level() const { return static_cast<uint32_t>(chip_swimlane_level_); }
     bool
     publish_chip_swimlane_extension(ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size) {
@@ -755,23 +768,14 @@ public:
      * can still produce the artifact. The store writes a pass at most once, so
      * every path that can end a run may call this unconditionally.
      */
-    void write_host_phase_records_artifact();
+    void write_host_phase_records_artifact(const std::string &output_prefix);
     void finish_clock_correlation_session(bool capture_device_complete, bool abandon_device_resources) noexcept;
-    void set_dump_args_enabled(int level) {
-        dump_args_level_ = static_cast<DumpArgsLevel>(level);
-        enable_dump_args_ = (dump_args_level_ != DumpArgsLevel::OFF);
-    }
-    void set_pmu_enabled(int enable_pmu) {
-        enable_pmu_ = (enable_pmu > 0);
-        pmu_event_type_ = resolve_pmu_event_type(enable_pmu);
-    }
-    void set_scope_stats_enabled(bool enable) { enable_scope_stats_ = enable; }
 
     /**
-     * Latch this run's per-run diagnostic config onto the runner's `enable_*_`
-     * members before prepare uses them. The c_api applies it only when no active
-     * run can observe the runner-global collector configuration. Defined in the
-     * .cpp so this header does not need the full CallConfig definition.
+     * Latch the part of this run's config a device-context query answers from.
+     * The c_api applies it only when no active run can observe the runner-global
+     * state. Defined in the .cpp so this header does not need the full CallConfig
+     * definition.
      */
     void apply_call_config(const CallConfig &config);
 
@@ -958,24 +962,31 @@ protected:
     int init_runtime_args_with_metadata(Runtime &runtime, KernelArgsHelper &kernel_args);
 
     /**
-     * Start collector mgmt + poll threads for the four shared
-     * diagnostics collectors (`chip_swimlane_collector_`, `dump_collector_`,
-     * `pmu_collector_`, `scope_stats_collector_`) that are enabled.
-     * Each `start()` is gated on the corresponding `enable_*_` flag;
-     * disabled collectors are not started.
+     * Open this run's collection window on the four shared diagnostics
+     * collectors (`chip_swimlane_collector_`, `dump_collector_`,
+     * `pmu_collector_`, `scope_stats_collector_`) that it enables, and start
+     * their mgmt + poll threads. Each block is gated on `dfx`, this run's own
+     * configuration, not on the runner's members.
+     *
+     * The collectors are resident and serve every run, so opening the window is
+     * destructive: it drops the previous run's records and counters and
+     * republishes the level the device reads. That is why it happens here, at
+     * launch, rather than during preparation — this is the first point the run
+     * holds the execution claim, so it is the first point at which no other run
+     * is executing against those collectors.
      *
      * Each spawned thread is bound to `device_id_` via `create_thread`.
      *
      * Subclasses with arch-specific collectors (`dep_gen_collector_`) call
-     * this helper and then start their own. The sim base carries the same
-     * split.
+     * this helper and then open and start their own. The sim base carries the
+     * same split.
      */
-    void start_shared_collectors_for_run();
+    void start_shared_collectors_for_run(const DfxRunConfig &dfx);
 
     /**
      * Tear down the four shared diagnostics collectors after the launched
-     * kernels have synced. Each block is gated on the corresponding
-     * `enable_*_` flag and does: stop() → reconcile_counters() →
+     * kernels have synced. Each block is gated on `dfx`, this run's own
+     * configuration, and does: stop() → reconcile_counters() →
      * export step (`chip_swimlane` writes swimlane JSON via
      * `read_phase_header_metadata` + `export_swimlane_json`; `dump`
      * writes dump files; `pmu` has no export step beyond reconcile;
@@ -985,7 +996,7 @@ protected:
      * `dep_gen_replay_emit_deps_json` export) inline their own teardown after
      * calling this helper. The sim base carries the same split.
      */
-    void teardown_shared_collectors_after_run(bool device_execution_complete);
+    void teardown_shared_collectors_after_run(const DfxRunConfig &dfx, bool device_execution_complete);
 
     /**
      * The core and AICPU-thread counts a resident collector's pools were built
@@ -1350,14 +1361,6 @@ protected:
     ScopeStatsCollector scope_stats_collector_;
 
     // Enablement for the four shared diagnostics sub-features.
-    // Written from CallConfig before enqueue and read by execution helpers.
-    bool enable_chip_swimlane_{false};
-    bool enable_dump_args_{false};
-    DumpArgsLevel dump_args_level_{DumpArgsLevel::OFF};  // resolved from set_dump_args_enabled()
-    bool enable_pmu_{false};
-    bool enable_scope_stats_{false};
     ChipSwimlaneLevel chip_swimlane_level_{ChipSwimlaneLevel::DISABLED};  // resolved from set_chip_swimlane_enabled()
-    PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};         // resolved from set_pmu_enabled()
-    bool capture_clock_anchors_{false};                                   // from CallConfig::capture_clock_anchors
     std::string output_prefix_{};                                         // diagnostic artifact root directory
 };

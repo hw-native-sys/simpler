@@ -894,7 +894,7 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         // The host phase records describe the bind path this variable exists to
         // measure, so they are written here as well as in the device-run
         // teardown. Skipping the device must not skip the artifact.
-        state->runner->write_host_phase_records_artifact();
+        state->runner->write_host_phase_records_artifact(state->config.output_prefix);
         state->completion_rc = 0;
         state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
         return 0;

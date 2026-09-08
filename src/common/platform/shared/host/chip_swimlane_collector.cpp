@@ -109,8 +109,9 @@ bool ChipSwimlaneCollector::set_json_extension(ChipSwimlaneExtensionSection sect
 }
 
 int ChipSwimlaneCollector::initialize(
-    int num_aicore, int aicpu_thread_num, int device_id, const ChipSwimlaneAllocCallback &alloc_cb,
-    ChipSwimlaneRegisterCallback register_cb, const ChipSwimlaneFreeCallback &free_cb
+    int num_aicore, int aicpu_thread_num, int device_id, ChipSwimlaneLevel chip_swimlane_level,
+    const ChipSwimlaneAllocCallback &alloc_cb, ChipSwimlaneRegisterCallback register_cb,
+    const ChipSwimlaneFreeCallback &free_cb
 ) {
     if (shm_host_ != nullptr) {
         // Already holding this run's device resources. They are not per-run:
@@ -118,6 +119,7 @@ int ChipSwimlaneCollector::initialize(
         // compile time, so there is nothing here left to re-apply.
         return 0;
     }
+    chip_swimlane_level_ = chip_swimlane_level;
     if (num_aicore <= 0 || num_aicore > PLATFORM_MAX_CORES) {
         LOG_ERROR("Invalid number of AICores: %d (max=%d)", num_aicore, PLATFORM_MAX_CORES);
         return PTO_RUNTIME_ERR_INTERNAL;

@@ -223,11 +223,11 @@ int DeviceRunner::prepare_execution(
     std::unique_ptr<PreparedExecution> *prepared
 ) {
     if (prepared == nullptr || *prepared != nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    auto execution = std::make_unique<PreparedExecution>(identity, runtime, config, pipeline_slot);
     // Resolved from this run's own CallConfig rather than read off the runner:
     // apply_call_config() is skipped when this prepare overlaps an in-flight
     // predecessor, so the members still describe that predecessor.
-    const DfxRunConfig dfx = DfxRunConfig::from(config);
-    auto execution = std::make_unique<PreparedExecution>(identity, runtime, config, pipeline_slot);
+    const DfxRunConfig &dfx = execution->dfx;
     execution->resources_owned = true;
     auto prepare_rollback = RAIIScopeGuard([this, &execution]() {
         cleanup_execution(*execution, /*retire_aicore=*/false);
@@ -367,8 +367,7 @@ int DeviceRunner::prepare_execution(
 
     if (dfx.chip_swimlane_enabled()) {
         rc = init_chip_swimlane(
-            num_aicore, runtime.get_aicpu_thread_num(), device_id_, execution->kernel_args, dfx.output_prefix,
-            dfx.chip_swimlane_level
+            num_aicore, runtime.get_aicpu_thread_num(), device_id_, execution->kernel_args, dfx.chip_swimlane_level
         );
         if (rc != 0) {
             LOG_ERROR("init_chip_swimlane failed: %d", rc);
@@ -378,7 +377,7 @@ int DeviceRunner::prepare_execution(
 
     if (dfx.dump_args_enabled()) {
         // Initialize args dump (independent from profiling)
-        rc = init_args_dump(runtime, device_id_, execution->kernel_args, dfx.output_prefix, dfx.dump_args_level);
+        rc = init_args_dump(runtime, device_id_, execution->kernel_args, dfx.dump_args_level);
         if (rc != 0) {
             LOG_ERROR("init_args_dump failed: %d", rc);
             return rc;
@@ -386,10 +385,7 @@ int DeviceRunner::prepare_execution(
     }
 
     if (dfx.pmu_enabled) {
-        rc = init_pmu(
-            num_aicore, launch_aicpu_num, make_pmu_csv_path(dfx.output_prefix), dfx.pmu_event_type, device_id_,
-            execution->kernel_args
-        );
+        rc = init_pmu(num_aicore, launch_aicpu_num, device_id_, execution->kernel_args);
         if (rc != 0) {
             LOG_ERROR("init_pmu failed: %d", rc);
             return rc;
@@ -460,7 +456,7 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
         cleanup_execution(prepared, /*retire_aicore=*/true);
     });
 
-    int rc = reap_run();
+    int rc = reap_run(prepared.dfx);
     if (rc != 0) {
         // The device/sync error remains authoritative over teardown errors.
         return rc;
@@ -621,14 +617,15 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
             try {
                 activate_launch_shape(runtime);
                 (void)arm_device_wall_buffer(prepared.kernel_args);
-                start_shared_collectors_for_run();
-                if (enable_dep_gen_ && !dep_gen_host_graph_active()) {
+                start_shared_collectors_for_run(prepared.dfx);
+                if (prepared.dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
                     auto thread_factory = [this](std::function<void()> fn) {
                         return create_thread(std::move(fn));
                     };
+                    dep_gen_collector_.begin_run();
                     dep_gen_collector_.start(thread_factory);
                 }
-                if (enable_chip_swimlane_ && chip_swimlane_collector_.is_initialized()) {
+                if (prepared.dfx.chip_swimlane_enabled() && chip_swimlane_collector_.is_initialized()) {
                     std::vector<CoreType> core_types(num_aicore);
                     for (int i = 0; i < num_aicore; i++)
                         core_types[i] = runtime.get_workers()[i].core_type;
@@ -691,7 +688,7 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
     return result;
 }
 
-int DeviceRunner::reap_run() {
+int DeviceRunner::reap_run(const DfxRunConfig &dfx) {
     if (!run_streams_.ready()) {
         LOG_ERROR("reap_run: the run stream pair is not ready");
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -712,7 +709,7 @@ int DeviceRunner::reap_run() {
         // JSON manifest, i.e. unusable for triage. reconcile/export are not
         // idempotent, so this runs only on the error return; the success path
         // still exports exactly once below.
-        teardown_shared_collectors_after_run(false);
+        teardown_shared_collectors_after_run(dfx, false);
         return rc;
     }
 
@@ -720,16 +717,16 @@ int DeviceRunner::reap_run() {
 
     // Tear down collectors. stop() joins mgmt then collector in the only safe
     // order (mgmt's final-drain pass into L2 has poll as its consumer).
-    teardown_shared_collectors_after_run(true);
+    teardown_shared_collectors_after_run(dfx, true);
 
     // a2a3-only dep_gen teardown, device-orch shape: the collector stops, the
     // ring reconciles, and the records replay. The host-orch shape emits at the
     // end of bind instead, where its capture window closes — see
     // `emit_host_dep_gen_graph` in c_api_shared.cpp.
-    if (enable_dep_gen_ && !dep_gen_host_graph_active()) {
+    if (dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
         dep_gen_collector_.quiesce();
         if (dep_gen_collector_.reconcile_counters()) {
-            const std::string deps = make_deps_json_path(output_prefix_);
+            const std::string deps = make_deps_json_path(dfx.output_prefix);
             const auto &records = dep_gen_collector_.records();
             int rc = dep_gen_replay_emit_deps_json(records.data(), records.size(), deps.c_str());
             if (rc != 0) {
@@ -1141,7 +1138,7 @@ int DeviceRunner::finalize() {
 
 int DeviceRunner::init_chip_swimlane(
     int num_aicore, int aicpu_thread_num, int device_id, KernelArgsHelper &kernel_args,
-    const std::string &output_prefix, ChipSwimlaneLevel chip_swimlane_level
+    ChipSwimlaneLevel chip_swimlane_level
 ) {
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);
@@ -1164,9 +1161,9 @@ int DeviceRunner::init_chip_swimlane(
         return mem_alloc_.free(dev_ptr);
     };
 
-    chip_swimlane_collector_.begin_run(output_prefix, chip_swimlane_level);
-    int rc =
-        chip_swimlane_collector_.initialize(num_aicore, aicpu_thread_num, device_id, alloc_cb, register_cb, free_cb);
+    int rc = chip_swimlane_collector_.initialize(
+        num_aicore, aicpu_thread_num, device_id, chip_swimlane_level, alloc_cb, register_cb, free_cb
+    );
     if (rc != 0) {
         return rc;
     }
@@ -1179,8 +1176,7 @@ int DeviceRunner::init_chip_swimlane(
 }
 
 int DeviceRunner::init_args_dump(
-    Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, const std::string &output_prefix,
-    DumpArgsLevel dump_args_level
+    Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, DumpArgsLevel dump_args_level
 ) {
     int num_dump_threads = runtime.get_aicpu_thread_num();
 
@@ -1205,8 +1201,7 @@ int DeviceRunner::init_args_dump(
         return mem_alloc_.free(dev_ptr);
     };
 
-    dump_collector_.begin_run(output_prefix, dump_args_level);
-    int rc = dump_collector_.initialize(num_dump_threads, device_id, alloc_cb, register_cb, free_cb);
+    int rc = dump_collector_.initialize(num_dump_threads, device_id, dump_args_level, alloc_cb, register_cb, free_cb);
     if (rc != 0) {
         return rc;
     }
@@ -1215,10 +1210,7 @@ int DeviceRunner::init_args_dump(
     return 0;
 }
 
-int DeviceRunner::init_pmu(
-    int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id,
-    KernelArgsHelper &kernel_args
-) {
+int DeviceRunner::init_pmu(int num_cores, int num_threads, int device_id, KernelArgsHelper &kernel_args) {
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);
     };
@@ -1240,7 +1232,6 @@ int DeviceRunner::init_pmu(
         return mem_alloc_.free(dev_ptr);
     };
 
-    pmu_collector_.begin_run(csv_path, event_type);
     int rc = pmu_collector_.init(num_cores, num_threads, alloc_cb, register_cb, free_cb, device_id);
     if (rc != 0) {
         return rc;
@@ -1251,7 +1242,6 @@ int DeviceRunner::init_pmu(
 }
 
 int DeviceRunner::init_dep_gen(int num_threads, int device_id, KernelArgsHelper &kernel_args) {
-    dep_gen_collector_.begin_run();
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);
     };
@@ -1283,7 +1273,6 @@ int DeviceRunner::init_dep_gen(int num_threads, int device_id, KernelArgsHelper 
 }
 
 int DeviceRunner::init_scope_stats(int num_threads, int device_id, KernelArgsHelper &kernel_args) {
-    scope_stats_collector_.begin_run();
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);
     };

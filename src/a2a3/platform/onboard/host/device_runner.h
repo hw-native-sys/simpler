@@ -257,7 +257,7 @@ private:
     // The kernel submission boundary is separate from the stream wait and
     // post-run teardown: launch_run() submits and drain_execution() reaps.
     LaunchTransactionResult launch_run(PreparedExecution &prepared, LaunchPermit permit);
-    int reap_run();
+    int reap_run(const DfxRunConfig &dfx);
 
     // On an AICore launch/sync error, best-effort drain the device so a later
     // enqueue on the same DeviceRunner can recover in place; if the drain itself
@@ -301,7 +301,7 @@ private:
      */
     int init_chip_swimlane(
         int num_aicore, int aicpu_thread_num, int device_id, KernelArgsHelper &kernel_args,
-        const std::string &output_prefix, ChipSwimlaneLevel chip_swimlane_level
+        ChipSwimlaneLevel chip_swimlane_level
     );
 
     /**
@@ -314,10 +314,7 @@ private:
      * @param device_id Device ID for host registration
      * @return 0 on success, error code on failure
      */
-    int init_args_dump(
-        Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, const std::string &output_prefix,
-        DumpArgsLevel dump_args_level
-    );
+    int init_args_dump(Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, DumpArgsLevel dump_args_level);
 
     /**
      * Initialize PMU streaming shared memory.
@@ -328,15 +325,10 @@ private:
      *
      * @param num_cores  Number of AICore instances
      * @param num_threads Number of AICPU scheduling threads
-     * @param csv_path   Output CSV file path
-     * @param event_type PMU event type (written to CSV rows)
      * @param device_id  Device ID for host registration
      * @return 0 on success, error code on failure
      */
-    int init_pmu(
-        int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id,
-        KernelArgsHelper &kernel_args
-    );
+    int init_pmu(int num_cores, int num_threads, int device_id, KernelArgsHelper &kernel_args);
 
     /**
      * Initialize dep_gen capture shared memory.

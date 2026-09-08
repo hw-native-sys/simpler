@@ -330,15 +330,14 @@ int DeviceRunner::prepare_execution(
     std::unique_ptr<PreparedExecution> *prepared
 ) {
     if (prepared == nullptr || *prepared != nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-    // Resolved from this run's own CallConfig rather than read off the runner:
-    // apply_call_config() is skipped when this prepare overlaps an in-flight
-    // predecessor, so the members still describe that predecessor.
-    const DfxRunConfig dfx = DfxRunConfig::from(config);
     if (active_run_ != nullptr) {
         LOG_ERROR("prepare_execution called while another simulated run still owns execution state");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     auto execution = std::make_unique<PreparedExecution>(identity, runtime, config, pipeline_slot);
+    // This run's own diagnostics configuration, carried on the prepared run so
+    // that arming at launch and teardown at drain read the same value.
+    DfxRunConfig &dfx = execution->dfx;
     active_run_ = std::make_unique<ActiveRun>();
     active_run_->runtime = &runtime;
     run_completion_.reset(1);
@@ -424,9 +423,7 @@ int DeviceRunner::prepare_execution(
     latch_collector_shape(num_aicore, runtime.get_aicpu_thread_num(), launch_aicpu_num);
 
     if (dfx.chip_swimlane_enabled()) {
-        rc = init_chip_swimlane(
-            num_aicore, runtime.get_aicpu_thread_num(), device_id_, dfx.output_prefix, dfx.chip_swimlane_level
-        );
+        rc = init_chip_swimlane(num_aicore, runtime.get_aicpu_thread_num(), device_id_, dfx.chip_swimlane_level);
         if (rc != 0) {
             LOG_ERROR("init_chip_swimlane failed: %d", rc);
             return rc;
@@ -441,7 +438,7 @@ int DeviceRunner::prepare_execution(
     }
 
     if (dfx.dump_args_enabled()) {
-        rc = init_args_dump(runtime, device_id_, dfx.output_prefix, dfx.dump_args_level);
+        rc = init_args_dump(runtime, device_id_, dfx.dump_args_level);
         if (rc != 0) {
             LOG_ERROR("init_args_dump failed: %d", rc);
             return rc;
@@ -449,16 +446,14 @@ int DeviceRunner::prepare_execution(
     }
 
     if (dfx.pmu_enabled) {
-        rc = init_pmu(
-            num_aicore, launch_aicpu_num, make_pmu_csv_path(dfx.output_prefix), dfx.pmu_event_type, device_id_
-        );
+        rc = init_pmu(num_aicore, launch_aicpu_num, device_id_);
         if (rc != 0) {
             LOG_ERROR("PMU init failed: %d, disabling PMU for this run", rc);
             kernel_args_.pmu_data_base = 0;
-            // Written to the runner, not to `dfx`: the launch arming and the
-            // teardown both read this member, and neither can see a local. It is
-            // therefore the one DFX value this prepare still writes runner-wide.
-            enable_pmu_ = false;
+            // Recorded on this run's own configuration, which its launch arming
+            // and its teardown both read. a2a3 fails the whole run on the same
+            // error instead of degrading it.
+            dfx.pmu_enabled = false;
         }
     }
 
@@ -552,24 +547,25 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 set_platform_regs_func_(kernel_args_.regs);
                 if (set_orch_device_id_func_ != nullptr) set_orch_device_id_func_(device_id_);
                 set_platform_dump_base_func_(kernel_args_.dump_data_base);
-                set_dump_args_enabled_func_(enable_dump_args_);
+                set_dump_args_enabled_func_(prepared->dfx.dump_args_enabled());
                 set_platform_chip_swimlane_base_func_(kernel_args_.chip_swimlane_data_base);
                 set_platform_chip_swimlane_aicore_rotation_table_func_(
                     kernel_args_.chip_swimlane_aicore_rotation_table
                 );
-                set_chip_swimlane_enabled_func_(enable_chip_swimlane_);
+                set_chip_swimlane_enabled_func_(prepared->dfx.chip_swimlane_enabled());
                 set_platform_pmu_base_func_(kernel_args_.pmu_data_base);
-                set_pmu_enabled_func_(enable_pmu_);
+                set_pmu_enabled_func_(prepared->dfx.pmu_enabled);
                 set_platform_dep_gen_base_func_(kernel_args_.dep_gen_data_base);
-                set_dep_gen_enabled_func_(enable_dep_gen_ && !dep_gen_host_graph_active());
-                set_scope_stats_enabled_func_(enable_scope_stats_);
+                set_dep_gen_enabled_func_(prepared->dfx.dep_gen_enabled && !dep_gen_host_graph_active());
+                set_scope_stats_enabled_func_(prepared->dfx.scope_stats_enabled);
                 set_platform_scope_stats_base_func_(kernel_args_.scope_stats_data_base);
 
-                start_shared_collectors_for_run();
-                if (enable_dep_gen_ && !dep_gen_host_graph_active()) {
+                start_shared_collectors_for_run(prepared->dfx);
+                if (prepared->dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
                     auto thread_factory = [this](std::function<void()> fn) {
                         return create_thread(std::move(fn));
                     };
+                    dep_gen_collector_.begin_run();
                     dep_gen_collector_.start(thread_factory);
                 }
 
@@ -635,11 +631,12 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
 
 int DeviceRunner::poll_execution(const ActiveExecution &) { return run_completion_.poll(); }
 
-int DeviceRunner::drain_execution(ActiveExecution &) {
-    if (active_run_ == nullptr) {
+int DeviceRunner::drain_execution(ActiveExecution &active) {
+    if (active_run_ == nullptr || active.prepared == nullptr) {
         LOG_ERROR("drain_execution called without a launched simulated run");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    const DfxRunConfig &dfx = active.prepared->dfx;
     auto run_cleanup = RAIIScopeGuard([this]() {
         cleanup_active_run();
     });
@@ -695,15 +692,15 @@ int DeviceRunner::drain_execution(ActiveExecution &) {
         return runtime_rc;
     }
 
-    teardown_shared_collectors_after_run(true);
+    teardown_shared_collectors_after_run(dfx, true);
 
     // Device-orch shape: the collector stops, the ring reconciles, and the
     // records replay. The host-orch shape emits at the end of bind instead, where
     // its capture window closes — see `emit_host_dep_gen_graph` in c_api_shared.cpp.
-    if (enable_dep_gen_ && !dep_gen_host_graph_active()) {
+    if (dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
         dep_gen_collector_.quiesce();
         if (dep_gen_collector_.reconcile_counters()) {
-            const std::string deps = make_deps_json_path(output_prefix_);
+            const std::string deps = make_deps_json_path(dfx.output_prefix);
             const auto &records = dep_gen_collector_.records();
             int replay_rc = dep_gen_replay_emit_deps_json(records.data(), records.size(), deps.c_str());
             if (replay_rc != 0) {
@@ -858,12 +855,11 @@ void DeviceRunner::finalize_collectors() {
 }
 
 int DeviceRunner::init_chip_swimlane(
-    int num_aicore, int aicpu_thread_num, int device_id, const std::string &output_prefix,
-    ChipSwimlaneLevel chip_swimlane_level
+    int num_aicore, int aicpu_thread_num, int device_id, ChipSwimlaneLevel chip_swimlane_level
 ) {
-    chip_swimlane_collector_.begin_run(output_prefix, chip_swimlane_level);
     int rc = chip_swimlane_collector_.initialize(
-        num_aicore, aicpu_thread_num, device_id, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb
+        num_aicore, aicpu_thread_num, device_id, chip_swimlane_level, prof_alloc_cb, /*register_cb=*/nullptr,
+        prof_free_cb
     );
     if (rc == 0) {
         kernel_args_.chip_swimlane_data_base =
@@ -874,14 +870,12 @@ int DeviceRunner::init_chip_swimlane(
     return rc;
 }
 
-int DeviceRunner::init_args_dump(
-    Runtime &runtime, int device_id, const std::string &output_prefix, DumpArgsLevel dump_args_level
-) {
+int DeviceRunner::init_args_dump(Runtime &runtime, int device_id, DumpArgsLevel dump_args_level) {
     int num_dump_threads = runtime.get_aicpu_thread_num();
 
-    dump_collector_.begin_run(output_prefix, dump_args_level);
-    int rc =
-        dump_collector_.initialize(num_dump_threads, device_id, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb);
+    int rc = dump_collector_.initialize(
+        num_dump_threads, device_id, dump_args_level, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb
+    );
     if (rc != 0) {
         return rc;
     }
@@ -890,10 +884,7 @@ int DeviceRunner::init_args_dump(
     return 0;
 }
 
-int DeviceRunner::init_pmu(
-    int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int /*device_id*/
-) {
-    pmu_collector_.begin_run(csv_path, event_type);
+int DeviceRunner::init_pmu(int num_cores, int num_threads, int /*device_id*/) {
     int rc = pmu_collector_.init(
         num_cores, num_threads, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, /*device_id=*/-1
     );
@@ -906,7 +897,6 @@ int DeviceRunner::init_pmu(
 }
 
 int DeviceRunner::init_scope_stats(int num_threads) {
-    scope_stats_collector_.begin_run();
     // a5 sim: register_cb=nullptr, so the collector mallocs a host shadow per
     // device buffer; sim's profiling_copy_* are plain memcpys, so the dev/host
     // shadow path collapses to one allocation pair without address-space tricks.
@@ -922,7 +912,6 @@ int DeviceRunner::init_scope_stats(int num_threads) {
 }
 
 int DeviceRunner::init_dep_gen(int num_threads, int /*device_id*/) {
-    dep_gen_collector_.begin_run();
     // a5 sim: register_cb=nullptr; sim's profiling_copy_* are plain memcpys, so
     // the dev/host shadow path collapses to one allocation pair.
     int rc =

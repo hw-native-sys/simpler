@@ -57,6 +57,7 @@
 #include "platform_comm/comm.h"
 #include "host/memory_allocator.h"
 #include "host/chip_swimlane_collector.h"
+#include "host/dfx_run_config.h"
 #include "host/host_phase_records.h"
 #include "host/args_dump_collector.h"
 #include "host/pmu_collector.h"
@@ -104,6 +105,7 @@ public:
             identity(identity_in),
             runtime(&runtime_in),
             config(config_in),
+            dfx(DfxRunConfig::from(config_in)),
             pipeline_slot(pipeline_slot_in) {}
         virtual ~PreparedExecution() = default;
         PreparedExecution(const PreparedExecution &) = delete;
@@ -112,6 +114,7 @@ public:
             identity(other.identity),
             runtime(std::exchange(other.runtime, nullptr)),
             config(other.config),
+            dfx(std::move(other.dfx)),
             pipeline_slot(other.pipeline_slot),
             num_aicore(other.num_aicore),
             launch_aicpu_num(other.launch_aicpu_num) {}
@@ -120,6 +123,17 @@ public:
         NativeRunIdentity identity{};
         Runtime *runtime{nullptr};
         CallConfig config{};
+        /**
+         * This run's diagnostics configuration, resolved from its own config.
+         *
+         * Every phase of the run reads its DFX configuration from here rather
+         * than from the runner's members, so that one run answers for its whole
+         * lifetime from a single value. A simulated device context takes the
+         * execution claim in simpler_prepare_run and therefore never prepares a
+         * successor against a live predecessor, so unlike onboard this carries
+         * no correctness weight here — it keeps the two runner shapes the same.
+         */
+        DfxRunConfig dfx{};
         uint32_t pipeline_slot{PTO_PIPELINE_MAX_DEPTH};
         int num_aicore{0};
         int launch_aicpu_num{0};
@@ -276,10 +290,7 @@ public:
     uint64_t last_task_slot_dispatch_ns(int slot) const { return task_slot_dispatch_ns_[slot]; }
     uint64_t last_task_slot_finish_ns(int slot) const { return task_slot_finish_ns_[slot]; }
 
-    void set_chip_swimlane_enabled(int level) {
-        chip_swimlane_level_ = static_cast<ChipSwimlaneLevel>(level);
-        enable_chip_swimlane_ = (chip_swimlane_level_ != ChipSwimlaneLevel::DISABLED);
-    }
+    void set_chip_swimlane_enabled(int level) { chip_swimlane_level_ = static_cast<ChipSwimlaneLevel>(level); }
     uint32_t chip_swimlane_level() const { return static_cast<uint32_t>(chip_swimlane_level_); }
     bool
     publish_chip_swimlane_extension(ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size) {
@@ -301,37 +312,32 @@ public:
      */
     virtual void publish_chip_swimlane_runtime_extensions() {}
     /**
-     * Start collector mgmt + poll threads for the four shared diagnostics
-     * collectors that are enabled. Mirrors the onboard base. Subclasses with
-     * arch-specific collectors (`dep_gen_collector_`) call this and then start
-     * their own.
+     * Open this run's collection window on the four shared diagnostics
+     * collectors it enables, and start their mgmt + poll threads. Each block is
+     * gated on `dfx`, this run's own configuration, not on the runner's members.
+     * Mirrors the onboard base, where opening the window at launch is what keeps
+     * a resident collector's per-run state off a live predecessor. Subclasses
+     * with arch-specific collectors (`dep_gen_collector_`) call this and then
+     * open and start their own.
      */
-    void start_shared_collectors_for_run();
+    void start_shared_collectors_for_run(const DfxRunConfig &dfx);
     /** Write this pass's per-event host phase records, if it collected any. */
-    void write_host_phase_records_artifact();
+    void write_host_phase_records_artifact(const std::string &output_prefix);
     /**
      * Tear down the four shared diagnostics collectors after the launched
      * kernels have synced, in the one order their couplings allow: the clock
      * correlation session closes before the swimlane export reads it, and each
-     * collector drains before it reconciles before it exports.
+     * collector drains before it reconciles before it exports. Each block is
+     * gated on `dfx`, this run's own configuration.
      *
      * Subclasses with arch-specific collectors (`dep_gen_collector_` + its
      * `dep_gen_replay_emit_deps_json` export) inline their own teardown after
      * calling this helper, as on onboard.
      */
-    void teardown_shared_collectors_after_run(bool device_execution_complete);
+    void teardown_shared_collectors_after_run(const DfxRunConfig &dfx, bool device_execution_complete);
     /** Start the level-4 Host/Device clock correlation once per run. */
     void begin_clock_correlation_session_if_needed() noexcept;
     void finish_clock_correlation_session(bool capture_device_complete) noexcept;
-    void set_dump_args_enabled(int level) {
-        dump_args_level_ = static_cast<DumpArgsLevel>(level);
-        enable_dump_args_ = (dump_args_level_ != DumpArgsLevel::OFF);
-    }
-    void set_pmu_enabled(int enable_pmu) {
-        enable_pmu_ = (enable_pmu > 0);
-        pmu_event_type_ = resolve_pmu_event_type(enable_pmu);
-    }
-    void set_scope_stats_enabled(bool enable) { enable_scope_stats_ = enable; }
     // Diagnostic artifact root directory (CallConfig::validate() enforces non-empty
     // upstream when any diagnostic is enabled).
     void set_output_prefix(const char *prefix) { output_prefix_ = (prefix != nullptr) ? prefix : ""; }
@@ -601,15 +607,10 @@ protected:
 
     CollectorShape collector_shape_{};
 
-    // Enablement flags. Written before enqueue and read by execution helpers.
-    bool enable_chip_swimlane_{false};
-    bool enable_dump_args_{false};
-    DumpArgsLevel dump_args_level_{DumpArgsLevel::OFF};  // resolved from set_dump_args_enabled()
-    bool enable_pmu_{false};
-    bool enable_scope_stats_{false};
+    // Enablement flags. A run's own diagnostics configuration travels on its
+    // PreparedExecution::dfx; the runner keeps only what a device-context query
+    // answers from, plus the artifact root the host-phase pool arms against.
     ChipSwimlaneLevel chip_swimlane_level_{ChipSwimlaneLevel::DISABLED};  // resolved from set_chip_swimlane_enabled()
-    PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};         // resolved from set_pmu_enabled()
-    bool capture_clock_anchors_{false};                                   // from CallConfig::capture_clock_anchors
     std::string output_prefix_{};                                         // diagnostic artifact root directory
 };
 

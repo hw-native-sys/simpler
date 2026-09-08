@@ -757,12 +757,8 @@ extern "C" __attribute__((weak)) int prewarm_config_impl(
 
 void SimDeviceRunnerBase::apply_call_config(const CallConfig &config) {
     set_chip_swimlane_enabled(config.enable_chip_swimlane);
-    set_dump_args_enabled(config.enable_dump_args);
-    set_pmu_enabled(config.enable_pmu);
     // a2a3 and a5 override set_dep_gen_enabled; an arch without dep_gen no-ops.
     set_dep_gen_enabled(config.enable_dep_gen != 0);
-    set_scope_stats_enabled(config.enable_scope_stats != 0);
-    capture_clock_anchors_ = config.capture_clock_anchors != 0;
     set_output_prefix(config.output_prefix);
 }
 
@@ -824,45 +820,53 @@ void SimDeviceRunnerBase::publish_host_phase_records_to_swimlane() {
     );
 }
 
-void SimDeviceRunnerBase::start_shared_collectors_for_run() {
+void SimDeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &dfx) {
+    // Opening a resident collector's window drops the previous run's records and
+    // republishes the device level, so it belongs with the start, at launch.
     auto thread_factory = [this](std::function<void()> fn) {
         return create_thread(std::move(fn));
     };
-    if (enable_chip_swimlane_) {
-        if (capture_clock_anchors_) begin_clock_correlation_session_if_needed();
+    if (dfx.chip_swimlane_enabled()) {
+        chip_swimlane_collector_.begin_run(dfx.output_prefix, dfx.chip_swimlane_level);
+        if (dfx.capture_clock_anchors) begin_clock_correlation_session_if_needed();
         chip_swimlane_collector_.start(thread_factory);
     }
-    if (enable_dump_args_) {
+    if (dfx.dump_args_enabled()) {
+        dump_collector_.begin_run(dfx.output_prefix, dfx.dump_args_level);
         dump_collector_.start(thread_factory);
     }
-    if (enable_pmu_) {
+    if (dfx.pmu_enabled) {
+        pmu_collector_.begin_run(make_pmu_csv_path(dfx.output_prefix), dfx.pmu_event_type);
         pmu_collector_.start(thread_factory);
     }
-    if (enable_scope_stats_) {
+    if (dfx.scope_stats_enabled) {
+        scope_stats_collector_.begin_run();
         scope_stats_collector_.start(thread_factory);
     }
 }
 
-void SimDeviceRunnerBase::write_host_phase_records_artifact() {
+void SimDeviceRunnerBase::write_host_phase_records_artifact(const std::string &output_prefix) {
     // Every phase this records is produced on the host during bind and the store
     // is finished before launch, so it touches no device state and is callable
-    // from any point after bind — including a path that never launched.
-    // `output_prefix_` is non-empty exactly when this run produces diagnostic
-    // artifacts, and the store writes a pass at most once.
-    if (!output_prefix_.empty() && host_phase_records_.finished()) {
-        (void)host_phase_records_.write_records_jsonl(make_host_phase_records_path(output_prefix_));
+    // from any point after bind — including a path that never launched. The run's
+    // output prefix is non-empty exactly when it produces diagnostic artifacts,
+    // and the store writes a pass at most once.
+    if (!output_prefix.empty() && host_phase_records_.finished()) {
+        (void)host_phase_records_.write_records_jsonl(make_host_phase_records_path(output_prefix));
     }
 }
 
-void SimDeviceRunnerBase::teardown_shared_collectors_after_run(bool device_execution_complete) {
+void SimDeviceRunnerBase::teardown_shared_collectors_after_run(
+    const DfxRunConfig &dfx, bool device_execution_complete
+) {
     // The order is fixed by three couplings, not by preference: the clock
     // correlation session closes before the swimlane export reads it, the host
     // phase records reach the collector before that same export serializes them,
     // and each collector drains before it reconciles before it exports.
-    // Diagnostic exports use the per-task `output_prefix_` directory the user set
-    // on CallConfig (CallConfig::validate() enforces non-empty upstream).
+    // Diagnostic exports use the per-task output prefix the user set on
+    // CallConfig (CallConfig::validate() enforces non-empty upstream).
     finish_clock_correlation_session(device_execution_complete);
-    if (enable_chip_swimlane_) {
+    if (dfx.chip_swimlane_enabled()) {
         chip_swimlane_collector_.quiesce();
         chip_swimlane_collector_.read_phase_header_metadata();
         chip_swimlane_collector_.reconcile_counters();
@@ -871,23 +875,23 @@ void SimDeviceRunnerBase::teardown_shared_collectors_after_run(bool device_execu
         chip_swimlane_collector_.export_swimlane_json();
     }
 
-    write_host_phase_records_artifact();
+    write_host_phase_records_artifact(dfx.output_prefix);
 
-    if (enable_dump_args_) {
+    if (dfx.dump_args_enabled()) {
         dump_collector_.quiesce();
         dump_collector_.reconcile_counters();
         dump_collector_.export_dump_files();
     }
 
-    if (enable_pmu_) {
+    if (dfx.pmu_enabled) {
         pmu_collector_.quiesce();
         pmu_collector_.reconcile_counters();
     }
 
-    if (enable_scope_stats_) {
+    if (dfx.scope_stats_enabled) {
         scope_stats_collector_.quiesce();
         scope_stats_collector_.reconcile_counters();
-        scope_stats_collector_.write_jsonl(output_prefix_);
+        scope_stats_collector_.write_jsonl(dfx.output_prefix);
     }
 }
 

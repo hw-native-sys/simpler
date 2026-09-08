@@ -255,7 +255,7 @@ private:
      */
     int init_chip_swimlane(
         int num_aicore, int aicpu_thread_num, int device_id, KernelArgsHelper &kernel_args,
-        const std::string &output_prefix, ChipSwimlaneLevel chip_swimlane_level
+        ChipSwimlaneLevel chip_swimlane_level
     );
 
     /**
@@ -266,10 +266,7 @@ private:
      * @param device_id Device ID for allocations
      * @return 0 on success, error code on failure
      */
-    int init_args_dump(
-        Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, const std::string &output_prefix,
-        DumpArgsLevel dump_args_level
-    );
+    int init_args_dump(Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, DumpArgsLevel dump_args_level);
 
     /**
      * Initialize PMU profiling device buffers.
@@ -297,10 +294,7 @@ private:
     bool aicpu_topology_cached_{false};
     pto::a5::AicpuTopology aicpu_topology_{};
 
-    int init_pmu(
-        int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id,
-        KernelArgsHelper &kernel_args
-    );
+    int init_pmu(int num_cores, int num_threads, int device_id, KernelArgsHelper &kernel_args);
     int init_scope_stats(int num_threads, int device_id, KernelArgsHelper &kernel_args);
 
     /**

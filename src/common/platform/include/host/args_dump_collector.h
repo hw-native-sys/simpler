@@ -227,12 +227,12 @@ public:
     // Allocates the device-side resources: header, per-thread DumpBufferStates,
     // DumpMetaBuffers and payload arenas.
     //
-    // The per-run configuration (output prefix, level) is NOT taken here — it
-    // is bound separately via begin_run(), which the caller must run before this
-    // on the first run.
+    // The level is taken here because it is written into DumpDataHeader with the
+    // rest of the layout. The prefix is bound by begin_run(), which runs once per
+    // run and may run either side of this.
     int initialize(
-        int num_dump_threads, int device_id, const DumpAllocCallback &alloc_cb, DumpRegisterCallback register_cb,
-        const DumpFreeCallback &free_cb
+        int num_dump_threads, int device_id, DumpArgsLevel dump_args_level, const DumpAllocCallback &alloc_cb,
+        DumpRegisterCallback register_cb, const DumpFreeCallback &free_cb
     );
 
     // Start a run's collection window: bind its artifact configuration, drop the
