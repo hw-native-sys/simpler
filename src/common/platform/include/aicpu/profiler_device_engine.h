@@ -98,10 +98,16 @@ struct DeviceProfilerEngine {
         //    observes the signal and opens the freeze, the barrier sees
         //    fq_freeze_active==0 and returns at once, so this loop re-checks and
         //    bridges the host round-trip. Once frozen, the barrier spins here
-        //    until release; its timeout arms only then and is the sole give-up
-        //    (host dead/hung mid-freeze).
+        //    until release.
         // 4. Freeze released -> loop re-checks and picks up the refilled slot.
+        //
+        // The barrier's own timeout covers only step 3's park, so it cannot bound
+        // a wait the host never freezes at all. `wait_start` is this wait's single
+        // budget across every iteration, matching the ready-queue gate above, and
+        // is what makes the give-up unconditional: a host that dies before it ever
+        // answers the leader signal leaves fq_freeze_active at 0 forever.
         bool contended_signalled = false;
+        const uint64_t wait_start = get_sys_cnt_aicpu();
 
         do {
             // Step 1: Check FQ slot availability
@@ -118,9 +124,13 @@ struct DeviceProfilerEngine {
             dfx_backpressure::mark_fq_contended(header, &contended_signalled);
 
             // Step 3: Park while the host holds the freeze open; returns at once
-            // when it is not open. Timeout fires only while frozen.
+            // when it is not open.
             if (!dfx_backpressure::pop_freeze_barrier(header, Module::kBackpressureWaitCycles)) {
                 break;  // gate timeout — fall through to the single failure exit below
+            }
+
+            if (get_sys_cnt_aicpu() - wait_start >= Module::kBackpressureWaitCycles) {
+                break;  // whole-wait deadline — same exit
             }
 
             // Step 4: Gate not held (never opened yet, or released) — re-check the

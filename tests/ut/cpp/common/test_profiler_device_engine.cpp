@@ -13,7 +13,10 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <thread>
 
 namespace {
 
@@ -204,6 +207,46 @@ TEST(ProfilerDeviceEngineTest, WaitForReleaseUsesCallerTimeoutBudget) {
     header.backpressure.fq_contended = 0;
     EXPECT_TRUE(dfx_backpressure::wait_for_release(&header, get_sys_cnt_aicpu(), 0));
     EXPECT_TRUE(dfx_backpressure::wait_for_release<FakeHeader>(nullptr, get_sys_cnt_aicpu(), 0));
+}
+
+// The pop gate's own barrier parks only while `fq_freeze_active` is set, so it
+// cannot bound a wait the host never answers. This is the deadline that spans
+// the whole wait — the property `docs/dfx/global-backpressure-design.md` states
+// as "every barrier and contention spin is bounded".
+//
+// Every object the worker touches is static on purpose: a regression leaves it
+// spinning forever, and a detached thread must not reference a freed frame. That
+// storage therefore outlives the test body, so each invocation has to establish
+// the state it asserts on rather than inherit it from the previous one.
+TEST(ProfilerDeviceEngineTest, PopGateGivesUpWhenTheFreezeIsNeverOpened) {
+    static FakeHeader header;
+    static FakeFreeQueue free_queue;
+    static std::atomic<bool> finished{false};
+    static std::atomic<bool> acquired{true};
+
+    header.backpressure.fq_contended = 0;
+    finished.store(false);
+    acquired.store(true);
+
+    ASSERT_EQ(free_queue.head, free_queue.tail);          // the gate finds no slot
+    ASSERT_EQ(header.backpressure.fq_freeze_active, 0u);  // and the host never freezes
+
+    std::thread worker([] {
+        uint32_t head = 0;
+        uint32_t tail = 0;
+        acquired.store(Engine::wait_for_free_queue_entry(&header, &free_queue, &head, &tail));
+        finished.store(true);
+    });
+    worker.detach();
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!finished.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    ASSERT_TRUE(finished.load()) << "pop gate spun with no deadline of its own while fq_freeze_active stayed 0";
+    EXPECT_FALSE(acquired.load());
+    EXPECT_EQ(header.backpressure.fq_contended, 1u);  // the leader signal was still raised
 }
 
 TEST(ProfilerDeviceEngineTest, TryPopFreeReturnsImmediatelyWhenStartupQueueIsEmpty) {
