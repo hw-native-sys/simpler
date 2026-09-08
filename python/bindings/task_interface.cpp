@@ -1628,10 +1628,20 @@ void fill_view(Tensor *t, nb::handle shapes, nb::handle strides) {
         t->shapes[i] = nb::cast<uint32_t>(nb::handle(shape_items[i]));
 
     if (strides.is_none()) {
-        uint32_t acc = 1;
+        // A stride is a u32 field, so a suffix product that does not fit one names no representable
+        // view: rejecting is what keeps a wrapped-small stride from passing validate_tensor's extent
+        // check while the view really spans past the backing. The accumulator is u64 and bounded
+        // before every further multiply, so it cannot wrap either.
+        uint64_t acc = 1;
         for (Py_ssize_t i = ndims; i-- > 0;) {
-            t->strides[i] = acc;
+            t->strides[i] = static_cast<uint32_t>(acc);
             acc *= t->shapes[i];
+            if (i > 0 && acc > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+                throw std::invalid_argument(
+                    "Tensor contiguous stride does not fit in uint32: prod(shapes[" + std::to_string(i) + ":]) is " +
+                    std::to_string(acc)
+                );
+            }
         }
         return;
     }
@@ -2067,7 +2077,7 @@ NB_MODULE(_task_interface, m) {
         )
         .def(
             "tensor",
-            [](const BufferDescriptor &self, nb::sequence shapes, nb::object dtype, nb::object strides,
+            [](const BufferDescriptor &self, nb::object shapes, nb::object dtype, nb::object strides,
                uint64_t byte_offset) -> Tensor {
                 Tensor t{};
                 t.buffer = self;

@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import ctypes
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from multiprocessing.shared_memory import SharedMemory
@@ -189,13 +189,14 @@ class Buffer:
 
     def tensor(
         self,
-        shapes: tuple[int, ...],
+        shapes: Iterable[int],
         dtype: int | DataType,
-        strides: tuple[int, ...] | None = None,
+        strides: Iterable[int] | None = None,
         byte_offset: int = 0,
     ) -> Tensor:
         """A self-describing ``Tensor`` viewing this buffer: embeds the full descriptor + the view.
 
+        ``shapes`` and ``strides`` are each consumed once, so any iterable of ints will do.
         ``strides`` default to contiguous (row-major) — ``buffer.tensor(shape, dtype)`` names the
         whole buffer as a contiguous view; pass explicit element strides for a strided view.
         ``byte_offset`` must be a multiple of the dtype size (checked at materialization).
