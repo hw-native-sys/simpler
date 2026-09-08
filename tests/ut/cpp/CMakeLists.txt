@@ -500,6 +500,37 @@ set_tests_properties(test_native_run_acceptance PROPERTIES LABELS "no_hardware")
 # callers invoke it from different host threads.
 add_common_utils_test(test_host_api common/test_host_api.cpp)
 
+# Kernel-mode entry argument validation: shared by every host-runtime
+# component (real implementation and stub alike), so its rejection rules are
+# provable here without any device or built .so.
+add_executable(test_kernel_entry_validation common/test_kernel_entry_validation.cpp)
+target_include_directories(test_kernel_entry_validation PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+)
+target_link_libraries(test_kernel_entry_validation PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_kernel_entry_validation COMMAND test_kernel_entry_validation)
+set_tests_properties(test_kernel_entry_validation PROPERTIES LABELS "no_hardware")
+
+# Kernel-mode phase machine and restricted-vocabulary tables, table-driven with
+# fake ops: init/close balance, poison, sticky CLOSING with retry, and the
+# separate runtime-error vs teardown-error slots.
+add_executable(test_kernel_execution_state
+    common/test_kernel_execution_state.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/kernel_execution_state.cpp
+)
+target_include_directories(test_kernel_execution_state PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+)
+target_link_libraries(test_kernel_execution_state PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_kernel_execution_state COMMAND test_kernel_execution_state)
+set_tests_properties(test_kernel_execution_state PROPERTIES LABELS "no_hardware")
+
 # Runtime extension payloads are per-run state even though the collector's
 # shared-memory resources remain resident across runs.
 add_executable(test_chip_swimlane_collector
@@ -544,7 +575,9 @@ set_tests_properties(test_sim_run_completion PROPERTIES LABELS "no_hardware")
 add_task_interface_test(test_buffer types/test_buffer.cpp)
 add_task_interface_test(test_child_memory types/test_child_memory.cpp)
 add_task_interface_test(test_chip_max_tensor_args types/test_chip_max_tensor_args.cpp)
+add_task_interface_test(test_callable_scalar_count types/test_callable_scalar_count.cpp)
 add_task_interface_test(test_call_config types/test_call_config.cpp)
+add_task_interface_test(test_kernel_invocation_header types/test_kernel_invocation_header.cpp)
 
 # Contract test for upload_chip_callable_buffer caller-buffer immutability.
 # Pulls both task_interface (callable.h) and src/common (utils/fnv1a_64.h),

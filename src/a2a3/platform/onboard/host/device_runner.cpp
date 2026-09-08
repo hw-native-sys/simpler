@@ -148,6 +148,20 @@ int DeviceRunner::ensure_acl_ready(int device_id) {
         LOG_ERROR("ensure_acl_ready: invalid device_id %d", device_id);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    // A kernel-mode context borrows the caller's device and ACL context, so
+    // the ACL lifecycle (aclInit / aclrtSetDevice / aclrtResetDevice[Force] /
+    // aclFinalize) belongs to the caller. Every call site of those APIs falls
+    // into one of three classes: (a) the aclInit / aclrtSetDevice below this
+    // guard, (b) calls inside force_reset_device(), behind its own
+    // kernel-mode guard, or (c) calls gated on acl_ready_, which only the
+    // path below this guard sets. finalize()'s rt-layer device reset on the
+    // acl_ready_ == false path is intercepted by the kernel-mode branch
+    // inside finalize(). Together these keep the caller's device and ACL
+    // state unreachable in kernel mode.
+    if (execution_mode_latch().is_kernel()) {
+        LOG_ERROR("ensure_acl_ready: refused — a kernel-mode context does not own the caller's ACL lifecycle");
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    }
 
     // aclInit is process-wide; CANN returns ACL_ERROR_REPEAT_INITIALIZE if it
     // has already been initialized (possibly by another owner), which we
@@ -857,6 +871,14 @@ int DeviceRunner::force_reset_device() {
     if (device_id_ < 0) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    // aclrtResetDeviceForce would reset the caller's device and ACL context;
+    // a kernel-mode context owns neither (see ensure_acl_ready()), so error
+    // recovery on that path never resets the device out from under the host
+    // process.
+    if (execution_mode_latch().is_kernel()) {
+        LOG_ERROR("force_reset_device: refused — a kernel-mode context does not own the caller's device");
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    }
     // aclrtResetDeviceForce is an ACL API; bring ACL up for the whole sequence,
     // released on scope exit so a repeated poison-then-reset cycle in a
     // long-lived process leaks no ACL state.
@@ -1071,10 +1093,15 @@ int DeviceRunner::finalize() {
         return abandon_rc != 0 ? abandon_rc : reset_rc;
     }
 
-    int rc = attach_current_thread(device_id_);
-    if (rc != 0) {
-        LOG_ERROR("Failed to attach finalize thread to device %d: %d", device_id_, rc);
-        return rc;
+    // A kernel-mode context runs on the caller's already-current device, so
+    // this thread needs no bind and the context owns no device state to adopt.
+    int rc = 0;
+    if (!execution_mode_latch().is_kernel()) {
+        rc = attach_current_thread(device_id_);
+        if (rc != 0) {
+            LOG_ERROR("Failed to attach finalize thread to device %d: %d", device_id_, rc);
+            return rc;
+        }
     }
 
     // Cleanup performance profiling (including a2a3's dep_gen). Normally
@@ -1121,6 +1148,10 @@ int DeviceRunner::finalize() {
                 if (rc == 0) rc = finalize_rc;
             }
             acl_ready_ = false;
+        } else if (execution_mode_latch().is_kernel()) {
+            // A kernel-mode context borrows the caller's device; the device
+            // reset belongs to the caller, so the healthy close path releases
+            // only context-owned resources.
         } else {
             int reset_rc = rtDeviceReset(device_id_);
             if (reset_rc != 0) {
