@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -84,3 +85,54 @@ def test_host_runtime_exports_required_pipeline_symbols(arch: str, variant: str,
     assert _NEWLY_REQUIRED_PIPELINE_SYMBOLS <= symbols, sorted(_NEWLY_REQUIRED_PIPELINE_SYMBOLS - symbols)
     assert _KERNEL_MODE_SYMBOLS <= symbols, sorted(_KERNEL_MODE_SYMBOLS - symbols)
     assert symbols.isdisjoint(_REMOVED_AMBIENT_SELECTION_SYMBOLS), sorted(symbols & _REMOVED_AMBIENT_SELECTION_SYMBOLS)
+
+
+@pytest.mark.parametrize(("language", "standard", "compiler_name"), [("c", "c11", "cc"), ("c++", "c++17", "c++")])
+@pytest.mark.parametrize(
+    "headers",
+    [
+        ("execution_mode.h",),
+        ("kernel_invocation_header.h",),
+        ("execution_mode.h", "kernel_invocation_header.h"),
+        ("kernel_invocation_header.h", "execution_mode.h"),
+    ],
+)
+def test_execution_mode_headers_are_self_contained(language: str, standard: str, compiler_name: str, headers: tuple):
+    compiler = shutil.which(compiler_name)
+    assert compiler is not None, f"Header ABI tests require {compiler_name}"
+    includes = "\n".join(f'#include "{header}"' for header in headers)
+    source = includes + "\nSimplerExecutionMode mode = SIMPLER_MODE_KERNEL;\n"
+    assertion = "_Static_assert" if language == "c" else "static_assert"
+    source += f'{assertion}(SIMPLER_MODE_PROGRAM == 0 && SIMPLER_MODE_KERNEL == 1, "mode values");\n'
+    result = subprocess.run(
+        [
+            compiler,
+            "-x",
+            language,
+            f"-std={standard}",
+            "-I",
+            str(_PROJECT_ROOT / "src/common/task_interface"),
+            "-fsyntax-only",
+            "-",
+        ],
+        input=source,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_pipeline_contract_has_no_invocation_header_dependency():
+    compiler = shutil.which("c++")
+    assert compiler is not None, "Header dependency test requires c++"
+    command = [compiler, "-x", "c++", "-std=c++17"]
+    for directory in ("src/common", "src/common/task_interface", "src/common/platform/include"):
+        command.extend(["-I", str(_PROJECT_ROOT / directory)])
+    source = '#include "worker/pipeline_contract.h"\n'
+    result = subprocess.run(command + ["-fsyntax-only", "-"], input=source, capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+    dependencies = subprocess.run(command + ["-M", "-"], input=source, capture_output=True, text=True, check=False)
+    assert dependencies.returncode == 0, dependencies.stderr
+    assert "execution_mode.h" in dependencies.stdout
+    assert "kernel_invocation_header.h" not in dependencies.stdout

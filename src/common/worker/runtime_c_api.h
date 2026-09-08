@@ -157,7 +157,10 @@ typedef enum PipelineResourceKind {
 typedef struct PipelineResource {
     uint32_t kind;
     uint32_t resource_class;
-    /* Size of one copy. Reserved: currently declared as 0 and required to be 0. */
+    /* Program: reserved, must be 0. Kernel: arena kinds declare nonzero
+       required usable bytes per copy, not committed HBM or capacity budgets.
+       Streams and TASK_ARGS must be 0; task-argument byte limits are not
+       represented by this field. */
     uint64_t bytes_per_copy;
 } PipelineResource;
 

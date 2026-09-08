@@ -83,6 +83,7 @@
 #include "host_log.h"
 #include "host/platform_compile_info.h"
 #include "host/raii_scope_guard.h"
+#include "host/kernel_pipeline_contract.h"
 #include "utils/device_arena.h"
 #include "prepare_callable_common.h"
 
@@ -103,6 +104,10 @@ static_assert(
         SCHEDULER_PROFILING_SCHED_PHASES_LEVEL == static_cast<uint64_t>(ChipSwimlaneLevel::SCHED_PHASES),
     "AICore Scheduler profiling levels must match the chip-swimlane contract"
 );
+
+extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *, PipelineContract *) {
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
 
 extern "C" const PipelineContract *get_pipeline_contract(void) {
     // Host orchestration materializes this run's own graph into the image it

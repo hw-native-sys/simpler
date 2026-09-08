@@ -266,7 +266,8 @@ void ChipWorker::init(
     }
 
     const PipelineContract *contract = get_pipeline_contract_fn();
-    if (!is_valid_pipeline_contract(contract) || !has_serviceable_arena_topology(*contract)) {
+    if (!is_valid_pipeline_contract(contract) || !has_serviceable_arena_topology(*contract) ||
+        !has_serviceable_stream_topology(*contract)) {
         throw std::runtime_error("host runtime returned a PipelineContract this build cannot accept");
     }
     const PipelineContract resolved_contract = *contract;
