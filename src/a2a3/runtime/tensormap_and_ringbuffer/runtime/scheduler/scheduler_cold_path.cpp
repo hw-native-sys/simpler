@@ -14,6 +14,7 @@
 
 #include <cinttypes>
 #include <cstdio>
+#include <cstring>
 
 #include "common/unified_log.h"
 #include "aicpu/aicpu_device_config.h"
@@ -1172,6 +1173,17 @@ int32_t SchedulerContext::pre_handshake_init(
     active_sched_threads_ = (sched_thread_num_ > 0) ? sched_thread_num_ : aicpu_thread_num_;
     handshake_failed_.store(false, std::memory_order_release);
 
+    // First-touch / zero the per-core dispatch buffers on the leader BEFORE
+    // hs_setup_done_ is published. On the decoupled path the orchestrator leaves
+    // init() as soon as setup completes and can open OrchWindow while schedulers
+    // are still in handshake/assign_own_clusters; leaving first-touch for assign
+    // puts hundreds of µs of minor faults into the Orch→Sched start gap. Touching
+    // only the live [0, cores_total_num_) rows here finishes before orch starts.
+    // assign_own_clusters still rewires the fields it needs on already-resident
+    // pages.
+    memset(payload_per_core_, 0, sizeof(payload_per_core_[0]) * static_cast<size_t>(cores_total_num_));
+    memset(deferred_slab_per_core_, 0, sizeof(deferred_slab_per_core_[0]) * static_cast<size_t>(cores_total_num_));
+
     // State the barrier-free per-thread init path no longer reaches via
     // post_handshake_init; reset on the leader before any scheduler thread is
     // released to dispatch.
@@ -1320,19 +1332,16 @@ void SchedulerContext::deinit() {
         core_exec_states_[i].pending_reg_task_id = AICPU_TASK_INVALID;
     }
 
-    // No per-core memset of payload_per_core_ / deferred_slab_per_core_ here
-    // (~300 KB across all cores). They are re-initialized before they can be read:
-    // build_payload() overwrites the per-dispatch payload fields (function addr,
-    // args[0..num_args) or src_payload, block_idx/block_num, async_ctx.task_token)
-    // on the exact [core][buf_idx] about to run; the async_ctx slab pointers +
-    // capacity, the two context-pointer args, and the deferred slab (count = 0 /
-    // error_code = NONE) are all cleared once per run in init() — the slab is
-    // thereafter re-cleared only by the completion path after a deferred task.
-    // The consumer side cannot reach a stale slot either: the
-    // drain only services a core's running_reg_task_id, and the loop above
-    // already reset every core_exec_states_[].running/pending_reg_task_id to
-    // AICPU_TASK_INVALID — so no FIN for an undispatched slot is processed, and
-    // the count-gated consumer never reads entries[] past the fresh count.
+    // No per-core memset of payload_per_core_ / deferred_slab_per_core_ here.
+    // The next run's pre_handshake_init zeroes the live [0, worker_count) rows
+    // (and first-touches them before OrchWindow on the decoupled path);
+    // assign_own_clusters then rewires context pointers and clears both slabs
+    // before dispatch. build_payload() overwrites the task-varying fields on
+    // the exact [core][buf_idx] about to run. The consumer side cannot reach a
+    // stale slot: the drain only services a core's running_reg_task_id, and the
+    // loop above already reset every core_exec_states_[].running/pending_reg_task_id
+    // to AICPU_TASK_INVALID — so no FIN for an undispatched slot is processed,
+    // and the count-gated consumer never reads entries[] past the fresh count.
 
     // Reset sync-start drain coordination — a previous run that aborted mid-drain
     // would otherwise leave dirty pending/ack state for the next reuse.
