@@ -299,7 +299,10 @@ private:
      * @param device_id Device ID for host registration
      * @return 0 on success, error code on failure
      */
-    int init_chip_swimlane(int num_aicore, int aicpu_thread_num, int device_id, KernelArgsHelper &kernel_args);
+    int init_chip_swimlane(
+        int num_aicore, int aicpu_thread_num, int device_id, KernelArgsHelper &kernel_args,
+        const std::string &output_prefix, ChipSwimlaneLevel chip_swimlane_level
+    );
 
     /**
      * Initialize args dump shared memory and collector.
@@ -311,7 +314,10 @@ private:
      * @param device_id Device ID for host registration
      * @return 0 on success, error code on failure
      */
-    int init_args_dump(Runtime &runtime, int device_id, KernelArgsHelper &kernel_args);
+    int init_args_dump(
+        Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, const std::string &output_prefix,
+        DumpArgsLevel dump_args_level
+    );
 
     /**
      * Initialize PMU streaming shared memory.

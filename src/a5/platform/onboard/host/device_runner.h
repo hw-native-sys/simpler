@@ -253,7 +253,10 @@ private:
      * @param device_id Device ID
      * @return 0 on success, error code on failure
      */
-    int init_chip_swimlane(int num_aicore, int aicpu_thread_num, int device_id, KernelArgsHelper &kernel_args);
+    int init_chip_swimlane(
+        int num_aicore, int aicpu_thread_num, int device_id, KernelArgsHelper &kernel_args,
+        const std::string &output_prefix, ChipSwimlaneLevel chip_swimlane_level
+    );
 
     /**
      * Initialize args dump device buffers.
@@ -263,7 +266,10 @@ private:
      * @param device_id Device ID for allocations
      * @return 0 on success, error code on failure
      */
-    int init_args_dump(Runtime &runtime, int device_id, KernelArgsHelper &kernel_args);
+    int init_args_dump(
+        Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, const std::string &output_prefix,
+        DumpArgsLevel dump_args_level
+    );
 
     /**
      * Initialize PMU profiling device buffers.
