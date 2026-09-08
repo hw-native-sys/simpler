@@ -221,6 +221,90 @@ TEST(PipelineContract, ShippedArenaTopologiesAreServiceable) {
     EXPECT_TRUE(has_serviceable_arena_topology(tmr));
 }
 
+PipelineContract kernel_contract() {
+    PipelineContract c{PTO_PIPELINE_CONTRACT_ABI_VERSION, 6, 1, {}};
+    for (uint32_t kind = PTO_PIPELINE_GM_HEAP; kind <= PTO_PIPELINE_RUNTIME_IMAGE; ++kind) {
+        c.resources[kind - 1] = {kind, PTO_PIPELINE_DEVICE_SCRATCH, 4096};
+    }
+    c.resources[3] = {PTO_PIPELINE_TASK_ARGS, PTO_PIPELINE_HOST_PER_RUN, 0};
+    c.resources[4] = {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0};
+    c.resources[5] = {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0};
+    return c;
+}
+
+TEST(PipelineContract, KernelByteRulesAreModeSpecific) {
+    auto c = kernel_contract();
+    EXPECT_TRUE(is_valid_pipeline_contract(&c, SIMPLER_MODE_KERNEL));
+    EXPECT_TRUE(is_valid_tmr_kernel_pipeline_contract(&c));
+    EXPECT_FALSE(is_valid_pipeline_contract(&c));
+    EXPECT_FALSE(is_valid_pipeline_contract(&c, 99u));
+    EXPECT_FALSE(is_valid_pipeline_contract(&c, UINT32_MAX));
+    EXPECT_FALSE(is_valid_pipeline_contract(nullptr, SIMPLER_MODE_KERNEL));
+    for (uint32_t i = 0; i < c.resource_count; ++i) {
+        auto invalid = c;
+        invalid.resources[i].bytes_per_copy = i < 3 ? 0 : 1;
+        EXPECT_FALSE(is_valid_pipeline_contract(&invalid, SIMPLER_MODE_KERNEL)) << i;
+    }
+}
+
+TEST(PipelineContract, KernelRequiresExactlyItsSupportedResourceShape) {
+    const auto c = kernel_contract();
+    for (uint32_t i = 0; i < c.resource_count; ++i) {
+        auto missing = c;
+        missing.resources[i] = missing.resources[--missing.resource_count];
+        EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(&missing)) << i;
+        auto wrong_class = c;
+        wrong_class.resources[i].resource_class = (wrong_class.resources[i].resource_class + 1) % 3;
+        EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(&wrong_class)) << i;
+        auto duplicate = c;
+        duplicate.resources[i] = duplicate.resources[(i + 1) % c.resource_count];
+        EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(&duplicate)) << i;
+    }
+    auto invalid = c;
+    invalid.pipeline_depth = 2;
+    EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(&invalid));
+    invalid = c;
+    invalid.resource_count = PTO_PIPELINE_MAX_RESOURCES + 1;
+    EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(&invalid));
+    EXPECT_FALSE(has_serviceable_stream_topology(invalid));
+    EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(nullptr));
+}
+
+TEST(PipelineContract, StreamServiceabilityDoesNotChangeStructuralRules) {
+    auto c = accepted_contract();
+    EXPECT_TRUE(has_serviceable_stream_topology(c));
+    c.pipeline_depth = 2;
+    EXPECT_TRUE(has_serviceable_stream_topology(c));
+    c.resources[3].kind = PTO_PIPELINE_AICPU_STREAM;
+    EXPECT_TRUE(is_valid_pipeline_contract(&c));
+    EXPECT_TRUE(has_serviceable_arena_topology(c));
+    EXPECT_FALSE(has_serviceable_stream_topology(c));
+    c = accepted_contract();
+    c.resources[2].resource_class = PTO_PIPELINE_HOST_PER_RUN;
+    EXPECT_FALSE(has_serviceable_stream_topology(c));
+    c.resource_count = 0;
+    EXPECT_TRUE(is_valid_pipeline_contract(&c));
+    EXPECT_FALSE(has_serviceable_stream_topology(c));
+}
+
+TEST(PipelineContract, CommonKernelAdmissionDoesNotRequireTmrResourceSet) {
+    const PipelineContract c{
+        PTO_PIPELINE_CONTRACT_ABI_VERSION,
+        4,
+        1,
+        {
+            {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_HOST_PER_RUN, 4096},
+            {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_HOST_PER_RUN, 4096},
+            {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
+            {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
+        }
+    };
+    ASSERT_TRUE(is_valid_pipeline_contract(&c, SIMPLER_MODE_KERNEL));
+    EXPECT_TRUE(has_serviceable_arena_topology(c));
+    EXPECT_TRUE(has_serviceable_stream_topology(c));
+    EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(&c));
+}
+
 TEST(PipelineSlotPool, DepthOneKeepsLegacySingleSlotBehavior) {
     PipelineSlotPool pool(1);
     auto first = pool.try_acquire();
