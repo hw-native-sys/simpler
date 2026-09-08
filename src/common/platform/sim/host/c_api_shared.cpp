@@ -397,14 +397,18 @@ int simpler_init(
 
     int rc;
     try {
-        rc = runner->ensure_dma_workspace_provisioned();
+        rc = runner->attach_current_thread(device_id);
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     if (rc != 0) return rc;
 
+    // Provisioning follows the attach because the release path depends on it:
+    // finalize() returns early on a runner that never attached, and its
+    // dma_workspace_release() sits past that guard, so a block acquired before
+    // the attach would outlive the runner.
     try {
-        rc = runner->attach_current_thread(device_id);
+        rc = runner->ensure_dma_workspace_provisioned();
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }

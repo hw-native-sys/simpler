@@ -70,9 +70,11 @@ class TestSimProvisionsSdmaWorkspace:
         finally:
             worker.close()
 
-    def test_finalize_and_reinitialize_allocates_fresh_workspace(self):
-        # Reinitializing a finalized simulator runner must re-provision fresh
-        # workspace rather than retaining a dangling pointer from a previous run.
+    def test_two_sdma_workers_share_a_device_in_sequence(self):
+        # Each Worker owns its own runner, so the workspace is per-runner state:
+        # the second provisions a block of its own after the first released at
+        # close(). A process-level cache or a shared handle in
+        # dma_workspace_provision() would break that, and is what this pins.
         worker1 = _make_sim_worker(enable_sdma=True)
         try:
             worker1.init()

@@ -259,10 +259,6 @@ public:
      */
     void set_dma_workspace_request(bool enable_sdma) { sdma_requested_ = enable_sdma; }
     int ensure_dma_workspace_provisioned();
-    uint64_t dma_workspace_addr(int kind) const {
-        if (kind < 0 || kind >= DMA_WORKSPACE_KIND_COUNT) return 0;
-        return dma_workspace_addr_[kind];
-    }
     int device_id() const { return device_id_; }
     uint64_t last_device_wall_ns() const { return device_wall_ns_; }
     // Per-phase AICPU wall (ns) from the most recent run; RunWall aliases

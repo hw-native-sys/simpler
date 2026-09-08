@@ -281,8 +281,9 @@ extern "C" CommHandle comm_init(int rank, int nranks, void *stream, const char *
 extern "C" uint32_t dma_workspace_supported_mask(void) { return uint32_t{1} << DMA_WORKSPACE_SDMA; }
 
 extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_out, int count, void **handle_out) {
-    if (!addr_out || !handle_out || count < DMA_WORKSPACE_KIND_COUNT) return -1;
-    for (int i = 0; i < count; ++i) addr_out[i] = 0;
+    if (!addr_out || !handle_out || count < 0) return -1;
+    for (int i = 0; i < count; ++i)
+        addr_out[i] = 0;
     *handle_out = nullptr;
 
     constexpr uint32_t kSdmaBit = uint32_t{1} << DMA_WORKSPACE_SDMA;
@@ -292,7 +293,12 @@ extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_ou
     if ((required_mask & kSdmaBit) == 0) {
         return 0;
     }
+    if (count <= DMA_WORKSPACE_SDMA) return -1;
 
+    // The size a2a3 onboard provisions: there the 16 KB block *is* the descriptor
+    // table for 48 CP-process STARS streams (docs/comm-domain.md). Simulation
+    // drives no engine, so the block is inert scratch — matching the onboard
+    // budget only keeps a kernel sized against it in bounds on both backends.
     constexpr size_t kSimDmaWorkspaceBytes = 16 * 1024;
     void *workspace = std::malloc(kSimDmaWorkspaceBytes);
     if (workspace == nullptr) {
