@@ -8,6 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+#include <atomic>
 #include <cstdio>
 
 #include "common/unified_log.h"
@@ -22,6 +23,7 @@
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "aicpu/platform_aicpu_affinity.h"
+#include "aicpu/thread_scheduling.h"
 #include "aicpu/scope_stats_collector_aicpu.h"
 #include "aicpu/args_dump_aicpu.h"
 #include "runtime.h"
@@ -98,6 +100,16 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
             runtime->get_aicpu_allowed_cpus(), runtime->get_aicpu_allowed_cpu_count(), runtime->get_aicpu_launch_count()
         )) {
         return 0;
+    }
+
+    // CANN workers retain their policy across calls; continuous RT polling
+    // can exhaust the device's real-time CPU budget.
+    const int scheduling_error = use_normal_aicpu_scheduling();
+    if (scheduling_error != 0) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true, std::memory_order_relaxed)) {
+            LOG_WARN("AICPU normal scheduling unavailable: errno=%d; retaining current policy", scheduling_error);
+        }
     }
 
     // Publish the phase-buffer base so the finer preamble/so_load/graph_build/

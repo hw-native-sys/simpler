@@ -1603,6 +1603,20 @@ target_link_libraries(test_a2a3_aicpu_affinity_select PRIVATE
 add_test(NAME test_a2a3_aicpu_affinity_select COMMAND test_a2a3_aicpu_affinity_select)
 set_tests_properties(test_a2a3_aicpu_affinity_select PROPERTIES LABELS "no_hardware")
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(test_a2a3_thread_scheduling a2a3/test_thread_scheduling.cpp)
+    target_include_directories(test_a2a3_thread_scheduling PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    )
+    target_link_libraries(test_a2a3_thread_scheduling PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+    target_link_options(test_a2a3_thread_scheduling PRIVATE
+        -Wl,--wrap=sched_getscheduler -Wl,--wrap=sched_setscheduler
+    )
+    add_test(NAME test_a2a3_thread_scheduling COMMAND test_a2a3_thread_scheduling)
+    set_tests_properties(test_a2a3_thread_scheduling PROPERTIES LABELS "no_hardware")
+endif()
+
 # a5 CPU_TOPO fallback and affinity selection. Pure logic; packaged fallback
 # entries enforce their own verified SoC, host-architecture, and OCCUPY constraints.
 set(A5_ONBOARD_HOST_DIR ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/onboard/host)

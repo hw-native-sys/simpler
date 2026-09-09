@@ -169,6 +169,7 @@ nav:
           - Overview and code reference: troubleshooting/device-error-codes.md
           - Diagnostic guide index: troubleshooting/device-error-codes/README.md
       - Local timeout defaults: troubleshooting/local-timeout-defaults.md
+      - A2/A3 scheduling tails: troubleshooting/a2a3-scheduling-tails.md
       - a2a3 507899 AICPU shared-SO fault: troubleshooting/a2a3-507899-aicpu-shared-so-fault.md
       - Sim oversubscription hang: troubleshooting/sim-oversubscription-hang.md
       - macOS build: troubleshooting/macos-build.md

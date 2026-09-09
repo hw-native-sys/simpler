@@ -11,6 +11,7 @@ guide when the failure happens during build, test setup, or simulation.
 | [Device Error Codes](device-error-codes.md) | Runtime and CANN error classification, first-response triage, minimal reproductions, and links to focused diagnostic guides |
 | [Local Runtime Timeouts](local-timeout-defaults.md) | Local and CI timeout defaults, override variables, and the required ordering for onboard watchdogs |
 | [A2/A3 Worker Retirement](a2a3-worker-retirement.md) | Why EXITED is not permission to return, and the group-wide CLOSE / GM-release handoff |
+| [A2/A3 Scheduling Tails](a2a3-scheduling-tails.md) | Periodic real-time CPU throttling, normal AICPU thread scheduling, and worker-policy lifetime |
 | [a2a3 AICPU Shared-SO Device Fault](a2a3-507899-aicpu-shared-so-fault.md) | Diagnosing mass `507899`/`507018` cascades caused by an AICPU shared-library device fault |
 | [Sim CPU Oversubscription](sim-oversubscription-hang.md) | Simulation hangs and false timeouts when AICPU and AICore host threads are CPU-starved |
 
