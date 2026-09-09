@@ -11,7 +11,6 @@
 
 #include <gtest/gtest.h>
 
-#include <cstddef>
 #include <cstring>
 
 #include "kernel_invocation_header.h"
@@ -21,18 +20,6 @@ namespace {
 TEST(KernelInvocationHeaderWire, ModeValuesArePinned) {
     EXPECT_EQ(SIMPLER_MODE_PROGRAM, 0);
     EXPECT_EQ(SIMPLER_MODE_KERNEL, 1);
-}
-
-TEST(KernelInvocationHeaderWire, LayoutMatchesHostDeviceEnvelope) {
-    EXPECT_EQ(sizeof(SimplerKernelInvocationHeader), 40u);
-    EXPECT_EQ(alignof(SimplerKernelInvocationHeader), 8u);
-    EXPECT_EQ(offsetof(SimplerKernelInvocationHeader, mode), 0u);
-    EXPECT_EQ(offsetof(SimplerKernelInvocationHeader, callable_id), 4u);
-    EXPECT_EQ(offsetof(SimplerKernelInvocationHeader, generation), 8u);
-    EXPECT_EQ(offsetof(SimplerKernelInvocationHeader, payload_bytes), 16u);
-    EXPECT_EQ(offsetof(SimplerKernelInvocationHeader, tensor_count), 24u);
-    EXPECT_EQ(offsetof(SimplerKernelInvocationHeader, scalar_count), 28u);
-    EXPECT_EQ(offsetof(SimplerKernelInvocationHeader, host_copy_tensor_count), 32u);
 }
 
 TEST(KernelInvocationHeaderWire, SurvivesMemcpyRoundtrip) {

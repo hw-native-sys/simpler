@@ -8,12 +8,18 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+/**
+ * The one definition of a context's execution mode, shared by every layer
+ * that names it: the host-side identity latch on the platform runners, the
+ * invocation wire header, and the C ABI documentation. A context's mode is
+ * decided by which init entry runs first and never changes afterwards.
+ */
 
 #pragma once
 
 typedef enum SimplerExecutionMode {
-    /* Exclusive-device execution. */
+    /* Historical exclusive-device semantics, claimed by simpler_init. */
     SIMPLER_MODE_PROGRAM = 0,
-    /* Caller-stream execution on a borrowed device. */
+    /* Borrowed-device semantics, claimed by simpler_kernel_mode_init. */
     SIMPLER_MODE_KERNEL = 1,
 } SimplerExecutionMode;
