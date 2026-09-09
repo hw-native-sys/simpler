@@ -29,6 +29,20 @@ struct GraphScopeResult {
     // mean traversing the in-flight map under its mutex on a path whose whole
     // purpose is to not contend with the submitting thread.
     void *recording_handle{nullptr};
+    // The formal parameters the recorded body must read: the entry's own deep copy, not
+    // the caller's arguments, which are only lent for the duration of the submit call.
+    // Set exactly when `recording` is, and valid until graph_commit drains the entry --
+    // which is after every job that could read it has finished.
+    //
+    // Const because the boundary is written once, by the submitting thread in graph_begin,
+    // and only read after that -- by the recorder, and by later same-key submissions
+    // comparing against it. Nothing may write it once it is handed out here.
+    //
+    // The body must read these and not the caller's arguments even on the synchronous
+    // fallback path: recording resolves a task slot's origin against this object's slot
+    // array, so an origin from any other object falls outside it and the parameter is
+    // recorded as static.
+    const GraphTaskArgs *params{nullptr};
 };
 
 using GraphSubmitResult = GraphScopeResult;
@@ -66,13 +80,8 @@ constexpr uint64_t graph_const_hash_impl(const char *s, uint64_t h) {
 constexpr uint64_t GRAPH_KEY(const char *s) { return graph_const_hash_impl(s, 1469598103934665603ULL); }
 
 inline bool rt_graph_args_cacheable(const GraphTaskArgs &args) {
-    if (args.has_error || args.tensor_count() <= 0 || args.tensor_count() > GRAPH_MAX_TENSOR_ARGS) {
+    if (args.has_error() || args.tensor_count() <= 0 || args.tensor_count() > GRAPH_MAX_TENSOR_ARGS) {
         return false;
-    }
-    for (int32_t i = 0; i < args.tensor_count(); ++i) {
-        // A Graph boundary is caller-owned storage. Runtime-allocated
-        // TensorCreateInfo outputs remain on the ordinary submit path.
-        if (args.tag(i) == TensorArgType::OUTPUT) return false;
     }
     return true;
 }

@@ -491,11 +491,10 @@ struct TaskPayload {
                 result.materialize_output(dst[i]);
             }
         }
-        // Round up to cache line boundary. Every scalar region is a whole number of
-        // cache lines (ARG_POOL_ALIGN), so the rounded copy stays inside this
-        // task's own region. Eliminates branches; extra bytes within the same CL have
-        // zero additional cost.
-        memcpy(scalar_data(), args.scalars(), CHIP_ALIGN_UP(args.scalar_count() * sizeof(uint64_t), 64));
+        // A slot is a value, so this is one memcpy of scalar_count entries. The trailing
+        // padding of this task's cache-line-aligned region keeps whatever it held --
+        // nothing reads past the count.
+        args.pack_scalars(scalar_data());
 
         // The task table's payload storage is raw shared memory that no constructor
         // runs over, so an unset predicate reads back as whatever the slot last held —

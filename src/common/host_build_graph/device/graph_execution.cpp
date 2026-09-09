@@ -62,8 +62,7 @@ bool bind_graph_topology(GraphExecution &execution) {
     // range overflows the increment before any bound check can see it.
     if (definition.task_count <= 0 || definition.task_count > MAX_IN_GRAPH_TASKS) return false;
     // GRAPH_MAX_SCALAR_ARGS, not MAX_SCALAR_ARGS: this counts the scalars the
-    // Graph BOUNDARY carries, which the recorder sizes with
-    // GraphTaskArgs = Arg<GRAPH_MAX_TENSOR_ARGS, GRAPH_MAX_SCALAR_ARGS> and the
+    // Graph BOUNDARY carries, which the recorder sizes with GraphTaskArgs and the
     // outer Graph payload hands it to GraphExecution, never through an in-graph task
     // payload. MAX_SCALAR_ARGS is the per-AICore-task cap (16) and applies to
     // InGraphTaskDefinition::scalar_count below, which is checked separately; using
@@ -373,18 +372,19 @@ GraphMaterializeResult graph_execution_materialize_slice(
         definition.scalar_arg_count == 0 ?
             nullptr :
             graph_definition_array<uint64_t>(definition, definition.off_scalars, definition.scalar_arg_count);
-    const GraphScalarSourceRef *scalar_sources =
-        definition.scalar_arg_count == 0 ? nullptr :
-                                           graph_definition_array<GraphScalarSourceRef>(
-                                               definition, definition.off_scalar_sources, definition.scalar_arg_count
-                                           );
+    const GraphScalarInheritance *scalar_inheritance =
+        definition.scalar_arg_count == 0 ?
+            nullptr :
+            graph_definition_array<GraphScalarInheritance>(
+                definition, definition.off_scalar_inheritance, definition.scalar_arg_count
+            );
     const GraphPredicate *predicates =
         definition.predicate_count == 0 ?
             nullptr :
             graph_definition_array<GraphPredicate>(definition, definition.off_predicates, definition.predicate_count);
     if (tasks == nullptr || in_graph_task_offsets == nullptr ||
         (definition.tensor_arg_count != 0 && (definition_tensors == nullptr || tensor_sources == nullptr)) ||
-        (definition.scalar_arg_count != 0 && (definition_scalars == nullptr || scalar_sources == nullptr)) ||
+        (definition.scalar_arg_count != 0 && (definition_scalars == nullptr || scalar_inheritance == nullptr)) ||
         (definition.predicate_count != 0 && predicates == nullptr)) {
         execution.materialize_busy.store(0, std::memory_order_release);
         return GraphMaterializeResult::INVALID;
@@ -462,18 +462,15 @@ GraphMaterializeResult graph_execution_materialize_slice(
         uint64_t *task_scalars = payload.scalar_data();
         for (int32_t j = 0; j < source.scalar_count; ++j) {
             const int32_t scalar_index = source.scalar_offset + j;
-            const GraphScalarSourceRef &ref = scalar_sources[scalar_index];
-            if (ref.source_kind == static_cast<uint8_t>(GraphScalarSourceKind::STATIC_VALUE)) {
+            const GraphScalarInheritance &ref = scalar_inheritance[scalar_index];
+            if (!ref.inherited()) {
                 task_scalars[j] = definition_scalars[scalar_index];
-            } else if (ref.source_kind == static_cast<uint8_t>(GraphScalarSourceKind::BOUNDARY)) {
-                if (ref.source_index >= execution.boundary_scalar_count || execution.boundary_scalars == nullptr) {
+            } else {
+                if (ref.boundary_index() >= execution.boundary_scalar_count || execution.boundary_scalars == nullptr) {
                     execution.materialize_busy.store(0, std::memory_order_release);
                     return GraphMaterializeResult::INVALID;
                 }
-                task_scalars[j] = execution.boundary_scalars[ref.source_index];
-            } else {
-                execution.materialize_busy.store(0, std::memory_order_release);
-                return GraphMaterializeResult::INVALID;
+                task_scalars[j] = execution.boundary_scalars[ref.boundary_index()];
             }
         }
         reset_graph_payload(payload);

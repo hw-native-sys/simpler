@@ -88,10 +88,10 @@ make_test_definition(uint64_t graph_key, uint64_t boundary_address, uint32_t bou
     tensor_sources[1].source_kind = static_cast<uint8_t>(GraphTensorSourceKind::INTERNAL);
     tensor_sources[1].packed_offset = 16;
     std::vector<uint64_t> scalars{0, 18};
-    std::vector<GraphScalarSourceRef> scalar_sources(2);
-    scalar_sources[0].source_kind = static_cast<uint8_t>(GraphScalarSourceKind::BOUNDARY);
-    scalar_sources[0].source_index = boundary_scalar_count - 1;
-    scalar_sources[1].source_kind = static_cast<uint8_t>(GraphScalarSourceKind::STATIC_VALUE);
+    std::vector<GraphScalarInheritance> scalar_inheritance{
+        GraphScalarInheritance::from_boundary(boundary_scalar_count - 1),
+        GraphScalarInheritance::self_value(),
+    };
 
     GraphDefinition definition{};
     definition.full_key = graph_key;
@@ -113,7 +113,7 @@ make_test_definition(uint64_t graph_key, uint64_t boundary_address, uint32_t bou
     definition.off_tensors = append_section(image, tensors);
     definition.off_tensor_sources = append_section(image, tensor_sources);
     definition.off_scalars = append_section(image, scalars);
-    definition.off_scalar_sources = append_section(image, scalar_sources);
+    definition.off_scalar_inheritance = append_section(image, scalar_inheritance);
     size_t execution_storage_bytes = 0;
     graph_execution_storage_bytes(
         definition.task_count, definition.tensor_arg_count, definition.scalar_arg_count, &execution_storage_bytes
@@ -279,34 +279,179 @@ TEST(GraphCache, ConfigValuesSelectDifferentDefinitions) {
     EXPECT_EQ(rt_graph_make_key(GRAPH_ID, 0), rt_graph_make_key(GRAPH_ID, 0));
 }
 
-TEST(GraphScalarProvenance, ForwardedScalarRetainsBoundarySource) {
-    uint32_t value = 17;
-    CoreTaskArgs boundary_args;
-    boundary_args.add_scalar(value, value);
-    boundary_args.anchor_scalar_sources();
-    CoreTaskArgs forwarded_args;
-    forwarded_args.copy_scalars_from(boundary_args, 1, 1);
+// Arg's storage stays unreachable only while the base is private. Under a public base an
+// implicit derived-to-base conversion reaches the same subobject, whose members are
+// public there however Arg hides their names -- so tags_, tensors_ and scalars_ would be
+// readable raw, each without the array that qualifies it.
+static_assert(
+    !std::is_convertible_v<
+        const CoreTaskArgs *,
+        const TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, TensorArgType> *>,
+    "Arg must not be convertible to its storage base"
+);
+
+// The slot array is handed out as void*, so index it the way recording does.
+const void *slot_addr(const void *base, int32_t i) { return static_cast<const uint64_t *>(base) + i; }
+
+// A boundary parameter must name no origin of its own. That is what makes the boundary's
+// slot array the basis recording resolves against: scalar(i) then folds to
+// &scalars_[i], and subtracting the base yields i. Were a boundary parameter to name an
+// origin -- a caller local, or a scratch buffer used while deep-copying -- scalar(i)
+// would hand out that address instead, it would fall outside the slot array, and
+// graph_classify_scalars would record the parameter as static. Every dynamic parameter
+// would silently stop being refreshed on replay.
+TEST(GraphScalarProvenance, AStaticParameterIsItsOwnOrigin) {
+    GraphTaskArgs boundary_args;
+    uint64_t scratch = 18;
+    boundary_args.add_static_scalar(scratch);
     CoreTaskArgs task_args;
 
-    task_args.copy_scalars_from(forwarded_args, 0, 1);
+    task_args.add_scalar(boundary_args.scalar(0));
 
-    EXPECT_EQ(task_args.scalar_source(0), static_cast<const void *>(&std::as_const(boundary_args).scalar(1)));
+    EXPECT_EQ(task_args.scalar_origin(0), boundary_args.scalar_slot_base())
+        << "a task slot must name the boundary's own slot, not whatever the value came from";
+    EXPECT_NE(task_args.scalar_origin(0), &scratch);
 }
 
-TEST(GraphScalarProvenance, MutableAccessInvalidatesForwardedSource) {
-    CoreTaskArgs boundary_args;
-    boundary_args.add_scalar(uint32_t{17});
-    boundary_args.anchor_scalar_sources();
+TEST(GraphScalarProvenance, AnLvalueDeclaresADynamicParameter) {
+    GraphTaskArgs args;
+    uint32_t token_pos = 17;
+
+    // An lvalue is a parameter the caller holds and may change between invocations; a
+    // literal cannot be changed by anyone. Width does not enter into it -- the value is
+    // converted here, where its type is still known.
+    args.add_scalar(token_pos);
+    args.add_scalar(uint32_t{18});
+    args.add_static_scalar(token_pos);
+
+    EXPECT_TRUE(args.scalar_dynamic(0));
+    EXPECT_EQ(args.scalar_origin(0), &token_pos);
+    EXPECT_FALSE(args.scalar_dynamic(1));
+    EXPECT_EQ(args.scalar_origin(1), nullptr);
+    EXPECT_FALSE(args.scalar_dynamic(2)) << "add_static_scalar overrides value category";
+    EXPECT_EQ(args.scalar(2).to<uint32_t>(), 17u);
+}
+
+TEST(GraphScalarProvenance, ForwardedScalarRetainsBoundarySource) {
+    GraphTaskArgs boundary_args;
+    boundary_args.add_scalar(uint32_t{17}, uint32_t{18});
     CoreTaskArgs task_args;
-    task_args.copy_scalars_from(boundary_args, 0, 1);
-    ASSERT_NE(task_args.scalar_source(0), nullptr);
 
-    task_args.scalar(0) = 18;
+    task_args.add_scalar(boundary_args.scalar(1));
 
-    EXPECT_EQ(task_args.scalar_source(0), nullptr);
-    EXPECT_EQ(
-        task_args.invalidated_scalar_source(0), static_cast<const void *>(&std::as_const(boundary_args).scalar(0))
-    );
+    EXPECT_TRUE(task_args.scalar_dynamic(0));
+    EXPECT_EQ(task_args.scalar_origin(0), slot_addr(boundary_args.scalar_slot_base(), 1));
+    EXPECT_EQ(task_args.scalar(0).to<uint64_t>(), uint64_t{18});
+}
+
+TEST(GraphScalarProvenance, ForwardedScalarNamesOriginThroughAnIntermediary) {
+    GraphTaskArgs boundary_args;
+    boundary_args.add_scalar(uint32_t{17}, uint32_t{18});
+    CoreTaskArgs forwarded_args;
+    forwarded_args.add_scalar(boundary_args.scalar(1));
+    CoreTaskArgs task_args;
+
+    task_args.add_scalar(forwarded_args.scalar(0));
+
+    // A -> B -> C still records A: the handle names the origin, not the Arg it came through.
+    EXPECT_TRUE(task_args.scalar_dynamic(0));
+    EXPECT_EQ(task_args.scalar_origin(0), slot_addr(boundary_args.scalar_slot_base(), 1));
+}
+
+TEST(GraphScalarProvenance, FreezingAParameterDropsItsOrigin) {
+    GraphTaskArgs boundary_args;
+    boundary_args.add_scalar(uint32_t{17}, uint32_t{18});
+    CoreTaskArgs task_args;
+
+    // add_static_scalar resolves the handle to its value: this is how an enclosing Graph's
+    // parameter is deliberately frozen rather than followed.
+    task_args.add_static_scalar(boundary_args.scalar(1));
+
+    EXPECT_FALSE(task_args.scalar_dynamic(0));
+    EXPECT_EQ(task_args.scalar_origin(0), nullptr);
+    EXPECT_EQ(task_args.scalar(0).to<uint64_t>(), uint64_t{18});
+}
+
+TEST(GraphScalarProvenance, ValueScalarHoldsItsOwnValue) {
+    CoreTaskArgs task_args;
+    task_args.add_scalar(uint32_t{17}, 2.5F);
+
+    EXPECT_FALSE(task_args.scalar_dynamic(0));
+    EXPECT_FALSE(task_args.scalar_dynamic(1));
+    EXPECT_EQ(task_args.scalar(0).to<uint64_t>(), uint64_t{17});
+    EXPECT_EQ(task_args.scalar(1).to<float>(), 2.5F);
+}
+
+TEST(GraphScalarProvenance, ZeroInitialisedSlotsReadAsStaticZero) {
+    CoreTaskArgs task_args;
+    uint64_t packed[4] = {1, 2, 3, 4};
+
+    task_args.add_scalar(uint64_t{0});
+    task_args.pack_scalars(packed);
+
+    EXPECT_FALSE(task_args.scalar_dynamic(0));
+    EXPECT_EQ(packed[0], uint64_t{0});
+}
+
+TEST(GraphScalarProvenance, PackCopiesEveryValue) {
+    GraphTaskArgs boundary_args;
+    boundary_args.add_scalar(uint64_t{100}, uint64_t{200});
+    CoreTaskArgs task_args;
+    // A slot is always a value, whether or not it names an origin, so a mixed run copies
+    // out whole.
+    task_args.add_scalar(uint64_t{7});
+    task_args.add_scalar(boundary_args.scalar(1));
+    task_args.add_scalar(uint64_t{9});
+    uint64_t packed[3] = {0, 0, 0};
+
+    task_args.pack_scalars(packed);
+
+    EXPECT_EQ(packed[0], uint64_t{7});
+    EXPECT_EQ(packed[1], uint64_t{200});
+    EXPECT_EQ(packed[2], uint64_t{9});
+}
+
+TEST(GraphScalarProvenance, AValueOutlivesItsOrigin) {
+    CoreTaskArgs task_args;
+    {
+        uint64_t transient = 42;
+        task_args.add_scalar(transient);
+    }
+
+    // The origin now dangles, and that is by design: the value was copied at add_scalar
+    // time, and the address is only ever compared, never read through.
+    EXPECT_TRUE(task_args.scalar_dynamic(0));
+    EXPECT_EQ(task_args.scalar(0).to<uint64_t>(), uint64_t{42});
+}
+
+TEST(GraphScalarProvenance, TaskSlotsInheritFromEachOther) {
+    GraphTaskArgs boundary_args;
+    boundary_args.add_scalar(uint32_t{17}, uint32_t{18});
+    CoreTaskArgs a;
+    a.add_scalar(boundary_args.scalar(1));
+    CoreTaskArgs b;
+
+    // Any slot is an inheritance source, not just a boundary parameter.
+    b.add_scalar(a.scalar(0));
+
+    // scalar(i) folds: a[0] already names an origin, so b records that origin rather than
+    // a[0] itself. A chain is therefore one hop and recording resolves it without a walk.
+    EXPECT_TRUE(b.scalar_dynamic(0));
+    EXPECT_EQ(b.scalar_origin(0), slot_addr(boundary_args.scalar_slot_base(), 1));
+    EXPECT_EQ(b.scalar(0).to<uint64_t>(), uint64_t{18});
+}
+
+TEST(GraphScalarProvenance, InheritingAValueSlotNamesThatSlot) {
+    CoreTaskArgs a;
+    a.add_scalar(uint64_t{7});
+    CoreTaskArgs b;
+
+    b.add_scalar(a.scalar(0));
+
+    // a[0] names no origin, so it is itself the origin.
+    EXPECT_TRUE(b.scalar_dynamic(0));
+    EXPECT_EQ(b.scalar_origin(0), a.scalar_slot_base());
+    EXPECT_EQ(b.scalar(0).to<uint64_t>(), uint64_t{7});
 }
 
 TEST(GraphExecutionStorage, ComputesAlignedExactSize) {

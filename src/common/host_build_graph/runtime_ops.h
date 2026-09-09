@@ -86,7 +86,7 @@ struct RuntimeOps {
     // layout does not move with SIMPLER_DFX; nullptr when DFX is off.
     void (*record_orch_phase)(uint32_t kind, uint64_t start_ns, uint64_t end_ns, uint64_t detail);
     // Queue one Graph body for asynchronous recording, and drain every queued one.
-    // `job` is a `std::function<void(GraphTaskArgs &)> *` the pool moves out of --
+    // `job` is a `std::function<void(const GraphTaskArgs &)> *` the pool moves out of --
     // whether or not it queues it, since start() takes the callable before it checks
     // capacity -- so the caller must not invoke it afterwards. Nothing is owned across
     // the boundary either way: the caller's std::function destructs normally, empty or

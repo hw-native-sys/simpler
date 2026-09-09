@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import warnings
 from functools import cache
 from pathlib import Path
 from typing import Optional, Union
@@ -363,9 +364,24 @@ class KernelCompiler:
         }
 
     def _run_subprocess(
-        self, cmd: list[str], label: str, error_hint: str = "Compiler not found"
+        self,
+        cmd: list[str],
+        label: str,
+        error_hint: str = "Compiler not found",
+        surface_diagnostics: bool = False,
     ) -> subprocess.CompletedProcess:
-        """Run a subprocess command with standardized logging and error handling."""
+        """Run a subprocess command with standardized logging and error handling.
+
+        surface_diagnostics reports a successful compile's stderr as a warning. It goes
+        through `warnings` rather than `logger`: pytest shows its warnings summary with no
+        flag at all, while logger output below ERROR is swallowed unless the run passes
+        --log-cli-level, and child pytest processes do not inherit that option (conftest's
+        _resource_child_command forwards only --manual). A diagnostic nobody sees by
+        default is a diagnostic that does not exist.
+
+        It is opt-in per call site rather than global because the kernel toolchains carry
+        pre-existing warnings that would bury the ones a caller turned this on to see.
+        """
         logger.debug(f"[{label}] Command: {' '.join(cmd)}")
         try:
             result = subprocess.run(cmd, check=False, capture_output=True, text=True, cwd=self.project_root)
@@ -374,6 +390,8 @@ class KernelCompiler:
                 logger.debug(f"[{label}] stdout:\n{result.stdout}")
             if result.stderr and logger.isEnabledFor(10):
                 logger.debug(f"[{label}] stderr:\n{result.stderr}")
+            if result.stderr and result.returncode == 0 and surface_diagnostics:
+                warnings.warn(f"[{label}] compiler diagnostics:\n{result.stderr}", stacklevel=2)
 
             if result.returncode != 0:
                 logger.error(f"[{label}] Compilation failed: {result.stderr}")
@@ -391,6 +409,7 @@ class KernelCompiler:
         label: str,
         error_hint: str = "Compiler not found",
         delete_output: bool = True,
+        surface_diagnostics: bool = False,
     ) -> bytes:
         """Run compilation command, read output file, clean up, return bytes.
 
@@ -399,6 +418,8 @@ class KernelCompiler:
             output_path: Path to expected output file
             label: Label for log messages
             error_hint: Message for FileNotFoundError
+            surface_diagnostics: Report a successful compile's stderr as a warning
+                (see _run_subprocess)
 
         Returns:
             Binary contents of the compiled output file
@@ -406,16 +427,20 @@ class KernelCompiler:
         Raises:
             RuntimeError: If compilation fails or output file not found
         """
-        self._run_subprocess(cmd, label, error_hint)
+        # The cleanup is a finally because _run_subprocess reports diagnostics through
+        # warnings.warn, which raises under an error-level warning filter -- a compile
+        # that produced its output would otherwise leave the file behind.
+        try:
+            self._run_subprocess(cmd, label, error_hint, surface_diagnostics=surface_diagnostics)
 
-        if not os.path.isfile(output_path):
-            raise RuntimeError(f"Compilation succeeded but output file not found: {output_path}")
+            if not os.path.isfile(output_path):
+                raise RuntimeError(f"Compilation succeeded but output file not found: {output_path}")
 
-        with open(output_path, "rb") as f:
-            binary_data = f.read()
-
-        if delete_output:
-            os.remove(output_path)
+            with open(output_path, "rb") as f:
+                binary_data = f.read()
+        finally:
+            if delete_output and os.path.isfile(output_path):
+                os.remove(output_path)
         logger.info(f"[{label}] Compilation {output_path} successful: {len(binary_data)} bytes")
         return binary_data
 

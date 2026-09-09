@@ -111,7 +111,7 @@ static void process_qtile_scope(const CoreTaskArgs &ctx) {
     uint64_t scale_value = ctx.scalar(7);
     uint64_t bn_this_batch = ctx.scalar(8);
     uint64_t cur_seq = ctx.scalar(9);
-    DataType data_type = static_cast<DataType>(ctx.scalar(10));
+    DataType data_type = ctx.scalar(10).to<DataType>();
 
     CYCLE_COUNT_START();
 

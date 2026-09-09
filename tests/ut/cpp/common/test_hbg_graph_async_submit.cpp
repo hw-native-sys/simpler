@@ -36,6 +36,14 @@ RuntimeContext *g_bound_runtime = nullptr;
 extern "C" RuntimeContext *framework_current_runtime(void) { return g_bound_runtime; }
 extern "C" void framework_bind_runtime(RuntimeContext *rt) { g_bound_runtime = rt; }
 
+// One recording's formal parameters and the tensor storage its TensorRefs point at.
+// The two travel together because gen_scalar_params_from_args resolves against storage
+// this object owns, the way an entry's GraphBoundary does.
+struct FakeBoundary {
+    std::array<simpler::hbg::Tensor, GRAPH_MAX_TENSOR_ARGS> tensors{};
+    GraphTaskArgs params;
+};
+
 struct FakeRuntime {
     const RuntimeOps *ops;
     ScopeMode pending_scope_mode{ScopeMode::AUTO};
@@ -68,8 +76,8 @@ struct FakeRuntime {
     std::thread::id prepare_thread;
     std::thread::id submit_thread;
 
-    // What graph_prepare actually received, so the deep copy GraphOwnedArgs makes
-    // can be compared against the boundary the caller passed.
+    // What graph_prepare actually received, so the parameter list the body resolves
+    // against can be compared against the boundary the caller passed.
     bool prepare_saw_args{false};
     const void *prepare_handle{nullptr};
     int32_t recorded_tensor_count{-1};
@@ -81,6 +89,15 @@ struct FakeRuntime {
     TensorArgType recorded_tag{};
     const void *recorded_args_object{nullptr};
     const void *recorded_tensor_storage{nullptr};
+
+    // Stands in for the in-flight entry's own copy of the formal parameters: the real
+    // graph_begin builds one per entry and hands it out through GraphScopeResult, and the
+    // recorded body reads that rather than the caller's arguments. One per recording, so
+    // a queued body still reads what its own begin built after a later begin has run.
+    // The storage is owned by the test, not by this struct, which is what keeps
+    // FakeRuntime standard-layout so the offsetof guards below stay well-defined.
+    FakeBoundary *boundaries{nullptr};
+    int32_t boundary_capacity{0};
 };
 
 static_assert(offsetof(FakeRuntime, ops) == 0);
@@ -90,15 +107,40 @@ FakeRuntime *as_fake(RuntimeContext *rt) { return reinterpret_cast<FakeRuntime *
 
 bool fake_is_fatal(RuntimeContext *rt) { return as_fake(rt)->fatal.load(std::memory_order_acquire); }
 
-GraphScopeResult fake_graph_begin(RuntimeContext *rt, uint64_t, const GraphTaskArgs &) {
+GraphScopeResult fake_graph_begin(RuntimeContext *rt, uint64_t, const GraphTaskArgs &args) {
     FakeRuntime &fake = *as_fake(rt);
     std::lock_guard<std::mutex> lock(fake.mutex);
     fake.begin_calls++;
     GraphScopeResult result;
     result.execute_block = false;
     result.recording = fake.record_every_begin || fake.begin_calls == 1;
-    // The handle the recording thread must hand back to graph_prepare.
-    if (result.recording) result.recording_handle = &fake;
+    if (result.recording) {
+        // Each recording resolves against its own list, so a body queued by an earlier
+        // begin is unaffected by a later one -- as with an entry's own GraphBoundary.
+        // A non-void return rules out ASSERT_, and EXPECT_ would record the failure and
+        // then index past the array anyway, so a test owning too few boundaries reports
+        // no recording instead.
+        if (fake.begin_calls > fake.boundary_capacity) {
+            ADD_FAILURE() << "test must own one boundary per recording";
+            result.recording = false;
+            return result;
+        }
+        FakeBoundary &boundary = fake.boundaries[fake.begin_calls - 1];
+        // Deep-copy the parameters the way graph_begin does: tensors first, so the
+        // TensorRefs that follow point at storage this object owns, then resolved values.
+        boundary.params.reset();
+        for (int32_t i = 0; i < args.tensor_count(); ++i) {
+            boundary.tensors[static_cast<size_t>(i)] = args.tensor(i).ref();
+        }
+        for (int32_t i = 0; i < args.tensor_count(); ++i) {
+            boundary.params.add_input(boundary.tensors[static_cast<size_t>(i)]);
+        }
+        boundary.params.gen_scalar_params_from_args(args);
+        // The handle the recording thread must hand back to graph_prepare, and the
+        // parameters the recorded body reads.
+        result.recording_handle = &fake;
+        result.params = &boundary.params;
+    }
     if (!result.recording) {
         fake.later_submit_entered = true;
         fake.cv.notify_all();
@@ -125,7 +167,7 @@ bool fake_graph_prepare(RuntimeContext *rt, void *recording_handle, const GraphT
         fake.recorded_tensor_storage = &tensor;
     }
     if (args.scalar_count() > 0) {
-        fake.recorded_scalar = args.scalar(0);
+        fake.recorded_scalar = args.scalar(0).to<uint64_t>();
     }
     if (fake.gate_four_prepares) {
         fake.cv.notify_all();
@@ -182,7 +224,7 @@ GraphAsyncRecordingState &test_pool() {
 }
 
 bool fake_graph_record_start(RuntimeContext *, const GraphTaskArgs &args, void *job) {
-    auto *record = static_cast<std::function<void(GraphTaskArgs &)> *>(job);
+    auto *record = static_cast<std::function<void(const GraphTaskArgs &)> *>(job);
     return test_pool().start(args, std::move(*record));
 }
 
@@ -217,7 +259,7 @@ TEST(HbgGraphAsyncSubmit, PrewarmedRecorderPoolGrowsPastThePrewarmedCount) {
     GraphTaskArgs empty_args;
 
     for (int i = 0; i < kGraphCount; ++i) {
-        ASSERT_TRUE(pool.start(empty_args, [&](GraphTaskArgs &) {
+        ASSERT_TRUE(pool.start(empty_args, [&](const GraphTaskArgs &) {
             std::unique_lock<std::mutex> lock(gate_mutex);
             worker_ids.insert(std::this_thread::get_id());
             entered++;
@@ -245,8 +287,11 @@ TEST(HbgGraphAsyncSubmit, PrewarmedRecorderPoolGrowsPastThePrewarmedCount) {
 }
 
 TEST(HbgGraphAsyncSubmit, FourDistinctGraphMissesDoNotInsertAnIntermediateCommit) {
+    std::array<FakeBoundary, 4> boundaries;
     FakeRuntime fake{};
     fake.ops = &kFakeOps;
+    fake.boundaries = boundaries.data();
+    fake.boundary_capacity = static_cast<int32_t>(boundaries.size());
     fake.record_every_begin = true;
     fake.gate_four_prepares = true;
     framework_bind_runtime(reinterpret_cast<RuntimeContext *>(&fake));
@@ -278,8 +323,11 @@ TEST(HbgGraphAsyncSubmit, FourDistinctGraphMissesDoNotInsertAnIntermediateCommit
 }
 
 TEST(HbgGraphAsyncSubmit, WorkerRecordsWhileMainSubmitsLaterGraphs) {
+    std::array<FakeBoundary, 4> boundaries;
     FakeRuntime fake{};
     fake.ops = &kFakeOps;
+    fake.boundaries = boundaries.data();
+    fake.boundary_capacity = static_cast<int32_t>(boundaries.size());
     framework_bind_runtime(reinterpret_cast<RuntimeContext *>(&fake));
 
     uint32_t storage[4]{};
@@ -370,8 +418,11 @@ TEST(HbgGraphAsyncSubmit, WorkerRecordsWhileMainSubmitsLaterGraphs) {
 // pins both halves of its contract — the values survive, and the storage they
 // live in is not the caller's.
 TEST(HbgGraphAsyncSubmit, RecordingReadsAnOwnedCopyOfTheBoundary) {
+    std::array<FakeBoundary, 4> boundaries;
     FakeRuntime fake{};
     fake.ops = &kFakeOps;
+    fake.boundaries = boundaries.data();
+    fake.boundary_capacity = static_cast<int32_t>(boundaries.size());
     framework_bind_runtime(reinterpret_cast<RuntimeContext *>(&fake));
 
     uint32_t storage[8]{};
@@ -427,8 +478,11 @@ TEST(HbgGraphAsyncSubmit, RecordingReadsAnOwnedCopyOfTheBoundary) {
 // directly: both live in the wrapper, which is why this case is here and not with the
 // orchestrator's own graph tests.
 TEST(HbgGraphAsyncSubmit, AFatalInsideARecordedBodyReachesGraphEndAndAbortsNothing) {
+    std::array<FakeBoundary, 4> boundaries;
     FakeRuntime fake{};
     fake.ops = &kFakeOps;
+    fake.boundaries = boundaries.data();
+    fake.boundary_capacity = static_cast<int32_t>(boundaries.size());
     framework_bind_runtime(reinterpret_cast<RuntimeContext *>(&fake));
 
     uint32_t storage[4]{};

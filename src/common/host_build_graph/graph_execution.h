@@ -93,15 +93,41 @@ struct GraphTensorSourceRef {
     uint64_t packed_offset;
 };
 
-enum class GraphScalarSourceKind : uint8_t {
-    STATIC_VALUE = 0,
-    BOUNDARY = 1,
-};
+// Where one in-graph task scalar slot takes its value from: the Definition's own
+// scalars[] entry, or the boundary parameter named by boundary_index(). It is the wire
+// form of the two things recording knows about a slot -- whether it inherits, and which
+// parameter it inherits -- so inherited() is the same predicate as Arg::scalar_inherited.
+//
+// Only a parameter of the replaying Graph's boundary can be refreshed; the index reaches
+// that boundary and nothing else, and means nothing while inherited() is false. The
+// fields are private so the pair can only be set together, through a factory that decides
+// both: an entry carrying an index while claiming not to inherit, or the reverse, cannot
+// be spelled. What the index means is still a claim about a boundary this entry cannot
+// see, so the readers bound it against the boundary they do have.
+class GraphScalarInheritance {
+public:
+    // The image's scalar section is allocated as an array, so a default-constructible
+    // slot is required; the factories below are what a caller fills one with.
+    GraphScalarInheritance() = default;
 
-struct GraphScalarSourceRef {
-    uint16_t source_index;
-    uint8_t source_kind;
-    uint8_t reserved;
+    static GraphScalarInheritance self_value() { return {0, false}; }
+    static GraphScalarInheritance from_boundary(uint16_t index) { return {index, true}; }
+
+    bool inherited() const { return inherited_ != 0; }
+    uint16_t boundary_index() const { return boundary_index_; }
+
+private:
+    GraphScalarInheritance(uint16_t index, bool inherits) :
+        boundary_index_(index),
+        inherited_(inherits ? 1 : 0) {}
+
+    // One access level for every field, which is what keeps this standard-layout and so
+    // safe to memcpy to the device. inherited_ is a uint16_t rather than a bool so the
+    // two fields fill the size alignof(uint16_t) rounds this type up to: there is no
+    // padding byte, and so no indeterminate byte in the image's scalar section, which the
+    // static_assert below pins the size of because that is what the section indexes by.
+    uint16_t boundary_index_;
+    uint16_t inherited_;
 };
 
 // Wire representation of an in-graph task's dispatch predicate. The operand's absolute GM
@@ -228,7 +254,7 @@ struct GraphDefinition {
     uint32_t off_tensors;
     uint32_t off_tensor_sources;
     uint32_t off_scalars;
-    uint32_t off_scalar_sources;
+    uint32_t off_scalar_inheritance;
     uint32_t off_boundary_signatures;
     uint32_t off_predicates;
 };
@@ -237,8 +263,9 @@ static_assert(std::is_trivially_copyable_v<GraphTensorSourceRef>);
 static_assert(std::is_standard_layout_v<GraphTensorSourceRef>);
 static_assert(std::is_trivially_copyable_v<GraphTensor>);
 static_assert(std::is_standard_layout_v<GraphTensor>);
-static_assert(std::is_trivially_copyable_v<GraphScalarSourceRef>);
-static_assert(std::is_standard_layout_v<GraphScalarSourceRef>);
+static_assert(std::is_trivially_copyable_v<GraphScalarInheritance>);
+static_assert(std::is_standard_layout_v<GraphScalarInheritance>);
+static_assert(sizeof(GraphScalarInheritance) == 4, "the image's scalar section assumes this layout");
 static_assert(std::is_trivially_copyable_v<InGraphTaskDefinition>);
 static_assert(std::is_standard_layout_v<InGraphTaskDefinition>);
 // graph_fill_definition assigns this struct field by field, so its interior padding
@@ -262,7 +289,7 @@ static_assert(std::is_standard_layout_v<GraphDefinition>);
 static_assert(
     alignof(InGraphTaskDefinition) <= alignof(std::max_align_t) && alignof(GraphTensor) <= alignof(std::max_align_t) &&
         alignof(GraphTensorSourceRef) <= alignof(std::max_align_t) &&
-        alignof(GraphScalarSourceRef) <= alignof(std::max_align_t) &&
+        alignof(GraphScalarInheritance) <= alignof(std::max_align_t) &&
         alignof(GraphBoundarySignature) <= alignof(std::max_align_t) &&
         alignof(GraphPredicate) <= alignof(std::max_align_t),
     "a Definition section type must not be over-aligned: its storage is a byte vector"
