@@ -1,6 +1,8 @@
+INHERIT: .site-theme/docs-theme/base.yml
+
 site_name: simpler
 site_description: "Simple Runtime — make writing runtime simpler"
-site_url: https://hw-native-sys.github.io/simpler/
+site_url: https://www.pypto.ai/simpler/
 repo_url: https://github.com/hw-native-sys/simpler
 repo_name: hw-native-sys/simpler
 edit_uri: edit/main/docs/
@@ -10,22 +12,27 @@ docs_dir: docs
 exclude_docs: |
   _hooks/
   requirements.txt
+  theme-revision.txt
 
 theme:
-  name: material
+  custom_dir: .site-theme/docs-theme/overrides
+  language: en
   features:
     - navigation.instant
     - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - navigation.indexes
     - navigation.top
+    - navigation.footer
+    - content.action.edit
     - content.code.copy
     - search.suggest
-  palette:
-    - media: "(prefers-color-scheme: light)"
-      scheme: default
-      toggle: { icon: material/weather-night, name: Switch to dark mode }
-    - media: "(prefers-color-scheme: dark)"
-      scheme: slate
-      toggle: { icon: material/weather-sunny, name: Switch to light mode }
+    - search.highlight
+    - toc.follow
+
+extra:
+  pypto_project: simpler
 
 # A page absent from nav builds fine by default and only shows up as an INFO
 # line, so it silently disappears from the site's navigation. Promote it to a

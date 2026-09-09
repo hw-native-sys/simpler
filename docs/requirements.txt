@@ -3,6 +3,8 @@
 # the C++ runtime, which the docs build does not need. mkdocstrings reads
 # `python/simpler` through griffe, which parses the source statically — nothing
 # is imported, so no CANN toolkit and no built extension are required.
+-c ../.site-theme/docs-theme/constraints.txt
+
 mkdocs>=1.6
 mkdocs-material>=9.5
 mkdocstrings[python]>=0.26

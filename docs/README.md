@@ -5,7 +5,7 @@ The top-level [README](../README.md) links only the handful of entry-point docs;
 this page is the complete map.
 
 These pages are also published as a searchable site at
-<https://hw-native-sys.github.io/simpler/>, which adds a generated API reference
+<https://www.pypto.ai/simpler/>, which adds a generated API reference
 for `simpler.worker`, `simpler.task_interface` and `simpler.orchestrator`. The
 site is built by `.github/workflows/docs.yml`; `mkdocs.yml` owns its navigation,
 so a new page needs a `nav` entry there as well as a row here.

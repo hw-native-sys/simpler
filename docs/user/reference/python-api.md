@@ -4,7 +4,7 @@ The surface you write against, hand-maintained: what `**config` keys `Worker`
 accepts, `CallConfig` defaults, and the argument-order footguns a generator
 cannot state. For the complete generated listing of every public symbol and
 signature, see the API pages on the
-[documentation site](https://hw-native-sys.github.io/simpler/user/reference/api/worker/).
+[documentation site](https://www.pypto.ai/simpler/user/reference/api/worker/).
 Treat the source as authoritative when the two disagree, and fix this page in the
 same change.
 

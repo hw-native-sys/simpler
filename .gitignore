@@ -49,3 +49,4 @@ profiling_logs_*/
 # mkdocs build output
 _site/
 site/
+.site-theme/
