@@ -123,7 +123,7 @@ def test_execution_mode_headers_are_self_contained(language: str, standard: str,
     assert result.returncode == 0, result.stderr
 
 
-def test_pipeline_contract_has_no_invocation_header_dependency():
+def test_pipeline_contract_has_no_kernel_lifecycle_or_invocation_dependency():
     compiler = shutil.which("c++")
     assert compiler is not None, "Header dependency test requires c++"
     command = [compiler, "-x", "c++", "-std=c++17"]
@@ -135,4 +135,5 @@ def test_pipeline_contract_has_no_invocation_header_dependency():
     dependencies = subprocess.run(command + ["-M", "-"], input=source, capture_output=True, text=True, check=False)
     assert dependencies.returncode == 0, dependencies.stderr
     assert "execution_mode.h" in dependencies.stdout
-    assert "kernel_invocation_header.h" not in dependencies.stdout
+    for header in ("kernel_invocation_header.h", "kernel_execution_state.h", "execution_mode_latch.h"):
+        assert header not in dependencies.stdout
