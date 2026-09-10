@@ -378,6 +378,14 @@ void destroy_device_context(DeviceContextHandle ctx) {
         LOG_ERROR("destroy_device_context: refusing to destroy a context with an unfinalized native run");
         return;
     }
+    // An unclosed kernel context still owns stream and event handles a
+    // captured ACLGraph may reference. Destroying it would free them under the
+    // graph, so the context is deliberately leaked instead: the caller closes
+    // it explicitly, or the process ends.
+    if (runner != nullptr && runner->kernel_execution_state().has_live_resources()) {
+        LOG_ERROR("destroy_device_context: refusing to destroy an unclosed kernel context; leaving it alive");
+        return;
+    }
     delete runner;
 }
 
@@ -427,7 +435,8 @@ int finalize_device(DeviceContextHandle ctx) {
             LOG_ERROR("finalize_device: native run must be finalized first");
             return PTO_RUNTIME_ERR_INTERNAL;
         }
-        return runner->finalize();
+        const int rc = runner->finalize();
+        return rc;
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -535,6 +544,68 @@ int simpler_init(
  * Per-callable_id preparation
  * =========================================================================== */
 
+/**
+ * Upload and record one callable on `runner`, leaving the AICPU-side
+ * registration launch to the caller: program mode brings the device up lazily
+ * and launches on the runner's own AICPU stream, kernel mode is already up and
+ * launches on the kernel context's. `needs_aicpu_register` reports whether
+ * that launch is owed — hbg resolves its orchestration host-side and owes
+ * none.
+ */
+static int record_callable_on_runner(
+    DeviceRunnerBase *runner, int32_t callable_id, const void *callable, bool *needs_aicpu_register
+) {
+    *needs_aicpu_register = false;
+    CallableArtifacts artifacts;
+    auto chip_buffer_guard = RAIIScopeGuard([runner, &artifacts]() {
+        if (artifacts.chip_buffer_hash != 0) {
+            runner->release_chip_callable_buffer(artifacts.chip_buffer_hash);
+        }
+    });
+    const HostApi host_api(runner, 0, 0, &g_host_api_ops);
+    int rc = register_callable_impl(reinterpret_cast<const ChipCallable *>(callable), &host_api, &artifacts);
+    if (rc != 0) return rc;
+
+    auto host_dlopen_guard = RAIIScopeGuard([&artifacts]() {
+        if (artifacts.host_dlopen_handle != nullptr) {
+            dlclose(artifacts.host_dlopen_handle);
+        }
+    });
+
+    // Re-pack ChildKernelAddr -> std::pair to match the existing
+    // record_device_orch_callable* signature. The named struct only crosses
+    // the runtime-maker / device-runner interface; CallableState stores the
+    // historical pair shape.
+    std::vector<std::pair<int, uint64_t>> kernel_addrs;
+    kernel_addrs.reserve(artifacts.kernel_addrs.size());
+    for (const ChildKernelAddr &c : artifacts.kernel_addrs) {
+        kernel_addrs.emplace_back(c.func_id, c.device_addr);
+    }
+
+    // hbg's register_callable_impl populates host_dlopen_handle; trb's leaves
+    // it null and fills orch_so_data + func_name/config_name.
+    if (artifacts.host_dlopen_handle != nullptr) {
+        rc = runner->record_host_orch_callable(
+            callable_id, artifacts.chip_buffer_hash, artifacts.aicore_image_hash, artifacts.host_dlopen_handle,
+            artifacts.host_orch_func_ptr, std::move(kernel_addrs), std::move(artifacts.signature)
+        );
+        if (rc != 0) return rc;
+        host_dlopen_guard.dismiss();
+        chip_buffer_guard.dismiss();
+        return 0;
+    }
+
+    rc = runner->record_device_orch_callable(
+        callable_id, artifacts.chip_buffer_hash, artifacts.aicore_image_hash, artifacts.chip_buffer_dev,
+        artifacts.orch_so_data, artifacts.orch_so_size, artifacts.func_name.c_str(), artifacts.config_name.c_str(),
+        std::move(kernel_addrs), std::move(artifacts.signature)
+    );
+    if (rc != 0) return rc;
+    chip_buffer_guard.dismiss();
+    *needs_aicpu_register = true;
+    return 0;
+}
+
 int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, const void *callable) {
     if (ctx == NULL || callable == NULL) return PTO_RUNTIME_ERR_INTERNAL;
     DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
@@ -547,54 +618,9 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
         int rc = runner->attach_current_thread(runner->device_id());
         if (rc != 0) return rc;
 
-        CallableArtifacts artifacts;
-        auto chip_buffer_guard = RAIIScopeGuard([runner, &artifacts]() {
-            if (artifacts.chip_buffer_hash != 0) {
-                runner->release_chip_callable_buffer(artifacts.chip_buffer_hash);
-            }
-        });
-        const HostApi host_api(runner, 0, 0, &g_host_api_ops);
-        rc = register_callable_impl(reinterpret_cast<const ChipCallable *>(callable), &host_api, &artifacts);
-        if (rc != 0) {
-            return rc;
-        }
-        auto host_dlopen_guard = RAIIScopeGuard([&artifacts]() {
-            if (artifacts.host_dlopen_handle != nullptr) {
-                dlclose(artifacts.host_dlopen_handle);
-            }
-        });
-
-        // Re-pack ChildKernelAddr -> std::pair to match the existing
-        // record_device_orch_callable* signature. The named struct only crosses
-        // the runtime-maker / device-runner interface; CallableState
-        // stores the historical pair shape.
-        std::vector<std::pair<int, uint64_t>> kernel_addrs;
-        kernel_addrs.reserve(artifacts.kernel_addrs.size());
-        for (const ChildKernelAddr &c : artifacts.kernel_addrs) {
-            kernel_addrs.emplace_back(c.func_id, c.device_addr);
-        }
-
-        // hbg's register_callable_impl populates host_dlopen_handle; trb's
-        // leaves it null and fills orch_so_data + func_name/config_name.
         bool needs_aicpu_register = false;
-        if (artifacts.host_dlopen_handle != nullptr) {
-            rc = runner->record_host_orch_callable(
-                callable_id, artifacts.chip_buffer_hash, artifacts.aicore_image_hash, artifacts.host_dlopen_handle,
-                artifacts.host_orch_func_ptr, std::move(kernel_addrs), std::move(artifacts.signature)
-            );
-            if (rc != 0) return rc;
-            host_dlopen_guard.dismiss();
-            chip_buffer_guard.dismiss();
-        } else {
-            rc = runner->record_device_orch_callable(
-                callable_id, artifacts.chip_buffer_hash, artifacts.aicore_image_hash, artifacts.chip_buffer_dev,
-                artifacts.orch_so_data, artifacts.orch_so_size, artifacts.func_name.c_str(),
-                artifacts.config_name.c_str(), std::move(kernel_addrs), std::move(artifacts.signature)
-            );
-            if (rc != 0) return rc;
-            chip_buffer_guard.dismiss();
-            needs_aicpu_register = true;
-        }
+        rc = record_callable_on_runner(runner, callable_id, callable, &needs_aicpu_register);
+        if (rc != 0) return rc;
         if (needs_aicpu_register) {
             rc = runner->launch_device_register(callable_id);
             if (rc != 0) {
@@ -1219,12 +1245,10 @@ int device_memory_info_ctx(DeviceContextHandle ctx, DeviceMemoryInfo *info) {
 /* ===========================================================================
  * Kernel-mode lifecycle
  *
- * This backend reports kernel mode unsupported: supported() is 0 and init
- * refuses after the shared structural validation, so no context here ever
- * latches kernel mode and prepare/launch reject with INVALID_STATE.
- * Argument validation is shared with every other component through
- * kernel_entry_validation.h, so an argument this stub accepts is one a real
- * implementation accepts.
+ * Init and prepare create context-owned resources on a borrowed device.
+ * Launch remains a rejecting stub, so supported() reports 0. Structural
+ * argument validation is shared with the simulated components through
+ * kernel_entry_validation.h.
  * =========================================================================== */
 
 int simpler_kernel_mode_supported(DeviceContextHandle) { return 0; }
@@ -1234,7 +1258,7 @@ int simpler_kernel_mode_init(
     const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,
     const CallConfig *config, uint64_t context_generation
 ) {
-    const int rc = validate_kernel_init_args(
+    int rc = validate_kernel_init_args(
         ctx, device_id, aicpu_binary, aicpu_size, aicore_binary, aicore_size, dispatcher_binary, dispatcher_size,
         config, context_generation
     );
@@ -1250,17 +1274,82 @@ int simpler_kernel_mode_init(
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    LOG_ERROR("simpler_kernel_mode_init: kernel mode is not supported by this host runtime");
-    return PTO_RUNTIME_ERR_UNSUPPORTED;
+
+    DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
+    // A same-mode latch is idempotent, but initialization is not. Reject
+    // reuse before replacing executors. The adopted device identity also
+    // catches init failures whose resource rollback
+    // returned the kernel execution state to New.
+    if (runner->device_id() >= 0 || runner->kernel_execution_state().phase() != KernelContextPhase::New) {
+        LOG_ERROR("simpler_kernel_mode_init: this context has already been initialized or requires close");
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    rc = runner->execution_mode_latch().latch(SIMPLER_MODE_KERNEL);
+    if (rc != 0) {
+        LOG_ERROR("simpler_kernel_mode_init: incompatible execution-mode latch");
+        return rc;
+    }
+
+    // The caller's CANN log level is the caller's: unlike simpler_init, this
+    // path opens no device context of its own, so it has nothing to level and
+    // no standing to change a process-wide setting it does not own.
+    try {
+        std::vector<uint8_t> aicpu_vec(aicpu_binary, aicpu_binary + aicpu_size);
+        std::vector<uint8_t> aicore_vec(aicore_binary, aicore_binary + aicore_size);
+        runner->set_executors(std::move(aicpu_vec), std::move(aicore_vec));
+        if (dispatcher_binary != NULL && dispatcher_size > 0) {
+            std::vector<uint8_t> dispatcher_vec(dispatcher_binary, dispatcher_binary + dispatcher_size);
+            runner->set_dispatcher_binary(std::move(dispatcher_vec));
+        }
+        rc = runner->init_kernel_context(device_id);
+    } catch (...) {
+        rc = PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (rc != 0) {
+        runner->kernel_execution_state().poison(rc);
+        return rc;
+    }
+    return 0;
 }
 
 int simpler_kernel_mode_prepare_callable(
-    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size, void *caller_stream
+    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size
 ) {
-    const int rc = validate_kernel_prepare_callable_args(ctx, callable_id, callable, callable_size, caller_stream);
+    int rc = validate_kernel_prepare_callable_args(ctx, callable_id, callable, callable_size);
     if (rc != 0) return rc;
-    LOG_ERROR("simpler_kernel_mode_prepare_callable: no live kernel context on this device context");
-    return PTO_RUNTIME_ERR_INVALID_STATE;
+
+    DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
+    if (!runner->execution_mode_latch().is_kernel()) {
+        LOG_ERROR("simpler_kernel_mode_prepare_callable: no live kernel context on this device context");
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    if (!runner->kernel_execution_state().accepts_dispatch()) {
+        LOG_ERROR("simpler_kernel_mode_prepare_callable: the kernel context no longer accepts preparation");
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+
+    try {
+        // The caller owns the thread's current device; this records identity
+        // without binding the thread or changing device configuration.
+        rc = runner->adopt_borrowed_device(runner->device_id());
+        if (rc != 0) return rc;
+
+        // prepare_kernel_callable's AICPU registration self-skips a callable
+        // whose orchestration was resolved host-side, so the flag it reports
+        // adds nothing here.
+        bool needs_aicpu_register = false;
+        rc = record_callable_on_runner(runner, callable_id, callable, &needs_aicpu_register);
+        if (rc != 0) return rc;
+
+        rc = runner->prepare_kernel_callable(callable_id);
+        if (rc != 0) {
+            runner->unregister_callable(callable_id);
+            return rc;
+        }
+        return 0;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
 }
 
 int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, const void *args, void *caller_stream) {

@@ -135,6 +135,13 @@ public:
      */
     int finalize() override;
 
+    /**
+     * a2a3 fills the AIC_CTRL per-core register table and the FFTS base
+     * address. The register table is allocated on `mem_alloc_`; the FFTS
+     * address is a query result and owns nothing.
+     */
+    int fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) override;
+
     // `upload_chip_callable_buffer` is inherited from `DeviceRunnerBase`.
 
     /**

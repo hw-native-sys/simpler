@@ -1069,6 +1069,44 @@ TEST(BufferPoolManagerShardingTest, FreeBufferAllowsAllocationAddressReuse) {
     EXPECT_EQ(released, (std::vector<void *>{dev_ptr, dev_ptr}));
 }
 
+TEST(BufferPoolManagerShardingTest, ReleaseAllOwnedDeduplicatesBlocksAndClearsEveryQueue) {
+    profiling_common::BufferPoolManager<TestModule> manager;
+    profiling_common::MemoryOps ops;
+    ops.alloc = [](size_t) {
+        return ptr(0x4000);
+    };
+    ops.reg = [](void *dev_ptr, size_t, int, void **host_ptr) {
+        *host_ptr = dev_ptr;
+        return 0;
+    };
+    manager.set_memory_context(std::move(ops), nullptr, nullptr, 0, 0);
+    void *host_ptr = nullptr;
+    ASSERT_EQ(manager.alloc_and_register_block(256, &host_ptr), ptr(0x4000));
+    manager.register_mapping(ptr(0x4040), ptr(0x4040));
+    manager.register_mapping(ptr(0x4080), ptr(0x4080));
+    manager.register_mapping(ptr(0x1000), nullptr);
+    manager.register_mapping(nullptr, nullptr);
+    ASSERT_TRUE(manager.push_recycled(0, ptr(0x4040), 0));
+    ASSERT_TRUE(manager.notify_copy_done(ptr(0x4000), 0, 1));
+    ASSERT_TRUE(manager.push_to_ready(TestReadyBufferInfo{ptr(0x4080), 2}, 2));
+    ASSERT_TRUE(manager.retire_unqueued_buffer(1, ptr(0x1000), 3));
+
+    std::vector<void *> released;
+    auto release = [&](void *p) {
+        released.push_back(p);
+    };
+    manager.release_all_owned(release);
+    ASSERT_EQ(released.size(), 2u);
+    EXPECT_EQ(std::set<void *>(released.begin(), released.end()), (std::set<void *>{ptr(0x1000), ptr(0x4000)}));
+    EXPECT_TRUE(manager.recycled_empty());
+    EXPECT_EQ(manager.drain_done_into_recycled(), 0u);
+    TestReadyBufferInfo ready;
+    EXPECT_FALSE(manager.try_pop_ready(ready, 2));
+    manager.release_owned_buffers(release);
+    manager.release_all_owned(release);
+    EXPECT_EQ(released.size(), 2u);
+}
+
 TEST(BufferPoolManagerShardingTest, ReleaseOwnedBuffersVisitsAllShards) {
     profiling_common::BufferPoolManager<TestModule> manager;
     ASSERT_TRUE(manager.push_recycled(/*kind=*/0, ptr(0x1000)));

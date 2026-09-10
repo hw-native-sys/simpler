@@ -35,6 +35,8 @@ struct FakeContextOps {
     int events_created{0};
     int events_destroyed{0};
     uintptr_t next_handle{1};
+    uint32_t requested_event_flag{0};
+    std::vector<uint32_t> event_flags_seen;
 
     static FakeContextOps *self(void *context) { return static_cast<FakeContextOps *>(context); }
 
@@ -60,10 +62,11 @@ struct FakeContextOps {
         ops->streams_destroyed++;
         return 0;
     }
-    static int create_event(void *context, void **event) {
+    static int create_event(void *context, uint32_t flag, void **event) {
         auto *ops = self(context);
         if (ops->create_event_rc_after >= 0 && ops->events_created == ops->create_event_rc_after) return -44;
         ops->events_created++;
+        ops->event_flags_seen.push_back(flag);
         *event = reinterpret_cast<void *>(ops->next_handle++);
         return 0;
     }
@@ -78,13 +81,54 @@ struct FakeContextOps {
     }
 
     KernelContextOps table() {
-        return KernelContextOps{this,          &get_current_device, &create_hidden_stream, &destroy_hidden_stream,
-                                &create_event, &destroy_event};
+        return KernelContextOps{
+            this,          &get_current_device, &create_hidden_stream, &destroy_hidden_stream, requested_event_flag,
+            &create_event, &destroy_event
+        };
     }
 };
 
 constexpr size_t kStreamCount = static_cast<size_t>(KernelStreamKind::Count);
 constexpr size_t kEventCount = static_cast<size_t>(KernelEventKind::Count);
+
+class KernelContextCreationFailure : public ::testing::TestWithParam<int> {};
+
+TEST_P(KernelContextCreationFailure, EveryCreationPointRollsBackAndCanRetry) {
+    FakeContextOps fake;
+    const int point = GetParam();
+    if (point < static_cast<int>(kStreamCount)) {
+        fake.create_stream_rc_after = point;
+    } else {
+        fake.create_event_rc_after = point - kStreamCount;
+    }
+    KernelExecutionState state;
+    EXPECT_NE(state.initialize(3, fake.table()), 0);
+    EXPECT_EQ(state.phase(), KernelContextPhase::New);
+    EXPECT_FALSE(state.has_live_resources());
+    EXPECT_EQ(fake.streams_created, fake.streams_destroyed);
+    EXPECT_EQ(fake.events_created, fake.events_destroyed);
+    EXPECT_EQ(fake.streams_created + fake.events_created, point);
+    fake.create_stream_rc_after = -1;
+    fake.create_event_rc_after = -1;
+    ASSERT_EQ(state.initialize(3, fake.table()), 0);
+    EXPECT_EQ(state.close(), 0);
+    EXPECT_EQ(fake.streams_created, fake.streams_destroyed);
+    EXPECT_EQ(fake.events_created, fake.events_destroyed);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    AllStreamsAndEvents, KernelContextCreationFailure, ::testing::Range(0, static_cast<int>(kStreamCount + kEventCount))
+);
+
+TEST(KernelExecutionState, DestructionWithoutCloseMakesNoRuntimeCalls) {
+    FakeContextOps fake;
+    {
+        KernelExecutionState state;
+        ASSERT_EQ(state.initialize(3, fake.table()), 0);
+    }
+    EXPECT_EQ(fake.streams_destroyed, 0);
+    EXPECT_EQ(fake.events_destroyed, 0);
+}
 
 TEST(KernelContextOpsVocabulary, IncompleteTableIsInvalid) {
     FakeContextOps fake;
@@ -121,6 +165,7 @@ TEST(ExecutionModeLatch, ModesAreMutuallyExclusiveInBothDirections) {
     EXPECT_FALSE(program.is_kernel());
 
     ExecutionModeLatch kernel;
+    EXPECT_EQ(kernel.latch(SIMPLER_MODE_KERNEL), 0);
     EXPECT_EQ(kernel.latch(SIMPLER_MODE_KERNEL), 0);
     EXPECT_EQ(kernel.latch(SIMPLER_MODE_PROGRAM), PTO_RUNTIME_ERR_INVALID_STATE);
     EXPECT_TRUE(kernel.is_kernel());
@@ -160,6 +205,20 @@ TEST(KernelExecutionState, EmptyContextInitThenCloseIsClean) {
     EXPECT_EQ(fake.streams_destroyed, fake.streams_created);
     EXPECT_EQ(fake.events_destroyed, fake.events_created);
     // Idempotent close.
+    EXPECT_EQ(state.close(), 0);
+}
+
+TEST(KernelExecutionState, EveryEventCarriesTheFlagTheOpsTableAsksFor) {
+    constexpr uint32_t kPlatformEventFlag = 0x8;
+    FakeContextOps fake;
+    fake.requested_event_flag = kPlatformEventFlag;
+    KernelExecutionState state;
+    ASSERT_EQ(state.initialize(3, fake.table()), 0);
+
+    ASSERT_EQ(fake.event_flags_seen.size(), kEventCount);
+    for (uint32_t flag : fake.event_flags_seen) {
+        EXPECT_EQ(flag, kPlatformEventFlag);
+    }
     EXPECT_EQ(state.close(), 0);
 }
 

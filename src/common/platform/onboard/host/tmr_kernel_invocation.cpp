@@ -9,35 +9,14 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#pragma once
+#include "tmr_kernel_invocation.h"
 
-#include "aicpu_loader/host/load_aicpu_op.h"
-#include "worker/runtime_c_api.h"
-#include "worker/tmr_kernel_invocation.h"
-
-class DeviceRunnerBase;
+#include "device_runner_base.h"
 
 namespace simpler::tmr {
 
-inline constexpr char TmrKernelInvocationName[] = "simpler_aicpu_kernel_exec";
-
-// The runner owns the initialized loader. The same borrowing and complete
-// enqueue/commit contract below applies to this production transport adapter.
 int enqueue_tmr_invocation_aicpu(
     DeviceRunnerBase &runner, void *stream, int32_t aicpu_num, const TmrEncodingCandidate &candidate,
-    const PreparedInvocationView &callable, const TmrExecutionBindingView &binding
-) noexcept;
-
-// Called by the owner's KernelLaunchOps::launch_aicpu callback. The owner
-// holds candidate, callable and binding live through this call and commits
-// its encoding cache only after the complete enqueue sequence succeeds.
-// stream is the owner's dedicated AICPU stream, not the borrowed caller
-// stream. The owner establishes event ordering outside this transport call.
-// The loader must have registered the kernel-mode entry, not the program
-// KernelArgs entry. CPU transport copy/lifetime support is a platform
-// integration precondition, verified with the native snapshot probe.
-inline int enqueue_tmr_invocation_aicpu(
-    host::LoadAicpuOp &loader, void *stream, int32_t aicpu_num, const TmrEncodingCandidate &candidate,
     const PreparedInvocationView &callable, const TmrExecutionBindingView &binding
 ) noexcept {
     if (stream == nullptr || aicpu_num <= 0) return PTO_RUNTIME_ERR_INTERNAL;
@@ -47,8 +26,8 @@ inline int enqueue_tmr_invocation_aicpu(
     if (status != InvocationStatus::Ok) return PTO_RUNTIME_ERR_INTERNAL;
     try {
         const auto packet = candidate.packet();
-        return loader.LaunchBuiltInOp(
-            stream, const_cast<uint8_t *>(packet.data), packet.size, aicpu_num, TmrKernelInvocationName
+        return runner.launch_aicpu_payload(
+            stream, const_cast<uint8_t *>(packet.data), packet.size, TmrKernelInvocationName, aicpu_num
         );
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;

@@ -92,6 +92,49 @@ TEST(TmrKernelInvocation, CacheHitStillUsesCurrentAddressesAndScalars) {
     EXPECT_EQ(cache.bytes(), first.packet().size);
 }
 
+TEST(TmrKernelInvocation, ConsumptionRejectsBeforeChangingCallerStorage) {
+    auto args = make_args();
+    TmrEncodingCache cache;
+    TmrEncodingCandidate packet;
+    ASSERT_EQ(encode_tmr_invocation(args, kCallable, kBinding, cache, &packet), InvocationStatus::Ok);
+    EntryArgsStorage storage{};
+    storage.scalar_count_ = 1;
+    storage.scalars_[0] = 1234;
+    auto stale = kCallable;
+    ++stale.slot_generation;
+    EXPECT_EQ(consume_tmr_invocation(packet.packet(), stale, kBinding, &storage), InvocationStatus::StaleCallable);
+    EXPECT_EQ(storage.scalar_count(), 1);
+    EXPECT_EQ(storage.scalar(0), 1234u);
+    auto wrong_binding = kBinding;
+    ++wrong_binding.context_generation;
+    EXPECT_EQ(
+        consume_tmr_invocation(packet.packet(), kCallable, wrong_binding, &storage), InvocationStatus::InvalidBinding
+    );
+    EXPECT_EQ(storage.scalar(0), 1234u);
+    EXPECT_EQ(
+        consume_tmr_invocation({packet.packet().data, packet.packet().size - 1}, kCallable, kBinding, &storage),
+        InvocationStatus::InvalidSize
+    );
+    EXPECT_EQ(storage.scalar(0), 1234u);
+    ASSERT_EQ(consume_tmr_invocation(packet.packet(), kCallable, kBinding, &storage), InvocationStatus::Ok);
+    EXPECT_EQ(storage.tensor_count(), 1);
+    EXPECT_EQ(storage.scalar(0), 19u);
+}
+
+TEST(TmrKernelInvocation, RetainedCacheIsBoundedAcrossRepeatedInvocations) {
+    TmrEncodingCache cache;
+    size_t expected_bytes = 0;
+    ASSERT_EQ(tmr_invocation_size(kCallable, &expected_bytes), InvocationStatus::Ok);
+    for (uint64_t i = 0; i < 10000; ++i) {
+        auto args = make_args(0x20000 + i * 64, i);
+        TmrEncodingCandidate candidate;
+        ASSERT_EQ(encode_tmr_invocation(args, kCallable, kBinding, cache, &candidate), InvocationStatus::Ok);
+        EXPECT_EQ(candidate.structural_hit(), i != 0);
+        cache.commit(std::move(candidate));
+        EXPECT_EQ(cache.bytes(), expected_bytes);
+    }
+}
+
 TEST(TmrKernelInvocation, FailedCandidateAndUnsubmittedCandidatePreserveCache) {
     TmrEncodingCache cache;
     auto args = make_args();

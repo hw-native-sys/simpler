@@ -681,6 +681,43 @@ target_include_directories(test_profiler_device_engine PRIVATE
 add_common_utils_test(test_worker_chip_orch_comm common/test_worker_chip_orch_comm.cpp)
 add_common_utils_test(test_file_marker_handshake common/test_file_marker_handshake.cpp)
 
+# Context-lifetime AICore argument owner. Built once per runtime variant
+# because the device image length it copies is a per-runtime decision
+# (runtime_device_copy_size): trb narrows to the `dev` descriptor, hbg copies
+# the whole Runtime. The injected alloc/free/copy vocabulary keeps both builds
+# free of CANN.
+set(KERNEL_PERSISTENT_ARGS_SRC
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/onboard/host/kernel_persistent_args.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/kernel_execution_state.cpp)
+
+add_executable(test_kernel_persistent_args
+    common/test_kernel_persistent_args.cpp
+    ${KERNEL_PERSISTENT_ARGS_SRC}
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
+)
+target_compile_definitions(test_kernel_persistent_args PRIVATE SIMPLER_UT_TRB_RUNTIME)
+target_include_directories(test_kernel_persistent_args PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/onboard/host
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/orchestration
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/common
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+)
+target_link_libraries(test_kernel_persistent_args PRIVATE
+    a2a3_rt_objs
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    pthread
+)
+add_test(NAME test_kernel_persistent_args COMMAND test_kernel_persistent_args)
+set_tests_properties(test_kernel_persistent_args PROPERTIES LABELS "no_hardware")
+
 add_executable(test_trb_runtime_temp_buffer
     common/test_trb_runtime_temp_buffer.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/host/runtime_maker.cpp
@@ -1015,6 +1052,16 @@ add_a2a3_hbg_runtime_test(test_hbg_tensor_access a2a3/test_hbg_tensor_access.cpp
 # links the Runtime implementation to pin the contract without a device.
 add_a2a3_hbg_runtime_test(test_dispatch_table a2a3/test_dispatch_table.cpp
     ${HBG_SHARED_DIR}/runtime.cpp)
+
+# The hbg half of the per-runtime pair started above: same assertions, whole-
+# Runtime device image.
+add_a2a3_hbg_runtime_test(test_hbg_kernel_persistent_args common/test_kernel_persistent_args.cpp
+    ${KERNEL_PERSISTENT_ARGS_SRC}
+    ${HBG_SHARED_DIR}/runtime.cpp)
+target_include_directories(test_hbg_kernel_persistent_args PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/onboard/host
+    ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+)
 add_a2a3_hbg_runtime_test(test_hbg_core_tracker common/test_hbg_core_tracker.cpp)
 # The seed test calls the real ready_queue_init_data_from_layout, so it links the
 # shared init TU (and the orchestrator/SM members that TU refers to).

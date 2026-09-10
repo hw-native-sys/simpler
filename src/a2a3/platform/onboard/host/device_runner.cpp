@@ -136,6 +136,27 @@ int kernel_args_init_ffts_base_addr(KernelArgsHelper &helper) {
 // DeviceRunner Implementation
 // =============================================================================
 
+int DeviceRunner::fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) {
+    if (args == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+
+    int rc = init_aicore_register_addresses(&args->regs, device_id, mem_alloc_, AicoreRegKind::Ctrl);
+    if (rc != 0) {
+        LOG_ERROR("fill_persistent_arch_fields: init_aicore_register_addresses(Ctrl) failed: %d", rc);
+        return rc;
+    }
+
+    uint32_t ffts_len = 0;
+    rc = rtGetC2cCtrlAddr(&args->ffts_base_addr, &ffts_len);
+    if (rc != 0) {
+        LOG_ERROR("fill_persistent_arch_fields: rtGetC2cCtrlAddr failed: %d", rc);
+        (void)mem_alloc_.free(reinterpret_cast<void *>(args->regs));
+        args->regs = 0;
+        args->ffts_base_addr = 0;
+        return rc;
+    }
+    return 0;
+}
+
 DeviceRunner::~DeviceRunner() { finalize(); }
 
 // `setup_static_arena`, `create_thread`, `attach_current_thread`,
@@ -1050,13 +1071,20 @@ int DeviceRunner::finalize() {
         // (verified on a2a3). An SDMA-provisioned card gets a single attempt:
         // there a non-confirming reset already blocks on the driver's
         // remote-event timeout, which a retry only multiplies.
+        // A kernel-mode context owns neither the device nor its ACL state, so
+        // force_reset_device() refuses. Asking anyway would log that refusal
+        // once per attempt and then report a reset that "did not confirm
+        // clean", which reads as a failed reset rather than the designed
+        // refusal it is.
+        const bool owns_device_reset = !execution_mode_latch().is_kernel();
         constexpr int kFatalResetAttempts = 3;
-        int reset_rc = attempt_fatal_reset(
-            [this]() {
-                return force_reset_device();
-            },
-            sdma_provisioned ? 1 : kFatalResetAttempts
-        );
+        int reset_rc = owns_device_reset ? attempt_fatal_reset(
+                                               [this]() {
+                                                   return force_reset_device();
+                                               },
+                                               sdma_provisioned ? 1 : kFatalResetAttempts
+                                           ) :
+                                           0;
         const bool reset_confirmed = reset_rc == 0;
         if (!reset_confirmed) {
             LOG_ERROR(
@@ -1119,6 +1147,7 @@ int DeviceRunner::finalize() {
     // mem_alloc_.finalize(), and cached arena sizes.
     rc = finalize_common();
     if (rc == 0) rc = stream_rc;
+    if (rc != 0 && execution_mode_latch().is_kernel()) return rc;
 
     // Reset device AFTER all device memory is freed. Two paths:
     //
