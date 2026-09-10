@@ -110,6 +110,9 @@ enum {
     PTO_RUNTIME_ERR_INVALID_STATE = PTO_RUNTIME_ERR_BASE - 3,
     /* A caller supplied an invalid pointer, id, size, or other argument. */
     PTO_RUNTIME_ERR_INVALID_ARGUMENT = PTO_RUNTIME_ERR_BASE - 4,
+    PTO_RUNTIME_ERR_CALLABLE_COUNT_EXCEEDED = PTO_RUNTIME_ERR_BASE - 5,
+    PTO_RUNTIME_ERR_CALLABLE_BYTES_EXCEEDED = PTO_RUNTIME_ERR_BASE - 6,
+    PTO_RUNTIME_ERR_CALLABLE_NOT_RESIDENT = PTO_RUNTIME_ERR_BASE - 7,
 };
 
 /** Return values from simpler_poll_run(). */
@@ -355,9 +358,9 @@ int finalize_device(DeviceContextHandle ctx);
  * H2D + caching keyed by `callable_id`) from each `simpler_run` invocation,
  * so the per-run cost shrinks to "rebuild Runtime args + launch". Callers
  * keep a stable small-int `callable_id` per ChipCallable; the platform side
- * caches the prepared state in a fixed-size table (cap 64, see
+ * caches the prepared state in a fixed-size table (cap 8192, see
  * MAX_REGISTERED_CALLABLE_IDS in the AICPU executor) and rejects ids outside
- * `[0, 64)`. Lifetime: caller must `unregister_callable` before
+ * `[0, 8192)`. Lifetime: caller must `unregister_callable` before
  * `finalize_device` to release the device-side orch SO buffer; kernels stay
  * resident until finalize regardless. Register and unregister mutate state
  * referenced by a prepared run, so both are rejected from successful prepare
@@ -622,11 +625,29 @@ int simpler_kernel_mode_init(
 /**
  * Stage one callable for kernel-mode launches, outside ACLGraph capture.
  *
+ * The caller serializes init/prepare/launch/finalize on each context.
+ * Every successful call uploads and registers a new image and writes a new
+ * context-local ID to out_callable_id, even for identical
+ * content. Handle reuse and content deduplication belong to the caller.
+ * Each registration receives an ID in [0, 8192). Device code storage grows
+ * in shared 2 MiB blocks; larger images allocate their 64-byte-aligned size.
+ * Total allocated block capacity, including unused tails, is capped at 2 GiB.
+ * Growth never moves published images and occurs only during preparation.
+ * No eviction, unregister, or slot reuse occurs.
+ * COUNT_EXCEEDED / BYTES_EXCEEDED reject admission before upload; a missing
+ * launch target returns CALLABLE_NOT_RESIDENT. No error exits the process.
+ * out_callable_id must be non-null and point to separate writable int32_t
+ * storage. On every failure, it is set to -1. The return value is
+ * a status code. Handles are valid only on the issuing context and
+ * remain stable until close. A full cache rejects every new registration.
+ * Failed device registration poisons the context and retains its storage
+ * until explicit close after caller-established quiescence.
+ *
  * `callable` points to a canonical ChipCallable image of exactly
  * `callable_size` bytes. Validating every flexible-array offset before the
  * image is hashed or uploaded is the implementation's obligation; the shared
  * entry validation checks only the image's alignment, its size floor, and the
- * callable id range. Preparation may allocate persistent state and enqueue
+ * output pointer. Preparation may allocate persistent state and enqueue
  * asynchronous device work on context-owned streams. Registration synchronizes
  * its internal AICPU control stream before committing the callable, but never
  * synchronizes a caller stream or the device. Preparation neither accepts nor
@@ -634,11 +655,16 @@ int simpler_kernel_mode_init(
  * independently to each launch.
  */
 int simpler_kernel_mode_prepare_callable(
-    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size
+    DeviceContextHandle ctx, const void *callable, size_t callable_size, int32_t *out_callable_id
 );
 
 /**
  * Enqueue one bounded asynchronous kernel-mode operator invocation.
+ *
+ * Use the ID returned by prepare only with its issuing context. IDs are not
+ * reused within a context and become invalid at close. Cross-context misuse
+ * is outside the API contract; a missing ID returns CALLABLE_NOT_RESIDENT.
+ * All referencing graphs must be destroyed and executions drained before close.
  *
  * `args` points to a ChipStorageTaskArgs POD whose tensor addresses are
  * caller-owned device addresses; they are passed through without ever being

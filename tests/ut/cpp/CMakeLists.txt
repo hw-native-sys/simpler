@@ -516,6 +516,18 @@ target_link_libraries(test_kernel_entry_validation PRIVATE ${GTEST_MAIN_LIB} ${G
 add_test(NAME test_kernel_entry_validation COMMAND test_kernel_entry_validation)
 set_tests_properties(test_kernel_entry_validation PROPERTIES LABELS "no_hardware")
 
+add_executable(test_kernel_callable_cache common/test_kernel_callable_cache.cpp)
+target_include_directories(test_kernel_callable_cache PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+)
+target_link_libraries(test_kernel_callable_cache PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_kernel_callable_cache COMMAND test_kernel_callable_cache)
+set_tests_properties(test_kernel_callable_cache PROPERTIES LABELS "no_hardware")
+
 # Kernel-mode phase machine and restricted-vocabulary tables, table-driven with
 # fake ops: init/close balance, poison, sticky CLOSING with retry, and the
 # separate runtime-error vs teardown-error slots.

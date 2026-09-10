@@ -30,6 +30,9 @@ PTO_RUNTIME_ERR_INTERNAL = -1000
 PTO_RUNTIME_ERR_UNSUPPORTED = -1001
 PTO_RUNTIME_ERR_INVALID_STATE = -1003
 PTO_RUNTIME_ERR_INVALID_ARGUMENT = -1004
+PTO_RUNTIME_ERR_CALLABLE_COUNT_EXCEEDED = -1005
+PTO_RUNTIME_ERR_CALLABLE_BYTES_EXCEEDED = -1006
+PTO_RUNTIME_ERR_CALLABLE_NOT_RESIDENT = -1007
 
 _ARCHES = ("a2a3", "a5")
 _RUNTIMES = ("host_build_graph", "tensormap_and_ringbuffer")
@@ -154,9 +157,9 @@ def _load(arch: str, variant: str, runtime: str) -> ctypes.CDLL:
     lib.simpler_kernel_mode_init.restype = ctypes.c_int
     lib.simpler_kernel_mode_prepare_callable.argtypes = [
         ctypes.c_void_p,
-        ctypes.c_int32,
         ctypes.c_void_p,
         ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_int32),
     ]
     lib.simpler_kernel_mode_prepare_callable.restype = ctypes.c_int
     lib.simpler_kernel_mode_launch.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p, ctypes.c_void_p]
@@ -170,6 +173,16 @@ def _load(arch: str, variant: str, runtime: str) -> ctypes.CDLL:
     ]  # fmt: skip
     lib.simpler_init.restype = ctypes.c_int
     return lib
+
+
+def _prepare(lib, ctx, image, size=None):
+    handle = ctypes.c_int32(12345)
+    rc = lib.simpler_kernel_mode_prepare_callable(
+        ctx, image, len(image) if size is None else size, ctypes.byref(handle)
+    )
+    if rc != 0:
+        assert handle.value == -1
+    return rc, handle.value
 
 
 def _minimal_callable_image() -> bytes:
@@ -328,21 +341,22 @@ def _run_lifecycle_retry(arch, runtime, device, scenario):
             assert lib.finalize_device(ctx) == 0
             finalized = True
         elif scenario == "prepare":
-            _check_prepare_reuse(lib, ctx, arch, runtime)
+            _check_prepare_registration(lib, ctx, arch, runtime)
             finalized = True
         elif scenario == "persistent_free_close":
-            _check_prepare_reuse(lib, ctx, arch, runtime, close=False)
-            # The first rtFree releases the callable upload. Fail the next
-            # call, which is owned by PersistentKernelArgs, to cover the exact
-            # owner -> finalize_common -> allocator retry chain.
-            faults.arm_destroy_failure_after(4, 1)
+            _check_prepare_registration(lib, ctx, arch, runtime, close=False)
+            # PersistentKernelArgs releases before the callable arena. Fail
+            # its first release to cover the owner -> finalize_common -> allocator retry chain.
+            faults.arm_destroy_failure_after(4, 0)
             # The allocator path may translate an injected RTS status, but it
             # must never report success or forget the allocation before retry.
             assert lib.finalize_device(ctx) != 0
             first_attempts = faults.destroy_attempts()
             assert first_attempts > 0
             assert lib.finalize_device(ctx) == 0
-            assert faults.destroy_attempts() == first_attempts + 1
+            # Retry frees the failed argument block and the retained callable arena.
+            assert faults.destroy_attempts() == first_attempts + 2
+            assert lib.committed_device_memory_ctx(ctx) == 0
             finalized = True
         elif scenario in ("repeat_init", "init_failure"):
             assert lib.simpler_kernel_mode_init(*init_args) == PTO_RUNTIME_ERR_INVALID_STATE
@@ -372,7 +386,7 @@ def _run_lifecycle_retry(arch, runtime, device, scenario):
         assert {name: faults.acl_call_count(i) for i, name in enumerate(names)} == dict.fromkeys(names, 0)
 
 
-def _check_prepare_reuse(lib, ctx, arch, runtime, *, close=True):
+def _check_prepare_registration(lib, ctx, arch, runtime, *, close=True):
     import tempfile  # noqa: PLC0415
 
     from simpler.task_interface import ChipCallable  # noqa: PLC0415
@@ -383,23 +397,43 @@ def _check_prepare_reuse(lib, ctx, arch, runtime, *, close=True):
         binary = KernelCompiler(arch).compile_orchestration(
             runtime, str(Path(__file__).with_name("kernel_prepare_orchestration.cpp")), build_dir=build_dir
         )
+
     chip = ChipCallable.build(signature=[], func_name="kernel_prepare_orchestration", binary=binary, children=[])
     image = ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size()))
+    dlopen_count = lib.get_host_dlopen_count if runtime == "host_build_graph" else lib.get_aicpu_dlopen_count
+    dlopen_count.argtypes = [ctypes.c_void_p]
+    dlopen_count.restype = ctypes.c_size_t
+    assert dlopen_count(ctx) == 0
     before = lib.committed_device_memory_ctx(ctx)
-    assert lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, len(image)) == 0
+    assert _prepare(lib, ctx, image) == (0, 0)
     prepared = lib.committed_device_memory_ctx(ctx)
-    assert prepared > before
-    # Duplicate registration is rejected; it must not disturb the first ID.
-    assert lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, len(image)) != 0
+    assert 0 < prepared - before < 4 * 1024 * 1024
     assert lib.committed_device_memory_ctx(ctx) == prepared
-    # Identical bytes deduplicate the callable upload. The second ID also
-    # reuses the context's persistent argument blocks, so neither adds GM.
-    assert lib.simpler_kernel_mode_prepare_callable(ctx, 1, image, len(image)) == 0
-    assert lib.committed_device_memory_ctx(ctx) == prepared
+    stream = ctypes.byref((ctypes.c_uint8 * 8)())
+    # A valid handle passes residency validation and reaches the unavailable binder.
+    assert lib.simpler_kernel_mode_launch(ctx, 0, image, stream) == PTO_RUNTIME_ERR_INVALID_STATE
+    assert lib.simpler_kernel_mode_launch(ctx, 8191, image, stream) == PTO_RUNTIME_ERR_CALLABLE_NOT_RESIDENT
+    assert _prepare(lib, ctx, image, 2 * 1024 * 1024 * 1024 + 1) == (PTO_RUNTIME_ERR_CALLABLE_BYTES_EXCEEDED, -1)
+    assert _prepare(lib, ctx, image, 1) == (PTO_RUNTIME_ERR_INVALID_ARGUMENT, -1)
+    assert lib.simpler_kernel_mode_prepare_callable(ctx, image, len(image), None) == PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    registrations = 65 if close else 1
+    for expected_id in range(1, registrations):
+        assert _prepare(lib, ctx, image) == (0, expected_id)
+    assert lib.simpler_kernel_mode_launch(ctx, 0, image, stream) == PTO_RUNTIME_ERR_INVALID_STATE
+    assert lib.simpler_kernel_mode_launch(ctx, registrations - 1, image, stream) == PTO_RUNTIME_ERR_INVALID_STATE
+    assert lib.simpler_kernel_mode_launch(ctx, 8192, image, stream) == PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    charged = (len(image) + 63) // 64 * 64
+    per_block = (2 * 1024 * 1024) // charged
+    blocks = (registrations + per_block - 1) // per_block
+    assert lib.committed_device_memory_ctx(ctx) == prepared + (blocks - 1) * 2 * 1024 * 1024
+    assert dlopen_count(ctx) == registrations
+    lib.simpler_unregister_callable.argtypes = [ctypes.c_void_p, ctypes.c_int32]
+    lib.simpler_unregister_callable.restype = ctypes.c_int
+    assert lib.simpler_unregister_callable(ctx, 0) == PTO_RUNTIME_ERR_INVALID_STATE
     if close:
         assert lib.finalize_device(ctx) == 0
         assert lib.committed_device_memory_ctx(ctx) == 0
-        assert lib.simpler_kernel_mode_prepare_callable(ctx, 2, image, len(image)) == PTO_RUNTIME_ERR_INVALID_STATE
+        assert _prepare(lib, ctx, image) == (PTO_RUNTIME_ERR_INVALID_STATE, -1)
 
 
 @pytest.mark.parametrize(("arch", "runtime"), _SIM_CASES)
@@ -413,12 +447,14 @@ def test_kernel_entries_reject_a_context_with_no_kernel_claim(arch: str, runtime
     assert ctx
     try:
         assert lib.simpler_kernel_mode_supported(ctx) == 0
-        assert lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, len(image)) == PTO_RUNTIME_ERR_INVALID_STATE
+        assert _prepare(lib, ctx, image) == (PTO_RUNTIME_ERR_INVALID_STATE, -1)
         assert lib.simpler_kernel_mode_launch(ctx, 0, image, stream) == PTO_RUNTIME_ERR_INVALID_STATE
-        # An out-of-range callable id and a truncated image are argument
-        # errors, so the structural checks run before the ordering one.
-        assert lib.simpler_kernel_mode_prepare_callable(ctx, -1, image, len(image)) == PTO_RUNTIME_ERR_INVALID_ARGUMENT
-        assert lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, 1) == PTO_RUNTIME_ERR_INVALID_ARGUMENT
+        # Structural checks run before lifecycle checks.
+        assert (
+            lib.simpler_kernel_mode_prepare_callable(ctx, image, len(image), None) == PTO_RUNTIME_ERR_INVALID_ARGUMENT
+        )
+        assert _prepare(lib, ctx, image, 1) == (PTO_RUNTIME_ERR_INVALID_ARGUMENT, -1)
+        assert _prepare(lib, None, image) == (PTO_RUNTIME_ERR_INVALID_ARGUMENT, -1)
         assert lib.simpler_kernel_mode_launch(ctx, 0, image, None) == PTO_RUNTIME_ERR_INVALID_ARGUMENT
     finally:
         lib.destroy_device_context(ctx)
@@ -442,7 +478,7 @@ def test_simulated_components_report_kernel_mode_unsupported(arch: str, runtime:
         )
         # The refused init took no claim, so the context is still free.
         image = _minimal_callable_image()
-        assert lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, len(image)) == PTO_RUNTIME_ERR_INVALID_STATE
+        assert _prepare(lib, ctx, image) == (PTO_RUNTIME_ERR_INVALID_STATE, -1)
     finally:
         lib.destroy_device_context(ctx)
 

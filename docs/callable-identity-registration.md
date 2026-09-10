@@ -1,5 +1,7 @@
 # Callable Identity Registration
 
+For kernel-mode registration, see [Kernel-mode callable residency](zh-cn/kernel-callable-residency.md).
+
 This document defines callable identity for local hierarchical workers.
 `hashid` is the stable identity across the parent process and its local child
 worker processes. Integer execution slots are target-worker internals and are

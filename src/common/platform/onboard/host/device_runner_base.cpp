@@ -742,6 +742,18 @@ PersistentArgsOps DeviceRunnerBase::persistent_args_ops() {
     return ops;
 }
 
+KernelCallableCache::Ops DeviceRunnerBase::kernel_callable_cache_ops() {
+    return {
+        this,
+        [](void *context, size_t bytes) -> void * {
+            return static_cast<DeviceRunnerBase *>(context)->mem_alloc_.alloc(bytes);
+        },
+        [](void *, void *dst, const void *src, size_t bytes) -> int {
+            return static_cast<int>(rtMemcpy(dst, bytes, src, bytes, RT_MEMCPY_HOST_TO_DEVICE));
+        }
+    };
+}
+
 int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id) {
     rtStream_t control_stream = static_cast<rtStream_t>(kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu));
     if (control_stream == nullptr) {
@@ -932,6 +944,10 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
         return 0;
     }
 
+    if (execution_mode_latch_.is_kernel()) {
+        return kernel_callable_cache_.pending_uploaded_address();
+    }
+
     const ChipCallableLayout layout = compute_chip_callable_layout(callable);
 
     // Content-hash dedup: identical bytes → return cached chip_dev.
@@ -979,6 +995,7 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
 }
 
 int DeviceRunnerBase::release_chip_callable_buffer(uint64_t hash) {
+    if (execution_mode_latch_.is_kernel()) return 0;
     if (hash == 0) {
         return 0;
     }
@@ -1860,6 +1877,7 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
         if (allocator_rc != 0 && rc == 0) rc = allocator_rc;
     }
 
+    kernel_callable_cache_.clear();
     block_dim_ = 0;
     worker_count_ = 0;
     // Tied to stream_aicore_, destroyed above: a re-provisioned runner

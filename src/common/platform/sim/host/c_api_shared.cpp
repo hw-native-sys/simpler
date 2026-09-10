@@ -1073,9 +1073,10 @@ int simpler_kernel_mode_init(
 }
 
 int simpler_kernel_mode_prepare_callable(
-    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size
+    DeviceContextHandle ctx, const void *callable, size_t callable_size, int32_t *out_callable_id
 ) {
-    const int rc = validate_kernel_prepare_callable_args(ctx, callable_id, callable, callable_size);
+    if (out_callable_id != nullptr) *out_callable_id = -1;
+    const int rc = validate_kernel_prepare_callable_args(ctx, callable, callable_size, out_callable_id);
     if (rc != 0) return rc;
     LOG_ERROR("simpler_kernel_mode_prepare_callable: no live kernel context on this device context");
     return PTO_RUNTIME_ERR_INVALID_STATE;

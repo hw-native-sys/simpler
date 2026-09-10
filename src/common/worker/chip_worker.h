@@ -156,7 +156,7 @@ public:
     void close_chip_run_lane();
 
     // Per-callable_id preparation. Requires init() first and a callable_id
-    // in [0, MAX_REGISTERED_CALLABLE_IDS) (cap 64).
+    // in [0, MAX_REGISTERED_CALLABLE_IDS) (cap 8192).
     void register_callable(int32_t callable_id, const void *callable);
     void unregister_callable(int32_t callable_id);
 
