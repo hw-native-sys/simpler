@@ -172,6 +172,10 @@ TEST(SchedulerState, PlansAndInitializesReadyState) {
     EXPECT_EQ(layout.ready_owner_states_offset % alignof(SchedulerReadyOwnerState), 0u);
     EXPECT_EQ(layout.ready_directory_offset % alignof(SchedulerReadyDirectory), 0u);
     EXPECT_EQ(layout.completion_inboxes_offset % alignof(SchedulerCompletionInbox), 0u);
+    EXPECT_EQ(
+        layout.worker_contexts_offset - layout.aicpu_lifecycle_traces_offset,
+        static_cast<uint64_t>(PLATFORM_MAX_AICPU_THREADS) * sizeof(AicpuThreadLifecycleTrace)
+    );
 
     SchedulerStateBuffer storage(layout);
     auto *controls = scheduler_state_at<SchedulerTaskControl>(storage.base(), layout.task_controls_offset);

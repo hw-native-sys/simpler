@@ -349,6 +349,38 @@ def test_parse_scheduler_classifies_release_as_scheduler_work():
     assert threads[0]["phases_seen"] == {"release", "resolve"}
 
 
+def test_parse_scheduler_counts_aicore_flat_dispatch_phases():
+    data = {
+        "aicpu_scheduler_phases": [
+            [
+                {"phase": "complete", "start_time_us": 1.0, "end_time_us": 2.0, "loop_iter": 1},
+                {"phase": "resolve", "start_time_us": 2.0, "end_time_us": 3.0, "loop_iter": 1},
+                {"phase": "state_probe", "start_time_us": 3.0, "end_time_us": 4.0, "loop_iter": 1},
+                {"phase": "dispatch", "start_time_us": 4.0, "end_time_us": 5.0, "loop_iter": 1},
+                {"phase": "worksteal", "start_time_us": 5.0, "end_time_us": 6.0, "loop_iter": 1},
+                {"phase": "refill", "start_time_us": 6.0, "end_time_us": 7.0, "loop_iter": 1},
+            ]
+        ]
+    }
+
+    threads = parse_scheduler_from_json_phases(data)
+
+    assert threads[0]["role"] == "scheduler"
+    assert threads[0]["state_probe_us"] == 1.0
+    assert threads[0]["dispatch_us"] == 1.0
+    assert threads[0]["worksteal_us"] == 1.0
+    assert threads[0]["refill_us"] == 1.0
+    assert threads[0]["total_us"] == 6.0
+    assert threads[0]["phases_seen"] == {
+        "complete",
+        "resolve",
+        "state_probe",
+        "dispatch",
+        "worksteal",
+        "refill",
+    }
+
+
 def test_parse_scheduler_uses_explicit_hbg_resolve_discriminator_at_parent_boundary():
     data = {
         "aicpu_scheduler_phases": [

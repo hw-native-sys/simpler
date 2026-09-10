@@ -490,28 +490,29 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         }
 
         const auto *lifecycle =
-            scheduler_state_at<AicpuCoreLifecycleTrace>(host_base, owner.layout.aicpu_lifecycle_traces_offset);
+            scheduler_state_at<AicpuThreadLifecycleTrace>(host_base, owner.layout.aicpu_lifecycle_traces_offset);
         std::ostringstream lifecycle_json;
         lifecycle_json << "[";
         bool first = true;
-        for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
-            const AicpuCoreLifecycleTrace &trace = lifecycle[worker];
-            if (trace.handshake_observed_cycles == 0) continue;
+        for (uint64_t thread = 0; thread < PLATFORM_MAX_AICPU_THREADS; ++thread) {
+            const AicpuThreadLifecycleTrace &trace = lifecycle[thread];
+            if (trace.handshake_start_cycles == 0) continue;
             if (!first) lifecycle_json << ",";
-            lifecycle_json << "\n    {\"worker_id\": " << trace.worker_id
-                           << ", \"aicpu_thread_id\": " << trace.aicpu_thread_id << ", \"core_type\": \""
-                           << scheduler_core_type_name(static_cast<int32_t>(trace.core_type))
-                           << "\", \"physical_core_id\": " << trace.physical_core_id
-                           << ", \"handshake_observed_cycles\": " << trace.handshake_observed_cycles
-                           << ", \"handshake_partition_complete_cycles\": " << trace.handshake_partition_complete_cycles
+            lifecycle_json << "\n    {\"aicpu_thread_id\": " << trace.aicpu_thread_id
+                           << ", \"handshake_start_cycles\": " << trace.handshake_start_cycles
+                           << ", \"handshake_complete_cycles\": " << trace.handshake_complete_cycles
                            << ", \"config_start_cycles\": " << trace.config_start_cycles
                            << ", \"topology_complete_cycles\": " << trace.topology_complete_cycles
+                           << ", \"context_publish_start_cycles\": " << trace.context_publish_start_cycles
                            << ", \"context_publish_complete_cycles\": " << trace.context_publish_complete_cycles
                            << ", \"bootstrap_wait_start_cycles\": " << trace.bootstrap_wait_start_cycles
                            << ", \"bootstrap_complete_cycles\": " << trace.bootstrap_complete_cycles
-                           << ", \"register_release_cycles\": " << trace.register_release_cycles
-                           << ", \"exit_signal_cycles\": " << trace.exit_signal_cycles
-                           << ", \"exit_ack_cycles\": " << trace.exit_ack_cycles << "}";
+                           << ", \"register_release_start_cycles\": " << trace.register_release_start_cycles
+                           << ", \"register_release_end_cycles\": " << trace.register_release_end_cycles
+                           << ", \"exit_signal_start_cycles\": " << trace.exit_signal_start_cycles
+                           << ", \"exit_signal_end_cycles\": " << trace.exit_signal_end_cycles
+                           << ", \"exit_wait_start_cycles\": " << trace.exit_wait_start_cycles
+                           << ", \"exit_wait_end_cycles\": " << trace.exit_wait_end_cycles << "}";
             first = false;
         }
         if (!first) lifecycle_json << "\n  ";
@@ -532,31 +533,26 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         const SchedulerWorkerContext &context = contexts[worker];
         if (context.is_scheduler == 0 || context.worker_index >= SCHEDULER_WORKER_CAPACITY) continue;
         append_scheduler_record(
-            &records[context.worker_index], context.bootstrap_start_cycles, context.bootstrap_end_cycles, 0,
+            &records[context.worker_index], context.bootstrap_start_cycles, context.target_bootstrap_end_cycles, 0,
             "bootstrap", context.bootstrap_task_count, 0, false
         );
     }
     for (uint64_t task_id = 0; task_id < owner.layout.task_count; ++task_id) {
         const SchedulerTaskTrace &trace = traces[task_id];
-        if (trace.fanin_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
+        if (trace.state_probe_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
             append_scheduler_record(
-                &records[trace.fanin_scheduler_worker_id], trace.fanin_start_cycles, trace.fanin_end_cycles,
-                trace.fanin_loop_iter, "fanin", 1, task_id
+                &records[trace.state_probe_scheduler_worker_id], trace.state_probe_start_cycles,
+                trace.state_probe_end_cycles, trace.dispatch_loop_iter, "state_probe", 1, task_id
             );
         }
-        if (trace.claim_worker_id < SCHEDULER_WORKER_CAPACITY) {
-            append_scheduler_record(
-                &records[trace.claim_worker_id], trace.claim_start_cycles, trace.claim_end_cycles,
-                trace.claim_loop_iter,
-                trace.ready_source == static_cast<uint64_t>(SchedulerReadySource::STOLEN) ? "ready_steal" :
-                                                                                            "ready_claim",
-                1, task_id
-            );
-        }
-        if (trace.dispatch_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
+        const auto ready_source = static_cast<SchedulerReadySource>(trace.ready_source);
+        const auto publication_mode = static_cast<SchedulerPublicationMode>(trace.publication_mode);
+        const bool refill = publication_mode == SchedulerPublicationMode::REFILL;
+        if (trace.dispatch_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY && !refill) {
             append_scheduler_record(
                 &records[trace.dispatch_scheduler_worker_id], trace.dispatch_start_cycles, trace.dispatch_end_cycles,
-                trace.dispatch_loop_iter, "dispatch", 1, task_id
+                trace.dispatch_loop_iter, ready_source == SchedulerReadySource::STOLEN ? "worksteal" : "dispatch", 1,
+                task_id
             );
         }
         if (trace.complete_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
@@ -568,7 +564,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         if (trace.refill_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
             append_scheduler_record(
                 &records[trace.refill_scheduler_worker_id], trace.refill_start_cycles, trace.refill_end_cycles,
-                trace.refill_loop_iter, "direct_refill", 1, trace.refill_task_id
+                trace.refill_loop_iter, "refill", 1, trace.refill_task_id
             );
         }
         const SchedulerTaskControl &control = controls[task_id];

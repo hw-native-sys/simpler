@@ -44,6 +44,15 @@ from simpler_setup.tools.scheduler_phase_records import (
 )
 from simpler_setup.tools.strace_timing import host_process_lanes, parse_spans, span_family
 
+_AICORE_SCHEDULER_PHASE_DISPLAY_NAMES = {
+    "complete": "Completion",
+    "resolve": "Resolve",
+    "state_probe": "StateProbe",
+    "dispatch": "Dispatch",
+    "worksteal": "Worksteal",
+    "refill": "Refill",
+}
+
 
 def _func_id_to_letter(func_id):
     """Map a non-negative integer func_id to a numeric+letter label.
@@ -255,7 +264,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
             "records": [[core_id, reg_task_id, dispatch_cycles, finish_cycles], ...]
           },
           "scheduler_records": {"schema_version": 1, "streams": [...]},
-          "aicpu_lifecycle_records": [{worker_id, aicpu_thread_id, ..._cycles}, ...],
+          "aicpu_lifecycle_records": [{aicpu_thread_id, ..._cycles}, ...],
           "aicpu_orchestrator_phases":  [ [ {submit_idx, task_id, start_cycles, end_cycles}, ... ], ... ],
           "host_orchestrator_phases":   [ [ {submit_idx, task_id, start_host_ns, end_host_ns}, ... ], ... ]
         }
@@ -574,16 +583,20 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
             _track(int(pr.get("start_cycles", 0)))
             _track(int(pr.get("end_cycles", 0)))
     lifecycle_cycle_fields = (
-        "handshake_observed_cycles",
-        "handshake_partition_complete_cycles",
+        "handshake_start_cycles",
+        "handshake_complete_cycles",
         "config_start_cycles",
         "topology_complete_cycles",
+        "context_publish_start_cycles",
         "context_publish_complete_cycles",
         "bootstrap_wait_start_cycles",
         "bootstrap_complete_cycles",
-        "register_release_cycles",
-        "exit_signal_cycles",
-        "exit_ack_cycles",
+        "register_release_start_cycles",
+        "register_release_end_cycles",
+        "exit_signal_start_cycles",
+        "exit_signal_end_cycles",
+        "exit_wait_start_cycles",
+        "exit_wait_end_cycles",
     )
     for record in lifecycle_raw:
         for field in lifecycle_cycle_fields:
@@ -1637,19 +1650,20 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             {"args": {"sort_index": 2}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": 6}
         )
         lifecycle_intervals = (
-            ("handshake_partition", "handshake_observed_time_us", "handshake_partition_complete_time_us"),
+            ("handshake_partition", "handshake_start_time_us", "handshake_complete_time_us"),
             ("topology_config", "config_start_time_us", "topology_complete_time_us"),
-            ("context_publish", "topology_complete_time_us", "context_publish_complete_time_us"),
+            ("context_publish", "context_publish_start_time_us", "context_publish_complete_time_us"),
             ("bootstrap_wait", "bootstrap_wait_start_time_us", "bootstrap_complete_time_us"),
-            ("exit_wait", "exit_signal_time_us", "exit_ack_time_us"),
+            ("register_release", "register_release_start_time_us", "register_release_end_time_us"),
+            ("exit_signal", "exit_signal_start_time_us", "exit_signal_end_time_us"),
+            ("exit_wait", "exit_wait_start_time_us", "exit_wait_end_time_us"),
         )
         for record in aicpu_lifecycle_records:
-            worker_id = int(record.get("worker_id", record.get("record_index", 0)))
-            thread_id = int(record.get("aicpu_thread_id", -1))
-            tid = 60000 + worker_id
+            thread_id = int(record.get("aicpu_thread_id", record.get("record_index", 0)))
+            tid = 60000 + thread_id
             events.append(
                 {
-                    "args": {"name": f"worker_{worker_id} (AICPU thread {thread_id})"},
+                    "args": {"name": f"AICPU Thread {thread_id}"},
                     "cat": "__metadata",
                     "name": "thread_name",
                     "ph": "M",
@@ -1657,12 +1671,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     "tid": tid,
                 }
             )
-            identity = {
-                "worker_id": worker_id,
-                "aicpu_thread_id": thread_id,
-                "core_type": record.get("core_type"),
-                "physical_core_id": record.get("physical_core_id"),
-            }
+            identity = {"aicpu_thread_id": thread_id}
             for name, start_field, end_field in lifecycle_intervals:
                 start = float(record.get(start_field, 0.0))
                 end = float(record.get(end_field, 0.0))
@@ -1678,20 +1687,6 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         "tid": tid,
                         "ts": start,
                         "dur": end - start,
-                    }
-                )
-            if "register_release_time_us" in record:
-                register_release = float(record["register_release_time_us"])
-                events.append(
-                    {
-                        "args": identity,
-                        "cat": "aicpu_lifecycle",
-                        "name": "register_release",
-                        "ph": "i",
-                        "s": "t",
-                        "pid": 6,
-                        "tid": tid,
-                        "ts": register_release,
                     }
                 )
 
@@ -2028,9 +2023,12 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             "graph_prepare": "rail_animation",  # bounded Scheduler-side Definition expansion
             "bootstrap": "rail_animation",
             "fanin": "cq_build_running",
+            "state_probe": "cq_build_running",
             "ready_claim": "cq_build_attempt_runnable",
             "ready_steal": "cq_build_attempt_failed",
             "direct_refill": "cq_build_attempt_passed",
+            "worksteal": "cq_build_attempt_failed",
+            "refill": "cq_build_attempt_passed",
             "idle": "grey",
             # Inner in TMR; standalone on HBG's dedicated P thread.
             "resolve": "vsync_highlight_color",  # on_task_complete: walk consumer list
@@ -2106,13 +2104,13 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
 
             # Thread name metadata
             stream = scheduler_streams[thread_idx] if scheduler_streams and thread_idx < len(scheduler_streams) else {}
+            is_aicore_scheduler = stream.get("producer") == "aicore"
             scheduler_id = stream.get("scheduler_id", thread_idx)
-            worker_id = stream.get("worker_id")
-            core_type = stream.get("core_type")
             physical_core_id = stream.get("physical_core_id")
             lane_name = f"Sched_{scheduler_id}"
-            if stream.get("producer") == "aicore":
-                lane_name = f"Scheduler_{scheduler_id} ({core_type}_{physical_core_id}, worker {worker_id})"
+            if is_aicore_scheduler:
+                display_id = physical_core_id if physical_core_id is not None else scheduler_id
+                lane_name = f"Scheduler_{display_id}"
             events.append(
                 {
                     "args": {"name": lane_name},
@@ -2123,7 +2121,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     "tid": tid,
                 }
             )
-            if nested_resolve_ids:
+            if nested_resolve_ids and not is_aicore_scheduler:
                 events.append(
                     {
                         "args": {"name": f"Sched_{thread_idx}"},
@@ -2212,9 +2210,12 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     "graph_prepare",
                     "bootstrap",
                     "fanin",
+                    "state_probe",
                     "ready_claim",
                     "ready_steal",
                     "direct_refill",
+                    "worksteal",
+                    "refill",
                     "idle",
                 ):
                     continue
@@ -2242,6 +2243,9 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     "loop_iter": record.get("loop_iter", 0),
                     "tasks_processed": tasks_processed,
                 }
+                task_id = normalize_task_id_int(record.get("task_id"))
+                if is_aicore_scheduler and task_id is not None:
+                    phase_args["task_id"] = task_id
                 if depths_valid:
                     # Perfetto's args SQL parses key names; `[...]` looks like
                     # an array-index op and crashes the details-panel query.
@@ -2266,8 +2270,20 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         phase_args["finishes_processed"] = matched_finish_rows
                         tasks_processed = matched_finish_rows
                         phase_args["tasks_processed"] = tasks_processed
-                display_name = f"{phase}({tasks_processed})"
-                event_tid = resolve_tid if raw_phase == "resolve" and id(record) in nested_resolve_ids else tid
+                display_phase = (
+                    _AICORE_SCHEDULER_PHASE_DISPLAY_NAMES.get(phase, phase) if is_aicore_scheduler else phase
+                )
+                if not is_aicore_scheduler:
+                    display_name = f"{display_phase}({tasks_processed})"
+                elif task_id is not None:
+                    display_name = f"{display_phase}({format_task_display(task_id)})"
+                else:
+                    display_name = display_phase
+                event_tid = (
+                    resolve_tid
+                    if not is_aicore_scheduler and raw_phase == "resolve" and id(record) in nested_resolve_ids
+                    else tid
+                )
                 events.append(
                     {
                         "args": phase_args,

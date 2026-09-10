@@ -401,11 +401,9 @@ def test_l3_directory_merge_keeps_scheduler_streams_and_lifecycle_records(tmp_pa
         }
         records["aicpu_lifecycle_records"] = [
             {
-                "worker_id": rank + 4,
                 "aicpu_thread_id": rank,
-                "core_type": "aiv",
-                "physical_core_id": rank,
-                "register_release_cycles": device_base + 600,
+                "register_release_start_cycles": device_base + 600,
+                "register_release_end_cycles": device_base + 650,
             }
         ]
         records_path.write_text(json.dumps(records))
@@ -817,20 +815,21 @@ def test_aicore_scheduler_records_keep_common_shape_and_stream_metadata(tmp_path
                 },
                 "aicpu_lifecycle_records": [
                     {
-                        "worker_id": 6,
                         "aicpu_thread_id": 1,
-                        "core_type": "aiv",
-                        "physical_core_id": 9,
-                        "handshake_observed_cycles": 90,
-                        "handshake_partition_complete_cycles": 91,
+                        "handshake_start_cycles": 90,
+                        "handshake_complete_cycles": 91,
                         "config_start_cycles": 92,
                         "topology_complete_cycles": 93,
+                        "context_publish_start_cycles": 93,
                         "context_publish_complete_cycles": 94,
                         "bootstrap_wait_start_cycles": 95,
                         "bootstrap_complete_cycles": 96,
-                        "register_release_cycles": 97,
-                        "exit_signal_cycles": 181,
-                        "exit_ack_cycles": 182,
+                        "register_release_start_cycles": 97,
+                        "register_release_end_cycles": 98,
+                        "exit_signal_start_cycles": 181,
+                        "exit_signal_end_cycles": 182,
+                        "exit_wait_start_cycles": 183,
+                        "exit_wait_end_cycles": 184,
                     }
                 ],
                 "scheduler_records": {
@@ -880,7 +879,7 @@ def test_aicore_scheduler_records_keep_common_shape_and_stream_metadata(tmp_path
     assert data["scheduler_streams"][0]["producer"] == "aicore"
     assert data["scheduler_records"][0][0]["claim_retries"] == 2
     assert data["scheduler_records"][0][1]["task_id"] is None
-    assert data["aicpu_lifecycle_records"][0]["register_release_time_us"] == pytest.approx(0.007)
+    assert data["aicpu_lifecycle_records"][0]["register_release_start_time_us"] == pytest.approx(0.007)
 
     trace_path = tmp_path / "merged_swimlane.json"
     sc.generate_chrome_trace_json(
@@ -895,10 +894,13 @@ def test_aicore_scheduler_records_keep_common_shape_and_stream_metadata(tmp_path
         event.get("name") == "process_name" and event.get("args", {}).get("name") == "AICore Scheduler"
         for event in events
     )
-    assert any(event.get("cat") == "scheduler" and event.get("name") == "idle(0)" for event in events)
+    assert any(event.get("cat") == "scheduler" and event.get("name") == "idle" for event in events)
     assert any(
         event.get("name") == "process_name" and event.get("args", {}).get("name") == "AICPU Lifecycle"
         for event in events
+    )
+    assert any(
+        event.get("name") == "thread_name" and event.get("args", {}).get("name") == "AICPU Thread 1" for event in events
     )
     assert any(event.get("cat") == "aicpu_lifecycle" and event.get("name") == "bootstrap_wait" for event in events)
 
@@ -1145,10 +1147,9 @@ def test_lifecycle_interval_can_start_at_relative_time_origin(tmp_path):
         str(trace_path),
         aicpu_lifecycle_records=[
             {
-                "worker_id": 0,
                 "aicpu_thread_id": 1,
-                "handshake_observed_time_us": 0.0,
-                "handshake_partition_complete_time_us": 2.0,
+                "handshake_start_time_us": 0.0,
+                "handshake_complete_time_us": 2.0,
             }
         ],
     )
@@ -1167,13 +1168,19 @@ def test_lifecycle_register_release_can_be_at_relative_time_origin(tmp_path):
                 "chip_swimlane_level": 1,
                 "metadata": {"clock_freq_hz": 1_000_000_000, "num_cores": 1, "core_types": ["aiv"]},
                 "aicore_tasks": [[0, 7, 7, 120, 180, 10]],
-                "aicpu_lifecycle_records": [{"worker_id": 0, "register_release_cycles": 90}],
+                "aicpu_lifecycle_records": [
+                    {
+                        "aicpu_thread_id": 0,
+                        "register_release_start_cycles": 90,
+                        "register_release_end_cycles": 91,
+                    }
+                ],
             }
         )
     )
 
     data = sc.read_perf_data(raw)
-    assert data["aicpu_lifecycle_records"][0]["register_release_time_us"] == 0.0
+    assert data["aicpu_lifecycle_records"][0]["register_release_start_time_us"] == 0.0
 
     trace_path = tmp_path / "merged_swimlane.json"
     sc.generate_chrome_trace_json(
@@ -1192,7 +1199,7 @@ def test_lifecycle_omits_missing_register_release(tmp_path):
     sc.generate_chrome_trace_json(
         [],
         str(trace_path),
-        aicpu_lifecycle_records=[{"worker_id": 0}],
+        aicpu_lifecycle_records=[{"aicpu_thread_id": 0}],
     )
 
     events = json.loads(trace_path.read_text())["traceEvents"]
@@ -1791,6 +1798,91 @@ def test_tmr_nested_resolve_stays_on_scheduler_sublane(tmp_path):
     resolve = next(event for event in events if event.get("name") == "resolve(0)")
     assert complete["tid"] == 30000
     assert resolve["tid"] == 30001
+
+
+def test_aicore_scheduler_uses_one_lane_and_display_names(tmp_path):
+    out = tmp_path / "trace.json"
+    scheduler_phases = [
+        [
+            {
+                "phase": "complete",
+                "start_time_us": 1.0,
+                "end_time_us": 4.0,
+                "tasks_processed": 1,
+                "task_id": 23,
+            },
+            {
+                "phase": "resolve",
+                "start_time_us": 2.0,
+                "end_time_us": 3.0,
+                "tasks_processed": 1,
+                "task_id": 23,
+            },
+            {
+                "phase": "state_probe",
+                "start_time_us": 4.0,
+                "end_time_us": 5.0,
+                "tasks_processed": 1,
+                "task_id": 5,
+            },
+            {
+                "phase": "dispatch",
+                "start_time_us": 5.0,
+                "end_time_us": 6.0,
+                "tasks_processed": 1,
+                "task_id": 5,
+            },
+            {
+                "phase": "worksteal",
+                "start_time_us": 6.0,
+                "end_time_us": 7.0,
+                "tasks_processed": 1,
+                "task_id": 7,
+            },
+            {
+                "phase": "refill",
+                "start_time_us": 7.0,
+                "end_time_us": 8.0,
+                "tasks_processed": 1,
+                "task_id": 9,
+            },
+        ]
+    ]
+    scheduler_streams = [
+        {
+            "producer": "aicore",
+            "scheduler_id": 4,
+            "worker_id": 36,
+            "core_type": "aiv",
+            "physical_core_id": 26,
+        }
+    ]
+
+    sc.generate_chrome_trace_json(
+        [], str(out), scheduler_phases=scheduler_phases, scheduler_streams=scheduler_streams, core_to_thread=[0]
+    )
+
+    events = json.loads(out.read_text())["traceEvents"]
+    scheduler_metadata = [
+        event
+        for event in events
+        if event.get("ph") == "M"
+        and event.get("pid") == 2
+        and event.get("name") == "thread_name"
+        and event.get("tid") != 3999
+    ]
+    assert [(event["tid"], event["args"]["name"]) for event in scheduler_metadata] == [(30000, "Scheduler_26")]
+    phases = [event for event in events if event.get("cat") == "scheduler"]
+    assert {event["tid"] for event in phases} == {30000}
+    assert [event["name"] for event in phases] == [
+        "Completion(t23)",
+        "Resolve(t23)",
+        "StateProbe(t5)",
+        "Dispatch(t5)",
+        "Worksteal(t7)",
+        "Refill(t9)",
+    ]
+    assert [event["args"]["task_id"] for event in phases] == [23, 23, 5, 5, 7, 9]
 
 
 def test_complete_flow_worker_view_only_without_scheduler_phases(tmp_path):

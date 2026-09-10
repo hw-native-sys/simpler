@@ -444,7 +444,9 @@ AICPU Scheduler: `dispatch_time` is the end of dispatch publication and
 `scheduler_tasks.producer` field identifies which Scheduler produced these
 timestamps. At level 2 and above, A5 HBG also exports AICPU lifecycle timestamps
 for handshake, topology/configuration, context publication, bootstrap wait,
-register release, and exit; these are supplemental control-plane records.
+register release, and exit. Collection and rendering use one record per AICPU
+thread; topology/configuration is present only on the leader thread. These are
+supplemental control-plane records.
 
 At level 3 and above, A5 HBG AICore Scheduler task intervals reuse the per-task
 trace. Consecutive taskless scheduler-loop iterations are coalesced into one
@@ -454,6 +456,28 @@ keeps capture size dependent on idle-to-active transitions instead of Host CPU
 speed in simulation. The buffer is not allocated below level 3. Interval
 endpoints are captured at operation entry and exit; no interval is synthesized
 from aggregate durations.
+
+Each AICore Scheduler stream renders on one lane. Bootstrap covers dependency
+initialization and Slot setup, then ends before the initial task dispatch; the
+per-task Fanin work is therefore not emitted as a nested phase. Runtime task
+processing uses flat, non-overlapping phases:
+
+- `complete` consumes a Completion Inbox entry and marks the task done.
+- `resolve` updates successor dependencies and publishes newly Ready tasks.
+- `state_probe` checks Cluster Slot / Ready state, acquires a Ready task locally
+  or by stealing, and decides immediate or deferred placement.
+- `dispatch` fills and publishes a task acquired from the local Inbox.
+- `worksteal` fills and publishes a task acquired from another Inbox; the steal
+  operation itself is included in `state_probe`.
+- `refill` republishes a completed Slot with replacement work.
+
+Deferred waiting is not emitted as a Scheduler phase. The original
+`state_probe` ends before the wait, and the eventual publication begins at its
+actual `dispatch` or `refill` start.
+
+Every executed task is published by exactly one of `dispatch`, `worksteal`, or
+`refill`. The converter displays these phases as Completion, Resolve,
+StateProbe, Dispatch, Worksteal, and Refill.
 
 At level 1 the AICore record carries the full `task_token_raw`
 (a `TaskId::raw`; see `src/common/host_build_graph/task_id.h`), read straight from

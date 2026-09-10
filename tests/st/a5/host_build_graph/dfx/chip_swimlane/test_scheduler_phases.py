@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 
 import torch
 from simpler.task_interface import ArgDirection as D
@@ -100,7 +101,24 @@ class TestSchedulerPhases(SceneTestCase):
                 for core_id, reg_task_id, dispatch_cycles, finish_cycles in scheduler_rows:
                     aicore_row = aicore_by_key[(int(core_id), int(reg_task_id))]
                     assert 0 < dispatch_cycles <= aicore_row[3] <= aicore_row[4] <= finish_cycles
-                assert raw["aicpu_lifecycle_records"], "AICPU lifecycle records are missing"
+                lifecycle_records = raw["aicpu_lifecycle_records"]
+                assert lifecycle_records, "AICPU lifecycle records are missing"
+                thread_ids = [int(record["aicpu_thread_id"]) for record in lifecycle_records]
+                assert thread_ids == list(range(len(thread_ids)))
+                assert all("worker_id" not in record for record in lifecycle_records)
+                for record in lifecycle_records:
+                    assert 0 < record["handshake_start_cycles"] <= record["handshake_complete_cycles"]
+                    assert 0 < record["context_publish_start_cycles"] <= record["context_publish_complete_cycles"]
+                    assert 0 < record["bootstrap_wait_start_cycles"] <= record["bootstrap_complete_cycles"]
+                    assert 0 < record["register_release_start_cycles"] <= record["register_release_end_cycles"]
+                    assert 0 < record["exit_signal_start_cycles"] <= record["exit_signal_end_cycles"]
+                    assert 0 < record["exit_wait_start_cycles"] <= record["exit_wait_end_cycles"]
+                leader = lifecycle_records[0]
+                assert 0 < leader["config_start_cycles"] <= leader["topology_complete_cycles"]
+                assert all(
+                    record["config_start_cycles"] == record["topology_complete_cycles"] == 0
+                    for record in lifecycle_records[1:]
+                )
             else:
                 assert "scheduler_tasks" not in raw
                 assert "aicpu_lifecycle_records" not in raw
@@ -111,9 +129,48 @@ class TestSchedulerPhases(SceneTestCase):
                 assert all(stream["producer"] == "aicore" for stream in streams)
                 assert all(stream["capture"]["dropped"] == 0 for stream in streams)
                 emitted_kinds = {record["kind"] for stream in streams for record in stream["records"]}
-                required_kinds = {"bootstrap", "fanin", "dispatch", "complete", "resolve", "idle"}
+                required_kinds = {"bootstrap", "state_probe", "dispatch", "complete", "resolve", "refill", "idle"}
                 assert required_kinds <= emitted_kinds, (
                     f"missing Scheduler kinds: {sorted(required_kinds - emitted_kinds)}"
+                )
+                assert not ({"fanin", "ready_claim", "ready_steal", "direct_refill"} & emitted_kinds)
+                records = [record for stream in streams for record in stream["records"]]
+                launch_kinds = {"dispatch", "worksteal", "refill"}
+                launches_by_task = Counter(
+                    int(record["task_id"])
+                    for record in records
+                    if record["kind"] in launch_kinds and record["task_id"] is not None
+                )
+                assert set(launches_by_task) == {int(row[1]) for row in aicore_rows}
+                assert set(launches_by_task.values()) == {1}
+                probes_by_task = Counter(
+                    int(record["task_id"])
+                    for record in records
+                    if record["kind"] == "state_probe" and record["task_id"] is not None
+                )
+                assert probes_by_task == launches_by_task
+                for stream in streams:
+                    ordered = sorted(
+                        stream["records"],
+                        key=lambda record: (record["start_cycles"], record["end_cycles"]),
+                    )
+                    assert all(
+                        previous["end_cycles"] <= current["start_cycles"]
+                        for previous, current in zip(ordered, ordered[1:])
+                    )
+                probe_by_task = {
+                    int(record["task_id"]): record
+                    for record in records
+                    if record["kind"] == "state_probe" and record["task_id"] is not None
+                }
+                launch_by_task = {
+                    int(record["task_id"]): record
+                    for record in records
+                    if record["kind"] in launch_kinds and record["task_id"] is not None
+                }
+                assert all(
+                    probe_by_task[task_id]["end_cycles"] <= launch["start_cycles"]
+                    for task_id, launch in launch_by_task.items()
                 )
             else:
                 assert "scheduler_records" not in raw

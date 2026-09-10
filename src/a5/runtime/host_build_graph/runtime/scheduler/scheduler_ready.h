@@ -97,29 +97,15 @@ struct SchedulerReadyClaim {
     int64_t task_id{SCHEDULER_TASK_ID_INVALID};
     uint64_t inbox_index{UINT64_MAX};
     SchedulerReadySource source{SchedulerReadySource::LOCAL};
-    uint64_t claim_start_cycles{0};
-    uint64_t claim_end_cycles{0};
+    SchedulerPublicationMode publication_mode{SchedulerPublicationMode::DISPATCH};
+    uint64_t state_probe_start_cycles{0};
+    uint64_t state_probe_end_cycles{0};
 };
 
 struct SchedulerFreeSlotClaim {
     uint64_t worker_id{UINT64_MAX};
     uint32_t slot_index{UINT32_MAX};
     uint32_t generation{0};
-};
-
-struct SchedulerCompletionServiceTiming {
-    uint64_t scan_cycles{0};
-    uint64_t consume_cycles{0};
-    uint64_t resolve_cycles{0};
-    uint64_t ready_publish_cycles{0};
-    uint64_t refill_cycles{0};
-    uint64_t finalize_cycles{0};
-};
-
-struct SchedulerDispatchFillTiming {
-    uint64_t prepare_cycles{0};
-    uint64_t materialize_cycles{0};
-    uint64_t publish_cycles{0};
 };
 
 inline __aicore__ uint64_t scheduler_cycles() {
@@ -829,7 +815,7 @@ inline __aicore__ uint64_t scheduler_load_ready_directory_shard(
 inline __aicore__ bool scheduler_steal_ready_from_shard(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *context,
     __gm__ SchedulerRunControl *run_control, uint32_t core_type_index, uint64_t shard_begin, uint64_t shard_end,
-    uint64_t start, uint64_t bits, SchedulerReadyStats *stats, SchedulerReadyClaim *claim, uint64_t profiling_level
+    uint64_t start, uint64_t bits, SchedulerReadyStats *stats, SchedulerReadyClaim *claim
 ) {
     int64_t task_id = SCHEDULER_TASK_ID_INVALID;
     bits &= ~(UINT64_C(1) << (context->inbox_index - shard_begin));
@@ -852,7 +838,6 @@ inline __aicore__ bool scheduler_steal_ready_from_shard(
                 claim->task_id = task_id;
                 claim->inbox_index = victim;
                 claim->source = SchedulerReadySource::STOLEN;
-                claim->claim_end_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
                 if (stats != nullptr) ++stats->steal_count;
                 return true;
             }
@@ -865,14 +850,13 @@ inline __aicore__ bool scheduler_claim_ready_for_slot(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *context,
     __gm__ SchedulerRunControl *run_control, uint64_t scheduler_count, uint32_t core_type_index,
     uint64_t *victim_cursor, SchedulerReadyStats *stats, SchedulerReadyClaim *claim,
-    __gm__ SchedulerReadyOwnerState *owner_state, uint64_t profiling_level = 0
+    __gm__ SchedulerReadyOwnerState *owner_state
 ) {
     if (victim_cursor == nullptr || claim == nullptr || owner_state == nullptr || scheduler_count == 0 ||
         scheduler_count > SCHEDULER_CAPACITY || context->inbox_index >= scheduler_count ||
         core_type_index >= SCHEDULER_CORE_TYPE_COUNT)
         return false;
     *claim = {};
-    claim->claim_start_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
     if (!scheduler_ready_owner_maintain_type(scheduler_state_base, context, core_type_index, owner_state)) return false;
     int64_t task_id = SCHEDULER_TASK_ID_INVALID;
     if (!scheduler_ready_pop_from_inbox(
@@ -882,7 +866,6 @@ inline __aicore__ bool scheduler_claim_ready_for_slot(
     if (task_id >= 0) {
         claim->task_id = task_id;
         claim->inbox_index = context->inbox_index;
-        claim->claim_end_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
         return true;
     }
 
@@ -897,13 +880,11 @@ inline __aicore__ bool scheduler_claim_ready_for_slot(
         scheduler_load_ready_directory_shard(directory, scheduler_count, core_type_index, context->inbox_index);
     if (bits != 0 && !scheduler_steal_ready_from_shard(
                          graph, scheduler_state_base, context, run_control, core_type_index, shard_begin, shard_end,
-                         start, bits, stats, claim, profiling_level
+                         start, bits, stats, claim
                      ))
         return false;
     const uint64_t cursor_base = claim->task_id >= 0 ? claim->inbox_index : start;
     *victim_cursor = cursor_base + 1 == shard_end ? shard_begin : cursor_base + 1;
-    if (claim->task_id >= 0) return true;
-    claim->claim_end_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
     return true;
 }
 
@@ -932,18 +913,16 @@ inline __aicore__ void scheduler_initialize_free_slot(__gm__ SchedulerDispatchSl
 inline __aicore__ bool scheduler_fill_dispatch_slot(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *scheduler,
     __gm__ SchedulerRunControl *run_control, const SchedulerFreeSlotClaim &slot_claim,
-    const SchedulerReadyClaim &ready_claim, uint64_t profiling_level = 0, SchedulerDispatchFillTiming *timing = nullptr
+    const SchedulerReadyClaim &ready_claim, uint64_t profiling_level = 0
 ) {
     if (ready_claim.task_id < 0 || static_cast<uint64_t>(ready_claim.task_id) >= graph.task_count ||
         slot_claim.worker_id >= scheduler->runtime_worker_count ||
         slot_claim.slot_index >= SCHEDULER_PENDING_SLOT_COUNT)
         return false;
-    const bool record_timeline = timing != nullptr;
     const bool task_timing_enabled = scheduler_task_timing_enabled(profiling_level);
     const bool schedule_timing_enabled = scheduler_schedule_timing_enabled(profiling_level);
     const bool phase_timing_enabled = scheduler_phase_timing_enabled(profiling_level);
     const uint64_t dispatch_start_cycles = phase_timing_enabled ? scheduler_cycles() : 0;
-    uint64_t operation_start = record_timeline ? scheduler_cycles() : 0;
     __gm__ SchedulerTaskMetadata *metadata_source =
         scheduler_task_metadata_at(scheduler_state_base, scheduler, ready_claim.task_id);
     scheduler_observe_cache_line(metadata_source);
@@ -989,14 +968,9 @@ inline __aicore__ bool scheduler_fill_dispatch_slot(
     }
 
     slot->task_id = ready_claim.task_id;
-    slot->ready_inbox_index = ready_claim.inbox_index;
-    slot->claim_start_cycles = ready_claim.claim_start_cycles;
-    slot->claim_end_cycles = ready_claim.claim_end_cycles;
-    slot->claim_worker_id = scheduler->worker_index;
     slot->kernel_id = kernel_id;
     slot->subtask_slot = subtask_slot;
     slot->has_fanin = scheduler_task_has_fanin(metadata.flags) ? 1 : 0;
-    slot->ready_source = static_cast<uint8_t>(ready_claim.source);
     slot->pending_slot = static_cast<uint8_t>(slot_claim.slot_index);
     slot->generation = generation;
     slot->block_idx = 0;
@@ -1008,9 +982,6 @@ inline __aicore__ bool scheduler_fill_dispatch_slot(
 
     const uint64_t dispatch_payload_offset =
         target->dispatch_payload_offset + static_cast<uint64_t>(slot_claim.slot_index) * sizeof(DispatchPayload);
-
-    uint64_t operation_end = record_timeline ? scheduler_cycles() : 0;
-    if (timing != nullptr) timing->prepare_cycles += operation_end - operation_start;
 
     SchedulerTaskInfo task{
         ready_claim.task_id,
@@ -1044,8 +1015,6 @@ inline __aicore__ bool scheduler_fill_dispatch_slot(
         );
         return false;
     }
-    uint64_t materialize_end = record_timeline ? scheduler_cycles() : 0;
-    if (timing != nullptr) timing->materialize_cycles += materialize_end - operation_end;
     scheduler_publish_dispatch_payload(payload);
     __gm__ SchedulerTaskControl *control =
         scheduler_task_control_at(scheduler_state_base, scheduler, ready_claim.task_id);
@@ -1054,8 +1023,6 @@ inline __aicore__ bool scheduler_fill_dispatch_slot(
         control->ready_publish_cycles = scheduler_cycles();
         scheduler_publish_cache_line(&control->next_waiter);
     }
-    uint64_t publish_end = record_timeline ? scheduler_cycles() : 0;
-    if (timing != nullptr) timing->publish_cycles += publish_end - materialize_end;
     if (task_timing_enabled) {
         __gm__ SchedulerTaskTrace *traces =
             scheduler_state_at<SchedulerTaskTrace>(scheduler_state_base, scheduler->trace_cells_offset);
@@ -1064,10 +1031,11 @@ inline __aicore__ bool scheduler_fill_dispatch_slot(
         trace->task_id = static_cast<uint64_t>(ready_claim.task_id);
         if (phase_timing_enabled) {
             trace->ready_source = static_cast<uint64_t>(ready_claim.source);
-            trace->claim_worker_id = scheduler->worker_index;
-            trace->claim_start_cycles = ready_claim.claim_start_cycles;
-            trace->claim_end_cycles = ready_claim.claim_end_cycles;
-            trace->claim_loop_iter = scheduler->profiling_loop_iter;
+            trace->publication_mode = static_cast<uint64_t>(ready_claim.publication_mode);
+            trace->state_probe_scheduler_worker_id = scheduler->worker_index;
+            trace->state_probe_start_cycles = ready_claim.state_probe_start_cycles;
+            trace->state_probe_end_cycles =
+                ready_claim.state_probe_end_cycles == 0 ? dispatch_start_cycles : ready_claim.state_probe_end_cycles;
             trace->dispatch_start_cycles = dispatch_start_cycles;
             trace->dispatch_scheduler_worker_id = scheduler->worker_index;
             trace->dispatch_loop_iter = scheduler->profiling_loop_iter;
@@ -1086,8 +1054,7 @@ inline __aicore__ bool scheduler_resolve_completion(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *context,
     __gm__ SchedulerRunControl *run_control, int64_t task_id, SchedulerWakeStats *wake_stats,
     SchedulerReadyStats *ready_stats, SchedulerCompletionStats *completion_stats,
-    __gm__ SchedulerReadyOwnerState *owner_state, uint64_t profiling_level = 0, bool validate_done_state = true,
-    uint64_t *ready_publish_cycles = nullptr
+    __gm__ SchedulerReadyOwnerState *owner_state, uint64_t profiling_level = 0, bool validate_done_state = true
 ) {
     if (owner_state == nullptr) return false;
     __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, context, task_id);
@@ -1167,7 +1134,6 @@ inline __aicore__ bool scheduler_resolve_completion(
         }
         waiter = next;
     }
-    uint64_t ready_publish_start = ready_publish_cycles == nullptr ? 0 : scheduler_cycles();
     for (uint32_t type = 0; type < SCHEDULER_CORE_TYPE_COUNT; ++type) {
         if (!scheduler_ready_batch_push(
                 scheduler_state_base, context, type, context->inbox_index, &batches[type], ready_stats, owner_state
@@ -1179,7 +1145,6 @@ inline __aicore__ bool scheduler_resolve_completion(
             return false;
         }
     }
-    if (ready_publish_cycles != nullptr) *ready_publish_cycles += scheduler_cycles() - ready_publish_start;
     if (phase_timing_enabled) {
         control->completion_resolve_end_cycles = scheduler_cycles();
         scheduler_publish_cache_line(&control->next_waiter);

@@ -1034,7 +1034,10 @@ def run_analysis(  # noqa: PLR0912, PLR0915
     phase_labels = {
         "complete": "Complete (poll handshake, completion handling)",
         "async_poll": "AsyncPoll (async-wait completion: SDMA/RoCE/URMA/CCU)",
+        "state_probe": "StateProbe (available work and Cluster Slot query)",
         "dispatch": "Dispatch (pop queue, build payload, flush)",
+        "worksteal": "Worksteal (remote Inbox claim and dispatch)",
+        "refill": "Refill (completed Slot reuse)",
         "release": "Release (deferred producer release)",
         "dummy": "Dummy (dependency-only task resolution)",
         "early_dispatch": "EarlyDispatch (speculative staging)",

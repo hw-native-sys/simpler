@@ -270,6 +270,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     // Only the leader polls the shared bootstrap line. Peers wait in AICPU
     // local memory, avoiding six concurrent cache invalidates on the same GM
     // cache line. The following release is the sole AICore-wide DMB gate.
+    aicore_lifecycle_.begin_bootstrap_wait(tidx);
     if (is_leader) {
         if (!init_failed_.load(std::memory_order_acquire) && aicore_lifecycle_.wait_bootstrap_complete(runtime) != 0) {
             init_failed_.store(true, std::memory_order_release);
@@ -284,6 +285,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
             init_failed_.store(true, std::memory_order_release);
         }
     }
+    aicore_lifecycle_.end_bootstrap_wait(tidx);
 
     // The DMB register is the only execution gate. On failure the same
     // partitioned path sends EXIT and waits for every ACK.

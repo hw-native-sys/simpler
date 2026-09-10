@@ -13,7 +13,10 @@ import bisect
 SCHED_OUTER_PHASES = (
     "complete",
     "async_poll",
+    "state_probe",
     "dispatch",
+    "worksteal",
+    "refill",
     "release",
     "dummy",
     "early_dispatch",
@@ -21,7 +24,19 @@ SCHED_OUTER_PHASES = (
     "graph_prepare",
 )
 
-_SCHEDULER_WORK_PHASES = frozenset({"complete", "dispatch", "release", "early_dispatch", "drain", "graph_prepare"})
+_SCHEDULER_WORK_PHASES = frozenset(
+    {
+        "complete",
+        "state_probe",
+        "dispatch",
+        "worksteal",
+        "refill",
+        "release",
+        "early_dispatch",
+        "drain",
+        "graph_prepare",
+    }
+)
 _RESOLUTION_WORK_PHASES = frozenset({"resolve", "resolve_standalone", "async_poll", "dummy"})
 
 
