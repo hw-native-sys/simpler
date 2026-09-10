@@ -150,6 +150,13 @@ struct HostApiOps {
     bool (*publish_chip_swimlane_extension)(
         void *runner_ctx, ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size
     );
+    // This context's execution identity. A kernel-mode context is
+    // context-static: every device buffer reached through this table is sized
+    // once and keeps its address for the context's life, because a captured
+    // graph replays the addresses of the run it captured. Runtime code reads
+    // this where it would otherwise resize such a buffer, so it can refuse
+    // instead. A table that does not supply it reports program mode.
+    bool (*is_kernel_mode)(void *runner_ctx);
 };
 
 /**
@@ -269,6 +276,13 @@ public:
         } catch (...) {
             return false;
         }
+    }
+    /**
+     * True when this run belongs to a kernel-mode context, whose device
+     * buffers hold their addresses for the life of the context.
+     */
+    bool is_kernel_mode() const noexcept {
+        return ops_->is_kernel_mode != nullptr && ops_->is_kernel_mode(runner_ctx_);
     }
 
 private:
