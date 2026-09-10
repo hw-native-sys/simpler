@@ -117,7 +117,15 @@ int DeviceRunner::ensure_acl_ready(int device_id) {
     // acl_ready_ == false path is intercepted by the kernel-mode branch
     // inside finalize(). Together these keep the caller's device and ACL
     // state unreachable in kernel mode.
-    if (execution_mode_latch().is_kernel()) {
+    // Latching rather than only reading is what makes class (c) above true:
+    // acl_ready_ is set only below this point, so it can be true only on a
+    // context this entry has already latched PROGRAM, and the write-once latch
+    // then refuses a later kernel init on that same context. Reading alone
+    // would leave the reverse order open — ensure_acl_ready on a mode-less
+    // context, kernel init afterwards — and finalize() would reset a borrowed
+    // card. Every reachable caller arrives on a context simpler_init already
+    // latched PROGRAM, for which latching is idempotent.
+    if (execution_mode_latch().latch(SIMPLER_MODE_PROGRAM) != 0) {
         LOG_ERROR("ensure_acl_ready: refused — a kernel-mode context does not own the caller's ACL lifecycle");
         return PTO_RUNTIME_ERR_UNSUPPORTED;
     }

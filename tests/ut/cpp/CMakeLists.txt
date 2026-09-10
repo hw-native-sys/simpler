@@ -1520,4 +1520,50 @@ if(SIMPLER_ENABLE_HARDWARE_TESTS)
         RESOURCE_GROUPS "2,npus:1"
     )
 
+    # Kernel-mode entry layer: the four C ABI entries reached on a device and
+    # stream the test owns.  Unlike test_comm_lifecycle this also links
+    # hierarchical_objs, because half of what it pins down is ChipWorker's own
+    # kernel entry points calling through to those symbols.  ChipWorker there
+    # dlopens the same libhost_runtime.so this target bakes in, so both halves
+    # exercise one module.
+    #
+    # The three binaries are what ChipWorker::kernel_init reads and forwards;
+    # the test skips when any of them is missing rather than asserting on a
+    # tree where the onboard runtime was never built.
+    set(ONBOARD_TRB_DIR "${PROJECT_ROOT}/build/lib/a2a3/onboard/tensormap_and_ringbuffer")
+    add_executable(test_kernel_mode_entry hardware/test_kernel_mode_entry.cpp)
+    # The default host-span adapter, as add_hierarchical_test supplies it to
+    # every other ChipWorker-linking test.
+    target_sources(test_kernel_mode_entry PRIVATE
+        ${PROJECT_ROOT}/src/common/log/unified_log_host.cpp)
+    target_include_directories(test_kernel_mode_entry PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${PROJECT_ROOT}/src/a2a3/platform/include
+        ${PROJECT_ROOT}/src/common/platform/include
+        ${PROJECT_ROOT}/src/common
+        ${ASCEND_HOME_PATH}/include
+    )
+    target_compile_definitions(test_kernel_mode_entry PRIVATE
+        PTO_HOST_RUNTIME_LIB_PATH="${HOST_RUNTIME_LIB}"
+        PTO_KERNEL_UT_AICPU_PATH="${ONBOARD_TRB_DIR}/libaicpu_kernel.so"
+        PTO_KERNEL_UT_AICORE_PATH="${ONBOARD_TRB_DIR}/aicore_kernel.o"
+        PTO_KERNEL_UT_DISPATCHER_PATH="${PROJECT_ROOT}/build/lib/a2a3/dispatcher/libsimpler_aicpu_dispatcher.so"
+    )
+    target_link_libraries(test_kernel_mode_entry PRIVATE
+        hierarchical_objs
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        ${ASCENDCL_LIB}
+        pthread
+        dl
+    )
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(test_kernel_mode_entry PRIVATE rt)
+    endif()
+    add_test(NAME test_kernel_mode_entry COMMAND test_kernel_mode_entry)
+    set_tests_properties(test_kernel_mode_entry PROPERTIES
+        LABELS "requires_hardware_a2a3"
+        RESOURCE_GROUPS "1,npus:1"
+    )
+
 endif()

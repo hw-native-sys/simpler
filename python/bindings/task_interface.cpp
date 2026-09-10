@@ -109,6 +109,8 @@ public:
     int (*aclInit)(const char *){nullptr};
     int (*aclrtSetDevice)(int){nullptr};
     int (*aclrtGetDevice)(int *){nullptr};
+    int (*aclrtCreateStream)(void **){nullptr};
+    int (*aclrtDestroyStream)(void *){nullptr};
     int (*aclrtMemcpy)(void *, size_t, const void *, size_t, int){nullptr};
     int (*aclrtMemGetAllocationGranularity)(LocalAclPhysicalMemProp *, int, size_t *){nullptr};
     int (*aclrtMallocPhysical)(void **, size_t, const LocalAclPhysicalMemProp *, uint64_t){nullptr};
@@ -132,6 +134,8 @@ public:
         aclInit = reinterpret_cast<int (*)(const char *)>(resolve_symbol("aclInit"));
         aclrtSetDevice = reinterpret_cast<int (*)(int)>(resolve_symbol("aclrtSetDevice"));
         aclrtGetDevice = reinterpret_cast<int (*)(int *)>(resolve_symbol("aclrtGetDevice"));
+        aclrtCreateStream = reinterpret_cast<int (*)(void **)>(resolve_symbol("aclrtCreateStream"));
+        aclrtDestroyStream = reinterpret_cast<int (*)(void *)>(resolve_symbol("aclrtDestroyStream"));
         aclrtMemcpy =
             reinterpret_cast<int (*)(void *, size_t, const void *, size_t, int)>(resolve_symbol("aclrtMemcpy"));
         aclrtMemGetAllocationGranularity = reinterpret_cast<int (*)(LocalAclPhysicalMemProp *, int, size_t *)>(
@@ -171,6 +175,14 @@ public:
     }
 
     void bind_device_with_check(int device_id) const { acl_check(aclrtSetDevice(device_id), "aclrtSetDevice"); }
+
+    void *create_stream_with_check() const {
+        void *stream = nullptr;
+        acl_check(aclrtCreateStream(&stream), "aclrtCreateStream");
+        return stream;
+    }
+
+    void destroy_stream_with_check(void *stream) const { acl_check(aclrtDestroyStream(stream), "aclrtDestroyStream"); }
 
     int current_device_with_check() const {
         int device_id = -1;
@@ -3323,6 +3335,62 @@ NB_MODULE(_task_interface, m) {
             "of the device orch SO buffer (kernel binaries stay resident until "
             "finalize)."
         )
+        .def(
+            "kernel_init",
+            [](ChipWorker &self, const std::string &host_lib_path, const std::string &aicpu_path,
+               const std::string &aicore_path, const std::string &dispatcher_path, int device_id,
+               const CallConfig &config, uint64_t context_generation, const std::string &sim_context_path) {
+                self.kernel_init(
+                    host_lib_path, aicpu_path, aicore_path, dispatcher_path, device_id, config, context_generation,
+                    sim_context_path
+                );
+            },
+            nb::arg("host_lib_path"), nb::arg("aicpu_path"), nb::arg("aicore_path"), nb::arg("dispatcher_path"),
+            nb::arg("device_id"), nb::arg("config"), nb::arg("context_generation"), nb::arg("sim_context_path") = "",
+            // Same reasoning as init: the native binding and device-context
+            // construction are long enough that another Python thread must be
+            // able to run during them.
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Bind the runtime library as a kernel-mode context on the device the "
+            "caller has already made current. Mutually exclusive with init. Takes "
+            "no ownership of the caller's device: no aclInit, no aclrtSetDevice, "
+            "no reset. Raises if the runtime does not support kernel mode."
+        )
+        .def(
+            "kernel_prepare_callable",
+            [](ChipWorker &self, int32_t callable_id, const PyChipCallable &callable, uint64_t caller_stream) {
+                self.kernel_prepare_callable(
+                    callable_id, callable.buffer_.data(), callable.buffer_.size(),
+                    reinterpret_cast<void *>(caller_stream)
+                );
+            },
+            nb::arg("callable_id"), nb::arg("callable"), nb::arg("caller_stream"),
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Stage a callable for kernel-mode launches on the caller's stream. "
+            "caller_stream is an aclrtStream as an integer address — the same "
+            "thing torch_npu.npu.current_stream().npu_stream yields. The stream is "
+            "borrowed for this call only and is never stored or destroyed here."
+        )
+        .def(
+            "kernel_launch",
+            [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, uint64_t caller_stream) {
+                self.kernel_launch(callable_id, &args, reinterpret_cast<void *>(caller_stream));
+            },
+            nb::arg("callable_id"), nb::arg("args"), nb::arg("caller_stream"), nb::call_guard<nb::gil_scoped_release>(),
+            "Enqueue one bounded asynchronous kernel-mode invocation on the "
+            "caller's stream. Returning means the sequence was enqueued; device "
+            "execution may still be in flight and may still fail asynchronously."
+        )
+        .def_prop_ro(
+            "kernel_mode_supported", &ChipWorker::kernel_mode_supported,
+            "Whether the bound runtime can execute kernel-mode launches. Requires "
+            "a bound runtime, so it answers for the runtime this worker loaded."
+        )
+        .def_static(
+            "next_kernel_context_generation", &ChipWorker::next_kernel_context_generation,
+            "A nonzero context generation, unique and increasing within this host "
+            "process. Generation zero is what the C ABI rejects as invalid."
+        )
         .def_prop_ro("device_id", &ChipWorker::device_id)
         .def_prop_ro("initialized", &ChipWorker::initialized)
         .def_prop_ro("pipeline_depth", &ChipWorker::pipeline_depth)
@@ -3576,6 +3644,44 @@ NB_MODULE(_task_interface, m) {
         },
         nb::arg("device_id"), nb::arg("shareable_handle"), nb::arg("mapping_bytes"), nb::arg("owner_token"),
         nb::call_guard<nb::gil_scoped_release>(), "Import an onboard VMM mapped region."
+    );
+    // Kernel mode borrows a stream the caller already owns, and in production
+    // that caller is a framework which has one — torch_npu hands out
+    // torch_npu.npu.current_stream().npu_stream. These two exist for the
+    // callers that are not a framework: they let Python stand up the borrowing
+    // side itself. simpler never creates a stream on its own kernel-mode path,
+    // so a stream from here is owned by whoever called it and must be destroyed
+    // by them.
+    m.def(
+        "_acl_create_stream",
+        []() {
+            acl_api().init();
+            return reinterpret_cast<uint64_t>(acl_api().create_stream_with_check());
+        },
+        nb::call_guard<nb::gil_scoped_release>(),
+        "Create an aclrtStream on the calling thread's current device and return "
+        "its integer address. The caller owns it and must pass it to "
+        "_acl_destroy_stream."
+    );
+    m.def(
+        "_acl_destroy_stream",
+        [](uint64_t stream) {
+            if (stream == 0) {
+                throw std::invalid_argument("_acl_destroy_stream requires a non-null stream address");
+            }
+            acl_api().destroy_stream_with_check(reinterpret_cast<void *>(stream));
+        },
+        nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(), "Destroy a stream created by _acl_create_stream."
+    );
+    m.def(
+        "_acl_bind_device",
+        [](int device_id) {
+            acl_api().init();
+            acl_api().bind_device_with_check(device_id);
+        },
+        nb::arg("device_id"), nb::call_guard<nb::gil_scoped_release>(),
+        "Run aclInit once and bind the calling thread to device_id, so this "
+        "thread can create the stream it lends to a kernel-mode context."
     );
     m.def(
         "_region_close",
