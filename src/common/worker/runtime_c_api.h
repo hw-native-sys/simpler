@@ -543,7 +543,7 @@ size_t get_run_stream_set_create_count(DeviceContextHandle ctx);
  * above. simpler_kernel_mode_init latches kernel mode, which borrows the
  * caller's already-current device and caller-owned stream to enqueue one
  * bounded asynchronous operator per launch: no device reset, no internal
- * stream/device synchronize on the prepare/launch/close paths, zero
+ * stream/device synchronize on the launch path, zero
  * allocation at launch, and no capture/model-state queries, so a launch is
  * capturable by ACLGraph as an ordinary node.
  *
@@ -555,8 +555,8 @@ size_t get_run_stream_set_create_count(DeviceContextHandle ctx);
  * simpler_init latches PROGRAM before touching any process or runner state, so
  * the mutual exclusion is enforced on every program init. Every kernel-mode
  * guard on the device/ACL lifecycle and arena paths keys on the latch reading
- * kernel; none of the entries below latches yet, so today only program
- * contexts exist and those guards never fire.
+ * kernel. Onboard kernel init latches the identity before creating resources;
+ * simulated kernel init remains unsupported.
  *
  * Kernel-mode capacity is a mode invariant, not a gated state: `config` is
  * context-static, so each pooled arena region is committed at most once and
@@ -566,17 +566,15 @@ size_t get_run_stream_set_create_count(DeviceContextHandle ctx);
  * CallConfig.runtime_env like everywhere else.
  *
  * All four entries below are part of the required dlsym surface: every
- * host_runtime.so exports them, and variants without kernel-mode support
- * export stubs that run the same structural validation and then refuse —
- * supported returns 0, init reports PTO_RUNTIME_ERR_UNSUPPORTED, and
- * prepare_callable and launch report PTO_RUNTIME_ERR_INVALID_STATE because
- * no kernel context is live. The fifth lifecycle entry is the existing
- * finalize_device(): in kernel mode it releases only context-owned resources
- * and never resets the device or finalizes ACL. device_id_ records which
- * device a context is on rather than a claim on it, so a kernel context
- * reaches that teardown path; the platform finalize() skips the per-thread
- * device bind on a kernel latch, because the caller already holds its own
- * device current.
+ * host_runtime.so exports them. Onboard implements init and prepare; launch
+ * remains a rejecting stub and supported returns 0. Simulated init reports
+ * PTO_RUNTIME_ERR_UNSUPPORTED; simulated prepare and launch report
+ * PTO_RUNTIME_ERR_INVALID_STATE after structural validation.
+ * The fifth lifecycle entry is the existing
+ * finalize_device(): in kernel mode it must release only context-owned
+ * resources and never reset the device or finalize ACL. Onboard kernel init
+ * records the borrowed device id, allowing explicit close to release the
+ * context-owned resources while the kernel-mode latch guards device reset.
  *
  * These entries accept only POD structs, serialized blobs, and device/stream
  * pointers — never framework objects. The caller stream is always an explicit
@@ -589,16 +587,22 @@ int simpler_kernel_mode_supported(DeviceContextHandle ctx);
 /**
  * Initialize a kernel-mode context on the caller's already-current device.
  *
- * A successful call latches kernel mode on the context — mutually exclusive
- * with the program-mode simpler_init — and the claim is what arms the
+ * After structural and lifecycle validation, the call latches kernel mode
+ * permanently, including on subsequent initialization failure. This is
+ * mutually exclusive with program-mode simpler_init and arms the
  * kernel-mode guards on the platform's device/ACL lifecycle and arena paths.
  *
- * Takes no device ownership: no device reset, no ACL init/finalize, and no
- * stream or device synchronize on this path. Creates only context-owned
- * persistent handles used by asynchronous preparation and launch. `config`
+ * Takes no device ownership: no device reset or ACL init/finalize. Bootstrap
+ * and AICPU initialization synchronize the context's dedicated AICPU stream
+ * outside capture. Creates context-owned persistent handles for preparation
+ * and launch. `config`
  * is context-static; launches never mutate it. `context_generation` is a
  * nonzero host-process-unique identity minted by the caller for sequential
  * contexts; generation zero is invalid.
+ * Repeated init is rejected without changing the existing context. An init
+ * failure after device binding retains kernel mode and requires explicit
+ * finalize_device() before destruction; initialization cannot be retried on
+ * that context.
  */
 int simpler_kernel_mode_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
@@ -611,15 +615,16 @@ int simpler_kernel_mode_init(
  *
  * `callable` points to a canonical ChipCallable image of exactly
  * `callable_size` bytes. Validating every flexible-array offset before the
- * image is hashed or uploaded is the implementation's obligation; the shared
- * entry validation checks only the image's alignment, its size floor, and the
- * callable id range. Preparation may allocate persistent state and
- * enqueue asynchronous device work on `caller_stream`, but never synchronizes
- * a stream or device — preparation errors surface through the caller's own
- * warmup + synchronize. The stream is borrowed for this call only.
+ * image is hashed or uploaded is the implementation's obligation. Shared
+ * entry validation checks the canonical image bounds, signature counts,
+ * symbol names, alignment, and callable id range. Preparation may allocate persistent state and
+ * enqueue device work on the context's own AICPU stream. It takes no caller
+ * stream: nothing it enqueues belongs on one, and the ordering a caller
+ * stream would have provided comes from that stream's own FIFO, which every
+ * later launch enqueues onto behind this registration.
  */
 int simpler_kernel_mode_prepare_callable(
-    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size, void *caller_stream
+    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size
 );
 
 /**

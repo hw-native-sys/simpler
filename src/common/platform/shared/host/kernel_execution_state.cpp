@@ -31,7 +31,7 @@ int KernelExecutionState::initialize(int requested_device_id, const KernelContex
     }
     if (rc == 0) {
         for (auto &event : events_) {
-            rc = ops_.create_event(ops_.context, &event);
+            rc = ops_.create_event(ops_.context, ops_.event_flag, &event);
             if (rc != 0) break;
         }
     }

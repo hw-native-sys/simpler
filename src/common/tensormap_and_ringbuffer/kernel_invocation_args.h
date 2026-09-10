@@ -33,4 +33,18 @@ inline InvocationStatus materialize_tmr_entry_args(const TmrInvocationView &view
     return InvocationStatus::Ok;
 }
 
+// trusted views are resolved independently of packet before this call. No
+// execution state is published until admission succeeds. out stays unchanged
+// on rejection and owns the converted arguments through their final use.
+inline InvocationStatus consume_tmr_invocation(
+    ByteSpan packet, const PreparedInvocationView &callable, const TmrExecutionBindingView &binding,
+    EntryArgsStorage *out
+) noexcept {
+    if (out == nullptr) return InvocationStatus::InvalidArgument;
+    TmrInvocationView view;
+    const auto status = decode_tmr_invocation(packet, callable, binding, &view);
+    if (status != InvocationStatus::Ok) return status;
+    return materialize_tmr_entry_args(view, out);
+}
+
 }  // namespace simpler::tmr

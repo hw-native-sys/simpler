@@ -380,6 +380,33 @@ class TestChipWorkerPython:
         )
         assert expected_warning in capsys.readouterr().err
 
+    def test_public_wrapper_keeps_registries_when_native_finalize_fails(self):
+        from _task_interface import ChipCallable  # noqa: PLC0415
+        from simpler.task_interface import ChipWorker  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
+
+        class FakeImpl:
+            initialized = True
+            device_id = 0
+
+            def finalize(self):
+                raise RuntimeError("injected device teardown failure")
+
+        worker = ChipWorker()
+        worker._impl = FakeImpl()
+        worker._callable_registry[0] = ChipCallable.build(signature=[], func_name="test", binary=b"\x00", children=[])
+        worker._identity_registry[b"digest"] = object()
+        worker._live_handles[1] = b"digest"
+
+        with pytest.raises(RuntimeError, match="injected device teardown failure"):
+            worker.finalize()
+
+        # The registries name what the native side still holds. A teardown that
+        # did not complete leaves those resources alive, so dropping the
+        # registries would hide them from a retry and from the caller.
+        assert list(worker._callable_registry) == [0]
+        assert list(worker._identity_registry) == [b"digest"]
+        assert worker._live_handles == {1: b"digest"}
+
     def test_public_wrapper_flush_timeout_is_reported_with_loss_counters(self, monkeypatch, capsys):
         import simpler.task_interface as task_interface_mod  # noqa: PLC0415
         from simpler.task_interface import ChipWorker  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
