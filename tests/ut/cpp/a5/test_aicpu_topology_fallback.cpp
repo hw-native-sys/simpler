@@ -43,6 +43,11 @@ using pto::a5::derive_topology_from_occupy;
 using pto::a5::enumerate_cpus_from_occupy;
 using pto::a5::format_aicpu_topology_json;
 using pto::a5::load_cpu_topo_from_json;
+using pto::a5::scheduler_cluster_owner;
+using pto::a5::scheduler_cluster_range;
+using pto::a5::SchedulerClusterAssignment;
+using pto::a5::SchedulerClusterRange;
+using pto::a5::select_scheduler_cluster_assignment;
 
 std::vector<AicpuLogicalCpu> make_physical_range(int32_t first_phy, int32_t last_phy) {
     std::vector<AicpuLogicalCpu> cpus;
@@ -83,6 +88,52 @@ TEST(A5AicpuTopologyFallback, EnumeratesBoundaryCpuIdsAndRejectsEmptyMask) {
     cpus = {{1, 1, 0, 0, 0}};
     EXPECT_FALSE(enumerate_cpus_from_occupy(0, cpus));
     EXPECT_TRUE(cpus.empty());
+}
+
+TEST(A5SchedulerClusterAssignment, UsesContiguousRangesForTrustedTopologyAndRoundRobinOtherwise) {
+    AicpuTopology topology;
+    topology.source = AicpuTopologySource::kDriver;
+    topology.soc_name = "Ascend950PR_9599";
+    set_device_occupy(topology, 0x1f8U);
+
+    std::vector<AicpuLogicalCpu> all_cpus;
+    ASSERT_TRUE(load_cpu_topo_from_json(topology.soc_name.c_str(), topology.device_occupancy.occupy, all_cpus));
+    for (const auto &cpu : all_cpus) {
+        if (cpu.cpu_id >= 3 && cpu.cpu_id <= 8) topology.os_schedulable_cpus.push_back(cpu);
+    }
+    EXPECT_EQ(select_scheduler_cluster_assignment(topology), SchedulerClusterAssignment::kContiguous);
+
+    topology.source = AicpuTopologySource::kJsonFallback;
+    EXPECT_EQ(select_scheduler_cluster_assignment(topology), SchedulerClusterAssignment::kContiguous);
+
+    topology.source = AicpuTopologySource::kDriver;
+    topology.os_schedulable_cpus.resize(1);
+    EXPECT_EQ(select_scheduler_cluster_assignment(topology), SchedulerClusterAssignment::kContiguous);
+
+    topology.source = AicpuTopologySource::kOccupyFallback;
+    EXPECT_EQ(select_scheduler_cluster_assignment(topology), SchedulerClusterAssignment::kRoundRobin);
+}
+
+TEST(A5SchedulerClusterAssignment, BalancesContiguousRangesAndPreservesRoundRobinOwnership) {
+    const std::vector<SchedulerClusterRange> five_by_four = {
+        scheduler_cluster_range(5, 4, 0),
+        scheduler_cluster_range(5, 4, 1),
+        scheduler_cluster_range(5, 4, 2),
+        scheduler_cluster_range(5, 4, 3),
+    };
+    EXPECT_EQ(five_by_four[0].begin, 0);
+    EXPECT_EQ(five_by_four[0].end, 1);
+    EXPECT_EQ(five_by_four[3].begin, 3);
+    EXPECT_EQ(five_by_four[3].end, 5);
+
+    std::vector<int32_t> contiguous_owner;
+    std::vector<int32_t> round_robin_owner;
+    for (int32_t cluster = 0; cluster < 6; ++cluster) {
+        contiguous_owner.push_back(scheduler_cluster_owner(SchedulerClusterAssignment::kContiguous, 6, 4, cluster));
+        round_robin_owner.push_back(scheduler_cluster_owner(SchedulerClusterAssignment::kRoundRobin, 6, 4, cluster));
+    }
+    EXPECT_EQ(contiguous_owner, (std::vector<int32_t>{0, 1, 1, 2, 3, 3}));
+    EXPECT_EQ(round_robin_owner, (std::vector<int32_t>{0, 1, 2, 3, 0, 1}));
 }
 
 #if defined(__x86_64__)

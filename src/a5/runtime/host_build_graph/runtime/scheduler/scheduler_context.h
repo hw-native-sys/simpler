@@ -14,6 +14,7 @@
 #include "aicpu/device_phase_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "common/chip_swimlane_profiling.h"
+#include "common/scheduler_cluster_partition.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "scheduler_types.h"
@@ -229,6 +230,7 @@ private:
     // --- Thread/core configuration ---
     int32_t active_sched_threads_{0};
     int32_t aicpu_thread_num_{0};
+    pto::a5::SchedulerClusterAssignment scheduler_cluster_assignment_{pto::a5::SchedulerClusterAssignment::kRoundRobin};
     int32_t cores_total_num_{0};
 
     // --- 3S+1P dedicated resolution thread ---
@@ -270,7 +272,7 @@ private:
     // Core management (scheduler_cold_path.cpp)
     // =========================================================================
 
-    // Assign discovered cores (cluster = 1 AIC + 2 AIV) round-robin across scheduler threads.
+    // Assign discovered cores (cluster = 1 AIC + 2 AIV) across scheduler threads.
     bool assign_cores_to_threads();
 
     // Emergency shutdown: broadcast exit signal to every handshake'd core and

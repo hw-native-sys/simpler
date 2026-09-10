@@ -14,6 +14,7 @@
 #include "aicpu/device_phase_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "common/chip_swimlane_profiling.h"
+#include "common/scheduler_cluster_partition.h"
 #include "common/unified_log.h"
 #include "scheduler_types.h"
 
@@ -72,8 +73,8 @@ public:
     void handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads);
     // Handshake exactly the cores this scheduler thread will later manage:
     // clusters {tidx, tidx+active, ...}, cluster ci =
-    // {ci, N/3+2ci, N/3+2ci+1} (blocked layout: [0,N/3) AIC, [N/3,N) AIV). Matches
-    // assign_cores_to_threads' round-robin so handshake warms the same
+    // {ci, N/3+2ci, N/3+2ci+1} (blocked layout: [0,N/3) AIC, [N/3,N) AIV).
+    // Matches assign_cores_to_threads so handshake warms the same
     // core_exec_states_ the thread later dispatches from.
     void handshake_owned_clusters(Runtime *runtime, int32_t tidx, int32_t active_threads);
     // Barrier-free counterpart of assign_cores_to_threads: thread tidx populates
@@ -185,6 +186,7 @@ private:
     int32_t active_sched_threads_{0};
     int32_t sched_thread_num_{0};
     int32_t aicpu_thread_num_{0};
+    pto::a5::SchedulerClusterAssignment scheduler_cluster_assignment_{pto::a5::SchedulerClusterAssignment::kRoundRobin};
     int32_t cores_total_num_{0};
 
     // Cluster-ordered worker_id lists, populated by post_handshake_init().
@@ -219,7 +221,7 @@ private:
     // Core management (scheduler_cold_path.cpp)
     // =========================================================================
 
-    // Assign discovered cores (cluster = 1 AIC + 2 AIV) round-robin across scheduler threads.
+    // Assign discovered cores (cluster = 1 AIC + 2 AIV) across scheduler threads.
     bool assign_cores_to_threads();
 
     // Emergency shutdown: broadcast exit signal to every handshake'd core and

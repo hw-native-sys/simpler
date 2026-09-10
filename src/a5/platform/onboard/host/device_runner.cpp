@@ -358,6 +358,8 @@ int DeviceRunner::prepare_execution(
             );
             return PTO_RUNTIME_ERR_INTERNAL;
         }
+        const auto cluster_assignment = pto::a5::select_scheduler_cluster_assignment(topology);
+        runtime.set_scheduler_cluster_assignment(cluster_assignment);
         const auto &allowed = launch_plan.allowed_cpus;
         active_aicpu_num = launch_plan.effective_active_count;
         runtime.set_aicpu_thread_num(active_aicpu_num);
@@ -403,9 +405,10 @@ int DeviceRunner::prepare_execution(
                 );
             }
             LOG_INFO(
-                "AICPU ALLOWED_CPUS = [%s] (scenario=%s active=%d launch=%d user_cpus=%zu)", dump.c_str(),
-                pto::a5::aicpu_scenario_name(topology.scenario_type), active_aicpu_num, launch_plan.launch_count,
-                topology.os_schedulable_cpus.size()
+                "AICPU ALLOWED_CPUS = [%s] (scenario=%s active=%d launch=%d user_cpus=%zu cluster_assignment=%s)",
+                dump.c_str(), pto::a5::aicpu_scenario_name(topology.scenario_type), active_aicpu_num,
+                launch_plan.launch_count, topology.os_schedulable_cpus.size(),
+                cluster_assignment == pto::a5::SchedulerClusterAssignment::kContiguous ? "contiguous" : "round_robin"
             );
         }
     }

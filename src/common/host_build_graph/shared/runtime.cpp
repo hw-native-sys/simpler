@@ -34,6 +34,7 @@ Runtime::Runtime() {
     std::memset(aicpu_allowed_cpus, 0, sizeof(aicpu_allowed_cpus));
     aicpu_allowed_cpu_count = 0;
     aicpu_launch_count = 0;
+    scheduler_cluster_assignment = pto::a5::SchedulerClusterAssignment::kRoundRobin;
     host_total_tasks = 0;
     sm_image_bytes = 0;
 

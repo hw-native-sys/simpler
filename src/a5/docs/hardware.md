@@ -173,6 +173,11 @@ runtime uses the set bits in OCCUPY as schedulable CPU IDs and applies the
 unknown-topology fallback without inferring physical cores, SMT siblings,
 clusters, or dies.
 
+AICore clusters use the balanced contiguous scheduler partition only when the
+driver topology or a verified JSON entry exactly covers the device-side
+OCCUPY population. An incomplete or unmatched topology keeps the existing
+cluster round-robin assignment.
+
 Live driver topology is still preferred when present. Hardware signatures
 without a matching packaged entry use the generic OCCUPY-only fallback and
 emit a CPU_TOPO-unavailable warning.
