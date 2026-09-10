@@ -54,7 +54,7 @@
 // time and are stripped before the args cross the dispatch boundary. The element
 // is Tensor (self-describing view; L3+ holds no C++ ChipTensor) — the L3→L2 wire
 // carries Tensors, materialized to ChipStorageTaskArgs (ChipTensor) on the L2 child.
-using TaskArgs = TaskArgsTpl<Tensor, uint64_t, 0, 0, TensorArgType>;
+using TaskArgs = TaskArgsTpl<Tensor, uint64_t, 0, 0, TensorArgType, true>;
 
 // ============================================================================
 // TaskArgsView — zero-copy view over a wire blob

@@ -34,6 +34,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     arg_direction_name,
     get_dtype_name,
     get_element_size,
+    materialize_task_args,
 )
 from simpler.buffer import (
     AccessMode,
@@ -452,6 +453,30 @@ class TestChipStorageTaskArgs:
         assert len(args) == 0
         assert args.tensor_count() == 0
         assert args.scalar_count() == 0
+
+    def test_host_view_defaults_to_zero_and_is_cleared_on_reuse(self):
+        args = ChipStorageTaskArgs()
+        args.add_tensor(ChipTensor.make(0x1000, (4,), DataType.FLOAT32, child_memory=True))
+        assert args._host_view(0) == 0
+        args._set_host_view(0, 0x2000, 16)
+        assert args._host_view(0) == 0x2000
+
+        args.clear()
+        args.add_tensor(ChipTensor.make(0x3000, (4,), DataType.FLOAT32, child_memory=True))
+        assert args._host_view(0) == 0
+
+    def test_materialize_preserves_task_args_host_view(self):
+        ref = _dev_ref(0x4000, (4,), DataType.FLOAT32)
+        args = TaskArgs()
+        args.add_tensor(ref)
+        args._set_host_view(0, 0x5000, 16)
+
+        resolved = {ref.buffer.identity: (0x4000, int(AddressSpace.DEVICE))}
+        materialized = materialize_task_args(args, resolved)
+
+        assert materialized.tensor(0).data == 0x4000
+        assert materialized._host_view(0) == 0x5000
+        assert materialized._host_view_size(0) == 16
 
 
 # ============================================================================

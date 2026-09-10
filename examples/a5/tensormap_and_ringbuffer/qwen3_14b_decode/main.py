@@ -44,10 +44,10 @@ from pathlib import Path
 import torch
 from simpler.buffer import Buffer
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import CallConfig, DataType, TaskArgs, TensorArgType, get_element_size
+from simpler.task_interface import CallConfig
 from simpler.worker import Worker
 
-from simpler_setup import SceneTestCase, scene_test
+from simpler_setup import SceneTestCase, TaskArgsBuilder, scene_test
 from simpler_setup.compile_pool import compile_worker_budget
 from simpler_setup.goldens.qwen3_14b_decode import (
     N_LAYERS,
@@ -62,6 +62,7 @@ from simpler_setup.goldens.qwen3_14b_decode import (
 )
 from simpler_setup.log_config import DEFAULT_LOG_LEVEL, LOG_LEVEL_CHOICES, configure_logging
 from simpler_setup.parallel_scheduler import device_range_to_list
+from simpler_setup.resident_task_args import ResidentTaskArgs
 from simpler_setup.scene_test import (
     build_output_prefix,
     compile_chip_callable_spec,
@@ -473,7 +474,8 @@ class TestQwen314BDecode(SceneTestCase):
     ]
 
     def generate_args(self, params):
-        return _decode_generate_inputs(params.get("seed", 1234), params.get("seq_len", 3500))
+        args = _decode_generate_inputs(params.get("seed", 1234), params.get("seq_len", 3500))
+        return TaskArgsBuilder(*(spec._replace(child_memory=True) for spec in args.specs))
 
     def compute_golden(self, args, params):
         _decode_golden(args)
@@ -488,58 +490,20 @@ def _chip_spec(orchestration_source: str | Path | None, orchestration_function: 
     return spec
 
 
-def _allocate_params(worker: Worker, n_layers: int) -> dict[str, Buffer]:
-    buffers: dict[str, Buffer] = {}
-    for spec in param_specs(n_layers):
-        dtype = getattr(DataType, spec.dtype)
-        nbytes = get_element_size(dtype)
-        for dim in spec.shape:
-            nbytes *= dim
-        buffers[spec.name] = worker.malloc(nbytes)
-    return buffers
-
-
-def _upload_fixture(
-    worker: Worker,
-    buffers: dict[str, Buffer],
-    *,
-    seed: int,
-    seq_len: int,
-    n_layers: int,
-) -> None:
-    # `out` is the sole D.OUT argument. The final copy_out task overwrites all
-    # BATCH * HIDDEN elements, so its freshly allocated contents need no upload.
-    for name, tensor in param_tensors(seed=seed, seq_len=seq_len, n_layers=n_layers):
-        if name != "out":
-            worker.copy_to(buffers[name], tensor)
-        # Drop the consumer's reference before the generator constructs the
-        # next parameter; otherwise two adjacent large weights overlap on host.
-        del tensor
-
-
-def _upload_materialized_fixture(worker: Worker, buffers: dict[str, Buffer], fixture, n_layers: int) -> None:
-    # See _upload_fixture: `out` is fully overwritten by copy_out.
-    for spec in param_specs(n_layers):
-        if spec.name != "out":
-            worker.copy_to(buffers[spec.name], getattr(fixture, spec.name))
-
-
-_DIRECTION_TAGS = {
-    D.IN: TensorArgType.INPUT,
-    D.OUT: TensorArgType.OUTPUT_EXISTING,
-    D.INOUT: TensorArgType.INOUT,
-}
-
-
-def _build_task_args(buffers: dict[str, Buffer], n_layers: int, signature: list) -> TaskArgs:
+def _upload_fixture(resident, signature, *, seed, seq_len, n_layers, fixture=None):
     specs = param_specs(n_layers)
     if len(specs) != len(signature):
-        raise ValueError(f"Qwen entry has {len(specs)} tensors but its orchestration signature has {len(signature)}")
-    args = TaskArgs()
-    for spec, direction in zip(specs, signature):
-        tag = _DIRECTION_TAGS[direction]
-        args.add_tensor(buffers[spec.name].tensor(spec.shape, getattr(DataType, spec.dtype)), tag)
-    return args
+        raise ValueError("Qwen parameter count must match the orchestration signature")
+    directions = {spec.name: direction for spec, direction in zip(specs, signature)}
+    tensors = (
+        ((spec.name, getattr(fixture, spec.name)) for spec in specs)
+        if fixture is not None
+        else param_tensors(seed=seed, seq_len=seq_len, n_layers=n_layers)
+    )
+    for name, tensor in tensors:
+        resident.add(name, tensor, directions[name])
+        # Release this weight before the generator creates its successor.
+        del tensor
 
 
 def _build_config(
@@ -667,17 +631,24 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
     worker = Worker(level=2, platform=platform, runtime=runtime, device_id=device_id)
     chip_handle = worker.register(chip)
     worker.init()
+    resident = ResidentTaskArgs(worker)
     try:
-        buffers = _allocate_params(worker, N_LAYERS)
         golden = None
         if skip_golden:
-            _upload_fixture(worker, buffers, seed=seed, seq_len=seq_len, n_layers=N_LAYERS)
+            _upload_fixture(resident, spec["orchestration"]["signature"], seed=seed, seq_len=seq_len, n_layers=N_LAYERS)
         else:
             print("[qwen] materializing one fixture for upload and torch golden...", flush=True)
             golden = _decode_generate_inputs(seed=seed, seq_len=seq_len, n_layers=N_LAYERS)
-            _upload_materialized_fixture(worker, buffers, golden, N_LAYERS)
+            _upload_fixture(
+                resident,
+                spec["orchestration"]["signature"],
+                seed=seed,
+                seq_len=seq_len,
+                n_layers=N_LAYERS,
+                fixture=golden,
+            )
             _decode_golden(golden, n_layers=N_LAYERS)
-        task_args = _build_task_args(buffers, N_LAYERS, spec["orchestration"]["signature"])
+        task_args = resident.build_args()
         config = _build_config(
             runtime_env,
             enable_chip_swimlane=diagnostics.chip_swimlane,
@@ -694,8 +665,9 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
             print(f"[qwen] round {round_idx + 1}/{rounds}", flush=True)
             worker.run(chip_handle, task_args, config)
         if golden is not None:
-            _copy_and_compare(worker, buffers, golden)
+            _copy_and_compare(worker, resident.buffers, golden)
     finally:
+        resident.release()
         worker.close()
         finalize_diagnostic_outputs(
             diagnostic_label,

@@ -314,7 +314,8 @@ Layer 1  Level axis
     │       └─ Layer 4  Class — one ChipWorker per (runtime, device), reused
     │                   across every class assigned to that device
     │           └─ Layer 5  Case — serial within a class
-    │               └─ Layer 6  Rounds — `--rounds N` loop, reuses Worker
+    │               └─ Layer 6  Rounds — `--rounds N` loop, reuses Worker;
+    │                           L2 residency is declared per tensor, independent of N
 ```
 
 ### Quick examples
@@ -901,3 +902,39 @@ This eliminates the need for separate `examples/` (sim) and `tests/st/` (device)
 ### When separate directories are still needed
 
 When kernels themselves differ (e.g., templated tile sizes tuned for device), separate test files remain the correct approach.
+
+## Explicit L2 tensor residency
+
+`TensorArg(name, value, child_memory=True)` keeps a case-owned device buffer
+across all rounds, including `--rounds 1`. `TaskArgsBuilder.add_tensor` accepts
+the same keyword. The default remains host staging on every round.
+
+| Declaration / direction | Setup | Between rounds | Validation |
+| ----------------------- | ----- | -------------- | ---------- |
+| Host-staged (default) | Existing path | Restore OUT/INOUT host fixtures | Existing per-round copy-back |
+| Resident IN | Allocate and upload once | Keep device address and input contents | No output readback |
+| Resident OUT | Allocate without upload | Keep device contents; the case must define all compared elements | Final readback |
+| Resident INOUT | Allocate and upload once | Keep device state | Final readback |
+
+Golden evaluation follows the same state evolution: resident outputs retain
+state and host-staged outputs reset. Cases with resident outputs compare after
+the final round; other cases continue comparing every round. `--skip-golden`
+skips validation readback, but not INOUT host-view synchronization.
+
+Add `host_view=True` only for resident IN/INOUT read or written by HBG host
+orchestration. IN views rely on the no-device-writes contract. INOUT views are
+refreshed from the device before each orchestration; host writes are pushed to
+the device. Pure OUT has no readable host view. TMR ignores the sidecar.
+These views do not permit reading values produced by tasks in the current run.
+
+Declarations currently require L2, contiguous CPU fixtures, and non-overlapping
+storage. Empty fixtures allocate no resident buffer; the existing transport
+still rejects zero-shaped Tensor arguments. Clone and rehost operations preserve
+declaration metadata. Streaming drivers can use
+`simpler_setup.resident_task_args.ResidentTaskArgs` as a context manager and add
+one fixture at a time; only explicit host views retain those fixtures.
+
+The HBG `paged_attention_unroll_manual_scope` examples include matched manual
+`Residency_staged`, `Residency_bulk`, and `Residency_host_view` cases. Bulk
+residency leaves `context_lens` and `block_table` host-staged; the host-view case
+also makes those controls resident. Existing default cases retain host staging.

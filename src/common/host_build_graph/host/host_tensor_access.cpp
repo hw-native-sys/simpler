@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include <vector>
+#include <limits>
 
 #include "common/host_api.h"
 
@@ -135,4 +136,45 @@ bool host_tensor_read(HostTensorAccessor *accessor, uint64_t dev_addr, void *dst
 
 bool host_tensor_write(HostTensorAccessor *accessor, uint64_t dev_addr, const void *src, uint64_t bytes) {
     return accessor != nullptr && accessor->write(dev_addr, src, bytes);
+}
+
+bool host_tensor_span(const ChipTensor &tensor, size_t *bytes) {
+    if (tensor.ndims == 0 || tensor.ndims > MAX_TENSOR_DIMS) return false;
+    for (uint32_t i = 0; i < tensor.ndims; ++i) {
+        if (tensor.shapes[i] == 0) {
+            *bytes = 0;
+            return true;
+        }
+    }
+    uint64_t last = tensor.start_offset;
+    const auto max = std::numeric_limits<uint64_t>::max();
+    for (uint32_t i = 0; i < tensor.ndims; ++i) {
+        if (tensor.strides[i] == 0) return false;
+        uint64_t delta = static_cast<uint64_t>(tensor.shapes[i] - 1) * tensor.strides[i];
+        if (delta > max - last) return false;
+        last += delta;
+    }
+    const uint64_t elem = get_element_size(tensor.dtype);
+    if (elem == 0 || last == max || last + 1 > max / elem) return false;
+    const uint64_t span = (last + 1) * elem;
+    if (span > tensor.buffer.size || span > std::numeric_limits<size_t>::max() || span > max - tensor.buffer.addr)
+        return false;
+    *bytes = static_cast<size_t>(span);
+    return true;
+}
+
+bool HostTensorAccessor::add_resident(
+    const ChipTensor &tensor, ArgDirection direction, uint64_t host_addr, uint64_t host_bytes
+) {
+    size_t bytes = 0;
+    if (impl_->api == nullptr || !tensor.is_device_memory() || tensor.buffer.addr == 0 ||
+        (direction != ArgDirection::IN && direction != ArgDirection::INOUT) || !host_tensor_span(tensor, &bytes) ||
+        host_addr == 0 || bytes > host_bytes || host_bytes > std::numeric_limits<uint64_t>::max() - host_addr)
+        return false;
+    if (bytes == 0) return true;
+    void *host = reinterpret_cast<void *>(static_cast<uintptr_t>(host_addr));
+    if (direction == ArgDirection::INOUT &&
+        impl_->api->copy_from_device(host, reinterpret_cast<void *>(tensor.buffer.addr), bytes) != 0)
+        return false;
+    return add(tensor.buffer.addr, bytes, host);
 }

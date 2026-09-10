@@ -94,13 +94,36 @@ class TestPagedAttentionUnrollManualScopeHostBuildGraph(SceneTestCase):
         },
     ]
 
+    CASES += [
+        {
+            "name": f"Residency_{mode}",
+            "platforms": ["a5"],
+            "manual": True,
+            "params": {
+                "batch": 16,
+                "num_heads": 16,
+                "kv_head_num": 1,
+                "head_dim": 128,
+                "block_size": 128,
+                "context_len": 1024,
+                "max_model_len": 2048,
+                "dtype": "bfloat16",
+                "residency": mode,
+            },
+        }
+        for mode in ("staged", "bulk", "host_view")
+    ]
+
     def generate_args(self, params):
         params = {**params, "variant": "paged_attention_unroll"}
         inputs = _pa_generate_inputs(params)
         specs = []
         for name, val in inputs:
             if isinstance(val, torch.Tensor):
-                specs.append(TensorArg(name, val))
+                control = name in ("context_lens", "block_table")
+                mode = params.get("residency")
+                resident = mode == "host_view" or (mode == "bulk" and not control)
+                specs.append(TensorArg(name, val, child_memory=resident, host_view=resident and control))
             else:
                 specs.append(Scalar(name, val))
         return TaskArgsBuilder(*specs)

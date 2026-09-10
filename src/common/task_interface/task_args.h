@@ -11,7 +11,7 @@
 /**
  * TaskArgsTpl - tensor + scalar argument storage (template)
  *
- * Template: TaskArgsTpl<T, S, MaxT, MaxS, TensorTag=void>
+ * Template: TaskArgsTpl<T, S, MaxT, MaxS, TensorTag=void, HasHostViews=false>
  *   - Static:  MaxT>0, MaxS>0 — fixed-size arrays
  *   - Dynamic: MaxT==0, MaxS==0 — std::vector backed
  *
@@ -21,6 +21,7 @@
  * Optional TensorTag (e.g. TensorArgType for INPUT/OUTPUT/INOUT):
  *   - void (default): no per-tensor tag — pure transport/storage
  *   - real type: adds tags_ storage + tag(i) accessor
+ * HasHostViews adds a host-only address/span sidecar; wire encoding omits it.
  *
  * The element type is the caller's: each layer instantiates the template over
  * whatever tensor form it holds. Only one instantiation lives here, the one whose
@@ -89,20 +90,73 @@ struct TensorTagMixin<void, MaxT> {};
 template <>
 struct TensorTagMixin<void, 0> {};
 
+// Host views stay in the host process; neither tensor nor dispatch wire carries them.
+struct HostTensorView {
+    uint64_t addr{0};
+    uint64_t bytes{0};
+};
+
+template <size_t MaxT>
+struct HostViewMixin {
+    HostTensorView views[MaxT]{};
+    void prepare(size_t) {}
+    void append(size_t i) { views[i] = {}; }
+    void clear() {
+        for (auto &view : views)
+            view = {};
+    }
+    HostTensorView &at(size_t i) { return views[i]; }
+    const HostTensorView &at(size_t i) const { return views[i]; }
+};
+
+template <>
+struct HostViewMixin<0> {
+    std::vector<HostTensorView> views;
+    void prepare(size_t n) { views.reserve(n); }
+    void append(size_t) { views.push_back({}); }
+    void clear() { views.clear(); }
+    HostTensorView &at(size_t i) { return views[i]; }
+    const HostTensorView &at(size_t i) const { return views[i]; }
+};
+
+struct NoHostViews {};
+
 // ============================================================================
 // TaskArgsTpl — primary template (static / fixed-size)
 // ============================================================================
 
-template <typename T, typename S, size_t MaxT, size_t MaxS, typename TensorTag = void>
-struct TaskArgsTpl : TensorTagMixin<TensorTag, MaxT> {
+// Storage specializations keep non-sidecar fixed layouts unchanged on C++17
+// toolchains, including the device compiler (which has no no_unique_address).
+template <typename T, typename S, size_t MaxT, size_t MaxS, bool HasHostViews>
+struct TaskArgsStorage {
     T tensors_[MaxT];
     S scalars_[MaxS];
     int32_t tensor_count_{0};
     int32_t scalar_count_{0};
+    HostViewMixin<MaxT> host_views_;
+};
+
+template <typename T, typename S, size_t MaxT, size_t MaxS>
+struct TaskArgsStorage<T, S, MaxT, MaxS, false> {
+    T tensors_[MaxT];
+    S scalars_[MaxS];
+    int32_t tensor_count_{0};
+    int32_t scalar_count_{0};
+};
+
+template <typename T, typename S, size_t MaxT, size_t MaxS, typename TensorTag = void, bool HasHostViews = false>
+struct TaskArgsTpl : TensorTagMixin<TensorTag, MaxT>,
+                     TaskArgsStorage<T, S, MaxT, MaxS, HasHostViews> {
+    using Storage = TaskArgsStorage<T, S, MaxT, MaxS, HasHostViews>;
+    using Storage::scalar_count_;
+    using Storage::scalars_;
+    using Storage::tensor_count_;
+    using Storage::tensors_;
 
     void add_tensor(const T &t) {
         if (scalar_count_ > 0) throw std::logic_error("TaskArgs: cannot add tensor after scalar");
         if (static_cast<size_t>(tensor_count_) >= MaxT) throw std::out_of_range("TaskArgs: tensor capacity exceeded");
+        if constexpr (HasHostViews) this->host_views_.append(tensor_count_);
         tensors_[tensor_count_++] = t;
     }
 
@@ -125,7 +179,24 @@ struct TaskArgsTpl : TensorTagMixin<TensorTag, MaxT> {
     int32_t tensor_count() const { return tensor_count_; }
     int32_t scalar_count() const { return scalar_count_; }
 
+    void set_host_view(int32_t i, uint64_t addr, uint64_t bytes) {
+        static_assert(HasHostViews, "This args type has no host views");
+        if (i < 0 || i >= tensor_count()) throw std::out_of_range("TaskArgs: host-view index out of range");
+        this->host_views_.at(static_cast<size_t>(i)) = {addr, bytes};
+    }
+    uint64_t host_view(int32_t i) const {
+        static_assert(HasHostViews, "This args type has no host views");
+        if (i < 0 || i >= tensor_count()) throw std::out_of_range("TaskArgs: host-view index out of range");
+        return this->host_views_.at(static_cast<size_t>(i)).addr;
+    }
+    uint64_t host_view_size(int32_t i) const {
+        static_assert(HasHostViews, "This args type has no host views");
+        if (i < 0 || i >= tensor_count()) throw std::out_of_range("TaskArgs: host-view index out of range");
+        return this->host_views_.at(static_cast<size_t>(i)).bytes;
+    }
+
     void clear() {
+        if constexpr (HasHostViews) this->host_views_.clear();
         tensor_count_ = 0;
         scalar_count_ = 0;
     }
@@ -135,15 +206,18 @@ struct TaskArgsTpl : TensorTagMixin<TensorTag, MaxT> {
 // TaskArgsTpl — partial specialization (dynamic / vector-backed, MaxT==0, MaxS==0)
 // ============================================================================
 
-template <typename T, typename S, typename TensorTag>
-struct TaskArgsTpl<T, S, 0, 0, TensorTag> : TensorTagMixin<TensorTag, 0> {
+template <typename T, typename S, typename TensorTag, bool HasHostViews>
+struct TaskArgsTpl<T, S, 0, 0, TensorTag, HasHostViews> : TensorTagMixin<TensorTag, 0> {
     std::vector<T> tensors_;
     std::vector<S> scalars_;
     std::vector<ExplicitTaskDependency> explicit_deps_;
+    std::conditional_t<HasHostViews, HostViewMixin<0>, NoHostViews> host_views_;
 
     void add_tensor(const T &t) {
         if (!scalars_.empty()) throw std::logic_error("TaskArgs: cannot add tensor after scalar");
+        if constexpr (HasHostViews) this->host_views_.prepare(tensors_.size() + 1);
         tensors_.push_back(t);
+        if constexpr (HasHostViews) this->host_views_.append(tensors_.size() - 1);
         if constexpr (!std::is_void_v<TensorTag>) {
             this->tags_.push_back(TensorTag{});
         }
@@ -153,7 +227,9 @@ struct TaskArgsTpl<T, S, 0, 0, TensorTag> : TensorTagMixin<TensorTag, 0> {
     template <typename Tag = TensorTag, typename = std::enable_if_t<!std::is_void_v<Tag>>>
     void add_tensor(const T &t, Tag tag) {
         if (!scalars_.empty()) throw std::logic_error("TaskArgs: cannot add tensor after scalar");
+        if constexpr (HasHostViews) this->host_views_.prepare(tensors_.size() + 1);
         tensors_.push_back(t);
+        if constexpr (HasHostViews) this->host_views_.append(tensors_.size() - 1);
         this->tags_.push_back(tag);
     }
 
@@ -177,7 +253,24 @@ struct TaskArgsTpl<T, S, 0, 0, TensorTag> : TensorTagMixin<TensorTag, 0> {
     const TaskHandle &explicit_dep(int32_t i) const { return explicit_deps_[static_cast<size_t>(i)].task; }
     bool explicit_dep_retain(int32_t i) const { return explicit_deps_[static_cast<size_t>(i)].retain; }
 
+    void set_host_view(int32_t i, uint64_t addr, uint64_t bytes) {
+        static_assert(HasHostViews, "This args type has no host views");
+        if (i < 0 || i >= tensor_count()) throw std::out_of_range("TaskArgs: host-view index out of range");
+        this->host_views_.at(static_cast<size_t>(i)) = {addr, bytes};
+    }
+    uint64_t host_view(int32_t i) const {
+        static_assert(HasHostViews, "This args type has no host views");
+        if (i < 0 || i >= tensor_count()) throw std::out_of_range("TaskArgs: host-view index out of range");
+        return this->host_views_.at(static_cast<size_t>(i)).addr;
+    }
+    uint64_t host_view_size(int32_t i) const {
+        static_assert(HasHostViews, "This args type has no host views");
+        if (i < 0 || i >= tensor_count()) throw std::out_of_range("TaskArgs: host-view index out of range");
+        return this->host_views_.at(static_cast<size_t>(i)).bytes;
+    }
+
     void clear() {
+        if constexpr (HasHostViews) this->host_views_.clear();
         tensors_.clear();
         scalars_.clear();
         explicit_deps_.clear();
@@ -194,4 +287,8 @@ struct TaskArgsTpl<T, S, 0, 0, TensorTag> : TensorTagMixin<TensorTag, 0> {
 // L2 runtime ABI: fixed POD matching runtime.so byte-for-byte, and the sole ChipTensor-typed args
 // container — the materialized form a chip child decodes the L3->L2 Tensor blob into, just before
 // simpler_run.
-using ChipStorageTaskArgs = TaskArgsTpl<ChipTensor, uint64_t, CHIP_MAX_TENSOR_ARGS, CHIP_MAX_SCALAR_ARGS>;
+using ChipStorageTaskArgs = TaskArgsTpl<ChipTensor, uint64_t, CHIP_MAX_TENSOR_ARGS, CHIP_MAX_SCALAR_ARGS, void, true>;
+static_assert(
+    std::is_trivially_copyable_v<ChipStorageTaskArgs> && std::is_standard_layout_v<ChipStorageTaskArgs>,
+    "ChipStorageTaskArgs crosses the runtime.so ABI as raw bytes"
+);

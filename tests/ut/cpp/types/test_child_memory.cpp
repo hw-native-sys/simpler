@@ -90,6 +90,19 @@ TEST(ChildMemory, BlobRoundtripPreservesAddressSpace) {
     std::vector<uint8_t> buf(blob_size);
     write_blob(buf.data(), args);
 
+    args.set_host_view(1, 0x1000, 16);
+    TaskArgs copy = args;
+    EXPECT_EQ(copy.host_view(1), 0x1000u);
+    EXPECT_EQ(copy.host_view_size(1), 16u);
+    ASSERT_EQ(task_args_blob_size(copy), blob_size);
+    std::vector<uint8_t> with_sidecar(blob_size);
+    write_blob(with_sidecar.data(), copy);
+    EXPECT_EQ(with_sidecar, buf);  // Process-local pointers never enter the dispatch wire.
+    copy.clear();
+    copy.add_tensor(make_wire_tensor(2, AddressSpace::DEVICE));
+    EXPECT_EQ(copy.host_view(0), 0u);
+    EXPECT_EQ(copy.host_view_size(0), 0u);
+
     // Test owns the buffer, so capacity = blob_size.
     TaskArgsView view = read_blob(buf.data(), blob_size);
     ASSERT_EQ(view.tensor_count, 2);

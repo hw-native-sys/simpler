@@ -153,3 +153,19 @@ recover `finish(B) − dispatch(A)`. Full semantics in
 - [chip-swimlane-profiling.md](chip-swimlane-profiling.md) — the per-task /
   scheduler-phase deep dive.
 - `simpler_setup/tools/README.md` — `strace_timing` CLI reference.
+
+### Residency and round comparisons
+
+`--rounds` does not select a tensor memory policy. SceneTest residency is an
+explicit per-argument `child_memory` declaration and is the same for one or
+many rounds. Allocation and initial upload for declared resident inputs happen
+at case setup, outside `Worker.run` and its round markers. Include setup and
+final validation readback when reporting total case time; do not label the
+round table alone as end-to-end case latency.
+
+For HBG, compare a host-staged baseline, bulk residency with staged control
+tensors, and residency with explicit control host views separately. INOUT host
+views incur a device-to-host refresh inside bind on every round, including runs
+with `--skip-golden`. Qwen's static graph measures residency but does not
+exercise host-view access. Report fresh measurements for the actual design,
+with identical fixtures, hardware, round counts and validation settings.
