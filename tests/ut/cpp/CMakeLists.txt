@@ -594,6 +594,14 @@ add_task_interface_test(test_chip_max_tensor_args types/test_chip_max_tensor_arg
 add_task_interface_test(test_callable_scalar_count types/test_callable_scalar_count.cpp)
 add_task_interface_test(test_call_config types/test_call_config.cpp)
 add_task_interface_test(test_kernel_invocation_header types/test_kernel_invocation_header.cpp)
+add_task_interface_test(test_kernel_invocation_validation types/test_kernel_invocation_validation.cpp)
+add_common_utils_test(test_tmr_kernel_invocation common/test_tmr_kernel_invocation.cpp)
+target_include_directories(test_tmr_kernel_invocation PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+)
+target_sources(test_tmr_kernel_invocation PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface/assert_compat.cpp
+)
 
 # Contract test for upload_chip_callable_buffer caller-buffer immutability.
 # Pulls both task_interface (callable.h) and src/common (utils/fnv1a_64.h),
