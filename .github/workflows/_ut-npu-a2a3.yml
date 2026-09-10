@@ -51,7 +51,13 @@ jobs:
           source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
           cmake -B tests/ut/cpp/build -S tests/ut/cpp -DSIMPLER_ENABLE_HARDWARE_TESTS=ON
-          cmake --build tests/ut/cpp/build --target test_comm_lifecycle
+          # Named targets, not the whole tree: this lane runs only the
+          # requires_hardware label, and building the ~140 no-hardware tests
+          # here would add minutes to a self-hosted job that never runs them.
+          # Every target added under the SIMPLER_ENABLE_HARDWARE_TESTS block
+          # belongs on this line — ctest reports an unbuilt registered test as
+          # "Not Run", so an omission fails the lane rather than hiding.
+          cmake --build tests/ut/cpp/build --target test_comm_lifecycle test_kernel_mode_entry
 
       # `ctest --timeout 300` matches the no-hardware lane. It is not a budget:
       # the only test in this label set, test_comm_lifecycle, runs in 2.4-3.2 s

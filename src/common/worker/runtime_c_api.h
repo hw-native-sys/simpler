@@ -540,10 +540,11 @@ size_t get_run_stream_set_create_count(DeviceContextHandle ctx);
  * exclusive-device path driven through the prepared-run family
  * above. simpler_kernel_mode_init latches kernel mode, which borrows the
  * caller's already-current device and caller-owned stream to enqueue one
- * bounded asynchronous operator per launch: no device reset, no internal
- * stream/device synchronize on the prepare/launch/close paths, zero
- * allocation at launch, and no capture/model-state queries, so a launch is
- * capturable by ACLGraph as an ordinary node.
+ * bounded asynchronous operator per launch: no device reset, no synchronize
+ * of a caller stream or the device on the prepare/launch/close paths, no
+ * synchronize of any stream at launch, zero allocation at launch, and no
+ * capture/model-state queries, so a launch is capturable by ACLGraph as an
+ * ordinary node.
  *
  * Identity is a write-once property of the context, not a state that evolves:
  * ExecutionModeLatch on the platform runner holds it, the first init entry to
@@ -581,8 +582,8 @@ size_t get_run_stream_set_create_count(DeviceContextHandle ctx);
  * Structural argument errors return PTO_RUNTIME_ERR_INVALID_ARGUMENT before
  * capability or lifecycle checks. These entries accept only POD structs,
  * serialized blobs, and device/stream pointers — never framework objects.
- * The caller stream is always an explicit parameter and is never stored
- * beyond the call or destroyed by simpler.
+ * Launch is the only entry that takes the caller's stream; there it is an
+ * explicit parameter, never stored beyond the call or destroyed by simpler.
  * =========================================================================== */
 
 /**
@@ -626,13 +627,22 @@ int simpler_kernel_mode_init(
  * `callable_size` bytes. Validating every flexible-array offset before the
  * image is hashed or uploaded is the implementation's obligation; the shared
  * entry validation checks only the image's alignment, its size floor, and the
- * callable id range. Preparation may allocate persistent state and
- * enqueue asynchronous device work on `caller_stream`, but never synchronizes
- * a stream or device — preparation errors surface through the caller's own
- * warmup + synchronize. The stream is borrowed for this call only.
+ * output pointer. Preparation may allocate persistent state and enqueue
+ * asynchronous device work on context-owned streams. Registration synchronizes
+ * its internal AICPU control stream before committing the callable, so a
+ * registration failure is reported by this call's status, but it never
+ * synchronizes a caller stream or the device. Preparation neither accepts nor
+ * retains a caller stream; the current caller stream is supplied independently
+ * to each launch.
+ *
+ * The runtime mints the callable ID. Every successful call writes a new
+ * context-local ID to out_callable_id, even for identical content.
+ * out_callable_id must be non-null and point to separate writable int32_t
+ * storage; when it is non-null, every failure sets it to -1. The return value
+ * is a status code. IDs are valid only on the issuing context.
  */
 int simpler_kernel_mode_prepare_callable(
-    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size, void *caller_stream
+    DeviceContextHandle ctx, const void *callable, size_t callable_size, int32_t *out_callable_id
 );
 
 /**

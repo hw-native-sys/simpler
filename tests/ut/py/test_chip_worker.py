@@ -196,8 +196,40 @@ def kernel_symbol_runtime(tmp_path_factory):
     """.split()
     cache = {}
 
-    def build(*, supported=0, missing=(), init_result=0):
-        key = (supported, missing, init_result)
+    def build(
+        *,
+        supported=0,
+        missing=(),
+        init_result=0,
+        kernel_init_result=None,
+        prepare_result=None,
+        launch_result=None,
+        finalize_failures=0,
+        finalize_aborts=False,
+        prepare_writes_id=True,
+    ):
+        # A kernel entry left at None stays an aborting sentinel; a value makes the
+        # fake implement it and return that status.
+        key = (
+            supported,
+            missing,
+            init_result,
+            kernel_init_result,
+            prepare_result,
+            launch_result,
+            finalize_failures,
+            finalize_aborts,
+            prepare_writes_id,
+        )
+        implemented = {
+            name
+            for name, value in (
+                ("simpler_kernel_mode_init", kernel_init_result),
+                ("simpler_kernel_mode_prepare_callable", prepare_result),
+                ("simpler_kernel_mode_launch", launch_result),
+            )
+            if value is not None
+        }
         if key in cache:
             return cache[key]
         source = build_dir / f"runtime_{len(cache)}.cpp"
@@ -206,6 +238,7 @@ def kernel_symbol_runtime(tmp_path_factory):
         source.write_text(
             '#include "runtime_c_api.h"\n'
             "#include <cstdlib>\n"
+            "#include <unordered_set>\n"
             "static int live_contexts = 0;\n"
             "struct ContextLeakCheck {\n"
             "    ~ContextLeakCheck() { if (live_contexts != 0) std::abort(); }\n"
@@ -213,11 +246,19 @@ def kernel_symbol_runtime(tmp_path_factory):
             "static ContextLeakCheck context_leak_check;\n"
             "struct SimplerHostLogState;\n"
             'extern "C" int simpler_host_log_bind_state(SimplerHostLogState *) { return 0; }\n'
-            "DeviceContextHandle create_device_context() { ++live_contexts; return new uint64_t{0}; }\n"
-            "void destroy_device_context(DeviceContextHandle ctx) {\n"
-            "    --live_contexts; delete static_cast<uint64_t *>(ctx);\n"
+            "static std::unordered_set<void *> live_handles;\n"
+            "DeviceContextHandle create_device_context() {\n"
+            "    ++live_contexts; auto *ctx = new uint64_t{0}; live_handles.insert(ctx); return ctx;\n"
             "}\n"
-            "int finalize_device(DeviceContextHandle) { return 0; }\n"
+            "void destroy_device_context(DeviceContextHandle ctx) {\n"
+            "    --live_contexts; live_handles.erase(ctx); delete static_cast<uint64_t *>(ctx);\n"
+            "}\n"
+            f"static int finalize_failures = {finalize_failures};\n"
+            "int finalize_device(DeviceContextHandle ctx) {\n"
+            f"    if ({int(finalize_aborts)} || live_handles.count(ctx) == 0) std::abort();\n"
+            "    if (finalize_failures > 0) { --finalize_failures; return -77; }\n"
+            "    return 0;\n"
+            "}\n"
             "size_t get_runtime_size() { return sizeof(uint64_t); }\n"
             "size_t get_runtime_alignment() { return alignof(uint64_t); }\n"
             "const PipelineContract *get_pipeline_contract() {\n"
@@ -236,6 +277,33 @@ def kernel_symbol_runtime(tmp_path_factory):
                 "}\n"
                 if "simpler_kernel_mode_supported" not in missing
                 else ""
+            )
+            + (
+                "int simpler_kernel_mode_init(DeviceContextHandle ctx, int, const uint8_t *, size_t,\n"
+                "                             const uint8_t *, size_t, const uint8_t *, size_t,\n"
+                "                             const CallConfig *, uint64_t) {\n"
+                "    if (ctx == nullptr) std::abort();\n"
+                f"    return {kernel_init_result};\n"
+                "}\n"
+                if kernel_init_result is not None
+                else ""
+            )
+            + (
+                "int simpler_kernel_mode_prepare_callable(DeviceContextHandle, const void *, size_t,\n"
+                "                                         int32_t *out_callable_id) {\n"
+                "    if (out_callable_id != nullptr) *out_callable_id = -1;\n"
+                f"    if ({prepare_result} == 0 && {int(prepare_writes_id)}) *out_callable_id = 5;\n"
+                f"    return {prepare_result};\n"
+                "}\n"
+                if prepare_result is not None
+                else ""
+            )
+            + (
+                "int simpler_kernel_mode_launch(DeviceContextHandle, int32_t, const void *, void *) {\n"
+                f"    return {launch_result};\n"
+                "}\n"
+                if launch_result is not None
+                else ""
             ),
             encoding="utf-8",
         )
@@ -246,7 +314,7 @@ def kernel_symbol_runtime(tmp_path_factory):
             + "".join(
                 f'extern "C" void {symbol}() {{ std::abort(); }}\n'
                 for symbol in (*unused_symbols, *_KERNEL_LIFECYCLE_SYMBOLS)
-                if symbol not in missing
+                if symbol not in missing and symbol not in implemented
             ),
             encoding="utf-8",
         )
@@ -329,6 +397,210 @@ class TestChipWorkerKernelSymbols:
             assert worker.initialized
         finally:
             worker.finalize()
+
+
+class TestChipWorkerKernelEntryLayer:
+    @staticmethod
+    def _kernel_init(worker, runtime):
+        worker.kernel_init(str(runtime), os.devnull, os.devnull, "", 0, CallConfig(), 1)
+
+    @staticmethod
+    def _probe_callable():
+        from _task_interface import ChipCallable  # noqa: PLC0415
+
+        return ChipCallable.build(signature=[], func_name="probe", binary=b"\x00", children=[])
+
+    def test_supported_is_false_whenever_no_runtime_is_bound(self, kernel_symbol_runtime):
+        runtime = kernel_symbol_runtime(supported=1, kernel_init_result=0)
+        worker = _ChipWorker()
+        assert worker.kernel_mode_supported is False
+        try:
+            self._kernel_init(worker, runtime)
+            assert worker.kernel_mode_supported is True
+        finally:
+            worker.finalize()
+        assert worker.kernel_mode_supported is False
+
+    def test_unsupported_kernel_init_is_typed_with_its_code(self, kernel_symbol_runtime):
+        from _task_interface import (  # noqa: PLC0415
+            PTO_RUNTIME_ERR_UNSUPPORTED,
+            ChipWorkerError,
+            UnsupportedRuntimeOperation,
+        )
+
+        runtime = kernel_symbol_runtime(kernel_init_result=PTO_RUNTIME_ERR_UNSUPPORTED)
+        worker = _ChipWorker()
+        with pytest.raises(UnsupportedRuntimeOperation) as excinfo:
+            self._kernel_init(worker, runtime)
+        error = excinfo.value
+        assert error.code == PTO_RUNTIME_ERR_UNSUPPORTED
+        assert isinstance(error, ChipWorkerError)
+        assert isinstance(error, RuntimeError)
+        assert isinstance(error, NotImplementedError)
+        assert not worker.initialized
+        worker.finalize()
+
+    def test_kernel_init_failure_carries_the_entry_status(self, kernel_symbol_runtime):
+        from _task_interface import ChipWorkerError, UnsupportedRuntimeOperation  # noqa: PLC0415
+
+        # -91 is no code ChipWorker raises on its own, so it can only have come
+        # from the entry.
+        runtime = kernel_symbol_runtime(kernel_init_result=-91)
+        worker = _ChipWorker()
+        with pytest.raises(ChipWorkerError, match="simpler_kernel_mode_init failed with code -91") as excinfo:
+            self._kernel_init(worker, runtime)
+        assert excinfo.value.code == -91
+        assert not isinstance(excinfo.value, UnsupportedRuntimeOperation)
+        assert not worker.initialized
+        worker.finalize()
+
+    def test_refusals_before_any_resource_skip_the_device_teardown(self, kernel_symbol_runtime):
+        from _task_interface import (  # noqa: PLC0415
+            PTO_RUNTIME_ERR_INVALID_ARGUMENT,
+            PTO_RUNTIME_ERR_UNSUPPORTED,
+            ChipWorkerError,
+            UnsupportedRuntimeOperation,
+        )
+
+        # finalize_device aborts the process in these runtimes. On sim it releases
+        # whichever device the calling thread is bound to, so a refusal that took
+        # no resources must never reach it.
+        unsupported = kernel_symbol_runtime(kernel_init_result=PTO_RUNTIME_ERR_UNSUPPORTED, finalize_aborts=True)
+        worker = _ChipWorker()
+        with pytest.raises(UnsupportedRuntimeOperation):
+            self._kernel_init(worker, unsupported)
+        assert not worker.initialized
+
+        invalid = kernel_symbol_runtime(kernel_init_result=PTO_RUNTIME_ERR_INVALID_ARGUMENT, finalize_aborts=True)
+        worker = _ChipWorker()
+        with pytest.raises(ChipWorkerError) as excinfo:
+            self._kernel_init(worker, invalid)
+        assert excinfo.value.code == PTO_RUNTIME_ERR_INVALID_ARGUMENT
+        assert not worker.initialized
+
+    def test_init_failure_with_a_failed_teardown_owes_a_retry(self, kernel_symbol_runtime):
+        from _task_interface import PTO_RUNTIME_ERR_INVALID_STATE, ChipWorkerError  # noqa: PLC0415
+
+        runtime = kernel_symbol_runtime(kernel_init_result=-91, finalize_failures=1)
+        worker = _ChipWorker()
+        try:
+            with pytest.raises(ChipWorkerError, match="finalize_device failed with code -77") as excinfo:
+                self._kernel_init(worker, runtime)
+            assert excinfo.value.code == -91
+            assert not worker.initialized
+            assert worker.kernel_mode_supported is False
+            with pytest.raises(ChipWorkerError) as kernel_reinit:
+                self._kernel_init(worker, runtime)
+            assert kernel_reinit.value.code == PTO_RUNTIME_ERR_INVALID_STATE
+            with pytest.raises(ChipWorkerError) as program_reinit:
+                worker.init(str(runtime), os.devnull, os.devnull, "", device_id=0)
+            assert program_reinit.value.code == PTO_RUNTIME_ERR_INVALID_STATE
+        finally:
+            # The fake aborts in finalize_device on a destroyed context, so this
+            # retry also proves the failed init kept the context.
+            worker.finalize()
+        assert not worker.initialized
+
+    def test_prepare_returns_the_id_the_runtime_minted(self, kernel_symbol_runtime):
+        runtime = kernel_symbol_runtime(kernel_init_result=0, prepare_result=0)
+        worker = _ChipWorker()
+        try:
+            self._kernel_init(worker, runtime)
+            assert worker.kernel_prepare_callable(self._probe_callable()) == 5
+        finally:
+            worker.finalize()
+
+    def test_prepare_and_launch_failures_carry_their_codes(self, kernel_symbol_runtime):
+        from _task_interface import ChipStorageTaskArgs, ChipWorkerError  # noqa: PLC0415
+
+        # -92 and -93 are no codes ChipWorker raises on its own.
+        runtime = kernel_symbol_runtime(kernel_init_result=0, prepare_result=-92, launch_result=-93)
+        worker = _ChipWorker()
+        try:
+            self._kernel_init(worker, runtime)
+            with pytest.raises(ChipWorkerError) as prepare_error:
+                worker.kernel_prepare_callable(self._probe_callable())
+            assert prepare_error.value.code == -92
+            with pytest.raises(ChipWorkerError) as launch_error:
+                worker.kernel_launch(0, ChipStorageTaskArgs(), 1)
+            assert launch_error.value.code == -93
+        finally:
+            worker.finalize()
+
+    def test_prepare_success_without_an_id_is_an_internal_error(self, kernel_symbol_runtime):
+        from _task_interface import PTO_RUNTIME_ERR_INTERNAL, ChipWorkerError  # noqa: PLC0415
+
+        runtime = kernel_symbol_runtime(kernel_init_result=0, prepare_result=0, prepare_writes_id=False)
+        worker = _ChipWorker()
+        try:
+            self._kernel_init(worker, runtime)
+            with pytest.raises(ChipWorkerError, match="without a callable id") as excinfo:
+                worker.kernel_prepare_callable(self._probe_callable())
+            assert excinfo.value.code == PTO_RUNTIME_ERR_INTERNAL
+        finally:
+            worker.finalize()
+
+    def test_unbound_kernel_entries_refuse_with_invalid_state(self):
+        from _task_interface import (  # noqa: PLC0415
+            PTO_RUNTIME_ERR_INVALID_STATE,
+            ChipStorageTaskArgs,
+            ChipWorkerError,
+        )
+
+        worker = _ChipWorker()
+        with pytest.raises(ChipWorkerError) as prepare_error:
+            worker.kernel_prepare_callable(self._probe_callable())
+        assert prepare_error.value.code == PTO_RUNTIME_ERR_INVALID_STATE
+        with pytest.raises(ChipWorkerError) as launch_error:
+            worker.kernel_launch(0, ChipStorageTaskArgs(), 1)
+        assert launch_error.value.code == PTO_RUNTIME_ERR_INVALID_STATE
+
+    def test_null_launch_stream_is_refused_before_the_entry(self, kernel_symbol_runtime):
+        from _task_interface import (  # noqa: PLC0415
+            PTO_RUNTIME_ERR_INVALID_ARGUMENT,
+            ChipStorageTaskArgs,
+            ChipWorkerError,
+        )
+
+        # launch_result is left unset, so the fake's launch entry aborts if reached.
+        runtime = kernel_symbol_runtime(kernel_init_result=0)
+        worker = _ChipWorker()
+        try:
+            self._kernel_init(worker, runtime)
+            with pytest.raises(ChipWorkerError, match="caller_stream") as excinfo:
+                worker.kernel_launch(0, ChipStorageTaskArgs(), 0)
+            assert excinfo.value.code == PTO_RUNTIME_ERR_INVALID_ARGUMENT
+        finally:
+            worker.finalize()
+
+    def test_kernel_teardown_failure_is_raised_and_retriable(self, kernel_symbol_runtime):
+        from _task_interface import PTO_RUNTIME_ERR_INVALID_STATE, ChipWorkerError  # noqa: PLC0415
+
+        runtime = kernel_symbol_runtime(supported=1, kernel_init_result=0, finalize_failures=1)
+        worker = _ChipWorker()
+        self._kernel_init(worker, runtime)
+        try:
+            with pytest.raises(ChipWorkerError, match=r"device teardown failed \(-77\)") as excinfo:
+                worker.finalize()
+            assert excinfo.value.code == -77
+            # The half-released context is reachable only through finalize().
+            assert not worker.initialized
+            assert worker.kernel_mode_supported is False
+            with pytest.raises(ChipWorkerError) as reinit:
+                self._kernel_init(worker, runtime)
+            assert reinit.value.code == PTO_RUNTIME_ERR_INVALID_STATE
+        finally:
+            # The fake aborts in finalize_device on a destroyed context, so this
+            # retry also proves the failed teardown kept the context.
+            worker.finalize()
+        assert not worker.initialized
+
+    def test_program_teardown_failure_is_not_raised(self, kernel_symbol_runtime):
+        runtime = kernel_symbol_runtime(finalize_failures=1)
+        worker = _ChipWorker()
+        worker.init(str(runtime), os.devnull, os.devnull, "", device_id=0)
+        worker.finalize()
+        assert not worker.initialized
 
 
 class TestChipWorkerStateMachine:
@@ -709,3 +981,100 @@ class TestMailboxConfigRoundtrip:
             "pipeline_generation": 23,
             "callable_digest": "ab" * 32,
         }
+
+
+class TestChipWorkerKernelWrapper:
+    @staticmethod
+    def _callable(name="probe"):
+        from _task_interface import ChipCallable  # noqa: PLC0415
+
+        return ChipCallable.build(signature=[], func_name=name, binary=b"\x00", children=[])
+
+    def test_prepare_keeps_the_callable_under_the_minted_id(self):
+        from simpler.task_interface import ChipWorker  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
+
+        class FakeImpl:
+            initialized = True
+            device_id = 0
+
+            def kernel_prepare_callable(self, chip_callable):
+                return 42
+
+        worker = ChipWorker()
+        worker._impl = FakeImpl()
+        target = self._callable()
+        assert worker.kernel_prepare_callable(target) == 42
+        assert worker._kernel_callables == {42: target}
+        # Kernel IDs are not program slots, so the program registry stays empty.
+        assert worker._callable_registry == {}
+
+    def test_failed_prepare_keeps_nothing(self):
+        from simpler.task_interface import ChipWorker  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
+
+        class FakeImpl:
+            initialized = True
+            device_id = 0
+
+            def kernel_prepare_callable(self, chip_callable):
+                raise RuntimeError("injected prepare failure")
+
+        worker = ChipWorker()
+        worker._impl = FakeImpl()
+        with pytest.raises(RuntimeError, match="injected prepare failure"):
+            worker.kernel_prepare_callable(self._callable())
+        assert worker._kernel_callables == {}
+
+    def test_registries_survive_a_failed_native_finalize_until_a_retry_succeeds(self, monkeypatch):
+        import simpler.task_interface as task_interface_mod  # noqa: PLC0415
+        from simpler.task_interface import ChipWorker  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
+
+        failures = [RuntimeError("injected device teardown failure")]
+
+        class FakeImpl:
+            initialized = True
+            device_id = 0
+
+            def finalize(self):
+                if failures:
+                    raise failures.pop()
+
+        monkeypatch.setattr(task_interface_mod, "_flush_host_log", lambda _timeout_ms: True)
+        worker = ChipWorker()
+        worker._impl = FakeImpl()
+        program_callable = self._callable("program")
+        kernel_callable = self._callable("kernel")
+        worker._callable_registry[0] = program_callable
+        worker._identity_registry[b"digest"] = object()
+        worker._live_handles[1] = b"digest"
+        worker._kernel_callables[3] = kernel_callable
+
+        with pytest.raises(RuntimeError, match="injected device teardown failure"):
+            worker.finalize()
+        assert worker._callable_registry == {0: program_callable}
+        assert list(worker._identity_registry) == [b"digest"]
+        assert worker._live_handles == {1: b"digest"}
+        assert worker._kernel_callables == {3: kernel_callable}
+
+        worker.finalize()
+        assert worker._callable_registry == {}
+        assert worker._identity_registry == {}
+        assert worker._live_handles == {}
+        assert worker._kernel_callables == {}
+
+    def test_error_types_and_status_codes_are_public(self):
+        import simpler.task_interface as task_interface_mod  # noqa: PLC0415
+
+        error = task_interface_mod.ChipWorkerError("constructed in Python")
+        assert error.code is None
+        assert isinstance(error, RuntimeError)
+        assert issubclass(task_interface_mod.UnsupportedRuntimeOperation, task_interface_mod.ChipWorkerError)
+        assert issubclass(task_interface_mod.UnsupportedRuntimeOperation, NotImplementedError)
+        for name in (
+            "PTO_RUNTIME_ERR_INTERNAL",
+            "PTO_RUNTIME_ERR_UNSUPPORTED",
+            "PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE",
+            "PTO_RUNTIME_ERR_INVALID_STATE",
+            "PTO_RUNTIME_ERR_INVALID_ARGUMENT",
+        ):
+            assert name in task_interface_mod.__all__
+            assert isinstance(getattr(task_interface_mod, name), int)
