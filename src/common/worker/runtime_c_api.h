@@ -557,8 +557,9 @@ size_t get_run_stream_set_create_count(DeviceContextHandle ctx);
  *
  * Kernel-mode capacity is a mode invariant, not a gated state: `config` is
  * context-static, so each pooled arena region is committed at most once and
- * never grown or released afterwards. The platform arena reports a growth or
- * release request under kernel mode as an internal invariant break
+ * never grown or released afterwards, and the trb retained temporary buffer is
+ * allocated at most once. Both report a request that would re-base or release
+ * what they already hold as an internal invariant break
  * (PTO_RUNTIME_ERR_INTERNAL), and capacity intent travels in
  * CallConfig.runtime_env like everywhere else.
  *

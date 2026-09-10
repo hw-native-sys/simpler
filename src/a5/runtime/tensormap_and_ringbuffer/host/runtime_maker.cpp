@@ -261,8 +261,9 @@ public:
 
     // Pack the run's non-child, non-empty tensors to compute the required
     // aligned size, then grow the retained slot if it is too small (free old +
-    // malloc new + write back). Returns false only if the (grow) device_malloc
-    // fails. A run needing 0 bytes leaves the slot untouched.
+    // malloc new + write back). Returns false when that device_malloc fails,
+    // and when a kernel-mode context would have to grow a slot that already
+    // holds a buffer. A run needing 0 bytes leaves the slot untouched.
     bool begin(const HostApi *api, const ChipStorageTaskArgs *orch_args) {
         api_ = api;
         offset_ = 0;
@@ -277,6 +278,21 @@ public:
         void *addr = nullptr;
         size_t size = 0;
         api->get_retained_temp_buffer(&addr, &size);
+        if (required > size && addr != nullptr && api->is_kernel_mode()) {
+            // A kernel-mode context's retained buffer keeps its address for the
+            // context's life, and a captured graph replays the slices it handed
+            // out. Growing is free + malloc, which re-bases every one of them,
+            // so the run is refused ahead of the free and the slot stays
+            // exactly as the previous run left it. An empty slot holds no
+            // address to preserve, so the context's first allocation is not a
+            // re-base and is taken normally.
+            LOG_ERROR(
+                "Retained temp buffer is context-static in kernel mode: this run needs %zu bytes, the retained "
+                "buffer holds %zu",
+                required, size
+            );
+            return false;
+        }
         if (required > size) {
             if (addr != nullptr) {
                 api->device_free(addr);

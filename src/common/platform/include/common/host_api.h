@@ -46,11 +46,13 @@ struct HostApiOps {
     // across runs on the DeviceRunner. trb bind reads the slot, and if the
     // retained buffer is too small for this run's packed temporary size it
     // device_free's the old one, device_malloc's a bigger one, and writes the
-    // new {addr, size} back. The grow/pack/slice logic lives in trb bind
-    // (runtime_maker); the platform only remembers the slot so it can be reused
-    // by later runs and freed at finalize. The slot is per pipeline slot, so
-    // two runs in different slots never share a staging buffer. `get` returns
-    // {nullptr, 0} when nothing is retained yet.
+    // new {addr, size} back — except under a kernel-mode context, which refuses
+    // the run instead and leaves the slot untouched, since its buffers keep
+    // their addresses for the life of the context. The grow/pack/slice logic
+    // lives in trb bind (runtime_maker); the platform only remembers the slot
+    // so it can be reused by later runs and freed at finalize. The slot is per
+    // pipeline slot, so two runs in different slots never share a staging
+    // buffer. `get` returns {nullptr, 0} when nothing is retained yet.
     void (*get_retained_temp_buffer)(void *runner_ctx, uint32_t pipeline_slot, void **addr, size_t *size);
     void (*set_retained_temp_buffer)(void *runner_ctx, uint32_t pipeline_slot, void *addr, size_t size);
     // Runner-owned Graph Definition storage: one device block per pipeline slot
@@ -93,8 +95,15 @@ struct HostApiOps {
     // Commit the three pooled regions (GM heap, runtime shared memory, and
     // prebuilt runtime arena) of the arena bank selected by this run, as three
     // independent device allocations. `runtime_arena_size == 0` skips the
-    // third region. Idempotent on identical sizes; returns 0 on success, -1 on
-    // allocation failure.
+    // third region. Idempotent on identical sizes; returns 0 on success and
+    // PTO_RUNTIME_ERR_INTERNAL on failure.
+    //
+    // The two failures leave the bank in different states. An allocation
+    // failure releases every region and zeroes every size the bank remembers,
+    // so a caller retries from the post-construction state rather than a
+    // partial layout. A kernel-mode context's refusal to re-base or release a
+    // committed region leaves every region exactly as it was, since rolling
+    // that back would free the addresses the refusal exists to hold still.
     int (*setup_static_arena)(
         void *runner_ctx, uint32_t arena_bank, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size
     );
@@ -150,6 +159,15 @@ struct HostApiOps {
     bool (*publish_chip_swimlane_extension)(
         void *runner_ctx, ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size
     );
+    // This context's execution identity. A captured graph replays the
+    // addresses of the run it captured, so a kernel-mode context's buffers must
+    // not move: the pooled arena regions and the retained temporary buffer are
+    // each sized once and keep their address for the context's life, and the
+    // two sizing paths that would otherwise re-base them read this and refuse
+    // instead. The other device buffers reached through this table do not
+    // consult it — acquire_graph_definition_block still grows by replacement. A
+    // table that does not supply this entry reports program mode.
+    bool (*is_kernel_mode)(void *runner_ctx);
 };
 
 /**
@@ -269,6 +287,14 @@ public:
         } catch (...) {
             return false;
         }
+    }
+    /**
+     * True when this run belongs to a kernel-mode context, whose pooled arena
+     * regions and retained temporary buffer hold their addresses for the life
+     * of the context.
+     */
+    bool is_kernel_mode() const noexcept {
+        return ops_->is_kernel_mode != nullptr && ops_->is_kernel_mode(runner_ctx_);
     }
 
 private:

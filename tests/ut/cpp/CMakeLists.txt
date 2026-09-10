@@ -1325,6 +1325,33 @@ add_dependencies(test_host_log_cross_dso test_host_log_consumer)
 add_test(NAME test_host_log_cross_dso COMMAND test_host_log_cross_dso)
 set_tests_properties(test_host_log_cross_dso PROPERTIES LABELS "no_hardware")
 
+# Arena-bank capacity rule shared by the onboard and sim runners
+# (host/static_arena_bank.h). Pure host logic over DeviceArena's libc backend,
+# so a kernel-mode context's address stability is provable with no CANN and no
+# device; the logger sources satisfy the rule's LOG_ERROR. Placed after
+# SIMPLER_LOG_DIR / HOST_LOG_TEST_SOURCES rather than beside the other
+# common-utils tests, which are declared before those are set.
+add_executable(test_static_arena_bank
+    common/test_static_arena_bank.cpp
+    ${HOST_LOG_TEST_SOURCES}
+)
+target_include_directories(test_static_arena_bank PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    # src/common resolves the "utils/..." and "worker/..." prefixes.
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+    ${SIMPLER_LOG_DIR}
+    ${SIMPLER_LOG_DIR}/include
+)
+target_link_libraries(test_static_arena_bank PRIVATE
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    pthread
+)
+add_test(NAME test_static_arena_bank COMMAND test_static_arena_bank)
+set_tests_properties(test_static_arena_bank PROPERTIES LABELS "no_hardware")
+
 set(COMMON_PLATFORM_DIR ${CMAKE_SOURCE_DIR}/../../../src/common/platform)
 function(add_device_phase_capture_test name host_strace device_strace expected)
     add_executable(${name}

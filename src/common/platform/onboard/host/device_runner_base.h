@@ -138,10 +138,12 @@ public:
 
     /**
      * This context's execution identity, latched once by whichever init entry
-     * constructs it. Every kernel-mode guard on the ACL-lifecycle and arena
-     * paths keys on is_kernel(); `attach_current_thread` refuses outright on a
-     * kernel latch, which is what keeps the program-mode entries and the
-     * per-thread device bind off a borrowed device.
+     * constructs it. Every kernel-mode guard on the ACL-lifecycle and capacity
+     * paths keys on is_kernel() — the pooled arena regions here, and the trb
+     * retained temporary buffer through HostApiOps::is_kernel_mode, which
+     * carries this same latch into runtime code. `attach_current_thread`
+     * refuses outright on a kernel latch, which is what keeps the program-mode
+     * entries and the per-thread device bind off a borrowed device.
      */
     ExecutionModeLatch &execution_mode_latch() { return execution_mode_latch_; }
 
@@ -187,15 +189,19 @@ public:
      * is 0 for the hbg path (no prebuilt runtime arena) — the
      * corresponding arena stays uncommitted.
      *
-     * On failure to commit a later region, earlier committed regions are
-     * rolled back (a5's prior semantics). This is the safer default: a
+     * An allocation failure on any region rolls the whole bank back,
+     * earlier committed peers included. This is the safer default: a
      * partial commit otherwise leaves the caller with pooled pointers
      * that survive a "failure" return, masking the real error and risking
-     * later mismatched-arena bugs. (The a2a3 implementation that
-     * previously kept earlier committed peers alive on failure is
-     * normalized away.)
+     * later mismatched-arena bugs.
      *
-     * @return 0 on success, -1 on failure.
+     * A kernel-mode context's refusal to re-base or release a committed
+     * region is the one failure that does not roll back — every region
+     * stays committed and every cached size stays intact, because the
+     * rollback would free the addresses the refusal exists to hold still.
+     * A caller distinguishes the two by mode, not by the return code.
+     *
+     * @return 0 on success, PTO_RUNTIME_ERR_INTERNAL on failure.
      */
     int setup_static_arena(uint32_t arena_bank, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
 

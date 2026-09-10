@@ -47,6 +47,7 @@
 #include "host/acl_error_log.h"
 #include "host/host_phase_records_artifact.h"
 #include "host/raii_scope_guard.h"
+#include "host/static_arena_bank.h"
 #include "host_log.h"
 #include "platform_comm/comm.h"
 #include "runtime_c_api.h"
@@ -365,90 +366,18 @@ int DeviceRunnerBase::setup_static_arena(
     // combined size can exceed the device allocator's largest contiguous
     // block. Each arena commits exactly one region, so its base() is the
     // pooled pointer the caller wants.
-    //
-    // Idempotent for the production case (sizes do not change across a
-    // worker's lifetime). If a caller asks for a larger layout on any
-    // region, redo just that region — already-committed peers stay alive
-    // so their callers don't have to re-acquire.
     ArenaBank &bank = this->arena_bank(arena_bank);
 
-    bool arena_changed = false;
-    // A kernel-mode context's config is context-static, so each region is
-    // committed at most once and never grown or released afterwards; captured
-    // graphs may hold the committed base address. A request that would
-    // re-base or release a committed region under kernel mode is therefore an
-    // internal invariant break, not caller-configurable behavior. The refusal
-    // is not self-contained: the caller collapses a nonzero return to
-    // `ok = false` and then releases all three regions unconditionally, and
-    // DeviceArena::release() frees the backing buffer — so a fired guard drops
-    // the very base addresses it names.
-    const bool kernel_mode = execution_mode_latch().is_kernel();
-    auto commit_region = [&arena_changed,
-                          kernel_mode](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
-        if (kernel_mode && arena.is_committed() &&
-            (requested_size == 0 ? cached_size != 0 : requested_size > cached_size)) {
-            LOG_ERROR(
-                "setup_static_arena: kernel mode forbids %s a committed region (cached %zu, requested %zu)",
-                requested_size == 0 ? "releasing" : "growing", cached_size, requested_size
-            );
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-        if (requested_size == 0) {
-            // hbg's runtime_arena path: caller passed 0 and never reserved
-            // a region. Leave the arena uncommitted; acquire_pooled_* will
-            // return nullptr.
-            if (arena.is_committed() && cached_size != 0) {
-                arena.release();
-                cached_size = 0;
-                arena_changed = true;
-            }
-            return 0;
-        }
-        if (arena.is_committed() && requested_size <= cached_size) {
-            return 0;
-        }
-        arena.release();
-        cached_size = 0;
-        arena_changed = true;
-        arena.reserve(requested_size, DeviceArena::kDefaultBaseAlign);
-        if (arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
-            // commit() failure leaves committed_=false, so the next entry's
-            // is_committed() guard skips the release branch. release() is
-            // idempotent on a never-committed arena (zeroes cursor_).
-            arena.release();
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-        cached_size = requested_size;
-        return 0;
+    const StaticArenaBankRequest request{
+        {&bank.gm_heap, &bank.cached_gm_heap_size, gm_heap_size},
+        {&bank.gm_sm, &bank.cached_gm_sm_size, gm_sm_size},
+        {&bank.runtime_pool, &bank.cached_runtime_arena_size, runtime_arena_size},
     };
-    // Try to commit all three regions; on any failure, fully roll back —
-    // including any earlier-committed peers from a PRIOR successful call.
-    // The simpler "only roll back peers from this call" pattern would
-    // leave stale committed regions when a re-init (e.g., later worker
-    // asking for a larger layout) fails midway, defeating the
-    // "failure means failure" guarantee. Reset everything to the
-    // post-construction state so the caller can retry with a new layout.
-    bool ok = commit_region(bank.gm_heap, bank.cached_gm_heap_size, gm_heap_size) == 0;
-    ok = ok && commit_region(bank.gm_sm, bank.cached_gm_sm_size, gm_sm_size) == 0;
-    ok = ok && commit_region(bank.runtime_pool, bank.cached_runtime_arena_size, runtime_arena_size) == 0;
-    if (!ok) {
-        bank.gm_heap.release();
-        bank.gm_sm.release();
-        bank.runtime_pool.release();
-        bank.cached_gm_heap_size = 0;
-        bank.cached_gm_sm_size = 0;
-        bank.cached_runtime_arena_size = 0;
-        if (arena_bank == 0) {
-            prebuilt_runtime_arena_cache_valid_ = false;
-            prebuilt_runtime_arena_cache_key_.clear();
-            prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
-            prebuilt_runtime_arena_cache_sm_base_ = nullptr;
-            prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
-            prebuilt_runtime_arena_cache_image_.clear();
-        }
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    if (arena_changed && arena_bank == 0) {
+    const StaticArenaBankOutcome outcome = commit_static_arena_bank(request, execution_mode_latch().is_kernel());
+    // The cache keys an assembled image to the bases it was built for, so it
+    // outlives exactly those calls that moved nothing. Only bank 0 has bases
+    // in it.
+    if (outcome.bases_changed && arena_bank == 0) {
         prebuilt_runtime_arena_cache_valid_ = false;
         prebuilt_runtime_arena_cache_key_.clear();
         prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
@@ -456,7 +385,7 @@ int DeviceRunnerBase::setup_static_arena(
         prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
         prebuilt_runtime_arena_cache_image_.clear();
     }
-    return 0;
+    return outcome.rc;
 }
 
 std::thread DeviceRunnerBase::create_thread(std::function<void()> fn) {

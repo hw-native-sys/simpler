@@ -224,6 +224,10 @@ static uint32_t get_chip_swimlane_level(void *runner_ctx) {
     return static_cast<SimDeviceRunnerBase *>(runner_ctx)->chip_swimlane_level();
 }
 
+static bool is_kernel_mode(void *runner_ctx) {
+    return runner_ctx != nullptr && static_cast<SimDeviceRunnerBase *>(runner_ctx)->execution_mode_latch().is_kernel();
+}
+
 static bool publish_chip_swimlane_extension(
     void *runner_ctx, ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size
 ) {
@@ -344,6 +348,7 @@ static const HostApiOps g_host_api_ops = {
     .host_phase_pool_arm = host_phase_pool_arm,
     .host_phase_pool_finish = host_phase_pool_finish,
     .publish_chip_swimlane_extension = publish_chip_swimlane_extension,
+    .is_kernel_mode = is_kernel_mode,
 };
 
 /* ===========================================================================

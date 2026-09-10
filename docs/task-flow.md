@@ -445,7 +445,9 @@ non-child tensors, growing it (free old + malloc new) only when a run needs
 more than is currently retained, and bump-slices each tensor from it. The
 buffer lives on the `DeviceRunner` across runs (freed once at finalize); the
 platform only stores its `{addr, size}` slot. If a grow allocation fails the
-run fails before device argument staging. See the runtime's `RUNTIME_LOGIC.md`
+run fails before device argument staging; under a kernel-mode context a run
+that would grow an already-allocated buffer fails there too, since that
+buffer's address is one a captured graph may replay. See the runtime's `RUNTIME_LOGIC.md`
 §2.4 for the grow/reuse mechanics.
 
 ### SUB-type child loop (Python callable leaf)
