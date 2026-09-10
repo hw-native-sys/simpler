@@ -616,6 +616,7 @@ static int record_callable_on_runner(
 int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, const void *callable) {
     if (ctx == NULL || callable == NULL) return PTO_RUNTIME_ERR_INTERNAL;
     DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
+    if (runner->execution_mode_latch().is_kernel()) return PTO_RUNTIME_ERR_INVALID_STATE;
     if (runner->native_runs_outstanding()) {
         LOG_ERROR("simpler_register_callable: native run must be finalized before mutating the callable registry");
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -1178,6 +1179,7 @@ int simpler_unregister_callable(DeviceContextHandle ctx, int32_t callable_id) {
     if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
     try {
         DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
+        if (runner->execution_mode_latch().is_kernel()) return PTO_RUNTIME_ERR_INVALID_STATE;
         if (runner->native_runs_outstanding()) {
             LOG_ERROR(
                 "simpler_unregister_callable: native run must be finalized before mutating the callable registry"
@@ -1310,6 +1312,7 @@ int simpler_kernel_mode_init(
             std::vector<uint8_t> dispatcher_vec(dispatcher_binary, dispatcher_binary + dispatcher_size);
             runner->set_dispatcher_binary(std::move(dispatcher_vec));
         }
+        runner->kernel_callable_cache().set_generation(context_generation);
         rc = runner->init_kernel_context(device_id, *config, context_generation);
     } catch (...) {
         rc = PTO_RUNTIME_ERR_INTERNAL;
@@ -1322,9 +1325,10 @@ int simpler_kernel_mode_init(
 }
 
 int simpler_kernel_mode_prepare_callable(
-    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size
+    DeviceContextHandle ctx, const void *callable, size_t callable_size, SimplerCallableHandle *out_handle
 ) {
-    int rc = validate_kernel_prepare_callable_args(ctx, callable_id, callable, callable_size);
+    if (out_handle != nullptr) *out_handle = {-1, 0};
+    int rc = validate_kernel_prepare_callable_args(ctx, callable, callable_size, out_handle);
     if (rc != 0) return rc;
 
     DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
@@ -1343,28 +1347,65 @@ int simpler_kernel_mode_prepare_callable(
         rc = runner->adopt_borrowed_device(runner->device_id());
         if (rc != 0) return rc;
 
-        // prepare_kernel_callable's AICPU registration self-skips a callable
-        // whose orchestration was resolved host-side, so the flag it reports
-        // adds nothing here.
-        bool needs_aicpu_register = false;
-        rc = record_callable_on_runner(runner, callable_id, callable, &needs_aicpu_register);
-        if (rc != 0) return rc;
-
-        rc = runner->prepare_kernel_callable(callable_id);
+        auto &cache = runner->kernel_callable_cache();
+        bool hit = false;
+        SimplerCallableHandle prepared{-1, 0};
+        rc = cache.stage(
+            static_cast<const ChipCallable *>(callable), callable_size, runner->kernel_callable_cache_ops(), prepared,
+            hit
+        );
         if (rc != 0) {
-            runner->unregister_callable(callable_id);
+            LOG_ERROR(
+                "kernel callable admission failed: cid=%d bytes=%zu resident=%zu/%d used=%zu/%zu rc=%d",
+                prepared.callable_id, callable_size, cache.resident_count(), MAX_REGISTERED_CALLABLE_IDS,
+                cache.resident_bytes(), KernelCallableCache::kByteLimit, rc
+            );
             return rc;
         }
+        if (hit) {
+            *out_handle = prepared;
+            return 0;
+        }
+        auto rollback = RAIIScopeGuard([&cache, prepared]() {
+            cache.rollback(prepared.callable_id);
+        });
+        bool needs_aicpu_register = false;
+        rc = record_callable_on_runner(runner, prepared.callable_id, callable, &needs_aicpu_register);
+        if (rc != 0) return rc;
+
+        // Registration may enqueue work before reporting failure. Its addresses
+        // cannot be recycled until the caller establishes quiescence and closes.
+        rollback.dismiss();
+        try {
+            rc = runner->prepare_kernel_callable(prepared.callable_id);
+        } catch (...) {
+            runner->kernel_execution_state().poison(PTO_RUNTIME_ERR_INTERNAL);
+            throw;
+        }
+        if (rc != 0) {
+            runner->kernel_execution_state().poison(rc);
+            return rc;
+        }
+        cache.commit(prepared.callable_id);
+        *out_handle = prepared;
         return 0;
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 }
 
-int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, const void *args, void *caller_stream) {
-    const int rc = validate_kernel_launch_args(ctx, callable_id, args, caller_stream);
+int simpler_kernel_mode_launch(
+    DeviceContextHandle ctx, SimplerCallableHandle handle, const void *args, void *caller_stream
+) {
+    const int rc = validate_kernel_launch_args(ctx, handle, args, caller_stream);
     if (rc != 0) return rc;
-    LOG_ERROR("simpler_kernel_mode_launch: no live kernel context on this device context");
+    auto *runner = static_cast<DeviceRunnerBase *>(ctx);
+    if (!runner->execution_mode_latch().is_kernel() || !runner->kernel_execution_state().accepts_dispatch())
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    KernelCallableResidency residency;
+    const int residency_rc = runner->kernel_callable_cache().resolve(handle, residency);
+    if (residency_rc != 0) return residency_rc;
+    LOG_ERROR("simpler_kernel_mode_launch: kernel launch binder is unavailable");
     return PTO_RUNTIME_ERR_INVALID_STATE;
 }
 

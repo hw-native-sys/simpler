@@ -133,7 +133,7 @@ TEST(KernelPipelineEntry, RealSimVariantsValidateWithoutClaimingOrCommitting) {
             EXPECT_EQ(committed(ctx), 0u);
             // A structurally valid launch still cannot run after unsupported init.
             int caller_stream_token = 0;
-            EXPECT_EQ(launch(ctx, 0, &config, &caller_stream_token), PTO_RUNTIME_ERR_INVALID_STATE);
+            EXPECT_EQ(launch(ctx, {0, 1}, &config, &caller_stream_token), PTO_RUNTIME_ERR_INVALID_STATE);
             EXPECT_EQ(invoke(&config), PTO_RUNTIME_ERR_UNSUPPORTED);
             EXPECT_EQ(committed(ctx), 0u);
             destroy(ctx);

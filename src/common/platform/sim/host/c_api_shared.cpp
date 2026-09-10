@@ -1075,16 +1075,19 @@ int simpler_kernel_mode_init(
 }
 
 int simpler_kernel_mode_prepare_callable(
-    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size
+    DeviceContextHandle ctx, const void *callable, size_t callable_size, SimplerCallableHandle *out_handle
 ) {
-    const int rc = validate_kernel_prepare_callable_args(ctx, callable_id, callable, callable_size);
+    if (out_handle != nullptr) *out_handle = {-1, 0};
+    const int rc = validate_kernel_prepare_callable_args(ctx, callable, callable_size, out_handle);
     if (rc != 0) return rc;
     LOG_ERROR("simpler_kernel_mode_prepare_callable: no live kernel context on this device context");
     return PTO_RUNTIME_ERR_INVALID_STATE;
 }
 
-int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, const void *args, void *caller_stream) {
-    const int rc = validate_kernel_launch_args(ctx, callable_id, args, caller_stream);
+int simpler_kernel_mode_launch(
+    DeviceContextHandle ctx, SimplerCallableHandle handle, const void *args, void *caller_stream
+) {
+    const int rc = validate_kernel_launch_args(ctx, handle, args, caller_stream);
     if (rc != 0) return rc;
     LOG_ERROR("simpler_kernel_mode_launch: no live kernel context on this device context");
     return PTO_RUNTIME_ERR_INVALID_STATE;

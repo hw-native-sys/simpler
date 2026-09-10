@@ -25,7 +25,7 @@
  * kernel-mode entries. Both platform c_api implementations (onboard and sim)
  * route through these checks, so a stub and a real implementation accept and
  * reject exactly the same arguments — the same parity rule the shared phase
- * machine follows. Each function returns 0 or PTO_RUNTIME_ERR_INTERNAL and
+ * machine follows. Each function returns 0 or a classified host error and
  * mutates nothing; logging stays with the callers.
  */
 
@@ -51,10 +51,9 @@ inline int validate_kernel_init_args(
 }
 
 inline int validate_kernel_prepare_callable_args(
-    const void *ctx, int32_t callable_id, const void *callable, size_t callable_size
+    const void *ctx, const void *callable, size_t callable_size, const SimplerCallableHandle *out_handle
 ) {
-    if (ctx == nullptr || callable == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-    if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) return PTO_RUNTIME_ERR_INTERNAL;
+    if (ctx == nullptr || callable == nullptr || out_handle == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     if (callable_size < sizeof(ChipCallable)) return PTO_RUNTIME_ERR_INTERNAL;
     /* ChipCallable's storage_ is CALLABLE_CHILD_ALIGN-aligned relative to the
        header, so a misaligned image puts every child at a misaligned address. */
@@ -101,9 +100,11 @@ inline int validate_kernel_prepare_callable_args(
     return 0;
 }
 
-inline int
-validate_kernel_launch_args(const void *ctx, int32_t callable_id, const void *args, const void *caller_stream) {
+inline int validate_kernel_launch_args(
+    const void *ctx, SimplerCallableHandle handle, const void *args, const void *caller_stream
+) {
     if (ctx == nullptr || args == nullptr || caller_stream == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-    if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) return PTO_RUNTIME_ERR_INTERNAL;
+    if (handle.callable_id < 0 || handle.generation == 0) return PTO_RUNTIME_ERR_INTERNAL;
+    if (handle.callable_id >= MAX_REGISTERED_CALLABLE_IDS) return PTO_RUNTIME_ERR_CALLABLE_COUNT_EXCEEDED;
     return 0;
 }

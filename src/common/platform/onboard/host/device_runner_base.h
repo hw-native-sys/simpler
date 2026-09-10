@@ -68,6 +68,7 @@
 #include "host/host_phase_records.h"
 #include "host/execution_mode_latch.h"
 #include "host/kernel_execution_state.h"
+#include "host/kernel_callable_cache.h"
 #include "kernel_persistent_args.h"
 #include "host/kernel_static_config.h"
 #include "host/memory_allocator.h"
@@ -167,6 +168,8 @@ public:
      * matters: only the first callable pays for the argument blocks.
      */
     int prepare_kernel_callable(int32_t callable_id);
+    KernelCallableCache &kernel_callable_cache() { return kernel_callable_cache_; }
+    KernelCallableCache::Ops kernel_callable_cache_ops();
 
     /** Allocate / free / copy on the per-Worker `MemoryAllocator` + CANN runtime. */
     void *allocate_tensor(std::size_t bytes);
@@ -1264,9 +1267,10 @@ protected:
     // This context's execution identity. Write-once: the first init entry to
     // run latches it, and it never changes afterwards.
     ExecutionModeLatch execution_mode_latch_;
-    // Kernel-mode context state. Both stay at their default-constructed
-    // values for a program-mode context, and neither performs a runtime call
+    // Kernel-mode context state. These stay at their default-constructed
+    // values for a program-mode context, and none performs a runtime call
     // on destruction.
+    KernelCallableCache kernel_callable_cache_;
     KernelExecutionState kernel_exec_state_;
     PersistentKernelArgs persistent_args_;
     KernelStaticConfig kernel_static_config_;

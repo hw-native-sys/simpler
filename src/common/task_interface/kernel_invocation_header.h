@@ -19,7 +19,8 @@
  * not constrained here. Validating identity, generation, and capacity against
  * this header before dispatching to the runtime payload consumer is the AICPU
  * dispatch entry's obligation: that validation lives with the consumers, not
- * in this header, and no consumer implements it.
+ * in this header. simpler_aicpu_kernel_exec validates the envelope and device
+ * residency before handing the payload to its runtime consumer.
  *
  * Both sides of this wire are produced by the same build (`build_runtimes.py`
  * emits the host runtime and the AICPU executor into one
@@ -45,8 +46,10 @@ typedef struct SimplerKernelInvocationHeader {
        generation starts at 1, matching PipelineSlotLease and CanonicalIdentity.
        The comparison belongs on the AICPU dispatch path because replay does
        not return to the host, so a stale captured snapshot has to be caught
-       on-device. Nothing mints this value and no device-side comparand
-       exists. */
+       on-device. KernelCallableCache mints it from the context generation; slots are
+       never reused within a context. KernelCallableDeviceResidency holds the
+       device-side comparand. The runtime invocation consumer must call
+       kernel_callable_residency_matches before dereferencing callable code. */
     uint64_t generation;
     /* Byte length of the runtime-specific payload that follows this header. */
     uint64_t payload_bytes;

@@ -72,6 +72,13 @@ struct CallConfig;
 extern "C" {
 #endif
 
+/* Context-local callable identity. Preserve both fields unchanged for launch.
+ * generation zero is invalid; slot reuse must issue a different generation. */
+typedef struct SimplerCallableHandle {
+    int32_t callable_id;
+    uint64_t generation;
+} SimplerCallableHandle;
+
 typedef void *RuntimeHandle;
 typedef void *DeviceContextHandle;
 
@@ -109,6 +116,10 @@ enum {
        context's lifecycle (e.g. launch on a context with no live kernel
        claim). */
     PTO_RUNTIME_ERR_INVALID_STATE = PTO_RUNTIME_ERR_BASE - 3,
+    PTO_RUNTIME_ERR_CALLABLE_COUNT_EXCEEDED = PTO_RUNTIME_ERR_BASE - 4,
+    PTO_RUNTIME_ERR_CALLABLE_BYTES_EXCEEDED = PTO_RUNTIME_ERR_BASE - 5,
+    PTO_RUNTIME_ERR_CALLABLE_NOT_RESIDENT = PTO_RUNTIME_ERR_BASE - 6,
+    PTO_RUNTIME_ERR_CALLABLE_STALE = PTO_RUNTIME_ERR_BASE - 7,
 };
 
 /** Return values from simpler_poll_run(). */
@@ -613,22 +624,42 @@ int simpler_kernel_mode_init(
 /**
  * Stage one callable for kernel-mode launches, outside ACLGraph capture.
  *
+ * The caller serializes init/prepare/launch/finalize on each context.
+ * On success, writes a context-local {callable_id, generation} to out_handle. Identical canonical
+ * content returns the same handle without another upload or registration. New
+ * content receives an internally allocated ID in [0, 64); the code arena holds
+ * 512 MiB of unique images, charged with 64-byte alignment, plus a separate
+ * fixed descriptor prefix. No eviction, unregister, or slot reuse occurs.
+ * COUNT_EXCEEDED / BYTES_EXCEEDED reject admission before upload; a missing
+ * launch target returns CALLABLE_NOT_RESIDENT. No error exits the process.
+ * out_handle must be non-null and point to separate writable SimplerCallableHandle
+ * storage. On every failure, it is set to {-1, 0}. The return value is
+ * a status code. Handles are valid only on the issuing context and
+ * remain stable until close. Hits still succeed when the cache is full.
+ * Failed device registration poisons the context and retains its storage
+ * until explicit close after caller-established quiescence.
+ *
  * `callable` points to a canonical ChipCallable image of exactly
  * `callable_size` bytes. Validating every flexible-array offset before the
  * image is hashed or uploaded is the implementation's obligation. Shared
  * entry validation checks the canonical image bounds, signature counts,
- * symbol names, alignment, and callable id range. Preparation may allocate persistent state and
+ * symbol names, alignment, and output pointer. Preparation may allocate persistent state and
  * enqueue device work on the context's own AICPU stream. It takes no caller
  * stream: nothing it enqueues belongs on one, and the ordering a caller
  * stream would have provided comes from that stream's own FIFO, which every
  * later launch enqueues onto behind this registration.
  */
 int simpler_kernel_mode_prepare_callable(
-    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size
+    DeviceContextHandle ctx, const void *callable, size_t callable_size, SimplerCallableHandle *out_handle
 );
 
 /**
  * Enqueue one bounded asynchronous kernel-mode operator invocation.
+ *
+ * Pass the complete handle returned by prepare, without replacing its generation.
+ * Zero generation is invalid; a resident ID with a different generation returns
+ * CALLABLE_STALE before dispatch. A missing ID returns CALLABLE_NOT_RESIDENT.
+ * Capture must preserve both fields in the invocation for device replay checks.
  *
  * `args` points to a ChipStorageTaskArgs POD whose tensor addresses are
  * caller-owned device addresses; they are passed through without ever being
@@ -639,7 +670,9 @@ int simpler_kernel_mode_prepare_callable(
  * implementation's obligation. A return of 0 means the sequence was enqueued;
  * device execution may still be in flight and may still fail asynchronously.
  */
-int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, const void *args, void *caller_stream);
+int simpler_kernel_mode_launch(
+    DeviceContextHandle ctx, SimplerCallableHandle handle, const void *args, void *caller_stream
+);
 
 #ifdef __cplusplus
 }

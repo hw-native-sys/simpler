@@ -29,6 +29,10 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 PTO_RUNTIME_ERR_INTERNAL = -1000
 PTO_RUNTIME_ERR_UNSUPPORTED = -1001
 PTO_RUNTIME_ERR_INVALID_STATE = -1003
+PTO_RUNTIME_ERR_CALLABLE_COUNT_EXCEEDED = -1004
+PTO_RUNTIME_ERR_CALLABLE_BYTES_EXCEEDED = -1005
+PTO_RUNTIME_ERR_CALLABLE_NOT_RESIDENT = -1006
+PTO_RUNTIME_ERR_CALLABLE_STALE = -1007
 
 _ARCHES = ("a2a3", "a5")
 _RUNTIMES = ("host_build_graph", "tensormap_and_ringbuffer")
@@ -110,6 +114,10 @@ class CallConfig(ctypes.Structure):
     ]
 
 
+class CallableHandle(ctypes.Structure):
+    _fields_ = [("callable_id", ctypes.c_int32), ("generation", ctypes.c_uint64)]
+
+
 def _load(arch: str, variant: str, runtime: str) -> ctypes.CDLL:
     path = _PROJECT_ROOT / "build" / "lib" / arch / variant / runtime / "libhost_runtime.so"
     if not path.exists():
@@ -144,12 +152,12 @@ def _load(arch: str, variant: str, runtime: str) -> ctypes.CDLL:
     lib.simpler_kernel_mode_init.restype = ctypes.c_int
     lib.simpler_kernel_mode_prepare_callable.argtypes = [
         ctypes.c_void_p,
-        ctypes.c_int32,
         ctypes.c_void_p,
         ctypes.c_size_t,
+        ctypes.POINTER(CallableHandle),
     ]
     lib.simpler_kernel_mode_prepare_callable.restype = ctypes.c_int
-    lib.simpler_kernel_mode_launch.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p, ctypes.c_void_p]
+    lib.simpler_kernel_mode_launch.argtypes = [ctypes.c_void_p, CallableHandle, ctypes.c_void_p, ctypes.c_void_p]
     lib.simpler_kernel_mode_launch.restype = ctypes.c_int
     lib.simpler_init.argtypes = [
         ctypes.c_void_p, ctypes.c_int,
@@ -160,6 +168,16 @@ def _load(arch: str, variant: str, runtime: str) -> ctypes.CDLL:
     ]  # fmt: skip
     lib.simpler_init.restype = ctypes.c_int
     return lib
+
+
+def _prepare(lib, ctx, image, size=None):
+    handle = CallableHandle(12345, 12345)
+    rc = lib.simpler_kernel_mode_prepare_callable(
+        ctx, image, len(image) if size is None else size, ctypes.byref(handle)
+    )
+    if rc != 0:
+        assert (handle.callable_id, handle.generation) == (-1, 0)
+    return rc, handle.callable_id, handle.generation
 
 
 def _minimal_callable_image() -> bytes:
@@ -383,7 +401,7 @@ def _run_lifecycle_retry(arch, runtime, device, scenario):
 def _check_prepare_reuse(lib, ctx, arch, runtime):
     import tempfile  # noqa: PLC0415
 
-    from simpler.task_interface import ChipCallable  # noqa: PLC0415
+    from simpler.task_interface import ArgDirection, ChipCallable  # noqa: PLC0415
 
     from simpler_setup.kernel_compiler import KernelCompiler  # noqa: PLC0415
 
@@ -391,22 +409,52 @@ def _check_prepare_reuse(lib, ctx, arch, runtime):
         binary = KernelCompiler(arch).compile_orchestration(
             runtime, str(Path(__file__).with_name("kernel_prepare_orchestration.cpp")), build_dir=build_dir
         )
-    chip = ChipCallable.build(signature=[], func_name="kernel_prepare_orchestration", binary=binary, children=[])
-    image = ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size()))
+
+    def make_image(count):
+        chip = ChipCallable.build(
+            signature=[ArgDirection.IN] * count,
+            func_name="kernel_prepare_orchestration",
+            binary=binary,
+            children=[],
+        )
+        return ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size()))
+
+    image = make_image(0)
     before = lib.committed_device_memory_ctx(ctx)
-    assert lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, len(image)) == 0
+    assert _prepare(lib, ctx, image) == (0, 0, 1)
     prepared = lib.committed_device_memory_ctx(ctx)
     assert prepared > before
-    # Duplicate registration is rejected; it must not disturb the first ID.
-    assert lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, len(image)) != 0
+    for _ in range(70):
+        assert _prepare(lib, ctx, image) == (0, 0, 1)
     assert lib.committed_device_memory_ctx(ctx) == prepared
-    # Identical bytes deduplicate the callable upload. The second ID also
-    # reuses the context's persistent argument blocks, so neither adds GM.
-    assert lib.simpler_kernel_mode_prepare_callable(ctx, 1, image, len(image)) == 0
+    stream = ctypes.byref((ctypes.c_uint8 * 8)())
+    for bad_generation in (2, 2**64 - 1):
+        assert (
+            lib.simpler_kernel_mode_launch(ctx, CallableHandle(0, bad_generation), image, stream)
+            == PTO_RUNTIME_ERR_CALLABLE_STALE
+        )
+    assert lib.simpler_kernel_mode_launch(ctx, CallableHandle(0, 0), image, stream) == PTO_RUNTIME_ERR_INTERNAL
+    # A valid handle passes residency validation and reaches the unavailable binder.
+    assert lib.simpler_kernel_mode_launch(ctx, CallableHandle(0, 1), image, stream) == PTO_RUNTIME_ERR_INVALID_STATE
+    assert (
+        lib.simpler_kernel_mode_launch(ctx, CallableHandle(63, 1), image, stream)
+        == PTO_RUNTIME_ERR_CALLABLE_NOT_RESIDENT
+    )
+    assert _prepare(lib, ctx, image, 512 * 1024 * 1024 + 1) == (PTO_RUNTIME_ERR_CALLABLE_BYTES_EXCEEDED, -1, 0)
+    assert _prepare(lib, ctx, image, 1) == (PTO_RUNTIME_ERR_INTERNAL, -1, 0)
+    assert lib.simpler_kernel_mode_prepare_callable(ctx, image, len(image), None) == PTO_RUNTIME_ERR_INTERNAL
+    for expected_id in range(1, 64):
+        assert _prepare(lib, ctx, make_image(expected_id)) == (0, expected_id, 1)
+    assert _prepare(lib, ctx, make_image(64)) == (PTO_RUNTIME_ERR_CALLABLE_COUNT_EXCEEDED, -1, 0)
+    assert _prepare(lib, ctx, image) == (0, 0, 1)
+    assert _prepare(lib, ctx, make_image(63)) == (0, 63, 1)
     assert lib.committed_device_memory_ctx(ctx) == prepared
+    lib.simpler_unregister_callable.argtypes = [ctypes.c_void_p, ctypes.c_int32]
+    lib.simpler_unregister_callable.restype = ctypes.c_int
+    assert lib.simpler_unregister_callable(ctx, 0) == PTO_RUNTIME_ERR_INVALID_STATE
     assert lib.finalize_device(ctx) == 0
     assert lib.committed_device_memory_ctx(ctx) == 0
-    assert lib.simpler_kernel_mode_prepare_callable(ctx, 2, image, len(image)) == PTO_RUNTIME_ERR_INVALID_STATE
+    assert _prepare(lib, ctx, image) == (PTO_RUNTIME_ERR_INVALID_STATE, -1, 0)
 
 
 @pytest.mark.parametrize(("arch", "runtime"), _SIM_CASES)
@@ -420,15 +468,15 @@ def test_kernel_entries_reject_a_context_with_no_kernel_claim(arch: str, runtime
     assert ctx
     try:
         assert lib.simpler_kernel_mode_supported(ctx) == 0
-        assert lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, len(image)) == PTO_RUNTIME_ERR_INVALID_STATE
-        assert lib.simpler_kernel_mode_launch(ctx, 0, image, stream) == PTO_RUNTIME_ERR_INVALID_STATE
-        # An out-of-range callable id and a truncated image are argument
-        # errors, so the structural checks run before the ordering one.
-        assert lib.simpler_kernel_mode_prepare_callable(ctx, -1, image, len(image)) == PTO_RUNTIME_ERR_INTERNAL
-        assert lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, 1) == PTO_RUNTIME_ERR_INTERNAL
-        assert lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, len(image) - 1) == PTO_RUNTIME_ERR_INTERNAL
-        assert lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, len(image)) == PTO_RUNTIME_ERR_INVALID_STATE
-        assert lib.simpler_kernel_mode_launch(ctx, 0, image, None) == PTO_RUNTIME_ERR_INTERNAL
+        assert _prepare(lib, ctx, image) == (PTO_RUNTIME_ERR_INVALID_STATE, -1, 0)
+        assert lib.simpler_kernel_mode_launch(ctx, CallableHandle(0, 1), image, stream) == PTO_RUNTIME_ERR_INVALID_STATE
+        # Structural checks run before lifecycle checks.
+        assert lib.simpler_kernel_mode_prepare_callable(ctx, image, len(image), None) == PTO_RUNTIME_ERR_INTERNAL
+        assert _prepare(lib, ctx, image, 1) == (PTO_RUNTIME_ERR_INTERNAL, -1, 0)
+        assert _prepare(lib, ctx, image, len(image) - 1) == (PTO_RUNTIME_ERR_INTERNAL, -1, 0)
+        assert _prepare(lib, ctx, image) == (PTO_RUNTIME_ERR_INVALID_STATE, -1, 0)
+        assert _prepare(lib, None, image) == (PTO_RUNTIME_ERR_INTERNAL, -1, 0)
+        assert lib.simpler_kernel_mode_launch(ctx, CallableHandle(0, 1), image, None) == PTO_RUNTIME_ERR_INTERNAL
     finally:
         lib.destroy_device_context(ctx)
 
@@ -451,7 +499,7 @@ def test_simulated_components_report_kernel_mode_unsupported(arch: str, runtime:
         )
         # The refused init took no claim, so the context is still free.
         image = _minimal_callable_image()
-        assert lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, len(image)) == PTO_RUNTIME_ERR_INVALID_STATE
+        assert _prepare(lib, ctx, image) == (PTO_RUNTIME_ERR_INVALID_STATE, -1, 0)
     finally:
         lib.destroy_device_context(ctx)
 
