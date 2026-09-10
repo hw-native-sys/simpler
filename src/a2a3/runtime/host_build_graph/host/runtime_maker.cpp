@@ -92,6 +92,8 @@ static_assert(
     "host-side C API codes must stay below the negation of every latched device code"
 );
 
+int configure_kernel_runtime_impl(Runtime &, bool) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
+
 extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *, PipelineContract *) {
     return PTO_RUNTIME_ERR_UNSUPPORTED;
 }

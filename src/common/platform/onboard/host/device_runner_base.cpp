@@ -46,6 +46,7 @@
 #include "common/unified_log.h"
 #include "host/acl_error_log.h"
 #include "kernel_platform_ops.h"
+#include "host/kernel_pipeline_contract.h"
 #include "host/host_phase_records_artifact.h"
 #include "host/raii_scope_guard.h"
 #include "host_log.h"
@@ -632,8 +633,12 @@ int DeviceRunnerBase::ensure_device_initialized() {
     return ensure_dma_workspace_warmed();
 }
 
-int DeviceRunnerBase::init_kernel_context(int device_id) {
-    int rc = adopt_borrowed_device(device_id);
+int DeviceRunnerBase::init_kernel_context(int device_id, const CallConfig &config, uint64_t context_generation) {
+    const char *serial_env = std::getenv("SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE");
+    const bool serial = serial_env && (serial_env[0] == '1' || serial_env[0] == 't' || serial_env[0] == 'T');
+    int rc = kernel_static_config_.initialize(&config, context_generation, serial);
+    if (rc != 0) return rc;
+    rc = adopt_borrowed_device(device_id);
     if (rc != 0) return rc;
 
     rc = kernel_exec_state_.initialize(device_id_, make_onboard_kernel_context_ops());
@@ -689,15 +694,21 @@ int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id) {
         return PTO_RUNTIME_ERR_INVALID_STATE;
     }
 
+    if (!kernel_static_config_.initialized()) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (!persistent_args_.is_prepared()) {
+        if (persistent_args_.has_live_resources()) return PTO_RUNTIME_ERR_INVALID_STATE;
+        int rc = prepare_launch_shape(kernel_runtime_, kernel_static_config_.request());
+        if (rc != 0) return rc;
+        rc = prepare_aicpu_affinity(kernel_runtime_, kernel_static_config_.request().aicpu_thread_num, control_stream);
+        if (rc != 0) return rc;
+        rc = configure_kernel_runtime_impl(kernel_runtime_, kernel_static_config_.serial_orch_sched());
+        if (rc != 0) return rc;
+        rc = persistent_args_.prepare_once(kernel_runtime_, persistent_args_ops(), static_cast<uint64_t>(device_id_));
+        if (rc != 0) return rc;
+        rc = kernel_static_config_.freeze();
+        if (rc != 0) return rc;
+    }
     int rc = register_callable_on_device(callable_id, control_stream);
-    if (rc != 0) return rc;
-
-    // Idempotent: only the first prepared callable allocates. The uploaded
-    // Runtime keeps its per-callable and per-invocation fields at the
-    // sentinels Runtime() sets — binding a callable into the device image is a
-    // later step's work, and overwriting them here would make every launch
-    // silently run whichever callable was prepared first.
-    rc = persistent_args_.prepare_once(kernel_runtime_, persistent_args_ops(), static_cast<uint64_t>(device_id_));
     if (rc != 0) return rc;
 
     return kernel_exec_state_.mark_ready_enqueued();
@@ -1556,6 +1567,13 @@ int DeviceRunnerBase::finalize_common() { return finalize_common_impl(false); }
 int DeviceRunnerBase::abandon_common_after_device_failure() { return finalize_common_impl(true); }
 
 int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
+    if (!abandon_device_resources && execution_mode_latch_.is_kernel()) {
+        const int args_rc = persistent_args_.finalize_once();
+        if (args_rc != 0) {
+            kernel_exec_state_.poison(args_rc);
+            return args_rc;
+        }
+    }
     int rc = 0;
     auto capture = [&rc](int err) {
         if (err != 0 && rc == 0) rc = err;

@@ -615,6 +615,7 @@ SchedulerContext::SyncStartStageResult SchedulerContext::stage_sync_start_cores(
             // contention).
             uint64_t my_mask[EARLY_DISPATCH_CORE_MASK_WORDS] = {0};
             for (int i = 0; i < handle_count; i++) {
+                if (!handles[i].valid) continue;
                 publish_subtask_to_core(handles[i], dispatch_ts, thread_idx);
                 if (gated) {
                     int32_t cid = tracker.get_core_id_by_offset(handles[i].core_offset);

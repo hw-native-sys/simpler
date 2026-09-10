@@ -83,6 +83,7 @@ class DeviceRunner : public DeviceRunnerBase {
 public:
     DeviceRunner() = default;
     ~DeviceRunner();
+    int prepare_aicpu_affinity(Runtime &runtime, int requested, rtStream_t control_stream) override;
 
     // `setup_static_arena`, `allocate_tensor`, `free_tensor`,
     // `copy_to_device`, `copy_from_device`,

@@ -69,6 +69,7 @@
 #include "host/execution_mode_latch.h"
 #include "host/kernel_execution_state.h"
 #include "kernel_persistent_args.h"
+#include "host/kernel_static_config.h"
 #include "host/memory_allocator.h"
 #include "host/pmu_collector.h"
 #include "host/runtime_timeout_config.h"
@@ -149,6 +150,7 @@ public:
 
     /** Context-lifetime streams and events, live only in kernel mode. */
     KernelExecutionState &kernel_execution_state() { return kernel_exec_state_; }
+    bool has_persistent_kernel_args() const { return persistent_args_.has_live_resources(); }
 
     /**
      * Bring up a kernel-mode context on a device the caller already owns:
@@ -157,7 +159,7 @@ public:
      * and launch simpler_aicpu_init on the context's AICPU stream. Creates no
      * async-DMA workspace — that channel belongs to program mode.
      */
-    int init_kernel_context(int device_id);
+    int init_kernel_context(int device_id, const CallConfig &config, uint64_t context_generation);
 
     /**
      * Register one callable on a kernel-mode context and make sure the
@@ -874,6 +876,7 @@ protected:
 
     /** The four operations PersistentKernelArgs is allowed to perform. */
     PersistentArgsOps persistent_args_ops();
+    virtual int prepare_aicpu_affinity(Runtime &runtime, int requested, rtStream_t control_stream) = 0;
 
     /**
      * Launch the AICPU callable registration on `control_stream` and wait for
@@ -1266,6 +1269,7 @@ protected:
     // on destruction.
     KernelExecutionState kernel_exec_state_;
     PersistentKernelArgs persistent_args_;
+    KernelStaticConfig kernel_static_config_;
     // The Runtime image a kernel-mode context uploads once. Its per-callable
     // and per-invocation fields stay at the sentinels Runtime() sets; binding
     // a callable into it is a later step's work.

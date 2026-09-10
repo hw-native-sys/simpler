@@ -56,7 +56,8 @@ struct PersistentArgsOps {
      * arches (a2a3 additionally selecting AicoreRegKind::Ctrl) and
      * `ffts_base_addr` on a2a3. DFX fields stay zero. Anything this
      * allocates must come from `alloc` above, so release through `free_`
-     * matches and a host-only test's counts balance.
+     * matches and a host-only test's counts balance. Every successful
+     * allocation is recorded in args even on failure; the owner rolls it back.
      */
     int (*fill_arch_fields)(void *context, KernelArgs *args, uint64_t device_id){nullptr};
 
@@ -91,16 +92,19 @@ public:
      * call on a prepared owner returns 0 without allocating, which is what
      * makes it correct to call from every prepare_callable.
      *
-     * A failure at any step releases whatever this call allocated, in reverse
-     * order, and leaves the owner unprepared with all three fields back at
-     * their unset values; the original failure code is returned.
+     * Failure revokes readiness and rolls back in reverse order. Failed
+     * releases retain ownership until finalize_once succeeds or abandon is
+     * called. Preparation is rejected while such resources remain.
      */
     int prepare_once(const Runtime &host_runtime, const PersistentArgsOps &ops, uint64_t device_id);
 
     bool is_prepared() const { return prepared_; }
+    bool has_live_resources() const {
+        return device_k_args_ != nullptr || args_.regs != 0 || args_.runtime_args != nullptr;
+    }
 
     /** Device address of the `KernelArgs` copy AICore's kernel entry receives. */
-    KernelArgs *device_k_args() const { return device_k_args_; }
+    KernelArgs *device_k_args() const { return prepared_ ? device_k_args_ : nullptr; }
 
     const KernelArgs &args() const { return args_; }
 
@@ -108,7 +112,7 @@ public:
      * Release the three device blocks in reverse allocation order. Idempotent.
      *
      * A failed release keeps its address so a retry redoes only the remainder,
-     * and leaves the owner prepared; the first failure code is returned.
+     * and leaves the owner unprepared; the first failure code is returned.
      */
     int finalize_once();
 

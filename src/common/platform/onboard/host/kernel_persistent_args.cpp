@@ -23,6 +23,7 @@
 
 int PersistentKernelArgs::prepare_once(const Runtime &host_runtime, const PersistentArgsOps &ops, uint64_t device_id) {
     if (prepared_) return 0;
+    if (has_live_resources()) return PTO_RUNTIME_ERR_INVALID_STATE;
     if (!ops.valid()) {
         LOG_ERROR("PersistentKernelArgs::prepare_once: incomplete operation table");
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -37,19 +38,18 @@ int PersistentKernelArgs::prepare_once(const Runtime &host_runtime, const Persis
         LOG_ERROR("PersistentKernelArgs::prepare_once: alloc for runtime_args failed");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    args_.runtime_args = reinterpret_cast<Runtime *>(runtime_dev);
     int rc = ops_.copy_h2d(ops_.context, runtime_dev, runtime_bytes, &host_runtime, runtime_bytes);
     if (rc != 0) {
         LOG_ERROR("PersistentKernelArgs::prepare_once: copy of runtime_args failed: %d", rc);
-        (void)ops_.free_(ops_.context, runtime_dev);
+        (void)finalize_once();
         return rc;
     }
-    args_.runtime_args = reinterpret_cast<Runtime *>(runtime_dev);
 
     rc = ops_.fill_arch_fields(ops_.context, &args_, device_id);
     if (rc != 0) {
         LOG_ERROR("PersistentKernelArgs::prepare_once: arch field init failed: %d", rc);
-        (void)ops_.free_(ops_.context, runtime_dev);
-        args_ = KernelArgs{};
+        (void)finalize_once();
         return rc;
     }
 
@@ -60,16 +60,14 @@ int PersistentKernelArgs::prepare_once(const Runtime &host_runtime, const Persis
         LOG_ERROR("PersistentKernelArgs::prepare_once: alloc for device KernelArgs failed");
         rc = PTO_RUNTIME_ERR_INTERNAL;
     } else {
+        device_k_args_ = reinterpret_cast<KernelArgs *>(device_args);
         rc = ops_.copy_h2d(ops_.context, device_args, sizeof(KernelArgs), &args_, sizeof(KernelArgs));
         if (rc != 0) {
             LOG_ERROR("PersistentKernelArgs::prepare_once: copy of device KernelArgs failed: %d", rc);
-            (void)ops_.free_(ops_.context, device_args);
         }
     }
     if (rc != 0) {
-        if (args_.regs != 0) (void)ops_.free_(ops_.context, reinterpret_cast<void *>(args_.regs));
-        (void)ops_.free_(ops_.context, runtime_dev);
-        args_ = KernelArgs{};
+        (void)finalize_once();
         return rc;
     }
 
@@ -85,6 +83,7 @@ int PersistentKernelArgs::release_block(void *block, int &first_error) {
 }
 
 int PersistentKernelArgs::finalize_once() {
+    prepared_ = false;
     if (ops_.free_ == nullptr) {
         device_k_args_ = nullptr;
         args_ = KernelArgs{};

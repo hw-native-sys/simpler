@@ -105,6 +105,8 @@ static_assert(
     "AICore Scheduler profiling levels must match the chip-swimlane contract"
 );
 
+int configure_kernel_runtime_impl(Runtime &, bool) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
+
 extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *, PipelineContract *) {
     return PTO_RUNTIME_ERR_UNSUPPORTED;
 }

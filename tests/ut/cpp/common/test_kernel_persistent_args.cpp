@@ -109,6 +109,7 @@ struct FakeArgsOps {
         void *block = alloc(context, kBlockAlign);
         if (block == nullptr) return kInjectedRc;
         args->regs = reinterpret_cast<uint64_t>(block);
+        if (ops->fail_after_arch_alloc) return kInjectedRc;
         return 0;
     }
 
@@ -128,6 +129,7 @@ struct FakeArgsOps {
     int fail_free_on = 0;
     int fail_copy_on = 0;
     int fail_fill_on = 0;
+    bool fail_after_arch_alloc = false;
     uint64_t last_device_id = 0;
     std::vector<Copy> copies;
     std::vector<void *> free_order;
@@ -420,11 +422,11 @@ TEST(PersistentKernelArgs, FinalizeRetryRedoesOnlyTheRemainder) {
     // still releases the remaining two and keeps only the failed address.
     ops.fail_free_on = ops.free_calls + 1;
     EXPECT_EQ(args.finalize_once(), kInjectedRc);
-    EXPECT_NE(args.device_k_args(), nullptr);
+    EXPECT_EQ(args.device_k_args(), nullptr);
     EXPECT_EQ(args.args().runtime_args, nullptr);
     EXPECT_EQ(args.args().regs, 0u);
     EXPECT_EQ(ops.live_blocks(), 1u);
-    EXPECT_TRUE(args.is_prepared());
+    EXPECT_FALSE(args.is_prepared());
 
     ops.fail_free_on = 0;
     const int frees_before_retry = ops.free_calls;
@@ -433,6 +435,81 @@ TEST(PersistentKernelArgs, FinalizeRetryRedoesOnlyTheRemainder) {
     EXPECT_EQ(ops.live_blocks(), 0u);
     EXPECT_EQ(args.device_k_args(), nullptr);
     EXPECT_FALSE(args.is_prepared());
+}
+
+TEST(PersistentKernelArgs, FailedRollbackRetainsOwnershipAndRejectsPrepare) {
+    for (int copy = 1; copy <= 2; ++copy) {
+        FakeArgsOps ops;
+        Runtime runtime;
+        PersistentKernelArgs args;
+        ops.fail_copy_on = copy;
+        ops.fail_free_on = 1;
+        ASSERT_EQ(args.prepare_once(runtime, ops.table(), kDeviceId), kInjectedRc);
+        EXPECT_FALSE(args.is_prepared());
+        EXPECT_EQ(args.device_k_args(), nullptr);
+        ASSERT_EQ(ops.live_blocks(), 1u);
+        const int allocs = ops.alloc_calls;
+        EXPECT_EQ(args.prepare_once(runtime, ops.table(), kDeviceId), PTO_RUNTIME_ERR_INVALID_STATE);
+        EXPECT_EQ(ops.alloc_calls, allocs);
+        EXPECT_EQ(args.finalize_once(), 0);
+        EXPECT_EQ(ops.live_blocks(), 0u);
+    }
+}
+
+TEST(PersistentKernelArgs, PartialArchFailureRetainsFailedRelease) {
+    FakeArgsOps ops;
+    Runtime runtime;
+    PersistentKernelArgs args;
+    ops.fail_after_arch_alloc = true;
+    ops.fail_free_on = 1;
+    EXPECT_EQ(args.prepare_once(runtime, ops.table(), kDeviceId), kInjectedRc);
+    EXPECT_FALSE(args.is_prepared());
+    EXPECT_TRUE(args.has_live_resources());
+    EXPECT_EQ(ops.live_blocks(), 1u);
+    EXPECT_EQ(args.finalize_once(), 0);
+    EXPECT_FALSE(args.has_live_resources());
+    EXPECT_EQ(ops.live_blocks(), 0u);
+}
+
+TEST(PersistentKernelArgs, EveryReleaseFailureRevokesReadinessAndRetriesOnlyLiveBlocks) {
+    for (int failed_release = 1; failed_release <= 3; ++failed_release) {
+        FakeArgsOps ops;
+        Runtime runtime;
+        PersistentKernelArgs args;
+        ASSERT_EQ(args.prepare_once(runtime, ops.table(), kDeviceId), 0);
+        ops.fail_free_on = failed_release;
+        EXPECT_EQ(args.finalize_once(), kInjectedRc);
+        EXPECT_FALSE(args.is_prepared());
+        EXPECT_EQ(args.device_k_args(), nullptr);
+        EXPECT_TRUE(args.has_live_resources());
+        EXPECT_EQ(ops.live_blocks(), 1u);
+        const int allocs = ops.alloc_calls;
+        EXPECT_EQ(args.prepare_once(runtime, ops.table(), kDeviceId), PTO_RUNTIME_ERR_INVALID_STATE);
+        EXPECT_EQ(ops.alloc_calls, allocs);
+        const int frees = ops.free_calls;
+        EXPECT_EQ(args.finalize_once(), 0);
+        EXPECT_EQ(ops.free_calls, frees + 1);
+        EXPECT_FALSE(args.has_live_resources());
+        EXPECT_EQ(ops.live_blocks(), 0u);
+    }
+}
+
+TEST(PersistentKernelArgs, AbandonAfterFailedRollbackDropsOnlyBookkeeping) {
+    FakeArgsOps ops;
+    Runtime runtime;
+    PersistentKernelArgs args;
+    ops.fail_copy_on = 2;
+    ops.fail_free_on = 1;
+    ASSERT_EQ(args.prepare_once(runtime, ops.table(), kDeviceId), kInjectedRc);
+    ASSERT_TRUE(args.has_live_resources());
+    const int frees = ops.free_calls;
+    args.abandon();
+    EXPECT_FALSE(args.has_live_resources());
+    EXPECT_FALSE(args.is_prepared());
+    EXPECT_EQ(args.finalize_once(), 0);
+    EXPECT_EQ(ops.free_calls, frees);
+    // The test allocator owns the backing after simulated device invalidation.
+    EXPECT_EQ(ops.live_blocks(), 1u);
 }
 
 TEST(PersistentKernelArgs, AbandonNeverReachesTheOpsTable) {

@@ -149,8 +149,6 @@ int DeviceRunner::fill_persistent_arch_fields(KernelArgs *args, uint64_t device_
     rc = rtGetC2cCtrlAddr(&args->ffts_base_addr, &ffts_len);
     if (rc != 0) {
         LOG_ERROR("fill_persistent_arch_fields: rtGetC2cCtrlAddr failed: %d", rc);
-        (void)mem_alloc_.free(reinterpret_cast<void *>(args->regs));
-        args->regs = 0;
         args->ffts_base_addr = 0;
         return rc;
     }
@@ -253,6 +251,56 @@ void DeviceRunner::set_dep_gen_enabled(bool enable) {
     dep_gen_host_graph_set_enabled(enable);
 }
 
+int DeviceRunner::prepare_aicpu_affinity(Runtime &runtime, int requested, rtStream_t control_stream) {
+    (void)control_stream;
+    {
+        std::vector<pto::a2a3::AicpuLogicalCpu> user_cpus;
+        std::vector<int32_t> allowed;
+        runtime.set_aicpu_allowed_cpu_count(0);
+        runtime.set_aicpu_launch_count(0);
+        if (!pto::a2a3::probe_aicpu_topology(static_cast<uint32_t>(device_id_), user_cpus)) {
+            LOG_ERROR("A2A3 AICPU topology probe failed; cannot configure affinity gate");
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        int resolved_aicpu =
+            resolve_aicpu_thread_num(requested, static_cast<int>(user_cpus.size()), PLATFORM_DEFAULT_AICPU_THREAD_NUM);
+        if (resolved_aicpu < 0) return PTO_RUNTIME_ERR_INTERNAL;
+        if (!pto::a2a3::compute_allowed_cpus(user_cpus, resolved_aicpu, allowed)) {
+            LOG_ERROR(
+                "A2A3 AICPU topology has %zu user cpus, cannot fit %d active threads", user_cpus.size(), resolved_aicpu
+            );
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        runtime.set_aicpu_thread_num(resolved_aicpu);
+        const size_t cap = runtime.aicpu_allowed_cpus_capacity();
+        if (allowed.size() > cap) {
+            LOG_ERROR("A2A3 compute_allowed_cpus returned %zu > cap %zu", allowed.size(), cap);
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        int32_t *allowed_cpus = runtime.get_aicpu_allowed_cpus();
+        for (size_t i = 0; i < allowed.size(); ++i)
+            allowed_cpus[i] = allowed[i];
+        runtime.set_aicpu_allowed_cpu_count(static_cast<int32_t>(allowed.size()));
+        int32_t launch_n = static_cast<int32_t>(user_cpus.size());
+        if (launch_n > PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH) {
+            launch_n = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
+        }
+        runtime.set_aicpu_launch_count(launch_n);
+
+        std::string dump;
+        for (size_t i = 0; i < allowed.size(); ++i) {
+            if (i) dump += ", ";
+            dump += std::to_string(allowed[i]);
+            if (i + 1 == allowed.size()) dump += "(last)";
+        }
+        LOG_INFO(
+            "A2A3 AICPU ALLOWED_CPUS = [%s] (active=%d, launch=%d, user_cpus=%zu)", dump.c_str(),
+            runtime.get_aicpu_thread_num(), runtime.get_aicpu_launch_count(), user_cpus.size()
+        );
+    }
+    return 0;
+}
+
 int DeviceRunner::prepare_execution(
     Runtime &runtime, const CallConfig &config, uint32_t pipeline_slot, const NativeRunIdentity &identity,
     std::unique_ptr<PreparedExecution> *prepared
@@ -338,57 +386,9 @@ int DeviceRunner::prepare_execution(
 
     resolve_task_binary_addrs(runtime);
 
-    // a2a3 onboard now uses the same host-computed, device-filtered affinity
-    // shape as a5. Host probes the AICPU user pool once, chooses the active
-    // cpu_ids deterministically, writes them into Runtime, and the AICPU-side
-    // gate only matches sched_getcpu() against this table.
-    {
-        std::vector<pto::a2a3::AicpuLogicalCpu> user_cpus;
-        std::vector<int32_t> allowed;
-        runtime.set_aicpu_allowed_cpu_count(0);
-        runtime.set_aicpu_launch_count(0);
-        if (!pto::a2a3::probe_aicpu_topology(static_cast<uint32_t>(device_id_), user_cpus)) {
-            LOG_ERROR("A2A3 AICPU topology probe failed; cannot configure affinity gate");
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-        int resolved_aicpu = resolve_aicpu_thread_num(
-            runtime.get_aicpu_thread_num(), static_cast<int>(user_cpus.size()), PLATFORM_DEFAULT_AICPU_THREAD_NUM
-        );
-        if (resolved_aicpu < 0) return PTO_RUNTIME_ERR_INTERNAL;
-        if (!pto::a2a3::compute_allowed_cpus(user_cpus, resolved_aicpu, allowed)) {
-            LOG_ERROR(
-                "A2A3 AICPU topology has %zu user cpus, cannot fit %d active threads", user_cpus.size(), resolved_aicpu
-            );
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-        runtime.set_aicpu_thread_num(resolved_aicpu);
-        launch_aicpu_num = resolved_aicpu;
-        const size_t cap = runtime.aicpu_allowed_cpus_capacity();
-        if (allowed.size() > cap) {
-            LOG_ERROR("A2A3 compute_allowed_cpus returned %zu > cap %zu", allowed.size(), cap);
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-        int32_t *allowed_cpus = runtime.get_aicpu_allowed_cpus();
-        for (size_t i = 0; i < allowed.size(); ++i)
-            allowed_cpus[i] = allowed[i];
-        runtime.set_aicpu_allowed_cpu_count(static_cast<int32_t>(allowed.size()));
-        int32_t launch_n = static_cast<int32_t>(user_cpus.size());
-        if (launch_n > PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH) {
-            launch_n = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
-        }
-        runtime.set_aicpu_launch_count(launch_n);
-
-        std::string dump;
-        for (size_t i = 0; i < allowed.size(); ++i) {
-            if (i) dump += ", ";
-            dump += std::to_string(allowed[i]);
-            if (i + 1 == allowed.size()) dump += "(last)";
-        }
-        LOG_INFO(
-            "A2A3 AICPU ALLOWED_CPUS = [%s] (active=%d, launch=%d, user_cpus=%zu)", dump.c_str(),
-            runtime.get_aicpu_thread_num(), runtime.get_aicpu_launch_count(), user_cpus.size()
-        );
-    }
+    rc = prepare_aicpu_affinity(runtime, runtime.get_aicpu_thread_num(), stream_aicpu_);
+    if (rc != 0) return rc;
+    launch_aicpu_num = runtime.get_aicpu_thread_num();
 
     // Initialize per-subsystem shared memory.
     //

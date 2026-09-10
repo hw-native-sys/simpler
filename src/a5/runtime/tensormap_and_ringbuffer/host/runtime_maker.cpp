@@ -492,6 +492,11 @@ static bool derive_arena_static_sizes(const ArenaSizingConfig &sizing, ArenaStat
     return true;
 }
 
+int configure_kernel_runtime_impl(Runtime &runtime, bool serial_orch_sched) {
+    runtime.dev.serial_orch_sched = serial_orch_sched;
+    return 0;
+}
+
 extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *config, PipelineContract *out) {
     if (config == nullptr || out == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
 

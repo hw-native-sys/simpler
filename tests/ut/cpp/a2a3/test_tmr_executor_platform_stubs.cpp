@@ -9,15 +9,12 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#pragma once
+#include "aicpu/platform_regs.h"
 
-#include "worker/runtime_c_api.h"
-
-// Internal host-runtime hook, not a dlsym lifecycle API. Input is borrowed and
-// immutable during the call; output is caller-exclusive and unchanged on error.
-// No device resources are acquired or retained. Separate calls may run concurrently.
-extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *config, PipelineContract *out);
-
-class Runtime;
-// Host-only preparation of runtime-specific static fields; no device work.
-int configure_kernel_runtime_impl(Runtime &runtime, bool serial_orch_sched);
+int32_t platform_retire_aicore_group(const AicoreExitTarget *, size_t count, uint64_t, bool *released) {
+    if (released != nullptr) {
+        for (size_t i = 0; i < count; ++i)
+            released[i] = true;
+    }
+    return 0;
+}

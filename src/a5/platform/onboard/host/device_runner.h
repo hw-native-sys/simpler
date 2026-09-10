@@ -76,6 +76,7 @@ class DeviceRunner : public DeviceRunnerBase {
 public:
     DeviceRunner() = default;
     ~DeviceRunner();
+    int prepare_aicpu_affinity(Runtime &runtime, int requested, rtStream_t control_stream) override;
 
     // `setup_static_arena`, `allocate_tensor`, `free_tensor`,
     // `copy_to_device`, `copy_from_device`,
@@ -291,14 +292,17 @@ private:
     // dep_gen enablement is a5-specific (a2a3 carries its own copy).
     bool enable_dep_gen_{false};
 
-    int query_aicpu_device_occupancy(pto::a5::AicpuDeviceOccupancy &out);
-    int query_aicpu_topology(pto::a5::AicpuTopology &out);
+    int query_aicpu_device_occupancy(pto::a5::AicpuDeviceOccupancy &out, rtStream_t control_stream);
+    int query_aicpu_topology(pto::a5::AicpuTopology &out, rtStream_t control_stream);
     void clear_aicpu_topology_cache();
     // Device-side occupancy and the merged Host topology are immutable during
     // one DeviceRunner attach/reset lifetime. Cache successful probes only;
     // allowed CPU selection still runs per call because the requested active
     // count may change. Recovery, reset, and finalize clear both values.
     bool aicpu_device_occupancy_cached_{false};
+    // A failed kernel query retains its output until its own stream drains.
+    void *kernel_topology_result_{nullptr};
+    rtStream_t kernel_topology_stream_{nullptr};
     pto::a5::AicpuDeviceOccupancy aicpu_device_occupancy_{};
     bool aicpu_topology_cached_{false};
     pto::a5::AicpuTopology aicpu_topology_{};

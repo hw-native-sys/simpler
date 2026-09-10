@@ -11,13 +11,20 @@
 
 #pragma once
 
-#include "worker/runtime_c_api.h"
+#include <cstddef>
+#include <cstdint>
 
-// Internal host-runtime hook, not a dlsym lifecycle API. Input is borrowed and
-// immutable during the call; output is caller-exclusive and unchanged on error.
-// No device resources are acquired or retained. Separate calls may run concurrently.
-extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *config, PipelineContract *out);
+namespace simpler::tmr {
 
-class Runtime;
-// Host-only preparation of runtime-specific static fields; no device work.
-int configure_kernel_runtime_impl(Runtime &runtime, bool serial_orch_sched);
+// Entries are device CoreCallable addresses, not instruction addresses.
+// The provider pins both the table and the callable images through all readers.
+struct CallableTableView {
+    const uint64_t *entries{nullptr};
+    size_t count{0};
+
+    uint64_t lookup(int32_t id) const noexcept {
+        if (entries == nullptr || id < 0 || static_cast<size_t>(id) >= count) return 0;
+        return entries[id];
+    }
+};
+}  // namespace simpler::tmr

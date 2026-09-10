@@ -46,6 +46,15 @@ jobs:
           system-site-packages: "true"
           source-cann: "false"
 
+      # Needs the onboard DSO and CANN headers, but interposes transport and
+      # never touches an NPU. Keep it out of the hardware task queue.
+      - name: Run a5 host topology lifecycle fault injection
+        run: |
+          source .venv/bin/activate
+          cmake -B tests/ut/cpp/build -S tests/ut/cpp -DSIMPLER_ENABLE_HARDWARE_TESTS=ON
+          cmake --build tests/ut/cpp/build --target test_a5_kernel_topology_lifecycle --parallel 4
+          ctest --test-dir tests/ut/cpp/build -R '^test_a5_kernel_topology_lifecycle$' --output-on-failure --timeout 300
+
       - name: Run Python hardware unit tests (a5)
         run: |
           source .venv/bin/activate

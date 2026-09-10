@@ -233,6 +233,43 @@ def test_kernel_init_rejects_malformed_arguments(arch: str, runtime: str):
         lib.destroy_device_context(ctx)
 
 
+@pytest.mark.parametrize(("arch", "runtime"), _SIM_CASES)
+def test_kernel_init_rejects_invalid_static_config_without_claim(arch: str, runtime: str):
+    lib = _load(arch, "sim", runtime)
+    config = CallConfig()
+    payload = b"\x00\x01\x02\x03"
+    ctx = lib.create_device_context()
+    assert ctx
+    try:
+        for threads in (-1, 1, 6):
+            config.aicpu_thread_num = threads
+            assert (
+                lib.simpler_kernel_mode_init(
+                    ctx, 0, payload, len(payload), payload, len(payload), payload, len(payload), ctypes.byref(config), 1
+                )
+                == PTO_RUNTIME_ERR_INTERNAL
+            )
+        config.aicpu_thread_num = 0
+        config.enable_dump_args = 1
+        assert (
+            lib.simpler_kernel_mode_init(
+                ctx, 0, payload, len(payload), payload, len(payload), payload, len(payload), ctypes.byref(config), 1
+            )
+            == PTO_RUNTIME_ERR_UNSUPPORTED
+        )
+        config.enable_dump_args = 0
+        assert (
+            lib.simpler_kernel_mode_init(
+                ctx, 0, payload, len(payload), payload, len(payload), payload, len(payload), ctypes.byref(config), 1
+            )
+            == PTO_RUNTIME_ERR_UNSUPPORTED
+        )
+        assert lib.committed_device_memory_ctx(ctx) == 0
+        assert lib.simpler_kernel_mode_supported(ctx) == 0
+    finally:
+        lib.destroy_device_context(ctx)
+
+
 def _run_lifecycle_retry(arch, runtime, device, scenario):
     lib = _load(arch, "onboard", runtime)
     # Caller-owned binding precedes kernel init and the forbidden-call window.
@@ -314,6 +351,10 @@ def _run_lifecycle_retry(arch, runtime, device, scenario):
             assert lib.ensure_acl_ready_ctx(ctx, device) == PTO_RUNTIME_ERR_UNSUPPORTED
             assert lib.finalize_device(ctx) == 0
         elif scenario == "prepare":
+            # The caller's packed buffer stops being configuration authority
+            # when init returns; prepare uses its owned, validated snapshot.
+            config.aicpu_thread_num = -1
+            config.enable_dump_args = 1
             _check_prepare_reuse(lib, ctx, arch, runtime)
         elif scenario in ("repeat_init", "init_failure"):
             assert lib.simpler_kernel_mode_init(*init_args) == PTO_RUNTIME_ERR_INVALID_STATE

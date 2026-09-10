@@ -29,6 +29,7 @@
 #include "device_runner_base.h"
 #include "host/dep_gen_collector.h"  // make_deps_json_path
 #include "host/kernel_entry_validation.h"
+#include "host/kernel_static_config.h"
 #include "host/kernel_pipeline_contract.h"
 #include "worker/pipeline_contract.h"
 #include "prepare_callable_common.h"
@@ -1053,6 +1054,8 @@ int simpler_kernel_mode_init(
     if (rc != 0) return rc;
     try {
         PipelineContract contract{};
+        const int config_rc = KernelStaticConfig::validate(config);
+        if (config_rc != 0) return config_rc;
         const int rc = build_kernel_pipeline_contract_impl(config, &contract);
         if (rc != 0) return rc;
         if (!is_valid_pipeline_contract(&contract, SIMPLER_MODE_KERNEL) || !has_serviceable_arena_topology(contract) ||

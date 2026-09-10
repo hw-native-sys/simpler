@@ -62,6 +62,9 @@
 
 // Scheduler context class
 #include "scheduler/scheduler_context.h"
+#include "tensormap_and_ringbuffer/kernel_execution_inputs.h"
+
+using simpler::tmr::ExecutionInputs;
 
 // Device orchestration function signature (loaded via dlopen).
 // The executor binds the current thread's RuntimeContext into orchestration TLS
@@ -79,12 +82,7 @@ extern "C" void framework_bind_runtime(RuntimeContext *rt);
 constexpr const char *DEFAULT_ORCH_ENTRY_SYMBOL = "aicpu_orchestration_entry";
 constexpr const char *DEFAULT_ORCH_CONFIG_SYMBOL = "aicpu_orchestration_config";
 
-static int32_t read_runtime_status(Runtime *runtime) {
-    if (runtime == nullptr) {
-        return 0;
-    }
-
-    void *sm = runtime->get_gm_sm_ptr();
+static int32_t read_runtime_status(void *sm) {
     if (sm == nullptr) {
         return 0;
     }
@@ -149,6 +147,7 @@ struct AicpuExecutor {
     // Entry-arg ChipTaskArgs built (via create_from_entry_storage) from get_orch_args()
     // before scheduler init; consumed by the (*p_func)(orch_args_cached_) below.
     ChipTaskArgs orch_args_cached_;
+    simpler::tmr::KernelInvocationState kernel_invocation_;
 
     // Per-callable_id table. Single orch thread today, so first-write/read
     // race is not possible; if multiple orch threads are ever introduced,
@@ -159,7 +158,7 @@ struct AicpuExecutor {
     SchedulerContext sched_ctx_;
 
     // ===== Methods =====
-    int32_t init(Runtime *runtime);
+    int32_t init(Runtime *runtime, const ExecutionInputs &inputs);
     // (Re)load a callable's orchestration SO into orch_so_table_[callable_id].
     // Register-only: the register_callable entry calls this to dlopen and
     // populate the slot. The run path never loads — it consumes an already
@@ -168,8 +167,8 @@ struct AicpuExecutor {
         int32_t callable_id, uint64_t dev_orch_so_addr, uint64_t dev_orch_so_size, const char *entry_symbol,
         const char *config_symbol, int32_t thread_idx
     );
-    int32_t run(Runtime *runtime);
-    void deinit(Runtime *runtime);
+    int32_t run(Runtime *runtime, const ExecutionInputs &inputs);
+    void deinit(Runtime *runtime, bool invalidate_host_image);
 
     ~AicpuExecutor() {
         // Process-wide teardown (the single static instance dies here). Every
@@ -196,7 +195,7 @@ static_assert(
 
 // ===== AicpuExecutor Method Implementations =====
 
-int32_t AicpuExecutor::init(Runtime *runtime) {
+int32_t AicpuExecutor::init(Runtime *runtime, const ExecutionInputs &inputs) {
     if (runtime == nullptr) {
         LOG_ERROR("runtime is nullptr");
         init_failed_.store(true, std::memory_order_release);
@@ -245,7 +244,9 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         serial_orch_sched_ = runtime->dev.serial_orch_sched;
 
         hs_arrived_.store(0, std::memory_order_relaxed);
-        if (sched_ctx_.pre_handshake_init(runtime, aicpu_thread_num_, sched_thread_num_, get_platform_regs()) != 0) {
+        if (sched_ctx_.pre_handshake_init(
+                runtime, aicpu_thread_num_, sched_thread_num_, get_platform_regs(), inputs.functions, inputs.sm
+            ) != 0) {
             init_failed_.store(true, std::memory_order_release);
             hs_setup_done_.store(true, std::memory_order_release);
             return -1;
@@ -327,7 +328,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     if (is_leader) {
         while (hs_arrived_.load(std::memory_order_acquire) < hs_nthreads) {}
         finished_count_.store(0, std::memory_order_release);
-        if (sched_ctx_.post_handshake_init(runtime) != 0) {
+        if (sched_ctx_.post_handshake_init(runtime, inputs.functions) != 0) {
             init_failed_.store(true, std::memory_order_release);
             init_done_.store(true, std::memory_order_release);
             return -1;
@@ -489,7 +490,7 @@ int32_t AicpuExecutor::load_orch_so(
 /**
  * Shutdown AICore - Send exit signal via registers to all AICore kernels
  */
-int32_t AicpuExecutor::run(Runtime *runtime) {
+int32_t AicpuExecutor::run(Runtime *runtime, const ExecutionInputs &inputs) {
     int32_t affinity_exec_idx = platform_aicpu_affinity_thread_idx();
     int32_t thread_idx = (affinity_exec_idx >= 0) ? affinity_exec_idx : (thread_idx_++);
     if (thread_idx < 0 || thread_idx >= aicpu_thread_num_ || thread_idx >= MAX_AICPU_THREADS) {
@@ -527,7 +528,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // register_callable entry. The run path only consumes it — it never
             // loads. A missing handle means run was reached without a prior
             // successful registration, which is a caller/scheduling bug.
-            const int32_t callable_id = runtime->get_active_callable_id();
+            const int32_t callable_id = inputs.callable_id;
             if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) {
                 LOG_ERROR(
                     "Thread %d: invalid callable_id %d (limit=%d)", thread_idx, callable_id, MAX_REGISTERED_CALLABLE_IDS
@@ -560,37 +561,16 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 p_bind = &entry.bind;
                 DeviceOrchestrationConfigFunc *p_config_func = &entry.config_func;
 
-                // Build the entry-arg once per run; both the config call below and
-                // the orchestration entry (consumed at orch_args_cached_) use it.
-                orch_args_cached_.create_from_entry_storage(runtime->get_orch_args());
-
-                // Validate arg count on every run against the registered SO.
-                if (*p_config_func != nullptr) {
-                    OrchestrationConfig cfg = (*p_config_func)(orch_args_cached_);
-                    LOG_DEBUG("Thread %d: Config: expected_args=%d", thread_idx, cfg.expected_arg_count);
-                    if (cfg.expected_arg_count > 0) {
-                        const simpler::tmr::EntryArgsStorage &args_validate = runtime->get_orch_args();
-                        int32_t actual_arg_count = args_validate.tensor_count() + args_validate.scalar_count();
-                        if (actual_arg_count < cfg.expected_arg_count) {
-                            LOG_ERROR(
-                                "Thread %d: arg_count %d < expected %d", thread_idx, actual_arg_count,
-                                cfg.expected_arg_count
-                            );
-                            // The registered SO is fine — these run args are
-                            // incompatible with it. Run only consumes the slot
-                            // (no reload), so leave the table intact and just
-                            // fail this run; unblock scheduler threads first so
-                            // they don't spin forever.
-                            runtime_init_ready_.store(true, std::memory_order_release);
-                            return -1;
-                        }
-                    }
+                if (!simpler::tmr::configure_orchestration_args(inputs, orch_args_cached_, *p_config_func)) {
+                    LOG_ERROR("Thread %d: invocation argument count does not match callable", thread_idx);
+                    runtime_init_ready_.store(true, std::memory_order_release);
+                    return -1;
                 }
 
                 // sm_handle / rt are bound to *this* run's memory and must be
                 // (re)created every run, regardless of whether the SO itself was
                 // reused above.
-                sm_ptr = runtime->get_gm_sm_ptr();
+                sm_ptr = inputs.sm;
             }
 
             // Prebuilt-arena fast path. Host uploads the runtime arena image
@@ -598,8 +578,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // re-wires arena-internal pointers to device addresses below.
             {
                 AicpuPhaseScope arena_wire(AicpuPhase::ArenaWire);
-                void *prebuilt_arena = runtime->get_prebuilt_arena_base();
-                size_t off_runtime = runtime->get_prebuilt_runtime_offset();
+                void *prebuilt_arena = inputs.arena;
+                size_t off_runtime = inputs.runtime_offset;
                 if (prebuilt_arena == nullptr) {
                     LOG_ERROR("Thread %d: prebuilt_arena_base is null", thread_idx);
                     runtime_init_ready_.store(true, std::memory_order_release);
@@ -894,7 +874,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         // every subsequent run.
         if (rt != nullptr) {
             // Clear g_current_runtime in this DSO and in the orchestration SO before destroying rt.
-            const int32_t callable_id = runtime->get_active_callable_id();
+            const int32_t callable_id = inputs.callable_id;
             framework_bind_runtime(nullptr);
             if (callable_id >= 0 && callable_id < MAX_REGISTERED_CALLABLE_IDS) {
                 DeviceOrchestrationBindRuntimeFunc bind = orch_so_table_[callable_id].bind;
@@ -910,12 +890,12 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     return run_rc;
 }
 
-void AicpuExecutor::deinit(Runtime *runtime) {
+void AicpuExecutor::deinit(Runtime *runtime, bool invalidate_host_image) {
     // 1. Invalidate AICPU cache for the device-copied Runtime range (`dev`).
     //    Next round's Host DMA (rtMemcpy) writes fresh bytes to HBM but
     //    bypasses this cache. Invalidating now ensures next round reads from
     //    HBM. Only `dev` is uploaded, so only `dev` needs invalidation.
-    cache_invalidate_range(runtime, sizeof(runtime->dev));
+    if (invalidate_host_image) cache_invalidate_range(runtime, sizeof(runtime->dev));
 
     // Reset all SchedulerContext-owned state in one place.
     sched_ctx_.deinit();
@@ -950,6 +930,39 @@ void AicpuExecutor::deinit(Runtime *runtime) {
 
     LOG_INFO("DeInit: AicpuExecutor reset complete");
 }
+
+namespace simpler::tmr {
+
+InvocationStatus
+admit_kernel_execution(ByteSpan packet, const KernelCallableView &callable, const KernelBindingView &binding) noexcept {
+    return g_aicpu_executor.kernel_invocation_.admit(packet, callable, binding);
+}
+
+int32_t init_kernel_execution() {
+    const auto &state = g_aicpu_executor.kernel_invocation_;
+    if (!state.active()) return -1;
+    return g_aicpu_executor.init(state.resident(), state.inputs());
+}
+
+int32_t run_kernel_execution() {
+    const auto &state = g_aicpu_executor.kernel_invocation_;
+    if (!state.active()) return -1;
+    return g_aicpu_executor.run(state.resident(), state.inputs());
+}
+
+int32_t kernel_execution_status() {
+    const auto &state = g_aicpu_executor.kernel_invocation_;
+    return state.active() ? read_runtime_status(state.inputs().sm) : -1;
+}
+
+void release_kernel_execution() {
+    auto &state = g_aicpu_executor.kernel_invocation_;
+    if (!state.active()) return;
+    g_aicpu_executor.deinit(state.resident(), false);
+    state.clear();
+}
+
+}  // namespace simpler::tmr
 
 // ===== Public Entry Point =====
 
@@ -1008,7 +1021,7 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         // init() barriers every thread internally until init is complete on the
         // leader (or a thread failed), then returns the status — so a non-zero
         // return is authoritative on all threads and no extra spin is needed.
-        if (g_aicpu_executor.init(runtime) != 0) {
+        if (g_aicpu_executor.init(runtime, simpler::tmr::program_execution_inputs(*runtime)) != 0) {
             LOG_ERROR("%s", "aicpu_execute: Initialization failed, aborting execution");
             return -1;
         }
@@ -1017,7 +1030,7 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     int32_t rc = 0;
     {
         AicpuPhaseScope graph_build(AicpuPhase::GraphBuild);
-        rc = g_aicpu_executor.run(runtime);
+        rc = g_aicpu_executor.run(runtime, simpler::tmr::program_execution_inputs(*runtime));
     }
     if (rc != 0) {
         LOG_ERROR("aicpu_execute: Thread execution failed with rc=%d", rc);
@@ -1031,11 +1044,11 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     // sched overlap into post_orch — inflating it well past the actual teardown.
     // read_runtime_status is two atomic loads every thread needs, so it
     // stays outside the scope.
-    int32_t runtime_rc = read_runtime_status(runtime);
+    int32_t runtime_rc = read_runtime_status(runtime->get_gm_sm_ptr());
     if (g_aicpu_executor.finished_.load(std::memory_order_acquire)) {
         AicpuPhaseScope post_orch(AicpuPhase::PostOrch);
         LOG_INFO("aicpu_execute: Last thread finished, cleaning up");
-        g_aicpu_executor.deinit(runtime);
+        g_aicpu_executor.deinit(runtime, true);
     }
 
     if (runtime_rc != 0) {

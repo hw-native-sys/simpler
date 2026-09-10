@@ -32,6 +32,8 @@
 #endif
 
 // Forward declarations — avoid pulling in full headers for pointer/reference params.
+#include "tensormap_and_ringbuffer/callable_table_view.h"
+
 class Runtime;
 struct Handshake;
 struct RuntimeContext;
@@ -67,6 +69,10 @@ public:
     // success, negative on failure.
     int32_t
     pre_handshake_init(Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, uint64_t regs_base);
+    int32_t pre_handshake_init(
+        Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, uint64_t regs_base,
+        simpler::tmr::CallableTableView functions, void *sm
+    );
     // All threads: handshake this thread's contiguous slice [lo, hi) of cores
     // (partitioned by tidx/nthreads). Each core is touched by exactly one thread.
     void handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads);
@@ -90,6 +96,7 @@ public:
     // Leader-only, after the handshake barrier: build worker-id lists, assign
     // cores, init profiling subsystems, read task counts, init payloads.
     int32_t post_handshake_init(Runtime *runtime);
+    int32_t post_handshake_init(Runtime *runtime, simpler::tmr::CallableTableView functions);
 
     // Reset all SchedulerContext-owned state to its post-construction defaults.
     // Called by AicpuExecutor::deinit() during per-run teardown.
@@ -179,7 +186,7 @@ private:
     // be submitted; schedulers poll it.
     std::atomic<bool> orchestrator_done_{false};
     std::atomic<bool> completed_{false};
-    uint64_t *func_id_to_addr_{nullptr};
+    simpler::tmr::CallableTableView functions_{};
 
     // --- Thread/core configuration ---
     int32_t active_sched_threads_{0};
@@ -251,7 +258,7 @@ private:
         ChipReadyQueue *queues, ResourceShape shape, int32_t thread_idx, ChipTaskSlotState **out, int max_count
     );
 
-    void build_payload(
+    bool build_payload(
         DispatchPayload &dispatch_payload, ChipTaskSlotState &slot_state, SubtaskSlot subslot, int32_t block_idx,
         bool force_gate = false
     );
@@ -271,6 +278,7 @@ private:
         int32_t core_offset;
         uint64_t *dispatch_timestamp_slot;
         int32_t task_timing_slot;  // TASK_TIMING_SLOT_NONE unless the task is tagged
+        bool valid{false};
     };
 
     PublishHandle prepare_subtask_to_core(
@@ -281,6 +289,7 @@ private:
     // `thread_idx` is the publishing Scheduler thread's index, used to select the
     // per-thread task-timing record; every call site already has it in scope.
     inline void publish_subtask_to_core(const PublishHandle &h, uint64_t dispatch_ts, int32_t thread_idx) {
+        if (!h.valid) return;
         if (h.dispatch_timestamp_slot != nullptr) {
             *h.dispatch_timestamp_slot = dispatch_ts;
         }
@@ -479,13 +488,7 @@ private:
     // Small inline helpers
     // =========================================================================
 
-    uint64_t get_function_bin_addr(int func_id) const {
-        if (!func_id_to_addr_ || func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
-            LOG_ERROR("func_id=%d is out of range [0, %d) or map is null", func_id, RUNTIME_MAX_FUNC_ID);
-            return 0;
-        }
-        return func_id_to_addr_[func_id];
-    }
+    uint64_t get_function_bin_addr(int func_id) const { return functions_.lookup(func_id); }
 };
 
 #endif  // SCHEDULER_CONTEXT_H
