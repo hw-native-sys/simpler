@@ -36,6 +36,7 @@
 #include "common/core_type.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
+#include "common/scheduler_cluster_partition.h"
 #include "task_args.h"
 #include "aicore_teardown.h"
 #include "host_build_graph/entry_args.h"  // EntryArgsStorage
@@ -174,6 +175,7 @@ public:
     int32_t aicpu_allowed_cpus[MAX_GATE_THREADS];
     int32_t aicpu_allowed_cpu_count;
     int32_t aicpu_launch_count;
+    pto::a5::SchedulerClusterAssignment scheduler_cluster_assignment{pto::a5::SchedulerClusterAssignment::kRoundRobin};
 
     // kernel binary resolution: kernel_id -> GM function_bin_addr mapping
     // NOTE: Made public for direct access from aicore code
@@ -242,6 +244,12 @@ public:
     void set_aicpu_allowed_cpu_count(int32_t n) { aicpu_allowed_cpu_count = n; }
     int32_t get_aicpu_launch_count() const { return aicpu_launch_count; }
     void set_aicpu_launch_count(int32_t n) { aicpu_launch_count = n; }
+    pto::a5::SchedulerClusterAssignment get_scheduler_cluster_assignment() const {
+        return scheduler_cluster_assignment;
+    }
+    void set_scheduler_cluster_assignment(pto::a5::SchedulerClusterAssignment assignment) {
+        scheduler_cluster_assignment = assignment;
+    }
     int32_t *get_aicpu_allowed_cpus() { return aicpu_allowed_cpus; }
     size_t aicpu_allowed_cpus_capacity() const { return sizeof(aicpu_allowed_cpus) / sizeof(aicpu_allowed_cpus[0]); }
 
