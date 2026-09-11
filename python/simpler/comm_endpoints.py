@@ -18,7 +18,7 @@ from enum import Enum, IntEnum
 from types import MappingProxyType
 from typing import Protocol
 
-from _task_interface import BackendKind  # pyright: ignore[reportMissingImports]
+from _task_interface import OWNER_INSTANCE_ID_BYTES, BackendKind  # pyright: ignore[reportMissingImports]
 
 EndpointId = int
 NodeScopeId = int
@@ -161,16 +161,26 @@ def _normalize_node_identity(host: str) -> str:
     return str(address).lower()
 
 
+def _require_owner_instance_id(nonce: object) -> bytes:
+    if not isinstance(nonce, (bytes, bytearray)):
+        raise ValueError("owner nonce must be bytes")
+    value = bytes(nonce)
+    if len(value) != OWNER_INSTANCE_ID_BYTES:
+        raise ValueError(f"owner nonce must be {OWNER_INSTANCE_ID_BYTES} bytes")
+    if value == b"\x00" * OWNER_INSTANCE_ID_BYTES:
+        raise ValueError("owner nonce must be nonzero")
+    return value
+
+
 @dataclass(frozen=True)
 class _EndpointTopologyEntry:
     path: str
     deployment: EndpointDeployment
     node_identity: str
-    #: Buffer-owner nonce of the Worker this endpoint *is*, when that Worker lives in this process.
-    #: Only a host endpoint carries one — a device endpoint is a view of a chip whose buffers are
-    #: minted by the host Worker that owns it — and a remote Worker's nonce lives in its own
-    #: process, so it is absent here rather than guessed.
+    #: Endpoint incarnation nonce. Local HOST_CPU/AICPU/AICORE entries carry one; Remote/MPI
+    #: entries leave it absent. Allocator presence is a separate frozen startup fact.
     owner_instance_id: bytes | None = None
+    has_buffer_identity_allocator: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -242,6 +252,7 @@ class EndpointRegistry:
         registry_epoch: int,
         records: Sequence[EndpointRecord],
         owner_bindings: Mapping[bytes, EndpointId] = MappingProxyType({}),
+        allocator_states: Mapping[EndpointId, bool | None] = MappingProxyType({}),
     ) -> None:
         self.root_level = int(root_level)
         self.session_instance_id = bytes(session_instance_id)
@@ -254,6 +265,9 @@ class EndpointRegistry:
         self._parsed_paths = {path: self._parse(path) for path in self._known_paths}
         self._by_owner_instance_id = {
             bytes(nonce): self._by_id[endpoint_id] for nonce, endpoint_id in owner_bindings.items()
+        }
+        self._buffer_identity_allocator_states = {
+            int(endpoint_id): None if state is None else bool(state) for endpoint_id, state in allocator_states.items()
         }
 
     @classmethod
@@ -270,6 +284,7 @@ class EndpointRegistry:
         records: list[EndpointRecord] = []
         seen: set[tuple[str, EndpointDeployment]] = set()
         owner_bindings: dict[bytes, EndpointId] = {}
+        allocator_states: dict[EndpointId, bool | None] = {}
         for endpoint_id, entry in enumerate(entries):
             deployment = EndpointDeployment(entry.deployment)
             key = (entry.path, deployment)
@@ -287,8 +302,11 @@ class EndpointRegistry:
                 registry_epoch=int(registry_epoch),
                 endpoint_id=endpoint_id,
             )
+            allocator_state = entry.has_buffer_identity_allocator
+            if allocator_state is not None:
+                allocator_state = bool(allocator_state)
             if entry.owner_instance_id is not None:
-                nonce = bytes(entry.owner_instance_id)
+                nonce = _require_owner_instance_id(entry.owner_instance_id)
                 bound = owner_bindings.get(nonce)
                 if bound is not None:
                     raise ValueError(
@@ -296,6 +314,9 @@ class EndpointRegistry:
                         f"and {records[bound].path} {records[bound].deployment.value}"
                     )
                 owner_bindings[nonce] = endpoint_id
+            elif allocator_state is True:
+                raise ValueError(f"allocator presence requires an owner nonce: {entry.path} {deployment.value}")
+            allocator_states[endpoint_id] = allocator_state
             records.append(
                 EndpointRecord(
                     identity=identity,
@@ -310,6 +331,7 @@ class EndpointRegistry:
             registry_epoch=int(registry_epoch),
             records=records,
             owner_bindings=owner_bindings,
+            allocator_states=allocator_states,
         )
 
     @property
@@ -376,6 +398,10 @@ class EndpointRegistry:
                 (bytes(owner_instance_id).hex(),),
             )
         return record
+
+    def _buffer_identity_allocator_state(self, endpoint: EndpointRecord | EndpointIdentity | EndpointId) -> bool | None:
+        record = self._record_for(endpoint)
+        return self._buffer_identity_allocator_states.get(record.endpoint_id)
 
     def all_same_node(self, members: Sequence[EndpointRecord]) -> bool:
         if len(members) <= 1:
@@ -976,7 +1002,7 @@ def _host_consumer_candidates(backend_kind: BackendKind, same_node: bool) -> tup
         return (_AdapterCandidate(AdapterKind.DIRECT_MAP, AdapterProfile.HOST_SHM_MAP),)
     if backend_kind is BackendKind.DEVICE_MALLOC:
         return (_AdapterCandidate(AdapterKind.OWNER_DELEGATED_COPY, AdapterProfile.OWNER_DEVICE_COPY),)
-    if backend_kind is BackendKind.VMM_WINDOW:
+    if backend_kind in (BackendKind.VMM_WINDOW, BackendKind.VMM_SHAREABLE):
         # A VMM VA cannot be host-registered, so HOST_SVM_MAP is deliberately absent.
         return (_AdapterCandidate(AdapterKind.OWNER_DELEGATED_COPY, AdapterProfile.HOST_VMM_COPY),)
     return _explicit_transfer_candidates(f"unsupported backend {backend_kind!r}")
@@ -990,9 +1016,13 @@ def _device_consumer_candidates(
     ``same_endpoint`` is what separates a backing already local to this chip from a same-node peer's:
     backend and deployment alone cannot tell ``DEVICE_LOCAL`` from ``DEVICE_PEER``.
     """
-    if same_endpoint and backend_kind in (BackendKind.DEVICE_MALLOC, BackendKind.VMM_WINDOW):
+    if same_endpoint and backend_kind in (
+        BackendKind.DEVICE_MALLOC,
+        BackendKind.VMM_WINDOW,
+        BackendKind.VMM_SHAREABLE,
+    ):
         return (_AdapterCandidate(AdapterKind.DIRECT_MAP, AdapterProfile.DEVICE_LOCAL),)
-    if backend_kind is BackendKind.VMM_WINDOW:
+    if backend_kind in (BackendKind.VMM_WINDOW, BackendKind.VMM_SHAREABLE):
         if same_node:
             return (
                 _AdapterCandidate(
@@ -1047,7 +1077,7 @@ def _backend_kind_for_provider(provider: EndpointRecord) -> BackendKind:
     `buffer_adapter_candidates` encodes.
     """
     if provider.deployment in (DEVICE_AICORE, DEVICE_AICPU):
-        return BackendKind.VMM_WINDOW
+        return BackendKind.VMM_SHAREABLE
     if provider.deployment is HOST_CPU:
         return BackendKind.POSIX_SHM
     raise ValueError(f"unsupported provider deployment: {_endpoint_label(provider)}")

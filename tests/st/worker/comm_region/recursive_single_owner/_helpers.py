@@ -449,8 +449,8 @@ def install_lifecycle_recorder(worker: Worker) -> _LifecycleRecorder:
     original_dispatcher = comm_provider._closed_part_dispatcher
     import_count = {"n": 0}
 
-    def _import(worker_id: int, resource_id: int, export: Any) -> Any:
-        lease = original_import(worker_id, resource_id, export)
+    def _import(worker_id: int, resource_id: int, export: Any, **kwargs) -> Any:
+        lease = original_import(worker_id, resource_id, export, **kwargs)
         import_count["n"] += 1
         part = RegionPartKind.PAYLOAD if import_count["n"] % 2 == 1 else RegionPartKind.COUNTER
         kind = (

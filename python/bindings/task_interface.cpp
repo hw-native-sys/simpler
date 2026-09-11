@@ -1718,6 +1718,89 @@ void check_access_subset(uint8_t granted, TensorArgType tag) {
     }
 }
 
+inline void store_le_u8(uint8_t *dst, uint8_t v) { dst[0] = v; }
+inline void store_le_u16(uint8_t *dst, uint16_t v) {
+    dst[0] = static_cast<uint8_t>(v);
+    dst[1] = static_cast<uint8_t>(v >> 8);
+}
+inline void store_le_u32(uint8_t *dst, uint32_t v) {
+    dst[0] = static_cast<uint8_t>(v);
+    dst[1] = static_cast<uint8_t>(v >> 8);
+    dst[2] = static_cast<uint8_t>(v >> 16);
+    dst[3] = static_cast<uint8_t>(v >> 24);
+}
+inline void store_le_u64(uint8_t *dst, uint64_t v) {
+    store_le_u32(dst, static_cast<uint32_t>(v));
+    store_le_u32(dst + 4, static_cast<uint32_t>(v >> 32));
+}
+inline uint8_t load_le_u8(const uint8_t *src) { return src[0]; }
+inline uint16_t load_le_u16(const uint8_t *src) {
+    return static_cast<uint16_t>(src[0] | (static_cast<uint16_t>(src[1]) << 8));
+}
+inline uint32_t load_le_u32(const uint8_t *src) {
+    return static_cast<uint32_t>(src[0]) | (static_cast<uint32_t>(src[1]) << 8) |
+           (static_cast<uint32_t>(src[2]) << 16) | (static_cast<uint32_t>(src[3]) << 24);
+}
+inline uint64_t load_le_u64(const uint8_t *src) {
+    return static_cast<uint64_t>(load_le_u32(src)) | (static_cast<uint64_t>(load_le_u32(src + 4)) << 32);
+}
+
+// Fieldwise 88-byte BufferDescriptor codec. Structural padding and unused body tail stay zero
+// because encoding starts from a zero-initialized buffer and never copies the native struct.
+std::array<uint8_t, sizeof(BufferDescriptor)> encode_buffer_descriptor_wire(const BufferDescriptor &desc) {
+    std::array<uint8_t, sizeof(BufferDescriptor)> wire{};
+    store_le_u16(wire.data() + offsetof(BufferDescriptor, magic), desc.magic);
+    store_le_u8(wire.data() + offsetof(BufferDescriptor, address_space), desc.address_space);
+    store_le_u8(wire.data() + offsetof(BufferDescriptor, access), desc.access);
+    store_le_u8(wire.data() + offsetof(BufferDescriptor, backend_kind), desc.backend_kind);
+    std::memcpy(
+        wire.data() + offsetof(BufferDescriptor, identity) + offsetof(CanonicalIdentity, owner_instance_id),
+        desc.identity.owner_instance_id, OWNER_INSTANCE_ID_BYTES
+    );
+    store_le_u64(
+        wire.data() + offsetof(BufferDescriptor, identity) + offsetof(CanonicalIdentity, buffer_id),
+        desc.identity.buffer_id
+    );
+    store_le_u32(
+        wire.data() + offsetof(BufferDescriptor, identity) + offsetof(CanonicalIdentity, generation),
+        desc.identity.generation
+    );
+    store_le_u64(wire.data() + offsetof(BufferDescriptor, nbytes), desc.nbytes);
+    store_le_u32(wire.data() + offsetof(BufferDescriptor, owner_worker_path_id), desc.owner_worker_path_id);
+    store_le_u16(wire.data() + offsetof(BufferDescriptor, body_len), desc.body_len);
+    std::memcpy(wire.data() + offsetof(BufferDescriptor, body), desc.body, DESC_MAX_BYTES);
+    return wire;
+}
+
+BufferDescriptor decode_buffer_descriptor_wire(const uint8_t *raw, size_t size) {
+    if (size != sizeof(BufferDescriptor)) {
+        throw std::invalid_argument(
+            "BufferDescriptor wire must be exactly " + std::to_string(sizeof(BufferDescriptor)) + " bytes, got " +
+            std::to_string(size)
+        );
+    }
+    BufferDescriptor desc{};
+    desc.magic = load_le_u16(raw + offsetof(BufferDescriptor, magic));
+    desc.address_space = load_le_u8(raw + offsetof(BufferDescriptor, address_space));
+    desc.access = load_le_u8(raw + offsetof(BufferDescriptor, access));
+    desc.backend_kind = load_le_u8(raw + offsetof(BufferDescriptor, backend_kind));
+    std::memcpy(
+        desc.identity.owner_instance_id,
+        raw + offsetof(BufferDescriptor, identity) + offsetof(CanonicalIdentity, owner_instance_id),
+        OWNER_INSTANCE_ID_BYTES
+    );
+    desc.identity.buffer_id =
+        load_le_u64(raw + offsetof(BufferDescriptor, identity) + offsetof(CanonicalIdentity, buffer_id));
+    desc.identity.generation =
+        load_le_u32(raw + offsetof(BufferDescriptor, identity) + offsetof(CanonicalIdentity, generation));
+    desc.nbytes = load_le_u64(raw + offsetof(BufferDescriptor, nbytes));
+    desc.owner_worker_path_id = load_le_u32(raw + offsetof(BufferDescriptor, owner_worker_path_id));
+    desc.body_len = load_le_u16(raw + offsetof(BufferDescriptor, body_len));
+    std::memcpy(desc.body, raw + offsetof(BufferDescriptor, body), DESC_MAX_BYTES);
+    validate_buffer_descriptor(desc);
+    return desc;
+}
+
 }  // namespace
 
 // ============================================================================
@@ -1919,8 +2002,8 @@ NB_MODULE(_task_interface, m) {
     m.attr("CHIP_TENSOR_ADDRESS_SPACE_OFFSET") = static_cast<int>(offsetof(ChipTensor, address_space));
 
     // Width of the opaque per-incarnation nonce, so the owner can draw one of the right size.
-    // The struct sizes stay unexported: no Python path turns these types into bytes or back, so a
-    // byte count here would have no reader — the layout is pinned by buffer.h's static_asserts.
+    // Public Python still has no `.pack()`: the only byte path is the module-private 88-byte
+    // codec below, which writes fieldwise into zero-initialized storage.
     m.attr("OWNER_INSTANCE_ID_BYTES") = static_cast<int>(OWNER_INSTANCE_ID_BYTES);
 
     // --- Buffer ABI enums ---
@@ -1941,7 +2024,8 @@ NB_MODULE(_task_interface, m) {
         .value("VMM_WINDOW", BackendKind::VMM_WINDOW)
         .value("REMOTE_SIDECAR", BackendKind::REMOTE_SIDECAR)
         .value("DEVICE_MALLOC", BackendKind::DEVICE_MALLOC)
-        .value("FORK_COW", BackendKind::FORK_COW);
+        .value("FORK_COW", BackendKind::FORK_COW)
+        .value("VMM_SHAREABLE", BackendKind::VMM_SHAREABLE);
 
     // --- CanonicalIdentity ---
     // Equality and hashing fold exactly the three meaningful fields, so a decode with dirty wire
@@ -2099,6 +2183,23 @@ NB_MODULE(_task_interface, m) {
                << ", nbytes=" << self.nbytes << ", body_len=" << self.body_len << ")";
             return os.str();
         });
+
+    m.def(
+        "_encode_buffer_descriptor_wire",
+        [](const BufferDescriptor &desc) {
+            const auto wire = encode_buffer_descriptor_wire(desc);
+            return nb::bytes(reinterpret_cast<const char *>(wire.data()), wire.size());
+        },
+        nb::arg("desc"),
+        "Module-private 88-byte BufferDescriptor encoding. Fieldwise, zero-padded; not a public pack API."
+    );
+    m.def(
+        "_decode_buffer_descriptor_wire",
+        [](nb::bytes raw) {
+            return decode_buffer_descriptor_wire(reinterpret_cast<const uint8_t *>(raw.c_str()), raw.size());
+        },
+        nb::arg("raw"), "Module-private 88-byte BufferDescriptor decoding. Exact size, then canonical validation."
+    );
 
     // --- Tensor ---
     // The L3+ task argument: a strided view over a buffer, carrying that buffer's descriptor whole
@@ -3736,6 +3837,14 @@ NB_MODULE(_task_interface, m) {
         nb::arg("handle"), nb::call_guard<nb::gil_scoped_release>(), "Close an L3 Host mapped-region handle."
     );
     m.def(
+        "_worker_host_mapped_region_mapped_base",
+        [](uint64_t handle) -> uint64_t {
+            RegionLease mapping = region_registry().lease(handle);
+            return mapping->device_addr;
+        },
+        nb::arg("handle"), "Return the mapped base VA for one L3 Host mapped-region handle."
+    );
+    m.def(
         "_worker_host_mapped_region_active_leases",
         [](uint64_t handle) {
             return region_registry().active_leases(handle);
@@ -3849,6 +3958,14 @@ NB_MODULE(_task_interface, m) {
         },
         nb::arg("handle"), nb::arg("counter_offset"), nb::arg("operand"), nb::arg("cmp"), nb::arg("timeout_ns"),
         nb::call_guard<nb::gil_scoped_release>(), "Poll one L3 Host-side L3-L2 signal counter until match or timeout."
+    );
+    m.def(
+        "_region_vmm_granularity",
+        [](int device_id) -> uint64_t {
+            return region_vmm_granularity(device_id);
+        },
+        nb::arg("device_id"), nb::call_guard<nb::gil_scoped_release>(),
+        "Provider/consumer runtime VMM granularity for one device."
     );
     m.def(
         "_region_vmm_begin",

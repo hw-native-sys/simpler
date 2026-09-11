@@ -96,6 +96,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     _mailbox_load_i32,
     _mailbox_store_i32,
     _read_control_copy_request,
+    _region_vmm_granularity,
     _set_host_span_level_prefix,
     _worker_host_mapped_region_ack_cleanup_error,
     _worker_host_mapped_region_import_onboard,
@@ -156,6 +157,7 @@ from .comm_endpoints import (
     BackendPlan,
     BackendResolver,
     DefaultRegionAccessService,
+    EndpointDeployment,
     EndpointRegistry,
     RegionAccessService,
     RegionLayoutSpec,
@@ -170,7 +172,7 @@ from .comm_endpoints import (
 )
 from .comm_provider import (
     DeviceAllocationTarget,
-    PosixShmImport,
+    LocalEndpointBufferIdentityAllocator,
     ProviderRegionStore,
     ProviderReleaseResult,
     ProviderReleaseStatus,
@@ -179,9 +181,11 @@ from .comm_provider import (
     RegionControlError,
     RegionControlErrorKind,
     RegionEnvironmentKind,
-    RegionPartExportDescriptor,
     RegionPartKind,
-    VmmShareableHandleImport,
+    _align_up,
+    _posix_object_size,
+    _posix_token_from_descriptor,
+    _vmm_shareable_facts,
 )
 from .comm_provider_control import (
     RELEASE_REPLY_BYTES,
@@ -2886,6 +2890,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
     prepared: set[int] | None = None,
     task_frame_count: int = 1,
     chip_rank: int | None = None,
+    provider_region_store: ProviderRegionStore | None = None,
 ) -> None:
     """Chip-process handlers for `_run_mailbox_loop`.
 
@@ -2903,16 +2908,19 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
     control-flow error and fails rather than lazily preparing it.
 
     ``owner_instance_id`` is the parent Worker's nonce — the only owner whose
-    DEVICE_MALLOC/VMM_WINDOW backings this chip may materialize.
+    DEVICE_MALLOC/VMM_WINDOW backings this chip may materialize. Region Buffer
+    identity uses the AICPU endpoint allocator constructed before INIT_READY.
     """
     prepared = prepared if prepared is not None else set()
     environment = RegionEnvironmentKind.SIM if str(chip_platform).endswith("sim") else RegionEnvironmentKind.ONBOARD
-    provider_region_store = ProviderRegionStore(
-        RegionAllocationContext(
-            environment_kind=environment,
-            target=DeviceAllocationTarget(int(device_id)),
+    if provider_region_store is None:
+        provider_region_store = ProviderRegionStore(
+            RegionAllocationContext(
+                environment_kind=environment,
+                target=DeviceAllocationTarget(int(device_id)),
+            ),
+            identity_allocator=LocalEndpointBufferIdentityAllocator(mint_owner_instance_id()),
         )
-    )
     provider_transaction_table = ProviderTransactionTable()
     import_registry = ImportRegistry(
         ImportContext(
@@ -3412,6 +3420,8 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     identity_table: dict[bytes, int],
     identity_refs: dict[bytes, int],
     owner_instance_id: bytes,
+    aicpu_owner_instance_id: bytes,
+    aicore_owner_instance_id: bytes,
     log_level: int = 25,
     platform: str = "",
     runtime: str = "",
@@ -3468,6 +3478,23 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
 
     mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
     state_addr = mailbox_addr + _OFF_STATE
+    environment = RegionEnvironmentKind.SIM if str(platform).endswith("sim") else RegionEnvironmentKind.ONBOARD
+    try:
+        _ = aicore_owner_instance_id
+        allocator = LocalEndpointBufferIdentityAllocator(aicpu_owner_instance_id)
+        provider_region_store = ProviderRegionStore(
+            RegionAllocationContext(
+                environment_kind=environment,
+                target=DeviceAllocationTarget(int(device_id)),
+            ),
+            identity_allocator=allocator,
+        )
+    except Exception as e:
+        _tb.print_exc()
+        _write_error(buf, 1, _format_exc(f"chip_process dev={device_id} provider store", e))
+        _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _INIT_FAILED)
+        cw.finalize()
+        return
     # Signal init success. The parent's readiness barrier waits for every chip
     # child to reach _INIT_READY before dispatching the first task, so the
     # per-rank host-side stream sync budget only covers actual op execution
@@ -3496,6 +3523,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             prepared=prepared,
             task_frame_count=_local_task_frame_count(platform, runtime, int(cw.pipeline_depth)),
             chip_rank=chip_rank,
+            provider_region_store=provider_region_store,
         )
     finally:
         cw.finalize()
@@ -4878,15 +4906,15 @@ class Worker:
         # since the nonce is opaque, `owner_worker_path_id` is diagnostic by contract, and
         # `address_space` does not say which card.
         #
-        # Both identities share this mint point. init() re-mints it (see the
-        # `_lifecycle = _Lifecycle.INITIALIZING` assignment) rather than trusting the value from
-        # here: for a next-level child, init() only ever runs inside the process that forked to
-        # host it, so that later mint is the one that names the real incarnation and is never older
-        # than its fork. The value assigned here exists only so a Worker that never reaches init()
-        # (e.g. a test double that pokes `_lifecycle` directly) still has a well-formed nonce.
+        # Both identities share this mint point. Root init() remints it after claiming the
+        # startup epoch. A next-level child receives the parent-frozen nonce as an explicit
+        # init input and does not remint, so the root snapshot and the child incarnation match.
         self._owner_instance_id: bytes = mint_owner_instance_id()
         self._buffer_id_counter: int = 1
         self._buffers: dict[int, Buffer] = {}
+        # Local chip endpoint incarnation facts, frozen once per (chip index, deployment).
+        # AICPU/AICORE each have a nonce; only AICPU has a Buffer identity allocator.
+        self._device_endpoint_identities: dict[tuple[int, EndpointDeployment], tuple[bytes, bool]] = {}
         # Re-export table (points 1-4): an upper-level ref received by this worker's orch is re-exported
         # to a local handle H' under this worker's identity, per-backing (keyed by source identity),
         # so each level's orch sees only its own handles. No map here — H' relabels the backing;
@@ -6602,12 +6630,23 @@ class Worker:
         include_self: bool,
     ) -> None:
         if include_self:
-            # The Worker's own buffer-owner nonce rides along, so the registry can resolve a
-            # BufferDescriptor back to the endpoint that minted it. A remote child's nonce is
-            # minted in its own process and is deliberately left absent below.
-            entries.append(_EndpointTopologyEntry(path, HOST_CPU, node_identity, worker._owner_instance_id))
+            entries.append(
+                _EndpointTopologyEntry(
+                    path,
+                    HOST_CPU,
+                    node_identity,
+                    worker._owner_instance_id,
+                    True,
+                )
+            )
         if int(worker.level) == 3:
-            self._append_device_endpoint_topology(entries, path, worker._config.get("device_ids", ()), node_identity)
+            self._append_device_endpoint_topology(
+                entries,
+                path,
+                worker._config.get("device_ids", ()),
+                node_identity,
+                local_worker=worker,
+            )
         for child_index, child in zip(worker._next_level_worker_ids, worker._next_level_workers):
             child_path = _format_worker_path(int(child.level), parent_path=path, index=int(child_index))
             self._append_endpoint_topology(entries, child, child_path, node_identity, include_self=True)
@@ -6631,11 +6670,35 @@ class Worker:
         path_to_l3: str,
         device_ids,
         node_identity: str,
+        *,
+        local_worker: Worker | None = None,
     ) -> None:
+        identities = None if local_worker is None else local_worker._ensure_local_device_endpoint_identities()
         for child_index, _device_id in enumerate(tuple(device_ids)):
             device_path = _format_worker_path(2, parent_path=path_to_l3, index=child_index)
-            entries.append(_EndpointTopologyEntry(device_path, DEVICE_AICORE, node_identity))
-            entries.append(_EndpointTopologyEntry(device_path, DEVICE_AICPU, node_identity))
+            if identities is None:
+                entries.append(_EndpointTopologyEntry(device_path, DEVICE_AICORE, node_identity))
+                entries.append(_EndpointTopologyEntry(device_path, DEVICE_AICPU, node_identity))
+                continue
+            aicore_nonce, aicore_allocator = identities[(child_index, DEVICE_AICORE)]
+            aicpu_nonce, aicpu_allocator = identities[(child_index, DEVICE_AICPU)]
+            entries.append(
+                _EndpointTopologyEntry(device_path, DEVICE_AICORE, node_identity, aicore_nonce, aicore_allocator)
+            )
+            entries.append(
+                _EndpointTopologyEntry(device_path, DEVICE_AICPU, node_identity, aicpu_nonce, aicpu_allocator)
+            )
+
+    def _ensure_local_device_endpoint_identities(
+        self,
+    ) -> dict[tuple[int, EndpointDeployment], tuple[bytes, bool]]:
+        device_ids = tuple(self._config.get("device_ids", ()))
+        for index in range(len(device_ids)):
+            for deployment, has_allocator in ((DEVICE_AICPU, True), (DEVICE_AICORE, False)):
+                key = (index, deployment)
+                if key not in self._device_endpoint_identities:
+                    self._device_endpoint_identities[key] = (mint_owner_instance_id(), has_allocator)
+        return self._device_endpoint_identities
 
     def _node_identity_from_remote_endpoint(self, endpoint: str) -> str:
         host, _port = self._parse_remote_endpoint(endpoint)
@@ -7725,7 +7788,11 @@ class Worker:
                 )
 
     def init(  # noqa: PLR0912, PLR0915
-        self, prewarm_config: CallConfig | None = None, *, _startup_deadline: float | None = None
+        self,
+        prewarm_config: CallConfig | None = None,
+        *,
+        _startup_deadline: float | None = None,
+        _adopted_owner_instance_id: bytes | None = None,
     ) -> None:
         """Initialize the worker and bring its whole subtree to READY.
 
@@ -7753,6 +7820,9 @@ class Worker:
                 inherited from a parent's startup epoch so a recursive descendant
                 consumes the parent's remaining budget instead of restarting the
                 timeout. ``None`` starts a fresh epoch.
+            _adopted_owner_instance_id: Internal. Parent-frozen HOST nonce for a
+                next-level child. Root still mints in this method; a child adopts
+                the value frozen before fork and does not remint.
         """
         if prewarm_config is not None:
             prewarm_config.validate()
@@ -7789,11 +7859,12 @@ class Worker:
             if _startup_deadline is None:
                 self._assign_shm_namespace()
             self._lifecycle = _Lifecycle.INITIALIZING
-            # Generated after this Worker's own fork: a next-level child's init() runs only inside
-            # the process that forked to host it (see _start_hierarchical), so this nonce is never
-            # older than the incarnation it names. Buffer and endpoint identity share this mint
-            # point (see the Owner-side Buffer state comment in __init__).
-            self._owner_instance_id: bytes = mint_owner_instance_id()
+            # Root mints after claiming the startup epoch. A next-level child adopts the nonce
+            # the parent froze before fork so the root snapshot and the child incarnation match.
+            if _adopted_owner_instance_id is None:
+                self._owner_instance_id = mint_owner_instance_id()
+            else:
+                self._owner_instance_id = bytes(_adopted_owner_instance_id)
             if self.level >= 3:
                 self._is_startup_root = _startup_deadline is None
                 own_deadline = _monotonic() + self._startup_timeout_s
@@ -8117,6 +8188,7 @@ class Worker:
         # task-loop variant; the base communicator is established lazily on first
         # ``orch.allocate_domain`` via CTRL_COMM_INIT.
         if device_ids:
+            self._ensure_local_device_endpoint_identities()
             for idx, dev_id in enumerate(device_ids):
                 pid = os.fork()
                 if pid == 0:
@@ -8143,6 +8215,8 @@ class Worker:
                                 target_namespace="LOCAL_CHIP",
                             ),
                             self._owner_instance_id,
+                            self._device_endpoint_identities[(idx, DEVICE_AICPU)][0],
+                            self._device_endpoint_identities[(idx, DEVICE_AICORE)][0],
                             log_level=chip_log_level,
                             platform=str(self._config["platform"]),
                             runtime=str(self._config["runtime"]),
@@ -8214,7 +8288,11 @@ class Worker:
                     # setup. A failure after inner.init() succeeded tears the
                     # inner subtree back down before propagating, so a fallible
                     # post-init step leaves no orphaned grandchildren / shms.
-                    inner.init(prewarm_config=self._prewarm_config, _startup_deadline=deadline)
+                    inner.init(
+                        prewarm_config=self._prewarm_config,
+                        _startup_deadline=deadline,
+                        _adopted_owner_instance_id=inner._owner_instance_id,
+                    )
                     try:
                         return _make_local_identity_tables(
                             identity_snapshot,
@@ -8662,29 +8740,63 @@ class Worker:
         with self._hierarchical_start_cv:
             return self._consume_worker_host_mapped_cleanup_error_locked(api)
 
-    def _import_provider_part(self, export: RegionPartExportDescriptor):
-        capability = export.import_capability
-        if isinstance(capability, PosixShmImport):
-            return _worker_host_mapped_region_import_sim(capability.shm_name, int(export.mapping_bytes), self._owner_id)
-        if isinstance(capability, VmmShareableHandleImport):
+    def _import_provider_part(
+        self,
+        descriptor: BufferDescriptor,
+        *,
+        part: RegionPartKind | None = None,
+        worker_id: int = 0,
+    ):
+        expected = self._provider_import_backend_kind()
+        if descriptor.backend_kind is not expected:
+            raise RuntimeError("create_worker_chip_region: unsupported import backend")
+        selected = None if part is None else RegionPartKind(part)
+        if expected is BackendKind.POSIX_SHM:
+            token = _posix_token_from_descriptor(descriptor)
+            mapping_bytes = _posix_object_size(token)
+            if mapping_bytes < int(descriptor.nbytes):
+                raise RuntimeError("POSIX shm object is shorter than the descriptor logical bytes")
+            if selected is RegionPartKind.COUNTER and mapping_bytes < _align_up(int(descriptor.nbytes), 64):
+                raise RuntimeError("COUNTER POSIX shm object is shorter than the 64-byte padded span")
+            return _worker_host_mapped_region_import_sim(token, int(mapping_bytes), self._owner_id)
+        if expected is BackendKind.VMM_SHAREABLE:
+            device_id, shareable_handle, mapping_bytes = _vmm_shareable_facts(descriptor)
+            if int(device_id) != int(self._provider_import_device_id(int(worker_id))):
+                raise RuntimeError("committed VMM device_id is outside this worker's device namespace")
+            try:
+                granularity = int(_region_vmm_granularity(int(device_id)))
+            except Exception as exc:
+                raise RuntimeError(str(exc) or "VMM granularity query failed") from exc
+            if granularity < 1 or int(mapping_bytes) % granularity != 0:
+                raise RuntimeError("VMM mapping_bytes must be a positive multiple of runtime granularity")
+            if selected is RegionPartKind.COUNTER and int(mapping_bytes) < _align_up(int(descriptor.nbytes), 64):
+                raise RuntimeError("COUNTER VMM mapping_bytes must cover 64-byte alignment")
             return _worker_host_mapped_region_import_onboard(
-                int(capability.device_id),
-                int(capability.shareable_handle),
-                int(export.mapping_bytes),
+                int(device_id),
+                int(shareable_handle),
+                int(mapping_bytes),
                 self._owner_id,
             )
-        raise RuntimeError("create_worker_chip_region: unsupported import capability")
+        raise RuntimeError("create_worker_chip_region: unsupported import backend")
 
-    def _provider_import_capability_type(self) -> type:
+    def _provider_import_backend_kind(self) -> BackendKind:
         platform = str(self._config.get("platform", ""))
-        return PosixShmImport if platform.endswith("sim") else VmmShareableHandleImport
+        return BackendKind.POSIX_SHM if platform.endswith("sim") else BackendKind.VMM_SHAREABLE
 
     def _provider_import_device_id(self, worker_id: int) -> int:
         device_ids = self._config.get("device_ids", [])
         return int(device_ids[int(worker_id)])
 
-    def _import_region_part_lease(self, worker_id: int, resource_id: int, export: RegionPartExportDescriptor):
-        return self._import_provider_part(export)
+    def _import_region_part_lease(
+        self,
+        worker_id: int,
+        resource_id: int,
+        descriptor: BufferDescriptor,
+        *,
+        part: RegionPartKind | None = None,
+    ):
+        del resource_id
+        return self._import_provider_part(descriptor, part=part, worker_id=int(worker_id))
 
     def _create_worker_chip_region(self, worker_id: int, payload_bytes: int, counter_bytes: int):
         if payload_bytes <= 0:

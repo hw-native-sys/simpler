@@ -20,7 +20,15 @@ from pathlib import Path
 
 import pytest
 import simpler.comm_provider as comm_provider_module
-from simpler.buffer import BackendKind
+from simpler.buffer import (
+    AccessMode,
+    AddressSpace,
+    BackendKind,
+    Buffer,
+    BufferDescriptor,
+    CanonicalIdentity,
+    intern_worker_path,
+)
 from simpler.comm_provider import (
     POSIX_SHM_TOKEN_MAX_BYTES,
     DeviceAllocationTarget,
@@ -46,7 +54,6 @@ from simpler.comm_provider import (
     RegionOperationKind,
     RegionPartAllocation,
     RegionPartAllocationSpec,
-    RegionPartExportDescriptor,
     RegionPartKind,
     RegionPartLocalView,
     SimPosixShmAllocation,
@@ -68,21 +75,14 @@ def _counter_spec(logical_bytes: int = 8, backing=BackendKind.VMM_WINDOW) -> Reg
     return RegionPartAllocationSpec(planned_backing_kind=backing, logical_bytes=logical_bytes)
 
 
-def _posix_export(logical_bytes: int, shm_name: str, *, mapping_bytes: int | None = None) -> RegionPartExportDescriptor:
-    return RegionPartExportDescriptor(
-        planned_backing_kind=BackendKind.VMM_WINDOW,
-        logical_bytes=logical_bytes,
-        mapping_bytes=logical_bytes if mapping_bytes is None else mapping_bytes,
-        import_capability=PosixShmImport(shm_name=shm_name),
-    )
-
-
-def _vmm_export(logical_bytes: int, handle: int = 7) -> RegionPartExportDescriptor:
-    return RegionPartExportDescriptor(
-        planned_backing_kind=BackendKind.VMM_WINDOW,
-        logical_bytes=logical_bytes,
-        mapping_bytes=logical_bytes,
-        import_capability=VmmShareableHandleImport(device_id=0, shareable_handle=handle),
+def _posix_descriptor(*, owner_nonce: bytes, buffer_id: int, nbytes: int, token: str) -> BufferDescriptor:
+    return BufferDescriptor(
+        CanonicalIdentity(bytes(owner_nonce), int(buffer_id), 1),
+        AddressSpace.HOST,
+        AccessMode.READWRITE,
+        BackendKind.POSIX_SHM,
+        int(nbytes),
+        token.encode("ascii"),
     )
 
 
@@ -223,17 +223,16 @@ def test_allocation_context_preserves_typed_targets():
         DeviceAllocationTarget(device_id=_INT32_MAX + 1)
 
 
-def test_export_descriptor_keeps_capability_and_omits_local_addresses():
-    descriptor = RegionExportDescriptor(
-        payload=_posix_export(64, "/pto_payload_a"),
-        counter=_vmm_export(8, handle=11),
-    )
-    assert dataclasses.fields(RegionPartExportDescriptor)
-    field_names = {field.name for field in dataclasses.fields(RegionPartExportDescriptor)}
+def test_export_descriptor_holds_two_buffer_descriptors():
+    nonce = b"\x01\x02\x03\x04\x05\x06\x07\x08"
+    payload = _posix_descriptor(owner_nonce=nonce, buffer_id=1, nbytes=64, token="pto_payload_a")
+    counter = _posix_descriptor(owner_nonce=nonce, buffer_id=2, nbytes=8, token="pto_counter_a")
+    descriptor = RegionExportDescriptor(payload=payload, counter=counter)
+    field_names = {field.name for field in dataclasses.fields(RegionExportDescriptor)}
+    assert field_names == {"payload", "counter"}
     assert "local_base" not in field_names
     assert "local_addr" not in field_names
-    assert isinstance(descriptor.payload.import_capability, PosixShmImport)
-    assert isinstance(descriptor.counter.import_capability, VmmShareableHandleImport)
+    assert descriptor.payload.identity != descriptor.counter.identity
     result = RegionAllocationResult(provider_resource_id=1, export_descriptor=descriptor)
     assert result.provider_resource_id == 1
     with pytest.raises(ValueError):
@@ -246,12 +245,10 @@ def test_posix_shm_token_rejects_empty_overlong_non_ascii_and_nul(shm_name):
         PosixShmImport(shm_name=shm_name)
 
 
-def test_posix_shm_token_accepts_bounded_ascii_and_mapping_may_exceed_logical_bytes():
+def test_posix_shm_token_accepts_bounded_ascii():
     token = "p" * POSIX_SHM_TOKEN_MAX_BYTES
-    export = _posix_export(8, token, mapping_bytes=64)
-    assert export.mapping_bytes == 64
-    with pytest.raises(ValueError):
-        _posix_export(16, "ok", mapping_bytes=15)
+    capability = PosixShmImport(shm_name=token)
+    assert capability.shm_name == token
 
 
 def test_local_view_accepts_base_zero_and_rejects_uint64_span_overflow():
@@ -388,6 +385,7 @@ class FakeRegionPartAllocation:
         self._local_base = local_base
         self._mapping_bytes = spec.logical_bytes if mapping_bytes is None else mapping_bytes
         self._import_capability: ImportCapability = PosixShmImport(shm_name=shm_name)
+        self._buffer: Buffer | None = None
 
     def _raise_configured(self, spec: BaseException | type[BaseException] | None) -> None:
         if spec is None:
@@ -396,7 +394,7 @@ class FakeRegionPartAllocation:
             raise spec
         raise spec()
 
-    def materialize(self) -> None:
+    def materialize(self, identity, diagnostics=None) -> Buffer:
         self.calls.append("materialize")
         self.world.record(self.part, "materialize")
         if self.release_count != 0:
@@ -405,6 +403,23 @@ class FakeRegionPartAllocation:
         self._raise_configured(self.fail_materialize)
         self.materialized = True
         self.world.side_effects.append((self.part, "materialize"))
+        owner_worker_path = ""
+        if diagnostics is not None:
+            owner_worker_path = str(getattr(diagnostics, "owner_worker_path", "") or "")
+        token = self._import_capability.shm_name.lstrip("/")
+        buffer = Buffer(
+            identity=identity,
+            owner_worker_path_id=intern_worker_path(owner_worker_path),
+            address_space=AddressSpace.HOST,
+            access=AccessMode.READWRITE,
+            backend_kind=BackendKind.POSIX_SHM,
+            nbytes=int(self.spec.logical_bytes),
+            body=token.encode("ascii"),
+            shm=None,
+            base=int(self._local_base),
+        )
+        self._buffer = buffer
+        return buffer
 
     def mapping_bytes(self) -> int:
         self.calls.append("mapping_bytes")
@@ -513,7 +528,7 @@ class FakeShellFactory:
             spec,
             world=self.world,
             local_base=local_base,
-            shm_name=f"/{part.name[0].lower()}{self._seq}",
+            shm_name=f"pto{part.name[0].lower()}{self._seq}",
         )
         self.world.constructed_parts.append(part)
         if part is RegionPartKind.PAYLOAD:

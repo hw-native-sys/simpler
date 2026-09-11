@@ -17,6 +17,7 @@ from typing import Any, Optional, Union
 
 import pytest
 from simpler import comm_endpoints as ce
+from simpler.buffer import AccessMode, AddressSpace, BackendKind, BufferDescriptor, CanonicalIdentity
 from simpler.comm_provider import (
     ProviderReleaseResult,
     ProviderReleaseStatus,
@@ -42,6 +43,7 @@ from simpler.comm_region import (
     RegionPartSpan,
     SignalTestResult,
     WaitCmp,
+    _RegionPartAttachment,
     materialize_region_instance,
     project_region_allocation_spec,
     validate_single_owner_region_shape,
@@ -84,6 +86,11 @@ def _context(worker: Worker, members, topology, layout=None) -> MaterializationC
 
 def _accepted_context(worker: Optional[Worker] = None) -> MaterializationContext:
     worker = worker or _l3(device_ids=[8, 9])
+    worker._config = {
+        **worker._config,
+        "platform": "a2a3sim",
+        "device_ids": list(worker._config.get("device_ids", [8, 9])),
+    }
     return _context(
         worker,
         [ce.at("L3", ce.HOST_CPU), ce.at("L3/L2[1]", ce.DEVICE_AICPU)],
@@ -97,8 +104,68 @@ def _assert_refusal(ctx: MaterializationContext, reason: RefusalReason) -> None:
     assert excinfo.value.reason is reason
 
 
+def _owner_nonce_for(registry, provider: ce.EndpointRecord) -> bytes:
+    for nonce, record in registry._by_owner_instance_id.items():
+        if record.identity == provider.identity:
+            return bytes(nonce)
+    raise AssertionError(f"no owner nonce bound to {provider.path} {provider.deployment.value}")
+
+
+def _aicpu_owner_nonce(worker: Worker, worker_id: int) -> bytes:
+    worker._ensure_local_device_endpoint_identities()
+    return bytes(worker._device_endpoint_identities[(int(worker_id), ce.DEVICE_AICPU)][0])
+
+
 def _attachments(part: ce.RegionPartPlan) -> dict[ce.EndpointIdentity, ce.MemberAttachmentPlan]:
     return {attachment.member: attachment for attachment in part.attachments}
+
+
+def _posix_descriptor(
+    *,
+    owner_nonce: bytes,
+    buffer_id: int,
+    nbytes: int,
+    token: str,
+    generation: int = 1,
+    access: AccessMode = AccessMode.READWRITE,
+) -> BufferDescriptor:
+    return BufferDescriptor(
+        CanonicalIdentity(bytes(owner_nonce), int(buffer_id), int(generation)),
+        AddressSpace.HOST,
+        access,
+        BackendKind.POSIX_SHM,
+        int(nbytes),
+        token.encode("ascii"),
+    )
+
+
+def _vmm_shareable_body(*, device_id: int, shareable_handle: int, mapping_bytes: int) -> bytes:
+    return (
+        int(device_id).to_bytes(4, "little", signed=True)
+        + (0).to_bytes(4, "little")
+        + int(shareable_handle).to_bytes(8, "little")
+        + int(mapping_bytes).to_bytes(8, "little")
+    )
+
+
+def _vmm_descriptor(
+    *,
+    owner_nonce: bytes,
+    buffer_id: int,
+    nbytes: int,
+    device_id: int,
+    shareable_handle: int,
+    mapping_bytes: int,
+    generation: int = 1,
+) -> BufferDescriptor:
+    return BufferDescriptor(
+        CanonicalIdentity(bytes(owner_nonce), int(buffer_id), int(generation)),
+        AddressSpace.DEVICE,
+        AccessMode.READWRITE,
+        BackendKind.VMM_SHAREABLE,
+        int(nbytes),
+        _vmm_shareable_body(device_id=device_id, shareable_handle=shareable_handle, mapping_bytes=mapping_bytes),
+    )
 
 
 def _materialize_default_region(worker: Worker):
@@ -143,12 +210,12 @@ def _manual_two_member_context(
         ordered_members=(consumer.identity, provider.identity),
         payload=ce.RegionPartPlan(
             part=ce.RegionPartKind.PAYLOAD,
-            backend_kind=ce.BackendKind.VMM_WINDOW,
+            backend_kind=ce.BackendKind.VMM_SHAREABLE,
             attachments=part_attachments,
         ),
         counter=ce.RegionPartPlan(
             part=ce.RegionPartKind.COUNTER,
-            backend_kind=ce.BackendKind.VMM_WINDOW,
+            backend_kind=ce.BackendKind.VMM_SHAREABLE,
             attachments=part_attachments,
         ),
         topology_plan=ce.SingleOwnerPlan(provider_endpoint=provider.identity),
@@ -361,12 +428,12 @@ def test_shape_validation_rejects_direct_map_and_extra_consumers():
         Union[ce.RegionAccessDecision, bool],
     ] = {
         (
-            ce.BackendKind.VMM_WINDOW,
+            ce.BackendKind.VMM_SHAREABLE,
             ce.AdapterKind.OWNER_DELEGATED_COPY,
             ce.AdapterProfile.HOST_VMM_COPY,
         ): True,
         (
-            ce.BackendKind.VMM_WINDOW,
+            ce.BackendKind.VMM_SHAREABLE,
             ce.AdapterKind.DEVICE_PEER,
             ce.AdapterProfile.DEVICE_VMM_PEER_IMPORT,
         ): True,
@@ -434,10 +501,13 @@ def test_shape_validation_rejects_duplicate_attachment_members():
 
 
 class _FakeLease:
-    def __init__(self, calls: list[tuple], name: str, handle: int, *, fail_close: bool = False) -> None:
+    def __init__(
+        self, calls: list[tuple], name: str, handle: int, *, fail_close: bool = False, mapped_base: int = 0
+    ) -> None:
         self._calls = calls
         self._name = name
         self.handle = handle
+        self.mapped_base = int(mapped_base)
         self.closed = False
         self._fail_close = fail_close
 
@@ -455,11 +525,13 @@ class _FakeNativeWorker:
         self,
         calls: list[tuple],
         *,
+        owner_nonce: bytes,
         fail_release: bool = False,
         allocate_error: Optional[BaseException] = None,
         mutate_success=None,
     ) -> None:
         self._calls = calls
+        self._owner_nonce = bytes(owner_nonce)
         self._fail_release = fail_release
         self._allocate_error = allocate_error
         self._mutate_success = mutate_success
@@ -499,7 +571,7 @@ class _FakeNativeWorker:
                     publish_reply(memoryview(staged), committed)
                     return bytes(staged)
                 raise self._allocate_error
-            result, payload_view, counter_view = _committed_success(spec)
+            result, payload_view, counter_view = _committed_success(spec, owner_nonce=self._owner_nonce)
             self._last_resource_id = int(result.provider_resource_id)
             committed = encode_reply(
                 DelegatedAllocateReply(
@@ -534,31 +606,37 @@ class _FakeNativeWorker:
         return bytes(staged)
 
 
-def _committed_success(spec, *, resource_id: int = 42, shm_names=None, payload_base: int = 0, counter_base: int = 64):
+def _committed_success(
+    spec,
+    *,
+    resource_id: int = 42,
+    shm_names=None,
+    payload_base: int = 0,
+    counter_base: int = 64,
+    owner_nonce: bytes,
+):
     from simpler.comm_provider import (
-        PosixShmImport,
         RegionAllocationResult,
         RegionExportDescriptor,
-        RegionPartExportDescriptor,
         RegionPartKind,
         RegionPartLocalView,
     )
 
-    names = shm_names or (f"/pto_payload_{resource_id}", f"/pto_counter_{resource_id}")
+    names = shm_names or (f"pto_payload_{resource_id}", f"pto_counter_{resource_id}")
     result = RegionAllocationResult(
         provider_resource_id=int(resource_id),
         export_descriptor=RegionExportDescriptor(
-            payload=RegionPartExportDescriptor(
-                spec.payload.planned_backing_kind,
-                int(spec.payload.logical_bytes),
-                int(spec.payload.logical_bytes),
-                PosixShmImport(names[0]),
+            payload=_posix_descriptor(
+                owner_nonce=owner_nonce,
+                buffer_id=1,
+                nbytes=int(spec.payload.logical_bytes),
+                token=names[0].lstrip("/"),
             ),
-            counter=RegionPartExportDescriptor(
-                spec.counter.planned_backing_kind,
-                int(spec.counter.logical_bytes),
-                int(spec.counter.logical_bytes),
-                PosixShmImport(names[1]),
+            counter=_posix_descriptor(
+                owner_nonce=owner_nonce,
+                buffer_id=2,
+                nbytes=int(spec.counter.logical_bytes),
+                token=names[1].lstrip("/"),
             ),
         ),
     )
@@ -585,16 +663,23 @@ def region_worker(monkeypatch):
         leases: list[_FakeLease] = []
         worker._worker = _FakeNativeWorker(
             calls,
+            owner_nonce=_aicpu_owner_nonce(worker, 1),
             fail_release=fail_release,
             allocate_error=allocate_error,
             mutate_success=mutate_success,
         )
         monkeypatch.setattr(worker, "_consume_worker_host_mapped_cleanup_error", lambda _api: None)
 
-        def fake_import(_worker_id, _resource_id, export):
+        def fake_import(_worker_id, _resource_id, descriptor, *, part=None):
             name = "payload" if not leases else "counter"
-            lease = _FakeLease(calls, name, handle=100 + len(leases), fail_close=fail_mapping_close)
-            calls.append(("import", name, int(export.logical_bytes)))
+            lease = _FakeLease(
+                calls,
+                name,
+                handle=100 + len(leases),
+                fail_close=fail_mapping_close,
+                mapped_base=0 if name == "payload" else 64,
+            )
+            calls.append(("import", name, int(descriptor.nbytes), part))
             if fail_first_import and name == "payload":
                 raise RuntimeError("first import failed")
             if fail_second_import and name == "counter":
@@ -614,14 +699,15 @@ def test_worker_materializes_region_instance_and_closes_single_region(region_wor
 
     assert instance.state is RegionInstanceState.LIVE
     assert instance.worker_id == 1
-    assert instance._payload_mapping is leases[0]
-    assert instance._counter_mapping is leases[1]
-    assert instance._payload_mapping is not None
-    assert instance._counter_mapping is not None
+    assert instance._payload_attachment is not None
+    assert instance._counter_attachment is not None
+    assert instance._payload_attachment.native_lease is leases[0]
+    assert instance._counter_attachment.native_lease is leases[1]
     assert instance._payload_part is not None
     assert instance._counter_part is not None
-    assert instance._payload_mapping is not instance._counter_mapping
-    assert instance._payload_mapping.handle != instance._counter_mapping.handle
+    assert instance._payload_attachment is not instance._counter_attachment
+    assert instance._payload_attachment.native_lease.handle != instance._counter_attachment.native_lease.handle
+    assert instance._payload_attachment.identity != instance._counter_attachment.identity
     assert instance._payload_part.span == RegionPartSpan(offset=0, nbytes=64)
     assert instance._counter_part.span == RegionPartSpan(offset=0, nbytes=128)
 
@@ -632,8 +718,8 @@ def test_worker_materializes_region_instance_and_closes_single_region(region_wor
     assert _tracked(worker) == ()
     assert calls == [
         ("allocate", 64, 128),
-        ("import", "payload", 64),
-        ("import", "counter", 128),
+        ("import", "payload", 64, RegionPartKind.PAYLOAD),
+        ("import", "counter", 128, RegionPartKind.COUNTER),
         ("mapping_close", "payload"),
         ("mapping_close", "counter"),
         ("release", 1, 42),
@@ -708,8 +794,8 @@ def test_live_region_instance_close_reuses_one_shot_cleanup(region_worker):
     assert _tracked(worker) == ()
     assert calls == [
         ("allocate", 64, 128),
-        ("import", "payload", 64),
-        ("import", "counter", 128),
+        ("import", "payload", 64, RegionPartKind.PAYLOAD),
+        ("import", "counter", 128, RegionPartKind.COUNTER),
         ("mapping_close", "payload"),
         ("mapping_close", "counter"),
         ("release", 1, 42),
@@ -740,8 +826,8 @@ def test_region_instance_close_failure_marks_failed_and_poisons_worker(region_wo
         instance.close()
     assert calls == [
         ("allocate", 64, 128),
-        ("import", "payload", 64),
-        ("import", "counter", 128),
+        ("import", "payload", 64, RegionPartKind.PAYLOAD),
+        ("import", "counter", 128, RegionPartKind.COUNTER),
         ("mapping_close", "payload"),
         ("mapping_close", "counter"),
         ("release", 1, 42),
@@ -763,8 +849,8 @@ def test_region_instance_close_failure_replays_cached_error(region_worker):
     assert second_excinfo.value is first_excinfo.value
     assert calls == [
         ("allocate", 64, 128),
-        ("import", "payload", 64),
-        ("import", "counter", 128),
+        ("import", "payload", 64, RegionPartKind.PAYLOAD),
+        ("import", "counter", 128, RegionPartKind.COUNTER),
         ("mapping_close", "payload"),
         ("mapping_close", "counter"),
         ("release", 1, 42),
@@ -788,8 +874,8 @@ def test_callback_region_close_before_submit_retired_from_run_cleanup(region_wor
     assert _tracked(worker) == ()
     assert calls == [
         ("allocate", 64, 128),
-        ("import", "payload", 64),
-        ("import", "counter", 128),
+        ("import", "payload", 64, RegionPartKind.PAYLOAD),
+        ("import", "counter", 128, RegionPartKind.COUNTER),
         ("mapping_close", "payload"),
         ("mapping_close", "counter"),
         ("release", 1, 42),
@@ -820,8 +906,8 @@ def test_callback_region_run_cleanup_then_later_close_is_idempotent(region_worke
     assert _tracked(worker) == ()
     assert calls == [
         ("allocate", 64, 128),
-        ("import", "payload", 64),
-        ("import", "counter", 128),
+        ("import", "payload", 64, RegionPartKind.PAYLOAD),
+        ("import", "counter", 128, RegionPartKind.COUNTER),
         ("mapping_close", "payload"),
         ("mapping_close", "counter"),
         ("release", 1, 42),
@@ -906,7 +992,7 @@ def test_first_import_failure_releases_once_and_poisons(region_worker):
     worker._require_no_ordered_cleanup_failure("test")
     assert calls == [
         ("allocate", 64, 128),
-        ("import", "payload", 64),
+        ("import", "payload", 64, RegionPartKind.PAYLOAD),
         ("release", 1, 42),
     ]
     assert leases == []
@@ -921,8 +1007,8 @@ def test_second_import_failure_closes_first_lease_and_poisons(region_worker):
     worker._require_no_ordered_cleanup_failure("test")
     assert calls == [
         ("allocate", 64, 128),
-        ("import", "payload", 64),
-        ("import", "counter", 128),
+        ("import", "payload", 64, RegionPartKind.PAYLOAD),
+        ("import", "counter", 128, RegionPartKind.COUNTER),
         ("mapping_close", "payload"),
         ("release", 1, 42),
     ]
@@ -1083,8 +1169,8 @@ def test_registry_run_cleanup_closes_live_instances(region_worker):
     assert _tracked(worker) == ()
     assert calls == [
         ("allocate", 64, 128),
-        ("import", "payload", 64),
-        ("import", "counter", 128),
+        ("import", "payload", 64, RegionPartKind.PAYLOAD),
+        ("import", "counter", 128, RegionPartKind.COUNTER),
         ("mapping_close", "payload"),
         ("mapping_close", "counter"),
         ("release", 1, 42),
@@ -1215,8 +1301,8 @@ def test_live_region_instance_access_requires_control_context(region_worker):
 
     assert calls == [
         ("allocate", 64, 128),
-        ("import", "payload", 64),
-        ("import", "counter", 128),
+        ("import", "payload", 64, RegionPartKind.PAYLOAD),
+        ("import", "counter", 128, RegionPartKind.COUNTER),
         ("mapping_close", "payload"),
         ("mapping_close", "counter"),
         ("release", 1, 42),
@@ -1414,8 +1500,8 @@ def test_projection_copies_admitted_part_backing_and_layout_bytes():
     assert spec.counter.planned_backing_kind is ctx.plan.counter.backend_kind
     assert spec.payload.logical_bytes == ctx.layout.payload_bytes
     assert spec.counter.logical_bytes == ctx.layout.counter_bytes
-    assert spec.payload.planned_backing_kind is ce.BackendKind.VMM_WINDOW
-    assert spec.counter.planned_backing_kind is ce.BackendKind.VMM_WINDOW
+    assert spec.payload.planned_backing_kind is ce.BackendKind.VMM_SHAREABLE
+    assert spec.counter.planned_backing_kind is ce.BackendKind.VMM_SHAREABLE
     assert not hasattr(spec, "provider")
     assert not hasattr(spec.payload, "device_id")
     assert not hasattr(spec.payload, "worker_id")
@@ -1460,8 +1546,8 @@ def test_compatibility_create_projects_admitted_w2_plan_not_byte_counts(monkeypa
     worker = _l3(device_ids=[8, 9])
     spec = worker._project_admitted_worker_chip_region_spec(1, 64, 128)
 
-    assert spec.payload.planned_backing_kind is ce.BackendKind.VMM_WINDOW
-    assert spec.counter.planned_backing_kind is ce.BackendKind.VMM_WINDOW
+    assert spec.payload.planned_backing_kind is ce.BackendKind.VMM_SHAREABLE
+    assert spec.counter.planned_backing_kind is ce.BackendKind.VMM_SHAREABLE
     assert spec.payload.logical_bytes == 64
     assert spec.counter.logical_bytes == 128
 
@@ -1493,7 +1579,16 @@ def test_compatibility_create_uses_projection_result_not_a_fabricated_spec(monke
     worker = _l3(device_ids=[8, 9])
     worker._config = {**worker._config, "platform": "a2a3sim", "device_ids": [8, 9]}
     monkeypatch.setattr(worker, "_consume_worker_host_mapped_cleanup_error", lambda _api: None)
-    monkeypatch.setattr(worker, "_import_region_part_lease", lambda *_args, **_kwargs: _FakeLease([], "payload", 1))
+    monkeypatch.setattr(
+        worker,
+        "_import_region_part_lease",
+        lambda _worker_id, _resource_id, _desc, *, part=None: _FakeLease(
+            [],
+            "payload" if part is RegionPartKind.PAYLOAD else "counter",
+            1,
+            mapped_base=0 if part is RegionPartKind.PAYLOAD else 64,
+        ),
+    )
     captured: dict[str, Any] = {}
 
     def payload(_worker_type, worker_id, sub_cmd, staged, _timeout):
@@ -1515,7 +1610,9 @@ def test_compatibility_create_uses_projection_result_not_a_fabricated_spec(monke
         captured["request"] = request
         captured["plan"] = worker._get_endpoint_registry()
         if envelope.operation is DelegatedRegionOperation.DELEGATED_ALLOCATE:
-            result, payload_view, counter_view = _committed_success(request.spec, resource_id=1)
+            result, payload_view, counter_view = _committed_success(
+                request.spec, resource_id=1, owner_nonce=_aicpu_owner_nonce(worker, 1)
+            )
             committed = encode_reply(
                 DelegatedAllocateReply(
                     tag=DelegatedAllocateReplyTag.ALLOCATED,
@@ -1535,8 +1632,8 @@ def test_compatibility_create_uses_projection_result_not_a_fabricated_spec(monke
     assert int(captured["worker_id"]) == 1
     assert request.payload_logical_bytes == 64
     assert request.counter_logical_bytes == 128
-    assert request.payload_backend_kind is ce.BackendKind.VMM_WINDOW
-    assert request.counter_backend_kind is ce.BackendKind.VMM_WINDOW
+    assert request.payload_backend_kind is ce.BackendKind.VMM_SHAREABLE
+    assert request.counter_backend_kind is ce.BackendKind.VMM_SHAREABLE
     registry = worker._get_endpoint_registry()
     plan = region._instance.plan
     provider = registry.record_for(plan.topology_plan.provider_endpoint)
@@ -1602,8 +1699,20 @@ class _StoreControlMailbox:
         return bytes(staged)
 
 
-def _live_control_worker(mailbox, monkeypatch, device_ids=(8, 9)):
-    worker = _l3(device_ids=device_ids)
+def _provider_store(worker: Worker, factory, *, worker_id: int = 1):
+    from simpler.comm_provider import LocalEndpointBufferIdentityAllocator, ProviderRegionStore
+
+    from tests.ut.py.test_worker.test_comm_provider import _sim_context
+
+    return ProviderRegionStore(
+        _sim_context(),
+        LocalEndpointBufferIdentityAllocator(_aicpu_owner_nonce(worker, worker_id)),
+        _shell_factory=factory,
+    )
+
+
+def _live_control_worker(mailbox, monkeypatch, device_ids=(8, 9), worker=None):
+    worker = worker or _l3(device_ids=device_ids)
     worker._config = {**worker._config, "platform": "a2a3sim", "device_ids": list(device_ids)}
     worker._worker = mailbox
     monkeypatch.setattr(worker, "_consume_worker_host_mapped_cleanup_error", lambda _api: None)
@@ -1624,14 +1733,13 @@ def _assert_poisoned(worker, *, cause: Optional[BaseException] = None) -> Runtim
 
 
 def test_handler_commit_then_mailbox_error_releases_once_and_poisons(monkeypatch):
-    from simpler.comm_provider import ProviderRegionStore
-
-    from tests.ut.py.test_worker.test_comm_provider import FakeShellFactory, _sim_context
+    from tests.ut.py.test_worker.test_comm_provider import FakeShellFactory
 
     factory = FakeShellFactory()
-    store = ProviderRegionStore(_sim_context(), _shell_factory=factory)
+    worker = _l3(device_ids=[8, 9])
+    store = _provider_store(worker, factory)
     mailbox = _StoreControlMailbox(store, fail_after_allocate=RuntimeError("mailbox down after commit"))
-    worker = _live_control_worker(mailbox, monkeypatch)
+    worker = _live_control_worker(mailbox, monkeypatch, worker=worker)
     with pytest.raises(RuntimeError, match="mailbox down after commit") as exc_info:
         _materialize_default_region(worker)
     assert _tracked(worker) == ()
@@ -1644,13 +1752,14 @@ def test_handler_commit_then_mailbox_error_releases_once_and_poisons(monkeypatch
 
 
 def test_dispatch_empty_reply_does_not_release_and_poisons(monkeypatch):
-    from simpler.comm_provider import ProviderRegionStore, RegionControlError
+    from simpler.comm_provider import RegionControlError
 
-    from tests.ut.py.test_worker.test_comm_provider import FakeShellFactory, _sim_context
+    from tests.ut.py.test_worker.test_comm_provider import FakeShellFactory
 
-    store = ProviderRegionStore(_sim_context(), _shell_factory=FakeShellFactory())
+    worker = _l3(device_ids=[8, 9])
+    store = _provider_store(worker, FakeShellFactory())
     mailbox = _StoreControlMailbox(store, reply_mode="empty")
-    worker = _live_control_worker(mailbox, monkeypatch)
+    worker = _live_control_worker(mailbox, monkeypatch, worker=worker)
     with pytest.raises(RegionControlError):
         _materialize_default_region(worker)
     assert _tracked(worker) == ()
@@ -1661,13 +1770,14 @@ def test_dispatch_empty_reply_does_not_release_and_poisons(monkeypatch):
 
 
 def test_dispatch_malformed_reply_does_not_release_and_poisons(monkeypatch):
-    from simpler.comm_provider import ProviderRegionStore, RegionControlError
+    from simpler.comm_provider import RegionControlError
 
-    from tests.ut.py.test_worker.test_comm_provider import FakeShellFactory, _sim_context
+    from tests.ut.py.test_worker.test_comm_provider import FakeShellFactory
 
-    store = ProviderRegionStore(_sim_context(), _shell_factory=FakeShellFactory())
+    worker = _l3(device_ids=[8, 9])
+    store = _provider_store(worker, FakeShellFactory())
     mailbox = _StoreControlMailbox(store, reply_mode="malformed")
-    worker = _live_control_worker(mailbox, monkeypatch)
+    worker = _live_control_worker(mailbox, monkeypatch, worker=worker)
     with pytest.raises(RegionControlError):
         _materialize_default_region(worker)
     assert _tracked(worker) == ()
@@ -1678,13 +1788,12 @@ def test_dispatch_malformed_reply_does_not_release_and_poisons(monkeypatch):
 
 
 def test_request_encode_failure_does_not_dispatch_or_poison(monkeypatch):
-    from simpler.comm_provider import ProviderRegionStore
+    from tests.ut.py.test_worker.test_comm_provider import FakeShellFactory
 
-    from tests.ut.py.test_worker.test_comm_provider import FakeShellFactory, _sim_context
-
-    store = ProviderRegionStore(_sim_context(), _shell_factory=FakeShellFactory())
+    worker = _l3(device_ids=[8, 9])
+    store = _provider_store(worker, FakeShellFactory())
     mailbox = _StoreControlMailbox(store)
-    worker = _live_control_worker(mailbox, monkeypatch)
+    worker = _live_control_worker(mailbox, monkeypatch, worker=worker)
 
     def _boom(*_args, **_kwargs):
         raise RuntimeError("encode failed")
@@ -1699,13 +1808,12 @@ def test_request_encode_failure_does_not_dispatch_or_poison(monkeypatch):
 
 
 def test_mailbox_error_before_handler_poisons_and_keeps_transport_type(monkeypatch):
-    from simpler.comm_provider import ProviderRegionStore
+    from tests.ut.py.test_worker.test_comm_provider import FakeShellFactory
 
-    from tests.ut.py.test_worker.test_comm_provider import FakeShellFactory, _sim_context
-
-    store = ProviderRegionStore(_sim_context(), _shell_factory=FakeShellFactory())
+    worker = _l3(device_ids=[8, 9])
+    store = _provider_store(worker, FakeShellFactory())
     mailbox = _StoreControlMailbox(store, fail_before_allocate=RuntimeError("mailbox down before handler"))
-    worker = _live_control_worker(mailbox, monkeypatch)
+    worker = _live_control_worker(mailbox, monkeypatch, worker=worker)
     with pytest.raises(RuntimeError, match="mailbox down before handler") as exc_info:
         _materialize_default_region(worker)
     assert mailbox.allocate_calls == 1
@@ -1718,15 +1826,16 @@ def test_mailbox_error_before_handler_poisons_and_keeps_transport_type(monkeypat
 
 
 def test_store_lifecycle_allocate_is_terminal_ambiguity(monkeypatch):
-    from simpler.comm_provider import ProviderRegionStore, RegionControlError, RegionControlErrorKind
+    from simpler.comm_provider import RegionControlError, RegionControlErrorKind
 
-    from tests.ut.py.test_worker.test_comm_provider import FakeShellFactory, _sim_context
+    from tests.ut.py.test_worker.test_comm_provider import FakeShellFactory
 
     factory = FakeShellFactory()
-    store = ProviderRegionStore(_sim_context(), _shell_factory=factory)
+    worker = _l3(device_ids=[8, 9])
+    store = _provider_store(worker, factory)
     store.sweep()
     mailbox = _StoreControlMailbox(store)
-    worker = _live_control_worker(mailbox, monkeypatch)
+    worker = _live_control_worker(mailbox, monkeypatch, worker=worker)
     with pytest.raises(RegionControlError) as exc_info:
         _materialize_default_region(worker)
     assert exc_info.value.kind is RegionControlErrorKind.STORE_LIFECYCLE
@@ -1752,11 +1861,23 @@ class _RecordingLease:
         self.calls = calls
         self.fail = fail
         self.handle = 1
+        self.mapped_base = 0 if name == "payload" else 64
 
     def close(self) -> None:
         self.calls.append(self.name)
         if self.fail is not None:
             raise self.fail
+
+
+def _recording_attachment(ctx: MaterializationContext, name: str, lease: _RecordingLease) -> _RegionPartAttachment:
+    nonce = _owner_nonce_for(ctx.registry, validate_single_owner_region_shape(ctx).provider)
+    buffer_id = 1 if name == "payload" else 2
+    nbytes = 64 if name == "payload" else 128
+    return _RegionPartAttachment(
+        RegionPartKind.PAYLOAD if name == "payload" else RegionPartKind.COUNTER,
+        _posix_descriptor(owner_nonce=nonce, buffer_id=buffer_id, nbytes=nbytes, token=f"rec_{name}"),
+        lease,
+    )
 
 
 def test_delegated_allocate_dispatch_is_serialized_and_burns_ids():
@@ -1868,8 +1989,8 @@ def test_delegated_identity_requires_track_and_skips_uncertainty_release():
     instance._bind_delegated_identity(_DELEGATED_SESSION_A, 1, b"L3/L2[1]")
     instance._state = RegionInstanceState.LIVE
     mapping_calls: list[str] = []
-    instance._payload_mapping = _RecordingLease("payload", mapping_calls)
-    instance._counter_mapping = _RecordingLease("counter", mapping_calls)
+    instance._payload_attachment = _recording_attachment(ctx, "payload", _RecordingLease("payload", mapping_calls))
+    instance._counter_attachment = _recording_attachment(ctx, "counter", _RecordingLease("counter", mapping_calls))
     instance._close_owned(poison_on_error=False)
     assert releases == []
     assert mapping_calls == ["payload", "counter"]
@@ -1897,8 +2018,10 @@ def test_committed_allocated_installs_release_edge_and_close_sends_once():
     mapping_calls: list[str] = []
     payload_error = RuntimeError("payload mapping close failed")
     instance._state = RegionInstanceState.LIVE
-    instance._payload_mapping = _RecordingLease("payload", mapping_calls, fail=payload_error)
-    instance._counter_mapping = _RecordingLease("counter", mapping_calls)
+    instance._payload_attachment = _recording_attachment(
+        ctx, "payload", _RecordingLease("payload", mapping_calls, fail=payload_error)
+    )
+    instance._counter_attachment = _recording_attachment(ctx, "counter", _RecordingLease("counter", mapping_calls))
     with pytest.raises(RuntimeError, match="payload mapping close failed"):
         instance._close_owned(poison_on_error=False)
     assert mapping_calls == ["payload", "counter"]
@@ -1954,12 +2077,19 @@ def test_delegated_shape_refuses_aicore_without_dispatch():
     assert core.value.reason is RefusalReason.UNSUPPORTED_PROVIDER_DEPLOYMENT
 
 
-def _posix_allocated_reply(session: bytes, transaction_id: int, *, payload_bytes: int, counter_bytes: int):
+def _posix_allocated_reply(
+    session: bytes,
+    transaction_id: int,
+    *,
+    payload_bytes: int,
+    counter_bytes: int,
+    owner_nonce: bytes,
+    payload_token: str = "pto_payload_a",
+    counter_token: str = "pto_counter_a",
+):
     from simpler.comm_provider import (
-        PosixShmImport,
         RegionAllocationResult,
         RegionExportDescriptor,
-        RegionPartExportDescriptor,
         RegionPartKind,
         RegionPartLocalView,
     )
@@ -1968,17 +2098,17 @@ def _posix_allocated_reply(session: bytes, transaction_id: int, *, payload_bytes
     result = RegionAllocationResult(
         provider_resource_id=11,
         export_descriptor=RegionExportDescriptor(
-            payload=RegionPartExportDescriptor(
-                planned_backing_kind=ce.BackendKind.VMM_WINDOW,
-                logical_bytes=payload_bytes,
-                mapping_bytes=payload_bytes,
-                import_capability=PosixShmImport(shm_name="/pto_payload_a"),
+            payload=_posix_descriptor(
+                owner_nonce=owner_nonce,
+                buffer_id=1,
+                nbytes=payload_bytes,
+                token=payload_token,
             ),
-            counter=RegionPartExportDescriptor(
-                planned_backing_kind=ce.BackendKind.VMM_WINDOW,
-                logical_bytes=counter_bytes,
-                mapping_bytes=counter_bytes,
-                import_capability=PosixShmImport(shm_name="/pto_counter_a"),
+            counter=_posix_descriptor(
+                owner_nonce=owner_nonce,
+                buffer_id=2,
+                nbytes=counter_bytes,
+                token=counter_token,
             ),
         ),
     )
@@ -2000,45 +2130,17 @@ class _TestDelegatedImportFailure(BaseException):
     pass
 
 
-def _posix_inconsistent_allocated_reply(session: bytes, transaction_id: int, *, payload_bytes: int, counter_bytes: int):
-    from simpler.comm_provider import (
-        PosixShmImport,
-        RegionAllocationResult,
-        RegionExportDescriptor,
-        RegionPartExportDescriptor,
-        RegionPartKind,
-        RegionPartLocalView,
-    )
-    from simpler.comm_provider_control import DelegatedAllocateReply, DelegatedAllocateReplyTag, encode_reply
-
-    result = RegionAllocationResult(
-        provider_resource_id=11,
-        export_descriptor=RegionExportDescriptor(
-            payload=RegionPartExportDescriptor(
-                planned_backing_kind=ce.BackendKind.VMM_WINDOW,
-                logical_bytes=payload_bytes,
-                mapping_bytes=payload_bytes,
-                import_capability=PosixShmImport(shm_name="/pto_same_token"),
-            ),
-            counter=RegionPartExportDescriptor(
-                planned_backing_kind=ce.BackendKind.VMM_WINDOW,
-                logical_bytes=counter_bytes,
-                mapping_bytes=counter_bytes,
-                import_capability=PosixShmImport(shm_name="/pto_same_token"),
-            ),
-        ),
-    )
-    payload = RegionPartLocalView(part=RegionPartKind.PAYLOAD, local_base=0x1000, logical_bytes=payload_bytes)
-    counter = RegionPartLocalView(part=RegionPartKind.COUNTER, local_base=0x2000, logical_bytes=counter_bytes)
-    return encode_reply(
-        DelegatedAllocateReply(
-            tag=DelegatedAllocateReplyTag.ALLOCATED,
-            session_instance_id=session,
-            transaction_id=transaction_id,
-            result=result,
-            payload_view=payload,
-            counter_view=counter,
-        )
+def _posix_inconsistent_allocated_reply(
+    session: bytes, transaction_id: int, *, payload_bytes: int, counter_bytes: int, owner_nonce: bytes
+):
+    return _posix_allocated_reply(
+        session,
+        transaction_id,
+        payload_bytes=payload_bytes,
+        counter_bytes=counter_bytes,
+        owner_nonce=owner_nonce,
+        payload_token="pto_same_token",
+        counter_token="pto_same_token",
     )
 
 
@@ -2071,7 +2173,6 @@ def _install_delegated_dispatch(
     import_error: Optional[BaseException] = None,
     reply_factory=None,
 ) -> None:
-    from simpler.comm_provider import PosixShmImport
     from simpler.comm_provider_control import parse_request
 
     close_calls = close_calls if close_calls is not None else []
@@ -2083,11 +2184,13 @@ def _install_delegated_dispatch(
         request = envelope.decode_terminal()
         dispatches.append(view.tobytes())
         factory = reply_factory if reply_factory is not None else _posix_allocated_reply
+        provider = worker._get_endpoint_registry()._by_key[(request.provider_path.decode(), ce.DEVICE_AICPU)]
         return factory(
             request.session_instance_id,
             request.transaction_id,
             payload_bytes=int(request.payload_logical_bytes),
             counter_bytes=int(request.counter_logical_bytes),
+            owner_nonce=_owner_nonce_for(worker._get_endpoint_registry(), provider),
         )
 
     def _import(*_args, **_kwargs):
@@ -2100,7 +2203,6 @@ def _install_delegated_dispatch(
 
     worker._dispatch_delegated_allocate = _dispatch
     worker._import_region_part_lease = _import
-    worker._provider_import_capability_type = lambda: PosixShmImport
 
 
 def test_l3_and_l4_plans_use_the_same_delegated_materializer_core():
@@ -2115,6 +2217,7 @@ def test_l3_and_l4_plans_use_the_same_delegated_materializer_core():
 
     l4_dispatches: list[bytes] = []
     l4_worker = _l4_with_local_l3(device_ids=[4])
+    l4_worker._config = {**l4_worker._config, "platform": "a2a3sim", "device_ids": [4]}
     l4_ctx = _context(
         l4_worker,
         [ce.at("L4", ce.HOST_CPU), ce.at("L4/L3[0]/L2[0]", ce.DEVICE_AICPU)],
@@ -2282,3 +2385,103 @@ def test_delegated_clean_backend_failure_preserves_typed_fields():
     live = materialize_region_instance(ctx)
     assert live._delegated_transaction_id == 2
     assert live.state is RegionInstanceState.LIVE
+
+
+@pytest.mark.parametrize("allocator_state", [False, None])
+def test_allocator_absent_refuses_before_dispatch(allocator_state):
+    ctx = _accepted_context()
+    ctx.registry._buffer_identity_allocator_state = lambda *_args, **_kwargs: allocator_state
+    ctx.worker._dispatch_delegated_allocate = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("allocator refusal must not dispatch")
+    )
+    with pytest.raises(MaterializationRefusal) as excinfo:
+        materialize_region_instance(ctx)
+    assert excinfo.value.reason is RefusalReason.UNSUPPORTED_PROVIDER_DEPLOYMENT
+    assert ctx.worker._region_instance_registry._instances == {}
+    assert ctx.worker._region_instance_registry._next_delegated_transaction_id == 1
+
+
+def test_wrong_owner_nonce_is_session_fatal_without_import():
+    ctx = _accepted_context()
+    captured: dict[str, RegionInstance] = {}
+    original_track = ctx.worker._region_instance_registry.track
+
+    def _track(instance, resources):
+        captured["instance"] = instance
+        return original_track(instance, resources)
+
+    ctx.worker._region_instance_registry.track = _track  # type: ignore[method-assign]
+    dispatches: list[bytes] = []
+    import_calls: list[str] = []
+    releases: list[dict[str, object]] = []
+    foreign = bytes(range(8))
+
+    def _wrong_owner(session, transaction_id, *, payload_bytes, counter_bytes, owner_nonce):
+        del owner_nonce
+        return _posix_allocated_reply(
+            session,
+            transaction_id,
+            payload_bytes=payload_bytes,
+            counter_bytes=counter_bytes,
+            owner_nonce=foreign,
+        )
+
+    _install_delegated_dispatch(ctx.worker, dispatches, import_calls=import_calls, reply_factory=_wrong_owner)
+    ctx.worker._dispatch_delegated_release = lambda **kwargs: releases.append(kwargs) or ProviderReleaseResult(
+        provider_resource_id=11, status=ProviderReleaseStatus.RELEASED
+    )
+    with pytest.raises(RuntimeError, match="admitted Provider"):
+        materialize_region_instance(ctx)
+    assert captured["instance"]._delegated_allocation_committed is False
+    assert import_calls == []
+    assert releases == []
+    assert ctx.worker._delegated_session_fatal is not None
+
+
+def test_epoch_change_after_allocated_latches_fatal_without_import():
+    ctx = _accepted_context()
+    captured: dict[str, RegionInstance] = {}
+    original_track = ctx.worker._region_instance_registry.track
+
+    def _track(instance, resources):
+        captured["instance"] = instance
+        return original_track(instance, resources)
+
+    ctx.worker._region_instance_registry.track = _track  # type: ignore[method-assign]
+    dispatches: list[bytes] = []
+    import_calls: list[str] = []
+    releases: list[dict[str, object]] = []
+    _install_delegated_dispatch(ctx.worker, dispatches, import_calls=import_calls)
+    original_dispatch = ctx.worker._dispatch_delegated_allocate
+
+    def _stale(staged):
+        reply = original_dispatch(staged)
+        ctx.worker._invalidate_endpoint_registry()
+        return reply
+
+    ctx.worker._dispatch_delegated_allocate = _stale
+    ctx.worker._dispatch_delegated_release = lambda **kwargs: releases.append(kwargs) or ProviderReleaseResult(
+        provider_resource_id=11, status=ProviderReleaseStatus.RELEASED
+    )
+    with pytest.raises(MaterializationRefusal) as excinfo:
+        materialize_region_instance(ctx)
+    assert excinfo.value.reason is RefusalReason.REGISTRY_MISMATCH
+    assert captured["instance"]._delegated_allocation_committed is False
+    assert import_calls == []
+    assert releases == []
+    assert ctx.worker._delegated_session_fatal is excinfo.value
+
+
+def test_typed_attachment_keeps_provider_identity(region_worker):
+    worker, _calls, leases = region_worker()
+    instance = _materialize_default_region(worker)
+    nonce = _aicpu_owner_nonce(worker, 1)
+    assert instance._payload_attachment is not None
+    assert instance._counter_attachment is not None
+    assert bytes(instance._payload_attachment.identity.owner_instance_id) == nonce
+    assert bytes(instance._counter_attachment.identity.owner_instance_id) == nonce
+    assert instance._payload_attachment.identity.buffer_id != instance._counter_attachment.identity.buffer_id
+    assert instance._payload_attachment.identity.generation == 1
+    assert instance._payload_attachment.native_lease is leases[0]
+    assert not hasattr(instance, "_payload_mapping")
+    assert not hasattr(instance, "_counter_mapping")
