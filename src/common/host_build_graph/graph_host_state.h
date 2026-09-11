@@ -93,5 +93,11 @@ size_t graph_host_upload_count(const GraphHostState &state);
 // Arena bytes this run has claimed: the prefix its objects occupy, and so the
 // length of the region an upload must ship for the objects built in place.
 size_t graph_host_arena_used(const GraphHostState &state);
+// Rebind after the upload owner grows staging while preserving its contents.
+// Recording must have completed; offsets and spill ownership remain unchanged.
+bool graph_host_rebind_staging(GraphHostState &state, void *base, size_t capacity);
 std::optional<GraphHostUpload> graph_host_upload(GraphHostState &state, size_t index);
 GraphHostDefinitionList graph_host_definitions(GraphHostState &state);
+
+// Borrowed Definition image, valid under the same workspace lease as the build.
+const std::byte *graph_host_definition_data(const GraphHostState &state, uint64_t full_key);

@@ -184,6 +184,7 @@ static_assert(
  * commits/attaches the arena before Phase 2/3.
  */
 RuntimeArenaLayout runtime_reserve_layout(DeviceArena &arena, uint64_t task_capacity);
+RuntimeArenaLayout runtime_reserve_layout(DeviceArena &arena, uint64_t task_capacity, uint64_t ready_capacity);
 
 /**
  * Phase 2 — write the data half of the runtime arena: standalone fields,

@@ -1327,6 +1327,23 @@ std::optional<GraphHostUpload> graph_host_upload(GraphHostState &state, size_t i
 
 size_t graph_host_arena_used(const GraphHostState &state) { return state.arena_cursor.load(std::memory_order_acquire); }
 
+bool graph_host_rebind_staging(GraphHostState &state, void *base, size_t capacity) {
+    if (base == nullptr || state.arena.object_align == 0 || capacity < graph_host_arena_used(state) ||
+        reinterpret_cast<uintptr_t>(base) % state.arena.object_align != 0) {
+        return false;
+    }
+    state.arena.base = static_cast<std::byte *>(base);
+    state.arena.capacity = capacity;
+    return true;
+}
+
+const std::byte *graph_host_definition_data(const GraphHostState &state, uint64_t full_key) {
+    const auto it = state.definitions.find(full_key);
+    return it == state.definitions.end() ?
+               nullptr :
+               reinterpret_cast<const std::byte *>(graph_record_definition(state, it->second));
+}
+
 GraphHostDefinitionList graph_host_definitions(GraphHostState &state) {
     GraphHostDefinitionList list;
     list.entries.reserve(state.definitions.size());

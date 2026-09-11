@@ -253,12 +253,22 @@ void ChipWorker::init(
         comm_global_domain_release_fn_ = load_symbol<CommGlobalDomainReleaseFn>(handle, "comm_global_domain_release");
         comm_barrier_fn_ = load_symbol<CommBarrierFn>(handle, "comm_barrier");
         comm_destroy_fn_ = load_symbol<CommDestroyFn>(handle, "comm_destroy");
+        // Kernel-mode lifecycle entries are part of the uniform host_runtime.so
+        // ABI like the ACL/comm group above: every runtime exports them, and
+        // variants without kernel-mode support ship validating stubs.
+        kernel_ctx_control_fn_ = load_symbol<SimplerKernelCtxControlFn>(handle, "simpler_kernel_mode_ctx_control");
+        kernel_supported_fn_ = load_symbol<SimplerKernelSupportedFn>(handle, "simpler_kernel_mode_supported");
+        kernel_init_fn_ = load_symbol<SimplerKernelInitFn>(handle, "simpler_kernel_mode_init");
+        kernel_prepare_callable_fn_ =
+            load_symbol<SimplerKernelPrepareCallableFn>(handle, "simpler_kernel_mode_prepare_callable");
+        kernel_launch_fn_ = load_symbol<SimplerKernelLaunchFn>(handle, "simpler_kernel_mode_launch");
     } catch (...) {
         throw;
     }
 
     const PipelineContract *contract = get_pipeline_contract_fn();
-    if (!is_valid_pipeline_contract(contract) || !has_serviceable_arena_topology(*contract)) {
+    if (!is_valid_pipeline_contract(contract) || !has_serviceable_arena_topology(*contract) ||
+        !has_serviceable_stream_topology(*contract)) {
         throw std::runtime_error("host runtime returned a PipelineContract this build cannot accept");
     }
     const PipelineContract resolved_contract = *contract;
