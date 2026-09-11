@@ -15,6 +15,8 @@
 #include <string>
 #include <vector>
 
+#include "common/scheduler_cluster_partition.h"
+
 namespace pto::a5 {
 
 // Per-cpu_id metadata used by the packing algorithm. Filled from CPU_TOPO
@@ -94,6 +96,11 @@ bool probe_aicpu_topology(
 // Enumerate OCCUPY set bits without inferring any topology relationships.
 // Returns false when the mask is empty.
 bool enumerate_cpus_from_occupy(uint64_t occupy, std::vector<AicpuLogicalCpu> &out_user_cpus);
+
+// Selects contiguous cluster ownership only when the driver topology, or a
+// verified JSON fallback after an incomplete driver result, exactly covers the
+// device OCCUPY population. All other states retain round-robin ownership.
+SchedulerClusterAssignment select_scheduler_cluster_assignment(const AicpuTopology &topology);
 
 // Load the full logical CPU_TOPO for a packaged fallback whose SoC and every
 // constraint declared by that entry (host architecture and/or OCCUPY) match.

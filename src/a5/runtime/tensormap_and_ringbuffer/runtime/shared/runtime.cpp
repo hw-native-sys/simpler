@@ -37,6 +37,7 @@ Runtime::Runtime() {
     memset(dev.aicpu_allowed_cpus, 0, sizeof(dev.aicpu_allowed_cpus));
     dev.aicpu_allowed_cpu_count = 0;
     dev.aicpu_launch_count = 0;
+    dev.scheduler_cluster_assignment = pto::a5::SchedulerClusterAssignment::kRoundRobin;
     dev.serial_orch_sched = false;
     dev.gm_sm_ptr_ = nullptr;
     dev.orch_args_storage_.clear();

@@ -312,9 +312,10 @@ void SchedulerContext::log_stall_diagnostics(
     }
 
     // CLUSTER lines: one per cluster this thread owns.
-    // cluster_id = local_cluster_idx * active_sched_threads_ + thread_idx, matching the
-    // round-robin assignment in assign_cores_to_threads.
     int32_t ast = active_sched_threads_ > 0 ? active_sched_threads_ : aicpu_thread_num_;
+    const int32_t cluster_begin = scheduler_cluster_assignment_ == pto::a5::SchedulerClusterAssignment::kContiguous ?
+                                      pto::a5::scheduler_cluster_range(aic_count_, ast, thread_idx).begin :
+                                      thread_idx;
     for (int32_t cli = 0; cli < tracker.get_cluster_count() && cli < STALL_DUMP_CORE_MAX; cli++) {
         int32_t offset = cli * PLATFORM_CORES_PER_BLOCKDIM;
         int32_t aic_id = tracker.get_aic_core_id(offset);
@@ -323,7 +324,9 @@ void SchedulerContext::log_stall_diagnostics(
         bool aic_idle = tracker.is_aic_core_idle(offset);
         bool aiv0_idle = tracker.is_aiv0_core_idle(offset);
         bool aiv1_idle = tracker.is_aiv1_core_idle(offset);
-        int32_t cluster_id = cli * ast + thread_idx;
+        int32_t cluster_id = scheduler_cluster_assignment_ == pto::a5::SchedulerClusterAssignment::kContiguous ?
+                                 cluster_begin + cli :
+                                 cli * ast + thread_idx;
         char aic_buf[128], aiv0_buf[128], aiv1_buf[128];
         format_core_status(
             aic_buf, sizeof(aic_buf), aic_id, aic_idle, &core_exec_states_[aic_id], core_exec_states_[aic_id].reg_addr
@@ -796,16 +799,22 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
 
 // Handshake exactly the cores this scheduler thread will later manage. Blocked
 // core layout ([0,N/3) AIC, [N/3,N) AIV) makes ownership predictable before
-// handshake: cluster ci = {ci, N/3+2ci, N/3+2ci+1}, assigned to thread
-// ci % active_threads. Same protocol as handshake_partition, but over the owned
-// set instead of a contiguous slice.
+// handshake. Same protocol as handshake_partition, but over the owned set
+// instead of a contiguous slice.
 void SchedulerContext::handshake_owned_clusters(Runtime *runtime, int32_t tidx, int32_t active_threads) {
     Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
     const int32_t aic_n = cores_total_num_ / PLATFORM_CORES_PER_BLOCKDIM;
 
+    const auto range = pto::a5::scheduler_cluster_range(aic_n, active_threads, tidx);
+    const int32_t first =
+        scheduler_cluster_assignment_ == pto::a5::SchedulerClusterAssignment::kContiguous ? range.begin : tidx;
+    const int32_t limit =
+        scheduler_cluster_assignment_ == pto::a5::SchedulerClusterAssignment::kContiguous ? range.end : aic_n;
+    const int32_t stride =
+        scheduler_cluster_assignment_ == pto::a5::SchedulerClusterAssignment::kContiguous ? 1 : active_threads;
     int32_t owned[RUNTIME_MAX_WORKER];
     int32_t own_n = 0;
-    for (int32_t ci = tidx; ci < aic_n; ci += active_threads) {
+    for (int32_t ci = first; ci < limit; ci += stride) {
         owned[own_n++] = ci;                  // AIC
         owned[own_n++] = aic_n + 2 * ci;      // AIV0
         owned[own_n++] = aic_n + 2 * ci + 1;  // AIV1
@@ -894,9 +903,8 @@ void SchedulerContext::handshake_owned_clusters(Runtime *runtime, int32_t tidx, 
 }
 
 // =============================================================================
-// Per-thread self-assignment (barrier-free init). Thread tidx owns the clusters
-// ci with ci % active_sched_threads_ == tidx (same round-robin as
-// assign_cores_to_threads), and the blocked layout gives their worker ids
+// Per-thread self-assignment (barrier-free init). The assignment mode selects
+// the clusters for thread tidx, and the blocked layout gives their worker ids
 // directly, so a thread populates its own CoreTracker + per-core sub_block_id
 // right after handshaking its own clusters, with no all-thread barrier.
 // =============================================================================
@@ -904,9 +912,16 @@ void SchedulerContext::assign_own_clusters(int32_t tidx) {
     const int32_t aic_n = cores_total_num_ / PLATFORM_CORES_PER_BLOCKDIM;
     const int32_t active = active_sched_threads_;
 
+    const auto range = pto::a5::scheduler_cluster_range(aic_n, active, tidx);
+    const int32_t first =
+        scheduler_cluster_assignment_ == pto::a5::SchedulerClusterAssignment::kContiguous ? range.begin : tidx;
+    const int32_t limit =
+        scheduler_cluster_assignment_ == pto::a5::SchedulerClusterAssignment::kContiguous ? range.end : aic_n;
+    const int32_t stride =
+        scheduler_cluster_assignment_ == pto::a5::SchedulerClusterAssignment::kContiguous ? 1 : active;
     CoreTracker &tracker = core_trackers_[tidx];
     int32_t own_n = 0;
-    for (int32_t ci = tidx; ci < aic_n; ci += active)
+    for (int32_t ci = first; ci < limit; ci += stride)
         own_n++;
     // Mirrors the check assign_cores_to_threads() makes on the serial path. A
     // thread owning more clusters than CoreTracker can hold used to write past
@@ -924,7 +939,7 @@ void SchedulerContext::assign_own_clusters(int32_t tidx) {
     tracker.init(own_n);
 
     int32_t local = 0;
-    for (int32_t ci = tidx; ci < aic_n; ci += active) {
+    for (int32_t ci = first; ci < limit; ci += stride) {
         tracker.set_cluster(local++, ci, aic_n + 2 * ci, aic_n + 2 * ci + 1);
     }
 
@@ -989,10 +1004,9 @@ void SchedulerContext::post_handshake_profiling_init() {
 }
 
 // =============================================================================
-// Assign discovered cores to scheduler threads (cluster-aligned round-robin).
+// Assign discovered cores to scheduler threads without splitting a cluster.
 // =============================================================================
 bool SchedulerContext::assign_cores_to_threads() {
-    // Cluster-aligned round-robin assignment: cluster ci -> sched thread ci % active_sched_threads_.
     // Each cluster = 1 AIC + 2 adjacent AIV; the triple is always kept together.
     active_sched_threads_ = (sched_thread_num_ > 0) ? sched_thread_num_ : aicpu_thread_num_;
     int32_t cluster_count = aic_count_;
@@ -1007,17 +1021,21 @@ bool SchedulerContext::assign_cores_to_threads() {
     }
 
     LOG_INFO(
-        "Assigning cores (round-robin): %d clusters across %d sched threads (%d AIC, %d AIV)", cluster_count,
-        active_sched_threads_, aic_count_, aiv_count_
+        "Assigning cores (%s): %d clusters across %d sched threads (%d AIC, %d AIV)",
+        scheduler_cluster_assignment_ == pto::a5::SchedulerClusterAssignment::kContiguous ? "contiguous" :
+                                                                                            "round-robin",
+        cluster_count, active_sched_threads_, aic_count_, aiv_count_
     );
 
     // running_reg_task_id / pending_reg_task_id for every serviced core are reset
     // in handshake_partition's sweep.
 
-    // Count clusters per thread first (round-robin may distribute unevenly)
+    // Count clusters per thread before sizing their trackers.
     int32_t clusters_per_thread[MAX_AICPU_THREADS] = {};
     for (int32_t ci = 0; ci < cluster_count; ci++) {
-        clusters_per_thread[ci % active_sched_threads_]++;
+        const int32_t owner =
+            pto::a5::scheduler_cluster_owner(scheduler_cluster_assignment_, cluster_count, active_sched_threads_, ci);
+        clusters_per_thread[owner]++;
     }
     for (int32_t i = 0; i < active_sched_threads_; i++) {
         core_trackers_[i].init(clusters_per_thread[i]);
@@ -1026,7 +1044,8 @@ bool SchedulerContext::assign_cores_to_threads() {
     int32_t cluster_idx_per_thread[MAX_AICPU_THREADS] = {};
 
     for (int32_t ci = 0; ci < cluster_count; ci++) {
-        int32_t t = ci % active_sched_threads_;
+        int32_t t =
+            pto::a5::scheduler_cluster_owner(scheduler_cluster_assignment_, cluster_count, active_sched_threads_, ci);
 
         int32_t aic_wid = aic_worker_ids_[ci];
         int32_t aiv0_wid = aiv_worker_ids_[2 * ci];
@@ -1088,6 +1107,7 @@ int32_t SchedulerContext::pre_handshake_init(
     // Wire thread/transition configuration that handshake/assign need to read.
     aicpu_thread_num_ = aicpu_thread_num;
     sched_thread_num_ = sched_thread_num;
+    scheduler_cluster_assignment_ = runtime->get_scheduler_cluster_assignment();
     regs_ = regs_base;
 
 #if SIMPLER_DFX
