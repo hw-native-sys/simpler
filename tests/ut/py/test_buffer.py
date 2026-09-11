@@ -10,10 +10,10 @@
 
 The three wire types are the C++ structs of buffer.h bound directly, so what is pinned here is the
 Python-visible contract over them — construction rejects what `validate_buffer_descriptor` rejects,
-and equality and hashing ignore wire padding. There is deliberately no `pack`/`unpack`: no Python
-path turns these types into bytes or back, which is what keeps construction the only way in.
-Imports come from `simpler.buffer` because that is where a caller reaches them, alongside the
-registry and the Buffer constructors that are genuinely defined there.
+and equality and hashing ignore wire padding. There is no public `pack`/`unpack`; the only Python
+byte path is the module-private 88-byte codec on `_task_interface`, and decode reuses the canonical
+validator. Imports come from `simpler.buffer` because that is where a caller reaches them, alongside
+the registry and the Buffer constructors that are genuinely defined there.
 """
 
 import ctypes
@@ -23,7 +23,13 @@ from multiprocessing.shared_memory import SharedMemory
 from unittest.mock import patch
 
 import pytest
-from _task_interface import OWNER_INSTANCE_ID_BYTES, DataType
+from _task_interface import (
+    OWNER_INSTANCE_ID_BYTES,
+    DataType,
+    _decode_buffer_descriptor_wire,
+    _encode_buffer_descriptor_wire,
+)
+from simpler import buffer as buffer_mod
 from simpler.buffer import (
     AccessMode,
     AddressSpace,
@@ -45,7 +51,15 @@ from simpler.buffer import (
     wrap_fork_inherited,
     wrap_vmm_window,
 )
-from simpler.comm_endpoints import DEVICE_AICPU, HOST_CPU, AdapterKind, AdapterProfile, RegionAccessReasonCode
+from simpler.comm_endpoints import (
+    DEVICE_AICPU,
+    HOST_CPU,
+    AdapterKind,
+    AdapterProfile,
+    BufferAccessQuery,
+    RegionAccessReasonCode,
+    buffer_adapter_candidates,
+)
 from simpler.task_interface import ChipTensor
 
 _OID = bytes(range(0xA0, 0xA0 + OWNER_INSTANCE_ID_BYTES))
@@ -77,12 +91,23 @@ def _identity(oid=_OID, buffer_id=7, generation=2):
     return CanonicalIdentity(oid, buffer_id, generation)
 
 
+def _vmm_shareable_body(device_id=0, shareable_handle=0x1111, mapping_bytes=64):
+    return (
+        int(device_id).to_bytes(4, "little", signed=True)
+        + (0).to_bytes(4, "little")
+        + int(shareable_handle).to_bytes(8, "little")
+        + int(mapping_bytes).to_bytes(8, "little")
+    )
+
+
 def _legal_body(backend: BackendKind) -> bytes:
     """A body that satisfies ``backend``'s schema, so a rejection is attributable to something else."""
     if backend == BackendKind.POSIX_SHM:
         return b"psm_legal"
     if backend == BackendKind.REMOTE_SIDECAR:
         return b""
+    if backend == BackendKind.VMM_SHAREABLE:
+        return _vmm_shareable_body()
     return (0x1000).to_bytes(8, "little")  # the four address-bearing backends
 
 
@@ -732,6 +757,7 @@ def test_owner_instance_ids_are_distinct():
     [
         (AddressSpace.HOST, BackendKind.VMM_WINDOW),
         (AddressSpace.HOST, BackendKind.DEVICE_MALLOC),
+        (AddressSpace.HOST, BackendKind.VMM_SHAREABLE),
         (AddressSpace.DEVICE, BackendKind.FORK_SHM),
         (AddressSpace.DEVICE, BackendKind.POSIX_SHM),
     ],
@@ -757,6 +783,7 @@ def test_descriptor_accepts_legal_combos():
         (AddressSpace.HOST, BackendKind.POSIX_SHM),
         (AddressSpace.DEVICE, BackendKind.VMM_WINDOW),
         (AddressSpace.DEVICE, BackendKind.DEVICE_MALLOC),
+        (AddressSpace.DEVICE, BackendKind.VMM_SHAREABLE),
         (AddressSpace.HOST, BackendKind.REMOTE_SIDECAR),
         (AddressSpace.DEVICE, BackendKind.REMOTE_SIDECAR),
     ]:
@@ -888,3 +915,161 @@ def test_mapped_arg_buffer_is_read_only_for_a_read_access_descriptor():
     assert view.readonly
     with pytest.raises(TypeError):
         view.cast("B")[0:4] = b"\x01\x02\x03\x04"
+
+
+def test_backend_kind_vmm_shareable_is_six_and_existing_values_stay_frozen():
+    assert int(BackendKind.FORK_SHM) == 0
+    assert int(BackendKind.POSIX_SHM) == 1
+    assert int(BackendKind.VMM_WINDOW) == 2
+    assert int(BackendKind.REMOTE_SIDECAR) == 3
+    assert int(BackendKind.DEVICE_MALLOC) == 4
+    assert int(BackendKind.FORK_COW) == 5
+    assert int(BackendKind.VMM_SHAREABLE) == 6
+
+
+def _vmm_shareable_descriptor(*, nbytes=64, body=None, access=AccessMode.READWRITE):
+    return BufferDescriptor(
+        identity=_identity(),
+        address_space=AddressSpace.DEVICE,
+        access=access,
+        backend_kind=BackendKind.VMM_SHAREABLE,
+        nbytes=nbytes,
+        body=_vmm_shareable_body() if body is None else body,
+    )
+
+
+def test_construction_rejects_malformed_vmm_shareable_bodies():
+    for bad in (b"", b"\x00" * 8, b"\x00" * 23, b"\x00" * 25, b"\x00" * 32):
+        with pytest.raises(ValueError, match="exactly 24 bytes"):
+            _vmm_shareable_descriptor(body=bad)
+
+    reserved = bytearray(_vmm_shareable_body())
+    reserved[4] = 1
+    with pytest.raises(ValueError, match="reserved"):
+        _vmm_shareable_descriptor(body=bytes(reserved))
+
+    with pytest.raises(ValueError, match="shareable_handle"):
+        _vmm_shareable_descriptor(body=_vmm_shareable_body(shareable_handle=0))
+
+    with pytest.raises(ValueError, match="mapping_bytes"):
+        _vmm_shareable_descriptor(body=_vmm_shareable_body(mapping_bytes=0))
+
+    with pytest.raises(ValueError, match="mapping_bytes"):
+        _vmm_shareable_descriptor(nbytes=64, body=_vmm_shareable_body(mapping_bytes=63))
+
+    with pytest.raises(ValueError, match="device_id"):
+        _vmm_shareable_descriptor(body=_vmm_shareable_body(device_id=-1))
+
+
+def test_buffer_descriptor_wire_codec_round_trips_and_zeros_padding():
+    desc = _vmm_shareable_descriptor(nbytes=96, body=_vmm_shareable_body(device_id=3, mapping_bytes=128))
+    wire = _encode_buffer_descriptor_wire(desc)
+    assert len(wire) == 88
+    assert wire[5:8] == b"\x00" * 3
+    assert wire[28:40] == b"\x00" * 12
+    assert wire[54:56] == b"\x00" * 2
+    assert wire[80:88] == b"\x00" * 8
+
+    decoded = _decode_buffer_descriptor_wire(wire)
+    assert decoded == desc
+    assert decoded.identity == desc.identity
+    assert decoded.backend_kind is BackendKind.VMM_SHAREABLE
+    assert decoded.nbytes == 96
+    assert decoded.body == _vmm_shareable_body(device_id=3, mapping_bytes=128)
+    assert _encode_buffer_descriptor_wire(decoded) == wire
+
+
+def test_buffer_descriptor_wire_codec_rejects_malformed_input():
+    desc = _vmm_shareable_descriptor()
+    wire = bytearray(_encode_buffer_descriptor_wire(desc))
+
+    with pytest.raises(ValueError, match="exactly 88 bytes"):
+        _decode_buffer_descriptor_wire(bytes(wire[:-1]))
+    with pytest.raises(ValueError, match="exactly 88 bytes"):
+        _decode_buffer_descriptor_wire(bytes(wire) + b"\x00")
+
+    dirty_reserved = bytearray(wire)
+    dirty_reserved[60] = 1  # body reserved at body[4]
+    with pytest.raises(ValueError, match="reserved"):
+        _decode_buffer_descriptor_wire(bytes(dirty_reserved))
+
+    dirty_tail = bytearray(wire)
+    dirty_tail[80] = 1  # unused body tail
+    with pytest.raises(ValueError, match="reserved bytes"):
+        _decode_buffer_descriptor_wire(bytes(dirty_tail))
+
+    dirty_handle = bytearray(wire)
+    dirty_handle[64:72] = (0).to_bytes(8, "little")
+    with pytest.raises(ValueError, match="shareable_handle"):
+        _decode_buffer_descriptor_wire(bytes(dirty_handle))
+
+    dirty_pad = bytearray(wire)
+    dirty_pad[5] = 0xA5
+    dirty_pad[54] = 0xA5
+    assert _decode_buffer_descriptor_wire(bytes(dirty_pad)) == desc
+
+
+def test_wrap_vmm_shareable_uses_supplied_identity_and_is_not_public():
+    identity = CanonicalIdentity(b"\x11" * OWNER_INSTANCE_ID_BYTES, 42, 3)
+    wrapped = buffer_mod._wrap_vmm_shareable(
+        device_ptr=0,
+        nbytes=64,
+        device_id=2,
+        mapping_bytes=128,
+        shareable_handle=0xABCD,
+        identity=identity,
+        owner_worker_path="L3/L2[1]",
+        owner_worker_id=7,
+    )
+    assert wrapped.identity == identity
+    assert wrapped.identity.buffer_id == 42
+    assert wrapped.identity.generation == 3
+    assert wrapped.address_space is AddressSpace.DEVICE
+    assert wrapped.access is AccessMode.READWRITE
+    assert wrapped.backend_kind is BackendKind.VMM_SHAREABLE
+    assert wrapped.nbytes == 64
+    assert wrapped.body == _vmm_shareable_body(device_id=2, shareable_handle=0xABCD, mapping_bytes=128)
+    assert wrapped.base == 0
+    assert wrapped.shm is None
+    assert wrapped.owner_worker_id == 7
+
+    desc = wrapped.to_descriptor()
+    assert desc.identity == identity
+    assert desc.nbytes == 64
+    assert desc.body == wrapped.body
+
+    wrapped.close()
+    assert wrapped.closed
+    with pytest.raises(ValueError, match="released"):
+        wrapped.to_descriptor()
+    wrapped.close()
+    assert wrapped.closed
+
+    assert "_wrap_vmm_shareable" not in buffer_mod.__all__
+    assert not hasattr(BufferDescriptor, "pack")
+    assert not hasattr(BufferDescriptor, "unpack")
+
+
+def test_vmm_shareable_stays_closed_dispatch_in_importer_paths():
+    identity = _identity()
+    wrapped = buffer_mod._wrap_vmm_shareable(
+        device_ptr=0x1000,
+        nbytes=64,
+        device_id=0,
+        mapping_bytes=64,
+        shareable_handle=1,
+        identity=identity,
+    )
+    desc = wrapped.to_descriptor()
+    query = BufferAccessQuery(BackendKind.VMM_SHAREABLE, DEVICE_AICPU, True, True)
+    candidates = buffer_adapter_candidates(query)
+    assert candidates
+    assert all(c.profile is not AdapterProfile.DEVICE_LOCAL for c in candidates)
+    assert all(c.profile is not AdapterProfile.HOST_VMM_COPY for c in candidates)
+
+    chip = ImportContext(deployment=DEVICE_AICPU, device_owner_instance_id=bytes(identity.owner_instance_id))
+    with pytest.raises(ValueError, match="unsupported backend"):
+        select_adapter(desc, chip)
+    reg = ImportRegistry(chip)
+    with pytest.raises(ValueError, match="unsupported backend"):
+        reg.materialize(desc)

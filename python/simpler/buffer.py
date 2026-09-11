@@ -456,6 +456,44 @@ def wrap_vmm_window(
     )
 
 
+def _wrap_vmm_shareable(
+    device_ptr: int,
+    nbytes: int,
+    device_id: int,
+    mapping_bytes: int,
+    shareable_handle: int,
+    identity: CanonicalIdentity,
+    owner_worker_path: str = "",
+    owner_worker_id: int = 0,
+) -> Buffer:
+    """Wrap an already-exported shareable VMM mapping as a Region-private ``VMM_SHAREABLE`` ``Buffer``.
+
+    ``identity`` is the caller-supplied canonical identity; this helper does not mint a nonce or
+    buffer id. The body is the 24-byte overlay ``device_id``, reserved 0, ``shareable_handle``,
+    ``mapping_bytes``. ``nbytes`` is the logical footprint and is not replaced by the mapping span.
+    ``shm`` stays ``None``: physical VMM release stays with the caller. ``device_ptr`` is the
+    provider-local base and may be 0.
+    """
+    body = (
+        int(device_id).to_bytes(4, "little", signed=True)
+        + (0).to_bytes(4, "little")
+        + int(shareable_handle).to_bytes(8, "little")
+        + int(mapping_bytes).to_bytes(8, "little")
+    )
+    return Buffer(
+        identity=identity,
+        owner_worker_path_id=intern_worker_path(owner_worker_path),
+        address_space=AddressSpace.DEVICE,
+        access=AccessMode.READWRITE,
+        backend_kind=BackendKind.VMM_SHAREABLE,
+        nbytes=int(nbytes),
+        body=body,
+        shm=None,
+        base=int(device_ptr),
+        owner_worker_id=int(owner_worker_id),
+    )
+
+
 def _descriptor_delta(a: BufferDescriptor, b: BufferDescriptor) -> str:
     """The fields on which two descriptors differ, as ``name: old -> new``.
 

@@ -66,6 +66,28 @@ void set_address_body(Tensor &r, uint64_t base) {
     std::memcpy(r.buffer.body, &base, sizeof(base));
 }
 
+void set_vmm_shareable_body(BufferDescriptor &h, int32_t device_id, uint64_t handle, uint64_t mapping_bytes) {
+    std::memset(h.body, 0, DESC_MAX_BYTES);
+    h.body_len = static_cast<uint16_t>(VMM_SHAREABLE_BODY_BYTES);
+    std::memcpy(h.body, &device_id, sizeof(device_id));
+    uint32_t reserved = 0;
+    std::memcpy(h.body + 4, &reserved, sizeof(reserved));
+    std::memcpy(h.body + 8, &handle, sizeof(handle));
+    std::memcpy(h.body + 16, &mapping_bytes, sizeof(mapping_bytes));
+}
+
+BufferDescriptor make_vmm_shareable_descriptor() {
+    BufferDescriptor h{};
+    h.magic = BUFFER_DESCRIPTOR_MAGIC;
+    h.address_space = static_cast<uint8_t>(AddressSpace::DEVICE);
+    h.access = static_cast<uint8_t>(AccessMode::READWRITE);
+    h.backend_kind = static_cast<uint8_t>(BackendKind::VMM_SHAREABLE);
+    h.identity = make_identity();
+    h.nbytes = 64;
+    set_vmm_shareable_body(h, 0, 0x1111ULL, 128);
+    return h;
+}
+
 Tensor make_device_tensor() {
     Tensor r = make_tensor();
     r.buffer.backend_kind = static_cast<uint8_t>(BackendKind::DEVICE_MALLOC);
@@ -100,6 +122,7 @@ TEST(BufferAbi, EnumValuesAreFrozen) {
     EXPECT_EQ(static_cast<uint8_t>(BackendKind::REMOTE_SIDECAR), 3);
     EXPECT_EQ(static_cast<uint8_t>(BackendKind::DEVICE_MALLOC), 4);
     EXPECT_EQ(static_cast<uint8_t>(BackendKind::FORK_COW), 5);
+    EXPECT_EQ(static_cast<uint8_t>(BackendKind::VMM_SHAREABLE), 6);
 }
 
 // --- memcpy round trip -------------------------------------------------------------------------
@@ -294,6 +317,70 @@ TEST(BufferAbi, DecodeRejectsABodyThatDoesNotMatchItsBackend) {
     sidecar.buffer.body_len = 0;
     std::memset(sidecar.buffer.body, 0, DESC_MAX_BYTES);
     EXPECT_NO_THROW(validate_tensor(sidecar));
+}
+
+TEST(BufferAbi, VmmShareableAcceptsLegalDeviceBody) {
+    BufferDescriptor h = make_vmm_shareable_descriptor();
+    EXPECT_NO_THROW(validate_buffer_descriptor(h));
+
+    set_vmm_shareable_body(h, 0, 0x1ULL, 64);  // mapping_bytes == nbytes is legal
+    EXPECT_NO_THROW(validate_buffer_descriptor(h));
+}
+
+TEST(BufferAbi, VmmShareableRejectsHostAddressSpace) {
+    BufferDescriptor h = make_vmm_shareable_descriptor();
+    h.address_space = static_cast<uint8_t>(AddressSpace::HOST);
+    EXPECT_THROW(validate_buffer_descriptor(h), std::invalid_argument);
+}
+
+TEST(BufferAbi, VmmShareableRejectsMalformedBody) {
+    BufferDescriptor h = make_vmm_shareable_descriptor();
+    EXPECT_NO_THROW(validate_buffer_descriptor(h));
+
+    for (uint16_t bad_len : {uint16_t{0}, uint16_t{8}, uint16_t{23}, uint16_t{25}, uint16_t{DESC_MAX_BYTES}}) {
+        SCOPED_TRACE(bad_len);
+        BufferDescriptor bad = make_vmm_shareable_descriptor();
+        bad.body_len = bad_len;
+        EXPECT_THROW(validate_buffer_descriptor(bad), std::invalid_argument);
+    }
+
+    BufferDescriptor reserved = make_vmm_shareable_descriptor();
+    reserved.body[4] = 1;
+    EXPECT_THROW(validate_buffer_descriptor(reserved), std::invalid_argument);
+
+    BufferDescriptor tail = make_vmm_shareable_descriptor();
+    tail.body[24] = 1;
+    EXPECT_THROW(validate_buffer_descriptor(tail), std::invalid_argument);
+
+    BufferDescriptor zero_handle = make_vmm_shareable_descriptor();
+    set_vmm_shareable_body(zero_handle, 0, 0, 128);
+    EXPECT_THROW(validate_buffer_descriptor(zero_handle), std::invalid_argument);
+
+    BufferDescriptor zero_mapping = make_vmm_shareable_descriptor();
+    set_vmm_shareable_body(zero_mapping, 0, 0x1ULL, 0);
+    zero_mapping.nbytes = 0;
+    EXPECT_THROW(validate_buffer_descriptor(zero_mapping), std::invalid_argument);
+
+    BufferDescriptor short_mapping = make_vmm_shareable_descriptor();
+    set_vmm_shareable_body(short_mapping, 0, 0x1ULL, 63);
+    EXPECT_THROW(validate_buffer_descriptor(short_mapping), std::invalid_argument);
+
+    BufferDescriptor negative_device = make_vmm_shareable_descriptor();
+    set_vmm_shareable_body(negative_device, -1, 0x1ULL, 128);
+    EXPECT_THROW(validate_buffer_descriptor(negative_device), std::invalid_argument);
+
+    BufferDescriptor out_of_range = make_vmm_shareable_descriptor();
+    out_of_range.backend_kind = 7;
+    EXPECT_THROW(validate_buffer_descriptor(out_of_range), std::invalid_argument);
+}
+
+TEST(BufferAbi, VmmShareableIsNotAnAddressBearingEightByteBody) {
+    BufferDescriptor h = make_vmm_shareable_descriptor();
+    h.body_len = static_cast<uint16_t>(BACKEND_ADDRESS_BODY_BYTES);
+    uint64_t base = 0xDEAD0000ULL;
+    std::memset(h.body, 0, DESC_MAX_BYTES);
+    std::memcpy(h.body, &base, sizeof(base));
+    EXPECT_THROW(validate_buffer_descriptor(h), std::invalid_argument);
 }
 
 // The unused tail of `body` crosses a process boundary with the descriptor, so whatever the owner's
