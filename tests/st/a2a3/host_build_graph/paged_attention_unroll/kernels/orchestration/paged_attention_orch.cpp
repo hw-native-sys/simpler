@@ -101,17 +101,17 @@ static void process_qtile_scope(const CoreTaskArgs &ctx) {
     const simpler::hbg::Tensor &value_cache = ctx.tensor(2).ref();
     const simpler::hbg::Tensor &block_table = ctx.tensor(3).ref();
     const simpler::hbg::Tensor &out = ctx.tensor(4).ref();
-    uint64_t b_idx = ctx.scalar(0);
-    uint64_t q_idx = ctx.scalar(1);
-    uint64_t q_head_num = ctx.scalar(2);
-    uint64_t q_tile = ctx.scalar(3);
-    uint64_t head_dim = ctx.scalar(4);
-    uint64_t block_size = ctx.scalar(5);
-    uint64_t block_num = ctx.scalar(6);
-    uint64_t scale_value = ctx.scalar(7);
-    uint64_t bn_this_batch = ctx.scalar(8);
-    uint64_t cur_seq = ctx.scalar(9);
-    DataType data_type = ctx.scalar(10).to<DataType>();
+    uint64_t b_idx = ctx.scalar<uint64_t>(0);
+    uint64_t q_idx = ctx.scalar<uint64_t>(1);
+    uint64_t q_head_num = ctx.scalar<uint64_t>(2);
+    uint64_t q_tile = ctx.scalar<uint64_t>(3);
+    uint64_t head_dim = ctx.scalar<uint64_t>(4);
+    uint64_t block_size = ctx.scalar<uint64_t>(5);
+    uint64_t block_num = ctx.scalar<uint64_t>(6);
+    uint64_t scale_value = ctx.scalar<uint64_t>(7);
+    uint64_t bn_this_batch = ctx.scalar<uint64_t>(8);
+    uint64_t cur_seq = ctx.scalar<uint64_t>(9);
+    DataType data_type = ctx.scalar<DataType>(10);
 
     CYCLE_COUNT_START();
 
@@ -266,7 +266,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     uint64_t block_num = orch_args.tensor(3).ref().shapes[1];
 
     // scale from scalar arg
-    uint64_t scale_value = orch_args.scalar(0);
+    uint64_t scale_value = orch_args.scalar<uint64_t>(0);
     uint64_t q_head_num = num_heads;
     uint64_t q_tile = std::min(num_heads, static_cast<uint64_t>(128));
     uint64_t q_loop = (q_head_num + q_tile - 1) / q_tile;

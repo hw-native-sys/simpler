@@ -133,7 +133,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     const simpler::tmr::Tensor &ext_num_tokens_per_owner = orch_args.tensor(91).ref();
 
     // Scalar params
-    int32_t my_rank = from_u64<int32_t>(orch_args.scalar(0));
+    int32_t my_rank = orch_args.scalar<int32_t>(0);
     uint64_t recv_meta_ctx = orch_args.scalar(1);
     uint64_t recv_x_ctx = orch_args.scalar(2);
     uint64_t recv_aux_ctx = orch_args.scalar(3);

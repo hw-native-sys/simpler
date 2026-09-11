@@ -56,11 +56,11 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     const simpler::tmr::Tensor &ext_Z = orch_args.tensor(5).ref();
 
     // Scalar config args
-    int batch = static_cast<int>(orch_args.scalar(0));
-    int M = static_cast<int>(orch_args.scalar(1));
-    int N = static_cast<int>(orch_args.scalar(2));
-    int matmul_batch = static_cast<int>(orch_args.scalar(3));
-    int add_batch = static_cast<int>(orch_args.scalar(4));
+    int batch = orch_args.scalar<int>(0);
+    int M = orch_args.scalar<int>(1);
+    int N = orch_args.scalar<int>(2);
+    int matmul_batch = orch_args.scalar<int>(3);
+    int add_batch = orch_args.scalar<int>(4);
 
     LOG_INFO(
         "[alternating_orch] Batch: %d, M: %d, N: %d, matmul_batch: %d, add_batch: %d", batch, M, N, matmul_batch,

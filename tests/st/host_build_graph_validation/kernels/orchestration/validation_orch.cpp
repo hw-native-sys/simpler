@@ -106,7 +106,7 @@ __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_c
 
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &orch_args) {
     const simpler::hbg::Tensor &external = orch_args.tensor(0).ref();
-    uint64_t case_id = orch_args.scalar(0);
+    uint64_t case_id = orch_args.scalar<uint64_t>(0);
     uint32_t index[1] = {0};
 
     switch (case_id) {

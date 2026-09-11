@@ -107,8 +107,8 @@ __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_c
 
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &args) {
     const simpler::hbg::Tensor &task_state = args.tensor(0).ref();
-    int64_t graph_case = static_cast<int64_t>(args.scalar(0));
-    int64_t core_type = static_cast<int64_t>(args.scalar(1));
+    int64_t graph_case = args.scalar<int64_t>(0);
+    int64_t core_type = args.scalar<int64_t>(1);
     switch (graph_case) {
     case 0:
         build_chain(task_state, core_type);

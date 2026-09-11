@@ -23,7 +23,7 @@ from simpler import comm_provider
 from simpler.comm_endpoints import DEVICE_AICPU, HOST_CPU, RegionLayoutSpec, SingleOwner, at
 from simpler.comm_provider import ProviderRegionStore, RegionPartKind
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import CallConfig, ChipCallable, CoreCallable, DataType, TaskArgs, scalar_to_uint64
+from simpler.task_interface import CallConfig, ChipCallable, CoreCallable, DataType, TaskArgs
 from simpler.worker import Worker, attach_exception_note
 from simpler.worker_chip_orch_comm import (
     NotifyOp,
@@ -145,7 +145,7 @@ def _chip_task_args(region) -> TaskArgs:
     task_args.add_scalar(_NUMEL)
     task_args.add_scalar(DataType.FLOAT32.value)
     task_args.add_scalar(_NBYTES)
-    task_args.add_scalar(scalar_to_uint64(_SCALAR))
+    task_args.add_scalar(_SCALAR)
     task_args.add_scalar(_DATA_READY_COUNTER)
     task_args.add_scalar(_COMPLETION_COUNTER)
     return task_args
