@@ -627,11 +627,11 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run(
 ChipWorkerNativeRun ChipWorker::prepare_native_run_for_lane(
     int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, const PipelineSlotLease &lease,
     uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value,
-    bool pipeline_leased
+    bool pipeline_leased, uint32_t flags
 ) {
     return prepare_native_run_on_slot(
         callable_id, args, config, lease.slot_id, lease.generation, run_id, dispatch_id, accepted_state, accepted_value,
-        pipeline_leased
+        pipeline_leased, flags
     );
 }
 
@@ -643,7 +643,7 @@ bool ChipWorker::supports_concurrent_native_prepare() const {
 ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
     int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, uint32_t slot_id,
     uint64_t generation, uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state,
-    int32_t accepted_value, bool admit_pipeline_generation
+    int32_t accepted_value, bool admit_pipeline_generation, uint32_t flags
 ) {
     config.validate();
     if (!initialized_) {
@@ -702,7 +702,8 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
         const NativeRunDescriptor descriptor{slot_id,        arena_bank_for_slot(slot_id),
                                              run_id,         generation,
                                              dispatch_id,    run_epoch,
-                                             accepted_state, accepted_value};
+                                             accepted_state, accepted_value,
+                                             flags};
         rc = prepare_run_fn_(device_ctx_, runtime_bufs_[slot_id].data(), callable_id, args, &config, &descriptor);
     } catch (...) {
         std::lock_guard<std::mutex> lk(native_run_mu_);
@@ -721,6 +722,11 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
         if (rc == PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE) {
             throw PreparedRunIncompatible(
                 "native prepare requires depth-one fallback " + format_native_run_identity(run_identity)
+            );
+        }
+        if (rc == PTO_RUNTIME_ERR_UNSUPPORTED) {
+            throw UnsupportedRuntimeOperation(
+                "native prepare is unsupported for this run " + format_native_run_identity(run_identity)
             );
         }
         throw std::runtime_error(

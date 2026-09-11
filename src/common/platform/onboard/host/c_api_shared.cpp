@@ -332,6 +332,10 @@ extern "C" int prewarm_config_impl(
     const HostApi *api, const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool
 );
 
+// Weak default rejects non-zero flags; TMR links the strong implementation.
+// A null Runtime is a capability probe used before acquiring run resources.
+extern "C" int configure_native_run_flags_impl(Runtime *runtime, uint32_t flags);
+
 // One immutable function table is shared by all runners. Each HostApi value
 // binds it to a specific runner and immutable per-run slot/bank selection.
 static const HostApiOps g_host_api_ops = {
@@ -678,11 +682,13 @@ native_run_context(DeviceContextHandle ctx, RuntimeHandle runtime, const char *o
     return state;
 }
 
-static void
-emit_native_run_host_wall(uint64_t trace_inv, uint64_t trace_hid, long long trace_start_ns, const char *trace_attrs) {
+static void emit_native_run_host_wall(
+    uint64_t trace_inv, uint64_t trace_hid, long long trace_start_ns, const char *trace_attrs, bool prewarm = false
+) {
     const long long end_ns = STRACE_NOW_NS();
     STRACE_CONTEXT(trace_inv, trace_hid, 0);
-    STRACE_HOST_SPAN_AT_A("chip.run", trace_start_ns, end_ns - trace_start_ns, 0, trace_attrs);
+    const char *name = prewarm ? "chip.prewarm.run" : "chip.run";
+    STRACE_HOST_SPAN_AT_A(name, trace_start_ns, end_ns - trace_start_ns, 0, trace_attrs);
 }
 
 static void emit_native_run_runner_wall(OnboardNativeRunContext *state) {
@@ -736,8 +742,9 @@ static int cleanup_failed_prepare(OnboardNativeRunContext *state, int execution_
         state->runner->release_native_run_reservation(state);
         state->runner_reserved = false;
     }
+    const bool prewarm = (state->descriptor.flags & PTO_NATIVE_RUN_FLAG_INTERNAL_PREWARM) != 0;
     destroy_native_run_context(state);
-    emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns, trace_attrs);
+    emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns, trace_attrs, prewarm);
     if (validation_rc != 0) return validation_rc;
     if (resources_rc != 0) return resources_rc;
     return execution_rc;
@@ -769,6 +776,8 @@ int simpler_prepare_run(
         LOG_ERROR("simpler_prepare_run: runner is unusable after a prior device failure");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    const int flags_rc = configure_native_run_flags_impl(nullptr, descriptor->flags);
+    if (flags_rc != 0) return flags_rc;
     uint64_t magic = 0;
     std::memcpy(&magic, runtime, sizeof(magic));
     if (magic == OnboardNativeRunContext::kMagic) {
@@ -786,6 +795,10 @@ int simpler_prepare_run(
     const long long trace_start_ns = STRACE_NOW_NS();
     try {
         state = new (runtime) OnboardNativeRunContext(runner, *config, trace_hid, *descriptor, &g_host_api_ops);
+        if (configure_native_run_flags_impl(&state->runtime, descriptor->flags) != 0) {
+            destroy_native_run_context(state);
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
         std::snprintf(
             state->trace_attrs, sizeof(state->trace_attrs),
             "run_id=%llu dispatch_id=%llu slot_id=%u generation=%llu run_epoch=%llu",
@@ -1089,8 +1102,9 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         state->runner->release_native_run_reservation(state);
         state->runner_reserved = false;
     }
+    const bool prewarm = (state->descriptor.flags & PTO_NATIVE_RUN_FLAG_INTERNAL_PREWARM) != 0;
     destroy_native_run_context(state);
-    emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns, trace_attrs);
+    emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns, trace_attrs, prewarm);
     if (validation_rc != 0) return validation_rc;
     if (resources_rc != 0) return resources_rc;
     return launched ? execution_rc : 0;

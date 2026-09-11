@@ -800,6 +800,41 @@ def test_rounds_table_omits_tmr_only_columns_when_only_host_and_device_exist():
     assert "Avg Device: 22.0 us [2/2]" in rendered
 
 
+def test_rounds_table_excludes_internal_prewarm_invocation():
+    prewarm = (
+        _record(1, 1, "chip.run.runner_run.device_wall", "clk=dev", depth=2, dur=300_000)
+        + _record(1, 1, "chip.prewarm.run", depth=0, dur=400_000)
+        + "\n"
+    )
+    official = []
+    for inv, host_dur, device_dur in ((2, 100_000, 20_000), (3, 120_000, 24_000)):
+        official.append(
+            _record(1, inv, "chip.run", dur=host_dur)
+            + _record(1, inv, "chip.run.runner_run.device_wall", "clk=dev", depth=2, dur=device_dur)
+            + "\n"
+        )
+    buckets = bucket_by_hid(group_invocations(parse_spans([prewarm, *official])))
+    output = StringIO()
+
+    print_rounds_table(buckets, stream=output)
+
+    rendered = output.getvalue()
+    assert "Avg Host: 110.0 us" in rendered
+    assert "Avg Device: 22.0 us [2/2]" in rendered
+    assert "(2 rounds)" in rendered
+    assert "300.0" not in rendered
+
+
+def test_rounds_table_distinguishes_prewarm_only_from_no_markers():
+    lines = [_record(1, 1, "chip.run.bind", depth=1) + _record(1, 1, "chip.prewarm.run", depth=0, dur=400_000) + "\n"]
+    buckets = bucket_by_hid(group_invocations(parse_spans(lines)))
+    output = StringIO()
+
+    print_rounds_table(buckets, stream=output)
+
+    assert output.getvalue() == "No official [STRACE] rounds found.\n"
+
+
 def _run_records(*, run_epoch, prepare, device, release, run_id=0, dispatch_id=0, slot_id=0, pid=7, inv=None):
     """One phased native run's spans, as the `chip.run` tree carries them.
 

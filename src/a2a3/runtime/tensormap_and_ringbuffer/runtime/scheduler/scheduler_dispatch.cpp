@@ -126,9 +126,13 @@ void SchedulerContext::build_payload(
     bool force_gate
 ) {
     int32_t slot_idx = static_cast<int32_t>(subslot);
-    uint64_t callable_addr = get_function_bin_addr(slot_state.task->kernel_id[slot_idx]);
-    const CoreCallable *callable = reinterpret_cast<const CoreCallable *>(callable_addr);
-    dispatch_payload.function_bin_addr = callable->resolved_addr();
+    if ((run_flags_ & RUNTIME_RUN_FLAG_INTERNAL_PREWARM) != 0) {
+        dispatch_payload.function_bin_addr = 0;
+    } else {
+        uint64_t callable_addr = get_function_bin_addr(slot_state.task->kernel_id[slot_idx]);
+        const CoreCallable *callable = reinterpret_cast<const CoreCallable *>(callable_addr);
+        dispatch_payload.function_bin_addr = callable->resolved_addr();
+    }
     auto &payload = *slot_state.payload;
     // A claimed early-stage range stays gated even if producer completion flips
     // the shared state before this payload is built. All other dispatches run on

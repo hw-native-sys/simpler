@@ -11,6 +11,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <cstdint>
 
 #include "native_run_context.h"
@@ -39,6 +40,7 @@ NativeRunDescriptor make_descriptor(volatile int32_t *accepted_state) {
     descriptor.pipeline_slot = kPipelineSlot;
     descriptor.accepted_state = accepted_state;
     descriptor.accepted_value = kAcceptedValue;
+    descriptor.flags = 0;
     return descriptor;
 }
 
@@ -57,6 +59,14 @@ LaunchReceipt complete_receipt(const NativeRunIdentity &identity) {
 }
 
 }  // namespace
+
+TEST(NativeRunDescriptorAbi, FlagsSitAfterAcceptedValueAndStayZeroByDefault) {
+    NativeRunDescriptor descriptor{};
+    EXPECT_EQ(descriptor.flags, 0u);
+    descriptor.flags = PTO_NATIVE_RUN_FLAG_INTERNAL_PREWARM;
+    EXPECT_EQ(descriptor.flags, PTO_NATIVE_RUN_FLAG_INTERNAL_PREWARM);
+    EXPECT_EQ(offsetof(NativeRunDescriptor, flags), offsetof(NativeRunDescriptor, accepted_value) + sizeof(int32_t));
+}
 
 TEST(NativeRunAcceptanceTest, MatchingReceiptStoresTheAcceptedValue) {
     volatile int32_t accepted_state = 0;

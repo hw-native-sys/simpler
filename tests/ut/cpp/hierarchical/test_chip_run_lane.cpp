@@ -46,7 +46,10 @@ std::array<int, 2> g_poll_rc{};
 std::array<int, 2> g_wait_rc{};
 std::array<int, 2> g_finalize_rc{};
 std::array<size_t, 2> g_prepare_count{};
+size_t g_prewarm_prepare_count{0};
+std::array<bool, 2> g_prewarm_run{};
 std::array<bool, 2> g_reject_first_prepare{};
+int g_prewarm_prepare_rc{0};
 size_t g_poll_count{0};
 // When nonzero, the poll stub completes the run after this many polls. Only
 // UnboundedWaitBlocksInsteadOfPolling sets it, so that a regression there fails
@@ -65,17 +68,27 @@ int prepare_run(
     void *, void *runtime, int32_t, const void *, const CallConfig *, const NativeRunDescriptor *descriptor
 ) {
     EXPECT_EQ(slot_of(runtime), descriptor->pipeline_slot);
-    g_complete[descriptor->pipeline_slot] = false;
-    g_events.push_back("prepare" + std::to_string(descriptor->pipeline_slot));
-    ++g_prepare_count[descriptor->pipeline_slot];
-    if (g_reject_first_prepare[descriptor->pipeline_slot] && g_prepare_count[descriptor->pipeline_slot] == 1) {
+    const uint32_t slot = descriptor->pipeline_slot;
+    const bool prewarm = (descriptor->flags & PTO_NATIVE_RUN_FLAG_INTERNAL_PREWARM) != 0;
+    g_prewarm_run[slot] = prewarm;
+    if (prewarm) {
+        EXPECT_EQ(descriptor->accepted_state, nullptr);
+        ++g_prewarm_prepare_count;
+        return g_prewarm_prepare_rc;
+    }
+    EXPECT_EQ(descriptor->flags, 0u);
+    g_complete[slot] = false;
+    g_events.push_back("prepare" + std::to_string(slot));
+    ++g_prepare_count[slot];
+    if (g_reject_first_prepare[slot] && g_prepare_count[slot] == 1) {
         return PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE;
     }
-    return g_prepare_rc[descriptor->pipeline_slot];
+    return g_prepare_rc[slot];
 }
 
 int launch_run(void *, void *runtime) {
     const uint32_t slot = slot_of(runtime);
+    if (g_prewarm_run[slot]) return 0;
     g_events.push_back("launch" + std::to_string(slot));
     return g_launch_rc[slot];
 }
@@ -90,6 +103,7 @@ int poll_run(void *, void *runtime) {
 
 int wait_run(void *, void *runtime) {
     const uint32_t slot = slot_of(runtime);
+    if (g_prewarm_run[slot]) return 0;
     g_events.push_back("wait" + std::to_string(slot));
     {
         std::unique_lock<std::mutex> lk(g_wait_mu);
@@ -105,6 +119,10 @@ int wait_run(void *, void *runtime) {
 
 int finalize_run(void *, void *runtime) {
     const uint32_t slot = slot_of(runtime);
+    if (g_prewarm_run[slot]) {
+        g_prewarm_run[slot] = false;
+        return 0;
+    }
     g_events.push_back("finalize" + std::to_string(slot));
     return g_finalize_rc[slot];
 }
@@ -120,7 +138,10 @@ void prime_worker(ChipWorker &worker) {
     g_wait_rc = {};
     g_finalize_rc = {};
     g_prepare_count = {};
+    g_prewarm_prepare_count = 0;
+    g_prewarm_run = {};
     g_reject_first_prepare = {};
+    g_prewarm_prepare_rc = 0;
     g_poll_count = 0;
     g_poll_completes_after = 0;
     g_supports_successor = true;
@@ -623,5 +644,84 @@ TEST(ChipRunLaneTest, CloseDrainsAndRejectsNewSubmissions) {
     EXPECT_THROW(
         lane.submit(1, args, CallConfig{}, PipelineSlotLease{1, 0, 102}, 102, 102, nullptr, 0, true), std::runtime_error
     );
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, FirstActivationRunsOnePrewarmThenTheOfficialRun) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    volatile int32_t accepted = 0;
+
+    ChipStorageTaskArgs args{};
+    ChipRun first = lane.submit(1, args, CallConfig{}, PipelineSlotLease{0, 0, 101}, 101, 101, &accepted, 1, true);
+    EXPECT_EQ(g_prewarm_prepare_count, 1u);
+    EXPECT_EQ(g_prepare_count[0], 1u);
+    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "launch0"}));
+
+    ChipRun second = submit(lane, 102, 1);
+    EXPECT_EQ(g_prewarm_prepare_count, 1u);
+    EXPECT_EQ(g_prepare_count[1], 1u);
+
+    g_complete[0] = true;
+    EXPECT_TRUE(first.done());
+    g_complete[1] = true;
+    EXPECT_TRUE(second.done());
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, UnactivatedFrameDoesNotPrewarm) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+
+    ChipRun staged = submit(lane, 101, 0, false);
+    EXPECT_EQ(g_prewarm_prepare_count, 0u);
+    EXPECT_EQ(g_prepare_count[0], 0u);
+    EXPECT_TRUE(g_events.empty());
+
+    staged.activate();
+    EXPECT_EQ(g_prewarm_prepare_count, 1u);
+    EXPECT_EQ(g_prepare_count[0], 1u);
+    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "launch0"}));
+
+    g_complete[0] = true;
+    EXPECT_TRUE(staged.done());
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, UnsupportedPrewarmSkipsAndOfficialRunSucceeds) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    g_prewarm_prepare_rc = PTO_RUNTIME_ERR_UNSUPPORTED;
+
+    ChipRun run = submit(lane, 101, 0);
+    EXPECT_EQ(g_prewarm_prepare_count, 1u);
+    EXPECT_EQ(g_prepare_count[0], 1u);
+    EXPECT_TRUE(run.launched());
+    EXPECT_FALSE(lane.poisoned());
+    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "launch0"}));
+
+    g_complete[0] = true;
+    EXPECT_TRUE(run.done());
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, PrewarmPrepareFailurePoisonsTheOfficialFirstRun) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    g_prewarm_prepare_rc = -5;
+
+    ChipRun run = submit(lane, 101, 0);
+    EXPECT_TRUE(run.done());
+    EXPECT_TRUE(lane.poisoned());
+    EXPECT_THROW(run.wait_until(ChipRunLane::Deadline::max()), std::runtime_error);
+    EXPECT_EQ(g_prepare_count[0], 0u);
+    EXPECT_THROW(lane.close(), std::runtime_error);
     worker.finalize();
 }
