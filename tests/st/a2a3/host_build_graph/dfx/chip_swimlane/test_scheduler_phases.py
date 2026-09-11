@@ -72,26 +72,34 @@ class TestSchedulerPhases(SceneTestCase):
             phase_threads = data.get("aicpu_scheduler_phases")
             assert phase_threads, "scheduler phase records are missing"
             assigned_threads = {thread_idx for thread_idx in data.get("core_to_thread", []) if thread_idx >= 0}
-            resolution_threads = [
-                records
-                for thread_idx, records in enumerate(phase_threads)
-                if records and thread_idx not in assigned_threads
-            ]
-            assert len(resolution_threads) == 1, f"expected one core-less P thread, found {len(resolution_threads)}"
-            resolution_thread = resolution_threads[0]
-            required = {"resolve_standalone", "dummy"}
-            emitted = {record.get("phase") for record in resolution_thread}
-            assert required <= emitted, f"missing P-thread phases: {sorted(required - emitted)}"
+            recording = [(thread_idx, records) for thread_idx, records in enumerate(phase_threads) if records]
+            assert recording, "no scheduler thread emitted phase records"
 
-            records = [record for record in resolution_thread if record.get("phase") in required]
-            assert all(record["loop_iter"] > 0 for record in records)
-            assert all(record["end_time_us"] >= record["start_time_us"] for record in records)
-            assert sum(record["tasks_processed"] for record in records if record["phase"] == "resolve_standalone") >= 1
-            assert sum(record["tasks_processed"] for record in records if record["phase"] == "dummy") == 1
-            assert len(resolution_thread) < 64, "P-thread phase aggregation produced excessive records"
+            # Scheduler threads are symmetric: each one owns cores and resolves
+            # the completions it observes, so no thread records phases without
+            # holding a core slice.
+            core_less = [thread_idx for thread_idx, _ in recording if thread_idx not in assigned_threads]
+            assert not core_less, f"scheduler threads own cores; core-less threads recorded phases: {core_less}"
 
-            ordered = sorted(records, key=lambda record: (record["start_time_us"], record["end_time_us"]))
-            assert all(left["end_time_us"] <= right["start_time_us"] for left, right in zip(ordered, ordered[1:]))
+            # The dummy retirement is not one thread's job any more -- whichever
+            # thread wins the queue does it -- but the graph holds exactly one
+            # dummy task, so the chip-wide count is still one.
+            dummy = [record for _, records in recording for record in records if record.get("phase") == "dummy"]
+            assert dummy, "no dummy phase recorded on any scheduler thread"
+            assert sum(record["tasks_processed"] for record in dummy) == 1
+            assert all(record["loop_iter"] > 0 for record in dummy)
+            assert all(record["end_time_us"] >= record["start_time_us"] for record in dummy)
+
+            for thread_idx, records in recording:
+                assert len(records) < 64, f"thread {thread_idx} phase aggregation produced excessive records"
+                # Compare only same-kind bars: the Dummy and AsyncPoll spans sit
+                # inside the same iteration's Complete span, so cross-kind overlap
+                # is expected.
+                ordered = sorted(
+                    (record for record in records if record.get("phase") == "dummy"),
+                    key=lambda record: (record["start_time_us"], record["end_time_us"]),
+                )
+                assert all(left["end_time_us"] <= right["start_time_us"] for left, right in zip(ordered, ordered[1:]))
 
 
 if __name__ == "__main__":

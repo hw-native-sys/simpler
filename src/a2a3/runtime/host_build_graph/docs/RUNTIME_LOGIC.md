@@ -137,7 +137,7 @@ read. `RuntimeContext` therefore holds a *pointer* to it, wired from
 region arrives holding the pooled allocation's previous generation, so every
 field the dispatch loop reads before anything writes it needs a value from
 `init_data_from_layout`: the queue headers, and `AsyncWaitList`'s `busy` and
-`count`. A residual `count` is the length the resolution thread's poll walks
+`count`. A residual `count` is the length a polling thread walks
 `entries` by, so it reads past the region and faults on an address that belongs
 to no mapping (issue #2121); a residual `busy` is the same miss inverted, making
 every drain a no-op and stranding deferred completions.

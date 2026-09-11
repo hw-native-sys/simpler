@@ -80,7 +80,7 @@ SlotTransition SchedulerContext::decide_slot_transition(
 // Complete one slot's task: subtask counting, mixed completion, deferred release, profiling.
 void SchedulerContext::complete_slot_task(
     ChipTaskSlotState &slot_state, int32_t expected_reg_task_id, [[maybe_unused]] SubtaskSlot subslot,
-    int32_t thread_idx, int32_t core_id, Handshake *hank, [[maybe_unused]] int32_t &completed_this_turn
+    [[maybe_unused]] int32_t thread_idx, int32_t core_id, Handshake *hank, int32_t &completed_this_turn
 #if SIMPLER_DFX
     ,
     uint64_t dispatch_ts, uint64_t finish_ts
@@ -188,12 +188,31 @@ void SchedulerContext::complete_slot_task(
             );
         }
 #endif
-        // 3S+1P: hand the finished task to the dedicated resolution (P) thread.
-        // P publishes task_states and drains the wake list — and owns
-        // completed_tasks_, so this scheduler thread neither
-        // resolves nor bumps completed_this_turn. (The Resolve swimlane bar is
-        // emitted by P, not here.)
-        sp_queues_[thread_idx].push(&slot_state);
+        // The thread that observed the FIN resolves it, here, inline: publish
+        // the completion flag and drain the wake list. There is no hand-off hop
+        // and no dedicated resolver, so completed_this_turn is bumped on this
+        // thread and feeds the caller's completed_tasks_ accounting.
+        //
+        // Concurrent resolvers are safe by construction: the wake-list detach is
+        // an exchange onto a terminal sentinel (exactly one thread walks a given
+        // producer's list), register_wake is a CAS loop that re-classifies when
+        // it loses to that sentinel, and the ready queues are MPMC.
+#if SIMPLER_SCHED_PROFILING
+        SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(slot_state, thread_idx);
+#else
+        SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(slot_state);
+#endif
+        if (outcome.error_code != SIMPLER_ERROR_NONE) {
+            // No Runtime* reaches this far, so latch the code the way the slab
+            // errors above do; the dispatch loop raises it on its next turn.
+            int32_t expected = SIMPLER_ERROR_NONE;
+            sched_->sm_header->sched_error_code.compare_exchange_strong(
+                expected, outcome.error_code, std::memory_order_acq_rel, std::memory_order_acquire
+            );
+            completed_.store(true, std::memory_order_release);
+            return;
+        }
+        completed_this_turn += outcome.stream_tasks_completed;
 #if SIMPLER_DFX
         chip_swimlane.phase_complete_count++;
 #endif
