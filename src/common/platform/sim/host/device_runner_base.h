@@ -55,6 +55,7 @@
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "platform_comm/comm.h"
+#include "host/execution_mode_latch.h"
 #include "host/memory_allocator.h"
 #include "host/chip_swimlane_collector.h"
 #include "host/host_phase_records.h"
@@ -260,6 +261,15 @@ public:
     void set_dma_workspace_request(bool enable_sdma) { sdma_requested_ = enable_sdma; }
     int ensure_dma_workspace_provisioned();
     int device_id() const { return device_id_; }
+
+    /**
+     * This context's execution identity, latched once by whichever init entry
+     * constructs it. The arena guard keys on is_kernel(). Simulation never
+     * supports kernel mode — it has no real streams for a caller to lend — so
+     * on this backend the latch only ever holds PROGRAM.
+     */
+    ExecutionModeLatch &execution_mode_latch() { return execution_mode_latch_; }
+
     uint64_t last_device_wall_ns() const { return device_wall_ns_; }
     // Per-phase AICPU wall (ns) from the most recent run; RunWall aliases
     // last_device_wall_ns(). 0 for a phase that was never stamped. Used to emit
@@ -368,13 +378,19 @@ protected:
     // --- Shared state (protected so subclass execution / init_* / finalize()
     // can read or write directly) ----------------------------------------
 
-    // Configuration. device_id_ is set once in attach_current_thread() during
-    // simpler_init and read afterwards; the user's call sequence is single-
-    // threaded with respect to it so plain int is sufficient.
+    // Configuration. device_id_ is which device this context is on — not a
+    // claim of ownership, which the execution-mode latch carries instead. Set
+    // once in attach_current_thread() during simpler_init and read afterwards;
+    // the user's call sequence is single-threaded with respect to it so plain
+    // int is sufficient.
     int device_id_{-1};
     int block_dim_{0};
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
     int worker_count_{0};
+
+    // This context's execution identity. Write-once: the first init entry to
+    // run latches it, and it never changes afterwards.
+    ExecutionModeLatch execution_mode_latch_;
 
     // Executor binaries — populated once via set_executors() during simpler_init,
     // owned for the rest of the runner's lifetime.

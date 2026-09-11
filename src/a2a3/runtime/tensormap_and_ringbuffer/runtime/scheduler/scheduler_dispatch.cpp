@@ -121,13 +121,15 @@ int SchedulerContext::pop_ready_tasks_batch(
     return count;
 }
 
-void SchedulerContext::build_payload(
+bool SchedulerContext::build_payload(
     DispatchPayload &dispatch_payload, ChipTaskSlotState &slot_state, SubtaskSlot subslot, int32_t block_idx,
     bool force_gate
 ) {
     int32_t slot_idx = static_cast<int32_t>(subslot);
     uint64_t callable_addr = get_function_bin_addr(slot_state.task->kernel_id[slot_idx]);
+    if (callable_addr == 0 || callable_addr % alignof(CoreCallable) != 0) return false;
     const CoreCallable *callable = reinterpret_cast<const CoreCallable *>(callable_addr);
+    if (callable->resolved_addr() == 0) return false;
     dispatch_payload.function_bin_addr = callable->resolved_addr();
     auto &payload = *slot_state.payload;
     // A claimed early-stage range stays gated even if producer completion flips
@@ -160,6 +162,7 @@ void SchedulerContext::build_payload(
     // [PAYLOAD_GLOBAL_CONTEXT_INDEX] are per-(core, buf_idx) constants, also
     // prefilled in init().
     dispatch_payload.local_context.async_ctx.task_token = slot_state.task->task_id;
+    return true;
 }
 
 SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
@@ -187,7 +190,13 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
     // deferred completion (count > 0), which is rare. A non-deferred task never
     // touches count/error_code, so the slab stays clean without a per-dispatch
     // write — keeping this cold per-core line off the dispatch path.
-    build_payload(payload, slot_state, subslot, block_idx, force_gate);
+    if (!build_payload(payload, slot_state, subslot, block_idx, force_gate)) {
+        int32_t expected = SIMPLER_ERROR_NONE;
+        sched_->sm_header->sched_error_code.compare_exchange_strong(
+            expected, SIMPLER_ERROR_INVALID_ARGS, std::memory_order_acq_rel
+        );
+        return {};
+    }
 
     if (to_pending) {
         core_exec_state.pending_subslot = subslot;
@@ -231,9 +240,12 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
     }
 #endif
 
-    return PublishHandle{
-        core_exec_state.reg_addr, reg_task_id, core_offset, dispatch_timestamp_slot, slot_state.task_attrs.timing_slot()
-    };
+    return PublishHandle{core_exec_state.reg_addr,
+                         reg_task_id,
+                         core_offset,
+                         dispatch_timestamp_slot,
+                         slot_state.task_attrs.timing_slot(),
+                         true};
 }
 
 int SchedulerContext::prepare_block_for_dispatch(
@@ -655,6 +667,7 @@ int32_t SchedulerContext::stage_consumer_blocks(
     if (n > 0) {
         wmb();
         for (int i = 0; i < n; i++) {
+            if (!handles[i].valid) continue;
             publish_subtask_to_core(handles[i], early_dispatch_ts, thread_idx);
             int32_t cid = tracker.get_core_id_by_offset(handles[i].core_offset);
             sched_->early_dispatch_doorbell_table[cid].addr = handles[i].reg_addr;
@@ -684,6 +697,7 @@ int32_t SchedulerContext::stage_consumer_blocks(
             }
         }
         for (int i = 0; i < n; i++) {
+            if (!handles[i].valid) continue;
             int32_t cid = tracker.get_core_id_by_offset(handles[i].core_offset);
             SchedulerState::ring_claimed_local_doorbell(
                 owned[cid >> 6], cid, handles[i].reg_addr, handles[i].reg_task_id

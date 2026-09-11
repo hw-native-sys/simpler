@@ -225,10 +225,11 @@ int init_aicore_register_addresses(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
+    *runtime_regs_ptr = reinterpret_cast<uint64_t>(reg_ptr);
     int ret = rtMemcpy(reg_ptr, regs_size, host_regs.data(), regs_size, RT_MEMCPY_HOST_TO_DEVICE);
     if (ret != 0) {
         LOG_ERROR("Failed to copy %s register addresses to device (rc=%d)", kind_to_name(kind), ret);
-        allocator.free(reg_ptr);
+        if (allocator.free(reg_ptr) == 0) *runtime_regs_ptr = 0;
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 

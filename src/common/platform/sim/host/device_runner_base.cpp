@@ -141,7 +141,26 @@ int SimDeviceRunnerBase::setup_static_arena(
     // worker's lifetime). If a caller asks for a larger layout on any
     // region, redo just that region.
     bool arena_changed = false;
-    auto commit_region = [&arena_changed](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
+    // A kernel-mode context's config is context-static, so each region is
+    // committed at most once and never grown or released afterwards; captured
+    // graphs may hold the committed base address. A request that would
+    // re-base or release a committed region under kernel mode is therefore an
+    // internal invariant break, not caller-configurable behavior. The refusal
+    // is not self-contained: the caller collapses a nonzero return to
+    // `ok = false` and then releases all three regions unconditionally, and
+    // DeviceArena::release() frees the backing buffer — so a fired guard drops
+    // the very base addresses it names.
+    const bool kernel_mode = execution_mode_latch().is_kernel();
+    auto commit_region = [&arena_changed,
+                          kernel_mode](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
+        if (kernel_mode && arena.is_committed() &&
+            (requested_size == 0 ? cached_size != 0 : requested_size > cached_size)) {
+            LOG_ERROR(
+                "setup_static_arena: kernel mode forbids %s a committed region (cached %zu, requested %zu)",
+                requested_size == 0 ? "releasing" : "growing", cached_size, requested_size
+            );
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
         if (requested_size == 0) {
             if (arena.is_committed() && cached_size != 0) {
                 arena.release();

@@ -45,6 +45,8 @@
 #include "common/sdma_warmup_layout.h"
 #include "common/unified_log.h"
 #include "host/acl_error_log.h"
+#include "kernel_platform_ops.h"
+#include "host/kernel_pipeline_contract.h"
 #include "host/host_phase_records_artifact.h"
 #include "host/raii_scope_guard.h"
 #include "host_log.h"
@@ -373,7 +375,26 @@ int DeviceRunnerBase::setup_static_arena(
     ArenaBank &bank = this->arena_bank(arena_bank);
 
     bool arena_changed = false;
-    auto commit_region = [&arena_changed](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
+    // A kernel-mode context's config is context-static, so each region is
+    // committed at most once and never grown or released afterwards; captured
+    // graphs may hold the committed base address. A request that would
+    // re-base or release a committed region under kernel mode is therefore an
+    // internal invariant break, not caller-configurable behavior. The refusal
+    // is not self-contained: the caller collapses a nonzero return to
+    // `ok = false` and then releases all three regions unconditionally, and
+    // DeviceArena::release() frees the backing buffer — so a fired guard drops
+    // the very base addresses it names.
+    const bool kernel_mode = execution_mode_latch().is_kernel();
+    auto commit_region = [&arena_changed,
+                          kernel_mode](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
+        if (kernel_mode && arena.is_committed() &&
+            (requested_size == 0 ? cached_size != 0 : requested_size > cached_size)) {
+            LOG_ERROR(
+                "setup_static_arena: kernel mode forbids %s a committed region (cached %zu, requested %zu)",
+                requested_size == 0 ? "releasing" : "growing", cached_size, requested_size
+            );
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
         if (requested_size == 0) {
             // hbg's runtime_arena path: caller passed 0 and never reserved
             // a region. Leave the arena uncommitted; acquire_pooled_* will
@@ -441,6 +462,10 @@ int DeviceRunnerBase::setup_static_arena(
 }
 
 std::thread DeviceRunnerBase::create_thread(std::function<void()> fn) {
+    // A freshly spawned thread carries no CANN device context of its own, so
+    // this bind creates one rather than taking anything from the caller — it
+    // is the one rtSetDevice a borrowed-device context still owns, and it is
+    // scoped to a thread this runner created.
     int dev_id = device_id_;
     return std::thread([dev_id, fn = std::move(fn)]() {
         rtSetDevice(dev_id);
@@ -448,7 +473,7 @@ std::thread DeviceRunnerBase::create_thread(std::function<void()> fn) {
     });
 }
 
-int DeviceRunnerBase::attach_current_thread(int device_id) {
+int DeviceRunnerBase::bind_current_thread(int device_id) {
     if (device_id < 0) {
         LOG_ERROR("Invalid device_id: %d", device_id);
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -468,13 +493,61 @@ int DeviceRunnerBase::attach_current_thread(int device_id) {
         ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
+    return 0;
+}
 
-    // simpler_init performs the only lifetime write. Prepared-run admission
-    // and execution subsequently attach different host threads, so repeated
-    // same-value writes here would still be a C++ data race.
+int DeviceRunnerBase::attach_current_thread(int device_id) {
+    // rtSetDevice and the op-execute watchdog below are acts of device
+    // ownership, so this entry belongs to a program context. A kernel context
+    // reaches its device through adopt_borrowed_device instead; the one caller
+    // here that runs under both identities is DeviceRunner::finalize(), which
+    // skips this call on a kernel latch.
+    if (execution_mode_latch().is_kernel()) {
+        LOG_ERROR("attach_current_thread: refused — a kernel-mode context does not own the caller's device");
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    }
+
+    int rc = bind_current_thread(device_id);
+    if (rc != 0) return rc;
+
+    // Both writers of device_id_ — this one and adopt_borrowed_device — guard
+    // on the still-unset value, and both run before any prepare, execution or
+    // collector thread attaches. Prepared-run admission and execution
+    // subsequently attach different host threads, so repeated same-value
+    // writes here would still be a C++ data race.
     if (device_id_ == -1) {
         timeout_config_ = resolve_onboard_timeout_config();
+        // aclrtSetOpExecuteTimeOutV2 is device-global: it changes the
+        // op-execute timeout of every operator any process runs on this
+        // device, including the host framework's own. Only a context that
+        // owns the device may set it.
         configure_aicore_op_timeout();
+        device_id_ = device_id;
+    }
+    return 0;
+}
+
+int DeviceRunnerBase::adopt_borrowed_device(int device_id) {
+    // The caller already holds this device current on its own threads, so the
+    // only thing a kernel context takes from it is the identity: no
+    // rtSetDevice, and no configure_aicore_op_timeout, which would rewrite the
+    // op-execute watchdog for every other user of that card. Resolving the
+    // timeout config is pure environment parsing and stays, because the stream
+    // and scheduler timeouts derived from it are read on both identities.
+    if (!execution_mode_latch().is_kernel()) {
+        LOG_ERROR("adopt_borrowed_device: refused — the context has not latched kernel mode");
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    if (device_id < 0) {
+        LOG_ERROR("Invalid device_id: %d", device_id);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (device_id_ != -1 && device_id_ != device_id) {
+        LOG_ERROR("DeviceRunner already on device %d; close before adopting device %d", device_id_, device_id);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (device_id_ == -1) {
+        timeout_config_ = resolve_onboard_timeout_config();
         device_id_ = device_id;
     }
     return 0;
@@ -546,7 +619,7 @@ int DeviceRunnerBase::ensure_device_initialized() {
         );
     }
 
-    rc = ensure_binaries_loaded();
+    rc = ensure_binaries_loaded(stream_aicpu_);
     if (rc != 0) return rc;
 
     // Before the AICPU init launch: that launch is what publishes the workspace
@@ -554,13 +627,94 @@ int DeviceRunnerBase::ensure_device_initialized() {
     rc = ensure_dma_workspace_provisioned();
     if (rc != 0) return rc;
 
-    rc = ensure_aicpu_init_launched();
+    rc = ensure_aicpu_init_launched(stream_aicpu_);
     if (rc != 0) return rc;
 
     return ensure_dma_workspace_warmed();
 }
 
-int DeviceRunnerBase::ensure_aicpu_init_launched() {
+int DeviceRunnerBase::init_kernel_context(int device_id, const CallConfig &config, uint64_t context_generation) {
+    const char *serial_env = std::getenv("SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE");
+    const bool serial = serial_env && (serial_env[0] == '1' || serial_env[0] == 't' || serial_env[0] == 'T');
+    int rc = kernel_static_config_.initialize(&config, context_generation, serial);
+    if (rc != 0) return rc;
+    rc = adopt_borrowed_device(device_id);
+    if (rc != 0) return rc;
+
+    rc = kernel_exec_state_.initialize(device_id_, make_onboard_kernel_context_ops());
+    if (rc != 0) {
+        LOG_ERROR("init_kernel_context: context stream/event creation failed: %d", rc);
+        return rc;
+    }
+
+    rtStream_t control_stream = static_cast<rtStream_t>(kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu));
+    rtStream_t aicore_stream = static_cast<rtStream_t>(kernel_exec_state_.hidden_stream(KernelStreamKind::Aicore));
+
+    // Same latch as the program path: resolve_block_dim() is pure arithmetic
+    // once this holds.
+    if (max_block_dim_ == 0) {
+        max_block_dim_ = query_max_block_dim(aicore_stream, &max_cube_cores_, &max_vector_cores_);
+        LOG_INFO(
+            "DeviceRunner: kernel context device=%d max_block_dim=%d (cube=%u, vector=%u)", device_id_, max_block_dim_,
+            max_cube_cores_, max_vector_cores_
+        );
+    }
+
+    rc = ensure_binaries_loaded(control_stream);
+    if (rc != 0) return rc;
+
+    // The async-DMA workspace is program mode's SDMA channel; kernel mode
+    // provisions none, so this launch publishes the all-zero addresses that
+    // mean "that engine is unavailable".
+    return ensure_aicpu_init_launched(control_stream);
+}
+
+PersistentArgsOps DeviceRunnerBase::persistent_args_ops() {
+    PersistentArgsOps ops{};
+    ops.context = this;
+    ops.alloc = [](void *context, size_t bytes) -> void * {
+        return static_cast<DeviceRunnerBase *>(context)->mem_alloc_.alloc(bytes);
+    };
+    ops.free_ = [](void *context, void *ptr) -> int {
+        return static_cast<DeviceRunnerBase *>(context)->mem_alloc_.free(ptr);
+    };
+    ops.copy_h2d = [](void *, void *dst, size_t dst_bytes, const void *src, size_t src_bytes) -> int {
+        return static_cast<int>(rtMemcpy(dst, dst_bytes, src, src_bytes, RT_MEMCPY_HOST_TO_DEVICE));
+    };
+    ops.fill_arch_fields = [](void *context, KernelArgs *args, uint64_t device_id) -> int {
+        return static_cast<DeviceRunnerBase *>(context)->fill_persistent_arch_fields(args, device_id);
+    };
+    return ops;
+}
+
+int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id) {
+    rtStream_t control_stream = static_cast<rtStream_t>(kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu));
+    if (control_stream == nullptr) {
+        LOG_ERROR("prepare_kernel_callable: no live kernel context");
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+
+    if (!kernel_static_config_.initialized()) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (!persistent_args_.is_prepared()) {
+        if (persistent_args_.has_live_resources()) return PTO_RUNTIME_ERR_INVALID_STATE;
+        int rc = prepare_launch_shape(kernel_runtime_, kernel_static_config_.request());
+        if (rc != 0) return rc;
+        rc = prepare_aicpu_affinity(kernel_runtime_, kernel_static_config_.request().aicpu_thread_num, control_stream);
+        if (rc != 0) return rc;
+        rc = configure_kernel_runtime_impl(kernel_runtime_, kernel_static_config_.serial_orch_sched());
+        if (rc != 0) return rc;
+        rc = persistent_args_.prepare_once(kernel_runtime_, persistent_args_ops(), static_cast<uint64_t>(device_id_));
+        if (rc != 0) return rc;
+        rc = kernel_static_config_.freeze();
+        if (rc != 0) return rc;
+    }
+    int rc = register_callable_on_device(callable_id, control_stream);
+    if (rc != 0) return rc;
+
+    return kernel_exec_state_.mark_ready_enqueued();
+}
+
+int DeviceRunnerBase::ensure_aicpu_init_launched(rtStream_t control_stream) {
     if (aicpu_init_launched_) {
         return 0;
     }
@@ -585,14 +739,14 @@ int DeviceRunnerBase::ensure_aicpu_init_launched() {
 
     LOG_INFO("=== launch_aicpu_payload %s ===", host::KernelNames::InitName);
     int rc = launch_aicpu_payload(
-        stream_aicpu_, &init_args, sizeof(init_args), host::KernelNames::InitName, /*aicpu_num=*/1
+        control_stream, &init_args, sizeof(init_args), host::KernelNames::InitName, /*aicpu_num=*/1
     );
     if (rc != 0) {
         LOG_ERROR("ensure_aicpu_init_launched: launch_aicpu_payload failed: %d", rc);
         return rc;
     }
 
-    rc = aclrtSynchronizeStreamWithTimeout(stream_aicpu_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    rc = aclrtSynchronizeStreamWithTimeout(control_stream, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
     if (rc != 0) {
         LOG_ERROR("ensure_aicpu_init_launched: stream sync failed: %d (device_id=%d)", rc, device_id_);
         return rc;
@@ -601,15 +755,16 @@ int DeviceRunnerBase::ensure_aicpu_init_launched() {
     return 0;
 }
 
-int DeviceRunnerBase::ensure_binaries_loaded() {
+int DeviceRunnerBase::ensure_binaries_loaded(rtStream_t control_stream) {
     // Check if already loaded (binaries are owned by the runner via
     // set_executors and live for the runner's lifetime).
     if (binaries_loaded_) {
         return 0;
     }
 
-    // Device must be set first
-    if (stream_aicpu_ == nullptr) {
+    // The control stream is what the bootstrap launch rides; a context that
+    // has not created one yet has no device to bootstrap on.
+    if (control_stream == nullptr) {
         LOG_ERROR("Device not set before loading binaries");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -631,7 +786,7 @@ int DeviceRunnerBase::ensure_binaries_loaded() {
     // rtsLaunchCpuKernel directly against the preinstall file.
     int rc = load_aicpu_op_.BootstrapDispatcher(
         dispatcher_so_binary_.data(), dispatcher_so_binary_.size(), aicpu_so_binary_.data(), aicpu_so_binary_.size(),
-        stream_aicpu_, device_id_
+        control_stream, device_id_
     );
     if (rc != 0) {
         LOG_ERROR("LoadAicpuOp::BootstrapDispatcher failed: %d", rc);
@@ -719,8 +874,12 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
     if (callable == nullptr) {
         return 0;
     }
-    if (stream_aicpu_ == nullptr) {
-        LOG_ERROR("Run context not prepared before upload_chip_callable_buffer()");
+    // The upload allocates and copies; it needs a bound device and nothing
+    // else. A kernel-mode context has no stream_aicpu_ — its AICPU stream
+    // belongs to KernelExecutionState — so the stream is not the precondition
+    // to test here.
+    if (device_id_ < 0) {
+        LOG_ERROR("No device bound before upload_chip_callable_buffer()");
         return 0;
     }
 
@@ -845,11 +1004,24 @@ int DeviceRunnerBase::launch_device_register(int32_t callable_id) {
         return 0;
     }
 
-    int rc = ensure_device_initialized();
+    const int rc = ensure_device_initialized();
     if (rc != 0) {
         LOG_ERROR("launch_device_register: ensure_device_initialized failed: %d", rc);
         return rc;
     }
+    return register_callable_on_device(callable_id, stream_aicpu_);
+}
+
+int DeviceRunnerBase::register_callable_on_device(int32_t callable_id, rtStream_t control_stream) {
+    auto it = callables_.find(callable_id);
+    if (it == callables_.end()) {
+        LOG_ERROR("register_callable_on_device: callable_id=%d not registered", callable_id);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (it->second.host_dlopen_handle != nullptr) {
+        return 0;
+    }
+    int rc = 0;
 
     // Build the orch-SO descriptor straight from CallableState — no full
     // Runtime H2D as the old prewarm path did. Registration always (re)dlopens
@@ -866,23 +1038,23 @@ int DeviceRunnerBase::launch_device_register(int32_t callable_id) {
 
     LOG_INFO("=== launch_aicpu_payload %s ===", host::KernelNames::RegisterCallableName);
     rc = launch_aicpu_payload(
-        stream_aicpu_, &reg_args, sizeof(reg_args), host::KernelNames::RegisterCallableName, /*aicpu_num=*/1
+        control_stream, &reg_args, sizeof(reg_args), host::KernelNames::RegisterCallableName, /*aicpu_num=*/1
     );
     if (rc != 0) {
-        LOG_ERROR("launch_device_register: launch_aicpu_payload failed: %d", rc);
+        LOG_ERROR("register_callable_on_device: launch_aicpu_payload failed: %d", rc);
         return rc;
     }
 
-    rc = aclrtSynchronizeStreamWithTimeout(stream_aicpu_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    rc = aclrtSynchronizeStreamWithTimeout(control_stream, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
     if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
         LOG_ERROR(
-            "launch_device_register: stream sync timeout timeout_ms=%d device_id=%d", PLATFORM_STREAM_SYNC_TIMEOUT_MS,
-            device_id_
+            "register_callable_on_device: stream sync timeout timeout_ms=%d device_id=%d",
+            PLATFORM_STREAM_SYNC_TIMEOUT_MS, device_id_
         );
         return rc;
     }
     if (rc != 0) {
-        LOG_ERROR("launch_device_register: aclrtSynchronizeStreamWithTimeout failed: %d", rc);
+        LOG_ERROR("register_callable_on_device: aclrtSynchronizeStreamWithTimeout failed: %d", rc);
         ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
@@ -1395,6 +1567,13 @@ int DeviceRunnerBase::finalize_common() { return finalize_common_impl(false); }
 int DeviceRunnerBase::abandon_common_after_device_failure() { return finalize_common_impl(true); }
 
 int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
+    if (!abandon_device_resources && execution_mode_latch_.is_kernel()) {
+        const int args_rc = persistent_args_.finalize_once();
+        if (args_rc != 0) {
+            kernel_exec_state_.poison(args_rc);
+            return args_rc;
+        }
+    }
     int rc = 0;
     auto capture = [&rc](int err) {
         if (err != 0 && rc == 0) rc = err;
@@ -1547,6 +1726,20 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
             free_tensor(device_wall_dev_ptr_);
         }
         device_wall_dev_ptr_ = nullptr;
+    }
+
+    // Kernel-mode context resources. The argument blocks route through
+    // mem_alloc_, so they are released before its finalize below; the streams
+    // and events do not, and go after them so a caller that inspects the
+    // teardown sees arguments released while their owning context still
+    // exists. Both are no-ops on a program-mode context.
+    if (abandon_device_resources) {
+        persistent_args_.abandon();
+    } else {
+        const int args_rc = persistent_args_.finalize_once();
+        if (args_rc != 0 && rc == 0) rc = args_rc;
+        const int close_rc = kernel_exec_state_.close();
+        if (close_rc != 0 && rc == 0) rc = close_rc;
     }
 
     // Free all remaining allocations (including handshake buffer and binGmAddr)

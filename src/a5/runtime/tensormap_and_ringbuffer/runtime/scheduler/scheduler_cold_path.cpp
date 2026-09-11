@@ -1081,6 +1081,17 @@ int32_t SchedulerContext::pre_handshake_init(
     Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, uint64_t regs_base
 ) {
     always_assert(runtime != nullptr);
+    return pre_handshake_init(
+        runtime, aicpu_thread_num, sched_thread_num, regs_base, {runtime->dev.func_id_to_addr_, RUNTIME_MAX_FUNC_ID},
+        runtime->get_gm_sm_ptr()
+    );
+}
+
+int32_t SchedulerContext::pre_handshake_init(
+    Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, uint64_t regs_base,
+    simpler::tmr::CallableTableView functions, void *sm
+) {
+    always_assert(runtime != nullptr);
 
     // Zero all per-core execution state before handshake
     memset(core_exec_states_, 0, sizeof(core_exec_states_));
@@ -1158,14 +1169,14 @@ int32_t SchedulerContext::pre_handshake_init(
     // released to dispatch.
     completed_tasks_.store(0, std::memory_order_release);
     orchestrator_done_.store(false, std::memory_order_release);
-    func_id_to_addr_ = runtime->dev.func_id_to_addr_;
+    functions_ = functions;
 
     // total_tasks_ must be read before hs_setup_done_ is published: on the
     // decoupled path the orchestrator resets the SM as soon as it observes
     // hs_setup_done_, which zeroes these ring counters, so the read completes here
     // (on the leader, before any thread is released) rather than post-handshake.
-    if (runtime->get_gm_sm_ptr()) {
-        auto *header = static_cast<SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
+    if (sm) {
+        auto *header = static_cast<SharedMemoryHeader *>(sm);
         int64_t task_count = 0;
         for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
             int32_t ring_tasks = header->rings[r].fc.current_task_index.load(std::memory_order_acquire);
@@ -1181,6 +1192,10 @@ int32_t SchedulerContext::pre_handshake_init(
 }
 
 int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
+    return post_handshake_init(runtime, {runtime->dev.func_id_to_addr_, RUNTIME_MAX_FUNC_ID});
+}
+
+int32_t SchedulerContext::post_handshake_init(Runtime *runtime, simpler::tmr::CallableTableView functions) {
     if (handshake_failed_.load(std::memory_order_acquire)) {
         emergency_shutdown(runtime);
         return -1;
@@ -1281,7 +1296,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
         }
     }
 
-    func_id_to_addr_ = runtime->dev.func_id_to_addr_;
+    functions_ = functions;
 
     return 0;
 }
@@ -1336,7 +1351,7 @@ void SchedulerContext::deinit() {
     regs_ = 0;
     sched_ = nullptr;
     rt_ = nullptr;
-    func_id_to_addr_ = nullptr;
+    functions_ = {};
 }
 
 void SchedulerContext::bind_runtime(RuntimeContext *rt) {

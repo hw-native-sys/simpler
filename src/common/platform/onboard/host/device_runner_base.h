@@ -19,8 +19,9 @@
  *   - The trivial tensor-memory wrappers (`allocate_tensor`,
  *     `free_tensor`, `copy_*_device`).
  *   - The arena-pool accessors (`acquire_pooled_gm_heap`, etc.).
- *   - Device lifecycle: `attach_current_thread`,
- *     `configure_aicore_op_timeout`, `ensure_device_initialized`,
+ *   - Device lifecycle: `bind_current_thread`, `attach_current_thread`,
+ *     `adopt_borrowed_device`, `configure_aicore_op_timeout`,
+ *     `ensure_device_initialized`,
  *     `ensure_binaries_loaded`, persistent AICPU/AICore streams,
  *     dispatcher/executor bytes, `LoadAicpuOp`, `KernelArgsHelper`.
  *   - block_dim resolution: `query_max_block_dim`, `resolve_block_dim`.
@@ -65,6 +66,10 @@
 #include "aicpu_loader/host/load_aicpu_op.h"
 #include "host/chip_swimlane_collector.h"
 #include "host/host_phase_records.h"
+#include "host/execution_mode_latch.h"
+#include "host/kernel_execution_state.h"
+#include "kernel_persistent_args.h"
+#include "host/kernel_static_config.h"
 #include "host/memory_allocator.h"
 #include "host/pmu_collector.h"
 #include "host/runtime_timeout_config.h"
@@ -133,6 +138,35 @@ public:
      * distinct buffers; tests read this to prove the split is real.
      */
     uint64_t retained_temp_addr(uint32_t slot_id) const;
+
+    /**
+     * This context's execution identity, latched once by whichever init entry
+     * constructs it. Every kernel-mode guard on the ACL-lifecycle and arena
+     * paths keys on is_kernel(); `attach_current_thread` refuses outright on a
+     * kernel latch, which is what keeps the program-mode entries and the
+     * per-thread device bind off a borrowed device.
+     */
+    ExecutionModeLatch &execution_mode_latch() { return execution_mode_latch_; }
+
+    /** Context-lifetime streams and events, live only in kernel mode. */
+    KernelExecutionState &kernel_execution_state() { return kernel_exec_state_; }
+    bool has_persistent_kernel_args() const { return persistent_args_.has_live_resources(); }
+
+    /**
+     * Bring up a kernel-mode context on a device the caller already owns:
+     * adopt its identity without changing the caller's device binding, create
+     * the context's own streams and events, then bootstrap the inner AICPU SO
+     * and launch simpler_aicpu_init on the context's AICPU stream. Creates no
+     * async-DMA workspace — that channel belongs to program mode.
+     */
+    int init_kernel_context(int device_id, const CallConfig &config, uint64_t context_generation);
+
+    /**
+     * Register one callable on a kernel-mode context and make sure the
+     * context's persistent argument blocks exist. Idempotent in the part that
+     * matters: only the first callable pays for the argument blocks.
+     */
+    int prepare_kernel_callable(int32_t callable_id);
 
     /** Allocate / free / copy on the per-Worker `MemoryAllocator` + CANN runtime. */
     void *allocate_tensor(std::size_t bytes);
@@ -215,17 +249,37 @@ public:
     std::thread create_thread(std::function<void()> fn);
 
     /**
-     * Attach the current host thread to the target device.
+     * Bind the calling thread to a device, taking nothing else from it.
      *
-     * Required before host-side runtime initialization may allocate or
-     * free device memory on the current thread. Idempotent for the same
-     * id; errors if called with a different id after a prior attach.
-     * No streams are created here.
+     * Idempotent for the same id; errors if called with a different id after
+     * a prior adopt. Creates no streams and records no identity.
+     *
+     * @param device_id  Device ID (0-15)
+     * @return 0 on success, error code on failure.
+     */
+    int bind_current_thread(int device_id);
+
+    /**
+     * Bind the current host thread and adopt the device for a program
+     * context: on the first call it also resolves the timeout config, writes
+     * the card's op-execute watchdog, and records device_id_.
+     *
+     * Required before host-side runtime initialization may allocate or free
+     * device memory on the current thread. Refuses with
+     * PTO_RUNTIME_ERR_UNSUPPORTED on a context latched to kernel mode, which
+     * owns neither the bind nor the watchdog.
      *
      * @param device_id  Device ID (0-15)
      * @return 0 on success, error code on failure.
      */
     int attach_current_thread(int device_id);
+    /**
+     * Record which device a kernel-mode context runs on. Takes no device side
+     * effect: the caller already holds the device current, so this neither
+     * binds the thread nor touches the card's op-execute watchdog. Requires
+     * the execution-mode latch to already read kernel.
+     */
+    int adopt_borrowed_device(int device_id);
 
     /**
      * One-shot device initialization. Performs, in order:
@@ -303,7 +357,7 @@ public:
         sdma_warmup_binary_ = std::move(sdma_warmup_binary);
     }
 
-    /** The device id captured by simpler_init's `attach_current_thread` call. */
+    /** Which device this context is on; -1 until an init entry adopts one. */
     int device_id() const { return device_id_; }
 
     /**
@@ -639,6 +693,14 @@ public:
     virtual int finalize() = 0;
 
     /**
+     * Populate the device-side KernelArgs fields only this architecture knows
+     * how to produce: the per-core register table on both, plus a2a3's FFTS
+     * base address. Anything allocated here must come from `mem_alloc_`, which
+     * is what PersistentKernelArgs releases through. DFX fields stay zero.
+     */
+    virtual int fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) = 0;
+
+    /**
      * dep_gen enablement setter. The shared c_api `simpler_run` calls this
      * unconditionally; a2a3 and a5 override it to capture submit_task inputs.
      * The base default is a no-op for any arch that does not implement dep_gen.
@@ -812,15 +874,27 @@ protected:
      */
     void configure_aicore_op_timeout();
 
+    /** The four operations PersistentKernelArgs is allowed to perform. */
+    PersistentArgsOps persistent_args_ops();
+    virtual int prepare_aicpu_affinity(Runtime &runtime, int requested, rtStream_t control_stream) = 0;
+
     /**
-     * Load AICPU SO and initialize device args. Called from
-     * `ensure_device_initialized()` after the persistent streams are
-     * created. Reads `aicpu_so_binary_` / `dispatcher_so_binary_` off
-     * the runner; releases both host buffers on success.
+     * Launch the AICPU callable registration on `control_stream` and wait for
+     * it. The device must already be up; launch_device_register() is the
+     * program-mode entry that brings it up first.
+     */
+    int register_callable_on_device(int32_t callable_id, rtStream_t control_stream);
+
+    /**
+     * Load AICPU SO and initialize device args. Called after the context's
+     * AICPU control stream exists, with that stream: it is `stream_aicpu_`
+     * for a program-mode context and the kernel context's own AICPU stream
+     * otherwise. Reads `aicpu_so_binary_` / `dispatcher_so_binary_` off the
+     * runner; releases both host buffers on success.
      *
      * @return 0 on success, error code on failure.
      */
-    int ensure_binaries_loaded();
+    int ensure_binaries_loaded(rtStream_t control_stream);
 
     /**
      * Initial launch of `simpler_aicpu_init`, latching the invariants (orch
@@ -831,7 +905,11 @@ protected:
      *
      * @return 0 on success, error code on failure.
      */
-    int ensure_aicpu_init_launched();
+    /**
+     * Launch simpler_aicpu_init on the context's AICPU control stream and
+     * wait for it. Same stream ownership rule as ensure_binaries_loaded().
+     */
+    int ensure_aicpu_init_launched(rtStream_t control_stream);
 
     /**
      * Provision the async-DMA workspaces this Worker asked for (see
@@ -1176,9 +1254,26 @@ protected:
 
     // ---- State shared by both a2a3 and a5 ---------------------------------
     //
-    // `device_id_` is written once by simpler_init and is immutable while
-    // native prepare, execution, and collector threads attach to the runner.
+    // Which device this context is on — not a claim of ownership, which the
+    // execution-mode latch carries instead. Written once before any prepare,
+    // execution or collector thread attaches: `attach_current_thread` writes
+    // it for a program context and `adopt_borrowed_device` for a kernel one, both
+    // guarded on the still-unset value, so repeated same-value writes from
+    // later-attaching threads cannot race.
     int device_id_{-1};
+    // This context's execution identity. Write-once: the first init entry to
+    // run latches it, and it never changes afterwards.
+    ExecutionModeLatch execution_mode_latch_;
+    // Kernel-mode context state. Both stay at their default-constructed
+    // values for a program-mode context, and neither performs a runtime call
+    // on destruction.
+    KernelExecutionState kernel_exec_state_;
+    PersistentKernelArgs persistent_args_;
+    KernelStaticConfig kernel_static_config_;
+    // The Runtime image a kernel-mode context uploads once. Its per-callable
+    // and per-invocation fields stay at the sentinels Runtime() sets; binding
+    // a callable into it is a later step's work.
+    Runtime kernel_runtime_;
     int block_dim_{0};
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
     int worker_count_{0};  // Stored for print_handshake_results
