@@ -303,6 +303,9 @@ _PY_CONTROL_TIMEOUT_S = 30.0
 # text emitted by the orchestration wrapper; keep this pattern in sync with the
 # wrapper's ``L3-L2 endpoint error ... region=<id>`` format.
 _WORKER_CHIP_ENDPOINT_ERROR_REGION_RE = re.compile(r"\bL3-L2 endpoint error\b[^\n]*\bregion=(\d+)\b")
+_SPSC_QUEUE_ENDPOINT_ERROR_RE = re.compile(
+    r"SPSC queue endpoint error op=\S+ kind=\d+ session=0x([0-9A-Fa-f]{16}) transaction=(\d+) msg="
+)
 
 
 def _host_spans_active() -> bool:
@@ -8549,6 +8552,43 @@ class Worker:
         if worker_id < 0 or worker_id >= len(device_ids):
             raise ValueError(f"create_worker_chip_region: worker_id {worker_id} outside [0, {len(device_ids)})")
 
+    def _poison_spsc_queue_from_endpoint_error(
+        self, exc: BaseException, resources: _RunResources | None = None
+    ) -> bool:
+        text = str(exc)
+        if "SPSC queue endpoint error" not in text:
+            return False
+        match = _SPSC_QUEUE_ENDPOINT_ERROR_RE.search(text)
+        if match is None:
+            self._record_unreclaimable(
+                "spsc queue: endpoint error marker is malformed; no further work is admitted",
+                exc,
+            )
+            return True
+        session = struct.pack("<Q", int(match.group(1), 16))
+        transaction_id = int(match.group(2))
+        if transaction_id == 0:
+            self._record_unreclaimable(
+                "spsc queue: endpoint error transaction id is illegal; no further work is admitted",
+                exc,
+            )
+            return True
+        try:
+            self._region_instance_registry.record_data_plane_failure_by_allocation_identity(
+                resources, session, transaction_id, exc
+            )
+        except MaterializationError as routing:
+            self._record_unreclaimable(
+                "spsc queue: data-plane failure routing failed for allocation identity; no further work is admitted",
+                routing,
+            )
+            return True
+        self._record_unreclaimable(
+            "spsc queue: issued local operation failed; no further work is admitted",
+            exc,
+        )
+        return True
+
     def _poison_worker_chip_region_from_endpoint_error(
         self, exc: BaseException, resources: _RunResources | None = None
     ) -> bool:
@@ -11649,6 +11689,8 @@ class Worker:
 
             def _poison_endpoint() -> None:
                 if native_error is not None:
+                    if self._poison_spsc_queue_from_endpoint_error(native_error, resources):
+                        return
                     self._poison_worker_chip_region_from_endpoint_error(native_error, resources)
 
             def _release_native_run() -> None:

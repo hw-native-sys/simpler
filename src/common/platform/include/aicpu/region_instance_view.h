@@ -111,8 +111,13 @@ class RegionInstanceViewImpl {
 public:
     class PayloadPart {
     public:
-        bool read(uint64_t offset, uint64_t nbytes, RegionPayloadView &out) {
-            return view_->payload_read(offset, nbytes, out);
+        template <typename View>
+        bool read(uint64_t offset, uint64_t nbytes, View &out) {
+            RegionPayloadView view{};
+            bool ok = view_->payload_read(offset, nbytes, view);
+            out.local_addr = view.local_addr;
+            out.nbytes = view.nbytes;
+            return ok;
         }
 
         bool write(uint64_t offset, const void *src, uint64_t nbytes) {
@@ -134,8 +139,13 @@ public:
 
         bool notify(uint64_t offset, int32_t value, RegionNotifyOp op) { return view_->notify(offset, value, op); }
 
-        bool test(uint64_t offset, int32_t cmp_value, RegionWaitCmp cmp, RegionSignalTestResult &out) {
-            return view_->test(offset, cmp_value, cmp, out);
+        template <typename Sample>
+        bool test(uint64_t offset, int32_t cmp_value, RegionWaitCmp cmp, Sample &out) {
+            RegionSignalTestResult sample{};
+            bool ok = view_->test(offset, cmp_value, cmp, sample);
+            out.matched = sample.matched;
+            out.observed = sample.observed;
+            return ok;
         }
 
         bool wait(uint64_t offset, int32_t cmp_value, RegionWaitCmp cmp, uint64_t timeout_ns, int32_t &observed) {
