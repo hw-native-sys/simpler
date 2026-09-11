@@ -474,6 +474,7 @@ def test_kernel_entries_reject_a_context_with_no_kernel_claim(arch: str, runtime
         assert lib.simpler_kernel_mode_prepare_callable(ctx, image, len(image), None) == PTO_RUNTIME_ERR_INTERNAL
         assert _prepare(lib, ctx, image, 1) == (PTO_RUNTIME_ERR_INTERNAL, -1, 0)
         assert _prepare(lib, ctx, image, len(image) - 1) == (PTO_RUNTIME_ERR_INTERNAL, -1, 0)
+        assert _prepare(lib, ctx, image, 512 * 1024 * 1024 + 1) == (PTO_RUNTIME_ERR_CALLABLE_BYTES_EXCEEDED, -1, 0)
         assert _prepare(lib, ctx, image) == (PTO_RUNTIME_ERR_INVALID_STATE, -1, 0)
         assert _prepare(lib, None, image) == (PTO_RUNTIME_ERR_INTERNAL, -1, 0)
         assert lib.simpler_kernel_mode_launch(ctx, CallableHandle(0, 1), image, None) == PTO_RUNTIME_ERR_INTERNAL

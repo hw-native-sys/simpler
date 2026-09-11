@@ -76,6 +76,10 @@ TEST(KernelEntryValidation, InitRejectsEachStructuralViolation) {
 
 TEST(KernelEntryValidation, PrepareCallableChecksOutputPointerAndImageSize) {
     SimplerCallableHandle id{-1, 0};
+    EXPECT_EQ(
+        validate_kernel_prepare_callable_args(kCtx, kCallableImage, kKernelCallableByteLimit + 1, &id),
+        PTO_RUNTIME_ERR_CALLABLE_BYTES_EXCEEDED
+    );
     EXPECT_EQ(validate_kernel_prepare_callable_args(kCtx, kCallableImage, sizeof(ChipCallable), &id), 0);
     EXPECT_EQ(
         validate_kernel_prepare_callable_args(nullptr, kCallableImage, sizeof(ChipCallable), &id),

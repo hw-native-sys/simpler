@@ -18,6 +18,7 @@
 #include "chip_callable_layout.h"
 #include "callable_protocol.h"
 #include "kernel_callable_residency.h"
+#include "host/kernel_entry_validation.h"
 #include "runtime_c_api.h"
 
 static_assert(std::is_trivially_copyable_v<SimplerCallableHandle> && std::is_standard_layout_v<SimplerCallableHandle>);
@@ -35,7 +36,7 @@ struct KernelCallableResidency {
 class KernelCallableCache {
 public:
     static constexpr size_t kDescriptorBytes = MAX_REGISTERED_CALLABLE_IDS * sizeof(KernelCallableDeviceResidency);
-    static constexpr size_t kByteLimit = 512ULL * 1024 * 1024;
+    static constexpr size_t kByteLimit = kKernelCallableByteLimit;
 
     explicit KernelCallableCache(size_t byte_limit = kByteLimit) :
         byte_limit_(std::min(byte_limit, kByteLimit)) {}
@@ -45,13 +46,14 @@ public:
         void *context;
         void *(*allocate)(void *, size_t);
         int (*copy)(void *, void *, const void *, size_t);
+        int (*release)(void *, void *){nullptr};
     };
 
     int
     stage(const ChipCallable *callable, size_t bytes, const Ops &ops, SimplerCallableHandle &out_handle, bool &hit) {
         out_handle = {-1, 0};
         hit = false;
-        if (generation_ == 0) return PTO_RUNTIME_ERR_INVALID_STATE;
+        if (closing_ || generation_ == 0) return PTO_RUNTIME_ERR_INVALID_STATE;
         if (bytes > byte_limit_) return PTO_RUNTIME_ERR_CALLABLE_BYTES_EXCEEDED;
         int rc = validate_image(callable, bytes);
         if (rc != 0) return rc;
@@ -122,9 +124,11 @@ public:
     }
 
     void commit(int32_t id) {
+        if (closing_) return;
         if (!entries_.empty() && entries_.back().residency.callable_id == id) entries_.back().ready = true;
     }
     void rollback(int32_t id) {
+        if (closing_) return;
         if (!entries_.empty() && !entries_.back().ready && entries_.back().residency.callable_id == id) {
             used_ -= entries_.back().charged;
             entries_.pop_back();
@@ -133,6 +137,7 @@ public:
     int resolve(SimplerCallableHandle handle, KernelCallableResidency &out) const {
         const int32_t id = handle.callable_id;
         out = {};
+        if (closing_) return PTO_RUNTIME_ERR_INVALID_STATE;
         if (id < 0 || handle.generation == 0) return PTO_RUNTIME_ERR_INTERNAL;
         if (id >= MAX_REGISTERED_CALLABLE_IDS) return PTO_RUNTIME_ERR_CALLABLE_COUNT_EXCEEDED;
         for (const auto &entry : entries_) {
@@ -145,6 +150,7 @@ public:
         return PTO_RUNTIME_ERR_CALLABLE_NOT_RESIDENT;
     }
     uint64_t uploaded_address(uint64_t hash) const {
+        if (closing_) return 0;
         for (const auto &entry : entries_)
             if (entry.hash == hash) return entry.residency.device_address;
         return 0;
@@ -156,51 +162,41 @@ public:
         });
     }
     size_t host_bytes() const { return used_ - padding_bytes(); }
-    // MemoryAllocator owns the arena; this operation only drops host metadata.
-    void clear() {
+    // Closing withdraws all Host borrowing before any owner starts freeing.
+    // External task/graph quiescence remains a precondition, not a side effect.
+    void begin_close() noexcept { closing_ = true; }
+    bool has_live_resources() const noexcept { return arena_ != nullptr; }
+    int finalize(const Ops &ops) noexcept {
+        begin_close();
+        if (arena_ != nullptr) {
+            if (ops.release == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+            try {
+                const int rc = ops.release(ops.context, arena_);
+                if (rc != 0) return rc;
+            } catch (...) {
+                return PTO_RUNTIME_ERR_INTERNAL;
+            }
+        }
+        clear_metadata();
+        return 0;
+    }
+    // Only after the owner confirms fatal device invalidation/quarantine.
+    void abandon() noexcept {
+        begin_close();
+        clear_metadata();
+    }
+
+    static int validate_image(const ChipCallable *callable, size_t bytes) {
+        return validate_kernel_callable_image(callable, bytes);
+    }
+
+private:
+    void clear_metadata() noexcept {
         entries_.clear();
         arena_ = nullptr;
         used_ = 0;
         generation_ = 0;
     }
-
-    static int validate_image(const ChipCallable *callable, size_t bytes) {
-        if (!callable || bytes < sizeof(ChipCallable) || reinterpret_cast<uintptr_t>(callable) % alignof(ChipCallable))
-            return PTO_RUNTIME_ERR_INTERNAL;
-        if (callable->sig_count_ < 0 || callable->sig_count_ > CHIP_MAX_TENSOR_ARGS || callable->child_count_ < 0 ||
-            callable->child_count_ > 1024 || callable->func_name_len_ >= CALLABLE_FUNC_NAME_MAX ||
-            callable->config_name_len_ >= CALLABLE_FUNC_NAME_MAX)
-            return PTO_RUNTIME_ERR_INTERNAL;
-        if (callable->func_name_[callable->func_name_len_] != '\0' ||
-            callable->config_name_[callable->config_name_len_] != '\0')
-            return PTO_RUNTIME_ERR_INTERNAL;
-        int32_t scalars = 0;
-        for (int32_t i = 0; i < callable->sig_count_; ++i) {
-            const auto direction = callable->signature_[i];
-            if (direction < ArgDirection::SCALAR || direction > ArgDirection::INOUT) return PTO_RUNTIME_ERR_INTERNAL;
-            scalars += direction == ArgDirection::SCALAR;
-        }
-        if (callable->scalar_count_ < 0 || scalars > CHIP_MAX_SCALAR_ARGS ||
-            (callable->scalar_count_ != 0 && callable->scalar_count_ != scalars))
-            return PTO_RUNTIME_ERR_INTERNAL;
-        const size_t storage = bytes - offsetof(ChipCallable, storage_);
-        size_t end = callable->binary_size_;
-        if (end > storage) return PTO_RUNTIME_ERR_INTERNAL;
-        for (int32_t i = 0; i < callable->child_count_; ++i) {
-            const size_t offset = callable->child_offsets_[i];
-            if (offset % CALLABLE_ALIGN || offset < end || offset > storage ||
-                CoreCallable::binary_data_offset() > storage - offset)
-                return PTO_RUNTIME_ERR_INTERNAL;
-            const auto &child = callable->child(i);
-            if (child.sig_count_ < 0 || child.sig_count_ > CORE_MAX_TENSOR_ARGS ||
-                child.binary_size_ > storage - offset - CoreCallable::binary_data_offset())
-                return PTO_RUNTIME_ERR_INTERNAL;
-            end = std::max(end, offset + CoreCallable::binary_data_offset() + child.binary_size_);
-        }
-        return end == storage ? 0 : PTO_RUNTIME_ERR_INTERNAL;
-    }
-
-private:
     struct Entry {
         KernelCallableResidency residency;
         uint64_t hash{0};
@@ -220,6 +216,7 @@ private:
     size_t byte_limit_;
     size_t used_{0};
     uint64_t generation_{0};
+    bool closing_{false};
     void *arena_{nullptr};
     std::vector<Entry> entries_;
 };

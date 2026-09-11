@@ -16,6 +16,7 @@
 #include <iostream>
 #include <set>
 #include <sstream>
+#include <vector>
 
 #include <acl/acl.h>
 #include "device_runner_base.h"
@@ -181,6 +182,38 @@ int DeviceRunnerBase::launch_aicpu_payload(
 }
 
 namespace {
+
+TEST_F(KernelTopologyLifecycle, CallableArenaFreeFailureRetainsAllocatorAndCloseOwnership) {
+    auto &cache = runner.kernel_callable_cache();
+    cache.set_generation(17);
+    std::vector<uint8_t> image(sizeof(ChipCallable));
+    SimplerCallableHandle handle{-1, 0};
+    bool hit = false;
+    ASSERT_EQ(
+        cache.stage(
+            reinterpret_cast<const ChipCallable *>(image.data()), image.size(), runner.kernel_callable_cache_ops(),
+            handle, hit
+        ),
+        0
+    );
+    cache.commit(handle.callable_id);
+    const auto bytes = runner.committed_device_memory();
+    ASSERT_GT(bytes, 0u);
+    fake.free_error = kInjectedError;
+    EXPECT_EQ(runner.finalize(), kInjectedError);
+    EXPECT_TRUE(cache.has_live_resources());
+    EXPECT_EQ(runner.committed_device_memory(), bytes);
+    EXPECT_EQ(fake.live.size(), 1u);
+    EXPECT_EQ(fake.free_calls, 1);
+    KernelCallableResidency found;
+    EXPECT_EQ(cache.resolve(handle, found), PTO_RUNTIME_ERR_INVALID_STATE);
+    fake.free_error = 0;
+    EXPECT_EQ(runner.finalize(), 0);
+    EXPECT_FALSE(cache.has_live_resources());
+    EXPECT_EQ(runner.committed_device_memory(), 0u);
+    EXPECT_EQ(fake.free_calls, 2);
+    EXPECT_TRUE(fake.live.empty());
+}
 
 TEST_F(KernelTopologyLifecycle, SuccessReleasesScratchAndReusesOccupancyCache) {
     ASSERT_EQ(query(), 0);

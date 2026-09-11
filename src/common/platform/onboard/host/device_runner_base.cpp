@@ -624,6 +624,9 @@ KernelCallableCache::Ops DeviceRunnerBase::kernel_callable_cache_ops() {
         },
         [](void *, void *dst, const void *src, size_t bytes) -> int {
             return static_cast<int>(rtMemcpy(dst, bytes, src, bytes, RT_MEMCPY_HOST_TO_DEVICE));
+        },
+        [](void *context, void *ptr) -> int {
+            return static_cast<DeviceRunnerBase *>(context)->mem_alloc_.free(ptr);
         }
     };
 }
@@ -1513,11 +1516,17 @@ int DeviceRunnerBase::finalize_common() { return finalize_common_impl(false); }
 int DeviceRunnerBase::abandon_common_after_device_failure() { return finalize_common_impl(true); }
 
 int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
+    if (execution_mode_latch_.is_kernel()) kernel_callable_cache_.begin_close();
     if (!abandon_device_resources && execution_mode_latch_.is_kernel()) {
         const int args_rc = persistent_args_.finalize_once();
         if (args_rc != 0) {
             kernel_exec_state_.poison(args_rc);
             return args_rc;
+        }
+        const int cache_rc = kernel_callable_cache_.finalize(kernel_callable_cache_ops());
+        if (cache_rc != 0) {
+            kernel_exec_state_.poison(cache_rc);
+            return cache_rc;
         }
     }
     int rc = 0;
@@ -1614,7 +1623,7 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
         }
     }
     chip_callable_buffers_.clear();
-    kernel_callable_cache_.clear();
+    if (abandon_device_resources) kernel_callable_cache_.abandon();
 
     // hbg path: dlclose any host orch handles callers forgot to unregister.
     // finalize() is the last chance; Worker.close() does not auto-unregister

@@ -389,7 +389,8 @@ void destroy_device_context(DeviceContextHandle ctx) {
     // graph, so the context is deliberately leaked instead: the caller closes
     // it explicitly, or the process ends.
     if (runner != nullptr &&
-        (runner->kernel_execution_state().has_live_resources() || runner->has_persistent_kernel_args())) {
+        (runner->kernel_execution_state().has_live_resources() || runner->has_persistent_kernel_args() ||
+         runner->kernel_callable_cache().has_live_resources())) {
         LOG_ERROR("destroy_device_context: refusing to destroy an unclosed kernel context; leaving it alive");
         return;
     }

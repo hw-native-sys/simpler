@@ -50,10 +50,12 @@ inline int validate_kernel_init_args(
     return 0;
 }
 
-inline int validate_kernel_prepare_callable_args(
-    const void *ctx, const void *callable, size_t callable_size, const SimplerCallableHandle *out_handle
-) {
-    if (ctx == nullptr || callable == nullptr || out_handle == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+inline constexpr size_t kKernelCallableByteLimit = 512ULL * 1024 * 1024;
+
+// Shared by the C entry and the residency cache, before any hash or upload.
+inline int validate_kernel_callable_image(const void *callable, size_t callable_size) {
+    if (callable == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    if (callable_size > kKernelCallableByteLimit) return PTO_RUNTIME_ERR_CALLABLE_BYTES_EXCEEDED;
     if (callable_size < sizeof(ChipCallable)) return PTO_RUNTIME_ERR_INTERNAL;
     /* ChipCallable's storage_ is CALLABLE_CHILD_ALIGN-aligned relative to the
        header, so a misaligned image puts every child at a misaligned address. */
@@ -98,6 +100,13 @@ inline int validate_kernel_prepare_callable_args(
     }
     if (used != storage_size) return PTO_RUNTIME_ERR_INTERNAL;
     return 0;
+}
+
+inline int validate_kernel_prepare_callable_args(
+    const void *ctx, const void *callable, size_t callable_size, const SimplerCallableHandle *out_handle
+) {
+    if (ctx == nullptr || out_handle == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    return validate_kernel_callable_image(callable, callable_size);
 }
 
 inline int validate_kernel_launch_args(

@@ -26,6 +26,10 @@ struct FakeDevice {
     int descriptors{0};
     KernelCallableDeviceResidency descriptor{};
     int copy_error{0};
+    int descriptor_error{0};
+    int releases{0};
+    int release_error{0};
+    bool throw_release{false};
     bool fail_alloc{false};
     std::vector<uint8_t> last_upload;
     KernelCallableCache::Ops ops() {
@@ -41,11 +45,18 @@ struct FakeDevice {
                 if (bytes == sizeof(KernelCallableDeviceResidency)) {
                     ++self.descriptors;
                     std::memcpy(&self.descriptor, src, bytes);
-                    return self.copy_error;
+                    return self.descriptor_error != 0 ? self.descriptor_error : self.copy_error;
                 }
                 ++self.copies;
                 self.last_upload.assign(static_cast<const uint8_t *>(src), static_cast<const uint8_t *>(src) + bytes);
                 return self.copy_error;
+            },
+            [](void *p, void *address) -> int {
+                auto &self = *static_cast<FakeDevice *>(p);
+                ++self.releases;
+                EXPECT_EQ(address, reinterpret_cast<void *>(0x10000000));
+                if (self.throw_release) throw std::bad_alloc();
+                return self.release_error;
             }
         };
     }
@@ -231,8 +242,9 @@ TEST(KernelCallableCache, HostBackingIsImmutableAndResolveDoesNotAllocateOrUploa
         ASSERT_EQ(cache.resolve({0, 11}, found), 0);
     EXPECT_EQ(device.allocations, 1);
     EXPECT_EQ(device.copies, 1);
-    cache.clear();
-    EXPECT_EQ(cache.resolve({0, 11}, found), PTO_RUNTIME_ERR_CALLABLE_NOT_RESIDENT);
+    EXPECT_EQ(cache.finalize(device.ops()), 0);
+    EXPECT_EQ(cache.resolve({0, 11}, found), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(device.releases, 1);
     EXPECT_EQ(cache.host_bytes(), 0);
 }
 TEST(KernelCallableCache, ChildAddressesArePatchedOnlyInDeviceScratch) {
@@ -321,5 +333,121 @@ TEST(KernelCallableCache, HandleGenerationIsCheckedWithoutMutation) {
     other.commit(0);
     EXPECT_EQ(other.resolve({0, 17}, found), PTO_RUNTIME_ERR_CALLABLE_STALE);
     EXPECT_EQ(other.resolve({0, 18}, found), 0);
+}
+
+TEST(KernelCallableCache, FailedCloseRetainsArenaAndWithdrawsEveryBorrow) {
+    for (bool throws : {false, true}) {
+        KernelCallableCache cache;
+        cache.set_generation(17);
+        FakeDevice device;
+        bool hit;
+        auto blob = image();
+        ASSERT_EQ(prepare(cache, device, 0, blob, hit), 0);
+        cache.commit(0);
+        ASSERT_EQ(prepare(cache, device, 1, image(65, 2), hit), 0);
+        const auto bytes = cache.resident_bytes();
+        device.release_error = -123;
+        device.throw_release = throws;
+        EXPECT_EQ(cache.finalize(device.ops()), throws ? PTO_RUNTIME_ERR_INTERNAL : -123);
+        EXPECT_TRUE(cache.has_live_resources());
+        EXPECT_EQ(cache.resident_bytes(), bytes);
+        EXPECT_EQ(cache.resident_count(), 1u);
+        KernelCallableResidency found;
+        EXPECT_EQ(cache.resolve({0, 17}, found), PTO_RUNTIME_ERR_INVALID_STATE);
+        EXPECT_EQ(found.device_address, 0u);
+        const auto hash =
+            compute_chip_callable_layout(reinterpret_cast<const ChipCallable *>(blob.data())).content_hash;
+        EXPECT_EQ(cache.uploaded_address(hash), 0u);
+        EXPECT_EQ(prepare(cache, device, 0, blob, hit), PTO_RUNTIME_ERR_INVALID_STATE);
+        cache.commit(1);
+        cache.rollback(1);
+        EXPECT_EQ(cache.resident_bytes(), bytes);
+        EXPECT_EQ(cache.resident_count(), 1u);
+        device.release_error = 0;
+        device.throw_release = false;
+        EXPECT_EQ(cache.finalize(device.ops()), 0);
+        EXPECT_FALSE(cache.has_live_resources());
+        EXPECT_EQ(cache.resident_bytes(), 0u);
+        EXPECT_EQ(cache.resident_count(), 0u);
+        EXPECT_EQ(cache.finalize(device.ops()), 0);
+        EXPECT_EQ(device.releases, 2);
+        cache.set_generation(18);
+        EXPECT_EQ(prepare(cache, device, 0, blob, hit), PTO_RUNTIME_ERR_INVALID_STATE);
+    }
+}
+
+TEST(KernelCallableCache, CopyFailureOrRollbackStillOwnsAnEmptyArena) {
+    for (int failure = 0; failure < 3; ++failure) {
+        KernelCallableCache cache;
+        cache.set_generation(1);
+        FakeDevice device;
+        device.copy_error = failure == 0 ? -123 : 0;
+        device.descriptor_error = failure == 1 ? -123 : 0;
+        bool hit;
+        ASSERT_EQ(prepare(cache, device, 0, image(), hit), failure == 2 ? 0 : -123);
+        if (failure == 2) cache.rollback(0);
+        EXPECT_EQ(cache.resident_count(), 0u);
+        EXPECT_EQ(cache.resident_bytes(), 0u);
+        EXPECT_TRUE(cache.has_live_resources());
+        device.release_error = -123;
+        EXPECT_EQ(cache.finalize(device.ops()), -123);
+        EXPECT_TRUE(cache.has_live_resources());
+        device.release_error = 0;
+        EXPECT_EQ(cache.finalize(device.ops()), 0);
+        EXPECT_FALSE(cache.has_live_resources());
+        EXPECT_EQ(device.releases, 2);
+    }
+}
+
+TEST(KernelCallableCache, MissingReleaseRetainsOwnershipAndAbandonDoesNotFree) {
+    KernelCallableCache cache;
+    cache.set_generation(1);
+    FakeDevice device;
+    bool hit;
+    ASSERT_EQ(prepare(cache, device, 0, image(), hit), 0);
+    auto ops = device.ops();
+    ops.release = nullptr;
+    EXPECT_EQ(cache.finalize(ops), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_TRUE(cache.has_live_resources());
+    cache.abandon();
+    EXPECT_FALSE(cache.has_live_resources());
+    EXPECT_EQ(cache.resident_bytes(), 0u);
+    EXPECT_EQ(cache.finalize(device.ops()), 0);
+    EXPECT_EQ(device.releases, 0);
+}
+
+TEST(KernelCallableCache, BeginCloseWithdrawsBorrowingWithoutCallingDevice) {
+    KernelCallableCache cache;
+    cache.set_generation(1);
+    FakeDevice device;
+    bool hit;
+    ASSERT_EQ(prepare(cache, device, 0, image(), hit), 0);
+    cache.commit(0);
+    cache.begin_close();
+    EXPECT_TRUE(cache.has_live_resources());
+    EXPECT_EQ(device.releases, 0);
+    KernelCallableResidency found;
+    EXPECT_EQ(cache.resolve({0, 1}, found), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(prepare(cache, device, 0, image(), hit), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(cache.finalize(device.ops()), 0);
+    EXPECT_EQ(device.releases, 1);
+}
+
+TEST(KernelCallableCache, AdmissionUsesTheFullSharedImageValidator) {
+    KernelCallableCache cache;
+    cache.set_generation(1);
+    FakeDevice device;
+    bool hit;
+    auto blob = image();
+    auto *chip = reinterpret_cast<ChipCallable *>(blob.data());
+    chip->sig_count_ = 2;
+    chip->signature_[0] = ArgDirection::SCALAR;
+    chip->signature_[1] = ArgDirection::IN;
+    EXPECT_EQ(prepare(cache, device, 0, blob, hit), PTO_RUNTIME_ERR_INTERNAL);
+    chip->sig_count_ = 0;
+    chip->func_name_len_ = 2;
+    chip->func_name_[0] = 'f';
+    EXPECT_EQ(prepare(cache, device, 0, blob, hit), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(device.allocations, 0);
 }
 }  // namespace
