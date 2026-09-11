@@ -127,6 +127,11 @@ void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value);
  */
 void platform_init_aicore_regs(uint64_t reg_addr);
 
+// Kernel-mode group retirement uses one deadline and publishes its independent
+// return gates only after every acknowledged register window is quiescent.
+uint64_t platform_aicore_exit_deadline();
+void platform_close_aicore_window(uint64_t reg_addr);
+
 /**
  * Deinitialize AICore registers before termination
  *

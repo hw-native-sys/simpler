@@ -219,9 +219,9 @@ class TestRuntimeBuilderGetBinaries:
 
         monkeypatch.setattr(rb_module, "PROJECT_ROOT", tmp_path)
 
-    def _make_runtime(self, tmp_path, test_arch):
+    def _make_runtime(self, tmp_path, test_arch, name="test_rt"):
         """Create a fake runtime with a valid build_config.py."""
-        rt_dir = tmp_path / "src" / test_arch / "runtime" / "test_rt"
+        rt_dir = tmp_path / "src" / test_arch / "runtime" / name
         for sub in ["aicore", "aicpu", "host", "runtime"]:
             (rt_dir / sub).mkdir(parents=True)
 
@@ -264,7 +264,7 @@ class TestRuntimeBuilderGetBinaries:
         assert result.aicore_path.name == "libaicore.so"
 
     def _isolated_builder(self, MockCompiler, tmp_path, monkeypatch, platform):
-        """A builder whose staging tree is tmp_path rather than the real build/lib.
+        """A builder whose staging and cache trees stay under tmp_path.
 
         ``_LIB_DIR`` is a class attribute bound to the real PROJECT_ROOT at import,
         so the ``_patch_runtime_root`` fixture does not redirect it. The SDMA
@@ -283,7 +283,43 @@ class TestRuntimeBuilderGetBinaries:
 
         builder = RuntimeBuilder(platform=platform)
         builder._LIB_DIR = tmp_path / "lib"
+        builder._CACHE_DIR = tmp_path / "cache"
         return builder, mock_instance
+
+    @pytest.mark.parametrize("platform", ["a2a3", "a5", "a2a3sim", "a5sim"])
+    @pytest.mark.parametrize("runtime", ["tensormap_and_ringbuffer", "host_build_graph"])
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
+    def test_kernel_aicore_build_and_lookup_matrix(self, MockCompiler, tmp_path, monkeypatch, platform, runtime):
+        """Only TMR onboard exports its separate ELF; the program path is unchanged."""
+        from simpler_setup import pto_isa  # noqa: PLC0415
+
+        arch = platform.removesuffix("sim")
+        self._make_runtime(tmp_path, arch, runtime)
+        builder, mock_instance = self._isolated_builder(MockCompiler, tmp_path, monkeypatch, platform)
+        monkeypatch.setattr(pto_isa, "validate_runtime_pto_isa_current_pin", lambda *args, **kwargs: None)
+        output_dir = builder._LIB_DIR / arch / builder._variant / runtime
+        output_dir.mkdir(parents=True)
+        for target in ("host", "aicpu", "aicore"):
+            getattr(mock_instance, f"{target}_target").get_binary_name.return_value = f"lib{target}.so"
+            (output_dir / f"lib{target}.so").write_bytes(b"program")
+        shared = builder._resolve_sim_context_path() or builder._resolve_dispatcher_path()
+        assert shared is not None
+        shared.parent.mkdir(parents=True, exist_ok=True)
+        shared.write_bytes(b"shared")
+        monkeypatch.setattr(builder, "ensure_sim_context", lambda **kwargs: builder._resolve_sim_context_path())
+
+        # Absence must not fall back to the program ELF, even for TMR onboard.
+        assert builder.get_binaries(runtime).kernel_aicore_path is None
+        staged = output_dir / "aicore_kernel_mode.o"
+        staged.write_bytes(b"kernel")
+        eligible = builder._variant == "onboard" and runtime == "tensormap_and_ringbuffer"
+        for build in (False, True):
+            result = builder.get_binaries(runtime, build=build)
+            assert result.aicore_path == output_dir / "libaicore.so"
+            assert result.kernel_aicore_path == (staged if eligible else None)
+
+        dests = {call.args[0]: call.kwargs["kernel_aicore_dest"] for call in mock_instance.compile.call_args_list}
+        assert dests == {"host": None, "aicpu": None, "aicore": output_dir if eligible else None}
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_sdma_warmup_path_is_none_when_nothing_staged(self, MockCompiler, tmp_path, monkeypatch):

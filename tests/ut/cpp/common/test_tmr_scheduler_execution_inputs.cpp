@@ -19,6 +19,7 @@
 #include "callable.h"
 #include "runtime.h"
 #include "scheduler/scheduler.h"
+#include "tensormap_and_ringbuffer/kernel_core_group.h"
 
 #define private public
 #include "scheduler/scheduler_context.h"
@@ -264,6 +265,50 @@ TEST_F(TmrSchedulerExecutionInputsTest, ProgramHandshakeWrappersConsumeResidentT
     DispatchPayload dispatch{};
     ASSERT_TRUE(context->build_payload(dispatch, slot, SubtaskSlot::AIC, 0, false));
     EXPECT_EQ(dispatch.function_bin_addr, reinterpret_cast<uint64_t>(&callable_b));
+}
+
+TEST_F(TmrSchedulerExecutionInputsTest, KernelTimeoutCancelsWithoutLegacyRetirementOrRelease) {
+    using namespace simpler::tmr;
+    initialize({table_a.data(), table_a.size()});
+    TmrLaunchControl control{};
+    std::array<TmrCoreReport, 3> reports{};
+    std::array<uint64_t, 3> bases{};
+    for (size_t i = 0; i < reports.size(); ++i) {
+        reports[i].physical_core_id = i;
+        reports[i].core_type = static_cast<uint32_t>(i == 0 ? CoreType::AIC : CoreType::AIV);
+        reports[i].ready = i + 1;
+        bases[i] = reinterpret_cast<uint64_t>(registers.data() + 256 * i);
+        context->core_exec_states_[i].reg_addr = bases[i];
+    }
+    KernelCoreGroup group;
+    ASSERT_TRUE(group.attach({&control, reports.data(), 3, 17}));
+    ASSERT_EQ(group.collect_reports(bases.data(), bases.size()), 0);
+    for (size_t i = 0; i < reports.size(); ++i)
+        group.open(i);
+    context->bind_kernel_core_group(&group);
+    // Includes the legacy teardown gates on architectures that have them.
+    std::vector<uint8_t> resident_before(sizeof(resident->dev));
+    std::memcpy(resident_before.data(), &resident->dev, resident_before.size());
+    register_writes = 0;
+    const int32_t result = context->handle_timeout_exit(
+        0, sched.sm_header, resident.get(), 10, 0
+#if SIMPLER_DFX
+        ,
+        0
+#endif
+    );
+    EXPECT_EQ(result, -SIMPLER_ERROR_SCHEDULER_TIMEOUT);
+    EXPECT_TRUE(context->is_completed());
+    EXPECT_EQ(sched.sm_header->sched_error_code.load(), SIMPLER_ERROR_SCHEDULER_TIMEOUT);
+    EXPECT_EQ(register_writes, 0);
+    for (size_t i = 0; i < reports.size(); ++i) {
+        EXPECT_EQ(reports[i].command, static_cast<uint32_t>(TmrCoreCommand::Cancel));
+        EXPECT_EQ(reports[i].round_epoch, 17u);
+        EXPECT_EQ(reports[i].release, static_cast<uint32_t>(TmrCoreRelease::Wait));
+    }
+    EXPECT_EQ(std::memcmp(&resident->dev, resident_before.data(), resident_before.size()), 0);
+    context->deinit();
+    EXPECT_EQ(context->kernel_cores_, nullptr);
 }
 
 }  // namespace

@@ -127,6 +127,11 @@ class RuntimeBinaries:
     it is optional: only arches whose aicore CMakeLists builds it have one, and
     a missing warmup ELF costs latency on the first TPREFETCH_ASYNC rather than
     breaking the worker, so the field is left ``None`` instead of raising.
+
+    ``kernel_aicore_path`` is the separate kernel-mode AICore ELF for TMR
+    onboard builds. It is optional for pre-built artifacts and always ``None``
+    for HBG and sim. ``aicore_path`` remains the program-mode binary; consumers
+    must not use it as a fallback when the kernel-mode artifact is absent.
     """
 
     host_path: Path
@@ -135,6 +140,7 @@ class RuntimeBinaries:
     sim_context_path: Optional[Path] = None
     dispatcher_path: Optional[Path] = None
     sdma_warmup_path: Optional[Path] = None
+    kernel_aicore_path: Optional[Path] = None
 
 
 class RuntimeBuilder:
@@ -308,6 +314,7 @@ class RuntimeBuilder:
             sim_context_path=sim_context_path,
             dispatcher_path=dispatcher_path,
             sdma_warmup_path=self._resolve_sdma_warmup_path(),
+            kernel_aicore_path=self._resolve_kernel_aicore_path(name, output_dir),
         )
 
     def get_binaries(
@@ -354,6 +361,7 @@ class RuntimeBuilder:
         # Same reasoning for the vector-only SDMA warmup ELF: no runtime-specific
         # code, so one copy per arch. None on sim — sim has no device SDMA.
         sdma_warmup_staging_dir = self._LIB_DIR / arch / "sdma_warmup" if variant != "sim" else None
+        kernel_aicore_staging_dir = output_dir if variant == "onboard" and name == "tensormap_and_ringbuffer" else None
 
         if not build:
             return self._lookup_binaries(name, output_dir)
@@ -420,6 +428,7 @@ class RuntimeBuilder:
                     dispatcher_dest=dispatcher_staging_dir if target == "aicpu" else None,
                     sdma_warmup_dest=sdma_warmup_staging_dir if target == "aicore" else None,
                     cmake_defines=cmake_defines,
+                    kernel_aicore_dest=kernel_aicore_staging_dir if target == "aicore" else None,
                 )
 
         logger.info("Compiling AICore, AICPU, Host in parallel...")
@@ -460,7 +469,15 @@ class RuntimeBuilder:
             sim_context_path=sim_context_path,
             dispatcher_path=dispatcher_path,
             sdma_warmup_path=self._resolve_sdma_warmup_path(),
+            kernel_aicore_path=self._resolve_kernel_aicore_path(name, output_dir),
         )
+
+    def _resolve_kernel_aicore_path(self, name: str, output_dir: Path) -> Optional[Path]:
+        """Return the separate TMR onboard kernel-mode ELF when it is staged."""
+        if self._variant != "onboard" or name != "tensormap_and_ringbuffer":
+            return None
+        path = output_dir / "aicore_kernel_mode.o"
+        return path if path.is_file() else None
 
     def _resolve_sdma_warmup_path(self) -> Optional[Path]:
         """Return path to sdma_warmup_kernel.o, or None when this build has none.

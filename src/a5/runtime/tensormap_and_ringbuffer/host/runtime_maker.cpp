@@ -1084,7 +1084,11 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
 // device, so it exports simpler_aicpu_register_callable; the common AICPU loader
 // queries this so it carries no runtime-specific symbol knowledge.
 extern "C" const char *const *runtime_extra_aicpu_symbols(size_t *count) {
-    static const char *const kExtra[] = {"simpler_aicpu_register_callable", "simpler_aicpu_query_topology"};
+    static const char *const kExtra[] = {
+        "simpler_aicpu_register_callable",   "simpler_aicpu_query_topology",
+        "simpler_aicpu_prepare_tmr_context", "simpler_aicpu_register_tmr_kernel_callable",
+        "simpler_aicpu_release_tmr_context", "simpler_aicpu_kernel_exec"
+    };
     if (count != nullptr) {
         *count = sizeof(kExtra) / sizeof(kExtra[0]);
     }

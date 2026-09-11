@@ -11,12 +11,21 @@
 #include "aicpu/platform_aicpu_affinity.h"
 
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
-#ifdef __linux__
 #include <sched.h>
-#endif
 
 #include "common/unified_log.h"
+
+int32_t platform_aicpu_current_cpu() { return sched_getcpu(); }
+
+int platform_aicpu_prepare_kernel_thread() {
+    const int policy = sched_getscheduler(0);
+    if (policy < 0) return errno;
+    if (policy == SCHED_OTHER) return 0;
+    const sched_param param{};
+    return sched_setscheduler(0, SCHED_OTHER, &param) == 0 ? 0 : errno;
+}
 
 // MAX_GATE_THREADS (= 16) is defined in aicpu/platform_aicpu_affinity.h, the
 // single source of truth shared with the Runtime ABI. 16 = headroom for a5's

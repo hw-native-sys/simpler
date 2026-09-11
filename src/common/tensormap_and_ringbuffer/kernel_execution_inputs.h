@@ -131,14 +131,8 @@ inline bool configure_orchestration_args(
            inputs.args->tensor_count() + inputs.args->scalar_count() >= cfg.expected_arg_count;
 }
 
-// Internal device consumption phases. Admission/release have one owner;
-// init/run execute on the admitted affinity group. No launch symbol is registered.
-// Caller supplies publication, cancellation, and an all-consumers-complete barrier.
-InvocationStatus
-admit_kernel_execution(ByteSpan packet, const KernelCallableView &, const KernelBindingView &) noexcept;
-int32_t init_kernel_execution();
-int32_t run_kernel_execution();
+// Read-only diagnostic under external quiescence. This neither admits nor
+// retires a round and does not provide synchronization for its readers.
 int32_t kernel_execution_status();
-void release_kernel_execution();
 
 }  // namespace simpler::tmr

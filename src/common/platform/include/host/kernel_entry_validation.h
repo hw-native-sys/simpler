@@ -18,6 +18,7 @@
 #include "callable.h"
 #include "callable_protocol.h"
 #include "kernel_invocation_validation.h"
+#include "kernel_callable_validation.h"
 #include "runtime_c_api.h"
 
 /**
@@ -50,56 +51,11 @@ inline int validate_kernel_init_args(
     return 0;
 }
 
-inline constexpr size_t kKernelCallableByteLimit = 512ULL * 1024 * 1024;
-
 // Shared by the C entry and the residency cache, before any hash or upload.
 inline int validate_kernel_callable_image(const void *callable, size_t callable_size) {
     if (callable == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     if (callable_size > kKernelCallableByteLimit) return PTO_RUNTIME_ERR_CALLABLE_BYTES_EXCEEDED;
-    if (callable_size < sizeof(ChipCallable)) return PTO_RUNTIME_ERR_INTERNAL;
-    /* ChipCallable's storage_ is CALLABLE_CHILD_ALIGN-aligned relative to the
-       header, so a misaligned image puts every child at a misaligned address. */
-    if (reinterpret_cast<uintptr_t>(callable) % alignof(ChipCallable) != 0) return PTO_RUNTIME_ERR_INTERNAL;
-    const auto *bytes = static_cast<const uint8_t *>(callable);
-    int32_t sig_count = 0;
-    int32_t cached_scalars = 0;
-    std::memcpy(&sig_count, bytes + offsetof(ChipCallable, sig_count_), sizeof(sig_count));
-    std::memcpy(&cached_scalars, bytes + offsetof(ChipCallable, scalar_count_), sizeof(cached_scalars));
-    int32_t tensors = 0;
-    int32_t scalars = 0;
-    const auto *signature = reinterpret_cast<const ArgDirection *>(bytes + offsetof(ChipCallable, signature_));
-    if (simpler::kernel::derive_invocation_counts(signature, sig_count, cached_scalars, &tensors, &scalars) !=
-        simpler::kernel::InvocationStatus::Ok)
-        return PTO_RUNTIME_ERR_INTERNAL;
-
-    const auto *image = static_cast<const ChipCallable *>(callable);
-    const auto valid_name = [](const char *name, uint32_t length) {
-        return length < CALLABLE_FUNC_NAME_MAX && name[length] == '\0' && std::memchr(name, '\0', length) == nullptr;
-    };
-    if (!valid_name(image->func_name_, image->func_name_len_) ||
-        !valid_name(image->config_name_, image->config_name_len_))
-        return PTO_RUNTIME_ERR_INTERNAL;
-    const size_t storage_size = callable_size - offsetof(ChipCallable, storage_);
-    size_t used = image->binary_size_;
-    constexpr size_t max_children = sizeof(image->child_offsets_) / sizeof(image->child_offsets_[0]);
-    if (used > storage_size || image->child_count_ < 0 || static_cast<size_t>(image->child_count_) > max_children)
-        return PTO_RUNTIME_ERR_INTERNAL;
-    for (int32_t i = 0; i < image->child_count_; ++i) {
-        const size_t offset = image->child_offsets_[i];
-        // Canonical child packing starts at the next aligned byte after
-        // the preceding binary; subtraction precedes every span read.
-        const size_t padding = (CALLABLE_ALIGN - used % CALLABLE_ALIGN) % CALLABLE_ALIGN;
-        if (padding > storage_size - used || offset != used + padding ||
-            CoreCallable::binary_data_offset() > storage_size - offset)
-            return PTO_RUNTIME_ERR_INTERNAL;
-        const auto *child = reinterpret_cast<const CoreCallable *>(image->storage_ + offset);
-        if (child->sig_count_ < 0 || child->sig_count_ > CORE_MAX_TENSOR_ARGS) return PTO_RUNTIME_ERR_INTERNAL;
-        const size_t binary_offset = offset + CoreCallable::binary_data_offset();
-        if (child->binary_size_ > storage_size - binary_offset) return PTO_RUNTIME_ERR_INTERNAL;
-        used = binary_offset + child->binary_size_;
-    }
-    if (used != storage_size) return PTO_RUNTIME_ERR_INTERNAL;
-    return 0;
+    return simpler::kernel::valid_kernel_callable_image(callable, callable_size) ? 0 : PTO_RUNTIME_ERR_INTERNAL;
 }
 
 inline int validate_kernel_prepare_callable_args(

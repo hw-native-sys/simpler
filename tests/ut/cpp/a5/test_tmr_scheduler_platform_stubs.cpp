@@ -10,6 +10,12 @@
  */
 
 #include "aicpu/platform_regs.h"
+#include "common/kernel_args.h"
+
+void corrupt_kernel_arch_argument(KernelArgs &args, int fault) {
+    if (fault == 0) args.force_simt_anchor = 1;
+    else args.aicore_pmu_ring_addrs = 64;
+}
 
 void write_reg(uint64_t base, RegId reg, uint64_t value) {
     reg_store_release(reinterpret_cast<volatile uint32_t *>(base + reg_offset(reg)), static_cast<uint32_t>(value));

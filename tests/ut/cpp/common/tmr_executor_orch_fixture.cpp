@@ -38,3 +38,8 @@ extern "C" OrchestrationConfig config_mismatch(const ChipTaskArgs &args) {
 }
 extern "C" void orchestration_a(const ChipTaskArgs &args) { execute(args, 3); }
 extern "C" void orchestration_b(const ChipTaskArgs &args) { execute(args, 4); }
+extern "C" void orchestration_error(const ChipTaskArgs &args) {
+    execute(args, 3);
+    RuntimeContext *rt = current_runtime();
+    rt->ops->report_fatal(rt, SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "intentional executor failure");
+}

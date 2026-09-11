@@ -35,6 +35,9 @@
 #include "tensormap_and_ringbuffer/callable_table_view.h"
 
 class Runtime;
+namespace simpler::tmr {
+class KernelCoreGroup;
+}
 struct Handshake;
 struct RuntimeContext;
 
@@ -52,6 +55,10 @@ struct RuntimeContext;
  */
 class SchedulerContext {
 public:
+    // Kernel rounds borrow independent launch controls. Program leaves this
+    // unset and retains its per-thread retirement behavior.
+    void bind_kernel_core_group(simpler::tmr::KernelCoreGroup *group) { kernel_cores_ = group; }
+    void handshake_kernel_partition(Runtime *runtime, int32_t index, int32_t threads);
     // =========================================================================
     // Lifecycle
     // =========================================================================
@@ -144,6 +151,7 @@ public:
     bool orchestration_done() const { return orchestrator_done_.load(std::memory_order_relaxed); }
 
 private:
+    simpler::tmr::KernelCoreGroup *kernel_cores_{nullptr};
     // =========================================================================
     // State
     // =========================================================================

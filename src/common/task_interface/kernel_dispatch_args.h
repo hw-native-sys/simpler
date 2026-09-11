@@ -27,14 +27,18 @@ struct SimplerKernelDispatchArgs {
     SimplerKernelInvocationHeader invocation;
 };
 
-// Direct AICPU entry return values, not host C API or latched runtime codes.
-// CANN propagates nonzero entry failure through the caller's synchronization.
+// Simpler dispatch classifications, not portable CANN native return codes.
+// TMR translates these only at its native entry boundary. The Host-visible
+// error also depends on CANN/topology; an event join is not an error guarantee.
 enum class KernelDispatchStatus : int32_t {
     Success = 0,
     InvalidArgs = 1,
     NotResident = 2,
     Stale = 3,
     UnsupportedPayload = 4,
+    InvalidBinding = 5,
+    ExecutionFailed = 6,
+    CleanupFailed = 7,
 };
 
 static_assert(

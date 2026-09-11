@@ -74,6 +74,13 @@ set(ALL_AIV_OBJECTS "")
 
 foreach(SRC_FILE ${ALL_SOURCES})
     get_filename_component(SRC_NAME ${SRC_FILE} NAME_WE)
+    set(SOURCE_WIRE_HEADERS "")
+    if(SRC_FILE MATCHES "/tensormap_and_ringbuffer/aicore/aicore_executor\\.cpp$")
+        set(SOURCE_WIRE_HEADERS
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/task_interface/tmr_kernel_context.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/task_interface/tmr_kernel_control.h"
+        )
+    endif()
     set(OBJ_AIC "${CMAKE_CURRENT_BINARY_DIR}/${SRC_NAME}_aic.o")
     set(OBJ_AIV "${CMAKE_CURRENT_BINARY_DIR}/${SRC_NAME}_aiv.o")
 
@@ -85,7 +92,7 @@ foreach(SRC_FILE ${ALL_SOURCES})
         OUTPUT ${OBJ_AIC}
         COMMAND ${BISHENG_CC} ${AICORE_FLAGS} ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS} --cce-aicore-arch=dav-c220-cube
                 -o ${OBJ_AIC} ${SRC_FILE}
-        DEPENDS ${SRC_FILE}
+        DEPENDS ${SRC_FILE} ${SOURCE_WIRE_HEADERS}
         COMMENT "Compiling ${SRC_NAME} for AIC"
     )
 
@@ -94,7 +101,7 @@ foreach(SRC_FILE ${ALL_SOURCES})
         OUTPUT ${OBJ_AIV}
         COMMAND ${BISHENG_CC} ${AICORE_FLAGS} ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS} --cce-aicore-arch=dav-c220-vec
                 -o ${OBJ_AIV} ${SRC_FILE}
-        DEPENDS ${SRC_FILE}
+        DEPENDS ${SRC_FILE} ${SOURCE_WIRE_HEADERS}
         COMMENT "Compiling ${SRC_NAME} for AIV"
     )
 endforeach()
@@ -127,6 +134,50 @@ add_custom_target(aicore_kernel ALL
     BYPRODUCTS ${AICORE_KERNEL_OBJ}
     COMMENT "Linking AICore kernel binary"
 )
+
+# The separate kernel-mode entry is applicable only to the TMR executor.
+# Never link kernel.cpp into this ELF: the runtime launches entry ID 0, and
+# the old program entry uses that same ID with a different argument layout.
+foreach(SRC_FILE ${ALL_SOURCES})
+    if(SRC_FILE MATCHES "/tensormap_and_ringbuffer/aicore/aicore_executor\\.cpp$")
+        set(TMR_KERNEL_MODE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/kernel_mode_kernel.cpp")
+        set(TMR_KERNEL_MODE_AIC "${CMAKE_CURRENT_BINARY_DIR}/kernel_mode_kernel_aic.o")
+        set(TMR_KERNEL_MODE_AIV "${CMAKE_CURRENT_BINARY_DIR}/kernel_mode_kernel_aiv.o")
+        set(TMR_KERNEL_MODE_OBJ "${CMAKE_CURRENT_BINARY_DIR}/aicore_kernel_mode.o")
+        set(TMR_KERNEL_MODE_OBJECTS ${ALL_AIC_OBJECTS} ${ALL_AIV_OBJECTS})
+        list(REMOVE_ITEM TMR_KERNEL_MODE_OBJECTS
+            "${CMAKE_CURRENT_BINARY_DIR}/kernel_aic.o"
+            "${CMAKE_CURRENT_BINARY_DIR}/kernel_aiv.o"
+        )
+        set(TMR_KERNEL_WIRE_HEADERS
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/task_interface/tmr_kernel_context.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/task_interface/tmr_kernel_control.h"
+        )
+        add_custom_command(
+            OUTPUT ${TMR_KERNEL_MODE_AIC}
+            COMMAND ${BISHENG_CC} ${AICORE_FLAGS} ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS}
+                    --cce-aicore-arch=dav-c220-cube -o ${TMR_KERNEL_MODE_AIC} ${TMR_KERNEL_MODE_SRC}
+            DEPENDS ${TMR_KERNEL_MODE_SRC} ${TMR_KERNEL_WIRE_HEADERS}
+            COMMENT "Compiling kernel-mode entry for AIC"
+        )
+        add_custom_command(
+            OUTPUT ${TMR_KERNEL_MODE_AIV}
+            COMMAND ${BISHENG_CC} ${AICORE_FLAGS} ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS}
+                    --cce-aicore-arch=dav-c220-vec -o ${TMR_KERNEL_MODE_AIV} ${TMR_KERNEL_MODE_SRC}
+            DEPENDS ${TMR_KERNEL_MODE_SRC} ${TMR_KERNEL_WIRE_HEADERS}
+            COMMENT "Compiling kernel-mode entry for AIV"
+        )
+        add_custom_target(aicore_kernel_mode ALL
+            DEPENDS ${TMR_KERNEL_MODE_OBJECTS} ${TMR_KERNEL_MODE_AIC} ${TMR_KERNEL_MODE_AIV}
+            COMMAND ${BISHENG_LD} -m aicorelinux -Ttext=0 -static -n
+                    -o ${TMR_KERNEL_MODE_OBJ} ${TMR_KERNEL_MODE_OBJECTS}
+                    ${TMR_KERNEL_MODE_AIC} ${TMR_KERNEL_MODE_AIV}
+            BYPRODUCTS ${TMR_KERNEL_MODE_OBJ}
+            COMMENT "Linking TMR kernel-mode AICore binary"
+        )
+        break()
+    endif()
+endforeach()
 
 # One-shot SDMA control-path warmup: a separate VECTOR-ONLY ELF, not part of
 # aicore_kernel.o above. It is its own binary because the executor ELF is a

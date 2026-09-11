@@ -706,6 +706,28 @@ target_include_directories(test_runtime_orch_so PRIVATE
 )
 add_common_utils_test(test_device_arena common/test_device_arena.cpp)
 add_common_utils_test(test_thread_completion_gate common/test_thread_completion_gate.cpp)
+add_common_utils_test(test_tmr_kernel_round_gate common/test_tmr_kernel_round_gate.cpp)
+target_include_directories(test_tmr_kernel_round_gate PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+)
+set_tests_properties(test_tmr_kernel_round_gate PROPERTIES TIMEOUT 60)
+add_common_utils_test(test_tmr_kernel_clear_plan common/test_tmr_kernel_clear_plan.cpp)
+foreach(k7_target kernel_execution_round kernel_prepared_context kernel_prepared_callable)
+    add_common_utils_test(test_tmr_${k7_target} common/test_tmr_${k7_target}.cpp)
+    target_include_directories(test_tmr_${k7_target} PRIVATE
+        $<TARGET_PROPERTY:a2a3_rt_objs,INTERFACE_INCLUDE_DIRECTORIES>
+    )
+    set_tests_properties(test_tmr_${k7_target} PROPERTIES TIMEOUT 30)
+endforeach()
+add_common_utils_test(test_tmr_kernel_core_group common/test_tmr_kernel_core_group.cpp)
+target_sources(test_tmr_kernel_prepared_context PRIVATE
+    ${A2A3_RUNTIME_DIR}/shared/runtime.cpp
+    stubs/test_stubs.cpp
+)
+target_include_directories(test_tmr_kernel_core_group PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+)
 add_common_utils_test(test_fatal_shutdown_latch common/test_fatal_shutdown_latch.cpp)
 add_common_utils_test(test_buffer_pool_manager common/test_buffer_pool_manager.cpp)
 target_sources(test_buffer_pool_manager PRIVATE
@@ -1368,6 +1390,13 @@ add_a5_orchestrator_runtime_test(test_a5_args_dump a5/test_args_dump.cpp)
 add_a5_runtime_test(test_a5_aicore_completion_mailbox a5/test_aicore_completion_mailbox.cpp)
 
 foreach(arch a2a3 a5)
+    add_common_utils_test(test_${arch}_tmr_kernel_aicore common/test_tmr_kernel_aicore.cpp)
+    target_include_directories(test_${arch}_tmr_kernel_aicore PRIVATE
+        $<TARGET_PROPERTY:${arch}_rt_objs,INTERFACE_INCLUDE_DIRECTORIES>
+        ${CMAKE_SOURCE_DIR}/../../../src/${arch}/runtime/tensormap_and_ringbuffer/aicore
+        ${CMAKE_SOURCE_DIR}/../../../src/${arch}/platform/sim/aicore
+    )
+    set_tests_properties(test_${arch}_tmr_kernel_aicore PROPERTIES TIMEOUT 30)
     set(executor_test test_${arch}_tmr_executor_execution_inputs)
     set(executor_runtime ${CMAKE_SOURCE_DIR}/../../../src/${arch}/runtime/tensormap_and_ringbuffer)
     set(executor_platform ${CMAKE_SOURCE_DIR}/../../../src/common/platform)
@@ -1401,7 +1430,6 @@ foreach(arch a2a3 a5)
         ${executor_platform}/shared/aicpu/dep_gen_collector_aicpu.cpp
         ${executor_platform}/shared/aicpu/device_phase_aicpu.cpp
         ${executor_platform}/shared/aicpu/scope_stats_collector_aicpu.cpp
-        ${executor_platform}/sim/aicpu/cache_ops.cpp
         ${executor_platform}/sim/aicpu/device_log.cpp
         ${executor_platform}/sim/aicpu/device_time.cpp
         ${executor_platform}/sim/aicpu/orch_so_file.cpp

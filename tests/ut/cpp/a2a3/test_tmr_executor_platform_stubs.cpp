@@ -10,6 +10,12 @@
  */
 
 #include "aicpu/platform_regs.h"
+#include "common/kernel_args.h"
+
+void corrupt_kernel_arch_argument(KernelArgs &args, int fault) {
+    if (fault == 0) ++args.ffts_base_addr;
+    else args.pmu_reg_addrs = 64;
+}
 
 int32_t platform_retire_aicore_group(const AicoreExitTarget *, size_t count, uint64_t, bool *released) {
     if (released != nullptr) {

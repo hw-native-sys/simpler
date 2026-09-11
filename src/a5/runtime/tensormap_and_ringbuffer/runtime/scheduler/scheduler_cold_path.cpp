@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include "scheduler_context.h"
+#include "tensormap_and_ringbuffer/kernel_core_group.h"
 
 #include <cinttypes>
 #include <cstdio>
@@ -678,6 +679,37 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx) {
 // built serially in post_handshake_init (core-index order) once every slice has
 // landed, so the shared aic_count_/aiv_count_ are written by one thread only.
 // =============================================================================
+
+// Reports are fully validated by the admission owner before any partition
+// opens a window. Every worker has one writer; final init runs after all slices.
+void SchedulerContext::handshake_kernel_partition(Runtime *runtime, int32_t index, int32_t threads) {
+    const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(index) * cores_total_num_) / threads);
+    const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(index + 1) * cores_total_num_) / threads);
+    for (int32_t i = lo; i < hi; ++i) {
+        auto &worker = runtime->dev.workers[i];
+        worker.task = reinterpret_cast<uint64_t>(&payload_per_core_[i][0]);
+        worker.physical_core_id = kernel_cores_->physical_id(i);
+        worker.core_type = kernel_cores_->core_type(i);
+        OUT_OF_ORDER_STORE_BARRIER();
+        kernel_cores_->open(i);
+        CoreExecState state{};
+        state.reg_addr = kernel_cores_->register_address(i);
+        state.cond_ptr = get_reg_ptr(state.reg_addr, RegId::COND);
+        state.running_reg_task_id = AICPU_TASK_INVALID;
+        state.pending_reg_task_id = AICPU_TASK_INVALID;
+#if !SIMPLER_DFX
+        state.worker_id = i;
+        state.physical_core_id = kernel_cores_->physical_id(i);
+        state.core_type = kernel_cores_->core_type(i);
+#endif
+        core_exec_states_[i] = state;
+        core_type_compact_[i] = static_cast<uint8_t>(kernel_cores_->core_type(i));
+#if SIMPLER_DFX
+        physical_core_ids_[i] = kernel_cores_->physical_id(i);
+#endif
+    }
+}
+
 void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads) {
     Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
     const int32_t total = cores_total_num_;
@@ -1055,6 +1087,11 @@ bool SchedulerContext::assign_cores_to_threads() {
 // deinit their AICore register blocks. Idempotent.
 // =============================================================================
 void SchedulerContext::emergency_shutdown(Runtime *runtime) {
+    if (kernel_cores_ != nullptr) {
+        completed_.store(true, std::memory_order_release);
+        kernel_cores_->cancel();
+        return;
+    }
     (void)runtime;  // exit is now delivered via each core's register block, not GM
     LOG_WARN("Emergency shutdown: sending exit signal to all initialized cores");
     int32_t timeout_count = 0;
@@ -1302,6 +1339,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime, simpler::tmr::Ca
 }
 
 void SchedulerContext::deinit() {
+    kernel_cores_ = nullptr;
     // Reset all per-core execution state
     for (int32_t i = 0; i < RUNTIME_MAX_WORKER; i++) {
         core_exec_states_[i] = {};
