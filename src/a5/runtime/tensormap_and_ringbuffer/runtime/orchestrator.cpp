@@ -30,6 +30,7 @@
 #include "common/dep_gen.h"
 #include "common/unified_log.h"
 #include "dep_compute.h"
+#include "hot_entry_alignment.h"
 #include "runtime_types.h"
 #include "shared_memory.h"
 #include "tensormap_and_ringbuffer/task_id.h"
@@ -1022,7 +1023,7 @@ static bool ensure_tensormap_capacity(OrchestratorState *orch, int32_t needed) {
 // kernel_ids (all INVALID_KERNEL_ID for dummy). Performs tensormap sync, fanin
 // computation (explicit_deps + auto), output registration, slot init, and
 // Orch-side wiring/ready publication.
-static TaskOutputTensors submit_task_common(
+SIMPLER_A5_TMR_HOT_ENTRY_ALIGN static TaskOutputTensors submit_task_common(
     OrchestratorState *orch, const CoreTaskArgs &args, ActiveMask active_mask, TaskAttrs task_attrs,
     int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id
 ) {

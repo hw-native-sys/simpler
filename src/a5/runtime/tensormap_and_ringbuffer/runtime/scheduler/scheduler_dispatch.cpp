@@ -24,6 +24,7 @@
 #include "common/chip_swimlane_profiling.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
+#include "hot_entry_alignment.h"
 #include "runtime_core.h"
 #include "runtime.h"
 #include "spin_hint.h"
@@ -846,7 +847,7 @@ int32_t SchedulerContext::try_early_dispatch(
 // Main scheduler dispatch loop
 // =============================================================================
 
-int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_idx) {
+SIMPLER_A5_TMR_HOT_ENTRY_ALIGN int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_idx) {
     always_assert(sched_ != nullptr);
     CoreTracker &tracker = core_trackers_[thread_idx];
 
