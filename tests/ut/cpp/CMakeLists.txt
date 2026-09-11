@@ -1164,6 +1164,7 @@ add_a5_orchestrator_runtime_test(test_a5_orchestrator_fanin a5/test_orchestrator
 add_a5_orchestrator_runtime_test(test_a5_wiring a5/test_wiring.cpp)
 add_a5_orchestrator_runtime_test(test_a5_args_dump a5/test_args_dump.cpp)
 add_a5_runtime_test(test_a5_aicore_completion_mailbox a5/test_aicore_completion_mailbox.cpp)
+add_a5_runtime_test(test_a5_rdma_completion_scheduler a5/test_rdma_completion_scheduler.cpp)
 
 # Host logger silent/off behavior — no runtime deps, just compile the same
 # self-contained host logger sources used by production consumers.

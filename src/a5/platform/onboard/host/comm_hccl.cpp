@@ -29,10 +29,15 @@
 #include "common/unified_log.h"
 #include "host/file_marker_handshake.h"
 
+#include <array>
 #include <chrono>
+#include <cctype>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <sstream>
@@ -51,6 +56,12 @@
 #endif
 #ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
 #include "pto/comm/async/urma/urma_workspace_manager.hpp"
+#endif
+#ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
+#ifndef __gm__
+#define __gm__
+#endif
+#include "pto/comm/async/rdma/rdma_workspace_manager.hpp"
 #endif
 
 // Thin wrappers around the HCCL public APIs we use. Kept as a translation
@@ -86,6 +97,9 @@ struct DomainAllocation {
 #ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
     std::unique_ptr<pto::comm::urma::UrmaWorkspaceManager> urma_workspace;
 #endif
+#ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
+    std::unique_ptr<pto::comm::rdma::RdmaWorkspaceManager> rdma_workspace;
+#endif
     CommContext *device_ctx = nullptr;  // aclrtMalloc'd CommContext mirror
 };
 
@@ -109,6 +123,9 @@ struct CommHandle_ {
 #endif
 #ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
     std::unique_ptr<pto::comm::urma::UrmaWorkspaceManager> urma_workspace;
+#endif
+#ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
+    std::unique_ptr<pto::comm::rdma::RdmaWorkspaceManager> rdma_workspace;
 #endif
 };
 
@@ -240,6 +257,18 @@ static void release_own_vmm_window(void *va, aclrtDrvMemHandle handle) {
     }
 }
 
+// RDMA-aware raw-window release for domain_alloc_via_ipc failure paths: under
+// the RDMA overlay the buffer is a plain low-segment aclrtMalloc pointer and
+// must be aclrtFree'd (never unmap/release a non-VMM address); otherwise it is
+// a VMM-mapped VA released via release_own_vmm_window.
+static void release_domain_window_raw(void *buf, aclrtDrvMemHandle handle) {
+#ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
+    if (buf != nullptr) aclrtFree(buf);
+#else
+    release_own_vmm_window(buf, handle);
+#endif
+}
+
 // Release every per-peer VMM import recorded on a domain allocation and clear
 // the list, so a re-release is a no-op.  Own window and device_ctx are freed
 // separately by the caller.
@@ -248,6 +277,22 @@ static void release_domain_peer_windows(DomainAllocation &alloc) {
         release_own_vmm_window(pw.first, pw.second);
     }
     alloc.peer_windows.clear();
+}
+
+// Release the own local window.  Under the RDMA overlay the window is a plain
+// low-segment aclrtMalloc pointer (own_handle == nullptr); otherwise it is a
+// VMM-mapped VA with a physical handle.
+static void release_domain_local_buffer(DomainAllocation &alloc) {
+    if (alloc.local_buf == nullptr) return;
+#ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
+    aclrtFree(alloc.local_buf);
+    alloc.local_buf = nullptr;
+    alloc.own_handle = nullptr;
+#else
+    release_own_vmm_window(alloc.local_buf, alloc.own_handle);
+    alloc.local_buf = nullptr;
+    alloc.own_handle = nullptr;
+#endif
 }
 
 }  // namespace
@@ -361,10 +406,14 @@ constexpr uint64_t kIpcAnnounceMagic = 0x49504344334d4549ULL;  // "IPCD3MEI"
 
 struct IpcAnnounceFile {
     uint64_t magic;
-    int32_t pid;
-    uint32_t rank;
-    int32_t device_id;          // ACL logic device id this rank is bound to.
     uint64_t shareable_handle;  // aclrtMemExportToShareableHandle output
+    uint64_t symmetric_addr;
+    int32_t pid;
+    int32_t device_id;  // ACL logic device id this rank is bound to.
+    uint32_t rank;
+    uint32_t phy_id;
+    uint16_t roce_base_port;
+    char roce_ip[64];
 };
 
 // Announce file path shares the `barrier_<prefix>_..._<rank>.ready` shape so
@@ -380,10 +429,10 @@ static bool ipc_write_announce(
 ) {
     IpcAnnounceFile a{};
     a.magic = kIpcAnnounceMagic;
+    a.shareable_handle = shareable_handle;
     a.pid = pid;
     a.rank = static_cast<uint32_t>(rank);
     a.device_id = device_id;
-    a.shareable_handle = shareable_handle;
     std::string p = ipc_announce_path(rootinfo, rank, run_token);
     std::string tmp = p + ".tmp." + std::to_string(getpid());
     {
@@ -677,14 +726,21 @@ domain_announce_path(const std::string &rootinfo, uint64_t allocation_id, uint32
 
 static bool domain_write_announce(
     const std::string &rootinfo, uint64_t allocation_id, uint32_t domain_rank, uint64_t run_token, int32_t pid,
-    int32_t device_id, uint64_t shareable_handle
+    int32_t device_id, uint64_t shareable_handle, uint64_t symmetric_addr = 0, uint32_t phy_id = 0,
+    uint16_t roce_base_port = 0, const char *roce_ip = nullptr
 ) {
     IpcAnnounceFile a{};
     a.magic = kIpcAnnounceMagic;
+    a.shareable_handle = shareable_handle;
+    a.symmetric_addr = symmetric_addr;
     a.pid = pid;
     a.rank = domain_rank;
     a.device_id = device_id;
-    a.shareable_handle = shareable_handle;
+    a.phy_id = phy_id;
+    a.roce_base_port = roce_base_port;
+    if (roce_ip != nullptr) {
+        std::snprintf(a.roce_ip, sizeof(a.roce_ip), "%s", roce_ip);
+    }
     std::string p = domain_announce_path(rootinfo, allocation_id, domain_rank, run_token);
     std::string tmp = p + ".tmp." + std::to_string(getpid());
     {
@@ -784,6 +840,7 @@ static uint64_t urma_workspace_bytes(uint32_t rank_count) {
            static_cast<uint64_t>(rank_count) *
                (2ULL * sizeof(UrmaWQCtx) * qp_num + 2ULL * sizeof(UrmaCqCtx) * qp_num + sizeof(UrmaMemInfo) * qp_num);
 }
+#endif
 
 static bool rank_ids_are_dense_prefix(const uint32_t *rank_ids, size_t rank_count) {
     if (rank_ids == nullptr) return false;
@@ -793,6 +850,7 @@ static bool rank_ids_are_dense_prefix(const uint32_t *rank_ids, size_t rank_coun
     return true;
 }
 
+#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
 static bool init_urma_workspace(
     CommHandle h, uint32_t rank_id, uint32_t rank_count, void *symmetric_addr, uint64_t symmetric_size,
     std::unique_ptr<pto::comm::urma::UrmaWorkspaceManager> &workspace
@@ -834,7 +892,11 @@ static bool ensure_base_urma_workspace(CommHandle h) {
 static void reset_domain_urma_workspace(DomainAllocation &alloc) {
 #ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
     alloc.urma_workspace.reset();
-#else
+#endif
+#ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
+    alloc.rdma_workspace.reset();
+#endif
+#if !defined(SIMPLER_ENABLE_PTO_URMA_WORKSPACE) && !defined(SIMPLER_ENABLE_PTO_RDMA_WORKSPACE)
     (void)alloc;
 #endif
 }
@@ -842,10 +904,440 @@ static void reset_domain_urma_workspace(DomainAllocation &alloc) {
 static void reset_base_urma_workspace(CommHandle h) {
 #ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
     h->urma_workspace.reset();
-#else
+#endif
+#ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
+    h->rdma_workspace.reset();
+#endif
+#if !defined(SIMPLER_ENABLE_PTO_URMA_WORKSPACE) && !defined(SIMPLER_ENABLE_PTO_RDMA_WORKSPACE)
     (void)h;
 #endif
 }
+
+#ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
+struct RdmaBootstrapInfo {
+    uint32_t phy_id = 0;
+    std::string local_ip;
+    uint16_t base_port = 60032;
+};
+
+constexpr const char *kDefaultRdmaRootinfoPath = "/etc/hccl_rootinfo.json";
+constexpr const char *kDefaultVirtualTopologyPath = "/var/run/ascend-topologyd/virtualTopology.xml";
+
+static bool rdma_split_csv_env(const char *name, std::vector<std::string> &out) {
+    const char *value = std::getenv(name);
+    if (value == nullptr) return false;
+    std::stringstream ss(value);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        size_t b = item.find_first_not_of(" \t");
+        if (b == std::string::npos) continue;
+        size_t e = item.find_last_not_of(" \t");
+        out.push_back(item.substr(b, e - b + 1));
+    }
+    return !out.empty();
+}
+
+static bool rdma_resolve_phy_id_from_runtime(uint32_t &phy_id) {
+    using GetDevFn = int (*)(int32_t *);
+    using MapFn = int (*)(int32_t, int32_t *);
+
+    auto getDev = reinterpret_cast<GetDevFn>(dlsym(RTLD_DEFAULT, "aclrtGetDevice"));
+    auto byUser = reinterpret_cast<MapFn>(dlsym(RTLD_DEFAULT, "aclrtGetPhyDevIdByUserDevId"));
+    auto byLogic = reinterpret_cast<MapFn>(dlsym(RTLD_DEFAULT, "aclrtGetPhyDevIdByLogicDevId"));
+    auto byIndex = reinterpret_cast<MapFn>(dlsym(RTLD_DEFAULT, "rtGetDevicePhyIdByIndex"));
+    if (getDev == nullptr) return false;
+
+    int32_t user_id = -1;
+    if (getDev(&user_id) != 0 || user_id < 0) return false;
+
+    int32_t phy = -1;
+    if (byUser != nullptr && byUser(user_id, &phy) == 0 && phy >= 0) {
+        phy_id = static_cast<uint32_t>(phy);
+        return true;
+    }
+    if (byLogic != nullptr && byLogic(user_id, &phy) == 0 && phy >= 0) {
+        phy_id = static_cast<uint32_t>(phy);
+        return true;
+    }
+    if (byIndex != nullptr && byIndex(user_id, &phy) == 0 && phy >= 0) {
+        phy_id = static_cast<uint32_t>(phy);
+        return true;
+    }
+    return false;
+}
+
+static bool rdma_resolve_phy_id(uint32_t base_rank, uint32_t rank_count, int device_id, uint32_t &phy_id) {
+    std::vector<std::string> phy_ids;
+    if (rdma_split_csv_env("PTO_ROCE_PHYIDS", phy_ids) && phy_ids.size() == rank_count && base_rank < phy_ids.size()) {
+        char *end = nullptr;
+        unsigned long parsed = std::strtoul(phy_ids[base_rank].c_str(), &end, 10);
+        if (end != phy_ids[base_rank].c_str() && *end == '\0' && parsed <= UINT_MAX) {
+            phy_id = static_cast<uint32_t>(parsed);
+            return true;
+        }
+    }
+    if (rdma_resolve_phy_id_from_runtime(phy_id)) return true;
+    phy_id = static_cast<uint32_t>(device_id);
+    LOG_WARN("[comm] RDMA phyId resolution unavailable, falling back to device id %d", device_id);
+    return true;
+}
+
+static bool parse_u16_env(const char *name, uint16_t &out) {
+    const char *value = std::getenv(name);
+    if (value == nullptr || *value == '\0') return true;
+    char *end = nullptr;
+    unsigned long parsed = std::strtoul(value, &end, 10);
+    if (end == value || *end != '\0' || parsed > 65535UL) return false;
+    out = static_cast<uint16_t>(parsed);
+    return true;
+}
+
+static bool rdma_extract_uint_after_key(
+    const std::string &s, const std::string &key, size_t from, uint32_t &value, size_t &key_pos
+) {
+    size_t p = s.find(key, from);
+    if (p == std::string::npos) return false;
+    key_pos = p;
+    p += key.size();
+    while (p < s.size() && (s[p] == ':' || std::isspace(static_cast<unsigned char>(s[p])) || s[p] == '"'))
+        ++p;
+    size_t start = p;
+    while (p < s.size() && std::isdigit(static_cast<unsigned char>(s[p])))
+        ++p;
+    if (p == start) return false;
+    value = static_cast<uint32_t>(std::strtoul(s.substr(start, p - start).c_str(), nullptr, 10));
+    return true;
+}
+
+static bool rdma_extract_quoted_after_key(
+    const std::string &s, const std::string &key, size_t from, std::string &out, size_t limit
+) {
+    size_t p = s.find(key, from);
+    if (p == std::string::npos || p >= limit) return false;
+    p = s.find('"', p + key.size());
+    if (p == std::string::npos || p >= limit) return false;
+    size_t start = p + 1;
+    size_t end = s.find('"', start);
+    if (end == std::string::npos || end > limit) return false;
+    out = s.substr(start, end - start);
+    return true;
+}
+
+static bool rdma_looks_like_ipv4(const std::string &value) {
+    int dots = 0;
+    for (char c : value) {
+        if (c == '.') {
+            ++dots;
+        } else if (!std::isdigit(static_cast<unsigned char>(c))) {
+            return false;
+        }
+    }
+    return dots == 3 && !value.empty();
+}
+
+static bool rdma_first_ipv4_in_line(const std::string &line, std::string &ip) {
+    size_t p = 0;
+    while (p < line.size()) {
+        while (p < line.size() && !std::isdigit(static_cast<unsigned char>(line[p])))
+            ++p;
+        size_t start = p;
+        while (p < line.size() && (std::isdigit(static_cast<unsigned char>(line[p])) || line[p] == '.'))
+            ++p;
+        if (p > start) {
+            std::string candidate = line.substr(start, p - start);
+            if (rdma_looks_like_ipv4(candidate) && candidate != "255.255.255.0") {
+                ip = candidate;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool rdma_resolve_local_ip_from_hccn_tool(int device_id, std::string &ip) {
+    if (device_id < 0) return false;
+
+    char cmd[256];
+    std::snprintf(
+        cmd, sizeof(cmd), "/usr/local/Ascend/driver/tools/hccn_tool -g -dev_info -i %d 2>/dev/null", device_id
+    );
+    std::array<char, 512> buffer{};
+    std::string output;
+    FILE *pipe = popen(cmd, "r");
+    if (pipe != nullptr) {
+        while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
+            output += buffer.data();
+        }
+        pclose(pipe);
+    }
+    if (output.empty()) {
+        std::snprintf(cmd, sizeof(cmd), "hccn_tool -g -dev_info -i %d 2>/dev/null", device_id);
+        pipe = popen(cmd, "r");
+        if (pipe != nullptr) {
+            while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
+                output += buffer.data();
+            }
+            pclose(pipe);
+        }
+    }
+
+    size_t pos = 0;
+    while (pos < output.size()) {
+        size_t nl = output.find('\n', pos);
+        if (nl == std::string::npos) nl = output.size();
+        std::string line = output.substr(pos, nl - pos);
+        if (line.find('|') != std::string::npos && rdma_first_ipv4_in_line(line, ip)) return true;
+        pos = nl + 1;
+    }
+    return false;
+}
+
+static const char *rdma_rootinfo_path() {
+    const char *path = std::getenv("PTO_ROCE_ROOTINFO");
+    return path != nullptr && *path != '\0' ? path : kDefaultRdmaRootinfoPath;
+}
+
+static bool rdma_resolve_local_ip_from_rootinfo(uint32_t phy_id, std::string &ip, const char *rootinfo_path) {
+    std::ifstream f(rootinfo_path);
+    if (!f.is_open()) return false;
+
+    std::stringstream ss;
+    ss << f.rdbuf();
+    const std::string s = ss.str();
+    if (s.empty()) return false;
+
+    const std::string device_key = "\"device_id\"";
+    const std::string addr_key = "\"addr\"";
+    size_t scan = 0;
+    while (scan < s.size()) {
+        uint32_t dev = 0;
+        size_t dev_key_pos = 0;
+        if (!rdma_extract_uint_after_key(s, device_key, scan, dev, dev_key_pos)) break;
+
+        size_t next_dev = s.find(device_key, dev_key_pos + device_key.size());
+        size_t block_end = next_dev == std::string::npos ? s.size() : next_dev;
+        if (dev == phy_id) {
+            size_t clos = s.find("\"CLOS\"", dev_key_pos);
+            if (clos == std::string::npos || clos >= block_end) return false;
+            size_t cur = clos;
+            std::string candidate;
+            while (rdma_extract_quoted_after_key(s, addr_key, cur, candidate, block_end)) {
+                if (rdma_looks_like_ipv4(candidate)) {
+                    ip = candidate;
+                    return true;
+                }
+                size_t adv = s.find(addr_key, cur);
+                if (adv == std::string::npos || adv >= block_end) break;
+                cur = adv + addr_key.size();
+            }
+            return false;
+        }
+        scan = block_end;
+    }
+    return false;
+}
+
+static bool rdma_resolve_local_ip_from_virtual_topology(uint32_t phy_id, std::string &ip) {
+    if (phy_id > static_cast<uint32_t>(INT_MAX)) return false;
+    using ResolveFn = int (*)(int, char *, size_t);
+
+    void *topo_handle = nullptr;
+    auto resolve = reinterpret_cast<ResolveFn>(dlsym(RTLD_DEFAULT, "GetRoceIpFromXml"));
+    if (resolve == nullptr) {
+        topo_handle = dlopen("libtopoaddrinfo.so", RTLD_NOW | RTLD_LOCAL);
+        if (topo_handle == nullptr) return false;
+        resolve = reinterpret_cast<ResolveFn>(dlsym(topo_handle, "GetRoceIpFromXml"));
+    }
+
+    char buffer[64] = {0};
+    const bool ok = resolve != nullptr && resolve(static_cast<int>(phy_id), buffer, sizeof(buffer)) == 0 &&
+                    rdma_looks_like_ipv4(buffer);
+    if (ok) ip = buffer;
+    if (topo_handle != nullptr) dlclose(topo_handle);
+    return ok;
+}
+
+static bool rdma_resolve_local_ip_from_env(uint32_t base_rank, uint32_t rank_count, std::string &ip) {
+    const char *local_ip = std::getenv("PTO_ROCE_LOCAL_IP");
+    if (local_ip != nullptr && rdma_looks_like_ipv4(local_ip)) {
+        ip = local_ip;
+        return true;
+    }
+    std::vector<std::string> ips;
+    if (rdma_split_csv_env("PTO_ROCE_IPS", ips) && ips.size() == rank_count && base_rank < ips.size() &&
+        rdma_looks_like_ipv4(ips[base_rank])) {
+        ip = ips[base_rank];
+        return true;
+    }
+    return false;
+}
+
+static bool
+resolve_rdma_bootstrap(CommHandle h, uint32_t base_rank, uint32_t rank_count, int device_id, RdmaBootstrapInfo &out) {
+    if (h == nullptr || device_id < 0) {
+        return false;
+    }
+
+    if (!rdma_resolve_phy_id(base_rank, rank_count, device_id, out.phy_id)) return false;
+    const char *rootinfo_path = rdma_rootinfo_path();
+    if (!rdma_resolve_local_ip_from_rootinfo(out.phy_id, out.local_ip, rootinfo_path) &&
+        !rdma_resolve_local_ip_from_virtual_topology(out.phy_id, out.local_ip) &&
+        !rdma_resolve_local_ip_from_env(base_rank, rank_count, out.local_ip) &&
+        !rdma_resolve_local_ip_from_hccn_tool(device_id, out.local_ip)) {
+        LOG_ERROR(
+            "[comm rank %d] RDMA bootstrap failed to resolve local RoCE IP "
+            "(no usable %s CLOS entry, no usable %s, and no PTO_ROCE_LOCAL_IP / PTO_ROCE_IPS)",
+            h->rank, rootinfo_path, kDefaultVirtualTopologyPath
+        );
+        return false;
+    }
+    if (!parse_u16_env("PTO_ROCE_BASE_PORT", out.base_port)) {
+        LOG_ERROR("[comm rank %d] invalid PTO_ROCE_BASE_PORT", h->rank);
+        return false;
+    }
+    return !out.local_ip.empty();
+}
+
+static uint64_t rdma_workspace_bytes(uint32_t rank_count) {
+    using namespace pto::comm::rdma;
+    using namespace pto::comm::rdma::hns_1825;
+    constexpr uint32_t qp_num = 1;
+    return sizeof(RdmaInfo) +
+           static_cast<uint64_t>(rank_count) *
+               (2ULL * sizeof(RoceSqCtx) * qp_num + 2ULL * sizeof(RoceCqCtx) * qp_num + sizeof(RdmaMemInfo));
+}
+
+// The HNS1825 RDMA NIC can only DMA to the low GM segment. Native pto-isa
+// tests aclrtMalloc(HUGE_FIRST) into 0x1200... (e.g. 0x120000017000, 0x12004c600000)
+// and pass; a VMM window reserved with hint=0 lands at 0x1240...000000, which the
+// NIC never reaches — WQEs are consumed but no CQE ever appears. aclrtMalloc is
+// not guaranteed to avoid that high region, so retry a bounded number of times
+// and reject any buffer at or above the VMM region start (0x1240...000000).
+// Used only for the RDMA overlay's symmetric buffer; the non-RDMA VMM path is
+// unchanged.
+static bool aclrt_malloc_low_segment(void **out, size_t size) {
+    constexpr uint32_t kMaxAttempts = 16;
+    constexpr uintptr_t kVmmRegionStart = UINT64_C(0x124000000000);
+    for (uint32_t attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        void *buf = nullptr;
+        if (aclrtMalloc(&buf, size, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS || buf == nullptr) {
+            continue;
+        }
+        if (reinterpret_cast<uintptr_t>(buf) < kVmmRegionStart) {
+            *out = buf;
+            return true;
+        }
+        aclrtFree(buf);
+    }
+    return false;
+}
+
+// Patch every SQ context's dbCos field in the RDMA device workspace so the
+// AICore rings the SQ hardware doorbell with the NIC-configured class of
+// service. The workspace is device memory (aclrtMalloc'd by the pto-isa
+// workspace manager); we read it back, fix the byte at each RoceSqCtx.dbCos
+// (offset 89), and write it back. See the caller comment for why dbCos must
+// match the NIC.
+static void patch_rdma_workspace_db_cos(void *workspace_addr, uint32_t rank_count) {
+    using namespace pto::comm::rdma;
+    using namespace pto::comm::rdma::hns_1825;
+    if (workspace_addr == nullptr || rank_count == 0) return;
+    constexpr uint8_t kExpectedDbCos = 4;  // NIC-configured cos observed on native pto-isa
+    const uint64_t workspace_size = rdma_workspace_bytes(rank_count);
+    std::vector<uint8_t> buf(workspace_size);
+    if (aclrtMemcpy(buf.data(), buf.size(), workspace_addr, buf.size(), ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
+        LOG_ERROR("[comm] rdma workspace dbCos patch: D2H read failed");
+        return;
+    }
+    RdmaInfo *info = reinterpret_cast<RdmaInfo *>(buf.data());
+    const uint64_t sq_ptr = info->sqPtr;
+    if (sq_ptr == 0) return;
+    bool patched = false;
+    for (uint32_t rank = 0; rank < rank_count; ++rank) {
+        const uint64_t sq_off = sq_ptr - reinterpret_cast<uint64_t>(workspace_addr) + rank * sizeof(RoceSqCtx);
+        if (sq_off + sizeof(RoceSqCtx) > buf.size()) return;
+        uint8_t *db_cos = buf.data() + sq_off + offsetof(RoceSqCtx, dbCos);
+        if (*db_cos == 0) {
+            *db_cos = kExpectedDbCos;
+            patched = true;
+        }
+    }
+    if (patched) {
+        if (aclrtMemcpy(workspace_addr, buf.size(), buf.data(), buf.size(), ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
+            LOG_ERROR("[comm] rdma workspace dbCos patch: H2D write failed");
+            return;
+        }
+    }
+    LOG_INFO(
+        "[comm] rdma workspace dbCos patch %s (rank_count=%u)", patched ? "applied" : "already-correct",
+        static_cast<unsigned>(rank_count)
+    );
+}
+
+static bool init_rdma_workspace(
+    CommHandle h, uint32_t domain_rank, uint32_t rank_count, const RdmaBootstrapInfo &bootstrap,
+    const std::vector<IpcAnnounceFile> &peers, void *symmetric_addr, uint64_t symmetric_size,
+    std::unique_ptr<pto::comm::rdma::RdmaWorkspaceManager> &workspace
+) {
+    if (workspace) return workspace->GetWorkspaceAddr() != nullptr;
+    if (h == nullptr || symmetric_addr == nullptr || symmetric_size == 0 || domain_rank >= rank_count ||
+        peers.size() != rank_count) {
+        return false;
+    }
+
+    pto::comm::rdma::WorkspaceConfig config{};
+    config.rankId = domain_rank;
+    config.rankCount = rank_count;
+    config.phyId = bootstrap.phy_id;
+    config.localIp = bootstrap.local_ip;
+    config.basePort = bootstrap.base_port;
+    config.symmetricAddr = symmetric_addr;
+    config.symmetricSize = symmetric_size;
+    config.peerIps.resize(rank_count);
+    config.peerPhyIds.resize(rank_count);
+    config.peerSymAddrs.resize(rank_count);
+    for (uint32_t p = 0; p < rank_count; ++p) {
+        if (peers[p].roce_base_port != bootstrap.base_port || peers[p].roce_ip[0] == '\0' ||
+            peers[p].symmetric_addr == 0) {
+            LOG_ERROR("[comm rank %d] RDMA peer metadata invalid for domain rank %u", h->rank, p);
+            return false;
+        }
+        config.peerIps[p] = peers[p].roce_ip;
+        config.peerPhyIds[p] = peers[p].phy_id;
+        config.peerSymAddrs[p] = peers[p].symmetric_addr;
+    }
+
+    auto manager = std::make_unique<pto::comm::rdma::RdmaWorkspaceManager>();
+    const auto init_result = manager->Init(config);
+    if (init_result != pto::comm::rdma::WorkspaceInitResult::READY) {
+        LOG_ERROR(
+            "[comm rank %d] RDMA workspace init failed (result=%u rank_id=%u rank_count=%u phy_id=%u ip=%s "
+            "base_port=%u peer0_phy=%u peer0_ip=%s peer0_addr=0x%llx peer1_phy=%u peer1_ip=%s "
+            "peer1_addr=0x%llx size=%llu)",
+            h->rank, static_cast<unsigned>(init_result), domain_rank, rank_count, bootstrap.phy_id,
+            bootstrap.local_ip.c_str(), static_cast<unsigned>(bootstrap.base_port),
+            rank_count > 0 ? peers[0].phy_id : 0, rank_count > 0 ? peers[0].roce_ip : "",
+            static_cast<unsigned long long>(rank_count > 0 ? peers[0].symmetric_addr : 0),
+            rank_count > 1 ? peers[1].phy_id : 0, rank_count > 1 ? peers[1].roce_ip : "",
+            static_cast<unsigned long long>(rank_count > 1 ? peers[1].symmetric_addr : 0),
+            static_cast<unsigned long long>(symmetric_size)
+        );
+        return false;
+    }
+
+    // The HNS1825 SQ hardware doorbell encodes the QP's class of service in a
+    // cos field; if it does not match the NIC's configured value the NIC
+    // silently ignores the doorbell (WQEs posted, software doorbell written,
+    // but nothing is consumed). The workspace's sq context dbCos is decoded by
+    // pto-isa from the HCOMM DbVendorSpecified field; on some pins it resolves
+    // to 0 while the NIC expects 4 (as native pto-isa tests observe). Patch the
+    // device workspace so AICore rings the doorbell with the NIC-configured cos.
+    patch_rdma_workspace_db_cos(manager->GetWorkspaceAddr(), static_cast<uint32_t>(rank_count));
+
+    workspace = std::move(manager);
+    return true;
+}
+#endif
 
 // Performs the per-allocation Path-D dance for one subset rank.  rank_ids
 // must list participating BASE-COMM rank ids in domain rank order; this
@@ -859,10 +1351,12 @@ static int domain_alloc_via_ipc(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
     uint64_t win_size, DomainAllocation *out
 ) {
+    (void)rank_ids;
     const std::string &rootinfo = h->rootinfo_path;
     const uint64_t run_token = h->run_token;
     const int subset_n = static_cast<int>(rank_count);
     const int my_dr = static_cast<int>(domain_rank);
+    aclError aret = ACL_SUCCESS;  // shared by both allocation branches and the ctx upload below
 
     int32_t myDevice = -1;
     if (aclrtGetDevice(&myDevice) != ACL_SUCCESS) {
@@ -870,8 +1364,24 @@ static int domain_alloc_via_ipc(
         return -1;
     }
 
-    // VMM own-window allocation; see alloc_windows_via_ipc for step-by-step
-    // rationale.
+    // Own-window allocation.  The non-RDMA path uses the VMM shareable-handle
+    // dance (see alloc_windows_via_ipc for step-by-step rationale) so peers can
+    // import each other's VA.  The RDMA overlay instead aclrtMallocs a buffer
+    // in the low GM segment (0x1200...) that the HNS1825 NIC can DMA to — a VMM
+    // window reserved with hint=0 lands at 0x1240...000000, which the NIC never
+    // reaches (WQEs consumed, no CQE).  RDMA reaches peers via rkey+VA, so no
+    // shareable handle is exchanged.
+#ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
+    void *localBuf = nullptr;
+    if (!aclrt_malloc_low_segment(&localBuf, win_size)) {
+        LOG_ERROR("[comm rank %d] alloc_domain: low-segment aclrtMalloc failed", h->rank);
+        return -1;
+    }
+    const uint64_t aligned_size = win_size;
+    aclrtDrvMemHandle handle = nullptr;  // unused for aclrtMalloc (VMM-only)
+    uint64_t shareableHandle = 0;        // RDMA reaches peers via rkey; no shareable handle
+#else
+    uint64_t shareableHandle = 0;
     aclrtPhysicalMemProp prop{};
     prop.handleType = ACL_MEM_HANDLE_TYPE_NONE;
     prop.allocationType = ACL_MEM_ALLOCATION_TYPE_PINNED;
@@ -879,7 +1389,7 @@ static int domain_alloc_via_ipc(
     prop.location.id = static_cast<uint32_t>(myDevice);
     prop.location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
     size_t granularity = 0;
-    aclError aret = aclrtMemGetAllocationGranularity(&prop, ACL_RT_MEM_ALLOC_GRANULARITY_MINIMUM, &granularity);
+    aret = aclrtMemGetAllocationGranularity(&prop, ACL_RT_MEM_ALLOC_GRANULARITY_MINIMUM, &granularity);
     if (aret != ACL_SUCCESS) {
         LOG_ERROR("[comm rank %d] alloc_domain: GetAllocationGranularity -> %d", h->rank, static_cast<int>(aret));
         return -1;
@@ -915,18 +1425,18 @@ static int domain_alloc_via_ipc(
     aret = aclrtMemSetAccess(localBuf, aligned_size, &accessDesc, 1);
     if (aret != ACL_SUCCESS) {
         LOG_ERROR("[comm rank %d] alloc_domain: MemSetAccess -> %d", h->rank, static_cast<int>(aret));
-        release_own_vmm_window(localBuf, handle);
+        release_domain_window_raw(localBuf, handle);
         return -1;
     }
-    uint64_t shareableHandle = 0;
     aret = aclrtMemExportToShareableHandle(
         handle, ACL_MEM_HANDLE_TYPE_NONE, ACL_RT_VMM_EXPORT_FLAG_DISABLE_PID_VALIDATION, &shareableHandle
     );
     if (aret != ACL_SUCCESS) {
         LOG_ERROR("[comm rank %d] alloc_domain: ExportToShareableHandle -> %d", h->rank, static_cast<int>(aret));
-        release_own_vmm_window(localBuf, handle);
+        release_domain_window_raw(localBuf, handle);
         return -1;
     }
+#endif
 
     // Wipe before the handle is published. Publication is the point from which
     // a peer may import this window and store into it — a barrier signal lands
@@ -937,14 +1447,27 @@ static int domain_alloc_via_ipc(
     aret = aclrtMemset(localBuf, aligned_size, 0, aligned_size);
     if (aret != ACL_SUCCESS) {
         LOG_ERROR("[comm rank %d] alloc_domain: aclrtMemset -> %d", h->rank, static_cast<int>(aret));
-        release_own_vmm_window(localBuf, handle);
+        release_domain_window_raw(localBuf, handle);
         return -1;
     }
 
     const int32_t myPid = static_cast<int32_t>(getpid());
+#ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
+    RdmaBootstrapInfo rdma_bootstrap{};
+    if (!resolve_rdma_bootstrap(h, domain_rank, static_cast<uint32_t>(rank_count), myDevice, rdma_bootstrap)) {
+        release_domain_window_raw(localBuf, handle);
+        return -1;
+    }
+    if (!domain_write_announce(
+            rootinfo, allocation_id, domain_rank, run_token, myPid, myDevice, shareableHandle,
+            reinterpret_cast<uint64_t>(localBuf), rdma_bootstrap.phy_id, rdma_bootstrap.base_port,
+            rdma_bootstrap.local_ip.c_str()
+        )) {
+#else
     if (!domain_write_announce(rootinfo, allocation_id, domain_rank, run_token, myPid, myDevice, shareableHandle)) {
+#endif
         LOG_ERROR("[comm rank %d] alloc_domain: write_announce failed", h->rank);
-        release_own_vmm_window(localBuf, handle);
+        release_domain_window_raw(localBuf, handle);
         return -1;
     }
     std::vector<IpcAnnounceFile> peers(subset_n);
@@ -955,11 +1478,17 @@ static int domain_alloc_via_ipc(
             peers[p].rank = domain_rank;
             peers[p].device_id = myDevice;
             peers[p].shareable_handle = shareableHandle;
+#ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
+            peers[p].symmetric_addr = reinterpret_cast<uint64_t>(localBuf);
+            peers[p].phy_id = rdma_bootstrap.phy_id;
+            peers[p].roce_base_port = rdma_bootstrap.base_port;
+            std::snprintf(peers[p].roce_ip, sizeof(peers[p].roce_ip), "%s", rdma_bootstrap.local_ip.c_str());
+#endif
             continue;
         }
         if (!domain_read_announce(rootinfo, allocation_id, static_cast<uint32_t>(p), run_token, &peers[p])) {
             LOG_ERROR("[comm rank %d] alloc_domain: read_announce(peer_dr=%d) timed out", h->rank, p);
-            release_own_vmm_window(localBuf, handle);
+            release_domain_window_raw(localBuf, handle);
             return -1;
         }
     }
@@ -971,6 +1500,11 @@ static int domain_alloc_via_ipc(
     // and per device-pair; once any allocation opens a pair, later ones simply
     // observe it. The enable is the operative call (resolves the peer physical
     // id via the HCCL adapter and opens the HCCS route).
+    //
+    // The RDMA overlay reaches peers over RoCE (HCOMM channel), not HCCS, so
+    // the HCCS peer-access enable/confirm dance is skipped there; the
+    // file_barrier below still synchronizes the announce exchange.
+#ifndef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
     for (int p = 0; p < subset_n; ++p) {
         if (p == my_dr) continue;
         aclError r = aclrtDeviceEnablePeerAccess(peers[p].device_id, 0);
@@ -998,7 +1532,7 @@ static int domain_alloc_via_ipc(
                     "[comm rank %d] alloc_domain: PeerAccessStatus(local_dev=%d peer_dev=%d) -> %d", h->rank, myDevice,
                     peers[p].device_id, static_cast<int>(r)
                 );
-                release_own_vmm_window(localBuf, handle);
+                release_domain_window_raw(localBuf, handle);
                 return -1;
             }
             if (status == 1) break;
@@ -1013,11 +1547,12 @@ static int domain_alloc_via_ipc(
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
+#endif
 
     // With DISABLE_PID_VALIDATION the import can proceed once peers have
     // published their shareable handles (read above) and P2P is up.
     if (!file_barrier(rootinfo, my_dr, subset_n, domain_barrier_tag(allocation_id, "p2p_ready"), run_token)) {
-        release_own_vmm_window(localBuf, handle);
+        release_domain_window_raw(localBuf, handle);
         return -1;
     }
 
@@ -1048,7 +1583,7 @@ static int domain_alloc_via_ipc(
             )) {
             reset_domain_urma_workspace(*out);
             release_domain_peer_windows(*out);
-            release_own_vmm_window(localBuf, handle);
+            release_domain_window_raw(localBuf, handle);
             return -1;
         }
         domain_workspace_addr = reinterpret_cast<uint64_t>(out->urma_workspace->GetWorkspaceAddr());
@@ -1056,6 +1591,19 @@ static int domain_alloc_via_ipc(
     } else {
         LOG_WARN("[comm rank %d] alloc_domain: URMA workspace disabled for non-dense rank mapping", h->rank);
     }
+#endif
+#ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
+    if (!init_rdma_workspace(
+            h, domain_rank, static_cast<uint32_t>(rank_count), rdma_bootstrap, peers, localBuf, aligned_size,
+            out->rdma_workspace
+        )) {
+        reset_domain_urma_workspace(*out);
+        release_domain_peer_windows(*out);
+        release_domain_window_raw(localBuf, handle);
+        return -1;
+    }
+    domain_workspace_addr = reinterpret_cast<uint64_t>(out->rdma_workspace->GetWorkspaceAddr());
+    domain_workspace_size = rdma_workspace_bytes(static_cast<uint32_t>(rank_count));
 #endif
 
     CommContext ctx{};
@@ -1067,6 +1615,11 @@ static int domain_alloc_via_ipc(
     ctx.windowsIn[my_dr] = reinterpret_cast<uint64_t>(localBuf);
     // Import each peer's shareable handle onto our device; see the symmetry
     // note in alloc_windows_via_ipc (one win_size, shared chip granularity).
+    //
+    // The RDMA overlay reaches peers over RoCE via rkey+VA (PeerMrBaseAddr),
+    // and the RDMA kernels only ever read windowsIn[own], so no peer VA import
+    // is needed there — the loop below is skipped and peer_windows stays empty.
+#ifndef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
     for (int p = 0; p < subset_n; ++p) {
         if (p == my_dr) continue;
         aclrtDrvMemHandle peerHandle = nullptr;
@@ -1078,7 +1631,7 @@ static int domain_alloc_via_ipc(
             );
             reset_domain_urma_workspace(*out);
             release_domain_peer_windows(*out);
-            release_own_vmm_window(localBuf, handle);
+            release_domain_window_raw(localBuf, handle);
             return -1;
         }
         void *peerVa = nullptr;
@@ -1091,7 +1644,7 @@ static int domain_alloc_via_ipc(
             aclrtFreePhysical(peerHandle);
             reset_domain_urma_workspace(*out);
             release_domain_peer_windows(*out);
-            release_own_vmm_window(localBuf, handle);
+            release_domain_window_raw(localBuf, handle);
             return -1;
         }
         aret = aclrtMapMem(peerVa, aligned_size, 0, peerHandle, 0);
@@ -1101,7 +1654,7 @@ static int domain_alloc_via_ipc(
             aclrtFreePhysical(peerHandle);
             reset_domain_urma_workspace(*out);
             release_domain_peer_windows(*out);
-            release_own_vmm_window(localBuf, handle);
+            release_domain_window_raw(localBuf, handle);
             return -1;
         }
         aret = aclrtMemSetAccess(peerVa, aligned_size, &accessDesc, 1);
@@ -1114,12 +1667,13 @@ static int domain_alloc_via_ipc(
             aclrtFreePhysical(peerHandle);
             reset_domain_urma_workspace(*out);
             release_domain_peer_windows(*out);
-            release_own_vmm_window(localBuf, handle);
+            release_domain_window_raw(localBuf, handle);
             return -1;
         }
         out->peer_windows.emplace_back(peerVa, peerHandle);
         ctx.windowsIn[p] = reinterpret_cast<uint64_t>(peerVa);
     }
+#endif
 
     void *newDevMem = nullptr;
     aret = aclrtMalloc(&newDevMem, sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST);
@@ -1127,7 +1681,7 @@ static int domain_alloc_via_ipc(
         LOG_ERROR("[comm rank %d] alloc_domain: ctx aclrtMalloc -> %d", h->rank, static_cast<int>(aret));
         reset_domain_urma_workspace(*out);
         release_domain_peer_windows(*out);
-        release_own_vmm_window(localBuf, handle);
+        release_domain_window_raw(localBuf, handle);
         return -1;
     }
     aret = aclrtMemcpy(newDevMem, sizeof(CommContext), &ctx, sizeof(CommContext), ACL_MEMCPY_HOST_TO_DEVICE);
@@ -1136,7 +1690,7 @@ static int domain_alloc_via_ipc(
         aclrtFree(newDevMem);
         reset_domain_urma_workspace(*out);
         release_domain_peer_windows(*out);
-        release_own_vmm_window(localBuf, handle);
+        release_domain_window_raw(localBuf, handle);
         return -1;
     }
     out->device_ctx = reinterpret_cast<CommContext *>(newDevMem);
@@ -1230,8 +1784,10 @@ extern "C" int comm_derive_context(
     }
 
     CommContext ctx{};
-    ctx.workSpace = h->host_ctx.workSpace;
-    ctx.workSpaceSize = h->host_ctx.workSpaceSize;
+    if (rank_ids_are_dense_prefix(rank_ids, rank_count)) {
+        ctx.workSpace = h->host_ctx.workSpace;
+        ctx.workSpaceSize = h->host_ctx.workSpaceSize;
+    }
     ctx.rankId = domain_rank;
     ctx.rankNum = static_cast<uint32_t>(rank_count);
     ctx.winSize = window_size;
@@ -1380,7 +1936,7 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
     // handle.
     release_domain_peer_windows(*alloc);
     if (alloc->local_buf) {
-        release_own_vmm_window(alloc->local_buf, alloc->own_handle);
+        release_domain_local_buffer(*alloc);
         alloc->local_buf = nullptr;
         alloc->own_handle = nullptr;
     }
@@ -1443,7 +1999,7 @@ extern "C" int comm_destroy(CommHandle h) try {
         if (alloc->device_ctx) aclrtFree(alloc->device_ctx);
         reset_domain_urma_workspace(*alloc);
         release_domain_peer_windows(*alloc);
-        if (alloc->local_buf) release_own_vmm_window(alloc->local_buf, alloc->own_handle);
+        if (alloc->local_buf) release_domain_local_buffer(*alloc);
     }
     h->domain_allocations.clear();
     reset_base_urma_workspace(h);
