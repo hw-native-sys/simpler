@@ -19,4 +19,5 @@ Invoke via ``python -m simpler_setup.tools.<name>``:
 - ``strace_timing``         : per-stage / per-round timing from [STRACE] log markers
 - ``hbg_bind_phases``       : per-segment host_build_graph bind statistics from the chip.run.bind.* spans
 - ``phase_time_split``      : the same segments split into on-CPU and off-CPU, from per-thread CPU clocks
+- ``rtt_die_preflight``     : A5 affinity preflight → allowed_cpus plan (uses aicpu_device_query)
 """

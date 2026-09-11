@@ -24,6 +24,7 @@
 #include "common/memory_barrier.h"
 #include "common/chip_swimlane_profiling.h"
 #include "common/platform_config.h"
+#include "common/scheduler_cluster_partition.h"
 #include "runtime_core.h"
 #include "shared_memory.h"
 #include "runtime.h"
@@ -312,9 +313,8 @@ void SchedulerContext::log_stall_diagnostics(
     }
 
     // CLUSTER lines: one per cluster this thread owns.
-    // cluster_id = local_cluster_idx * active_sched_threads_ + thread_idx, matching the
-    // round-robin assignment in assign_cores_to_threads.
     int32_t ast = active_sched_threads_ > 0 ? active_sched_threads_ : aicpu_thread_num_;
+    const int32_t cluster_begin = scheduler_cluster_range(aic_count_, ast, thread_idx).begin;
     for (int32_t cli = 0; cli < tracker.get_cluster_count() && cli < STALL_DUMP_CORE_MAX; cli++) {
         int32_t offset = cli * PLATFORM_CORES_PER_BLOCKDIM;
         int32_t aic_id = tracker.get_aic_core_id(offset);
@@ -323,7 +323,7 @@ void SchedulerContext::log_stall_diagnostics(
         bool aic_idle = tracker.is_aic_core_idle(offset);
         bool aiv0_idle = tracker.is_aiv0_core_idle(offset);
         bool aiv1_idle = tracker.is_aiv1_core_idle(offset);
-        int32_t cluster_id = cli * ast + thread_idx;
+        int32_t cluster_id = cluster_begin + cli;
         char aic_buf[128], aiv0_buf[128], aiv1_buf[128];
         format_core_status(
             aic_buf, sizeof(aic_buf), aic_id, aic_idle, &core_exec_states_[aic_id], core_exec_states_[aic_id].reg_addr
@@ -796,16 +796,19 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
 
 // Handshake exactly the cores this scheduler thread will later manage. Blocked
 // core layout ([0,N/3) AIC, [N/3,N) AIV) makes ownership predictable before
-// handshake: cluster ci = {ci, N/3+2ci, N/3+2ci+1}, assigned to thread
-// ci % active_threads. Same protocol as handshake_partition, but over the owned
+// handshake: cluster ci = {ci, N/3+2ci, N/3+2ci+1}, assigned to thread via
+// balanced contiguous ranges. Same protocol as handshake_partition, but over the owned
 // set instead of a contiguous slice.
 void SchedulerContext::handshake_owned_clusters(Runtime *runtime, int32_t tidx, int32_t active_threads) {
     Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
     const int32_t aic_n = cores_total_num_ / PLATFORM_CORES_PER_BLOCKDIM;
+    const SchedulerClusterRange range = scheduler_cluster_range(aic_n, active_threads, tidx);
+    const int32_t begin = range.begin;
+    const int32_t end = range.end;
 
     int32_t owned[RUNTIME_MAX_WORKER];
     int32_t own_n = 0;
-    for (int32_t ci = tidx; ci < aic_n; ci += active_threads) {
+    for (int32_t ci = begin; ci < end; ++ci) {
         owned[own_n++] = ci;                  // AIC
         owned[own_n++] = aic_n + 2 * ci;      // AIV0
         owned[own_n++] = aic_n + 2 * ci + 1;  // AIV1
@@ -894,20 +897,22 @@ void SchedulerContext::handshake_owned_clusters(Runtime *runtime, int32_t tidx, 
 }
 
 // =============================================================================
-// Per-thread self-assignment (barrier-free init). Thread tidx owns the clusters
-// ci with ci % active_sched_threads_ == tidx (same round-robin as
-// assign_cores_to_threads), and the blocked layout gives their worker ids
-// directly, so a thread populates its own CoreTracker + per-core sub_block_id
-// right after handshaking its own clusters, with no all-thread barrier.
+// Per-thread self-assignment (barrier-free init). Thread tidx owns the
+// balanced contiguous range of clusters (same as assign_cores_to_threads), and the
+// blocked layout gives their worker ids directly, so a thread populates its own
+// CoreTracker + per-core sub_block_id right after handshaking its own clusters,
+// with no all-thread barrier.
 // =============================================================================
 void SchedulerContext::assign_own_clusters(int32_t tidx) {
     const int32_t aic_n = cores_total_num_ / PLATFORM_CORES_PER_BLOCKDIM;
     const int32_t active = active_sched_threads_;
+    // Contiguous slice: [t*N/A, (t+1)*N/A). With A=4 this is quarters.
+    const SchedulerClusterRange range = scheduler_cluster_range(aic_n, active, tidx);
+    const int32_t begin = range.begin;
+    const int32_t end = range.end;
+    const int32_t own_n = end - begin;
 
     CoreTracker &tracker = core_trackers_[tidx];
-    int32_t own_n = 0;
-    for (int32_t ci = tidx; ci < aic_n; ci += active)
-        own_n++;
     // Mirrors the check assign_cores_to_threads() makes on the serial path. A
     // thread owning more clusters than CoreTracker can hold used to write past
     // core_id_map_ into the next tracker, which is the orchestrator's on the
@@ -924,7 +929,7 @@ void SchedulerContext::assign_own_clusters(int32_t tidx) {
     tracker.init(own_n);
 
     int32_t local = 0;
-    for (int32_t ci = tidx; ci < aic_n; ci += active) {
+    for (int32_t ci = begin; ci < end; ++ci) {
         tracker.set_cluster(local++, ci, aic_n + 2 * ci, aic_n + 2 * ci + 1);
     }
 
@@ -989,10 +994,9 @@ void SchedulerContext::post_handshake_profiling_init() {
 }
 
 // =============================================================================
-// Assign discovered cores to scheduler threads (cluster-aligned round-robin).
+// Assign discovered cores to scheduler threads (balanced contiguous ranges).
 // =============================================================================
 bool SchedulerContext::assign_cores_to_threads() {
-    // Cluster-aligned round-robin assignment: cluster ci -> sched thread ci % active_sched_threads_.
     // Each cluster = 1 AIC + 2 adjacent AIV; the triple is always kept together.
     active_sched_threads_ = (sched_thread_num_ > 0) ? sched_thread_num_ : aicpu_thread_num_;
     int32_t cluster_count = aic_count_;
@@ -1007,34 +1011,29 @@ bool SchedulerContext::assign_cores_to_threads() {
     }
 
     LOG_INFO(
-        "Assigning cores (round-robin): %d clusters across %d sched threads (%d AIC, %d AIV)", cluster_count,
-        active_sched_threads_, aic_count_, aiv_count_
+        "Assigning cores (balanced contiguous): %d clusters across %d sched threads "
+        "(%d AIC, %d AIV)",
+        cluster_count, active_sched_threads_, aic_count_, aiv_count_
     );
 
     // running_reg_task_id / pending_reg_task_id for every serviced core are reset
     // in handshake_partition's sweep.
 
-    // Count clusters per thread first (round-robin may distribute unevenly)
-    int32_t clusters_per_thread[MAX_AICPU_THREADS] = {};
-    for (int32_t ci = 0; ci < cluster_count; ci++) {
-        clusters_per_thread[ci % active_sched_threads_]++;
-    }
-    for (int32_t i = 0; i < active_sched_threads_; i++) {
-        core_trackers_[i].init(clusters_per_thread[i]);
-    }
-
-    int32_t cluster_idx_per_thread[MAX_AICPU_THREADS] = {};
-
-    for (int32_t ci = 0; ci < cluster_count; ci++) {
-        int32_t t = ci % active_sched_threads_;
-
-        int32_t aic_wid = aic_worker_ids_[ci];
-        int32_t aiv0_wid = aiv_worker_ids_[2 * ci];
-        int32_t aiv1_wid = aiv_worker_ids_[2 * ci + 1];
-
-        core_trackers_[t].set_cluster(cluster_idx_per_thread[t]++, aic_wid, aiv0_wid, aiv1_wid);
-
-        LOG_DEBUG("Thread %d: cluster %d (AIC=%d, AIV0=%d, AIV1=%d)", t, ci, aic_wid, aiv0_wid, aiv1_wid);
+    // Contiguous slices: thread t owns [t*N/A, (t+1)*N/A).
+    const int32_t active = active_sched_threads_;
+    for (int32_t t = 0; t < active; t++) {
+        const SchedulerClusterRange range = scheduler_cluster_range(cluster_count, active, t);
+        const int32_t begin = range.begin;
+        const int32_t end = range.end;
+        core_trackers_[t].init(end - begin);
+        int32_t local = 0;
+        for (int32_t ci = begin; ci < end; ci++) {
+            int32_t aic_wid = aic_worker_ids_[ci];
+            int32_t aiv0_wid = aiv_worker_ids_[2 * ci];
+            int32_t aiv1_wid = aiv_worker_ids_[2 * ci + 1];
+            core_trackers_[t].set_cluster(local++, aic_wid, aiv0_wid, aiv1_wid);
+            LOG_DEBUG("Thread %d: cluster %d (AIC=%d, AIV0=%d, AIV1=%d)", t, ci, aic_wid, aiv0_wid, aiv1_wid);
+        }
     }
 
     for (int32_t t = 0; t < aicpu_thread_num_; t++) {

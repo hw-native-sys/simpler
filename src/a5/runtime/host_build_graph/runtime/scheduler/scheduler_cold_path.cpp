@@ -23,6 +23,7 @@
 #include "common/memory_barrier.h"
 #include "common/chip_swimlane_profiling.h"
 #include "common/platform_config.h"
+#include "common/scheduler_cluster_partition.h"
 #include "host_build_graph/runtime_status.h"
 #include "host_build_graph/runtime_core.h"
 #include "host_build_graph/shared_memory.h"
@@ -296,9 +297,8 @@ void SchedulerContext::log_stall_diagnostics(
     }
 
     // CLUSTER lines: one per cluster this thread owns.
-    // cluster_id = local_cluster_idx * active_sched_threads_ + thread_idx, matching the
-    // round-robin assignment in assign_cores_to_threads.
     int32_t ast = active_sched_threads_ > 0 ? active_sched_threads_ : aicpu_thread_num_;
+    const int32_t cluster_begin = scheduler_cluster_range(aic_count_, ast, thread_idx).begin;
     for (int32_t cli = 0; cli < tracker.get_cluster_count() && cli < STALL_DUMP_CORE_MAX; cli++) {
         int32_t offset = cli * 3;
         int32_t aic_id = tracker.get_aic_core_id(offset);
@@ -307,7 +307,7 @@ void SchedulerContext::log_stall_diagnostics(
         bool aic_idle = tracker.is_aic_core_idle(offset);
         bool aiv0_idle = tracker.is_aiv0_core_idle(offset);
         bool aiv1_idle = tracker.is_aiv1_core_idle(offset);
-        int32_t cluster_id = cli * ast + thread_idx;
+        int32_t cluster_id = cluster_begin + cli;
         char aic_buf[192], aiv0_buf[192], aiv1_buf[192];
         format_core_status(
             aic_buf, sizeof(aic_buf), aic_id, aic_idle, &core_exec_states_[aic_id], core_exec_states_[aic_id].reg_addr
@@ -689,11 +689,10 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
 }
 
 // =============================================================================
-// Assign discovered cores to scheduler threads (cluster-aligned round-robin).
+// Assign discovered cores to scheduler threads (balanced contiguous ranges).
 // =============================================================================
 bool SchedulerContext::assign_cores_to_threads() {
-    // Cluster-aligned round-robin assignment: cluster ci -> sched thread ci % active_sched_threads_.
-    // Each cluster = 1 AIC + 2 adjacent AIV; the triple is always kept together.
+    // Cluster-aligned assignment: each cluster = 1 AIC + 2 adjacent AIV.
     //
     // 3S+1P: the last AICPU thread is the core-less resolution thread (P); cores
     // partition across the remaining (aicpu_thread_num_ - 1) scheduler threads
@@ -721,34 +720,29 @@ bool SchedulerContext::assign_cores_to_threads() {
     }
 
     LOG_INFO(
-        "Assigning cores (round-robin): %d clusters across %d sched threads (%d AIC, %d AIV)", cluster_count,
-        active_sched_threads_, aic_count_, aiv_count_
+        "Assigning cores (balanced contiguous): %d clusters across %d sched threads "
+        "(%d AIC, %d AIV)",
+        cluster_count, active_sched_threads_, aic_count_, aiv_count_
     );
 
     // running_reg_task_id / pending_reg_task_id for every serviced core are reset
     // in handshake_partition's sweep.
 
-    // Count clusters per thread first (round-robin may distribute unevenly)
-    int32_t clusters_per_thread[MAX_AICPU_THREADS] = {};
-    for (int32_t ci = 0; ci < cluster_count; ci++) {
-        clusters_per_thread[ci % active_sched_threads_]++;
-    }
-    for (int32_t i = 0; i < active_sched_threads_; i++) {
-        core_trackers_[i].init(clusters_per_thread[i]);
-    }
-
-    int32_t cluster_idx_per_thread[MAX_AICPU_THREADS] = {};
-
-    for (int32_t ci = 0; ci < cluster_count; ci++) {
-        int32_t t = ci % active_sched_threads_;
-
-        int32_t aic_wid = aic_worker_ids_[ci];
-        int32_t aiv0_wid = aiv_worker_ids_[2 * ci];
-        int32_t aiv1_wid = aiv_worker_ids_[2 * ci + 1];
-
-        core_trackers_[t].set_cluster(cluster_idx_per_thread[t]++, aic_wid, aiv0_wid, aiv1_wid);
-
-        LOG_DEBUG("Thread %d: cluster %d (AIC=%d, AIV0=%d, AIV1=%d)", t, ci, aic_wid, aiv0_wid, aiv1_wid);
+    // Contiguous slices: thread t owns [t*N/A, (t+1)*N/A).
+    const int32_t active = active_sched_threads_;
+    for (int32_t t = 0; t < active; t++) {
+        const SchedulerClusterRange range = scheduler_cluster_range(cluster_count, active, t);
+        const int32_t begin = range.begin;
+        const int32_t end = range.end;
+        core_trackers_[t].init(end - begin);
+        int32_t local = 0;
+        for (int32_t ci = begin; ci < end; ci++) {
+            int32_t aic_wid = aic_worker_ids_[ci];
+            int32_t aiv0_wid = aiv_worker_ids_[2 * ci];
+            int32_t aiv1_wid = aiv_worker_ids_[2 * ci + 1];
+            core_trackers_[t].set_cluster(local++, aic_wid, aiv0_wid, aiv1_wid);
+            LOG_DEBUG("Thread %d: cluster %d (AIC=%d, AIV0=%d, AIV1=%d)", t, ci, aic_wid, aiv0_wid, aiv1_wid);
+        }
     }
 
     for (int32_t t = 0; t < aicpu_thread_num_; t++) {

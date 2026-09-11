@@ -29,11 +29,17 @@
 
 #include <cassert>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <string>
+#include <system_error>
+#include <utility>
 #include <vector>
 
+#include "affinity_allowed_file.h"
 #include "aicpu_topology_probe.h"
 #include "callable.h"
 #include "callable_protocol.h"
@@ -47,7 +53,21 @@
 
 namespace {
 constexpr const char *kAicpuTopologyQueryName = "simpler_aicpu_query_topology";
+
+int popcount_u64(uint64_t value) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_popcountll(value);
+#else
+    int count = 0;
+    while (value != 0) {
+        count += static_cast<int>(value & 1u);
+        value >>= 1;
+    }
+    return count;
+#endif
 }
+
+}  // namespace
 
 // dep_gen has two shapes, one per orchestration site, and each runtime provides
 // the strong symbols for the one it uses:
@@ -223,31 +243,53 @@ int DeviceRunner::query_aicpu_device_occupancy(pto::a5::AicpuDeviceOccupancy &ou
     return 0;
 }
 
-int DeviceRunner::query_aicpu_topology(pto::a5::AicpuTopology &out) {
-    if (aicpu_topology_cached_) {
-        out = aicpu_topology_;
-        return 0;
+bool DeviceRunner::load_cached_affinity_plan(const char *soc_name, uint64_t current_occupy) {
+    const std::string soc = soc_name == nullptr ? std::string{} : std::string(soc_name);
+    const std::string path = pto::a5::affinity_cpus_side_path(device_id_);
+    std::error_code ec;
+    const uint64_t file_size = static_cast<uint64_t>(std::filesystem::file_size(path, ec));
+    if (ec) {
+        affinity_plan_cache_.reset();
+        return false;
+    }
+    const auto mtime = std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        affinity_plan_cache_.reset();
+        return false;
+    }
+    const int64_t mtime_ticks = static_cast<int64_t>(mtime.time_since_epoch().count());
+    auto &cache = affinity_plan_cache_;
+    if (cache.matches(soc, path, device_id_, current_occupy, file_size, mtime_ticks)) return true;
+
+    cache.reset();
+    std::vector<int32_t> allowed_cpus;
+    std::string source;
+    if (soc.empty() ||
+        !pto::a5::load_affinity_cpus_side_file(soc.c_str(), device_id_, current_occupy, allowed_cpus, source)) {
+        LOG_INFO(
+            "Affinity .cpus side file missing/invalid for soc=%s device=%d occupy=0x%llx; "
+            "prepare will use OCCUPY contiguous fallback (Python ChipWorker.init owns preflight)",
+            soc.empty() ? "(unknown)" : soc.c_str(), device_id_, static_cast<unsigned long long>(current_occupy)
+        );
+        return false;
     }
 
-    pto::a5::AicpuDeviceOccupancy occupancy;
-    int rc = query_aicpu_device_occupancy(occupancy);
-    if (rc != 0) return rc;
-
-    pto::a5::AicpuTopology topology;
-    if (!pto::a5::probe_aicpu_topology(static_cast<uint32_t>(device_id_), occupancy, topology))
-        return PTO_RUNTIME_ERR_INTERNAL;
-
-    aicpu_topology_ = std::move(topology);
-    aicpu_topology_cached_ = true;
-    out = aicpu_topology_;
-    return 0;
+    cache.soc = soc;
+    cache.path = path;
+    cache.device_id = device_id_;
+    cache.occupy = current_occupy;
+    cache.file_size = file_size;
+    cache.mtime_ticks = mtime_ticks;
+    cache.valid = true;
+    cache.source = std::move(source);
+    cache.allowed_cpus = std::move(allowed_cpus);
+    return true;
 }
 
-void DeviceRunner::clear_aicpu_topology_cache() {
+void DeviceRunner::clear_aicpu_caches() {
     aicpu_device_occupancy_cached_ = false;
     aicpu_device_occupancy_ = {};
-    aicpu_topology_cached_ = false;
-    aicpu_topology_ = {};
+    affinity_plan_cache_.reset();
 }
 
 void DeviceRunner::set_dep_gen_enabled(bool enable) {
@@ -274,7 +316,6 @@ int DeviceRunner::prepare_execution(
     });
     const int block_dim = runtime.get_worker_count() / cores_per_blockdim_;
     int requested_aicpu_num = config.aicpu_thread_num;
-    const bool automatic_aicpu_num = requested_aicpu_num == 0;
     // A prior AICore launch/sync error poisoned the device context and the
     // in-place drain could not clear it. Refuse to run rather than cascade
     // into halResMap rc=62 (init_aicore_register_addresses) or rtMalloc
@@ -293,8 +334,7 @@ int DeviceRunner::prepare_execution(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     if (validate_launch_aicpu_num(requested_aicpu_num) != 0) return PTO_RUNTIME_ERR_INTERNAL;
-    int active_aicpu_num = automatic_aicpu_num ? PLATFORM_DEFAULT_AICPU_THREAD_NUM : requested_aicpu_num;
-    runtime.set_aicpu_thread_num(active_aicpu_num);
+    int active_aicpu_num = 0;
 
     int rc = ensure_device_initialized();
     if (rc != 0) {
@@ -333,79 +373,89 @@ int DeviceRunner::prepare_execution(
 
     resolve_task_binary_addrs(runtime);
 
-    // a5-specific: probe the AICPU topology + compute ALLOWED_CPUS for the
-    // filter-style gate (see src/common/platform/onboard/aicpu/
-    // platform_aicpu_affinity.cpp::platform_aicpu_affinity_gate_filter).
-    // Convention: indices 0..active-2 are scheduler slots and the last slot
-    // is the orchestrator. In auto mode only, unknown shapes may reduce the
-    // active count to the available pool, but execution keeps at least one of
-    // each role.
+    // A5-specific: only the default 4-scheduler + 1-orchestrator shape consumes
+    // the Python RTT plan. Other valid widths, missing/invalid plans, and probe
+    // failures all use OCCUPY-bit contiguous [S..., O]. Runtime never spawns
+    // Python or probes RTT. AICore ownership is contiguous by logical sched idx.
     {
-        pto::a5::AicpuTopology topology;
         runtime.set_aicpu_allowed_cpu_count(0);
-        if (query_aicpu_topology(topology) != 0) {
-            LOG_ERROR("AICPU topology probe failed; affinity gate will not launch");
+        pto::a5::AicpuDeviceOccupancy occupancy;
+        if (query_aicpu_device_occupancy(occupancy) != 0) {
+            LOG_ERROR("AICPU OCCUPY query failed; cannot set affinity launch_count");
             return PTO_RUNTIME_ERR_INTERNAL;
         }
-        pto::a5::AicpuLaunchPlan launch_plan;
-        std::string plan_error;
-        if (!pto::a5::build_aicpu_launch_plan(topology, requested_aicpu_num, launch_plan, plan_error)) {
+        const char *soc = aclrtGetSocName();
+        const int32_t launch_count = occupancy.occupy_valid ? popcount_u64(occupancy.occupy) : 0;
+        if (launch_count < 2 || launch_count > PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH) {
             LOG_ERROR(
-                "cannot build AICPU launch plan: soc=%s scenario=%s occupy=0x%llx reason=%s",
-                topology.soc_name.empty() ? "(unknown)" : topology.soc_name.c_str(),
-                pto::a5::aicpu_scenario_name(topology.scenario_type),
-                static_cast<unsigned long long>(topology.device_occupancy.occupy), plan_error.c_str()
+                "AICPU OCCUPY population=%d is outside supported launch range [2,%d]", launch_count,
+                PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH
             );
             return PTO_RUNTIME_ERR_INTERNAL;
         }
-        const auto &allowed = launch_plan.allowed_cpus;
-        active_aicpu_num = launch_plan.effective_active_count;
+        bool rtt_shape = false;
+        if (!pto::a5::resolve_aicpu_active_count(requested_aicpu_num, launch_count, active_aicpu_num, rtt_shape)) {
+            LOG_ERROR(
+                "requested aicpu_thread_num=%d cannot be satisfied by OCCUPY population=%d", requested_aicpu_num,
+                launch_count
+            );
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+
+        std::vector<int32_t> allowed;
+        std::string source;
+        if (rtt_shape && load_cached_affinity_plan(soc, occupancy.occupy)) {
+            allowed = affinity_plan_cache_.allowed_cpus;
+            source = affinity_plan_cache_.source;
+        } else if (occupancy.occupy_valid &&
+                   pto::a5::build_occupy_contiguous_allowed(occupancy.occupy, active_aicpu_num, allowed)) {
+            source = "runtime-occupy-contiguous";
+            if (rtt_shape) {
+                LOG_WARN(
+                    "AICPU RTT affinity plan missing/invalid for device %d (soc=%s); using OCCUPY contiguous "
+                    "placement for 4 schedulers",
+                    device_id_, soc == nullptr ? "(unknown)" : soc
+                );
+            } else {
+                LOG_WARN(
+                    "AICPU RTT affinity requires 4 schedulers; resolved %d scheduler(s) from "
+                    "aicpu_thread_num=%d, using OCCUPY contiguous placement",
+                    active_aicpu_num - 1, requested_aicpu_num
+                );
+            }
+        } else {
+            LOG_ERROR(
+                "OCCUPY contiguous AICPU placement failed for device %d (soc=%s active=%d)", device_id_,
+                soc == nullptr ? "(unknown)" : soc, active_aicpu_num
+            );
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+
+        if (allowed.size() != static_cast<size_t>(active_aicpu_num)) {
+            LOG_ERROR("AICPU placement returned %zu CPUs for active count %d", allowed.size(), active_aicpu_num);
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
         runtime.set_aicpu_thread_num(active_aicpu_num);
         {
             const size_t cap = runtime.aicpu_allowed_cpus_capacity();
             if (allowed.size() > cap) {
-                LOG_ERROR("AICPU selection returned %zu > cap %zu", allowed.size(), cap);
+                LOG_ERROR("AICPU plan returned %zu > cap %zu", allowed.size(), cap);
                 return PTO_RUNTIME_ERR_INTERNAL;
             }
             int32_t *allowed_cpus = runtime.get_aicpu_allowed_cpus();
             for (size_t i = 0; i < allowed.size(); ++i)
                 allowed_cpus[i] = allowed[i];
             runtime.set_aicpu_allowed_cpu_count(static_cast<int32_t>(allowed.size()));
-            runtime.set_aicpu_launch_count(launch_plan.launch_count);
+            runtime.set_aicpu_launch_count(launch_count);
             std::string dump;
             for (size_t i = 0; i < allowed.size(); ++i) {
                 if (i) dump += ", ";
                 dump += std::to_string(allowed[i]);
                 if (i + 1 == allowed.size()) dump += "(orch)";
             }
-            if (launch_plan.warn_cpu_topology_unavailable) {
-                LOG_WARN(
-                    "AICPU CPU_TOPO unavailable; using %s: soc=%s occupy=0x%llx "
-                    "stable_reachable=%d requested=%d effective=%d affinity=[%s]%s",
-                    pto::a5::aicpu_topology_source_name(topology.source),
-                    topology.soc_name.empty() ? "(unknown)" : topology.soc_name.c_str(),
-                    static_cast<unsigned long long>(topology.device_occupancy.occupy),
-                    launch_plan.stable_reachable_count, requested_aicpu_num, active_aicpu_num, dump.c_str(),
-                    topology.source == pto::a5::AicpuTopologySource::kOccupyFallback ?
-                        "; physical/SMT/cluster/die placement is unknown" :
-                        ""
-                );
-            }
-            if (launch_plan.warn_stable_reachable_below_default) {
-                LOG_WARN(
-                    "AICPU stable reachable CPUs below active capacity: soc=%s scenario=%s occupy=0x%llx "
-                    "stable_reachable=%d capacity=%d requested=%d effective=%d affinity=[%s]",
-                    topology.soc_name.empty() ? "(unknown)" : topology.soc_name.c_str(),
-                    pto::a5::aicpu_scenario_name(topology.scenario_type),
-                    static_cast<unsigned long long>(topology.device_occupancy.occupy),
-                    launch_plan.stable_reachable_count, PLATFORM_DEFAULT_AICPU_THREAD_NUM, requested_aicpu_num,
-                    active_aicpu_num, dump.c_str()
-                );
-            }
             LOG_INFO(
-                "AICPU ALLOWED_CPUS = [%s] (scenario=%s active=%d launch=%d user_cpus=%zu)", dump.c_str(),
-                pto::a5::aicpu_scenario_name(topology.scenario_type), active_aicpu_num, launch_plan.launch_count,
-                topology.os_schedulable_cpus.size()
+                "AICPU ALLOWED_CPUS = [%s] (source=%s active=%d launch=%d)", dump.c_str(), source.c_str(),
+                active_aicpu_num, launch_count
             );
         }
     }
@@ -740,7 +790,7 @@ void DeviceRunner::recover_device_or_mark_unusable(int aicore_rc) {
             aicore_rc
         );
     }
-    clear_aicpu_topology_cache();
+    clear_aicpu_caches();
     device_unusable_.store(true, std::memory_order_release);
 }
 
@@ -812,7 +862,7 @@ private:
 }  // namespace
 
 int DeviceRunner::force_reset_device() {
-    clear_aicpu_topology_cache();
+    clear_aicpu_caches();
     if (device_id_ < 0) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -1000,7 +1050,7 @@ int DeviceRunner::finalize() {
 
     // Only the healthy path reaches here: a poisoned card returned from the
     // fatal branch at the top of finalize(), which owns the force reset.
-    clear_aicpu_topology_cache();
+    clear_aicpu_caches();
     device_id_ = -1;
     device_unusable_.store(false, std::memory_order_release);
     return rc;

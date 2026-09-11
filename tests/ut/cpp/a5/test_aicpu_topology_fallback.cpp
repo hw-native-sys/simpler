@@ -18,6 +18,7 @@
 
 #include "aicpu_topology_probe.h"
 #include "common/platform_config.h"
+#include "common/scheduler_cluster_partition.h"
 
 extern "C" {
 void unified_log_error(const char *, const char *, ...) {}
@@ -35,6 +36,7 @@ using pto::a5::AicpuSelectionPolicy;
 using pto::a5::AicpuTopology;
 using pto::a5::AicpuTopologySource;
 using pto::a5::build_aicpu_launch_plan;
+using pto::a5::build_complete_topology_user_pool;
 using pto::a5::classify_aicpu_scenario;
 using pto::a5::compute_allowed_cpus;
 using pto::a5::compute_scenario_allowed_cpus;
@@ -83,6 +85,52 @@ TEST(A5AicpuTopologyFallback, EnumeratesBoundaryCpuIdsAndRejectsEmptyMask) {
     cpus = {{1, 1, 0, 0, 0}};
     EXPECT_FALSE(enumerate_cpus_from_occupy(0, cpus));
     EXPECT_TRUE(cpus.empty());
+}
+
+TEST(A5AicpuTopologyFallback, UsesOnlyCompleteDriverOrVerifiedJsonPool) {
+    AicpuTopology topology;
+    topology.source = AicpuTopologySource::kDriver;
+    topology.os_schedulable_cpus = {{5, 2, 1, 1, 0}, {3, 1, 1, 0, 0}, {4, 2, 0, 1, 0}};
+    set_device_occupy(topology, (1ULL << 3) | (1ULL << 4) | (1ULL << 5));
+    std::vector<int32_t> pool;
+    ASSERT_TRUE(build_complete_topology_user_pool(topology, pool));
+    EXPECT_EQ(pool, (std::vector<int32_t>{3, 4, 5}));
+
+    topology.source = AicpuTopologySource::kJsonFallback;
+    EXPECT_TRUE(build_complete_topology_user_pool(topology, pool));
+
+    topology.source = AicpuTopologySource::kOccupyFallback;
+    EXPECT_FALSE(build_complete_topology_user_pool(topology, pool));
+    EXPECT_TRUE(pool.empty());
+
+    topology.source = AicpuTopologySource::kDriver;
+    topology.os_schedulable_cpus.pop_back();
+    EXPECT_FALSE(build_complete_topology_user_pool(topology, pool));
+    EXPECT_TRUE(pool.empty());
+}
+
+TEST(A5AicpuTopologyFallback, RejectsTopologyPoolBeyondVerifiedLaunchMaximum) {
+    AicpuTopology topology;
+    topology.source = AicpuTopologySource::kDriver;
+    ASSERT_TRUE(enumerate_cpus_from_occupy((1ULL << 15) - 1, topology.os_schedulable_cpus));
+    set_device_occupy(topology, (1ULL << 15) - 1);
+    std::vector<int32_t> pool;
+    EXPECT_FALSE(build_complete_topology_user_pool(topology, pool));
+    EXPECT_TRUE(pool.empty());
+}
+
+TEST(A5SchedulerClusterPartition, FourSchedulersCoverBalancedContiguousRanges) {
+    for (int32_t cluster_count : {28, 36}) {
+        int32_t previous_end = 0;
+        for (int32_t thread = 0; thread < 4; ++thread) {
+            const SchedulerClusterRange range = scheduler_cluster_range(cluster_count, 4, thread);
+            EXPECT_EQ(range.begin, previous_end);
+            EXPECT_GE(range.end - range.begin, cluster_count / 4);
+            EXPECT_LE(range.end - range.begin, (cluster_count + 3) / 4);
+            previous_end = range.end;
+        }
+        EXPECT_EQ(previous_end, cluster_count);
+    }
 }
 
 #if defined(__x86_64__)
@@ -527,6 +575,59 @@ TEST(A5AicpuTopologySelection, KnownScenarioRejectsUnsupportedActiveCount) {
     EXPECT_TRUE(allowed.empty());
     EXPECT_FALSE(compute_scenario_allowed_cpus(topology, 6, allowed));
     EXPECT_TRUE(allowed.empty());
+}
+
+TEST(A5AicpuLaunchPlan, FiveThreadFgHasNoRuntimeRttToggle) {
+    const auto all = make_physical_range(0, 7);
+    AicpuTopology topology;
+    topology.source = AicpuTopologySource::kDriver;
+    topology.scenario_type = AicpuScenarioType::kFg;
+    topology.os_schedulable_cpus = primaries(all);
+    std::reverse(topology.os_schedulable_cpus.begin(), topology.os_schedulable_cpus.end());
+    uint64_t occupy = 0;
+    for (const auto &cpu : topology.os_schedulable_cpus)
+        occupy |= 1ULL << cpu.cpu_id;
+    set_device_occupy(topology, occupy);
+
+    AicpuLaunchPlan plan;
+    std::string error;
+    ASSERT_TRUE(build_aicpu_launch_plan(topology, 0, plan, error)) << error;
+    EXPECT_EQ(plan.effective_active_count, 5);
+    EXPECT_EQ(plan.allowed_cpus.size(), 5u);
+    const std::string json = format_aicpu_topology_json(topology, AicpuSelectionPolicy::kScenario, plan);
+    EXPECT_EQ(json.find("rtt_die_preflight"), std::string::npos);
+    EXPECT_EQ(json.find("sched_aicore_assignment_mode"), std::string::npos);
+    EXPECT_EQ(json.find("mode 3"), std::string::npos);
+}
+
+TEST(A5AicpuLaunchPlan, OccupyOnlyStillBuildsFiveWhenMaskIsFive) {
+    AicpuTopology topology;
+    topology.source = AicpuTopologySource::kOccupyFallback;
+    topology.scenario_type = AicpuScenarioType::kUnknown;
+    ASSERT_TRUE(enumerate_cpus_from_occupy(0x3eU, topology.os_schedulable_cpus));
+    set_device_occupy(topology, 0x3eU);
+    std::reverse(topology.os_schedulable_cpus.begin(), topology.os_schedulable_cpus.end());
+
+    AicpuLaunchPlan plan;
+    std::string error;
+    ASSERT_TRUE(build_aicpu_launch_plan(topology, 0, plan, error)) << error;
+    EXPECT_EQ(plan.effective_active_count, 5);
+    EXPECT_EQ(
+        std::vector<int32_t>(plan.allowed_cpus.begin(), plan.allowed_cpus.end() - 1), (std::vector<int32_t>{1, 2, 3, 4})
+    );
+}
+
+TEST(A5AicpuLaunchPlan, EffectiveCountFourStillBuilds) {
+    AicpuTopology topology;
+    topology.source = AicpuTopologySource::kDriver;
+    topology.scenario_type = AicpuScenarioType::kUnknown;
+    topology.os_schedulable_cpus = {{1, 0, 0, 0, 0}, {3, 2, 0, 1, 0}, {5, 4, 0, 2, 1}, {7, 6, 0, 3, 1}};
+    set_device_occupy(topology, (1ULL << 1) | (1ULL << 3) | (1ULL << 5) | (1ULL << 7));
+
+    AicpuLaunchPlan plan;
+    std::string error;
+    ASSERT_TRUE(build_aicpu_launch_plan(topology, 0, plan, error)) << error;
+    EXPECT_EQ(plan.effective_active_count, 4);
 }
 
 }  // namespace

@@ -13,6 +13,7 @@ import ctypes
 import gc
 import itertools
 import struct
+import subprocess
 import weakref
 from multiprocessing.shared_memory import SharedMemory
 from types import SimpleNamespace
@@ -57,7 +58,13 @@ from simpler.task_interface import (
     _remote_sidecar_for,
 )
 
+from simpler_setup.tools import rtt_die_preflight
+
 _REF_BID = itertools.count(1)
+
+
+def _a5_onboard_bins():
+    return SimpleNamespace(dispatcher_path="/tmp/a5/dispatcher.so", host_path="/tmp/a5/host.so")
 
 
 def _dev_ref(addr, shapes, dtype, tag=None):
@@ -1478,3 +1485,80 @@ class TestAddRefAccessSubset:
             assert args.tensor_count() == 3
         finally:
             h.close()
+
+
+class TestA5AffinityPreflightBootstrap:
+    def test_auto_probe_receives_exact_per_device_out_path(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv(rtt_die_preflight.PLAN_ENV, raising=False)
+        calls = []
+
+        def fail_probe(command, **_kwargs):
+            calls.append(command)
+            return SimpleNamespace(returncode=1, stdout="", stderr="synthetic failure")
+
+        monkeypatch.setattr(task_interface_module.subprocess, "run", fail_probe)
+        task_interface_module._ensure_a5_affinity_cpus(2, _a5_onboard_bins())
+
+        expected = tmp_path / "build/config/aicpu_affinity_plan.2.json"
+        assert calls and calls[0][-2:] == ["--out", str(expected)]
+        assert not expected.exists()
+        assert not expected.with_suffix(".cpus").exists()
+
+    def test_valid_plan_skips_auto_probe(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv(rtt_die_preflight.PLAN_ENV, raising=False)
+        plan = rtt_die_preflight.default_plan_path(1)
+        node = rtt_die_preflight.build_device_node_from_allowed(
+            soc_name="Ascend950PR_9599",
+            device_id=1,
+            allowed_cpus=[3, 4, 5, 6, 7],
+            occupy_cpus=[3, 4, 5, 6, 7, 8],
+        )
+        rtt_die_preflight.persist_device_plan(plan, soc_name="Ascend950PR_9599", device_id=1, device_node=node)
+
+        def unexpected_probe(*_args, **_kwargs):
+            raise AssertionError("valid plan should skip preflight")
+
+        monkeypatch.setattr(task_interface_module.subprocess, "run", unexpected_probe)
+        task_interface_module._ensure_a5_affinity_cpus(1, _a5_onboard_bins())
+
+    def test_timeout_record_skips_auto_probe(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv(rtt_die_preflight.PLAN_ENV, raising=False)
+        plan = rtt_die_preflight.default_plan_path(3)
+        rtt_die_preflight.write_timeout_record(plan, 3, reason="test")
+
+        def unexpected_probe(*_args, **_kwargs):
+            raise AssertionError("timeout record should skip preflight")
+
+        monkeypatch.setattr(task_interface_module.subprocess, "run", unexpected_probe)
+        task_interface_module._ensure_a5_affinity_cpus(3, _a5_onboard_bins())
+
+    def test_safety_budget_timeout_does_not_write_timeout_record(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv(rtt_die_preflight.PLAN_ENV, raising=False)
+
+        def timeout_probe(*_args, **_kwargs):
+            raise subprocess.TimeoutExpired(
+                "probe",
+                rtt_die_preflight.HELPER_BUILD_TIMEOUT_SECONDS + rtt_die_preflight.PREFLIGHT_TIMEOUT_SECONDS,
+            )
+
+        monkeypatch.setattr(task_interface_module.subprocess, "run", timeout_probe)
+        task_interface_module._ensure_a5_affinity_cpus(4, _a5_onboard_bins())
+        plan = rtt_die_preflight.default_plan_path(4)
+        assert not plan.with_suffix(".timeout").exists()
+
+    def test_cli_probe_timeout_record_is_honored(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv(rtt_die_preflight.PLAN_ENV, raising=False)
+        plan = rtt_die_preflight.default_plan_path(5)
+
+        def probe_writes_timeout(*_args, **_kwargs):
+            rtt_die_preflight.write_timeout_record(plan, 5, reason="preflight-timeout")
+            return SimpleNamespace(returncode=1, stdout="", stderr="device probe timed out")
+
+        monkeypatch.setattr(task_interface_module.subprocess, "run", probe_writes_timeout)
+        task_interface_module._ensure_a5_affinity_cpus(5, _a5_onboard_bins())
+        assert rtt_die_preflight.timeout_record_looks_usable(plan.with_suffix(".timeout"), 5)

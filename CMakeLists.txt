@@ -76,6 +76,11 @@ if(SKBUILD_MODE)
     # sanitizer build is requested.
     install(DIRECTORY ${CMAKE_SOURCE_DIR}/cmake/
             DESTINATION simpler_setup/_assets/cmake)
+    # The public affinity preflight CLI builds and invokes this hardware
+    # backend from either a source checkout or an installed wheel.
+    install(DIRECTORY ${CMAKE_SOURCE_DIR}/simpler_setup/tools/aicpu_device_query/
+            DESTINATION simpler_setup/tools/aicpu_device_query
+            PATTERN "build" EXCLUDE)
     install(DIRECTORY ${CMAKE_SOURCE_DIR}/build/lib/
             DESTINATION simpler_setup/_assets/build/lib
             OPTIONAL
