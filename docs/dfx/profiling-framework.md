@@ -414,7 +414,7 @@ mid-run by the framework.
 | `done_shards_[q]` | replenish | collector q | fixed-capacity SPSC ring |
 | `recycled_[shard][kind]` | drain shard at runtime | replenish | fixed-capacity SPSC ring; startup code may pop any shard before threads start |
 | `retired_[shard][kind]` | teardown | exceptional fallback paths | mutex-protected holding pool; not used by the hot recycle path |
-| `dev_to_host_` / block ranges | mgmt (`resolve_host_ptr`) | init/startup allocation | `mapping_mutex_`; collector touches it only in `release_owned_buffers` / `clear_mappings`, after `stop()` has joined mgmt |
+| `dev_to_host_` / block ranges | drain shards (`resolve_host_ptr`) | init/startup allocation, runtime replenish, teardown | shared `mapping_mutex_` for resolution; exclusive `mapping_mutex_` for mutation |
 | `MemoryOps` / `shared_mem_host_` / `device_id_` | both threads | start-only | `set_memory_context` is called once before threads spawn; read-only afterwards |
 | AICPU per-thread ready queues (`header->queues[q]`) | mgmt (head advance) | AICPU (tail advance) | `read_range_from_device` in split drain, then `write_range_to_device` for `queue_heads[q]` |
 | Per-instance `FreeQueue` | AICPU (head advance) | owning drain shard (tail advance) | SPSC ownership; host refreshes `head` before writing `buffer_ptrs[]` / `tail` |

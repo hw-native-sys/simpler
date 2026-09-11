@@ -196,8 +196,7 @@
  *       Used in the idle-timeout log line (e.g. "ChipSwimlane", "PMU", "ArgsDump").
  */
 
-#ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_PROFILER_BASE_H_
-#define SRC_COMMON_PLATFORM_INCLUDE_HOST_PROFILER_BASE_H_
+#pragma once
 
 #include <algorithm>
 #include <array>
@@ -1125,6 +1124,8 @@ private:
         std::vector<std::pair<int, EntrySite<Module>>> short_sites;
 
         while (mgmt_running_.load(std::memory_order_relaxed)) {
+            // An ack covers only a sweep that starts after this epoch is observed.
+            const uint64_t requested = drain_quiesce_epoch_.load(std::memory_order_acquire);
             bool found_any = false;
             for (int q = queue_start; q < queue_count_; q += queue_stride) {
                 ReadyEntry entry;
@@ -1153,7 +1154,6 @@ private:
             // precondition) nothing can arrive behind this report, so it is the
             // quiescent condition for phase one.
             if (!found_any) {
-                const uint64_t requested = drain_quiesce_epoch_.load(std::memory_order_acquire);
                 if (drain_acked_[queue_start].load(std::memory_order_relaxed) != requested) {
                     drain_acked_[queue_start].store(requested, std::memory_order_release);
                 }
@@ -1337,5 +1337,3 @@ private:
 };
 
 }  // namespace profiling_common
-
-#endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_PROFILER_BASE_H_

@@ -26,10 +26,14 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -128,13 +132,14 @@ public:
 
     // Stand-in for a real Derived::init(): latch the thread count and hand the
     // base an identity-mapped (SVM-style) memory context.
-    void init(int aicpu_thread_num, void *shm) {
+    void
+    init(int aicpu_thread_num, void *shm, std::function<int(void *, const void *, size_t)> copy_from_device = nullptr) {
         this->set_aicpu_thread_num(aicpu_thread_num);
         this->set_memory_context(
             [](size_t size) {
                 return std::malloc(size);
             },
-            /*register_cb=*/nullptr, /*free_cb=*/nullptr, /*copy_to_device=*/nullptr, /*copy_from_device=*/nullptr, shm,
+            /*register_cb=*/nullptr, /*free_cb=*/nullptr, /*copy_to_device=*/nullptr, std::move(copy_from_device), shm,
             shm, sizeof(TestHeader), /*device_id=*/0
         );
     }
@@ -145,16 +150,18 @@ private:
     std::atomic<int> last_shard_{-1};
 };
 
-// Publish one buffer on device queue `q`, exactly as DeviceProfilerEngine's
-// enqueue_ready does: write the entry, then advance the tail. The buffer must
-// already be known to the manager — process_entry drops any entry whose device
-// pointer has no host mapping.
+// The buffer mapping is immutable while collector threads run.
 template <typename Collector>
-void publish(Collector &collector, TestHeader &header, int q, uint64_t *buffer) {
+void register_buffer(Collector &collector, uint64_t *buffer) {
     collector.manager().register_mapping(buffer, buffer);  // SVM-style identity map
+}
+
+// Publish one buffer on device queue `q` with DeviceProfilerEngine's entry-before-tail ordering.
+void publish(TestHeader &header, int q, uint64_t *buffer) {
     uint32_t tail = header.queue_tails[q];
     header.queues[q][tail].buffer_ptr = reinterpret_cast<uint64_t>(buffer);
     header.queues[q][tail].buffer_seq = 0;
+    wmb();
     header.queue_tails[q] = (tail + 1) % kReadyQueueSize;
 }
 
@@ -203,9 +210,10 @@ TEST(ProfilerBaseTest, SingleDrainThreadScansEveryLiveQueue) {
     TestCollector<SingleShardModule> collector;
     collector.init(kThreads, &header);
     ASSERT_EQ(collector.manager().shard_count(), 1);
+    register_buffer(collector, &buffer);
 
     collector.start(nullptr);
-    publish(collector, header, kOrchQueue, &buffer);
+    publish(header, kOrchQueue, &buffer);
 
     EXPECT_TRUE(wait_for_collected(collector, 1, std::chrono::seconds(5)));
     collector.stop();
@@ -224,10 +232,13 @@ TEST(ProfilerBaseTest, EveryLiveQueueIsDrained) {
 
     TestCollector<PerThreadModule> collector;
     collector.init(kThreads, &header);
+    for (int q = 0; q < kThreads; q++) {
+        register_buffer(collector, &buffers[q]);
+    }
     collector.start(nullptr);
 
     for (int q = 0; q < kThreads; q++) {
-        publish(collector, header, q, &buffers[q]);
+        publish(header, q, &buffers[q]);
     }
 
     EXPECT_TRUE(wait_for_collected(collector, kThreads, std::chrono::seconds(5)));
@@ -304,15 +315,16 @@ TEST(ProfilerBaseTest, LifecycleControlWakesEverySilentCollectorShard) {
 // a regression shows up as a hang or an early-abandoned shard, not a flake.
 TEST(ProfilerBaseTest, SilentRunDoesNotTripIdleTimeout) {
     TestHeader header{};
+    uint64_t buffer = 0;
     TestCollector<SingleShardModule> collector;
     collector.init(2, &header);
+    register_buffer(collector, &buffer);
 
     collector.start(nullptr);
     std::this_thread::sleep_for(std::chrono::seconds(3));  // > kIdleTimeoutSec
 
     // The collector must still be alive and able to take a late buffer.
-    uint64_t buffer = 0;
-    publish(collector, header, 1, &buffer);
+    publish(header, 1, &buffer);
     EXPECT_TRUE(wait_for_collected(collector, 1, std::chrono::seconds(5)));
 
     collector.stop();
@@ -323,20 +335,22 @@ TEST(ProfilerBaseTest, CollectorStaysAliveAfterArmedIdleTimeout) {
     using namespace std::chrono_literals;
 
     TestHeader header{};
+    uint64_t first_buffer = 0;
+    uint64_t late_buffer = 0;
     TestCollector<SingleShardModule, 0> collector;
     collector.init(2, &header);
+    register_buffer(collector, &first_buffer);
+    register_buffer(collector, &late_buffer);
     collector.start(nullptr);
 
-    uint64_t first_buffer = 0;
-    publish(collector, header, 1, &first_buffer);
+    publish(header, 1, &first_buffer);
     EXPECT_TRUE(wait_for_collected(collector, 1, 5s));
 
     // Once traffic has armed the idle detector, a zero-second timeout fires on
     // the next empty poll. The collector must report it without exiting.
     std::this_thread::sleep_for(250ms);
 
-    uint64_t late_buffer = 0;
-    publish(collector, header, 1, &late_buffer);
+    publish(header, 1, &late_buffer);
     EXPECT_TRUE(wait_for_collected(collector, 2, 5s));
 
     collector.stop();
@@ -356,10 +370,14 @@ TEST(ProfilerBaseTest, QuiesceDrainsWithoutRetiringThreads) {
 
     TestCollector<PerThreadModule> collector;
     collector.init(kThreads, &header);
+    for (int q = 0; q < kThreads; q++) {
+        register_buffer(collector, &first[q]);
+        register_buffer(collector, &second[q]);
+    }
     collector.start(nullptr);
 
     for (int q = 0; q < kThreads; q++) {
-        publish(collector, header, q, &first[q]);
+        publish(header, q, &first[q]);
     }
     collector.quiesce();
     // No wait_for_collected here on purpose: quiesce() must have delivered
@@ -368,7 +386,7 @@ TEST(ProfilerBaseTest, QuiesceDrainsWithoutRetiringThreads) {
     EXPECT_EQ(collector.collected(), kThreads);
 
     for (int q = 0; q < kThreads; q++) {
-        publish(collector, header, q, &second[q]);
+        publish(header, q, &second[q]);
     }
     collector.quiesce();
     EXPECT_EQ(collector.collected(), 2 * kThreads);
@@ -377,22 +395,124 @@ TEST(ProfilerBaseTest, QuiesceDrainsWithoutRetiringThreads) {
     EXPECT_EQ(collector.collected(), 2 * kThreads);
 }
 
+TEST(ProfilerBaseTest, QuiesceAcknowledgementRequiresPostRequestSweep) {
+    using namespace std::chrono_literals;
+
+    TestHeader header{};
+    uint64_t buffer = 0;
+    std::mutex gate_mutex;
+    std::condition_variable gate_cv;
+    int queue_zero_reads = 0;
+    bool first_sweep_paused = false;
+    bool second_sweep_paused = false;
+    bool release_first_sweep = false;
+    bool release_second_sweep = false;
+
+    auto gated_copy = [&](void * /*dst*/, const void *src, size_t /*size*/) {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        if (src == &header.queue_heads[0]) {
+            queue_zero_reads++;
+            if (queue_zero_reads == 2) {
+                second_sweep_paused = true;
+                gate_cv.notify_all();
+                gate_cv.wait(lock, [&]() {
+                    return release_second_sweep;
+                });
+            }
+        } else if (src == &header.queue_heads[1] && !first_sweep_paused) {
+            first_sweep_paused = true;
+            gate_cv.notify_all();
+            gate_cv.wait(lock, [&]() {
+                return release_first_sweep;
+            });
+        }
+        return 0;
+    };
+
+    TestCollector<SingleShardModule> collector;
+    collector.init(2, &header, gated_copy);
+    register_buffer(collector, &buffer);
+    collector.start(nullptr);
+
+    {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        if (!gate_cv.wait_for(lock, 2s, [&]() {
+                return first_sweep_paused;
+            })) {
+            release_first_sweep = true;
+            release_second_sweep = true;
+            lock.unlock();
+            gate_cv.notify_all();
+            collector.stop();
+            FAIL() << "drain did not reach the first sweep gate";
+        }
+    }
+
+    // Queue zero is published only after this sweep has already observed it empty.
+    publish(header, 0, &buffer);
+    std::atomic<bool> quiesce_started{false};
+    std::atomic<bool> quiesce_done{false};
+    std::thread quiesce_thread([&]() {
+        quiesce_started.store(true, std::memory_order_release);
+        collector.quiesce();
+        quiesce_done.store(true, std::memory_order_release);
+    });
+    while (!quiesce_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(100ms);
+
+    {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        release_first_sweep = true;
+    }
+    gate_cv.notify_all();
+
+    {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        if (!gate_cv.wait_for(lock, 2s, [&]() {
+                return second_sweep_paused;
+            })) {
+            release_second_sweep = true;
+            lock.unlock();
+            gate_cv.notify_all();
+            quiesce_thread.join();
+            collector.stop();
+            FAIL() << "drain did not reach the post-request sweep gate";
+        }
+    }
+
+    std::this_thread::sleep_for(250ms);
+    const bool completed_before_post_request_sweep = quiesce_done.load(std::memory_order_acquire);
+    {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        release_second_sweep = true;
+    }
+    gate_cv.notify_all();
+
+    quiesce_thread.join();
+    EXPECT_FALSE(completed_before_post_request_sweep);
+    EXPECT_EQ(collector.collected(), 1);
+    collector.stop();
+}
+
 // A subsystem that emitted nothing still has to complete the handshake. The
 // collector loop skips its idle bookkeeping for a shard that has never seen a
 // buffer, so an ack placed behind that guard would leave quiesce() waiting
 // forever on a silent run — a hang, not a wrong count.
 TEST(ProfilerBaseTest, QuiesceCompletesOnASilentCollector) {
     TestHeader header{};
+    uint64_t buffer = 0;
     TestCollector<SingleShardModule> collector;
     collector.init(2, &header);
+    register_buffer(collector, &buffer);
     collector.start(nullptr);
 
     collector.quiesce();
     EXPECT_EQ(collector.collected(), 0);
 
     // Still live afterwards.
-    uint64_t buffer = 0;
-    publish(collector, header, 1, &buffer);
+    publish(header, 1, &buffer);
     collector.quiesce();
     EXPECT_EQ(collector.collected(), 1);
 
