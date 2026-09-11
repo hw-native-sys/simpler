@@ -8540,6 +8540,38 @@ class Worker:
         """
         return dict(self._live_domains)
 
+    def detach_persistent_domain(self, handle: CommDomainHandle) -> None:
+        """Transfer one CommDomain from the current run's journal to Worker ownership.
+
+        A newly allocated domain is recorded in both the run being built
+        (``_RunResources.live_domains``) and the Worker's own long-lived registry
+        (``live_domains``). This removes only the run-local claim, so the Worker
+        registry keeps ``handle`` reachable for ``close()`` to reclaim it if the
+        request is interrupted before the run retires. A caller that wants to
+        outlive one run's completion fence — e.g. to dispatch many requests
+        against the same domain — calls this once per newly allocated handle.
+
+        Args:
+            handle: A domain allocated during the run currently being built.
+
+        Raises:
+            RuntimeError: No run is currently being built, the run already
+                retired, or ``handle`` is not that run's live claim on this
+                domain.
+        """
+        resources = self._building_run_resources
+        if resources is None:
+            raise RuntimeError("detach_persistent_domain: no run resources are being built")
+        with resources.domain_lock:
+            if resources.retired:
+                raise RuntimeError("detach_persistent_domain: run resources are already retired")
+            if (
+                self._live_domains.get(handle.name) is not handle
+                or resources.live_domains.get(handle.name) is not handle
+            ):
+                raise RuntimeError("detach_persistent_domain: handle is not this run's live claim on this domain")
+            del resources.live_domains[handle.name]
+
     def _validate_worker_chip_id(self, worker_id: int) -> None:
         if self.level < 3:
             raise RuntimeError("create_worker_chip_region requires a hierarchical Worker")
