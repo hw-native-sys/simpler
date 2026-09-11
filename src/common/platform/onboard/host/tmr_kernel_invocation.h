@@ -12,6 +12,7 @@
 #pragma once
 
 #include "aicpu_loader/host/load_aicpu_op.h"
+#include "host/tmr_dispatch_packet.h"
 #include "worker/runtime_c_api.h"
 #include "worker/tmr_kernel_invocation.h"
 
@@ -25,7 +26,7 @@ inline constexpr char TmrKernelInvocationName[] = "simpler_aicpu_kernel_exec";
 // enqueue/commit contract below applies to this production transport adapter.
 int enqueue_tmr_invocation_aicpu(
     DeviceRunnerBase &runner, void *stream, int32_t aicpu_num, const TmrEncodingCandidate &candidate,
-    const PreparedInvocationView &callable, const TmrExecutionBindingView &binding
+    const PreparedInvocationView &callable, const TmrExecutionBindingView &binding, uint64_t residency_address
 ) noexcept;
 
 // Called by the owner's KernelLaunchOps::launch_aicpu callback. The owner
@@ -36,20 +37,20 @@ int enqueue_tmr_invocation_aicpu(
 // The loader must have registered the kernel-mode entry, not the program
 // KernelArgs entry. CPU transport copy/lifetime support is a platform
 // integration precondition, verified with the native snapshot probe.
+// residency_address is the descriptor from the issuing cache's resolve(),
+// borrowed under the same owner protection as callable and execution binding.
 inline int enqueue_tmr_invocation_aicpu(
     host::LoadAicpuOp &loader, void *stream, int32_t aicpu_num, const TmrEncodingCandidate &candidate,
-    const PreparedInvocationView &callable, const TmrExecutionBindingView &binding
+    const PreparedInvocationView &callable, const TmrExecutionBindingView &binding, uint64_t residency_address
 ) noexcept {
     if (stream == nullptr || aicpu_num <= 0) return PTO_RUNTIME_ERR_INTERNAL;
-    const auto status = validate_tmr_submission(candidate, callable, binding);
-    if (status == InvocationStatus::StaleCallable || status == InvocationStatus::InvalidBinding)
-        return PTO_RUNTIME_ERR_INVALID_STATE;
-    if (status != InvocationStatus::Ok) return PTO_RUNTIME_ERR_INTERNAL;
     try {
-        const auto packet = candidate.packet();
-        return loader.LaunchBuiltInOp(
-            stream, const_cast<uint8_t *>(packet.data), packet.size, aicpu_num, TmrKernelInvocationName
-        );
+        std::vector<uint8_t> packet;
+        const auto status = make_tmr_dispatch_packet(candidate, callable, binding, residency_address, &packet);
+        if (status == InvocationStatus::StaleCallable || status == InvocationStatus::InvalidBinding)
+            return PTO_RUNTIME_ERR_INVALID_STATE;
+        if (status != InvocationStatus::Ok) return PTO_RUNTIME_ERR_INTERNAL;
+        return loader.LaunchBuiltInOp(stream, packet.data(), packet.size(), aicpu_num, TmrKernelInvocationName);
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }

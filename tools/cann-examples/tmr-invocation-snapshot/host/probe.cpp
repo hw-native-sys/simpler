@@ -60,6 +60,22 @@ int main(int argc, char **argv) {
         void *gate = nullptr;
         check(aclrtMalloc(&gate, sizeof(uint32_t), ACL_MEM_MALLOC_HUGE_FIRST), "alloc test gate");
         check(aclrtMemset(gate, sizeof(uint32_t), 0, sizeof(uint32_t)), "close test gate");
+        // Test-only descriptors back the real adapter's dispatch envelope.
+        // The probe checks identity, never dereferences device_address as code.
+        KernelCallableDeviceResidency descriptors[3]{};
+        for (int32_t id = 0; id < 3; ++id) {
+            const auto callable = snapshot_probe_callable(id);
+            descriptors[id] = {
+                callable.slot_generation, reinterpret_cast<uint64_t>(results), count * sizeof(SnapshotProbeResult), id,
+                0
+            };
+        }
+        void *residencies = nullptr;
+        check(aclrtMalloc(&residencies, sizeof(descriptors), ACL_MEM_MALLOC_HUGE_FIRST), "alloc test residencies");
+        check(
+            aclrtMemcpy(residencies, sizeof(descriptors), descriptors, sizeof(descriptors), ACL_MEMCPY_HOST_TO_DEVICE),
+            "publish test residencies"
+        );
         {
             host::LoadAicpuOp loader;
             check(
@@ -69,7 +85,10 @@ int main(int argc, char **argv) {
                 "bootstrap"
             );
             check(loader.Init({simpler::tmr::TmrKernelInvocationName}), "register entries");
-            SnapshotProbeInit init{reinterpret_cast<uint64_t>(results), 13, reinterpret_cast<uint64_t>(gate), count};
+            SnapshotProbeInit init{
+                reinterpret_cast<uint64_t>(results), 13, reinterpret_cast<uint64_t>(gate),
+                reinterpret_cast<uint64_t>(residencies), count
+            };
             check(loader.LaunchBuiltInOp(stream, &init, sizeof(init), 1, "simpler_aicpu_init"), "init fixture");
             check(aclrtSynchronizeStream(stream), "sync prepare");
 
@@ -96,7 +115,10 @@ int main(int argc, char **argv) {
                 auto status = simpler::tmr::encode_tmr_invocation(args, callable, binding, caches[i % 3], &candidate);
                 if (status != simpler::kernel::InvocationStatus::Ok) throw std::runtime_error("encode failed");
                 check(
-                    simpler::tmr::enqueue_tmr_invocation_aicpu(loader, stream, 1, candidate, callable, binding),
+                    simpler::tmr::enqueue_tmr_invocation_aicpu(
+                        loader, stream, 1, candidate, callable, binding,
+                        init.residencies_addr + static_cast<uint64_t>(callable.callable_id) * sizeof(descriptors[0])
+                    ),
                     "enqueue snapshot"
                 );
                 caches[i % 3].commit(std::move(candidate));
@@ -125,6 +147,7 @@ int main(int argc, char **argv) {
                 "PASS: %u gated asynchronous snapshots, minimum/maximum packets, host overwrite+release\n", count
             );
         }
+        check(aclrtFree(residencies), "free test residencies");
         check(aclrtFree(results), "free results");
         check(aclrtFree(gate), "free test gate");
         check(aclrtDestroyStream(release_stream), "destroy release stream");

@@ -570,6 +570,24 @@ target_link_libraries(test_kernel_dispatch_unavailable PRIVATE ${GTEST_MAIN_LIB}
 add_test(NAME test_kernel_dispatch_unavailable COMMAND test_kernel_dispatch_unavailable)
 set_tests_properties(test_kernel_dispatch_unavailable PROPERTIES LABELS "no_hardware")
 
+# Real TMR encoder -> dispatch envelope -> production rejecting consumer.
+add_executable(test_tmr_dispatch_packet
+    common/test_tmr_dispatch_packet.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/kernel_dispatch.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/kernel_invocation_consumer.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/aicpu/cache_ops.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface/assert_compat.cpp
+)
+target_include_directories(test_tmr_dispatch_packet PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+)
+target_link_libraries(test_tmr_dispatch_packet PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_tmr_dispatch_packet COMMAND test_tmr_dispatch_packet)
+set_tests_properties(test_tmr_dispatch_packet PROPERTIES LABELS "no_hardware")
+
 # Kernel-mode phase machine and restricted-vocabulary tables, table-driven with
 # fake ops: init/close balance, poison, sticky CLOSING with retry, and the
 # separate runtime-error vs teardown-error slots.

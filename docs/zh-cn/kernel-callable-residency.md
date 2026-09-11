@@ -3,9 +3,10 @@
 本文从 `simpler_kernel_mode_prepare_callable` 开始，说明当前缓存实现的上传、注册、
 命中、回滚以及 launch 前查询流程。
 
-开发基线是 K2 提交 `48b120b1`（`Add: persistent kernel-context execution resources`），
+K10a 原开发基线是 K2 提交 `48b120b1`（`Add: persistent kernel-context execution resources`），
 其父提交 `dc1268cd` 是 K1。分支 `feat/k10a-callable-cache` 直接在该 K2 提交上建立，
 K10a 复用 K2 的持久参数块，没有重新实现这部分资源管理。
+K7 整合分支同时保留 K4 的完整镜像校验、K5 的静态配置准备及失败回收；下文描述整合后的调用顺序。
 本文记录当前工作区的同步行为；prepare 的异步改造由 K2 另行推进，本次管理层接口改动不调整同步点。
 
 ## 1. 入口与调用总览
@@ -59,14 +60,16 @@ flowchart TD
     D -->|同内容、已 ready| E["hit=true，返回已有 handle"]
     D -->|新 ID，暂存成功| F["record_callable_on_runner"]
     F --> G["prepare_kernel_callable"]
-    G --> H["设备注册：TRB 执行，HBG 跳过"]
-    H --> I["PersistentKernelArgs::prepare_once"]
+    G --> H["首次 prepare：解析静态配置、prepare_once、freeze；后续复用"]
+    H --> I["设备注册：TRB 执行，HBG 跳过"]
     I --> J["mark_ready_enqueued"]
     J --> K["cache.commit：ready=true"]
     K --> L["写出新 handle，返回 0"]
 ```
 
-入口先调用 `validate_kernel_prepare_callable_args` 检查输入/输出指针、最小尺寸和对齐，
+入口先调用 `validate_kernel_prepare_callable_args` 检查输入/输出指针与完整镜像。
+与缓存共用的 `validate_kernel_callable_image` 先拒绝超大镜像，再校验尺寸、对齐、
+tensor/scalar 签名顺序、有效名称、子项布局与精确末尾；不让非法镜像进入 hash 或上传。
 再确认 context 已归属 kernel 模式且 `accepts_dispatch()` 为真。
 `adopt_borrowed_device` 核对借用设备身份，不接管调用方的设备生命周期。
 
@@ -157,11 +160,14 @@ program 模式仍使用原来的 `chip_callable_buffers_` 上传与引用计数�
 TRB 设备端的 `simpler_aicpu_register_callable` 调用 `load_orch_so`，将 orchestration
 入口装入按 ID 索引的表。prepare 中存在 stream 同步，这是当前实现事实，不是 launch 的行为。
 
-注册后继续调用 K2 的 `PersistentKernelArgs::prepare_once`：
+`prepare_kernel_callable` 在设备注册前完成 K5 静态准备：
 
-- 第一次成功调用分配并初始化 Runtime 设备副本、架构相关资源和设备 `KernelArgs`。
+- init 已复制保存 context 执行配置；首次 prepare 结合硬件拓扑解析线程数与 affinity，
+  配置 kernel Runtime，然后由 K2 `PersistentKernelArgs::prepare_once` 分配并初始化
+  Runtime 设备副本、架构相关资源和设备 `KernelArgs`；成功后固定静态配置。
 - 后续 callable 复用这些 context 级参数块，不按 ID 再分配一套。
 - 持久 Runtime 不在这里绑定为“最近 prepare 的 callable”；具体 invocation 的绑定属于后续 binder。
+- 静态准备成功后才执行上述 TRB 设备注册；HBG 跳过的是设备注册，不是静态准备。
 
 最后先执行 `mark_ready_enqueued()`，再执行 `cache.commit(callable_id)`，将条目标为 ready；只有此后才向调用方写出新 handle。
 **代码已上传、runtime 已记录、context 已就绪和缓存可供 launch 查询，是不同阶段。**
@@ -196,9 +202,12 @@ program 的 `simpler_register_callable` / `simpler_unregister_callable` 绕过�
 是否退出上层进程由调用方处理返回码后决定。
 
 正常 close 前，调用方必须停止 enqueue、等待 eager/replay 完成并销毁相关 graph。
-`finalize_device → runner->finalize → finalize_common_impl` 会清理缓存 Host 元数据，
-arena 的设备分配由 `MemoryAllocator` 统一释放。
-`KernelCallableCache::clear()` 本身不调用设备 free；fatal abandon 路径遵循原有的设备资源放弃规则。
+`finalize_device → runner->finalize → finalize_common_impl` 先调用缓存 `begin_close()`
+撤销借用，再回收 K5 持久参数，随后调用 `cache.finalize(ops)` 通过 allocator 的单块
+`free` 释放代码 arena。只有释放成功才清理缓存 Host 元数据并继续 allocator 总清理。
+持久参数或代码 arena 的 free 失败时，保留指针与所有权，拒绝后续 stage/resolve，
+由后续 close 重试；不得销毁仍有资源的 owner。即使上传失败使条目数为零，arena 仍可能需要释放。
+`abandon()` 只用于上层确认设备失效或完成隔离的 fatal 路径，不用来吞掉普通 free 失败。
 
 ## 5. prepare 之后：launch 查询与待接入部分
 
@@ -211,7 +220,7 @@ simpler_kernel_mode_launch(ctx, handle, args, caller_stream)
   │   ├─ 无 ready 项：CALLABLE_NOT_RESIDENT（-1006）
   │   ├─ ID 已驻留但 generation 不匹配：CALLABLE_STALE（-1007）
   │   └─ 成功：返回 ID、generation、代码地址、镜像大小、描述符地址
-  └─ binder 尚未实现：返回 INVALID_STATE
+  └─ 尚未接通真实 provider 和统一提交 owner：返回 INVALID_STATE
 ```
 
 `resolve` 只读 Host 缓存，无分配、H2D 或懒注册。prepare 成功目前不意味着 kernel launch 已可执行，
@@ -234,6 +243,11 @@ packet_bytes + residency_address + K9 invocation header + payload
 当前入口不能检测已释放的设备地址。CANN 入口只传 `void *`，没有独立的长度参数，
 binder 必须保证真实参数分配与 `packet_bytes` 一致；入口检查声明的包长与 payload 长度是否一致。
 
+K4 TMR codec 保持原来的 `K9 + TmrBindingRef + tensor/scalar` 内层格式。
+内部 `make_tmr_dispatch_packet` 在其前面添加包长和可信描述符地址，native adapter
+提交完整外层包，并持有 Host buffer 到 native API 返回；不新增 Device 参数池。
+此 adapter 需要 owner 显式提供真实描述符地址，不能用固定地址绕过缺失的 provider。
+
 ```text
 simpler_aicpu_kernel_exec(packet)
   ├─ 检查包长、mode、ID 范围、非零 generation、参数计数及描述符地址对齐
@@ -254,14 +268,18 @@ simpler_aicpu_kernel_exec(packet)
 调用方同步时具体看到的 CANN 错误码仍需上板核验。失败时入口不发起 runtime 工作或内部等待。
 binder 的双流完成/错误收敛协议仍由 binder 负责。
 
-**当前连接边界：** Host launch binder 尚未向此入口 enqueue；runtime-specific payload 消费函数
+**当前连接边界：** 三流 binder 模块已存在，但公开 launch 的 owner/provider 接线尚未完成；
+不能按枚举序号把 binder 的 PrepareTail 与 K2 的 AicoreStart 事件直接对应。
+runtime-specific payload 消费函数
 明确返回 `UnsupportedPayload`，不会借 program executor 执行或将未执行报告为成功。
 所以设备入口的 generation 校验已实现且有 UT，但完整算子执行和 ACLGraph replay 上板联调尚未完成。
 
 对应测试：
 
 - [缓存单元测试](../../tests/ut/cpp/common/test_kernel_callable_cache.cpp)：数量、字节、对齐、去重、
-  上传失败、回滚、子地址修补、Host handle 校验及跨 context 代次。
+  上传失败、回滚、子地址修补、Host handle 校验、跨 context 代次及 free 失败后 close 重试。
+- [TMR 外层包测试](../../tests/ut/cpp/common/test_tmr_dispatch_packet.cpp)：真实 K4 编码、外层封装
+  与生产 dispatch 联用；完整包到达未实现的 payload 边界，陈旧代次在此前拒绝。
 - [AICPU 入口单元测试](../../tests/ut/cpp/common/test_kernel_dispatch.cpp)：直接编译生产入口 `.cpp`，
   仅替换 cache primitive 和 payload 消费函数；验证非法 ID/零代次先于设备读取被拒、过期代次和错误槽位
   不进入消费函数、合法调用透传消费返回码，以及同一捕获参数在槽位代次更新后的再次调用被拒。

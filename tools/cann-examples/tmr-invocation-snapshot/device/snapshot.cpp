@@ -39,17 +39,32 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_kernel_exec(
         timespec now{};
         if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec - started.tv_sec > 30) return 1;
     }
-    SimplerKernelInvocationHeader header{};
-    std::memcpy(&header, args, sizeof(header));
+    SimplerKernelDispatchArgs dispatch{};
+    std::memcpy(&dispatch, args, sizeof(dispatch));
+    const auto &header = dispatch.invocation;
     const auto callable = snapshot_probe_callable(header.callable_id);
     size_t bytes = 0;
     auto status = tmr_invocation_size(callable, &bytes);
+    constexpr size_t prefix_bytes = offsetof(SimplerKernelDispatchArgs, invocation);
+    if (status == InvocationStatus::Ok) {
+        const uint64_t expected_residency = fixture.residencies_addr + static_cast<uint64_t>(callable.callable_id) *
+                                                                           sizeof(KernelCallableDeviceResidency);
+        if (fixture.residencies_addr == 0 || dispatch.packet_bytes != prefix_bytes + bytes ||
+            dispatch.residency_address != expected_residency) {
+            status = InvocationStatus::InvalidArgument;
+        } else {
+            KernelCallableDeviceResidency resident{};
+            std::memcpy(&resident, reinterpret_cast<const void *>(expected_residency), sizeof(resident));
+            if (!kernel_callable_residency_matches(header, resident)) status = InvocationStatus::InvalidArgument;
+        }
+    }
     TmrInvocationView view;
     const TmrExecutionBindingView binding{fixture.results_addr, fixture.context_generation};
     // The formal host adapter submits exactly the independently derived size.
     // This CPU entry has no API for observing CANN's actual readable byte count.
     if (status == InvocationStatus::Ok)
-        status = decode_tmr_invocation({static_cast<const uint8_t *>(args), bytes}, callable, binding, &view);
+        status =
+            decode_tmr_invocation({static_cast<const uint8_t *>(args) + prefix_bytes, bytes}, callable, binding, &view);
     uint64_t sum = 0;
     if (status == InvocationStatus::Ok) {
         EntryArgsStorage storage{};

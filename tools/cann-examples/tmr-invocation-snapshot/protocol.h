@@ -12,6 +12,8 @@
 #pragma once
 #include <cstdint>
 #include <type_traits>
+#include "task_interface/kernel_callable_residency.h"
+#include "task_interface/kernel_dispatch_args.h"
 #include "task_interface/kernel_invocation_validation.h"
 
 // Test fixtures, published by a separate init task before any invocation.
@@ -19,6 +21,7 @@ struct SnapshotProbeInit {
     uint64_t results_addr;
     uint64_t context_generation;
     uint64_t gate_addr;
+    uint64_t residencies_addr;
     uint32_t capacity;
 };
 struct SnapshotProbeResult {
