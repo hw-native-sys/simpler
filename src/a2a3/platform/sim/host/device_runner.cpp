@@ -162,17 +162,25 @@ int DeviceRunner::ensure_binaries_loaded() {
             return PTO_RUNTIME_ERR_INTERNAL;
         load_optional_sym("set_orch_device_id", reinterpret_cast<void **>(&set_orch_device_id_func_));
         load_optional_sym("set_scheduler_timeout_ms", reinterpret_cast<void **>(&set_scheduler_timeout_ms_func_));
-        if (set_scheduler_timeout_ms_func_ != nullptr) {
+        load_optional_sym("set_tensor_data_timeout_ms", reinterpret_cast<void **>(&set_tensor_data_timeout_ms_func_));
+        if (set_scheduler_timeout_ms_func_ != nullptr || set_tensor_data_timeout_ms_func_ != nullptr) {
             // Per-device one-shot latch (mirrors the onboard InitArgs path):
-            // honor SIMPLER_SCHEDULER_TIMEOUT_MS once at SO load, not per run. 0 ->
-            // the scheduler keeps its compile-time default. Sim skips the
-            // op/stream ordering check (validate_runtime_timeout_order is onboard).
-            RuntimeTimeoutParseStatus sched_status;
-            RuntimeTimeoutConfig sched_cfg =
-                resolve_runtime_timeout_config(RuntimeTimeoutConfig{1, 1, 0}, &sched_status);
-            set_scheduler_timeout_ms_func_(
-                (sched_status.scheduler_env_set && sched_status.scheduler_valid) ? sched_cfg.scheduler_timeout_ms : 0
-            );
+            // honor SIMPLER_SCHEDULER_TIMEOUT_MS / SIMPLER_TENSOR_DATA_TIMEOUT_MS
+            // once at SO load, not per run. 0 -> the device keeps its
+            // compile-time default. Sim skips the op/stream ordering check
+            // (validate_runtime_timeout_order is onboard).
+            RuntimeTimeoutParseStatus status;
+            RuntimeTimeoutConfig cfg = resolve_runtime_timeout_config(RuntimeTimeoutConfig{1, 1, 0, 0}, &status);
+            const int32_t scheduler_override =
+                (status.scheduler_env_set && status.scheduler_valid) ? cfg.scheduler_timeout_ms : 0;
+            const int32_t tensor_data_override =
+                (status.tensor_data_env_set && status.tensor_data_valid) ? cfg.tensor_data_timeout_ms : 0;
+            if (set_scheduler_timeout_ms_func_ != nullptr) {
+                set_scheduler_timeout_ms_func_(scheduler_override);
+            }
+            if (set_tensor_data_timeout_ms_func_ != nullptr) {
+                set_tensor_data_timeout_ms_func_(tensor_data_override);
+            }
         }
         if (!load_sym("set_platform_dump_base", reinterpret_cast<void **>(&set_platform_dump_base_func_)))
             return PTO_RUNTIME_ERR_INTERNAL;

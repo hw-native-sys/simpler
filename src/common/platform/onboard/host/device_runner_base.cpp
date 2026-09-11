@@ -66,8 +66,10 @@ extern "C" const char *const *runtime_extra_aicpu_symbols(size_t *count);
 namespace {
 
 HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
+    // The tensor-data budget seeds as 0: its default lives in the runtime, out
+    // of this file's reach, and 0 already means "device keeps that default".
     RuntimeTimeoutConfig order_defaults{
-        PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS, PLATFORM_SCHEDULER_TIMEOUT_MS
+        PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS, PLATFORM_SCHEDULER_TIMEOUT_MS, 0
     };
     RuntimeTimeoutParseStatus parse_status;
     RuntimeTimeoutConfig cfg = resolve_runtime_timeout_config(order_defaults, &parse_status);
@@ -96,6 +98,11 @@ HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
         );
     }
 
+    if (parse_status.tensor_data_env_set && !parse_status.tensor_data_valid) {
+        const char *tensor_env = std::getenv(SIMPLER_TENSOR_DATA_TIMEOUT_MS_ENV);
+        LOG_WARN("%s=%s invalid, ignored", SIMPLER_TENSOR_DATA_TIMEOUT_MS_ENV, tensor_env);
+    }
+
     bool host_timeout_env_set =
         parse_status.op_execute_env_set || parse_status.stream_sync_env_set || parse_status.scheduler_env_set;
     RuntimeTimeoutOrderStatus order_status = validate_runtime_timeout_order(cfg);
@@ -107,17 +114,35 @@ HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
                                   order_status == RuntimeTimeoutOrderStatus::OK) ?
                                      cfg.scheduler_timeout_ms :
                                      0;
+    // The tensor-data override rides the same InitArgs latch but stands outside
+    // the ordering group, so a rejected group still forwards it.
+    int32_t tensor_data_override =
+        (parse_status.tensor_data_env_set && parse_status.tensor_data_valid) ? cfg.tensor_data_timeout_ms : 0;
+    HostRuntimeTimeoutConfig resolved{
+        cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms, scheduler_override, tensor_data_override
+    };
     if (host_timeout_env_set && order_status != RuntimeTimeoutOrderStatus::OK) {
         LOG_WARN(
             "Ignoring timeout env overrides: %s (scheduler=%d ms, op_execute=%llu us, stream_sync=%d ms)",
             runtime_timeout_order_status_name(order_status), cfg.scheduler_timeout_ms,
             (unsigned long long)cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms
         );
-        return HostRuntimeTimeoutConfig{
-            order_defaults.op_execute_timeout_us, order_defaults.stream_sync_timeout_ms, scheduler_override
-        };
+        resolved.op_execute_timeout_us = order_defaults.op_execute_timeout_us;
+        resolved.stream_sync_timeout_ms = order_defaults.stream_sync_timeout_ms;
     }
-    return HostRuntimeTimeoutConfig{cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms, scheduler_override};
+    if (tensor_data_override != 0) {
+        RuntimeTimeoutConfig effective = cfg;
+        effective.op_execute_timeout_us = resolved.op_execute_timeout_us;
+        if (!tensor_data_timeout_can_latch(effective)) {
+            LOG_WARN(
+                "%s=%d ms is not below op_execute=%llu us; the op is reaped before the tensor-data wait can report "
+                "SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT",
+                SIMPLER_TENSOR_DATA_TIMEOUT_MS_ENV, tensor_data_override,
+                (unsigned long long)resolved.op_execute_timeout_us
+            );
+        }
+    }
+    return resolved;
 }
 
 }  // namespace
@@ -575,6 +600,8 @@ int DeviceRunnerBase::ensure_aicpu_init_launched() {
     // Per-device scheduler watchdog override, resolved once at attach into
     // timeout_config_. 0 -> the AICPU scheduler keeps its compile-time default.
     init_args.scheduler_timeout_ms = timeout_config_.scheduler_timeout_ms;
+    // Same latch for the orchestration tensor-data wait; 0 -> compile-time default.
+    init_args.tensor_data_timeout_ms = timeout_config_.tensor_data_timeout_ms;
     // Publish the provisioned async-DMA workspace addresses (all-zero unless the
     // Worker opted into SDMA). ensure_dma_workspace_provisioned() runs first, so
     // this single launch carries them; the AICPU SO stays resident, and the

@@ -26,6 +26,7 @@
 
 #include <algorithm>
 
+#include "aicpu/aicpu_device_config.h"  // get_tensor_data_timeout_ms (per-device override)
 #include "aicpu/device_time.h"
 #include "common/platform_config.h"  // PLATFORM_PROF_SYS_CNT_FREQ (data-wait deadline)
 #include "common/unified_log.h"
@@ -43,7 +44,13 @@ __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { retur
 // that define PLATFORM_PROF_SYS_CNT_FREQ locally, so pulling the platform header into
 // it caused a redefinition conflict (#1189). Scaling MS by the counter frequency (like
 // SCHEDULER_TIMEOUT_CYCLES) keeps the data-wait wall-clock identical across arches.
-static constexpr uint64_t TENSOR_DATA_TIMEOUT_CYCLES = (TENSOR_DATA_TIMEOUT_MS * PLATFORM_PROF_SYS_CNT_FREQ) / 1000;
+// A non-zero per-device override (SIMPLER_TENSOR_DATA_TIMEOUT_MS -> InitArgs ->
+// resident-SO global, latched at worker init) replaces TENSOR_DATA_TIMEOUT_MS.
+static uint64_t tensor_data_timeout_cycles() {
+    const int32_t override_ms = get_tensor_data_timeout_ms();
+    const uint64_t timeout_ms = override_ms > 0 ? static_cast<uint64_t>(override_ms) : TENSOR_DATA_TIMEOUT_MS;
+    return (timeout_ms * PLATFORM_PROF_SYS_CNT_FREQ) / 1000;
+}
 
 // =============================================================================
 // Orchestration Ops Table (function-pointer dispatch for orchestration .so)
@@ -112,6 +119,7 @@ static bool wait_for_tensor_ready(
     const ChipTaskSlotState *seg[kSegmentCap];
     int seg_count = 0;
     bool failed = false;
+    const uint64_t timeout_cycles = tensor_data_timeout_cycles();
 
     auto wait_one_producer = [&](const ChipTaskSlotState &slot) {
         uint8_t ring_id = slot.ring_id;
@@ -126,11 +134,11 @@ static bool wait_for_tensor_ready(
                     failed = true;
                     return;
                 }
-                if (get_sys_cnt_aicpu() - t0 > TENSOR_DATA_TIMEOUT_CYCLES) {
+                if (get_sys_cnt_aicpu() - t0 > timeout_cycles) {
                     orch.report_fatal(
                         SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT, caller,
                         "Timeout (%llu cycles): producer (ring=%d, local=%d) not completed",
-                        (unsigned long long)TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
+                        (unsigned long long)timeout_cycles, ring_id, local_id
                     );
                     failed = true;
                     return;
@@ -153,11 +161,11 @@ static bool wait_for_tensor_ready(
                     failed = true;
                     return;
                 }
-                if (get_sys_cnt_aicpu() - t0 > TENSOR_DATA_TIMEOUT_CYCLES) {
+                if (get_sys_cnt_aicpu() - t0 > timeout_cycles) {
                     orch.report_fatal(
                         SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT, caller,
                         "Timeout (%llu cycles): consumers of producer (ring=%d, local=%d) not done",
-                        (unsigned long long)TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
+                        (unsigned long long)timeout_cycles, ring_id, local_id
                     );
                     failed = true;
                     return;

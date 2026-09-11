@@ -127,6 +127,7 @@ simulator platforms.
 | `SIMPLER_OP_EXECUTE_TIMEOUT_US` | host platform | µs | op-execute timeout (overrides the `platform_config.h` compile default) |
 | `SIMPLER_STREAM_SYNC_TIMEOUT_MS` | host platform | ms | stream-sync timeout |
 | `SIMPLER_SCHEDULER_TIMEOUT_MS` | host platform | ms | scheduler no-progress timeout |
+| `SIMPLER_TENSOR_DATA_TIMEOUT_MS` | host platform | ms | orchestration tensor-data wait timeout |
 
 ### Per-run DFX flag bitmask (`platform_config.h`)
 

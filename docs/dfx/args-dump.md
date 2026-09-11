@@ -938,6 +938,15 @@ the no-progress budget without onboard-only ordering limits. CI restores the
 old fast-fail values through these env vars: 2 s scheduler, 3 s op-execute,
 and 4 s stream-sync for onboard jobs; 5 s scheduler for sim jobs.
 
+`SIMPLER_TENSOR_DATA_TIMEOUT_MS` overrides a fourth wait — the orchestration
+`get_tensor_data`/`set_tensor_data` spin, 15 s by default in
+`tensormap_and_ringbuffer` — and is deliberately outside that ordering group. It
+is a diagnostic refinement: expiring first buys the precise `TENSOR_WAIT_TIMEOUT`
+code with its producer locator, while the clean shutdown is the scheduler
+watchdog's job for every stall shape. Folding it into the ordering check would
+let a value the host cannot even see (the default is compiled into the runtime)
+invalidate an otherwise valid override set.
+
 - **Device-side graceful flush (primary).** At 20 s of no progress
   the AICPU declares the hang, runs the end-of-loop flush, *and*
   dumps the **partial output** of every task still RUNNING on a core

@@ -17,12 +17,11 @@ the technique transfers:
 
 - To make the **scheduler** win (get a `sub_class`), squeeze it below the others:
   `SCHEDULER=2000ms < OP_EXECUTE=3s < STREAM_SYNC=4000ms` (`aicore_hang` case).
-- To let a **slow-but-alive** path finish, push the others out of the way:
-  `SCHEDULER=30000ms`, `OP_EXECUTE=30s`, `STREAM_SYNC=40000ms` — this is how the
-  `tensor_wait_timeout` case lets the 15 s tensor-data wait land code 8 instead of
-  being reaped first.
+- To make the **tensor-data wait** win (get code 8 and its producer locator),
+  squeeze `TENSOR_DATA=1000ms` below all three — it sits outside their ordering
+  group, so lowering it alone leaves them valid (`tensor_wait_timeout` case).
 
-**These three are read once, at `Worker.init()`.** Changing them between `run()`
+**These four are read once, at `Worker.init()`.** Changing them between `run()`
 calls on the same Worker does nothing — you must rebuild the Worker (or use a
 separate process) per value. Defaults and the rationale are in
 [`../local-timeout-defaults.md`](../local-timeout-defaults.md).
@@ -63,11 +62,18 @@ exist) before reading. See the "Device logs" section of
 ## Code 8, specifically
 
 Only `tensormap_and_ringbuffer` raises this code. Its tensor-data wait defaults to
-15 s (`TENSOR_DATA_TIMEOUT_MS`, frequency-scaled). It means either the producer
+15 s (`TENSOR_DATA_TIMEOUT_MS`, frequency-scaled) and is overridden per run by
+`SIMPLER_TENSOR_DATA_TIMEOUT_MS`. It means either the producer
 never completed, or a consumer never
 released its fanout reference. Check for a hung producer first (that is S1 above),
 then verify the consumer really declares the dependency and exits. If the kernel is
 merely slow, raising the timeout will prove it.
+
+Code 8 only reaches you if this wait expires before the other watchdogs reap the
+op. Its 15 s default sits below the 20 s scheduler no-progress budget but above
+the op-execute timeout CI tightens to 3 s, so under CI's values a stall reports
+code 100 or a bare 507018 instead. Lower `SIMPLER_TENSOR_DATA_TIMEOUT_MS` below
+both when you want the producer locator that code 8 carries.
 
 `host_build_graph` has no such wait: its orchestration finishes before the device
 starts, so `get_tensor_data` / `set_tensor_data` reject a tensor with a producer
