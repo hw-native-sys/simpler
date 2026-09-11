@@ -25,9 +25,11 @@
  */
 
 #include "callable.h"
+#include "callable_protocol.h"
 #include "call_config.h"
 #include "device_runner_base.h"
 #include "host/dep_gen_collector.h"  // make_deps_json_path
+#include "host/kernel_ctx_control.h"
 #include "prepare_callable_common.h"
 #include "runtime_c_api.h"
 #include "task_args_wire.h"
@@ -1199,6 +1201,65 @@ int device_memory_info_ctx(DeviceContextHandle ctx, DeviceMemoryInfo *info) {
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+}
+
+/* ===========================================================================
+ * Kernel-mode lifecycle (SIMPLER_MODE_KERNEL)
+ *
+ * This backend reports kernel mode unsupported: supported() is 0 and init
+ * refuses, so no kernel context can exist here and prepare/launch reject with
+ * INVALID_STATE. simpler_kernel_mode_ctx_control still runs the full shared
+ * validation and ordering state machine (KernelCtxControlState), so every
+ * fail-closed rule of the control ABI holds on this component exactly as on
+ * one with kernel-mode execution.
+ * =========================================================================== */
+
+int simpler_kernel_mode_ctx_control(DeviceContextHandle ctx, const SimplerKernelCtxControl *control) {
+    if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
+    DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
+    try {
+        const KernelCtxControlState::Environment env{runner->device_bound(), runner->has_committed_arena_region()};
+        const KernelCtxControlState::Capabilities caps{};
+        const int rc = runner->kernel_ctx_control().apply(control, env, caps);
+        if (rc != 0) LOG_ERROR("simpler_kernel_mode_ctx_control rejected: %d", rc);
+        return rc;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int simpler_kernel_mode_supported(DeviceContextHandle) { return 0; }
+
+int simpler_kernel_mode_init(
+    DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
+    const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,
+    const CallConfig *config, uint64_t context_generation
+) {
+    if (ctx == NULL || config == NULL) return PTO_RUNTIME_ERR_INTERNAL;
+    if (device_id < 0 || context_generation == 0) return PTO_RUNTIME_ERR_INTERNAL;
+    if ((aicpu_binary == NULL && aicpu_size != 0) || (aicore_binary == NULL && aicore_size != 0) ||
+        (dispatcher_binary == NULL && dispatcher_size != 0)) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    LOG_ERROR("simpler_kernel_mode_init: kernel mode is not supported by this host runtime");
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
+int simpler_kernel_mode_prepare_callable(
+    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size, void *caller_stream
+) {
+    if (ctx == NULL || callable == NULL || caller_stream == NULL) return PTO_RUNTIME_ERR_INTERNAL;
+    if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) return PTO_RUNTIME_ERR_INTERNAL;
+    if (callable_size < sizeof(ChipCallable)) return PTO_RUNTIME_ERR_INTERNAL;
+    LOG_ERROR("simpler_kernel_mode_prepare_callable: no live kernel context on this device context");
+    return PTO_RUNTIME_ERR_INVALID_STATE;
+}
+
+int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, const void *args, void *caller_stream) {
+    if (ctx == NULL || args == NULL || caller_stream == NULL) return PTO_RUNTIME_ERR_INTERNAL;
+    if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) return PTO_RUNTIME_ERR_INTERNAL;
+    LOG_ERROR("simpler_kernel_mode_launch: no live kernel context on this device context");
+    return PTO_RUNTIME_ERR_INVALID_STATE;
 }
 
 }  // extern "C"

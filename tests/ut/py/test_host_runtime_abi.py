@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -22,6 +23,16 @@ _NEWLY_REQUIRED_PIPELINE_SYMBOLS = {
     "get_pipeline_contract",
     "get_retained_temp_addr_ctx",
     "supports_concurrent_native_prepare_ctx",
+}
+# Kernel-mode lifecycle surface: every host-runtime component exports all of
+# these; components without kernel-mode support export validating stubs that
+# report unsupported rather than omitting the symbols.
+_KERNEL_MODE_SYMBOLS = {
+    "simpler_kernel_mode_ctx_control",
+    "simpler_kernel_mode_init",
+    "simpler_kernel_mode_launch",
+    "simpler_kernel_mode_prepare_callable",
+    "simpler_kernel_mode_supported",
 }
 _REMOVED_AMBIENT_SELECTION_SYMBOLS = {
     "select_arena_bank_ctx",
@@ -73,4 +84,71 @@ def test_host_runtime_exports_required_pipeline_symbols(arch: str, variant: str,
     symbols = _defined_external_symbols(runtime_path)
 
     assert _NEWLY_REQUIRED_PIPELINE_SYMBOLS <= symbols, sorted(_NEWLY_REQUIRED_PIPELINE_SYMBOLS - symbols)
+    assert _KERNEL_MODE_SYMBOLS <= symbols, sorted(_KERNEL_MODE_SYMBOLS - symbols)
     assert symbols.isdisjoint(_REMOVED_AMBIENT_SELECTION_SYMBOLS), sorted(symbols & _REMOVED_AMBIENT_SELECTION_SYMBOLS)
+
+
+@pytest.mark.parametrize(("language", "standard", "compiler_name"), [("c", "c11", "cc"), ("c++", "c++17", "c++")])
+@pytest.mark.parametrize(
+    "headers",
+    [
+        ("execution_mode.h",),
+        ("kernel_invocation_header.h",),
+        ("execution_mode.h", "kernel_invocation_header.h"),
+        ("kernel_invocation_header.h", "execution_mode.h"),
+    ],
+)
+def test_execution_mode_headers_are_self_contained(language: str, standard: str, compiler_name: str, headers: tuple):
+    compiler = shutil.which(compiler_name)
+    assert compiler is not None, f"Header ABI tests require {compiler_name}"
+    includes = "\n".join(f'#include "{header}"' for header in headers)
+    source = includes + "\nSimplerExecutionMode mode = SIMPLER_MODE_KERNEL;\n"
+    assertion = "_Static_assert" if language == "c" else "static_assert"
+    source += f'{assertion}(SIMPLER_MODE_PROGRAM == 0 && SIMPLER_MODE_KERNEL == 1, "mode values");\n'
+    result = subprocess.run(
+        [
+            compiler,
+            "-x",
+            language,
+            f"-std={standard}",
+            "-I",
+            str(_PROJECT_ROOT / "src/common/task_interface"),
+            "-I",
+            str(_PROJECT_ROOT / "src/common/worker"),
+            "-fsyntax-only",
+            "-",
+        ],
+        input=source,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_pipeline_contract_has_no_invocation_header_dependency():
+    compiler = shutil.which("c++")
+    assert compiler is not None, "Header dependency test requires c++"
+    command = [compiler, "-x", "c++", "-std=c++17"]
+    for directory in ("src/common", "src/common/task_interface", "src/common/platform/include"):
+        command.extend(["-I", str(_PROJECT_ROOT / directory)])
+    source = '#include "worker/pipeline_contract.h"\n'
+    result = subprocess.run(command + ["-fsyntax-only", "-"], input=source, capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+    dependencies = subprocess.run(command + ["-M", "-"], input=source, capture_output=True, text=True, check=False)
+    assert dependencies.returncode == 0, dependencies.stderr
+    assert "execution_mode.h" in dependencies.stdout
+    assert "kernel_invocation_header.h" not in dependencies.stdout
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        ("runtime_c_api.h",),
+        ("runtime_c_api.h", "kernel_invocation_header.h"),
+        ("kernel_invocation_header.h", "runtime_c_api.h"),
+    ],
+)
+def test_runtime_api_shares_execution_mode_definition(headers: tuple):
+    # The runtime API forward-declares C++ CallConfig; only its wire headers are C-compatible.
+    test_execution_mode_headers_are_self_contained("c++", "c++17", "c++", headers)

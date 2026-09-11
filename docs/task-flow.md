@@ -254,6 +254,10 @@ consumes the resulting POD and invokes the runtime's execution lifecycle.
 
 #### Pipeline resource leases
 
+The following describes the program pipeline. The capture-external
+[HBG kernel resource declaration](host-build-graph-kernel-contract.md) uses a
+separate size snapshot and a single execution slot.
+
 A2/A3 host runtimes and the A5 tensor-map-and-ring-buffer runtime declare
 `pipeline_depth = 2` as resource capacity. The contract determines the
 concrete copy count rather than permitting concurrent device execution by

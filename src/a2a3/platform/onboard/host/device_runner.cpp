@@ -148,6 +148,16 @@ int DeviceRunner::ensure_acl_ready(int device_id) {
         LOG_ERROR("ensure_acl_ready: invalid device_id %d", device_id);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    // A kernel-mode context borrows the caller's device and ACL context, so
+    // the ACL lifecycle (aclInit / aclrtSetDevice / aclrtResetDevice[Force] /
+    // aclFinalize) belongs to the caller. Every call site of those APIs is
+    // either inside force_reset_device() or gated on acl_ready_, which only
+    // this function sets — refusing here and in force_reset_device() keeps
+    // the whole lifecycle unreachable in kernel mode.
+    if (kernel_ctx_control().configured_mode() == SIMPLER_MODE_KERNEL) {
+        LOG_ERROR("ensure_acl_ready: refused — a kernel-mode context does not own the caller's ACL lifecycle");
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    }
 
     // aclInit is process-wide; CANN returns ACL_ERROR_REPEAT_INITIALIZE if it
     // has already been initialized (possibly by another owner), which we
@@ -856,6 +866,14 @@ private:
 int DeviceRunner::force_reset_device() {
     if (device_id_ < 0) {
         return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    // aclrtResetDeviceForce would reset the caller's device and ACL context;
+    // a kernel-mode context owns neither (see ensure_acl_ready()), so error
+    // recovery on that path never resets the device out from under the host
+    // process.
+    if (kernel_ctx_control().configured_mode() == SIMPLER_MODE_KERNEL) {
+        LOG_ERROR("force_reset_device: refused — a kernel-mode context does not own the caller's device");
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
     }
     // aclrtResetDeviceForce is an ACL API; bring ACL up for the whole sequence,
     // released on scope exit so a repeated poison-then-reset cycle in a

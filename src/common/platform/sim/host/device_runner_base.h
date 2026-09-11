@@ -55,6 +55,7 @@
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "platform_comm/comm.h"
+#include "host/kernel_ctx_control.h"
 #include "host/memory_allocator.h"
 #include "host/chip_swimlane_collector.h"
 #include "host/host_phase_records.h"
@@ -260,6 +261,27 @@ public:
     void set_dma_workspace_request(bool enable_sdma) { sdma_requested_ = enable_sdma; }
     int ensure_dma_workspace_provisioned();
     int device_id() const { return device_id_; }
+
+    /** Per-context state machine behind simpler_kernel_mode_ctx_control. */
+    KernelCtxControlState &kernel_ctx_control() { return kernel_ctx_control_; }
+
+    /** True once simpler_init has bound this runner to a simulated device. */
+    bool device_bound() const { return device_id_ >= 0; }
+
+    /**
+     * True once setup_static_arena has committed at least one pooled region on
+     * any bank — the FREEZE precondition that execution capacity exists.
+     */
+    bool has_committed_arena_region() const {
+        for (const auto &bank : arena_banks_) {
+            if (bank == nullptr) continue;
+            if (bank->gm_heap.is_committed() || bank->gm_sm.is_committed() || bank->runtime_pool.is_committed()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     uint64_t last_device_wall_ns() const { return device_wall_ns_; }
     // Per-phase AICPU wall (ns) from the most recent run; RunWall aliases
     // last_device_wall_ns(). 0 for a phase that was never stamped. Used to emit
@@ -375,6 +397,10 @@ protected:
     int block_dim_{0};
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
     int worker_count_{0};
+
+    // Execution-mode / capacity-freeze declaration for this context, mutated
+    // only through simpler_kernel_mode_ctx_control.
+    KernelCtxControlState kernel_ctx_control_;
 
     // Executor binaries — populated once via set_executors() during simpler_init,
     // owned for the rest of the runner's lifetime.
