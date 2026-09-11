@@ -30,6 +30,9 @@
  *                   simpler_unregister_callable,
  *                   get_aicpu_dlopen_count, get_host_dlopen_count,
  *                   get_run_stream_set_create_count
+ *   - kernel mode:  simpler_kernel_mode_ctx_control, simpler_kernel_mode_supported,
+ *                   simpler_kernel_mode_init, simpler_kernel_mode_prepare_callable,
+ *                   simpler_kernel_mode_launch
  *   - pipeline:     get_pipeline_contract,
  *                   supports_concurrent_native_prepare_ctx,
  *                   get_arena_bank_gm_heap_base_ctx,
@@ -56,6 +59,7 @@
 #include <stdint.h>
 
 #include "device_memory_info.h"
+#include "../task_interface/execution_mode.h"
 
 // simpler_run takes a pointer to the C++ CallConfig POD (task_interface/
 // call_config.h). Forward-declared so this C-linkage header needn't pull the
@@ -102,6 +106,13 @@ enum {
     /* The request names a capability this platform/runtime does not implement. */
     PTO_RUNTIME_ERR_UNSUPPORTED = PTO_RUNTIME_ERR_BASE - 1,
     PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE = PTO_RUNTIME_ERR_BASE - 2,
+    /* The call is structurally valid but arrives out of order for this
+       context's lifecycle (e.g. CONFIGURE after simpler_init, FREEZE before
+       capacity exists, launch on a context with no live kernel claim). */
+    PTO_RUNTIME_ERR_INVALID_STATE = PTO_RUNTIME_ERR_BASE - 3,
+    /* A frozen context received a request that would grow, first-commit, or
+       release an execution-capacity region. */
+    PTO_RUNTIME_ERR_CAPACITY_EXCEEDED = PTO_RUNTIME_ERR_BASE - 4,
 };
 
 /** Return values from simpler_poll_run(). */
@@ -130,7 +141,8 @@ typedef enum PipelineResourceClass {
     /* Not rewritten per run: whoever populates it does so once, and device ops
        run one at a time, so a single instance is reused across runs. */
     PTO_PIPELINE_DEVICE_SCRATCH = 1,
-    /* Execution context (stream) a run owns while its op runs and is reaped. */
+    /* Execution role. Kernel mode owns a dedicated non-hidden AICPU stream
+       and a hidden AICore stream; both are distinct from borrowed caller. */
     PTO_PIPELINE_EXEC_HANDLE = 2,
 } PipelineResourceClass;
 
@@ -150,7 +162,10 @@ typedef enum PipelineResourceKind {
 typedef struct PipelineResource {
     uint32_t kind;
     uint32_t resource_class;
-    /* Size of one copy. Reserved: currently declared as 0 and required to be 0. */
+    /* Program: reserved, must be 0. Kernel: arena kinds declare nonzero
+       required usable bytes per copy, not committed HBM or capacity budgets.
+       Streams and TASK_ARGS must be 0; task-argument byte limits are not
+       represented by this field. */
     uint64_t bytes_per_copy;
 } PipelineResource;
 
@@ -523,6 +538,139 @@ size_t get_host_dlopen_count(DeviceContextHandle ctx);
  */
 size_t get_run_stream_set_create_count(DeviceContextHandle ctx);
 
+/* ===========================================================================
+ * Kernel-mode lifecycle (SIMPLER_MODE_KERNEL)
+ *
+ * A context has one of two execution modes for its whole lifetime. Program
+ * mode (the default) is the historical exclusive-device path: simpler takes
+ * device ownership and drives runs through the prepared-run family above.
+ * Kernel mode borrows the caller's already-current device and caller-owned
+ * stream to enqueue one bounded asynchronous operator per launch: no device
+ * reset, no internal stream/device synchronize on the prepare/launch/close
+ * paths, zero allocation at launch, and no capture/model-state queries, so a
+ * launch is capturable by ACLGraph as an ordinary node.
+ *
+ * All five entry points below plus simpler_kernel_mode_ctx_control are part of the
+ * required dlsym surface: every host_runtime.so exports them, and variants
+ * without kernel-mode support export stubs that run the same structural and
+ * ordering validation before reporting PTO_RUNTIME_ERR_UNSUPPORTED. The fifth
+ * lifecycle entry is the existing finalize_device(): in kernel mode it
+ * releases only context-owned resources and never resets the device or
+ * finalizes ACL.
+ *
+ * These entries accept only POD structs, serialized blobs, and device/stream
+ * pointers — never framework objects. The caller stream is always an explicit
+ * parameter and is never stored beyond the call or destroyed by simpler.
+ * =========================================================================== */
+
+enum {
+    SIMPLER_KERNEL_CTX_CONTROL_ABI_VERSION = 1,
+};
+
+typedef enum SimplerKernelCtxAction {
+    /* Declare the context's execution mode and capacity intent. Accepted only
+       before simpler_init / simpler_kernel_mode_init; repeating it with the same
+       effective tuple is idempotent, changing the tuple is rejected. */
+    SIMPLER_KERNEL_CTX_CONFIGURE = 1,
+    /* Lock execution capacity. Accepted only on a context whose kernel-mode
+       CONFIGURE was accepted, after init once capacity is established; a
+       FREEZE without a kernel-mode CONFIGURE, or a second FREEZE, is
+       rejected. */
+    SIMPLER_KERNEL_CTX_FREEZE = 2,
+} SimplerKernelCtxAction;
+
+/**
+ * Versioned wire payload of simpler_kernel_mode_ctx_control. Validation is
+ * fail-closed: unknown version, wrong struct_size, out-of-enum action or
+ * mode, or any nonzero reserved word rejects the call before any state
+ * mutation. FREEZE carries no payload — its mode and capacity fields must be
+ * zero. Capacity fields are byte counts consumed by CONFIGURE only; zero
+ * selects the platform default for that region.
+ */
+typedef struct SimplerKernelCtxControl {
+    uint32_t abi_version; /* must equal SIMPLER_KERNEL_CTX_CONTROL_ABI_VERSION */
+    uint32_t struct_size; /* must equal sizeof(SimplerKernelCtxControl) */
+    uint32_t action;      /* SimplerKernelCtxAction */
+    uint32_t mode;        /* SimplerExecutionMode; CONFIGURE only */
+    uint64_t gm_heap_bytes;
+    uint64_t gm_sm_bytes;
+    uint64_t runtime_arena_bytes;
+    uint64_t reserved[4]; /* must be all zero */
+} SimplerKernelCtxControl;
+
+/**
+ * Configure or freeze one context's execution mode and capacity, before and
+ * independently of any launch. Returns 0 on success;
+ * PTO_RUNTIME_ERR_INTERNAL on structural validation failure,
+ * PTO_RUNTIME_ERR_INVALID_STATE on an out-of-order action, and
+ * PTO_RUNTIME_ERR_UNSUPPORTED for a structurally valid request this variant
+ * cannot honor (kernel mode, or a nonzero capacity intent).
+ */
+int simpler_kernel_mode_ctx_control(DeviceContextHandle ctx, const SimplerKernelCtxControl *control);
+
+/** Return nonzero when this runtime/context can execute kernel-mode launches. */
+int simpler_kernel_mode_supported(DeviceContextHandle ctx);
+
+/**
+ * Initialize a kernel-mode context on the caller's already-current device.
+ *
+ * Takes no device ownership: no device reset, no ACL init/finalize, and no
+ * stream or device synchronize on this path. Creates only context-owned
+ * persistent handles used by asynchronous preparation and launch. `config`
+ * is context-static; launches never mutate it. `context_generation` is a
+ * nonzero host-process-unique identity minted by the caller for sequential
+ * contexts; generation zero is invalid. Mutually exclusive with the
+ * program-mode simpler_init on the same context.
+ */
+int simpler_kernel_mode_init(
+    DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
+    const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,
+    const CallConfig *config, uint64_t context_generation
+);
+
+/**
+ * Stage one callable for kernel-mode launches, outside ACLGraph capture.
+ *
+ * `callable` points to a canonical ChipCallable image of exactly
+ * `callable_size` bytes; every flexible-array offset is validated before the
+ * image is hashed or uploaded. Preparation may allocate persistent state and
+ * enqueue asynchronous device work on `caller_stream`, but never synchronizes
+ * a stream or device — preparation errors surface through the caller's own
+ * warmup + synchronize. The stream is borrowed for this call only.
+ */
+int simpler_kernel_mode_prepare_callable(
+    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size, void *caller_stream
+);
+
+/**
+ * Enqueue one bounded asynchronous kernel-mode operator invocation.
+ *
+ * `args` points to a ChipStorageTaskArgs POD whose tensor addresses are
+ * caller-owned device addresses; they are passed through without ever being
+ * dereferenced on the host. The launch path performs no device malloc/free,
+ * no tensor staging, no synchronize, no capture-state query, and no
+ * stream-to-model attachment. A return of 0 means the sequence was enqueued;
+ * device execution may still be in flight and may still fail asynchronously.
+ */
+int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, const void *args, void *caller_stream);
+
 #ifdef __cplusplus
 }
+#endif
+
+#ifdef __cplusplus
+#include <type_traits>
+
+static_assert(
+    std::is_trivially_copyable_v<SimplerKernelCtxControl> && std::is_standard_layout_v<SimplerKernelCtxControl>
+);
+static_assert(offsetof(SimplerKernelCtxControl, abi_version) == 0);
+static_assert(offsetof(SimplerKernelCtxControl, struct_size) == 4);
+static_assert(offsetof(SimplerKernelCtxControl, action) == 8);
+static_assert(offsetof(SimplerKernelCtxControl, mode) == 12);
+static_assert(offsetof(SimplerKernelCtxControl, gm_heap_bytes) == 16);
+static_assert(offsetof(SimplerKernelCtxControl, gm_sm_bytes) == 24);
+static_assert(offsetof(SimplerKernelCtxControl, runtime_arena_bytes) == 32);
+static_assert(offsetof(SimplerKernelCtxControl, reserved) == 40);
+static_assert(sizeof(SimplerKernelCtxControl) == 72);
 #endif

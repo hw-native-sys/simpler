@@ -131,6 +131,7 @@ nav:
       - TPUSH/TPOP: tpush-tpop.md
   - Launch and linking:
       - AICPU Kernel Launch: aicpu-kernel-launch-mechanisms.md
+      - HBG Kernel Contract: host-build-graph-kernel-contract.md
       - Dynamic Linking: dynamic-linking.md
       - Callable Identity: callable-identity-registration.md
       - Callable IPC Registration: callable-ipc-dynamic-register.md

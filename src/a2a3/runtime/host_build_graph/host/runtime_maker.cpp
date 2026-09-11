@@ -58,6 +58,7 @@
 #include "host_build_graph/graph_execution.h"
 #include "host_build_graph/host_tensor_access.h"
 #include "host_build_graph/graph_host_state.h"
+#include "host_build_graph/host_graph_build.h"
 #include "host_build_graph/host_phase_trace.h"
 #include "host_build_graph/orchestrator.h"
 #include "host_build_graph/ready_queue_sizing.h"
@@ -76,6 +77,7 @@
 #include "common/unified_log.h"
 #include "host_log.h"
 #include "host/raii_scope_guard.h"
+#include "host/kernel_pipeline_contract.h"
 #include "utils/device_arena.h"
 #include "prepare_callable_common.h"
 
@@ -90,6 +92,11 @@ static_assert(
         PTO_RUNTIME_ERR_BASE < -PTO_RUNTIME_LATCHED_CODE_MAX,
     "host-side C API codes must stay below the negation of every latched device code"
 );
+
+extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *, PipelineContract *) {
+    // CallConfig alone cannot determine the graph-dependent heap and image sizes.
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
 
 extern "C" const PipelineContract *get_pipeline_contract(void) {
     // Host orchestration materializes this run's own graph into the image it
@@ -405,19 +412,9 @@ bool create_orch_so_tempfile(const uint8_t *data, size_t size, std::string *out_
     return true;
 }
 
-// The orchestration .so exports these (submit_task form).
-typedef void (*OrchestrationEntryFunc)(const ChipTaskArgs &);
-typedef void (*OrchestrationBindFunc)(RuntimeContext *);
-
-// Resolved orchestration .so entry points. register_callable_impl allocates one
-// of these (the entry, plus the .so's own framework_bind_runtime, which sets
-// the .so-private g_current_runtime its inline rt_submit_* read) and stores its
-// pointer in CallableArtifacts::host_orch_func_ptr. Owned for the callable's
-// lifetime alongside host_dlopen_handle.
-struct HostOrchEntryPoints {
-    OrchestrationEntryFunc entry{nullptr};
-    OrchestrationBindFunc bind{nullptr};
-};
+using OrchestrationEntryFunc = void (*)(const ChipTaskArgs &);
+using OrchestrationBindFunc = void (*)(RuntimeContext *);
+using hbg::HostOrchEntryPoints;
 
 // host_build_graph host-orch: the orchestrator builds the task graph in a host
 // shared-memory mirror, and every cross-task reference it stores is an offset or
@@ -491,6 +488,9 @@ bool bind_graph_definitions(
             return false;
         }
         staging = static_cast<std::byte *>(staging_addr);
+        // The owner may have moved staging. Publish its new base even if a
+        // later copy fails, so retry and repeated upload retain a valid source.
+        if (!graph_host_rebind_staging(graph_state, staging, block_bytes)) return false;
         for (const auto &[key, object] : packed) {
             std::byte *base = staging + object.object_offset;
             std::byte *image = base + sizeof(GraphDefinitionHeader);
@@ -601,11 +601,14 @@ struct GraphHostStateBinding {
     OrchestratorState &orchestrator;
 };
 
-int32_t run_host_orchestration(
-    Runtime *runtime, const HostApi *api, HostTensorAccessor &tensor_access, RuntimeContext *rt,
-    DeviceArena &host_arena, const RuntimeArenaLayout &layout, uint64_t sm_size, uint64_t task_capacity,
-    void *host_orch_func_ptr, const ChipTaskArgs &orch_l2
+}  // namespace
+
+int32_t hbg::build_graph(
+    Runtime *runtime, HostTensorAccessor &tensor_access, RuntimeContext *rt, void *host_sm, uint64_t sm_size,
+    uint64_t task_capacity, const GraphDefinitionArena &definition_arena, const HostOrchEntryPoints &entry_points,
+    const ChipTaskArgs &args, GraphBuild &build
 ) {
+    build.ready = false;
     // The dep_gen graph belongs to the orchestration that is about to run.
     dep_gen_host_graph_begin_capture();
 
@@ -614,32 +617,18 @@ int32_t run_host_orchestration(
     // only the fixed-size header here; the per-slot segments are initialized in
     // orch::prepare_task and shipped bounded to total_tasks below.
     const sm_layout::SegmentOffsets sm_segs = sm_layout::segment_offsets(task_capacity);
-    // The mirror belongs to the runner, one per pipeline slot, and lives past the
-    // bind that writes it: at the configured task capacity it is tens of MB, far
-    // above the block size glibc recycles, so a per-bind buffer costs an mmap and
-    // an munmap per bind. Nothing carries over inside it — the header is cleared
-    // here, and the prefix of each segment that ships is one this bind wrote. The
-    // layout needs CHIP_ALIGN_SIZE: every segment offset is a multiple of it and
-    // ChipTaskSlotState is alignas(64).
-    void *host_sm = nullptr;
-    if (api->acquire_sm_mirror(static_cast<size_t>(sm_size), CHIP_ALIGN_SIZE, &host_sm) != 0 || host_sm == nullptr) {
-        LOG_ERROR("host-orch: host SM mirror of %" PRIu64 " bytes unavailable", sm_size);
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
     std::memset(host_sm, 0, sm_segs.storage);
 
     // Re-point the orchestrator half at the host SM (scheduler keeps device SM).
-    // Host-owned and destroyed with this frame, so rt->orchestrator is dropped on
-    // every exit — it must never outlive the object it names.
-    OrchestratorState orchestrator;
+    // The result owns this state; the runtime binding is active only during build.
+    OrchestratorState &orchestrator = build.orchestrator;
     rt->orchestrator = &orchestrator;
     RAIIScopeGuard orchestrator_binding([rt]() {
         rt->orchestrator = nullptr;
     });
     // The graph heap is allocated out of the HEAP_VIRTUAL_BASE window: its device
-    // region is committed below, once this pass has revealed how many bytes it
-    // actually needs, and compact_live_image moves every address the orchestrator
-    // wrote onto the real base before the image travels.
+    // region is committed by upload_program_graph at the measured size. compact_live_image
+    // moves every address the orchestrator wrote onto the real base before upload.
     if (!orchestrator.init(
             host_sm, reinterpret_cast<void *>(HEAP_VIRTUAL_BASE), HEAP_VIRTUAL_CAPACITY, task_capacity
         )) {
@@ -648,32 +637,14 @@ int32_t run_host_orchestration(
     }
 
     // Initialize the host SM header (ring flow control) so submit_task can run.
-    SharedMemoryHandle host_sm_handle;
+    SharedMemoryHandle &host_sm_handle = build.sm_handle;
     if (!host_sm_handle.init(host_sm, sm_size, task_capacity)) {
         LOG_ERROR("host-orch: host SM init failed");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
-    // The recorders build their Definition objects straight into the retained
-    // staging block, so it is claimed before orchestration starts and at whatever
-    // capacity the previous bind left behind — the run's real total is not known
-    // until every recording has ended. What does not fit is built in its own
-    // buffer and copied by the upload, which then grows the block, so the arena
-    // reaches a run's high-water mark within one bind of needing it.
-    GraphDefinitionArena definition_arena{};
-    definition_arena.object_prefix_bytes = sizeof(GraphDefinitionHeader);
-    definition_arena.object_align = GRAPH_DEFINITION_OBJECT_ALIGN;
-    {
-        void *staging = nullptr;
-        size_t staging_bytes = 0;
-        api->get_graph_definition_staging(&staging, &staging_bytes);
-        if (staging != nullptr && reinterpret_cast<uintptr_t>(staging) % definition_arena.object_align == 0) {
-            definition_arena.base = static_cast<std::byte *>(staging);
-            definition_arena.capacity = staging_bytes;
-        }
-    }
-
-    GraphHostStatePtr graph_state = make_graph_host_state(definition_arena);
+    build.graph_state = make_graph_host_state(definition_arena);
+    GraphHostStatePtr &graph_state = build.graph_state;
     if (!graph_state) {
         LOG_ERROR("host-orch: failed to allocate Graph host state");
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -699,23 +670,22 @@ int32_t run_host_orchestration(
     // context_lens/block_table) whether or not the platform maps device memory
     // into the host address space.
 
-    const auto *entry_points = reinterpret_cast<const HostOrchEntryPoints *>(host_orch_func_ptr);
-    if (entry_points->bind == nullptr) {
+    if (entry_points.bind == nullptr) {
         LOG_ERROR("host-orch: orch .so framework_bind_runtime was not resolved");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    rt->active_callable_hash = reinterpret_cast<uint64_t>(entry_points->entry);
+    rt->active_callable_hash = reinterpret_cast<uint64_t>(entry_points.entry);
     rt->tensor_access = &tensor_access;
     // Binds the orchestration .so's own framework_current_runtime, which its
     // inline rt_submit_* read. The host library links a same-named copy from
     // orchestration/common.cpp, but nothing outside the .so includes
     // orchestration_api.h, so nothing reads that one — rt_scope_* and
     // rt_orchestration_done take the runtime as an argument.
-    entry_points->bind(rt);
+    entry_points.bind(rt);
 
     const BindPhaseMark orch_phase = bind_phase_begin();
     rt_scope_begin(rt);
-    entry_points->entry(orch_l2);
+    entry_points.entry(args);
     rt_scope_end(rt);
     rt_orchestration_done(rt);
 #if SIMPLER_ORCH_PROFILING
@@ -781,6 +751,66 @@ int32_t run_host_orchestration(
         ready_queue_populations.add_task(slot.active_mask, slot.task_attrs, slot.task_kind);
     }
 
+    const uint64_t nt = static_cast<uint64_t>(total_tasks);
+    // What this bind actually put in the pools. The orchestrator's cursors are the
+    // exact populated extent of each one — no scan of the mirror is needed, and the
+    // image ships that much rather than the worst case the mirror is dimensioned for.
+    const OrchestratorState &orch_state = orchestrator;
+    const sm_layout::BindUsage bind_usage{
+        nt,
+        static_cast<uint64_t>(orch_state.fanin_pool_cursor),
+        static_cast<uint64_t>(orch_state.tensor_pool_cursor),
+        static_cast<uint64_t>(orch_state.scalar_pool_cursor),
+    };
+    const uint64_t image_bytes = sm_layout::segment_offsets(sm_layout::image_extents(bind_usage)).end;
+    const uint64_t heap_bytes = CHIP_ALIGN_UP(
+        std::max<uint64_t>(orchestrator.task_allocator.heap_used_bytes(), CHIP_ALIGN_SIZE),
+        DeviceArena::kDefaultBaseAlign
+    );
+    build.host_sm = host_sm;
+    build.task_capacity = task_capacity;
+    build.total_tasks = total_tasks;
+    build.ready_queue_populations = ready_queue_populations;
+    build.usage = bind_usage;
+    build.image_bytes = image_bytes;
+    build.heap_bytes = heap_bytes;
+    build.ready = true;
+    return total_tasks;
+}
+
+int32_t hbg::get_graph_resource_requirements(
+    const GraphBuild &build, const RuntimeArenaLayout &layout, GraphResourceRequirements &requirements
+) {
+    if (!build.ready || !build.graph_state || build.total_tasks < 0) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (layout.off_copied_begin > layout.off_copied_end || build.heap_bytes == 0 || build.image_bytes == 0) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (build.image_bytes > UINT64_MAX - layout.off_copied_end) return PTO_RUNTIME_ERR_CAPACITY_EXCEEDED;
+    GraphResourceRequirements next{};
+    next.gm_heap_bytes = build.heap_bytes;
+    next.runtime_arena_bytes = layout.off_copied_end + build.image_bytes;
+    if (!graph_definition_block_bytes(
+            graph_host_definitions(*build.graph_state), graph_host_arena_used(*build.graph_state),
+            next.graph_definition_bytes
+        )) {
+        return PTO_RUNTIME_ERR_CAPACITY_EXCEEDED;
+    }
+    uint64_t total = 0;
+    if (!next.required_bytes(total)) return PTO_RUNTIME_ERR_CAPACITY_EXCEEDED;
+    requirements = next;
+    return 0;
+}
+
+int32_t hbg::upload_program_graph(
+    Runtime *runtime, const HostApi *api, RuntimeContext *rt, DeviceArena &host_arena, const RuntimeArenaLayout &layout,
+    GraphBuild &build
+) {
+    if (!build.ready) return PTO_RUNTIME_ERR_INVALID_STATE;
+    GraphHostStatePtr &graph_state = build.graph_state;
+    void *host_sm = build.host_sm;
+    const uint64_t task_capacity = build.task_capacity;
+    const int32_t total_tasks = build.total_tasks;
+    ReadyQueuePopulations ready_queue_populations = build.ready_queue_populations;
     // Upload each distinct Definition as its own retained device object and bind
     // every outer Graph task to it. Per-invocation data already lives in that
     // task's payload regions and is copied with the shared-memory image below.
@@ -838,21 +868,12 @@ int32_t run_host_orchestration(
     // with the same pitch, which is sound because a task id is its own slot index:
     // every id is below total_tasks and indexes the image directly.
     const uint64_t nt = static_cast<uint64_t>(total_tasks);
-    // What this bind actually put in the pools. The orchestrator's cursors are the
-    // exact populated extent of each one — no scan of the mirror is needed, and the
-    // image ships that much rather than the worst case the mirror is dimensioned for.
-    const OrchestratorState &orch_state = orchestrator;
-    const sm_layout::BindUsage bind_usage{
-        nt,
-        static_cast<uint64_t>(orch_state.fanin_pool_cursor),
-        static_cast<uint64_t>(orch_state.tensor_pool_cursor),
-        static_cast<uint64_t>(orch_state.scalar_pool_cursor),
-    };
-    const uint64_t image_bytes = sm_layout::segment_offsets(sm_layout::image_extents(bind_usage)).end;
+    const sm_layout::BindUsage &bind_usage = build.usage;
+    const uint64_t image_bytes = build.image_bytes;
     runtime->sm_image_bytes = image_bytes;
 
-    // Only now are both sizes known, so this is where the two device regions are
-    // committed: the arena up to its shared-memory tail, and the graph heap to the
+    // The build measured both sizes. Upload commits the arena up to its
+    // shared-memory tail and the graph heap to the
     // bytes orchestration actually handed out. setup_static_arena commits per
     // region and short-circuits a request an existing one already covers, so a
     // repeated workload pays for neither twice and the heap is grow-only across a
@@ -870,10 +891,7 @@ int32_t run_host_orchestration(
     // same boundary it starts on, so an access at the tail of the last packed buffer
     // stays inside the region even when its width exceeds the bytes that buffer
     // asked for.
-    const uint64_t heap_bytes = CHIP_ALIGN_UP(
-        std::max<uint64_t>(orchestrator.task_allocator.heap_used_bytes(), CHIP_ALIGN_SIZE),
-        DeviceArena::kDefaultBaseAlign
-    );
+    const uint64_t heap_bytes = build.heap_bytes;
     if (api->setup_static_arena(heap_bytes, /*gm_sm_size=*/0, device_arena_bytes) != 0) {
         LOG_ERROR(
             "host-orch: failed to commit %" PRIu64 " bytes of graph heap + %" PRIu64 " bytes of device runtime arena",
@@ -975,6 +993,53 @@ int32_t run_host_orchestration(
         record_bind_phase(HostPhaseKind::BindArenaH2d, h2d_phase, attrs, upload_bytes);
     }
     return total_tasks;
+}
+
+namespace {
+
+int32_t run_host_orchestration(
+    Runtime *runtime, const HostApi *api, HostTensorAccessor &tensor_access, RuntimeContext *rt,
+    DeviceArena &host_arena, const RuntimeArenaLayout &layout, uint64_t sm_size, uint64_t task_capacity,
+    void *host_orch_func_ptr, const ChipTaskArgs &orch_l2
+) {
+    // The mirror belongs to the runner, one per pipeline slot, and lives past the
+    // bind that writes it: at the configured task capacity it is tens of MB, far
+    // above the block size glibc recycles, so a per-bind buffer costs an mmap and
+    // an munmap per bind. Nothing carries over inside it — the header is cleared
+    // here, and the prefix of each segment that ships is one this bind wrote. The
+    // layout needs CHIP_ALIGN_SIZE: every segment offset is a multiple of it and
+    // ChipTaskSlotState is alignas(64).
+    void *host_sm = nullptr;
+    if (api->acquire_sm_mirror(static_cast<size_t>(sm_size), CHIP_ALIGN_SIZE, &host_sm) != 0 || host_sm == nullptr) {
+        LOG_ERROR("host-orch: host SM mirror of %" PRIu64 " bytes unavailable", sm_size);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    // The recorders build their Definition objects straight into the retained
+    // staging block, so it is claimed before orchestration starts and at whatever
+    // capacity the previous bind left behind — the run's real total is not known
+    // until every recording has ended. What does not fit is built in its own
+    // buffer and copied by the upload, which then grows the block, so the arena
+    // reaches a run's high-water mark within one bind of needing it.
+    GraphDefinitionArena definition_arena{};
+    definition_arena.object_prefix_bytes = sizeof(GraphDefinitionHeader);
+    definition_arena.object_align = GRAPH_DEFINITION_OBJECT_ALIGN;
+    {
+        void *staging = nullptr;
+        size_t staging_bytes = 0;
+        api->get_graph_definition_staging(&staging, &staging_bytes);
+        if (staging != nullptr && reinterpret_cast<uintptr_t>(staging) % definition_arena.object_align == 0) {
+            definition_arena.base = static_cast<std::byte *>(staging);
+            definition_arena.capacity = staging_bytes;
+        }
+    }
+
+    hbg::GraphBuild build;
+    const auto &entry_points = *static_cast<const HostOrchEntryPoints *>(host_orch_func_ptr);
+    const int32_t status = hbg::build_graph(
+        runtime, tensor_access, rt, host_sm, sm_size, task_capacity, definition_arena, entry_points, orch_l2, build
+    );
+    if (status < 0) return status;
+    return hbg::upload_program_graph(runtime, api, rt, host_arena, layout, build);
 }
 
 }  // namespace

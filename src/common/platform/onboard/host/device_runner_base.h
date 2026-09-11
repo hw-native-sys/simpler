@@ -65,6 +65,7 @@
 #include "aicpu_loader/host/load_aicpu_op.h"
 #include "host/chip_swimlane_collector.h"
 #include "host/host_phase_records.h"
+#include "host/kernel_ctx_control.h"
 #include "host/memory_allocator.h"
 #include "host/pmu_collector.h"
 #include "host/runtime_timeout_config.h"
@@ -133,6 +134,26 @@ public:
      * distinct buffers; tests read this to prove the split is real.
      */
     uint64_t retained_temp_addr(uint32_t slot_id) const;
+
+    /** Per-context state machine behind simpler_kernel_mode_ctx_control. */
+    KernelCtxControlState &kernel_ctx_control() { return kernel_ctx_control_; }
+
+    /** True once simpler_init has bound this runner to a device. */
+    bool device_bound() const { return device_id_ >= 0; }
+
+    /**
+     * True once setup_static_arena has committed at least one pooled region on
+     * any bank — the FREEZE precondition that execution capacity exists.
+     */
+    bool has_committed_arena_region() const {
+        for (const auto &bank : arena_banks_) {
+            if (bank == nullptr) continue;
+            if (bank->gm_heap.is_committed() || bank->gm_sm.is_committed() || bank->runtime_pool.is_committed()) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     /** Allocate / free / copy on the per-Worker `MemoryAllocator` + CANN runtime. */
     void *allocate_tensor(std::size_t bytes);
@@ -1179,6 +1200,9 @@ protected:
     // `device_id_` is written once by simpler_init and is immutable while
     // native prepare, execution, and collector threads attach to the runner.
     int device_id_{-1};
+    // Execution-mode / capacity-freeze declaration for this context, mutated
+    // only through simpler_kernel_mode_ctx_control.
+    KernelCtxControlState kernel_ctx_control_;
     int block_dim_{0};
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
     int worker_count_{0};  // Stored for print_handshake_results
