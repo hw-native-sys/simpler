@@ -559,7 +559,7 @@ TEST(KernelPipelineBuilder, InvalidSizesLeaveOutputUntouched) {
     std::array<unsigned char, sizeof(output)> original{};
     std::memcpy(original.data(), &output, sizeof(output));
     auto reject = [&](const CallConfig *config) {
-        EXPECT_EQ(build_kernel_pipeline_contract_impl(config, &output), PTO_RUNTIME_ERR_INTERNAL);
+        EXPECT_EQ(build_kernel_pipeline_contract_impl(config, &output), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
         EXPECT_EQ(std::memcmp(&output, original.data(), sizeof(output)), 0);
     };
     reject(nullptr);

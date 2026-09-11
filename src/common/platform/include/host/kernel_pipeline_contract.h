@@ -16,4 +16,6 @@
 // Internal host-runtime hook, not a dlsym lifecycle API. Input is borrowed and
 // immutable during the call; output is caller-exclusive and unchanged on error.
 // No device resources are acquired or retained. Separate calls may run concurrently.
+// TMR rejects invalid config with INVALID_ARGUMENT and a null output or invalid
+// generated contract with INTERNAL. Unsupported implementations return UNSUPPORTED.
 extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *config, PipelineContract *out);
