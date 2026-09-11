@@ -18,6 +18,7 @@
 // calls, so an unwanted re-base is observable here with no device present.
 
 #include <cstddef>
+#include <new>
 
 #include <gtest/gtest.h>
 
@@ -30,6 +31,21 @@ constexpr size_t kGmHeapBytes = 64 * 1024;
 constexpr size_t kGmSmBytes = 16 * 1024;
 constexpr size_t kRuntimePoolBytes = 8 * 1024;
 
+struct FailingAllocator {
+    int calls{0};
+    int fail_on{0};
+    bool throw_on_failure{false};
+
+    static void *allocate(void *context, size_t bytes) {
+        auto &self = *static_cast<FailingAllocator *>(context);
+        if (++self.calls == self.fail_on) {
+            if (self.throw_on_failure) throw std::bad_alloc();
+            return nullptr;
+        }
+        return DeviceArena::default_alloc(nullptr, bytes);
+    }
+};
+
 // One bank's regions plus the sizes it remembers for them: the state a runner
 // keeps between calls.
 struct Bank {
@@ -39,6 +55,12 @@ struct Bank {
     size_t cached_gm_heap_size{0};
     size_t cached_gm_sm_size{0};
     size_t cached_runtime_pool_size{0};
+
+    Bank() = default;
+    explicit Bank(FailingAllocator &allocator) :
+        gm_heap(FailingAllocator::allocate, DeviceArena::default_free, &allocator),
+        gm_sm(FailingAllocator::allocate, DeviceArena::default_free, &allocator),
+        runtime_pool(FailingAllocator::allocate, DeviceArena::default_free, &allocator) {}
 
     StaticArenaBankRequest request(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_pool_size) {
         return StaticArenaBankRequest{
@@ -237,4 +259,56 @@ TEST(StaticArenaBankProgramMode, ZeroRequestReleasesACommittedRegion) {
     EXPECT_TRUE(outcome.bases_changed);
     EXPECT_FALSE(bank.runtime_pool.is_committed());
     EXPECT_EQ(bank.cached_runtime_pool_size, 0u);
+}
+
+TEST(StaticArenaBankKernelMode, RefusalPrecedesEveryNewAllocation) {
+    Bank bank;
+    ASSERT_EQ(bank.commit(0, kGmSmBytes, kRuntimePoolBytes, true).rc, 0);
+    const auto pinned = bases_of(bank);
+    const auto allocs = bank.alloc_calls();
+    const auto frees = bank.free_calls();
+    const auto refused = bank.commit(kGmHeapBytes, kGmSmBytes + 1, kRuntimePoolBytes, true);
+    EXPECT_EQ(refused.rc, PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_FALSE(refused.bases_changed);
+    EXPECT_TRUE(bases_of(bank) == pinned);
+    EXPECT_EQ(bank.alloc_calls(), allocs);
+    EXPECT_EQ(bank.free_calls(), frees);
+    EXPECT_EQ(bank.cached_gm_heap_size, 0u);
+}
+
+TEST(StaticArenaBankKernelMode, AllocationFailureRollsBackOnlyNewRegions) {
+    for (bool previously_committed : {false, true}) {
+        for (bool throw_on_failure : {false, true}) {
+            FailingAllocator allocator;
+            Bank bank(allocator);
+            const size_t old_heap = previously_committed ? kGmHeapBytes : 0;
+            ASSERT_EQ(bank.commit(old_heap, 0, 0, true).rc, 0);
+            const auto pinned = bases_of(bank);
+            allocator.fail_on = allocator.calls + (previously_committed ? 2 : 3);
+            allocator.throw_on_failure = throw_on_failure;
+            const auto failed = bank.commit(kGmHeapBytes, kGmSmBytes, kRuntimePoolBytes, true);
+            EXPECT_EQ(failed.rc, PTO_RUNTIME_ERR_INTERNAL);
+            EXPECT_FALSE(failed.bases_changed);
+            EXPECT_TRUE(bases_of(bank) == pinned);
+            EXPECT_EQ(bank.cached_gm_heap_size, old_heap);
+            EXPECT_EQ(bank.cached_gm_sm_size, 0u);
+            EXPECT_EQ(bank.cached_runtime_pool_size, 0u);
+            allocator.fail_on = 0;
+            EXPECT_EQ(bank.commit(kGmHeapBytes, kGmSmBytes, kRuntimePoolBytes, true).rc, 0);
+            if (previously_committed) EXPECT_EQ(bank.gm_heap.base(), pinned.gm_heap);
+        }
+    }
+}
+
+TEST(StaticArenaBankProgramMode, AllocationFailureStillReleasesCommittedPeers) {
+    FailingAllocator allocator;
+    Bank bank(allocator);
+    ASSERT_EQ(bank.commit(kGmHeapBytes, kGmSmBytes, 0, false).rc, 0);
+    allocator.fail_on = allocator.calls + 1;
+    EXPECT_EQ(bank.commit(kGmHeapBytes, kGmSmBytes, kRuntimePoolBytes, false).rc, PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(bank.gm_heap.base(), nullptr);
+    EXPECT_EQ(bank.gm_sm.base(), nullptr);
+    EXPECT_EQ(bank.runtime_pool.base(), nullptr);
+    EXPECT_EQ(bank.cached_gm_heap_size, 0u);
+    EXPECT_EQ(bank.cached_gm_sm_size, 0u);
 }

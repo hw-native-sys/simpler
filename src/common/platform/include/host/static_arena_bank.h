@@ -42,9 +42,9 @@ struct StaticArenaBankRequest {
 };
 
 /**
- * `rc` is 0 or PTO_RUNTIME_ERR_INTERNAL. `bases_changed` is true when any
- * region was released or (re)committed, so the pooled base addresses handed
- * out earlier are no longer current and any image keyed on them is stale.
+ * `rc` is 0 or PTO_RUNTIME_ERR_INTERNAL. `bases_changed` tells the caller to
+ * refresh images keyed on the bank's published bases. Rolling back only new,
+ * unpublished kernel regions leaves previously published bases valid.
  */
 struct StaticArenaBankOutcome {
     int rc{0};
@@ -63,33 +63,36 @@ struct StaticArenaBankOutcome {
  * or release a committed region is therefore an internal invariant break, not
  * caller-configurable behavior, and is refused with PTO_RUNTIME_ERR_INTERNAL.
  *
- * The refusal is the one failure that leaves the bank exactly as it was. Every
- * other failure rolls the whole bank back — releasing each region and zeroing
- * its cached size, peers from earlier successful calls included, so a caller
- * that retries starts from the post-construction state rather than a partial
- * layout. Rolling a refusal back would free the very base addresses the rule
- * exists to hold still, so the two failures cannot share one exit.
+ * Kernel requests are preflighted before any allocation. Allocation failure
+ * rolls back only this call's new regions, preserving every previously held
+ * base and its image cache. Program mode retains whole-bank rollback.
  */
 inline StaticArenaBankOutcome commit_static_arena_bank(const StaticArenaBankRequest &request, bool kernel_mode) {
     const StaticArenaRegionRequest regions[] = {request.gm_heap, request.gm_sm, request.runtime_pool};
     StaticArenaBankOutcome outcome;
-    bool capacity_refused = false;
+    const bool pinned[] = {
+        request.gm_heap.arena->is_committed(), request.gm_sm.arena->is_committed(),
+        request.runtime_pool.arena->is_committed()
+    };
+
+    if (kernel_mode) {
+        for (const auto &region : regions) {
+            const size_t cached = *region.cached_size;
+            const size_t requested = region.requested_size;
+            if (region.arena->is_committed() && (requested == 0 ? cached != 0 : requested > cached)) {
+                LOG_ERROR(
+                    "setup_static_arena: kernel mode forbids %s a committed region (cached %zu, requested %zu)",
+                    requested == 0 ? "releasing" : "growing", cached, requested
+                );
+                return {PTO_RUNTIME_ERR_INTERNAL, false};
+            }
+        }
+    }
 
     for (const StaticArenaRegionRequest &region : regions) {
         DeviceArena &arena = *region.arena;
         size_t &cached_size = *region.cached_size;
         const size_t requested_size = region.requested_size;
-
-        if (kernel_mode && arena.is_committed() &&
-            (requested_size == 0 ? cached_size != 0 : requested_size > cached_size)) {
-            LOG_ERROR(
-                "setup_static_arena: kernel mode forbids %s a committed region (cached %zu, requested %zu)",
-                requested_size == 0 ? "releasing" : "growing", cached_size, requested_size
-            );
-            capacity_refused = true;
-            outcome.rc = PTO_RUNTIME_ERR_INTERNAL;
-            break;
-        }
         if (requested_size == 0) {
             // hbg's runtime_arena path: caller passed 0 and never reserved a
             // region. Leave the arena uncommitted; acquire_pooled_* will
@@ -108,7 +111,13 @@ inline StaticArenaBankOutcome commit_static_arena_bank(const StaticArenaBankRequ
         cached_size = 0;
         outcome.bases_changed = true;
         arena.reserve(requested_size, DeviceArena::kDefaultBaseAlign);
-        if (arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
+        void *base = nullptr;
+        try {
+            base = arena.commit(DeviceArena::kDefaultBaseAlign);
+        } catch (...) {
+            if (!kernel_mode) throw;
+        }
+        if (base == nullptr) {
             // commit() failure leaves committed_=false, so the rollback below
             // skips this arena's release branch. release() is idempotent on a
             // never-committed arena (zeroes cursor_).
@@ -119,12 +128,16 @@ inline StaticArenaBankOutcome commit_static_arena_bank(const StaticArenaBankRequ
         cached_size = requested_size;
     }
 
-    if (outcome.rc != 0 && !capacity_refused) {
-        for (const StaticArenaRegionRequest &region : regions) {
+    if (outcome.rc != 0) {
+        for (size_t i = 0; i < 3; ++i) {
+            if (kernel_mode && pinned[i]) continue;
+            const auto &region = regions[i];
             region.arena->release();
             *region.cached_size = 0;
         }
-        outcome.bases_changed = true;
+        // Rolled-back regions were never published. Existing kernel image
+        // caches still refer to the same bases; only program rollback drops them.
+        outcome.bases_changed = !kernel_mode;
     }
     return outcome;
 }
