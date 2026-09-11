@@ -91,7 +91,7 @@ __attribute__((visibility("default"))) void build_paged_attention_graph(const Ch
     uint64_t block_size = orch_args.tensor(1).ref().shapes[1];
     uint64_t block_num = orch_args.tensor(3).ref().shapes[1];
 
-    uint64_t scale_value = orch_args.scalar(0);
+    uint64_t scale_value = orch_args.scalar<uint64_t>(0);
 
     uint64_t q_head_num = num_heads;
     uint64_t q_tile = std::min(num_heads, static_cast<uint64_t>(128));

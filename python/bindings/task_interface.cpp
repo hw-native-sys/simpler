@@ -1666,6 +1666,67 @@ nb::tuple dims_tuple(const uint32_t *dims, uint32_t ndims) {
     return nb::tuple(out);
 }
 
+// `ctypes._SimpleCData` is the common base of every ctypes scalar. Cached after the first
+// lookup: importing `ctypes` and walking its attributes on every add_scalar call would cost far
+// more than the check it guards.
+PyObject *ctypes_simple_cdata_type() {
+    static PyObject *cached = nb::module_::import_("ctypes").attr("_SimpleCData").inc_ref().ptr();
+    return cached;
+}
+
+// A ctypes scalar's buffer format is a byte-order prefix plus one `struct` format character
+// ("<I", ">d"). Both halves decide whether it can encode, which is why the buffer's format
+// answers this rather than the type's `_type_`: `_type_` carries the character alone.
+//
+// **The prefix is the scalar's actual byte order**, and ctypes spells it out even for a native
+// type, so admission is a match against the host's. `ctypes.c_uint32.__ctype_be__` is an
+// ordinary `_SimpleCData` subclass whose `_type_` is `'I'`, indistinguishable from `c_uint32`,
+// but whose format is `">I"` and whose bytes for the value 1 are `00 00 00 01`. Copying those
+// raw would store `0x01000000` where `to_u64(uint32_t{1})` is `0x1`. A reversed-order scalar has
+// no native C++ counterpart to agree with, so it is refused rather than byte-swapped into one.
+//
+// **The character decides whether the value is a number at all**: the integer widths, `f`, `d`
+// and `?` encode. The pointer and character types (`P`, `z`, `Z`, `c`, `u`) and long double
+// (`g`) do not — they name no number a slot can carry, and encoding a host pointer into a
+// device-bound slot is a defect wherever it happens. A subclass inherits its base's format, so
+// it is admitted with the base, which dispatching on the type's `__name__` would not do.
+enum class CtypesFormat { Encodable, ForeignByteOrder, NotNumeric };
+
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+constexpr char NATIVE_BYTE_ORDER = '>';
+#else
+constexpr char NATIVE_BYTE_ORDER = '<';
+#endif
+
+CtypesFormat classify_ctypes_format(const char *format) {
+    // ctypes always emits the prefix, so a format without one did not come from one of its
+    // scalars and is refused rather than guessed at.
+    if (format == nullptr || (format[0] != '<' && format[0] != '>')) {
+        return CtypesFormat::NotNumeric;
+    }
+    if (format[1] == '\0' || format[2] != '\0') {
+        return CtypesFormat::NotNumeric;
+    }
+    switch (format[1]) {
+    case 'b':
+    case 'B':
+    case 'h':
+    case 'H':
+    case 'i':
+    case 'I':
+    case 'l':
+    case 'L':
+    case 'q':
+    case 'Q':
+    case 'f':
+    case 'd':
+    case '?':
+        return format[0] == NATIVE_BYTE_ORDER ? CtypesFormat::Encodable : CtypesFormat::ForeignByteOrder;
+    default:
+        return CtypesFormat::NotNumeric;
+    }
+}
+
 // Resolve one wire tensor onto a local base and build the address-bearing device POD.
 // `resolved` maps CanonicalIdentity -> (local_base, address_space); the caller populates it by
 // materializing each embedded descriptor.
@@ -1690,6 +1751,129 @@ ChipTensor materialize_one(const Tensor &r, nb::dict resolved) {
         reinterpret_cast<void *>(static_cast<uintptr_t>(base + r.byte_offset)), r.shapes, r.strides, r.ndims, r.dtype,
         static_cast<AddressSpace>(addr_space)
     );
+}
+
+// Read an exact PyLong as the 64-bit pattern a slot stores, accepting the whole two's-complement
+// range: signed first, then unsigned for anything above INT64_MAX. Out of that range is an error
+// rather than a silent truncation to the low 64 bits.
+uint64_t encode_python_int(PyObject *long_ptr) {
+    int64_t signed_value = PyLong_AsLongLong(long_ptr);
+    if (signed_value == -1 && PyErr_Occurred()) {
+        PyErr_Clear();
+        unsigned long long unsigned_value = PyLong_AsUnsignedLongLong(long_ptr);
+        if (PyErr_Occurred()) {
+            PyErr_Clear();
+            throw std::overflow_error("add_scalar: integer value out of 64-bit range");
+        }
+        return static_cast<uint64_t>(unsigned_value);
+    }
+    return static_cast<uint64_t>(signed_value);
+}
+
+// The one place a Python scalar becomes the uint64_t a wire slot stores. Its output must match
+// C++ `to_u64` bit for bit for the same value, so that a slot written from Python and one written
+// from orchestration read back identically.
+//
+// Three encodings, in the order checked:
+//
+// - A Python int is read as a 64-bit quantity, which is what `to_u64(int64_t)` / `to_u64(uint64_t)`
+//   also produce. PyLong_CheckExact short-circuits the common case; the general branch further
+//   down goes through __index__ (PyIndex_Check), not PyLong_Check, so bool, IntEnum members, and
+//   numpy integer scalars are admitted -- none of which are actual `int` instances -- while every
+//   float type, numpy's included, is still rejected, since none of them define __index__.
+// - A ctypes scalar is read through the buffer protocol and **zero-extended** into the slot, which
+//   is exactly what to_u64's union does. Reading `.value` instead would sign-extend a narrow
+//   signed type (c_int8(-1) -> 0xFFFF'FFFF'FFFF'FFFF where to_u64(int8_t{-1}) is 0xFF), and
+//   dispatching on the type's __name__ to find the float types would miss their subclasses and
+//   silently narrow a c_double subclass to single precision. One buffer read has neither problem,
+//   and its format answers admission and byte order in the same step -- see classify_ctypes_format.
+// - A native Python float narrows to IEEE-754 single precision, matching to_u64(float). Out of
+//   single-precision range is an error, not an infinity: a finite input that narrowed to inf would
+//   be stored as a different number. This is the one encoding that cannot align with its C++
+//   counterpart by construction, because a Python float carries no width: to_u64(1.5) in
+//   orchestration is a double. ctypes.c_double is the spelling for full precision, and the
+//   docstrings say so.
+uint64_t encode_scalar(nb::handle value) {
+    PyObject *ptr = value.ptr();
+
+    if (PyLong_CheckExact(ptr)) {
+        return encode_python_int(ptr);
+    }
+
+    // PyObject_IsInstance answers -1 on error, which is truthy -- test for it explicitly rather
+    // than walking into the ctypes branch with a Python exception already set.
+    int is_ctypes = PyObject_IsInstance(ptr, ctypes_simple_cdata_type());
+    if (is_ctypes < 0) {
+        throw nb::python_error();
+    }
+    if (is_ctypes) {
+        // One buffer request answers both questions: its format decides admission and byte
+        // order, its length decides the width. Taking the width from the buffer rather than
+        // inferring it from the format character is what keeps a subclass whose format
+        // disagrees with its layout from reading past its own storage.
+        Py_buffer view;
+        if (PyObject_GetBuffer(ptr, &view, PyBUF_FORMAT) != 0) {
+            throw std::invalid_argument("add_scalar: ctypes scalar does not support the buffer protocol");
+        }
+        CtypesFormat verdict = classify_ctypes_format(view.format);
+        size_t width = static_cast<size_t>(view.len);
+        uint64_t bits = 0;
+        if (verdict == CtypesFormat::Encodable && width <= sizeof(uint64_t)) {
+            std::memcpy(&bits, view.buf, width);
+        }
+        PyBuffer_Release(&view);
+
+        if (verdict == CtypesFormat::ForeignByteOrder) {
+            throw std::invalid_argument(
+                "add_scalar: ctypes scalar is not in host byte order (e.g. c_uint32.__ctype_be__ on a "
+                "little-endian host); its bytes would encode to a different number than the same value "
+                "written from orchestration"
+            );
+        }
+        if (verdict == CtypesFormat::NotNumeric) {
+            throw std::invalid_argument(
+                "add_scalar: ctypes scalar must be an integer width (c_int8..c_uint64), c_float, "
+                "c_double or c_bool -- a pointer or character type carries no value a slot can hold"
+            );
+        }
+        if (width > sizeof(uint64_t)) {
+            throw std::invalid_argument("add_scalar: ctypes scalar is wider than the 8-byte slot");
+        }
+        return bits;
+    }
+
+    if (PyFloat_Check(ptr)) {
+        double d = PyFloat_AsDouble(ptr);
+        if (d == -1.0 && PyErr_Occurred()) {
+            throw nb::python_error();
+        }
+        float f = static_cast<float>(d);
+        // A finite value that narrows to an infinity is out of single-precision range, and
+        // storing that infinity would silently be a different number. An input that is already
+        // infinite or NaN passes through as itself.
+        if (std::isfinite(d) && !std::isfinite(f)) {
+            throw std::overflow_error(
+                "add_scalar: float value out of IEEE-754 single-precision range; pass ctypes.c_double "
+                "for full precision"
+            );
+        }
+        uint32_t bits;
+        std::memcpy(&bits, &f, sizeof(bits));
+        return static_cast<uint64_t>(bits);
+    }
+
+    if (PyIndex_Check(ptr)) {
+        // Normalize through __index__ into an exact PyLong first: PyLong_As* is only
+        // guaranteed against one, and ptr may be a numpy integer scalar or an IntEnum member,
+        // neither of which is a PyLong itself.
+        nb::object as_long = nb::steal<nb::object>(PyNumber_Index(ptr));
+        if (!as_long.is_valid()) {
+            throw nb::python_error();
+        }
+        return encode_python_int(as_long.ptr());
+    }
+
+    throw std::invalid_argument("add_scalar: value must be int, float, bool, or a ctypes scalar");
 }
 
 // Which device allocations a dispatch's operands may name: the private snapshot of every live
@@ -2333,8 +2517,18 @@ NB_MODULE(_task_interface, m) {
         )
 
         .def(
-            "add_scalar", &ChipStorageTaskArgs::add_scalar, nb::arg("s"),
-            "Add a uint64_t scalar. After this, add_tensor() is no longer allowed."
+            "add_scalar",
+            [](ChipStorageTaskArgs &self, nb::object value) {
+                self.add_scalar(encode_scalar(value));
+            },
+            nb::arg("s"),
+            "Add a scalar -- Python int, float, bool, or a ctypes scalar (c_int8..c_uint64, "
+            "c_float, c_double, c_bool; a pointer or character type, and any scalar not in host "
+            "byte order, is refused). Bit-encoded exactly like scalar_to_uint64(), which matches "
+            "C++ to_u64(): a ctypes scalar zero-extends from its own width, and a native float "
+            "narrows to IEEE-754 single precision -- a finite value out of that range raises "
+            "rather than becoming an infinity, so use ctypes.c_double for full precision. "
+            "After this, add_tensor() is no longer allowed."
         )
 
         .def(
@@ -2413,8 +2607,18 @@ NB_MODULE(_task_interface, m) {
         )
 
         .def(
-            "add_scalar", &TaskArgs::add_scalar, nb::arg("s"),
-            "Add a uint64_t scalar. After this, add_tensor() is no longer allowed."
+            "add_scalar",
+            [](TaskArgs &self, nb::object value) {
+                self.add_scalar(encode_scalar(value));
+            },
+            nb::arg("s"),
+            "Add a scalar -- Python int, float, bool, or a ctypes scalar (c_int8..c_uint64, "
+            "c_float, c_double, c_bool; a pointer or character type, and any scalar not in host "
+            "byte order, is refused). Bit-encoded exactly like scalar_to_uint64(), which matches "
+            "C++ to_u64(): a ctypes scalar zero-extends from its own width, and a native float "
+            "narrows to IEEE-754 single precision -- a finite value out of that range raises "
+            "rather than becoming an infinity, so use ctypes.c_double for full precision. "
+            "After this, add_tensor() is no longer allowed."
         )
 
         .def(
@@ -3465,6 +3669,19 @@ NB_MODULE(_task_interface, m) {
         .def("comm_destroy_all", &ChipWorker::comm_destroy_all, "Destroy all owned communicators in LIFO order.");
 
     // --- Standalone blob helpers ---
+
+    m.def(
+        "scalar_to_uint64", &encode_scalar, nb::arg("value"),
+        "Bit-encode a Python int, float, bool, or ctypes scalar into the uint64 a scalar slot "
+        "stores, matching C++ to_u64() bit for bit. A ctypes scalar is read at its own width and "
+        "zero-extended, so ctypes.c_int8(-1) is 0xFF rather than a sign-extended 0xFF..FF; the "
+        "admitted ctypes types are c_int8..c_uint64, c_float, c_double and c_bool in host byte "
+        "order, and a pointer type, a character type, or a byte-order-qualified variant such as "
+        "c_uint32.__ctype_be__ is refused. A native Python float narrows to IEEE-754 single "
+        "precision and zero-extends, and a finite value out of single-precision range raises "
+        "rather than becoming an infinity; pass ctypes.c_double for full precision, or another "
+        "ctypes scalar for exact width."
+    );
 
     m.def(
         "materialize_task_args",

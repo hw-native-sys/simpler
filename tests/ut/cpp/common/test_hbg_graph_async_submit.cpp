@@ -167,7 +167,7 @@ bool fake_graph_prepare(RuntimeContext *rt, void *recording_handle, const GraphT
         fake.recorded_tensor_storage = &tensor;
     }
     if (args.scalar_count() > 0) {
-        fake.recorded_scalar = args.scalar(0).to<uint64_t>();
+        fake.recorded_scalar = args.scalar<uint64_t>(0);
     }
     if (fake.gate_four_prepares) {
         fake.cv.notify_all();

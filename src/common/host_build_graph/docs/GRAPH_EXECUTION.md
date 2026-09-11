@@ -99,28 +99,33 @@ parameter on every replay. A slot names the parameter it came from, not the
 `Arg` it was copied through, so provenance survives any number of intermediate
 copies.
 
-Reading a parameter as a value freezes it. `uint64_t v = args.scalar(i)` and
-`static_cast<int32_t>(args.scalar(i))` both convert through a **deprecated**
-operator, so the compiler names the file and line: the destination slot becomes
-static Definition data holding the recording invocation's number, and later
-cache hits replay that number. Forwarding never reaches that operator, which is
-what keeps a correct pass-through silent.
+Reading a parameter as a value freezes it, and the type system says so: an
+`InheritableScalar` has no conversion to a number, so `uint64_t v =
+args.scalar(i)` and `static_cast<int32_t>(args.scalar(i))` do not compile. A
+value read has to name the type it is reading — `args.scalar<T>(i)` — and what
+it produces is a plain `T`: the destination slot becomes static Definition data
+holding the recording invocation's number, and later cache hits replay that
+number. Forwarding never converts, which is what keeps a correct pass-through
+silent.
 
-That diagnostic has one limit. GCC suppresses a deprecation instantiated inside
-a system header, so a value read whose conversion happens in third-party
-template code stays silent — `EXPECT_EQ(args.scalar(i), v)` is the case found so
-far. The warning is an inventory of the value reads written here, not a proof
-that none exists.
+Because the diagnostic is the absence of a conversion rather than a
+deprecation, it has no blind spot. A value read inside third-party template
+code — `EXPECT_EQ(args.scalar(i), v)` is the case that motivated this — fails
+there too, where a `[[deprecated]]` attribute would have been suppressed for
+being instantiated inside a system header.
 
-When a value read is what you meant, say so with `args.scalar(i).to<T>()`. It
+When a value read is what you meant, say so with `args.scalar<T>(i)`. It
 applies `to_u64`'s actual inverse, which `static_cast` is not — a float slot
 holds a bit pattern, so `static_cast<float>` of `1.0f`'s pattern yields
-`1065353216.0`. It is also the only spelling that reaches an enum:
-`static_cast<DataType>(args.scalar(i))` does not compile, because a conversion
-to an enumeration does not accept a user-defined one on the way.
+`1065353216.0`. An enum has no other spelling at all:
+`static_cast<DataType>(args.scalar(i))` does not compile, because the handle
+converts to nothing and `static_cast` has no conversion to apply.
+`InheritableScalar::to<T>()` is the same read on a handle already in hand —
+reach for it when the parameter arrived as a function argument and the `Arg` it
+came from is no longer reachable.
 
 Freezing on purpose has a second spelling, and the two do different things.
-`args.scalar(i).to<T>()` hands the body a `T` to compute with, and whatever the
+`args.scalar<T>(i)` hands the body a `T` to compute with, and whatever the
 body does with it afterwards is ordinary host code.
 `task_args.add_static_scalar(args.scalar(i))` instead forwards the parameter
 into a slot and drops its origin: the slot carries the same bit pattern a
@@ -129,10 +134,11 @@ following the parameter. Reach for the first when the body needs the number, the
 second when a destination — typically a nested Graph's boundary — should hold
 the value the enclosing parameter had at record time.
 
-A derived value (`args.scalar(i) + 1`) is a value read and freezes the same way.
-Compute it before constructing the boundary and pass it as its own parameter,
-perform the transformation in a kernel, or use a construction parameter when the
-value changes the Graph's structure.
+A derived value freezes the same way, and needs the same explicit read:
+`args.scalar(i) + 1` does not compile, `args.scalar<uint64_t>(i) + 1` does and
+is frozen. Compute it before constructing the boundary and pass it as its own
+parameter, perform the transformation in a kernel, or use a construction
+parameter when the value changes the Graph's structure.
 
 Boundary scalar slots are read-only: `scalar()` hands out the parameter, not a
 mutable reference, so a binding cannot be overwritten after it is forwarded.

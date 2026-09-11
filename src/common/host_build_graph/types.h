@@ -208,29 +208,20 @@ public:
 
     constexpr const void *origin() const { return origin_; }
 
-    // Read the parameter as a value, with to_u64's actual inverse applied. static_cast on
-    // the pattern is not that inverse: a float slot holds a bit pattern, so
-    // static_cast<float> of 1.0f's pattern yields 1065353216.0. It is also the only
-    // spelling that reaches an enum, since a conversion to an enumeration does not accept
-    // a user-defined one on the way.
-    template <typename T>
-    T to() const {
-        return from_u64<T>(bits_);
-    }
-
-    // Implicit, so an existing value read still compiles; deprecated, so it says so.
-    // Forwarding stores origin() and never reaches here, which is what keeps a
-    // pass-through silent.
-    [[deprecated(
-        "scalar slot read as a value, which breaks inheritance: the destination "
-        "slot holds this invocation's number instead of following the source, so "
-        "a Graph Definition freezes it. Forward it (add_scalar(args.scalar(i))) "
-        "to keep it per-invocation; use args.scalar(i).to<T>() if a static "
-        "value is intended; pass it as a construction parameter if it selects "
-        "the Graph's structure."
-    )]]
-    operator uint64_t() const {
-        return bits_;
+    // Read this handle as a value, with to_u64's actual inverse applied. Arg::scalar<T>(i)
+    // is the spelling when the Arg is in hand; this one is for a handle that has already
+    // been passed on -- a function parameter, say -- where the Arg it came from is no
+    // longer reachable. Both freeze the parameter: whatever the body computes from the
+    // number is ordinary host code, and the destination slot no longer follows the source.
+    //
+    // static_cast is not that inverse: a float slot holds a bit pattern, so
+    // static_cast<float> of 1.0f's pattern yields 1065353216.0. An enum has no other
+    // spelling at all -- the handle converts to nothing, so static_cast<DataType> of one
+    // has no conversion to apply.
+    template <typename ScalarT>
+    ScalarT to() const {
+        static_assert(sizeof(ScalarT) <= sizeof(uint64_t), "to<T>: type must fit in the slot");
+        return from_u64<ScalarT>(bits_);
     }
 
 private:
@@ -558,15 +549,29 @@ public:
         add_scalars_impl(values, count, false);
     }
 
-    // Hand out parameter i for forwarding: its value, plus the slot that value comes from.
-    // Passing the result to another Arg's add_scalar makes that slot follow this one;
-    // reading it as a value goes through InheritableScalar's deprecated conversion, which
-    // is what makes breaking the chain visible at the call site.
+    // Hand out parameter i. The default template argument (InheritableScalar) is for
+    // forwarding: its value, plus the slot that value comes from. Passing the result to
+    // another Arg's add_scalar makes that slot follow this one; InheritableScalar has no
+    // implicit conversion to a raw value, so reading it as one instead of forwarding it
+    // requires explicitly requesting a different ScalarT.
     //
     // An already-inherited slot yields its own origin rather than itself, so the chain a
     // destination records is always one hop: "C inherits B, B inherits A" records C -> A.
-    InheritableScalar scalar(int32_t i) const {
-        return {scalars_[i], scalar_inherited_[i] != nullptr ? scalar_inherited_[i] : &scalars_[i]};
+    //
+    // scalar<T>(i) for any other T reads the slot directly as T, with to_u64's actual
+    // inverse applied -- the same read InheritableScalar::to<T>() performs on a handle
+    // already in hand. static_cast on the pattern is not that inverse: a float slot holds a
+    // bit pattern, so static_cast<float> of 1.0f's pattern yields 1065353216.0. An enum has
+    // no other spelling at all -- the handle converts to nothing, so
+    // static_cast<DataType>(scalar(i)) has no conversion to apply.
+    template <typename ScalarT = InheritableScalar>
+    ScalarT scalar(int32_t i) const {
+        if constexpr (is_inheritable_scalar_v<ScalarT>) {
+            return {scalars_[i], scalar_inherited_[i] != nullptr ? scalar_inherited_[i] : &scalars_[i]};
+        } else {
+            static_assert(sizeof(ScalarT) <= sizeof(uint64_t), "scalar<T>: type must fit in the slot");
+            return from_u64<ScalarT>(scalars_[i]);
+        }
     }
 
     // Copy every value into a compact uint64 array -- what submit and payload
@@ -636,10 +641,9 @@ private:
     void add_scalar_one(T &&value) {
         if constexpr (is_inheritable_scalar_v<T>) {
             // The value travels with the handle, so following the parameter costs no
-            // dereference of the origin -- and lets the origin dangle harmlessly. Read
-            // through to<uint64_t>() rather than a bits() getter: a public bits() would be
-            // a second silent value-read path, exactly what the deprecated conversion
-            // exists to surface.
+            // dereference of the origin -- and lets the origin dangle harmlessly. The
+            // forwarded slot holds the same 8 bytes whatever the source type was, so the
+            // read that pulls them out names uint64_t.
             scalars_[scalar_count_] = value.template to<uint64_t>();
             scalar_inherited_[scalar_count_] = Dynamic ? value.origin() : nullptr;
 #if SIMPLER_DFX

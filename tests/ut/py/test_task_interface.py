@@ -10,9 +10,11 @@
 """Tests for the _task_interface nanobind extension and task_interface wrapper."""
 
 import ctypes
+import enum
 import gc
 import itertools
 import struct
+import sys
 import weakref
 from multiprocessing.shared_memory import SharedMemory
 from types import SimpleNamespace
@@ -294,23 +296,279 @@ class TestTorchInterop:
             assert arg.nbytes() == 2 * 4
 
 
+def _f32_bits(value):
+    return struct.unpack("<I", struct.pack("<f", value))[0]
+
+
+def _struct_pack_f_raises(value):
+    """Whether the pre-binding Python encoder refused this float.
+
+    `scalar_to_uint64` used `struct.pack("<f", ...)`, so these tests assert the C++ encoder
+    accepts and refuses the same set rather than hardcoding a range next to it.
+    """
+    try:
+        struct.pack("<f", value)
+    except OverflowError:
+        return True
+    return False
+
+
+def _HOST_ORDER(ctype):  # noqa: N802
+    """The byte-order-qualified variant naming the host's own order."""
+    return ctype.__ctype_le__ if sys.byteorder == "little" else ctype.__ctype_be__
+
+
+def _FOREIGN_ORDER(ctype):  # noqa: N802
+    """The byte-order-qualified variant naming the order the host does not use."""
+    return ctype.__ctype_be__ if sys.byteorder == "little" else ctype.__ctype_le__
+
+
+def _f64_bits(value):
+    return struct.unpack("<Q", struct.pack("<d", value))[0]
+
+
+class _Opcode(enum.IntEnum):
+    IDLE = 0
+    RUN = 7
+
+
+class _MyDouble(ctypes.c_double):
+    """A c_double subclass — must still encode at double precision."""
+
+
+# Every encoding scalar_to_uint64 must produce, as (value, expected bits). These are the
+# same bits C++ to_u64() produces for the same value, which is what lets a slot written
+# from Python and one written from orchestration read back identically.
+#
+# The ctypes rows are the load-bearing ones: a ctypes scalar is read at its own width and
+# ZERO-extended, so c_int8(-1) is 0xFF, matching to_u64(int8_t{-1}). Sign-extending it to
+# 0xFF..FF — which reading `.value` would do — is the divergence these rows exist to catch.
+_ENCODING_CASES = [
+    ("int_zero", 0, 0),
+    ("int_small", 999, 999),
+    ("int_negative_one", -1, 0xFFFFFFFFFFFFFFFF),
+    ("int_int64_min", -(2**63), 0x8000000000000000),
+    ("int_int64_max", 2**63 - 1, 0x7FFFFFFFFFFFFFFF),
+    ("int_uint64_max", 2**64 - 1, 0xFFFFFFFFFFFFFFFF),
+    ("bool_true", True, 1),
+    ("bool_false", False, 0),
+    ("intenum", _Opcode.RUN, 7),
+    ("c_int8_negative", ctypes.c_int8(-1), 0xFF),
+    ("c_int16_negative", ctypes.c_int16(-1), 0xFFFF),
+    ("c_int32_negative", ctypes.c_int32(-1), 0xFFFFFFFF),
+    ("c_int64_negative", ctypes.c_int64(-1), 0xFFFFFFFFFFFFFFFF),
+    ("c_int64_positive", ctypes.c_int64(42), 42),
+    ("c_uint8_max", ctypes.c_uint8(255), 0xFF),
+    ("c_uint64_max", ctypes.c_uint64(2**64 - 1), 0xFFFFFFFFFFFFFFFF),
+    ("c_bool_true", ctypes.c_bool(True), 1),
+    ("c_bool_false", ctypes.c_bool(False), 0),
+    ("c_float", ctypes.c_float(1.5), _f32_bits(1.5)),
+    ("c_double", ctypes.c_double(1.5), _f64_bits(1.5)),
+    # A subclass is still that ctypes type. Dispatching on the type's __name__ would miss
+    # this one and narrow it to single precision.
+    ("c_double_subclass", _MyDouble(1.5), _f64_bits(1.5)),
+    # A bare Python float carries no width, so it narrows. This is the one encoding that
+    # cannot align with its C++ counterpart, where to_u64(1.5) is a double.
+    ("python_float", 1.5, _f32_bits(1.5)),
+    ("python_float_negative", -2.25, _f32_bits(-2.25)),
+]
+
+_ENCODING_IDS = [case[0] for case in _ENCODING_CASES]
+_ENCODING_PARAMS = [(case[1], case[2]) for case in _ENCODING_CASES]
+
+
 class TestScalarToUint64:
-    def test_scalar_to_uint64_int(self):
+    @pytest.mark.parametrize(("value", "expected"), _ENCODING_PARAMS, ids=_ENCODING_IDS)
+    def test_encoding(self, value, expected):
         from simpler.task_interface import scalar_to_uint64
 
-        assert scalar_to_uint64(999) == 999
+        assert scalar_to_uint64(value) == expected
 
-    def test_scalar_to_uint64_ctypes(self):
+    def test_python_float_loses_precision_where_c_double_does_not(self):
         from simpler.task_interface import scalar_to_uint64
 
-        assert scalar_to_uint64(ctypes.c_int64(42)) == 42
+        value = 0.1
+        assert scalar_to_uint64(value) == _f32_bits(value)
+        assert scalar_to_uint64(ctypes.c_double(value)) == _f64_bits(value)
+        assert scalar_to_uint64(value) != scalar_to_uint64(ctypes.c_double(value))
 
-    def test_scalar_to_uint64_float_ctypes(self):
+    def test_numpy_integer_is_accepted(self):
+        np = pytest.importorskip("numpy")
         from simpler.task_interface import scalar_to_uint64
 
-        bits = scalar_to_uint64(ctypes.c_float(1.5))
-        expected_bits = struct.unpack("I", struct.pack("f", 1.5))[0]
-        assert bits == expected_bits
+        assert scalar_to_uint64(np.int64(-1)) == 0xFFFFFFFFFFFFFFFF
+        assert scalar_to_uint64(np.uint32(7)) == 7
+
+    def test_numpy_float64_is_a_python_float_subclass(self):
+        np = pytest.importorskip("numpy")
+        from simpler.task_interface import scalar_to_uint64
+
+        assert scalar_to_uint64(np.float64(1.5)) == _f32_bits(1.5)
+
+    def test_rejects_narrower_numpy_float(self):
+        np = pytest.importorskip("numpy")
+        from simpler.task_interface import scalar_to_uint64
+
+        # np.float32 defines neither __index__ nor float inheritance, so it is refused
+        # rather than silently coerced through int().
+        with pytest.raises((TypeError, ValueError)):
+            scalar_to_uint64(np.float32(1.5))
+
+    def test_rejects_non_scalar(self):
+        from simpler.task_interface import scalar_to_uint64
+
+        with pytest.raises((TypeError, ValueError)):
+            scalar_to_uint64("7")
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            ctypes.c_void_p(0x1234),
+            ctypes.c_char_p(b"seven"),
+            ctypes.c_char(b"7"),
+            ctypes.c_wchar("7"),
+        ],
+        ids=["c_void_p", "c_char_p", "c_char", "c_wchar"],
+    )
+    def test_rejects_non_numeric_ctypes(self, value):
+        from simpler.task_interface import scalar_to_uint64
+
+        # These are _SimpleCData subclasses whose buffer holds an address or a character,
+        # not a number. Encoding one would put a host pointer into a device-bound slot.
+        with pytest.raises((TypeError, ValueError)):
+            scalar_to_uint64(value)
+
+    def test_accepts_a_subclass_of_an_admitted_ctypes_type(self):
+        from simpler.task_interface import scalar_to_uint64
+
+        # Admission reads the buffer's format, which a subclass inherits from its base, so it
+        # is not decided by the type's own name.
+        class _MyInt8(ctypes.c_int8):
+            pass
+
+        assert scalar_to_uint64(_MyInt8(-1)) == 0xFF
+
+    @pytest.mark.parametrize(
+        ("foreign", "native"),
+        [
+            (_FOREIGN_ORDER(ctypes.c_uint32)(1), ctypes.c_uint32(1)),
+            (_FOREIGN_ORDER(ctypes.c_double)(1.5), ctypes.c_double(1.5)),
+        ],
+        ids=["c_uint32", "c_double"],
+    )
+    def test_rejects_a_foreign_byte_order_ctypes_scalar(self, foreign, native):
+        from simpler.task_interface import scalar_to_uint64
+
+        # A byte-order-qualified variant carries the *same* `_type_` as its native counterpart
+        # and differs only in the buffer format's prefix, so `_type_` alone cannot tell them
+        # apart. Its bytes are reversed, so copying them would encode c_uint32.__ctype_be__(1)
+        # as 0x01000000 where to_u64(uint32_t{1}) is 0x1 — a different number for the same
+        # value, which is exactly the bit-for-bit contract this encoder claims.
+        assert type(foreign)._type_ == type(native)._type_
+        assert bytes(memoryview(foreign)) == bytes(reversed(bytes(memoryview(native))))
+        with pytest.raises((TypeError, ValueError)):
+            scalar_to_uint64(foreign)
+
+    def test_accepts_the_host_byte_order_qualified_variant(self):
+        from simpler.task_interface import scalar_to_uint64
+
+        # The qualifier naming the host's own order is not foreign, so it encodes like the
+        # unqualified type rather than being refused along with its sibling.
+        assert scalar_to_uint64(_HOST_ORDER(ctypes.c_uint32)(1)) == 1
+
+    @pytest.mark.parametrize(
+        "value",
+        [1e100, -1e100, 3.402823806667635e38, 1e308],
+        ids=["1e100", "-1e100", "just_above_flt_max", "1e308"],
+    )
+    def test_rejects_float_out_of_single_precision_range(self, value):
+        from simpler.task_interface import scalar_to_uint64
+
+        # struct.pack("<f", ...) raised OverflowError for these, and storing the infinity a
+        # narrowing conversion produces would silently be a different number.
+        assert _struct_pack_f_raises(value)
+        with pytest.raises((OverflowError, ValueError)):
+            scalar_to_uint64(value)
+
+    def test_float_range_boundary(self):
+        from simpler.task_interface import scalar_to_uint64
+
+        # FLT_MAX itself is in range; the smallest double above it that does not round back
+        # down to it is not.
+        flt_max = 3.4028234663852886e38
+        assert scalar_to_uint64(flt_max) == _f32_bits(flt_max)
+        assert not _struct_pack_f_raises(flt_max)
+
+    @pytest.mark.parametrize("value", [float("inf"), float("-inf")], ids=["inf", "-inf"])
+    def test_non_finite_float_passes_through(self, value):
+        from simpler.task_interface import scalar_to_uint64
+
+        # An input that is already infinite is not a value that went out of range on the way
+        # in, so it encodes as itself rather than raising.
+        assert scalar_to_uint64(value) == _f32_bits(value)
+
+    def test_nan_float_passes_through(self):
+        from simpler.task_interface import scalar_to_uint64
+
+        bits = scalar_to_uint64(float("nan"))
+        # Exponent all ones with a non-zero mantissa — the payload is not pinned down.
+        assert bits & 0x7F800000 == 0x7F800000
+        assert bits & 0x007FFFFF != 0
+
+    @pytest.mark.parametrize("value", [2**64, -(2**63) - 1, 2**70], ids=["above_u64", "below_i64", "far_above"])
+    def test_rejects_out_of_range_integer(self, value):
+        from simpler.task_interface import scalar_to_uint64
+
+        # Truncating to the low 64 bits would silently store a different number.
+        with pytest.raises((OverflowError, ValueError)):
+            scalar_to_uint64(value)
+
+    def test_propagates_an_exception_raised_by_index(self):
+        from simpler.task_interface import scalar_to_uint64
+
+        # __index__ answering with an exception leaves PyNumber_Index at nullptr with that
+        # exception pending. The caller sees its own error, not a crash and not a substitute.
+        class BrokenIndex:
+            def __index__(self):
+                raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            scalar_to_uint64(BrokenIndex())
+
+        args = TaskArgs()
+        with pytest.raises(RuntimeError, match="boom"):
+            args.add_scalar(BrokenIndex())
+        assert args.scalar_count() == 0
+
+
+class TestAddScalarEncoding:
+    """add_scalar takes the value itself and encodes it exactly as scalar_to_uint64 does."""
+
+    @pytest.mark.parametrize(("value", "expected"), _ENCODING_PARAMS, ids=_ENCODING_IDS)
+    def test_task_args(self, value, expected):
+        args = TaskArgs()
+        args.add_scalar(value)
+        assert args.scalar(0) == expected
+
+    @pytest.mark.parametrize(("value", "expected"), _ENCODING_PARAMS, ids=_ENCODING_IDS)
+    def test_chip_storage_task_args(self, value, expected):
+        args = ChipStorageTaskArgs()
+        args.add_scalar(value)
+        assert args.scalar(0) == expected
+
+    def test_pre_encoded_uint64_still_round_trips(self):
+        from simpler.task_interface import scalar_to_uint64
+
+        # The pre-encoding spelling stays valid: its result is an int, which passes through.
+        args = TaskArgs()
+        args.add_scalar(scalar_to_uint64(ctypes.c_float(1.5)))
+        assert args.scalar(0) == _f32_bits(1.5)
+
+    def test_rejects_non_scalar(self):
+        args = TaskArgs()
+        with pytest.raises((TypeError, ValueError)):
+            args.add_scalar("7")
+        assert args.scalar_count() == 0
 
 
 # ============================================================================

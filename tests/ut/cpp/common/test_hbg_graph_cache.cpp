@@ -329,7 +329,7 @@ TEST(GraphScalarProvenance, AnLvalueDeclaresADynamicParameter) {
     EXPECT_FALSE(args.scalar_dynamic(1));
     EXPECT_EQ(args.scalar_origin(1), nullptr);
     EXPECT_FALSE(args.scalar_dynamic(2)) << "add_static_scalar overrides value category";
-    EXPECT_EQ(args.scalar(2).to<uint32_t>(), 17u);
+    EXPECT_EQ(args.scalar<uint32_t>(2), 17u);
 }
 
 TEST(GraphScalarProvenance, ForwardedScalarRetainsBoundarySource) {
@@ -341,7 +341,7 @@ TEST(GraphScalarProvenance, ForwardedScalarRetainsBoundarySource) {
 
     EXPECT_TRUE(task_args.scalar_dynamic(0));
     EXPECT_EQ(task_args.scalar_origin(0), slot_addr(boundary_args.scalar_slot_base(), 1));
-    EXPECT_EQ(task_args.scalar(0).to<uint64_t>(), uint64_t{18});
+    EXPECT_EQ(task_args.scalar<uint64_t>(0), uint64_t{18});
 }
 
 TEST(GraphScalarProvenance, ForwardedScalarNamesOriginThroughAnIntermediary) {
@@ -369,7 +369,7 @@ TEST(GraphScalarProvenance, FreezingAParameterDropsItsOrigin) {
 
     EXPECT_FALSE(task_args.scalar_dynamic(0));
     EXPECT_EQ(task_args.scalar_origin(0), nullptr);
-    EXPECT_EQ(task_args.scalar(0).to<uint64_t>(), uint64_t{18});
+    EXPECT_EQ(task_args.scalar<uint64_t>(0), uint64_t{18});
 }
 
 TEST(GraphScalarProvenance, ValueScalarHoldsItsOwnValue) {
@@ -378,8 +378,8 @@ TEST(GraphScalarProvenance, ValueScalarHoldsItsOwnValue) {
 
     EXPECT_FALSE(task_args.scalar_dynamic(0));
     EXPECT_FALSE(task_args.scalar_dynamic(1));
-    EXPECT_EQ(task_args.scalar(0).to<uint64_t>(), uint64_t{17});
-    EXPECT_EQ(task_args.scalar(1).to<float>(), 2.5F);
+    EXPECT_EQ(task_args.scalar<uint64_t>(0), uint64_t{17});
+    EXPECT_EQ(task_args.scalar<float>(1), 2.5F);
 }
 
 TEST(GraphScalarProvenance, ZeroInitialisedSlotsReadAsStaticZero) {
@@ -421,7 +421,7 @@ TEST(GraphScalarProvenance, AValueOutlivesItsOrigin) {
     // The origin now dangles, and that is by design: the value was copied at add_scalar
     // time, and the address is only ever compared, never read through.
     EXPECT_TRUE(task_args.scalar_dynamic(0));
-    EXPECT_EQ(task_args.scalar(0).to<uint64_t>(), uint64_t{42});
+    EXPECT_EQ(task_args.scalar<uint64_t>(0), uint64_t{42});
 }
 
 TEST(GraphScalarProvenance, TaskSlotsInheritFromEachOther) {
@@ -438,7 +438,7 @@ TEST(GraphScalarProvenance, TaskSlotsInheritFromEachOther) {
     // a[0] itself. A chain is therefore one hop and recording resolves it without a walk.
     EXPECT_TRUE(b.scalar_dynamic(0));
     EXPECT_EQ(b.scalar_origin(0), slot_addr(boundary_args.scalar_slot_base(), 1));
-    EXPECT_EQ(b.scalar(0).to<uint64_t>(), uint64_t{18});
+    EXPECT_EQ(b.scalar<uint64_t>(0), uint64_t{18});
 }
 
 TEST(GraphScalarProvenance, InheritingAValueSlotNamesThatSlot) {
@@ -451,7 +451,7 @@ TEST(GraphScalarProvenance, InheritingAValueSlotNamesThatSlot) {
     // a[0] names no origin, so it is itself the origin.
     EXPECT_TRUE(b.scalar_dynamic(0));
     EXPECT_EQ(b.scalar_origin(0), a.scalar_slot_base());
-    EXPECT_EQ(b.scalar(0).to<uint64_t>(), uint64_t{7});
+    EXPECT_EQ(b.scalar<uint64_t>(0), uint64_t{7});
 }
 
 TEST(GraphExecutionStorage, ComputesAlignedExactSize) {

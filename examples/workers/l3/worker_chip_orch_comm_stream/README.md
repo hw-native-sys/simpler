@@ -25,7 +25,7 @@ mechanism.
 | **Explicit payload transfer** | `region.payload_write(offset, tensor, nbytes)` and `payload_read(...)`, at offsets the host lays out itself: header at 0, input at 64, output after the input. |
 | **A monotonic sequence as the protocol** | Round *n* sets `data_ready` to *n* and waits for `completion >= n`. `GE`, not `EQ`, so a host that fell behind still makes progress. |
 | **In-band shutdown** | The stop is round `_ROUNDS + 1` with opcode 2 in the header — the same notify path as a data round, no separate channel. |
-| **Passing a typed scalar** | `scalar_to_uint64(ctypes.c_float(7.0))` reinterprets a float's bits for `add_scalar`. |
+| **Passing a typed scalar** | `add_scalar(ctypes.c_float(7.0))` stores the float's bits. A ctypes scalar is read at its own width and zero-extended, so the encoding matches C++ `to_u64()`; a bare Python float narrows to single precision. |
 
 ## Run
 

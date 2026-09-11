@@ -102,7 +102,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     uint64_t block_num = orch_args.tensor(3).ref().shapes[1];
 
     // scale from scalar arg
-    uint64_t scale_value = orch_args.scalar(0);
+    uint64_t scale_value = orch_args.scalar<uint64_t>(0);
     uint64_t q_head_num = num_heads;
     uint64_t q_tile = std::min(num_heads, 128UL);
     uint64_t q_loop = (q_head_num + q_tile - 1) / q_tile;
