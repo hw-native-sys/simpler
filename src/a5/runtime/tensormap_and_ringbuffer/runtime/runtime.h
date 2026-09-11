@@ -45,6 +45,7 @@
 #include "dispatch_payload.h"
 #include "task_args.h"
 #include "tensormap_and_ringbuffer/entry_args.h"  // EntryArgsStorage
+#include "utils/tensor_lease.h"
 
 // =============================================================================
 // Configuration Macros
@@ -110,26 +111,6 @@ struct Handshake {
     volatile CoreType core_type;    // Core type: CoreType::AIC or CoreType::AIV (reported by AICore with aicore_done)
     volatile uint32_t physical_core_id;  // Physical core ID (reported by AICore with aicore_done)
 } __attribute__((aligned(64)));
-
-enum class TensorReleaseKind {
-    Free,
-    BufferNoop,
-    ExternalNoop,
-};
-
-/**
- * simpler::tmr::Tensor lease for tracking host-device memory mappings and release ownership.
- */
-struct TensorLease {
-    void *host_ptr;
-    void *dev_ptr;
-    size_t size;
-    // false for read-only INPUT tensors: they are never written by the kernel,
-    // so the end-of-run D2H copy-back is skipped. OUTPUT/INOUT/unknown
-    // keep the safe default of copying back.
-    bool needs_copy_back = true;
-    TensorReleaseKind release_kind = TensorReleaseKind::Free;
-};
 
 /**
  * Task structure - Compatibility stub for platform layer

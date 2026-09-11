@@ -9,21 +9,22 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Runtime Builder - rt2 Implementation (Device Orchestration)
+ * tensormap_and_ringbuffer runtime maker (device orchestration).
  *
- * Provides init_runtime_impl and validate_runtime_impl functions for rt2 runtime.
- * Supports device orchestration where AICPU thread 3 runs the orchestrator.
+ * Supports device orchestration where an AICPU thread runs the orchestrator.
  *
- * init_runtime_impl:
- *   - Converts host tensor pointers to device pointers (all inputs copied H2D;
- *     only OUTPUT/INOUT tensors are copied back D2H)
+ * bind_callable_to_runtime_impl:
+ *   - Stages host tensor arguments into slices of the pipeline slot's retained
+ *     temporary buffer (all readable inputs copied H2D; only OUTPUT/INOUT
+ *     tensors are copied back D2H) and records one lease each
  *   - Copies orchestration SO to device memory
  *   - Sets up runtime state for device orchestration
  *
  * validate_runtime_impl:
  *   - Copies OUTPUT/INOUT tensors back from device to host (read-only inputs
  *     are skipped)
- *   - Frees device memory
+ *   - Releases the run's leases. The slices are no-ops: the retained buffer
+ *     outlives the run and is freed once at Worker finalization.
  */
 
 #include <stddef.h>
@@ -55,6 +56,8 @@
 #include "host/raii_scope_guard.h"
 #include "common/host_api.h"
 #include "utils/device_arena.h"
+#include "utils/retained_temp_bump.h"
+#include "utils/tensor_lease_release.h"
 #include "prepare_callable_common.h"
 
 // This file returns both kinds of negative status — a latched device code
@@ -221,102 +224,27 @@ static int32_t read_runtime_status(Runtime *runtime, const HostApi *api, SharedM
     return runtime_status_from_error_codes(orch_error_code, sched_error_code);
 }
 
-static void release_tensor_leases(Runtime *runtime, const HostApi *api) {
-    int freed = 0;
-    int buffer_noop = 0;
-    int external_noop = 0;
-    for (TensorLease &lease : runtime->tensor_leases_) {
-        if (lease.dev_ptr == nullptr) {
-            continue;
-        }
-        switch (lease.release_kind) {
-        case TensorReleaseKind::Free:
-            api->device_free(lease.dev_ptr);
-            ++freed;
-            break;
-        case TensorReleaseKind::BufferNoop:
-            ++buffer_noop;
-            break;
-        case TensorReleaseKind::ExternalNoop:
-            ++external_noop;
-            break;
-        }
-    }
-    LOG_DEBUG("Released tensor leases: freed=%d buffer_noop=%d external_noop=%d", freed, buffer_noop, external_noop);
-    runtime->tensor_leases_.clear();
+static void release_run_tensor_leases(Runtime *runtime, const HostApi *api) {
+    const TensorLeaseReleaseCounts counts = release_tensor_leases(runtime->tensor_leases_, api);
+    LOG_DEBUG(
+        "Released tensor leases: freed=%d buffer_noop=%d external_noop=%d", counts.freed, counts.buffer_noop,
+        counts.external_noop
+    );
 }
 
-// per-run bump allocator over the runner's retained temporary buffer. This is
-// the whole temporary-buffer mechanism: the platform only remembers a
-// {addr, size} slot across runs (HostApi get/set_retained_temp_buffer); the
-// grow/pack/slice logic lives here. TRB kernels require 1024-byte-aligned
-// device pointers, which device_malloc already guarantees for the OFF path, so
-// the retained base is 1024-aligned and slices taken at 1024-aligned offsets
-// stay aligned without any base fix-up.
-class RetainedTempBump {
-public:
-    static constexpr size_t kAlignment = 1024;
-
-    static size_t align_up(size_t v) { return (v + (kAlignment - 1)) & ~(kAlignment - 1); }
-
-    // Pack the run's non-child, non-empty tensors to compute the required
-    // aligned size, then grow the retained slot if it is too small (free old +
-    // malloc new + write back). Returns false only if the (grow) device_malloc
-    // fails. A run needing 0 bytes leaves the slot untouched.
-    bool begin(const HostApi *api, const ChipStorageTaskArgs *orch_args) {
-        api_ = api;
-        offset_ = 0;
-        size_t required = 0;
-        for (int i = 0; i < orch_args->tensor_count(); i++) {
-            ChipTensor t = orch_args->tensor(i);
-            if (t.is_device_memory() || t.nbytes() == 0) {
-                continue;
-            }
-            required += align_up(static_cast<size_t>(t.nbytes()));
+// Packed byte size of the slices stage_device_args takes for one run: the
+// non-child, non-empty tensors, each aligned up to the bump's slice alignment.
+static size_t packed_temp_bytes(const ChipStorageTaskArgs *orch_args) {
+    size_t required = 0;
+    for (int i = 0; i < orch_args->tensor_count(); i++) {
+        ChipTensor t = orch_args->tensor(i);
+        if (t.is_device_memory() || t.nbytes() == 0) {
+            continue;
         }
-        void *addr = nullptr;
-        size_t size = 0;
-        api->get_retained_temp_buffer(&addr, &size);
-        if (required > size) {
-            if (addr != nullptr) {
-                api->device_free(addr);
-            }
-            addr = required != 0 ? api->device_malloc(required) : nullptr;
-            if (required != 0 && addr == nullptr) {
-                api->set_retained_temp_buffer(nullptr, 0);
-                base_ = nullptr;
-                capacity_ = 0;
-                LOG_ERROR("Retained temp buffer grow failed: required bytes %zu", required);
-                return false;
-            }
-            api->set_retained_temp_buffer(addr, required);
-            size = required;
-        }
-        base_ = addr;
-        capacity_ = size;
-        return true;
+        required += RetainedTempBump::align_up(static_cast<size_t>(t.nbytes()));
     }
-
-    // Slice `bytes` from the retained buffer at the next 1024-aligned offset.
-    // Must fit because begin() sized the buffer from the same tensors; a miss
-    // is a caller bug (plan/slice mismatch), reported as nullptr.
-    void *acquire(size_t bytes) {
-        size_t aligned = align_up(offset_);
-        if (base_ == nullptr || aligned + bytes > capacity_) {
-            LOG_ERROR("Retained temp buffer slice miss: bytes=%zu offset=%zu capacity=%zu", bytes, aligned, capacity_);
-            return nullptr;
-        }
-        void *ptr = static_cast<char *>(base_) + aligned;
-        offset_ = aligned + bytes;
-        return ptr;
-    }
-
-private:
-    const HostApi *api_ = nullptr;
-    void *base_ = nullptr;
-    size_t capacity_ = 0;
-    size_t offset_ = 0;
-};
+    return required;
+}
 
 /**
  * Stage the per-callable resources (kernel binaries + orchestration SO) into
@@ -492,7 +420,7 @@ static bool derive_arena_static_sizes(const ArenaSizingConfig &sizing, ArenaStat
 
 // per-run: the only signature-aware step. Copy the orch args, replacing each
 // host tensor pointer with a freshly staged device pointer (H2D copy-in, or an
-// on-device zero for pure-OUTPUT buffers), and record the host/device pair for
+// nothing at all for pure-OUTPUT buffers), and record the host/device pair for
 // copy-back. Read-only INPUT tensors skip copy-back. When `bump` is non-null,
 // ordinary non-child tensors are sliced from the runner's retained temporary
 // buffer (released as a no-op — the buffer is reused across runs); otherwise
@@ -530,7 +458,10 @@ static bool stage_device_args(
             dev_ptr = bump->acquire(size);
             release_kind = TensorReleaseKind::BufferNoop;
             if (dev_ptr == nullptr) {
-                LOG_ERROR("Retained temp buffer slice failed for tensor %d: tensor bytes=%zu", i, size);
+                LOG_ERROR(
+                    "Retained temp buffer slice miss for tensor %d: bytes=%zu offset=%zu capacity=%zu", i, size,
+                    bump->next_offset(), bump->capacity()
+                );
                 return false;
             }
         } else {
@@ -820,12 +751,14 @@ extern "C" int bind_callable_to_runtime_impl(
     // the runner across runs; here we grow it to this run's packed size and
     // bump-slice from it.
     RetainedTempBump bump;
-    if (!bump.begin(api, orch_args)) {
+    const size_t required_temp_bytes = packed_temp_bytes(orch_args);
+    if (!bump.begin(api, required_temp_bytes)) {
+        LOG_ERROR("Retained temp buffer grow failed: required bytes %zu", required_temp_bytes);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     auto bind_cleanup = RAIIScopeGuard([&]() {
-        release_tensor_leases(runtime, api);
+        release_run_tensor_leases(runtime, api);
     });
 
     ChipStorageTaskArgs device_args;
@@ -866,7 +799,7 @@ extern "C" int bind_callable_to_runtime_impl(
 
     int64_t t_total_end = _now_ms();
     LOG_INFO("TIMING: prebuilt_runtime_arena = %" PRId64 "ms", t_prebuilt_end - t_prebuilt_start);
-    LOG_INFO("TIMING: total_init_runtime_impl = %" PRId64 "ms", t_total_end - t_total_start);
+    LOG_INFO("TIMING: total_bind = %" PRId64 "ms", t_total_end - t_total_start);
 
     bind_cleanup.dismiss();
     return 0;
@@ -1001,7 +934,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
 
     // Cleanup device tensors
     LOG_INFO("=== Cleaning Up ===");
-    release_tensor_leases(runtime, api);
+    release_run_tensor_leases(runtime, api);
 
     LOG_INFO("=== Finalize Complete ===");
 

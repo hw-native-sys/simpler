@@ -134,7 +134,7 @@ struct alignas(64) Tensor {
     }
 
     /// True when `buffer.addr` is a device pointer allocated by the child process
-    /// (host skips the H2D copy in init_runtime_impl). Host-side concept carried
+    /// (host skips the H2D copy when staging bind's arguments). Host-side concept carried
     /// across the wire; runtime views inherit it via the cache-line-1 copy.
     [[nodiscard]] bool is_device_memory() const { return address_space == AddressSpace::DEVICE; }
 

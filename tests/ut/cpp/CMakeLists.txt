@@ -577,6 +577,7 @@ target_include_directories(test_runtime_orch_so PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
 )
 add_common_utils_test(test_device_arena common/test_device_arena.cpp)
+add_common_utils_test(test_retained_temp_bump common/test_retained_temp_bump.cpp)
 add_common_utils_test(test_thread_completion_gate common/test_thread_completion_gate.cpp)
 add_common_utils_test(test_fatal_shutdown_latch common/test_fatal_shutdown_latch.cpp)
 add_common_utils_test(test_buffer_pool_manager common/test_buffer_pool_manager.cpp)
@@ -969,6 +970,31 @@ target_sources(test_hbg_async_wait_init PRIVATE
     ${HBG_ORCH_SHARED_SOURCES}
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
 )
+# Drives the real hbg bind/validate against a fake HostApi. bind takes the
+# resolved host-orch entry points as a parameter, so this needs no orchestration
+# .so — the test supplies its own two function pointers.
+#
+# Lists orchestrator.cpp + HBG_SHARED_RUNTIME_SOURCES rather than
+# HBG_ORCH_SHARED_SOURCES: that variable carries hbg_orch_stubs.cpp, whose
+# dep-gen and host-phase stubs collide with the real TUs this test needs for
+# dep_gen_host_graph_begin_capture and the bind-phase records.
+add_a2a3_hbg_runtime_test(test_hbg_bind_ledger common/test_hbg_bind_ledger.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/host_build_graph/host/runtime_maker.cpp
+    ${HBG_HOST_DIR}/orchestrator.cpp
+    ${HBG_SHARED_RUNTIME_SOURCES}
+    ${HBG_HOST_DIR}/runtime_core.cpp
+    ${HBG_HOST_DIR}/dep_gen_host_graph.cpp
+    ${HBG_HOST_DIR}/graph_recorder_pool.cpp
+    ${HBG_HOST_DIR}/host_phase_trace.cpp
+    ${HBG_HOST_DIR}/ready_queue_sizing.cpp
+    ${HBG_HOST_DIR}/host_tensor_access.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/platform_compile_info.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
+    # test_stubs.cpp already defines unified_log_*; only HostLogger is missing.
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/host_log.cpp
+)
+target_compile_definitions(test_hbg_bind_ledger PRIVATE SIMPLER_PLATFORM_NAME="a2a3sim")
+
 add_a2a3_hbg_runtime_test(test_hbg_self_relative_ptr common/test_hbg_self_relative_ptr.cpp)
 add_a2a3_hbg_runtime_test(test_hbg_sm_compaction common/test_hbg_sm_compaction.cpp)
 add_a2a3_hbg_runtime_test(test_hbg_scheduler_drain common/test_hbg_scheduler_drain.cpp)

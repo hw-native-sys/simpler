@@ -335,7 +335,7 @@ class TestRunStreamReuseHbg(SceneTestCase):
             st_worker.unregister(add_handle)
 
     def test_depth_two_slots_own_separate_resources(self, st_platform, st_worker):
-        """Each slot owns its own host Runtime buffer and its own arena bank.
+        """Each slot owns its own host Runtime buffer, arena bank, and staging buffer.
 
         Runs on simulation too: sim implements the same depth, so HBG — whose
         GM heap is HOST_PER_RUN — must commit a distinct bank per slot there as
@@ -388,10 +388,15 @@ class TestRunStreamReuseHbg(SceneTestCase):
             assert bank0 != 0 and bank1 != 0, f"a served bank is uncommitted: {bank0:#x}, {bank1:#x}"
             assert bank0 != bank1, f"both arena banks resolve to one GM heap: {bank0:#x}"
 
-            # hbg stages device args directly, never through the retained
-            # temporary buffer, so neither slot should hold one.
-            assert chip_worker.retained_temp_addr(0) == 0
-            assert chip_worker.retained_temp_addr(1) == 0
+            # hbg stages device args through the retained temporary buffer, and
+            # that buffer is per pipeline slot. Both slots ran, so both hold
+            # one, and they must be distinct — sequential runs re-stage their
+            # arguments every round, so correct output alone would survive both
+            # slots sharing a staging buffer.
+            temp0 = chip_worker.retained_temp_addr(0)
+            temp1 = chip_worker.retained_temp_addr(1)
+            assert temp0 != 0 and temp1 != 0, f"a slot that ran staged nothing: slot0={temp0:#x}, slot1={temp1:#x}"
+            assert temp0 != temp1, f"both slots stage through one retained buffer: {temp0:#x}"
         finally:
             st_worker.unregister(add_handle)
 

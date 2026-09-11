@@ -56,6 +56,43 @@ An orchestration fatal stops this sequence before the upload. The orchestrator
 runs on the host, so its code is latched in `OrchestratorState::fatal_code` and
 never reaches shared memory; the bind maps it onto the status the caller sees.
 
+Step 1 stages each caller tensor through the runner's retained temporary buffer
+rather than a per-run `device_malloc` / `device_free` pair: bind packs the run's
+non-child tensors to a 1024-aligned required size, grows the buffer only when a
+run needs more than is currently retained, and bump-slices each tensor from it,
+so a steady-state workload performs no temporary device allocation at all. The
+slices are recorded as `BufferNoop` leases — validate copies the written ones
+back and releases none, and the buffer itself is freed once at Worker finalize.
+The buffer is per pipeline slot; a run holds its slot from bind through validate
+and a concurrent reservation is admitted only on a distinct slot, so no other
+run can re-slice a buffer whose slices are still live. The mechanism
+(`RetainedTempBump`, `src/common/utils/retained_temp_bump.h`) is shared with
+`tensormap_and_ringbuffer`; that runtime's `RUNTIME_LOGIC.md` §2.4 carries the
+grow/slice details.
+
+The H2D copy of a staged tensor precedes its registration with the run's host
+accessor, so a reused slice can never expose the previous run's bytes to
+orchestration.
+
+A pure `OUT` tensor is staged into a slice but never copied in, and nothing
+zero-fills it, so the bytes a kernel does not write are whatever the slice last
+held. That was already true of a fresh `device_malloc` — the allocator pools and
+reuses device memory — but the residue is no longer always arbitrary. **On a run
+that reuses the retained buffer unchanged, it is whatever the previous tensor
+occupying that byte range left there.** The slot is keyed by pipeline slot
+alone, not by callable or by tensor identity, so that is the same tensor's own
+bytes only when the same callable runs consecutively with the same argument
+layout; a slot alternating between callables leaves another callable's bytes.
+A run that allocated or grew the buffer gets uninitialized allocator memory as
+before, and so does the first run of any Worker, because
+`RetainedTempBump::begin()` neither preserves nor initializes a buffer it
+replaces. So a kernel that writes only part of its output fails
+deterministically across the steady-state rounds of a fixed-shape workload —
+where a golden check is least likely to catch it — and randomly everywhere
+else. `device_memset` exists for zero-filling pure outputs;
+neither runtime uses it, because it would cost a device operation per output per
+run.
+
 ### 2.3 Device Execution and Teardown
 
 The boot thread attaches the already-populated arena without resetting it. All

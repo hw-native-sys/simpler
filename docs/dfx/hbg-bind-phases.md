@@ -26,7 +26,7 @@ the `chip.run.bind` span:
 
 | Segment | What it covers |
 | ------- | -------------- |
-| `args` | staging readable caller tensors H2D and exposing their existing host buffers to orchestration; pure outputs skip both |
+| `args` | staging readable caller tensors H2D into slices of the slot's retained staging buffer, and exposing their existing host buffers to orchestration; pure outputs skip the H2D and the view. The buffer grows to the high-water packed size and is reused, so a steady-state workload allocates no device memory here |
 | `arena_build`, `static_arena`, `gm_heap`, `shared_mem`, `runtime_init` | arena layout, GM heap and shared-memory bring-up |
 | `host_orch` | **all** orchestration: every task submitted, every in-graph task recorded, the Definition built |
 | `graph_upload` | one H2D of the block holding every Definition object, and binding each Graph task to the one with its key. The recorders built the objects in that block's host staging during `host_orch`, so this segment writes their headers and copies in only what did not fit |

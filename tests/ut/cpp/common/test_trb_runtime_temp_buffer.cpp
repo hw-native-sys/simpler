@@ -102,10 +102,10 @@ void *fake_device_malloc(void * /*runner_ctx*/, size_t size) {
         ++g_fake->device_malloc_count;
         return nullptr;
     }
-    // Over-align so a retained-buffer base satisfies the 1024-byte requirement
-    // the same way the real device_malloc does.
-    void *ptr = nullptr;
-    if (posix_memalign(&ptr, kAlign, std::max<size_t>(size, 1)) != 0) {
+    // Deliberately NOT over-aligned: the sim backend's device_malloc is
+    // std::malloc, and RetainedTempBump is what aligns the base it hands out.
+    void *ptr = std::malloc(std::max<size_t>(size, 1));
+    if (ptr == nullptr) {
         return nullptr;
     }
     ++g_fake->device_malloc_count;
@@ -340,7 +340,8 @@ TEST_F(TrbRuntimeTempBufferTest, TemporaryBufferSlicesWithoutChangingCopies) {
     Runtime buffer_runtime = make_runtime();
     ASSERT_EQ(bind_runtime(buffer_runtime, api_, args, signature, 2), 0);
     EXPECT_EQ(fake_.device_malloc_count, 1);
-    EXPECT_EQ(fake_.retained_size, align_up(64, kAlign) * 2);
+    // Over-sized by the headroom RetainedTempBump may spend aligning its base.
+    EXPECT_EQ(fake_.retained_size, align_up(64, kAlign) * 2 + kAlign - 1);
     EXPECT_EQ(fake_.copy_to_count, 2);
     EXPECT_EQ(fake_.device_memset_count, 0);
     ASSERT_EQ(validate_runtime_impl(&buffer_runtime, &api_, 0), 0);
@@ -383,7 +384,8 @@ TEST_F(TrbRuntimeTempBufferTest, LargerRunGrowsSmallerRunKeepsBuffer) {
     ASSERT_EQ(bind_runtime(run1, api_, small, signature, 2), 0);
     ASSERT_EQ(validate_runtime_impl(&run1, &api_, 0), 0);
     EXPECT_EQ(fake_.device_malloc_count, 1);
-    EXPECT_EQ(fake_.retained_size, align_up(64, kAlign) * 2);
+    // Over-sized by the headroom RetainedTempBump may spend aligning its base.
+    EXPECT_EQ(fake_.retained_size, align_up(64, kAlign) * 2 + kAlign - 1);
 
     // Larger run: free old + malloc new.
     std::vector<uint8_t> big_in(4096, 1);
@@ -394,7 +396,7 @@ TEST_F(TrbRuntimeTempBufferTest, LargerRunGrowsSmallerRunKeepsBuffer) {
     ASSERT_EQ(validate_runtime_impl(&run2, &api_, 0), 0);
     EXPECT_EQ(fake_.device_malloc_count, 2);
     EXPECT_EQ(fake_.device_free_count, 1);
-    EXPECT_EQ(fake_.retained_size, align_up(4096, kAlign) * 2);
+    EXPECT_EQ(fake_.retained_size, align_up(4096, kAlign) * 2 + kAlign - 1);
     size_t after_grow_mallocs = fake_.device_malloc_count;
 
     // Smaller run again: retained buffer is big enough, no free/malloc.
@@ -403,7 +405,7 @@ TEST_F(TrbRuntimeTempBufferTest, LargerRunGrowsSmallerRunKeepsBuffer) {
     ASSERT_EQ(validate_runtime_impl(&run3, &api_, 0), 0);
     EXPECT_EQ(fake_.device_malloc_count, static_cast<int>(after_grow_mallocs));
     EXPECT_EQ(fake_.device_free_count, 1);
-    EXPECT_EQ(fake_.retained_size, align_up(4096, kAlign) * 2);
+    EXPECT_EQ(fake_.retained_size, align_up(4096, kAlign) * 2 + kAlign - 1);
 }
 
 TEST_F(TrbRuntimeTempBufferTest, ChildMemoryIsPassThroughAndPureOutSkipsStaging) {
@@ -421,7 +423,7 @@ TEST_F(TrbRuntimeTempBufferTest, ChildMemoryIsPassThroughAndPureOutSkipsStaging)
     // no per-tensor malloc), but its buffer is handed to the kernel with no
     // staging; the child is passed through.
     EXPECT_EQ(fake_.device_malloc_count, 1);
-    EXPECT_EQ(fake_.retained_size, align_up(64, kAlign));
+    EXPECT_EQ(fake_.retained_size, align_up(64, kAlign) + kAlign - 1);
     // The pure-OUT tensor is neither copied nor memset and the child is passed
     // through, so no tensor copy-in and no memset — the single copy_to is the
     // runtime arena image upload that every bind performs.

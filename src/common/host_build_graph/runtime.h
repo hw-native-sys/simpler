@@ -16,7 +16,7 @@
  * only handles:
  * - Handshake buffers for AICPU-AICore communication
  * - Execution parameters (block_dim, aicpu_thread_num)
- * - simpler::hbg::Tensor pair management for host-device memory tracking
+ * - simpler::hbg::Tensor lease management for host-device memory tracking
  * - Device orchestration state (gm_sm_ptr_, orch_args_)
  * - Function address mapping (func_id_to_addr_)
  *
@@ -39,6 +39,7 @@
 #include "task_args.h"
 #include "aicore_teardown.h"
 #include "host_build_graph/entry_args.h"  // EntryArgsStorage
+#include "utils/tensor_lease.h"
 
 // =============================================================================
 // Configuration Macros
@@ -106,20 +107,6 @@ struct Handshake {
 // Runtime::teardown_gates, one isolated line each; A5 leaves them unused.
 static_assert(sizeof(Handshake) == 64);
 static_assert(std::is_standard_layout_v<Handshake> && std::is_trivially_copyable_v<Handshake>);
-
-/**
- * simpler::hbg::Tensor pair for tracking host-device memory mappings.
- * Used for copy-back during finalize.
- */
-struct TensorPair {
-    void *host_ptr;
-    void *dev_ptr;
-    size_t size;
-    // false for read-only INPUT tensors: they are never written by the kernel,
-    // so the end-of-run D2H copy-back is skipped. OUTPUT/INOUT/unknown
-    // keep the safe default of copying back.
-    bool needs_copy_back = true;
-};
 
 /**
  * Task structure - Compatibility stub for platform layer
@@ -315,7 +302,7 @@ public:
     // Runtime image also carries the host-only std::vector control block, which
     // device code must not inspect. No fixed cap — grows with the chip-level
     // entry-tensor count.
-    std::vector<TensorPair> tensor_pairs_;
+    std::vector<TensorLease> tensor_leases_;
 };
 
 // Number of bytes of the Runtime image that must be copied to the device.

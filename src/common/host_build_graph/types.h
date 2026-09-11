@@ -19,7 +19,7 @@
  * defined in tensor.h.
  *
  * This header is independent of orch_build_graph_runtime.h to allow inclusion from runtime.h
- * without type conflicts (Handshake, TensorPair, HostApi).
+ * without type conflicts (Handshake, TensorLease, HostApi).
  */
 
 #pragma once

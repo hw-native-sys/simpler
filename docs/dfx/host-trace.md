@@ -152,7 +152,7 @@ output sees the original text; a consumer reading the raw log does not.
 ```text
 chip.run                                      (= host_wall)
 ├─ chip.run.bind
-│  ├─ chip.run.bind.args        (ntensor=N: per-tensor device_malloc + H2D)
+│  ├─ chip.run.bind.args        (ntensor=N: per-tensor retained-buffer slice + H2D)
 │  ├─ chip.run.bind.prebuilt    (TMR: prebuilt runtime-arena cache hit or build + upload)
 │  └─ .{arena_build,static_arena,gm_heap,shared_mem,runtime_init,host_orch,
 │       graph_upload,arena_h2d,host_view_close}

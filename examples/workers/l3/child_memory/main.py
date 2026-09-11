@@ -16,8 +16,8 @@ Pattern (the "load weights once, run kernel many times" idiom):
   * ``orch.copy_to(dev_handle, host_buffer)`` — H2D upload of the weight.
   * ``Tensor.make(dev_ptr, shape, dtype, child_memory=True)`` —
     wrap the worker pointer as a tensor that the runtime treats as
-    *already on device*. ``init_runtime_impl`` skips malloc + H2D copy
-    for these and does not record them in ``tensor_pairs``, so the buffer
+    *already on device*. The runtime's bind skips staging + H2D copy for
+    these and keeps them out of its host-side staging ledger, so the buffer
     is **not** freed at the end of the task — it stays live for the next
     invocation.
   * Submit two kernel tasks pinned to the same worker, both reading the

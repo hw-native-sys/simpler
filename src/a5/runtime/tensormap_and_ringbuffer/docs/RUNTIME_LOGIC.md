@@ -108,15 +108,17 @@ different buffers even though they share arena bank 0 for device scratch.
 The platform side is deliberately thin: `DeviceRunnerBase` only remembers a
 `{addr, size}` slot per pipeline slot, exposed through two HostApi callbacks —
 `get_retained_temp_buffer` and `set_retained_temp_buffer`. It is not an
-allocator; all grow/pack/slice logic lives in `runtime_maker.cpp`
-(`RetainedTempBump`).
+allocator; the grow/slice logic lives in `RetainedTempBump`
+(`src/common/utils/retained_temp_bump.h`, shared with `host_build_graph`), and
+the packing that sizes it stays in `runtime_maker.cpp` next to the staging loop
+it mirrors.
 
-On each trb bind, `RetainedTempBump`:
+On each trb bind, staging:
 
 - packs the run's non-child, non-empty tensors to a required size, aligning
-  each slice up to 1024 bytes (TRB kernels require 1024-aligned device
-  pointers, which `device_malloc` already guarantees, so the retained base and
-  every 1024-aligned slice stay aligned without a base fix-up);
+  each slice up to 1024 bytes (kernels require 1024-aligned device pointers,
+  which `device_malloc` already guarantees, so the retained base and every
+  1024-aligned slice stay aligned without a base fix-up);
 - reads the slot via `get_retained_temp_buffer`; if `required` exceeds the
   retained size it `device_free`s the old buffer, `device_malloc`s a new one,
   and writes it back via `set_retained_temp_buffer` (no data preserved across
@@ -126,6 +128,19 @@ On each trb bind, `RetainedTempBump`:
   offset. Slices always fit because the buffer was sized from the same
   tensors; a miss is a caller bug (reported, bind fails). The runtime never
   falls back to `device_malloc` mid-run.
+
+A pure `OUT` tensor is staged into a slice but never copied in, and nothing
+zero-fills it, so the bytes a kernel does not write are whatever the slice last
+held. On a run that reuses the retained buffer unchanged, that is whatever the
+previous tensor occupying that byte range left there — the same tensor's own
+bytes only when the same callable runs consecutively with the same argument
+layout, since the slot is keyed by pipeline slot alone. A run that allocated or
+grew the buffer gets uninitialized allocator residue, since `begin()` neither
+preserves nor initializes a replacement buffer. A kernel that writes only part of
+its output therefore fails deterministically across a fixed-shape workload's
+steady-state rounds and randomly elsewhere. `device_memset` exists for
+zero-filling pure outputs; it is not used here, because it would cost a device
+operation per output per run.
 
 Slices are recorded as `BufferNoop` leases: per-tensor release is a no-op, and
 the retained buffer is neither freed at end of run nor per run — each slot's
