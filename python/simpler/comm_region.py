@@ -20,26 +20,29 @@ from enum import Enum, IntEnum
 from typing import Any
 
 from _task_interface import (  # pyright: ignore[reportMissingImports]
+    AccessMode,
+    BufferDescriptor,
     _host_vmm_copy_from,
     _host_vmm_copy_to,
     _region_counter_notify,
     _region_counter_test,
     _region_counter_wait,
     _worker_host_mapped_region_close,
+    _worker_host_mapped_region_mapped_base,
 )
 
-from .buffer import AddressSpace, Buffer
+from .buffer import AddressSpace, BackendKind, Buffer
 from .comm_endpoints import (
     DEVICE_AICPU,
     HOST_CPU,
     AdapterKind,
     AdapterProfile,
     AttachmentRole,
-    BackendKind,
     BackendPlan,
     EndpointDeploymentKind,
     EndpointRecord,
     EndpointRegistry,
+    EndpointResolveError,
     MemberAttachmentPlan,
     RegionLayoutSpec,
     RegionPartPlan,
@@ -49,7 +52,6 @@ from .comm_endpoints import (
     parse_endpoint_path,
 )
 from .comm_provider import (
-    PosixShmImport,
     ProviderReleaseStatus,
     RegionAllocationError,
     RegionAllocationResult,
@@ -59,7 +61,9 @@ from .comm_provider import (
     RegionPartAllocationSpec,
     RegionPartKind,
     RegionPartLocalView,
-    VmmShareableHandleImport,
+    _align_up,
+    _posix_token_from_descriptor,
+    _vmm_shareable_facts,
     validate_independent_local_views,
 )
 from .comm_provider_control import (
@@ -71,6 +75,34 @@ from .comm_provider_control import (
     encode_request,
     parse_reply,
 )
+
+_COUNTER_BASE_ALIGNMENT = 64
+
+
+class _RegionPartAttachment:
+    def __init__(self, part: RegionPartKind, descriptor: BufferDescriptor, native_lease: Any) -> None:
+        self.part = RegionPartKind(part)
+        self.descriptor = descriptor
+        self.native_lease = native_lease
+        self._closed = False
+
+    @property
+    def identity(self):
+        return self.descriptor.identity
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        lease = self.native_lease
+        if lease is None:
+            return
+        closer = getattr(lease, "close", None)
+        if closer is not None:
+            closer()
+            return
+        _worker_host_mapped_region_close(int(lease))
+
 
 _GENERATION_COUNTER = itertools.count(1)
 _MAX_SIGNED_CHRONO_TIMEOUT_NS = 2**63 - 1
@@ -162,6 +194,8 @@ class HostVmmCopyAccess:
 
     @classmethod
     def from_mapping(cls, mapping: Any) -> HostVmmCopyAccess:
+        if isinstance(mapping, _RegionPartAttachment):
+            mapping = mapping.native_lease
         return cls(getattr(mapping, "handle", mapping))
 
     @property
@@ -486,8 +520,8 @@ class RegionInstance:
         )
         self._worker = ctx.worker
         self._cleanup_resources = getattr(ctx.worker, "_building_run_resources", None)
-        self._payload_mapping: Any | None = None
-        self._counter_mapping: Any | None = None
+        self._payload_attachment: _RegionPartAttachment | None = None
+        self._counter_attachment: _RegionPartAttachment | None = None
         self._payload_part: PayloadPart | None = None
         self._counter_part: CounterPart | None = None
         self._payload_local_view: RegionPartLocalView | None = None
@@ -573,7 +607,12 @@ class RegionInstance:
             return
         if self._state is RegionInstanceState.CLOSE_FAILED and self._cleanup_error is not None:
             raise self._cleanup_error
-        if self._state is None and self._provider_resource_id == 0 and self._payload_mapping is None:
+        if (
+            self._state is None
+            and self._provider_resource_id == 0
+            and self._payload_attachment is None
+            and self._counter_attachment is None
+        ):
             self._state = RegionInstanceState.CLOSED
             self._worker._region_instance_registry._settle(self)
             return
@@ -634,17 +673,15 @@ class RegionInstance:
 
     def _close_mapping_leases(self) -> list[BaseException]:
         errors: list[BaseException] = []
-        for lease in (self._payload_mapping, self._counter_mapping):
-            if lease is None:
+        for attachment in (self._payload_attachment, self._counter_attachment):
+            if attachment is None:
                 continue
             try:
-                closer = getattr(lease, "close", None)
-                if closer is not None:
-                    closer()
-                else:
-                    _worker_host_mapped_region_close(int(lease))
+                attachment.close()
             except BaseException as exc:  # noqa: BLE001
                 errors.append(exc)
+        self._payload_attachment = None
+        self._counter_attachment = None
         return errors
 
     def _release_provider_resource(self) -> BaseException | None:
@@ -921,7 +958,7 @@ def _delegated_allocate_request(
     )
 
 
-def materialize_region_instance(ctx: MaterializationContext) -> RegionInstance:
+def materialize_region_instance(ctx: MaterializationContext) -> RegionInstance:  # noqa: PLR0912
     shape = validate_single_owner_region_shape(ctx)
     spec = project_region_allocation_spec(ctx.plan, ctx.layout)
     instance = RegionInstance.planned(ctx, shape)
@@ -929,6 +966,14 @@ def materialize_region_instance(ctx: MaterializationContext) -> RegionInstance:
     ctx.worker._region_instance_registry.track(instance, resources)
     if resources is not None:
         resources.requires_ordered_cleanup = True
+    allocator_state = ctx.registry._buffer_identity_allocator_state(shape.provider)
+    if allocator_state is not True:
+        instance._state = RegionInstanceState.CLOSED
+        ctx.worker._region_instance_registry._settle(instance)
+        raise MaterializationRefusal(
+            RefusalReason.UNSUPPORTED_PROVIDER_DEPLOYMENT,
+            "Provider endpoint does not have a Buffer identity allocator",
+        )
     dispatcher = getattr(ctx.worker, "_dispatch_delegated_allocate", None)
     if not callable(dispatcher):
         ctx.worker._region_instance_registry._settle(instance)
@@ -952,37 +997,83 @@ def materialize_region_instance(ctx: MaterializationContext) -> RegionInstance:
                 reply_payload = staged
             outcome = parse_reply(reply_payload).decode_outcome()
         if isinstance(outcome, DelegatedAllocateReply) and outcome.tag is DelegatedAllocateReplyTag.ALLOCATED:
+            expected_backend = ctx.worker._provider_import_backend_kind()
             try:
                 if outcome.result is None or outcome.payload_view is None or outcome.counter_view is None:
                     raise MaterializationError("delegated ALLOCATED reply is missing result or local views")
+                _validate_registry_matches_worker(ctx)
                 validate_committed_region_allocation(
                     ctx.plan,
                     spec,
                     outcome.result,
                     outcome.payload_view,
                     outcome.counter_view,
-                    expected_capability_type=ctx.worker._provider_import_capability_type(),
+                    registry=ctx.registry,
+                    admitted_provider=instance.provider,
+                    expected_backend_kind=expected_backend,
                     expected_device_id=int(shape.provider_device_id),
                 )
             except BaseException as exc:
                 ctx.worker._latch_delegated_session_fatal(exc)
                 raise
             instance._commit_delegated_allocation(int(outcome.result.provider_resource_id))
-            payload_lease = ctx.worker._import_region_part_lease(
-                instance.worker_id, instance._provider_resource_id, outcome.result.export_descriptor.payload
-            )
-            instance._payload_mapping = payload_lease
-            counter_lease = ctx.worker._import_region_part_lease(
-                instance.worker_id, instance._provider_resource_id, outcome.result.export_descriptor.counter
-            )
-            instance._counter_mapping = counter_lease
+            payload_desc = outcome.result.export_descriptor.payload
+            counter_desc = outcome.result.export_descriptor.counter
+            payload_lease = None
+            counter_lease = None
+            try:
+                payload_lease = ctx.worker._import_region_part_lease(
+                    instance.worker_id,
+                    instance._provider_resource_id,
+                    payload_desc,
+                    part=RegionPartKind.PAYLOAD,
+                )
+                _validate_imported_lease(
+                    payload_desc,
+                    payload_lease,
+                    part=RegionPartKind.PAYLOAD,
+                    expected_backend_kind=expected_backend,
+                )
+                instance._payload_attachment = _RegionPartAttachment(
+                    RegionPartKind.PAYLOAD, payload_desc, payload_lease
+                )
+                payload_lease = None
+                counter_lease = ctx.worker._import_region_part_lease(
+                    instance.worker_id,
+                    instance._provider_resource_id,
+                    counter_desc,
+                    part=RegionPartKind.COUNTER,
+                )
+                _validate_imported_lease(
+                    counter_desc,
+                    counter_lease,
+                    part=RegionPartKind.COUNTER,
+                    expected_backend_kind=expected_backend,
+                )
+                instance._counter_attachment = _RegionPartAttachment(
+                    RegionPartKind.COUNTER, counter_desc, counter_lease
+                )
+                counter_lease = None
+            except BaseException:
+                if counter_lease is not None:
+                    _close_native_lease(counter_lease)
+                if instance._payload_attachment is not None:
+                    instance._payload_attachment.close()
+                    instance._payload_attachment = None
+                elif payload_lease is not None:
+                    _close_native_lease(payload_lease)
+                raise
             instance._payload_part = PayloadPart(
                 RegionPartSpan(offset=0, nbytes=int(spec.payload.logical_bytes)),
-                _select_host_vmm_copy_access(ctx.plan.payload, instance.provider, instance.consumer, payload_lease),
+                _select_host_vmm_copy_access(
+                    ctx.plan.payload, instance.provider, instance.consumer, instance._payload_attachment
+                ),
             )
             instance._counter_part = CounterPart(
                 RegionPartSpan(offset=0, nbytes=int(spec.counter.logical_bytes)),
-                _select_host_vmm_copy_access(ctx.plan.counter, instance.provider, instance.consumer, counter_lease),
+                _select_host_vmm_copy_access(
+                    ctx.plan.counter, instance.provider, instance.consumer, instance._counter_attachment
+                ),
             )
             instance._payload_local_view = outcome.payload_view
             instance._counter_local_view = outcome.counter_view
@@ -1011,6 +1102,75 @@ def materialize_region_instance(ctx: MaterializationContext) -> RegionInstance:
         raise
 
 
+def _close_native_lease(lease: Any) -> None:
+    if lease is None:
+        return
+    closer = getattr(lease, "close", None)
+    if closer is not None:
+        closer()
+        return
+    _worker_host_mapped_region_close(int(lease))
+
+
+def _imported_lease_base(lease: Any) -> int | None:
+    mapped = getattr(lease, "mapped_base", None)
+    if mapped is not None:
+        return int(mapped)
+    handle = getattr(lease, "handle", lease)
+    try:
+        return int(_worker_host_mapped_region_mapped_base(int(handle)))
+    except Exception:
+        return None
+
+
+def _validate_imported_lease(
+    descriptor: BufferDescriptor,
+    lease: Any,
+    *,
+    part: RegionPartKind,
+    expected_backend_kind: BackendKind,
+) -> None:
+    if descriptor.backend_kind is not expected_backend_kind:
+        raise RuntimeError("imported lease backend does not match the current execution environment")
+    if RegionPartKind(part) is not RegionPartKind.COUNTER:
+        return
+    base = _imported_lease_base(lease)
+    if base is None:
+        return
+    if int(base) % _COUNTER_BASE_ALIGNMENT != 0:
+        raise RuntimeError("COUNTER mapped base must be 64-byte aligned")
+
+
+def _require_legal_actual_lowering(
+    descriptor: BufferDescriptor,
+    *,
+    planned: BackendKind,
+    expected_actual: BackendKind,
+    part_name: str,
+) -> None:
+    if planned is not BackendKind.VMM_SHAREABLE:
+        raise RuntimeError(f"committed {part_name} planned backing does not match the admitted plan")
+    if descriptor.backend_kind is not expected_actual:
+        raise RuntimeError("committed actual backend is not the legal lowering of the admitted plan")
+    if expected_actual is BackendKind.POSIX_SHM and descriptor.address_space is not AddressSpace.HOST:
+        raise RuntimeError("SIM POSIX_SHM descriptors must use HOST address space")
+    if expected_actual is BackendKind.VMM_SHAREABLE and descriptor.address_space is not AddressSpace.DEVICE:
+        raise RuntimeError("ONBOARD VMM_SHAREABLE descriptors must use DEVICE address space")
+
+
+def _require_exact_provider_owner(
+    descriptor: BufferDescriptor,
+    registry: EndpointRegistry,
+    admitted_provider: EndpointRecord,
+) -> None:
+    try:
+        owner = registry.owner_endpoint(bytes(descriptor.identity.owner_instance_id))
+    except EndpointResolveError as exc:
+        raise RuntimeError("BufferDescriptor owner is not the admitted Provider") from exc
+    if owner.identity != admitted_provider.identity:
+        raise RuntimeError("BufferDescriptor owner is not the admitted Provider")
+
+
 def validate_committed_region_allocation(  # noqa: PLR0912
     plan: BackendPlan,
     spec: RegionAllocationSpec,
@@ -1018,46 +1178,58 @@ def validate_committed_region_allocation(  # noqa: PLR0912
     payload_view: RegionPartLocalView,
     counter_view: RegionPartLocalView,
     *,
-    expected_capability_type: type,
+    registry: EndpointRegistry,
+    admitted_provider: EndpointRecord,
+    expected_backend_kind: BackendKind,
     expected_device_id: int | None,
 ) -> None:
-    payload_export = result.export_descriptor.payload
-    counter_export = result.export_descriptor.counter
-    if payload_export.planned_backing_kind is not plan.payload.backend_kind:
-        raise RuntimeError("committed PAYLOAD planned backing does not match the admitted plan")
-    if counter_export.planned_backing_kind is not plan.counter.backend_kind:
-        raise RuntimeError("committed COUNTER planned backing does not match the admitted plan")
-    if payload_export.planned_backing_kind is not spec.payload.planned_backing_kind:
+    payload = result.export_descriptor.payload
+    counter = result.export_descriptor.counter
+    if not isinstance(payload, BufferDescriptor) or not isinstance(counter, BufferDescriptor):
+        raise RuntimeError("committed export descriptors must be BufferDescriptor")
+    if payload.access is not AccessMode.READWRITE or counter.access is not AccessMode.READWRITE:
+        raise RuntimeError("region BufferDescriptors must be READWRITE")
+    if int(payload.identity.generation) != 1 or int(counter.identity.generation) != 1:
+        raise RuntimeError("region BufferDescriptor generation must be 1")
+    if payload.identity == counter.identity:
+        raise RuntimeError("PAYLOAD and COUNTER identities must differ")
+    if bytes(payload.identity.owner_instance_id) != bytes(counter.identity.owner_instance_id):
+        raise RuntimeError("PAYLOAD and COUNTER must share one owner nonce")
+    _require_exact_provider_owner(payload, registry, admitted_provider)
+    if plan.payload.backend_kind is not spec.payload.planned_backing_kind:
         raise RuntimeError("committed PAYLOAD planned backing does not match the admitted spec")
-    if counter_export.planned_backing_kind is not spec.counter.planned_backing_kind:
+    if plan.counter.backend_kind is not spec.counter.planned_backing_kind:
         raise RuntimeError("committed COUNTER planned backing does not match the admitted spec")
-    if int(payload_export.logical_bytes) != int(spec.payload.logical_bytes):
+    _require_legal_actual_lowering(
+        payload,
+        planned=plan.payload.backend_kind,
+        expected_actual=expected_backend_kind,
+        part_name="PAYLOAD",
+    )
+    _require_legal_actual_lowering(
+        counter,
+        planned=plan.counter.backend_kind,
+        expected_actual=expected_backend_kind,
+        part_name="COUNTER",
+    )
+    if int(payload.nbytes) != int(spec.payload.logical_bytes):
         raise RuntimeError("committed PAYLOAD logical_bytes do not match the admitted spec")
-    if int(counter_export.logical_bytes) != int(spec.counter.logical_bytes):
+    if int(counter.nbytes) != int(spec.counter.logical_bytes):
         raise RuntimeError("committed COUNTER logical_bytes do not match the admitted spec")
-    if not isinstance(payload_export.import_capability, expected_capability_type) or not isinstance(
-        counter_export.import_capability, expected_capability_type
-    ):
-        raise RuntimeError("committed import capability does not match the current execution environment")
-    if expected_capability_type is VmmShareableHandleImport:
-        payload_cap = payload_export.import_capability
-        counter_cap = counter_export.import_capability
-        assert isinstance(payload_cap, VmmShareableHandleImport)
-        assert isinstance(counter_cap, VmmShareableHandleImport)
-        if int(payload_cap.shareable_handle) == int(counter_cap.shareable_handle):
+    if expected_backend_kind is BackendKind.POSIX_SHM:
+        if _posix_token_from_descriptor(payload) == _posix_token_from_descriptor(counter):
+            raise RuntimeError("POSIX shm tokens must be distinct")
+    elif expected_backend_kind is BackendKind.VMM_SHAREABLE:
+        payload_device, payload_handle, _payload_mapping = _vmm_shareable_facts(payload)
+        counter_device, counter_handle, counter_mapping = _vmm_shareable_facts(counter)
+        if int(payload_handle) == int(counter_handle):
             raise RuntimeError("committed VMM shareable handles must be distinct")
         if expected_device_id is not None and (
-            int(payload_cap.device_id) != int(expected_device_id)
-            or int(counter_cap.device_id) != int(expected_device_id)
+            int(payload_device) != int(expected_device_id) or int(counter_device) != int(expected_device_id)
         ):
             raise RuntimeError("committed VMM device_id is outside this worker's device namespace")
-    elif expected_capability_type is PosixShmImport:
-        payload_cap = payload_export.import_capability
-        counter_cap = counter_export.import_capability
-        assert isinstance(payload_cap, PosixShmImport)
-        assert isinstance(counter_cap, PosixShmImport)
-        if payload_cap.shm_name == counter_cap.shm_name:
-            raise RuntimeError("committed POSIX shm tokens must be distinct")
+        if int(counter_mapping) < _align_up(int(counter.nbytes), _COUNTER_BASE_ALIGNMENT):
+            raise RuntimeError("COUNTER VMM mapping_bytes must cover 64-byte alignment")
     if payload_view.part is not RegionPartKind.PAYLOAD or counter_view.part is not RegionPartKind.COUNTER:
         raise RuntimeError("committed local views must be PAYLOAD then COUNTER")
     if int(payload_view.logical_bytes) != int(spec.payload.logical_bytes):
@@ -1098,10 +1270,10 @@ def _validate_registry_matches_worker(ctx: MaterializationContext) -> None:
 
 
 def _validate_part(part: RegionPartPlan, provider: EndpointRecord, consumer: EndpointRecord) -> None:
-    if part.backend_kind is not BackendKind.VMM_WINDOW:
+    if part.backend_kind is not BackendKind.VMM_SHAREABLE:
         raise MaterializationRefusal(
             RefusalReason.UNSUPPORTED_BACKEND_KIND,
-            "Only VMM_WINDOW-backed worker-chip region parts are supported",
+            "Only VMM_SHAREABLE-backed worker-chip region parts are supported",
         )
     attachments = {attachment.member: attachment for attachment in part.attachments}
     if len(attachments) != len(part.attachments) or set(attachments) != {provider.identity, consumer.identity}:

@@ -3837,6 +3837,14 @@ NB_MODULE(_task_interface, m) {
         nb::arg("handle"), nb::call_guard<nb::gil_scoped_release>(), "Close an L3 Host mapped-region handle."
     );
     m.def(
+        "_worker_host_mapped_region_mapped_base",
+        [](uint64_t handle) -> uint64_t {
+            RegionLease mapping = region_registry().lease(handle);
+            return mapping->device_addr;
+        },
+        nb::arg("handle"), "Return the mapped base VA for one L3 Host mapped-region handle."
+    );
+    m.def(
         "_worker_host_mapped_region_active_leases",
         [](uint64_t handle) {
             return region_registry().active_leases(handle);
@@ -3950,6 +3958,14 @@ NB_MODULE(_task_interface, m) {
         },
         nb::arg("handle"), nb::arg("counter_offset"), nb::arg("operand"), nb::arg("cmp"), nb::arg("timeout_ns"),
         nb::call_guard<nb::gil_scoped_release>(), "Poll one L3 Host-side L3-L2 signal counter until match or timeout."
+    );
+    m.def(
+        "_region_vmm_granularity",
+        [](int device_id) -> uint64_t {
+            return region_vmm_granularity(device_id);
+        },
+        nb::arg("device_id"), nb::call_guard<nb::gil_scoped_release>(),
+        "Provider/consumer runtime VMM granularity for one device."
     );
     m.def(
         "_region_vmm_begin",

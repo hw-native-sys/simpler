@@ -19,25 +19,30 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
-from typing import Any, Optional, Union, cast
+from typing import Any, Optional, cast
 from unittest.mock import MagicMock
 
 import pytest
 from simpler import comm_endpoints as ce
 from simpler import comm_region, worker_chip_orch_comm
 from simpler import worker as worker_module
-from simpler.buffer import BackendKind, mint_owner_instance_id, wrap_fork_inherited
+from simpler.buffer import (
+    AccessMode,
+    AddressSpace,
+    BackendKind,
+    BufferDescriptor,
+    CanonicalIdentity,
+    mint_owner_instance_id,
+    wrap_fork_inherited,
+)
 from simpler.comm_provider import (
-    PosixShmImport,
     ProviderReleaseResult,
     ProviderReleaseStatus,
     RegionAllocationResult,
     RegionControlError,
     RegionExportDescriptor,
-    RegionPartExportDescriptor,
     RegionPartKind,
     RegionPartLocalView,
-    VmmShareableHandleImport,
 )
 from simpler.orchestrator import Orchestrator
 from simpler.task_interface import DataType
@@ -64,6 +69,49 @@ _ACCESS_ONBOARD_VMM = 1
 _ACCESS_SIM_POSIX_SHM = 2
 _TEST_WALL_BUDGET_S = 30.0
 _TEST_WALL_BUDGET_NS = int(_TEST_WALL_BUDGET_S * 1_000_000_000)
+_FAKE_POSIX_OBJECT_SIZES: dict[str, int] = {}
+
+
+@pytest.fixture(autouse=True)
+def _fake_region_runtime_facts(monkeypatch):
+    real_posix_object_size = worker_module._posix_object_size
+
+    def _posix_object_size(token: str) -> int:
+        recorded = _FAKE_POSIX_OBJECT_SIZES.get(str(token))
+        if recorded is not None:
+            return int(recorded)
+        return real_posix_object_size(token)
+
+    monkeypatch.setattr(worker_module, "_posix_object_size", _posix_object_size)
+    monkeypatch.setattr(worker_module, "_region_vmm_granularity", lambda _device_id: 1)
+
+
+def _vmm_shareable_body(*, device_id: int, shareable_handle: int, mapping_bytes: int) -> bytes:
+    return (
+        int(device_id).to_bytes(4, "little", signed=True)
+        + (0).to_bytes(4, "little")
+        + int(shareable_handle).to_bytes(8, "little")
+        + int(mapping_bytes).to_bytes(8, "little")
+    )
+
+
+def _region_part_descriptor(
+    *,
+    owner_nonce: bytes,
+    buffer_id: int,
+    nbytes: int,
+    backend_kind: BackendKind,
+    body: bytes,
+) -> BufferDescriptor:
+    space = AddressSpace.HOST if backend_kind is BackendKind.POSIX_SHM else AddressSpace.DEVICE
+    return BufferDescriptor(
+        CanonicalIdentity(bytes(owner_nonce), int(buffer_id), 1),
+        space,
+        AccessMode.READWRITE,
+        backend_kind,
+        int(nbytes),
+        body,
+    )
 
 
 def _wait_until(predicate, failure_message: str) -> None:
@@ -145,6 +193,7 @@ class _FakeDirectCWorker:
         region_id: Optional[int] = None,
         mapping_bytes: Optional[int] = None,
         corrupt_access_profile: bool = False,
+        owner_nonce: Optional[bytes] = None,
     ):
         self.create_calls: list[tuple[int, int]] = []
         self.release_calls: list[tuple[int, int]] = []
@@ -159,6 +208,7 @@ class _FakeDirectCWorker:
         self.region_id = region_id
         self.mapping_bytes = mapping_bytes
         self.corrupt_access_profile = bool(corrupt_access_profile)
+        self.owner_nonce = owner_nonce
         self.allocate_specs: list[Any] = []
 
     def close(self) -> None:
@@ -195,26 +245,54 @@ class _FakeDirectCWorker:
             counter_bytes = int(spec.counter.logical_bytes)
             payload_mapping = payload_bytes if self.mapping_bytes is None else int(self.mapping_bytes)
             counter_mapping = counter_bytes if self.mapping_bytes is None else int(self.mapping_bytes)
+            owner_nonce = self.owner_nonce
+            if owner_nonce is None:
+                raise RuntimeError("FakeDirectCWorker requires owner_nonce")
             if sim:
-                payload_cap: Union[PosixShmImport, VmmShareableHandleImport] = PosixShmImport(
-                    f"sim-direct-{region_id}-p"
+                payload_token = f"sim-direct-{region_id}-p"
+                counter_token = f"sim-direct-{region_id}-c"
+                _FAKE_POSIX_OBJECT_SIZES[payload_token] = payload_bytes
+                _FAKE_POSIX_OBJECT_SIZES[counter_token] = counter_bytes
+                payload_desc = _region_part_descriptor(
+                    owner_nonce=owner_nonce,
+                    buffer_id=1,
+                    nbytes=payload_bytes,
+                    backend_kind=BackendKind.POSIX_SHM,
+                    body=payload_token.encode("ascii"),
                 )
-                counter_cap: Union[PosixShmImport, VmmShareableHandleImport] = PosixShmImport(
-                    f"sim-direct-{region_id}-c"
+                counter_desc = _region_part_descriptor(
+                    owner_nonce=owner_nonce,
+                    buffer_id=2,
+                    nbytes=counter_bytes,
+                    backend_kind=BackendKind.POSIX_SHM,
+                    body=counter_token.encode("ascii"),
                 )
             else:
-                payload_cap = VmmShareableHandleImport(self.device_id, self.shareable_handle)
-                counter_cap = VmmShareableHandleImport(self.device_id, self.shareable_handle + 1)
+                payload_desc = _region_part_descriptor(
+                    owner_nonce=owner_nonce,
+                    buffer_id=1,
+                    nbytes=payload_bytes,
+                    backend_kind=BackendKind.VMM_SHAREABLE,
+                    body=_vmm_shareable_body(
+                        device_id=self.device_id,
+                        shareable_handle=self.shareable_handle,
+                        mapping_bytes=max(payload_mapping, payload_bytes),
+                    ),
+                )
+                counter_desc = _region_part_descriptor(
+                    owner_nonce=owner_nonce,
+                    buffer_id=2,
+                    nbytes=counter_bytes,
+                    backend_kind=BackendKind.VMM_SHAREABLE,
+                    body=_vmm_shareable_body(
+                        device_id=self.device_id,
+                        shareable_handle=self.shareable_handle + 1,
+                        mapping_bytes=max(counter_mapping, counter_bytes),
+                    ),
+                )
             result = RegionAllocationResult(
                 provider_resource_id=max(region_id, 1),
-                export_descriptor=RegionExportDescriptor(
-                    payload=RegionPartExportDescriptor(
-                        BackendKind.VMM_WINDOW, payload_bytes, max(payload_mapping, payload_bytes), payload_cap
-                    ),
-                    counter=RegionPartExportDescriptor(
-                        BackendKind.VMM_WINDOW, counter_bytes, max(counter_mapping, counter_bytes), counter_cap
-                    ),
-                ),
+                export_descriptor=RegionExportDescriptor(payload=payload_desc, counter=counter_desc),
             )
             committed = encode_reply(
                 DelegatedAllocateReply(
@@ -287,6 +365,8 @@ def _make_started_sim_worker() -> tuple[Worker, SharedMemory, _FakeDirectCWorker
     worker._worker = fake_c_worker
     worker._next_level_worker_ids = [0]
     worker._chip_shms = [shm]
+    worker._ensure_local_device_endpoint_identities()
+    fake_c_worker.owner_nonce = worker._device_endpoint_identities[(0, ce.DEVICE_AICPU)][0]
     return worker, shm, fake_c_worker
 
 
@@ -303,6 +383,8 @@ def _make_started_onboard_worker(platform: str = "a2a3") -> tuple[Worker, Shared
     worker._worker = fake_c_worker
     worker._next_level_worker_ids = [0]
     worker._chip_shms = [shm]
+    worker._ensure_local_device_endpoint_identities()
+    fake_c_worker.owner_nonce = worker._device_endpoint_identities[(0, ce.DEVICE_AICPU)][0]
     return worker, shm, fake_c_worker
 
 
@@ -347,9 +429,11 @@ def test_sim_direct_region_uses_lifecycle_control_and_worker_host_metadata(monke
         assert len(fake_c_worker.create_calls) == 1
         assert region.descriptor_scalars() == [0x4C334C3200030000, 1, 0xDEAD_0000, 64, 0xDEAD_1000, 128]
         assert 99 not in region.descriptor_scalars()
-        assert region._instance._payload_mapping == 99
-        assert region._instance._counter_mapping == 99
-        assert region._instance._payload_mapping != region.descriptor.payload_base
+        assert region._instance._payload_attachment is not None
+        assert region._instance._counter_attachment is not None
+        assert int(region._instance._payload_attachment.native_lease) == 99
+        assert int(region._instance._counter_attachment.native_lease) == 99
+        assert int(region._instance._payload_attachment.native_lease) != region.descriptor.payload_base
         assert calls[0] == ("import", "sim-direct-1-p", 64, worker._owner_id)
         assert calls[1] == ("import", "sim-direct-1-c", 128, worker._owner_id)
         assert calls[2][0:3] == ("write", 99, 0)
@@ -388,7 +472,8 @@ def test_onboard_direct_region_imports_vmm_shareable_handle_and_uses_worker_host
         assert len(fake_c_worker.create_calls) == 1
         assert region.descriptor_scalars() == [0x4C334C3200030000, 1, 0xDEAD_0000, 64, 0xDEAD_1000, 128]
         assert 123 not in region.descriptor_scalars()
-        assert region._instance._payload_mapping == 123
+        assert region._instance._payload_attachment is not None
+        assert int(region._instance._payload_attachment.native_lease) == 123
         assert calls[0] == ("import_onboard", 2, 0xABCDEF, 64, worker._owner_id)
         assert calls[1] == ("import_onboard", 2, 0xABCDEF + 1, 128, worker._owner_id)
         assert calls[2] == ("notify", 123, 64, 9, int(NotifyOp.Set))
@@ -411,8 +496,8 @@ def test_sim_direct_create_sends_projected_vmm_window_spec(monkeypatch):
 
         assert len(fake_c_worker.allocate_specs) == 1
         spec = fake_c_worker.allocate_specs[0]
-        assert spec.payload.planned_backing_kind is BackendKind.VMM_WINDOW
-        assert spec.counter.planned_backing_kind is BackendKind.VMM_WINDOW
+        assert spec.payload.planned_backing_kind is BackendKind.VMM_SHAREABLE
+        assert spec.counter.planned_backing_kind is BackendKind.VMM_SHAREABLE
         assert spec.payload.logical_bytes == 64
         assert spec.counter.logical_bytes == 128
         assert region.region_id == 1
@@ -448,7 +533,7 @@ def test_direct_create_decode_failure_rolls_back_l2_host_region():
     worker, shm, fake_c_worker = _make_started_sim_worker()
     fake_c_worker.access_profile = _ACCESS_ONBOARD_VMM
     try:
-        with pytest.raises(RuntimeError, match="committed import capability does not match"):
+        with pytest.raises(RuntimeError, match="committed actual backend is not the legal lowering"):
             worker._create_worker_chip_region(0, 64, 128)
 
         assert fake_c_worker.release_calls == []
@@ -474,7 +559,7 @@ def test_direct_create_decode_failure_rolls_back_l2_host_region():
         (
             {"access_profile": _ACCESS_ONBOARD_VMM},
             RuntimeError,
-            "committed import capability does not match",
+            "committed actual backend is not the legal lowering",
             None,
         ),
     ],
@@ -513,8 +598,9 @@ def test_onboard_direct_mapping_bytes_cover_each_independent_part(monkeypatch):
             (2, 0xABCDEF, 191, worker._owner_id),
             (2, 0xABCDEF + 1, 191, worker._owner_id),
         ]
-        assert region._instance._payload_mapping == 123
-        assert region._instance._counter_mapping == 123
+        assert region._instance._payload_attachment is not None
+        assert int(region._instance._payload_attachment.native_lease) == 123
+        assert int(region._instance._counter_attachment.native_lease) == 123
     finally:
         worker._close_worker_chip_orch_comm()
         shm.close()
@@ -538,8 +624,9 @@ def test_onboard_direct_mapping_allows_granularity_aligned_mapping(monkeypatch):
             (2, 0xABCDEF, 65536, worker._owner_id),
             (2, 0xABCDEF + 1, 65536, worker._owner_id),
         ]
-        assert region._instance._payload_mapping == 123
-        assert region._instance._counter_mapping == 123
+        assert region._instance._payload_attachment is not None
+        assert int(region._instance._payload_attachment.native_lease) == 123
+        assert int(region._instance._counter_attachment.native_lease) == 123
     finally:
         worker._close_worker_chip_orch_comm()
         shm.close()

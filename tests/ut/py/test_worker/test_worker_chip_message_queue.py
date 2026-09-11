@@ -18,14 +18,21 @@ from typing import Optional
 import pytest
 from simpler import comm_region
 from simpler import worker as worker_module
-from simpler.buffer import AccessMode, BackendKind, CanonicalIdentity, mint_owner_instance_id, wrap_fork_inherited
+from simpler.buffer import (
+    AccessMode,
+    AddressSpace,
+    BackendKind,
+    BufferDescriptor,
+    CanonicalIdentity,
+    mint_owner_instance_id,
+    wrap_fork_inherited,
+)
+from simpler.comm_endpoints import DEVICE_AICPU
 from simpler.comm_provider import (
-    PosixShmImport,
     ProviderReleaseResult,
     ProviderReleaseStatus,
     RegionAllocationResult,
     RegionExportDescriptor,
-    RegionPartExportDescriptor,
     RegionPartKind,
     RegionPartLocalView,
 )
@@ -124,10 +131,14 @@ class _FakeRequest:
     counter_operand: int = 0
 
 
+_FAKE_POSIX_OBJECT_SIZES: dict[str, int] = {}
+
+
 class _FakeCWorker:
-    def __init__(self):
+    def __init__(self, owner_nonce: Optional[bytes] = None):
         self.next_region_id = 1
         self._last_resource_id = 1
+        self.owner_nonce = owner_nonce
 
     def control_payload(self, _worker_type, worker_id, sub_cmd, payload, _timeout):
         assert int(sub_cmd) == _CTRL_DELEGATED_REGION
@@ -141,20 +152,31 @@ class _FakeCWorker:
             region_id = self.next_region_id
             self.next_region_id += 1
             self._last_resource_id = region_id
+            owner_nonce = self.owner_nonce
+            if owner_nonce is None:
+                raise RuntimeError("FakeCWorker requires owner_nonce")
+            payload_token = f"queue-direct-{region_id}-p"
+            counter_token = f"queue-direct-{region_id}-c"
+            _FAKE_POSIX_OBJECT_SIZES[payload_token] = payload_bytes
+            _FAKE_POSIX_OBJECT_SIZES[counter_token] = counter_bytes
             result = RegionAllocationResult(
                 provider_resource_id=region_id,
                 export_descriptor=RegionExportDescriptor(
-                    payload=RegionPartExportDescriptor(
-                        BackendKind.VMM_WINDOW,
+                    payload=BufferDescriptor(
+                        CanonicalIdentity(bytes(owner_nonce), 1, 1),
+                        AddressSpace.HOST,
+                        AccessMode.READWRITE,
+                        BackendKind.POSIX_SHM,
                         payload_bytes,
-                        payload_bytes,
-                        PosixShmImport(f"queue-direct-{region_id}-p"),
+                        payload_token.encode("ascii"),
                     ),
-                    counter=RegionPartExportDescriptor(
-                        BackendKind.VMM_WINDOW,
+                    counter=BufferDescriptor(
+                        CanonicalIdentity(bytes(owner_nonce), 2, 1),
+                        AddressSpace.HOST,
+                        AccessMode.READWRITE,
+                        BackendKind.POSIX_SHM,
                         counter_bytes,
-                        counter_bytes,
-                        PosixShmImport(f"queue-direct-{region_id}-c"),
+                        counter_token.encode("ascii"),
                     ),
                 ),
             )
@@ -326,6 +348,7 @@ def _make_orchestrator() -> tuple[Orchestrator, Worker, SharedMemory, _FakeClien
     fake_client = _FakeClient()
     fake_client.original_helpers = [
         (worker_module, "_worker_host_mapped_region_import_sim", worker_module._worker_host_mapped_region_import_sim),
+        (worker_module, "_posix_object_size", worker_module._posix_object_size),
         (comm_region, "_host_vmm_copy_to", comm_region._host_vmm_copy_to),
         (comm_region, "_host_vmm_copy_from", comm_region._host_vmm_copy_from),
         (comm_region, "_region_counter_notify", comm_region._region_counter_notify),
@@ -334,14 +357,26 @@ def _make_orchestrator() -> tuple[Orchestrator, Worker, SharedMemory, _FakeClien
         (comm_region, "_worker_host_mapped_region_close", comm_region._worker_host_mapped_region_close),
     ]
     worker._lifecycle = worker_module._Lifecycle.READY
-    worker._worker = _FakeCWorker()
+    fake_c_worker = _FakeCWorker()
+    worker._worker = fake_c_worker
     worker._next_level_worker_ids = [0]
     worker._chip_shms = [shm]
+    worker._ensure_local_device_endpoint_identities()
+    fake_c_worker.owner_nonce = worker._device_endpoint_identities[(0, DEVICE_AICPU)][0]
     worker._worker_chip_test_fake_client = fake_client
     reservation = worker._control_reservation("test_worker_chip_queue")
     reservation.__enter__()
     worker._worker_chip_test_reservation = reservation
     worker_module._worker_host_mapped_region_import_sim = fake_client.import_region
+    real_posix_object_size = worker_module._posix_object_size
+
+    def _posix_object_size(token: str) -> int:
+        recorded = _FAKE_POSIX_OBJECT_SIZES.get(str(token))
+        if recorded is not None:
+            return int(recorded)
+        return real_posix_object_size(token)
+
+    worker_module._posix_object_size = _posix_object_size
     comm_region._worker_host_mapped_region_close = lambda _handle: None
     comm_region._host_vmm_copy_to = fake_client.payload_write
     comm_region._host_vmm_copy_from = fake_client.payload_read

@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Delegated-region control wire (DRCT v1) and terminal transaction table.
+"""Delegated-region control wire (DRCT v2) and terminal transaction table.
 
 This module owns the delegated-region envelope codec. Physical allocation, release, cleanup
 ledger, and sweep authority stay in ProviderRegionStore.
@@ -20,7 +20,13 @@ from dataclasses import dataclass
 from enum import Enum, IntEnum
 from typing import Protocol, TypeVar
 
-from _task_interface import BackendKind  # pyright: ignore[reportMissingImports]
+from _task_interface import (  # pyright: ignore[reportMissingImports]
+    AccessMode,
+    BackendKind,
+    BufferDescriptor,
+    _decode_buffer_descriptor_wire,
+    _encode_buffer_descriptor_wire,
+)
 
 from .comm_endpoints import (
     AdapterKind,
@@ -35,8 +41,6 @@ from .comm_endpoints import (
     parse_endpoint_path,
 )
 from .comm_provider import (
-    POSIX_SHM_TOKEN_MAX_BYTES,
-    PosixShmImport,
     ProviderCleanupFailure,
     ProviderReleaseResult,
     ProviderReleaseStatus,
@@ -49,15 +53,13 @@ from .comm_provider import (
     RegionExportDescriptor,
     RegionOperationKind,
     RegionPartAllocationSpec,
-    RegionPartExportDescriptor,
     RegionPartKind,
     RegionPartLocalView,
-    VmmShareableHandleImport,
     validate_independent_local_views,
 )
 
 DELEGATED_REGION_CTRL_MAGIC = 0x44524354
-DELEGATED_REGION_CTRL_ABI_MAJOR = 1
+DELEGATED_REGION_CTRL_ABI_MAJOR = 2
 DELEGATED_REGION_CTRL_ABI_MINOR = 0
 DELEGATED_REGION_CTRL_MAGIC_VERSION = (
     (DELEGATED_REGION_CTRL_MAGIC << 32) | (DELEGATED_REGION_CTRL_ABI_MAJOR << 16) | DELEGATED_REGION_CTRL_ABI_MINOR
@@ -69,19 +71,17 @@ ALLOCATE_REQUEST_HARD_CEILING = 616
 RELEASE_REQUEST_HARD_CEILING = 296
 REPLY_HEADER_BYTES = 40
 REPLY_TAG_OFFSET = 12
-ALLOCATE_REPLY_BYTES = 256
+ALLOCATE_REPLY_BYTES = 288
 RELEASE_REPLY_BYTES = 72
 PATH_CEILING_BYTES = 256
-EXPORT_PART_BYTES = 72
+BUFFER_DESCRIPTOR_WIRE_BYTES = 88
 LOCAL_VIEW_BYTES = 24
-CAPABILITY_PAYLOAD_BYTES = 40
-VMM_CAPABILITY_PAYLOAD_BYTES = 16
-ALLOCATE_OUTCOME_BYTES = 216
+ALLOCATE_OUTCOME_BYTES = 248
 RELEASE_OUTCOME_BYTES = 32
 ALLOCATE_OUTCOME_OFFSET = REPLY_HEADER_BYTES
-ALLOCATE_PAYLOAD_EXPORT_OFFSET = ALLOCATE_OUTCOME_OFFSET + 24
-ALLOCATE_COUNTER_EXPORT_OFFSET = ALLOCATE_PAYLOAD_EXPORT_OFFSET + EXPORT_PART_BYTES
-ALLOCATE_PAYLOAD_VIEW_OFFSET = ALLOCATE_COUNTER_EXPORT_OFFSET + EXPORT_PART_BYTES
+ALLOCATE_PAYLOAD_DESCRIPTOR_OFFSET = ALLOCATE_OUTCOME_OFFSET + 24
+ALLOCATE_COUNTER_DESCRIPTOR_OFFSET = ALLOCATE_PAYLOAD_DESCRIPTOR_OFFSET + BUFFER_DESCRIPTOR_WIRE_BYTES
+ALLOCATE_PAYLOAD_VIEW_OFFSET = ALLOCATE_COUNTER_DESCRIPTOR_OFFSET + BUFFER_DESCRIPTOR_WIRE_BYTES
 ALLOCATE_COUNTER_VIEW_OFFSET = ALLOCATE_PAYLOAD_VIEW_OFFSET + LOCAL_VIEW_BYTES
 RELEASE_OUTCOME_OFFSET = REPLY_HEADER_BYTES
 FAILURE_MASK_PAYLOAD = 1
@@ -92,26 +92,23 @@ _ALLOCATE_PROJECTION = struct.Struct("<IIIIQIIIIQIIII")
 _REPLY_HEADER = struct.Struct("<QIIII8sQ")
 _REPLY_TAG = struct.Struct("<I")
 _ALLOCATE_OUTCOME_PREFIX = struct.Struct("<QIIII")
-_EXPORT_PART = struct.Struct("<IIQQII40s")
 _LOCAL_VIEW = struct.Struct("<IIQQ")
 _RELEASE_OUTCOME = struct.Struct("<QIIIIII")
-_VMM_CAPABILITY = struct.Struct("<iI Q")
 _PATH_ROOT_RE = re.compile(r"^L([0-9]+)$")
 _UINT64_MAX = (1 << 64) - 1
 _BACKEND_KINDS = {int(kind): kind for kind in BackendKind}
 
-assert DELEGATED_REGION_CTRL_MAGIC_VERSION == 0x4452435400010000
+assert DELEGATED_REGION_CTRL_MAGIC_VERSION == 0x4452435400020000
 assert _REQUEST_HEADER.size == REQUEST_HEADER_BYTES
 assert _ALLOCATE_PROJECTION.size == ALLOCATE_PROJECTION_BYTES
 assert _REPLY_HEADER.size == REPLY_HEADER_BYTES
 assert _ALLOCATE_OUTCOME_PREFIX.size == 24
-assert _EXPORT_PART.size == EXPORT_PART_BYTES
 assert _LOCAL_VIEW.size == LOCAL_VIEW_BYTES
 assert _RELEASE_OUTCOME.size == RELEASE_OUTCOME_BYTES
-assert ALLOCATE_PAYLOAD_EXPORT_OFFSET == 64
-assert ALLOCATE_COUNTER_EXPORT_OFFSET == 136
-assert ALLOCATE_PAYLOAD_VIEW_OFFSET == 208
-assert ALLOCATE_COUNTER_VIEW_OFFSET == 232
+assert ALLOCATE_PAYLOAD_DESCRIPTOR_OFFSET == 64
+assert ALLOCATE_COUNTER_DESCRIPTOR_OFFSET == 152
+assert ALLOCATE_PAYLOAD_VIEW_OFFSET == 240
+assert ALLOCATE_COUNTER_VIEW_OFFSET == 264
 assert ALLOCATE_COUNTER_VIEW_OFFSET + LOCAL_VIEW_BYTES == ALLOCATE_REPLY_BYTES
 assert REPLY_HEADER_BYTES + ALLOCATE_OUTCOME_BYTES == ALLOCATE_REPLY_BYTES
 assert REPLY_HEADER_BYTES + RELEASE_OUTCOME_BYTES == RELEASE_REPLY_BYTES
@@ -171,12 +168,6 @@ class DelegatedReleaseReplyTag(IntEnum):
     UNKNOWN_TRANSACTION = 6
 
 
-class ImportCapabilityWireKind(IntEnum):
-    INVALID = 0
-    VMM_SHAREABLE_HANDLE = 1
-    POSIX_SHM = 2
-
-
 @dataclass(frozen=True)
 class DelegatedAllocateRequest:
     session_instance_id: bytes
@@ -188,8 +179,8 @@ class DelegatedAllocateRequest:
     topology: RegionTopologyKind = RegionTopologyKind.SINGLE_OWNER
     initiator_deployment: EndpointDeploymentKind = EndpointDeploymentKind.HOST_CPU
     provider_deployment: EndpointDeploymentKind = EndpointDeploymentKind.DEVICE_AICPU
-    payload_backend_kind: BackendKind = BackendKind.VMM_WINDOW
-    counter_backend_kind: BackendKind = BackendKind.VMM_WINDOW
+    payload_backend_kind: BackendKind = BackendKind.VMM_SHAREABLE
+    counter_backend_kind: BackendKind = BackendKind.VMM_SHAREABLE
     payload_consumer_adapter_kind: AdapterKind = AdapterKind.OWNER_DELEGATED_COPY
     payload_consumer_adapter_profile: AdapterProfile = AdapterProfile.HOST_VMM_COPY
     counter_consumer_adapter_kind: AdapterKind = AdapterKind.OWNER_DELEGATED_COPY
@@ -781,10 +772,14 @@ def _require_first_shape_fields(request: DelegatedAllocateRequest) -> None:
         raise RegionControlError(RegionControlErrorKind.INVALID_FIELD_VALUE, "initiator_deployment must be HOST_CPU")
     if request.provider_deployment is not EndpointDeploymentKind.DEVICE_AICPU:
         raise RegionControlError(RegionControlErrorKind.INVALID_FIELD_VALUE, "provider_deployment must be DEVICE_AICPU")
-    if request.payload_backend_kind is not BackendKind.VMM_WINDOW:
-        raise RegionControlError(RegionControlErrorKind.INVALID_FIELD_VALUE, "PAYLOAD backend_kind must be VMM_WINDOW")
-    if request.counter_backend_kind is not BackendKind.VMM_WINDOW:
-        raise RegionControlError(RegionControlErrorKind.INVALID_FIELD_VALUE, "COUNTER backend_kind must be VMM_WINDOW")
+    if request.payload_backend_kind is not BackendKind.VMM_SHAREABLE:
+        raise RegionControlError(
+            RegionControlErrorKind.INVALID_FIELD_VALUE, "PAYLOAD backend_kind must be VMM_SHAREABLE"
+        )
+    if request.counter_backend_kind is not BackendKind.VMM_SHAREABLE:
+        raise RegionControlError(
+            RegionControlErrorKind.INVALID_FIELD_VALUE, "COUNTER backend_kind must be VMM_SHAREABLE"
+        )
     if request.payload_consumer_adapter_kind is not AdapterKind.OWNER_DELEGATED_COPY:
         raise RegionControlError(
             RegionControlErrorKind.INVALID_FIELD_VALUE,
@@ -879,8 +874,8 @@ def _encode_allocate_reply(reply: DelegatedAllocateReply) -> bytes:
             0,
             0,
         )
-        _encode_export_part(frame, ALLOCATE_PAYLOAD_EXPORT_OFFSET, reply.result.export_descriptor.payload)
-        _encode_export_part(frame, ALLOCATE_COUNTER_EXPORT_OFFSET, reply.result.export_descriptor.counter)
+        _encode_buffer_descriptor(frame, ALLOCATE_PAYLOAD_DESCRIPTOR_OFFSET, reply.result.export_descriptor.payload)
+        _encode_buffer_descriptor(frame, ALLOCATE_COUNTER_DESCRIPTOR_OFFSET, reply.result.export_descriptor.counter)
         _encode_local_view(frame, ALLOCATE_PAYLOAD_VIEW_OFFSET, reply.payload_view)
         _encode_local_view(frame, ALLOCATE_COUNTER_VIEW_OFFSET, reply.counter_view)
     elif tag is DelegatedAllocateReplyTag.ERROR:
@@ -967,9 +962,10 @@ def _decode_allocate_reply(envelope: DelegatedRegionReplyEnvelope) -> DelegatedA
                 "ALLOCATED requires a resource id and zero error fields",
             )
         descriptor = RegionExportDescriptor(
-            payload=_decode_export_part(envelope.frame, ALLOCATE_PAYLOAD_EXPORT_OFFSET),
-            counter=_decode_export_part(envelope.frame, ALLOCATE_COUNTER_EXPORT_OFFSET),
+            payload=_decode_buffer_descriptor(envelope.frame, ALLOCATE_PAYLOAD_DESCRIPTOR_OFFSET),
+            counter=_decode_buffer_descriptor(envelope.frame, ALLOCATE_COUNTER_DESCRIPTOR_OFFSET),
         )
+        _validate_decoded_descriptor_pair(descriptor)
         payload_view = _decode_local_view(envelope.frame, ALLOCATE_PAYLOAD_VIEW_OFFSET, RegionPartKind.PAYLOAD)
         counter_view = _decode_local_view(envelope.frame, ALLOCATE_COUNTER_VIEW_OFFSET, RegionPartKind.COUNTER)
         validate_independent_local_views(payload_view, counter_view)
@@ -982,7 +978,9 @@ def _decode_allocate_reply(envelope: DelegatedRegionReplyEnvelope) -> DelegatedA
             payload_view=payload_view,
             counter_view=counter_view,
         )
-    _require_zero_span(envelope.frame, ALLOCATE_PAYLOAD_EXPORT_OFFSET, 2 * EXPORT_PART_BYTES + 2 * LOCAL_VIEW_BYTES)
+    _require_zero_span(
+        envelope.frame, ALLOCATE_PAYLOAD_DESCRIPTOR_OFFSET, 2 * BUFFER_DESCRIPTOR_WIRE_BYTES + 2 * LOCAL_VIEW_BYTES
+    )
     kind = _require_enum(RegionControlErrorKind, int(error_kind), allow_zero=True)
     if kind is RegionControlErrorKind.NONE:
         raise RegionControlError(RegionControlErrorKind.INVALID_FIELD_VALUE, "ERROR requires a nonzero error_kind")
@@ -1251,104 +1249,58 @@ def _decode_cleanup_incomplete_failures(
     return failures
 
 
-def _capability_wire_kind(capability: VmmShareableHandleImport | PosixShmImport) -> ImportCapabilityWireKind:
-    if isinstance(capability, VmmShareableHandleImport):
-        return ImportCapabilityWireKind.VMM_SHAREABLE_HANDLE
-    return ImportCapabilityWireKind.POSIX_SHM
-
-
-def _encode_capability_payload(capability: VmmShareableHandleImport | PosixShmImport) -> tuple[int, bytes]:
-    payload = bytearray(CAPABILITY_PAYLOAD_BYTES)
-    if isinstance(capability, VmmShareableHandleImport):
-        _VMM_CAPABILITY.pack_into(payload, 0, int(capability.device_id), 0, int(capability.shareable_handle))
-        return VMM_CAPABILITY_PAYLOAD_BYTES, bytes(payload)
-    token = capability.shm_name.encode("ascii")
-    payload[: len(token)] = token
-    return len(token), bytes(payload)
-
-
-def _decode_capability_payload(
-    kind: ImportCapabilityWireKind, payload_bytes: int, payload: bytes
-) -> VmmShareableHandleImport | PosixShmImport:
-    if len(payload) != CAPABILITY_PAYLOAD_BYTES:
-        raise RegionControlError(RegionControlErrorKind.BAD_MESSAGE_SIZE, "capability payload must be 40 bytes")
-    if payload_bytes < 0 or payload_bytes > CAPABILITY_PAYLOAD_BYTES:
-        raise RegionControlError(RegionControlErrorKind.INVALID_FIELD_VALUE, "capability payload bytes out of range")
-    if any(payload[payload_bytes:]):
-        raise RegionControlError(RegionControlErrorKind.RESERVED_NONZERO, "inactive capability bytes must be zero")
-    if kind is ImportCapabilityWireKind.VMM_SHAREABLE_HANDLE:
-        if payload_bytes != VMM_CAPABILITY_PAYLOAD_BYTES:
-            raise RegionControlError(
-                RegionControlErrorKind.INVALID_FIELD_VALUE,
-                "VMM capability payload_bytes must be 16",
-            )
-        device_id, reserved, shareable = _VMM_CAPABILITY.unpack_from(payload, 0)
-        if int(reserved) != 0:
-            raise RegionControlError(RegionControlErrorKind.RESERVED_NONZERO, "VMM capability reserved must be zero")
-        try:
-            return VmmShareableHandleImport(device_id=int(device_id), shareable_handle=int(shareable))
-        except (TypeError, ValueError) as exc:
-            raise RegionControlError(
-                RegionControlErrorKind.INVALID_FIELD_VALUE,
-                str(exc) or "VMM capability fields are invalid",
-            ) from exc
-    if kind is ImportCapabilityWireKind.POSIX_SHM:
-        if payload_bytes < 1 or payload_bytes > POSIX_SHM_TOKEN_MAX_BYTES:
-            raise RegionControlError(
-                RegionControlErrorKind.INVALID_FIELD_VALUE,
-                "POSIX shm token length must be in 1..32 bytes",
-            )
-        token = bytes(payload[:payload_bytes])
-        if b"\x00" in token:
-            raise RegionControlError(RegionControlErrorKind.INVALID_FIELD_VALUE, "POSIX shm token must not contain NUL")
-        try:
-            return PosixShmImport(shm_name=token.decode("ascii"))
-        except (TypeError, ValueError, UnicodeDecodeError) as exc:
-            raise RegionControlError(
-                RegionControlErrorKind.INVALID_FIELD_VALUE,
-                str(exc) or "POSIX shm token is invalid",
-            ) from exc
-    raise RegionControlError(RegionControlErrorKind.INVALID_ENUM_VALUE, "import capability kind is invalid")
-
-
-def _encode_export_part(view: bytearray, offset: int, part: RegionPartExportDescriptor) -> None:
-    payload_bytes, payload = _encode_capability_payload(part.import_capability)
-    _EXPORT_PART.pack_into(
-        view,
-        offset,
-        int(part.planned_backing_kind),
-        int(_capability_wire_kind(part.import_capability)),
-        int(part.logical_bytes),
-        int(part.mapping_bytes),
-        int(payload_bytes),
-        0,
-        payload,
-    )
-
-
-def _decode_export_part(view: bytes, offset: int) -> RegionPartExportDescriptor:
-    backing, cap_kind, logical_bytes, mapping_bytes, payload_bytes, reserved, payload = _EXPORT_PART.unpack_from(
-        view, offset
-    )
-    if int(reserved) != 0:
-        raise RegionControlError(RegionControlErrorKind.RESERVED_NONZERO, "export-part reserved must be zero")
-    capability = _decode_capability_payload(
-        _require_enum(ImportCapabilityWireKind, int(cap_kind)),
-        int(payload_bytes),
-        bytes(payload),
-    )
+def _encode_buffer_descriptor(view: bytearray, offset: int, descriptor: BufferDescriptor) -> None:
     try:
-        return RegionPartExportDescriptor(
-            planned_backing_kind=_require_backend_kind(int(backing)),
-            logical_bytes=int(logical_bytes),
-            mapping_bytes=int(mapping_bytes),
-            import_capability=capability,
+        wire = bytes(_encode_buffer_descriptor_wire(descriptor))
+    except Exception as exc:
+        raise RegionControlError(
+            RegionControlErrorKind.INTERNAL_INVARIANT,
+            str(exc) or "canonical BufferDescriptor encode failed",
+        ) from exc
+    if len(wire) != BUFFER_DESCRIPTOR_WIRE_BYTES:
+        raise RegionControlError(
+            RegionControlErrorKind.INTERNAL_INVARIANT,
+            "canonical BufferDescriptor wire must be 88 bytes",
         )
-    except (TypeError, ValueError) as exc:
+    view[offset : offset + BUFFER_DESCRIPTOR_WIRE_BYTES] = wire
+
+
+def _decode_buffer_descriptor(view: bytes, offset: int) -> BufferDescriptor:
+    raw = bytes(view[offset : offset + BUFFER_DESCRIPTOR_WIRE_BYTES])
+    if len(raw) != BUFFER_DESCRIPTOR_WIRE_BYTES:
+        raise RegionControlError(RegionControlErrorKind.BAD_MESSAGE_SIZE, "BufferDescriptor slot must be 88 bytes")
+    try:
+        return _decode_buffer_descriptor_wire(raw)
+    except Exception as exc:
         raise RegionControlError(
             RegionControlErrorKind.INVALID_FIELD_VALUE,
-            str(exc) or "export-part fields are invalid",
+            str(exc) or "BufferDescriptor is invalid",
         ) from exc
+
+
+def _validate_decoded_descriptor_pair(descriptor: RegionExportDescriptor) -> None:
+    payload = descriptor.payload
+    counter = descriptor.counter
+    if payload.access is not AccessMode.READWRITE or counter.access is not AccessMode.READWRITE:
+        raise RegionControlError(
+            RegionControlErrorKind.INVALID_FIELD_VALUE,
+            "region BufferDescriptors must be READWRITE",
+        )
+    if int(payload.identity.generation) != 1 or int(counter.identity.generation) != 1:
+        raise RegionControlError(
+            RegionControlErrorKind.INVALID_FIELD_VALUE,
+            "region BufferDescriptor generation must be 1",
+        )
+    if payload.identity == counter.identity:
+        raise RegionControlError(
+            RegionControlErrorKind.INVALID_FIELD_VALUE,
+            "PAYLOAD and COUNTER identities must differ",
+        )
+    if bytes(payload.identity.owner_instance_id) != bytes(counter.identity.owner_instance_id):
+        raise RegionControlError(
+            RegionControlErrorKind.INVALID_FIELD_VALUE,
+            "PAYLOAD and COUNTER must share one owner nonce",
+        )
 
 
 def _encode_local_view(view: bytearray, offset: int, local_view: RegionPartLocalView) -> None:

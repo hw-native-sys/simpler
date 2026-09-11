@@ -18,6 +18,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import logging
+import threading
 import uuid
 from dataclasses import dataclass
 from enum import Enum, IntEnum
@@ -25,12 +26,19 @@ from multiprocessing.shared_memory import SharedMemory
 from typing import Any, Callable, Protocol, TypeVar, Union
 
 from _task_interface import (  # pyright: ignore[reportMissingImports]
+    AccessMode,
+    AddressSpace,
     BackendKind,
+    BufferDescriptor,
+    CanonicalIdentity,
     _region_vmm_allocate_export,
     _region_vmm_begin,
+    _region_vmm_granularity,
     _region_vmm_release,
     _region_vmm_zero_bytes,
 )
+
+from .buffer import Buffer, _wrap_vmm_shareable, intern_worker_path
 
 _UINT64_MAX = (1 << 64) - 1
 _INT32_MIN = -(1 << 31)
@@ -206,6 +214,52 @@ def _require_counter_logical_bytes(value: object) -> int:
     return logical_bytes
 
 
+def _align_up(value: int, alignment: int) -> int:
+    if alignment <= 0:
+        raise ValueError("alignment must be positive")
+    return (int(value) + alignment - 1) // alignment * alignment
+
+
+def _require_owner_nonce(nonce: object) -> bytes:
+    if not isinstance(nonce, (bytes, bytearray)):
+        raise TypeError("owner_instance_id must be bytes")
+    value = bytes(nonce)
+    if len(value) != 8 or value == b"\x00" * 8:
+        raise ValueError("owner_instance_id must be a nonzero 8-byte nonce")
+    return value
+
+
+class EndpointBufferIdentityAllocator(Protocol):
+    @property
+    def owner_instance_id(self) -> bytes: ...
+
+    def burn_identity(self) -> CanonicalIdentity: ...
+
+
+class LocalEndpointBufferIdentityAllocator:
+    """Thread-safe endpoint-scoped Buffer identity allocator."""
+
+    def __init__(self, owner_instance_id: bytes) -> None:
+        self._owner_instance_id = _require_owner_nonce(owner_instance_id)
+        self._lock = threading.Lock()
+        self._next_buffer_id = 1
+
+    @property
+    def owner_instance_id(self) -> bytes:
+        return self._owner_instance_id
+
+    def burn_identity(self) -> CanonicalIdentity:
+        with self._lock:
+            buffer_id = self._next_buffer_id
+            if buffer_id > _UINT64_MAX:
+                raise RegionControlError(
+                    RegionControlErrorKind.INTERNAL_INVARIANT,
+                    "buffer identity space exhausted",
+                )
+            self._next_buffer_id = buffer_id + 1
+        return CanonicalIdentity(self._owner_instance_id, buffer_id, 1)
+
+
 @dataclass(frozen=True)
 class DeviceAllocationTarget:
     device_id: int
@@ -288,36 +342,43 @@ class PosixShmImport:
 ImportCapability = Union[VmmShareableHandleImport, PosixShmImport]
 
 
-@dataclass(frozen=True)
-class RegionPartExportDescriptor:
-    planned_backing_kind: BackendKind
-    logical_bytes: int
-    mapping_bytes: int
-    import_capability: ImportCapability
+def _posix_token_from_descriptor(descriptor: BufferDescriptor) -> str:
+    if descriptor.backend_kind is not BackendKind.POSIX_SHM:
+        raise ValueError("POSIX shm token requires POSIX_SHM")
+    return _require_posix_shm_token(bytes(descriptor.body).decode("ascii"))
 
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "planned_backing_kind", _require_backend_kind(self.planned_backing_kind))
-        logical_bytes = _require_positive_uint64("logical_bytes", self.logical_bytes)
-        mapping_bytes = _require_uint64("mapping_bytes", self.mapping_bytes)
-        if mapping_bytes < logical_bytes:
-            raise ValueError("mapping_bytes must cover logical_bytes")
-        if not isinstance(self.import_capability, (VmmShareableHandleImport, PosixShmImport)):
-            raise TypeError("import_capability must be a single VMM or POSIX variant")
-        object.__setattr__(self, "logical_bytes", logical_bytes)
-        object.__setattr__(self, "mapping_bytes", mapping_bytes)
+
+def _posix_object_size(token: str) -> int:
+    shm = SharedMemory(name=_posix_shm_create_name(token), create=False)
+    try:
+        return int(shm.size)
+    finally:
+        shm.close()
+
+
+def _vmm_shareable_facts(descriptor: BufferDescriptor) -> tuple[int, int, int]:
+    if descriptor.backend_kind is not BackendKind.VMM_SHAREABLE:
+        raise ValueError("VMM shareable facts require VMM_SHAREABLE")
+    body = bytes(descriptor.body)
+    if len(body) != 24:
+        raise ValueError("VMM_SHAREABLE body must be 24 bytes")
+    device_id = int.from_bytes(body[0:4], "little", signed=True)
+    shareable_handle = int.from_bytes(body[8:16], "little")
+    mapping_bytes = int.from_bytes(body[16:24], "little")
+    return device_id, shareable_handle, mapping_bytes
 
 
 @dataclass(frozen=True)
 class RegionExportDescriptor:
-    payload: RegionPartExportDescriptor
-    counter: RegionPartExportDescriptor
+    payload: BufferDescriptor
+    counter: BufferDescriptor
 
     def __post_init__(self) -> None:
-        if not isinstance(self.payload, RegionPartExportDescriptor):
-            raise TypeError("payload export descriptor must be RegionPartExportDescriptor")
-        if not isinstance(self.counter, RegionPartExportDescriptor):
-            raise TypeError("counter export descriptor must be RegionPartExportDescriptor")
-        _require_counter_logical_bytes(self.counter.logical_bytes)
+        if not isinstance(self.payload, BufferDescriptor):
+            raise TypeError("payload export descriptor must be BufferDescriptor")
+        if not isinstance(self.counter, BufferDescriptor):
+            raise TypeError("counter export descriptor must be BufferDescriptor")
+        _require_counter_logical_bytes(self.counter.nbytes)
 
 
 @dataclass(frozen=True)
@@ -475,15 +536,9 @@ class RegionAllocationError(RegionProviderError):
 
 
 class RegionPartAllocation(Protocol):
-    """Owning backend shell for one PAYLOAD or COUNTER allocation."""
+    """Store-private allocation mechanism for one PAYLOAD or COUNTER backing."""
 
-    def materialize(self) -> None: ...
-
-    def mapping_bytes(self) -> int: ...
-
-    def import_capability(self) -> ImportCapability: ...
-
-    def local_base(self) -> int: ...
+    def materialize(self, identity: CanonicalIdentity, diagnostics: Any = None) -> Buffer: ...
 
     def zero_bytes(self, offset: int, nbytes: int) -> None: ...
 
@@ -563,6 +618,11 @@ class SimPosixShmAllocation:
         self._mapping_available = False
         self._shm: SharedMemory | None = None
         self._local_base: int | None = None
+        self._physical_bytes = (
+            _align_up(self._spec.logical_bytes, _COUNTER_BASE_ALIGNMENT)
+            if self._part is RegionPartKind.COUNTER
+            else self._spec.logical_bytes
+        )
         self._close_attempted = False
         self._close_complete = False
         self._unlink_attempted = False
@@ -571,17 +631,25 @@ class SimPosixShmAllocation:
         self._first_cleanup_failure: ProviderCleanupFailure | None = None
         self.local_cleanup_details: list[tuple[str, BaseException]] = []
 
-    def materialize(self) -> None:
+    def materialize(self, identity: CanonicalIdentity, diagnostics: Any = None) -> Buffer:
         try:
             shm = self._shm_cls(
                 name=_posix_shm_create_name(self.candidate_name),
                 create=True,
-                size=self._spec.logical_bytes,
+                size=self._physical_bytes,
             )
         except FileExistsError as exc:
             raise RegionControlError(
                 RegionControlErrorKind.BACKEND_FAILURE,
                 "POSIX shm name collision",
+                failed_part=self._part,
+                failed_operation=RegionOperationKind.MATERIALIZE,
+            ) from exc
+        except OSError as exc:
+            self._name_ownership_known = True
+            raise RegionControlError(
+                RegionControlErrorKind.BACKEND_FAILURE,
+                str(exc) or "POSIX shm create failed",
                 failed_part=self._part,
                 failed_operation=RegionOperationKind.MATERIALIZE,
             ) from exc
@@ -593,25 +661,27 @@ class SimPosixShmAllocation:
         self._shm_object_installed = True
         self._local_base = _shm_local_base(shm)
         self._mapping_available = True
-
-    def mapping_bytes(self) -> int:
-        self._require_mapping("mapping_bytes")
-        return self._spec.logical_bytes
-
-    def import_capability(self) -> PosixShmImport:
-        self._require_mapping("import_capability")
-        return PosixShmImport(shm_name=self.candidate_name)
-
-    def local_base(self) -> int:
-        self._require_mapping("local_base")
-        if self._local_base is None:
+        if self._part is RegionPartKind.COUNTER and self._local_base % _COUNTER_BASE_ALIGNMENT != 0:
             raise RegionControlError(
                 RegionControlErrorKind.INTERNAL_INVARIANT,
-                "POSIX shm mapping has no local base",
+                "COUNTER POSIX mapping base must be 64-byte aligned",
                 failed_part=self._part,
-                failed_operation=RegionOperationKind.LOCAL_VIEW,
+                failed_operation=RegionOperationKind.MATERIALIZE,
             )
-        return self._local_base
+        owner_worker_path = ""
+        if diagnostics is not None:
+            owner_worker_path = str(getattr(diagnostics, "owner_worker_path", "") or "")
+        return Buffer(
+            identity=identity,
+            owner_worker_path_id=intern_worker_path(owner_worker_path),
+            address_space=AddressSpace.HOST,
+            access=AccessMode.READWRITE,
+            backend_kind=BackendKind.POSIX_SHM,
+            nbytes=self._spec.logical_bytes,
+            body=self.candidate_name.encode("ascii"),
+            shm=None,
+            base=self._local_base,
+        )
 
     def zero_bytes(self, offset: int, nbytes: int) -> None:
         self._require_mapping("zero_bytes")
@@ -676,11 +746,7 @@ class SimPosixShmAllocation:
                 RegionControlErrorKind.INTERNAL_INVARIANT,
                 f"{operation} requires a materialized POSIX shm mapping",
                 failed_part=self._part,
-                failed_operation=RegionOperationKind.DESCRIBE
-                if operation in {"mapping_bytes", "import_capability"}
-                else RegionOperationKind.LOCAL_VIEW
-                if operation == "local_base"
-                else RegionOperationKind.ZERO_BYTES,
+                failed_operation=RegionOperationKind.ZERO_BYTES,
             )
 
 
@@ -713,7 +779,7 @@ class VmmAllocation:
     def registry_handle(self) -> int | None:
         return self._handle
 
-    def materialize(self) -> None:
+    def materialize(self, identity: CanonicalIdentity, diagnostics: Any = None) -> Buffer:
         try:
             handle = _region_vmm_begin(self._device_id)
             self._handle = handle
@@ -727,31 +793,66 @@ class VmmAllocation:
                 failed_part=self._part,
                 failed_operation=RegionOperationKind.MATERIALIZE,
             ) from exc
-        self._device_addr = int(export.device_addr)
-        self._mapping_bytes = int(export.mapping_bytes)
-        self._shareable_handle = int(export.shareable_handle)
-        self._mapping_available = True
-
-    def mapping_bytes(self) -> int:
-        self._require_mapping("mapping_bytes")
-        assert self._mapping_bytes is not None
-        return self._mapping_bytes
-
-    def import_capability(self) -> VmmShareableHandleImport:
-        self._require_mapping("import_capability")
-        assert self._shareable_handle is not None
-        return VmmShareableHandleImport(device_id=self._device_id, shareable_handle=self._shareable_handle)
-
-    def local_base(self) -> int:
-        self._require_mapping("local_base")
-        if self._device_addr is None:
+        device_addr = int(export.device_addr)
+        mapping_bytes = int(export.mapping_bytes)
+        shareable_handle = int(export.shareable_handle)
+        try:
+            granularity = int(_region_vmm_granularity(self._device_id))
+        except BaseException as exc:
+            raise RegionControlError(
+                RegionControlErrorKind.BACKEND_FAILURE,
+                str(exc) or "VMM granularity query failed",
+                failed_part=self._part,
+                failed_operation=RegionOperationKind.MATERIALIZE,
+            ) from exc
+        if granularity < 1 or mapping_bytes % granularity != 0:
             raise RegionControlError(
                 RegionControlErrorKind.INTERNAL_INVARIANT,
-                "VMM mapping has no local base",
+                "VMM mapping_bytes must be a positive multiple of runtime granularity",
                 failed_part=self._part,
-                failed_operation=RegionOperationKind.LOCAL_VIEW,
+                failed_operation=RegionOperationKind.MATERIALIZE,
             )
-        return self._device_addr
+        if mapping_bytes < self._spec.logical_bytes:
+            raise RegionControlError(
+                RegionControlErrorKind.INTERNAL_INVARIANT,
+                "VMM mapping_bytes must cover logical_bytes",
+                failed_part=self._part,
+                failed_operation=RegionOperationKind.MATERIALIZE,
+            )
+        if self._part is RegionPartKind.COUNTER:
+            if mapping_bytes < _align_up(self._spec.logical_bytes, _COUNTER_BASE_ALIGNMENT):
+                raise RegionControlError(
+                    RegionControlErrorKind.INTERNAL_INVARIANT,
+                    "COUNTER VMM mapping_bytes must cover 64-byte alignment",
+                    failed_part=self._part,
+                    failed_operation=RegionOperationKind.MATERIALIZE,
+                )
+            if device_addr % _COUNTER_BASE_ALIGNMENT != 0:
+                raise RegionControlError(
+                    RegionControlErrorKind.INTERNAL_INVARIANT,
+                    "COUNTER VMM base must be 64-byte aligned",
+                    failed_part=self._part,
+                    failed_operation=RegionOperationKind.MATERIALIZE,
+                )
+        self._device_addr = device_addr
+        self._mapping_bytes = mapping_bytes
+        self._shareable_handle = shareable_handle
+        self._mapping_available = True
+        owner_worker_path = ""
+        owner_worker_id = 0
+        if diagnostics is not None:
+            owner_worker_path = str(getattr(diagnostics, "owner_worker_path", "") or "")
+            owner_worker_id = int(getattr(diagnostics, "owner_worker_id", 0) or 0)
+        return _wrap_vmm_shareable(
+            device_addr,
+            self._spec.logical_bytes,
+            self._device_id,
+            mapping_bytes,
+            shareable_handle,
+            identity,
+            owner_worker_path=owner_worker_path,
+            owner_worker_id=owner_worker_id,
+        )
 
     def zero_bytes(self, offset: int, nbytes: int) -> None:
         self._require_mapping("zero_bytes")
@@ -807,11 +908,7 @@ class VmmAllocation:
                 RegionControlErrorKind.INTERNAL_INVARIANT,
                 f"{operation} requires a materialized VMM mapping",
                 failed_part=self._part,
-                failed_operation=RegionOperationKind.DESCRIBE
-                if operation in {"mapping_bytes", "import_capability"}
-                else RegionOperationKind.LOCAL_VIEW
-                if operation == "local_base"
-                else RegionOperationKind.ZERO_BYTES,
+                failed_operation=RegionOperationKind.ZERO_BYTES,
             )
 
 
@@ -820,7 +917,7 @@ def _closed_part_dispatcher(
     part: RegionPartKind,
     spec: RegionPartAllocationSpec,
 ) -> RegionPartAllocation:
-    if spec.planned_backing_kind is not BackendKind.VMM_WINDOW or not isinstance(
+    if spec.planned_backing_kind is not BackendKind.VMM_SHAREABLE or not isinstance(
         context.target, DeviceAllocationTarget
     ):
         raise RegionControlError(
@@ -896,11 +993,14 @@ class _ProviderPartRecord:
         self,
         kind: RegionPartKind,
         spec: RegionPartAllocationSpec,
+        identity: CanonicalIdentity,
         allocation: RegionPartAllocation,
     ) -> None:
         self.kind = kind
         self.spec = spec
+        self.identity = identity
         self.allocation = allocation
+        self.buffer: Buffer | None = None
         self.state = ProviderPartResourceState.SHELL
         self.cleanup_failure: ProviderCleanupFailure | None = None
 
@@ -923,12 +1023,18 @@ class ProviderRegionStore:
     def __init__(
         self,
         context: RegionAllocationContext,
+        identity_allocator: EndpointBufferIdentityAllocator,
         *,
         _shell_factory: ShellFactory | None = None,
     ) -> None:
         if not isinstance(context, RegionAllocationContext):
             raise TypeError("context must be RegionAllocationContext")
+        if identity_allocator is None:
+            raise TypeError("identity_allocator is required")
+        owner_nonce = _require_owner_nonce(identity_allocator.owner_instance_id)
         self._context = context
+        self._identity_allocator = identity_allocator
+        self._allocator_nonce = owner_nonce
         self._state = ProviderRegionStoreState.OPEN
         self._next_provider_resource_id = 1
         self._resources: dict[int, ProviderRegionResource] = {}
@@ -942,10 +1048,26 @@ class ProviderRegionStore:
     def state(self) -> ProviderRegionStoreState:
         return self._state
 
+    def _require_allocator(self) -> EndpointBufferIdentityAllocator:
+        allocator = self._identity_allocator
+        if allocator is None:
+            raise RegionControlError(
+                RegionControlErrorKind.INTERNAL_INVARIANT,
+                "provider identity allocator is missing",
+            )
+        nonce = _require_owner_nonce(allocator.owner_instance_id)
+        if nonce != self._allocator_nonce:
+            raise RegionControlError(
+                RegionControlErrorKind.INTERNAL_INVARIANT,
+                "provider identity allocator nonce changed",
+            )
+        return allocator
+
     def allocate_and_export(self, spec: RegionAllocationSpec) -> RegionAllocationResult:
         self._require_open()
         if not isinstance(spec, RegionAllocationSpec):
             raise TypeError("spec must be RegionAllocationSpec")
+        allocator = self._require_allocator()
         resource_id = self._burn_id()
         resource = ProviderRegionResource(resource_id, spec)
         self._resources[resource_id] = resource
@@ -954,14 +1076,15 @@ class ProviderRegionStore:
             for kind in REGION_PARTS:
                 stage.part = kind
                 stage.operation = RegionOperationKind.NONE
+                identity = allocator.burn_identity()
                 allocation = self._shell_factory(self._context, kind, spec.part(kind))
-                resource.parts[kind] = _ProviderPartRecord(kind, spec.part(kind), allocation)
+                resource.parts[kind] = _ProviderPartRecord(kind, spec.part(kind), identity, allocation)
             for kind in REGION_PARTS:
                 stage.part = kind
                 stage.operation = RegionOperationKind.MATERIALIZE
                 part = resource.parts[kind]
                 part.state = ProviderPartResourceState.MATERIALIZING
-                part.allocation.materialize()
+                part.buffer = part.allocation.materialize(part.identity)
             stage.part = RegionPartKind.COUNTER
             stage.operation = RegionOperationKind.ZERO_BYTES
             _initialize_counter_storage(resource.parts[RegionPartKind.COUNTER].allocation, spec.counter.logical_bytes)
@@ -1104,31 +1227,23 @@ class ProviderRegionStore:
         return resource
 
     def _freeze_descriptor(self, resource: ProviderRegionResource, stage: _AllocateStage) -> RegionExportDescriptor:
-        exports: dict[RegionPartKind, RegionPartExportDescriptor] = {}
+        exports: dict[RegionPartKind, BufferDescriptor] = {}
         for kind in REGION_PARTS:
             stage.part = kind
             stage.operation = RegionOperationKind.DESCRIBE
             part = resource.parts[kind]
-            spec = part.spec
-            try:
-                mapping_bytes = part.allocation.mapping_bytes()
-                import_capability = part.allocation.import_capability()
-            except RegionControlError:
-                raise
-            except Exception as exc:
+            buffer = part.buffer
+            if buffer is None:
                 raise RegionControlError(
-                    RegionControlErrorKind.BACKEND_FAILURE,
-                    str(exc) or "export descriptor facts failed",
+                    RegionControlErrorKind.INTERNAL_INVARIANT,
+                    "READY part is missing its canonical Buffer",
                     failed_part=kind,
                     failed_operation=RegionOperationKind.DESCRIBE,
-                ) from exc
-            try:
-                exports[kind] = RegionPartExportDescriptor(
-                    planned_backing_kind=spec.planned_backing_kind,
-                    logical_bytes=spec.logical_bytes,
-                    mapping_bytes=mapping_bytes,
-                    import_capability=import_capability,
                 )
+            try:
+                exports[kind] = buffer.to_descriptor()
+            except RegionControlError:
+                raise
             except Exception as exc:
                 raise RegionControlError(
                     RegionControlErrorKind.INTERNAL_INVARIANT,
@@ -1136,6 +1251,21 @@ class ProviderRegionStore:
                     failed_part=kind,
                     failed_operation=RegionOperationKind.DESCRIBE,
                 ) from exc
+            descriptor = exports[kind]
+            if descriptor.identity != part.identity:
+                raise RegionControlError(
+                    RegionControlErrorKind.INTERNAL_INVARIANT,
+                    "Buffer identity must match the burned part identity",
+                    failed_part=kind,
+                    failed_operation=RegionOperationKind.DESCRIBE,
+                )
+            if int(descriptor.nbytes) != int(part.spec.logical_bytes):
+                raise RegionControlError(
+                    RegionControlErrorKind.INTERNAL_INVARIANT,
+                    "Buffer nbytes must match the admitted logical_bytes",
+                    failed_part=kind,
+                    failed_operation=RegionOperationKind.DESCRIBE,
+                )
         return RegionExportDescriptor(
             payload=exports[RegionPartKind.PAYLOAD],
             counter=exports[RegionPartKind.COUNTER],
@@ -1149,23 +1279,22 @@ class ProviderRegionStore:
             stage.part = kind
             stage.operation = RegionOperationKind.LOCAL_VIEW
             part = resource.parts[kind]
-            try:
-                local_base = part.allocation.local_base()
-            except RegionControlError:
-                raise
-            except Exception as exc:
+            buffer = part.buffer
+            if buffer is None:
                 raise RegionControlError(
-                    RegionControlErrorKind.BACKEND_FAILURE,
-                    str(exc) or "local view facts failed",
+                    RegionControlErrorKind.INTERNAL_INVARIANT,
+                    "READY part is missing its canonical Buffer",
                     failed_part=kind,
                     failed_operation=RegionOperationKind.LOCAL_VIEW,
-                ) from exc
+                )
             try:
                 views[kind] = RegionPartLocalView(
                     part=kind,
-                    local_base=local_base,
-                    logical_bytes=part.spec.logical_bytes,
+                    local_base=int(buffer.base),
+                    logical_bytes=int(buffer.nbytes),
                 )
+            except RegionControlError:
+                raise
             except Exception as exc:
                 raise RegionControlError(
                     RegionControlErrorKind.INTERNAL_INVARIANT,
@@ -1184,7 +1313,18 @@ class ProviderRegionStore:
             ) from exc
         return views
 
+    def _logical_close_part_buffers(self, resource: ProviderRegionResource) -> None:
+        for kind in REGION_PARTS:
+            part = resource.parts.get(kind)
+            if part is None or part.buffer is None:
+                continue
+            try:
+                part.buffer.close()
+            except BaseException:
+                part.buffer.closed = True
+
     def _release_installed_parts(self, resource: ProviderRegionResource) -> bool:
+        self._logical_close_part_buffers(resource)
         for kind in REGION_PARTS:
             part = resource.parts.get(kind)
             if part is None or part.state is ProviderPartResourceState.RELEASED:
@@ -1231,11 +1371,8 @@ class ProviderRegionStore:
         debt: bool,
     ) -> RegionAllocationError:
         kind = RegionControlErrorKind.INTERNAL_INVARIANT
-        if isinstance(primary, RegionControlError):
-            if primary.kind in _ALLOCATION_ERROR_KINDS:
-                kind = primary.kind
-        elif operation in _BACKEND_FAILURE_OPERATIONS:
-            kind = RegionControlErrorKind.BACKEND_FAILURE
+        if isinstance(primary, RegionControlError) and primary.kind in _ALLOCATION_ERROR_KINDS:
+            kind = primary.kind
         if kind is RegionControlErrorKind.BACKEND_FAILURE and operation not in _BACKEND_FAILURE_OPERATIONS:
             kind = RegionControlErrorKind.INTERNAL_INVARIANT
             operation = RegionOperationKind.NONE
