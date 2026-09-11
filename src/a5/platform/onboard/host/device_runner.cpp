@@ -107,6 +107,22 @@ int DeviceRunner::ensure_acl_ready(int device_id) {
         LOG_ERROR("ensure_acl_ready: invalid device_id %d", device_id);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    // aclInit / aclrtSetDevice below, and the aclFinalize this records
+    // responsibility for, are acts of device ownership, so reaching this entry
+    // makes the context a program context. Latching here rather than merely
+    // testing is_kernel() closes the unclaimed path: ensure_acl_ready_ctx is a
+    // standalone initialization entry that callers reach without simpler_init
+    // (tests/ut/cpp/hardware/test_comm_lifecycle.cpp), and an unlatched context
+    // that took ACL ownership would later let a kernel latch coexist with
+    // acl_ready_, whose finalize resets a device this context does not own.
+    // Latching before the first ACL call is also what keeps the refusal
+    // side-effect-free. The latch is write-once: an ACL failure below leaves
+    // the identity in place, and a repeat call re-latches the same mode.
+    const int mode_rc = execution_mode_latch().latch(SIMPLER_MODE_PROGRAM);
+    if (mode_rc != 0) {
+        LOG_ERROR("ensure_acl_ready: refused — this context already belongs to kernel mode");
+        return mode_rc;
+    }
 
     // aclInit is process-wide; CANN returns 100002 if it has already been
     // initialized (possibly by another owner), which we treat as success.
@@ -816,6 +832,14 @@ int DeviceRunner::force_reset_device() {
     if (device_id_ < 0) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    // aclrtResetDeviceForce would reset the caller's device and ACL context;
+    // a kernel-mode context owns neither (see ensure_acl_ready()), so error
+    // recovery on that path never resets the device out from under the host
+    // process.
+    if (execution_mode_latch().is_kernel()) {
+        LOG_ERROR("force_reset_device: refused — a kernel-mode context does not own the caller's device");
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
     // aclrtResetDeviceForce is an ACL API; bring ACL up for the whole sequence,
     // released on scope exit so a repeated poison-then-reset cycle in a
     // long-lived process leaks no ACL state.
@@ -956,10 +980,15 @@ int DeviceRunner::finalize() {
         return abandon_rc != 0 ? abandon_rc : reset_rc;
     }
 
-    int rc = attach_current_thread(device_id_);
-    if (rc != 0) {
-        LOG_ERROR("Failed to attach finalize thread to device %d: %d", device_id_, rc);
-        return rc;
+    // A kernel-mode context runs on the caller's already-current device, so
+    // this thread needs no bind and the context owns no device state to adopt.
+    int rc = 0;
+    if (!execution_mode_latch().is_kernel()) {
+        rc = attach_current_thread(device_id_);
+        if (rc != 0) {
+            LOG_ERROR("Failed to attach finalize thread to device %d: %d", device_id_, rc);
+            return rc;
+        }
     }
 
     // Cleanup all profiling subsystems (free shm + per-buffer dev/host
@@ -990,7 +1019,7 @@ int DeviceRunner::finalize() {
             if (rc == 0) rc = finalize_rc;
         }
         acl_ready_ = false;
-    } else {
+    } else if (!execution_mode_latch().is_kernel()) {
         int reset_rc = rtDeviceReset(device_id_);
         if (reset_rc != 0) {
             LOG_ERROR("rtDeviceReset(%d) failed during finalize: %d", device_id_, reset_rc);

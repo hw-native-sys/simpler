@@ -19,8 +19,9 @@
  *   - The trivial tensor-memory wrappers (`allocate_tensor`,
  *     `free_tensor`, `copy_*_device`).
  *   - The arena-pool accessors (`acquire_pooled_gm_heap`, etc.).
- *   - Device lifecycle: `attach_current_thread`,
- *     `configure_aicore_op_timeout`, `ensure_device_initialized`,
+ *   - Device lifecycle: `bind_current_thread`, `attach_current_thread`,
+ *     `adopt_borrowed_device`, `configure_aicore_op_timeout`,
+ *     `ensure_device_initialized`,
  *     `ensure_binaries_loaded`, persistent AICPU/AICore streams,
  *     dispatcher/executor bytes, `LoadAicpuOp`, `KernelArgsHelper`.
  *   - block_dim resolution: `query_max_block_dim`, `resolve_block_dim`.
@@ -65,6 +66,8 @@
 #include "aicpu_loader/host/load_aicpu_op.h"
 #include "host/chip_swimlane_collector.h"
 #include "host/host_phase_records.h"
+#include "host/execution_mode_latch.h"
+#include "host/kernel_entry_validation.h"
 #include "host/memory_allocator.h"
 #include "host/pmu_collector.h"
 #include "host/runtime_timeout_config.h"
@@ -133,6 +136,15 @@ public:
      * distinct buffers; tests read this to prove the split is real.
      */
     uint64_t retained_temp_addr(uint32_t slot_id) const;
+
+    /**
+     * This context's execution identity, latched once by whichever init entry
+     * constructs it. Every kernel-mode guard on the ACL-lifecycle and arena
+     * paths keys on is_kernel(); `attach_current_thread` refuses outright on a
+     * kernel latch, which is what keeps the program-mode entries and the
+     * per-thread device bind off a borrowed device.
+     */
+    ExecutionModeLatch &execution_mode_latch() { return execution_mode_latch_; }
 
     /** Allocate / free / copy on the per-Worker `MemoryAllocator` + CANN runtime. */
     void *allocate_tensor(std::size_t bytes);
@@ -215,17 +227,37 @@ public:
     std::thread create_thread(std::function<void()> fn);
 
     /**
-     * Attach the current host thread to the target device.
+     * Bind the calling thread to a device, taking nothing else from it.
      *
-     * Required before host-side runtime initialization may allocate or
-     * free device memory on the current thread. Idempotent for the same
-     * id; errors if called with a different id after a prior attach.
-     * No streams are created here.
+     * Idempotent for the same id; errors if called with a different id after
+     * a prior adopt. Creates no streams and records no identity.
+     *
+     * @param device_id  Device ID (0-15)
+     * @return 0 on success, error code on failure.
+     */
+    int bind_current_thread(int device_id);
+
+    /**
+     * Bind the current host thread and adopt the device for a program
+     * context: on the first call it also resolves the timeout config, writes
+     * the card's op-execute watchdog, and records device_id_.
+     *
+     * Required before host-side runtime initialization may allocate or free
+     * device memory on the current thread. Refuses with
+     * PTO_RUNTIME_ERR_INVALID_STATE on a context latched to kernel mode, which
+     * owns neither the bind nor the watchdog.
      *
      * @param device_id  Device ID (0-15)
      * @return 0 on success, error code on failure.
      */
     int attach_current_thread(int device_id);
+    /**
+     * Record which device a kernel-mode context runs on. Takes no device side
+     * effect: the caller already holds the device current, so this neither
+     * binds the thread nor touches the card's op-execute watchdog. Requires
+     * the execution-mode latch to already read kernel.
+     */
+    int adopt_borrowed_device(int device_id);
 
     /**
      * One-shot device initialization. Performs, in order:
@@ -303,7 +335,7 @@ public:
         sdma_warmup_binary_ = std::move(sdma_warmup_binary);
     }
 
-    /** The device id captured by simpler_init's `attach_current_thread` call. */
+    /** Which device this context is on; -1 until an init entry adopts one. */
     int device_id() const { return device_id_; }
 
     /**
@@ -1176,9 +1208,16 @@ protected:
 
     // ---- State shared by both a2a3 and a5 ---------------------------------
     //
-    // `device_id_` is written once by simpler_init and is immutable while
-    // native prepare, execution, and collector threads attach to the runner.
+    // Which device this context is on — not a claim of ownership, which the
+    // execution-mode latch carries instead. Written once before any prepare,
+    // execution or collector thread attaches: `attach_current_thread` writes
+    // it for a program context and `adopt_borrowed_device` for a kernel one, both
+    // guarded on the still-unset value, so repeated same-value writes from
+    // later-attaching threads cannot race.
     int device_id_{-1};
+    // This context's execution identity. Write-once: the first init entry to
+    // run latches it, and it never changes afterwards.
+    ExecutionModeLatch execution_mode_latch_;
     int block_dim_{0};
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
     int worker_count_{0};  // Stored for print_handshake_results

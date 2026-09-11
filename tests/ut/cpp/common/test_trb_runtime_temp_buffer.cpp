@@ -18,23 +18,29 @@
 // fake only remembers the slot and records malloc/copy counts.
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
 #include <gtest/gtest.h>
 
 #include "arg_direction.h"
+#include "call_config.h"
 #include "common/host_api.h"
+#include "host/kernel_pipeline_contract.h"
 #include "runtime_status.h"
 #include "runtime_types.h"
 #include "shared_memory.h"
 #include "runtime.h"
 #include "task_args.h"
 #include "worker/runtime_c_api.h"
+#include "worker/pipeline_contract.h"
 
 extern "C" int bind_callable_to_runtime_impl(
     Runtime *runtime, const HostApi *api, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr,
@@ -483,4 +489,168 @@ TEST_F(TrbRuntimeTempBufferTest, PreparedRuntimeEnvRequiresTheActiveArenaKey) {
     heap[2] = 2048;
     EXPECT_EQ(prepared_run_config_compatible_impl(&compatibility_api, task_window, heap, dep_pool), 0);
     EXPECT_NE(fake_.observed_key, fake_.compatibility_key);
+}
+
+namespace {
+
+CallConfig small_kernel_config() {
+    CallConfig config;
+    for (int i = 0; i < RUNTIME_ENV_RING_COUNT; ++i) {
+        config.runtime_env.ring_task_window[i] = 4;
+        config.runtime_env.ring_heap[i] = 1024;
+        config.runtime_env.ring_dep_pool[i] = 4;
+    }
+    return config;
+}
+
+uint64_t required_bytes(const PipelineContract &contract, PipelineResourceKind kind) {
+    for (uint32_t i = 0; i < contract.resource_count; ++i) {
+        if (contract.resources[i].kind == kind) return contract.resources[i].bytes_per_copy;
+    }
+    ADD_FAILURE() << "Missing resource " << kind;
+    return 0;
+}
+
+void expect_same_contract(const PipelineContract &a, const PipelineContract &b) {
+    EXPECT_EQ(a.abi_version, b.abi_version);
+    EXPECT_EQ(a.pipeline_depth, b.pipeline_depth);
+    ASSERT_EQ(a.resource_count, b.resource_count);
+    for (uint32_t i = 0; i < a.resource_count; ++i) {
+        EXPECT_EQ(a.resources[i].kind, b.resources[i].kind);
+        EXPECT_EQ(a.resources[i].resource_class, b.resources[i].resource_class);
+        EXPECT_EQ(a.resources[i].bytes_per_copy, b.resources[i].bytes_per_copy);
+    }
+}
+
+}  // namespace
+
+TEST(KernelPipelineBuilder, DefaultAndPackedInputsPreserveProgramContract) {
+    const PipelineContract program_before = *get_pipeline_contract();
+    CallConfig defaults;
+    PipelineContract contract{};
+    ASSERT_EQ(build_kernel_pipeline_contract_impl(&defaults, &contract), 0);
+    EXPECT_TRUE(is_valid_tmr_kernel_pipeline_contract(&contract));
+    EXPECT_EQ(contract.pipeline_depth, 1u);
+    EXPECT_EQ(required_bytes(contract, PTO_PIPELINE_TASK_ARGS), 0u);
+
+    // CallConfig is packed and may start at any byte; use a genuinely unaligned input.
+    alignas(uint64_t) std::array<unsigned char, sizeof(CallConfig) + 1> packed{};
+    ASSERT_NE(
+        reinterpret_cast<uintptr_t>(packed.data() + 1 + offsetof(CallConfig, runtime_env)) % alignof(uint64_t), 0u
+    );
+    const CallConfig small = small_kernel_config();
+    std::memcpy(packed.data() + 1, &small, sizeof(small));
+    const auto before = packed;
+    PipelineContract expected{};
+    ASSERT_EQ(build_kernel_pipeline_contract_impl(&small, &expected), 0);
+    ASSERT_EQ(
+        build_kernel_pipeline_contract_impl(reinterpret_cast<const CallConfig *>(packed.data() + 1), &contract), 0
+    );
+    expect_same_contract(contract, expected);
+    EXPECT_EQ(packed, before);
+    expect_same_contract(*get_pipeline_contract(), program_before);
+    EXPECT_TRUE(is_valid_pipeline_contract(get_pipeline_contract()));
+    EXPECT_EQ(get_pipeline_contract()->pipeline_depth, 2u);
+}
+
+TEST(KernelPipelineBuilder, InvalidSizesLeaveOutputUntouched) {
+    PipelineContract output;
+    std::memset(&output, 0x5a, sizeof(output));
+    std::array<unsigned char, sizeof(output)> original{};
+    std::memcpy(original.data(), &output, sizeof(output));
+    auto reject = [&](const CallConfig *config) {
+        EXPECT_EQ(build_kernel_pipeline_contract_impl(config, &output), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+        EXPECT_EQ(std::memcmp(&output, original.data(), sizeof(output)), 0);
+    };
+    reject(nullptr);
+    auto config = small_kernel_config();
+    EXPECT_EQ(build_kernel_pipeline_contract_impl(&config, nullptr), PTO_RUNTIME_ERR_INTERNAL);
+    for (uint64_t bad : {uint64_t{1}, uint64_t{3}, uint64_t{6}, uint64_t{1} << 31}) {
+        config = small_kernel_config();
+        config.runtime_env.ring_task_window[0] = bad;
+        reject(&config);
+    }
+    config = small_kernel_config();
+    config.runtime_env.ring_task_window[0] = uint64_t{1} << 30;
+    config.runtime_env.ring_task_window[1] = uint64_t{1} << 30;
+    reject(&config);
+    config = small_kernel_config();
+    config.runtime_env.ring_heap[0] = 1023;
+    reject(&config);
+    config.runtime_env.ring_heap[0] = std::numeric_limits<uint64_t>::max();
+    reject(&config);
+    for (uint64_t bad : {uint64_t{3}, uint64_t{INT32_MAX} + 1}) {
+        config = small_kernel_config();
+        config.runtime_env.ring_dep_pool[0] = bad;
+        reject(&config);
+    }
+    // Sum fits uint64_t but adding DeviceArena base-alignment slack would overflow.
+    config = small_kernel_config();
+    config.runtime_env.ring_heap[0] = std::numeric_limits<uint64_t>::max() - 3 * 1024;
+    reject(&config);
+    // Last usable byte before that alignment limit is legal; reserve must not allocate it.
+    config.runtime_env.ring_heap[0] -= 1023;
+    ASSERT_EQ(build_kernel_pipeline_contract_impl(&config, &output), 0);
+    EXPECT_EQ(required_bytes(output, PTO_PIPELINE_GM_HEAP), std::numeric_limits<uint64_t>::max() - 1023);
+}
+
+TEST_F(TrbRuntimeTempBufferTest, KernelRequirementsMatchRealBindWithoutQuerySideEffects) {
+    auto config = small_kernel_config();
+    PipelineContract contract{};
+    ASSERT_EQ(build_kernel_pipeline_contract_impl(&config, &contract), 0);
+    EXPECT_EQ(fake_.setup_static_arena_count, 0);
+    EXPECT_EQ(fake_.device_malloc_count, 0);
+    EXPECT_EQ(fake_.copy_to_count, 0);
+    Runtime runtime = make_runtime();
+    ChipStorageTaskArgs args;
+    ASSERT_EQ(bind_runtime(runtime, api_, args, nullptr, 0), 0);
+    EXPECT_EQ(required_bytes(contract, PTO_PIPELINE_GM_HEAP), fake_.gm_heap.size());
+    EXPECT_EQ(required_bytes(contract, PTO_PIPELINE_GM_SM), fake_.gm_sm.size());
+    EXPECT_EQ(required_bytes(contract, PTO_PIPELINE_RUNTIME_IMAGE), fake_.runtime_arena.size());
+    ASSERT_EQ(validate_runtime_impl(&runtime, &api_, 0), 0);
+}
+
+TEST_F(TrbRuntimeTempBufferTest, LargestRingCountsOnlyReserveLayout) {
+    auto config = small_kernel_config();
+    PipelineContract small{};
+    ASSERT_EQ(build_kernel_pipeline_contract_impl(&config, &small), 0);
+    config.runtime_env.ring_task_window[0] = uint64_t{1} << 30;
+    for (int r = 0; r < CHIP_MAX_RING_DEPTH; ++r) {
+        config.runtime_env.ring_dep_pool[r] = INT32_MAX;
+    }
+    PipelineContract large{};
+    ASSERT_EQ(build_kernel_pipeline_contract_impl(&config, &large), 0);
+    EXPECT_TRUE(is_valid_tmr_kernel_pipeline_contract(&large));
+    EXPECT_EQ(required_bytes(large, PTO_PIPELINE_GM_HEAP), required_bytes(small, PTO_PIPELINE_GM_HEAP));
+    EXPECT_GT(required_bytes(large, PTO_PIPELINE_GM_SM), required_bytes(small, PTO_PIPELINE_GM_SM));
+    EXPECT_GT(required_bytes(large, PTO_PIPELINE_RUNTIME_IMAGE), required_bytes(small, PTO_PIPELINE_RUNTIME_IMAGE));
+    EXPECT_EQ(fake_.setup_static_arena_count, 0);
+    EXPECT_EQ(fake_.device_malloc_count, 0);
+    EXPECT_EQ(fake_.copy_to_count, 0);
+}
+
+TEST(KernelPipelineBuilder, IndependentCallsCanInterleave) {
+    constexpr size_t count = 4;
+    std::array<CallConfig, count> configs;
+    std::array<PipelineContract, count> expected{};
+    std::array<std::thread, count> threads;
+    for (size_t i = 0; i < count; ++i) {
+        configs[i] = small_kernel_config();
+        configs[i].runtime_env.ring_task_window[0] = uint64_t{4} << i;
+        configs[i].runtime_env.ring_heap[0] = 1024 * (i + 1);
+        configs[i].runtime_env.ring_dep_pool[0] = 4 + i;
+        ASSERT_EQ(build_kernel_pipeline_contract_impl(&configs[i], &expected[i]), 0);
+    }
+    for (size_t i = 0; i < count; ++i) {
+        threads[i] = std::thread([&, i] {
+            const CallConfig config = configs[i];
+            for (int iteration = 0; iteration < 32; ++iteration) {
+                PipelineContract actual{};
+                EXPECT_EQ(build_kernel_pipeline_contract_impl(&config, &actual), 0);
+                expect_same_contract(actual, expected[i]);
+            }
+        });
+    }
+    for (auto &thread : threads)
+        thread.join();
 }

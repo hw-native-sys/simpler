@@ -1406,6 +1406,50 @@ class TestChipCallable:
         assert "sig_count=2" in r
         assert "child_count=1" in r
 
+    def test_scalar_count_without_scalars_is_zero(self):
+        chip = ChipCallable.build(
+            signature=[ArgDirection.IN],
+            func_name="test_func",
+            binary=b"\x00",
+            children=[],
+        )
+        assert chip.scalar_count == 0
+
+    def test_scalar_count_derived_from_signature(self):
+        chip = ChipCallable.build(
+            signature=[ArgDirection.IN, ArgDirection.OUT] + [ArgDirection.SCALAR] * 5,
+            func_name="test_func",
+            binary=b"\x00",
+            children=[],
+        )
+        assert chip.scalar_count == 5
+
+    def test_scalar_count_survives_from_bytes(self):
+        chip = ChipCallable.build(
+            signature=[ArgDirection.IN] + [ArgDirection.SCALAR] * 7,
+            func_name="test_func",
+            binary=b"\x00",
+            children=[],
+        )
+        raw = ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size()))
+        clone = ChipCallable.from_bytes(raw)
+        assert clone.scalar_count == 7
+
+    @pytest.mark.parametrize("signature_count", [-1, 257])
+    def test_scalar_count_rejects_corrupt_cached_signature_count(self, signature_count):
+        chip = ChipCallable.build(
+            signature=[ArgDirection.IN, ArgDirection.SCALAR],
+            func_name="test_func",
+            binary=b"\x00",
+            children=[],
+        )
+        raw = bytearray(ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size())))
+        # The wire signature contains 256 int32 ArgDirection entries before sig_count.
+        struct.pack_into("<i", raw, 256 * struct.calcsize("<i"), signature_count)
+        clone = ChipCallable.from_bytes(bytes(raw))
+        with pytest.raises(ValueError, match=rf"signature count {signature_count}.*256"):
+            _ = clone.scalar_count
+
 
 # ============================================================================
 # ChipTensor.child_memory

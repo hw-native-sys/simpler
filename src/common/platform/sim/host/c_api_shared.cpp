@@ -24,9 +24,13 @@
 #include "runtime_c_api.h"
 
 #include "callable.h"
+#include "callable_protocol.h"
 #include "call_config.h"
 #include "device_runner_base.h"
 #include "host/dep_gen_collector.h"  // make_deps_json_path
+#include "host/kernel_entry_validation.h"
+#include "host/kernel_pipeline_contract.h"
+#include "worker/pipeline_contract.h"
 #include "prepare_callable_common.h"
 #include "task_args_wire.h"
 #include "native_run_context.h"
@@ -433,6 +437,18 @@ int simpler_init(
     if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
 
     SimDeviceRunnerBase *runner = static_cast<SimDeviceRunnerBase *>(ctx);
+
+    // Latching the identity is the first thing this entry does, so a context
+    // that already belongs to kernel mode is refused before any process- or
+    // runner-state mutation below. Latching PROGRAM is idempotent, which is
+    // what lets an init -> finalize -> init sequence on the same device run
+    // again.
+    const int latch_rc = runner->execution_mode_latch().latch(SIMPLER_MODE_PROGRAM);
+    if (latch_rc != 0) {
+        LOG_ERROR("simpler_init: refused — this context already belongs to kernel mode");
+        return latch_rc;
+    }
+
     runner->set_dma_workspace_request(enable_sdma != 0);
 
     int rc;
@@ -1010,6 +1026,60 @@ size_t committed_device_memory_ctx(DeviceContextHandle ctx) {
 int device_memory_info_ctx(DeviceContextHandle ctx, DeviceMemoryInfo *info) {
     if (ctx == NULL || info == NULL) return PTO_RUNTIME_ERR_INTERNAL;
     return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
+/* ===========================================================================
+ * Kernel-mode lifecycle
+ *
+ * Simulation never supports kernel mode: it has no real streams for a caller
+ * to lend. supported() is 0 and init refuses after the shared structural
+ * validation, so no context here ever latches kernel mode and
+ * prepare/launch reject with INVALID_STATE. Argument validation is shared
+ * with every other component through kernel_entry_validation.h, so an
+ * argument this stub accepts is one the onboard path accepts too.
+ * =========================================================================== */
+
+int simpler_kernel_mode_supported(DeviceContextHandle) { return 0; }
+
+int simpler_kernel_mode_init(
+    DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
+    const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,
+    const CallConfig *config, uint64_t context_generation
+) {
+    const int rc = validate_kernel_init_args(
+        ctx, device_id, aicpu_binary, aicpu_size, aicore_binary, aicore_size, dispatcher_binary, dispatcher_size,
+        config, context_generation
+    );
+    if (rc != 0) return rc;
+    try {
+        PipelineContract contract{};
+        const int rc = build_kernel_pipeline_contract_impl(config, &contract);
+        if (rc != 0) return rc;
+        if (!is_valid_pipeline_contract(&contract, SIMPLER_MODE_KERNEL) || !has_serviceable_arena_topology(contract) ||
+            !has_serviceable_stream_topology(contract)) {
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    LOG_ERROR("simpler_kernel_mode_init: kernel mode is not supported by the simulator");
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
+int simpler_kernel_mode_prepare_callable(
+    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size, void *caller_stream
+) {
+    const int rc = validate_kernel_prepare_callable_args(ctx, callable_id, callable, callable_size, caller_stream);
+    if (rc != 0) return rc;
+    LOG_ERROR("simpler_kernel_mode_prepare_callable: no live kernel context on this device context");
+    return PTO_RUNTIME_ERR_INVALID_STATE;
+}
+
+int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, const void *args, void *caller_stream) {
+    const int rc = validate_kernel_launch_args(ctx, callable_id, args, caller_stream);
+    if (rc != 0) return rc;
+    LOG_ERROR("simpler_kernel_mode_launch: no live kernel context on this device context");
+    return PTO_RUNTIME_ERR_INVALID_STATE;
 }
 
 }  // extern "C"
