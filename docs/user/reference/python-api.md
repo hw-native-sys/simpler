@@ -107,12 +107,17 @@ ChipCallable.build(
     func_name="my_orchestration",     # the exported orchestration symbol
     binary=orch_bytes,
     children=[(func_id, core_callable), ...],
+    scalar_count=0,                   # scalar arguments the orchestration expects
 )
 ```
 
 `ArgDirection` is `SCALAR`, `IN`, `OUT`, or `INOUT`. The signature list is
 positional and defines the task-arg order. `func_id` must match the id the
-orchestration submits. `ChipCallable` exposes `binary_size`.
+orchestration submits. `ChipCallable` exposes `binary_size` and
+`scalar_count`. `scalar_count` is a cached derivation of the signature: a
+nonzero value must equal the signature's `SCALAR` entry count or `build`
+raises, while 0 also means "not recorded" — an artifact built before the
+count existed or an orchestration that takes no scalars.
 
 Public `Worker` calls use `TaskArgs` containing address-free `Tensor` views at
 every level. The L2 leaf resolves those views into the internal

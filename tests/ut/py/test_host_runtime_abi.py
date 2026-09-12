@@ -23,6 +23,15 @@ _NEWLY_REQUIRED_PIPELINE_SYMBOLS = {
     "get_retained_temp_addr_ctx",
     "supports_concurrent_native_prepare_ctx",
 }
+# Kernel-mode lifecycle surface: every host-runtime component exports all of
+# these; components without kernel-mode support export validating stubs that
+# report unsupported rather than omitting the symbols.
+_KERNEL_MODE_SYMBOLS = {
+    "simpler_kernel_mode_init",
+    "simpler_kernel_mode_launch",
+    "simpler_kernel_mode_prepare_callable",
+    "simpler_kernel_mode_supported",
+}
 _REMOVED_AMBIENT_SELECTION_SYMBOLS = {
     "select_arena_bank_ctx",
     "select_pipeline_slot_ctx",
@@ -73,4 +82,5 @@ def test_host_runtime_exports_required_pipeline_symbols(arch: str, variant: str,
     symbols = _defined_external_symbols(runtime_path)
 
     assert _NEWLY_REQUIRED_PIPELINE_SYMBOLS <= symbols, sorted(_NEWLY_REQUIRED_PIPELINE_SYMBOLS - symbols)
+    assert _KERNEL_MODE_SYMBOLS <= symbols, sorted(_KERNEL_MODE_SYMBOLS - symbols)
     assert symbols.isdisjoint(_REMOVED_AMBIENT_SELECTION_SYMBOLS), sorted(symbols & _REMOVED_AMBIENT_SELECTION_SYMBOLS)

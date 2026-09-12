@@ -47,6 +47,7 @@
 #include "host/acl_error_log.h"
 #include "host/host_phase_records_artifact.h"
 #include "host/raii_scope_guard.h"
+#include "host/static_arena_bank.h"
 #include "host_log.h"
 #include "platform_comm/comm.h"
 #include "runtime_c_api.h"
@@ -365,71 +366,18 @@ int DeviceRunnerBase::setup_static_arena(
     // combined size can exceed the device allocator's largest contiguous
     // block. Each arena commits exactly one region, so its base() is the
     // pooled pointer the caller wants.
-    //
-    // Idempotent for the production case (sizes do not change across a
-    // worker's lifetime). If a caller asks for a larger layout on any
-    // region, redo just that region — already-committed peers stay alive
-    // so their callers don't have to re-acquire.
     ArenaBank &bank = this->arena_bank(arena_bank);
 
-    bool arena_changed = false;
-    auto commit_region = [&arena_changed](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
-        if (requested_size == 0) {
-            // hbg's runtime_arena path: caller passed 0 and never reserved
-            // a region. Leave the arena uncommitted; acquire_pooled_* will
-            // return nullptr.
-            if (arena.is_committed() && cached_size != 0) {
-                arena.release();
-                cached_size = 0;
-                arena_changed = true;
-            }
-            return 0;
-        }
-        if (arena.is_committed() && requested_size <= cached_size) {
-            return 0;
-        }
-        arena.release();
-        cached_size = 0;
-        arena_changed = true;
-        arena.reserve(requested_size, DeviceArena::kDefaultBaseAlign);
-        if (arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
-            // commit() failure leaves committed_=false, so the next entry's
-            // is_committed() guard skips the release branch. release() is
-            // idempotent on a never-committed arena (zeroes cursor_).
-            arena.release();
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-        cached_size = requested_size;
-        return 0;
+    const StaticArenaBankRequest request{
+        {&bank.gm_heap, &bank.cached_gm_heap_size, gm_heap_size},
+        {&bank.gm_sm, &bank.cached_gm_sm_size, gm_sm_size},
+        {&bank.runtime_pool, &bank.cached_runtime_arena_size, runtime_arena_size},
     };
-    // Try to commit all three regions; on any failure, fully roll back —
-    // including any earlier-committed peers from a PRIOR successful call.
-    // The simpler "only roll back peers from this call" pattern would
-    // leave stale committed regions when a re-init (e.g., later worker
-    // asking for a larger layout) fails midway, defeating the
-    // "failure means failure" guarantee. Reset everything to the
-    // post-construction state so the caller can retry with a new layout.
-    bool ok = commit_region(bank.gm_heap, bank.cached_gm_heap_size, gm_heap_size) == 0;
-    ok = ok && commit_region(bank.gm_sm, bank.cached_gm_sm_size, gm_sm_size) == 0;
-    ok = ok && commit_region(bank.runtime_pool, bank.cached_runtime_arena_size, runtime_arena_size) == 0;
-    if (!ok) {
-        bank.gm_heap.release();
-        bank.gm_sm.release();
-        bank.runtime_pool.release();
-        bank.cached_gm_heap_size = 0;
-        bank.cached_gm_sm_size = 0;
-        bank.cached_runtime_arena_size = 0;
-        if (arena_bank == 0) {
-            prebuilt_runtime_arena_cache_valid_ = false;
-            prebuilt_runtime_arena_cache_key_.clear();
-            prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
-            prebuilt_runtime_arena_cache_sm_base_ = nullptr;
-            prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
-            prebuilt_runtime_arena_cache_image_.clear();
-        }
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    if (arena_changed && arena_bank == 0) {
+    const StaticArenaBankOutcome outcome = commit_static_arena_bank(request, execution_mode_latch().is_kernel());
+    // The cache keys an assembled image to the bases it was built for, so it
+    // outlives exactly those calls that moved nothing. Only bank 0 has bases
+    // in it.
+    if (outcome.bases_changed && arena_bank == 0) {
         prebuilt_runtime_arena_cache_valid_ = false;
         prebuilt_runtime_arena_cache_key_.clear();
         prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
@@ -437,10 +385,14 @@ int DeviceRunnerBase::setup_static_arena(
         prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
         prebuilt_runtime_arena_cache_image_.clear();
     }
-    return 0;
+    return outcome.rc;
 }
 
 std::thread DeviceRunnerBase::create_thread(std::function<void()> fn) {
+    // A freshly spawned thread carries no CANN device context of its own, so
+    // this bind creates one rather than taking anything from the caller — it
+    // is the one rtSetDevice a borrowed-device context still owns, and it is
+    // scoped to a thread this runner created.
     int dev_id = device_id_;
     return std::thread([dev_id, fn = std::move(fn)]() {
         rtSetDevice(dev_id);
@@ -448,7 +400,7 @@ std::thread DeviceRunnerBase::create_thread(std::function<void()> fn) {
     });
 }
 
-int DeviceRunnerBase::attach_current_thread(int device_id) {
+int DeviceRunnerBase::bind_current_thread(int device_id) {
     if (device_id < 0) {
         LOG_ERROR("Invalid device_id: %d", device_id);
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -468,13 +420,57 @@ int DeviceRunnerBase::attach_current_thread(int device_id) {
         ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
+    return 0;
+}
 
-    // simpler_init performs the only lifetime write. Prepared-run admission
-    // and execution subsequently attach different host threads, so repeated
-    // same-value writes here would still be a C++ data race.
+int DeviceRunnerBase::attach_current_thread(int device_id) {
+    // rtSetDevice and the op-execute watchdog below are acts of device
+    // ownership, so this entry belongs to a program context. A kernel context
+    // reaches its device through adopt_borrowed_device instead; the one caller
+    // here that runs under both identities is DeviceRunner::finalize(), which
+    // skips this call on a kernel latch.
+    if (execution_mode_latch().is_kernel()) {
+        LOG_ERROR("attach_current_thread: refused — a kernel-mode context does not own the caller's device");
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    }
+
+    int rc = bind_current_thread(device_id);
+    if (rc != 0) return rc;
+
+    // Both writers of device_id_ — this one and adopt_borrowed_device — guard
+    // on the still-unset value, and both run before any prepare, execution or
+    // collector thread attaches. Prepared-run admission and execution
+    // subsequently attach different host threads, so repeated same-value
+    // writes here would still be a C++ data race.
     if (device_id_ == -1) {
         timeout_config_ = resolve_onboard_timeout_config();
         configure_aicore_op_timeout();
+        device_id_ = device_id;
+    }
+    return 0;
+}
+
+int DeviceRunnerBase::adopt_borrowed_device(int device_id) {
+    // The caller already holds this device current on its own threads, so the
+    // only thing a kernel context takes from it is the identity: no
+    // rtSetDevice, and no configure_aicore_op_timeout, which would rewrite the
+    // op-execute watchdog for every other user of that card. Resolving the
+    // timeout config is pure environment parsing and stays, because the stream
+    // and scheduler timeouts derived from it are read on both identities.
+    if (!execution_mode_latch().is_kernel()) {
+        LOG_ERROR("adopt_borrowed_device: refused — the context has not latched kernel mode");
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    if (device_id < 0) {
+        LOG_ERROR("Invalid device_id: %d", device_id);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (device_id_ != -1 && device_id_ != device_id) {
+        LOG_ERROR("DeviceRunner already on device %d; close before adopting device %d", device_id_, device_id);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (device_id_ == -1) {
+        timeout_config_ = resolve_onboard_timeout_config();
         device_id_ = device_id;
     }
     return 0;

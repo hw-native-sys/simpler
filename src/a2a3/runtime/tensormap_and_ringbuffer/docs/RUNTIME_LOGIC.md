@@ -120,7 +120,11 @@ On each trb bind, `RetainedTempBump`:
   retained size it `device_free`s the old buffer, `device_malloc`s a new one,
   and writes it back via `set_retained_temp_buffer` (no data preserved across
   this grow — the buffer is per-run scratch). Smaller later runs keep the
-  larger buffer; the slot only grows;
+  larger buffer; the slot only grows. Under a kernel-mode context the slot is
+  context-static: the first allocation is taken normally, but a later run
+  needing more than the retained size is refused with
+  `PTO_RUNTIME_ERR_INTERNAL` instead of re-based, because a captured graph
+  replays the slices the buffer already handed out;
 - bump-slices each tensor from the retained base at the next 1024-aligned
   offset. Slices always fit because the buffer was sized from the same
   tensors; a miss is a caller bug (reported, bind fails). The runtime never
