@@ -355,7 +355,7 @@ inline bool graph_tensor_wire_valid(const GraphTensor &tensor) {
         const uint64_t shape = tensor.shapes[i];
         const uint64_t stride = tensor.strides[i];
         if (shape == 0 || stride == 0) return false;
-        contiguous &= stride == expected_stride;
+        contiguous &= shape == 1 || stride == expected_stride;
         if (shape - 1 > (UINT64_MAX - extent) / stride || expected_stride > UINT64_MAX / shape) return false;
         extent += (shape - 1) * stride;
         expected_stride *= shape;

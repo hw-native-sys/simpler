@@ -53,7 +53,8 @@ namespace simpler::hbg {
  * Fast-path flags on cache line 1:
  *   - manual_dep: when true, dependency tracking is creator-only (skip OverlapMap)
  *   - is_contiguous: cached PyTorch-style contiguous flag — i.e.
- *     `strides[i] == prod(shapes[i+1..ndims-1])`. When true AND start_offset==0,
+ *     `strides[i] == prod(shapes[i+1..ndims-1])` for dimensions of size > 1.
+ *     Singleton strides do not affect contiguity. When true AND start_offset==0,
  *     all hot paths can compute extent_elem from `shapes` alone and never read
  *     cache line 2. NOTE: this is strictly tighter than the pre-#808
  *     `shapes[i] == raw_shapes[i]` test, but equivalent on every view the old
@@ -83,7 +84,7 @@ struct alignas(64) Tensor {
     uint32_t ndims;                    // Number of dimensions used
     DataType dtype;                    // Data type of tensor elements
     bool manual_dep;                   // True when dependency tracking is creator-only (skip OverlapMap lookup/insert)
-    bool is_contiguous;                // Cached: strides[] == row_major_stride(shapes)
+    bool is_contiguous;                // Cached row-major contiguity, ignoring singleton strides
     AddressSpace address_space;        // HOST (default) or DEVICE (child-managed device memory; skips H2D copy)
     uint32_t shapes[MAX_TENSOR_DIMS];  // Current view shape per dimension (elements)
 
@@ -482,13 +483,13 @@ private:
     /// Recompute extent_elem_cache and is_contiguous from current shapes / stride.
     /// Called after any op that mutates view metadata. Single reverse pass:
     ///   extent_elem += (shapes[i] - 1) · strides[i]
-    ///   is_contiguous &&= (strides[i] == prod(shapes[i+1..]))
+    ///   is_contiguous &&= (shapes[i] == 1 || strides[i] == prod(shapes[i+1..]))
     void refresh_derived() {
         uint64_t e = 1;
         uint64_t expected = 1;
         bool contig = true;
         for (int32_t i = static_cast<int32_t>(ndims) - 1; i >= 0; --i) {
-            if (strides[i] != expected) contig = false;
+            if (shapes[i] != 1 && strides[i] != expected) contig = false;
             if (shapes[i] > 0) {
                 e += static_cast<uint64_t>(shapes[i] - 1) * static_cast<uint64_t>(strides[i]);
             }

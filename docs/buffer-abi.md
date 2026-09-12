@@ -122,7 +122,12 @@ chip runtime, so neither an L3 builder nor an L2 caller has anything to put ther
 they live on `simpler::{hbg,tmr}::Tensor`, which `Runtime::set_orch_args` adopts
 each argument into. The same goes for `is_contiguous` and `extent_elem_cache`:
 derived from `shapes`/`strides`, and cached only where a hot path reads them per
-task.
+task. Contiguity follows PyTorch's rule for nonempty tensors: dimensions of
+size one do not constrain their stride. For example, shape `(64, 1)` with
+strides `(1, 64)` is contiguous and permits a zero-copy runtime reshape;
+strides `(2, 64)` still describe gapped storage. The boundary descriptor,
+runtime caches, and HBG graph validation use the same rule. The contiguity
+checks do not rewrite strides or change the storage extent.
 
 So a merged struct would carry ~70 B that the AICore never reads, in a type whose
 size is pinned at two cache lines precisely because the scheduler walks it per
