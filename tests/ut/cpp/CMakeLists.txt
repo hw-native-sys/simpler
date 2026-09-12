@@ -450,6 +450,22 @@ add_hierarchical_test(test_remote_wire hierarchical/test_remote_wire.cpp)
 add_hierarchical_test(test_remote_endpoint hierarchical/test_remote_endpoint.cpp)
 add_hierarchical_test(test_pipeline_contract hierarchical/test_pipeline_contract.cpp)
 
+# Exercise ChipWorker's actual dlopen/dlsym admission before a sentinel factory,
+# then the four built sim runtimes through the unchanged public kernel ABI.
+add_library(pipeline_contract_runtime SHARED stubs/pipeline_contract_runtime.cpp)
+target_include_directories(pipeline_contract_runtime PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+)
+add_hierarchical_test(test_pipeline_contract_loader hierarchical/test_pipeline_contract_loader.cpp)
+add_dependencies(test_pipeline_contract_loader pipeline_contract_runtime)
+target_compile_definitions(test_pipeline_contract_loader PRIVATE
+    PIPELINE_FIXTURE_PATH="$<TARGET_FILE:pipeline_contract_runtime>"
+    SIM_CONTEXT_PATH="${CMAKE_SOURCE_DIR}/../../../build/lib/libcpu_sim_context.so"
+    RUNTIME_LIBRARY_ROOT="${CMAKE_SOURCE_DIR}/../../../build/lib"
+)
+
 # Run-stream pair state machine: publication-aware AICore stream reuse,
 # submitter-gated retirement, and failed-destroy ownership. Header-only with
 # injected create/destroy, so it needs no runtime objects and no device.
@@ -500,6 +516,108 @@ set_tests_properties(test_native_run_acceptance PROPERTIES LABELS "no_hardware")
 # callers invoke it from different host threads.
 add_common_utils_test(test_host_api common/test_host_api.cpp)
 
+# Kernel-mode entry argument validation: shared by every host-runtime
+# component (real implementation and stub alike), so its rejection rules are
+# provable here without any device or built .so.
+add_executable(test_kernel_entry_validation common/test_kernel_entry_validation.cpp)
+target_include_directories(test_kernel_entry_validation PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+)
+target_link_libraries(test_kernel_entry_validation PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_kernel_entry_validation COMMAND test_kernel_entry_validation)
+set_tests_properties(test_kernel_entry_validation PROPERTIES LABELS "no_hardware")
+
+add_executable(test_kernel_callable_cache common/test_kernel_callable_cache.cpp)
+target_include_directories(test_kernel_callable_cache PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+)
+target_link_libraries(test_kernel_callable_cache PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_kernel_callable_cache COMMAND test_kernel_callable_cache)
+set_tests_properties(test_kernel_callable_cache PROPERTIES LABELS "no_hardware")
+
+add_executable(test_kernel_dispatch
+    common/test_kernel_dispatch.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/kernel_dispatch.cpp
+)
+target_include_directories(test_kernel_dispatch PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+)
+target_link_libraries(test_kernel_dispatch PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_kernel_dispatch COMMAND test_kernel_dispatch)
+set_tests_properties(test_kernel_dispatch PROPERTIES LABELS "no_hardware")
+
+add_executable(test_kernel_dispatch_unavailable
+    common/test_kernel_dispatch_unavailable.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/kernel_dispatch.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/kernel_invocation_consumer.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/aicpu/cache_ops.cpp
+)
+target_include_directories(test_kernel_dispatch_unavailable PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+)
+target_link_libraries(test_kernel_dispatch_unavailable PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_kernel_dispatch_unavailable COMMAND test_kernel_dispatch_unavailable)
+set_tests_properties(test_kernel_dispatch_unavailable PROPERTIES LABELS "no_hardware")
+
+# Real TMR encoder -> dispatch envelope -> production rejecting consumer.
+add_executable(test_tmr_dispatch_packet
+    common/test_tmr_dispatch_packet.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/kernel_dispatch.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/kernel_invocation_consumer.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/aicpu/cache_ops.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface/assert_compat.cpp
+)
+target_include_directories(test_tmr_dispatch_packet PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+)
+target_link_libraries(test_tmr_dispatch_packet PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_tmr_dispatch_packet COMMAND test_tmr_dispatch_packet)
+set_tests_properties(test_tmr_dispatch_packet PROPERTIES LABELS "no_hardware")
+
+# Kernel-mode phase machine and restricted-vocabulary tables, table-driven with
+# fake ops: init/close balance, poison, sticky CLOSING with retry, and the
+# separate runtime-error vs teardown-error slots.
+add_executable(test_kernel_execution_state
+    common/test_kernel_execution_state.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/kernel_execution_state.cpp
+)
+target_include_directories(test_kernel_execution_state PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+)
+target_link_libraries(test_kernel_execution_state PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_kernel_execution_state COMMAND test_kernel_execution_state)
+set_tests_properties(test_kernel_execution_state PROPERTIES LABELS "no_hardware")
+
+add_executable(test_kernel_launch_binder
+    common/test_kernel_launch_binder.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/onboard/host/kernel_launch_binder.cpp
+)
+target_include_directories(test_kernel_launch_binder PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${GTEST_INCLUDE_DIRS}
+)
+target_link_libraries(test_kernel_launch_binder PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_kernel_launch_binder COMMAND test_kernel_launch_binder)
+set_tests_properties(test_kernel_launch_binder PROPERTIES LABELS "no_hardware")
+
 # Runtime extension payloads are per-run state even though the collector's
 # shared-memory resources remain resident across runs.
 add_executable(test_chip_swimlane_collector
@@ -544,7 +662,17 @@ set_tests_properties(test_sim_run_completion PROPERTIES LABELS "no_hardware")
 add_task_interface_test(test_buffer types/test_buffer.cpp)
 add_task_interface_test(test_child_memory types/test_child_memory.cpp)
 add_task_interface_test(test_chip_max_tensor_args types/test_chip_max_tensor_args.cpp)
+add_task_interface_test(test_callable_scalar_count types/test_callable_scalar_count.cpp)
 add_task_interface_test(test_call_config types/test_call_config.cpp)
+add_task_interface_test(test_kernel_invocation_header types/test_kernel_invocation_header.cpp)
+add_task_interface_test(test_kernel_invocation_validation types/test_kernel_invocation_validation.cpp)
+add_common_utils_test(test_tmr_kernel_invocation common/test_tmr_kernel_invocation.cpp)
+target_include_directories(test_tmr_kernel_invocation PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+)
+target_sources(test_tmr_kernel_invocation PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface/assert_compat.cpp
+)
 
 # Contract test for upload_chip_callable_buffer caller-buffer immutability.
 # Pulls both task_interface (callable.h) and src/common (utils/fnv1a_64.h),
@@ -578,6 +706,28 @@ target_include_directories(test_runtime_orch_so PRIVATE
 )
 add_common_utils_test(test_device_arena common/test_device_arena.cpp)
 add_common_utils_test(test_thread_completion_gate common/test_thread_completion_gate.cpp)
+add_common_utils_test(test_tmr_kernel_round_gate common/test_tmr_kernel_round_gate.cpp)
+target_include_directories(test_tmr_kernel_round_gate PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+)
+set_tests_properties(test_tmr_kernel_round_gate PROPERTIES TIMEOUT 60)
+add_common_utils_test(test_tmr_kernel_clear_plan common/test_tmr_kernel_clear_plan.cpp)
+foreach(k7_target kernel_execution_round kernel_prepared_context kernel_prepared_callable)
+    add_common_utils_test(test_tmr_${k7_target} common/test_tmr_${k7_target}.cpp)
+    target_include_directories(test_tmr_${k7_target} PRIVATE
+        $<TARGET_PROPERTY:a2a3_rt_objs,INTERFACE_INCLUDE_DIRECTORIES>
+    )
+    set_tests_properties(test_tmr_${k7_target} PROPERTIES TIMEOUT 30)
+endforeach()
+add_common_utils_test(test_tmr_kernel_core_group common/test_tmr_kernel_core_group.cpp)
+target_sources(test_tmr_kernel_prepared_context PRIVATE
+    ${A2A3_RUNTIME_DIR}/shared/runtime.cpp
+    stubs/test_stubs.cpp
+)
+target_include_directories(test_tmr_kernel_core_group PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+)
 add_common_utils_test(test_fatal_shutdown_latch common/test_fatal_shutdown_latch.cpp)
 add_common_utils_test(test_buffer_pool_manager common/test_buffer_pool_manager.cpp)
 target_sources(test_buffer_pool_manager PRIVATE
@@ -624,7 +774,45 @@ target_include_directories(test_profiler_device_engine PRIVATE
 add_common_utils_test(test_worker_chip_orch_comm common/test_worker_chip_orch_comm.cpp)
 add_common_utils_test(test_file_marker_handshake common/test_file_marker_handshake.cpp)
 
+# Context-lifetime AICore argument owner. Built once per runtime variant
+# because the device image length it copies is a per-runtime decision
+# (runtime_device_copy_size): trb narrows to the `dev` descriptor, hbg copies
+# the whole Runtime. The injected alloc/free/copy vocabulary keeps both builds
+# free of CANN.
+set(KERNEL_PERSISTENT_ARGS_SRC
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/onboard/host/kernel_persistent_args.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/kernel_execution_state.cpp)
+
+add_executable(test_kernel_persistent_args
+    common/test_kernel_persistent_args.cpp
+    ${KERNEL_PERSISTENT_ARGS_SRC}
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
+)
+target_compile_definitions(test_kernel_persistent_args PRIVATE SIMPLER_UT_TRB_RUNTIME)
+target_include_directories(test_kernel_persistent_args PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/onboard/host
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/orchestration
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/common
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+)
+target_link_libraries(test_kernel_persistent_args PRIVATE
+    a2a3_rt_objs
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    pthread
+)
+add_test(NAME test_kernel_persistent_args COMMAND test_kernel_persistent_args)
+set_tests_properties(test_kernel_persistent_args PROPERTIES LABELS "no_hardware")
+
 add_executable(test_trb_runtime_temp_buffer
+    common/test_kernel_execution_inputs.cpp
     common/test_trb_runtime_temp_buffer.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/host/runtime_maker.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
@@ -653,6 +841,7 @@ add_test(NAME test_trb_runtime_temp_buffer COMMAND test_trb_runtime_temp_buffer)
 set_tests_properties(test_trb_runtime_temp_buffer PROPERTIES LABELS "no_hardware")
 
 add_executable(test_a5_trb_runtime_temp_buffer
+    common/test_kernel_execution_inputs.cpp
     common/test_trb_runtime_temp_buffer.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/tensormap_and_ringbuffer/host/runtime_maker.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
@@ -958,6 +1147,16 @@ add_a2a3_hbg_runtime_test(test_hbg_tensor_access a2a3/test_hbg_tensor_access.cpp
 # links the Runtime implementation to pin the contract without a device.
 add_a2a3_hbg_runtime_test(test_dispatch_table a2a3/test_dispatch_table.cpp
     ${HBG_SHARED_DIR}/runtime.cpp)
+
+# The hbg half of the per-runtime pair started above: same assertions, whole-
+# Runtime device image.
+add_a2a3_hbg_runtime_test(test_hbg_kernel_persistent_args common/test_kernel_persistent_args.cpp
+    ${KERNEL_PERSISTENT_ARGS_SRC}
+    ${HBG_SHARED_DIR}/runtime.cpp)
+target_include_directories(test_hbg_kernel_persistent_args PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/onboard/host
+    ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+)
 add_a2a3_hbg_runtime_test(test_hbg_core_tracker common/test_hbg_core_tracker.cpp)
 # The seed test calls the real ready_queue_init_data_from_layout, so it links the
 # shared init TU (and the orchestrator/SM members that TU refers to).
@@ -1129,6 +1328,14 @@ target_sources(test_hbg_tensor_access PRIVATE
 )
 add_a2a3_runtime_test(test_dep_list_pool    a2a3/test_dep_list_pool.cpp)
 add_a2a3_runtime_test(test_scheduler_state  a2a3/test_scheduler_state.cpp)
+add_a2a3_runtime_test(test_tmr_scheduler_execution_inputs common/test_tmr_scheduler_execution_inputs.cpp
+    a2a3/test_tmr_scheduler_platform_stubs.cpp
+    ${A2A3_RUNTIME_DIR}/scheduler/scheduler_cold_path.cpp
+    ${A2A3_RUNTIME_DIR}/scheduler/scheduler_dispatch.cpp
+    ${A2A3_RUNTIME_DIR}/scheduler/scheduler_completion.cpp
+    ${A2A3_RUNTIME_DIR}/shared/runtime.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/shared/aicpu/pmu_collector_aicpu.cpp
+)
 add_a2a3_runtime_test(test_task_state       a2a3/test_task_state.cpp)
 add_a2a3_runtime_test(test_ready_queue      a2a3/test_ready_queue.cpp)
 add_a2a3_runtime_test(test_shared_memory    a2a3/test_shared_memory.cpp)
@@ -1155,6 +1362,23 @@ add_a5_runtime_test(test_a5_task_allocator   a5/test_task_allocator.cpp)
 add_a5_runtime_test(test_a5_scope_deadlock_detection common/test_scope_deadlock_detection.cpp)
 add_a5_runtime_test(test_a5_dep_list_pool    a5/test_dep_list_pool.cpp)
 add_a5_runtime_test(test_a5_scheduler_state  a5/test_scheduler_state.cpp)
+add_a5_runtime_test(test_a5_tmr_scheduler_execution_inputs common/test_tmr_scheduler_execution_inputs.cpp)
+target_sources(test_a5_tmr_scheduler_execution_inputs PRIVATE
+    a5/test_tmr_scheduler_platform_stubs.cpp
+    ${A5_RUNTIME_DIR}/scheduler/scheduler_cold_path.cpp
+    ${A5_RUNTIME_DIR}/scheduler/scheduler_dispatch.cpp
+    ${A5_RUNTIME_DIR}/scheduler/scheduler_completion.cpp
+    ${A5_RUNTIME_DIR}/shared/runtime.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/shared/aicpu/pmu_collector_aicpu.cpp
+)
+foreach(target test_tmr_scheduler_execution_inputs test_a5_tmr_scheduler_execution_inputs)
+    target_sources(${target} PRIVATE
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/aicpu_device_config.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/chip_swimlane_collector_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/device_phase_aicpu.cpp
+    )
+endforeach()
 add_a5_runtime_test(test_a5_task_state       a5/test_task_state.cpp)
 add_a5_runtime_test(test_a5_ready_queue      a5/test_ready_queue.cpp)
 add_a5_runtime_test(test_a5_shared_memory    a5/test_shared_memory.cpp)
@@ -1164,6 +1388,89 @@ add_a5_orchestrator_runtime_test(test_a5_orchestrator_fanin a5/test_orchestrator
 add_a5_orchestrator_runtime_test(test_a5_wiring a5/test_wiring.cpp)
 add_a5_orchestrator_runtime_test(test_a5_args_dump a5/test_args_dump.cpp)
 add_a5_runtime_test(test_a5_aicore_completion_mailbox a5/test_aicore_completion_mailbox.cpp)
+
+foreach(arch a2a3 a5)
+    add_common_utils_test(test_${arch}_tmr_kernel_aicore common/test_tmr_kernel_aicore.cpp)
+    target_include_directories(test_${arch}_tmr_kernel_aicore PRIVATE
+        $<TARGET_PROPERTY:${arch}_rt_objs,INTERFACE_INCLUDE_DIRECTORIES>
+        ${CMAKE_SOURCE_DIR}/../../../src/${arch}/runtime/tensormap_and_ringbuffer/aicore
+        ${CMAKE_SOURCE_DIR}/../../../src/${arch}/platform/sim/aicore
+    )
+    set_tests_properties(test_${arch}_tmr_kernel_aicore PROPERTIES TIMEOUT 30)
+    set(executor_test test_${arch}_tmr_executor_execution_inputs)
+    set(executor_runtime ${CMAKE_SOURCE_DIR}/../../../src/${arch}/runtime/tensormap_and_ringbuffer)
+    set(executor_platform ${CMAKE_SOURCE_DIR}/../../../src/common/platform)
+    add_library(${arch}_tmr_executor_orch_fixture MODULE
+        common/tmr_executor_orch_fixture.cpp
+        ${executor_runtime}/orchestration/common.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/log/host_log.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/log/unified_log_host.cpp
+    )
+    target_include_directories(${arch}_tmr_executor_orch_fixture PRIVATE
+        $<TARGET_PROPERTY:${arch}_rt_objs,INTERFACE_INCLUDE_DIRECTORIES>
+    )
+    add_executable(${executor_test}
+        common/test_tmr_executor_execution_inputs.cpp
+        ${executor_runtime}/aicpu/aicpu_executor.cpp
+        ${executor_runtime}/orchestration/common.cpp
+        ${executor_runtime}/runtime/runtime_core.cpp
+        ${executor_runtime}/runtime/orchestrator.cpp
+        ${executor_runtime}/runtime/ring_buffer.cpp
+        ${executor_runtime}/runtime/shared/runtime.cpp
+        ${executor_runtime}/runtime/shared/runtime_init.cpp
+        ${executor_runtime}/runtime/shared/shared_memory.cpp
+        ${executor_runtime}/runtime/shared/tensormap.cpp
+        ${executor_runtime}/runtime/scheduler/scheduler.cpp
+        ${executor_runtime}/runtime/scheduler/scheduler_cold_path.cpp
+        ${executor_runtime}/runtime/scheduler/scheduler_dispatch.cpp
+        ${executor_runtime}/runtime/scheduler/scheduler_completion.cpp
+        ${executor_platform}/shared/aicpu/aicpu_device_config.cpp
+        ${executor_platform}/shared/aicpu/args_dump_aicpu.cpp
+        ${executor_platform}/shared/aicpu/chip_swimlane_collector_aicpu.cpp
+        ${executor_platform}/shared/aicpu/dep_gen_collector_aicpu.cpp
+        ${executor_platform}/shared/aicpu/device_phase_aicpu.cpp
+        ${executor_platform}/shared/aicpu/scope_stats_collector_aicpu.cpp
+        ${executor_platform}/sim/aicpu/device_log.cpp
+        ${executor_platform}/sim/aicpu/device_time.cpp
+        ${executor_platform}/sim/aicpu/orch_so_file.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/${arch}/platform/shared/aicpu/pmu_collector_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/log/host_log.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/log/unified_log_host.cpp
+    )
+    target_include_directories(${executor_test} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        $<TARGET_PROPERTY:${arch}_rt_objs,INTERFACE_INCLUDE_DIRECTORIES>
+    )
+    target_compile_definitions(${executor_test} PRIVATE
+        TMR_EXECUTOR_ORCH_FIXTURE="$<TARGET_FILE:${arch}_tmr_executor_orch_fixture>"
+    )
+    target_link_libraries(${executor_test} PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread ${CMAKE_DL_LIBS})
+    add_dependencies(${executor_test} ${arch}_tmr_executor_orch_fixture)
+    add_test(NAME ${executor_test} COMMAND ${executor_test})
+    set_tests_properties(${executor_test} PROPERTIES LABELS "no_hardware" TIMEOUT 30)
+endforeach()
+target_sources(test_a2a3_tmr_executor_execution_inputs PRIVATE a2a3/test_tmr_executor_platform_stubs.cpp)
+target_sources(test_a5_tmr_executor_execution_inputs PRIVATE a5/test_tmr_scheduler_platform_stubs.cpp)
+
+add_a5_runtime_test(test_a5_kernel_persistent_args common/test_kernel_persistent_args.cpp)
+target_sources(test_a5_kernel_persistent_args PRIVATE
+    ${KERNEL_PERSISTENT_ARGS_SRC}
+    ${A5_RUNTIME_DIR}/shared/runtime.cpp
+)
+target_compile_definitions(test_a5_kernel_persistent_args PRIVATE SIMPLER_UT_TRB_RUNTIME)
+target_include_directories(test_a5_kernel_persistent_args PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/onboard/host
+    ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+)
+add_a5_hbg_runtime_test(test_a5_hbg_kernel_persistent_args common/test_kernel_persistent_args.cpp)
+target_sources(test_a5_hbg_kernel_persistent_args PRIVATE
+    ${KERNEL_PERSISTENT_ARGS_SRC}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/host_build_graph/shared/runtime.cpp
+)
+target_include_directories(test_a5_hbg_kernel_persistent_args PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/onboard/host
+    ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+)
 
 # Host logger silent/off behavior — no runtime deps, just compile the same
 # self-contained host logger sources used by production consumers.
@@ -1291,6 +1598,33 @@ target_link_libraries(test_host_log_cross_dso PRIVATE
 add_dependencies(test_host_log_cross_dso test_host_log_consumer)
 add_test(NAME test_host_log_cross_dso COMMAND test_host_log_cross_dso)
 set_tests_properties(test_host_log_cross_dso PROPERTIES LABELS "no_hardware")
+
+# Arena-bank capacity rule shared by the onboard and sim runners
+# (host/static_arena_bank.h). Pure host logic over DeviceArena's libc backend,
+# so a kernel-mode context's address stability is provable with no CANN and no
+# device; the logger sources satisfy the rule's LOG_ERROR. Placed after
+# SIMPLER_LOG_DIR / HOST_LOG_TEST_SOURCES rather than beside the other
+# common-utils tests, which are declared before those are set.
+add_executable(test_static_arena_bank
+    common/test_static_arena_bank.cpp
+    ${HOST_LOG_TEST_SOURCES}
+)
+target_include_directories(test_static_arena_bank PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    # src/common resolves the "utils/..." and "worker/..." prefixes.
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+    ${SIMPLER_LOG_DIR}
+    ${SIMPLER_LOG_DIR}/include
+)
+target_link_libraries(test_static_arena_bank PRIVATE
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    pthread
+)
+add_test(NAME test_static_arena_bank COMMAND test_static_arena_bank)
+set_tests_properties(test_static_arena_bank PROPERTIES LABELS "no_hardware")
 
 set(COMMON_PLATFORM_DIR ${CMAKE_SOURCE_DIR}/../../../src/common/platform)
 function(add_device_phase_capture_test name host_strace device_strace expected)
@@ -1472,6 +1806,61 @@ if(SIMPLER_ENABLE_HARDWARE_TESTS)
             ${ASCEND_HOME_PATH}/runtime/lib64
             ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/lib64
         NO_DEFAULT_PATH REQUIRED)
+
+    # Transport-only fault injection into the actual a5 host runtime. An
+    # architecture-specific package build may not provide this DSO; registering
+    # the test requires it, but executing the test never needs an NPU.
+    if(EXISTS "${PROJECT_ROOT}/build/lib/a5/onboard/tensormap_and_ringbuffer/libhost_runtime.so")
+        add_executable(test_a5_kernel_topology_lifecycle hardware/test_a5_kernel_topology_lifecycle.cpp)
+        target_include_directories(test_a5_kernel_topology_lifecycle PRIVATE
+            ${GTEST_INCLUDE_DIRS}
+            ${PROJECT_ROOT}/src/a5/platform/onboard/host
+            ${PROJECT_ROOT}/src/a5/platform/include
+            ${PROJECT_ROOT}/src/common/platform/onboard/host
+            ${PROJECT_ROOT}/src/common/platform/include
+            ${PROJECT_ROOT}/src/common/task_interface
+            ${PROJECT_ROOT}/src/common/worker
+            ${PROJECT_ROOT}/src/common/log/include
+            ${PROJECT_ROOT}/src/common
+            ${PROJECT_ROOT}/src/a5/runtime/tensormap_and_ringbuffer/runtime
+            ${PROJECT_ROOT}/src/a5/runtime/tensormap_and_ringbuffer/common
+            ${PROJECT_ROOT}/src/a5/runtime
+            ${ASCEND_HOME_PATH}/include
+            ${ASCEND_HOME_PATH}/pkg_inc
+            ${ASCEND_HOME_PATH}/pkg_inc/runtime
+            ${ASCEND_HOME_PATH}/pkg_inc/runtime/runtime
+            ${ASCEND_HOME_PATH}/pkg_inc/profiling
+        )
+        target_link_libraries(test_a5_kernel_topology_lifecycle PRIVATE
+            "${PROJECT_ROOT}/build/lib/a5/onboard/tensormap_and_ringbuffer/libhost_runtime.so"
+            ${GTEST_MAIN_LIB}
+            ${GTEST_LIB}
+            ${ASCENDCL_LIB}
+            ${RUNTIME_LIB}
+            pthread
+            dl
+        )
+        target_link_options(test_a5_kernel_topology_lifecycle PRIVATE -Wl,--export-dynamic)
+        add_test(NAME test_a5_kernel_topology_lifecycle COMMAND test_a5_kernel_topology_lifecycle)
+        set_tests_properties(test_a5_kernel_topology_lifecycle PROPERTIES LABELS "no_hardware")
+    endif()
+
+    # SDK declarations with fake ACL symbols: execution needs no device.
+    add_executable(test_kernel_launch_native
+        common/test_kernel_launch_native.cpp
+        ${PROJECT_ROOT}/src/common/platform/onboard/host/kernel_launch_binder.cpp
+        ${PROJECT_ROOT}/src/common/platform/onboard/host/kernel_launch_native.cpp
+    )
+    target_include_directories(test_kernel_launch_native PRIVATE
+        ${PROJECT_ROOT}/src/common
+        ${PROJECT_ROOT}/src/common/platform/include
+        ${PROJECT_ROOT}/src/common/platform/onboard/host
+        ${ASCEND_HOME_PATH}/include
+        ${GTEST_INCLUDE_DIRS}
+    )
+    target_link_libraries(test_kernel_launch_native PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+    add_test(NAME test_kernel_launch_native COMMAND test_kernel_launch_native)
+    set_tests_properties(test_kernel_launch_native PROPERTIES LABELS "no_hardware")
 
     # Black-box lifecycle UT for the comm_* C API on Path D. See the file
     # header for the contract it pins down.

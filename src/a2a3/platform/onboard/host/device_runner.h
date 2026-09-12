@@ -83,6 +83,7 @@ class DeviceRunner : public DeviceRunnerBase {
 public:
     DeviceRunner() = default;
     ~DeviceRunner();
+    int prepare_aicpu_affinity(Runtime &runtime, int requested, rtStream_t control_stream) override;
 
     // `setup_static_arena`, `allocate_tensor`, `free_tensor`,
     // `copy_to_device`, `copy_from_device`,
@@ -134,6 +135,13 @@ public:
      * @return 0 on success, error code on failure
      */
     int finalize() override;
+
+    /**
+     * a2a3 fills the AIC_CTRL per-core register table and the FFTS base
+     * address. The register table is allocated on `mem_alloc_`; the FFTS
+     * address is a query result and owns nothing.
+     */
+    int fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) override;
 
     // `upload_chip_callable_buffer` is inherited from `DeviceRunnerBase`.
 

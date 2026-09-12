@@ -136,6 +136,25 @@ int kernel_args_init_ffts_base_addr(KernelArgsHelper &helper) {
 // DeviceRunner Implementation
 // =============================================================================
 
+int DeviceRunner::fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) {
+    if (args == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+
+    int rc = init_aicore_register_addresses(&args->regs, device_id, mem_alloc_, AicoreRegKind::Ctrl);
+    if (rc != 0) {
+        LOG_ERROR("fill_persistent_arch_fields: init_aicore_register_addresses(Ctrl) failed: %d", rc);
+        return rc;
+    }
+
+    uint32_t ffts_len = 0;
+    rc = rtGetC2cCtrlAddr(&args->ffts_base_addr, &ffts_len);
+    if (rc != 0) {
+        LOG_ERROR("fill_persistent_arch_fields: rtGetC2cCtrlAddr failed: %d", rc);
+        args->ffts_base_addr = 0;
+        return rc;
+    }
+    return 0;
+}
+
 DeviceRunner::~DeviceRunner() { finalize(); }
 
 // `setup_static_arena`, `create_thread`, `attach_current_thread`,
@@ -147,6 +166,20 @@ int DeviceRunner::ensure_acl_ready(int device_id) {
     if (device_id < 0) {
         LOG_ERROR("ensure_acl_ready: invalid device_id %d", device_id);
         return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    // A kernel-mode context borrows the caller's device and ACL context, so
+    // the ACL lifecycle (aclInit / aclrtSetDevice / aclrtResetDevice[Force] /
+    // aclFinalize) belongs to the caller. Every call site of those APIs falls
+    // into one of three classes: (a) the aclInit / aclrtSetDevice below this
+    // guard, (b) calls inside force_reset_device(), behind its own
+    // kernel-mode guard, or (c) calls gated on acl_ready_, which only the
+    // path below this guard sets. finalize()'s rt-layer device reset on the
+    // acl_ready_ == false path is intercepted by the kernel-mode branch
+    // inside finalize(). Together these keep the caller's device and ACL
+    // state unreachable in kernel mode.
+    if (execution_mode_latch().is_kernel()) {
+        LOG_ERROR("ensure_acl_ready: refused — a kernel-mode context does not own the caller's ACL lifecycle");
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
     }
 
     // aclInit is process-wide; CANN returns ACL_ERROR_REPEAT_INITIALIZE if it
@@ -216,6 +249,56 @@ void DeviceRunner::set_dep_gen_enabled(bool enable) {
     // device-orch one). The c_api latches the CallConfig before bind, and the
     // orchestration entry resets the graph before recording it.
     dep_gen_host_graph_set_enabled(enable);
+}
+
+int DeviceRunner::prepare_aicpu_affinity(Runtime &runtime, int requested, rtStream_t control_stream) {
+    (void)control_stream;
+    {
+        std::vector<pto::a2a3::AicpuLogicalCpu> user_cpus;
+        std::vector<int32_t> allowed;
+        runtime.set_aicpu_allowed_cpu_count(0);
+        runtime.set_aicpu_launch_count(0);
+        if (!pto::a2a3::probe_aicpu_topology(static_cast<uint32_t>(device_id_), user_cpus)) {
+            LOG_ERROR("A2A3 AICPU topology probe failed; cannot configure affinity gate");
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        int resolved_aicpu =
+            resolve_aicpu_thread_num(requested, static_cast<int>(user_cpus.size()), PLATFORM_DEFAULT_AICPU_THREAD_NUM);
+        if (resolved_aicpu < 0) return PTO_RUNTIME_ERR_INTERNAL;
+        if (!pto::a2a3::compute_allowed_cpus(user_cpus, resolved_aicpu, allowed)) {
+            LOG_ERROR(
+                "A2A3 AICPU topology has %zu user cpus, cannot fit %d active threads", user_cpus.size(), resolved_aicpu
+            );
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        runtime.set_aicpu_thread_num(resolved_aicpu);
+        const size_t cap = runtime.aicpu_allowed_cpus_capacity();
+        if (allowed.size() > cap) {
+            LOG_ERROR("A2A3 compute_allowed_cpus returned %zu > cap %zu", allowed.size(), cap);
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        int32_t *allowed_cpus = runtime.get_aicpu_allowed_cpus();
+        for (size_t i = 0; i < allowed.size(); ++i)
+            allowed_cpus[i] = allowed[i];
+        runtime.set_aicpu_allowed_cpu_count(static_cast<int32_t>(allowed.size()));
+        int32_t launch_n = static_cast<int32_t>(user_cpus.size());
+        if (launch_n > PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH) {
+            launch_n = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
+        }
+        runtime.set_aicpu_launch_count(launch_n);
+
+        std::string dump;
+        for (size_t i = 0; i < allowed.size(); ++i) {
+            if (i) dump += ", ";
+            dump += std::to_string(allowed[i]);
+            if (i + 1 == allowed.size()) dump += "(last)";
+        }
+        LOG_INFO(
+            "A2A3 AICPU ALLOWED_CPUS = [%s] (active=%d, launch=%d, user_cpus=%zu)", dump.c_str(),
+            runtime.get_aicpu_thread_num(), runtime.get_aicpu_launch_count(), user_cpus.size()
+        );
+    }
+    return 0;
 }
 
 int DeviceRunner::prepare_execution(
@@ -303,57 +386,9 @@ int DeviceRunner::prepare_execution(
 
     resolve_task_binary_addrs(runtime);
 
-    // a2a3 onboard now uses the same host-computed, device-filtered affinity
-    // shape as a5. Host probes the AICPU user pool once, chooses the active
-    // cpu_ids deterministically, writes them into Runtime, and the AICPU-side
-    // gate only matches sched_getcpu() against this table.
-    {
-        std::vector<pto::a2a3::AicpuLogicalCpu> user_cpus;
-        std::vector<int32_t> allowed;
-        runtime.set_aicpu_allowed_cpu_count(0);
-        runtime.set_aicpu_launch_count(0);
-        if (!pto::a2a3::probe_aicpu_topology(static_cast<uint32_t>(device_id_), user_cpus)) {
-            LOG_ERROR("A2A3 AICPU topology probe failed; cannot configure affinity gate");
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-        int resolved_aicpu = resolve_aicpu_thread_num(
-            runtime.get_aicpu_thread_num(), static_cast<int>(user_cpus.size()), PLATFORM_DEFAULT_AICPU_THREAD_NUM
-        );
-        if (resolved_aicpu < 0) return PTO_RUNTIME_ERR_INTERNAL;
-        if (!pto::a2a3::compute_allowed_cpus(user_cpus, resolved_aicpu, allowed)) {
-            LOG_ERROR(
-                "A2A3 AICPU topology has %zu user cpus, cannot fit %d active threads", user_cpus.size(), resolved_aicpu
-            );
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-        runtime.set_aicpu_thread_num(resolved_aicpu);
-        launch_aicpu_num = resolved_aicpu;
-        const size_t cap = runtime.aicpu_allowed_cpus_capacity();
-        if (allowed.size() > cap) {
-            LOG_ERROR("A2A3 compute_allowed_cpus returned %zu > cap %zu", allowed.size(), cap);
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-        int32_t *allowed_cpus = runtime.get_aicpu_allowed_cpus();
-        for (size_t i = 0; i < allowed.size(); ++i)
-            allowed_cpus[i] = allowed[i];
-        runtime.set_aicpu_allowed_cpu_count(static_cast<int32_t>(allowed.size()));
-        int32_t launch_n = static_cast<int32_t>(user_cpus.size());
-        if (launch_n > PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH) {
-            launch_n = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
-        }
-        runtime.set_aicpu_launch_count(launch_n);
-
-        std::string dump;
-        for (size_t i = 0; i < allowed.size(); ++i) {
-            if (i) dump += ", ";
-            dump += std::to_string(allowed[i]);
-            if (i + 1 == allowed.size()) dump += "(last)";
-        }
-        LOG_INFO(
-            "A2A3 AICPU ALLOWED_CPUS = [%s] (active=%d, launch=%d, user_cpus=%zu)", dump.c_str(),
-            runtime.get_aicpu_thread_num(), runtime.get_aicpu_launch_count(), user_cpus.size()
-        );
-    }
+    rc = prepare_aicpu_affinity(runtime, runtime.get_aicpu_thread_num(), stream_aicpu_);
+    if (rc != 0) return rc;
+    launch_aicpu_num = runtime.get_aicpu_thread_num();
 
     // Initialize per-subsystem shared memory.
     //
@@ -854,6 +889,14 @@ int DeviceRunner::force_reset_device() {
     if (device_id_ < 0) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    // aclrtResetDeviceForce would reset the caller's device and ACL context;
+    // a kernel-mode context owns neither (see ensure_acl_ready()), so error
+    // recovery on that path never resets the device out from under the host
+    // process.
+    if (execution_mode_latch().is_kernel()) {
+        LOG_ERROR("force_reset_device: refused — a kernel-mode context does not own the caller's device");
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    }
     // aclrtResetDeviceForce is an ACL API; bring ACL up for the whole sequence,
     // released on scope exit so a repeated poison-then-reset cycle in a
     // long-lived process leaks no ACL state.
@@ -1025,13 +1068,20 @@ int DeviceRunner::finalize() {
         // (verified on a2a3). An SDMA-provisioned card gets a single attempt:
         // there a non-confirming reset already blocks on the driver's
         // remote-event timeout, which a retry only multiplies.
+        // A kernel-mode context owns neither the device nor its ACL state, so
+        // force_reset_device() refuses. Asking anyway would log that refusal
+        // once per attempt and then report a reset that "did not confirm
+        // clean", which reads as a failed reset rather than the designed
+        // refusal it is.
+        const bool owns_device_reset = !execution_mode_latch().is_kernel();
         constexpr int kFatalResetAttempts = 3;
-        int reset_rc = attempt_fatal_reset(
-            [this]() {
-                return force_reset_device();
-            },
-            sdma_provisioned ? 1 : kFatalResetAttempts
-        );
+        int reset_rc = owns_device_reset ? attempt_fatal_reset(
+                                               [this]() {
+                                                   return force_reset_device();
+                                               },
+                                               sdma_provisioned ? 1 : kFatalResetAttempts
+                                           ) :
+                                           0;
         const bool reset_confirmed = reset_rc == 0;
         if (!reset_confirmed) {
             LOG_ERROR(
@@ -1068,10 +1118,15 @@ int DeviceRunner::finalize() {
         return abandon_rc != 0 ? abandon_rc : reset_rc;
     }
 
-    int rc = attach_current_thread(device_id_);
-    if (rc != 0) {
-        LOG_ERROR("Failed to attach finalize thread to device %d: %d", device_id_, rc);
-        return rc;
+    // A kernel-mode context runs on the caller's already-current device, so
+    // this thread needs no bind and the context owns no device state to adopt.
+    int rc = 0;
+    if (!execution_mode_latch().is_kernel()) {
+        rc = attach_current_thread(device_id_);
+        if (rc != 0) {
+            LOG_ERROR("Failed to attach finalize thread to device %d: %d", device_id_, rc);
+            return rc;
+        }
     }
 
     // Cleanup performance profiling (including a2a3's dep_gen). Normally
@@ -1089,6 +1144,7 @@ int DeviceRunner::finalize() {
     // mem_alloc_.finalize(), and cached arena sizes.
     rc = finalize_common();
     if (rc == 0) rc = stream_rc;
+    if (rc != 0 && execution_mode_latch().is_kernel()) return rc;
 
     // Reset device AFTER all device memory is freed. Two paths:
     //
@@ -1118,6 +1174,10 @@ int DeviceRunner::finalize() {
                 if (rc == 0) rc = finalize_rc;
             }
             acl_ready_ = false;
+        } else if (execution_mode_latch().is_kernel()) {
+            // A kernel-mode context borrows the caller's device; the device
+            // reset belongs to the caller, so the healthy close path releases
+            // only context-owned resources.
         } else {
             int reset_rc = rtDeviceReset(device_id_);
             if (reset_rc != 0) {

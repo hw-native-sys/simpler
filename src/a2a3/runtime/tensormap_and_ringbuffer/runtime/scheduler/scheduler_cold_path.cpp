@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include "scheduler_context.h"
+#include "tensormap_and_ringbuffer/kernel_core_group.h"
 
 #include "utils/fatal_shutdown_latch.h"
 
@@ -708,6 +709,37 @@ int32_t SchedulerContext::retire_all_cores(Runtime *runtime) {
 // built serially in post_handshake_init (core-index order) once every slice has
 // landed, so the shared aic_count_/aiv_count_ are written by one thread only.
 // =============================================================================
+
+// Reports are fully validated by the admission owner before any partition
+// opens a window. Every worker has one writer; final init runs after all slices.
+void SchedulerContext::handshake_kernel_partition(Runtime *runtime, int32_t index, int32_t threads) {
+    const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(index) * cores_total_num_) / threads);
+    const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(index + 1) * cores_total_num_) / threads);
+    for (int32_t i = lo; i < hi; ++i) {
+        auto &worker = runtime->dev.workers[i];
+        worker.task = reinterpret_cast<uint64_t>(&payload_per_core_[i][0]);
+        worker.physical_core_id = kernel_cores_->physical_id(i);
+        worker.core_type = kernel_cores_->core_type(i);
+        OUT_OF_ORDER_STORE_BARRIER();
+        kernel_cores_->open(i);
+        CoreExecState state{};
+        state.reg_addr = kernel_cores_->register_address(i);
+        state.cond_ptr = get_reg_ptr(state.reg_addr, RegId::COND);
+        state.running_reg_task_id = AICPU_TASK_INVALID;
+        state.pending_reg_task_id = AICPU_TASK_INVALID;
+#if !SIMPLER_DFX
+        state.worker_id = i;
+        state.physical_core_id = kernel_cores_->physical_id(i);
+        state.core_type = kernel_cores_->core_type(i);
+#endif
+        core_exec_states_[i] = state;
+        core_type_compact_[i] = static_cast<uint8_t>(kernel_cores_->core_type(i));
+#if SIMPLER_DFX
+        physical_core_ids_[i] = kernel_cores_->physical_id(i);
+#endif
+    }
+}
+
 void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads) {
     Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
     const int32_t total = cores_total_num_;
@@ -1087,6 +1119,12 @@ bool SchedulerContext::begin_emergency_shutdown() {
 }
 
 void SchedulerContext::signal_emergency_shutdown(Runtime *runtime) {
+    if (kernel_cores_ != nullptr) {
+        // Kernel windows retire only after every CPU consumer has arrived at
+        // the outer gate, including the scheduler-timeout diagnostic path.
+        kernel_cores_->cancel();
+        return;
+    }
     // Sweeps every core rather than one thread's slice: a fatal run must not
     // depend on the owning threads reaching their own shutdown. Per-core
     // claiming keeps whatever they already retired untouched. Cores whose
@@ -1097,6 +1135,11 @@ void SchedulerContext::signal_emergency_shutdown(Runtime *runtime) {
 }
 
 void SchedulerContext::emergency_shutdown(Runtime *runtime) {
+    if (kernel_cores_ != nullptr) {
+        completed_.store(true, std::memory_order_release);
+        kernel_cores_->cancel();
+        return;
+    }
     if (begin_emergency_shutdown()) {
         signal_emergency_shutdown(runtime);
     }
@@ -1107,6 +1150,17 @@ void SchedulerContext::emergency_shutdown(Runtime *runtime) {
 // =============================================================================
 int32_t SchedulerContext::pre_handshake_init(
     Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, uint64_t regs_base
+) {
+    always_assert(runtime != nullptr);
+    return pre_handshake_init(
+        runtime, aicpu_thread_num, sched_thread_num, regs_base, {runtime->dev.func_id_to_addr_, RUNTIME_MAX_FUNC_ID},
+        runtime->get_gm_sm_ptr()
+    );
+}
+
+int32_t SchedulerContext::pre_handshake_init(
+    Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, uint64_t regs_base,
+    simpler::tmr::CallableTableView functions, void *sm
 ) {
     always_assert(runtime != nullptr);
 
@@ -1191,14 +1245,14 @@ int32_t SchedulerContext::pre_handshake_init(
     // released to dispatch.
     completed_tasks_.store(0, std::memory_order_release);
     orchestrator_done_.store(false, std::memory_order_release);
-    func_id_to_addr_ = runtime->dev.func_id_to_addr_;
+    functions_ = functions;
 
     // total_tasks_ must be read before hs_setup_done_ is published: on the
     // decoupled path the orchestrator resets the SM as soon as it observes
     // hs_setup_done_, which zeroes these ring counters, so the read completes here
     // (on the leader, before any thread is released) rather than post-handshake.
-    if (runtime->get_gm_sm_ptr()) {
-        auto *header = static_cast<SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
+    if (sm) {
+        auto *header = static_cast<SharedMemoryHeader *>(sm);
         int64_t window_tasks = 0;
         for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
             int32_t ring_tasks = header->rings[r].fc.current_task_index.load(std::memory_order_acquire);
@@ -1214,6 +1268,10 @@ int32_t SchedulerContext::pre_handshake_init(
 }
 
 int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
+    return post_handshake_init(runtime, {runtime->dev.func_id_to_addr_, RUNTIME_MAX_FUNC_ID});
+}
+
+int32_t SchedulerContext::post_handshake_init(Runtime *runtime, simpler::tmr::CallableTableView functions) {
     if (handshake_failed_.load(std::memory_order_acquire)) {
         emergency_shutdown(runtime);
         return -1;
@@ -1321,12 +1379,13 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
         }
     }
 
-    func_id_to_addr_ = runtime->dev.func_id_to_addr_;
+    functions_ = functions;
 
     return 0;
 }
 
 void SchedulerContext::deinit() {
+    kernel_cores_ = nullptr;
     // Reset all per-core execution state
     for (int32_t i = 0; i < RUNTIME_MAX_WORKER; i++) {
         core_exec_states_[i] = {};
@@ -1381,7 +1440,7 @@ void SchedulerContext::deinit() {
     regs_ = 0;
     sched_ = nullptr;
     rt_ = nullptr;
-    func_id_to_addr_ = nullptr;
+    functions_ = {};
 }
 
 void SchedulerContext::bind_runtime(RuntimeContext *rt) {

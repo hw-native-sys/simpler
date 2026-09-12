@@ -9,6 +9,9 @@
 """Tests for RuntimeCompiler's CMake invocation."""
 
 import logging
+from pathlib import Path
+
+import pytest
 
 from simpler_setup.toolchain import Toolchain
 
@@ -91,3 +94,75 @@ def test_instance_cache_is_scoped_by_sanitizer_configuration(monkeypatch):
     assert plain is not sanitized
     assert plain.host_target.toolchain.cxx_path == "g++"
     assert sanitized.host_target.toolchain.cxx_path == "g++-15"
+
+
+@pytest.mark.parametrize("platform", ["a2a3", "a5", "a2a3sim", "a5sim"])
+@pytest.mark.parametrize("requested", [False, True])
+def test_kernel_aicore_side_product_staging(tmp_path, monkeypatch, platform, requested):
+    """Collect the requested onboard ELF without replacing the program result."""
+    from simpler_setup import runtime_compiler  # noqa: PLC0415
+
+    compiler = runtime_compiler.RuntimeCompiler.__new__(runtime_compiler.RuntimeCompiler)
+    compiler.platform = platform
+    compiler._sanitizers = ""
+    binary_name = "libaicore_kernel.so" if platform.endswith("sim") else "aicore_kernel.o"
+    compiler.aicore_target = runtime_compiler.BuildTarget(_StubToolchain(is_host=False), str(tmp_path), binary_name)
+
+    def fake_build(source, args, name, *, platform, build_dir):
+        binary = Path(build_dir) / name
+        binary.write_bytes(b"program")
+        (Path(build_dir) / "aicore_kernel_mode.o").write_bytes(b"kernel")
+        return str(binary)
+
+    monkeypatch.setattr(compiler, "_run_compilation", fake_build)
+    output_dir = tmp_path / "out"
+    result = compiler.compile(
+        "aicore",
+        [],
+        [],
+        build_dir=str(tmp_path / "cache"),
+        output_dir=output_dir,
+        kernel_aicore_dest=output_dir if requested else None,
+    )
+
+    assert result == output_dir / binary_name
+    assert result.read_bytes() == b"program"
+    staged = output_dir / "aicore_kernel_mode.o"
+    if requested and not platform.endswith("sim"):
+        assert staged.read_bytes() == b"kernel"
+    else:
+        assert not staged.exists()
+
+
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+def test_missing_requested_kernel_aicore_is_not_masked_by_staged_file(tmp_path, monkeypatch, platform):
+    """A stale exported ELF cannot make an incomplete new build appear successful."""
+    from simpler_setup import runtime_compiler  # noqa: PLC0415
+
+    compiler = runtime_compiler.RuntimeCompiler.__new__(runtime_compiler.RuntimeCompiler)
+    compiler.platform = platform
+    compiler._sanitizers = ""
+    compiler.aicore_target = runtime_compiler.BuildTarget(
+        _StubToolchain(is_host=False), str(tmp_path), "aicore_kernel.o"
+    )
+
+    def fake_build(source, args, name, *, platform, build_dir):
+        binary = Path(build_dir) / name
+        binary.write_bytes(b"program")
+        return str(binary)
+
+    monkeypatch.setattr(compiler, "_run_compilation", fake_build)
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    staged = output_dir / "aicore_kernel_mode.o"
+    staged.write_bytes(b"old kernel")
+    with pytest.raises(FileNotFoundError, match="TMR kernel-mode AICore binary not found"):
+        compiler.compile(
+            "aicore",
+            [],
+            [],
+            build_dir=str(tmp_path / "cache"),
+            output_dir=output_dir,
+            kernel_aicore_dest=output_dir,
+        )
+    assert staged.read_bytes() == b"old kernel"

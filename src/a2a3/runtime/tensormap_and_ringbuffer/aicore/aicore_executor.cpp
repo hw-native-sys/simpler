@@ -17,6 +17,8 @@
 #include "common/platform_config.h"  // Register-based communication
 #include "dispatch_payload.h"
 #include "runtime.h"
+#include "task_interface/tmr_kernel_context.h"
+#include "task_interface/tmr_kernel_control.h"
 
 /**
  * Unified function pointer type for kernel dispatch
@@ -43,85 +45,57 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Dispat
     OUT_OF_ORDER_STORE_BARRIER();
 }
 
-/**
- * AICore main execution loop
- *
- * Implements the AICPU-AICore register-based dispatch protocol:
- * 1. Report physical core ID and core type, signal aicore_done (no AICPU wait)
- * 2. Wait for the AICPU to open our register window (DATA_MAIN_BASE != 0)
- * 3. Cache per-core DispatchPayload pointer from my_hank->task
- * 4. Poll DATA_MAIN_BASE register for task dispatch until exit signal
- *
- * AICore reports on launch; the AICPU writes &s_payload_per_core[i] to
- * my_hank->task and then opens the register window (DATA_MAIN_BASE = IDLE), which
- * is itself the acknowledgement. AICore caches this pointer and reads
- * function_bin_addr + args pointer from it on each dispatch. reg_val is a
- * monotonically increasing task ID used only for dispatch signaling and
- * ACK/FIN protocol.
- *
- * Profiling state (enable flag, chip swimlane rotation channel) is published into the platform
- * via set_aicore_profiling_flag / set_chip_swimlane_aicore_head_slot at kernel entry —
- * this routine reads it through the matching getters, so neither Handshake
- * nor this signature carry profiling fields.
- *
- * @param runtime Pointer to Runtime in global memory
- * @param block_idx Block index (core ID)
- * @param core_type Core type (AIC or AIV)
- */
-__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type) {
-    __gm__ Handshake *my_hank = (__gm__ Handshake *)(&runtime->dev.workers[block_idx]);
+using simpler::tmr::TmrCoreCommand;
+using simpler::tmr::TmrCoreRelease;
+using simpler::tmr::TmrCoreReport;
+using simpler::tmr::TmrKernelContextDescriptor;
+using simpler::tmr::TmrLaunchControl;
 
-    // Phase 1: report physical core ID + core type and signal done in one write,
-    // with no wait for the AICPU — both fields are self-known. The AICPU opens
-    // this core's register window only after it observes aicore_done, so a single
-    // report suffices. The host clears aicore_done before this kernel launches,
-    // so the value the AICPU reads is this run's report, never a stale prior one.
-    my_hank->physical_core_id = get_physical_core_id();
-    my_hank->core_type = core_type;
-    OUT_OF_ORDER_STORE_BARRIER();
-    my_hank->aicore_done = block_idx + 1;  // Signal ready (use block_idx + 1 to avoid 0)
-    dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
+namespace {
+constexpr uint32_t kCancelPollInterval = 256;
+static_assert(kCancelPollInterval != 0 && (kCancelPollInterval & (kCancelPollInterval - 1)) == 0);
 
-    // Phase 2: Wait for the AICPU to open our register window. A kernel launch
-    // resets DATA_MAIN_BASE to 0 (verified on a2a3 silicon); the AICPU writes
-    // DATA_MAIN_BASE = AICPU_IDLE_TASK_ID (non-zero) as it opens FAST_PATH, so a
-    // non-zero read means the window is open and reads/writes are valid. The
-    // AICPU runs assign_cores_to_threads (µs) between opening the window and the
-    // first dispatch, so this IDLE is observed long before any task_id lands —
-    // the poll cannot miss it and mistake a later task for the reset value.
-    // Window-open is the sync point for everything the AICPU publishes (task
-    // pointer, swimlane head): the AICPU writes those before opening the window.
-    while (read_reg(RegId::DATA_MAIN_BASE) == 0) {
-        SPIN_WAIT_HINT();
-    }
-    // Report initial idle status via register (FAST_PATH is now open).
-    write_reg(RegId::COND, AICORE_IDLE_VALUE);
+__aicore__ inline uint32_t load_kernel_control(__gm__ uint32_t *word) { return load_kernel_gm_word(word); }
 
-    // The AICPU writes task after observing our report (so our CACHELINE_OUT flush
-    // above cannot clobber it) and before opening the window; dcci to read its
-    // fresh value here.
+__aicore__ inline void publish_kernel_report(__gm__ TmrCoreReport *report) {
+    dcci(report, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    dsb(static_cast<mem_dsb_t>(0));
+}
+}  // namespace
+
+// Only the kernel specialization reads its control report. Both wrappers use
+// the same task dispatch and ordinary/early-dispatch payload execution body.
+template <bool KernelMode>
+__aicore__ static void execute_dispatch_loop(__gm__ Handshake *my_hank, __gm__ TmrCoreReport *report = nullptr) {
     dcci(my_hank, SINGLE_CACHE_LINE);
     __gm__ DispatchPayload *payload = reinterpret_cast<__gm__ DispatchPayload *>(my_hank->task);
 
-    uint32_t enable_profiling_flag = get_aicore_profiling_flag();
+    uint32_t enable_profiling_flag = KernelMode ? 0 : get_aicore_profiling_flag();
     bool chip_swimlane_enabled = SIMPLER_GET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
     bool dump_args_enabled = SIMPLER_GET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS);
     bool pmu_enabled = SIMPLER_GET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_PMU);
 
     // This executor chooses first-dispatch lazy resolution. The rotation
-    // channel has already been safe to resolve since Phase 2 exit above.
+    // channel is safe to resolve after the wrapper observes window-open.
     __gm__ ChipSwimlaneActiveHead *chip_swimlane_head = nullptr;
     // cached_buf_seq must start != AICPU's initial head.current_buf_seq (0)
     // so the first reservation observes a mismatch and loads the buffer ptr.
     ChipSwimlaneAicoreLocalState chip_swimlane_local = {nullptr, UINT32_MAX, 0};
 
-    // Phase 4: Main execution loop - poll register for tasks until exit signal
     // Register encoding: AICPU_IDLE_TASK_ID=idle, task_id=task, AICORE_EXIT_SIGNAL=exit
     uint32_t reg_val = AICPU_IDLE_TASK_ID;
     uint32_t last_reg_val = AICPU_IDLE_TASK_ID;
     bool exiting = false;
+    uint32_t cancel_polls = 0;
 
     while (true) {
+        if constexpr (KernelMode) {
+            if ((cancel_polls++ & (kCancelPollInterval - 1)) == 0 &&
+                load_kernel_control(&report->command) == static_cast<uint32_t>(TmrCoreCommand::Cancel)) {
+                write_reg(RegId::COND, AICORE_EXITED_VALUE);
+                break;
+            }
+        }
         reg_val = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
         if (reg_val == AICORE_EXIT_SIGNAL) {
             // Signal exit acknowledgment to AICPU
@@ -195,6 +169,13 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                 }
                 OUT_OF_ORDER_STORE_BARRIER();
                 while (true) {
+                    if constexpr (KernelMode) {
+                        if ((cancel_polls++ & (kCancelPollInterval - 1)) == 0 &&
+                            load_kernel_control(&report->command) == static_cast<uint32_t>(TmrCoreCommand::Cancel)) {
+                            exiting = true;
+                            break;
+                        }
+                    }
                     // Honor teardown: shutdown overwrites the low half with EXIT.
                     // Check it on the doorbell-match iteration too, so an EXIT that
                     // races in right after the matching doorbell still wins over
@@ -212,6 +193,13 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                     SPIN_WAIT_HINT();
                 }
                 if (exiting) {
+                    write_reg(RegId::COND, AICORE_EXITED_VALUE);
+                    break;
+                }
+            }
+
+            if constexpr (KernelMode) {
+                if (load_kernel_control(&report->command) == static_cast<uint32_t>(TmrCoreCommand::Cancel)) {
                     write_reg(RegId::COND, AICORE_EXITED_VALUE);
                     break;
                 }
@@ -271,11 +259,80 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             }
         }
     }
+}
 
-    // Flush all dirty cache lines to HBM before kernel exit.
+__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type) {
+    __gm__ Handshake *my_hank = &runtime->dev.workers[block_idx];
+    my_hank->physical_core_id = get_physical_core_id();
+    my_hank->core_type = core_type;
+    OUT_OF_ORDER_STORE_BARRIER();
+    my_hank->aicore_done = block_idx + 1;
+    dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
+
+    // Program launch resets DATA_MAIN_BASE; its nonzero IDLE value is the
+    // acknowledgement that the AICPU has published task and opened FAST_PATH.
+    while (read_reg(RegId::DATA_MAIN_BASE) == 0) {
+        SPIN_WAIT_HINT();
+    }
+    write_reg(RegId::COND, AICORE_IDLE_VALUE);
+    execute_dispatch_loop<false>(my_hank);
+
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
     // EXITED acknowledges quiescence; the AICPU opens this gate only after it
     // has closed this core's fast-path window. The gate is a line of its own,
     // outside the Handshake the dcci above writes back.
     wait_for_post_close_release(&runtime->dev.teardown_gates[block_idx].post_close_release);
+}
+
+__aicore__ __attribute__((weak)) void aicore_execute_kernel(
+    __gm__ Runtime *runtime, __gm__ const TmrKernelContextDescriptor *context, int block_idx, CoreType core_type
+) {
+    if (block_idx < 0 || block_idx >= context->worker_count || context->worker_count > RUNTIME_MAX_WORKER ||
+        context->reports_bytes != static_cast<uint64_t>(context->worker_count) * sizeof(TmrCoreReport) ||
+        context->control_bytes != sizeof(TmrLaunchControl) || context->reports_address == 0 ||
+        context->reports_address > UINT64_MAX - context->reports_bytes ||
+        context->reports_address % alignof(TmrCoreReport) != 0 || context->control_address == 0 ||
+        context->control_address > UINT64_MAX - context->control_bytes ||
+        context->control_address % alignof(TmrLaunchControl) != 0)
+        return;
+
+    auto *report = reinterpret_cast<__gm__ TmrCoreReport *>(context->reports_address) + block_idx;
+    auto *control = reinterpret_cast<__gm__ TmrLaunchControl *>(context->control_address);
+    dcci(report, SINGLE_CACHE_LINE);
+    dsb(static_cast<mem_dsb_t>(0));
+    report->physical_core_id = get_physical_core_id();
+    report->core_type = static_cast<uint32_t>(core_type);
+    publish_kernel_report(report);
+    store_kernel_gm_word(&report->ready, static_cast<uint32_t>(block_idx + 1));
+    publish_kernel_report(report);
+
+    uint32_t cancel_polls = 0;
+    bool opened = false;
+    while (true) {
+        if ((cancel_polls++ & (kCancelPollInterval - 1)) == 0 && load_kernel_control(&control->host_cancel) != 0) break;
+        const uint32_t command = load_kernel_control(&report->command);
+        if (command == static_cast<uint32_t>(TmrCoreCommand::Cancel)) {
+            // A CANCEL can hide OPEN from a late core. The AICPU publishes a
+            // nonzero epoch only after opening this core's register window.
+            opened = load_kernel_gm_word(&report->round_epoch) != 0;
+            if (opened) write_reg(RegId::COND, AICORE_EXITED_VALUE);
+            break;
+        }
+        if (command == static_cast<uint32_t>(TmrCoreCommand::Open)) {
+            opened = true;
+            write_reg(RegId::COND, AICORE_IDLE_VALUE);
+            execute_dispatch_loop<true>(&runtime->dev.workers[block_idx], report);
+            break;
+        }
+        SPIN_WAIT_HINT();
+    }
+
+    store_kernel_gm_word(&report->exited, static_cast<uint32_t>(block_idx + 1));
+    publish_kernel_report(report);
+    if (opened) {
+        while (load_kernel_control(&report->release) != static_cast<uint32_t>(TmrCoreRelease::Release)) {
+            SPIN_WAIT_HINT();
+        }
+        dsb(static_cast<mem_dsb_t>(0));
+    }
 }

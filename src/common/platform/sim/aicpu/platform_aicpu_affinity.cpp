@@ -15,6 +15,9 @@
 
 #include "common/unified_log.h"
 
+int32_t platform_aicpu_current_cpu() { return -1; }
+int platform_aicpu_prepare_kernel_thread() { return 0; }
+
 static std::atomic<int32_t> s_thread_counter{0};
 static std::atomic<int32_t> s_cleanup_counter{0};
 

@@ -70,3 +70,12 @@ int32_t platform_aicpu_affinity_thread_idx();
 // drops every sub-phase stamp. Must be called on the executing thread, before
 // any phase stamping.
 void platform_aicpu_affinity_set_thread_idx(int32_t idx);
+
+// Observe this worker without entering program's filtering gate. Kernel's
+// round-owned classifier also accepts -1 when topology is unavailable (sim).
+int32_t platform_aicpu_current_cpu();
+
+// Before kernel's all-worker gate, normalize resident polling workers to the
+// platform's normal scheduling policy. Returns an errno on failure; sim is a
+// no-op. Does not enter or reset program's affinity gate.
+int platform_aicpu_prepare_kernel_thread();

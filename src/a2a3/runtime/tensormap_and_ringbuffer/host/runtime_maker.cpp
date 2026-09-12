@@ -52,6 +52,8 @@
 #include "common/strace.h"
 #include "common/unified_log.h"
 #include "host/platform_compile_info.h"
+#include "host/kernel_pipeline_contract.h"
+#include "worker/pipeline_contract.h"
 #include "host/raii_scope_guard.h"
 #include "common/host_api.h"
 #include "utils/device_arena.h"
@@ -261,8 +263,9 @@ public:
 
     // Pack the run's non-child, non-empty tensors to compute the required
     // aligned size, then grow the retained slot if it is too small (free old +
-    // malloc new + write back). Returns false only if the (grow) device_malloc
-    // fails. A run needing 0 bytes leaves the slot untouched.
+    // malloc new + write back). Returns false when that device_malloc fails,
+    // and when a kernel-mode context would have to grow at all. A run needing
+    // 0 bytes leaves the slot untouched.
     bool begin(const HostApi *api, const ChipStorageTaskArgs *orch_args) {
         api_ = api;
         offset_ = 0;
@@ -277,6 +280,19 @@ public:
         void *addr = nullptr;
         size_t size = 0;
         api->get_retained_temp_buffer(&addr, &size);
+        if (required > size && api->is_kernel_mode()) {
+            // A kernel-mode context's device buffers keep their addresses for
+            // the context's life, and a captured graph replays the slices this
+            // one handed out. Growing is free + malloc, which re-bases them, so
+            // the run is refused ahead of the free and the slot stays exactly
+            // as the previous run left it.
+            LOG_ERROR(
+                "Retained temp buffer is context-static in kernel mode: this run needs %zu bytes, the retained "
+                "buffer holds %zu",
+                required, size
+            );
+            return false;
+        }
         if (required > size) {
             if (addr != nullptr) {
                 api->device_free(addr);
@@ -488,6 +504,57 @@ static bool derive_arena_static_sizes(const ArenaSizingConfig &sizing, ArenaStat
     }
     out->sm_size = SharedMemoryHandle::calculate_size_per_ring(sizing.task_window_sizes);
     return true;
+}
+
+int configure_kernel_runtime_impl(Runtime &runtime, bool serial_orch_sched) {
+    runtime.dev.serial_orch_sched = serial_orch_sched;
+    return 0;
+}
+
+extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *config, PipelineContract *out) {
+    if (config == nullptr || out == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+
+    ArenaSizingConfig sizing;
+    if (!resolve_arena_sizing(
+            config->runtime_env.ring_task_window, config->runtime_env.ring_heap, config->runtime_env.ring_dep_pool,
+            &sizing
+        )) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    uint64_t total_window = 0;
+    for (int r = 0; r < CHIP_MAX_RING_DEPTH; ++r)
+        total_window += sizing.task_window_sizes[r];
+    // OrchestratorLayout stores the sum in int32_t and asserts before narrowing.
+    if (total_window > static_cast<uint64_t>(INT32_MAX)) return PTO_RUNTIME_ERR_INTERNAL;
+
+    // Layout has a fixed number of regions; window/dep counts are int32-bounded.
+    // Their reserve-only size arithmetic requires the platform's 64-bit size_t.
+    static_assert(sizeof(size_t) == sizeof(uint64_t));
+    ArenaStaticSizes sizes;
+    if (!derive_arena_static_sizes(sizing, &sizes)) return PTO_RUNTIME_ERR_INTERNAL;
+    constexpr size_t max_usable = std::numeric_limits<size_t>::max() - (DeviceArena::kDefaultBaseAlign - 1);
+    if (sizes.total_heap > max_usable || sizes.sm_size > max_usable) return PTO_RUNTIME_ERR_INTERNAL;
+    DeviceArena arena;
+    const auto layout =
+        runtime_reserve_layout(arena, sizing.task_window_sizes, sizing.heap_sizes, sizing.dep_pool_capacities);
+    if (layout.offsets.arena_size > max_usable) return PTO_RUNTIME_ERR_INTERNAL;
+
+    const PipelineContract candidate = {
+        PTO_PIPELINE_CONTRACT_ABI_VERSION,
+        6,
+        1,
+        {
+            {PTO_PIPELINE_TASK_ARGS, PTO_PIPELINE_HOST_PER_RUN, 0},
+            {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_DEVICE_SCRATCH, sizes.total_heap},
+            {PTO_PIPELINE_GM_SM, PTO_PIPELINE_DEVICE_SCRATCH, sizes.sm_size},
+            {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_DEVICE_SCRATCH, layout.offsets.arena_size},
+            {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
+            {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
+        }
+    };
+    if (!is_valid_tmr_kernel_pipeline_contract(&candidate)) return PTO_RUNTIME_ERR_INTERNAL;
+    *out = candidate;
+    return 0;
 }
 
 // per-run: the only signature-aware step. Copy the orch args, replacing each
@@ -1017,7 +1084,10 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
 // device, so it exports simpler_aicpu_register_callable; the common AICPU loader
 // queries this so it carries no runtime-specific symbol knowledge.
 extern "C" const char *const *runtime_extra_aicpu_symbols(size_t *count) {
-    static const char *const kExtra[] = {"simpler_aicpu_register_callable"};
+    static const char *const kExtra[] = {
+        "simpler_aicpu_register_callable", "simpler_aicpu_prepare_tmr_context",
+        "simpler_aicpu_register_tmr_kernel_callable", "simpler_aicpu_release_tmr_context", "simpler_aicpu_kernel_exec"
+    };
     if (count != nullptr) {
         *count = sizeof(kExtra) / sizeof(kExtra[0]);
     }

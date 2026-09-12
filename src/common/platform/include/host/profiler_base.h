@@ -289,6 +289,9 @@ public:
         release_fn_(std::move(release_fn)),
         committed_(false) {}
 
+    // Runtime release callbacks report errors as return codes. The guarded
+    // std::function calls below cannot throw libc++'s bad_function_call.
+    // NOLINTNEXTLINE(bugprone-exception-escape)
     ~InitRollbackGuard() {
         if (committed_) return;
         for (void *p : direct_ptrs_) {

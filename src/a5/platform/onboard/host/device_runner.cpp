@@ -91,6 +91,16 @@ extern "C" __attribute__((weak, visibility("hidden"))) bool publish_runtime_chip
 // DeviceRunner Implementation
 // =============================================================================
 
+int DeviceRunner::fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) {
+    if (args == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+
+    const int rc = init_aicore_register_addresses(&args->regs, device_id, mem_alloc_);
+    if (rc != 0) {
+        LOG_ERROR("fill_persistent_arch_fields: init_aicore_register_addresses failed: %d", rc);
+    }
+    return rc;
+}
+
 DeviceRunner::~DeviceRunner() { finalize(); }
 
 // `setup_static_arena`, `create_thread`, `attach_current_thread`,
@@ -106,6 +116,20 @@ int DeviceRunner::ensure_acl_ready(int device_id) {
     if (device_id < 0) {
         LOG_ERROR("ensure_acl_ready: invalid device_id %d", device_id);
         return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    // A kernel-mode context borrows the caller's device and ACL context, so
+    // the ACL lifecycle (aclInit / aclrtSetDevice / aclrtResetDevice[Force] /
+    // aclFinalize) belongs to the caller. Every call site of those APIs falls
+    // into one of three classes: (a) the aclInit / aclrtSetDevice below this
+    // guard, (b) calls inside force_reset_device(), behind its own
+    // kernel-mode guard, or (c) calls gated on acl_ready_, which only the
+    // path below this guard sets. finalize()'s rt-layer device reset on the
+    // acl_ready_ == false path is intercepted by the kernel-mode branch
+    // inside finalize(). Together these keep the caller's device and ACL
+    // state unreachable in kernel mode.
+    if (execution_mode_latch().is_kernel()) {
+        LOG_ERROR("ensure_acl_ready: refused — a kernel-mode context does not own the caller's ACL lifecycle");
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
     }
 
     // aclInit is process-wide; CANN returns 100002 if it has already been
@@ -165,7 +189,8 @@ int DeviceRunner::destroy_comm_stream(void *stream) {
     return 0;
 }
 
-int DeviceRunner::query_aicpu_device_occupancy(pto::a5::AicpuDeviceOccupancy &out) {
+int DeviceRunner::query_aicpu_device_occupancy(pto::a5::AicpuDeviceOccupancy &out, rtStream_t control_stream) {
+    if (kernel_topology_result_ != nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
     if (aicpu_device_occupancy_cached_) {
         out = aicpu_device_occupancy_;
         return 0;
@@ -177,8 +202,16 @@ int DeviceRunner::query_aicpu_device_occupancy(pto::a5::AicpuDeviceOccupancy &ou
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     auto result_cleanup = RAIIScopeGuard([&]() {
-        mem_alloc_.free(device_result);
+        if (execution_mode_latch().is_kernel()) {
+            if (kernel_topology_stream_ != nullptr) return;
+            const int free_rc = mem_alloc_.free(device_result);
+            if (free_rc == 0) kernel_topology_result_ = nullptr;
+            else kernel_execution_state().poison(free_rc);
+        } else {
+            mem_alloc_.free(device_result);
+        }
     });
+    if (execution_mode_latch().is_kernel()) kernel_topology_result_ = device_result;
     AicpuTopologyQueryResult zero{};
     int rc = rtMemcpy(device_result, sizeof(zero), &zero, sizeof(zero), RT_MEMCPY_HOST_TO_DEVICE);
     if (rc != 0) {
@@ -187,19 +220,23 @@ int DeviceRunner::query_aicpu_device_occupancy(pto::a5::AicpuDeviceOccupancy &ou
     }
     AicpuTopologyQueryArgs args{};
     args.result_addr = reinterpret_cast<uint64_t>(device_result);
-    rc = launch_aicpu_payload(stream_aicpu_, &args, sizeof(args), kAicpuTopologyQueryName, /*aicpu_num=*/1);
+    if (execution_mode_latch().is_kernel()) kernel_topology_stream_ = control_stream;
+    rc = launch_aicpu_payload(control_stream, &args, sizeof(args), kAicpuTopologyQueryName, /*aicpu_num=*/1);
     if (rc != 0) {
         LOG_ERROR("AICPU device occupancy query launch failed: %d", rc);
-        recover_device_or_mark_unusable(rc);
+        if (execution_mode_latch().is_kernel()) kernel_execution_state().poison(rc);
+        else recover_device_or_mark_unusable(rc);
         return rc;
     }
-    rc = aclrtSynchronizeStreamWithTimeout(stream_aicpu_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    rc = aclrtSynchronizeStreamWithTimeout(control_stream, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
     if (rc != 0) {
         LOG_ERROR("AICPU device occupancy query sync failed: %d", rc);
-        recover_device_or_mark_unusable(rc);
+        if (execution_mode_latch().is_kernel()) kernel_execution_state().poison(rc);
+        else recover_device_or_mark_unusable(rc);
         return rc;
     }
     AicpuTopologyQueryResult result{};
+    kernel_topology_stream_ = nullptr;
     rc = rtMemcpy(&result, sizeof(result), device_result, sizeof(result), RT_MEMCPY_DEVICE_TO_HOST);
     if (rc != 0) {
         LOG_ERROR("AICPU device occupancy query copy failed: %d", rc);
@@ -212,6 +249,15 @@ int DeviceRunner::query_aicpu_device_occupancy(pto::a5::AicpuDeviceOccupancy &ou
         );
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    if (execution_mode_latch().is_kernel()) {
+        result_cleanup.dismiss();
+        rc = mem_alloc_.free(device_result);
+        if (rc != 0) {
+            kernel_execution_state().poison(rc);
+            return rc;
+        }
+        kernel_topology_result_ = nullptr;
+    }
     aicpu_device_occupancy_.occupy = result.occupy;
     aicpu_device_occupancy_.pf_occupy = result.pf_occupy;
     aicpu_device_occupancy_.os_sched = result.os_sched;
@@ -223,14 +269,14 @@ int DeviceRunner::query_aicpu_device_occupancy(pto::a5::AicpuDeviceOccupancy &ou
     return 0;
 }
 
-int DeviceRunner::query_aicpu_topology(pto::a5::AicpuTopology &out) {
+int DeviceRunner::query_aicpu_topology(pto::a5::AicpuTopology &out, rtStream_t control_stream) {
     if (aicpu_topology_cached_) {
         out = aicpu_topology_;
         return 0;
     }
 
     pto::a5::AicpuDeviceOccupancy occupancy;
-    int rc = query_aicpu_device_occupancy(occupancy);
+    int rc = query_aicpu_device_occupancy(occupancy, control_stream);
     if (rc != 0) return rc;
 
     pto::a5::AicpuTopology topology;
@@ -256,6 +302,79 @@ void DeviceRunner::set_dep_gen_enabled(bool enable) {
     // device-orch one). The c_api latches the CallConfig before bind, and the
     // orchestration entry resets the graph before recording it.
     dep_gen_host_graph_set_enabled(enable);
+}
+
+int DeviceRunner::prepare_aicpu_affinity(Runtime &runtime, int requested, rtStream_t control_stream) {
+    {
+        pto::a5::AicpuTopology topology;
+        runtime.set_aicpu_allowed_cpu_count(0);
+        if (query_aicpu_topology(topology, control_stream) != 0) {
+            LOG_ERROR("AICPU topology probe failed; affinity gate will not launch");
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        pto::a5::AicpuLaunchPlan launch_plan;
+        std::string plan_error;
+        if (!pto::a5::build_aicpu_launch_plan(topology, requested, launch_plan, plan_error)) {
+            LOG_ERROR(
+                "cannot build AICPU launch plan: soc=%s scenario=%s occupy=0x%llx reason=%s",
+                topology.soc_name.empty() ? "(unknown)" : topology.soc_name.c_str(),
+                pto::a5::aicpu_scenario_name(topology.scenario_type),
+                static_cast<unsigned long long>(topology.device_occupancy.occupy), plan_error.c_str()
+            );
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        const auto &allowed = launch_plan.allowed_cpus;
+        const int active_aicpu_num = launch_plan.effective_active_count;
+        runtime.set_aicpu_thread_num(active_aicpu_num);
+        {
+            const size_t cap = runtime.aicpu_allowed_cpus_capacity();
+            if (allowed.size() > cap) {
+                LOG_ERROR("AICPU selection returned %zu > cap %zu", allowed.size(), cap);
+                return PTO_RUNTIME_ERR_INTERNAL;
+            }
+            int32_t *allowed_cpus = runtime.get_aicpu_allowed_cpus();
+            for (size_t i = 0; i < allowed.size(); ++i)
+                allowed_cpus[i] = allowed[i];
+            runtime.set_aicpu_allowed_cpu_count(static_cast<int32_t>(allowed.size()));
+            runtime.set_aicpu_launch_count(launch_plan.launch_count);
+            std::string dump;
+            for (size_t i = 0; i < allowed.size(); ++i) {
+                if (i) dump += ", ";
+                dump += std::to_string(allowed[i]);
+                if (i + 1 == allowed.size()) dump += "(orch)";
+            }
+            if (launch_plan.warn_cpu_topology_unavailable) {
+                LOG_WARN(
+                    "AICPU CPU_TOPO unavailable; using %s: soc=%s occupy=0x%llx "
+                    "stable_reachable=%d requested=%d effective=%d affinity=[%s]%s",
+                    pto::a5::aicpu_topology_source_name(topology.source),
+                    topology.soc_name.empty() ? "(unknown)" : topology.soc_name.c_str(),
+                    static_cast<unsigned long long>(topology.device_occupancy.occupy),
+                    launch_plan.stable_reachable_count, requested, active_aicpu_num, dump.c_str(),
+                    topology.source == pto::a5::AicpuTopologySource::kOccupyFallback ?
+                        "; physical/SMT/cluster/die placement is unknown" :
+                        ""
+                );
+            }
+            if (launch_plan.warn_stable_reachable_below_default) {
+                LOG_WARN(
+                    "AICPU stable reachable CPUs below active capacity: soc=%s scenario=%s occupy=0x%llx "
+                    "stable_reachable=%d capacity=%d requested=%d effective=%d affinity=[%s]",
+                    topology.soc_name.empty() ? "(unknown)" : topology.soc_name.c_str(),
+                    pto::a5::aicpu_scenario_name(topology.scenario_type),
+                    static_cast<unsigned long long>(topology.device_occupancy.occupy),
+                    launch_plan.stable_reachable_count, PLATFORM_DEFAULT_AICPU_THREAD_NUM, requested, active_aicpu_num,
+                    dump.c_str()
+                );
+            }
+            LOG_INFO(
+                "AICPU ALLOWED_CPUS = [%s] (scenario=%s active=%d launch=%d user_cpus=%zu)", dump.c_str(),
+                pto::a5::aicpu_scenario_name(topology.scenario_type), active_aicpu_num, launch_plan.launch_count,
+                topology.os_schedulable_cpus.size()
+            );
+        }
+    }
+    return 0;
 }
 
 int DeviceRunner::prepare_execution(
@@ -333,82 +452,9 @@ int DeviceRunner::prepare_execution(
 
     resolve_task_binary_addrs(runtime);
 
-    // a5-specific: probe the AICPU topology + compute ALLOWED_CPUS for the
-    // filter-style gate (see src/common/platform/onboard/aicpu/
-    // platform_aicpu_affinity.cpp::platform_aicpu_affinity_gate_filter).
-    // Convention: indices 0..active-2 are scheduler slots and the last slot
-    // is the orchestrator. In auto mode only, unknown shapes may reduce the
-    // active count to the available pool, but execution keeps at least one of
-    // each role.
-    {
-        pto::a5::AicpuTopology topology;
-        runtime.set_aicpu_allowed_cpu_count(0);
-        if (query_aicpu_topology(topology) != 0) {
-            LOG_ERROR("AICPU topology probe failed; affinity gate will not launch");
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-        pto::a5::AicpuLaunchPlan launch_plan;
-        std::string plan_error;
-        if (!pto::a5::build_aicpu_launch_plan(topology, requested_aicpu_num, launch_plan, plan_error)) {
-            LOG_ERROR(
-                "cannot build AICPU launch plan: soc=%s scenario=%s occupy=0x%llx reason=%s",
-                topology.soc_name.empty() ? "(unknown)" : topology.soc_name.c_str(),
-                pto::a5::aicpu_scenario_name(topology.scenario_type),
-                static_cast<unsigned long long>(topology.device_occupancy.occupy), plan_error.c_str()
-            );
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-        const auto &allowed = launch_plan.allowed_cpus;
-        active_aicpu_num = launch_plan.effective_active_count;
-        runtime.set_aicpu_thread_num(active_aicpu_num);
-        {
-            const size_t cap = runtime.aicpu_allowed_cpus_capacity();
-            if (allowed.size() > cap) {
-                LOG_ERROR("AICPU selection returned %zu > cap %zu", allowed.size(), cap);
-                return PTO_RUNTIME_ERR_INTERNAL;
-            }
-            int32_t *allowed_cpus = runtime.get_aicpu_allowed_cpus();
-            for (size_t i = 0; i < allowed.size(); ++i)
-                allowed_cpus[i] = allowed[i];
-            runtime.set_aicpu_allowed_cpu_count(static_cast<int32_t>(allowed.size()));
-            runtime.set_aicpu_launch_count(launch_plan.launch_count);
-            std::string dump;
-            for (size_t i = 0; i < allowed.size(); ++i) {
-                if (i) dump += ", ";
-                dump += std::to_string(allowed[i]);
-                if (i + 1 == allowed.size()) dump += "(orch)";
-            }
-            if (launch_plan.warn_cpu_topology_unavailable) {
-                LOG_WARN(
-                    "AICPU CPU_TOPO unavailable; using %s: soc=%s occupy=0x%llx "
-                    "stable_reachable=%d requested=%d effective=%d affinity=[%s]%s",
-                    pto::a5::aicpu_topology_source_name(topology.source),
-                    topology.soc_name.empty() ? "(unknown)" : topology.soc_name.c_str(),
-                    static_cast<unsigned long long>(topology.device_occupancy.occupy),
-                    launch_plan.stable_reachable_count, requested_aicpu_num, active_aicpu_num, dump.c_str(),
-                    topology.source == pto::a5::AicpuTopologySource::kOccupyFallback ?
-                        "; physical/SMT/cluster/die placement is unknown" :
-                        ""
-                );
-            }
-            if (launch_plan.warn_stable_reachable_below_default) {
-                LOG_WARN(
-                    "AICPU stable reachable CPUs below active capacity: soc=%s scenario=%s occupy=0x%llx "
-                    "stable_reachable=%d capacity=%d requested=%d effective=%d affinity=[%s]",
-                    topology.soc_name.empty() ? "(unknown)" : topology.soc_name.c_str(),
-                    pto::a5::aicpu_scenario_name(topology.scenario_type),
-                    static_cast<unsigned long long>(topology.device_occupancy.occupy),
-                    launch_plan.stable_reachable_count, PLATFORM_DEFAULT_AICPU_THREAD_NUM, requested_aicpu_num,
-                    active_aicpu_num, dump.c_str()
-                );
-            }
-            LOG_INFO(
-                "AICPU ALLOWED_CPUS = [%s] (scenario=%s active=%d launch=%d user_cpus=%zu)", dump.c_str(),
-                pto::a5::aicpu_scenario_name(topology.scenario_type), active_aicpu_num, launch_plan.launch_count,
-                topology.os_schedulable_cpus.size()
-            );
-        }
-    }
+    rc = prepare_aicpu_affinity(runtime, requested_aicpu_num, stream_aicpu_);
+    if (rc != 0) return rc;
+    active_aicpu_num = runtime.get_aicpu_thread_num();
 
     // Initialize per-subsystem shared memory.
     //
@@ -813,6 +859,14 @@ int DeviceRunner::force_reset_device() {
     if (device_id_ < 0) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    // aclrtResetDeviceForce would reset the caller's device and ACL context;
+    // a kernel-mode context owns neither (see ensure_acl_ready()), so error
+    // recovery on that path never resets the device out from under the host
+    // process.
+    if (execution_mode_latch().is_kernel()) {
+        LOG_ERROR("force_reset_device: refused — a kernel-mode context does not own the caller's device");
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    }
     // aclrtResetDeviceForce is an ACL API; bring ACL up for the whole sequence,
     // released on scope exit so a repeated poison-then-reset cycle in a
     // long-lived process leaks no ACL state.
@@ -900,6 +954,18 @@ int DeviceRunner::finalize() {
     if (device_id_ == -1) {
         return 0;
     }
+    if (execution_mode_latch().is_kernel() && kernel_topology_result_ != nullptr) {
+        int rc = rtSetDevice(device_id_);
+        if (rc != 0) return rc;
+        if (kernel_topology_stream_ != nullptr) {
+            rc = aclrtSynchronizeStreamWithTimeout(kernel_topology_stream_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+            if (rc != 0) return rc;
+            kernel_topology_stream_ = nullptr;
+        }
+        rc = mem_alloc_.free(kernel_topology_result_);
+        if (rc != 0) return rc;
+        kernel_topology_result_ = nullptr;
+    }
 
     // Fatal cleanup must not walk poisoned streams, mappings, or allocations.
     // Stop collector threads locally, drain and force-reset the card, then
@@ -916,12 +982,19 @@ int DeviceRunner::finalize() {
         // before abandon_common_after_device_failure() clears it.
         constexpr int kFatalResetAttempts = 3;
         const bool sdma_provisioned = dma_workspace_handle_ != nullptr;
-        int reset_rc = attempt_fatal_reset(
-            [this]() {
-                return force_reset_device();
-            },
-            sdma_provisioned ? 1 : kFatalResetAttempts
-        );
+        // A kernel-mode context owns neither the device nor its ACL state, so
+        // force_reset_device() refuses. Asking anyway would log that refusal
+        // once per attempt and then report a reset that "did not confirm
+        // clean", which reads as a failed reset rather than the designed
+        // refusal it is.
+        const bool owns_device_reset = !execution_mode_latch().is_kernel();
+        int reset_rc = owns_device_reset ? attempt_fatal_reset(
+                                               [this]() {
+                                                   return force_reset_device();
+                                               },
+                                               sdma_provisioned ? 1 : kFatalResetAttempts
+                                           ) :
+                                           0;
         const bool reset_confirmed = reset_rc == 0;
         if (!reset_confirmed) {
             LOG_ERROR(
@@ -953,10 +1026,15 @@ int DeviceRunner::finalize() {
         return abandon_rc != 0 ? abandon_rc : reset_rc;
     }
 
-    int rc = attach_current_thread(device_id_);
-    if (rc != 0) {
-        LOG_ERROR("Failed to attach finalize thread to device %d: %d", device_id_, rc);
-        return rc;
+    // A kernel-mode context runs on the caller's already-current device, so
+    // this thread needs no bind and the context owns no device state to adopt.
+    int rc = 0;
+    if (!execution_mode_latch().is_kernel()) {
+        rc = attach_current_thread(device_id_);
+        if (rc != 0) {
+            LOG_ERROR("Failed to attach finalize thread to device %d: %d", device_id_, rc);
+            return rc;
+        }
     }
 
     // Cleanup all profiling subsystems (free shm + per-buffer dev/host
@@ -968,6 +1046,7 @@ int DeviceRunner::finalize() {
     // chip-callable buffer pool, the three arenas, device_wall,
     // mem_alloc_.finalize(), and cached arena sizes.
     rc = finalize_common();
+    if (rc != 0 && execution_mode_latch().is_kernel()) return rc;
 
     // Reset device and finalize ACL AFTER all device memory is freed. When the
     // ACL layer was brought up (comm path), aclrtResetDevice supersedes
@@ -987,6 +1066,10 @@ int DeviceRunner::finalize() {
             if (rc == 0) rc = finalize_rc;
         }
         acl_ready_ = false;
+    } else if (execution_mode_latch().is_kernel()) {
+        // A kernel-mode context borrows the caller's device; the device
+        // reset belongs to the caller, so the healthy close path releases
+        // only context-owned resources.
     } else {
         int reset_rc = rtDeviceReset(device_id_);
         if (reset_rc != 0) {

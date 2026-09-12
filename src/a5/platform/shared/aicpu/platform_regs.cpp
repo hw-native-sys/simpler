@@ -36,6 +36,13 @@ void platform_init_aicore_regs(uint64_t reg_addr) {
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
 }
 
+uint64_t platform_aicore_exit_deadline() { return get_sys_cnt_aicpu() + inner_get_deinit_timeout_ticks(); }
+
+void platform_close_aicore_window(uint64_t reg_addr) {
+    write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
+    (void)read_reg(reg_addr, RegId::DATA_MAIN_BASE);
+}
+
 int32_t platform_deinit_aicore_regs(uint64_t reg_addr) {
     // Send exit signal to AICore
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);

@@ -44,6 +44,21 @@
 // OUT_OF_ORDER_FULL_BARRIER - no-op on real hardware (dcci handles full cache coherency)
 #define OUT_OF_ORDER_FULL_BARRIER() ((void)0)
 
+// Kernel GM control uses CPU atomics in sim and explicit cache maintenance
+// on silicon. The shared wire remains plain POD.
+
+template <typename T>
+__aicore__ inline T load_kernel_gm_word(__gm__ T *address) {
+    dcci(address, SINGLE_CACHE_LINE);
+    dsb(static_cast<mem_dsb_t>(0));
+    return *reinterpret_cast<volatile __gm__ T *>(address);
+}
+template <typename T>
+__aicore__ inline void store_kernel_gm_word(__gm__ T *address, T value) {
+    *reinterpret_cast<volatile __gm__ T *>(address) = value;
+    dcci(address, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    dsb(static_cast<mem_dsb_t>(0));
+}
 /**
  * Read an AICore register via SPR access
  *

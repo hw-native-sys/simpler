@@ -67,6 +67,14 @@ else()
 endif()
 
 # Create shared library (host-compatible for dlopen)
+# TMR owns the whole-task kernel entry so framing failures also rendezvous.
+# Other runtimes retain the shared unavailable-payload entry.
+foreach(SRC_FILE ${AICPU_SOURCES})
+    if(SRC_FILE MATCHES "/tensormap_and_ringbuffer/aicpu/aicpu_executor\\.cpp$")
+        list(FILTER AICPU_SOURCES EXCLUDE REGEX "/common/platform/shared/aicpu/kernel_dispatch\\.cpp$")
+        break()
+    endif()
+endforeach()
 add_library(aicpu_kernel SHARED ${AICPU_SOURCES})
 include("${SIMPLER_CMAKE_DIR}/profiling_config.cmake")
 simpler_configure_profiling(aicpu_kernel)
