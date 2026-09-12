@@ -1457,12 +1457,17 @@ class ChipWorker:
                 raise RuntimeError("ChipWorker.finalize() cannot run while ChipWorker.init() is in progress")
         try:
             self._impl.finalize()
-        finally:
+        except BaseException:
+            # The registries name what the native side still holds. A teardown
+            # that did not complete leaves those resources alive, so dropping
+            # the registries would hide them from a retry and from the caller.
             _flush_host_log_or_warn("ChipWorker.finalize()")
-            with self._registry_lock:
-                self._callable_registry.clear()
-                self._identity_registry.clear()
-                self._live_handles.clear()
+            raise
+        _flush_host_log_or_warn("ChipWorker.finalize()")
+        with self._registry_lock:
+            self._callable_registry.clear()
+            self._identity_registry.clear()
+            self._live_handles.clear()
 
     def _allocate_slot_locked(self) -> int:
         for slot_id in range(MAX_REGISTERED_CALLABLE_IDS):

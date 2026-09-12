@@ -20,6 +20,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -160,7 +161,15 @@ ChipWorker::RuntimeStorage &ChipWorker::RuntimeStorage::operator=(RuntimeStorage
     return *this;
 }
 
-ChipWorker::~ChipWorker() { finalize(); }
+ChipWorker::~ChipWorker() {
+    try {
+        finalize();
+    } catch (const std::exception &error) {
+        std::fprintf(stderr, "ChipWorker::~ChipWorker: teardown failed: %s\n", error.what());
+    } catch (...) {
+        std::fprintf(stderr, "ChipWorker::~ChipWorker: teardown failed with an unknown error\n");
+    }
+}
 
 void ChipWorker::init(
     const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
@@ -201,6 +210,10 @@ void ChipWorker::init(
     bind_host_log_state(handle, "host runtime");
 
     GetPipelineContractFn get_pipeline_contract_fn = nullptr;
+    KernelSupportedFn kernel_supported_fn = nullptr;
+    KernelInitFn kernel_init_fn = nullptr;
+    KernelPrepareCallableFn kernel_prepare_callable_fn = nullptr;
+    KernelLaunchFn kernel_launch_fn = nullptr;
     try {
         create_device_context_fn_ = load_symbol<CreateDeviceContextFn>(handle, "create_device_context");
         destroy_device_context_fn_ = load_symbol<DestroyDeviceContextFn>(handle, "destroy_device_context");
@@ -235,8 +248,10 @@ void ChipWorker::init(
         // ACL lifecycle + comm_* are part of the uniform host_runtime.so ABI.
         // Every platform runtime exports all of them — runtimes that do not
         // have a real backend (today: a5) ship not-supported stubs rather
-        // than omitting the symbols.  This keeps ChipWorker.init platform-
-        // agnostic: no per-symbol probing, no half-loaded extension groups.
+        // than omitting the symbols, so this group resolves unconditionally
+        // and never half-loads. The kernel-mode entries are the one group
+        // that does not: only simpler_kernel_mode_supported is required of
+        // every runtime, and the other three resolve behind its verdict.
         ensure_acl_ready_fn_ = load_symbol<EnsureAclReadyFn>(handle, "ensure_acl_ready_ctx");
         create_comm_stream_fn_ = load_symbol<CreateCommStreamFn>(handle, "create_comm_stream_ctx");
         destroy_comm_stream_fn_ = load_symbol<DestroyCommStreamFn>(handle, "destroy_comm_stream_ctx");
@@ -253,6 +268,7 @@ void ChipWorker::init(
         comm_global_domain_release_fn_ = load_symbol<CommGlobalDomainReleaseFn>(handle, "comm_global_domain_release");
         comm_barrier_fn_ = load_symbol<CommBarrierFn>(handle, "comm_barrier");
         comm_destroy_fn_ = load_symbol<CommDestroyFn>(handle, "comm_destroy");
+        kernel_supported_fn = load_symbol<KernelSupportedFn>(handle, "simpler_kernel_mode_supported");
     } catch (...) {
         throw;
     }
@@ -269,6 +285,12 @@ void ChipWorker::init(
     }
 
     try {
+        if (kernel_supported_fn(device_ctx_) != 0) {
+            kernel_init_fn = load_symbol<KernelInitFn>(handle, "simpler_kernel_mode_init");
+            kernel_prepare_callable_fn =
+                load_symbol<KernelPrepareCallableFn>(handle, "simpler_kernel_mode_prepare_callable");
+            kernel_launch_fn = load_symbol<KernelLaunchFn>(handle, "simpler_kernel_mode_launch");
+        }
         // One opaque native-run storage buffer per slot, always. The host
         // runtime constructs its per-run Runtime + phase state behind this
         // ABI boundary. This storage is not the RUNTIME_IMAGE resource: the
@@ -380,6 +402,10 @@ void ChipWorker::init(
         comm_global_domain_release_fn_ = nullptr;
         comm_barrier_fn_ = nullptr;
         comm_destroy_fn_ = nullptr;
+        kernel_supported_fn_ = nullptr;
+        kernel_init_fn_ = nullptr;
+        kernel_prepare_callable_fn_ = nullptr;
+        kernel_launch_fn_ = nullptr;
         runtime_bufs_.clear();
         throw;
     }
@@ -439,11 +465,19 @@ void ChipWorker::init(
         comm_global_domain_release_fn_ = nullptr;
         comm_barrier_fn_ = nullptr;
         comm_destroy_fn_ = nullptr;
+        kernel_supported_fn_ = nullptr;
+        kernel_init_fn_ = nullptr;
+        kernel_prepare_callable_fn_ = nullptr;
+        kernel_launch_fn_ = nullptr;
         runtime_bufs_.clear();
         throw std::runtime_error("simpler_init failed with code " + std::to_string(init_rc));
     }
 
     lib_handle_ = host_guard.release();
+    kernel_supported_fn_ = kernel_supported_fn;
+    kernel_init_fn_ = kernel_init_fn;
+    kernel_prepare_callable_fn_ = kernel_prepare_callable_fn;
+    kernel_launch_fn_ = kernel_launch_fn;
     device_id_ = device_id;
     // Published only once the runtime is up: the rollback paths above leave the
     // default K=1 contract in place, so a failed init never reports the counts
@@ -478,8 +512,19 @@ void ChipWorker::finalize() {
     // communicator handles and streams before tearing down the device context.
     clear_comm_sessions();
 
+    int device_finalize_rc = 0;
     if (device_ctx_ != nullptr && finalize_device_fn_ != nullptr && initialized_) {
-        finalize_device_fn_(device_ctx_);
+        device_finalize_rc = finalize_device_fn_(device_ctx_);
+    }
+    // A context whose teardown did not complete still owns device resources,
+    // and unloading the library that owns their release routines — or
+    // destroying the context that holds them — is unrecoverable. Both the
+    // context and the handle stay, so an explicit retry can finish the job.
+    if (device_finalize_rc != 0) {
+        throw std::runtime_error(
+            "ChipWorker::finalize: device teardown failed (" + std::to_string(device_finalize_rc) +
+            "); keeping the context and host runtime loaded"
+        );
     }
     if (device_ctx_ != nullptr && destroy_device_context_fn_ != nullptr) {
         destroy_device_context_fn_(device_ctx_);
@@ -529,6 +574,10 @@ void ChipWorker::finalize() {
     comm_global_domain_release_fn_ = nullptr;
     comm_barrier_fn_ = nullptr;
     comm_destroy_fn_ = nullptr;
+    kernel_supported_fn_ = nullptr;
+    kernel_init_fn_ = nullptr;
+    kernel_prepare_callable_fn_ = nullptr;
+    kernel_launch_fn_ = nullptr;
     runtime_bufs_.clear();
     pipeline_generations_.reset();
     pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 1, {}};

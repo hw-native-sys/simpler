@@ -2779,6 +2779,14 @@ NB_MODULE(_task_interface, m) {
         )
 
         .def_prop_ro(
+            "scalar_count",
+            [](const PyChipCallable &self) -> int32_t {
+                return self.get().scalar_count();
+            },
+            "Number of SCALAR entries in the orchestration signature."
+        )
+
+        .def_prop_ro(
             "child_count",
             [](const PyChipCallable &self) -> int32_t {
                 return self.get().child_count();

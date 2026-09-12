@@ -500,6 +500,39 @@ set_tests_properties(test_native_run_acceptance PROPERTIES LABELS "no_hardware")
 # callers invoke it from different host threads.
 add_common_utils_test(test_host_api common/test_host_api.cpp)
 
+# Kernel-mode entry argument validation: shared by every host-runtime
+# component (real implementation and stub alike), so its rejection rules are
+# provable here without any device or built .so.
+add_executable(test_kernel_entry_validation common/test_kernel_entry_validation.cpp)
+target_include_directories(test_kernel_entry_validation PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+    # src/common is needed so `#include "utils/device_arena.h"` resolves.
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+)
+target_link_libraries(test_kernel_entry_validation PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_kernel_entry_validation COMMAND test_kernel_entry_validation)
+set_tests_properties(test_kernel_entry_validation PROPERTIES LABELS "no_hardware")
+
+# Kernel-mode phase machine and restricted-vocabulary tables, table-driven with
+# fake ops: init/close balance, poison, sticky CLOSING with retry, and the
+# separate runtime-error vs teardown-error slots.
+add_executable(test_kernel_execution_state
+    common/test_kernel_execution_state.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/kernel_execution_state.cpp
+)
+target_include_directories(test_kernel_execution_state PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+)
+target_link_libraries(test_kernel_execution_state PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_kernel_execution_state COMMAND test_kernel_execution_state)
+set_tests_properties(test_kernel_execution_state PROPERTIES LABELS "no_hardware")
+
 # Runtime extension payloads are per-run state even though the collector's
 # shared-memory resources remain resident across runs.
 add_executable(test_chip_swimlane_collector
@@ -544,7 +577,9 @@ set_tests_properties(test_sim_run_completion PROPERTIES LABELS "no_hardware")
 add_task_interface_test(test_buffer types/test_buffer.cpp)
 add_task_interface_test(test_child_memory types/test_child_memory.cpp)
 add_task_interface_test(test_chip_max_tensor_args types/test_chip_max_tensor_args.cpp)
+add_task_interface_test(test_callable_scalar_count types/test_callable_scalar_count.cpp)
 add_task_interface_test(test_call_config types/test_call_config.cpp)
+add_task_interface_test(test_kernel_invocation_header types/test_kernel_invocation_header.cpp)
 
 # Contract test for upload_chip_callable_buffer caller-buffer immutability.
 # Pulls both task_interface (callable.h) and src/common (utils/fnv1a_64.h),
@@ -623,6 +658,43 @@ target_include_directories(test_profiler_device_engine PRIVATE
 
 add_common_utils_test(test_worker_chip_orch_comm common/test_worker_chip_orch_comm.cpp)
 add_common_utils_test(test_file_marker_handshake common/test_file_marker_handshake.cpp)
+
+# Context-lifetime AICore argument owner. Built once per runtime variant
+# because the device image length it copies is a per-runtime decision
+# (runtime_device_copy_size): trb narrows to the `dev` descriptor, hbg copies
+# the whole Runtime. The injected alloc/free/copy vocabulary keeps both builds
+# free of CANN.
+set(KERNEL_PERSISTENT_ARGS_SRC
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/onboard/host/kernel_persistent_args.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/kernel_execution_state.cpp)
+
+add_executable(test_kernel_persistent_args
+    common/test_kernel_persistent_args.cpp
+    ${KERNEL_PERSISTENT_ARGS_SRC}
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
+)
+target_compile_definitions(test_kernel_persistent_args PRIVATE SIMPLER_UT_TRB_RUNTIME)
+target_include_directories(test_kernel_persistent_args PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/onboard/host
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/orchestration
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/common
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+)
+target_link_libraries(test_kernel_persistent_args PRIVATE
+    a2a3_rt_objs
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    pthread
+)
+add_test(NAME test_kernel_persistent_args COMMAND test_kernel_persistent_args)
+set_tests_properties(test_kernel_persistent_args PROPERTIES LABELS "no_hardware")
 
 add_executable(test_trb_runtime_temp_buffer
     common/test_trb_runtime_temp_buffer.cpp
@@ -958,6 +1030,16 @@ add_a2a3_hbg_runtime_test(test_hbg_tensor_access a2a3/test_hbg_tensor_access.cpp
 # links the Runtime implementation to pin the contract without a device.
 add_a2a3_hbg_runtime_test(test_dispatch_table a2a3/test_dispatch_table.cpp
     ${HBG_SHARED_DIR}/runtime.cpp)
+
+# The hbg half of the per-runtime pair started above: same assertions, whole-
+# Runtime device image.
+add_a2a3_hbg_runtime_test(test_hbg_kernel_persistent_args common/test_kernel_persistent_args.cpp
+    ${KERNEL_PERSISTENT_ARGS_SRC}
+    ${HBG_SHARED_DIR}/runtime.cpp)
+target_include_directories(test_hbg_kernel_persistent_args PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/onboard/host
+    ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+)
 add_a2a3_hbg_runtime_test(test_hbg_core_tracker common/test_hbg_core_tracker.cpp)
 # The seed test calls the real ready_queue_init_data_from_layout, so it links the
 # shared init TU (and the orchestrator/SM members that TU refers to).
