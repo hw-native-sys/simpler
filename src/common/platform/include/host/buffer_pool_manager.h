@@ -450,7 +450,8 @@ public:
      *
      * Drains recycled/done/ready first (just discards — release goes via
      * dev_to_host_ to avoid double-free) and then iterates the full mapping
-     * table. Each unique allocation base is released exactly once.
+     * table. Each unique allocation base is released exactly once, in no
+     * specified order.
      */
     template <typename ReleaseFn>
     void release_all_owned(const ReleaseFn &release_fn) {
@@ -479,7 +480,6 @@ public:
                 }
             }
         }
-        std::sort(release_order.begin(), release_order.end(), std::less<void *>{});
         for (void *p : release_order) {
             release_fn(p);
         }
@@ -693,7 +693,7 @@ public:
     void notify_ready_waiters() {
         for (int shard_index = 0; shard_index < shard_count_; shard_index++) {
             auto &shard = ready_shards_[shard_index];
-            std::lock_guard<std::mutex> lock(shard.wait_mutex);
+            std::scoped_lock<std::mutex> lock(shard.wait_mutex);
             shard.cv.notify_all();
         }
     }

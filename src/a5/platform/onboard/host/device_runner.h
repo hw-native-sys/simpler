@@ -120,6 +120,12 @@ public:
      */
     int finalize() override;
 
+    /**
+     * a5 fills the per-core register table only: it has no ffts_base_addr
+     * field. The table is allocated on `mem_alloc_`.
+     */
+    int fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) override;
+
     // `upload_chip_callable_buffer`, `register_callable`,
     // `record_host_orch_callable`, `unregister_callable`, `has_callable`,
     // `bind_callable_to_runtime`, `aicpu_dlopen_count`, and
