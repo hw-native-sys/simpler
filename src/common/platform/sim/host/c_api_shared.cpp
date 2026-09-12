@@ -749,6 +749,10 @@ int simpler_prepare_run(
         if (rc != 0) return cleanup_failed_prepare(state, rc, true);
 
         runner->apply_call_config(state->config);
+        // Armed from this run's own config on the thread that is about to bind:
+        // a host-orchestrating runtime keeps the capture in thread-local state
+        // between orchestration and emit. Mirrors the onboard c_api.
+        runner->arm_host_dep_gen_capture(state->config.enable_dep_gen != 0);
 
         {
             STRACE("chip.run.bind");

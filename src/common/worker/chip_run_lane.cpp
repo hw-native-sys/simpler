@@ -70,9 +70,25 @@ struct ChipRunLaneState {
         std::rethrow_exception(run->error);
     }
 
+    /**
+     * Whether the predecessor at the FIFO head can carry a prepared successor.
+     *
+     * A diagnostics config is no longer disqualifying on its own: the collector
+     * pools and per-run state a preparation would otherwise have armed are built
+     * and reset under the execution claim.
+     *
+     * Level-4 chip swimlane is the exception, and it excludes a run from both
+     * roles. A host-orchestrating runtime opens a clock-correlation session on
+     * the resident swimlane collector, and samples its HostOrchestrationBegin
+     * anchor into it, from inside bind — so a successor preparing at that level
+     * would overwrite the session a predecessor is still running under, and a
+     * successor preparing behind such a predecessor would destroy it.
+     */
     bool permits_native_successor(const ChipRunState &predecessor, const CallConfig &successor_config) const {
-        return worker->supports_concurrent_native_prepare() && !predecessor.config.diagnostics_any() &&
-               !successor_config.diagnostics_any() && predecessor.phase == ChipRunState::Phase::LAUNCHED;
+        return worker->supports_concurrent_native_prepare() &&
+               !predecessor.config.captures_host_orchestration_phases() &&
+               !successor_config.captures_host_orchestration_phases() &&
+               predecessor.phase == ChipRunState::Phase::LAUNCHED;
     }
 
     bool permits_native_successor(const ChipRunState &predecessor, const ChipRunState &successor) const {

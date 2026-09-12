@@ -172,8 +172,11 @@ public:
     /** Wait for completion, publish DFX, and release per-run resources. */
     virtual int drain_execution(ActiveExecution &active) = 0;
     virtual int finalize() = 0;
-    // a2a3 and a5 both override; an arch without dep_gen leaves the no-op.
-    virtual void set_dep_gen_enabled(bool /*enable*/) {}
+    // Arms this thread's host-side dep_gen capture from the run's own config,
+    // before it binds. a2a3 and a5 both override; an arch without dep_gen leaves
+    // the no-op. See the onboard base for why it is not part of
+    // apply_call_config().
+    virtual void arm_host_dep_gen_capture(bool /*enable*/) {}
 
     /** Reserve the runner's single active native execution through finalize. */
     bool try_acquire_native_run(const void *owner, const NativeRunIdentity &identity, LaunchPermit *permit);
@@ -580,17 +583,11 @@ protected:
      *
      * The release frees device memory the collectors are holding, so it is only
      * safe while no other run is executing against them. Nothing here enforces
-     * that. What guarantees it today is the diagnostics depth-1 gate: with any
-     * diagnostic on, `allow_prepared_successor` is false, so a successor cannot
-     * even reserve while a predecessor is in flight, and a stale shape is only
-     * ever seen between runs.
-     *
-     * **Whoever lifts that gate must move this rebuild inside the execution
-     * claim.** Do not reach for `native_run_active()` as the guard — it is not a
-     * usable predicate at this point: onboard takes the claim in
-     * `simpler_launch_run`, but sim takes it in `simpler_prepare_run`, so on sim
-     * it is already true for the run being prepared and the check fires on its
-     * own run.
+     * that. What guarantees it is the caller: `arm_collectors_for_run()` is the
+     * sole user, and it runs from the launch arming, under the execution claim.
+     * A simulated context takes that claim at prepare and never overlaps two
+     * runs, so this holds here by construction; the call stays in the launch
+     * arming anyway, because the two runner shapes are kept identical.
      */
     bool collector_shape_is_stale(int num_aicore, int aicpu_thread_num, int launch_aicpu_num) const {
         return collector_shape_.latched &&

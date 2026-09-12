@@ -757,8 +757,6 @@ extern "C" __attribute__((weak)) int prewarm_config_impl(
 
 void SimDeviceRunnerBase::apply_call_config(const CallConfig &config) {
     set_chip_swimlane_enabled(config.enable_chip_swimlane);
-    // a2a3 and a5 override set_dep_gen_enabled; an arch without dep_gen no-ops.
-    set_dep_gen_enabled(config.enable_dep_gen != 0);
     set_output_prefix(config.output_prefix);
 }
 

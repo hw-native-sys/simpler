@@ -62,6 +62,23 @@ extern "C" int dlog_setlevel(int moduleId, int level, int enableEvent);
 extern "C" bool dep_gen_host_graph_active();
 extern "C" int dep_gen_host_graph_emit(const char *deps_json_path);
 
+/**
+ * Whether a host-orchestrating bind arms the runner's host-phase record store.
+ *
+ * Strong in the host_build_graph runtime, where it reads the
+ * SIMPLER_HBG_HOST_PHASE_RECORDS_ENABLE opt-in once; weak `false` below for the
+ * device-orchestrating runtimes, whose bind never touches that store. The
+ * pipeline admission reads it because the store is one per runner, not one per
+ * run, so an opted-in run cannot carry a prepared successor.
+ *
+ * Declared with C++ linkage to match `host_phase_trace.h`. Giving it C linkage
+ * here would mangle to a different symbol, which the weak definition would then
+ * satisfy unconditionally — the opt-in would read `false` even where the strong
+ * one is linked, and nothing would say so.
+ */
+bool host_phase_records_enabled();
+__attribute__((weak)) bool host_phase_records_enabled() { return false; }
+
 using OnboardNativeRunContext = NativeRunContext<DeviceRunnerBase>;
 // Phase entry points validate raw caller storage before beginning object
 // lifetime, so the on-storage magic must remain the leading bytes.
@@ -794,8 +811,17 @@ int simpler_prepare_run(
             static_cast<unsigned long long>(state->descriptor.generation),
             static_cast<unsigned long long>(state->descriptor.run_epoch)
         );
-        const bool allow_prepared_successor =
-            concurrent_native_prepare_supported_impl() != 0 && !config->diagnostics_any();
+        // Level-4 swimlane and the host-phase record opt-in both make a
+        // host-orchestrating bind arm state that is not per-run — a
+        // clock-correlation session and anchor samples on the resident swimlane
+        // collector, and the runner's single host-phase record store. A prepared
+        // successor binds while its predecessor is still executing, so a run
+        // under either keeps the pipeline at depth one. Every other diagnostics
+        // config overlaps: what its preparation would arm is built and reset
+        // under the execution claim.
+        const bool allow_prepared_successor = concurrent_native_prepare_supported_impl() != 0 &&
+                                              !config->captures_host_orchestration_phases() &&
+                                              !host_phase_records_enabled();
         if (!runner->try_reserve_native_run(
                 state, state->descriptor.pipeline_slot, state->descriptor.arena_bank, allow_prepared_successor
             )) {
@@ -852,10 +878,17 @@ int simpler_prepare_run(
         rc = runner->prepare_launch_shape(state->runtime, state->config);
         if (rc != 0) return cleanup_failed_prepare(state, rc, true);
 
-        // Diagnostic binding reads runner-global collector configuration. It
-        // is depth-one, while concurrent HBG preparation must leave the active
-        // run's configuration untouched until launch.
+        // Latches what a device-context query answers from. Skipped for a
+        // successor prepared against an active predecessor, whose configuration
+        // is the one that query must keep reporting until it retires.
         if (!overlaps_active_run) runner->apply_call_config(state->config);
+
+        // Unconditional, and from this run's own config: a host-orchestrating
+        // runtime holds the captured graph in thread-local state between
+        // orchestration and emit, so the arming has to happen on this thread
+        // ahead of its bind whether or not it overlaps a predecessor. It writes
+        // nothing the two runs share.
+        runner->arm_host_dep_gen_capture(config->enable_dep_gen != 0);
 
         {
             STRACE("chip.run.bind");

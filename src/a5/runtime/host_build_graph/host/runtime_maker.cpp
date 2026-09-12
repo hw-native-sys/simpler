@@ -127,8 +127,7 @@ extern "C" const PipelineContract *get_pipeline_contract(void) {
 
 extern "C" int concurrent_native_prepare_supported_impl(void) {
     // HBG can materialize a complete graph into the lease-selected unpublished
-    // arena bank. The common C API keeps collector-bearing configurations on
-    // the sequential path until their state is per-epoch.
+    // arena bank.
     return 1;
 }
 

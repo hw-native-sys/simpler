@@ -176,7 +176,12 @@ TEST(ChipRunLaneTest, OwnsFifoPreparationAndLaunch) {
     worker.finalize();
 }
 
-TEST(ChipRunLaneTest, ValidationOnlySuccessorPreparesAfterPromotion) {
+// A diagnostics config is not special-cased by the lane: its collector pools and
+// per-run state are built and reset under the execution claim, so its
+// preparation touches nothing the predecessor is using. The lane declines to
+// stage silently rather than raising, so a reinstated special case would only
+// show up as lost pipeline depth.
+TEST(ChipRunLaneTest, DiagnosticSuccessorPreparesLikeAnyOther) {
     ChipWorker worker;
     prime_worker(worker);
     ChipRunLane lane(worker);
@@ -187,14 +192,14 @@ TEST(ChipRunLaneTest, ValidationOnlySuccessorPreparesAfterPromotion) {
 
     ChipRun first = submit(lane, 101, 0);
     ChipRun second = lane.submit(1, args, diagnostic, PipelineSlotLease{1, 0, 102}, 102, 102, nullptr, 0, false);
-    EXPECT_EQ(second.preparation_disposition(), ChipRunPreparationDisposition::VALIDATED_ONLY);
-    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "launch0"}));
+    EXPECT_EQ(second.preparation_disposition(), ChipRunPreparationDisposition::NATIVE_PREPARED);
+    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "launch0", "prepare1"}));
 
     second.activate();
     g_complete[0] = true;
     EXPECT_TRUE(first.done());
     EXPECT_FALSE(second.done());
-    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "launch0", "finalize0", "prepare1", "launch1"}));
+    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "launch0", "prepare1", "finalize0", "launch1"}));
     lane.close();
     worker.finalize();
 }

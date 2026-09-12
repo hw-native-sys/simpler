@@ -108,7 +108,7 @@ public:
      * instead of the device collector. Defined in the .cpp so this header stays
      * free of the runtime-provided capture symbols.
      */
-    void set_dep_gen_enabled(bool enable) override;
+    void arm_host_dep_gen_capture(bool enable) override;
 
     /**
      * Cleanup all resources
@@ -291,7 +291,6 @@ private:
     // `pmu_event_type_`, `output_prefix_`) live on `DeviceRunnerBase`.
     //
     // dep_gen enablement is a5-specific (a2a3 carries its own copy).
-    bool enable_dep_gen_{false};
 
     int query_aicpu_device_occupancy(pto::a5::AicpuDeviceOccupancy &out);
     int query_aicpu_topology(pto::a5::AicpuTopology &out);

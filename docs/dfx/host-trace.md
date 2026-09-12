@@ -490,7 +490,8 @@ from the positive arm in exactly one variable:
 | --- | -------------- | ---------------- |
 | overlap stress | — | accepted, one check per adjacent pair |
 | serial submission | one run in flight instead of two | rejected, `did not overlap` |
-| diagnostics config | `enable_scope_stats` set | rejected, `did not overlap` |
+| diagnostics config | `enable_scope_stats` set | accepted |
+| orch-phase swimlane | `enable_chip_swimlane` 4 | rejected, `did not overlap` |
 
 The second arm is what makes the first a detector rather than a formality.
 Between the pipeline and the verdict sits a chain — which spans are emitted,
@@ -500,14 +501,23 @@ intersection independent of real concurrency, the positive arm would still be
 green. Matching the message matters: it separates a real rejection from the
 vacuous "need at least two complete native runs" one.
 
-The third arm covers a fallback that is otherwise silent. `allow_prepared_successor`
-folds in `CallConfig::diagnostics_any()` — the OR of all five diagnostic flags —
-because a collector's setup mutates runner-global state that is not yet
-per-epoch, so *any* one of them keeps a run and its successor on separate device
-windows even at depth 2. The lane's own check declines to stage rather than
-raising, so the submissions still succeed and the goldens still pass; nothing
-else would notice. Which flag is set does not matter, only that
-`diagnostics_any()` becomes true, so the arm picks the lightest.
+The last two hold a boundary that is otherwise invisible.
+`allow_prepared_successor` once folded in `CallConfig::diagnostics_any()` — the
+OR of all five diagnostic flags — because a collector's setup wrote
+runner-global state during preparation, which a prepared successor would have
+done while its predecessor was still running against it. The pools and that
+per-run state are now built and reset under the execution claim, so a diagnostic
+configuration overlaps like any other.
+
+Level 4 is the exception, and the reason it is not simply the same case: a
+host-orchestrating bind opens a clock-correlation session on the *resident*
+swimlane collector and samples its `HostOrchestrationBegin` anchor into it. That
+cannot move under the claim — the anchor's meaning is when host orchestration
+began — so until the session is per-run, a level-4 run neither carries a
+prepared successor nor is one. Nothing else would notice either boundary
+moving: the lane declines to stage silently rather than raising, so a run that
+lost its overlap and one that kept an overlap it should not have look the same
+from outside.
 
 Staging has three inputs and only that one is reachable from a submission. The
 other two — the runtime PipelineContract's `pipeline_depth` and the runtime's

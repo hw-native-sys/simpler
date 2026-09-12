@@ -210,10 +210,10 @@ int DeviceRunner::destroy_comm_stream(void *stream) {
 // live on `DeviceRunnerBase` — see
 // `src/common/platform/onboard/host/device_runner_base.cpp`.
 
-void DeviceRunner::set_dep_gen_enabled(bool enable) {
-    enable_dep_gen_ = enable;
+void DeviceRunner::arm_host_dep_gen_capture(bool enable) {
     // Arms host-side capture for a host-orch runtime (no-op weak stub for the
-    // device-orch one). The c_api latches the CallConfig before bind, and the
+    // device-orch one). The capture is thread-local between orchestration and
+    // emit, so the c_api calls this on the binding thread before every bind; the
     // orchestration entry resets the graph before recording it.
     dep_gen_host_graph_set_enabled(enable);
 }

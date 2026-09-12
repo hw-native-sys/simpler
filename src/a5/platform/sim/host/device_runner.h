@@ -47,7 +47,7 @@ public:
     // capture, which a host-orch runtime uses instead of the device collector.
     // Defined in the .cpp so this header stays free of the runtime-provided
     // capture symbols.
-    void set_dep_gen_enabled(bool enable) override;
+    void arm_host_dep_gen_capture(bool enable) override;
 
 private:
     struct ActiveRun;
@@ -106,7 +106,6 @@ private:
 
     // dep_gen collector — captures orchestrator submit_task inputs for offline replay.
     DepGenCollector dep_gen_collector_;
-    bool enable_dep_gen_{false};
     std::unique_ptr<ActiveRun> active_run_;
     simpler::common::sim_host::SimRunCompletion run_completion_;
 };

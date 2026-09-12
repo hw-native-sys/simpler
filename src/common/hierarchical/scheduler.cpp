@@ -540,10 +540,12 @@ void Scheduler::dispatch_preparable_next_level_singles() {
             cfg_.enqueue_ready_cb(slot);
             continue;
         }
-        // Diagnostic setup mutates runner-global state, so it starts only
-        // after this run reaches the active FIFO lane. Ordinary tasks may use
-        // the prepared lane because their backend preparation is run-local.
-        if (state.config.diagnostics_any()) {
+        // A host-orchestrating runtime arms its clock-correlation session on the
+        // resident swimlane collector from inside bind, so a level-4 run starts
+        // only after it reaches the active FIFO lane. Every other diagnostics
+        // config may use the prepared lane: what its preparation would arm is
+        // built and reset under the execution claim.
+        if (state.config.captures_host_orchestration_phases()) {
             cfg_.enqueue_ready_cb(slot);
             continue;
         }

@@ -654,11 +654,16 @@ public:
     virtual int finalize() = 0;
 
     /**
-     * dep_gen enablement setter. The shared c_api `simpler_run` calls this
-     * unconditionally; a2a3 and a5 override it to capture submit_task inputs.
-     * The base default is a no-op for any arch that does not implement dep_gen.
+     * Arm or disarm this thread's host-side dep_gen capture, from the run's own
+     * config, before it binds.
+     *
+     * A host-orchestrating runtime holds the captured graph in thread-local
+     * state between orchestration and emit, so this has to run on the thread
+     * that is about to bind, for every prepare — including one that overlaps an
+     * active predecessor, which skips `apply_call_config`. It writes nothing the
+     * runner shares between runs. An arch without dep_gen keeps the no-op.
      */
-    virtual void set_dep_gen_enabled(bool /*enable*/) {}
+    virtual void arm_host_dep_gen_capture(bool /*enable*/) {}
 
     /**
      * Launch an AICPU kernel. Internal helper used by the subclass's
@@ -1022,17 +1027,11 @@ protected:
      *
      * The release frees device memory the collectors are holding, so it is only
      * safe while no other run is executing against them. Nothing here enforces
-     * that. What guarantees it today is the diagnostics depth-1 gate: with any
-     * diagnostic on, `allow_prepared_successor` is false, so a successor cannot
-     * even reserve while a predecessor is in flight, and a stale shape is only
-     * ever seen between runs.
-     *
-     * **Whoever lifts that gate must move this rebuild inside the execution
-     * claim.** Do not reach for `native_run_active()` as the guard — it is not a
-     * usable predicate at this point: onboard takes the claim in
-     * `simpler_launch_run`, but sim takes it in `simpler_prepare_run`, so on sim
-     * it is already true for the run being prepared and the check fires on its
-     * own run.
+     * that. What guarantees it is the caller: `arm_collectors_for_run()` is the
+     * sole user, and it runs from the launch arming, under the execution claim.
+     * Do not move the call back into preparation — a prepared successor overlaps
+     * its predecessor's device window, so this would free pools that predecessor
+     * is still writing into.
      */
     bool collector_shape_is_stale(int num_aicore, int aicpu_thread_num, int launch_aicpu_num) const {
         return collector_shape_.latched &&

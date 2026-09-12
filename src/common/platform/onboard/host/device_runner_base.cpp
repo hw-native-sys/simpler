@@ -1275,9 +1275,6 @@ extern "C" __attribute__((weak)) int prewarm_config_impl(
 
 void DeviceRunnerBase::apply_call_config(const CallConfig &config) {
     set_chip_swimlane_enabled(config.enable_chip_swimlane);
-    // Virtual: a2a3 and a5 wire through to their enable_dep_gen_; an arch
-    // without dep_gen falls through to the base no-op.
-    set_dep_gen_enabled(config.enable_dep_gen != 0);
     set_output_prefix(config.output_prefix);
 }
 

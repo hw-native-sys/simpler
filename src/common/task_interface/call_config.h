@@ -130,6 +130,20 @@ struct CallConfig {
                enable_scope_stats != 0;
     }
 
+    /**
+     * Whether this run captures host-orchestration phase state, which a
+     * host-orchestrating runtime arms during its bind.
+     *
+     * Level 4 is the one that opens a clock-correlation session on the resident
+     * swimlane collector and samples its `HostOrchestrationBegin` anchor there,
+     * both from inside bind — i.e. from inside preparation, which a prepared
+     * successor performs while its predecessor is still executing. That state is
+     * not per-run, so such a run neither carries a prepared successor nor is one.
+     * The literal is `ChipSwimlaneLevel::ORCH_PHASES`, which this header cannot
+     * include without pulling the profiling headers into the task-interface ABI.
+     */
+    bool captures_host_orchestration_phases() const noexcept { return enable_chip_swimlane == 4; }
+
     bool output_prefix_set() const noexcept { return output_prefix[0] != '\0'; }
 
     // Throws if any diagnostic flag is enabled but `output_prefix` is empty,

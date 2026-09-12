@@ -657,7 +657,8 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
     }
     const uint64_t run_epoch = next_native_run_epoch();
     const ChipWorkerNativeRun run_identity{slot_id, generation, run_epoch, run_id, dispatch_id};
-    const bool allow_prepared_successor = supports_concurrent_native_prepare() && !config.diagnostics_any();
+    const bool allow_prepared_successor =
+        supports_concurrent_native_prepare() && !config.captures_host_orchestration_phases();
     {
         std::lock_guard<std::mutex> lk(native_run_mu_);
         NativeRunSlotState &state = native_run_states_[slot_id];
