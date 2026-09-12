@@ -1406,6 +1406,67 @@ class TestChipCallable:
         assert "sig_count=2" in r
         assert "child_count=1" in r
 
+    def test_scalar_count_defaults_to_zero(self):
+        chip = ChipCallable.build(
+            signature=[ArgDirection.IN],
+            func_name="test_func",
+            binary=b"\x00",
+            children=[],
+        )
+        assert chip.scalar_count == 0
+
+    def test_scalar_count_keyword_round_trip(self):
+        chip = ChipCallable.build(
+            signature=[ArgDirection.IN, ArgDirection.OUT] + [ArgDirection.SCALAR] * 5,
+            func_name="test_func",
+            binary=b"\x00",
+            children=[],
+            scalar_count=5,
+        )
+        assert chip.scalar_count == 5
+
+    def test_scalar_count_survives_from_bytes(self):
+        chip = ChipCallable.build(
+            signature=[ArgDirection.IN] + [ArgDirection.SCALAR] * 7,
+            func_name="test_func",
+            binary=b"\x00",
+            children=[],
+            scalar_count=7,
+        )
+        raw = ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size()))
+        clone = ChipCallable.from_bytes(raw)
+        assert clone.scalar_count == 7
+
+    def test_scalar_count_out_of_range_reports_value_and_limit(self):
+        for bad in (-1, 129):
+            with pytest.raises(ValueError, match=rf"{bad}.*128"):
+                ChipCallable.build(
+                    signature=[],
+                    func_name="test_func",
+                    binary=b"\x00",
+                    children=[],
+                    scalar_count=bad,
+                )
+
+    def test_scalar_count_disagreeing_with_signature_rejected(self):
+        """A nonzero count is a cached derivation of the signature; zero also
+        means "not recorded" and stays valid with any signature."""
+        with pytest.raises(ValueError, match=r"5.*0.*SCALAR"):
+            ChipCallable.build(
+                signature=[ArgDirection.IN, ArgDirection.OUT],
+                func_name="test_func",
+                binary=b"\x00",
+                children=[],
+                scalar_count=5,
+            )
+        unrecorded = ChipCallable.build(
+            signature=[ArgDirection.IN] + [ArgDirection.SCALAR] * 3,
+            func_name="test_func",
+            binary=b"\x00",
+            children=[],
+        )
+        assert unrecorded.scalar_count == 0
+
 
 # ============================================================================
 # ChipTensor.child_memory
