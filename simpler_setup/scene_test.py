@@ -282,7 +282,7 @@ def scene_level(level: int | SceneTestLevel):
 
 
 class TensorArg(NamedTuple):
-    """Named CPU tensor, optionally kept device-resident for the whole L2 case."""
+    """Named CPU tensor, optionally kept as child memory for the whole L2 case."""
 
     name: str
     value: Any  # torch.Tensor
@@ -576,19 +576,19 @@ class CallableNamespace:
 # ---------------------------------------------------------------------------
 
 
-def _resident_l2_args(worker, test_args, signature):
+def _child_memory_args(worker, test_args, signature):
     """Own the device buffers for every `child_memory` TensorArg, for the whole case.
 
     Returns an owner whose `tensors` is empty when nothing is declared, so the
-    caller's arg build falls through to ordinary host staging. Resident storage
+    caller's arg build falls through to ordinary host staging. Child-memory storage
     may not alias any other argument's storage: independent device buffers
     cannot preserve an overlap the orchestrator would otherwise see.
     """
-    from simpler_setup.resident_task_args import ResidentTaskArgs  # noqa: PLC0415
+    from simpler_setup.child_memory_args import ChildMemoryArgs  # noqa: PLC0415
 
     specs = [spec for spec in test_args.specs if isinstance(spec, TensorArg)]
     if not any(spec.child_memory for spec in specs):
-        return ResidentTaskArgs(worker)
+        return ChildMemoryArgs(worker)
     if len(specs) != len(signature):
         raise ValueError("TensorArg count must match the orchestration signature")
     ranges = []
@@ -596,26 +596,26 @@ def _resident_l2_args(worker, test_args, signature):
         host = spec.value
         if host.numel():
             # Unselected tensors may be strided: their full span participates
-            # in overlap rejection when either argument is resident.
+            # in overlap rejection when either argument is child memory.
             span = 1 + sum((n - 1) * stride for n, stride in zip(host.shape, host.stride()))
             lo = host.data_ptr()
             hi = lo + span * host.element_size()
             for other, start, end in ranges:
                 if (spec.child_memory or other.child_memory) and lo < end and start < hi:
-                    raise ValueError(f"Resident tensors cannot alias: {spec.name!r}, {other.name!r}")
+                    raise ValueError(f"Child-memory tensors cannot alias: {spec.name!r}, {other.name!r}")
             ranges.append((spec, lo, hi))
-    resident = ResidentTaskArgs(worker)
+    child_args = ChildMemoryArgs(worker)
     try:
         for spec, direction in zip(specs, signature):
             if spec.child_memory:
-                resident.add(spec.name, spec.value, direction)
+                child_args.add(spec.name, spec.value, direction)
     except BaseException:
-        resident.release()
+        child_args.release()
         raise
-    return resident
+    return child_args
 
 
-def _build_l2_ref_args(test_args: TaskArgsBuilder, orch_signature: list, worker, resident=None):
+def _build_l2_ref_args(test_args: TaskArgsBuilder, orch_signature: list, worker, child_args=None):
     """Build TensorArg `TaskArgs` from `TaskArgsBuilder` for the L2 `Worker.run` path.
 
     An L2 leaf consumes its own args: `Worker.run(handle, args, cfg)` materializes each TensorArg to a
@@ -651,8 +651,8 @@ def _build_l2_ref_args(test_args: TaskArgsBuilder, orch_signature: list, worker,
                     f"Update CALLABLE['orchestration']['signature'] to match generate_args()."
                 )
             direction = orch_signature[tensor_idx]
-            if resident is not None and spec.name in resident.tensors:
-                tensor_arg = resident.tensors[spec.name]
+            if child_args is not None and spec.name in child_args.tensors:
+                tensor_arg = child_args.tensors[spec.name]
             else:
                 tensor_arg = make_tensor_arg(worker, spec.value)
             args.add_tensor(tensor_arg, dir2tag.get(direction, TensorArgType.INPUT))
@@ -1926,17 +1926,17 @@ class SceneTestCase:
             type(self)._st_l2_handle = handle
 
         test_args = self.generate_args(params)
-        with _resident_l2_args(worker, test_args, orch_sig) as resident:
-            chip_args, output_names = _build_l2_ref_args(test_args, orch_sig, worker, resident=resident)
-            staged_outputs = [name for name in output_names if name not in resident.tensors]
-            resident_outputs = [name for name in output_names if name in resident.tensors]
+        with _child_memory_args(worker, test_args, orch_sig) as child_args:
+            chip_args, output_names = _build_l2_ref_args(test_args, orch_sig, worker, child_args=child_args)
+            staged_outputs = [name for name in output_names if name not in child_args.tensors]
+            child_memory_outputs = [name for name in output_names if name in child_args.tensors]
 
             golden_args = None
             if not skip_golden:
                 golden_args = test_args.clone()
                 with _golden_thread_cap():
                     initial_golden = {name: getattr(golden_args, name).clone() for name in staged_outputs}
-                    for golden_round in range(rounds if resident_outputs else 1):
+                    for golden_round in range(rounds if child_memory_outputs else 1):
                         if golden_round:
                             for name, initial in initial_golden.items():
                                 getattr(golden_args, name).copy_(initial)
@@ -1977,10 +1977,10 @@ class SceneTestCase:
                 with _temporary_env(self._resolve_env()):
                     worker.run(handle, chip_args, config=config)
 
-                if not skip_golden and not resident_outputs:
+                if not skip_golden and not child_memory_outputs:
                     self.compare_outputs(test_args, golden_args, output_names, params)
-            if not skip_golden and resident_outputs:
-                resident.copy_back(test_args, resident_outputs)
+            if not skip_golden and child_memory_outputs:
+                child_args.copy_back(test_args, child_memory_outputs)
                 self.compare_outputs(test_args, golden_args, output_names, params)
 
     def _run_and_validate_l3(  # noqa: PLR0913 -- threads CLI diagnostic flags + L3 ns context

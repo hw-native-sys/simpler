@@ -315,7 +315,7 @@ Layer 1  Level axis
     │                   across every class assigned to that device
     │           └─ Layer 5  Case — serial within a class
     │               └─ Layer 6  Rounds — `--rounds N` loop, reuses Worker;
-    │                           L2 residency is declared per tensor, independent of N
+    │                           L2 child memory is declared per tensor, independent of N
 ```
 
 ### Quick examples
@@ -903,7 +903,7 @@ This eliminates the need for separate `examples/` (sim) and `tests/st/` (device)
 
 When kernels themselves differ (e.g., templated tile sizes tuned for device), separate test files remain the correct approach.
 
-## Explicit L2 tensor residency
+## Explicit L2 child memory
 
 `TensorArg(name, value, child_memory=True)` keeps a case-owned device buffer
 across all rounds, including `--rounds 1`. `TaskArgsBuilder.add_tensor` accepts
@@ -912,30 +912,30 @@ the same keyword. The default remains host staging on every round.
 | Declaration / direction | Setup | Between rounds | Validation |
 | ----------------------- | ----- | -------------- | ---------- |
 | Host-staged (default) | Existing path | Restore OUT/INOUT host fixtures | Existing per-round copy-back |
-| Resident IN | Allocate and upload once | Keep device address and input contents | No output readback |
-| Resident OUT | Allocate without upload | Keep device contents; the case must define all compared elements | Final readback |
-| Resident INOUT | Allocate and upload once | Keep device state | Final readback |
+| Child-memory IN | Allocate and upload once | Keep device address and input contents | No output readback |
+| Child-memory OUT | Allocate without upload | Keep device contents; the case must define all compared elements | Final readback |
+| Child-memory INOUT | Allocate and upload once | Keep device state | Final readback |
 
-Golden evaluation follows the same state evolution: resident outputs retain
-state and host-staged outputs reset. Cases with resident outputs compare after
+Golden evaluation follows the same state evolution: child-memory outputs retain
+state and host-staged outputs reset. Cases with child-memory outputs compare after
 the final round; other cases continue comparing every round.
 
 A tensor whose contents the HBG host orchestration reads (`get_tensor_data`) or
-writes (`set_tensor_data`) must stay host-staged — a resident tensor takes the
+writes (`set_tensor_data`) must stay host-staged — a child-memory tensor takes the
 device pass-through and is never registered as a readable region, so an
-orchestration access to it fails closed. Residency is declared per argument, so
-a data-dependent case can keep its bulk tensors resident and leave its small
+orchestration access to it fails closed. The declaration is per argument, so
+a data-dependent case can keep its bulk tensors as child memory and leave its small
 control tensors staged.
 
 Declarations currently require L2, contiguous CPU fixtures, and non-overlapping
-storage. Empty fixtures allocate no resident buffer; the existing transport
+storage. Empty fixtures allocate no device buffer; the existing transport
 still rejects zero-shaped Tensor arguments. Clone and rehost operations preserve
 declaration metadata. Streaming drivers can use
-`simpler_setup.resident_task_args.ResidentTaskArgs` as a context manager and add
+`simpler_setup.child_memory_args.ChildMemoryArgs` as a context manager and add
 one fixture at a time, so each large fixture can be released before the next is
 materialized.
 
 The HBG `paged_attention_unroll_manual_scope` examples include matched manual
-`Residency_staged` and `Residency_bulk` cases. Bulk residency leaves
+`ChildMemory_False` and `ChildMemory_True` cases. The latter leaves
 `context_lens` and `block_table` host-staged because the orchestration reads
 them. Existing default cases retain host staging.

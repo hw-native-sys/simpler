@@ -15,7 +15,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-class ResidentTaskArgs:
+class ChildMemoryArgs:
     """Own fixed device addresses until release; upload each input exactly once.
 
     ``add`` consumes one CPU contiguous fixture at a time, so a streaming driver
@@ -35,11 +35,11 @@ class ResidentTaskArgs:
         from simpler_setup.torch_interop import torch_dtype_to_datatype  # noqa: PLC0415
 
         if name in self.directions:
-            raise ValueError(f"Duplicate resident tensor {name!r}")
+            raise ValueError(f"Duplicate child-memory tensor {name!r}")
         if direction not in (D.IN, D.OUT, D.INOUT):
-            raise ValueError(f"Resident tensor {name!r} has an unsupported direction")
+            raise ValueError(f"Child-memory tensor {name!r} has an unsupported direction")
         if host.device.type != "cpu" or not host.is_contiguous():
-            raise ValueError(f"Resident tensor {name!r} must be a contiguous CPU tensor")
+            raise ValueError(f"Child-memory tensor {name!r} must be a contiguous CPU tensor")
         size = host.numel() * host.element_size()
         if not size:
             # An empty tensor names no device bytes. Leaving it unrecorded keeps
@@ -55,14 +55,14 @@ class ResidentTaskArgs:
             try:
                 self.worker.free(buf)
             except Exception as exc:  # noqa: BLE001 -- preserve the construction failure
-                logger.warning("Resident tensor cleanup failed: %s", exc)
+                logger.warning("Child-memory tensor cleanup failed: %s", exc)
             raise
         self.buffers[name] = buf
         self.tensors[name] = tensor
         self.directions[name] = direction
 
     def build_args(self, expected_count=None):
-        """Build all-resident L2 args, preserving direction.
+        """Build all-child-memory L2 args, preserving direction.
 
         ``expected_count`` is the caller's tensor-argument count. A mismatch means
         `add` skipped an empty tensor, so every later argument would shift against
@@ -74,8 +74,8 @@ class ResidentTaskArgs:
 
         if expected_count is not None and expected_count != len(self.tensors):
             raise ValueError(
-                f"build_args expected {expected_count} resident tensors but holds {len(self.tensors)}; "
-                "an empty tensor cannot be resident -- keep it on the host-staging path instead."
+                f"build_args expected {expected_count} child-memory tensors but holds {len(self.tensors)}; "
+                "an empty tensor cannot be child memory -- keep it on the host-staging path instead."
             )
         tags = {D.IN: TensorArgType.INPUT, D.OUT: TensorArgType.OUTPUT_EXISTING, D.INOUT: TensorArgType.INOUT}
         args = TaskArgs()
@@ -97,7 +97,7 @@ class ResidentTaskArgs:
             try:
                 self.worker.free(buf)
             except Exception as exc:  # noqa: BLE001 -- attempt all frees, preserve the test result
-                logger.warning("Resident tensor cleanup failed: %s", exc)
+                logger.warning("Child-memory tensor cleanup failed: %s", exc)
 
     def __enter__(self):
         return self

@@ -154,17 +154,17 @@ recover `finish(B) − dispatch(A)`. Full semantics in
   scheduler-phase deep dive.
 - `simpler_setup/tools/README.md` — `strace_timing` CLI reference.
 
-### Residency and round comparisons
+### Child memory and round comparisons
 
-`--rounds` does not select a tensor memory policy. SceneTest residency is an
+`--rounds` does not select a tensor memory policy. SceneTest child memory is an
 explicit per-argument `child_memory` declaration and is the same for one or
-many rounds. Allocation and initial upload for declared resident inputs happen
+many rounds. Allocation and initial upload for declared child-memory inputs happen
 at case setup, outside `Worker.run` and its round markers. Include setup and
 final validation readback when reporting total case time; do not label the
 round table alone as end-to-end case latency.
 
-A resident argument skips the per-round staging path entirely, so `bind.args`
+A child-memory argument skips the per-round staging path entirely, so `bind.args`
 reports fewer staged tensors and fewer staged bytes for it. Numbers taken
-before and after a case declares residency are therefore not comparable on the
+before and after a case declares child memory are therefore not comparable on the
 host/bind component; re-measure both arms with identical fixtures, hardware,
 round counts and validation settings.

@@ -48,6 +48,7 @@ from simpler.task_interface import CallConfig
 from simpler.worker import Worker
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, scene_test
+from simpler_setup.child_memory_args import ChildMemoryArgs
 from simpler_setup.compile_pool import compile_worker_budget
 from simpler_setup.goldens.qwen3_14b_decode import (
     N_LAYERS,
@@ -62,7 +63,6 @@ from simpler_setup.goldens.qwen3_14b_decode import (
 )
 from simpler_setup.log_config import DEFAULT_LOG_LEVEL, LOG_LEVEL_CHOICES, configure_logging
 from simpler_setup.parallel_scheduler import device_range_to_list
-from simpler_setup.resident_task_args import ResidentTaskArgs
 from simpler_setup.scene_test import (
     build_output_prefix,
     compile_chip_callable_spec,
@@ -490,7 +490,7 @@ def _chip_spec(orchestration_source: str | Path | None, orchestration_function: 
     return spec
 
 
-def _upload_fixture(resident, signature, *, seed, seq_len, n_layers, fixture=None):
+def _upload_fixture(child_args, signature, *, seed, seq_len, n_layers, fixture=None):
     specs = param_specs(n_layers)
     if len(specs) != len(signature):
         raise ValueError("Qwen parameter count must match the orchestration signature")
@@ -501,7 +501,7 @@ def _upload_fixture(resident, signature, *, seed, seq_len, n_layers, fixture=Non
         else param_tensors(seed=seed, seq_len=seq_len, n_layers=n_layers)
     )
     for name, tensor in tensors:
-        resident.add(name, tensor, directions[name])
+        child_args.add(name, tensor, directions[name])
         # Release this weight before the generator creates its successor.
         del tensor
 
@@ -631,16 +631,18 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
     worker = Worker(level=2, platform=platform, runtime=runtime, device_id=device_id)
     chip_handle = worker.register(chip)
     worker.init()
-    resident = ResidentTaskArgs(worker)
+    child_args = ChildMemoryArgs(worker)
     try:
         golden = None
         if skip_golden:
-            _upload_fixture(resident, spec["orchestration"]["signature"], seed=seed, seq_len=seq_len, n_layers=N_LAYERS)
+            _upload_fixture(
+                child_args, spec["orchestration"]["signature"], seed=seed, seq_len=seq_len, n_layers=N_LAYERS
+            )
         else:
             print("[qwen] materializing one fixture for upload and torch golden...", flush=True)
             golden = _decode_generate_inputs(seed=seed, seq_len=seq_len, n_layers=N_LAYERS)
             _upload_fixture(
-                resident,
+                child_args,
                 spec["orchestration"]["signature"],
                 seed=seed,
                 seq_len=seq_len,
@@ -648,7 +650,7 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
                 fixture=golden,
             )
             _decode_golden(golden, n_layers=N_LAYERS)
-        task_args = resident.build_args(expected_count=len(param_specs(N_LAYERS)))
+        task_args = child_args.build_args(expected_count=len(param_specs(N_LAYERS)))
         config = _build_config(
             runtime_env,
             enable_chip_swimlane=diagnostics.chip_swimlane,
@@ -665,9 +667,9 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
             print(f"[qwen] round {round_idx + 1}/{rounds}", flush=True)
             worker.run(chip_handle, task_args, config)
         if golden is not None:
-            _copy_and_compare(worker, resident.buffers, golden)
+            _copy_and_compare(worker, child_args.buffers, golden)
     finally:
-        resident.release()
+        child_args.release()
         worker.close()
         finalize_diagnostic_outputs(
             diagnostic_label,

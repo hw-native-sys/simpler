@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ruff: noqa: PLC0415
-"""Explicit L2 residency has stable allocation and round semantics."""
+"""Explicit L2 child memory has stable allocation and round semantics."""
 
 import sys
 from unittest.mock import patch
@@ -20,14 +20,14 @@ from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg
 scene = sys.modules["simpler_setup.scene_test"]
 
 
-def test_clone_preserves_residency_declarations():
+def test_clone_preserves_child_memory_declarations():
     args = TaskArgsBuilder(TensorArg("x", torch.ones(4), child_memory=True))
     clone = args.clone()
     assert clone.specs[0].child_memory
     assert clone.x.data_ptr() != args.x.data_ptr()
 
 
-def test_builder_add_tensor_accepts_residency():
+def test_builder_add_tensor_accepts_child_memory():
     args = TaskArgsBuilder()
     args.add_tensor("x", torch.ones(4), child_memory=True)
     assert args.specs[0].child_memory
@@ -78,7 +78,7 @@ class FakeWorker:
         ).tensor(shapes, dtype)
 
 
-def test_resident_directions_empty_and_lifo():
+def test_child_memory_directions_empty_and_lifo():
     from simpler.task_interface import ArgDirection as D
 
     args = TaskArgsBuilder(
@@ -89,17 +89,17 @@ def test_resident_directions_empty_and_lifo():
         TensorArg("staged", torch.ones(4)),
     )
     worker = FakeWorker()
-    with scene._resident_l2_args(worker, args, [D.IN, D.INOUT, D.OUT, D.IN, D.IN]) as resident:
+    with scene._child_memory_args(worker, args, [D.IN, D.INOUT, D.OUT, D.IN, D.IN]) as child_args:
         assert len(worker.created) == 3
         assert worker.uploads == worker.created[:2]
         # Zero-shaped wire Tensors are rejected by the existing transport;
         # the owner skips their device allocation and leaves them host-staged.
-        assert "empty" not in resident.tensors
+        assert "empty" not in child_args.tensors
         nonempty = TaskArgsBuilder(*(spec for spec in args.specs if spec.name != "empty"))
-        _chip_args, outputs = scene._build_l2_ref_args(nonempty, [D.IN, D.INOUT, D.OUT, D.IN], worker, resident)
+        _chip_args, outputs = scene._build_l2_ref_args(nonempty, [D.IN, D.INOUT, D.OUT, D.IN], worker, child_args)
         assert outputs == ["y", "z"]
     assert worker.freed == worker.created[::-1]
-    resident.release()
+    child_args.release()
     assert len(worker.freed) == 3
 
 
@@ -107,22 +107,22 @@ def test_build_args_rejects_a_count_the_signature_would_misalign():
     """A skipped empty tensor shifts every later argument, so reject rather than dispatch."""
     from simpler.task_interface import ArgDirection as D
 
-    from simpler_setup.resident_task_args import ResidentTaskArgs
+    from simpler_setup.child_memory_args import ChildMemoryArgs
 
     worker = FakeWorker()
-    with ResidentTaskArgs(worker) as resident:
-        resident.add("x", torch.ones(4), D.IN)
-        resident.add("empty", torch.empty(0), D.IN)
-        assert len(resident.tensors) == 1
-        with pytest.raises(ValueError, match="empty tensor cannot be resident"):
-            resident.build_args(expected_count=2)
-        assert resident.build_args(expected_count=1).tensor_count() == 1
+    with ChildMemoryArgs(worker) as child_args:
+        child_args.add("x", torch.ones(4), D.IN)
+        child_args.add("empty", torch.empty(0), D.IN)
+        assert len(child_args.tensors) == 1
+        with pytest.raises(ValueError, match="empty tensor cannot be child memory"):
+            child_args.build_args(expected_count=2)
+        assert child_args.build_args(expected_count=1).tensor_count() == 1
 
 
 @pytest.mark.parametrize("rounds", [1, 2, 3])
-@pytest.mark.parametrize("resident", [False, True])
+@pytest.mark.parametrize("child_memory", [False, True])
 @pytest.mark.parametrize("skip_golden", [False, True])
-def test_round_state_and_final_copyback(rounds, resident, skip_golden):
+def test_round_state_and_final_copyback(rounds, child_memory, skip_golden):
     from simpler.task_interface import ArgDirection as D
 
     class Case(SceneTestCase):
@@ -131,7 +131,7 @@ def test_round_state_and_final_copyback(rounds, resident, skip_golden):
 
         def generate_args(self, _params):
             self.args = TaskArgsBuilder(
-                TensorArg("state", torch.ones(4), child_memory=resident),
+                TensorArg("state", torch.ones(4), child_memory=child_memory),
                 TensorArg("out", torch.zeros(4)),
             )
             return self.args
@@ -146,7 +146,7 @@ def test_round_state_and_final_copyback(rounds, resident, skip_golden):
     runs = []
 
     def run(*_args, **_kwargs):
-        state = worker.data[worker.created[0].identity] if resident else case.args.state
+        state = worker.data[worker.created[0].identity] if child_memory else case.args.state
         assert torch.equal(case.args.out, torch.zeros(4))
         state.add_(1)
         case.args.out.copy_(state)
@@ -156,10 +156,10 @@ def test_round_state_and_final_copyback(rounds, resident, skip_golden):
     with patch.object(Case, "_build_config", return_value=object()):
         case._run_and_validate_l2(worker, object(), {}, rounds=rounds, skip_golden=skip_golden)
     assert len(runs) == rounds
-    assert torch.equal(runs[-1], torch.full((4,), float(rounds + 1 if resident else 2)))
-    assert len(worker.created) == int(resident)
-    assert len(worker.uploads) == int(resident)
-    assert len(worker.downloads) == int(resident and not skip_golden)
+    assert torch.equal(runs[-1], torch.full((4,), float(rounds + 1 if child_memory else 2)))
+    assert len(worker.created) == int(child_memory)
+    assert len(worker.uploads) == int(child_memory)
+    assert len(worker.downloads) == int(child_memory and not skip_golden)
     assert worker.freed == worker.created
 
 
@@ -169,17 +169,17 @@ def test_partial_construction_and_execution_failure_release():
     args = TaskArgsBuilder(TensorArg("x", torch.ones(4), True), TensorArg("bad", torch.ones(2, 3).T, True))
     worker = FakeWorker()
     with pytest.raises(ValueError, match="contiguous"):
-        scene._resident_l2_args(worker, args, [D.IN, D.IN])
+        scene._child_memory_args(worker, args, [D.IN, D.IN])
     assert worker.freed == worker.created
     assert args.specs[0].value is args.x
     worker = FakeWorker()
     worker.fail_copy = True
     with pytest.raises(RuntimeError, match="copy failed"):
-        scene._resident_l2_args(worker, TaskArgsBuilder(args.specs[0]), [D.IN])
+        scene._child_memory_args(worker, TaskArgsBuilder(args.specs[0]), [D.IN])
     assert worker.freed == worker.created
     worker = FakeWorker()
     with pytest.raises(RuntimeError, match="execution"):
-        with scene._resident_l2_args(worker, TaskArgsBuilder(args.specs[0]), [D.IN]):
+        with scene._child_memory_args(worker, TaskArgsBuilder(args.specs[0]), [D.IN]):
             raise RuntimeError("execution")
     assert worker.freed == worker.created
 
@@ -194,7 +194,7 @@ def test_invalid_direction_and_alias_rejected():
     ]:
         worker = FakeWorker()
         with pytest.raises(ValueError, match=match):
-            scene._resident_l2_args(worker, args, sig)
+            scene._child_memory_args(worker, args, sig)
         assert not worker.created
 
 
@@ -203,19 +203,19 @@ def test_streaming_owner_does_not_retain_weights():
 
     from simpler.task_interface import ArgDirection as D
 
-    from simpler_setup.resident_task_args import ResidentTaskArgs
+    from simpler_setup.child_memory_args import ChildMemoryArgs
 
     worker = FakeWorker()
-    with ResidentTaskArgs(worker) as resident:
+    with ChildMemoryArgs(worker) as child_args:
         weight = torch.ones(4)
         reference = weakref.ref(weight)
-        resident.add("weight", weight, D.IN)
+        child_args.add("weight", weight, D.IN)
         del weight
         assert reference() is None
-        assert resident.build_args().tensor_count() == 1
+        assert child_args.build_args().tensor_count() == 1
 
 
-def test_l3_rejects_residency_before_allocation():
+def test_l3_rejects_child_memory_before_allocation():
     class Case(SceneTestCase):
         CASES = []
 
