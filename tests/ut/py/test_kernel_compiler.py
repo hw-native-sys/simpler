@@ -137,3 +137,42 @@ def test_compile_cache_token_preserves_every_incore_toolchain_token(monkeypatch)
     token = compiler.compile_cache_token("host_build_graph", ["aiv", "aic"])
 
     assert token["incore"] == {"variants": [tokens["aic"], tokens["aiv"]]}
+
+
+@pytest.mark.parametrize("platform", ["a2a3sim", "a5sim"])
+@pytest.mark.parametrize("core_type", ["aic", "aiv"])
+@pytest.mark.parametrize("pto_isa_root", [None, "isa"])
+def test_simulator_ffts_header_is_arch_specific(monkeypatch, tmp_path, platform, core_type, pto_isa_root):
+    from simpler_setup.kernel_compiler import KernelCompiler  # noqa: PLC0415
+
+    compiler = KernelCompiler(platform)
+    source = tmp_path / "kernel.cpp"
+    source.write_text('extern "C" void kernel_entry() {}\n')
+    captured = {}
+
+    def capture_compile(command, *_args, **_kwargs):
+        captured["command"] = command
+        return b"compiled"
+
+    monkeypatch.setattr(compiler, "_compile_to_bytes", capture_compile)
+    assert compiler._compile_incore_sim(str(source), core_type=core_type, pto_isa_root=pto_isa_root) == b"compiled"
+    command = captured["command"]
+    assert ("-include" in command) == (platform == "a2a3sim")
+    assert ("-D__DAV_CUBE__" in command) == (core_type == "aic")
+    assert ("-D__DAV_VEC__" in command) == (core_type == "aiv")
+    if platform == "a2a3sim":
+        assert command[command.index("-include") + 1].endswith("incore/ffts_sim.h")
+
+
+def test_simulator_ffts_header_changes_invalidate_compiled_artifacts(monkeypatch, tmp_path):
+    from simpler_setup.kernel_compiler import KernelCompiler  # noqa: PLC0415
+
+    header = tmp_path / "ffts_sim.h"
+    compiler = KernelCompiler("a2a3sim")
+    monkeypatch.setattr(compiler, "_sim_ffts_header", lambda: header)
+    header.write_text("first implementation")
+    original = compiler.incore_compile_cache_token("aic")
+    header.write_text("second implementation")
+    updated = compiler.incore_compile_cache_token("aic")
+    assert original["sim_ffts"] != updated["sim_ffts"]
+    assert KernelCompiler("a5sim").incore_compile_cache_token("aic")["sim_ffts"] is None

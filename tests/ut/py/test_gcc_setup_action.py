@@ -9,6 +9,7 @@
 
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -493,12 +494,21 @@ def test_scene_tests_request_graphviz(workflow_name: str) -> None:
 
 
 @pytest.mark.parametrize("workflow_name", ["_st-sim-a2a3.yml", "_st-sim-a5.yml"])
-def test_self_cpu_scene_tests_preserve_the_preprovisioned_compiler_contract(tmp_path: Path, workflow_name: str) -> None:
+@pytest.mark.parametrize("has_gcc15", [False, True])
+def test_self_cpu_scene_tests_preserve_the_preprovisioned_compiler_contract(
+    tmp_path: Path, workflow_name: str, has_gcc15: bool
+) -> None:
     bin_dir = tmp_path / "preinstalled-bin"
     bin_dir.mkdir()
+    for command in ("bash", "mkdir", "ln"):
+        command_path = shutil.which(command)
+        assert command_path is not None
+        (bin_dir / command).symlink_to(command_path)
     for command in ("ninja", "dot"):
         _write_command(bin_dir / command)
     _write_command(bin_dir / "g++", 'if [ "${1:-}" = -dumpversion ]; then echo 12.3.0; fi')
+    if has_gcc15:
+        _write_command(bin_dir / "g++-15", 'if [ "${1:-}" = -dumpversion ]; then echo 15.1.0; fi')
 
     runner_temp = tmp_path / "runner-temp"
     runner_temp.mkdir()
@@ -508,7 +518,7 @@ def test_self_cpu_scene_tests_preserve_the_preprovisioned_compiler_contract(tmp_
     env.update(
         {
             "GITHUB_PATH": str(github_path),
-            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            "PATH": str(bin_dir),
             "RUNNER_TEMP": str(runner_temp),
         }
     )
@@ -522,7 +532,12 @@ def test_self_cpu_scene_tests_preserve_the_preprovisioned_compiler_contract(tmp_
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert (runner_temp / "bin/g++-15").resolve() == bin_dir / "g++"
+    if has_gcc15:
+        assert not (runner_temp / "bin/g++-15").exists()
+        assert not github_path.exists()
+    else:
+        assert (runner_temp / "bin/g++-15").resolve() == bin_dir / "g++"
+        assert github_path.read_text().splitlines() == [str(runner_temp / "bin")]
 
 
 @pytest.mark.parametrize("path", (ACTION_PATH, APT_ACTION_PATH, *WORKFLOW_PATHS), ids=lambda path: path.name)

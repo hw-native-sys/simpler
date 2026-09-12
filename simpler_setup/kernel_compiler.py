@@ -361,7 +361,14 @@ class KernelCompiler:
             "core_type": core_type,
             "flags": flags,
             "linker": linker,
+            "sim_ffts": hashlib.sha256(self._sim_ffts_header().read_bytes()).hexdigest()
+            if self.platform == "a2a3sim"
+            else None,
         }
+
+    @staticmethod
+    def _sim_ffts_header() -> Path:
+        return Path(__file__).resolve().parent / "incore" / "ffts_sim.h"
 
     def _run_subprocess(
         self,
@@ -755,6 +762,9 @@ class KernelCompiler:
             pto_include = os.path.join(pto_isa_root, "include")
             pto_pto_include = os.path.join(pto_isa_root, "include", "pto")
             cmd.extend([f"-I{compiler_visible_path(pto_include)}", f"-I{compiler_visible_path(pto_pto_include)}"])
+
+        if self.platform == "a2a3sim":
+            cmd.extend(["-include", str(compiler_visible_path(self._sim_ffts_header()))])
 
         for inc_dir in self.get_incore_include_dirs():
             cmd.append(f"-I{compiler_visible_path(inc_dir)}")
