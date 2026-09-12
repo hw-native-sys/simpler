@@ -9,8 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#ifndef SRC_A2A3_PLATFORM_ONBOARD_HOST_AICPU_TOPOLOGY_PROBE_H_
-#define SRC_A2A3_PLATFORM_ONBOARD_HOST_AICPU_TOPOLOGY_PROBE_H_
+#pragma once
 
 #include <cstdint>
 #include <vector>
@@ -21,6 +20,8 @@ struct AicpuLogicalCpu {
     int32_t cpu_id;
     int32_t cluster_id;
 };
+
+bool resolve_aicpu_cpu_id_base(const char *soc_name, int64_t phy_die_id, int32_t &out_cpu_id_base);
 
 // Probe host-side AICPU OCCUPY and return the user-schedulable cpu_id pool.
 // a2a3 exposes two AICPU clusters per die, four logical cpu_ids per cluster;
@@ -36,5 +37,3 @@ bool compute_allowed_cpus(
 );
 
 }  // namespace pto::a2a3
-
-#endif  // SRC_A2A3_PLATFORM_ONBOARD_HOST_AICPU_TOPOLOGY_PROBE_H_

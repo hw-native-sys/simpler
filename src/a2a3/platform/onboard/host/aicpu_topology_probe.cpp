@@ -14,6 +14,7 @@
 #include <dlfcn.h>
 
 #include <algorithm>
+#include <cstring>
 #include <mutex>
 #include <unordered_map>
 
@@ -28,7 +29,11 @@ namespace {
 // driver/ascend_hal.h — replicated here to keep the runtime .so free of a
 // CANN header dependency (see tools/cann-examples/query for the reference use).
 constexpr int32_t kModuleAicpu = 1;
+constexpr int32_t kModuleSystem = 0;
 constexpr int32_t kInfoOccupy = 8;
+constexpr int32_t kInfoPhyDieId = 19;
+constexpr char kA2SocPrefix[] = "Ascend910B";
+constexpr char kA3SocPrefix[] = "Ascend910_93";
 // a2a3 AICPU has NO SMT: each logical cpu_id maps 1:1 to a physical core, so
 // the cluster can be derived arithmetically from cpu_id alone (no DSMI CPU_TOPO
 // probe is needed, unlike a5). 8 cores/die, 4 cores/cluster ⇒ 2 clusters/die.
@@ -36,6 +41,11 @@ constexpr int32_t kAicpuCoresPerDie = 8;
 constexpr int32_t kCpusPerCluster = 4;
 
 using HalGetDeviceInfoFn = int (*)(uint64_t deviceId, int32_t moduleType, int32_t infoType, int64_t *value);
+using AclrtGetSocNameFn = const char *(*)();
+
+bool has_soc_prefix(const char *soc_name, const char *prefix) {
+    return soc_name != nullptr && std::strncmp(soc_name, prefix, std::strlen(prefix)) == 0;
+}
 
 HalGetDeviceInfoFn load_hal_get_device_info() {
     static HalGetDeviceInfoFn cached_fn = []() -> HalGetDeviceInfoFn {
@@ -71,6 +81,29 @@ bool query_occupy(uint32_t device_id, uint64_t &out_mask) {
     return true;
 }
 
+const char *query_soc_name() {
+    auto fn = reinterpret_cast<AclrtGetSocNameFn>(dlsym(nullptr, "aclrtGetSocName"));
+    if (fn == nullptr) {
+        LOG_WARN("a2a3_aicpu_topology_probe: aclrtGetSocName not found via dlsym");
+        return nullptr;
+    }
+    return fn();
+}
+
+bool query_phy_die_id(uint32_t device_id, int64_t &out_phy_die_id) {
+    auto fn = load_hal_get_device_info();
+    if (fn == nullptr) return false;
+
+    int64_t value = -1;
+    int rc = fn(static_cast<uint64_t>(pto::acl_to_hal_device_id(device_id)), kModuleSystem, kInfoPhyDieId, &value);
+    if (rc != 0) {
+        LOG_WARN("a2a3_aicpu_topology_probe: halGetDeviceInfo(SYSTEM,PHY_DIE_ID) rc=%d", rc);
+        return false;
+    }
+    out_phy_die_id = value;
+    return true;
+}
+
 std::mutex s_topo_cache_mu;
 std::unordered_map<uint32_t, std::vector<AicpuLogicalCpu>> s_topo_cache;
 
@@ -80,11 +113,20 @@ bool probe_aicpu_topology_uncached(uint32_t device_id, std::vector<AicpuLogicalC
     uint64_t occupy = 0;
     if (!query_occupy(device_id, occupy)) return false;
 
-    for (int32_t cpu_id = 0; cpu_id < 64; ++cpu_id) {
-        if (((occupy >> cpu_id) & 1ULL) == 0) continue;
+    const char *soc_name = query_soc_name();
+    if (soc_name == nullptr) return false;
+
+    int64_t phy_die_id = 0;
+    if (has_soc_prefix(soc_name, kA3SocPrefix) && !query_phy_die_id(device_id, phy_die_id)) return false;
+
+    int32_t cpu_id_base = 0;
+    if (!resolve_aicpu_cpu_id_base(soc_name, phy_die_id, cpu_id_base)) return false;
+
+    for (int32_t local_cpu_id = 0; local_cpu_id < kAicpuCoresPerDie; ++local_cpu_id) {
+        if (((occupy >> local_cpu_id) & 1ULL) == 0) continue;
         AicpuLogicalCpu e{};
-        e.cpu_id = cpu_id;
-        e.cluster_id = (cpu_id % kAicpuCoresPerDie) / kCpusPerCluster;
+        e.cpu_id = cpu_id_base + local_cpu_id;
+        e.cluster_id = local_cpu_id / kCpusPerCluster;
         out_user_cpus.push_back(e);
     }
 
@@ -95,6 +137,25 @@ bool probe_aicpu_topology_uncached(uint32_t device_id, std::vector<AicpuLogicalC
 }
 
 }  // namespace
+
+bool resolve_aicpu_cpu_id_base(const char *soc_name, int64_t phy_die_id, int32_t &out_cpu_id_base) {
+    out_cpu_id_base = 0;
+    if (soc_name == nullptr) {
+        LOG_WARN("%s", "a2a3_aicpu_topology_probe: SoC name is unavailable");
+        return false;
+    }
+    if (has_soc_prefix(soc_name, kA2SocPrefix)) return true;
+    if (!has_soc_prefix(soc_name, kA3SocPrefix)) {
+        LOG_WARN("a2a3_aicpu_topology_probe: unsupported SoC name %s", soc_name);
+        return false;
+    }
+    if (phy_die_id < 0 || phy_die_id > 1) {
+        LOG_WARN("a2a3_aicpu_topology_probe: invalid A3 PHY_DIE_ID %lld", static_cast<long long>(phy_die_id));
+        return false;
+    }
+    out_cpu_id_base = static_cast<int32_t>(phy_die_id) * kAicpuCoresPerDie;
+    return true;
+}
 
 bool probe_aicpu_topology(uint32_t device_id, std::vector<AicpuLogicalCpu> &out_user_cpus) {
     {

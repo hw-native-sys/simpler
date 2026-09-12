@@ -45,6 +45,7 @@ void unified_log_debug(const char *, const char *, ...) {}
 
 using pto::a2a3::AicpuLogicalCpu;
 using pto::a2a3::compute_allowed_cpus;
+using pto::a2a3::resolve_aicpu_cpu_id_base;
 
 namespace {
 
@@ -79,6 +80,35 @@ TEST(A2a3AffinitySelect, HbgThreeThreadsLandInOneCluster) {
     const int32_t c = cluster_of(allowed[0]);
     for (int32_t id : allowed)
         EXPECT_EQ(cluster_of(id), c) << "cpu " << id << " crossed a cluster";
+}
+
+TEST(A2a3AffinitySelect, A2UsesDieLocalCpuIds) {
+    int32_t base = -1;
+    ASSERT_TRUE(resolve_aicpu_cpu_id_base("Ascend910B3", /*phy_die_id=*/-1, base));
+    EXPECT_EQ(base, 0);
+}
+
+TEST(A2a3AffinitySelect, A3OffsetsTheSecondDieInTheSharedAicpuOs) {
+    int32_t die0_base = -1;
+    int32_t die1_base = -1;
+    ASSERT_TRUE(resolve_aicpu_cpu_id_base("Ascend910_9392", /*phy_die_id=*/0, die0_base));
+    ASSERT_TRUE(resolve_aicpu_cpu_id_base("Ascend910_9392", /*phy_die_id=*/1, die1_base));
+    EXPECT_EQ(die0_base, 0);
+    EXPECT_EQ(die1_base, 8);
+
+    auto die1_pool = standard_pool();
+    for (auto &entry : die1_pool)
+        entry.cpu_id += die1_base;
+    std::vector<int32_t> allowed;
+    ASSERT_TRUE(compute_allowed_cpus(die1_pool, /*active_count=*/4, allowed));
+    EXPECT_EQ(allowed, (std::vector<int32_t>{12, 13, 14, 15}));
+}
+
+TEST(A2a3AffinitySelect, RejectsUnknownSocAndInvalidA3Die) {
+    int32_t base = -1;
+    EXPECT_FALSE(resolve_aicpu_cpu_id_base(nullptr, /*phy_die_id=*/0, base));
+    EXPECT_FALSE(resolve_aicpu_cpu_id_base("Ascend950PR_9599", /*phy_die_id=*/0, base));
+    EXPECT_FALSE(resolve_aicpu_cpu_id_base("Ascend910_9392", /*phy_die_id=*/2, base));
 }
 
 // Selection is a pure function of its input — repeated calls are identical.
