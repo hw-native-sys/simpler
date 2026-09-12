@@ -20,6 +20,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -253,6 +254,14 @@ void ChipWorker::init(
         comm_global_domain_release_fn_ = load_symbol<CommGlobalDomainReleaseFn>(handle, "comm_global_domain_release");
         comm_barrier_fn_ = load_symbol<CommBarrierFn>(handle, "comm_barrier");
         comm_destroy_fn_ = load_symbol<CommDestroyFn>(handle, "comm_destroy");
+        // Kernel-mode lifecycle entries are part of the uniform host_runtime.so
+        // ABI like the ACL/comm group above: every runtime exports them, and
+        // variants without kernel-mode support ship validating stubs.
+        kernel_supported_fn_ = load_symbol<SimplerKernelSupportedFn>(handle, "simpler_kernel_mode_supported");
+        kernel_init_fn_ = load_symbol<SimplerKernelInitFn>(handle, "simpler_kernel_mode_init");
+        kernel_prepare_callable_fn_ =
+            load_symbol<SimplerKernelPrepareCallableFn>(handle, "simpler_kernel_mode_prepare_callable");
+        kernel_launch_fn_ = load_symbol<SimplerKernelLaunchFn>(handle, "simpler_kernel_mode_launch");
     } catch (...) {
         throw;
     }
@@ -380,6 +389,10 @@ void ChipWorker::init(
         comm_global_domain_release_fn_ = nullptr;
         comm_barrier_fn_ = nullptr;
         comm_destroy_fn_ = nullptr;
+        kernel_supported_fn_ = nullptr;
+        kernel_init_fn_ = nullptr;
+        kernel_prepare_callable_fn_ = nullptr;
+        kernel_launch_fn_ = nullptr;
         runtime_bufs_.clear();
         throw;
     }
@@ -439,6 +452,10 @@ void ChipWorker::init(
         comm_global_domain_release_fn_ = nullptr;
         comm_barrier_fn_ = nullptr;
         comm_destroy_fn_ = nullptr;
+        kernel_supported_fn_ = nullptr;
+        kernel_init_fn_ = nullptr;
+        kernel_prepare_callable_fn_ = nullptr;
+        kernel_launch_fn_ = nullptr;
         runtime_bufs_.clear();
         throw std::runtime_error("simpler_init failed with code " + std::to_string(init_rc));
     }
@@ -478,8 +495,20 @@ void ChipWorker::finalize() {
     // communicator handles and streams before tearing down the device context.
     clear_comm_sessions();
 
+    int device_finalize_rc = 0;
     if (device_ctx_ != nullptr && finalize_device_fn_ != nullptr && initialized_) {
-        finalize_device_fn_(device_ctx_);
+        device_finalize_rc = finalize_device_fn_(device_ctx_);
+    }
+    // A context whose teardown did not complete still owns device resources,
+    // and unloading the library that owns their release routines — or
+    // destroying the context that holds them — is unrecoverable. Both the
+    // context and the handle stay, so an explicit retry can finish the job.
+    if (device_finalize_rc != 0) {
+        std::fprintf(
+            stderr, "ChipWorker::finalize: device teardown failed (%d); keeping the context and host runtime loaded\n",
+            device_finalize_rc
+        );
+        return;
     }
     if (device_ctx_ != nullptr && destroy_device_context_fn_ != nullptr) {
         destroy_device_context_fn_(device_ctx_);
@@ -529,6 +558,10 @@ void ChipWorker::finalize() {
     comm_global_domain_release_fn_ = nullptr;
     comm_barrier_fn_ = nullptr;
     comm_destroy_fn_ = nullptr;
+    kernel_supported_fn_ = nullptr;
+    kernel_init_fn_ = nullptr;
+    kernel_prepare_callable_fn_ = nullptr;
+    kernel_launch_fn_ = nullptr;
     runtime_bufs_.clear();
     pipeline_generations_.reset();
     pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 1, {}};
