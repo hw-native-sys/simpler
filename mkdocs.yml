@@ -131,6 +131,7 @@ nav:
       - TPUSH/TPOP: tpush-tpop.md
   - Launch and linking:
       - AICPU Kernel Launch: aicpu-kernel-launch-mechanisms.md
+      - Kernel Launch Binder: kernel-launch-binder.md
       - Dynamic Linking: dynamic-linking.md
       - Callable Identity: callable-identity-registration.md
       - Callable IPC Registration: callable-ipc-dynamic-register.md
