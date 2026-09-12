@@ -584,11 +584,11 @@ def _child_memory_args(worker, test_args, signature):
     may not alias any other argument's storage: independent device buffers
     cannot preserve an overlap the orchestrator would otherwise see.
     """
-    from simpler_setup.child_memory_args import ChildMemoryArgs  # noqa: PLC0415
+    from simpler_setup.child_memory_task_args import ChildMemoryTaskArgs  # noqa: PLC0415
 
     specs = [spec for spec in test_args.specs if isinstance(spec, TensorArg)]
     if not any(spec.child_memory for spec in specs):
-        return ChildMemoryArgs(worker)
+        return ChildMemoryTaskArgs(worker)
     if len(specs) != len(signature):
         raise ValueError("TensorArg count must match the orchestration signature")
     ranges = []
@@ -604,7 +604,7 @@ def _child_memory_args(worker, test_args, signature):
                 if (spec.child_memory or other.child_memory) and lo < end and start < hi:
                     raise ValueError(f"Child-memory tensors cannot alias: {spec.name!r}, {other.name!r}")
             ranges.append((spec, lo, hi))
-    child_args = ChildMemoryArgs(worker)
+    child_args = ChildMemoryTaskArgs(worker)
     try:
         for spec, direction in zip(specs, signature):
             if spec.child_memory:

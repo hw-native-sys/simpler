@@ -931,11 +931,11 @@ Declarations currently require L2, contiguous CPU fixtures, and non-overlapping
 storage. Empty fixtures allocate no device buffer; the existing transport
 still rejects zero-shaped Tensor arguments. Clone and rehost operations preserve
 declaration metadata. Streaming drivers can use
-`simpler_setup.child_memory_args.ChildMemoryArgs` as a context manager and add
+`simpler_setup.child_memory_task_args.ChildMemoryTaskArgs` as a context manager and add
 one fixture at a time, so each large fixture can be released before the next is
 materialized.
 
 The HBG `paged_attention_unroll_manual_scope` examples include matched manual
-`ChildMemory_False` and `ChildMemory_True` cases. The latter leaves
+`HostStaged` and `ChildMemory` cases. The latter leaves
 `context_lens` and `block_table` host-staged because the orchestration reads
 them. Existing default cases retain host staging.

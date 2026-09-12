@@ -15,7 +15,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-class ChildMemoryArgs:
+class ChildMemoryTaskArgs:
     """Own fixed device addresses until release; upload each input exactly once.
 
     ``add`` consumes one CPU contiguous fixture at a time, so a streaming driver

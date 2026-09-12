@@ -94,9 +94,11 @@ class TestPagedAttentionUnrollManualScopeHostBuildGraph(SceneTestCase):
         },
     ]
 
+    # Matched A/B for the child_memory declaration: same workload, same fixtures,
+    # only the memory policy differs.
     CASES += [
         {
-            "name": f"ChildMemory_{child_memory}",
+            "name": name,
             "platforms": ["a5"],
             "manual": True,
             "params": {
@@ -111,7 +113,7 @@ class TestPagedAttentionUnrollManualScopeHostBuildGraph(SceneTestCase):
                 "child_memory": child_memory,
             },
         }
-        for child_memory in (False, True)
+        for name, child_memory in (("HostStaged", False), ("ChildMemory", True))
     ]
 
     def generate_args(self, params):

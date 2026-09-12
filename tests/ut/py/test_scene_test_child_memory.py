@@ -107,10 +107,10 @@ def test_build_args_rejects_a_count_the_signature_would_misalign():
     """A skipped empty tensor shifts every later argument, so reject rather than dispatch."""
     from simpler.task_interface import ArgDirection as D
 
-    from simpler_setup.child_memory_args import ChildMemoryArgs
+    from simpler_setup.child_memory_task_args import ChildMemoryTaskArgs
 
     worker = FakeWorker()
-    with ChildMemoryArgs(worker) as child_args:
+    with ChildMemoryTaskArgs(worker) as child_args:
         child_args.add("x", torch.ones(4), D.IN)
         child_args.add("empty", torch.empty(0), D.IN)
         assert len(child_args.tensors) == 1
@@ -203,10 +203,10 @@ def test_streaming_owner_does_not_retain_weights():
 
     from simpler.task_interface import ArgDirection as D
 
-    from simpler_setup.child_memory_args import ChildMemoryArgs
+    from simpler_setup.child_memory_task_args import ChildMemoryTaskArgs
 
     worker = FakeWorker()
-    with ChildMemoryArgs(worker) as child_args:
+    with ChildMemoryTaskArgs(worker) as child_args:
         weight = torch.ones(4)
         reference = weakref.ref(weight)
         child_args.add("weight", weight, D.IN)

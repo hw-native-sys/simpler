@@ -48,7 +48,7 @@ from simpler.task_interface import CallConfig
 from simpler.worker import Worker
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, scene_test
-from simpler_setup.child_memory_args import ChildMemoryArgs
+from simpler_setup.child_memory_task_args import ChildMemoryTaskArgs
 from simpler_setup.compile_pool import compile_worker_budget
 from simpler_setup.goldens.qwen3_14b_decode import (
     N_LAYERS,
@@ -627,7 +627,7 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
     worker = Worker(level=2, platform=platform, runtime=runtime, device_id=device_id)
     chip_handle = worker.register(chip)
     worker.init()
-    child_args = ChildMemoryArgs(worker)
+    child_args = ChildMemoryTaskArgs(worker)
     try:
         golden = None
         if skip_golden:
