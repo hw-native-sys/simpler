@@ -288,18 +288,9 @@ int DeviceRunner::prepare_execution(
         }
     }
 
-    // Build the profiling-flag bitfield (a2a3 carries an extra dep_gen bit).
-    uint32_t enable_profiling_flag = SIMPLER_DFX_FLAG_NONE;
-    if (dfx.dump_args_enabled()) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS);
-    if (dfx.chip_swimlane_enabled()) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
-    if (dfx.pmu_enabled) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_PMU);
-    // The device flag drives the AICPU writer only; a host-orch runtime has no
-    // device-side dep_gen to switch on.
-    if (dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
-        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DEP_GEN);
-    }
-    if (dfx.scope_stats_enabled) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_SCOPE_STATS);
-    execution->kernel_args.args.enable_profiling_flag = enable_profiling_flag;
+    // The AICore-visible half of this — the profiling flag and the swimlane /
+    // PMU ring tables — is built by `arm_collectors_for_run` at launch and
+    // reaches the device through a refreshed KernelArgs copy.
 
     resolve_task_binary_addrs(runtime);
 
@@ -353,62 +344,6 @@ int DeviceRunner::prepare_execution(
             "A2A3 AICPU ALLOWED_CPUS = [%s] (active=%d, launch=%d, user_cpus=%zu)", dump.c_str(),
             runtime.get_aicpu_thread_num(), runtime.get_aicpu_launch_count(), user_cpus.size()
         );
-    }
-
-    // Initialize per-subsystem shared memory.
-    //
-    // Collectors stay initialized across runs, so pools built for an earlier
-    // run's core / AICPU-thread counts have to go before this run seeds pools
-    // and recycled lanes at different ones.
-    if (collector_shape_is_stale(num_aicore, runtime.get_aicpu_thread_num(), launch_aicpu_num)) {
-        finalize_collectors();
-    }
-    latch_collector_shape(num_aicore, runtime.get_aicpu_thread_num(), launch_aicpu_num);
-
-    if (dfx.chip_swimlane_enabled()) {
-        rc = init_chip_swimlane(
-            num_aicore, runtime.get_aicpu_thread_num(), device_id_, execution->kernel_args, dfx.chip_swimlane_level
-        );
-        if (rc != 0) {
-            LOG_ERROR("init_chip_swimlane failed: %d", rc);
-            return rc;
-        }
-    }
-
-    if (dfx.dump_args_enabled()) {
-        // Initialize args dump (independent from profiling)
-        rc = init_args_dump(runtime, device_id_, execution->kernel_args, dfx.dump_args_level);
-        if (rc != 0) {
-            LOG_ERROR("init_args_dump failed: %d", rc);
-            return rc;
-        }
-    }
-
-    if (dfx.pmu_enabled) {
-        rc = init_pmu(num_aicore, launch_aicpu_num, device_id_, execution->kernel_args);
-        if (rc != 0) {
-            LOG_ERROR("init_pmu failed: %d", rc);
-            return rc;
-        }
-    }
-
-    // A host-orch runtime already holds the graph in host memory; standing up
-    // the device ring and its collector would allocate shared memory and a
-    // drain thread for a stream that never produces a record.
-    if (dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
-        rc = init_dep_gen(launch_aicpu_num, device_id_, execution->kernel_args);
-        if (rc != 0) {
-            LOG_ERROR("init_dep_gen failed: %d", rc);
-            return rc;
-        }
-    }
-
-    if (dfx.scope_stats_enabled) {
-        rc = init_scope_stats(launch_aicpu_num, device_id_, execution->kernel_args);
-        if (rc != 0) {
-            LOG_ERROR("init_scope_stats failed: %d", rc);
-            return rc;
-        }
     }
 
     // Resolve the orchestration SO into a device-resident buffer and refresh
@@ -617,6 +552,7 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
             try {
                 activate_launch_shape(runtime);
                 (void)arm_device_wall_buffer(prepared.kernel_args);
+                if (int arm_rc = arm_collectors_for_run(runtime, prepared); arm_rc != 0) return arm_rc;
                 start_shared_collectors_for_run(prepared.dfx);
                 if (prepared.dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
                     auto thread_factory = [this](std::function<void()> fn) {
@@ -1135,6 +1071,98 @@ int DeviceRunner::finalize() {
 }
 
 // `launch_aicpu_kernel` and `launch_aicore_kernel` live on `DeviceRunnerBase`.
+
+int DeviceRunner::arm_collectors_for_run(Runtime &runtime, PreparedExecution &prepared) {
+    DfxRunConfig &dfx = prepared.dfx;
+    const int num_aicore = prepared.num_aicore;
+    const int launch_aicpu_num = prepared.launch_aicpu_num;
+    const int aicpu_thread_num = runtime.get_aicpu_thread_num();
+
+    // Collectors stay initialized across runs, so pools built for an earlier
+    // run's core / AICPU-thread counts have to go before this run seeds pools
+    // and recycled lanes at different ones. Releasing them frees device memory
+    // the collectors hold, which is only safe while no other run is executing
+    // against them — so the whole block runs here, where this run holds the
+    // execution claim, rather than during its preparation.
+    if (collector_shape_is_stale(num_aicore, aicpu_thread_num, launch_aicpu_num)) {
+        finalize_collectors();
+    }
+    latch_collector_shape(num_aicore, aicpu_thread_num, launch_aicpu_num);
+
+    int rc = 0;
+    if (dfx.chip_swimlane_enabled()) {
+        rc =
+            init_chip_swimlane(num_aicore, aicpu_thread_num, device_id_, prepared.kernel_args, dfx.chip_swimlane_level);
+        if (rc != 0) {
+            LOG_ERROR("init_chip_swimlane failed: %d", rc);
+            return rc;
+        }
+    }
+
+    if (dfx.dump_args_enabled()) {
+        rc = init_args_dump(runtime, device_id_, prepared.kernel_args, dfx.dump_args_level);
+        if (rc != 0) {
+            LOG_ERROR("init_args_dump failed: %d", rc);
+            return rc;
+        }
+    }
+
+    if (dfx.pmu_enabled) {
+        rc = init_pmu(num_aicore, launch_aicpu_num, device_id_, prepared.kernel_args);
+        if (rc != 0) {
+            LOG_ERROR("init_pmu failed: %d", rc);
+            return rc;
+        }
+    }
+
+    // A host-orch runtime already holds the graph in host memory; standing up
+    // the device ring and its collector would allocate shared memory and a
+    // drain thread for a stream that never produces a record.
+    if (dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
+        rc = init_dep_gen(launch_aicpu_num, device_id_, prepared.kernel_args);
+        if (rc != 0) {
+            LOG_ERROR("init_dep_gen failed: %d", rc);
+            return rc;
+        }
+    }
+
+    if (dfx.scope_stats_enabled) {
+        rc = init_scope_stats(launch_aicpu_num, device_id_, prepared.kernel_args);
+        if (rc != 0) {
+            LOG_ERROR("init_scope_stats failed: %d", rc);
+            return rc;
+        }
+    }
+
+    // Built here rather than during preparation because the dep_gen bit depends
+    // on the same host-orch check the init above makes, and because a run that
+    // degrades a channel must not ship a flag that still advertises it.
+    // a2a3 carries an extra dep_gen bit.
+    uint32_t enable_profiling_flag = SIMPLER_DFX_FLAG_NONE;
+    if (dfx.dump_args_enabled()) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS);
+    if (dfx.chip_swimlane_enabled()) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
+    if (dfx.pmu_enabled) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_PMU);
+    // The device flag drives the AICPU writer only; a host-orch runtime has no
+    // device-side dep_gen to switch on.
+    if (dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
+        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DEP_GEN);
+    }
+    if (dfx.scope_stats_enabled) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_SCOPE_STATS);
+    prepared.kernel_args.args.enable_profiling_flag = enable_profiling_flag;
+
+    // AICore's KERNEL_ENTRY reads the profiling flag and the swimlane / PMU ring
+    // tables out of the device copy of KernelArgs, and prepare uploaded that copy
+    // before any of the above ran. The AICPU side needs no refresh: it receives
+    // the host-side struct as the launch argument blob.
+    if (dfx.diagnostics_any()) {
+        rc = prepared.kernel_args.init_device_kernel_args(mem_alloc_);
+        if (rc != 0) {
+            LOG_ERROR("KernelArgs refresh after collector arming failed: %d", rc);
+            return rc;
+        }
+    }
+    return 0;
+}
 
 int DeviceRunner::init_chip_swimlane(
     int num_aicore, int aicpu_thread_num, int device_id, KernelArgsHelper &kernel_args,

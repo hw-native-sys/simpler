@@ -56,6 +56,14 @@ private:
     void unload_executor_binaries();
     void cleanup_active_run() noexcept;
 
+    /**
+     * Build this run's collector pools and profiling flag under the execution
+     * claim, before the arming below publishes their bases to the simulated
+     * device. Mirrors the onboard runner, where the claim is what keeps a
+     * shape-driven pool release off a live predecessor.
+     */
+    int arm_collectors_for_run(Runtime &runtime, PreparedExecution &prepared);
+
     int init_chip_swimlane(int num_aicore, int aicpu_thread_num, int device_id, ChipSwimlaneLevel chip_swimlane_level);
     int init_args_dump(Runtime &runtime, int device_id, DumpArgsLevel dump_args_level);
     int init_pmu(int num_cores, int num_threads, int device_id);

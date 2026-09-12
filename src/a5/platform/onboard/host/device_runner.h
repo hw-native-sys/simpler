@@ -253,6 +253,17 @@ private:
      * @param device_id Device ID
      * @return 0 on success, error code on failure
      */
+    /**
+     * Build this run's collector pools, profiling flag and device KernelArgs
+     * refresh, under the execution claim.
+     *
+     * The collectors are resident and shared by every run on this runner, and a
+     * run whose core / AICPU-thread counts differ from the pools' releases and
+     * rebuilds them. Neither is safe while another run is executing against
+     * them, which is why none of it happens during preparation.
+     */
+    int arm_collectors_for_run(Runtime &runtime, PreparedExecution &prepared);
+
     int init_chip_swimlane(
         int num_aicore, int aicpu_thread_num, int device_id, KernelArgsHelper &kernel_args,
         ChipSwimlaneLevel chip_swimlane_level
