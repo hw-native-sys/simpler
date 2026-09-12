@@ -1076,7 +1076,7 @@ int DeviceRunner::finalize() {
 // `launch_aicpu_kernel` and `launch_aicore_kernel` live on `DeviceRunnerBase`.
 
 int DeviceRunner::arm_collectors_for_run(Runtime &runtime, PreparedExecution &prepared) {
-    DfxRunConfig &dfx = prepared.dfx;
+    const DfxRunConfig &dfx = prepared.dfx;
     const int num_aicore = prepared.num_aicore;
     const int launch_aicpu_num = prepared.launch_aicpu_num;
     const int aicpu_thread_num = runtime.get_aicpu_thread_num();
