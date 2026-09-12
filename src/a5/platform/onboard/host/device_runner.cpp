@@ -969,7 +969,7 @@ void DeviceRunner::finalize_collectors(bool abandon_device_resources) {
 }
 
 int DeviceRunner::arm_collectors_for_run(Runtime &runtime, PreparedExecution &prepared) {
-    DfxRunConfig &dfx = prepared.dfx;
+    const DfxRunConfig &dfx = prepared.dfx;
     const int num_aicore = prepared.num_aicore;
     const int active_aicpu_num = prepared.launch_aicpu_num;
     const int aicpu_thread_num = runtime.get_aicpu_thread_num();
@@ -1012,12 +1012,8 @@ int DeviceRunner::arm_collectors_for_run(Runtime &runtime, PreparedExecution &pr
     if (dfx.pmu_enabled) {
         rc = init_pmu(num_aicore, active_aicpu_num, device_id_, prepared.kernel_args);
         if (rc != 0) {
-            LOG_ERROR("PMU init failed: %d, disabling PMU for this run", rc);
-            prepared.kernel_args.args.pmu_data_base = 0;
-            // Recorded on this run's own configuration, which the profiling flag
-            // below and the teardown both read. a2a3 fails the whole run on the
-            // same error instead of degrading it.
-            dfx.pmu_enabled = false;
+            LOG_ERROR("init_pmu failed: %d", rc);
+            return rc;
         }
     }
 
