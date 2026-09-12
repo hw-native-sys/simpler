@@ -23,7 +23,7 @@
  * host can only replay a ring of captured submits.
  *
  * Capture surface:
- *   begin_capture()         — once per orchestration, from run_host_orchestration
+ *   begin_capture()         — once per orchestration, from simpler::hbg::build_graph
  *   begin_task()            — one per submit, before its dependency steps
  *   add_explicit_edge()     — STEP 1, per declared dependency
  *   add_creator_edge()      — STEP 3 Step A, per creator-retention producer

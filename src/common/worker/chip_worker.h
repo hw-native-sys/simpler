@@ -296,6 +296,10 @@ private:
     using CommGlobalDomainReleaseFn = int (*)(uint64_t);
     using CommBarrierFn = int (*)(void *);
     using CommDestroyFn = int (*)(void *);
+    using KernelSupportedFn = decltype(&simpler_kernel_mode_supported);
+    using KernelInitFn = decltype(&simpler_kernel_mode_init);
+    using KernelPrepareCallableFn = decltype(&simpler_kernel_mode_prepare_callable);
+    using KernelLaunchFn = decltype(&simpler_kernel_mode_launch);
 
     struct CommSession {
         void *handle = nullptr;
@@ -356,6 +360,10 @@ private:
     CommGlobalDomainReleaseFn comm_global_domain_release_fn_ = nullptr;
     CommBarrierFn comm_barrier_fn_ = nullptr;
     CommDestroyFn comm_destroy_fn_ = nullptr;
+    KernelSupportedFn kernel_supported_fn_ = nullptr;
+    KernelInitFn kernel_init_fn_ = nullptr;
+    KernelPrepareCallableFn kernel_prepare_callable_fn_ = nullptr;
+    KernelLaunchFn kernel_launch_fn_ = nullptr;
     void *device_ctx_ = nullptr;
     std::vector<CommSession> comm_sessions_;
     std::unordered_map<uint64_t, size_t> comm_session_index_;
