@@ -25,9 +25,6 @@
 #include <cstdint>
 #include <thread>
 #include <vector>
-#include <cstring>
-#include <limits>
-#include "task_interface/task_args.h"
 
 #include "common/host_api.h"
 #include "host_build_graph/host_tensor_access.h"
@@ -62,18 +59,8 @@ void *record_register(void *, void *, size_t) {
 
 void record_unregister(void *, void *dev_ptr) { g_unregistered.push_back(dev_ptr); }
 
-int g_download_result = 0;
-int g_download_count = 0;
-int copy_from_memory(void *, void *host, const void *device, size_t bytes) {
-    ++g_download_count;
-    if (g_download_result) return g_download_result;
-    std::memcpy(host, device, bytes);
-    return 0;
-}
-
 const HostApiOps kHostApiOps{
     .copy_to_device = record_copy,
-    .copy_from_device = copy_from_memory,
     .register_device_memory_to_host = record_register,
     .unregister_device_memory_from_host = record_unregister,
 };
@@ -87,8 +74,6 @@ protected:
         g_registered_view = nullptr;
         g_register_count = 0;
         g_copy_result = 0;
-        g_download_result = 0;
-        g_download_count = 0;
     }
 };
 
@@ -328,78 +313,6 @@ TEST_F(HostTensorAccessTest, EmptyOrNullFallbackRegionIsRejected) {
     HostTensorAccessor accessor(&kHostApi);
     EXPECT_FALSE(accessor.add(kFakeDeviceBase, 0, mirror));
     EXPECT_FALSE(accessor.add(kFakeDeviceBase, sizeof(mirror), nullptr));
-}
-
-TEST_F(HostTensorAccessTest, ResidentInoutRefreshesEveryBindAndWritesBack) {
-    int32_t device[4] = {1, 2, 3, 4};
-    int32_t host[4] = {};
-    uint32_t shape[] = {4}, stride[] = {1};
-    auto tensor = make_tensor_strided(device, shape, stride, 1, DataType::INT32, AddressSpace::DEVICE);
-    for (int round = 0; round < 2; ++round) {
-        device[0] += 10;
-        HostTensorAccessor accessor(&kHostApi);
-        ASSERT_TRUE(accessor.add_resident(tensor, ArgDirection::INOUT, reinterpret_cast<uint64_t>(host), sizeof(host)));
-        int32_t actual = 0;
-        ASSERT_TRUE(accessor.read(tensor.buffer.addr, &actual, sizeof(actual)));
-        EXPECT_EQ(actual, device[0]);
-        int32_t update = 99;
-        ASSERT_TRUE(accessor.write(tensor.buffer.addr + sizeof(int32_t), &update, sizeof(update)));
-        EXPECT_EQ(host[1], update);
-        EXPECT_EQ(g_copies.back().dev_ptr, &device[1]);
-    }
-    EXPECT_EQ(g_download_count, 2);
-}
-
-TEST_F(HostTensorAccessTest, ResidentViewChecksSpanBeforeCopyAndPropagatesFailure) {
-    int32_t device[12] = {}, host[12] = {};
-    uint32_t shape[] = {2, 3}, stride[] = {5, 1};
-    auto tensor = make_tensor_strided(device, shape, stride, 2, DataType::INT32, AddressSpace::DEVICE);
-    EXPECT_EQ(tensor.nbytes(), 24u);
-    size_t span = 0;
-    ASSERT_TRUE(host_tensor_span(tensor, &span));
-    EXPECT_EQ(span, 32u);
-    HostTensorAccessor accessor(&kHostApi);
-    EXPECT_FALSE(accessor.add_resident(tensor, ArgDirection::INOUT, reinterpret_cast<uint64_t>(host), 24));
-    EXPECT_EQ(g_download_count, 0);
-    EXPECT_FALSE(accessor.add_resident(tensor, ArgDirection::OUT, reinterpret_cast<uint64_t>(host), sizeof(host)));
-    g_download_result = -1;
-    EXPECT_FALSE(accessor.add_resident(tensor, ArgDirection::INOUT, reinterpret_cast<uint64_t>(host), sizeof(host)));
-    int32_t untouched = 42;
-    EXPECT_FALSE(accessor.read(tensor.buffer.addr, &untouched, sizeof(untouched)));
-    EXPECT_EQ(untouched, 42);
-    EXPECT_TRUE(accessor.add_resident(tensor, ArgDirection::IN, reinterpret_cast<uint64_t>(host), sizeof(host)));
-    EXPECT_EQ(g_download_count, 1);
-    EXPECT_TRUE(accessor.read(tensor.buffer.addr + 28, &untouched, 4));
-    EXPECT_FALSE(accessor.read(tensor.buffer.addr + 32, &untouched, 4));
-    g_copy_result = -1;
-    EXPECT_FALSE(accessor.write(tensor.buffer.addr, &untouched, 4));
-    tensor.start_offset = 2;
-    tensor.buffer.size = sizeof(device);
-    ASSERT_TRUE(host_tensor_span(tensor, &span));
-    EXPECT_EQ(span, 40u);
-    tensor.start_offset = std::numeric_limits<uint64_t>::max();
-    EXPECT_FALSE(host_tensor_span(tensor, &span));
-    tensor.shapes[0] = 0;
-    EXPECT_TRUE(host_tensor_span(tensor, &span));
-    EXPECT_EQ(span, 0u);
-}
-
-TEST_F(HostTensorAccessTest, FixedArgsCopyAndClearHostViewMetadata) {
-    ChipStorageTaskArgs args;
-    ChipTensor tensor{};
-    args.add_tensor(tensor);
-    args.set_host_view(0, 0x1000, 32);
-    ChipStorageTaskArgs copy = args;
-    EXPECT_EQ(copy.host_view(0), 0x1000u);
-    EXPECT_EQ(copy.host_view_size(0), 32u);
-    args.clear();
-    EXPECT_THROW(args.host_view(0), std::out_of_range);
-    args.add_tensor(tensor);
-    EXPECT_EQ(args.host_view(0), 0u);
-    EXPECT_EQ(args.host_view_size(0), 0u);
-    for (int i = 1; i < CHIP_MAX_TENSOR_ARGS; ++i)
-        args.add_tensor(tensor);
-    EXPECT_THROW(args.add_tensor(tensor), std::out_of_range);
 }
 
 }  // namespace

@@ -62,8 +62,8 @@ class TestVectorExample(SceneTestCase):
         resident = params.get("resident", False)
         SIZE = 128 * 128
         return TaskArgsBuilder(
-            TensorArg("a", torch.full((SIZE,), 2.0, dtype=torch.float32), child_memory=resident, host_view=resident),
-            TensorArg("b", torch.full((SIZE,), 3.0, dtype=torch.float32), child_memory=resident, host_view=resident),
+            TensorArg("a", torch.full((SIZE,), 2.0, dtype=torch.float32), child_memory=resident),
+            TensorArg("b", torch.full((SIZE,), 3.0, dtype=torch.float32), child_memory=resident),
             TensorArg("f", torch.zeros(SIZE, dtype=torch.float32), child_memory=resident),
         )
 

@@ -111,7 +111,7 @@ class TestPagedAttentionUnrollManualScopeHostBuildGraph(SceneTestCase):
                 "residency": mode,
             },
         }
-        for mode in ("staged", "bulk", "host_view")
+        for mode in ("staged", "bulk")
     ]
 
     def generate_args(self, params):
@@ -120,10 +120,11 @@ class TestPagedAttentionUnrollManualScopeHostBuildGraph(SceneTestCase):
         specs = []
         for name, val in inputs:
             if isinstance(val, torch.Tensor):
+                # The orchestration reads these two on the host to shape the graph,
+                # so they stay host-staged; only the bulk tensors go resident.
                 control = name in ("context_lens", "block_table")
-                mode = params.get("residency")
-                resident = mode == "host_view" or (mode == "bulk" and not control)
-                specs.append(TensorArg(name, val, child_memory=resident, host_view=resident and control))
+                resident = params.get("residency") == "bulk" and not control
+                specs.append(TensorArg(name, val, child_memory=resident))
             else:
                 specs.append(Scalar(name, val))
         return TaskArgsBuilder(*specs)

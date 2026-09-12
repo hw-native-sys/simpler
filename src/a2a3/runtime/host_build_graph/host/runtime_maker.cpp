@@ -1167,8 +1167,8 @@ extern "C" int bind_callable_to_runtime_impl(
     ChipStorageTaskArgs device_args;
 
     // This run's host-view window. The accessor owns every mapping it
-    // registers views only for this orchestration window; resident INOUT
-    // views are refreshed before registration on every bind.
+    // registers and releases them on every exit path, so no host view outlives
+    // the point at which a task could make it stale.
     HostTensorAccessor tensor_access(api);
 
     const BindPhaseMark args_phase = bind_phase_begin();
@@ -1183,30 +1183,13 @@ extern "C" int bind_callable_to_runtime_impl(
         // as if it were a graph-heap allocation.
         if (t.is_device_memory()) {
             always_assert(t.buffer.addr < HEAP_VIRTUAL_BASE && "caller tensor reaches into the virtual heap window");
-            const uint64_t host_view_addr = orch_args->host_view(i);
-            if (host_view_addr != 0) {
-                if (signature == nullptr || i >= sig_count ||
-                    !tensor_access.add_resident(t, signature[i], host_view_addr, orch_args->host_view_size(i))) {
-                    LOG_ERROR("host-orch: invalid or unsynchronized host view for tensor %d", i);
-                    return PTO_RUNTIME_ERR_INTERNAL;
-                }
-            }
-            LOG_DEBUG("  ChipTensor %d: device memory, pass-through (0x%" PRIx64 ")", i, t.buffer.addr);
+            LOG_DEBUG("  ChipTensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.buffer.addr);
             device_args.add_tensor(t);
             continue;
         }
 
         void *host_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(t.buffer.addr));
-        size_t size = 0;
-        if (!host_tensor_span(t, &size)) {
-            LOG_ERROR("host-orch: invalid tensor span for tensor %d", i);
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-        if (size == 0) {
-            t.address_space = AddressSpace::DEVICE;
-            device_args.add_tensor(t);
-            continue;
-        }
+        size_t size = static_cast<size_t>(t.nbytes());
 
         void *dev_ptr = api->device_malloc(size);
         if (dev_ptr == nullptr) {

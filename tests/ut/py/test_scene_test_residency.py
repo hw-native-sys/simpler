@@ -21,10 +21,9 @@ scene = sys.modules["simpler_setup.scene_test"]
 
 
 def test_clone_preserves_residency_declarations():
-    args = TaskArgsBuilder(TensorArg("x", torch.ones(4), child_memory=True, host_view=True))
+    args = TaskArgsBuilder(TensorArg("x", torch.ones(4), child_memory=True))
     clone = args.clone()
     assert clone.specs[0].child_memory
-    assert clone.specs[0].host_view
     assert clone.x.data_ptr() != args.x.data_ptr()
 
 
@@ -32,7 +31,6 @@ def test_builder_add_tensor_accepts_residency():
     args = TaskArgsBuilder()
     args.add_tensor("x", torch.ones(4), child_memory=True)
     assert args.specs[0].child_memory
-    assert not args.specs[0].host_view
 
 
 class FakeWorker:
@@ -80,11 +78,11 @@ class FakeWorker:
         ).tensor(shapes, dtype)
 
 
-def test_resident_directions_views_empty_and_lifo():
+def test_resident_directions_empty_and_lifo():
     from simpler.task_interface import ArgDirection as D
 
     args = TaskArgsBuilder(
-        TensorArg("x", torch.ones(4), True, True),
+        TensorArg("x", torch.ones(4), True),
         TensorArg("y", torch.ones(4), True),
         TensorArg("z", torch.zeros(4), True),
         TensorArg("empty", torch.empty(0), True),
@@ -95,16 +93,30 @@ def test_resident_directions_views_empty_and_lifo():
         assert len(worker.created) == 3
         assert worker.uploads == worker.created[:2]
         # Zero-shaped wire Tensors are rejected by the existing transport;
-        # the owner still skips their device allocation.
+        # the owner skips their device allocation and leaves them host-staged.
+        assert "empty" not in resident.tensors
         nonempty = TaskArgsBuilder(*(spec for spec in args.specs if spec.name != "empty"))
-        chip_args, outputs = scene._build_l2_ref_args(nonempty, [D.IN, D.INOUT, D.OUT, D.IN], worker, resident)
+        _chip_args, outputs = scene._build_l2_ref_args(nonempty, [D.IN, D.INOUT, D.OUT, D.IN], worker, resident)
         assert outputs == ["y", "z"]
-        assert chip_args._host_view(0) == args.x.data_ptr()
-        assert chip_args._host_view_size(0) == 16
-        assert chip_args._host_view(1) == 0
     assert worker.freed == worker.created[::-1]
     resident.release()
     assert len(worker.freed) == 3
+
+
+def test_build_args_rejects_a_count_the_signature_would_misalign():
+    """A skipped empty tensor shifts every later argument, so reject rather than dispatch."""
+    from simpler.task_interface import ArgDirection as D
+
+    from simpler_setup.resident_task_args import ResidentTaskArgs
+
+    worker = FakeWorker()
+    with ResidentTaskArgs(worker) as resident:
+        resident.add("x", torch.ones(4), D.IN)
+        resident.add("empty", torch.empty(0), D.IN)
+        assert len(resident.tensors) == 1
+        with pytest.raises(ValueError, match="empty tensor cannot be resident"):
+            resident.build_args(expected_count=2)
+        assert resident.build_args(expected_count=1).tensor_count() == 1
 
 
 @pytest.mark.parametrize("rounds", [1, 2, 3])
@@ -172,13 +184,12 @@ def test_partial_construction_and_execution_failure_release():
     assert worker.freed == worker.created
 
 
-def test_invalid_view_and_alias_rejected():
+def test_invalid_direction_and_alias_rejected():
     from simpler.task_interface import ArgDirection as D
 
     host = torch.ones(8)
     for args, sig, match in [
-        (TaskArgsBuilder(TensorArg("x", host, host_view=True)), [D.IN], "requires child_memory"),
-        (TaskArgsBuilder(TensorArg("x", host, True, True)), [D.OUT], "IN or INOUT"),
+        (TaskArgsBuilder(TensorArg("x", host, True)), [D.SCALAR], "unsupported direction"),
         (TaskArgsBuilder(TensorArg("x", host[:4], True), TensorArg("y", host[2:])), [D.IN, D.IN], "alias"),
     ]:
         worker = FakeWorker()
@@ -201,7 +212,7 @@ def test_streaming_owner_does_not_retain_weights():
         resident.add("weight", weight, D.IN)
         del weight
         assert reference() is None
-        assert resident.build_args()._host_view(0) == 0
+        assert resident.build_args().tensor_count() == 1
 
 
 def test_l3_rejects_residency_before_allocation():

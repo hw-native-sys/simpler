@@ -18,19 +18,18 @@ logger = logging.getLogger(__name__)
 class ResidentTaskArgs:
     """Own fixed device addresses until release; upload each input exactly once.
 
-    ``add`` consumes one CPU contiguous fixture at a time. Only requested host
-    views retain that fixture, so streaming drivers can discard large weights.
-    Callers retain ordinary host outputs separately when they need copy-back.
+    ``add`` consumes one CPU contiguous fixture at a time, so a streaming driver
+    can discard each large weight before materializing its successor. Callers
+    retain ordinary host outputs separately when they need copy-back.
     """
 
     def __init__(self, worker):
         self.worker = worker
         self.buffers = {}
         self.tensors = {}
-        self.host_views = {}
         self.directions = {}
 
-    def add(self, name, host, direction, *, host_view=False):
+    def add(self, name, host, direction):
         from simpler.task_interface import ArgDirection as D  # noqa: PLC0415
 
         from simpler_setup.torch_interop import torch_dtype_to_datatype  # noqa: PLC0415
@@ -39,12 +38,13 @@ class ResidentTaskArgs:
             raise ValueError(f"Duplicate resident tensor {name!r}")
         if direction not in (D.IN, D.OUT, D.INOUT):
             raise ValueError(f"Resident tensor {name!r} has an unsupported direction")
-        if host_view and direction == D.OUT:
-            raise ValueError(f"Host view requires IN or INOUT: {name!r}")
         if host.device.type != "cpu" or not host.is_contiguous():
             raise ValueError(f"Resident tensor {name!r} must be a contiguous CPU tensor")
         size = host.numel() * host.element_size()
         if not size:
+            # An empty tensor names no device bytes. Leaving it unrecorded keeps
+            # it on the ordinary host-staging path, so `build_args` callers must
+            # reconcile their own argument list -- see the count check there.
             return
         buf = self.worker.malloc(size)
         try:
@@ -60,25 +60,28 @@ class ResidentTaskArgs:
         self.buffers[name] = buf
         self.tensors[name] = tensor
         self.directions[name] = direction
-        if host_view:
-            self.host_views[name] = host
 
-    def build_args(self):
-        """Build all-resident L2 args, preserving direction and local host views."""
+    def build_args(self, expected_count=None):
+        """Build all-resident L2 args, preserving direction.
+
+        ``expected_count`` is the caller's tensor-argument count. A mismatch means
+        `add` skipped an empty tensor, so every later argument would shift against
+        the orchestration signature -- reject that rather than dispatch a silently
+        misaligned argument list.
+        """
         from simpler.task_interface import ArgDirection as D  # noqa: PLC0415
         from simpler.task_interface import TaskArgs, TensorArgType  # noqa: PLC0415
 
+        if expected_count is not None and expected_count != len(self.tensors):
+            raise ValueError(
+                f"build_args expected {expected_count} resident tensors but holds {len(self.tensors)}; "
+                "an empty tensor cannot be resident -- keep it on the host-staging path instead."
+            )
         tags = {D.IN: TensorArgType.INPUT, D.OUT: TensorArgType.OUTPUT_EXISTING, D.INOUT: TensorArgType.INOUT}
         args = TaskArgs()
-        for i, (name, tensor) in enumerate(self.tensors.items()):
+        for name, tensor in self.tensors.items():
             args.add_tensor(tensor, tags[self.directions[name]])
-            self.attach_host_view(args, i, name)
         return args
-
-    def attach_host_view(self, args, i, name):
-        host = self.host_views.get(name)
-        if host is not None:
-            args._set_host_view(i, host.data_ptr(), host.numel() * host.element_size())
 
     def copy_back(self, test_args, names):
         for name in names:
@@ -88,7 +91,6 @@ class ResidentTaskArgs:
     def release(self):
         """Release in LIFO order, even when an individual free fails."""
         self.tensors.clear()
-        self.host_views.clear()
         self.directions.clear()
         while self.buffers:
             _, buf = self.buffers.popitem()

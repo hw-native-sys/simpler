@@ -163,9 +163,8 @@ at case setup, outside `Worker.run` and its round markers. Include setup and
 final validation readback when reporting total case time; do not label the
 round table alone as end-to-end case latency.
 
-For HBG, compare a host-staged baseline, bulk residency with staged control
-tensors, and residency with explicit control host views separately. INOUT host
-views incur a device-to-host refresh inside bind on every round, including runs
-with `--skip-golden`. Qwen's static graph measures residency but does not
-exercise host-view access. Report fresh measurements for the actual design,
-with identical fixtures, hardware, round counts and validation settings.
+A resident argument skips the per-round staging path entirely, so `bind.args`
+reports fewer staged tensors and fewer staged bytes for it. Numbers taken
+before and after a case declares residency are therefore not comparable on the
+host/bind component; re-measure both arms with identical fixtures, hardware,
+round counts and validation settings.

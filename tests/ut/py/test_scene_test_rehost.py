@@ -335,11 +335,11 @@ def test_builder_valid_args_order_named_access_and_clone():
 
 
 def test_rehost_and_release_preserve_declarations():
-    args = TaskArgsBuilder(TensorArg("x", torch.ones(4), child_memory=True, host_view=True))
+    args = TaskArgsBuilder(TensorArg("x", torch.ones(4), child_memory=True))
     original = args.x
     worker = _FakeWorker()
     rehosted = _RehostedTaskArgs(worker, args)
-    assert args.specs[0].child_memory and args.specs[0].host_view
+    assert args.specs[0].child_memory
     rehosted.release()
     assert args.specs[0].value is original
-    assert args.specs[0].child_memory and args.specs[0].host_view
+    assert args.specs[0].child_memory

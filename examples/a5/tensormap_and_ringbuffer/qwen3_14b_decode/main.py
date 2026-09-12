@@ -648,7 +648,7 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
                 fixture=golden,
             )
             _decode_golden(golden, n_layers=N_LAYERS)
-        task_args = resident.build_args()
+        task_args = resident.build_args(expected_count=len(param_specs(N_LAYERS)))
         config = _build_config(
             runtime_env,
             enable_chip_swimlane=diagnostics.chip_swimlane,

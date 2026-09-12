@@ -20,8 +20,8 @@
  * that capability is resolved, so the orchestrator core never dereferences a
  * device address itself.
  *
- * The bind path registers staged input tensors and explicit resident host views,
- * backed by the caller's host tensor buffer:
+ * The current bind path registers one region per staged tensor, backed by the
+ * caller's host tensor buffer:
  *
  *   - A read observes that caller buffer.
  *   - A write mutates that caller buffer, then uses the device-copy hook so the
@@ -31,21 +31,21 @@
  * `add` also retains a null-fallback platform path: it asks the platform for a
  * host-readable mapping whose address may equal or differ from `dev_base`, and
  * always accesses the returned address. The current runtime-maker path cannot
- * reach it: staged and resident views supply a host buffer, while pure outputs
+ * reach it: staged tensors always have the caller buffer, while pure outputs
  * are deliberately left unregistered. The path remains as an explicit
  * platform-capability escape hatch in `add` and is covered directly by unit
  * tests; no current production caller reaches it.
  *
  * An address no registered region covers is a failure, never a raw
- * dereference. Pure outputs, GM-heap tensors and child buffers without an
- * explicit host view remain inaccessible.
+ * dereference. Pure outputs, GM-heap tensors and pass-through child-memory
+ * buffers have no region, so both reads and writes resolve to nothing.
  *
- * Regions belong to one host orchestration run, before tasks are dispatched.
- * Staged views contain the bytes just uploaded. Resident IN views remain
- * coherent across rounds under the caller's no-device-writes contract; host
- * writes update both copies. Resident INOUT views are refreshed from the
- * device at every bind. These windows do not expose task-produced values or
- * provide coherence while device tasks execute.
+ * Regions and any optional mappings are owned by one orchestration run — the
+ * window between staging and the first dispatched task. A caller-buffer view
+ * holds the staged bytes, and nothing has executed yet to make it stale; once
+ * tasks run, that view would be indistinguishable from live device memory.
+ * `HostTensorAccessor` bounds the window and releases its mappings on every
+ * exit path.
  *
  * `host/host_tensor_access.cpp` holds the only definitions of the read/write
  * pair, and libhost_runtime.so links them. Nothing in the AICPU build reaches
@@ -56,9 +56,6 @@
 
 #include <stddef.h>
 #include <stdint.h>
-
-#include "task_interface/arg_direction.h"
-#include "task_interface/tensor.h"
 
 struct HostApi;  // common/host_api.h — fwd-declared so this header stays out of platform includes
 
@@ -96,16 +93,13 @@ public:
      * Register `[dev_base, dev_base + size)`, using `fallback_host_view` (the
      * caller's host tensor buffer) when available and asking the platform for a
      * host mapping otherwise. The current runtime-maker always supplies the
-     * fallback for staged and explicit resident views, and skips pure outputs; it
+     * fallback for staged tensors and skips pure outputs, so its bind path does
      * not install mappings.
      *
      * @return false for an empty region, a null `api`, or when neither a
      *         mapping nor a fallback view is available.
      */
     bool add(uint64_t dev_base, uint64_t size, void *fallback_host_view);
-    // An IN view stays coherent because kernels do not mutate it and host writes
-    // push back. An INOUT view is refreshed from the device before orchestration.
-    bool add_resident(const ChipTensor &tensor, ArgDirection direction, uint64_t host_addr, uint64_t host_bytes);
     bool read(uint64_t dev_addr, void *dst, uint64_t bytes) const;
     bool write(uint64_t dev_addr, const void *src, uint64_t bytes) const;
 
@@ -139,7 +133,3 @@ bool host_tensor_read(HostTensorAccessor *accessor, uint64_t dev_addr, void *dst
  *         push-back to the device fails.
  */
 bool host_tensor_write(HostTensorAccessor *accessor, uint64_t dev_addr, const void *src, uint64_t bytes);
-
-// Byte span from buffer.addr through the last reachable element, including
-// start_offset and stride gaps. Reject malformed or out-of-bounds geometry.
-bool host_tensor_span(const ChipTensor &tensor, size_t *bytes);

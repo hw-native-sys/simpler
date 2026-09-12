@@ -282,12 +282,11 @@ def scene_level(level: int | SceneTestLevel):
 
 
 class TensorArg(NamedTuple):
-    """Named CPU tensor with optional L2 residency and an HBG host view."""
+    """Named CPU tensor, optionally kept device-resident for the whole L2 case."""
 
     name: str
     value: Any  # torch.Tensor
     child_memory: bool = False
-    host_view: bool = False
 
 
 class Scalar(NamedTuple):
@@ -330,9 +329,9 @@ class TaskArgsBuilder:
             elif isinstance(spec, Scalar):
                 self._add_scalar(spec)
 
-    def add_tensor(self, name: str, value: Any, *, child_memory=False, host_view=False) -> None:
+    def add_tensor(self, name: str, value: Any, *, child_memory=False) -> None:
         """Add a tensor. Must be called before any add_scalar."""
-        self._add_tensor(TensorArg(name, value, child_memory, host_view))
+        self._add_tensor(TensorArg(name, value, child_memory))
 
     def add_scalar(self, name: str, value: Any) -> None:
         """Add a scalar. After this, add_tensor is not allowed."""
@@ -578,17 +577,22 @@ class CallableNamespace:
 
 
 def _resident_l2_args(worker, test_args, signature):
+    """Own the device buffers for every `child_memory` TensorArg, for the whole case.
+
+    Returns an owner whose `tensors` is empty when nothing is declared, so the
+    caller's arg build falls through to ordinary host staging. Resident storage
+    may not alias any other argument's storage: independent device buffers
+    cannot preserve an overlap the orchestrator would otherwise see.
+    """
     from simpler_setup.resident_task_args import ResidentTaskArgs  # noqa: PLC0415
 
     specs = [spec for spec in test_args.specs if isinstance(spec, TensorArg)]
-    if not any(spec.child_memory or spec.host_view for spec in specs):
+    if not any(spec.child_memory for spec in specs):
         return ResidentTaskArgs(worker)
     if len(specs) != len(signature):
         raise ValueError("TensorArg count must match the orchestration signature")
     ranges = []
     for spec in specs:
-        if spec.host_view and not spec.child_memory:
-            raise ValueError(f"Host view requires child_memory: {spec.name!r}")
         host = spec.value
         if host.numel():
             # Unselected tensors may be strided: their full span participates
@@ -604,7 +608,7 @@ def _resident_l2_args(worker, test_args, signature):
     try:
         for spec, direction in zip(specs, signature):
             if spec.child_memory:
-                resident.add(spec.name, spec.value, direction, host_view=spec.host_view)
+                resident.add(spec.name, spec.value, direction)
     except BaseException:
         resident.release()
         raise
@@ -619,8 +623,8 @@ def _build_l2_ref_args(test_args: TaskArgsBuilder, orch_signature: list, worker,
     at L2 there is no fork, so any host tensor resolves in-process); the direction tag is inert at L2
     but set for parity with the L3 path.
 
-    Explicit resident arguments use case-owned device addresses. Optional host
-    views remain local to the L2 host process.
+    Explicit `child_memory` arguments use case-owned device addresses; the rest
+    keep the per-round host-staging path.
 
     Returns:
         args: TaskArgs (TensorArg)
@@ -652,8 +656,6 @@ def _build_l2_ref_args(test_args: TaskArgsBuilder, orch_signature: list, worker,
             else:
                 tensor_arg = make_tensor_arg(worker, spec.value)
             args.add_tensor(tensor_arg, dir2tag.get(direction, TensorArgType.INPUT))
-            if resident is not None:
-                resident.attach_host_view(args, tensor_idx, spec.name)
             if direction in (ArgDirection.OUT, ArgDirection.INOUT):
                 output_names.append(spec.name)
             tensor_idx += 1
@@ -2002,8 +2004,8 @@ class SceneTestCase:
 
         # Build args
         test_args = self.generate_args(params)
-        if any(isinstance(spec, TensorArg) and (spec.child_memory or spec.host_view) for spec in test_args.specs):
-            raise ValueError("SceneTest child_memory and host_view declarations require L2")
+        if any(isinstance(spec, TensorArg) and spec.child_memory for spec in test_args.specs):
+            raise ValueError("SceneTest child_memory declarations require L2")
 
         # Compute golden (unless skip_golden)
         golden_args = None

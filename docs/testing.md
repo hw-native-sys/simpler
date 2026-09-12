@@ -918,23 +918,24 @@ the same keyword. The default remains host staging on every round.
 
 Golden evaluation follows the same state evolution: resident outputs retain
 state and host-staged outputs reset. Cases with resident outputs compare after
-the final round; other cases continue comparing every round. `--skip-golden`
-skips validation readback, but not INOUT host-view synchronization.
+the final round; other cases continue comparing every round.
 
-Add `host_view=True` only for resident IN/INOUT read or written by HBG host
-orchestration. IN views rely on the no-device-writes contract. INOUT views are
-refreshed from the device before each orchestration; host writes are pushed to
-the device. Pure OUT has no readable host view. TMR ignores the sidecar.
-These views do not permit reading values produced by tasks in the current run.
+A tensor whose contents the HBG host orchestration reads (`get_tensor_data`) or
+writes (`set_tensor_data`) must stay host-staged — a resident tensor takes the
+device pass-through and is never registered as a readable region, so an
+orchestration access to it fails closed. Residency is declared per argument, so
+a data-dependent case can keep its bulk tensors resident and leave its small
+control tensors staged.
 
 Declarations currently require L2, contiguous CPU fixtures, and non-overlapping
 storage. Empty fixtures allocate no resident buffer; the existing transport
 still rejects zero-shaped Tensor arguments. Clone and rehost operations preserve
 declaration metadata. Streaming drivers can use
 `simpler_setup.resident_task_args.ResidentTaskArgs` as a context manager and add
-one fixture at a time; only explicit host views retain those fixtures.
+one fixture at a time, so each large fixture can be released before the next is
+materialized.
 
 The HBG `paged_attention_unroll_manual_scope` examples include matched manual
-`Residency_staged`, `Residency_bulk`, and `Residency_host_view` cases. Bulk
-residency leaves `context_lens` and `block_table` host-staged; the host-view case
-also makes those controls resident. Existing default cases retain host staging.
+`Residency_staged` and `Residency_bulk` cases. Bulk residency leaves
+`context_lens` and `block_table` host-staged because the orchestration reads
+them. Existing default cases retain host staging.

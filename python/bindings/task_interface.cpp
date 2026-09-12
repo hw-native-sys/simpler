@@ -2360,11 +2360,6 @@ NB_MODULE(_task_interface, m) {
         .def("tensor_count", &ChipStorageTaskArgs::tensor_count)
         .def("scalar_count", &ChipStorageTaskArgs::scalar_count)
 
-        .def("_set_host_view", &ChipStorageTaskArgs::set_host_view, nb::arg("i"), nb::arg("addr"), nb::arg("bytes"))
-
-        .def("_host_view", &ChipStorageTaskArgs::host_view, nb::arg("i"))
-        .def("_host_view_size", &ChipStorageTaskArgs::host_view_size, nb::arg("i"))
-
         .def("clear", &ChipStorageTaskArgs::clear)
 
         .def(
@@ -2421,11 +2416,6 @@ NB_MODULE(_task_interface, m) {
             "add_scalar", &TaskArgs::add_scalar, nb::arg("s"),
             "Add a uint64_t scalar. After this, add_tensor() is no longer allowed."
         )
-
-        .def("_set_host_view", &TaskArgs::set_host_view, nb::arg("i"), nb::arg("addr"), nb::arg("bytes"))
-
-        .def("_host_view", &TaskArgs::host_view, nb::arg("i"))
-        .def("_host_view_size", &TaskArgs::host_view_size, nb::arg("i"))
 
         .def(
             "add_dep",
@@ -3482,7 +3472,6 @@ NB_MODULE(_task_interface, m) {
             ChipStorageTaskArgs out;
             for (int32_t i = 0; i < args.tensor_count(); i++) {
                 out.add_tensor(materialize_one(args.tensor(i), resolved));
-                out.set_host_view(i, args.host_view(i), args.host_view_size(i));
             }
             for (int32_t i = 0; i < args.scalar_count(); i++) {
                 out.add_scalar(args.scalar(i));
