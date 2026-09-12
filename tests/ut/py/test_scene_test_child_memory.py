@@ -107,7 +107,7 @@ def test_build_args_rejects_a_count_the_signature_would_misalign():
     """A skipped empty tensor shifts every later argument, so reject rather than dispatch."""
     from simpler.task_interface import ArgDirection as D
 
-    from simpler_setup.child_memory_task_args import ChildMemoryTaskArgs
+    from simpler_setup.scene_test import ChildMemoryTaskArgs
 
     worker = FakeWorker()
     with ChildMemoryTaskArgs(worker) as child_args:
@@ -203,7 +203,7 @@ def test_streaming_owner_does_not_retain_weights():
 
     from simpler.task_interface import ArgDirection as D
 
-    from simpler_setup.child_memory_task_args import ChildMemoryTaskArgs
+    from simpler_setup.scene_test import ChildMemoryTaskArgs
 
     worker = FakeWorker()
     with ChildMemoryTaskArgs(worker) as child_args:

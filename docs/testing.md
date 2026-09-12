@@ -930,10 +930,12 @@ control tensors staged.
 Declarations currently require L2, contiguous CPU fixtures, and non-overlapping
 storage. Empty fixtures allocate no device buffer; the existing transport
 still rejects zero-shaped Tensor arguments. Clone and rehost operations preserve
-declaration metadata. Streaming drivers can use
-`simpler_setup.child_memory_task_args.ChildMemoryTaskArgs` as a context manager and add
-one fixture at a time, so each large fixture can be released before the next is
-materialized.
+declaration metadata. An in-repo standalone driver that owns its own `Worker`
+reuses the same owner, `simpler_setup.scene_test.ChildMemoryTaskArgs`, as a
+context manager, adding one fixture at a time so each large fixture can be
+released before the next is materialized. It is a scene-test helper, not part of
+the `simpler_setup` public surface — it builds `TaskArgs` and copies back through
+a `TaskArgsBuilder`, so it has no meaning outside this corpus.
 
 The HBG `paged_attention_unroll_manual_scope` examples include matched manual
 `HostStaged` and `ChildMemory` cases. The latter leaves

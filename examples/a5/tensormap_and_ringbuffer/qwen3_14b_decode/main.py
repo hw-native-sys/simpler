@@ -48,7 +48,6 @@ from simpler.task_interface import CallConfig
 from simpler.worker import Worker
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, scene_test
-from simpler_setup.child_memory_task_args import ChildMemoryTaskArgs
 from simpler_setup.compile_pool import compile_worker_budget
 from simpler_setup.goldens.qwen3_14b_decode import (
     N_LAYERS,
@@ -64,6 +63,7 @@ from simpler_setup.goldens.qwen3_14b_decode import (
 from simpler_setup.log_config import DEFAULT_LOG_LEVEL, LOG_LEVEL_CHOICES, configure_logging
 from simpler_setup.parallel_scheduler import device_range_to_list
 from simpler_setup.scene_test import (
+    ChildMemoryTaskArgs,
     build_output_prefix,
     compile_chip_callable_spec,
     effective_diagnostic_options,
