@@ -646,6 +646,7 @@ int DeviceRunner::reap_run(const DfxRunConfig &dfx, uint32_t pipeline_slot) {
         // idempotent, so this runs only on the error return; the success path
         // still exports exactly once below.
         teardown_shared_collectors_after_run(dfx, pipeline_slot, false);
+        emit_device_dep_gen_graph(dfx);
         return rc;
     }
 
@@ -654,24 +655,26 @@ int DeviceRunner::reap_run(const DfxRunConfig &dfx, uint32_t pipeline_slot) {
     // Tear down collectors. stop() joins mgmt then collector in the only safe
     // order (mgmt's final-drain pass into L2 has poll as its consumer).
     teardown_shared_collectors_after_run(dfx, pipeline_slot, true);
-
-    // a2a3-only dep_gen teardown, device-orch shape: the collector stops, the
-    // ring reconciles, and the records replay. The host-orch shape emits at the
-    // end of bind instead, where its capture window closes — see
-    // `emit_host_dep_gen_graph` in c_api_shared.cpp.
-    if (dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
-        dep_gen_collector_.quiesce();
-        if (dep_gen_collector_.reconcile_counters()) {
-            const std::string deps = make_deps_json_path(dfx.output_prefix);
-            const auto &records = dep_gen_collector_.records();
-            int rc = dep_gen_replay_emit_deps_json(records.data(), records.size(), deps.c_str());
-            if (rc != 0) {
-                LOG_ERROR("dep_gen replay failed (%d) — deps.json not produced", rc);
-            }
-        }
-    }
+    emit_device_dep_gen_graph(dfx);
 
     return 0;
+}
+
+void DeviceRunner::emit_device_dep_gen_graph(const DfxRunConfig &dfx) {
+    // The host-orch shape emits at the end of bind instead, where its capture
+    // window closes — see `emit_host_dep_gen_graph` in c_api_shared.cpp.
+    if (!dfx.dep_gen_enabled || dep_gen_host_graph_active()) return;
+    dep_gen_collector_.quiesce();
+    // reconcile_counters() is the completeness gate: an un-flushed device buffer
+    // or a dropped record makes it false and no deps.json is written, so a run
+    // that failed mid-flight yields a whole graph or none — never a partial one.
+    if (!dep_gen_collector_.reconcile_counters()) return;
+    const std::string deps = make_deps_json_path(dfx.output_prefix);
+    const auto &records = dep_gen_collector_.records();
+    int rc = dep_gen_replay_emit_deps_json(records.data(), records.size(), deps.c_str());
+    if (rc != 0) {
+        LOG_ERROR("dep_gen replay failed (%d) — deps.json not produced", rc);
+    }
 }
 
 // `print_handshake_results`, `prepare_orch_so`, `register_callable`,

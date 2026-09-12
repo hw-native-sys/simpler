@@ -577,6 +577,7 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
             LOG_WARN("Runtime chip-swimlane extension publication failed");
         }
         teardown_shared_collectors_after_run(prepared.dfx, prepared.pipeline_slot, false);
+        emit_device_dep_gen_graph(prepared.dfx);
         return rc;
     }
 
@@ -585,26 +586,28 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
         LOG_WARN("Runtime chip-swimlane extension publication failed");
     }
     teardown_shared_collectors_after_run(prepared.dfx, prepared.pipeline_slot, true);
-
-    // a5-specific dep_gen teardown, device-orch shape: the collector stops, the
-    // ring reconciles, and the records replay. The host-orch shape emits at the
-    // end of bind instead, where its capture window closes — see
-    // `emit_host_dep_gen_graph` in c_api_shared.cpp.
-    if (prepared.dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
-        dep_gen_collector_.quiesce();
-        if (dep_gen_collector_.reconcile_counters()) {
-            const std::string deps = make_deps_json_path(prepared.dfx.output_prefix);
-            const auto &records = dep_gen_collector_.records();
-            int replay_rc = dep_gen_replay_emit_deps_json(records.data(), records.size(), deps.c_str());
-            if (replay_rc != 0) {
-                LOG_ERROR("dep_gen replay failed (%d) — deps.json not produced", replay_rc);
-            }
-        }
-    }
+    emit_device_dep_gen_graph(prepared.dfx);
 
     // Reads device memory, so it must precede KernelArgs/runtime cleanup.
     print_handshake_results(prepared.kernel_args);
     return 0;
+}
+
+void DeviceRunner::emit_device_dep_gen_graph(const DfxRunConfig &dfx) {
+    // The host-orch shape emits at the end of bind instead, where its capture
+    // window closes — see `emit_host_dep_gen_graph` in c_api_shared.cpp.
+    if (!dfx.dep_gen_enabled || dep_gen_host_graph_active()) return;
+    dep_gen_collector_.quiesce();
+    // reconcile_counters() is the completeness gate: an un-flushed device buffer
+    // or a dropped record makes it false and no deps.json is written, so a run
+    // that failed mid-flight yields a whole graph or none — never a partial one.
+    if (!dep_gen_collector_.reconcile_counters()) return;
+    const std::string deps = make_deps_json_path(dfx.output_prefix);
+    const auto &records = dep_gen_collector_.records();
+    int replay_rc = dep_gen_replay_emit_deps_json(records.data(), records.size(), deps.c_str());
+    if (replay_rc != 0) {
+        LOG_ERROR("dep_gen replay failed (%d) — deps.json not produced", replay_rc);
+    }
 }
 
 void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool launched) noexcept {

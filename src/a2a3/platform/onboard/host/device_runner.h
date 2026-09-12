@@ -247,17 +247,21 @@ private:
     int retire_run_aicore_stream(const void *owner, RunStreamPair::CompletionStatus completion_status);
     int destroy_run_streams();
 
-    // Release execution-owned resources in collector, runtime-argument,
-    // register-buffer, then stream order. The collectors this releases were
-    // initialized by prepare_execution() for this run alone; an overlapping
-    // predecessor cannot own any, because a prepared successor is admitted only
-    // when both runs declare no diagnostics.
+    // Release the resources this run owns, in runtime-argument, register-buffer,
+    // then stream order. Collectors are not among them: their device resources
+    // belong to the worker's lifetime and are released in finalize().
     void cleanup_execution(PreparedExecution &prepared, bool retire_aicore) noexcept;
 
     // The kernel submission boundary is separate from the stream wait and
     // post-run teardown: launch_run() submits and drain_execution() reaps.
     LaunchTransactionResult launch_run(PreparedExecution &prepared, LaunchPermit permit);
     int reap_run(const DfxRunConfig &dfx, uint32_t pipeline_slot);
+
+    // Emit the device-orchestration dep_gen graph, on both the success and the
+    // error return of reap_run: the device flushes its dep_gen buffers during
+    // emergency_shutdown, so a failed run's graph is recoverable. Its own
+    // reconcile is the completeness gate — see the definition.
+    void emit_device_dep_gen_graph(const DfxRunConfig &dfx);
 
     // On an AICore launch/sync error, best-effort drain the device so a later
     // enqueue on the same DeviceRunner can recover in place; if the drain itself

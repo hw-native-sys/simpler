@@ -71,6 +71,12 @@ private:
     int init_scope_stats(int num_threads);
     int init_dep_gen(int num_threads, int device_id);
 
+    // Emit the device-orchestration dep_gen graph, on both the success and the
+    // error return of drain_execution: the AICPU threads are joined before
+    // either, so a failed run's records are as complete as the run made them.
+    // Its own reconcile is the completeness gate — see the definition.
+    void emit_device_dep_gen_graph(const DfxRunConfig &dfx);
+
     // Per-run collector teardown: stop + release shm so a session-scoped Worker
     // can re-init collectors on the next enqueue. Matches a2a3 sim.
     void finalize_collectors();

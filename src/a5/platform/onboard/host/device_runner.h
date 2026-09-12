@@ -217,9 +217,9 @@ private:
 
     // Release execution-owned per-run resources. Idempotent so prepare rollback
     // and drain share one path. `launched` publishes the sticky terminal poll
-    // state, which only a run that reached the streams may claim; the collectors
-    // are released either way, since prepare_execution() initialized them for
-    // this run alone.
+    // state, which only a run that reached the streams may claim. Collectors are
+    // not released here: their device resources belong to the worker's lifetime
+    // and are released in finalize().
     void cleanup_execution(PreparedExecution &prepared, bool launched) noexcept;
 
     // On an AICore launch/sync error, best-effort drain the device so a later
@@ -315,6 +315,12 @@ private:
      * kernel_args.dep_gen_data_base.
      */
     int init_dep_gen(int num_threads, int device_id, KernelArgsHelper &kernel_args);
+
+    // Emit the device-orchestration dep_gen graph, on both the success and the
+    // error return of drain_execution: the device flushes its dep_gen buffers
+    // during emergency_shutdown, so a failed run's graph is recoverable. Its own
+    // reconcile is the completeness gate — see the definition.
+    void emit_device_dep_gen_graph(const DfxRunConfig &dfx);
 
     // Per-run collector teardown: stops mgmt + poll threads on every collector
     // whose init succeeded, in the only safe order (stop() joins mgmt before
