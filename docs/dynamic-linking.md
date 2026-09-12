@@ -304,8 +304,11 @@ ChipWorker.init(device_id, bins)                       # Python wrapper
            simpler_unregister_callable, get_pipeline_contract,
            supports_concurrent_native_prepare_ctx,
            get_arena_bank_gm_heap_base_ctx, get_retained_temp_addr_ctx,
-           finalize_device
+           finalize_device, simpler_kernel_mode_supported
     create_device_context() → DeviceContextHandle
+    if simpler_kernel_mode_supported(ctx) != 0:
+      dlsym simpler_kernel_mode_init, simpler_kernel_mode_prepare_callable,
+            simpler_kernel_mode_launch                 require the complete group
     allocate zeroed, aligned, stable native-run storage per pipeline slot
     simpler_init(ctx, device_id, aicpu*, aicpu_size, aicore*, aicore_size, ...)
       DeviceRunner::attach_current_thread(device_id)

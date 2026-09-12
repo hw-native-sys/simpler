@@ -372,6 +372,39 @@ int DeviceRunnerBase::setup_static_arena(
     // so their callers don't have to re-acquire.
     ArenaBank &bank = this->arena_bank(arena_bank);
 
+    // Captured graphs can retain committed base addresses, so kernel mode
+    // forbids growing or releasing a region that is already committed. The
+    // check covers all three regions and completes before the first
+    // commit_region call, which is what makes the refusal side-effect-free:
+    // a refusal raised from inside the commit sequence would fall into the
+    // unified rollback below, whose release() calls free the very base
+    // addresses the refusal exists to preserve.
+    if (execution_mode_latch().is_kernel()) {
+        const struct {
+            const DeviceArena &arena;
+            size_t cached_size;
+            size_t requested_size;
+            const char *name;
+        } regions[] = {
+            {bank.gm_heap, bank.cached_gm_heap_size, gm_heap_size, "gm_heap"},
+            {bank.gm_sm, bank.cached_gm_sm_size, gm_sm_size, "gm_sm"},
+            {bank.runtime_pool, bank.cached_runtime_arena_size, runtime_arena_size, "runtime_pool"},
+        };
+        for (const auto &region : regions) {
+            if (!kernel_arena_change_is_forbidden(
+                    region.arena.is_committed(), region.cached_size, region.requested_size
+                )) {
+                continue;
+            }
+            LOG_ERROR(
+                "setup_static_arena: kernel mode forbids %s committed region %s (cached %zu, requested %zu)",
+                region.requested_size == 0 ? "releasing" : "growing", region.name, region.cached_size,
+                region.requested_size
+            );
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+    }
+
     bool arena_changed = false;
     auto commit_region = [&arena_changed](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
         if (requested_size == 0) {
@@ -441,6 +474,10 @@ int DeviceRunnerBase::setup_static_arena(
 }
 
 std::thread DeviceRunnerBase::create_thread(std::function<void()> fn) {
+    // A freshly spawned thread carries no CANN device context of its own, so
+    // this bind creates one rather than taking anything from the caller — it
+    // is the one rtSetDevice a borrowed-device context still owns, and it is
+    // scoped to a thread this runner created.
     int dev_id = device_id_;
     return std::thread([dev_id, fn = std::move(fn)]() {
         rtSetDevice(dev_id);
@@ -448,7 +485,7 @@ std::thread DeviceRunnerBase::create_thread(std::function<void()> fn) {
     });
 }
 
-int DeviceRunnerBase::attach_current_thread(int device_id) {
+int DeviceRunnerBase::bind_current_thread(int device_id) {
     if (device_id < 0) {
         LOG_ERROR("Invalid device_id: %d", device_id);
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -468,13 +505,57 @@ int DeviceRunnerBase::attach_current_thread(int device_id) {
         ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
+    return 0;
+}
 
-    // simpler_init performs the only lifetime write. Prepared-run admission
-    // and execution subsequently attach different host threads, so repeated
-    // same-value writes here would still be a C++ data race.
+int DeviceRunnerBase::attach_current_thread(int device_id) {
+    // rtSetDevice and the op-execute watchdog below are acts of device
+    // ownership, so this entry belongs to a program context. A kernel context
+    // reaches its device through adopt_borrowed_device instead; the one caller
+    // here that runs under both identities is DeviceRunner::finalize(), which
+    // skips this call on a kernel latch.
+    if (execution_mode_latch().is_kernel()) {
+        LOG_ERROR("attach_current_thread: refused — a kernel-mode context does not own the caller's device");
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+
+    int rc = bind_current_thread(device_id);
+    if (rc != 0) return rc;
+
+    // Both writers of device_id_ — this one and adopt_borrowed_device — guard
+    // on the still-unset value, and both run before any prepare, execution or
+    // collector thread attaches. Prepared-run admission and execution
+    // subsequently attach different host threads, so repeated same-value
+    // writes here would still be a C++ data race.
     if (device_id_ == -1) {
         timeout_config_ = resolve_onboard_timeout_config();
         configure_aicore_op_timeout();
+        device_id_ = device_id;
+    }
+    return 0;
+}
+
+int DeviceRunnerBase::adopt_borrowed_device(int device_id) {
+    // The caller already holds this device current on its own threads, so the
+    // only thing a kernel context takes from it is the identity: no
+    // rtSetDevice, and no configure_aicore_op_timeout, which would rewrite the
+    // op-execute watchdog for every other user of that card. Resolving the
+    // timeout config is pure environment parsing and stays, because the stream
+    // and scheduler timeouts derived from it are read on both identities.
+    if (!execution_mode_latch().is_kernel()) {
+        LOG_ERROR("adopt_borrowed_device: refused — the context has not latched kernel mode");
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    if (device_id < 0) {
+        LOG_ERROR("Invalid device_id: %d", device_id);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (device_id_ != -1 && device_id_ != device_id) {
+        LOG_ERROR("DeviceRunner already on device %d; close before adopting device %d", device_id_, device_id);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (device_id_ == -1) {
+        timeout_config_ = resolve_onboard_timeout_config();
         device_id_ = device_id;
     }
     return 0;
