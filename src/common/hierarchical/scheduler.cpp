@@ -540,15 +540,6 @@ void Scheduler::dispatch_preparable_next_level_singles() {
             cfg_.enqueue_ready_cb(slot);
             continue;
         }
-        // A host-orchestrating runtime arms its clock-correlation session on the
-        // resident swimlane collector from inside bind, so a level-4 run starts
-        // only after it reaches the active FIFO lane. Every other diagnostics
-        // config may use the prepared lane: what its preparation would arm is
-        // built and reset under the execution claim.
-        if (state.config.captures_host_orchestration_phases()) {
-            cfg_.enqueue_ready_cb(slot);
-            continue;
-        }
         if (cfg_.before_claim_cb) cfg_.before_claim_cb(slot);
         if (!claim_for_dispatch(state)) continue;
         dispatch_claimed(worker, WorkerDispatch{slot, 0}, /*prepared=*/true);

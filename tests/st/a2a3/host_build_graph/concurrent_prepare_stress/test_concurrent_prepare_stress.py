@@ -36,19 +36,18 @@ positive one in exactly one variable:
   A collector's pools and per-run state are built and reset under the execution
   claim, so a diagnostic flag no longer keeps a run and its successor on
   separate device windows.
-* ``inflight_limit=2`` at chip-swimlane level 4 — *rejected*, and the one
-  diagnostics config that still serializes. Its bind opens a clock-correlation
-  session on the resident swimlane collector and samples an anchor into it,
-  which is not per-run and cannot move under the claim without losing its
-  meaning.
+* ``inflight_limit=2`` at chip-swimlane level 4 — overlap is required here too.
+  Its bind records host-orchestration phase state, which cannot move under the
+  claim without losing its meaning, so it is held per pipeline slot and
+  published to the resident collector at launch.
 
-The last two are what hold that boundary in place. It is invisible from goldens:
-the lane declines to stage silently rather than raising, so a run that lost its
-overlap, or one that kept an overlap it should not have, looks identical from
-outside.
+The last two are what hold that open. It is invisible from goldens: the lane
+declines to stage silently rather than raising, so a run that lost its overlap
+looks identical from outside.
 """
 
 import contextlib
+import pathlib
 import tempfile
 
 import pytest
@@ -190,7 +189,7 @@ class TestConcurrentPrepareStressHbg(SceneTestCase):
         # Distinct per-iteration data → a corrupted/aliased bank fails this.
         _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
-    def _drive_pipeline(self, chip_worker, callable_id, orch_sig, config, iters, inflight_limit):
+    def _drive_pipeline(self, chip_worker, callable_id, orch_sig, config, iters, inflight_limit, config_for=None):
         """Submit ``iters`` runs, never letting more than ``inflight_limit`` coexist.
 
         The direct-chip lane is the sole admission authority and follows the
@@ -201,10 +200,15 @@ class TestConcurrentPrepareStressHbg(SceneTestCase):
         against the other bank, i.e. the overlaps_active_run path. At
         ``inflight_limit=1`` every run reaches terminal before the next is
         submitted, so no bind can coexist with a device window.
+
+        ``config_for`` gives each iteration its own config, which is what lets a
+        caller send every run's artifacts to a different directory and so read
+        back what each one produced rather than only the last.
         """
         inflight = []
         for iteration in range(iters):
-            inflight.append(self._submit_iteration(chip_worker, callable_id, orch_sig, config, iteration))
+            run_config = config_for(iteration) if config_for is not None else config
+            inflight.append(self._submit_iteration(chip_worker, callable_id, orch_sig, run_config, iteration))
             if len(inflight) >= inflight_limit:
                 self._retire(inflight.pop(0))
         while inflight:
@@ -308,24 +312,27 @@ class TestConcurrentPrepareStressHbg(SceneTestCase):
 
         assert_native_overlap(parse_spans(captured.splitlines()))
 
-    def test_orch_phase_swimlane_serializes_the_native_lane(self, st_platform, st_worker, capfd, drain_host_log):
-        """Level-4 swimlane is the one diagnostics config that still serializes.
+    def test_orch_phase_swimlane_overlaps_the_native_lane(self, st_platform, st_worker, capfd, drain_host_log):
+        """Level-4 swimlane overlaps too, now that its phase state is per-run.
 
-        A host-orchestrating runtime opens a clock-correlation session on the
-        *resident* swimlane collector, and samples its ``HostOrchestrationBegin``
-        anchor into it, from inside bind — that is, from inside preparation,
-        which a prepared successor performs while its predecessor is still
-        executing. Unlike the collector pools, that state cannot move under the
-        execution claim: the anchor's whole meaning is when host orchestration
-        began. Until it is per-run, a level-4 run neither carries a prepared
-        successor nor is one, and the verdict must be *rejected*.
+        A host-orchestrating bind records phase events and samples a
+        ``HostOrchestrationBegin`` clock anchor, and neither can move under the
+        execution claim: the records describe the bind, and the anchor means the
+        instant host orchestration began. They are held per pipeline slot
+        instead, and everything destined for the resident swimlane collector is
+        published from the launch arming — so a successor's bind writes its own
+        state rather than resetting the predecessor's.
 
-        This is the arm that would go quiet if the exclusion were dropped without
-        making the session per-run: the lane declines to stage rather than
-        raising, so the runs would still succeed and their goldens still pass
-        while the predecessor's clock anchors were destroyed by the successor's
-        bind. It retires when that state becomes per-run, and then it flips to
-        the same `assert_native_overlap` its sibling arm above already makes.
+        This arm previously required the opposite verdict, which is what made
+        the exclusion visible while it existed.
+
+        Overlap alone would not detect a regression here: collapsing the state
+        back to one store still overlaps, it just loses a run's records. So the
+        arm also gives every iteration its own output directory and requires
+        each one's swimlane artifact to carry ``orchestrator_source: host``.
+        That marker is written only when the run's own host-phase records
+        reached the collector, so a predecessor whose store a successor's bind
+        reset produces an artifact without it.
         """
         if st_platform != "a2a3":
             pytest.skip("concurrent native prepare / two-bank pipeline is an a2a3 onboard path")
@@ -335,14 +342,31 @@ class TestConcurrentPrepareStressHbg(SceneTestCase):
         chip_worker = self._chip_worker(st_worker)
         callable_id = _ARM_CALLABLE_ID
 
-        with tempfile.TemporaryDirectory(prefix="simpler-orch-phase-lane-") as output_dir:
-            # 4 is ChipSwimlaneLevel::ORCH_PHASES, the only level whose bind arms
-            # host-orchestration phase state on the resident collector.
-            config = self._build_config({}, enable_chip_swimlane=4, output_prefix=output_dir)
+        with tempfile.TemporaryDirectory(prefix="simpler-orch-phase-lane-") as output_root:
+            root = pathlib.Path(output_root)
+            run_dirs = [root / f"run{i}" for i in range(_CONTROL_ITERS)]
+            for run_dir in run_dirs:
+                run_dir.mkdir()
+
+            # 4 is ChipSwimlaneLevel::ORCH_PHASES, the only level whose bind
+            # records host-orchestration phase state at all.
+            def config_for(iteration):
+                return self._build_config({}, enable_chip_swimlane=4, output_prefix=str(run_dirs[iteration]))
+
             with self._registered_callable(chip_worker, callable_id, callable_obj):
                 drain_host_log(capfd)
-                self._drive_pipeline(chip_worker, callable_id, orch_sig, config, _CONTROL_ITERS, inflight_limit=2)
+                self._drive_pipeline(
+                    chip_worker, callable_id, orch_sig, None, _CONTROL_ITERS, inflight_limit=2, config_for=config_for
+                )
                 captured = drain_host_log(capfd)
 
-        with pytest.raises(NativeOverlapError, match="did not overlap"):
-            assert_native_overlap(parse_spans(captured.splitlines()))
+            for iteration, run_dir in enumerate(run_dirs):
+                artifact = run_dir / "chip_swimlane_records.json"
+                assert artifact.exists(), f"run {iteration}: {artifact} missing"
+                assert '"orchestrator_source": "host"' in artifact.read_text(), (
+                    f"run {iteration}: its host-orchestration phase records never reached the collector. "
+                    f"A successor's bind reset the store this run was still waiting to publish, which is "
+                    f"what per-pipeline-slot host-phase state exists to prevent."
+                )
+
+        assert_native_overlap(parse_spans(captured.splitlines()))

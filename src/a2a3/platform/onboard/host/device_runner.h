@@ -257,7 +257,7 @@ private:
     // The kernel submission boundary is separate from the stream wait and
     // post-run teardown: launch_run() submits and drain_execution() reaps.
     LaunchTransactionResult launch_run(PreparedExecution &prepared, LaunchPermit permit);
-    int reap_run(const DfxRunConfig &dfx);
+    int reap_run(const DfxRunConfig &dfx, uint32_t pipeline_slot);
 
     // On an AICore launch/sync error, best-effort drain the device so a later
     // enqueue on the same DeviceRunner can recover in place; if the drain itself

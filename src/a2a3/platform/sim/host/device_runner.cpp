@@ -502,7 +502,7 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 set_scope_stats_enabled_func_(prepared->dfx.scope_stats_enabled);
                 set_platform_scope_stats_base_func_(kernel_args_.scope_stats_data_base);
 
-                start_shared_collectors_for_run(prepared->dfx);
+                start_shared_collectors_for_run(prepared->dfx, prepared->pipeline_slot);
                 if (prepared->dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
                     auto thread_factory = [this](std::function<void()> fn) {
                         return create_thread(std::move(fn));
@@ -629,11 +629,11 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
     int runtime_rc = run_completion_.first_error();
     if (runtime_rc != 0) {
         LOG_ERROR("AICPU execution failed with rc=%d", runtime_rc);
-        finish_clock_correlation_session(false);
+        finish_clock_correlation_session(active.prepared->pipeline_slot, false);
         return runtime_rc;
     }
 
-    teardown_shared_collectors_after_run(dfx, true);
+    teardown_shared_collectors_after_run(dfx, active.prepared->pipeline_slot, true);
 
     // Device-orch shape: the collector stops, the ring reconciles, and the
     // records replay. The host-orch shape emits at the end of bind instead, where
@@ -792,6 +792,12 @@ int DeviceRunner::arm_collectors_for_run(Runtime &runtime, PreparedExecution &pr
         finalize_collectors();
     }
     latch_collector_shape(num_aicore, aicpu_thread_num, launch_aicpu_num);
+
+    // Between the stale-shape release and the init: finalize() resets
+    // host_orchestrated_ and the collector's clock session, and initialize()
+    // reads host_orchestrated_ when it decides whether to size a device orch
+    // phase pool. Publishing before the release would lose both.
+    publish_host_phase_run_to_collector(prepared.pipeline_slot);
 
     int rc = 0;
     if (dfx.chip_swimlane_enabled()) {

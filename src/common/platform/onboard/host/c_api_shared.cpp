@@ -62,23 +62,6 @@ extern "C" int dlog_setlevel(int moduleId, int level, int enableEvent);
 extern "C" bool dep_gen_host_graph_active();
 extern "C" int dep_gen_host_graph_emit(const char *deps_json_path);
 
-/**
- * Whether a host-orchestrating bind arms the runner's host-phase record store.
- *
- * Strong in the host_build_graph runtime, where it reads the
- * SIMPLER_HBG_HOST_PHASE_RECORDS_ENABLE opt-in once; weak `false` below for the
- * device-orchestrating runtimes, whose bind never touches that store. The
- * pipeline admission reads it because the store is one per runner, not one per
- * run, so an opted-in run cannot carry a prepared successor.
- *
- * Declared with C++ linkage to match `host_phase_trace.h`. Giving it C linkage
- * here would mangle to a different symbol, which the weak definition would then
- * satisfy unconditionally — the opt-in would read `false` even where the strong
- * one is linked, and nothing would say so.
- */
-bool host_phase_records_enabled();
-__attribute__((weak)) bool host_phase_records_enabled() { return false; }
-
 using OnboardNativeRunContext = NativeRunContext<DeviceRunnerBase>;
 // Phase entry points validate raw caller storage before beginning object
 // lifetime, so the on-storage magic must remain the leading bytes.
@@ -263,14 +246,15 @@ static bool publish_chip_swimlane_extension(
            static_cast<DeviceRunnerBase *>(runner_ctx)->publish_chip_swimlane_extension(section, json_value, json_size);
 }
 
-static void *host_phase_pool_arm(void *runner_ctx, int producer_wants_records) {
+static void *host_phase_pool_arm(void *runner_ctx, uint32_t pipeline_slot, int producer_wants_records) {
     if (runner_ctx == nullptr) return nullptr;
-    return static_cast<DeviceRunnerBase *>(runner_ctx)->host_phase_pool_arm(producer_wants_records != 0);
+    return static_cast<DeviceRunnerBase *>(runner_ctx)->host_phase_pool_arm(pipeline_slot, producer_wants_records != 0);
 }
 
-static void host_phase_pool_finish(void *runner_ctx, uint64_t submitted_tasks, uint64_t invocation_id) {
+static void
+host_phase_pool_finish(void *runner_ctx, uint32_t pipeline_slot, uint64_t submitted_tasks, uint64_t invocation_id) {
     if (runner_ctx == nullptr) return;
-    static_cast<DeviceRunnerBase *>(runner_ctx)->host_phase_pool_finish(submitted_tasks, invocation_id);
+    static_cast<DeviceRunnerBase *>(runner_ctx)->host_phase_pool_finish(pipeline_slot, submitted_tasks, invocation_id);
 }
 
 static int setup_static_arena_wrapper(
@@ -721,7 +705,9 @@ static int cleanup_failed_prepare(OnboardNativeRunContext *state, int execution_
     char trace_attrs[sizeof(state->trace_attrs)];
     std::memcpy(trace_attrs, state->trace_attrs, sizeof(trace_attrs));
     if (clear_gm_sm) state->runtime.set_gm_sm_ptr(nullptr);
-    state->runner->finish_clock_correlation_session(false, !state->runner->can_accept_run());
+    state->runner->finish_clock_correlation_session(
+        state->descriptor.pipeline_slot, false, !state->runner->can_accept_run()
+    );
     int validation_rc = PTO_RUNTIME_ERR_INTERNAL;
     try {
         validation_rc = validate_runtime_impl(&state->runtime, &state->host_api, execution_rc);
@@ -811,17 +797,7 @@ int simpler_prepare_run(
             static_cast<unsigned long long>(state->descriptor.generation),
             static_cast<unsigned long long>(state->descriptor.run_epoch)
         );
-        // Level-4 swimlane and the host-phase record opt-in both make a
-        // host-orchestrating bind arm state that is not per-run — a
-        // clock-correlation session and anchor samples on the resident swimlane
-        // collector, and the runner's single host-phase record store. A prepared
-        // successor binds while its predecessor is still executing, so a run
-        // under either keeps the pipeline at depth one. Every other diagnostics
-        // config overlaps: what its preparation would arm is built and reset
-        // under the execution claim.
-        const bool allow_prepared_successor = concurrent_native_prepare_supported_impl() != 0 &&
-                                              !config->captures_host_orchestration_phases() &&
-                                              !host_phase_records_enabled();
+        const bool allow_prepared_successor = concurrent_native_prepare_supported_impl() != 0;
         if (!runner->try_reserve_native_run(
                 state, state->descriptor.pipeline_slot, state->descriptor.arena_bank, allow_prepared_successor
             )) {
@@ -889,6 +865,10 @@ int simpler_prepare_run(
         // ahead of its bind whether or not it overlaps a predecessor. It writes
         // nothing the two runs share.
         runner->arm_host_dep_gen_capture(config->enable_dep_gen != 0);
+        // Same reason, different state: a host-orchestrating bind records phase
+        // events and samples its clock anchor, and both belong to the run doing
+        // the binding rather than to whichever run last held the claim.
+        runner->begin_host_phase_run(state->descriptor.pipeline_slot, DfxRunConfig::from(*config));
 
         {
             STRACE("chip.run.bind");
@@ -927,7 +907,7 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         // The host phase records describe the bind path this variable exists to
         // measure, so they are written here as well as in the device-run
         // teardown. Skipping the device must not skip the artifact.
-        state->runner->write_host_phase_records_artifact(state->config.output_prefix);
+        state->runner->write_host_phase_records_artifact(state->config.output_prefix, state->descriptor.pipeline_slot);
         state->completion_rc = 0;
         state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
         return 0;
@@ -1106,10 +1086,12 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         state->runner_resources_owned = false;
     }
 
-    // Correlation state is runner-wide. Finish it before releasing either
-    // ownership token, after which a successor may begin capture and replace
-    // the provider/session.
-    state->runner->finish_clock_correlation_session(false, !state->runner->can_accept_run());
+    // The collector's session is still resident even though the provider and the
+    // anchors are per-run, so finish it before releasing either ownership token,
+    // after which a successor may publish its own.
+    state->runner->finish_clock_correlation_session(
+        state->descriptor.pipeline_slot, false, !state->runner->can_accept_run()
+    );
     if (state->runner_claimed) {
         // The point a successor's launch becomes admissible. Ordering a
         // successor's device work against this boundary is what separates a

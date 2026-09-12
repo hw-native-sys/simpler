@@ -391,7 +391,7 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
         cleanup_execution(prepared, /*retire_aicore=*/true);
     });
 
-    int rc = reap_run(prepared.dfx);
+    int rc = reap_run(prepared.dfx, prepared.pipeline_slot);
     if (rc != 0) {
         // The device/sync error remains authoritative over teardown errors.
         return rc;
@@ -553,7 +553,7 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
                 activate_launch_shape(runtime);
                 (void)arm_device_wall_buffer(prepared.kernel_args);
                 if (int arm_rc = arm_collectors_for_run(runtime, prepared); arm_rc != 0) return arm_rc;
-                start_shared_collectors_for_run(prepared.dfx);
+                start_shared_collectors_for_run(prepared.dfx, prepared.pipeline_slot);
                 if (prepared.dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
                     auto thread_factory = [this](std::function<void()> fn) {
                         return create_thread(std::move(fn));
@@ -624,7 +624,7 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
     return result;
 }
 
-int DeviceRunner::reap_run(const DfxRunConfig &dfx) {
+int DeviceRunner::reap_run(const DfxRunConfig &dfx, uint32_t pipeline_slot) {
     if (!run_streams_.ready()) {
         LOG_ERROR("reap_run: the run stream pair is not ready");
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -645,7 +645,7 @@ int DeviceRunner::reap_run(const DfxRunConfig &dfx) {
         // JSON manifest, i.e. unusable for triage. reconcile/export are not
         // idempotent, so this runs only on the error return; the success path
         // still exports exactly once below.
-        teardown_shared_collectors_after_run(dfx, false);
+        teardown_shared_collectors_after_run(dfx, pipeline_slot, false);
         return rc;
     }
 
@@ -653,7 +653,7 @@ int DeviceRunner::reap_run(const DfxRunConfig &dfx) {
 
     // Tear down collectors. stop() joins mgmt then collector in the only safe
     // order (mgmt's final-drain pass into L2 has poll as its consumer).
-    teardown_shared_collectors_after_run(dfx, true);
+    teardown_shared_collectors_after_run(dfx, pipeline_slot, true);
 
     // a2a3-only dep_gen teardown, device-orch shape: the collector stops, the
     // ring reconciles, and the records replay. The host-orch shape emits at the
@@ -1088,6 +1088,12 @@ int DeviceRunner::arm_collectors_for_run(Runtime &runtime, PreparedExecution &pr
         finalize_collectors();
     }
     latch_collector_shape(num_aicore, aicpu_thread_num, launch_aicpu_num);
+
+    // Between the stale-shape release and the init: finalize() resets
+    // host_orchestrated_ and the collector's clock session, and initialize()
+    // reads host_orchestrated_ when it decides whether to size a device orch
+    // phase pool. Publishing before the release would lose both.
+    publish_host_phase_run_to_collector(prepared.pipeline_slot);
 
     int rc = 0;
     if (dfx.chip_swimlane_enabled()) {

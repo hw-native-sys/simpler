@@ -18,14 +18,6 @@
 #include "common/chip_swimlane_profiling.h"
 #include "host/pmu_collector.h"
 
-// CallConfig::captures_host_orchestration_phases() spells this level as a bare
-// literal, because the task-interface ABI header cannot include the profiling
-// headers. This is the only place that sees both.
-static_assert(
-    static_cast<int32_t>(ChipSwimlaneLevel::ORCH_PHASES) == 4,
-    "CallConfig::captures_host_orchestration_phases() hardcodes the ORCH_PHASES level"
-);
-
 /**
  * One run's diagnostics configuration, resolved from its own CallConfig.
  *

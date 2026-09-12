@@ -145,8 +145,10 @@ struct HostApiOps {
     // chip-swimlane level, `producer_wants_records` carries the producer's own
     // (a runtime knob the platform does not read).
     uint32_t (*get_chip_swimlane_level)(void *runner_ctx);
-    void *(*host_phase_pool_arm)(void *runner_ctx, int producer_wants_records);
-    void (*host_phase_pool_finish)(void *runner_ctx, uint64_t submitted_tasks, uint64_t invocation_id);
+    void *(*host_phase_pool_arm)(void *runner_ctx, uint32_t pipeline_slot, int producer_wants_records);
+    void (*host_phase_pool_finish)(
+        void *runner_ctx, uint32_t pipeline_slot, uint64_t submitted_tasks, uint64_t invocation_id
+    );
     bool (*publish_chip_swimlane_extension)(
         void *runner_ctx, ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size
     );
@@ -243,6 +245,11 @@ public:
     /**
      * Arm this pass's host phase pool.
      *
+     * The pool is one per pipeline slot, not one per runner: a host-orchestrating
+     * bind is preparation, and a prepared successor prepares while its
+     * predecessor is still executing. `pipeline_slot_` is this run's, so the
+     * hook needs no argument for it.
+     *
      * @param producer_wants_records  the producer's own enabling condition; the
      *                                runner ORs it with the chip-swimlane level
      * @return HostPhaseRecordPool* to record into, or nullptr when this pass
@@ -251,11 +258,11 @@ public:
      */
     void *host_phase_pool_arm(bool producer_wants_records) const noexcept {
         if (ops_->host_phase_pool_arm == nullptr) return nullptr;
-        return ops_->host_phase_pool_arm(runner_ctx_, producer_wants_records ? 1 : 0);
+        return ops_->host_phase_pool_arm(runner_ctx_, pipeline_slot_, producer_wants_records ? 1 : 0);
     }
     void host_phase_pool_finish(uint64_t submitted_tasks, uint64_t invocation_id) const noexcept {
         if (ops_->host_phase_pool_finish != nullptr) {
-            ops_->host_phase_pool_finish(runner_ctx_, submitted_tasks, invocation_id);
+            ops_->host_phase_pool_finish(runner_ctx_, pipeline_slot_, submitted_tasks, invocation_id);
         }
     }
     bool publish_chip_swimlane_extension(

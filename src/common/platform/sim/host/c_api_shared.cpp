@@ -229,14 +229,17 @@ static bool publish_chip_swimlane_extension(
                                         ->publish_chip_swimlane_extension(section, json_value, json_size);
 }
 
-static void *host_phase_pool_arm(void *runner_ctx, int producer_wants_records) {
+static void *host_phase_pool_arm(void *runner_ctx, uint32_t pipeline_slot, int producer_wants_records) {
     if (runner_ctx == nullptr) return nullptr;
-    return static_cast<SimDeviceRunnerBase *>(runner_ctx)->host_phase_pool_arm(producer_wants_records != 0);
+    return static_cast<SimDeviceRunnerBase *>(runner_ctx)
+        ->host_phase_pool_arm(pipeline_slot, producer_wants_records != 0);
 }
 
-static void host_phase_pool_finish(void *runner_ctx, uint64_t submitted_tasks, uint64_t invocation_id) {
+static void
+host_phase_pool_finish(void *runner_ctx, uint32_t pipeline_slot, uint64_t submitted_tasks, uint64_t invocation_id) {
     if (runner_ctx == nullptr) return;
-    static_cast<SimDeviceRunnerBase *>(runner_ctx)->host_phase_pool_finish(submitted_tasks, invocation_id);
+    static_cast<SimDeviceRunnerBase *>(runner_ctx)
+        ->host_phase_pool_finish(pipeline_slot, submitted_tasks, invocation_id);
 }
 
 static int setup_static_arena_wrapper(
@@ -670,7 +673,7 @@ static int cleanup_failed_prepare(SimNativeRunContext *state, int execution_rc, 
     const uint64_t trace_hid = state->trace_hid;
     const long long trace_start_ns = state->trace_start_ns;
     if (clear_gm_sm) state->runtime.set_gm_sm_ptr(nullptr);
-    state->runner->finish_clock_correlation_session(false);
+    state->runner->finish_clock_correlation_session(state->descriptor.pipeline_slot, false);
     int validation_rc = PTO_RUNTIME_ERR_INTERNAL;
     try {
         validation_rc = validate_runtime_impl(&state->runtime, &state->host_api, execution_rc);
@@ -749,6 +752,8 @@ int simpler_prepare_run(
         if (rc != 0) return cleanup_failed_prepare(state, rc, true);
 
         runner->apply_call_config(state->config);
+        // This run's host-phase state, before its bind records into it.
+        runner->begin_host_phase_run(state->descriptor.pipeline_slot, DfxRunConfig::from(state->config));
         // Armed from this run's own config on the thread that is about to bind:
         // a host-orchestrating runtime keeps the capture in thread-local state
         // between orchestration and emit. Mirrors the onboard c_api.
@@ -923,7 +928,7 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
 
     // Correlation state is runner-wide. Finish it before releasing the claim,
     // after which a successor may begin capture and replace the provider/session.
-    state->runner->finish_clock_correlation_session(false);
+    state->runner->finish_clock_correlation_session(state->descriptor.pipeline_slot, false);
     if (state->runner_claimed) {
         state->runner->release_native_run(state);
         state->runner_claimed = false;

@@ -59,6 +59,7 @@
 #include "host/chip_swimlane_collector.h"
 #include "host/dfx_run_config.h"
 #include "host/host_phase_records.h"
+#include "host/host_phase_run_state.h"
 #include "host/args_dump_collector.h"
 #include "host/pmu_collector.h"
 #include "host/scope_stats_collector.h"
@@ -300,13 +301,19 @@ public:
         return json_value != nullptr &&
                chip_swimlane_collector_.set_json_extension(section, std::string(json_value, json_size));
     }
-    HostPhaseRecordPool *host_phase_pool_arm(bool producer_wants_records) noexcept;
-    void host_phase_pool_finish(uint64_t submitted_tasks, uint64_t invocation_id) noexcept {
-        host_phase_records_.finish(submitted_tasks, invocation_id);
+    /** Hand one slot's host-phase state to the run about to bind into it. */
+    void begin_host_phase_run(uint32_t pipeline_slot, const DfxRunConfig &dfx);
+    HostPhaseRecordPool *host_phase_pool_arm(uint32_t pipeline_slot, bool producer_wants_records) noexcept;
+    void host_phase_pool_finish(uint32_t pipeline_slot, uint64_t submitted_tasks, uint64_t invocation_id) noexcept {
+        if (pipeline_slot >= host_phase_runs_.size()) return;
+        host_phase_runs_[pipeline_slot].records.finish(submitted_tasks, invocation_id);
     }
-    const simpler::dfx::HostPhaseRecordStore &host_phase_records() const { return host_phase_records_; }
+    /** Hand this run's captured clock session to the resident collector, at launch. */
+    void publish_host_phase_run_to_collector(uint32_t pipeline_slot) noexcept;
+    /** Create this run's provider and sample its HostOrchestrationBegin anchors. */
+    void capture_clock_correlation_begin(HostPhaseRunState &run) noexcept;
     /** Hand this pass's records to the swimlane reader, just before its export. */
-    void publish_host_phase_records_to_swimlane();
+    void publish_host_phase_records_to_swimlane(uint32_t pipeline_slot);
     /**
      * Publish arch-specific runtime metadata into the swimlane export, between
      * the host-phase handoff and the export itself — the only point at which the
@@ -323,9 +330,9 @@ public:
      * with arch-specific collectors (`dep_gen_collector_`) call this and then
      * open and start their own.
      */
-    void start_shared_collectors_for_run(const DfxRunConfig &dfx);
+    void start_shared_collectors_for_run(const DfxRunConfig &dfx, uint32_t pipeline_slot);
     /** Write this pass's per-event host phase records, if it collected any. */
-    void write_host_phase_records_artifact(const std::string &output_prefix);
+    void write_host_phase_records_artifact(const std::string &output_prefix, uint32_t pipeline_slot);
     /**
      * Tear down the four shared diagnostics collectors after the launched
      * kernels have synced, in the one order their couplings allow: the clock
@@ -337,10 +344,12 @@ public:
      * `dep_gen_replay_emit_deps_json` export) inline their own teardown after
      * calling this helper, as on onboard.
      */
-    void teardown_shared_collectors_after_run(const DfxRunConfig &dfx, bool device_execution_complete);
+    void teardown_shared_collectors_after_run(
+        const DfxRunConfig &dfx, uint32_t pipeline_slot, bool device_execution_complete
+    );
     /** Start the level-4 Host/Device clock correlation once per run. */
-    void begin_clock_correlation_session_if_needed() noexcept;
-    void finish_clock_correlation_session(bool capture_device_complete) noexcept;
+    void begin_clock_correlation_session_if_needed(uint32_t pipeline_slot) noexcept;
+    void finish_clock_correlation_session(uint32_t pipeline_slot, bool capture_device_complete) noexcept;
     // Diagnostic artifact root directory (CallConfig::validate() enforces non-empty
     // upstream when any diagnostic is enabled).
     void set_output_prefix(const char *prefix) { output_prefix_ = (prefix != nullptr) ? prefix : ""; }
@@ -553,8 +562,11 @@ protected:
     // Not a collector: the pool the runtime's prepare path writes into, read by
     // whichever per-event views the run enabled. Its two readers are gated
     // independently, so it belongs to neither.
-    simpler::dfx::HostPhaseRecordStore host_phase_records_;
-    std::unique_ptr<simpler::dfx::ClockCorrelationProvider> clock_correlation_provider_{};
+    // One per pipeline slot: a bind is preparation, and a prepared successor
+    // binds while its predecessor still owns the collectors.
+    std::array<HostPhaseRunState, PTO_PIPELINE_MAX_DEPTH> host_phase_runs_{};
+    // Which slot's session the resident collector holds; see the onboard base.
+    uint32_t clock_correlation_session_slot_{PTO_PIPELINE_MAX_DEPTH};
     ArgsDumpCollector dump_collector_;
     PmuCollector pmu_collector_;
     ScopeStatsCollector scope_stats_collector_;
