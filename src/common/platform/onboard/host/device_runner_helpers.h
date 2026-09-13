@@ -47,12 +47,34 @@
 int query_stream_pair_nonblocking(rtStream_t aicpu_stream, rtStream_t aicore_stream);
 
 /**
+ * The device blocks one pipeline slot reuses across every run it prepares.
+ *
+ * All three have a size fixed for the runner's lifetime — `sizeof(KernelArgs)`,
+ * the runtime variant's device-copy length, and the architecture register
+ * table — so a run rewrites their contents rather than reallocating them. A
+ * slot admits at most one run at a time (`try_reserve_native_run` rejects a
+ * second reservation on an occupied slot), so one block per slot needs no
+ * further serialization.
+ *
+ * The runner owns these for its whole lifetime and releases them in
+ * `finalize()`, alongside the collector resources that already work this way.
+ */
+struct SlotPersistentArgs {
+    Runtime *runtime_args{nullptr};      // device copy of the Runtime prefix
+    KernelArgs *device_k_args{nullptr};  // device copy of KernelArgs for AICore
+    uint64_t regs{0};                    // architecture register table
+    uint64_t runtime_bytes{0};           // committed length of runtime_args
+};
+
+/**
  * Helper class for managing `KernelArgs` with device memory.
  *
  * Wraps `KernelArgs` (defined per-arch in `common/kernel_args.h`) and provides
- * host-side initialization methods for allocating device memory and copying
- * data to the device. Separates device-memory management (host-only) from the
- * structure layout (shared with kernels).
+ * host-side initialization methods for publishing data to the device. The
+ * `KernelArgs` value is per-run: every prepare refills it and copies it over.
+ * The device blocks it names are not — they live in the slot's
+ * `SlotPersistentArgs` and are only rewritten here. Separates device-memory
+ * management (host-only) from the structure layout (shared with kernels).
  *
  * The helper provides implicit conversion to `KernelArgs *` for seamless use
  * with runtime APIs.
@@ -77,28 +99,35 @@ struct KernelArgsHelper {
     KernelArgs *device_k_args_{nullptr};  // Device copy of KernelArgs for AICore
 
     /**
-     * Initialize runtime arguments by allocating device memory and copying data.
+     * Publish the host runtime into the slot's device copy, committing that
+     * copy on first use.
      *
      * @param host_runtime  Host-side runtime to copy to device.
      * @param allocator     Memory allocator to use.
+     * @param slot          The slot's persistent device blocks.
      * @return 0 on success, error code on failure.
      */
-    int init_runtime_args(const Runtime &host_runtime, MemoryAllocator &allocator);
-
-    /** Free device memory allocated for runtime arguments. */
-    int finalize_runtime_args();
+    int init_runtime_args(const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot);
 
     /**
-     * Allocate device memory for the host-resident `KernelArgs` and copy the
-     * struct over. AICore's `KERNEL_ENTRY` expects a `KernelArgs *` (not a
-     * `Runtime *`) so it can read the profiling enablement bits + ring address
-     * tables and forward them into AICore platform state. Call this after
-     * every `kernel_args.args.*` field is populated for the run.
+     * Publish this run's `KernelArgs` into the slot's device copy, committing
+     * that copy on first use. AICore's `KERNEL_ENTRY` expects a `KernelArgs *`
+     * (not a `Runtime *`) so it can read the profiling enablement bits + ring
+     * address tables and forward them into AICore platform state. Call this
+     * after every `kernel_args.args.*` field is populated for the run.
      */
-    int init_device_kernel_args(MemoryAllocator &allocator);
+    int init_device_kernel_args(MemoryAllocator &allocator, SlotPersistentArgs &slot);
 
-    /** Free device memory allocated for the device-resident `KernelArgs` copy. */
-    int finalize_device_kernel_args();
+    /**
+     * Drop this run's view of the slot's device blocks.
+     *
+     * The blocks themselves stay committed for the next run on this slot; only
+     * the per-run `KernelArgs` stops naming them.
+     */
+    void release_run_view() {
+        args.runtime_args = nullptr;
+        device_k_args_ = nullptr;
+    }
 
     /**
      * Clear device-pointer bookkeeping without calling the allocator.
@@ -120,3 +149,20 @@ struct KernelArgsHelper {
     operator KernelArgs *() { return &args; }
     KernelArgs *operator&() { return &args; }
 };
+
+/**
+ * Release one slot's persistent device blocks and clear its bookkeeping.
+ *
+ * Returns the first failing free's code, having attempted every block, so a
+ * single failure cannot strand the rest. A block whose free fails keeps its
+ * address so a retry reaches it again.
+ */
+int release_slot_persistent_args(SlotPersistentArgs &slot, MemoryAllocator &allocator);
+
+/**
+ * Drop one slot's persistent device blocks without calling the allocator.
+ *
+ * Used only by fatal teardown, where a reset has already invalidated the
+ * device generation these addresses belong to.
+ */
+void abandon_slot_persistent_args(SlotPersistentArgs &slot);

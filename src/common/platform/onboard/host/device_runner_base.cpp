@@ -1721,13 +1721,26 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
         device_wall_dev_ptr_ = nullptr;
     }
 
+    // Each slot's KernelArgs / runtime / register blocks outlive the runs that
+    // use them, so this is where they are returned — same reason and same
+    // ordering constraint as the device-wall buffer above. A failing free keeps
+    // its block recorded, so reporting the error is what lets a caller retry
+    // reach it.
+    for (SlotPersistentArgs &slot : slot_persistent_args_) {
+        if (abandon_device_resources) {
+            abandon_slot_persistent_args(slot);
+        } else {
+            capture(release_slot_persistent_args(slot, mem_alloc_));
+        }
+    }
+
     // Free all remaining allocations (including handshake buffer and binGmAddr)
     if (!abandon_device_resources) {
         // The mappings name the allocations mem_alloc_ is about to free, so
         // they cannot be released after it. A force reset already invalidated
         // both, and the unregister would be a further device call.
         release_child_memory_host_views();
-        mem_alloc_.finalize();
+        capture(mem_alloc_.finalize());
     }
 
     block_dim_ = 0;
@@ -2049,8 +2062,10 @@ void DeviceRunnerBase::read_device_wall_ns() {
     }
 }
 
-int DeviceRunnerBase::init_runtime_args_with_metadata(Runtime &runtime, KernelArgsHelper &kernel_args) {
-    int rc = kernel_args.init_runtime_args(runtime, mem_alloc_);
+int DeviceRunnerBase::init_runtime_args_with_metadata(
+    Runtime &runtime, KernelArgsHelper &kernel_args, SlotPersistentArgs &slot
+) {
+    int rc = kernel_args.init_runtime_args(runtime, mem_alloc_, slot);
     if (rc != 0) {
         LOG_ERROR("init_runtime_args failed: %d", rc);
         return rc;

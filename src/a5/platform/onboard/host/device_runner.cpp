@@ -326,13 +326,17 @@ int DeviceRunner::prepare_execution(
     }
     int num_aicore = block_dim * cores_per_blockdim_;
 
-    rc = init_aicore_register_addresses(
-        &execution->kernel_args.args.regs, static_cast<uint64_t>(device_id_), mem_alloc_
-    );
-    if (rc != 0) {
-        LOG_ERROR("init_aicore_register_addresses failed: %d", rc);
-        return rc;
+    // The register table is a property of the device, not of the run, so the
+    // slot commits it once and every later run on that slot reuses it.
+    SlotPersistentArgs &slot_args = slot_persistent_args(execution->pipeline_slot);
+    if (slot_args.regs == 0) {
+        rc = init_aicore_register_addresses(&slot_args.regs, static_cast<uint64_t>(device_id_), mem_alloc_);
+        if (rc != 0) {
+            LOG_ERROR("init_aicore_register_addresses failed: %d", rc);
+            return rc;
+        }
     }
+    execution->kernel_args.args.regs = slot_args.regs;
 
     // The AICore-visible half of this — the profiling flag and the swimlane /
     // PMU ring tables — is built by `arm_collectors_for_run` at launch and
@@ -422,10 +426,10 @@ int DeviceRunner::prepare_execution(
         LOG_ERROR("prepare_orch_so failed: %d", rc);
         return rc;
     }
-    rc = init_runtime_args_with_metadata(runtime, execution->kernel_args);
+    rc = init_runtime_args_with_metadata(runtime, execution->kernel_args, slot_args);
     if (rc != 0) return rc;
 
-    rc = execution->kernel_args.init_device_kernel_args(mem_alloc_);
+    rc = execution->kernel_args.init_device_kernel_args(mem_alloc_, slot_args);
     if (rc != 0) {
         LOG_ERROR("init_device_kernel_args failed: %d", rc);
         return rc;
@@ -635,20 +639,17 @@ void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool launched)
     const bool abandon = device_unusable_.load(std::memory_order_acquire);
 
     // Collectors stop before device/runtime arguments and register buffers.
-    // The collectors' device resources are not per-run: they are released in
-    // finalize(), which owns them for the worker's lifetime.
+    // The collectors' device resources are not per-run, and neither are the
+    // slot's KernelArgs / runtime / register blocks: both are released in
+    // finalize(), which owns them for the worker's lifetime. A run only stops
+    // naming them here.
     if (abandon) {
         prepared.kernel_args.abandon_after_device_failure();
+        abandon_slot_persistent_args(slot_persistent_args(prepared.pipeline_slot));
     } else {
-        (void)prepared.kernel_args.finalize_device_kernel_args();
-        (void)prepared.kernel_args.finalize_runtime_args();
+        prepared.kernel_args.release_run_view();
     }
-    if (prepared.kernel_args.args.regs != 0) {
-        if (!abandon) {
-            (void)mem_alloc_.free(reinterpret_cast<void *>(prepared.kernel_args.args.regs));
-        }
-        prepared.kernel_args.args.regs = 0;
-    }
+    prepared.kernel_args.args.regs = 0;
     prepared.resources_owned = false;
     if (launched) run_poll_state_.store(RunPollState::Drained, std::memory_order_release);
 }
@@ -1086,7 +1087,7 @@ int DeviceRunner::arm_collectors_for_run(Runtime &runtime, PreparedExecution &pr
     // before any of the above ran. The AICPU side needs no refresh: it receives
     // the host-side struct as the launch argument blob.
     if (dfx.diagnostics_any()) {
-        rc = prepared.kernel_args.init_device_kernel_args(mem_alloc_);
+        rc = prepared.kernel_args.init_device_kernel_args(mem_alloc_, slot_persistent_args(prepared.pipeline_slot));
         if (rc != 0) {
             LOG_ERROR("KernelArgs refresh after collector arming failed: %d", rc);
             return rc;

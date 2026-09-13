@@ -1048,7 +1048,7 @@ protected:
      *
      * @return 0 on success, the underlying init_runtime_args rc on failure.
      */
-    int init_runtime_args_with_metadata(Runtime &runtime, KernelArgsHelper &kernel_args);
+    int init_runtime_args_with_metadata(Runtime &runtime, KernelArgsHelper &kernel_args, SlotPersistentArgs &slot);
 
     /**
      * Open this run's collection window on the four shared diagnostics
@@ -1405,6 +1405,16 @@ protected:
     std::array<std::unique_ptr<ArenaBank>, PTO_PIPELINE_MAX_DEPTH> arena_banks_;
     ArenaBank &arena_bank(uint32_t bank_id) { return *arena_banks_[bank_id]; }
 
+    // The device blocks each pipeline slot reuses across its runs. Committed on
+    // a slot's first prepare and released in finalize(), so a steady-state run
+    // rewrites their contents instead of reallocating them.
+    std::array<SlotPersistentArgs, PTO_PIPELINE_MAX_DEPTH> slot_persistent_args_;
+
+public:
+    /** The persistent device blocks belonging to one pipeline slot. */
+    SlotPersistentArgs &slot_persistent_args(uint32_t pipeline_slot) { return slot_persistent_args_[pipeline_slot]; }
+
+protected:
     bool prebuilt_runtime_arena_cache_valid_{false};
     uint64_t prebuilt_runtime_arena_cache_hash_{0};
     std::vector<uint8_t> prebuilt_runtime_arena_cache_key_;

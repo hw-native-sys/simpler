@@ -57,7 +57,9 @@ int query_stream_pair_nonblocking(rtStream_t aicpu_stream, rtStream_t aicore_str
     return SIMPLER_NATIVE_RUN_POLL_NOT_READY;
 }
 
-int KernelArgsHelper::init_runtime_args(const Runtime &host_runtime, MemoryAllocator &allocator) {
+int KernelArgsHelper::init_runtime_args(
+    const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot
+) {
     allocator_ = &allocator;
 
     // Only the device-read prefix of Runtime crosses to the device: trb copies
@@ -65,58 +67,88 @@ int KernelArgsHelper::init_runtime_args(const Runtime &host_runtime, MemoryAlloc
     // at &host_runtime; runtime_device_copy_size() picks the right length per
     // runtime variant so this shared path stays runtime-agnostic.
     const uint64_t runtime_size = runtime_device_copy_size(host_runtime);
-    if (args.runtime_args == nullptr) {
+    // The length is a property of the runtime variant, which is fixed for a
+    // runner, so a committed block always fits. A mismatch would mean the
+    // block belongs to a different variant than the run being prepared.
+    if (slot.runtime_args != nullptr && slot.runtime_bytes != runtime_size) {
+        LOG_ERROR(
+            "runtime_args block is %llu bytes but this run needs %llu",
+            static_cast<unsigned long long>(slot.runtime_bytes), static_cast<unsigned long long>(runtime_size)
+        );
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (slot.runtime_args == nullptr) {
         void *runtime_dev = allocator_->alloc(runtime_size);
         if (runtime_dev == nullptr) {
             LOG_ERROR("Alloc for runtime_args failed");
             return PTO_RUNTIME_ERR_INTERNAL;
         }
-        args.runtime_args = reinterpret_cast<Runtime *>(runtime_dev);
+        slot.runtime_args = reinterpret_cast<Runtime *>(runtime_dev);
+        slot.runtime_bytes = runtime_size;
     }
+    args.runtime_args = slot.runtime_args;
     int rc = rtMemcpy(args.runtime_args, runtime_size, &host_runtime, runtime_size, RT_MEMCPY_HOST_TO_DEVICE);
     if (rc != 0) {
         LOG_ERROR("rtMemcpy for runtime failed: %d", rc);
-        allocator_->free(args.runtime_args);
         args.runtime_args = nullptr;
         return rc;
     }
     return 0;
 }
 
-int KernelArgsHelper::finalize_runtime_args() {
-    if (args.runtime_args != nullptr && allocator_ != nullptr) {
-        int rc = allocator_->free(args.runtime_args);
-        args.runtime_args = nullptr;
-        return rc;
-    }
-    return 0;
-}
-
-int KernelArgsHelper::init_device_kernel_args(MemoryAllocator &allocator) {
+int KernelArgsHelper::init_device_kernel_args(MemoryAllocator &allocator, SlotPersistentArgs &slot) {
     allocator_ = &allocator;
-    if (device_k_args_ == nullptr) {
+    if (slot.device_k_args == nullptr) {
         void *dev_ptr = allocator_->alloc(sizeof(KernelArgs));
         if (dev_ptr == nullptr) {
             LOG_ERROR("Alloc for device KernelArgs failed");
             return PTO_RUNTIME_ERR_INTERNAL;
         }
-        device_k_args_ = reinterpret_cast<KernelArgs *>(dev_ptr);
+        slot.device_k_args = reinterpret_cast<KernelArgs *>(dev_ptr);
     }
+    device_k_args_ = slot.device_k_args;
     int rc = rtMemcpy(device_k_args_, sizeof(KernelArgs), &args, sizeof(KernelArgs), RT_MEMCPY_HOST_TO_DEVICE);
     if (rc != 0) {
         LOG_ERROR("rtMemcpy for KernelArgs failed: %d", rc);
-        allocator_->free(device_k_args_);
         device_k_args_ = nullptr;
         return rc;
     }
     return 0;
 }
 
-int KernelArgsHelper::finalize_device_kernel_args() {
-    if (device_k_args_ != nullptr && allocator_ != nullptr) {
-        int rc = allocator_->free(device_k_args_);
-        device_k_args_ = nullptr;
-        return rc;
+int release_slot_persistent_args(SlotPersistentArgs &slot, MemoryAllocator &allocator) {
+    int first_error = 0;
+    if (slot.device_k_args != nullptr) {
+        const int rc = allocator.free(slot.device_k_args);
+        if (rc != 0) {
+            first_error = rc;
+        } else {
+            slot.device_k_args = nullptr;
+        }
     }
-    return 0;
+    if (slot.runtime_args != nullptr) {
+        const int rc = allocator.free(slot.runtime_args);
+        if (rc != 0) {
+            if (first_error == 0) first_error = rc;
+        } else {
+            slot.runtime_args = nullptr;
+            slot.runtime_bytes = 0;
+        }
+    }
+    if (slot.regs != 0) {
+        const int rc = allocator.free(reinterpret_cast<void *>(slot.regs));
+        if (rc != 0) {
+            if (first_error == 0) first_error = rc;
+        } else {
+            slot.regs = 0;
+        }
+    }
+    return first_error;
+}
+
+void abandon_slot_persistent_args(SlotPersistentArgs &slot) {
+    slot.device_k_args = nullptr;
+    slot.runtime_args = nullptr;
+    slot.runtime_bytes = 0;
+    slot.regs = 0;
 }

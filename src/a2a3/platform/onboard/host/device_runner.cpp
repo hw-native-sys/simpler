@@ -283,14 +283,20 @@ int DeviceRunner::prepare_execution(
     }
     int num_aicore = block_dim * cores_per_blockdim_;
 
-    // Get AICore register addresses for register-based task dispatch
-    rc = init_aicore_register_addresses(
-        &execution->kernel_args.args.regs, static_cast<uint64_t>(device_id_), mem_alloc_, AicoreRegKind::Ctrl
-    );
-    if (rc != 0) {
-        LOG_ERROR("init_aicore_register_addresses(Ctrl) failed: %d", rc);
-        return rc;
+    // Get AICore register addresses for register-based task dispatch. The table
+    // is a property of the device, not of the run, so the slot commits it once
+    // and every later run on that slot reuses the same addresses.
+    SlotPersistentArgs &slot_args = slot_persistent_args(execution->pipeline_slot);
+    if (slot_args.regs == 0) {
+        rc = init_aicore_register_addresses(
+            &slot_args.regs, static_cast<uint64_t>(device_id_), mem_alloc_, AicoreRegKind::Ctrl
+        );
+        if (rc != 0) {
+            LOG_ERROR("init_aicore_register_addresses(Ctrl) failed: %d", rc);
+            return rc;
+        }
     }
+    execution->kernel_args.args.regs = slot_args.regs;
 
     // Get AICore PMU register addresses (distinct MMIO page from AIC_CTRL).
     if (dfx.pmu_enabled) {
@@ -370,7 +376,7 @@ int DeviceRunner::prepare_execution(
         return rc;
     }
 
-    rc = init_runtime_args_with_metadata(runtime, execution->kernel_args);
+    rc = init_runtime_args_with_metadata(runtime, execution->kernel_args, slot_args);
     if (rc != 0) return rc;
 
     rc = kernel_args_init_ffts_base_addr(execution->kernel_args);
@@ -380,7 +386,7 @@ int DeviceRunner::prepare_execution(
     }
 
     // Copy KernelArgs to device memory for AICore
-    rc = execution->kernel_args.init_device_kernel_args(mem_alloc_);
+    rc = execution->kernel_args.init_device_kernel_args(mem_alloc_, slot_args);
     if (rc != 0) {
         LOG_ERROR("init_device_kernel_args failed: %d", rc);
         return rc;
@@ -435,25 +441,22 @@ void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool retire_ai
 
     // Collectors must stop before their backing arguments are released; the
     // per-run stream retires last. Each cleanup operation is idempotent.
-    // The collectors' device resources are not per-run: they are released in
-    // finalize(), which owns them for the worker's lifetime.
+    // The collectors' device resources are not per-run, and neither are the
+    // slot's KernelArgs / runtime / register blocks: both are released in
+    // finalize(), which owns them for the worker's lifetime. A run only stops
+    // naming them here.
     if (abandon) {
         prepared.kernel_args.abandon_after_device_failure();
+        abandon_slot_persistent_args(slot_persistent_args(prepared.pipeline_slot));
     } else {
-        (void)prepared.kernel_args.finalize_device_kernel_args();
-        (void)prepared.kernel_args.finalize_runtime_args();
+        prepared.kernel_args.release_run_view();
     }
+    prepared.kernel_args.args.regs = 0;
     if (prepared.kernel_args.args.pmu_reg_addrs != 0) {
         if (!abandon) {
             (void)mem_alloc_.free(reinterpret_cast<void *>(prepared.kernel_args.args.pmu_reg_addrs));
         }
         prepared.kernel_args.args.pmu_reg_addrs = 0;
-    }
-    if (prepared.kernel_args.args.regs != 0) {
-        if (!abandon) {
-            (void)mem_alloc_.free(reinterpret_cast<void *>(prepared.kernel_args.args.regs));
-        }
-        prepared.kernel_args.args.regs = 0;
     }
     if (retire_aicore && !abandon && !prepared.aicore_retirement_attempted) {
         prepared.aicore_retirement_attempted = true;
@@ -1193,7 +1196,7 @@ int DeviceRunner::arm_collectors_for_run(Runtime &runtime, PreparedExecution &pr
     // before any of the above ran. The AICPU side needs no refresh: it receives
     // the host-side struct as the launch argument blob.
     if (dfx.diagnostics_any()) {
-        rc = prepared.kernel_args.init_device_kernel_args(mem_alloc_);
+        rc = prepared.kernel_args.init_device_kernel_args(mem_alloc_, slot_persistent_args(prepared.pipeline_slot));
         if (rc != 0) {
             LOG_ERROR("KernelArgs refresh after collector arming failed: %d", rc);
             return rc;
