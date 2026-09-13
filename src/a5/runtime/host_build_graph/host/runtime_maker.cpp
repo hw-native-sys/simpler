@@ -1343,7 +1343,7 @@ int32_t run_host_orchestration(
     orchestrator.total_aiv_count = block_dim * PLATFORM_AIV_CORES_PER_BLOCKDIM;
     rt->mode = MODE_EXECUTE;
     // get_tensor_data/set_tensor_data resolve buffer.addr through the host
-    // views registered at staging time (host_build_graph/host_tensor_access.h),
+    // views registered at copy-in time (host_build_graph/host_tensor_access.h),
     // so the host orchestrator can read control tensors (e.g. paged_attention's
     // context_lens/block_table) whether or not the platform maps device memory
     // into the host address space.
@@ -1750,7 +1750,7 @@ extern "C" int register_callable_impl(const ChipCallable *callable, const HostAp
         out->host_orch_func_ptr = eps;
         LOG_INFO("host-orch: loaded orchestration entry '%s' on host", orch_func_name);
     }
-    LOG_INFO("Orchestration SO: %zu bytes staged", orch_so_size);
+    LOG_INFO("Orchestration SO: %zu bytes uploaded", orch_so_size);
     return 0;
 }
 
@@ -1826,8 +1826,8 @@ extern "C" int bind_callable_to_runtime_impl(
     HostTensorAccessor tensor_access(api);
 
     const BindPhaseMark args_phase = bind_phase_begin();
-    uint64_t staged_bytes = 0;
-    int staged_tensors = 0;
+    uint64_t h2d_bytes = 0;
+    int h2d_tensors = 0;
     for (int i = 0; i < tensor_count; i++) {
         ChipTensor t = orch_args->tensor(i);
 
@@ -1839,7 +1839,7 @@ extern "C" int bind_callable_to_runtime_impl(
             always_assert(t.buffer.addr < HEAP_VIRTUAL_BASE && "caller tensor reaches into the virtual heap window");
             LOG_DEBUG("  ChipTensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.buffer.addr);
             // The bytes stay where the caller put them, so orchestration has no
-            // staged buffer to read them from. Claim the span now and let the
+            // copy-in buffer to read them from. Claim the span now and let the
             // platform resolve a means only if an access actually lands in it.
             if (!tensor_access.add_child_memory(t.buffer.addr, t.buffer.size)) {
                 LOG_ERROR("host-orch: could not claim child-memory tensor %d (0x%" PRIx64 ")", i, t.buffer.addr);
@@ -1859,19 +1859,19 @@ extern "C" int bind_callable_to_runtime_impl(
         }
 
         // Pure write-only OUTPUT buffers are never read by the kernel and hold
-        // no meaningful host content, so they need no device staging — the
+        // no meaningful host content, so they need no copy-in — the
         // kernel defines what it writes and any unwritten bytes are undefined.
-        // IN / INOUT (read-before-write) are staged H2D.
+        // IN / INOUT (read-before-write) are copied in H2D.
         bool is_pure_output = (signature != nullptr && i < sig_count && signature[i] == ArgDirection::OUT);
         if (!is_pure_output) {
             int rc = api->copy_to_device(dev_ptr, host_ptr, size);
             if (rc != 0) {
-                LOG_ERROR("Failed to stage tensor %d to device", i);
+                LOG_ERROR("Failed to copy tensor %d in to the device", i);
                 api->device_free(dev_ptr);
                 return PTO_RUNTIME_ERR_INTERNAL;
             }
-            staged_bytes += static_cast<uint64_t>(size);
-            ++staged_tensors;
+            h2d_bytes += static_cast<uint64_t>(size);
+            ++h2d_tensors;
         }
         // Read-only INPUT tensors are never written by the kernel, so there is
         // no point copying them back D2H at the end. Index the signature
@@ -1884,7 +1884,7 @@ extern "C" int bind_callable_to_runtime_impl(
         LOG_DEBUG("  ChipTensor %d: %zu bytes at %p", i, size, dev_ptr);
 
         // host_build_graph runs the orchestrator on the host, which may read
-        // staged control tensors (e.g. paged_attention's context_lens and
+        // host-memory control tensors (e.g. paged_attention's context_lens and
         // block_table) via get_tensor_data to shape the graph. A pure output
         // has no valid readable bytes before execution, and a5 cannot map it;
         // exposing its caller buffer would therefore make reads unsafe. Leave
@@ -1904,9 +1904,7 @@ extern "C" int bind_callable_to_runtime_impl(
     }
     {
         char attrs[kBindAttrsCapacity];
-        snprintf(
-            attrs, sizeof(attrs), "ntensor=%d staged=%d bytes=%" PRIu64, tensor_count, staged_tensors, staged_bytes
-        );
+        snprintf(attrs, sizeof(attrs), "ntensor=%d h2d=%d bytes=%" PRIu64, tensor_count, h2d_tensors, h2d_bytes);
         record_bind_phase(HostPhaseKind::BindArgs, args_phase, attrs);
     }
 

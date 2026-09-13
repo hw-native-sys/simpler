@@ -86,14 +86,14 @@ def test_child_memory_directions_empty_and_lifo():
         TensorArg("y", torch.ones(4), True),
         TensorArg("z", torch.zeros(4), True),
         TensorArg("empty", torch.empty(0), True),
-        TensorArg("staged", torch.ones(4)),
+        TensorArg("host_memory", torch.ones(4)),
     )
     worker = FakeWorker()
     with scene._child_memory_args(worker, args, [D.IN, D.INOUT, D.OUT, D.IN, D.IN]) as child_args:
         assert len(worker.created) == 3
         assert worker.uploads == worker.created[:2]
         # Zero-shaped wire Tensors are rejected by the existing transport;
-        # the owner skips their device allocation and leaves them host-staged.
+        # the owner skips their device allocation and leaves them on host memory.
         assert "empty" not in child_args.tensors
         nonempty = TaskArgsBuilder(*(spec for spec in args.specs if spec.name != "empty"))
         _chip_args, outputs = scene._build_l2_ref_args(nonempty, [D.IN, D.INOUT, D.OUT, D.IN], worker, child_args)

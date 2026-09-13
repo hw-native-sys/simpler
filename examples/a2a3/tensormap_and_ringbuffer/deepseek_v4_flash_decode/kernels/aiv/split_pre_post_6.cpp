@@ -535,7 +535,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         reinterpret_cast<__gm__ float *>(post_ffn_inline11927__ssa_v0_tensor->buffer.addr) +
         post_ffn_inline11927__ssa_v0_tensor->start_offset;
 
-    // Unpack tensor: hc_scale (scale0/scale1 read from GM instead of host-staged scalars)
+    // Unpack tensor: hc_scale (scale0/scale1 read from GM instead of host-passed scalars)
     __gm__ Tensor *hc_scale_tensor = reinterpret_cast<__gm__ Tensor *>(args[5]);
     __gm__ float *hc_scale =
         reinterpret_cast<__gm__ float *>(hc_scale_tensor->buffer.addr) + hc_scale_tensor->start_offset;

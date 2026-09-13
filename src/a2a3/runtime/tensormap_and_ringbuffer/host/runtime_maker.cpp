@@ -366,7 +366,7 @@ extern "C" int register_callable_impl(const ChipCallable *callable, const HostAp
     out->orch_so_size = orch_so_size;
     out->func_name = callable->func_name();
     out->config_name = callable->config_name();
-    LOG_INFO("Orchestration SO: %zu bytes staged (host-only)", orch_so_size);
+    LOG_INFO("Orchestration SO: %zu bytes uploaded (host-only)", orch_so_size);
     return 0;
 }
 
@@ -491,14 +491,14 @@ static bool derive_arena_static_sizes(const ArenaSizingConfig &sizing, ArenaStat
 }
 
 // per-run: the only signature-aware step. Copy the orch args, replacing each
-// host tensor pointer with a freshly staged device pointer (H2D copy-in, or an
+// host tensor pointer with a freshly allocated device pointer (H2D copy-in, or an
 // on-device zero for pure-OUTPUT buffers), and record the host/device pair for
 // copy-back. Read-only INPUT tensors skip copy-back. When `bump` is non-null,
 // ordinary non-child tensors are sliced from the runner's retained temporary
 // buffer (released as a no-op — the buffer is reused across runs); otherwise
 // each is device_malloc'd and freed in validate. On failure the partially
-// staged device_args / tensor_leases_ stay owned by the caller's Runtime.
-static bool stage_device_args(
+// copied-in device_args / tensor_leases_ stay owned by the caller's Runtime.
+static bool copy_in_device_args(
     Runtime *runtime, const HostApi *api, const ChipStorageTaskArgs *orch_args, const ArgDirection *signature,
     int sig_count, RetainedTempBump *bump, ChipStorageTaskArgs *out
 ) {
@@ -542,14 +542,14 @@ static bool stage_device_args(
         }
 
         // Pure write-only OUTPUT buffers are never read by the kernel and hold
-        // no meaningful host content, so they need no device staging — the
+        // no meaningful host content, so they need no copy-in — the
         // kernel defines what it writes and any unwritten bytes are undefined.
-        // IN / INOUT (read-before-write) are staged H2D.
+        // IN / INOUT (read-before-write) are copied in H2D.
         bool is_pure_output = (signature != nullptr && i < sig_count && signature[i] == ArgDirection::OUT);
         if (!is_pure_output) {
             int rc = api->copy_to_device(dev_ptr, host_ptr, size);
             if (rc != 0) {
-                LOG_ERROR("Failed to stage tensor %d to device", i);
+                LOG_ERROR("Failed to copy tensor %d in to the device", i);
                 if (release_kind == TensorReleaseKind::Free) {
                     api->device_free(dev_ptr);
                 }
@@ -769,7 +769,7 @@ static bool build_and_cache_prebuilt_arena(
  * half runs only once per callable_id.
  *
  * Orchestrates the three lifecycles behind the bind: per-config arena sizing
- * (resolve_arena_sizing) + per-run args (stage_device_args) + the prebuilt
+ * (resolve_arena_sizing) + per-run args (copy_in_device_args) + the prebuilt
  * runtime-arena image (build_and_cache_prebuilt_arena on a cache miss, then
  * bind_cached_runtime_image wires the pointers onto the runtime).
  *
@@ -829,7 +829,7 @@ extern "C" int bind_callable_to_runtime_impl(
     });
 
     ChipStorageTaskArgs device_args;
-    if (!stage_device_args(runtime, api, orch_args, signature, sig_count, &bump, &device_args)) {
+    if (!copy_in_device_args(runtime, api, orch_args, signature, sig_count, &bump, &device_args)) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 

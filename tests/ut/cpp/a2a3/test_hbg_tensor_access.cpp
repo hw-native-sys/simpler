@@ -13,7 +13,7 @@
  * Host-view resolution for the host orchestrator's tensor reads and writes,
  * and the per-run ownership of the mappings that serve them.
  *
- * The fallback path serves staged tensors without mapping their device
+ * The fallback path serves host-memory tensors without mapping their device
  * allocations. `g_registered_view` is what the fake
  * `register_device_memory_to_host` hands back when no fallback is available.
  */
@@ -179,9 +179,8 @@ TEST_F(HostTensorAccessTest, FallbackWriteReportsCopyFailure) {
     EXPECT_FALSE(host_tensor_write(&accessor, kFakeDeviceBase, &written, sizeof(written)));
 }
 
-// The fail-closed contract: an address outside every registered region — a
-// GM-heap tensor the orchestrator created or a pass-through child-memory
-// buffer — resolves to nothing instead of being dereferenced.
+// The fail-closed contract: an address outside every region — a GM-heap tensor
+// the orchestrator created — resolves to nothing instead of being dereferenced.
 TEST_F(HostTensorAccessTest, UnregisteredSpanFailsClosed) {
     int32_t fallback[2] = {1, 2};
     HostTensorAccessor accessor(&kHostApi);

@@ -2,14 +2,14 @@
 
 `host_build_graph` runs the orchestration function synchronously on the host,
 before any AICPU scheduler or AICore kernel starts. `get_tensor_data` and
-`set_tensor_data` therefore access the host view used to stage the graph's
-external tensors; they do not interleave host code with device execution.
+`set_tensor_data` therefore access the host view the graph's external tensors
+were copied in from; they do not interleave host code with device execution.
 
 ## Supported Uses
 
 | Tensor state | `get_tensor_data` | `set_tensor_data` |
 | ------------ | ----------------- | ----------------- |
-| External tensor with no submitted producer | Reads the staged host value | Updates the staged host value |
+| External tensor with no submitted producer | Reads the copied-in host value | Updates the copied-in host value |
 | External control/output tensor not referenced by a task | Reads immediately | Writes immediately |
 | External tensor a submitted task writes (`OUTPUT`/`INOUT`) | Fails with `INVALID_ARGS` | Fails with `INVALID_ARGS` |
 | Output of a submitted task | Fails with `INVALID_ARGS` | Fails with `INVALID_ARGS` |
@@ -17,7 +17,7 @@ external tensors; they do not interleave host code with device execution.
 | Tensor with an invalid or stale owner task ID | Fails with `INVALID_ARGS` | Fails with `INVALID_ARGS` |
 
 The supported write changes the data that will be copied to the device. Every
-task in the graph observes that final staged value; submit order does not turn
+task in the graph observes that final copied-in value; submit order does not turn
 the write into a barrier between kernels.
 
 ## API
@@ -29,7 +29,7 @@ int32_t value = get_tensor_data<int32_t>(control, 1, index);
 set_tensor_data<int32_t>(layout, 1, index, value + 1);
 ```
 
-Both tensors in this example must be external tensors staged by the host. A
+Both tensors in this example must be external tensors the host copied in. A
 common use is to read an input control value or publish runtime geometry into an
 external layout tensor that no submitted task owns.
 
@@ -84,7 +84,7 @@ producer, so a forged ID cannot reach a task-table slot. A rejection latches
 
 ## Practical Rules
 
-- Use scalar access only on external, host-staged tensors that no submitted task
+- Use scalar access only on external, host-memory tensors that no submitted task
   produces.
 - Use tensor dependencies to order device tasks; do not use host scalar access
   as a device synchronization barrier.

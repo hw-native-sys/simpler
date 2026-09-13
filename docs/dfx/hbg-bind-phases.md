@@ -1,7 +1,7 @@
 # The `host_build_graph` bind phases
 
 `host_build_graph` builds the whole task graph on the host before the device
-executes anything, so the host-side **`bind` stage** — argument staging,
+executes anything, so the host-side **`bind` stage** — argument copy-in,
 orchestration, the Graph Definition, and every H2D copy — is a first-class cost.
 `bind` is the `chip.run.bind` `[STRACE]` span both runtimes emit; only this one
 subdivides it into **segments**, one `chip.run.bind.<segment>` span each. This
@@ -26,7 +26,7 @@ the `chip.run.bind` span:
 
 | Segment | What it covers |
 | ------- | -------------- |
-| `args` | staging readable caller tensors H2D and exposing their existing host buffers to orchestration; pure outputs skip both |
+| `args` | copying readable caller tensors in H2D and exposing their existing host buffers to orchestration; pure outputs skip both |
 | `arena_build`, `static_arena`, `gm_heap`, `shared_mem`, `runtime_init` | arena layout, GM heap and shared-memory bring-up |
 | `host_orch` | **all** orchestration: every task submitted, every in-graph task recorded, the Definition built |
 | `graph_upload` | one H2D of the block holding every Definition object, and binding each Graph task to the one with its key. The recorders built the objects in that block's host staging during `host_orch`, so this segment writes their headers and copies in only what did not fit |
@@ -462,7 +462,7 @@ meant to outlive it.
 | `arena_h2d` † | 0.035–0.039 ms / 632 B | 0.03–0.10 ms / 632 B |
 | `heap_used` | 127,673,344 | 2,038,508,544 |
 | device wall | 39.3 ms | does not complete yet (`sched_error_code=5 INVALID_ARGS`) |
-| `args` (excluded) | 1.37 s / 40.9 GB, 19 of 20 staged | 1.48 s / 45.8 GB, 77 of 92 staged |
+| `args` (excluded) | 1.37 s / 40.9 GB, 19 of 20 copied in | 1.48 s / 45.8 GB, 77 of 92 copied in |
 | `host_view_close` (excluded, legacy mapping path) | 0.25 s / 40.9 GB | 0.28 s / 45.8 GB |
 
 † The three upload rows are the markers as they read at that commit, before the
@@ -474,16 +474,16 @@ remaining regions in `arena_h2d` — so the same case reports different figures 
 the same work.
 
 **dsv4's `args` and `host_view_close` rows no longer describe that case at this
-scale.** Both are per-byte costs over what a bind stages, and dsv4's parameters
+scale.** Both are per-byte costs over what a bind copies in, and dsv4's parameters
 now live in child memory: allocated once before the first round, and passed
 through without malloc, H2D or a host view. What still crosses is
 `num_tokens_per_owner`, the one caller tensor the host orchestrator has to read —
-so a bind stages **1 of its 92 tensors, 8 bytes**. On `dcf7559e8`, 12 binds
+so a bind copies in **1 of its 92 tensors, 8 bytes**. On `dcf7559e8`, 12 binds
 (`--rounds 6`, both ranks) measure `args` at 0.036–0.075 ms and
 `host_view_close` at 0.0012–0.0030 ms with `count=0 bytes=0`, against 1.48 s and
 0.28 s over 45.8 GB above. The same run peaks at 1.31 GiB of host RSS across the
 whole process tree under `--skip-golden`, and at 23.4 GiB when the fixture is
-streamed in, where the row above cost ~45.5 GB per rank. qwen still stages its
+streamed in, where the row above cost ~45.5 GB per rank. qwen still copies in its
 fixture.
 
 The rows also describe the legacy mapping behavior at the pinned commit. A
@@ -491,7 +491,7 @@ current bind uses the caller's existing host buffers as its
 orchestration views, so it performs no `halHostRegister` calls and reports
 `host_view_close count=0 bytes=0`. On Qwen3-14B this makes the close marker
 20.12–24.73 us instead of the 0.25 s shown above. The old `args` figure included
-20 registrations in addition to staging 19 tensors H2D; current `args` retains
+20 registrations in addition to copying 19 tensors in H2D; current `args` retains
 the H2D work but removes that registration side.
 
 Three of these deserve reading together. `host_orch` is the whole story on dsv4 —
@@ -499,10 +499,10 @@ Three of these deserve reading together. `host_orch` is the whole story on dsv4 
 5, 277 and 2 — and its 2.3 ms of scatter is why a claim about it needs a
 sub-counter rather than a stopwatch. At the pinned commit, `args` plus
 `host_view_close` are two orders of magnitude above everything else while being
-excluded from the control plane: they are staging and legacy mapping costs over
+excluded from the control plane: they are copy-in and legacy mapping costs over
 the ~41–46 GB of weights, not graph dispatch. Current qwen runs retain the
-staging cost in `args` but close no mappings; moving dsv4's parameters to child
-memory left its bind staging one 8-byte tensor, whose caller-buffer view also
+copy-in cost in `args` but close no mappings; moving dsv4's parameters to child
+memory left its bind copying in one 8-byte tensor, whose caller-buffer view also
 needs no mapping. And dsv4's device wall is absent because the case did not
 complete on device at the pinned commit — it is a completion case with no golden
 whose host path is what these numbers describe, which is also why

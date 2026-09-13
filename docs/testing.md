@@ -907,17 +907,17 @@ When kernels themselves differ (e.g., templated tile sizes tuned for device), se
 
 `TensorArg(name, value, child_memory=True)` keeps a case-owned device buffer
 across all rounds, including `--rounds 1`. `TaskArgsBuilder.add_tensor` accepts
-the same keyword. The default remains host staging on every round.
+the same keyword. The default remains host memory; IN and INOUT tensors are copied in on every round, while pure OUT buffers skip the copy.
 
 | Declaration / direction | Setup | Between rounds | Validation |
 | ----------------------- | ----- | -------------- | ---------- |
-| Host-staged (default) | Existing path | Restore OUT/INOUT host fixtures | Existing per-round copy-back |
+| Host memory (default) | Existing path | Restore OUT/INOUT host fixtures | Existing per-round copy-back |
 | Child-memory IN | Allocate and upload once | Keep device address and input contents | No output readback |
 | Child-memory OUT | Allocate without upload | Keep device contents; the case must define all compared elements | Final readback |
 | Child-memory INOUT | Allocate and upload once | Keep device state | Final readback |
 
 Golden evaluation follows the same state evolution: child-memory outputs retain
-state and host-staged outputs reset. Cases with child-memory outputs compare after
+state and host-memory outputs reset. Cases with child-memory outputs compare after
 the final round; other cases continue comparing every round.
 
 A tensor whose contents the HBG host orchestration reads (`get_tensor_data`) or
@@ -933,7 +933,7 @@ touches costs nothing.
 
 On the second row the cost is per access, not per tensor, so a tensor the
 orchestration reads thousands of times — `paged_attention`'s `block_table` is
-read once per (batch, block) pair — is better left host-staged there. The
+read once per (batch, block) pair — is better left in host memory there. The
 declaration is per argument, so a data-dependent case can mix freely. The bind's
 `BindHostViewClose` phase attributes report `devcopy=N` when this path was taken.
 
@@ -955,4 +955,4 @@ The HBG `paged_attention_unroll_manual_scope` examples include matched manual
 `HostStaged` and `ChildMemory` cases, the latter declaring every tensor —
 including the two the orchestration reads. The HBG `paged_attention` scene tests
 carry the same pairing as non-manual cases, so CI covers an orchestration
-reading child memory on both arches. Existing default cases retain host staging.
+reading child memory on both arches. Existing default cases retain host memory.

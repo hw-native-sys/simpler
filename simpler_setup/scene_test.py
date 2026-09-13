@@ -533,7 +533,7 @@ class ChildMemoryTaskArgs:
     The device-side counterpart of :class:`_RehostedTaskArgs`: that one relocates a
     builder's host tensors into born-shared child buffers so a forked child can
     reach them, this one relocates them onto the device so every round reuses one
-    address instead of re-staging.
+    address instead of re-copying it in every round.
 
     ``add`` consumes one CPU contiguous fixture at a time, so a streaming driver
     can discard each large weight before materializing its successor. Callers
@@ -560,7 +560,7 @@ class ChildMemoryTaskArgs:
         size = host.numel() * host.element_size()
         if not size:
             # An empty tensor names no device bytes. Leaving it unrecorded keeps
-            # it on the ordinary host-staging path, so `build_args` callers must
+            # it on the ordinary host-memory path, so `build_args` callers must
             # reconcile their own argument list -- see the count check there.
             return
         buf = self.worker.malloc(size)
@@ -592,7 +592,7 @@ class ChildMemoryTaskArgs:
         if expected_count is not None and expected_count != len(self.tensors):
             raise ValueError(
                 f"build_args expected {expected_count} child-memory tensors but holds {len(self.tensors)}; "
-                "an empty tensor cannot be child memory -- keep it on the host-staging path instead."
+                "an empty tensor cannot be child memory -- keep it on the host-memory path instead."
             )
         tags = {D.IN: TensorArgType.INPUT, D.OUT: TensorArgType.OUTPUT_EXISTING, D.INOUT: TensorArgType.INOUT}
         args = TaskArgs()
@@ -676,7 +676,7 @@ def _child_memory_args(worker, test_args, signature):
     """Own the device buffers for every `child_memory` TensorArg, for the whole case.
 
     Returns an owner whose `tensors` is empty when nothing is declared, so the
-    caller's arg build falls through to ordinary host staging. Child-memory storage
+    caller's arg build falls through to ordinary host memory. Child-memory storage
     may not alias any other argument's storage: independent device buffers
     cannot preserve an overlap the orchestrator would otherwise see.
     """
@@ -718,7 +718,7 @@ def _build_l2_ref_args(test_args: TaskArgsBuilder, orch_signature: list, worker,
     but set for parity with the L3 path.
 
     Explicit `child_memory` arguments use case-owned device addresses; the rest
-    keep the per-round host-staging path.
+    keep the per-round host-memory path.
 
     Returns:
         args: TaskArgs (TensorArg)
@@ -2022,14 +2022,14 @@ class SceneTestCase:
         test_args = self.generate_args(params)
         with _child_memory_args(worker, test_args, orch_sig) as child_args:
             chip_args, output_names = _build_l2_ref_args(test_args, orch_sig, worker, child_args=child_args)
-            staged_outputs = [name for name in output_names if name not in child_args.tensors]
+            host_memory_outputs = [name for name in output_names if name not in child_args.tensors]
             child_memory_outputs = [name for name in output_names if name in child_args.tensors]
 
             golden_args = None
             if not skip_golden:
                 golden_args = test_args.clone()
                 with _golden_thread_cap():
-                    initial_golden = {name: getattr(golden_args, name).clone() for name in staged_outputs}
+                    initial_golden = {name: getattr(golden_args, name).clone() for name in host_memory_outputs}
                     for golden_round in range(rounds if child_memory_outputs else 1):
                         if golden_round:
                             for name, initial in initial_golden.items():
@@ -2041,7 +2041,7 @@ class SceneTestCase:
             # Save initial output tensor values for reset between rounds
             initial_outputs = {}
             if rounds > 1:
-                for name in staged_outputs:
+                for name in host_memory_outputs:
                     initial_outputs[name] = getattr(test_args, name).clone()
 
             # Execute rounds. The platform emits `[STRACE]` host/device markers to

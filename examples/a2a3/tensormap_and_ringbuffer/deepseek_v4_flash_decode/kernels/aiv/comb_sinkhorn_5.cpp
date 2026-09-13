@@ -1999,7 +1999,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         reinterpret_cast<__gm__ float *>(comb_t_inline11617__ssa_v0_tensor->buffer.addr) +
         comb_t_inline11617__ssa_v0_tensor->start_offset;
 
-    // Unpack tensor: hc_scale (scale2 read from GM instead of a host-staged scalar)
+    // Unpack tensor: hc_scale (scale2 read from GM instead of a host-passed scalar)
     __gm__ Tensor *hc_scale_tensor = reinterpret_cast<__gm__ Tensor *>(args[4]);
     __gm__ float *hc_scale =
         reinterpret_cast<__gm__ float *>(hc_scale_tensor->buffer.addr) + hc_scale_tensor->start_offset;

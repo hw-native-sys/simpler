@@ -163,8 +163,8 @@ at case setup, outside `Worker.run` and its round markers. Include setup and
 final validation readback when reporting total case time; do not label the
 round table alone as end-to-end case latency.
 
-A child-memory argument skips the per-round staging path entirely, so `bind.args`
-reports fewer staged tensors and fewer staged bytes for it. Numbers taken
+A child-memory argument skips the per-round copy-in path entirely, so `bind.args`
+reports a smaller `h2d=` count and fewer bytes for it. Numbers taken
 before and after a case declares child memory are therefore not comparable on the
 host/bind component; re-measure both arms with identical fixtures, hardware,
 round counts and validation settings.

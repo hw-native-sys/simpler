@@ -20,8 +20,8 @@
  * that capability is resolved, so the orchestrator core never dereferences a
  * device address itself.
  *
- * The current bind path registers one region per staged tensor, backed by the
- * caller's host tensor buffer:
+ * The current bind path registers one region per host-memory tensor, backed by
+ * the caller's host tensor buffer, which the bind has just copied in H2D:
  *
  *   - A read observes that caller buffer.
  *   - A write mutates that caller buffer, then uses the device-copy hook so the
@@ -49,7 +49,7 @@
  * `add` also retains a null-fallback platform path: it asks the platform for a
  * host-readable mapping whose address may equal or differ from `dev_base`, and
  * always accesses the returned address. The current runtime-maker path cannot
- * reach it: staged tensors always have the caller buffer, while pure outputs
+ * reach it: host-memory tensors always have the caller buffer, while pure outputs
  * are deliberately left unregistered. The path remains as an explicit
  * platform-capability escape hatch in `add` and is covered directly by unit
  * tests; no current production caller reaches it.
@@ -59,8 +59,8 @@
  * reads and writes resolve to nothing.
  *
  * Regions and any optional mappings are owned by one orchestration run — the
- * window between staging and the first dispatched task. A caller-buffer view
- * holds the staged bytes, and nothing has executed yet to make it stale; once
+ * window between copy-in and the first dispatched task. A caller-buffer view
+ * holds the copied-in bytes, and nothing has executed yet to make it stale; once
  * tasks run, that view would be indistinguishable from live device memory.
  * `HostTensorAccessor` bounds the window and releases its mappings on every
  * exit path. A child-memory mapping is the exception it does not own: the
@@ -113,7 +113,7 @@ public:
      * Register `[dev_base, dev_base + size)`, using `fallback_host_view` (the
      * caller's host tensor buffer) when available and asking the platform for a
      * host mapping otherwise. The current runtime-maker always supplies the
-     * fallback for staged tensors and skips pure outputs, so its bind path does
+     * fallback for host-memory tensors and skips pure outputs, so its bind path does
      * not install mappings.
      *
      * @return false for an empty region, a null `api`, or when neither a
@@ -142,7 +142,7 @@ public:
     /** Mappings installed by `add` and not yet dropped by `close`. */
     size_t mapping_count() const noexcept;
 
-    /** Total bytes covered by those mappings; excludes fallback staging views. */
+    /** Total bytes covered by those mappings; excludes caller-buffer views. */
     uint64_t mapped_bytes() const noexcept;
 
     /**

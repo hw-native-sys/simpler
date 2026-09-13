@@ -27,7 +27,7 @@ enum class AccessMeans : uint8_t {
     // Not yet decided. A child-memory region starts here and resolves on the
     // first access that lands in it.
     Unresolved,
-    // The caller's staged host buffer, or a mapping this accessor installed.
+    // The caller's host buffer the bind copied in, or a mapping this accessor installed.
     // `needs_push_back` decides whether a write must also reach the device.
     HostView,
     // No host mapping was available for this allocation, so every access is a
@@ -45,7 +45,7 @@ struct HostTensorRegion {
     AccessMeans means;
 };
 
-// One entry per tensor staged for the run being orchestrated. A run stages a
+// One entry per caller tensor of the run being orchestrated. A run has a
 // handful of tensors and orchestration reads are cold-path, so a linear scan
 // costs less than the map that would replace it.
 struct HostTensorAccessor::Impl {
