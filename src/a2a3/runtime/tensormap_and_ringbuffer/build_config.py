@@ -17,10 +17,22 @@
 # The "orchestration" directory contains source files compiled into both
 # runtime targets AND the orchestration .so (e.g., tensor methods needed
 # by the Tensor constructor's validation logic).
+#
+# src/common/tensormap_and_ringbuffer holds the sources shared with the other
+# architecture. Its .cpp files sit under a "host" subdirectory naming the target
+# that compiles them; headers stay flat there. Those sources still include this
+# runtime's headers by bare name (dep_gen_replay.cpp takes dep_compute.h,
+# tensormap.h and tensor.h) and resolve them to whichever architecture's
+# "runtime" directory is on the include path, which is what lets one source
+# produce per-arch object code.
+SHARED = "../../../common/tensormap_and_ringbuffer"
 
 BUILD_CONFIG = {
     "aicore": {"include_dirs": ["runtime", "common", ".."], "source_dirs": ["aicore", "orchestration"]},
     "aicpu": {"include_dirs": ["runtime", "common", ".."], "source_dirs": ["aicpu", "runtime", "orchestration"]},
-    "host": {"include_dirs": ["runtime", "common", ".."], "source_dirs": ["host", "runtime/shared", "orchestration"]},
+    "host": {
+        "include_dirs": ["runtime", "common", ".."],
+        "source_dirs": ["host", "runtime/shared", "orchestration", f"{SHARED}/host"],
+    },
     "orchestration": {"include_dirs": ["runtime", "orchestration", "common", ".."], "source_dirs": ["orchestration"]},
 }

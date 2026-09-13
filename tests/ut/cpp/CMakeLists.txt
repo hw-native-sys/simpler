@@ -85,7 +85,7 @@ endif()
 # have had if the sources were listed directly.
 # ---------------------------------------------------------------------------
 set(A2A3_RUNTIME_DIR ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime)
-set(A2A3_HOST_DIR ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/host)
+set(TMR_SHARED_HOST_DIR ${CMAKE_SOURCE_DIR}/../../../src/common/tensormap_and_ringbuffer/host)
 
 add_library(a2a3_rt_objs OBJECT
     ${A2A3_RUNTIME_DIR}/ring_buffer.cpp
@@ -1166,8 +1166,8 @@ add_a2a3_runtime_test(test_task_state       a2a3/test_task_state.cpp)
 add_a2a3_runtime_test(test_ready_queue      a2a3/test_ready_queue.cpp)
 add_a2a3_runtime_test(test_shared_memory    a2a3/test_shared_memory.cpp)
 add_a2a3_runtime_test(test_a2a3_tensormap   a2a3/test_tensormap.cpp)
-add_a2a3_runtime_test(test_dep_gen_replay common/test_dep_gen_replay.cpp ${A2A3_HOST_DIR}/dep_gen_replay.cpp)
-target_include_directories(test_dep_gen_replay PRIVATE ${A2A3_HOST_DIR})
+add_a2a3_runtime_test(test_dep_gen_replay common/test_dep_gen_replay.cpp ${TMR_SHARED_HOST_DIR}/dep_gen_replay.cpp)
+target_include_directories(test_dep_gen_replay PRIVATE ${TMR_SHARED_HOST_DIR})
 add_a2a3_runtime_test(test_fanin_pool       a2a3/test_fanin_pool.cpp)
 add_a2a3_orchestrator_runtime_test(test_a2a3_orchestrator_fanin a2a3/test_orchestrator_fanin.cpp)
 add_a2a3_orchestrator_runtime_test(test_wiring a2a3/test_wiring.cpp)

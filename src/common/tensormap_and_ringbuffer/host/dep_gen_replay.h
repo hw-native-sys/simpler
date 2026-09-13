@@ -70,8 +70,7 @@
  * The replay is single-threaded and pure CPU: no device handle is required.
  */
 
-#ifndef SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_HOST_DEP_GEN_REPLAY_H_
-#define SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_HOST_DEP_GEN_REPLAY_H_
+#pragma once
 
 #include <stddef.h>
 #include <stdint.h>
@@ -102,5 +101,3 @@ int dep_gen_replay_emit_deps_json(const struct DepGenRecord *records, size_t num
 #ifdef __cplusplus
 }  // extern "C"
 #endif
-
-#endif  // SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_HOST_DEP_GEN_REPLAY_H_
