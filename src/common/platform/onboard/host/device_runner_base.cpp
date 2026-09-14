@@ -1460,7 +1460,8 @@ void DeviceRunnerBase::publish_host_phase_run_to_collector(uint32_t pipeline_slo
     // Read by the collector's initialize() when it sizes the orch phase pool, so
     // this has to precede it — both now run from the launch arming.
     chip_swimlane_collector_.set_host_orchestrated(run.host_orchestrated);
-    if (!run.host_orchestrated || chip_swimlane_collector_.clock_correlation_active()) return;
+    // A clock-capture attempt supplies a provider name even when unavailable.
+    if (run.clock_provider_name.empty() || chip_swimlane_collector_.clock_correlation_active()) return;
     try {
         chip_swimlane_collector_.begin_clock_correlation_session(
             run.clock_provider_name.c_str(), run.clock_provider_unit.c_str()
@@ -1482,7 +1483,6 @@ void DeviceRunnerBase::begin_clock_correlation_session_if_needed(uint32_t pipeli
     if (run.chip_swimlane_level != ChipSwimlaneLevel::ORCH_PHASES) return;
     // The device-orchestrating path has no bind-time capture, so both halves run
     // here, under the execution claim.
-    run.host_orchestrated = true;
     capture_clock_correlation_begin(run);
     publish_host_phase_run_to_collector(pipeline_slot);
 }

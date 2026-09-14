@@ -22,12 +22,15 @@ that variant exercises the per-task dedup branch in
 ``compute_dag_stats_from_deps`` which this AIV-only workload doesn't.
 """
 
+import json
 import time
+from pathlib import Path
 
 import torch
 from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
+from simpler_setup.scene_test import build_output_prefix
 
 from ._swimlane_validate import validate_perf_artifact
 
@@ -110,6 +113,32 @@ class TestChipSwimlane(SceneTestCase):
             validate_perf_artifact(
                 f"TestChipSwimlane_{case['name']}", since=run_marker, expected_task_count=_EXPECTED_TASK_COUNT
             )
+
+
+@scene_test(level=2, runtime="tensormap_and_ringbuffer")
+class TestDeviceOrchestrationClockCapture(TestChipSwimlane):
+    """Clock anchors and AICPU orchestration records coexist in one capture."""
+
+    def test_run(self, st_platform, st_worker, request):
+        SceneTestCase.test_run(self, st_platform, st_worker, request)
+
+    def _build_config(self, config_dict, *args, **kwargs):
+        config = super()._build_config(config_dict, *args, **kwargs)
+        config.enable_chip_swimlane = 4
+        config.capture_clock_anchors = True
+        if not config.output_prefix:
+            config.output_prefix = str(build_output_prefix(f"{type(self).__name__}_{time.monotonic_ns()}"))
+        self._clock_capture_path = Path(config.output_prefix) / "chip_swimlane_records.json"
+        return config
+
+    def compare_outputs(self, test_args, golden_args, output_names, params):
+        super().compare_outputs(test_args, golden_args, output_names, params)
+        path = self._clock_capture_path
+        assert path.is_file(), f"missing device orchestration capture: {path}"
+        records = json.loads(path.read_text())
+        assert any(records.get("aicpu_orchestrator_phases", [])), "AICPU orchestration records missing"
+        assert records["metadata"].get("orchestrator_source") != "host"
+        assert "clock_anchors" in records["metadata"], "clock capture was dropped"
 
 
 if __name__ == "__main__":
