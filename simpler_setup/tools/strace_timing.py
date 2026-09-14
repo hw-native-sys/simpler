@@ -39,12 +39,11 @@ Outputs:
       of each sub-stage across invocations), and
     * optionally a Chrome-trace / Perfetto JSON (``--trace-out``): one ``ph:"X"``
       event per span on a synthetic per-invocation lane, so each host call tree
-      renders as nested slices; host events also carry wall time when the log
-      contains a matching ``CLOCK_ANCHOR``, or
+      renders as nested slices, or
     * a host scheduler swimlane (``--swimlane``) whose lanes are the real OS
       pid/tid, except that a thread which interleaved runs is split into one lane
       per pipeline slot so each lane reads as a sequence; cross-thread handoffs
-      are Chrome flow events and host events carry matching anchor wall time.
+      are Chrome flow events.
 """
 
 from __future__ import annotations
@@ -56,7 +55,6 @@ import re
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 
 # A record's attribute list runs to the end of its line, so what bounds it is the
 # lookahead for the next record's log prefix — which is why this pattern exists at
@@ -87,19 +85,12 @@ _DROP_SUMMARY_RE = re.compile(
     r"queue_full=(?P<queue_full>\d+)\s+claim_exhausted=(?P<claim_exhausted>\d+)\s+"
     r"output_failed=(?P<output_failed>\d+)\s+not_admitted=(?P<not_admitted>\d+)",
 )
-_CLOCK_ANCHOR_RE = re.compile(
-    r"\[mono_ns=\d+\]\[T0x[0-9a-fA-F]+\]\[TIMING\]\s+clock_anchor:\s+"
-    r"\[CLOCK_ANCHOR\]\s+v=(?P<v>\d+)\s+pid=(?P<pid>\d+)\s+"
-    r"mono_ns=(?P<mono_ns>\d+)\s+wall_ns=(?P<wall_ns>\d+)[ \t]*\r?$",
-    re.MULTILINE,
-)
 # The emitter percent-encodes any byte that would otherwise be record grammar —
 # see `encode_host_span_field` in src/common/log/host_log.cpp.
 _PERCENT_ESCAPE_RE = re.compile(r"%([0-9A-Fa-f]{2})")
 # One file per process, written under a run's `output_prefix` when the host logger
 # writes to files rather than stderr. It holds everything that logger emits, so a
-# process's spans and its `[CLOCK_ANCHOR]` are in the same file. See
-# docs/dfx/host-trace.md.
+# process's spans are in the same file. See docs/dfx/host-trace.md.
 _LOG_FILE_GLOB = "host.*.log"
 
 
@@ -130,16 +121,6 @@ def decode_field(text):
     marker that the value is incomplete, not an encoded byte.
     """
     return _PERCENT_ESCAPE_RE.sub(lambda m: chr(int(m.group(1), 16)), text)
-
-
-@dataclass
-class ClockAnchor:
-    pid: int
-    mono_ns: int
-    wall_ns: int
-
-    def to_wall_ns(self, monotonic_ns):
-        return self.wall_ns + monotonic_ns - self.mono_ns
 
 
 @dataclass
@@ -272,19 +253,6 @@ def warn_about_lost_records(lines, spans):
         )
 
 
-def parse_clock_anchors(lines):
-    """Yield the per-process monotonic-to-wall mappings in a log."""
-    for line in lines:
-        for match in _CLOCK_ANCHOR_RE.finditer(line):
-            if int(match["v"]) != 1:
-                continue
-            yield ClockAnchor(
-                pid=int(match["pid"]),
-                mono_ns=int(match["mono_ns"]),
-                wall_ns=int(match["wall_ns"]),
-            )
-
-
 def parse_spans(lines):
     """Yield every complete span, including adjacent records on one line."""
     for line in lines:
@@ -302,28 +270,8 @@ def parse_spans(lines):
             )
 
 
-def _format_wall_time(wall_ns):
-    seconds, nanoseconds = divmod(wall_ns, 1_000_000_000)
-    prefix = datetime.fromtimestamp(seconds, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-    return f"{prefix}.{nanoseconds:09d}Z"
-
-
-def _wall_time_args(pid, monotonic_ns, anchors_by_pid):
-    anchor = anchors_by_pid.get(pid)
-    if anchor is None or anchor.mono_ns > monotonic_ns:
-        return {}
-    wall_ns = anchor.to_wall_ns(monotonic_ns)
-    return {"wall_ts_ns": str(wall_ns), "wall_time": _format_wall_time(wall_ns)}
-
-
-def _trace_document(events, anchors_by_pid, **extra):
-    document = {"traceEvents": events, "displayTimeUnit": "ms", **extra}
-    if anchors_by_pid:
-        document["clockAnchors"] = [
-            {"pid": anchor.pid, "mono_ns": str(anchor.mono_ns), "wall_ns": str(anchor.wall_ns)}
-            for anchor in sorted(anchors_by_pid.values(), key=lambda item: item.pid)
-        ]
-    return document
+def _trace_document(events, **extra):
+    return {"traceEvents": events, "displayTimeUnit": "ms", **extra}
 
 
 # A span name leads with the word for the level that produced it. The words come
@@ -729,7 +677,7 @@ def _bucket_label(buckets, hid):
     return hid[:8]
 
 
-def to_chrome_trace(invocations, buckets=None, anchors=None):
+def to_chrome_trace(invocations, buckets=None):
     """Build a Chrome-trace / Perfetto event list with readable nested tracks.
 
     Each invocation gets its own named process lane ("decode inv=3" /
@@ -738,10 +686,8 @@ def to_chrome_trace(invocations, buckets=None, anchors=None):
     ``ts`` is a device-clock offset, the two are NOT on a common timeline and
     must not share a track. Within each track the spans nest by their own
     ``ts``/``dur`` (Perfetto renders containment as nested slices), and ``depth``
-    is carried so the structure is unambiguous. A matching clock anchor adds
-    wall time to the event arguments without changing that monotonic axis.
+    is carried so the structure is unambiguous.
     """
-    anchors_by_pid = {anchor.pid: anchor for anchor in anchors or ()}
     events = []
     lane_map = {}
     for inv in invocations:
@@ -770,8 +716,6 @@ def to_chrome_trace(invocations, buckets=None, anchors=None):
         )
         for s in inv.spans:
             event_args = {"inv": s.inv, "hid": s.hid, "depth": s.depth, "attrs": s.attrs}
-            if not s.is_device:
-                event_args.update(_wall_time_args(s.pid, s.ts, anchors_by_pid))
             events.append(
                 {
                     "name": s.name,
@@ -783,7 +727,7 @@ def to_chrome_trace(invocations, buckets=None, anchors=None):
                     "args": event_args,
                 }
             )
-    return _trace_document(events, anchors_by_pid)
+    return _trace_document(events)
 
 
 def _parsed_attrs(span):
@@ -1113,7 +1057,7 @@ def _process_label(pid, process_spans):
     return f"simpler chip child (pid={pid})"
 
 
-def to_host_swimlane(spans, anchors=None):
+def to_host_swimlane(spans):
     """Build a real-pid/tid host scheduling timeline for Perfetto.
 
     Host timestamps remain on their shared CLOCK_MONOTONIC axis. Chrome Trace
@@ -1121,9 +1065,7 @@ def to_host_swimlane(spans, anchors=None):
     alongside host events without either a false clock alignment or a huge
     empty interval. Keep those raw events in ``unalignedDeviceSpans`` for
     inspection, but do not add them to Perfetto's visible ``traceEvents``.
-    Matching anchors add wall time as host-event metadata only.
     """
-    anchors_by_pid = {anchor.pid: anchor for anchor in anchors or ()}
     # (span, parsed attributes) pairs, so the attributes travel with their span
     # through every partition below. `Span` is an unhashable dataclass, so a
     # side table would have to be keyed on identity.
@@ -1172,7 +1114,6 @@ def to_host_swimlane(spans, anchors=None):
             "os_tid": span.tid,
             **parsed,
         }
-        event_args.update(_wall_time_args(span.pid, span.ts, anchors_by_pid))
         events.append(
             {
                 "name": span.name,
@@ -1216,11 +1157,8 @@ def to_host_swimlane(spans, anchors=None):
             f"{attrs.get('group_index', -1)}:{attrs.get('worker_id', -1)}:{attrs.get('dispatch_id', 0)}"
         )
         source_ts = min(source.ts + source.dur, destination.ts)
-        source_args = {"dispatch_key": dispatch_key, **_wall_time_args(source.pid, source_ts, anchors_by_pid)}
-        destination_args = {
-            "dispatch_key": dispatch_key,
-            **_wall_time_args(destination.pid, destination.ts, anchors_by_pid),
-        }
+        source_args = {"dispatch_key": dispatch_key}
+        destination_args = {"dispatch_key": dispatch_key}
         events.append(
             {
                 "name": "task dispatch",
@@ -1264,7 +1202,7 @@ def to_host_swimlane(spans, anchors=None):
             }
         )
 
-    return _trace_document(events, anchors_by_pid, unalignedDeviceSpans=unaligned_device_spans)
+    return _trace_document(events, unalignedDeviceSpans=unaligned_device_spans)
 
 
 def host_process_lanes(spans):
@@ -1386,7 +1324,7 @@ def print_tree(buckets, stream=sys.stdout):
         print(file=stream)
 
 
-def write_host_swimlane(args, spans, anchors):
+def write_host_swimlane(args, spans):
     """Write the host swimlane, adding whatever prepare-path detail is available.
 
     A runtime's bind segments are `[STRACE]` spans and are already in ``spans``.
@@ -1409,7 +1347,7 @@ def write_host_swimlane(args, spans, anchors):
                 file=sys.stderr,
             )
     with open(args.swimlane, "w", encoding="utf-8") as f:
-        json.dump(to_host_swimlane(lane_spans, anchors=anchors), f)
+        json.dump(to_host_swimlane(lane_spans), f)
     host_count = sum(not span.is_device for span in spans)
     extras = []
     if record_count:
@@ -1483,28 +1421,6 @@ def main(argv=None):
                 lines.extend(f.readlines())
 
     spans = list(parse_spans(lines))
-    anchors = list(parse_clock_anchors(lines))
-    anchor_counts = defaultdict(int)
-    for anchor in anchors:
-        anchor_counts[anchor.pid] += 1
-    for pid, count in sorted(anchor_counts.items()):
-        if count > 1:
-            print(
-                f"warning: multiple [CLOCK_ANCHOR] records found for pid {pid} ({count} records); using the last one",
-                file=sys.stderr,
-            )
-    # Without an anchor a pid's records stay monotonic-only, and every renderer
-    # degrades to relative time without saying so. A process writes its anchor
-    # ahead of its first record, into whichever stream it is logging to, so a pid
-    # with spans and no anchor means that stream reached us incomplete.
-    unanchored = sorted({span.pid for span in spans} - set(anchor_counts))
-    if unanchored:
-        print(
-            f"warning: no [CLOCK_ANCHOR] record for pid(s) {', '.join(str(pid) for pid in unanchored)} that emitted "
-            "spans; their timestamps stay monotonic-only. Each process writes its anchor before its first record, so "
-            "check that every input is complete and that no process's stream is missing.",
-            file=sys.stderr,
-        )
     warn_about_lost_records(lines, spans)
     keyed = invocation_spans(spans)
     invocations = group_invocations(keyed)
@@ -1526,11 +1442,11 @@ def main(argv=None):
 
     if args.trace_out:
         with open(args.trace_out, "w", encoding="utf-8") as f:
-            json.dump(to_chrome_trace(invocations, buckets, anchors=anchors), f)
+            json.dump(to_chrome_trace(invocations, buckets), f)
         print(f"Wrote Chrome trace: {args.trace_out} ({len(keyed)} spans)")
 
     if args.swimlane:
-        write_host_swimlane(args, spans, anchors)
+        write_host_swimlane(args, spans)
 
     return 0
 

@@ -328,10 +328,8 @@ public:
         if (pipeline_slot >= host_phase_runs_.size()) return;
         host_phase_runs_[pipeline_slot].records.finish(submitted_tasks, invocation_id);
     }
-    /** Hand this run's captured clock session to the resident collector, at launch. */
+    /** Publish this run's host-orchestration mode to the resident collector. */
     void publish_host_phase_run_to_collector(uint32_t pipeline_slot) noexcept;
-    /** Create this run's provider and sample its HostOrchestrationBegin anchors. */
-    void capture_clock_correlation_begin(HostPhaseRunState &run) noexcept;
     /** Hand this pass's records to the swimlane reader, just before its export. */
     void publish_host_phase_records_to_swimlane(uint32_t pipeline_slot);
     /**
@@ -350,13 +348,12 @@ public:
      * with arch-specific collectors (`dep_gen_collector_`) call this and then
      * open and start their own.
      */
-    void start_shared_collectors_for_run(const DfxRunConfig &dfx, uint32_t pipeline_slot);
+    void start_shared_collectors_for_run(const DfxRunConfig &dfx);
     /** Write this pass's per-event host phase records, if it collected any. */
     void write_host_phase_records_artifact(const std::string &output_prefix, uint32_t pipeline_slot);
     /**
      * Tear down the four shared diagnostics collectors after the launched
-     * kernels have synced, in the one order their couplings allow: the clock
-     * correlation session closes before the swimlane export reads it, and each
+     * kernels have synced, in the one order their couplings allow: each
      * collector drains before it reconciles before it exports. Each block is
      * gated on `dfx`, this run's own configuration.
      *
@@ -364,12 +361,7 @@ public:
      * `dep_gen_replay_emit_deps_json` export) inline their own teardown after
      * calling this helper, as on onboard.
      */
-    void teardown_shared_collectors_after_run(
-        const DfxRunConfig &dfx, uint32_t pipeline_slot, bool device_execution_complete
-    );
-    /** Start the level-4 Host/Device clock correlation once per run. */
-    void begin_clock_correlation_session_if_needed(uint32_t pipeline_slot) noexcept;
-    void finish_clock_correlation_session(uint32_t pipeline_slot, bool capture_device_complete) noexcept;
+    void teardown_shared_collectors_after_run(const DfxRunConfig &dfx, uint32_t pipeline_slot);
     // Diagnostic artifact root directory (CallConfig::validate() enforces non-empty
     // upstream when any diagnostic is enabled).
     void set_output_prefix(const char *prefix) { output_prefix_ = (prefix != nullptr) ? prefix : ""; }
@@ -591,8 +583,6 @@ protected:
     // One per pipeline slot: a bind is preparation, and a prepared successor
     // binds while its predecessor still owns the collectors.
     std::array<HostPhaseRunState, PTO_PIPELINE_MAX_DEPTH> host_phase_runs_{};
-    // Which slot's session the resident collector holds; see the onboard base.
-    uint32_t clock_correlation_session_slot_{PTO_PIPELINE_MAX_DEPTH};
     ArgsDumpCollector dump_collector_;
     PmuCollector pmu_collector_;
     ScopeStatsCollector scope_stats_collector_;

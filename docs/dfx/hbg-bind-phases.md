@@ -374,8 +374,7 @@ The skill's timeline mode is this recipe; it finishes with
 
 ```bash
 D=outputs/<case>_<ts>
-# The clock anchors are split: the invoking process wrote its own to $LOG, each
-# chip child wrote its own under $D. Concatenating keeps every pid alignable.
+# The invoking process writes to $LOG and each chip child writes under $D.
 cat "$LOG" "$D"/host.*.log > "$D/bind_timeline.log"
 python -m simpler_setup.tools.strace_timing "$D/bind_timeline.log" \
     --host-phase-records "$D/host_phase_records.jsonl" \

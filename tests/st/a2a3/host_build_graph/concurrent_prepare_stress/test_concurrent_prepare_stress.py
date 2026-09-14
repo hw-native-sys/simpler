@@ -315,13 +315,12 @@ class TestConcurrentPrepareStressHbg(SceneTestCase):
     def test_orch_phase_swimlane_overlaps_the_native_lane(self, st_platform, st_worker, capfd, drain_host_log):
         """Level-4 swimlane overlaps too, now that its phase state is per-run.
 
-        A host-orchestrating bind records phase events and samples a
-        ``HostOrchestrationBegin`` clock anchor, and neither can move under the
-        execution claim: the records describe the bind, and the anchor means the
-        instant host orchestration began. They are held per pipeline slot
-        instead, and everything destined for the resident swimlane collector is
-        published from the launch arming — so a successor's bind writes its own
-        state rather than resetting the predecessor's.
+        A host-orchestrating bind records phase events that cannot move under
+        the execution claim because they describe the bind. They are held per
+        pipeline slot instead, and everything destined for the resident
+        swimlane collector is published from the launch arming — so a
+        successor's bind writes its own state rather than resetting the
+        predecessor's.
 
         This arm previously required the opposite verdict, which is what made
         the exclusion visible while it existed.

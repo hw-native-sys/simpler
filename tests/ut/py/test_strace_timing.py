@@ -30,7 +30,6 @@ from simpler_setup.tools.strace_timing import (
     load_host_phase_records,
     main,
     node_span_leaf,
-    parse_clock_anchors,
     parse_drop_summaries,
     parse_spans,
     print_rounds_table,
@@ -60,13 +59,6 @@ def _record(pid, inv, name, attrs="", *, depth=0, ts=100, dur=20):
         f"[mono_ns={1_000_000 + pid}][T0x{pid}][TIMING] emit_host_span: "
         f"[STRACE] v=1 pid={pid} tid={pid} inv={inv} hid=abc depth={depth} "
         f"name={name} ts={ts} dur={dur} {attrs}"
-    )
-
-
-def _anchor_record(pid, mono_ns, wall_ns):
-    return (
-        f"[mono_ns={mono_ns}][T0x{pid}][TIMING] clock_anchor: "
-        f"[CLOCK_ANCHOR] v=1 pid={pid} mono_ns={mono_ns} wall_ns={wall_ns}\n"
     )
 
 
@@ -142,101 +134,6 @@ def test_parse_spans_preserves_64_bit_invocation_id():
 
     assert len(spans) == 1
     assert spans[0].inv == invocation_id
-
-
-def test_parse_clock_anchor_maps_monotonic_to_wall_time():
-    lines = [
-        "worker-3: [mono_ns=1005][T0x1][TIMING] clock_anchor: "
-        "[CLOCK_ANCHOR] v=1 pid=41 mono_ns=1000 wall_ns=1700000000000000000\n"
-    ]
-
-    anchors = list(parse_clock_anchors(lines))
-
-    assert len(anchors) == 1
-    assert anchors[0].pid == 41
-    assert anchors[0].mono_ns == 1000
-    assert anchors[0].wall_ns == 1_700_000_000_000_000_000
-    assert anchors[0].to_wall_ns(1250) == 1_700_000_000_000_000_250
-
-
-def test_parse_clock_anchor_rejects_payloads_outside_complete_anchor_records():
-    payload = "[CLOCK_ANCHOR] v=1 pid=41 mono_ns=1000 wall_ns=1700000000000000000"
-    lines = [
-        payload + "\n",
-        f"[mono_ns=1005][T0x1][INFO] message: copied {payload}\n",
-        f"[mono_ns=1005][T0x1][TIMING] clock_anchor: {payload} trailing\n",
-    ]
-
-    assert list(parse_clock_anchors(lines)) == []
-
-
-def test_trace_renderers_add_wall_time_without_replacing_monotonic_timestamps():
-    wall_ns = 1_700_000_000_000_000_000
-    anchors = list(parse_clock_anchors([_anchor_record(41, 1_000, wall_ns)]))
-    spans = list(
-        parse_spans(
-            [
-                _span_record(pid=41, tid=410, inv=7, name="chip.run", ts=1_250, dur=20),
-                _span_record(
-                    pid=41,
-                    tid=410,
-                    inv=7,
-                    name="chip.run.runner_run.device_wall",
-                    ts=300,
-                    dur=40,
-                    attrs="clk=dev",
-                    depth=1,
-                ),
-            ]
-        )
-    )
-
-    invocations = group_invocations(spans)
-    chrome_trace = to_chrome_trace(invocations, bucket_by_hid(invocations), anchors=anchors)
-    host_swimlane = to_host_swimlane(spans, anchors=anchors)
-
-    for trace in (chrome_trace, host_swimlane):
-        host_event = next(event for event in trace["traceEvents"] if event.get("name") == "chip.run")
-        assert host_event["ts"] == 1.25
-        assert host_event["args"]["wall_ts_ns"] == "1700000000000000250"
-        assert host_event["args"]["wall_time"] == "2023-11-14T22:13:20.000000250Z"
-        assert trace["clockAnchors"] == [{"pid": 41, "mono_ns": "1000", "wall_ns": "1700000000000000000"}]
-
-    device_event = next(event for event in chrome_trace["traceEvents"] if event.get("name", "").endswith("device_wall"))
-    assert "wall_ts_ns" not in device_event["args"]
-    assert "wall_time" not in device_event["args"]
-
-
-def test_wall_time_uses_the_matching_anchor_for_each_pid():
-    anchors = list(
-        parse_clock_anchors(
-            [
-                _anchor_record(41, 1_000, 1_700_000_000_000_000_000),
-                _anchor_record(52, 1_000, 1_900_000_000_000_000_000),
-                _anchor_record(64, 2_000, 2_000_000_000_000_000_000),
-            ]
-        )
-    )
-    spans = list(
-        parse_spans(
-            [
-                _span_record(pid=41, tid=410, inv=1, name="node.submit", ts=1_500, dur=10),
-                _span_record(pid=52, tid=520, inv=1, name="node.submit", ts=1_500, dur=10),
-                _span_record(pid=63, tid=630, inv=1, name="node.submit", ts=1_500, dur=10),
-                _span_record(pid=64, tid=640, inv=1, name="node.submit", ts=1_500, dur=10),
-            ]
-        )
-    )
-
-    trace = to_host_swimlane(spans, anchors=anchors)
-    events = [event for event in trace["traceEvents"] if event.get("ph") == "X"]
-
-    assert [event["args"].get("wall_ts_ns") for event in events] == [
-        "1700000000000000500",
-        "1900000000000000500",
-        None,
-        None,
-    ]
 
 
 def test_count_record_heads_sees_a_torn_record_that_parse_spans_drops():
@@ -666,8 +563,7 @@ def test_swimlane_cli_writes_trace(tmp_path):
     log_path = tmp_path / "run.log"
     output_path = tmp_path / "host_swimlane.json"
     log_path.write_text(
-        _anchor_record(71, 50, 1_700_000_000_000_000_000)
-        + _span_record(pid=71, tid=710, inv=2, name="node.graph_build", ts=100, dur=25, attrs="run_id=2 role=facade"),
+        _span_record(pid=71, tid=710, inv=2, name="node.graph_build", ts=100, dur=25, attrs="run_id=2 role=facade"),
         encoding="utf-8",
     )
 
@@ -675,7 +571,7 @@ def test_swimlane_cli_writes_trace(tmp_path):
 
     trace = json.loads(output_path.read_text(encoding="utf-8"))
     event = next(event for event in trace["traceEvents"] if event.get("name") == "node.graph_build")
-    assert event["args"]["wall_ts_ns"] == "1700000000000000050"
+    assert event["ts"] == 0.1
 
 
 def test_cli_reads_every_input_so_a_run_needs_no_manual_merge(tmp_path, capsys):
@@ -687,15 +583,12 @@ def test_cli_reads_every_input_so_a_run_needs_no_manual_merge(tmp_path, capsys):
     """
     first = tmp_path / "host.71.log"
     second = tmp_path / "host.72.log"
-    # Each process's own file carries its anchor ahead of its records.
     first.write_text(
-        _anchor_record(71, 50, 1_700_000_000_000_000_000)
-        + _span_record(pid=71, tid=710, inv=1, name="node.submit", ts=100, dur=10),
+        _span_record(pid=71, tid=710, inv=1, name="node.submit", ts=100, dur=10),
         encoding="utf-8",
     )
     second.write_text(
-        _anchor_record(72, 60, 1_700_000_000_000_000_010)
-        + _span_record(pid=72, tid=720, inv=1, name="chip.run", ts=200, dur=20),
+        _span_record(pid=72, tid=720, inv=1, name="chip.run", ts=200, dur=20),
         encoding="utf-8",
     )
     output_path = tmp_path / "swimlane.json"
@@ -704,8 +597,7 @@ def test_cli_reads_every_input_so_a_run_needs_no_manual_merge(tmp_path, capsys):
 
     trace = json.loads(output_path.read_text(encoding="utf-8"))
     assert {event["pid"] for event in trace["traceEvents"] if event.get("ph") == "X"} == {71, 72}
-    assert {int(anchor["pid"]) for anchor in trace["clockAnchors"]} == {71, 72}
-    assert "no [CLOCK_ANCHOR] record" not in capsys.readouterr().err
+    assert capsys.readouterr().err == ""
 
 
 def test_cli_expands_a_run_directory_to_its_per_process_log_files(tmp_path):
@@ -734,40 +626,6 @@ def test_cli_rejects_a_directory_with_no_span_files(tmp_path):
 
     with pytest.raises(SystemExit, match="holds no host\\."):
         main([str(empty)])
-
-
-def test_cli_warns_when_a_pid_emitted_spans_without_a_clock_anchor(tmp_path, capsys):
-    """An incomplete input leaves those pids monotonic-only.
-
-    `clockAnchors` is then simply absent from the output rather than wrong, which
-    is exactly the kind of loss nobody notices.
-    """
-    log_file = tmp_path / "host.71.log"
-    log_file.write_text(
-        _span_record(pid=71, tid=710, inv=1, name="node.submit", ts=100, dur=10)
-        + _span_record(pid=72, tid=720, inv=1, name="chip.run", ts=200, dur=20),
-        encoding="utf-8",
-    )
-
-    assert main([str(log_file)]) == 0
-
-    err = capsys.readouterr().err
-    assert "no [CLOCK_ANCHOR] record for pid(s) 71, 72" in err
-    assert "check that every input is complete" in err
-
-
-def test_cli_warns_when_one_pid_has_multiple_clock_anchors(tmp_path, capsys):
-    log_path = tmp_path / "run.log"
-    log_path.write_text(
-        _anchor_record(71, 50, 1_700_000_000_000_000_000)
-        + _anchor_record(71, 75, 1_700_000_000_000_000_025)
-        + _span_record(pid=71, tid=710, inv=2, name="chip.run", ts=100, dur=25),
-        encoding="utf-8",
-    )
-
-    assert main([str(log_path)]) == 0
-
-    assert "warning: multiple [CLOCK_ANCHOR] records found for pid 71" in capsys.readouterr().err
 
 
 def test_rounds_table_omits_tmr_only_columns_when_only_host_and_device_exist():
@@ -974,12 +832,11 @@ def test_swimlane_keeps_a_sequential_thread_on_its_own_tid():
     assert list(lanes) == [7]
 
 
-def test_chrome_trace_cli_writes_wall_time(tmp_path):
+def test_chrome_trace_cli_writes_trace(tmp_path):
     log_path = tmp_path / "run.log"
     output_path = tmp_path / "strace.json"
     log_path.write_text(
-        _anchor_record(71, 50, 1_700_000_000_000_000_000)
-        + _span_record(pid=71, tid=710, inv=2, name="chip.run", ts=100, dur=25),
+        _span_record(pid=71, tid=710, inv=2, name="chip.run", ts=100, dur=25),
         encoding="utf-8",
     )
 
@@ -988,7 +845,6 @@ def test_chrome_trace_cli_writes_wall_time(tmp_path):
     trace = json.loads(output_path.read_text(encoding="utf-8"))
     event = next(event for event in trace["traceEvents"] if event.get("name") == "chip.run")
     assert event["ts"] == 0.1
-    assert event["args"]["wall_ts_ns"] == "1700000000000000050"
 
 
 def test_host_phase_records_loader_keeps_only_well_formed_passes(tmp_path):

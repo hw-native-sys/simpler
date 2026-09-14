@@ -23,7 +23,7 @@ def _containment_placement(document, *, runner_start_ns=1_000, runner_dur_ns=5_0
 
     The `sched` span is what joins the two artifacts: the capture records the
     same window in absolute cycles, so the pair fixes the offset between the two
-    device timelines without any clock anchor.
+    device timelines from their common phase window.
     """
     prefix = "[mono_ns=1000][T0x1][TIMING] emit_host_span: "
     head = "[STRACE] v=1 pid=42 tid=42 inv=1 hid=abc"

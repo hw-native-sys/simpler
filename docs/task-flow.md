@@ -210,7 +210,6 @@ struct CallConfig {
     int32_t enable_pmu = 0;           // 0 = disabled; >0 selects PMU event type
     int32_t enable_dep_gen = 0;
     int32_t enable_scope_stats = 0;
-    int32_t capture_clock_anchors = 0; // set by the ChipWorker child, not by callers
     RuntimeEnv runtime_env;      // three arrays of four uint64_t overrides
     char    output_prefix[1024] = {};
 };

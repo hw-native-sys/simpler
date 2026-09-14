@@ -39,13 +39,12 @@ struct DfxRunConfig {
     bool pmu_enabled{false};
     bool dep_gen_enabled{false};
     bool scope_stats_enabled{false};
-    bool capture_clock_anchors{false};
     std::string output_prefix;
 
     bool chip_swimlane_enabled() const { return chip_swimlane_level != ChipSwimlaneLevel::DISABLED; }
     bool dump_args_enabled() const { return dump_args_level != DumpArgsLevel::OFF; }
 
-    /** Mirrors CallConfig::diagnostics_any(), which likewise excludes the clock anchors. */
+    /** Mirrors CallConfig::diagnostics_any(). */
     bool diagnostics_any() const {
         return chip_swimlane_enabled() || dump_args_enabled() || pmu_enabled || dep_gen_enabled || scope_stats_enabled;
     }
@@ -58,7 +57,6 @@ struct DfxRunConfig {
         resolved.pmu_event_type = resolve_pmu_event_type(config.enable_pmu);
         resolved.dep_gen_enabled = config.enable_dep_gen != 0;
         resolved.scope_stats_enabled = config.enable_scope_stats != 0;
-        resolved.capture_clock_anchors = config.capture_clock_anchors != 0;
         resolved.output_prefix = config.output_prefix;
         return resolved;
     }

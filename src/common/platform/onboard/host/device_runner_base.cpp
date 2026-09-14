@@ -1427,64 +1427,15 @@ DeviceRunnerBase::host_phase_pool_arm(uint32_t pipeline_slot, bool producer_want
     } catch (...) {
         LOG_WARN("Host phase pool could not be armed; this pass collects no per-event records");
     }
-    if (!run.host_orchestrated) return pool;
-
-    capture_clock_correlation_begin(run);
     return pool;
-}
-
-void DeviceRunnerBase::capture_clock_correlation_begin(HostPhaseRunState &run) noexcept {
-    // Sampled here, in the bind, because the anchor means the instant host
-    // orchestration began — the one thing about this state that cannot wait for
-    // the execution claim. It reaches the resident collector at launch, in
-    // publish_host_phase_run_to_collector().
-    if (run.clock_correlation != nullptr) return;
-    try {
-        run.clock_correlation = simpler::dfx::make_clock_correlation_provider();
-        run.clock_provider_name = run.clock_correlation->name();
-        run.clock_provider_unit = run.clock_correlation->raw_device_timestamp_unit();
-        run.orchestration_begin_anchors = simpler::dfx::capture_clock_anchor_group(
-            *run.clock_correlation, simpler::dfx::ClockAnchorPosition::HostOrchestrationBegin
-        );
-    } catch (...) {
-        run.clock_correlation.reset();
-        run.orchestration_begin_anchors.clear();
-        run.clock_provider_name = "unavailable";
-        run.clock_provider_unit = "unknown";
-    }
 }
 
 void DeviceRunnerBase::publish_host_phase_run_to_collector(uint32_t pipeline_slot) noexcept {
     if (pipeline_slot >= host_phase_runs_.size()) return;
-    HostPhaseRunState &run = host_phase_runs_[pipeline_slot];
+    const HostPhaseRunState &run = host_phase_runs_[pipeline_slot];
     // Read by the collector's initialize() when it sizes the orch phase pool, so
     // this has to precede it — both now run from the launch arming.
     chip_swimlane_collector_.set_host_orchestrated(run.host_orchestrated);
-    if (!run.host_orchestrated || chip_swimlane_collector_.clock_correlation_active()) return;
-    try {
-        chip_swimlane_collector_.begin_clock_correlation_session(
-            run.clock_provider_name.c_str(), run.clock_provider_unit.c_str()
-        );
-        if (!run.orchestration_begin_anchors.empty()) {
-            chip_swimlane_collector_.record_clock_anchor_samples(run.orchestration_begin_anchors);
-        }
-        clock_correlation_session_slot_ = pipeline_slot;
-    } catch (...) {
-        // begin() stores diagnostic strings and can still fail under allocation
-        // pressure. Keep this noexcept path fail-closed.
-        chip_swimlane_collector_.finish_clock_correlation_session();
-    }
-}
-
-void DeviceRunnerBase::begin_clock_correlation_session_if_needed(uint32_t pipeline_slot) noexcept {
-    if (pipeline_slot >= host_phase_runs_.size()) return;
-    HostPhaseRunState &run = host_phase_runs_[pipeline_slot];
-    if (run.chip_swimlane_level != ChipSwimlaneLevel::ORCH_PHASES) return;
-    // The device-orchestrating path has no bind-time capture, so both halves run
-    // here, under the execution claim.
-    run.host_orchestrated = true;
-    capture_clock_correlation_begin(run);
-    publish_host_phase_run_to_collector(pipeline_slot);
 }
 
 void DeviceRunnerBase::publish_host_phase_records_to_swimlane(uint32_t pipeline_slot) {
@@ -1495,44 +1446,6 @@ void DeviceRunnerBase::publish_host_phase_records_to_swimlane(uint32_t pipeline_
         records.submit_records(), records.device_upload_records(), records.submitted_tasks(), records.total_records(),
         records.dropped_records()
     );
-}
-
-void DeviceRunnerBase::finish_clock_correlation_session(
-    uint32_t pipeline_slot, bool capture_device_complete, bool abandon_device_resources
-) noexcept {
-    std::unique_ptr<simpler::dfx::ClockCorrelationProvider> *provider = nullptr;
-    if (pipeline_slot < host_phase_runs_.size()) {
-        provider = &host_phase_runs_[pipeline_slot].clock_correlation;
-    }
-    auto release_provider = [&]() {
-        if (provider != nullptr && *provider != nullptr) {
-            (*provider)->release(abandon_device_resources);
-            provider->reset();
-        }
-    };
-    // The providers are per slot but the collector holds one session, so only
-    // the slot that opened it may end it. A prepared successor that fails while
-    // its predecessor is executing reaches here for its own slot; ending the
-    // session there would cost the predecessor its DeviceExecutionComplete
-    // anchor and export a correlation with no closing edge.
-    if (!chip_swimlane_collector_.clock_correlation_active() || clock_correlation_session_slot_ != pipeline_slot) {
-        release_provider();
-        return;
-    }
-    if (capture_device_complete && provider != nullptr && *provider != nullptr) {
-        try {
-            chip_swimlane_collector_.record_clock_anchor_samples(
-                simpler::dfx::capture_clock_anchor_group(
-                    **provider, simpler::dfx::ClockAnchorPosition::DeviceExecutionComplete
-                )
-            );
-        } catch (...) {
-            LOG_WARN("Device-complete clock anchors could not be sampled");
-        }
-    }
-    chip_swimlane_collector_.finish_clock_correlation_session();
-    clock_correlation_session_slot_ = PTO_PIPELINE_MAX_DEPTH;
-    release_provider();
 }
 
 // =============================================================================
@@ -1564,12 +1477,6 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     auto capture = [&rc](int err) {
         if (err != 0 && rc == 0) rc = err;
     };
-
-    // Every slot: finalize releases the runner's device-owning resources, and a
-    // provider that never reached a drain is one of them.
-    for (uint32_t slot = 0; slot < host_phase_runs_.size(); ++slot) {
-        finish_clock_correlation_session(slot, false, abandon_device_resources);
-    }
 
     // Teardown invariant: finalize_common() is the single place that releases
     // every RTS/device-owning resource, and the subclass runs it BEFORE its
@@ -2061,7 +1968,7 @@ int DeviceRunnerBase::init_runtime_args_with_metadata(Runtime &runtime, KernelAr
     return 0;
 }
 
-void DeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &dfx, uint32_t pipeline_slot) {
+void DeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &dfx) {
     // Open each enabled collector's window and start its mgmt + poll threads
     // now, just before kernels launch. Both halves belong here: begin_run()
     // drops the previous run's records and republishes the device level, which
@@ -2073,7 +1980,6 @@ void DeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &dfx, 
     };
     if (dfx.chip_swimlane_enabled()) {
         chip_swimlane_collector_.begin_run(dfx.output_prefix, dfx.chip_swimlane_level);
-        if (dfx.capture_clock_anchors) begin_clock_correlation_session_if_needed(pipeline_slot);
         chip_swimlane_collector_.start(thread_factory);
     }
     if (dfx.dump_args_enabled()) {
@@ -2106,14 +2012,11 @@ void DeviceRunnerBase::write_host_phase_records_artifact(const std::string &outp
     }
 }
 
-void DeviceRunnerBase::teardown_shared_collectors_after_run(
-    const DfxRunConfig &dfx, uint32_t pipeline_slot, bool device_execution_complete
-) {
+void DeviceRunnerBase::teardown_shared_collectors_after_run(const DfxRunConfig &dfx, uint32_t pipeline_slot) {
     // Tear down collectors. stop() joins mgmt then collector in the only safe
     // order (mgmt's final-drain pass into L2 has poll as its consumer).
     // Diagnostic exports use the per-task output prefix the user set on
     // CallConfig (CallConfig::validate() enforces non-empty upstream).
-    finish_clock_correlation_session(pipeline_slot, device_execution_complete, !can_accept_run());
     if (dfx.chip_swimlane_enabled()) {
         chip_swimlane_collector_.quiesce();
         chip_swimlane_collector_.read_phase_header_metadata();

@@ -20,7 +20,6 @@
 #include <cerrno>
 #include <fstream>
 #include <sstream>
-#include <set>
 #include <string>
 #include <thread>
 #include <utility>
@@ -52,7 +51,7 @@ struct CannLogLevelCall {
 
 CannLogLevelCall g_cann_log_level_call{};
 SimplerHostLogState g_shared_log_state{
-    static_cast<int32_t>(LogLevel::TIMING), 0, 0, {}, 0, 0, nullptr, nullptr, 0, 0, 0, {}, 0,
+    static_cast<int32_t>(LogLevel::TIMING), 0, {}, 0, 0, nullptr, nullptr, 0, 0, 0, {}, 0,
 };
 
 int capture_cann_log_level(int module_id, int level, int enable_event) {
@@ -110,7 +109,6 @@ TEST(HostLogTest, SharedStateBindingValidatesThresholdAndOwnsIt) {
     EXPECT_NE(simpler_host_log_bind_state(&bad_threshold), 0);
 
     g_shared_log_state.threshold = static_cast<int32_t>(LogLevel::ERROR);
-    g_shared_log_state.clock_anchor_pid = 0;
     ASSERT_EQ(simpler_host_log_bind_state(&g_shared_log_state), 0);
     // This executable supplies the process-owned storage; production consumers
     // only take the exported bind path and therefore cannot create its writer.
@@ -242,69 +240,6 @@ TEST(HostLogTest, EmitPrefixHasMonotonicNanosecondsAndTid) {
     EXPECT_NE(captured.err.find("marker"), std::string::npos);
 }
 
-TEST(HostLogTest, TimingStartupEmitsOneClockAnchorPerProcess) {
-    ASSERT_TRUE(HostLogger::get_instance().prepare_to_fork());
-    int log_pipe[2];
-    ASSERT_EQ(pipe(log_pipe), 0);
-
-    const pid_t child = fork();
-    ASSERT_GE(child, 0);
-    if (child == 0) {
-        close(log_pipe[0]);
-        if (dup2(log_pipe[1], STDERR_FILENO) < 0) _exit(2);
-        close(log_pipe[1]);
-
-        HostLogger::get_instance().set_level(LogLevel::TIMING);
-        HostLogger::get_instance().log(LogLevel::TIMING, "child", "first-record");
-        HostLogger::get_instance().log(LogLevel::TIMING, "child", "second-record");
-        if (!HostLogger::get_instance().flush()) _exit(3);
-        _exit(0);
-    }
-
-    close(log_pipe[1]);
-    std::string captured;
-    char buffer[1024];
-    ssize_t count = 0;
-    while ((count = read(log_pipe[0], buffer, sizeof(buffer))) > 0) {
-        captured.append(buffer, static_cast<size_t>(count));
-    }
-    close(log_pipe[0]);
-
-    int status = 0;
-    ASSERT_EQ(waitpid(child, &status, 0), child);
-    ASSERT_TRUE(WIFEXITED(status));
-    ASSERT_EQ(WEXITSTATUS(status), 0);
-    ASSERT_TRUE(HostLogger::get_instance().start_writer());
-
-    const size_t anchor_pos = captured.find("[CLOCK_ANCHOR]");
-    ASSERT_NE(anchor_pos, std::string::npos);
-    EXPECT_EQ(captured.find("[CLOCK_ANCHOR]", anchor_pos + 1), std::string::npos);
-    const size_t anchor_line_start = captured.rfind('\n', anchor_pos);
-    const size_t anchor_level =
-        captured.find("][TIMING]", anchor_line_start == std::string::npos ? 0 : anchor_line_start);
-    ASSERT_NE(anchor_level, std::string::npos);
-    EXPECT_LT(anchor_level, anchor_pos);
-    const size_t first_record_pos = captured.find("first-record");
-    const size_t second_record_pos = captured.find("second-record");
-    ASSERT_NE(first_record_pos, std::string::npos);
-    ASSERT_NE(second_record_pos, std::string::npos);
-    EXPECT_LT(anchor_pos, first_record_pos);
-
-    int anchor_pid = -1;
-    long long mono_ns = 0;
-    long long wall_ns = 0;
-    ASSERT_EQ(
-        sscanf(
-            captured.c_str() + anchor_pos, "[CLOCK_ANCHOR] v=1 pid=%d mono_ns=%lld wall_ns=%lld", &anchor_pid, &mono_ns,
-            &wall_ns
-        ),
-        3
-    );
-    EXPECT_EQ(anchor_pid, child);
-    EXPECT_GT(mono_ns, 0);
-    EXPECT_GT(wall_ns, 0);
-}
-
 TEST(HostLogTest, AllOutputGoesToStderr) {
     auto captured = run_with_config(LogLevel::DEBUG, [] {
         HostLogger::get_instance().log(LogLevel::ERROR, "fn", "error-output-marker");
@@ -355,11 +290,9 @@ TEST(HostLogTest, HostSpanEscapesDelimitersAndFitsAtomicPipeRecord) {
     EXPECT_EQ(record[record.size() - 2], '~');
 }
 
-// The output directory is frozen on the first non-empty value, so a test that
-// needs its own clears the binding first — the same shape as this file's
-// existing `clock_anchor_pid` resets. Restoring it on scope exit is what keeps
-// one directory test from redirecting every later test's records away from
-// stderr, including when an ASSERT leaves the test early.
+// The output directory is frozen on the first non-empty value. Restoring it on
+// scope exit keeps one directory test from redirecting every later test's
+// records away from stderr, including when an ASSERT leaves the test early.
 class ScopedLogDirectory {
 public:
     explicit ScopedLogDirectory(const char *directory) {
@@ -395,24 +328,20 @@ TEST(HostLogTest, LogDirectorySendsEveryRecordToOneAsyncFilePerProcess) {
 
     const SimplerHostSpan nested{7, 0x1234, 1, 0, 100, 25, "chip.run.bind", "run_id=7"};
     const SimplerHostSpan root{7, 0x1234, 0, 0, 90, 50, "chip.run", "run_id=7"};
-    g_shared_log_state.clock_anchor_pid = 0;
     const auto captured = run_with_config(LogLevel::TIMING, [&] {
         unified_log_host_span(&nested);
         unified_log_host_span(&root);
     });
     // The destination belongs to the logger, so nothing is left behind on
-    // stderr — not the spans and not the anchor they are unreadable without.
+    // stderr.
     EXPECT_EQ(captured.err, "");
 
     const std::string contents = read_log_file(directory, getpid());
     std::istringstream records(contents);
-    std::string anchor_record;
     std::string nested_record;
     std::string root_record;
-    ASSERT_TRUE(static_cast<bool>(std::getline(records, anchor_record)));
     ASSERT_TRUE(static_cast<bool>(std::getline(records, nested_record)));
     ASSERT_TRUE(static_cast<bool>(std::getline(records, root_record)));
-    EXPECT_NE(anchor_record.find("[CLOCK_ANCHOR] v=1"), std::string::npos);
     // Field sequence, not just the name: `name=chip.run` is a prefix of
     // `name=chip.run.bind`, so a name alone cannot tell the root record from the
     // nested one.
@@ -421,9 +350,8 @@ TEST(HostLogTest, LogDirectorySendsEveryRecordToOneAsyncFilePerProcess) {
     std::string extra_record;
     EXPECT_FALSE(static_cast<bool>(std::getline(records, extra_record)));
 
-    // Every line went through the same envelope, which is what lets one reader
-    // parse the anchor and the spans out of this one file.
-    for (const std::string &record : {anchor_record, nested_record, root_record}) {
+    // Every line went through the same envelope.
+    for (const std::string &record : {nested_record, root_record}) {
         EXPECT_EQ(record.find("[mono_ns="), 0u) << record;
     }
 
@@ -438,7 +366,6 @@ TEST(HostLogTest, ExplicitDrainMakesAllAcceptedFileRecordsVisible) {
     ASSERT_NE(directory, nullptr);
     ScopedLogDirectory scoped_log_directory(directory);
 
-    g_shared_log_state.clock_anchor_pid = 0;
     const auto captured = run_with_config(LogLevel::TIMING, [] {
         HostLogger::get_instance().log(LogLevel::ERROR, "fn", "disk-please");
         HostLogger::get_instance().log(LogLevel::TIMING, "fn", "queued-please");
@@ -637,19 +564,11 @@ TEST(HostLogTest, ForkedProcessesEmitWholePipeRecords) {
     ASSERT_TRUE(HostLogger::get_instance().start_writer());
 
     std::vector<std::vector<bool>> seen(child_count, std::vector<bool>(records_per_child, false));
-    std::set<int> anchor_pids;
     std::istringstream lines(captured);
     std::string line;
     int line_count = 0;
     constexpr char payload_marker[] = " payload=";
     while (std::getline(lines, line)) {
-        const size_t anchor_pos = line.find("[CLOCK_ANCHOR]");
-        if (anchor_pos != std::string::npos) {
-            int anchor_pid = -1;
-            ASSERT_EQ(sscanf(line.c_str() + anchor_pos, "[CLOCK_ANCHOR] v=1 pid=%d", &anchor_pid), 1);
-            EXPECT_TRUE(anchor_pids.insert(anchor_pid).second);
-            continue;
-        }
         const size_t record_pos = line.find("child=");
         const size_t payload_pos = line.find(payload_marker);
         ASSERT_NE(record_pos, std::string::npos);
@@ -674,5 +593,4 @@ TEST(HostLogTest, ForkedProcessesEmitWholePipeRecords) {
         ++line_count;
     }
     EXPECT_EQ(line_count, child_count * records_per_child);
-    EXPECT_EQ(anchor_pids.size(), static_cast<size_t>(child_count));
 }

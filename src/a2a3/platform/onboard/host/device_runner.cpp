@@ -569,7 +569,7 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
                 activate_launch_shape(runtime);
                 (void)arm_device_wall_buffer(prepared.kernel_args);
                 if (int arm_rc = arm_collectors_for_run(runtime, prepared); arm_rc != 0) return arm_rc;
-                start_shared_collectors_for_run(prepared.dfx, prepared.pipeline_slot);
+                start_shared_collectors_for_run(prepared.dfx);
                 if (prepared.dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
                     auto thread_factory = [this](std::function<void()> fn) {
                         return create_thread(std::move(fn));
@@ -661,7 +661,7 @@ int DeviceRunner::reap_run(const DfxRunConfig &dfx, uint32_t pipeline_slot) {
         // JSON manifest, i.e. unusable for triage. reconcile/export are not
         // idempotent, so this runs only on the error return; the success path
         // still exports exactly once below.
-        teardown_shared_collectors_after_run(dfx, pipeline_slot, false);
+        teardown_shared_collectors_after_run(dfx, pipeline_slot);
         emit_device_dep_gen_graph(dfx);
         return rc;
     }
@@ -670,7 +670,7 @@ int DeviceRunner::reap_run(const DfxRunConfig &dfx, uint32_t pipeline_slot) {
 
     // Tear down collectors. stop() joins mgmt then collector in the only safe
     // order (mgmt's final-drain pass into L2 has poll as its consumer).
-    teardown_shared_collectors_after_run(dfx, pipeline_slot, true);
+    teardown_shared_collectors_after_run(dfx, pipeline_slot);
     emit_device_dep_gen_graph(dfx);
 
     return 0;
@@ -1122,9 +1122,9 @@ int DeviceRunner::arm_collectors_for_run(Runtime &runtime, PreparedExecution &pr
     latch_collector_shape(num_aicore, aicpu_thread_num, launch_aicpu_num);
 
     // Between the stale-shape release and the init: finalize() resets
-    // host_orchestrated_ and the collector's clock session, and initialize()
+    // host_orchestrated_, and initialize()
     // reads host_orchestrated_ when it decides whether to size a device orch
-    // phase pool. Publishing before the release would lose both.
+    // phase pool. Publishing before the release would lose that state.
     publish_host_phase_run_to_collector(prepared.pipeline_slot);
 
     int rc = 0;

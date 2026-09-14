@@ -830,21 +830,11 @@ public:
     /** Hand this pass's records to the swimlane reader, just before its export. */
     void publish_host_phase_records_to_swimlane(uint32_t pipeline_slot);
     /**
-     * Hand this run's captured clock-correlation session to the resident
-     * collector, under the execution claim.
-     *
-     * Its `HostOrchestrationBegin` anchor was sampled during bind, where the
-     * position's meaning lives; this is the first point at which writing the
-     * collector cannot land on a predecessor's session. `set_host_orchestrated`
-     * rides along because the collector's initialize() reads it when it sizes
-     * the orch phase pool, and that now runs from the same launch arming.
+     * Hand this run's host-orchestration mode to the resident collector under
+     * the execution claim. `set_host_orchestrated` must precede collector
+     * initialization because it controls the device orch phase-pool shape.
      */
     void publish_host_phase_run_to_collector(uint32_t pipeline_slot) noexcept;
-    /**
-     * Capture and publish in one step, for the device-orchestrating path that
-     * has no bind-time hook and reaches this already under the claim.
-     */
-    void begin_clock_correlation_session_if_needed(uint32_t pipeline_slot) noexcept;
     /**
      * Write this pass's per-event host phase records under `output_prefix`.
      *
@@ -854,11 +844,6 @@ public:
      * every path that can end a run may call this unconditionally.
      */
     void write_host_phase_records_artifact(const std::string &output_prefix, uint32_t pipeline_slot);
-    void finish_clock_correlation_session(
-        uint32_t pipeline_slot, bool capture_device_complete, bool abandon_device_resources
-    ) noexcept;
-    /** Create this run's provider and sample its HostOrchestrationBegin anchors. */
-    void capture_clock_correlation_begin(HostPhaseRunState &run) noexcept;
 
     /**
      * Latch the part of this run's config a device-context query answers from.
@@ -1070,7 +1055,7 @@ protected:
      * this helper and then open and start their own. The sim base carries the
      * same split.
      */
-    void start_shared_collectors_for_run(const DfxRunConfig &dfx, uint32_t pipeline_slot);
+    void start_shared_collectors_for_run(const DfxRunConfig &dfx);
 
     /**
      * Tear down the four shared diagnostics collectors after the launched
@@ -1085,9 +1070,7 @@ protected:
      * `dep_gen_replay_emit_deps_json` export) inline their own teardown after
      * calling this helper. The sim base carries the same split.
      */
-    void teardown_shared_collectors_after_run(
-        const DfxRunConfig &dfx, uint32_t pipeline_slot, bool device_execution_complete
-    );
+    void teardown_shared_collectors_after_run(const DfxRunConfig &dfx, uint32_t pipeline_slot);
 
     /**
      * The core and AICPU-thread counts a resident collector's pools were built
@@ -1454,10 +1437,6 @@ protected:
     // bind is preparation and a prepared successor prepares while its
     // predecessor still owns the collectors — see host_phase_run_state.h.
     std::array<HostPhaseRunState, PTO_PIPELINE_MAX_DEPTH> host_phase_runs_{};
-    // Which slot's session the resident collector currently holds, or
-    // PTO_PIPELINE_MAX_DEPTH for none. The providers are per slot but the
-    // collector's session is not, so only its opener may end it.
-    uint32_t clock_correlation_session_slot_{PTO_PIPELINE_MAX_DEPTH};
     ArgsDumpCollector dump_collector_;
     PmuCollector pmu_collector_;
     ScopeStatsCollector scope_stats_collector_;

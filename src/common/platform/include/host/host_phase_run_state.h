@@ -11,12 +11,9 @@
 
 #pragma once
 
-#include <memory>
 #include <string>
-#include <vector>
 
 #include "common/chip_swimlane_profiling.h"
-#include "host/clock_correlation.h"
 #include "host/dfx_run_config.h"
 #include "host/host_phase_records.h"
 
@@ -27,8 +24,7 @@
  * preparation — and a prepared successor prepares while its predecessor is
  * still executing. So unlike the collector pools, which `arm_collectors_for_run`
  * builds under the execution claim, this cannot be deferred to launch: the
- * records describe the bind, and the `HostOrchestrationBegin` anchor means the
- * instant host orchestration began. What it gets instead is one of these per
+ * records describe the bind. What it gets instead is one of these per
  * concurrently-live run, so a successor's bind writes its own.
  *
  * The collector on the far side is still resident and single, so everything
@@ -47,11 +43,6 @@ struct HostPhaseRunState {
     ChipSwimlaneLevel chip_swimlane_level{ChipSwimlaneLevel::DISABLED};
     std::string output_prefix;
 
-    std::unique_ptr<simpler::dfx::ClockCorrelationProvider> clock_correlation;
-    /** Sampled during bind; replayed into the collector at launch. */
-    std::vector<simpler::dfx::ClockAnchorSample> orchestration_begin_anchors;
-    std::string clock_provider_name;
-    std::string clock_provider_unit;
     /**
      * Whether this run's orchestrator phase records come from the host rather
      * than the AICPU, which decides whether the collector sizes a device orch
@@ -68,8 +59,5 @@ struct HostPhaseRunState {
         chip_swimlane_level = dfx.chip_swimlane_level;
         output_prefix = dfx.output_prefix;
         host_orchestrated = false;
-        orchestration_begin_anchors.clear();
-        clock_provider_name.clear();
-        clock_provider_unit.clear();
     }
 };

@@ -23,8 +23,8 @@ is than the work it brackets — and that term is measured, never estimated:
     slack     = outer_duration - device_extent
     placement in [outer_start, outer_start + slack]
 
-Nothing here reads a Host/Device clock anchor. Two unknowns stand between a raw
-cycle and the Host axis, and containment bounds both:
+Two unknowns stand between a raw cycle and the Host axis, and containment
+bounds both:
 
 ``origin_cycles``
     The cycle that device-phase time zero sits on. The host log carries the

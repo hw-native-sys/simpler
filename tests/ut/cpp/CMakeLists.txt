@@ -536,7 +536,6 @@ set_tests_properties(test_execution_mode_latch PROPERTIES LABELS "no_hardware")
 add_executable(test_chip_swimlane_collector
     common/test_chip_swimlane_collector.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/chip_swimlane_collector.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/clock_correlation.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/sim/host/profiling_copy.cpp
     ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
 )

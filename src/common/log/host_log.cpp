@@ -73,7 +73,6 @@ static_assert(kRecordCapacity >= 2);
 
 struct QueuedRecord {
     uint32_t size;
-    int32_t anchor_pid;
     char data[kRecordCapacity];
 };
 
@@ -193,14 +192,6 @@ void atomic_store_u64(uint64_t *value, uint64_t desired) { __atomic_store_n(valu
 void count_drop(SimplerHostLogState *state, SimplerHostLogDropReason reason) {
     atomic_add_u64(&state->dropped_record_count, 1);
     atomic_add_u64(&state->dropped_by_reason[reason], 1);
-}
-
-void release_anchor_after_write_failure(SimplerHostLogState *state, int32_t pid) {
-    int32_t observed = __atomic_load_n(&state->clock_anchor_pid, __ATOMIC_ACQUIRE);
-    while (
-        (observed == pid || observed == -pid) &&
-        !__atomic_compare_exchange_n(&state->clock_anchor_pid, &observed, 0, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)
-    ) {}
 }
 
 long host_trace_tid() {
@@ -363,8 +354,7 @@ struct HostLogAsyncSink {
     SimplerHostLogState *state;
     pid_t pid;
 
-    static int
-    enqueue(void *context, SimplerHostLogState *state, const char *record, uint32_t size, int32_t anchor_pid) {
+    static int enqueue(void *context, SimplerHostLogState *state, const char *record, uint32_t size) {
         auto *sink = static_cast<HostLogAsyncSink *>(context);
         if (sink == nullptr) {
             atomic_sub_u64(&state->sink_producer_state, 1);
@@ -409,7 +399,6 @@ struct HostLogAsyncSink {
 #endif
 
         slot->record.size = size;
-        slot->record.anchor_pid = anchor_pid;
         std::memcpy(slot->record.data, record, size);
         atomic_add_u64(&state->pending_record_count, 1);
         slot->sequence.store(position + 1, std::memory_order_release);
@@ -473,7 +462,6 @@ private:
 
             if (!write_record_now(state, record.data, record.size)) {
                 count_drop(state, SIMPLER_HOST_LOG_DROP_OUTPUT_FAILED);
-                if (record.anchor_pid != 0) release_anchor_after_write_failure(state, record.anchor_pid);
             }
             atomic_sub_u64(&state->pending_record_count, 1);
             completion_cv.notify_all();
@@ -495,7 +483,7 @@ private:
 // binds the process-owned state. Missing binding is therefore observable as an
 // absent module stream rather than output filtered at the wrong threshold.
 SimplerHostLogState g_module_log_state{
-    static_cast<int32_t>(LogLevel::NUL), 0, 0, {}, 0, 0, nullptr, nullptr, 0, 0, 0, {}, 0,
+    static_cast<int32_t>(LogLevel::NUL), 0, {}, 0, 0, nullptr, nullptr, 0, 0, 0, {}, 0,
 };
 
 int32_t atomic_load_i32(const int32_t *value) { return __atomic_load_n(value, __ATOMIC_ACQUIRE); }
@@ -583,7 +571,6 @@ bool HostLogger::start_writer() {
     const auto enqueue = atomic_load_enqueue(&shared->sink_enqueue);
     void *context = atomic_load_pointer(&shared->sink_context);
     if (owner == pid && enqueue != nullptr && context != nullptr) {
-        emit_clock_anchor_if_needed();
         return true;
     }
 
@@ -631,7 +618,6 @@ bool HostLogger::start_writer() {
     atomic_store_enqueue(&shared->sink_enqueue, &HostLogAsyncSink::enqueue);
     atomic_store_i32(&shared->sink_owner_pid, pid);
     __atomic_fetch_and(&shared->sink_producer_state, ~kProducerStopFlag, __ATOMIC_RELEASE);
-    emit_clock_anchor_if_needed();
     return true;
 }
 
@@ -695,7 +681,7 @@ void HostLogger::report_drops_if_grown() {
         by_reason[reason] = static_cast<unsigned long long>(atomic_load_u64(&shared->dropped_by_reason[reason]));
     }
     (void)emit_ungated(
-        0, level_name(LogLevel::ERROR), "host_log_drops",
+        level_name(LogLevel::ERROR), "host_log_drops",
         "[HOSTLOG_DROPS] v=1 pid=%d new=%llu total=%llu queue_full=%llu claim_exhausted=%llu output_failed=%llu "
         "not_admitted=%llu\n",
         static_cast<int>(getpid()), static_cast<unsigned long long>(total - reported),
@@ -759,7 +745,7 @@ const char *HostLogger::level_name(LogLevel level) const {
     return "?";
 }
 
-bool HostLogger::emit(const char *level_tag, const char *func, const char *fmt, va_list args, int32_t anchor_pid) {
+bool HostLogger::emit(const char *level_tag, const char *func, const char *fmt, va_list args) {
     const int64_t monotonic_ns = simpler::log::monotonic_now_ns();
     auto tid = static_cast<unsigned long>(reinterpret_cast<uintptr_t>(pthread_self()));
 
@@ -790,7 +776,6 @@ bool HostLogger::emit(const char *level_tag, const char *func, const char *fmt, 
         // path; steady-state producers below remain bounded and do no output I/O.
         if (write_record_now(shared, record, size)) return true;
         count_drop(shared, SIMPLER_HOST_LOG_DROP_OUTPUT_FAILED);
-        if (anchor_pid != 0) release_anchor_after_write_failure(shared, anchor_pid);
         return false;
     }
     if (!acquire_sink_producer(shared)) {
@@ -811,48 +796,21 @@ bool HostLogger::emit(const char *level_tag, const char *func, const char *fmt, 
     }
     // A rejection is attributed by the sink, which is the only side that knows
     // whether the queue was full or the claim budget ran out.
-    return enqueue(context, shared, record, size, anchor_pid) != 0;
+    return enqueue(context, shared, record, size) != 0;
 }
 
-bool HostLogger::emit_ungated(int32_t anchor_pid, const char *level_tag, const char *func, const char *fmt, ...) {
+bool HostLogger::emit_ungated(const char *level_tag, const char *func, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
-    // Its one caller writes the clock anchor, which every reader of this stream
-    // needs before it can place anything else in wall time.
-    const bool written = emit(level_tag, func, fmt, args, anchor_pid);
+    const bool written = emit(level_tag, func, fmt, args);
     va_end(args);
     return written;
-}
-
-void HostLogger::emit_clock_anchor_if_needed() {
-    if (!is_enabled(LogLevel::TIMING)) return;
-
-    const pid_t pid = getpid();
-    SimplerHostLogState *shared = state();
-    const int32_t pid_value = static_cast<int32_t>(pid);
-    int32_t observed = atomic_load_i32(&shared->clock_anchor_pid);
-    if (observed == pid_value || observed == -pid_value) return;
-    if (!atomic_compare_exchange_i32(&shared->clock_anchor_pid, &observed, -pid_value)) {
-        return;
-    }
-
-    const int64_t monotonic_ns = simpler::log::monotonic_now_ns();
-    const int64_t wall_ns =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
-            .count();
-    const bool written = emit_ungated(
-        pid_value, level_name(LogLevel::TIMING), "clock_anchor", "[CLOCK_ANCHOR] v=1 pid=%d mono_ns=%lld wall_ns=%lld",
-        static_cast<int>(pid), static_cast<long long>(monotonic_ns), static_cast<long long>(wall_ns)
-    );
-    int32_t claim = -pid_value;
-    (void)atomic_compare_exchange_i32(&shared->clock_anchor_pid, &claim, written ? pid_value : 0);
 }
 
 void HostLogger::vlog(LogLevel level, const char *func, const char *fmt, va_list args) {
     if (!is_enabled(level)) {
         return;
     }
-    emit_clock_anchor_if_needed();
     (void)emit(level_name(level), func, fmt, args);
 }
 

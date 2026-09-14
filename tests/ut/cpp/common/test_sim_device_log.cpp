@@ -38,7 +38,7 @@ namespace {
 constexpr const char *kTags[] = {"DEBUG", "INFO", "TIMING", "WARN", "ERROR"};
 
 SimplerHostLogState g_log_state{
-    static_cast<int32_t>(simpler::log::LogLevel::ERROR), 0, 0, {}, 0, 0, nullptr, nullptr, 0, 0, 0, {}, 0,
+    static_cast<int32_t>(simpler::log::LogLevel::ERROR), 0, {}, 0, 0, nullptr, nullptr, 0, 0, 0, {}, 0,
 };
 
 // level_idx selects the compatibility entry point under test.
@@ -71,7 +71,6 @@ std::string record(int level_idx, const char *func, const std::string &body) {
 
 void bind_level(simpler::log::LogLevel level) {
     g_log_state.threshold = static_cast<int32_t>(level);
-    g_log_state.clock_anchor_pid = static_cast<int32_t>(getpid());
     g_log_state.log_directory_bound = 0;
     g_log_state.log_directory[0] = '\0';
     ASSERT_EQ(set_host_log_state(&g_log_state), 0);
@@ -319,7 +318,6 @@ TEST(SimDeviceLogTest, ForkedProcessesEmitWholeRecords) {
         pid_t pid = fork();
         ASSERT_GE(pid, 0);
         if (pid == 0) {
-            g_log_state.clock_anchor_pid = static_cast<int32_t>(getpid());
             set_log_level(static_cast<int>(simpler::log::LogLevel::DEBUG));
             for (int i = 0; i < kPerChild; ++i) {
                 emit(c, "chip_worker", "c%d-r%03d", c, i);
@@ -377,7 +375,6 @@ TEST(SimDeviceLogTest, WritersOutrunASmallPipeWithoutDeadlocking) {
         pid_t pid = fork();
         ASSERT_GE(pid, 0);
         if (pid == 0) {
-            g_log_state.clock_anchor_pid = static_cast<int32_t>(getpid());
             set_log_level(static_cast<int>(simpler::log::LogLevel::DEBUG));
             for (int i = 0; i < kPerChild; ++i) {
                 emit(c, "chip_worker", "c%d-r%03d", c, i);

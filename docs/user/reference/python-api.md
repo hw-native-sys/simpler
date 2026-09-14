@@ -151,7 +151,6 @@ input/output view. `DataType` carries the element types.
 | `enable_pmu` | `0` | `0` off; `>0` selects the event type |
 | `enable_dep_gen` | `0` | Emit the dependency graph |
 | `enable_scope_stats` | `0` | Writes `<output_prefix>/scope_stats/scope_stats.jsonl` |
-| `capture_clock_anchors` | `False` | Samples the Host and Device clocks around a run and serializes the pairs into the capture. Set by the ChipWorker child for an L3 chip-swimlane capture; not a caller knob. The offline tools place device records by span containment and no longer read these |
 | `output_prefix` | `""` | **Required whenever any diagnostic is enabled** |
 | `runtime_env` | — | TRB uses `ring_task_window`, `ring_heap`, and `ring_dep_pool`. HBG uses `ring_task_window[0]` for graph task capacity; its graph heap is sized after orchestration |
 

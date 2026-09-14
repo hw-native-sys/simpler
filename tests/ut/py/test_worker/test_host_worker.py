@@ -1096,7 +1096,7 @@ class _TwoFrameLoopHarness:
         try:
             frame[worker_mod._OFF_TASK_CALLABLE_HASH : worker_mod._OFF_TASK_ARGS_BLOB] = self.digest
             struct.pack_into("=ii", frame, worker_mod._OFF_TASK_ARGS_BLOB, 0, 0)
-            cfg_values = [0] * (7 + 3 * worker_mod.RUNTIME_ENV_RING_COUNT)
+            cfg_values = [0] * (6 + 3 * worker_mod.RUNTIME_ENV_RING_COUNT)
             cfg_values[3] = int(diagnostics)
             output_prefix = b"/tmp/simpler-test" if diagnostics else b""
             worker_mod._CFG_FMT.pack_into(frame, worker_mod._OFF_CONFIG, *cfg_values, output_prefix)
@@ -8210,7 +8210,7 @@ def test_a_failed_diagnostic_sidecar_write_fails_the_task_not_the_loop(tmp_path)
     try:
         frame[worker_mod._OFF_TASK_CALLABLE_HASH : worker_mod._OFF_TASK_ARGS_BLOB] = digest
         struct.pack_into("=ii", frame, worker_mod._OFF_TASK_ARGS_BLOB, 0, 0)
-        cfg_values = [0] * (7 + 3 * worker_mod.RUNTIME_ENV_RING_COUNT)
+        cfg_values = [0] * (6 + 3 * worker_mod.RUNTIME_ENV_RING_COUNT)
         cfg_values[1] = 4  # enable_chip_swimlane
         worker_mod._CFG_FMT.pack_into(frame, worker_mod._OFF_CONFIG, *cfg_values, str(tmp_path).encode())
         worker_mod._PIPELINE_LEASE_FMT.pack_into(frame, worker_mod._OFF_PIPELINE_LEASE, 0, 0, 11)

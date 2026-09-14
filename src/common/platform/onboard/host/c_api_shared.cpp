@@ -728,9 +728,6 @@ static int cleanup_failed_prepare(OnboardNativeRunContext *state, int execution_
     char trace_attrs[sizeof(state->trace_attrs)];
     std::memcpy(trace_attrs, state->trace_attrs, sizeof(trace_attrs));
     if (clear_gm_sm) state->runtime.set_gm_sm_ptr(nullptr);
-    state->runner->finish_clock_correlation_session(
-        state->descriptor.pipeline_slot, false, !state->runner->can_accept_run()
-    );
     int validation_rc = PTO_RUNTIME_ERR_INTERNAL;
     try {
         validation_rc = validate_runtime_impl(&state->runtime, &state->host_api, execution_rc);
@@ -889,8 +886,8 @@ int simpler_prepare_run(
         // nothing the two runs share.
         runner->arm_host_dep_gen_capture(config->enable_dep_gen != 0);
         // Same reason, different state: a host-orchestrating bind records phase
-        // events and samples its clock anchor, and both belong to the run doing
-        // the binding rather than to whichever run last held the claim.
+        // events that belong to the run doing the binding rather than to
+        // whichever run last held the claim.
         runner->begin_host_phase_run(state->descriptor.pipeline_slot, DfxRunConfig::from(*config));
 
         {
@@ -1109,12 +1106,6 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         state->runner_resources_owned = false;
     }
 
-    // The collector's session is still resident even though the provider and the
-    // anchors are per-run, so finish it before releasing either ownership token,
-    // after which a successor may publish its own.
-    state->runner->finish_clock_correlation_session(
-        state->descriptor.pipeline_slot, false, !state->runner->can_accept_run()
-    );
     if (state->runner_claimed) {
         // The point a successor's launch becomes admissible. Ordering a
         // successor's device work against this boundary is what separates a

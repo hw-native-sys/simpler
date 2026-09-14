@@ -52,7 +52,7 @@ src/common/log/
 │   │   ├── log_level.h            shared levels + CANN mapping
 │   │   └── unified_log.h          LOG_* ABI used by host and device code
 │   └── host_log.h                 private HostLogger implementation interface
-├── host_log.cpp                   host envelope, filter, clock anchor, STRACE grammar
+├── host_log.cpp                   host envelope, filter, STRACE grammar
 └── unified_log_host.cpp           unified_log_* adapters → HostLogger
 
 src/common/platform/
@@ -166,11 +166,10 @@ reads the same `SimplerHostLogState`:
 struct SimplerHostLogState;
 typedef int (*SimplerHostLogEnqueueFn)(
     void *context, struct SimplerHostLogState *state,
-    const char *record, uint32_t size, int32_t anchor_pid);
+    const char *record, uint32_t size);
 
 typedef struct SimplerHostLogState {
     int32_t threshold;
-    int32_t clock_anchor_pid;
     int32_t log_directory_bound;
     char log_directory[1024];
     int32_t sink_owner_pid;
@@ -202,11 +201,8 @@ Only `simpler_host_log_bind_state` is exported from a host logging consumer.
 accidentally recreating the old global-symbol singleton through ELF
 interposition while still giving loaders one stable binding entry point.
 
-`clock_anchor_pid` is also shared. Consequently the private logger copies
-coordinate one successful `[CLOCK_ANCHOR]` per process. A negative PID is a
-temporary writer claim; a failed output releases the claim so the next record
-can retry. The first non-empty `log_directory` binding wins, so every bound DSO
-in the process chooses the same output without moving a file already in use.
+The first non-empty `log_directory` binding wins, so every bound DSO in the
+process chooses the same output without moving a file already in use.
 
 The owner publishes a C callback and opaque context in the same state. A private
 logger in any bound DSO can therefore submit to the one process queue without
@@ -297,22 +293,10 @@ sequential `ChipWorker` instances.
 ```
 
 The prefix clock is monotonic nanoseconds, so envelope ordering and host span
-timestamps share one clock and are unaffected by wall-clock corrections.
+timestamps share one clock.
 `T0x...` is `pthread_self()`.
 
-The first TIMING-enabled record in a process emits a mapping to Unix wall time:
-
-```text
-[mono_ns=...][T0x...][TIMING] clock_anchor: [CLOCK_ANCHOR] v=1 pid=<pid> mono_ns=<ns> wall_ns=<ns>
-```
-
-For a record at `record_ns`, the corresponding wall time is approximately
-`wall_ns + record_ns - mono_ns`. The anchor is TIMING so it is present whenever
-the default-threshold host trace is present. A forked child emits its own
-anchor because coordination is keyed by PID.
-
-`strace_timing.py` parses these anchors and adds wall-clock metadata to Chrome
-trace/swimlane JSON while leaving event timestamps monotonic and relative. See
+`strace_timing.py` keeps the Chrome trace/swimlane timestamps monotonic. See
 [Host trace](dfx/host-trace.md) for the rendering contract.
 
 ### AICPU sim

@@ -697,7 +697,6 @@ static int cleanup_failed_prepare(SimNativeRunContext *state, int execution_rc, 
     const uint64_t trace_hid = state->trace_hid;
     const long long trace_start_ns = state->trace_start_ns;
     if (clear_gm_sm) state->runtime.set_gm_sm_ptr(nullptr);
-    state->runner->finish_clock_correlation_session(state->descriptor.pipeline_slot, false);
     int validation_rc = PTO_RUNTIME_ERR_INTERNAL;
     try {
         validation_rc = validate_runtime_impl(&state->runtime, &state->host_api, execution_rc);
@@ -950,9 +949,6 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         state->runner->abandon_prepared_execution(*state->prepared_execution);
     }
 
-    // Correlation state is runner-wide. Finish it before releasing the claim,
-    // after which a successor may begin capture and replace the provider/session.
-    state->runner->finish_clock_correlation_session(state->descriptor.pipeline_slot, false);
     if (state->runner_claimed) {
         state->runner->release_native_run(state);
         state->runner_claimed = false;

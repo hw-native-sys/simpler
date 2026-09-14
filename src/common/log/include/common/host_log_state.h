@@ -26,10 +26,6 @@ extern "C" {
  * independent of the C++ library ABI; host_log.cpp performs all mutable scalar
  * accesses with compiler atomic builtins.
  *
- * clock_anchor_pid is positive after a successful anchor write and temporarily
- * negative while one writer owns the claim for that PID. Linux PIDs are
- * positive and bounded well below INT32_MAX.
- *
  * log_directory is where the process writer appends records, one file per
  * process. It is empty until a caller that knows the run's artifact directory
  * supplies it, and the writer uses stderr while it is. The destination is a
@@ -41,8 +37,8 @@ extern "C" {
  * directory or the whole one, and a reader that has already opened the file never
  * has the path change under it.
  *
- * sink_owner_pid follows the anchor's claim convention while the process owner
- * creates the bounded sink. sink_process_pid distinguishes a parent restarting
+ * sink_owner_pid is negative while the process owner creates the bounded sink.
+ * sink_process_pid distinguishes a parent restarting
  * after a quiescent fork boundary from a child that inherited owner=0; the child
  * starts fresh counters. The high bit of sink_producer_state closes admission;
  * its low bits count callers that may still hold sink_context. Bound private
@@ -77,12 +73,11 @@ enum SimplerHostLogDropReason {
  * process sink. A zero return has already been attributed to a reason by the
  * callee, so the caller must not count it again. */
 typedef int (*SimplerHostLogEnqueueFn)(
-    void *context, struct SimplerHostLogState *state, const char *record, uint32_t size, int32_t anchor_pid
+    void *context, struct SimplerHostLogState *state, const char *record, uint32_t size
 );
 
 typedef struct SimplerHostLogState {
     int32_t threshold;
-    int32_t clock_anchor_pid;
     int32_t log_directory_bound;
     char log_directory[SIMPLER_HOST_LOG_DIR_CAPACITY];
     int32_t sink_owner_pid;

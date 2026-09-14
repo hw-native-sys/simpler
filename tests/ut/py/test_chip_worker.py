@@ -609,7 +609,6 @@ class TestMailboxConfigRoundtrip:
             cfg.enable_pmu,
             int(cfg.enable_dep_gen),
             int(cfg.enable_scope_stats),
-            int(cfg.capture_clock_anchors),
             *cfg.runtime_env.ring_task_window,
             *cfg.runtime_env.ring_heap,
             *cfg.runtime_env.ring_dep_pool,
@@ -627,16 +626,12 @@ class TestMailboxConfigRoundtrip:
         assert decoded.runtime_env.ring_heap == [1024, 2048, 4096, 8192]
         assert decoded.runtime_env.ring_dep_pool == [64, 128, 256, 512]
         assert decoded.output_prefix == "/tmp/out"
-        assert decoded.capture_clock_anchors is False
 
         ranked = _read_config_from_mailbox(memoryview(buf), chip_rank=2, capture_index=7)
         assert ranked.output_prefix == "/tmp/out/rank2/d7"
-        assert ranked.capture_clock_anchors is True
 
-    def test_rank_directory_covers_every_diagnostic_but_anchors_stay_swimlane_only(self):
-        # rankN/dN separates one ChipWorker child's artifacts from its siblings',
-        # which every diagnostic needs; capture_clock_anchors only turns on the
-        # Host/Device clock anchors, which only the swimlane reader consumes.
+    def test_rank_directory_covers_every_diagnostic(self):
+        # rankN/dN separates one ChipWorker child's artifacts from its siblings'.
         from simpler.worker import (  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
             _CFG_FMT,
             _OFF_CONFIG,
@@ -658,7 +653,6 @@ class TestMailboxConfigRoundtrip:
                 cfg.enable_pmu,
                 int(cfg.enable_dep_gen),
                 int(cfg.enable_scope_stats),
-                int(cfg.capture_clock_anchors),
                 *cfg.runtime_env.ring_task_window,
                 *cfg.runtime_env.ring_heap,
                 *cfg.runtime_env.ring_dep_pool,
@@ -668,11 +662,9 @@ class TestMailboxConfigRoundtrip:
 
         dep_gen_only = decode(enable_dep_gen=True)
         assert dep_gen_only.output_prefix == "/tmp/out/rank1/d0"
-        assert dep_gen_only.capture_clock_anchors is False
 
         swimlane = decode(enable_chip_swimlane=4)
         assert swimlane.output_prefix == "/tmp/out/rank1/d0"
-        assert swimlane.capture_clock_anchors is True
 
         # No diagnostic at all: nothing is written below output_prefix, so the
         # child leaves the case root alone.

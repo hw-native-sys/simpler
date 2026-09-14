@@ -34,7 +34,6 @@
 
 #include "common/chip_swimlane_extension.h"
 #include "common/chip_swimlane_profiling.h"
-#include "host/clock_correlation.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
@@ -482,11 +481,6 @@ public:
         std::vector<HostPhaseRecord> submit_records, std::vector<HostPhaseRecord> upload_records,
         uint64_t submitted_tasks, uint64_t total_records, uint64_t dropped_records
     );
-    void begin_clock_correlation_session(const char *provider_name, const char *raw_device_timestamp_unit);
-    void record_clock_anchor_samples(std::vector<simpler::dfx::ClockAnchorSample> samples);
-    void finish_clock_correlation_session();
-    bool clock_correlation_active() const { return clock_correlation_session_.active(); }
-
     /**
      * Export collected records as a Chrome Trace Event JSON (swimlane view).
      * Writes <output_prefix>/chip_swimlane_records.json — directory is captured at
@@ -615,7 +609,6 @@ private:
     std::vector<std::vector<ChipSwimlaneAicpuOrchPhaseRecord>> collected_orch_phase_records_;
     std::vector<HostPhaseRecord> host_submit_records_;
     std::vector<HostPhaseRecord> host_upload_records_;
-    simpler::dfx::ClockCorrelationSession clock_correlation_session_;
 
     // Core-to-thread mapping (core_id → scheduler thread index, -1 = unassigned)
     std::vector<int8_t> core_to_thread_;

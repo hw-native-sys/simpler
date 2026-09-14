@@ -122,9 +122,8 @@ private:
     HostLogger &operator=(HostLogger &&) = delete;
 
     const char *level_name(simpler::log::LogLevel level) const;
-    bool emit(const char *level_tag, const char *func, const char *fmt, va_list args, int32_t anchor_pid = 0);
-    bool emit_ungated(int32_t anchor_pid, const char *level_tag, const char *func, const char *fmt, ...);
-    void emit_clock_anchor_if_needed();
+    bool emit(const char *level_tag, const char *func, const char *fmt, va_list args);
+    bool emit_ungated(const char *level_tag, const char *func, const char *fmt, ...);
     // Write the loss breakdown into the log itself when it has grown since the
     // last report. The counters die with the process, so without this a reader
     // holding only the log file cannot tell that records are missing.

@@ -225,7 +225,7 @@ int DeviceRunner::ensure_binaries_loaded() {
         }
 
         // The AICPU sim SO binds its private HostLogger before the compatibility
-        // level setter can emit a clock anchor.
+        // level setter affects the collector shape.
         using SetLogLevelFunc = void (*)(int);
         SetLogLevelFunc set_log_level_func = nullptr;
         if (!load_sym("set_log_level", reinterpret_cast<void **>(&set_log_level_func))) return PTO_RUNTIME_ERR_INTERNAL;
@@ -481,7 +481,7 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 set_scope_stats_enabled_func_(prepared->dfx.scope_stats_enabled);
                 set_platform_scope_stats_base_func_(kernel_args_.scope_stats_data_base);
 
-                start_shared_collectors_for_run(prepared->dfx, prepared->pipeline_slot);
+                start_shared_collectors_for_run(prepared->dfx);
                 if (prepared->dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
                     auto thread_factory = [this](std::function<void()> fn) {
                         return create_thread(std::move(fn));
@@ -612,14 +612,13 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
         // The AICPU threads are joined above, so every collector's producer has
         // stopped and its records are as complete as the run made them. Export
         // them: a failed run is the one whose swimlane, dumped tensors and
-        // dep_gen graph are worth reading. `false` withholds only the
-        // DeviceExecutionComplete clock anchor, which this run never reached.
-        teardown_shared_collectors_after_run(dfx, active.prepared->pipeline_slot, false);
+        // dep_gen graph are worth reading.
+        teardown_shared_collectors_after_run(dfx, active.prepared->pipeline_slot);
         emit_device_dep_gen_graph(dfx);
         return runtime_rc;
     }
 
-    teardown_shared_collectors_after_run(dfx, active.prepared->pipeline_slot, true);
+    teardown_shared_collectors_after_run(dfx, active.prepared->pipeline_slot);
     emit_device_dep_gen_graph(dfx);
 
     print_handshake_results();
@@ -801,9 +800,9 @@ int DeviceRunner::arm_collectors_for_run(Runtime &runtime, PreparedExecution &pr
     latch_collector_shape(num_aicore, aicpu_thread_num, launch_aicpu_num);
 
     // Between the stale-shape release and the init: finalize() resets
-    // host_orchestrated_ and the collector's clock session, and initialize()
+    // host_orchestrated_, and initialize()
     // reads host_orchestrated_ when it decides whether to size a device orch
-    // phase pool. Publishing before the release would lose both.
+    // phase pool. Publishing before the release would lose that state.
     publish_host_phase_run_to_collector(prepared.pipeline_slot);
 
     int rc = 0;

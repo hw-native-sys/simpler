@@ -43,9 +43,9 @@ _INTERVAL_START_KEYS = ("start_ns=", "start_us=", "begin_ns=")
 
 # The shapes a LOG_TIMING line may legitimately carry, as a reader's map rather
 # than as an assertion: summed cost shares (`total_ns=`/`count=`), the
-# orchestrator's own step totals, the clock anchor's two absolute readings, the
-# writer's drop counters, and queue-occupancy probes.
-_ALLOWED_SHAPES = ("total_ns=", "count=", "ns=", "mono_ns=", "wall_ns=", "dropped=", "queue")
+# orchestrator's own step totals, the writer's drop counters, and queue-occupancy
+# probes.
+_ALLOWED_SHAPES = ("total_ns=", "count=", "ns=", "dropped=", "queue")
 
 _SOURCE_ROOT = pathlib.Path(__file__).resolve().parents[3] / "src"
 _STRING_LITERAL = re.compile(r'"((?:[^"\\]|\\.)*)"')

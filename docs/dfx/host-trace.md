@@ -34,8 +34,8 @@ run that does not keeps its records on the console. There is no separate switch 
 configure, and the runtime never derives the path itself.
 
 **The destination belongs to the logger, not to a record.** Everything that logger
-writes follows it: `LOG_*` records, `[STRACE]` spans, `[CLOCK_ANCHOR]`, the
-`host-orch phase=` cost-share summaries, and the spans Python emits through
+writes follows it: `LOG_*` records, `[STRACE]` spans, the `host-orch phase=`
+cost-share summaries, and the spans Python emits through
 `unified_log_host_span`. Nothing declares an intent and no record kind is treated
 specially, so there is no state in which part of a run's log is in one place and
 part in another. The first non-empty directory in a process wins, and it is the
@@ -86,13 +86,6 @@ concatenate them, and a directory expands to the `host.*.log` files inside it:
 python -m simpler_setup.tools.strace_timing <output_prefix> --swimlane swimlane.json
 ```
 
-A process writes its `[CLOCK_ANCHOR]` ahead of its first record and into the same
-stream, so each file is self-contained for wall-clock recovery. If an input is
-truncated or a process's file is missing, the pids in it stay monotonic-only and
-`clockAnchors` is absent from the output rather than wrong — the tool warns when a
-pid emitted spans and no anchor was found for it, which is the signal that this
-happened.
-
 ## Marker grammar
 
 Every host log record starts with a `CLOCK_MONOTONIC` nanosecond timestamp:
@@ -101,27 +94,8 @@ Every host log record starts with a `CLOCK_MONOTONIC` nanosecond timestamp:
 [mono_ns=<ns>][T0x<thread>][<level>] <func>: ...
 ```
 
-Each process emits one TIMING-level mapping from that clock to wall time when
-its logger starts:
-
-```text
-[CLOCK_ANCHOR] v=1 pid=<pid> mono_ns=<ns> wall_ns=<ns>
-```
-
-For host-clock records, consumers recover an approximate absolute timestamp
-with `wall_ns + record_mono_ns - mono_ns`. Their event ordering and duration
-calculations remain entirely on the monotonic clock and are unaffected by
-wall-clock corrections. Records tagged `clk=dev` use the separate device-clock
-domain described below and do not use this anchor.
-
-`strace_timing.py` applies that mapping to both `--trace-out` and `--swimlane`.
-The visible Perfetto axis remains monotonic; each mapped host event exposes the
-exact decimal `wall_ts_ns` and a UTC `wall_time` in its arguments, while the JSON
-top level retains the source mappings in `clockAnchors`. Nanosecond epoch values
-are strings because JSON consumers commonly use IEEE-754 numbers, which cannot
-represent current epoch nanoseconds exactly. A log with no anchor for a pid gets
-no wall time for that pid's events and is otherwise unaffected, and `clk=dev`
-records never receive host wall time.
+The Perfetto axis remains monotonic. Records tagged `clk=dev` use the separate
+device-clock domain described below.
 
 One line per span, emitted on scope exit
 (`src/common/log/include/common/strace.h`):
@@ -491,7 +465,7 @@ from the positive arm in exactly one variable:
 | overlap stress | — | accepted, one check per adjacent pair |
 | serial submission | one run in flight instead of two | rejected, `did not overlap` |
 | diagnostics config | `enable_scope_stats` set | accepted |
-| orch-phase swimlane | `enable_chip_swimlane` 4 | rejected, `did not overlap` |
+| orch-phase swimlane | `enable_chip_swimlane` 4 | accepted |
 
 The second arm is what makes the first a detector rather than a formality.
 Between the pipeline and the verdict sits a chain — which spans are emitted,
@@ -501,23 +475,16 @@ intersection independent of real concurrency, the positive arm would still be
 green. Matching the message matters: it separates a real rejection from the
 vacuous "need at least two complete native runs" one.
 
-The last two hold a boundary that is otherwise invisible.
+The last two exercise collector-bearing configurations that previously forced
+serialization.
 `allow_prepared_successor` once folded in `CallConfig::diagnostics_any()` — the
 OR of all five diagnostic flags — because a collector's setup wrote
 runner-global state during preparation, which a prepared successor would have
 done while its predecessor was still running against it. The pools and that
 per-run state are now built and reset under the execution claim, so a diagnostic
-configuration overlaps like any other.
-
-Level 4 is the exception, and the reason it is not simply the same case: a
-host-orchestrating bind opens a clock-correlation session on the *resident*
-swimlane collector and samples its `HostOrchestrationBegin` anchor into it. That
-cannot move under the claim — the anchor's meaning is when host orchestration
-began — so until the session is per-run, a level-4 run neither carries a
-prepared successor nor is one. Nothing else would notice either boundary
-moving: the lane declines to stage silently rather than raising, so a run that
-lost its overlap and one that kept an overlap it should not have look the same
-from outside.
+configuration overlaps like any other. Host-orchestration phase records are
+held per pipeline slot and published to the resident collector at launch, so a
+level-4 run can overlap without resetting its predecessor's records.
 
 Staging has three inputs and only that one is reachable from a submission. The
 other two — the runtime PipelineContract's `pipeline_depth` and the runtime's
@@ -529,15 +496,8 @@ successor is a **failure** in the scene test rather than a skip — a skip would
 report green for the one state in which the property cannot hold. The platform
 gate runs first, so the sim path never reaches that assert.
 
-The two negative arms differ in how long they are meant to last. The serial one
-names no mechanism — one run in flight cannot overlap under any admission policy
-— so it is permanent. The diagnostics one is deliberately perishable:
-`concurrent_native_prepare_supported_impl` keeps collector-bearing configurations
-sequential only *until their state is per-epoch*, and once that lands and
-`diagnostics_any()` leaves `allow_prepared_successor`, this arm fails with the
-very `did not overlap` it now requires. **Delete it then; do not restore the
-serialization** — its value and its lifetime both come from the fallback being
-silent.
+The serial arm is the permanent negative control: one run in flight cannot
+overlap under any admission policy.
 
 ## Why markers, not a return value
 

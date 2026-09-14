@@ -117,12 +117,7 @@ struct CallConfig {
     int32_t enable_pmu = 0;  // 0 = disabled; >0 = enabled, value selects event type
     int32_t enable_dep_gen = 0;
     int32_t enable_scope_stats = 0;  // writes <output_prefix>/scope_stats/scope_stats.jsonl
-    // Anchor the Host and Device clocks for this capture even when no Host
-    // orchestration records exist, which is what places its device timestamps on
-    // an absolute Host timeline. Independent of why a caller wants that timeline:
-    // the runtime samples the anchors and never learns who consumes them.
-    int32_t capture_clock_anchors = 0;
-    RuntimeEnv runtime_env;  // per-task ring sizing
+    RuntimeEnv runtime_env;          // per-task ring sizing
     char output_prefix[1024] = {};
 
     bool diagnostics_any() const noexcept {
@@ -150,6 +145,6 @@ struct CallConfig {
 #pragma pack(pop)
 static_assert(sizeof(RuntimeEnv) == RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t), "RuntimeEnv wire layout drift");
 static_assert(
-    sizeof(CallConfig) == 7 * sizeof(int32_t) + RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t) + 1024,
+    sizeof(CallConfig) == 6 * sizeof(int32_t) + RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t) + 1024,
     "CallConfig wire layout drift"
 );

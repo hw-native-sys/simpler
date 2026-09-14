@@ -525,45 +525,9 @@ remains the compatibility selector for old captures and for independently
 submitted per-Rank tasks; it fails if available sidecars show that the selected
 paths belong to different parent groups.
 
-> **The offline tools no longer read `clock_anchors`.** Placement comes from
-> span containment, which needs no calibration and no anchor sampling. The
-> runtime still collects and serializes them as described below, and they remain
-> in the on-disk schema; nothing in `simpler_setup/tools` consumes them.
-
-Host-orchestrated level-4 runs retain their existing clock anchors. For
-Device/AICPU orchestration, anchors are additionally enabled only when the
-ChipWorker marks the capture with `CallConfig.capture_clock_anchors`, which it
-does for an L3 chip-swimlane capture, at the common launch boundary before
-collectors and kernels start. Both modes sample again after AICPU/AICore
-execution completes. Existing single-card Device/AICPU level-4 captures
-therefore keep their prior relative timeline and do not pay the new anchor cost.
-The per-launch cost of that sampling is 475–696 us, of which the cold first
-sample is 83–89% because `ClockCorrelationProvider` is built and destroyed per
-launch — larger than the placement slack containment publishes without it.
-
-`capture_clock_anchors` says only *what the runtime does* — sample the two
-clocks — never why. Rank, group and merge are concepts of the layer above: the
-platform runner that reads this flag has no notion of a Rank, and no runtime or
-platform code parses the `rankN/dN` path. The two are deliberately separate
-switches, because the directory is artifact separation that every diagnostic
-needs while the anchors are consumed only by the swimlane reader. An L3 run with
-`--enable-dep-gen` alone therefore gets its own `rankN/dN` directory and pays no
-anchor cost.
-
-**The opening anchor sits at a different point in each runtime**, because each
-takes it at the earliest point preceding every device timestamp it records:
-
-| Runtime | Opening anchor | Calibrated interval covers |
-| ------- | -------------- | -------------------------- |
-| `host_build_graph` | before Host orchestration (`host_phase_pool_arm`) | bind, H2D, and execution |
-| `tensormap_and_ringbuffer` | before kernel launch (`start_shared_collectors_for_run`) | execution only |
-
-Both close on `post_device_execution`. So the two runtimes' calibrated intervals
-are not comparable in length, and a `host_build_graph` interpolation spans work
-a `tensormap_and_ringbuffer` one does not. The serialized position name
-`pre_host_orchestration` predates the
-Device/AICPU case — read it as "start of the calibrated interval", not as a
-claim about Host orchestration.
+Placement comes from span containment. The runtime therefore performs no
+Host/Device clock calibration and writes no calibration records into the
+capture.
 
 The default output depends on which input form was used, and `-o` overrides
 either:

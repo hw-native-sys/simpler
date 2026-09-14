@@ -323,14 +323,14 @@ _OFF_ERROR = 4
 _OFF_CALLABLE = 8
 _OFF_CONFIG = 16
 # Packed CallConfig wire layout — must match call_config.h byte for byte:
-# 7 int32 (aicpu_thread_num, enable_chip_swimlane, enable_dump_args,
-# enable_pmu, enable_dep_gen, enable_scope_stats, capture_clock_anchors) + uint64
+# 6 int32 (aicpu_thread_num, enable_chip_swimlane, enable_dump_args,
+# enable_pmu, enable_dep_gen, enable_scope_stats) + uint64
 # ring sizing overrides (3 per-ring arrays of RUNTIME_ENV_RING_COUNT:
 # ring_task_window, ring_heap, ring_dep_pool) + 1024-byte NUL-terminated
 # output_prefix. Log config travels separately via ChipWorker.init(log_level) —
 # not on per-task wire.
 _RUNTIME_ENV_UINT64_FIELD_COUNT = 3 * RUNTIME_ENV_RING_COUNT
-_CFG_FMT = struct.Struct("=iiiiiii" + ("Q" * _RUNTIME_ENV_UINT64_FIELD_COUNT) + "1024s")
+_CFG_FMT = struct.Struct("=iiiiii" + ("Q" * _RUNTIME_ENV_UINT64_FIELD_COUNT) + "1024s")
 # The generation-safe pipeline lease follows CONFIG. Args start after the
 # lease, rounded up to 8 bytes so the first
 # Tensor.data (uint64_t at OFF_ARGS+8) is 8-byte aligned, avoiding
@@ -3515,7 +3515,6 @@ def _read_config_from_mailbox(
         pmu,
         dep_gen,
         scope_stats,
-        _capture_clock_anchors,
         *ring_values,
         prefix_bytes,
     ) = _CFG_FMT.unpack_from(buf, _OFF_CONFIG)
@@ -3546,10 +3545,6 @@ def _read_config_from_mailbox(
         # it is read only by the offline tools: no runtime or platform code
         # parses this path, or knows that a Rank is what produced it.
         cfg.output_prefix = os.path.join(cfg.output_prefix, f"rank{chip_rank}", f"d{capture_index}")
-        # Only the swimlane reader places its records against a Host timeline,
-        # so it alone needs both clocks anchored; the other diagnostics get the
-        # directory separation without paying for the anchors.
-        cfg.capture_clock_anchors = bool(cfg.enable_chip_swimlane)
     return cfg
 
 
