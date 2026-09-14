@@ -335,7 +335,15 @@ class TestNextLevelStartupFailure:
 
     def test_failed_startup_reaps_children_no_leak(self, monkeypatch):
         """After a startup failure the forked children are killed and reaped."""
-        _install_manual_worker_clock(monkeypatch)
+        # Real clock, deliberately. This case asserts an OS-level fact about real
+        # forked pids -- that `os.waitpid` no longer knows them -- and
+        # `_abort_hierarchical` bounds its reap with a `_monotonic()` deadline it
+        # is allowed to give up on ("a survivor still alive at the deadline is
+        # left to the OS/init"). A manual clock advances that deadline in zero
+        # real time, so the budget can expire before a child has actually died
+        # and the rollback takes the give-up path while the assertion below still
+        # demands a reap. The sibling deadline tests may use one: logical elapsed
+        # time is their subject, and they assert bookkeeping rather than pids.
         l3 = _l3_child()
         l3.init = _init_hangs  # noqa: SLF001
 
