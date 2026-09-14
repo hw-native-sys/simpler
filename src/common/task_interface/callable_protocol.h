@@ -28,4 +28,4 @@
 // via Worker.register / DeviceRunner::register_callable. The AICPU
 // executor reserves a fixed-size `orch_so_table_[MAX_REGISTERED_CALLABLE_IDS]`
 // keyed by callable_id, so this bound is part of the host↔AICPU protocol.
-constexpr int32_t MAX_REGISTERED_CALLABLE_IDS = 64;
+constexpr int32_t MAX_REGISTERED_CALLABLE_IDS = 8192;

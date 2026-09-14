@@ -26,7 +26,6 @@ TEST(KernelInvocationHeaderWire, MatchesWireLayoutAndSurvivesMemcpy) {
     SimplerKernelInvocationHeader header{};
     header.mode = SIMPLER_MODE_KERNEL;
     header.callable_id = 17;
-    header.generation = 0x1122334455667788ull;
     header.payload_bytes = 4096;
     header.tensor_count = 12;
     header.scalar_count = 5;
@@ -38,16 +37,14 @@ TEST(KernelInvocationHeaderWire, MatchesWireLayoutAndSurvivesMemcpy) {
 
     EXPECT_EQ(restored.mode, static_cast<uint32_t>(SIMPLER_MODE_KERNEL));
     EXPECT_EQ(restored.callable_id, 17);
-    EXPECT_EQ(restored.generation, 0x1122334455667788ull);
     EXPECT_EQ(restored.payload_bytes, 4096u);
     EXPECT_EQ(restored.tensor_count, 12);
     EXPECT_EQ(restored.scalar_count, 5);
     EXPECT_EQ(restored.host_copy_tensor_count, 0);
     EXPECT_EQ(restored.reserved_, 0u);
 
-    const unsigned char expected[40] = {
-        1, 0, 0, 0, 17, 0, 0, 0, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0, 0x10, 0, 0,
-        0, 0, 0, 0, 12, 0, 0, 0, 5,    0,    0,    0,    0,    0,    0,    0,    0, 0,    0, 0,
+    const unsigned char expected[32] = {
+        1, 0, 0, 0, 17, 0, 0, 0, 0, 0x10, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     };
     EXPECT_EQ(std::memcmp(wire, expected, sizeof(expected)), 0);
 }
