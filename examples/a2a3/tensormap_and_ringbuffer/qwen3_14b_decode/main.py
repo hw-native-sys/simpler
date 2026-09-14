@@ -66,6 +66,7 @@ from simpler_setup.scene_test import (
     ChildMemoryTaskArgs,
     build_output_prefix,
     compile_chip_callable_spec,
+    dump_args_level,
     effective_diagnostic_options,
     finalize_diagnostic_outputs,
     l3_compile_cache_key,
@@ -689,7 +690,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--seq-len", type=int, default=3500)
     parser.add_argument("--enable-chip-swimlane", nargs="?", const=4, type=int, default=0)
-    parser.add_argument("--dump-args", nargs="?", const=1, type=int, default=0)
+    parser.add_argument(
+        "--dump-args",
+        nargs="?",
+        const="partial",
+        default="off",
+        choices=("off", "partial", "hybrid", "full"),
+    )
     parser.add_argument("--enable-pmu", nargs="?", const=2, type=int, default=0)
     parser.add_argument("--enable-dep-gen", action="store_true")
     parser.add_argument("--enable-scope-stats", action="store_true")
@@ -716,7 +723,7 @@ def main(argv=None, *, case_name: str | None = None, **overrides) -> int:
         seed=cli.seed,
         seq_len=cli.seq_len,
         enable_chip_swimlane=cli.enable_chip_swimlane,
-        dump_args=cli.dump_args,
+        dump_args=dump_args_level(cli.dump_args),
         enable_pmu=cli.enable_pmu,
         enable_dep_gen=cli.enable_dep_gen,
         enable_scope_stats=cli.enable_scope_stats,

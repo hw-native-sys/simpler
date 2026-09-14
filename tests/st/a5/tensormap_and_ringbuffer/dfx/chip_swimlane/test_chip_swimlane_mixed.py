@@ -149,9 +149,11 @@ class TestChipSwimlaneMixed(SceneTestCase):
                     since=run_marker,
                     expected_complete_finishes=6,
                 )
-        # Full-dump modes give the func_id array its regression barrier on the
-        # cooperative-mix path (single-kernel coverage lives in test_args_dump).
-        if int(request.config.getoption("--dump-args", default=0)) >= 2:
+        # The modes that record every task give the func_id array its regression
+        # barrier on the cooperative-mix path; this reads the manifest only, so
+        # it needs full task coverage rather than payload (single-kernel
+        # coverage lives in test_args_dump).
+        if request.config.getoption("--dump-args", default="off") in ("hybrid", "full"):
             for case in matched:
                 self._validate_dump_func_ids(case, run_marker)
 

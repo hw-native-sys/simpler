@@ -186,13 +186,16 @@ def pytest_addoption(parser):
     parser.addoption(
         "--dump-args",
         nargs="?",
-        const=1,
-        type=int,
-        default=0,
-        help="Dump per-task args at runtime. Level: 0=off, 1=partial (only "
-        "args selected via Arg::dump(...), default when given without a value), 2=full (all args), "
-        "3=hybrid (all tasks' JSON metadata; args marked via Arg::dump(...) also write payload; "
-        "used by simpler_setup.tools.core_swimlane for Core swimlane simulator replay).",
+        const="partial",
+        default="off",
+        choices=("off", "partial", "hybrid", "full"),
+        help="Dump per-task args at runtime. Two independent choices, not a dial: "
+        "which tasks reach the JSON manifest, and which of those also write payload. "
+        "partial (default when given without a value) = only args selected via "
+        "Arg::dump(...), manifest and payload; hybrid = every task's manifest, payload "
+        "only for Arg::dump(...)-marked args (the mode "
+        "simpler_setup.tools.core_swimlane replays from); full = every task, every "
+        "arg, manifest and payload.",
     )
     parser.addoption(
         "--enable-dep-gen",
@@ -885,7 +888,7 @@ def _strip_value_options(args, options):
 _RESOURCE_CHILD_VALUE_OPTIONS = (
     ("--rounds", 1),
     ("--enable-chip-swimlane", 0),
-    ("--dump-args", 0),
+    ("--dump-args", "off"),
     ("--enable-pmu", 0),
 )
 _RESOURCE_CHILD_FLAG_OPTIONS = (

@@ -66,6 +66,25 @@ class _DiagnosticOptions(NamedTuple):
     swimlane_overhead: bool
 
 
+# Args-dump modes, mirroring DumpArgsLevel in
+# src/common/platform/include/common/args_dump.h. The CLI spells the mode by
+# name because the three modes are two independent choices — which tasks reach
+# the manifest, and which of those write payload — rather than a dial. The
+# wire field stays the int, ordered so each value is a strict superset of the
+# one below it.
+DUMP_ARGS_MODES = {"off": 0, "partial": 1, "hybrid": 2, "full": 3}
+
+
+def dump_args_level(mode) -> int:
+    """Resolve a ``--dump-args`` mode name to its ``DumpArgsLevel`` value."""
+    if isinstance(mode, int):
+        return mode
+    try:
+        return DUMP_ARGS_MODES[mode]
+    except KeyError:
+        raise ValueError(f"unknown --dump-args mode {mode!r} (expected one of {', '.join(DUMP_ARGS_MODES)})") from None
+
+
 def _validate_diagnostic_flags(*, chip_swimlane: int, swimlane_overhead: bool) -> None:
     """Reject diagnostic combinations that can never produce their artifact.
 
@@ -148,7 +167,7 @@ def standalone_pytest_options(request) -> dict:
         "rounds": getoption("--rounds", default=1),
         "skip_golden": getoption("--skip-golden", default=False),
         "enable_chip_swimlane": getoption("--enable-chip-swimlane", default=0),
-        "dump_args": getoption("--dump-args", default=0),
+        "dump_args": dump_args_level(getoption("--dump-args", default="off")),
         "enable_pmu": getoption("--enable-pmu", default=0),
         "enable_dep_gen": getoption("--enable-dep-gen", default=False),
         "enable_scope_stats": getoption("--enable-scope-stats", default=False),
@@ -2221,7 +2240,7 @@ class SceneTestCase:
         rounds = request.config.getoption("--rounds", default=1)
         skip_golden = request.config.getoption("--skip-golden", default=False)
         enable_chip_swimlane = request.config.getoption("--enable-chip-swimlane", default=0)
-        enable_dump_args = request.config.getoption("--dump-args", default=0)
+        enable_dump_args = dump_args_level(request.config.getoption("--dump-args", default="off"))
         enable_pmu = request.config.getoption("--enable-pmu", default=0)
         enable_dep_gen = request.config.getoption("--enable-dep-gen", default=False)
         enable_scope_stats = request.config.getoption("--enable-scope-stats", default=False)

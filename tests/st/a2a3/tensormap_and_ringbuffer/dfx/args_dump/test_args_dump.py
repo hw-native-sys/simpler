@@ -27,32 +27,35 @@ import torch
 from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
-from simpler_setup.scene_test import _outputs_dir, _sanitize_for_filename
+from simpler_setup.scene_test import _outputs_dir, _sanitize_for_filename, dump_args_level
 
 KERNELS_BASE = "../../../../../../examples/a2a3/tensormap_and_ringbuffer/vector_example/kernels"
 
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
 class TestArgsDump(SceneTestCase):
-    """args_dump capture smoke, level-aware on the ``--dump-args`` level.
+    """args_dump capture smoke, mode-aware on the ``--dump-args`` value.
 
     Uses ``partial_dump_orch`` (5 tasks; four carry ``dump(...)`` markers) so a
-    single orchestration exercises all three enabled levels:
+    single orchestration exercises all three enabled modes. The modes are two
+    independent choices — which tasks reach the manifest, and which of those
+    also write payload — rather than a dial:
 
-    - ``--dump-args 1`` (partial): only marked args are captured — task
-      ``0x..00`` via no-arg ``dump()`` (all tensor + scalar args), task
-      ``0x..01`` via ``dump(t2_addend)`` (scalar-only), task ``0x..02`` via
-      ``dump(d, inter_ci, t3_count)`` (mixed tensor + scalar, input ``e``
-      excluded), and task ``0x..03`` via no-arg ``dump()`` (all tensor args).
-      Mode is latched host-side before dispatch, so it is race-free regardless
-      of submission order.
-    - ``--dump-args 2`` (full): markers are ignored, every task is dumped.
-    - ``--dump-args 3`` (hybrid): every task is present in JSON, while
-      only tensors selected by those same ``dump(...)`` markers contribute
-      payload bytes to ``args.bin``.
+    - ``--dump-args partial``: only marked args are captured, manifest and
+      payload — task ``0x..00`` via no-arg ``dump()`` (all tensor + scalar
+      args), task ``0x..01`` via ``dump(t2_addend)`` (scalar-only), task
+      ``0x..02`` via ``dump(d, inter_ci, t3_count)`` (mixed tensor + scalar,
+      input ``e`` excluded), and task ``0x..03`` via no-arg ``dump()`` (all
+      tensor args). Mode is latched host-side before dispatch, so it is
+      race-free regardless of submission order.
+    - ``--dump-args hybrid``: every task is present in JSON, while only tensors
+      selected by those same ``dump(...)`` markers contribute payload bytes to
+      ``args.bin``.
+    - ``--dump-args full``: markers are ignored; every task and every arg is
+      dumped, manifest and payload.
 
-    The dump level comes straight from the CLI ``--dump-args`` value
-    (no per-case override).
+    The mode comes straight from the CLI ``--dump-args`` value (no per-case
+    override).
     """
 
     CALLABLE = {
@@ -107,7 +110,8 @@ class TestArgsDump(SceneTestCase):
         # Marker taken before the run so we bind to this invocation's output dir
         # rather than a stale same-label leftover from a prior run/session.
         run_marker = int(time.time())  # floor to whole seconds: safe if outputs/ ever lands on a coarse-mtime fs
-        level = int(request.config.getoption("--dump-args", default=0))
+        mode = request.config.getoption("--dump-args", default="off")
+        level = dump_args_level(mode)
         if level:
             matched = self._matching_cases(st_platform, request)
             assert len(matched) <= 1, (
@@ -171,7 +175,7 @@ class TestArgsDump(SceneTestCase):
         # Level-aware checks operate on the tensor entries.
         tensor_entries = [t for t in tensors if t.get("kind") == "tensor"]
         task_ids = {t["task_id"] for t in tensor_entries}
-        if level == 1:
+        if mode == "partial":
             # Partial: only the selected tensor/scalar args, race-free (host-latched).
             assert len(tensor_entries) == 7, f"partial expected 7 tensor entries, got {len(tensor_entries)}"
             assert task_ids == {
@@ -205,8 +209,8 @@ class TestArgsDump(SceneTestCase):
         else:
             # Full and hybrid both record every task; hybrid still uses the
             # markers above to select tensor payload.
-            assert len(task_ids) >= 5, f"level {level} should cover all 5 tasks, got {sorted(task_ids)}"
-            if level == 3:
+            assert len(task_ids) >= 5, f"{mode} should cover all 5 tasks, got {sorted(task_ids)}"
+            if mode == "hybrid":
                 selected_tensor_slots = {
                     ("0x0000000100000000", 0),
                     ("0x0000000100000000", 1),

@@ -44,7 +44,7 @@ captured args — zero hand-written shapes or scalars.
   `msprof op simulator` op. The cube sub-core runs the AIC member, the
   vec sub-cores run the AIV member(s) → a combined AIC+AIV swimlane.
 - **Zero-guess args** — the task's real Tensor descriptors and scalars
-  come from a `--dump-args 3` (hybrid) capture. When a structured
+  come from a `--dump-args hybrid` capture. When a structured
   control tensor also needs its real contents, repeatable
   `--restore-arg SLOT` restores payload already selected in orchestration by
   `CoreTaskArgs::dump(...)` into the replay on `a2a3` / `a2a3sim`. The dump's
@@ -129,7 +129,7 @@ onboard `--platform`; a sim `--platform` uses no NPU until step 5):
 | Step | Action | Uses NPU |
 | ---- | ------ | -------- |
 | 1 | Read the test's `CALLABLE`; build a `func_id → (source, core_type)` table | No |
-| 2 | Run `--dump-args 3` (hybrid) → full `args_dump.json` plus `args.bin` for tensors marked with `CoreTaskArgs::dump(...)` (or reuse via `--dump-json`) | Onboard only |
+| 2 | Run `--dump-args hybrid` → full `args_dump.json` plus `args.bin` for tensors marked with `CoreTaskArgs::dump(...)` (or reuse via `--dump-json`) | Onboard only |
 | 3 | Select the task whose member set == `--func-id`, reconstruct its full positional args, **print the arg-slot table** (slot / kind / shape / value) | No |
 | 4 | Emit the replay workspace and smoke-build it locally | No |
 | 5 | `msprof op simulator` collect + export → `trace.json`, then auto-converts a Perfetto variant | **Yes** |
@@ -246,7 +246,7 @@ already small.
 Use `--restore-arg` only when the kernel reads non-uniform tensor contents
 that affect control flow or addressing — for example a runtime-built tiling
 structure. Mark the tensor in the task's `CoreTaskArgs::dump(...)`; a fresh run
-then uses hybrid dump level 3 for full metadata and reuses that Level-1 mask for
+then uses the hybrid dump mode for full metadata and reuses `partial`'s mask for
 payload. Restoration is currently supported only with `--platform a2a3` or
 `a2a3sim`; do not consume a5 tensor payload while #1560 is open. Do not mark
 weight, activation, or KV-pool tensors merely for replay.

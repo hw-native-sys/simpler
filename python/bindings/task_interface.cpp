@@ -3187,10 +3187,15 @@ NB_MODULE(_task_interface, m) {
                 }
             }
         )
-        // Accept either an int dump level (0=off, 1=partial, 2=full,
-        // 3=hybrid) or a Python bool. `True` maps to level 1
-        // (partial) — the default when --dump-args is passed without a
-        // value; `False` maps to 0.
+        // Accepts the mode's name ("off" / "partial" / "hybrid" / "full"), a
+        // Python bool (`True` == "partial", the mode a bare `--dump-args`
+        // selects), or the raw int. Reads back as the int, which is what the
+        // CallConfig wire codecs pack.
+        //
+        // An out-of-range int raises rather than clamping: the values are a
+        // superset ladder, so clamping a too-large value to the numeric maximum
+        // would silently hand back a different mode than the caller asked for
+        // if that ladder ever changes shape.
         .def_prop_rw(
             "enable_dump_args",
             [](const CallConfig &c) {
@@ -3199,10 +3204,33 @@ NB_MODULE(_task_interface, m) {
             [](CallConfig &c, nb::object v) {
                 if (PyBool_Check(v.ptr())) {
                     c.enable_dump_args = nb::cast<bool>(v) ? 1 : 0;
-                } else {
-                    int level = nb::cast<int>(v);
-                    c.enable_dump_args = (level < 0) ? 0 : (level > 3) ? 3 : level;
+                    return;
                 }
+                if (nb::isinstance<nb::str>(v)) {
+                    const std::string name = nb::cast<std::string>(v);
+                    if (name == "off") {
+                        c.enable_dump_args = 0;
+                    } else if (name == "partial") {
+                        c.enable_dump_args = 1;
+                    } else if (name == "hybrid") {
+                        c.enable_dump_args = 2;
+                    } else if (name == "full") {
+                        c.enable_dump_args = 3;
+                    } else {
+                        throw std::invalid_argument(
+                            "enable_dump_args: unknown mode '" + name + "' (off / partial / hybrid / full)"
+                        );
+                    }
+                    return;
+                }
+                int level = nb::cast<int>(v);
+                if (level < 0 || level > 3) {
+                    throw std::invalid_argument(
+                        "enable_dump_args: " + std::to_string(level) +
+                        " is out of range (0=off, 1=partial, 2=hybrid, 3=full)"
+                    );
+                }
+                c.enable_dump_args = level;
             }
         )
         .def_rw("enable_pmu", &CallConfig::enable_pmu)
