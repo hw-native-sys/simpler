@@ -17,20 +17,20 @@ and stream creation through ``_acl_bind_device`` / ``_acl_create_stream`` and
 hands the resulting integer address to kernel_init. In production that integer
 comes from the framework instead — torch_npu.npu.current_stream().npu_stream.
 
-The backend reports kernel mode unsupported today, so the contract-correct
-outcome is a refusal, and reaching the refusal is the assertion: it proves the
-Python call arrived at the C ABI rather than being rejected on the way. When the
-platform gains a real implementation these expectations invert into a full
-init -> prepare -> launch -> close lifecycle; the borrowing scaffolding does not
-change.
+tensormap_and_ringbuffer implements kernel mode, so its cases claim the borrowed
+stream and check that a second claim on the same device is refused.
+host_build_graph reports no kernel capability; the refusal case loads it, and
+reaching the refusal is the assertion: it proves the Python call arrived at the
+C ABI rather than being rejected on the way.
 
 Each case runs in a forked subprocess: kernel_init binds a runtime library into
 the process and the ACL device bind is per-thread, so a fresh process per case
 keeps one case's state out of the next.
 
 The ``runtime`` marker is what makes conftest's resource phase dispatch these
-rather than deselect them, so it is load-bearing rather than descriptive — the
-runtime it names is the one whose binaries the cases load.
+rather than deselect them, so it is load-bearing rather than descriptive — it
+names the runtime whose kernel path the cases exercise. The refusal case also
+loads host_build_graph, which every a2a3 build produces.
 """
 
 from __future__ import annotations
@@ -53,7 +53,8 @@ def _run_case(case: str, device_id: int, platform: str, queue) -> None:
 
         from simpler_setup.runtime_builder import RuntimeBuilder
 
-        bins = RuntimeBuilder(platform=platform).get_binaries("tensormap_and_ringbuffer", build=False)
+        builder = RuntimeBuilder(platform=platform)
+        bins = builder.get_binaries("tensormap_and_ringbuffer", build=False)
 
         # The caller's device and stream. simpler must not create, reset or
         # destroy any of this.
@@ -66,15 +67,43 @@ def _run_case(case: str, device_id: int, platform: str, queue) -> None:
         config = CallConfig()
 
         if case == "init_refused":
-            # Reaching simpler_kernel_mode_init and being told UNSUPPORTED is
-            # the pass: a call that never arrived would raise something else.
+            # host_build_graph reaching simpler_kernel_mode_init and being told
+            # UNSUPPORTED is the pass: a call that never arrived would raise
+            # something else.
+            unsupported_bins = builder.get_binaries("host_build_graph", build=False)
             with pytest.raises(Exception) as excinfo:  # noqa: PT011
-                worker.kernel_init(device_id, bins, config, stream)
+                worker.kernel_init(device_id, unsupported_bins, config, stream)
             result["error"] = str(excinfo.value)
             result["reached_abi"] = "kernel mode" in str(excinfo.value)
             result["initialized_after"] = bool(worker._impl.initialized)
             worker.finalize()
             result["ok"] = bool(result["reached_abi"]) and not result["initialized_after"]
+
+        elif case == "init_claims_borrowed_stream":
+            # One kernel context per device and runtime: the first claim holds,
+            # and a second worker is refused without disturbing the owner.
+            worker.kernel_init(device_id, bins, config, stream)
+            result["stage"] = "kernel_init"
+            result["initialized"] = bool(worker._impl.initialized)
+            result["kernel_supported"] = bool(worker.kernel_mode_supported)
+            refused = ChipWorker()
+            try:
+                refused.kernel_init(device_id, bins, config, stream)
+                result["second_claim_refused"] = False
+            except RuntimeError as exc:
+                result["second_claim_refused"] = True
+                result["second_claim_error"] = str(exc)
+            result["refused_initialized"] = bool(refused._impl.initialized)
+            refused.finalize()
+            result["owner_still_initialized"] = bool(worker._impl.initialized)
+            worker.finalize()
+            result["ok"] = (
+                result["initialized"]
+                and result["kernel_supported"]
+                and result["second_claim_refused"]
+                and not result["refused_initialized"]
+                and result["owner_still_initialized"]
+            )
 
         elif case == "null_stream_rejected":
             # Named at the Python boundary rather than deep in the C ABI.
@@ -116,7 +145,7 @@ def _run_case(case: str, device_id: int, platform: str, queue) -> None:
             except RuntimeError:
                 result["second_init_refused"] = True
             worker.finalize()
-            result["ok"] = result["initialized"] and not result["kernel_supported"] and result["second_init_refused"]
+            result["ok"] = result["initialized"] and result["kernel_supported"] and result["second_init_refused"]
 
         else:
             raise AssertionError(f"unknown case {case}")
@@ -155,6 +184,7 @@ def _run_in_subprocess(case: str, device_id: int, platform: str) -> dict:
     "case",
     [
         "init_refused",
+        "init_claims_borrowed_stream",
         "null_stream_rejected",
         "generation_is_unique",
         "uninitialized_surface_refuses",

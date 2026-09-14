@@ -145,9 +145,28 @@ The 13 hardware cases were:
   `tensormap_and_ringbuffer`;
 - the K2 capture probe with 100 replays.
 
-This revalidation did not repeat the simulation scene sweeps, the onboard
-main-scene and SDMA sweeps, the full Python unit suite, or the 24-snapshot
-transport probe. Their results in the execution record above predate the merge.
+### Full sweeps on the merged tree
+
+A second pass on the same merged tree ran the remaining suites, including every
+Python hardware unit test. Hardware work again acquired devices through
+`task-submit --device auto`.
+
+`tests/ut/py/test_worker/test_kernel_mode_entry.py` asserted that every runtime
+refuses kernel init, and three of its jobs failed against TMR, which claims the
+borrowed device. Its refusal cases load `host_build_graph`, which reports no
+kernel capability. The `init_claims_borrowed_stream` case matches the C++ twin:
+TMR init succeeds, reports kernel support, and refuses a second worker on the
+same device while the first stays initialized.
+
+| Suite | Result |
+| ----- | ------ |
+| Python hardware unit tests, `tests/ut -m requires_hardware --platform a2a3` | 30 passed |
+| Python unit tests, `tests/ut -m "not requires_hardware"` | 2335 passed |
+| Invocation transport probe, `tools/cann-examples/tmr-invocation-snapshot` | 24 gated asynchronous snapshots passed |
+| a2a3 onboard scenes, `-m "not sdma" --exclude-level 4` | 167 passed, 1 skipped |
+| a2a3 SDMA scenes | 3 passed |
+| a2a3sim scenes | 82 passed, 8 skipped |
+| a5sim scenes | 78 passed |
 
 ## Remaining boundaries
 
