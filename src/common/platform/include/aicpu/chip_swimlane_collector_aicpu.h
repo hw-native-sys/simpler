@@ -34,7 +34,9 @@
  *
  * Two-channel level transport (mirrors the PMU pattern):
  *   - binary on/off — `enable_profiling_flag` bit1 → `set_chip_swimlane_enabled(bool)`
- *     at kernel entry; queried via `is_chip_swimlane_enabled()`.
+ *     at kernel entry; queried via `is_chip_swimlane_enabled()`. Each call
+ *     invalidates the preceding launch's cached level and phase writers,
+ *     including when profiling is disabled and init will not run.
  *   - granular ChipSwimlaneLevel — `ChipSwimlaneDataHeader::chip_swimlane_level`
  *     (shared memory); read in `chip_swimlane_aicpu_init` and cached, then queried
  *     via `get_chip_swimlane_level()` for
