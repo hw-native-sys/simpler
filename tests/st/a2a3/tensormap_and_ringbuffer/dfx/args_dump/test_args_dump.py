@@ -220,17 +220,22 @@ class TestArgsDump(SceneTestCase):
                     selected = (entry["task_id"], entry["arg_index"]) in selected_tensor_slots
                     assert (entry.get("bin_size", 0) > 0) == selected, entry
 
-                restored_input = next(
-                    entry
-                    for entry in tensor_entries
-                    if entry["task_id"] == "0x0000000100000000"
-                    and entry["arg_index"] == 0
-                    and entry["stage"] == "before_dispatch"
-                )
-                with bin_path.open("rb") as payload_file:
-                    payload_file.seek(restored_input["bin_offset"])
-                    payload = payload_file.read(restored_input["bin_size"])
-                assert payload == struct.pack("<f", 5.0) * (128 * 128)
+        # Payload truth, at every level that writes one. Everything above this
+        # point is structural — entry counts, arg indices, offsets, sizes — and
+        # a dump whose payload is correctly sized and entirely zero satisfies
+        # all of it. This tensor is task 0's `a + b` over the 2.0 / 3.0 inputs,
+        # so its bytes are known ahead of the run and cannot be a coincidence.
+        restored_input = next(
+            entry
+            for entry in tensor_entries
+            if entry["task_id"] == "0x0000000100000000"
+            and entry["arg_index"] == 0
+            and entry["stage"] == "before_dispatch"
+        )
+        with bin_path.open("rb") as payload_file:
+            payload_file.seek(restored_input["bin_offset"])
+            payload = payload_file.read(restored_input["bin_size"])
+        assert payload == struct.pack("<f", 5.0) * (128 * 128)
 
         # ---- Tool smoke: dump_viewer ----
         # Exit-code-only check; the no-filter default lists every captured
