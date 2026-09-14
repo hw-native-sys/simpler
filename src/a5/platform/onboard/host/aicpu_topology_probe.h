@@ -95,6 +95,11 @@ bool probe_aicpu_topology(
 // Returns false when the mask is empty.
 bool enumerate_cpus_from_occupy(uint64_t occupy, std::vector<AicpuLogicalCpu> &out_user_cpus);
 
+// Return the complete user pool directly when driver or verified-JSON CPU_TOPO
+// covers every authoritative OCCUPY bit. OCCUPY-only topology and partial
+// metadata return false so callers can use an explicit discovery fallback.
+bool build_complete_topology_user_pool(const AicpuTopology &topology, std::vector<int32_t> &out_cpu_ids);
+
 // Load the full logical CPU_TOPO for a packaged fallback whose SoC and every
 // constraint declared by that entry (host architecture and/or OCCUPY) match.
 // Output is not OCCUPY-filtered. `out_generic_selection_only` reports entries

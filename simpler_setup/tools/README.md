@@ -19,6 +19,7 @@ no repo checkout required.
 - **[dump_viewer](#dump_viewer)** — inspect / export args dumps (see [docs/args-dump.md](../../docs/dfx/args-dump.md) for full workflow)
 - **[deps_viewer](#deps_viewer)** — `deps.json` (dep_gen) → text or pan/zoom HTML dependency graph
 - **[wait_reduction_sim](#wait_reduction_sim)** — `deps.json` (dep_gen) → bounded-bitmap WAIT reduction coverage vs the full-DAG upper bound, per BL
+- **[rtt_die_preflight](#rtt_die_preflight)** — full AICPU affinity preflight → per-device `aicpu_affinity_plan.<id>.json` (authoritative `allowed_cpus`; backend: `aicpu_device_query/`)
 
 For CLIs that allow an omitted input, auto-detection paths
 (`outputs/*/chip_swimlane_records.json`, `outputs/*/args_dump/`) are resolved
@@ -914,6 +915,49 @@ For batch-run hardware regression, see the dev-only script
 - Install graphviz: `brew install graphviz` (macOS) or `apt install graphviz` (Debian/Ubuntu)
 - Verify with `which dot`; should print a path
 - Use a different layout engine with `--engine sfdp` for very large graphs
+
+---
+
+## rtt_die_preflight
+
+Full A5 AICPU affinity preflight. Invokes
+`simpler_setup/tools/aicpu_device_query` (`--rtt-json`) to:
+
+1. enumerate the user AICPU pool (serial `aicpu_num=1`)
+2. elect the orchestrator via atomic-flag pairwise handshake (1000 iters)
+3. score non-orch threads with COND die sums (100 samples/core)
+4. pack physical picks `{die0,die1,die1,die0}` into logical
+   `[S0,S1,S2,S3,O]` so **S0/S1 own die0 and S2/S3 own die1**
+
+Writes one independent schema-v3 pair per device:
+`build/config/aicpu_affinity_plan.<device_id>.json` and the matching `.cpus`
+companion. Independent files avoid shared-JSON lost updates during parallel L3
+initialization. A probe requires a complete pool of 5–14 CPUs. Any enumeration,
+measurement, or validation failure writes neither file; the runtime then uses
+OCCUPY-contiguous allocation in memory.
+
+On a5 onboard `ChipWorker.init`, if the JSON/side pair is missing or structurally
+invalid the Python wrapper runs this CLI (`--plan-source auto-first-run`) with
+the exact per-device `--out` path and prints start / done / fail. `DeviceRunner`
+only reads the side file. A valid five-thread plan is used for four schedulers;
+other requested widths, or a missing/invalid plan, warn and use exactly the
+requested number of OCCUPY-contiguous CPUs. C++ never spawns Python.
+The automatic device probe is bounded by 30 seconds after helper compilation;
+helper/dispatcher builds use a separate budget and are excluded from that
+timer. A device-probe timeout writes a per-device `.timeout` record and later
+automatic initialization skips probing and falls back directly. An explicit
+manual `--probe` clears the record before retrying. A helper-build timeout
+does not write `.timeout`.
+
+```bash
+task-submit --device auto --device-num 1 --run \
+  'python -m simpler_setup.tools.rtt_die_preflight --device "$TASK_DEVICE" --probe'
+
+# Offline authoritative write (plan_source=manual):
+python -m simpler_setup.tools.rtt_die_preflight --device 0 \
+  --soc Ascend950PR_9599 --allowed-cpus 3,4,5,6,8 \
+  --occupy-cpus 3,4,5,6,7,8
+```
 
 ---
 

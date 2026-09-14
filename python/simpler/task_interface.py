@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import subprocess
 import sys
 import threading
 import uuid
@@ -1289,6 +1290,129 @@ def _initialize_host_log(log_level: int | None = None, *, defer_writer: bool = F
     _log.attach_unified_log_handler(_native_emit_host_log, _native_host_log_directory)
 
 
+def _is_a5_onboard_bins(bins: Any) -> bool:
+    """True when binaries look like a5 onboard (dispatcher + host under .../a5/...)."""
+    dispatcher = getattr(bins, "dispatcher_path", None)
+    if dispatcher is None or str(dispatcher) == "":
+        return False
+    host = getattr(bins, "host_path", None)
+    if host is None:
+        return False
+    return "a5" in Path(host).parts
+
+
+def _affinity_plan_paths(device_id: int) -> tuple[Path, Path]:
+    """Resolve the exact per-device JSON and runtime companion paths."""
+    from simpler_setup.tools.rtt_die_preflight import cpus_side_path, default_plan_path  # noqa: PLC0415
+
+    plan = default_plan_path(int(device_id))
+    return plan, cpus_side_path(plan)
+
+
+def _ensure_a5_affinity_cpus(device_id: int, bins: Any) -> None:
+    """If a5 onboard and .cpus side file is missing, run rtt_die_preflight --probe.
+
+    Never raises into ChipWorker.init: probe failure leaves prepare to use
+    OCCUPY contiguous fallback. Prints start / skip / done / fail for operators.
+    """
+    if not _is_a5_onboard_bins(bins):
+        return
+
+    from simpler_setup.tools.rtt_die_preflight import (  # noqa: PLC0415
+        HELPER_BUILD_TIMEOUT_SECONDS,
+        PREFLIGHT_TIMEOUT_SECONDS,
+        plan_files_look_usable,
+        timeout_record_looks_usable,
+        timeout_record_path,
+    )
+
+    plan, side = _affinity_plan_paths(device_id)
+    timeout_record = timeout_record_path(plan)
+    if plan_files_look_usable(plan, device_id):
+        print(f"[affinity-preflight] device={device_id} skip, using existing {side}", flush=True)
+        return
+    if timeout_record_looks_usable(timeout_record, device_id):
+        print(
+            f"[affinity-preflight] device={device_id} skip, previous probe timed out; "
+            "runtime will use OCCUPY contiguous fallback",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+
+    print(
+        f"[affinity-preflight] device={device_id} start → valid plan missing; probing to {plan}…",
+        flush=True,
+    )
+    cmd = [
+        sys.executable,
+        "-m",
+        "simpler_setup.tools.rtt_die_preflight",
+        "--device",
+        str(int(device_id)),
+        "--probe",
+        "--plan-source",
+        "auto-first-run",
+        "--out",
+        str(plan),
+    ]
+    # Outer timeout is only a safety net covering helper builds + the 30s probe.
+    # The CLI alone decides whether a device-probe timeout warrants a permanent
+    # `.timeout` marker; a hung helper build must not permanently skip probing.
+    try:
+        completed = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=HELPER_BUILD_TIMEOUT_SECONDS + PREFLIGHT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            f"[affinity-preflight] device={device_id} exceeded helper-build+probe safety budget "
+            f"({HELPER_BUILD_TIMEOUT_SECONDS + PREFLIGHT_TIMEOUT_SECONDS}s); "
+            "runtime will use OCCUPY contiguous fallback",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    except OSError as exc:
+        print(
+            f"[affinity-preflight] device={device_id} failed to spawn preflight ({exc}); "
+            "runtime will use OCCUPY contiguous fallback",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    if completed.stdout:
+        sys.stdout.write(completed.stdout)
+        if not completed.stdout.endswith("\n"):
+            sys.stdout.write("\n")
+        sys.stdout.flush()
+    if completed.stderr:
+        sys.stderr.write(completed.stderr)
+        if not completed.stderr.endswith("\n"):
+            sys.stderr.write("\n")
+        sys.stderr.flush()
+    if timeout_record_looks_usable(timeout_record, device_id):
+        print(
+            f"[affinity-preflight] device={device_id} timed out; runtime will use OCCUPY contiguous fallback",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    if completed.returncode != 0 or not plan_files_look_usable(plan, device_id):
+        err = (completed.stderr or "").strip() or f"exit={completed.returncode}"
+        last = err.splitlines()[-1] if err else "unknown"
+        print(
+            f"[affinity-preflight] device={device_id} failed ({last}); runtime will use OCCUPY contiguous fallback",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    print(f"[affinity-preflight] device={device_id} done → wrote {plan} and {side}", flush=True)
+
+
 def _start_host_log_writer() -> None:
     """Start the process-owned writer after the process's final local fork."""
     if not _native_start_host_log_writer():
@@ -1420,6 +1544,7 @@ class ChipWorker:
 
         try:
             _initialize_host_log(log_level)
+            _ensure_a5_affinity_cpus(int(device_id), bins)
 
             # C++ retains libcpu_sim_context.so in the sim process registry,
             # loads host_runtime.so, and binds both private logger copies.
