@@ -164,6 +164,16 @@ DeviceRunner → dlsym(aicpu_handle, "set_aicpu_sim_context_helpers")
 These injected function pointers are stored as globals in the respective SOs
 and called instead of `dlsym(RTLD_DEFAULT)`.
 
+### Kernel PTO architecture selection
+
+PTO kernel SOs export `simpler_cpu_sim_select_pto_arch`. Immediately after
+loading each kernel, `DeviceRunner` calls this function to set the SO's
+architecture-specific `NPUMemoryModel` default. This happens before kernel
+worker threads start. Each worker therefore initializes its existing PTO
+thread-local memory model with the selected architecture on first Tile use;
+the integration adds no additional C++ thread-local state to the unloadable
+kernel SO.
+
 ## Thread-Local Storage
 
 ### Design Principle
@@ -320,6 +330,7 @@ ChipWorker.run(handle, args, config)                   # public wrapper path
     simpler_prepare_run(..., &descriptor)
       new (buf) NativeRunContext(..., descriptor, host_api)   owns Runtime + progress state
       DeviceRunner::bind_callable_to_runtime(r, cid, &host_api, args, rings)
+        dlopen each kernel SO and select its PTO architecture
       DeviceRunner::prepare_execution(r, config, slot, identity)
     simpler_launch_run(...)
       child progress path: DeviceRunner::launch_execution(prepared, permit)

@@ -16,6 +16,7 @@ import tempfile
 import warnings
 from functools import cache
 from pathlib import Path
+from textwrap import dedent
 from typing import Optional, Union
 
 from simpler import env_manager
@@ -44,6 +45,15 @@ _COMPILE_CACHE_SCHEMA = 1
 # invocation and flags, toolchain selection, and the ELF section extraction
 # applied to every onboard incore.
 _ARTIFACT_LOGIC_MODULES = ("kernel_compiler.py", "toolchain.py", "compile_paths.py", "elf_parser.py")
+
+# Optional entry exported by PTO kernel shared libraries. The sim loader calls
+# it after ``dlopen`` and before starting any kernel worker threads.
+_SIM_KERNEL_PTO_ARCH_SELECTOR = "simpler_cpu_sim_select_pto_arch"
+
+# PTO ISA architecture each sim platform's kernels run as. The CPU memory model
+# defaults to A2A3, and the architecture decides both the simulated buffer
+# sizes and the DMA tail-padding TLoad applies.
+_SIM_KERNEL_PTO_ARCH = {"a2a3sim": "A2A3", "a5sim": "A5"}
 
 
 @cache
@@ -764,16 +774,50 @@ class KernelCompiler:
             for inc_dir in extra_include_dirs:
                 cmd.append(f"-I{compiler_visible_path(inc_dir)}")
 
+        # Set the shared library's PTO architecture before its worker threads
+        # start. Each worker's existing NPUMemoryModel instance then lazily
+        # initializes with that default on first use. Keeping the selector out
+        # of kernel_entry avoids adding C++ thread-local state to a shared
+        # library that is repeatedly dlopen'd and dlclose'd.
+        selector_path = None
+        if pto_isa_root:
+            if self.platform not in _SIM_KERNEL_PTO_ARCH:
+                raise ValueError(f"No PTO ISA architecture for platform: {self.platform}")
+            arch = _SIM_KERNEL_PTO_ARCH[self.platform]
+            selector_path = self._make_temp_path(
+                prefix=f"{os.path.basename(source_path)}.sim_pto_arch_", suffix=".cpp", build_dir=build_dir
+            )
+            # cpu_stub.hpp defines the address-space macros (``__gm__``) used
+            # by the memory model header.
+            Path(selector_path).write_text(
+                dedent(
+                    f"""
+                    #include <pto/common/cpu_stub.hpp>
+                    #include <pto/cpu/NPUMemoryModel.hpp>
+
+                    extern "C" void {_SIM_KERNEL_PTO_ARCH_SELECTOR}() {{
+                        pto::NPUMemoryModel::SetDefaultArch(pto::NPUArch::{arch});
+                    }}
+                    """
+                )
+            )
+
         cmd.extend(["-o", output_path, str(compiler_visible_path(source_path))])
+        if selector_path:
+            cmd.append(str(compiler_visible_path(selector_path)))
 
         # Log compilation command
         logger.info(f"[SimKernel] Compiling: {source_path}")
         logger.debug(f"  Command: {' '.join(cmd)}")
 
-        return self._compile_to_bytes(
-            cmd,
-            output_path,
-            "SimKernel",
-            error_hint=f"{self.gxx15.cxx_path} not found. Please install g++-15.",
-            delete_output=build_dir is None,
-        )
+        try:
+            return self._compile_to_bytes(
+                cmd,
+                output_path,
+                "SimKernel",
+                error_hint=f"{self.gxx15.cxx_path} not found. Please install g++-15.",
+                delete_output=build_dir is None,
+            )
+        finally:
+            if selector_path:
+                os.remove(selector_path)

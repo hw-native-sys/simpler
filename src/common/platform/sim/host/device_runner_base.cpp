@@ -1034,6 +1034,11 @@ uint64_t SimDeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *ca
             return 0;
         }
 
+        auto select_pto_arch = reinterpret_cast<void (*)()>(dlsym(handle, "simpler_cpu_sim_select_pto_arch"));
+        if (select_pto_arch != nullptr) {
+            select_pto_arch();
+        }
+
         auto register_hooks = reinterpret_cast<void (*)(void *, void *)>(dlsym(handle, "pto_sim_register_hooks"));
         if (register_hooks != nullptr) {
             register_hooks(
