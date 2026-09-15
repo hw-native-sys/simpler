@@ -116,7 +116,7 @@ backward-compatible with the old boolean behavior).
 | 1 | AICore timing only (start_time_us/end_time_us/task_id/func_id/core_type) | No Scheduler timestamps |
 | 2 | + Scheduler per-task dispatch_time_us, finish_time_us | Producer is identified as `aicpu` or `aicore` |
 | 3 | + scheduler phases (`scheduler_records`) | Skips orchestrator phases |
-| 4 | + orchestrator phases (`aicpu_orchestrator_phases[]`) | Full collection |
+| 4 | + orchestrator phases (Host for HBG, AICPU for TMR) | Full collection |
 
 Dependency arrows are not produced by any swimlane level — see
 [§3.5](#35-dependency-arrows-from-dep_gen) for the dep_gen join.
@@ -382,8 +382,10 @@ Separate-lane phases are routed to a different lane by the converter
 bars even when their timestamps fall inside an outer span.
 
 For the A5 HBG AICore producer, all phases render on the single
-`Scheduler_<physical-AIV-ID>` lane. Completion, Resolve, StateProbe, and the
-selected publication phase are mutually time-exclusive. StateProbe includes
+`Scheduler_<worker_id>` lane, matching the worker ID used by Executor lanes.
+If `worker_id` is missing or null, the lane suffix falls back to `scheduler_id`.
+Completion, Resolve, StateProbe, and the selected publication phase are mutually
+time-exclusive. StateProbe includes
 Ready claim or steal and ends when immediate or deferred placement has been
 decided. Deferred waiting is intentionally left as an empty interval before
 the eventual Dispatch, Worksteal, or Refill. Worksteal identifies a task whose
@@ -460,6 +462,82 @@ python -m simpler_setup.tools.swimlane_converter \
 python -m simpler_setup.tools.swimlane_converter \
     build_output/<case>/dfx_outputs --dispatch-id 17:5
 ```
+
+### Optional alignment embedded in a single capture
+
+For `host_build_graph` captures, single-file conversion looks for sibling
+`host.*.log` files, or the files specified by `--host-log`. The converter identifies
+HBG by `scheduler_records.streams[].runtime`, with Host orchestrator/capture markers
+as the fallback for legacy files. Automatic alignment also requires Host capture
+information (`host_orchestrator_phases`, `host_device_uploads`, or Host capture
+metadata). Normal HBG levels 1-3 contain only device records and therefore retain
+their single-file conversion without automatic containment or source rewriting.
+Level 4 adds Host records. With `SIMPLER_HBG_HOST_PHASE_RECORDS_ENABLE=1`, the
+independent Host phase pool can also supply Host lanes to a level-3 export, so the
+converter checks the capture content rather than requiring level 4.
+For captures with Host information it computes containment only when the logs contain
+usable `runner_run` / `device_wall` windows matching the capture. A sidecar's
+process and dispatch identity are constraints, and Host records in the capture
+must lie inside the matching `chip.run` span. Missing, filtered, inconsistent or
+ambiguous logs leave the capture unaligned and print the reason; conversion
+still produces a diagnostic view.
+
+```bash
+python -m simpler_setup.tools.swimlane_converter \
+    outputs/<case>/chip_swimlane_records.json --host-log outputs/<case>/test.log
+```
+
+SceneTest's existing post-case converter performs this step automatically inside
+`swimlane_converter.py`, which calls `containment` directly; no additional tool
+invocation is required. Alignment writeback belongs to single-file conversion.
+Directory merging keeps its existing containment behavior for all runtimes and
+levels without rewriting source captures.
+The postprocessor atomically adds `metadata.clock_alignment`; all original
+records retain their Host-ns / device-cycle timestamps and original formatting.
+Only the alignment member is inserted or replaced. The metadata is one
+fixed-size object per capture, independent of task count. A valid saved mapping
+is reused without reading logs or sidecars, including by `read_perf_data()`.
+An explicit `--host-log` requests recalculation.
+
+| Field | Meaning |
+| ----- | ------- |
+| `schema_version` | `1` |
+| `status` | `bounded` when placed; `unavailable` with `reason` when skipped |
+| `method` | `span_containment_v1`; this is a bounded placement, not measured clock calibration |
+| `clock_freq_hz` | Device counter frequency; matches the capture metadata |
+| `host_clock_domain_id` | Capture's Host clock domain, when available |
+| `device_anchor_cycles` | Integer device reference timestamp |
+| `host_anchor_ns` | Selected Host timestamp corresponding to that reference |
+| `host_anchor_min_ns` / `host_anchor_max_ns` | Allowed Host interval for the reference, including both placement slack and device-phase join freedom |
+| `uncertainty_ns` | Width of that interval |
+| `placement` | Original containment diagnostics: Host window, PID/invocation, device extent, slack and join residual |
+| `capture_sha256` | Digest of the document with `metadata.clock_alignment` removed, to reject stale mappings |
+
+An IDE such as pypto-toolkit must consume `metadata.clock_alignment` to match the
+merged view. Merely opening the enriched file with a reader that ignores this field
+does not align its clocks. Once adapted, a reader can draw device events using only
+the capture, without Host logs or another tool invocation:
+
+```text
+host_ns = host_anchor_ns
+        + (device_cycles - device_anchor_cycles) * 1e9 / clock_freq_hz
+display_us = (host_ns - chosen_host_timeline_origin_ns) / 1000
+```
+
+Host records use that same display origin directly. The selected Host anchor is
+rounded to integer ns; interval endpoints are rounded outward. The mapping's
+bounds must remain visible when interpreting cross-domain gaps. A broad Host
+window still gives broad uncertainty after the mapping has been embedded.
+The digest uses sorted-key, ASCII-escaped JSON with compact separators and no
+trailing newline. Changing the capture invalidates its saved mapping.
+
+Without a valid mapping, Host/device latency is unavailable. The HBG diagnostic
+composite places device work after the last Host submit or upload to preserve
+causal order, and explicitly keeps `cross_domain_latency_available=false`.
+This visual seam does not measure the physical gap. An IDE should identify that
+state as unaligned instead of treating the seam as calibrated time.
+
+### Directory alignment
 
 For directory input, the default output is `dfx_outputs/l3_swimlane.json`.
 Every Rank must sit under `rankN/<dispatch>/` and report the same

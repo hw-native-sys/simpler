@@ -356,3 +356,30 @@ def test_host_pid_alone_still_needs_the_dispatch_when_the_process_ran_twice():
 
     assert (pairs[0].pid, pairs[0].inv) == (11, 2)
     assert diagnostics[0]["source"] == "capture_sidecar"
+
+
+def test_capture_windows_reads_scheduler_streams():
+    raw = _capture()
+    records = raw.pop("aicpu_scheduler_phases")[0]
+    raw["scheduler_records"] = {
+        "schema_version": 1,
+        "streams": [{"producer": "aicpu", "scheduler_id": 0, "records": records}],
+    }
+    capture = containment.capture_windows(raw)
+    assert capture.extent == (1900, 2200)
+    assert capture.windows["sched"] == (1900, 1950)
+
+
+def test_capture_windows_includes_aicore_scheduler_streams_in_extent():
+    raw = _capture()
+    raw["scheduler_records"] = {
+        "schema_version": 1,
+        "streams": [
+            {"producer": "aicpu", "records": raw.pop("aicpu_scheduler_phases")[0]},
+            {"producer": "aicore", "records": [{"start_cycles": 1800, "end_cycles": 2300}]},
+        ],
+    }
+    capture = containment.capture_windows(raw)
+    assert capture.extent == (1800, 2300)
+    # The Host log's AICPU sched phase does not bracket AICore producers.
+    assert capture.windows["sched"] == (1900, 1950)

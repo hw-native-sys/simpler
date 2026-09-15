@@ -358,8 +358,10 @@ python -m pytest <case> --platform <platform> --device 0 --enable-chip-swimlane 
   appear on the `graph record worker` lane, while outer `graph_submit` events
   appear on the `graph submit main` lane.
 
-- **The host lanes of `chip_swimlane_records.json`**, at level 4 only. These
-  records are already Host ns; the device records reach the same axis through
+- **The host lanes of `chip_swimlane_records.json`**, normally at level 4.
+  An independently enabled `SIMPLER_HBG_HOST_PHASE_RECORDS_ENABLE=1` pool can
+  also supply them at level 3 through the shared export path. These records are
+  already Host ns; the device records reach the same axis through
   the `chip.run.runner_run` window that contained them, which bounds the seam
   rather than closing it (see `simpler_setup/tools/containment.py`). Two
   projections of the pool land there:

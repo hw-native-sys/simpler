@@ -339,6 +339,26 @@ def _stream_bounds(data, stream):
     )
 
 
+def _scheduler_phase_streams(data):
+    """Yield (producer, records), preferring the versioned wire format."""
+    section = data.get("scheduler_records")
+    if section is None:
+        yield "aicpu", list(_phase_records(data.get("aicpu_scheduler_phases")))
+        return
+    if not isinstance(section, dict) or section.get("schema_version") != 1:
+        raise ContainmentError("unsupported scheduler_records schema")
+    streams = section.get("streams")
+    if not isinstance(streams, list):
+        raise ContainmentError("scheduler_records.streams must be an array")
+    for stream in streams:
+        if not isinstance(stream, dict) or not isinstance(stream.get("records"), list):
+            raise ContainmentError("scheduler stream must contain a records array")
+        records = stream["records"]
+        if any(not isinstance(record, dict) for record in records):
+            raise ContainmentError("scheduler phase records must be objects")
+        yield stream.get("producer"), records
+
+
 def capture_windows(data):
     """Read one ``chip_swimlane_records.json`` document's device-cycle extent.
 
@@ -365,9 +385,15 @@ def capture_windows(data):
     scheduler_tasks = data.get("scheduler_tasks") or {}
     for row in scheduler_tasks.get("records") or []:
         cycles.extend(int(value) for value in row[2:4])
-    for stream in ("aicpu_scheduler_phases", "aicpu_orchestrator_phases"):
-        for record in _phase_records(data.get(stream)):
-            cycles.extend(int(record.get(field, 0)) for field in ("start_cycles", "end_cycles"))
+    scheduler_streams = list(_scheduler_phase_streams(data))
+    for _producer, records in scheduler_streams:
+        for record in records:
+            start, end = int(record["start_cycles"]), int(record["end_cycles"])
+            if end < start:
+                raise ContainmentError("scheduler phase has a negative interval")
+            cycles.extend((start, end))
+    for record in _phase_records(data.get("aicpu_orchestrator_phases")):
+        cycles.extend(int(record.get(field, 0)) for field in ("start_cycles", "end_cycles"))
     # Lifecycle records name their instants one field per event rather than as
     # a start/end pair, and the set grows with the control plane, so this reads
     # the suffix instead of a field list that would drift from the decoder's.
@@ -387,7 +413,20 @@ def capture_windows(data):
 
     windows = {}
     for short_name, stream in _JOIN_STREAMS:
-        bounds = _stream_bounds(data, stream)
+        if short_name == "sched":
+            # The logged sched window belongs to AICPU. Other producers still
+            # contribute to the full extent, but cannot narrow this phase join.
+            bounds = _cycle_bounds(
+                [
+                    int(record[field])
+                    for producer, records in scheduler_streams
+                    if producer == "aicpu"
+                    for record in records
+                    for field in ("start_cycles", "end_cycles")
+                ]
+            )
+        else:
+            bounds = _stream_bounds(data, stream)
         if bounds is not None:
             windows[short_name] = bounds
     return CaptureWindows(frequency_hz=frequency_hz, extent=extent, windows=windows)
