@@ -409,7 +409,21 @@ def test_l3_directory_merge_keeps_scheduler_streams_and_lifecycle_records(tmp_pa
         records_path.write_text(json.dumps(records))
 
     output = tmp_path / "l3.json"
-    args = sc._build_parser().parse_args([str(root), "--dispatch", "d0", "-o", str(output)])
+    # AICore streams do not identify the logged AICPU sched window.
+    # Pin the processes for these otherwise indistinguishable captures.
+    args = sc._build_parser().parse_args(
+        [
+            str(root),
+            "--dispatch",
+            "d0",
+            "-o",
+            str(output),
+            "--rank-pid",
+            "0=1000:1",
+            "--rank-pid",
+            "1=1001:1",
+        ]
+    )
 
     sc._generate_l3_trace(args, root)
 
@@ -1851,8 +1865,8 @@ def test_aicore_scheduler_uses_one_lane_and_display_names(tmp_path):
     scheduler_streams = [
         {
             "producer": "aicore",
-            "scheduler_id": 4,
-            "worker_id": 36,
+            "scheduler_id": 3,
+            "worker_id": 34,
             "core_type": "aiv",
             "physical_core_id": 26,
         }
@@ -1871,7 +1885,7 @@ def test_aicore_scheduler_uses_one_lane_and_display_names(tmp_path):
         and event.get("name") == "thread_name"
         and event.get("tid") != 3999
     ]
-    assert [(event["tid"], event["args"]["name"]) for event in scheduler_metadata] == [(30000, "Scheduler_26")]
+    assert [(event["tid"], event["args"]["name"]) for event in scheduler_metadata] == [(30000, "Scheduler_34")]
     phases = [event for event in events if event.get("cat") == "scheduler"]
     assert {event["tid"] for event in phases} == {30000}
     assert [event["name"] for event in phases] == [

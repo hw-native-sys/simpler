@@ -1240,6 +1240,8 @@ def _run_swimlane_converter(
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
         if result.stdout:
             logger.info(result.stdout)
+        if result.stderr:
+            logger.warning(result.stderr.strip())
         logger.info("Swimlane JSON generation completed")
         return True
     except subprocess.CalledProcessError as e:
