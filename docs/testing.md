@@ -929,13 +929,20 @@ touches costs nothing.
 | Platform | Means | Per-access cost |
 | -------- | ----- | --------------- |
 | Host map available (a2a3 onboard, sim) | one mapping of the allocation, held by the runtime for the allocation's lifetime | none |
-| Host map unavailable (a5 onboard, or a 64 KiB-page host — issue #1531) | a device copy per access | one PCIe round trip, ~1.5 µs |
+| Host map unavailable (a5 onboard, or a 64 KiB-page host — issue #1531) | a device copy per access | one synchronous driver round trip, ~9.5 µs† |
+
+† Measured on a2a3 with 4 KiB host pages (CANN 9.0.0), which is neither
+configuration in that row — a2a3 on ordinary pages takes the mapping. It is
+what a small synchronous `aclrtMemcpy` costs against this driver; a5 and
+64 KiB-page hosts are unmeasured. See
+[the investigation](investigations/2026-09-hbg-per-run-host-view-rebuild.md).
 
 On the second row the cost is per access, not per tensor, so a tensor the
 orchestration reads thousands of times — `paged_attention`'s `block_table` is
-read once per (batch, block) pair — is better left in host memory there. The
-declaration is per argument, so a data-dependent case can mix freely. The bind's
-`BindHostViewClose` phase attributes report `devcopy=N` when this path was taken.
+read once per (batch, block) pair, 16,384 times in Case1, which is ~156 ms — is
+better left in host memory there. The declaration is per argument, so a
+data-dependent case can mix freely. The bind's `BindHostViewClose` phase
+attributes report `devcopy=N` when this path was taken.
 
 Runtime-created tensors (graph-heap allocations the orchestration made itself)
 remain unreadable: they are uninitialized until a task writes them, and

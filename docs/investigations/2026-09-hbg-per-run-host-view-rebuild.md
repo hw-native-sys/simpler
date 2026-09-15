@@ -45,12 +45,20 @@ separately, rotating over 4 distinct `aclrtMalloc` allocations per size so no
 measurement is served by HAL state a real bind would not have. 300 iterations
 per size, reporting min and median.
 
+The harness is **not retained** — neither in-tree nor in the PR branch, since it
+was written under a gitignored scratch directory. It is ~90 lines and the
+paragraph above is enough to rewrite it: `dlopen("libascend_hal.so")`, `dlsym`
+`halHostRegister` / `halHostUnregister`, call them around
+`std::chrono::steady_clock`, and build against the CANN toolkit:
+
 ```bash
-# .docs/bench_host_register.cpp in the PR branch; not retained in-tree
 g++ -std=c++17 -O2 bench_host_register.cpp -o bench_host_register \
     -I$ASCEND/include -L$ASCEND/lib64 -lascendcl -ldl
-task-submit --device auto --device-num 1 --run .docs/run_bench.sh   # a2a3, CANN 9.0.0
+task-submit --device auto --device-num 1 --run ./bench_host_register   # a2a3, CANN 9.0.0
 ```
+
+A second harness of the same shape measures the fallback's per-access cost with
+`aclrtMemcpy(..., ACL_MEMCPY_DEVICE_TO_HOST)` over 2000 iterations.
 
 ## Result
 
@@ -70,6 +78,29 @@ device=1 iters=300 buffers=4
 across two independent runs. #1848's reading that the cost is essentially all
 per-byte is wrong at small sizes — it was right about the regime it measured
 and does not extrapolate down.
+
+The fallback's per-access cost, measured the same way (2000 iterations, two
+independent runs):
+
+```text
+     bytes   d2h_min_us   d2h_med_us
+         4        9.020        9.740
+         8        9.051        9.890
+        64        8.660        9.530
+```
+
+**A small D2H costs ~9.5 µs**, essentially flat from 4 to 64 bytes — it is a
+synchronous driver round trip, not a transfer. An earlier revision of this entry
+and of `docs/testing.md` quoted ~1.5 µs here from an estimate rather than a
+measurement; the real figure is ~6× that, and it changes a conclusion below.
+
+**Measured on a2a3, `getconf PAGESIZE` 4096, CANN 9.0.0 — which is neither
+configuration that actually takes this path.** a5 onboard has no host-map path
+at all, and a 64 KiB-page host refuses the registration (#1531); this box does
+neither, since `halHostRegister` here accepts even a 4-byte allocation. The
+figure is what a synchronous small `aclrtMemcpy` costs against this driver, and
+nothing here establishes that a5 or a 64 KiB-page host matches it. Re-measure on
+one of those before treating it as their number.
 
 The per-byte slope from the two largest points is
 `(1765.03 − 114.06) / 240 MiB = 6.9 µs/MiB`, i.e. **7.0 ms/GiB** — which does
@@ -112,11 +143,34 @@ Two details sharpen it beyond the headline ratio:
   turns that into a one-time cost, which is the difference between a feature
   with a sharp edge and one without.
 
-Caching also removes the need for any access-count heuristic. Without it there
-is a real crossover — a tensor read only two or three times is cheaper served
-by per-access `rtMemcpy` (~1.5 µs each) than by a 5.2 µs register/unregister
-pair — and picking between them per tensor is a policy nobody wants to own.
-With the cache, SVM-always is right.
+**The access-count crossover is size-dependent, and two earlier revisions of
+this entry got it wrong in opposite directions.** The first claimed a tensor
+read two or three times is cheaper served per-access, on the estimated 1.5 µs.
+The second, correcting that, claimed there is no crossover at all — but it
+compared the 9.5 µs read against the **5.2 µs floor**, which is the cost only
+for a tensor small enough to be one or two pages. Register is per mapped page,
+so the pair grows with the tensor:
+
+| accessed tensor | register+unregister | 1 read | 2 reads | cheaper |
+| --------------- | ------------------: | -----: | ------: | ------- |
+| `context_lens`, ~1 KiB | 5.21 µs | 9.74 µs | — | mapping, from the first access |
+| `block_table`, 256 KiB | 18.76 µs | 9.74 µs | 19.48 µs | copy at one read; mapping from the second |
+
+So the crossover exists and sits at **one or two accesses** across this whole
+size range. SVM-always is still right for every caller in the corpus, but
+because the crossover is that low, not because there is none: the least-read
+tensor here is a `shape` / `layout` slot written 2–4 times, and `block_table` is
+read 16,384 times. A per-tensor heuristic would have to distinguish one access
+from two to earn anything, which is not a policy worth owning.
+
+The one case where it would matter — a large tensor the orchestration touches
+exactly once — is #2205's stated trigger condition, and no caller does it today.
+
+The same correction makes the fallback's worst case worse than documented:
+`block_table` in `paged_attention` Case1 is read 16,384 times, which is ~156 ms
+of driver round trips rather than the ~16–33 ms estimated in #2205. That is the
+number behind `docs/testing.md`'s advice to leave a heavily-read tensor in host
+memory on a host that cannot map.
 
 The three cost-independent arguments above do not go away; they become design
 constraints on the cache rather than reasons to skip it. Invalidation is why it
