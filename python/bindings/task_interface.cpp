@@ -3623,6 +3623,14 @@ NB_MODULE(_task_interface, m) {
             "A nonzero context generation, unique and increasing within this host "
             "process. Generation zero is what the C ABI rejects as invalid."
         )
+        .def_static(
+            "probe_kernel_mode_supported", &ChipWorker::probe_kernel_mode_supported, nb::arg("host_lib_path"),
+            nb::arg("sim_context_path"), nb::call_guard<nb::gil_scoped_release>(),
+            "Whether the host runtime at host_lib_path can execute kernel-mode launches. Answers from the "
+            "runtime build alone on a fresh device context that is destroyed before returning, so it takes no "
+            "device and needs no init or kernel_init. Raises RuntimeError when the runtime cannot be loaded, "
+            "lacks a required symbol, or yields no context."
+        )
         .def_prop_ro("device_id", &ChipWorker::device_id)
         .def_prop_ro("initialized", &ChipWorker::initialized)
         .def_prop_ro("pipeline_depth", &ChipWorker::pipeline_depth)

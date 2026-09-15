@@ -67,6 +67,7 @@ import importlib
 import json
 import logging
 import math
+import operator
 import os
 import re
 import shutil
@@ -79,6 +80,8 @@ import tempfile
 import threading
 import time
 import uuid
+import warnings
+import weakref
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field, replace
 from multiprocessing import resource_tracker
@@ -270,6 +273,7 @@ from .task_interface import (
     CallConfig,
     ChipCallable,
     ChipDomainContext,
+    ChipStorageTaskArgs,
     ChipWorker,
     CommBufferSpec,
     CommDomainHandle,
@@ -4623,6 +4627,44 @@ class _DeviceAllocations:
         return len(self._snapshots)
 
 
+# ChipWorkers of kernel-mode Workers that were garbage-collected, or still alive at interpreter exit,
+# without close(). Entries are never removed; see _pin_unclosed_kernel_chip.
+_PINNED_KERNEL_CHIP_WORKERS: list[ChipWorker] = []
+
+
+class _KernelChipPin:
+    """The ChipWorker a kernel-mode Worker's GC finalizer pins; ``chip`` is None once close() tore it down."""
+
+    __slots__ = ("chip",)
+
+    def __init__(self, chip: ChipWorker) -> None:
+        self.chip: ChipWorker | None = chip
+
+
+def _pin_unclosed_kernel_chip(pin: _KernelChipPin) -> None:
+    """Finalizer of a kernel-mode Worker collected, or still alive at interpreter exit, without close().
+
+    ``~ChipWorker`` finalizes its context on whichever thread destroys it, without the caller's
+    quiescence, stream synchronization and graph destruction that kernel-mode teardown requires. The
+    ChipWorker is therefore kept alive for the rest of the process instead. The finalizer receives only
+    the pin, never the Worker, so it does not keep the Worker reachable.
+    """
+    chip = pin.chip
+    if chip is None:
+        return
+    _PINNED_KERNEL_CHIP_WORKERS.append(chip)
+    # Interpreter finalization clears module globals, this list included, and dropping the list's
+    # reference there would run ~ChipWorker. This reference is never released, so the object outlives
+    # finalization and its native destructor never runs.
+    ctypes.pythonapi.Py_IncRef(ctypes.py_object(chip))
+    warnings.warn(
+        "Worker(execution_mode='kernel') was garbage-collected without close(); its kernel context is "
+        "intentionally leaked rather than finalized on an arbitrary thread",
+        ResourceWarning,
+        stacklevel=2,
+    )
+
+
 class Worker:
     """Unified worker for all hierarchy levels.
 
@@ -4632,7 +4674,43 @@ class Worker:
     level=4+: wraps the C++ Worker composite with Worker(level-1)×N as
               NEXT_LEVEL children + SubWorker×M. Children are added via
               add_worker() before init().
+
+    A level=2 Worker runs in one of two execution modes, fixed at construction by
+    the ``execution_mode`` config key:
+
+    - ``"program"`` (default): ``init()`` opens the device; callables go through
+      ``register()`` and run through ``submit()`` / ``run()``.
+    - ``"kernel"``: ``init(config=...)`` binds the runtime as a kernel-mode
+      context on a device and stream the caller already owns::
+
+          worker = Worker(level=2, execution_mode="kernel", device_id=0,
+                          platform="a2a3", runtime="tensormap_and_ringbuffer")
+          worker.init(config=CallConfig())  # device 0 is already current on this thread
+          callable_id = worker.kernel_prepare_callable(chip_callable)
+          worker.kernel_launch(callable_id, args, caller_stream=stream)
+          ...  # the caller synchronizes its own stream
+          worker.close()
+
+      Preconditions: the thread that calls ``init()`` already has ``device_id``
+      current, and the same thread calls ``close()``. The caller serializes
+      ``kernel_prepare_callable``, ``kernel_launch`` and ``close()``; an
+      overlapping launch fails immediately. Before ``close()`` the caller stops
+      launching, synchronizes its own stream, and destroys every graph that
+      replays the context. ``close()`` never synchronizes the caller's stream,
+      resets the device, or finalizes ACL. Only the process that called
+      ``init()`` may drive or close the context. Kernel mode has no L3+ form.
+      The program-mode APIs (``register`` / ``unregister`` / ``submit`` /
+      ``run``, ``malloc`` / ``free`` / ``copy_to`` / ``copy_from``,
+      ``create_buffer`` / ``make_tensor_arg`` / ``release_buffer``, and
+      ``device_memory_info``) raise ``RuntimeError`` on a kernel-mode Worker.
+      A kernel-mode Worker garbage-collected without ``close()`` emits a
+      ``ResourceWarning`` and leaks its context rather than finalizing it on the
+      collecting thread.
     """
+
+    # `__init__` sets the instance value; this default makes a Worker built without `__init__`
+    # (`Worker.__new__`) read as program mode in the mode guards and in close().
+    _execution_mode: str = "program"
 
     def __init__(
         self,
@@ -4714,6 +4792,7 @@ class Worker:
         self._startup_timeout_s = float(config.get("startup_timeout_s", _STARTUP_TIMEOUT_S))
         if not (self._startup_timeout_s > 0 and math.isfinite(self._startup_timeout_s)):
             raise ValueError("Worker startup_timeout_s must be a positive finite number of seconds")
+        self._init_execution_mode(level, config)
         # Per-startup bookkeeping consumed by the rollback path: PIDs the barrier
         # already reaped (must not be re-SIGKILLed — the PID may be reused) and
         # PIDs that reached their serve loop (READY → asked to close gracefully
@@ -6558,6 +6637,55 @@ class Worker:
                     self._lease_depth[tid] = depth
                 self._hierarchical_start_cv.notify_all()
 
+    def _init_execution_mode(self, level: int, config: dict[str, Any]) -> None:
+        """Validate the ``execution_mode`` config key and set up the kernel-mode state.
+
+        ``"kernel"`` binds a level-2 kernel-mode context in init(); it has no L3+ form and provisions
+        no SDMA workspace, so both are refused here, before any startup resource exists.
+        """
+        execution_mode = config.get("execution_mode", "program")
+        if execution_mode not in ("program", "kernel"):
+            raise ValueError(f"Worker execution_mode must be 'program' or 'kernel', got {execution_mode!r}")
+        if execution_mode == "kernel" and level != 2:
+            raise ValueError("execution_mode='kernel' requires level=2")
+        if execution_mode == "kernel" and config.get("enable_sdma"):
+            raise ValueError("execution_mode='kernel' does not support enable_sdma")
+        self._execution_mode = execution_mode
+        # `_kernel_callables` maps each id kernel_prepare_callable returned to its image; the device
+        # holds addresses into those images until a native teardown succeeds, so only that teardown
+        # clears it. `_kernel_gate` linearizes prepare and launch against the native finalize.
+        # `_kernel_pid` is the process whose kernel_init bound the context, None until one succeeds.
+        self._kernel_config: CallConfig | None = None
+        self._kernel_callables: dict[int, ChipCallable] = {}
+        self._kernel_gate = threading.Lock()
+        self._kernel_pid: int | None = None
+        self._kernel_chip_pin: _KernelChipPin | None = None
+        self._kernel_pin_finalizer: weakref.finalize | None = None
+        # Cached pre-init kernel_mode_supported answer for this Worker's platform/runtime build.
+        self._kernel_supported_probe: bool | None = None
+        self._kernel_supported_lock = threading.Lock()
+
+    def _require_execution_mode(self, api: str, mode: str) -> None:
+        """Reject an API of the other execution mode; the mode is fixed at construction."""
+        if self._execution_mode != mode:
+            raise RuntimeError(
+                f"Worker.{api}: requires execution_mode={mode!r}, but this Worker was constructed with "
+                f"execution_mode={self._execution_mode!r}"
+            )
+
+    def _require_kernel_process(self, api: str) -> None:
+        """Reject a kernel-context operation from a process other than the one whose kernel_init bound it.
+
+        A forked child inherits this Worker object but must not drive or tear down the parent's
+        context. Before a kernel_init succeeds there is no context to fence.
+        """
+        pid = self._kernel_pid
+        if pid is not None and os.getpid() != pid:
+            raise RuntimeError(
+                f"Worker.{api}: this kernel-mode context belongs to process {pid}; "
+                f"process {os.getpid()} must not drive or tear it down"
+            )
+
     def _invalidate_endpoint_registry(self) -> None:
         self._endpoint_registry = None
         self._region_access_service = None
@@ -6741,7 +6869,11 @@ class Worker:
 
         A post-init dynamic register re-validates eligibility against the
         frozen topology (``_eligible_target_need``), same as init().
+
+        Program mode only, before and after init(); a kernel-mode Worker
+        registers images through ``kernel_prepare_callable``.
         """
+        self._require_execution_mode("register", "program")
         if isinstance(target, RemoteCallable) and self.level < 4:
             raise TypeError("Worker.register(RemoteCallable): remote L3 dispatch requires a level >= 4 parent")
         if self.level == 2 and not isinstance(target, ChipCallable):
@@ -6847,6 +6979,123 @@ class Worker:
                 self._rollback_handle_locked(handle)
             raise
         return handle
+
+    @property
+    def kernel_mode_supported(self) -> bool:
+        """Whether this Worker's platform/runtime build can run kernel-mode launches.
+
+        This is the question a caller asks before choosing ``execution_mode``, so the answer is
+        independent of the lifecycle and of this Worker's own mode: it is the same before
+        ``init()``, in program mode, and after ``close()``. A Worker whose level is not 2 has no
+        kernel mode and answers False. Otherwise the first read loads the runtime build and asks a
+        fresh device context that touches no device, then caches the answer; a READY kernel-mode
+        Worker answers True without probing, because kernel_init succeeds only on a supporting
+        runtime. A missing runtime build raises exactly as ``init()`` would, rather than reading as
+        unsupported.
+        """
+        if self.level != 2:
+            return False
+        with self._hierarchical_start_cv:
+            if self._execution_mode == "kernel" and self._lifecycle is _Lifecycle.READY:
+                return True
+        with self._kernel_supported_lock:
+            if self._kernel_supported_probe is None:
+                from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+                binaries = RuntimeBuilder(self._config["platform"]).get_binaries(self._config["runtime"])
+                self._kernel_supported_probe = bool(ChipWorker.probe_kernel_mode_supported(binaries))
+            return self._kernel_supported_probe
+
+    def kernel_prepare_callable(self, chip_callable: ChipCallable) -> int:
+        """Register ``chip_callable`` with this kernel-mode context; returns the id the runtime minted.
+
+        Unrelated to ``register()``: there is no digest dedup, no handle, and no pre-init recording,
+        so the same callable prepared twice takes two distinct, equally valid ids. The call blocks
+        until the device-side registration is committed and raises its failure; call it outside graph
+        capture. The Worker keeps every prepared image alive until ``close()`` tears the context down,
+        because the device holds addresses into it. Requires a READY kernel-mode Worker, called in the
+        process that initialized it.
+        """
+        self._require_execution_mode("kernel_prepare_callable", "kernel")
+        if not isinstance(chip_callable, ChipCallable):
+            raise TypeError(
+                f"Worker.kernel_prepare_callable: expected a ChipCallable, got {type(chip_callable).__name__}"
+            )
+        self._require_kernel_process("kernel_prepare_callable")
+        with self._operation_lease("kernel_prepare_callable"), self._kernel_gate:
+            chip = self._chip_worker
+            assert chip is not None
+            callable_id = int(chip.kernel_prepare_callable(chip_callable))
+            # Recorded before the id is judged: the runtime may hold the image under an id rejected
+            # below, and this entry is what keeps the image alive for it.
+            self._kernel_callables[callable_id] = chip_callable
+            if callable_id < 0:
+                raise RuntimeError(f"Worker.kernel_prepare_callable: the runtime minted invalid id {callable_id}")
+        return callable_id
+
+    def kernel_launch(self, callable_id: int, args: ChipStorageTaskArgs, *, caller_stream: int) -> None:
+        """Enqueue one kernel-mode invocation of ``callable_id`` on ``caller_stream``.
+
+        Returning means the invocation was enqueued; device execution may still be in flight, and a
+        device-side failure surfaces on the caller's own synchronize. ``callable_id`` must be an id
+        this Worker's ``kernel_prepare_callable`` returned, and ``caller_stream`` the caller's
+        non-null ACL stream for this call. There is no ``RunHandle``, no wait, and no operation
+        lease: a launch that overlaps another launch, a prepare, or ``close()`` raises
+        ``RuntimeError`` immediately instead of queueing, because the caller serializes them.
+        Requires a READY kernel-mode Worker, called in the process that initialized it.
+        """
+        self._require_execution_mode("kernel_launch", "kernel")
+        stream = int(caller_stream)
+        if not stream:
+            raise ValueError("Worker.kernel_launch requires a non-null caller_stream")
+        if not isinstance(args, ChipStorageTaskArgs):
+            raise TypeError(f"Worker.kernel_launch: args must be ChipStorageTaskArgs, got {type(args).__name__}")
+        callable_id = operator.index(callable_id)
+        self._require_kernel_process("kernel_launch")
+        if not self._kernel_gate.acquire(blocking=False):
+            raise RuntimeError(
+                "Worker.kernel_launch: a kernel prepare/launch/close is in progress; the caller serializes them"
+            )
+        try:
+            # Read without the lifecycle lock: close() publishes CLOSED before it takes this gate to
+            # finalize, so a launch holding the gate either observes CLOSED or finishes before finalize.
+            if self._lifecycle is not _Lifecycle.READY:
+                raise RuntimeError(
+                    "Worker.kernel_launch: requires an initialized (READY) worker"
+                ) from self._startup_error
+            # A negative id stays in `_kernel_callables` only to keep its image alive; prepare
+            # raised for it, so it is not a launchable id.
+            if callable_id < 0 or callable_id not in self._kernel_callables:
+                raise ValueError(
+                    f"Worker.kernel_launch: callable_id {callable_id} was not returned by this Worker's "
+                    "kernel_prepare_callable"
+                )
+            chip = self._chip_worker
+            assert chip is not None
+            chip.kernel_launch(callable_id, args, stream)
+        finally:
+            self._kernel_gate.release()
+
+    def _arm_kernel_chip_pin(self) -> None:
+        """Arm the finalizer that leaks this Worker's kernel ChipWorker if the Worker is never closed.
+
+        ``weakref.finalize`` also runs at interpreter exit, so a Worker still alive then is pinned
+        before module teardown.
+        """
+        assert self._chip_worker is not None
+        pin = _KernelChipPin(self._chip_worker)
+        self._kernel_chip_pin = pin
+        self._kernel_pin_finalizer = weakref.finalize(self, _pin_unclosed_kernel_chip, pin)
+
+    def _disarm_kernel_chip_pin(self) -> None:
+        """Drop the pin once the kernel context is torn down; nothing is left to leak."""
+        pin, finalizer = self._kernel_chip_pin, self._kernel_pin_finalizer
+        self._kernel_chip_pin = None
+        self._kernel_pin_finalizer = None
+        if pin is not None:
+            pin.chip = None
+        if finalizer is not None:
+            finalizer.detach()
 
     def _python_worker_types(self) -> list[WorkerType]:
         worker_types: list[WorkerType] = []
@@ -7339,7 +7588,9 @@ class Worker:
 
         Raises:
           KeyError: handle was never registered.
+          RuntimeError: the Worker was constructed with ``execution_mode="kernel"``.
         """
+        self._require_execution_mode("unregister", "program")
         if self._pre_start_unregister_if_needed(handle_or_slot):
             return
         # Every post-start path takes the READY-only lease before touching the
@@ -7725,7 +7976,11 @@ class Worker:
                 )
 
     def init(  # noqa: PLR0912, PLR0915
-        self, prewarm_config: CallConfig | None = None, *, _startup_deadline: float | None = None
+        self,
+        prewarm_config: CallConfig | None = None,
+        *,
+        config: CallConfig | None = None,
+        _startup_deadline: float | None = None,
     ) -> None:
         """Initialize the worker and bring its whole subtree to READY.
 
@@ -7740,6 +7995,15 @@ class Worker:
         ``run`` / ``create_buffer`` / the remote register/memory APIs never
         trigger startup.
 
+        An L2 worker constructed with ``execution_mode="kernel"`` opens no
+        device: it binds the runtime as a kernel-mode context on a device the
+        caller already holds. The calling thread must already have
+        ``device_id`` current (init checks it and never sets it), and that
+        thread is the one that calls ``close()``. Nothing is prewarmed, no
+        registration is replayed, and no SDMA workspace is provisioned. A
+        runtime without kernel mode fails init, which rolls back to FAILED like
+        any other startup failure.
+
         Args:
             prewarm_config: Optional CallConfig. When given, its ring sizing
                 (``runtime_env.ring_task_window`` / ``ring_heap`` /
@@ -7748,14 +8012,37 @@ class Worker:
                 An L2 worker prewarms here; an L3+ worker prewarms each chip child
                 during hierarchy startup, before it publishes INIT_READY. A no-op
                 for runtimes without a prebuilt arena (host_build_graph). ``None``
-                (default) disables prewarm.
+                (default) disables prewarm. Program mode only.
+            config: The context-static CallConfig a kernel-mode context binds,
+                validated before startup. Required with
+                ``execution_mode="kernel"`` and refused in program mode. It is
+                keyword-only, so a positional CallConfig binds to
+                ``prewarm_config``.
             _startup_deadline: Internal. Absolute ``time.monotonic()`` deadline
                 inherited from a parent's startup epoch so a recursive descendant
                 consumes the parent's remaining budget instead of restarting the
                 timeout. ``None`` starts a fresh epoch.
         """
-        if prewarm_config is not None:
-            prewarm_config.validate()
+        if self._execution_mode == "kernel":
+            if config is None:
+                raise ValueError(
+                    "Worker.init(): execution_mode='kernel' requires config=CallConfig(...) "
+                    "(a positional argument binds to prewarm_config)"
+                )
+            if prewarm_config is not None:
+                raise ValueError(
+                    "Worker.init(): execution_mode='kernel' takes no prewarm_config; pass the context-static "
+                    "CallConfig as config="
+                )
+            config.validate()
+        else:
+            if config is not None:
+                raise ValueError(
+                    "Worker.init(): config= is only accepted with execution_mode='kernel'; "
+                    "program mode takes prewarm_config"
+                )
+            if prewarm_config is not None:
+                prewarm_config.validate()
         # Claim the startup epoch atomically: NEW -> INITIALIZING under the
         # lifecycle lock so a concurrent init / register / close observes one
         # linear transition and never a half-built Worker. Every level claims the
@@ -7783,6 +8070,7 @@ class Worker:
             # this lock).
             self._validate_eligible_targets()
             self._prewarm_config = prewarm_config
+            self._kernel_config = config
             self._startup_error = None
             self._init_owner_thread = threading.current_thread()
             self._cancel_token = False
@@ -7870,6 +8158,17 @@ class Worker:
 
         builder = RuntimeBuilder(platform)
         binaries = builder.get_binaries(runtime)
+
+        if self._execution_mode == "kernel":
+            kernel_config = self._kernel_config
+            assert kernel_config is not None
+            # Assigned before kernel_init so a raising kernel_init still leaves rollback's
+            # _finalize_chip a ChipWorker to finalize.
+            self._chip_worker = ChipWorker()
+            self._chip_worker.kernel_init(device_id, binaries, kernel_config)
+            self._kernel_pid = os.getpid()
+            self._arm_kernel_chip_pin()
+            return
 
         self._chip_worker = ChipWorker()
         # The prebuilt runtime-arena is prewarmed inside cw.init for the declared
@@ -10616,6 +10915,7 @@ class Worker:
         allocates child device memory with ``alloc_child_tensor(worker_id, ...)`` instead — a Worker is
         the only allocator, the Orchestrator never allocates.
         """
+        self._require_execution_mode("malloc", "program")
         if self.level != 2:
             raise TypeError("worker.malloc is L2-only; at L3+ use worker.alloc_child_tensor(worker_id, ...)")
         with self._operation_lease("malloc"):
@@ -10677,6 +10977,7 @@ class Worker:
 
         The operation lease is re-entrant, so an in-run ``orch.free`` that delegates here nests safely.
         """
+        self._require_execution_mode("free", "program")
         if self.level != 2 and not self._chip_shms:
             self._check_chip_worker_id(0)
         # Lock selection comes from the private registration snapshot. A caller may mutate the
@@ -10727,7 +11028,10 @@ class Worker:
         Level 2 queries the in-process chip worker. Level 3 routes by logical
         *worker_id* to the matching forked chip child. Simulator backends do
         not synthesize device-wide memory and raise ``NotImplementedError``.
+        A kernel-mode Worker raises ``RuntimeError``: the native query refuses a
+        kernel-mode context.
         """
+        self._require_execution_mode("device_memory_info", "program")
         worker_id = int(worker_id)
         with self._operation_lease("device_memory_info"):
             if self.level == 2:
@@ -10825,6 +11129,7 @@ class Worker:
         allocation ``dst`` already names; there is no way to name a sub-range with a handle built at
         an interior address, because such a handle names no allocation at all.
         """
+        self._require_execution_mode("copy_to", "program")
         host, src_addr, host_nbytes = self._host_side_of_copy(src, writing=False, api="copy_to")
         dst_offset, src_offset, nbytes = self._copy_extent(
             host_nbytes, dst_offset, src_offset, nbytes, host_side="src", api="copy_to"
@@ -10885,6 +11190,7 @@ class Worker:
         ``nbytes`` defaults to the rest of the host side after ``dst_offset``, so a plain
         ``copy_from(dst, src)`` still transfers a whole host backing's worth.
         """
+        self._require_execution_mode("copy_from", "program")
         host, dst_addr, host_nbytes = self._host_side_of_copy(dst, writing=True, api="copy_from")
         src_offset, dst_offset, nbytes = self._copy_extent(
             host_nbytes, src_offset, dst_offset, nbytes, host_side="dst", api="copy_from"
@@ -10948,6 +11254,7 @@ class Worker:
         tensor in-process on ``run``. Build a tensor over ``buffer.shm.buf`` with the buffer protocol.
         Not thread-safe against a concurrent run/create/free on the same Worker.
         """
+        self._require_execution_mode("create_buffer", "program")
         if self.level < 2:
             raise TypeError("create_buffer requires a level >= 2 Worker")
         with self._operation_lease("create_buffer"):
@@ -10993,6 +11300,7 @@ class Worker:
         it; the ``byte_offset`` this computes is what then separates two views that do not intersect.
         At L2 (no fork) any host tensor works. ``dtype`` is the ``DataType`` int value.
         """
+        self._require_execution_mode("make_tensor_arg", "program")
         untyped_storage = getattr(tensor, "untyped_storage", None)
         if callable(untyped_storage):
             st = untyped_storage()
@@ -11125,6 +11433,7 @@ class Worker:
         The slot is dropped only when it still holds *this* buffer: a buffer_id minted elsewhere can
         collide with a registry key, and evicting the live entry it names would strand that
         backing."""
+        self._require_execution_mode("release_buffer", "program")
         if not buffer.closed:
             # Exclusive, not shared: `shared()` would already exclude admission and so
             # satisfy the "never mid-callback" argument above, but this keeps the
@@ -11204,7 +11513,10 @@ class Worker:
         caller whose first run only completes because a later callback runs
         would deadlock on a depth-one backend. Completion and cleanup stay
         attached to each handle.
+
+        Program mode only; a kernel-mode Worker launches through ``kernel_launch``.
         """
+        self._require_execution_mode("submit", "program")
         try:
             with self._operation_lease("submit"):
                 result = self._submit_locked(callable, args, config)
@@ -11224,6 +11536,7 @@ class Worker:
         with ``simpler_setup.tools.strace_timing`` (see
         ``docs/dfx/host-trace.md``).
         """
+        self._require_execution_mode("run", "program")
         self.submit(callable, args=args, config=config).wait()
 
     def _submit_locked(self, callable, args, config) -> RunHandle:
@@ -11891,6 +12204,14 @@ class Worker:
           each resource until its native free succeeds and preserves the child
           pid/mailbox pair until ``waitpid`` proves the child is gone.
         - Native teardown runs on the ``init()``-owner thread, being device-bound.
+        - With ``execution_mode="kernel"`` it releases only the context: it never
+          synchronizes the caller's stream, resets the device or finalizes ACL.
+          It raises ``TimeoutError`` when a prepare or launch keeps the kernel
+          gate past the rollback grace period and ``RuntimeError`` when native
+          teardown fails; both keep the context for a later ``close()``. A
+          process other than the one that called ``init()`` is refused. An
+          unclosed kernel Worker leaks its context with a ``ResourceWarning``
+          instead of holding the device through a finalize.
         """
         # close() is a permanent commitment against a resource, not a reversible
         # attempt: it publishes CLOSED atomically (the sole public admission
@@ -12372,31 +12693,55 @@ class Worker:
 
             def _finalize_chip() -> None:
                 if self._chip_worker:
-                    # Close the lane before finalizing the worker: a handle the
-                    # caller never waited on still owns device work, and the
-                    # lane drains it here while the device is still up.
-                    #
-                    # The lane rethrows its poison on close. Whether that is
-                    # news depends on who has already seen it: waiting on a
-                    # handle delivers the run's error and retires its entry, so
-                    # a remaining entry is a run whose failure nobody has been
-                    # told about, and only then is close the first report. With
-                    # every run waited, the poison is the error those waits
-                    # already raised, and re-raising it here would turn a
-                    # handled run failure into an unhandled close failure.
-                    impl = getattr(self._chip_worker, "_impl", None)
-                    if impl is not None:
-                        undelivered = bool(self._chip_runs)
-                        try:
-                            impl._close_chip_run_lane()
-                        except Exception:
-                            if undelivered:
-                                raise
-                    with self._registry_lock:
-                        self._chip_runs.clear()
-                        self._chip_run_touched_identities.clear()
-                    self._chip_worker.finalize()
-                    self._chip_worker = None
+                    kernel = self._execution_mode == "kernel"
+                    if kernel:
+                        self._require_kernel_process("close")
+                        # Prepare and launch each hold the gate across one native call.
+                        if not self._kernel_gate.acquire(timeout=_ROLLBACK_GRACEFUL_TIMEOUT_S):
+                            raise TimeoutError(
+                                "Worker.close(): a kernel prepare/launch still holds the kernel gate after "
+                                f"{_ROLLBACK_GRACEFUL_TIMEOUT_S}s; the context is kept, close() again"
+                            )
+                    try:
+                        # Close the lane before finalizing the worker: a handle the
+                        # caller never waited on still owns device work, and the
+                        # lane drains it here while the device is still up.
+                        #
+                        # The lane rethrows its poison on close. Whether that is
+                        # news depends on who has already seen it: waiting on a
+                        # handle delivers the run's error and retires its entry, so
+                        # a remaining entry is a run whose failure nobody has been
+                        # told about, and only then is close the first report. With
+                        # every run waited, the poison is the error those waits
+                        # already raised, and re-raising it here would turn a
+                        # handled run failure into an unhandled close failure.
+                        impl = getattr(self._chip_worker, "_impl", None)
+                        if impl is not None:
+                            undelivered = bool(self._chip_runs)
+                            try:
+                                impl._close_chip_run_lane()
+                            except Exception:
+                                if undelivered:
+                                    raise
+                        with self._registry_lock:
+                            self._chip_runs.clear()
+                            self._chip_run_touched_identities.clear()
+                        self._chip_worker.finalize()
+                        # ChipWorker.finalize returns without raising when the native device teardown
+                        # fails, and the native worker then stays initialized. Raising keeps this
+                        # journal entry, the ChipWorker, its prepared images and the GC pin for a
+                        # later close().
+                        if kernel and impl is not None and bool(getattr(impl, "initialized", False)):
+                            raise RuntimeError(
+                                "kernel context teardown failed; the context is kept, close() again after quiescence"
+                            )
+                        self._chip_worker = None
+                        if kernel:
+                            self._kernel_callables.clear()
+                            self._disarm_kernel_chip_pin()
+                    finally:
+                        if kernel:
+                            self._kernel_gate.release()
 
             self._cleanup_journal.add_once("native", "ChipWorker", _finalize_chip)
             journal_err = self._cleanup_journal.drive({("native", "ChipWorker")})

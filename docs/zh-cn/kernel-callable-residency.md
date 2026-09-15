@@ -41,7 +41,7 @@ context-local `int32_t`，失败写 `-1`。当前上限为 8192。
 int32_t callable_id = -1;
 int rc = simpler_kernel_mode_prepare_callable(ctx, callable, size, &callable_id);
 if (rc != 0) return rc;
-// 在 capture 之外完成 caller 的 warmup 并同步，检查异步准备结果。
+// prepare 已同步 context 自己的 AICPU stream，rc 即注册结果；以下是调用者为 capture 做的 warmup 和同步。
 rc = caller_warmup_and_synchronize(caller_stream); // 调用者自己的逻辑
 if (rc != 0) return rc;
 return simpler_kernel_mode_launch(ctx, callable_id, args, caller_stream);

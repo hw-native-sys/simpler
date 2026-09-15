@@ -8,11 +8,14 @@
 # -----------------------------------------------------------------------------------------------------------
 """Tests for CallConfig and ChipWorker state machine."""
 
+import ctypes
 import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
+import types
 from pathlib import Path
 
 import pytest
@@ -240,15 +243,20 @@ def kernel_symbol_runtime(tmp_path_factory):
             "#include <cstdlib>\n"
             "#include <unordered_set>\n"
             "static int live_contexts = 0;\n"
+            "static int created_contexts = 0;\n"
             "struct ContextLeakCheck {\n"
             "    ~ContextLeakCheck() { if (live_contexts != 0) std::abort(); }\n"
             "};\n"
             "static ContextLeakCheck context_leak_check;\n"
+            # A caller that holds the DSO open reads context lifetime through these two.
+            'extern "C" int fake_live_contexts() { return live_contexts; }\n'
+            'extern "C" int fake_created_contexts() { return created_contexts; }\n'
             "struct SimplerHostLogState;\n"
             'extern "C" int simpler_host_log_bind_state(SimplerHostLogState *) { return 0; }\n'
             "static std::unordered_set<void *> live_handles;\n"
             "DeviceContextHandle create_device_context() {\n"
-            "    ++live_contexts; auto *ctx = new uint64_t{0}; live_handles.insert(ctx); return ctx;\n"
+            "    ++live_contexts; ++created_contexts; auto *ctx = new uint64_t{0};\n"
+            "    live_handles.insert(ctx); return ctx;\n"
             "}\n"
             "void destroy_device_context(DeviceContextHandle ctx) {\n"
             "    --live_contexts; live_handles.erase(ctx); delete static_cast<uint64_t *>(ctx);\n"
@@ -613,6 +621,92 @@ class TestChipWorkerKernelEntryLayer:
         worker.init(str(runtime), os.devnull, os.devnull, "", device_id=0)
         worker.finalize()
         assert not worker.initialized
+
+
+class TestChipWorkerKernelProbe:
+    @staticmethod
+    def _context_counters(runtime):
+        # ctypes never dlcloses, so the counters outlive the probe's own handle on the DSO.
+        library = ctypes.CDLL(str(runtime))
+        return library.fake_live_contexts, library.fake_created_contexts
+
+    @pytest.mark.parametrize(("supported", "expected"), ((0, False), (1, True)))
+    def test_probe_reports_runtime_capability(self, kernel_symbol_runtime, supported, expected):
+        runtime = kernel_symbol_runtime(supported=supported)
+        assert _ChipWorker.probe_kernel_mode_supported(str(runtime), "") is expected
+
+    @pytest.mark.parametrize("supported", (0, 1))
+    def test_probe_destroys_the_context_it_created(self, kernel_symbol_runtime, supported):
+        runtime = kernel_symbol_runtime(supported=supported)
+        live, created = self._context_counters(runtime)
+        created_before = created()
+
+        _ChipWorker.probe_kernel_mode_supported(str(runtime), "")
+
+        assert created() == created_before + 1
+        assert live() == 0
+
+    def test_probe_missing_capability_symbol_raises_before_creating_a_context(self, kernel_symbol_runtime):
+        runtime = kernel_symbol_runtime(supported=1, missing=("simpler_kernel_mode_supported",))
+        live, created = self._context_counters(runtime)
+        created_before = created()
+
+        with pytest.raises(RuntimeError, match="dlsym failed for 'simpler_kernel_mode_supported'"):
+            _ChipWorker.probe_kernel_mode_supported(str(runtime), "")
+
+        assert created() == created_before
+        assert live() == 0
+
+    def test_probe_nonexistent_library_raises(self):
+        with pytest.raises(RuntimeError, match="dlopen failed"):
+            _ChipWorker.probe_kernel_mode_supported("/nonexistent/libfoo.so", "")
+
+    def test_probe_in_fresh_process_needs_no_init(self, kernel_symbol_runtime):
+        runtime = kernel_symbol_runtime(supported=1)
+        # The fake DSO aborts when unloaded with a context still live, and the
+        # probe unloads it before returning, so a leaked context kills this subprocess.
+        code = (
+            "import sys, types\n"
+            "from simpler.task_interface import ChipWorker\n"
+            "bins = types.SimpleNamespace(host_path=sys.argv[1], sim_context_path=None)\n"
+            "print(ChipWorker.probe_kernel_mode_supported(bins))\n"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", code, str(runtime)], capture_output=True, text=True, check=False, timeout=120
+        )
+        assert completed.returncode == 0, f"{completed.stdout!r} {completed.stderr!r}"
+        assert completed.stdout.strip().splitlines()[-1] == "True", f"{completed.stdout!r} {completed.stderr!r}"
+
+    def test_public_wrapper_maps_bins_to_the_native_probe(self, monkeypatch):
+        import simpler.task_interface as task_interface_mod  # noqa: PLC0415
+        from simpler.task_interface import ChipWorker  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
+
+        probes = []
+        seeded_levels = []
+
+        class FakeNative:
+            answers = [1, 0]
+
+            @staticmethod
+            def probe_kernel_mode_supported(host_lib_path, sim_context_path):
+                probes.append((host_lib_path, sim_context_path))
+                return FakeNative.answers[len(probes) - 1]
+
+        monkeypatch.setattr(task_interface_mod, "_ChipWorker", FakeNative)
+        monkeypatch.setattr(task_interface_mod, "_initialize_host_log", seeded_levels.append)
+
+        onboard = types.SimpleNamespace(host_path=Path("/rt/libhost_runtime.so"), sim_context_path=None)
+        sim = types.SimpleNamespace(
+            host_path=Path("/rt/libhost_runtime.so"), sim_context_path=Path("/rt/libcpu_sim_context.so")
+        )
+
+        assert ChipWorker.probe_kernel_mode_supported(onboard, log_level=20) is True
+        assert ChipWorker.probe_kernel_mode_supported(sim) is False
+        assert probes == [
+            ("/rt/libhost_runtime.so", ""),
+            ("/rt/libhost_runtime.so", "/rt/libcpu_sim_context.so"),
+        ]
+        assert seeded_levels == [20, None]
 
 
 class TestChipWorkerStateMachine:

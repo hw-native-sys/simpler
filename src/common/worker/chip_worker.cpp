@@ -455,6 +455,38 @@ uint64_t ChipWorker::next_kernel_context_generation() {
     return counter.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
+bool ChipWorker::probe_kernel_mode_supported(const std::string &host_lib_path, const std::string &sim_context_path) {
+    if (!sim_context_path.empty()) {
+        load_sim_context(sim_context_path);
+    }
+
+    dlerror();
+    void *handle = dlopen(host_lib_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!handle) {
+        std::string err = "dlopen failed: ";
+        const char *msg = dlerror();
+        err += msg ? msg : "unknown error";
+        throw std::runtime_error(err);
+    }
+    DlHandleGuard host_guard(handle);
+    bind_host_log_state(handle, "host runtime");
+
+    const auto create_device_context_fn = load_symbol<CreateDeviceContextFn>(handle, "create_device_context");
+    const auto destroy_device_context_fn = load_symbol<DestroyDeviceContextFn>(handle, "destroy_device_context");
+    const auto kernel_supported_fn = load_symbol<KernelSupportedFn>(handle, "simpler_kernel_mode_supported");
+
+    void *ctx = create_device_context_fn();
+    if (ctx == nullptr) {
+        throw std::runtime_error("create_device_context returned null");
+    }
+    // simpler_kernel_mode_supported is a C entry and cannot throw, so nothing
+    // between create and destroy skips the destroy, and destroy runs before the
+    // guard unloads the library that implements it.
+    const int supported = kernel_supported_fn(ctx);
+    destroy_device_context_fn(ctx);
+    return supported != 0;
+}
+
 void ChipWorker::kernel_init(
     const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
     const std::string &dispatcher_path, int device_id, const CallConfig &config, uint64_t context_generation,

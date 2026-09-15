@@ -163,6 +163,19 @@ public:
     /// counter starts at one.
     static uint64_t next_kernel_context_generation();
 
+    /// Whether the host runtime at `host_lib_path` can execute kernel-mode
+    /// launches, answered without a worker. Retains the sim context first when
+    /// `sim_context_path` is non-empty (the same process-wide registry init()
+    /// uses), loads the runtime, asks simpler_kernel_mode_supported on a fresh
+    /// device context, destroys that context, and releases its runtime handle.
+    ///
+    /// The C ABI requires simpler_kernel_mode_supported to answer from the
+    /// runtime build alone on a context no init has touched, so this takes no
+    /// device, attaches no thread, and is independent of init() and
+    /// kernel_init() on any worker — usable before either. Throws when the
+    /// runtime cannot be loaded, lacks a required symbol, or yields no context.
+    static bool probe_kernel_mode_supported(const std::string &host_lib_path, const std::string &sim_context_path);
+
     /// Tear down everything: device resources and runtime library. The worker
     /// cannot be initialized again afterwards. When a kernel context's device
     /// teardown fails, this throws ChipWorkerError and keeps the context and the
