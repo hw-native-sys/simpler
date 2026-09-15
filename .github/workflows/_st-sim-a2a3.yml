@@ -135,12 +135,23 @@ jobs:
             --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
             --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" --enable-pmu 2
 
-      - name: args_dump smoke (a2a3)
+      # One args-dump mode per lane. The three modes are two independent
+      # choices — which tasks reach the manifest, and which of those write
+      # payload — so no one of them covers the others' code paths: only
+      # `partial` filters by the Arg::dump() masks, only `hybrid` suppresses
+      # payload for unmarked args and opens args.bin lazily, and only `full`
+      # ignores the masks entirely. Running the same mode everywhere would
+      # leave two of those three paths untested; running all three in every
+      # lane would be redundant, because the writer is shared
+      # (src/common/platform/shared/{host,aicpu}/args_dump*). a5sim takes
+      # `hybrid` and onboard takes `full`.
+      - name: args_dump smoke (a2a3, partial)
         if: inputs.include_dfx_smokes
         run: |
           .venv/bin/python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py \
             --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
-            --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" --dump-args
+            --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" \
+            --dump-args partial
 
       - name: scope_stats smoke (a2a3)
         if: inputs.include_dfx_smokes

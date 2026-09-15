@@ -135,9 +135,16 @@ runs:
           "tests/st/$platform/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py" \
           --enable-pmu 2
 
-        start_job "args_dump" \
+        # Mode "full" here; see the mode-per-lane rationale in _st-sim-a2a3.yml.
+        # This action runs for both a2a3 and a5 onboard, so full -- the only
+        # mode that ignores the Arg::dump() masks and writes payload for every
+        # arg -- is the one that gets hardware coverage on both architectures.
+        # The sim lanes take partial and hybrid.
+        # No backticks in this comment: the heredoc above is quoted today, but
+        # they would become command substitution if it were ever unquoted.
+        start_job "args_dump (full)" \
           "tests/st/$platform/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py" \
-          --dump-args
+          --dump-args full
 
         if [[ "$platform" == "a2a3" ]]; then
           start_job "dep_gen (host_build_graph)" \
