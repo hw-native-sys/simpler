@@ -135,11 +135,15 @@ Any ordinary human-readable record whose formatted envelope and body exceed
 record to one atomic pipe write when several forked processes share captured
 stderr; callers that need a large payload must split it into separate records.
 
-One background writer drains the queue. When `CallConfig.output_prefix` is
-present it appends every C++ host-log record to the process-private
-`host.<pid>.log`; otherwise it writes to stderr. The bound directory is the
-destination, not a preference: a record it cannot take is counted as a drop
-rather than relocated, so a run's log is never split across two places.
+One background writer drains the queue. A non-empty
+`CallConfig.output_prefix` lazily enables file logging, but the cumulative log
+is not stored in that capture: the process tree binds once to
+`${TMPDIR:-/tmp}/simpler-host-logs-<root-pid>-<uuid>/`, and each process appends
+to its own `host.<pid>.log`. The root process removes this transient spool at
+normal interpreter exit. Without an output prefix the writer uses stderr. The
+bound directory is the destination, not a preference: a record it cannot take
+is counted as a drop rather than relocated, so a run's log is never split
+across two places.
 Severity and span depth no longer choose synchronous producer-side flush paths.
 Explicit lifecycle drains wait boundedly for records already accepted by the
 process.
@@ -206,7 +210,8 @@ interposition while still giving loaders one stable binding entry point.
 coordinate one successful `[CLOCK_ANCHOR]` per process. A negative PID is a
 temporary writer claim; a failed output releases the claim so the next record
 can retry. The first non-empty `log_directory` binding wins, so every bound DSO
-in the process chooses the same output without moving a file already in use.
+in the process chooses the same process-session spool without tying its lifetime
+to any one capture directory.
 
 The owner publishes a C callback and opaque context in the same state. A private
 logger in any bound DSO can therefore submit to the one process queue without
@@ -224,7 +229,10 @@ exposes the drop counter to diagnostics and tests, while
 `_host_log_pending_records()` distinguishes accepted work still waiting for the
 writer. Python and C++ flush defaults are both 1000 ms. Teardown and `os._exit()`
 paths report a timeout with both counters instead of silently abandoning the
-accepted backlog.
+accepted backlog. Bound runtime DSOs can also flush the current process writer
+using the shared counters. A successful flush means the accepted queue was drained;
+write failures are counted separately as drops, and flush does not call `fsync`.
+It does not drain another process's writer.
 
 ### Attributing a drop, and saying so in the log
 
@@ -263,8 +271,8 @@ _initialize_host_log(level, defer_writer=is_hierarchical)
 _start_host_log_writer()
 self._impl.init(host_path, aicpu_path, aicore_path, dispatcher_path,
                 device_id, prewarm_config, enable_sdma, sim_context_path)
-# At submit, after CallConfig is available:
-_set_host_log_directory(config.output_prefix)
+# At the first submit carrying an output prefix:
+_bind_host_log_session_directory()
 ```
 
 `ChipWorker::init` then performs the module-specific work:

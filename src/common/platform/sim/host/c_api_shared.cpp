@@ -45,6 +45,7 @@
 
 #include "common/device_phase.h"
 #include "common/strace.h"
+#include "host/host_clock_alignment_log.h"
 #include "common/unified_log.h"
 #include "cpu_sim_context.h"
 #include "host/raii_scope_guard.h"
@@ -804,6 +805,7 @@ int simpler_prepare_run(
         state->runner_claimed = true;
         state->trace_inv = trace_inv;
         state->trace_start_ns = trace_start_ns;
+        if (config->enable_chip_swimlane >= 3) state->clock_log_offset = host_clock_alignment_log_offset();
         STRACE_CONTEXT(state->trace_inv, state->trace_hid, 1);
 
         int rc = runner->attach_current_thread(runner->device_id());
@@ -951,6 +953,8 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     const uint64_t trace_inv = state->trace_inv;
     const uint64_t trace_hid = state->trace_hid;
     const long long trace_start_ns = state->trace_start_ns;
+    const uint64_t clock_log_offset = state->clock_log_offset;
+    const std::string output_prefix = state->config.output_prefix;
 
     STRACE_CONTEXT(state->trace_inv, state->trace_hid, 1);
 
@@ -1019,12 +1023,17 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     // Correlation state is runner-wide. Finish it before releasing the claim,
     // after which a successor may begin capture and replace the provider/session.
     state->runner->finish_clock_correlation_session(state->descriptor.pipeline_slot, false);
+    const bool export_clock_log = launched && execution_rc == 0 && validation_rc == 0 &&
+                                  state->runner->host_clock_alignment_log_required(state->descriptor.pipeline_slot);
     if (state->runner_claimed) {
         state->runner->release_native_run(state);
         state->runner_claimed = false;
     }
     destroy_native_run_context(state);
     emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns);
+    if (export_clock_log && !export_host_clock_alignment_log(output_prefix, trace_inv, clock_log_offset)) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
     if (validation_rc != 0) return validation_rc;
     return launched ? execution_rc : 0;
 }

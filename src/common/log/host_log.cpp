@@ -712,8 +712,21 @@ bool HostLogger::flush(uint32_t timeout_ms) {
         return true;
     }
     auto *sink = static_cast<HostLogAsyncSink *>(sink_.load(std::memory_order_acquire));
-    if (sink == nullptr || sink->state != shared || sink->pid != getpid()) return false;
-    return sink->wait_until_empty(timeout_ms);
+    if (sink != nullptr && sink->state == shared && sink->pid == getpid()) return sink->wait_until_empty(timeout_ms);
+
+    // A bound runtime DSO borrows the process writer. Shared counters reach zero
+    // after accepted records are processed; write failures count as drops.
+    // No owner-local sink pointer is needed.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    do {
+        if (atomic_load_i32(&shared->sink_owner_pid) != getpid() ||
+            atomic_load_i32(&shared->sink_process_pid) != getpid())
+            return false;
+        if ((atomic_load_u64(&shared->sink_producer_state) & ~kProducerStopFlag) == 0 &&
+            atomic_load_u64(&shared->pending_record_count) == 0)
+            return true;
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
 }
 
 uint64_t HostLogger::dropped_records() const { return atomic_load_u64(&state()->dropped_record_count); }

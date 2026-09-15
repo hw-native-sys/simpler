@@ -4,8 +4,8 @@
 
 Profiling data (`chip_swimlane_records.json`) identifies tasks by numeric IDs
 (e.g., `func_id: 0`).  Without a mapping, swimlane visualizations show
-opaque labels like `func_0_a(t0)` instead of human-readable names like
-`QK(t0)`.
+opaque labels like `func_0_a(r0t0)` instead of human-readable names like
+`QK(r0t0)`.
 
 ## Design Principle: Each Level Owns Its Own Mapping
 
@@ -137,8 +137,8 @@ When `--enable-chip-swimlane` is used, SceneTest automatically:
 
 No manual steps are needed.  If no `"name"` fields are defined, no
 mapping file is written and the tools fall back to default labels:
-`func_<id>(rXtY)` when a `deps.json` resolved the `func_id`, or
-`task(rXtY)` when none is available (the host emits `func_id = -1`,
+`func_<id>(<task-id>)` when a `deps.json` resolved the `func_id`, or
+`task(<task-id>)` when none is available (the host emits `func_id = -1`,
 so without `deps.json` tasks cannot be told apart by function — see
 [dfx/chip-swimlane-profiling.md §3.5](chip-swimlane-profiling.md#35-dependency-arrows-from-dep_gen)).
 

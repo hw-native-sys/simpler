@@ -222,6 +222,60 @@ def _write_l3_rank(root, rank, *, host_shift_ns, task_id, clock_domain="same-boo
     return rank_dir
 
 
+def _write_hbg_l3_rank(root, rank, *, host_shift_ns, task_id, clock_domain="same-boot", dispatch="d0"):
+    capture_dir = _write_l3_rank(
+        root,
+        rank,
+        host_shift_ns=host_shift_ns,
+        task_id=task_id,
+        clock_domain=clock_domain,
+        dispatch=dispatch,
+    )
+    records_path = capture_dir / "chip_swimlane_records.json"
+    records = json.loads(records_path.read_text())
+    records["metadata"]["runtime"] = sc.HBG_RUNTIME
+    records["scheduler_tasks"] = {
+        "producer": "aicore",
+        "records": records.pop("aicpu_tasks"),
+    }
+    phase = records.pop("aicpu_scheduler_phases")[0][0]
+    records["scheduler_records"] = {
+        "streams": [
+            {
+                "platform": "a5",
+                "producer": "aicore",
+                "scheduler_id": rank,
+                "worker_id": rank,
+                "core_type": "aiv",
+                "physical_core_id": rank,
+                "capture": {"committed": 1, "dropped": 0, "truncated": False},
+                "records": [
+                    {
+                        "start_cycles": phase["start_cycles"],
+                        "end_cycles": phase["end_cycles"],
+                        "loop_iter": 0,
+                        "kind": "dispatch",
+                        "tasks_processed": 1,
+                        "task_id": task_id,
+                    }
+                ],
+                "metrics": [],
+            }
+        ]
+    }
+    records_path.write_text(json.dumps(records))
+
+    pid = 1000 + rank
+    compact_log = capture_dir / f"host_clock_alignment.{pid}.log"
+    (root / f"host.{pid}.log").rename(compact_log)
+    with compact_log.open("a") as stream:
+        stream.write(
+            f"[STRACE] v=1 pid={pid} tid={pid} inv=1 hid=abc depth=0 "
+            f"name=chip.run ts={host_shift_ns + 1_000} dur=8000\n"
+        )
+    return capture_dir
+
+
 def _write_dispatch_identity(capture_dir, *, run_id, task_slot, group_index, group_size):
     rank = int(capture_dir.parent.name.removeprefix("rank"))
     capture_index = int(capture_dir.name.removeprefix("d"))
@@ -258,6 +312,7 @@ def test_l3_directory_merge_uses_common_host_origin_and_rank_namespaces(tmp_path
     trace = json.loads(output.read_text())
     # The axis starts at the earliest window any Rank can have begun in, and
     # each Rank is drawn at the earliest position its own window allows.
+    assert trace["metadata"]["runtime"] == sc.TMR_RUNTIME
     assert trace["metadata"]["global_origin_ns"] == 1_000
     assert trace["metadata"]["host_clock_domain_id"] == "same-boot"
     assert trace["metadata"]["layout"] == "containment_spliced_multi_rank"
@@ -294,6 +349,84 @@ def test_l3_directory_merge_uses_common_host_origin_and_rank_namespaces(tmp_path
         for event in trace["traceEvents"]
         if event.get("ph") == "X" and event["pid"] >= sc._RANK_PID_STRIDE
     } == {6_000}
+
+
+def test_l3_directory_merge_persists_hbg_alignment(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    capture_dir = _write_hbg_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    output = tmp_path / "l3.json"
+    args = sc._build_parser().parse_args([str(root), "--dispatch", "d0", "-o", str(output)])
+
+    sc._generate_l3_trace(args, root)
+
+    trace = json.loads(output.read_text())
+    assert trace["metadata"]["runtime"] == sc.HBG_RUNTIME
+    raw = json.loads((capture_dir / "chip_swimlane_records.json").read_text())
+    alignment = raw["metadata"]["clock_alignment"]
+    assert alignment["status"] == "bounded"
+    decoded = sc.read_perf_data(
+        capture_dir / "chip_swimlane_records.json",
+        timeline_origin_ns=trace["metadata"]["global_origin_ns"],
+    )
+    worker = next(
+        event
+        for event in trace["traceEvents"]
+        if event.get("ph") == "X" and event.get("cat") == "event" and event.get("pid") == 104
+    )
+    assert worker["ts"] == decoded["tasks"][0]["receive_time_us"]
+
+
+def test_l3_directory_merge_uses_new_alignment_when_writeback_fails(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "dfx_outputs"
+    capture_dir = _write_hbg_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    records_path = capture_dir / "chip_swimlane_records.json"
+    raw = json.loads(records_path.read_text())
+    old_alignment = {
+        "status": "bounded",
+        "device_anchor_cycles": 900,
+        "host_anchor_ns": 90_000,
+        "host_anchor_min_ns": 90_000,
+        "host_anchor_max_ns": 90_100,
+    }
+    raw["metadata"]["clock_alignment"] = old_alignment
+    records_path.write_text(json.dumps(raw))
+
+    rank_traces = []
+    generate_trace = sc.generate_chrome_trace_json
+
+    def record_rank_trace(*args, **kwargs):
+        trace = generate_trace(*args, **kwargs)
+        rank_traces.append(trace)
+        return trace
+
+    def fail_writeback(_source, _destination):
+        raise OSError("read-only capture")
+
+    monkeypatch.setattr(sc, "generate_chrome_trace_json", record_rank_trace)
+    monkeypatch.setattr(sc.os, "replace", fail_writeback)
+    output = tmp_path / "l3.json"
+    args = sc._build_parser().parse_args([str(root), "--dispatch", "d0", "-o", str(output)])
+
+    sc._generate_l3_trace(args, root)
+
+    assert "could not save clock alignment: read-only capture" in capsys.readouterr().err
+    assert json.loads(records_path.read_text())["metadata"]["clock_alignment"] == old_alignment
+    new_alignment = rank_traces[0]["metadata"]["clock_alignment"]
+    assert new_alignment["status"] == "bounded"
+    assert new_alignment != old_alignment
+
+    merged = json.loads(output.read_text())
+    worker = next(
+        event
+        for event in merged["traceEvents"]
+        if event.get("ph") == "X" and event.get("cat") == "event" and event.get("args", {}).get("taskId") == 7
+    )
+    receive_cycles = raw["aicore_tasks"][0][3] - raw["aicore_tasks"][0][5]
+    mapped_ns = new_alignment["host_anchor_ns"] + (
+        (receive_cycles - new_alignment["device_anchor_cycles"]) * 1_000_000_000 / raw["metadata"]["clock_freq_hz"]
+    )
+    expected_ts = (mapped_ns - merged["metadata"]["global_origin_ns"]) / 1000
+    assert worker["ts"] == pytest.approx(expected_ts, abs=0.001)
 
 
 def test_l3_directory_merge_groups_the_two_clock_domains_into_blocks(tmp_path):
@@ -386,7 +519,7 @@ def test_l3_directory_merge_leaves_the_standalone_host_swimlane_alone(tmp_path):
 def test_l3_directory_merge_keeps_scheduler_streams_and_lifecycle_records(tmp_path):
     root = tmp_path / "dfx_outputs"
     for rank in (0, 1):
-        capture_dir = _write_l3_rank(root, rank, host_shift_ns=rank * 10_000, task_id=rank + 7)
+        capture_dir = _write_hbg_l3_rank(root, rank, host_shift_ns=rank * 10_000, task_id=rank + 7)
         records_path = capture_dir / "chip_swimlane_records.json"
         records = json.loads(records_path.read_text())
         device_base = records["aicore_tasks"][0][3] - 1_000
@@ -394,7 +527,6 @@ def test_l3_directory_merge_keeps_scheduler_streams_and_lifecycle_records(tmp_pa
             "streams": [
                 {
                     "platform": "a5",
-                    "runtime": "host_build_graph",
                     "producer": "aicore",
                     "scheduler_id": rank + 2,
                     "worker_id": rank + 4,
@@ -425,7 +557,21 @@ def test_l3_directory_merge_keeps_scheduler_streams_and_lifecycle_records(tmp_pa
         records_path.write_text(json.dumps(records))
 
     output = tmp_path / "l3.json"
-    args = sc._build_parser().parse_args([str(root), "--dispatch", "d0", "-o", str(output)])
+    # AICore streams do not identify the logged AICPU sched window.
+    # Pin the processes for these otherwise indistinguishable captures.
+    args = sc._build_parser().parse_args(
+        [
+            str(root),
+            "--dispatch",
+            "d0",
+            "-o",
+            str(output),
+            "--rank-pid",
+            "0=1000:1",
+            "--rank-pid",
+            "1=1001:1",
+        ]
+    )
 
     sc._generate_l3_trace(args, root)
 
@@ -594,7 +740,9 @@ def test_l3_directory_merge_needs_a_host_log_to_place_ranks(tmp_path):
         log.unlink()
     args = sc._build_parser().parse_args([str(root), "--dispatch", "d0"])
 
-    with pytest.raises(ValueError, match="no host.*log under"):
+    legacy_dir = root / "rank0" / "d0"
+    (legacy_dir / "host.1000.log").write_text("not an alignment archive\n")
+    with pytest.raises(ValueError, match="no host_clock_alignment.*log under"):
         sc._generate_l3_trace(args, root)
 
 
@@ -825,7 +973,7 @@ def test_aicore_scheduler_records_keep_common_shape_and_stream_metadata(tmp_path
             {
                 "chip_swimlane_level": 3,
                 "metadata": {
-                    "runtime": sc.TMR_RUNTIME,
+                    "runtime": sc.HBG_RUNTIME,
                     "clock_freq_hz": 1_000_000_000,
                     "num_cores": 1,
                     "core_types": ["aiv"],
@@ -858,7 +1006,6 @@ def test_aicore_scheduler_records_keep_common_shape_and_stream_metadata(tmp_path
                     "streams": [
                         {
                             "platform": "a5",
-                            "runtime": "host_build_graph",
                             "producer": "aicore",
                             "scheduler_id": 2,
                             "worker_id": 6,
@@ -1141,7 +1288,6 @@ def test_scheduler_tasks_reject_ambiguous_legacy_stream(tmp_path):
 def _sched_stream(scheduler_id, *, start_cycles, kind="complete", tasks_processed=1, producer="aicpu"):
     return {
         "platform": "a5",
-        "runtime": "tensormap_and_ringbuffer",
         "producer": producer,
         "scheduler_id": scheduler_id,
         "worker_id": scheduler_id,
@@ -1986,8 +2132,8 @@ def test_aicore_scheduler_uses_one_lane_and_display_names(tmp_path):
     scheduler_streams = [
         {
             "producer": "aicore",
-            "scheduler_id": 4,
-            "worker_id": 36,
+            "scheduler_id": 3,
+            "worker_id": 34,
             "core_type": "aiv",
             "physical_core_id": 26,
         }
@@ -2004,16 +2150,16 @@ def test_aicore_scheduler_uses_one_lane_and_display_names(tmp_path):
         and event.get("name") == "thread_name"
         and event.get("tid") != 3999
     ]
-    assert [(event["tid"], event["args"]["name"]) for event in scheduler_metadata] == [(30000, "Scheduler_26")]
+    assert [(event["tid"], event["args"]["name"]) for event in scheduler_metadata] == [(30000, "Scheduler_34")]
     phases = [event for event in events if event.get("cat") == "scheduler"]
     assert {event["tid"] for event in phases} == {30000}
     assert [event["name"] for event in phases] == [
-        "Completion(t23)",
-        "Resolve(t23)",
-        "StateProbe(t5)",
-        "Dispatch(t5)",
-        "Worksteal(t7)",
-        "Refill(t9)",
+        "Completion(r0t23)",
+        "Resolve(r0t23)",
+        "StateProbe(r0t5)",
+        "Dispatch(r0t5)",
+        "Worksteal(r0t7)",
+        "Refill(r0t9)",
     ]
     assert [event["args"]["task_id"] for event in phases] == [23, 23, 5, 5, 7, 9]
 
@@ -2295,12 +2441,11 @@ def test_l3_rank_pid_pin_names_the_invocation_when_the_process_ran_more_than_onc
 
 
 def _write_l3_scheduler_log(root, *, pid=900, spans):
-    """The L3 process's own log, which the run writes into the same case root.
+    """Model an explicitly supplied L3 process log at the conversion root.
 
-    `_submit_l3_locked` binds this process's log to `CallConfig.output_prefix`
-    just as each ChipWorker child does, so the scheduler's `node.*` spans sit
-    beside the Rank captures rather than anywhere the merge has to be told
-    about.
+    The automatic runtime path keeps this cumulative log in the process-session
+    spool. This fixture places the same input at the root to exercise directory
+    conversion's explicit full-log discovery.
     """
     lines = []
     for name, ts, dur, tid, inv in spans:
@@ -2469,9 +2614,9 @@ def test_hbg_task_display_names_the_space_it_decodes():
 
 
 def test_tmr_task_display_keeps_the_ring_form():
-    """The tmr layout is unchanged: ring in bits 39:32, and ring 0 stays bare."""
-    assert sc._tmr_task_display(_tmr(0, 0)) == "t0"
-    assert sc._tmr_task_display(_tmr(0, 100)) == "t100"
+    """Every tmr label carries the ring that scopes its local task id."""
+    assert sc._tmr_task_display(_tmr(0, 0)) == "r0t0"
+    assert sc._tmr_task_display(_tmr(0, 100)) == "r0t100"
     assert sc._tmr_task_display(_tmr(2, 100)) == "r2t100"
     assert sc._tmr_task_display("not-a-number") == "not-a-number"
 

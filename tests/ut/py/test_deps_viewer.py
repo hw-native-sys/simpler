@@ -54,8 +54,8 @@ def test_emit_text_marks_alloc_without_task_entry():
         task_table={},
     )
 
-    assert "TASK 1 kind=alloc func_id=none fanin=0 fanout=0" in text
-    assert "=== TASK 1 kind=alloc func_id=none ===" in text
+    assert "TASK r0t1 kind=alloc func_id=none fanin=0 fanout=0" in text
+    assert "=== TASK r0t1 kind=alloc func_id=none ===" in text
 
 
 def test_emit_text_marks_dummy_without_kernel_slots():
@@ -69,8 +69,8 @@ def test_emit_text_marks_dummy_without_kernel_slots():
         task_table={1: {"task_id": 1, "kernel_ids": [-1, -1, -1]}},
     )
 
-    assert "TASK 1 kind=dummy func_id=none fanin=0 fanout=0" in text
-    assert "=== TASK 1 kind=dummy func_id=none ===" in text
+    assert "TASK r0t1 kind=dummy func_id=none fanin=0 fanout=0" in text
+    assert "=== TASK r0t1 kind=dummy func_id=none ===" in text
 
 
 def test_emit_text_marks_func_name_map_yes_only_with_named_func():
@@ -112,7 +112,7 @@ def test_kernel_ids_fill_func_id_when_perf_sidecar_is_absent():
         task_table={1: {"task_id": 1, "kernel_ids": [-1, 2, -1]}},
     )
 
-    assert "TASK 1 kind=submit func_id=[-1,2,-1] fanin=0 fanout=0" in text
+    assert "TASK r0t1 kind=submit func_id=[-1,2,-1] fanin=0 fanout=0" in text
     assert "func_name_map: no" in text
 
 
@@ -132,8 +132,8 @@ def test_emit_text_marks_spmd_block_count():
         task_table={1: {"task_id": 1, "kernel_ids": [-1, 2, -1], "block_num": 4}},
     )
 
-    assert "TASK 1 kind=submit func_id=[-1,2,-1] SPMD block num = 4 fanin=0 fanout=0" in text
-    assert "=== TASK 1 kind=submit func_id=[-1,2,-1] SPMD block num = 4 ===" in text
+    assert "TASK r0t1 kind=submit func_id=[-1,2,-1] SPMD block num = 4 fanin=0 fanout=0" in text
+    assert "=== TASK r0t1 kind=submit func_id=[-1,2,-1] SPMD block num = 4 ===" in text
 
 
 def test_kernel_ids_render_all_active_funcs_for_mixed_task():
@@ -160,9 +160,9 @@ def test_kernel_ids_render_all_active_funcs_for_mixed_task():
         },
     )
 
-    assert "TASK 1 kind=submit func_id=[0,1,2] fanin=0 fanout=0" in text
-    assert "TASK 2 kind=submit func_id=[0,1,-1] fanin=0 fanout=0" in text
-    assert "TASK 3 kind=submit func_id=[-1,3,4] fanin=0 fanout=0" in text
+    assert "TASK r0t1 kind=submit func_id=[0,1,2] fanin=0 fanout=0" in text
+    assert "TASK r0t2 kind=submit func_id=[0,1,-1] fanin=0 fanout=0" in text
+    assert "TASK r0t3 kind=submit func_id=[-1,3,4] fanin=0 fanout=0" in text
     assert "func_name_map: no" in text
 
 
@@ -198,7 +198,7 @@ def test_kernel_ids_use_func_name_map_when_available():
         task_table={1: {"task_id": 1, "kernel_ids": [-1, 2, -1]}},
     )
 
-    assert "TASK 1 kind=submit func_id=[-1,2,-1] fanin=0 fanout=0" in text
+    assert "TASK r0t1 kind=submit func_id=[-1,2,-1] fanin=0 fanout=0" in text
     assert "func_name_map: yes" in text
 
 
@@ -219,7 +219,7 @@ def test_kernel_ids_use_all_named_funcs_when_available():
         task_table={1: {"task_id": 1, "kernel_ids": [0, 1, 2]}},
     )
 
-    assert "TASK 1 kind=submit func_id=[0,1,2] fanin=0 fanout=0" in text
+    assert "TASK r0t1 kind=submit func_id=[0,1,2] fanin=0 fanout=0" in text
     assert "func_name_map: yes" in text
 
 
@@ -235,7 +235,7 @@ def test_emit_dot_marks_spmd_nodes_without_expanding_labels():
         show_tensor_info=False,
     )
 
-    assert 'label="1 ↓0 ↑0"' in plain
+    assert 'label="r0t1 ↓0 ↑0"' in plain
     assert 'color="#C62828"' in plain
     assert "penwidth=1.5" in plain
     assert 'style="filled"' in plain
@@ -303,7 +303,7 @@ def test_dep_stats_json_groups_peers_by_name_hint():
 def test_emit_dot_handles_missing_task_table():
     dot = _emit_dot(edges=[], nodes=[1], meta={}, task_table=None)
 
-    assert 'label="🔥 1 · alloc ↓0 ↑0"' in dot
+    assert 'label="🔥 r0t1 · alloc ↓0 ↑0"' in dot
 
 
 def test_emit_dot_does_not_mark_alloc_only_successor_with_star():
@@ -315,9 +315,9 @@ def test_emit_dot_does_not_mark_alloc_only_successor_with_star():
         show_tensor_info=False,
     )
 
-    assert 'label="🔥 1 · alloc ↓0 ↑1"' in dot
-    assert 'label="🔥 2 · alloc ↓0 ↑1"' in dot
-    assert 'label="3 ↓2 ↑0"' in dot
+    assert 'label="🔥 r0t1 · alloc ↓0 ↑1"' in dot
+    assert 'label="🔥 r0t2 · alloc ↓0 ↑1"' in dot
+    assert 'label="r0t3 ↓2 ↑0"' in dot
 
 
 def test_emit_dot_marks_star_with_alloc_and_early_dispatch_predecessors():
@@ -332,9 +332,9 @@ def test_emit_dot_marks_star_with_alloc_and_early_dispatch_predecessors():
         show_tensor_info=False,
     )
 
-    assert 'label="🔥 1 · alloc ↓0 ↑1"' in dot
-    assert 'label="🔥 2 ↓0 ↑1"' in dot
-    assert 'label="⭐ 3 ↓2 ↑0"' in dot
+    assert 'label="🔥 r0t1 · alloc ↓0 ↑1"' in dot
+    assert 'label="🔥 r0t2 ↓0 ↑1"' in dot
+    assert 'label="⭐ r0t3 ↓2 ↑0"' in dot
 
 
 def test_emit_dot_does_not_mark_star_when_any_predecessor_lacks_fire():
@@ -350,7 +350,7 @@ def test_emit_dot_does_not_mark_star_when_any_predecessor_lacks_fire():
         show_tensor_info=False,
     )
 
-    assert 'label="4 ↓3 ↑0"' in dot
+    assert 'label="r0t4 ↓3 ↑0"' in dot
 
 
 def test_emit_html_includes_dep_stats_and_detail_panel(monkeypatch):
@@ -732,8 +732,8 @@ def test_main_dataflow_edge_modes_keep_lifetime_boundaries_and_omit_middle(tmp_p
     assert omitted_rc == 0
     assert "unique_task_edges: 4" in reduced_out.read_text()
     assert "unique_task_edges: 1" in omitted_out.read_text()
-    assert "=== TASK 1" in omitted_out.read_text()
-    assert "  -> 3" in omitted_out.read_text()
+    assert "=== TASK r0t1" in omitted_out.read_text()
+    assert "  -> r0t3" in omitted_out.read_text()
 
 
 def _write_deps_edges(tmp_path, edges, sources=None, runtime: Optional[str] = TMR_RUNTIME):
@@ -943,14 +943,15 @@ def test_tmr_labels_keep_the_ring_form():
     fmt = deps_viewer._make_task_formatter(nodes, "tensormap_and_ringbuffer")
 
     assert fmt((2 << 32) | 100) == "r2t100"
-    assert fmt(5) == "t5"
+    assert fmt(5) == "r0t5"
 
 
-def test_a_graph_whose_ids_are_all_plain_drops_the_prefix():
-    """No noise on a workload that never enters a manual scope or a Graph body."""
-    for runtime in (HBG_RUNTIME, TMR_RUNTIME):
-        fmt = deps_viewer._make_task_formatter([1, 2, 3], runtime)
-        assert [fmt(n) for n in (1, 2, 3)] == ["1", "2", "3"], runtime
+def test_formatter_keeps_tmr_ring_zero_explicit_and_compacts_plain_hbg_ids():
+    hbg = deps_viewer._make_task_formatter([1, 2, 3], HBG_RUNTIME)
+    tmr = deps_viewer._make_task_formatter([1, 2, 3], TMR_RUNTIME)
+
+    assert [hbg(n) for n in (1, 2, 3)] == ["1", "2", "3"]
+    assert [tmr(n) for n in (1, 2, 3)] == ["r0t1", "r0t2", "r0t3"]
 
 
 def test_a_document_naming_no_runtime_is_refused(tmp_path):

@@ -135,6 +135,12 @@ runs:
           "tests/st/$platform/tensormap_and_ringbuffer/dfx/chip_swimlane/" \
           --enable-chip-swimlane --enable-dep-gen
 
+        if [[ "$platform" == "a5" ]]; then
+          start_job "chip_swimlane (host_build_graph)" \
+            tests/st/a5/host_build_graph/dfx/chip_swimlane/test_scheduler_phases.py::TestConsecutiveClockAlignment::test_run \
+            --manual include --enable-chip-swimlane 4
+        fi
+
         start_job "PMU" \
           "tests/st/$platform/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py" \
           --enable-pmu 2

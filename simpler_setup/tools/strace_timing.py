@@ -96,8 +96,8 @@ _CLOCK_ANCHOR_RE = re.compile(
 # The emitter percent-encodes any byte that would otherwise be record grammar —
 # see `encode_host_span_field` in src/common/log/host_log.cpp.
 _PERCENT_ESCAPE_RE = re.compile(r"%([0-9A-Fa-f]{2})")
-# One file per process, written under a run's `output_prefix` when the host logger
-# writes to files rather than stderr. It holds everything that logger emits, so a
+# One file per process in either the transient session spool or an explicitly
+# bound directory. It holds everything that logger emits, so a
 # process's spans and its `[CLOCK_ANCHOR]` are in the same file. See
 # docs/dfx/host-trace.md.
 _LOG_FILE_GLOB = "host.*.log"
@@ -106,8 +106,8 @@ _LOG_FILE_GLOB = "host.*.log"
 def expand_log_source(source):
     """Resolve one CLI input to the files to read.
 
-    A directory expands to its per-process log files, so a run's
-    ``output_prefix`` can be passed as-is instead of being globbed by the caller.
+    A directory expands to its per-process log files, so a session spool or
+    explicitly bound destination can be passed without shell globbing.
     Sorted, because a reader comparing two runs should not have to care that the
     shell and the filesystem disagree about order.
 
@@ -1429,7 +1429,7 @@ def main(argv=None):
         "log",
         nargs="+",
         help="one or more host/CANN logs containing [STRACE] lines, '-' for stdin, or a directory holding "
-        f"{_LOG_FILE_GLOB} files (a run's output_prefix). Several inputs are concatenated: records carry their "
+        f"{_LOG_FILE_GLOB} files. Several inputs are concatenated: records carry their "
         "own pid, so a whole run's per-process logs, or logs from several runs, can be passed together.",
     )
     ap.add_argument(

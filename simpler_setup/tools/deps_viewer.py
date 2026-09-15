@@ -167,15 +167,13 @@ def _make_task_formatter(nodes, runtime_name):
     The layout comes from the runtime the document names, because nothing in a
     task_id value says which minted it. Under ``host_build_graph`` that yields
     ``g{parent}t{index}`` for a sub-task, ``p{index}`` for a boundary parameter and
-    ``t{local}`` for a task of the run; under ``tensormap_and_ringbuffer``,
-    ``r{ring}t{local}`` off ring 0. An unnamed or unrecognised runtime raises rather
-    than defaulting — see swimlane_converter.resolve_runtime.
+    ``t{local}`` for a task of the run; under ``tensormap_and_ringbuffer``, every
+    task is ``r{ring}t{local}``, including ring zero. An unnamed or unrecognised
+    runtime raises rather than defaulting — see swimlane_converter.resolve_runtime.
 
-    On a graph where every id decodes to the bare ``t{local}`` form the prefix is
-    dropped and the display is just ``{local}`` — no noise on workloads that never
-    enter a manual scope or a Graph body. The moment one node needs more, every node
-    keeps the explicit form so the asymmetry is visible instead of hidden (you can't
-    have ``0`` next to ``r1t3`` and know what 0's high field is without context).
+    An HBG graph containing only GLOBAL ids drops the ``t`` prefix and displays the
+    local counters alone. TMR always retains its ring because the prefix distinguishes
+    its task-id layout from HBG's GLOBAL space.
     """
     display = task_display_for(runtime_name)
 

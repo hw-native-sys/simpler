@@ -162,9 +162,9 @@ def main() -> int:
     if not binds:
         print(
             f"{' '.join(args.log)}: no `chip.run.bind.<segment>` spans. Either "
-            "SIMPLER_HBG_BIND_BREAKDOWN_ENABLE=1 was not set, or a diagnostic flag made "
-            "CallConfig.output_prefix non-empty and moved the whole host log to "
-            "outputs/<case>_<ts>/host.<pid>.log -- parse those instead. The log level is not a "
+            "SIMPLER_HBG_BIND_BREAKDOWN_ENABLE=1 was not set, or an output run moved the whole "
+            "host log into the process-session spool -- parse those host.*.log files instead. "
+            "The log level is not a "
             "cause: TIMING is the default. See docs/dfx/hbg-bind-phases.md.",
             file=sys.stderr,
         )

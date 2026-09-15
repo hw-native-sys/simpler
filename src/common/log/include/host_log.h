@@ -75,7 +75,8 @@ public:
     // pinned instead of forking while a C++ thread is alive.
     bool prepare_to_fork(uint32_t timeout_ms = 1000);
 
-    // Drain records already accepted by this process owner. Producers must be
+    // Drain accepted records through this process writer, including bound DSOs.
+    // Write failures are tracked separately as drops. Producers must be
     // quiescent if the caller needs a strict shutdown boundary.
     bool flush(uint32_t timeout_ms = 1000);
     uint64_t dropped_records() const;
@@ -86,9 +87,10 @@ public:
     uint64_t pending_records() const;
 
     // Write this process's records to `path`/host.<pid>.log instead of stderr.
-    // The caller is the one that knows where this run's artifacts go —
-    // CallConfig::output_prefix — so the logger never derives a path itself.
-    // The first non-empty path wins; a null or empty one leaves the logger on
+    // Python normally supplies a stable process-session spool; an embedding
+    // caller may instead select an explicit persistent destination. The logger
+    // never derives a path itself. The first non-empty path wins; a null or
+    // empty one leaves the logger on
     // stderr. This is the logger's output, so it applies to every record: no
     // caller declares anything and no record kind is treated specially.
     void set_log_directory(const char *path);

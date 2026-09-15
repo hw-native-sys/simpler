@@ -26,20 +26,38 @@ initialization-time policy described in [logging.md](../logging.md).
 
 ## Where the records go
 
-The host logger writes to stderr until it is given a directory, and then it
-writes to `<directory>/host.<pid>.log` instead. The directory is
-`CallConfig.output_prefix` — the one every other diagnostic artifact already goes
-under — so a run that has one gets its host log beside its other artifacts, and a
-run that does not keeps its records on the console. There is no separate switch to
-configure, and the runtime never derives the path itself.
+The host logger writes to stderr until an output run enables file logging.
+Worker then binds the whole process tree to one stable transient directory,
+`${TMPDIR:-/tmp}/simpler-host-logs-<root-pid>-<uuid>/`, and each process writes
+`host.<pid>.log` there. Every later capture in that Worker session reuses the
+same spool, so deleting an earlier `CallConfig.output_prefix` cannot break the
+writer. The root process removes the spool at normal interpreter exit. Until it
+is bound, records stay on the console. An embedding that needs a persistent
+complete trace may explicitly call `_set_host_log_directory(path)` before the
+first output run; the automatic binder preserves an existing destination.
+
+After successful execution and validation of an HBG level-3/4 capture with Host
+recording armed and finished and an output prefix, native finalize
+flushes the executing process's log and exports a capture-local
+`host_clock_alignment.<pid>.log` beside the raw swimlane file, before completion
+is published. Level 4 enables Host records automatically; level 3 requires the
+independent `SIMPLER_HBG_HOST_PHASE_RECORDS_ENABLE=1` switch and an output prefix.
+This works for direct L2 and forked ChipWorker runs without SceneTest. The file
+contains only the current invocation's original alignment spans and is not the
+cumulative logger destination. It requires TIMING-or-finer logging. While the
+process is alive, use the session spool's `host.<pid>.log` files for ordinary
+messages or the complete Host call tree; prebind an explicit directory when that
+complete trace must survive process exit. The AICPU-launch marker is a TIMING Host-clock point sampled immediately
+before the launch API call (`dur=0`, `depth=2`), not a Device-start or
+launch-completion timestamp.
 
 **The destination belongs to the logger, not to a record.** Everything that logger
 writes follows it: `LOG_*` records, `[STRACE]` spans, `[CLOCK_ANCHOR]`, the
 `host-orch phase=` cost-share summaries, and the spans Python emits through
 `unified_log_host_span`. Nothing declares an intent and no record kind is treated
 specially, so there is no state in which part of a run's log is in one place and
-part in another. The first non-empty directory in a process wins, and it is the
-destination rather than a preference: a record the file cannot take — a path
+part in another. The first non-empty session or explicit directory in a process
+wins, and it is the destination rather than a preference: a record the file cannot take — a path
 that does not fit, a failed open, a failed write — is dropped and counted, not
 relocated to stderr. That is what keeps "the log is complete" and
 "`dropped_record_count` is zero" the same statement. stderr is the destination
@@ -83,7 +101,7 @@ Every record carries its own `pid`, so the tools take several inputs and
 concatenate them, and a directory expands to the `host.*.log` files inside it:
 
 ```bash
-python -m simpler_setup.tools.strace_timing <output_prefix> --swimlane swimlane.json
+python -m simpler_setup.tools.strace_timing <host-log-directory> --swimlane swimlane.json
 ```
 
 A process writes its `[CLOCK_ANCHOR]` ahead of its first record and into the same
@@ -247,7 +265,7 @@ including time the caller spends polling or doing other host work; blocking
 | ----- | ---------- |
 | 0 | `chip.run` |
 | 1 | `chip.run.bind`, `chip.run.stage_inputs`, `chip.run.prepare_execution`, `chip.run.runner_run`, `chip.run.claim_release`, `chip.run.validate` |
-| 2 | `chip.run.bind.args`, `chip.run.bind.prebuilt`, the other HBG `chip.run.bind.*` segments, `chip.run.runner_run.device_wall` |
+| 2 | `chip.run.bind.args`, `chip.run.bind.prebuilt`, the other HBG `chip.run.bind.*` segments, `chip.run.runner_run.aicpu_launch` (onboard point), `chip.run.runner_run.device_wall` |
 | 3 | TMR phase spans `chip.run.runner_run.device_wall.{preamble,so_load,graph_build,config_validate,arena_wire,sm_reset,post_orch,orch,sched}` and optional `task_slot_*` spans |
 
 ## Host scheduler spans

@@ -567,7 +567,6 @@ def test_dag_stats_reach_a_thread_whose_stream_was_not_the_first_recorded(tmp_pa
                     "streams": [
                         {
                             "platform": "a5",
-                            "runtime": "tensormap_and_ringbuffer",
                             "producer": "aicpu",
                             "scheduler_id": 1,
                             "worker_id": 1,

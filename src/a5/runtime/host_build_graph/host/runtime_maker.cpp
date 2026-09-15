@@ -675,8 +675,8 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
             return std::strcmp(lhs.kind, rhs.kind) < 0;
         });
         if (!first_stream) scheduler_json << ",";
-        scheduler_json << "\n      {\"platform\": \"a5\", \"runtime\": \"host_build_graph\", "
-                          "\"producer\": \"aicore\", \"scheduler_id\": "
+        scheduler_json << "\n      {\"platform\": \"a5\", \"producer\": \"aicore\", "
+                          "\"scheduler_id\": "
                        << context.scheduler_index << ", \"worker_id\": " << worker << ", \"core_type\": \""
                        << scheduler_core_type_name(context.core_type)
                        << "\", \"physical_core_id\": " << context.physical_core_id

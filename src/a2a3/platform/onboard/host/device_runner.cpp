@@ -19,6 +19,7 @@
 
 #include "run_retention_probe.h"
 
+#include "common/strace.h"
 #include "host_log.h"
 #include "aicpu_loader/host/load_aicpu_op.h"
 
@@ -680,9 +681,9 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
             return record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicore, streams.aicore);
         },
         [&](LaunchProgressSink &sink) -> int {
-            LOG_INFO("=== launch_aicpu_kernel %s ===", host::KernelNames::RunName);
             int aicpu_launch_n =
                 (runtime.get_aicpu_launch_count() > 0) ? runtime.get_aicpu_launch_count() : launch_aicpu_num;
+            STRACE_HOST_SPAN_AT("chip.run.runner_run.aicpu_launch", STRACE_NOW_NS(), 0, 2);
             int launch_rc = launch_aicpu_kernel(
                 streams.aicpu, &prepared.kernel_args.args, host::KernelNames::RunName, aicpu_launch_n
             );

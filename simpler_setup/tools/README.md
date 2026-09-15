@@ -77,7 +77,7 @@ used as the source for two additional Perfetto-compatible traces:
 
 Both files retain every view, metadata event, bar, and flow from the merged
 trace. Only AIC/AIV task bars in Worker View (`pid=4`) outside the selected path
-are renamed to `·(rXtY)` (or `·(tY)` for ring 0); path bars and every slice
+are renamed to `·(<task-id>)`; TMR labels include the explicit `r0` for ring 0, while path bars and every slice
 in other views keep their original names. With Perfetto's default name-based
 coloring, the middle dot maps to a light blue-purple while digits are removed
 before hashing, so anonymous Worker View bars share a subdued color and path
@@ -167,14 +167,57 @@ python -m simpler_setup.tools.swimlane_converter build_output/<case>/dfx_outputs
     --dispatch-id 17:5 -o build_output/<case>/dfx_outputs/l3_swimlane.json
 ```
 
+For level-3/4 `host_build_graph` captures containing Host records or Host capture
+metadata, single-file conversion attempts containment when matching Host logs are
+available beside the capture (or supplied with `--host-log`). Level 4 enables
+Host records automatically; level 3 can include them through
+`SIMPLER_HBG_HOST_PHASE_RECORDS_ENABLE=1` with an output prefix. Levels 1-2 and
+Device-only single-file captures, including TMR captures, skip this step.
+This runs inside `swimlane_converter.py`; no additional command is needed. It saves
+`metadata.clock_alignment` in the source JSON, so subsequent conversion and IDE
+readers that consume this field can use that one file without logs. Device-only
+single-file conversion does not compute containment or rewrite its source.
+Missing or unusable logs skip
+alignment; a valid saved mapping is reused. Raw timestamps are preserved.
+The saved object contains only `status`, `device_anchor_cycles`, `host_anchor_ns`,
+`host_anchor_min_ns`, and `host_anchor_max_ns`. Frequency comes from the capture
+metadata and uncertainty is the upper bound minus the lower bound. Unavailable
+alignment contains `status` and `reason`. Saved mappings assume unchanged raw
+capture data; full placement diagnostics stay in traces calculated from logs.
+The first output run binds cumulative process logs to a stable transient
+process-session spool under `${TMPDIR:-/tmp}/simpler-host-logs-<root-pid>-<uuid>/`, not to a
+capture directory. After successful execution and validation of a mixed HBG capture with Host
+recording armed and finished and an output prefix, native finalize flushes the
+executing process's
+accepted Host-log records and atomically exports that invocation's original timing
+spans as `host_clock_alignment.<pid>.log` beside the capture before publishing
+completion. Direct L2 and forked ChipWorker executions share this path, so ST,
+PyPTO, pypto-lib, and models using these execution paths need no SceneTest log
+preparation. The exporter starts at the file position recorded before the invocation,
+filters by its PID/invocation, and keeps the complete process log unchanged.
+Other diagnostic flags and Device-only captures do not trigger this export.
+TIMING-or-finer logging is required; coarser logging warns and skips export.
+Flush or artifact-export failures are reported as diagnostic errors.
+A TIMING `chip.run.runner_run.aicpu_launch` marker raises the Device placement
+lower bound to the later of the runner start and launch. Required Host spans
+need a TIMING-or-finer log threshold. The remaining interval bounds placement
+freedom; saved anchor bounds also include phase-join freedom. Old logs without
+the marker retain the original containment bounds.
+Directory conversion also saves alignment metadata in mixed HBG source captures.
+The converter reads runtime-exported timing logs and does not create them.
+See [the single-capture schema](../../docs/dfx/chip-swimlane-profiling.md#optional-alignment-embedded-in-a-single-capture).
+
 Directory mode puts the Ranks on one axis by containment, not by calibration:
 each Rank's device work is placed inside the `chip.run.runner_run` window that
-held it, read from the run's `host.<pid>.log`. It therefore needs those logs
-(`--host-log` overrides the default of every `host.*.log` beside the captures)
-and works at any capture level. Every drawn slice carries the `slack_ns` its Rank was placed under, each
-Rank's metadata carries the full `placement` record, and the top level carries
-`cross_rank_uncertainty_ns` — the sum of the two widest, which bounds any
-interval read between two Ranks. See
+held it, read from persistent or capture-local timing logs. Default lookup reads
+`host.*.log` and `host_clock_alignment.*.log` directly under the input directory,
+plus `rank*/d*/host_clock_alignment.*.log` (`--host-log` overrides this lookup)
+and works at any capture level. Device slices carry their Rank's `slack_ns`.
+Each Rank's metadata carries the full `placement` record, and the top level carries
+`cross_rank_uncertainty_ns` — the sum of the two widest slacks, bounding
+placement freedom between two Ranks for their selected joins. Phase-join freedom
+is reported separately as `join.residual_ns` and must also be considered when
+interpreting cross-Rank gaps. See
 [`containment.py`](containment.py) for the mechanism.
 
 The merged trace also carries the processes that dispatched to the Ranks —
@@ -245,7 +288,7 @@ per-subtask crossbar.
 
 SPMD lane labels append `_spmd` before `(rXtY)` unless the function
 name already contains `spmd` (case-insensitive), e.g.
-`v_proj_spmd(r2t10)` vs `SPMD_WRITE_AIV(t0)`.
+`v_proj_spmd(r2t10)` vs `SPMD_WRITE_AIV(r0t0)`.
 
 With `-v`, the converter prints
 `dependency arrows anchor on min core_id subtask per core_type` when
@@ -259,7 +302,7 @@ SPMD tasks are present.
 | `--output` | `-o` | Output JSON file (default: `merged_swimlane.json` beside a file input, `l3_swimlane.json` inside a directory input) |
 | `--dispatch` | | Directory mode only: local capture directory to merge across Ranks, e.g. `d0`. Mutually exclusive with `--dispatch-id` |
 | `--dispatch-id` | | Directory mode only: parent dispatch identity to merge, formatted `RUN_ID:TASK_SLOT`. Resolves each Rank's own `dN` through `dispatch_identity.json`. Mutually exclusive with `--dispatch` |
-| `--host-log` | | Directory mode: Host `[STRACE]` log holding the `chip.run.runner_run` windows the captures are placed in (repeatable). Defaults to every `host.*.log` in the input directory |
+| `--host-log` | | Host `[STRACE]` log holding the `chip.run.runner_run` windows (repeatable). Single-file mode prefers sibling `host_clock_alignment.*.log`, falling back to `host.*.log`; directory mode reads both at the root plus `rank*/d*/host_clock_alignment.*.log`. An explicit argument recalculates single-file alignment |
 | `--rank-pid` | | Directory mode: pin one Rank's capture to the Host invocation that ran it, `RANK=PID` or `RANK=PID:INV` (repeatable). Only needed when the captures carry no `dispatch_identity.json` and Ranks running the same shape cannot be told apart by their device windows |
 | `--kernel-config` | `-k` | Path to kernel_config.py, used for function name mapping. Rejected in directory mode |
 | `--func-names` | | Path to name_map*.json (SceneTest format) for function name mapping. Rejected in directory mode |
@@ -612,8 +655,8 @@ python -m simpler_setup.tools.deps_viewer outputs/<case>_<ts>/deps.json \
 
 All reduction modes print the redundant edges to stdout as a
 `<task> -> <task>` list, where each task uses the same label as the rendered
-graph — the bare `local` counter when every task is in ring 0, or the explicit
-`(ring, local)` tuple once any task lives in ring >= 1. Text output emits only
+graph. HBG graphs containing only GLOBAL tasks use the bare `local` counter;
+TMR graphs always use the explicit `r{ring}t{local}` label, including ring 0. Text output emits only
 the selected edge set. HTML output keeps every edge in the Graphviz layout and
 colors unselected edges like the page background, so `reduced` / `omitted`
 preserve the full-graph node placement and routing while showing only the

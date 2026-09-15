@@ -13,7 +13,7 @@
 
 #include <stdint.h>
 
-/* Matches CallConfig::output_prefix, which is where the path comes from. */
+/* Holds either an explicitly selected directory or the process-session spool. */
 #define SIMPLER_HOST_LOG_DIR_CAPACITY 1024
 
 #ifdef __cplusplus
@@ -31,10 +31,10 @@ extern "C" {
  * positive and bounded well below INT32_MAX.
  *
  * log_directory is where the process writer appends records, one file per
- * process. It is empty until a caller that knows the run's artifact directory
- * supplies it, and the writer uses stderr while it is. The destination is a
- * property of the logger, so it applies to every record from every caller —
- * there is no per-record or per-call-site routing.
+ * process. It is empty until a caller supplies either an explicit destination
+ * or the process tree's stable session spool, and the writer uses stderr while
+ * it is. The destination is a property of the logger, so it applies to every
+ * record from every caller — there is no per-record or per-call-site routing.
  *
  * The first non-empty path wins: log_directory_bound is release-stored after the
  * path is filled and acquire-loaded before it is read, so a reader sees either no

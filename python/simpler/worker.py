@@ -108,9 +108,6 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
 from _task_interface import (
     _host_spans_active as _native_host_spans_active,
 )
-from _task_interface import (
-    _set_host_log_directory as _native_set_host_log_directory,
-)
 
 from . import _log as _simpler_log
 from .buffer import (
@@ -281,6 +278,7 @@ from .task_interface import (
     RemoteBufferExport,
     RemoteBufferHandle,
     TaskArgs,
+    _bind_host_log_session_directory,
     _flush_host_log_or_warn,
     _initialize_host_log,
     _start_host_log_writer,
@@ -2950,6 +2948,13 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
         diagnostic_capture_index += 1
         return cfg
 
+    def finish_task_logging(cfg: CallConfig | None, code: int, msg: str) -> tuple[int, str]:
+        # TASK_DONE permits the parent to read this child's completed invocation.
+        if cfg is not None and cfg.enable_chip_swimlane and cfg.output_prefix:
+            if not _flush_host_log_or_warn(f"chip_process dev={device_id}: task completion"):
+                return 1, msg or f"chip_process dev={device_id}: diagnostic Host log flush failed"
+        return code, msg
+
     def handle_task(task_buf) -> tuple[int, str]:
         task_addr = ctypes.addressof(ctypes.c_char.from_buffer(task_buf))
         digest = _read_task_digest(task_buf)
@@ -2958,6 +2963,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
 
         code = 0
         msg = ""
+        cfg = None
         try:
             # Inside the try because it writes the diagnostic sidecar: a full or
             # read-only output_prefix must surface as this task's error, not as
@@ -2990,6 +2996,8 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             chip_args = materialize_task_args(args, resolved)
             # The acceptance flag lives in the mailbox, not in the materialized args, so
             # the fence still publishes through the address the parent polls.
+            if cfg.output_prefix:
+                _bind_host_log_session_directory()
             cw._impl.run_materialized(
                 cid,
                 chip_args,
@@ -3010,7 +3018,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
         # staging garbage would mask the real error in post-mortems.
         if code == 0 and on_task_done_success is not None:
             code, msg = on_task_done_success()
-        return code, msg
+        return finish_task_logging(cfg, code, msg)
 
     def handle_control(  # noqa: PLR0912, PLR0915 -- one branch per control sub-command
         sub_cmd: int,
@@ -3245,6 +3253,8 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             args = read_args_from_blob(args_ptr, _MAILBOX_ARGS_CAPACITY)
             resolved = import_registry.materialize_args(args)
             chip_args = materialize_task_args(args, resolved)
+            if frame.config.output_prefix:
+                _bind_host_log_session_directory()
             frame.chip_run = cw._impl._submit_chip_run_materialized(
                 frame.cid,
                 chip_args,
@@ -3351,6 +3361,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                                 except Exception as e:  # noqa: BLE001
                                     code = 1
                                     msg = _format_exc(f"chip_process dev={device_id}: task completion hook", e)
+                            code, msg = finish_task_logging(staged.config, code, msg)
                             _write_error(staged.frame_buf, code, msg)
                             _mailbox_store_i32(
                                 staged.frame_addr + _OFF_STATE,
@@ -3554,10 +3565,6 @@ def _read_config_from_mailbox(
     # land in the namespace it owns rather than in its parent's.
     if level_worker is not None:
         cfg.output_prefix = _level_capture_prefix(cfg.output_prefix, level_worker)
-    # An attached Worker's Host logs always live in its level namespace;
-    # rankN/dN below remains gated on per-rank diagnostics.
-    if cfg.output_prefix:
-        _native_set_host_log_directory(cfg.output_prefix)
     if cfg.output_prefix and chip_rank is not None and capture_index is not None and _config_diagnostics_any(cfg):
         # Every diagnostic below output_prefix uses a fixed filename, so N
         # ChipWorker children sharing one prefix overwrite each other's
@@ -11257,6 +11264,8 @@ class Worker:
         if self.level == 2:
             assert self._chip_worker is not None
             state = self._resolve_handle(callable, expected_namespace="LOCAL_CHIP")
+            if getattr(cfg, "output_prefix", ""):
+                _bind_host_log_session_directory()
             return self._submit_l2_locked(state.slot_id, args, cfg)
 
         with self._submit_mu.exclusive():
@@ -11515,13 +11524,8 @@ class Worker:
     def _submit_l3_locked(self, callable, args, cfg: CallConfig) -> RunHandle:
         assert self._orch is not None
         assert self._worker is not None
-        # This process's log belongs beside the run's other diagnostic artifacts,
-        # so the directory comes from the config that already names it. First one
-        # in a process wins; with no prefix the logger stays on stderr. Read
-        # defensively: wiring an output must never be what fails a submit.
-        log_directory = getattr(cfg, "output_prefix", "")
-        if log_directory:
-            _native_set_host_log_directory(log_directory)
+        if getattr(cfg, "output_prefix", ""):
+            _bind_host_log_session_directory()
         run_id = self._orch._begin_run()
         resources = _RunResources()
         handle = RunHandle(self, run_id, (callable, args, cfg), resources)

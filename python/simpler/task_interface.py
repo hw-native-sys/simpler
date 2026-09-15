@@ -26,9 +26,13 @@ Usage:
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import ctypes
+import os
+import shutil
 import sys
+import tempfile
 import threading
 import uuid
 import weakref
@@ -95,6 +99,9 @@ from _task_interface import (
 )
 from _task_interface import (
     _initialize_host_log as _native_initialize_host_log,
+)
+from _task_interface import (
+    _set_host_log_directory as _native_set_host_log_directory,
 )
 from _task_interface import (
     _start_host_log_writer as _native_start_host_log_writer,
@@ -1292,6 +1299,38 @@ class GlobalCommDomainView:
         return self._committed
 
 
+_HOST_LOG_SESSION_OWNER_PID = os.getpid()
+_HOST_LOG_SESSION_DIRECTORY = Path(tempfile.gettempdir()) / (
+    f"simpler-host-logs-{_HOST_LOG_SESSION_OWNER_PID}-{uuid.uuid4().hex}"
+)
+
+
+def _bind_host_log_session_directory() -> str:
+    """Bind the process tree to one log directory that outlives every capture."""
+    bound = _native_host_log_directory()
+    if bound:
+        return str(bound)
+    _HOST_LOG_SESSION_DIRECTORY.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _native_set_host_log_directory(str(_HOST_LOG_SESSION_DIRECTORY))
+    bound = _native_host_log_directory()
+    if not bound:
+        raise RuntimeError(f"cannot bind simpler Host log directory {_HOST_LOG_SESSION_DIRECTORY}")
+    return str(bound)
+
+
+def _cleanup_host_log_session_directory() -> None:
+    """Remove the transient spool at normal owner-process exit."""
+    if os.getpid() != _HOST_LOG_SESSION_OWNER_PID:
+        return
+    with contextlib.suppress(BaseException):
+        _native_flush_host_log(1000)
+    with contextlib.suppress(OSError):
+        shutil.rmtree(_HOST_LOG_SESSION_DIRECTORY)
+
+
+atexit.register(_cleanup_host_log_session_directory)
+
+
 def _initialize_host_log(log_level: int | None = None, *, defer_writer: bool = False) -> None:
     """Seed host-log state, optionally leaving its writer stopped for local forks.
 
@@ -1648,6 +1687,8 @@ class ChipWorker:
             config = CallConfig()
         for k, v in kwargs.items():
             setattr(config, k, v)
+        if config.output_prefix:
+            _bind_host_log_session_directory()
         # Returns None; per-stage timing is emitted as `[STRACE]` log markers.
         self._impl.run(int(callable_id), args, config)
 
@@ -1656,6 +1697,8 @@ class ChipWorker:
             config = CallConfig()
         for k, v in kwargs.items():
             setattr(config, k, v)
+        if config.output_prefix:
+            _bind_host_log_session_directory()
         self._impl._run_with_pipeline_lease(int(callable_id), args, config, int(slot_id), int(generation))
 
     def _prepare_native_run_with_pipeline_lease(self, callable_id, args, slot_id, generation, config=None, **kwargs):
@@ -1671,6 +1714,8 @@ class ChipWorker:
             config = CallConfig()
         for k, v in kwargs.items():
             setattr(config, k, v)
+        if config.output_prefix:
+            _bind_host_log_session_directory()
         return self._impl._prepare_native_run_with_pipeline_lease(
             int(callable_id), args, config, int(slot_id), int(generation)
         )

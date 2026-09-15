@@ -130,7 +130,8 @@ class TestHbgSingleCoreDag(SceneTestCase):
             streams = raw["scheduler_records"]["streams"]
             assert streams, "A5 HBG AICore Scheduler records are missing"
             assert all(stream["producer"] == "aicore" for stream in streams)
-            assert all(stream["platform"] == "a5" and stream["runtime"] == "host_build_graph" for stream in streams)
+            assert all(stream["platform"] == "a5" for stream in streams)
+            assert all("runtime" not in stream for stream in streams)
             records = [record for stream in streams for record in stream["records"]]
             assert all(set(record) == record_fields for record in records)
             assert all(0 < record["start_cycles"] <= record["end_cycles"] for record in records)

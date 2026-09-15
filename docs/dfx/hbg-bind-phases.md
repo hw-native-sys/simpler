@@ -384,23 +384,30 @@ swimlane for a case that hangs on device is cheaper to take with the variable se
 than to take by waiting out the stall.
 
 **The flag that satisfies condition 2 also moves the log.** A non-empty
-`CallConfig.output_prefix` redirects every host-log record — segment spans
-and `[STRACE]` spans alike — from stderr into `outputs/<case>_<ts>/host.<pid>.log`,
-one file per process ([`python/simpler/worker.py`](../../python/simpler/worker.py)
-sets the directory on the L3 submit path and in the forked chip child;
-[`src/common/log/host_log.cpp`](../../src/common/log/host_log.cpp) opens the file).
-So Recipe A's `grep -c 'name=chip.run.bind\.' "$LOG"` reports **0** for a Recipe B run that
-worked perfectly, and the finisher must read the prefix's own logs. Measured on a
-2-rank dsv4 run: `$LOG` alone yields `No [STRACE] markers found` and drops every
-phase record, while `$LOG` plus the prefix's logs attaches all 4186 of them.
+`CallConfig.output_prefix` enables one transient Host-log spool for the whole
+process tree under `${TMPDIR:-/tmp}/simpler-host-logs-<root-pid>-<uuid>/`; it does not bind the
+logger to that capture. Segment and `[STRACE]` spans leave stderr together, so
+Recipe A's `grep -c 'name=chip.run.bind\.' "$LOG"` still reports **0** for a
+Recipe B run that worked perfectly. SceneTest consumes the spool before process
+exit. A manual workflow that parses after exit must prebind a persistent directory
+before the first output run; the automatic session binder preserves it:
 
-The skill's timeline mode is this recipe; it finishes with
+```python
+import os
+from pathlib import Path
+from _task_interface import _set_host_log_directory
+
+log_dir = Path(os.environ["SIMPLER_FULL_HOST_LOG_DIR"])
+log_dir.mkdir(parents=True, exist_ok=True)
+_set_host_log_directory(str(log_dir))
+```
+
+The skill's timeline mode uses that prebound directory and finishes with
 
 ```bash
 D=outputs/<case>_<ts>
-# The clock anchors are split: the invoking process wrote its own to $LOG, each
-# chip child wrote its own under $D. Concatenating keeps every pid alignable.
-cat "$LOG" "$D"/host.*.log > "$D/bind_timeline.log"
+H="$D/full_host_logs"  # SIMPLER_FULL_HOST_LOG_DIR used by the runner above
+cat "$LOG" "$H"/host.*.log > "$D/bind_timeline.log"
 python -m simpler_setup.tools.strace_timing "$D/bind_timeline.log" \
     --host-phase-records "$D/host_phase_records.jsonl" \
     --swimlane "$D/host_swimlane.json"
@@ -439,7 +446,7 @@ signal than any duration on a shared box.
 
 | Trap | Symptom | What to do |
 | ---- | ------- | ---------- |
-| Any diagnostic flag on (so, every Recipe B run) | `$LOG` has no `[STRACE]` markers at all, run passes | the non-empty `output_prefix` moved the host log to `outputs/<case>_<ts>/host.<pid>.log`; grep and parse those too |
+| Any diagnostic flag on (so, every Recipe B run) | `$LOG` has no `[STRACE]` markers at all, run passes | the output run moved the host log to the process-session spool; parse it before exit or prebind a persistent directory as shown above |
 | A `SceneTestCase` with `device_count > 1` run through the module runner | log has zero segment spans, test passes | give the child command `--runtime <rt> --level 3`; a standalone `main.py` case needs nothing |
 | `SIMPLER_SKIP_DEVICE_RUN=0` | run still skips the device, "PASSED" means nothing ran | `unset` the variable |
 | `--rounds 6` with `--enable-scope-stats` | no `outputs/<case>_<ts>/` artifacts, plus a `disabled: --rounds > 1` warning | one round for artifacts, many rounds for numbers |

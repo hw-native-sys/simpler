@@ -709,7 +709,7 @@ def test_cli_reads_every_input_so_a_run_needs_no_manual_merge(tmp_path, capsys):
 
 
 def test_cli_expands_a_run_directory_to_its_per_process_log_files(tmp_path):
-    """A run's output_prefix can be passed as-is."""
+    """A directory of per-process logs can be passed without shell globbing."""
     prefix = tmp_path / "case_20260824"
     prefix.mkdir()
     (prefix / "host.71.log").write_text(
