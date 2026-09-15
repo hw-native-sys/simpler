@@ -1,6 +1,6 @@
 # HBG kernel resource declarations
 
-Reference: the supplied `kernel-mode-design.md`, [v9 final decisions](https://icc.gt.tc/vllm-pto#v9-design).
+Reference: the supplied `kernel-mode-design.md`, [v9 final decisions](https://icc.gt.tc/vllm-pto?i=2#v9-design).
 The final decisions in §0 override historical alternatives, except for the user's subsequent three-stream clarification: caller, dedicated non-hidden AICPU and hidden AICore are distinct.
 These are internal host C++ interfaces, not new public workspace-size APIs.
 The integrated K1 C entry points and `SimplerKernelInvocationHeader` remain the
@@ -31,8 +31,9 @@ upload in sequence and retains its existing resource management.
 This borrowed intermediate is consumed by `make_graph_launch_template`, which
 produces an independently owned immutable packet. Kernel submission uses that
 packet and a prepared working slot, never the program upload path. Device
-admission checks the independently registered slot; per-replay restore remains
-separate integration work.
+admission checks the independently registered slot and trusted callable metadata.
+The leader restores the packet into that slot before dispatch; see
+[execution-slot registration and restoration](host-build-graph-kernel-slot.md).
 
 ## Graph requirements and context capacity
 
@@ -76,7 +77,7 @@ layout during restore, never combined across graphs.
 
 For example, graph A needs runtime 8192 and Definition 512 bytes; graph B needs
 runtime 4096 and scheduler 2048 bytes. The combined arena reserves runtime
-`[0, 8192)`, Definition `[8192, 8704)`, padding, scheduler `[9216, 11264)`, and registry `[11264, 11456)`.
+`[0, 8192)`, Definition `[8192, 8704)`, padding, scheduler `[9216, 11264)`, and registry `[11264, 11520)`.
 This is a legal layout for either graph; the larger individual packed total
 alone would not describe these combined region capacities.
 
@@ -137,11 +138,13 @@ an `int32_t callable_id` in `prepare_callable` and carries no callable generatio
 in the 32-byte invocation header.
 
 HBG's public kernel launch remains unsupported. The resource lifecycle and
-immutable HBG packet producer are implemented internally, but H4 device restore
-and public owner/registration integration are still required before enabling
-HBG execution. Resource freeze is the internal `context.freeze_resources()`
-transition; a future HBG owner must connect it to the preparation lifecycle.
-The TMR public launch implementation has its own independent admission path.
+immutable HBG packet producer are implemented internally, and H4 restores the
+pristine packet into the prepared slot before dispatch. H5 exports the dedicated
+HBG kernel registration entry and symbol manifest. Public HBG owner integration
+is still required before enabling execution. Resource freeze is the internal
+`context.freeze_resources()` transition; the HBG owner must connect it to the
+preparation lifecycle. The TMR public launch implementation has its own
+independent admission path.
 
 ## Common contract and stream roles
 
@@ -247,7 +250,8 @@ ranges, canonical region order and full-capacity coverage. A checksum covers the
 common header, HBG binding/identity, descriptors, padding and payload, excluding
 only the checksum and the single patched address. It detects accidental
 corruption; it cannot replace H3's independent device registry trust check or
-H4's semantic image validation and restore.
+the leader image validation and restore described in
+[execution-slot registration and restoration](host-build-graph-kernel-slot.md).
 
 [Execution-slot registration and admission](host-build-graph-kernel-slot.md)
 defines the prepare-time seal, context-owned AICPU registry and read-only
@@ -269,8 +273,9 @@ Enqueue errors are returned unchanged to the enclosing launch protocol.
 The adapter assumes the enclosing protocol has established entry/exit events
 and retained the function/context leases. It does not create streams, record
 or wait events, implement partial-enqueue recovery, or enable public HBG launch.
-The A5 scheduler region is a zeroed restore destination; its per-invocation
-metadata and scheduler initialization belong to device restore integration.
+The A5 scheduler region is restored from its zeroed template. The common
+scheduler queues, mailbox and runtime pointers are rebuilt by the leader restore;
+A5 dispatch-specific metadata binding remains with the kernel entry.
 Host framing/ownership tests and compilation against the installed CANN header
 are not evidence of on-device capture/restore correctness.
 
@@ -278,24 +283,40 @@ are not evidence of on-device capture/restore correctness.
 
 The independent orchestration requirements metadata describes generated Host
 behavior, not whether a tensor argument exists or carries a device address.
-The Host tensor-data capability bit has these semantics for the gate producer
-and consumer:
+New orchestration libraries may export
+`pypto_orchestration_requirements_v1`. Kernel mode requires the symbol and
+rejects unknown bits before Host build. Program mode records the metadata when
+present but retains its existing behavior for legacy libraries.
 
 | Host orchestration operation | Requires Host tensor-data capability |
 | ---------------------------- | ------------------------------------ |
 | Inspect shape, dtype, stride or scalar arguments | No |
 | Carry device addresses or construct tensor views without dereferencing storage | No |
 | Emit device predicate metadata (address, comparison, element size) | No; device evaluates the value |
-| Execute `get_tensor_data` / read tensor element values on Host | Yes, including reads through a staged Host mirror |
-| Execute `set_tensor_data` / write tensor values on Host | Yes, including mirror writes followed by H2D |
+| Execute `get_tensor_data` / read tensor element values on Host | Yes; kernel mode also requires an explicit Host-copy argument |
+| Execute `set_tensor_data` / write tensor values on Host | Yes; unsupported in kernel mode |
 
-The gate must reject that capability for kernel mode before build or execution
-resource mutation. Missing metadata and unknown bits also fail closed in kernel
-mode. Program mode retains its existing Host accessor behavior and permits old
-orchestration libraries without metadata. An explicit future Host-copy argument
-ABI must be treated separately; it does not make an arbitrary device tensor
-Host-readable. K1's `host_copy_tensor_count` remains zero.
+H6 encodes arguments as `[device tensors][host-only copies][scalars]`.
+`host_copy_tensor_count` names the trailing tensor suffix. The suffix is paired
+in order with the equally sized suffix of the device-tensor prefix. A pair must
+have identical shape, stride, dtype, start offset and buffer size; only its
+address space and address differ. This gives `pa(..., block_table,
+block_table_host)` a deterministic wire form without another pointer table.
 
-This declaration change does not load or gate requirements symbols and does not
-assign a new competing bit number. Producer bit assignments and optional symbol
-loading belong to the capability-gate integration with PyPTO.
+All main tensors must carry `AddressSpace::DEVICE`. V1 accepts a dense
+row-major layout or row-major rows with outer padding: the innermost stride is
+one and each outer stride covers the complete next dimension. Broadcast,
+transpose and stepped innermost views are rejected before Host build.
+
+Kernel Host build registers only the explicit Host-copy suffix as read-only.
+It never maps a device tensor, performs fallback D2H, synchronizes a stream or
+allows Host writes. The Host-only copy is build input and cannot enter a task
+payload, Graph Definition, predicate operand or device graph packet. The host
+packet producer checks this before binding the frozen working slot, and the
+AICPU restore path checks again before writing any device destination.
+
+The resulting graph packet contains caller-owned device addresses and the
+captured graph structure. Capture builds this immutable packet once. Replay
+restores it into the existing fixed-capacity slot and does not re-enter Host
+build or read the Host copy. A changed shape, stride family, task topology or
+address specialization requires another captured graph.

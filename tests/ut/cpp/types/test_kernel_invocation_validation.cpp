@@ -127,4 +127,25 @@ TEST(KernelInvocationValidation, RuntimePayloadIsOpaqueAndTrustedCountsAreRequir
     );
     EXPECT_EQ(out.callable_id, prepared.callable_id);
 }
+
+TEST(KernelInvocationValidation, HostCopyCountIsAValidatedTensorSuffix) {
+    const PreparedInvocationView prepared{5, 2, 0};
+    SimplerKernelInvocationHeader header{};
+    header.mode = SIMPLER_MODE_KERNEL;
+    header.callable_id = prepared.callable_id;
+    header.tensor_count = prepared.tensor_count;
+    header.host_copy_tensor_count = 1;
+    SimplerKernelInvocationHeader out{};
+    ASSERT_EQ(
+        validate_invocation_header({reinterpret_cast<const uint8_t *>(&header), sizeof(header)}, prepared, &out),
+        InvocationStatus::Ok
+    );
+    EXPECT_EQ(out.host_copy_tensor_count, 1);
+
+    header.host_copy_tensor_count = 2;
+    EXPECT_EQ(
+        validate_invocation_header({reinterpret_cast<const uint8_t *>(&header), sizeof(header)}, prepared, &out),
+        InvocationStatus::InvalidCounts
+    );
+}
 }  // namespace

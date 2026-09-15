@@ -37,6 +37,7 @@ foreach(arch IN ITEMS a2a3 a5)
         ${HBG_HOST_DIR}/kernel_graph_template.cpp
         ${HBG_HOST_DIR}/kernel_graph_slot.cpp
         ${CMAKE_SOURCE_DIR}/../../../src/common/host_build_graph/device/kernel_graph_slot_registry.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/host_build_graph/device/kernel_graph_restore.cpp
         ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
         ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/platform_compile_info.cpp
     )

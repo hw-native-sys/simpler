@@ -52,6 +52,10 @@ inline bool valid_invocation_counts(int32_t tensors, int32_t scalars) noexcept {
            tensors + scalars <= CHIP_MAX_TENSOR_ARGS;
 }
 
+inline bool valid_host_copy_tensor_count(int32_t tensors, int32_t host_copies) noexcept {
+    return host_copies >= 0 && host_copies <= tensors / 2;
+}
+
 // signature names a readable, aligned array of sig_count entries; its owning
 // callable's flexible-array bounds are validated before this function is called.
 inline InvocationStatus derive_invocation_counts(
@@ -96,7 +100,8 @@ inline InvocationStatus validate_invocation_header(
     if (header.mode != SIMPLER_MODE_KERNEL || header.callable_id < 0 ||
         header.callable_id >= MAX_REGISTERED_CALLABLE_IDS || header.reserved_ != 0)
         return InvocationStatus::InvalidHeader;
-    if (!valid_invocation_counts(header.tensor_count, header.scalar_count) || header.host_copy_tensor_count != 0)
+    if (!valid_invocation_counts(header.tensor_count, header.scalar_count) ||
+        !valid_host_copy_tensor_count(header.tensor_count, header.host_copy_tensor_count))
         return InvocationStatus::InvalidCounts;
     if (header.payload_bytes != packet.size - sizeof(header)) return InvocationStatus::InvalidSize;
     if (!valid_prepared_invocation(trusted)) return InvocationStatus::InvalidArgument;

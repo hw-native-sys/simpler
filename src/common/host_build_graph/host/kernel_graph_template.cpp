@@ -15,6 +15,7 @@
 #include <unordered_map>
 
 #include "host_build_graph/host_graph_build.h"
+#include "host_build_graph/kernel_external_tensor_wire.h"
 #include "host_build_graph/runtime_core.h"
 
 namespace hbg {
@@ -44,6 +45,62 @@ struct DefinitionImage {
     uint64_t offset;
     const GraphDefinition *definition;
 };
+
+bool valid_definition_external_tensors(const GraphDefinition &definition) {
+    if (definition.tensor_arg_count < 0 || definition.predicate_count < 0) return false;
+    if (definition.tensor_arg_count != 0) {
+        const auto *tensors =
+            graph_definition_array<GraphTensor>(definition, definition.off_tensors, definition.tensor_arg_count);
+        if (tensors == nullptr) return false;
+        for (int32_t i = 0; i < definition.tensor_arg_count; ++i)
+            if (!valid_kernel_graph_tensor(tensors[i])) return false;
+    }
+    if (definition.predicate_count != 0) {
+        const auto *predicates =
+            graph_definition_array<GraphPredicate>(definition, definition.off_predicates, definition.predicate_count);
+        if (predicates == nullptr) return false;
+        for (int32_t i = 0; i < definition.predicate_count; ++i)
+            if (!valid_kernel_graph_tensor(predicates[i].operand)) return false;
+    }
+    return true;
+}
+
+bool valid_build_external_tensors(const GraphBuild &build) {
+    const auto offsets = sm_layout::segment_offsets(build.workspace.task_capacity);
+    const auto *base = static_cast<const std::byte *>(build.workspace.sm_mirror);
+    const auto *storage = reinterpret_cast<const ChipTaskStorage *>(base + offsets.storage);
+    const uintptr_t tensor_pool_begin = reinterpret_cast<uintptr_t>(base + offsets.tensor_pool);
+    const uintptr_t tensor_pool_end = reinterpret_cast<uintptr_t>(base + offsets.scalar_pool);
+    for (int32_t i = 0; i < build.total_tasks; ++i) {
+        const auto &task = storage[i];
+        const bool graph = task.slot.task_kind == TaskKind::GRAPH;
+        const int32_t count = task.payload.tensor_count;
+        if (count < 0 || count > (graph ? GRAPH_MAX_TENSOR_ARGS : MAX_TENSOR_ARGS)) return false;
+        if (count == 0) continue;
+        const uintptr_t first = reinterpret_cast<uintptr_t>(task.payload.tensor_data());
+        const uint64_t element_bytes = graph ? sizeof(GraphTensor) : sizeof(simpler::hbg::Tensor);
+        const uint64_t bytes = static_cast<uint64_t>(count) * element_bytes;
+        if (first < tensor_pool_begin || first > tensor_pool_end || bytes > tensor_pool_end - first) return false;
+        for (int32_t j = 0; j < count; ++j) {
+            const auto *element = reinterpret_cast<const std::byte *>(first + static_cast<uint64_t>(j) * element_bytes);
+            if (graph) {
+                if (!valid_kernel_graph_tensor(*reinterpret_cast<const GraphTensor *>(element))) return false;
+            } else if (!valid_kernel_graph_tensor(*reinterpret_cast<const simpler::hbg::Tensor *>(element))) {
+                return false;
+            }
+        }
+    }
+    const auto definitions = graph_host_definitions(*build.graph_state);
+    for (const auto &entry : definitions.entries) {
+        const auto *source = graph_host_definition_data(*build.graph_state, entry.full_key);
+        if (source == nullptr || entry.bytes < sizeof(GraphDefinition)) return false;
+        const auto &definition = *reinterpret_cast<const GraphDefinition *>(source);
+        if (definition.total_bytes != entry.bytes || definition.full_key != entry.full_key ||
+            !valid_definition_external_tensors(definition))
+            return false;
+    }
+    return true;
+}
 
 int copy_definitions(
     const GraphBuild &build, std::byte *out, uint64_t capacity, std::unordered_map<uint64_t, DefinitionImage> &images
@@ -171,10 +228,11 @@ int make_graph_launch_template(
 ) try {
     if (!build.build_complete || !build.graph_state || build.workspace.sm_mirror == nullptr || build.total_tasks < 0)
         return PTO_RUNTIME_ERR_INVALID_STATE;
-    if (identity.callable_id < 0 || identity.tensor_count < 0 || identity.scalar_count < 0 ||
-        identity.tensor_count > CHIP_MAX_TENSOR_ARGS || identity.scalar_count > CHIP_MAX_SCALAR_ARGS ||
-        identity.callable_hash == 0 || identity.argument_hash == 0 || identity.function_hash == 0 ||
-        runtime_binary_id == 0)
+    if (identity.callable_id < 0 || identity.callable_id >= MAX_REGISTERED_CALLABLE_IDS ||
+        !simpler::kernel::valid_invocation_counts(identity.tensor_count, identity.scalar_count) ||
+        !simpler::kernel::valid_host_copy_tensor_count(identity.tensor_count, identity.host_copy_tensor_count) ||
+        identity.callable_hash == 0 || identity.argument_hash == 0 ||
+        identity.function_hash == 0 || runtime_binary_id == 0)
         return PTO_RUNTIME_ERR_INTERNAL;
     RuntimeArenaLayout layout{};
     int rc = make_kernel_graph_layout(build.workspace.task_capacity, layout);
@@ -186,6 +244,7 @@ int make_graph_launch_template(
         build.bind_usage.scalar_elems > mirror.scalar_elems ||
         build.image_bytes != sm_layout::segment_offsets(sm_layout::image_extents(build.bind_usage)).end)
         return PTO_RUNTIME_ERR_CAPACITY_EXCEEDED;
+    if (!valid_build_external_tensors(build)) return PTO_RUNTIME_ERR_INTERNAL;
     GraphResourceRequirements required{};
     rc = get_graph_resource_requirements(build, layout, required);
     if (rc != 0) return rc;
@@ -261,6 +320,7 @@ int make_graph_launch_template(
     invocation.callable_id = identity.callable_id;
     invocation.tensor_count = identity.tensor_count;
     invocation.scalar_count = identity.scalar_count;
+    invocation.host_copy_tensor_count = identity.host_copy_tensor_count;
     invocation.payload_bytes = header.total_bytes;
     std::memcpy(packet, &invocation, sizeof(invocation));
     std::memcpy(packet + sizeof(invocation), &header, sizeof(header));

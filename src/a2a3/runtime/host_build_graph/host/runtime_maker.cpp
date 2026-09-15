@@ -60,6 +60,7 @@
 #include "host_build_graph/graph_host_state.h"
 #include "host_build_graph/host_graph_build.h"
 #include "host_build_graph/graph_definition_pack.h"
+#include "orchestration_requirements.h"
 #include "host_build_graph/host_phase_trace.h"
 #include "host_build_graph/orchestrator.h"
 #include "host_build_graph/ready_queue_sizing.h"
@@ -1009,6 +1010,13 @@ extern "C" int register_callable_impl(const ChipCallable *callable, const HostAp
         auto *eps = new HostOrchEntryPoints{};
         eps->entry = reinterpret_cast<OrchestrationEntryFunc>(entry);
         eps->bind = reinterpret_cast<OrchestrationBindFunc>(bind_sym);
+        if (void *requirements_sym = dlsym(handle, simpler::orchestration::REQUIREMENTS_V1_SYMBOL);
+            requirements_sym != nullptr) {
+            const auto requirements =
+                reinterpret_cast<simpler::orchestration::RequirementsV1Function>(requirements_sym);
+            eps->requirements_v1 = requirements();
+            eps->requirements_v1_available = true;
+        }
         out->host_dlopen_handle = handle;
         out->host_orch_func_ptr = eps;
         LOG_INFO("host-orch: loaded orchestration entry '%s' on host", orch_func_name);
@@ -1404,4 +1412,14 @@ extern "C" const char *const *runtime_extra_aicpu_symbols(size_t *count) {
         *count = 0;
     }
     return nullptr;
+}
+
+// Kernel mode uses a separate loader manifest so its context registration
+// cannot change the program-mode runtime's resolved entry set.
+extern "C" const char *const *runtime_l1_extra_aicpu_symbols(size_t *count) {
+    static const char *const kExtra[] = {"simpler_aicpu_l1_hbg_register_execution_slot"};
+    if (count != nullptr) {
+        *count = sizeof(kExtra) / sizeof(kExtra[0]);
+    }
+    return kExtra;
 }

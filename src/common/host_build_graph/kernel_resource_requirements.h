@@ -152,7 +152,7 @@ public:
         return context.prepare_resources(layout, ops);
     }
 
-    static constexpr uint64_t resource_schema = 0x4842470000000002ULL;
+    static constexpr uint64_t resource_schema = 0x4842470000000003ULL;
 
     PipelineContract pipeline_contract() const {
         return {
