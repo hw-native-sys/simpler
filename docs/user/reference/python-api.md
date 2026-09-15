@@ -35,6 +35,7 @@ into `**config` and validated later. The recognized keys:
 | --- | ---------- | ------- |
 | `platform` | all | `a2a3`, `a2a3sim`, `a5`, `a5sim` |
 | `runtime` | all | `tensormap_and_ringbuffer` or `host_build_graph` |
+| `execution_mode` | L2 | `"program"` (default) or `"kernel"`; see [Kernel mode](#kernel-mode-l2). `"kernel"` with `level != 2` or a truthy `enable_sdma` raises `ValueError`, as does an unknown value |
 | `device_id` | L2 | the single chip this worker drives |
 | `device_ids` | L3+ | one chip child process per entry |
 | `num_sub_workers` | L3+ | host-side Python callables to fork |
@@ -53,8 +54,8 @@ else raises. Remote-worker and remote-memory calls require `level >= 4`.
 | `unregister(handle_or_slot)` | Releases a registration |
 | `add_worker(worker) -> int` | Attaches a child worker; returns its id |
 | `add_remote_worker(spec: RemoteWorkerSpec) -> int` | L4; see the remote-L3 design doc |
-| `init(prewarm_config=None)` | Resolves runtime binaries, opens the device, forks children. First place setup errors appear |
-| `close()` | Releases the device and reaps children. Put it in a `finally` — a skipped `close()` leaves the device held |
+| `init(prewarm_config=None, *, config=None)` | Resolves runtime binaries, opens the device, forks children. First place setup errors appear. `config=` is kernel mode's required context config and is refused in program mode; kernel mode refuses `prewarm_config` |
+| `close()` | Releases the device and reaps children. Put it in a `finally` — a skipped `close()` leaves the device held. In `execution_mode="kernel"` it releases only the context; see [Kernel mode](#kernel-mode-l2) |
 
 ### Memory
 
@@ -97,6 +98,71 @@ callable is a **Python orchestration function** `f(orch, args, cfg)`, where
 | `allocate_domain(*, name, workers, window_size, buffers=())` | Context manager returning a handle indexed by domain-local rank |
 | `alloc_child_tensor(worker_id, shapes, dtype) -> Buffer` | Delegates allocation to the owning Worker; target chip memory is named by the returned handle |
 
+### Kernel mode (L2)
+
+`Worker(level=2, execution_mode="kernel")` is the entry for a framework that
+already owns the device and its streams. The Worker borrows the device that is
+current on the calling thread. Each launch enqueues bounded asynchronous work
+on the caller's stream and returns without synchronizing.
+
+| Member | Notes |
+| ------ | ----- |
+| `init(*, config: CallConfig)` | Kernel init on the already-current `device_id`. `config` is required and validated; it is fixed for the life of the context. A positional argument binds to `prewarm_config` and is refused, so pass `config=CallConfig(...)`. There is no prewarm, no SDMA, and no replay of registrations |
+| `kernel_mode_supported -> bool` | Property. `False` when `level != 2`. Otherwise it reports whether the configured platform/runtime build supports kernel mode, whatever the `execution_mode`. The build is probed once, without touching a device, and the result is cached, so it can be asked before `init()` or before choosing a mode. Missing runtime binaries raise rather than answer `False` |
+| `kernel_prepare_callable(chip_callable: ChipCallable) -> int` | Uploads the callable and returns the id the runtime minted. It blocks until device-side registration finishes, so a registration failure raises from this call. There is no deduplication: the same callable prepared twice gets two ids. It is unrelated to `register()`. Call it outside ACLGraph capture. The Worker keeps the callable alive until `close()` |
+| `kernel_launch(callable_id: int, args: ChipStorageTaskArgs, *, caller_stream: int) -> None` | Enqueues one invocation on `caller_stream`, a nonzero `aclrtStream` address, and returns. Returning means enqueued; device-side errors surface when the caller synchronizes its own stream. No `RunHandle`, no wait. An id this Worker did not mint or a zero stream raises `ValueError`, and any other `args` type raises `TypeError`. A launch that overlaps a prepare, launch or close raises `RuntimeError` at once rather than waiting |
+| `close()` | Releases only the resources the context owns. It never synchronizes the caller's stream, resets the device, or finalizes ACL |
+
+In kernel mode these raise `RuntimeError`: `register` (also before `init()`),
+`unregister`, `run`, `submit`, `malloc`, `free`, `copy_to`, `copy_from`,
+`create_buffer`, `make_tensor_arg`, `release_buffer`, and `device_memory_info`.
+`committed_device_memory` stays available. In program mode, `kernel_prepare_callable`
+and `kernel_launch` raise `RuntimeError`.
+
+The caller's side of the contract:
+
+- `device_id` is already current on the thread that calls `init()`, and that
+  thread also calls `close()`.
+- `args` tensors are `ChipTensor.make(addr, shapes, dtype, child_memory=True)`
+  views of caller-owned device memory. The caller keeps `caller_stream` alive
+  until the work it submitted completes.
+- The caller serializes `kernel_prepare_callable`, `kernel_launch` and `close()`.
+- Before `close()`, the caller stops launching, synchronizes its own stream, and
+  destroys every graph that replays the context. Synchronizing, resetting the
+  device and finalizing ACL after `close()` are also the caller's job.
+- `close()` raises `TimeoutError` when an in-flight prepare or launch does not
+  finish within the rollback grace period, and `RuntimeError` when native
+  teardown fails. In both cases the context is kept, and a later `close()`
+  retries.
+- Only the process that called `init()` may prepare, launch or close; a forked
+  child gets `RuntimeError`. Kernel mode has no L3+ form.
+- A kernel Worker that is garbage-collected, or still open at interpreter exit,
+  without `close()` emits a `ResourceWarning`. Its native context is leaked on
+  purpose rather than finalized on an arbitrary thread.
+
+```python
+from simpler import Worker
+from simpler.task_interface import CallConfig, ChipStorageTaskArgs, ChipTensor, DataType
+
+# The framework has made device 0 current on this thread and owns `stream`,
+# the device buffers `x_addr` / `y_addr`, and `chip_callable`.
+worker = Worker(level=2, execution_mode="kernel", device_id=0,
+                platform="a2a3", runtime="tensormap_and_ringbuffer")
+if not worker.kernel_mode_supported:
+    raise RuntimeError("this runtime build has no kernel mode")
+worker.init(config=CallConfig())
+try:
+    cid = worker.kernel_prepare_callable(chip_callable)
+    args = ChipStorageTaskArgs()
+    args.add_tensor(ChipTensor.make(x_addr, (n,), DataType.FLOAT32, child_memory=True))
+    args.add_tensor(ChipTensor.make(y_addr, (n,), DataType.FLOAT32, child_memory=True))
+    args.add_scalar(1.25)
+    worker.kernel_launch(cid, args, caller_stream=stream)
+    synchronize(stream)  # the framework's own stream synchronize; device errors surface here
+finally:
+    worker.close()
+```
+
 ## Callables and task args
 
 ```python
@@ -120,7 +186,8 @@ including for callables loaded from cached bytes. The tensor count is
 Public `Worker` calls use `TaskArgs` containing address-free `Tensor` views at
 every level. The L2 leaf resolves those views into the internal
 `ChipStorageTaskArgs` / `ChipTensor` representation; callers do not pass that
-internal representation to `Worker.run()`.
+internal representation to `Worker.run()`. The exception is kernel mode's
+`kernel_launch`, which takes a caller-built `ChipStorageTaskArgs` directly.
 
 For L3+ graph construction, `TaskArgs.add_dep(*handles)` adds `WAIT | RETAIN`
 edges: each consumer waits for its producers and keeps their task-owned

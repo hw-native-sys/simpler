@@ -20,6 +20,13 @@ kernel 模式下，simpler 是一个被调用的库：它借用调用方已经�
 直接调用 host runtime 动态库，自己扮演调用方，不经过 PyTorch，也不经过 simpler
 的 Python Worker。
 
+经过 Worker 的是另外两个文件，入口都是 `Worker(level=2, execution_mode="kernel")`：
+
+| 文件 | 硬件 | 覆盖 |
+| ---- | ---- | ---- |
+| `tests/ut/py/test_worker/test_worker_kernel_mode.py` | 不需要 | 用假的 ChipWorker 检查参数校验、`init(config=...)` 的路由、program 与 kernel 两种模式的接口互斥、prepare/launch/close 之间的串行闸门，以及 teardown 失败后 `close()` 可重试 |
+| `tests/ut/py/test_worker/test_worker_kernel_mode_hw.py` | a2a3 真机 | 调用方自己设卡、建 stream，经 `init(config=...)`、`kernel_prepare_callable`、`kernel_launch(..., caller_stream=...)` 和 `close()` 驱动 kernel 模式，再同步自己的 stream 核对结果 |
+
 被执行的算子是一个 AIV 向量加标量，`y[i] = x[i] + scalar`：
 
 | 组成 | 源文件 | 编译产物 |

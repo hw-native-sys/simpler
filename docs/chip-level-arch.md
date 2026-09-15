@@ -180,6 +180,13 @@ level model (see [hierarchical-level-runtime.md](hierarchical-level-runtime.md))
 `CallConfig` is the exception — same type used at every level, with no
 `Chip*` / unprefixed split (see [task-flow.md](task-flow.md) for details).
 The unified `Worker(level=N)` factory already routes to the correct backend.
+At `level=2` the default `execution_mode="program"` drives `ChipWorker.init` /
+`run`. `Worker(level=2, execution_mode="kernel")` routes to the kernel entries
+instead: `init(config=...)` to `ChipWorker.kernel_init`,
+`kernel_prepare_callable` / `kernel_launch` to `ChipWorker.kernel_*`, and
+`close()` to `ChipWorker.finalize`. Its `kernel_mode_supported` property
+answers through `ChipWorker.probe_kernel_mode_supported`, before init and without
+touching a device. Kernel mode has no L3+ route.
 When new level-specific types are added (e.g. `ChipCallable`), each concept
 should follow the same pattern: a `Chip*` concrete type for L2, a prefix-less
 concrete type for L3+, and optionally a factory function that routes by level.

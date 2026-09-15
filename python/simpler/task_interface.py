@@ -1523,6 +1523,34 @@ class ChipWorker:
             with self._lifecycle_lock:
                 self._init_in_progress = False
 
+    @staticmethod
+    def probe_kernel_mode_supported(bins: Any, log_level: int | None = None) -> bool:
+        """Whether the host runtime in ``bins`` can execute kernel-mode launches.
+
+        Answers before init and independently of every ChipWorker: the native
+        probe loads the host runtime, asks it on a fresh device context that no
+        init touches, and destroys that context before returning. The runtime
+        build alone decides the answer, so no device is taken, no thread is
+        attached, and the caller needs no current device.
+
+        Args:
+            bins: same structural type init() takes; only host_path and
+                sim_context_path are read.
+            log_level: as for init().
+
+        Raises:
+            RuntimeError: the host runtime cannot be loaded, lacks a required
+                symbol, or yields no device context.
+        """
+        _initialize_host_log(log_level)
+        sim_context_path = getattr(bins, "sim_context_path", None)
+        return bool(
+            _ChipWorker.probe_kernel_mode_supported(
+                str(bins.host_path),
+                "" if sim_context_path is None else str(sim_context_path),
+            )
+        )
+
     @property
     def kernel_mode_supported(self) -> bool:
         """Whether the bound runtime can execute kernel-mode launches."""
@@ -1536,8 +1564,9 @@ class ChipWorker:
         valid ids, and there is no lookup. It takes no stream — registration
         enqueues on the context's own AICPU stream, which every later launch
         also enqueues on, so stream FIFO orders registration ahead of each
-        launch. Errors surface through the caller's own warmup plus
-        synchronize.
+        launch. Registration synchronizes that context stream before committing
+        the callable, so a device-side registration failure raises from this
+        call; it synchronizes no caller stream and no device.
         """
         callable_id = int(self._impl.kernel_prepare_callable(chip_callable))
         # The registry owns the image for the life of the context: the device
