@@ -120,11 +120,23 @@ class TestDeviceOrchestrationClockCapture(TestChipSwimlane):
     """Clock captures and disabled runs alternate on the same worker."""
 
     _swimlane_level = 4
+    _clock_capture_paths: tuple[Path, ...] = ()
 
     def test_run(self, st_platform, st_worker, request):
         for level in (4, 0, 4, 0):
             self._swimlane_level = level
+            self._clock_capture_paths = ()
             SceneTestCase.test_run(self, st_platform, st_worker, request)
+            # Artifact checks cover every case even when golden comparison is disabled.
+            for path in self._clock_capture_paths:
+                assert path.is_file(), f"missing device orchestration capture: {path}"
+                records = json.loads(path.read_text())
+                assert any(records.get("aicpu_orchestrator_phases", [])), "AICPU orchestration records missing"
+                assert "orchestrator_source" not in records["metadata"]
+                anchors = records["metadata"].get("clock_anchors", {}).get("samples", [])
+                assert any(sample["error"] is None and sample["device_cycles"] > 0 for sample in anchors), (
+                    "no valid clock anchor was captured"
+                )
 
     def _build_config(self, config_dict, *args, **kwargs):
         config = super()._build_config(config_dict, *args, **kwargs)
@@ -132,22 +144,12 @@ class TestDeviceOrchestrationClockCapture(TestChipSwimlane):
         config.capture_clock_anchors = bool(self._swimlane_level)
         if not config.output_prefix:
             config.output_prefix = str(build_output_prefix(f"{type(self).__name__}_{time.monotonic_ns()}"))
-        self._clock_capture_path = Path(config.output_prefix) / "chip_swimlane_records.json"
+        if self._swimlane_level:
+            path = Path(config.output_prefix) / "chip_swimlane_records.json"
+            # CLI-generated prefixes can repeat for the same case within one second.
+            path.unlink(missing_ok=True)
+            self._clock_capture_paths += (path,)
         return config
-
-    def compare_outputs(self, test_args, golden_args, output_names, params):
-        super().compare_outputs(test_args, golden_args, output_names, params)
-        if not self._swimlane_level:
-            return
-        path = self._clock_capture_path
-        assert path.is_file(), f"missing device orchestration capture: {path}"
-        records = json.loads(path.read_text())
-        assert any(records.get("aicpu_orchestrator_phases", [])), "AICPU orchestration records missing"
-        assert records["metadata"].get("orchestrator_source") != "host"
-        anchors = records["metadata"].get("clock_anchors", {}).get("samples", [])
-        assert any(sample["error"] is None and sample["device_cycles"] > 0 for sample in anchors), (
-            "no valid clock anchor was captured"
-        )
 
 
 if __name__ == "__main__":
