@@ -975,6 +975,13 @@ int simpler_run(
     return finalize_rc != 0 ? finalize_rc : rc;
 }
 
+// Sim prepares under the exclusive execution claim: `simpler_prepare_run` takes
+// `try_acquire_native_run` before it binds, and rejects a second run with
+// "another native run is active on this device context". There is also no
+// `try_reserve_native_run` on this base for a successor to hold — reservation
+// exists only onboard. So depth-2 pipelining is unreachable here rather than
+// switched off, and every overlap-dependent path in the shared runner base is
+// dead code when built for sim.
 int supports_concurrent_native_prepare_ctx(DeviceContextHandle) { return 0; }
 
 uint64_t get_arena_bank_gm_heap_base_ctx(DeviceContextHandle ctx, uint32_t bank_id) {

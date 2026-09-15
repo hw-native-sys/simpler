@@ -588,8 +588,12 @@ protected:
     // Not a collector: the pool the runtime's prepare path writes into, read by
     // whichever per-event views the run enabled. Its two readers are gated
     // independently, so it belongs to neither.
-    // One per pipeline slot: a bind is preparation, and a prepared successor
-    // binds while its predecessor still owns the collectors.
+    // One entry per pipeline slot, indexed by the run descriptor's slot. Only
+    // one is ever live here — sim prepares under the exclusive execution claim,
+    // so it stages no successor (see `supports_concurrent_native_prepare_ctx`
+    // in c_api_shared.cpp). The array keeps this storage the same shape as the
+    // onboard base's, which is what lets the shared host-phase code index by
+    // slot without a per-platform branch.
     std::array<HostPhaseRunState, PTO_PIPELINE_MAX_DEPTH> host_phase_runs_{};
     // Which slot's session the resident collector holds; see the onboard base.
     uint32_t clock_correlation_session_slot_{PTO_PIPELINE_MAX_DEPTH};
