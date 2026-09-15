@@ -358,11 +358,19 @@ python -m pytest <case> --platform <platform> --device 0 --enable-chip-swimlane 
   appear on the `graph record worker` lane, while outer `graph_submit` events
   appear on the `graph submit main` lane.
 
-- **The host lanes of `chip_swimlane_records.json`**, at level 4 only. These
-  records are already Host ns; the device records reach the same axis through
-  the `chip.run.runner_run` window that contained them, which bounds the seam
-  rather than closing it (see `simpler_setup/tools/containment.py`). Two
-  projections of the pool land there:
+- **The host lanes of `chip_swimlane_records.json`**, normally at level 4.
+  An independently enabled `SIMPLER_HBG_HOST_PHASE_RECORDS_ENABLE=1` pool can
+  also supply them at level 3 through the shared export path. These records are
+  already Host ns. At level 3 or 4, automatic single-file conversion uses matching
+  TIMING-or-finer Host logs to place Device records within `chip.run.runner_run`.
+  The AICPU launch marker, when present, narrows the placement range. Conversion
+  saves `metadata.clock_alignment` anchors and bounds for source-file readers
+  (see `simpler_setup/tools/containment.py`). Without usable logs or a valid saved
+  mapping, the view remains unaligned. Captures with Host recording armed and finished at level 3 or 4
+  export `host_clock_alignment.<pid>.log` beside the swimlane during native
+  finalize, after the executing process's TIMING-or-finer logs are flushed.
+  This applies to direct L2 and forked ChipWorker runs without SceneTest.
+  Two projections land there:
 
   | Key | Kinds | Rendered as |
   | --- | ----- | ----------- |

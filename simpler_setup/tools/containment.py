@@ -17,14 +17,21 @@ the outer window*. For a Chip Swimlane capture the chain is
       └─ chip.run.runner_run.device_wall    device sys-counter, ts = 0
            └─ the capture's records         device sys-counter, absolute cycles
 
-so an event's placement error is the outer window's *slack* — how much wider it
-is than the work it brackets — and that term is measured, never estimated:
+so the outer window bounds the device block's placement. For a chosen
+device-phase join, the block can slide through the window's spare width:
 
-    slack     = outer_duration - device_extent
-    placement in [outer_start, outer_start + slack]
+    outer_slack = outer_duration - device_extent
+    placement in [outer_start, outer_start + outer_slack]
 
-Nothing here reads a Host/Device clock anchor. Two unknowns stand between a raw
-cycle and the Host axis, and containment bounds both:
+When present, the Host-side AICPU launch marker narrows that interval by the
+causal statement ``aicpu_launch <= device_start``. This raises the interval's
+lower endpoint and narrows the published ``slack`` to the interval that remains.
+The rendering selects the later of the runner start and launch time as the
+block's start. It does not measure the true device start or clock offset.
+
+This module does not consume the capture's ``clock_anchors`` samples. Two
+unknowns stand between a raw cycle and the Host axis, and containment bounds
+both:
 
 ``origin_cycles``
     The cycle that device-phase time zero sits on. The host log carries the
@@ -42,9 +49,10 @@ Same-host Ranks need nothing further: ``runner_run`` endpoints are
 CLOCK_MONOTONIC and same-host cross-process comparable
 (``docs/dfx/host-trace.md``), so each Rank's window is already on one axis.
 
-The bound cannot be wrong, only loose. A reader who needs to know whether two
-events are separable compares their gap against the sum of their slacks; a gap
-below that sum is undecided, not zero.
+These bounds assume correctly matched artifacts, enclosing Host spans, and the
+capture's counter frequency. ``slack_ns`` bounds placement freedom for a chosen
+join; serialized ``join.residual_ns`` reports the separate device-phase origin
+range. Both must be considered when interpreting event order across clock domains.
 """
 
 import math
@@ -55,6 +63,7 @@ from typing import Optional
 RUN_SPAN = "chip.run"
 RUNNER_SPAN = "chip.run.runner_run"
 DEVICE_WALL_SPAN = "chip.run.runner_run.device_wall"
+AICPU_LAUNCH_SPAN = "chip.run.runner_run.aicpu_launch"
 
 _PHASE_PREFIX = DEVICE_WALL_SPAN + "."
 
@@ -108,8 +117,9 @@ class HostWindow:
     ``phases`` holds the ``device_wall`` sub-phase spans as
     ``name -> (ts_ns, dur_ns)`` on the device-phase timeline, whose zero is the
     earliest sub-phase start (``DeviceRunnerBase::read_device_wall_ns``).
-    ``device_wall`` itself is emitted at ``ts = 0`` by convention and its own
-    start is not published, so it bounds a duration and never a position.
+    ``device_wall`` itself is emitted at ``ts = 0`` by convention. Containment
+    uses its duration and relative sub-phases, not its optional absolute cycle
+    attributes.
 
     ``identity`` is the dispatch the root ``chip.run`` span names, or ``None``
     for an invocation that carries none — a run outside the prepared-native
@@ -123,6 +133,7 @@ class HostWindow:
     device_wall_ns: int
     phases: dict[str, tuple[int, int]]
     identity: Optional[tuple[int, ...]] = None
+    aicpu_launch_ns: Optional[int] = None
 
     @property
     def end_ns(self):
@@ -151,21 +162,21 @@ class Join:
     sources: tuple[str, ...]
 
     @property
-    def residual_ns(self):
-        """Width of the surviving offset interval — the join's own error bar."""
+    def residual_cycles(self):
+        """Width of the surviving device-phase offset interval, in cycles."""
         return self.interval_cycles[1] - self.interval_cycles[0]
 
     def metadata(self, frequency_hz):
         return {
             "sources": list(self.sources),
             "origin_cycles": int(round(self.origin_cycles)),
-            "residual_ns": int(round(_cycles_to_ns(self.residual_ns, frequency_hz))),
+            "residual_ns": int(round(_cycles_to_ns(self.residual_cycles, frequency_hz))),
         }
 
 
 @dataclass(frozen=True)
 class Placement:
-    """One capture's provable position on the Host CLOCK_MONOTONIC axis."""
+    """One capture's bounded display placement on the Host CLOCK_MONOTONIC axis."""
 
     host: HostWindow
     capture: Optional[CaptureWindows]
@@ -177,9 +188,9 @@ class Placement:
     def head_phase_ns(self):
         """The device-phase instant the placed block starts at.
 
-        Zero is the earliest sub-phase start, so device activity begins there
-        even when the first thing drawn comes later. A capture whose records
-        precede every sub-phase moves it earlier.
+        Zero is the earliest logged sub-phase start. The placed block includes
+        that point even if its first captured record comes later; records
+        before that point extend the block to negative phase time.
         """
         return min(0.0, self.lo_phase_ns)
 
@@ -187,30 +198,39 @@ class Placement:
     def extent_ns(self):
         """How much device time must fit inside the Host window.
 
-        ``device_wall`` brackets the whole on-NPU run and so is a lower bound on
-        the extent even when less than that is drawn; what is drawn bounds it
-        from the other side whenever a record sits past the run wall's own end.
+        The block includes the logged AICPU ``device_wall`` duration even when
+        fewer records are drawn. Capture records outside that relative wall
+        extend the block; it does not measure unrecorded Device startup.
         """
         return max(self.host.device_wall_ns, self.hi_phase_ns) - self.head_phase_ns
 
     @property
-    def slack_ns(self):
+    def outer_slack_ns(self):
+        """Placement width before applying a Host-side causal marker."""
         return self.host.duration_ns - self.extent_ns
 
     @property
     def place_lo_ns(self):
         """Earliest Host ns the placed block can start at — the placement used."""
-        return float(self.host.start_ns)
+        lower_bound = float(self.host.start_ns)
+        if self.host.aicpu_launch_ns is not None:
+            lower_bound = max(lower_bound, float(self.host.aicpu_launch_ns))
+        return lower_bound
 
     @property
     def place_hi_ns(self):
-        return self.host.start_ns + self.slack_ns
+        return self.host.start_ns + self.outer_slack_ns
+
+    @property
+    def slack_ns(self):
+        """Width of the placement interval after every known constraint."""
+        return self.place_hi_ns - self.place_lo_ns
 
     def phase_ns_to_host_ns(self, phase_ns):
         return self.place_lo_ns + (phase_ns - self.head_phase_ns)
 
     def map_cycles_to_host_ns(self, cycles):
-        """Place one raw device cycle on the Host axis, at its lower bound."""
+        """Map a raw device cycle using the chosen join and earliest block start."""
         if self.capture is None or self.join is None:
             raise ContainmentError("this placement carries no capture, so it maps no raw cycles")
         phase_ns = _cycles_to_ns(cycles - self.join.origin_cycles, self.capture.frequency_hz)
@@ -226,12 +246,16 @@ class Placement:
             "outer_duration_ns": self.host.duration_ns,
             "device_wall_ns": self.host.device_wall_ns,
             "device_extent_ns": int(round(self.extent_ns)),
+            "outer_slack_ns": int(round(self.outer_slack_ns)),
             "slack_ns": int(round(self.slack_ns)),
             "place_lo_ns": int(round(self.place_lo_ns)),
             "place_hi_ns": int(round(self.place_hi_ns)),
         }
         if self.join is not None and self.capture is not None:
             out["join"] = self.join.metadata(self.capture.frequency_hz)
+        if self.host.aicpu_launch_ns is not None:
+            out["aicpu_launch_ns"] = self.host.aicpu_launch_ns
+            out["causal_constraint"] = "aicpu_launch<=device_start"
         return out
 
 
@@ -240,7 +264,8 @@ def _host_identity(span):
 
     The four fields are written as one ``snprintf`` and are therefore all
     present or all absent; a partial set means the log is not what it claims and
-    is treated as no identity rather than as a half key.
+    is treated as no identity rather than as a half key. Synchronous launches
+    use zero run/dispatch IDs and likewise carry no dispatch identity.
     """
     if span is None:
         return None
@@ -252,7 +277,7 @@ def _host_identity(span):
                 found[key] = int(value)
             except ValueError:
                 return None
-    if len(found) != len(_HOST_IDENTITY_FIELDS):
+    if len(found) != len(_HOST_IDENTITY_FIELDS) or found["run_id"] == found["dispatch_id"] == 0:
         return None
     return tuple(found[field] for field in _HOST_IDENTITY_FIELDS)
 
@@ -292,6 +317,13 @@ def host_windows(spans):
         device_wall = named.get(DEVICE_WALL_SPAN)
         if runner is None or device_wall is None:
             continue
+        launch = named.get(AICPU_LAUNCH_SPAN)
+        if launch is not None and (
+            launch.is_device or launch.dur != 0 or not runner.ts <= launch.ts <= runner.ts + runner.dur
+        ):
+            raise ContainmentError(
+                "invalid AICPU launch marker: expected Host clock, zero duration, and time within runner window"
+            )
         phases = {
             name[len(_PHASE_PREFIX) :]: (span.ts, span.dur)
             for name, span in named.items()
@@ -306,6 +338,7 @@ def host_windows(spans):
                 device_wall_ns=device_wall.dur,
                 phases=phases,
                 identity=_host_identity(named.get(RUN_SPAN)),
+                aicpu_launch_ns=(named[AICPU_LAUNCH_SPAN].ts if AICPU_LAUNCH_SPAN in named else None),
             )
         )
     return windows
@@ -339,6 +372,26 @@ def _stream_bounds(data, stream):
     )
 
 
+def _scheduler_phase_streams(data):
+    """Yield (producer, records), preferring the versioned wire format."""
+    section = data.get("scheduler_records")
+    if section is None:
+        yield "aicpu", list(_phase_records(data.get("aicpu_scheduler_phases")))
+        return
+    if not isinstance(section, dict) or section.get("schema_version") != 1:
+        raise ContainmentError("unsupported scheduler_records schema")
+    streams = section.get("streams")
+    if not isinstance(streams, list):
+        raise ContainmentError("scheduler_records.streams must be an array")
+    for stream in streams:
+        if not isinstance(stream, dict) or not isinstance(stream.get("records"), list):
+            raise ContainmentError("scheduler stream must contain a records array")
+        records = stream["records"]
+        if any(not isinstance(record, dict) for record in records):
+            raise ContainmentError("scheduler phase records must be objects")
+        yield stream.get("producer"), records
+
+
 def capture_windows(data):
     """Read one ``chip_swimlane_records.json`` document's device-cycle extent.
 
@@ -365,9 +418,15 @@ def capture_windows(data):
     scheduler_tasks = data.get("scheduler_tasks") or {}
     for row in scheduler_tasks.get("records") or []:
         cycles.extend(int(value) for value in row[2:4])
-    for stream in ("aicpu_scheduler_phases", "aicpu_orchestrator_phases"):
-        for record in _phase_records(data.get(stream)):
-            cycles.extend(int(record.get(field, 0)) for field in ("start_cycles", "end_cycles"))
+    scheduler_streams = list(_scheduler_phase_streams(data))
+    for _producer, records in scheduler_streams:
+        for record in records:
+            start, end = int(record["start_cycles"]), int(record["end_cycles"])
+            if end < start:
+                raise ContainmentError("scheduler phase has a negative interval")
+            cycles.extend((start, end))
+    for record in _phase_records(data.get("aicpu_orchestrator_phases")):
+        cycles.extend(int(record.get(field, 0)) for field in ("start_cycles", "end_cycles"))
     # Lifecycle records name their instants one field per event rather than as
     # a start/end pair, and the set grows with the control plane, so this reads
     # the suffix instead of a field list that would drift from the decoder's.
@@ -387,7 +446,20 @@ def capture_windows(data):
 
     windows = {}
     for short_name, stream in _JOIN_STREAMS:
-        bounds = _stream_bounds(data, stream)
+        if short_name == "sched":
+            # The logged sched window belongs to AICPU. Other producers still
+            # contribute to the full extent, but cannot narrow this phase join.
+            bounds = _cycle_bounds(
+                [
+                    int(record[field])
+                    for producer, records in scheduler_streams
+                    if producer == "aicpu"
+                    for record in records
+                    for field in ("start_cycles", "end_cycles")
+                ]
+            )
+        else:
+            bounds = _stream_bounds(data, stream)
         if bounds is not None:
             windows[short_name] = bounds
     return CaptureWindows(frequency_hz=frequency_hz, extent=extent, windows=windows)
@@ -423,9 +495,8 @@ def join_origin(host, capture):
         if window is not None and records is not None:
             narrow(window, records, short_name)
 
-    # device_wall covers the whole run, but its own start is not published, so
-    # it bounds only through the sub-phase timeline it contains: everything
-    # drawn must fit inside a window of that length.
+    # On the relative phase timeline, every drawn record must fit within
+    # the device_wall duration. Absolute cycle attributes are not consumed.
     narrow((0, host.device_wall_ns), capture.extent, "device_wall")
 
     if lo > hi:
@@ -441,9 +512,9 @@ def place(host, capture=None, join=None):
 
     With a ``capture``, that capture's records are joined onto the same
     device-phase timeline and placed alongside the ``device_wall`` sub-phases
-    the Host log carries. The cross-Rank merge is the only caller and always
-    passes one; the capture-less form bounds the Host log's own ``clk=dev``
-    spans and is exercised by the unit tests alone.
+    the Host log carries. Single-capture and cross-Rank conversion both pass
+    one; the capture-less form bounds the Host log's own ``clk=dev`` spans and
+    is exercised by the unit tests alone.
     """
     if capture is not None and join is None:
         join = join_origin(host, capture)
@@ -466,10 +537,15 @@ def place(host, capture=None, join=None):
         lo_phase_ns=lo_phase_ns,
         hi_phase_ns=hi_phase_ns,
     )
-    if placement.slack_ns < 0:
+    if placement.outer_slack_ns < 0:
         raise ContainmentError(
             f"pid {host.pid} inv {host.inv} draws {placement.extent_ns / 1000.0:.1f} us of device work "
             f"but its {RUNNER_SPAN} window is only {host.duration_ns / 1000.0:.1f} us wide"
+        )
+    if placement.slack_ns < 0:
+        raise ContainmentError(
+            f"pid {host.pid} inv {host.inv} has no legal placement: its {AICPU_LAUNCH_SPAN} marker "
+            "would put the device block outside the runner window"
         )
     return placement
 
@@ -481,6 +557,14 @@ def _pairing_cost(host, capture):
     stream covers nearly all of its phase window, so the true pairing is the
     small one. A pairing that is not even feasible costs infinity.
     """
+    # A candidate must satisfy every constraint that the following placement
+    # step will enforce. In particular, a late launch marker can leave no room
+    # for the device extent even when the outer window alone is wide enough.
+    try:
+        place(host, capture)
+    except ContainmentError:
+        return math.inf
+
     cost = 0.0
     matched = 0
     for short_name in capture.windows:
@@ -682,9 +766,9 @@ def pair_captures(hosts, captures, *, forced=None, identities=None, host_pids=No
         raise ContainmentError(
             f"the captures pair ambiguously with the Host log's invocations: the best match is off by "
             f"{best_cost / 1000.0:.1f} us of window and the next by {runner_up / 1000.0:.1f} us, which is too "
-            "close to tell apart. Ranks running the same shape leave nothing in the timing that names the other, "
-            "so re-run so the captures carry dispatch_identity.json with its host_pid, or pin the pairing "
-            "explicitly (--rank-pid RANK=PID:INV)."
+            "close to tell apart. Repeated runs or Ranks with the same shape leave nothing in the timing that "
+            "names the other. Re-run so the captures carry dispatch_identity.json with its host_pid, or pin the "
+            "pairing explicitly (--rank-pid RANK=PID:INV)."
         )
 
     sources = dict.fromkeys(pinned, "pinned")

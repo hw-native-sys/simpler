@@ -48,7 +48,9 @@ TEST(HostLogCrossDsoTest, BoundConsumerUsesProcessOwnedFileSink) {
 
     owner.log(LogLevel::ERROR, "owner", "owner-record");
     emit();
-    ASSERT_TRUE(owner.flush());
+    auto flush = reinterpret_cast<int (*)()>(dlsym(handle, "test_host_log_consumer_flush"));
+    ASSERT_NE(flush, nullptr);
+    ASSERT_EQ(flush(), 1) << "a bound runtime consumer must drain the process owner's accepted records";
     EXPECT_EQ(start_writer(), 1) << "a bound consumer should recognize the already-published owner sink";
 
     const std::string path = std::string(directory) + "/host." + std::to_string(static_cast<int>(getpid())) + ".log";

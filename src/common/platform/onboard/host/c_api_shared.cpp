@@ -50,6 +50,7 @@
 #include "common/unified_log.h"
 #include "host/acl_error_log.h"
 #include "host_log.h"
+#include "host/host_clock_alignment_log.h"
 #include "host/raii_scope_guard.h"
 #include "runtime.h"
 #include "platform_comm/comm.h"
@@ -862,6 +863,7 @@ int simpler_prepare_run(
 
     OnboardNativeRunContext *state = nullptr;
     const uint64_t trace_hid = runner->callable_hash(callable_id);
+    if (config->output_prefix[0] != '\0') HostLogger::get_instance().set_log_directory(config->output_prefix);
     const uint64_t trace_inv = STRACE_ALLOC_INV();
     const long long trace_start_ns = STRACE_NOW_NS();
     try {
@@ -886,6 +888,7 @@ int simpler_prepare_run(
         const bool overlaps_active_run = allow_prepared_successor && runner->native_run_active();
         state->trace_inv = trace_inv;
         state->trace_start_ns = trace_start_ns;
+        if (config->enable_chip_swimlane >= 3) state->clock_log_offset = host_clock_alignment_log_offset();
         STRACE_CONTEXT(state->trace_inv, state->trace_hid, 1);
 
         int rc = runner->attach_current_thread(runner->device_id());
@@ -1015,6 +1018,10 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
+    // launch_execution emits point-in-time markers from the DeviceRunner
+    // without carrying trace identity through that interface. Restore the
+    // prepared invocation on this API thread for the duration of the launch.
+    STRACE_CONTEXT(state->trace_inv, state->trace_hid, 1);
     state->runner_trace_start_ns = STRACE_NOW_NS();
     int rc = PTO_RUNTIME_ERR_INTERNAL;
     try {
@@ -1097,6 +1104,8 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     const uint64_t trace_inv = state->trace_inv;
     const uint64_t trace_hid = state->trace_hid;
     const long long trace_start_ns = state->trace_start_ns;
+    const uint64_t clock_log_offset = state->clock_log_offset;
+    const std::string output_prefix = state->config.output_prefix;
     char trace_attrs[sizeof(state->trace_attrs)];
     std::memcpy(trace_attrs, state->trace_attrs, sizeof(trace_attrs));
 
@@ -1189,6 +1198,8 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     state->runner->finish_clock_correlation_session(
         state->descriptor.pipeline_slot, false, !state->runner->can_accept_run()
     );
+    const bool export_clock_log = launched && execution_rc == 0 && validation_rc == 0 &&
+                                  state->runner->host_clock_alignment_log_required(state->descriptor.pipeline_slot);
     if (state->runner_claimed) {
         // The point a successor's launch becomes admissible. Ordering a
         // successor's device work against this boundary is what separates a
@@ -1203,6 +1214,9 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     }
     destroy_native_run_context(state);
     emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns, trace_attrs);
+    if (export_clock_log && !export_host_clock_alignment_log(output_prefix, trace_inv, clock_log_offset)) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
     if (validation_rc != 0) return validation_rc;
     if (resources_rc != 0) return resources_rc;
     return launched ? execution_rc : 0;

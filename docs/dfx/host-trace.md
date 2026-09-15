@@ -28,10 +28,24 @@ initialization-time policy described in [logging.md](../logging.md).
 
 The host logger writes to stderr until it is given a directory, and then it
 writes to `<directory>/host.<pid>.log` instead. The directory is
-`CallConfig.output_prefix` — the one every other diagnostic artifact already goes
-under — so a run that has one gets its host log beside its other artifacts, and a
-run that does not keeps its records on the console. There is no separate switch to
-configure, and the runtime never derives the path itself.
+`<CallConfig.output_prefix>` when configured through Worker. The first
+non-empty prefix wins for the process; later runs keep writing to that directory.
+Until a prefix is bound, records stay on the console. There is no separate
+switch to configure.
+
+After successful execution and validation of an HBG level-3/4 capture with Host
+recording armed and finished and an output prefix, native finalize
+flushes the executing process's log and exports a capture-local
+`host_clock_alignment.<pid>.log` beside the raw swimlane file, before completion
+is published. Level 4 enables Host records automatically; level 3 requires the
+independent `SIMPLER_HBG_HOST_PHASE_RECORDS_ENABLE=1` switch and an output prefix.
+This works for direct L2 and forked ChipWorker runs without SceneTest. The file
+contains only the current invocation's original alignment spans and is not the
+persistent logger destination. It requires TIMING-or-finer logging. Use the
+persistent `host.<pid>.log` files for ordinary messages or the complete Host call
+tree. The AICPU-launch marker is a TIMING Host-clock point sampled immediately
+before the launch API call (`dur=0`, `depth=2`), not a Device-start or
+launch-completion timestamp.
 
 **The destination belongs to the logger, not to a record.** Everything that logger
 writes follows it: `LOG_*` records, `[STRACE]` spans, `[CLOCK_ANCHOR]`, the
@@ -230,7 +244,7 @@ including time the caller spends polling or doing other host work; blocking
 | ----- | ---------- |
 | 0 | `chip.run` |
 | 1 | `chip.run.bind`, `chip.run.runner_run`, `chip.run.claim_release`, `chip.run.validate` |
-| 2 | `chip.run.bind.args`, `chip.run.bind.prebuilt`, the other HBG `chip.run.bind.*` segments, `chip.run.runner_run.device_wall` |
+| 2 | `chip.run.bind.args`, `chip.run.bind.prebuilt`, the other HBG `chip.run.bind.*` segments, `chip.run.runner_run.aicpu_launch` (onboard point), `chip.run.runner_run.device_wall` |
 | 3 | TMR phase spans `chip.run.runner_run.device_wall.{preamble,so_load,graph_build,config_validate,arena_wire,sm_reset,post_orch,orch,sched}` and optional `task_slot_*` spans |
 
 ## Host scheduler spans

@@ -959,6 +959,9 @@ public:
         host_phase_runs_[pipeline_slot].records.finish(submitted_tasks, invocation_id);
     }
     /** Hand this pass's records to the swimlane reader, just before its export. */
+    bool host_clock_alignment_log_required(uint32_t pipeline_slot) const {
+        return pipeline_slot < host_phase_runs_.size() && host_phase_runs_[pipeline_slot].needs_clock_alignment();
+    }
     void publish_host_phase_records_to_swimlane(uint32_t pipeline_slot);
     /**
      * Hand this run's captured clock-correlation session to the resident

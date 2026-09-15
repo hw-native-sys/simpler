@@ -117,8 +117,8 @@ backward-compatible with the old boolean behavior).
 | 0 | Nothing (disabled) | Default when flag is absent |
 | 1 | AICore timing only (start_time_us/end_time_us/task_id/func_id/core_type) | No Scheduler timestamps |
 | 2 | + Scheduler per-task dispatch_time_us, finish_time_us | Producer is identified as `aicpu` or `aicore` |
-| 3 | + scheduler phases (`scheduler_records`) | Skips orchestrator phases |
-| 4 | + orchestrator phases (`aicpu_orchestrator_phases[]`) | Full collection |
+| 3 | + scheduler phases (`scheduler_records`) | Does not enable orchestrator collection; an independently enabled HBG Host pool can still export Host records |
+| 4 | + orchestrator phases (Host for HBG, AICPU for TMR) | Full collection |
 
 Dependency arrows are not produced by any swimlane level — see
 [§3.5](#35-dependency-arrows-from-dep_gen) for the dep_gen join.
@@ -211,6 +211,7 @@ parent-assigned node namespace:
 │   ├── host.<l3-or-chip-pid>.log
 │   └── rank0/d0/
 │       ├── chip_swimlane_records.json
+│       ├── host_clock_alignment.<chip-pid>.log  # matched timing spans only
 │       └── dispatch_identity.json
 └── node1/
     ├── host.<l3-or-chip-pid>.log
@@ -265,7 +266,15 @@ layers to be aware of:**
     "clock_freq_hz": <int>,            // cycle→µs factor. a2a3=50e6, a5=1e9.
     "num_cores": <int>,                // == len(core_types)
     "core_types": ["aic"|"aiv", ...],  // indexed by core_id
-    "core_to_thread": [<int>, ...]     // optional; level >= 3 only
+    "core_to_thread": [<int>, ...],    // optional; level >= 3 only
+    // Optional postprocessed HBG Host/Device mapping. Raw cycles stay unchanged.
+    "clock_alignment": {
+      "status": "bounded",
+      "device_anchor_cycles": <int>,
+      "host_anchor_ns": <int>,
+      "host_anchor_min_ns": <int>,
+      "host_anchor_max_ns": <int>
+    } // If alignment fails: {"status": "unavailable", "reason": <string>}
   },
 
   // Bulk task streams. Tuple column order is fixed.
@@ -343,7 +352,7 @@ microseconds, downstream code sees:
 | ----- | ------- |
 | `task_id` | Runtime task id (`TaskId::raw`); its high 32 bits are also exposed split off as `ring_id`, which is a ring index under `tensormap_and_ringbuffer` and an id space under `host_build_graph` |
 | `func_id` | Kernel function id. Always `-1` on disk; resolved post-process from `deps.json::tasks[].kernel_ids[3]` (see `swimlane_converter.resolve_func_id_from_kernel_map`) |
-| `core_id` / `core_type` | Physical core index and `"aic"` / `"aiv"` string |
+| `core_id` / `core_type` | Runtime worker index into `metadata.core_types` and `"aic"` / `"aiv"` string. A5 HBG uses `worker_id`; the physical core ID is a separate Scheduler stream field. |
 | `start_time_us` / `end_time_us` / `duration_us` | AICore execution window in microseconds |
 | `dispatch_time_us` | Scheduler timestamp when dispatch publication completed (filled at level >= 2) |
 | `finish_time_us` | Scheduler timestamp when completion processing began (filled at level >= 2) |
@@ -411,8 +420,10 @@ Separate-lane phases are routed to a different lane by the converter
 bars even when their timestamps fall inside an outer span.
 
 For the A5 HBG AICore producer, all phases render on the single
-`Scheduler_<physical-AIV-ID>` lane. Completion, Resolve, StateProbe when
-present, and the selected publication phase are mutually time-exclusive.
+`Scheduler_<worker_id>` lane, matching the worker ID used in Worker View.
+If `worker_id` is missing or null, the suffix falls back to `scheduler_id`.
+Completion, Resolve, StateProbe when present, and the selected publication phase
+are mutually time-exclusive.
 StateProbe includes Ready claim or steal and ends when immediate or deferred
 placement has been decided. Deferred waiting is intentionally left as an empty
 interval before the eventual Dispatch, Worksteal, or Refill. Worksteal
@@ -492,31 +503,154 @@ python -m simpler_setup.tools.swimlane_converter \
     build_output/<case>/dfx_outputs --dispatch-id 17:5
 ```
 
+### Optional alignment embedded in a single capture
+
+For `host_build_graph` captures, single-file conversion prefers sibling
+`host_clock_alignment.*.log` files, falling back to persistent `host.*.log` files.
+Explicit `--host-log` arguments override this lookup. The converter identifies
+HBG by `scheduler_records.streams[].runtime`, with Host orchestrator/capture markers
+as the fallback for legacy files. Automatic alignment also requires Host capture
+information (`host_orchestrator_phases`, `host_device_uploads`, or Host capture
+metadata) at level 3 or 4. Level 4 arms the Host record pool automatically;
+level 3 can contain Host records when `SIMPLER_HBG_HOST_PHASE_RECORDS_ENABLE=1`
+is set and an output prefix is configured. The independent Host record pool can
+also be enabled at levels 1-2, producing `host_phase_records.jsonl`; those levels
+do not write Host task/upload projections into the swimlane or export compact
+clock logs. Levels 1-2 and Device-only single-file captures, such as TMR captures,
+skip automatic containment and source rewriting. It computes containment only
+when the logs contain usable `runner_run` / `device_wall` windows matching the
+capture. A sidecar's
+process and dispatch identity are constraints, and Host records in the capture
+must lie inside the matching `chip.run` span. Missing, filtered, inconsistent or
+ambiguous logs leave the capture unaligned and print the reason; conversion
+still produces a diagnostic view.
+
+```bash
+python -m simpler_setup.tools.swimlane_converter \
+    outputs/<case>/chip_swimlane_records.json --host-log outputs/<case>/test.log
+```
+
+Worker binds the persistent process log to
+`<first_output_prefix>/host.<pid>.log`; it keeps accumulating across calls.
+After successful Device execution and validation, if Host recording is armed and
+finished for a level-3/4 capture with an output prefix, native finalize emits the last `chip.run` span, flushes the executing process's logger,
+and atomically exports `host_clock_alignment.<pid>.log` beside
+`chip_swimlane_records.json` before publishing completion. Direct L2 runs and
+forked ChipWorker runs use this same path; SceneTest is not required.
+The exporter reads from the written-file position sampled before this invocation's
+first spans. Older records still queued at that point may also appear in the tail;
+PID/invocation filtering excludes them. It preserves the original STRACE
+records: `chip.run`, `runner_run`, AICPU-launch when present, `device_wall`, and
+its device sub-phases. It skips the cumulative file prefix preceding this run
+and does not alter the live logger destination. TIMING-or-finer logging is required; with a coarser threshold,
+the runtime warns and skips the timing export. Flush, read, incomplete-marker,
+or write failures are reported as diagnostic errors without publishing a partial
+new timing file. The required markers are `chip.run`, `runner_run`, and
+`device_wall`; the AICPU-launch marker is retained when present. Export is complete
+before runtime returns; the exported `chip.run` span ends before the export itself.
+
+SceneTest and PyPTO can then invoke the converter, which reads the sibling timing
+logs, performs containment, saves `metadata.clock_alignment` in mixed HBG source
+captures, and generates the merged trace. Timing-log export itself does not
+calculate or save clock alignment. Device-only captures and other diagnostics
+alone do not trigger this export. Directory merging retains containment for all
+runtimes and levels. Complete Host call trees remain in the persistent
+`host.<pid>.log` files and can be supplied through explicit `--host-log` inputs.
+
+The TIMING marker `chip.run.runner_run.aicpu_launch`, sampled immediately before
+AICPU launch, raises the placement lower bound to the later of the runner start
+and launch time. These markers and the required runner/device-wall spans need a
+Host log threshold of TIMING or finer. The upper bound remains the runner window
+end minus the device extent. The remaining
+interval is reported as `slack_ns`; `outer_slack_ns` retains the original width.
+This selects a legal display position and does not measure the true clock offset.
+Old logs without this marker retain their original containment bounds.
+The postprocessor atomically adds `metadata.clock_alignment`; all original
+records retain their Host-ns / device-cycle timestamps and original formatting.
+Only the alignment member is inserted or replaced. The metadata is one
+fixed-size object per capture, independent of task count. A valid saved mapping
+is reused without reading logs or sidecars, including by `read_perf_data()`.
+An explicit `--host-log` requests recalculation.
+HBG captures containing Host records at level 3 or 4 carry Host timestamps
+within their own `chip.run` span.
+Together with the sidecar's Host PID, these timestamps distinguish consecutive
+synchronous invocations whose logs carry zero run/dispatch IDs. Saved mappings assume the raw
+capture is unchanged; they carry no digest or algorithm/version fields. Device
+frequency and Host clock domain come from the existing capture metadata.
+Detailed containment diagnostics stay in the merged trace when calculated from
+Host logs; source-only conversion reuses the saved anchors and bounds.
+
+| Field | Meaning |
+| ----- | ------- |
+| `status` | `bounded` when placed; `unavailable` with `reason` when skipped |
+| `device_anchor_cycles` | Earliest device-record timestamp in the capture extent; a mapping reference, not necessarily device startup or first dispatch |
+| `host_anchor_ns` | Selected Host timestamp corresponding to that reference |
+| `host_anchor_min_ns` / `host_anchor_max_ns` | Allowed Host interval for the reference, including both placement slack and device-phase join freedom |
+
+An IDE such as pypto-toolkit must consume `metadata.clock_alignment` to match the
+merged view. Merely opening the enriched file with a reader that ignores this field
+does not align its clocks. Once adapted, a reader can draw device events using only
+the capture, without Host logs or another tool invocation:
+
+```text
+host_ns = host_anchor_ns
+        + (device_cycles - device_anchor_cycles) * 1e9 / metadata.clock_freq_hz
+display_us = (host_ns - chosen_host_timeline_origin_ns) / 1000
+```
+
+Host records use that same display origin directly. The selected Host anchor is
+rounded to integer ns; interval endpoints are rounded outward. The mapping's
+bounds must remain visible when interpreting cross-domain gaps. A broad Host
+window still gives broad uncertainty after the mapping has been embedded.
+If raw timestamps or frequency metadata change, the saved mapping must be
+removed or recalculated with explicit `--host-log`; reuse does not detect those
+changes automatically.
+
+Without a valid mapping, Host/device latency is unavailable. The HBG diagnostic
+composite places device work after the last Host submit or upload to preserve
+causal order, and explicitly keeps `cross_domain_latency_available=false`.
+This visual seam does not measure the physical gap. An IDE should identify that
+state as unaligned instead of treating the seam as calibrated time.
+
+### Directory alignment
+
 For directory input, the default output is `dfx_outputs/l3_swimlane.json`.
 Every Rank must sit under `rankN/<dispatch>/` and report the same
-`metadata.host_clock_domain_id`, and the run's `host.<pid>.log` files must be
-readable beside them (`--host-log` overrides where they are looked for). Those
-logs hold every invocation of the run, so which one a capture belongs to is read
-off the dispatch both artifacts name — `dispatch_identity.json` on one side, the
-root `chip.run` span's attributes on the other. `dispatch_id` counts per worker
-and so is shared by the members of one group round; which Rank of that round is
-then decided by the device windows each capture fills, or pinned with
+`metadata.host_clock_domain_id`. Persistent `host.<pid>.log` files or archived `host_clock_alignment.<pid>.log`
+files must be readable directly under the input directory; archived timing logs
+are also discovered under `rank*/d*/host_clock_alignment.*.log`
+(`--host-log` overrides that lookup).
+Persistent logs can contain multiple invocations; archived timing logs contain
+only the matched invocation. The converter matches Host PID and dispatch identity,
+or uses mixed HBG captures' Host-record bounds when synchronous dispatch IDs are
+zero. Legacy captures retain device-window matching, or can be pinned with
 `--rank-pid RANK=PID[:INV]`. The
-converter preserves real Rank start skew, adds Rank-specific PID/name/flow
-namespaces, and reports each Rank's placement `slack_ns` plus the summed
-`cross_rank_uncertainty_ns` in trace metadata.
+converter preserves the Host windows' relative positions, adds Rank-specific
+PID/name/flow namespaces, and reports each Rank's placement `slack_ns` plus the
+summed `cross_rank_uncertainty_ns` in trace metadata. The displayed Device start
+skew is a bounded placement, not a measurement of the exact Device start skew.
 
 **Placement is by containment, and the bound is published.** A Rank's device
-records are drawn at the earliest Host ns its window allows; the window's spare
-width — `runner_run.dur − device_wall.dur` — is how far the whole block could
-slide, and appears as `slack_ns` on every drawn slice and as a "Placement
-Bound" lane in the trace.
+records are drawn at the earliest Host ns its window allows. The complete Device
+extent includes the device-wall duration and all drawn Device records. For a
+chosen device-phase join, the allowed block-start interval is:
+
+```text
+place_lo_ns = max(runner_start_ns, aicpu_launch_ns)  # runner start if no marker
+place_hi_ns = runner_end_ns - device_extent_ns
+slack_ns = place_hi_ns - place_lo_ns
+```
+
+That width appears as `slack_ns` on Device slices and as a "Placement Bound" lane.
+It describes placement freedom for the selected join. Phase-join freedom is
+reported separately as `join.residual_ns`; the saved HBG anchor bounds include
+both sources of uncertainty.
 
 The Host block comes first and has two parts. Above the Ranks are the
 processes that dispatched to them — the L3 scheduler's `node.*` lanes, and an
-L4's `network1.*` above those. Each process binds its host log to the root of
-the level namespace it owns, so a direct L3 run leaves all of them beside the
-Rank captures. Under a parent-assigned namespace only that namespace's own
+L4's `network1.*` above those. Each process binds its persistent host log to the root of
+the level namespace it owns, so a direct L3 run stores them above the Rank
+captures. Under a parent-assigned namespace only that namespace's own
 levels are beside them — the L4 above a `nodeN` writes one directory up, where
 a merge reading that `nodeN` does not look. They are Host CLOCK_MONOTONIC and
 same-host cross-process comparable, so they are drawn directly and **carry no
@@ -533,24 +667,24 @@ block of view pids, so everything from the Host log groups above every Chip
 view rather than one Rank at a time between them. Perfetto orders process groups by
 pid and ignores `process_sort_index`, so the pid assignment *is* the layout.
 `strace_timing --swimlane` is unchanged and still writes its own single-process
-view. The shape *inside* a Rank is exact: the `device_wall.sched` window
-appears in both the Host log (relative ns) and the capture (absolute cycles), so
-the two device timelines join to within the few µs between "the phase opened"
-and "the first record inside it", reported as `join.residual_ns`.
+view. Relative intervals within one Device clock domain retain their recorded
+timing. Joining those records to the log's device-phase timeline introduces the
+separate `join.residual_ns` range. A matching AICPU `device_wall.sched` window can
+narrow that range; AICore Scheduler streams contribute to the Device extent but
+are not paired with the AICPU sched window. If no matching phase is available,
+the join uses the wider device-wall constraint.
 
-Ranks on two different Hosts are refused rather than spliced. Doing it needs the
-window of the level that dispatched to both — `network1.dispatch` …
-`network1.complete` — plus the one error term containment does not cover: two
-machines' counters differ by 10–100 ppm, which distorts a duration spliced into
-the other machine's window in proportion to that window's length (0.4–4 µs over
-40 ms). Neither is implemented.
+Ranks on two different Hosts are refused rather than spliced. Cross-host merging
+is not implemented: different machines' Host CLOCK_MONOTONIC values have no
+shared origin. Supporting it requires a cross-host timing model that accounts
+for both clock offsets and counter-rate differences.
 
-Two consequences worth stating plainly. Slack is a property of the *outer span*,
-not of the method: the collector teardown that `reap_run()` performs after the
-device is done falls inside `runner_run`, so a capture-enabled run's slack
-absorbs it and can reach hundreds of ms. And a gap between two Ranks narrower
-than the sum of their slacks is undecided, not zero — containment cannot be
-wrong, only loose.
+Collector teardown in `reap_run()` falls inside `runner_run`, so even after the
+launch constraint a capture-enabled run can have broad placement uncertainty.
+A cross-Rank gap smaller than the summed placement slacks is undecided. A larger
+gap must still account for phase-join freedom before establishing event order.
+The bounds rely on correctly matched logs, enclosing Host windows, and the
+capture's counter frequency; they do not measure the true clock offset.
 
 For new group captures, `--dispatch-id RUN_ID:TASK_SLOT` selects the common
 parent DAG node and resolves each Rank's actual `dN` path through

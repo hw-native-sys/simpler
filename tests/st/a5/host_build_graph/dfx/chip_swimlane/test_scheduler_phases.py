@@ -11,13 +11,44 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import Counter
+from importlib import import_module
 
 import torch
 from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
-from simpler_setup.scene_test import _outputs_dir, _sanitize_for_filename
+from simpler_setup.scene_test import _build_l3_task_args, _outputs_dir, _sanitize_for_filename
+from simpler_setup.tools.strace_timing import parse_spans
+
+
+def _verify_runtime_clock_logs(monkeypatch, st_platform):
+    """Check paired timing artifacts exist before any SceneTest converter runs."""
+    scene_test_module = import_module("simpler_setup.scene_test")
+    original = scene_test_module.finalize_diagnostic_outputs
+
+    def finalize(case_label, output_prefix, **kwargs):
+        for capture in output_prefix.rglob("chip_swimlane_records.json"):
+            raw = json.loads(capture.read_text())
+            logs = list(capture.parent.glob("host_clock_alignment.*.log"))
+            has_host = raw["metadata"].get("orchestrator_source") == "host"
+            if raw["chip_swimlane_level"] >= 3 and has_host:
+                assert len(logs) == 1, "runtime must export timing logs before upper-level postprocessing"
+                assert "clock_alignment" not in raw["metadata"]
+                with logs[0].open() as stream:
+                    spans = list(parse_spans(stream))
+                assert len({(span.pid, span.inv) for span in spans}) == 1
+                required = {"chip.run", "chip.run.runner_run", "chip.run.runner_run.device_wall"}
+                if st_platform == "a5":
+                    required.add("chip.run.runner_run.aicpu_launch")
+                assert required <= {span.name for span in spans}
+            else:
+                assert not logs, "Device-only captures must not export Host alignment logs"
+        return original(case_label, output_prefix, **kwargs)
+
+    monkeypatch.setattr(scene_test_module, "finalize_diagnostic_outputs", finalize)
+
 
 FANOUT_WIDTH = 32
 EXPECTED_PROFILED_TASKS = 1 + FANOUT_WIDTH + 1 + 1  # root + children + final + terminal dummy
@@ -64,7 +95,8 @@ class TestSchedulerPhases(SceneTestCase):
     def compute_golden(self, args, params):
         args.input[0] = 1
 
-    def test_run(self, st_platform, st_worker, request):
+    def test_run(self, st_platform, st_worker, request, monkeypatch):
+        _verify_runtime_clock_logs(monkeypatch, st_platform)
         outputs_dir = _outputs_dir()
         previous_outputs = (
             {path: path.stat().st_mtime_ns for path in outputs_dir.iterdir()} if outputs_dir.exists() else {}
@@ -193,6 +225,99 @@ class TestSchedulerPhases(SceneTestCase):
                 )
             else:
                 assert "scheduler_records" not in raw
+
+
+def run_profiled_chip(orch, callables, task_args, config):
+    chip_args, _ = _build_l3_task_args(task_args, callables.profiled_chip_sig)
+    callables.keep(chip_args)
+    orch.submit_next_level(callables.profiled_chip, chip_args, config, worker=0)
+
+
+@scene_test(level=3, runtime="host_build_graph")
+class TestConsecutiveClockAlignment(SceneTestCase):
+    """A persistent ChipWorker produces and aligns two separate captures."""
+
+    CALLABLE = {
+        "orchestration": run_profiled_chip,
+        "callables": [{"name": "profiled_chip", **TestSchedulerPhases.CALLABLE}],
+    }
+    CASES = [
+        {
+            "name": name,
+            "platforms": ["a5"],
+            "manual": True,
+            "config": {"device_count": 1, "num_sub_workers": 0},
+            "params": {},
+        }
+        for name in ("first", "later")
+    ]
+
+    def generate_args(self, params):
+        return TaskArgsBuilder(TensorArg("input", torch.zeros(1, dtype=torch.int32).share_memory_()))
+
+    def compute_golden(self, args, params):
+        args.input[0] = 1
+
+    def test_run(self, st_platform, st_worker, request, monkeypatch):
+        _verify_runtime_clock_logs(monkeypatch, st_platform)
+        outputs_dir = _outputs_dir()
+        previous_outputs = set(outputs_dir.iterdir()) if outputs_dir.exists() else set()
+        super().test_run(st_platform, st_worker, request)
+        level = self._effective_enable_chip_swimlane(request)
+        if level < 3 or (level == 3 and not os.environ.get("SIMPLER_HBG_HOST_PHASE_RECORDS_ENABLE")):
+            return
+
+        invocations = []
+        for case in self._matching_cases(st_platform, request):
+            label = _sanitize_for_filename(f"TestConsecutiveClockAlignment_{case['name']}")
+            matches = [path for path in outputs_dir.glob(f"{label}_*") if path not in previous_outputs]
+            assert len(matches) == 1, f"expected one new output for {label}: {matches}"
+            captures = list(matches[0].rglob("chip_swimlane_records.json"))
+            assert len(captures) == 1
+            capture = captures[0]
+            raw = json.loads(capture.read_text())
+            merged = json.loads((matches[0] / "l3_swimlane.json").read_text())
+            alignment = raw["metadata"]["clock_alignment"]
+            assert alignment["status"] == "bounded"
+            rank_metadata = merged["metadata"]["ranks"]
+            assert len(rank_metadata) == 1
+            assert rank_metadata[0]["input"] == str(capture)
+            placement = rank_metadata[0]["placement"]
+            pid, inv = placement["outer_pid"], placement["outer_inv"]
+            assert pid != os.getpid(), "the producer must be a forked ChipWorker"
+            log = capture.with_name(f"host_clock_alignment.{pid}.log")
+            with log.open() as stream:
+                spans = list(parse_spans(stream))
+            assert {(span.pid, span.inv) for span in spans} == {(pid, inv)}
+            assert all(
+                span.name in {"chip.run", "chip.run.runner_run", "chip.run.runner_run.aicpu_launch"}
+                or span.name == "chip.run.runner_run.device_wall"
+                or span.name.startswith("chip.run.runner_run.device_wall.")
+                for span in spans
+            )
+            names = {span.name for span in spans}
+            assert {
+                "chip.run",
+                "chip.run.runner_run",
+                "chip.run.runner_run.device_wall",
+                "chip.run.runner_run.aicpu_launch",
+            } <= names
+            assert placement["place_lo_ns"] >= placement["aicpu_launch_ns"]
+            # The device anchor is the earliest device slice in both previews.
+            device_events = [
+                event
+                for event in merged["traceEvents"]
+                if event.get("ph") == "X"
+                and event.get("cat") in {"aicpu_lifecycle", "aicpu_scheduler", "aicore_scheduler", "kernel"}
+            ]
+            assert device_events
+            anchor_ns = merged["metadata"]["global_origin_ns"] + min(event["ts"] for event in device_events) * 1000
+            assert abs(anchor_ns - alignment["host_anchor_ns"]) <= 1
+            assert anchor_ns >= placement["aicpu_launch_ns"]
+            invocations.append((pid, inv))
+        if len(invocations) == 2:
+            assert invocations[0][0] == invocations[1][0], "cases must reuse the same ChipWorker"
+            assert invocations[0][1] != invocations[1][1], "each capture must select its own invocation"
 
 
 if __name__ == "__main__":

@@ -231,6 +231,16 @@ def test_l3_directory_merge_uses_common_host_origin_and_rank_namespaces(tmp_path
     root = tmp_path / "dfx_outputs"
     _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
     _write_l3_rank(root, 1, host_shift_ns=10_000, task_id=8)
+    for rank in (0, 1):
+        pid = 1000 + rank
+        capture_dir = root / f"rank{rank}" / "d0"
+        log = capture_dir / f"host_clock_alignment.{pid}.log"
+        (root / f"host.{pid}.log").rename(log)
+        with log.open("a") as stream:
+            stream.write(
+                f"[STRACE] v=1 pid={pid} tid={pid} inv=1 hid=abc depth=0 "
+                f"name=chip.run ts={1000 + rank * 10000} dur=8000\n"
+            )
     output = tmp_path / "l3.json"
     args = sc._build_parser().parse_args([str(root), "--dispatch", "d0", "-o", str(output)])
 
@@ -251,6 +261,20 @@ def test_l3_directory_merge_uses_common_host_origin_and_rank_namespaces(tmp_path
     assert [item["placement"]["slack_ns"] for item in rank_metadata] == [6_000, 6_000]
     assert [item["placement"]["outer_pid"] for item in rank_metadata] == [1_000, 1_001]
     assert [item["host_pairing"]["source"] for item in rank_metadata] == ["device_window_fit"] * 2
+
+    for item in rank_metadata:
+        rank = item["rank"]
+        capture_dir = root / f"rank{rank}" / "d0"
+        raw = json.loads((capture_dir / "chip_swimlane_records.json").read_text())
+        alignment = raw["metadata"]["clock_alignment"]
+        assert alignment["status"] == "bounded"
+        decoded = sc.read_perf_data(capture_dir / "chip_swimlane_records.json", timeline_origin_ns=1_000)
+        worker = next(
+            event
+            for event in trace["traceEvents"]
+            if event.get("ph") == "X" and event.get("cat") == "event" and event.get("pid") == (rank + 1) * 100 + 4
+        )
+        assert worker["ts"] == decoded["tasks"][0]["receive_time_us"]
 
     process_names = {
         event["args"]["name"]
@@ -409,7 +433,21 @@ def test_l3_directory_merge_keeps_scheduler_streams_and_lifecycle_records(tmp_pa
         records_path.write_text(json.dumps(records))
 
     output = tmp_path / "l3.json"
-    args = sc._build_parser().parse_args([str(root), "--dispatch", "d0", "-o", str(output)])
+    # AICore streams do not identify the logged AICPU sched window.
+    # Pin the processes for these otherwise indistinguishable captures.
+    args = sc._build_parser().parse_args(
+        [
+            str(root),
+            "--dispatch",
+            "d0",
+            "-o",
+            str(output),
+            "--rank-pid",
+            "0=1000:1",
+            "--rank-pid",
+            "1=1001:1",
+        ]
+    )
 
     sc._generate_l3_trace(args, root)
 
@@ -578,7 +616,9 @@ def test_l3_directory_merge_needs_a_host_log_to_place_ranks(tmp_path):
         log.unlink()
     args = sc._build_parser().parse_args([str(root), "--dispatch", "d0"])
 
-    with pytest.raises(ValueError, match="no host.*log under"):
+    legacy_dir = root / "rank0" / "d0"
+    (legacy_dir / "host.1000.log").write_text("not an alignment archive\n")
+    with pytest.raises(ValueError, match="no host_clock_alignment.*log under"):
         sc._generate_l3_trace(args, root)
 
 
@@ -1851,8 +1891,8 @@ def test_aicore_scheduler_uses_one_lane_and_display_names(tmp_path):
     scheduler_streams = [
         {
             "producer": "aicore",
-            "scheduler_id": 4,
-            "worker_id": 36,
+            "scheduler_id": 3,
+            "worker_id": 34,
             "core_type": "aiv",
             "physical_core_id": 26,
         }
@@ -1871,7 +1911,7 @@ def test_aicore_scheduler_uses_one_lane_and_display_names(tmp_path):
         and event.get("name") == "thread_name"
         and event.get("tid") != 3999
     ]
-    assert [(event["tid"], event["args"]["name"]) for event in scheduler_metadata] == [(30000, "Scheduler_26")]
+    assert [(event["tid"], event["args"]["name"]) for event in scheduler_metadata] == [(30000, "Scheduler_34")]
     phases = [event for event in events if event.get("cat") == "scheduler"]
     assert {event["tid"] for event in phases} == {30000}
     assert [event["name"] for event in phases] == [
@@ -2162,12 +2202,11 @@ def test_l3_rank_pid_pin_names_the_invocation_when_the_process_ran_more_than_onc
 
 
 def _write_l3_scheduler_log(root, *, pid=900, spans):
-    """The L3 process's own log, which the run writes into the same case root.
+    """The L3 process's own log in the case's output directory.
 
     `_submit_l3_locked` binds this process's log to `CallConfig.output_prefix`
     just as each ChipWorker child does, so the scheduler's `node.*` spans sit
-    beside the Rank captures rather than anywhere the merge has to be told
-    about.
+    at the case root, which directory conversion discovers automatically.
     """
     lines = []
     for name, ts, dur, tid, inv in spans:

@@ -89,7 +89,7 @@ def test_join_narrows_the_offset_to_the_window_the_records_do_not_fill():
 
     assert join.sources == ("sched", "device_wall")
     assert join.interval_cycles == (1_150, 1_200)
-    assert join.residual_ns == 50
+    assert join.residual_cycles == 50
     assert join.origin_cycles == 1_175
 
 
@@ -239,6 +239,11 @@ def test_identity_is_the_same_four_numbers_under_two_spellings():
     )
 
 
+def test_synchronous_launch_zero_ids_do_not_claim_a_dispatch_identity():
+    (window,) = containment.host_windows(parse_spans(_host_log(dispatch=(0, 0, 0, 1))))
+    assert window.identity is None
+
+
 def test_a_log_without_the_identity_attributes_still_pairs_by_window_fit():
     """Old logs keep working; they just fall back to the looser route."""
     hosts = [
@@ -356,3 +361,18 @@ def test_host_pid_alone_still_needs_the_dispatch_when_the_process_ran_twice():
 
     assert (pairs[0].pid, pairs[0].inv) == (11, 2)
     assert diagnostics[0]["source"] == "capture_sidecar"
+
+
+def test_capture_windows_includes_aicore_scheduler_streams_in_extent():
+    raw = _capture()
+    raw["scheduler_records"] = {
+        "schema_version": 1,
+        "streams": [
+            {"producer": "aicpu", "records": raw.pop("aicpu_scheduler_phases")[0]},
+            {"producer": "aicore", "records": [{"start_cycles": 1800, "end_cycles": 2300}]},
+        ],
+    }
+    capture = containment.capture_windows(raw)
+    assert capture.extent == (1800, 2300)
+    # The Host log's AICPU sched phase does not bracket AICore producers.
+    assert capture.windows["sched"] == (1900, 1950)

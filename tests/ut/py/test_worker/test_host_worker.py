@@ -1087,6 +1087,7 @@ class _TwoFrameLoopHarness:
         state: int = worker_mod._TASK_READY,
         generation: int = 11,
         diagnostics: bool = False,
+        chip_swimlane: int = 0,
         task_slot: Optional[int] = None,
         group_index: int = 0,
         group_size: int = 1,
@@ -1097,8 +1098,9 @@ class _TwoFrameLoopHarness:
             frame[worker_mod._OFF_TASK_CALLABLE_HASH : worker_mod._OFF_TASK_ARGS_BLOB] = self.digest
             struct.pack_into("=ii", frame, worker_mod._OFF_TASK_ARGS_BLOB, 0, 0)
             cfg_values = [0] * (7 + 3 * worker_mod.RUNTIME_ENV_RING_COUNT)
+            cfg_values[1] = chip_swimlane
             cfg_values[3] = int(diagnostics)
-            output_prefix = b"/tmp/simpler-test" if diagnostics else b""
+            output_prefix = b"/tmp/simpler-test" if diagnostics or chip_swimlane else b""
             worker_mod._CFG_FMT.pack_into(frame, worker_mod._OFF_CONFIG, *cfg_values, output_prefix)
             worker_mod._PIPELINE_LEASE_FMT.pack_into(frame, worker_mod._OFF_PIPELINE_LEASE, index, 0, generation)
             struct.pack_into("=Q", frame, worker_mod._OFF_FRAME_PROTOCOL, worker_mod._TASK_PROTOCOL_VERSION)
@@ -1209,6 +1211,38 @@ def test_two_frame_stages_b_without_native_prepare_until_a_finalizes():
             ("launch_enter", 1, 0, worker_mod._FRAME_STAGED),
         ]
     finally:
+        harness.close()
+
+
+@pytest.mark.parametrize("chip_swimlane,flushed", [(4, True), (4, False), (0, False)])
+def test_two_frame_swimlane_log_flush_before_completion(monkeypatch, chip_swimlane, flushed):
+    entered = threading.Event()
+    release = threading.Event()
+
+    def flush(context):
+        entered.set()
+        if chip_swimlane:
+            assert release.wait(5.0)
+        return flushed
+
+    monkeypatch.setattr(worker_mod, "_flush_host_log_or_warn", flush)
+    harness = _TwoFrameLoopHarness(chip_runtime="host_build_graph")
+    try:
+        harness.publish(0, 1, diagnostics=True, chip_swimlane=chip_swimlane)
+        harness.start()
+        assert harness.cw._impl.launched[0].wait(5.0)
+        harness.cw._impl.completed[0].set()
+        if not chip_swimlane:
+            harness.wait_state(0, worker_mod._TASK_DONE)
+            assert not entered.is_set(), "PMU-only completion must not flush the Host log"
+            return
+        assert entered.wait(5.0), "completion did not flush the swimlane Host log"
+        assert _mailbox_load_i32(harness.state_addr(0)) == worker_mod._TASK_LAUNCHED
+        release.set()
+        expected = worker_mod._TASK_DONE if flushed else worker_mod._TASK_FAILED
+        harness.wait_state(0, expected)
+    finally:
+        release.set()
         harness.close()
 
 
@@ -3183,13 +3217,7 @@ class TestRunHandle:
             worker._submit_l3_locked(bad_graph, None, cast(Any, object()))
 
     def test_submit_seeds_the_log_directory_from_the_run_output_prefix(self, monkeypatch):
-        """This process's log lands beside the run's other diagnostic artifacts.
-
-        `CallConfig.output_prefix` is the directory every diagnostic artifact
-        already goes under, and its contract is that the runtime never derives a
-        path itself — so the submit path hands that directory to the log layer
-        rather than the log layer reading one from the environment.
-        """
+        """The persistent log uses the run output root; timing exports use a distinct filename."""
         worker, _events = self._submission_failure_worker(failures=0)
         seeded: list[str] = []
         monkeypatch.setattr(worker_mod, "_native_set_host_log_directory", seeded.append)
@@ -3198,18 +3226,18 @@ class TestRunHandle:
             raise ValueError("bad graph")
 
         with pytest.raises(ValueError, match="bad graph"):
-            worker._submit_l3_locked(bad_graph, None, cast(Any, SimpleNamespace(output_prefix="/tmp/run-artifacts")))
+            worker._submit_locked(bad_graph, None, cast(Any, SimpleNamespace(output_prefix="/tmp/run-artifacts")))
         assert seeded == ["/tmp/run-artifacts"]
 
-        # No prefix means no directory to seed, and spans stay on stderr.
+        # An empty prefix does not bind or change the logger destination.
         seeded.clear()
         with pytest.raises(ValueError, match="bad graph"):
-            worker._submit_l3_locked(bad_graph, None, cast(Any, SimpleNamespace(output_prefix="")))
+            worker._submit_locked(bad_graph, None, cast(Any, SimpleNamespace(output_prefix="")))
         assert seeded == []
 
         # A config without the field at all must not be what fails a submit.
         with pytest.raises(ValueError, match="bad graph"):
-            worker._submit_l3_locked(bad_graph, None, cast(Any, object()))
+            worker._submit_locked(bad_graph, None, cast(Any, object()))
         assert seeded == []
 
     def test_unsettled_graph_cancellation_abandons_the_handle_before_close(self):

@@ -18,3 +18,7 @@ extern "C" __attribute__((visibility("default"))) void test_host_log_consumer_em
 extern "C" __attribute__((visibility("default"))) int test_host_log_consumer_start_writer() {
     return HostLogger::get_instance().start_writer() ? 1 : 0;
 }
+
+extern "C" __attribute__((visibility("default"))) int test_host_log_consumer_flush() {
+    return HostLogger::get_instance().flush() ? 1 : 0;
+}

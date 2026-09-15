@@ -29,10 +29,14 @@ import argparse
 import bisect
 import importlib.util
 import json
+import math
+import os
 import re
 import sys
+import tempfile
 import traceback
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -235,6 +239,272 @@ def _collect_graph_execution_instances(tasks, scheduler_phases):  # noqa: PLR091
     return instances
 
 
+_CLOCK_ALIGNMENT_FIELDS = (
+    "status",
+    "device_anchor_cycles",
+    "host_anchor_ns",
+    "host_anchor_min_ns",
+    "host_anchor_max_ns",
+)
+
+
+def _capture_without_alignment(raw):
+    """Compare capture data independently of the saved mapping."""
+    document = dict(raw)
+    metadata = dict(document.get("metadata") or {})
+    metadata.pop("clock_alignment", None)
+    document["metadata"] = metadata
+    return document
+
+
+@dataclass(frozen=True)
+class _StoredClockAlignment:
+    """A saved device-to-Host mapping, using the capture's counter frequency."""
+
+    record: dict
+    frequency_hz: int
+
+    @property
+    def place_lo_ns(self):
+        return self.record["host_anchor_min_ns"]
+
+    def map_cycles_to_host_ns(self, cycles):
+        return self.record["host_anchor_ns"] + (
+            (cycles - self.record["device_anchor_cycles"]) * 1_000_000_000 / self.frequency_hz
+        )
+
+
+def _read_clock_alignment(raw):
+    """Validate saved anchors, bounds, and the capture counter frequency."""
+    metadata = raw.get("metadata") or {}
+    record = metadata.get("clock_alignment")
+    if record is None:
+        return None
+    if not isinstance(record, dict):
+        raise ValueError("clock_alignment must be an object")
+    if record.get("status") == "unavailable":
+        return None
+    if record.get("status") != "bounded":
+        raise ValueError("unsupported clock_alignment status")
+    if any(type(record.get(key)) is not int for key in _CLOCK_ALIGNMENT_FIELDS[1:]):
+        raise ValueError("clock_alignment anchors and bounds must be integers")
+    frequency_hz = metadata.get("clock_freq_hz")
+    if type(frequency_hz) is not int or frequency_hz <= 0:
+        raise ValueError("capture metadata has no usable clock_freq_hz")
+    lo, hi = record["host_anchor_min_ns"], record["host_anchor_max_ns"]
+    if record["device_anchor_cycles"] <= 0 or not 0 < lo <= record["host_anchor_ns"] <= hi:
+        raise ValueError("invalid clock_alignment bounds")
+    return _StoredClockAlignment(record, frequency_hz)
+
+
+def _clock_alignment_record(placement):
+    """Serialize one mapping, bounding both window slack and phase-join freedom."""
+    if placement.capture is None or placement.join is None:
+        raise ValueError("clock alignment requires device records")
+    anchor = placement.capture.extent[0]
+    candidates = [
+        containment.place(
+            placement.host,
+            placement.capture,
+            containment.Join(origin, placement.join.interval_cycles, placement.join.sources),
+        )
+        for origin in placement.join.interval_cycles
+    ]
+    lo = math.floor(min(item.map_cycles_to_host_ns(anchor) for item in candidates))
+    hi = math.ceil(max(item.map_cycles_to_host_ns(anchor) + item.slack_ns for item in candidates))
+    return {
+        "status": "bounded",
+        "device_anchor_cycles": anchor,
+        "host_anchor_ns": int(round(placement.map_cycles_to_host_ns(anchor))),
+        "host_anchor_min_ns": lo,
+        "host_anchor_max_ns": hi,
+    }
+
+
+def _json_object_members(text, start):
+    """Locate value spans without reformatting the surrounding JSON."""
+    decoder = json.JSONDecoder()
+
+    def skip_space(position):
+        while text[position] in " \t\r\n":
+            position += 1
+        return position
+
+    cursor = skip_space(start + 1)
+    while text[cursor] != "}":
+        key, cursor = decoder.raw_decode(text, cursor)
+        cursor = skip_space(cursor)
+        if text[cursor] != ":":
+            raise ValueError("invalid JSON object member")
+        value_start = skip_space(cursor + 1)
+        _value, value_end = decoder.raw_decode(text, value_start)
+        yield key, value_start, value_end
+        cursor = skip_space(value_end)
+        if text[cursor] == ",":
+            cursor = skip_space(cursor + 1)
+        elif text[cursor] != "}":
+            raise ValueError("invalid JSON object separator")
+
+
+def _replace_alignment_text(text, record):
+    """Only the alignment value is rewritten; compact task rows stay compact."""
+    root_start = len(text) - len(text.lstrip())
+    metadata_start = next(
+        (start for key, start, _end in _json_object_members(text, root_start) if key == "metadata"),
+        None,
+    )
+    if metadata_start is None or text[metadata_start] != "{":
+        raise ValueError("capture metadata must be an object")
+    encoded = json.dumps(record, separators=(",", ":"), ensure_ascii=True)
+    members = list(_json_object_members(text, metadata_start))
+    for key, start, end in members:
+        if key == "clock_alignment":
+            return text[:start] + encoded + text[end:]
+    newline = "\r\n" if "\r\n" in text else "\n"
+    insertion = members[-1][2] if members else metadata_start + 1
+    addition = ("," if members else "") + newline + '    "clock_alignment": ' + encoded
+    return text[:insertion] + addition + text[insertion:]
+
+
+def _write_clock_alignment_record(path, raw, record):
+    """Replace the complete JSON atomically, preserving its data and permissions."""
+    metadata = raw.setdefault("metadata", {})
+    if metadata.get("clock_alignment") == record:
+        return
+    path = Path(path).resolve()
+    # The writeback source must still contain the same raw capture.
+    source_text = path.read_bytes().decode("utf-8")
+    current = json.loads(source_text)
+    if _capture_without_alignment(current) != _capture_without_alignment(raw):
+        raise ValueError("capture changed during clock alignment")
+    updated_text = _replace_alignment_text(source_text, record)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+        ) as output:
+            temporary = Path(output.name)
+            os.fchmod(output.fileno(), path.stat().st_mode & 0o777)
+            output.write(updated_text)
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    metadata["clock_alignment"] = record
+
+
+def _host_record_bounds(raw):
+    values = []
+    # These are Host-clock records. clock_anchors samples can lie outside the
+    # invocation and must not participate in matching it.
+    for name in ("host_orchestrator_phases", "host_device_uploads"):
+        for record in containment._phase_records(raw.get(name)):
+            values.extend(int(record[field]) for field in ("start_host_ns", "end_host_ns") if record.get(field, 0) > 0)
+    return (min(values), max(values)) if values else None
+
+
+def _matching_capture_host_windows(raw, spans, sidecar):
+    windows = containment.host_windows(spans)
+    by_name = {(span.pid, span.inv, span.name): span for span in spans}
+    windows = [
+        window
+        for window in windows
+        if not by_name[(window.pid, window.inv, containment.RUNNER_SPAN)].is_device
+        and by_name[(window.pid, window.inv, containment.DEVICE_WALL_SPAN)].is_device
+    ]
+    roots = {(span.pid, span.inv): span for span in spans if span.name == containment.RUN_SPAN and not span.is_device}
+    identity = containment.capture_identity(sidecar)
+    pid = (sidecar or {}).get("host_pid")
+    if pid is not None:
+        windows = [window for window in windows if window.pid == int(pid)]
+    if identity is not None:
+        windows = [window for window in windows if window.identity is None or window.identity == identity]
+    host_bounds = _host_record_bounds(raw)
+    if host_bounds is not None:
+        windows = [
+            window
+            for window in windows
+            if (root := roots.get((window.pid, window.inv))) is not None
+            and root.ts <= host_bounds[0] <= host_bounds[1] <= root.ts + root.dur
+        ]
+    windows = [
+        window for window in windows if window.start_ns > 0 and window.duration_ns > 0 and window.device_wall_ns > 0
+    ]
+    if not windows:
+        raise ValueError("no matching Host runner_run/device_wall windows")
+    return windows
+
+
+def _is_hbg_host_capture(raw):
+    """HBG level-3/4 captures containing Host data require clock alignment."""
+    if raw.get("chip_swimlane_level") not in (3, 4):
+        return False
+    metadata = raw.get("metadata") or {}
+    has_host_capture = (
+        metadata.get("orchestrator_source") == "host"
+        or bool(raw.get("host_orchestrator_phases"))
+        or bool(raw.get("host_device_uploads"))
+        or isinstance(metadata.get("host_capture"), dict)
+    )
+    if not has_host_capture:
+        return False
+    section = raw.get("scheduler_records")
+    streams = (section.get("streams") or []) if isinstance(section, dict) else []
+    runtimes = {stream["runtime"] for stream in streams if isinstance(stream, dict) and stream.get("runtime")}
+    return not runtimes or runtimes == {"host_build_graph"}
+
+
+def _prepare_capture_clock_alignment(path, host_logs=None):
+    """Return an enriched HBG capture and any available placement diagnostics.
+
+    Explicit logs request a fresh calculation. With no override, a valid saved
+    mapping is sufficient and no log or sidecar is read.
+    """
+    path = Path(path)
+    raw = json.loads(path.read_text())
+    if not _is_hbg_host_capture(raw):
+        return raw, None
+    try:
+        saved = _read_clock_alignment(raw) if host_logs is None else None
+        if saved is not None:
+            return raw, saved
+    except ValueError as error:
+        print(f"Warning: ignoring saved clock alignment: {error}", file=sys.stderr)
+
+    placement = None
+    try:
+        logs = (
+            [Path(log) for log in host_logs]
+            if host_logs is not None
+            else (sorted(path.parent.glob("host_clock_alignment.*.log")) or sorted(path.parent.glob("host.*.log")))
+        )
+        if not logs:
+            raise ValueError("no Host log available")
+        spans = []
+        for log in logs:
+            with log.open() as input_file:
+                spans.extend(parse_spans(input_file))
+        sidecar_path = path.parent / "dispatch_identity.json"
+        sidecar = json.loads(sidecar_path.read_text()) if sidecar_path.is_file() else None
+        windows = _matching_capture_host_windows(raw, spans, sidecar)
+        if len(windows) != 1:
+            raise ValueError("capture does not uniquely identify a Host invocation")
+        capture = containment.capture_windows(raw)
+        placement = containment.place(windows[0], capture)
+        record = _clock_alignment_record(placement)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        placement = None
+        record = {"status": "unavailable", "reason": str(error)}
+        print(f"Warning: clock alignment skipped: {error}", file=sys.stderr)
+    try:
+        _write_clock_alignment_record(path, raw, record)
+    except (OSError, ValueError) as error:
+        # A read-only source can still be converted with the computed mapping.
+        raw.setdefault("metadata", {})["clock_alignment"] = record
+        print(f"Warning: could not save clock alignment: {error}", file=sys.stderr)
+    return raw, placement
+
+
 def read_perf_data(filepath, *, timeline_origin_ns=None, placement=None):
     """Read and decode performance data from a swimlane JSON file."""
     with open(filepath) as file:
@@ -282,13 +552,15 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
     ``placement`` optionally supplies a ``containment.Placement`` — where this
     capture's device clock sits on the Host CLOCK_MONOTONIC axis, derived from
     the Host span that brackets it (see ``containment``). With one, device
-    records are emitted on the Host timeline and carry the placement's slack as
-    their error bound; without one they stay on their own relative timeline,
-    because nothing in this file alone says where that timeline sits.
+    records are emitted on the Host timeline. Placement diagnostics report
+    block-start slack and separate phase-join freedom; saved anchor bounds
+    include both. With no explicit placement, a valid saved
+    ``metadata.clock_alignment`` is reused. If neither is available, device
+    records remain relative and the HBG composite only preserves causal order.
 
     ``timeline_origin_ns`` optionally supplies a Host CLOCK_MONOTONIC origin
-    shared by several same-host Rank files. It requires a ``placement``: an
-    origin from another process is meaningless on a relative device timeline.
+    shared by several same-host Rank files. It requires an explicit or saved
+    placement: a Host origin is meaningless on a relative device timeline.
 
     Returns a dict shaped for `generate_chrome_trace_json`,
     `print_task_statistics`, and `sched_overhead_analysis`: `tasks`,
@@ -319,6 +591,13 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
         raise ValueError(f"Unsupported chip_swimlane_level: {level} (expected 1, 2, 3, or 4)")
 
     metadata = data.get("metadata") or {}
+    saved_alignment = metadata.get("clock_alignment")
+    if placement is None:
+        try:
+            placement = _read_clock_alignment(data)
+        except ValueError as error:
+            print(f"Warning: ignoring saved clock alignment: {error}", file=sys.stderr)
+            saved_alignment = {"status": "unavailable", "reason": str(error)}
     clock_freq_hz = int(metadata.get("clock_freq_hz") or 0)
     if clock_freq_hz <= 0:
         raise ValueError(f"metadata missing/zero clock_freq_hz: {clock_freq_hz}")
@@ -496,7 +775,14 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
     if host_timestamps and source_host_origin_ns == 0:
         source_host_origin_ns = min(host_timestamps)
     host_origin_ns = source_host_origin_ns
-    host_composite_end_us = (max(host_timestamps) - host_origin_ns) / 1000.0 if host_timestamps else 0.0
+    composite_timestamps = host_timestamps + [
+        int(record[field])
+        for record in data.get("host_device_uploads") or []
+        for field in ("start_host_ns", "end_host_ns")
+    ]
+    # The unaligned composite preserves upload-before-dispatch causality only;
+    # its seam is not a measurement of cross-domain latency.
+    host_composite_end_us = (max(composite_timestamps) - host_origin_ns) / 1000.0 if composite_timestamps else 0.0
 
     # AICore lookup keyed by (core_id, reg_task_id). Two dispatches of the
     # same task_token_raw to the same core (SPMD over-subscription, MIX
@@ -820,8 +1106,8 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
             "relation": metadata.get("timeline_relation", "host_orchestration_precedes_device"),
             "host_capture": host_capture,
             "host_records_complete": host_capture_complete,
-            # Containment bounds the seam rather than closing it, so a latency
-            # read across it is available but never exact: it carries `slack_ns`.
+            # Cross-domain gaps retain placement and phase-join uncertainty,
+            # represented together by saved anchor bounds when available.
             "cross_domain_latency_available": placement is not None and host_capture_complete,
             "source_timeline_origin_ns": source_host_origin_ns,
             "timeline_origin_ns": host_origin_ns,
@@ -849,8 +1135,12 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
             "source_timeline_origin_ns": source_host_origin_ns,
             "timeline_origin_ns": host_origin_ns,
         }
+    if saved_alignment is not None and "timeline_metadata" not in out:
+        out["timeline_metadata"] = {"layout": "device_relative", "cross_domain_latency_available": False}
     if "timeline_metadata" in out:
-        if placement is not None:
+        if saved_alignment is not None:
+            out["timeline_metadata"]["clock_alignment"] = saved_alignment
+        if isinstance(placement, containment.Placement):
             out["timeline_metadata"]["placement"] = placement.metadata()
         host_clock_domain_id = metadata.get("host_clock_domain_id")
         if host_clock_domain_id:
@@ -2106,10 +2396,10 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             stream = scheduler_streams[thread_idx] if scheduler_streams and thread_idx < len(scheduler_streams) else {}
             is_aicore_scheduler = stream.get("producer") == "aicore"
             scheduler_id = stream.get("scheduler_id", thread_idx)
-            physical_core_id = stream.get("physical_core_id")
+            worker_id = stream.get("worker_id")
             lane_name = f"Sched_{scheduler_id}"
             if is_aicore_scheduler:
-                display_id = physical_core_id if physical_core_id is not None else scheduler_id
+                display_id = worker_id if worker_id is not None else scheduler_id
                 lane_name = f"Scheduler_{display_id}"
             events.append(
                 {
@@ -3193,7 +3483,9 @@ Examples:
         "--host-log",
         action="append",
         help="Host [STRACE] log holding the chip.run.runner_run windows the captures are placed in "
-        "(repeatable). Defaults to every host.*.log in the input directory.",
+        "(repeatable). Single-file input prefers sibling host_clock_alignment.*.log over host.*.log. "
+        "Directory input reads both at the root and rank*/d*/host_clock_alignment.*.log. "
+        "A single capture with no matching logs remains unaligned; valid saved alignment needs no logs.",
     )
     parser.add_argument(
         "--rank-pid",
@@ -3641,9 +3933,9 @@ def _rank_clock_domain(rank, records_path, raw):
 def _discover_host_logs(root, explicit):
     """The `[STRACE]` logs that hold the outer windows for these captures.
 
-    A run writes one `host.<pid>.log` per process into its ``output_prefix``,
-    which is the directory the Rank captures sit below, so the default needs no
-    flag. See ``docs/dfx/host-trace.md``.
+    Persistent ``host.<pid>.log`` files live at the case/level output root;
+    ``host_clock_alignment.<pid>.log`` holds capture-local timing spans.
+    See ``docs/dfx/host-trace.md``.
     """
     if explicit:
         paths = [Path(item) for item in explicit]
@@ -3651,10 +3943,17 @@ def _discover_host_logs(root, explicit):
         if missing:
             raise ValueError(f"--host-log names a file that does not exist: {', '.join(missing)}")
         return paths
-    paths = sorted(Path(root).glob("host.*.log"))
+    paths = sorted(
+        {
+            *Path(root).glob("host_clock_alignment.*.log"),
+            *Path(root).glob("host.*.log"),
+            *Path(root).glob("rank*/d*/host_clock_alignment.*.log"),
+        }
+    )
     if not paths:
         raise ValueError(
-            f"no host.*.log under {root}: cross-Rank placement reads each Rank's device work out of the "
+            f"no host_clock_alignment.*.log or host.*.log under {root}: cross-Rank placement reads "
+            "each Rank's device work out of the "
             f"{containment.RUNNER_SPAN} window that contains it. Pass --host-log, or re-run with a Host log "
             f"threshold of TIMING or finer."
         )
@@ -3697,6 +3996,21 @@ def _place_rank_captures(host_log_paths, raw_inputs, identities, host_pids, pins
             "nothing brackets the device work"
         )
     captures = {rank: containment.capture_windows(raw) for rank, raw in raw_inputs.items()}
+    pins = dict(pins)
+    for rank, raw in raw_inputs.items():
+        if rank in pins or host_pids.get(rank) is None or not _is_hbg_host_capture(raw):
+            continue
+        # HBG Host records fall within their own chip.run invocation.
+        # They disambiguate synchronous launches, whose dispatch IDs are zero.
+        try:
+            matches = _matching_capture_host_windows(raw, spans, {"host_pid": host_pids[rank]})
+        except ValueError:
+            # Logs without a chip.run root cannot use the Host-record bounds.
+            continue
+        identity = identities.get(rank)
+        matches = [window for window in matches if identity is None or window.identity in (None, identity)]
+        if len(matches) == 1:
+            pins[rank] = (matches[0].pid, matches[0].inv)
     pairs, pairing = containment.pair_captures(
         windows, captures, forced=pins, identities=identities, host_pids=host_pids
     )
@@ -3767,9 +4081,9 @@ def _dispatcher_spans(spans, chip_pids, window_ns):
 def _dispatcher_block_events(spans, global_origin_ns):
     """The processes that dispatched to these Ranks, drawn above them.
 
-    Each process writes its `host.<pid>.log` into the root of the level
-    namespace it owns, so a direct L3 run leaves the scheduler's own `node.*`
-    spans — and an L4's `network1.*` above them — beside the Rank captures.
+    Each process writes its `host.<pid>.log` at the root of the level
+    namespace it owns, so a direct L3 run supplies the scheduler's own `node.*`
+    spans — and an L4's `network1.*` above them — from the persistent logs.
     Under a parent-assigned `nodeN` namespace the levels above it write one
     directory up, outside the root this merge reads, so only that namespace's
     own levels reach here. They are Host CLOCK_MONOTONIC and same-host
@@ -3910,8 +4224,8 @@ def _placement_bound_events(rank, placement, global_origin_ns):
 
     The lane says two things a reader needs before comparing Ranks: the outer
     window the device work provably sits in, and the interval its start can
-    fall in. A gap between two Ranks narrower than the sum of their slacks is
-    undecided, and this is where that is visible.
+    fall in for the selected phase join. The lane shows placement slack;
+    phase-join freedom is reported separately in the join metadata.
     """
     pid, events = _host_block_lane(rank, 2, "Placement Bound")
     outer_start_us = (placement.host.start_ns - global_origin_ns) / 1000.0
@@ -4075,7 +4389,14 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
     rank_metadata = []
     for rank, records_path in rank_inputs:
         placement = placements[rank]
-        data = _decode_perf_data(raw_inputs[rank], timeline_origin_ns=global_origin_ns, placement=placement)
+        raw = raw_inputs[rank]
+        if _is_hbg_host_capture(raw):
+            record = _clock_alignment_record(placement)
+            try:
+                _write_clock_alignment_record(records_path, raw, record)
+            except (OSError, ValueError) as error:
+                print(f"Warning: could not save clock alignment: {error}", file=sys.stderr)
+        data = _decode_perf_data(raw, timeline_origin_ns=global_origin_ns, placement=placement)
         artifacts = _load_rank_local_artifacts(records_path)
         dispatch_identity = artifacts["dispatch_identity"]
         trace = generate_chrome_trace_json(
@@ -4188,7 +4509,8 @@ def main():
             raise ValueError("--dispatch and --dispatch-id are only valid when input is a dfx_outputs directory")
         if args.verbose:
             print(f"Reading performance data from: {input_path}")
-        data = read_perf_data(input_path)
+        raw, placement = _prepare_capture_clock_alignment(input_path, args.host_log)
+        data = _decode_perf_data(raw, placement=placement)
         _print_verbose_data_info(data, args.verbose)
 
         func_names, orchestrator_name = _load_func_names(args, input_path)

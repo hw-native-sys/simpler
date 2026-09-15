@@ -224,7 +224,10 @@ exposes the drop counter to diagnostics and tests, while
 `_host_log_pending_records()` distinguishes accepted work still waiting for the
 writer. Python and C++ flush defaults are both 1000 ms. Teardown and `os._exit()`
 paths report a timeout with both counters instead of silently abandoning the
-accepted backlog.
+accepted backlog. Bound runtime DSOs can also flush the current process writer
+using the shared counters. A successful flush means the accepted queue was drained;
+write failures are counted separately as drops, and flush does not call `fsync`.
+It does not drain another process's writer.
 
 ### Attributing a drop, and saying so in the log
 
