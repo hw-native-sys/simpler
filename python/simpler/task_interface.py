@@ -56,11 +56,17 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     MAX_TENSOR_DIMS,
     PROV_DESCRIPTOR_MISMATCH,
     PROV_NOT_LIVE,
+    PTO_RUNTIME_ERR_INTERNAL,
+    PTO_RUNTIME_ERR_INVALID_ARGUMENT,
+    PTO_RUNTIME_ERR_INVALID_STATE,
+    PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE,
+    PTO_RUNTIME_ERR_UNSUPPORTED,
     ArgDirection,
     CallConfig,
     ChipCallable,
     ChipStorageTaskArgs,
     ChipTensor,
+    ChipWorkerError,
     CoreCallable,
     DataType,
     DeviceMemoryInfo,
@@ -70,6 +76,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     TaskHandle,
     TaskState,
     TensorArgType,
+    UnsupportedRuntimeOperation,
     WorkerType,
     _ChipWorker,
     _Worker,
@@ -194,6 +201,13 @@ __all__ = [
     "CallConfig",
     "RuntimeEnv",
     "ChipWorker",
+    "ChipWorkerError",
+    "UnsupportedRuntimeOperation",
+    "PTO_RUNTIME_ERR_INTERNAL",
+    "PTO_RUNTIME_ERR_UNSUPPORTED",
+    "PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE",
+    "PTO_RUNTIME_ERR_INVALID_STATE",
+    "PTO_RUNTIME_ERR_INVALID_ARGUMENT",
     "arg_direction_name",
     "scalar_to_uint64",
     # Distributed runtime
@@ -1391,6 +1405,10 @@ class ChipWorker:
         self._identity_registry: dict[bytes, Any] = {}
         self._live_handles: dict[int, bytes] = {}
         self._next_handle_id = 0
+        # Callables staged through kernel_prepare_callable, keyed by the ID the
+        # runtime minted. Separate from _callable_registry, whose keys are program
+        # slots that init() replays into the program ABI.
+        self._kernel_callables: dict[int, ChipCallable] = {}
 
     def init(
         self,
@@ -1467,10 +1485,112 @@ class ChipWorker:
             with self._lifecycle_lock:
                 self._init_in_progress = False
 
+    def kernel_init(
+        self,
+        device_id: int,
+        bins: Any,
+        config: CallConfig,
+        context_generation: int | None = None,
+        log_level: int | None = None,
+    ):
+        """Bind the runtime as a kernel-mode context on a device the caller
+        already holds.
+
+        The kernel counterpart of init(), and mutually exclusive with it. The
+        caller owns the device and the stream: this takes no ACL ownership, does
+        no aclrtSetDevice, and resets nothing at teardown.
+
+        Args:
+            device_id: the device the calling thread has already made current.
+            bins: same structural type init() takes — an object exposing
+                host_path / aicpu_path / aicore_path / dispatcher_path /
+                sim_context_path.
+            config: context-static CallConfig; launches never mutate it.
+            context_generation: nonzero and unique within this process. Minted
+                here when omitted.
+            log_level: as for init().
+        """
+        with self._lifecycle_lock:
+            if self._init_in_progress:
+                raise RuntimeError("ChipWorker.init() is already in progress")
+            if self._impl.initialized:
+                raise RuntimeError("ChipWorker is already initialized")
+            self._init_owner_thread = threading.current_thread()
+            self._init_in_progress = True
+
+        try:
+            _initialize_host_log(log_level)
+            dispatcher_path = getattr(bins, "dispatcher_path", None)
+            sim_context_path = getattr(bins, "sim_context_path", None)
+            generation = (
+                int(_ChipWorker.next_kernel_context_generation())
+                if context_generation is None
+                else int(context_generation)
+            )
+            self._impl.kernel_init(
+                str(bins.host_path),
+                str(bins.aicpu_path),
+                str(bins.aicore_path),
+                "" if dispatcher_path is None else str(dispatcher_path),
+                int(device_id),
+                config,
+                generation,
+                "" if sim_context_path is None else str(sim_context_path),
+            )
+        finally:
+            with self._lifecycle_lock:
+                self._init_in_progress = False
+
+    @property
+    def kernel_mode_supported(self) -> bool:
+        """Whether the bound runtime can execute kernel-mode launches.
+
+        ``False`` whenever ``initialized`` is ``False``: before ``init()`` or
+        ``kernel_init()``, after an init that failed, after a kernel teardown
+        that failed, and after ``finalize()``. ``initialized`` distinguishes
+        that case from a bound runtime without kernel-mode support.
+        """
+        return bool(self._impl.kernel_mode_supported)
+
+    def kernel_prepare_callable(self, chip_callable: ChipCallable) -> int:
+        """Stage a callable for kernel-mode launches, outside ACLGraph capture.
+
+        Returns the ID the runtime minted for it. Every successful call yields a
+        new ID, identical content included, and the ID is valid only on this
+        worker's kernel context. Takes no stream: the platform prepares on
+        streams the context owns, and kernel_launch is the only entry that takes
+        the caller's. The callable stays referenced under its ID until
+        finalize() succeeds.
+        """
+        callable_id = int(self._impl.kernel_prepare_callable(chip_callable))
+        with self._registry_lock:
+            self._kernel_callables[callable_id] = chip_callable
+        return callable_id
+
+    def kernel_launch(self, callable_id: int, args, caller_stream: int):
+        """Enqueue one bounded asynchronous kernel-mode invocation.
+
+        ``caller_stream`` is this call's execution stream. It is borrowed for
+        this call only, may differ from call to call, and is never stored or
+        destroyed by simpler.
+
+        Returning means the sequence was enqueued on that stream; device
+        execution may still be in flight and may still fail asynchronously.
+        """
+        stream = int(caller_stream)
+        if not stream:
+            raise ValueError("kernel_launch requires a non-null caller_stream")
+        self._impl.kernel_launch(int(callable_id), args, stream)
+
     def finalize(self):
         """Tear down everything: device resources and runtime library.
 
-        Terminal operation — the object cannot be reused after this.
+        After a successful call the object cannot be initialized again. For a
+        kernel context, a failed device teardown raises ``ChipWorkerError``
+        carrying the ``finalize_device`` status and keeps the context and the
+        runtime library loaded; ``initialized`` reads ``False`` and calling
+        ``finalize()`` again retries the teardown. A program-mode teardown
+        status is not raised.
         """
         with self._lifecycle_lock:
             owner = self._init_owner_thread
@@ -1481,11 +1601,17 @@ class ChipWorker:
         try:
             self._impl.finalize()
         finally:
+            # The log flush is not an ownership record, so it runs either way.
             _flush_host_log_or_warn("ChipWorker.finalize()")
-            with self._registry_lock:
-                self._callable_registry.clear()
-                self._identity_registry.clear()
-                self._live_handles.clear()
+        # Reached only when the native teardown succeeded. These registries are this
+        # wrapper's record of what the runtime still holds, so they stay populated
+        # while a failed teardown leaves the runtime holding it; a later retry —
+        # the CleanupJournal keeps a failed entry and re-drives it — reads them.
+        with self._registry_lock:
+            self._callable_registry.clear()
+            self._identity_registry.clear()
+            self._live_handles.clear()
+            self._kernel_callables.clear()
 
     def _allocate_slot_locked(self) -> int:
         for slot_id in range(MAX_REGISTERED_CALLABLE_IDS):

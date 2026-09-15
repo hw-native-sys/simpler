@@ -47,9 +47,24 @@ class ChipRun;
 class ChipRunLane;
 struct ChipRunLaneState;
 
-class UnsupportedRuntimeOperation : public std::runtime_error {
+/// A ChipWorker failure that carries a status code, so a caller can classify
+/// it without parsing the message. The code is a PTO_RUNTIME_ERR_* value from
+/// runtime_c_api.h or the status a runtime C entry returned.
+class ChipWorkerError : public std::runtime_error {
 public:
-    using std::runtime_error::runtime_error;
+    ChipWorkerError(int code, const std::string &what) :
+        std::runtime_error(what),
+        code_(code) {}
+    int code() const noexcept { return code_; }
+
+private:
+    int code_;
+};
+
+class UnsupportedRuntimeOperation : public ChipWorkerError {
+public:
+    explicit UnsupportedRuntimeOperation(const std::string &what) :
+        ChipWorkerError(PTO_RUNTIME_ERR_UNSUPPORTED, what) {}
 };
 
 class ChipWorker {
@@ -93,8 +108,67 @@ public:
         bool enable_sdma = false, const std::string &sim_context_path = "", const std::string &sdma_warmup_path = ""
     );
 
-    /// Tear down everything: device resources and runtime library.
-    /// Terminal — the object cannot be reused after this.
+    /// Bind the runtime library and construct this context as a kernel-mode
+    /// context on the device the caller has already made current.
+    ///
+    /// The kernel counterpart of init(), and mutually exclusive with it: the
+    /// `initialized_` guard rejects the second of the two on one worker, and
+    /// the platform's write-once ExecutionModeLatch rejects it again on the
+    /// device context. The two paths share the runtime binding — dlopen, the
+    /// whole dlsym surface, the PipelineContract acceptance check, and
+    /// create_device_context — and diverge at the one call that decides the
+    /// context's identity: this one runs simpler_kernel_mode_init.
+    ///
+    /// Takes no ownership of the caller's device: this path never calls
+    /// aclInit, aclrtSetDevice, ensure_acl_ready, or any device reset, and it
+    /// provisions no SDMA workspace. `config` is context-static — launches
+    /// never mutate it. `context_generation` must be nonzero and unique among
+    /// the kernel contexts this process constructs; next_kernel_context_generation()
+    /// mints one.
+    ///
+    /// The per-slot native-run storage and the ChipRunLane stay absent: both
+    /// back the program-mode prepare/launch/poll/wait/finalize_run surface,
+    /// which a kernel context does not have. Every one of those entries
+    /// bounds-checks the empty storage, so they refuse rather than reach the
+    /// runtime.
+    void kernel_init(
+        const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
+        const std::string &dispatcher_path, int device_id, const CallConfig &config, uint64_t context_generation,
+        const std::string &sim_context_path = ""
+    );
+
+    /// Whether the bound runtime can execute kernel-mode launches. The answer
+    /// belongs to the runtime library init() or kernel_init() bound, so it is
+    /// false whenever the worker is not initialized: before either init, after
+    /// an init that failed, after a kernel teardown that failed, and after
+    /// finalize(). initialized() distinguishes that case from a bound runtime
+    /// without kernel-mode support.
+    bool kernel_mode_supported() const;
+
+    /// Stage one callable for kernel-mode launches and return the ID the runtime
+    /// minted for it. `callable` is a canonical ChipCallable image of
+    /// `callable_size` bytes. Every successful call yields a new context-local
+    /// ID, identical content included, and the ID is valid only on this worker's
+    /// context. Takes no stream: the platform prepares on streams the context
+    /// owns.
+    int32_t kernel_prepare_callable(const void *callable, size_t callable_size);
+
+    /// Enqueue one bounded asynchronous kernel-mode invocation on the caller's
+    /// stream, the only kernel entry that takes one. `caller_stream` is
+    /// borrowed for this call only and never stored or destroyed here.
+    /// Returning means the sequence was enqueued; device execution may still be
+    /// in flight and may still fail asynchronously.
+    void kernel_launch(int32_t callable_id, const ChipStorageTaskArgs *args, void *caller_stream);
+
+    /// A nonzero context generation, unique and increasing within this host
+    /// process. Generation zero is what the C ABI rejects as invalid, so the
+    /// counter starts at one.
+    static uint64_t next_kernel_context_generation();
+
+    /// Tear down everything: device resources and runtime library. The worker
+    /// cannot be initialized again afterwards. When a kernel context's device
+    /// teardown fails, this throws ChipWorkerError and keeps the context and the
+    /// runtime library loaded; calling finalize() again retries the teardown.
     void finalize();
 
     // Launch a cid previously staged via register_callable. `args` is the runtime.so-ABI POD, which
@@ -310,6 +384,35 @@ private:
         size_t window_size = 0;
     };
 
+    /// The entries bind_runtime_symbols resolves but does not install. An init
+    /// publishes them only once its runtime is up, so a worker whose init
+    /// failed holds null kernel entries rather than entries into a runtime it
+    /// is not bound to. get_pipeline_contract rides along because no member
+    /// holds it at all.
+    struct DeferredRuntimeBindings {
+        GetPipelineContractFn get_pipeline_contract = nullptr;
+        KernelSupportedFn kernel_supported = nullptr;
+        KernelInitFn kernel_init = nullptr;
+        KernelPrepareCallableFn kernel_prepare_callable = nullptr;
+        KernelLaunchFn kernel_launch = nullptr;
+    };
+
+    /// Resolve every entry of the uniform host_runtime.so ABI out of `handle`,
+    /// installing all but the deferred ones into this worker's function-pointer
+    /// members. All-or-nothing: a missing symbol throws, and no member installed
+    /// before it survives the throw.
+    DeferredRuntimeBindings bind_runtime_symbols(void *handle);
+
+    /// Install the deferred kernel-mode entries. Called by an init that has
+    /// succeeded, never by one that is rolling back.
+    void publish_kernel_bindings(const DeferredRuntimeBindings &deferred);
+
+    /// Drop every binding this worker holds into the runtime module: the
+    /// function pointers resolved by bind_runtime_symbols and the per-slot
+    /// native-run storage. Leaves `lib_handle_` and `device_ctx_` alone —
+    /// their owners differ per teardown path, and each unwinds them itself.
+    void reset_runtime_bindings();
+
     void *create_comm_stream_checked(const char *op_name);
     void destroy_comm_stream_best_effort(void *stream, int *rc);
     CommSession *find_comm_session(uint64_t comm_handle);
@@ -432,4 +535,15 @@ private:
     int device_id_ = -1;
     bool initialized_ = false;
     bool finalized_ = false;
+    /// A kernel context still holds resources that no completed teardown
+    /// released: its init or its finalize() failed after the entry took them.
+    /// `initialized_` is false, so no other entry reaches the context;
+    /// finalize() still attempts the teardown, and no init runs until one
+    /// succeeds.
+    bool device_teardown_owed_ = false;
+    /// This worker entered simpler_kernel_mode_init. finalize() raises a failed
+    /// device teardown only for such a context: a kernel context keeps its
+    /// resources on that failure and a retry can release them, whereas a
+    /// program-mode runner gives up its device even when it reports a failure.
+    bool kernel_context_ = false;
 };

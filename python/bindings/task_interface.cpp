@@ -109,6 +109,8 @@ public:
     int (*aclInit)(const char *){nullptr};
     int (*aclrtSetDevice)(int){nullptr};
     int (*aclrtGetDevice)(int *){nullptr};
+    int (*aclrtCreateStream)(void **){nullptr};
+    int (*aclrtDestroyStream)(void *){nullptr};
     int (*aclrtMemcpy)(void *, size_t, const void *, size_t, int){nullptr};
     int (*aclrtMemGetAllocationGranularity)(LocalAclPhysicalMemProp *, int, size_t *){nullptr};
     int (*aclrtMallocPhysical)(void **, size_t, const LocalAclPhysicalMemProp *, uint64_t){nullptr};
@@ -132,6 +134,8 @@ public:
         aclInit = reinterpret_cast<int (*)(const char *)>(resolve_symbol("aclInit"));
         aclrtSetDevice = reinterpret_cast<int (*)(int)>(resolve_symbol("aclrtSetDevice"));
         aclrtGetDevice = reinterpret_cast<int (*)(int *)>(resolve_symbol("aclrtGetDevice"));
+        aclrtCreateStream = reinterpret_cast<int (*)(void **)>(resolve_symbol("aclrtCreateStream"));
+        aclrtDestroyStream = reinterpret_cast<int (*)(void *)>(resolve_symbol("aclrtDestroyStream"));
         aclrtMemcpy =
             reinterpret_cast<int (*)(void *, size_t, const void *, size_t, int)>(resolve_symbol("aclrtMemcpy"));
         aclrtMemGetAllocationGranularity = reinterpret_cast<int (*)(LocalAclPhysicalMemProp *, int, size_t *)>(
@@ -164,13 +168,26 @@ public:
             return;
         }
         int rc = aclInit(nullptr);
-        if (rc != kAclSuccess) {
+        // aclInit is process-wide, and in kernel mode the framework that lends
+        // simpler its device has already run it, so kAclRepeatInitialize means
+        // ACL is initialized, not that this call failed. `initialized_` records
+        // that this object may use ACL, not that it owns it — nothing here
+        // finalizes ACL either way.
+        if (rc != kAclSuccess && rc != kAclRepeatInitialize) {
             throw std::runtime_error("aclInit failed with code " + std::to_string(rc));
         }
         initialized_ = true;
     }
 
     void bind_device_with_check(int device_id) const { acl_check(aclrtSetDevice(device_id), "aclrtSetDevice"); }
+
+    void *create_stream_with_check() const {
+        void *stream = nullptr;
+        acl_check(aclrtCreateStream(&stream), "aclrtCreateStream");
+        return stream;
+    }
+
+    void destroy_stream_with_check(void *stream) const { acl_check(aclrtDestroyStream(stream), "aclrtDestroyStream"); }
 
     int current_device_with_check() const {
         int device_id = -1;
@@ -283,6 +300,9 @@ public:
 
 private:
     static constexpr int kAclSuccess = 0;
+    // ACL_ERROR_REPEAT_INITIALIZE. Spelled out because this file dlopens
+    // libascendcl rather than including <acl/acl.h>.
+    static constexpr int kAclRepeatInitialize = 100002;
     static constexpr int kAclMemcpyHostToDevice = 1;
     static constexpr int kAclMemcpyDeviceToHost = 2;
     static constexpr int kAclMemHandleTypeNone = 0;
@@ -1902,6 +1922,21 @@ void check_access_subset(uint8_t granted, TensorArgType tag) {
     }
 }
 
+// Raises the Python exception type in `payload` for a ChipWorkerError of type T,
+// carrying the C++ status code as its `code` attribute. Translators run with
+// the GIL held: a call_guard<gil_scoped_release> has already unwound.
+template <typename T>
+void translate_chip_worker_error(const std::exception_ptr &error, void *payload) {
+    try {
+        std::rethrow_exception(error);
+    } catch (const T &e) {
+        nb::handle type(static_cast<PyObject *>(payload));
+        nb::object value = type(e.what());
+        value.attr("code") = e.code();
+        PyErr_SetObject(type.ptr(), value.ptr());
+    }
+}
+
 }  // namespace
 
 // ============================================================================
@@ -3374,6 +3409,26 @@ NB_MODULE(_task_interface, m) {
             nb::call_guard<nb::gil_scoped_release>()
         );
 
+    // --- ChipWorker errors ---
+    // nanobind tries translators newest first, so the subclass is registered
+    // after its base and is matched before it.
+    nb::exception<ChipWorkerError> chip_worker_error(m, "ChipWorkerError", PyExc_RuntimeError);
+    // Only a native raise carries a status; an instance constructed in Python
+    // reads the class default.
+    chip_worker_error.attr("code") = nb::none();
+    nb::register_exception_translator(translate_chip_worker_error<ChipWorkerError>, chip_worker_error.ptr());
+    nb::exception<UnsupportedRuntimeOperation> unsupported_runtime_operation(
+        m, "UnsupportedRuntimeOperation", nb::make_tuple(chip_worker_error, nb::handle(PyExc_NotImplementedError))
+    );
+    nb::register_exception_translator(
+        translate_chip_worker_error<UnsupportedRuntimeOperation>, unsupported_runtime_operation.ptr()
+    );
+    m.attr("PTO_RUNTIME_ERR_INTERNAL") = static_cast<int>(PTO_RUNTIME_ERR_INTERNAL);
+    m.attr("PTO_RUNTIME_ERR_UNSUPPORTED") = static_cast<int>(PTO_RUNTIME_ERR_UNSUPPORTED);
+    m.attr("PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE") = static_cast<int>(PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE);
+    m.attr("PTO_RUNTIME_ERR_INVALID_STATE") = static_cast<int>(PTO_RUNTIME_ERR_INVALID_STATE);
+    m.attr("PTO_RUNTIME_ERR_INVALID_ARGUMENT") = static_cast<int>(PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+
     // --- ChipWorker ---
     nb::class_<ChipWorker>(m, "_ChipWorker")
         .def(nb::init<>())
@@ -3551,6 +3606,64 @@ NB_MODULE(_task_interface, m) {
             "of the device orch SO buffer (kernel binaries stay resident until "
             "finalize)."
         )
+        .def(
+            "kernel_init",
+            [](ChipWorker &self, const std::string &host_lib_path, const std::string &aicpu_path,
+               const std::string &aicore_path, const std::string &dispatcher_path, int device_id,
+               const CallConfig &config, uint64_t context_generation, const std::string &sim_context_path) {
+                self.kernel_init(
+                    host_lib_path, aicpu_path, aicore_path, dispatcher_path, device_id, config, context_generation,
+                    sim_context_path
+                );
+            },
+            nb::arg("host_lib_path"), nb::arg("aicpu_path"), nb::arg("aicore_path"), nb::arg("dispatcher_path"),
+            nb::arg("device_id"), nb::arg("config"), nb::arg("context_generation"), nb::arg("sim_context_path") = "",
+            // Same reasoning as init: the native binding and device-context
+            // construction are long enough that another Python thread must be
+            // able to run during them.
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Bind the runtime library as a kernel-mode context on the device the "
+            "caller has already made current. Mutually exclusive with init. Takes "
+            "no ownership of the caller's device: no aclInit, no aclrtSetDevice, "
+            "no reset. Raises if the runtime does not support kernel mode."
+        )
+        .def(
+            "kernel_prepare_callable",
+            [](ChipWorker &self, const PyChipCallable &callable) {
+                return self.kernel_prepare_callable(callable.buffer_.data(), callable.buffer_.size());
+            },
+            nb::arg("callable"), nb::call_guard<nb::gil_scoped_release>(),
+            "Stage a callable for kernel-mode launches and return the ID the runtime "
+            "minted for it. Every successful call yields a new context-local ID, "
+            "identical content included. Takes no stream: the platform prepares on "
+            "streams the context owns."
+        )
+        .def(
+            "kernel_launch",
+            [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, uint64_t caller_stream) {
+                self.kernel_launch(callable_id, &args, reinterpret_cast<void *>(caller_stream));
+            },
+            nb::arg("callable_id"), nb::arg("args"), nb::arg("caller_stream"), nb::call_guard<nb::gil_scoped_release>(),
+            "Enqueue one bounded asynchronous kernel-mode invocation on the "
+            "caller's stream. caller_stream is an aclrtStream as an integer "
+            "address — the same thing torch_npu.npu.current_stream().npu_stream "
+            "yields — borrowed for this call only and never stored or destroyed "
+            "here. Returning means the sequence was enqueued; device execution "
+            "may still be in flight and may still fail asynchronously."
+        )
+        .def_prop_ro(
+            "kernel_mode_supported", &ChipWorker::kernel_mode_supported,
+            "Whether the bound runtime can execute kernel-mode launches. False "
+            "whenever initialized is False: before init or kernel_init, after an "
+            "init that failed, after a kernel teardown that failed, and after "
+            "finalize. initialized distinguishes that case from a bound runtime "
+            "without kernel-mode support."
+        )
+        .def_static(
+            "next_kernel_context_generation", &ChipWorker::next_kernel_context_generation,
+            "A nonzero context generation, unique and increasing within this host "
+            "process. Generation zero is what the C ABI rejects as invalid."
+        )
         .def_prop_ro("device_id", &ChipWorker::device_id)
         .def_prop_ro("initialized", &ChipWorker::initialized)
         .def_prop_ro("pipeline_depth", &ChipWorker::pipeline_depth)
@@ -3604,15 +3717,7 @@ NB_MODULE(_task_interface, m) {
             "from their cache budget (it may be invisible to aclrtGetMemInfo)."
         )
         .def(
-            "device_memory_info",
-            [](const ChipWorker &self) {
-                try {
-                    return self.device_memory_info();
-                } catch (const UnsupportedRuntimeOperation &e) {
-                    PyErr_SetString(PyExc_NotImplementedError, e.what());
-                    throw nb::python_error();
-                }
-            },
+            "device_memory_info", &ChipWorker::device_memory_info,
             "Return the ACL_HBM_MEM free/total byte snapshot for this worker's device."
         )
         .def("malloc", &ChipWorker::malloc, nb::arg("size"))
@@ -3817,6 +3922,47 @@ NB_MODULE(_task_interface, m) {
         },
         nb::arg("device_id"), nb::arg("shareable_handle"), nb::arg("mapping_bytes"), nb::arg("owner_token"),
         nb::call_guard<nb::gil_scoped_release>(), "Import an onboard VMM mapped region."
+    );
+    // Test-support surface for the kernel-mode hardware UTs; not an integration
+    // interface. Kernel mode borrows a device and stream the caller already
+    // owns. A framework caller holds both itself (torch_npu provides the stream
+    // as torch_npu.npu.current_stream().npu_stream), so integration code does not
+    // call these three. They let a test with no framework stand up the borrowing
+    // side. simpler never creates a stream on its kernel-mode path: a stream from
+    // _acl_create_stream belongs to its caller, who destroys it with
+    // _acl_destroy_stream.
+    m.def(
+        "_acl_create_stream",
+        []() {
+            return reinterpret_cast<uint64_t>(acl_api().create_stream_with_check());
+        },
+        nb::call_guard<nb::gil_scoped_release>(),
+        "Test support only; kernel-mode integrations pass their framework's "
+        "stream instead. Create an aclrtStream on the calling thread's current "
+        "device and return its integer address. The caller owns it and must pass "
+        "it to _acl_destroy_stream."
+    );
+    m.def(
+        "_acl_destroy_stream",
+        [](uint64_t stream) {
+            if (stream == 0) {
+                throw std::invalid_argument("_acl_destroy_stream requires a non-null stream address");
+            }
+            acl_api().destroy_stream_with_check(reinterpret_cast<void *>(stream));
+        },
+        nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
+        "Test support only. Destroy a stream created by _acl_create_stream."
+    );
+    m.def(
+        "_acl_bind_device",
+        [](int device_id) {
+            acl_api().bind_device_with_check(device_id);
+        },
+        nb::arg("device_id"), nb::call_guard<nb::gil_scoped_release>(),
+        "Test support only; kernel-mode integrations run on the device their "
+        "framework already made current. Run aclInit once and bind the calling "
+        "thread to device_id, so a test can create the stream it lends to a "
+        "kernel-mode context."
     );
     m.def(
         "_region_close",
