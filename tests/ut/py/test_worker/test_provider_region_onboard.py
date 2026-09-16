@@ -112,7 +112,9 @@ def test_onboard_provider_region_host_two_lifecycles(st_platform, st_device_ids,
                 worker_id=0, payload_bytes=_PAYLOAD_BYTES, counter_bytes=_COUNTER_BYTES
             )
             resource_ids.append(int(region.descriptor_scalars()[1]))
-            assert int(region._instance._payload_mapping) != int(region._instance._counter_mapping)
+            assert int(region._instance._payload_attachment.native_lease) != int(
+                region._instance._counter_attachment.native_lease
+            )
             assert int(region._instance._payload_local_view.logical_bytes) == _PAYLOAD_BYTES
             assert int(region._instance._counter_local_view.logical_bytes) == _COUNTER_BYTES
             region.payload_write(0, host, nbytes=_PAYLOAD_BYTES)

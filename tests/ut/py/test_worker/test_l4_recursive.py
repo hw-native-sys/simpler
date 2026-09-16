@@ -634,7 +634,7 @@ class TestDelegatedRouting:
         worker._worker = native
         request = encode_request(
             _allocate_request(initiator_path=b"L3", provider_path=b"L3/L2[1]"),
-            staged_capacity=256,
+            staged_capacity=ALLOCATE_REPLY_BYTES,
         )
         envelope = parse_request(request)
         _forward_delegated_region(worker, "L3", memoryview(request))
@@ -648,6 +648,7 @@ class TestDelegatedRouting:
 
     def test_l4_to_l3_to_l2_keeps_request_bytes_and_creates_no_table(self):
         from simpler.comm_provider_control import (  # noqa: PLC0415
+            ALLOCATE_REPLY_BYTES,
             ProviderTransactionTable,
             encode_request,
             parse_request,
@@ -681,7 +682,7 @@ class TestDelegatedRouting:
             l4._delegated_control_path = "L4"
             request = encode_request(
                 _allocate_request(initiator_path=b"L4", provider_path=b"L4/L3[0]/L2[0]"),
-                staged_capacity=256,
+                staged_capacity=ALLOCATE_REPLY_BYTES,
             )
             envelope = parse_request(request)
             _forward_delegated_region(l4, "L4", memoryview(request))
@@ -697,7 +698,7 @@ class TestDelegatedRouting:
 
     def test_routing_rejects_before_control_payload(self):
         from simpler.comm_provider import RegionControlError  # noqa: PLC0415
-        from simpler.comm_provider_control import encode_request  # noqa: PLC0415
+        from simpler.comm_provider_control import ALLOCATE_REPLY_BYTES, encode_request  # noqa: PLC0415
         from simpler.worker import _forward_delegated_region  # noqa: PLC0415
 
         native = _RecordingNative(_backend_error_reply)
@@ -705,7 +706,7 @@ class TestDelegatedRouting:
         missing._worker = native
         staged = encode_request(
             _allocate_request(initiator_path=b"L3", provider_path=b"L3/L2[1]"),
-            staged_capacity=256,
+            staged_capacity=ALLOCATE_REPLY_BYTES,
         )
         with pytest.raises(RegionControlError, match="next L2 child does not exist"):
             _forward_delegated_region(missing, "L3", memoryview(staged))
@@ -720,7 +721,7 @@ class TestDelegatedRouting:
                 memoryview(
                     encode_request(
                         _allocate_request(initiator_path=b"L4", provider_path=b"L4/L3[0]/L2[0]"),
-                        staged_capacity=256,
+                        staged_capacity=ALLOCATE_REPLY_BYTES,
                     )
                 ),
             )

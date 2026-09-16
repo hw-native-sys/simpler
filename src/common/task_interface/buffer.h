@@ -65,13 +65,16 @@ inline constexpr uint16_t BUFFER_DESCRIPTOR_MAGIC = 0x5342;  // 'BS' little-endi
 // process and second.
 inline constexpr uint32_t OWNER_INSTANCE_ID_BYTES = 8;
 
-// Backend body upper bound. Only POSIX_SHM uses more than 8 bytes (a shm name); every other backend
-// stores a single u64 address.
+// Backend body upper bound. POSIX_SHM uses a shm name; VMM_SHAREABLE uses a fixed 24-byte overlay;
+// every address-bearing backend stores a single u64 address.
 inline constexpr uint32_t DESC_MAX_BYTES = 32;
 
 // Body width of every address-bearing backend: one u64 little-endian base. Exact, not a maximum —
 // a shorter body reads as a truncated pointer indistinguishable from a real one.
 inline constexpr uint32_t BACKEND_ADDRESS_BODY_BYTES = 8;
+
+// VMM_SHAREABLE body: int32 device_id, uint32 reserved 0, uint64 shareable_handle, uint64 mapping_bytes.
+inline constexpr uint32_t VMM_SHAREABLE_BODY_BYTES = 24;
 
 // The backing's granted permission. A per-arg TensorArgType requests read/write and is validated
 // against this at submit (requested must be a subset of granted).
@@ -83,13 +86,18 @@ enum class AccessMode : uint8_t {
 
 // Materialization backend of a buffer. The consumer resolves a Tensor to a local address via the
 // import registry keyed by canonical identity; this tag selects how. REMOTE_SIDECAR is reserved for
-// P2 and rejected on decode in P1. Values are frozen; 6.. reserved (unknown tag => reject).
+// P2 and rejected on decode in P1. Values 0–5 are frozen; VMM_SHAREABLE is 6; 7.. reserved
+// (unknown tag => reject).
 //
 // FORK_SHM and FORK_COW materialize identically — the body is a base VA the child already has,
 // inherited across the fork — but the kernel's write semantics are opposite, so they are separate
 // tags rather than one tag plus a hint. A child's write to a MAP_SHARED page lands in the physical
 // page the parent reads; a write to a copy-on-write page splits it into a private copy the parent
 // never sees, silently. FORK_COW therefore grants READ only, and that is enforced on decode.
+//
+// VMM_WINDOW and VMM_SHAREABLE are distinct tags: the former's body is an already-valid owner-chip
+// device VA that cannot leave that context, while the latter carries a shareable handle an importer
+// maps for itself.
 enum class BackendKind : uint8_t {
     FORK_SHM = 0,
     POSIX_SHM = 1,
@@ -97,6 +105,7 @@ enum class BackendKind : uint8_t {
     REMOTE_SIDECAR = 3,
     DEVICE_MALLOC = 4,
     FORK_COW = 5,
+    VMM_SHAREABLE = 6,
 };
 
 /**
@@ -289,7 +298,7 @@ inline void validate_buffer_descriptor(const BufferDescriptor &h) {
     if (h.address_space > static_cast<uint8_t>(AddressSpace::DEVICE))
         reject("invalid BufferDescriptor: address_space out of range");
     if (h.access > static_cast<uint8_t>(AccessMode::READWRITE)) reject("invalid BufferDescriptor: access out of range");
-    if (h.backend_kind > static_cast<uint8_t>(BackendKind::FORK_COW))
+    if (h.backend_kind > static_cast<uint8_t>(BackendKind::VMM_SHAREABLE))
         reject("invalid BufferDescriptor: backend_kind out of range");
     if (h.body_len > DESC_MAX_BYTES) reject("invalid BufferDescriptor: body_len exceeds DESC_MAX_BYTES");
     if (h.identity.generation == 0) reject("invalid BufferDescriptor: generation 0 is reserved (uninitialized)");
@@ -298,7 +307,8 @@ inline void validate_buffer_descriptor(const BufferDescriptor &h) {
     const auto backend = static_cast<BackendKind>(h.backend_kind);
     const bool device_space = h.address_space == static_cast<uint8_t>(AddressSpace::DEVICE);
     if (backend != BackendKind::REMOTE_SIDECAR) {
-        const bool device_backend = backend == BackendKind::VMM_WINDOW || backend == BackendKind::DEVICE_MALLOC;
+        const bool device_backend = backend == BackendKind::VMM_WINDOW || backend == BackendKind::DEVICE_MALLOC ||
+                                    backend == BackendKind::VMM_SHAREABLE;
         if (device_backend != device_space)
             reject("invalid BufferDescriptor: unsupported address_space x backend_kind (capability matrix)");
     }
@@ -338,6 +348,24 @@ inline void validate_buffer_descriptor(const BufferDescriptor &h) {
                 reject("invalid BufferDescriptor: POSIX_SHM shm name must be printable ASCII without '/'");
             }
         }
+        break;
+    }
+    case BackendKind::VMM_SHAREABLE: {
+        if (h.body_len != VMM_SHAREABLE_BODY_BYTES)
+            reject("invalid BufferDescriptor: VMM_SHAREABLE body must be exactly 24 bytes");
+        int32_t device_id = 0;
+        uint32_t reserved = 0;
+        uint64_t shareable_handle = 0;
+        uint64_t mapping_bytes = 0;
+        std::memcpy(&device_id, h.body, sizeof(device_id));
+        std::memcpy(&reserved, h.body + 4, sizeof(reserved));
+        std::memcpy(&shareable_handle, h.body + 8, sizeof(shareable_handle));
+        std::memcpy(&mapping_bytes, h.body + 16, sizeof(mapping_bytes));
+        if (device_id < 0) reject("invalid BufferDescriptor: VMM_SHAREABLE device_id out of range");
+        if (reserved != 0) reject("invalid BufferDescriptor: VMM_SHAREABLE reserved bytes must be zero");
+        if (shareable_handle == 0) reject("invalid BufferDescriptor: VMM_SHAREABLE shareable_handle must be nonzero");
+        if (mapping_bytes == 0) reject("invalid BufferDescriptor: VMM_SHAREABLE mapping_bytes must be nonzero");
+        if (mapping_bytes < h.nbytes) reject("invalid BufferDescriptor: VMM_SHAREABLE mapping_bytes must cover nbytes");
         break;
     }
     case BackendKind::REMOTE_SIDECAR:
