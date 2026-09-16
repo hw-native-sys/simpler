@@ -180,6 +180,7 @@ private:
     std::atomic<bool> orchestrator_done_{false};
     std::atomic<bool> completed_{false};
     uint64_t *func_id_to_addr_{nullptr};
+    uint32_t run_flags_{0};
 
     // --- Thread/core configuration ---
     int32_t active_sched_threads_{0};

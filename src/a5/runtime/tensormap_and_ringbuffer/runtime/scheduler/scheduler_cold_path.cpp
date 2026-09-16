@@ -1159,6 +1159,7 @@ int32_t SchedulerContext::pre_handshake_init(
     completed_tasks_.store(0, std::memory_order_release);
     orchestrator_done_.store(false, std::memory_order_release);
     func_id_to_addr_ = runtime->dev.func_id_to_addr_;
+    run_flags_ = runtime->get_run_flags();
 
     // total_tasks_ must be read before hs_setup_done_ is published: on the
     // decoupled path the orchestrator resets the SM as soon as it observes
@@ -1282,6 +1283,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     }
 
     func_id_to_addr_ = runtime->dev.func_id_to_addr_;
+    run_flags_ = runtime->get_run_flags();
 
     return 0;
 }
