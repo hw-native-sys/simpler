@@ -653,9 +653,12 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
 // emitted at depth 3 beneath it. Phases never stamped (0 ns) are skipped.
 // Capture and emission share one gate, so a gated-off run performs no transfers
 // for markers that cannot reach the log.
-static void emit_device_phase_markers(DeviceRunnerBase *runner) {
+static void emit_device_phase_markers(DeviceRunnerBase *runner, uint32_t pipeline_slot) {
     if (!device_phase_capture_enabled()) return;
-    const uint64_t run_wall_ns = runner->last_device_phase_ns(AicpuPhase::RunWall);
+    // One read of this run's own record: every field below belongs to the run
+    // that owned `pipeline_slot`, not to whatever the runner is doing now.
+    const DeviceRunnerBase::DeviceRunTiming &timing = runner->device_run_timing(pipeline_slot);
+    const uint64_t run_wall_ns = timing.phase_ns[static_cast<int>(AicpuPhase::RunWall)];
     if (run_wall_ns != 0) {
         // `ts` stays 0: it is this run's device-clock origin, and the sub-phases
         // below are positioned against it, so containment would invert if this
@@ -668,9 +671,9 @@ static void emit_device_phase_markers(DeviceRunnerBase *runner) {
         char dev_attrs[160];
         const int written = std::snprintf(
             dev_attrs, sizeof(dev_attrs), "clk=dev dev_id=%d dev_start_cycle=%llu dev_end_cycle=%llu dev_cnt_hz=%llu",
-            runner->device_id(), static_cast<unsigned long long>(runner->last_device_run_wall_start_cycles()),
-            static_cast<unsigned long long>(runner->last_device_run_wall_end_cycles()),
-            static_cast<unsigned long long>(DeviceRunnerBase::device_sys_cnt_frequency_hz())
+            timing.device_id, static_cast<unsigned long long>(timing.run_wall_start_cycles),
+            static_cast<unsigned long long>(timing.run_wall_end_cycles),
+            static_cast<unsigned long long>(timing.sys_cnt_hz)
         );
         if (written > 0 && static_cast<size_t>(written) < sizeof(dev_attrs)) {
             STRACE_DEV_SPAN_AT_A(
@@ -701,11 +704,11 @@ static void emit_device_phase_markers(DeviceRunnerBase *runner) {
         "kPhases[] must list every AicpuPhase except RunWall — add the new phase here"
     );
     for (const auto &p : kPhases) {
-        const uint64_t ns = runner->last_device_phase_ns(p.phase);
+        const uint64_t ns = timing.phase_ns[static_cast<int>(p.phase)];
         if (ns != 0) {
             STRACE_DEV_SPAN_AT(
-                p.name, static_cast<long long>(runner->last_device_phase_start_ns(p.phase)), static_cast<long long>(ns),
-                3
+                p.name, static_cast<long long>(timing.phase_start_ns[static_cast<int>(p.phase)]),
+                static_cast<long long>(ns), 3
             );
         }
     }
@@ -725,8 +728,8 @@ static void emit_device_phase_markers(DeviceRunnerBase *runner) {
         "chip.run.runner_run.device_wall.task_slot_14", "chip.run.runner_run.device_wall.task_slot_15",
     };
     for (int s = 0; s < NUM_TASK_TIMING_SLOTS; ++s) {
-        const uint64_t dispatch_ns = runner->last_task_slot_dispatch_ns(s);
-        const uint64_t finish_ns = runner->last_task_slot_finish_ns(s);
+        const uint64_t dispatch_ns = timing.task_slot_dispatch_ns[s];
+        const uint64_t finish_ns = timing.task_slot_finish_ns[s];
         if (finish_ns > dispatch_ns) {
             STRACE_DEV_SPAN_AT(
                 kTaskSlotNames[s], static_cast<long long>(dispatch_ns), static_cast<long long>(finish_ns - dispatch_ns),
@@ -1134,13 +1137,22 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
                     &state->runtime, &state->host_api, launched ? execution_rc : PTO_RUNTIME_ERR_INTERNAL
                 );
             }
-            if (launched && execution_rc == 0) emit_device_phase_markers(state->runner);
+            if (launched && execution_rc == 0) {
+                emit_device_phase_markers(state->runner, state->descriptor.pipeline_slot);
+            }
         } else {
             validation_rc = attach_rc;
         }
     } catch (...) {
         validation_rc = PTO_RUNTIME_ERR_INTERNAL;
     }
+
+    // Unconditional: this run is over, so its slot's device-timing storage is
+    // reusable whether or not the result was emitted above. A run that never
+    // launched, failed, lost its attach, or threw has no result to read — but it
+    // still owns the slot, so skipping this on those paths would leave the slot
+    // armed forever and cost every later run on it its capture.
+    state->runner->release_device_run_timing(state->descriptor.pipeline_slot);
 
     int resources_rc = 0;
     if (state->prepared_execution != nullptr) {

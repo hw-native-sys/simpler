@@ -1902,16 +1902,19 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     // invalidated device allocations, not these pages.
     release_sm_mirrors();
 
-    // Free the device-phase/task-timing buffer (allocated lazily in run()) while
-    // mem_alloc_ and the device context are still live. free_tensor() routes
-    // through mem_alloc_.free(), so it must run before mem_alloc_.finalize()
-    // and before the subclass's `rtDeviceReset()` tears down the device runtime.
-    if (device_wall_dev_ptr_ != nullptr) {
+    // Free each slot's device-phase/task-timing buffer (allocated lazily in
+    // run()) while mem_alloc_ and the device context are still live.
+    // free_tensor() routes through mem_alloc_.free(), so it must run before
+    // mem_alloc_.finalize() and before the subclass's `rtDeviceReset()` tears
+    // down the device runtime.
+    for (void *&slot_ptr : device_wall_dev_ptrs_) {
+        if (slot_ptr == nullptr) continue;
         if (!abandon_device_resources) {
-            free_tensor(device_wall_dev_ptr_);
+            free_tensor(slot_ptr);
         }
-        device_wall_dev_ptr_ = nullptr;
+        slot_ptr = nullptr;
     }
+    device_timing_armed_.fill(false);
 
     // Each slot's KernelArgs / runtime / register blocks outlive the runs that
     // use them, so this is where they are returned — same reason and same
@@ -2056,8 +2059,19 @@ int DeviceRunnerBase::resolve_aicpu_thread_num(int requested, int usable, int ar
     return total;
 }
 
-void DeviceRunnerBase::ensure_device_wall_buffer(KernelArgsHelper &kernel_args) {
-    if (!device_phase_capture_enabled()) {
+const DeviceRunnerBase::DeviceRunTiming &DeviceRunnerBase::device_run_timing(uint32_t pipeline_slot) const {
+    static const DeviceRunTiming kEmpty{};
+    if (pipeline_slot >= device_run_timing_.size()) return kEmpty;
+    return device_run_timing_[pipeline_slot];
+}
+
+void DeviceRunnerBase::release_device_run_timing(uint32_t pipeline_slot) {
+    if (pipeline_slot >= device_timing_armed_.size()) return;
+    device_timing_armed_[pipeline_slot] = false;
+}
+
+void DeviceRunnerBase::ensure_device_wall_buffer(uint32_t pipeline_slot, KernelArgsHelper &kernel_args) {
+    if (!device_phase_capture_enabled() || pipeline_slot >= device_wall_dev_ptrs_.size()) {
         // A null base makes the AICPU stamping helpers no-op.
         kernel_args.args.device_wall_data_base = 0;
         return;
@@ -2066,24 +2080,38 @@ void DeviceRunnerBase::ensure_device_wall_buffer(KernelArgsHelper &kernel_args) 
     // AicpuPhaseRecord[NUM_AICPU_PHASES] per launched AICPU thread). Slot
     // AicpuPhase::RunWall keeps the original whole-run wall; the rest subdivide
     // the on-NPU portion. Each surviving AICPU thread writes its own records
-    // (plain stores, no atomics); read_device_phases() reduces RunWall as
-    // max(end) - min(start) and surfaces the other phases as trace markers. The
-    // buffer is allocated once (lazy) but RESET every run so a stale prior run
-    // cannot leak into the reduction.
+    // (plain stores, no atomics); read_device_wall_ns() reduces RunWall as
+    // max(end) - min(start) and surfaces the other phases as trace markers.
+    // Each pipeline slot owns its own buffer, allocated lazily and reset every
+    // run, so the device's writes for one run cannot land in storage whose
+    // result another run has not read yet.
     constexpr int kThreads = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
     using BufferImage = DevicePhaseBufferStorage<kThreads>;
     constexpr size_t kBytes = device_phase_buffer_bytes(kThreads);
     static_assert(sizeof(BufferImage) == kBytes, "device-phase buffer layout drift");
-    if (device_wall_dev_ptr_ == nullptr) {
-        device_wall_dev_ptr_ = allocate_tensor(kBytes);
+    void *&slot_ptr = device_wall_dev_ptrs_[pipeline_slot];
+    if (slot_ptr == nullptr) {
+        slot_ptr = allocate_tensor(kBytes);
     }
-    if (device_wall_dev_ptr_ != nullptr) {
-        kernel_args.args.device_wall_data_base = reinterpret_cast<uint64_t>(device_wall_dev_ptr_);
+    if (slot_ptr != nullptr) {
+        kernel_args.args.device_wall_data_base = reinterpret_cast<uint64_t>(slot_ptr);
     }
 }
 
-int DeviceRunnerBase::arm_device_wall_buffer(KernelArgsHelper &kernel_args) {
-    if (device_wall_dev_ptr_ == nullptr || kernel_args.args.device_wall_data_base == 0) return 0;
+int DeviceRunnerBase::arm_device_wall_buffer(uint32_t pipeline_slot, KernelArgsHelper &kernel_args) {
+    if (pipeline_slot >= device_wall_dev_ptrs_.size()) return 0;
+    void *slot_ptr = device_wall_dev_ptrs_[pipeline_slot];
+    if (slot_ptr == nullptr || kernel_args.args.device_wall_data_base == 0) return 0;
+    if (device_timing_armed_[pipeline_slot]) {
+        // The slot's previous result was never consumed, so its owner's finalize
+        // did not run. Arming anyway would overwrite an unread result; report it
+        // and leave this run without capture rather than corrupt both.
+        LOG_WARN(
+            "device_phase slot %u still holds an unconsumed result; disabling phase capture this run", pipeline_slot
+        );
+        kernel_args.args.device_wall_data_base = 0;
+        return 0;
+    }
     constexpr int kThreads = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
     using BufferImage = DevicePhaseBufferStorage<kThreads>;
     static const BufferImage init = [] {
@@ -2091,14 +2119,15 @@ int DeviceRunnerBase::arm_device_wall_buffer(KernelArgsHelper &kernel_args) {
         reset_device_phase_buffer(&image, kThreads);
         return image;
     }();
-    if (copy_to_device(device_wall_dev_ptr_, &init, sizeof(init)) != 0) {
+    if (copy_to_device(slot_ptr, &init, sizeof(init)) != 0) {
         // Reset failed — disable capture for this run so stale slot data
-        // can't leak into the reduction. Keep the shared allocation alive:
-        // an earlier run may still reference it, and the next run retries reset.
+        // can't leak into the reduction. Keep the slot's allocation alive:
+        // the next run on this slot retries the reset.
         LOG_WARN("device_phase reset H2D failed; disabling phase capture this run");
         kernel_args.args.device_wall_data_base = 0;
         return 0;
     }
+    device_timing_armed_[pipeline_slot] = true;
     return 0;
 }
 
@@ -2200,39 +2229,43 @@ int DeviceRunnerBase::sync_stream_pair(rtStream_t aicpu_stream, rtStream_t aicor
     return 0;
 }
 
-void DeviceRunnerBase::read_device_wall_ns() {
+void DeviceRunnerBase::read_device_wall_ns(uint32_t pipeline_slot) {
     // Pull the per-thread AICPU phase records back from the device buffer that
     // AICPU writes through via KernelArgs::device_wall_data_base. (We can't use
     // the device_k_args_ shadow here — CANN's rtAicpuKernelLaunchExWithArgs
     // copies KernelArgs into AICPU-private memory at launch, so AICPU's writes
     // to its local copy don't propagate to device_k_args_.) Failure path is a
-    // soft warn — wall + phases stay zero.
-    device_wall_ns_ = 0;
-    device_run_wall_start_cycles_ = 0;
-    device_run_wall_end_cycles_ = 0;
-    for (int p = 0; p < NUM_AICPU_PHASES; ++p) {
-        device_phase_ns_[p] = 0;
-        device_phase_start_ns_[p] = 0;
-    }
-    for (int s = 0; s < NUM_TASK_TIMING_SLOTS; ++s) {
-        task_slot_dispatch_ns_[s] = 0;
-        task_slot_finish_ns_[s] = 0;
-    }
+    // soft warn — the slot's record stays zeroed.
+    if (pipeline_slot >= device_run_timing_.size()) return;
+    DeviceRunTiming &out = device_run_timing_[pipeline_slot];
+    out = DeviceRunTiming{};
+    // The device this run was stamped on, and the unit its ticks are in, travel
+    // with the result: the emit path must not read them off the runner, whose
+    // state may already describe a later run.
+    out.device_id = device_id_;
+    out.sys_cnt_hz = device_sys_cnt_frequency_hz();
     if (!device_phase_capture_enabled()) return;
-    if (device_wall_dev_ptr_ == nullptr) return;
+    // Gate on this slot's arming, not just on the buffer existing. A failed
+    // reset leaves the allocation in place but publishes a null device base, so
+    // AICPU never stamped for this run — reading anyway would republish the
+    // previous run on this slot (or, on a slot's first run, whatever
+    // `allocate_tensor` handed back) as this run's result.
+    if (!device_timing_armed_[pipeline_slot]) return;
+    void *slot_ptr = device_wall_dev_ptrs_[pipeline_slot];
+    if (slot_ptr == nullptr) return;
 
     constexpr int kThreads = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
     using BufferPrefix = DevicePhaseBufferPrefixStorage<kThreads>;
     static_assert(sizeof(BufferPrefix) == task_timing_tail_offset(kThreads), "device-phase prefix layout drift");
     BufferPrefix buf{};
-    int wall_rc = rtMemcpy(&buf, sizeof(buf), device_wall_dev_ptr_, sizeof(buf), RT_MEMCPY_DEVICE_TO_HOST);
+    int wall_rc = rtMemcpy(&buf, sizeof(buf), slot_ptr, sizeof(buf), RT_MEMCPY_DEVICE_TO_HOST);
     if (wall_rc != 0) {
         LOG_WARN("rtMemcpy(device_phase) D2H failed: %d", wall_rc);
         return;
     }
 
     // Reduce across threads: per phase, min(start) + span = max(end) - min(start)
-    // in cycles. RunWall (slot 0) is published as device_wall_ns_ for backward
+    // in cycles. RunWall (slot 0) is published as wall_ns for backward
     // compatibility; its duration is the whole-run wall.
     uint64_t start_cycles[NUM_AICPU_PHASES];
     uint64_t span_cycles[NUM_AICPU_PHASES];
@@ -2248,13 +2281,13 @@ void DeviceRunnerBase::read_device_wall_ns() {
     }
 
     for (int p = 0; p < NUM_AICPU_PHASES; ++p) {
-        device_phase_ns_[p] = span_cycles[p] > 0 ? static_cast<uint64_t>(cycles_to_us(span_cycles[p]) * 1000.0) : 0;
+        out.phase_ns[p] = span_cycles[p] > 0 ? static_cast<uint64_t>(cycles_to_us(span_cycles[p]) * 1000.0) : 0;
         if (p != static_cast<int>(AicpuPhase::RunWall) && start_cycles[p] != kPhaseUnset && origin != kPhaseUnset &&
             start_cycles[p] >= origin) {
-            device_phase_start_ns_[p] = static_cast<uint64_t>(cycles_to_us(start_cycles[p] - origin) * 1000.0);
+            out.phase_start_ns[p] = static_cast<uint64_t>(cycles_to_us(start_cycles[p] - origin) * 1000.0);
         }
     }
-    device_wall_ns_ = device_phase_ns_[static_cast<int>(AicpuPhase::RunWall)];
+    out.wall_ns = out.phase_ns[static_cast<int>(AicpuPhase::RunWall)];
 
     // The offsets above are rebased on this run's origin, so they cannot express
     // the interval between two runs. Keep RunWall's bounds as raw sys-counter
@@ -2264,8 +2297,8 @@ void DeviceRunnerBase::read_device_wall_ns() {
     // each bound first.
     const uint64_t run_wall_start = start_cycles[static_cast<int>(AicpuPhase::RunWall)];
     if (run_wall_start != kPhaseUnset) {
-        device_run_wall_start_cycles_ = run_wall_start;
-        device_run_wall_end_cycles_ = run_wall_start + span_cycles[static_cast<int>(AicpuPhase::RunWall)];
+        out.run_wall_start_cycles = run_wall_start;
+        out.run_wall_end_cycles = run_wall_start + span_cycles[static_cast<int>(AicpuPhase::RunWall)];
     }
 
     // A nonzero header means the last AICPU thread found at least one
@@ -2274,8 +2307,7 @@ void DeviceRunnerBase::read_device_wall_ns() {
     constexpr int kTailRecords = task_timing_buffer_slots(kThreads);
     int tail_rc = read_task_timing_tail_if_used(buf.header, [&]() {
         TaskTimingRecord tail[kTailRecords] = {};
-        const void *tail_src =
-            reinterpret_cast<const uint8_t *>(device_wall_dev_ptr_) + task_timing_tail_offset(kThreads);
+        const void *tail_src = reinterpret_cast<const uint8_t *>(slot_ptr) + task_timing_tail_offset(kThreads);
         int rc = rtMemcpy(tail, sizeof(tail), tail_src, sizeof(tail), RT_MEMCPY_DEVICE_TO_HOST);
         if (rc != 0) return rc;
         resolve_task_timing_slots_ns(
@@ -2283,7 +2315,7 @@ void DeviceRunnerBase::read_device_wall_ns() {
             [](uint64_t cyc) {
                 return static_cast<uint64_t>(cycles_to_us(cyc) * 1000.0);
             },
-            task_slot_dispatch_ns_, task_slot_finish_ns_
+            out.task_slot_dispatch_ns, out.task_slot_finish_ns
         );
         return 0;
     });

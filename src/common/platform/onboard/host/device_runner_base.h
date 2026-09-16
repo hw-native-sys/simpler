@@ -409,20 +409,62 @@ public:
     int device_id() const { return device_id_; }
 
     /**
-     * Device-side wall (ns) from the most recently completed run,
-     * written by the platform AICPU entry. Returns 0 before any run
-     * completes. Independent of any profiling / swimlane subsystem.
+     * One run's device-timing readback, owned by that run's pipeline slot.
+     *
+     * Every field here is a *result of one execution*, so it must survive until
+     * that run's finalize has emitted it. Keeping them on the runner instead
+     * would let a successor's drain overwrite a predecessor's unread values —
+     * silently, because nothing reads a generation. `device_id` and `sys_cnt_hz`
+     * travel with the result rather than being read off the runner at emit time,
+     * so the emitted bounds always name the device they were stamped on.
      */
-    uint64_t last_device_wall_ns() const { return device_wall_ns_; }
+    struct DeviceRunTiming {
+        uint64_t wall_ns{0};
+        uint64_t phase_ns[NUM_AICPU_PHASES]{};
+        uint64_t phase_start_ns[NUM_AICPU_PHASES]{};
+        uint64_t task_slot_dispatch_ns[NUM_TASK_TIMING_SLOTS]{};
+        uint64_t task_slot_finish_ns[NUM_TASK_TIMING_SLOTS]{};
+        uint64_t run_wall_start_cycles{0};
+        uint64_t run_wall_end_cycles{0};
+        uint64_t sys_cnt_hz{0};
+        int device_id{-1};
+    };
 
     /**
-     * Per-phase AICPU wall (ns) from the most recently completed run, reduced
-     * across threads as max(end) - min(start). Returns 0 for a phase that was
-     * never stamped (e.g. a platform whose AICPU does not emit that phase).
+     * This slot's last completed run's device timing. A slot's result is written
+     * by `read_device_wall_ns(slot)` at drain and consumed by finalize; the slot
+     * is not handed to another run in between, which is what makes the result
+     * this run's own. Returns a zeroed record before the slot has run, or when
+     * capture is off.
+     */
+    const DeviceRunTiming &device_run_timing(uint32_t pipeline_slot) const;
+
+    /**
+     * Mark this slot's timing result consumed, so the slot may be armed again.
+     * Called by finalize on every path that ends a run, emitted or not: a run
+     * that never launched still owns its slot. Re-arming a slot that is still
+     * armed means a successor took storage whose result nobody read, and
+     * `arm_device_wall_buffer` reports that rather than overwriting it.
+     */
+    void release_device_run_timing(uint32_t pipeline_slot);
+
+    /**
+     * Device-side wall (ns) of the run that last used `pipeline_slot`,
+     * written by the platform AICPU entry. Returns 0 before that slot has
+     * completed a run. Independent of any profiling / swimlane subsystem.
+     */
+    uint64_t last_device_wall_ns(uint32_t pipeline_slot) const { return device_run_timing(pipeline_slot).wall_ns; }
+
+    /**
+     * Per-phase AICPU wall (ns) for that slot's run, reduced across threads as
+     * max(end) - min(start). Returns 0 for a phase that was never stamped
+     * (e.g. a platform whose AICPU does not emit that phase).
      * AicpuPhase::RunWall aliases last_device_wall_ns(). Used by the host to
      * emit device-phase trace markers; see simpler_run in c_api_shared.
      */
-    uint64_t last_device_phase_ns(AicpuPhase phase) const { return device_phase_ns_[static_cast<int>(phase)]; }
+    uint64_t last_device_phase_ns(uint32_t pipeline_slot, AicpuPhase phase) const {
+        return device_run_timing(pipeline_slot).phase_ns[static_cast<int>(phase)];
+    }
 
     /**
      * Per-phase start offset (ns) on a common device-clock timeline shared by
@@ -432,8 +474,8 @@ public:
      * "Effective" window) and the sub-phases nest correctly. 0 for RunWall (the
      * origin) and for any phase never stamped.
      */
-    uint64_t last_device_phase_start_ns(AicpuPhase phase) const {
-        return device_phase_start_ns_[static_cast<int>(phase)];
+    uint64_t last_device_phase_start_ns(uint32_t pipeline_slot, AicpuPhase phase) const {
+        return device_run_timing(pipeline_slot).phase_start_ns[static_cast<int>(phase)];
     }
 
     /**
@@ -445,23 +487,32 @@ public:
      * comparable **across runs on one device within one counter epoch** — which
      * is what makes the interval between one run's device end and the next
      * run's device start computable. Difference the ticks first and convert
-     * afterwards against `device_sys_cnt_frequency_hz()` (the unit they are
+     * afterwards against the record's own `sys_cnt_hz` (the unit they are
      * already in, not `cntfrq_el0`); converting each bound first would round
      * both ends of a sub-microsecond gap away. Not comparable to the host
      * clock. Both 0 when unstamped or capture is off.
      */
-    uint64_t last_device_run_wall_start_cycles() const { return device_run_wall_start_cycles_; }
-    uint64_t last_device_run_wall_end_cycles() const { return device_run_wall_end_cycles_; }
+    uint64_t last_device_run_wall_start_cycles(uint32_t pipeline_slot) const {
+        return device_run_timing(pipeline_slot).run_wall_start_cycles;
+    }
+    uint64_t last_device_run_wall_end_cycles(uint32_t pipeline_slot) const {
+        return device_run_timing(pipeline_slot).run_wall_end_cycles;
+    }
 
     /** Tick rate the two bounds above are expressed in (50 MHz a2a3, 1 GHz a5). */
     static uint64_t device_sys_cnt_frequency_hz() { return PLATFORM_PROF_SYS_CNT_FREQ; }
 
     /**
      * Per-slot task-timing dispatch/finish (ns) on the same device-clock timeline
-     * as the phases. Both 0 for an untagged or incomplete slot. `slot` is 0..15.
+     * as the phases. Both 0 for an untagged or incomplete slot. `slot` is 0..15
+     * — a *task* timing slot, unrelated to `pipeline_slot`.
      */
-    uint64_t last_task_slot_dispatch_ns(int slot) const { return task_slot_dispatch_ns_[slot]; }
-    uint64_t last_task_slot_finish_ns(int slot) const { return task_slot_finish_ns_[slot]; }
+    uint64_t last_task_slot_dispatch_ns(uint32_t pipeline_slot, int slot) const {
+        return device_run_timing(pipeline_slot).task_slot_dispatch_ns[slot];
+    }
+    uint64_t last_task_slot_finish_ns(uint32_t pipeline_slot, int slot) const {
+        return device_run_timing(pipeline_slot).task_slot_finish_ns[slot];
+    }
 
     /**
      * Upload an entire ChipCallable buffer to device memory in one shot.
@@ -1055,13 +1106,14 @@ protected:
     int resolve_aicpu_thread_num(int requested, int usable, int arch_default);
 
     /**
-     * Prepare the device-phase/task-timing buffer for one run. Capture-disabled
-     * runs publish a null device base. Capture-enabled runs allocate lazily,
-     * reset every record, and publish the base for AICPU stamping. Allocation or
-     * reset failure is non-fatal; the base stays null and timing reads as 0.
+     * Prepare the device-phase/task-timing buffer for one run, in that run's
+     * pipeline slot. Capture-disabled runs publish a null device base.
+     * Capture-enabled runs allocate the slot's buffer lazily, reset every
+     * record, and publish the base for AICPU stamping. Allocation or reset
+     * failure is non-fatal; the base stays null and timing reads as 0.
      */
-    void ensure_device_wall_buffer(KernelArgsHelper &kernel_args);
-    int arm_device_wall_buffer(KernelArgsHelper &kernel_args);
+    void ensure_device_wall_buffer(uint32_t pipeline_slot, KernelArgsHelper &kernel_args);
+    int arm_device_wall_buffer(uint32_t pipeline_slot, KernelArgsHelper &kernel_args);
 
     /**
      * Resolve this run's block_dim: every cluster the device has, i.e.
@@ -1099,11 +1151,13 @@ protected:
     int sync_stream_pair(rtStream_t aicpu_stream, rtStream_t aicore_stream);
 
     /**
-     * Read and reduce the device-phase/task-timing records after stream sync.
-     * Capture-disabled runs and missing buffers leave all cached timings at 0.
-     * A D2H failure is a soft warning and also leaves timing at 0.
+     * Read and reduce this slot's device-phase/task-timing records after stream
+     * sync, into that slot's `DeviceRunTiming`. A D2H failure is a soft warning
+     * and leaves the record zeroed, as do a capture-disabled run, a missing
+     * buffer, and a run whose arming failed — the launch path continues after a
+     * failed arm, and that run has no stamps of its own to read.
      */
-    void read_device_wall_ns();
+    void read_device_wall_ns(uint32_t pipeline_slot);
 
     /**
      * H2D the Runtime struct via the supplied per-execution kernel arguments. Log config
@@ -1528,23 +1582,25 @@ protected:
     // and the optional task-timing tail. Its address rides on
     // `KernelArgs.device_wall_data_base`. AICPU stamps raw sys-counter cycles;
     // subclass drain always pulls back the header + phases after stream sync,
-    // and only pulls the tail when the header marks it used. Allocated lazily
-    // on the first capture-enabled run and freed in subclass `finalize()`.
-    void *device_wall_dev_ptr_{nullptr};
-    uint64_t device_wall_ns_{0};
-    uint64_t device_phase_ns_[NUM_AICPU_PHASES] = {0};
-    // Per-phase start offset (ns) from the earliest sub-phase start; see
-    // last_device_phase_start_ns(). Populated alongside device_phase_ns_.
-    uint64_t device_phase_start_ns_[NUM_AICPU_PHASES] = {0};
-    // RunWall's raw device-clock bounds in sys-counter ticks, retaining the
-    // origin the per-phase offsets above subtract away; see
-    // last_device_run_wall_start_cycles().
-    uint64_t device_run_wall_start_cycles_{0};
-    uint64_t device_run_wall_end_cycles_{0};
-    // Per-slot task-timing dispatch/finish (ns), offset from the same origin as
-    // the phases; see last_task_slot_dispatch_ns() / last_task_slot_finish_ns().
-    uint64_t task_slot_dispatch_ns_[NUM_TASK_TIMING_SLOTS] = {0};
-    uint64_t task_slot_finish_ns_[NUM_TASK_TIMING_SLOTS] = {0};
+    // and only pulls the tail when the header marks it used.
+    //
+    // One buffer per pipeline slot, allocated lazily on that slot's first
+    // capture-enabled run and freed in subclass `finalize()`. Per slot rather
+    // than per run so the hot path does no device malloc/free, and rather than
+    // one shared buffer because the device writes it for the whole of a run
+    // while the host reads it only at that run's drain — a successor armed into
+    // the same storage would corrupt both.
+    std::array<void *, PTO_PIPELINE_MAX_DEPTH> device_wall_dev_ptrs_{};
+    // Per-slot readback results; see device_run_timing().
+    std::array<DeviceRunTiming, PTO_PIPELINE_MAX_DEPTH> device_run_timing_{};
+    // Set when a slot's buffer is successfully reset for a launch, cleared when
+    // finalize has finished with the result. It answers two questions from the
+    // one fact, because both are "this slot's buffer is reset and unread":
+    // `arm_device_wall_buffer` refuses while it is set, so a successor cannot
+    // overwrite an unconsumed result; `read_device_wall_ns` skips while it is
+    // clear, so a run whose reset failed does not publish the storage's
+    // previous contents as its own timing.
+    std::array<bool, PTO_PIPELINE_MAX_DEPTH> device_timing_armed_{};
 
     // True after AICPU SO loaded; reset by the subclass's `finalize()`.
     bool binaries_loaded_{false};

@@ -295,7 +295,7 @@ int DeviceRunner::prepare_execution(
         return rc;
     }
 
-    ensure_device_wall_buffer(execution->kernel_args);
+    ensure_device_wall_buffer(pipeline_slot, execution->kernel_args);
 
     if (block_dim < 1) {
         LOG_ERROR("prepare_execution computed block_dim < 1 from worker_count=%d", runtime.get_worker_count());
@@ -594,7 +594,7 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
             // and leave the run safely rollback-able.
             try {
                 activate_launch_shape(runtime);
-                (void)arm_device_wall_buffer(prepared.kernel_args);
+                (void)arm_device_wall_buffer(prepared.pipeline_slot, prepared.kernel_args);
                 if (int arm_rc = arm_collectors_for_run(runtime, prepared); arm_rc != 0) return arm_rc;
                 start_shared_collectors_for_run(prepared.dfx, prepared.pipeline_slot);
                 if (prepared.dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
@@ -693,7 +693,7 @@ int DeviceRunner::reap_run(const DfxRunConfig &dfx, uint32_t pipeline_slot) {
         return rc;
     }
 
-    read_device_wall_ns();
+    read_device_wall_ns(pipeline_slot);
 
     // Tear down collectors. stop() joins mgmt then collector in the only safe
     // order (mgmt's final-drain pass into L2 has poll as its consumer).

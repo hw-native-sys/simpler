@@ -328,7 +328,7 @@ int DeviceRunner::prepare_execution(
         return rc;
     }
 
-    ensure_device_wall_buffer(execution->kernel_args);
+    ensure_device_wall_buffer(pipeline_slot, execution->kernel_args);
 
     if (block_dim < 1) {
         LOG_ERROR("prepare_execution computed block_dim < 1 from worker_count=%d", runtime.get_worker_count());
@@ -472,7 +472,7 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
             // and leave the run safely rollback-able.
             try {
                 activate_launch_shape(runtime);
-                (void)arm_device_wall_buffer(prepared->kernel_args);
+                (void)arm_device_wall_buffer(prepared->pipeline_slot, prepared->kernel_args);
                 if (int arm_rc = arm_collectors_for_run(runtime, *prepared); arm_rc != 0) return arm_rc;
                 start_shared_collectors_for_run(prepared->dfx, prepared->pipeline_slot);
                 if (prepared->dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
@@ -615,7 +615,7 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
         return rc;
     }
 
-    read_device_wall_ns();
+    read_device_wall_ns(prepared.pipeline_slot);
     if (prepared.dfx.chip_swimlane_enabled() && !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
         LOG_WARN("Runtime chip-swimlane extension publication failed");
     }
