@@ -629,7 +629,28 @@ static void emit_device_phase_markers(DeviceRunnerBase *runner) {
     if (!device_phase_capture_enabled()) return;
     const uint64_t run_wall_ns = runner->last_device_phase_ns(AicpuPhase::RunWall);
     if (run_wall_ns != 0) {
-        STRACE_DEV_SPAN_AT("chip.run.runner_run.device_wall", 0, static_cast<long long>(run_wall_ns), 2);
+        // `ts` stays 0: it is this run's device-clock origin, and the sub-phases
+        // below are positioned against it, so containment would invert if this
+        // bracket moved to an absolute instant. The raw RunWall bounds ride
+        // alongside as attributes instead, because only an absolute tick is
+        // comparable between two runs — the interval between run N's device end
+        // and run N+1's device start is
+        // `dev_start_cycle(N+1) - dev_end_cycle(N)`, differenced as integers and
+        // converted with `dev_cnt_hz` afterwards.
+        char dev_attrs[160];
+        const int written = std::snprintf(
+            dev_attrs, sizeof(dev_attrs), "clk=dev dev_id=%d dev_start_cycle=%llu dev_end_cycle=%llu dev_cnt_hz=%llu",
+            runner->device_id(), static_cast<unsigned long long>(runner->last_device_run_wall_start_cycles()),
+            static_cast<unsigned long long>(runner->last_device_run_wall_end_cycles()),
+            static_cast<unsigned long long>(DeviceRunnerBase::device_sys_cnt_frequency_hz())
+        );
+        if (written > 0 && static_cast<size_t>(written) < sizeof(dev_attrs)) {
+            STRACE_DEV_SPAN_AT_A(
+                "chip.run.runner_run.device_wall", 0, static_cast<long long>(run_wall_ns), 2, dev_attrs
+            );
+        } else {
+            STRACE_DEV_SPAN_AT("chip.run.runner_run.device_wall", 0, static_cast<long long>(run_wall_ns), 2);
+        }
     }
     struct PhaseName {
         AicpuPhase phase;

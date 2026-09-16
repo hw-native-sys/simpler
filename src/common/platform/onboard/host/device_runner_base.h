@@ -396,6 +396,26 @@ public:
     }
 
     /**
+     * RunWall's raw device-clock bounds in `get_sys_cnt_aicpu()` ticks —
+     * `min_start` and `max_end` across threads, unconverted and not rebased on
+     * this run's origin. That counter is CNTVCT_EL0 rescaled into the
+     * PLATFORM_PROF_SYS_CNT_FREQ unit, so it is a monotone function of a
+     * free-running counter that is never reset per run: these ticks stay
+     * comparable **across runs on one device within one counter epoch** — which
+     * is what makes the interval between one run's device end and the next
+     * run's device start computable. Difference the ticks first and convert
+     * afterwards against `device_sys_cnt_frequency_hz()` (the unit they are
+     * already in, not `cntfrq_el0`); converting each bound first would round
+     * both ends of a sub-microsecond gap away. Not comparable to the host
+     * clock. Both 0 when unstamped or capture is off.
+     */
+    uint64_t last_device_run_wall_start_cycles() const { return device_run_wall_start_cycles_; }
+    uint64_t last_device_run_wall_end_cycles() const { return device_run_wall_end_cycles_; }
+
+    /** Tick rate the two bounds above are expressed in (50 MHz a2a3, 1 GHz a5). */
+    static uint64_t device_sys_cnt_frequency_hz() { return PLATFORM_PROF_SYS_CNT_FREQ; }
+
+    /**
      * Per-slot task-timing dispatch/finish (ns) on the same device-clock timeline
      * as the phases. Both 0 for an untagged or incomplete slot. `slot` is 0..15.
      */
@@ -1443,6 +1463,11 @@ protected:
     // Per-phase start offset (ns) from the earliest sub-phase start; see
     // last_device_phase_start_ns(). Populated alongside device_phase_ns_.
     uint64_t device_phase_start_ns_[NUM_AICPU_PHASES] = {0};
+    // RunWall's raw device-clock bounds in sys-counter ticks, retaining the
+    // origin the per-phase offsets above subtract away; see
+    // last_device_run_wall_start_cycles().
+    uint64_t device_run_wall_start_cycles_{0};
+    uint64_t device_run_wall_end_cycles_{0};
     // Per-slot task-timing dispatch/finish (ns), offset from the same origin as
     // the phases; see last_task_slot_dispatch_ns() / last_task_slot_finish_ns().
     uint64_t task_slot_dispatch_ns_[NUM_TASK_TIMING_SLOTS] = {0};

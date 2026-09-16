@@ -1992,6 +1992,8 @@ void DeviceRunnerBase::read_device_wall_ns() {
     // to its local copy don't propagate to device_k_args_.) Failure path is a
     // soft warn — wall + phases stay zero.
     device_wall_ns_ = 0;
+    device_run_wall_start_cycles_ = 0;
+    device_run_wall_end_cycles_ = 0;
     for (int p = 0; p < NUM_AICPU_PHASES; ++p) {
         device_phase_ns_[p] = 0;
         device_phase_start_ns_[p] = 0;
@@ -2037,6 +2039,18 @@ void DeviceRunnerBase::read_device_wall_ns() {
         }
     }
     device_wall_ns_ = device_phase_ns_[static_cast<int>(AicpuPhase::RunWall)];
+
+    // The offsets above are rebased on this run's origin, so they cannot express
+    // the interval between two runs. Keep RunWall's bounds as raw sys-counter
+    // ticks: that counter is a monotone rescaling of CNTVCT_EL0 and is not reset
+    // per run, so consecutive runs' ticks are directly comparable, and a
+    // consumer differences the ticks before converting rather than converting
+    // each bound first.
+    const uint64_t run_wall_start = start_cycles[static_cast<int>(AicpuPhase::RunWall)];
+    if (run_wall_start != kPhaseUnset) {
+        device_run_wall_start_cycles_ = run_wall_start;
+        device_run_wall_end_cycles_ = run_wall_start + span_cycles[static_cast<int>(AicpuPhase::RunWall)];
+    }
 
     // A nonzero header means the last AICPU thread found at least one
     // dispatched timing slot. The conditional callback D2Hs the optional tail

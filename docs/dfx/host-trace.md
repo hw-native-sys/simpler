@@ -138,7 +138,7 @@ One line per span, emitted on scope exit
 | `hid` | callable content hash (ELF Build-ID 64), stable across slot reuse / processes / runs. The parser buckets by `hid`; the most-frequent bucket is decode (one invocation per token), a once-seen bucket is prefill. |
 | `depth` | thread-local nesting depth (`++` on enter, `--` on exit). The parser rebuilds the call tree from `depth` — **not** from timestamp containment. |
 | `name` | dotted span name (self-locating even without the tree). |
-| `ts` `dur` | start + duration in ns. Maps 1:1 onto a Chrome-trace `"X"` event. For host spans `ts` is `CLOCK_MONOTONIC` (`steady_clock`), same-host cross-process comparable. For `clk=dev` device spans (see below) `ts` is instead a **device-clock** start offset on a per-invocation origin — comparable to the other device spans (so the orch∪sched window is recoverable), not the host clock. |
+| `ts` `dur` | start + duration in ns. Maps 1:1 onto a Chrome-trace `"X"` event. For host spans `ts` is `CLOCK_MONOTONIC` (`steady_clock`), same-host cross-process comparable. For `clk=dev` device spans (see below) `ts` is instead a **device-clock** start offset on a per-invocation origin — comparable to the other device spans (so the orch∪sched window is recoverable), not the host clock, and **not comparable between invocations**; for that, see [Comparing device spans across runs](#comparing-device-spans-across-runs). |
 | `k=v ...` | optional per-span attributes (e.g. `ntensor=4`); a parser that doesn't recognize one ignores it. |
 
 Span names and attributes percent-encode control bytes and record delimiters.
@@ -175,6 +175,45 @@ back after stream-sync, converts cycles → ns, and emits the marker. `orch`/
 device-log lines. A phase that was never stamped
 (0 ns) is skipped — e.g. `so_load` is ~0 on a cached-callable run. See
 [device-phases.md](device-phases.md) for the device-side mechanism.
+
+### Comparing device spans across runs
+
+A device span's `ts` is rebased on its own invocation's origin, so it orders
+spans *within* one run and says nothing about the interval *between* two runs.
+`device_wall` therefore also carries its raw bounds:
+
+| attribute | meaning |
+| --------- | ------- |
+| `dev_id` | the device these ticks were stamped on; ticks from different devices are not comparable |
+| `dev_start_cycle` | RunWall's `min_start` across AICPU threads, in sys-counter ticks |
+| `dev_end_cycle` | RunWall's `max_end` across AICPU threads, same unit |
+| `dev_cnt_hz` | tick rate those two are expressed in (50 MHz a2a3, 1 GHz a5) |
+
+The ticks come from `get_sys_cnt_aicpu()`, which reads the free-running
+`CNTVCT_EL0` **rescaled into the `PLATFORM_PROF_SYS_CNT_FREQ` unit**
+(`sys_cnt_now_ticks()`: `cntvct * PROF / cntfrq_el0`, an identity on real
+silicon where the two agree). So `dev_cnt_hz` is the divisor — **not**
+`cntfrq_el0`, which differs from it wherever that identity does not hold. The
+rescaled counter is a monotone function of `CNTVCT_EL0` and is never reset per
+run, so consecutive runs' ticks are directly comparable and the device-side
+inter-run gap is
+
+```text
+gap = (dev_start_cycle(N+1) - dev_end_cycle(N)) / dev_cnt_hz
+```
+
+**Difference the ticks, then convert.** Converting each bound to ns first rounds
+both ends and can consume a sub-microsecond gap entirely. `sys_cnt_elapsed_ns()`
+in `aicpu/device_time.h` is that operation with the overflow guards already in
+place. `ts` stays 0 on this
+span because it is the origin the depth-3 sub-phases are positioned against;
+moving it to an absolute instant would invert their containment. Comparability
+holds within one device and one counter epoch — it says nothing across a device
+reset, and these ticks are never comparable to the host clock. Both bounds read
+back as 0 when the phase went unstamped, which also covers the misconfigured
+counter (`cntfrq_el0` unset makes every stamp 0, so no interval is derived from
+it rather than a bogus one). The onboard platform emits them; the
+sim platform derives `device_wall` from `steady_clock` and emits `ts`/`dur` only.
 
 The phased native-run interface preserves this same marker contract. Prepare
 allocates one `inv` and records the host-wall start; prepare, the child progress
