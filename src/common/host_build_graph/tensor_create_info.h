@@ -60,7 +60,7 @@ public:
     }
 
 public:
-    uint32_t ndims{0};
+    uint8_t ndims{0};
     DataType dtype{DataType::FLOAT32};
     bool manual_dep{false};
     uint32_t shapes[MAX_TENSOR_DIMS]{};

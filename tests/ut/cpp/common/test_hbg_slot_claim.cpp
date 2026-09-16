@@ -146,7 +146,7 @@ TEST_F(HbgSlotClaimTest, GraphOuterTaskClaimsAPoisonedSlot) {
     ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary_args));
 
     CoreTaskArgs task_args;
-    task_args.add_input(boundary);
+    task_args.add_input(graph.params->tensor(0).ref());
     ASSERT_TRUE(orch.submit_dummy_task(task_args).task_id().is_valid());
     ASSERT_TRUE(orch.graph_end());
     ASSERT_EQ(orch.task_allocator.active_count(), 1);
@@ -172,7 +172,7 @@ TEST_F(HbgSlotClaimTest, CachedGraphReplayClaimsAPoisonedSlot) {
     ASSERT_TRUE(recorded.recording);
     ASSERT_TRUE(orch.graph_prepare(recorded.recording_handle, boundary_args));
     CoreTaskArgs task_args;
-    task_args.add_input(boundary);
+    task_args.add_input(recorded.params->tensor(0).ref());
     ASSERT_TRUE(orch.submit_dummy_task(task_args).task_id().is_valid());
     ASSERT_TRUE(orch.graph_end());
 

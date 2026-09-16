@@ -105,11 +105,15 @@ TEST_F(HbgGraphRecordingBoundsTest, RecordedTaskIsKeyedByItsIndexNotByTheRunsNum
     ASSERT_TRUE(graph.recording);
     ASSERT_NE(graph.recording_handle, nullptr);
     ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary_args));
+    // What a body actually receives: the entry's own parameter list, whose tensors carry
+    // recording-space addresses and PARAM provenance. Passing the caller's tensor instead
+    // is the case the classifier rejects.
+    const simpler::hbg::Tensor &param = graph.params->tensor(0).ref();
 
     // An INOUT operand is what makes the recorded task register an output: the
     // recording's hazard map exists for exactly the write-in-place shape.
     CoreTaskArgs task_args;
-    task_args.add_inout(boundary);
+    task_args.add_inout(param);
     const TaskId in_graph_task_id = orch.submit_dummy_task(task_args).task_id();
     ASSERT_TRUE(in_graph_task_id.is_valid());
     EXPECT_EQ(in_graph_task_id.space(), TaskId::Space::IN_GRAPH)
@@ -147,9 +151,10 @@ TEST_F(HbgGraphRecordingBoundsTest, PreGraphProducerOfABoundaryTensorContributes
     const GraphScopeResult graph = orch.graph_begin(0x6B0D5A1F, boundary_args, 0x1736);
     ASSERT_TRUE(graph.recording);
     ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary_args));
+    const simpler::hbg::Tensor &param = graph.params->tensor(0).ref();
 
     CoreTaskArgs task_args;
-    task_args.add_inout(boundary);
+    task_args.add_inout(param);
     ASSERT_TRUE(orch.submit_dummy_task(task_args).task_id().is_valid());
     ASSERT_TRUE(orch.graph_end());
 
@@ -164,4 +169,49 @@ TEST_F(HbgGraphRecordingBoundsTest, PreGraphProducerOfABoundaryTensorContributes
     EXPECT_EQ(definition->edge_count, 0u) << "the pre-Graph producer is reached through the shell, not through an "
                                              "edge the Definition carries";
     EXPECT_EQ(definition->root_count, 1u);
+}
+
+// Two parameters over one buffer are one alias partition and must land in one
+// parameter window. The shadow tensor map infers WAR/WAW edges by buffer address, so
+// giving them separate windows would tell the recorder they are unrelated memory and
+// the edge between a write through one and a read through the other would vanish --
+// silently, into a Definition that replays a DAG the body never had.
+TEST_F(HbgGraphRecordingBoundsTest, TwoViewsOfOneBufferShareAWindowAndKeepTheEdgeBetweenThem) {
+    std::array<uint32_t, 16> storage{};
+    uint32_t shape[] = {static_cast<uint32_t>(storage.size())};
+    simpler::hbg::Tensor written = simpler::hbg::make_tensor_external(storage.data(), shape, 1);
+    simpler::hbg::Tensor read = simpler::hbg::make_tensor_external(storage.data(), shape, 1);
+
+    orch.begin_scope();
+    GraphTaskArgs boundary_args;
+    boundary_args.add_inout(written);
+    boundary_args.add_input(read);
+    const GraphScopeResult graph = orch.graph_begin(0x6B0D5A20, boundary_args, 0x1736);
+    ASSERT_TRUE(graph.recording);
+    ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary_args));
+
+    const simpler::hbg::Tensor &write_param = graph.params->tensor(0).ref();
+    const simpler::hbg::Tensor &read_param = graph.params->tensor(1).ref();
+    EXPECT_EQ(write_param.buffer.addr, read_param.buffer.addr) << "parameters over one buffer must share a window base";
+    EXPECT_NE(write_param.buffer.addr, written.buffer.addr)
+        << "a parameter is addressed in the recording's space, not the caller's";
+
+    CoreTaskArgs writer_args;
+    writer_args.add_inout(write_param);
+    ASSERT_TRUE(orch.submit_dummy_task(writer_args).task_id().is_valid());
+
+    CoreTaskArgs reader_args;
+    reader_args.add_input(read_param);
+    ASSERT_TRUE(orch.submit_dummy_task(reader_args).task_id().is_valid());
+    ASSERT_TRUE(orch.graph_end());
+
+    const GraphHostDefinitionList published = graph_host_definitions(*graph_state);
+    ASSERT_EQ(published.entries.size(), 1u);
+    const GraphHostDefinition &entry = published.entries.front();
+    ASSERT_NE(entry.object_offset, GRAPH_NO_OBJECT_OFFSET);
+    const auto *definition = reinterpret_cast<const GraphDefinition *>(
+        definition_staging.data() + entry.object_offset + sizeof(GraphDefinitionHeader)
+    );
+    EXPECT_EQ(definition->task_count, 2u);
+    EXPECT_EQ(definition->edge_count, 1u) << "the reader depends on the writer through the buffer they share";
 }

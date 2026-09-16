@@ -24,7 +24,6 @@
 #include <cstring>
 #include <vector>
 
-#include "graph_execution.h"
 #include "host_build_graph/shared_memory.h"
 #include "host_build_graph/task_id.h"
 
@@ -490,40 +489,34 @@ TEST(HbgSmCompaction, RebaseIsANoOpWhenNothingCameFromTheHeap) {
     }
 }
 
-// An outer GRAPH task's boundary tensors are GraphTensors packed at their own
-// stride into the simpler::hbg::Tensor-slotted pool (graph_boundary_tensor_pool_slots sizes
-// the slots), so only the first one starts on a simpler::hbg::Tensor boundary. The rebase
-// therefore cannot walk the pool as ChipTensors: every boundary past the first
-// keeps a virtual address the device then dereferences, and the bytes that *are*
-// rewritten land in the middle of a GraphTensor.
+// Every boundary of an outer GRAPH task is rebased, not just the first. A Graph's boundary
+// is this invocation's actual arguments, held as simpler::hbg::Tensors in the same pool and
+// at the same stride as any other task's, so one walk covers both kinds -- a boundary the
+// walk skipped would keep a virtual address the device then dereferences.
 TEST(HbgSmCompaction, MovesEveryGraphBoundaryAddressOntoTheRealBase) {
     constexpr uint64_t REAL_BASE = 0x7F0000000000ULL;
-    // Two is enough to expose the stride: the second GraphTensor starts at
-    // sizeof(GraphTensor), which is not a simpler::hbg::Tensor boundary. Their packed bytes
-    // still fit the simpler::hbg::Tensor slots this slot's region owns.
     constexpr uint32_t BOUNDARIES = 2;
-    ASSERT_LT(sizeof(GraphTensor), sizeof(simpler::hbg::Tensor))
-        << "the packing this test is about only exists while GraphTensor is the smaller";
-    ASSERT_LE(BOUNDARIES * sizeof(GraphTensor), TENSORS_PER_TASK * sizeof(simpler::hbg::Tensor));
+    static_assert(BOUNDARIES <= TENSORS_PER_TASK, "the boundaries must fit the slot's own tensor region");
 
     Mirror mirror;
-    // One GRAPH task whose boundaries all live in the graph heap. task_kind is what
-    // tells the restack which element type this task's region holds.
+    // One GRAPH task whose boundaries all live in the graph heap.
     constexpr uint64_t GRAPH_SLOT = 0;
     ChipTaskStorage &graph_entry = mirror.storage()[GRAPH_SLOT];
     graph_entry.slot.task_kind = TaskKind::GRAPH;
     graph_entry.payload.tensor_count = static_cast<int32_t>(BOUNDARIES);
-    auto *boundaries = reinterpret_cast<GraphTensor *>(graph_entry.payload.tensor_data());
+    auto *boundaries = graph_entry.payload.tensor_data();
     for (uint32_t j = 0; j < BOUNDARIES; ++j) {
-        boundaries[j] = GraphTensor{};
-        boundaries[j].buffer_addr = HEAP_VIRTUAL_BASE + 0x1000 * (j + 1);
-        boundaries[j].buffer_size = 0x40;
+        boundaries[j] = simpler::hbg::Tensor{};
+        boundaries[j].buffer.addr = HEAP_VIRTUAL_BASE + 0x1000 * (j + 1);
+        boundaries[j].buffer.size = 0x40;
+        // A caller-owned tensor: the restack asserts nothing a recording addressed is here.
+        boundaries[j].owner_task_id = TaskId::invalid();
     }
 
     Compacted compacted(mirror, SUBMITTED, {REAL_BASE, 1ULL << 30});
-    const auto *shipped = reinterpret_cast<const GraphTensor *>(compacted.storage[GRAPH_SLOT].payload.tensor_data());
+    const auto *shipped = compacted.storage[GRAPH_SLOT].payload.tensor_data();
     for (uint32_t j = 0; j < BOUNDARIES; ++j) {
-        EXPECT_EQ(shipped[j].buffer_addr, REAL_BASE + 0x1000 * (j + 1)) << "boundary " << j;
-        EXPECT_EQ(shipped[j].buffer_size, 0x40u) << "boundary " << j << " had a neighbouring field rewritten";
+        EXPECT_EQ(shipped[j].buffer.addr, REAL_BASE + 0x1000 * (j + 1)) << "boundary " << j;
+        EXPECT_EQ(shipped[j].buffer.size, 0x40u) << "boundary " << j << " had a neighbouring field rewritten";
     }
 }

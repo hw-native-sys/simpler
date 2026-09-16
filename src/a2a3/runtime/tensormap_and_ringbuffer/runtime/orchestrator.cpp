@@ -1037,11 +1037,8 @@ static TaskOutputTensors submit_task_common(
 #if SIMPLER_DFX
     if (is_dep_gen_enabled()) {
         const void *tensor_ptrs[MAX_TENSOR_ARGS];
-        // TensorArgType is `enum class : int32_t` (4 bytes); the on-disk record
-        // packs arg_types as uint8_t[16] (5-value enum fits in a byte). Narrow
-        // each tag here rather than letting the AICPU writer reinterpret a
-        // 4×-wider array as bytes — that path silently lost two of every three
-        // tags on little-endian and synthesized phantom self-edges in replay.
+        // The on-disk record packs arg_types as uint8_t[16]; TensorArgType is a byte-wide
+        // enum, so staging each tag here is a type change and not a narrowing.
         uint8_t arg_types_u8[MAX_TENSOR_ARGS];
         // Clamp to MAX_TENSOR_ARGS even though the Arg builder caps adds at
         // MAX_TENSOR_ARGS: defensive against any future builder bypass /

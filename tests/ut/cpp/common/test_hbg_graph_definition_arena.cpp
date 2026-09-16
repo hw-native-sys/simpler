@@ -104,7 +104,10 @@ protected:
         ASSERT_TRUE(scope.recording);
         ASSERT_TRUE(scope.task_id.is_valid());
         ASSERT_TRUE(orch.graph_prepare(scope.recording_handle, boundary_args));
-        simpler::hbg::Tensor input = boundary;
+        // A body reads the entry's parameter list, not the caller's tensors: those carry
+        // recording-space addresses and PARAM provenance, which is what the classifier
+        // resolves against.
+        simpler::hbg::Tensor input = scope.params->tensor(0).ref();
         for (int i = 0; i < task_count; ++i) {
             CoreTaskArgs task_args;
             task_args.add_input(input);

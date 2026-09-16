@@ -51,6 +51,12 @@ struct TaskId {
      *   IN_GRAPH — a task belonging to one Graph task's body. It lives in that Graph's
      *              own storage, not in the task table, so its low bits are the packed
      *              pair below and must never be resolved against a table slot.
+     *   PARAM    — a formal parameter of a Graph boundary, or a view derived from one.
+     *              It names no task at all: it is the provenance mark a recording
+     *              stamps on its boundary tensors so classification can tell a
+     *              parameter from a body-local output and from an object that entered
+     *              the body without passing through the boundary. Its low bits are the
+     *              parameter index, and nothing resolves it against a table slot.
      *
      * An IN_GRAPH id is minted twice for the same task, in two disjoint scopes. The
      * recorder mints one per task it records, with `graph_task_id` fixed at 0: a
@@ -62,7 +68,7 @@ struct TaskId {
      * private map and the body's own locals, and a materialized task is addressed by
      * index rather than looked up by id.
      */
-    enum class Space : uint32_t { GLOBAL = 0, IN_GRAPH = 1 };
+    enum class Space : uint32_t { GLOBAL = 0, IN_GRAPH = 1, PARAM = 2 };
 
     // An in-graph task's low bits pack its Graph task's local id above the task's own
     // in-graph local id. graph_execution.h asserts MAX_IN_GRAPH_TASKS fits the low half.
@@ -86,13 +92,23 @@ struct TaskId {
         return TaskId{(static_cast<uint64_t>(Space::IN_GRAPH) << 32) | static_cast<uint64_t>(packed)};
     }
 
+    // A boundary parameter's low field is the parameter index alone, not the packed
+    // pair above: a parameter belongs to a boundary rather than to any task, so there
+    // is no owning Graph task to name beside it. local_id() therefore round-trips the
+    // index this was minted with.
+    static constexpr TaskId make_param(int32_t param_index) {
+        return TaskId{
+            (static_cast<uint64_t>(Space::PARAM) << 32) | static_cast<uint64_t>(static_cast<uint32_t>(param_index))
+        };
+    }
+
     constexpr bool is_valid() const { return raw != UINT64_MAX; }
 
     constexpr Space space() const { return static_cast<Space>(static_cast<uint32_t>(raw >> 32)); }
 
     // True exactly when this id names a slot in the shared-memory task table, which is
-    // what every caller that is about to resolve one is really asking. An IN_GRAPH id
-    // answers false and must not reach get_slot_by_task_id().
+    // what every caller that is about to resolve one is really asking. An IN_GRAPH or
+    // PARAM id answers false and must not reach get_slot_by_task_id().
     constexpr bool is_global() const { return space() == Space::GLOBAL; }
 
     // The low 32 bits. A task-table local id for a GLOBAL task; the packed pair above
@@ -100,7 +116,7 @@ struct TaskId {
     // is_global() first. Both fit int32_t: a table index is bounded by the run's task
     // capacity, and a packed pair by MAX_IN_GRAPH_TASKS above that same capacity.
     //
-    // Only the GLOBAL case round-trips its minting argument. For an IN_GRAPH id the
+    // GLOBAL and PARAM round-trip their minting argument. For an IN_GRAPH id the
     // in_graph_local_id given to make_in_graph() is the low IN_GRAPH_LOCAL_ID_BITS of
     // what this returns, not the whole of it.
     constexpr int32_t local_id() const { return static_cast<int32_t>(raw & 0xFFFFFFFFu); }

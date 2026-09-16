@@ -563,7 +563,7 @@ bool bind_graph_definitions(
                 definition->task_count, definition->tensor_arg_count, definition->scalar_arg_count, &storage_layout
             ) ||
             storage_layout.total_bytes != definition->execution_storage_bytes ||
-            upload->outer_slot->to_payload().tensor_count != definition->boundary_count ||
+            upload->outer_slot->to_payload().tensor_count != definition->boundary_tensor_count ||
             upload->outer_slot->to_payload().scalar_count != definition->boundary_scalar_count) {
             LOG_ERROR("host-orch: invalid Graph Definition for task");
             return false;
@@ -660,9 +660,7 @@ int32_t run_host_orchestration(
     // region is committed below, once this pass has revealed how many bytes it
     // actually needs, and compact_live_image moves every address the orchestrator
     // wrote onto the real base before the image travels.
-    if (!orchestrator.init(
-            host_sm, reinterpret_cast<void *>(HEAP_VIRTUAL_BASE), HEAP_VIRTUAL_CAPACITY, task_capacity
-        )) {
+    if (!orchestrator.init(host_sm, reinterpret_cast<void *>(HEAP_VIRTUAL_BASE), MAX_HEAP_CAPACITY, task_capacity)) {
         LOG_ERROR("host-orch: orchestrator init against host SM failed");
         return PTO_RUNTIME_ERR_INTERNAL;
     }

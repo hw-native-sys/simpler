@@ -10,12 +10,13 @@ tasks — where an AIC, AIV or MIX task is a leaf that dispatches straight to co
 Every invocation places exactly one `GRAPH` task in the host task window. On a
 first miss, the caller immediately submits an outer task shell keyed by Graph
 identity while a recording thread records the DAG off the ordinary submit path. Internal
-submissions build host-only in-graph task metadata and assign output addresses from a
-private bit-63 virtual range instead of consuming task-window slots or heap.
+submissions build host-only in-graph task metadata and assign output addresses from the
+recording's own address space instead of consuming task-window slots or heap.
 Later calls for the same in-flight identity submit more shells without waiting
 for recording, and a call for a *different* identity opens its own recording on
 its own thread rather than waiting. At orchestration completion, the caller joins
-every recording and fills each shell's heap range and Definition content hash.
+every recording and fills each shell's heap range and the device address of the
+Definition object it replays.
 Cached invocations submit the same one `GRAPH` task directly — a cache hit never
 waits on a recording. In both cases the device Scheduler expands the saved
 topology and dispatches the in-graph tasks; the Host Orchestrator never submits
@@ -152,8 +153,8 @@ is the author's declaration, and this is the declared consequence. Two notes on
 why it cannot be diagnosed instead:
 
 - An address cannot tell "created inside this body" from "created outside it".
-  The body's `Arg`s are stack locals while the boundary is pool storage, so
-  their relative addresses are a platform accident, not a guarantee.
+  The body's `Arg`s are stack locals while the boundary lives on the in-flight
+  entry, so their relative addresses are a platform accident, not a guarantee.
 - Whether the outside slot's value changes between invocations is invisible
   here. If it does, the Definition keeps replaying the recorded one.
 
@@ -166,23 +167,61 @@ why it cannot be diagnosed instead:
 - A Graph boundary contains at least one ChipTensor.
 - Construction parameters are part of Graph identity and may control the
   function's task count, kernel selection, or other structural choices.
-- Boundary ChipTensor shape, stride, dtype, size, direction, contiguity, and alias
-  partition must match the first invocation.
+- Boundary ChipTensor shape, stride, dtype, size, direction, contiguity, and
+  alias partition must match the first invocation.
+- A parameter's view origin (`start_offset`) may move between invocations, but
+  only by moving its whole alias partition: what the contract compares is each
+  parameter's origin *relative to the lowest-numbered parameter sharing its
+  buffer*. A recorded tensor derived from a parameter stores its origin relative
+  to that parameter, so a uniform shift of the partition is absorbed when the
+  tensor is rebound; a shift of one member against another is not, because the
+  overlap geometry recording inferred from those origins is baked into the
+  Definition. A sliding-window caller that hands the same cache a different
+  slice each invocation therefore keeps reusing its Definition.
+- The buffers a boundary names must be pairwise identical or disjoint. Two
+  parameters either share a buffer exactly — same address and same size, as two
+  views of one tensor do — or share nothing. This one is a **precondition, not a
+  checked property**: hazard tracking groups by buffer address, so two buffers
+  that partially overlap at different addresses would be called unrelated memory
+  and the edges between them would be lost. A runtime-allocated buffer satisfies
+  it for free, since one allocator hands out disjoint blocks; boundary storage is
+  caller-owned, though, and a caller-provided device address
+  (`ChipTensor.make(..., child_memory=True)`) is outside that guarantee, so for
+  those the caller supplies the precondition. Proving it per invocation would
+  cost an ordering of the addresses, which is the whole cost of a sort.
+- Two things about a boundary's buffers *are* checked, because each is
+  answerable from one address alone. None of them may be empty. And two
+  parameters at one address must name one size — a parameter's recording-space
+  window is reserved once per address and sized from the first parameter to
+  claim it, so its group has to agree on how wide that is. Either refusal sends
+  the invocation down the ordinary path.
+- Everything else about the body's shape is the author's declaration, not a
+  checked property. A Graph key asserts that two invocations record the same
+  topology: the same task count, the same kernel selection, the same edge set,
+  and the same overlap geometry within an alias partition. The runtime validates
+  none of it.
 - Internal task scalars with no boundary source are fixed Definition data.
 - Boundary storage is caller-owned. `INPUT`, `INOUT`, `OUTPUT_EXISTING`, and
   `NO_DEP` are supported. A boundary `TensorCreateInfo` tagged `OUTPUT` is not.
 - Early-resolve hints apply while recording the first invocation. Replayed
   in-graph tasks use the saved completion topology without the hint.
-- A recorded task may depend on a Graph-external producer when that producer
-  is the creator of a boundary ChipTensor. The outer Graph owns that dependency on
-  replay; arbitrary cross-boundary explicit dependencies remain unsupported.
+- Every tensor a recorded task uses must come from the Graph's own boundary — a
+  parameter, or a view derived from one — or from another in-graph task's output.
+  A tensor that entered the body any other way, such as a global or one produced
+  before the Graph, is refused by name: recording is abandoned and the bind fails
+  rather than baking a Definition that would rebind that tensor to someone else's
+  buffer. Pass it as a boundary parameter instead.
+- A recorded task may not depend on a task submitted before the Graph. The only
+  way to order a body behind one is to pass that task's output as a boundary
+  parameter, which the outer Graph task then depends on like any other argument.
+  An explicit dependency naming a task outside the Graph is refused by name.
 - A recorded task may carry a dispatch predicate. Submit resolves a predicate
   into an absolute GM address, which no Definition can hold, so the Definition
-  stores the operand tensor's classified source plus the element index within
-  it and materialize resolves the pair per execution. The operand may be a
-  boundary ChipTensor or another in-graph task's output; the predicate itself creates no
-  dependency, exactly as on the ordinary path, so the caller still declares one
-  on the operand's producer.
+  stores the operand tensor plus the element index within it, and materialize
+  rebinds the tensor and resolves the pair per execution. The operand may be a
+  boundary ChipTensor or another in-graph task's output, but not the consuming
+  task's own output; the predicate itself creates no dependency, exactly as on
+  the ordinary path, so the caller still declares one on the operand's producer.
 
 Structural or alias mismatch logs a warning and executes the Graph function
 normally for that invocation. It never reuses heap offsets recorded for a
@@ -272,23 +311,58 @@ serialized size. Published and in-flight entries count against the same limit,
 since an in-flight one has already claimed its identity. No fixed maximum-size
 recording array is copied on a cache hit.
 
-Recorded output addresses start at `GRAPH_RECORD_VIRTUAL_BASE = 1ULL << 63`.
-They exist only to classify `OWN_OUTPUT` and `INTERNAL` Tensor sources and are
-converted to offsets in the Definition; they are never dereferenced or placed
-on the wire. Classification is by address-range containment alone, so it is only
-sound while no real heap address can fall in that range:
-`TaskAllocator::init()` asserts the whole configured heap lies below
-`GRAPH_RECORD_VIRTUAL_BASE`, which makes an overlapping device GM heap a loud
-failure at setup instead of a silently misclassified Tensor source. Recording
-therefore leaves the shared task allocator unchanged.
+A recording addresses its body in a space of its own, starting at
+`GRAPH_RECORD_BASE = PACKED_OUTPUT_ALIGN`. The boundary's formal parameters come
+first, one address per buffer — parameters sharing a buffer share an address —
+each claiming as much room as the argument it stands for. An in-graph task's
+packed outputs are bumped from the end of that region. Both are positions in the
+recording's own space, not addresses of anything.
+
+Moving the parameters into that space is what makes a recording closed. The body
+derives every tensor it uses from a parameter or from another in-graph task's
+output, so no address the caller owns reaches the Definition — the caller's real
+addresses travel with the outer shell's own arguments instead. The base is
+non-zero so that no recorded object sits at address 0, which a task slot uses as
+its "has no packed output" sentinel, and it is `PACKED_OUTPUT_ALIGN` specifically
+because that is the finest granularity any recorded address takes.
+
+Parameters sharing a buffer must land on one address, and parameters over
+different buffers on different ones, because hazard tracking groups by buffer
+address: splitting one buffer across two addresses drops the WAR/WAW edges
+between its views, and merging two buffers onto one invents edges the body never
+had. `graph_alias_partition` settles that grouping in one hashing pass over the
+addresses — argument order is the scan order, so each parameter's representative
+is simply the first parameter that reached its address. What the pass does *not*
+do is prove the distinct addresses name non-overlapping memory; that is a
+precondition the allocator supplies (see "Supported dynamic and static data").
+
+**Classification is by provenance, not by address range.** Each boundary tensor
+is stamped with `TaskId::Space::PARAM` and its parameter index, each recorded
+output with `Space::IN_GRAPH`, and views propagate the stamp — so a tensor's
+`owner_task_id` says which of the two cases it is. A tensor owned by neither,
+meaning one that entered the body without passing through the boundary, is
+refused by name and the Graph is abandoned rather than recorded. Ranges could not
+answer this: a recording's space starts just above zero and a real device address
+is 48-bit, so the two overlap, and an address test would attribute a foreign
+tensor to whichever parameter it happened to land on.
+
+**A recorded tensor is its own relocation record.** Nothing travels beside it
+saying where its storage comes from: its owner already says that, and only its
+buffer address has to move. A parameter's is dropped — replay takes the buffer
+from this invocation's argument — and a body tensor's is stored relative to the
+recording's output region, which is an exact affine image of the heap a replay
+commits, so replay adds that heap's base and nothing else. Everything else in the
+tensor is carried absolutely, because the boundary contract pins the fields a
+replay would otherwise have to supply.
 
 ### First-miss host threading
 
 `graph_begin` computes the Graph identity before the body is recorded. On a
 cache miss, the calling thread allocates a zero-heap outer task shell, records
-its boundary dependency edges, and returns. A recording thread receives a deep
-copy of the boundary arguments, records the in-graph tasks in the private virtual
-address range, and builds and hashes the Definition. The first call waits only
+its boundary dependency edges, captures the boundary into the in-flight entry,
+and returns. A recording thread reads that entry's parameter list, records the
+in-graph tasks in the recording's own address space, and builds and hashes the
+Definition. The first call waits only
 until that private job has been installed in the recorder queue; it does not wait
 for the operating system to schedule the thread or for `graph_prepare` to bind
 the private recording state. The keyed in-flight entry and zero-heap outer shell
@@ -300,7 +374,8 @@ workers are created when the callable's orchestration SO is loaded, before any
 unmapped.
 
 **Distinct identities record concurrently.** The recorder owns a fixed 16-slot
-job queue and 16 reusable boundary snapshots. The eight prewarmed workers cover
+job queue; each boundary lives on its own in-flight entry. The eight prewarmed
+workers cover
 a workload that cuts a forward pass into up to eight Definitions without creating
 threads or allocating boundary storage between shell submissions. A ninth or later
 concurrent miss grows one worker per additional job, up to the 16-Definition
@@ -309,8 +384,10 @@ Growth happens inside the submission that needs it, so it lands on the submittin
 thread: a workload whose Definition count exceeds the prewarmed count pays a
 `pthread_create` (measured 32-74 us each) in the middle of its submission burst.
 Recording touches no shared allocator state and each recording classifies Tensor
-sources only against its own in-graph tasks and its own boundary, so two recordings
-sharing the `GRAPH_RECORD_VIRTUAL_BASE` range cannot see each other's addresses.
+sources only against its own in-graph tasks and its own boundary, so two
+recordings cannot see each other's addresses even though both address their
+bodies from `GRAPH_RECORD_BASE`: a tensor's provenance names a parameter or a
+task of the recording that stamped it, and nothing resolves it anywhere else.
 What serializes is only the per-identity rule: at most one recording per Graph
 key, which the keyed in-flight map enforces.
 
@@ -324,7 +401,7 @@ The queue handoff hands `graph_prepare` the in-flight entry's own address,
 carried through `GraphScopeResult::recording_handle`. Prepare therefore neither
 searches for its recording nor reacquires the Definition-state mutex: until its
 thread ends or aborts, later same-identity submissions only read the immutable
-boundary signature under that mutex. Avoiding the redundant acquire prevents the
+captured boundary under that mutex. Avoiding the redundant acquire prevents the
 short main-thread submit loop from starving a recording thread before it can
 enter its private state, and the handle makes recording into another identity's
 state unrepresentable rather than merely unlikely.
@@ -349,8 +426,8 @@ nothing during a run.
 `rt_graph_commit` is therefore a barrier at exactly one point, orchestration
 completion. It waits for **every** recording in flight, then walks deferred
 shells in original submission order, reserves each shell's real heap block using
-its Definition's `required_heap`, patches the task descriptor and Definition
-content hash, and lets the image be uploaded. A scope transition is deliberately
+its Definition's `required_heap`, patches the task descriptor and the shell's
+Definition address, and lets the image be uploaded. A scope transition is deliberately
 not a barrier either: the main thread has already submitted the outer Graph shell
 into that scope, while scopes executed by a recording thread are no-ops on the
 real scope stack.
@@ -390,25 +467,33 @@ Definition. It contains:
   body — so a root's verdict is not recorded here but decided at
   materialization;
 - one packed-heap offset per in-graph task;
-- each in-graph task's ChipTensor source:
-  `BOUNDARY_EXACT`, `BOUNDARY_VIEW`, `INTERNAL`, or `OWN_OUTPUT`;
-- fixed scalar values plus boundary-scalar source indices;
-- fixed boundary signatures and alias representatives.
+- each in-graph task's ChipTensors, stored relative to whatever replay rebases
+  them against and carrying the owner that says which that is;
+- fixed scalar values plus boundary-scalar source indices.
 
-The header also carries a content hash of the complete Definition image. The
-device execution pool requires this hash, the Graph key, and the in-graph task count to
-all match before reusing a resident Definition. A new run may record different
-metadata under the same function identity, so key-only reuse is not safe.
+The recorded boundary itself — the parameters, their directions, and the alias
+partition they form — is **not** in the image. It is held beside it, on the host,
+because only the host reads it: it is what a later invocation is matched against,
+while materialize takes the boundary from the outer task's own payload.
 
-All references are 32-bit offsets from the Definition base. Cross-boundary
-Tensors use the fixed-width `GraphTensor` wire POD rather than the
-64-byte-aligned C++ `ChipTensor` object. The upload is therefore one contiguous
-copy with no raw Host pointers and no relocation pass.
+The header carries the object magic, the Graph key, and the image size. The
+framing check requires the magic, a size that admits a `GraphDefinition`, a
+`total_bytes` equal to the header's own, and a key equal to the header's before
+any section offset is read out of the image.
 
-Before materialization, the Scheduler recomputes the Definition content hash
-and validates section ranges, topology indices, in-graph task heap offsets, the outer
-heap extent, ChipTensor metadata, and ChipTensor-source bounds. Invalid wire data is
-rejected before an offset participates in pointer arithmetic.
+All references are 32-bit offsets from the Definition base. A tensor is stored as
+`TensorData`, the 96-byte base the 64-byte-aligned runtime `Tensor` derives from:
+the image is built in a byte vector, which has nowhere to put an over-aligned
+element. The upload is therefore one contiguous copy with no raw Host pointers
+and no relocation pass.
+
+Before materialization, the Scheduler re-checks the object framing and validates
+section ranges, topology indices, in-graph task heap offsets, and the
+outer heap extent. A tensor's own geometry is not re-checked there: the host
+resolved each one against the parameter or the producing block it came from and
+refused the body otherwise, so what materialize validates is only the parameter
+index that reaches an array of the execution. Invalid wire data is rejected
+before an offset participates in pointer arithmetic.
 
 There is no cache schema version. The cache is per run and starts empty, so a
 persistent-format version would currently have no effect.
@@ -426,11 +511,12 @@ For a cache hit, the Host Orchestrator:
 5. emits one outer `GRAPH` task;
 6. stores boundary values in the outer task's ordinary compact argument pools.
 
-The outer Graph's tensor region is counted in `ChipTensor` pool slots but holds
-densely packed `GraphTensor` wire values. Graph scheduling never dispatches the
-outer payload as a kernel payload; device localization reads the compact values
-directly, so boundary metadata does not need to expand to full `ChipTensor`
-records on either side of H2D.
+The outer Graph's tensor region holds ordinary `Tensor` values, one pool slot per
+boundary parameter — the same element type and stride every other task's argument
+pool uses. That uniformity is what lets the shared-memory restack walk every
+task's tensors in one pass rather than switching element stride on the `GRAPH`
+kind. Graph scheduling never dispatches the outer payload as a kernel payload;
+device materialization reads the boundary from it directly.
 
 In-graph tasks consume no task-table slots. Their descriptor, payload, slot
 state, argument pools, and completion states live in the tail of the outer `GRAPH` task's
@@ -495,8 +581,8 @@ dependency wiring remains an Orchestrator responsibility:
 
 - recording constructs both fanin and fanout CSR in the immutable Definition;
 - materialization builds each in-graph task's runnable state from the Definition,
-  resolving its Tensor addresses against the boundary image and its producers'
-  packed windows;
+  moving each Tensor's buffer onto this invocation's argument or onto the graph
+  heap this execution was given;
 - materialization registers each non-root on one producer selected from its
   saved fanin CSR, scanning the row from its tail so the bet lands on the
   producer likeliest to complete last. A row holds the consumer's deduplicated
@@ -568,10 +654,12 @@ error instead of leaving an already-submitted outer Graph unable to complete.
 Conditions detected before an outer shell is accepted use the ordinary path:
 
 - an empty Graph boundary;
-- variable ChipTensor shape or metadata;
-- changed boundary aliasing;
+- variable ChipTensor shape, stride, dtype, size, direction, or contiguity;
+- a boundary whose alias partition changed, or whose members moved relative to
+  each other within a partition;
+- a boundary naming an empty buffer, or naming one address at two buffer sizes;
 - runtime-allocated boundary outputs;
-- more than 32 boundary Tensors;
+- more than `GRAPH_MAX_TENSOR_ARGS` (128) boundary Tensors;
 - more than 16 Definitions;
 - insufficient task-window or known cache-hit heap capacity.
 
@@ -581,10 +669,9 @@ sequence, they assert in debug builds and fail the orchestration in release
 builds:
 
 - nested Graph recording;
-- cross-boundary explicit dependencies that are not represented by a boundary
-  ChipTensor's creator;
-- an unclassifiable internal ChipTensor source, including a dispatch
-  predicate's operand tensor;
+- an explicit dependency naming a task outside the Graph;
+- a ChipTensor that reached the body without coming through the boundary,
+  including a dispatch predicate's operand tensor;
 - a dispatch predicate whose operand is the predicated in-graph task's own output;
 - a dispatch predicate whose index vector leaves the operand tensor's extent;
 - runtime allocation inside the Graph body;

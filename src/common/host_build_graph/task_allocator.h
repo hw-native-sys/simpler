@@ -23,7 +23,6 @@
 #include <atomic>
 #include <inttypes.h>
 
-#include "assert_compat.h"
 #include "host_build_graph/runtime_status.h"
 #include "host_build_graph/runtime_types.h"
 #include "common/unified_log.h"
@@ -76,14 +75,6 @@ public:
         error_code_ptr_ = error_code_ptr;
         local_task_id_ = 0;
         heap_top_ = 0;
-        // Every address this allocator hands out lies in
-        // [heap_base_, heap_base_ + heap_size_), so checking the range once here
-        // keeps it disjoint from GRAPH_RECORD_VIRTUAL_BASE for every allocation.
-        const uint64_t heap_base_addr = reinterpret_cast<uint64_t>(heap_base);
-        always_assert(
-            heap_base_addr < GRAPH_RECORD_VIRTUAL_BASE && heap_size <= GRAPH_RECORD_VIRTUAL_BASE - heap_base_addr &&
-            "Graph heap overlaps the Graph-recording virtual address range"
-        );
     }
 
     /**
@@ -202,7 +193,7 @@ private:
      *
      * The task capacity is a configured size, so its branch is the one a real bind
      * reaches. The heap is not configured: a bind hands
-     * this allocator the whole HEAP_VIRTUAL_CAPACITY span and commits the device
+     * this allocator the whole MAX_HEAP_CAPACITY span and commits the device
      * region afterwards, so a graph that does not fit the device fails at that
      * commit and not here. The heap branch stays because the allocator is also
      * constructed directly, against a small heap, by the unit tests that cover

@@ -100,40 +100,43 @@
 #define CHIP_TENSORMAP_POOL_SIZE (65536)  // TensorMap entry pool
 #define CHIP_TENSORMAP_NUM_BUCKETS 4096   // Power of 2 for fast hash (4096×8B=32KB fits L1)
 
-// Three address classes coexist during orchestration, in windows the two constants
-// below keep disjoint: real device addresses stay below HEAP_VIRTUAL_BASE, since
-// Ascend VA is 48-bit and the asserts named further down hold caller-owned ones
-// there; the graph heap spans HEAP_VIRTUAL_BASE up to GRAPH_RECORD_VIRTUAL_BASE;
-// Graph recording takes everything above.
+// Two address classes coexist during orchestration: real device addresses, which
+// stay below HEAP_VIRTUAL_BASE since Ascend VA is 48-bit and the asserts in the
+// host's bind path hold caller-owned ones there, and the graph heap, which spans
+// MAX_HEAP_CAPACITY bytes from HEAP_VIRTUAL_BASE.
+//
+// "Graph heap" here is the output heap of THIS orchestration's task DAG. It
+// exists on every bind, whether or not the bind holds a Graph task, and it is
+// addressed virtually only because the device region is committed after
+// orchestration, from the byte count orchestration turned out to need. It is a
+// different mechanism from the recording address space a Graph (the
+// rt_submit_graph feature) builds its body in, which is a per-recording space
+// starting at GRAPH_RECORD_BASE and never leaves the host.
 //
 // Base of the window the graph heap is allocated out of during orchestration.
-// The heap's device region is committed only once orchestration has run and its
-// exact size is known, so the addresses handed out while the graph is being
-// built cannot be the device ones; compact_live_image rewrites them to the real
-// base before the image travels. Nothing dereferences an address in this window.
+// compact_live_image rewrites an address in this window to the real device base
+// before the image travels. Nothing dereferences one.
 inline constexpr uint64_t HEAP_VIRTUAL_BASE = 1ULL << 62;
 
-// Base of the address range Graph recording hands to an in-graph task's packed
-// outputs. Recorded addresses are never dereferenced: they exist so
-// graph_classify_tensor can tell an internal producer's output from a boundary
-// tensor by address-range containment alone, and the Definition stores them as
-// offsets. That classification is only sound while the range is disjoint from
-// every graph-heap address, which TaskAllocator::init() asserts, and from
-// every real device address, which the two asserts in the host's bind path
-// (the acquired heap base, and each caller tensor as it enters device_args)
-// keep below HEAP_VIRTUAL_BASE.
-inline constexpr uint64_t GRAPH_RECORD_VIRTUAL_BASE = 1ULL << 63;
+// Upper bound on a graph heap, simulated or real. A recording's address space
+// mirrors the heap a replay will need, so the same bound governs both: a graph
+// too large to commit fails at the recording cursor instead of wrapping. Stays
+// well below HEAP_VIRTUAL_BASE so the graph-heap window it also sizes cannot
+// reach the recording space.
+inline constexpr uint64_t MAX_HEAP_CAPACITY = 1ULL << 60;
 
-// Whether an address was handed out by Graph recording rather than naming a
-// graph-heap block or a real device buffer. Exact because the three windows above
-// are disjoint: a recorded in-graph task's output is the only thing at or above
-// the base.
-inline constexpr bool is_graph_record_address(uint64_t addr) { return addr >= GRAPH_RECORD_VIRTUAL_BASE; }
-
-// Span of the graph-heap window: everything between the two virtual bases. This
-// is the bound orchestration allocates against, so a graph is limited by what
-// the device can commit afterwards rather than by a configured heap size.
-inline constexpr uint64_t HEAP_VIRTUAL_CAPACITY = GRAPH_RECORD_VIRTUAL_BASE - HEAP_VIRTUAL_BASE;
+// Base of a recording's own address space. A recording hands out positions in
+// this space rather than any address the caller owns: the formal parameters take
+// one each, and an in-graph task's packed outputs follow them. It is non-zero so
+// that no recorded object sits at address 0, which a task slot uses as its "has
+// no packed output" sentinel, and PACKED_OUTPUT_ALIGN specifically because that
+// is the finest granularity any recorded address takes, so a recorded address
+// keeps the alignment the real one had.
+//
+// Nothing in this space reaches a Definition: a parameter's recorded address is
+// dropped when the image is packed, and a body tensor's is stored relative to the
+// output region, so an image is readable knowing only the heap it binds to.
+inline constexpr uint64_t GRAPH_RECORD_BASE = PACKED_OUTPUT_ALIGN;
 
 // Scope management
 #define CHIP_MAX_SCOPE_DEPTH 64  // Maximum nesting depth

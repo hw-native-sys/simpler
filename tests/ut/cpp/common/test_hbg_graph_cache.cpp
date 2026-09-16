@@ -41,16 +41,26 @@ uint32_t append_section(std::vector<std::byte> &image, const std::vector<T> &val
     return static_cast<uint32_t>(offset);
 }
 
-GraphTensor make_test_tensor(uint64_t address) {
-    GraphTensor tensor{};
-    tensor.buffer_addr = address;
-    tensor.buffer_size = 64;
-    tensor.extent_elem = 1;
+simpler::hbg::TensorData make_test_tensor(uint64_t address, TaskId owner) {
+    simpler::hbg::TensorData tensor{};
+    tensor.buffer.addr = address;
+    tensor.buffer.size = 64;
+    tensor.owner_task_id = owner;
+    tensor.extent_elem_cache = 1;
     tensor.shapes[0] = 1;
     tensor.strides[0] = 1;
     tensor.ndims = 1;
-    tensor.dtype = static_cast<uint8_t>(DataType::FLOAT32);
-    tensor.is_contiguous = 1;
+    tensor.dtype = DataType::FLOAT32;
+    tensor.is_contiguous = true;
+    return tensor;
+}
+
+// The same tensor in the form a boundary holds it. A boundary is this invocation's actual
+// arguments rather than anything the image carries, so it is a simpler::hbg::Tensor, and
+// it carries the caller's own provenance.
+simpler::hbg::Tensor make_test_boundary(uint64_t address) {
+    simpler::hbg::Tensor tensor{};
+    tensor.init_from(make_test_tensor(address, TaskId::invalid()));
     return tensor;
 }
 
@@ -102,8 +112,9 @@ std::vector<std::byte> make_test_definition(
         tasks[0].task_attrs = root_attrs.raw();
         tasks[0].predicate_slot = 1;
         GraphPredicate predicate{};
-        predicate.operand = make_test_tensor(boundary_address);
-        predicate.operand_source.source_kind = static_cast<uint8_t>(GraphTensorSourceKind::BOUNDARY_EXACT);
+        // The operand came through the boundary, which its owner is what says: replay
+        // takes the buffer from parameter 0, so the recorded address is dropped.
+        predicate.operand = make_test_tensor(0, TaskId::make_param(0));
         predicate.elem_size = static_cast<uint8_t>(get_element_size(DataType::FLOAT32));
         predicate.op = static_cast<uint8_t>(PredicateOp::EQ);
         predicates.push_back(predicate);
@@ -126,8 +137,7 @@ std::vector<std::byte> make_test_definition(
         tasks[1].task_attrs = attrs.raw();
         tasks[1].predicate_slot = static_cast<uint16_t>(predicates.size() + 1);
         GraphPredicate predicate{};
-        predicate.operand = make_test_tensor(boundary_address);
-        predicate.operand_source.source_kind = static_cast<uint8_t>(GraphTensorSourceKind::BOUNDARY_EXACT);
+        predicate.operand = make_test_tensor(0, TaskId::make_param(0));
         predicate.elem_size = static_cast<uint8_t>(get_element_size(DataType::FLOAT32));
         predicate.op = static_cast<uint8_t>(PredicateOp::EQ);
         predicates.push_back(predicate);
@@ -139,12 +149,14 @@ std::vector<std::byte> make_test_definition(
         tasks[1].total_required_subtasks = 0;
         std::fill(std::begin(tasks[1].kernel_id), std::end(tasks[1].kernel_id), INVALID_KERNEL_ID);
     }
-    std::vector<GraphTensor> tensors{make_test_tensor(boundary_address), make_test_tensor(boundary_address)};
-    tensors[1].buffer_size = 32;
-    std::vector<GraphTensorSourceRef> tensor_sources(2);
-    tensor_sources[0].source_kind = static_cast<uint8_t>(GraphTensorSourceKind::BOUNDARY_EXACT);
-    tensor_sources[1].source_kind = static_cast<uint8_t>(GraphTensorSourceKind::INTERNAL);
-    tensor_sources[1].packed_offset = 16;
+    // Tensor 0 came through the boundary: its owner names parameter 0, and its recorded
+    // address is dropped because replay takes the buffer from this invocation's argument.
+    // Tensor 1 is task 0's output, so its address is an offset into the graph heap.
+    std::vector<simpler::hbg::TensorData> tensors{
+        make_test_tensor(0, TaskId::make_param(0)),
+        make_test_tensor(16, TaskId::make_in_graph(0, 0)),
+    };
+    tensors[1].buffer.size = 32;
     std::vector<uint64_t> scalars{0, 18};
     std::vector<GraphScalarInheritance> scalar_inheritance{
         GraphScalarInheritance::from_boundary(boundary_scalar_count - 1),
@@ -157,7 +169,7 @@ std::vector<std::byte> make_test_definition(
     definition.task_count = 2;
     definition.edge_count = 1;
     definition.root_count = 1;
-    definition.boundary_count = 1;
+    definition.boundary_tensor_count = 1;
     definition.boundary_scalar_count = boundary_scalar_count;
     definition.tensor_arg_count = 2;
     definition.scalar_arg_count = 2;
@@ -169,7 +181,6 @@ std::vector<std::byte> make_test_definition(
     definition.off_in_graph_task_offsets = append_section(image, in_graph_task_offsets);
     definition.off_in_graph_tasks = append_section(image, tasks);
     definition.off_tensors = append_section(image, tensors);
-    definition.off_tensor_sources = append_section(image, tensor_sources);
     definition.off_scalars = append_section(image, scalars);
     definition.off_scalar_inheritance = append_section(image, scalar_inheritance);
     if (!predicates.empty()) {
@@ -244,16 +255,15 @@ private:
 // graph_submit_definition sizes them. Device localization constructs the
 // execution in the heap tail and reads invocation boundaries from the payload.
 //
-// The boundary regions are sized by the same helpers graph_submit_outer reserves
-// with — the simpler::hbg::Tensor slot span that holds GRAPH_MAX_TENSOR_ARGS packed
-// GraphTensors, and the ARG_POOL_ALIGN-rounded scalar span — rather than by the
-// GraphTaskArgs element caps, so the fixture reserves what production reserves for
-// the widest legal boundary. They are members, not separate allocations: a payload
-// names its regions through an int32 SelfRelativePtr delta, which silently binds as
-// unbound past ±2 GiB.
+// The boundary regions are sized by what graph_submit_outer reserves — one
+// simpler::hbg::Tensor slot per boundary tensor, and the ARG_POOL_ALIGN-rounded scalar
+// span — rather than by the GraphTaskArgs element caps, so the fixture reserves what
+// production reserves for the widest legal boundary. They are members, not separate
+// allocations: a payload names its regions through an int32 SelfRelativePtr delta, which
+// silently binds as unbound past ±2 GiB.
 class OuterHeap {
 public:
-    static constexpr size_t TENSOR_SLOTS = graph_boundary_tensor_pool_slots(GRAPH_MAX_TENSOR_ARGS);
+    static constexpr size_t TENSOR_SLOTS = GRAPH_MAX_TENSOR_ARGS;
     static constexpr size_t SCALAR_SPAN =
         CHIP_ALIGN_UP(static_cast<size_t>(GRAPH_MAX_SCALAR_ARGS), ARG_POOL_ALIGN / sizeof(uint64_t));
 
@@ -271,28 +281,27 @@ public:
     uint8_t *end() const { return storage_->bytes() + storage_->size(); }
     void *execution() const { return base() + heap_bytes_; }
 
-    // The tensor region past the packed boundary. Production reserves only the packed
-    // span rounded up to a whole slot, so a write anywhere beyond the packed bytes
-    // lands in another task's arguments on a real ring.
+    // The tensor region past the boundary. Production reserves one slot per boundary
+    // tensor, so a write anywhere beyond them lands in another task's arguments on a real
+    // ring.
     const std::byte *boundary_tail(uint32_t boundary_count) const {
-        return reinterpret_cast<const std::byte *>(boundary_tensors_.data()) + boundary_count * sizeof(GraphTensor);
+        return reinterpret_cast<const std::byte *>(boundary_tensors_.data() + boundary_count);
     }
     size_t boundary_tail_bytes(uint32_t boundary_count) const {
-        return TENSOR_SLOTS * sizeof(simpler::hbg::Tensor) - boundary_count * sizeof(GraphTensor);
+        return (TENSOR_SLOTS - boundary_count) * sizeof(simpler::hbg::Tensor);
     }
 
     GraphExecution *initialize_execution(
         const TestDefinitionObject &definition_object, uint64_t boundary_address, uint64_t boundary_scalar
     ) {
         const GraphDefinition *definition = definition_object.definition();
-        if (graph_boundary_tensor_pool_slots(definition->boundary_count) > TENSOR_SLOTS ||
+        if (static_cast<size_t>(definition->boundary_tensor_count) > TENSOR_SLOTS ||
             definition->boundary_scalar_count > SCALAR_SPAN) {
             return nullptr;
         }
         std::memset(boundary_tensors_.data(), 0, TENSOR_SLOTS * sizeof(simpler::hbg::Tensor));
-        const GraphTensor boundary = make_test_tensor(boundary_address);
-        new (boundary_tensors_.data()) GraphTensor{boundary};
-        storage_entry_.payload.tensor_count = definition->boundary_count;
+        boundary_tensors_[0] = make_test_boundary(boundary_address);
+        storage_entry_.payload.tensor_count = definition->boundary_tensor_count;
         storage_entry_.payload.scalar_count = definition->boundary_scalar_count;
         std::fill_n(boundary_scalars_.data(), definition->boundary_scalar_count, uint64_t{0});
         if (definition->boundary_scalar_count != 0) {
@@ -323,9 +332,7 @@ TEST(GraphCache, RejectsEmptyBoundary) {
 
 TEST(GraphCache, AcceptsBoundaryScalars) {
     std::array<uint8_t, 64> boundary{};
-    const GraphTensor packed = make_test_tensor(reinterpret_cast<uint64_t>(boundary.data()));
-    simpler::hbg::Tensor tensor{};
-    graph_tensor_unpack(packed, &tensor);
+    const simpler::hbg::Tensor tensor = make_test_boundary(reinterpret_cast<uint64_t>(boundary.data()));
 
     GraphTaskArgs args;
     args.add_input(tensor);
@@ -534,36 +541,17 @@ TEST(GraphExecutionStorage, ComputesAlignedExactSize) {
     EXPECT_EQ(layout.total_bytes, layout.states_offset + TASK_COUNT * sizeof(std::atomic<ChipTaskState>));
 }
 
-// The outer Graph payload's tensor region is counted in simpler::hbg::Tensor pool slots but
-// holds densely packed GraphTensor values, so the slot count must cover the packed
-// bytes and be the smallest count that does — anything larger silently overdraws the
-// shared pool, anything smaller lets localize read past the region.
-TEST(GraphBoundaryPool, TensorSlotsCoverPackedBytesMinimally) {
-    EXPECT_EQ(graph_boundary_tensor_pool_slots(0), 0U);
-    for (uint32_t count = 1; count <= GRAPH_MAX_TENSOR_ARGS; ++count) {
-        const size_t slots = graph_boundary_tensor_pool_slots(count);
-        const size_t packed = static_cast<size_t>(count) * sizeof(GraphTensor);
-        EXPECT_GE(slots * sizeof(simpler::hbg::Tensor), packed) << "count " << count;
-        EXPECT_LT((slots - 1) * sizeof(simpler::hbg::Tensor), packed) << "count " << count;
-    }
-}
-
 // A Graph boundary is GraphTaskArgs-wide while the pools budget MAX_TENSOR_ARGS /
 // MAX_SCALAR_ARGS per window slot, so the widest legal boundary draws several slots'
 // worth. graph_submit_outer's preflight exists because of that gap; pin the gap itself
-// so a cap or type-size change cannot quietly close or widen it unnoticed.
+// so a cap change cannot quietly close or widen it unnoticed.
 TEST(GraphBoundaryPool, WidestBoundaryExceedsOneSlotBudget) {
-    EXPECT_GT(graph_boundary_tensor_pool_slots(GRAPH_MAX_TENSOR_ARGS), static_cast<size_t>(MAX_TENSOR_ARGS));
+    EXPECT_GT(static_cast<size_t>(GRAPH_MAX_TENSOR_ARGS), static_cast<size_t>(MAX_TENSOR_ARGS));
     EXPECT_GT(
         static_cast<size_t>(
             CHIP_ALIGN_UP(static_cast<int32_t>(GRAPH_MAX_SCALAR_ARGS), ARG_POOL_ALIGN / (int32_t)sizeof(uint64_t))
         ),
         static_cast<size_t>(MAX_SCALAR_ARGS)
-    );
-    // The widest boundary that still fits one slot's tensor budget.
-    EXPECT_LE(
-        graph_boundary_tensor_pool_slots(MAX_TENSOR_ARGS * sizeof(simpler::hbg::Tensor) / sizeof(GraphTensor)),
-        static_cast<size_t>(MAX_TENSOR_ARGS)
     );
 }
 

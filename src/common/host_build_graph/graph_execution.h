@@ -39,66 +39,12 @@ static_assert(
 );
 inline constexpr int32_t GRAPH_MATERIALIZE_SLICE_TASKS = 4;
 
-enum class GraphTensorSourceKind : uint8_t {
-    BOUNDARY_EXACT = 0,
-    BOUNDARY_VIEW = 1,
-    INTERNAL = 2,
-    OWN_OUTPUT = 3,
-};
-
-// Wire representation of simpler::hbg::Tensor. simpler::hbg::Tensor itself is a host/runtime C++ type with
-// 64-byte alignment and helper methods; placing it inside vector<std::byte>
-// would not guarantee that alignment. Keep the boundary image C-compatible and
-// copy only semantic fields into this naturally 8-byte-aligned POD.
-struct GraphTensor {
-    uint64_t buffer_addr;
-    uint64_t buffer_size;
-    uint64_t owner_task_id;
-    uint64_t start_offset;
-    uint64_t extent_elem;
-    int32_t version;
-    uint32_t shapes[MAX_TENSOR_DIMS];
-    uint32_t strides[MAX_TENSOR_DIMS];
-    uint8_t ndims;
-    uint8_t dtype;
-    uint8_t manual_dep;
-    uint8_t is_contiguous;
-    uint8_t address_space;
-    uint8_t reserved[3];
-};
-
-// Definition records are copied across the host-device boundary. Keep them
-// pointer-free, fixed-width and position-independent: every reference is an
-// offset from its owning header.
+// Every type a Definition section holds is copied across the host-device boundary, so all
+// of them are pointer-free, fixed-width and position-independent: a reference is an offset
+// from its owning header, never an address.
 //
-// How one recorded tensor argument is rebuilt for an execution: which object of
-// that execution supplies its storage, and where inside that object it starts.
-// `source_kind` decides what the other two fields mean, because each kind adds its
-// offset to a different field of the rebound tensor (graph_rebind_tensor):
-//
-//   source_kind     source_index indexes       packed_offset adds to     unit
-//   BOUNDARY_EXACT  the boundary tensors       nothing (must be zero)    --
-//   BOUNDARY_VIEW   the boundary tensors       rebound.start_offset      elements
-//   INTERNAL        the in-graph tasks         rebound.buffer_addr       bytes
-//   OWN_OUTPUT      the consuming task itself  rebound.buffer_addr       bytes
-//
-// The unit follows the field the offset lands in rather than being a choice. A
-// BOUNDARY kind keeps the boundary tensor's whole buffer, since that buffer is what
-// graph_tensor_wire_valid bounds the view against, so its offset has nowhere to go
-// but start_offset — which simpler::hbg::Tensor counts in elements. An INTERNAL
-// tensor instead owns the slice it names, so its offset moves the buffer itself.
-// An element offset is meaningful only while the consumer and the boundary tensor
-// share a dtype.
-//
-// OWN_OUTPUT carries a source_index equal to the consuming task's own index, which
-// replay checks rather than reads.
-struct GraphTensorSourceRef {
-    uint8_t source_kind;
-    uint8_t reserved;
-    uint16_t source_index;
-    uint32_t reserved2;
-    uint64_t packed_offset;
-};
+// A tensor travels as simpler::hbg::TensorData, the 96-byte base simpler::hbg::Tensor
+// derives from -- see its declaration for why the image cannot hold the aligned form.
 
 // Where one in-graph task scalar slot takes its value from: the Definition's own
 // scalars[] entry, or the boundary parameter named by boundary_index(). It is the wire
@@ -143,8 +89,9 @@ private:
 // materialize rebinds the tensor for the execution and resolves the pair into
 // the address the scheduler reads at the dispatch point.
 struct GraphPredicate {
-    GraphTensor operand;
-    GraphTensorSourceRef operand_source;
+    // A relocation record on the same terms as the off_tensors section: replay rebinds it
+    // before resolving the address below.
+    simpler::hbg::TensorData operand;
     // Element index into the rebound operand tensor, added to its start_offset.
     // Fixed at record time: a Graph with a variable simpler::hbg::Tensor shape is rejected
     // before recording, so the operand's strides cannot change across replays.
@@ -182,19 +129,6 @@ struct InGraphTaskDefinition {
     int32_t tensor_offset;
     int32_t scalar_offset;
     ArgsDumpTaskMetadata dump_metadata;
-};
-
-struct GraphBoundarySignature {
-    uint64_t buffer_size;
-    uint32_t shapes[MAX_TENSOR_DIMS];
-    uint32_t strides[MAX_TENSOR_DIMS];
-    uint16_t alias_rep;
-    uint8_t ndims;
-    uint8_t dtype;
-    uint8_t tag;
-    uint8_t manual_dep;
-    uint8_t is_contiguous;
-    uint8_t reserved;
 };
 
 inline constexpr uint64_t GRAPH_DEFINITION_OBJECT_MAGIC = 0x4752415048455844ULL;
@@ -241,7 +175,7 @@ struct GraphDefinition {
     int32_t task_count;
     int32_t edge_count;
     int32_t root_count;
-    int32_t boundary_count;
+    int32_t boundary_tensor_count;
     int32_t boundary_scalar_count;
     int32_t tensor_arg_count;
     int32_t scalar_arg_count;
@@ -258,18 +192,38 @@ struct GraphDefinition {
     uint32_t off_root_indices;
     uint32_t off_in_graph_task_offsets;
     uint32_t off_in_graph_tasks;
+    // Every in-graph task's tensor arguments, concatenated; a task names its own run
+    // through tensor_offset / tensor_count.
+    //
+    // These are **relocation records**, not tensors. Every other simpler::hbg::Tensor in
+    // this runtime -- a boundary parameter, an invocation's argument, a materialized task
+    // argument -- holds values that mean something on their own. One here does not: the
+    // two fields replay has a base for are stored relative, and which base to add follows
+    // the tensor's own owner_task_id, stamped by the recording.
+    //
+    //   field           owner PARAM                           owner IN_GRAPH
+    //   buffer_addr     0 -- replay takes the whole buffer     offset into the graph heap,
+    //                   from this call's argument              whose base the execution has
+    //   start_offset    the view's offset inside that          the view's own origin,
+    //                   parameter; replay adds the             absolute in its own buffer
+    //                   argument's origin
+    //
+    // Geometry, dtype and flags travel absolute, because graph_boundary_matches pins those
+    // equal before a Definition may be reused.
+    //
+    // So start_offset here does not mean what it means on the boundary tensors this is
+    // matched against: there it is the caller's own origin, here an offset from it. A
+    // parameter's offset is relative to its own parameter rather than to its alias
+    // partition's, so a tensor is rebuilt against the argument it came from; two tensors
+    // over one buffer keep their recorded distance only while the arguments keep theirs,
+    // which is what graph_boundary_matches checks and what the recorded WAR/WAW edges were
+    // inferred from.
     uint32_t off_tensors;
-    uint32_t off_tensor_sources;
     uint32_t off_scalars;
     uint32_t off_scalar_inheritance;
-    uint32_t off_boundary_signatures;
     uint32_t off_predicates;
 };
 
-static_assert(std::is_trivially_copyable_v<GraphTensorSourceRef>);
-static_assert(std::is_standard_layout_v<GraphTensorSourceRef>);
-static_assert(std::is_trivially_copyable_v<GraphTensor>);
-static_assert(std::is_standard_layout_v<GraphTensor>);
 static_assert(std::is_trivially_copyable_v<GraphScalarInheritance>);
 static_assert(std::is_standard_layout_v<GraphScalarInheritance>);
 static_assert(sizeof(GraphScalarInheritance) == 4, "the image's scalar section assumes this layout");
@@ -282,8 +236,6 @@ static_assert(std::is_standard_layout_v<InGraphTaskDefinition>);
 static_assert(sizeof(InGraphTaskDefinition) == 80, "an InGraphTaskDefinition field changed the wire layout");
 static_assert(std::is_trivially_copyable_v<GraphPredicate>);
 static_assert(std::is_standard_layout_v<GraphPredicate>);
-static_assert(std::is_trivially_copyable_v<GraphBoundarySignature>);
-static_assert(std::is_standard_layout_v<GraphBoundarySignature>);
 static_assert(std::is_trivially_copyable_v<GraphDefinition>);
 static_assert(std::is_standard_layout_v<GraphDefinition>);
 
@@ -294,78 +246,12 @@ static_assert(std::is_standard_layout_v<GraphDefinition>);
 // type that asked for more would make every one of those stores undefined, with
 // no diagnostic.
 static_assert(
-    alignof(InGraphTaskDefinition) <= alignof(std::max_align_t) && alignof(GraphTensor) <= alignof(std::max_align_t) &&
-        alignof(GraphTensorSourceRef) <= alignof(std::max_align_t) &&
+    alignof(InGraphTaskDefinition) <= alignof(std::max_align_t) &&
+        alignof(simpler::hbg::TensorData) <= alignof(std::max_align_t) &&
         alignof(GraphScalarInheritance) <= alignof(std::max_align_t) &&
-        alignof(GraphBoundarySignature) <= alignof(std::max_align_t) &&
         alignof(GraphPredicate) <= alignof(std::max_align_t),
     "a Definition section type must not be over-aligned: its storage is a byte vector"
 );
-
-inline GraphTensor graph_tensor_pack(const simpler::hbg::Tensor &tensor) {
-    GraphTensor packed{};
-    packed.buffer_addr = tensor.buffer.addr;
-    packed.buffer_size = tensor.buffer.size;
-    packed.owner_task_id = tensor.owner_task_id.raw;
-    packed.start_offset = tensor.start_offset;
-    packed.extent_elem = tensor.extent_elem_cache;
-    packed.version = tensor.version;
-    for (uint32_t i = 0; i < tensor.ndims; ++i) {
-        packed.shapes[i] = tensor.shapes[i];
-        packed.strides[i] = tensor.strides[i];
-    }
-    packed.ndims = static_cast<uint8_t>(tensor.ndims);
-    packed.dtype = static_cast<uint8_t>(tensor.dtype);
-    packed.manual_dep = tensor.manual_dep ? 1 : 0;
-    packed.is_contiguous = tensor.is_contiguous ? 1 : 0;
-    packed.address_space = static_cast<uint8_t>(tensor.address_space);
-    return packed;
-}
-
-inline void graph_tensor_unpack(const GraphTensor &packed, simpler::hbg::Tensor *tensor) {
-    tensor->buffer = PTOBufferHandle{packed.buffer_addr, packed.buffer_size};
-    tensor->owner_task_id = TaskId{packed.owner_task_id};
-    tensor->start_offset = packed.start_offset;
-    tensor->extent_elem_cache = packed.extent_elem;
-    tensor->version = packed.version;
-    tensor->ndims = packed.ndims;
-    tensor->dtype = static_cast<DataType>(packed.dtype);
-    tensor->manual_dep = packed.manual_dep != 0;
-    tensor->is_contiguous = packed.is_contiguous != 0;
-    tensor->address_space = static_cast<AddressSpace>(packed.address_space);
-    for (uint32_t i = 0; i < MAX_TENSOR_DIMS; ++i) {
-        tensor->shapes[i] = packed.shapes[i];
-        tensor->strides[i] = packed.strides[i];
-    }
-    for (uint8_t &byte : tensor->_pad_cl2)
-        byte = 0;
-}
-
-inline bool graph_tensor_wire_valid(const GraphTensor &tensor) {
-    if (tensor.buffer_addr == 0 || tensor.ndims == 0 || tensor.ndims > MAX_TENSOR_DIMS ||
-        tensor.dtype >= static_cast<uint8_t>(DataType::DATA_TYPE_NUM) || tensor.manual_dep > 1 ||
-        tensor.is_contiguous > 1 || tensor.address_space > 1) {
-        return false;
-    }
-
-    uint64_t extent = 1;
-    uint64_t expected_stride = 1;
-    bool contiguous = true;
-    for (int32_t i = static_cast<int32_t>(tensor.ndims) - 1; i >= 0; --i) {
-        const uint64_t shape = tensor.shapes[i];
-        const uint64_t stride = tensor.strides[i];
-        if (shape == 0 || stride == 0) return false;
-        contiguous &= stride == expected_stride;
-        if (shape - 1 > (UINT64_MAX - extent) / stride || expected_stride > UINT64_MAX / shape) return false;
-        extent += (shape - 1) * stride;
-        expected_stride *= shape;
-    }
-    if (extent != tensor.extent_elem || contiguous != (tensor.is_contiguous != 0)) return false;
-
-    const uint64_t element_size = get_element_size(static_cast<DataType>(tensor.dtype));
-    const uint64_t buffer_elements = tensor.buffer_size / element_size;
-    return tensor.start_offset <= buffer_elements && tensor.extent_elem <= buffer_elements - tensor.start_offset;
-}
 
 // A section's length is the same int32 every counting field of the header carries.
 // A negative one is rejected outright rather than left to wrap through the size_t
@@ -444,7 +330,15 @@ struct GraphExecution {
     const GraphDefinition *definition{nullptr};
     const int32_t *fanin_offsets{nullptr};
     const uint16_t *fanin_indices{nullptr};
-    const GraphTensor *boundary_tensors{nullptr};
+    // Base of the graph heap this execution was given. A body tensor's recorded offset is
+    // relative to the recording's own output region, which is an affine image of this heap,
+    // so the two added together are the real address.
+    uintptr_t heap_base{0};
+    // This invocation's actual arguments, held in the outer Graph task's own argument
+    // pool. They are simpler::hbg::Tensors like every other task's, so a rebind that
+    // resolves to one copies it across rather than converting: the boundary is the one
+    // input that does not come from the image.
+    const simpler::hbg::Tensor *boundary_tensors{nullptr};
     int32_t boundary_tensor_count{0};
     const uint64_t *boundary_scalars{nullptr};
     int32_t boundary_scalar_count{0};
@@ -493,12 +387,6 @@ static_assert(
     alignof(ChipTaskStorage) % alignof(GraphExecution) == 0,
     "the in-graph task array's alignment must subsume the execution header's"
 );
-static_assert(sizeof(GraphTensor) <= sizeof(simpler::hbg::Tensor));
-
-inline constexpr size_t graph_boundary_tensor_pool_slots(uint32_t tensor_count) {
-    const size_t bytes = static_cast<size_t>(tensor_count) * sizeof(GraphTensor);
-    return (bytes + sizeof(simpler::hbg::Tensor) - 1) / sizeof(simpler::hbg::Tensor);
-}
 
 // The outer GRAPH task's heap tail occupies
 // [GraphExecution][ChipTaskStorage x task_count][simpler::hbg::Tensor x tensor_arg_count]

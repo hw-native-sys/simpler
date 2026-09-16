@@ -36,7 +36,6 @@
 #include <set>
 
 #include "host_build_graph/task_allocator.h"
-#include "task_interface/assert_compat.h"
 
 class HbgTaskAllocatorTest : public ::testing::Test {
 protected:
@@ -292,32 +291,16 @@ TEST_F(HbgTaskAllocatorTest, LatchedFatalShortCircuitsReserveDeferredHeap) {
     EXPECT_EQ(allocator.heap_top(), 0u);
 }
 
-// Graph recording addresses its in-graph tasks' outputs from
-// GRAPH_RECORD_VIRTUAL_BASE upward and classifies internal vs boundary tensor
-// sources by address-range containment alone. A real heap that reached into that
-// range would silently misclassify, so init() refuses it.
-TEST_F(HbgTaskAllocatorTest, InitRejectsAHeapOverlappingTheRecordingVirtualRange) {
-    TaskAllocator overlapping{};
-    auto *base = reinterpret_cast<void *>(GRAPH_RECORD_VIRTUAL_BASE);
-    EXPECT_THROW(overlapping.init(MAX_TASKS, base, HEAP_SIZE, &error_code), AssertionError);
-
-    TaskAllocator straddling{};
-    auto *just_below = reinterpret_cast<void *>(GRAPH_RECORD_VIRTUAL_BASE - 64);
-    EXPECT_THROW(straddling.init(MAX_TASKS, just_below, HEAP_SIZE, &error_code), AssertionError);
-}
-
 // What the production path passes: the graph heap is allocated out of the virtual
 // window, because its device region is committed only once this allocator has
-// revealed how many bytes the graph needs. The window ends exactly where Graph
-// recording's begins, so the disjointness check above holds at equality — which is
-// what makes the two windows provably non-overlapping rather than merely far apart.
+// revealed how many bytes the graph needs. The window is bounded by MAX_HEAP_CAPACITY
+// rather than by a configured size, so a graph is limited by what the device can
+// commit afterwards.
 TEST_F(HbgTaskAllocatorTest, AcceptsTheVirtualHeapWindow) {
-    EXPECT_EQ(HEAP_VIRTUAL_BASE + HEAP_VIRTUAL_CAPACITY, GRAPH_RECORD_VIRTUAL_BASE);
-
     TaskAllocator virtual_heap{};
     auto *base = reinterpret_cast<void *>(HEAP_VIRTUAL_BASE);
-    virtual_heap.init(MAX_TASKS, base, HEAP_VIRTUAL_CAPACITY, &error_code);
-    EXPECT_EQ(virtual_heap.heap_capacity(), HEAP_VIRTUAL_CAPACITY);
+    virtual_heap.init(MAX_TASKS, base, MAX_HEAP_CAPACITY, &error_code);
+    EXPECT_EQ(virtual_heap.heap_capacity(), MAX_HEAP_CAPACITY);
 
     auto r = virtual_heap.alloc(64);
     ASSERT_FALSE(r.failed());

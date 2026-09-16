@@ -39,7 +39,6 @@
 
 #include "assert_compat.h"
 #include "utils/device_arena.h"
-#include "graph_execution.h"
 #include "host_build_graph/runtime_types.h"
 
 // =============================================================================
@@ -380,9 +379,12 @@ struct HeapRebase {
 // Translate one address the image carries. Anything below HEAP_VIRTUAL_BASE is a
 // real device address the caller owns — a boundary tensor, or an unset field left
 // at 0 — and is returned untouched. At or above it, the address came from the
-// graph heap: a recorded in-graph task's outputs live in its Definition as offsets, so no
-// Graph-recording address (>= GRAPH_RECORD_VIRTUAL_BASE) reaches the image, and
-// the committed-heap bound below rejects one rather than classifying by it.
+// graph heap, and the committed-heap bound below rejects an address past what the
+// bind actually allocated.
+//
+// A recording's own addresses are small integers and would pass through the first
+// branch untranslated, so this function cannot be what keeps them out of the image. The
+// owner test in the restack's tensor walk is.
 inline uint64_t rebased_heap_addr(uint64_t addr, const HeapRebase &rebase) noexcept {
     if (addr < HEAP_VIRTUAL_BASE) {
         return addr;
@@ -415,8 +417,8 @@ inline uint64_t rebased_heap_addr(uint64_t addr, const HeapRebase &rebase) noexc
 //     Three fields carry one: a descriptor's packed buffer bounds (read on the
 //     device by the Graph expansion in graph_execution.cpp), a payload's dispatch
 //     predicate (dereferenced by the scheduler), and a tensor argument's buffer
-//     address — the last one per task and in that task's own element type, since an
-//     outer GRAPH task's boundaries are GraphTensors rather than ChipTensors.
+//     address — the last one per task, in one walk: every task kind holds its
+//     arguments as simpler::hbg::Tensors, an outer GRAPH task's boundaries included.
 //
 // Those three are the whole surface: a heap address that reached the device through
 // an untyped channel would not be moved, and the scalar pool cannot be swept for
@@ -492,22 +494,17 @@ inline uint64_t compact_live_image(
             src_scalars == nullptr ? nullptr : out_scalars + (src_scalars - mirror_scalars),
             src_fanin == nullptr ? nullptr : out_fanin + (src_fanin - mirror_fanin)
         );
-        // The tensor pool holds two element types, so each task's own region is walked
-        // with the type that task wrote: an outer GRAPH task's boundaries are
-        // GraphTensors packed at their own stride, merely occupying the number of
-        // simpler::hbg::Tensor slots graph_boundary_tensor_pool_slots reserves for them. Walking
-        // the pool itself as one simpler::hbg::Tensor array would reach only the first boundary
-        // of each Graph and rewrite bytes in the middle of the rest.
-        if (out_entry.slot.task_kind == TaskKind::GRAPH) {
-            auto *boundaries = reinterpret_cast<GraphTensor *>(out_payload.tensor_data());
-            for (int32_t j = 0; j < out_payload.tensor_count; ++j) {
-                boundaries[j].buffer_addr = rebased_heap_addr(boundaries[j].buffer_addr, rebase);
-            }
-        } else {
-            simpler::hbg::Tensor *tensors = out_payload.tensor_data();
-            for (int32_t j = 0; j < out_payload.tensor_count; ++j) {
-                tensors[j].buffer.addr = rebased_heap_addr(tensors[j].buffer.addr, rebase);
-            }
+        simpler::hbg::Tensor *tensors = out_payload.tensor_data();
+        for (int32_t j = 0; j < out_payload.tensor_count; ++j) {
+            // Nothing a recording addressed may reach this image: a recording's addresses
+            // are positions in its own space, and this image's are the run's. Only an
+            // outer-run task, or no task at all, can own a tensor here. The owner answers
+            // this without depending on where the address falls, which an address test
+            // cannot do: a recording's space overlaps the range real device addresses
+            // occupy. A positive whitelist, so it keeps holding as TaskId gains id spaces.
+            const TaskId owner = tensors[j].owner_task_id;
+            always_assert((!owner.is_valid() || owner.is_global()) && "a recording's tensor reached the image");
+            tensors[j].buffer.addr = rebased_heap_addr(tensors[j].buffer.addr, rebase);
         }
         TaskDescriptor &out_task = out_entry.task;
         out_task.packed_buffer_base = reinterpret_cast<void *>(

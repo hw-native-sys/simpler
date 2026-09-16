@@ -97,17 +97,20 @@ protected:
         return simpler::hbg::make_tensor_external(boundary_storage.data(), shape, 1);
     }
 
-    // Opens a recording over one boundary tensor. Returns the boundary the body's
-    // tasks read from.
-    simpler::hbg::Tensor begin_body(uint64_t key, GraphTaskArgs &boundary_args) {
+    // Opens a recording over one boundary tensor. Returns the parameter the body's tasks
+    // read from -- the entry's own copy, which carries a recording-space address and PARAM
+    // provenance, rather than the caller's tensor the recording was opened with.
+    // `boundary` must outlive every use of `boundary_args`: GraphTaskArgs stores a
+    // Tensor pointer, so a tensor built inside this helper would leave the caller
+    // holding a dangling one.
+    simpler::hbg::Tensor begin_body(uint64_t key, GraphTaskArgs &boundary_args, const simpler::hbg::Tensor &boundary) {
         orch.begin_scope();
-        const simpler::hbg::Tensor boundary = boundary_tensor();
         boundary_args.add_input(boundary);
         const GraphScopeResult graph = orch.graph_begin(key, boundary_args, 0);
         EXPECT_TRUE(graph.recording);
         EXPECT_NE(graph.recording_handle, nullptr);
         EXPECT_TRUE(orch.graph_prepare(graph.recording_handle, boundary_args));
-        return boundary;
+        return graph.params->tensor(0).ref();
     }
 
     // One AIV task reading `input` and writing its own output; `flagged` sets
@@ -195,7 +198,8 @@ protected:
 
 TEST_F(HbgGraphEdQualificationTest, AllFlaggedProducersMakeCandidateAndSortItsRow) {
     GraphTaskArgs boundary_args;
-    const simpler::hbg::Tensor boundary = begin_body(0x6ED0A001, boundary_args);
+    const simpler::hbg::Tensor caller = boundary_tensor();
+    const simpler::hbg::Tensor boundary = begin_body(0x6ED0A001, boundary_args, caller);
 
     const simpler::hbg::Tensor t0 = record_task(boundary, /*flagged=*/true);
     const simpler::hbg::Tensor t1 = record_task(boundary, /*flagged=*/true);
@@ -231,7 +235,8 @@ TEST_F(HbgGraphEdQualificationTest, AllFlaggedProducersMakeCandidateAndSortItsRo
 
 TEST_F(HbgGraphEdQualificationTest, OneUnflaggedProducerDisqualifiesAndLeavesItsRowInRecordOrder) {
     GraphTaskArgs boundary_args;
-    const simpler::hbg::Tensor boundary = begin_body(0x6ED0A002, boundary_args);
+    const simpler::hbg::Tensor caller = boundary_tensor();
+    const simpler::hbg::Tensor boundary = begin_body(0x6ED0A002, boundary_args, caller);
 
     const simpler::hbg::Tensor t0 = record_task(boundary, /*flagged=*/true);
     const simpler::hbg::Tensor t1 = record_task(boundary, /*flagged=*/false);
@@ -267,7 +272,8 @@ TEST_F(HbgGraphEdQualificationTest, OneUnflaggedProducerDisqualifiesAndLeavesIts
 // through the recorded attrs.
 TEST_F(HbgGraphEdQualificationTest, HiddenAllocProducerDoesNotDisqualifyItsConsumer) {
     GraphTaskArgs boundary_args;
-    const simpler::hbg::Tensor boundary = begin_body(0x6ED0A003, boundary_args);
+    const simpler::hbg::Tensor caller = boundary_tensor();
+    const simpler::hbg::Tensor boundary = begin_body(0x6ED0A003, boundary_args, caller);
 
     const simpler::hbg::Tensor flagged = record_task(boundary, /*flagged=*/true);
     const simpler::hbg::Tensor allocated = record_alloc();
@@ -298,12 +304,16 @@ TEST_F(HbgGraphEdQualificationTest, HiddenAllocProducerDoesNotDisqualifyItsConsu
 // materialization may flag any of them.
 TEST_F(HbgGraphEdQualificationTest, FlaggedProducerMakesTheShellACandidate) {
     GraphTaskArgs boundary_args;
-    const simpler::hbg::Tensor boundary = begin_body(0x6ED0B001, boundary_args);
-    record_task(boundary, /*flagged=*/true);
+    const simpler::hbg::Tensor caller = boundary_tensor();
+    const simpler::hbg::Tensor param = begin_body(0x6ED0B001, boundary_args, caller);
+    record_task(param, /*flagged=*/true);
     ASSERT_TRUE(orch.graph_end());
     orch.graph_commit();
 
-    const TaskId producer = submit_boundary_producer(boundary, /*flagged=*/true);
+    // Outside the Graph the caller's own tensor is what an ordinary task takes: a
+    // parameter's owner is PARAM, which names no task of the run, so passing one here
+    // would ask the fanin walk to resolve it against the task table.
+    const TaskId producer = submit_boundary_producer(boundary_tensor(), /*flagged=*/true);
     const TaskId shell = submit_shell(0x6ED0B001, boundary_args);
 
     EXPECT_EQ(slot_of(shell).task_kind, TaskKind::GRAPH);
@@ -313,12 +323,13 @@ TEST_F(HbgGraphEdQualificationTest, FlaggedProducerMakesTheShellACandidate) {
 
 TEST_F(HbgGraphEdQualificationTest, OneUnflaggedProducerDisqualifiesTheShell) {
     GraphTaskArgs boundary_args;
-    const simpler::hbg::Tensor boundary = begin_body(0x6ED0B002, boundary_args);
-    record_task(boundary, /*flagged=*/true);
+    const simpler::hbg::Tensor caller = boundary_tensor();
+    const simpler::hbg::Tensor param = begin_body(0x6ED0B002, boundary_args, caller);
+    record_task(param, /*flagged=*/true);
     ASSERT_TRUE(orch.graph_end());
     orch.graph_commit();
 
-    const TaskId producer = submit_boundary_producer(boundary, /*flagged=*/false);
+    const TaskId producer = submit_boundary_producer(boundary_tensor(), /*flagged=*/false);
     const TaskId shell = submit_shell(0x6ED0B002, boundary_args);
 
     EXPECT_EQ(slot_of(shell).ed_flags & ED_FLAG_CANDIDATE, 0);
