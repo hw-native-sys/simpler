@@ -23,7 +23,7 @@
 #include "task_interface/kernel_dispatch_args.h"
 #include "tensormap_and_ringbuffer/kernel_invocation.h"
 
-extern "C" aclError capture_gate_before_register(aclrtStream stream);
+extern "C" aclError capture_gate_install_if_armed(aclrtStream stream);
 
 namespace {
 enum class ObserverError : int {
@@ -50,7 +50,10 @@ struct Observer {
 Observer observer;
 bool invocation_scope{false};
 bool forbid_sync{false};
+bool prepare_scope{false};
 uint64_t forbidden_sync_calls{0};
+uint64_t caller_stream_syncs{0};
+const void *caller_streams[2]{nullptr, nullptr};
 int query_override{0};
 uint64_t query_override_calls{0};
 uint64_t total_queries{0};
@@ -59,10 +62,34 @@ int prepare_failure{0};
 uint64_t prepare_failure_calls{0};
 
 bool fail_prepare_step(int kind) {
-    if (!forbid_sync || invocation_scope || prepare_failure != kind) return false;
+    if (!prepare_scope || prepare_failure != kind) return false;
     prepare_failure = 0;
     ++prepare_failure_calls;
     return true;
+}
+
+bool is_caller_stream(const void *stream) {
+    for (const void *candidate : caller_streams) {
+        if (candidate != nullptr && candidate == stream) return true;
+    }
+    return false;
+}
+
+// A sync the scope in force forbids, counted in that scope's own tally. Launch
+// forbids every sync: it is pure enqueue, and a wait there is what a captured
+// graph cannot contain. Registration forbids only the caller's streams — it
+// synchronizes the context's own AICPU stream by contract, so that one reaches
+// CANN. A null stream means device-wide, which drains the caller's streams too.
+bool sync_is_forbidden(const void *stream) {
+    if (forbid_sync) {
+        ++forbidden_sync_calls;
+        return true;
+    }
+    if (prepare_scope && (stream == nullptr || is_caller_stream(stream))) {
+        ++caller_stream_syncs;
+        return true;
+    }
+    return false;
 }
 
 void note_error(ObserverError error) {
@@ -135,8 +162,14 @@ extern "C" void capture_observer_begin() {
 }
 
 extern "C" void capture_observer_guard_sync(int enabled) { forbid_sync = enabled != 0; }
+extern "C" void capture_observer_prepare_scope(int enabled) { prepare_scope = enabled != 0; }
 extern "C" void capture_observer_invocation_scope(int enabled) { invocation_scope = enabled != 0; }
 extern "C" uint64_t capture_observer_sync_calls() { return forbidden_sync_calls; }
+extern "C" uint64_t capture_observer_caller_syncs() { return caller_stream_syncs; }
+extern "C" void capture_observer_caller_streams(uint64_t first, uint64_t second) {
+    caller_streams[0] = reinterpret_cast<const void *>(first);
+    caller_streams[1] = reinterpret_cast<const void *>(second);
+}
 extern "C" void capture_observer_override_query(int kind) {
     query_override = kind;
     query_override_calls = 0;
@@ -187,10 +220,7 @@ extern "C" aclError aclrtMemsetAsync(void *device, size_t maximum, int32_t value
 }
 
 extern "C" aclError aclrtSynchronizeStreamWithTimeout(aclrtStream stream, int32_t timeout) {
-    if (forbid_sync) {
-        ++forbidden_sync_calls;
-        return -4331;
-    }
+    if (sync_is_forbidden(stream)) return -4331;
     static const auto real = reinterpret_cast<decltype(&aclrtSynchronizeStreamWithTimeout)>(
         resolve_cann_symbol("aclrtSynchronizeStreamWithTimeout")
     );
@@ -198,30 +228,21 @@ extern "C" aclError aclrtSynchronizeStreamWithTimeout(aclrtStream stream, int32_
 }
 
 extern "C" aclError aclrtSynchronizeStream(aclrtStream stream) {
-    if (forbid_sync) {
-        ++forbidden_sync_calls;
-        return -4331;
-    }
+    if (sync_is_forbidden(stream)) return -4331;
     static const auto real =
         reinterpret_cast<decltype(&aclrtSynchronizeStream)>(resolve_cann_symbol("aclrtSynchronizeStream"));
     return real == nullptr ? -4330 : real(stream);
 }
 
 extern "C" aclError aclrtSynchronizeDevice() {
-    if (forbid_sync) {
-        ++forbidden_sync_calls;
-        return -4331;
-    }
+    if (sync_is_forbidden(nullptr)) return -4331;
     static const auto real =
         reinterpret_cast<decltype(&aclrtSynchronizeDevice)>(resolve_cann_symbol("aclrtSynchronizeDevice"));
     return real == nullptr ? -4330 : real();
 }
 
 extern "C" rtError_t rtStreamSynchronize(rtStream_t stream) {
-    if (forbid_sync) {
-        ++forbidden_sync_calls;
-        return -4331;
-    }
+    if (sync_is_forbidden(stream)) return -4331;
     static const auto real =
         reinterpret_cast<decltype(&rtStreamSynchronize)>(resolve_cann_symbol("rtStreamSynchronize"));
     return real == nullptr ? -4330 : real(stream);
@@ -282,8 +303,10 @@ extern "C" rtError_t rtsLaunchCpuKernel(
     rtCpuKernelArgs_t *args
 ) {
     if (fail_prepare_step(1)) return -4333;
-    if (forbid_sync && !invocation_scope) {
-        if (const auto rc = capture_gate_before_register(stream); rc != 0) return rc;
+    // Ahead of this invocation's own AICPU work, so a gate armed for it holds
+    // the whole chained sequence and the caller's serial tail with it.
+    if (invocation_scope) {
+        if (const auto rc = capture_gate_install_if_armed(stream); rc != 0) return rc;
     }
     if (observer.armed && invocation_scope) observe_cpu(args);
     static const auto real = reinterpret_cast<decltype(&rtsLaunchCpuKernel)>(resolve_cann_symbol("rtsLaunchCpuKernel"));

@@ -36,6 +36,7 @@ into `**config` and validated later. The recognized keys:
 | `platform` | all | `a2a3`, `a2a3sim`, `a5`, `a5sim` |
 | `runtime` | all | `tensormap_and_ringbuffer` or `host_build_graph` |
 | `device_id` | L2 | the single chip this worker drives |
+| `execution_mode` | L2 | `program` (default) or `kernel`; see [Execution modes](#execution-modes) |
 | `device_ids` | L3+ | one chip child process per entry |
 | `num_sub_workers` | L3+ | host-side Python callables to fork |
 | `enable_sdma` | a2a3 | provisions the SDMA workspace; defaults to `False` |
@@ -45,6 +46,38 @@ into `**config` and validated later. The recognized keys:
 `level` selects the topology: `2` is one chip, `>= 3` is hierarchical. Anything
 else raises. Remote-worker and remote-memory calls require `level >= 4`.
 
+### Execution modes
+
+`execution_mode` is fixed at construction and selects the dispatch surface. It
+is read-only afterwards, exposed as `worker.execution_mode`.
+
+| Aspect | `program` (default) | `kernel` |
+| ------ | ------------------- | -------- |
+| Device | this Worker brings ACL up and owns the device | already current on the calling thread; the Worker borrows it and resets nothing |
+| Streams | created and owned internally | the context creates its own private ones; the *caller's* stream is passed per launch |
+| Levels | any | 2 only — one chip context, no child to fork |
+| `init` | `init(prewarm_config=None)` | `init(config=<CallConfig>)`, required and context-static |
+| Dispatch | `register` / `unregister` / `submit` / `run` | `kernel_prepare_callable` / `kernel_launch` |
+| `close` | same call in both modes | |
+
+The two dispatch surfaces are mutually exclusive: each refuses the other's
+calls, naming the mode the Worker was constructed with. Kernel mode is the path
+a framework integration takes — it holds the device, the stream and the tensor
+storage, and calls simpler as a library.
+
+| Method | Notes |
+| ------ | ----- |
+| `kernel_mode_supported -> bool` | Whether the bound runtime can execute kernel-mode launches. `False` before `init()`, after an init that failed, after `close()`, and on any `level >= 3` Worker. A capability query, not a mode assertion — a program-mode L2 Worker answers for the runtime it bound |
+| `kernel_prepare_callable(chip_callable) -> int` | Registers one callable and returns the context-local id simpler minted. **Pure registration**: the same image registered twice takes two distinct, equally valid ids, there is no lookup, and capacity is spent per registration. Deduplication belongs to the caller's own cache. Takes no stream — registration enqueues on the context's own AICPU stream, which every later launch also enqueues on |
+| `kernel_launch(callable_id, args, caller_stream)` | Enqueues one bounded asynchronous invocation. `args` is a `ChipStorageTaskArgs` whose tensors name device addresses the caller owns; `caller_stream` is the native stream handle for *this* call. Returning means enqueued, not complete — asynchronous failures surface at the caller's own synchronization point |
+
+An id is never reused within a context, and `close()` invalidates every id that
+context minted; a closed Worker refuses further launches. Those three properties
+together are what makes a bare `int32` id safe — there is no generation field.
+
+Call it outside ACLGraph capture: capture must hit an already-registered id, and
+a `prepare` inside the capture window is a caller error.
+
 ### Lifecycle
 
 | Method | Notes |
@@ -53,7 +86,7 @@ else raises. Remote-worker and remote-memory calls require `level >= 4`.
 | `unregister(handle_or_slot)` | Releases a registration |
 | `add_worker(worker) -> int` | Attaches a child worker; returns its id |
 | `add_remote_worker(spec: RemoteWorkerSpec) -> int` | L4; see the remote-L3 design doc |
-| `init(prewarm_config=None)` | Resolves runtime binaries, opens the device, forks children. First place setup errors appear |
+| `init(prewarm_config=None, *, config=None)` | Resolves runtime binaries, opens the device, forks children. First place setup errors appear. `config` is the kernel context's static `CallConfig` — required in kernel mode and refused in program mode, which sizes per run; `prewarm_config` is the reverse |
 | `close()` | Releases the device and reaps children. Put it in a `finally` — a skipped `close()` leaves the device held |
 
 ### Memory
@@ -75,6 +108,9 @@ Both offsets are bounded together with the length against the *registered* exten
 cannot walk a legal-looking length past the end.
 
 ### Execution
+
+Program mode. The kernel-mode surface is `kernel_prepare_callable` /
+`kernel_launch`, under [Execution modes](#execution-modes) above.
 
 | Method | Notes |
 | ------ | ----- |

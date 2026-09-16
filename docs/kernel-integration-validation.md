@@ -40,6 +40,10 @@ source import as runtime evidence.
 - Public TMR C API: caller-owned ACL/device/stream, initialization, immutable
   callable preparation, two real 16,384-element numerical launches with
   different addresses and scalar values, stable memory, and complete close.
+- Public L2 Worker: the same path through the object PyPTO holds — construction
+  identity, `init(config=)`, two registrations of one image, two numerical
+  launches, close, and a launch after close that CLOSED refuses. Mode mutual
+  exclusion and the init argument contract resolve before any device exists.
 - Lifecycle failures: failed initialization, event/stream cleanup retry,
   forgotten close, fatal-device abandonment, invalid current device and
   device-query errors. Rejected work preserves the context and can recover.
@@ -582,6 +586,74 @@ platform entries those suites exercise.
 `mkdocs build --strict` was not re-run: mkdocs is not installed in this
 worktree and PyPI is unreachable from this host. The change adds no page and
 changes no nav entry.
+
+## L2 Worker entry validation (2026-09-15)
+
+The public `Worker(level=2, execution_mode="kernel")` surface is added over the
+existing `ChipWorker` one: the mode is fixed at construction, `init(config=)`
+and `close()` are shared with program mode, and `kernel_prepare_callable` /
+`kernel_launch` are the kernel dispatch surface. The decisions are D21 in the
+integration log.
+
+Nothing below the Worker changed. `init` reaches `ChipWorker.kernel_init`,
+`close` finalizes the chip worker through the `CleanupJournal` that already
+covers a failed kernel teardown, and prepare and launch forward under the same
+READY lease every other live-tree call takes — which is what makes CLOSED refuse
+a later launch. The C++ and native layers are untouched, so no rebuild of them
+is part of this change.
+
+| Suite | Result |
+| ----- | ------ |
+| Python unit tests, `tests/ut -m "not requires_hardware"` | 2458 passed, 54 deselected |
+| Python hardware unit tests, `tests/ut -m requires_hardware --platform a2a3` | 23/23 scheduled cases passed |
+| a2a3sim scenes, `examples tests/st --platform a2a3sim --device 0-3` | 40/40 scheduled cases passed |
+| pre-commit hooks on changed files | passed |
+
+The Python unit count is the 2448 baseline this line reached after PR #2247,
+plus the ten device-free cases added here — the mode and init-argument contract
+resolves from the constructor, so it needs no runtime binary. The hardware count
+is what this pool scheduled, not a comparison: the scheduler's case count varies
+with the pool (see the count discrepancy recorded against `conftest.py`). One of
+the 23 is the new `test_worker_kernel_mode_eager_end_to_end`, which drives init,
+two registrations of
+one image, two 16,384-element launches with different addresses and scalars,
+numeric verification, close, and a refused launch afterwards, all on a device and
+stream the test itself owns.
+
+Not re-run: the C++ suites, the a2a3 onboard scene phases, the SDMA phase, a5sim
+scenes, and `tests/ut/py/test_kernel_mode_c_api.py`. The change is confined to
+`python/simpler/worker.py` and its tests and does not reach any native
+translation unit.
+
+`mkdocs build --strict` was not re-run: mkdocs is not installed in this worktree
+and PyPI is unreachable from this host. The change adds no page and changes no
+nav entry.
+
+## Capture scene-test revalidation (2026-09-15)
+
+`tests/st/a2a3/tensormap_and_ringbuffer/kernel_mode_capture` was failing 23 of
+its 24 scenarios on a2a3 before this change, every one on
+`prepare/launch performed an internal sync` — the observer forbade the AICPU
+stream wait that #2245 deliberately added to registration. The decisions are D22
+in the integration log: the wait stays, the guard splits into a launch scope
+that refuses every synchronize and a registration scope that refuses only the
+caller's streams, and the blocking gate moves from registration to launch.
+
+| Suite | Result |
+| ----- | ------ |
+| a2a3 hardware, `tests/st/.../kernel_mode_capture` | 24/24 scenarios passed |
+| a2a3 hardware, `tests/st/a2a3/kernel_capture` | passed, unchanged |
+| Python unit tests, `tests/ut -m "not requires_hardware"` | 2458 passed |
+| Python hardware unit tests, `tests/ut -m requires_hardware --platform a2a3` | 23/23 scheduled cases passed |
+| pre-commit hooks on changed files | passed |
+
+Before the change the same invocation reported 1 of 24. Splitting the two scopes
+alone took it to 22; the remaining two, `blocked_same` and `stream_busy`, are the
+scenarios whose gate assumed registration returns while it is still outstanding,
+and they pass once the gate is installed ahead of a launch instead.
+
+This is a test-side change only: no native source differs, so the entry
+behaviour every earlier row in this document recorded is unchanged.
 
 ## Remaining boundaries
 

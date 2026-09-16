@@ -4623,6 +4623,28 @@ class _DeviceAllocations:
         return len(self._snapshots)
 
 
+_EXECUTION_MODES = ("program", "kernel")
+
+
+def _validated_execution_mode(mode: Any, level: int) -> str:
+    """The execution mode a Worker is fixed to at construction.
+
+    ``program`` owns its device: it brings ACL up, creates its own streams, and
+    dispatches through register / submit / run. ``kernel`` borrows a device and a
+    stream the caller already holds and dispatches through
+    kernel_prepare_callable / kernel_launch. A context latches one of the two
+    natively, so one Worker is never both.
+
+    Kernel mode is level 2 only: it is a single chip context, with no child to
+    fork and no next level to dispatch to.
+    """
+    if mode not in _EXECUTION_MODES:
+        raise ValueError(f"Worker: execution_mode must be one of {_EXECUTION_MODES}, got {mode!r}")
+    if mode == "kernel" and level != 2:
+        raise ValueError(f"Worker: execution_mode='kernel' requires level 2, got level {level}")
+    return str(mode)
+
+
 class Worker:
     """Unified worker for all hierarchy levels.
 
@@ -4632,6 +4654,13 @@ class Worker:
     level=4+: wraps the C++ Worker composite with Worker(level-1)×N as
               NEXT_LEVEL children + SubWorker×M. Children are added via
               add_worker() before init().
+
+    ``execution_mode`` picks the dispatch surface and is fixed at construction:
+    ``"program"`` (the default) owns its device and dispatches through
+    register / submit / run; ``"kernel"`` (level 2 only) borrows the caller's
+    device and per-call stream and dispatches through kernel_prepare_callable /
+    kernel_launch. ``init`` and ``close`` are shared by both. The two surfaces
+    are mutually exclusive — each refuses the other's calls.
     """
 
     def __init__(
@@ -4646,6 +4675,7 @@ class Worker:
         # so a span emitted before init names L3 rather than nothing.
         self._host_span_prefix = _span_prefix(WorkerLevel.node)
         self._config = config
+        self._execution_mode = _validated_execution_mode(config.get("execution_mode", "program"), int(level))
         self._callable_registry: dict[int, Any] = {}
         self._identity_registry: dict[bytes, _CallableIdentityState] = {}
         self._live_handles: dict[int, bytes] = {}
@@ -4782,6 +4812,11 @@ class Worker:
         # first run() with the same sizing skips the (~800ms) cold prebuilt
         # runtime-arena build. Set by init(prewarm_config=...); None = disabled.
         self._prewarm_config: Any | None = None
+
+        # The kernel context's static CallConfig, set by init(config=...) on a
+        # kernel-mode Worker. It fixes the context's capacity and pipeline
+        # topology for the whole context lifetime — a launch never mutates it.
+        self._kernel_config: Any | None = None
 
         # Level-2 internals
         self._chip_worker: ChipWorker | None = None
@@ -6558,6 +6593,22 @@ class Worker:
                     self._lease_depth[tid] = depth
                 self._hierarchical_start_cv.notify_all()
 
+    def _require_execution_mode(self, mode: str, api: str) -> None:
+        """Refuse a call that belongs to the other execution mode.
+
+        The two dispatch surfaces are disjoint by construction: a program
+        context has slots and a run lane but no borrowed stream, a kernel
+        context has the reverse. Native refuses the crossing too — the program
+        entries bounds-check a kernel context's empty slot storage, and the
+        device context latches one mode write-once — so this only names the
+        mode the caller fixed at construction, before the call reaches either.
+        """
+        if self._execution_mode != mode:
+            raise RuntimeError(
+                f"Worker.{api}: requires execution_mode='{mode}'; this Worker was "
+                f"constructed with execution_mode='{self._execution_mode}'"
+            )
+
     def _invalidate_endpoint_registry(self) -> None:
         self._endpoint_registry = None
         self._region_access_service = None
@@ -6742,6 +6793,7 @@ class Worker:
         A post-init dynamic register re-validates eligibility against the
         frozen topology (``_eligible_target_need``), same as init().
         """
+        self._require_execution_mode("program", "register")
         if isinstance(target, RemoteCallable) and self.level < 4:
             raise TypeError("Worker.register(RemoteCallable): remote L3 dispatch requires a level >= 4 parent")
         if self.level == 2 and not isinstance(target, ChipCallable):
@@ -7340,6 +7392,7 @@ class Worker:
         Raises:
           KeyError: handle was never registered.
         """
+        self._require_execution_mode("program", "unregister")
         if self._pre_start_unregister_if_needed(handle_or_slot):
             return
         # Every post-start path takes the READY-only lease before touching the
@@ -7725,7 +7778,11 @@ class Worker:
                 )
 
     def init(  # noqa: PLR0912, PLR0915
-        self, prewarm_config: CallConfig | None = None, *, _startup_deadline: float | None = None
+        self,
+        prewarm_config: CallConfig | None = None,
+        *,
+        config: CallConfig | None = None,
+        _startup_deadline: float | None = None,
     ) -> None:
         """Initialize the worker and bring its whole subtree to READY.
 
@@ -7748,12 +7805,26 @@ class Worker:
                 An L2 worker prewarms here; an L3+ worker prewarms each chip child
                 during hierarchy startup, before it publishes INIT_READY. A no-op
                 for runtimes without a prebuilt arena (host_build_graph). ``None``
-                (default) disables prewarm.
+                (default) disables prewarm. Program mode only.
+            config: The kernel context's static CallConfig. Required in kernel
+                mode and rejected in program mode, which sizes per run instead.
+                It takes no stream: kernel init creates the context's own private
+                streams, and the caller's stream is per-launch.
             _startup_deadline: Internal. Absolute ``time.monotonic()`` deadline
                 inherited from a parent's startup epoch so a recursive descendant
                 consumes the parent's remaining budget instead of restarting the
                 timeout. ``None`` starts a fresh epoch.
         """
+        if self._execution_mode == "kernel":
+            if config is None:
+                raise ValueError("Worker.init(): execution_mode='kernel' requires config=<CallConfig>")
+            if prewarm_config is not None:
+                raise ValueError(
+                    "Worker.init(): prewarm_config is program-mode only; a kernel context is sized by config="
+                )
+            config.validate()
+        elif config is not None:
+            raise ValueError("Worker.init(): config= is kernel-mode only; program mode sizes per run")
         if prewarm_config is not None:
             prewarm_config.validate()
         # Claim the startup epoch atomically: NEW -> INITIALIZING under the
@@ -7783,6 +7854,7 @@ class Worker:
             # this lock).
             self._validate_eligible_targets()
             self._prewarm_config = prewarm_config
+            self._kernel_config = config
             self._startup_error = None
             self._init_owner_thread = threading.current_thread()
             self._cancel_token = False
@@ -7806,7 +7878,10 @@ class Worker:
 
         try:
             if self.level == 2:
-                self._init_level2()
+                if self._execution_mode == "kernel":
+                    self._init_level2_kernel()
+                else:
+                    self._init_level2()
             elif self.level >= 3:
                 self._init_hierarchical()
                 self._start_hierarchical()
@@ -7890,6 +7965,24 @@ class Worker:
         for cid, target in self._callable_registry.items():
             if isinstance(target, ChipCallable):
                 self._chip_worker._register_callable_at_slot(cid, target)
+
+    def _init_level2_kernel(self) -> None:
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        platform = self._config["platform"]
+        runtime = self._config["runtime"]
+        device_id = self._config.get("device_id", 0)
+
+        builder = RuntimeBuilder(platform)
+        binaries = builder.get_binaries(runtime)
+
+        assert self._kernel_config is not None
+        self._chip_worker = ChipWorker()
+        # Neither of the program path's two follow-ups applies: a kernel context
+        # borrows the caller's device rather than bringing one up, so it
+        # provisions no SDMA workspace, and it has no program slots to replay —
+        # register() is refused in this mode, so the registry is empty.
+        self._chip_worker.kernel_init(device_id, binaries, self._kernel_config)
 
     def _init_hierarchical(self) -> None:
         device_ids = self._config.get("device_ids", [])
@@ -11205,6 +11298,7 @@ class Worker:
         would deadlock on a depth-one backend. Completion and cleanup stay
         attached to each handle.
         """
+        self._require_execution_mode("program", "submit")
         try:
             with self._operation_lease("submit"):
                 result = self._submit_locked(callable, args, config)
@@ -11225,6 +11319,68 @@ class Worker:
         ``docs/dfx/host-trace.md``).
         """
         self.submit(callable, args=args, config=config).wait()
+
+    # ------------------------------------------------------------------
+    # kernel mode
+    # ------------------------------------------------------------------
+
+    @property
+    def execution_mode(self) -> str:
+        """The dispatch surface this Worker was constructed with."""
+        return self._execution_mode
+
+    @property
+    def kernel_mode_supported(self) -> bool:
+        """Whether this Worker can execute kernel-mode launches.
+
+        The answer belongs to the runtime library the chip context bound, so it
+        is False before init(), after an init that failed, and after close(). It
+        is also False on a level >= 3 Worker, which binds no runtime of its own.
+        A program-mode L2 Worker answers for the runtime it bound, the same way
+        ChipWorker does — this reports capability, it does not assert a mode.
+        """
+        chip_worker = self._chip_worker
+        return False if chip_worker is None else bool(chip_worker.kernel_mode_supported)
+
+    def kernel_prepare_callable(self, chip_callable: ChipCallable) -> int:
+        """Register one callable on this context and return the id simpler minted.
+
+        Pure registration, outside any ACLGraph capture: the same callable
+        registered twice takes two distinct, equally valid ids, there is no
+        lookup, and capacity is spent per registration rather than per unique
+        callable. Deduplication belongs to the caller's own cache.
+
+        The id is context-local — valid only on this Worker, never reused within
+        it, and invalid for every one of them once close() succeeds. It takes no
+        stream: registration enqueues on the context's own AICPU stream, which
+        every later launch also enqueues on, so stream FIFO orders registration
+        ahead of each launch.
+        """
+        self._require_execution_mode("kernel", "kernel_prepare_callable")
+        with self._operation_lease("kernel_prepare_callable"):
+            assert self._chip_worker is not None
+            return self._chip_worker.kernel_prepare_callable(chip_callable)
+
+    def kernel_launch(self, callable_id: int, args, caller_stream: int) -> None:
+        """Enqueue one bounded asynchronous invocation on the caller's stream.
+
+        ``callable_id`` is a value ``kernel_prepare_callable`` returned on this
+        Worker. ``args`` is the packed ChipStorageTaskArgs for this call, whose
+        tensors name device addresses the caller owns. ``caller_stream`` is the
+        native stream handle for *this* call, taken per call rather than
+        remembered from init: a framework caller's current stream is a property
+        of the call, so a stream fixed at init would keep enqueueing onto a
+        stale one. It is borrowed for this call only and simpler neither stores
+        nor destroys it.
+
+        Returning means the sequence was enqueued. Device execution may still be
+        in flight and may still fail asynchronously, which the caller observes at
+        its own synchronization point.
+        """
+        self._require_execution_mode("kernel", "kernel_launch")
+        with self._operation_lease("kernel_launch"):
+            assert self._chip_worker is not None
+            self._chip_worker.kernel_launch(callable_id, args, caller_stream)
 
     def _submit_locked(self, callable, args, config) -> RunHandle:
         cfg = config if config is not None else CallConfig()

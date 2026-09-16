@@ -113,7 +113,9 @@ extern "C" int capture_gate_finish() {
     return gate.process_rc ? gate.process_rc : unsubscribed;
 }
 
-extern "C" aclError capture_gate_before_register(aclrtStream stream) {
+// Installs a blocking callback on `stream` when armed, so the work enqueued
+// after it cannot run until capture_gate_release(). One arm installs one gate.
+extern "C" aclError capture_gate_install_if_armed(aclrtStream stream) {
     if (!armed) return 0;
     armed = false;
     return install_gate(stream);

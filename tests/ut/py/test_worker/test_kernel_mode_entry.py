@@ -7,9 +7,17 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ruff: noqa: PLC0415
-"""Hardware UT for the Python kernel-mode surface of ChipWorker.
+"""UT for the Python kernel-mode surface: ChipWorker and the L2 Worker over it.
 
-The Python twin of tests/ut/cpp/hardware/test_kernel_mode_entry.cpp, and the
+Two layers, and the split between them is what each part tests. ``ChipWorker``
+is the native wrapper; ``Worker(level=2, execution_mode="kernel")`` is the public
+object PyPTO holds, which fixes the mode at construction, dispatches init and
+close to the kernel entries, and refuses the program surface. The Worker-level
+mode and argument contract resolves before any device exists, so those cases run
+anywhere; everything that binds a runtime needs a device or the simulator.
+
+The hardware cases are the Python twin of
+tests/ut/cpp/hardware/test_kernel_mode_entry.cpp, and the
 inverse of test_platform_comm.py's contract: there ChipWorker owns ACL bring-up
 and stream lifetime internally, here the *caller* owns both. That inversion is
 what kernel mode is, so the test does its own device bind and stream creation
@@ -248,3 +256,324 @@ def test_borrowed_stream_survives_a_refused_kernel_init(st_platform, st_device_i
         f"the caller's stream did not survive a refused kernel_init: {result}"
     )
     assert "stream_teardown_error" not in result, f"post-init stream operation failed: {result}"
+
+
+def _kernel_worker(platform: str, device_id: int = 0, runtime: str = "tensormap_and_ringbuffer"):
+    from simpler.worker import Worker  # noqa: PLC0415
+
+    return Worker(
+        level=2,
+        execution_mode="kernel",
+        device_id=device_id,
+        platform=platform,
+        runtime=runtime,
+    )
+
+
+def _program_worker(platform: str = "a2a3", runtime: str = "tensormap_and_ringbuffer"):
+    from simpler.worker import Worker  # noqa: PLC0415
+
+    return Worker(level=2, device_id=0, platform=platform, runtime=runtime)
+
+
+class TestWorkerExecutionMode:
+    """The Worker-level contract that holds before any device is touched.
+
+    ``execution_mode`` is fixed at construction and picks the dispatch surface,
+    so everything here resolves from the constructor argument alone — no
+    runtime binary, no device, no ACL.
+    """
+
+    def test_program_is_the_default(self):
+        assert _program_worker().execution_mode == "program"
+
+    def test_kernel_mode_is_level_2_only(self):
+        from simpler.worker import Worker  # noqa: PLC0415
+
+        for level in (3, 4):
+            with pytest.raises(ValueError, match="requires level 2"):
+                Worker(level=level, execution_mode="kernel")
+
+    def test_an_unknown_mode_is_rejected(self):
+        from simpler.worker import Worker  # noqa: PLC0415
+
+        # Silently falling back to program mode is the failure this prevents:
+        # nothing else validates **config keys, so a typo would come up READY
+        # on the wrong surface.
+        with pytest.raises(ValueError, match="execution_mode must be one of"):
+            Worker(level=2, execution_mode="kernal", platform="a2a3", runtime="tensormap_and_ringbuffer")
+
+    def test_kernel_init_requires_its_static_config(self):
+        with pytest.raises(ValueError, match="requires config="):
+            _kernel_worker("a2a3").init()
+
+    def test_program_init_refuses_a_kernel_config(self):
+        from simpler.task_interface import CallConfig  # noqa: PLC0415
+
+        with pytest.raises(ValueError, match="kernel-mode only"):
+            _program_worker().init(config=CallConfig())
+
+    def test_kernel_init_refuses_a_prewarm_config(self):
+        from simpler.task_interface import CallConfig  # noqa: PLC0415
+
+        # The two configs are not interchangeable: prewarm is a ring-sizing hint
+        # for a later run, config is the context's immutable sizing.
+        with pytest.raises(ValueError, match="program-mode only"):
+            _kernel_worker("a2a3").init(CallConfig(), config=CallConfig())
+
+    def test_the_two_dispatch_surfaces_refuse_each_other(self):
+        from simpler.task_interface import ChipStorageTaskArgs  # noqa: PLC0415
+
+        kernel = _kernel_worker("a2a3")
+        # run() is submit().wait(), so it is refused under submit's own name.
+        for api, call in (
+            ("register", lambda: kernel.register(None)),
+            ("unregister", lambda: kernel.unregister(0)),
+            ("submit", lambda: kernel.submit(None)),
+            ("submit", lambda: kernel.run(None)),
+        ):
+            with pytest.raises(RuntimeError, match=f"Worker.{api}: requires execution_mode='program'"):
+                call()
+
+        program = _program_worker()
+        for api, call in (
+            ("kernel_prepare_callable", lambda: program.kernel_prepare_callable(None)),
+            ("kernel_launch", lambda: program.kernel_launch(0, ChipStorageTaskArgs(), 1)),
+        ):
+            with pytest.raises(RuntimeError, match=f"Worker.{api}: requires execution_mode='kernel'"):
+                call()
+
+    def test_capability_is_false_before_init(self):
+        # The answer belongs to a bound runtime, and neither worker has one yet.
+        assert _kernel_worker("a2a3").kernel_mode_supported is False
+        assert _program_worker().kernel_mode_supported is False
+
+    def test_a_level_3_worker_reports_no_kernel_capability(self):
+        from simpler.worker import Worker  # noqa: PLC0415
+
+        # It binds no runtime of its own; its chip children each bind theirs.
+        assert Worker(level=3, platform="a2a3", runtime="tensormap_and_ringbuffer").kernel_mode_supported is False
+
+
+class TestWorkerKernelModeOnTheSimulator:
+    """The simulator implements the four entries and refuses at init.
+
+    Reaching that refusal is the assertion: it proves Worker.init dispatched
+    into the kernel path and arrived at the C ABI, rather than being rejected
+    on the way or silently taking the program path.
+    """
+
+    @staticmethod
+    def _skip_without_sim_binaries():
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        try:
+            RuntimeBuilder(platform="a2a3sim").get_binaries("tensormap_and_ringbuffer")
+        except FileNotFoundError as e:
+            pytest.skip(f"a2a3sim runtime binaries unavailable: {e}")
+
+    def test_init_refusal_reaches_the_c_abi(self):
+        import _task_interface as native  # noqa: PLC0415
+        from simpler.task_interface import CallConfig  # noqa: PLC0415
+
+        self._skip_without_sim_binaries()
+        worker = _kernel_worker("a2a3sim")
+        try:
+            with pytest.raises(native.UnsupportedRuntimeOperation) as excinfo:
+                worker.init(config=CallConfig())
+            assert excinfo.value.code == native.PTO_RUNTIME_ERR_UNSUPPORTED
+            assert worker.kernel_mode_supported is False
+        finally:
+            # A refused init must still leave a closeable Worker.
+            worker.close()
+
+
+def _kernel_context_config():
+    """The context-static CallConfig the eager callable's rings need."""
+    from simpler.task_interface import CallConfig  # noqa: PLC0415
+
+    config = CallConfig()
+    config.runtime_env.ring_task_window = [64] * 4
+    config.runtime_env.ring_heap = [1 << 20] * 4
+    config.runtime_env.ring_dep_pool = [1024] * 4
+    return config
+
+
+def _acl_memory_api(platform: str, runtime: str):
+    """ctypes handles for the caller-side device memory this test owns.
+
+    The device bind and the stream come from the nanobind ``_acl_*`` helpers
+    above; allocation and copies have no such helper, so they are resolved off
+    the same host runtime library, whose CANN dependencies export them.
+    """
+    import ctypes  # noqa: PLC0415
+
+    from tests.ut.py.test_kernel_mode_c_api import _load  # noqa: PLC0415
+
+    lib = _load(platform, "onboard", runtime)
+    for symbol, argtypes in (
+        ("aclrtMalloc", [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_int]),
+        ("aclrtFree", [ctypes.c_void_p]),
+        ("aclrtMemcpy", [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]),
+        ("aclrtSynchronizeStreamWithTimeout", [ctypes.c_void_p, ctypes.c_int32]),
+    ):
+        function = getattr(lib, symbol)
+        function.argtypes = argtypes
+        function.restype = ctypes.c_int
+    return lib
+
+
+def _run_worker_eager_case(device_id: int, platform: str, queue) -> None:  # noqa: PLR0915 -- one linear caller script
+    """Subprocess body: drive init -> prepare -> launch -> close through Worker.
+
+    The Worker twin of ``test_kernel_mode_c_api``'s eager values case. There the
+    caller is ctypes against the C ABI; here it is the public L2 Worker, which
+    is what PyPTO holds. Everything outside simpler — device, stream, device
+    memory — still belongs to this test.
+    """
+    import ctypes  # noqa: PLC0415
+
+    result: dict[str, object] = {"case": "worker_eager", "stage": "start", "ok": False}
+    stream = 0
+    worker = None
+    allocations: list = []
+    lib = None
+    runtime = "tensormap_and_ringbuffer"
+    try:
+        import _task_interface as native  # noqa: PLC0415
+        from simpler.task_interface import ChipStorageTaskArgs, ChipTensor, DataType  # noqa: PLC0415
+
+        from tests.ut.py.test_kernel_mode_c_api import _build_eager_callable  # noqa: PLC0415
+
+        chip = _build_eager_callable(platform, runtime)
+        lib = _acl_memory_api(platform, runtime)
+
+        native._acl_bind_device(device_id)
+        stream = native._acl_create_stream()
+        result["stream_nonzero"] = bool(stream)
+        result["stage"] = "borrowed"
+
+        worker = _kernel_worker(platform, device_id=device_id, runtime=runtime)
+        worker.init(config=_kernel_context_config())
+        result["stage"] = "initialized"
+        result["kernel_supported"] = bool(worker.kernel_mode_supported)
+
+        # The program surface stays refused on a live kernel Worker.
+        try:
+            worker.submit(None)
+            result["submit_refused"] = False
+        except RuntimeError:
+            result["submit_refused"] = True
+
+        # Registration is pure: the same image registered twice mints two ids,
+        # and both have to launch.
+        first_id = worker.kernel_prepare_callable(chip)
+        second_id = worker.kernel_prepare_callable(chip)
+        result["ids"] = [int(first_id), int(second_id)]
+        result["ids_distinct"] = first_id != second_id
+        result["stage"] = "prepared"
+
+        count = 128 * 128
+        host_array = ctypes.c_float * count
+        nbytes = ctypes.sizeof(host_array)
+        rounds = []
+        args = ChipStorageTaskArgs()
+        for round_index, (callable_id, scalar) in enumerate(((first_id, 1.25), (second_id, -3.5))):
+            addresses = []
+            for _ in range(2):
+                address = ctypes.c_void_p()
+                assert lib.aclrtMalloc(ctypes.byref(address), nbytes, 0) == 0
+                allocations.append(address)
+                addresses.append(address)
+            source, destination = addresses
+            values = [float(i % 127 + round_index * 257) for i in range(count)]
+            host_input = host_array(*values)
+            host_output = host_array(*([-999.0] * count))
+            assert lib.aclrtMemcpy(source, nbytes, host_input, nbytes, 1) == 0
+            assert lib.aclrtMemcpy(destination, nbytes, host_output, nbytes, 1) == 0
+
+            args.clear()
+            args.add_tensor(ChipTensor.make(source.value, (count,), DataType.FLOAT32, child_memory=True))
+            args.add_tensor(ChipTensor.make(destination.value, (count,), DataType.FLOAT32, child_memory=True))
+            args.add_scalar(ctypes.c_float(scalar))
+            worker.kernel_launch(callable_id, args, stream)
+            # Enqueue took the snapshot, so the host-side args are already spent.
+            args.clear()
+            assert lib.aclrtSynchronizeStreamWithTimeout(stream, 60000) == 0
+            assert lib.aclrtMemcpy(host_output, nbytes, destination, nbytes, 2) == 0
+            expected = [value + scalar for value in values]
+            rounds.append(list(host_output) == expected)
+        result["rounds"] = rounds
+        result["stage"] = "launched"
+
+        worker.close()
+        result["stage"] = "closed"
+        # CLOSED is absorbing: it is what invalidates every id this context
+        # minted, in place of a generation field on the id itself.
+        try:
+            worker.kernel_launch(first_id, ChipStorageTaskArgs(), stream)
+            result["launch_after_close_refused"] = False
+        except RuntimeError:
+            result["launch_after_close_refused"] = True
+        worker = None
+
+        result["ok"] = (
+            bool(result["kernel_supported"])
+            and result["submit_refused"] is True
+            and result["ids_distinct"] is True
+            and all(rounds)
+            and len(rounds) == 2
+            and result["launch_after_close_refused"] is True
+        )
+        result["stage"] = "done"
+    except BaseException as exc:  # noqa: BLE001
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        result["traceback"] = traceback.format_exc()
+    finally:
+        if worker is not None:
+            try:
+                worker.close()
+            except BaseException as exc:  # noqa: BLE001
+                result["close_error"] = f"{type(exc).__name__}: {exc}"
+                result["ok"] = False
+        if lib is not None:
+            for address in allocations:
+                lib.aclrtFree(address)
+        # Destroying the caller's stream after close() is the evidence that
+        # neither the Worker nor its teardown reset the device or finalized ACL.
+        if stream:
+            try:
+                import _task_interface as native  # noqa: PLC0415
+
+                native._acl_destroy_stream(stream)
+                result["stream_destroyed"] = True
+            except BaseException as exc:  # noqa: BLE001
+                result["stream_destroyed"] = False
+                result["stream_teardown_error"] = f"{type(exc).__name__}: {exc}"
+                result["ok"] = False
+        queue.put(result)
+
+
+@pytest.mark.requires_hardware
+@pytest.mark.platforms(["a2a3"])
+@pytest.mark.device_count(1)
+@pytest.mark.runtime("tensormap_and_ringbuffer")
+def test_worker_kernel_mode_eager_end_to_end(st_platform, st_device_ids):
+    """The full public path — Worker init, prepare, launch, close — on silicon."""
+    assert st_device_ids, "device_count(1) fixture must yield at least one id"
+    ctx = mp.get_context("fork")
+    queue = ctx.Queue()
+    proc = ctx.Process(target=_run_worker_eager_case, args=(int(st_device_ids[0]), st_platform, queue))
+    proc.start()
+    proc.join(timeout=900)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(timeout=10)
+        if proc.is_alive():
+            proc.kill()
+            proc.join()
+        pytest.fail("worker_eager did not exit within 900s")
+    assert not queue.empty(), f"worker_eager produced no result (exitcode={proc.exitcode})"
+    result = queue.get()
+    assert result["ok"], f"worker_eager failed: {result}"
+    assert result.get("stream_destroyed") is True, f"the caller's stream did not survive the Worker: {result}"

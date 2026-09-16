@@ -18,7 +18,7 @@ kernel 模式下，simpler 是一个被调用的库：它借用调用方已经�
 `tests/ut/py/test_kernel_mode_c_api.py` 里的
 `test_kernel_eager_launch_executes_fresh_tensor_and_scalar_snapshots`。它用 ctypes
 直接调用 host runtime 动态库，自己扮演调用方，不经过 PyTorch，也不经过 simpler
-的 Python Worker。
+的 Python Worker。走 Worker 的同一个算子见 §4.1。
 
 被执行的算子是一个 AIV 向量加标量，`y[i] = x[i] + scalar`：
 
@@ -80,6 +80,33 @@ simpler 没有调用过它们。
 
 init 期间的执行体加载和 prepare 期间的 callable 注册，会同步上下文自己的 AICPU
 stream。launch 路径不同步任何 stream。
+
+## 4.1 Python 侧的 Worker 入口
+
+上面四个是 C 入口。Python 侧对应的公开对象是 L2 `Worker`，构造时用
+`execution_mode` 选定分派面，之后只读：
+
+```python
+worker = Worker(level=2, execution_mode="kernel", device_id=d,
+                platform="a2a3", runtime="tensormap_and_ringbuffer")
+worker.init(config=cfg)                       # -> simpler_kernel_mode_init
+cid = worker.kernel_prepare_callable(chip)    # -> ..._prepare_callable，返回铸好的 id
+worker.kernel_launch(cid, args, stream)       # -> ..._launch，stream 每次显式传
+worker.close()                                # -> finalize_device
+```
+
+`config` 是 context 固定配置，kernel 模式必填、program 模式拒收；program 模式的
+`prewarm_config` 反之。init 与 prepare 都不收 stream，只有 launch 收，且不保存。
+两个分派面互斥：kernel 模式下 `register` / `submit` / `run` 被拒，program 模式下两个
+`kernel_*` 入口被拒，报错里点名构造时固定的模式。
+
+`kernel_prepare_callable` 是纯注册：同一个 callable 注册两次得到两个不同且都有效的
+id，没有去重也没有 lookup，容量按注册次数计。id 只在本 context 内有效、成功过的不
+复用，`close()` 之后整体失效——这三条合起来取代了 id 上的 generation 字段。
+
+Worker 层的端到端用例是 `tests/ut/py/test_worker/test_kernel_mode_entry.py` 的
+`test_worker_kernel_mode_eager_end_to_end`：与第 2 节的 C API 用例同一个向量加标量
+算子，同样由测试自己持有设备、stream 和显存，区别只是经过 Worker 而不是 ctypes。
 
 prepare 之后，测试自己同步一次 caller stream 再读 committed memory。prepare 的设备侧
 注册错误由它自己的返回值报告，不依赖这次同步。
@@ -150,23 +177,38 @@ simpler 仍引用主机侧参数，本次执行会读到被清空的数据，结
 
 ## 8. 图模式验证到哪一步
 
-上面的数值用例是 eager 调用，不包含任何 `aclmdlRICapture` 调用。
+第 2 节的数值用例是 eager 调用，不包含任何 `aclmdlRICapture` 调用。图模式由两套
+测试覆盖，一套验证原语，一套验证公开入口。
 
-图模式只在独立探针 `tests/st/a2a3/kernel_capture/` 中验证过：
+**独立探针 `tests/st/a2a3/kernel_capture/`** 验证三流五事件原语本身：
 
 1. 在一条 warmup stream 上 eager 执行一遍。
 2. 在 caller stream 上 `aclmdlRICaptureBegin`，执行同一串操作，`aclmdlRICaptureEnd` 得到图。
 3. `aclmdlRIExecuteAsync` 回放 100 次，每次更换输入数据并校验结果，证明回放时内部 kernel 确实重新执行。
 4. 用链接器 `--wrap` 拦截 `rtStreamAddToModel`、`rtStreamGetCaptureInfo`、`aclmdlRICaptureGetInfo`，断言调用次数为零。
 
-该探针不经过公开的四个入口。它直接构造执行状态对象，自行加载 AICPU 执行体，
-手写 record / wait 序列，使用测试专用的小 kernel，不经过 TMR runtime，也不经过
-launch owner 与 binder。
+它直接构造执行状态对象，自行加载 AICPU 执行体，手写 record / wait 序列，使用
+测试专用的小 kernel，不经过 TMR runtime，也不经过 launch owner 与 binder。
 
-因此两件事是分开验证的：三流五事件原语能被 ACLGraph 正确 capture 与回放；公开
-launch 路径能在 eager 下算对。在 capture 窗口内调用 `simpler_kernel_mode_launch`
-并回放，目前还没有验证。补充方式是在现有 eager 用例上增加一段：在 capture 窗口内
-调用一次 launch，得到图后改写同一块输入显存，回放若干次并比对输出。
+**场景测试 `tests/st/a2a3/tensormap_and_ringbuffer/kernel_mode_capture/`** 走的是
+公开入口：24 个场景在 `aclmdlRICaptureBegin` / `End` 之间调用
+`simpler_kernel_mode_launch`，取到图后改写输入显存再 `aclmdlRIExecuteAsync` 回放并
+比对输出，覆盖冷图、热图、多 callable、跨 stream、重建图、长链、DAG 以及 eager 侧
+的批量与拒绝路径。
+
+这套测试用 `LD_PRELOAD` 挂一个观察层（`kernel_capture_observer.cpp` +
+`prepare_gate.cpp`，编译成 `observer.so`），按名字截获 CANN 与 runtime 符号，做三件事：
+
+| 职责 | 手段 |
+| ---- | ---- |
+| 断言 simpler 不做什么 | 截获四个同步入口与 `aclrtQueryEventStatus`，按作用域判定：launch 作用域内**任何**同步都被拒绝并计数（入队路径不得含等待，否则图里装不下）；注册作用域内只拒绝**调用方自己的 stream**，上下文私有 AICPU stream 的那次同步照常放行 |
+| 观察它做了什么 | 截获 `rtKernelLaunchWithHandleV2`（AICore）与 `rtsLaunchCpuKernel`（AICPU），解包校验 binding 地址与常驻 `KernelArgs` 在多次调用间不变、两侧 launch 成对；另计 event wait / record 与 `aclrtMemsetAsync` 次数，给出事件拓扑 |
+| 注入故障 | `capture_observer_fail_prepare` 让 AICPU 注册 launch 返回 -4333；`prepare_gate.cpp` 用 `aclrtLaunchCallback(ACL_CALLBACK_BLOCK)` 在 AICPU stream 上插一个阻塞回调，供 `blocked_same` / `stream_busy` 制造"前一次 launch 的 serial tail 未完成"的状态 |
+
+注册作用域与 launch 作用域必须分开：注册**会**同步上下文自己的 AICPU stream（见
+第 4 节），那次等待正是设备侧注册失败能成为 `prepare_callable` 自身返回值的原因。
+阻塞门也随之挂在 launch 上而不是注册上——注册返回时它已经完成，没有"注册尚未完成"
+的窗口可言。
 
 ## 9. 并入主线时的接口裁决
 

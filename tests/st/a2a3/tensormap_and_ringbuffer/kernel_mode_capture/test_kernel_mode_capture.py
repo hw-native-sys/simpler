@@ -201,6 +201,10 @@ def _bind_observer_guards(observer):
         function.restype = None if name in ("arm", "release") else ctypes.c_int
     observer.capture_observer_guard_sync.argtypes = [ctypes.c_int]
     observer.capture_observer_guard_sync.restype = None
+    observer.capture_observer_prepare_scope.argtypes = [ctypes.c_int]
+    observer.capture_observer_prepare_scope.restype = None
+    observer.capture_observer_caller_streams.argtypes = [ctypes.c_uint64, ctypes.c_uint64]
+    observer.capture_observer_caller_streams.restype = None
     observer.capture_observer_invocation_scope.argtypes = [ctypes.c_int]
     observer.capture_observer_invocation_scope.restype = None
     observer.capture_observer_sync_calls.argtypes = []
@@ -209,6 +213,8 @@ def _bind_observer_guards(observer):
     observer.capture_observer_override_query.restype = None
     observer.capture_observer_fail_prepare.argtypes = [ctypes.c_int]
     observer.capture_observer_fail_prepare.restype = None
+    observer.capture_observer_caller_syncs.argtypes = []
+    observer.capture_observer_caller_syncs.restype = ctypes.c_uint64
     for name in ("query_calls", "total_queries", "waits", "records", "clears", "prepare_failures"):
         function = getattr(observer, "capture_observer_" + name)
         function.argtypes = []
@@ -321,6 +327,7 @@ def _initialize(device, scenario, build_dir):
     )
     observer = _bind_capture_functions(lib)
     _bind_observer_guards(observer)
+    observer.capture_observer_caller_streams(streams[0].value or 0, streams[1].value or 0)
     return chips, lib, streams, caller, ctx, observer
 
 
@@ -328,17 +335,21 @@ def _prepare_initial(scenario, observer, prepare, launch):
     from tests.st.a2a3.tensormap_and_ringbuffer.kernel_mode_capture.kernel_capture_values import _check  # noqa: PLC0415
 
     blocked = scenario == "blocked_same"
-    if blocked:
-        observer.capture_gate_arm()
     prepare(0)
     if blocked:
+        # The gate holds the first launch's AICPU work, so its serial tail stays
+        # incomplete. A second launch on that same caller stream is ordered by
+        # the stream's own FIFO, so it neither queries the tail nor waits for it
+        # — the query belongs to the different-stream path alone.
+        observer.capture_gate_arm()
+        launch(0)
         assert observer.capture_gate_blocked() == 1
         before = observer.capture_observer_total_queries()
         launch(0)
         assert observer.capture_observer_total_queries() == before
-        assert observer.capture_gate_blocked() == 1, "launch waited for blocked prepare"
+        assert observer.capture_gate_blocked() == 1, "a same-stream launch waited for the one before it"
         observer.capture_gate_release()
-        _check(observer.capture_gate_finish(), "finish prepare gate")
+        _check(observer.capture_gate_finish(), "finish launch gate")
     return blocked
 
 
@@ -363,20 +374,20 @@ def _configure(context, scenario, prepare, launch, sync, io, pairs, initial):
     from tests.st.a2a3.tensormap_and_ringbuffer.kernel_mode_capture.kernel_capture_values import _check  # noqa: PLC0415
 
     lib, observer, streams, caller = context.lib, context.observer, context.streams, context.caller
-    if scenario == "stream_busy":
-        observer.capture_gate_arm()
     if _prepare_initial(scenario, observer, prepare, launch):
         sync(caller)
         io.verify(pairs[0][1], [value + 1.25 for value in initial])
     if scenario in ("multi_callable", "eager_multi_callable"):
         prepare(1)
-    if scenario not in ("cold_unsynced", "stream_busy"):
+    if scenario != "cold_unsynced":
         _check(lib.aclrtSynchronizeDevice(), "external preparation drain")
     if scenario == "cross_stream":
         launch(0)
         sync(caller)
         caller = streams[1]
     if scenario in ("stream_query_error", "stream_busy"):
+        if scenario == "stream_busy":
+            observer.capture_gate_arm()
         launch(0, stream=caller)
         if scenario == "stream_query_error":
             sync(caller)
@@ -438,13 +449,37 @@ def _execute_eager(context, scenario, guarded, io, launch, sync, pairs, initial,
 
 
 def _guarded(observer, operation, *arguments, expected=0):
+    """Run one launch with every synchronize refused.
+
+    Launch is pure enqueue: a wait inside it is what an ACLGraph capture cannot
+    contain, so the observer refuses each one rather than only counting it —
+    a refusal surfaces as the operation's own status instead of a later hang.
+    """
     observer.capture_observer_guard_sync(1)
     try:
         result = operation(*arguments)
     finally:
         observer.capture_observer_guard_sync(0)
-    assert observer.capture_observer_sync_calls() == 0, "prepare/launch performed an internal sync"
+    assert observer.capture_observer_sync_calls() == 0, "launch performed an internal sync"
     assert result == expected, f"guarded native operation rc={result}, expected={expected}"
+
+
+def _prepared(observer, operation, *arguments, expected=0):
+    """Run one registration with the caller's streams off limits.
+
+    Registration synchronizes the context's own AICPU stream, and that wait is
+    what makes a device-side registration failure this call's own status. What
+    it must never touch is a stream the caller owns, so only those are refused;
+    the context's own sync reaches CANN. The scope also arms the registration
+    fault injection and the capture gate, which apply to this call alone.
+    """
+    observer.capture_observer_prepare_scope(1)
+    try:
+        result = operation(*arguments)
+    finally:
+        observer.capture_observer_prepare_scope(0)
+    assert observer.capture_observer_caller_syncs() == 0, "prepare synchronized a caller stream"
+    assert result == expected, f"prepared native operation rc={result}, expected={expected}"
 
 
 def _replay(context, graph, stream=None):
@@ -481,11 +516,12 @@ def _run(device, scenario, build_dir):
     callable_ids = {}
 
     guarded = partial(_guarded, observer)
+    prepared = partial(_prepared, observer)
 
     def prepare(cid, expected=0):
         chip = chips[cid]
         minted = ctypes.c_int32(99)
-        guarded(
+        prepared(
             lib.simpler_kernel_mode_prepare_callable,
             ctx,
             chip.buffer_ptr(),

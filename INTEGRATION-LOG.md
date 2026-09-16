@@ -899,3 +899,126 @@ artifact of its own stub platform:
 
 **Affects.** #2185 (the remainder of its refreshed head adopted); D15 (its
 deferral of this PR closed).
+
+---
+
+## D21 - The L2 Worker owns the mode; init and close are shared, dispatch is not
+
+**Problem.** The target call-flow document names one runtime entry object for
+PyPTO — `simpler.worker.Worker(level=2, execution_mode="kernel")` — and lists
+its construction identity plus `init` / `prepare` / `launch` / `close` dispatch
+as the one simpler deliverable still marked 🔧. This line had only the
+`ChipWorker` surface: the native wrapper, one layer below the object PyPTO
+holds. Every kernel test drove `ChipWorker` or the C ABI directly, so nothing
+established that the public path exists at all.
+
+**Finding.** Three shapes are decided together, and the argument for each is
+that the alternative reintroduces something the design already removed.
+
+**Choice.**
+
+1. **The mode is fixed at construction, not chosen at `init`.** `Worker(level=2,
+   execution_mode="kernel")`; `program` is the default and every existing caller
+   keeps its meaning. A mode argument on `init` would make the two surfaces
+   reachable on one object before it, so `register()` on a not-yet-initialized
+   Worker could not say which surface it belongs to. Fixing it at construction
+   makes every refusal resolve from the constructor, before any device exists —
+   which is also what makes the mode contract testable without hardware.
+2. **`init` and `close` are shared; dispatch is not.** `init(config=...)` and
+   `close()` are one call in both modes, which is the unified init the document
+   asks for.
+   The dispatch surfaces stay disjoint and refuse each other by name:
+   `register` / `unregister` / `submit` / `run` are program-only,
+   `kernel_prepare_callable` / `kernel_launch` are kernel-only. Native refuses
+   the crossing too — the program entries bounds-check a kernel context's empty
+   slot storage, and the device context latches one mode write-once — so the
+   Python guard adds a diagnosis, not a safety property.
+3. **The kernel context's `CallConfig` is a new `config=` parameter, not
+   `prewarm_config`.** They are not the same object wearing two names:
+   `prewarm_config` is an optional ring-sizing hint for a later `run`, and the
+   kernel one is the context's required, immutable sizing, with no later `run`
+   to hint at. Each is refused in the other's mode rather than silently
+   ignored, because an ignored sizing config is exactly the failure that a
+   context fixed at init cannot report later.
+4. **Kernel mode is level 2 only.** L3+ forks a chip child per device, and a
+   forked child cannot inherit the borrowed device and stream the caller holds.
+   `level != 2` with `execution_mode="kernel"` is refused at construction.
+5. **`kernel_mode_supported` reports capability, not mode.** It answers for the
+   runtime the chip context bound — false before init, after a failed init,
+   after close, and on any L3+ Worker, which binds none of its own. A
+   program-mode L2 Worker answers for its runtime, exactly as `ChipWorker`
+   does.
+
+**Reason.** The Worker layer adds no mechanism: `init` reaches
+`ChipWorker.kernel_init`, `close` already finalizes the chip worker through the
+`CleanupJournal`, whose retry is what covers a failed kernel teardown, and
+prepare and launch forward under the same READY lease every other live-tree call
+takes. What it adds is the identity the three-party contract is written to, and
+the guarantee that a Worker constructed for one surface cannot reach the other.
+
+**Boundary.** `tests/ut/py/test_worker/test_kernel_mode_entry.py` now drives the
+public path end to end on a2a3 — init, two registrations of one image, two
+launches with different addresses and scalars, numeric verification, close, and
+a launch after close that the CLOSED state refuses. The capture boundary is
+unchanged by this entry: no test drives `Worker.kernel_launch` inside a captured
+graph, so D16's note stands.
+
+**Affects.** The target call-flow document's 🔧 row for the L2 Worker
+construction identity and lifecycle dispatch; D16 (its prepare/launch contract
+is what this surface exposes).
+
+---
+
+## D22 - Registration may synchronize; only the launch scope forbids every wait
+
+**Problem.** `tests/st/a2a3/tensormap_and_ringbuffer/kernel_mode_capture` failed
+23 of its 24 scenarios on a2a3, every one on the same assertion:
+`prepare/launch performed an internal sync`. D19 routed kernel
+`prepare_callable` through `register_callable_on_device`, which synchronizes the
+context's AICPU stream so a device-side registration failure is
+`prepare_callable`'s own status. The scene test's `_guarded` armed the
+observer's `forbid_sync` around registration as well as launch, and the observer
+does not merely count a forbidden sync — it refuses it, returning -4331. The two
+cannot both stand. #2245 merged at 12:09 and #2242 at 12:16 the same day, so the
+latter's checks ran against a base without the wait, and this base branch runs
+only the `build` check.
+
+**Choice.** D19's wait stays. The test's expectation is the half that was
+written against a contract that had already changed.
+
+1. **Two scopes, not one.** `capture_observer_guard_sync` keeps its meaning for
+   launch: every synchronize is refused, because launch is pure enqueue and a
+   wait there is what a captured graph cannot contain. A new
+   `capture_observer_prepare_scope` covers registration and refuses only the
+   *caller's* streams, which the test registers up front; the context's own
+   AICPU stream reaches CANN. A null stream counts as the caller's, since a
+   device-wide drain takes those streams with it.
+2. **`forbid_sync` stops doubling as a scope marker.** The registration fault
+   injection and the capture gate both keyed off `forbid_sync &&
+   !invocation_scope`, so simply not arming it around registration would have
+   disarmed them too — `prepare_fail_register` returned 0 where it expects
+   -4333. Both now key off `prepare_scope` directly.
+3. **The blocking gate moves from registration to launch.** It installed a
+   blocking callback ahead of the AICPU register launch, which a synchronous
+   registration now waits on: `prepare` returned only after the gate's own 10 s
+   timeout, and the scenarios that assert it is still blocked could not hold.
+   `capture_gate_install_if_armed` is called from the invocation scope instead,
+   ahead of that launch's AICPU work, so the first launch's serial tail stays
+   incomplete. `blocked_same` then asserts what remains true — a second launch
+   on the same caller stream neither queries the tail nor waits for it, since
+   the stream's own FIFO orders it and the query belongs to the
+   different-stream path — and `stream_busy` keeps its
+   `PREPARED_INCOMPATIBLE` coverage for the different-stream case.
+
+**Reason.** The property the scene test exists for is that a launch contains no
+wait, and that is untouched. Registration is not in a captured graph: it is the
+eager, out-of-capture step whose whole purpose is to have already happened
+before any launch a graph records. Asserting it performs no wait asserted
+something the design never promised, and the narrower assertion — that it never
+touches a stream the caller owns — is the one that protects a framework caller.
+
+**Boundary.** 24 of 24 scenarios pass on a2a3. `tests/st/a2a3/kernel_capture`
+is unchanged and still passes. No native source changed.
+
+**Affects.** #2242 (its observer and two of its scenarios); #2245 and D19 (their
+wait confirmed as the contract).
