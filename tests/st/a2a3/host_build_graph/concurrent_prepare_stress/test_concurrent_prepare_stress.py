@@ -21,7 +21,7 @@ orchestrator) would corrupt a result and fail the golden check. The point is to
 exercise the concurrent-prepare bind path under many alternating-bank
 iterations, not to measure anything.
 
-Three arms drive the same pipeline through :meth:`_drive_pipeline` and read the
+Four arms drive the same pipeline through :meth:`_drive_pipeline` and read the
 same ``assert_native_overlap`` verdict, so each negative arm differs from the
 positive one in exactly one variable:
 
@@ -32,15 +32,22 @@ positive one in exactly one variable:
   the pipeline and the verdict (which spans are emitted, where their endpoints
   land, ``bind`` standing in for preparation, ``runner_run`` being a host wall
   span) could otherwise report an intersection independent of real concurrency.
-* ``inflight_limit=2`` with a diagnostics config — staging is off because
-  ``allow_prepared_successor`` folds in ``CallConfig::diagnostics_any()``, so the
-  lane admits one run at a time and the verdict must again be rejected. Of the
-  three inputs that can disable staging, this is the only one a submission can
-  reach: the other two are the runtime's contract depth and its capability
-  symbol, both compile-time properties of the runtime.
+* ``inflight_limit=2`` with a diagnostics config — overlap is required here too.
+  A collector's pools and per-run state are built and reset under the execution
+  claim, so a diagnostic flag no longer keeps a run and its successor on
+  separate device windows.
+* ``inflight_limit=2`` at chip-swimlane level 4 — overlap is required here too.
+  Its bind records host-orchestration phase state, which cannot move under the
+  claim without losing its meaning, so it is held per pipeline slot and
+  published to the resident collector at launch.
+
+The last two are what hold that open. It is invisible from goldens: the lane
+declines to stage silently rather than raising, so a run that lost its overlap
+looks identical from outside.
 """
 
 import contextlib
+import pathlib
 import tempfile
 
 import pytest
@@ -182,7 +189,7 @@ class TestConcurrentPrepareStressHbg(SceneTestCase):
         # Distinct per-iteration data → a corrupted/aliased bank fails this.
         _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
-    def _drive_pipeline(self, chip_worker, callable_id, orch_sig, config, iters, inflight_limit):
+    def _drive_pipeline(self, chip_worker, callable_id, orch_sig, config, iters, inflight_limit, config_for=None):
         """Submit ``iters`` runs, never letting more than ``inflight_limit`` coexist.
 
         The direct-chip lane is the sole admission authority and follows the
@@ -193,10 +200,15 @@ class TestConcurrentPrepareStressHbg(SceneTestCase):
         against the other bank, i.e. the overlaps_active_run path. At
         ``inflight_limit=1`` every run reaches terminal before the next is
         submitted, so no bind can coexist with a device window.
+
+        ``config_for`` gives each iteration its own config, which is what lets a
+        caller send every run's artifacts to a different directory and so read
+        back what each one produced rather than only the last.
         """
         inflight = []
         for iteration in range(iters):
-            inflight.append(self._submit_iteration(chip_worker, callable_id, orch_sig, config, iteration))
+            run_config = config_for(iteration) if config_for is not None else config
+            inflight.append(self._submit_iteration(chip_worker, callable_id, orch_sig, run_config, iteration))
             if len(inflight) >= inflight_limit:
                 self._retire(inflight.pop(0))
         while inflight:
@@ -261,33 +273,24 @@ class TestConcurrentPrepareStressHbg(SceneTestCase):
         with pytest.raises(NativeOverlapError, match="did not overlap"):
             assert_native_overlap(parse_spans(captured.splitlines()))
 
-    def test_diagnostics_config_serializes_the_native_lane(self, st_platform, st_worker, capfd, drain_host_log):
-        """A diagnostic flag turns staging off, and the log must then be rejected.
+    def test_diagnostics_config_still_overlaps_the_native_lane(self, st_platform, st_worker, capfd, drain_host_log):
+        """A diagnostic flag does not serialize the lane, and the log must overlap.
 
-        ``allow_prepared_successor`` folds in ``CallConfig::diagnostics_any()`` —
-        the OR of all five diagnostic flags — because a collector's setup mutates
-        runner-global state that is not yet per-epoch, so two overlapping runs
-        would tread on each other. Any one flag therefore keeps a run and its
-        successor on separate device windows even at depth 2.
+        ``allow_prepared_successor`` used to fold in ``CallConfig::diagnostics_any()``
+        — the OR of all five diagnostic flags — because a collector's setup wrote
+        runner-global state during preparation, which a prepared successor would
+        have done while its predecessor was still running against it. The pools
+        and that per-run state are now built and reset by
+        ``arm_collectors_for_run()`` under the execution claim, so the successor's
+        preparation touches neither and the configuration overlaps like any other.
 
-        Unlike the depth and capability inputs, this one is reachable from a
-        submission, which is what makes it the literal control for "staging
-        disabled". The lane's own check is the polite one: it declines to stage
-        rather than raising, so the submissions still succeed and the goldens
-        still pass and nothing else in the suite would notice.
+        This arm is the only thing holding that open. The property is invisible
+        from goldens — the lane declines to stage silently rather than raising, so
+        a regression would let every diagnostic run fall back to depth one with
+        the whole suite still green.
 
         Host spans are gated separately (compile-time ``SIMPLER_HOST_STRACE``),
         so the trace still comes out with device diagnostics on.
-
-        **This arm retires with the fallback it covers.** The serialization is
-        temporary by design — ``concurrent_native_prepare_supported_impl`` in
-        ``runtime_maker.cpp`` keeps collector-bearing configurations sequential
-        only *until their state is per-epoch*. Once it is and
-        ``diagnostics_any()`` leaves ``allow_prepared_successor``, a diagnostic
-        config will overlap like any other and this arm turns red with the same
-        ``did not overlap`` it currently demands. The fix at that point is to
-        delete this test, not to restore the serialization: its value and its
-        lifetime come from the same place, the fallback being silent.
         """
         if st_platform != "a2a3":
             pytest.skip("concurrent native prepare / two-bank pipeline is an a2a3 onboard path")
@@ -297,7 +300,7 @@ class TestConcurrentPrepareStressHbg(SceneTestCase):
         chip_worker = self._chip_worker(st_worker)
         callable_id = _ARM_CALLABLE_ID
 
-        with tempfile.TemporaryDirectory(prefix="simpler-serialized-lane-") as output_dir:
+        with tempfile.TemporaryDirectory(prefix="simpler-diagnostics-lane-") as output_dir:
             # scope_stats is the lightest of the five flags; which one is set does
             # not matter, only that diagnostics_any() becomes true. output_prefix
             # is required by CallConfig::validate() whenever one of them is.
@@ -307,5 +310,63 @@ class TestConcurrentPrepareStressHbg(SceneTestCase):
                 self._drive_pipeline(chip_worker, callable_id, orch_sig, config, _CONTROL_ITERS, inflight_limit=2)
                 captured = drain_host_log(capfd)
 
-        with pytest.raises(NativeOverlapError, match="did not overlap"):
-            assert_native_overlap(parse_spans(captured.splitlines()))
+        assert_native_overlap(parse_spans(captured.splitlines()))
+
+    def test_orch_phase_swimlane_overlaps_the_native_lane(self, st_platform, st_worker, capfd, drain_host_log):
+        """Level-4 swimlane overlaps too, now that its phase state is per-run.
+
+        A host-orchestrating bind records phase events and samples a
+        ``HostOrchestrationBegin`` clock anchor, and neither can move under the
+        execution claim: the records describe the bind, and the anchor means the
+        instant host orchestration began. They are held per pipeline slot
+        instead, and everything destined for the resident swimlane collector is
+        published from the launch arming — so a successor's bind writes its own
+        state rather than resetting the predecessor's.
+
+        This arm previously required the opposite verdict, which is what made
+        the exclusion visible while it existed.
+
+        Overlap alone would not detect a regression here: collapsing the state
+        back to one store still overlaps, it just loses a run's records. So the
+        arm also gives every iteration its own output directory and requires
+        each one's swimlane artifact to carry ``orchestrator_source: host``.
+        That marker is written only when the run's own host-phase records
+        reached the collector, so a predecessor whose store a successor's bind
+        reset produces an artifact without it.
+        """
+        if st_platform != "a2a3":
+            pytest.skip("concurrent native prepare / two-bank pipeline is an a2a3 onboard path")
+
+        orch_sig = self.CALLABLE["orchestration"]["signature"]
+        callable_obj = self.build_callable(st_platform)
+        chip_worker = self._chip_worker(st_worker)
+        callable_id = _ARM_CALLABLE_ID
+
+        with tempfile.TemporaryDirectory(prefix="simpler-orch-phase-lane-") as output_root:
+            root = pathlib.Path(output_root)
+            run_dirs = [root / f"run{i}" for i in range(_CONTROL_ITERS)]
+            for run_dir in run_dirs:
+                run_dir.mkdir()
+
+            # 4 is ChipSwimlaneLevel::ORCH_PHASES, the only level whose bind
+            # records host-orchestration phase state at all.
+            def config_for(iteration):
+                return self._build_config({}, enable_chip_swimlane=4, output_prefix=str(run_dirs[iteration]))
+
+            with self._registered_callable(chip_worker, callable_id, callable_obj):
+                drain_host_log(capfd)
+                self._drive_pipeline(
+                    chip_worker, callable_id, orch_sig, None, _CONTROL_ITERS, inflight_limit=2, config_for=config_for
+                )
+                captured = drain_host_log(capfd)
+
+            for iteration, run_dir in enumerate(run_dirs):
+                artifact = run_dir / "chip_swimlane_records.json"
+                assert artifact.exists(), f"run {iteration}: {artifact} missing"
+                assert '"orchestrator_source": "host"' in artifact.read_text(), (
+                    f"run {iteration}: its host-orchestration phase records never reached the collector. "
+                    f"A successor's bind reset the store this run was still waiting to publish, which is "
+                    f"what per-pipeline-slot host-phase state exists to prevent."
+                )
+
+        assert_native_overlap(parse_spans(captured.splitlines()))

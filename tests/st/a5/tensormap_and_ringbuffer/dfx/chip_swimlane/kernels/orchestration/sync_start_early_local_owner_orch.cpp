@@ -120,7 +120,7 @@ static void submit_consumer(const simpler::tmr::Tensor &out, TaskId producer, in
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &orch_args) {
     const simpler::tmr::Tensor &output = orch_args.tensor(0).ref();
     const bool use_pending = orch_args.scalar(0) != 0;
-    const int16_t consumer_blocks = static_cast<int16_t>(orch_args.scalar(1));
+    const int16_t consumer_blocks = orch_args.scalar<int16_t>(1);
     const int32_t blocker_count = static_cast<int32_t>(rt_available_aiv_count());
 
     if (use_pending && (blocker_count <= 0 || blocker_count > BLOCKER_STATUS_CAPACITY || consumer_blocks <= 0 ||

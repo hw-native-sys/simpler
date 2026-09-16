@@ -112,7 +112,10 @@ ChipCallable.build(
 
 `ArgDirection` is `SCALAR`, `IN`, `OUT`, or `INOUT`. The signature list is
 positional and defines the task-arg order. `func_id` must match the id the
-orchestration submits. `ChipCallable` exposes `binary_size`.
+orchestration submits. `ChipCallable` exposes `binary_size` and
+`scalar_count`. `scalar_count` counts the signature's `SCALAR` entries,
+including for callables loaded from cached bytes. The tensor count is
+`sig_count - scalar_count`.
 
 Public `Worker` calls use `TaskArgs` containing address-free `Tensor` views at
 every level. The L2 leaf resolves those views into the internal

@@ -56,12 +56,15 @@ class TestVectorExample(SceneTestCase):
         },
     ]
 
+    CASES += [{**CASES[0], "name": "child_memory", "params": {"child_memory": True}}]
+
     def generate_args(self, params):
+        child_memory = params.get("child_memory", False)
         SIZE = 128 * 128
         return TaskArgsBuilder(
-            TensorArg("a", torch.full((SIZE,), 2.0, dtype=torch.float32)),
-            TensorArg("b", torch.full((SIZE,), 3.0, dtype=torch.float32)),
-            TensorArg("f", torch.zeros(SIZE, dtype=torch.float32)),
+            TensorArg("a", torch.full((SIZE,), 2.0, dtype=torch.float32), child_memory=child_memory),
+            TensorArg("b", torch.full((SIZE,), 3.0, dtype=torch.float32), child_memory=child_memory),
+            TensorArg("f", torch.zeros(SIZE, dtype=torch.float32), child_memory=child_memory),
         )
 
     def compute_golden(self, args, params):

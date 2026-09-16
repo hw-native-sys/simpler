@@ -29,10 +29,11 @@ TensorMap producers.
 
 ## API
 
-A Graph uses `CoreTaskArgs`, the existing incore argument type:
+A Graph boundary uses `GraphTaskArgs`; an in-graph task's arguments use
+`CoreTaskArgs`, the existing incore argument type:
 
 ```cpp
-void graph_function(const CoreTaskArgs &args, int variant) {
+void graph_function(const GraphTaskArgs &args, int variant) {
     const ChipTensor &input = args.tensor(0).ref();
     const ChipTensor &weight = args.tensor(1).ref();
     const ChipTensor &output = args.tensor(2).ref();
@@ -45,7 +46,7 @@ void graph_function(const CoreTaskArgs &args, int variant) {
     CoreTaskArgs matmul_args;
     matmul_args.add_input(input, weight);
     matmul_args.add_output(intermediate);
-    matmul_args.copy_scalars_from(args, 0, 1);  // current invocation's value
+    matmul_args.add_scalar(args.scalar(0));  // forwarded boundary parameter
     TaskOutputTensors matmul = rt_submit_aic_task(
         variant == 0 ? FUNC_MATMUL : FUNC_MATMUL_TRANSPOSED,
         matmul_args
@@ -57,7 +58,7 @@ void graph_function(const CoreTaskArgs &args, int variant) {
     rt_submit_aiv_task(FUNC_ACTIVATION, activation_args);
 }
 
-void submit_layer(const CoreTaskArgs &args) {
+void submit_layer(const GraphTaskArgs &args) {
     rt_submit_graph(&graph_function, args, /*variant=*/0);
 }
 ```
@@ -65,7 +66,7 @@ void submit_layer(const CoreTaskArgs &args) {
 The function pointer is the default Graph identity. Trailing integral,
 `float`, `double`, and `bool` construction parameters are forwarded to the
 Graph function and hashed by value into the cache key. They are separate from
-execution scalars in `CoreTaskArgs`: changing a construction parameter selects a
+execution scalars in `GraphTaskArgs`: changing a construction parameter selects a
 different Definition rather than patching an existing one.
 
 An explicit identity is available for call sites that need a stable name:
@@ -85,28 +86,76 @@ Graph function pointer from the cache identity so the key remains stable; using
 the same key for different functions can select the wrong recorded topology.
 
 There are no public `GraphArgs`, `GraphBindings`, `Patch`, or `ScalarRef`
-types. The boundary is represented by `CoreTaskArgs`.
+types. The boundary is represented by `GraphTaskArgs`, which a Graph function
+receives as `const GraphTaskArgs &`. It is sized independently of
+`CoreTaskArgs`, and forwarding a boundary scalar into a task's `CoreTaskArgs`
+crosses those two capacities without either naming the other: what
+`args.scalar(i)` hands out identifies a parameter, not the `Arg` holding it.
 
-Boundary scalars are pass-through bindings. Forward them directly with
-`task_args.add_scalar(args.scalar(i))` or `copy_scalars_from(args, i, count)`
-so recording can retain their source indices.
+Boundary scalars are formal parameters. `args.scalar(i)` answers parameter `i`
+itself rather than its value, so forwarding it —
+`task_args.add_scalar(args.scalar(i))` — makes the destination slot follow that
+parameter on every replay. A slot names the parameter it came from, not the
+`Arg` it was copied through, so provenance survives any number of intermediate
+copies.
 
-Ordinary C++ value transformations do not retain boundary provenance. Both
-`task_args.add_scalar(args.scalar(i) + 1)` and copying `args.scalar(i)` into a
-local arithmetic variable before calling `add_scalar` produce an ordinary
-static in-graph task scalar. That value is stored in the Definition, and later cache
-hits reuse the first invocation's value without a warning. The runtime cannot
-distinguish such a derived value from an intentional static literal after the
-C++ expression has produced a plain arithmetic value. Compute the derived value
-before constructing the Graph boundary and pass it as another boundary scalar,
-perform the transformation in a kernel, or use a construction parameter when
-the value changes the Graph structure.
+Reading a parameter as a value freezes it, and the type system says so: an
+`InheritableScalar` has no conversion to a number, so `uint64_t v =
+args.scalar(i)` and `static_cast<int32_t>(args.scalar(i))` do not compile. A
+value read has to name the type it is reading — `args.scalar<T>(i)` — and what
+it produces is a plain `T`: the destination slot becomes static Definition data
+holding the recording invocation's number, and later cache hits replay that
+number. Forwarding never converts, which is what keeps a correct pass-through
+silent.
 
-Access through a non-const `scalar()` invalidates inherited boundary provenance
-conservatively, because returning a mutable reference cannot distinguish a read
-from a later write. A Graph containing such an invalidated binding is not
-cached, which prevents replay from silently replacing the transformed value
-with the unmodified boundary value.
+Because the diagnostic is the absence of a conversion rather than a
+deprecation, it has no blind spot. A value read inside third-party template
+code — `EXPECT_EQ(args.scalar(i), v)` is the case that motivated this — fails
+there too, where a `[[deprecated]]` attribute would have been suppressed for
+being instantiated inside a system header.
+
+When a value read is what you meant, say so with `args.scalar<T>(i)`. It
+applies `to_u64`'s actual inverse, which `static_cast` is not — a float slot
+holds a bit pattern, so `static_cast<float>` of `1.0f`'s pattern yields
+`1065353216.0`. An enum has no other spelling at all:
+`static_cast<DataType>(args.scalar(i))` does not compile, because the handle
+converts to nothing and `static_cast` has no conversion to apply.
+`InheritableScalar::to<T>()` is the same read on a handle already in hand —
+reach for it when the parameter arrived as a function argument and the `Arg` it
+came from is no longer reachable.
+
+Freezing on purpose has a second spelling, and the two do different things.
+`args.scalar<T>(i)` hands the body a `T` to compute with, and whatever the
+body does with it afterwards is ordinary host code.
+`task_args.add_static_scalar(args.scalar(i))` instead forwards the parameter
+into a slot and drops its origin: the slot carries the same bit pattern a
+forward would have, but is recorded as static Definition data rather than
+following the parameter. Reach for the first when the body needs the number, the
+second when a destination — typically a nested Graph's boundary — should hold
+the value the enclosing parameter had at record time.
+
+A derived value freezes the same way, and needs the same explicit read:
+`args.scalar(i) + 1` does not compile, `args.scalar<uint64_t>(i) + 1` does and
+is frozen. Compute it before constructing the boundary and pass it as its own
+parameter, perform the transformation in a kernel, or use a construction
+parameter when the value changes the Graph's structure.
+
+Boundary scalar slots are read-only: `scalar()` hands out the parameter, not a
+mutable reference, so a binding cannot be overwritten after it is forwarded.
+
+**Only a parameter of the Graph's own boundary is refreshed on replay.** The
+Definition's scalar source refs index that boundary and nothing else, so a slot
+that inherits anything else — a slot of some other `GraphTaskArgs`, or one built
+inside the body — is static Definition data holding the value it resolved to at
+record time. The runtime does not reject that; which slot a body inherits from
+is the author's declaration, and this is the declared consequence. Two notes on
+why it cannot be diagnosed instead:
+
+- An address cannot tell "created inside this body" from "created outside it".
+  The body's `Arg`s are stack locals while the boundary is pool storage, so
+  their relative addresses are a platform accident, not a guarantee.
+- Whether the outside slot's value changes between invocations is invisible
+  here. If it does, the Definition keeps replaying the recorded one.
 
 ## Supported dynamic and static data
 
@@ -143,11 +192,11 @@ path remains the defensive release-build behavior.
 
 ## Qwen decoder-layer example
 
-The upper layer packages all ChipTensor I/O in `CoreTaskArgs`; the wrapper has no
+The upper layer packages all ChipTensor I/O in `GraphTaskArgs`; the wrapper has no
 separate `hidden`, `weight`, or `output` parameters:
 
 ```cpp
-void qwen_decoder_layer(const CoreTaskArgs &args) {
+void qwen_decoder_layer(const GraphTaskArgs &args) {
     const ChipTensor &hidden = args.tensor(0).ref();
     const ChipTensor &attention_weight = args.tensor(1).ref();
     const ChipTensor &mlp_weight = args.tensor(2).ref();
@@ -161,7 +210,7 @@ void qwen_decoder_layer(const CoreTaskArgs &args) {
     CoreTaskArgs attention_args;
     attention_args.add_input(hidden, attention_weight);
     attention_args.add_output(attention_out);
-    attention_args.copy_scalars_from(args, 0, 1);  // dynamic token position
+    attention_args.add_scalar(args.scalar(0));  // dynamic token position
     TaskOutputTensors attention =
         rt_submit_aic_task(FUNC_ATTENTION, attention_args);
 
@@ -175,7 +224,7 @@ void qwen_decoder_layer(const CoreTaskArgs &args) {
     rt_submit_task(mlp, mlp_args);
 }
 
-void submit_qwen_decoder_layer(const CoreTaskArgs &args) {
+void submit_qwen_decoder_layer(const GraphTaskArgs &args) {
     rt_submit_graph(&qwen_decoder_layer, args);
 }
 
@@ -187,7 +236,7 @@ void decode_three_layers(
     const std::array<uint32_t, 3> &token_position
 ) {
     for (std::size_t layer = 0; layer < hidden.size(); ++layer) {
-        CoreTaskArgs args;
+        GraphTaskArgs args;
         args.add_input(
             hidden[layer],
             attention_weight[layer],
@@ -333,9 +382,13 @@ Definition. It contains:
   dispatchable shape and at least one internal producer; `ED_FLAG_TRACKED` when
   some candidate names it as a producer). A candidate's fanin CSR row is stored
   sorted by producer index, so its tail names its deepest producer; every other
-  row keeps record order. `bind_graph_topology` validates these flags but
-  nothing propagates them to a task slot, so they steer no dispatch yet — the
-  sorted row is the only part of the verdict the device acts on;
+  row keeps record order. `bind_graph_topology` validates these flags and
+  materialization replays them onto each task's slot, where the publish chain
+  reads them: a candidate registers on its producers' chains and pre-stages
+  once they have all published. The verdict covers non-root tasks only —
+  qualification needs a producer to bet on, and a body root has none inside the
+  body — so a root's verdict is not recorded here but decided at
+  materialization;
 - one packed-heap offset per in-graph task;
 - each in-graph task's ChipTensor source:
   `BOUNDARY_EXACT`, `BOUNDARY_VIEW`, `INTERNAL`, or `OWN_OUTPUT`;
@@ -462,6 +515,32 @@ dependency wiring remains an Orchestrator responsibility:
 - `WAKE_LIST_SENTINEL` closes the completion/registration race: a failed
   registration observes completion and immediately rescans.
 
+Early dispatch enters a body from two directions, and each is decided by a
+different party:
+
+- **Into the body.** The outer shell qualifies at submit, by the top-level rule
+  minus the terms that describe dispatching to cores: a shell carries no
+  predicate, has no resource shape and occupies no core, so its producers alone
+  decide it. A qualified shell that its producers release early does not stage
+  itself — it has nothing of its own to place — but stages the body's roots,
+  each an ordinary AICore task. They ring on the ordinary route, when the
+  shell's producers complete and `activate_graph_task` opens the external gate.
+  A Graph as a *producer* is the direction not supported: a shell publishes no
+  placement of its own for a consumer to bet on.
+- **A root's own verdict.** Materialization, not recording, decides it, and the
+  decision is three terms rather than the recorded conjunction: the shell must
+  itself be a candidate, since staging a root can only ever happen on a shell
+  release; and the root must be neither `DUMMY` (no dispatchable shape to index
+  a per-shape early-dispatch queue with) nor predicated (an early release
+  returns before the predicate test). Deciding it at materialization is what
+  keeps the flag off a slot a reader can already see.
+
+Which early-dispatch queue a released candidate enters is chosen by the task's
+own `sync_start` attribute, never by its cohort: a `sync_start` candidate needs
+an all-or-nothing stage and parks in the single shape-agnostic queue, every
+other candidate in its per-shape one. An in-graph task reaches that fork by the
+same path a top-level one does.
+
 The runtime wake-list registration is a transient polling subscription, not
 dependency discovery or Graph rewiring. Fanout CSR remains in the Definition
 as part of the complete recorded topology and for DFX, but readiness does not
@@ -508,7 +587,6 @@ builds:
   predicate's operand tensor;
 - a dispatch predicate whose operand is the predicated in-graph task's own output;
 - a dispatch predicate whose index vector leaves the operand tensor's extent;
-- a boundary-derived scalar accessed through mutable `scalar()`;
 - runtime allocation inside the Graph body;
 - more than 1024 in-graph tasks;
 - insufficient heap capacity while deferred shells are finalized.

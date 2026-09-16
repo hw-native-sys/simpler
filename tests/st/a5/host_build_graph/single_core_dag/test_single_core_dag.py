@@ -11,6 +11,7 @@
 
 import ctypes
 import json
+from collections import Counter
 
 import torch
 from simpler.task_interface import ArgDirection as D
@@ -132,13 +133,23 @@ class TestHbgSingleCoreDag(SceneTestCase):
             records = [record for stream in streams for record in stream["records"]]
             assert all(set(record) == record_fields for record in records)
             assert all(0 < record["start_cycles"] <= record["end_cycles"] for record in records)
-            required_kinds = {"bootstrap", "dispatch", "complete", "resolve", "idle"}
-            if case["params"]["graph_case"] != GRAPH_CASES["multi_root_64"][0]:
-                required_kinds.add("fanin")
+            required_kinds = {"bootstrap", "state_probe", "complete", "resolve", "idle"}
             emitted_kinds = {record["kind"] for record in records}
             assert required_kinds <= emitted_kinds, f"missing Scheduler kinds: {sorted(required_kinds - emitted_kinds)}"
             profiled_task_ids = {int(row[1]) for row in raw["aicore_tasks"]}
-            for kind in ("dispatch", "complete"):
+            launch_kinds = {"dispatch", "worksteal", "refill"}
+            launches_by_task = Counter(
+                int(record["task_id"])
+                for record in records
+                if record["kind"] in launch_kinds and record["task_id"] is not None
+            )
+            assert set(launches_by_task) == profiled_task_ids, (
+                "launch records do not cover every profiled task: "
+                f"missing={sorted(profiled_task_ids - set(launches_by_task))} "
+                f"unexpected={sorted(set(launches_by_task) - profiled_task_ids)}"
+            )
+            assert set(launches_by_task.values()) == {1}
+            for kind in ("state_probe", "complete"):
                 recorded_task_ids = {int(record["task_id"]) for record in records if record["kind"] == kind}
                 assert recorded_task_ids == profiled_task_ids, (
                     f"{kind} records do not cover every profiled task: "

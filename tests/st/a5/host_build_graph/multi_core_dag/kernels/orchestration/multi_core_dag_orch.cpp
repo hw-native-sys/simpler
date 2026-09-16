@@ -95,8 +95,8 @@ __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_c
 
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &args) {
     const simpler::hbg::Tensor &task_state = args.tensor(0).ref();
-    const int64_t graph_case = static_cast<int64_t>(args.scalar(0));
-    const int64_t task_count = static_cast<int64_t>(args.scalar(1));
+    const int64_t graph_case = args.scalar<int64_t>(0);
+    const int64_t task_count = args.scalar<int64_t>(1);
     if (task_count < 1 || task_count > kTaskCapacity) {
         rt_report_fatal(
             SIMPLER_ERROR_INVALID_ARGS, "task_count must be in [1, %d], got %ld", kTaskCapacity, task_count

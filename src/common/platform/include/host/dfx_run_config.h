@@ -45,6 +45,11 @@ struct DfxRunConfig {
     bool chip_swimlane_enabled() const { return chip_swimlane_level != ChipSwimlaneLevel::DISABLED; }
     bool dump_args_enabled() const { return dump_args_level != DumpArgsLevel::OFF; }
 
+    /** Mirrors CallConfig::diagnostics_any(), which likewise excludes the clock anchors. */
+    bool diagnostics_any() const {
+        return chip_swimlane_enabled() || dump_args_enabled() || pmu_enabled || dep_gen_enabled || scope_stats_enabled;
+    }
+
     static DfxRunConfig from(const CallConfig &config) {
         DfxRunConfig resolved;
         resolved.chip_swimlane_level = static_cast<ChipSwimlaneLevel>(config.enable_chip_swimlane);

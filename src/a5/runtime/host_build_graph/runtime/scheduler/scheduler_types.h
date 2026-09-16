@@ -668,6 +668,11 @@ enum class SchedulerReadySource : uint8_t {
     STOLEN = 1,
 };
 
+enum class SchedulerPublicationMode : uint8_t {
+    DISPATCH = 0,
+    REFILL = 1,
+};
+
 struct SchedulerIdleRecord {
     uint64_t start_time;
     uint64_t end_time;
@@ -916,14 +921,11 @@ struct alignas(128) SchedulerExecutorTaskTrace {
 // publication in the second line and owns the trailing trace payload.
 struct alignas(128) SchedulerDispatchSlot {
     int64_t task_id;
-    uint64_t ready_inbox_index;
-    uint64_t claim_start_cycles;
-    uint64_t claim_end_cycles;
-    uint64_t claim_worker_id;
+    uint64_t scheduler_metadata_reserved[4];
     uint16_t kernel_id;
     uint8_t subtask_slot;
     uint8_t has_fanin;
-    uint8_t ready_source;
+    uint8_t scheduler_metadata_byte_reserved;
     uint8_t pending_slot;
     uint16_t block_num;
     uint32_t generation;
@@ -1030,42 +1032,23 @@ struct alignas(128) SchedulerRunControl {
     uint64_t error_reserved[6];
 };
 
-struct alignas(128) AicpuCoreLifecycleTrace {
-    uint64_t worker_id;
+struct alignas(128) AicpuThreadLifecycleTrace {
     uint64_t aicpu_thread_id;
-    uint64_t core_type;
-    uint64_t physical_core_id;
-    uint64_t handshake_observed_cycles;
-    uint64_t handshake_partition_complete_cycles;
+    uint64_t handshake_start_cycles;
+    uint64_t handshake_complete_cycles;
     uint64_t config_start_cycles;
     uint64_t topology_complete_cycles;
+    uint64_t context_publish_start_cycles;
     uint64_t context_publish_complete_cycles;
     uint64_t bootstrap_wait_start_cycles;
     uint64_t bootstrap_complete_cycles;
-    uint64_t register_release_cycles;
-    uint64_t exit_signal_cycles;
-    uint64_t exit_ack_cycles;
-    uint64_t reserved[2];
-};
-
-struct alignas(128) SchedulerTailTrace {
-    volatile uint64_t valid;
-    uint64_t start_cycles;
-    uint64_t end_cycles;
-    uint64_t completion_scan_cycles;
-    uint64_t completion_consume_cycles;
-    uint64_t completion_resolve_cycles;
-    uint64_t completion_ready_publish_cycles;
-    uint64_t completion_refill_cycles;
-    uint64_t completion_finalize_cycles;
-    uint64_t gang_service_cycles;
-    uint64_t dispatch_probe_cycles[SCHEDULER_CORE_TYPE_COUNT];
-    uint64_t dispatch_claim_cycles[SCHEDULER_CORE_TYPE_COUNT];
-    uint64_t dispatch_prepare_cycles[SCHEDULER_CORE_TYPE_COUNT];
-    uint64_t dispatch_materialize_cycles[SCHEDULER_CORE_TYPE_COUNT];
-    uint64_t dispatch_publish_cycles[SCHEDULER_CORE_TYPE_COUNT];
-    uint64_t ready_poll_cycles;
-    uint64_t backoff_cycles;
+    uint64_t register_release_start_cycles;
+    uint64_t register_release_end_cycles;
+    uint64_t exit_signal_start_cycles;
+    uint64_t exit_signal_end_cycles;
+    uint64_t exit_wait_start_cycles;
+    uint64_t exit_wait_end_cycles;
+    uint64_t reserved;
 };
 
 struct alignas(128) SchedulerWorkerContext {
@@ -1107,8 +1090,7 @@ struct alignas(128) SchedulerWorkerContext {
     uint64_t target_bootstrap_end_cycles;
     uint64_t bootstrap_target_aic_cycles;
     uint64_t bootstrap_target_aiv_cycles;
-    uint64_t bootstrap_ready_claim_aic_cycles;
-    uint64_t bootstrap_ready_claim_aiv_cycles;
+    uint64_t bootstrap_timing_reserved[2];
 
     volatile uint64_t gang_coordinator_offset;
     volatile uint64_t gang_cohorts_offset;
@@ -1157,7 +1139,7 @@ struct alignas(128) SchedulerWorkerContext {
 
     uint64_t completion_enqueue_cycles;
     uint64_t bootstrap_start_cycles;
-    uint64_t bootstrap_end_cycles;
+    uint64_t bootstrap_end_reserved;
     uint64_t drain_start_cycles;
     uint64_t drain_end_cycles;
     uint64_t exit_wait_start_cycles;
@@ -1169,20 +1151,21 @@ struct alignas(128) SchedulerWorkerContext {
     uint64_t bootstrap_slot_fill_aiv_cycles;
     uint64_t termination_reserved[4];
 
-    SchedulerTailTrace scheduler_tail_trace;
+    // Preserve the shared wire layout after retiring the unconsumed
+    // Scheduler-tail profiling payload.
+    uint64_t scheduler_tail_reserved[32];
 };
 
 struct alignas(128) SchedulerTaskTrace {
     // Dispatch publishes this line before READY; completion publishes valid.
-    // Bootstrap owns only the fanin line and must not dirty this cache line.
     volatile uint64_t valid;
     uint64_t ready_source;
     uint64_t worker_id;
     uint64_t task_id;
-    uint64_t claim_worker_id;
-    uint64_t claim_start_cycles;
-    uint64_t claim_end_cycles;
-    uint64_t claim_loop_iter;
+    uint64_t state_probe_scheduler_worker_id;
+    uint64_t state_probe_start_cycles;
+    uint64_t state_probe_end_cycles;
+    uint64_t publication_mode;
 
     uint64_t kernel_start_cycles;
     uint64_t kernel_end_cycles;
@@ -1194,10 +1177,7 @@ struct alignas(128) SchedulerTaskTrace {
     uint64_t completion_inbox_index;
 
     uint64_t ready_transition_cycles;
-    uint64_t fanin_start_cycles;
-    uint64_t fanin_end_cycles;
-    uint64_t fanin_scheduler_worker_id;
-    uint64_t fanin_loop_iter;
+    uint64_t fanin_timing_reserved[4];
     uint64_t aicore_entry_cycles;
     uint64_t handshake_publish_cycles;
     uint64_t register_release_cycles;
@@ -1291,8 +1271,7 @@ static_assert(alignof(SchedulerRunControl) == 128, "run control alignment change
 static_assert(offsetof(SchedulerRunControl, executed_task_count) == 128, "lifecycle atomics need their own line");
 static_assert(offsetof(SchedulerRunControl, error_claimed) == 256, "error state needs its own line");
 static_assert(offsetof(SchedulerRunControl, error_site) == 328, "error site ABI changed");
-static_assert(sizeof(AicpuCoreLifecycleTrace) == 128, "AICPU lifecycle trace layout changed");
-static_assert(sizeof(SchedulerTailTrace) == 256, "scheduler tail trace layout changed");
+static_assert(sizeof(AicpuThreadLifecycleTrace) == 128, "AICPU lifecycle trace layout changed");
 static_assert(sizeof(SchedulerWorkerContext) == 1024, "worker context layout changed");
 static_assert(alignof(SchedulerWorkerContext) == 128, "worker context alignment changed");
 static_assert(offsetof(SchedulerWorkerContext, task_metadata_offset) == 128, "runtime offsets changed");
@@ -1300,7 +1279,7 @@ static_assert(offsetof(SchedulerWorkerContext, gang_coordinator_offset) == 256, 
 static_assert(offsetof(SchedulerWorkerContext, bootstrap_task_count) == 384, "worker stats offset changed");
 static_assert(offsetof(SchedulerWorkerContext, wake_cas_retry_count) == 512, "wake stats offset changed");
 static_assert(offsetof(SchedulerWorkerContext, completion_enqueue_cycles) == 640, "termination stats offset changed");
-static_assert(offsetof(SchedulerWorkerContext, scheduler_tail_trace) == 768, "scheduler tail trace offset changed");
+static_assert(offsetof(SchedulerWorkerContext, scheduler_tail_reserved) == 768, "worker reserved tail offset changed");
 static_assert(sizeof(SchedulerTaskTrace) == 384, "task trace layout changed");
 static_assert(
     offsetof(SchedulerTaskTrace, dispatch_start_cycles) % 64 == 0,
@@ -1354,9 +1333,11 @@ static_assert(
 static_assert(std::is_standard_layout_v<SchedulerDispatchSlot> && std::is_trivially_copyable_v<SchedulerDispatchSlot>);
 static_assert(std::is_standard_layout_v<SchedulerRunControl> && std::is_trivially_copyable_v<SchedulerRunControl>);
 static_assert(
+    std::is_standard_layout_v<AicpuThreadLifecycleTrace> && std::is_trivially_copyable_v<AicpuThreadLifecycleTrace>
+);
+static_assert(
     std::is_standard_layout_v<SchedulerWorkerContext> && std::is_trivially_copyable_v<SchedulerWorkerContext>
 );
-static_assert(std::is_standard_layout_v<SchedulerTailTrace> && std::is_trivially_copyable_v<SchedulerTailTrace>);
 static_assert(std::is_standard_layout_v<SchedulerTaskTrace> && std::is_trivially_copyable_v<SchedulerTaskTrace>);
 
 inline bool scheduler_layout_checked_add(uint64_t lhs, uint64_t rhs, uint64_t *out) {
@@ -1407,7 +1388,9 @@ inline bool scheduler_plan_layout(
     if (!scheduler_layout_reserve(
             &cursor, sizeof(SchedulerRunControl), alignof(SchedulerRunControl), &next.run_control_offset
         ) ||
-        !SCHEDULER_RESERVE_ARRAY(SCHEDULER_WORKER_CAPACITY, AicpuCoreLifecycleTrace, aicpu_lifecycle_traces_offset) ||
+        !SCHEDULER_RESERVE_ARRAY(
+            PLATFORM_MAX_AICPU_THREADS, AicpuThreadLifecycleTrace, aicpu_lifecycle_traces_offset
+        ) ||
         !SCHEDULER_RESERVE_ARRAY(SCHEDULER_WORKER_CAPACITY, SchedulerWorkerContext, worker_contexts_offset) ||
         !SCHEDULER_RESERVE_ARRAY(
             SCHEDULER_WORKER_CAPACITY * SCHEDULER_PENDING_SLOT_COUNT, DispatchPayload, dispatch_payloads_offset

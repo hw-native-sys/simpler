@@ -1267,18 +1267,18 @@ void csa_moe_block(const GraphTaskArgs &args, bool route_by_hash) {
     // pushes to a truncated window address — an MTE bus fault on the AIV, not a
     // wrong number. The peeled hash_moe_l*_block bodies below already bind them
     // this way.
-    int32_t csa_layer_inline714 = static_cast<int32_t>(args.scalar(0));
-    int32_t csa_moe_epoch_inline715 = static_cast<int32_t>(args.scalar(1));
-    uint64_t arrived_ctx = args.scalar(2);
-    uint64_t combine_arrived_ctx = args.scalar(3);
-    uint64_t data_arrived_ctx = args.scalar(4);
-    int32_t my_rank = static_cast<int32_t>(args.scalar(5));
-    int32_t nt_inline677__rv_v2 = static_cast<int32_t>(args.scalar(6));
-    uint64_t recv_meta_ctx = args.scalar(7);
-    uint64_t recv_x_ctx = args.scalar(8);
-    uint64_t recv_aux_ctx = args.scalar(9);
-    uint64_t recv_route_ctx = args.scalar(10);
-    uint64_t routed_y_buf_ctx = args.scalar(11);
+    int32_t csa_layer_inline714 = args.scalar<int32_t>(0);
+    int32_t csa_moe_epoch_inline715 = args.scalar<int32_t>(1);
+    uint64_t arrived_ctx = args.scalar<uint64_t>(2);
+    uint64_t combine_arrived_ctx = args.scalar<uint64_t>(3);
+    uint64_t data_arrived_ctx = args.scalar<uint64_t>(4);
+    int32_t my_rank = args.scalar<int32_t>(5);
+    int32_t nt_inline677__rv_v2 = args.scalar<int32_t>(6);
+    uint64_t recv_meta_ctx = args.scalar<uint64_t>(7);
+    uint64_t recv_x_ctx = args.scalar<uint64_t>(8);
+    uint64_t recv_aux_ctx = args.scalar<uint64_t>(9);
+    uint64_t recv_route_ctx = args.scalar<uint64_t>(10);
+    uint64_t routed_y_buf_ctx = args.scalar<uint64_t>(11);
     SIMPLER_SCOPE() {
         uint32_t x_mixed_inline11049_ci_shapes[2] = {8, 4096};
         TensorCreateInfo x_mixed_inline11049_ci(x_mixed_inline11049_ci_shapes, 2, DataType::BFLOAT16);
@@ -2989,17 +2989,17 @@ void hca_moe_block(const GraphTaskArgs &args) {
     // pushes to a truncated window address — an MTE bus fault on the AIV, not a
     // wrong number. The peeled hash_moe_l*_block bodies below already bind them
     // this way.
-    int32_t hca_moe_epoch_inline716 = static_cast<int32_t>(args.scalar(0));
-    uint64_t arrived_ctx = args.scalar(1);
-    uint64_t combine_arrived_ctx = args.scalar(2);
-    uint64_t data_arrived_ctx = args.scalar(3);
-    int32_t my_rank = static_cast<int32_t>(args.scalar(4));
-    int32_t nt_inline677__rv_v2 = static_cast<int32_t>(args.scalar(5));
-    uint64_t recv_meta_ctx = args.scalar(6);
-    uint64_t recv_x_ctx = args.scalar(7);
-    uint64_t recv_aux_ctx = args.scalar(8);
-    uint64_t recv_route_ctx = args.scalar(9);
-    uint64_t routed_y_buf_ctx = args.scalar(10);
+    int32_t hca_moe_epoch_inline716 = args.scalar<int32_t>(0);
+    uint64_t arrived_ctx = args.scalar<uint64_t>(1);
+    uint64_t combine_arrived_ctx = args.scalar<uint64_t>(2);
+    uint64_t data_arrived_ctx = args.scalar<uint64_t>(3);
+    int32_t my_rank = args.scalar<int32_t>(4);
+    int32_t nt_inline677__rv_v2 = args.scalar<int32_t>(5);
+    uint64_t recv_meta_ctx = args.scalar<uint64_t>(6);
+    uint64_t recv_x_ctx = args.scalar<uint64_t>(7);
+    uint64_t recv_aux_ctx = args.scalar<uint64_t>(8);
+    uint64_t recv_route_ctx = args.scalar<uint64_t>(9);
+    uint64_t routed_y_buf_ctx = args.scalar<uint64_t>(10);
     SIMPLER_SCOPE() {
         uint32_t x_mixed_inline11928_ci_shapes[2] = {8, 4096};
         TensorCreateInfo x_mixed_inline11928_ci(x_mixed_inline11928_ci_shapes, 2, DataType::BFLOAT16);
@@ -4508,16 +4508,16 @@ void hash_moe_l0_block(const GraphTaskArgs &args) {
     const simpler::hbg::Tensor &ext_routed_y_buf = args.tensor(27).ref();
     const simpler::hbg::Tensor &ext_combine_arrived = args.tensor(28).ref();
     const simpler::hbg::Tensor &hidden_inline709 = args.tensor(29).ref();
-    int32_t nt_inline677__rv_v2 = static_cast<int32_t>(args.scalar(0));
-    int32_t my_rank = static_cast<int32_t>(args.scalar(1));
-    uint64_t recv_meta_ctx = args.scalar(2);
-    uint64_t arrived_ctx = args.scalar(3);
-    uint64_t recv_x_ctx = args.scalar(4);
-    uint64_t recv_aux_ctx = args.scalar(5);
-    uint64_t recv_route_ctx = args.scalar(6);
-    uint64_t data_arrived_ctx = args.scalar(7);
-    uint64_t routed_y_buf_ctx = args.scalar(8);
-    uint64_t combine_arrived_ctx = args.scalar(9);
+    int32_t nt_inline677__rv_v2 = args.scalar<int32_t>(0);
+    int32_t my_rank = args.scalar<int32_t>(1);
+    uint64_t recv_meta_ctx = args.scalar<uint64_t>(2);
+    uint64_t arrived_ctx = args.scalar<uint64_t>(3);
+    uint64_t recv_x_ctx = args.scalar<uint64_t>(4);
+    uint64_t recv_aux_ctx = args.scalar<uint64_t>(5);
+    uint64_t recv_route_ctx = args.scalar<uint64_t>(6);
+    uint64_t data_arrived_ctx = args.scalar<uint64_t>(7);
+    uint64_t routed_y_buf_ctx = args.scalar<uint64_t>(8);
+    uint64_t combine_arrived_ctx = args.scalar<uint64_t>(9);
     SIMPLER_SCOPE() {
         uint32_t x_mixed_inline9242_ci_shapes[2] = {8, 4096};
         TensorCreateInfo x_mixed_inline9242_ci(x_mixed_inline9242_ci_shapes, 2, DataType::BFLOAT16);
@@ -5337,16 +5337,16 @@ void hash_moe_l1_block(const GraphTaskArgs &args) {
     const simpler::hbg::Tensor &ext_routed_y_buf = args.tensor(27).ref();
     const simpler::hbg::Tensor &ext_combine_arrived = args.tensor(28).ref();
     const simpler::hbg::Tensor &hidden_inline709 = args.tensor(29).ref();
-    int32_t nt_inline677__rv_v2 = static_cast<int32_t>(args.scalar(0));
-    int32_t my_rank = static_cast<int32_t>(args.scalar(1));
-    uint64_t recv_meta_ctx = args.scalar(2);
-    uint64_t arrived_ctx = args.scalar(3);
-    uint64_t recv_x_ctx = args.scalar(4);
-    uint64_t recv_aux_ctx = args.scalar(5);
-    uint64_t recv_route_ctx = args.scalar(6);
-    uint64_t data_arrived_ctx = args.scalar(7);
-    uint64_t routed_y_buf_ctx = args.scalar(8);
-    uint64_t combine_arrived_ctx = args.scalar(9);
+    int32_t nt_inline677__rv_v2 = args.scalar<int32_t>(0);
+    int32_t my_rank = args.scalar<int32_t>(1);
+    uint64_t recv_meta_ctx = args.scalar<uint64_t>(2);
+    uint64_t arrived_ctx = args.scalar<uint64_t>(3);
+    uint64_t recv_x_ctx = args.scalar<uint64_t>(4);
+    uint64_t recv_aux_ctx = args.scalar<uint64_t>(5);
+    uint64_t recv_route_ctx = args.scalar<uint64_t>(6);
+    uint64_t data_arrived_ctx = args.scalar<uint64_t>(7);
+    uint64_t routed_y_buf_ctx = args.scalar<uint64_t>(8);
+    uint64_t combine_arrived_ctx = args.scalar<uint64_t>(9);
     SIMPLER_SCOPE() {
         uint32_t x_mixed_inline10004_ci_shapes[2] = {8, 4096};
         TensorCreateInfo x_mixed_inline10004_ci(x_mixed_inline10004_ci_shapes, 2, DataType::BFLOAT16);
@@ -6241,19 +6241,19 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     const simpler::hbg::Tensor &ext_num_tokens_per_owner = orch_args.tensor(91).ref();
 
     // Scalar params
-    int32_t my_rank = from_u64<int32_t>(orch_args.scalar(0));
-    uint64_t recv_meta_ctx = orch_args.scalar(1);
-    uint64_t recv_x_ctx = orch_args.scalar(2);
-    uint64_t recv_aux_ctx = orch_args.scalar(3);
-    uint64_t recv_route_ctx = orch_args.scalar(4);
-    uint64_t arrived_ctx = orch_args.scalar(5);
-    uint64_t data_arrived_ctx = orch_args.scalar(6);
-    uint64_t routed_y_buf_ctx = orch_args.scalar(7);
-    uint64_t combine_arrived_ctx = orch_args.scalar(8);
-    uint64_t lm_head_hidden_window_ctx = orch_args.scalar(9);
-    uint64_t lm_head_hidden_done_ctx = orch_args.scalar(10);
-    uint64_t lm_head_logits_window_ctx = orch_args.scalar(11);
-    uint64_t lm_head_logits_done_ctx = orch_args.scalar(12);
+    int32_t my_rank = orch_args.scalar<int32_t>(0);
+    uint64_t recv_meta_ctx = orch_args.scalar<uint64_t>(1);
+    uint64_t recv_x_ctx = orch_args.scalar<uint64_t>(2);
+    uint64_t recv_aux_ctx = orch_args.scalar<uint64_t>(3);
+    uint64_t recv_route_ctx = orch_args.scalar<uint64_t>(4);
+    uint64_t arrived_ctx = orch_args.scalar<uint64_t>(5);
+    uint64_t data_arrived_ctx = orch_args.scalar<uint64_t>(6);
+    uint64_t routed_y_buf_ctx = orch_args.scalar<uint64_t>(7);
+    uint64_t combine_arrived_ctx = orch_args.scalar<uint64_t>(8);
+    uint64_t lm_head_hidden_window_ctx = orch_args.scalar<uint64_t>(9);
+    uint64_t lm_head_hidden_done_ctx = orch_args.scalar<uint64_t>(10);
+    uint64_t lm_head_logits_window_ctx = orch_args.scalar<uint64_t>(11);
+    uint64_t lm_head_logits_done_ctx = orch_args.scalar<uint64_t>(12);
 
     uint32_t ori_slot_mapping_inline614_ci_shapes[1] = {8};
     TensorCreateInfo ori_slot_mapping_inline614_ci(ori_slot_mapping_inline614_ci_shapes, 1, DataType::INT64);

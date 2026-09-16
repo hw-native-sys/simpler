@@ -4,21 +4,21 @@ This document describes the substantive differences in the current code under
 `src/{a2a3,a5}/runtime/tensormap_and_ringbuffer/`.
 
 > **Maintenance baseline:** The source layout and classifications were verified
-> on 2026-09-03. Recompute the counts and update the affected sections whenever
+> on 2026-09-13. Recompute the counts and update the affected sections whenever
 > the files or constants described here change.
 
 ## Comparison Boundary and Classification
 
 The direct comparison covers tracked files under
 `src/{a2a3,a5}/runtime/tensormap_and_ringbuffer/`, matched by relative path.
-There are 53 paths present on both platforms and two additional paths present
+There are 51 paths present on both platforms and two additional paths present
 only on A5. Every file in that boundary belongs to exactly one of these three
 categories:
 
 | Category | Count | Definition |
 | -------- | ----: | ---------- |
 | Byte-identical | 24 | The files at the same relative path have identical bytes |
-| Compile-time or non-functional differences | 11 | Text differs, but the generated runtime behavior and data semantics are equivalent |
+| Compile-time or non-functional differences | 9 | Text differs, but the generated runtime behavior and data semantics are equivalent |
 | Functional differences | 20 | Eighteen matching paths and two A5-only paths encode or document differences in runtime behavior, capacity, diagnostics, or supported backends |
 
 A file is classified as functional when any part of its diff changes behavior,
@@ -26,18 +26,22 @@ even if the same diff also contains include-order, comment, or formatting
 changes. Files outside the direct boundary, such as platform configuration and
 PMU collector implementations, are cited only as supporting evidence.
 
+The boundary shrinks when a pair is deduplicated rather than reconciled: three
+`host/` paths left it for `src/common/tensormap_and_ringbuffer/host/`, where
+there is one file and so nothing to compare.
+
 ## Byte-Identical Files
 
 The following 24 files are byte-identical:
 
 ```text
 build_config.py
+common/runtime_status.h
 docs/{SCALAR_DATA_ACCESS.md,SUBMIT_BY_CLUSTER.md,device_log_profiling.md,profiling_levels.md}
-host/{dep_gen_replay.cpp,runtime_compile_info.cpp}
 orchestration/{common.cpp,arg_with_deps.h,orchestration_api.h}
 runtime/{common.h,async_kernel_api.h,dep_compute.h,orchestrator.h,
-         runtime_core.cpp,runtime_core.h,shared_memory.h,tensormap.h,
-         tensor_create_info.h}
+         runtime_core.cpp,runtime_core.h,shared_memory.h,tensor.h,
+         tensormap.h,tensor_create_info.h}
 runtime/scheduler/{scheduler.cpp,scheduler_types.h}
 runtime/shared/{shared_memory.cpp,tensormap.cpp,runtime.cpp}
 ```
@@ -46,14 +50,18 @@ Byte identity is a textual result only. A shared file may still consume
 platform-specific constants or APIs supplied by files outside this comparison
 boundary.
 
+The `host/` directory holds only `runtime_maker.cpp` and appears nowhere above:
+`dep_gen_replay.{cpp,h}` and `runtime_compile_info.cpp` now exist once, in
+`src/common/tensormap_and_ringbuffer/host/`, so they have no pair to compare.
+
 ## Compile-Time or Non-Functional Differences
 
-The following 11 matching paths differ textually without changing runtime
+The following 9 matching paths differ textually without changing runtime
 behavior:
 
 | Files | Difference |
 | ----- | ---------- |
-| `common/runtime_status.h`, `host/dep_gen_replay.h`, `runtime/constants.h` | Path-derived include-guard macro names only |
+| `runtime/constants.h` | Path-derived include-guard macro names only |
 | `runtime/backend/sdma/sdma_completion_kernel.h`, `runtime/types.h` | `#pragma once` on A2/A3 versus a path-derived include guard on A5 |
 | `common/intrinsic.h` | A5 uses `s_block_idx` and `s_block_num` because the unprefixed names are compiler-reserved; getter semantics and layout are unchanged |
 | `runtime/dispatch_payload.h` | Comments follow the platform-specific `LocalContext` field names; payload semantics are unchanged |
@@ -62,7 +70,7 @@ behavior:
 | `runtime/runtime_types.h` | Comments state the corresponding 72- or 108-worker capacity; the mask remains two 64-bit words on both platforms |
 | `runtime/submit_types.h` | The launch accessor and backing field are named `block_num` on A2/A3 and `core_num` on A5; both represent the logical SPMD block count |
 
-The first two rows, covering five files, are the strict "compile macro only"
+The first two rows, covering three files, are the strict "compile macro only"
 subset. The `s_block_*` names are also a compile-time constraint rather than a
 different runtime data model. No standalone cleanup is planned; mechanical
 include guards can converge to `#pragma once` when those files are next

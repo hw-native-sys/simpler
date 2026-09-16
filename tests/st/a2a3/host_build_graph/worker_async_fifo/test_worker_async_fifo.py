@@ -28,7 +28,7 @@ from pathlib import Path
 import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import DataType, TaskArgs, TensorArgType, scalar_to_uint64
+from simpler.task_interface import DataType, TaskArgs, TensorArgType
 from simpler.worker import (
     _FRAME_STAGED,
     _OFF_ACCEPTED,
@@ -73,7 +73,7 @@ def _chip_args(handles, orch_signature, *scalars):
     for handle, direction in zip(handles, orch_signature):
         args.add_tensor(handle.tensor((_SIZE,), DataType.FLOAT32), _DIR_TAGS[direction])
     for value in scalars:
-        args.add_scalar(scalar_to_uint64(value))
+        args.add_scalar(value)
     return args
 
 

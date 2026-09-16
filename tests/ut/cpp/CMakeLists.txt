@@ -85,7 +85,7 @@ endif()
 # have had if the sources were listed directly.
 # ---------------------------------------------------------------------------
 set(A2A3_RUNTIME_DIR ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime)
-set(A2A3_HOST_DIR ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/host)
+set(TMR_SHARED_HOST_DIR ${CMAKE_SOURCE_DIR}/../../../src/common/tensormap_and_ringbuffer/host)
 
 add_library(a2a3_rt_objs OBJECT
     ${A2A3_RUNTIME_DIR}/ring_buffer.cpp
@@ -450,6 +450,22 @@ add_hierarchical_test(test_remote_wire hierarchical/test_remote_wire.cpp)
 add_hierarchical_test(test_remote_endpoint hierarchical/test_remote_endpoint.cpp)
 add_hierarchical_test(test_pipeline_contract hierarchical/test_pipeline_contract.cpp)
 
+# Exercise ChipWorker's actual dlopen/dlsym admission before a sentinel factory,
+# then the four built sim runtimes through the unchanged public kernel ABI.
+add_library(pipeline_contract_runtime SHARED stubs/pipeline_contract_runtime.cpp)
+target_include_directories(pipeline_contract_runtime PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+)
+add_hierarchical_test(test_pipeline_contract_loader hierarchical/test_pipeline_contract_loader.cpp)
+add_dependencies(test_pipeline_contract_loader pipeline_contract_runtime)
+target_compile_definitions(test_pipeline_contract_loader PRIVATE
+    PIPELINE_FIXTURE_PATH="$<TARGET_FILE:pipeline_contract_runtime>"
+    SIM_CONTEXT_PATH="${CMAKE_SOURCE_DIR}/../../../build/lib/libcpu_sim_context.so"
+    RUNTIME_LIBRARY_ROOT="${CMAKE_SOURCE_DIR}/../../../build/lib"
+)
+
 # Run-stream pair state machine: publication-aware AICore stream reuse,
 # submitter-gated retirement, and failed-destroy ownership. Header-only with
 # injected create/destroy, so it needs no runtime objects and no device.
@@ -500,6 +516,37 @@ set_tests_properties(test_native_run_acceptance PROPERTIES LABELS "no_hardware")
 # callers invoke it from different host threads.
 add_common_utils_test(test_host_api common/test_host_api.cpp)
 
+# Kernel-mode entry argument validation: shared by every host-runtime
+# component (real implementation and stub alike), so its rejection rules are
+# provable here without any device or built .so.
+add_executable(test_kernel_entry_validation common/test_kernel_entry_validation.cpp)
+target_include_directories(test_kernel_entry_validation PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+    # src/common is needed so `#include "utils/device_arena.h"` resolves.
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+)
+target_link_libraries(test_kernel_entry_validation PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_kernel_entry_validation COMMAND test_kernel_entry_validation)
+set_tests_properties(test_kernel_entry_validation PROPERTIES LABELS "no_hardware")
+
+# Write-once execution identity: the latch both runner bases hold and every
+# kernel-mode guard reads.
+add_executable(test_execution_mode_latch
+    common/test_execution_mode_latch.cpp
+)
+target_include_directories(test_execution_mode_latch PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+)
+target_link_libraries(test_execution_mode_latch PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_execution_mode_latch COMMAND test_execution_mode_latch)
+set_tests_properties(test_execution_mode_latch PROPERTIES LABELS "no_hardware")
+
 # Runtime extension payloads are per-run state even though the collector's
 # shared-memory resources remain resident across runs.
 add_executable(test_chip_swimlane_collector
@@ -544,7 +591,9 @@ set_tests_properties(test_sim_run_completion PROPERTIES LABELS "no_hardware")
 add_task_interface_test(test_buffer types/test_buffer.cpp)
 add_task_interface_test(test_child_memory types/test_child_memory.cpp)
 add_task_interface_test(test_chip_max_tensor_args types/test_chip_max_tensor_args.cpp)
+add_task_interface_test(test_callable_scalar_count types/test_callable_scalar_count.cpp)
 add_task_interface_test(test_call_config types/test_call_config.cpp)
+add_task_interface_test(test_kernel_invocation_header types/test_kernel_invocation_header.cpp)
 
 # Contract test for upload_chip_callable_buffer caller-buffer immutability.
 # Pulls both task_interface (callable.h) and src/common (utils/fnv1a_64.h),
@@ -577,6 +626,7 @@ target_include_directories(test_runtime_orch_so PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
 )
 add_common_utils_test(test_device_arena common/test_device_arena.cpp)
+add_common_utils_test(test_retained_temp_bump common/test_retained_temp_bump.cpp)
 add_common_utils_test(test_thread_completion_gate common/test_thread_completion_gate.cpp)
 add_common_utils_test(test_fatal_shutdown_latch common/test_fatal_shutdown_latch.cpp)
 add_common_utils_test(test_buffer_pool_manager common/test_buffer_pool_manager.cpp)
@@ -969,6 +1019,31 @@ target_sources(test_hbg_async_wait_init PRIVATE
     ${HBG_ORCH_SHARED_SOURCES}
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
 )
+# Drives the real hbg bind/validate against a fake HostApi. bind takes the
+# resolved host-orch entry points as a parameter, so this needs no orchestration
+# .so — the test supplies its own two function pointers.
+#
+# Lists orchestrator.cpp + HBG_SHARED_RUNTIME_SOURCES rather than
+# HBG_ORCH_SHARED_SOURCES: that variable carries hbg_orch_stubs.cpp, whose
+# dep-gen and host-phase stubs collide with the real TUs this test needs for
+# dep_gen_host_graph_begin_capture and the bind-phase records.
+add_a2a3_hbg_runtime_test(test_hbg_bind_ledger common/test_hbg_bind_ledger.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/host_build_graph/host/runtime_maker.cpp
+    ${HBG_HOST_DIR}/orchestrator.cpp
+    ${HBG_SHARED_RUNTIME_SOURCES}
+    ${HBG_HOST_DIR}/runtime_core.cpp
+    ${HBG_HOST_DIR}/dep_gen_host_graph.cpp
+    ${HBG_HOST_DIR}/graph_recorder_pool.cpp
+    ${HBG_HOST_DIR}/host_phase_trace.cpp
+    ${HBG_HOST_DIR}/ready_queue_sizing.cpp
+    ${HBG_HOST_DIR}/host_tensor_access.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/platform_compile_info.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
+    # test_stubs.cpp already defines unified_log_*; only HostLogger is missing.
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/host_log.cpp
+)
+target_compile_definitions(test_hbg_bind_ledger PRIVATE SIMPLER_PLATFORM_NAME="a2a3sim")
+
 add_a2a3_hbg_runtime_test(test_hbg_self_relative_ptr common/test_hbg_self_relative_ptr.cpp)
 add_a2a3_hbg_runtime_test(test_hbg_sm_compaction common/test_hbg_sm_compaction.cpp)
 add_a2a3_hbg_runtime_test(test_hbg_scheduler_drain common/test_hbg_scheduler_drain.cpp)
@@ -1133,8 +1208,8 @@ add_a2a3_runtime_test(test_task_state       a2a3/test_task_state.cpp)
 add_a2a3_runtime_test(test_ready_queue      a2a3/test_ready_queue.cpp)
 add_a2a3_runtime_test(test_shared_memory    a2a3/test_shared_memory.cpp)
 add_a2a3_runtime_test(test_a2a3_tensormap   a2a3/test_tensormap.cpp)
-add_a2a3_runtime_test(test_dep_gen_replay common/test_dep_gen_replay.cpp ${A2A3_HOST_DIR}/dep_gen_replay.cpp)
-target_include_directories(test_dep_gen_replay PRIVATE ${A2A3_HOST_DIR})
+add_a2a3_runtime_test(test_dep_gen_replay common/test_dep_gen_replay.cpp ${TMR_SHARED_HOST_DIR}/dep_gen_replay.cpp)
+target_include_directories(test_dep_gen_replay PRIVATE ${TMR_SHARED_HOST_DIR})
 add_a2a3_runtime_test(test_fanin_pool       a2a3/test_fanin_pool.cpp)
 add_a2a3_orchestrator_runtime_test(test_a2a3_orchestrator_fanin a2a3/test_orchestrator_fanin.cpp)
 add_a2a3_orchestrator_runtime_test(test_wiring a2a3/test_wiring.cpp)

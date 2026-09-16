@@ -540,13 +540,6 @@ void Scheduler::dispatch_preparable_next_level_singles() {
             cfg_.enqueue_ready_cb(slot);
             continue;
         }
-        // Diagnostic setup mutates runner-global state, so it starts only
-        // after this run reaches the active FIFO lane. Ordinary tasks may use
-        // the prepared lane because their backend preparation is run-local.
-        if (state.config.diagnostics_any()) {
-            cfg_.enqueue_ready_cb(slot);
-            continue;
-        }
         if (cfg_.before_claim_cb) cfg_.before_claim_cb(slot);
         if (!claim_for_dispatch(state)) continue;
         dispatch_claimed(worker, WorkerDispatch{slot, 0}, /*prepared=*/true);

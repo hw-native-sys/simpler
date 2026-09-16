@@ -27,6 +27,7 @@ from .._helpers import (
     COUNT_PER_RANK,
     DTYPE_NBYTES,
     SIGNAL_TAIL_NBYTES,
+    CollectiveReduceOp,
     generic_collective_orch_fn,
     reduce_scatter_expected_output,
 )
@@ -36,6 +37,13 @@ def reduce_scatter_orch_fn(orch, callables, task_args, config):
     nranks = int(task_args.nranks.value)
     scratch_nbytes = nranks * COUNT_PER_RANK * DTYPE_NBYTES + SIGNAL_TAIL_NBYTES
     window_size = max(scratch_nbytes, 4 * 1024)
+    reduce_op_val = 0
+    if hasattr(task_args, "reduce_op"):
+        reduce_op_val = int(task_args.reduce_op.value)
+    try:
+        CollectiveReduceOp(reduce_op_val)
+    except ValueError as exc:
+        raise ValueError(f"invalid reduce_scatter reduce_op: {reduce_op_val}") from exc
     generic_collective_orch_fn(
         orch,
         callables,
@@ -45,6 +53,7 @@ def reduce_scatter_orch_fn(orch, callables, task_args, config):
         float_elems=nranks * COUNT_PER_RANK,
         scratch_nbytes=scratch_nbytes,
         window_size=window_size,
+        post_scalars=[reduce_op_val],
     )
 
 
@@ -72,7 +81,7 @@ _CALLABLE = {
 }
 
 
-def _make_args(nranks):
+def _make_args(nranks, reduce_op=0):
     specs = []
     for r in range(nranks):
         inp = torch.tensor([i + r * 100 for i in range(nranks * COUNT_PER_RANK)], dtype=torch.float32).share_memory_()
@@ -80,6 +89,7 @@ def _make_args(nranks):
         specs.append(STensor(f"in_{r}", inp))
         specs.append(STensor(f"out_{r}", out))
     specs.append(SScalar("nranks", ctypes.c_int64(nranks)))
+    specs.append(SScalar("reduce_op", ctypes.c_int64(reduce_op)))
     return TaskArgsBuilder(*specs)
 
 
@@ -92,16 +102,19 @@ class TestReduceScatterP2(SceneTestCase):
             "platforms": ["a2a3sim", "a2a3", "a5sim"],
             "manual": ["a2a3sim", "a5sim"],
             "config": {"device_count": 2},
-            "params": {"nranks": 2},
+            "params": {"nranks": 2, "reduce_op": 0},
         }
     ]
 
     def generate_args(self, params):
-        return _make_args(params["nranks"])
+        return _make_args(params["nranks"], params["reduce_op"])
 
     def compute_golden(self, args, params):
         for r in range(params["nranks"]):
-            expected = torch.tensor(reduce_scatter_expected_output(params["nranks"], r), dtype=torch.float32)
+            expected = torch.tensor(
+                reduce_scatter_expected_output(params["nranks"], r, CollectiveReduceOp(params["reduce_op"])),
+                dtype=torch.float32,
+            )
             getattr(args, f"out_{r}").copy_(expected)
 
 
@@ -114,16 +127,57 @@ class TestReduceScatterP4(SceneTestCase):
             "platforms": ["a2a3sim", "a2a3", "a5sim"],
             "manual": True,
             "config": {"device_count": 4},
-            "params": {"nranks": 4},
+            "params": {"nranks": 4, "reduce_op": 0},
         }
     ]
 
     def generate_args(self, params):
-        return _make_args(params["nranks"])
+        return _make_args(params["nranks"], params["reduce_op"])
 
     def compute_golden(self, args, params):
         for r in range(params["nranks"]):
-            expected = torch.tensor(reduce_scatter_expected_output(params["nranks"], r), dtype=torch.float32)
+            expected = torch.tensor(
+                reduce_scatter_expected_output(params["nranks"], r, CollectiveReduceOp(params["reduce_op"])),
+                dtype=torch.float32,
+            )
+            getattr(args, f"out_{r}").copy_(expected)
+
+
+@scene_test(level=3, runtime="tensormap_and_ringbuffer")
+class TestReduceScatterP2MaxMinProd(SceneTestCase):
+    """ReduceScatter — 2-rank, non-Sum reduce ops."""
+
+    CALLABLE = _CALLABLE
+    CASES = [
+        {
+            "name": "p2_max",
+            "platforms": ["a2a3sim", "a2a3", "a5sim"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2, "reduce_op": 1},
+        },
+        {
+            "name": "p2_min",
+            "platforms": ["a2a3sim", "a2a3", "a5sim"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2, "reduce_op": 2},
+        },
+        {
+            "name": "p2_prod",
+            "platforms": ["a2a3sim", "a2a3", "a5sim"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2, "reduce_op": 3},
+        },
+    ]
+
+    def generate_args(self, params):
+        return _make_args(params["nranks"], params["reduce_op"])
+
+    def compute_golden(self, args, params):
+        for r in range(params["nranks"]):
+            expected = torch.tensor(
+                reduce_scatter_expected_output(params["nranks"], r, CollectiveReduceOp(params["reduce_op"])),
+                dtype=torch.float32,
+            )
             getattr(args, f"out_{r}").copy_(expected)
 
 

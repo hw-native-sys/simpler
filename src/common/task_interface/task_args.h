@@ -43,7 +43,8 @@
 #include <vector>
 
 #include "arg_direction.h"
-#include "tensor.h"  // ChipTensor (device POD) + TensorArgType, the tag TaskArgs carries
+#include "data_type.h"  // from_u64, which scalar<T>() applies to a slot
+#include "tensor.h"     // ChipTensor (device POD) + TensorArgType, the tag TaskArgs carries
 
 // Opaque at the Python surface. The run id prevents a slot from being reused
 // as a dependency after the parent-side Ring resets its monotonic slot ids.
@@ -114,7 +115,20 @@ struct TaskArgsTpl : TensorTagMixin<TensorTag, MaxT> {
     const T &tensor(int32_t i) const { return tensors_[i]; }
     T &tensor(int32_t i) { return tensors_[i]; }
 
-    S scalar(int32_t i) const { return scalars_[i]; }
+    // ScalarT defaults to S (the slot's native type, uint64_t in every instantiation), which
+    // keeps a bare scalar(i) unchanged. scalar<T>(i) for any other T reads the slot as T via
+    // from_u64, not static_cast: a float slot holds a bit pattern, so static_cast<float> of
+    // 1.0f's pattern yields 1065353216.0. The bound is sizeof(S) because what the read has
+    // to fit in is this instantiation's slot, whatever S is.
+    template <typename ScalarT = S>
+    ScalarT scalar(int32_t i) const {
+        if constexpr (std::is_same_v<ScalarT, S>) {
+            return scalars_[i];
+        } else {
+            static_assert(sizeof(ScalarT) <= sizeof(S), "scalar<T>: type must fit in the slot");
+            return from_u64<ScalarT>(scalars_[i]);
+        }
+    }
     S &scalar(int32_t i) { return scalars_[i]; }
 
     const S *scalars() const { return scalars_; }
@@ -165,7 +179,15 @@ struct TaskArgsTpl<T, S, 0, 0, TensorTag> : TensorTagMixin<TensorTag, 0> {
     const T &tensor(int32_t i) const { return tensors_[static_cast<size_t>(i)]; }
     T &tensor(int32_t i) { return tensors_[static_cast<size_t>(i)]; }
 
-    S scalar(int32_t i) const { return scalars_[static_cast<size_t>(i)]; }
+    template <typename ScalarT = S>
+    ScalarT scalar(int32_t i) const {
+        if constexpr (std::is_same_v<ScalarT, S>) {
+            return scalars_[static_cast<size_t>(i)];
+        } else {
+            static_assert(sizeof(ScalarT) <= sizeof(S), "scalar<T>: type must fit in the slot");
+            return from_u64<ScalarT>(scalars_[static_cast<size_t>(i)]);
+        }
+    }
     S &scalar(int32_t i) { return scalars_[static_cast<size_t>(i)]; }
 
     const T *tensor_data() const { return tensors_.data(); }

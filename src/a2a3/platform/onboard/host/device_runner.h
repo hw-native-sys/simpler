@@ -123,7 +123,7 @@ public:
      * `set_output_prefix`, `output_prefix`, and `launch_aicpu_kernel` live on
      * `DeviceRunnerBase`.
      */
-    void set_dep_gen_enabled(bool enable) override;
+    void arm_host_dep_gen_capture(bool enable) override;
 
     /**
      * Cleanup all resources
@@ -247,17 +247,21 @@ private:
     int retire_run_aicore_stream(const void *owner, RunStreamPair::CompletionStatus completion_status);
     int destroy_run_streams();
 
-    // Release execution-owned resources in collector, runtime-argument,
-    // register-buffer, then stream order. The collectors this releases were
-    // initialized by prepare_execution() for this run alone; an overlapping
-    // predecessor cannot own any, because a prepared successor is admitted only
-    // when both runs declare no diagnostics.
+    // Release the resources this run owns, in runtime-argument, register-buffer,
+    // then stream order. Collectors are not among them: their device resources
+    // belong to the worker's lifetime and are released in finalize().
     void cleanup_execution(PreparedExecution &prepared, bool retire_aicore) noexcept;
 
     // The kernel submission boundary is separate from the stream wait and
     // post-run teardown: launch_run() submits and drain_execution() reaps.
     LaunchTransactionResult launch_run(PreparedExecution &prepared, LaunchPermit permit);
-    int reap_run();
+    int reap_run(const DfxRunConfig &dfx, uint32_t pipeline_slot);
+
+    // Emit the device-orchestration dep_gen graph, on both the success and the
+    // error return of reap_run: the device flushes its dep_gen buffers during
+    // emergency_shutdown, so a failed run's graph is recoverable. Its own
+    // reconcile is the completeness gate — see the definition.
+    void emit_device_dep_gen_graph(const DfxRunConfig &dfx);
 
     // On an AICore launch/sync error, best-effort drain the device so a later
     // enqueue on the same DeviceRunner can recover in place; if the drain itself
@@ -299,9 +303,20 @@ private:
      * @param device_id Device ID for host registration
      * @return 0 on success, error code on failure
      */
+    /**
+     * Build this run's collector pools, profiling flag and device KernelArgs
+     * refresh, under the execution claim.
+     *
+     * The collectors are resident and shared by every run on this runner, and a
+     * run whose core / AICPU-thread counts differ from the pools' releases and
+     * rebuilds them. Neither is safe while another run is executing against
+     * them, which is why none of it happens during preparation.
+     */
+    int arm_collectors_for_run(Runtime &runtime, PreparedExecution &prepared);
+
     int init_chip_swimlane(
         int num_aicore, int aicpu_thread_num, int device_id, KernelArgsHelper &kernel_args,
-        const std::string &output_prefix, ChipSwimlaneLevel chip_swimlane_level
+        ChipSwimlaneLevel chip_swimlane_level
     );
 
     /**
@@ -314,10 +329,7 @@ private:
      * @param device_id Device ID for host registration
      * @return 0 on success, error code on failure
      */
-    int init_args_dump(
-        Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, const std::string &output_prefix,
-        DumpArgsLevel dump_args_level
-    );
+    int init_args_dump(Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, DumpArgsLevel dump_args_level);
 
     /**
      * Initialize PMU streaming shared memory.
@@ -328,15 +340,10 @@ private:
      *
      * @param num_cores  Number of AICore instances
      * @param num_threads Number of AICPU scheduling threads
-     * @param csv_path   Output CSV file path
-     * @param event_type PMU event type (written to CSV rows)
      * @param device_id  Device ID for host registration
      * @return 0 on success, error code on failure
      */
-    int init_pmu(
-        int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id,
-        KernelArgsHelper &kernel_args
-    );
+    int init_pmu(int num_cores, int num_threads, int device_id, KernelArgsHelper &kernel_args);
 
     /**
      * Initialize dep_gen capture shared memory.
@@ -369,5 +376,4 @@ private:
     // `pmu_event_type_`, `output_prefix_`) live on `DeviceRunnerBase`.
     //
     // dep_gen enablement is a2a3-only.
-    bool enable_dep_gen_{false};
 };

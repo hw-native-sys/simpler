@@ -16,28 +16,31 @@
  * will honor are stated in one place and can be exercised on their own.
  */
 
-#ifndef SRC_COMMON_WORKER_PIPELINE_CONTRACT_H_
-#define SRC_COMMON_WORKER_PIPELINE_CONTRACT_H_
+#pragma once
 
 #include <cstdint>
 
 #include "runtime_c_api.h"
+#include "execution_mode.h"
 
 /**
- * Whether this build can honor `contract`.
+ * Whether `contract` has a valid structure and mode-specific byte counts.
+ * Serviceability and runtime-specific resource sets are checked separately.
  *
  * Rejects a contract whose ABI version is not the one compiled in, that
  * declares more resources than fit, that asks for a pipeline depth outside
  * the supported range, or whose resources carry an unspecified or out-of-range kind, an
- * out-of-range class, or a non-zero reserved `bytes_per_copy`.
+ * out-of-range class, or a byte count incompatible with the mode and resource class.
  *
  * The unspecified-kind rule is what catches a `resource_count` larger than the
  * entries a runtime actually filled in: the trailing entries are still zeroed,
  * and zero is not a resource. Repeated kinds stay legal, so a runtime may
  * declare several resources of one kind.
  */
-inline bool is_valid_pipeline_contract(const PipelineContract *contract) {
-    if (contract == nullptr || contract->abi_version != PTO_PIPELINE_CONTRACT_ABI_VERSION ||
+// Accept the raw mode value so unknown values can be rejected before an enum cast.
+inline bool is_valid_pipeline_contract(const PipelineContract *contract, uint32_t mode) {
+    if ((mode != SIMPLER_MODE_PROGRAM && mode != SIMPLER_MODE_KERNEL) || contract == nullptr ||
+        contract->abi_version != PTO_PIPELINE_CONTRACT_ABI_VERSION ||
         contract->resource_count > PTO_PIPELINE_MAX_RESOURCES || contract->pipeline_depth == 0 ||
         contract->pipeline_depth > PTO_PIPELINE_MAX_DEPTH) {
         return false;
@@ -45,16 +48,27 @@ inline bool is_valid_pipeline_contract(const PipelineContract *contract) {
     for (uint32_t i = 0; i < contract->resource_count; ++i) {
         const PipelineResource &resource = contract->resources[i];
         if (resource.kind == PTO_PIPELINE_KIND_UNSPECIFIED || resource.kind > PTO_PIPELINE_AICORE_STREAM ||
-            resource.resource_class > PTO_PIPELINE_EXEC_HANDLE || resource.bytes_per_copy != 0) {
+            resource.resource_class > PTO_PIPELINE_EXEC_HANDLE) {
             return false;
         }
+        // A program declaration carries no sizes. A kernel declaration sizes
+        // every resource that occupies storage, and only an execution handle
+        // is exempt, so within kernel mode the rule keys on the resource class
+        // and adding a kind cannot change which side a resource falls on.
+        const bool sized = mode == SIMPLER_MODE_KERNEL && resource.resource_class != PTO_PIPELINE_EXEC_HANDLE;
+        if (sized ? resource.bytes_per_copy == 0 : resource.bytes_per_copy != 0) return false;
     }
     return true;
 }
 
+// Program-mode compatibility overload.
+inline bool is_valid_pipeline_contract(const PipelineContract *contract) {
+    return is_valid_pipeline_contract(contract, SIMPLER_MODE_PROGRAM);
+}
+
 /** Return the number of concrete copies required for one resource. */
 inline uint32_t pipeline_resource_copy_count(const PipelineContract &contract, const PipelineResource &resource) {
-    return resource.resource_class == PTO_PIPELINE_DEVICE_SCRATCH ? 1u : contract.pipeline_depth;
+    return resource.resource_class == PTO_PIPELINE_HOST_PER_RUN ? contract.pipeline_depth : 1u;
 }
 
 /** Select the concrete copy of `resource` owned by `lease`. */
@@ -65,6 +79,7 @@ inline uint32_t pipeline_resource_slot(
 }
 
 /** Find a declared resource kind, or return nullptr when the runtime does not use it. */
+// The caller must validate the contract before looking up a resource.
 inline const PipelineResource *find_pipeline_resource(const PipelineContract &contract, uint32_t kind) {
     for (uint32_t i = 0; i < contract.resource_count; ++i) {
         if (contract.resources[i].kind == kind) return &contract.resources[i];
@@ -81,6 +96,7 @@ inline const PipelineResource *find_pipeline_resource(const PipelineContract &co
  * declares one of them twice, where only the first entry would ever be read —
  * describes a layout the executor cannot produce, and is rejected at load
  * rather than at the first launch that would need the second bank.
+ * The caller must validate the contract before checking this topology.
  */
 inline bool has_serviceable_arena_topology(const PipelineContract &contract) {
     constexpr uint32_t ARENA_KINDS[] = {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_GM_SM, PTO_PIPELINE_RUNTIME_IMAGE};
@@ -104,4 +120,40 @@ inline bool has_serviceable_arena_topology(const PipelineContract &contract) {
     return true;
 }
 
-#endif  // SRC_COMMON_WORKER_PIPELINE_CONTRACT_H_
+// Each execution role is supplied exactly once.
+inline bool has_serviceable_stream_topology(const PipelineContract &contract) {
+    if (contract.resource_count > PTO_PIPELINE_MAX_RESOURCES) return false;
+    constexpr uint32_t STREAM_KINDS[] = {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_AICORE_STREAM};
+    for (uint32_t kind : STREAM_KINDS) {
+        uint32_t count = 0;
+        for (uint32_t i = 0; i < contract.resource_count; ++i) {
+            const auto &resource = contract.resources[i];
+            if (resource.kind != kind) continue;
+            if (resource.resource_class != PTO_PIPELINE_EXEC_HANDLE) return false;
+            ++count;
+        }
+        if (count != 1) return false;
+    }
+    return true;
+}
+
+// Complete TMR kernel admission, including structural checks before any lookup.
+inline bool is_valid_tmr_kernel_pipeline_contract(const PipelineContract *contract) {
+    // Exact cardinality plus required-kind checks excludes extra TASK_ARGS
+    // entries, which neither the arena nor stream topology check covers.
+    if (!is_valid_pipeline_contract(contract, SIMPLER_MODE_KERNEL) || contract->resource_count != 6 ||
+        !has_serviceable_arena_topology(*contract) || !has_serviceable_stream_topology(*contract)) {
+        return false;
+    }
+    constexpr PipelineResource REQUIRED_STORAGE[] = {
+        {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_DEVICE_SCRATCH, 0},
+        {PTO_PIPELINE_GM_SM, PTO_PIPELINE_DEVICE_SCRATCH, 0},
+        {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_DEVICE_SCRATCH, 0},
+        {PTO_PIPELINE_TASK_ARGS, PTO_PIPELINE_HOST_PER_RUN, 0},
+    };
+    for (const auto &required : REQUIRED_STORAGE) {
+        const auto *resource = find_pipeline_resource(*contract, required.kind);
+        if (resource == nullptr || resource->resource_class != required.resource_class) return false;
+    }
+    return true;
+}

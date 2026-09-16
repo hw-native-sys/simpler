@@ -73,9 +73,10 @@ class TestNativeRunLifecycle(SceneTestCase):
 
         spans = list(parse_spans(drain_host_log(capfd).splitlines()))
         invocations = [inv for inv in group_invocations(spans) if "chip.run" in inv.by_name()]
-        # Two of these are the abandoned diagnostic prepares below, which record a
-        # chip.run invocation without ever reaching chip.run.runner_run.
-        expected_invocations = 5 if st_platform.endswith("sim") else 9
+        # The onboard count includes the two diagnostic-config pairs below, each
+        # of which now runs an active predecessor and a prepared successor to
+        # completion rather than having its successor refused.
+        expected_invocations = 5 if st_platform.endswith("sim") else 11
         assert len(invocations) == expected_invocations
 
         common_depths = {
@@ -104,7 +105,7 @@ class TestNativeRunLifecycle(SceneTestCase):
             for name in expected_depths.keys() - {"chip.run", "chip.run.runner_run.device_wall"}:
                 stage = by_name[name]
                 assert root.ts <= stage.ts <= stage.ts + stage.dur <= root_end
-        expected_launched = 2 if st_platform.endswith("sim") else 6
+        expected_launched = 2 if st_platform.endswith("sim") else 8
         assert launched_count == expected_launched
         if not st_platform.endswith("sim"):
             root_attrs = [inv.by_name()["chip.run"].attrs for inv in invocations]
@@ -276,37 +277,47 @@ class TestNativeRunLifecycle(SceneTestCase):
                     diagnostic_config.enable_dep_gen = True
                     diagnostic_config.output_prefix = output_dir
 
-                    # A diagnostic successor cannot overlap an ordinary active
-                    # run, even though the predecessor otherwise permits one.
+                    # A diagnostic successor overlaps an ordinary active run like
+                    # any other: its collector pools and per-run state are built
+                    # and reset under the execution claim, so its preparation
+                    # touches nothing the predecessor is using.
                     active_args, active_chip_args, active_outputs, active_golden = build_run_args()
                     native_run = chip_worker._prepare_native_run_with_pipeline_lease(
                         _SLOT, active_chip_args, 0, _GENERATION + 2, config=config
                     )
                     chip_worker._launch_native_run(native_run)
-                    with pytest.raises(RuntimeError, match="active predecessor"):
-                        chip_worker._prepare_native_run_with_pipeline_lease(
-                            _SLOT, successor_chip_args, 1, _GENERATION + 1, config=diagnostic_config
-                        )
+                    successor_run = chip_worker._prepare_native_run_with_pipeline_lease(
+                        _SLOT, successor_chip_args, 1, _GENERATION + 1, config=diagnostic_config
+                    )
                     chip_worker._wait_native_run(native_run)
                     chip_worker._finalize_native_run(native_run)
                     native_run = None
                     _compare_outputs(active_args, active_golden, active_outputs, self.RTOL, self.ATOL)
+                    chip_worker._launch_native_run(successor_run)
+                    chip_worker._wait_native_run(successor_run)
+                    chip_worker._finalize_native_run(successor_run)
+                    successor_run = None
 
-                    # A diagnostic predecessor also cannot admit an ordinary
-                    # successor while it owns the execution claim.
+                    # And a diagnostic predecessor admits an ordinary successor
+                    # while it owns the execution claim, for the same reason.
+                    successor_args, successor_chip_args, successor_outputs, successor_golden = build_run_args()
                     active_args, active_chip_args, active_outputs, active_golden = build_run_args()
                     native_run = chip_worker._prepare_native_run_with_pipeline_lease(
                         _SLOT, active_chip_args, 0, _GENERATION + 3, config=diagnostic_config
                     )
                     chip_worker._launch_native_run(native_run)
-                    with pytest.raises(RuntimeError, match="active predecessor"):
-                        chip_worker._prepare_native_run_with_pipeline_lease(
-                            _SLOT, successor_chip_args, 1, _GENERATION + 1, config=config
-                        )
+                    successor_run = chip_worker._prepare_native_run_with_pipeline_lease(
+                        _SLOT, successor_chip_args, 1, _GENERATION + 1, config=config
+                    )
                     chip_worker._wait_native_run(native_run)
                     chip_worker._finalize_native_run(native_run)
                     native_run = None
                     _compare_outputs(active_args, active_golden, active_outputs, self.RTOL, self.ATOL)
+                    chip_worker._launch_native_run(successor_run)
+                    chip_worker._wait_native_run(successor_run)
+                    chip_worker._finalize_native_run(successor_run)
+                    successor_run = None
+                    _compare_outputs(successor_args, successor_golden, successor_outputs, self.RTOL, self.ATOL)
         finally:
             for unfinished_run in (successor_run, native_run):
                 if unfinished_run is None:

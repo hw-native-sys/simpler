@@ -27,6 +27,7 @@
  *   tensor(2) = scratch  (HCCL window slot, cross-rank addressable)
  *   scalar(0) = nranks
  *   scalar(1) = CommContext device pointer
+ *   scalar(2) = reduce_op (CollectiveReduceOp: 0=Sum, 1=Max, 2=Min, 3=Prod)
  */
 
 #include <cstdint>
@@ -35,6 +36,7 @@
 #include "pto/comm/pto_comm_inst.hpp"
 #include "platform_comm/comm_context.h"
 #include "tensor.h"
+#include "collectives_reduce_op.hpp"
 
 #ifndef __gm__
 #define __gm__
@@ -75,6 +77,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     __gm__ Tensor *scratch_tensor = reinterpret_cast<__gm__ Tensor *>(args[2]);
     int nranks = static_cast<int>(args[3]);
     __gm__ CommContext *commCtx = reinterpret_cast<__gm__ CommContext *>(args[4]);
+    CollectiveReduceOp reduce_op = static_cast<CollectiveReduceOp>(args[5]);
 
     __gm__ float *input = reinterpret_cast<__gm__ float *>(input_tensor->buffer.addr) + input_tensor->start_offset;
     __gm__ float *output = reinterpret_cast<__gm__ float *>(output_tensor->buffer.addr) + output_tensor->start_offset;
@@ -150,7 +153,20 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         TLOAD(recvTile, remoteG);
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
-        TADD(accTile, accTile, recvTile);
+        switch (reduce_op) {
+        case CollectiveReduceOp::kSum:
+            TADD(accTile, accTile, recvTile);
+            break;
+        case CollectiveReduceOp::kMax:
+            TMAX(accTile, accTile, recvTile);
+            break;
+        case CollectiveReduceOp::kMin:
+            TMIN(accTile, accTile, recvTile);
+            break;
+        case CollectiveReduceOp::kProd:
+            TMUL(accTile, accTile, recvTile);
+            break;
+        }
         set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
     }

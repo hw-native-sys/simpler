@@ -56,7 +56,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     const simpler::tmr::Tensor &base = orch_args.tensor(0).ref();
     const simpler::tmr::Tensor &result = orch_args.tensor(1).ref();
 
-    int steps = static_cast<int>(orch_args.scalar(0));
+    int steps = orch_args.scalar<int>(0);
     if (steps <= 0) {
         return;
     }

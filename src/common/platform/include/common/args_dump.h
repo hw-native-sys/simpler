@@ -231,13 +231,27 @@ static_assert(sizeof(DumpReadyQueueEntry) == 32, "DumpReadyQueueEntry must be 32
  * - Queue full: (tail + 1) % capacity == head
  */
 
-// Args-dump level. Carried in DumpDataHeader so the AICPU can latch the mode
+// Args-dump mode. Carried in DumpDataHeader so the AICPU can latch the mode
 // before any task is dispatched.
+//
+// This is two independent choices, not a severity dial: which tasks and args
+// reach the JSON manifest, and which of those also write payload bytes into
+// args.bin. Payload is always a subset of manifest, so three combinations
+// exist:
+//
+//   value           manifest                 payload
+//   1 PARTIAL       Arg::dump()-marked only  the same marked args
+//   2 HYBRID        every task               Arg::dump()-marked args only
+//   3 FULL          every task               every arg
+//
+// The values are assigned so that a higher one is a strict superset of a lower
+// one, which is what makes an ordinal comparison meaningful here. A mode added
+// later that is not a superset must not simply take the next number.
 enum class DumpArgsLevel : uint32_t {
-    OFF = 0,      // no dump
-    PARTIAL = 1,  // only args marked with Arg::dump(...)
-    FULL = 2,     // every task's tensor/scalar I/O (JSON manifest + BIN payload)
-    HYBRID = 3,   // every task's metadata; payload only for Arg::dump()-marked tensors
+    OFF = 0,
+    PARTIAL = 1,
+    HYBRID = 2,
+    FULL = 3,
 };
 
 struct DumpDataHeader {
@@ -251,7 +265,7 @@ struct DumpDataHeader {
     uint32_t records_per_buffer;
     uint64_t arena_size_per_thread;
     uint32_t magic;
-    uint32_t dump_args_level;  // DumpArgsLevel: 0=off, 1=partial, 2=full, 3=hybrid
+    uint32_t dump_args_level;  // DumpArgsLevel: 0=off, 1=partial, 2=hybrid, 3=full
 } __attribute__((aligned(64)));
 
 // =============================================================================

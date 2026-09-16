@@ -32,7 +32,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     const simpler::hbg::Tensor &a = args.tensor(0).ref();
     const simpler::hbg::Tensor &b = args.tensor(1).ref();
     const simpler::hbg::Tensor &out = args.tensor(2).ref();
-    const uint64_t spin_iters = args.scalar(0);
+    const uint64_t spin_iters = args.scalar<uint64_t>(0);
     uint32_t shape[1] = {a.shapes[0]};
     TensorCreateInfo temporary(shape, 1, DataType::FLOAT32);
 

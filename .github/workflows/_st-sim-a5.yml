@@ -140,12 +140,20 @@ jobs:
             --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
             --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" --enable-pmu 2
 
-      - name: args_dump smoke (a5)
+      # `hybrid` here; see the mode-per-lane rationale in _st-sim-a2a3.yml.
+      # a5sim takes this one because it is the payload-selective mode and a5's
+      # payload path is the one that was broken (#1560): every task reaches the
+      # manifest, but only Arg::dump()-marked args write bytes, so args.bin is
+      # opened lazily and the manifest reports `bin_file: null` when nothing is
+      # marked. This is also the mode simpler_setup.tools.core_swimlane replays
+      # from, so it is the one whose producer must keep matching that consumer.
+      - name: args_dump smoke (a5, hybrid)
         if: inputs.include_dfx_smokes
         run: |
           .venv/bin/python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py \
             --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
-            --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" --dump-args
+            --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" \
+            --dump-args hybrid
 
       - name: scope_stats smoke (a5)
         if: inputs.include_dfx_smokes

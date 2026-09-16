@@ -228,8 +228,9 @@ TEST(SchedulerProfilingLevel, DispatchWritesTaskIdentityBeforePhaseDetails) {
         storage.contexts[1].core_type = static_cast<int32_t>(CoreType::AIC);
         SchedulerReadyClaim ready_claim{};
         ready_claim.task_id = 0;
-        ready_claim.claim_start_cycles = 123;
-        ready_claim.claim_end_cycles = 456;
+        ready_claim.source = SchedulerReadySource::STOLEN;
+        ready_claim.state_probe_start_cycles = 100;
+        ready_claim.state_probe_end_cycles = 123;
 
         ASSERT_TRUE(scheduler_fill_dispatch_slot(
             graph.graph(), storage.scheduler_state->base(), &storage.contexts[1], storage.run_control,
@@ -239,8 +240,21 @@ TEST(SchedulerProfilingLevel, DispatchWritesTaskIdentityBeforePhaseDetails) {
             scheduler_state_at<SchedulerTaskTrace>(storage.scheduler_state->base(), storage.layout.trace_cells_offset);
         EXPECT_EQ(traces[0].worker_id, level == 0 ? 0u : storage.contexts[1].worker_index);
         EXPECT_EQ(traces[0].task_id, 0u);
-        EXPECT_EQ(traces[0].claim_start_cycles, level >= SCHEDULER_PROFILING_SCHED_PHASES_LEVEL ? 123u : 0u);
-        EXPECT_EQ(traces[0].claim_end_cycles, level >= SCHEDULER_PROFILING_SCHED_PHASES_LEVEL ? 456u : 0u);
+        EXPECT_EQ(
+            traces[0].state_probe_scheduler_worker_id,
+            level >= SCHEDULER_PROFILING_SCHED_PHASES_LEVEL ? storage.contexts[1].worker_index : 0u
+        );
+        EXPECT_EQ(traces[0].state_probe_start_cycles, level >= SCHEDULER_PROFILING_SCHED_PHASES_LEVEL ? 100u : 0u);
+        EXPECT_EQ(traces[0].state_probe_end_cycles, level >= SCHEDULER_PROFILING_SCHED_PHASES_LEVEL ? 123u : 0u);
+        EXPECT_EQ(
+            traces[0].ready_source,
+            level >= SCHEDULER_PROFILING_SCHED_PHASES_LEVEL ? static_cast<uint64_t>(SchedulerReadySource::STOLEN) : 0u
+        );
+        EXPECT_EQ(
+            traces[0].publication_mode, level >= SCHEDULER_PROFILING_SCHED_PHASES_LEVEL ?
+                                            static_cast<uint64_t>(SchedulerPublicationMode::DISPATCH) :
+                                            0u
+        );
     }
 }
 
@@ -1209,7 +1223,7 @@ TEST(SchedulerReadyWake, WakeResolveQueuesBehindOlderPublishedWork) {
     controls[0].state = static_cast<int64_t>(SchedulerTaskState::DONE);
     ASSERT_TRUE(scheduler_resolve_completion(
         graph.graph(), storage.scheduler_state->base(), &storage.contexts[0], storage.run_control, 0, &wake, &ready,
-        &completion, &owner_state, false, true, nullptr
+        &completion, &owner_state, false, true
     ));
     EXPECT_EQ(completion.resolve_count, 1u);
     EXPECT_EQ(scheduler_ready_pending_head(owner_state.queues[0].pending_endpoints), 1);

@@ -62,8 +62,7 @@ bool bind_graph_topology(GraphExecution &execution) {
     // range overflows the increment before any bound check can see it.
     if (definition.task_count <= 0 || definition.task_count > MAX_IN_GRAPH_TASKS) return false;
     // GRAPH_MAX_SCALAR_ARGS, not MAX_SCALAR_ARGS: this counts the scalars the
-    // Graph BOUNDARY carries, which the recorder sizes with
-    // GraphTaskArgs = Arg<GRAPH_MAX_TENSOR_ARGS, GRAPH_MAX_SCALAR_ARGS> and the
+    // Graph BOUNDARY carries, which the recorder sizes with GraphTaskArgs and the
     // outer Graph payload hands it to GraphExecution, never through an in-graph task
     // payload. MAX_SCALAR_ARGS is the per-AICore-task cap (16) and applies to
     // InGraphTaskDefinition::scalar_count below, which is checked separately; using
@@ -130,6 +129,18 @@ bool bind_graph_topology(GraphExecution &execution) {
         const int32_t end = fanin_offsets[consumer + 1];
         if (begin > end || end > definition.edge_count) return false;
         if (begin == end) observed_roots++;
+        // ED_FLAG_CANDIDATE steers dispatch from materialization onward, so the
+        // image must carry the whole conjunction the recorder decided it by, not
+        // merely a known bit: a candidate with no producer has nothing to bet on,
+        // a DUMMY one would index early_dispatch_queues[] one past its last
+        // shape, and a predicated one would be released before its predicate is
+        // ever tested. graph_fill_definition is the only writer of this field and
+        // holds all three, so a violation means the image is not one it produced.
+        if ((tasks[consumer].ed_flags & ED_FLAG_CANDIDATE) != 0 &&
+            (begin == end || tasks[consumer].predicate_slot != 0 ||
+             ActiveMask(tasks[consumer].active_mask).to_shape() == ResourceShape::DUMMY)) {
+            return false;
+        }
         for (int32_t edge = begin; edge < end; ++edge) {
             if (fanin_indices[edge] >= consumer) return false;
         }
@@ -373,18 +384,19 @@ GraphMaterializeResult graph_execution_materialize_slice(
         definition.scalar_arg_count == 0 ?
             nullptr :
             graph_definition_array<uint64_t>(definition, definition.off_scalars, definition.scalar_arg_count);
-    const GraphScalarSourceRef *scalar_sources =
-        definition.scalar_arg_count == 0 ? nullptr :
-                                           graph_definition_array<GraphScalarSourceRef>(
-                                               definition, definition.off_scalar_sources, definition.scalar_arg_count
-                                           );
+    const GraphScalarInheritance *scalar_inheritance =
+        definition.scalar_arg_count == 0 ?
+            nullptr :
+            graph_definition_array<GraphScalarInheritance>(
+                definition, definition.off_scalar_inheritance, definition.scalar_arg_count
+            );
     const GraphPredicate *predicates =
         definition.predicate_count == 0 ?
             nullptr :
             graph_definition_array<GraphPredicate>(definition, definition.off_predicates, definition.predicate_count);
     if (tasks == nullptr || in_graph_task_offsets == nullptr ||
         (definition.tensor_arg_count != 0 && (definition_tensors == nullptr || tensor_sources == nullptr)) ||
-        (definition.scalar_arg_count != 0 && (definition_scalars == nullptr || scalar_sources == nullptr)) ||
+        (definition.scalar_arg_count != 0 && (definition_scalars == nullptr || scalar_inheritance == nullptr)) ||
         (definition.predicate_count != 0 && predicates == nullptr)) {
         execution.materialize_busy.store(0, std::memory_order_release);
         return GraphMaterializeResult::INVALID;
@@ -393,6 +405,12 @@ GraphMaterializeResult graph_execution_materialize_slice(
     const int32_t first = execution.materialized_tasks;
     const int32_t last = std::min(execution.task_count, first + max_tasks);
     const uintptr_t outer_base = reinterpret_cast<uintptr_t>(outer_slot.to_descriptor().packed_buffer_base);
+    // stage_graph_roots_early is the only path that gives a body root a staging
+    // claim, and it runs only when the shell itself is released early, so under
+    // a shell the host did not qualify no root can ever be staged. The shell's
+    // verdict is written by the host before upload and never changes, so this is
+    // loop-invariant for the whole execution.
+    const bool shell_stages_roots = (outer_slot.ed_flags & ED_FLAG_CANDIDATE) != 0;
     for (int32_t i = first; i < last; ++i) {
         ChipTaskStorage *storage = &execution.task_at(i);
         if (i >= execution.constructed_tasks) {
@@ -419,12 +437,36 @@ GraphMaterializeResult graph_execution_materialize_slice(
         execution.reset_task_state(i);
         slot.active_mask = ActiveMask(source.active_mask);
         slot.task_attrs = TaskAttrs(source.task_attrs);
+        // Recording decided these once for the whole body; every execution of the
+        // same Definition qualifies the same tasks, so materialization only
+        // replays the verdict.
+        slot.ed_flags = source.ed_flags;
         slot.total_required_subtasks = source.total_required_subtasks;
         slot.logical_block_num = source.logical_block_num;
         slot.in_graph_local_id = i;
         // A task in a Graph body is an ordinary leaf, classified by the same rule as
         // one submitted outside a Graph. Its membership is carried by graph_context.
         slot.task_kind = slot.active_mask.is_dummy() ? TaskKind::DUMMY : TaskKind::KERNEL;
+        // A root carries no recorded verdict — qualification needs a producer to
+        // bet on and a root has none inside the body — but an early-released
+        // shell stages roots on the body's behalf, and push_ready_routed reads
+        // this flag to decide whether a task may hold a staging claim. The two
+        // per-task terms are the ones the recorded conjunction applies to the
+        // task itself, and both are load-bearing rather than defensive: a DUMMY
+        // task has no dispatchable shape to index a per-shape queue with, and a
+        // predicated task must reach the predicate test in push_ready_routed,
+        // which an early release returns before. The shell term keeps the flag
+        // off a root nothing can stage, which would otherwise pay a seq_cst CAS
+        // on every route for a claim it can never hold.
+        //
+        // Deciding it here rather than at staging time is what makes it safe:
+        // materialization owns this slot exclusively and runs strictly before
+        // any path can route the root, so the flag is never written beside a
+        // reader.
+        const bool root_stageable = shell_stages_roots &&
+                                    execution.fanin_offsets[i] == execution.fanin_offsets[i + 1] &&
+                                    !slot.task_attrs.has_predicate() && slot.task_kind != TaskKind::DUMMY;
+        if (root_stageable) slot.ed_flags |= ED_FLAG_CANDIDATE;
         slot.graph_context = &execution;
         payload.tensor_count = source.tensor_count;
         payload.scalar_count = source.scalar_count;
@@ -462,18 +504,15 @@ GraphMaterializeResult graph_execution_materialize_slice(
         uint64_t *task_scalars = payload.scalar_data();
         for (int32_t j = 0; j < source.scalar_count; ++j) {
             const int32_t scalar_index = source.scalar_offset + j;
-            const GraphScalarSourceRef &ref = scalar_sources[scalar_index];
-            if (ref.source_kind == static_cast<uint8_t>(GraphScalarSourceKind::STATIC_VALUE)) {
+            const GraphScalarInheritance &ref = scalar_inheritance[scalar_index];
+            if (!ref.inherited()) {
                 task_scalars[j] = definition_scalars[scalar_index];
-            } else if (ref.source_kind == static_cast<uint8_t>(GraphScalarSourceKind::BOUNDARY)) {
-                if (ref.source_index >= execution.boundary_scalar_count || execution.boundary_scalars == nullptr) {
+            } else {
+                if (ref.boundary_index() >= execution.boundary_scalar_count || execution.boundary_scalars == nullptr) {
                     execution.materialize_busy.store(0, std::memory_order_release);
                     return GraphMaterializeResult::INVALID;
                 }
-                task_scalars[j] = execution.boundary_scalars[ref.source_index];
-            } else {
-                execution.materialize_busy.store(0, std::memory_order_release);
-                return GraphMaterializeResult::INVALID;
+                task_scalars[j] = execution.boundary_scalars[ref.boundary_index()];
             }
         }
         reset_graph_payload(payload);

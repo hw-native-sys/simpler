@@ -1047,6 +1047,68 @@ TEST(BufferPoolManagerShardingTest, BlockBatchCarvesRangeMappingsAndReleasesBase
     manager.clear_mappings();
 }
 
+TEST(BufferPoolManagerShardingTest, ConcurrentBlockRegistrationAndResolutionPreservesMappings) {
+    using Manager = profiling_common::BufferPoolManager<TestModule>;
+
+    Manager manager;
+    profiling_common::MemoryOps ops;
+    ops.alloc = [](size_t size) {
+        return std::malloc(size);
+    };
+    ops.reg = [](void *dev_ptr, size_t /*size*/, int /*device_id*/, void **host_ptr_out) {
+        *host_ptr_out = dev_ptr;
+        return 0;
+    };
+    manager.set_memory_context(std::move(ops), nullptr, nullptr, 0, 0);
+
+    void *stable_host = nullptr;
+    void *stable_dev = manager.alloc_and_register_block(64, &stable_host);
+    ASSERT_NE(stable_dev, nullptr);
+    ASSERT_EQ(stable_host, stable_dev);
+    void *inner_dev = reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(stable_dev) + 1);
+    void *inner_host = reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(stable_host) + 1);
+
+    std::atomic<int> readers_ready{0};
+    std::atomic<bool> start{false};
+    std::atomic<bool> writer_done{false};
+    std::atomic<int> failures{0};
+    auto resolve_until_done = [&](void *dev_ptr, void *expected_host_ptr) {
+        readers_ready.fetch_add(1, std::memory_order_release);
+        while (!start.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        do {
+            if (manager.resolve_host_ptr(dev_ptr) != expected_host_ptr) {
+                failures.fetch_add(1, std::memory_order_relaxed);
+            }
+            std::this_thread::yield();
+        } while (!writer_done.load(std::memory_order_acquire));
+    };
+
+    std::thread exact_reader(resolve_until_done, stable_dev, stable_host);
+    std::thread range_reader(resolve_until_done, inner_dev, inner_host);
+    while (readers_ready.load(std::memory_order_acquire) != 2) {
+        std::this_thread::yield();
+    }
+    start.store(true, std::memory_order_release);
+
+    constexpr int kAdditionalBlocks = 2048;
+    for (int i = 0; i < kAdditionalBlocks; i++) {
+        void *host_ptr = nullptr;
+        if (manager.alloc_and_register_block(64, &host_ptr) == nullptr || host_ptr == nullptr) {
+            failures.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    writer_done.store(true, std::memory_order_release);
+    exact_reader.join();
+    range_reader.join();
+
+    EXPECT_EQ(failures.load(std::memory_order_relaxed), 0);
+    manager.release_all_owned([](void *p) {
+        std::free(p);
+    });
+}
+
 TEST(BufferPoolManagerShardingTest, FreeBufferAllowsAllocationAddressReuse) {
     using Manager = profiling_common::BufferPoolManager<TestModule>;
 

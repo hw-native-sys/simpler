@@ -122,10 +122,10 @@ static inline TaskOutputTensors alloc_tensors(const TensorCreateInfo create_info
     for (uint32_t i = 0; i < count; i++) {
         args.add_output(create_infos[i]);
     }
-    if (args.has_error) {
+    if (args.has_error()) {
         rt->ops->report_fatal(
             rt, SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "%s",
-            args.error_msg ? args.error_msg : "alloc_tensors failed to construct output-only Arg"
+            args.error_msg() ? args.error_msg() : "alloc_tensors failed to construct output-only Arg"
         );
         return TaskOutputTensors{};
     }
@@ -145,10 +145,10 @@ static inline TaskOutputTensors alloc_tensors(const CIs &...cis) {
     }
     CoreTaskArgs args;
     (args.add_output(cis), ...);
-    if (args.has_error) {
+    if (args.has_error()) {
         rt->ops->report_fatal(
             rt, SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "%s",
-            args.error_msg ? args.error_msg : "alloc_tensors failed to construct output-only Arg"
+            args.error_msg() ? args.error_msg() : "alloc_tensors failed to construct output-only Arg"
         );
         return TaskOutputTensors{};
     }
@@ -431,7 +431,7 @@ static inline uint64_t rt_graph_function_id(Function function) {
 // its own boundary copy as a parameter for exactly that reason.
 template <typename Invoke>
 static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const GraphTaskArgs &args, Invoke invoke) {
-    debug_assert(!args.has_error && "Graph boundary GraphTaskArgs construction failed");
+    debug_assert(!args.has_error() && "Graph boundary GraphTaskArgs construction failed");
     debug_assert(args.tensor_count() <= GRAPH_MAX_TENSOR_ARGS && "Graph boundary exceeds the tensor limit");
     debug_assert(
         args.explicit_dep_count() == 0 && "Explicit dependencies crossing the Graph boundary are not supported"
@@ -467,9 +467,13 @@ static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const G
     const uint64_t _begun_ns = rt_orch_phase_now_ns();
     if (result.recording) {
         void *handle = result.recording_handle;
+        // The formal parameters the body reads: the entry's own copy, not `args` -- the
+        // caller only lends those for the duration of this call, and recording resolves a
+        // task slot's origin against this object's slot array.
+        const GraphTaskArgs &params = *result.params;
         // A std::function rather than a bare lambda because the pool takes it as one
         // through the ops table's void *.
-        std::function<void(GraphTaskArgs &)> job = [invoke, handle](GraphTaskArgs &record_args) mutable {
+        std::function<void(const GraphTaskArgs &)> job = [invoke, handle](const GraphTaskArgs &record_args) mutable {
             try {
                 if (!rt_graph_prepare(handle, record_args)) {
                     rt_graph_abort(handle);
@@ -491,15 +495,15 @@ static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const G
         // costs nothing here, because the fallback below re-runs `invoke` -- captured by
         // value, so unaffected -- rather than the job.
         RuntimeContext *record_rt = current_runtime();
-        const bool queued =
-            record_rt->ops->graph_record_start != nullptr && record_rt->ops->graph_record_start(record_rt, args, &job);
+        const bool queued = record_rt->ops->graph_record_start != nullptr &&
+                            record_rt->ops->graph_record_start(record_rt, params, &job);
         if (!queued) {
             try {
-                if (!rt_graph_prepare(handle, args)) {
+                if (!rt_graph_prepare(handle, params)) {
                     rt_graph_abort(handle);
                     return result;
                 }
-                invoke(args);
+                invoke(params);
                 (void)rt_graph_end();
             } catch (...) {
                 rt_graph_abort(handle);

@@ -8,20 +8,14 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-#include "host/platform_compile_info.h"
-#include "host/runtime_compile_info.h"
-#include <string.h>
+#pragma once
 
-extern "C" {
-
-ToolchainType get_incore_compiler(void) {
-    if (strcmp(get_platform(), "a2a3") == 0) return TOOLCHAIN_CCEC;
-    return TOOLCHAIN_HOST_GXX_15;
-}
-
-ToolchainType get_orchestration_compiler(void) {
-    // tensormap_and_ringbuffer: a2a3 needs aarch64 cross-compile (AICPU is aarch64)
-    if (strcmp(get_platform(), "a2a3") == 0) return TOOLCHAIN_AARCH64_GXX;
-    return TOOLCHAIN_HOST_GXX;
-}
-}
+/// Reduction operator for simpler hand-written collective kernels.
+/// Mirrors pypto's ReduceOp (include/pypto/ir/comm.h) without a cross-repo
+/// include dependency.
+enum class CollectiveReduceOp : int {
+    kSum = 0,
+    kMax = 1,
+    kMin = 2,
+    kProd = 3,
+};

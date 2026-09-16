@@ -162,7 +162,7 @@ def test_l2_records_after_argument_build_before_run(monkeypatch):
     monkeypatch.setattr(
         scene_test,
         "_build_l2_ref_args",
-        lambda *_args: (events.append("args") or object(), []),
+        lambda *_args, **_kwargs: (events.append("args") or object(), []),
     )
     monkeypatch.setattr(
         _MinimalCase,

@@ -38,19 +38,30 @@ struct HostApiOps {
     // backend without a host-map path return nullptr / no-op.
     void *(*register_device_memory_to_host)(void *runner_ctx, void *dev_ptr, size_t bytes);
     void (*unregister_device_memory_from_host)(void *runner_ctx, void *dev_ptr);
+    // Host view of a child-memory address, for a host-side orchestrator
+    // (host_build_graph) that reads or writes a device-resident tensor's bytes
+    // to shape the graph. Unlike the pair above, the runner owns the mapping:
+    // it is established over the whole containing allocation on first request
+    // and released by the free of that allocation, so a bind neither pays for
+    // it again nor has to pair an unregister. Returns a host address carrying
+    // dev_ptr's offset, or nullptr when this backend cannot map device memory
+    // to the host (a5 onboard) or the mapping was refused for this allocation
+    // (see issue #1531) — the caller then serves each access with a copy.
+    void *(*acquire_child_memory_host_view)(void *runner_ctx, void *dev_ptr, size_t bytes);
     // Set a device buffer to a byte value (device-side, no PCIe). Used to
     // zero-init pure OUTPUT buffers in lieu of an H2D copy-in.
     int (*device_memset)(void *runner_ctx, void *dev_ptr, int value, size_t size);
-    // Runner-scoped retained temporary buffer for TRB device-arg staging.
-    // This is NOT an allocator — it is a single {addr, size} slot that lives
-    // across runs on the DeviceRunner. trb bind reads the slot, and if the
-    // retained buffer is too small for this run's packed temporary size it
-    // device_free's the old one, device_malloc's a bigger one, and writes the
-    // new {addr, size} back. The grow/pack/slice logic lives in trb bind
-    // (runtime_maker); the platform only remembers the slot so it can be reused
-    // by later runs and freed at finalize. The slot is per pipeline slot, so
-    // two runs in different slots never share a staging buffer. `get` returns
-    // {nullptr, 0} when nothing is retained yet.
+    // Runner-scoped retained temporary buffer for device arguments, used by
+    // every host runtime that gives caller tensors a device buffer. This is NOT an allocator —
+    // it is a single {addr, size} slot that lives across runs on the
+    // DeviceRunner. A bind reads the slot, and if the retained buffer is too
+    // small for this run's packed temporary size it device_free's the old one,
+    // device_malloc's a bigger one, and writes the new {addr, size} back. The
+    // grow/slice logic lives in utils/retained_temp_bump.h; the platform only
+    // remembers the slot so it can be reused by later runs and freed at
+    // finalize. The slot is per pipeline slot, so two runs in different slots
+    // never share a staging buffer. `get` returns {nullptr, 0} when nothing is
+    // retained yet.
     void (*get_retained_temp_buffer)(void *runner_ctx, uint32_t pipeline_slot, void **addr, size_t *size);
     void (*set_retained_temp_buffer)(void *runner_ctx, uint32_t pipeline_slot, void *addr, size_t size);
     // Runner-owned Graph Definition storage: one device block per pipeline slot
@@ -145,8 +156,10 @@ struct HostApiOps {
     // chip-swimlane level, `producer_wants_records` carries the producer's own
     // (a runtime knob the platform does not read).
     uint32_t (*get_chip_swimlane_level)(void *runner_ctx);
-    void *(*host_phase_pool_arm)(void *runner_ctx, int producer_wants_records);
-    void (*host_phase_pool_finish)(void *runner_ctx, uint64_t submitted_tasks, uint64_t invocation_id);
+    void *(*host_phase_pool_arm)(void *runner_ctx, uint32_t pipeline_slot, int producer_wants_records);
+    void (*host_phase_pool_finish)(
+        void *runner_ctx, uint32_t pipeline_slot, uint64_t submitted_tasks, uint64_t invocation_id
+    );
     bool (*publish_chip_swimlane_extension)(
         void *runner_ctx, ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size
     );
@@ -179,6 +192,10 @@ public:
     }
     void unregister_device_memory_from_host(void *dev_ptr) const {
         ops_->unregister_device_memory_from_host(runner_ctx_, dev_ptr);
+    }
+    void *acquire_child_memory_host_view(void *dev_ptr, size_t bytes) const {
+        if (ops_->acquire_child_memory_host_view == nullptr) return nullptr;
+        return ops_->acquire_child_memory_host_view(runner_ctx_, dev_ptr, bytes);
     }
     int device_memset(void *dev_ptr, int value, size_t size) const {
         return ops_->device_memset(runner_ctx_, dev_ptr, value, size);
@@ -243,6 +260,11 @@ public:
     /**
      * Arm this pass's host phase pool.
      *
+     * The pool is one per pipeline slot, not one per runner: a host-orchestrating
+     * bind is preparation, and a prepared successor prepares while its
+     * predecessor is still executing. `pipeline_slot_` is this run's, so the
+     * hook needs no argument for it.
+     *
      * @param producer_wants_records  the producer's own enabling condition; the
      *                                runner ORs it with the chip-swimlane level
      * @return HostPhaseRecordPool* to record into, or nullptr when this pass
@@ -251,11 +273,11 @@ public:
      */
     void *host_phase_pool_arm(bool producer_wants_records) const noexcept {
         if (ops_->host_phase_pool_arm == nullptr) return nullptr;
-        return ops_->host_phase_pool_arm(runner_ctx_, producer_wants_records ? 1 : 0);
+        return ops_->host_phase_pool_arm(runner_ctx_, pipeline_slot_, producer_wants_records ? 1 : 0);
     }
     void host_phase_pool_finish(uint64_t submitted_tasks, uint64_t invocation_id) const noexcept {
         if (ops_->host_phase_pool_finish != nullptr) {
-            ops_->host_phase_pool_finish(runner_ctx_, submitted_tasks, invocation_id);
+            ops_->host_phase_pool_finish(runner_ctx_, pipeline_slot_, submitted_tasks, invocation_id);
         }
     }
     bool publish_chip_swimlane_extension(

@@ -68,7 +68,7 @@ collapse that into a single type were considered and dropped.
 
 ### Rejected: merge `Tensor` into `ChipTensor`
 
-Drop `buffer.addr`, add the buffer descriptor, and have the H2D staging step
+Drop `buffer.addr`, add the buffer descriptor, and have the H2D copy-in step
 rewrite the backend tag and body (and mint a fresh identity for the device copy).
 That is self-consistent, but it charges the device for host-side fields:
 
@@ -132,8 +132,8 @@ task.
 > OverlapMap by it rather than by `buffer.addr` would make two views of one
 > backing bucket together by construction. That needs 32 B — which fits the
 > existing `_pad_cl2[36]` at `sizeof == 128`, i.e. **without** merging anything
-> else. If it is ever done, the H2D staging step must mint a *new* identity for
-> each staged copy, because the device buffer is a distinct backing from the host
+> else. If it is ever done, the H2D copy-in step must mint a *new* identity for
+> each copy, because the device buffer is a distinct backing from the host
 > one it was copied from.
 
 ### Rejected: keep the wire type transport-only, use `ChipTensor` in the L3 orch
@@ -337,7 +337,7 @@ values are final, at submit:
   named as an output and then silently losing every write in the child.
 - **No overlapping writes within one task.** Two arguments of one task that name
   intersecting bytes of the same backing are rejected: they belong to one node,
-  so there is no order between them to express, and a device-staged copy of a
+  so there is no order between them to express, and a device-side copy of a
   host backing does not even alias on the device for the L2 overlap map to
   notice. Disjoint slices of one buffer stay legal — that is what `byte_offset`
   is for, and this check runs the same two-stage comparison dependency

@@ -12,7 +12,7 @@
 Given a SceneTest test file + platform + a comma-list of func_ids (the mix
 member set), this tool:
   1. runs (or reuses) an args dump to capture the task's real per-arg
-     metadata with `--dump-args 3` (hybrid); tensors marked by orchestration's
+     metadata with `--dump-args hybrid`; tensors marked by orchestration's
      `CoreTaskArgs::dump(...)` also contribute payload bytes,
   2. picks the task whose active-subtask set == `--func-id` and reconstructs its
      FULL positional args[] (shapes / dtypes / strides / start_offset / scalar
@@ -270,9 +270,9 @@ def get_or_run_dump(
 
     outputs = PROJECT_ROOT / "outputs"
     before = set(outputs.glob("*/args_dump")) if outputs.is_dir() else set()
-    # Hybrid Level 3 captures the complete metadata needed by this Core swimlane replay
-    # and reuses the existing Arg::dump() mask for requested tensor payload.
-    cmd = [sys.executable, str(test_path), "-p", platform, "--dump-args", "3"]
+    # The hybrid mode captures the complete metadata this Core swimlane replay
+    # needs and reuses the existing Arg::dump() mask for requested tensor payload.
+    cmd = [sys.executable, str(test_path), "-p", platform, "--dump-args", "hybrid"]
     # Pin the dump to exactly one case, allowing it to be `manual` (core_swimlane
     # tracing targets are often manual to stay out of CI). `case` is main's
     # resolved case: the explicit --case, else the auto-pinned first-platform
@@ -492,7 +492,7 @@ def restore_arg_payloads(manifest: Path, kargs: list[dict], restore_slots):
         raise ValueError(
             "--restore-arg requires a payload-carrying dump; this manifest has no bin_file "
             "(mark the tensor with CoreTaskArgs::dump(...) in orchestration and recapture with "
-            "--dump-args 3 (hybrid))"
+            "--dump-args hybrid)"
         )
     bin_path = manifest.parent / bin_name
     if not bin_path.is_file():

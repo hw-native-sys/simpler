@@ -143,7 +143,53 @@ void *DeviceRunnerBase::allocate_tensor(std::size_t bytes) { return mem_alloc_.a
 
 void DeviceRunnerBase::free_tensor(void *dev_ptr) {
     if (dev_ptr != nullptr) {
+        // Before the pages go: a mapping outliving them would hand a live host
+        // VA to whatever the driver puts there next.
+        if (child_memory_host_views_.take(dev_ptr)) {
+            unregister_device_memory_from_host(dev_ptr);
+        }
         mem_alloc_.free(dev_ptr);
+    }
+}
+
+void *DeviceRunnerBase::acquire_child_memory_host_view(void *dev_ptr, std::size_t bytes) {
+    if (dev_ptr == nullptr || bytes == 0) return nullptr;
+
+    void *alloc_base = nullptr;
+    std::size_t alloc_size = 0;
+    if (!mem_alloc_.owning_allocation(dev_ptr, &alloc_base, &alloc_size)) {
+        LOG_ERROR("acquire_child_memory_host_view: %p is not inside a tracked device allocation", dev_ptr);
+        return nullptr;
+    }
+    const auto *end = static_cast<const unsigned char *>(dev_ptr) + bytes;
+    if (end > static_cast<const unsigned char *>(alloc_base) + alloc_size) {
+        LOG_ERROR(
+            "acquire_child_memory_host_view: [%p, +%zu) overruns its allocation [%p, +%zu)", dev_ptr, bytes, alloc_base,
+            alloc_size
+        );
+        return nullptr;
+    }
+
+    if (void *cached = child_memory_host_views_.lookup(alloc_base, dev_ptr); cached != nullptr) {
+        return cached;
+    }
+
+    void *host_view = register_device_memory_to_host(alloc_base, alloc_size);
+    if (host_view == nullptr) {
+        return nullptr;
+    }
+    child_memory_host_views_.insert(alloc_base, alloc_size, host_view);
+    LOG_INFO(
+        "host-orch: mapped child-memory allocation %p (%zu bytes); %zu mapping(s), %llu bytes held", alloc_base,
+        alloc_size, child_memory_host_views_.count(),
+        static_cast<unsigned long long>(child_memory_host_views_.mapped_bytes())
+    );
+    return child_memory_host_views_.lookup(alloc_base, dev_ptr);
+}
+
+void DeviceRunnerBase::release_child_memory_host_views() {
+    for (void *alloc_base : child_memory_host_views_.take_all()) {
+        unregister_device_memory_from_host(alloc_base);
     }
 }
 
@@ -372,6 +418,39 @@ int DeviceRunnerBase::setup_static_arena(
     // so their callers don't have to re-acquire.
     ArenaBank &bank = this->arena_bank(arena_bank);
 
+    // Captured graphs can retain committed base addresses, so kernel mode
+    // forbids growing or releasing a region that is already committed. The
+    // check covers all three regions and completes before the first
+    // commit_region call, which is what makes the refusal side-effect-free:
+    // a refusal raised from inside the commit sequence would fall into the
+    // unified rollback below, whose release() calls free the very base
+    // addresses the refusal exists to preserve.
+    if (execution_mode_latch().is_kernel()) {
+        const struct {
+            const DeviceArena &arena;
+            size_t cached_size;
+            size_t requested_size;
+            const char *name;
+        } regions[] = {
+            {bank.gm_heap, bank.cached_gm_heap_size, gm_heap_size, "gm_heap"},
+            {bank.gm_sm, bank.cached_gm_sm_size, gm_sm_size, "gm_sm"},
+            {bank.runtime_pool, bank.cached_runtime_arena_size, runtime_arena_size, "runtime_pool"},
+        };
+        for (const auto &region : regions) {
+            if (!kernel_arena_change_is_forbidden(
+                    region.arena.is_committed(), region.cached_size, region.requested_size
+                )) {
+                continue;
+            }
+            LOG_ERROR(
+                "setup_static_arena: kernel mode forbids %s committed region %s (cached %zu, requested %zu)",
+                region.requested_size == 0 ? "releasing" : "growing", region.name, region.cached_size,
+                region.requested_size
+            );
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+    }
+
     bool arena_changed = false;
     auto commit_region = [&arena_changed](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
         if (requested_size == 0) {
@@ -441,6 +520,10 @@ int DeviceRunnerBase::setup_static_arena(
 }
 
 std::thread DeviceRunnerBase::create_thread(std::function<void()> fn) {
+    // A freshly spawned thread carries no CANN device context of its own, so
+    // this bind creates one rather than taking anything from the caller — it
+    // is the one rtSetDevice a borrowed-device context still owns, and it is
+    // scoped to a thread this runner created.
     int dev_id = device_id_;
     return std::thread([dev_id, fn = std::move(fn)]() {
         rtSetDevice(dev_id);
@@ -448,7 +531,7 @@ std::thread DeviceRunnerBase::create_thread(std::function<void()> fn) {
     });
 }
 
-int DeviceRunnerBase::attach_current_thread(int device_id) {
+int DeviceRunnerBase::bind_current_thread(int device_id) {
     if (device_id < 0) {
         LOG_ERROR("Invalid device_id: %d", device_id);
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -468,13 +551,57 @@ int DeviceRunnerBase::attach_current_thread(int device_id) {
         ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
+    return 0;
+}
 
-    // simpler_init performs the only lifetime write. Prepared-run admission
-    // and execution subsequently attach different host threads, so repeated
-    // same-value writes here would still be a C++ data race.
+int DeviceRunnerBase::attach_current_thread(int device_id) {
+    // rtSetDevice and the op-execute watchdog below are acts of device
+    // ownership, so this entry belongs to a program context. A kernel context
+    // reaches its device through adopt_borrowed_device instead; the one caller
+    // here that runs under both identities is DeviceRunner::finalize(), which
+    // skips this call on a kernel latch.
+    if (execution_mode_latch().is_kernel()) {
+        LOG_ERROR("attach_current_thread: refused — a kernel-mode context does not own the caller's device");
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+
+    int rc = bind_current_thread(device_id);
+    if (rc != 0) return rc;
+
+    // Both writers of device_id_ — this one and adopt_borrowed_device — guard
+    // on the still-unset value, and both run before any prepare, execution or
+    // collector thread attaches. Prepared-run admission and execution
+    // subsequently attach different host threads, so repeated same-value
+    // writes here would still be a C++ data race.
     if (device_id_ == -1) {
         timeout_config_ = resolve_onboard_timeout_config();
         configure_aicore_op_timeout();
+        device_id_ = device_id;
+    }
+    return 0;
+}
+
+int DeviceRunnerBase::adopt_borrowed_device(int device_id) {
+    // The caller already holds this device current on its own threads, so the
+    // only thing a kernel context takes from it is the identity: no
+    // rtSetDevice, and no configure_aicore_op_timeout, which would rewrite the
+    // op-execute watchdog for every other user of that card. Resolving the
+    // timeout config is pure environment parsing and stays, because the stream
+    // and scheduler timeouts derived from it are read on both identities.
+    if (!execution_mode_latch().is_kernel()) {
+        LOG_ERROR("adopt_borrowed_device: refused — the context has not latched kernel mode");
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    if (device_id < 0) {
+        LOG_ERROR("Invalid device_id: %d", device_id);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (device_id_ != -1 && device_id_ != device_id) {
+        LOG_ERROR("DeviceRunner already on device %d; close before adopting device %d", device_id_, device_id);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (device_id_ == -1) {
+        timeout_config_ = resolve_onboard_timeout_config();
         device_id_ = device_id;
     }
     return 0;
@@ -1275,99 +1402,137 @@ extern "C" __attribute__((weak)) int prewarm_config_impl(
 
 void DeviceRunnerBase::apply_call_config(const CallConfig &config) {
     set_chip_swimlane_enabled(config.enable_chip_swimlane);
-    set_dump_args_enabled(config.enable_dump_args);
-    set_pmu_enabled(config.enable_pmu);
-    // Virtual: a2a3 and a5 wire through to their enable_dep_gen_; an arch
-    // without dep_gen falls through to the base no-op.
-    set_dep_gen_enabled(config.enable_dep_gen != 0);
-    set_scope_stats_enabled(config.enable_scope_stats != 0);
-    capture_clock_anchors_ = config.capture_clock_anchors != 0;
     set_output_prefix(config.output_prefix);
 }
 
-HostPhaseRecordPool *DeviceRunnerBase::host_phase_pool_arm(bool producer_wants_records) noexcept {
-    if (clock_correlation_provider_ != nullptr) {
-        clock_correlation_provider_->release(false);
-        clock_correlation_provider_.reset();
-    }
-    const bool swimlane_wants_records = chip_swimlane_level_ == ChipSwimlaneLevel::ORCH_PHASES;
-    const bool artifact_wants_records = producer_wants_records && !output_prefix_.empty();
-    chip_swimlane_collector_.set_host_orchestrated(swimlane_wants_records);
+void DeviceRunnerBase::begin_host_phase_run(uint32_t pipeline_slot, const DfxRunConfig &dfx) {
+    if (pipeline_slot >= host_phase_runs_.size()) return;
+    host_phase_runs_[pipeline_slot].begin(dfx);
+}
+
+HostPhaseRecordPool *
+DeviceRunnerBase::host_phase_pool_arm(uint32_t pipeline_slot, bool producer_wants_records) noexcept {
+    if (pipeline_slot >= host_phase_runs_.size()) return nullptr;
+    HostPhaseRunState &run = host_phase_runs_[pipeline_slot];
+    // Only a host-orchestrating bind reaches this, so arriving here is what
+    // makes the run's orchestrator phases host-produced.
+    run.host_orchestrated = run.chip_swimlane_level == ChipSwimlaneLevel::ORCH_PHASES;
+
     // arm() allocates the pool's buffers, so it can throw; this path is noexcept,
     // where an escaping exception is std::terminate. A pass that cannot get its
     // storage collects no records and says so by handing back nullptr.
     HostPhaseRecordPool *pool = nullptr;
     try {
-        pool = host_phase_records_.arm(artifact_wants_records || swimlane_wants_records);
+        pool = run.records.arm(run.wants_records(producer_wants_records));
     } catch (...) {
         LOG_WARN("Host phase pool could not be armed; this pass collects no per-event records");
     }
-    if (!swimlane_wants_records) return pool;
+    if (!run.host_orchestrated) return pool;
 
-    begin_clock_correlation_session_if_needed();
+    capture_clock_correlation_begin(run);
     return pool;
 }
 
-void DeviceRunnerBase::begin_clock_correlation_session_if_needed() noexcept {
-    if (chip_swimlane_level_ != ChipSwimlaneLevel::ORCH_PHASES || chip_swimlane_collector_.clock_correlation_active()) {
-        return;
-    }
+void DeviceRunnerBase::capture_clock_correlation_begin(HostPhaseRunState &run) noexcept {
+    // Sampled here, in the bind, because the anchor means the instant host
+    // orchestration began — the one thing about this state that cannot wait for
+    // the execution claim. It reaches the resident collector at launch, in
+    // publish_host_phase_run_to_collector().
+    if (run.clock_correlation != nullptr) return;
     try {
-        clock_correlation_provider_ = simpler::dfx::make_clock_correlation_provider();
-        chip_swimlane_collector_.begin_clock_correlation_session(
-            clock_correlation_provider_->name(), clock_correlation_provider_->raw_device_timestamp_unit()
-        );
-        chip_swimlane_collector_.record_clock_anchor_samples(
-            simpler::dfx::capture_clock_anchor_group(
-                *clock_correlation_provider_, simpler::dfx::ClockAnchorPosition::HostOrchestrationBegin
-            )
+        run.clock_correlation = simpler::dfx::make_clock_correlation_provider();
+        run.clock_provider_name = run.clock_correlation->name();
+        run.clock_provider_unit = run.clock_correlation->raw_device_timestamp_unit();
+        run.orchestration_begin_anchors = simpler::dfx::capture_clock_anchor_group(
+            *run.clock_correlation, simpler::dfx::ClockAnchorPosition::HostOrchestrationBegin
         );
     } catch (...) {
-        clock_correlation_provider_.reset();
-        try {
-            chip_swimlane_collector_.begin_clock_correlation_session("unavailable", "unknown");
-        } catch (...) {
-            // begin() stores diagnostic strings and can still fail under
-            // allocation pressure. Keep this noexcept path fail-closed.
-            chip_swimlane_collector_.finish_clock_correlation_session();
-        }
+        run.clock_correlation.reset();
+        run.orchestration_begin_anchors.clear();
+        run.clock_provider_name = "unavailable";
+        run.clock_provider_unit = "unknown";
     }
 }
 
-void DeviceRunnerBase::publish_host_phase_records_to_swimlane() {
-    if (!host_phase_records_.finished()) return;
+void DeviceRunnerBase::publish_host_phase_run_to_collector(uint32_t pipeline_slot) noexcept {
+    if (pipeline_slot >= host_phase_runs_.size()) return;
+    HostPhaseRunState &run = host_phase_runs_[pipeline_slot];
+    // Read by the collector's initialize() when it sizes the orch phase pool, so
+    // this has to precede it — both now run from the launch arming.
+    chip_swimlane_collector_.set_host_orchestrated(run.host_orchestrated);
+    // A clock-capture attempt supplies a provider name even when unavailable.
+    if (run.clock_provider_name.empty() || chip_swimlane_collector_.clock_correlation_active()) return;
+    try {
+        chip_swimlane_collector_.begin_clock_correlation_session(
+            run.clock_provider_name.c_str(), run.clock_provider_unit.c_str()
+        );
+        if (!run.orchestration_begin_anchors.empty()) {
+            chip_swimlane_collector_.record_clock_anchor_samples(run.orchestration_begin_anchors);
+        }
+        clock_correlation_session_slot_ = pipeline_slot;
+    } catch (...) {
+        // begin() stores diagnostic strings and can still fail under allocation
+        // pressure. Keep this noexcept path fail-closed.
+        chip_swimlane_collector_.finish_clock_correlation_session();
+    }
+}
+
+void DeviceRunnerBase::begin_clock_correlation_session_if_needed(uint32_t pipeline_slot) noexcept {
+    if (pipeline_slot >= host_phase_runs_.size()) return;
+    HostPhaseRunState &run = host_phase_runs_[pipeline_slot];
+    if (run.chip_swimlane_level != ChipSwimlaneLevel::ORCH_PHASES) return;
+    // The device-orchestrating path has no bind-time capture, so both halves run
+    // here, under the execution claim.
+    capture_clock_correlation_begin(run);
+    publish_host_phase_run_to_collector(pipeline_slot);
+}
+
+void DeviceRunnerBase::publish_host_phase_records_to_swimlane(uint32_t pipeline_slot) {
+    if (pipeline_slot >= host_phase_runs_.size()) return;
+    const simpler::dfx::HostPhaseRecordStore &records = host_phase_runs_[pipeline_slot].records;
+    if (!records.finished()) return;
     chip_swimlane_collector_.set_host_phase_records(
-        host_phase_records_.submit_records(), host_phase_records_.device_upload_records(),
-        host_phase_records_.submitted_tasks(), host_phase_records_.total_records(),
-        host_phase_records_.dropped_records()
+        records.submit_records(), records.device_upload_records(), records.submitted_tasks(), records.total_records(),
+        records.dropped_records()
     );
 }
 
 void DeviceRunnerBase::finish_clock_correlation_session(
-    bool capture_device_complete, bool abandon_device_resources
+    uint32_t pipeline_slot, bool capture_device_complete, bool abandon_device_resources
 ) noexcept {
-    if (!chip_swimlane_collector_.clock_correlation_active()) {
-        if (clock_correlation_provider_ != nullptr) {
-            clock_correlation_provider_->release(abandon_device_resources);
-            clock_correlation_provider_.reset();
+    std::unique_ptr<simpler::dfx::ClockCorrelationProvider> *provider = nullptr;
+    if (pipeline_slot < host_phase_runs_.size()) {
+        provider = &host_phase_runs_[pipeline_slot].clock_correlation;
+    }
+    auto release_provider = [&]() {
+        if (provider != nullptr && *provider != nullptr) {
+            (*provider)->release(abandon_device_resources);
+            provider->reset();
         }
+    };
+    // The providers are per slot but the collector holds one session, so only
+    // the slot that opened it may end it. A prepared successor that fails while
+    // its predecessor is executing reaches here for its own slot; ending the
+    // session there would cost the predecessor its DeviceExecutionComplete
+    // anchor and export a correlation with no closing edge.
+    if (!chip_swimlane_collector_.clock_correlation_active() || clock_correlation_session_slot_ != pipeline_slot) {
+        release_provider();
         return;
     }
-
-    if (capture_device_complete && clock_correlation_provider_ != nullptr) {
+    if (capture_device_complete && provider != nullptr && *provider != nullptr) {
         try {
             chip_swimlane_collector_.record_clock_anchor_samples(
                 simpler::dfx::capture_clock_anchor_group(
-                    *clock_correlation_provider_, simpler::dfx::ClockAnchorPosition::DeviceExecutionComplete
+                    **provider, simpler::dfx::ClockAnchorPosition::DeviceExecutionComplete
                 )
             );
-        } catch (...) {}
+        } catch (...) {
+            LOG_WARN("Device-complete clock anchors could not be sampled");
+        }
     }
     chip_swimlane_collector_.finish_clock_correlation_session();
-    if (clock_correlation_provider_ != nullptr) {
-        clock_correlation_provider_->release(abandon_device_resources);
-        clock_correlation_provider_.reset();
-    }
+    clock_correlation_session_slot_ = PTO_PIPELINE_MAX_DEPTH;
+    release_provider();
 }
 
 // =============================================================================
@@ -1400,7 +1565,11 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
         if (err != 0 && rc == 0) rc = err;
     };
 
-    finish_clock_correlation_session(false, abandon_device_resources);
+    // Every slot: finalize releases the runner's device-owning resources, and a
+    // provider that never reached a drain is one of them.
+    for (uint32_t slot = 0; slot < host_phase_runs_.size(); ++slot) {
+        finish_clock_correlation_session(slot, false, abandon_device_resources);
+    }
 
     // Teardown invariant: finalize_common() is the single place that releases
     // every RTS/device-owning resource, and the subclass runs it BEFORE its
@@ -1530,6 +1699,9 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
         abandon_graph_definition_blocks();
         retained_temp_addrs_.fill(nullptr);
         retained_temp_sizes_.fill(0);
+        // Forget the mappings without unregistering: the reset invalidated them
+        // and the call would be a further device operation.
+        (void)child_memory_host_views_.take_all();
     } else {
         release_graph_definition_blocks();
         clear_temporary_buffer();
@@ -1549,9 +1721,26 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
         device_wall_dev_ptr_ = nullptr;
     }
 
+    // Each slot's KernelArgs / runtime / register blocks outlive the runs that
+    // use them, so this is where they are returned — same reason and same
+    // ordering constraint as the device-wall buffer above. A failing free keeps
+    // its block recorded, so reporting the error is what lets a caller retry
+    // reach it.
+    for (SlotPersistentArgs &slot : slot_persistent_args_) {
+        if (abandon_device_resources) {
+            abandon_slot_persistent_args(slot);
+        } else {
+            capture(release_slot_persistent_args(slot, mem_alloc_));
+        }
+    }
+
     // Free all remaining allocations (including handshake buffer and binGmAddr)
     if (!abandon_device_resources) {
-        mem_alloc_.finalize();
+        // The mappings name the allocations mem_alloc_ is about to free, so
+        // they cannot be released after it. A force reset already invalidated
+        // both, and the unregister would be a further device call.
+        release_child_memory_host_views();
+        capture(mem_alloc_.finalize());
     }
 
     block_dim_ = 0;
@@ -1873,8 +2062,10 @@ void DeviceRunnerBase::read_device_wall_ns() {
     }
 }
 
-int DeviceRunnerBase::init_runtime_args_with_metadata(Runtime &runtime, KernelArgsHelper &kernel_args) {
-    int rc = kernel_args.init_runtime_args(runtime, mem_alloc_);
+int DeviceRunnerBase::init_runtime_args_with_metadata(
+    Runtime &runtime, KernelArgsHelper &kernel_args, SlotPersistentArgs &slot
+) {
+    int rc = kernel_args.init_runtime_args(runtime, mem_alloc_, slot);
     if (rc != 0) {
         LOG_ERROR("init_runtime_args failed: %d", rc);
         return rc;
@@ -1885,73 +2076,84 @@ int DeviceRunnerBase::init_runtime_args_with_metadata(Runtime &runtime, KernelAr
     return 0;
 }
 
-void DeviceRunnerBase::start_shared_collectors_for_run() {
-    // Start collector mgmt + poll threads now, just before kernels launch.
-    // Starting earlier wastes CPU on empty queues and risks tripping
-    // ProfilerBase's poll-loop idle-timeout if device-side init is slow.
+void DeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &dfx, uint32_t pipeline_slot) {
+    // Open each enabled collector's window and start its mgmt + poll threads
+    // now, just before kernels launch. Both halves belong here: begin_run()
+    // drops the previous run's records and republishes the device level, which
+    // is only safe while this run holds the execution claim, and starting
+    // earlier wastes CPU on empty queues and risks tripping ProfilerBase's
+    // poll-loop idle-timeout if device-side init is slow.
     auto thread_factory = [this](std::function<void()> fn) {
         return create_thread(std::move(fn));
     };
-    if (enable_chip_swimlane_) {
-        if (capture_clock_anchors_) begin_clock_correlation_session_if_needed();
+    if (dfx.chip_swimlane_enabled()) {
+        chip_swimlane_collector_.begin_run(dfx.output_prefix, dfx.chip_swimlane_level);
+        if (dfx.capture_clock_anchors) begin_clock_correlation_session_if_needed(pipeline_slot);
         chip_swimlane_collector_.start(thread_factory);
     }
-    if (enable_dump_args_) {
+    if (dfx.dump_args_enabled()) {
+        dump_collector_.begin_run(dfx.output_prefix, dfx.dump_args_level);
         dump_collector_.start(thread_factory);
     }
-    if (enable_pmu_) {
+    if (dfx.pmu_enabled) {
+        pmu_collector_.begin_run(make_pmu_csv_path(dfx.output_prefix), dfx.pmu_event_type);
         pmu_collector_.start(thread_factory);
     }
-    if (enable_scope_stats_) {
+    if (dfx.scope_stats_enabled) {
+        scope_stats_collector_.begin_run();
         scope_stats_collector_.start(thread_factory);
     }
 }
 
-void DeviceRunnerBase::write_host_phase_records_artifact() {
+void DeviceRunnerBase::write_host_phase_records_artifact(const std::string &output_prefix, uint32_t pipeline_slot) {
+    if (pipeline_slot >= host_phase_runs_.size()) return;
+    simpler::dfx::HostPhaseRecordStore &records = host_phase_runs_[pipeline_slot].records;
     // Per-event view of the prepare path. Every phase it records is produced on
     // the host during bind, and the store is finished before launch, so this
     // touches no device state and is callable from any point after bind --
-    // including a path that never launches. Keyed on output_prefix_ because it is
-    // non-empty exactly when this run produces diagnostic artifacts, and on the
-    // store having finished a pass, which is what a host-orchestrating runtime
-    // leaves behind. The store writes a pass at most once, so every path that can
-    // end a run calls this unconditionally.
-    if (!output_prefix_.empty() && host_phase_records_.finished()) {
-        (void)host_phase_records_.write_records_jsonl(make_host_phase_records_path(output_prefix_));
+    // including a path that never launches. Keyed on the run's output_prefix
+    // because it is non-empty exactly when this run produces diagnostic
+    // artifacts, and on the store having finished a pass, which is what a
+    // host-orchestrating runtime leaves behind. The store writes a pass at most
+    // once, so every path that can end a run calls this unconditionally.
+    if (!output_prefix.empty() && records.finished()) {
+        (void)records.write_records_jsonl(make_host_phase_records_path(output_prefix));
     }
 }
 
-void DeviceRunnerBase::teardown_shared_collectors_after_run(bool device_execution_complete) {
+void DeviceRunnerBase::teardown_shared_collectors_after_run(
+    const DfxRunConfig &dfx, uint32_t pipeline_slot, bool device_execution_complete
+) {
     // Tear down collectors. stop() joins mgmt then collector in the only safe
     // order (mgmt's final-drain pass into L2 has poll as its consumer).
-    // Diagnostic exports use the per-task `output_prefix_` directory the user
-    // set on CallConfig (CallConfig::validate() enforces non-empty upstream).
-    finish_clock_correlation_session(device_execution_complete, !can_accept_run());
-    if (enable_chip_swimlane_) {
+    // Diagnostic exports use the per-task output prefix the user set on
+    // CallConfig (CallConfig::validate() enforces non-empty upstream).
+    finish_clock_correlation_session(pipeline_slot, device_execution_complete, !can_accept_run());
+    if (dfx.chip_swimlane_enabled()) {
         chip_swimlane_collector_.quiesce();
         chip_swimlane_collector_.read_phase_header_metadata();
         chip_swimlane_collector_.reconcile_counters();
-        publish_host_phase_records_to_swimlane();
+        publish_host_phase_records_to_swimlane(pipeline_slot);
         chip_swimlane_collector_.export_swimlane_json();
     }
 
-    write_host_phase_records_artifact();
+    write_host_phase_records_artifact(dfx.output_prefix, pipeline_slot);
 
-    if (enable_dump_args_) {
+    if (dfx.dump_args_enabled()) {
         dump_collector_.quiesce();
         dump_collector_.reconcile_counters();
         dump_collector_.export_dump_files();
     }
 
-    if (enable_pmu_) {
+    if (dfx.pmu_enabled) {
         pmu_collector_.quiesce();
         pmu_collector_.reconcile_counters();
     }
 
-    if (enable_scope_stats_) {
+    if (dfx.scope_stats_enabled) {
         scope_stats_collector_.quiesce();
         scope_stats_collector_.reconcile_counters();
-        scope_stats_collector_.write_jsonl(output_prefix_);
+        scope_stats_collector_.write_jsonl(dfx.output_prefix);
     }
 }
 

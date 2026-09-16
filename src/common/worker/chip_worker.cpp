@@ -201,6 +201,10 @@ void ChipWorker::init(
     bind_host_log_state(handle, "host runtime");
 
     GetPipelineContractFn get_pipeline_contract_fn = nullptr;
+    KernelSupportedFn kernel_supported_fn = nullptr;
+    KernelInitFn kernel_init_fn = nullptr;
+    KernelPrepareCallableFn kernel_prepare_callable_fn = nullptr;
+    KernelLaunchFn kernel_launch_fn = nullptr;
     try {
         create_device_context_fn_ = load_symbol<CreateDeviceContextFn>(handle, "create_device_context");
         destroy_device_context_fn_ = load_symbol<DestroyDeviceContextFn>(handle, "destroy_device_context");
@@ -232,11 +236,13 @@ void ChipWorker::init(
         get_run_stream_set_create_count_fn_ =
             load_symbol<GetAicpuDlopenCountFn>(handle, "get_run_stream_set_create_count");
         finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "finalize_device");
-        // ACL lifecycle + comm_* are part of the uniform host_runtime.so ABI.
-        // Every platform runtime exports all of them — runtimes that do not
-        // have a real backend (today: a5) ship not-supported stubs rather
-        // than omitting the symbols.  This keeps ChipWorker.init platform-
-        // agnostic: no per-symbol probing, no half-loaded extension groups.
+        // ACL lifecycle + comm_* + kernel mode are part of the uniform
+        // host_runtime.so ABI. Every platform runtime exports all of them —
+        // runtimes that do not have a real backend (today: a5 for comm, every
+        // variant for kernel mode) ship not-supported stubs rather than
+        // omitting the symbols, so these groups resolve unconditionally and
+        // never half-load. simpler_kernel_mode_supported answers the runtime
+        // capability question at call time; it does not gate symbol resolution.
         ensure_acl_ready_fn_ = load_symbol<EnsureAclReadyFn>(handle, "ensure_acl_ready_ctx");
         create_comm_stream_fn_ = load_symbol<CreateCommStreamFn>(handle, "create_comm_stream_ctx");
         destroy_comm_stream_fn_ = load_symbol<DestroyCommStreamFn>(handle, "destroy_comm_stream_ctx");
@@ -253,12 +259,18 @@ void ChipWorker::init(
         comm_global_domain_release_fn_ = load_symbol<CommGlobalDomainReleaseFn>(handle, "comm_global_domain_release");
         comm_barrier_fn_ = load_symbol<CommBarrierFn>(handle, "comm_barrier");
         comm_destroy_fn_ = load_symbol<CommDestroyFn>(handle, "comm_destroy");
+        kernel_supported_fn = load_symbol<KernelSupportedFn>(handle, "simpler_kernel_mode_supported");
+        kernel_init_fn = load_symbol<KernelInitFn>(handle, "simpler_kernel_mode_init");
+        kernel_prepare_callable_fn =
+            load_symbol<KernelPrepareCallableFn>(handle, "simpler_kernel_mode_prepare_callable");
+        kernel_launch_fn = load_symbol<KernelLaunchFn>(handle, "simpler_kernel_mode_launch");
     } catch (...) {
         throw;
     }
 
     const PipelineContract *contract = get_pipeline_contract_fn();
-    if (!is_valid_pipeline_contract(contract) || !has_serviceable_arena_topology(*contract)) {
+    if (!is_valid_pipeline_contract(contract) || !has_serviceable_arena_topology(*contract) ||
+        !has_serviceable_stream_topology(*contract)) {
         throw std::runtime_error("host runtime returned a PipelineContract this build cannot accept");
     }
     const PipelineContract resolved_contract = *contract;
@@ -380,6 +392,10 @@ void ChipWorker::init(
         comm_global_domain_release_fn_ = nullptr;
         comm_barrier_fn_ = nullptr;
         comm_destroy_fn_ = nullptr;
+        kernel_supported_fn_ = nullptr;
+        kernel_init_fn_ = nullptr;
+        kernel_prepare_callable_fn_ = nullptr;
+        kernel_launch_fn_ = nullptr;
         runtime_bufs_.clear();
         throw;
     }
@@ -439,11 +455,19 @@ void ChipWorker::init(
         comm_global_domain_release_fn_ = nullptr;
         comm_barrier_fn_ = nullptr;
         comm_destroy_fn_ = nullptr;
+        kernel_supported_fn_ = nullptr;
+        kernel_init_fn_ = nullptr;
+        kernel_prepare_callable_fn_ = nullptr;
+        kernel_launch_fn_ = nullptr;
         runtime_bufs_.clear();
         throw std::runtime_error("simpler_init failed with code " + std::to_string(init_rc));
     }
 
     lib_handle_ = host_guard.release();
+    kernel_supported_fn_ = kernel_supported_fn;
+    kernel_init_fn_ = kernel_init_fn;
+    kernel_prepare_callable_fn_ = kernel_prepare_callable_fn;
+    kernel_launch_fn_ = kernel_launch_fn;
     device_id_ = device_id;
     // Published only once the runtime is up: the rollback paths above leave the
     // default K=1 contract in place, so a failed init never reports the counts
@@ -529,6 +553,10 @@ void ChipWorker::finalize() {
     comm_global_domain_release_fn_ = nullptr;
     comm_barrier_fn_ = nullptr;
     comm_destroy_fn_ = nullptr;
+    kernel_supported_fn_ = nullptr;
+    kernel_init_fn_ = nullptr;
+    kernel_prepare_callable_fn_ = nullptr;
+    kernel_launch_fn_ = nullptr;
     runtime_bufs_.clear();
     pipeline_generations_.reset();
     pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 1, {}};
@@ -657,7 +685,7 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
     }
     const uint64_t run_epoch = next_native_run_epoch();
     const ChipWorkerNativeRun run_identity{slot_id, generation, run_epoch, run_id, dispatch_id};
-    const bool allow_prepared_successor = supports_concurrent_native_prepare() && !config.diagnostics_any();
+    const bool allow_prepared_successor = supports_concurrent_native_prepare();
     {
         std::lock_guard<std::mutex> lk(native_run_mu_);
         NativeRunSlotState &state = native_run_states_[slot_id];

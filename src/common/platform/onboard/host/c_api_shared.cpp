@@ -25,9 +25,13 @@
  */
 
 #include "callable.h"
+#include "callable_protocol.h"
 #include "call_config.h"
 #include "device_runner_base.h"
 #include "host/dep_gen_collector.h"  // make_deps_json_path
+#include "host/kernel_entry_validation.h"
+#include "host/kernel_pipeline_contract.h"
+#include "worker/pipeline_contract.h"
 #include "prepare_callable_common.h"
 #include "runtime_c_api.h"
 #include "task_args_wire.h"
@@ -161,6 +165,15 @@ static void unregister_device_memory_from_host(void *runner_ctx, void *dev_ptr) 
     } catch (...) {}
 }
 
+static void *acquire_child_memory_host_view(void *runner_ctx, void *dev_ptr, size_t bytes) {
+    if (runner_ctx == nullptr) return nullptr;
+    try {
+        return static_cast<DeviceRunnerBase *>(runner_ctx)->acquire_child_memory_host_view(dev_ptr, bytes);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 static int device_memset(void *runner_ctx, void *dev_ptr, int value, size_t size) {
     if (runner_ctx == nullptr || dev_ptr == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     try {
@@ -246,14 +259,15 @@ static bool publish_chip_swimlane_extension(
            static_cast<DeviceRunnerBase *>(runner_ctx)->publish_chip_swimlane_extension(section, json_value, json_size);
 }
 
-static void *host_phase_pool_arm(void *runner_ctx, int producer_wants_records) {
+static void *host_phase_pool_arm(void *runner_ctx, uint32_t pipeline_slot, int producer_wants_records) {
     if (runner_ctx == nullptr) return nullptr;
-    return static_cast<DeviceRunnerBase *>(runner_ctx)->host_phase_pool_arm(producer_wants_records != 0);
+    return static_cast<DeviceRunnerBase *>(runner_ctx)->host_phase_pool_arm(pipeline_slot, producer_wants_records != 0);
 }
 
-static void host_phase_pool_finish(void *runner_ctx, uint64_t submitted_tasks, uint64_t invocation_id) {
+static void
+host_phase_pool_finish(void *runner_ctx, uint32_t pipeline_slot, uint64_t submitted_tasks, uint64_t invocation_id) {
     if (runner_ctx == nullptr) return;
-    static_cast<DeviceRunnerBase *>(runner_ctx)->host_phase_pool_finish(submitted_tasks, invocation_id);
+    static_cast<DeviceRunnerBase *>(runner_ctx)->host_phase_pool_finish(pipeline_slot, submitted_tasks, invocation_id);
 }
 
 static int setup_static_arena_wrapper(
@@ -341,6 +355,7 @@ static const HostApiOps g_host_api_ops = {
     .copy_from_device = copy_from_device,
     .register_device_memory_to_host = register_device_memory_to_host,
     .unregister_device_memory_from_host = unregister_device_memory_from_host,
+    .acquire_child_memory_host_view = acquire_child_memory_host_view,
     .device_memset = device_memset,
     .get_retained_temp_buffer = get_retained_temp_buffer,
     .set_retained_temp_buffer = set_retained_temp_buffer,
@@ -437,6 +452,17 @@ int simpler_init(
     if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
 
     DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
+
+    // Latching the identity is the first thing this entry does, so a context
+    // that already belongs to kernel mode is refused before any process- or
+    // runner-state mutation below. Latching PROGRAM is idempotent, which is
+    // what lets an init -> finalize -> init sequence on the same device run
+    // again.
+    const int latch_rc = runner->execution_mode_latch().latch(SIMPLER_MODE_PROGRAM);
+    if (latch_rc != 0) {
+        LOG_ERROR("simpler_init: refused — this context already belongs to kernel mode");
+        return latch_rc;
+    }
 
     // CANN dlog must be levelled BEFORE the device context is opened
     // (rtSetDevice inside attach_current_thread): CANN snapshots the
@@ -704,7 +730,9 @@ static int cleanup_failed_prepare(OnboardNativeRunContext *state, int execution_
     char trace_attrs[sizeof(state->trace_attrs)];
     std::memcpy(trace_attrs, state->trace_attrs, sizeof(trace_attrs));
     if (clear_gm_sm) state->runtime.set_gm_sm_ptr(nullptr);
-    state->runner->finish_clock_correlation_session(false, !state->runner->can_accept_run());
+    state->runner->finish_clock_correlation_session(
+        state->descriptor.pipeline_slot, false, !state->runner->can_accept_run()
+    );
     int validation_rc = PTO_RUNTIME_ERR_INTERNAL;
     try {
         validation_rc = validate_runtime_impl(&state->runtime, &state->host_api, execution_rc);
@@ -794,8 +822,7 @@ int simpler_prepare_run(
             static_cast<unsigned long long>(state->descriptor.generation),
             static_cast<unsigned long long>(state->descriptor.run_epoch)
         );
-        const bool allow_prepared_successor =
-            concurrent_native_prepare_supported_impl() != 0 && !config->diagnostics_any();
+        const bool allow_prepared_successor = concurrent_native_prepare_supported_impl() != 0;
         if (!runner->try_reserve_native_run(
                 state, state->descriptor.pipeline_slot, state->descriptor.arena_bank, allow_prepared_successor
             )) {
@@ -852,10 +879,21 @@ int simpler_prepare_run(
         rc = runner->prepare_launch_shape(state->runtime, state->config);
         if (rc != 0) return cleanup_failed_prepare(state, rc, true);
 
-        // Diagnostic binding reads runner-global collector configuration. It
-        // is depth-one, while concurrent HBG preparation must leave the active
-        // run's configuration untouched until launch.
+        // Latches what a device-context query answers from. Skipped for a
+        // successor prepared against an active predecessor, whose configuration
+        // is the one that query must keep reporting until it retires.
         if (!overlaps_active_run) runner->apply_call_config(state->config);
+
+        // Unconditional, and from this run's own config: a host-orchestrating
+        // runtime holds the captured graph in thread-local state between
+        // orchestration and emit, so the arming has to happen on this thread
+        // ahead of its bind whether or not it overlaps a predecessor. It writes
+        // nothing the two runs share.
+        runner->arm_host_dep_gen_capture(config->enable_dep_gen != 0);
+        // Same reason, different state: a host-orchestrating bind records phase
+        // events and samples its clock anchor, and both belong to the run doing
+        // the binding rather than to whichever run last held the claim.
+        runner->begin_host_phase_run(state->descriptor.pipeline_slot, DfxRunConfig::from(*config));
 
         {
             STRACE("chip.run.bind");
@@ -894,7 +932,7 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         // The host phase records describe the bind path this variable exists to
         // measure, so they are written here as well as in the device-run
         // teardown. Skipping the device must not skip the artifact.
-        state->runner->write_host_phase_records_artifact();
+        state->runner->write_host_phase_records_artifact(state->config.output_prefix, state->descriptor.pipeline_slot);
         state->completion_rc = 0;
         state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
         return 0;
@@ -1073,10 +1111,12 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         state->runner_resources_owned = false;
     }
 
-    // Correlation state is runner-wide. Finish it before releasing either
-    // ownership token, after which a successor may begin capture and replace
-    // the provider/session.
-    state->runner->finish_clock_correlation_session(false, !state->runner->can_accept_run());
+    // The collector's session is still resident even though the provider and the
+    // anchors are per-run, so finish it before releasing either ownership token,
+    // after which a successor may publish its own.
+    state->runner->finish_clock_correlation_session(
+        state->descriptor.pipeline_slot, false, !state->runner->can_accept_run()
+    );
     if (state->runner_claimed) {
         // The point a successor's launch becomes admissible. Ordering a
         // successor's device work against this boundary is what separates a
@@ -1199,6 +1239,60 @@ int device_memory_info_ctx(DeviceContextHandle ctx, DeviceMemoryInfo *info) {
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+}
+
+/* ===========================================================================
+ * Kernel-mode lifecycle
+ *
+ * This backend reports kernel mode unsupported: supported() is 0 and init
+ * refuses after the shared structural validation, so no context here ever
+ * latches kernel mode and prepare/launch reject with INVALID_STATE.
+ * Argument validation is shared with every other component through
+ * kernel_entry_validation.h, so an argument this stub accepts is one a real
+ * implementation accepts.
+ * =========================================================================== */
+
+int simpler_kernel_mode_supported(DeviceContextHandle) { return 0; }
+
+int simpler_kernel_mode_init(
+    DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
+    const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,
+    const CallConfig *config, uint64_t context_generation
+) {
+    const int rc = validate_kernel_init_args(
+        ctx, device_id, aicpu_binary, aicpu_size, aicore_binary, aicore_size, dispatcher_binary, dispatcher_size,
+        config, context_generation
+    );
+    if (rc != 0) return rc;
+    try {
+        PipelineContract contract{};
+        const int rc = build_kernel_pipeline_contract_impl(config, &contract);
+        if (rc != 0 && rc != PTO_RUNTIME_ERR_UNSUPPORTED) return rc;
+        if (rc == 0 && (!is_valid_pipeline_contract(&contract, SIMPLER_MODE_KERNEL) ||
+                        !has_serviceable_arena_topology(contract) || !has_serviceable_stream_topology(contract))) {
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    LOG_ERROR("simpler_kernel_mode_init: kernel mode is not supported by this host runtime");
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
+int simpler_kernel_mode_prepare_callable(
+    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size, void *caller_stream
+) {
+    const int rc = validate_kernel_prepare_callable_args(ctx, callable_id, callable, callable_size, caller_stream);
+    if (rc != 0) return rc;
+    LOG_ERROR("simpler_kernel_mode_prepare_callable: no live kernel context on this device context");
+    return PTO_RUNTIME_ERR_INVALID_STATE;
+}
+
+int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, const void *args, void *caller_stream) {
+    const int rc = validate_kernel_launch_args(ctx, callable_id, args, caller_stream);
+    if (rc != 0) return rc;
+    LOG_ERROR("simpler_kernel_mode_launch: no live kernel context on this device context");
+    return PTO_RUNTIME_ERR_INVALID_STATE;
 }
 
 }  // extern "C"

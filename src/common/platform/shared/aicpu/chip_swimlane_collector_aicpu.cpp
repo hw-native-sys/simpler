@@ -116,7 +116,22 @@ extern "C" void set_platform_chip_swimlane_base(uint64_t chip_swimlane_data_base
     g_platform_chip_swimlane_base = chip_swimlane_data_base;
 }
 extern "C" uint64_t get_platform_chip_swimlane_base() { return g_platform_chip_swimlane_base; }
-extern "C" void set_chip_swimlane_enabled(bool enable) { g_enable_chip_swimlane = enable; }
+extern "C" void set_chip_swimlane_enabled(bool enable) {
+    // Every launch publishes its enable bit before the onboard affinity barrier
+    // or before sim threads start. Disabled launches skip profiling init, so
+    // all phase-writer state must be invalidated at this common entry point.
+    g_enable_chip_swimlane = enable;
+    g_chip_swimlane_level = ChipSwimlaneLevel::DISABLED;
+    s_phase_initialized = false;
+    s_chip_swimlane_header = nullptr;
+    s_orch_thread_idx = -1;
+    for (int t = 0; t < PLATFORM_MAX_AICPU_THREADS; t++) {
+        s_sched_phase_pools[t] = nullptr;
+        s_current_sched_phase_buffers[t] = nullptr;
+        s_orch_phase_pools[t] = nullptr;
+        s_current_orch_phase_buffers[t] = nullptr;
+    }
+}
 extern "C" bool is_chip_swimlane_enabled() { return g_enable_chip_swimlane; }
 extern "C" void set_platform_chip_swimlane_aicore_rotation_table(uint64_t table_addr) {
     g_platform_chip_swimlane_aicore_rotation_table = table_addr;
@@ -275,18 +290,7 @@ try_pop_records_buffer(int core_id, ChipSwimlaneAicpuTaskPool *state, uint32_t n
 }
 
 void chip_swimlane_aicpu_init(int worker_count) {
-    // Reset cross-launch state up front. AICPU statics persist across launches
-    // on the same loaded .so; without this reset, an enabled→disabled launch
-    // sequence would leave s_phase_initialized=true from the prior run, and
-    // any subsequent record_sched_phase / record_orch_phase call would
-    // dereference the prior launch's (now-freed) s_sched_phase_pools /
-    // s_orch_phase_pools pointers. Same shape as the [[block_local]] reset
-    // in onboard/aicore/kernel.cpp for the AICore-side rotation slot
-    // (fixed in #936).
-    s_phase_initialized = false;
-
-    // Reset AICore dispatch-count bookkeeping for the same reason: the next
-    // launch must start counting from 0 so the rotation boundary check
+    // Each profiled launch starts counting AICore dispatches from 0 so the rotation boundary check
     // (count % BUFFER_SIZE == 0) lands on the right dispatches. Stale values
     // from a prior launch would skip the first rotation (count already past a
     // boundary) or trigger one prematurely. The deferred-enqueue stash must be

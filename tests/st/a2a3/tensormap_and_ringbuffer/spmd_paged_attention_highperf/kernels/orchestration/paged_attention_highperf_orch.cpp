@@ -26,7 +26,7 @@ __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_c
 }
 
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &orch_args) {
-    int64_t block_dim = static_cast<int64_t>(orch_args.scalar(0));
+    int64_t block_dim = orch_args.scalar<int64_t>(0);
 
     LOG_INFO("SPMD PA highperf: block_dim=%" PRId64, block_dim);
 

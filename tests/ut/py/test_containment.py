@@ -299,7 +299,7 @@ def test_the_extent_counts_every_record_the_converter_draws():
     assert with_receive.extent == (1_800, 2_200)
 
     with_lifecycle = containment.capture_windows(
-        _capture(aicpu_lifecycle_records=[{"worker_id": 0, "exit_ack_cycles": 3_400}])
+        _capture(aicpu_lifecycle_records=[{"aicpu_thread_id": 0, "exit_wait_end_cycles": 3_400}])
     )
     assert with_lifecycle.extent == (1_900, 3_400)
 
@@ -307,7 +307,7 @@ def test_the_extent_counts_every_record_the_converter_draws():
 def test_a_record_outside_the_run_wall_is_caught_rather_than_drawn_outside_it():
     """The join is what enforces containment, so the extent has to feed it."""
     capture = containment.capture_windows(
-        _capture(aicpu_lifecycle_records=[{"worker_id": 0, "exit_ack_cycles": 9_000}])
+        _capture(aicpu_lifecycle_records=[{"aicpu_thread_id": 0, "exit_wait_end_cycles": 9_000}])
     )
 
     with pytest.raises(containment.ContainmentError, match="do not overlap"):

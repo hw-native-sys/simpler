@@ -70,13 +70,19 @@ struct ChipRunLaneState {
         std::rethrow_exception(run->error);
     }
 
-    bool permits_native_successor(const ChipRunState &predecessor, const CallConfig &successor_config) const {
-        return worker->supports_concurrent_native_prepare() && !predecessor.config.diagnostics_any() &&
-               !successor_config.diagnostics_any() && predecessor.phase == ChipRunState::Phase::LAUNCHED;
-    }
-
-    bool permits_native_successor(const ChipRunState &predecessor, const ChipRunState &successor) const {
-        return permits_native_successor(predecessor, successor.config);
+    /**
+     * Whether the predecessor at the FIFO head can carry a prepared successor.
+     *
+     * A diagnostics config is no longer disqualifying on its own: the collector
+     * pools and per-run state a preparation would otherwise have armed are built
+     * and reset under the execution claim.
+     *
+     * The successor's own configuration does not enter, at any level: a bind's
+     * host-orchestration phase state is held per pipeline slot, and everything
+     * it hands to the resident collector is published under this claim.
+     */
+    bool permits_native_successor(const ChipRunState &predecessor) const {
+        return worker->supports_concurrent_native_prepare() && predecessor.phase == ChipRunState::Phase::LAUNCHED;
     }
 
     void prepare(const std::shared_ptr<ChipRunState> &run) {
@@ -152,7 +158,7 @@ struct ChipRunLaneState {
     void prepare_successor_if_eligible(const std::shared_ptr<ChipRunState> &run) {
         if (fifo.size() != 2 || fifo.back() != run || fifo.front() == run) return;
         if (run->phase != ChipRunState::Phase::QUEUED || run->depth_one_fallback) return;
-        if (!permits_native_successor(*fifo.front(), *run)) return;
+        if (!permits_native_successor(*fifo.front())) return;
         try {
             prepare(run);
         } catch (const ChipWorker::PreparedRunIncompatible &) {
@@ -435,7 +441,7 @@ ChipRun ChipRunLane::submit(
     // minted or native preparation begins.
     while (!state_->fifo.empty()) {
         const bool has_successor_capacity =
-            state_->fifo.size() == 1 && state_->permits_native_successor(*state_->fifo.front(), config);
+            state_->fifo.size() == 1 && state_->permits_native_successor(*state_->fifo.front());
         if (has_successor_capacity) break;
         state_->drain_front();
         state_->require_usable();

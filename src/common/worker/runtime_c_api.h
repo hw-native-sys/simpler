@@ -30,6 +30,9 @@
  *                   simpler_unregister_callable,
  *                   get_aicpu_dlopen_count, get_host_dlopen_count,
  *                   get_run_stream_set_create_count
+ *   - kernel mode:  simpler_kernel_mode_supported, simpler_kernel_mode_init,
+ *                   simpler_kernel_mode_prepare_callable,
+ *                   simpler_kernel_mode_launch
  *   - pipeline:     get_pipeline_contract,
  *                   supports_concurrent_native_prepare_ctx,
  *                   get_arena_bank_gm_heap_base_ctx,
@@ -102,6 +105,11 @@ enum {
     /* The request names a capability this platform/runtime does not implement. */
     PTO_RUNTIME_ERR_UNSUPPORTED = PTO_RUNTIME_ERR_BASE - 1,
     PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE = PTO_RUNTIME_ERR_BASE - 2,
+    /* The call is structurally valid but conflicts with the context's
+       execution mode or lifecycle (e.g. launch before kernel initialization). */
+    PTO_RUNTIME_ERR_INVALID_STATE = PTO_RUNTIME_ERR_BASE - 3,
+    /* A caller supplied an invalid pointer, id, size, or other argument. */
+    PTO_RUNTIME_ERR_INVALID_ARGUMENT = PTO_RUNTIME_ERR_BASE - 4,
 };
 
 /** Return values from simpler_poll_run(). */
@@ -120,8 +128,8 @@ enum {
 
 /**
  * How a resource behaves across the KernelLaunch boundary, which is what
- * decides its copy count: HOST_PER_RUN and EXEC_HANDLE need one instance per
- * in-flight run (`pipeline_depth`), DEVICE_SCRATCH needs exactly one.
+ * decides its copy count: HOST_PER_RUN needs one instance per in-flight run
+ * (`pipeline_depth`); DEVICE_SCRATCH and EXEC_HANDLE need exactly one.
  */
 typedef enum PipelineResourceClass {
     /* Carries this run's own content, so the device is still reading the
@@ -130,7 +138,9 @@ typedef enum PipelineResourceClass {
     /* Not rewritten per run: whoever populates it does so once, and device ops
        run one at a time, so a single instance is reused across runs. */
     PTO_PIPELINE_DEVICE_SCRATCH = 1,
-    /* Execution context (stream) a run owns while its op runs and is reaped. */
+    /* Execution context (stream) a run owns while its op runs and is reaped.
+       One instance serves every run: a role is declared once and the platform
+       holds that stream for the runner's lifetime. */
     PTO_PIPELINE_EXEC_HANDLE = 2,
 } PipelineResourceClass;
 
@@ -150,7 +160,11 @@ typedef enum PipelineResourceKind {
 typedef struct PipelineResource {
     uint32_t kind;
     uint32_t resource_class;
-    /* Size of one copy. Reserved: currently declared as 0 and required to be 0. */
+    /* Program: must be 0. Kernel: every resource that occupies storage states
+       nonzero required usable bytes per copy, and an EXEC_HANDLE states 0.
+       The number is a per-copy requirement for the resource named by `kind`:
+       it is neither committed HBM nor a capacity budget, and the declared
+       resources are not a complete manifest of what a context commits. */
     uint64_t bytes_per_copy;
 } PipelineResource;
 
@@ -213,7 +227,12 @@ typedef struct NativeRunDescriptor {
  * Public API (resolved by ChipWorker via dlsym)
  * =========================================================================== */
 
-/** Return this runtime's immutable pipeline resource declaration. */
+/**
+ * Return this runtime's immutable program-mode resource declaration.
+ * Program resources have bytes_per_copy == 0. Both AICPU_STREAM and
+ * AICORE_STREAM must appear exactly once, each with class EXEC_HANDLE.
+ * ChipWorker rejects unserviceable declarations before creating a context.
+ */
 const PipelineContract *get_pipeline_contract(void);
 
 /**
@@ -324,7 +343,8 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
  *      separate call. Only `prewarm_config->runtime_env` is read.
  *
  * Returns 0 on success, negative on attach, provisioning, or prewarm-build
- * failure.
+ * failure, and PTO_RUNTIME_ERR_INVALID_STATE when the context is already
+ * latched to kernel mode.
  */
 int simpler_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
@@ -522,6 +542,129 @@ size_t get_host_dlopen_count(DeviceContextHandle ctx);
  * bootstrap pair.
  */
 size_t get_run_stream_set_create_count(DeviceContextHandle ctx);
+
+/* ===========================================================================
+ * Kernel-mode lifecycle (four entries + finalize_device)
+ *
+ * A context has one of two execution modes for its whole lifetime, decided by
+ * which init entry runs first. simpler_init latches program mode — the
+ * exclusive-device path driven through the prepared-run family
+ * above. simpler_kernel_mode_init latches kernel mode, which borrows the
+ * caller's already-current device and caller-owned stream to enqueue one
+ * bounded asynchronous operator per launch: no device reset, no internal
+ * stream/device synchronize on the prepare/launch/close paths, zero
+ * allocation at launch, and no capture/model-state queries, so a launch is
+ * capturable by ACLGraph as an ordinary node.
+ *
+ * Identity is a write-once property of the context, not a state that evolves:
+ * ExecutionModeLatch on the platform runner holds it, the first init entry to
+ * run latches it, and it never changes — not on finalize, not on error. There
+ * is no separate declaration call to forget, and no unlatch, so a handle from
+ * a failed kernel init can never be recycled into a program context.
+ * simpler_init latches PROGRAM before touching any process or runner state, so
+ * the mutual exclusion is enforced on every program init. Every kernel-mode
+ * guard on the device/ACL lifecycle and arena paths keys on the latch reading
+ * kernel. A call that conflicts with the context's execution mode returns
+ * PTO_RUNTIME_ERR_INVALID_STATE.
+ *
+ * Kernel-mode capacity is a mode invariant, not a gated state: `config` is
+ * context-static, so each pooled arena region is committed at most once and
+ * never grown or released afterwards. The platform arena reports a growth or
+ * release request under kernel mode as a capacity invariant break
+ * (PTO_RUNTIME_ERR_INTERNAL), and capacity intent travels in
+ * CallConfig.runtime_env like everywhere else.
+ *
+ * Every host_runtime.so exports all four entries below, so a consumer resolves
+ * them unconditionally like the rest of the uniform ABI; supported answers the
+ * capability question at call time rather than gating symbol resolution.
+ * Variants without kernel-mode support
+ * export stubs that run the same structural validation and then refuse —
+ * supported returns 0, init reports PTO_RUNTIME_ERR_UNSUPPORTED, and
+ * prepare_callable and launch report PTO_RUNTIME_ERR_INVALID_STATE because
+ * no kernel context is live. The fifth lifecycle entry is the existing
+ * finalize_device(): in kernel mode it releases only context-owned resources
+ * and never resets the device or finalizes ACL. device_id_ records which
+ * device a context is on rather than a claim on it, so a kernel context
+ * reaches that teardown path; the platform finalize() skips the per-thread
+ * device bind on a kernel latch, because the caller already holds its own
+ * device current.
+ *
+ * Structural argument errors return PTO_RUNTIME_ERR_INVALID_ARGUMENT before
+ * capability or lifecycle checks. These entries accept only POD structs,
+ * serialized blobs, and device/stream pointers — never framework objects.
+ * The caller stream is always an explicit parameter and is never stored
+ * beyond the call or destroyed by simpler.
+ * =========================================================================== */
+
+/**
+ * Return nonzero when this runtime can execute kernel-mode launches.
+ *
+ * This is the capability question a caller asks before choosing between the
+ * kernel-mode entries and the program-mode prepared-run family. It is callable
+ * on a context that create_device_context() has returned but that no init has
+ * touched; at that point the context exists but names no device —
+ * create_device_context() takes no device and device_id_ is still unset — so an
+ * implementation must answer from the runtime build alone, never from init
+ * state or device identity. `ctx` is accepted for signature symmetry with the
+ * rest of the family and must not be dereferenced for a device.
+ */
+int simpler_kernel_mode_supported(DeviceContextHandle ctx);
+
+/**
+ * Initialize a kernel-mode context on the caller's already-current device.
+ *
+ * A successful call latches kernel mode on the context — mutually exclusive
+ * with the program-mode simpler_init — and the latch controls the
+ * kernel-mode guards on the platform's device/ACL lifecycle and arena paths.
+ *
+ * Takes no device ownership: no device reset, no ACL init/finalize, and no
+ * stream or device synchronize on this path. Creates only context-owned
+ * persistent handles used by asynchronous preparation and launch. `config`
+ * is context-static; launches never mutate it. `context_generation` is a
+ * nonzero host-process-unique identity minted by the caller for sequential
+ * contexts; generation zero is invalid.
+ *
+ * Structural argument errors and invalid TMR sizing configurations return
+ * PTO_RUNTIME_ERR_INVALID_ARGUMENT. Invalid generated resource contracts or
+ * C++ exceptions during admission return PTO_RUNTIME_ERR_INTERNAL.
+ * The current TMR/HBG implementations return PTO_RUNTIME_ERR_UNSUPPORTED
+ * after successful admission or when no kernel contract is available;
+ * neither case establishes kernel resources or changes the context's mode.
+ */
+int simpler_kernel_mode_init(
+    DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
+    const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,
+    const CallConfig *config, uint64_t context_generation
+);
+
+/**
+ * Stage one callable for kernel-mode launches, outside ACLGraph capture.
+ *
+ * `callable` points to a canonical ChipCallable image of exactly
+ * `callable_size` bytes. Validating every flexible-array offset before the
+ * image is hashed or uploaded is the implementation's obligation; the shared
+ * entry validation checks only the image's alignment, its size floor, and the
+ * callable id range. Preparation may allocate persistent state and
+ * enqueue asynchronous device work on `caller_stream`, but never synchronizes
+ * a stream or device — preparation errors surface through the caller's own
+ * warmup + synchronize. The stream is borrowed for this call only.
+ */
+int simpler_kernel_mode_prepare_callable(
+    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size, void *caller_stream
+);
+
+/**
+ * Enqueue one bounded asynchronous kernel-mode operator invocation.
+ *
+ * `args` points to a ChipStorageTaskArgs POD whose tensor addresses are
+ * caller-owned device addresses; they are passed through without ever being
+ * dereferenced on the host. A launch performs no device malloc/free, no
+ * tensor staging, no synchronize, no capture-state query, and no
+ * stream-to-model attachment — keeping those out of the launch path is the
+ * implementation's obligation. A return of 0 means the sequence was enqueued;
+ * device execution may still be in flight and may still fail asynchronously.
+ */
+int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, const void *args, void *caller_stream);
 
 #ifdef __cplusplus
 }

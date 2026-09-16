@@ -87,6 +87,13 @@ jobs:
           if [ "${{ inputs.setup_variant }}" = "self-cpu" ]; then
             source .venv/bin/activate
           fi
+          # Real entry tests may skip in a standalone C++ build, but not in CI.
+          test -f build/lib/libcpu_sim_context.so
+          for arch in a2a3 a5; do
+            for runtime in tensormap_and_ringbuffer host_build_graph; do
+              test -f "build/lib/$arch/sim/$runtime/libhost_runtime.so"
+            done
+          done
           cmake -B tests/ut/cpp/build -S tests/ut/cpp
           cmake --build tests/ut/cpp/build --parallel 4
           ctest --test-dir tests/ut/cpp/build -LE requires_hardware -j4 --output-on-failure --timeout 300

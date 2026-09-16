@@ -66,6 +66,25 @@ class _DiagnosticOptions(NamedTuple):
     swimlane_overhead: bool
 
 
+# Args-dump modes, mirroring DumpArgsLevel in
+# src/common/platform/include/common/args_dump.h. The CLI spells the mode by
+# name because the three modes are two independent choices — which tasks reach
+# the manifest, and which of those write payload — rather than a dial. The
+# wire field stays the int, ordered so each value is a strict superset of the
+# one below it.
+DUMP_ARGS_MODES = {"off": 0, "partial": 1, "hybrid": 2, "full": 3}
+
+
+def dump_args_level(mode) -> int:
+    """Resolve a ``--dump-args`` mode name to its ``DumpArgsLevel`` value."""
+    if isinstance(mode, int):
+        return mode
+    try:
+        return DUMP_ARGS_MODES[mode]
+    except KeyError:
+        raise ValueError(f"unknown --dump-args mode {mode!r} (expected one of {', '.join(DUMP_ARGS_MODES)})") from None
+
+
 def _validate_diagnostic_flags(*, chip_swimlane: int, swimlane_overhead: bool) -> None:
     """Reject diagnostic combinations that can never produce their artifact.
 
@@ -148,7 +167,7 @@ def standalone_pytest_options(request) -> dict:
         "rounds": getoption("--rounds", default=1),
         "skip_golden": getoption("--skip-golden", default=False),
         "enable_chip_swimlane": getoption("--enable-chip-swimlane", default=0),
-        "dump_args": getoption("--dump-args", default=0),
+        "dump_args": dump_args_level(getoption("--dump-args", default="off")),
         "enable_pmu": getoption("--enable-pmu", default=0),
         "enable_dep_gen": getoption("--enable-dep-gen", default=False),
         "enable_scope_stats": getoption("--enable-scope-stats", default=False),
@@ -282,10 +301,11 @@ def scene_level(level: int | SceneTestLevel):
 
 
 class TensorArg(NamedTuple):
-    """Named torch.Tensor argument spec."""
+    """Named CPU tensor, optionally kept as child memory for the whole L2 case."""
 
     name: str
     value: Any  # torch.Tensor
+    child_memory: bool = False
 
 
 class Scalar(NamedTuple):
@@ -328,9 +348,9 @@ class TaskArgsBuilder:
             elif isinstance(spec, Scalar):
                 self._add_scalar(spec)
 
-    def add_tensor(self, name: str, value: Any) -> None:
+    def add_tensor(self, name: str, value: Any, *, child_memory=False) -> None:
         """Add a tensor. Must be called before any add_scalar."""
-        self._add_tensor(TensorArg(name, value))
+        self._add_tensor(TensorArg(name, value, child_memory))
 
     def add_scalar(self, name: str, value: Any) -> None:
         """Add a scalar. After this, add_tensor is not allowed."""
@@ -382,7 +402,7 @@ class TaskArgsBuilder:
         for spec in self._specs:
             if isinstance(spec, TensorArg):
                 cloned = spec.value.clone() if isinstance(spec.value, torch.Tensor) else spec.value
-                new_spec = TensorArg(spec.name, cloned)
+                new_spec = spec._replace(value=cloned)
                 new._specs.append(new_spec)
                 new._data[spec.name] = cloned
             elif isinstance(spec, Scalar):
@@ -444,7 +464,7 @@ class _RehostedTaskArgs:
                     self._originals[spec.name] = test_args._data[spec.name]
                     self._handles[spec.name] = handle
                     test_args._data[spec.name] = view
-                    new_specs.append(TensorArg(spec.name, view))
+                    new_specs.append(spec._replace(value=view))
                 else:
                     new_specs.append(spec)
             test_args._specs = new_specs
@@ -510,7 +530,7 @@ class _RehostedTaskArgs:
         for name, orig in self._originals.items():
             self._test_args._data[name] = orig
         self._test_args._specs = [
-            TensorArg(s.name, self._originals[s.name]) if isinstance(s, TensorArg) and s.name in self._originals else s
+            s._replace(value=self._originals[s.name]) if isinstance(s, TensorArg) and s.name in self._originals else s
             for s in self._test_args._specs
         ]
         self._originals.clear()
@@ -524,6 +544,102 @@ class _RehostedTaskArgs:
                 handle.close()  # drops the view above, then closes + unlinks the POSIX shm
             except Exception as exc:  # noqa: BLE001 -- best-effort cleanup; a leak here must not mask the test result, but process-control exceptions still propagate
                 logger.warning("SceneTest rehost cleanup: handle.close failed: %s", exc)
+
+
+class ChildMemoryTaskArgs:
+    """Own a case's device buffers until release; upload each input exactly once.
+
+    The device-side counterpart of :class:`_RehostedTaskArgs`: that one relocates a
+    builder's host tensors into born-shared child buffers so a forked child can
+    reach them, this one relocates them onto the device so every round reuses one
+    address instead of re-copying it in every round.
+
+    ``add`` consumes one CPU contiguous fixture at a time, so a streaming driver
+    can discard each large weight before materializing its successor. Callers
+    retain ordinary host outputs separately when they need copy-back.
+    """
+
+    def __init__(self, worker):
+        self.worker = worker
+        self.buffers = {}
+        self.tensors = {}
+        self.directions = {}
+
+    def add(self, name, host, direction):
+        from simpler.task_interface import ArgDirection as D  # noqa: PLC0415
+
+        from simpler_setup.torch_interop import torch_dtype_to_datatype  # noqa: PLC0415
+
+        if name in self.directions:
+            raise ValueError(f"Duplicate child-memory tensor {name!r}")
+        if direction not in (D.IN, D.OUT, D.INOUT):
+            raise ValueError(f"Child-memory tensor {name!r} has an unsupported direction")
+        if host.device.type != "cpu" or not host.is_contiguous():
+            raise ValueError(f"Child-memory tensor {name!r} must be a contiguous CPU tensor")
+        size = host.numel() * host.element_size()
+        if not size:
+            # An empty tensor names no device bytes. Leaving it unrecorded keeps
+            # it on the ordinary host-memory path, so `build_args` callers must
+            # reconcile their own argument list -- see the count check there.
+            return
+        buf = self.worker.malloc(size)
+        try:
+            if direction != D.OUT:
+                self.worker.copy_to(buf, host)
+            tensor = buf.tensor(tuple(host.shape), int(torch_dtype_to_datatype(host.dtype).value))
+        except BaseException:
+            try:
+                self.worker.free(buf)
+            except Exception as exc:  # noqa: BLE001 -- preserve the construction failure
+                logger.warning("Child-memory tensor cleanup failed: %s", exc)
+            raise
+        self.buffers[name] = buf
+        self.tensors[name] = tensor
+        self.directions[name] = direction
+
+    def build_args(self, expected_count=None):
+        """Build all-child-memory L2 args, preserving direction.
+
+        ``expected_count`` is the caller's tensor-argument count. A mismatch means
+        `add` skipped an empty tensor, so every later argument would shift against
+        the orchestration signature -- reject that rather than dispatch a silently
+        misaligned argument list.
+        """
+        from simpler.task_interface import ArgDirection as D  # noqa: PLC0415
+        from simpler.task_interface import TaskArgs, TensorArgType  # noqa: PLC0415
+
+        if expected_count is not None and expected_count != len(self.tensors):
+            raise ValueError(
+                f"build_args expected {expected_count} child-memory tensors but holds {len(self.tensors)}; "
+                "an empty tensor cannot be child memory -- keep it on the host-memory path instead."
+            )
+        tags = {D.IN: TensorArgType.INPUT, D.OUT: TensorArgType.OUTPUT_EXISTING, D.INOUT: TensorArgType.INOUT}
+        args = TaskArgs()
+        for name, tensor in self.tensors.items():
+            args.add_tensor(tensor, tags[self.directions[name]])
+        return args
+
+    def copy_back(self, test_args, names):
+        for name in names:
+            if name in self.buffers:
+                self.worker.copy_from(getattr(test_args, name), self.buffers[name])
+
+    def release(self):
+        """Release in LIFO order, even when an individual free fails."""
+        self.tensors.clear()
+        self.directions.clear()
+        while self.buffers:
+            _, buf = self.buffers.popitem()
+            try:
+                self.worker.free(buf)
+            except Exception as exc:  # noqa: BLE001 -- attempt all frees, preserve the test result
+                logger.warning("Child-memory tensor cleanup failed: %s", exc)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.release()
 
 
 # ---------------------------------------------------------------------------
@@ -575,7 +691,44 @@ class CallableNamespace:
 # ---------------------------------------------------------------------------
 
 
-def _build_l2_ref_args(test_args: TaskArgsBuilder, orch_signature: list, worker):
+def _child_memory_args(worker, test_args, signature):
+    """Own the device buffers for every `child_memory` TensorArg, for the whole case.
+
+    Returns an owner whose `tensors` is empty when nothing is declared, so the
+    caller's arg build falls through to ordinary host memory. Child-memory storage
+    may not alias any other argument's storage: independent device buffers
+    cannot preserve an overlap the orchestrator would otherwise see.
+    """
+    specs = [spec for spec in test_args.specs if isinstance(spec, TensorArg)]
+    if not any(spec.child_memory for spec in specs):
+        return ChildMemoryTaskArgs(worker)
+    if len(specs) != len(signature):
+        raise ValueError("TensorArg count must match the orchestration signature")
+    ranges = []
+    for spec in specs:
+        host = spec.value
+        if host.numel():
+            # Unselected tensors may be strided: their full span participates
+            # in overlap rejection when either argument is child memory.
+            span = 1 + sum((n - 1) * stride for n, stride in zip(host.shape, host.stride()))
+            lo = host.data_ptr()
+            hi = lo + span * host.element_size()
+            for other, start, end in ranges:
+                if (spec.child_memory or other.child_memory) and lo < end and start < hi:
+                    raise ValueError(f"Child-memory tensors cannot alias: {spec.name!r}, {other.name!r}")
+            ranges.append((spec, lo, hi))
+    child_args = ChildMemoryTaskArgs(worker)
+    try:
+        for spec, direction in zip(specs, signature):
+            if spec.child_memory:
+                child_args.add(spec.name, spec.value, direction)
+    except BaseException:
+        child_args.release()
+        raise
+    return child_args
+
+
+def _build_l2_ref_args(test_args: TaskArgsBuilder, orch_signature: list, worker, child_args=None):
     """Build TensorArg `TaskArgs` from `TaskArgsBuilder` for the L2 `Worker.run` path.
 
     An L2 leaf consumes its own args: `Worker.run(handle, args, cfg)` materializes each TensorArg to a
@@ -583,11 +736,14 @@ def _build_l2_ref_args(test_args: TaskArgsBuilder, orch_signature: list, worker)
     at L2 there is no fork, so any host tensor resolves in-process); the direction tag is inert at L2
     but set for parity with the L3 path.
 
+    Explicit `child_memory` arguments use case-owned device addresses; the rest
+    keep the per-round host-memory path.
+
     Returns:
         args: TaskArgs (TensorArg)
         output_names: list of tensor names that are OUTPUT or INOUT
     """
-    from simpler.task_interface import ArgDirection, TaskArgs, TensorArgType, scalar_to_uint64  # noqa: PLC0415
+    from simpler.task_interface import ArgDirection, TaskArgs, TensorArgType  # noqa: PLC0415
 
     from simpler_setup.torch_interop import make_tensor_arg  # noqa: PLC0415
 
@@ -608,12 +764,16 @@ def _build_l2_ref_args(test_args: TaskArgsBuilder, orch_signature: list, worker)
                     f"Update CALLABLE['orchestration']['signature'] to match generate_args()."
                 )
             direction = orch_signature[tensor_idx]
-            args.add_tensor(make_tensor_arg(worker, spec.value), dir2tag.get(direction, TensorArgType.INPUT))
+            if child_args is not None and spec.name in child_args.tensors:
+                tensor_arg = child_args.tensors[spec.name]
+            else:
+                tensor_arg = make_tensor_arg(worker, spec.value)
+            args.add_tensor(tensor_arg, dir2tag.get(direction, TensorArgType.INPUT))
             if direction in (ArgDirection.OUT, ArgDirection.INOUT):
                 output_names.append(spec.name)
             tensor_idx += 1
         elif isinstance(spec, Scalar):
-            args.add_scalar(scalar_to_uint64(spec.value))
+            args.add_scalar(spec.value)
 
     return args, output_names
 
@@ -632,7 +792,6 @@ def _build_chip_task_args(test_args: TaskArgsBuilder, orch_signature: list):
     from simpler.task_interface import (  # noqa: PLC0415
         ArgDirection,
         ChipStorageTaskArgs,
-        scalar_to_uint64,
     )
 
     # make_chip_tensor_arg builds the chip POD (ChipTensor, carries an address) for the direct
@@ -657,7 +816,7 @@ def _build_chip_task_args(test_args: TaskArgsBuilder, orch_signature: list):
                 output_names.append(spec.name)
             tensor_idx += 1
         elif isinstance(spec, Scalar):
-            chip_args.add_scalar(scalar_to_uint64(spec.value))
+            chip_args.add_scalar(spec.value)
 
     return chip_args, output_names
 
@@ -727,7 +886,6 @@ def _build_l3_task_args(test_args: TaskArgsBuilder, orch_signature: list, worker
         ArgDirection,
         TaskArgs,
         TensorArgType,
-        scalar_to_uint64,
     )
 
     _DIR_TO_TAG = {
@@ -757,7 +915,7 @@ def _build_l3_task_args(test_args: TaskArgsBuilder, orch_signature: list, worker
                 output_names.append(spec.name)
             tensor_idx += 1
         elif isinstance(spec, Scalar):
-            chip_args.add_scalar(scalar_to_uint64(spec.value))
+            chip_args.add_scalar(spec.value)
 
     return chip_args, output_names
 
@@ -1878,53 +2036,62 @@ class SceneTestCase:
             handle = worker.register(callable_obj)
             type(self)._st_l2_handle = handle
 
-        # Build args
         test_args = self.generate_args(params)
-        chip_args, output_names = _build_l2_ref_args(test_args, orch_sig, worker)
+        with _child_memory_args(worker, test_args, orch_sig) as child_args:
+            chip_args, output_names = _build_l2_ref_args(test_args, orch_sig, worker, child_args=child_args)
+            host_memory_outputs = [name for name in output_names if name not in child_args.tensors]
+            child_memory_outputs = [name for name in output_names if name in child_args.tensors]
 
-        # Compute golden (unless skip_golden)
-        golden_args = None
-        if not skip_golden:
-            golden_args = test_args.clone()
-            with _golden_thread_cap():
-                self.compute_golden(golden_args, params)
-
-        _log_torch_backend_autoload_once()
-
-        # Save initial output tensor values for reset between rounds
-        initial_outputs = {}
-        if rounds > 1:
-            for name in output_names:
-                initial_outputs[name] = getattr(test_args, name).clone()
-
-        # Execute rounds. The platform emits `[STRACE]` host/device markers to
-        # stderr on every run; multi-round timing is obtained by teeing stderr
-        # to a file and parsing it offline with
-        # `python -m simpler_setup.tools.strace_timing <log> --rounds-table`
-        # (the scene test no longer captures/parses inline). See
-        # docs/dfx/l2-timing.md.
-        for round_idx in range(rounds):
-            if round_idx > 0:
-                for name, initial in initial_outputs.items():
-                    getattr(test_args, name).copy_(initial)
-
-            # Every diagnostic reaching this loop is already multi-round-safe:
-            # effective_diagnostic_options zeroes all of them when rounds > 1,
-            # so no per-round masking belongs here.
-            config = self._build_config(
-                config_dict,
-                enable_chip_swimlane=enable_chip_swimlane,
-                enable_dump_args=enable_dump_args,
-                enable_pmu=enable_pmu,
-                enable_dep_gen=enable_dep_gen,
-                enable_scope_stats=enable_scope_stats,
-                output_prefix=output_prefix,
-            )
-
-            with _temporary_env(self._resolve_env()):
-                worker.run(handle, chip_args, config=config)
-
+            golden_args = None
             if not skip_golden:
+                golden_args = test_args.clone()
+                with _golden_thread_cap():
+                    initial_golden = {name: getattr(golden_args, name).clone() for name in host_memory_outputs}
+                    for golden_round in range(rounds if child_memory_outputs else 1):
+                        if golden_round:
+                            for name, initial in initial_golden.items():
+                                getattr(golden_args, name).copy_(initial)
+                        self.compute_golden(golden_args, params)
+
+            _log_torch_backend_autoload_once()
+
+            # Save initial output tensor values for reset between rounds
+            initial_outputs = {}
+            if rounds > 1:
+                for name in host_memory_outputs:
+                    initial_outputs[name] = getattr(test_args, name).clone()
+
+            # Execute rounds. The platform emits `[STRACE]` host/device markers to
+            # stderr on every run; multi-round timing is obtained by teeing stderr
+            # to a file and parsing it offline with
+            # `python -m simpler_setup.tools.strace_timing <log> --rounds-table`
+            # (the scene test no longer captures/parses inline). See
+            # docs/dfx/l2-timing.md.
+            for round_idx in range(rounds):
+                if round_idx > 0:
+                    for name, initial in initial_outputs.items():
+                        getattr(test_args, name).copy_(initial)
+
+                # Every diagnostic reaching this loop is already multi-round-safe:
+                # effective_diagnostic_options zeroes all of them when rounds > 1,
+                # so no per-round masking belongs here.
+                config = self._build_config(
+                    config_dict,
+                    enable_chip_swimlane=enable_chip_swimlane,
+                    enable_dump_args=enable_dump_args,
+                    enable_pmu=enable_pmu,
+                    enable_dep_gen=enable_dep_gen,
+                    enable_scope_stats=enable_scope_stats,
+                    output_prefix=output_prefix,
+                )
+
+                with _temporary_env(self._resolve_env()):
+                    worker.run(handle, chip_args, config=config)
+
+                if not skip_golden and not child_memory_outputs:
+                    self.compare_outputs(test_args, golden_args, output_names, params)
+            if not skip_golden and child_memory_outputs:
+                child_args.copy_back(test_args, child_memory_outputs)
                 self.compare_outputs(test_args, golden_args, output_names, params)
 
     def _run_and_validate_l3(  # noqa: PLR0913 -- threads CLI diagnostic flags + L3 ns context
@@ -1948,6 +2115,8 @@ class SceneTestCase:
 
         # Build args
         test_args = self.generate_args(params)
+        if any(isinstance(spec, TensorArg) and spec.child_memory for spec in test_args.specs):
+            raise ValueError("SceneTest child_memory declarations require L2")
 
         # Compute golden (unless skip_golden)
         golden_args = None
@@ -2071,7 +2240,7 @@ class SceneTestCase:
         rounds = request.config.getoption("--rounds", default=1)
         skip_golden = request.config.getoption("--skip-golden", default=False)
         enable_chip_swimlane = request.config.getoption("--enable-chip-swimlane", default=0)
-        enable_dump_args = request.config.getoption("--dump-args", default=0)
+        enable_dump_args = dump_args_level(request.config.getoption("--dump-args", default="off"))
         enable_pmu = request.config.getoption("--enable-pmu", default=0)
         enable_dep_gen = request.config.getoption("--enable-dep-gen", default=False)
         enable_scope_stats = request.config.getoption("--enable-scope-stats", default=False)

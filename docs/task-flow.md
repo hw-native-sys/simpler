@@ -192,7 +192,7 @@ snapshot for that purpose.
 ④ ChipStorageTaskArgs (ChipTensor records + scalars)
      │ native run or prepare/launch/poll/finalize lifecycle
      ▼
-    chip runtime stages host-backed data or uses owned device memory
+    chip runtime copies host-backed data in or uses owned device memory
 ```
 
 A public L2 `Worker.run()` performs the same materialization in its own
@@ -248,7 +248,7 @@ run token for the staged prepare/launch/poll/finalize path.
 
 This boundary is a descriptor resolution and materialization step, not a
 memcpy from the mailbox tensor array into `ChipTensor[]`. Host-backed arguments
-may need device staging and output copy-back; device-backed arguments must
+may need a device copy-in and output copy-back; device-backed arguments must
 resolve to allocations owned by the target chip. The native `ChipWorker`
 consumes the resulting POD and invokes the runtime's execution lifecycle.
 
@@ -431,22 +431,23 @@ long run; a finite control timeout includes this deferral interval, and expiry
 poisons the local endpoint because the pending command's completion is
 uncertain.
 
-#### TRB temporary buffer
+#### Retained temporary buffer
 
-`tensormap_and_ringbuffer` stages ordinary non-child tensor arguments through a
+Both host runtimes copy ordinary non-child tensor arguments in through a
 retained temporary buffer owned per pipeline slot, instead of a per-run `device_malloc()` /
-`device_free()` pair. This is always on for TRB — an internal allocation
+`device_free()` pair. This is always on — an internal allocation
 optimization with no user-facing switch. It is not serialized in task mailboxes
 and does not change `TaskArgs`, `CallConfig`, child-memory tensors, or public
 `Worker.malloc()` / `Worker.free()` semantics.
 
-On each TRB bind the host runtime sizes the retained buffer from the run's
+On each bind the host runtime sizes the retained buffer from the run's
 non-child tensors, growing it (free old + malloc new) only when a run needs
 more than is currently retained, and bump-slices each tensor from it. The
 buffer lives on the `DeviceRunner` across runs (freed once at finalize); the
 platform only stores its `{addr, size}` slot. If a grow allocation fails the
-run fails before device argument staging. See the runtime's `RUNTIME_LOGIC.md`
-§2.4 for the grow/reuse mechanics.
+run fails before the device arguments are copied in. The grow/slice logic is
+`RetainedTempBump` in `src/common/utils/retained_temp_bump.h`; see
+`tensormap_and_ringbuffer`'s `RUNTIME_LOGIC.md` §2.4 for the mechanics.
 
 ### SUB-type child loop (Python callable leaf)
 
@@ -753,7 +754,7 @@ Step-by-step (one chip worker):
 | 5 | WT_chip_0 parent side | encode one leased task frame: write `config`, digest prefix, and the args blob; publish `TASK_READY` for the active lane or `PREPARE_READY` for a staged successor |
 | 6 | chip_0 child process | validate the frame and resolve its digest; ordinary HBG with an active predecessor also prepares the leased inactive arena bank before publishing `FRAME_STAGED`, while a frame with no active predecessor, diagnostic HBG, and TMR publish after validation and defer native prepare |
 | 7 | chip_0 native-run path | after activation and the predecessor's finalization fence, launch an already-prepared HBG run or finish deferred native preparation and then launch; poll it to completion and finalize it before another staged frame may launch. Compatibility endpoints perform the equivalent operation through blocking `ChipWorker::run` |
-| 8 | runtime.so | stage resolved host-backed tensors on the device; dispatch AICPU / AICore; copy output back to `c` during finalization |
+| 8 | runtime.so | copy resolved host-backed tensors in to the device; dispatch AICPU / AICore; copy output back to `c` during finalization |
 | 9 | chip_0 child | native finalization returns; write `TASK_DONE` |
 | 10 | WT_chip_0 parent | observe `TASK_DONE`; push success completion |
 | 11 | Scheduler | mark slot COMPLETED; fanout release (none in this DAG); scope_end will release scope ref |

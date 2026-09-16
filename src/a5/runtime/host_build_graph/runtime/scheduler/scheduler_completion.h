@@ -36,7 +36,7 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     uint32_t completed_generation, SchedulerWakeStats *wake_stats, SchedulerReadyStats *ready_stats,
     SchedulerCompletionStats *completion_stats, uint64_t *ready_victim_cursors, uint64_t profiling_level,
     const SchedulerReadyClaim *replacement_ready, bool *direct_refilled,
-    SchedulerCompletionServiceTiming *timing = nullptr, __gm__ SchedulerReadyOwnerState *owner_state = nullptr
+    __gm__ SchedulerReadyOwnerState *owner_state = nullptr
 ) {
     if (direct_refilled != nullptr) *direct_refilled = false;
     if (cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM || pending_slot >= SCHEDULER_PENDING_SLOT_COUNT ||
@@ -63,9 +63,7 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     const bool chip_task_timing_enabled = scheduler_task_timing_enabled(profiling_level);
     const bool schedule_timing_enabled = scheduler_schedule_timing_enabled(profiling_level);
     const bool phase_timing_enabled = scheduler_phase_timing_enabled(profiling_level);
-    const bool record_timeline = phase_timing_enabled;
     const uint64_t completion_start = schedule_timing_enabled ? scheduler_cycles() : 0;
-    uint64_t operation_start = record_timeline ? completion_start : 0;
     scheduler_observe_cache_line(slot);
     const int64_t task_id = slot->task_id;
     if (task_id < 0 || static_cast<uint64_t>(task_id) >= graph.task_count) {
@@ -133,28 +131,21 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     }
     const uint8_t completed_subtask_slot = slot->subtask_slot;
     scheduler_gm_store(completion_line->completed_generations[pending_slot], UINT32_C(0));
-    uint64_t operation_end = record_timeline ? scheduler_cycles() : 0;
-    if (timing != nullptr) timing->consume_cycles += operation_end - operation_start;
-    operation_start = operation_end;
-    uint64_t ready_publish_cycles = 0;
-    uint64_t refill_cycles = 0;
-    uint64_t finalize_cycles = 0;
     uint64_t refill_start_cycles = 0;
     uint64_t refill_end_cycles = 0;
     bool refilled = false;
     __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, scheduler, task_id);
     scheduler_gm_store(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
+    const uint64_t completion_phase_end = phase_timing_enabled ? scheduler_cycles() : 0;
     if (!scheduler_resolve_completion(
             graph, scheduler_state_base, scheduler, run_control, task_id, wake_stats, ready_stats, completion_stats,
-            owner_state, profiling_level, false, timing == nullptr ? nullptr : &ready_publish_cycles
+            owner_state, profiling_level, false
         )) {
         scheduler_account_failed_completion(
             graph, scheduler, run_control, task_id, SchedulerErrorSite::COMPLETION_RESOLVE_FAILED
         );
         return false;
     }
-    if (timing != nullptr) timing->ready_publish_cycles += ready_publish_cycles;
-    refill_start_cycles = record_timeline ? scheduler_cycles() : 0;
     SchedulerReadyClaim ready{};
     bool ready_available = replacement_ready != nullptr;
     if (ready_available) {
@@ -163,18 +154,26 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
         // A normal AIV task is never refilled directly onto the Scheduler.
         // Its completed slot becomes capacity for late binding instead.
         const uint32_t core_type = scheduler_metadata_core_type_index(completed_subtask_slot);
+        const uint64_t state_probe_start_cycles = phase_timing_enabled ? scheduler_cycles() : 0;
         if (!scheduler_claim_ready_for_slot(
                 graph, scheduler_state_base, scheduler, run_control, scheduler->scheduler_count, core_type,
-                &ready_victim_cursors[core_type], ready_stats, &ready, owner_state, profiling_level
+                &ready_victim_cursors[core_type], ready_stats, &ready, owner_state
             )) {
             scheduler_account_failed_completion(
                 graph, scheduler, run_control, task_id, SchedulerErrorSite::COMPLETION_REFILL_CLAIM_FAILED
             );
             return false;
         }
+        ready.state_probe_start_cycles = state_probe_start_cycles;
         ready_available = ready.task_id >= 0;
+        if (ready_available) {
+            ready.state_probe_end_cycles = phase_timing_enabled ? scheduler_cycles() : 0;
+            refill_start_cycles = ready.state_probe_end_cycles;
+        }
     }
     if (ready_available) {
+        if (refill_start_cycles == 0) refill_start_cycles = phase_timing_enabled ? scheduler_cycles() : 0;
+        ready.publication_mode = SchedulerPublicationMode::REFILL;
         SchedulerFreeSlotClaim claim{worker_id, pending_slot, slot->generation};
         if (!scheduler_fill_dispatch_slot(
                 graph, scheduler_state_base, scheduler, run_control, claim, ready, profiling_level
@@ -186,18 +185,8 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
         }
         refilled = true;
     }
-    refill_end_cycles = record_timeline ? scheduler_cycles() : 0;
-    if (timing != nullptr) {
-        refill_cycles = refill_end_cycles - refill_start_cycles;
-        timing->refill_cycles += refill_cycles;
-    }
-    operation_end = record_timeline ? scheduler_cycles() : 0;
-    if (timing != nullptr) {
-        uint64_t resolve_total = operation_end - operation_start;
-        uint64_t excluded = ready_publish_cycles + refill_cycles + finalize_cycles;
-        timing->resolve_cycles += resolve_total > excluded ? resolve_total - excluded : 0;
-    }
-    operation_start = operation_end;
+    refill_end_cycles = phase_timing_enabled ? scheduler_cycles() : 0;
+    if (refill_start_cycles == 0) refill_start_cycles = refill_end_cycles;
     if (!refilled) {
         slot->task_id = SCHEDULER_TASK_ID_INVALID;
         scheduler_writeback_cache_line(slot);
@@ -205,11 +194,9 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
             slot->publication, scheduler_dispatch_publication(slot->generation, SchedulerDispatchSlotState::FREE)
         );
     }
-    const uint64_t completion_end = record_timeline ? scheduler_cycles() : 0;
-    if (timing != nullptr) timing->finalize_cycles += completion_end - operation_start;
     if (chip_task_timing_enabled) {
         if (phase_timing_enabled) {
-            completed_trace->complete_end_cycles = completion_end;
+            completed_trace->complete_end_cycles = completion_phase_end;
         }
         if (phase_timing_enabled && refilled) {
             completed_trace->refill_scheduler_worker_id = scheduler->worker_index;
@@ -233,12 +220,7 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     } else if (completed_trace != nullptr) {
         scheduler_publish_cache_line(&completed_trace->kernel_start_cycles);
     }
-    const uint64_t resolved_count_start = timing == nullptr ? 0 : scheduler_cycles();
     scheduler_gm_fetch_add(run_control->resolved_task_count, UINT64_C(1));
-    if (timing != nullptr) {
-        finalize_cycles = scheduler_cycles() - resolved_count_start;
-        timing->finalize_cycles += finalize_cycles;
-    }
     if (direct_refilled != nullptr) *direct_refilled = refilled;
     return true;
 }
@@ -252,8 +234,7 @@ inline __aicore__ bool scheduler_service_cluster_completions(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *scheduler,
     __gm__ SchedulerRunControl *run_control, SchedulerWakeStats *wake_stats, SchedulerReadyStats *ready_stats,
     SchedulerCompletionStats *completion_stats, uint64_t *ready_victim_cursors = nullptr, uint64_t profiling_level = 0,
-    uint64_t *direct_refilled_slot_mask = nullptr, SchedulerCompletionServiceTiming *timing = nullptr,
-    __gm__ SchedulerReadyOwnerState *owner_state = nullptr
+    uint64_t *direct_refilled_slot_mask = nullptr, __gm__ SchedulerReadyOwnerState *owner_state = nullptr
 ) {
     if (scheduler->is_scheduler == 0) return false;
     if (direct_refilled_slot_mask != nullptr) *direct_refilled_slot_mask = 0;
@@ -284,7 +265,7 @@ inline __aicore__ bool scheduler_service_cluster_completions(
                 if (!scheduler_service_cluster_completion_slot(
                         graph, scheduler_state_base, scheduler, run_control, cluster_lane, pending_slot,
                         completed_generation, wake_stats, ready_stats, completion_stats, ready_victim_cursors,
-                        profiling_level, nullptr, &direct_refilled, timing, owner_state
+                        profiling_level, nullptr, &direct_refilled, owner_state
                     ))
                     return false;
                 if (direct_refilled && direct_refilled_slot_mask != nullptr)

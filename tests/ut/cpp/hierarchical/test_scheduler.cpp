@@ -2182,7 +2182,13 @@ TEST_F(ProgressSchedulerFixture, SuccessorStagesButActivatesOnlyAfterFifoPromoti
     if (orchestrator.run_done(second_run)) orchestrator.release_run(second_run);
 }
 
-TEST_F(ProgressSchedulerFixture, DiagnosticSuccessorWaitsForActiveLaneInsteadOfStaging) {
+// A diagnostics config once took the active FIFO lane instead of the prepared
+// one, because collector setup wrote runner-global state during preparation.
+// That state is now built and reset under the execution claim, so a diagnostic
+// successor stages like any other. Nothing user-visible reports the difference —
+// the run still completes and its artifacts still land — so without this the
+// special case could come back unnoticed.
+TEST_F(ProgressSchedulerFixture, DiagnosticSuccessorStagesLikeAnyOther) {
     RunId first_run = orchestrator.begin_run();
     SubmitResult first =
         orchestrator.submit_next_level(C(1), single_tensor_args(0x1100, TensorArgType::OUTPUT), config, 0);
@@ -2200,22 +2206,27 @@ TEST_F(ProgressSchedulerFixture, DiagnosticSuccessorWaitsForActiveLaneInsteadOfS
         orchestrator.submit_next_level(C(2), single_tensor_args(0x2200, TensorArgType::OUTPUT), diagnostic_config, 0);
     orchestrator.close_run_submission(second_run);
 
-    EXPECT_FALSE(endpoint0->wait_submitted(2, std::chrono::milliseconds(50)));
-    std::vector<WorkerDispatch> submitted = endpoint0->submitted();
-    ASSERT_EQ(submitted.size(), 1u);
-    EXPECT_EQ(submitted[0].task_slot, first.task_slot);
-    EXPECT_FALSE(submitted[0].prepare_only);
-
-    endpoint0->emit(WorkerProgressKind::ACCEPTED, submitted[0]);
-    endpoint0->emit(WorkerProgressKind::COMPLETED, submitted[0]);
     ASSERT_TRUE(endpoint0->wait_submitted(2));
-    submitted = endpoint0->submitted();
+    std::vector<WorkerDispatch> submitted = endpoint0->submitted();
     ASSERT_EQ(submitted.size(), 2u);
-    EXPECT_EQ(submitted[1].task_slot, second.task_slot);
-    EXPECT_FALSE(submitted[1].prepare_only);
+    auto first_dispatch = std::find_if(submitted.begin(), submitted.end(), [&](const WorkerDispatch &dispatch) {
+        return dispatch.task_slot == first.task_slot;
+    });
+    auto second_dispatch = std::find_if(submitted.begin(), submitted.end(), [&](const WorkerDispatch &dispatch) {
+        return dispatch.task_slot == second.task_slot;
+    });
+    ASSERT_NE(first_dispatch, submitted.end());
+    ASSERT_NE(second_dispatch, submitted.end());
+    EXPECT_FALSE(first_dispatch->prepare_only);
+    EXPECT_TRUE(second_dispatch->prepare_only);
+    EXPECT_EQ(orchestrator.active_run_id(), first_run);
+    EXPECT_EQ(orchestrator.preparable_run_id(), second_run);
 
-    endpoint0->emit(WorkerProgressKind::ACCEPTED, submitted[1]);
-    endpoint0->emit(WorkerProgressKind::COMPLETED, submitted[1]);
+    endpoint0->emit(WorkerProgressKind::ACCEPTED, *first_dispatch);
+    endpoint0->emit(WorkerProgressKind::COMPLETED, *first_dispatch);
+    ASSERT_TRUE(endpoint0->wait_activated(second_run));
+    endpoint0->emit(WorkerProgressKind::ACCEPTED, *second_dispatch);
+    endpoint0->emit(WorkerProgressKind::COMPLETED, *second_dispatch);
     EXPECT_TRUE(orchestrator.wait_run_for(first_run, 3.0));
     EXPECT_TRUE(orchestrator.wait_run_for(second_run, 3.0));
     if (orchestrator.run_done(first_run)) orchestrator.release_run(first_run);

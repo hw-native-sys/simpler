@@ -46,6 +46,7 @@
 #include "task_args.h"
 #include "aicore_teardown.h"
 #include "tensormap_and_ringbuffer/entry_args.h"  // EntryArgsStorage
+#include "utils/tensor_lease.h"
 
 // =============================================================================
 // Configuration Macros
@@ -112,26 +113,6 @@ struct Handshake {
 // DeviceRuntimeLaunchDesc::teardown_gates, one isolated line each.
 static_assert(sizeof(Handshake) == 64);
 static_assert(std::is_standard_layout_v<Handshake> && std::is_trivially_copyable_v<Handshake>);
-
-enum class TensorReleaseKind {
-    Free,
-    BufferNoop,
-    ExternalNoop,
-};
-
-/**
- * simpler::tmr::Tensor lease for tracking host-device memory mappings and release ownership.
- */
-struct TensorLease {
-    void *host_ptr;
-    void *dev_ptr;
-    size_t size;
-    // false for read-only INPUT tensors: they are never written by the kernel,
-    // so the end-of-run D2H copy-back is skipped. OUTPUT/INOUT/unknown
-    // keep the safe default of copying back.
-    bool needs_copy_back = true;
-    TensorReleaseKind release_kind = TensorReleaseKind::Free;
-};
 
 /**
  * Task structure - Compatibility stub for platform layer

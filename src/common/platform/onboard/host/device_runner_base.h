@@ -19,8 +19,9 @@
  *   - The trivial tensor-memory wrappers (`allocate_tensor`,
  *     `free_tensor`, `copy_*_device`).
  *   - The arena-pool accessors (`acquire_pooled_gm_heap`, etc.).
- *   - Device lifecycle: `attach_current_thread`,
- *     `configure_aicore_op_timeout`, `ensure_device_initialized`,
+ *   - Device lifecycle: `bind_current_thread`, `attach_current_thread`,
+ *     `adopt_borrowed_device`, `configure_aicore_op_timeout`,
+ *     `ensure_device_initialized`,
  *     `ensure_binaries_loaded`, persistent AICPU/AICore streams,
  *     dispatcher/executor bytes, `LoadAicpuOp`, `KernelArgsHelper`.
  *   - block_dim resolution: `query_max_block_dim`, `resolve_block_dim`.
@@ -64,7 +65,12 @@
 #include "device_runner_helpers.h"
 #include "aicpu_loader/host/load_aicpu_op.h"
 #include "host/chip_swimlane_collector.h"
+#include "host/dfx_run_config.h"
+#include "host/execution_mode_latch.h"
 #include "host/host_phase_records.h"
+#include "host/host_phase_run_state.h"
+#include "host/kernel_entry_validation.h"
+#include "host/child_memory_host_view.h"
 #include "host/memory_allocator.h"
 #include "host/pmu_collector.h"
 #include "host/runtime_timeout_config.h"
@@ -134,6 +140,15 @@ public:
      */
     uint64_t retained_temp_addr(uint32_t slot_id) const;
 
+    /**
+     * This context's execution identity, latched once by whichever init entry
+     * constructs it. Every kernel-mode guard on the ACL-lifecycle and arena
+     * paths keys on is_kernel(); `attach_current_thread` refuses outright on a
+     * kernel latch, which is what keeps the program-mode entries and the
+     * per-thread device bind off a borrowed device.
+     */
+    ExecutionModeLatch &execution_mode_latch() { return execution_mode_latch_; }
+
     /** Allocate / free / copy on the per-Worker `MemoryAllocator` + CANN runtime. */
     void *allocate_tensor(std::size_t bytes);
     /** Total device HBM (bytes) currently committed by this runner's MemoryAllocator. */
@@ -166,6 +181,32 @@ public:
         return nullptr;
     }
     virtual void unregister_device_memory_from_host(void *dev_ptr) { (void)dev_ptr; }
+
+    /**
+     * Host view of a child-memory address for a host-side orchestrator, with
+     * the mapping owned by this runner rather than by the caller.
+     *
+     * The mapping covers the whole tracked allocation containing `dev_ptr` —
+     * that is the unit `free_tensor` invalidates, and several tensors or views
+     * inside one child buffer then share it. Established on the first request
+     * and kept until that allocation is freed, because establishing one costs
+     * ~5.2 µs plus ~7.0 ms/GiB and a bind would otherwise pay it every run
+     * (docs/investigations/2026-09-hbg-per-run-host-view-rebuild.md).
+     *
+     * @return a host address carrying `dev_ptr`'s offset within the allocation,
+     *         or nullptr when `dev_ptr` is not inside a tracked allocation, or
+     *         this backend has no host-map path (a5 onboard), or the platform
+     *         refused the mapping (issue #1531).
+     */
+    void *acquire_child_memory_host_view(void *dev_ptr, std::size_t bytes);
+
+    /**
+     * Unregister every child-memory mapping still held.
+     *
+     * Runs before `mem_alloc_.finalize()`, which frees the allocations these
+     * map: past that point the pages are gone and the mapping cannot be named.
+     */
+    void release_child_memory_host_views();
 
     /**
      * Commit the three per-Worker pooled regions (GM heap, shared
@@ -215,17 +256,37 @@ public:
     std::thread create_thread(std::function<void()> fn);
 
     /**
-     * Attach the current host thread to the target device.
+     * Bind the calling thread to a device, taking nothing else from it.
      *
-     * Required before host-side runtime initialization may allocate or
-     * free device memory on the current thread. Idempotent for the same
-     * id; errors if called with a different id after a prior attach.
-     * No streams are created here.
+     * Idempotent for the same id; errors if called with a different id after
+     * a prior adopt. Creates no streams and records no identity.
+     *
+     * @param device_id  Device ID (0-15)
+     * @return 0 on success, error code on failure.
+     */
+    int bind_current_thread(int device_id);
+
+    /**
+     * Bind the current host thread and adopt the device for a program
+     * context: on the first call it also resolves the timeout config, writes
+     * the card's op-execute watchdog, and records device_id_.
+     *
+     * Required before host-side runtime initialization may allocate or free
+     * device memory on the current thread. Refuses with
+     * PTO_RUNTIME_ERR_INVALID_STATE on a context latched to kernel mode, which
+     * owns neither the bind nor the watchdog.
      *
      * @param device_id  Device ID (0-15)
      * @return 0 on success, error code on failure.
      */
     int attach_current_thread(int device_id);
+    /**
+     * Record which device a kernel-mode context runs on. Takes no device side
+     * effect: the caller already holds the device current, so this neither
+     * binds the thread nor touches the card's op-execute watchdog. Requires
+     * the execution-mode latch to already read kernel.
+     */
+    int adopt_borrowed_device(int device_id);
 
     /**
      * One-shot device initialization. Performs, in order:
@@ -303,7 +364,7 @@ public:
         sdma_warmup_binary_ = std::move(sdma_warmup_binary);
     }
 
-    /** The device id captured by simpler_init's `attach_current_thread` call. */
+    /** Which device this context is on; -1 until an init entry adopts one. */
     int device_id() const { return device_id_; }
 
     /**
@@ -558,6 +619,7 @@ public:
             identity(identity_in),
             runtime(&runtime_in),
             config(config_in),
+            dfx(DfxRunConfig::from(config_in)),
             pipeline_slot(pipeline_slot_in) {}
         PreparedExecution(const PreparedExecution &) = delete;
         PreparedExecution &operator=(const PreparedExecution &) = delete;
@@ -565,6 +627,7 @@ public:
             identity(other.identity),
             runtime(std::exchange(other.runtime, nullptr)),
             config(other.config),
+            dfx(std::move(other.dfx)),
             pipeline_slot(other.pipeline_slot),
             num_aicore(other.num_aicore),
             launch_aicpu_num(other.launch_aicpu_num),
@@ -576,6 +639,18 @@ public:
         NativeRunIdentity identity{};
         Runtime *runtime{nullptr};
         CallConfig config{};
+        /**
+         * This run's diagnostics configuration, resolved from its own config.
+         *
+         * Every phase of the run reads its DFX configuration from here rather
+         * than from the runner's members: prepare because it can overlap a
+         * predecessor whose configuration is still the one bound on the runner,
+         * and launch/drain so that one run answers for its whole lifetime from a
+         * single value. A run that degrades a channel (a5 disables PMU when its
+         * init fails) writes that here, where it reaches this run's arming and
+         * teardown and no other run's.
+         */
+        DfxRunConfig dfx{};
         uint32_t pipeline_slot{PTO_PIPELINE_MAX_DEPTH};
         int num_aicore{0};
         int launch_aicpu_num{0};
@@ -639,11 +714,16 @@ public:
     virtual int finalize() = 0;
 
     /**
-     * dep_gen enablement setter. The shared c_api `simpler_run` calls this
-     * unconditionally; a2a3 and a5 override it to capture submit_task inputs.
-     * The base default is a no-op for any arch that does not implement dep_gen.
+     * Arm or disarm this thread's host-side dep_gen capture, from the run's own
+     * config, before it binds.
+     *
+     * A host-orchestrating runtime holds the captured graph in thread-local
+     * state between orchestration and emit, so this has to run on the thread
+     * that is about to bind, for every prepare — including one that overlaps an
+     * active predecessor, which skips `apply_call_config`. It writes nothing the
+     * runner shares between runs. An arch without dep_gen keeps the no-op.
      */
-    virtual void set_dep_gen_enabled(bool /*enable*/) {}
+    virtual void arm_host_dep_gen_capture(bool /*enable*/) {}
 
     /**
      * Launch an AICPU kernel. Internal helper used by the subclass's
@@ -722,56 +802,69 @@ public:
 
     /**
      * Enablement setters for the four shared diagnostics sub-features.
-     * Applied from the per-run CallConfig by `apply_call_config()` before prepare;
-     * downstream execution paths read the corresponding `enable_*_`
-     * members directly.
+     * Applied from the per-run CallConfig by `apply_call_config()` before
+     * prepare. Execution paths do not read these: a run's own diagnostics
+     * configuration reaches them on its `PreparedExecution::dfx`, and the runner
+     * keeps only what a device-context query answers from.
      *
      * `set_dep_gen_enabled` is a2a3-only and lives on the subclass.
      */
-    void set_chip_swimlane_enabled(int level) {
-        chip_swimlane_level_ = static_cast<ChipSwimlaneLevel>(level);
-        enable_chip_swimlane_ = (chip_swimlane_level_ != ChipSwimlaneLevel::DISABLED);
-    }
+    void set_chip_swimlane_enabled(int level) { chip_swimlane_level_ = static_cast<ChipSwimlaneLevel>(level); }
     uint32_t chip_swimlane_level() const { return static_cast<uint32_t>(chip_swimlane_level_); }
     bool
     publish_chip_swimlane_extension(ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size) {
         return json_value != nullptr &&
                chip_swimlane_collector_.set_json_extension(section, std::string(json_value, json_size));
     }
-    HostPhaseRecordPool *host_phase_pool_arm(bool producer_wants_records) noexcept;
-    void host_phase_pool_finish(uint64_t submitted_tasks, uint64_t invocation_id) noexcept {
-        host_phase_records_.finish(submitted_tasks, invocation_id);
-    }
-    const simpler::dfx::HostPhaseRecordStore &host_phase_records() const { return host_phase_records_; }
-    /** Hand this pass's records to the swimlane reader, just before its export. */
-    void publish_host_phase_records_to_swimlane();
-    /** Start the level-4 Host/Device clock correlation once per run. */
-    void begin_clock_correlation_session_if_needed() noexcept;
     /**
-     * Write this pass's per-event host phase records to `output_prefix_`.
+     * Hand one pipeline slot's host-phase state to the run about to bind into
+     * it, from that run's own config. Called before every bind, because the
+     * runner's members describe whichever run last held the execution claim.
+     */
+    void begin_host_phase_run(uint32_t pipeline_slot, const DfxRunConfig &dfx);
+    HostPhaseRecordPool *host_phase_pool_arm(uint32_t pipeline_slot, bool producer_wants_records) noexcept;
+    void host_phase_pool_finish(uint32_t pipeline_slot, uint64_t submitted_tasks, uint64_t invocation_id) noexcept {
+        if (pipeline_slot >= host_phase_runs_.size()) return;
+        host_phase_runs_[pipeline_slot].records.finish(submitted_tasks, invocation_id);
+    }
+    /** Hand this pass's records to the swimlane reader, just before its export. */
+    void publish_host_phase_records_to_swimlane(uint32_t pipeline_slot);
+    /**
+     * Hand this run's captured clock-correlation session to the resident
+     * collector, under the execution claim.
+     *
+     * Its `HostOrchestrationBegin` anchor was sampled during bind, where the
+     * position's meaning lives; this is the first point at which writing the
+     * collector cannot land on a predecessor's session. `set_host_orchestrated`
+     * rides along because the collector's initialize() reads it when it sizes
+     * the orch phase pool, and that now runs from the same launch arming.
+     */
+    void publish_host_phase_run_to_collector(uint32_t pipeline_slot) noexcept;
+    /**
+     * Capture and publish in one step, for the device-orchestrating path that
+     * has no bind-time hook and reaches this already under the claim.
+     */
+    void begin_clock_correlation_session_if_needed(uint32_t pipeline_slot) noexcept;
+    /**
+     * Write this pass's per-event host phase records under `output_prefix`.
      *
      * Host-only: every phase recorded is produced on the host during bind and the
      * store is finished before launch, so a caller that never reaches the device
      * can still produce the artifact. The store writes a pass at most once, so
      * every path that can end a run may call this unconditionally.
      */
-    void write_host_phase_records_artifact();
-    void finish_clock_correlation_session(bool capture_device_complete, bool abandon_device_resources) noexcept;
-    void set_dump_args_enabled(int level) {
-        dump_args_level_ = static_cast<DumpArgsLevel>(level);
-        enable_dump_args_ = (dump_args_level_ != DumpArgsLevel::OFF);
-    }
-    void set_pmu_enabled(int enable_pmu) {
-        enable_pmu_ = (enable_pmu > 0);
-        pmu_event_type_ = resolve_pmu_event_type(enable_pmu);
-    }
-    void set_scope_stats_enabled(bool enable) { enable_scope_stats_ = enable; }
+    void write_host_phase_records_artifact(const std::string &output_prefix, uint32_t pipeline_slot);
+    void finish_clock_correlation_session(
+        uint32_t pipeline_slot, bool capture_device_complete, bool abandon_device_resources
+    ) noexcept;
+    /** Create this run's provider and sample its HostOrchestrationBegin anchors. */
+    void capture_clock_correlation_begin(HostPhaseRunState &run) noexcept;
 
     /**
-     * Latch this run's per-run diagnostic config onto the runner's `enable_*_`
-     * members before prepare uses them. The c_api applies it only when no active
-     * run can observe the runner-global collector configuration. Defined in the
-     * .cpp so this header does not need the full CallConfig definition.
+     * Latch the part of this run's config a device-context query answers from.
+     * The c_api applies it only when no active run can observe the runner-global
+     * state. Defined in the .cpp so this header does not need the full CallConfig
+     * definition.
      */
     void apply_call_config(const CallConfig &config);
 
@@ -955,27 +1048,34 @@ protected:
      *
      * @return 0 on success, the underlying init_runtime_args rc on failure.
      */
-    int init_runtime_args_with_metadata(Runtime &runtime, KernelArgsHelper &kernel_args);
+    int init_runtime_args_with_metadata(Runtime &runtime, KernelArgsHelper &kernel_args, SlotPersistentArgs &slot);
 
     /**
-     * Start collector mgmt + poll threads for the four shared
-     * diagnostics collectors (`chip_swimlane_collector_`, `dump_collector_`,
-     * `pmu_collector_`, `scope_stats_collector_`) that are enabled.
-     * Each `start()` is gated on the corresponding `enable_*_` flag;
-     * disabled collectors are not started.
+     * Open this run's collection window on the four shared diagnostics
+     * collectors (`chip_swimlane_collector_`, `dump_collector_`,
+     * `pmu_collector_`, `scope_stats_collector_`) that it enables, and start
+     * their mgmt + poll threads. Each block is gated on `dfx`, this run's own
+     * configuration, not on the runner's members.
+     *
+     * The collectors are resident and serve every run, so opening the window is
+     * destructive: it drops the previous run's records and counters and
+     * republishes the level the device reads. That is why it happens here, at
+     * launch, rather than during preparation — this is the first point the run
+     * holds the execution claim, so it is the first point at which no other run
+     * is executing against those collectors.
      *
      * Each spawned thread is bound to `device_id_` via `create_thread`.
      *
      * Subclasses with arch-specific collectors (`dep_gen_collector_`) call
-     * this helper and then start their own. The sim base carries the same
-     * split.
+     * this helper and then open and start their own. The sim base carries the
+     * same split.
      */
-    void start_shared_collectors_for_run();
+    void start_shared_collectors_for_run(const DfxRunConfig &dfx, uint32_t pipeline_slot);
 
     /**
      * Tear down the four shared diagnostics collectors after the launched
-     * kernels have synced. Each block is gated on the corresponding
-     * `enable_*_` flag and does: stop() → reconcile_counters() →
+     * kernels have synced. Each block is gated on `dfx`, this run's own
+     * configuration, and does: stop() → reconcile_counters() →
      * export step (`chip_swimlane` writes swimlane JSON via
      * `read_phase_header_metadata` + `export_swimlane_json`; `dump`
      * writes dump files; `pmu` has no export step beyond reconcile;
@@ -985,7 +1085,9 @@ protected:
      * `dep_gen_replay_emit_deps_json` export) inline their own teardown after
      * calling this helper. The sim base carries the same split.
      */
-    void teardown_shared_collectors_after_run(bool device_execution_complete);
+    void teardown_shared_collectors_after_run(
+        const DfxRunConfig &dfx, uint32_t pipeline_slot, bool device_execution_complete
+    );
 
     /**
      * The core and AICPU-thread counts a resident collector's pools were built
@@ -1011,17 +1113,11 @@ protected:
      *
      * The release frees device memory the collectors are holding, so it is only
      * safe while no other run is executing against them. Nothing here enforces
-     * that. What guarantees it today is the diagnostics depth-1 gate: with any
-     * diagnostic on, `allow_prepared_successor` is false, so a successor cannot
-     * even reserve while a predecessor is in flight, and a stale shape is only
-     * ever seen between runs.
-     *
-     * **Whoever lifts that gate must move this rebuild inside the execution
-     * claim.** Do not reach for `native_run_active()` as the guard — it is not a
-     * usable predicate at this point: onboard takes the claim in
-     * `simpler_launch_run`, but sim takes it in `simpler_prepare_run`, so on sim
-     * it is already true for the run being prepared and the check fires on its
-     * own run.
+     * that. What guarantees it is the caller: `arm_collectors_for_run()` is the
+     * sole user, and it runs from the launch arming, under the execution claim.
+     * Do not move the call back into preparation — a prepared successor overlaps
+     * its predecessor's device window, so this would free pools that predecessor
+     * is still writing into.
      */
     bool collector_shape_is_stale(int num_aicore, int aicpu_thread_num, int launch_aicpu_num) const {
         return collector_shape_.latched &&
@@ -1176,9 +1272,16 @@ protected:
 
     // ---- State shared by both a2a3 and a5 ---------------------------------
     //
-    // `device_id_` is written once by simpler_init and is immutable while
-    // native prepare, execution, and collector threads attach to the runner.
+    // Which device this context is on — not a claim of ownership, which the
+    // execution-mode latch carries instead. Written once before any prepare,
+    // execution or collector thread attaches: `attach_current_thread` writes
+    // it for a program context and `adopt_borrowed_device` for a kernel one, both
+    // guarded on the still-unset value, so repeated same-value writes from
+    // later-attaching threads cannot race.
     int device_id_{-1};
+    // This context's execution identity. Write-once: the first init entry to
+    // run latches it, and it never changes afterwards.
+    ExecutionModeLatch execution_mode_latch_;
     int block_dim_{0};
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
     int worker_count_{0};  // Stored for print_handshake_results
@@ -1231,10 +1334,15 @@ protected:
     host::LoadAicpuOp load_aicpu_op_;
 
     MemoryAllocator mem_alloc_;
-    // Retained temporary buffer for TRB device-arg staging, one per pipeline
-    // slot (see HostApi get/set_retained_temp_buffer). Just a remembered
+    // Host mappings of child-memory allocations a host-side orchestrator has
+    // touched — see HostApi acquire_child_memory_host_view. Keyed by allocation
+    // base and dropped by that allocation's free, which is what keeps a cached
+    // host VA from outliving its pages.
+    ChildMemoryHostViewCache child_memory_host_views_;
+    // Retained temporary buffer for device arguments, one per pipeline slot
+    // (see HostApi get/set_retained_temp_buffer). Just a remembered
     // {addr, size} that the slot reuses across its runs and finalize frees;
-    // the grow/pack logic lives in trb bind.
+    // the grow/slice logic lives in utils/retained_temp_bump.h.
     std::array<void *, PTO_PIPELINE_MAX_DEPTH> retained_temp_addrs_{};
     std::array<std::size_t, PTO_PIPELINE_MAX_DEPTH> retained_temp_sizes_{};
     // Graph Definition storage, one retained block per pipeline slot — see
@@ -1297,6 +1405,16 @@ protected:
     std::array<std::unique_ptr<ArenaBank>, PTO_PIPELINE_MAX_DEPTH> arena_banks_;
     ArenaBank &arena_bank(uint32_t bank_id) { return *arena_banks_[bank_id]; }
 
+    // The device blocks each pipeline slot reuses across its runs. Committed on
+    // a slot's first prepare and released in finalize(), so a steady-state run
+    // rewrites their contents instead of reallocating them.
+    std::array<SlotPersistentArgs, PTO_PIPELINE_MAX_DEPTH> slot_persistent_args_;
+
+public:
+    /** The persistent device blocks belonging to one pipeline slot. */
+    SlotPersistentArgs &slot_persistent_args(uint32_t pipeline_slot) { return slot_persistent_args_[pipeline_slot]; }
+
+protected:
     bool prebuilt_runtime_arena_cache_valid_{false};
     uint64_t prebuilt_runtime_arena_cache_hash_{0};
     std::vector<uint8_t> prebuilt_runtime_arena_cache_key_;
@@ -1340,24 +1458,21 @@ protected:
     // on the base. `DepGenCollector` is not shared — each arch that
     // implements dep_gen (a2a3, a5) keeps it on its own subclass.
     ChipSwimlaneCollector chip_swimlane_collector_;
-    // Not a collector: the pool the runtime's prepare path writes into, read by
+    // Not a collector: the state the runtime's bind writes into, read by
     // whichever per-event views the run enabled. Its two readers are gated
-    // independently, so it belongs to neither.
-    simpler::dfx::HostPhaseRecordStore host_phase_records_;
-    std::unique_ptr<simpler::dfx::ClockCorrelationProvider> clock_correlation_provider_{};
+    // independently, so it belongs to neither. One per pipeline slot, because a
+    // bind is preparation and a prepared successor prepares while its
+    // predecessor still owns the collectors — see host_phase_run_state.h.
+    std::array<HostPhaseRunState, PTO_PIPELINE_MAX_DEPTH> host_phase_runs_{};
+    // Which slot's session the resident collector currently holds, or
+    // PTO_PIPELINE_MAX_DEPTH for none. The providers are per slot but the
+    // collector's session is not, so only its opener may end it.
+    uint32_t clock_correlation_session_slot_{PTO_PIPELINE_MAX_DEPTH};
     ArgsDumpCollector dump_collector_;
     PmuCollector pmu_collector_;
     ScopeStatsCollector scope_stats_collector_;
 
     // Enablement for the four shared diagnostics sub-features.
-    // Written from CallConfig before enqueue and read by execution helpers.
-    bool enable_chip_swimlane_{false};
-    bool enable_dump_args_{false};
-    DumpArgsLevel dump_args_level_{DumpArgsLevel::OFF};  // resolved from set_dump_args_enabled()
-    bool enable_pmu_{false};
-    bool enable_scope_stats_{false};
     ChipSwimlaneLevel chip_swimlane_level_{ChipSwimlaneLevel::DISABLED};  // resolved from set_chip_swimlane_enabled()
-    PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};         // resolved from set_pmu_enabled()
-    bool capture_clock_anchors_{false};                                   // from CallConfig::capture_clock_anchors
     std::string output_prefix_{};                                         // diagnostic artifact root directory
 };

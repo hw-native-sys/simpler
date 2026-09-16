@@ -154,6 +154,33 @@ protected:
         return out.task_id();
     }
 
+    // One top-level task writing the boundary the body reads, so a shell
+    // submitted for that body names it as a producer. `flagged` sets
+    // allow_early_resolve, the term the shell's conjunction turns on.
+    TaskId submit_boundary_producer(const simpler::hbg::Tensor &boundary, bool flagged) {
+        CoreTaskArgs args;
+        args.add_output(boundary);
+        args.set_allow_early_resolve(flagged);
+        MixedKernels mixed{};
+        mixed.aiv0_kernel_id = 0;
+        TaskOutputTensors out = orch.submit_task(mixed, args);
+        EXPECT_TRUE(out.task_id().is_valid());
+        return out.task_id();
+    }
+
+    // Replays a recorded body by its key. The cache hit is what submits the
+    // outer shell, which is where the shell's own verdict is decided.
+    TaskId submit_shell(uint64_t key, GraphTaskArgs &boundary_args) {
+        const GraphScopeResult replay = orch.graph_begin(key, boundary_args, 0);
+        EXPECT_FALSE(replay.recording) << "the body is already recorded, so this must be a cache hit";
+        EXPECT_TRUE(replay.task_id.is_valid());
+        return replay.task_id;
+    }
+
+    const ChipTaskSlotState &slot_of(TaskId id) {
+        return orch.sm_header->tasks.get_slot_state_by_task_id(id.local_id());
+    }
+
     const GraphDefinition *published_definition() {
         const GraphHostDefinitionList published = graph_host_definitions(*graph_state);
         EXPECT_EQ(published.entries.size(), 1u);
@@ -263,6 +290,41 @@ TEST_F(HbgGraphEdQualificationTest, HiddenAllocProducerDoesNotDisqualifyItsConsu
     EXPECT_NE(tasks[1].ed_flags & ED_FLAG_TRACKED, 0);
 }
 
+// The outer shell's own verdict, decided per submit against its inline row of
+// GLOBAL producers rather than against the body's CSR. A shell occupies no core,
+// so its conjunction is the top-level one minus the dispatch-shape terms: it
+// qualifies on producers alone. What its release does instead is admit the
+// body's roots, which is why the verdict below is also what decides whether
+// materialization may flag any of them.
+TEST_F(HbgGraphEdQualificationTest, FlaggedProducerMakesTheShellACandidate) {
+    GraphTaskArgs boundary_args;
+    const simpler::hbg::Tensor boundary = begin_body(0x6ED0B001, boundary_args);
+    record_task(boundary, /*flagged=*/true);
+    ASSERT_TRUE(orch.graph_end());
+    orch.graph_commit();
+
+    const TaskId producer = submit_boundary_producer(boundary, /*flagged=*/true);
+    const TaskId shell = submit_shell(0x6ED0B001, boundary_args);
+
+    EXPECT_EQ(slot_of(shell).task_kind, TaskKind::GRAPH);
+    EXPECT_NE(slot_of(shell).ed_flags & ED_FLAG_CANDIDATE, 0);
+    EXPECT_NE(slot_of(producer).ed_flags & ED_FLAG_TRACKED, 0);
+}
+
+TEST_F(HbgGraphEdQualificationTest, OneUnflaggedProducerDisqualifiesTheShell) {
+    GraphTaskArgs boundary_args;
+    const simpler::hbg::Tensor boundary = begin_body(0x6ED0B002, boundary_args);
+    record_task(boundary, /*flagged=*/true);
+    ASSERT_TRUE(orch.graph_end());
+    orch.graph_commit();
+
+    const TaskId producer = submit_boundary_producer(boundary, /*flagged=*/false);
+    const TaskId shell = submit_shell(0x6ED0B002, boundary_args);
+
+    EXPECT_EQ(slot_of(shell).ed_flags & ED_FLAG_CANDIDATE, 0);
+    EXPECT_EQ(slot_of(producer).ed_flags & ED_FLAG_TRACKED, 0);
+}
+
 // The device side of a body's fanin CSR row. The scheduler reads only the CSR
 // pair and the slots it indexes, so a topology can be stated directly here
 // rather than materialized from a Definition.
@@ -329,6 +391,46 @@ protected:
         return popped == 1 ? out : nullptr;
     }
 };
+
+// A wide in-graph row exceeds what a byte cursor can index. The scan must
+// report the row unfinished until every producer has published: a truncated
+// cursor would wrap to a low index, find that one entry published, and stage a
+// candidate whose remaining producers have not.
+TEST_F(HbgGraphWakeScanTest, WideRowCursorDoesNotTruncate) {
+    constexpr int32_t kProducers = 300;  // > 0xFF, the old cursor width
+    std::vector<std::vector<uint16_t>> rows(kProducers);
+    std::vector<uint16_t> consumer_row;
+    consumer_row.reserve(kProducers);
+    for (int32_t i = 0; i < kProducers; ++i)
+        consumer_row.push_back(static_cast<uint16_t>(i));
+    rows.push_back(consumer_row);
+    build(rows);
+
+    ChipTaskSlotState &consumer = slot(kProducers);
+    consumer.ed_flags |= ED_FLAG_CANDIDATE;
+    for (int32_t i = 0; i < kProducers; ++i)
+        slot(i).ed_flags |= ED_FLAG_TRACKED;
+
+    // Intake hangs it on the row's tail, and the cursor must name that entry
+    // rather than a wrapped one.
+    ASSERT_FALSE(sched.register_on_ed_publish_list(consumer));
+    EXPECT_EQ(consumer.ed_publish_scan_cursor, kProducers - 1);
+
+    // Publishing every producer but the first leaves the row unfinished.
+    for (int32_t i = kProducers - 1; i > 0; --i) {
+        execution.store_published(i);
+        sched.seal_ed_publish_list(slot(i));
+    }
+    ChipTaskSlotState *detached = nullptr;
+    while (sched.ed_publish_drain_queue.pop_batch(&detached, 1) == 1) {
+        if (sched.advance_ed_publish_scan(*detached)) FAIL() << "staged while producer 0 is unpublished";
+    }
+
+    execution.store_published(0);
+    sched.seal_ed_publish_list(slot(0));
+    ASSERT_EQ(sched.ed_publish_drain_queue.pop_batch(&detached, 1), 1);
+    EXPECT_TRUE(sched.advance_ed_publish_scan(*detached));
+}
 
 // Each classification resumes where the last one hung and never re-walks the
 // row's completed tail. Completion is monotone, so the resume reaches the same

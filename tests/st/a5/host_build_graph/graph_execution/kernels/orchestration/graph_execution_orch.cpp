@@ -29,6 +29,12 @@ void layer(const GraphTaskArgs &args, int variant) {
     const std::array<uint32_t, 1> shape{a.shapes[0]};
     TensorCreateInfo intermediate(shape.data(), static_cast<uint32_t>(shape.size()), DataType::FLOAT32);
 
+    // A dependency-only root. Its shape is DUMMY, which indexes no per-shape
+    // dispatch queue, so it must never be staged by the shell's early release —
+    // this body is where that is exercised on device.
+    CoreTaskArgs dummy_root_args;
+    rt_submit_dummy_task(dummy_root_args);
+
     CoreTaskArgs add_args;
     add_args.add_input(a, b);
     add_args.add_output(intermediate);
@@ -94,6 +100,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     seed_args.add_input(a);
     seed_args.add_output(seeded_input_info);
     seed_args.add_scalar(0.0F);
+    // Flagged so the Graph shells that consume its output qualify as
+    // early-dispatch candidates: a shell's release materializes its body ahead
+    // of this task's completion, which is the ordinary-task-to-Graph edge.
+    seed_args.set_allow_early_resolve(true);
     TaskOutputTensors seed_outputs = rt_submit_aiv_task(FUNC_ADD_SCALAR, seed_args);
     simpler::hbg::Tensor seeded_a = seed_outputs.get_ref(0);
 

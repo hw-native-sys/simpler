@@ -8,14 +8,16 @@
 # -----------------------------------------------------------------------------------------------------------
 """Shared helpers for collective scene tests.
 
-Provides comm-window scratch-parameter computation and orch-function
-building so each collective test (allreduce, allgather, reduce_scatter,
+Provides comm-window scratch-parameter computation, orch-function
+building, reduction operator enumeration, and golden output helpers
+so each collective test (allreduce, allgather, reduce_scatter,
 broadcast, all_to_all) can reuse the same domain-allocation pattern.
 """
 
 from __future__ import annotations
 
 import ctypes
+from enum import IntEnum
 
 import torch
 from simpler.task_interface import CommBufferSpec, DataType, TaskArgs, TensorArgType
@@ -24,6 +26,18 @@ from simpler_setup import TensorArg as STensor
 from simpler_setup.scene_test import TaskArgsBuilder, _rehosted_ref_for
 
 _F32 = DataType.FLOAT32
+
+
+class CollectiveReduceOp(IntEnum):
+    """Mirror of C++ CollectiveReduceOp (simpler_setup/incore/collectives_reduce_op.hpp)."""
+
+    SUM = 0
+    MAX = 1
+    MIN = 2
+    PROD = 3
+
+
+_REDUCE_OP_NAMES = {0: "Sum", 1: "Max", 2: "Min", 3: "Prod"}
 
 # ---------------------------------------------------------------------------
 # Allreduce constants (must match kernel COUNT)
@@ -90,8 +104,9 @@ def _allreduce_scratch_params(mode: str, nranks: int) -> tuple[int, int, int]:
 def allreduce_orch_fn(orch, callables, task_args, config):
     """L3 orch: allocate a domain and submit all allreduce ranks as one group.
 
-    Reads nranks and mode_id from task_args scalars. Selects the
-    ChipCallable by mode name (e.g. ``allreduce_onephase``).
+    Reads nranks, mode_id, and optional reduce_op from task_args
+    scalars. Selects the ChipCallable by mode name (e.g.
+    ``allreduce_onephase``).
     """
     nranks = int(task_args.nranks.value)
     if not (2 <= nranks <= ALLREDUCE_MAX_RANKS):
@@ -100,6 +115,13 @@ def allreduce_orch_fn(orch, callables, task_args, config):
     if not (0 <= mode_id < len(_ALLREDUCE_MODE_NAMES)):
         raise ValueError(f"invalid allreduce mode_id: {mode_id}")
     mode = _ALLREDUCE_MODE_NAMES[mode_id]
+    reduce_op_val = 0
+    if hasattr(task_args, "reduce_op"):
+        reduce_op_val = int(task_args.reduce_op.value)
+    try:
+        CollectiveReduceOp(reduce_op_val)
+    except ValueError as exc:
+        raise ValueError(f"invalid allreduce reduce_op: {reduce_op_val}") from exc
 
     # ibing is only supported for P=2
     if mode == "ibing" and nranks != 2:
@@ -132,6 +154,7 @@ def allreduce_orch_fn(orch, callables, task_args, config):
             chip_args.add_tensor(domain.buffers["scratch"].tensor((float_elems,), _F32), TensorArgType.INOUT)
             chip_args.add_scalar(domain.domain_size)
             chip_args.add_scalar(domain.device_ctx)
+            chip_args.add_scalar(reduce_op_val)
             args_list.append(chip_args)
         orch.submit_next_level_group(chip, args_list, config, workers=list(range(nranks)))
 
@@ -141,9 +164,27 @@ def allreduce_orch_fn(orch, callables, task_args, config):
 # ---------------------------------------------------------------------------
 
 
-def allreduce_expected_output(nranks: int) -> list[float]:
-    """output[i] = nranks*i + 100*nranks*(nranks-1)//2."""
-    return [float(nranks * i + 100 * nranks * (nranks - 1) // 2) for i in range(ALLREDUCE_COUNT)]
+def allreduce_expected_output(nranks: int, reduce_op: CollectiveReduceOp = CollectiveReduceOp.SUM) -> list[float]:
+    """output = reduce_op over all rank inputs.
+
+    Input[rank][i] = i + rank*100.  Return [golden[i] for i in range(C)].
+    """
+    if reduce_op == CollectiveReduceOp.SUM:
+        return [float(nranks * i + 100 * nranks * (nranks - 1) // 2) for i in range(ALLREDUCE_COUNT)]
+    if reduce_op == CollectiveReduceOp.MAX:
+        return [float((nranks - 1) * 100 + i) for i in range(ALLREDUCE_COUNT)]
+    if reduce_op == CollectiveReduceOp.MIN:
+        return [float(i) for i in range(ALLREDUCE_COUNT)]
+    if reduce_op == CollectiveReduceOp.PROD:
+        return [allreduce_prod_expected(nranks, i) for i in range(ALLREDUCE_COUNT)]
+    raise ValueError(f"unsupported reduce_op: {reduce_op}")
+
+
+def allreduce_prod_expected(nranks: int, i: int) -> float:
+    p = 1.0
+    for r in range(nranks):
+        p *= float(r * 100 + i)
+    return p
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +203,7 @@ def generic_collective_orch_fn(
     scratch_nbytes: int,
     window_size: int,
     extra_scalars: list | None = None,
+    post_scalars: list | None = None,
 ):
     """Generic L3 orch for single-mode collectives (allgather, reduce_scatter, broadcast, all_to_all).
 
@@ -197,6 +239,8 @@ def generic_collective_orch_fn(
             for s in extras:
                 chip_args.add_scalar(s)
             chip_args.add_scalar(domain.device_ctx)
+            for s in post_scalars or []:
+                chip_args.add_scalar(s)
             args_list.append(chip_args)
         orch.submit_next_level_group(chip, args_list, config, workers=list(range(nranks)))
 
@@ -211,11 +255,27 @@ def allgather_expected_output(nranks: int) -> list[float]:
     return [float(r * 100 + i) for r in range(nranks) for i in range(COUNT_PER_RANK)]
 
 
-def reduce_scatter_expected_output(nranks: int, dest: int) -> list[float]:
-    """output[j] = sum_r (dest*C+j + r*100) = nranks*(dest*C+j) + 100*nranks*(nranks-1)/2."""
-    return [
-        float(nranks * (dest * COUNT_PER_RANK + j) + 100 * nranks * (nranks - 1) // 2) for j in range(COUNT_PER_RANK)
-    ]
+def reduce_scatter_expected_output(
+    nranks: int, dest: int, reduce_op: CollectiveReduceOp = CollectiveReduceOp.SUM
+) -> list[float]:
+    """golden[dest][j] = reduce_op over r of input[r][dest*C+j]."""
+    base = dest * COUNT_PER_RANK
+    if reduce_op == CollectiveReduceOp.SUM:
+        return [float(nranks * (base + j) + 100 * nranks * (nranks - 1) // 2) for j in range(COUNT_PER_RANK)]
+    if reduce_op == CollectiveReduceOp.MAX:
+        return [float((nranks - 1) * 100 + base + j) for j in range(COUNT_PER_RANK)]
+    if reduce_op == CollectiveReduceOp.MIN:
+        return [float(base + j) for j in range(COUNT_PER_RANK)]
+    if reduce_op == CollectiveReduceOp.PROD:
+        return [reduce_scatter_prod_expected(nranks, base, j) for j in range(COUNT_PER_RANK)]
+    raise ValueError(f"unsupported reduce_op: {reduce_op}")
+
+
+def reduce_scatter_prod_expected(nranks: int, base: int, j: int) -> float:
+    p = 1.0
+    for r in range(nranks):
+        p *= float(r * 100 + base + j)
+    return p
 
 
 def broadcast_expected_output(root: int) -> list[float]:
@@ -233,8 +293,8 @@ def all_to_all_expected_output(nranks: int, rank: int) -> list[float]:
 # ---------------------------------------------------------------------------
 
 
-def make_allreduce_args(nranks: int, mode_id: int) -> TaskArgsBuilder:
-    """Build per-rank input/output tensors + nranks/mode_id scalars.
+def make_allreduce_args(nranks: int, mode_id: int, reduce_op: int = 0) -> TaskArgsBuilder:
+    """Build per-rank input/output tensors + nranks/mode_id/reduce_op scalars.
 
     input[rank][i] = i + rank*100. Output initially zeros.
     """
@@ -251,4 +311,5 @@ def make_allreduce_args(nranks: int, mode_id: int) -> TaskArgsBuilder:
         builder_specs.append(STensor(f"out_{rank}", out))
     builder_specs.append(SScalar("nranks", ctypes.c_int64(nranks)))
     builder_specs.append(SScalar("mode_id", ctypes.c_int64(mode_id)))
+    builder_specs.append(SScalar("reduce_op", ctypes.c_int64(reduce_op)))
     return TaskArgsBuilder(*builder_specs)

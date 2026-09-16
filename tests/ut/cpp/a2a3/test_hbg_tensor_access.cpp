@@ -13,7 +13,7 @@
  * Host-view resolution for the host orchestrator's tensor reads and writes,
  * and the per-run ownership of the mappings that serve them.
  *
- * The fallback path serves staged tensors without mapping their device
+ * The fallback path serves host-memory tensors without mapping their device
  * allocations. `g_registered_view` is what the fake
  * `register_device_memory_to_host` hands back when no fallback is available.
  */
@@ -23,6 +23,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <thread>
 #include <vector>
 
@@ -42,14 +43,34 @@ struct CopyCall {
 };
 
 std::vector<CopyCall> g_copies;
+std::vector<CopyCall> g_reads;
 std::vector<void *> g_unregistered;
 void *g_registered_view = nullptr;
 int g_register_count = 0;
 int g_copy_result = 0;
+// What the fake `acquire_child_memory_host_view` hands back, and how often it
+// was asked. Null models the two platforms that have no host-map path for an
+// allocation: a5 onboard, and an ordinary-page small allocation on a 64 KiB-page
+// host (issue #1531).
+void *g_child_memory_view = nullptr;
+int g_child_memory_acquire_count = 0;
+int g_read_result = 0;
+// Bytes the fake device holds, so a device-copy read returns something the test
+// can distinguish from the host view.
+unsigned char g_device_bytes[64];
 
 int record_copy(void *, void *dev_ptr, const void *host_ptr, size_t size) {
     g_copies.push_back({dev_ptr, host_ptr, size});
     return g_copy_result;
+}
+
+int record_read(void *, void *host_ptr, const void *dev_ptr, size_t size) {
+    g_reads.push_back({const_cast<void *>(dev_ptr), host_ptr, size});
+    if (g_read_result == 0) {
+        const uint64_t offset = reinterpret_cast<uint64_t>(dev_ptr) - kFakeDeviceBase;
+        memcpy(host_ptr, g_device_bytes + offset, size);
+    }
+    return g_read_result;
 }
 
 void *record_register(void *, void *, size_t) {
@@ -59,10 +80,17 @@ void *record_register(void *, void *, size_t) {
 
 void record_unregister(void *, void *dev_ptr) { g_unregistered.push_back(dev_ptr); }
 
+void *record_child_memory_acquire(void *, void *, size_t) {
+    ++g_child_memory_acquire_count;
+    return g_child_memory_view;
+}
+
 const HostApiOps kHostApiOps{
     .copy_to_device = record_copy,
+    .copy_from_device = record_read,
     .register_device_memory_to_host = record_register,
     .unregister_device_memory_from_host = record_unregister,
+    .acquire_child_memory_host_view = record_child_memory_acquire,
 };
 const HostApi kHostApi(nullptr, 0, 0, &kHostApiOps);
 
@@ -70,10 +98,15 @@ class HostTensorAccessTest : public ::testing::Test {
 protected:
     void SetUp() override {
         g_copies.clear();
+        g_reads.clear();
         g_unregistered.clear();
         g_registered_view = nullptr;
         g_register_count = 0;
         g_copy_result = 0;
+        g_child_memory_view = nullptr;
+        g_child_memory_acquire_count = 0;
+        g_read_result = 0;
+        memset(g_device_bytes, 0, sizeof(g_device_bytes));
     }
 };
 
@@ -146,9 +179,8 @@ TEST_F(HostTensorAccessTest, FallbackWriteReportsCopyFailure) {
     EXPECT_FALSE(host_tensor_write(&accessor, kFakeDeviceBase, &written, sizeof(written)));
 }
 
-// The fail-closed contract: an address outside every registered region — a
-// GM-heap tensor the orchestrator created or a pass-through child-memory
-// buffer — resolves to nothing instead of being dereferenced.
+// The fail-closed contract: an address outside every region — a GM-heap tensor
+// the orchestrator created — resolves to nothing instead of being dereferenced.
 TEST_F(HostTensorAccessTest, UnregisteredSpanFailsClosed) {
     int32_t fallback[2] = {1, 2};
     HostTensorAccessor accessor(&kHostApi);
@@ -313,6 +345,173 @@ TEST_F(HostTensorAccessTest, EmptyOrNullFallbackRegionIsRejected) {
     HostTensorAccessor accessor(&kHostApi);
     EXPECT_FALSE(accessor.add(kFakeDeviceBase, 0, mirror));
     EXPECT_FALSE(accessor.add(kFakeDeviceBase, sizeof(mirror), nullptr));
+}
+
+// ---------------------------------------------------------------------------
+// Child memory: no caller buffer exists, so the means is chosen on first access.
+// ---------------------------------------------------------------------------
+
+// Declaring the region consults nothing. An orchestration that never touches
+// the tensor is what makes this the cheap default.
+TEST_F(HostTensorAccessTest, ChildMemoryRegionResolvesNothingUntilAccessed) {
+    HostTensorAccessor accessor(&kHostApi);
+    ASSERT_TRUE(accessor.add_child_memory(kFakeDeviceBase, 16));
+
+    EXPECT_EQ(g_child_memory_acquire_count, 0);
+    EXPECT_EQ(g_register_count, 0);
+    EXPECT_EQ(accessor.mapping_count(), 0u);
+    EXPECT_EQ(accessor.device_copy_count(), 0u);
+}
+
+TEST_F(HostTensorAccessTest, ChildMemoryMappingServesReadsAndWritesDirectly) {
+    int32_t mapped[4] = {10, 20, 30, 40};
+    g_child_memory_view = mapped;
+    HostTensorAccessor accessor(&kHostApi);
+    ASSERT_TRUE(accessor.add_child_memory(kFakeDeviceBase, sizeof(mapped)));
+
+    int32_t value = 0;
+    ASSERT_TRUE(host_tensor_read(&accessor, kFakeDeviceBase + 2 * sizeof(int32_t), &value, sizeof(value)));
+    EXPECT_EQ(value, 30);
+
+    const int32_t written = 99;
+    ASSERT_TRUE(host_tensor_write(&accessor, kFakeDeviceBase + sizeof(int32_t), &written, sizeof(written)));
+    EXPECT_EQ(mapped[1], 99);
+
+    // The mapping is coherent, so nothing is pushed back and no copy is made.
+    EXPECT_TRUE(g_copies.empty());
+    EXPECT_TRUE(g_reads.empty());
+    EXPECT_EQ(accessor.device_copy_count(), 0u);
+}
+
+// The platform owns a child-memory mapping for its allocation's lifetime, so
+// this accessor must neither count it as one of its own nor release it.
+TEST_F(HostTensorAccessTest, ChildMemoryMappingIsNotOwnedByTheAccessor) {
+    int32_t mapped[2] = {1, 2};
+    g_child_memory_view = mapped;
+    HostTensorAccessor accessor(&kHostApi);
+    ASSERT_TRUE(accessor.add_child_memory(kFakeDeviceBase, sizeof(mapped)));
+    int32_t value = 0;
+    ASSERT_TRUE(host_tensor_read(&accessor, kFakeDeviceBase, &value, sizeof(value)));
+
+    EXPECT_EQ(accessor.mapping_count(), 0u);
+    EXPECT_EQ(accessor.mapped_bytes(), 0u);
+    accessor.close();
+    EXPECT_TRUE(g_unregistered.empty());
+}
+
+// The means is resolved once and reused, so a hot orchestration loop does not
+// ask the platform per access.
+TEST_F(HostTensorAccessTest, ChildMemoryMeansIsResolvedOncePerRegion) {
+    int32_t mapped[4] = {1, 2, 3, 4};
+    g_child_memory_view = mapped;
+    HostTensorAccessor accessor(&kHostApi);
+    ASSERT_TRUE(accessor.add_child_memory(kFakeDeviceBase, sizeof(mapped)));
+
+    int32_t value = 0;
+    for (int i = 0; i < 4; ++i) {
+        ASSERT_TRUE(host_tensor_read(&accessor, kFakeDeviceBase + i * sizeof(int32_t), &value, sizeof(value)));
+    }
+    EXPECT_EQ(g_child_memory_acquire_count, 1);
+}
+
+// a5 onboard, or a #1531 host: every access is a device copy instead. Nothing
+// is held between accesses, so a read cannot serve stale bytes.
+TEST_F(HostTensorAccessTest, ChildMemoryWithoutMappingCopiesPerAccess) {
+    g_child_memory_view = nullptr;
+    const int32_t device_values[4] = {5, 6, 7, 8};
+    memcpy(g_device_bytes, device_values, sizeof(device_values));
+
+    HostTensorAccessor accessor(&kHostApi);
+    ASSERT_TRUE(accessor.add_child_memory(kFakeDeviceBase, sizeof(device_values)));
+
+    int32_t value = 0;
+    const uint64_t read_addr = kFakeDeviceBase + 2 * sizeof(int32_t);
+    ASSERT_TRUE(host_tensor_read(&accessor, read_addr, &value, sizeof(value)));
+    EXPECT_EQ(value, 7);
+    ASSERT_EQ(g_reads.size(), 1u);
+    EXPECT_EQ(g_reads[0].dev_ptr, reinterpret_cast<void *>(read_addr));
+    EXPECT_EQ(g_reads[0].size, sizeof(int32_t));
+
+    // A write lands on the device immediately rather than in a host buffer that
+    // would then need pushing back.
+    const int32_t written = 77;
+    const uint64_t write_addr = kFakeDeviceBase + sizeof(int32_t);
+    ASSERT_TRUE(host_tensor_write(&accessor, write_addr, &written, sizeof(written)));
+    ASSERT_EQ(g_copies.size(), 1u);
+    EXPECT_EQ(g_copies[0].dev_ptr, reinterpret_cast<void *>(write_addr));
+    EXPECT_EQ(g_copies[0].host_ptr, static_cast<const void *>(&written));
+    EXPECT_EQ(g_copies[0].size, sizeof(int32_t));
+
+    EXPECT_EQ(accessor.device_copy_count(), 2u);
+}
+
+TEST_F(HostTensorAccessTest, ChildMemoryDeviceCopyFailurePropagates) {
+    g_child_memory_view = nullptr;
+    HostTensorAccessor accessor(&kHostApi);
+    ASSERT_TRUE(accessor.add_child_memory(kFakeDeviceBase, 16));
+
+    g_read_result = -1;
+    int32_t value = 0;
+    EXPECT_FALSE(host_tensor_read(&accessor, kFakeDeviceBase, &value, sizeof(value)));
+
+    g_copy_result = -1;
+    const int32_t written = 5;
+    EXPECT_FALSE(host_tensor_write(&accessor, kFakeDeviceBase, &written, sizeof(written)));
+}
+
+// A child-memory region bounds accesses exactly as a staged one does: an
+// address outside every region resolves to nothing and never reaches the
+// platform.
+TEST_F(HostTensorAccessTest, ChildMemorySpanOutsideEveryRegionFailsClosed) {
+    g_child_memory_view = nullptr;
+    HostTensorAccessor accessor(&kHostApi);
+    ASSERT_TRUE(accessor.add_child_memory(kFakeDeviceBase, 16));
+
+    int32_t value = 0xABCD;
+    EXPECT_FALSE(host_tensor_read(&accessor, kFakeDeviceBase + 0x100000, &value, sizeof(value)));
+    EXPECT_EQ(value, 0xABCD);
+    int64_t wide = 0;
+    // Starts inside, ends past the region.
+    EXPECT_FALSE(host_tensor_read(&accessor, kFakeDeviceBase + 12, &wide, sizeof(wide)));
+
+    EXPECT_EQ(g_child_memory_acquire_count, 0);
+    EXPECT_TRUE(g_reads.empty());
+}
+
+TEST_F(HostTensorAccessTest, ChildMemoryRejectsEmptyRegionAndNullApi) {
+    HostTensorAccessor accessor(&kHostApi);
+    EXPECT_FALSE(accessor.add_child_memory(kFakeDeviceBase, 0));
+    EXPECT_FALSE(accessor.add_child_memory(0, 16));
+
+    HostTensorAccessor no_api(nullptr);
+    EXPECT_FALSE(no_api.add_child_memory(kFakeDeviceBase, 16));
+}
+
+// Staged and child-memory regions coexist in one accessor and each keeps its
+// own means.
+TEST_F(HostTensorAccessTest, StagedAndChildMemoryRegionsResolveIndependently) {
+    int32_t staged[2] = {1, 2};
+    int32_t mapped[2] = {3, 4};
+    const uint64_t child_base = kFakeDeviceBase + 0x10000;
+    g_child_memory_view = mapped;
+
+    HostTensorAccessor accessor(&kHostApi);
+    ASSERT_TRUE(accessor.add(kFakeDeviceBase, sizeof(staged), staged));
+    ASSERT_TRUE(accessor.add_child_memory(child_base, sizeof(mapped)));
+
+    int32_t value = 0;
+    ASSERT_TRUE(host_tensor_read(&accessor, kFakeDeviceBase, &value, sizeof(value)));
+    EXPECT_EQ(value, 1);
+    ASSERT_TRUE(host_tensor_read(&accessor, child_base + sizeof(int32_t), &value, sizeof(value)));
+    EXPECT_EQ(value, 4);
+
+    // The staged write still pushes back; the mapped one does not.
+    const int32_t written = 9;
+    ASSERT_TRUE(host_tensor_write(&accessor, kFakeDeviceBase, &written, sizeof(written)));
+    EXPECT_EQ(g_copies.size(), 1u);
+    ASSERT_TRUE(host_tensor_write(&accessor, child_base, &written, sizeof(written)));
+    EXPECT_EQ(g_copies.size(), 1u);
+    EXPECT_EQ(mapped[0], 9);
 }
 
 }  // namespace

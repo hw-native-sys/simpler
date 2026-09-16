@@ -153,3 +153,24 @@ recover `finish(B) − dispatch(A)`. Full semantics in
 - [chip-swimlane-profiling.md](chip-swimlane-profiling.md) — the per-task /
   scheduler-phase deep dive.
 - `simpler_setup/tools/README.md` — `strace_timing` CLI reference.
+
+### Child memory and round comparisons
+
+`--rounds` does not select a tensor memory policy. SceneTest child memory is an
+explicit per-argument `child_memory` declaration and is the same for one or
+many rounds. Allocation and initial upload for declared child-memory inputs happen
+at case setup, outside `Worker.run` and its round markers. Include setup and
+final validation readback when reporting total case time; do not label the
+round table alone as end-to-end case latency.
+
+A child-memory argument skips the per-round copy-in path entirely, so `bind.args`
+reports a smaller `h2d=` count and fewer bytes for it. Numbers taken
+before and after a case declares child memory are therefore not comparable on the
+host/bind component; re-measure both arms with identical fixtures, hardware,
+round counts and validation settings.
+
+If the HBG orchestration reads or writes that argument, `bind.host_view_close`
+reports what the access cost. `devcopy=N` means no host mapping was available
+and each of the N accesses was a PCIe round trip — an arm that maps and an arm
+that copies are not comparable either, and the two can differ between hosts on
+the same arch (issue #1531).

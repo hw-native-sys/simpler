@@ -9,22 +9,27 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Runtime Builder - rt2 Implementation (host_build_graph: Host Orchestration)
+ * host_build_graph runtime maker (host orchestration).
  *
- * Provides init_runtime_impl and validate_runtime_impl functions for rt2 runtime.
  * The HOST runs the orchestrator to completion, populates shared memory + the
  * prebuilt arena, and H2Ds the image; the device boots scheduler-only.
  *
- * init_runtime_impl:
- *   - Converts host tensor pointers to device pointers (all inputs copied H2D;
- *     only OUTPUT/INOUT tensors are copied back D2H)
- *   - dlopens the orchestration SO on the host and runs it to build the graph
+ * register_callable_impl:
+ *   - dlopens the orchestration SO on the host and resolves its entry points,
+ *     which bind then invokes per run
+ *
+ * bind_callable_to_runtime_impl:
+ *   - Gives host-memory tensor arguments slices of the pipeline slot's retained
+ *     temporary buffer (all readable inputs copied H2D; only OUTPUT/INOUT
+ *     tensors are copied back D2H) and records one lease each
+ *   - Runs the resolved orchestration entry to build the graph
  *   - Sets up runtime state for host orchestration
  *
  * validate_runtime_impl:
  *   - Copies OUTPUT/INOUT tensors back from device to host (read-only inputs
  *     are skipped)
- *   - Frees device memory
+ *   - Releases the run's leases. The slices are no-ops: the retained buffer
+ *     outlives the run and is freed once at Worker finalization.
  */
 
 #include <dlfcn.h>
@@ -83,7 +88,11 @@
 #include "host_log.h"
 #include "host/platform_compile_info.h"
 #include "host/raii_scope_guard.h"
+#include "host/kernel_pipeline_contract.h"
 #include "utils/device_arena.h"
+#include "utils/retained_temp_bump.h"
+#include "utils/temp_buffer_plan.h"
+#include "utils/tensor_lease_release.h"
 #include "prepare_callable_common.h"
 
 // This file returns both kinds of negative status — a latched device code
@@ -103,6 +112,10 @@ static_assert(
         SCHEDULER_PROFILING_SCHED_PHASES_LEVEL == static_cast<uint64_t>(ChipSwimlaneLevel::SCHED_PHASES),
     "AICore Scheduler profiling levels must match the chip-swimlane contract"
 );
+
+extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *, PipelineContract *) {
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
 
 extern "C" const PipelineContract *get_pipeline_contract(void) {
     // Host orchestration materializes this run's own graph into the image it
@@ -127,8 +140,7 @@ extern "C" const PipelineContract *get_pipeline_contract(void) {
 
 extern "C" int concurrent_native_prepare_supported_impl(void) {
     // HBG can materialize a complete graph into the lease-selected unpublished
-    // arena bank. The common C API keeps collector-bearing configurations on
-    // the sequential path until their state is per-epoch.
+    // arena bank.
     return 1;
 }
 
@@ -373,6 +385,14 @@ static int32_t read_runtime_status(Runtime *runtime, const HostApi *api, SharedM
     return runtime_status_from_error_code(sched_error_code);
 }
 
+static void release_run_tensor_leases(Runtime *runtime, const HostApi *api) {
+    const TensorLeaseReleaseCounts counts = release_tensor_leases(runtime->tensor_leases_, api);
+    LOG_DEBUG(
+        "Released tensor leases: freed=%d buffer_noop=%d external_noop=%d", counts.freed, counts.buffer_noop,
+        counts.external_noop
+    );
+}
+
 namespace {
 
 struct SchedulerStateOwner {
@@ -490,28 +510,29 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         }
 
         const auto *lifecycle =
-            scheduler_state_at<AicpuCoreLifecycleTrace>(host_base, owner.layout.aicpu_lifecycle_traces_offset);
+            scheduler_state_at<AicpuThreadLifecycleTrace>(host_base, owner.layout.aicpu_lifecycle_traces_offset);
         std::ostringstream lifecycle_json;
         lifecycle_json << "[";
         bool first = true;
-        for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
-            const AicpuCoreLifecycleTrace &trace = lifecycle[worker];
-            if (trace.handshake_observed_cycles == 0) continue;
+        for (uint64_t thread = 0; thread < PLATFORM_MAX_AICPU_THREADS; ++thread) {
+            const AicpuThreadLifecycleTrace &trace = lifecycle[thread];
+            if (trace.handshake_start_cycles == 0) continue;
             if (!first) lifecycle_json << ",";
-            lifecycle_json << "\n    {\"worker_id\": " << trace.worker_id
-                           << ", \"aicpu_thread_id\": " << trace.aicpu_thread_id << ", \"core_type\": \""
-                           << scheduler_core_type_name(static_cast<int32_t>(trace.core_type))
-                           << "\", \"physical_core_id\": " << trace.physical_core_id
-                           << ", \"handshake_observed_cycles\": " << trace.handshake_observed_cycles
-                           << ", \"handshake_partition_complete_cycles\": " << trace.handshake_partition_complete_cycles
+            lifecycle_json << "\n    {\"aicpu_thread_id\": " << trace.aicpu_thread_id
+                           << ", \"handshake_start_cycles\": " << trace.handshake_start_cycles
+                           << ", \"handshake_complete_cycles\": " << trace.handshake_complete_cycles
                            << ", \"config_start_cycles\": " << trace.config_start_cycles
                            << ", \"topology_complete_cycles\": " << trace.topology_complete_cycles
+                           << ", \"context_publish_start_cycles\": " << trace.context_publish_start_cycles
                            << ", \"context_publish_complete_cycles\": " << trace.context_publish_complete_cycles
                            << ", \"bootstrap_wait_start_cycles\": " << trace.bootstrap_wait_start_cycles
                            << ", \"bootstrap_complete_cycles\": " << trace.bootstrap_complete_cycles
-                           << ", \"register_release_cycles\": " << trace.register_release_cycles
-                           << ", \"exit_signal_cycles\": " << trace.exit_signal_cycles
-                           << ", \"exit_ack_cycles\": " << trace.exit_ack_cycles << "}";
+                           << ", \"register_release_start_cycles\": " << trace.register_release_start_cycles
+                           << ", \"register_release_end_cycles\": " << trace.register_release_end_cycles
+                           << ", \"exit_signal_start_cycles\": " << trace.exit_signal_start_cycles
+                           << ", \"exit_signal_end_cycles\": " << trace.exit_signal_end_cycles
+                           << ", \"exit_wait_start_cycles\": " << trace.exit_wait_start_cycles
+                           << ", \"exit_wait_end_cycles\": " << trace.exit_wait_end_cycles << "}";
             first = false;
         }
         if (!first) lifecycle_json << "\n  ";
@@ -532,31 +553,26 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         const SchedulerWorkerContext &context = contexts[worker];
         if (context.is_scheduler == 0 || context.worker_index >= SCHEDULER_WORKER_CAPACITY) continue;
         append_scheduler_record(
-            &records[context.worker_index], context.bootstrap_start_cycles, context.bootstrap_end_cycles, 0,
+            &records[context.worker_index], context.bootstrap_start_cycles, context.target_bootstrap_end_cycles, 0,
             "bootstrap", context.bootstrap_task_count, 0, false
         );
     }
     for (uint64_t task_id = 0; task_id < owner.layout.task_count; ++task_id) {
         const SchedulerTaskTrace &trace = traces[task_id];
-        if (trace.fanin_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
+        if (trace.state_probe_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
             append_scheduler_record(
-                &records[trace.fanin_scheduler_worker_id], trace.fanin_start_cycles, trace.fanin_end_cycles,
-                trace.fanin_loop_iter, "fanin", 1, task_id
+                &records[trace.state_probe_scheduler_worker_id], trace.state_probe_start_cycles,
+                trace.state_probe_end_cycles, trace.dispatch_loop_iter, "state_probe", 1, task_id
             );
         }
-        if (trace.claim_worker_id < SCHEDULER_WORKER_CAPACITY) {
-            append_scheduler_record(
-                &records[trace.claim_worker_id], trace.claim_start_cycles, trace.claim_end_cycles,
-                trace.claim_loop_iter,
-                trace.ready_source == static_cast<uint64_t>(SchedulerReadySource::STOLEN) ? "ready_steal" :
-                                                                                            "ready_claim",
-                1, task_id
-            );
-        }
-        if (trace.dispatch_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
+        const auto ready_source = static_cast<SchedulerReadySource>(trace.ready_source);
+        const auto publication_mode = static_cast<SchedulerPublicationMode>(trace.publication_mode);
+        const bool refill = publication_mode == SchedulerPublicationMode::REFILL;
+        if (trace.dispatch_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY && !refill) {
             append_scheduler_record(
                 &records[trace.dispatch_scheduler_worker_id], trace.dispatch_start_cycles, trace.dispatch_end_cycles,
-                trace.dispatch_loop_iter, "dispatch", 1, task_id
+                trace.dispatch_loop_iter, ready_source == SchedulerReadySource::STOLEN ? "worksteal" : "dispatch", 1,
+                task_id
             );
         }
         if (trace.complete_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
@@ -568,7 +584,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         if (trace.refill_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
             append_scheduler_record(
                 &records[trace.refill_scheduler_worker_id], trace.refill_start_cycles, trace.refill_end_cycles,
-                trace.refill_loop_iter, "direct_refill", 1, trace.refill_task_id
+                trace.refill_loop_iter, "refill", 1, trace.refill_task_id
             );
         }
         const SchedulerTaskControl &control = controls[task_id];
@@ -1348,7 +1364,7 @@ int32_t run_host_orchestration(
     orchestrator.total_aiv_count = block_dim * PLATFORM_AIV_CORES_PER_BLOCKDIM;
     rt->mode = MODE_EXECUTE;
     // get_tensor_data/set_tensor_data resolve buffer.addr through the host
-    // views registered at staging time (host_build_graph/host_tensor_access.h),
+    // views registered at copy-in time (host_build_graph/host_tensor_access.h),
     // so the host orchestrator can read control tensors (e.g. paged_attention's
     // context_lens/block_table) whether or not the platform maps device memory
     // into the host address space.
@@ -1755,7 +1771,7 @@ extern "C" int register_callable_impl(const ChipCallable *callable, const HostAp
         out->host_orch_func_ptr = eps;
         LOG_INFO("host-orch: loaded orchestration entry '%s' on host", orch_func_name);
     }
-    LOG_INFO("Orchestration SO: %zu bytes staged", orch_so_size);
+    LOG_INFO("Orchestration SO: %zu bytes uploaded", orch_so_size);
     return 0;
 }
 
@@ -1830,9 +1846,32 @@ extern "C" int bind_callable_to_runtime_impl(
     // the point at which a task could make it stale.
     HostTensorAccessor tensor_access(api);
 
+    // A lease recorded by an earlier bind names an offset this bind is about to
+    // re-slice, so carrying one over would copy this run's bytes back to that
+    // run's host pointer. Every exit path from here on leaves the ledger owned
+    // by the caller's Runtime, and this is where it starts empty.
+    runtime->tensor_leases_.clear();
+
+    // The retained temporary buffer is always used on the hbg path — it is an
+    // internal allocation optimization, not user-facing config. The buffer
+    // lives on the runner across runs, one per pipeline slot; here we grow it
+    // to this run's packed size and bump-slice from it. A run holds its
+    // pipeline slot from bind through validate and a concurrent reservation is
+    // admitted only on a distinct slot, so no other run can re-slice this
+    // buffer while these slices are live.
+    //
+    // Inside the args span: growing the buffer is the only device allocation
+    // this phase can make, so a steady-state workload reporting no allocation
+    // cost here is a measurement rather than a definition.
     const BindPhaseMark args_phase = bind_phase_begin();
-    uint64_t staged_bytes = 0;
-    int staged_tensors = 0;
+    RetainedTempBump bump;
+    const size_t required_temp_bytes = packed_temp_bytes(orch_args);
+    if (!bump.begin(api, required_temp_bytes)) {
+        LOG_ERROR("Retained temp buffer grow failed: required bytes %zu", required_temp_bytes);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    uint64_t h2d_bytes = 0;
+    int h2d_tensors = 0;
     for (int i = 0; i < tensor_count; i++) {
         ChipTensor t = orch_args->tensor(i);
 
@@ -1843,33 +1882,49 @@ extern "C" int bind_callable_to_runtime_impl(
         if (t.is_device_memory()) {
             always_assert(t.buffer.addr < HEAP_VIRTUAL_BASE && "caller tensor reaches into the virtual heap window");
             LOG_DEBUG("  ChipTensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.buffer.addr);
+            // The bytes stay where the caller put them, so orchestration has no
+            // copy-in buffer to read them from. Claim the span now and let the
+            // platform resolve a means only if an access actually lands in it.
+            if (!tensor_access.add_child_memory(t.buffer.addr, t.buffer.size)) {
+                LOG_ERROR("host-orch: could not claim child-memory tensor %d (0x%" PRIx64 ")", i, t.buffer.addr);
+                return PTO_RUNTIME_ERR_INTERNAL;
+            }
             device_args.add_tensor(t);
             continue;
         }
 
         void *host_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(t.buffer.addr));
         size_t size = static_cast<size_t>(t.nbytes());
+        // An empty tensor addresses nothing, so it takes no slice and carries a
+        // null address rather than one aliasing the next tensor's.
+        if (size == 0) {
+            t.buffer.addr = 0;
+            device_args.add_tensor(t);
+            continue;
+        }
 
-        void *dev_ptr = api->device_malloc(size);
+        void *dev_ptr = bump.acquire(size);
         if (dev_ptr == nullptr) {
-            LOG_ERROR("Failed to allocate device memory for tensor %d", i);
+            LOG_ERROR(
+                "Retained temp buffer slice miss for tensor %d: bytes=%zu offset=%zu capacity=%zu", i, size,
+                bump.next_offset(), bump.capacity()
+            );
             return PTO_RUNTIME_ERR_INTERNAL;
         }
 
         // Pure write-only OUTPUT buffers are never read by the kernel and hold
-        // no meaningful host content, so they need no device staging — the
+        // no meaningful host content, so they need no copy-in — the
         // kernel defines what it writes and any unwritten bytes are undefined.
-        // IN / INOUT (read-before-write) are staged H2D.
+        // IN / INOUT (read-before-write) are copied in H2D.
         bool is_pure_output = (signature != nullptr && i < sig_count && signature[i] == ArgDirection::OUT);
         if (!is_pure_output) {
             int rc = api->copy_to_device(dev_ptr, host_ptr, size);
             if (rc != 0) {
-                LOG_ERROR("Failed to stage tensor %d to device", i);
-                api->device_free(dev_ptr);
+                LOG_ERROR("Failed to copy tensor %d in to the device", i);
                 return PTO_RUNTIME_ERR_INTERNAL;
             }
-            staged_bytes += static_cast<uint64_t>(size);
-            ++staged_tensors;
+            h2d_bytes += static_cast<uint64_t>(size);
+            ++h2d_tensors;
         }
         // Read-only INPUT tensors are never written by the kernel, so there is
         // no point copying them back D2H at the end. Index the signature
@@ -1878,11 +1933,11 @@ extern "C" int bind_callable_to_runtime_impl(
         // tensor entries). Anything not provably IN keeps the safe default of
         // copying back.
         bool needs_copy_back = !(signature != nullptr && i < sig_count && signature[i] == ArgDirection::IN);
-        runtime->tensor_pairs_.push_back({host_ptr, dev_ptr, size, needs_copy_back});
+        runtime->tensor_leases_.push_back({host_ptr, dev_ptr, size, needs_copy_back, TensorReleaseKind::BufferNoop});
         LOG_DEBUG("  ChipTensor %d: %zu bytes at %p", i, size, dev_ptr);
 
         // host_build_graph runs the orchestrator on the host, which may read
-        // staged control tensors (e.g. paged_attention's context_lens and
+        // host-memory control tensors (e.g. paged_attention's context_lens and
         // block_table) via get_tensor_data to shape the graph. A pure output
         // has no valid readable bytes before execution, and a5 cannot map it;
         // exposing its caller buffer would therefore make reads unsafe. Leave
@@ -1894,7 +1949,7 @@ extern "C" int bind_callable_to_runtime_impl(
         }
 
         t.buffer.addr = reinterpret_cast<uint64_t>(dev_ptr);
-        always_assert(t.buffer.addr < HEAP_VIRTUAL_BASE && "device_malloc reaches into the virtual heap window");
+        always_assert(t.buffer.addr < HEAP_VIRTUAL_BASE && "an argument slice reaches into the virtual heap window");
         device_args.add_tensor(t);
     }
     for (int i = 0; i < scalar_count; i++) {
@@ -1902,9 +1957,7 @@ extern "C" int bind_callable_to_runtime_impl(
     }
     {
         char attrs[kBindAttrsCapacity];
-        snprintf(
-            attrs, sizeof(attrs), "ntensor=%d staged=%d bytes=%" PRIu64, tensor_count, staged_tensors, staged_bytes
-        );
+        snprintf(attrs, sizeof(attrs), "ntensor=%d h2d=%d bytes=%" PRIu64, tensor_count, h2d_tensors, h2d_bytes);
         record_bind_phase(HostPhaseKind::BindArgs, args_phase, attrs);
     }
 
@@ -1914,7 +1967,7 @@ extern "C" int bind_callable_to_runtime_impl(
     // submitted its tasks, and the heap's only once orchestration has allocated
     // its intermediate buffers. Both are committed by the single
     // setup_static_arena in run_host_orchestration. Owned by DeviceRunner across
-    // runs — do NOT record in tensor_pairs_; the free is deferred to
+    // runs — do NOT record in tensor_leases_; the free is deferred to
     // DeviceRunner::finalize(). The runtime-arena size is determined by replaying
     // the reserve sequence on a host-side arena.
     uint64_t sm_size = SharedMemoryHandle::calculate_size(task_capacity);
@@ -1990,11 +2043,15 @@ extern "C" int bind_callable_to_runtime_impl(
         // owns these buffers, so drop the window on both exits.
         const size_t view_count = tensor_access.mapping_count();
         const uint64_t view_bytes = tensor_access.mapped_bytes();
+        const uint64_t device_copies = tensor_access.device_copy_count();
         const BindPhaseMark view_close_phase = bind_phase_begin();
         tensor_access.close();
         {
             char attrs[kBindAttrsCapacity];
-            snprintf(attrs, sizeof(attrs), "count=%zu bytes=%" PRIu64, view_count, view_bytes);
+            snprintf(
+                attrs, sizeof(attrs), "count=%zu bytes=%" PRIu64 " devcopy=%" PRIu64, view_count, view_bytes,
+                device_copies
+            );
             record_bind_phase(HostPhaseKind::BindHostViewClose, view_close_phase, attrs);
         }
         if (total_tasks < 0) {
@@ -2047,10 +2104,10 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
     LOG_INFO("=== Copying Results Back to Host ===");
 
     // Copy all recorded tensors from device back to host
-    TensorPair *tensor_pairs = runtime->tensor_pairs_.data();
-    int tensor_pair_count = static_cast<int>(runtime->tensor_pairs_.size());
+    TensorLease *tensor_leases = runtime->tensor_leases_.data();
+    int tensor_lease_count = static_cast<int>(runtime->tensor_leases_.size());
 
-    LOG_INFO("ChipTensor pairs to process: %d", tensor_pair_count);
+    LOG_INFO("ChipTensor leases to process: %d", tensor_lease_count);
 
     bool skip_tensor_copy_back = execution_rc != 0;
     int32_t runtime_status = 0;
@@ -2068,47 +2125,42 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
     if (skip_tensor_copy_back) {
         LOG_WARN("Skipping tensor copy-back because execution failed");
     } else {
-        for (int i = 0; i < tensor_pair_count; i++) {
-            const TensorPair &pair = tensor_pairs[i];
+        for (int i = 0; i < tensor_lease_count; i++) {
+            const TensorLease &lease = tensor_leases[i];
 
             // Skip if device pointer is null
-            if (pair.dev_ptr == nullptr) {
+            if (lease.dev_ptr == nullptr) {
                 LOG_WARN("ChipTensor %d has null device pointer, skipping", i);
                 continue;
             }
 
             // If host pointer is null, this is a device-only allocation (no copy-back)
-            if (pair.host_ptr == nullptr) {
+            if (lease.host_ptr == nullptr) {
                 LOG_DEBUG("ChipTensor %d: device-only allocation (no copy-back)", i);
                 continue;
             }
 
             // Read-only INPUT tensors were uploaded H2D but the kernel never
             // wrote them — copying them back (potentially ~GB) is pure waste.
-            // They are still device_free'd in the cleanup loop below.
-            if (!pair.needs_copy_back) {
+            // They are still released through release_kind below.
+            if (!lease.needs_copy_back) {
                 LOG_DEBUG("ChipTensor %d: read-only input, skipping copy-back", i);
                 continue;
             }
 
-            int copy_rc = api->copy_from_device(pair.host_ptr, pair.dev_ptr, pair.size);
+            int copy_rc = api->copy_from_device(lease.host_ptr, lease.dev_ptr, lease.size);
             if (copy_rc != 0) {
                 LOG_ERROR("Failed to copy tensor %d from device: %d", i, copy_rc);
                 rc = copy_rc;
             } else {
-                LOG_DEBUG("ChipTensor %d: %zu bytes copied to host", i, pair.size);
+                LOG_DEBUG("ChipTensor %d: %zu bytes copied to host", i, lease.size);
             }
         }
     }
 
     // Cleanup device tensors
     LOG_INFO("=== Cleaning Up ===");
-    for (int i = 0; i < tensor_pair_count; i++) {
-        if (tensor_pairs[i].dev_ptr != nullptr) {
-            api->device_free(tensor_pairs[i].dev_ptr);
-        }
-    }
-    LOG_INFO("Freed %d device allocations", tensor_pair_count);
+    release_run_tensor_leases(runtime, api);
     release_scheduler_state(runtime, api);
 
     // The dispatch table is owned by bind_callable_to_runtime, which clears it
@@ -2116,9 +2168,6 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
     // buffer behind those addresses is pool-managed by DeviceRunner (keyed by
     // content hash) and bulk-freed in DeviceRunner::finalize(), so re-running the
     // same callable repeatedly does not re-upload.
-
-    // Clear tensor pairs
-    runtime->tensor_pairs_.clear();
 
     LOG_INFO("=== Finalize Complete ===");
 

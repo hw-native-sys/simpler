@@ -359,7 +359,7 @@ Emitted in six parts:
 - **Part 1: Overhead verdict** — per-engine overhead (idle T-core *and* a ready, undispatched T-task, MIX-aware) + system `all_overhead` / `has_overhead`, all as % of makespan. An engine with no ready work is not overhead (dependency-mandated idle, not waste).
 - **Part 2: aicore switch** — the pre-dispatched pickup gap (`dispatch < prev_end`), reported **per core** (min/mean/max, ~0.8 µs each), the overhead-vs-independent split, and the makespan switch bound `[min over cores, sum of per-engine minima]`.
 - **Part 3 / 4: Head / Tail OH distributions** — P10–P99 + mean + total (per-task pickup and detect-latency magnitude).
-- **Part 5: Scheduler phase breakdown** — Level >= 3 reports the producer's phases. AICPU includes per-thread loop, queue-pop, fanout/fanin, and tail-vs-loop metrics; AICore reports its bootstrap/fanin/ready/dispatch/complete/refill/resolve/idle phase totals without applying AICPU-only queue formulas. At Level 2 this section is explicitly marked unavailable while Parts 1–4 and 6 remain available.
+- **Part 5: Scheduler phase breakdown** — Level >= 3 reports the producer's phases. AICPU includes per-thread loop, queue-pop, fanout/fanin, and tail-vs-loop metrics; AICore reports its flat bootstrap, completion, resolve, StateProbe, dispatch/worksteal/refill, and idle phase totals without applying AICPU-only queue formulas. Deferred waiting is left as an empty interval between StateProbe and publication. At Level 2 this section is explicitly marked unavailable while Parts 1–4 and 6 remain available.
 - **Part 6: Critical-path latency attribution** — along the makespan path, scheduler-injected µs vs compute µs ("scheduler adds X% to the critical path").
 
 The common dependency-aware analysis works at chip_swimlane_level >= 2 for
@@ -801,11 +801,14 @@ Top-level layout depends on `chip_swimlane_level`:
 - All levels: `chip_swimlane_level`, `tasks[]` (per-task fields above).
 - A5 HBG `>= 2`: also `aicpu_lifecycle_records[]`; the converter renders the
   real handshake, topology/configuration, context-publication, bootstrap-wait,
-  register-release, and exit timestamps under `AICPU Lifecycle`.
+  register-release, and exit intervals under `AICPU Lifecycle`, with one record
+  and lane per participating AICPU thread.
 - `>= 3`: also `scheduler_records.streams[]`. Every Record has the common
   `start_cycles`, `end_cycles`, `loop_iter`, `kind`, `tasks_processed`, and
   nullable `task_id` fields. Stream metadata selects the AICPU or AICore
   interpretation; producer-specific counters live in `metrics[]`.
+  A5 HBG task-bound phase labels use the actual task id, for example
+  `StateProbe(t23)`; Bootstrap and Idle use the phase name alone.
 - `>= 4`: also `aicpu_orchestrator_phases[]` (per-task orchestrator
   phase records).
 

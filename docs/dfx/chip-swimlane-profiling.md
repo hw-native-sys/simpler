@@ -77,6 +77,13 @@ that loads directly in Perfetto. For the scheduler-overhead deep-dive, capture
   emit them (PR #1079's Scan/Poll debug overlay was removed;
   Fanout was renamed Resolve and now also filters out <1 µs walks;
   Prestage was renamed EarlyDispatch).
+  A5 `host_build_graph` uses the AICore Scheduler as the producer and emits one
+  flat lane per Scheduler. Its task-processing phases are `complete`,
+  `resolve`, `state_probe`, and exactly one of `dispatch`, `worksteal`, or
+  `refill`; the converter displays them as Completion, Resolve, StateProbe,
+  Dispatch, Worksteal, and Refill. Bootstrap ends before the initial task
+  dispatch, and its dependency initialization is not emitted again as a nested
+  `fanin` phase.
 - **Orchestrator submit envelope** — one record per `submit_task()`
   / `alloc_tensors()` call covering the whole submit's
   `[start, end]` window (`orch_submit` phase). Per-sub-step
@@ -244,6 +251,26 @@ layers to be aware of:**
     "records": [[...], ...]
   },
 
+  // A5 HBG AICPU control-plane records (level >= 2 only), one per
+  // participating AICPU thread. Every phase is an explicit start/end pair.
+  "aicpu_lifecycle_records": [{
+    "aicpu_thread_id": <int>,
+    "handshake_start_cycles": <int>,
+    "handshake_complete_cycles": <int>,
+    "config_start_cycles": <int>,
+    "topology_complete_cycles": <int>,
+    "context_publish_start_cycles": <int>,
+    "context_publish_complete_cycles": <int>,
+    "bootstrap_wait_start_cycles": <int>,
+    "bootstrap_complete_cycles": <int>,
+    "register_release_start_cycles": <int>,
+    "register_release_end_cycles": <int>,
+    "exit_signal_start_cycles": <int>,
+    "exit_signal_end_cycles": <int>,
+    "exit_wait_start_cycles": <int>,
+    "exit_wait_end_cycles": <int>
+  }],
+
   // Producer-neutral per-Scheduler streams (level >= 3 only).
   "scheduler_records": {
     "schema_version": 1,
@@ -307,7 +334,7 @@ Phase records (per Scheduler stream, level >= 3 in raw
 | `phase` | Lowercase phase name. Scheduler: see the table below. Orchestrator: `orch_submit` — one record per `submit_task()` / `alloc_tensors()` call spanning its full `[start, end]` window. Legacy per-sub-step strings (`orch_sync` / `orch_alloc` / `orch_params` / `orch_lookup` / `orch_insert` / `orch_fanin`) may appear in old captures. |
 | `loop_iter` (scheduler) / `submit_idx` (orchestrator) | Iteration / submit-call counter for the producing thread |
 | `tasks_processed` (scheduler) | Number of tasks or blocks handled by the phase; `dummy_task` and `predicated_skip` record one task |
-| `task_id` | Full runtime task id on orchestrator records and scheduler `dummy_task` / `predicated_skip` records |
+| `task_id` | Full runtime task id on orchestrator records, A5 HBG AICore Scheduler task phases, and scheduler `dummy_task` / `predicated_skip` records |
 | `pop_hit` / `pop_miss` (dispatch only) | Ready-queue pop deltas since the previous dispatch emit |
 
 The raw scheduler record has a phase-tagged union: `dispatch` stores
@@ -320,15 +347,19 @@ field but render differently in Perfetto:
 
 | Phase | Role | Lane | `tasks_processed` semantic |
 | ----- | ---- | ---- | -------------------------- |
-| `complete` | outer | sched (pid=2) | FIN'd subtasks + sub-block retires this iter |
+| `bootstrap` | A5 HBG AICore outer | AICore Scheduler lane | initial executable tasks classified and published before normal scheduling |
+| `complete` | outer | sched (pid=2) | FIN'd subtasks + sub-block retires this iter; A5 HBG ends this phase before dependency resolution |
 | `async_poll` | outer | sched | async-wait completions resolved; zero means polling consumed CPU without completing work |
 | `dispatch` | outer | sched | subtasks published this iter |
+| `state_probe` | A5 HBG AICore outer | AICore Scheduler lane | Cluster Slot / Ready state checked, a Ready task acquired, and immediate or deferred placement decided |
+| `worksteal` | A5 HBG AICore outer | AICore Scheduler lane | a task acquired from another non-empty Inbox is published |
+| `refill` | A5 HBG AICore outer | AICore Scheduler lane | completed Slot reused for one replacement task |
 | `release` | outer | sched | deferred-release slots drained this iter |
 | `dummy` | outer | sched | `dummy_ready_queue` entries handled this iter (explicit dummies and false-predicate tasks) |
 | `early_dispatch` | outer | sched | blocks staged by speculative early-dispatch this pass |
 | `drain` | outer | sched | blocks staged by this thread's global sync-start drain pass |
 | `graph_prepare` | outer | sched | Graph Definition nodes expanded this pass |
-| `resolve` | inner (TMR) | TMR sched sub-lane | consumers visited in `on_task_complete` |
+| `resolve` | inner (TMR); A5 HBG AICore outer | TMR sched sub-lane or AICore Scheduler lane | consumers visited after completion |
 | `resolve_standalone` | P-thread outer (HBG); rendered as `resolve` | HBG P sched lane | completed SPSC slots |
 | `drain_prepare` | inner | sched, nested in `drain` | subtasks prepared for global sync-start publication |
 | `drain_publish` | inner | sched, nested in `drain` | subtasks published during global sync-start staging |
@@ -349,6 +380,29 @@ lane. In `host_build_graph`, standalone `resolve` stays beside `async_poll` and
 Separate-lane phases are routed to a different lane by the converter
 (Worker View AICPU_N), so they never overlap visually with the sched lane
 bars even when their timestamps fall inside an outer span.
+
+For the A5 HBG AICore producer, all phases render on the single
+`Scheduler_<physical-AIV-ID>` lane. Completion, Resolve, StateProbe, and the
+selected publication phase are mutually time-exclusive. StateProbe includes
+Ready claim or steal and ends when immediate or deferred placement has been
+decided. Deferred waiting is intentionally left as an empty interval before
+the eventual Dispatch, Worksteal, or Refill. Worksteal identifies a task whose
+Ready source was another Inbox when its publication mode is not Refill; a
+completed Slot reused for a replacement task remains Refill regardless of its
+Ready source. The steal operation itself is included in StateProbe. The older
+`fanin`, `ready_claim`, `ready_steal`, and `direct_refill` records remain
+accepted only for existing captures.
+
+Task-bound A5 HBG Scheduler bars use the runtime task identity in their label,
+for example `StateProbe(t23)` and `Dispatch(t23)`. Bootstrap and Idle have no
+task identity and use the phase name alone; `tasks_processed` remains available
+in the event arguments.
+
+A5 HBG AICPU lifecycle records and lanes are indexed by AICPU thread, not by
+the AIC/AIV workers managed by that thread. Parallel handshake, context
+publication, register release, and shutdown spans are recorded on each thread;
+leader-only topology configuration is emitted only on thread 0. Bootstrap wait
+covers each thread's synchronization before the common register release.
 
 On the HBG P thread, consecutive empty async-wait polls are compacted into one
 `async_poll(0)` record. Its duration is the exact sum of time spent inside the
@@ -531,6 +585,14 @@ same lane structure — the directory form repeats it once per Rank under the
   appears on an adjacent `Sched_N` sub-lane; HBG's standalone `resolve` stays
   on the P thread's first lane. `drain_prepare` and `drain_publish` nest within
   `drain`.
+  A5 HBG AICore Scheduler streams instead use one named `Scheduler_N` lane;
+  their Resolve and all dispatch variants remain on that lane. Task-bound bars
+  use labels such as `StateProbe(t23)`; taskless Bootstrap and Idle bars use
+  only the phase name.
+- **AICPU Lifecycle** (pid=6) — one lane per participating AICPU thread,
+  containing its handshake, context publication, bootstrap synchronization,
+  register release, and shutdown intervals. Topology configuration appears
+  only on the leader thread.
 - **Scheduler View** (pid=3) — task-execution overlay using Scheduler
   dispatch/finish timestamps (level >= 2), with the same labels
   as Worker View.

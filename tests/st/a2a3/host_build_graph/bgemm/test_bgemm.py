@@ -69,8 +69,8 @@ class TestBgemmHostBuildGraph(SceneTestCase):
         A = torch.randn(BATCH, GRID_M, GRID_K, TILE_M, TILE_K, dtype=torch.float32) * 0.01
         B = torch.randn(BATCH, GRID_K, GRID_N, TILE_K, TILE_N, dtype=torch.float32) * 0.01
         # C is an INOUT accumulator: the k=0 tile_add reads it before anything
-        # writes it. A non-zero base makes the host->device staging of C
-        # observable — a zeroed or unstaged device buffer fails the compare.
+        # writes it. A non-zero base makes the host->device copy-in of C
+        # observable — a zeroed or never-copied device buffer fails the compare.
         C = torch.full((BATCH, GRID_M, GRID_N, TILE_M, TILE_N), C_BASE, dtype=torch.float32)
 
         return TaskArgsBuilder(

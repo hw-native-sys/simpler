@@ -138,8 +138,8 @@ void ArgsDumpCollector::merge_collector_shards() {
 }
 
 int ArgsDumpCollector::initialize(
-    int num_dump_threads, int device_id, const DumpAllocCallback &alloc_cb, DumpRegisterCallback register_cb,
-    const DumpFreeCallback &free_cb
+    int num_dump_threads, int device_id, DumpArgsLevel dump_args_level, const DumpAllocCallback &alloc_cb,
+    DumpRegisterCallback register_cb, const DumpFreeCallback &free_cb
 ) {
     if (shm_host_ != nullptr) {
         // Already holding this run's device resources. They are not per-run:
@@ -147,6 +147,7 @@ int ArgsDumpCollector::initialize(
         // compile time, so there is nothing here left to re-apply.
         return 0;
     }
+    dump_args_level_ = dump_args_level;
     if (num_dump_threads <= 0 || num_dump_threads > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR(
             "ArgsDumpCollector::initialize: invalid num_dump_threads=%d (valid range: 1-%d)", num_dump_threads,
@@ -288,8 +289,8 @@ void ArgsDumpCollector::start_writer_thread_once() {
     if (writer_started_) return;
     writer_started_ = true;
 
-    // `output_prefix_` is captured at initialize() time and is the per-task
-    // uniqueness boundary; the dump dir name is fixed (`<prefix>/args_dump`).
+    // `output_prefix_` is bound by begin_run() and is the per-task uniqueness
+    // boundary; the dump dir name is fixed (`<prefix>/args_dump`).
     std::string run_dir_name = "args_dump";
     run_dir_ = std::filesystem::path(output_prefix_) / run_dir_name;
     std::filesystem::create_directories(run_dir_);

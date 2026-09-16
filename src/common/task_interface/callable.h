@@ -40,9 +40,19 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "arg_direction.h"
+
+// signature contains sig_count validated entries.
+inline int32_t count_scalar_args(const ArgDirection *signature, int32_t sig_count) {
+    int32_t scalar_count = 0;
+    for (int32_t i = 0; i < sig_count; ++i) {
+        if (signature[i] == ArgDirection::SCALAR) ++scalar_count;
+    }
+    return scalar_count;
+}
 
 // ============================================================================
 // Forward declaration
@@ -129,6 +139,15 @@ struct Callable {
     uint32_t func_name_len() const { return func_name_len_; }
     const char *config_name() const { return config_name_; }
     uint32_t config_name_len() const { return config_name_len_; }
+    int32_t scalar_count() const {
+        if (sig_count_ < 0 || sig_count_ > MaxSig) {
+            throw std::invalid_argument(
+                "Callable: signature count " + std::to_string(sig_count_) + " is outside the supported range [0, " +
+                std::to_string(MaxSig) + "]"
+            );
+        }
+        return count_scalar_args(signature_, sig_count_);
+    }
 
     const Child &child(int32_t i) const {
         if (i < 0 || i >= child_count_) throw std::out_of_range("Callable: child index out of range");
@@ -176,6 +195,41 @@ static_assert(
     offsetof(ChipCallable, storage_) % CALLABLE_CHILD_ALIGN == 0,
     "ChipCallable.storage_ must be CALLABLE_CHILD_ALIGN-aligned for SIMT kernel binaries"
 );
+
+// Callable bytes are shipped through L3/L4 IPC and the on-disk kernel cache,
+// so the header layout is wire ABI. The constants below encode
+// CHIP_MAX_TENSOR_ARGS = 256, CORE_MAX_TENSOR_ARGS = 32,
+// CALLABLE_FUNC_NAME_MAX = 64, and MaxChildren = 1024; a deliberate capacity
+// change updates them in the same commit.
+static_assert(
+    std::is_trivially_copyable_v<ChipCallable> && std::is_standard_layout_v<ChipCallable>,
+    "ChipCallable wire ABI: must stay memcpy-able POD"
+);
+static_assert(
+    std::is_trivially_copyable_v<CoreCallable> && std::is_standard_layout_v<CoreCallable>,
+    "CoreCallable wire ABI: must stay memcpy-able POD"
+);
+static_assert(offsetof(ChipCallable, signature_) == 0, "ChipCallable wire ABI: signature offset changed");
+static_assert(offsetof(ChipCallable, sig_count_) == 1024, "ChipCallable wire ABI: sig_count offset changed");
+static_assert(offsetof(ChipCallable, binary_size_) == 1028, "ChipCallable wire ABI: binary_size offset changed");
+static_assert(offsetof(ChipCallable, func_name_) == 1032, "ChipCallable wire ABI: func_name offset changed");
+static_assert(offsetof(ChipCallable, func_name_len_) == 1096, "ChipCallable wire ABI: func_name_len offset changed");
+static_assert(offsetof(ChipCallable, child_func_ids_) == 1100, "ChipCallable wire ABI: child_func_ids offset changed");
+static_assert(offsetof(ChipCallable, child_offsets_) == 5196, "ChipCallable wire ABI: child_offsets offset changed");
+static_assert(offsetof(ChipCallable, child_count_) == 9292, "ChipCallable wire ABI: child_count offset changed");
+static_assert(offsetof(ChipCallable, config_name_) == 9296, "ChipCallable wire ABI: config_name offset changed");
+static_assert(
+    offsetof(ChipCallable, config_name_len_) == 9360, "ChipCallable wire ABI: config_name_len offset changed"
+);
+static_assert(offsetof(ChipCallable, storage_) == 9376, "ChipCallable wire ABI: storage offset changed");
+static_assert(sizeof(ChipCallable) == 9376, "ChipCallable wire ABI: header size changed");
+static_assert(offsetof(CoreCallable, signature_) == 0, "CoreCallable wire ABI: signature offset changed");
+static_assert(offsetof(CoreCallable, sig_count_) == 128, "CoreCallable wire ABI: sig_count offset changed");
+static_assert(offsetof(CoreCallable, binary_size_) == 132, "CoreCallable wire ABI: binary_size offset changed");
+static_assert(offsetof(CoreCallable, resolved_addr_) == 136, "CoreCallable wire ABI: resolved_addr offset changed");
+static_assert(offsetof(CoreCallable, storage_) == 144, "CoreCallable wire ABI: storage offset changed");
+static_assert(sizeof(CoreCallable) == 144, "CoreCallable wire ABI: header size changed");
+static_assert(CoreCallable::binary_data_offset() == 192, "CoreCallable wire ABI: binary data offset changed");
 
 // ============================================================================
 // Factory: make_callable for static leaf

@@ -380,3 +380,43 @@ def test_device_error_class_reaches_host_log(st_platform, st_device_ids, case_na
         _assert_annotated(log, case)
     finally:
         worker.close()
+
+
+# The orchestrator fatals before any task completes, so this case leaves the
+# swimlane collector empty and only the two collectors asserted below hold
+# anything. That is deliberate: the point is the teardown, not the volume.
+_DFX_ON_FAILURE_CASE = "scope_deadlock"
+
+
+@pytest.mark.platforms(["a5sim", "a2a3sim", "a2a3"])
+@pytest.mark.device_count(1)
+@pytest.mark.runtime(RUNTIME)
+def test_failed_run_exports_its_diagnostics(st_platform, st_device_ids, monkeypatch, tmp_path):
+    """A run that fails still exports the collectors it armed."""
+    configure_logging("error")
+    worker, handle, config = _make_worker(st_platform, int(st_device_ids[0]), _DFX_ON_FAILURE_CASE, monkeypatch)
+    out = tmp_path / "fatal_dfx"
+    config.output_prefix = str(out)
+    # chip_swimlane is enabled but not asserted: it exports nothing when a run
+    # holds no task records, so its artifact cannot witness the teardown. It is
+    # on so the failure path drives its export too.
+    config.enable_chip_swimlane = 1
+    config.enable_scope_stats = True
+    config.enable_dep_gen = True
+    try:
+        with pytest.raises(RuntimeError):
+            worker.run(handle, None, config)
+    finally:
+        worker.close()
+
+    produced = sorted(str(p.relative_to(out)) for p in out.rglob("*")) if out.is_dir() else []
+    # scope_stats writes whenever its collector initialized, so it carries no
+    # record-count precondition, and it is written last in the teardown: its
+    # absence means the teardown did not run, or did not run to the end.
+    assert (out / "scope_stats" / "scope_stats.jsonl").is_file(), (
+        f"the failed run exported no scope_stats; {out} holds {produced}"
+    )
+    # The dep_gen emit follows the teardown and has its own completeness gate,
+    # so it needs its own assertion. The device flushes its dep_gen buffers
+    # during emergency shutdown, which is what lets the gate pass here.
+    assert (out / "deps.json").is_file(), f"the failed run emitted no deps.json; {out} holds {produced}"

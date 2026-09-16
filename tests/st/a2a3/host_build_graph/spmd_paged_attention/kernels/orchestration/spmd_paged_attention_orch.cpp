@@ -69,7 +69,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
 
     uint64_t block_size = orch_args.tensor(1).ref().shapes[1];
     uint64_t max_num_blocks_per_req = orch_args.tensor(3).ref().shapes[1];
-    uint64_t scale_value = orch_args.scalar(0);
+    uint64_t scale_value = orch_args.scalar<uint64_t>(0);
 
     // q_tile adapts to num_heads: use 64 when num_heads >= 64, else 16.
     // The kernel statically dispatches on q_tile == 16 vs 64.

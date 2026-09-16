@@ -284,7 +284,7 @@ TEST(SchedulerClusterCompletion, SpscGenerationCompletesNormalTask) {
     SchedulerCompletionStats completion_stats{};
     ASSERT_TRUE(scheduler_service_cluster_completions(
         graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, &wake_stats, &ready_stats,
-        &completion_stats, nullptr, false, nullptr, nullptr, &storage.owner_states[scheduler.inbox_index]
+        &completion_stats, nullptr, false, nullptr, &storage.owner_states[scheduler.inbox_index]
     ));
     EXPECT_EQ(completion_line->completed_generations[0], 0u);
     EXPECT_EQ(scheduler_dispatch_state(slot->publication), SchedulerDispatchSlotState::FREE);
@@ -317,7 +317,7 @@ TEST(SchedulerClusterCompletion, RejectsStaleCompletionGenerationAtNamedSite) {
     SchedulerCompletionStats completion_stats{};
     EXPECT_FALSE(scheduler_service_cluster_completion_slot(
         graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, 0, 0, slot->generation + 1,
-        &wake_stats, &ready_stats, &completion_stats, nullptr, false, nullptr, nullptr, nullptr,
+        &wake_stats, &ready_stats, &completion_stats, nullptr, false, nullptr, nullptr,
         &storage.owner_states[scheduler.inbox_index]
     ));
     EXPECT_EQ(
@@ -345,7 +345,7 @@ TEST(SchedulerClusterCompletion, RejectsUnexpectedGangSlotAtNamedSite) {
     SchedulerCompletionStats completion_stats{};
     EXPECT_FALSE(scheduler_service_cluster_completion_slot(
         graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, 0, 0, slot->generation,
-        &wake_stats, &ready_stats, &completion_stats, nullptr, false, nullptr, nullptr, nullptr,
+        &wake_stats, &ready_stats, &completion_stats, nullptr, false, nullptr, nullptr,
         &storage.owner_states[scheduler.inbox_index]
     ));
     EXPECT_EQ(
@@ -362,7 +362,7 @@ TEST(SchedulerClusterCompletion, AccountsCompletedTaskWhenResolveFails) {
 
     EXPECT_FALSE(scheduler_service_cluster_completion_slot(
         graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, 0, 0, slot->generation,
-        nullptr, nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, nullptr
+        nullptr, nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr
     ));
     EXPECT_EQ(storage.run_control->resolved_task_count, 1u);
     EXPECT_NE(storage.run_control->scheduler_error, 0u);
@@ -381,7 +381,7 @@ TEST(SchedulerClusterCompletion, AccountsCompletedTaskWhenRefillClaimFails) {
 
     EXPECT_FALSE(scheduler_service_cluster_completion_slot(
         graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, 0, 0, slot->generation,
-        nullptr, nullptr, nullptr, ready_victim_cursors, 0, nullptr, nullptr, nullptr, &owner_state
+        nullptr, nullptr, nullptr, ready_victim_cursors, 0, nullptr, nullptr, &owner_state
     ));
     EXPECT_EQ(storage.run_control->resolved_task_count, 1u);
     EXPECT_NE(storage.run_control->scheduler_error, 0u);
@@ -401,8 +401,7 @@ TEST(SchedulerClusterCompletion, AccountsCompletedTaskWhenRefillDispatchFails) {
 
     EXPECT_FALSE(scheduler_service_cluster_completion_slot(
         graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, 0, 0, slot->generation,
-        nullptr, nullptr, nullptr, nullptr, 0, &replacement, nullptr, nullptr,
-        &storage.owner_states[scheduler.inbox_index]
+        nullptr, nullptr, nullptr, nullptr, 0, &replacement, nullptr, &storage.owner_states[scheduler.inbox_index]
     ));
     EXPECT_EQ(storage.run_control->resolved_task_count, 1u);
     EXPECT_NE(storage.run_control->scheduler_error, 0u);
@@ -454,7 +453,7 @@ TEST(SchedulerClusterCompletion, PropagatesTraceToCompletionAndWokenTask) {
     SchedulerCompletionStats completion_stats{};
     ASSERT_TRUE(scheduler_service_cluster_completions(
         graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, &wake_stats, &ready_stats,
-        &completion_stats, nullptr, SCHEDULER_PROFILING_SCHED_PHASES_LEVEL, nullptr, nullptr,
+        &completion_stats, nullptr, SCHEDULER_PROFILING_SCHED_PHASES_LEVEL, nullptr,
         &storage.owner_states[scheduler.inbox_index]
     ));
     EXPECT_EQ(producer->completion_resolve_start_cycles, 0u);
@@ -499,6 +498,7 @@ TEST(SchedulerClusterCompletion, DirectlyRefillsCompletedSlotWhenReadyTaskExists
     slot->task_id = 0;
     slot->subtask_slot = 0;
     slot->gang = 0;
+    slot->executor_trace.generation = completed_generation;
     scheduler_gm_store(
         slot->publication, scheduler_dispatch_publication(completed_generation, SchedulerDispatchSlotState::READY)
     );
@@ -522,7 +522,7 @@ TEST(SchedulerClusterCompletion, DirectlyRefillsCompletedSlotWhenReadyTaskExists
     uint64_t direct_refilled_slot_mask = 0;
     ASSERT_TRUE(scheduler_service_cluster_completions(
         graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, &wake_stats, &ready_stats,
-        &completion_stats, ready_victim_cursors, false, &direct_refilled_slot_mask, nullptr,
+        &completion_stats, ready_victim_cursors, SCHEDULER_PROFILING_SCHED_PHASES_LEVEL, &direct_refilled_slot_mask,
         &storage.owner_states[scheduler.inbox_index]
     ));
 
@@ -533,6 +533,47 @@ TEST(SchedulerClusterCompletion, DirectlyRefillsCompletedSlotWhenReadyTaskExists
     EXPECT_EQ(completed_control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
     EXPECT_EQ(storage.run_control->resolved_task_count, 1u);
     EXPECT_EQ(direct_refilled_slot_mask, 1u);
+    auto *traces =
+        scheduler_state_at<SchedulerTaskTrace>(storage.scheduler_state->base(), storage.layout.trace_cells_offset);
+    EXPECT_EQ(traces[1].ready_source, static_cast<uint64_t>(SchedulerReadySource::LOCAL));
+    EXPECT_EQ(traces[1].publication_mode, static_cast<uint64_t>(SchedulerPublicationMode::REFILL));
+    EXPECT_LE(traces[1].state_probe_start_cycles, traces[1].state_probe_end_cycles);
+    EXPECT_EQ(traces[1].state_probe_end_cycles, traces[0].refill_start_cycles);
+}
+
+TEST(SchedulerClusterCompletion, DeferredRefillPreservesOriginalStateProbeAndReadySource) {
+    FixtureStorage storage(2, 3);
+    GraphBuffer graph(2);
+    graph.executable(0, 0);
+    graph.executable(1, 0);
+    storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIC);
+    SchedulerWorkerContext &scheduler = storage.contexts[1];
+    SchedulerDispatchSlot *slot = prepare_completed_normal_slot(storage, scheduler);
+    slot->executor_trace.generation = slot->generation;
+    auto *callables =
+        scheduler_state_at<uint64_t>(storage.scheduler_state->base(), storage.layout.callable_addresses_offset);
+    callables[1] = 0x1000;
+
+    SchedulerReadyClaim replacement{};
+    replacement.task_id = 1;
+    replacement.source = SchedulerReadySource::STOLEN;
+    replacement.state_probe_start_cycles = 123;
+    replacement.state_probe_end_cycles = 456;
+    bool refilled = false;
+
+    ASSERT_TRUE(scheduler_service_cluster_completion_slot(
+        graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, 0, 0, slot->generation,
+        nullptr, nullptr, nullptr, nullptr, SCHEDULER_PROFILING_SCHED_PHASES_LEVEL, &replacement, &refilled,
+        &storage.owner_states[scheduler.inbox_index]
+    ));
+
+    EXPECT_TRUE(refilled);
+    auto *traces =
+        scheduler_state_at<SchedulerTaskTrace>(storage.scheduler_state->base(), storage.layout.trace_cells_offset);
+    EXPECT_EQ(traces[1].ready_source, static_cast<uint64_t>(SchedulerReadySource::STOLEN));
+    EXPECT_EQ(traces[1].publication_mode, static_cast<uint64_t>(SchedulerPublicationMode::REFILL));
+    EXPECT_EQ(traces[1].state_probe_start_cycles, 123u);
+    EXPECT_EQ(traces[1].state_probe_end_cycles, 456u);
 }
 
 TEST(SchedulerNormalDispatch, FillsFreshAicSlot) {
@@ -565,7 +606,7 @@ TEST(SchedulerNormalDispatch, FillsFreshAicSlot) {
     uint64_t victim_cursors[SCHEDULER_CORE_TYPE_COUNT]{};
     ASSERT_TRUE(scheduler_fill_cluster_normal_slots(
         graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, victim_cursors, &ready_stats,
-        false, 0, nullptr, nullptr, &storage.owner_states[scheduler.inbox_index]
+        false, 0, nullptr, &storage.owner_states[scheduler.inbox_index]
     ));
     EXPECT_EQ(slot->task_id, 0);
     EXPECT_EQ(scheduler_dispatch_state(slot->publication), SchedulerDispatchSlotState::READY);
@@ -610,7 +651,7 @@ TEST(SchedulerNormalDispatch, PreservesProgressWhenALaterFillFails) {
     bool failed = false;
     EXPECT_TRUE(scheduler_fill_cluster_normal_slots(
         graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, victim_cursors, &ready_stats,
-        false, 0, nullptr, nullptr, &storage.owner_states[scheduler.inbox_index], &failed
+        false, 0, nullptr, &storage.owner_states[scheduler.inbox_index], &failed
     ));
     EXPECT_TRUE(failed);
     auto *first_slot = scheduler_dispatch_slot_at(storage.scheduler_state->base(), &scheduler, 0, 0);
@@ -638,7 +679,7 @@ TEST(SchedulerNormalDispatch, RejectsExcessAivWorkersAtNamedSite) {
     bool failed = false;
     EXPECT_FALSE(scheduler_fill_cluster_normal_slots(
         graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, victim_cursors, &ready_stats,
-        false, 0, nullptr, &deferred, &storage.owner_states[scheduler.inbox_index], &failed
+        false, 0, &deferred, &storage.owner_states[scheduler.inbox_index], &failed
     ));
     EXPECT_TRUE(failed);
     EXPECT_EQ(
@@ -659,7 +700,7 @@ TEST(SchedulerNormalDispatch, PublishesOrdinaryAivToPeerBeforeScheduler) {
     SchedulerDeferredAivQueue deferred{};
     ASSERT_TRUE(scheduler_fill_cluster_normal_slots(
         graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, victim_cursors, &ready_stats,
-        false, 0, nullptr, &deferred, &storage.owner_states[scheduler.inbox_index]
+        false, 0, &deferred, &storage.owner_states[scheduler.inbox_index]
     ));
     auto *peer_slot = scheduler_dispatch_slot_at(storage.scheduler_state->base(), &scheduler, 2, 0);
     EXPECT_EQ(peer_slot->task_id, 0);
@@ -683,7 +724,7 @@ TEST(SchedulerDeferredAiv, ReservesOnlyAvailableSchedulerSlotsBeforeClaiming) {
     SchedulerDeferredAivQueue deferred{};
     ASSERT_TRUE(scheduler_fill_cluster_normal_slots(
         graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, victim_cursors, &ready_stats,
-        false, 0, nullptr, &deferred, &storage.owner_states[scheduler.inbox_index]
+        false, 0, &deferred, &storage.owner_states[scheduler.inbox_index]
     ));
 
     ASSERT_EQ(deferred.count, SCHEDULER_PENDING_SLOT_COUNT);
@@ -795,7 +836,7 @@ TEST(SchedulerDeferredAiv, DoesNotClaimWithoutSchedulerReservation) {
     bool failed = true;
     EXPECT_FALSE(scheduler_fill_cluster_normal_slots(
         graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, victim_cursors, &ready_stats,
-        false, 0, nullptr, &deferred, &storage.owner_states[scheduler.inbox_index], &failed
+        false, 0, &deferred, &storage.owner_states[scheduler.inbox_index], &failed
     ));
     EXPECT_FALSE(failed);
     EXPECT_EQ(deferred.count, 0u);
@@ -817,7 +858,7 @@ TEST(SchedulerDeferredAiv, KeepsReservationForSchedulerWhenNoPeerIsActive) {
     SchedulerDeferredAivQueue deferred{};
     ASSERT_TRUE(scheduler_fill_cluster_normal_slots(
         graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, victim_cursors, &ready_stats,
-        false, 0, nullptr, &deferred, &storage.owner_states[scheduler.inbox_index]
+        false, 0, &deferred, &storage.owner_states[scheduler.inbox_index]
     ));
     ASSERT_EQ(deferred.count, 1u);
 
@@ -825,7 +866,7 @@ TEST(SchedulerDeferredAiv, KeepsReservationForSchedulerWhenNoPeerIsActive) {
     SchedulerCompletionStats completion_stats{};
     EXPECT_TRUE(scheduler_drain_deferred_aiv_to_peer(
         graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, &deferred, &wake_stats,
-        &ready_stats, &completion_stats, false, nullptr, nullptr, &storage.owner_states[scheduler.inbox_index]
+        &ready_stats, &completion_stats, false, &storage.owner_states[scheduler.inbox_index]
     ));
     EXPECT_EQ(deferred.count, 1u);
 
@@ -852,7 +893,7 @@ TEST(SchedulerDeferredAiv, PrefersNewPeerCapacityAndSelfPublishesOnlyOne) {
     SchedulerDeferredAivQueue deferred{};
     ASSERT_TRUE(scheduler_fill_cluster_normal_slots(
         graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, victim_cursors, &ready_stats,
-        false, 0, nullptr, &deferred, &storage.owner_states[scheduler.inbox_index]
+        false, 0, &deferred, &storage.owner_states[scheduler.inbox_index]
     ));
     ASSERT_EQ(deferred.count, 2u);
     const SchedulerFreeSlotClaim first_reservation = deferred.entries[0].reserved_slot;
@@ -866,7 +907,7 @@ TEST(SchedulerDeferredAiv, PrefersNewPeerCapacityAndSelfPublishesOnlyOne) {
     SchedulerCompletionStats completion_stats{};
     ASSERT_TRUE(scheduler_drain_deferred_aiv_to_peer(
         graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, &deferred, &wake_stats,
-        &ready_stats, &completion_stats, false, nullptr, nullptr, &storage.owner_states[scheduler.inbox_index]
+        &ready_stats, &completion_stats, false, &storage.owner_states[scheduler.inbox_index]
     ));
     ASSERT_EQ(deferred.count, 1u);
     EXPECT_EQ(scheduler_dispatch_state(peer_slot->publication), SchedulerDispatchSlotState::READY);
@@ -900,7 +941,7 @@ TEST(SchedulerDeferredAiv, KeepsSecondReservationAfterOneSelfPublish) {
     SchedulerDeferredAivQueue deferred{};
     ASSERT_TRUE(scheduler_fill_cluster_normal_slots(
         graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, victim_cursors, &ready_stats,
-        false, 0, nullptr, &deferred, &storage.owner_states[scheduler.inbox_index]
+        false, 0, &deferred, &storage.owner_states[scheduler.inbox_index]
     ));
     ASSERT_EQ(deferred.count, 2u);
 
@@ -938,7 +979,7 @@ TEST(SchedulerDeferredAiv, RetiresCompletedPeerAndRefillsWithoutFreeDecision) {
     SchedulerDeferredAivQueue deferred{};
     ASSERT_TRUE(scheduler_fill_cluster_normal_slots(
         graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, victim_cursors, &ready_stats,
-        false, 0, nullptr, &deferred, &storage.owner_states[scheduler.inbox_index]
+        false, 0, &deferred, &storage.owner_states[scheduler.inbox_index]
     ));
     ASSERT_EQ(deferred.count, 1u);
     auto *peer_slot = scheduler_dispatch_slot_at(storage.scheduler_state->base(), &scheduler, 2, 0);
@@ -950,7 +991,7 @@ TEST(SchedulerDeferredAiv, RetiresCompletedPeerAndRefillsWithoutFreeDecision) {
     SchedulerCompletionStats completion_stats{};
     ASSERT_TRUE(scheduler_drain_deferred_aiv_to_peer(
         graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, &deferred, &wake_stats,
-        &ready_stats, &completion_stats, false, nullptr, nullptr, &storage.owner_states[scheduler.inbox_index]
+        &ready_stats, &completion_stats, false, &storage.owner_states[scheduler.inbox_index]
     ));
     EXPECT_EQ(deferred.count, 0u);
     EXPECT_EQ(completion_line->completed_generations[0], 0u);
@@ -983,7 +1024,7 @@ TEST(SchedulerDeferredAiv, SchedulerCompletionDoesNotDirectRefillItself) {
     uint64_t direct_refilled_slot_mask = 0;
     ASSERT_TRUE(scheduler_service_cluster_completions(
         graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, &wake_stats, &ready_stats,
-        &completion_stats, victim_cursors, false, &direct_refilled_slot_mask, nullptr,
+        &completion_stats, victim_cursors, false, &direct_refilled_slot_mask,
         &storage.owner_states[scheduler.inbox_index]
     ));
     EXPECT_EQ(direct_refilled_slot_mask, 0u);

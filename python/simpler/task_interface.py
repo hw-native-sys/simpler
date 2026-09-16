@@ -99,6 +99,9 @@ from _task_interface import (
 from _task_interface import (
     _start_host_log_writer as _native_start_host_log_writer,
 )
+from _task_interface import (
+    scalar_to_uint64 as _native_scalar_to_uint64,
+)
 
 from .buffer import Buffer, Tensor
 
@@ -957,26 +960,46 @@ assert ctypes.sizeof(_CommContextStruct) == 1056
 def scalar_to_uint64(value) -> int:
     """Convert a scalar value to ``uint64``.
 
-    *value* can be a Python int, float, a ctypes scalar (``c_int64``,
-    ``c_float``, etc.), or any object convertible to ``int``.
+    *value* can be a Python int, float, bool, a numpy integer scalar, an
+    ``IntEnum`` member, or a ctypes scalar.
 
-    Python float values are converted to IEEE 754 single precision (32-bit)
-    and their bit pattern is zero-extended to uint64. This may cause a loss of
-    precision. For double precision, use ``ctypes.c_double``.
+    The accepted ctypes types are the integer widths (``c_int8`` ..
+    ``c_uint64``), ``c_float``, ``c_double`` and ``c_bool``, and any subclass
+    of one of them. A pointer or character type (``c_void_p``, ``c_char_p``,
+    ``c_char``, ``c_wchar``) is refused: its buffer holds an address or a
+    character rather than a number a slot can carry.
+
+    A byte-order-qualified variant (``c_uint32.__ctype_be__`` on a
+    little-endian host, and its ``__ctype_le__`` counterpart on a big-endian
+    one) is also refused. Its bytes are stored in the opposite order, so
+    copying them would encode a different number than the same value written
+    from orchestration, and ``to_u64`` has no reversed-order form to agree
+    with.
+
+    The encoding matches C++ ``to_u64()`` bit for bit, so a slot written from
+    Python and one written from orchestration read back identically.
+
+    A ctypes scalar is read at its own width and **zero-extended**, never
+    sign-extended: ``c_int8(-1)`` is ``0xFF``, matching ``to_u64(int8_t{-1})``.
+    Reading it back with the matching width (``scalar<int8_t>``) still yields
+    ``-1``.
+
+    Python float values (and ``numpy.float64``, which is itself a ``float``
+    subclass) are converted to IEEE 754 single precision (32-bit) and their
+    bit pattern is zero-extended to uint64. This may cause a loss of
+    precision. A finite value outside single-precision range (``1e100``)
+    raises rather than being stored as an infinity; ``inf`` and ``nan`` pass
+    through as themselves. For double precision, use ``ctypes.c_double`` -- a
+    bare Python float carries no width, so this is the one encoding that
+    cannot align with its C++ counterpart, where ``to_u64(1.5)`` is a double.
+    A narrower numpy float (e.g. ``numpy.float32``) is rejected rather than
+    silently coerced through ``int()`` -- wrap it in ``float(...)`` first if
+    that narrowing is what you want.
+
+    An integer outside the 64-bit two's-complement range raises rather than
+    truncating to its low 64 bits.
     """
-    import struct as _struct
-
-    if isinstance(value, float):
-        bits = _struct.unpack("<I", _struct.pack("<f", value))[0]
-        return bits
-    import ctypes as _ct
-
-    if isinstance(value, _ct._SimpleCData):
-        if isinstance(value, (_ct.c_float, _ct.c_double)):
-            uint_type = _ct.c_uint32 if isinstance(value, _ct.c_float) else _ct.c_uint64
-            return uint_type.from_buffer_copy(value).value
-        return int(value.value) & 0xFFFFFFFFFFFFFFFF
-    return int(value) & 0xFFFFFFFFFFFFFFFF
+    return _native_scalar_to_uint64(value)
 
 
 @dataclass

@@ -9,21 +9,22 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Runtime Builder - rt2 Implementation (Device Orchestration)
+ * tensormap_and_ringbuffer runtime maker (device orchestration).
  *
- * Provides init_runtime_impl and validate_runtime_impl functions for rt2 runtime.
- * Supports device orchestration where AICPU thread 3 runs the orchestrator.
+ * Supports device orchestration where an AICPU thread runs the orchestrator.
  *
- * init_runtime_impl:
- *   - Converts host tensor pointers to device pointers (all inputs copied H2D;
- *     only OUTPUT/INOUT tensors are copied back D2H)
+ * bind_callable_to_runtime_impl:
+ *   - Gives host-memory tensor arguments slices of the pipeline slot's retained
+ *     temporary buffer (all readable inputs copied H2D; only OUTPUT/INOUT
+ *     tensors are copied back D2H) and records one lease each
  *   - Copies orchestration SO to device memory
  *   - Sets up runtime state for device orchestration
  *
  * validate_runtime_impl:
  *   - Copies OUTPUT/INOUT tensors back from device to host (read-only inputs
  *     are skipped)
- *   - Frees device memory
+ *   - Releases the run's leases. The slices are no-ops: the retained buffer
+ *     outlives the run and is freed once at Worker finalization.
  */
 
 #include <stddef.h>
@@ -52,9 +53,14 @@
 #include "common/strace.h"
 #include "common/unified_log.h"
 #include "host/platform_compile_info.h"
+#include "host/kernel_pipeline_contract.h"
+#include "worker/pipeline_contract.h"
 #include "host/raii_scope_guard.h"
 #include "common/host_api.h"
 #include "utils/device_arena.h"
+#include "utils/retained_temp_bump.h"
+#include "utils/temp_buffer_plan.h"
+#include "utils/tensor_lease_release.h"
 #include "prepare_callable_common.h"
 
 // This file returns both kinds of negative status — a latched device code
@@ -221,102 +227,13 @@ static int32_t read_runtime_status(Runtime *runtime, const HostApi *api, SharedM
     return runtime_status_from_error_codes(orch_error_code, sched_error_code);
 }
 
-static void release_tensor_leases(Runtime *runtime, const HostApi *api) {
-    int freed = 0;
-    int buffer_noop = 0;
-    int external_noop = 0;
-    for (TensorLease &lease : runtime->tensor_leases_) {
-        if (lease.dev_ptr == nullptr) {
-            continue;
-        }
-        switch (lease.release_kind) {
-        case TensorReleaseKind::Free:
-            api->device_free(lease.dev_ptr);
-            ++freed;
-            break;
-        case TensorReleaseKind::BufferNoop:
-            ++buffer_noop;
-            break;
-        case TensorReleaseKind::ExternalNoop:
-            ++external_noop;
-            break;
-        }
-    }
-    LOG_DEBUG("Released tensor leases: freed=%d buffer_noop=%d external_noop=%d", freed, buffer_noop, external_noop);
-    runtime->tensor_leases_.clear();
+static void release_run_tensor_leases(Runtime *runtime, const HostApi *api) {
+    const TensorLeaseReleaseCounts counts = release_tensor_leases(runtime->tensor_leases_, api);
+    LOG_DEBUG(
+        "Released tensor leases: freed=%d buffer_noop=%d external_noop=%d", counts.freed, counts.buffer_noop,
+        counts.external_noop
+    );
 }
-
-// per-run bump allocator over the runner's retained temporary buffer. This is
-// the whole temporary-buffer mechanism: the platform only remembers a
-// {addr, size} slot across runs (HostApi get/set_retained_temp_buffer); the
-// grow/pack/slice logic lives here. TRB kernels require 1024-byte-aligned
-// device pointers, which device_malloc already guarantees for the OFF path, so
-// the retained base is 1024-aligned and slices taken at 1024-aligned offsets
-// stay aligned without any base fix-up.
-class RetainedTempBump {
-public:
-    static constexpr size_t kAlignment = 1024;
-
-    static size_t align_up(size_t v) { return (v + (kAlignment - 1)) & ~(kAlignment - 1); }
-
-    // Pack the run's non-child, non-empty tensors to compute the required
-    // aligned size, then grow the retained slot if it is too small (free old +
-    // malloc new + write back). Returns false only if the (grow) device_malloc
-    // fails. A run needing 0 bytes leaves the slot untouched.
-    bool begin(const HostApi *api, const ChipStorageTaskArgs *orch_args) {
-        api_ = api;
-        offset_ = 0;
-        size_t required = 0;
-        for (int i = 0; i < orch_args->tensor_count(); i++) {
-            ChipTensor t = orch_args->tensor(i);
-            if (t.is_device_memory() || t.nbytes() == 0) {
-                continue;
-            }
-            required += align_up(static_cast<size_t>(t.nbytes()));
-        }
-        void *addr = nullptr;
-        size_t size = 0;
-        api->get_retained_temp_buffer(&addr, &size);
-        if (required > size) {
-            if (addr != nullptr) {
-                api->device_free(addr);
-            }
-            addr = required != 0 ? api->device_malloc(required) : nullptr;
-            if (required != 0 && addr == nullptr) {
-                api->set_retained_temp_buffer(nullptr, 0);
-                base_ = nullptr;
-                capacity_ = 0;
-                LOG_ERROR("Retained temp buffer grow failed: required bytes %zu", required);
-                return false;
-            }
-            api->set_retained_temp_buffer(addr, required);
-            size = required;
-        }
-        base_ = addr;
-        capacity_ = size;
-        return true;
-    }
-
-    // Slice `bytes` from the retained buffer at the next 1024-aligned offset.
-    // Must fit because begin() sized the buffer from the same tensors; a miss
-    // is a caller bug (plan/slice mismatch), reported as nullptr.
-    void *acquire(size_t bytes) {
-        size_t aligned = align_up(offset_);
-        if (base_ == nullptr || aligned + bytes > capacity_) {
-            LOG_ERROR("Retained temp buffer slice miss: bytes=%zu offset=%zu capacity=%zu", bytes, aligned, capacity_);
-            return nullptr;
-        }
-        void *ptr = static_cast<char *>(base_) + aligned;
-        offset_ = aligned + bytes;
-        return ptr;
-    }
-
-private:
-    const HostApi *api_ = nullptr;
-    void *base_ = nullptr;
-    size_t capacity_ = 0;
-    size_t offset_ = 0;
-};
 
 /**
  * Stage the per-callable resources (kernel binaries + orchestration SO) into
@@ -366,7 +283,7 @@ extern "C" int register_callable_impl(const ChipCallable *callable, const HostAp
     out->orch_so_size = orch_so_size;
     out->func_name = callable->func_name();
     out->config_name = callable->config_name();
-    LOG_INFO("Orchestration SO: %zu bytes staged (host-only)", orch_so_size);
+    LOG_INFO("Orchestration SO: %zu bytes uploaded (host-only)", orch_so_size);
     return 0;
 }
 
@@ -379,9 +296,14 @@ struct ArenaSizingConfig {
     int32_t dep_pool_capacities[CHIP_MAX_RING_DEPTH];
 };
 
+// The three device regions one bind commits, in bytes. Derived from ring
+// sizing alone, so a config resolves to the same three numbers whichever entry
+// asks: the program path hands them to setup_static_arena, kernel-mode init
+// declares them as its resource requirements.
 struct ArenaStaticSizes {
     uint64_t total_heap;
     uint64_t sm_size;
+    uint64_t runtime_image_size;
 };
 
 // Device pointers to the per-Worker static pools that DeviceRunner keeps alive
@@ -487,18 +409,88 @@ static bool derive_arena_static_sizes(const ArenaSizingConfig &sizing, ArenaStat
         out->total_heap += sizing.heap_sizes[r];
     }
     out->sm_size = SharedMemoryHandle::calculate_size_per_ring(sizing.task_window_sizes);
+
+    uint64_t total_window = 0;
+    for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
+        total_window += sizing.task_window_sizes[r];
+    }
+    // OrchestratorLayout stores the sum in int32_t and asserts before narrowing.
+    if (total_window > static_cast<uint64_t>(INT32_MAX)) {
+        LOG_ERROR("Total task window %" PRIu64 " exceeds the int32 layout bound", total_window);
+        return false;
+    }
+
+    // A region's committed span is forward-aligned to the arena's base alignment,
+    // so a size within that much of SIZE_MAX cannot be committed.
+    // Layout has a fixed number of regions; window/dep counts are int32-bounded.
+    // Their reserve-only size arithmetic requires the platform's 64-bit size_t.
+    static_assert(sizeof(size_t) == sizeof(uint64_t));
+    constexpr size_t max_usable = std::numeric_limits<size_t>::max() - (DeviceArena::kDefaultBaseAlign - 1);
+    if (out->total_heap > max_usable || out->sm_size > max_usable) {
+        LOG_ERROR("Heap or shared-memory size leaves no room for base alignment");
+        return false;
+    }
+
+    DeviceArena sizing_arena;  // discarded; only its computed arena_size is read
+    const RuntimeArenaLayout layout =
+        runtime_reserve_layout(sizing_arena, sizing.task_window_sizes, sizing.heap_sizes, sizing.dep_pool_capacities);
+    if (layout.offsets.arena_size > max_usable) {
+        LOG_ERROR("Runtime image size leaves no room for base alignment");
+        return false;
+    }
+    out->runtime_image_size = layout.offsets.arena_size;
     return true;
 }
 
+extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *config, PipelineContract *out) {
+    if (out == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    if (config == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+
+    // The same two steps the program bind path runs, so both entries accept the
+    // same configs and request the same three sizes.
+    ArenaSizingConfig sizing;
+    if (!resolve_arena_sizing(
+            config->runtime_env.ring_task_window, config->runtime_env.ring_heap, config->runtime_env.ring_dep_pool,
+            &sizing
+        )) {
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    }
+    ArenaStaticSizes sizes;
+    if (!derive_arena_static_sizes(sizing, &sizes)) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+
+    // TASK_ARGS covers this runtime's current per-run host argument storage and
+    // nothing else. A full device publication needs more than this — banked
+    // launch state and device KernelArgs, handshake and domain control, a
+    // graph's stable update slot with its versions and staging, and resident
+    // profiling metadata — each of which is accounted for where it is
+    // established. These six entries are not a complete capacity manifest.
+    const PipelineContract candidate = {
+        PTO_PIPELINE_CONTRACT_ABI_VERSION,
+        6,
+        2,
+        {
+            {PTO_PIPELINE_TASK_ARGS, PTO_PIPELINE_HOST_PER_RUN, sizeof(ChipStorageTaskArgs)},
+            {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_DEVICE_SCRATCH, sizes.total_heap},
+            {PTO_PIPELINE_GM_SM, PTO_PIPELINE_DEVICE_SCRATCH, sizes.sm_size},
+            {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_DEVICE_SCRATCH, sizes.runtime_image_size},
+            {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
+            {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
+        }
+    };
+    if (!is_valid_tmr_kernel_pipeline_contract(&candidate)) return PTO_RUNTIME_ERR_INTERNAL;
+    *out = candidate;
+    return 0;
+}
+
 // per-run: the only signature-aware step. Copy the orch args, replacing each
-// host tensor pointer with a freshly staged device pointer (H2D copy-in, or an
-// on-device zero for pure-OUTPUT buffers), and record the host/device pair for
+// host tensor pointer with one sliced from the retained temporary buffer (H2D
+// copy-in, or nothing at all for pure-OUTPUT buffers), and record the host/device pair for
 // copy-back. Read-only INPUT tensors skip copy-back. When `bump` is non-null,
 // ordinary non-child tensors are sliced from the runner's retained temporary
 // buffer (released as a no-op — the buffer is reused across runs); otherwise
 // each is device_malloc'd and freed in validate. On failure the partially
-// staged device_args / tensor_leases_ stay owned by the caller's Runtime.
-static bool stage_device_args(
+// copied-in device_args / tensor_leases_ stay owned by the caller's Runtime.
+static bool copy_in_device_args(
     Runtime *runtime, const HostApi *api, const ChipStorageTaskArgs *orch_args, const ArgDirection *signature,
     int sig_count, RetainedTempBump *bump, ChipStorageTaskArgs *out
 ) {
@@ -530,7 +522,10 @@ static bool stage_device_args(
             dev_ptr = bump->acquire(size);
             release_kind = TensorReleaseKind::BufferNoop;
             if (dev_ptr == nullptr) {
-                LOG_ERROR("Retained temp buffer slice failed for tensor %d: tensor bytes=%zu", i, size);
+                LOG_ERROR(
+                    "Retained temp buffer slice miss for tensor %d: bytes=%zu offset=%zu capacity=%zu", i, size,
+                    bump->next_offset(), bump->capacity()
+                );
                 return false;
             }
         } else {
@@ -542,14 +537,14 @@ static bool stage_device_args(
         }
 
         // Pure write-only OUTPUT buffers are never read by the kernel and hold
-        // no meaningful host content, so they need no device staging — the
+        // no meaningful host content, so they need no copy-in — the
         // kernel defines what it writes and any unwritten bytes are undefined.
-        // IN / INOUT (read-before-write) are staged H2D.
+        // IN / INOUT (read-before-write) are copied in H2D.
         bool is_pure_output = (signature != nullptr && i < sig_count && signature[i] == ArgDirection::OUT);
         if (!is_pure_output) {
             int rc = api->copy_to_device(dev_ptr, host_ptr, size);
             if (rc != 0) {
-                LOG_ERROR("Failed to stage tensor %d to device", i);
+                LOG_ERROR("Failed to copy tensor %d in to the device", i);
                 if (release_kind == TensorReleaseKind::Free) {
                     api->device_free(dev_ptr);
                 }
@@ -592,18 +587,12 @@ static void apply_orch_sched_env_flags(Runtime *runtime) {
 // per-(cid,config): reserve and acquire the static device pools. GM heap, shared memory
 // shared memory, and the prebuilt runtime arena all live in one backing
 // allocation; setup_static_arena reserves the three regions and commits in one
-// shot. The runtime-arena size is recovered by replaying the (pure, cheap)
-// reserve sequence on a throwaway host arena. Idempotent across runs — the
-// pools are owned by DeviceRunner and freed in DeviceRunner::finalize().
-static bool ensure_static_arenas(
-    const HostApi *api, const ArenaSizingConfig &sizing, const ArenaStaticSizes &sizes, StaticArenaPtrs *out
-) {
-    DeviceArena sizing_arena;  // discarded; only its computed arena_size is read
-    RuntimeArenaLayout layout =
-        runtime_reserve_layout(sizing_arena, sizing.task_window_sizes, sizing.heap_sizes, sizing.dep_pool_capacities);
-
+// shot, at the sizes derive_arena_static_sizes already resolved. Idempotent
+// across runs — the pools are owned by DeviceRunner and freed in
+// DeviceRunner::finalize().
+static bool ensure_static_arenas(const HostApi *api, const ArenaStaticSizes &sizes, StaticArenaPtrs *out) {
     int64_t t_setup_start = _now_ms();
-    if (api->setup_static_arena(sizes.total_heap, sizes.sm_size, layout.offsets.arena_size) != 0) {
+    if (api->setup_static_arena(sizes.total_heap, sizes.sm_size, sizes.runtime_image_size) != 0) {
         LOG_ERROR("Failed to setup pooled static arena");
         return false;
     }
@@ -731,7 +720,7 @@ static bool build_and_cache_prebuilt_arena(
     }
 
     StaticArenaPtrs ptrs;
-    if (!ensure_static_arenas(api, sizing, sizes, &ptrs)) {
+    if (!ensure_static_arenas(api, sizes, &ptrs)) {
         return false;
     }
 
@@ -769,7 +758,7 @@ static bool build_and_cache_prebuilt_arena(
  * half runs only once per callable_id.
  *
  * Orchestrates the three lifecycles behind the bind: per-config arena sizing
- * (resolve_arena_sizing) + per-run args (stage_device_args) + the prebuilt
+ * (resolve_arena_sizing) + per-run args (copy_in_device_args) + the prebuilt
  * runtime-arena image (build_and_cache_prebuilt_arena on a cache miss, then
  * bind_cached_runtime_image wires the pointers onto the runtime).
  *
@@ -820,16 +809,18 @@ extern "C" int bind_callable_to_runtime_impl(
     // the runner across runs; here we grow it to this run's packed size and
     // bump-slice from it.
     RetainedTempBump bump;
-    if (!bump.begin(api, orch_args)) {
+    const size_t required_temp_bytes = packed_temp_bytes(orch_args);
+    if (!bump.begin(api, required_temp_bytes)) {
+        LOG_ERROR("Retained temp buffer grow failed: required bytes %zu", required_temp_bytes);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     auto bind_cleanup = RAIIScopeGuard([&]() {
-        release_tensor_leases(runtime, api);
+        release_run_tensor_leases(runtime, api);
     });
 
     ChipStorageTaskArgs device_args;
-    if (!stage_device_args(runtime, api, orch_args, signature, sig_count, &bump, &device_args)) {
+    if (!copy_in_device_args(runtime, api, orch_args, signature, sig_count, &bump, &device_args)) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
@@ -866,7 +857,7 @@ extern "C" int bind_callable_to_runtime_impl(
 
     int64_t t_total_end = _now_ms();
     LOG_INFO("TIMING: prebuilt_runtime_arena = %" PRId64 "ms", t_prebuilt_end - t_prebuilt_start);
-    LOG_INFO("TIMING: total_init_runtime_impl = %" PRId64 "ms", t_total_end - t_total_start);
+    LOG_INFO("TIMING: total_bind = %" PRId64 "ms", t_total_end - t_total_start);
 
     bind_cleanup.dismiss();
     return 0;
@@ -1001,7 +992,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
 
     // Cleanup device tensors
     LOG_INFO("=== Cleaning Up ===");
-    release_tensor_leases(runtime, api);
+    release_run_tensor_leases(runtime, api);
 
     LOG_INFO("=== Finalize Complete ===");
 

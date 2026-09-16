@@ -87,14 +87,17 @@ TEST(PipelineContract, AcceptsDepthTwoAndDerivesResourceCopies) {
     PipelineContract c = accepted_contract();
     c.pipeline_depth = 2;
     ASSERT_TRUE(is_valid_pipeline_contract(&c));
-    EXPECT_EQ(pipeline_resource_copy_count(c, c.resources[0]), 2u);
-    EXPECT_EQ(pipeline_resource_copy_count(c, c.resources[1]), 1u);
-    EXPECT_EQ(pipeline_resource_copy_count(c, c.resources[2]), 2u);
+    // Only a host-filled region is replicated per in-flight run. A device
+    // scratch region is reused across runs, and an execution handle is held
+    // for the runner's lifetime, so both stay at one.
+    EXPECT_EQ(pipeline_resource_copy_count(c, c.resources[0]), 2u);  // TASK_ARGS, HOST_PER_RUN
+    EXPECT_EQ(pipeline_resource_copy_count(c, c.resources[1]), 1u);  // RUNTIME_IMAGE, DEVICE_SCRATCH
+    EXPECT_EQ(pipeline_resource_copy_count(c, c.resources[2]), 1u);  // AICPU_STREAM, EXEC_HANDLE
 
     const PipelineSlotLease second_slot{1, 0, 7};
     EXPECT_EQ(pipeline_resource_slot(c, c.resources[0], second_slot), 1u);
     EXPECT_EQ(pipeline_resource_slot(c, c.resources[1], second_slot), 0u);
-    EXPECT_EQ(pipeline_resource_slot(c, c.resources[2], second_slot), 1u);
+    EXPECT_EQ(pipeline_resource_slot(c, c.resources[2], second_slot), 0u);
 }
 
 TEST(PipelineContract, RejectsDepthOutsideSupportedRange) {
@@ -219,6 +222,111 @@ TEST(PipelineContract, ShippedArenaTopologiesAreServiceable) {
     tmr.resources[1] = {PTO_PIPELINE_GM_SM, PTO_PIPELINE_DEVICE_SCRATCH, 0};
     tmr.resources[2] = {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_DEVICE_SCRATCH, 0};
     EXPECT_TRUE(has_serviceable_arena_topology(tmr));
+}
+
+PipelineContract kernel_contract() {
+    PipelineContract c{PTO_PIPELINE_CONTRACT_ABI_VERSION, 6, 2, {}};
+    for (uint32_t kind = PTO_PIPELINE_GM_HEAP; kind <= PTO_PIPELINE_RUNTIME_IMAGE; ++kind) {
+        c.resources[kind - 1] = {kind, PTO_PIPELINE_DEVICE_SCRATCH, 4096};
+    }
+    c.resources[3] = {PTO_PIPELINE_TASK_ARGS, PTO_PIPELINE_HOST_PER_RUN, 4096};
+    c.resources[4] = {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0};
+    c.resources[5] = {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0};
+    return c;
+}
+
+TEST(PipelineContract, KernelByteRulesAreModeSpecific) {
+    auto c = kernel_contract();
+    EXPECT_TRUE(is_valid_pipeline_contract(&c, SIMPLER_MODE_KERNEL));
+    EXPECT_TRUE(is_valid_tmr_kernel_pipeline_contract(&c));
+    EXPECT_FALSE(is_valid_pipeline_contract(&c));
+    EXPECT_FALSE(is_valid_pipeline_contract(&c, 99u));
+    EXPECT_FALSE(is_valid_pipeline_contract(&c, UINT32_MAX));
+    EXPECT_FALSE(is_valid_pipeline_contract(nullptr, SIMPLER_MODE_KERNEL));
+    for (uint32_t i = 0; i < c.resource_count; ++i) {
+        auto invalid = c;
+        invalid.resources[i].bytes_per_copy = i < 4 ? 0 : 1;
+        EXPECT_FALSE(is_valid_pipeline_contract(&invalid, SIMPLER_MODE_KERNEL)) << i;
+    }
+}
+
+TEST(PipelineContract, KernelRequiresExactlyItsSupportedResourceShape) {
+    const auto c = kernel_contract();
+    for (uint32_t i = 0; i < c.resource_count; ++i) {
+        auto missing = c;
+        missing.resources[i] = missing.resources[--missing.resource_count];
+        EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(&missing)) << i;
+        auto wrong_class = c;
+        wrong_class.resources[i].resource_class = (wrong_class.resources[i].resource_class + 1) % 3;
+        EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(&wrong_class)) << i;
+        auto duplicate = c;
+        duplicate.resources[i] = duplicate.resources[(i + 1) % c.resource_count];
+        EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(&duplicate)) << i;
+    }
+    auto invalid = c;
+    // Depth is the runtime's choice across the supported range; the validator
+    // bounds it rather than fixing it. What a given depth costs, and how a
+    // captured graph maps its calls onto banks, are decided where the resources
+    // are established, not here.
+    invalid.pipeline_depth = 1;
+    EXPECT_TRUE(is_valid_tmr_kernel_pipeline_contract(&invalid));
+    invalid.pipeline_depth = 0;
+    EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(&invalid));
+    invalid.pipeline_depth = PTO_PIPELINE_MAX_DEPTH + 1;
+    EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(&invalid));
+    invalid = c;
+    invalid.resource_count = PTO_PIPELINE_MAX_RESOURCES + 1;
+    EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(&invalid));
+    EXPECT_FALSE(has_serviceable_stream_topology(invalid));
+    EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(nullptr));
+}
+
+TEST(PipelineContract, TmrRequiredKindsAreOrderIndependentAndRejectExtraArgs) {
+    auto c = kernel_contract();
+    const auto first = c.resources[0];
+    c.resources[0] = c.resources[3];
+    c.resources[3] = first;
+    EXPECT_TRUE(is_valid_tmr_kernel_pipeline_contract(&c));
+    c.resources[c.resource_count++] = c.resources[0];
+    ASSERT_TRUE(is_valid_pipeline_contract(&c, SIMPLER_MODE_KERNEL));
+    ASSERT_TRUE(has_serviceable_arena_topology(c));
+    ASSERT_TRUE(has_serviceable_stream_topology(c));
+    EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(&c));
+}
+
+TEST(PipelineContract, StreamServiceabilityDoesNotChangeStructuralRules) {
+    auto c = accepted_contract();
+    EXPECT_TRUE(has_serviceable_stream_topology(c));
+    c.pipeline_depth = 2;
+    EXPECT_TRUE(has_serviceable_stream_topology(c));
+    c.resources[3].kind = PTO_PIPELINE_AICPU_STREAM;
+    EXPECT_TRUE(is_valid_pipeline_contract(&c));
+    EXPECT_TRUE(has_serviceable_arena_topology(c));
+    EXPECT_FALSE(has_serviceable_stream_topology(c));
+    c = accepted_contract();
+    c.resources[2].resource_class = PTO_PIPELINE_HOST_PER_RUN;
+    EXPECT_FALSE(has_serviceable_stream_topology(c));
+    c.resource_count = 0;
+    EXPECT_TRUE(is_valid_pipeline_contract(&c));
+    EXPECT_FALSE(has_serviceable_stream_topology(c));
+}
+
+TEST(PipelineContract, CommonKernelAdmissionDoesNotRequireTmrResourceSet) {
+    const PipelineContract c{
+        PTO_PIPELINE_CONTRACT_ABI_VERSION,
+        4,
+        1,
+        {
+            {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_HOST_PER_RUN, 4096},
+            {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_HOST_PER_RUN, 4096},
+            {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
+            {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
+        }
+    };
+    ASSERT_TRUE(is_valid_pipeline_contract(&c, SIMPLER_MODE_KERNEL));
+    EXPECT_TRUE(has_serviceable_arena_topology(c));
+    EXPECT_TRUE(has_serviceable_stream_topology(c));
+    EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(&c));
 }
 
 TEST(PipelineSlotPool, DepthOneKeepsLegacySingleSlotBehavior) {

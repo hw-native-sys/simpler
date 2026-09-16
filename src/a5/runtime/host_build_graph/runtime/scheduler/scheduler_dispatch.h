@@ -35,29 +35,6 @@ inline __aicore__ void scheduler_deferred_aiv_pop_front(SchedulerDeferredAivQueu
     queue->entries[queue->count] = {};
 }
 
-struct SchedulerNormalDispatchTiming {
-    uint64_t probe_cycles[SCHEDULER_CORE_TYPE_COUNT]{};
-    uint64_t claim_cycles[SCHEDULER_CORE_TYPE_COUNT]{};
-    uint64_t prepare_cycles[SCHEDULER_CORE_TYPE_COUNT]{};
-    uint64_t materialize_cycles[SCHEDULER_CORE_TYPE_COUNT]{};
-    uint64_t publish_cycles[SCHEDULER_CORE_TYPE_COUNT]{};
-};
-
-inline __aicore__ uint64_t
-scheduler_normal_dispatch_detail_cycles(const SchedulerNormalDispatchTiming &timing, uint32_t core_type) {
-    return timing.claim_cycles[core_type] + timing.prepare_cycles[core_type] + timing.materialize_cycles[core_type] +
-           timing.publish_cycles[core_type];
-}
-
-inline __aicore__ void scheduler_finish_normal_dispatch_stage(
-    SchedulerNormalDispatchTiming *timing, uint32_t core_type, uint64_t stage_start, uint64_t detail_start
-) {
-    if (timing == nullptr) return;
-    uint64_t stage_cycles = scheduler_cycles() - stage_start;
-    uint64_t detail_cycles = scheduler_normal_dispatch_detail_cycles(*timing, core_type) - detail_start;
-    timing->probe_cycles[core_type] += stage_cycles > detail_cycles ? stage_cycles - detail_cycles : 0;
-}
-
 inline __aicore__ bool scheduler_normal_aiv_worker_precedes(
     uint32_t candidate_occupied_slots, bool candidate_is_scheduler, uint32_t selected_occupied_slots,
     bool selected_is_scheduler
@@ -70,15 +47,13 @@ inline __aicore__ bool scheduler_normal_aiv_worker_precedes(
 inline __aicore__ bool scheduler_fill_cluster_normal_slots(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *scheduler,
     __gm__ SchedulerRunControl *run_control, uint64_t *ready_victim_cursors, SchedulerReadyStats *ready_stats,
-    uint64_t profiling_level, uint64_t skip_slot_mask = 0, SchedulerNormalDispatchTiming *timing = nullptr,
-    SchedulerDeferredAivQueue *deferred_aiv = nullptr, __gm__ SchedulerReadyOwnerState *owner_state = nullptr,
-    bool *failed = nullptr
+    uint64_t profiling_level, uint64_t skip_slot_mask = 0, SchedulerDeferredAivQueue *deferred_aiv = nullptr,
+    __gm__ SchedulerReadyOwnerState *owner_state = nullptr, bool *failed = nullptr
 ) {
     if (failed != nullptr) *failed = false;
     if (scheduler->is_scheduler == 0) return false;
     const uint32_t aic_core_type = static_cast<uint32_t>(CoreType::AIC);
-    uint64_t stage_start = timing == nullptr ? 0 : scheduler_cycles();
-    uint64_t detail_start = timing == nullptr ? 0 : scheduler_normal_dispatch_detail_cycles(*timing, aic_core_type);
+    uint64_t state_probe_start_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
     bool progress = false;
 
     // AIC has no peer lane in its Cluster, so preserve the existing slot order.
@@ -104,17 +79,17 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
                 SchedulerReadyClaim ready{};
                 if (!scheduler_claim_ready_for_slot(
                         graph, scheduler_state_base, scheduler, run_control, scheduler->scheduler_count, aic_core_type,
-                        &ready_victim_cursors[aic_core_type], ready_stats, &ready, owner_state, profiling_level
+                        &ready_victim_cursors[aic_core_type], ready_stats, &ready, owner_state
                     )) {
                     if (failed != nullptr) *failed = true;
                     return progress;
                 }
-                if (timing != nullptr && ready.claim_end_cycles >= ready.claim_start_cycles)
-                    timing->claim_cycles[aic_core_type] += ready.claim_end_cycles - ready.claim_start_cycles;
                 if (ready.task_id < 0) {
                     aic_ready_available = false;
                     break;
                 }
+                ready.state_probe_start_cycles = state_probe_start_cycles;
+                ready.state_probe_end_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
                 SchedulerFreeSlotClaim claim{
                     worker_id,
                     pending_slot,
@@ -124,25 +99,17 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
                     slot->publication,
                     scheduler_dispatch_publication(claim.generation, SchedulerDispatchSlotState::FILLING)
                 );
-                SchedulerDispatchFillTiming fill_timing{};
                 if (!scheduler_fill_dispatch_slot(
-                        graph, scheduler_state_base, scheduler, run_control, claim, ready, profiling_level,
-                        timing == nullptr ? nullptr : &fill_timing
+                        graph, scheduler_state_base, scheduler, run_control, claim, ready, profiling_level
                     )) {
                     if (failed != nullptr) *failed = true;
                     return progress;
                 }
-                if (timing != nullptr) {
-                    timing->prepare_cycles[aic_core_type] += fill_timing.prepare_cycles;
-                    timing->materialize_cycles[aic_core_type] += fill_timing.materialize_cycles;
-                    timing->publish_cycles[aic_core_type] += fill_timing.publish_cycles;
-                }
                 progress = true;
+                state_probe_start_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
             }
         }
     }
-    scheduler_finish_normal_dispatch_stage(timing, aic_core_type, stage_start, detail_start);
-
     // A Scheduler shares its AIV with Executor work. Exhaust the non-Scheduler
     // peer's free slots first, then claim more work only against reserved
     // Scheduler capacity. The caller decides the reserved work's owner after
@@ -155,8 +122,7 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
         bool is_scheduler{false};
     };
     const uint32_t aiv_core_type = static_cast<uint32_t>(CoreType::AIV);
-    stage_start = timing == nullptr ? 0 : scheduler_cycles();
-    detail_start = timing == nullptr ? 0 : scheduler_normal_dispatch_detail_cycles(*timing, aiv_core_type);
+    state_probe_start_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
     if (scheduler_ready_directory_nonempty(
             scheduler_state_base, scheduler, scheduler->scheduler_count, aiv_core_type
         )) {
@@ -226,7 +192,7 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
             SchedulerReadyClaim ready{};
             if (!scheduler_claim_ready_for_slot(
                     graph, scheduler_state_base, scheduler, run_control, scheduler->scheduler_count, aiv_core_type,
-                    &ready_victim_cursors[aiv_core_type], ready_stats, &ready, owner_state, profiling_level
+                    &ready_victim_cursors[aiv_core_type], ready_stats, &ready, owner_state
                 )) {
                 scheduler_gm_store(
                     slot->publication,
@@ -235,8 +201,6 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
                 if (failed != nullptr) *failed = true;
                 return progress;
             }
-            if (timing != nullptr && ready.claim_end_cycles >= ready.claim_start_cycles)
-                timing->claim_cycles[aiv_core_type] += ready.claim_end_cycles - ready.claim_start_cycles;
             if (ready.task_id < 0) {
                 scheduler_gm_store(
                     slot->publication,
@@ -244,30 +208,28 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
                 );
                 break;
             }
+            ready.state_probe_start_cycles = state_probe_start_cycles;
             if (worker.is_scheduler) {
-                deferred_aiv->entries[deferred_aiv->count++] = {ready, claim};
+                SchedulerDeferredAivDispatch &entry = deferred_aiv->entries[deferred_aiv->count++];
+                entry = {ready, claim};
                 ++worker.occupied_slots;
                 progress = true;
+                state_probe_start_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
+                entry.ready.state_probe_end_cycles = state_probe_start_cycles;
                 continue;
             }
-            SchedulerDispatchFillTiming fill_timing{};
+            ready.state_probe_end_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
             if (!scheduler_fill_dispatch_slot(
-                    graph, scheduler_state_base, scheduler, run_control, claim, ready, profiling_level,
-                    timing == nullptr ? nullptr : &fill_timing
+                    graph, scheduler_state_base, scheduler, run_control, claim, ready, profiling_level
                 )) {
                 if (failed != nullptr) *failed = true;
                 return progress;
             }
-            if (timing != nullptr) {
-                timing->prepare_cycles[aiv_core_type] += fill_timing.prepare_cycles;
-                timing->materialize_cycles[aiv_core_type] += fill_timing.materialize_cycles;
-                timing->publish_cycles[aiv_core_type] += fill_timing.publish_cycles;
-            }
             ++worker.occupied_slots;
             progress = true;
+            state_probe_start_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
         }
     }
-    scheduler_finish_normal_dispatch_stage(timing, aiv_core_type, stage_start, detail_start);
     return progress;
 }
 
@@ -318,8 +280,7 @@ inline __aicore__ bool scheduler_drain_deferred_aiv_to_peer(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *scheduler,
     __gm__ SchedulerRunControl *run_control, SchedulerDeferredAivQueue *queue, SchedulerWakeStats *wake_stats,
     SchedulerReadyStats *ready_stats, SchedulerCompletionStats *completion_stats, uint64_t profiling_level,
-    SchedulerCompletionServiceTiming *completion_timing = nullptr,
-    SchedulerNormalDispatchTiming *dispatch_timing = nullptr, __gm__ SchedulerReadyOwnerState *owner_state = nullptr
+    __gm__ SchedulerReadyOwnerState *owner_state = nullptr
 ) {
     if (queue == nullptr || queue->count == 0) return true;
     const int32_t peer_lane = scheduler_deferred_aiv_peer_lane(scheduler_state_base, scheduler);
@@ -330,7 +291,6 @@ inline __aicore__ bool scheduler_drain_deferred_aiv_to_peer(
     const uint64_t peer_worker_id = scheduler->cluster_worker_ids[static_cast<uint32_t>(peer_lane)];
     __gm__ SchedulerCompletionInbox *completion_line =
         scheduler_completion_inbox_at(scheduler_state_base, scheduler, peer_worker_id);
-    const uint32_t aiv_core_type = static_cast<uint32_t>(CoreType::AIV);
 
     for (uint32_t pass = 0; pass < 2 && queue->count != 0; ++pass) {
         const uint64_t completed_generations =
@@ -349,18 +309,12 @@ inline __aicore__ bool scheduler_drain_deferred_aiv_to_peer(
                     peer_slot->publication,
                     scheduler_dispatch_publication(generation, SchedulerDispatchSlotState::FILLING)
                 );
-                SchedulerDispatchFillTiming fill_timing{};
                 if (!scheduler_fill_dispatch_slot(
                         graph, scheduler_state_base, scheduler, run_control,
                         SchedulerFreeSlotClaim{peer_worker_id, pending_slot, generation}, queue->entries[0].ready,
-                        profiling_level, dispatch_timing == nullptr ? nullptr : &fill_timing
+                        profiling_level
                     ))
                     return false;
-                if (dispatch_timing != nullptr) {
-                    dispatch_timing->prepare_cycles[aiv_core_type] += fill_timing.prepare_cycles;
-                    dispatch_timing->materialize_cycles[aiv_core_type] += fill_timing.materialize_cycles;
-                    dispatch_timing->publish_cycles[aiv_core_type] += fill_timing.publish_cycles;
-                }
                 refilled = true;
             } else {
                 if (state != SchedulerDispatchSlotState::READY) continue;
@@ -372,7 +326,7 @@ inline __aicore__ bool scheduler_drain_deferred_aiv_to_peer(
                 if (!scheduler_service_cluster_completion_slot(
                         graph, scheduler_state_base, scheduler, run_control, static_cast<uint32_t>(peer_lane),
                         pending_slot, completed_generation, wake_stats, ready_stats, completion_stats, nullptr,
-                        profiling_level, &queue->entries[0].ready, &refilled, completion_timing, owner_state
+                        profiling_level, &queue->entries[0].ready, &refilled, owner_state
                     ) ||
                     !refilled)
                     return false;
@@ -390,7 +344,7 @@ inline __aicore__ bool scheduler_drain_deferred_aiv_to_peer(
 inline __aicore__ bool scheduler_publish_deferred_aiv_local(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *scheduler,
     __gm__ SchedulerRunControl *run_control, SchedulerDeferredAivQueue *queue, uint64_t profiling_level,
-    uint32_t *published_slot, SchedulerNormalDispatchTiming *timing = nullptr
+    uint32_t *published_slot
 ) {
     if (published_slot != nullptr) *published_slot = UINT32_MAX;
     if (queue == nullptr || queue->count == 0) return true;
@@ -417,18 +371,10 @@ inline __aicore__ bool scheduler_publish_deferred_aiv_local(
         );
         return false;
     }
-    const uint32_t aiv_core_type = static_cast<uint32_t>(CoreType::AIV);
-    SchedulerDispatchFillTiming fill_timing{};
     if (!scheduler_fill_dispatch_slot(
-            graph, scheduler_state_base, scheduler, run_control, entry.reserved_slot, entry.ready, profiling_level,
-            timing == nullptr ? nullptr : &fill_timing
+            graph, scheduler_state_base, scheduler, run_control, entry.reserved_slot, entry.ready, profiling_level
         ))
         return false;
-    if (timing != nullptr) {
-        timing->prepare_cycles[aiv_core_type] += fill_timing.prepare_cycles;
-        timing->materialize_cycles[aiv_core_type] += fill_timing.materialize_cycles;
-        timing->publish_cycles[aiv_core_type] += fill_timing.publish_cycles;
-    }
     if (published_slot != nullptr) *published_slot = entry.reserved_slot.slot_index;
     scheduler_deferred_aiv_pop_front(queue);
     return true;

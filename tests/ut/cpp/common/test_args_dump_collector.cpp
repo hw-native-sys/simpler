@@ -49,7 +49,7 @@ TEST(ArgsDumpCollectorTest, MergesConcurrentShardRecordsIntoManifest) {
     constexpr int kShardCount = DumpModule::kMaxCollectorThreads;
     ArgsDumpCollector collector;
     collector.begin_run(test_dir.string(), DumpArgsLevel::HYBRID);
-    ASSERT_EQ(collector.initialize(kShardCount, 0, test_alloc, nullptr, test_free), 0);
+    ASSERT_EQ(collector.initialize(kShardCount, 0, DumpArgsLevel::HYBRID, test_alloc, nullptr, test_free), 0);
 
     std::vector<DumpMetaBuffer> buffers(kShardCount);
     std::atomic<int> ready_workers{0};
@@ -90,7 +90,12 @@ TEST(ArgsDumpCollectorTest, MergesConcurrentShardRecordsIntoManifest) {
     std::ifstream manifest_file(manifest_path);
     ASSERT_TRUE(manifest_file.is_open());
     const std::string manifest{std::istreambuf_iterator<char>(manifest_file), std::istreambuf_iterator<char>()};
-    EXPECT_NE(manifest.find("\"dump_args_level\": 3"), std::string::npos);
+    // Derived from the enum rather than spelled as a literal: the manifest
+    // records the mode's wire value, and the check is that the run's mode
+    // round-trips, not that it holds any particular number.
+    const std::string expected_level =
+        "\"dump_args_level\": " + std::to_string(static_cast<uint32_t>(DumpArgsLevel::HYBRID));
+    EXPECT_NE(manifest.find(expected_level), std::string::npos);
     EXPECT_NE(manifest.find("\"bin_file\": null"), std::string::npos);
     EXPECT_NE(manifest.find("\"total_args\": " + std::to_string(kShardCount * kRecordsPerShard)), std::string::npos);
     EXPECT_EQ(manifest.find("\"dropped_overwrite\""), std::string::npos);
@@ -110,7 +115,7 @@ TEST(ArgsDumpCollectorTest, ArenaAckAdvancesOnlyForThreadsWhosePayloadsLanded) {
     constexpr uint64_t kPayloadSize = sizeof(uint64_t);
     TestArgsDumpCollector collector;
     collector.begin_run(test_dir.string(), DumpArgsLevel::FULL);
-    ASSERT_EQ(collector.initialize(kArenaCount, 0, test_alloc, nullptr, test_free), 0);
+    ASSERT_EQ(collector.initialize(kArenaCount, 0, DumpArgsLevel::FULL, test_alloc, nullptr, test_free), 0);
 
     auto *device_base = collector.get_dump_shm_device_ptr();
     ASSERT_NE(device_base, nullptr);
@@ -172,7 +177,7 @@ TEST(ArgsDumpCollectorTest, ArenaAckDoesNotOffsetPayloadsAcrossThreads) {
 
     TestArgsDumpCollector collector;
     collector.begin_run(test_dir.string(), DumpArgsLevel::FULL);
-    ASSERT_EQ(collector.initialize(2, 0, test_alloc, nullptr, test_free), 0);
+    ASSERT_EQ(collector.initialize(2, 0, DumpArgsLevel::FULL, test_alloc, nullptr, test_free), 0);
 
     auto *device_base = collector.get_dump_shm_device_ptr();
     ASSERT_NE(device_base, nullptr);
