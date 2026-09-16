@@ -16,6 +16,16 @@
 
 namespace pto::a2a3 {
 
+// Two translation units implement this header. aicpu_topology_probe.cpp owns
+// probe_aicpu_topology and includes the CANN driver header for it;
+// aicpu_affinity_select.cpp owns resolve_aicpu_cpu_id_base and
+// compute_allowed_cpus and includes nothing of CANN, which is what lets
+// tests/ut/cpp build them on a runner with no CANN installed.
+
+// AICPU OS IDs owned by one physical die: die N owns [N*8, N*8+8). a2a3 AICPU
+// has no SMT, so each ID is one physical core.
+constexpr int32_t kAicpuCoresPerDie = 8;
+
 struct AicpuLogicalCpu {
     // cpu_id is an AICPU OS-global affinity ID, not a die-local OCCUPY bit.
     int32_t cpu_id;

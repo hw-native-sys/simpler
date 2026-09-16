@@ -10,7 +10,7 @@
  */
 /**
  * Unit tests for a2a3 host-side AICPU affinity selection
- * (compute_allowed_cpus from src/a2a3/platform/onboard/host/aicpu_topology_probe).
+ * (src/a2a3/platform/onboard/host/aicpu_affinity_select.cpp).
  *
  * This is the regression barrier for issue #1045: AICPU survivors must all
  * land in one NUMA cluster. Moving selection host-side (PR #1119) made it a
@@ -30,9 +30,9 @@
 
 #include "aicpu_topology_probe.h"
 
-// Minimal logger stubs so aicpu_topology_probe.cpp links without pulling in
-// HostLogger. compute_allowed_cpus only emits LOG_WARN; the probe path (not
-// exercised here) also uses LOG_INFO. The unified_log symbols have C
+// Minimal logger stubs so aicpu_affinity_select.cpp links without pulling in
+// HostLogger. It reaches for only unified_log_error and unified_log_warn; the
+// rest are here to cover the whole unified_log surface. The symbols have C
 // linkage (see common/unified_log.h), so match it. No-ops — these tests
 // assert on return values, not log text.
 extern "C" {
