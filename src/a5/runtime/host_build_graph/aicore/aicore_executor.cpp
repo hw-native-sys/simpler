@@ -160,7 +160,8 @@ __aicore__ __attribute__((noinline)) void stage_task_trace_before_completion(
 __aicore__ bool bootstrap_ready_graph(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *scheduler,
     __gm__ SchedulerRunControl *run_control, uint64_t scheduler_count, SchedulerWorkerStats *stats,
-    uint64_t profiling_level, SchedulerDeferredAivQueue *deferred_aiv, __gm__ SchedulerReadyOwnerState *ready_owner
+    uint64_t profiling_level, SchedulerDeferredAivQueue *deferred_aiv, __gm__ SchedulerReadyOwnerState *ready_owner,
+    SchedulerClusterSlotState *cluster_slots
 ) {
     if (scheduler_count == 0 || scheduler->inbox_index >= scheduler_count || ready_owner == nullptr) return false;
     const bool phase_timing_enabled = scheduler_phase_timing_enabled(profiling_level);
@@ -184,14 +185,14 @@ __aicore__ bool bootstrap_ready_graph(
                         ) :
                         SchedulerRouteResult::READY_TO_ENQUEUE;
         if (route == SchedulerRouteResult::ERROR) return false;
-        if (route == SchedulerRouteResult::READY_TO_ENQUEUE &&
-            !scheduler_bootstrap_ready_batch_append(
-                scheduler_state_base, scheduler, static_cast<int64_t>(task_id),
-                &batches[scheduler_metadata_core_type_index(scheduler_metadata_single_subtask_slot(metadata
-                                                                                                       ->active_mask))],
-                phase_timing_enabled ? &stats->ready : nullptr, profiling_level
-            )) {
-            return false;
+        if (route == SchedulerRouteResult::READY_TO_ENQUEUE) {
+            const uint32_t core_type =
+                scheduler_metadata_core_type_index(scheduler_metadata_single_subtask_slot(metadata->active_mask));
+            if (!scheduler_bootstrap_ready_batch_append(
+                    scheduler_state_base, scheduler, static_cast<int64_t>(task_id), &batches[core_type],
+                    phase_timing_enabled ? &stats->ready : nullptr, profiling_level
+                ))
+                return false;
         }
         if (phase_timing_enabled) ++stats->bootstrap_task_count;
     }
@@ -249,7 +250,7 @@ __aicore__ bool bootstrap_ready_graph(
             __gm__ SchedulerDispatchSlot *slot =
                 scheduler_dispatch_slot_at(scheduler_state_base, scheduler, worker_id, slot_index);
             scheduler_observe_cache_line(slot);
-            scheduler_initialize_free_slot(slot);
+            scheduler_initialize_free_slot(slot, scheduler_local_slot_at(cluster_slots, cluster_lane, slot_index));
         }
         scheduler_gm_publish(target->bootstrap_done, UINT64_C(1));
         if (phase_timing_enabled) stats->bootstrap_target_cycles[type] += scheduler_cycles() - target_start;
@@ -265,7 +266,8 @@ __aicore__ bool bootstrap_ready_graph(
     bool fill_failed = false;
     (void)scheduler_fill_cluster_normal_slots(
         graph, scheduler_state_base, scheduler, run_control, ready_victim_cursors,
-        phase_timing_enabled ? &stats->ready : nullptr, profiling_level, 0, deferred_aiv, ready_owner, &fill_failed
+        phase_timing_enabled ? &stats->ready : nullptr, profiling_level, 0, deferred_aiv, ready_owner, &fill_failed,
+        cluster_slots
     );
     if (fill_failed) return false;
     // No peer can make progress while the launch gate is closed. Materialize
@@ -273,7 +275,8 @@ __aicore__ bool bootstrap_ready_graph(
     // never cross the bootstrap boundary.
     while (deferred_aiv != nullptr && deferred_aiv->count != 0) {
         if (!scheduler_publish_deferred_aiv_local(
-                graph, scheduler_state_base, scheduler, run_control, deferred_aiv, profiling_level, nullptr
+                graph, scheduler_state_base, scheduler, run_control, deferred_aiv, profiling_level, nullptr,
+                cluster_slots
             ))
             return false;
     }
@@ -288,7 +291,7 @@ __aicore__ bool bootstrap_ready_graph(
 __aicore__ bool run_ready_dispatch_loop(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *context,
     __gm__ SchedulerRunControl *run_control, SchedulerWorkerStats *stats, uint64_t profiling_level,
-    SchedulerDeferredAivQueue *deferred_aiv
+    SchedulerDeferredAivQueue *deferred_aiv, SchedulerClusterSlotState *cluster_slots
 ) {
     const bool task_timing_enabled = scheduler_task_timing_enabled(profiling_level);
     const bool phase_timing_enabled = scheduler_phase_timing_enabled(profiling_level);
@@ -344,13 +347,13 @@ __aicore__ bool run_ready_dispatch_loop(
             if (!scheduler_drain_deferred_aiv_to_peer(
                     graph, scheduler_state_base, context, run_control, deferred_aiv,
                     phase_timing_enabled ? &stats->wake : nullptr, phase_timing_enabled ? &stats->ready : nullptr,
-                    phase_timing_enabled ? &stats->completion : nullptr, profiling_level, ready_owner
+                    phase_timing_enabled ? &stats->completion : nullptr, profiling_level, ready_owner, cluster_slots
                 ))
                 return false;
             scheduler_progress = deferred_aiv->count != deferred_before;
             if (deferred_aiv->count != 0 && !scheduler_publish_deferred_aiv_local(
                                                 graph, scheduler_state_base, context, run_control, deferred_aiv,
-                                                profiling_level, &preferred_ready_slot
+                                                profiling_level, &preferred_ready_slot, cluster_slots
                                             ))
                 return false;
         }
@@ -359,14 +362,14 @@ __aicore__ bool run_ready_dispatch_loop(
             const bool completion_progress = scheduler_service_cluster_completions(
                 graph, scheduler_state_base, context, run_control, phase_timing_enabled ? &stats->wake : nullptr,
                 phase_timing_enabled ? &stats->ready : nullptr, phase_timing_enabled ? &stats->completion : nullptr,
-                ready_victim_cursors, profiling_level, &direct_refilled_slot_mask, ready_owner
+                ready_victim_cursors, profiling_level, &direct_refilled_slot_mask, ready_owner, cluster_slots
             );
             scheduler_progress = completion_progress;
             bool fill_failed = false;
             const bool dispatch_progress = scheduler_fill_cluster_normal_slots(
                 graph, scheduler_state_base, context, run_control, ready_victim_cursors,
                 phase_timing_enabled ? &stats->ready : nullptr, profiling_level, direct_refilled_slot_mask,
-                deferred_aiv, ready_owner, &fill_failed
+                deferred_aiv, ready_owner, &fill_failed, cluster_slots
             );
             scheduler_progress = dispatch_progress || scheduler_progress;
             if (fill_failed) return false;
@@ -375,13 +378,13 @@ __aicore__ bool run_ready_dispatch_loop(
                 if (!scheduler_drain_deferred_aiv_to_peer(
                         graph, scheduler_state_base, context, run_control, deferred_aiv,
                         phase_timing_enabled ? &stats->wake : nullptr, phase_timing_enabled ? &stats->ready : nullptr,
-                        phase_timing_enabled ? &stats->completion : nullptr, profiling_level, ready_owner
+                        phase_timing_enabled ? &stats->completion : nullptr, profiling_level, ready_owner, cluster_slots
                     ))
                     return false;
                 scheduler_progress = scheduler_progress || deferred_aiv->count != deferred_before;
                 if (deferred_aiv->count != 0 && !scheduler_publish_deferred_aiv_local(
                                                     graph, scheduler_state_base, context, run_control, deferred_aiv,
-                                                    profiling_level, &preferred_ready_slot
+                                                    profiling_level, &preferred_ready_slot, cluster_slots
                                                 ))
                     return false;
             }
@@ -483,7 +486,6 @@ __aicore__ bool run_ready_dispatch_loop(
             }
             execute_task(payload);
             uint64_t kernel_end = get_sys_cnt_aicore();
-            scheduler_publish_dispatch_payload(payload);
             __gm__ SchedulerCompletionInbox *completion_line =
                 scheduler_completion_inbox_at(scheduler_state_base, context, context->worker_index);
             uint64_t completion_start = get_sys_cnt_aicore();
@@ -608,6 +610,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     };
     SchedulerWorkerStats stats{};
     SchedulerDeferredAivQueue deferred_aiv{};
+    SchedulerClusterSlotState cluster_slots{};
     __gm__ SchedulerReadyOwnerState *ready_owner = nullptr;
     uint64_t descriptor_cache_observed_cycles = 0;
     if (context->active != 0) {
@@ -620,7 +623,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         if (context->is_scheduler != 0 &&
             !bootstrap_ready_graph(
                 graph, scheduler_state_base, context, run_control, scheduler_gm_query(run_control->scheduler_count),
-                &stats, profiling_level, &deferred_aiv, ready_owner
+                &stats, profiling_level, &deferred_aiv, ready_owner, &cluster_slots
             )) {
             scheduler_record_error(
                 run_control, SCHEDULER_TASK_ID_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
@@ -662,7 +665,8 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         write_reg(RegId::COND, AICORE_IDLE_VALUE);
         if (context->active != 0) {
             (void)run_ready_dispatch_loop(
-                graph, scheduler_state_base, context, run_control, &stats, profiling_level, &deferred_aiv
+                graph, scheduler_state_base, context, run_control, &stats, profiling_level, &deferred_aiv,
+                &cluster_slots
             );
         }
     }

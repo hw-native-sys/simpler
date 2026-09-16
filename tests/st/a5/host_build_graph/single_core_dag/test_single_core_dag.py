@@ -149,13 +149,26 @@ class TestHbgSingleCoreDag(SceneTestCase):
                 f"unexpected={sorted(set(launches_by_task) - profiled_task_ids)}"
             )
             assert set(launches_by_task.values()) == {1}
-            for kind in ("state_probe", "complete"):
-                recorded_task_ids = {int(record["task_id"]) for record in records if record["kind"] == kind}
-                assert recorded_task_ids == profiled_task_ids, (
-                    f"{kind} records do not cover every profiled task: "
-                    f"missing={sorted(profiled_task_ids - recorded_task_ids)} "
-                    f"unexpected={sorted(recorded_task_ids - profiled_task_ids)}"
-                )
+            completed_task_ids = {int(record["task_id"]) for record in records if record["kind"] == "complete"}
+            assert completed_task_ids == profiled_task_ids, (
+                "complete records do not cover every profiled task: "
+                f"missing={sorted(profiled_task_ids - completed_task_ids)} "
+                f"unexpected={sorted(completed_task_ids - profiled_task_ids)}"
+            )
+            state_probe_task_ids = {int(record["task_id"]) for record in records if record["kind"] == "state_probe"}
+            assert state_probe_task_ids <= profiled_task_ids
+            inbox_launch_task_ids = {
+                int(record["task_id"]) for record in records if record["kind"] in {"dispatch", "worksteal"}
+            }
+            assert inbox_launch_task_ids <= state_probe_task_ids, (
+                "Ready Inbox launches are missing state_probe records: "
+                f"{sorted(inbox_launch_task_ids - state_probe_task_ids)}"
+            )
+            refill_task_ids = {int(record["task_id"]) for record in records if record["kind"] == "refill"}
+            assert profiled_task_ids - state_probe_task_ids <= refill_task_ids, (
+                "tasks without state_probe were not launched by refill: "
+                f"{sorted(profiled_task_ids - state_probe_task_ids - refill_task_ids)}"
+            )
 
 
 if __name__ == "__main__":

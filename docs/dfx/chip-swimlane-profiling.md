@@ -78,12 +78,14 @@ that loads directly in Perfetto. For the scheduler-overhead deep-dive, capture
   Fanout was renamed Resolve and now also filters out <1 µs walks;
   Prestage was renamed EarlyDispatch).
   A5 `host_build_graph` uses the AICore Scheduler as the producer and emits one
-  flat lane per Scheduler. Its task-processing phases are `complete`,
-  `resolve`, `state_probe`, and exactly one of `dispatch`, `worksteal`, or
-  `refill`; the converter displays them as Completion, Resolve, StateProbe,
-  Dispatch, Worksteal, and Refill. Bootstrap ends before the initial task
-  dispatch, and its dependency initialization is not emitted again as a nested
-  `fanin` phase.
+  flat lane per Scheduler. Every executed task has exactly one publication
+  phase: `dispatch`, `worksteal`, or `refill`. Tasks acquired from a Ready Inbox
+  first emit `state_probe`; a compatible single-fanin successor selected by
+  `DIRECT_RESOLVE` moves from `resolve` directly to `refill` and emits no
+  `state_probe`. The converter displays these phases as Completion, Resolve,
+  StateProbe, Dispatch, Worksteal, and Refill. Bootstrap ends before the initial
+  task dispatch, and its dependency initialization is not emitted again as a
+  nested `fanin` phase.
 - **Orchestrator submit envelope** — one record per `submit_task()`
   / `alloc_tensors()` call covering the whole submit's
   `[start, end]` window (`orch_submit` phase). Per-sub-step
@@ -351,9 +353,9 @@ field but render differently in Perfetto:
 | `complete` | outer | sched (pid=2) | FIN'd subtasks + sub-block retires this iter; A5 HBG ends this phase before dependency resolution |
 | `async_poll` | outer | sched | async-wait completions resolved; zero means polling consumed CPU without completing work |
 | `dispatch` | outer | sched | subtasks published this iter |
-| `state_probe` | A5 HBG AICore outer | AICore Scheduler lane | Cluster Slot / Ready state checked, a Ready task acquired, and immediate or deferred placement decided |
+| `state_probe` | A5 HBG AICore outer | AICore Scheduler lane | Cluster Slot / Ready state checked, a task acquired from a Ready Inbox, and immediate or deferred placement decided |
 | `worksteal` | A5 HBG AICore outer | AICore Scheduler lane | a task acquired from another non-empty Inbox is published |
-| `refill` | A5 HBG AICore outer | AICore Scheduler lane | completed Slot reused for one replacement task |
+| `refill` | A5 HBG AICore outer | AICore Scheduler lane | completed Slot reused for one replacement task; `DIRECT_RESOLVE` omits a preceding `state_probe` |
 | `release` | outer | sched | deferred-release slots drained this iter |
 | `dummy` | outer | sched | `dummy_ready_queue` entries handled this iter (explicit dummies and false-predicate tasks) |
 | `early_dispatch` | outer | sched | blocks staged by speculative early-dispatch this pass |
@@ -382,16 +384,18 @@ Separate-lane phases are routed to a different lane by the converter
 bars even when their timestamps fall inside an outer span.
 
 For the A5 HBG AICore producer, all phases render on the single
-`Scheduler_<physical-AIV-ID>` lane. Completion, Resolve, StateProbe, and the
-selected publication phase are mutually time-exclusive. StateProbe includes
-Ready claim or steal and ends when immediate or deferred placement has been
-decided. Deferred waiting is intentionally left as an empty interval before
-the eventual Dispatch, Worksteal, or Refill. Worksteal identifies a task whose
-Ready source was another Inbox when its publication mode is not Refill; a
-completed Slot reused for a replacement task remains Refill regardless of its
-Ready source. The steal operation itself is included in StateProbe. The older
-`fanin`, `ready_claim`, `ready_steal`, and `direct_refill` records remain
-accepted only for existing captures.
+`Scheduler_<physical-AIV-ID>` lane. Completion, Resolve, StateProbe when
+present, and the selected publication phase are mutually time-exclusive.
+StateProbe includes Ready claim or steal and ends when immediate or deferred
+placement has been decided. Deferred waiting is intentionally left as an empty
+interval before the eventual Dispatch, Worksteal, or Refill. Worksteal
+identifies a task whose Ready source was another Inbox when its publication
+mode is not Refill; a completed Slot reused for a replacement task remains
+Refill regardless of its Ready source. A Ready-Inbox replacement retains its
+StateProbe, while a `DIRECT_RESOLVE` replacement proceeds directly from
+Resolve to Refill without one. The steal operation itself is included in
+StateProbe. The older `fanin`, `ready_claim`, `ready_steal`, and
+`direct_refill` records remain accepted only for existing captures.
 
 Task-bound A5 HBG Scheduler bars use the runtime task identity in their label,
 for example `StateProbe(t23)` and `Dispatch(t23)`. Bootstrap and Idle have no

@@ -464,12 +464,17 @@ processing uses flat, non-overlapping phases:
 
 - `complete` consumes a Completion Inbox entry and marks the task done.
 - `resolve` updates successor dependencies and publishes newly Ready tasks.
-- `state_probe` checks Cluster Slot / Ready state, acquires a Ready task locally
-  or by stealing, and decides immediate or deferred placement.
+- `state_probe` checks Cluster Slot / Ready state, acquires a task from a Ready
+  Inbox locally or by stealing, and decides immediate or deferred placement.
 - `dispatch` fills and publishes a task acquired from the local Inbox.
 - `worksteal` fills and publishes a task acquired from another Inbox; the steal
   operation itself is included in `state_probe`.
 - `refill` republishes a completed Slot with replacement work.
+
+A compatible single-fanin successor selected during completion resolution uses
+the `DIRECT_RESOLVE` source and moves directly from `resolve` to `refill`
+without a `state_probe`. A replacement acquired from a Ready Inbox retains its
+`state_probe` even when the completed Slot is reused through `refill`.
 
 Deferred waiting is not emitted as a Scheduler phase. The original
 `state_probe` ends before the wait, and the eventual publication begins at its

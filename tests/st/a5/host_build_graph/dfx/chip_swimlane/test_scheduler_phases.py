@@ -143,12 +143,31 @@ class TestSchedulerPhases(SceneTestCase):
                 )
                 assert set(launches_by_task) == {int(row[1]) for row in aicore_rows}
                 assert set(launches_by_task.values()) == {1}
-                probes_by_task = Counter(
+                profiled_task_ids = set(launches_by_task)
+                state_probe_task_ids = {
                     int(record["task_id"])
                     for record in records
                     if record["kind"] == "state_probe" and record["task_id"] is not None
+                }
+                assert state_probe_task_ids <= profiled_task_ids
+                inbox_launch_task_ids = {
+                    int(record["task_id"])
+                    for record in records
+                    if record["kind"] in {"dispatch", "worksteal"} and record["task_id"] is not None
+                }
+                assert inbox_launch_task_ids <= state_probe_task_ids, (
+                    "Ready Inbox launches are missing state_probe records: "
+                    f"{sorted(inbox_launch_task_ids - state_probe_task_ids)}"
                 )
-                assert probes_by_task == launches_by_task
+                refill_task_ids = {
+                    int(record["task_id"])
+                    for record in records
+                    if record["kind"] == "refill" and record["task_id"] is not None
+                }
+                assert profiled_task_ids - state_probe_task_ids <= refill_task_ids, (
+                    "tasks without state_probe were not launched by refill: "
+                    f"{sorted(profiled_task_ids - state_probe_task_ids - refill_task_ids)}"
+                )
                 for stream in streams:
                     ordered = sorted(
                         stream["records"],
@@ -169,8 +188,8 @@ class TestSchedulerPhases(SceneTestCase):
                     if record["kind"] in launch_kinds and record["task_id"] is not None
                 }
                 assert all(
-                    probe_by_task[task_id]["end_cycles"] <= launch["start_cycles"]
-                    for task_id, launch in launch_by_task.items()
+                    probe["end_cycles"] <= launch_by_task[task_id]["start_cycles"]
+                    for task_id, probe in probe_by_task.items()
                 )
             else:
                 assert "scheduler_records" not in raw

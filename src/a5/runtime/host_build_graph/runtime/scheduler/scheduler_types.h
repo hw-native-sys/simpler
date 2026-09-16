@@ -658,14 +658,13 @@ inline constexpr uint64_t SCHEDULER_READY_PENDING_EMPTY = UINT64_MAX;
 
 enum class SchedulerTaskState : int64_t {
     BLOCKED = 0,
-    READY = 1,
     DONE = 2,
-    DISPATCHING = 3,
 };
 
 enum class SchedulerReadySource : uint8_t {
     LOCAL = 0,
     STOLEN = 1,
+    DIRECT_RESOLVE = 2,
 };
 
 enum class SchedulerPublicationMode : uint8_t {
@@ -694,7 +693,6 @@ enum class SchedulerDispatchSlotState : uint8_t {
     FREE = 1,
     FILLING = 2,
     READY = 3,
-    GATED = 4,
 };
 
 enum SchedulerTaskMetadataFlags : uint8_t {
@@ -772,8 +770,8 @@ struct alignas(128) SchedulerTaskControl {
     volatile int64_t wake_list_head;
     uint8_t atomic_line_padding[48];
 
-    // next_waiter links the dependency wake list while BLOCKED and the Ready
-    // inbox after routing.
+    // next_waiter links the task only while it belongs to a dependency wake
+    // list or Ready inbox; its value is unspecified in all other states.
     int64_t next_waiter;
     int32_t next_fanin_index;
     int32_t waiting_producer;
@@ -964,7 +962,6 @@ enum class SchedulerErrorSite : uint64_t {
     COMPLETION_RESOLVE_FAILED = 68,
     COMPLETION_REFILL_CLAIM_FAILED = 69,
     COMPLETION_REFILL_DISPATCH_FAILED = 70,
-    COMPLETION_UNEXPECTED_GANG_SLOT = 73,
     COMPLETION_GENERATION_MISMATCH = 74,
     DEFERRED_RESERVATION_INVALID_OWNER = 75,
     DEFERRED_RESERVATION_INVALID_STATE = 76,

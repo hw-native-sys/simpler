@@ -195,7 +195,7 @@ void enqueue_normal_aiv_tasks(
     for (uint64_t task = task_begin; task < task_end; ++task) {
         auto *control =
             scheduler_task_control_at(storage.scheduler_state->base(), &scheduler, static_cast<int64_t>(task));
-        control->state = static_cast<int64_t>(SchedulerTaskState::READY);
+        control->state = static_cast<int64_t>(SchedulerTaskState::BLOCKED);
         ASSERT_TRUE(scheduler_ready_batch_append(
             storage.scheduler_state->base(), &scheduler, static_cast<int64_t>(task), &batch, &ready_stats
         ));
@@ -240,7 +240,7 @@ prepare_completed_normal_slot(FixtureStorage &storage, SchedulerWorkerContext &s
     auto *completion_line = scheduler_completion_inbox_at(storage.scheduler_state->base(), &scheduler, worker_id);
     completion_line->completed_generations[0] = slot->generation;
     auto *control = scheduler_task_control_at(storage.scheduler_state->base(), &scheduler, 0);
-    control->state = static_cast<int64_t>(SchedulerTaskState::READY);
+    control->state = static_cast<int64_t>(SchedulerTaskState::BLOCKED);
     return slot;
 }
 
@@ -278,7 +278,7 @@ TEST(SchedulerClusterCompletion, SpscGenerationCompletesNormalTask) {
     auto *completion_line = scheduler_completion_inbox_at(storage.scheduler_state->base(), &scheduler, 0);
     completion_line->completed_generations[0] = slot->generation;
     auto *control = scheduler_task_control_at(storage.scheduler_state->base(), &scheduler, 0);
-    control->state = static_cast<int64_t>(SchedulerTaskState::READY);
+    control->state = static_cast<int64_t>(SchedulerTaskState::BLOCKED);
     SchedulerWakeStats wake_stats{};
     SchedulerReadyStats ready_stats{};
     SchedulerCompletionStats completion_stats{};
@@ -322,34 +322,6 @@ TEST(SchedulerClusterCompletion, RejectsStaleCompletionGenerationAtNamedSite) {
     ));
     EXPECT_EQ(
         storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::COMPLETION_GENERATION_MISMATCH)
-    );
-}
-
-TEST(SchedulerClusterCompletion, RejectsUnexpectedGangSlotAtNamedSite) {
-    FixtureStorage storage(1, 3);
-    GraphBuffer graph(1);
-    graph.executable(0, 0);
-    SchedulerWorkerContext &scheduler = storage.contexts[1];
-    scheduler.is_scheduler = 1;
-    scheduler.cluster_worker_ids[0] = 0;
-    auto *slot = scheduler_dispatch_slot_at(storage.scheduler_state->base(), &scheduler, 0, 0);
-    scheduler_initialize_free_slot(slot);
-    slot->task_id = 0;
-    slot->gang = 1;
-    scheduler_gm_store(
-        slot->publication, scheduler_dispatch_publication(slot->generation, SchedulerDispatchSlotState::READY)
-    );
-
-    SchedulerWakeStats wake_stats{};
-    SchedulerReadyStats ready_stats{};
-    SchedulerCompletionStats completion_stats{};
-    EXPECT_FALSE(scheduler_service_cluster_completion_slot(
-        graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, 0, 0, slot->generation,
-        &wake_stats, &ready_stats, &completion_stats, nullptr, false, nullptr, nullptr,
-        &storage.owner_states[scheduler.inbox_index]
-    ));
-    EXPECT_EQ(
-        storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::COMPLETION_UNEXPECTED_GANG_SLOT)
     );
 }
 
@@ -416,14 +388,18 @@ TEST(SchedulerClusterCompletion, PropagatesTraceToCompletionAndWokenTask) {
     graph.executable(0, 0);
     graph.executable(1, 0, {0});
     storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
+    storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIC);
     SchedulerWorkerContext &scheduler = storage.contexts[1];
     scheduler.is_scheduler = 1;
     scheduler.scheduler_count = 1;
     scheduler.cluster_worker_ids[0] = 0;
     scheduler.cluster_worker_ids[1] = 1;
     scheduler.cluster_worker_ids[2] = 2;
+    auto *callables =
+        scheduler_state_at<uint64_t>(storage.scheduler_state->base(), storage.layout.callable_addresses_offset);
+    callables[1] = 0x1000;
     auto *producer = scheduler_task_control_at(storage.scheduler_state->base(), &scheduler, 0);
-    producer->state = static_cast<int64_t>(SchedulerTaskState::READY);
+    producer->state = static_cast<int64_t>(SchedulerTaskState::BLOCKED);
     SchedulerWakeStats wake_stats{};
     ASSERT_EQ(
         scheduler_bootstrap_route_task(
@@ -464,7 +440,12 @@ TEST(SchedulerClusterCompletion, PropagatesTraceToCompletionAndWokenTask) {
     EXPECT_EQ(traces[0].kernel_start_cycles, 100u);
     EXPECT_EQ(traces[0].kernel_end_cycles, 200u);
     auto *waiter = scheduler_task_control_at(storage.scheduler_state->base(), &scheduler, 1);
-    EXPECT_EQ(waiter->state, static_cast<int64_t>(SchedulerTaskState::READY));
+    EXPECT_EQ(waiter->state, static_cast<int64_t>(SchedulerTaskState::BLOCKED));
+    EXPECT_EQ(slot->task_id, 1);
+    EXPECT_EQ(traces[1].ready_source, static_cast<uint64_t>(SchedulerReadySource::DIRECT_RESOLVE));
+    EXPECT_EQ(traces[1].state_probe_scheduler_worker_id, UINT64_MAX);
+    EXPECT_EQ(ready_stats.enqueue_count, 0u);
+    EXPECT_EQ(wake_stats.fanin_state_load_count, 0u);
 }
 
 TEST(SchedulerClusterCompletion, CatchupRefreshIsBoundedToInitiallyEmptySibling) {
@@ -505,9 +486,9 @@ TEST(SchedulerClusterCompletion, DirectlyRefillsCompletedSlotWhenReadyTaskExists
     auto *completion_line = scheduler_completion_inbox_at(storage.scheduler_state->base(), &scheduler, 0);
     completion_line->completed_generations[0] = completed_generation;
     auto *completed_control = scheduler_task_control_at(storage.scheduler_state->base(), &scheduler, 0);
-    completed_control->state = static_cast<int64_t>(SchedulerTaskState::READY);
+    completed_control->state = static_cast<int64_t>(SchedulerTaskState::BLOCKED);
     auto *ready_control = scheduler_task_control_at(storage.scheduler_state->base(), &scheduler, 1);
-    ready_control->state = static_cast<int64_t>(SchedulerTaskState::READY);
+    ready_control->state = static_cast<int64_t>(SchedulerTaskState::BLOCKED);
     SchedulerReadyBatch batch{};
     SchedulerReadyStats ready_stats{};
     ASSERT_TRUE(scheduler_ready_batch_append(storage.scheduler_state->base(), &scheduler, 1, &batch, &ready_stats));
@@ -539,6 +520,72 @@ TEST(SchedulerClusterCompletion, DirectlyRefillsCompletedSlotWhenReadyTaskExists
     EXPECT_EQ(traces[1].publication_mode, static_cast<uint64_t>(SchedulerPublicationMode::REFILL));
     EXPECT_LE(traces[1].state_probe_start_cycles, traces[1].state_probe_end_cycles);
     EXPECT_EQ(traces[1].state_probe_end_cycles, traces[0].refill_start_cycles);
+}
+
+TEST(SchedulerClusterCompletion, UsesSchedulerLocalSlotStateWithoutRereadingDispatchMetadata) {
+    FixtureStorage storage(2, 3);
+    GraphBuffer graph(2);
+    graph.executable(0, 0);
+    graph.executable(1, 0, {0});
+    storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
+    storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIC);
+    SchedulerWorkerContext &scheduler = storage.contexts[1];
+    scheduler.is_scheduler = 1;
+    scheduler.scheduler_index = 0;
+    scheduler.scheduler_count = 1;
+    scheduler.inbox_index = 0;
+    scheduler.cluster_worker_ids[0] = 0;
+    scheduler.cluster_worker_ids[1] = 1;
+    scheduler.cluster_worker_ids[2] = 2;
+    auto *callables =
+        scheduler_state_at<uint64_t>(storage.scheduler_state->base(), storage.layout.callable_addresses_offset);
+    callables[1] = 0x1000;
+
+    SchedulerClusterSlotState cluster_slots{};
+    auto *slot = scheduler_dispatch_slot_at(storage.scheduler_state->base(), &scheduler, 0, 0);
+    SchedulerLocalSlotState *local_slot = &cluster_slots.slots[0][0];
+    scheduler_initialize_free_slot(slot, local_slot);
+    SchedulerReadyClaim producer_ready{};
+    producer_ready.task_id = 0;
+    ASSERT_TRUE(scheduler_fill_dispatch_slot(
+        graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control,
+        SchedulerFreeSlotClaim{0, 0, local_slot->generation, 0}, producer_ready, SCHEDULER_PROFILING_TASK_TIMING_LEVEL,
+        &cluster_slots
+    ));
+    ASSERT_EQ(
+        scheduler_bootstrap_route_task(
+            graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, 1, nullptr
+        ),
+        SchedulerRouteResult::WAITING
+    );
+
+    const uint32_t completed_generation = local_slot->generation;
+    slot->executor_trace.generation = completed_generation;
+    slot->executor_trace.kernel_start_cycles = 100;
+    slot->executor_trace.kernel_end_cycles = 200;
+    slot->task_id = 999;
+    slot->subtask_slot = 2;
+    slot->generation = completed_generation + 99;
+    slot->publication = scheduler_dispatch_publication(slot->generation, SchedulerDispatchSlotState::EMPTY);
+    auto *completion_line = scheduler_completion_inbox_at(storage.scheduler_state->base(), &scheduler, 0);
+    completion_line->completed_generations[0] = completed_generation;
+
+    SchedulerReadyStats ready_stats{};
+    uint64_t victim_cursors[SCHEDULER_CORE_TYPE_COUNT]{};
+    ASSERT_TRUE(scheduler_service_cluster_completions(
+        graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, nullptr, &ready_stats, nullptr,
+        victim_cursors, SCHEDULER_PROFILING_TASK_TIMING_LEVEL, nullptr, &storage.owner_states[scheduler.inbox_index],
+        &cluster_slots
+    ));
+
+    EXPECT_EQ(local_slot->task_id, 1);
+    EXPECT_EQ(local_slot->generation, completed_generation + 1);
+    EXPECT_EQ(local_slot->state, SchedulerDispatchSlotState::READY);
+    EXPECT_EQ(ready_stats.enqueue_count, 0u);
+    auto *traces =
+        scheduler_state_at<SchedulerTaskTrace>(storage.scheduler_state->base(), storage.layout.trace_cells_offset);
+    EXPECT_EQ(traces[0].kernel_start_cycles, 100u);
+    EXPECT_EQ(traces[0].kernel_end_cycles, 200u);
 }
 
 TEST(SchedulerClusterCompletion, DeferredRefillPreservesOriginalStateProbeAndReadySource) {
@@ -594,7 +641,7 @@ TEST(SchedulerNormalDispatch, FillsFreshAicSlot) {
     auto *slot = scheduler_dispatch_slot_at(storage.scheduler_state->base(), &scheduler, 0, 0);
     scheduler_initialize_free_slot(slot);
     auto *control = scheduler_task_control_at(storage.scheduler_state->base(), &scheduler, 0);
-    control->state = static_cast<int64_t>(SchedulerTaskState::READY);
+    control->state = static_cast<int64_t>(SchedulerTaskState::BLOCKED);
     SchedulerReadyBatch batch{};
     SchedulerReadyStats ready_stats{};
     ASSERT_TRUE(scheduler_ready_batch_append(storage.scheduler_state->base(), &scheduler, 0, &batch, &ready_stats));
@@ -637,7 +684,7 @@ TEST(SchedulerNormalDispatch, PreservesProgressWhenALaterFillFails) {
     SchedulerReadyStats ready_stats{};
     for (int64_t task_id = 0; task_id < 2; ++task_id) {
         auto *control = scheduler_task_control_at(storage.scheduler_state->base(), &scheduler, task_id);
-        control->state = static_cast<int64_t>(SchedulerTaskState::READY);
+        control->state = static_cast<int64_t>(SchedulerTaskState::BLOCKED);
         ASSERT_TRUE(
             scheduler_ready_batch_append(storage.scheduler_state->base(), &scheduler, task_id, &batch, &ready_stats)
         );
@@ -971,7 +1018,7 @@ TEST(SchedulerDeferredAiv, RetiresCompletedPeerAndRefillsWithoutFreeDecision) {
     occupy_normal_slot(storage, scheduler, 2, 1, SCHEDULER_TASK_ID_INVALID);
     occupy_normal_slot(storage, scheduler, 1, 1, SCHEDULER_TASK_ID_INVALID);
     auto *completed_control = scheduler_task_control_at(storage.scheduler_state->base(), &scheduler, 0);
-    completed_control->state = static_cast<int64_t>(SchedulerTaskState::READY);
+    completed_control->state = static_cast<int64_t>(SchedulerTaskState::BLOCKED);
     enqueue_normal_aiv_tasks(storage, scheduler, 1, 2);
 
     uint64_t victim_cursors[SCHEDULER_CORE_TYPE_COUNT]{};
@@ -1014,7 +1061,7 @@ TEST(SchedulerDeferredAiv, SchedulerCompletionDoesNotDirectRefillItself) {
     auto *completion_line = scheduler_completion_inbox_at(storage.scheduler_state->base(), &scheduler, 1);
     completion_line->completed_generations[0] = completed_slot->generation;
     auto *completed_control = scheduler_task_control_at(storage.scheduler_state->base(), &scheduler, 0);
-    completed_control->state = static_cast<int64_t>(SchedulerTaskState::READY);
+    completed_control->state = static_cast<int64_t>(SchedulerTaskState::BLOCKED);
     enqueue_normal_aiv_tasks(storage, scheduler, 1, 2);
 
     SchedulerWakeStats wake_stats{};

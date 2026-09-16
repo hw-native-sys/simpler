@@ -1160,7 +1160,8 @@ TEST(SchedulerReadyWake, ConcurrentRegistrationAndCloseResolveEveryConsumerExact
     EXPECT_EQ(storage.run_control->scheduler_error, 0u);
     for (uint64_t task = 1; task <= kConsumers; ++task) {
         EXPECT_EQ(seen[task].load(), 1u) << "consumer=" << task;
-        EXPECT_EQ(controls[task].next_fanin_index, 1) << "consumer=" << task;
+        EXPECT_EQ(controls[task].next_fanin_index, 0) << "consumer=" << task;
+        EXPECT_EQ(controls[task].state, static_cast<int64_t>(SchedulerTaskState::BLOCKED)) << "consumer=" << task;
     }
 }
 
