@@ -17,6 +17,7 @@
 #include "tensor.h"
 
 extern "C" void kernel_entry(int64_t *args) {
+    set_ffts_base_addr(0);
     auto *scratch = reinterpret_cast<Tensor *>(args[0]);
     auto *output = reinterpret_cast<Tensor *>(args[1]);
     const int block = get_block_idx(args);

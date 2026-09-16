@@ -360,13 +360,13 @@ class KernelCompiler:
             "core_type": core_type,
             "flags": flags,
             "linker": linker,
-            "sim_ffts": hashlib.sha256(self._sim_ffts_header().read_bytes()).hexdigest()
+            "sim_kernel_hooks": hashlib.sha256(self._sim_kernel_hooks_header().read_bytes()).hexdigest()
             if self.platform == "a2a3sim"
             else None,
         }
 
-    def _sim_ffts_header(self) -> Path:
-        return self.project_root / "src" / "a2a3" / "platform" / "sim" / "aicore" / "ffts_sim.h"
+    def _sim_kernel_hooks_header(self) -> Path:
+        return self.project_root / "src" / "common" / "platform" / "sim" / "aicore" / "sim_kernel_hooks.h"
 
     def _run_subprocess(
         self, cmd: list[str], label: str, error_hint: str = "Compiler not found"
@@ -737,8 +737,8 @@ class KernelCompiler:
             pto_pto_include = os.path.join(pto_isa_root, "include", "pto")
             cmd.extend([f"-I{compiler_visible_path(pto_include)}", f"-I{compiler_visible_path(pto_pto_include)}"])
 
-        if self.platform == "a2a3sim":
-            cmd.extend(["-include", str(compiler_visible_path(self._sim_ffts_header()))])
+        if self.platform == "a2a3sim" and pto_isa_root:
+            cmd.extend(["-include", str(compiler_visible_path(self._sim_kernel_hooks_header()))])
 
         for inc_dir in self.get_incore_include_dirs():
             cmd.append(f"-I{compiler_visible_path(inc_dir)}")

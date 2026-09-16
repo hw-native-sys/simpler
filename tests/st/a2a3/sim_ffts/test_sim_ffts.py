@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Explicit FFTS simulator synchronization across separate kernel DSOs."""
+"""PTO ISA events using the runtime's device, cluster and run storage."""
 
 import subprocess
 import sys
@@ -20,18 +20,14 @@ from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.pto_isa import ensure_pto_isa_root
 
 
-@pytest.mark.parametrize("with_pto_isa", [False, True], ids=["standalone", "pto"])
 @scene_level(SceneTestLevel.CHIP)
 @pytest.mark.platforms(["a2a3sim"])
 @pytest.mark.runtime("host_build_graph")
-def test_ffts_mode2_credits_across_kernel_dsos(tmp_path, st_platform, with_pto_isa):
+def test_ffts_runtime_storage_across_kernel_dsos(tmp_path, st_platform):
     compiler = KernelCompiler(st_platform)
-    isa = ensure_pto_isa_root() if with_pto_isa else None
+    isa = ensure_pto_isa_root()
     source_dir = Path(__file__).parent / "fixtures"
     source = source_dir / "kernel.cpp"
-    if with_pto_isa:
-        source = tmp_path / "pto_kernel.cpp"
-        source.write_text('#include <pto/pto-inst.hpp>\n#include "kernel.cpp"\n')
     libraries = []
     for core_type in ("aic", "aiv"):
         binary = compiler._compile_incore_sim(

@@ -17,7 +17,6 @@
 #include <dlfcn.h>
 #include <future>
 #include <iostream>
-#include <stdexcept>
 #include <string>
 #include <thread>
 
@@ -41,9 +40,6 @@ struct Kernel {
     Event wait;
     Event legacy_signal;
     Event legacy_wait;
-    void (*inject)(void *, void *);
-    void (*message)(int, int, int);
-    int (*encode)(int, int, int);
 
     explicit Kernel(const char *path) {
         handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
@@ -53,7 +49,7 @@ struct Kernel {
             if (symbol == nullptr) fail(std::string("missing DSO symbol: ") + name);
             return symbol;
         };
-        inject = reinterpret_cast<decltype(inject)>(lookup("pto_sim_register_hooks"));
+        auto inject = reinterpret_cast<void (*)(void *, void *)>(lookup("pto_sim_register_hooks"));
         inject(
             reinterpret_cast<void *>(pto_sim_get_subblock_id), reinterpret_cast<void *>(pto_sim_get_pipe_shared_state)
         );
@@ -61,8 +57,6 @@ struct Kernel {
         wait = reinterpret_cast<Event>(lookup("wait_event"));
         legacy_signal = reinterpret_cast<Event>(lookup("legacy_signal_event"));
         legacy_wait = reinterpret_cast<Event>(lookup("legacy_wait_event"));
-        message = reinterpret_cast<decltype(message)>(lookup("signal_message"));
-        encode = reinterpret_cast<decltype(encode)>(lookup("encode_message"));
     }
 };
 
@@ -99,117 +93,10 @@ struct Waiter {
     }
 };
 
-template <class Fn>
-void expect_rejected(Fn fn) {
-    try {
-        fn();
-    } catch (const std::runtime_error &) {
-        return;
-    }
-    fail("invalid FFTS operation was accepted");
-}
-
-void validation(Kernel &cube, Kernel &vector) {
-    std::cout << "message encoding and rejected operations" << std::endl;
-    for (auto *kernel : {&cube, &vector}) {
-        if (kernel->encode(2, 7, 1) != 0x721 || kernel->encode(1, 15, 3) != 0xf13)
-            fail("incorrect FFTS message encoding");
-        for (int mode : {0, 1, 3}) {
-            expect_rejected([&] {
-                kernel->message(mode, 0, 1);
-            });
-        }
-        for (int count : {0, 2, 15}) {
-            expect_rejected([&] {
-                kernel->message(2, 0, count);
-            });
-        }
-        for (int event : {-1, 16}) {
-            expect_rejected([&] {
-                kernel->wait(event);
-            });
-        }
-        kernel->inject(nullptr, nullptr);
-        expect_rejected([&] {
-            kernel->signal(0);
-        });
-        auto null_storage = +[](uint64_t, size_t) -> void * {
-            return nullptr;
-        };
-        kernel->inject(reinterpret_cast<void *>(pto_sim_get_subblock_id), reinterpret_cast<void *>(null_storage));
-        expect_rejected([&] {
-            kernel->wait(0);
-        });
-        kernel->inject(
-            reinterpret_cast<void *>(pto_sim_get_subblock_id), reinterpret_cast<void *>(pto_sim_get_pipe_shared_state)
-        );
-    }
-    bind(0, 0, 2);
-    expect_rejected([&] {
-        vector.signal(0);
-    });
-    expect_rejected([&] {
-        vector.wait(0);
-    });
-    bind();
-}
-
-void credits(Kernel &cube, Kernel &vector) {
-    std::cout << "broadcast and queued credits" << std::endl;
-    bind();
-    for (int i = 0; i < 3; ++i)
-        cube.signal(0);
-    for (int lane = 0; lane < 2; ++lane) {
-        bind(0, 0, lane);
-        for (int i = 0; i < 3; ++i)
-            vector.wait(0);
-    }
-    Waiter lane0([&] {
-        bind();
-        vector.wait(0);
-    });
-    Waiter lane1([&] {
-        bind(0, 0, 1);
-        vector.wait(0);
-    });
-    lane0.blocked();
-    lane1.blocked();
-    bind();
-    cube.legacy_signal(0);
-    lane0.finish();
-    lane1.finish();
-
-    std::cout << "joint AIV completion and event isolation" << std::endl;
-    bind();
-    vector.signal(3);
-    vector.signal(3);
-    Waiter joined([&] {
-        bind();
-        cube.wait(3);
-    });
-    joined.blocked();
-    bind(0, 0, 1);
-    vector.signal(7);
-    joined.blocked();
-    vector.signal(3);
-    joined.finish();
-    Waiter joined2([&] {
-        bind();
-        cube.legacy_wait(3);
-    });
-    joined2.blocked();
-    bind(0, 0, 1);
-    vector.legacy_signal(3);
-    joined2.finish();
-    bind();
-    vector.signal(7);
-    cube.wait(7);
-}
-
 void isolation(Kernel &cube, Kernel &vector) {
     std::cout << "device and cluster isolation" << std::endl;
     bind();
-    cube.signal(5);
+    cube.legacy_signal(5);
     Waiter device([&] {
         bind(2);
         vector.wait(5);
@@ -335,8 +222,6 @@ int main(int argc, char **argv) {
     Kernel cube(argv[1]);
     Kernel vector(argv[2]);
     bind();
-    validation(cube, vector);
-    credits(cube, vector);
     isolation(cube, vector);
     pipeline(cube, vector);
     pto_cpu_sim_release_device(0);

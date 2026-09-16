@@ -9,18 +9,14 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#pragma once
+
 #include <cstddef>
 #include <cstdint>
-#include <pto/pto-inst.hpp>
+#include <pto/common/cpu_stub.hpp>
 
-extern "C" void signal_event(int event) {
-    __builtin_cce_ffts_cross_core_sync(PIPE_MTE3, pto::getFFTSMsg(FFTS_MODE_VAL, event));
+// Each kernel DSO binds its ISA operations to the runtime-owned simulation context.
+extern "C" __attribute__((visibility("default"))) void
+pto_sim_register_hooks(void *get_subblock_id, void *get_pipe_shared_state) {
+    pto::cpu_sim::register_hooks(get_subblock_id, get_pipe_shared_state);
 }
-
-extern "C" void wait_event(int event) { __builtin_cce_wait_flag_dev(event); }
-
-extern "C" void legacy_signal_event(int event) {
-    ffts_cross_core_sync(PIPE_MTE3, pto::getFFTSMsg(FFTS_MODE_VAL, event));
-}
-
-extern "C" void legacy_wait_event(int event) { wait_flag_dev(event); }

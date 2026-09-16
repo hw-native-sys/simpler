@@ -142,7 +142,9 @@ def test_compile_cache_token_preserves_every_incore_toolchain_token(monkeypatch)
 @pytest.mark.parametrize("platform", ["a2a3sim", "a5sim"])
 @pytest.mark.parametrize("core_type", ["aic", "aiv"])
 @pytest.mark.parametrize("pto_isa_root", [None, "isa"])
-def test_simulator_ffts_header_is_arch_specific(monkeypatch, tmp_path, platform, core_type, pto_isa_root):
+def test_simulator_kernel_hooks_only_apply_to_a2a3_pto_kernels(
+    monkeypatch, tmp_path, platform, core_type, pto_isa_root
+):
     from simpler_setup.kernel_compiler import KernelCompiler  # noqa: PLC0415
 
     compiler = KernelCompiler(platform)
@@ -157,32 +159,32 @@ def test_simulator_ffts_header_is_arch_specific(monkeypatch, tmp_path, platform,
     monkeypatch.setattr(compiler, "_compile_to_bytes", capture_compile)
     assert compiler._compile_incore_sim(str(source), core_type=core_type, pto_isa_root=pto_isa_root) == b"compiled"
     command = captured["command"]
-    has_ffts = platform == "a2a3sim"
-    assert ("-include" in command) == has_ffts
+    has_hooks = platform == "a2a3sim" and pto_isa_root is not None
+    assert ("-include" in command) == has_hooks
     assert ("-D__DAV_CUBE__" in command) == (core_type == "aic")
     assert ("-D__DAV_VEC__" in command) == (core_type == "aiv")
-    if has_ffts:
-        assert command[command.index("-include") + 1].endswith("src/a2a3/platform/sim/aicore/ffts_sim.h")
+    if has_hooks:
+        assert command[command.index("-include") + 1].endswith("src/common/platform/sim/aicore/sim_kernel_hooks.h")
 
 
-def test_simulator_ffts_header_changes_invalidate_compiled_artifacts(monkeypatch, tmp_path):
+def test_simulator_kernel_hooks_changes_invalidate_compiled_artifacts(monkeypatch, tmp_path):
     from simpler_setup.kernel_compiler import KernelCompiler  # noqa: PLC0415
 
-    header = tmp_path / "ffts_sim.h"
+    header = tmp_path / "sim_kernel_hooks.h"
     compiler = KernelCompiler("a2a3sim")
-    monkeypatch.setattr(compiler, "_sim_ffts_header", lambda: header)
+    monkeypatch.setattr(compiler, "_sim_kernel_hooks_header", lambda: header)
     header.write_text("first implementation")
     original = compiler.incore_compile_cache_token("aic")
     header.write_text("second implementation")
     updated = compiler.incore_compile_cache_token("aic")
-    assert original["sim_ffts"] != updated["sim_ffts"]
-    assert KernelCompiler("a5sim").incore_compile_cache_token("aic")["sim_ffts"] is None
+    assert original["sim_kernel_hooks"] != updated["sim_kernel_hooks"]
+    assert KernelCompiler("a5sim").incore_compile_cache_token("aic")["sim_kernel_hooks"] is None
 
 
-def test_simulator_ffts_header_resolve_from_installed_project_root(monkeypatch, tmp_path):
+def test_simulator_kernel_hooks_resolve_from_installed_project_root(monkeypatch, tmp_path):
     from simpler_setup.kernel_compiler import KernelCompiler  # noqa: PLC0415
 
     assets = tmp_path / "simpler_setup" / "_assets"
     compiler = KernelCompiler("a2a3sim")
     monkeypatch.setattr(compiler, "project_root", assets)
-    assert compiler._sim_ffts_header() == (assets / "src/a2a3/platform/sim/aicore/ffts_sim.h")
+    assert compiler._sim_kernel_hooks_header() == (assets / "src/common/platform/sim/aicore/sim_kernel_hooks.h")
