@@ -138,6 +138,9 @@ inline InvocationStatus decode_tmr_invocation(
     TmrInvocationView candidate;
     auto status = kernel::validate_invocation_header(packet, trusted_callable, &candidate.header_);
     if (status != InvocationStatus::Ok) return status;
+    // H6 host-only duplicates belong to Host-build graph construction. TMR
+    // executes orchestration on AICPU and has no host-copy suffix contract.
+    if (candidate.header_.host_copy_tensor_count != 0) return InvocationStatus::InvalidCounts;
     size_t expected_bytes = 0;
     status = tmr_invocation_size(trusted_callable, &expected_bytes);
     if (status != InvocationStatus::Ok) return status;

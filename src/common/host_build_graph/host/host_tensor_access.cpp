@@ -50,6 +50,7 @@ struct HostTensorRegion {
 // costs less than the map that would replace it.
 struct HostTensorAccessor::Impl {
     const HostApi *api;
+    HostTensorAccessMode mode;
     std::vector<HostTensorRegion> regions;
     std::vector<void *> mappings;
     // Bytes covered by `mappings`, i.e. excluding regions serving a fallback view.
@@ -75,8 +76,8 @@ find_region(std::vector<HostTensorRegion> &regions, uint64_t dev_addr, uint64_t 
     return nullptr;
 }
 
-HostTensorAccessor::HostTensorAccessor(const HostApi *api) :
-    impl_(new Impl{api, {}, {}, 0, 0}) {}
+HostTensorAccessor::HostTensorAccessor(const HostApi *api, HostTensorAccessMode mode) :
+    impl_(new Impl{api, mode, {}, {}, 0, 0}) {}
 
 HostTensorAccessor::~HostTensorAccessor() {
     close();
@@ -84,7 +85,7 @@ HostTensorAccessor::~HostTensorAccessor() {
 }
 
 bool HostTensorAccessor::add(uint64_t dev_base, uint64_t size, void *fallback_host_view) {
-    if (impl_->api == nullptr || dev_base == 0 || size == 0) {
+    if (impl_->mode != HostTensorAccessMode::Program || impl_->api == nullptr || dev_base == 0 || size == 0) {
         return false;
     }
     impl_->regions.reserve(impl_->regions.size() + 1);
@@ -110,10 +111,22 @@ bool HostTensorAccessor::add(uint64_t dev_base, uint64_t size, void *fallback_ho
 }
 
 bool HostTensorAccessor::add_child_memory(uint64_t dev_base, uint64_t size) {
-    if (impl_->api == nullptr || dev_base == 0 || size == 0) {
+    if (impl_->mode != HostTensorAccessMode::Program || impl_->api == nullptr || dev_base == 0 || size == 0) {
         return false;
     }
     impl_->regions.push_back({dev_base, size, nullptr, false, AccessMeans::Unresolved});
+    return true;
+}
+
+bool HostTensorAccessor::add_host_copy(uint64_t logical_base, uint64_t size, const void *host_view) {
+    if (impl_->mode != HostTensorAccessMode::KernelHostCopiesOnly || logical_base == 0 || size == 0 ||
+        host_view == nullptr || logical_base != reinterpret_cast<uintptr_t>(host_view)) {
+        return false;
+    }
+    impl_->regions.push_back(
+        {logical_base, size, const_cast<unsigned char *>(static_cast<const unsigned char *>(host_view)), false,
+         AccessMeans::HostView}
+    );
     return true;
 }
 
@@ -149,6 +162,7 @@ bool HostTensorAccessor::read(uint64_t dev_addr, void *dst, uint64_t bytes) {
 }
 
 bool HostTensorAccessor::write(uint64_t dev_addr, const void *src, uint64_t bytes) {
+    if (impl_->mode == HostTensorAccessMode::KernelHostCopiesOnly) return false;
     uint64_t offset = 0;
     HostTensorRegion *region = find_region(impl_->regions, dev_addr, bytes, &offset);
     if (region == nullptr) {

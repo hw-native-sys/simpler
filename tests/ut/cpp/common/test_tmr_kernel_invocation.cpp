@@ -301,6 +301,29 @@ TEST(TmrKernelInvocation, SelfConsistentEnvelopeStillRequiresExactTmrSize) {
     }
 }
 
+TEST(TmrKernelInvocation, RejectsTheHbgHostCopySuffixContract) {
+    const PreparedInvocationView callable{3, 2, 0};
+    const uint32_t shape[] = {8};
+    ChipStorageTaskArgs args;
+    args.add_tensor(
+        make_tensor_external(reinterpret_cast<void *>(0x20000), shape, 1, DataType::FLOAT32, AddressSpace::DEVICE)
+    );
+    args.add_tensor(
+        make_tensor_external(reinterpret_cast<void *>(0x30000), shape, 1, DataType::FLOAT32, AddressSpace::DEVICE)
+    );
+    TmrEncodingCache cache;
+    TmrEncodingCandidate encoded;
+    ASSERT_EQ(encode_tmr_invocation(args, callable, kBinding, cache, &encoded), InvocationStatus::Ok);
+    std::vector<uint8_t> packet(encoded.packet().data, encoded.packet().data + encoded.packet().size);
+    auto *header = reinterpret_cast<SimplerKernelInvocationHeader *>(packet.data());
+    header->host_copy_tensor_count = 1;
+    TmrInvocationView view;
+    EXPECT_EQ(
+        decode_tmr_invocation({packet.data(), packet.size()}, callable, kBinding, &view),
+        InvocationStatus::InvalidCounts
+    );
+}
+
 TEST(TmrKernelInvocation, InvalidTensorArithmeticAndHostBackingAreRejected) {
     auto args = make_args();
     for (int change = 0; change < 8; ++change) {

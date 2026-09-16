@@ -29,6 +29,8 @@ namespace hbg {
 struct HostOrchEntryPoints {
     void (*entry)(const ChipTaskArgs &){nullptr};
     void (*bind)(RuntimeContext *){nullptr};
+    uint64_t requirements_v1{0};
+    bool requirements_v1_available{false};
 };
 
 struct GraphDefinitionPlan;

@@ -11,14 +11,17 @@
 
 /**
  * @file host_tensor_access.h
- * @brief simpler::hbg::Tensor-byte access for the host orchestrator, over device buffers.
+ * @brief Tensor-byte access policy for the host orchestrator.
  *
- * `simpler::hbg::Tensor::buffer.addr` is a device address. host_build_graph runs the
- * orchestrator on the host, so `get_tensor_data` / `set_tensor_data` cannot
- * assume the CPU executing them can load that address — whether it can is a
- * platform capability, not a property of the runtime. This is the seam where
- * that capability is resolved, so the orchestrator core never dereferences a
- * device address itself.
+ * In program mode, `simpler::hbg::Tensor::buffer.addr` is a device address.
+ * host_build_graph runs the orchestrator on the host, so `get_tensor_data` /
+ * `set_tensor_data` cannot assume the CPU executing them can load that address.
+ * This is the seam where that platform capability is resolved.
+ *
+ * Kernel mode instead accepts only explicit caller-owned Host-copy arguments.
+ * It registers their Host addresses directly, permits reads, and denies writes.
+ * Device mappings and device-copy fallbacks are disabled, so Host build cannot
+ * inspect device storage or introduce a stream synchronization.
  *
  * The current bind path registers one region per host-memory tensor, backed by
  * the caller's host tensor buffer, which the bind has just copied in H2D:
@@ -79,6 +82,15 @@
 
 struct HostApi;  // common/host_api.h — fwd-declared so this header stays out of platform includes
 
+enum class HostTensorAccessMode : uint8_t {
+    // Program mode may stage, map or copy device storage as part of its
+    // self-managed synchronous run.
+    Program,
+    // Kernel-mode Host build may read only explicit caller-owned Host copies.
+    // Device mappings, D2H fallback and Host writes are unrepresentable.
+    KernelHostCopiesOnly,
+};
+
 /**
  * The registered regions of one orchestration run, and any optional mappings
  * that run installed to serve them.
@@ -103,7 +115,7 @@ struct HostApi;  // common/host_api.h — fwd-declared so this header stays out 
  */
 class HostTensorAccessor {
 public:
-    explicit HostTensorAccessor(const HostApi *api);
+    explicit HostTensorAccessor(const HostApi *api, HostTensorAccessMode mode = HostTensorAccessMode::Program);
     ~HostTensorAccessor();
 
     HostTensorAccessor(const HostTensorAccessor &) = delete;
@@ -133,6 +145,14 @@ public:
      */
     bool add_child_memory(uint64_t dev_base, uint64_t size);
 
+    /**
+     * Register an explicit host-only duplicate for HBG kernel Host build.
+     * `logical_base` is the address carried by that HOST ChipTensor and
+     * `host_view` is the same caller-owned storage. No platform mapping or
+     * device copy is attempted, and writes through the accessor remain denied.
+     */
+    bool add_host_copy(uint64_t logical_base, uint64_t size, const void *host_view);
+
     bool read(uint64_t dev_addr, void *dst, uint64_t bytes);
     bool write(uint64_t dev_addr, const void *src, uint64_t bytes);
 
@@ -160,7 +180,7 @@ private:
 };
 
 /**
- * Read `bytes` at device address `dev_addr` into `dst`.
+ * Read `bytes` at the accessor's logical address `dev_addr` into `dst`.
  *
  * @return false when no registered region covers the whole span; `dst` is
  *         untouched.

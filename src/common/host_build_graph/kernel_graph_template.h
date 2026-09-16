@@ -30,6 +30,7 @@ struct GraphInvocationIdentity {
     uint64_t callable_hash{0};
     uint64_t argument_hash{0};
     uint64_t function_hash{0};
+    int32_t host_copy_tensor_count{0};
 };
 
 // Window-based scheduler reservations, independent of the program-mode maximum.

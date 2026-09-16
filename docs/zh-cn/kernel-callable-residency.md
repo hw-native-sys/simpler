@@ -154,12 +154,13 @@ launch 不分配设备内存、不创建 stream/event、不同步、不查询 ca
 `KernelArgs` 地址和 context generation、SM/arena 范围及 `SimplerKernelInvocationHeader`。
 镜像地址由 binder 从本 context 已提交的驻留信息填入，不来自调用方镜像；该分配在每个
 引用它的图销毁前不释放。公共 invocation header 固定为 32 字节，不带 callable generation
-字段；`host_copy_tensor_count` 和显式 `reserved_` 必须为零。
+字段；TMR 要求 `host_copy_tensor_count` 为零，HBG H6 用它标识尾随的 host-only 副本参数；
+所有 runtime 都要求显式 `reserved_` 为零。
 
 设备入口先检查公共 framing 和镜像跨度（非零、对齐、不小于 `sizeof(ChipCallable)`、
 不溢出），再由 TMR consumer 建立缓存可见性并校验绑定、大小、参数数量和
 signature，解码到本次调用的私有参数，进入真实 executor。
-HBG payload 尚未接入执行 consumer。
+HBG 已有内部 packet/restore consumer，公共 kernel launch owner 尚未接线。
 
 部分已提交工作的失败会使 context 进入 Poisoned。若外围包在建立可信绑定前被拒绝，
 设备入口不会解引用任意 `binding_address` 尝试取消 AICore。常规错误输入在 Host 提交前

@@ -16,10 +16,10 @@ namespace hbg {
 
 inline constexpr uint32_t GRAPH_SLOT_MAGIC = 0x53474248;      // HBGS
 inline constexpr uint32_t GRAPH_REGISTRY_MAGIC = 0x52474248;  // HBGR
-inline constexpr uint16_t GRAPH_SLOT_VERSION = 1;
+inline constexpr uint16_t GRAPH_SLOT_VERSION = 2;
 inline constexpr uint32_t GRAPH_SLOT_FROZEN_SERIAL = 3;
 
-enum class GraphSlotPhase : uint32_t { Empty, Publishing, Ready };
+enum class GraphSlotPhase : uint32_t { Empty, Publishing, Ready, Poisoned };
 enum class GraphSlotStatus : uint32_t {
     Ok,
     InvalidRegistration,
@@ -32,7 +32,10 @@ enum class GraphSlotStatus : uint32_t {
     BinaryMismatch,
     InvalidPacket,
     BindingMismatch,
-    SourceOverlap
+    SourceOverlap,
+    CallableMismatch,
+    Poisoned,
+    SourceUnavailable
 };
 
 // Sealed only from context-owned frozen allocations, never from a launch packet.
@@ -51,6 +54,24 @@ struct GraphSlotRegistration {
     uint64_t checksum;
 };
 
+enum class GraphRestorePhase : uint32_t { Idle, Restoring, Ready, Failed };
+
+// One leader writes this line; peers acquire phase after the entry's invocation
+// barrier. attempt is device-owned and advances even when a restore fails.
+struct alignas(64) GraphRestoreControl {
+    uint64_t attempt;
+    uint64_t committed_generation;
+    uint64_t runtime_address;
+    uint64_t sm_bytes;
+    uint32_t phase;
+    uint32_t status;
+    uint32_t total_tasks;
+    uint32_t reserved0;
+    uint64_t reserved[2];
+};
+static_assert(sizeof(GraphRestoreControl) == 64);
+static_assert(std::is_standard_layout_v<GraphRestoreControl> && std::is_trivially_copyable_v<GraphRestoreControl>);
+
 // Context-owned device memory. Publication lives on a separate cache line from
 // the immutable registration. phase is accessed through atomic builtins on AICPU.
 struct alignas(64) GraphSlotRegistry {
@@ -63,6 +84,7 @@ struct alignas(64) GraphSlotRegistry {
     uint64_t runtime_binary_id;
     uint64_t reserved[4];
     GraphSlotRegistration registration;
+    GraphRestoreControl restore;
 };
 
 static_assert(std::is_standard_layout_v<GraphSlotRegistration> && std::is_trivially_copyable_v<GraphSlotRegistration>);
@@ -72,9 +94,10 @@ static_assert(offsetof(GraphSlotRegistration, slot_generation) == 16);
 static_assert(offsetof(GraphSlotRegistration, destinations) == 40);
 static_assert(offsetof(GraphSlotRegistration, registry) == 104);
 static_assert(offsetof(GraphSlotRegistration, checksum) == 120);
-static_assert(sizeof(GraphSlotRegistry) == 192 && alignof(GraphSlotRegistry) == 64);
+static_assert(sizeof(GraphSlotRegistry) == 256 && alignof(GraphSlotRegistry) == 64);
 static_assert(offsetof(GraphSlotRegistry, phase) == 8);
 static_assert(offsetof(GraphSlotRegistry, registration) == 64);
+static_assert(offsetof(GraphSlotRegistry, restore) == 192);
 
 // Both inputs must already have non-overflowing bounds.
 inline bool graph_windows_overlap(GraphDestination a, GraphDestination b) noexcept {

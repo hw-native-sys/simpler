@@ -16,9 +16,11 @@
  * The header is the shared envelope both runtimes use; the payload format
  * under it belongs to each runtime (tensormap_and_ringbuffer carries
  * graph-build input, host_build_graph carries a serialized graph blob) and is
- * not constrained here. AICPU dispatch consumers must validate identity
- * and capacity before consuming the payload, and reject nonzero
- * host_copy_tensor_count or reserved_. Producers must zero-initialize the
+ * not constrained here. AICPU dispatch consumers must validate identity and
+ * capacity before consuming the payload. HBG may use
+ * host_copy_tensor_count for the trailing host-only tensor suffix defined by
+ * its H6 contract; runtimes that do not implement that contract must reject a
+ * nonzero value. All consumers reject reserved_. Producers must zero-initialize the
  * complete header before assigning invocation fields.
  *
  * Both sides of this wire are produced by the same build (`build_runtimes.py`
@@ -47,7 +49,8 @@ typedef struct SimplerKernelInvocationHeader {
        sig_count minus that count. */
     int32_t tensor_count;
     int32_t scalar_count;
-    /* Reserved host-only duplicate tensor count; must be zero. */
+    /* Number of trailing host-only duplicate tensors. HBG validates their
+       pairing before Host build; other runtimes require zero. */
     int32_t host_copy_tensor_count;
     uint32_t reserved_; /* Must be zero. */
 } SimplerKernelInvocationHeader;

@@ -16,7 +16,7 @@
 #include <type_traits>
 
 #include "task_interface/kernel_invocation_header.h"
-#include "task_interface/arg_direction.h"
+#include "task_interface/kernel_invocation_validation.h"
 #include "utils/fnv1a_64.h"
 
 namespace hbg {
@@ -49,7 +49,7 @@ struct GraphImageRegion {
     uint64_t destination_offset;
 };
 
-// Follows the common invocation header. Device addresses name
+// Follows the shared common invocation header. Device addresses name
 // context-owned storage; they are claims to compare with the registry, not authority.
 struct GraphPacketHeader {
     uint32_t magic;
@@ -115,9 +115,10 @@ validate_graph_packet(const void *packet, size_t size, GraphPacketAddress addres
     const auto *bytes = static_cast<const uint8_t *>(packet);
     SimplerKernelInvocationHeader invocation{};
     std::memcpy(&invocation, bytes, sizeof(invocation));
-    if (invocation.mode != SIMPLER_MODE_KERNEL || invocation.callable_id < 0 || invocation.tensor_count < 0 ||
-        invocation.tensor_count > CHIP_MAX_TENSOR_ARGS || invocation.scalar_count < 0 ||
-        invocation.scalar_count > CHIP_MAX_SCALAR_ARGS || invocation.host_copy_tensor_count != 0 ||
+    if (invocation.mode != SIMPLER_MODE_KERNEL || invocation.callable_id < 0 ||
+        invocation.callable_id >= MAX_REGISTERED_CALLABLE_IDS ||
+        !simpler::kernel::valid_invocation_counts(invocation.tensor_count, invocation.scalar_count) ||
+        !simpler::kernel::valid_host_copy_tensor_count(invocation.tensor_count, invocation.host_copy_tensor_count) ||
         invocation.reserved_ != 0 || invocation.payload_bytes != size - prefix)
         return GraphPacketStatus::InvalidEnvelope;
     GraphPacketHeader header{};

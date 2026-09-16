@@ -11,6 +11,7 @@
 #include <limits>
 
 #include "kernel_dispatch_args.h"
+#include "kernel_invocation_validation.h"
 #include "callable_protocol.h"
 #include "arg_direction.h"
 #include "aicpu/kernel_invocation_consumer.h"
@@ -31,7 +32,8 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_kernel_exec(
         invocation.tensor_count < 0 || invocation.tensor_count > CHIP_MAX_TENSOR_ARGS || invocation.scalar_count < 0 ||
         invocation.scalar_count > CHIP_MAX_SCALAR_ARGS ||
         invocation.tensor_count > CHIP_MAX_TENSOR_ARGS - invocation.scalar_count ||
-        invocation.host_copy_tensor_count != 0 || invocation.reserved_ != 0)
+        !simpler::kernel::valid_host_copy_tensor_count(invocation.tensor_count, invocation.host_copy_tensor_count) ||
+        invocation.reserved_ != 0)
         return static_cast<int>(KernelDispatchStatus::InvalidArgs);
     if (args.chip_callable_address == 0 || args.chip_callable_address % alignof(ChipCallable) != 0 ||
         args.chip_callable_bytes < sizeof(ChipCallable) ||
