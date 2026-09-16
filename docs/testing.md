@@ -143,6 +143,25 @@ Entries unused for 14 days are pruned. When `build/` is not writable — a wheel
 installed into a read-only `site-packages` — the cache is skipped with a warning
 and every callable is compiled in-process, exactly as before the cache existed.
 
+### Runtime prewarm
+
+Every `Worker` / `ChipWorker` attempts one internal prewarm before the first
+activated run of each chip. On the tensormap-and-ringbuffer runtime, it walks
+the normal host bind, AICPU/AICore handshake, scheduler, one-task dispatch,
+completion, and cleanup paths. The AICPU submits a private zero-argument,
+single-block AIV task instead of invoking the user orchestration entry, and the
+scheduler publishes a zero kernel address so AICore performs only the protocol
+ACK/FIN. Host-build-graph reports the feature unsupported and proceeds directly
+to the official run.
+
+The prewarm does not copy outputs back, write `accepted_state`, advance a
+pipeline lease, or enable runtime diagnostics. It uses the first activated
+callable's host binding; later callables and later rounds do not add another
+attempt. L3 staged frames stay inert until activation.
+
+`--rounds N` still means exactly N official workload runs and N timing rows.
+L3 swimlane files contain only official runs.
+
 Scene tests support advanced CLI options for benchmarking, profiling, and runtime control. These work identically in both pytest and standalone mode.
 
 > "Profiling" is the umbrella for three parallel diagnostics sub-features: `--enable-chip-swimlane` (chip swimlane), `--dump-args` (unified argument dump), and `--enable-pmu` (PMU CSV). They are independent and can be combined.
@@ -172,7 +191,7 @@ python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ l
 
 | Option | Short | Default | Description |
 | ------ | ----- | ------- | ----------- |
-| `--rounds N` | | 1 | Run each case N times (reuses the same Worker across rounds) |
+| `--rounds N` | | 1 | Run each case N times (reuses the same Worker across rounds; the one-time per-chip prewarm is not a round) |
 | `--device IDS` | `-d` | `0` | Single id (`0`), range (`0-7`), or list (`0,2,5`). Sets the device-id pool for L3 cases and the available slots for L2 fanout. |
 | `--max-parallel N` | | `auto` | Max in-flight subprocesses (make-style). `auto` = `min(nproc, len(--device))` on sim, `len(--device)` on hardware. Decouples device-id pool size from parallelism; use to throttle sim on a CPU-constrained runner. |
 | `--runtime NAME` | | (all) | Restrict to one runtime (also used internally as the child-mode marker) |

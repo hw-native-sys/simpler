@@ -660,15 +660,23 @@ def print_rounds_table(buckets, stream=sys.stdout):
         print("No [STRACE] markers found.", file=stream)
         return
 
-    # Busiest hid = the rounds (decode emits one invocation per token; a static
-    # L2 example emits one per --rounds repetition).
-    _, invs = max(buckets.items(), key=lambda kv: len(kv[1]))
+    # Only a depth-0 chip.run root identifies an official round. Internal
+    # prewarm invocations reuse chip.run.* child spans, so matching children
+    # would add one fake round and contaminate benchmark averages.
+    run_buckets = {
+        hid: [inv for inv in invs if (root := inv.root()) is not None and root.name == _ROUNDS_TABLE_NAMES["run"]]
+        for hid, invs in buckets.items()
+    }
+    run_buckets = {hid: invs for hid, invs in run_buckets.items() if invs}
+    if not run_buckets:
+        print("No official [STRACE] rounds found.", file=stream)
+        return
+
+    # Busiest official hid = the rounds (decode emits one invocation per token;
+    # a static L2 example emits one per --rounds repetition).
+    _, invs = max(run_buckets.items(), key=lambda kv: len(kv[1]))
     invs = sorted(invs, key=lambda i: i.inv)
     rows = [_round_metrics(inv) for inv in invs]
-
-    if not rows:
-        print("No [STRACE] markers found.", file=stream)
-        return
 
     n = len(rows)
     # Host (col 0) is always captured → averaged over all rounds. Every other

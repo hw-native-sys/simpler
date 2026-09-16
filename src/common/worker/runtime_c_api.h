@@ -112,6 +112,11 @@ enum {
     PTO_RUNTIME_ERR_INVALID_ARGUMENT = PTO_RUNTIME_ERR_BASE - 4,
 };
 
+/** Internal NativeRunDescriptor.flags bits. Not part of the PyPTO CallConfig ABI. */
+enum {
+    PTO_NATIVE_RUN_FLAG_INTERNAL_PREWARM = 1u << 0,
+};
+
 /** Return values from simpler_poll_run(). */
 enum {
     SIMPLER_NATIVE_RUN_POLL_ERROR = PTO_RUNTIME_ERR_INTERNAL,
@@ -216,6 +221,7 @@ typedef struct NativeRunDescriptor {
     uint64_t run_epoch;
     volatile int32_t *accepted_state;
     int32_t accepted_value;
+    uint32_t flags;
 } NativeRunDescriptor;
 
 /* Per-stage run timing is no longer returned. The platform emits it as

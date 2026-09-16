@@ -508,6 +508,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         return -1;
     }
     int32_t run_rc = 0;
+    const bool internal_prewarm = (runtime->get_run_flags() & RUNTIME_RUN_FLAG_INTERNAL_PREWARM) != 0;
     // Publish the resolved index so per-thread readers in this `.so` (notably
     // the AICPU phase-record slot) agree with the executor. On sim the basic
     // affinity gate leaves the index unset (-1); without this the sub-phase
@@ -566,10 +567,12 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
                 // Build the entry-arg once per run; both the config call below and
                 // the orchestration entry (consumed at orch_args_cached_) use it.
-                orch_args_cached_.create_from_entry_storage(runtime->get_orch_args());
+                if (!internal_prewarm) {
+                    orch_args_cached_.create_from_entry_storage(runtime->get_orch_args());
+                }
 
-                // Validate arg count on every run against the registered SO.
-                if (*p_config_func != nullptr) {
+                // Validate arg count on every official run against the registered SO.
+                if (!internal_prewarm && *p_config_func != nullptr) {
                     OrchestrationConfig cfg = (*p_config_func)(orch_args_cached_);
                     LOG_DEBUG("Thread %d: Config: expected_args=%d", thread_idx, cfg.expected_arg_count);
                     if (cfg.expected_arg_count > 0) {
@@ -717,12 +720,19 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 #if SIMPLER_DFX
             orch_cycle_start = get_sys_cnt_aicpu();
 #endif
-            framework_bind_runtime(rt);
-            if (*p_bind != nullptr) {
-                (*p_bind)(rt);
-            }
             rt_scope_begin(rt);
-            (*p_func)(orch_args_cached_);
+            if (internal_prewarm) {
+                MixedKernels kernels;
+                kernels.aiv0_kernel_id = 0;
+                CoreTaskArgs args;
+                rt->orchestrator.submit_task(kernels, args);
+            } else {
+                framework_bind_runtime(rt);
+                if (*p_bind != nullptr) {
+                    (*p_bind)(rt);
+                }
+                (*p_func)(orch_args_cached_);
+            }
             rt_scope_end(rt);
 
 #if SIMPLER_DFX
@@ -895,12 +905,14 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         // every subsequent run.
         if (rt != nullptr) {
             // Clear g_current_runtime in this DSO and in the orchestration SO before destroying rt.
-            const int32_t callable_id = runtime->get_active_callable_id();
-            framework_bind_runtime(nullptr);
-            if (callable_id >= 0 && callable_id < MAX_REGISTERED_CALLABLE_IDS) {
-                DeviceOrchestrationBindRuntimeFunc bind = orch_so_table_[callable_id].bind;
-                if (bind != nullptr) {
-                    bind(nullptr);
+            if (!internal_prewarm) {
+                const int32_t callable_id = runtime->get_active_callable_id();
+                framework_bind_runtime(nullptr);
+                if (callable_id >= 0 && callable_id < MAX_REGISTERED_CALLABLE_IDS) {
+                    DeviceOrchestrationBindRuntimeFunc bind = orch_so_table_[callable_id].bind;
+                    if (bind != nullptr) {
+                        bind(nullptr);
+                    }
                 }
             }
             runtime_destroy(rt, runtime_arena_);
