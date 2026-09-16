@@ -479,7 +479,7 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
 
     LaunchTransactionResult result = exact_launch_transaction(
         prepared->identity, std::move(permit),
-        [&]() -> int {
+        [&](LaunchProgressSink &) -> int {
             // Arming precedes any simulated-core thread, so its failures — including
             // a thread-spawn or allocation throw — are reported as an rc and leave
             // the run safely rollback-able.
@@ -537,7 +537,7 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
             }
             return 0;
         },
-        [&]() -> int {
+        [&](LaunchProgressSink &) -> int {
             LOG_INFO("Launching %d AICPU threads (logical=%d)", over_launch, launch_aicpu_num);
             for (int i = 0; i < over_launch; i++) {
                 run->aicpu_threads.push_back(create_thread([this, run, launch_aicpu_num, over_launch, sim_t0]() {

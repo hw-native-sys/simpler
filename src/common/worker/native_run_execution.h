@@ -115,6 +115,27 @@ enum class LaunchProgress : uint8_t {
     Complete,
 };
 
+/**
+ * A submit callback's channel for reporting that its submission reached the
+ * device queue.
+ *
+ * A callback does more than one thing — it submits a kernel and then records
+ * that kernel's completion boundary — and only the first of those is what
+ * grades the run. Without this, a boundary-record failure returned from the
+ * callback would be read as a failure before any submission and the run graded
+ * `NotStarted`, i.e. an already-submitted kernel reported as never launched.
+ * Callbacks therefore mark this the instant the device accepts a submission,
+ * ahead of anything that can still fail.
+ */
+class LaunchProgressSink {
+public:
+    void mark_submitted() { submitted_ = true; }
+    bool submitted() const { return submitted_; }
+
+private:
+    bool submitted_{false};
+};
+
 struct LaunchTransactionResult {
     int rc{-1};
     LaunchProgress progress{LaunchProgress::NotStarted};
@@ -140,7 +161,9 @@ struct LaunchTransactionResult {
  * non-zero return rather than an exception. An escaping exception is therefore
  * evidence that the submission itself was attempted, and grades the run
  * `Partial`. Returning non-zero from `submit_aicore` is by contrast a
- * before-first-submission failure, so it stays `NotStarted`.
+ * before-first-submission failure, so it stays `NotStarted` — unless the
+ * callback marked its `LaunchProgressSink`, which says the device already
+ * accepted a submission and the failure came from a later step.
  */
 template <typename AicoreSubmit, typename AicpuSubmit>
 struct ExactLaunchTransaction {
@@ -150,18 +173,22 @@ struct ExactLaunchTransaction {
         LaunchTransactionResult result;
         if (!permit.consume(identity)) return result;
 
+        LaunchProgressSink sink;
         try {
-            result.rc = std::forward<AicoreSubmit>(submit_aicore)();
+            result.rc = std::forward<AicoreSubmit>(submit_aicore)(sink);
         } catch (...) {
             result.rc = -1;
             result.progress = LaunchProgress::Partial;
             return result;
         }
-        if (result.rc != 0) return result;
+        if (result.rc != 0) {
+            if (sink.submitted()) result.progress = LaunchProgress::Partial;
+            return result;
+        }
 
         result.progress = LaunchProgress::Partial;
         try {
-            result.rc = std::forward<AicpuSubmit>(submit_aicpu)();
+            result.rc = std::forward<AicpuSubmit>(submit_aicpu)(sink);
         } catch (...) {
             result.rc = -1;
         }

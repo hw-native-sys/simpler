@@ -47,6 +47,24 @@
 int query_stream_pair_nonblocking(rtStream_t aicpu_stream, rtStream_t aicore_stream);
 
 /**
+ * The error either stream of one onboard run is already holding, or 0 for none.
+ *
+ * Non-blocking, and strictly weaker than a stream synchronize: it reports a
+ * stream left in a sticky error state, which is what `rtStreamQuery` answers.
+ * It does **not** detect a device exception raised by the work itself —
+ * measured on a2a3, an AICPU kernel that returns a fatal status leaves both
+ * streams reading drained and error-free here, and only
+ * `aclrtSynchronizeStreamWithTimeout` produces the 507018. So this preserves
+ * what a non-blocking poll used to report; it is not a substitute for the
+ * synchronize on the drain path.
+ *
+ * Work still queued reads as no error, since a stream holds its error stickily.
+ * Returns the AICPU error in preference to the AICore one, matching the order
+ * `sync_stream_pair` reports them in.
+ */
+int query_stream_pair_error(rtStream_t aicpu_stream, rtStream_t aicore_stream);
+
+/**
  * The device blocks one pipeline slot reuses across every run it prepares.
  *
  * All three have a size fixed for the runner's lifetime — `sizeof(KernelArgs)`,

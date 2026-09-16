@@ -259,10 +259,10 @@ private:
     // belong to the worker's lifetime and are released in finalize().
     void cleanup_execution(PreparedExecution &prepared, bool retire_aicore) noexcept;
 
-    // The kernel submission boundary is separate from the stream wait and
+    // The kernel submission boundary is separate from the fence wait and
     // post-run teardown: launch_run() submits and drain_execution() reaps.
     LaunchTransactionResult launch_run(PreparedExecution &prepared, LaunchPermit permit);
-    int reap_run(const DfxRunConfig &dfx, uint32_t pipeline_slot);
+    int reap_run(const PreparedExecution &prepared);
 
     // Emit the device-orchestration dep_gen graph, on both the success and the
     // error return of reap_run: the device flushes its dep_gen buffers during

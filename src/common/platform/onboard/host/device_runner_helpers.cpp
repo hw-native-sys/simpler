@@ -41,6 +41,20 @@ int query_stream_nonblocking(rtStream_t stream, const char *name) {
     return SIMPLER_NATIVE_RUN_POLL_ERROR;
 }
 
+int query_stream_error(rtStream_t stream, const char *name) {
+    if (stream == nullptr) {
+        LOG_ERROR("rtStreamQuery (%s) received a null stream", name);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+
+    const rtError_t rc = rtStreamQuery(stream);
+    if (rc == RT_ERROR_NONE || rc == ACL_ERROR_RT_STREAM_NOT_COMPLETE) return 0;
+
+    LOG_ERROR("rtStreamQuery (%s) reports a device error: %d", name, static_cast<int>(rc));
+    ACL_LOG_ERROR_DETAIL(rc);
+    return static_cast<int>(rc);
+}
+
 }  // namespace
 
 int query_stream_pair_nonblocking(rtStream_t aicpu_stream, rtStream_t aicore_stream) {
@@ -55,6 +69,12 @@ int query_stream_pair_nonblocking(rtStream_t aicpu_stream, rtStream_t aicore_str
         return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
     }
     return SIMPLER_NATIVE_RUN_POLL_NOT_READY;
+}
+
+int query_stream_pair_error(rtStream_t aicpu_stream, rtStream_t aicore_stream) {
+    const int aicpu_rc = query_stream_error(aicpu_stream, "AICPU");
+    if (aicpu_rc != 0) return aicpu_rc;
+    return query_stream_error(aicore_stream, "AICore");
 }
 
 int KernelArgsHelper::init_runtime_args(

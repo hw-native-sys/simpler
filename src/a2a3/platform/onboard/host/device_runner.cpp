@@ -425,8 +425,13 @@ int DeviceRunner::prepare_execution(
 
 int DeviceRunner::poll_execution(const ActiveExecution &active) {
     if (active.prepared == nullptr) return SIMPLER_NATIVE_RUN_POLL_ERROR;
-    return run_streams_.poll([](void *aicpu, void *aicore) {
-        return query_stream_pair_nonblocking(static_cast<rtStream_t>(aicpu), static_cast<rtStream_t>(aicore));
+    const PreparedExecution &prepared = *active.prepared;
+    // The pair still gates the query: it owns the try-lock against a concurrent
+    // retirement, the submitter check, and the sticky terminal result. What it
+    // no longer decides is completion — the handles it hands over are only the
+    // evidence the no-boundary fallback inside poll_run_fence needs.
+    return run_streams_.poll([this, &prepared](void *aicpu, void *aicore) {
+        return poll_run_fence(prepared, static_cast<rtStream_t>(aicpu), static_cast<rtStream_t>(aicore));
     });
 }
 
@@ -437,7 +442,7 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
         cleanup_execution(prepared, /*retire_aicore=*/true);
     });
 
-    int rc = reap_run(prepared.dfx, prepared.pipeline_slot);
+    int rc = reap_run(prepared);
     if (rc != 0) {
         // The device/sync error remains authoritative over teardown errors.
         return rc;
@@ -486,6 +491,10 @@ void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool retire_ai
         prepared.aicore_retirement_attempted = true;
         (void)retire_run_aicore_stream(&prepared, RunStreamPair::CompletionStatus::Unproven);
     }
+    // The fence's arming, not its events: the slot keeps those for its next
+    // run. A fatal teardown has already invalidated the whole device
+    // generation, so finalize's abandon owns that case instead.
+    if (!abandon) retire_run_fence(prepared);
     prepared.resources_owned = false;
 }
 
@@ -588,12 +597,15 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
     RunStreamSet streams{static_cast<rtStream_t>(run_streams_.aicpu()), static_cast<rtStream_t>(run_streams_.aicore())};
     LaunchTransactionResult result = exact_launch_transaction(
         prepared.identity, std::move(permit),
-        [&]() -> int {
+        [&](LaunchProgressSink &sink) -> int {
             // Arming precedes any execution-visible submission, so its failures —
             // including a thread-spawn or allocation throw — are reported as an rc
-            // and leave the run safely rollback-able.
+            // and leave the run safely rollback-able. Taking the completion fence
+            // belongs here for the same reason: creating its events can fail, and
+            // here that failure costs the run nothing.
             try {
                 activate_launch_shape(runtime);
+                if (int fence_rc = arm_run_fence(prepared); fence_rc != 0) return fence_rc;
                 (void)arm_device_wall_buffer(prepared.pipeline_slot, prepared.kernel_args);
                 if (int arm_rc = arm_collectors_for_run(runtime, prepared); arm_rc != 0) return arm_rc;
                 start_shared_collectors_for_run(prepared.dfx, prepared.pipeline_slot);
@@ -648,10 +660,14 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
             if (launch_rc != 0) {
                 LOG_ERROR("launch_aicore_kernel failed: %d", launch_rc);
                 recover_device_or_mark_unusable(launch_rc);
+                return launch_rc;
             }
-            return launch_rc;
+            sink.mark_submitted();
+            // Nothing else enters this stream between the kernel and its
+            // boundary, so the boundary completes exactly when the kernel exits.
+            return record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicore, streams.aicore);
         },
-        [&]() -> int {
+        [&](LaunchProgressSink &sink) -> int {
             LOG_INFO("=== launch_aicpu_kernel %s ===", host::KernelNames::RunName);
             int aicpu_launch_n =
                 (runtime.get_aicpu_launch_count() > 0) ? runtime.get_aicpu_launch_count() : launch_aicpu_num;
@@ -660,25 +676,31 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
             );
             if (launch_rc != 0) {
                 LOG_ERROR("launch_aicpu_kernel (main) failed: %d", launch_rc);
+                return launch_rc;
             }
-            return launch_rc;
+            sink.mark_submitted();
+            return record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicpu, streams.aicpu);
         }
     );
     return result;
 }
 
-int DeviceRunner::reap_run(const DfxRunConfig &dfx, uint32_t pipeline_slot) {
+int DeviceRunner::reap_run(const PreparedExecution &prepared) {
     if (!run_streams_.ready()) {
         LOG_ERROR("reap_run: the run stream pair is not ready");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    int rc = sync_stream_pair(run_streams_.aicpu(), run_streams_.aicore());
+    const DfxRunConfig &dfx = prepared.dfx;
+    const uint32_t pipeline_slot = prepared.pipeline_slot;
+    int rc = wait_run_fence(
+        prepared, static_cast<rtStream_t>(run_streams_.aicpu()), static_cast<rtStream_t>(run_streams_.aicore())
+    );
     if (rc != 0) {
-        // The pair wait surfaces the AICore op-timeout (STARS-reaped op ->
-        // 507000/507018/507046 at AICPU/AICore stream sync). The op-timeout
-        // leaves the device context poisoned for the SAME DeviceRunner's next
-        // run, so attempt recovery / mark-unusable here too, not only on the
-        // launch-error path above.
+        // The fence wait surfaces the AICore op-timeout (STARS-reaped op ->
+        // 507000/507018/507046 at the boundary or, on the no-fence fallback, at
+        // stream sync). The op-timeout leaves the device context poisoned for
+        // the SAME DeviceRunner's next run, so attempt recovery / mark-unusable
+        // here too, not only on the launch-error path above.
         recover_device_or_mark_unusable(rc);
         // On an AICPU-detected scheduler hang the device flushed its diagnostic
         // buffers during emergency_shutdown before returning the timeout rc.

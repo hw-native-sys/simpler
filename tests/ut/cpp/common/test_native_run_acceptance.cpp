@@ -45,10 +45,12 @@ NativeRunDescriptor make_descriptor(volatile int32_t *accepted_state) {
 LaunchReceipt complete_receipt(const NativeRunIdentity &identity) {
     LaunchTransactionResult launched = exact_launch_transaction(
         identity, NativeRunExecutionTestPeer::mint(identity),
-        []() {
+        [](LaunchProgressSink &sink) {
+            sink.mark_submitted();
             return 0;
         },
-        []() {
+        [](LaunchProgressSink &sink) {
+            sink.mark_submitted();
             return 0;
         }
     );

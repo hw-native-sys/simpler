@@ -1,0 +1,277 @@
+# Run completion fences
+
+How an onboard run's completion is established, who owns the resources that
+establish it, and what a future change that queues two runs at once may rely
+on.
+
+## The question a stream cannot answer
+
+An onboard run submits exactly two kernels: an AICore kernel and an AICPU
+kernel, on two distinct streams. `rtStreamQuery` and
+`aclrtSynchronizeStreamWithTimeout` answer *"is this queue drained"*. While a
+queue only ever holds one run's work, that is the same question as *"is this run
+finished"* — which is why the runner used to ask it.
+
+It stops being the same question the moment a successor is queued behind a
+predecessor. A stream query would then report the predecessor incomplete until
+the successor had also finished, and a stream wait would block on the
+successor's kernel to answer a question about the predecessor's. Both are wrong
+in the direction that matters: a run would never be reported complete until the
+whole pipeline drained.
+
+So a run gets a boundary of its own.
+
+## The boundary
+
+Each stream records an event immediately after its own kernel:
+
+```text
+AICore stream: kernel(N) -> record core_done(N)
+AICPU  stream: kernel(N) -> record cpu_done(N)
+```
+
+Stream order is what makes this a proof: nothing else enters the stream between
+the kernel and its record, so the event cannot complete before the kernel it
+follows has exited. A run is device-complete when **both** of its recorded
+boundaries complete.
+
+Three things that are *not* proofs, each of which is a way to get this wrong:
+
+- **One boundary.** The two kernels handshake — the AICPU Run kernel spins
+  waiting for AICore workers to report in — so either kernel can still be
+  running while the other has exited.
+- **A device-side handshake or completion flag.** Those are published from
+  inside the kernel, before it returns.
+- **A timeout expiring.** Expiry says the host stopped waiting. It says nothing
+  about what the device is still doing, so it can never license freeing memory
+  the device may hold.
+
+The host must not wait for the AICore boundary before submitting the AICPU
+kernel, for the same handshake reason: the AICore kernel may be spinning for a
+kernel that has not been submitted yet. The two submissions stay back to back,
+AICore first (see the launch-order note in each arch's `launch_execution`), and
+only the boundaries are waited on.
+
+## Completion is not the verdict — a measured constraint
+
+A boundary proves the kernel ahead of it **exited**. It carries nothing about
+whether the device was happy with it, and on this SDK the two facts travel on
+different channels.
+
+Measured on a2a3 / CANN 9.0, on a run whose AICPU kernel returns a fatal status
+(`tests/st/runtime_fatal_codes`, `scope_deadlock` and `explicit_fatal`):
+
+| Call | Result |
+| ---- | ------ |
+| `aclrtSynchronizeEventWithTimeout` on both boundaries | `0` — both complete, so both kernels did exit |
+| `rtStreamQuery` on both streams | `0` — drained, no error |
+| `aclrtPeekAtLastError(ACL_RT_THREAD_LEVEL)` before any synchronize | `0` — nothing recorded |
+| `aclrtSynchronizeStreamWithTimeout(stream, 0)` | `107000` — a zero timeout is rejected outright |
+| `aclrtSynchronizeStreamWithTimeout` with the run's timeout | **`507018`** |
+| `aclrtPeekAtLastError` *after* that synchronize | `507018` |
+
+So the stream synchronize does not merely *report* the exception, it is what
+**materializes** it: nothing observes the fault until that call runs, and there
+is no non-blocking form of it.
+
+That splits the drain path in two, and the split is deliberate:
+
+- **completion** — the run's own two boundaries. Bounded, run-scoped, and
+  unaffected by anything queued behind them.
+- **the device's verdict** — `sync_stream_pair`, because no other call produces
+  one.
+
+The verdict read is the reason the normal drain path still touches the whole
+pair. It is not a hidden completion dependency — completion is already settled
+before it runs, and under the present one-launched-run-at-a-time invariant the
+streams are drained by then, so it returns immediately. But a change that
+queues a successor **cannot keep it**: it would wait for the successor's kernels
+to answer a question about the predecessor's. Replacing it is a prerequisite of
+opening admission, not an afterthought of it.
+
+The candidate that does not require a synchronize is
+`aclrtSetExceptionInfoCallback` — the driver invokes it when a device exception
+occurs, so the error arrives without anyone waiting. It is device-scoped rather
+than run-scoped and brings its own threading and lifetime contract, so it is a
+subsystem to design, not a call to drop in. It is unmeasured here.
+
+### What this leaves open
+
+Run-scoped completion is delivered; a run-scoped *normal drain* is not, because
+that verdict read still waits on the whole pair. Issue #2267 therefore stays
+open on this point, and replacing the read is a prerequisite of admitting a
+second launched run rather than a task that change can absorb. Concretely, that
+change owes:
+
+- an error channel that reports a device exception without a stream
+  synchronize, so a predecessor's drain stops depending on a successor's
+  kernels; and
+- a decision on how a *successor's* fault is attributed, since a stream carries
+  its error stickily and the predecessor's drain would otherwise report it.
+
+`poll_execution` needs none of this. It reports completion from the boundaries
+and additionally reads the streams' *sticky* error state, which is exactly what
+the whole-pair query it replaced reported — so a poll that used to surface a
+stream left in error still does, and a poll that never detected a device
+exception (measured above: `rtStreamQuery` returns `0`) still does not.
+
+## Ownership: the run owns the facts, the runner owns the handles
+
+| Thing | Owner | Released by |
+| ----- | ----- | ----------- |
+| Stream handles | `RunStreamPair` (a2a3) / the persistent pair (a5) | `finalize()` |
+| Boundary event handles | `RunCompletionFence`, one per pipeline slot | `finalize_common_impl` |
+| Submitted / recorded / complete **facts** | the fence's *arming*, keyed on `NativeRunIdentity` | the run, at `retire` |
+
+The events are runner-owned per pipeline slot rather than created per run.
+`aclrtCreateEventExWithFlag` produces an event that re-records without an
+`aclrtResetEvent`, so one pair can serve every run a slot hosts; creating and
+destroying a pair per run would add four device calls to every dispatch and buy
+nothing. This is the same arrangement as the slot's `SlotPersistentArgs` device
+blocks and its retained graph-definition block.
+
+What keeps that safe is that the *facts* are not slot-scoped. Every read and
+mutation on the fence carries the run's `NativeRunIdentity`, so a poller holding
+a stale identity and a later run reusing the slot both fail the check rather
+than observing a boundary that is not theirs. `arm` drops the previous run's
+facts and keeps the handles.
+
+Events are created during the launch arming prologue, ahead of the first
+device-visible submission. A creation failure therefore costs the run nothing:
+it has submitted nothing and rolls back.
+
+## API and timeout choices
+
+| Operation | Call | Why this one |
+| --------- | ---- | ------------ |
+| create | `aclrtCreateEventExWithFlag(ACL_EVENT_SYNC)` | `Ex` events re-record without a reset, which is what makes per-slot reuse possible. `ACL_EVENT_SYNC` is completion-only — these boundaries are never read for a timestamp. |
+| record | `aclrtRecordEvent` | |
+| query | `aclrtQueryEventStatus` | Reports not-ready as a *status*, so a pending boundary is never confused with a failed query. |
+| wait | `aclrtSynchronizeEventWithTimeout` | Bounded, at `timeout_config_.stream_sync_timeout_ms` — the same budget the whole-stream wait it replaces used, so existing timeout configuration keeps its meaning. Its timeout sentinel is `ACL_ERROR_RT_EVENT_SYNC_TIMEOUT` (507047) where the stream form returned `ACL_ERROR_RT_STREAM_SYNC_TIMEOUT` (507046). |
+| destroy | `aclrtDestroyEvent` | |
+
+`aclrtQueryEventWaitStatus` is not used: the question asked here is whether the
+recorded boundary has been reached, which is the *recorded* status.
+
+These are kept deliberately separate from the `ACL_EVENT_TIME_LINE` events
+`clock_correlation.cpp` owns on its own stream. Those exist to be read for a
+timestamp and have their own lifetime contract; sharing one event between a
+completion fence and a timing reader would couple two lifetimes that have no
+reason to agree.
+
+## Submitted work with no boundary
+
+A record can fail *after* its kernel is already on the device. The fence keeps
+those two facts apart, and reports such a run `Unfenced`: its own events cannot
+decide it.
+
+| Per-stream facts | Handling |
+| ---------------- | -------- |
+| No kernel, no queued wait | Nothing device-visible; resources roll back |
+| Kernel submitted, boundary recorded | Query / wait this stream's boundary |
+| Kernel submitted, boundary missing | `Unfenced` — retain resources until an independent bounded proof |
+| No kernel, but a committed wait exists | Kernel parameters may be reclaimable; the wait's event reference is still live |
+
+For an `Unfenced` run, `poll_run_fence` falls back to querying the streams and
+`wait_run_fence` skips the boundary wait and goes straight to the bounded
+`sync_stream_pair` — which on that path is the only evidence available, not just
+the verdict read. A partial launch is by construction not a run with a successor
+queued behind it, so the over-wait a stream carries costs nothing there.
+
+Appending *another* event to an `Unfenced` run would prove nothing — the AICore
+kernel may already be waiting on an AICPU kernel whose submission failed, so
+nothing after it in that stream will ever run. When the fallback cannot
+establish quiescence either, the existing policy takes over unchanged:
+`recover_device_or_mark_unusable` marks the context unusable, `can_accept_run()`
+then fails admission, and `finalize()` takes its force-reset teardown, which is
+the only thing that actually invalidates the device's references. Nothing is
+freed on an unproven path and nothing is re-executed.
+
+## The cross-run join a later change will use
+
+Opening admission to two launched runs needs the successor ordered after the
+predecessor. With per-run boundaries that is two queued waits, crossed:
+
+```text
+successor AICore stream waits predecessor cpu_done
+successor AICPU  stream waits predecessor core_done
+```
+
+Crossed rather than parallel, because each stream already orders itself: the
+AICore edge puts `cpu_done` before the successor's AICore kernel, the stream's
+own order puts `core_done` before `cpu_done`'s peer, and together the two edges
+put **both** predecessor kernels ahead of **either** successor kernel. A
+predecessor record must already be submitted before a successor wait on it is
+queued, and no wait may point back at a successor, or the pair deadlocks.
+
+`RunCompletionFence` carries the reference protocol this needs today, with no
+production caller — inserting the waits and admitting a second launched run
+belong to the change that opens admission. That change also owes the verdict
+channel described above: with a successor queued, the `sync_stream_pair` at the
+end of `wait_run_fence` stops being free and has to be replaced before the
+boundaries can stand alone.
+
+1. `reserve_wait_reference(identity, boundary, waiter)` before queueing the
+   wait. Reserving first is what makes the failure path decidable.
+2. Queue the stream wait on `boundary_event(identity, boundary)`.
+3. `commit_wait_reference` on success, `revoke_wait_reference` on failure.
+4. `release_wait_reference(ref, proven_waiter)` exactly once, and only once a
+   completion proof covers the successor stream `waiter` — the stream that
+   actually holds the wait. Since the join crosses the streams, a proof about
+   the *other* stream leaves the wait uncovered, and the call rejects it.
+   `release_wait_reference_on_quiescence` is the alternative for a verified
+   reset or quarantine, which invalidates every reference at once.
+
+A reference *is* a count, and there is exactly one way to get a count wrong:
+decrement one that is not yours. Every rule below closes one route to that.
+
+- **The token moves, never copies, and a move empties the source.** Two tokens
+  naming one reference would each be releasable, and the second release would
+  consume some other live wait's count. Move assignment is deleted rather than
+  allowed to overwrite — and so silently drop — a live destination token.
+- **The token carries the fence and the arming it was minted against, and every
+  mutation re-checks both.** The counters are per boundary role, so a token
+  offered to the wrong fence, or to the right fence after it re-armed for a
+  later run, would otherwise decrement whichever counter happened to share its
+  two roles. Both are refused.
+- **A fence holding any reservation or committed reference refuses `arm`,
+  `record`, `retire` and `release`.** The first three keep it from re-recording
+  an event a queued wait still names; `release` is the last place the event
+  could be destroyed under one, so it is guarded rather than trusted, and leaves
+  handles and counters intact for a caller that has since released.
+- **Only a verified reset may drop a count without a per-stream proof, and it
+  does so wholesale.** `abandon()` invalidates the generation and its counts
+  together. Tokens still held against it then name counters that are gone, and
+  `discard_stale_wait_reference` is how their holders drop them. Only the fence
+  that minted a token may judge it stale, and it refuses two cases rather than
+  one: a token it still recognises is current, so emptying it would leak the
+  count it holds; and a token *another* fence minted is not stale here either —
+  emptying it would strand the count over there, leaving that fence blocked from
+  retiring with no token left to release it. "Not mine" and "no longer live" are
+  different questions.
+- **`NotStarted` kernels do not imply no reference.** A run whose own kernels
+  never launched can still have queued a wait, and that reference has to be
+  released rather than assumed away.
+
+## Where this lives
+
+| Piece | File |
+| ----- | ---- |
+| State machine | `src/common/platform/include/host/run_completion_fence.h` |
+| ACL event operations | `make_acl_event_ops()` in `src/common/platform/onboard/host/device_runner_base.cpp` |
+| Shared arm / record / poll / wait / retire helpers | `DeviceRunnerBase`, same file |
+| Launch-transaction accounting | `LaunchProgressSink` in `src/common/worker/native_run_execution.h` |
+| Per-arch wiring | `src/{a2a3,a5}/platform/onboard/host/device_runner.cpp` |
+| Tests | `tests/ut/cpp/hierarchical/test_run_completion_fence.cpp` |
+
+`LaunchProgressSink` is part of this and not an aside. A submit callback now
+submits a kernel *and then* records its boundary, so it has a step that can fail
+after the device has already accepted work. Without the sink, that failure's
+non-zero return would be read as a failure before any submission and the run
+graded `NotStarted` — an already-submitted kernel reported as never launched,
+with its resources free to roll back. The callback therefore marks the sink the
+instant the submission is accepted, and the transaction grades a later failure
+`Partial`.
+
+Simulation records no events: its submit callbacks take the sink and ignore it,
+and its grading is unchanged.

@@ -387,12 +387,20 @@ device_worker_main(device_id)
                   ensure_binaries_loaded()     already done by init
                   launch_aicore_kernel()       cached rtRegisterAllKernel handle
                                                  + rtKernelLaunchWithHandleV2
+                                                 + record core_done on that stream
                   launch_aicpu_kernel(Run)     rtsLaunchCpuKernel, cached rtFuncHandle
+                                                 + record cpu_done on that stream
                   publish acceptance from the completed launch receipt
               simpler_poll_run(...)            nonblocking child progress query
-                DeviceRunner::poll_execution(active) nonblocking stream query
+                DeviceRunner::poll_execution(active) nonblocking query of this run's
+                                                 two completion boundaries
               simpler_wait_run(...)
-                DeviceRunner::drain_execution(active) wait on both streams
+                DeviceRunner::drain_execution(active) wait on this run's two
+                                                 boundaries, then read the
+                                                 device's verdict with a stream
+                                                 synchronize — the only call
+                                                 that produces one
+                                                 (docs/design/run-completion-fence.md)
               simpler_finalize_run(...)        rtMemcpy results back; destroy state
 
     ChipWorker.finalize()

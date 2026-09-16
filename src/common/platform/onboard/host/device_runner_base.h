@@ -74,6 +74,7 @@
 #include "host/kernel_execution_state.h"
 #include "host/memory_allocator.h"
 #include "host/pmu_collector.h"
+#include "host/run_completion_fence.h"
 #include "host/runtime_timeout_config.h"
 #include "host/scope_stats_collector.h"
 #include "host/args_dump_collector.h"
@@ -1139,16 +1140,82 @@ protected:
     void resolve_task_binary_addrs(Runtime &runtime);
 
     /**
-     * Wait for both per-Worker streams (AICPU first, then AICore) with
-     * the resolved stream-sync timeout.
-     * Distinguishes the timeout
-     * sentinel `ACL_ERROR_RT_STREAM_SYNC_TIMEOUT` with a stream-id and (device,
+     * Wait for an explicit AICPU/AICore stream pair (AICPU first) with the
+     * resolved stream-sync timeout. Distinguishes the timeout sentinel
+     * `ACL_ERROR_RT_STREAM_SYNC_TIMEOUT` with a stream-id and (device,
      * block_dim) context in the log. Returns the first non-zero rc encountered.
+     *
+     * Waits for everything queued on the pair, so a run's own completion is
+     * established by `wait_run_fence` below instead. This stays the bounded
+     * wait for work no boundary covers, and the call `wait_run_fence` reads the
+     * device's verdict with once completion is settled.
      */
-    int sync_run_streams();
-
-    /** Wait for an explicit AICPU/AICore stream pair. */
     int sync_stream_pair(rtStream_t aicpu_stream, rtStream_t aicore_stream);
+
+    // ---- Per-run completion fences ---------------------------------------
+    //
+    // A stream query or stream wait answers a question about a queue, so it
+    // covers everything queued on it. These helpers answer the same question
+    // about one run, from the two boundary events that run recorded after its
+    // own kernels. See host/run_completion_fence.h for the ownership model and
+    // docs/design/run-completion-fence.md for why each fallback below exists.
+
+    /** One pipeline slot's fence. Slots are indexed as everywhere else. */
+    RunCompletionFence &run_fence(uint32_t pipeline_slot) { return *run_fences_[pipeline_slot]; }
+
+    /**
+     * Take this run's slot fence, committing its events. Belongs in the launch
+     * arming prologue: creation can fail, and there it fails while the run has
+     * still submitted nothing and can roll back.
+     */
+    int arm_run_fence(const PreparedExecution &prepared);
+
+    /**
+     * Record one stream's completion boundary, immediately after that stream's
+     * kernel submission was accepted. Notes the submission first, so a record
+     * failure cannot be mistaken for a kernel that never launched.
+     */
+    int record_run_boundary(const PreparedExecution &prepared, RunCompletionFence::StreamRole role, rtStream_t stream);
+
+    /**
+     * Query this run's boundaries without waiting, as one of the
+     * SIMPLER_NATIVE_RUN_POLL_* values.
+     *
+     * A run holding submitted work that no boundary covers cannot be decided
+     * from its own events, so it falls back to querying the streams — the
+     * queues are the only remaining evidence, and a partial launch is not a
+     * path that has a successor queued behind it.
+     *
+     * A run the boundaries prove complete is additionally checked against the
+     * streams' sticky error state, which keeps what a whole-pair query used to
+     * report about a stream left in error. That check is not a device-exception
+     * detector; see `wait_run_fence`.
+     */
+    int poll_run_fence(const PreparedExecution &prepared, rtStream_t aicpu_stream, rtStream_t aicore_stream);
+
+    /**
+     * Establish that this run finished and what the device made of it.
+     *
+     * Completion comes from the run's own boundaries, waited with the resolved
+     * stream-sync timeout and the event-timeout sentinel logged with the same
+     * (device, block_dim) context `sync_stream_pair` logs. A run no boundary
+     * covers has no such proof and falls back to the bounded whole-stream wait;
+     * expiry proves nothing about quiescence either way, so the caller's
+     * recover-or-mark-unusable policy still owns the non-zero rc.
+     *
+     * The device's verdict is then read with a stream synchronize, which is the
+     * only call on this SDK that produces one — see the measurement in the
+     * definition. That read is what still makes the normal path touch the whole
+     * pair, and it is the piece a change that queues a successor has to replace
+     * before it can rely on the boundaries alone.
+     */
+    int wait_run_fence(const PreparedExecution &prepared, rtStream_t aicpu_stream, rtStream_t aicore_stream);
+
+    /**
+     * Give up this run's arming. Idempotent and a no-op for a run that never
+     * armed, so every teardown path may call it.
+     */
+    void retire_run_fence(const PreparedExecution &prepared) noexcept;
 
     /**
      * Read and reduce this slot's device-phase/task-timing records after stream
@@ -1556,6 +1623,15 @@ protected:
     // a slot's first prepare and released in finalize(), so a steady-state run
     // rewrites their contents instead of reallocating them.
     std::array<SlotPersistentArgs, PTO_PIPELINE_MAX_DEPTH> slot_persistent_args_;
+
+    // One completion fence per pipeline slot. The events are runner-owned for
+    // the same reason the blocks above are: a reuse-capable event re-records
+    // without a reset, so creating a pair per run would add device calls to
+    // every dispatch. The per-run facts they carry are identity-bound, so a
+    // slot's next run cannot read the previous one's completion. Held by
+    // pointer because the fence is non-copyable, so the array cannot be
+    // brace-initialised without naming every slot.
+    std::array<std::unique_ptr<RunCompletionFence>, PTO_PIPELINE_MAX_DEPTH> run_fences_;
 
 public:
     /** The persistent device blocks belonging to one pipeline slot. */

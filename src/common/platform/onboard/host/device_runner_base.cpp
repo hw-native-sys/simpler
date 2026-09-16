@@ -121,11 +121,76 @@ HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
     return HostRuntimeTimeoutConfig{cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms, scheduler_override};
 }
 
+/**
+ * The ACL event operations a `RunCompletionFence` is built on.
+ *
+ * `aclrtCreateEventExWithFlag` rather than the plain form because its events
+ * re-record without an `aclrtResetEvent`, which is what lets one slot's pair
+ * serve every run it hosts. `ACL_EVENT_SYNC` is the completion-only flag: these
+ * boundaries are never read for a timestamp, so they stay distinct from the
+ * `ACL_EVENT_TIME_LINE` events `clock_correlation.cpp` owns on its own stream,
+ * whose lifetime contract is its own.
+ *
+ * `aclrtQueryEventStatus` reports not-ready as a status rather than an error
+ * code, so a pending boundary is never confused with a failed query.
+ */
+RunCompletionFence::DeviceEventOps make_acl_event_ops() {
+    RunCompletionFence::DeviceEventOps ops;
+    ops.create = [](void **out_event) -> int {
+        aclrtEvent event = nullptr;
+        aclError rc = aclrtCreateEventExWithFlag(&event, ACL_EVENT_SYNC);
+        if (rc != ACL_SUCCESS) {
+            LOG_ERROR("aclrtCreateEventExWithFlag (run completion boundary) failed: %d", static_cast<int>(rc));
+            ACL_LOG_ERROR_DETAIL(rc);
+            return static_cast<int>(rc);
+        }
+        *out_event = event;
+        return 0;
+    };
+    ops.record = [](void *event, void *stream) -> int {
+        aclError rc = aclrtRecordEvent(static_cast<aclrtEvent>(event), static_cast<aclrtStream>(stream));
+        if (rc != ACL_SUCCESS) {
+            LOG_ERROR("aclrtRecordEvent (run completion boundary) failed: %d", static_cast<int>(rc));
+            ACL_LOG_ERROR_DETAIL(rc);
+            return static_cast<int>(rc);
+        }
+        return 0;
+    };
+    ops.query = [](void *event, bool *complete) -> int {
+        aclrtEventRecordedStatus status = ACL_EVENT_RECORDED_STATUS_NOT_READY;
+        aclError rc = aclrtQueryEventStatus(static_cast<aclrtEvent>(event), &status);
+        if (rc != ACL_SUCCESS) {
+            LOG_ERROR("aclrtQueryEventStatus (run completion boundary) failed: %d", static_cast<int>(rc));
+            ACL_LOG_ERROR_DETAIL(rc);
+            return static_cast<int>(rc);
+        }
+        *complete = status == ACL_EVENT_RECORDED_STATUS_COMPLETE;
+        return 0;
+    };
+    ops.wait = [](void *event, int timeout_ms) -> int {
+        aclError rc = aclrtSynchronizeEventWithTimeout(static_cast<aclrtEvent>(event), timeout_ms);
+        return rc == ACL_SUCCESS ? 0 : static_cast<int>(rc);
+    };
+    ops.destroy = [](void *event) -> int {
+        aclError rc = aclrtDestroyEvent(static_cast<aclrtEvent>(event));
+        if (rc != ACL_SUCCESS) {
+            LOG_ERROR("aclrtDestroyEvent (run completion boundary) failed: %d", static_cast<int>(rc));
+            ACL_LOG_ERROR_DETAIL(rc);
+            return static_cast<int>(rc);
+        }
+        return 0;
+    };
+    return ops;
+}
+
 }  // namespace
 
 DeviceRunnerBase::DeviceRunnerBase() {
     for (auto &bank : arena_banks_) {
         bank = std::make_unique<ArenaBank>(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_);
+    }
+    for (auto &fence : run_fences_) {
+        fence = std::make_unique<RunCompletionFence>(make_acl_event_ops());
     }
 }
 
@@ -1757,6 +1822,16 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     if (abandon_device_resources) {
         LOG_WARN("Fatal teardown: force reset/quarantine finished; skipping per-resource RTS destroy/free calls");
     }
+    // Completion-boundary events are released ahead of the streams they were
+    // recorded on: no run is left to wait on them here, and a destroyed stream
+    // cannot be the thing that proves a surviving event safe to drop.
+    for (auto &fence : run_fences_) {
+        if (abandon_device_resources) {
+            fence->abandon();
+        } else {
+            capture(fence->release());
+        }
+    }
     if (stream_aicpu_ != nullptr) {
         if (!abandon_device_resources) {
             capture(rtStreamDestroy(stream_aicpu_));
@@ -2192,8 +2267,6 @@ void DeviceRunnerBase::resolve_task_binary_addrs(Runtime &runtime) {
     }
 }
 
-int DeviceRunnerBase::sync_run_streams() { return sync_stream_pair(stream_aicpu_, stream_aicore_); }
-
 int DeviceRunnerBase::sync_stream_pair(rtStream_t aicpu_stream, rtStream_t aicore_stream) {
     LOG_INFO("=== aclrtSynchronizeStreamWithTimeout AICPU stream ===");
     int rc = aclrtSynchronizeStreamWithTimeout(aicpu_stream, timeout_config_.stream_sync_timeout_ms);
@@ -2227,6 +2300,119 @@ int DeviceRunnerBase::sync_stream_pair(rtStream_t aicpu_stream, rtStream_t aicor
         return rc;
     }
     return 0;
+}
+
+namespace {
+
+const char *stream_role_name(RunCompletionFence::StreamRole role) {
+    return role == RunCompletionFence::StreamRole::Aicore ? "AICore" : "AICPU";
+}
+
+}  // namespace
+
+int DeviceRunnerBase::arm_run_fence(const PreparedExecution &prepared) {
+    int rc = run_fence(prepared.pipeline_slot).arm(prepared.identity);
+    if (rc != 0) {
+        LOG_ERROR("arm_run_fence: slot %u could not take a completion fence: %d", prepared.pipeline_slot, rc);
+    }
+    return rc;
+}
+
+int DeviceRunnerBase::record_run_boundary(
+    const PreparedExecution &prepared, RunCompletionFence::StreamRole role, rtStream_t stream
+) {
+    RunCompletionFence &fence = run_fence(prepared.pipeline_slot);
+    // The submission is a fact the instant the device queue accepted it, and it
+    // has to be recorded before anything that can still fail — otherwise a
+    // failing record below would leave the run looking unsubmitted.
+    fence.note_kernel_submitted(prepared.identity, role);
+    int rc = fence.record(prepared.identity, role, stream);
+    if (rc != 0) {
+        LOG_ERROR(
+            "record_run_boundary: %s boundary of slot %u was not recorded: %d; this run holds submitted work no "
+            "fence covers",
+            stream_role_name(role), prepared.pipeline_slot, rc
+        );
+    }
+    return rc;
+}
+
+int DeviceRunnerBase::poll_run_fence(
+    const PreparedExecution &prepared, rtStream_t aicpu_stream, rtStream_t aicore_stream
+) {
+    switch (run_fence(prepared.pipeline_slot).poll(prepared.identity)) {
+    case RunCompletionFence::Completion::Complete:
+        // Boundaries prove the kernels exited; the streams carry the device's
+        // verdict on them, which a completed run still has to be asked for.
+        return query_stream_pair_error(aicpu_stream, aicore_stream) == 0 ? SIMPLER_NATIVE_RUN_POLL_COMPLETE :
+                                                                           SIMPLER_NATIVE_RUN_POLL_ERROR;
+    case RunCompletionFence::Completion::Pending:
+        return SIMPLER_NATIVE_RUN_POLL_NOT_READY;
+    case RunCompletionFence::Completion::Unfenced:
+        return query_stream_pair_nonblocking(aicpu_stream, aicore_stream);
+    case RunCompletionFence::Completion::Error:
+        break;
+    }
+    return SIMPLER_NATIVE_RUN_POLL_ERROR;
+}
+
+int DeviceRunnerBase::wait_run_fence(
+    const PreparedExecution &prepared, rtStream_t aicpu_stream, rtStream_t aicore_stream
+) {
+    RunCompletionFence &fence = run_fence(prepared.pipeline_slot);
+    if (!fence.fenced(prepared.identity)) {
+        LOG_WARN(
+            "wait_run_fence: slot %u holds submitted work no boundary covers; falling back to the bounded "
+            "whole-stream wait",
+            prepared.pipeline_slot
+        );
+        return sync_stream_pair(aicpu_stream, aicore_stream);
+    }
+
+    LOG_INFO("=== aclrtSynchronizeEventWithTimeout run completion boundaries ===");
+    int rc = fence.wait(prepared.identity, timeout_config_.stream_sync_timeout_ms);
+    if (rc == ACL_ERROR_RT_EVENT_SYNC_TIMEOUT) {
+        LOG_ERROR(
+            "Run fence wait timeout: timeout_ms=%d device_id=%d block_dim=%d slot=%u",
+            timeout_config_.stream_sync_timeout_ms, device_id_, block_dim_, prepared.pipeline_slot
+        );
+        ACL_LOG_ERROR_DETAIL(rc);
+        return rc;
+    }
+    if (rc != 0) {
+        LOG_ERROR("aclrtSynchronizeEventWithTimeout (run completion boundary) failed: %d", rc);
+        ACL_LOG_ERROR_DETAIL(rc);
+        return rc;
+    }
+
+    // Completion is settled above; this reads the device's verdict on the work
+    // that completed, and on this SDK a stream synchronize is the only call
+    // that produces one. Measured on a2a3 for a run whose AICPU kernel returned
+    // a fatal status: both boundaries complete (so the kernels did exit),
+    // rtStreamQuery reports both streams drained and error-free,
+    // aclrtPeekAtLastError reports nothing, and only
+    // aclrtSynchronizeStreamWithTimeout surfaces the 507018 — after which peek
+    // reports it too. A zero timeout is rejected outright (107000), so there is
+    // no non-blocking form of the same check. See
+    // docs/design/run-completion-fence.md.
+    rc = sync_stream_pair(aicpu_stream, aicore_stream);
+    if (rc != 0) {
+        LOG_ERROR(
+            "Run completed its boundaries but the device reports an error executing it: %d (device_id=%d "
+            "block_dim=%d slot=%u)",
+            rc, device_id_, block_dim_, prepared.pipeline_slot
+        );
+    }
+    return rc;
+}
+
+void DeviceRunnerBase::retire_run_fence(const PreparedExecution &prepared) noexcept {
+    if (run_fence(prepared.pipeline_slot).retire(prepared.identity) != 0) {
+        LOG_ERROR(
+            "retire_run_fence: slot %u keeps its fence — a queued cross-run wait still names a boundary of it",
+            prepared.pipeline_slot
+        );
+    }
 }
 
 void DeviceRunnerBase::read_device_wall_ns(uint32_t pipeline_slot) {

@@ -479,6 +479,19 @@ target_link_libraries(test_run_stream_pair PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB
 add_test(NAME test_run_stream_pair COMMAND test_run_stream_pair)
 set_tests_properties(test_run_stream_pair PROPERTIES LABELS "no_hardware")
 
+# Per-run completion fence: dual-boundary completion, the submitted-without-a-
+# boundary verdict, and the cross-run wait-reference lifetime. Header-only with
+# injected event operations, so it needs no runtime objects and no device.
+add_executable(test_run_completion_fence hierarchical/test_run_completion_fence.cpp)
+target_include_directories(test_run_completion_fence PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+)
+target_link_libraries(test_run_completion_fence PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_run_completion_fence COMMAND test_run_completion_fence)
+set_tests_properties(test_run_completion_fence PROPERTIES LABELS "no_hardware")
+
 add_executable(test_native_run_execution common/test_native_run_execution.cpp)
 target_include_directories(test_native_run_execution PRIVATE
     ${GTEST_INCLUDE_DIRS}

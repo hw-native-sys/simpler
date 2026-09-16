@@ -116,6 +116,7 @@ nav:
       - Scheduler: scheduler.md
       - TMR A2/A3 vs A5: tensormap-and-ringbuffer-a2a3-vs-a5.md
       - A5 AICPU core selection: design/a5-fg-pg-core-selection.en.md
+      - Run completion fences: design/run-completion-fence.md
       - Worker Manager: worker-manager.md
       - Hardware:
           - Overview: hardware/README.md

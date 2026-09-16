@@ -34,11 +34,11 @@ TEST(NativeRunExecutionTest, IdentityMismatchDoesNotSubmit) {
 
     LaunchTransactionResult result = exact_launch_transaction(
         other, NativeRunExecutionTestPeer::mint(kIdentity),
-        [&]() {
+        [&](LaunchProgressSink &) {
             ++submissions;
             return 0;
         },
-        [&]() {
+        [&](LaunchProgressSink &) {
             ++submissions;
             return 0;
         }
@@ -54,10 +54,10 @@ TEST(NativeRunExecutionTest, AicoreFailureIsSafePrelaunchFailure) {
     int aicpu_submissions = 0;
     LaunchTransactionResult result = exact_launch_transaction(
         kIdentity, NativeRunExecutionTestPeer::mint(kIdentity),
-        []() {
+        [](LaunchProgressSink &) {
             return 41;
         },
-        [&]() {
+        [&](LaunchProgressSink &) {
             ++aicpu_submissions;
             return 0;
         }
@@ -73,7 +73,7 @@ TEST(NativeRunExecutionTest, ArmingFailureReportedAsRcStaysSafe) {
     int aicpu_submissions = 0;
     LaunchTransactionResult result = exact_launch_transaction(
         kIdentity, NativeRunExecutionTestPeer::mint(kIdentity),
-        [&]() -> int {
+        [&](LaunchProgressSink &) -> int {
             // The shape every real submit callback uses: the arming prologue
             // catches its own throws and reports them as an rc, so the failure
             // stays on the safe side of the first submission.
@@ -83,7 +83,7 @@ TEST(NativeRunExecutionTest, ArmingFailureReportedAsRcStaysSafe) {
                 return -1;
             }
         },
-        [&]() {
+        [&](LaunchProgressSink &) {
             ++aicpu_submissions;
             return 0;
         }
@@ -95,14 +95,57 @@ TEST(NativeRunExecutionTest, ArmingFailureReportedAsRcStaysSafe) {
     EXPECT_EQ(aicpu_submissions, 0);
 }
 
+// The record-after-launch shape: the kernel is already on the device when the
+// step after it fails. Grading that NotStarted would hand the caller a run it
+// believes never launched, and let it roll back resources the device holds.
+TEST(NativeRunExecutionTest, AicoreFailureAfterMarkedSubmissionPoisons) {
+    int aicpu_submissions = 0;
+    LaunchTransactionResult result = exact_launch_transaction(
+        kIdentity, NativeRunExecutionTestPeer::mint(kIdentity),
+        [](LaunchProgressSink &sink) {
+            sink.mark_submitted();
+            return 41;
+        },
+        [&](LaunchProgressSink &) {
+            ++aicpu_submissions;
+            return 0;
+        }
+    );
+
+    EXPECT_EQ(result.rc, 41);
+    EXPECT_EQ(result.progress, LaunchProgress::Partial);
+    EXPECT_TRUE(result.poisoned());
+    EXPECT_EQ(aicpu_submissions, 0);
+    EXPECT_FALSE(result.receipt.valid());
+}
+
+TEST(NativeRunExecutionTest, AicpuFailureAfterMarkedSubmissionStaysPartial) {
+    LaunchTransactionResult result = exact_launch_transaction(
+        kIdentity, NativeRunExecutionTestPeer::mint(kIdentity),
+        [](LaunchProgressSink &sink) {
+            sink.mark_submitted();
+            return 0;
+        },
+        [](LaunchProgressSink &sink) {
+            sink.mark_submitted();
+            return 43;
+        }
+    );
+
+    EXPECT_EQ(result.rc, 43);
+    EXPECT_EQ(result.progress, LaunchProgress::Partial);
+    EXPECT_TRUE(result.poisoned());
+    EXPECT_FALSE(result.receipt.valid());
+}
+
 TEST(NativeRunExecutionTest, AicoreExceptionPoisonsWithoutTryingAicpu) {
     int aicpu_submissions = 0;
     LaunchTransactionResult result = exact_launch_transaction(
         kIdentity, NativeRunExecutionTestPeer::mint(kIdentity),
-        []() -> int {
+        [](LaunchProgressSink &) -> int {
             throw 41;
         },
-        [&]() {
+        [&](LaunchProgressSink &) {
             ++aicpu_submissions;
             return 0;
         }
@@ -118,10 +161,10 @@ TEST(NativeRunExecutionTest, AicoreExceptionPoisonsWithoutTryingAicpu) {
 TEST(NativeRunExecutionTest, AicpuFailureAfterAicorePoisonsWithoutReceipt) {
     LaunchTransactionResult result = exact_launch_transaction(
         kIdentity, NativeRunExecutionTestPeer::mint(kIdentity),
-        []() {
+        [](LaunchProgressSink &) {
             return 0;
         },
-        []() {
+        [](LaunchProgressSink &) {
             return 43;
         }
     );
@@ -136,11 +179,11 @@ TEST(NativeRunExecutionTest, AicpuExceptionAfterAicorePoisonsWithoutReceipt) {
     int aicore_submissions = 0;
     LaunchTransactionResult result = exact_launch_transaction(
         kIdentity, NativeRunExecutionTestPeer::mint(kIdentity),
-        [&]() {
+        [&](LaunchProgressSink &) {
             ++aicore_submissions;
             return 0;
         },
-        []() -> int {
+        [](LaunchProgressSink &) -> int {
             throw 43;
         }
     );
@@ -156,12 +199,14 @@ TEST(NativeRunExecutionTest, BothSubmissionsProduceIdentityBoundReceipt) {
     int order = 0;
     LaunchTransactionResult result = exact_launch_transaction(
         kIdentity, NativeRunExecutionTestPeer::mint(kIdentity),
-        [&]() {
+        [&](LaunchProgressSink &sink) {
             EXPECT_EQ(order++, 0);
+            sink.mark_submitted();
             return 0;
         },
-        [&]() {
+        [&](LaunchProgressSink &sink) {
             EXPECT_EQ(order++, 1);
+            sink.mark_submitted();
             return 0;
         }
     );
@@ -184,10 +229,10 @@ TEST(NativeRunExecutionTest, PermitIsOneShot) {
 
     LaunchTransactionResult success = exact_launch_transaction(
         kIdentity, std::move(first),
-        []() {
+        [](LaunchProgressSink &) {
             return 0;
         },
-        []() {
+        [](LaunchProgressSink &) {
             return 0;
         }
     );

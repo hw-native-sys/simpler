@@ -466,12 +466,15 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
 
     LaunchTransactionResult transaction = exact_launch_transaction(
         prepared->identity, std::move(permit),
-        [&]() -> int {
+        [&](LaunchProgressSink &sink) -> int {
             // Arming precedes any execution-visible submission, so its failures —
             // including a thread-spawn or allocation throw — are reported as an rc
-            // and leave the run safely rollback-able.
+            // and leave the run safely rollback-able. Taking the completion fence
+            // belongs here for the same reason: creating its events can fail, and
+            // here that failure costs the run nothing.
             try {
                 activate_launch_shape(runtime);
+                if (int fence_rc = arm_run_fence(*prepared); fence_rc != 0) return fence_rc;
                 (void)arm_device_wall_buffer(prepared->pipeline_slot, prepared->kernel_args);
                 if (int arm_rc = arm_collectors_for_run(runtime, *prepared); arm_rc != 0) return arm_rc;
                 start_shared_collectors_for_run(prepared->dfx, prepared->pipeline_slot);
@@ -527,10 +530,14 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
             if (launch_rc != 0) {
                 LOG_ERROR("launch_aicore_kernel failed: %d", launch_rc);
                 recover_device_or_mark_unusable(launch_rc);
+                return launch_rc;
             }
-            return launch_rc;
+            sink.mark_submitted();
+            // Nothing else enters this stream between the kernel and its
+            // boundary, so the boundary completes exactly when the kernel exits.
+            return record_run_boundary(*prepared, RunCompletionFence::StreamRole::Aicore, stream_aicore_);
         },
-        [&]() -> int {
+        [&](LaunchProgressSink &sink) -> int {
             LOG_INFO("=== launch_aicpu_kernel %s ===", host::KernelNames::RunName);
             // launch_count = popcount(OCCUPY) from the topology probe — one thread
             // per user-schedulable cpu_id. The filter gate barriers exactly this
@@ -544,8 +551,10 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
             );
             if (launch_rc != 0) {
                 LOG_ERROR("launch_aicpu_kernel (main) failed: %d", launch_rc);
+                return launch_rc;
             }
-            return launch_rc;
+            sink.mark_submitted();
+            return record_run_boundary(*prepared, RunCompletionFence::StreamRole::Aicpu, stream_aicpu_);
         }
     );
 
@@ -573,7 +582,11 @@ int DeviceRunner::poll_execution(const ActiveExecution &active) {
     }
     if (state != RunPollState::Submitted) return SIMPLER_NATIVE_RUN_POLL_ERROR;
 
-    const int rc = query_stream_pair_nonblocking(stream_aicpu_, stream_aicore_);
+    // The state machine above still gates the query — it owns the slot check
+    // and the sticky terminal result. What it no longer decides is completion:
+    // that is this run's own boundaries, with the streams left as the evidence
+    // the no-boundary fallback inside poll_run_fence needs.
+    const int rc = poll_run_fence(*active.prepared, stream_aicpu_, stream_aicore_);
     if (rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE) {
         RunPollState expected = RunPollState::Submitted;
         (void)run_poll_state_.compare_exchange_strong(
@@ -598,12 +611,13 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
         cleanup_execution(prepared, /*launched=*/true);
     });
 
-    int rc = sync_run_streams();
+    int rc = wait_run_fence(prepared, stream_aicpu_, stream_aicore_);
     if (rc != 0) {
-        // sync_run_streams surfaces the AICore op-timeout (STARS-reaped op ->
-        // 507000/507018/507046 at AICPU/AICore stream sync). The op-timeout
-        // leaves the context poisoned, so recovery remains the drain owner's
-        // responsibility and its error remains authoritative over cleanup.
+        // The fence wait surfaces the AICore op-timeout (STARS-reaped op ->
+        // 507000/507018/507046 at the boundary or, on the no-fence fallback, at
+        // stream sync). The op-timeout leaves the context poisoned, so recovery
+        // remains the drain owner's responsibility and its error remains
+        // authoritative over cleanup.
         recover_device_or_mark_unusable(rc);
         // Emergency shutdown may already have flushed diagnostics. Export the
         // manifest on the error path exactly once.
@@ -664,6 +678,10 @@ void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool launched)
         prepared.kernel_args.release_run_view();
     }
     prepared.kernel_args.args.regs = 0;
+    // The fence's arming, not its events: the slot keeps those for its next
+    // run. A fatal teardown has already invalidated the whole device
+    // generation, so finalize's abandon owns that case instead.
+    if (!abandon) retire_run_fence(prepared);
     prepared.resources_owned = false;
     if (launched) run_poll_state_.store(RunPollState::Drained, std::memory_order_release);
 }
