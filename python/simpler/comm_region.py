@@ -456,6 +456,31 @@ class RegionInstanceRegistry:
         if instance._data_plane_error is None:
             instance._data_plane_error = error
 
+    def record_data_plane_failure_by_allocation_identity(
+        self,
+        run_scope: object,
+        session_instance_id: bytes,
+        transaction_id: int,
+        error: BaseException,
+    ) -> None:
+        session = bytes(session_instance_id)
+        transaction = int(transaction_id)
+        matches: list[RegionInstance] = []
+        for instance in self._iter_run(run_scope):
+            try:
+                identity = instance._allocation_identity
+            except MaterializationError:
+                continue
+            if identity == (session, transaction):
+                matches.append(instance)
+        if not matches:
+            raise MaterializationError("no region instance for allocation identity")
+        if len(matches) > 1:
+            raise MaterializationError("duplicate region instances for allocation identity")
+        instance = matches[0]
+        if instance._data_plane_error is None:
+            instance._data_plane_error = error
+
     def _iter_run(self, run_scope: Any) -> tuple[RegionInstance, ...]:
         return tuple(instance for key, instance in self._instances.items() if self._run_scopes[key] is run_scope)
 
@@ -515,6 +540,16 @@ class RegionInstance:
     @property
     def provider_resource_id(self) -> int:
         return int(self._provider_resource_id)
+
+    @property
+    def _allocation_identity(self) -> tuple[bytes, int]:
+        session = self._delegated_session_instance_id
+        if not isinstance(session, (bytes, bytearray)) or len(bytes(session)) != _SESSION_INSTANCE_ID_BYTES:
+            raise MaterializationError("region allocation identity is incomplete")
+        transaction_id = self._delegated_transaction_id
+        if type(transaction_id) is not int or transaction_id < 1 or transaction_id > _UINT64_MAX:
+            raise MaterializationError("region allocation identity is incomplete")
+        return bytes(session), int(transaction_id)
 
     @property
     def data_plane_error(self) -> BaseException | None:
