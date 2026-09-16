@@ -541,6 +541,49 @@ an all-or-nothing stage and parks in the single shape-agnostic queue, every
 other candidate in its per-shape one. An in-graph task reaches that fork by the
 same path a top-level one does.
 
+### What a `sync_start` cohort is scoped to
+
+A cohort is **one task's blocks**, never a set of tasks. Everything the
+rendezvous reads — `staged_core_mask`, `running_slot_count` and
+`early_dispatch_state` — lives in that one task's `TaskPayload`, so
+`try_launch_sync_start_cohort` decides a launch from that task alone. A body
+root and a top-level task therefore never rendezvous with each other, and two
+`sync_start` roots in the same body do not either. This holds however the
+members were staged: the scope is the task, not the submission site.
+
+What changes for a root inside a body is only **which event supplies each half**
+of the rendezvous. Both halves must still hold before any doorbell rings, and
+both mean the same thing they do at top level:
+
+- *every gated core occupies a running slot*. For a top-level candidate Tier 0
+  stages the cohort once its producer has published. For a body root Tier 0
+  stages it once `stage_graph_roots_early` has enqueued it, which happens on the
+  shell's early release rather than on any publish of its own.
+- *the producer released*, i.e. `early_dispatch_state == DISPATCHED`. At top
+  level that is the producer completing. For a body root it is the shell's
+  producers completing, which lets `activate_graph_task` open the external gate
+  and `graph_route_ready_roots` route the root.
+
+A root has no producer inside the body, so the second half is the shell's
+dependency rather than its own — which is the same dependency the shell stands
+for. The all-or-nothing contract is unchanged; only its trigger moved.
+
+The one thing two cohorts do share is the **global drain**, and it is a mutual
+exclusion rather than a rendezvous: `sync_start_pending` admits one
+capacity-short cohort at a time, whether it came from a body or from the top
+level. A cohort that loses that race is cancelled back to the ordinary ready
+path, not merged into the winner.
+
+A body root that needs the whole device is legal and does not deadlock against
+its siblings, for three independent reasons. Early staging runs only on an idle
+pass with every ready queue drained, so it never takes cores from ready work.
+Gated staging counts pending slots as available (`include_pending`), so a cohort
+can stage behind running tasks instead of waiting for them to retire. And
+sibling roots carry no waits-for edge between them — they are all gated on the
+same external event — so no cycle exists for them to close. The worst outcome is
+a lost pre-stage: a cohort that cannot be placed is cancelled and takes the
+ordinary `ready_sync_queues` path, where the ready drain serves it.
+
 The runtime wake-list registration is a transient polling subscription, not
 dependency discovery or Graph rewiring. Fanout CSR remains in the Definition
 as part of the complete recorded topology and for DFX, but readiness does not
