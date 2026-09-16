@@ -3198,18 +3198,18 @@ class TestRunHandle:
             raise ValueError("bad graph")
 
         with pytest.raises(ValueError, match="bad graph"):
-            worker._submit_l3_locked(bad_graph, None, cast(Any, SimpleNamespace(output_prefix="/tmp/run-artifacts")))
+            worker._submit_locked(bad_graph, None, cast(Any, SimpleNamespace(output_prefix="/tmp/run-artifacts")))
         assert seeded == ["/tmp/run-artifacts"]
 
         # No prefix means no directory to seed, and spans stay on stderr.
         seeded.clear()
         with pytest.raises(ValueError, match="bad graph"):
-            worker._submit_l3_locked(bad_graph, None, cast(Any, SimpleNamespace(output_prefix="")))
+            worker._submit_locked(bad_graph, None, cast(Any, SimpleNamespace(output_prefix="")))
         assert seeded == []
 
         # A config without the field at all must not be what fails a submit.
         with pytest.raises(ValueError, match="bad graph"):
-            worker._submit_l3_locked(bad_graph, None, cast(Any, object()))
+            worker._submit_locked(bad_graph, None, cast(Any, object()))
         assert seeded == []
 
     def test_unsettled_graph_cancellation_abandons_the_handle_before_close(self):

@@ -64,6 +64,26 @@ def test_l3_swimlane_postprocess_merges_dispatches_present_on_every_rank(tmp_pat
     ]
 
 
+def test_single_file_postprocess_passes_the_processes_actual_bound_host_log(tmp_path, monkeypatch) -> None:
+    """A later case must not assume the process-wide log moved beside it."""
+    scene_test_module = importlib.import_module("simpler_setup.scene_test")
+    task_interface = importlib.import_module("_task_interface")
+    bound = tmp_path / "first-case"
+    current = tmp_path / "later-case"
+    bound.mkdir()
+    current.mkdir()
+    host_log = bound / "host.42.log"
+    host_log.write_text("")
+    (current / "chip_swimlane_records.json").write_text("{}")
+    monkeypatch.setattr(task_interface, "_host_log_directory", lambda: str(bound))
+    calls = []
+    monkeypatch.setattr(scene_test_module, "_run_swimlane_converter", _recording_converter(calls))
+
+    scene_test_module._convert_case_swimlane("case", current)
+
+    assert calls[0]["host_log_paths"] == [host_log]
+
+
 def test_l3_swimlane_postprocess_merges_below_level_four(tmp_path, monkeypatch, caplog) -> None:
     """Placement comes from the Host log, so no capture level gates the merge.
 

@@ -18,7 +18,15 @@ from simpler_setup.tools import swimlane_converter as sc
 from simpler_setup.tools.strace_timing import parse_spans, to_host_swimlane
 
 
-def _containment_placement(document, *, runner_start_ns=1_000, runner_dur_ns=5_000, wall_ns=2_000, sched=(700, 100)):
+def _containment_placement(
+    document,
+    *,
+    runner_start_ns=1_000,
+    runner_dur_ns=5_000,
+    wall_ns=2_000,
+    sched=(700, 100),
+    aicpu_launch_ns=None,
+):
     """Place a capture inside a synthetic Host window, the way the tools do.
 
     The `sched` span is what joins the two artifacts: the capture records the
@@ -32,6 +40,8 @@ def _containment_placement(document, *, runner_start_ns=1_000, runner_dur_ns=5_0
         f"{prefix}{head} depth=2 name=chip.run.runner_run.device_wall ts=0 dur={wall_ns} clk=dev",
         f"{prefix}{head} depth=3 name=chip.run.runner_run.device_wall.sched ts={sched[0]} dur={sched[1]} clk=dev",
     ]
+    if aicpu_launch_ns is not None:
+        lines.append(f"{prefix}{head} depth=2 name=chip.run.runner_run.aicpu_launch ts={aicpu_launch_ns} dur=0")
     (window,) = containment.host_windows(parse_spans(lines))
     return containment.place(window, containment.capture_windows(document))
 
@@ -798,6 +808,225 @@ def test_single_capture_uses_host_timeline_when_a_containing_window_is_given(tmp
     # The `sched` window is 50 ns wider than the records inside it, which is
     # exactly how well the two artifacts can be joined.
     assert data["timeline_metadata"]["placement"]["join"]["residual_ns"] == 50
+
+
+def test_placement_bound_lane_starts_at_aicpu_launch_and_draws_the_remaining_interval():
+    document = {
+        "metadata": {"clock_freq_hz": 1_000_000_000},
+        "aicore_tasks": [[0, 7, 1, 2_100, 2_200, 0]],
+        "aicpu_scheduler_phases": [[{"kind": "dispatch", "start_cycles": 1_900, "end_cycles": 1_950}]],
+    }
+    placement = _containment_placement(document, aicpu_launch_ns=2_500)
+
+    events = sc._placement_bound_events(0, placement, global_origin_ns=0)
+    outer = next(event for event in events if event.get("ph") == "X" and event["tid"] == 0)
+    slack = next(event for event in events if event.get("ph") == "X" and event["tid"] == 1)
+
+    assert (outer["ts"], outer["dur"]) == (1.0, 5.0)
+    assert (slack["ts"], slack["dur"]) == (2.5, 1.5)
+    assert slack["args"]["outer_slack_ns"] == 3_000
+    assert slack["args"]["slack_ns"] == 1_500
+
+
+@pytest.mark.parametrize("runtime", ["host_build_graph", "tensormap_and_ringbuffer"])
+def test_file_conversion_auto_splices_a_sibling_host_log(monkeypatch, tmp_path, runtime):
+    host_orchestrated = runtime == "host_build_graph"
+    document = {
+        "chip_swimlane_level": 4,
+        "metadata": {
+            "clock_freq_hz": 1_000_000_000,
+            "num_cores": 1,
+            "core_types": ["aiv"],
+            "core_to_thread": [0],
+        },
+        "aicore_tasks": [[0, 7, 1, 2_100, 2_200, 0]],
+        "aicpu_tasks": [[0, 1, 2_000, 2_300]],
+        "aicpu_scheduler_phases": [
+            [{"kind": "dispatch", "start_cycles": 1_900, "end_cycles": 1_950, "tasks_processed": 1}]
+        ],
+    }
+    if host_orchestrated:
+        document["metadata"].update(
+            {
+                "orchestrator_source": "host",
+                "orchestrator_clock_domain": "host_monotonic_ns",
+                "host_orchestration_origin_ns": 500,
+                "timeline_relation": "host_orchestration_precedes_device",
+                "host_capture": {
+                    "status": "complete",
+                    "expected_records": 1,
+                    "recorded_records": 1,
+                    "dropped_records": 0,
+                    "error": None,
+                },
+            }
+        )
+        document["host_orchestrator_phases"] = [
+            [{"submit_idx": 0, "task_id": 7, "start_host_ns": 500, "end_host_ns": 800}]
+        ]
+        document["host_device_uploads"] = [
+            {"phase": "arena_h2d", "start_host_ns": 800, "end_host_ns": 900, "detail": 64}
+        ]
+    else:
+        document["aicpu_orchestrator_phases"] = [
+            [{"submit_idx": 0, "task_id": 7, "start_cycles": 1_800, "end_cycles": 1_850}]
+        ]
+    raw = tmp_path / "chip_swimlane_records.json"
+    raw.write_text(json.dumps(document))
+    prefix = "[mono_ns=6000][T0x1][TIMING] emit_host_span: "
+    head = "[STRACE] v=1 pid=42 tid=42 inv=1 hid=abc"
+    (tmp_path / "host.42.log").write_text(
+        "\n".join(
+            [
+                f"{prefix}{head} depth=0 name=chip.run ts=900 dur=5200 ",
+                f"{prefix}{head} depth=1 name=chip.run.bind ts=900 dur=50 ",
+                f"{prefix}{head} depth=1 name=chip.run.runner_run ts=1000 dur=5000 ",
+                f"{prefix}{head} depth=2 name=chip.run.runner_run.device_wall ts=0 dur=2000 clk=dev",
+                f"{prefix}{head} depth=3 name=chip.run.runner_run.device_wall.sched ts=700 dur=100 clk=dev",
+                f"{prefix}{head} depth=1 name=chip.run.validate ts=6000 dur=50 ",
+            ]
+        )
+    )
+    monkeypatch.setattr("sys.argv", ["swimlane_converter", str(raw)])
+
+    assert sc.main() == 0
+
+    trace = json.loads((tmp_path / "merged_swimlane.json").read_text())
+    assert trace["metadata"]["layout"] == "containment_spliced"
+    assert trace["metadata"]["cross_domain_latency_available"] is True
+    assert trace["metadata"]["placement"]["outer_pid"] == 42
+    process_names = {
+        event["args"]["name"]
+        for event in trace["traceEvents"]
+        if event.get("ph") == "M" and event.get("name") == "process_name"
+    }
+    assert "Device phases (placed)" not in process_names
+    assert "Placement Bound" not in process_names
+    assert "Host" not in process_names
+    assert not any(event.get("cat") == "host" for event in trace["traceEvents"])
+    assert not any(event.get("cat") == "containment" for event in trace["traceEvents"])
+    names = {event.get("name") for event in trace["traceEvents"] if event.get("ph") == "X"}
+    assert "submit(t7)" in names
+    assert ("arena_h2d" in names) is host_orchestrated
+
+
+def test_file_conversion_falls_back_when_repeated_host_windows_are_ambiguous(monkeypatch, tmp_path, capsys):
+    """A sibling log may improve a file conversion, but cannot make it fail."""
+    document = {
+        "chip_swimlane_level": 4,
+        "metadata": {
+            "clock_freq_hz": 1_000_000_000,
+            "num_cores": 1,
+            "core_types": ["aiv"],
+            "core_to_thread": [0],
+        },
+        "aicore_tasks": [[0, 7, 1, 2_100, 2_200, 0]],
+        "scheduler_tasks": {
+            "schema_version": 1,
+            "producer": "aicpu",
+            "records": [[0, 1, 2_000, 2_300]],
+        },
+        "aicpu_scheduler_phases": [
+            [{"kind": "dispatch", "start_cycles": 1_900, "end_cycles": 1_950, "tasks_processed": 1}]
+        ],
+    }
+    raw = tmp_path / "chip_swimlane_records.json"
+    raw.write_text(json.dumps(document))
+    lines = []
+    for inv, start in ((1, 1_000), (2, 10_000)):
+        prefix = f"[mono_ns={start}][T0x1][TIMING] emit_host_span: "
+        head = f"[STRACE] v=1 pid=42 tid=42 inv={inv} hid=abc"
+        lines += [
+            f"{prefix}{head} depth=1 name=chip.run.runner_run ts={start} dur=5000 ",
+            f"{prefix}{head} depth=2 name=chip.run.runner_run.device_wall ts=0 dur=2000 clk=dev",
+            f"{prefix}{head} depth=3 name=chip.run.runner_run.device_wall.sched ts=700 dur=100 clk=dev",
+        ]
+    (tmp_path / "host.42.log").write_text("\n".join(lines) + "\n")
+    monkeypatch.setattr("sys.argv", ["swimlane_converter", str(raw)])
+
+    assert sc.main() == 0
+
+    trace = json.loads((tmp_path / "merged_swimlane.json").read_text())
+    assert trace["metadata"]["layout"] == "device_relative"
+    assert "pair ambiguously" in trace["metadata"]["host_placement_error"]
+    assert "writing the relative device timeline instead" in capsys.readouterr().err
+
+
+def test_file_rank_pid_pin_selects_one_repeated_invocation(tmp_path):
+    document = {
+        "metadata": {"clock_freq_hz": 1_000_000_000},
+        "aicore_tasks": [[0, 7, 1, 2_100, 2_200, 0]],
+        "aicpu_scheduler_phases": [[{"kind": "dispatch", "start_cycles": 1_900, "end_cycles": 1_950}]],
+    }
+    records = tmp_path / "chip_swimlane_records.json"
+    records.write_text(json.dumps(document))
+    lines = []
+    for inv, start in ((1, 1_000), (2, 10_000)):
+        prefix = f"[mono_ns={start}][T0x1][TIMING] emit_host_span: "
+        head = f"[STRACE] v=1 pid=42 tid=42 inv={inv} hid=abc"
+        lines += [
+            f"{prefix}{head} depth=1 name=chip.run.runner_run ts={start} dur=5000 ",
+            f"{prefix}{head} depth=2 name=chip.run.runner_run.device_wall ts=0 dur=2000 clk=dev",
+            f"{prefix}{head} depth=3 name=chip.run.runner_run.device_wall.sched ts=700 dur=100 clk=dev",
+        ]
+    (tmp_path / "host.42.log").write_text("\n".join(lines) + "\n")
+
+    placement, context = sc._place_single_capture(records, document, None, ["0=42:2"])
+
+    assert placement is not None
+    assert context is not None
+    assert placement.host.inv == 2
+    assert context["host_pairing"]["source"] == "pinned"
+
+
+def test_file_conversion_reads_its_dispatch_identity_sidecar(tmp_path):
+    document = {
+        "metadata": {"clock_freq_hz": 1_000_000_000},
+        "aicore_tasks": [[0, 7, 1, 2_100, 2_200, 0]],
+        "aicpu_scheduler_phases": [[{"kind": "dispatch", "start_cycles": 1_900, "end_cycles": 1_950}]],
+    }
+    capture_dir = tmp_path / "rank0" / "d0"
+    capture_dir.mkdir(parents=True)
+    records = capture_dir / "chip_swimlane_records.json"
+    records.write_text(json.dumps(document))
+    (capture_dir / "dispatch_identity.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "run_id": 7,
+                "task_slot": 0,
+                "group_index": 0,
+                "group_size": 1,
+                "chip_rank": 0,
+                "local_capture_index": 0,
+                "endpoint_dispatch_id": 2,
+                "pipeline_slot": 0,
+                "pipeline_generation": 1,
+                "host_pid": 42,
+                "callable_digest": "ab" * 32,
+            }
+        )
+    )
+    lines = []
+    for inv, dispatch_id, start in ((1, 1, 1_000), (2, 2, 10_000)):
+        prefix = f"[mono_ns={start}][T0x1][TIMING] emit_host_span: "
+        head = f"[STRACE] v=1 pid=42 tid=42 inv={inv} hid=abc"
+        lines += [
+            f"{prefix}{head} depth=0 name=chip.run ts={start - 100} dur=5200 "
+            f"run_id=7 dispatch_id={dispatch_id} slot_id=0 generation=1",
+            f"{prefix}{head} depth=1 name=chip.run.runner_run ts={start} dur=5000 ",
+            f"{prefix}{head} depth=2 name=chip.run.runner_run.device_wall ts=0 dur=2000 clk=dev",
+            f"{prefix}{head} depth=3 name=chip.run.runner_run.device_wall.sched ts=700 dur=100 clk=dev",
+        ]
+    host_log = tmp_path / "host.42.log"
+    host_log.write_text("\n".join(lines) + "\n")
+
+    placement, context = sc._place_single_capture(records, document, [str(host_log)])
+
+    assert placement is not None
+    assert context is not None
+    assert placement.host.inv == 2
+    assert context["host_pairing"]["source"] == "capture_sidecar"
 
 
 def test_aicore_scheduler_records_keep_common_shape_and_stream_metadata(tmp_path):

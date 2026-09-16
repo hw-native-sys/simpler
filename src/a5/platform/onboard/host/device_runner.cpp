@@ -18,6 +18,7 @@
 #include "device_runner.h"
 
 #include "acl/acl.h"
+#include "common/strace.h"
 #include "host/acl_error_log.h"
 #include "host_log.h"
 #include "platform_comm/comm.h"
@@ -507,7 +508,6 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
 
             run_poll_slot_.store(prepared->pipeline_slot, std::memory_order_relaxed);
             run_poll_state_.store(RunPollState::Enqueuing, std::memory_order_release);
-            LOG_INFO("=== launch_aicore_kernel ===");
             run_poll_state_.store(RunPollState::Submitted, std::memory_order_release);
             int launch_rc = launch_aicore_kernel(stream_aicore_, prepared->kernel_args.device_k_args_);
             if (launch_rc != 0) {
@@ -517,7 +517,6 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
             return launch_rc;
         },
         [&]() -> int {
-            LOG_INFO("=== launch_aicpu_kernel %s ===", host::KernelNames::RunName);
             // launch_count = popcount(OCCUPY) from the topology probe — one thread
             // per user-schedulable cpu_id. The filter gate barriers exactly this
             // many threads (runtime.aicpu_launch_count is read on the device side
@@ -525,6 +524,7 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
             // the topology-derived launch count above.
             int aicpu_launch_n =
                 (runtime.get_aicpu_launch_count() > 0) ? runtime.get_aicpu_launch_count() : launch_aicpu_num;
+            STRACE_HOST_SPAN_AT("chip.run.runner_run.aicpu_launch", STRACE_NOW_NS(), 0, 2);
             int launch_rc = launch_aicpu_kernel(
                 stream_aicpu_, &prepared->kernel_args.args, host::KernelNames::RunName, aicpu_launch_n
             );

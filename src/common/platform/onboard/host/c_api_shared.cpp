@@ -952,6 +952,10 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
+    // launch_execution emits point-in-time markers from the DeviceRunner
+    // without carrying trace identity through that interface. Restore the
+    // prepared invocation on this API thread for the duration of the launch.
+    STRACE_CONTEXT(state->trace_inv, state->trace_hid, 1);
     state->runner_trace_start_ns = STRACE_NOW_NS();
     int rc = PTO_RUNTIME_ERR_INTERNAL;
     try {

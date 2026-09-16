@@ -11229,6 +11229,15 @@ class Worker:
     def _submit_locked(self, callable, args, config) -> RunHandle:
         cfg = config if config is not None else CallConfig()
 
+        # This process's log belongs beside the first run's diagnostic
+        # artifacts. The destination is process-wide and the first non-empty
+        # path wins, so later SceneTest cases explicitly pass the actual bound
+        # host log to their converter instead of assuming it moved with the
+        # next CallConfig.output_prefix.
+        log_directory = getattr(cfg, "output_prefix", "")
+        if log_directory:
+            _native_set_host_log_directory(log_directory)
+
         if self.level == 2:
             assert self._chip_worker is not None
             state = self._resolve_handle(callable, expected_namespace="LOCAL_CHIP")
@@ -11490,13 +11499,6 @@ class Worker:
     def _submit_l3_locked(self, callable, args, cfg: CallConfig) -> RunHandle:
         assert self._orch is not None
         assert self._worker is not None
-        # This process's log belongs beside the run's other diagnostic artifacts,
-        # so the directory comes from the config that already names it. First one
-        # in a process wins; with no prefix the logger stays on stderr. Read
-        # defensively: wiring an output must never be what fails a submit.
-        log_directory = getattr(cfg, "output_prefix", "")
-        if log_directory:
-            _native_set_host_log_directory(log_directory)
         run_id = self._orch._begin_run()
         resources = _RunResources()
         handle = RunHandle(self, run_id, (callable, args, cfg), resources)

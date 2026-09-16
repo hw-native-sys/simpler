@@ -20,8 +20,15 @@ the outer window*. For a Chip Swimlane capture the chain is
 so an event's placement error is the outer window's *slack* — how much wider it
 is than the work it brackets — and that term is measured, never estimated:
 
-    slack     = outer_duration - device_extent
-    placement in [outer_start, outer_start + slack]
+    outer_slack = outer_duration - device_extent
+    placement in [outer_start, outer_start + outer_slack]
+
+When present, the Host-side AICPU launch marker narrows that interval by the
+causal statement ``aicpu_launch <= device_start``. This raises the interval's
+lower endpoint and narrows the published ``slack`` to the interval that remains.
+The lower-bound rendering places the device block directly at launch; it does
+not claim the device began there exactly, and no timestamp from one clock is
+equated to one from another.
 
 Nothing here reads a Host/Device clock anchor. Two unknowns stand between a raw
 cycle and the Host axis, and containment bounds both:
@@ -55,6 +62,7 @@ from typing import Optional
 RUN_SPAN = "chip.run"
 RUNNER_SPAN = "chip.run.runner_run"
 DEVICE_WALL_SPAN = "chip.run.runner_run.device_wall"
+AICPU_LAUNCH_SPAN = "chip.run.runner_run.aicpu_launch"
 
 _PHASE_PREFIX = DEVICE_WALL_SPAN + "."
 
@@ -123,6 +131,7 @@ class HostWindow:
     device_wall_ns: int
     phases: dict[str, tuple[int, int]]
     identity: Optional[tuple[int, ...]] = None
+    aicpu_launch_ns: Optional[int] = None
 
     @property
     def end_ns(self):
@@ -194,17 +203,26 @@ class Placement:
         return max(self.host.device_wall_ns, self.hi_phase_ns) - self.head_phase_ns
 
     @property
-    def slack_ns(self):
+    def outer_slack_ns(self):
+        """Placement width before applying a Host-side causal marker."""
         return self.host.duration_ns - self.extent_ns
 
     @property
     def place_lo_ns(self):
         """Earliest Host ns the placed block can start at — the placement used."""
-        return float(self.host.start_ns)
+        lower_bound = float(self.host.start_ns)
+        if self.host.aicpu_launch_ns is not None:
+            lower_bound = max(lower_bound, float(self.host.aicpu_launch_ns))
+        return lower_bound
 
     @property
     def place_hi_ns(self):
-        return self.host.start_ns + self.slack_ns
+        return self.host.start_ns + self.outer_slack_ns
+
+    @property
+    def slack_ns(self):
+        """Width of the placement interval after every known constraint."""
+        return self.place_hi_ns - self.place_lo_ns
 
     def phase_ns_to_host_ns(self, phase_ns):
         return self.place_lo_ns + (phase_ns - self.head_phase_ns)
@@ -226,12 +244,16 @@ class Placement:
             "outer_duration_ns": self.host.duration_ns,
             "device_wall_ns": self.host.device_wall_ns,
             "device_extent_ns": int(round(self.extent_ns)),
+            "outer_slack_ns": int(round(self.outer_slack_ns)),
             "slack_ns": int(round(self.slack_ns)),
             "place_lo_ns": int(round(self.place_lo_ns)),
             "place_hi_ns": int(round(self.place_hi_ns)),
         }
         if self.join is not None and self.capture is not None:
             out["join"] = self.join.metadata(self.capture.frequency_hz)
+        if self.host.aicpu_launch_ns is not None:
+            out["aicpu_launch_ns"] = self.host.aicpu_launch_ns
+            out["causal_constraint"] = "aicpu_launch<=device_start"
         return out
 
 
@@ -306,6 +328,7 @@ def host_windows(spans):
                 device_wall_ns=device_wall.dur,
                 phases=phases,
                 identity=_host_identity(named.get(RUN_SPAN)),
+                aicpu_launch_ns=(named[AICPU_LAUNCH_SPAN].ts if AICPU_LAUNCH_SPAN in named else None),
             )
         )
     return windows
@@ -441,9 +464,9 @@ def place(host, capture=None, join=None):
 
     With a ``capture``, that capture's records are joined onto the same
     device-phase timeline and placed alongside the ``device_wall`` sub-phases
-    the Host log carries. The cross-Rank merge is the only caller and always
-    passes one; the capture-less form bounds the Host log's own ``clk=dev``
-    spans and is exercised by the unit tests alone.
+    the Host log carries. Single-capture and cross-Rank conversion both pass
+    one; the capture-less form bounds the Host log's own ``clk=dev`` spans and
+    is exercised by the unit tests alone.
     """
     if capture is not None and join is None:
         join = join_origin(host, capture)
@@ -466,10 +489,15 @@ def place(host, capture=None, join=None):
         lo_phase_ns=lo_phase_ns,
         hi_phase_ns=hi_phase_ns,
     )
-    if placement.slack_ns < 0:
+    if placement.outer_slack_ns < 0:
         raise ContainmentError(
             f"pid {host.pid} inv {host.inv} draws {placement.extent_ns / 1000.0:.1f} us of device work "
             f"but its {RUNNER_SPAN} window is only {host.duration_ns / 1000.0:.1f} us wide"
+        )
+    if placement.slack_ns < 0:
+        raise ContainmentError(
+            f"pid {host.pid} inv {host.inv} has no legal placement: its {AICPU_LAUNCH_SPAN} marker "
+            "would put the device block outside the runner window"
         )
     return placement
 
@@ -481,6 +509,14 @@ def _pairing_cost(host, capture):
     stream covers nearly all of its phase window, so the true pairing is the
     small one. A pairing that is not even feasible costs infinity.
     """
+    # A candidate must satisfy every constraint that the following placement
+    # step will enforce. In particular, a late launch marker can leave no room
+    # for the device extent even when the outer window alone is wide enough.
+    try:
+        place(host, capture)
+    except ContainmentError:
+        return math.inf
+
     cost = 0.0
     matched = 0
     for short_name in capture.windows:
@@ -682,9 +718,9 @@ def pair_captures(hosts, captures, *, forced=None, identities=None, host_pids=No
         raise ContainmentError(
             f"the captures pair ambiguously with the Host log's invocations: the best match is off by "
             f"{best_cost / 1000.0:.1f} us of window and the next by {runner_up / 1000.0:.1f} us, which is too "
-            "close to tell apart. Ranks running the same shape leave nothing in the timing that names the other, "
-            "so re-run so the captures carry dispatch_identity.json with its host_pid, or pin the pairing "
-            "explicitly (--rank-pid RANK=PID:INV)."
+            "close to tell apart. Repeated runs or Ranks with the same shape leave nothing in the timing that "
+            "names the other. Re-run so the captures carry dispatch_identity.json with its host_pid, or pin the "
+            "pairing explicitly (--rank-pid RANK=PID:INV)."
         )
 
     sources = dict.fromkeys(pinned, "pinned")

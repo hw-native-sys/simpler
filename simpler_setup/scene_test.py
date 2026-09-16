@@ -1204,6 +1204,7 @@ def _run_swimlane_converter(
     dispatch: str | None = None,
     dispatch_id: str | None = None,
     output_path: Path | None = None,
+    host_log_paths: list[Path] | None = None,
 ) -> bool:
     """Invoke the bundled swimlane converter as a subprocess.
 
@@ -1234,6 +1235,8 @@ def _run_swimlane_converter(
         cmd += ["--dispatch-id", dispatch_id]
     if output_path is not None:
         cmd += ["--output", str(output_path)]
+    for host_log_path in host_log_paths or []:
+        cmd += ["--host-log", str(host_log_path)]
     if enable_overhead:
         cmd.append("--overhead")
     try:
@@ -1249,6 +1252,25 @@ def _run_swimlane_converter(
         if e.stderr:
             logger.warning(f"stderr: {e.stderr.strip()}")
         return False
+
+
+def _external_bound_host_logs(output_prefix: Path) -> list[Path]:
+    """Return the process log files when the logger is bound to an older case.
+
+    The host logger is process-wide and deliberately keeps one destination so
+    concurrent runs cannot move each other's records. SceneTest, however, may
+    create several per-case output directories in that process. Later cases
+    therefore pass the actual bound files explicitly to the converter instead
+    of assuming their logs are siblings of each capture.
+    """
+    try:
+        from _task_interface import _host_log_directory  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+    except ImportError:
+        return []
+    bound = _host_log_directory()
+    if not bound or Path(bound).resolve() == output_prefix.resolve():
+        return []
+    return sorted(Path(bound).glob("host.*.log"))
 
 
 def _sanitize_for_filename(s: str) -> str:
@@ -1318,6 +1340,8 @@ def _convert_rank_swimlanes(
         logger.warning(f"[{case_label}] no complete Rank capture is present under {output_prefix}")
         return
 
+    host_log_paths = _external_bound_host_logs(output_prefix)
+
     for target in targets:
         # Directory mode auto-loads each Rank's own sibling name map, so these
         # are dumped in place and never passed as a global override.
@@ -1329,6 +1353,7 @@ def _convert_rank_swimlanes(
             dispatch=target["dispatch"],
             dispatch_id=target["dispatch_id"],
             output_path=output_prefix / f"{target['output_stem']}.json" if len(targets) > 1 else None,
+            host_log_paths=host_log_paths,
         )
         if not merged:
             for capture_dir in target["capture_dirs"]:
@@ -1336,6 +1361,7 @@ def _convert_rank_swimlanes(
                     input_path=capture_dir / "chip_swimlane_records.json",
                     func_names_path=dump_name_map(capture_dir),
                     enable_overhead=enable_overhead,
+                    host_log_paths=host_log_paths,
                 )
 
 
@@ -1377,7 +1403,12 @@ def _convert_case_swimlane(
         safe_label = _sanitize_for_filename(case_label)
         func_names_path = _dump_name_map(mapping, output_prefix / f"name_map_{safe_label}.json")
 
-    _run_swimlane_converter(input_path=perf_file, func_names_path=func_names_path, enable_overhead=enable_overhead)
+    _run_swimlane_converter(
+        input_path=perf_file,
+        func_names_path=func_names_path,
+        enable_overhead=enable_overhead,
+        host_log_paths=_external_bound_host_logs(output_prefix),
+    )
 
 
 def _run_deps_viewer(

@@ -461,6 +461,18 @@ python -m simpler_setup.tools.swimlane_converter \
     build_output/<case>/dfx_outputs --dispatch-id 17:5
 ```
 
+For a single `chip_swimlane_records.json`, the converter discovers sibling
+`host.*.log` files and places the Device block inside its
+`chip.run.runner_run` window. The same placement covers both Chip runtimes:
+HBG's Host-orchestrator records remain on `CLOCK_MONOTONIC`, while TMR's AICPU
+orchestration records move with the Device block. The resulting trace retains
+only HBG's task-centric Host Orchestrator / Host Prepare projections, such as
+`submit` and `arena_h2d`. The `device_wall` phases, placement bounds, and full
+`chip.run` bind/runner/validation call tree remain available in `host.*.log`
+rather than being duplicated here. With no sibling Host log, an archived
+capture remains readable on its relative Device timeline; `--host-log` supplies
+a log stored elsewhere.
+
 For directory input, the default output is `dfx_outputs/l3_swimlane.json`.
 Every Rank must sit under `rankN/<dispatch>/` and report the same
 `metadata.host_clock_domain_id`, and the run's `host.<pid>.log` files must be

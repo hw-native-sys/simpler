@@ -16,7 +16,16 @@ from simpler_setup.tools.strace_timing import parse_spans
 _GHZ = 1_000_000_000
 
 
-def _host_log(*, pid=42, inv=1, runner=(1_000, 5_000), wall_ns=2_000, phases=(("sched", 700, 100),), dispatch=None):
+def _host_log(
+    *,
+    pid=42,
+    inv=1,
+    runner=(1_000, 5_000),
+    wall_ns=2_000,
+    phases=(("sched", 700, 100),),
+    dispatch=None,
+    aicpu_launch=None,
+):
     """One invocation's `[STRACE]` lines, as `emit_native_run_host_wall` writes them.
 
     ``dispatch`` is the ``(run_id, dispatch_id, slot_id, generation)`` the root
@@ -36,6 +45,8 @@ def _host_log(*, pid=42, inv=1, runner=(1_000, 5_000), wall_ns=2_000, phases=(("
         f"{prefix}{head} depth=1 name=chip.run.runner_run ts={runner[0]} dur={runner[1]} ",
         f"{prefix}{head} depth=2 name=chip.run.runner_run.device_wall ts=0 dur={wall_ns} clk=dev",
     ]
+    if aicpu_launch is not None:
+        lines.append(f"{prefix}{head} depth=2 name=chip.run.runner_run.aicpu_launch ts={aicpu_launch} dur=0")
     lines += [
         f"{prefix}{head} depth=3 name=chip.run.runner_run.device_wall.{name} ts={ts} dur={dur} clk=dev"
         for name, ts, dur in phases
@@ -121,6 +132,33 @@ def test_placement_keeps_every_record_inside_its_window():
     assert placement.host.start_ns <= first <= last <= placement.host.end_ns
 
 
+def test_aicpu_launch_places_the_device_block_at_its_lower_bound():
+    """The marker bounds the whole device block without becoming a clock anchor."""
+    capture = containment.capture_windows(_capture())
+    placement = containment.place(_window(aicpu_launch=2_500), capture)
+
+    assert placement.phase_ns_to_host_ns(placement.head_phase_ns) == 2_500
+    assert placement.map_cycles_to_host_ns(2_100) == 3_425
+    assert placement.place_lo_ns == 2_500
+    assert placement.place_hi_ns == 4_000
+    assert placement.outer_slack_ns == 3_000
+    assert placement.slack_ns == 1_500
+    assert placement.metadata()["causal_constraint"] == "aicpu_launch<=device_start"
+
+
+def test_old_host_log_without_aicpu_launch_keeps_the_original_placement():
+    capture = containment.capture_windows(_capture())
+
+    assert containment.place(_window(), capture).place_lo_ns == 1_000
+
+
+def test_aicpu_launch_refuses_a_causal_constraint_outside_the_runner_window():
+    capture = containment.capture_windows(_capture())
+
+    with pytest.raises(containment.ContainmentError, match="no legal placement"):
+        containment.place(_window(aicpu_launch=5_500), capture)
+
+
 def test_placement_without_a_capture_places_the_host_logs_own_device_spans():
     """A host swimlane has no capture, only the `clk=dev` spans in the log."""
     placement = containment.place(_window(phases=(("sched", 700, 100), ("preamble", 0, 300))))
@@ -152,6 +190,20 @@ def test_pairing_reads_the_rank_out_of_the_window_each_capture_fills():
     assert [pairs[rank].pid for rank in (0, 1)] == [10, 11]
     assert diagnostics[0]["window_excess_ns"] == 50
     assert diagnostics[1]["source"] == "device_window_fit"
+
+
+def test_pairing_skips_a_window_that_the_launch_constraint_makes_unplaceable():
+    """A cheap phase fit is not a candidate when its marker leaves no room."""
+    capture = containment.capture_windows(_capture())
+    hosts = [
+        _window(pid=10, phases=(("sched", 700, 50),), aicpu_launch=4_500),
+        _window(pid=11, phases=(("sched", 700, 100),)),
+    ]
+
+    pairs, diagnostics = containment.pair_captures(hosts, {0: capture})
+
+    assert pairs[0].pid == 11
+    assert diagnostics[0]["pid"] == 11
 
 
 def test_pairing_refuses_to_guess_between_look_alike_ranks():

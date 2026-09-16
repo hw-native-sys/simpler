@@ -17,6 +17,7 @@
 
 #include "device_runner.h"
 
+#include "common/strace.h"
 #include "host_log.h"
 #include "aicpu_loader/host/load_aicpu_op.h"
 
@@ -619,7 +620,6 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
                 return rc;
             }
 
-            LOG_INFO("=== launch_aicore_kernel ===");
             int launch_rc = launch_aicore_kernel(streams.aicore, prepared.kernel_args.device_k_args_);
             if (launch_rc != 0) {
                 LOG_ERROR("launch_aicore_kernel failed: %d", launch_rc);
@@ -628,9 +628,9 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
             return launch_rc;
         },
         [&]() -> int {
-            LOG_INFO("=== launch_aicpu_kernel %s ===", host::KernelNames::RunName);
             int aicpu_launch_n =
                 (runtime.get_aicpu_launch_count() > 0) ? runtime.get_aicpu_launch_count() : launch_aicpu_num;
+            STRACE_HOST_SPAN_AT("chip.run.runner_run.aicpu_launch", STRACE_NOW_NS(), 0, 2);
             int launch_rc = launch_aicpu_kernel(
                 streams.aicpu, &prepared.kernel_args.args, host::KernelNames::RunName, aicpu_launch_n
             );

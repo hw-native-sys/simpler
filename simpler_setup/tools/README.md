@@ -167,6 +167,20 @@ python -m simpler_setup.tools.swimlane_converter build_output/<case>/dfx_outputs
     --dispatch-id 17:5 -o build_output/<case>/dfx_outputs/l3_swimlane.json
 ```
 
+For a file input, the converter automatically reads sibling `host.*.log`
+files and places the Chip records inside the `chip.run.runner_run` window that
+held them. This applies to both `host_build_graph` and
+`tensormap_and_ringbuffer`: Host-orchestrated records keep their Host
+timestamps, while AICPU orchestration records move with the Device block. A
+placed file trace keeps only the existing task-centric Host Orchestrator / Host
+Prepare projections, such as `submit` and `arena_h2d`. The `device_wall`
+phases, placement bounds, and full `chip.run` bind/runner/validation call tree
+remain in the Host log rather than crowding this view. A
+capture with no sibling Host log retains its relative timeline. `--host-log`
+can name the log explicitly when it is stored elsewhere. If the available log
+cannot identify one invocation unambiguously, file mode warns and retains the
+relative timeline; `--rank-pid 0=PID:INV` can pin that invocation explicitly.
+
 Directory mode puts the Ranks on one axis by containment, not by calibration:
 each Rank's device work is placed inside the `chip.run.runner_run` window that
 held it, read from the run's `host.<pid>.log`. It therefore needs those logs
@@ -259,8 +273,8 @@ SPMD tasks are present.
 | `--output` | `-o` | Output JSON file (default: `merged_swimlane.json` beside a file input, `l3_swimlane.json` inside a directory input) |
 | `--dispatch` | | Directory mode only: local capture directory to merge across Ranks, e.g. `d0`. Mutually exclusive with `--dispatch-id` |
 | `--dispatch-id` | | Directory mode only: parent dispatch identity to merge, formatted `RUN_ID:TASK_SLOT`. Resolves each Rank's own `dN` through `dispatch_identity.json`. Mutually exclusive with `--dispatch` |
-| `--host-log` | | Directory mode: Host `[STRACE]` log holding the `chip.run.runner_run` windows the captures are placed in (repeatable). Defaults to every `host.*.log` in the input directory |
-| `--rank-pid` | | Directory mode: pin one Rank's capture to the Host invocation that ran it, `RANK=PID` or `RANK=PID:INV` (repeatable). Only needed when the captures carry no `dispatch_identity.json` and Ranks running the same shape cannot be told apart by their device windows |
+| `--host-log` | | Host `[STRACE]` log holding the `chip.run.runner_run` windows used for placement (repeatable). Defaults to sibling `host.*.log` files for file input, or `host.*.log` in the input directory for directory mode |
+| `--rank-pid` | | Pin a capture to the Host invocation that ran it, `RANK=PID` or `RANK=PID:INV` (repeatable); use Rank `0` for file input. Only needed when the capture carries no usable `dispatch_identity.json` and repeated runs cannot be told apart by their device windows |
 | `--kernel-config` | `-k` | Path to kernel_config.py, used for function name mapping. Rejected in directory mode |
 | `--func-names` | | Path to name_map*.json (SceneTest format) for function name mapping. Rejected in directory mode |
 | `--deps-json` | | Path to a dep_gen `deps.json` (defaults to sibling of input). Without one, no dependency arrows are drawn. Rejected in directory mode |

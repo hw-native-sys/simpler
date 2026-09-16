@@ -3192,16 +3192,17 @@ Examples:
     parser.add_argument(
         "--host-log",
         action="append",
-        help="Host [STRACE] log holding the chip.run.runner_run windows the captures are placed in "
-        "(repeatable). Defaults to every host.*.log in the input directory.",
+        help="Host [STRACE] log holding the chip.run.runner_run windows the capture is placed in "
+        "(repeatable). Defaults to every sibling host.*.log for file input, or every host.*.log in a "
+        "directory input.",
     )
     parser.add_argument(
         "--rank-pid",
         action="append",
         metavar="RANK=PID[:INV]",
-        help="Pin one Rank's capture to the Host invocation that ran it (repeatable). Only needed when the "
-        "captures carry no dispatch_identity.json and Ranks running the same shape cannot be told apart by "
-        "their device windows. Give :INV when the process ran more than once.",
+        help="Pin a capture to the Host invocation that ran it (repeatable; use Rank 0 for file input). Only "
+        "needed when the capture carries no usable dispatch_identity.json and repeated runs cannot be told "
+        "apart by their device windows. Give :INV when the process ran more than once.",
     )
     parser.add_argument(
         "--overhead",
@@ -3704,6 +3705,53 @@ def _place_rank_captures(host_log_paths, raw_inputs, identities, host_pids, pins
     return placements, pairing, spans
 
 
+def _place_single_capture(records_path, raw, explicit_host_logs, rank_pid_values=None):
+    """Place one Chip capture inside its sibling Host execution window.
+
+    A standalone capture predating Host-log placement remains readable on its
+    relative timeline when no log is present. A sibling log is opportunistic:
+    when it cannot identify this capture unambiguously, conversion falls back
+    to that relative timeline instead of making a previously valid file input
+    unusable. The warning and metadata keep the lost placement observable.
+    """
+    if explicit_host_logs:
+        host_logs = _discover_host_logs(records_path.parent, explicit_host_logs)
+    else:
+        host_logs = sorted(records_path.parent.glob("host.*.log"))
+        if not host_logs:
+            return None, None
+
+    sidecar = _load_dispatch_identity(records_path.parent)
+    identity = containment.capture_identity(sidecar)
+    host_pid = (sidecar or {}).get("host_pid")
+    identities = {0: identity} if identity is not None else {}
+    host_pids = {0: int(host_pid)} if host_pid is not None else {}
+    pins = _parse_rank_pid_pins(rank_pid_values)
+
+    # A Level-2 file uses the same containment pipeline as cross-Rank placement,
+    # including both ways the CLI documents for resolving repeated invocations.
+    try:
+        placements, pairing, _ = _place_rank_captures(host_logs, {0: raw}, identities, host_pids, pins)
+    except (containment.ContainmentError, ValueError) as error:
+        message = str(error).rstrip(".")
+        print(
+            f"Warning: could not place {records_path.name} on the Host timeline: {message}; "
+            "writing the relative device timeline instead.",
+            file=sys.stderr,
+        )
+        return None, {
+            "host_logs": [str(path) for path in host_logs],
+            "host_placement_error": message,
+        }
+    return (
+        placements[0],
+        {
+            "host_logs": [str(path) for path in host_logs],
+            "host_pairing": pairing[0],
+        },
+    )
+
+
 def _host_block_lane(rank, lane_index, label):
     """Metadata for one lane of a Rank's Host block.
 
@@ -3912,6 +3960,7 @@ def _placement_bound_events(rank, placement, global_origin_ns):
     """
     pid, events = _host_block_lane(rank, 2, "Placement Bound")
     outer_start_us = (placement.host.start_ns - global_origin_ns) / 1000.0
+    placement_start_us = (placement.place_lo_ns - global_origin_ns) / 1000.0
     args = placement.metadata()
     events += [
         {"args": {"name": "outer window"}, "cat": "__metadata", "name": "thread_name", "ph": "M", "pid": pid, "tid": 0},
@@ -3939,7 +3988,7 @@ def _placement_bound_events(rank, placement, global_origin_ns):
             "ph": "X",
             "pid": pid,
             "tid": 1,
-            "ts": outer_start_us,
+            "ts": placement_start_us,
             "dur": placement.slack_ns / 1000.0,
             "args": args,
         },
@@ -4185,7 +4234,16 @@ def main():
             raise ValueError("--dispatch and --dispatch-id are only valid when input is a dfx_outputs directory")
         if args.verbose:
             print(f"Reading performance data from: {input_path}")
-        data = read_perf_data(input_path)
+        with input_path.open() as file:
+            raw = json.load(file)
+        placement, placement_context = _place_single_capture(input_path, raw, args.host_log, args.rank_pid)
+        data = _decode_perf_data(raw, placement=placement)
+        global_origin_ns = data.get("timeline_metadata", {}).get("timeline_origin_ns")
+        if placement_context is not None:
+            timeline_metadata = data.setdefault("timeline_metadata", {})
+            timeline_metadata.setdefault("layout", "device_relative")
+            timeline_metadata.update(placement_context)
+            data["timeline_metadata"]["global_origin_ns"] = global_origin_ns
         _print_verbose_data_info(data, args.verbose)
 
         func_names, orchestrator_name = _load_func_names(args, input_path)
@@ -4241,6 +4299,11 @@ def main():
         print("\n✓ Conversion complete")
         print(f"  Input:  {input_path}")
         print(f"  Output: {output_path}")
+        if placement is not None:
+            print(
+                f"  Bound:  device records placed within {placement.slack_ns / 1000.0:.1f} us of their "
+                f"{containment.RUNNER_SPAN} window"
+            )
         print(f"\nTo visualize: Open https://ui.perfetto.dev/ and drag in {output_path}")
 
         print_task_statistics(data["tasks"], func_names, chip_swimlane_level=data["chip_swimlane_level"])

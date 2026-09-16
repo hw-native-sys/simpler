@@ -11,20 +11,23 @@
 sys.path is handled by pyproject.toml [tool.pytest.ini_options] pythonpath.
 """
 
+import os
+import re
 import time
+from pathlib import Path
 
 import pytest
 
 
 @pytest.fixture
 def drain_host_log():
-    """Read captured output with the host-log writer drained first.
+    """Read new host-log output from the process's active sink.
 
-    A `[STRACE]` record reaches captured stderr through the process writer
-    thread, so a bare `capfd.readouterr()` races it: the reader can return before
-    the last records are written, and the failure then looks like a missing span
-    rather than a timing problem. Every test that counts or matches spans in
-    captured output needs this.
+    A `[STRACE]` record reaches stderr or ``host.<pid>.log`` through the process
+    writer thread, so a bare ``capfd.readouterr()`` both races the writer and
+    misses records after a run binds the logger to its output directory. Track
+    the file cursor as well as captured output so repeated drains consume each
+    record exactly once regardless of which sink is active.
 
     The wait is bounded but it is not the verdict. Producers are quiescent by the
     time a test reads — the run has completed — so `pending_record_count`
@@ -33,11 +36,56 @@ def drain_host_log():
     Exhausting the bound means the writer is genuinely stuck, and the message
     reports the drop counter so a queue loss is not mistaken for a slow drain.
     """
+    from _task_interface import _host_log_directory  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
     from simpler.task_interface import (  # noqa: PLC0415
         _flush_host_log,
         _host_log_dropped_records,
         _host_log_pending_records,
     )
+
+    file_directory = _host_log_directory()
+    fixture_start_ns = time.monotonic_ns()
+    file_offset = 0
+    if file_directory:
+        host_log = Path(file_directory) / f"host.{os.getpid()}.log"
+        if host_log.exists():
+            file_offset = host_log.stat().st_size
+
+    def _read_file_tail() -> str:
+        nonlocal file_directory, file_offset
+        active_directory = _host_log_directory()
+        if not active_directory:
+            file_directory = ""
+            file_offset = 0
+            return ""
+
+        changed_directory = active_directory != file_directory
+        if changed_directory:
+            file_directory = active_directory
+            file_offset = 0
+        host_log = Path(active_directory) / f"host.{os.getpid()}.log"
+        try:
+            with host_log.open("rb") as stream:
+                stream.seek(file_offset)
+                chunk = stream.read()
+                file_offset = stream.tell()
+        except FileNotFoundError:
+            return ""
+        text = chunk.decode("utf-8", errors="replace")
+        if not changed_directory:
+            return text
+
+        # The bind may happen after fixture setup but before this first read.
+        # Starting at EOF would discard this test's already-flushed records;
+        # starting at zero without a cutoff would replay an earlier session.
+        # Every unified record carries the same monotonic envelope, so retain
+        # precisely the records produced after this fixture began.
+        kept = []
+        for line in text.splitlines(keepends=True):
+            match = re.match(r"\[mono_ns=(\d+)\]", line)
+            if match is not None and int(match.group(1)) >= fixture_start_ns:
+                kept.append(line)
+        return "".join(kept)
 
     def _drain(capfd, timeout_s: float = 5.0) -> str:
         dropped_before = _host_log_dropped_records()
@@ -48,6 +96,7 @@ def drain_host_log():
             captured = capfd.readouterr()
             chunks.extend((captured.err, captured.out))
             if flushed and _host_log_pending_records() == 0:
+                chunks.append(_read_file_tail())
                 return "".join(chunks)
             if time.monotonic() >= deadline:
                 pending = _host_log_pending_records()
