@@ -30,7 +30,7 @@ from typing import Any, cast
 
 import pytest
 import simpler.worker as worker_mod
-from simpler.task_interface import CallConfig, ChipStorageTaskArgs
+from simpler.task_interface import CallConfig, ChipStorageTaskArgs, ChipWorkerError
 from simpler.worker import Worker
 
 import simpler_setup.runtime_builder as rb_mod
@@ -71,7 +71,7 @@ class _KernelScript:
         self.launch_entered = threading.Event()
         self.launch_release: threading.Event | None = None
         self.launch_hook: Callable[[], None] | None = None
-        # Number of finalize() calls that return with the native worker still initialized.
+        # Number of finalize() calls that raise ChipWorkerError for a failed device teardown.
         self.failed_finalizes = 0
         self.chips: list[_FakeKernelChip] = []
 
@@ -145,10 +145,12 @@ class _FakeKernelChip:
 
     def finalize(self) -> None:
         self.finalize_threads.append(threading.current_thread())
+        # A kernel context clears initialized and records the owed teardown before it raises,
+        # so a retry is a second finalize() rather than a re-init.
+        self._impl.initialized = False
         if self._script.failed_finalizes > 0:
             self._script.failed_finalizes -= 1
-            return
-        self._impl.initialized = False
+            raise ChipWorkerError(-77, "ChipWorker::finalize: device teardown failed (-77)")
 
     def init(self, *_a, **_k) -> None:
         raise AssertionError("kernel-mode Worker reached ChipWorker.init")
@@ -771,7 +773,7 @@ class TestClose:
         callable_id = worker.kernel_prepare_callable(target)
         script.failed_finalizes = 1
 
-        with pytest.raises(RuntimeError, match="kernel context teardown failed"):
+        with pytest.raises(ChipWorkerError, match="device teardown failed"):
             worker.close()
         assert worker._lifecycle is _Lifecycle.CLOSED
         assert len(chip.finalize_threads) == 1

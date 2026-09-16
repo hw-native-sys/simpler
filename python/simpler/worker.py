@@ -12726,15 +12726,11 @@ class Worker:
                         with self._registry_lock:
                             self._chip_runs.clear()
                             self._chip_run_touched_identities.clear()
+                        # A kernel context whose device teardown fails raises from finalize(),
+                        # which keeps this journal entry, the ChipWorker, its prepared images and
+                        # the GC pin for a later close(). Everything below is reached only once
+                        # the context is actually gone.
                         self._chip_worker.finalize()
-                        # ChipWorker.finalize returns without raising when the native device teardown
-                        # fails, and the native worker then stays initialized. Raising keeps this
-                        # journal entry, the ChipWorker, its prepared images and the GC pin for a
-                        # later close().
-                        if kernel and impl is not None and bool(getattr(impl, "initialized", False)):
-                            raise RuntimeError(
-                                "kernel context teardown failed; the context is kept, close() again after quiescence"
-                            )
                         self._chip_worker = None
                         if kernel:
                             self._kernel_callables.clear()
