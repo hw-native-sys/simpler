@@ -19,6 +19,7 @@
 #include "common/chip_swimlane_profiling.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
+#include "hot_entry_alignment.h"
 #include "runtime_core.h"
 #include "runtime.h"
 #include "spin_hint.h"
@@ -75,7 +76,7 @@ SlotTransition SchedulerContext::decide_slot_transition(
 }
 
 // Complete one slot's task: subtask counting, mixed completion, deferred release, profiling.
-void SchedulerContext::complete_slot_task(
+SIMPLER_A5_TMR_HOT_ENTRY_ALIGN void SchedulerContext::complete_slot_task(
     ChipTaskSlotState &slot_state, int32_t expected_reg_task_id, [[maybe_unused]] SubtaskSlot subslot,
     [[maybe_unused]] int32_t thread_idx, int32_t core_id, Handshake *hank, int32_t &completed_this_turn,
     ChipTaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
