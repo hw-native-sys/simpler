@@ -145,11 +145,20 @@ public:
     /**
      * @brief Forget the binary and entry handles without calling rtsBinaryUnload.
      *
-     * For every caller that knows the device generation those handles belonged
-     * to has ended: a force reset, a device already unusable — where another
-     * runtime teardown request could block waiting for device service — and a
-     * completed reset on a healthy close, after which a retained handle from a
-     * failed unload names a binary that no longer exists.
+     * Two distinct conditions reach this, and only the first ends the binary's
+     * life on the device:
+     *
+     *   - Confirmed retirement. A force reset, or a completed reset on a
+     *     healthy close, ended the device generation those handles belonged
+     *     to, so a handle retained by a failed unload names a binary that no
+     *     longer exists.
+     *   - Terminal abandonment. The device is already unusable — where another
+     *     runtime teardown request could block waiting for device service — or
+     *     its reset did not complete. The binary may well still be resident;
+     *     forgetting the handle is what keeps a later implicit unload from
+     *     being issued against a device whose state is unconfirmed.
+     *
+     * Neither is a successful device release, and a caller must not report one.
      */
     void ForgetWithoutUnload();
 

@@ -37,6 +37,13 @@ int watched_free_hits = 0;
 int unload_failures_left = 0;
 int unload_calls = 0;
 int func_lookup_failures_left = 0;
+// Independent of `guard_acl`, which refuses all six ACL/rt symbols at once and
+// exists to assert that kernel mode calls none of them. This one fails a
+// bounded number of resets and then lets the real call through, so a second
+// lifecycle can still come up. It covers the two soft resets only —
+// `aclrtResetDeviceForce` belongs to the fatal branch and stays uninjectable.
+int reset_failures_left = 0;
+int reset_calls = 0;
 
 int forbidden(size_t index) {
     ++forbidden_calls[index];
@@ -91,8 +98,24 @@ extern "C" int aclrtSetDevice(int device) {
     if (guard_acl) return forbidden(1);
     return reinterpret_cast<int (*)(int)>(dlsym(RTLD_NEXT, "aclrtSetDevice"))(device);
 }
+extern "C" void arm_reset_failures(int count) {
+    reset_failures_left = count;
+    reset_calls = 0;
+}
+extern "C" int reset_call_count() { return reset_calls; }
+
+namespace {
+bool reset_should_fail() {
+    ++reset_calls;
+    if (reset_failures_left <= 0) return false;
+    --reset_failures_left;
+    return true;
+}
+}  // namespace
+
 extern "C" int aclrtResetDevice(int device) {
     if (guard_acl) return forbidden(2);
+    if (reset_should_fail()) return -4321;
     return reinterpret_cast<int (*)(int)>(dlsym(RTLD_NEXT, "aclrtResetDevice"))(device);
 }
 extern "C" int aclrtResetDeviceForce(int device) {
@@ -105,6 +128,7 @@ extern "C" int aclFinalize() {
 }
 extern "C" int rtDeviceReset(int device) {
     if (guard_acl) return forbidden(5);
+    if (reset_should_fail()) return -4321;
     return reinterpret_cast<int (*)(int)>(dlsym(RTLD_NEXT, "rtDeviceReset"))(device);
 }
 extern "C" int aclrtSynchronizeDeviceWithTimeout(int32_t timeout) {

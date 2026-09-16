@@ -1006,13 +1006,20 @@ int DeviceRunner::finalize() {
         }
         reset_completed = reset_rc == 0;
     }
-    // Only a reset that completed ended the generation. A failed one leaves the
-    // device in whatever state the existing isolation policy applies to, and the
-    // retained handle with it.
-    if (reset_completed) retire_loader_after_device_reset();
+    // A successful reset invalidates the retained loader handle.
+    // If reset failed, abandon the handle to prevent an implicit unload;
+    // the device binary may remain resident and release is unconfirmed.
+    // A kernel context runs neither reset arm and so arrives here with
+    // `reset_completed` false — the abandon argument, whose job is to
+    // forget a handle without unloading it. The helper's latch guard is
+    // what makes that inert, independently of the early return above.
+    retire_loader_after_device_teardown(reset_completed);
 
-    // Only the healthy path reaches here: a poisoned card returned from the
-    // fatal branch at the top of finalize(), which owns the force reset.
+    // A poisoned card returned from the fatal branch at the top of finalize(),
+    // which owns the force reset, so the card reaching here is not poisoned.
+    // Its reset may still have failed: `rc` carries that, and every owner —
+    // including the loader handle retired just above — has already been
+    // released or abandoned, so there is nothing a later close could reach.
     clear_aicpu_topology_cache();
     device_id_ = -1;
     device_unusable_.store(false, std::memory_order_release);

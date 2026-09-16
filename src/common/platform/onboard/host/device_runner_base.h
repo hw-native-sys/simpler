@@ -1281,20 +1281,43 @@ protected:
     int finalize_common();
 
     /**
-     * Retire loader state that a completed device reset has invalidated.
+     * Retire loader state that a program close's device teardown has left
+     * unreachable, whichever way that teardown went.
      *
      * `LoadAicpuOp::Finalize()` keeps its binary handle when `rtsBinaryUnload`
-     * fails, so that an owner able to retry it survives. A program close then
-     * resets the device, which ends the generation that handle belonged to:
-     * from that point a retry would unload a handle into a dead generation,
-     * `Init` would refuse a re-init over a binary that no longer exists, and
-     * the destructor would attempt a third unload. Calling this after a
-     * confirmed reset is what keeps `init -> finalize -> init` working on one
-     * context. A kernel close resets nothing and must not call it.
+     * fails, so that an owner able to retry it survives. Neither outcome of a
+     * program close leaves that retry reachable, so both forget the handle:
+     *
+     *   - `reset_confirmed` — the reset ended the generation the handle
+     *     belonged to, so it names a binary that no longer exists. Forgetting
+     *     it is what keeps `init -> finalize -> init` working on one context.
+     *   - otherwise — the device's state is unconfirmed, and this close has
+     *     already released every other owner and is about to clear
+     *     `device_id_`. Forgetting the handle is what keeps `~LoadAicpuOp`
+     *     from issuing an unreported unload against that device.
+     *
+     * Neither is a successful release and neither is reported as one: the
+     * error this close already returned to the caller is the last word on it.
+     *
+     * A no-op on a kernel context, which resets nothing — its retained handle
+     * stays valid and its explicit close is the only thing that may retire it.
+     * That close cannot reach here today, because a retained handle makes
+     * `finalize_common()` return non-zero and the arch tail returns early on a
+     * kernel latch; the guard enforces the invariant rather than resting on
+     * that.
      */
-    void retire_loader_after_device_reset() {
+    void retire_loader_after_device_teardown(bool reset_confirmed) {
+        if (execution_mode_latch_.is_kernel()) return;
         if (!load_aicpu_op_.has_live_resources()) return;
-        LOG_WARN("finalize: device reset ended the generation of the retained AICPU binary handle; forgetting it");
+        if (reset_confirmed) {
+            LOG_WARN("finalize: device reset ended the generation of the retained AICPU binary handle; forgetting it");
+        } else {
+            LOG_ERROR(
+                "finalize: device reset did not complete and the AICPU binary handle is still retained; forgetting it "
+                "without unloading — the binary may still be resident, and no further call is issued against this "
+                "device"
+            );
+        }
         load_aicpu_op_.ForgetWithoutUnload();
     }
 

@@ -780,6 +780,87 @@ def _run_program_loader_unload(arch, runtime, device):
             lib.destroy_device_context(ctx)
 
 
+def _run_program_loader_double_failure(arch, runtime, device, use_acl):
+    """When a program close's unload *and* its device reset both fail, the
+    retained handle has no reachable retry — `device_id_` is cleared and the
+    next close returns early. It is therefore abandoned at that point, so
+    nothing issues an unreported unload against a device whose reset never
+    completed, and the context is still reusable.
+
+    Covers the two soft-reset arms. `aclrtResetDeviceForce` is deliberately not
+    injectable here: it belongs to the fatal branch, which this change does not
+    touch and which has its own abandonment already."""
+    lib = _load(arch, "onboard", runtime)
+    lib.ensure_acl_ready_ctx.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.ensure_acl_ready_ctx.restype = ctypes.c_int
+    lib.simpler_register_callable.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p]
+    lib.simpler_register_callable.restype = ctypes.c_int
+    aicpu, aicore, dispatcher = _binaries(arch, runtime)
+    config = CallConfig()
+    faults = ctypes.CDLL(None)
+    faults.bind_test_log.argtypes = [ctypes.c_void_p]
+    faults.bind_test_log.restype = ctypes.c_int
+    assert faults.bind_test_log(lib._handle) == 0
+    faults.arm_unload_failures.argtypes = [ctypes.c_int]
+    faults.unload_call_count.restype = ctypes.c_int
+    faults.arm_reset_failures.argtypes = [ctypes.c_int]
+    faults.reset_call_count.restype = ctypes.c_int
+    image = _prepared_callable_image(arch, runtime)
+    ctx = lib.create_device_context()
+    assert ctx
+    init_args = (
+        ctx,
+        device,
+        aicpu,
+        len(aicpu),
+        aicore,
+        len(aicore),
+        dispatcher,
+        len(dispatcher),
+        ctypes.byref(config),
+        0,
+        None,
+        0,
+    )
+    destroyed = False
+    try:
+        assert lib.simpler_init(*init_args) == 0
+        if use_acl:
+            # Brings `acl_ready_` up so finalize takes the aclrtResetDevice arm
+            # instead of the bare rtDeviceReset one.
+            assert lib.ensure_acl_ready_ctx(ctx, device) == 0
+        faults.arm_unload_failures(1)
+        faults.arm_reset_failures(1)
+        assert lib.finalize_device(ctx) != 0
+        assert faults.unload_call_count() == 1
+        assert faults.reset_call_count() >= 1
+        # `device_id_` is cleared regardless of the reset's result, so this
+        # close is the last one that could reach anything. It reports the
+        # failure; the next is idempotent over a context that owns nothing.
+        assert lib.finalize_device(ctx) == 0
+        assert faults.unload_call_count() == 1
+        # Reuse of the same context is the property the disposition was chosen
+        # for, so it is asserted rather than inferred: keeping the context
+        # poisoned instead of abandoning would break it. `Init` refuses to load
+        # over a live handle, so this is where the pre-fix behaviour stops —
+        # `a binary is still loaded; Finalize must retire it first`.
+        assert lib.simpler_init(*init_args) == 0
+        assert lib.simpler_register_callable(ctx, 0, image) == 0
+        assert lib.finalize_device(ctx) == 0
+        # Two: the double failure's own attempt, and this lifecycle's success.
+        # Three would mean the abandoned handle was resurrected into it.
+        assert faults.unload_call_count() == 2
+        lib.destroy_device_context(ctx)
+        destroyed = True
+        # `~LoadAicpuOp` has nothing left to unload. Before this fix the handle
+        # abandoned above stayed live and the destructor unloaded it again,
+        # against a device whose reset never completed, reported to nobody.
+        assert faults.unload_call_count() == 2
+    finally:
+        if not destroyed:
+            lib.destroy_device_context(ctx)
+
+
 @pytest.mark.parametrize("scenario", ["close_retry", "init_rollback"])
 @pytest.mark.parametrize(("arch", "runtime"), _ONBOARD_CASES)
 def test_loader_unload_failure_keeps_a_retryable_owner(arch, runtime, scenario, kernel_close_faults, request):
@@ -847,11 +928,35 @@ def test_program_callable_release_failure_leaves_no_stale_record(arch, runtime, 
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("reset_arm", ["rt", "acl"])
+@pytest.mark.parametrize(("arch", "runtime"), _ONBOARD_CASES)
+def test_program_loader_double_failure_leaves_nothing_to_unload(arch, runtime, reset_arm, kernel_close_faults, request):
+    """A program close whose unload and device reset both fail must not leave a
+    retryable-looking handle behind: there is no reachable retry once
+    `device_id_` is cleared, so the destructor must issue no further unload."""
+    device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
+    env = dict(os.environ)
+    env["LD_PRELOAD"] = str(kernel_close_faults) + (":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else "")
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), arch, runtime, device, "program_double_" + reset_arm],
+        check=False,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 if __name__ == "__main__":
     if sys.argv[4] == "program_callable_release":
         _run_program_callable_release(sys.argv[1], sys.argv[2], int(sys.argv[3]))
     elif sys.argv[4] == "program_loader_unload":
         _run_program_loader_unload(sys.argv[1], sys.argv[2], int(sys.argv[3]))
+    elif sys.argv[4].startswith("program_double_"):
+        _run_program_loader_double_failure(
+            sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4] == "program_double_acl"
+        )
     elif sys.argv[4].startswith("loader_"):
         _run_loader_unload_retry(sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4][len("loader_") :])
     else:
