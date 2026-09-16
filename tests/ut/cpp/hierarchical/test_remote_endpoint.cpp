@@ -533,6 +533,55 @@ TEST(RemoteEndpoint, TaskDispatchUsesProgressSubmissionAndPolling) {
     ring.shutdown();
 }
 
+TEST(RemoteEndpoint, ProgressFrameAttrsNameTheHeaderThePeerReceives) {
+    Ring ring;
+    ring.init(1ULL << 20);
+    TaskSlot slot = make_slot(ring, scalar_args());
+
+    auto *transport = new FakeRemoteTransport();
+    RemoteL3Endpoint endpoint(3, 99, "fake", std::unique_ptr<RemoteL3Transport>(transport));
+    EXPECT_TRUE(endpoint.progress_frame_attrs().empty());
+
+    WorkerDispatch dispatch;
+    dispatch.task_slot = slot;
+    dispatch.dispatch_id = 7;
+    endpoint.submit_progress(&ring, dispatch);
+
+    // The token is a join key only if it names the frame that left this
+    // process, so it is read back out of the encoded frame itself. The three
+    // parts are matched as one string: joined, they arrive together or not at
+    // all, and a record the attribute capacity cut short cannot pass as two of
+    // them present.
+    const auto sent = remote_l3::decode_frame(transport->last_frame);
+    const std::string attrs = endpoint.progress_frame_attrs();
+    const std::string expected = " frame=" + std::to_string(sent.header.session_id) + ":" +
+                                 std::to_string(sent.header.worker_id) + ":" + std::to_string(sent.header.sequence);
+    EXPECT_NE(attrs.find(expected), std::string::npos) << attrs;
+    ring.shutdown();
+}
+
+TEST(RemoteEndpoint, AFailedSubmissionPublishesNoFrameHeader) {
+    Ring ring;
+    ring.init(1ULL << 20);
+    TaskSlot slot = make_slot(ring, scalar_args());
+
+    auto *transport = new FakeRemoteTransport();
+    RemoteL3Endpoint endpoint(3, 99, "fake", std::unique_ptr<RemoteL3Transport>(transport));
+
+    WorkerDispatch dispatch;
+    dispatch.task_slot = slot;
+    dispatch.dispatch_id = 7;
+    endpoint.submit_progress(&ring, dispatch);
+    EXPECT_FALSE(endpoint.progress_frame_attrs().empty());
+
+    // The lane still holds the first frame, so this one never reaches the wire.
+    // Reporting the first frame's header here would name it twice, and the
+    // second span's window would silently replace the first's.
+    EXPECT_THROW(endpoint.submit_progress(&ring, dispatch), std::runtime_error);
+    EXPECT_TRUE(endpoint.progress_frame_attrs().empty());
+    ring.shutdown();
+}
+
 TEST(RemoteEndpoint, ProgressStopReleasesWaitingControl) {
     Ring ring;
     ring.init(1ULL << 20);

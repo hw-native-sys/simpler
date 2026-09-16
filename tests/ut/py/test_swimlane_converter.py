@@ -17,6 +17,8 @@ from simpler_setup.tools import containment
 from simpler_setup.tools import swimlane_converter as sc
 from simpler_setup.tools.strace_timing import parse_spans, to_host_swimlane
 
+_RECORD_PREFIX = "[mono_ns=1000][T0x1][TIMING] emit_host_span: "
+
 
 def _containment_placement(document, *, runner_start_ns=1_000, runner_dur_ns=5_000, wall_ns=2_000, sched=(700, 100)):
     """Place a capture inside a synthetic Host window, the way the tools do.
@@ -25,7 +27,7 @@ def _containment_placement(document, *, runner_start_ns=1_000, runner_dur_ns=5_0
     same window in absolute cycles, so the pair fixes the offset between the two
     device timelines without any clock anchor.
     """
-    prefix = "[mono_ns=1000][T0x1][TIMING] emit_host_span: "
+    prefix = _RECORD_PREFIX
     head = "[STRACE] v=1 pid=42 tid=42 inv=1 hid=abc"
     lines = [
         f"{prefix}{head} depth=1 name=chip.run.runner_run ts={runner_start_ns} dur={runner_dur_ns} ",
@@ -2287,3 +2289,226 @@ def test_l3_directory_merge_draws_the_scheduler_loops_that_carry_no_invocation(t
     assert "node.graph_build" in {
         event["name"] for event in trace["traceEvents"] if event.get("ph") == "X" and event["pid"] == 1
     }
+
+
+def _write_remote_pair(
+    root,
+    *,
+    caller_pid=1500,
+    peer_pid=2500,
+    frame=(1026041362850311600, 1, 17),
+    dispatch_ns=500,
+    complete_ns=30_000,
+    peer_base_ns=17 * 24 * 3_600 * 1_000_000_000,
+):
+    """A dispatch to a peer host, and that host's log for the frame it served.
+
+    The peer's clock is days away from this one, which is the case the pairing
+    exists for: nothing in either log is comparable to the other except the
+    frame header both wrote down, and the two durations that header joins.
+    """
+    handoff = "run_id=5 task_slot=2 group_index=0 worker_id=1 dispatch_id=9"
+    frame_attrs = containment.format_frame_key(frame)
+    prefix = _RECORD_PREFIX
+    caller = f"[STRACE] v=1 pid={caller_pid} tid={caller_pid} inv=1 hid=abc"
+    (root / f"host.{caller_pid}.log").write_text(
+        "\n".join(
+            [
+                f"{prefix}{caller} depth=1 name=network1.dispatch ts={dispatch_ns} dur=100 "
+                f"{handoff} endpoint_kind=remote_l3 role=scheduler {frame_attrs}",
+                f"{prefix}{caller} depth=1 name=network1.complete ts={complete_ns} dur=100 "
+                f"{handoff} endpoint_kind=remote_l3 role=worker outcome=0",
+            ]
+        )
+        + "\n"
+    )
+    peer = f"[STRACE] v=1 pid={peer_pid} tid={peer_pid} inv=1 hid=abc"
+    (root / f"host.{peer_pid}.log").write_text(
+        "\n".join(
+            [
+                f"{prefix}{peer} depth=0 name=node.remote_task ts={peer_base_ns} dur=20000 {frame_attrs}",
+                f"{prefix}{peer} depth=1 name=node.submit ts={peer_base_ns + 1_000} dur=400 {handoff}",
+                f"{prefix}{peer} depth=1 name=node.dispatch ts={peer_base_ns + 2_000} dur=300 "
+                f"{handoff} endpoint_kind=local_mailbox role=scheduler",
+            ]
+        )
+        + "\n"
+    )
+
+
+def _l3_trace_with_remote_peer(tmp_path, **peer_kwargs):
+    root = tmp_path / "dfx_outputs"
+    _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _write_l3_rank(root, 1, host_shift_ns=10_000, task_id=8)
+    _write_remote_pair(root, **peer_kwargs)
+    output = tmp_path / "l3.json"
+    args = sc._build_parser().parse_args([str(root), "--dispatch", "d0", "-o", str(output)])
+    sc._generate_l3_trace(args, root)
+    return json.loads(output.read_text())
+
+
+def test_l3_merge_places_a_peer_host_inside_the_window_that_dispatched_to_it(tmp_path):
+    """A process days away on its own clock lands inside the caller's window.
+
+    The caller held the frame from ts=500 to ts=30_100, which is 29_600 ns, and
+    the peer reported 20_000 ns of work — so the peer block is drawn at the
+    caller's window start and could have been up to 9_600 ns later.
+    """
+    document = _l3_trace_with_remote_peer(tmp_path)
+
+    (window,) = document["metadata"]["remote_windows"]
+    assert (window["frame_session"], window["frame_worker"], window["frame_sequence"]) == (1026041362850311600, 1, 17)
+    assert window["caller_duration_ns"] == 29_600
+    assert window["peer_duration_ns"] == 20_000
+    # 9_600 ns of spare window, and what two counters can add over 29.6 us.
+    assert window["rate_bound_ns"] == 3
+    assert window["slack_ns"] == 9_603
+
+    events = document["traceEvents"]
+    names = {event["pid"]: event["args"]["name"] for event in events if event.get("name") == "process_name"}
+    peer_pid = next(pid for pid, name in names.items() if "(placed," in name)
+    assert names[peer_pid].endswith("(placed, +9.6 us)")
+    peer_slices = [event for event in events if event.get("ph") == "X" and event["pid"] == peer_pid]
+
+    # Drawn on the caller's axis, not days away on its own: the block opens at
+    # the window's own start, which is where the caller's dispatch span sits.
+    assert {event["name"] for event in peer_slices} == {"node.remote_task", "node.submit", "node.dispatch"}
+    caller = next(
+        event
+        for event in events
+        if event.get("ph") == "X" and event["name"] == "network1.dispatch" and "frame" in event["args"]
+    )
+    served = next(event for event in peer_slices if event["name"] == "node.remote_task")
+    assert served["ts"] == caller["ts"] == 0.0
+    assert served["dur"] == 20.0
+    # Every peer slice says how far the block it belongs to could slide.
+    assert {event["args"]["slack_ns"] for event in peer_slices} == {9_603}
+
+
+def test_the_peer_block_keeps_its_own_shape_exactly(tmp_path):
+    """Only the origin is bounded; offsets inside one frame are one clock's."""
+    document = _l3_trace_with_remote_peer(tmp_path)
+    events = document["traceEvents"]
+    names = {event["pid"]: event["args"]["name"] for event in events if event.get("name") == "process_name"}
+    peer_pid = next(pid for pid, name in names.items() if "(placed," in name)
+    slices = {event["name"]: event for event in events if event.get("ph") == "X" and event["pid"] == peer_pid}
+
+    served = slices["node.remote_task"]
+    assert slices["node.submit"]["ts"] - served["ts"] == pytest.approx(1.0)
+    assert slices["node.dispatch"]["ts"] - served["ts"] == pytest.approx(2.0)
+
+
+def test_moving_the_peer_clock_does_not_move_the_drawn_block(tmp_path):
+    """The placement reads two durations, so the peer's own zero cancels out.
+
+    A method that compared an instant across the two hosts would move the block
+    by the difference between their boot times; this one does not move at all.
+    """
+    day = 24 * 3_600 * 1_000_000_000
+    near = _l3_trace_with_remote_peer(tmp_path / "near", peer_base_ns=3 * day)
+    far = _l3_trace_with_remote_peer(tmp_path / "far", peer_base_ns=900 * day)
+
+    def peer_slices(document):
+        events = document["traceEvents"]
+        names = {event["pid"]: event["args"]["name"] for event in events if event.get("name") == "process_name"}
+        peer_pid = next(pid for pid, name in names.items() if "(placed," in name)
+        return {
+            event["name"]: (event["ts"], event["dur"])
+            for event in events
+            if event.get("ph") == "X" and event["pid"] == peer_pid
+        }
+
+    assert peer_slices(near) == peer_slices(far)
+    assert near["metadata"]["remote_windows"] == far["metadata"]["remote_windows"]
+
+
+def test_one_pid_in_two_host_logs_refuses_the_merge(tmp_path):
+    """A span names its process by pid, and two machines number theirs apart."""
+    root = tmp_path / "dfx_outputs"
+    _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _write_l3_rank(root, 1, host_shift_ns=10_000, task_id=8)
+    prefix = _RECORD_PREFIX
+    for name in ("host.4242.log", "host.4242.other.log"):
+        (root / name).write_text(
+            f"{prefix}[STRACE] v=1 pid=4242 tid=4242 inv=1 hid=abc depth=1 name=node.submit ts=100 dur=10 \n"
+        )
+    args = sc._build_parser().parse_args([str(root), "--dispatch", "d0", "-o", str(tmp_path / "l3.json")])
+
+    with pytest.raises(ValueError, match="more than one Host log"):
+        sc._generate_l3_trace(args, root)
+
+
+def test_ranks_on_two_host_clocks_are_still_refused(tmp_path):
+    """A frame window places the process it was served by, not a Rank below it.
+
+    The chip children under a peer are other pids in other logs that no window
+    names, so nothing puts their windows on this axis.
+    """
+    root = tmp_path / "dfx_outputs"
+    _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _write_l3_rank(root, 1, host_shift_ns=10_000, task_id=8, clock_domain="another-boot")
+    _write_remote_pair(root)
+    args = sc._build_parser().parse_args([str(root), "--dispatch", "d0", "-o", str(tmp_path / "l3.json")])
+
+    with pytest.raises(ValueError, match="different Host clocks"):
+        sc._generate_l3_trace(args, root)
+
+
+def test_a_peer_side_process_is_not_drawn_on_the_local_path(tmp_path):
+    """Only what the chain places or vouches for reaches the trace.
+
+    Collecting the peer's log directory brings its children along; they are
+    neither placed by a frame nor on this axis, so they are left out rather
+    than drawn where their own machine's clock put them.
+    """
+    root = tmp_path / "dfx_outputs"
+    _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _write_l3_rank(root, 1, host_shift_ns=10_000, task_id=8)
+    _write_remote_pair(root)
+    prefix = _RECORD_PREFIX
+    (root / "host.2600.log").write_text(
+        f"{prefix}[STRACE] v=1 pid=2600 tid=2600 inv=1 hid=abc depth=0 name=node.submit "
+        f"ts={17 * 24 * 3_600 * 1_000_000_000 + 5_000} dur=400 run_id=5 task_slot=2 group_index=0 "
+        f"worker_id=1 dispatch_id=9\n"
+    )
+    output = tmp_path / "l3.json"
+    args = sc._build_parser().parse_args([str(root), "--dispatch", "d0", "-o", str(output)])
+
+    sc._generate_l3_trace(args, root)
+
+    events = json.loads(output.read_text())["traceEvents"]
+    drawn = {event["args"]["os_pid"] for event in events if event.get("ph") == "X" and "os_pid" in event["args"]}
+    assert 2600 not in drawn
+    assert 1500 in drawn
+
+
+def test_a_peer_whose_timestamps_already_land_in_the_window_keeps_them(tmp_path):
+    """A loopback peer is drawn where it was recorded, and says its bound runs both ways.
+
+    Placing it would move it to the window's start and erase the gap between
+    the dispatch and the peer picking the frame up — the one latency a
+    same-host session exists to show.
+    """
+    root = tmp_path / "dfx_outputs"
+    _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _write_l3_rank(root, 1, host_shift_ns=10_000, task_id=8)
+    # Inside the caller's window rather than days from it.
+    _write_remote_pair(root, peer_base_ns=4_000)
+    output = tmp_path / "l3.json"
+    args = sc._build_parser().parse_args([str(root), "--dispatch", "d0", "-o", str(output)])
+
+    sc._generate_l3_trace(args, root)
+
+    document = json.loads(output.read_text())
+    events = document["traceEvents"]
+    names = {event["pid"]: event["args"]["name"] for event in events if event.get("name") == "process_name"}
+    peer_pid = next(pid for pid, name in names.items() if "observed" in name)
+    assert "±" in names[peer_pid]
+    served = next(event for event in events if event.get("ph") == "X" and event["name"] == "node.remote_task")
+    caller = next(
+        event
+        for event in events
+        if event.get("ph") == "X" and event["name"] == "network1.dispatch" and "frame" in event["args"]
+    )
+    # 3.5 us after the dispatch opened, which is where the peer log put it.
+    assert served["ts"] - caller["ts"] == pytest.approx(3.5)

@@ -27,6 +27,7 @@
 #include <cstring>
 #include <cstdint>
 #include <future>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -1303,6 +1304,14 @@ void RemoteL3Endpoint::finish_progress_command(uint64_t sequence) {
 
 void RemoteL3Endpoint::submit_progress(Ring *ring, const WorkerDispatch &dispatch) {
     if (ring == nullptr) throw std::invalid_argument("RemoteL3Endpoint::submit_progress: null ring");
+    // Dropped ahead of everything that can throw, the payload encoding
+    // included: a caller reading the header after a failed submission must see
+    // no frame rather than the previous one, or the span for the failure names
+    // a frame another span already names.
+    {
+        std::lock_guard<std::mutex> drop_lk(command_mu_);
+        published_frame_ = {};
+    }
     TaskSlotState *slot = ring->slot_state(dispatch.task_slot);
     if (slot == nullptr) throw std::out_of_range("RemoteL3Endpoint::submit_progress: invalid task slot");
     auto payload = remote_l3::encode_task_payload(build_task_payload(*slot, dispatch.group_index));
@@ -1329,6 +1338,7 @@ void RemoteL3Endpoint::submit_progress(Ring *ring, const WorkerDispatch &dispatc
         pending_task_.occupied = true;
         pending_task_.dispatch = dispatch;
         pending_task_.sequence = sequence;
+        published_frame_ = {true, session_id_, caps_.worker_id, sequence};
     } catch (...) {
         try {
             command_lane_.finish_reply(sequence);
@@ -1646,6 +1656,20 @@ std::vector<uint8_t> RemoteL3Endpoint::control_remote_domain(
     remote_l3::ControlName control_name, const std::vector<uint8_t> &command_bytes, bool group_target
 ) {
     return run_control(control_name, command_bytes, group_target).result_bytes;
+}
+
+std::string RemoteL3Endpoint::progress_frame_attrs() const {
+    std::lock_guard<std::mutex> command_lk(command_mu_);
+    if (!published_frame_.valid) return {};
+    // One field, not three. A dispatch's attributes already run to ~137 bytes
+    // against the record's 192, and three `frame_*=` names overrun it — which
+    // truncates the last one and leaves a key that reads as present but is
+    // half written. Joined into one token the three cannot be separated, and
+    // the whole thing costs 29 bytes.
+    std::ostringstream attrs;
+    attrs << " frame=" << published_frame_.session_id << ":" << published_frame_.worker_id << ":"
+          << published_frame_.sequence;
+    return attrs.str();
 }
 
 void RemoteL3Endpoint::shutdown_child() {

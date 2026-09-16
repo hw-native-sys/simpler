@@ -210,6 +210,7 @@ which every one of those levels runs on:
 | `<level>.graph_build` | serialized Python graph callback |
 | `<level>.submit` | next-level task publication after slot allocation |
 | `<level>.dispatch` | scheduler handoff to a worker thread |
+| `<level>.remote_task` | one dispatched frame, served on the peer that received it |
 | `<level>.frame_submit` | local child mailbox-frame publication |
 | `<level>.activate` | prepared-frame activation |
 | `<level>.complete` | terminal child progress handling |
@@ -219,6 +220,24 @@ which every one of those levels runs on:
 Their attributes carry the available `run_id`, `task_slot`, `group_index`,
 `worker_id`, `dispatch_id`, endpoint kind, and the dispatch's pipeline lease
 (`slot_id` / `generation`).
+
+**A dispatch to a remote endpoint also carries the frame header it sent** — one
+`frame=<session>:<worker>:<sequence>` token — and the peer that serves that
+frame writes the same token onto its own `<level>.remote_task` span. Every
+other field on a dispatch is local to the process that wrote it: `run_id` and
+`dispatch_id` name a run on this host and nothing on the peer. The header is the
+one name both sides see, which is what lets a reader put the peer's window
+inside the dispatch window that contains it — the two hosts' clocks never being
+comparable, only the two durations are. The sequence counts per endpoint, so the
+triple is what separates one endpoint's frames from another's. A local mailbox
+endpoint publishes no frame and so carries no token.
+
+One field rather than three names, because the three names do not fit: a
+dispatch's attributes already run to about 137 of the record's 192 bytes, and a
+key the capacity cuts short reads as present while being half written. Joined,
+the three parts arrive together or not at all, and `containment.py` reports a
+record the capacity did cut short rather than reading it as a dispatch that
+carried no frame.
 
 `<level>.scheduler_loop` is the exception to that list and to the tree below: a
 loop iteration serves whichever runs were ready, so it belongs to no run and

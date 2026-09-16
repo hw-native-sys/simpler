@@ -383,6 +383,13 @@ public:
     // the unpublished dispatch with the caller after endpoint quiescence.
     virtual bool report_submission_error(const WorkerDispatch &dispatch, const std::string &reason);
 
+    // The wire frame this endpoint published most recently through
+    // submit_progress, as `[STRACE]` `k=v` attributes; empty for an endpoint
+    // that publishes no frame. A frame header is the only name both this
+    // process and the peer that serves the frame can write into their own
+    // logs, so it is what joins the two.
+    virtual std::string progress_frame_attrs() const { return {}; }
+
     virtual void shutdown_child() {}
     virtual uint64_t control_malloc(size_t size);
     virtual uint64_t control_committed_device_memory();

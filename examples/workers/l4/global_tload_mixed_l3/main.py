@@ -148,6 +148,22 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--comm-profile", default="a3-fabric-v1")
     parser.add_argument("--session-timeout", type=float, default=120.0)
     parser.add_argument("--session-listen-host", default="0.0.0.0")
+    parser.add_argument(
+        "--enable-chip-swimlane",
+        nargs="?",
+        const=4,
+        default=0,
+        type=int,
+        metavar="PERF_LEVEL",
+        help="Capture a chip swimlane on every rank this run reaches, the peer machine's included. "
+        "Bare flag=level 4 (full). Needs --output-prefix to have somewhere to land.",
+    )
+    parser.add_argument(
+        "--output-prefix",
+        default="",
+        help="Directory this run's diagnostic artifacts go under: each rank's chip_swimlane_records.json, "
+        "and this process's host.<pid>.log. Without one the host log stays on stderr and no capture is written.",
+    )
     return parser.parse_args()
 
 
@@ -161,11 +177,27 @@ def run(
     comm_profile: str = "a3-fabric-v1",
     session_timeout: float = 120.0,
     session_listen_host: str = "0.0.0.0",  # noqa: S104 - Remote peer callbacks need a reachable listener.
+    enable_chip_swimlane: int = 0,
+    output_prefix: str = "",
 ) -> int:
     # The local L3 is a fork of this process, so its orchestration function
     # reaches the handle only through module state; a local would not survive
     # into the child.
     global _LOCAL_CHIP_HANDLE  # noqa: PLW0603
+
+    def call_config() -> CallConfig:
+        """The config every run this process issues carries.
+
+        The diagnostics ride it down each dispatch, and the remote L3 decodes
+        these same fields off the wire, so one flag covers both machines rather
+        than needing the peer to be configured on its own.
+        """
+        cfg = CallConfig()
+        if enable_chip_swimlane:
+            cfg.enable_chip_swimlane = enable_chip_swimlane
+        if output_prefix:
+            cfg.output_prefix = output_prefix
+        return cfg
 
     local_device = _parse_first_device(local_devices, label="local")
     remote_device = _parse_first_device(remote_devices, label="remote")
@@ -240,7 +272,7 @@ def run(
             orch.submit_next_level(remote_handle, remote_args, cfg, worker=remote_node)
             domain_handle = domain
 
-        worker.run(build_and_run, args=None, config=CallConfig())
+        worker.run(build_and_run, args=None, config=call_config())
         if domain_handle is None:
             raise RuntimeError("the Global CommDomain was not allocated")
         domain = domain_handle
@@ -254,7 +286,7 @@ def run(
             finally:
                 domain.release()
 
-        worker.run(read_and_release, args=None, config=CallConfig())
+        worker.run(read_and_release, args=None, config=call_config())
 
         expected = _expected_values(len(RANK_LABELS))
         failed_ranks: list[int] = []
@@ -295,6 +327,8 @@ def main() -> int:
         comm_profile=args.comm_profile,
         session_timeout=args.session_timeout,
         session_listen_host=args.session_listen_host,
+        enable_chip_swimlane=args.enable_chip_swimlane,
+        output_prefix=args.output_prefix,
     )
 
 

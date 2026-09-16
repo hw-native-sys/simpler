@@ -3682,15 +3682,29 @@ def _parse_rank_pid_pins(values):
 def _place_rank_captures(host_log_paths, raw_inputs, identities, host_pids, pins):
     """Bound where each Rank's device records sit on the Host timeline.
 
-    Returns the spans as well: the same Host log that supplies the outer window
-    also holds that process's own call tree, which the merged trace draws beside
-    the Rank it belongs to.
+    Returns the spans and the remote chain as well: the same Host log that
+    supplies the outer window also holds that process's own call tree, which
+    the merged trace draws beside the Rank it belongs to, and a Rank whose
+    window a peer recorded reaches this axis only through the frame that
+    dispatched to that peer.
     """
     spans = []
+    logs_by_pid = defaultdict(set)
     for path in host_log_paths:
         with path.open(errors="replace") as log:
-            spans.extend(parse_spans(log))
-    windows = containment.host_windows(spans)
+            for span in parse_spans(log):
+                spans.append(span)
+                logs_by_pid[span.pid].add(path.name)
+    # A span names its process by pid and nothing else, and two machines number
+    # their processes independently. One pid writing two logs is therefore
+    # either a reused pid or two machines' logs collected together, and both
+    # readings make every pid in this pile ambiguous.
+    shared = {pid: sorted(names) for pid, names in logs_by_pid.items() if len(names) > 1}
+    if shared:
+        detail = "; ".join(f"pid {pid} in {', '.join(names)}" for pid, names in sorted(shared.items()))
+        raise ValueError(f"one pid appears in more than one Host log, so no pid identifies a process: {detail}")
+    chain = containment.remote_chain(spans, logs_by_pid.keys())
+    windows = containment.rebase_windows(containment.host_windows(spans), chain)
     if not windows:
         raise ValueError(
             f"the Host logs hold no {containment.RUNNER_SPAN} / {containment.DEVICE_WALL_SPAN} pair; "
@@ -3701,7 +3715,7 @@ def _place_rank_captures(host_log_paths, raw_inputs, identities, host_pids, pins
         windows, captures, forced=pins, identities=identities, host_pids=host_pids
     )
     placements = {rank: containment.place(pairs[rank], captures[rank]) for rank in captures}
-    return placements, pairing, spans
+    return placements, pairing, spans, chain
 
 
 def _host_block_lane(rank, lane_index, label):
@@ -3726,7 +3740,7 @@ def _host_block_lane(rank, lane_index, label):
     ]
 
 
-def _dispatcher_spans(spans, chip_pids, window_ns):
+def _dispatcher_spans(spans, chip_pids, window_ns, chain):
     """The dispatching processes' spans that belong to the merged dispatch.
 
     Their logs cover the whole run while the merge covers one dispatch, so the
@@ -3746,11 +3760,35 @@ def _dispatcher_spans(spans, chip_pids, window_ns):
     the Ranks' own windows at both ends.
     """
     window_lo, window_hi = window_ns
+    # A frame window is part of this dispatch's story: a peer block is drawn
+    # inside one, so the spans that opened and closed it have to be drawn too,
+    # or the trace shows a placed block and not what placed it.
+    for window in chain.windows:
+        # The caller's own interval may itself be a peer's, so it reaches this
+        # axis the same way every other peer instant does.
+        opened = chain.place(window.caller_pid, window.caller_start_ns)
+        closed = chain.place(window.caller_pid, window.caller_start_ns + window.caller_duration_ns)
+        if opened is None or closed is None:
+            continue
+        window_lo = min(window_lo, int(opened[0]))
+        window_hi = max(window_hi, int(closed[0] + closed[1]))
     # By family, not only by pid: a chip child that no placement paired with is
     # still a chip child, and labelling it a dispatcher would be a lie.
     host_spans = [
         span for span in spans if span.pid not in chip_pids and not span.is_device and span_family(span.name) != "chip"
     ]
+
+    # A peer process ran against its own machine's clock, so the window test
+    # below would reject every one of its spans by many days. What selects
+    # those is the peer interval each frame's own window names, and a span
+    # outside all of them belongs to a frame this merge did not ask for.
+    peer_spans = [
+        span for span in host_spans if span.pid in chain.peer_pids and chain.place(span.pid, span.ts) is not None
+    ]
+    # By what the chain can place, not by what it cannot: a process it neither
+    # placed nor put on the axis has no position here, and leaving it in the
+    # local path would draw it at another machine's raw timestamps.
+    host_spans = [span for span in host_spans if span.pid in chain.axis_pids]
 
     def overlaps(span, lo, hi):
         return span.ts < hi and span.ts + span.dur > lo
@@ -3761,18 +3799,23 @@ def _dispatcher_spans(spans, chip_pids, window_ns):
     story_lo = min([window_lo] + [span.ts for span in selected])
     story_hi = max([window_hi] + [span.ts + span.dur for span in selected])
     selected += [span for span in host_spans if not span.inv and overlaps(span, story_lo, story_hi)]
-    return selected
+    return selected + peer_spans
 
 
-def _dispatcher_block_events(spans, global_origin_ns):
+def _dispatcher_block_events(spans, global_origin_ns, chain):
     """The processes that dispatched to these Ranks, drawn above them.
 
     An L3 run writes one `host.<pid>.log` per process into the same case root,
     so the scheduler's own `node.*` spans — and an L4's `network1.*` above them
     — are already beside the Rank captures. They are Host CLOCK_MONOTONIC and
     same-host cross-process comparable, so they go straight onto the axis: no
-    containment, no slack. Containment is only ever needed for the device
-    clock, which is why nothing in this block carries a bound.
+    containment, no slack.
+
+    A process on the far side of a remote dispatch is the exception: its clock
+    shares no zero with this one, so each of its spans is drawn through the
+    frame window that contained it and carries that window's `slack_ns`. The
+    shape inside one frame stays exact; what the bound covers is where the
+    block as a whole sits.
     """
     processes = host_process_lanes(spans)
     if len(processes) > _DISPATCHER_PID_LIMIT:
@@ -3784,9 +3827,24 @@ def _dispatcher_block_events(spans, global_origin_ns):
     events = []
     for index, (pid, process) in enumerate(sorted(processes.items())):
         block_pid = _DISPATCHER_PID_BASE + index
+        bounds = [
+            placed[1]
+            for span, _attrs, _tid in process["spans"]
+            if (placed := chain.place(span.pid, span.ts)) is not None and placed[1]
+        ]
+        label = process["label"]
+        if bounds:
+            widest = max(bounds)
+            # A placed block is drawn at the earliest position its window
+            # allows, so it can only have been later; one left where it was
+            # recorded can be either side of that.
+            if pid in chain.observed_pids:
+                label = f"{label} (observed, ±{widest / 1000.0:.1f} us)"
+            else:
+                label = f"{label} (placed, +{widest / 1000.0:.1f} us)"
         events += [
             {
-                "args": {"name": process["label"]},
+                "args": {"name": label},
                 "cat": "__metadata",
                 "name": "process_name",
                 "ph": "M",
@@ -3812,6 +3870,8 @@ def _dispatcher_block_events(spans, global_origin_ns):
             for tid, name in process["lanes"].items()
         ]
         for span, attrs, tid in process["spans"]:
+            start_ns, slack_ns = chain.place(span.pid, span.ts)
+            placed = {"slack_ns": int(round(slack_ns))} if slack_ns else {}
             events.append(
                 {
                     "name": span.name,
@@ -3819,15 +3879,22 @@ def _dispatcher_block_events(spans, global_origin_ns):
                     "ph": "X",
                     "pid": block_pid,
                     "tid": tid,
-                    "ts": (span.ts - global_origin_ns) / 1000.0,
+                    "ts": (start_ns - global_origin_ns) / 1000.0,
                     "dur": span.dur / 1000.0,
-                    "args": {"inv": span.inv, "os_pid": span.pid, "os_tid": span.tid, "depth": span.depth, **attrs},
+                    "args": {
+                        "inv": span.inv,
+                        "os_pid": span.pid,
+                        "os_tid": span.tid,
+                        "depth": span.depth,
+                        **placed,
+                        **attrs,
+                    },
                 }
             )
     return events
 
 
-def _host_call_tree_events(rank, placement, spans, global_origin_ns):
+def _host_call_tree_events(rank, placement, spans, global_origin_ns, chain):
     """The Rank's own Host call tree — `chip.run` and everything under it.
 
     Drawn on the Host axis directly, since that is the clock it was recorded
@@ -3847,6 +3914,9 @@ def _host_call_tree_events(rank, placement, spans, global_origin_ns):
         }
     )
     for span in sorted(spans, key=lambda item: (item.ts, -item.dur)):
+        placed = chain.place(span.pid, span.ts)
+        if placed is None:
+            continue
         events.append(
             {
                 "name": span.name,
@@ -3854,7 +3924,7 @@ def _host_call_tree_events(rank, placement, spans, global_origin_ns):
                 "ph": "X",
                 "pid": pid,
                 "tid": 0,
-                "ts": (span.ts - global_origin_ns) / 1000.0,
+                "ts": (placed[0] - global_origin_ns) / 1000.0,
                 "dur": span.dur / 1000.0,
                 "args": {"rank": rank, "inv": span.inv, "os_pid": span.pid, "depth": span.depth},
             }
@@ -4031,17 +4101,21 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
         clock_domain = _rank_clock_domain(rank, records_path, raw_inputs[rank])
         if clock_domain is not None:
             clock_domains.add(clock_domain)
+    host_logs = _discover_host_logs(root, args.host_log)
+    placements, host_pairing, host_spans, chain = _place_rank_captures(
+        host_logs, raw_inputs, rank_identities, rank_host_pids, _parse_rank_pid_pins(args.rank_pid)
+    )
+    # A frame window places the process that served the frame, never the chip
+    # children under it: those are other pids in other logs, which no window
+    # names. So a Rank on a second Host clock still has nothing to be placed
+    # against, and is refused rather than drawn at its own machine's raw
+    # timestamps. What the chain relaxed is the dispatching processes beside
+    # the Ranks, not the Ranks.
     if len(clock_domains) > 1:
         raise ValueError(
             f"Rank inputs come from different Host clocks ({sorted(clock_domains)}), so their windows are not "
-            "comparable. Placing them on one axis needs the window of the level that dispatched to both — the "
-            "cross-host splice is not implemented."
+            "comparable. A frame window places the process it was served by, not the Ranks below it."
         )
-
-    host_logs = _discover_host_logs(root, args.host_log)
-    placements, host_pairing, host_spans = _place_rank_captures(
-        host_logs, raw_inputs, rank_identities, rank_host_pids, _parse_rank_pid_pins(args.rank_pid)
-    )
     # The Host log holds several processes; each Rank draws only the spans of
     # the invocation its capture was paired with.
     spans_by_invocation = defaultdict(list)
@@ -4050,25 +4124,33 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
 
     # What the Ranks occupy on the Host axis. It bounds the origin below and
     # selects which of the dispatching processes' spans belong to this merge.
+    # A Rank whose process is a peer's reaches this axis the same way its
+    # window did, so the spans that bound the origin are read after placement
+    # rather than as the peer's own clock wrote them.
     rank_spans = [
-        span
+        (span, placed[0])
         for placement in placements.values()
         for span in spans_by_invocation[(placement.host.pid, placement.host.inv)]
-        if not span.is_device
+        if not span.is_device and (placed := chain.place(span.pid, span.ts)) is not None
     ]
     # The axis starts at the earliest thing drawn on it. That is not always a
     # placement: a Rank's `chip.run` opens before the `runner_run` window
     # inside it, and the scheduler's `node.dispatch` opens before that again,
     # so an origin taken from the windows alone would put both at a negative
     # timestamp.
-    window_lo = min([int(placement.place_lo_ns) for placement in placements.values()] + [s.ts for s in rank_spans])
+    window_lo = min(
+        [int(placement.place_lo_ns) for placement in placements.values()] + [int(ns) for _span, ns in rank_spans]
+    )
     window_hi = max(
-        [int(placement.host.end_ns) for placement in placements.values()] + [s.ts + s.dur for s in rank_spans]
+        [int(placement.host.end_ns) for placement in placements.values()]
+        + [int(ns) + span.dur for span, ns in rank_spans]
     )
     chip_pids = {placement.host.pid for placement in placements.values()}
-    dispatcher_spans = _dispatcher_spans(host_spans, chip_pids, (window_lo, window_hi))
-    global_origin_ns = min([window_lo] + [span.ts for span in dispatcher_spans])
-    all_events = _dispatcher_block_events(dispatcher_spans, global_origin_ns)
+    # A peer host's processes reach this axis only through the frame windows
+    # that bracket them, so the windows are resolved before anything is placed.
+    dispatcher_spans = _dispatcher_spans(host_spans, chip_pids, (window_lo, window_hi), chain)
+    global_origin_ns = min([window_lo] + [span.ts for span in dispatcher_spans if span.pid not in chain.peer_pids])
+    all_events = _dispatcher_block_events(dispatcher_spans, global_origin_ns, chain)
     rank_metadata = []
     for rank, records_path in rank_inputs:
         placement = placements[rank]
@@ -4099,7 +4181,7 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
         invocation = spans_by_invocation[(placement.host.pid, placement.host.inv)]
         all_events.extend(
             _host_call_tree_events(
-                rank, placement, [span for span in invocation if not span.is_device], global_origin_ns
+                rank, placement, [span for span in invocation if not span.is_device], global_origin_ns, chain
             )
         )
         all_events.extend(
@@ -4130,9 +4212,12 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
         "host_clock_domain_id": next(iter(clock_domains)) if clock_domains else None,
         "host_logs": [str(path) for path in host_logs],
         "global_origin_ns": global_origin_ns,
-        # The processes that dispatched to these Ranks, drawn on the Host clock
-        # directly — no containment, so no slack applies to their lanes.
+        # The processes that dispatched to these Ranks. Those on this Host go
+        # straight onto the axis, so no slack applies to their lanes; a peer
+        # reached across a wire is placed by the frame window that held it, and
+        # `remote_windows` publishes that bound per frame.
         "dispatcher_pids": sorted({span.pid for span in dispatcher_spans}),
+        "remote_windows": [window.metadata() for window in chain.windows],
         "rank_count": len(rank_metadata),
         **pairing_metadata,
         "trace_status": "partial" if any(rank["trace_status"] != "complete" for rank in rank_metadata) else "complete",
