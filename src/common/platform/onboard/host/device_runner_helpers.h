@@ -64,6 +64,11 @@ struct SlotPersistentArgs {
     KernelArgs *device_k_args{nullptr};  // device copy of KernelArgs for AICore
     uint64_t regs{0};                    // architecture register table
     uint64_t runtime_bytes{0};           // committed length of runtime_args
+    // Whether `regs` names a table whose contents reached the device. A failed
+    // host-to-device copy whose rollback release also failed leaves the block
+    // owned but unwritten, so `regs != 0` alone does not mean "usable": the
+    // address is retained for release, and the next prepare must commit again.
+    bool regs_committed{false};
 };
 
 /**

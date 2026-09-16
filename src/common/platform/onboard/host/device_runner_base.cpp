@@ -45,6 +45,7 @@
 #include "common/sdma_warmup_layout.h"
 #include "common/unified_log.h"
 #include "host/acl_error_log.h"
+#include "kernel_platform_ops.h"
 #include "host/host_phase_records_artifact.h"
 #include "host/raii_scope_guard.h"
 #include "host_log.h"
@@ -575,6 +576,10 @@ int DeviceRunnerBase::attach_current_thread(int device_id) {
     // writes here would still be a C++ data race.
     if (device_id_ == -1) {
         timeout_config_ = resolve_onboard_timeout_config();
+        // aclrtSetOpExecuteTimeOutV2 is device-global: it changes the
+        // op-execute timeout of every operator any process runs on this
+        // device, including the host framework's own. Only a context that
+        // owns the device may set it.
         configure_aicore_op_timeout();
         device_id_ = device_id;
     }
@@ -673,7 +678,7 @@ int DeviceRunnerBase::ensure_device_initialized() {
         );
     }
 
-    rc = ensure_binaries_loaded();
+    rc = ensure_binaries_loaded(stream_aicpu_);
     if (rc != 0) return rc;
 
     // Before the AICPU init launch: that launch is what publishes the workspace
@@ -681,13 +686,90 @@ int DeviceRunnerBase::ensure_device_initialized() {
     rc = ensure_dma_workspace_provisioned();
     if (rc != 0) return rc;
 
-    rc = ensure_aicpu_init_launched();
+    rc = ensure_aicpu_init_launched(stream_aicpu_);
     if (rc != 0) return rc;
 
     return ensure_dma_workspace_warmed();
 }
 
-int DeviceRunnerBase::ensure_aicpu_init_launched() {
+int DeviceRunnerBase::init_kernel_context(int device_id) {
+    int rc = adopt_borrowed_device(device_id);
+    if (rc != 0) return rc;
+
+    rc = kernel_exec_state_.initialize(device_id_, make_onboard_kernel_context_ops());
+    if (rc != 0) {
+        LOG_ERROR("init_kernel_context: context stream/event creation failed: %d", rc);
+        return rc;
+    }
+
+    rtStream_t control_stream = static_cast<rtStream_t>(kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu));
+    rtStream_t aicore_stream = static_cast<rtStream_t>(kernel_exec_state_.hidden_stream(KernelStreamKind::Aicore));
+
+    // Same latch as the program path: resolve_block_dim() is pure arithmetic
+    // once this holds.
+    if (max_block_dim_ == 0) {
+        max_block_dim_ = query_max_block_dim(aicore_stream, &max_cube_cores_, &max_vector_cores_);
+        LOG_INFO(
+            "DeviceRunner: kernel context device=%d max_block_dim=%d (cube=%u, vector=%u)", device_id_, max_block_dim_,
+            max_cube_cores_, max_vector_cores_
+        );
+    }
+
+    rc = ensure_binaries_loaded(control_stream);
+    if (rc != 0) return rc;
+
+    // The async-DMA workspace is program mode's SDMA channel; kernel mode
+    // provisions none, so this launch publishes the all-zero addresses that
+    // mean "that engine is unavailable".
+    return ensure_aicpu_init_launched(control_stream);
+}
+
+PersistentArgsOps DeviceRunnerBase::persistent_args_ops() {
+    PersistentArgsOps ops{};
+    ops.context = this;
+    ops.alloc = [](void *context, size_t bytes) -> void * {
+        return static_cast<DeviceRunnerBase *>(context)->mem_alloc_.alloc(bytes);
+    };
+    ops.free_ = [](void *context, void *ptr) -> int {
+        return static_cast<DeviceRunnerBase *>(context)->mem_alloc_.free(ptr);
+    };
+    ops.copy_h2d = [](void *, void *dst, size_t dst_bytes, const void *src, size_t src_bytes) -> int {
+        return static_cast<int>(rtMemcpy(dst, dst_bytes, src, src_bytes, RT_MEMCPY_HOST_TO_DEVICE));
+    };
+    ops.fill_arch_fields = [](void *context, KernelArgs *args, uint64_t device_id) -> int {
+        return static_cast<DeviceRunnerBase *>(context)->fill_persistent_arch_fields(args, device_id);
+    };
+    return ops;
+}
+
+int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id) {
+    rtStream_t control_stream = static_cast<rtStream_t>(kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu));
+    if (control_stream == nullptr) {
+        LOG_ERROR("prepare_kernel_callable: no live kernel context");
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+
+    int rc = register_callable_on_device(callable_id, control_stream);
+    if (rc != 0) return rc;
+
+    // Idempotent: only the first prepared callable allocates. The uploaded
+    // Runtime keeps its per-callable and per-invocation fields at the sentinels
+    // Runtime() sets, because no callable is bound into this image: a launch
+    // resolves its own target, and writing one here would make every launch
+    // run whichever callable was prepared first.
+    //
+    // One set of execution resources, and this context reads no pipeline depth.
+    // The kernel contract `build_kernel_pipeline_contract_impl` produces and
+    // the init entry validates declares depth 2, which nothing consumes — the
+    // number is the contract's, not this owner's, and one set is what a context
+    // admitting a single invocation at a time needs.
+    rc = persistent_args_.prepare_once(kernel_runtime_, persistent_args_ops(), static_cast<uint64_t>(device_id_));
+    if (rc != 0) return rc;
+
+    return kernel_exec_state_.mark_ready_enqueued();
+}
+
+int DeviceRunnerBase::ensure_aicpu_init_launched(rtStream_t control_stream) {
     if (aicpu_init_launched_) {
         return 0;
     }
@@ -712,14 +794,14 @@ int DeviceRunnerBase::ensure_aicpu_init_launched() {
 
     LOG_INFO("=== launch_aicpu_payload %s ===", host::KernelNames::InitName);
     int rc = launch_aicpu_payload(
-        stream_aicpu_, &init_args, sizeof(init_args), host::KernelNames::InitName, /*aicpu_num=*/1
+        control_stream, &init_args, sizeof(init_args), host::KernelNames::InitName, /*aicpu_num=*/1
     );
     if (rc != 0) {
         LOG_ERROR("ensure_aicpu_init_launched: launch_aicpu_payload failed: %d", rc);
         return rc;
     }
 
-    rc = aclrtSynchronizeStreamWithTimeout(stream_aicpu_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    rc = aclrtSynchronizeStreamWithTimeout(control_stream, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
     if (rc != 0) {
         LOG_ERROR("ensure_aicpu_init_launched: stream sync failed: %d (device_id=%d)", rc, device_id_);
         return rc;
@@ -728,15 +810,16 @@ int DeviceRunnerBase::ensure_aicpu_init_launched() {
     return 0;
 }
 
-int DeviceRunnerBase::ensure_binaries_loaded() {
+int DeviceRunnerBase::ensure_binaries_loaded(rtStream_t control_stream) {
     // Check if already loaded (binaries are owned by the runner via
     // set_executors and live for the runner's lifetime).
     if (binaries_loaded_) {
         return 0;
     }
 
-    // Device must be set first
-    if (stream_aicpu_ == nullptr) {
+    // The control stream is what the bootstrap launch rides; a context that
+    // has not created one yet has no device to bootstrap on.
+    if (control_stream == nullptr) {
         LOG_ERROR("Device not set before loading binaries");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -758,7 +841,7 @@ int DeviceRunnerBase::ensure_binaries_loaded() {
     // rtsLaunchCpuKernel directly against the preinstall file.
     int rc = load_aicpu_op_.BootstrapDispatcher(
         dispatcher_so_binary_.data(), dispatcher_so_binary_.size(), aicpu_so_binary_.data(), aicpu_so_binary_.size(),
-        stream_aicpu_, device_id_
+        control_stream, device_id_
     );
     if (rc != 0) {
         LOG_ERROR("LoadAicpuOp::BootstrapDispatcher failed: %d", rc);
@@ -846,8 +929,12 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
     if (callable == nullptr) {
         return 0;
     }
-    if (stream_aicpu_ == nullptr) {
-        LOG_ERROR("Run context not prepared before upload_chip_callable_buffer()");
+    // The upload allocates and copies; it needs a bound device and nothing
+    // else. A kernel-mode context has no stream_aicpu_ — its AICPU stream
+    // belongs to KernelExecutionState — so the stream is not the precondition
+    // to test here.
+    if (device_id_ < 0) {
+        LOG_ERROR("No device bound before upload_chip_callable_buffer()");
         return 0;
     }
 
@@ -972,11 +1059,24 @@ int DeviceRunnerBase::launch_device_register(int32_t callable_id) {
         return 0;
     }
 
-    int rc = ensure_device_initialized();
+    const int rc = ensure_device_initialized();
     if (rc != 0) {
         LOG_ERROR("launch_device_register: ensure_device_initialized failed: %d", rc);
         return rc;
     }
+    return register_callable_on_device(callable_id, stream_aicpu_);
+}
+
+int DeviceRunnerBase::register_callable_on_device(int32_t callable_id, rtStream_t control_stream) {
+    auto it = callables_.find(callable_id);
+    if (it == callables_.end()) {
+        LOG_ERROR("register_callable_on_device: callable_id=%d not registered", callable_id);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (it->second.host_dlopen_handle != nullptr) {
+        return 0;
+    }
+    int rc = 0;
 
     // Build the orch-SO descriptor straight from CallableState — no full
     // Runtime H2D as the old prewarm path did. Registration always (re)dlopens
@@ -993,24 +1093,39 @@ int DeviceRunnerBase::launch_device_register(int32_t callable_id) {
 
     LOG_INFO("=== launch_aicpu_payload %s ===", host::KernelNames::RegisterCallableName);
     rc = launch_aicpu_payload(
-        stream_aicpu_, &reg_args, sizeof(reg_args), host::KernelNames::RegisterCallableName, /*aicpu_num=*/1
+        control_stream, &reg_args, sizeof(reg_args), host::KernelNames::RegisterCallableName, /*aicpu_num=*/1
     );
     if (rc != 0) {
-        LOG_ERROR("launch_device_register: launch_aicpu_payload failed: %d", rc);
+        // Submission itself failed, so no AICPU task exists and nothing on the
+        // device can be reading the uploaded orchestration SO. The caller may
+        // release the registration.
+        LOG_ERROR("register_callable_on_device: launch_aicpu_payload failed: %d", rc);
         return rc;
     }
 
-    rc = aclrtSynchronizeStreamWithTimeout(stream_aicpu_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    // Past this point the registration task is enqueued and the AICPU reads the
+    // uploaded orchestration SO out of the callable's device buffer. A failed or
+    // timed-out wait does not establish that it stopped, so admission is
+    // poisoned rather than the buffer released: `accepts_dispatch()` turning
+    // false is how the caller learns it must not unregister this callable.
+    rc = aclrtSynchronizeStreamWithTimeout(control_stream, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
     if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
         LOG_ERROR(
-            "launch_device_register: stream sync timeout timeout_ms=%d device_id=%d", PLATFORM_STREAM_SYNC_TIMEOUT_MS,
-            device_id_
+            "register_callable_on_device: stream sync timeout timeout_ms=%d device_id=%d — retaining callable "
+            "ownership, the AICPU may still be reading its image",
+            PLATFORM_STREAM_SYNC_TIMEOUT_MS, device_id_
         );
+        kernel_exec_state_.poison(rc);
         return rc;
     }
     if (rc != 0) {
-        LOG_ERROR("launch_device_register: aclrtSynchronizeStreamWithTimeout failed: %d", rc);
+        LOG_ERROR(
+            "register_callable_on_device: aclrtSynchronizeStreamWithTimeout failed: %d — retaining callable "
+            "ownership, completion is not established",
+            rc
+        );
         ACL_LOG_ERROR_DETAIL(rc);
+        kernel_exec_state_.poison(rc);
         return rc;
     }
 
@@ -1647,17 +1762,30 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     // re-launches simpler_aicpu_init after the next ensure_binaries_loaded().
     aicpu_init_launched_ = false;
 
-    // Release any chip callable buffers callers forgot to unregister.
+    bool kernel_cleanup_failed = false;
+
+    // Release any chip callable buffers callers forgot to unregister. Keep a
+    // failed allocation registered so an explicit kernel close can retry it;
+    // dropping the entry here would make MemoryAllocator::finalize() clear
+    // the last ownership record and turn the retry into a false success.
     if (!abandon_device_resources) {
-        for (auto &kv : chip_callable_buffers_) {
-            mem_alloc_.free(reinterpret_cast<void *>(kv.second.chip_dev));
+        for (auto it = chip_callable_buffers_.begin(); it != chip_callable_buffers_.end();) {
+            const int free_rc = mem_alloc_.free(reinterpret_cast<void *>(it->second.chip_dev));
+            if (free_rc != 0) {
+                capture(free_rc);
+                kernel_cleanup_failed = execution_mode_latch().is_kernel();
+                ++it;
+                continue;
+            }
             LOG_DEBUG(
-                "Freed chip callable buffer: chip_dev=0x%lx, size=%zu, hash=0x%lx", kv.second.chip_dev,
-                kv.second.total_size, kv.first
+                "Freed chip callable buffer: chip_dev=0x%lx, size=%zu, hash=0x%lx", it->second.chip_dev,
+                it->second.total_size, it->first
             );
+            it = chip_callable_buffers_.erase(it);
         }
+    } else {
+        chip_callable_buffers_.clear();
     }
-    chip_callable_buffers_.clear();
 
     // hbg path: dlclose any host orch handles callers forgot to unregister.
     // finalize() is the last chance; Worker.close() does not auto-unregister
@@ -1730,12 +1858,36 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
         if (abandon_device_resources) {
             abandon_slot_persistent_args(slot);
         } else {
-            capture(release_slot_persistent_args(slot, mem_alloc_));
+            const int slot_rc = release_slot_persistent_args(slot, mem_alloc_);
+            capture(slot_rc);
+            kernel_cleanup_failed = kernel_cleanup_failed || (execution_mode_latch().is_kernel() && slot_rc != 0);
         }
+    }
+
+    // Kernel-mode context resources. The argument blocks route through
+    // mem_alloc_, so they are released before its finalize below; the streams
+    // and events do not, and go after them so a caller that inspects the
+    // teardown sees arguments released while their owning context still
+    // exists. Both are no-ops on a program-mode context.
+    if (abandon_device_resources) {
+        persistent_args_.abandon();
+    } else {
+        const int args_rc = persistent_args_.finalize_once();
+        if (args_rc != 0 && rc == 0) rc = args_rc;
+        const int close_rc = kernel_exec_state_.close();
+        if (close_rc != 0 && rc == 0) rc = close_rc;
+        kernel_cleanup_failed =
+            kernel_cleanup_failed || (execution_mode_latch().is_kernel() && (args_rc != 0 || close_rc != 0));
     }
 
     // Free all remaining allocations (including handshake buffer and binGmAddr)
     if (!abandon_device_resources) {
+        // A failed persistent release keeps its address for explicit close
+        // retry. MemoryAllocator::finalize() deliberately clears its tracking
+        // map even when rtFree fails, which would turn that retry into a false
+        // success. Preserve the allocator and all remaining runner state until
+        // the kernel cleanup has completed.
+        if (kernel_cleanup_failed) return rc;
         // The mappings name the allocations mem_alloc_ is about to free, so
         // they cannot be released after it. A force reset already invalidated
         // both, and the unregister would be a further device call.

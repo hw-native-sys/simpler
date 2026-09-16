@@ -141,6 +141,7 @@ int release_slot_persistent_args(SlotPersistentArgs &slot, MemoryAllocator &allo
             if (first_error == 0) first_error = rc;
         } else {
             slot.regs = 0;
+            slot.regs_committed = false;
         }
     }
     return first_error;
@@ -151,4 +152,5 @@ void abandon_slot_persistent_args(SlotPersistentArgs &slot) {
     slot.runtime_args = nullptr;
     slot.runtime_bytes = 0;
     slot.regs = 0;
+    slot.regs_committed = false;
 }

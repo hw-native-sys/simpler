@@ -1079,10 +1079,11 @@ int simpler_kernel_mode_init(
     if (rc != 0) return rc;
     try {
         PipelineContract contract{};
-        const int rc = build_kernel_pipeline_contract_impl(config, &contract);
-        if (rc != 0 && rc != PTO_RUNTIME_ERR_UNSUPPORTED) return rc;
-        if (rc == 0 && (!is_valid_pipeline_contract(&contract, SIMPLER_MODE_KERNEL) ||
-                        !has_serviceable_arena_topology(contract) || !has_serviceable_stream_topology(contract))) {
+        const int contract_rc = build_kernel_pipeline_contract_impl(config, &contract);
+        if (contract_rc != 0 && contract_rc != PTO_RUNTIME_ERR_UNSUPPORTED) return contract_rc;
+        if (contract_rc == 0 &&
+            (!is_valid_pipeline_contract(&contract, SIMPLER_MODE_KERNEL) || !has_serviceable_arena_topology(contract) ||
+             !has_serviceable_stream_topology(contract))) {
             return PTO_RUNTIME_ERR_INTERNAL;
         }
     } catch (...) {
@@ -1093,9 +1094,9 @@ int simpler_kernel_mode_init(
 }
 
 int simpler_kernel_mode_prepare_callable(
-    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size, void *caller_stream
+    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size
 ) {
-    const int rc = validate_kernel_prepare_callable_args(ctx, callable_id, callable, callable_size, caller_stream);
+    const int rc = validate_kernel_prepare_callable_args(ctx, callable_id, callable, callable_size);
     if (rc != 0) return rc;
     LOG_ERROR("simpler_kernel_mode_prepare_callable: no live kernel context on this device context");
     return PTO_RUNTIME_ERR_INVALID_STATE;

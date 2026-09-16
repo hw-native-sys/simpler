@@ -196,8 +196,8 @@ def kernel_symbol_runtime(tmp_path_factory):
     """.split()
     cache = {}
 
-    def build(*, supported=0, missing=(), init_result=0):
-        key = (supported, missing, init_result)
+    def build(*, supported=0, missing=(), init_result=0, finalize_failures=0):
+        key = (supported, missing, init_result, finalize_failures)
         if key in cache:
             return cache[key]
         source = build_dir / f"runtime_{len(cache)}.cpp"
@@ -217,7 +217,11 @@ def kernel_symbol_runtime(tmp_path_factory):
             "void destroy_device_context(DeviceContextHandle ctx) {\n"
             "    --live_contexts; delete static_cast<uint64_t *>(ctx);\n"
             "}\n"
-            "int finalize_device(DeviceContextHandle) { return 0; }\n"
+            f"static int finalize_failures = {finalize_failures};\n"
+            "int finalize_device(DeviceContextHandle) {\n"
+            "    if (finalize_failures > 0) { --finalize_failures; return -77; }\n"
+            "    return 0;\n"
+            "}\n"
             "size_t get_runtime_size() { return sizeof(uint64_t); }\n"
             "size_t get_runtime_alignment() { return alignof(uint64_t); }\n"
             "const PipelineContract *get_pipeline_contract() {\n"
@@ -331,6 +335,17 @@ class TestChipWorkerKernelSymbols:
             assert worker.initialized
         finally:
             worker.finalize()
+
+    def test_native_finalize_failure_is_reported_and_retriable(self, kernel_symbol_runtime):
+        runtime = kernel_symbol_runtime(finalize_failures=1)
+        worker = _ChipWorker()
+        worker.init(str(runtime), os.devnull, os.devnull, "", device_id=0)
+        with pytest.raises(RuntimeError, match=r"device teardown failed \(-77\)"):
+            worker.finalize()
+        assert worker.initialized
+        assert worker.device_id == 0
+        worker.finalize()
+        assert not worker.initialized
 
 
 class TestChipWorkerStateMachine:
@@ -546,6 +561,33 @@ class TestChipWorkerPython:
             "WARNING: host-log flush failed during ChipWorker.finalize(): injected host-log flush failure"
         )
         assert expected_warning in capsys.readouterr().err
+
+    def test_public_wrapper_keeps_registries_when_native_finalize_fails(self):
+        from _task_interface import ChipCallable  # noqa: PLC0415
+        from simpler.task_interface import ChipWorker  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
+
+        class FakeImpl:
+            initialized = True
+            device_id = 0
+
+            def finalize(self):
+                raise RuntimeError("injected device teardown failure")
+
+        worker = ChipWorker()
+        worker._impl = FakeImpl()
+        worker._callable_registry[0] = ChipCallable.build(signature=[], func_name="test", binary=b"\x00", children=[])
+        worker._identity_registry[b"digest"] = object()
+        worker._live_handles[1] = b"digest"
+
+        with pytest.raises(RuntimeError, match="injected device teardown failure"):
+            worker.finalize()
+
+        # The registries name what the native side still holds. A teardown that
+        # did not complete leaves those resources alive, so dropping the
+        # registries would hide them from a retry and from the caller.
+        assert list(worker._callable_registry) == [0]
+        assert list(worker._identity_registry) == [b"digest"]
+        assert worker._live_handles == {1: b"digest"}
 
     def test_public_wrapper_flush_timeout_is_reported_with_loss_counters(self, monkeypatch, capsys):
         import simpler.task_interface as task_interface_mod  # noqa: PLC0415

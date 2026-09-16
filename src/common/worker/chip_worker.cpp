@@ -20,6 +20,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -160,7 +161,15 @@ ChipWorker::RuntimeStorage &ChipWorker::RuntimeStorage::operator=(RuntimeStorage
     return *this;
 }
 
-ChipWorker::~ChipWorker() { finalize(); }
+ChipWorker::~ChipWorker() {
+    try {
+        finalize();
+    } catch (const std::exception &error) {
+        std::fprintf(stderr, "ChipWorker::~ChipWorker: teardown failed: %s\n", error.what());
+    } catch (...) {
+        std::fprintf(stderr, "ChipWorker::~ChipWorker: teardown failed with an unknown error\n");
+    }
+}
 
 void ChipWorker::init(
     const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
@@ -502,8 +511,19 @@ void ChipWorker::finalize() {
     // communicator handles and streams before tearing down the device context.
     clear_comm_sessions();
 
+    int device_finalize_rc = 0;
     if (device_ctx_ != nullptr && finalize_device_fn_ != nullptr && initialized_) {
-        finalize_device_fn_(device_ctx_);
+        device_finalize_rc = finalize_device_fn_(device_ctx_);
+    }
+    // A context whose teardown did not complete still owns device resources,
+    // and unloading the library that owns their release routines — or
+    // destroying the context that holds them — is unrecoverable. Both the
+    // context and the handle stay, so an explicit retry can finish the job.
+    if (device_finalize_rc != 0) {
+        throw std::runtime_error(
+            "ChipWorker::finalize: device teardown failed (" + std::to_string(device_finalize_rc) +
+            "); keeping the context and host runtime loaded"
+        );
     }
     if (device_ctx_ != nullptr && destroy_device_context_fn_ != nullptr) {
         destroy_device_context_fn_(device_ctx_);

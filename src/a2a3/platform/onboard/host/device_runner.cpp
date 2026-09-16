@@ -136,6 +136,26 @@ int kernel_args_init_ffts_base_addr(KernelArgsHelper &helper) {
 // DeviceRunner Implementation
 // =============================================================================
 
+int DeviceRunner::fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) {
+    if (args == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+
+    int rc = init_aicore_register_addresses(&args->regs, device_id, mem_alloc_, AicoreRegKind::Ctrl);
+    if (rc != 0) {
+        LOG_ERROR("fill_persistent_arch_fields: init_aicore_register_addresses(Ctrl) failed: %d", rc);
+        return rc;
+    }
+
+    uint32_t ffts_len = 0;
+    rc = rtGetC2cCtrlAddr(&args->ffts_base_addr, &ffts_len);
+    if (rc != 0) {
+        LOG_ERROR("fill_persistent_arch_fields: rtGetC2cCtrlAddr failed: %d", rc);
+        if (mem_alloc_.free(reinterpret_cast<void *>(args->regs)) == 0) args->regs = 0;
+        args->ffts_base_addr = 0;
+        return rc;
+    }
+    return 0;
+}
+
 DeviceRunner::~DeviceRunner() { finalize(); }
 
 // `setup_static_arena`, `create_thread`, `attach_current_thread`,
@@ -287,14 +307,18 @@ int DeviceRunner::prepare_execution(
     // is a property of the device, not of the run, so the slot commits it once
     // and every later run on that slot reuses the same addresses.
     SlotPersistentArgs &slot_args = slot_persistent_args(execution->pipeline_slot);
-    if (slot_args.regs == 0) {
+    if (!slot_args.regs_committed) {
         rc = init_aicore_register_addresses(
             &slot_args.regs, static_cast<uint64_t>(device_id_), mem_alloc_, AicoreRegKind::Ctrl
         );
         if (rc != 0) {
+            // A retained address stays in `slot_args.regs` for release; it is
+            // not committed, so the next prepare commits again rather than
+            // handing the device an unwritten table.
             LOG_ERROR("init_aicore_register_addresses(Ctrl) failed: %d", rc);
             return rc;
         }
+        slot_args.regs_committed = true;
     }
     execution->kernel_args.args.regs = slot_args.regs;
 
@@ -991,15 +1015,22 @@ int DeviceRunner::finalize() {
         // (verified on a2a3). An SDMA-provisioned card gets a single attempt:
         // there a non-confirming reset already blocks on the driver's
         // remote-event timeout, which a retry only multiplies.
+        // A kernel-mode context owns neither the device nor its ACL state, so
+        // force_reset_device() refuses. Asking anyway would log that refusal
+        // once per attempt and then report a reset that "did not confirm
+        // clean", which reads as a failed reset rather than the designed
+        // refusal it is.
+        const bool owns_device_reset = !execution_mode_latch().is_kernel();
         constexpr int kFatalResetAttempts = 3;
-        int reset_rc = attempt_fatal_reset(
-            [this]() {
-                return force_reset_device();
-            },
-            sdma_provisioned ? 1 : kFatalResetAttempts
-        );
-        const bool reset_confirmed = reset_rc == 0;
-        if (!reset_confirmed) {
+        int reset_rc = owns_device_reset ? attempt_fatal_reset(
+                                               [this]() {
+                                                   return force_reset_device();
+                                               },
+                                               sdma_provisioned ? 1 : kFatalResetAttempts
+                                           ) :
+                                           0;
+        const bool reset_confirmed = owns_device_reset && reset_rc == 0;
+        if (!reset_confirmed && owns_device_reset) {
             LOG_ERROR(
                 "Fatal teardown: force reset of device %d did not confirm clean (rc=%d); "
                 "quarantining old handles without per-resource RTS calls",
@@ -1007,8 +1038,20 @@ int DeviceRunner::finalize() {
             );
         }
 
-        run_streams_.abandon();
-        int abandon_rc = abandon_common_after_device_failure();
+        // Abandoning the handle bookkeeping is only correct once a reset has
+        // invalidated the device generation those addresses belong to. A
+        // kernel-mode context resets nothing, so its streams, events and
+        // argument blocks are still live and still owned: quarantine the
+        // context and leave them for an explicit close to release for real.
+        // Dropping them here would report a clean finalize while the caller's
+        // device still holds every one of them.
+        int abandon_rc = 0;
+        if (owns_device_reset) {
+            run_streams_.abandon();
+            abandon_rc = abandon_common_after_device_failure();
+        } else {
+            kernel_exec_state_.poison(PTO_RUNTIME_ERR_INVALID_STATE);
+        }
 
         // Only finalize the ACL owner after force reset established a clean
         // generation. On reset failure, aclFinalize may itself walk poisoned
@@ -1024,6 +1067,27 @@ int DeviceRunner::finalize() {
                 LOG_WARN("Fatal teardown: skipping aclFinalize because device reset was not confirmed");
             }
             acl_ready_ = false;
+        }
+
+        // A context whose resources are still owned is not finalized. Keeping
+        // `device_id_` is what lets a later close reach them again, and the
+        // device stays poisoned because no reset established a clean generation
+        // to clear it on.
+        //
+        // The quarantine is terminal for this context: `device_unusable_` keeps
+        // every later close on this branch, so the resources are pinned until
+        // the process ends. Retiring them needs a caller-confirmed recovery
+        // signal that does not exist yet — and the alternatives are worse than
+        // pinning, because clearing the poison, releasing resources the device
+        // may still be using, or resetting a borrowed device are all things
+        // this context has no standing to do.
+        if (!owns_device_reset) {
+            LOG_ERROR(
+                "Fatal teardown: kernel context on borrowed device %d quarantined — resources retained for an "
+                "explicit close after the caller establishes quiescence",
+                device_id_
+            );
+            return abandon_rc != 0 ? abandon_rc : PTO_RUNTIME_ERR_INVALID_STATE;
         }
 
         device_id_ = -1;
@@ -1060,6 +1124,7 @@ int DeviceRunner::finalize() {
     // mem_alloc_.finalize(), and cached arena sizes.
     rc = finalize_common();
     if (rc == 0) rc = stream_rc;
+    if (rc != 0 && execution_mode_latch().is_kernel()) return rc;
 
     // Reset device AFTER all device memory is freed. Two paths:
     //

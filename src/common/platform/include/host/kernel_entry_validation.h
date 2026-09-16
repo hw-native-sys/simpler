@@ -64,15 +64,55 @@ inline int validate_kernel_init_args(
 }
 
 inline int validate_kernel_prepare_callable_args(
-    const void *ctx, int32_t callable_id, const void *callable, size_t callable_size, const void *caller_stream
+    const void *ctx, int32_t callable_id, const void *callable, size_t callable_size
 ) {
-    if (ctx == nullptr || callable == nullptr || caller_stream == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    if (ctx == nullptr || callable == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     if (callable_size < sizeof(ChipCallable)) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     /* ChipCallable's storage_ is CALLABLE_CHILD_ALIGN-aligned relative to the
        header, so a misaligned image puts every child at a misaligned address. */
     if (reinterpret_cast<uintptr_t>(callable) % alignof(ChipCallable) != 0) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     return 0;
+}
+
+/* Validate the complete canonical flexible-array image before any code reads
+   a child header or hashes/uploads bytes beyond the fixed ChipCallable header. */
+inline int validate_kernel_callable_image(const void *callable_image, size_t callable_size) {
+    if (callable_image == nullptr || callable_size < sizeof(ChipCallable)) {
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    }
+    const auto *callable = static_cast<const ChipCallable *>(callable_image);
+    if (callable->sig_count_ < 0 || callable->sig_count_ > CHIP_MAX_TENSOR_ARGS || callable->child_count_ < 0 ||
+        callable->child_count_ > 1024 || callable->func_name_len_ >= CALLABLE_FUNC_NAME_MAX ||
+        callable->config_name_len_ >= CALLABLE_FUNC_NAME_MAX ||
+        callable->func_name_[callable->func_name_len_] != '\0' ||
+        callable->config_name_[callable->config_name_len_] != '\0') {
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    }
+
+    const size_t header_size = offsetof(ChipCallable, storage_);
+    const size_t storage_size = callable_size - header_size;
+    size_t used = callable->binary_size_;
+    if (used > storage_size) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+
+    for (int32_t i = 0; i < callable->child_count_; ++i) {
+        if (used > SIZE_MAX - (CALLABLE_ALIGN - 1)) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+        const size_t aligned = (used + CALLABLE_ALIGN - 1) & ~(static_cast<size_t>(CALLABLE_ALIGN) - 1);
+        const size_t offset = callable->child_offsets_[i];
+        if (aligned < used || offset != aligned || offset > storage_size ||
+            CoreCallable::binary_data_offset() > storage_size - offset) {
+            return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+        }
+        const auto *child = reinterpret_cast<const CoreCallable *>(callable->storage_ + offset);
+        if (child->sig_count_ < 0 || child->sig_count_ > CORE_MAX_TENSOR_ARGS) {
+            return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+        }
+        const size_t child_header = CoreCallable::binary_data_offset();
+        const size_t child_binary = child->binary_size_;
+        if (child_binary > storage_size - offset - child_header) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+        used = offset + child_header + child_binary;
+    }
+    return used == storage_size ? 0 : PTO_RUNTIME_ERR_INVALID_ARGUMENT;
 }
 
 inline int
