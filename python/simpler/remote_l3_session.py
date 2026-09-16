@@ -16,6 +16,7 @@ prestarts the embedded L3 Worker, then exposes the Remote L3 command lane.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
 import hashlib
 import importlib
@@ -32,6 +33,12 @@ import traceback
 from dataclasses import dataclass
 from multiprocessing import shared_memory
 from typing import Any, Callable
+
+from _task_interface import (  # pyright: ignore[reportMissingImports]
+    _emit_host_span,
+    _host_spans_active,
+    _monotonic_now_ns,
+)
 
 from .buffer import (
     AccessMode,
@@ -102,6 +109,7 @@ from .remote_l3_protocol import (
 )
 from .task_interface import ChipCallable, TaskArgs, get_element_size
 from .worker import Worker, _NoBufferConsumerError
+from .worker_level import span_prefix
 
 sys.modules.setdefault("simpler.remote_l3_session", sys.modules[__name__])
 
@@ -1213,29 +1221,38 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                 send_frame(conn, FrameHeader(FrameType.COMPLETION, session_id, worker_id, header.sequence), payload)
                 continue
 
-            try:
-                task = decode_task_payload(frame.payload)
-                orch_fn = dispatch_registry.get(task.callable_digest)
-                if orch_fn is None:
-                    raise KeyError(f"remote TASK dispatcher has no callable hashid {task.callable_digest.hex()}")
-                task_args, inline_backings = _materialize_task_args(
-                    task.args, buffers, worker_id, mint_inline_buffer=mint_session_buffer
-                )
+            with _served_frame_span(
+                inner_worker.level, session_id=session_id, worker_id=worker_id, sequence=header.sequence
+            ):
                 try:
-                    inner_worker.run(orch_fn, task_args, task.config)
-                finally:
-                    for backing in inline_backings:
-                        backing.close()
-                payload = encode_completion(header.sequence, 0, "")
-            except BaseException as exc:  # noqa: BLE001
-                payload = encode_completion(
-                    header.sequence,
-                    1,
-                    _format_remote_error(
-                        f"remote worker_id={worker_id} hashid={frame.payload[:32].hex()} sequence={header.sequence}",
-                        exc,
-                    ),
-                )
+                    task = decode_task_payload(frame.payload)
+                    orch_fn = dispatch_registry.get(task.callable_digest)
+                    if orch_fn is None:
+                        raise KeyError(f"remote TASK dispatcher has no callable hashid {task.callable_digest.hex()}")
+                    task_args, inline_backings = _materialize_task_args(
+                        task.args, buffers, worker_id, mint_inline_buffer=mint_session_buffer
+                    )
+                    try:
+                        inner_worker.run(orch_fn, task_args, task.config)
+                    finally:
+                        for backing in inline_backings:
+                            backing.close()
+                    payload = encode_completion(header.sequence, 0, "")
+                except BaseException as exc:  # noqa: BLE001
+                    payload = encode_completion(
+                        header.sequence,
+                        1,
+                        _format_remote_error(
+                            f"remote worker_id={worker_id} hashid={frame.payload[:32].hex()} "
+                            f"sequence={header.sequence}",
+                            exc,
+                        ),
+                    )
+            # Outside the span on purpose. The caller is released by this frame
+            # and can have handled its completion before the write returns, so
+            # a span that closed after it would report work the caller's own
+            # window had already ended — which is the one thing the window has
+            # to be able to say it contains.
             send_frame(conn, FrameHeader(FrameType.COMPLETION, session_id, worker_id, header.sequence), payload)
     finally:
         for key, entry in list(buffers.items()):
@@ -1243,6 +1260,45 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
         buffers.clear()
         with _INNER_HANDLE_LOCK:
             _INNER_HANDLES.clear()
+
+
+# A context manager that does nothing, reused rather than built per frame: a
+# gated-off run serves frames at the same rate a gated-on one does.
+_NO_FRAME_SPAN = contextlib.nullcontext()
+
+
+@contextlib.contextmanager
+def _emitting_frame_span(level: int, session_id: int, worker_id: int, sequence: int):
+    start_ns = _monotonic_now_ns()
+    try:
+        yield
+    finally:
+        _emit_host_span(
+            f"{span_prefix(level)}.remote_task",
+            0,
+            0,
+            0,
+            start_ns,
+            _monotonic_now_ns() - start_ns,
+            f"frame={session_id}:{worker_id}:{sequence}",
+        )
+
+
+def _served_frame_span(level: int, *, session_id: int, worker_id: int, sequence: int):
+    """Bracket the work this process does for one TASK frame, named by that frame.
+
+    The caller that sent the frame records the same three header fields on its
+    own `dispatch` span, and the two processes share no clock - so this span is
+    what lets an offline reader say which of this host's windows sits inside
+    which of the caller's, and read the difference of the two durations as the
+    placement bound. See `docs/dfx/host-trace.md`.
+
+    The name is the level word plus `.remote_task`, so it joins the host-span
+    family this process's orchestrator already emits into.
+    """
+    if not _host_spans_active():
+        return _NO_FRAME_SPAN
+    return _emitting_frame_span(level, session_id, worker_id, sequence)
 
 
 def run_session(

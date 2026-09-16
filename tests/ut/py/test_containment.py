@@ -14,6 +14,21 @@ from simpler_setup.tools import containment
 from simpler_setup.tools.strace_timing import parse_spans
 
 _GHZ = 1_000_000_000
+_RECORD_PREFIX = "[mono_ns=1000][T0x1][TIMING] emit_host_span: "
+
+
+def _span_line(name, ts, dur, *, pid=100, inv=1, depth=0, attrs=""):
+    """One `[STRACE]` record, as the host logger writes it.
+
+    The record grammar is spelled here and nowhere else, so a test that means
+    to describe a span cannot end up describing the format instead, and a
+    change to the format moves one line rather than every log a test builds.
+    """
+    line = (
+        f"{_RECORD_PREFIX}[STRACE] v=1 pid={pid} tid={pid} inv={inv} hid=abc "
+        f"depth={depth} name={name} ts={ts} dur={dur}"
+    )
+    return f"{line} {attrs}" if attrs else line
 
 
 def _host_log(*, pid=42, inv=1, runner=(1_000, 5_000), wall_ns=2_000, phases=(("sched", 700, 100),), dispatch=None):
@@ -23,7 +38,7 @@ def _host_log(*, pid=42, inv=1, runner=(1_000, 5_000), wall_ns=2_000, phases=(("
     ``chip.run`` span carries; without it the invocation names no dispatch, as
     a log from before the attributes existed does.
     """
-    prefix = "[mono_ns=1000][T0x1][TIMING] emit_host_span: "
+    prefix = _RECORD_PREFIX
     head = f"[STRACE] v=1 pid={pid} tid={pid} inv={inv} hid=abc"
     lines = []
     if dispatch is not None:
@@ -356,3 +371,491 @@ def test_host_pid_alone_still_needs_the_dispatch_when_the_process_ran_twice():
 
     assert (pairs[0].pid, pairs[0].inv) == (11, 2)
     assert diagnostics[0]["source"] == "capture_sidecar"
+
+
+_HANDOFF = "run_id=5 task_slot=2 group_index=0 worker_id=1 dispatch_id=9"
+
+
+def _caller_log(
+    *,
+    pid=100,
+    level="network1",
+    frame=(1026041362850311600, 1, 17),
+    dispatch=(10_000, 200),
+    complete=(23_000, 300),
+    handoff=_HANDOFF,
+):
+    """The dispatching host's two spans for one remote handoff.
+
+    The window they bracket is ``dispatch.start .. complete.end``: the caller
+    publishes the frame inside the first and handles the peer's completion
+    inside the second, so everything the peer did sits between them.
+    """
+    prefix = _RECORD_PREFIX
+    head = f"[STRACE] v=1 pid={pid} tid={pid} inv=1 hid=abc"
+    frame_attrs = "" if frame is None else " " + containment.format_frame_key(frame)
+    return [
+        f"{prefix}{head} depth=1 name={level}.dispatch ts={dispatch[0]} dur={dispatch[1]} "
+        f"{handoff} endpoint_kind=remote_l3 role=scheduler{frame_attrs}",
+        f"{prefix}{head} depth=1 name={level}.complete ts={complete[0]} dur={complete[1]} "
+        f"{handoff} endpoint_kind=remote_l3 role=worker outcome=0",
+    ]
+
+
+def _peer_log(*, pid=200, level="node", frame=(1026041362850311600, 1, 17), window=(8_000_000_000, 11_000)):
+    """The serving host's span for one frame, on that host's own clock."""
+    prefix = _RECORD_PREFIX
+    head = f"[STRACE] v=1 pid={pid} tid={pid} inv=1 hid=abc"
+    return [
+        f"{prefix}{head} depth=0 name={level}.remote_task ts={window[0]} dur={window[1]} "
+        f"{containment.format_frame_key(frame)}"
+    ]
+
+
+def _windows(*log_groups):
+    spans = list(parse_spans([line for group in log_groups for line in group]))
+    return containment.remote_windows(spans)
+
+
+def test_remote_window_slack_is_the_caller_window_less_the_peer_window():
+    """The bound is a difference of two durations, each timed on one host."""
+    (window,) = _windows(_caller_log(), _peer_log())
+
+    assert window.frame == (1026041362850311600, 1, 17)
+    assert window.caller_pid == 100
+    assert window.peer_pid == 200
+    # dispatch opens at 10_000 and complete ends at 23_300, so the caller held
+    # the frame for 13_300 ns while the peer reported 11_000 of work.
+    assert window.caller_duration_ns == 13_300
+    assert window.peer_duration_ns == 11_000
+    # 2_300 ns of spare window, and what two counters' rates can add over the
+    # 13.3 us the caller held the frame for.
+    assert window.rate_bound_ns == pytest.approx(13_300 * containment.MAX_RELATIVE_RATE)
+    assert window.slack_ns == pytest.approx(2_300 + window.rate_bound_ns)
+    assert (window.place_lo_ns, window.place_hi_ns) == (10_000.0, 10_000 + window.slack_ns)
+
+
+def test_no_instant_is_compared_across_the_two_hosts():
+    """Moving the peer's whole clock changes nothing the placement reports.
+
+    This is the property the cross-host case rests on: the two machines'
+    CLOCK_MONOTONIC axes have no common zero, so a method that reads one of
+    them against the other would move here. Seventeen days is the real gap
+    measured between two hosts' boot times.
+    """
+    seventeen_days_ns = 17 * 24 * 3_600 * 1_000_000_000
+    near = _windows(_caller_log(), _peer_log(window=(8_000_000_000, 11_000)))[0]
+    far = _windows(_caller_log(), _peer_log(window=(8_000_000_000 + seventeen_days_ns, 11_000)))[0]
+
+    assert near.slack_ns == far.slack_ns
+    assert near.place_lo_ns == far.place_lo_ns
+    assert near.place_hi_ns == far.place_hi_ns
+    # An event 4 us into the peer's window lands at the same caller instant.
+    assert near.peer_ns_to_host_ns(8_000_000_000 + 4_000) == far.peer_ns_to_host_ns(
+        8_000_000_000 + seventeen_days_ns + 4_000
+    )
+
+
+def test_offsets_inside_the_peer_window_are_exact():
+    """One clock and one rate inside a host, so only the block's origin is bounded."""
+    (window,) = _windows(_caller_log(), _peer_log(window=(8_000_000_000, 11_000)))
+
+    assert window.peer_ns_to_host_ns(8_000_000_000) == 10_000.0
+    assert window.peer_ns_to_host_ns(8_000_000_000 + 11_000) == 21_000.0
+
+
+def test_one_side_of_the_wire_alone_yields_no_window():
+    """A pile holding only the caller, or only the peer, produces no pairing."""
+    assert _windows(_caller_log()) == []
+    assert _windows(_peer_log()) == []
+
+
+def test_a_frame_the_peer_never_served_is_not_paired():
+    assert (
+        _windows(_caller_log(frame=(1026041362850311600, 1, 17)), _peer_log(frame=(1026041362850311600, 1, 18))) == []
+    )
+
+
+def test_a_local_dispatch_carries_no_frame_and_is_ignored():
+    """Only a dispatch that published a frame can name a peer window."""
+    local = _caller_log(frame=None, handoff=_HANDOFF + " endpoint_kind=local_mailbox")
+    assert _windows(local, _peer_log()) == []
+
+
+def test_a_frame_key_missing_a_part_is_no_key():
+    """The three arrive as one token, so two of them is a malformed record."""
+    prefix = _RECORD_PREFIX
+    head = "[STRACE] v=1 pid=100 tid=100 inv=1 hid=abc depth=1"
+    # The token with its last part missing, which is what a reader sees when
+    # three values were meant and two arrived.
+    whole = containment.format_frame_key((41, 1, 17))
+    missing_a_part = whole.rsplit(containment._FRAME_SEPARATOR, 1)[0]
+    half = [
+        f"{prefix}{head} name=network1.dispatch ts=10000 dur=200 {_HANDOFF} {missing_a_part}",
+        f"{prefix}{head} name=network1.complete ts=23000 dur=300 {_HANDOFF} outcome=0",
+    ]
+    assert _windows(half, _peer_log()) == []
+
+
+def test_a_truncated_dispatch_says_so_instead_of_pairing_nothing(capsys):
+    """A record the attribute capacity cut short is a record problem, not a local dispatch.
+
+    The log marks it with a trailing `~`. Reading that as "this dispatch
+    carried no frame" is how the pairing would otherwise present a key the
+    record could not fit: zero windows and no reason given.
+    """
+    prefix = _RECORD_PREFIX
+    head = "[STRACE] v=1 pid=100 tid=100 inv=1 hid=abc depth=1"
+    # The token as the attribute capacity left it: cut mid-value, with the
+    # marker the logger appends in place of what it dropped.
+    cut_short = containment.format_frame_key((1026041362850311600, 1, 17))[:-2] + "~"
+    cut = [
+        f"{prefix}{head} name=network1.dispatch ts=10000 dur=200 {_HANDOFF} {cut_short}",
+        f"{prefix}{head} name=network1.complete ts=23000 dur=300 {_HANDOFF} outcome=0",
+    ]
+
+    assert _windows(cut, _peer_log()) == []
+    assert "cut short by the record's attribute capacity" in capsys.readouterr().err
+
+
+def test_a_peer_window_wider_than_its_caller_window_describes_no_containment():
+    """Dropped rather than reported as a negative bound.
+
+    The usual cause is two logs from different runs whose sequence numbers
+    collide, which is a fact about that one pairing and not about the method.
+    """
+    assert _windows(_caller_log(), _peer_log(window=(8_000_000_000, 99_000))) == []
+
+
+def test_two_frames_from_one_process_pair_to_their_own_peer_windows():
+    """The handoff fields repeat across rounds; the frame header does not."""
+    first = _caller_log(frame=(1026041362850311600, 1, 17), dispatch=(10_000, 200), complete=(23_000, 300))
+    second = _caller_log(frame=(1026041362850311600, 1, 18), dispatch=(30_000, 200), complete=(48_000, 300))
+    peers = _peer_log(frame=(1026041362850311600, 1, 17), window=(8_000_000_000, 11_000)) + _peer_log(
+        frame=(1026041362850311600, 1, 18), window=(8_000_030_000, 16_000)
+    )
+
+    windows = {window.frame: window for window in _windows(first, second, peers)}
+
+    assert sorted(windows) == [(1026041362850311600, 1, 17), (1026041362850311600, 1, 18)]
+    assert windows[(1026041362850311600, 1, 17)].slack_ns == pytest.approx(
+        2_300 + 13_300 * containment.MAX_RELATIVE_RATE
+    )
+    assert windows[(1026041362850311600, 1, 18)].caller_duration_ns == 18_300
+    assert windows[(1026041362850311600, 1, 18)].slack_ns == pytest.approx(
+        2_300 + 18_300 * containment.MAX_RELATIVE_RATE
+    )
+
+
+def test_one_frame_served_twice_refuses_rather_than_choosing():
+    """Two peer windows for one header means the pile spans more than one run."""
+    doubled = _peer_log(window=(8_000_000_000, 11_000)) + _peer_log(window=(9_000_000_000, 11_000))
+    with pytest.raises(containment.ContainmentError, match="more than one run"):
+        _windows(_caller_log(), doubled)
+
+
+def test_a_dispatch_with_no_completion_in_the_log_is_not_paired():
+    """Without the closing span the caller's window has no end to measure."""
+    prefix = _RECORD_PREFIX
+    head = "[STRACE] v=1 pid=100 tid=100 inv=1 hid=abc"
+    frame = containment.format_frame_key((41, 1, 17))
+    open_only = [f"{prefix}{head} depth=1 name=network1.dispatch ts=10000 dur=200 {_HANDOFF} {frame}"]
+    assert _windows(open_only, _peer_log()) == []
+
+
+def test_the_level_word_does_not_have_to_match_across_the_wire():
+    """An L4 dispatches `network1.*` and the L3 that serves it emits `node.*`."""
+    (window,) = _windows(_caller_log(level="network1"), _peer_log(level="node"))
+    assert window.frame == (1026041362850311600, 1, 17)
+
+
+def test_metadata_publishes_the_bound_and_both_ends_of_the_pairing():
+    (window,) = _windows(_caller_log(), _peer_log())
+    metadata = window.metadata()
+
+    assert metadata["method"] == "span_containment_v1"
+    assert (metadata["frame_session"], metadata["frame_worker"], metadata["frame_sequence"]) == (
+        1026041362850311600,
+        1,
+        17,
+    )
+    assert (metadata["caller_pid"], metadata["peer_pid"]) == (100, 200)
+    assert metadata["rate_bound_ns"] == 1
+    assert metadata["slack_ns"] == 2_301
+    assert metadata["place_lo_ns"] == 10_000
+    assert metadata["place_hi_ns"] == 12_301
+
+
+_DAY_NS = 24 * 3_600 * 1_000_000_000
+
+
+def _three_level_logs(*, l4_base_ns=3 * _DAY_NS, l3_base_ns=900 * _DAY_NS):
+    """An L5 dispatching to an L4 that dispatches on to an L3, three clocks.
+
+    Each machine's log is written against its own boot, days apart, which is
+    what makes the chain the only way any of them reach one axis.
+    """
+    prefix = _RECORD_PREFIX
+
+    def head(pid):
+        return f"[STRACE] v=1 pid={pid} tid={pid} inv=1 hid=abc"
+
+    l4_frame = containment.format_frame_key((7, 1, 1))
+    l3_frame = containment.format_frame_key((8, 1, 1))
+    return [
+        f"{prefix}{head(3000)} depth=1 name=network2.dispatch ts=1000 dur=100 {_HANDOFF} {l4_frame}",
+        f"{prefix}{head(3000)} depth=1 name=network2.complete ts=60000 dur=100 {_HANDOFF} outcome=0",
+        f"{prefix}{head(1500)} depth=0 name=network1.remote_task ts={l4_base_ns} dur=50000 {l4_frame}",
+        f"{prefix}{head(1500)} depth=1 name=network1.dispatch ts={l4_base_ns + 2000} dur=100 {_HANDOFF} {l3_frame}",
+        f"{prefix}{head(1500)} depth=1 name=network1.complete ts={l4_base_ns + 40000} dur=100 {_HANDOFF} outcome=0",
+        f"{prefix}{head(2500)} depth=0 name=node.remote_task ts={l3_base_ns} dur=30000 {l3_frame}",
+        f"{prefix}{head(2500)} depth=1 name=node.submit ts={l3_base_ns + 1000} dur=400 {_HANDOFF}",
+    ]
+
+
+def test_a_chain_composes_every_hop_and_sums_their_slacks():
+    """Three machines, two hops, one axis.
+
+    The L4 block slides inside the L5's window and the L3 block slides inside
+    the L4's, so an L3 instant on the L5 axis is free by the sum of the two.
+    """
+    chain = containment.remote_chain(list(parse_spans(_three_level_logs())), log_pids={3000, 1500, 2500})
+
+    assert len(chain.windows) == 2
+    assert chain.peer_pids == frozenset({1500, 2500})
+    # The L5 wrote this axis, so its own instants arrive exactly.
+    assert chain.place(3000, 1000) == (1000, 0.0)
+    # One hop for the L4's dispatch, two for the L3's submit. Each hop carries
+    # what its own pair of counters can differ by, and those add too.
+    first_rate = 59_100 * containment.MAX_RELATIVE_RATE
+    second_rate = 38_100 * containment.MAX_RELATIVE_RATE
+    assert chain.place(1500, 3 * _DAY_NS + 2000) == pytest.approx((3_000.0, 9_100.0 + first_rate))
+    assert chain.place(2500, 900 * _DAY_NS + 1000) == pytest.approx((4_000.0, 17_200.0 + first_rate + second_rate))
+
+
+def test_a_chain_is_unmoved_by_where_any_machine_booted():
+    """Every hop subtracts two durations, so three boot times all cancel."""
+    near = containment.remote_chain(
+        list(parse_spans(_three_level_logs(l4_base_ns=_DAY_NS, l3_base_ns=2 * _DAY_NS))), log_pids={3000, 1500, 2500}
+    )
+    far = containment.remote_chain(
+        list(parse_spans(_three_level_logs(l4_base_ns=500 * _DAY_NS, l3_base_ns=9_000 * _DAY_NS))),
+        log_pids={3000, 1500, 2500},
+    )
+
+    assert near.place(1500, _DAY_NS + 2000) == far.place(1500, 500 * _DAY_NS + 2000)
+    assert near.place(2500, 2 * _DAY_NS + 1000) == far.place(2500, 9_000 * _DAY_NS + 1000)
+
+
+def test_a_peer_instant_belonging_to_no_frame_is_not_placed():
+    """The peer's log covers its whole run; only what a frame held is drawn."""
+    chain = containment.remote_chain(list(parse_spans(_three_level_logs())), log_pids={3000, 1500, 2500})
+    assert chain.place(2500, 900 * _DAY_NS + 999_999) is None
+
+
+def test_a_process_on_the_axis_needs_no_hop_and_carries_no_bound():
+    chain = containment.remote_chain(list(parse_spans(_caller_log() + _peer_log())), log_pids={100, 200})
+    assert chain.place(100, 12_345) == (12_345, 0.0)
+
+
+def test_a_cycle_in_the_windows_refuses_rather_than_looping():
+    """Two windows naming each other's process reach no axis at all."""
+    first = containment.RemoteWindow(
+        frame=(1, 1, 1),
+        caller_pid=10,
+        caller_start_ns=0,
+        caller_duration_ns=100,
+        peer_pid=20,
+        peer_start_ns=0,
+        peer_duration_ns=50,
+    )
+    second = containment.RemoteWindow(
+        frame=(1, 1, 2),
+        caller_pid=20,
+        caller_start_ns=0,
+        caller_duration_ns=100,
+        peer_pid=10,
+        peer_start_ns=0,
+        peer_duration_ns=50,
+    )
+    chain = containment.RemoteChain((first, second), frozenset())
+
+    with pytest.raises(containment.ContainmentError, match="cycle"):
+        chain.place(10, 10)
+
+
+def test_rebase_moves_a_window_a_peer_recorded_onto_the_axis():
+    """A Rank on the far side is bounded twice, and the two bounds add.
+
+    Its own `runner_run` window keeps its width; what the frame adds is where
+    that window sits, and how far it can be from where it was drawn.
+    """
+    spans = list(parse_spans(_three_level_logs()))
+    chain = containment.remote_chain(spans, log_pids={3000, 1500, 2500})
+    peer_window = containment.HostWindow(
+        pid=2500, inv=1, start_ns=900 * _DAY_NS + 2_000, duration_ns=5_000, device_wall_ns=2_000, phases={}
+    )
+    local_window = containment.HostWindow(
+        pid=3000, inv=1, start_ns=1_500, duration_ns=5_000, device_wall_ns=2_000, phases={}
+    )
+
+    rebased = {window.pid: window for window in containment.rebase_windows([peer_window, local_window], chain)}
+
+    # On the axis already: untouched, so its own slack is unchanged.
+    assert rebased[3000] is local_window
+    # Two hops away: the origin moves onto the axis and the width grows by the
+    # chain's own bound, so `place()` reports the summed slack.
+    chained = 17_200 + (59_100 + 38_100) * containment.MAX_RELATIVE_RATE
+    assert rebased[2500].start_ns == 5_000
+    assert rebased[2500].duration_ns == round(5_000 + chained)
+    assert containment.place(rebased[2500]).slack_ns == pytest.approx(3_000 + chained, abs=1)
+
+
+def test_a_window_the_chain_cannot_place_is_dropped():
+    """A peer window outside every frame has no axis to be drawn on."""
+    spans = list(parse_spans(_three_level_logs()))
+    chain = containment.remote_chain(spans, log_pids={3000, 1500, 2500})
+    stray = containment.HostWindow(
+        pid=2500, inv=9, start_ns=900 * _DAY_NS + 900_000, duration_ns=5_000, device_wall_ns=2_000, phases={}
+    )
+    assert containment.rebase_windows([stray], chain) == []
+
+
+def test_a_peer_already_on_this_axis_is_left_where_it_was_recorded():
+    """A peer whose timestamps already land in the window keeps them.
+
+    Placing it would move it to the window's start and erase the real gap
+    between the dispatch and the peer picking the frame up. The bound is
+    published either way, because nothing here says whether the two timestamps
+    line up from one clock writing them or from two reading alike.
+    """
+    loopback = _peer_log(window=(15_000, 5_000))
+    (window,) = _windows(_caller_log(), loopback)
+    assert window.same_axis
+
+    chain = containment.remote_chain(list(parse_spans(_caller_log() + loopback)), log_pids={100, 200})
+    placed = chain.place(200, 15_500)
+
+    assert placed is not None
+    placed_ns, slack_ns = placed
+    assert placed_ns == 15_500
+    assert slack_ns == pytest.approx(window.slack_ns)
+    assert 200 in chain.observed_pids
+
+
+def test_a_peer_on_another_clock_is_still_placed():
+    """The same test, failing, is what makes a second clock a second clock."""
+    (window,) = _windows(_caller_log(), _peer_log())
+    assert not window.same_axis
+
+
+def test_a_process_the_caller_cannot_vouch_for_is_not_placed():
+    """A pid nothing names is dropped, not taken for one on the axis.
+
+    A peer's own children write their own logs under their own pids, and no
+    frame window names them. Reading such a pid as "already on the axis" would
+    draw a second machine's raw timestamps as if they were this one's.
+    """
+    chain = containment.remote_chain(list(parse_spans(_caller_log() + _peer_log())), log_pids={100, 200})
+    assert chain.place(999, 12_345) is None
+    assert chain.place(100, 12_345) == (12_345, 0.0)
+
+
+def test_a_peer_side_process_with_no_window_of_its_own_is_not_on_this_axis():
+    """A peer's own children write their own logs, and no frame names them.
+
+    Collecting the peer host's log directory to enable the splice brings them
+    along. Their whole interval is days from anything the dispatching process
+    wrote, which is what says they are a second machine's - so they are dropped
+    rather than drawn at their own clock's raw timestamps.
+    """
+    prefix = _RECORD_PREFIX
+    stray = [
+        f"{prefix}[STRACE] v=1 pid=2600 tid=2600 inv=1 hid=abc depth=0 "
+        f"name=chip.run ts={8_000_000_000 + 2_000} dur=6000 run_id=1 dispatch_id=1 slot_id=0 generation=0"
+    ]
+    spans = list(parse_spans(_caller_log() + _peer_log() + stray))
+    chain = containment.remote_chain(spans, log_pids={100, 200, 2600})
+
+    assert 2600 not in chain.axis_pids
+    assert chain.place(2600, 8_000_000_000 + 2_000) is None
+    # The dispatching process it was collected alongside is still on the axis.
+    assert chain.place(100, 12_000) == (12_000, 0.0)
+
+
+def test_a_process_with_no_window_of_its_own_is_left_out_of_a_spliced_merge():
+    """A pile that holds two machines vouches for a process or leaves it out.
+
+    Two machines' clocks can read however close to one another, so no rule over
+    the timestamps separates a local process from one of the peer's. What the
+    merge can vouch for is a process at the top of a chain, and one whose own
+    device window the merge is of; the rest are dropped rather than drawn where
+    nothing places them.
+    """
+    prefix = _RECORD_PREFIX
+    unvouched = [
+        f"{prefix}[STRACE] v=1 pid=101 tid=101 inv=1 hid=abc depth=0 name=node.graph_build ts=9000 dur=400 run_id=1"
+    ]
+    spans = list(parse_spans(_caller_log() + _peer_log() + unvouched))
+    chain = containment.remote_chain(spans, log_pids={100, 101, 200})
+
+    assert chain.axis_pids == frozenset({100})
+    assert chain.place(100, 9_000) == (9_000, 0.0)
+    assert chain.place(101, 9_000) is None
+
+
+def test_with_nothing_spliced_every_process_is_on_the_one_axis():
+    """A same-host merge holds one clock, so no process has to earn its place."""
+    chain = containment.remote_chain(list(parse_spans(_caller_log(frame=None))), log_pids={100, 555})
+    assert chain.windows == ()
+    assert chain.place(555, 12_345) == (12_345, 0.0)
+
+
+def test_the_instant_a_frame_ends_at_belongs_to_what_came_after_it():
+    """The window is half-open, so its end is the first instant outside it."""
+    chain = containment.remote_chain(list(parse_spans(_caller_log() + _peer_log())), log_pids={100, 200})
+    (window,) = chain.windows
+    last_inside = window.peer_start_ns + window.peer_duration_ns - 1
+
+    assert chain.place(200, last_inside) is not None
+    assert chain.place(200, window.peer_start_ns + window.peer_duration_ns) is None
+
+
+def test_one_frame_dispatched_twice_refuses_rather_than_keeping_the_later():
+    """The caller side refuses a repeated frame, as the peer side does.
+
+    Keeping the later span would silently move the window: the earlier
+    dispatch's interval is replaced by a different, later one, and the
+    completion search then closes the wrong end.
+    """
+    doubled = _caller_log(dispatch=(10_000, 200), complete=(23_000, 300)) + _caller_log(
+        dispatch=(50_000, 200), complete=(70_000, 300)
+    )
+    with pytest.raises(containment.ContainmentError, match="dispatched by two spans"):
+        _windows(doubled, _peer_log())
+
+
+def test_metadata_separates_where_the_bound_is_from_where_the_block_sits():
+    """A peer left where it was recorded is not sitting at the bound's floor."""
+    placed = _windows(_caller_log(), _peer_log())[0].metadata()
+    observed = _windows(_caller_log(), _peer_log(window=(15_000, 5_000)))[0].metadata()
+
+    assert placed["observed"] is False
+    assert placed["drawn_at_ns"] == placed["place_lo_ns"] == 10_000
+    assert observed["observed"] is True
+    assert observed["place_lo_ns"] == 10_000
+    assert observed["drawn_at_ns"] == 15_000
+
+
+def test_a_peer_with_a_device_window_of_its_own_is_still_only_a_peer():
+    """Counted once, down the path that places it, never also as an axis process."""
+    prefix = _RECORD_PREFIX
+    peer_with_window = _peer_log() + [
+        f"{prefix}[STRACE] v=1 pid=200 tid=200 inv=2 hid=abc depth=1 name=chip.run.runner_run ts=8000001000 dur=800 ",
+        f"{prefix}[STRACE] v=1 pid=200 tid=200 inv=2 hid=abc depth=2 "
+        f"name=chip.run.runner_run.device_wall ts=0 dur=200 clk=dev",
+    ]
+    chain = containment.remote_chain(list(parse_spans(_caller_log() + peer_with_window)), log_pids={100, 200})
+
+    assert 200 in chain.peer_pids
+    assert 200 not in chain.axis_pids

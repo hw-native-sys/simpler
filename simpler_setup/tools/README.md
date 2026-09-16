@@ -189,6 +189,49 @@ Ranks must report the same `metadata.host_clock_domain_id`, since two Hosts'
 windows are not on one axis; a capture from before that field existed is placed
 with a warning.
 
+**A peer host reached across a wire is placed, not refused.** A process on the
+far side of a remote dispatch has its spans drawn through the frame window that
+held them: the caller blocked from publishing the frame until the completion
+arrived, so everything the peer did happened inside that window, and the spare
+width between the two durations is the bound. Both durations are timed on one
+machine each, and no instant is ever compared across the two — which is why the
+peer's own boot time cancels out of the answer. What does not cancel is a
+relative rate difference between the two counters; containment handles a clock's
+offset and not its rate, so `slack_ns` carries that term as well as the measured
+width and `rate_bound_ns` publishes it apart, since only the measured half
+shrinks when a window tightens.
+
+The two logs join on the frame header — one
+`frame=<session>:<worker>:<sequence>` token, the only name both sides write
+down. `metadata.remote_windows` carries one record per frame, splitting that
+token back into `frame_session` / `frame_worker` / `frame_sequence`; each peer
+lane is labelled with its bound, and every drawn slice repeats it as
+`slack_ns`. The shape inside one frame stays exact: one clock, one rate, so
+only the block's origin is bounded.
+
+**A peer whose own timestamps already fall in the window keeps them.** That
+happens when the two logs share a clock, and also when two machines booted
+within the window's spare width of each other — nothing separates those
+readings, and neither has to be: under both, the recorded instant is within
+`slack_ns` of the truth. So the position stays observed rather than derived,
+which keeps the real gap between the dispatch and the peer picking the frame up
+where placing would collapse it to zero, and the lane says `observed, ±N us`
+rather than `placed, +N us` because the truth can lie either side of it.
+
+**A process the pile cannot vouch for is left out.** Two machines' clocks can
+read however close to one another, so no rule over the timestamps separates a
+local process from one of the peer's; what the merge vouches for is a process at
+the top of a chain and one whose own device window the merge is of. Collecting
+the peer's log directory brings its other processes along, and those are dropped
+rather than drawn where nothing places them. One pid writing two Host logs makes
+every pid ambiguous — a span names its process by pid alone — and refuses the
+merge outright.
+
+**Ranks still have to share one Host clock.** A frame window places the process
+it was served by, never the chip children under it: those are other pids in
+other logs that no window names. `metadata.host_clock_domain_id` differing
+across Ranks therefore still refuses the merge.
+
 **Which invocation, then which Rank.** A Host log holds every invocation of the
 run, while a capture holds one, so the pairing is two questions. The first is
 answered exactly: the capture's `dispatch_identity.json` and the Host log's root

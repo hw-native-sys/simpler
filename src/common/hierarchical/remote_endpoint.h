@@ -209,6 +209,7 @@ public:
     void request_progress_stop() noexcept override;
     void report_progress_error(const std::string &reason) noexcept override;
     bool report_submission_error(const WorkerDispatch &dispatch, const std::string &reason) noexcept override;
+    std::string progress_frame_attrs() const override;
     void shutdown_child() override;
     void control_prepare(const uint8_t *digest) override;
     void control_remote_prepare_register(
@@ -246,7 +247,7 @@ private:
     uint64_t session_id_{0};
     std::unique_ptr<RemoteL3Transport> transport_;
     remote_l3::OrderedCommandLane command_lane_;
-    std::mutex command_mu_;
+    mutable std::mutex command_mu_;
     std::condition_variable command_cv_;
 
     struct PendingTask {
@@ -254,6 +255,17 @@ private:
         WorkerDispatch dispatch{};
         uint64_t sequence{0};
     } pending_task_;
+
+    // The header of the last TASK frame published, kept after the frame
+    // completes so a trace site can name it once the dispatch is over. Stored
+    // as its fields rather than as text: submit_progress runs on the dispatch
+    // path, where formatting a string the run may never read is not free.
+    struct PublishedFrame {
+        bool valid{false};
+        uint64_t session_id{0};
+        int32_t worker_id{-1};
+        uint64_t sequence{0};
+    } published_frame_;
     bool progress_stop_requested_{false};
     std::string progress_stop_reason_;
 

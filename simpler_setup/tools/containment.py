@@ -48,9 +48,14 @@ below that sum is undecided, not zero.
 """
 
 import math
-from dataclasses import dataclass
+import sys
+from bisect import bisect_right
+from dataclasses import dataclass, replace
+from functools import cached_property
 from itertools import permutations
 from typing import Optional
+
+from simpler_setup.tools.strace_timing import node_span_leaf
 
 RUN_SPAN = "chip.run"
 RUNNER_SPAN = "chip.run.runner_run"
@@ -77,6 +82,13 @@ _JOIN_STREAMS = (
 )
 
 _NS_PER_S = 1_000_000_000
+
+# What two counters' rates can differ by, relative. This is the one term
+# containment does not measure: it handles a clock's offset and not its rate,
+# and `#2134` states the magnitude - 10-100 ppm between two machines - and asks
+# for it in the published error rather than left implicit. The loose end is
+# taken, because a bound drawn tighter than the parts would not hold.
+MAX_RELATIVE_RATE = 100e-6
 
 # The window fit scores whole assignments, so its cost is the number of
 # *assignments*, `P(candidate windows, unidentified captures)` — not the number
@@ -726,3 +738,473 @@ def sum_two_widest_slacks(slacks):
 def cross_uncertainty_ns(placements):
     """``sum_two_widest_slacks`` over the placements themselves."""
     return sum_two_widest_slacks(int(round(placement.slack_ns)) for placement in placements)
+
+
+# The frame header a remote dispatch sent, and that the peer serving it wrote
+# onto its own span, as one `frame=<session>:<worker>:<sequence>` token. Two
+# hosts' CLOCK_MONOTONIC axes have no common zero, so this is the only name
+# that means the same thing in both logs.
+#
+# One field rather than three, because a record's attributes are capped and a
+# dispatch's already run most of the way to that cap: three names overran it,
+# and what a reader got back was a key that looked present with its last part
+# cut off. Joined, the three arrive together or not at all.
+_FRAME_FIELD = "frame"
+# The three parts are one token, so what joins them is part of the grammar
+# rather than a detail of whoever wrote the record.
+_FRAME_SEPARATOR = ":"
+
+# What closes a dispatch span against the completion span for the same handoff,
+# inside one process. Every field names a run or a slot on that host, which is
+# exactly why none of them can also serve as the cross-host key.
+_DISPATCH_FIELDS = ("run_id", "task_slot", "group_index", "worker_id", "dispatch_id")
+
+DISPATCH_LEAF = "dispatch"
+COMPLETE_LEAF = "complete"
+REMOTE_TASK_LEAF = "remote_task"
+
+
+@dataclass(frozen=True)
+class RemoteWindow:
+    """One remote dispatch, and the peer window it provably contains.
+
+    The caller blocks from publishing the frame until the completion for it
+    arrives, so everything the peer did for that frame happened inside
+    ``[caller_start_ns, caller_start_ns + caller_duration_ns)``. Both ends of
+    that interval are read on the caller's clock and both ends of the peer's
+    are read on the peer's, so the difference of the two *durations* is a real
+    quantity while no instant is ever compared across the two hosts.
+
+    What the subtraction assumes is that the two machines agree on how long a
+    second is, not on when it started, and that is the one thing containment
+    does not measure: it handles a clock's offset and not its rate. Writing the
+    true elapsed times ``T_c`` and ``T_p`` with relative rate errors ``e_c`` and
+    ``e_p``, the true slack and the measured one differ by
+    ``T_p(e_p - e_c) - S·e_c``, which ``T_c × MAX_RELATIVE_RATE`` bounds. Only
+    the *difference* between the two rates carries: two clocks off by the same
+    amount leave an error proportional to the slack itself. ``slack_ns``
+    therefore carries that term as well as the measured width, and
+    ``rate_bound_ns`` publishes it apart, since only the measured half shrinks
+    when a window tightens.
+    """
+
+    frame: tuple[int, int, int]
+    caller_pid: int
+    caller_start_ns: int
+    caller_duration_ns: int
+    peer_pid: int
+    peer_start_ns: int
+    peer_duration_ns: int
+
+    @property
+    def slack_ns(self):
+        """Spare width of the caller's window, plus what two clocks can add."""
+        return self.caller_duration_ns - self.peer_duration_ns + self.rate_bound_ns
+
+    @property
+    def rate_bound_ns(self):
+        """How far two counters' rates can pull the measured width apart."""
+        return self.caller_duration_ns * MAX_RELATIVE_RATE
+
+    @property
+    def same_axis(self):
+        """Whether the peer's own timestamps already fall in the caller's window.
+
+        They do when the two logs share a clock, and also when two machines
+        booted within this window's spare width of each other; nothing here
+        separates those readings. What both allow is leaving the peer where it
+        was recorded, since under either the recorded instant is within
+        ``slack_ns`` of the truth. That keeps the observed gap between the
+        dispatch and the peer picking the frame up, which placing would
+        collapse to zero — and the bound is published all the same, running
+        both ways rather than forward only.
+        """
+        return (
+            self.caller_start_ns <= self.peer_start_ns
+            and self.peer_start_ns + self.peer_duration_ns <= self.caller_start_ns + self.caller_duration_ns
+        )
+
+    @property
+    def place_lo_ns(self):
+        """Earliest caller-clock ns the peer block can start at.
+
+        The bound the window states, which holds whether the block was moved
+        onto that window or left where it was recorded; ``drawn_at_ns`` says
+        which of those happened.
+        """
+        return float(self.caller_start_ns)
+
+    @property
+    def place_hi_ns(self):
+        return self.caller_start_ns + self.slack_ns
+
+    @property
+    def drawn_at_ns(self):
+        """Where the block is actually drawn, which is not always the bound's floor."""
+        return float(self.peer_start_ns if self.same_axis else self.caller_start_ns)
+
+    def peer_ns_to_host_ns(self, peer_ns):
+        """Place one peer-clock instant on the caller's axis, at its lower bound.
+
+        The offset inside the peer's own window is exact — one clock, one rate —
+        so only the block's origin carries the bound.
+        """
+        return self.place_lo_ns + (peer_ns - self.peer_start_ns)
+
+    def metadata(self):
+        return {
+            "method": "span_containment_v1",
+            "frame_session": self.frame[0],
+            "frame_worker": self.frame[1],
+            "frame_sequence": self.frame[2],
+            "caller_pid": self.caller_pid,
+            "caller_start_ns": self.caller_start_ns,
+            "caller_duration_ns": self.caller_duration_ns,
+            "peer_pid": self.peer_pid,
+            "peer_duration_ns": self.peer_duration_ns,
+            "slack_ns": int(round(self.slack_ns)),
+            # Published apart from the total: only the measured half of the
+            # bound shrinks when a window tightens, and `#2134` asks for the
+            # rate term to be stated rather than folded away.
+            "rate_bound_ns": int(round(self.rate_bound_ns)),
+            "place_lo_ns": int(round(self.place_lo_ns)),
+            "place_hi_ns": int(round(self.place_hi_ns)),
+            # Where the bound is and where the block sits are two facts: a peer
+            # already reading on this clock keeps its own instant.
+            "drawn_at_ns": int(round(self.drawn_at_ns)),
+            "observed": self.same_axis,
+        }
+
+
+@dataclass(frozen=True)
+class RemoteChain:
+    """Every peer process's path back to the axis a trace is drawn on.
+
+    A peer can itself have dispatched to a further peer, so placing one instant
+    takes as many hops as the pile holds: each window puts it on the clock of
+    the process that dispatched, and the next takes it from there. The slacks
+    add, because the freedom one window grants is freedom the windows above it
+    cannot take back - which is the sum the chain's bound is made of.
+    """
+
+    windows: tuple
+    axis_pids: frozenset
+
+    @cached_property
+    def peer_pids(self):
+        return frozenset(window.peer_pid for window in self.windows)
+
+    @cached_property
+    def observed_pids(self):
+        """Peers left where they were recorded rather than moved onto the axis.
+
+        Their bound runs both ways, where a placed block is drawn at the
+        earliest position its window allows and can only be later, so a reader
+        has to be told which kind of position a lane carries.
+        """
+        return frozenset(window.peer_pid for window in self.windows if window.same_axis)
+
+    @cached_property
+    def _by_peer(self):
+        """Each peer's windows in start order, with the widest of them.
+
+        A long run dispatches thousands of frames and a trace holds thousands
+        of spans, so finding one instant's window by scanning would make
+        placing a log quadratic in what the log holds. The widest duration
+        bounds how far back a search has to look once it has bisected, which is
+        one step for the frames a process served in sequence.
+        """
+        index = {}
+        for window in self.windows:
+            index.setdefault(window.peer_pid, []).append(window)
+        found = {}
+        for pid, group in index.items():
+            group.sort(key=lambda window: window.peer_start_ns)
+            widest = max(window.peer_duration_ns for window in group)
+            found[pid] = ([window.peer_start_ns for window in group], group, widest)
+        return found
+
+    def place(self, pid, ns):
+        """One instant on the drawn axis, with the bound it arrives under.
+
+        ``(ns, 0)`` for a process ``axis_pids`` names, which is the only
+        evidence that a timestamp is already on the axis — a pid alone is not,
+        since two machines number their processes independently. ``None``
+        otherwise: for a peer instant belonging to no frame this pile holds,
+        and for a process nothing places, both of which are dropped rather than
+        drawn where nothing supports them.
+        """
+        slack = 0.0
+        for _ in range(len(self.windows) + 1):
+            window = self._window_holding(pid, ns)
+            if window is None:
+                return (ns, slack) if pid in self.axis_pids else None
+            # A window whose peer already reads on this clock moves nothing;
+            # what it contributes is the bound, which holds under either
+            # reading of why the two timestamps line up.
+            if not window.same_axis:
+                ns = window.peer_ns_to_host_ns(ns)
+            slack += window.slack_ns
+            pid = window.caller_pid
+        raise ContainmentError("the remote windows form a cycle, so no process in them reaches the drawn axis")
+
+    def _window_holding(self, pid, ns):
+        """The window an instant falls in, the window being half-open.
+
+        An instant at ``peer_start_ns + peer_duration_ns`` is the first one
+        after the frame rather than the last one in it, so it belongs to
+        whatever the peer did next and not to a frame that has closed.
+        """
+        found = self._by_peer.get(pid)
+        if found is None:
+            return None
+        starts, group, widest = found
+        for index in range(bisect_right(starts, ns) - 1, -1, -1):
+            window = group[index]
+            if ns - window.peer_start_ns > widest:
+                return None
+            if ns < window.peer_start_ns + window.peer_duration_ns:
+                return window
+        return None
+
+
+def _dispatchers_of(spans, device_windows):
+    """The processes that dispatched the device work this merge is of.
+
+    A device window's own process is the one that ran the work, never the one
+    that asked for it — the scheduler above it is a different process with its
+    own log. What names one in the other is the dispatch identity both write
+    down, the same four fields the capture pairing already joins on.
+
+    Identity alone does not settle it: the fields count per run, so two
+    machines each starting at one write the same numbers, and a pile holding
+    both logs holds that identity twice. The dispatcher is then the one that
+    was running when the window opened. That compares no clock across a
+    boundary — it asks only whether a process's own log covers an instant, and
+    a process whose whole recorded life excludes it cannot have dispatched what
+    began there.
+    """
+    wanted = {}
+    for window in device_windows:
+        if window.identity is not None:
+            wanted.setdefault(window.identity, set()).add(window.start_ns)
+    if not wanted:
+        return frozenset()
+
+    extent = {}
+    for span in spans:
+        low, high = extent.get(span.pid, (span.ts, span.ts + span.dur))
+        extent[span.pid] = (min(low, span.ts), max(high, span.ts + span.dur))
+
+    found = set()
+    for span in spans:
+        if node_span_leaf(span.name) != DISPATCH_LEAF or span.pid in found:
+            continue
+        starts = wanted.get(_attr_ints(span, _HOST_IDENTITY_FIELDS))
+        if not starts:
+            continue
+        low, high = extent[span.pid]
+        if any(low <= start <= high for start in starts):
+            found.add(span.pid)
+    return frozenset(found)
+
+
+def remote_chain(spans, log_pids):
+    """The chain the remote dispatches in ``spans`` form.
+
+    ``log_pids`` is every process the logs hold, and which of them are on the
+    axis is decided rather than assumed. A span names its process by pid alone,
+    so a pile holding two machines' logs would otherwise read a second
+    machine's raw timestamps as this axis's. With no window in the pile nothing
+    is spliced and every process is on the one axis there is.
+
+    With a window, a process is on the axis when the pile can name what put it
+    there: the top of a chain, a process whose own device window this merge is
+    of, or one that dispatched such a window. The three cover a chain from end
+    to end, which the first two alone do not — a scheduler between the root and
+    a chip owns no device window and is nobody's root, and dropping it draws a
+    trace whose middle level is missing.
+
+    Everything else is left out, because a peer's machine writes a log per
+    process and no window names those — and no rule over the timestamps
+    themselves separates them, since two machines' clocks can read however
+    close to one another.
+    """
+    windows = tuple(remote_windows(spans))
+    if not windows:
+        return RemoteChain((), frozenset(log_pids))
+
+    peers = frozenset(window.peer_pid for window in windows)
+    roots = frozenset(window.caller_pid for window in windows) - peers
+    device = tuple(host_windows(spans))
+    # Peers are placed, not vouched for: a peer that also has a device window
+    # of its own would otherwise be drawn twice, once down each path.
+    vouched = roots | frozenset(window.pid for window in device) | _dispatchers_of(spans, device)
+    return RemoteChain(windows, (vouched - peers) & frozenset(log_pids))
+
+
+def rebase_windows(windows, chain):
+    """Put every Host window a peer recorded onto the axis the trace is drawn on.
+
+    A Rank whose ``runner_run`` sits in a peer's log is bounded twice: once by
+    that window around its device work, and again by the frame that dispatched
+    to the peer. Moving the window's origin and widening its spare width by the
+    frame's own makes every reader of the resulting placement correct without
+    having to know a second hop happened.
+
+    A window the chain cannot place belongs to no frame this trace holds, and
+    is dropped for the same reason an unplaceable span is.
+    """
+    rebased = []
+    for window in windows:
+        placed = chain.place(window.pid, window.start_ns)
+        if placed is None:
+            continue
+        start_ns, slack = placed
+        if not slack and start_ns == window.start_ns:
+            rebased.append(window)
+            continue
+        rebased.append(
+            replace(window, start_ns=int(round(start_ns)), duration_ns=int(round(window.duration_ns + slack)))
+        )
+    return rebased
+
+
+def format_frame_key(frame):
+    """The attribute a span carries to name one frame, as `_frame_key` reads it.
+
+    The grammar lives beside its parser so that a writer and a reader cannot
+    come to describe different things — which is what spelling it out a second
+    time, in a test or anywhere else, would eventually allow.
+    """
+    return _FRAME_FIELD + "=" + _FRAME_SEPARATOR.join(str(part) for part in frame)
+
+
+def _frame_key(span):
+    """The frame header one span names, or ``None`` if it names none.
+
+    A span whose attributes the record could not fit says so with a trailing
+    `~`, and that is reported rather than read as "this dispatch carried no
+    frame": a key the log cut short is a record problem, and pairing nothing
+    with no reason given is how it would otherwise present.
+    """
+    found = None
+    for item in span.attrs.split():
+        key, separator, value = item.partition("=")
+        if not separator or key != _FRAME_FIELD:
+            continue
+        parts = value.split(_FRAME_SEPARATOR)
+        if len(parts) == 3:
+            try:
+                found = tuple(int(part) for part in parts)
+            except ValueError:
+                found = None
+        break
+    if found is None and span.attrs.endswith("~"):
+        print(
+            f"warning: pid {span.pid} {span.name} at ts={span.ts} was cut short by the record's attribute "
+            "capacity, so any frame header it carried is unreadable",
+            file=sys.stderr,
+        )
+    return found
+
+
+def _attr_ints(span, fields):
+    """The named attributes of one span as ints, or ``None`` if any is missing.
+
+    A partial set means the record is not what it claims, which is treated as no
+    key at all rather than as a key with holes.
+    """
+    found = {}
+    for item in span.attrs.split():
+        key, separator, value = item.partition("=")
+        if separator and key in fields:
+            try:
+                found[key] = int(value)
+            except ValueError:
+                return None
+    if len(found) != len(fields):
+        return None
+    return tuple(found[field] for field in fields)
+
+
+def _close_dispatch(dispatch, completions):
+    """The completion that closed one dispatch, or ``None`` if the log holds none.
+
+    Keyed on the handoff the two spans both name, then taken in time order: a
+    process that dispatched the same slot again reuses every one of those
+    fields, so the key alone selects a set and the ordering selects within it.
+    """
+    for completion in completions:
+        if completion.ts + completion.dur >= dispatch.ts + dispatch.dur:
+            return completion
+    return None
+
+
+def remote_windows(spans):
+    """Every remote dispatch paired with the peer window it contains.
+
+    A dispatch is remote exactly when it recorded a frame header; a peer window
+    is the ``remote_task`` span carrying the same one. Both sides therefore
+    select themselves out of one undifferentiated pile of logs, and a pile
+    holding only one side yields nothing rather than a guess.
+
+    A pair whose peer window is wider than the caller's describes no
+    containment and is dropped with its reason, because that is a fact about
+    one dispatch: the usual cause is two logs from different runs, where the
+    sequence numbers collide by coincidence.
+    """
+    dispatches = {}
+    completions = {}
+    peers = {}
+    for span in spans:
+        leaf = node_span_leaf(span.name)
+        if leaf == REMOTE_TASK_LEAF:
+            frame = _frame_key(span)
+            if frame is not None:
+                peers.setdefault(frame, []).append(span)
+            continue
+        if leaf not in (DISPATCH_LEAF, COMPLETE_LEAF):
+            continue
+        handoff = _attr_ints(span, _DISPATCH_FIELDS)
+        if handoff is None:
+            continue
+        if leaf == COMPLETE_LEAF:
+            completions.setdefault((span.pid, handoff), []).append(span)
+            continue
+        frame = _frame_key(span)
+        if frame is None:
+            continue
+        if frame in dispatches:
+            raise ContainmentError(f"frame {frame} is dispatched by two spans; the logs are from more than one run")
+        dispatches[frame] = (span, handoff)
+
+    for group in completions.values():
+        group.sort(key=lambda span: span.ts)
+
+    windows = []
+    for frame, (dispatch, handoff) in sorted(dispatches.items()):
+        peer_group = peers.get(frame)
+        if not peer_group:
+            continue
+        if len(peer_group) > 1:
+            raise ContainmentError(
+                f"frame {frame} is served by {len(peer_group)} peer windows; the logs are from more than one run"
+            )
+        completion = _close_dispatch(dispatch, completions.get((dispatch.pid, handoff), []))
+        if completion is None:
+            continue
+        peer = peer_group[0]
+        window = RemoteWindow(
+            frame=frame,
+            caller_pid=dispatch.pid,
+            caller_start_ns=dispatch.ts,
+            caller_duration_ns=completion.ts + completion.dur - dispatch.ts,
+            peer_pid=peer.pid,
+            peer_start_ns=peer.ts,
+            peer_duration_ns=peer.dur,
+        )
+        if window.slack_ns < 0:
+            continue
+        windows.append(window)
+    return windows

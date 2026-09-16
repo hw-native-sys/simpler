@@ -1093,11 +1093,25 @@ def host_record_spans(spans, passes):
     return out, dropped_passes, skipped_records
 
 
+def _level_word(process_spans):
+    """The level word a process bound, or the family name if it bound no single one.
+
+    `set_level_prefix` refuses a second binding, so one process emits one word.
+    A process carrying two is not describing a level, and naming it after
+    either of them would be a claim the log does not support.
+    """
+    words = {span.name.split(".", 1)[0] for span in process_spans if span_family(span.name) == "node"}
+    return words.pop() if len(words) == 1 else "node"
+
+
 def _process_label(pid, process_spans):
     """Name one process from the families of the spans it emitted.
 
     Any span of ours makes the process ours, and the host family wins over the
-    chip one. Sharing is the common case rather than the exception: a producer
+    chip one. A host-family process is named by its own level word rather than
+    by the family, because one trace can hold several of them at once and
+    `node`, `network1` and the levels above it are different schedulers with
+    the same lane shape. Sharing is the common case rather than the exception: a producer
     calling the public tracing API emits from inside our own host process, so
     `ext.` spans alongside ours say nothing about whose process it is. Only a
     process that emitted external spans and nothing else belongs to a producer,
@@ -1105,7 +1119,7 @@ def _process_label(pid, process_spans):
     """
     families = {span_family(span.name) for span in process_spans}
     if "node" in families:
-        return f"simpler node (pid={pid})"
+        return f"simpler {_level_word(process_spans)} (pid={pid})"
     if families == {"external"}:
         producers = sorted({producer for span in process_spans if (producer := external_producer(span.name))})
         named = "/".join(producers) if producers else "unattributed"

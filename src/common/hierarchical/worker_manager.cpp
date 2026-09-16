@@ -66,6 +66,8 @@ const char *endpoint_kind_name(WorkerEndpointKind kind) {
         return "local_mailbox";
     case WorkerEndpointKind::REMOTE_L3:
         return "remote_l3";
+    case WorkerEndpointKind::MPI_GROUP_MAILBOX:
+        return "mpi_group_mailbox";
     }
     return "unknown";
 }
@@ -479,12 +481,17 @@ WorkerThread::submit_dispatch(WorkerDispatch d, LaneKind lane_kind, RunId expect
     } catch (...) {
         fail_submission(d, "submit_progress failed with unknown exception");
     }
+#if SIMPLER_HOST_STRACE
+    // Read while this dispatch still holds admission: past the unlock another
+    // submission can publish its own frame, and the header would name that one.
+    const std::string trace_frame = trace_enabled ? endpoint_->progress_frame_attrs() : std::string();
+#endif
     admission_lk.unlock();
 #if SIMPLER_HOST_STRACE
     if (trace_enabled) {
         const int64_t trace_end_ns = simpler::host_trace::now_ns();
         const std::string trace_attrs =
-            trace_dispatch_attrs(trace_run, d, endpoint_->caps(), "scheduler") + trace_lease;
+            trace_dispatch_attrs(trace_run, d, endpoint_->caps(), "scheduler") + trace_lease + trace_frame;
         simpler::host_trace::emit(
             simpler::host_trace::host_span_name(simpler::host_trace::HostSpan::Dispatch), trace_run, trace_hash, 0,
             trace_start_ns, trace_end_ns - trace_start_ns, trace_attrs.c_str()

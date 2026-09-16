@@ -10,6 +10,7 @@
 import struct
 
 import pytest
+from simpler import remote_l3_session
 from simpler.remote_l3_protocol import (
     MAX_ERROR_BYTES,
     REMOTE_BUFFER_ACCESS_READ,
@@ -28,6 +29,8 @@ from simpler.remote_l3_protocol import (
     encode_import_buffer_result,
     encode_register_callable_command,
 )
+
+from simpler_setup.tools import containment
 
 
 def _oversized_multibyte_error_message():
@@ -166,3 +169,41 @@ def test_export_buffer_result_decode_rejects_invalid_live_identity(field, value)
 def test_import_buffer_result_rejects_invalid_live_identity(field, value):
     with pytest.raises(ValueError, match="live imported buffer identity"):
         encode_import_buffer_result(_import_result(**{field: value}))
+
+
+def test_served_frame_span_names_the_frame_the_caller_dispatched(monkeypatch):
+    """The peer's span carries the header fields the caller's dispatch span does.
+
+    Neither host can read the other's clock, so the two logs join on the frame
+    header and on nothing else. The span brackets what this process did for
+    that frame, which is the duration the caller's window has to hold.
+    """
+    emitted = []
+    monkeypatch.setattr(remote_l3_session, "_host_spans_active", lambda: True)
+    monkeypatch.setattr(remote_l3_session, "_monotonic_now_ns", lambda: 1_000)
+    monkeypatch.setattr(remote_l3_session, "_emit_host_span", lambda *args: emitted.append(args))
+
+    with remote_l3_session._served_frame_span(3, session_id=41, worker_id=2, sequence=17):
+        pass
+
+    assert len(emitted) == 1
+    name, _inv, _hash, _depth, start_ns, _dur, attrs = emitted[0]
+    assert name == "node.remote_task"
+    assert start_ns == 1_000
+    # Read back through the parser rather than compared to a literal: what the
+    # peer writes has to be what `containment` reads, and a test spelling the
+    # grammar a third time would let the writer and the reader drift apart
+    # while both still passed their own assertions.
+    assert attrs == containment.format_frame_key((41, 2, 17))
+
+
+def test_served_frame_span_emits_nothing_while_host_spans_are_off(monkeypatch):
+    """A gated-off run pays no formatting for a record it cannot write."""
+    emitted = []
+    monkeypatch.setattr(remote_l3_session, "_host_spans_active", lambda: False)
+    monkeypatch.setattr(remote_l3_session, "_emit_host_span", lambda *args: emitted.append(args))
+
+    with remote_l3_session._served_frame_span(3, session_id=41, worker_id=2, sequence=17):
+        pass
+
+    assert emitted == []
