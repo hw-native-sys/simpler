@@ -78,6 +78,9 @@ class TestPagedAttentionHostBuildGraph(SceneTestCase):
             "name": "Case1",
             "platforms": ["a2a3"],
             "manual": True,
+            # ~65,792 tasks, all resident at once; the table is sized to the next
+            # power of two above that. The heap takes no knob.
+            "config": {"runtime_env": {"ring_task_window": 131072}},
             "params": {
                 "batch": 256,
                 "num_heads": 16,
@@ -93,6 +96,8 @@ class TestPagedAttentionHostBuildGraph(SceneTestCase):
             "name": "Case2",
             "platforms": ["a2a3"],
             "manual": True,
+            # ~32,832 resident tasks.
+            "config": {"runtime_env": {"ring_task_window": 65536}},
             "params": {
                 "batch": 64,
                 "num_heads": 64,
