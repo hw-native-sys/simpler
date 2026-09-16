@@ -23,6 +23,7 @@
 constexpr const char *SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV = "SIMPLER_OP_EXECUTE_TIMEOUT_US";
 constexpr const char *SIMPLER_STREAM_SYNC_TIMEOUT_MS_ENV = "SIMPLER_STREAM_SYNC_TIMEOUT_MS";
 constexpr const char *SIMPLER_SCHEDULER_TIMEOUT_MS_ENV = "SIMPLER_SCHEDULER_TIMEOUT_MS";
+constexpr const char *SIMPLER_TENSOR_DATA_TIMEOUT_MS_ENV = "SIMPLER_TENSOR_DATA_TIMEOUT_MS";
 
 // Covers the host stream-sync window before the AICPU scheduler no-progress
 // timer is armed: cold kernel registration, orchestration SO dlopen, runtime
@@ -35,6 +36,11 @@ struct RuntimeTimeoutConfig {
     uint64_t op_execute_timeout_us;
     int32_t stream_sync_timeout_ms;
     int32_t scheduler_timeout_ms;
+    // Orchestration tensor-data wait (ms). Unlike its three siblings this one
+    // has no host-side default to seed: the budget lives in the runtime's
+    // TENSOR_DATA_TIMEOUT_MS, which no host translation unit can include, so a
+    // caller passes 0 here and 0 survives to mean "no override".
+    int32_t tensor_data_timeout_ms;
 };
 
 struct HostRuntimeTimeoutConfig {
@@ -44,6 +50,12 @@ struct HostRuntimeTimeoutConfig {
     // override" — the device falls back to its compile-time default
     // (SCHEDULER_TIMEOUT_CYCLES). Latched once per device into InitArgs.
     int32_t scheduler_timeout_ms{0};
+    // Orchestration tensor-data wait override (ms), same 0-means-default
+    // convention and the same per-device InitArgs latch. It takes no part in
+    // the ordering validation below: an unreachable value costs the precise
+    // SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT classification, never the clean
+    // shutdown, which the scheduler watchdog owns for every stall shape.
+    int32_t tensor_data_timeout_ms{0};
 };
 
 struct RuntimeTimeoutParseStatus {
@@ -53,6 +65,8 @@ struct RuntimeTimeoutParseStatus {
     bool stream_sync_valid{true};
     bool scheduler_env_set{false};
     bool scheduler_valid{true};
+    bool tensor_data_env_set{false};
+    bool tensor_data_valid{true};
 };
 
 enum class RuntimeTimeoutOrderStatus {
@@ -171,7 +185,26 @@ resolve_runtime_timeout_config(const RuntimeTimeoutConfig &defaults, RuntimeTime
         );
         if (status != nullptr) status->scheduler_valid = ok;
     }
+    const char *tensor_env = std::getenv(SIMPLER_TENSOR_DATA_TIMEOUT_MS_ENV);
+    if (tensor_env != nullptr) {
+        if (status != nullptr) status->tensor_data_env_set = true;
+        bool ok = apply_runtime_timeout_override(
+            SIMPLER_TENSOR_DATA_TIMEOUT_MS_ENV, tensor_env, 1,
+            static_cast<uint64_t>(std::numeric_limits<int32_t>::max()), &cfg.tensor_data_timeout_ms
+        );
+        if (status != nullptr) status->tensor_data_valid = ok;
+    }
     return cfg;
+}
+
+// Whether an overridden tensor-data wait can still latch
+// SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT: it must expire before STARS reaps the op.
+// Advisory — the caller warns rather than rejecting, because losing that code
+// degrades the diagnosis to a generic 507018 without changing what the run does.
+// Meaningless for an unset (0) budget, whose real value is compiled into the
+// runtime and unknown here.
+inline bool tensor_data_timeout_can_latch(const RuntimeTimeoutConfig &cfg) {
+    return static_cast<uint64_t>(cfg.tensor_data_timeout_ms) * 1000 < cfg.op_execute_timeout_us;
 }
 
 inline RuntimeTimeoutOrderStatus validate_runtime_timeout_order(const RuntimeTimeoutConfig &cfg) {

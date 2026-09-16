@@ -174,6 +174,7 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_init(void *a
     set_log_level(static_cast<int>(init_args->log_level));
     set_orch_device_id(static_cast<int>(init_args->device_id));
     set_scheduler_timeout_ms(static_cast<int>(init_args->scheduler_timeout_ms));
+    set_tensor_data_timeout_ms(static_cast<int>(init_args->tensor_data_timeout_ms));
     for (int k = 0; k < DMA_WORKSPACE_KIND_COUNT; ++k) {
         set_dma_workspace_addr(k, init_args->dma_workspace_addr[k]);
     }

@@ -51,6 +51,19 @@ void set_scheduler_timeout_ms(int timeout_ms);
 int get_scheduler_timeout_ms();
 
 /**
+ * Set the orchestration tensor-data wait timeout (ms). Latched once per device
+ * by simpler_aicpu_init (from InitArgs.tensor_data_timeout_ms); read by
+ * get_tensor_data / set_tensor_data when they block on a producer or its
+ * consumers. 0 means "no override" — the wait keeps its compile-time
+ * TENSOR_DATA_TIMEOUT_MS. Consumed by tensormap_and_ringbuffer only;
+ * host_build_graph resolves tensor data on the host and never waits.
+ */
+void set_tensor_data_timeout_ms(int timeout_ms);
+
+/** Get the tensor-data wait timeout override in ms (0 if unset). */
+int get_tensor_data_timeout_ms();
+
+/**
  * Set the device address of the per-device async-DMA workspace for one engine
  * kind (see DmaWorkspaceKind). Published by simpler_aicpu_init (from
  * InitArgs.dma_workspace_addr[]) into a resident-SO array; the scheduler
