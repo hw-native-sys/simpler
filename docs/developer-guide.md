@@ -214,6 +214,11 @@ A `pto_isa.pin` bump changes the SDMA headers embedded by
 `host_runtime.so`. Install-time runtime builds and run-time kernel compilation
 both read `pto_isa.pin`; use a different ISA revision by updating that file.
 
+The a5 RDMA workspace is an explicit opt-in overlay enabled with
+`SIMPLER_ENABLE_PTO_RDMA_WORKSPACE=ON`. It requires a `pto_isa.pin` revision
+that provides the PTO-ISA RDMA/HNS1825 headers and is mutually exclusive with
+the SDMA and URMA workspace overlays.
+
 ### Runtime binary lookup
 
 Scene tests load pre-built runtime binaries from `build/lib/`. These are produced

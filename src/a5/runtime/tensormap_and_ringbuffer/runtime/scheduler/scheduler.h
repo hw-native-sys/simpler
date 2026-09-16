@@ -1456,6 +1456,52 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
     return result;
 }
 
+inline void AsyncWaitList::log_diagnostics(AICoreCompletionMailbox *aicore_mailbox) {
+    uint64_t mailbox_head = 0;
+    uint64_t mailbox_tail = 0;
+    if (aicore_mailbox != nullptr) {
+        mailbox_head = aicore_mailbox->head.load(std::memory_order_acquire);
+        mailbox_tail = aicore_mailbox->tail.load(std::memory_order_acquire);
+    }
+    LOG_INFO(
+        "[ASYNC_WAIT] mailbox_head=%llu mailbox_tail=%llu mailbox_pending=%llu mpsc_skipped=%llu",
+        static_cast<unsigned long long>(mailbox_head), static_cast<unsigned long long>(mailbox_tail),
+        static_cast<unsigned long long>(mailbox_head - mailbox_tail),
+        static_cast<unsigned long long>(mpsc_skipped_count.load(std::memory_order_relaxed))
+    );
+
+    if (!try_lock()) {
+        LOG_INFO("[ASYNC_WAIT] wait-list busy; skipping locked entry dump");
+        return;
+    }
+    LOG_INFO("[ASYNC_WAIT] wait_count=%d", count);
+
+    for (int32_t i = 0; i < count; ++i) {
+        const AsyncWaitEntry &entry = entries[i];
+        LOG_INFO(
+            "[ASYNC_WAIT entry=%d] task_token=%llu slot_state=0x%llx normal_done=%u conditions=%d waiting=%d", i,
+            static_cast<unsigned long long>(entry.task_token.raw),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(entry.slot_state)),
+            static_cast<unsigned>(entry.normal_done), entry.condition_count, entry.waiting_completion_count
+        );
+        for (int32_t c = 0; c < entry.condition_count; ++c) {
+            const CompletionCondition &cond = entry.conditions[c];
+            LOG_INFO(
+                "[ASYNC_WAIT entry=%d cond=%d] engine=%s type=%d satisfied=%u retired=%u addr=0x%llx cookie=0x%llx "
+                "expected=%u",
+                i, c, async_engine_name(cond.engine), cond.completion_type, static_cast<unsigned>(cond.satisfied),
+                static_cast<unsigned>(cond.retired), static_cast<unsigned long long>(cond.addr),
+                static_cast<unsigned long long>(cond.backend_cookie), cond.expected_value
+            );
+            if (cond.completion_type == COMPLETION_TYPE_RDMA_EVENT_HANDLE) {
+                pto2::rdma_backend::log_rdma_event_handle_snapshot(cond.addr, cond.backend_cookie, i, c);
+            }
+        }
+    }
+
+    unlock();
+}
+
 // =============================================================================
 // Scheduler Profiling Data
 // =============================================================================
