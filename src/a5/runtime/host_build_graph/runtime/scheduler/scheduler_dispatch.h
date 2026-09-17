@@ -21,8 +21,8 @@ struct SchedulerDeferredAivDispatch {
 };
 
 struct SchedulerDeferredAivQueue {
-    // Every entry owns one Scheduler slot held in FILLING, so a peer miss can
-    // always fall back to local execution without another capacity decision.
+    // Every entry owns one Scheduler slot reserved in local FILLING state, so
+    // a peer miss can fall back to local execution without another capacity decision.
     SchedulerDeferredAivDispatch entries[SCHEDULER_PENDING_SLOT_COUNT]{};
     uint32_t count{0};
 };
@@ -47,9 +47,8 @@ inline __aicore__ bool scheduler_normal_aiv_worker_precedes(
 inline __aicore__ bool scheduler_fill_cluster_normal_slots(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *scheduler,
     __gm__ SchedulerRunControl *run_control, uint64_t *ready_victim_cursors, SchedulerReadyStats *ready_stats,
-    uint64_t profiling_level, uint64_t skip_slot_mask = 0, SchedulerDeferredAivQueue *deferred_aiv = nullptr,
-    __gm__ SchedulerReadyOwnerState *owner_state = nullptr, bool *failed = nullptr,
-    SchedulerClusterSlotState *cluster_slots = nullptr
+    uint64_t profiling_level, uint64_t skip_slot_mask, SchedulerDeferredAivQueue *deferred_aiv,
+    __gm__ SchedulerReadyOwnerState *owner_state, bool *failed, SchedulerLocalState *scheduler_local_state
 ) {
     if (failed != nullptr) *failed = false;
     if (scheduler->is_scheduler == 0) return false;
@@ -73,23 +72,12 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
                 if ((skip_slot_mask & (UINT64_C(1) << (cluster_lane * SCHEDULER_PENDING_SLOT_COUNT + pending_slot))) !=
                     0)
                     continue;
-                __gm__ SchedulerDispatchSlot *slot =
-                    scheduler_dispatch_slot_at(scheduler_state_base, scheduler, worker_id, pending_slot);
-                SchedulerLocalSlotState *local_slot =
-                    scheduler_local_slot_at(cluster_slots, cluster_lane, pending_slot);
-                uint32_t generation = 0;
-                if (local_slot != nullptr) {
-                    if (local_slot->state != SchedulerDispatchSlotState::FREE) continue;
-                    generation = local_slot->generation;
-                } else {
-                    const uint64_t publication = scheduler_gm_query(slot->publication);
-                    if (scheduler_dispatch_state(publication) != SchedulerDispatchSlotState::FREE) continue;
-                    generation = scheduler_dispatch_generation(publication);
-                }
+                SchedulerLocalSlotState *local_slot = &scheduler_local_state->slots[cluster_lane][pending_slot];
+                if (local_slot->state != SchedulerDispatchSlotState::FREE) continue;
                 SchedulerReadyClaim ready{};
                 if (!scheduler_claim_ready_for_slot(
                         graph, scheduler_state_base, scheduler, run_control, scheduler->scheduler_count, aic_core_type,
-                        &ready_victim_cursors[aic_core_type], ready_stats, &ready, owner_state
+                        &ready_victim_cursors[aic_core_type], ready_stats, &ready, owner_state, scheduler_local_state
                     )) {
                     if (failed != nullptr) *failed = true;
                     return progress;
@@ -103,17 +91,13 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
                 SchedulerFreeSlotClaim claim{
                     worker_id,
                     pending_slot,
-                    generation,
+                    local_slot->generation,
                     cluster_lane,
                 };
-                if (local_slot != nullptr) local_slot->state = SchedulerDispatchSlotState::FILLING;
-                scheduler_gm_store(
-                    slot->publication,
-                    scheduler_dispatch_publication(claim.generation, SchedulerDispatchSlotState::FILLING)
-                );
+                local_slot->state = SchedulerDispatchSlotState::FILLING;
                 if (!scheduler_fill_dispatch_slot(
                         graph, scheduler_state_base, scheduler, run_control, claim, ready, profiling_level,
-                        cluster_slots
+                        scheduler_local_state
                     )) {
                     if (failed != nullptr) *failed = true;
                     return progress;
@@ -130,7 +114,6 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
     struct AivWorkerSlots {
         uint64_t worker_id{UINT64_MAX};
         uint32_t cluster_lane{UINT32_MAX};
-        uint64_t publications[SCHEDULER_PENDING_SLOT_COUNT]{};
         uint32_t free_mask{0};
         uint32_t occupied_slots{0};
         bool is_scheduler{false};
@@ -166,16 +149,8 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
                     ++worker.occupied_slots;
                     continue;
                 }
-                __gm__ SchedulerDispatchSlot *slot =
-                    scheduler_dispatch_slot_at(scheduler_state_base, scheduler, worker_id, pending_slot);
-                SchedulerLocalSlotState *local_slot =
-                    scheduler_local_slot_at(cluster_slots, cluster_lane, pending_slot);
-                const uint64_t publication =
-                    local_slot != nullptr ? scheduler_dispatch_publication(local_slot->generation, local_slot->state) :
-                                            scheduler_gm_query(slot->publication);
-                worker.publications[pending_slot] = publication;
-                if (scheduler_dispatch_state(publication) == SchedulerDispatchSlotState::FREE)
-                    worker.free_mask |= 1U << pending_slot;
+                SchedulerLocalSlotState *local_slot = &scheduler_local_state->slots[cluster_lane][pending_slot];
+                if (local_slot->state == SchedulerDispatchSlotState::FREE) worker.free_mask |= 1U << pending_slot;
                 else ++worker.occupied_slots;
             }
         }
@@ -197,40 +172,25 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
             worker.free_mask &= ~(1U << pending_slot);
             if (worker.is_scheduler && (deferred_aiv == nullptr || deferred_aiv->count >= SCHEDULER_PENDING_SLOT_COUNT))
                 break;
-            const uint64_t publication = worker.publications[pending_slot];
+            SchedulerLocalSlotState *local_slot = &scheduler_local_state->slots[worker.cluster_lane][pending_slot];
             SchedulerFreeSlotClaim claim{
                 worker.worker_id,
                 pending_slot,
-                scheduler_dispatch_generation(publication),
+                local_slot->generation,
                 worker.cluster_lane,
             };
-            __gm__ SchedulerDispatchSlot *slot =
-                scheduler_dispatch_slot_at(scheduler_state_base, scheduler, worker.worker_id, pending_slot);
-            SchedulerLocalSlotState *local_slot =
-                scheduler_local_slot_at(cluster_slots, worker.cluster_lane, pending_slot);
-            if (local_slot != nullptr) local_slot->state = SchedulerDispatchSlotState::FILLING;
-            scheduler_gm_store(
-                slot->publication, scheduler_dispatch_publication(claim.generation, SchedulerDispatchSlotState::FILLING)
-            );
+            local_slot->state = SchedulerDispatchSlotState::FILLING;
             SchedulerReadyClaim ready{};
             if (!scheduler_claim_ready_for_slot(
                     graph, scheduler_state_base, scheduler, run_control, scheduler->scheduler_count, aiv_core_type,
-                    &ready_victim_cursors[aiv_core_type], ready_stats, &ready, owner_state
+                    &ready_victim_cursors[aiv_core_type], ready_stats, &ready, owner_state, scheduler_local_state
                 )) {
-                scheduler_gm_store(
-                    slot->publication,
-                    scheduler_dispatch_publication(claim.generation, SchedulerDispatchSlotState::FREE)
-                );
-                if (local_slot != nullptr) local_slot->state = SchedulerDispatchSlotState::FREE;
+                local_slot->state = SchedulerDispatchSlotState::FREE;
                 if (failed != nullptr) *failed = true;
                 return progress;
             }
             if (ready.task_id < 0) {
-                scheduler_gm_store(
-                    slot->publication,
-                    scheduler_dispatch_publication(claim.generation, SchedulerDispatchSlotState::FREE)
-                );
-                if (local_slot != nullptr) local_slot->state = SchedulerDispatchSlotState::FREE;
+                local_slot->state = SchedulerDispatchSlotState::FREE;
                 break;
             }
             ready.state_probe_start_cycles = state_probe_start_cycles;
@@ -245,7 +205,8 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
             }
             ready.state_probe_end_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
             if (!scheduler_fill_dispatch_slot(
-                    graph, scheduler_state_base, scheduler, run_control, claim, ready, profiling_level, cluster_slots
+                    graph, scheduler_state_base, scheduler, run_control, claim, ready, profiling_level,
+                    scheduler_local_state
                 )) {
                 if (failed != nullptr) *failed = true;
                 return progress;
@@ -259,37 +220,29 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
 }
 
 inline __aicore__ bool scheduler_release_deferred_aiv_reservation(
-    const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *scheduler,
-    __gm__ SchedulerRunControl *run_control, const SchedulerFreeSlotClaim &reservation,
-    SchedulerClusterSlotState *cluster_slots = nullptr
+    const SchedulerGraphView &graph, __gm__ SchedulerWorkerContext *scheduler, __gm__ SchedulerRunControl *run_control,
+    const SchedulerFreeSlotClaim &reservation, SchedulerLocalState *scheduler_local_state
 ) {
-    if (reservation.worker_id != scheduler->worker_index || reservation.slot_index >= SCHEDULER_PENDING_SLOT_COUNT) {
+    if (reservation.worker_id != scheduler->worker_index || reservation.slot_index >= SCHEDULER_PENDING_SLOT_COUNT ||
+        reservation.cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM) {
         scheduler_record_error(
             run_control, SCHEDULER_TASK_ID_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
             SchedulerErrorSite::DEFERRED_RESERVATION_INVALID_OWNER
         );
         return false;
     }
-    __gm__ SchedulerDispatchSlot *slot =
-        scheduler_dispatch_slot_at(scheduler_state_base, scheduler, reservation.worker_id, reservation.slot_index);
     SchedulerLocalSlotState *local_slot =
-        scheduler_local_slot_at(cluster_slots, reservation.cluster_lane, reservation.slot_index);
-    const uint64_t publication = local_slot != nullptr ?
-                                     scheduler_dispatch_publication(local_slot->generation, local_slot->state) :
-                                     scheduler_gm_query(slot->publication);
-    const int64_t task_id = local_slot != nullptr ? local_slot->task_id : slot->task_id;
-    if (scheduler_dispatch_state(publication) != SchedulerDispatchSlotState::FILLING ||
-        scheduler_dispatch_generation(publication) != reservation.generation || task_id != SCHEDULER_TASK_ID_INVALID) {
+        &scheduler_local_state->slots[reservation.cluster_lane][reservation.slot_index];
+    const int64_t task_id = local_slot->task_id;
+    if (local_slot->state != SchedulerDispatchSlotState::FILLING || local_slot->generation != reservation.generation ||
+        task_id != SCHEDULER_TASK_ID_INVALID) {
         scheduler_record_error(
             run_control, task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
             SchedulerErrorSite::DEFERRED_RESERVATION_INVALID_STATE
         );
         return false;
     }
-    scheduler_gm_publish(
-        slot->publication, scheduler_dispatch_publication(reservation.generation, SchedulerDispatchSlotState::FREE)
-    );
-    if (local_slot != nullptr) local_slot->state = SchedulerDispatchSlotState::FREE;
+    local_slot->state = SchedulerDispatchSlotState::FREE;
     return true;
 }
 
@@ -311,7 +264,7 @@ inline __aicore__ bool scheduler_drain_deferred_aiv_to_peer(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *scheduler,
     __gm__ SchedulerRunControl *run_control, SchedulerDeferredAivQueue *queue, SchedulerWakeStats *wake_stats,
     SchedulerReadyStats *ready_stats, SchedulerCompletionStats *completion_stats, uint64_t profiling_level,
-    __gm__ SchedulerReadyOwnerState *owner_state = nullptr, SchedulerClusterSlotState *cluster_slots = nullptr
+    __gm__ SchedulerReadyOwnerState *owner_state, SchedulerLocalState *scheduler_local_state
 ) {
     if (queue == nullptr || queue->count == 0) return true;
     const int32_t peer_lane = scheduler_deferred_aiv_peer_lane(scheduler_state_base, scheduler);
@@ -328,48 +281,40 @@ inline __aicore__ bool scheduler_drain_deferred_aiv_to_peer(
             pass == 1 ? scheduler_gm_query_u32_pair(completion_line->completed_generations) : 0;
         for (uint32_t pending_slot = 0; pending_slot < SCHEDULER_PENDING_SLOT_COUNT && queue->count != 0;
              ++pending_slot) {
-            __gm__ SchedulerDispatchSlot *peer_slot =
-                scheduler_dispatch_slot_at(scheduler_state_base, scheduler, peer_worker_id, pending_slot);
             SchedulerLocalSlotState *local_slot =
-                scheduler_local_slot_at(cluster_slots, static_cast<uint32_t>(peer_lane), pending_slot);
-            const uint64_t publication = local_slot != nullptr ?
-                                             scheduler_dispatch_publication(local_slot->generation, local_slot->state) :
-                                             scheduler_gm_query(peer_slot->publication);
-            const SchedulerDispatchSlotState state = scheduler_dispatch_state(publication);
-            const uint32_t generation = scheduler_dispatch_generation(publication);
+                &scheduler_local_state->slots[static_cast<uint32_t>(peer_lane)][pending_slot];
             bool refilled = false;
             if (pass == 0) {
-                if (state != SchedulerDispatchSlotState::FREE) continue;
-                scheduler_gm_store(
-                    peer_slot->publication,
-                    scheduler_dispatch_publication(generation, SchedulerDispatchSlotState::FILLING)
-                );
-                if (local_slot != nullptr) local_slot->state = SchedulerDispatchSlotState::FILLING;
+                if (local_slot->state != SchedulerDispatchSlotState::FREE) continue;
+                local_slot->state = SchedulerDispatchSlotState::FILLING;
                 if (!scheduler_fill_dispatch_slot(
                         graph, scheduler_state_base, scheduler, run_control,
                         SchedulerFreeSlotClaim{
-                            peer_worker_id, pending_slot, generation, static_cast<uint32_t>(peer_lane)
+                            peer_worker_id, pending_slot, local_slot->generation, static_cast<uint32_t>(peer_lane)
                         },
-                        queue->entries[0].ready, profiling_level, cluster_slots
+                        queue->entries[0].ready, profiling_level, scheduler_local_state
                     ))
                     return false;
                 refilled = true;
             } else {
-                if (state != SchedulerDispatchSlotState::READY) continue;
+                if (local_slot->state != SchedulerDispatchSlotState::READY) continue;
                 const uint32_t completed_generation =
                     static_cast<uint32_t>(completed_generations >> (pending_slot * 32));
-                if (completed_generation != generation) continue;
-                if (local_slot == nullptr) scheduler_observe_cache_line(peer_slot);
+                if (completed_generation != local_slot->generation ||
+                    !scheduler_completion_generation_is_new(
+                        scheduler_local_state, static_cast<uint32_t>(peer_lane), pending_slot, completed_generation
+                    ))
+                    continue;
                 if (!scheduler_service_cluster_completion_slot(
                         graph, scheduler_state_base, scheduler, run_control, static_cast<uint32_t>(peer_lane),
                         pending_slot, completed_generation, wake_stats, ready_stats, completion_stats, nullptr,
-                        profiling_level, &queue->entries[0].ready, &refilled, owner_state, cluster_slots
+                        profiling_level, &queue->entries[0].ready, &refilled, owner_state, scheduler_local_state
                     ) ||
                     !refilled)
                     return false;
             }
             if (!scheduler_release_deferred_aiv_reservation(
-                    graph, scheduler_state_base, scheduler, run_control, queue->entries[0].reserved_slot, cluster_slots
+                    graph, scheduler, run_control, queue->entries[0].reserved_slot, scheduler_local_state
                 ))
                 return false;
             scheduler_deferred_aiv_pop_front(queue);
@@ -381,32 +326,25 @@ inline __aicore__ bool scheduler_drain_deferred_aiv_to_peer(
 inline __aicore__ bool scheduler_publish_deferred_aiv_local(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *scheduler,
     __gm__ SchedulerRunControl *run_control, SchedulerDeferredAivQueue *queue, uint64_t profiling_level,
-    uint32_t *published_slot, SchedulerClusterSlotState *cluster_slots = nullptr
+    uint32_t *published_slot, SchedulerLocalState *scheduler_local_state
 ) {
     if (published_slot != nullptr) *published_slot = UINT32_MAX;
     if (queue == nullptr || queue->count == 0) return true;
     const SchedulerDeferredAivDispatch &entry = queue->entries[0];
     if (entry.reserved_slot.worker_id != scheduler->worker_index ||
-        entry.reserved_slot.slot_index >= SCHEDULER_PENDING_SLOT_COUNT) {
+        entry.reserved_slot.slot_index >= SCHEDULER_PENDING_SLOT_COUNT ||
+        entry.reserved_slot.cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM) {
         scheduler_record_error(
             run_control, entry.ready.task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
             SchedulerErrorSite::DEFERRED_PUBLISH_INVALID_RESERVATION
         );
         return false;
     }
-    __gm__ SchedulerDispatchSlot *slot = scheduler_dispatch_slot_at(
-        scheduler_state_base, scheduler, entry.reserved_slot.worker_id, entry.reserved_slot.slot_index
-    );
     SchedulerLocalSlotState *local_slot =
-        scheduler_local_slot_at(cluster_slots, entry.reserved_slot.cluster_lane, entry.reserved_slot.slot_index);
-    const uint64_t publication = local_slot != nullptr ?
-                                     scheduler_dispatch_publication(local_slot->generation, local_slot->state) :
-                                     scheduler_gm_query(slot->publication);
-    if (local_slot == nullptr) scheduler_observe_cache_line(slot);
-    const int64_t task_id = local_slot != nullptr ? local_slot->task_id : slot->task_id;
-    if (scheduler_dispatch_state(publication) != SchedulerDispatchSlotState::FILLING ||
-        scheduler_dispatch_generation(publication) != entry.reserved_slot.generation ||
-        task_id != SCHEDULER_TASK_ID_INVALID) {
+        &scheduler_local_state->slots[entry.reserved_slot.cluster_lane][entry.reserved_slot.slot_index];
+    const int64_t task_id = local_slot->task_id;
+    if (local_slot->state != SchedulerDispatchSlotState::FILLING ||
+        local_slot->generation != entry.reserved_slot.generation || task_id != SCHEDULER_TASK_ID_INVALID) {
         scheduler_record_error(
             run_control, entry.ready.task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
             SchedulerErrorSite::DEFERRED_PUBLISH_INVALID_RESERVATION
@@ -415,7 +353,7 @@ inline __aicore__ bool scheduler_publish_deferred_aiv_local(
     }
     if (!scheduler_fill_dispatch_slot(
             graph, scheduler_state_base, scheduler, run_control, entry.reserved_slot, entry.ready, profiling_level,
-            cluster_slots
+            scheduler_local_state
         ))
         return false;
     if (published_slot != nullptr) *published_slot = entry.reserved_slot.slot_index;

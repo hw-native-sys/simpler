@@ -209,7 +209,9 @@ TEST(SchedulerState, PreservesCacheLineAlignmentAndArrayStride) {
     EXPECT_EQ(alignof(SchedulerTaskControl), 128u);
     EXPECT_EQ(alignof(SchedulerCompletionInbox), 64u);
     EXPECT_EQ(alignof(SchedulerReadyOwnerState), 128u);
-    EXPECT_EQ(alignof(SchedulerDispatchSlot), 128u);
+    EXPECT_EQ(alignof(SchedulerExecutorTaskTrace), 64u);
+    EXPECT_EQ(sizeof(SchedulerExecutorTaskTrace), 64u);
+    EXPECT_EQ(alignof(SchedulerDispatchSlot), 64u);
     EXPECT_EQ(alignof(SchedulerRunControl), 128u);
     EXPECT_EQ(alignof(SchedulerWorkerContext), 128u);
     EXPECT_EQ(alignof(SchedulerTaskTrace), 128u);
@@ -218,11 +220,12 @@ TEST(SchedulerState, PreservesCacheLineAlignmentAndArrayStride) {
     std::array<SchedulerDispatchSlot, 2> dispatch_slots{};
     std::array<SchedulerWorkerContext, 2> contexts{};
     EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[1]) - reinterpret_cast<uintptr_t>(&controls[0]), 128u);
-    EXPECT_EQ(reinterpret_cast<uintptr_t>(&dispatch_slots[1]) - reinterpret_cast<uintptr_t>(&dispatch_slots[0]), 256u);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(&dispatch_slots[1]) - reinterpret_cast<uintptr_t>(&dispatch_slots[0]), 192u);
     EXPECT_EQ(reinterpret_cast<uintptr_t>(&contexts[1]) - reinterpret_cast<uintptr_t>(&contexts[0]), 1024u);
     EXPECT_EQ(offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, wake_list_head) / 64);
     EXPECT_NE(offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, next_waiter) / 64);
     EXPECT_NE(offsetof(SchedulerDispatchSlot, task_id) / 64, offsetof(SchedulerDispatchSlot, publication) / 64);
+    EXPECT_EQ(offsetof(SchedulerDispatchSlot, task_id) / 64, offsetof(SchedulerDispatchSlot, timing_slot) / 64);
     EXPECT_EQ(offsetof(SchedulerDispatchSlot, executor_trace), 128u);
     EXPECT_EQ(
         offsetof(SchedulerTaskTrace, dispatch_start_cycles) / 64, offsetof(SchedulerTaskTrace, complete_loop_iter) / 64

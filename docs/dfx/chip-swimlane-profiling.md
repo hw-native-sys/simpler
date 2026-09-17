@@ -380,7 +380,7 @@ field but render differently in Perfetto:
 | `complete` | outer | sched (pid=2) | FIN'd subtasks + sub-block retires this iter; A5 HBG ends this phase before dependency resolution |
 | `async_poll` | outer | sched | async-wait completions resolved; zero means polling consumed CPU without completing work |
 | `dispatch` | outer | sched | subtasks published this iter |
-| `state_probe` | A5 HBG AICore outer | AICore Scheduler lane | Cluster Slot / Ready state checked, a task acquired from a Ready Inbox, and immediate or deferred placement decided |
+| `state_probe` | A5 HBG AICore outer | AICore Scheduler lane | Scheduler-local Dispatch Slot / Ready state checked, a task acquired from a Ready Inbox, and immediate or deferred placement decided |
 | `worksteal` | A5 HBG AICore outer | AICore Scheduler lane | a task acquired from another non-empty Inbox is published |
 | `refill` | A5 HBG AICore outer | AICore Scheduler lane | completed Slot reused for one replacement task; `DIRECT_RESOLVE` omits a preceding `state_probe` |
 | `release` | outer | sched | deferred-release slots drained this iter |

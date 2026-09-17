@@ -898,11 +898,9 @@ struct alignas(128) SchedulerReadyDirectory {
     volatile uint64_t bootstrap_ready_types[SCHEDULER_WORKER_CAPACITY];
 };
 
-// The Executor publishes this per-slot payload before the completion generation.
-// The generation is the release/acquire hand-off to the Scheduler; neither side
-// writes the final per-task trace concurrently.
-struct alignas(128) SchedulerExecutorTaskTrace {
-    volatile uint64_t generation;
+// The Executor publishes this per-slot payload before the Completion Inbox
+// generation. Neither side writes the final per-task trace concurrently.
+struct alignas(64) SchedulerExecutorTaskTrace {
     uint64_t kernel_start_cycles;
     uint64_t kernel_end_cycles;
     uint64_t ready_scan_start_cycles;
@@ -910,28 +908,19 @@ struct alignas(128) SchedulerExecutorTaskTrace {
     uint64_t completion_end_cycles;
     uint64_t completion_bookkeeping_end_cycles;
     uint64_t completion_id;
-
     uint64_t completion_inbox_index;
-    uint64_t reserved[7];
 };
 
-// Scheduler-owned metadata occupies the first line. The Executor polls only
-// publication in the second line and owns the trailing trace payload.
-struct alignas(128) SchedulerDispatchSlot {
+// Executor-consumed metadata occupies the first line. The Scheduler publishes
+// it once and subsequently uses SchedulerLocalState instead of reading it back
+// from GM. The Executor polls only publication in the second line and owns the
+// trailing trace payload.
+struct alignas(64) SchedulerDispatchSlot {
     int64_t task_id;
-    uint64_t scheduler_metadata_reserved[4];
-    uint16_t kernel_id;
-    uint8_t subtask_slot;
-    uint8_t has_fanin;
-    uint8_t scheduler_metadata_byte_reserved;
-    uint8_t pending_slot;
-    uint16_t block_num;
+    int32_t timing_slot;
     uint32_t generation;
-    uint32_t block_idx;
-    uint32_t cohort_generation;
-    uint8_t cohort_index;
-    uint8_t gang;
-    uint8_t metadata_padding[2];
+    uint8_t pending_slot;
+    uint8_t scheduler_metadata_padding[47];
 
     volatile uint64_t publication;
     uint8_t publication_padding[56];
@@ -1252,17 +1241,14 @@ static_assert(
                                         128 * 128),
     "ready directory layout changed"
 );
-static_assert(sizeof(SchedulerExecutorTaskTrace) == 128, "executor trace must occupy two cache lines");
-static_assert(alignof(SchedulerExecutorTaskTrace) == 128, "executor trace alignment changed");
-static_assert(offsetof(SchedulerExecutorTaskTrace, generation) == 0, "executor trace generation must lead payload");
-static_assert(
-    offsetof(SchedulerExecutorTaskTrace, completion_inbox_index) == 64,
-    "executor trace lifecycle must start on its second cache line"
-);
-static_assert(sizeof(SchedulerDispatchSlot) == 256, "dispatch slot layout changed");
-static_assert(alignof(SchedulerDispatchSlot) == 128, "dispatch slot alignment changed");
+static_assert(sizeof(SchedulerExecutorTaskTrace) == 64, "executor trace must occupy one cache line");
+static_assert(alignof(SchedulerExecutorTaskTrace) == 64, "executor trace alignment changed");
+static_assert(offsetof(SchedulerExecutorTaskTrace, completion_inbox_index) == 56, "executor trace layout changed");
+static_assert(sizeof(SchedulerDispatchSlot) == 192, "dispatch slot must occupy three cache lines");
+static_assert(alignof(SchedulerDispatchSlot) == 64, "dispatch slot alignment changed");
+static_assert(offsetof(SchedulerDispatchSlot, timing_slot) == 8, "dispatch timing slot layout changed");
 static_assert(offsetof(SchedulerDispatchSlot, publication) == 64, "dispatch publication needs its own line");
-static_assert(offsetof(SchedulerDispatchSlot, executor_trace) == 128, "executor trace needs exclusive cache lines");
+static_assert(offsetof(SchedulerDispatchSlot, executor_trace) == 128, "executor trace needs an exclusive cache line");
 static_assert(sizeof(SchedulerRunControl) == 384, "run control layout changed");
 static_assert(alignof(SchedulerRunControl) == 128, "run control alignment changed");
 static_assert(offsetof(SchedulerRunControl, executed_task_count) == 128, "lifecycle atomics need their own line");

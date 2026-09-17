@@ -464,7 +464,7 @@ processing uses flat, non-overlapping phases:
 
 - `complete` consumes a Completion Inbox entry and marks the task done.
 - `resolve` updates successor dependencies and publishes newly Ready tasks.
-- `state_probe` checks Cluster Slot / Ready state, acquires a task from a Ready
+- `state_probe` checks Scheduler-local Dispatch Slot / Ready state, acquires a task from a Ready
   Inbox locally or by stealing, and decides immediate or deferred placement.
 - `dispatch` fills and publishes a task acquired from the local Inbox.
 - `worksteal` fills and publishes a task acquired from another Inbox; the steal

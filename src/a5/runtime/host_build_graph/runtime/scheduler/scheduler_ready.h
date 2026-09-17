@@ -116,16 +116,90 @@ struct SchedulerLocalSlotState {
     uint8_t sampled_task_timing{0};
 };
 
-struct SchedulerClusterSlotState {
-    SchedulerLocalSlotState slots[PLATFORM_CORES_PER_BLOCKDIM][SCHEDULER_PENDING_SLOT_COUNT]{};
+struct SchedulerWorkerTraceCache {
+    uint64_t aicore_entry_cycles{0};
+    uint64_t handshake_publish_cycles{0};
+    uint64_t register_release_cycles{0};
+    uint64_t descriptor_cache_observed_cycles{0};
+    bool valid{false};
 };
 
-inline __aicore__ SchedulerLocalSlotState *
-scheduler_local_slot_at(SchedulerClusterSlotState *cluster_slots, uint32_t cluster_lane, uint32_t slot_index) {
-    if (cluster_slots == nullptr || cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM ||
-        slot_index >= SCHEDULER_PENDING_SLOT_COUNT)
-        return nullptr;
-    return &cluster_slots->slots[cluster_lane][slot_index];
+// Scheduler-owned AICore-local state. Slot entries mirror only the metadata
+// needed by the Scheduler after publication; Executors continue to consume the
+// shared SchedulerDispatchSlot payload in GM.
+struct SchedulerLocalState {
+    SchedulerLocalSlotState slots[PLATFORM_CORES_PER_BLOCKDIM][SCHEDULER_PENDING_SLOT_COUNT]{};
+    // Executors own the published tokens. The single Scheduler consumer keeps
+    // its last-seen generation locally instead of clearing tokens in GM.
+    uint64_t consumed_completion_generations[PLATFORM_CORES_PER_BLOCKDIM]{};
+    uint64_t local_ready_publications[SCHEDULER_PENDING_SLOT_COUNT]{};
+    SchedulerWorkerTraceCache worker_traces[PLATFORM_CORES_PER_BLOCKDIM]{};
+    uint32_t local_ready_mask{0};
+    uint32_t owner_active_queue_mask{0};
+};
+
+inline __aicore__ uint32_t scheduler_consumed_completion_generation(
+    const SchedulerLocalState *scheduler_local_state, uint32_t cluster_lane, uint32_t slot_index
+) {
+    if (cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM || slot_index >= SCHEDULER_PENDING_SLOT_COUNT) return 0;
+    return static_cast<uint32_t>(
+        scheduler_local_state->consumed_completion_generations[cluster_lane] >> (slot_index * 32)
+    );
+}
+
+inline __aicore__ bool scheduler_completion_generation_is_new(
+    const SchedulerLocalState *scheduler_local_state, uint32_t cluster_lane, uint32_t slot_index,
+    uint32_t completed_generation
+) {
+    return completed_generation != 0 &&
+           completed_generation !=
+               scheduler_consumed_completion_generation(scheduler_local_state, cluster_lane, slot_index);
+}
+
+inline __aicore__ void scheduler_mark_completion_consumed(
+    SchedulerLocalState *scheduler_local_state, uint32_t cluster_lane, uint32_t slot_index,
+    uint32_t completed_generation
+) {
+    if (cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM || slot_index >= SCHEDULER_PENDING_SLOT_COUNT) return;
+    const uint32_t shift = slot_index * 32;
+    const uint64_t mask = UINT64_C(0xffffffff) << shift;
+    uint64_t &consumed = scheduler_local_state->consumed_completion_generations[cluster_lane];
+    consumed = (consumed & ~mask) | (static_cast<uint64_t>(completed_generation) << shift);
+}
+
+inline __aicore__ void
+scheduler_local_ready_publish(SchedulerLocalState *scheduler_local_state, uint32_t slot_index, uint64_t publication) {
+    if (slot_index >= SCHEDULER_PENDING_SLOT_COUNT) return;
+    scheduler_local_state->local_ready_publications[slot_index] = publication;
+    scheduler_local_state->local_ready_mask |= UINT32_C(1) << slot_index;
+}
+
+inline __aicore__ bool scheduler_local_ready_pop(
+    SchedulerLocalState *scheduler_local_state, uint32_t scan_start, uint32_t *slot_index, uint64_t *publication
+) {
+    if (slot_index == nullptr || publication == nullptr || scheduler_local_state->local_ready_mask == 0) return false;
+    for (uint32_t offset = 0; offset < SCHEDULER_PENDING_SLOT_COUNT; ++offset) {
+        const uint32_t selected = (scan_start + offset) % SCHEDULER_PENDING_SLOT_COUNT;
+        const uint32_t selected_mask = UINT32_C(1) << selected;
+        if ((scheduler_local_state->local_ready_mask & selected_mask) == 0) continue;
+        scheduler_local_state->local_ready_mask &= ~selected_mask;
+        *slot_index = selected;
+        *publication = scheduler_local_state->local_ready_publications[selected];
+        return true;
+    }
+    return false;
+}
+
+inline __aicore__ void
+scheduler_owner_queue_activate(SchedulerLocalState *scheduler_local_state, uint32_t core_type_index) {
+    if (core_type_index >= SCHEDULER_CORE_TYPE_COUNT) return;
+    scheduler_local_state->owner_active_queue_mask |= UINT32_C(1) << core_type_index;
+}
+
+inline __aicore__ void
+scheduler_owner_queue_deactivate(SchedulerLocalState *scheduler_local_state, uint32_t core_type_index) {
+    if (core_type_index >= SCHEDULER_CORE_TYPE_COUNT) return;
+    scheduler_local_state->owner_active_queue_mask &= ~(UINT32_C(1) << core_type_index);
 }
 
 inline __aicore__ uint64_t scheduler_cycles() {
@@ -661,7 +735,7 @@ inline __aicore__ bool scheduler_ready_owner_pending_append(
 
 inline __aicore__ bool scheduler_ready_owner_maintain_type(
     __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *context, uint32_t core_type_index,
-    __gm__ SchedulerReadyOwnerState *owner_state
+    __gm__ SchedulerReadyOwnerState *owner_state, SchedulerLocalState *scheduler_local_state
 ) {
     if (owner_state == nullptr || core_type_index >= SCHEDULER_CORE_TYPE_COUNT ||
         context->inbox_index >= SCHEDULER_CAPACITY)
@@ -673,6 +747,7 @@ inline __aicore__ bool scheduler_ready_owner_maintain_type(
     const int64_t head = scheduler_gm_query(inbox->head);
     if (head < SCHEDULER_INBOX_EMPTY) return false;
     if (head != SCHEDULER_INBOX_EMPTY) {
+        scheduler_owner_queue_activate(scheduler_local_state, core_type_index);
         if (scheduler_gm_query(owner_queue->advertised) == 0) {
             scheduler_ready_directory_set(directory, core_type_index, context->inbox_index);
             scheduler_gm_store(owner_queue->advertised, UINT64_C(1));
@@ -684,6 +759,7 @@ inline __aicore__ bool scheduler_ready_owner_maintain_type(
     const int64_t pending_tail = scheduler_ready_pending_tail(pending);
     if (pending_head != SCHEDULER_INBOX_EMPTY) {
         if (pending_head < 0 || pending_tail < 0) return false;
+        scheduler_owner_queue_activate(scheduler_local_state, core_type_index);
         scheduler_cache_barrier();
         scheduler_gm_store(inbox->head, pending_head);
         scheduler_cache_barrier();
@@ -700,15 +776,21 @@ inline __aicore__ bool scheduler_ready_owner_maintain_type(
         scheduler_ready_directory_clear(directory, core_type_index, context->inbox_index);
         scheduler_gm_store(owner_queue->advertised, UINT64_C(0));
     }
+    scheduler_owner_queue_deactivate(scheduler_local_state, core_type_index);
     return true;
 }
 
 inline __aicore__ bool scheduler_ready_owner_maintain(
     __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *context,
-    __gm__ SchedulerReadyOwnerState *owner_state
+    __gm__ SchedulerReadyOwnerState *owner_state, SchedulerLocalState *scheduler_local_state
 ) {
+    const uint32_t active_mask = scheduler_local_state->owner_active_queue_mask;
     for (uint32_t type = 0; type < SCHEDULER_CORE_TYPE_COUNT; ++type) {
-        if (!scheduler_ready_owner_maintain_type(scheduler_state_base, context, type, owner_state)) return false;
+        if ((active_mask & (UINT32_C(1) << type)) == 0) continue;
+        if (!scheduler_ready_owner_maintain_type(
+                scheduler_state_base, context, type, owner_state, scheduler_local_state
+            ))
+            return false;
     }
     return true;
 }
@@ -716,13 +798,14 @@ inline __aicore__ bool scheduler_ready_owner_maintain(
 inline __aicore__ bool scheduler_ready_batch_push(
     __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *context, uint32_t core_type_index,
     uint64_t inbox_index, SchedulerReadyBatch *batch, SchedulerReadyStats *stats,
-    __gm__ SchedulerReadyOwnerState *owner_state
+    __gm__ SchedulerReadyOwnerState *owner_state, SchedulerLocalState *scheduler_local_state
 ) {
     if (batch == nullptr || owner_state == nullptr || core_type_index >= SCHEDULER_CORE_TYPE_COUNT ||
         inbox_index >= SCHEDULER_CAPACITY || inbox_index != context->inbox_index)
         return false;
     if (batch->head == SCHEDULER_INBOX_EMPTY) return true;
     if (batch->tail < 0) return false;
+    scheduler_owner_queue_activate(scheduler_local_state, core_type_index);
     __gm__ SchedulerReadyInbox *inbox =
         scheduler_ready_inbox_at(scheduler_state_base, context, core_type_index, inbox_index);
     __gm__ SchedulerReadyOwnerQueue *owner_queue = &owner_state->queues[core_type_index];
@@ -862,14 +945,17 @@ inline __aicore__ bool scheduler_claim_ready_for_slot(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *context,
     __gm__ SchedulerRunControl *run_control, uint64_t scheduler_count, uint32_t core_type_index,
     uint64_t *victim_cursor, SchedulerReadyStats *stats, SchedulerReadyClaim *claim,
-    __gm__ SchedulerReadyOwnerState *owner_state
+    __gm__ SchedulerReadyOwnerState *owner_state, SchedulerLocalState *scheduler_local_state
 ) {
     if (victim_cursor == nullptr || claim == nullptr || owner_state == nullptr || scheduler_count == 0 ||
         scheduler_count > SCHEDULER_CAPACITY || context->inbox_index >= scheduler_count ||
         core_type_index >= SCHEDULER_CORE_TYPE_COUNT)
         return false;
     *claim = {};
-    if (!scheduler_ready_owner_maintain_type(scheduler_state_base, context, core_type_index, owner_state)) return false;
+    if (!scheduler_ready_owner_maintain_type(
+            scheduler_state_base, context, core_type_index, owner_state, scheduler_local_state
+        ))
+        return false;
     int64_t task_id = SCHEDULER_TASK_ID_INVALID;
     if (!scheduler_ready_pop_from_inbox(
             graph, scheduler_state_base, context, run_control, core_type_index, context->inbox_index, &task_id, stats
@@ -912,7 +998,7 @@ inline __aicore__ bool scheduler_ready_directory_nonempty(
 }
 
 inline __aicore__ void
-scheduler_initialize_free_slot(__gm__ SchedulerDispatchSlot *slot, SchedulerLocalSlotState *local_slot = nullptr) {
+scheduler_initialize_free_slot(__gm__ SchedulerDispatchSlot *slot, SchedulerLocalSlotState *local_slot) {
     uint32_t generation = slot->generation + 1;
     if (generation == 0) generation = 1;
     slot->task_id = SCHEDULER_TASK_ID_INVALID;
@@ -921,24 +1007,21 @@ scheduler_initialize_free_slot(__gm__ SchedulerDispatchSlot *slot, SchedulerLoca
     scheduler_gm_publish(
         slot->publication, scheduler_dispatch_publication(generation, SchedulerDispatchSlotState::FREE)
     );
-    if (local_slot != nullptr) {
-        local_slot->task_id = SCHEDULER_TASK_ID_INVALID;
-        local_slot->generation = generation;
-        local_slot->state = SchedulerDispatchSlotState::FREE;
-        local_slot->subtask_slot = UINT8_MAX;
-        local_slot->sampled_task_timing = 0;
-    }
+    local_slot->task_id = SCHEDULER_TASK_ID_INVALID;
+    local_slot->generation = generation;
+    local_slot->state = SchedulerDispatchSlotState::FREE;
+    local_slot->subtask_slot = UINT8_MAX;
+    local_slot->sampled_task_timing = 0;
 }
 
 inline __aicore__ bool scheduler_fill_dispatch_slot(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *scheduler,
     __gm__ SchedulerRunControl *run_control, const SchedulerFreeSlotClaim &slot_claim,
-    const SchedulerReadyClaim &ready_claim, uint64_t profiling_level = 0,
-    SchedulerClusterSlotState *cluster_slots = nullptr
+    const SchedulerReadyClaim &ready_claim, uint64_t profiling_level, SchedulerLocalState *scheduler_local_state
 ) {
     if (ready_claim.task_id < 0 || static_cast<uint64_t>(ready_claim.task_id) >= graph.task_count ||
         slot_claim.worker_id >= scheduler->runtime_worker_count ||
-        slot_claim.slot_index >= SCHEDULER_PENDING_SLOT_COUNT)
+        slot_claim.slot_index >= SCHEDULER_PENDING_SLOT_COUNT || slot_claim.cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM)
         return false;
     const bool task_timing_enabled = scheduler_task_timing_enabled(profiling_level);
     const bool schedule_timing_enabled = scheduler_schedule_timing_enabled(profiling_level);
@@ -989,16 +1072,9 @@ inline __aicore__ bool scheduler_fill_dispatch_slot(
     }
 
     slot->task_id = ready_claim.task_id;
-    slot->kernel_id = kernel_id;
-    slot->subtask_slot = subtask_slot;
-    slot->has_fanin = scheduler_task_has_fanin(metadata.flags) ? 1 : 0;
-    slot->pending_slot = static_cast<uint8_t>(slot_claim.slot_index);
+    slot->timing_slot = metadata.timing_slot;
     slot->generation = generation;
-    slot->block_idx = 0;
-    slot->block_num = 1;
-    slot->cohort_generation = 0;
-    slot->cohort_index = UINT8_MAX;
-    slot->gang = 0;
+    slot->pending_slot = static_cast<uint8_t>(slot_claim.slot_index);
     scheduler_writeback_cache_line(slot);
 
     const uint64_t dispatch_payload_offset =
@@ -1072,19 +1148,17 @@ inline __aicore__ bool scheduler_fill_dispatch_slot(
         scheduler_publish_cache_line(trace);
         if (schedule_timing_enabled) scheduler_publish_cache_line(&trace->dispatch_start_cycles);
     }
-    scheduler_gm_publish(
-        slot->publication, scheduler_dispatch_publication(generation, SchedulerDispatchSlotState::READY)
-    );
-    SchedulerLocalSlotState *local_slot =
-        scheduler_local_slot_at(cluster_slots, slot_claim.cluster_lane, slot_claim.slot_index);
-    if (local_slot != nullptr) {
-        local_slot->task_id = ready_claim.task_id;
-        local_slot->generation = generation;
-        local_slot->state = SchedulerDispatchSlotState::READY;
-        local_slot->subtask_slot = subtask_slot;
-        local_slot->sampled_task_timing =
-            metadata.timing_slot >= 0 && metadata.timing_slot < SCHEDULER_TASK_TIMING_SLOT_COUNT ? 1 : 0;
-    }
+    const uint64_t publication = scheduler_dispatch_publication(generation, SchedulerDispatchSlotState::READY);
+    scheduler_gm_publish(slot->publication, publication);
+    SchedulerLocalSlotState *local_slot = &scheduler_local_state->slots[slot_claim.cluster_lane][slot_claim.slot_index];
+    local_slot->task_id = ready_claim.task_id;
+    local_slot->generation = generation;
+    local_slot->state = SchedulerDispatchSlotState::READY;
+    local_slot->subtask_slot = subtask_slot;
+    local_slot->sampled_task_timing =
+        metadata.timing_slot >= 0 && metadata.timing_slot < SCHEDULER_TASK_TIMING_SLOT_COUNT ? 1 : 0;
+    if (slot_claim.worker_id == scheduler->worker_index)
+        scheduler_local_ready_publish(scheduler_local_state, slot_claim.slot_index, publication);
     return true;
 }
 
@@ -1092,8 +1166,8 @@ inline __aicore__ bool scheduler_resolve_completion(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *context,
     __gm__ SchedulerRunControl *run_control, int64_t task_id, SchedulerWakeStats *wake_stats,
     SchedulerReadyStats *ready_stats, SchedulerCompletionStats *completion_stats,
-    __gm__ SchedulerReadyOwnerState *owner_state, uint64_t profiling_level = 0, bool validate_done_state = true,
-    SchedulerReadyClaim *direct_ready = nullptr, uint32_t direct_core_type = UINT32_MAX
+    __gm__ SchedulerReadyOwnerState *owner_state, uint64_t profiling_level, bool validate_done_state,
+    SchedulerReadyClaim *direct_ready, uint32_t direct_core_type, SchedulerLocalState *scheduler_local_state
 ) {
     if (owner_state == nullptr) return false;
     __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, context, task_id);
@@ -1190,7 +1264,8 @@ inline __aicore__ bool scheduler_resolve_completion(
     }
     for (uint32_t type = 0; type < SCHEDULER_CORE_TYPE_COUNT; ++type) {
         if (!scheduler_ready_batch_push(
-                scheduler_state_base, context, type, context->inbox_index, &batches[type], ready_stats, owner_state
+                scheduler_state_base, context, type, context->inbox_index, &batches[type], ready_stats, owner_state,
+                scheduler_local_state
             )) {
             scheduler_record_error(
                 run_control, task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
