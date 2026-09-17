@@ -15,17 +15,24 @@ extern "C" void kernel_tmr_chain(const ChipTaskArgs &args) {
     SIMPLER_SCOPE_GUARD();
     uint32_t shape[] = {128 * 128};
     TensorCreateInfo intermediate(shape, 1, DataType::FLOAT32);
-    auto previous = args.tensor(0).ref();
-    for (int step = 0; step < 16; ++step) {
-        CoreTaskArgs task;
-        task.add_input(previous);
-        if (step == 15) {
-            task.add_output(args.tensor(1).ref());
-        } else {
-            task.add_output(intermediate);
-        }
-        task.add_scalar(args.scalar(0));
-        auto outputs = rt_submit_aiv_task(0, task);
-        if (step < 15) previous = outputs.get_ref(0);
-    }
+    CoreTaskArgs first;
+    first.add_input(args.tensor(0).ref());
+    first.add_output(intermediate);
+    first.add_scalar(args.scalar(0));
+    auto root = rt_submit_aiv_task(0, first);
+    CoreTaskArgs left;
+    left.add_input(root.get_ref(0));
+    left.add_output(intermediate);
+    left.add_scalar(args.scalar(0));
+    auto branch_left = rt_submit_aiv_task(0, left);
+    CoreTaskArgs right;
+    right.add_input(root.get_ref(0));
+    right.add_output(intermediate);
+    right.add_scalar(uint64_t{0});
+    auto branch_right = rt_submit_aiv_task(0, right);
+    CoreTaskArgs join;
+    join.add_input(branch_left.get_ref(0));
+    join.add_input(branch_right.get_ref(0));
+    join.add_output(args.tensor(1).ref());
+    rt_submit_aiv_task(1, join);
 }

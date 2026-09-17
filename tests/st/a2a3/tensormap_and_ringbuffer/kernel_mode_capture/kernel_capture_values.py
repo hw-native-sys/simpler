@@ -14,7 +14,7 @@ must terminate that process without unwinding graph-visible device resources.
 
 import ctypes
 
-_COUNT = 128 * 128  # The compiled scalar-add child processes one 128x128 tile.
+_COUNT = 128 * 128  # Maximum tile size; shorter views leave a checked sentinel suffix.
 
 
 def _check(code, operation):

@@ -56,13 +56,26 @@ def run_eager_case(scenario, io, launch, sync, pairs, initial, reject, cid):
             io.verify(y, [value + iteration for value in initial])
         return
 
+    if scenario == "eager_dag":
+        for iteration in range(100):
+            values = [value + iteration for value in initial]
+            io.write(x, values)
+            launch(0, (x, y), scalar=float(iteration % 7 + 1))
+            sync()
+            io.verify(y, [2 * value + 3 * (iteration % 7 + 1) for value in values])
+        return
     # Alternating snapshots form a feedback chain. There is only one final sync.
     expected = 0.0
+    sign = 1
     for iteration in range(100):
         index = (0, 1, 0)[iteration % 3] if scenario == "eager_multi_callable" else 0
         scalar = float(iteration % 7 + 1)
         launch(index, (x, y), scalar=scalar)
-        expected += -scalar if index == 1 else scalar
+        if index == 1:
+            sign = -sign
+            expected = -expected - scalar
+        else:
+            expected += scalar
         x, y = y, x
     sync()
-    io.verify(x, [value + expected for value in initial])
+    io.verify(x, [sign * value + expected for value in initial])

@@ -28,6 +28,28 @@ def batch_expected(sequence, initial=0.0):
     return x, y, *counts
 
 
+def _run_dependency_case(scenario, io, record, replay, sync, buffers, initial):
+    x, y, z, count_a = buffers
+    if scenario == "tmr_dag":
+        graph = record([(0, (x, y), 1.25)])
+        for iteration in range(REPLAYS):
+            values = [v + iteration for v in initial]
+            io.write(x, values)
+            io.write(y, [POISON] * _COUNT)
+            replay(graph)
+            sync()
+            io.verify(y, [2 * v + 3.75 for v in values])
+    else:
+        graph = record([(0, (x, y), 1.0), (1, (y, z), 2.0), (0, (z, x), 4.0), (0, (count_a, count_a), 1.0)])
+        for _ in range(REPLAYS):
+            replay(graph)
+        sync()
+        io.verify(x, initial)
+        io.verify(y, [2.0 - v for v in initial])
+        io.verify(z, [v - 4.0 for v in initial])
+        io.verify(count_a, [float(REPLAYS)] * _COUNT)
+
+
 def run_graph_case(scenario, io, record, replay, launch, sync, destroy):
     x, y, z, count_a, count_b = [io.allocate() for _ in range(5)]
     initial = [float(i % 127) for i in range(_COUNT)]
@@ -36,6 +58,9 @@ def run_graph_case(scenario, io, record, replay, launch, sync, destroy):
         io.write(address, [POISON] * _COUNT)
     for address in (count_a, count_b):
         io.write(address, [0.0] * _COUNT)
+    if scenario in ("tmr_dag", "multi_callable"):
+        _run_dependency_case(scenario, io, record, replay, sync, (x, y, z, count_a), initial)
+        return
 
     if scenario == "graph_recreate":
         for iteration in range(REPLAYS):

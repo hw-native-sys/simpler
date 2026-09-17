@@ -59,6 +59,9 @@ bool prepare_scope{false};
 uint64_t forbidden_sync_calls{0};
 uint64_t caller_stream_syncs{0};
 const void *caller_streams[2]{nullptr, nullptr};
+uint64_t prepare_syncs{0};
+aclrtStream registration_stream{nullptr};
+uint64_t forbidden_resource_calls{0};
 int query_override{0};
 uint64_t query_override_calls{0};
 uint64_t total_queries{0};
@@ -99,6 +102,17 @@ bool sync_is_forbidden(const void *stream) {
         return true;
     }
     return false;
+}
+
+bool forbidden_resource_call(void *caller) {
+    if (!invocation_scope) return false;
+    Dl_info info{};
+    // Count direct Simpler requests, not CANN's task-owned capture allocations.
+    if (dladdr(caller, &info) == 0 || info.dli_fname == nullptr ||
+        std::strstr(info.dli_fname, "libhost_runtime") == nullptr)
+        return false;
+    ++forbidden_resource_calls;
+    return true;
 }
 
 void note_error(ObserverError error) {
@@ -174,7 +188,11 @@ extern "C" void capture_observer_begin() {
 }
 
 extern "C" void capture_observer_guard_sync(int enabled) { forbid_sync = enabled != 0; }
-extern "C" void capture_observer_prepare_scope(int enabled) { prepare_scope = enabled != 0; }
+extern "C" void capture_observer_prepare_scope(int enabled) {
+    prepare_scope = enabled != 0;
+    registration_stream = nullptr;
+}
+extern "C" uint64_t capture_observer_prepare_syncs() { return prepare_syncs; }
 extern "C" void capture_observer_invocation_scope(int enabled) { invocation_scope = enabled != 0; }
 extern "C" uint64_t capture_observer_sync_calls() { return forbidden_sync_calls; }
 extern "C" uint64_t capture_observer_caller_syncs() { return caller_stream_syncs; }
@@ -200,9 +218,10 @@ extern "C" void capture_observer_fail_large_free(int enabled) { fail_large_free 
 extern "C" uint64_t capture_observer_failed_frees() { return failed_frees; }
 extern "C" void capture_observer_corrupt_next_invocation() { corrupt_next_invocation = true; }
 
-extern "C" rtError_t rtMalloc(void **address, uint64_t bytes, uint32_t kind, uint16_t module) {
+extern "C" rtError_t rtMalloc(void **address, uint64_t bytes, rtMemType_t type, uint16_t module) {
+    if (forbidden_resource_call(__builtin_return_address(0))) return -4334;
     static const auto real = reinterpret_cast<decltype(&rtMalloc)>(resolve_cann_symbol("rtMalloc"));
-    const auto rc = real == nullptr ? -4330 : real(address, bytes, kind, module);
+    const auto rc = real == nullptr ? -4330 : real(address, bytes, type, module);
     if (rc == 0 && prepare_scope && bytes >= 1024 * 1024) large_prepare_allocations.insert(*address);
     return rc;
 }
@@ -257,7 +276,9 @@ extern "C" aclError aclrtSynchronizeStreamWithTimeout(aclrtStream stream, int32_
     static const auto real = reinterpret_cast<decltype(&aclrtSynchronizeStreamWithTimeout)>(
         resolve_cann_symbol("aclrtSynchronizeStreamWithTimeout")
     );
-    return real == nullptr ? -4330 : real(stream, timeout);
+    const auto rc = real == nullptr ? -4330 : real(stream, timeout);
+    if (rc == 0 && prepare_scope && registration_stream != nullptr && stream == registration_stream) ++prepare_syncs;
+    return rc;
 }
 
 extern "C" aclError aclrtSynchronizeStream(aclrtStream stream) {
@@ -282,10 +303,68 @@ extern "C" rtError_t rtStreamSynchronize(rtStream_t stream) {
 }
 
 extern "C" int capture_observer_status() {
+    if (forbidden_resource_calls != 0) return -4334;
     if (observer.error != ObserverError::None) return static_cast<int>(observer.error);
     if (!observer.armed || observer.core_launches == 0 || observer.core_launches != observer.cpu_launches)
         return static_cast<int>(ObserverError::NoPairedLaunches);
     return 0;
+}
+
+extern "C" aclError aclrtMalloc(void **address, size_t bytes, aclrtMemMallocPolicy policy) {
+    if (forbidden_resource_call(__builtin_return_address(0))) return -4334;
+    static const auto real = reinterpret_cast<decltype(&aclrtMalloc)>(resolve_cann_symbol("aclrtMalloc"));
+    return real == nullptr ? -4330 : real(address, bytes, policy);
+}
+
+extern "C" rtError_t rtMemcpy(void *dest, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind) {
+    if (kind == RT_MEMCPY_HOST_TO_DEVICE && forbidden_resource_call(__builtin_return_address(0))) return -4334;
+    static const auto real = reinterpret_cast<decltype(&rtMemcpy)>(resolve_cann_symbol("rtMemcpy"));
+    return real == nullptr ? -4330 : real(dest, capacity, src, bytes, kind);
+}
+
+extern "C" rtError_t
+rtMemcpyAsync(void *dest, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind, rtStream_t stream) {
+    if (kind == RT_MEMCPY_HOST_TO_DEVICE && forbidden_resource_call(__builtin_return_address(0))) return -4334;
+    static const auto real = reinterpret_cast<decltype(&rtMemcpyAsync)>(resolve_cann_symbol("rtMemcpyAsync"));
+    return real == nullptr ? -4330 : real(dest, capacity, src, bytes, kind, stream);
+}
+
+extern "C" aclError aclrtFree(void *address) {
+    if (forbidden_resource_call(__builtin_return_address(0))) return -4334;
+    static const auto real = reinterpret_cast<decltype(&aclrtFree)>(resolve_cann_symbol("aclrtFree"));
+    return real == nullptr ? -4330 : real(address);
+}
+
+extern "C" aclError aclrtCreateStream(aclrtStream *stream) {
+    if (forbidden_resource_call(__builtin_return_address(0))) return -4334;
+    static const auto real = reinterpret_cast<decltype(&aclrtCreateStream)>(resolve_cann_symbol("aclrtCreateStream"));
+    return real == nullptr ? -4330 : real(stream);
+}
+
+extern "C" rtError_t rtStreamCreate(rtStream_t *stream, int32_t priority) {
+    if (forbidden_resource_call(__builtin_return_address(0))) return -4334;
+    static const auto real = reinterpret_cast<decltype(&rtStreamCreate)>(resolve_cann_symbol("rtStreamCreate"));
+    return real == nullptr ? -4330 : real(stream, priority);
+}
+
+extern "C" aclError aclrtCreateEventExWithFlag(aclrtEvent *event, uint32_t flags) {
+    if (forbidden_resource_call(__builtin_return_address(0))) return -4334;
+    static const auto real =
+        reinterpret_cast<decltype(&aclrtCreateEventExWithFlag)>(resolve_cann_symbol("aclrtCreateEventExWithFlag"));
+    return real == nullptr ? -4330 : real(event, flags);
+}
+
+extern "C" aclError aclrtMemcpy(void *dest, size_t capacity, const void *src, size_t bytes, aclrtMemcpyKind kind) {
+    if (kind == ACL_MEMCPY_HOST_TO_DEVICE && forbidden_resource_call(__builtin_return_address(0))) return -4334;
+    static const auto real = reinterpret_cast<decltype(&aclrtMemcpy)>(resolve_cann_symbol("aclrtMemcpy"));
+    return real == nullptr ? -4330 : real(dest, capacity, src, bytes, kind);
+}
+
+extern "C" aclError
+aclrtMemcpyAsync(void *dest, size_t capacity, const void *src, size_t bytes, aclrtMemcpyKind kind, aclrtStream stream) {
+    if (kind == ACL_MEMCPY_HOST_TO_DEVICE && forbidden_resource_call(__builtin_return_address(0))) return -4334;
+    static const auto real = reinterpret_cast<decltype(&aclrtMemcpyAsync)>(resolve_cann_symbol("aclrtMemcpyAsync"));
+    return real == nullptr ? -4330 : real(dest, capacity, src, bytes, kind, stream);
 }
 
 extern "C" uint64_t capture_observer_core_launches() { return observer.core_launches; }
@@ -396,6 +475,7 @@ extern "C" rtError_t rtsLaunchCpuKernel(
     if (invocation_scope) {
         if (const auto rc = capture_gate_install_if_armed(stream); rc != 0) return rc;
     }
+    if (prepare_scope) registration_stream = stream;
     // The separate caller-result node carries only trusted context identity;
     // it is not an invocation and must not be counted as a second dispatch.
     if (observer.armed && invocation_scope && args != nullptr &&

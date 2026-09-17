@@ -57,6 +57,16 @@ SCENARIOS = (
     "long_chain",
     "tmr_dag",
     "eager_dag",
+    "mixed_stream_eager",
+    "mixed_stream_graph",
+    "graph_survivor",
+    "geometry_snapshot",
+    "context_lifecycle",
+    "ring_wrap_eager",
+    "ring_wrap_graph",
+    "callable_growth",
+    "early_dispatch_eager",
+    "early_dispatch_graph",
 )
 
 
@@ -132,6 +142,19 @@ def test_tmr_kernel_mode(st_platform, st_device_ids, scenario, capture_observer)
         assert f"PASS {scenario} caller_error=1 cores_retired=1" in output
     elif scenario == "close_fail_free":
         assert "PASS close_fail_free retained_then_retried=1" in output
+    elif scenario in (
+        "mixed_stream_eager",
+        "mixed_stream_graph",
+        "graph_survivor",
+        "geometry_snapshot",
+        "context_lifecycle",
+        "ring_wrap_eager",
+        "ring_wrap_graph",
+        "callable_growth",
+        "early_dispatch_eager",
+        "early_dispatch_graph",
+    ):
+        assert f"PASS {scenario} rounds=100 forbidden_sync=0" in output
     elif scenario.startswith("prepare_fail_"):
         assert f"PASS {scenario} rejected_after_failure=1 forbidden_sync=0" in output
     elif scenario.startswith("eager_") and scenario != "eager_replay":
@@ -140,7 +163,7 @@ def test_tmr_kernel_mode(st_platform, st_device_ids, scenario, capture_observer)
         assert f"PASS {scenario} replays=100 forbidden_sync=0" in output
 
 
-def _build_callable(build_dir, alternate=False, dag=False, execution_error=False):
+def _build_callable(build_dir, alternate=False, dag=False, ring_wrap=False, early=False, execution_error=False):
     from simpler.task_interface import ArgDirection, ChipCallable, CoreCallable  # noqa: PLC0415
 
     from simpler_setup.elf_parser import extract_text_section  # noqa: PLC0415
@@ -156,11 +179,32 @@ def _build_callable(build_dir, alternate=False, dag=False, execution_error=False
     )
     if dag:
         source = Path(__file__).with_name("kernel_tmr_chain.cpp")
+    if ring_wrap:
+        source = Path(__file__).with_name("kernel_ring_wrap.cpp")
+    if early:
+        source = Path(__file__).with_name("kernel_early_dispatch.cpp")
     if execution_error:
         source = Path(__file__).with_name("kernel_execution_error.cpp")
-    orchestration = compiler.compile_orchestration(RUNTIME, str(source), build_dir=str(build_dir))
+    orchestration = compiler.compile_orchestration(
+        RUNTIME,
+        str(source),
+        build_dir=str(build_dir),
+        extra_include_dirs=[
+            str(ROOT / p) for p in ("src/common/platform/include", "src/common", "src/common/log/include")
+        ]
+        if early
+        else None,
+    )
     incore = compiler.compile_incore(
-        str(ROOT / "examples/a2a3/tensormap_and_ringbuffer/vector_example/kernels/aiv/kernel_add_scalar.cpp"),
+        str(
+            Path(__file__).with_name(
+                "kernel_delayed_add.cpp"
+                if early
+                else "kernel_vector_reflect.cpp"
+                if alternate
+                else "kernel_vector_add.cpp"
+            )
+        ),
         core_type="aiv",
         pto_isa_root=ensure_pto_isa_root(),
         extra_include_dirs=compiler.get_orchestration_include_dirs(RUNTIME),
@@ -168,15 +212,46 @@ def _build_callable(build_dir, alternate=False, dag=False, execution_error=False
     )
     signature = [ArgDirection.IN, ArgDirection.OUT, ArgDirection.SCALAR]
     child = CoreCallable.build(signature=signature, binary=extract_text_section(incore))
+    children = [(0, child)]
+    if early:
+        regular = compiler.compile_incore(
+            str(Path(__file__).with_name("kernel_vector_add.cpp")),
+            core_type="aiv",
+            pto_isa_root=ensure_pto_isa_root(),
+            extra_include_dirs=compiler.get_orchestration_include_dirs(RUNTIME),
+            build_dir=str(build_dir),
+        )
+        children.append((1, CoreCallable.build(signature=signature, binary=extract_text_section(regular))))
+    if dag:
+        addition = compiler.compile_incore(
+            str(ROOT / "examples/a2a3/tensormap_and_ringbuffer/vector_example/kernels/aiv/kernel_add.cpp"),
+            core_type="aiv",
+            pto_isa_root=ensure_pto_isa_root(),
+            extra_include_dirs=compiler.get_orchestration_include_dirs(RUNTIME),
+            build_dir=str(build_dir),
+        )
+        children.append(
+            (
+                1,
+                CoreCallable.build(
+                    signature=[ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT],
+                    binary=extract_text_section(addition),
+                ),
+            )
+        )
     return ChipCallable.build(
         signature=signature,
         func_name="kernel_execution_error"
         if execution_error
         else "kernel_tmr_chain"
         if dag
+        else "kernel_early_dispatch"
+        if early
+        else "kernel_ring_wrap"
+        if ring_wrap
         else ("kernel_capture_alternate" if alternate else "kernel_eager_orchestration"),
         binary=orchestration,
-        children=[(0, child)],
+        children=children,
     )
 
 
@@ -231,7 +306,7 @@ def _bind_observer_guards(observer):
     observer.capture_observer_caller_syncs.restype = ctypes.c_uint64
     observer.capture_observer_failure_retired.argtypes = [ctypes.c_int]
     observer.capture_observer_failure_retired.restype = ctypes.c_int
-    for name in ("query_calls", "total_queries", "waits", "records", "clears", "prepare_failures"):
+    for name in ("query_calls", "total_queries", "waits", "records", "clears", "prepare_failures", "prepare_syncs"):
         function = getattr(observer, "capture_observer_" + name)
         function.argtypes = []
         function.restype = ctypes.c_uint64
@@ -342,6 +417,8 @@ def _initialize(device, scenario, build_dir):
             build_dir / "callable-a",
             dag=scenario in ("tmr_dag", "eager_dag"),
             execution_error=scenario.startswith("runtime_error_"),
+            ring_wrap=scenario in ("ring_wrap_eager", "ring_wrap_graph"),
+            early=scenario in ("early_dispatch_eager", "early_dispatch_graph"),
         )
     ]
     if scenario in ("multi_callable", "prepare_again", "prepare_after_capture", "eager_multi_callable"):
@@ -396,7 +473,8 @@ def _verify_values(io, pairs, initial, counter, scenario):
     from tests.st.a2a3.tensormap_and_ringbuffer.kernel_mode_capture.kernel_capture_values import _COUNT  # noqa: PLC0415
 
     for cid, (_, destination) in enumerate(pairs):
-        io.verify(destination, [value + (1.25 if cid == 0 else -1.25) for value in initial])
+        expected = [value + 1.25 if cid == 0 else -value - 1.25 for value in initial]
+        io.verify(destination, expected)
     io.verify(counter, [187.5 if scenario == "two_graphs" else 125.0] * _COUNT)
 
 
@@ -418,7 +496,7 @@ def _configure(context, scenario, prepare, launch, sync, io, pairs, initial):
         io.verify(pairs[0][1], [value + 1.25 for value in initial])
     if scenario in ("multi_callable", "eager_multi_callable"):
         prepare(1)
-    if scenario != "cold_unsynced":
+    if scenario == "cold_synced":
         _check(lib.aclrtSynchronizeDevice(), "external preparation drain")
     if scenario == "cross_stream":
         launch(0)
@@ -440,7 +518,7 @@ def _configure(context, scenario, prepare, launch, sync, io, pairs, initial):
         if scenario == "stream_busy":
             assert observer.capture_gate_blocked() == 1
             observer.capture_gate_release()
-            _check(observer.capture_gate_finish(), "finish registration gate")
+            _check(observer.capture_gate_finish(), "finish launch gate")
         sync(streams[0])
         launch(0, stream=caller)
         sync(caller)
@@ -449,7 +527,6 @@ def _configure(context, scenario, prepare, launch, sync, io, pairs, initial):
         sync(caller)
     if scenario == "prepare_again":
         prepare(1)
-        _check(lib.aclrtSynchronizeDevice(), "external preparation drain")
     return caller
 
 
@@ -487,6 +564,25 @@ def _execute_eager(context, scenario, guarded, io, launch, sync, pairs, initial,
     )
 
 
+def _prepare_callable(observer, lib, ctx, chip, expected):
+    minted = ctypes.c_int32(99)
+    before = observer.capture_observer_prepare_syncs()
+    _prepared(
+        observer,
+        lib.simpler_kernel_mode_prepare_callable,
+        ctx,
+        chip.buffer_ptr(),
+        chip.buffer_size(),
+        ctypes.byref(minted),
+        expected=expected,
+    )
+    if expected == 0:
+        assert observer.capture_observer_prepare_syncs() > before, "prepare did not complete registration sync"
+    else:
+        assert minted.value == -1
+    return minted.value
+
+
 def _guarded(observer, operation, *arguments, expected=0):
     """Run one launch with every synchronize refused.
 
@@ -510,7 +606,7 @@ def _prepared(observer, operation, *arguments, expected=0):
     what makes a device-side registration failure this call's own status. What
     it must never touch is a stream the caller owns, so only those are refused;
     the context's own sync reaches CANN. The scope also arms the registration
-    fault injection and the capture gate, which apply to this call alone.
+    fault injection, which applies to this call alone.
     """
     observer.capture_observer_prepare_scope(1)
     try:
@@ -564,7 +660,25 @@ def _run_close_failure(context, prepare, launch, sync):
     _check_close_failure(context)
 
 
-def _run(device, scenario, build_dir):
+def _run(device, scenario, build_dir):  # noqa: PLR0915
+    if scenario in (
+        "mixed_stream_eager",
+        "mixed_stream_graph",
+        "graph_survivor",
+        "geometry_snapshot",
+        "context_lifecycle",
+        "ring_wrap_eager",
+        "ring_wrap_graph",
+        "callable_growth",
+        "early_dispatch_eager",
+        "early_dispatch_graph",
+    ):
+        from tests.st.a2a3.tensormap_and_ringbuffer.kernel_mode_capture.lifecycle_cases import (  # noqa: PLC0415
+            run_lifecycle_case,
+        )
+
+        run_lifecycle_case(device, scenario, build_dir)
+        return
     from simpler.task_interface import ChipStorageTaskArgs, ChipTensor, DataType  # noqa: PLC0415
 
     from tests.st.a2a3.tensormap_and_ringbuffer.kernel_mode_capture.kernel_capture_values import (  # noqa: PLC0415
@@ -585,24 +699,12 @@ def _run(device, scenario, build_dir):
     callable_ids = {}
 
     guarded = partial(_guarded, observer)
-    prepared = partial(_prepared, observer)
 
     def prepare(cid, expected=0):
-        chip = chips[cid]
-        minted = ctypes.c_int32(99)
-        prepared(
-            lib.simpler_kernel_mode_prepare_callable,
-            ctx,
-            chip.buffer_ptr(),
-            chip.buffer_size(),
-            ctypes.byref(minted),
-            expected=expected,
-        )
+        minted = _prepare_callable(observer, lib, ctx, chips[cid], expected)
         if expected == 0:
-            assert minted.value >= 0 and minted.value not in callable_ids.values()
-            callable_ids[cid] = minted.value
-        else:
-            assert minted.value == -1
+            assert minted >= 0 and minted not in callable_ids.values()
+            callable_ids[cid] = minted
 
     def sync(stream):
         _check(lib.aclrtSynchronizeStreamWithTimeout(stream, 10000), "external sync")
@@ -613,7 +715,7 @@ def _run(device, scenario, build_dir):
         args.clear()
         args.add_tensor(ChipTensor.make(source.value, (_COUNT,), DataType.FLOAT32, child_memory=True))
         args.add_tensor(ChipTensor.make(destination.value, (_COUNT,), DataType.FLOAT32, child_memory=True))
-        args.add_scalar(ctypes.c_float(scalar / 16 if scenario in ("tmr_dag", "eager_dag") else scalar))
+        args.add_scalar(ctypes.c_float(scalar))
         observer.capture_observer_invocation_scope(1)
         try:
             guarded(
@@ -681,7 +783,16 @@ def _run(device, scenario, build_dir):
             _close(lib, ctx, allocations, streams, device)
             print(f"PASS {scenario} eager=100 forbidden_sync=0", flush=True)
             return
-        if scenario in ("fresh_inputs", "chain", "feedback_batch", "eager_replay", "graph_recreate", "long_chain"):
+        if scenario in (
+            "fresh_inputs",
+            "chain",
+            "feedback_batch",
+            "eager_replay",
+            "graph_recreate",
+            "long_chain",
+            "multi_callable",
+            "tmr_dag",
+        ):
 
             def destroy(graph):
                 _check(lib.aclmdlRIDestroy(graph), "destroy graph")
@@ -700,10 +811,14 @@ def _run(device, scenario, build_dir):
             committed = lib.committed_device_memory_ctx(ctx)
         if scenario == "two_graphs":
             record([0], increment=2.5)
-        _check_resident(observer, host_launches)
+        if scenario != "cold_unsynced":
+            _check_resident(observer, host_launches)
         replay_stream = streams[1] if scenario == "replay_stream" else caller
         for iteration in range(100):
             replay(graphs[iteration % len(graphs)], replay_stream)
+            if scenario == "cold_unsynced" and iteration == 0:
+                sync(replay_stream)
+                _check_resident(observer, host_launches)
         sync(replay_stream)
         _verify_values(io, pairs, initial, counter, scenario)
         _check_resident(observer, host_launches)
