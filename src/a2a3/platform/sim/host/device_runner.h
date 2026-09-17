@@ -92,6 +92,7 @@ private:
     void (*set_scheduler_timeout_ms_func_)(int){nullptr};
     void (*set_platform_dump_base_func_)(uint64_t){nullptr};
     void (*set_platform_phase_base_func_)(uint64_t){nullptr};
+    void (*set_platform_run_result_func_)(uint64_t, uint64_t){nullptr};
     void (*set_dump_args_enabled_func_)(bool){nullptr};
     void (*set_platform_chip_swimlane_base_func_)(uint64_t){nullptr};
     void (*set_platform_chip_swimlane_aicore_rotation_table_func_)(uint64_t){nullptr};

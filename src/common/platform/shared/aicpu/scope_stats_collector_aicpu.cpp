@@ -22,6 +22,7 @@
 #include <cstring>
 
 #include "aicpu/profiler_device_engine.h"
+#include "aicpu/device_run_result_base_aicpu.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "common/scope_stats.h"
@@ -123,7 +124,20 @@ struct ScopeStatsDeviceModule {
     }
 
     static void account_dropped(Context, State *state, uint32_t count) { state->dropped_record_count += count; }
-    static void on_pop_success(Context, State *, Buffer *) {}
+    // Stamp the acquiring run's identity onto the buffer. This is the only
+    // point that writes it: the engine calls the hook after advancing
+    // `current_buf_seq` and before its own `wmb()`, so the stamp is published
+    // by that fence — ahead of the first record the producer writes, and ahead
+    // of the `enqueue_ready` that makes the buffer reachable by the host.
+    //
+    // The epoch comes from the platform getter rather than a module field
+    // because the generic engine owns neither: it is published by the AICPU
+    // kernel entry before `aicpu_execute`, and every acquisition here happens
+    // inside it. Zero means the host provided no run identity.
+    static void on_pop_success(Context, State *state, Buffer *buffer) {
+        buffer->run_epoch = get_platform_run_result_epoch();
+        buffer->local_seq = state->current_buf_seq;
+    }
     static void on_current_cleared(Context, State *) {}
     static void on_no_replacement(Context, State *) {}
     static void on_enqueue_failed(Context, State *, Buffer *) {}

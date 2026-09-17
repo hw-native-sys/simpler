@@ -188,6 +188,8 @@ int DeviceRunner::ensure_binaries_loaded() {
             return PTO_RUNTIME_ERR_INTERNAL;
         if (!load_sym("set_platform_phase_base", reinterpret_cast<void **>(&set_platform_phase_base_func_)))
             return PTO_RUNTIME_ERR_INTERNAL;
+        if (!load_sym("set_platform_run_result", reinterpret_cast<void **>(&set_platform_run_result_func_)))
+            return PTO_RUNTIME_ERR_INTERNAL;
         if (!load_sym("set_dump_args_enabled", reinterpret_cast<void **>(&set_dump_args_enabled_func_)))
             return PTO_RUNTIME_ERR_INTERNAL;
         if (!load_sym(
@@ -421,10 +423,11 @@ int DeviceRunner::prepare_execution(
 
     if (aicpu_execute_func_ == nullptr || aicore_execute_func_ == nullptr || set_platform_regs_func_ == nullptr ||
         set_platform_dump_base_func_ == nullptr || set_platform_phase_base_func_ == nullptr ||
-        set_dump_args_enabled_func_ == nullptr || set_platform_pmu_base_func_ == nullptr ||
-        set_pmu_enabled_func_ == nullptr || set_platform_dep_gen_base_func_ == nullptr ||
-        set_dep_gen_enabled_func_ == nullptr || set_scope_stats_enabled_func_ == nullptr ||
-        set_platform_scope_stats_base_func_ == nullptr || set_platform_chip_swimlane_base_func_ == nullptr ||
+        set_platform_run_result_func_ == nullptr || set_dump_args_enabled_func_ == nullptr ||
+        set_platform_pmu_base_func_ == nullptr || set_pmu_enabled_func_ == nullptr ||
+        set_platform_dep_gen_base_func_ == nullptr || set_dep_gen_enabled_func_ == nullptr ||
+        set_scope_stats_enabled_func_ == nullptr || set_platform_scope_stats_base_func_ == nullptr ||
+        set_platform_chip_swimlane_base_func_ == nullptr ||
         set_platform_chip_swimlane_aicore_rotation_table_func_ == nullptr ||
         set_chip_swimlane_enabled_func_ == nullptr) {
         LOG_ERROR("Executor functions not loaded. Call ensure_binaries_loaded first.");
@@ -495,6 +498,11 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 }
                 reset_device_phase_buffer(&run->phase_buf, over_launch);
                 set_platform_phase_base_func_(reinterpret_cast<uint64_t>(&run->phase_buf));
+                // Sim allocates no result region, so there is no base to publish —
+                // but the epoch still has to reach the AICPU SO, because the
+                // collectors stamp it onto every buffer they acquire. Without
+                // it sim records carry no run identity at all.
+                set_platform_run_result_func_(/*region_base=*/0, prepared->identity.run_epoch);
                 sim_t0 = std::chrono::steady_clock::now();
                 run_completion_.reset(static_cast<size_t>(over_launch) + static_cast<size_t>(num_aicore));
             } catch (...) {

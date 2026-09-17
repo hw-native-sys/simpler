@@ -173,8 +173,8 @@ bytes, not wrapping ring offsets:
 
 ```json
 {"fatal": false, "dropped": 0, "total": 4, "task_window_max": [8, 4], "heap_max": [268435456, 268435456], "dep_pool_max": [1024, 1024], "tensormap_max": 65536}
-{"site": "example_orchestration.cpp:77", "phase": "begin", "depth": 1, "ring": 1, "task_window_start": 0, "task_window_end": 0, "heap_start": 0, "heap_end": 0, "dep_pool_start": 1, "dep_pool_end": 1, "tensormap": 0}
-{"site": "example_orchestration.cpp:77", "phase": "end", "depth": 1, "ring": 1, "task_window_start": 0, "task_window_end": 4, "heap_start": 0, "heap_end": 8192, "dep_pool_start": 1, "dep_pool_end": 6, "tensormap": 5}
+{"site": "example_orchestration.cpp:77", "phase": "begin", "depth": 1, "ring": 1, "task_window_start": 0, "task_window_end": 0, "heap_start": 0, "heap_end": 0, "dep_pool_start": 1, "dep_pool_end": 1, "tensormap": 0, "run_epoch": 7, "buf_seq": 0}
+{"site": "example_orchestration.cpp:77", "phase": "end", "depth": 1, "ring": 1, "task_window_start": 0, "task_window_end": 4, "heap_start": 0, "heap_end": 8192, "dep_pool_start": 1, "dep_pool_end": 6, "tensormap": 5, "run_epoch": 7, "buf_seq": 0}
 ```
 
 Metadata line (line 1):
@@ -204,6 +204,8 @@ Per-sample lines, oldest-first:
 | `dep_pool_start` | int | Scheduler-published dependency-list pool tail at this boundary |
 | `dep_pool_end` | int | Scheduler-published dependency-list pool top at this boundary |
 | `tensormap` | int | Tensormap entries in use |
+| `run_epoch` | uint | Which run produced this record. Copied out of the buffer the record came from, so it stays correct after that buffer is returned to the pool and reused by a later run. `0` means the producer had no run identity to stamp |
+| `buf_seq` | uint | Buffer generation within that run. Restarts per run, so it identifies a buffer only together with `run_epoch` — not a cross-run ordering key |
 
 `start`/`end` are the ring's tail/head pointers at that boundary — see
 the metric formulas in [§1](#reading-the-report) for how a scope's peak

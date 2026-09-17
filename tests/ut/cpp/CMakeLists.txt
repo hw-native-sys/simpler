@@ -126,6 +126,7 @@ function(add_a2a3_hbg_runtime_test name src)
         ${ARGN}
         ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
         ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/scope_stats_collector_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/device_run_result_base_aicpu.cpp
     )
     target_include_directories(${name} PRIVATE
         ${GTEST_INCLUDE_DIRS}
@@ -157,6 +158,7 @@ function(add_a5_hbg_runtime_test name src)
         ${src}
         ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
         ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/scope_stats_collector_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/device_run_result_base_aicpu.cpp
     )
     target_include_directories(${name} PRIVATE
         ${GTEST_INCLUDE_DIRS}
@@ -188,6 +190,7 @@ function(add_a2a3_orchestrator_runtime_test name src)
         ${src}
         ${A2A3_RUNTIME_DIR}/orchestrator.cpp
         ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/scope_stats_collector_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/device_run_result_base_aicpu.cpp
         ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
     )
     target_include_directories(${name} PRIVATE
@@ -358,6 +361,7 @@ function(add_a5_orchestrator_runtime_test name src)
         ${src}
         ${A5_RUNTIME_DIR}/orchestrator.cpp
         ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/scope_stats_collector_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/device_run_result_base_aicpu.cpp
         ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
     )
     target_include_directories(${name} PRIVATE
@@ -579,9 +583,15 @@ set_tests_properties(test_execution_mode_latch PROPERTIES LABELS "no_hardware")
 
 # Runtime extension payloads are per-run state even though the collector's
 # shared-memory resources remain resident across runs.
+# Carries both real sides of the swimlane path: the host collector and the AICPU
+# producer module, so a test can drive init -> complete_task -> flush and read
+# the result back through the production host copy.
 add_executable(test_chip_swimlane_collector
     common/test_chip_swimlane_collector.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/chip_swimlane_collector.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/chip_swimlane_collector_aicpu.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/device_run_result_base_aicpu.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/sim/aicpu/inner_platform_regs.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/clock_correlation.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/sim/host/profiling_copy.cpp
     ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
@@ -589,6 +599,7 @@ add_executable(test_chip_swimlane_collector
 target_compile_definitions(test_chip_swimlane_collector PRIVATE SIMPLER_RUNTIME_NAME="test_runtime")
 target_include_directories(test_chip_swimlane_collector PRIVATE
     ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/aicpu
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
     ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
@@ -863,15 +874,21 @@ target_include_directories(test_error_code_names PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/common
 )
 
+# Carries both real sides of the scope_stats path: the host collector and the
+# device producer module, so a test can stamp identity through the production
+# device functions and read it back through the production host parse.
 add_executable(test_scope_stats_collector
     common/test_scope_stats_collector.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/scope_stats_collector.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/scope_stats_collector_aicpu.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/device_run_result_base_aicpu.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/sim/host/profiling_copy.cpp
     ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
 )
 target_include_directories(test_scope_stats_collector PRIVATE
     ${GTEST_INCLUDE_DIRS}
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/aicpu
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
     ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
     ${CMAKE_SOURCE_DIR}/../../../src/common
@@ -1292,7 +1309,10 @@ add_a2a3_orchestrator_runtime_test(test_a2a3_orchestrator_fanin a2a3/test_orches
 add_a2a3_orchestrator_runtime_test(test_wiring a2a3/test_wiring.cpp)
 add_a2a3_orchestrator_runtime_test(test_a2a3_args_dump a2a3/test_args_dump.cpp)
 add_a2a3_runtime_test(test_aicore_completion_mailbox a2a3/test_aicore_completion_mailbox.cpp)
-add_a2a3_runtime_test(test_a2a3_scope_stats_collector a2a3/test_scope_stats_collector.cpp)
+# This test #includes scope_stats_collector_aicpu.cpp directly, so it needs the
+# run-result base/epoch globals that the device module stamps buffers from.
+add_a2a3_runtime_test(test_a2a3_scope_stats_collector a2a3/test_scope_stats_collector.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/device_run_result_base_aicpu.cpp)
 
 # ---------------------------------------------------------------------------
 # A5 tests (src/a5/runtime/tensormap_and_ringbuffer/)

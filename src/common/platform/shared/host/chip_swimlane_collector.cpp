@@ -593,7 +593,7 @@ void ChipSwimlaneCollector::copy_perf_buffer(const ReadyBufferInfo &info, int co
         auto &dst = perf_records_by_collector_[shard][core_index];
         dst.reserve(dst.size() + count);
         for (uint32_t i = 0; i < count; i++) {
-            dst.push_back(buf->records[i]);
+            dst.push_back({buf->records[i], buf->run_epoch, buf->local_seq, 0});
         }
         collector_counters_[shard].total_perf_collected += count;
     }
@@ -612,7 +612,7 @@ void ChipSwimlaneCollector::copy_sched_phase_buffer(const ReadyBufferInfo &info,
         auto &dst = sched_phase_records_by_collector_[shard][tidx];
         dst.reserve(dst.size() + count);
         for (uint32_t i = 0; i < count; i++) {
-            dst.push_back(buf->records[i]);
+            dst.push_back({buf->records[i], buf->run_epoch, buf->local_seq, 0});
         }
         collector_counters_[shard].total_sched_phase_collected += count;
         if (count > 0) {
@@ -634,7 +634,7 @@ void ChipSwimlaneCollector::copy_orch_phase_buffer(const ReadyBufferInfo &info, 
         auto &dst = orch_phase_records_by_collector_[shard][tidx];
         dst.reserve(dst.size() + count);
         for (uint32_t i = 0; i < count; i++) {
-            dst.push_back(buf->records[i]);
+            dst.push_back({buf->records[i], buf->run_epoch, buf->local_seq, 0});
         }
         collector_counters_[shard].total_orch_phase_collected += count;
         if (count > 0) {
@@ -684,7 +684,7 @@ void ChipSwimlaneCollector::copy_aicore_buffer(const ReadyBufferInfo &info, int 
                 skipped++;
                 continue;
             }
-            dst.push_back(r);
+            dst.push_back({r, buf->run_epoch, buf->local_seq, 0});
         }
     }
     if (skipped > 0) {
@@ -1228,7 +1228,8 @@ int ChipSwimlaneCollector::export_swimlane_json() {
             bool first = true;
             size_t total = 0;
             for (size_t core_idx = 0; core_idx < collected_aicore_records_.size(); core_idx++) {
-                for (const auto &r : collected_aicore_records_[core_idx]) {
+                for (const auto &collected : collected_aicore_records_[core_idx]) {
+                    const ChipSwimlaneAicoreTaskRecord &r = collected.record;
                     if (!first) outfile << ",";
                     outfile << "\n    [" << core_idx << ", " << r.task_token_raw << ", " << r.reg_task_id << ", "
                             << r.start_time << ", " << r.end_time << ", " << r.receive_to_start_cycles << "]";
@@ -1251,7 +1252,8 @@ int ChipSwimlaneCollector::export_swimlane_json() {
             bool first = true;
             size_t total = 0;
             for (size_t core_idx = 0; core_idx < collected_perf_records_.size(); core_idx++) {
-                for (const auto &r : collected_perf_records_[core_idx]) {
+                for (const auto &collected : collected_perf_records_[core_idx]) {
+                    const ChipSwimlaneAicpuTaskRecord &r = collected.record;
                     if (!first) outfile << ",";
                     outfile << "\n    [" << core_idx << ", " << r.reg_task_id << ", " << r.dispatch_time << ", "
                             << r.finish_time << "]";
@@ -1290,7 +1292,8 @@ int ChipSwimlaneCollector::export_swimlane_json() {
             for (size_t t = 0; t < orch_lanes; t++) {
                 outfile << "    [";
                 bool first = true;
-                for (const auto &pr : collected_orch_phase_records_[t]) {
+                for (const auto &collected : collected_orch_phase_records_[t]) {
+                    const ChipSwimlaneAicpuOrchPhaseRecord &pr = collected.record;
                     if (!first) outfile << ",";
                     outfile << "\n      {\"submit_idx\": " << pr.submit_idx << ", \"task_id\": " << pr.task_id
                             << ", \"start_cycles\": " << pr.start_time << ", \"end_cycles\": " << pr.end_time << "}";

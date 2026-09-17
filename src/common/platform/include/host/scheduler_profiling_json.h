@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "common/scheduler_profiling.h"
+#include "host/collected_record.h"
 
 inline const char *chip_swimlane_scheduler_kind_name(ChipSwimlaneSchedPhaseKind kind) {
     switch (kind) {
@@ -54,7 +55,7 @@ inline const char *chip_swimlane_scheduler_kind_name(ChipSwimlaneSchedPhaseKind 
 }
 
 inline void chip_swimlane_write_scheduler_records(
-    std::ostream &out, const std::vector<std::vector<ChipSwimlaneAicpuSchedPhaseRecord>> &streams,
+    std::ostream &out, const std::vector<std::vector<CollectedRecord<ChipSwimlaneAicpuSchedPhaseRecord>>> &streams,
     const std::vector<uint32_t> &dropped_records, const std::string &runtime_name
 ) {
     out << "{\n    \"schema_version\": 1,\n    \"streams\": [";
@@ -70,7 +71,7 @@ inline void chip_swimlane_write_scheduler_records(
             << ", \"dropped\": " << dropped << ", \"truncated\": " << (dropped == 0 ? "false" : "true")
             << "}, \"records\": [";
         for (size_t record_index = 0; record_index < records.size(); ++record_index) {
-            const auto &record = records[record_index];
+            const ChipSwimlaneAicpuSchedPhaseRecord &record = records[record_index].record;
             if (record_index != 0) out << ",";
             out << "\n        {\"start_cycles\": " << record.start_time << ", \"end_cycles\": " << record.end_time
                 << ", \"loop_iter\": " << record.loop_iter << ", \"kind\": \""
@@ -93,7 +94,7 @@ inline void chip_swimlane_write_scheduler_records(
         if (!records.empty()) out << "\n      ";
         out << "], \"metrics\": [";
         for (size_t record_index = 0; record_index < records.size(); ++record_index) {
-            const auto &record = records[record_index];
+            const ChipSwimlaneAicpuSchedPhaseRecord &record = records[record_index].record;
             if (record_index != 0) out << ",";
             out << "\n        {\"record_index\": " << record_index;
             if (record.kind == ChipSwimlaneSchedPhaseKind::Dispatch) {

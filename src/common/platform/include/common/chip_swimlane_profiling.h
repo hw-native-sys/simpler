@@ -204,6 +204,20 @@ template <typename Record, size_t N>
 struct TypedBuffer {
     Record records[N];
     volatile uint32_t count;
+    // Which run's records these are, stamped once when the buffer is acquired
+    // and not rewritten while it is owned. The host copies identity out with
+    // the records, so a host-side copy keeps its run after the device buffer
+    // has been returned to the pool and re-stamped by a later run. Zero when
+    // the producer had no run identity to stamp.
+    //
+    // These land in the alignment tail the `records[] + count` layout already
+    // had, so the buffer does not grow — the size assertions below hold that.
+    uint64_t run_epoch;
+    // Buffer generation within that run. Restarts per run, so it identifies a
+    // buffer only together with `run_epoch`. Distinct from
+    // `ChipSwimlaneActiveHead::current_buf_seq`, which AICore reads as a
+    // rotation generation and which must keep that meaning.
+    uint32_t local_seq;
 } __attribute__((aligned(64)));
 
 using ChipSwimlaneAicpuTaskBuffer = TypedBuffer<ChipSwimlaneAicpuTaskRecord, PLATFORM_PROF_BUFFER_SIZE>;
@@ -223,6 +237,21 @@ static_assert(
 // burst depth alongside the AICPU and Phase pools.
 
 using ChipSwimlaneAicoreTaskBuffer = TypedBuffer<ChipSwimlaneAicoreTaskRecord, PLATFORM_AICORE_BUFFER_SIZE>;
+
+// The run identity in TypedBuffer costs no device memory: it occupies the
+// alignment tail `records[] + count` already had. These pin that — a record
+// size or capacity change that makes identity grow the buffer has to be a
+// deliberate decision, not a silent allocation increase on every core's pool.
+static_assert(
+    sizeof(ChipSwimlaneAicpuTaskBuffer) ==
+        ((sizeof(ChipSwimlaneAicpuTaskRecord) * PLATFORM_PROF_BUFFER_SIZE + 4 + 63) / 64) * 64,
+    "run identity grew ChipSwimlaneAicpuTaskBuffer past its former alignment tail"
+);
+static_assert(
+    sizeof(ChipSwimlaneAicoreTaskBuffer) ==
+        ((sizeof(ChipSwimlaneAicoreTaskRecord) * PLATFORM_AICORE_BUFFER_SIZE + 4 + 63) / 64) * 64,
+    "run identity grew ChipSwimlaneAicoreTaskBuffer past its former alignment tail"
+);
 
 // =============================================================================
 // ChipSwimlaneFreeQueue - SPSC Lock-Free Queue for Free Buffers

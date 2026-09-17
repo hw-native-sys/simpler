@@ -103,12 +103,24 @@ struct ScopeStatsRecord {
 struct ScopeStatsBuffer {
     // Header (first 64 bytes) — host copies this alone first to learn count.
     volatile uint32_t count;  // Number of valid records committed
-    uint32_t _pad0[15];       // Pad count to 64 B; isolates count's cache line.
+    uint32_t _pad0;
+    // Which run's records these are, stamped once when the buffer is acquired
+    // and never rewritten while the buffer is owned. The host copies identity
+    // out with the records, so a host-side copy keeps its run even after the
+    // device buffer has been returned to the pool and reused by a later run.
+    // Zero when the producer had no run identity to stamp.
+    uint64_t run_epoch;
+    // Buffer generation within that run, from the producer's own rotation
+    // counter. Restarts per run, so it identifies a buffer only together with
+    // `run_epoch` — it is not a cross-run ordering key.
+    uint32_t local_seq;
+    uint32_t _pad1[11];  // Pad the header to 64 B; isolates count's cache line.
 
     ScopeStatsRecord records[PLATFORM_SCOPE_STATS_RECORDS_PER_BUFFER];
 } __attribute__((aligned(64)));
 
 static_assert(offsetof(ScopeStatsBuffer, records) == 64, "ScopeStatsBuffer header must be exactly 64 bytes");
+static_assert(offsetof(ScopeStatsBuffer, run_epoch) % sizeof(uint64_t) == 0, "run_epoch must stay 8-byte aligned");
 
 // SPSC free queue: Host (producer) pushes recycled/new buffers, Device (AICPU
 // consumer) pops them when switching the current buffer.

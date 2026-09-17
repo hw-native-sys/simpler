@@ -44,6 +44,7 @@ _REQUIRED_RECORD_FIELDS = {
     "dep_pool_start",
     "dep_pool_end",
     "tensormap",
+    "run_epoch",
 }
 
 
@@ -141,6 +142,15 @@ class TestScopeStats(SceneTestCase):
         assert len(records) >= 4, f"expected ≥4 begin/end records, got {records!r}"
         for rec in records:
             assert _REQUIRED_RECORD_FIELDS <= rec.keys(), f"record missing fields: {rec!r}"
+
+        # Every record carries the run that produced it, and this is one run, so
+        # they all carry the same non-zero epoch. Zero would mean the device
+        # stamped a buffer before the run's identity was published — the reason
+        # the stamp has to happen at buffer acquisition, which runs inside
+        # ``aicpu_execute`` and therefore after the kernel entry publishes it.
+        epochs = {rec["run_epoch"] for rec in records}
+        assert epochs != {0}, f"records carry no run identity: {records[0]!r}"
+        assert len(epochs) == 1, f"a single run produced more than one epoch: {sorted(epochs)}"
 
 
 if __name__ == "__main__":

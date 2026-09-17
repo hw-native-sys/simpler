@@ -35,6 +35,7 @@
 #include "common/chip_swimlane_extension.h"
 #include "common/chip_swimlane_profiling.h"
 #include "host/clock_correlation.h"
+#include "host/collected_record.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
@@ -435,6 +436,22 @@ public:
     void on_buffer_collected(const ReadyBufferInfo &info, int collector_shard);
 
     /**
+     * Per-shard AICore records as collected, each with the run it came from.
+     * Exposed for the identity/ownership tests, which need the pre-merge view:
+     * the merge into `collected_aicore_records_` only runs at reconcile.
+     */
+    const std::vector<std::vector<CollectedRecord<ChipSwimlaneAicoreTaskRecord>>> &
+    collected_aicore_records_for_test() const {
+        return aicore_records_by_collector_[0];
+    }
+
+    /** Per-shard AICPU task records as collected, each with its run. */
+    const std::vector<std::vector<CollectedRecord<ChipSwimlaneAicpuTaskRecord>>> &
+    collected_perf_records_for_test() const {
+        return perf_records_by_collector_[0];
+    }
+
+    /**
      * Publish per-core core_type (AIC/AIV/...) so the host emit path can
      * resolve the lane label without consulting an AICPU task record. Required
      * for TASK_TIMING (level=1) where complete_task is bypassed and the
@@ -557,7 +574,9 @@ public:
     /**
      * @return Per-core ChipSwimlaneAicpuTaskRecord vectors (indexed by core_index). For tests.
      */
-    const std::vector<std::vector<ChipSwimlaneAicpuTaskRecord>> &get_records() const { return collected_perf_records_; }
+    const std::vector<std::vector<CollectedRecord<ChipSwimlaneAicpuTaskRecord>>> &get_records() const {
+        return collected_perf_records_;
+    }
 
 private:
     struct alignas(64) CollectorShardCounters {
@@ -603,16 +622,16 @@ private:
     std::array<std::string, static_cast<size_t>(ChipSwimlaneExtensionSection::Count)> json_extensions_{};
 
     // Merged data, populated from per-collector shards after collector threads join.
-    std::vector<std::vector<ChipSwimlaneAicpuTaskRecord>> collected_perf_records_;
+    std::vector<std::vector<CollectedRecord<ChipSwimlaneAicpuTaskRecord>>> collected_perf_records_;
 
     // Collected AICore records (per-core vectors). Each entry is a full
     // ChipSwimlaneAicoreTaskRecord captured from a rotated ChipSwimlaneAicoreTaskBuffer.
-    std::vector<std::vector<ChipSwimlaneAicoreTaskRecord>> collected_aicore_records_;
+    std::vector<std::vector<CollectedRecord<ChipSwimlaneAicoreTaskRecord>>> collected_aicore_records_;
 
     // AICPU phase profiling data — separate per-thread vectors for sched and
     // orch records (kind-tagged at routing time; no parse-time discrimination).
-    std::vector<std::vector<ChipSwimlaneAicpuSchedPhaseRecord>> collected_sched_phase_records_;
-    std::vector<std::vector<ChipSwimlaneAicpuOrchPhaseRecord>> collected_orch_phase_records_;
+    std::vector<std::vector<CollectedRecord<ChipSwimlaneAicpuSchedPhaseRecord>>> collected_sched_phase_records_;
+    std::vector<std::vector<CollectedRecord<ChipSwimlaneAicpuOrchPhaseRecord>>> collected_orch_phase_records_;
     std::vector<HostPhaseRecord> host_submit_records_;
     std::vector<HostPhaseRecord> host_upload_records_;
     simpler::dfx::ClockCorrelationSession clock_correlation_session_;
@@ -620,10 +639,10 @@ private:
     // Core-to-thread mapping (core_id → scheduler thread index, -1 = unassigned)
     std::vector<int8_t> core_to_thread_;
 
-    RecordsByCollector<ChipSwimlaneAicpuTaskRecord> perf_records_by_collector_;
-    RecordsByCollector<ChipSwimlaneAicoreTaskRecord> aicore_records_by_collector_;
-    RecordsByCollector<ChipSwimlaneAicpuSchedPhaseRecord> sched_phase_records_by_collector_;
-    RecordsByCollector<ChipSwimlaneAicpuOrchPhaseRecord> orch_phase_records_by_collector_;
+    RecordsByCollector<CollectedRecord<ChipSwimlaneAicpuTaskRecord>> perf_records_by_collector_;
+    RecordsByCollector<CollectedRecord<ChipSwimlaneAicoreTaskRecord>> aicore_records_by_collector_;
+    RecordsByCollector<CollectedRecord<ChipSwimlaneAicpuSchedPhaseRecord>> sched_phase_records_by_collector_;
+    RecordsByCollector<CollectedRecord<ChipSwimlaneAicpuOrchPhaseRecord>> orch_phase_records_by_collector_;
     std::vector<CollectorShardCounters> collector_counters_;
 
     // Running totals used at reconcile time to cross-check device-side counters.
