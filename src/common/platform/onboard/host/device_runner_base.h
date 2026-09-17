@@ -128,6 +128,22 @@ public:
     bool native_runs_outstanding() const;
 
     /**
+     * Whether a live reservation other than `owner`'s holds `arena_bank`.
+     *
+     * Two runs collide over the pooled device regions only when the slot lease
+     * hands them the same bank, and that is a property of the contract rather
+     * than of the depth: `pipeline_resource_slot` gives every slot its own bank
+     * for a `HOST_PER_RUN` arena and bank 0 to all of them for a shared one. So
+     * a successor whose bank differs cannot reach its predecessor's regions —
+     * `setup_static_arena` only ever touches the bank it is given — while one
+     * that shares a bank can grow or release regions the predecessor is
+     * executing against. The prepare gate uses this to decide whether the
+     * runtime's compatibility probe has to answer before the successor may
+     * prepare concurrently.
+     */
+    bool arena_bank_shared_with_other_run(const void *owner, uint32_t arena_bank) const;
+
+    /**
      * Committed GM heap base of one arena bank, or 0 while that bank has never
      * been committed. Two banks that have both served a run hold distinct
      * device allocations; tests read this to prove the depth-two split is real

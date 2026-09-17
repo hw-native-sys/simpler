@@ -2494,6 +2494,16 @@ bool DeviceRunnerBase::try_reserve_native_run(
     return false;
 }
 
+bool DeviceRunnerBase::arena_bank_shared_with_other_run(const void *owner, uint32_t arena_bank) const {
+    if (arena_bank >= PTO_PIPELINE_MAX_DEPTH) return false;
+    std::lock_guard<std::mutex> lk(native_run_mu_);
+    for (const NativeRunReservation &reservation : native_run_reservations_) {
+        if (reservation.owner == nullptr || reservation.owner == owner) continue;
+        if (reservation.arena_bank == arena_bank) return true;
+    }
+    return false;
+}
+
 void DeviceRunnerBase::release_native_run_reservation(const void *owner) {
     if (owner == nullptr) return;
     std::lock_guard<std::mutex> lk(native_run_mu_);

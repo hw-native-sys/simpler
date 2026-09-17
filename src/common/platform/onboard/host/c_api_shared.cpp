@@ -892,8 +892,19 @@ int simpler_prepare_run(
         if (rc != 0) return cleanup_failed_prepare(state, rc, true);
 
         if (overlaps_active_run) {
-            int compatibility_rc = 0;
-            {
+            // The probe exists to protect a *shared* arena bank, so require it
+            // only when this run actually shares one. A runtime whose arena
+            // resources are per-run gets its own bank from the slot lease, and
+            // `setup_static_arena` only ever touches the bank it is handed — so
+            // its successor cannot grow or release the predecessor's regions and
+            // has nothing for a probe to rule on. Asking anyway would leave
+            // those runtimes admitted on the strength of the weak default
+            // answer, which is the same value a runtime that shares a bank and
+            // forgot to implement a probe would get.
+            const bool shares_arena_bank =
+                runner->arena_bank_shared_with_other_run(state, state->descriptor.arena_bank);
+            int compatibility_rc = shares_arena_bank ? 0 : 1;
+            if (shares_arena_bank) {
                 STRACE("chip.run.bind.compatibility");
                 compatibility_rc = prepared_run_config_compatible_impl(
                     &state->host_api, config->runtime_env.ring_task_window, config->runtime_env.ring_heap,
