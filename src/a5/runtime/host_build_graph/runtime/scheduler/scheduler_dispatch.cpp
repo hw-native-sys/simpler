@@ -1416,35 +1416,12 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         bool try_pushed = false;
 
-        // Phase 2 drain check
-        if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
-#if SIMPLER_DFX
-            // The drain is otherwise a swimlane blind spot: the `continue` below skips
-            // every phase record, and handle_drain_mode is uninstrumented. Time it here so
-            // the sync_start stop-the-world window shows on the scheduler lane (one bar per
-            // iteration that enters the drain; retries appear as multiple bars).
-            uint64_t drain_t0 = (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
-            uint64_t drain_stage_wall = 0;  // set by handle_drain_mode ONLY if this thread staged
-            handle_drain_mode(thread_idx, &drain_stage_wall);
-            // Record a Drain bar only when this thread actually did drain work (reached
-            // stage_sync_start_cores). The many no-op entries — ack + availability-insufficient
-            // reset or follower bail before stage_go — never stage, so they
-            // would otherwise clutter the lane with zero-work drain(0) bars.
-            if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES && drain_stage_wall != 0) {
-                chip_swimlane_aicpu_record_sched_phase(
-                    thread_idx, ChipSwimlaneSchedPhaseKind::Drain, drain_t0, get_sys_cnt_aicpu(),
-                    chip_swimlane.sched_loop_count, static_cast<uint32_t>(drain_stage_wall)
-                );
-            }
-#else
-            handle_drain_mode(thread_idx);
-#endif
-            continue;
-        }
-
-        // Graph control work never consumes an AICore. External dependency
-        // readiness and bounded definition materialization progress
-        // independently, then meet in GraphExecution::state.
+        // Graph control work runs BEFORE the drain check because it occupies no
+        // AICore: the drain exists to free cores, and skipping a pass that takes
+        // none cannot help it. It is also the only path that rings a body root a
+        // shell staged early — activate_graph_task -> graph_route_ready_roots ->
+        // push_ready_routed — so a sync_start cohort waiting on cores those roots
+        // hold can only be satisfied once this has run.
         //
         // Keep this ahead of dummy/regular dispatch so a ready Graph can expose
         // its root tasks without waiting for an otherwise unrelated dispatch
@@ -1502,6 +1479,32 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 }
 #endif
             }
+        }
+
+        // Phase 2 drain check
+        if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
+#if SIMPLER_DFX
+            // The drain is otherwise a swimlane blind spot: the `continue` below skips
+            // every phase record, and handle_drain_mode is uninstrumented. Time it here so
+            // the sync_start stop-the-world window shows on the scheduler lane (one bar per
+            // iteration that enters the drain; retries appear as multiple bars).
+            uint64_t drain_t0 = (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
+            uint64_t drain_stage_wall = 0;  // set by handle_drain_mode ONLY if this thread staged
+            handle_drain_mode(thread_idx, &drain_stage_wall);
+            // Record a Drain bar only when this thread actually did drain work (reached
+            // stage_sync_start_cores). The many no-op entries — ack + availability-insufficient
+            // reset or follower bail before stage_go — never stage, so they
+            // would otherwise clutter the lane with zero-work drain(0) bars.
+            if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES && drain_stage_wall != 0) {
+                chip_swimlane_aicpu_record_sched_phase(
+                    thread_idx, ChipSwimlaneSchedPhaseKind::Drain, drain_t0, get_sys_cnt_aicpu(),
+                    chip_swimlane.sched_loop_count, static_cast<uint32_t>(drain_stage_wall)
+                );
+            }
+#else
+            handle_drain_mode(thread_idx);
+#endif
+            continue;
         }
 
         // Phase 3 (dependency-only dummy / predicate-failed retirement) runs on
