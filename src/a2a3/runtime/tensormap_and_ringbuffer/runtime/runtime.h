@@ -239,6 +239,7 @@ public:
     int get_aicpu_thread_num() const { return dev.aicpu_thread_num; }
     void set_aicpu_thread_num(int n) { dev.aicpu_thread_num = n; }
     Handshake *get_workers() { return dev.workers; }
+    const Handshake *get_workers() const { return dev.workers; }
     AicoreTeardownControl *get_teardown_gates() { return dev.teardown_gates; }
     int32_t get_aicpu_allowed_cpu_count() const { return dev.aicpu_allowed_cpu_count; }
     void set_aicpu_allowed_cpu_count(int32_t n) { dev.aicpu_allowed_cpu_count = n; }
@@ -313,9 +314,10 @@ public:
     // Host-only state (not copied to device)
     // =========================================================================
 
-    // Host-side tensor ledger for D2H copy-back at finalize. Populated by
-    // runtime_maker.cpp from orch_args at bind time, then iterated in
-    // validate_runtime_impl. Host-only (after `dev`): never uploaded.
+    // Host-side tensor ledger for the run's H2D and D2H transfers. Populated by
+    // runtime_maker.cpp from orch_args at bind time, iterated by
+    // copy_in_run_inputs_impl and copy_back_run_outputs_impl, and released by
+    // release_run_bindings_impl. Host-only (after `dev`): never uploaded.
     std::vector<TensorLease> tensor_leases_;
 };
 

@@ -15,14 +15,22 @@
  *
  * bind_callable_to_runtime_impl:
  *   - Gives host-memory tensor arguments slices of the pipeline slot's retained
- *     temporary buffer (all readable inputs copied H2D; only OUTPUT/INOUT
- *     tensors are copied back D2H) and records one lease each
+ *     temporary buffer and records one lease each with its transfer directions.
+ *     Moves no tensor bytes
  *   - Copies orchestration SO to device memory
  *   - Sets up runtime state for device orchestration
  *
- * validate_runtime_impl:
+ * copy_in_run_inputs_impl:
+ *   - Copies IN/INOUT tensors H2D into the buffers their leases name (pure
+ *     OUTPUT tensors are skipped), and rejects an input with no usable
+ *     endpoint rather than passing over it
+ *
+ * copy_back_run_outputs_impl:
+ *   - Reads the device-side status of a failed run that reached a stream
  *   - Copies OUTPUT/INOUT tensors back from device to host (read-only inputs
- *     are skipped)
+ *     are skipped). Releases nothing
+ *
+ * release_run_bindings_impl:
  *   - Releases the run's leases. The slices are no-ops: the retained buffer
  *     outlives the run and is freed once at Worker finalization.
  */
@@ -60,6 +68,7 @@
 #include "utils/device_arena.h"
 #include "utils/retained_temp_bump.h"
 #include "utils/temp_buffer_plan.h"
+#include "utils/tensor_lease_copy_in.h"
 #include "utils/tensor_lease_release.h"
 #include "prepare_callable_common.h"
 
@@ -206,7 +215,7 @@ static bool resolve_ring_config(
     return true;
 }
 
-static int32_t read_runtime_status(Runtime *runtime, const HostApi *api, SharedMemoryHeader *host_header) {
+static int32_t read_runtime_status(const Runtime *runtime, const HostApi *api, SharedMemoryHeader *host_header) {
     if (runtime == nullptr || host_header == nullptr) {
         return 0;
     }
@@ -504,13 +513,16 @@ extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *config, Pip
 }
 
 // per-run: the only signature-aware step. Copy the orch args, replacing each
-// host tensor pointer with one sliced from the retained temporary buffer (H2D
-// copy-in, or nothing at all for pure-OUTPUT buffers), and record the host/device pair for
-// copy-back. Read-only INPUT tensors skip copy-back. When `bump` is non-null,
-// ordinary non-child tensors are sliced from the runner's retained temporary
-// buffer (released as a no-op — the buffer is reused across runs); otherwise
-// each is device_malloc'd and freed in validate. On failure the partially
-// copied-in device_args / tensor_leases_ stay owned by the caller's Runtime.
+// host tensor pointer with one sliced from the retained temporary buffer, and
+// record the host/device pair plus its transfer directions. When `bump` is
+// non-null, ordinary non-child tensors are sliced from the runner's retained
+// temporary buffer (released as a no-op — the buffer is reused across runs);
+// otherwise each is device_malloc'd and freed when the run's bindings are
+// released. On failure the partially sliced device_args / tensor_leases_ stay
+// owned by the caller's Runtime.
+//
+// No tensor bytes move here: copy_in_run_inputs_impl copies them, which the
+// current adapter calls after this bind returns.
 static bool copy_in_device_args(
     Runtime *runtime, const HostApi *api, const ChipStorageTaskArgs *orch_args, const ArgDirection *signature,
     int sig_count, RetainedTempBump *bump, ChipStorageTaskArgs *out
@@ -560,18 +572,11 @@ static bool copy_in_device_args(
         // Pure write-only OUTPUT buffers are never read by the kernel and hold
         // no meaningful host content, so they need no copy-in — the
         // kernel defines what it writes and any unwritten bytes are undefined.
-        // IN / INOUT (read-before-write) are copied in H2D.
+        // IN / INOUT (read-before-write) are copied in H2D. The copy itself is
+        // its own step (copy_in_run_inputs_impl): this settles which buffer each
+        // tensor gets, not what is in it.
         bool is_pure_output = (signature != nullptr && i < sig_count && signature[i] == ArgDirection::OUT);
-        if (!is_pure_output) {
-            int rc = api->copy_to_device(dev_ptr, host_ptr, size);
-            if (rc != 0) {
-                LOG_ERROR("Failed to copy tensor %d in to the device", i);
-                if (release_kind == TensorReleaseKind::Free) {
-                    api->device_free(dev_ptr);
-                }
-                return false;
-            }
-        }
+        bool needs_copy_in = !is_pure_output;
         // Read-only INPUT tensors are never written by the kernel, so there is
         // no point copying them back D2H at the end. Index the signature
         // by the orch tensor index `i` (device-space tensors are skipped above
@@ -579,7 +584,7 @@ static bool copy_in_device_args(
         // tensor entries). Anything not provably IN keeps the safe default of
         // copying back.
         bool needs_copy_back = !(signature != nullptr && i < sig_count && signature[i] == ArgDirection::IN);
-        runtime->tensor_leases_.push_back({host_ptr, dev_ptr, size, needs_copy_back, release_kind});
+        runtime->tensor_leases_.push_back({host_ptr, dev_ptr, size, needs_copy_in, needs_copy_back, release_kind});
         LOG_DEBUG("  ChipTensor %d: %zu bytes at %p", i, size, dev_ptr);
 
         t.buffer.addr = reinterpret_cast<uint64_t>(dev_ptr);
@@ -589,7 +594,7 @@ static bool copy_in_device_args(
         out->add_scalar(orch_args->scalar(i));
     }
     int64_t t_args_end = _now_ms();
-    LOG_INFO("TIMING: args_malloc_copy = %" PRId64 "ms", t_args_end - t_args_start);
+    LOG_INFO("TIMING: args_slice = %" PRId64 "ms", t_args_end - t_args_start);
     return true;
 }
 
@@ -911,19 +916,58 @@ extern "C" int prewarm_config_impl(
 }
 
 /**
- * Validate runtime results and cleanup.
+ * Stage one run's inputs into the device buffers its leases already name.
+ *
+ * Separate from the bind so that a run's input bytes are its own: the bind
+ * settles which device buffer each caller tensor gets, and this settles what is
+ * in it. An input-bearing lease with no usable endpoint fails here rather than
+ * being passed over, which would launch the run against whatever its device
+ * buffer already held.
+ */
+extern "C" int copy_in_run_inputs_impl(const Runtime *runtime, const HostApi *api) {
+    if (runtime == nullptr || api == nullptr) {
+        LOG_ERROR("copy_in_run_inputs_impl: null runtime or HostApi");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    const int rc = copy_in_tensor_leases(runtime->tensor_leases_, api);
+    if (rc != 0) {
+        LOG_ERROR("Failed to stage this run's input tensors: %d", rc);
+    }
+    return rc;
+}
+
+/**
+ * Release the tensor bindings the bind recorded.
+ *
+ * Its own entry rather than the tail of the copy-back, so that reading a run's
+ * results and retiring the device memory behind them are separately orderable.
+ */
+extern "C" int release_run_bindings_impl(Runtime *runtime, const HostApi *api) {
+    if (runtime == nullptr || api == nullptr) {
+        LOG_ERROR("release_run_bindings_impl: null runtime or HostApi");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    release_run_tensor_leases(runtime, api);
+    return 0;
+}
+
+/**
+ * Inspect one run's results.
  *
  * This function:
- * 1. Copies recorded tensors from device back to host
- * 2. Releases recorded tensor leases
- * 3. Clears tensor lease state
+ * 1. Reads the device-side runtime status when the run failed on the device
+ * 2. Copies written tensors from device back to host
+ *
+ * It releases nothing; `release_run_bindings_impl` ends the bindings it reads.
  *
  * @param runtime       Pointer to Runtime
  * @param execution_rc  Device-runner drain status after successful enqueue,
  *                      or enqueue status on failure
+ * @param launched      Nonzero when this run reached a stream, and its
+ *                      device-side status is therefore readable
  * @return 0 on success, -1 on failure
  */
-extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc) {
+extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi *api, int execution_rc, int launched) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -938,7 +982,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
     LOG_INFO("=== Copying Results Back to Host ===");
 
     // Copy all recorded tensors from device back to host
-    TensorLease *tensor_leases = runtime->tensor_leases_.data();
+    const TensorLease *tensor_leases = runtime->tensor_leases_.data();
     int tensor_lease_count = static_cast<int>(runtime->tensor_leases_.size());
 
     LOG_INFO("ChipTensor leases to process: %d", tensor_lease_count);
@@ -948,7 +992,10 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
     SharedMemoryHeader host_header;
     memset(&host_header, 0, sizeof(host_header));
 
-    if (execution_rc != 0) {
+    // Both status channels are device state, readable only for a run that
+    // reached a stream. A run that failed before launch has published nothing
+    // and its shared memory belongs to whoever ran there last.
+    if (execution_rc != 0 && launched != 0) {
         runtime_status = read_published_run_status(api, &host_header);
         if (runtime_status == 0) {
             // No snapshot from this run, so fall back to the shared header. That
@@ -1026,11 +1073,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
         }
     }
 
-    // Cleanup device tensors
-    LOG_INFO("=== Cleaning Up ===");
-    release_run_tensor_leases(runtime, api);
-
-    LOG_INFO("=== Finalize Complete ===");
+    LOG_INFO("=== Result Copy-Back Complete ===");
 
     if (rc == 0 && runtime_status != 0) {
         rc = runtime_status;

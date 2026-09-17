@@ -33,7 +33,7 @@ The `host_build_graph` runtime runs orchestration on the host, transfers the
 prepared image to the AICPU, and runs scheduling there. The
 `tensormap_and_ringbuffer` runtime runs both orchestration and scheduling on the
 AICPU. On a fatal condition the runtime **latches** a code, which the host reads
-back in `validate_runtime_impl` to print the lines above. Where it is latched
+back in `copy_back_run_outputs_impl` to print the lines above. Where it is latched
 follows where the reporter runs: a scheduler code goes into the shared-memory
 header, and so does an orchestrator code under `tensormap_and_ringbuffer`, whose
 orchestrator is on the AICPU. `host_build_graph`'s orchestrator is host-side, so
@@ -226,7 +226,7 @@ time, so there is nothing to drift out of sync.
 
 - Code definitions: `src/common/host_build_graph/runtime_status.h`,
   `src/{arch}/runtime/tensormap_and_ringbuffer/common/runtime_status.h`
-- Host print site: `.../host/runtime_maker.cpp` (`validate_runtime_impl`)
+- Host print site: `.../host/runtime_maker.cpp` (`copy_back_run_outputs_impl`)
 - Sub-class logic: `.../runtime/scheduler/scheduler_cold_path.cpp` (`classify_stall_reason`)
 - End-to-end negative tests: `tests/st/runtime_fatal_codes/`
 - Onboard `507018` mechanism triage + device logs: [`running-onboard.md`](../../.claude/rules/running-onboard.md)

@@ -19,7 +19,7 @@
  * A macro rather than a function on purpose. LOG_ERROR bakes in __FUNCTION__, __FILENAME__
  * and __LINE__ at its expansion point, so wrapping it in a function would stamp every line
  * with this header's name instead of the site that actually detected the failure. Expanding
- * at the call site keeps the log pointing at validate_runtime_impl in the caller's
+ * at the call site keeps the log pointing at copy_back_run_outputs_impl in the caller's
  * runtime_maker.cpp, which is the thing a reader needs.
  *
  * The first line is parsed by the STs (which match on "orch_error_code=N") and mirrored in

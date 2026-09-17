@@ -224,6 +224,7 @@ public:
     int get_aicpu_thread_num() const { return aicpu_thread_num; }
     void set_aicpu_thread_num(int n) { aicpu_thread_num = n; }
     Handshake *get_workers() { return workers; }
+    const Handshake *get_workers() const { return workers; }
     AicoreTeardownControl *get_teardown_gates() { return teardown_gates; }
     int32_t get_aicpu_allowed_cpu_count() const { return aicpu_allowed_cpu_count; }
     void set_aicpu_allowed_cpu_count(int32_t n) { aicpu_allowed_cpu_count = n; }
@@ -296,9 +297,10 @@ public:
     /** @deprecated RT2 uses DispatchPayload, not Task. Always returns nullptr. */
     Task *get_task(int) { return nullptr; }
 
-    // Host-side tensor ledger for D2H copy-back at finalize. Populated by
-    // runtime_maker.cpp from orch_args at bind time, then iterated in
-    // validate_runtime_impl. Not read by AICPU/AICore — the device-side
+    // Host-side tensor ledger for the run's H2D and D2H transfers. Populated
+    // by runtime_maker.cpp from orch_args at bind time, iterated by
+    // copy_back_run_outputs_impl and released by release_run_bindings_impl.
+    // Not read by AICPU/AICore — the device-side
     // Runtime image also carries the host-only std::vector control block, which
     // device code must not inspect. No fixed cap — grows with the chip-level
     // entry-tensor count.

@@ -102,7 +102,36 @@ extern "C" {
  * Runtime Implementation Functions (defined in each runtime's runtime_maker.cpp)
  * =========================================================================== */
 int register_callable_impl(const ChipCallable *callable, const HostApi *api, CallableArtifacts *out);
-int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc);
+/**
+ * One run's input staging: copy each input-bearing binding's current host bytes
+ * into the device buffer the bind gave it.
+ *
+ * Separate from the bind because the bind settles which device buffer each
+ * caller tensor uses, not what is in it. This adapter calls it from
+ * `simpler_prepare_run`, after the bind. A runtime whose host orchestrator reads
+ * the inputs while it builds the graph stages them inside its own bind and
+ * implements this as a no-op.
+ */
+int copy_in_run_inputs_impl(const Runtime *runtime, const HostApi *api);
+/**
+ * One run's result inspection: read the device-side runtime status when it
+ * failed on the device, then copy every written tensor back to the caller's
+ * buffers.
+ *
+ * Releases nothing, so that reading a run's results and retiring the device
+ * memory behind them are separately orderable — which is what a partially
+ * submitted run needs, where the results are readable but the bindings must be
+ * retained until quiescence is proven. `launched` distinguishes a run that
+ * reached a stream, and whose device-side status is therefore readable, from one
+ * that never did; it is an argument rather than an inference from the image so
+ * that a failing prepare does not have to mutate what it was about to publish.
+ */
+int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi *api, int execution_rc, int launched);
+/**
+ * End the tensor bindings the bind recorded, releasing each the way its
+ * provenance requires.
+ */
+int release_run_bindings_impl(Runtime *runtime, const HostApi *api);
 __attribute__((weak)) int concurrent_native_prepare_supported_impl(void) { return 0; }
 __attribute__((weak)) int prepared_run_config_compatible_impl(
     const HostApi * /*api*/, const uint64_t * /*ring_task_window*/, const uint64_t * /*ring_heap*/,
@@ -828,19 +857,21 @@ static void report_terminal_disagreement(const OnboardNativeRunContext *state, i
     }
 }
 
-static int cleanup_failed_prepare(OnboardNativeRunContext *state, int execution_rc, bool clear_gm_sm) {
+static int cleanup_failed_prepare(OnboardNativeRunContext *state, int execution_rc) {
     const uint64_t trace_inv = state->trace_inv;
     const uint64_t trace_hid = state->trace_hid;
     const long long trace_start_ns = state->trace_start_ns;
     char trace_attrs[sizeof(state->trace_attrs)];
     std::memcpy(trace_attrs, state->trace_attrs, sizeof(trace_attrs));
-    if (clear_gm_sm) state->runtime.set_gm_sm_ptr(nullptr);
     state->runner->finish_clock_correlation_session(
         state->descriptor.pipeline_slot, false, !state->runner->can_accept_run()
     );
+    // A prepare that failed produced no device work, so there is no status to
+    // read and nothing written to copy back. Whatever bindings its bind got as
+    // far as recording are this attempt's, and end with it.
     int validation_rc = PTO_RUNTIME_ERR_INTERNAL;
     try {
-        validation_rc = validate_runtime_impl(&state->runtime, &state->host_api, execution_rc);
+        validation_rc = release_run_bindings_impl(&state->runtime, &state->host_api);
     } catch (...) {
         validation_rc = PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -942,7 +973,7 @@ int simpler_prepare_run(
         STRACE_CONTEXT(state->trace_inv, state->trace_hid, 1);
 
         int rc = runner->attach_current_thread(runner->device_id());
-        if (rc != 0) return cleanup_failed_prepare(state, rc, true);
+        if (rc != 0) return cleanup_failed_prepare(state, rc);
 
         if (overlaps_active_run) {
             // The probe exists to protect a *shared* arena bank, so require it
@@ -984,16 +1015,16 @@ int simpler_prepare_run(
                         state->trace_attrs
                     );
                 }
-                return cleanup_failed_prepare(state, compatibility_rc, true);
+                return cleanup_failed_prepare(state, compatibility_rc);
             }
         }
 
         state->runner_resources_owned = true;
         rc = runner->provision_native_run_resources(state->descriptor.pipeline_slot);
-        if (rc != 0) return cleanup_failed_prepare(state, rc, true);
+        if (rc != 0) return cleanup_failed_prepare(state, rc);
 
         rc = runner->prepare_launch_shape(state->runtime, state->config);
-        if (rc != 0) return cleanup_failed_prepare(state, rc, true);
+        if (rc != 0) return cleanup_failed_prepare(state, rc);
 
         // Latches what a device-context query answers from. Skipped for a
         // successor prepared against an active predecessor, whose configuration
@@ -1018,17 +1049,26 @@ int simpler_prepare_run(
                 state->config.runtime_env.ring_heap, state->config.runtime_env.ring_dep_pool
             );
         }
-        if (rc != 0) return cleanup_failed_prepare(state, rc, true);
+        if (rc != 0) return cleanup_failed_prepare(state, rc);
         emit_host_dep_gen_graph(state->config, state->trace_attrs);
+        // This run's own input bytes, into the buffers its bind just named.
+        {
+            STRACE("chip.run.stage_inputs");
+            rc = copy_in_run_inputs_impl(&state->runtime, &state->host_api);
+        }
+        if (rc != 0) {
+            LOG_ERROR("simpler_prepare_run: staging this run's inputs failed: %d (%s)", rc, state->trace_attrs);
+            return cleanup_failed_prepare(state, rc);
+        }
         rc = runner->prepare_execution(
             state->runtime, state->config, state->descriptor.pipeline_slot, state->identity(),
             &state->prepared_execution
         );
-        if (rc != 0) return cleanup_failed_prepare(state, rc, true);
+        if (rc != 0) return cleanup_failed_prepare(state, rc);
         state->runner_resources_owned = false;
         return 0;
     } catch (...) {
-        if (state != nullptr) return cleanup_failed_prepare(state, PTO_RUNTIME_ERR_INTERNAL, true);
+        if (state != nullptr) return cleanup_failed_prepare(state, PTO_RUNTIME_ERR_INTERNAL);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 }
@@ -1163,8 +1203,8 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     // that must be drained, whose rc is the run's result, and whose runtime
     // holds a live GM/SM pointer, from one that never touched a stream.
     const bool launched = state->active_execution != nullptr;
-    // Both drain_execution() and validate_runtime_impl() touch the device, so
-    // the attach covers each of them. rtSetDevice is idempotent on an
+    // Both drain_execution() and copy_back_run_outputs_impl() touch the device,
+    // so the attach covers each of them. rtSetDevice is idempotent on an
     // already-attached thread.
     int attach_rc = PTO_RUNTIME_ERR_INTERNAL;
     try {
@@ -1193,7 +1233,6 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
 
     int validation_rc = PTO_RUNTIME_ERR_INTERNAL;
     try {
-        if (!launched) state->runtime.set_gm_sm_ptr(nullptr);
         if (attach_rc == 0) {
             // Immediately before the consumer, and after whichever drain
             // completed the run — `simpler_wait_run` may have done it, leaving
@@ -1208,9 +1247,14 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
             }
             {
                 STRACE("chip.run.validate");
-                validation_rc = validate_runtime_impl(
-                    &state->runtime, &state->host_api, launched ? execution_rc : PTO_RUNTIME_ERR_INTERNAL
+                validation_rc = copy_back_run_outputs_impl(
+                    &state->runtime, &state->host_api, launched ? execution_rc : PTO_RUNTIME_ERR_INTERNAL,
+                    launched ? 1 : 0
                 );
+                // This run is the only user of its bindings, so they end here,
+                // after its outputs have come back through them.
+                const int release_rc = release_run_bindings_impl(&state->runtime, &state->host_api);
+                if (validation_rc == 0) validation_rc = release_rc;
             }
             if (launched && execution_rc == 0) {
                 emit_device_phase_markers(state->runner, state->descriptor.pipeline_slot);

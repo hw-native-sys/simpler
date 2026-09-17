@@ -8,14 +8,15 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-// Host-side fake HostApi tests for TRB bind/validate tensor leases.
+// Host-side fake HostApi tests for TRB tensor leases: what the bind records,
+// what each half of the run's tensor IO then does with it.
 //
 // The retained temporary buffer's grow/pack/slice logic lives entirely in
 // runtime_maker.cpp (file-local RetainedTempBump). The platform side is just a
 // {addr, size} slot exposed via get/set_retained_temp_buffer, and the buffer
 // is grown through the ordinary device_malloc/device_free callbacks. So these
-// end-to-end bind/validate tests exercise the real grow/reuse logic while the
-// fake only remembers the slot and records malloc/copy counts.
+// end-to-end tests exercise the real grow/reuse logic while the fake only
+// remembers the slot and records malloc/copy counts.
 
 #include <algorithm>
 #include <array>
@@ -47,7 +48,9 @@ extern "C" int bind_callable_to_runtime_impl(
     const ArgDirection *signature, int sig_count, const uint64_t *ring_task_window, const uint64_t *ring_heap,
     const uint64_t *ring_dep_pool
 );
-extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc);
+extern "C" int copy_in_run_inputs_impl(const Runtime *runtime, const HostApi *api);
+extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi *api, int execution_rc, int launched);
+extern "C" int release_run_bindings_impl(Runtime *runtime, const HostApi *api);
 extern "C" int concurrent_native_prepare_supported_impl(void);
 extern "C" int prepared_run_config_compatible_impl(
     const HostApi *api, const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool
@@ -249,6 +252,15 @@ ChipStorageTaskArgs make_args(std::vector<uint8_t> &input, std::vector<uint8_t> 
     return args;
 }
 
+// A HOST tensor with a size and no address. `init_external` accepts it and the
+// bind gives it a real device slice, so it is reachable through the native API.
+ChipTensor null_source_tensor(size_t bytes) {
+    ChipTensor tensor;
+    uint32_t shape[1] = {static_cast<uint32_t>(bytes)};
+    tensor.init_external(nullptr, bytes, shape, 1, DataType::UINT8, AddressSpace::HOST);
+    return tensor;
+}
+
 int bind_runtime(
     Runtime &runtime, const HostApi &api, const ChipStorageTaskArgs &args, const ArgDirection *signature, int sig_count
 ) {
@@ -270,6 +282,16 @@ protected:
 
     Runtime make_runtime() { return Runtime{}; }
 
+    int stage_inputs(Runtime &runtime) { return copy_in_run_inputs_impl(&runtime, &api_); }
+
+    // The two halves the c_api calls back to back for a run it is finalizing:
+    // read the results, then end the bindings they came back through.
+    int finish_run(Runtime &runtime, int execution_rc, int launched = 1) {
+        const int rc = copy_back_run_outputs_impl(&runtime, &api_, execution_rc, launched);
+        const int release_rc = release_run_bindings_impl(&runtime, &api_);
+        return rc != 0 ? rc : release_rc;
+    }
+
     FakeHostApi fake_;
     HostApi api_ = make_host_api();
 };
@@ -288,7 +310,7 @@ TEST_F(TrbRuntimeTempBufferTest, SuccessfulValidateCopiesOnlyOutputTensor) {
     ASSERT_EQ(runtime.tensor_leases_.size(), 1u);
     std::memset(runtime.tensor_leases_[0].dev_ptr, 0x2a, output.size());
 
-    ASSERT_EQ(validate_runtime_impl(&runtime, &api_, 0), 0);
+    ASSERT_EQ(finish_run(runtime, 0), 0);
     EXPECT_EQ(fake_.copy_from_count, 1);
     EXPECT_TRUE(std::all_of(output.begin(), output.end(), [](uint8_t value) {
         return value == 0x2a;
@@ -308,7 +330,7 @@ TEST_F(TrbRuntimeTempBufferTest, FailedExecutionCopiesRuntimeStatus) {
     ASSERT_NE(header, nullptr);
     header->orch_error_code.store(SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, std::memory_order_relaxed);
 
-    EXPECT_EQ(validate_runtime_impl(&runtime, &api_, -1), -SIMPLER_ERROR_EXPLICIT_ORCH_FATAL);
+    EXPECT_EQ(finish_run(runtime, -1), -SIMPLER_ERROR_EXPLICIT_ORCH_FATAL);
     EXPECT_EQ(fake_.copy_from_count, 1);
 }
 
@@ -326,7 +348,7 @@ TEST_F(TrbRuntimeTempBufferTest, FailedExecutionWithoutDeviceStatusSkipsTensorCo
 
     // A stream/bind failure may happen before the device publishes a
     // status. The one D2H is the diagnostic header; tensor data stays untouched.
-    EXPECT_EQ(validate_runtime_impl(&runtime, &api_, -1), 0);
+    EXPECT_EQ(finish_run(runtime, -1), 0);
     EXPECT_EQ(fake_.copy_from_count, 1);
     EXPECT_TRUE(std::all_of(output.begin(), output.end(), [](uint8_t value) {
         return value == 0;
@@ -348,9 +370,13 @@ TEST_F(TrbRuntimeTempBufferTest, TemporaryBufferSlicesWithoutChangingCopies) {
     EXPECT_EQ(fake_.device_malloc_count, 1);
     // Over-sized by the headroom RetainedTempBump may spend aligning its base.
     EXPECT_EQ(fake_.retained_size, align_up(64, kAlign) * 2 + kAlign - 1);
-    EXPECT_EQ(fake_.copy_to_count, 2);
+    // One H2D, and it is the runtime arena image: the bind names the tensors'
+    // buffers and moves none of their bytes.
+    EXPECT_EQ(fake_.copy_to_count, 1);
     EXPECT_EQ(fake_.device_memset_count, 0);
-    ASSERT_EQ(validate_runtime_impl(&buffer_runtime, &api_, 0), 0);
+    ASSERT_EQ(stage_inputs(buffer_runtime), 0);
+    EXPECT_EQ(fake_.copy_to_count, 2);
+    ASSERT_EQ(finish_run(buffer_runtime, 0), 0);
     // Retained buffer is NOT freed at end of run — it lives on the slot.
     EXPECT_EQ(fake_.device_free_count, 0);
     EXPECT_EQ(fake_.copy_from_count, 1);
@@ -366,13 +392,13 @@ TEST_F(TrbRuntimeTempBufferTest, SecondSameShapeRunReusesRetainedBuffer) {
     fake_.reset();
     Runtime run1 = make_runtime();
     ASSERT_EQ(bind_runtime(run1, api_, args, signature, 2), 0);
-    ASSERT_EQ(validate_runtime_impl(&run1, &api_, 0), 0);
+    ASSERT_EQ(finish_run(run1, 0), 0);
     EXPECT_EQ(fake_.device_malloc_count, 1);
     void *first_addr = fake_.retained_addr;
 
     Runtime run2 = make_runtime();
     ASSERT_EQ(bind_runtime(run2, api_, args, signature, 2), 0);
-    ASSERT_EQ(validate_runtime_impl(&run2, &api_, 0), 0);
+    ASSERT_EQ(finish_run(run2, 0), 0);
     // Same shape → no new allocation, same retained buffer.
     EXPECT_EQ(fake_.device_malloc_count, 1);
     EXPECT_EQ(fake_.device_free_count, 0);
@@ -388,7 +414,7 @@ TEST_F(TrbRuntimeTempBufferTest, LargerRunGrowsSmallerRunKeepsBuffer) {
     ChipStorageTaskArgs small = make_args(small_in, small_out);
     Runtime run1 = make_runtime();
     ASSERT_EQ(bind_runtime(run1, api_, small, signature, 2), 0);
-    ASSERT_EQ(validate_runtime_impl(&run1, &api_, 0), 0);
+    ASSERT_EQ(finish_run(run1, 0), 0);
     EXPECT_EQ(fake_.device_malloc_count, 1);
     // Over-sized by the headroom RetainedTempBump may spend aligning its base.
     EXPECT_EQ(fake_.retained_size, align_up(64, kAlign) * 2 + kAlign - 1);
@@ -399,7 +425,7 @@ TEST_F(TrbRuntimeTempBufferTest, LargerRunGrowsSmallerRunKeepsBuffer) {
     ChipStorageTaskArgs big = make_args(big_in, big_out);
     Runtime run2 = make_runtime();
     ASSERT_EQ(bind_runtime(run2, api_, big, signature, 2), 0);
-    ASSERT_EQ(validate_runtime_impl(&run2, &api_, 0), 0);
+    ASSERT_EQ(finish_run(run2, 0), 0);
     EXPECT_EQ(fake_.device_malloc_count, 2);
     EXPECT_EQ(fake_.device_free_count, 1);
     EXPECT_EQ(fake_.retained_size, align_up(4096, kAlign) * 2 + kAlign - 1);
@@ -408,7 +434,7 @@ TEST_F(TrbRuntimeTempBufferTest, LargerRunGrowsSmallerRunKeepsBuffer) {
     // Smaller run again: retained buffer is big enough, no free/malloc.
     Runtime run3 = make_runtime();
     ASSERT_EQ(bind_runtime(run3, api_, small, signature, 2), 0);
-    ASSERT_EQ(validate_runtime_impl(&run3, &api_, 0), 0);
+    ASSERT_EQ(finish_run(run3, 0), 0);
     EXPECT_EQ(fake_.device_malloc_count, static_cast<int>(after_grow_mallocs));
     EXPECT_EQ(fake_.device_free_count, 1);
     EXPECT_EQ(fake_.retained_size, align_up(4096, kAlign) * 2 + kAlign - 1);
@@ -435,8 +461,191 @@ TEST_F(TrbRuntimeTempBufferTest, ChildMemoryIsPassThroughAndPureOutSkipsStaging)
     // runtime arena image upload that every bind performs.
     EXPECT_EQ(fake_.copy_to_count, 1);
     EXPECT_EQ(fake_.device_memset_count, 0);
-    ASSERT_EQ(validate_runtime_impl(&runtime, &api_, 0), 0);
+    // Staging has nothing to do either: an OUT tensor has no host content worth
+    // moving and a child-memory tensor was never given a slice.
+    ASSERT_EQ(stage_inputs(runtime), 0);
+    EXPECT_EQ(fake_.copy_to_count, 1);
+    ASSERT_EQ(finish_run(runtime, 0), 0);
     EXPECT_EQ(fake_.device_free_count, 0);
+}
+
+// The bind settles which device buffer each tensor gets; the run's own staging
+// step settles what is in it. If the bind still moved the bytes, the copy count
+// after it would already be 2.
+TEST_F(TrbRuntimeTempBufferTest, BindNamesTheBufferAndStagingMovesTheBytes) {
+    fake_.reset();
+    Runtime runtime = make_runtime();
+    std::vector<uint8_t> input(64, 7);
+    std::vector<uint8_t> output(64, 0);
+    ChipStorageTaskArgs args = make_args(input, output);
+    ArgDirection signature[2] = {ArgDirection::IN, ArgDirection::OUT};
+
+    ASSERT_EQ(bind_runtime(runtime, api_, args, signature, 2), 0);
+    ASSERT_EQ(runtime.tensor_leases_.size(), 2u);
+    EXPECT_TRUE(runtime.tensor_leases_[0].needs_copy_in);
+    EXPECT_FALSE(runtime.tensor_leases_[0].needs_copy_back);
+    EXPECT_FALSE(runtime.tensor_leases_[1].needs_copy_in);
+    EXPECT_TRUE(runtime.tensor_leases_[1].needs_copy_back);
+    EXPECT_EQ(fake_.copy_to_count, 1);
+
+    // A sentinel the staging has to overwrite, so the assertion below cannot
+    // pass on bytes that were already there.
+    std::memset(runtime.tensor_leases_[0].dev_ptr, 0xab, input.size());
+    ASSERT_EQ(stage_inputs(runtime), 0);
+    EXPECT_EQ(fake_.copy_to_count, 2);
+    EXPECT_EQ(std::memcmp(runtime.tensor_leases_[0].dev_ptr, input.data(), input.size()), 0);
+}
+
+// Staging reads the caller's buffer at the point the run owns it, so a caller
+// that rewrites its inputs between two runs of one bind gets the new values.
+TEST_F(TrbRuntimeTempBufferTest, StagingMovesWhateverTheCallerHoldsNow) {
+    fake_.reset();
+    Runtime runtime = make_runtime();
+    std::vector<uint8_t> input(64, 1);
+    ChipStorageTaskArgs args;
+    args.add_tensor(make_tensor(input));
+    ArgDirection signature[1] = {ArgDirection::IN};
+
+    ASSERT_EQ(bind_runtime(runtime, api_, args, signature, 1), 0);
+    ASSERT_EQ(runtime.tensor_leases_.size(), 1u);
+    void *slice = runtime.tensor_leases_[0].dev_ptr;
+    ASSERT_EQ(stage_inputs(runtime), 0);
+    EXPECT_EQ(static_cast<const uint8_t *>(slice)[0], 1);
+
+    std::fill(input.begin(), input.end(), 2);
+    ASSERT_EQ(stage_inputs(runtime), 0);
+    EXPECT_EQ(static_cast<const uint8_t *>(slice)[0], 2);
+    EXPECT_EQ(slice, runtime.tensor_leases_[0].dev_ptr) << "staging must not re-place the buffer";
+}
+
+// An input the kernel will read, whose device buffer no host bytes can reach,
+// must fail staging rather than be passed over. Skipping it would leave the
+// slice holding whatever it held before and report success, so the run would
+// consume those bytes as its input.
+TEST_F(TrbRuntimeTempBufferTest, StagingRejectsAnInputWithNoHostSource) {
+    fake_.reset();
+    Runtime runtime = make_runtime();
+    ChipStorageTaskArgs args;
+    args.add_tensor(null_source_tensor(64));
+    ArgDirection signature[1] = {ArgDirection::IN};
+
+    ASSERT_EQ(bind_runtime(runtime, api_, args, signature, 1), 0);
+    ASSERT_EQ(runtime.tensor_leases_.size(), 1u);
+    ASSERT_NE(runtime.tensor_leases_[0].dev_ptr, nullptr) << "the bind gave this input a real slice";
+    ASSERT_EQ(runtime.tensor_leases_[0].host_ptr, nullptr);
+    EXPECT_TRUE(runtime.tensor_leases_[0].needs_copy_in);
+    // A sentinel the staging would otherwise leave for the kernel to read.
+    std::memset(runtime.tensor_leases_[0].dev_ptr, 0xab, 64);
+    const int copies_before = fake_.copy_to_count;
+
+    EXPECT_NE(stage_inputs(runtime), 0) << "a null-source input was staged as a success";
+    EXPECT_EQ(fake_.copy_to_count, copies_before) << "no H2D can have been attempted from a null source";
+    // The bindings stay the caller's to release, as after any staging failure.
+    EXPECT_EQ(runtime.tensor_leases_.size(), 1u);
+    ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+    EXPECT_TRUE(runtime.tensor_leases_.empty());
+}
+
+// A pure OUTPUT tensor carries no input, so the same missing address is not an
+// error there: the kernel defines every byte it writes.
+TEST_F(TrbRuntimeTempBufferTest, StagingIgnoresAnOutputWithNoHostSource) {
+    fake_.reset();
+    Runtime runtime = make_runtime();
+    ChipStorageTaskArgs args;
+    args.add_tensor(null_source_tensor(64));
+    ArgDirection signature[1] = {ArgDirection::OUT};
+
+    ASSERT_EQ(bind_runtime(runtime, api_, args, signature, 1), 0);
+    ASSERT_EQ(runtime.tensor_leases_.size(), 1u);
+    EXPECT_FALSE(runtime.tensor_leases_[0].needs_copy_in);
+    const int copies_before = fake_.copy_to_count;
+
+    EXPECT_EQ(stage_inputs(runtime), 0);
+    EXPECT_EQ(fake_.copy_to_count, copies_before);
+    ASSERT_EQ(finish_run(runtime, 0), 0);
+}
+
+// Reading a run's results and retiring the memory behind them are separate
+// steps. A free during the copy-back would mean the two are still welded, and a
+// partially submitted run would have no way to keep its bindings.
+TEST_F(TrbRuntimeTempBufferTest, CopyBackLeavesTheBindingsForTheReleaseToEnd) {
+    fake_.reset();
+    Runtime runtime = make_runtime();
+    std::vector<uint8_t> output(64, 0);
+    ChipStorageTaskArgs args;
+    args.add_tensor(make_tensor(output));
+    ArgDirection signature[1] = {ArgDirection::OUT};
+
+    ASSERT_EQ(bind_runtime(runtime, api_, args, signature, 1), 0);
+    // An owned allocation alongside the retained slice, so the release has
+    // something to actually free.
+    std::vector<uint8_t> owned_host(32, 0);
+    void *owned = fake_device_malloc(nullptr, owned_host.size());
+    ASSERT_NE(owned, nullptr);
+    runtime.tensor_leases_.push_back(
+        {owned_host.data(), owned, owned_host.size(), false, false, TensorReleaseKind::Free}
+    );
+    const size_t lease_count = runtime.tensor_leases_.size();
+
+    ASSERT_EQ(copy_back_run_outputs_impl(&runtime, &api_, 0, 1), 0);
+    EXPECT_EQ(fake_.device_free_count, 0);
+    EXPECT_EQ(runtime.tensor_leases_.size(), lease_count);
+
+    ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+    EXPECT_EQ(fake_.device_free_count, 1) << "the owned allocation is the only lease the release frees";
+    EXPECT_TRUE(runtime.tensor_leases_.empty());
+    // The retained buffer is the slot's, not the run's.
+    EXPECT_NE(fake_.retained_addr, nullptr);
+}
+
+// A run that never reached a stream has no device-side status, and the shared
+// memory it would be read from belongs to whoever ran there last. `launched`
+// carries that fact, so nothing has to null a pointer in the image to say it.
+TEST_F(TrbRuntimeTempBufferTest, AnUnlaunchedRunReadsNoDeviceStatus) {
+    fake_.reset();
+    Runtime runtime = make_runtime();
+    std::vector<uint8_t> output(64, 0);
+    ChipStorageTaskArgs args;
+    args.add_tensor(make_tensor(output));
+    ArgDirection signature[1] = {ArgDirection::OUT};
+
+    ASSERT_EQ(bind_runtime(runtime, api_, args, signature, 1), 0);
+    auto *header = static_cast<SharedMemoryHeader *>(runtime.get_gm_sm_ptr());
+    ASSERT_NE(header, nullptr);
+    header->orch_error_code.store(SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, std::memory_order_relaxed);
+    void *const gm_sm_before = runtime.get_gm_sm_ptr();
+
+    EXPECT_EQ(copy_back_run_outputs_impl(&runtime, &api_, PTO_RUNTIME_ERR_INTERNAL, /*launched=*/0), 0);
+    EXPECT_EQ(fake_.copy_from_count, 0) << "an unlaunched run read device state";
+    EXPECT_EQ(runtime.get_gm_sm_ptr(), gm_sm_before) << "the image must survive a run that never launched";
+    EXPECT_EQ(runtime.tensor_leases_.size(), 1u);
+    ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+}
+
+// A staging failure leaves the run releasable: the bindings are the bind's, and
+// a partially staged input set is exactly when the caller must be able to end
+// them without having launched.
+TEST_F(TrbRuntimeTempBufferTest, FailedInputStagingKeepsTheRunsBindings) {
+    fake_.reset();
+    Runtime runtime = make_runtime();
+    std::vector<uint8_t> input(64, 9);
+    ChipStorageTaskArgs args;
+    args.add_tensor(make_tensor(input));
+    ArgDirection signature[1] = {ArgDirection::IN};
+
+    ASSERT_EQ(bind_runtime(runtime, api_, args, signature, 1), 0);
+    ASSERT_EQ(runtime.tensor_leases_.size(), 1u);
+    // The next H2D is this run's only input.
+    fake_.fail_copy_to_on_call = fake_.copy_to_count + 1;
+    EXPECT_EQ(stage_inputs(runtime), -7);
+
+    // The retained buffer lives on the slot and the lease is still the run's to
+    // release; the slice release is a no-op, so nothing is freed.
+    EXPECT_NE(fake_.retained_addr, nullptr);
+    EXPECT_EQ(runtime.tensor_leases_.size(), 1u);
+    ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+    EXPECT_EQ(fake_.device_free_count, 0);
+    EXPECT_TRUE(runtime.tensor_leases_.empty());
 }
 
 TEST_F(TrbRuntimeTempBufferTest, GrowAllocationFailureFailsBindWithoutLeak) {
@@ -455,8 +664,10 @@ TEST_F(TrbRuntimeTempBufferTest, GrowAllocationFailureFailsBindWithoutLeak) {
     EXPECT_TRUE(runtime.tensor_leases_.empty());
 }
 
-TEST_F(TrbRuntimeTempBufferTest, FailedCopyOnTemporaryPathDoesNotFreeRetainedBuffer) {
+TEST_F(TrbRuntimeTempBufferTest, FailedImageUploadDoesNotFreeRetainedBuffer) {
     fake_.reset();
+    // The bind's own H2D is the runtime arena image, and it is the first one a
+    // bind performs now that no tensor bytes move here.
     fake_.fail_copy_to_on_call = 1;
     Runtime runtime = make_runtime();
     std::vector<uint8_t> input(64, 9);
@@ -471,6 +682,8 @@ TEST_F(TrbRuntimeTempBufferTest, FailedCopyOnTemporaryPathDoesNotFreeRetainedBuf
     EXPECT_EQ(fake_.device_malloc_count, 1);
     EXPECT_EQ(fake_.device_free_count, 0);
     EXPECT_NE(fake_.retained_addr, nullptr);
+    // The lease the walk recorded before the failure is the caller's to release.
+    ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
     EXPECT_TRUE(runtime.tensor_leases_.empty());
 }
 
@@ -611,7 +824,7 @@ TEST_F(TrbRuntimeTempBufferTest, KernelRequirementsMatchRealBindWithoutQuerySide
     EXPECT_EQ(required_bytes(contract, PTO_PIPELINE_GM_HEAP), fake_.gm_heap.size());
     EXPECT_EQ(required_bytes(contract, PTO_PIPELINE_GM_SM), fake_.gm_sm.size());
     EXPECT_EQ(required_bytes(contract, PTO_PIPELINE_RUNTIME_IMAGE), fake_.runtime_arena.size());
-    ASSERT_EQ(validate_runtime_impl(&runtime, &api_, 0), 0);
+    ASSERT_EQ(finish_run(runtime, 0), 0);
 }
 
 TEST_F(TrbRuntimeTempBufferTest, LargestRingCountsOnlyReserveLayout) {

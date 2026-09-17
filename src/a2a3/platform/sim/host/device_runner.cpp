@@ -793,7 +793,7 @@ int DeviceRunner::finalize() {
 // Performance Profiling Implementation
 // =============================================================================
 
-int DeviceRunner::arm_collectors_for_run(Runtime &runtime, PreparedExecution &prepared) {
+int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecution &prepared) {
     const DfxRunConfig &dfx = prepared.dfx;
     const int num_aicore = prepared.num_aicore;
     const int launch_aicpu_num = prepared.launch_aicpu_num;
@@ -915,7 +915,7 @@ int DeviceRunner::init_chip_swimlane(
     return 0;
 }
 
-int DeviceRunner::init_args_dump(Runtime &runtime, int device_id, DumpArgsLevel dump_args_level) {
+int DeviceRunner::init_args_dump(const Runtime &runtime, int device_id, DumpArgsLevel dump_args_level) {
     int num_dump_threads = runtime.get_aicpu_thread_num();
 
     auto alloc_cb = [this](size_t size) -> void * {

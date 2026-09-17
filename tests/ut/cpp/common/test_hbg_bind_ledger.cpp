@@ -10,12 +10,13 @@
  */
 // host_build_graph bind: the tensor-lease ledger belongs to one run.
 //
-// validate_runtime_impl is the only consumer of the ledger and the only other
-// place that clears it, so a run whose validate never executes — a finalize
-// whose attach_current_thread failed — leaves its leases behind. Since the
-// staging slices come from a buffer the next bind re-slices from offset zero,
-// an inherited lease names a byte range that now belongs to a different tensor,
-// and validate copies those bytes back to the earlier run's host pointer.
+// copy_back_run_outputs_impl is the only consumer of the ledger, and
+// release_run_bindings_impl the only other place that clears it, so a run whose
+// finalize never runs either — one whose attach_current_thread failed — leaves
+// its leases behind. Since the staging slices come from a buffer the next bind
+// re-slices from offset zero, an inherited lease names a byte range that now
+// belongs to a different tensor, and the copy-back sends those bytes to the
+// earlier run's host pointer.
 //
 // bind therefore clears the ledger on entry. These tests drive the real
 // bind_callable_to_runtime_impl against a fake HostApi; no orchestration .so is
@@ -43,7 +44,9 @@ extern "C" int bind_callable_to_runtime_impl(
     const ArgDirection *signature, int sig_count, const uint64_t *ring_task_window, const uint64_t *ring_heap,
     const uint64_t *ring_dep_pool
 );
-extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc);
+extern "C" int copy_in_run_inputs_impl(const Runtime *runtime, const HostApi *api);
+extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi *api, int execution_rc, int launched);
+extern "C" int release_run_bindings_impl(Runtime *runtime, const HostApi *api);
 
 namespace {
 
@@ -204,6 +207,13 @@ protected:
         return bind_callable_to_runtime_impl(&rt, &api_, &args, &eps_, sig, n, win, nullptr, nullptr);
     }
 
+    // The two halves the c_api calls back to back for a run it is finalizing.
+    int finish_run(Runtime &rt, int execution_rc, int launched = 1) {
+        const int rc = copy_back_run_outputs_impl(&rt, &api_, execution_rc, launched);
+        const int release_rc = release_run_bindings_impl(&rt, &api_);
+        return rc != 0 ? rc : release_rc;
+    }
+
     FakeHostApi fake_;
     HostApi api_{nullptr, 0, 0, 0, &fake_ops()};
     TestHostOrchEntryPoints eps_{empty_orch_entry, empty_orch_bind};
@@ -245,7 +255,7 @@ TEST_F(HbgBindLedgerTest, SecondBindDoesNotInheritTheFirstBindsLeases) {
     ASSERT_EQ(bind(runtime, args_a, sig, 1), 0);
     ASSERT_EQ(runtime.tensor_leases_.size(), 1u);
 
-    // No validate_runtime_impl here: this is the finalize-attach-failure shape.
+    // No copy-back here: this is the finalize-attach-failure shape.
     std::vector<uint8_t> second(64, 0x22);
     ChipStorageTaskArgs args_b;
     args_b.add_tensor(host_tensor(second));
@@ -255,8 +265,8 @@ TEST_F(HbgBindLedgerTest, SecondBindDoesNotInheritTheFirstBindsLeases) {
     EXPECT_EQ(runtime.tensor_leases_[0].host_ptr, second.data());
 }
 
-// What the stale lease would actually do: validate copies every recorded slice
-// back, so an inherited lease writes this run's bytes into the previous run's
+// What the stale lease would actually do: the copy-back walks every recorded
+// slice, so an inherited lease writes this run's bytes into the previous run's
 // caller buffer.
 TEST_F(HbgBindLedgerTest, ValidateAfterARebindLeavesTheEarlierRunsBufferAlone) {
     Runtime runtime;
@@ -280,7 +290,7 @@ TEST_F(HbgBindLedgerTest, ValidateAfterARebindLeavesTheEarlierRunsBufferAlone) {
         std::memset(lease.dev_ptr, 0x5a, 64);
     }
 
-    ASSERT_EQ(validate_runtime_impl(&runtime, &api_, 0), 0);
+    ASSERT_EQ(finish_run(runtime, 0), 0);
     EXPECT_EQ(second, std::vector<uint8_t>(64, 0x5a));
     EXPECT_EQ(first, first_before) << "the earlier run's host buffer was overwritten by this run's bytes";
 }

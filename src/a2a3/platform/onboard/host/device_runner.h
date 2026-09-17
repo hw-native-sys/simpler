@@ -337,7 +337,7 @@ private:
      * rebuilds them. Neither is safe while another run is executing against
      * them, which is why none of it happens during preparation.
      */
-    int arm_collectors_for_run(Runtime &runtime, PreparedExecution &prepared);
+    int arm_collectors_for_run(const Runtime &runtime, PreparedExecution &prepared);
 
     int init_chip_swimlane(
         int num_aicore, int aicpu_thread_num, int device_id, KernelArgsHelper &kernel_args,
@@ -354,7 +354,8 @@ private:
      * @param device_id Device ID for host registration
      * @return 0 on success, error code on failure
      */
-    int init_args_dump(Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, DumpArgsLevel dump_args_level);
+    int
+    init_args_dump(const Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, DumpArgsLevel dump_args_level);
 
     /**
      * Initialize PMU streaming shared memory.

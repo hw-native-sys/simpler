@@ -63,10 +63,10 @@ private:
      * device. Mirrors the onboard runner, where the claim is what keeps a
      * shape-driven pool release off a live predecessor.
      */
-    int arm_collectors_for_run(Runtime &runtime, PreparedExecution &prepared);
+    int arm_collectors_for_run(const Runtime &runtime, PreparedExecution &prepared);
 
     int init_chip_swimlane(int num_aicore, int aicpu_thread_num, int device_id, ChipSwimlaneLevel chip_swimlane_level);
-    int init_args_dump(Runtime &runtime, int device_id, DumpArgsLevel dump_args_level);
+    int init_args_dump(const Runtime &runtime, int device_id, DumpArgsLevel dump_args_level);
     int init_pmu(int num_cores, int num_threads, int device_id);
     int init_scope_stats(int num_threads);
     int init_dep_gen(int num_threads, int device_id);

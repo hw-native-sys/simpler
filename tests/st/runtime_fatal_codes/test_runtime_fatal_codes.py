@@ -23,7 +23,7 @@ Two host behaviours are exercised, because they genuinely differ:
   wins the race and masks the real code with a generic CANN ``507xxx``; the
   device-classified info (orchestrator code, the #1180 ``sub_class`` for the
   scheduler stall, or the async ``sched_error_code``) still reaches the host via
-  the ``validate_runtime_impl`` log line. That race is the exact scenario #1180
+  the ``copy_back_run_outputs_impl`` log line. That race is the exact scenario #1180
   exists for and only hardware reproduces it; the onboard test therefore asserts
   on the host log rather than the masked exception code.
 """
@@ -84,7 +84,7 @@ def _wait_for_host_log(capfd, markers: tuple[str, ...], dropped_before: int, tim
 #   code       : runtime status the host reports in sim (orch_error_code or sched_error_code)
 #   runtime_env: CallConfig.runtime_env overrides that pin the offending resource small
 #   kernel     : AIV kernel (rel to kernels/) for the async cases, else None
-#   marker     : substring of the validate_runtime_impl host-log line proving the
+#   marker     : substring of the copy_back_run_outputs_impl host-log line proving the
 #                device error class reached the host (the assertion that holds on
 #                both sim and onboard, even when onboard masks the code as 507xxx)
 #   explain    : SIMPLER_ERROR_* name the "error detail:" annotation line must carry, so

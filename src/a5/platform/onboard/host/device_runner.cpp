@@ -1095,7 +1095,7 @@ int DeviceRunner::ensure_aicore_reg_table() {
     return 0;
 }
 
-int DeviceRunner::arm_collectors_for_run(Runtime &runtime, PreparedExecution &prepared) {
+int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecution &prepared) {
     const DfxRunConfig &dfx = prepared.dfx;
     const int num_aicore = prepared.num_aicore;
     const int active_aicpu_num = prepared.launch_aicpu_num;
@@ -1216,7 +1216,7 @@ int DeviceRunner::init_chip_swimlane(
 }
 
 int DeviceRunner::init_args_dump(
-    Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, DumpArgsLevel dump_args_level
+    const Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, DumpArgsLevel dump_args_level
 ) {
     int num_dump_threads = runtime.get_aicpu_thread_num();
 

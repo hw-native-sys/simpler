@@ -20,12 +20,14 @@
  *
  * bind_callable_to_runtime_impl:
  *   - Gives host-memory tensor arguments slices of the pipeline slot's retained
- *     temporary buffer (all readable inputs copied H2D; only OUTPUT/INOUT
- *     tensors are copied back D2H) and records one lease each
+ *     temporary buffer, copies every readable input H2D, and records one lease
+ *     each with its transfer directions. The copy is here rather than in
+ *     copy_in_run_inputs_impl because the orchestration entry below reads these
+ *     tensors while it builds the graph
  *   - Runs the resolved orchestration entry to build the graph
  *   - Sets up runtime state for host orchestration
  *
- * validate_runtime_impl:
+ * copy_back_run_outputs_impl / release_run_bindings_impl:
  *   - Copies OUTPUT/INOUT tensors back from device to host (read-only inputs
  *     are skipped)
  *   - Releases the run's leases. The slices are no-ops: the retained buffer
@@ -365,7 +367,7 @@ static bool resolve_graph_task_capacity(const uint64_t *ring_task_window, uint64
     return true;
 }
 
-static int32_t read_runtime_status(Runtime *runtime, const HostApi *api, SharedMemoryHeader *host_header) {
+static int32_t read_runtime_status(const Runtime *runtime, const HostApi *api, SharedMemoryHeader *host_header) {
     if (runtime == nullptr || api == nullptr || host_header == nullptr) {
         return 0;
     }
@@ -1913,9 +1915,13 @@ extern "C" int bind_callable_to_runtime_impl(
         // Pure write-only OUTPUT buffers are never read by the kernel and hold
         // no meaningful host content, so they need no copy-in — the
         // kernel defines what it writes and any unwritten bytes are undefined.
-        // IN / INOUT (read-before-write) are copied in H2D.
+        // IN / INOUT (read-before-write) are copied in H2D. The copy happens here
+        // rather than in copy_in_run_inputs_impl because the orchestrator below
+        // runs on the host and reads these tensors while it builds the graph;
+        // that function documents what makes the earlier copy sound.
         bool is_pure_output = (signature != nullptr && i < sig_count && signature[i] == ArgDirection::OUT);
-        if (!is_pure_output) {
+        bool needs_copy_in = !is_pure_output;
+        if (needs_copy_in) {
             int rc = api->copy_to_device(dev_ptr, host_ptr, size);
             if (rc != 0) {
                 LOG_ERROR("Failed to copy tensor %d in to the device", i);
@@ -1931,7 +1937,9 @@ extern "C" int bind_callable_to_runtime_impl(
         // tensor entries). Anything not provably IN keeps the safe default of
         // copying back.
         bool needs_copy_back = !(signature != nullptr && i < sig_count && signature[i] == ArgDirection::IN);
-        runtime->tensor_leases_.push_back({host_ptr, dev_ptr, size, needs_copy_back, TensorReleaseKind::BufferNoop});
+        runtime->tensor_leases_.push_back(
+            {host_ptr, dev_ptr, size, needs_copy_in, needs_copy_back, TensorReleaseKind::BufferNoop}
+        );
         LOG_DEBUG("  ChipTensor %d: %zu bytes at %p", i, size, dev_ptr);
 
         // host_build_graph runs the orchestrator on the host, which may read
@@ -1982,11 +1990,6 @@ extern "C" int bind_callable_to_runtime_impl(
         snprintf(attrs, sizeof(attrs), "bytes=%" PRIu64, static_cast<uint64_t>(layout.arena_size));
         record_bind_phase(HostPhaseKind::BindArenaBuild, arena_build_phase, attrs);
     }
-
-    // The shared memory is placed at the end of orchestration, so until then this
-    // bind has none. Clearing the pointer keeps a failure before that point from
-    // leaving the previous bind's address for the error-code read to follow.
-    runtime->set_gm_sm_ptr(nullptr);
 
     // Set up orchestration state (consumed by the host orchestrator below)
     runtime->set_orch_args(device_args);
@@ -2075,19 +2078,55 @@ extern "C" int bind_callable_to_runtime_impl(
 }
 
 /**
- * Validate runtime results and cleanup.
+ * Stage one run's inputs. A no-op for this runtime.
+ *
+ * host_build_graph runs its orchestrator on the host during bind, and that
+ * orchestrator reads the input tensors it was given while it builds the graph,
+ * so the bytes have to be in place before orchestration rather than after it —
+ * `bind_callable_to_runtime_impl` copies them there. What makes that sound is
+ * that a bind serves exactly one run: the graph this bind materializes carries
+ * the values it read, so the bytes and the graph belong to the same run.
+ */
+extern "C" int copy_in_run_inputs_impl(const Runtime * /*runtime*/, const HostApi * /*api*/) { return 0; }
+
+/**
+ * Release the tensor bindings the bind recorded, and the scheduler state its bind stood up.
+ *
+ * Its own entry rather than the tail of the copy-back, so that reading a run's
+ * results and retiring the device memory behind them are separately orderable.
+ */
+extern "C" int release_run_bindings_impl(Runtime *runtime, const HostApi *api) {
+    if (runtime == nullptr || api == nullptr) {
+        LOG_ERROR("release_run_bindings_impl: null runtime or HostApi");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    release_run_tensor_leases(runtime, api);
+    release_scheduler_state(runtime, api);
+    // The dispatch table is owned by bind_callable_to_runtime, which clears it
+    // before replaying the active callable's addresses. The chip-callable device
+    // buffer behind those addresses is pool-managed by DeviceRunner (keyed by
+    // content hash) and bulk-freed in DeviceRunner::finalize(), so re-running the
+    // same callable repeatedly does not re-upload.
+    return 0;
+}
+
+/**
+ * Inspect one run's results.
  *
  * This function:
- * 1. Copies recorded tensors from device back to host
- * 2. Frees device memory for recorded tensors
- * 3. Clears tensor pair state
+ * 1. Reads the device-side runtime status when the run failed on the device
+ * 2. Copies written tensors from device back to host
+ *
+ * It releases nothing; `release_run_bindings_impl` ends the bindings it reads.
  *
  * @param runtime       Pointer to Runtime
  * @param execution_rc  Device-runner drain status after successful enqueue,
  *                      or enqueue status on failure
+ * @param launched      Nonzero when this run reached a stream, and its
+ *                      device-side status is therefore readable
  * @return 0 on success, -1 on failure
  */
-extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc) {
+extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi *api, int execution_rc, int launched) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -2102,7 +2141,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
     LOG_INFO("=== Copying Results Back to Host ===");
 
     // Copy all recorded tensors from device back to host
-    TensorLease *tensor_leases = runtime->tensor_leases_.data();
+    const TensorLease *tensor_leases = runtime->tensor_leases_.data();
     int tensor_lease_count = static_cast<int>(runtime->tensor_leases_.size());
 
     LOG_INFO("ChipTensor leases to process: %d", tensor_lease_count);
@@ -2112,7 +2151,9 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
     SharedMemoryHeader host_header;
     memset(&host_header, 0, sizeof(host_header));
 
-    if (execution_rc != 0) {
+    // The shared-memory status is device state, readable only for a run that
+    // reached a stream.
+    if (execution_rc != 0 && launched != 0) {
         runtime_status = read_runtime_status(runtime, api, &host_header);
     }
     if (runtime_status != 0) {
@@ -2156,18 +2197,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
         }
     }
 
-    // Cleanup device tensors
-    LOG_INFO("=== Cleaning Up ===");
-    release_run_tensor_leases(runtime, api);
-    release_scheduler_state(runtime, api);
-
-    // The dispatch table is owned by bind_callable_to_runtime, which clears it
-    // before replaying the active callable's addresses. The chip-callable device
-    // buffer behind those addresses is pool-managed by DeviceRunner (keyed by
-    // content hash) and bulk-freed in DeviceRunner::finalize(), so re-running the
-    // same callable repeatedly does not re-upload.
-
-    LOG_INFO("=== Finalize Complete ===");
+    LOG_INFO("=== Result Copy-Back Complete ===");
 
     if (rc == 0 && runtime_status != 0) {
         rc = runtime_status;

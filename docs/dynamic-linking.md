@@ -252,7 +252,7 @@ Applies to all 4 runtime executors: a2a3 (hbg, tmr), a5 (hbg, tmr).
 | Host runtime | `ChipWorker::lib_handle_` | Per-init: dlopen in `init()`, dlclose in `finalize()` |
 | AICPU | `DeviceRunner::aicpu_so_handle_` | Per-init: loaded lazily by the first `prepare_execution()`, retained across runs, closed by `finalize()` |
 | AICore | `DeviceRunner::aicore_so_handle_` | Per-run: reloaded for the run's kernel binary, closed after a successful `drain_execution()` (or by final cleanup) |
-| Kernel | `DeviceRunner::func_id_to_addr_` (map by func_id) | Per-task: uploaded in `init_runtime_impl()`, removed in `validate_runtime_impl()` |
+| Kernel | `DeviceRunner::func_id_to_addr_` (map by func_id) | Per-task: uploaded in `init_runtime_impl()`, removed in `release_run_bindings_impl()` |
 | Orchestration | `AicpuExecutor::orch_so_handle_` | Per-run: loaded by orchestrator thread, closed by last thread in `deinit()` |
 
 ### Onboard
@@ -332,7 +332,8 @@ ChipWorker.run(handle, args, config)                   # public wrapper path
     simpler_wait_run(...)
       DeviceRunner::drain_execution(active)   join threads; close AICore SO
     simpler_finalize_run(...)
-      validate_runtime_impl(r)               copy results, remove kernels
+      copy_back_run_outputs_impl(r)          copy results
+      release_run_bindings_impl(r)           release leases, remove kernels
       state->~NativeRunContext()               destroys Runtime
 
 ChipWorker.finalize()

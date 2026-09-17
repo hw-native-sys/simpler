@@ -17,15 +17,21 @@
  * One host runtime's record of a caller tensor it gave a device buffer, shared
  * by every runtime that does so.
  *
- * A `Runtime` holds the run's leases so validate can copy written tensors back
- * and then release each one the way its provenance requires. The release kind
- * is what keeps that decision out of the release loop's hands: a bump slice and
- * an owned allocation are both a `dev_ptr`, and only the site that made it knows
- * which it handed over.
+ * A `Runtime` holds the run's leases so its outputs can be copied back and each
+ * one then released the way its provenance requires. The release kind is what
+ * keeps that decision out of the release loop's hands: a bump slice and an owned
+ * allocation are both a `dev_ptr`, and only the site that made it knows which it
+ * handed over.
+ *
+ * The two direction flags describe the binding, not one transfer: the site that
+ * records a lease settles *which* device buffer a caller tensor gets, and the
+ * bytes move in their own steps at each end of the execution. Neither the ledger
+ * nor the buffers behind it are consumed by a copy in either direction.
  *
  * Declared here rather than beside either `Runtime` because both are included
  * by AICore and AICPU translation units, which is also why this header pulls in
- * no host API: the release itself lives in `utils/tensor_lease_release.h`.
+ * no host API: the transfers themselves live in `utils/tensor_lease_copy_in.h`
+ * and the release in `utils/tensor_lease_release.h`.
  */
 enum class TensorReleaseKind {
     // device_free at end of run — the site that made it owns this allocation.
@@ -40,6 +46,10 @@ struct TensorLease {
     void *host_ptr;
     void *dev_ptr;
     size_t size;
+    // false for pure OUTPUT tensors: the kernel defines every byte it writes and
+    // the host content means nothing, so the start-of-execution H2D is skipped.
+    // IN / INOUT / unknown keep the safe default of copying in.
+    bool needs_copy_in = true;
     // false for read-only INPUT tensors: they are never written by the kernel,
     // so the end-of-run D2H copy-back is skipped. OUTPUT/INOUT/unknown
     // keep the safe default of copying back.
