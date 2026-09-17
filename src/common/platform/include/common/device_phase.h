@@ -59,6 +59,11 @@ enum class AicpuPhase : uint32_t {
     ConfigValidate,  // config_func() + arg-count validate
     ArenaWire,       // attach prebuilt runtime arena + wire device pointers
     SmReset,         // SM/ring reset + finalize + bind, up to releasing the schedulers
+    // Between the dispatch windows closing and graph_build returning, on every
+    // scheduler thread that owns cores. Fixed cardinality like the phases above:
+    // one stamp per run per thread, never per core or per poll. Appended (not
+    // reordered) so existing slot indices stay stable.
+    Shutdown,  // SchedulerContext::shutdown(): the AICore exit handshake
     Count,
 };
 
