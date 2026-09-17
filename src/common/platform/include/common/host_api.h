@@ -163,20 +163,31 @@ struct HostApiOps {
     bool (*publish_chip_swimlane_extension)(
         void *runner_ctx, ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size
     );
+    // This run's device-published result payload, or nullptr when the run
+    // published none. The platform holds one region per pipeline slot and never
+    // interprets the bytes — the layout is the runtime's own. `run_epoch` is the
+    // epoch the caller's run was given: a region still carrying an earlier run's
+    // epoch reads as absent, so a predecessor's payload cannot be returned as
+    // this run's. See common/device_run_result.h for why the region exists and
+    // for what "absent" does and does not mean.
+    const void *(*get_run_result)(void *runner_ctx, uint32_t pipeline_slot, uint64_t run_epoch, size_t *bytes_out);
 };
 
 /**
  * One run's binding of the immutable function table to a runner and that run's
- * slot/bank selection. Constructed per run and passed by const pointer into the
- * runtime impls; a callback reaches its runner and resources through the bound
- * members instead of a thread-local.
+ * slot/bank selection and epoch. Constructed per run and passed by const
+ * pointer into the runtime impls; a callback reaches its runner and resources
+ * through the bound members instead of a thread-local.
  */
 struct HostApi {
 public:
-    HostApi(void *runner_ctx, uint32_t pipeline_slot, uint32_t arena_bank, const HostApiOps *ops) noexcept :
+    HostApi(
+        void *runner_ctx, uint32_t pipeline_slot, uint32_t arena_bank, uint64_t run_epoch, const HostApiOps *ops
+    ) noexcept :
         runner_ctx_(runner_ctx),
         pipeline_slot_(pipeline_slot),
         arena_bank_(arena_bank),
+        run_epoch_(run_epoch),
         ops_(ops) {}
 
     void *device_malloc(size_t size) const { return ops_->device_malloc(runner_ctx_, size); }
@@ -292,10 +303,27 @@ public:
             return false;
         }
     }
+    /**
+     * What this run's device side published for the host to read, or nullptr
+     * when it published nothing. `*bytes_out` receives the payload length.
+     *
+     * Absent is not "succeeded": a producer publishes only what it wants
+     * preserved, so a run with nothing to report and a run that never reached
+     * its publish point both read as absent. A caller decides that a run failed
+     * from the execution error channel and comes here for the detail.
+     */
+    const void *run_result(size_t *bytes_out) const noexcept {
+        if (ops_->get_run_result == nullptr) {
+            if (bytes_out != nullptr) *bytes_out = 0;
+            return nullptr;
+        }
+        return ops_->get_run_result(runner_ctx_, pipeline_slot_, run_epoch_, bytes_out);
+    }
 
 private:
     void *runner_ctx_{nullptr};
     uint32_t pipeline_slot_{0};
     uint32_t arena_bank_{0};
+    uint64_t run_epoch_{0};
     const HostApiOps *ops_{nullptr};
 };

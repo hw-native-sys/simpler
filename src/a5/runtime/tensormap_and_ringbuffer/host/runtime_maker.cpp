@@ -227,6 +227,27 @@ static int32_t read_runtime_status(Runtime *runtime, const HostApi *api, SharedM
     return runtime_status_from_error_codes(orch_error_code, sched_error_code);
 }
 
+/**
+ * This run's own error tail, published by its device side into storage the run
+ * owns, or 0 when the run published none.
+ *
+ * Preferred over the shared header because it cannot have been overwritten: the
+ * device copied it before its kernel returned, hence before the fence that
+ * releases a successor to reset the header. `host_header` receives the tail at
+ * its own offset, leaving the rest zeroed, so every field the log lines below
+ * read resolves the same way as on the header path.
+ */
+static int32_t read_published_run_status(const HostApi *api, SharedMemoryHeader *host_header) {
+    if (api == nullptr || host_header == nullptr) return 0;
+    size_t bytes = 0;
+    const void *snapshot = api->run_result(&bytes);
+    if (snapshot == nullptr || bytes != SHARED_MEMORY_ERROR_TAIL_BYTES) return 0;
+    memcpy(reinterpret_cast<uint8_t *>(host_header) + SHARED_MEMORY_ERROR_TAIL_OFFSET, snapshot, bytes);
+    int32_t orch_error_code = host_header->orch_error_code.load(std::memory_order_relaxed);
+    int32_t sched_error_code = host_header->sched_error_code.load(std::memory_order_relaxed);
+    return runtime_status_from_error_codes(orch_error_code, sched_error_code);
+}
+
 static void release_run_tensor_leases(Runtime *runtime, const HostApi *api) {
     const TensorLeaseReleaseCounts counts = release_tensor_leases(runtime->tensor_leases_, api);
     LOG_DEBUG(
@@ -928,7 +949,22 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
     memset(&host_header, 0, sizeof(host_header));
 
     if (execution_rc != 0) {
-        runtime_status = read_runtime_status(runtime, api, &host_header);
+        runtime_status = read_published_run_status(api, &host_header);
+        if (runtime_status == 0) {
+            // No snapshot from this run, so fall back to the shared header. That
+            // read is only sound under the current single-launched contract:
+            // this run still holds its execution claim, no successor has been
+            // launched, and nothing has reset or rebuilt the shared memory since
+            // this run wrote it. Once P4 admits a launched successor the branch
+            // has to be reworked — an unproven read could then report the
+            // successor's header as this run's error. A run that published
+            // nothing keeps its execution error either way; only the diagnostic
+            // detail is missing.
+            runtime_status = read_runtime_status(runtime, api, &host_header);
+            if (runtime_status != 0) {
+                LOG_WARN("no error snapshot from this run; the failure detail below is read from the shared header");
+            }
+        }
     }
     if (runtime_status != 0) {
         int32_t orch_error_code = host_header.orch_error_code.load(std::memory_order_relaxed);

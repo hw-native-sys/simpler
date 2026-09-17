@@ -92,7 +92,7 @@ const HostApiOps kHostApiOps{
     .unregister_device_memory_from_host = record_unregister,
     .acquire_child_memory_host_view = record_child_memory_acquire,
 };
-const HostApi kHostApi(nullptr, 0, 0, &kHostApiOps);
+const HostApi kHostApi(nullptr, 0, 0, 0, &kHostApiOps);
 
 class HostTensorAccessTest : public ::testing::Test {
 protected:

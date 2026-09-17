@@ -362,7 +362,8 @@ def test_fatal_code_surfaces_on_sim(st_platform, st_device_ids, case_name, monke
 @pytest.mark.parametrize("case_name", list(CASES))
 def test_device_error_class_reaches_host_log(st_platform, st_device_ids, case_name, monkeypatch, capfd):
     """onboard: the watchdog may mask the code as 507xxx, but the device class still reaches the host log."""
-    configure_logging("error")
+    # warning, not error: the run-result fallback asserted below is a LOG_WARN.
+    configure_logging("warning")
     case = CASES[case_name]
     dropped_before = _host_log_dropped_records()
     worker, handle, config = _make_worker(st_platform, int(st_device_ids[0]), case_name, monkeypatch)
@@ -378,6 +379,14 @@ def test_device_error_class_reaches_host_log(st_platform, st_device_ids, case_na
             dropped_before,
         )
         _assert_annotated(log, case)
+        # The detail must come from the result the run's own device side
+        # published, not from the shared header a successor may already have
+        # reset. The runtime warns whenever it falls back to that header, and
+        # that warning is a real discriminator: disabling the device-side
+        # publish makes it fire on every case here.
+        assert "read from the shared header" not in log, (
+            "the failure detail came from the shared header, so this run published no result"
+        )
     finally:
         worker.close()
 

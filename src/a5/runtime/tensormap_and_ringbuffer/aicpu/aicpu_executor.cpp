@@ -25,6 +25,8 @@
 #include "aicpu/device_time.h"
 #include "aicpu/device_log.h"
 #include "aicpu/device_phase_aicpu.h"
+#include "aicpu/device_run_result_aicpu.h"
+#include "aicpu/device_run_result_base_aicpu.h"
 #include "aicpu/orch_so_file.h"
 #include "callable_protocol.h"
 #include "common/kernel_args.h"
@@ -93,6 +95,43 @@ static int32_t read_runtime_status(Runtime *runtime) {
     int32_t orch_error_code = header->orch_error_code.load(std::memory_order_acquire);
     int32_t sched_error_code = header->sched_error_code.load(std::memory_order_acquire);
     return runtime_status_from_error_codes(orch_error_code, sched_error_code);
+}
+
+// The error tail this run publishes, sized by the header's own layout so a new
+// field joins it without a change here.
+static_assert(
+    SHARED_MEMORY_ERROR_TAIL_BYTES <= DEVICE_RUN_RESULT_PAYLOAD_BYTES,
+    "the shared-memory error tail no longer fits one run's result region"
+);
+
+/**
+ * Preserve this run's error scene in storage the run owns.
+ *
+ * The shared header is reset by whichever run occupies the arena next, and the
+ * fence that lets the host return is the same fence that releases that
+ * successor — so a result left in the header is unreadable by the time the host
+ * looks. Copying it here, on the last thread out and before the kernel returns,
+ * puts the copy ahead of both.
+ *
+ * Publishes only on failure: the region preserves an error scene and is not a
+ * per-run status channel, so a successful run leaves the region carrying some
+ * earlier run's epoch, which the host reads as "no result from this run".
+ */
+static void publish_run_error_result(Runtime *runtime) {
+    if (runtime == nullptr) return;
+    void *sm = runtime->get_gm_sm_ptr();
+    if (sm == nullptr) return;
+    auto *header = static_cast<SharedMemoryHeader *>(sm);
+    if (runtime_status_from_error_codes(
+            header->orch_error_code.load(std::memory_order_acquire),
+            header->sched_error_code.load(std::memory_order_acquire)
+        ) == 0) {
+        return;
+    }
+    aicpu_publish_run_result(
+        get_platform_run_result_base(), get_platform_run_result_epoch(),
+        reinterpret_cast<const uint8_t *>(header) + SHARED_MEMORY_ERROR_TAIL_OFFSET, SHARED_MEMORY_ERROR_TAIL_BYTES
+    );
 }
 
 static RuntimeContext *rt{nullptr};
@@ -887,6 +926,14 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     // Check if this is the last thread to finish
     int32_t prev_finished = finished_count_.fetch_add(1, std::memory_order_acq_rel);
     if (prev_finished + 1 == aicpu_thread_num_) {
+        // Every other thread's error writes are visible here — the count is
+        // acq_rel and this is the thread that closed it — and nothing has torn
+        // the runtime down yet, so this is the one point where the run's final
+        // error state can be read and preserved. It has to precede
+        // `finished_`: that latch is what releases teardown, and the kernel
+        // return behind it is what releases a successor to reset the header
+        // this copies from.
+        publish_run_error_result(runtime);
         aicpu_publish_task_timing_tail_usage(aicpu_thread_num_);
         finished_.store(true, std::memory_order_release);
         // Destroy the runtime context. sm_handle / rt are recreated every run so we

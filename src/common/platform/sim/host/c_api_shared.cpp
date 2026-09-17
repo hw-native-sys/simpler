@@ -359,6 +359,10 @@ static const HostApiOps g_host_api_ops = {
     .host_phase_pool_arm = host_phase_pool_arm,
     .host_phase_pool_finish = host_phase_pool_finish,
     .publish_chip_swimlane_extension = publish_chip_swimlane_extension,
+    // The simulated AICPU runs in this process and shares the runtime's
+    // address space, so a run's result never has to leave a device: nothing
+    // allocates a result region and nothing publishes into one.
+    .get_run_result = nullptr,
 };
 
 /* ===========================================================================
@@ -504,7 +508,7 @@ int simpler_init(
     // runtimes link the weak no-op. Only the ring sizing is read.
     if (prewarm_config != NULL) {
         try {
-            const HostApi prewarm_api(runner, 0, 0, &g_host_api_ops);
+            const HostApi prewarm_api(runner, 0, 0, 0, &g_host_api_ops);
             rc = prewarm_config_impl(
                 &prewarm_api, prewarm_config->runtime_env.ring_task_window, prewarm_config->runtime_env.ring_heap,
                 prewarm_config->runtime_env.ring_dep_pool
@@ -536,7 +540,7 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
                 runner->release_chip_callable_buffer(artifacts.chip_buffer_hash);
             }
         });
-        const HostApi host_api(runner, 0, 0, &g_host_api_ops);
+        const HostApi host_api(runner, 0, 0, 0, &g_host_api_ops);
         int rc = register_callable_impl(reinterpret_cast<const ChipCallable *>(callable), &host_api, &artifacts);
         if (rc != 0) {
             return rc;

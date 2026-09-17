@@ -1991,6 +1991,18 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     }
     device_timing_armed_.fill(false);
 
+    // Same ordering constraint as the timing buffers above: free while
+    // mem_alloc_ and the device context are still live.
+    for (void *&slot_ptr : device_run_result_dev_ptrs_) {
+        if (slot_ptr == nullptr) continue;
+        if (!abandon_device_resources) {
+            free_tensor(slot_ptr);
+        }
+        slot_ptr = nullptr;
+    }
+    device_run_results_.fill(DeviceRunResultRegion{});
+    device_run_result_initialized_.fill(false);
+
     // The AICore register-address tables are device constants committed once per
     // device context, so this is where they are returned — same window and same
     // ordering constraint as the device-wall buffers above. Release keys on the
@@ -2169,6 +2181,81 @@ const DeviceRunnerBase::DeviceRunTiming &DeviceRunnerBase::device_run_timing(uin
 void DeviceRunnerBase::release_device_run_timing(uint32_t pipeline_slot) {
     if (pipeline_slot >= device_timing_armed_.size()) return;
     device_timing_armed_[pipeline_slot] = false;
+}
+
+const uint8_t *
+DeviceRunnerBase::device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, size_t *bytes_out) const {
+    if (bytes_out != nullptr) *bytes_out = 0;
+    if (pipeline_slot >= device_run_results_.size()) return nullptr;
+    const DeviceRunResultRegion &region = device_run_results_[pipeline_slot];
+    if (!device_run_result_published(region, run_epoch)) return nullptr;
+    if (bytes_out != nullptr) *bytes_out = region.payload_bytes;
+    return region.payload;
+}
+
+int DeviceRunnerBase::ensure_device_run_result_region(
+    uint32_t pipeline_slot, uint64_t run_epoch, KernelArgsHelper &kernel_args
+) {
+    kernel_args.args.run_result_data_base = 0;
+    kernel_args.args.run_result_epoch = 0;
+    if (pipeline_slot >= device_run_result_dev_ptrs_.size()) {
+        LOG_ERROR("run-result region: pipeline slot %u is out of range", pipeline_slot);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    // Epoch 0 would be indistinguishable from never-written device memory, so a
+    // run without one cannot be given a region it could later mis-read.
+    if (run_epoch == 0) {
+        LOG_ERROR("run-result region: run epoch 0 cannot be published");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    void *&slot_ptr = device_run_result_dev_ptrs_[pipeline_slot];
+    if (slot_ptr == nullptr) {
+        slot_ptr = allocate_tensor(device_run_result_bytes());
+        device_run_result_initialized_[pipeline_slot] = false;
+    }
+    if (slot_ptr == nullptr) {
+        // Failing prepare is the point. Launching anyway would run a device side
+        // with nowhere to put its result, and leave the host to read a region
+        // whose contents belong to nobody.
+        LOG_ERROR("run-result region: allocation failed for slot %u", pipeline_slot);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    // A fresh allocation has to be zeroed once. `allocate_tensor` is an
+    // `rtMalloc`: the bytes it returns are whatever the device left there, so
+    // `published` cannot be assumed to differ from the epoch this run is about
+    // to look for. Only the first use of an allocation pays this — steady-state
+    // reuse is distinguished by epoch and needs no per-run H2D.
+    if (!device_run_result_initialized_[pipeline_slot]) {
+        const uint64_t unpublished = 0;
+        if (copy_to_device(slot_ptr, &unpublished, sizeof(unpublished)) != 0) {
+            // Publish no base: a region whose `published` is still unknown could
+            // read back as this run's own epoch. The allocation stays so the
+            // next prepare on this slot retries the initialization.
+            LOG_ERROR("run-result region: initial clear failed for slot %u", pipeline_slot);
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        device_run_result_initialized_[pipeline_slot] = true;
+    }
+    kernel_args.args.run_result_data_base = reinterpret_cast<uint64_t>(slot_ptr);
+    kernel_args.args.run_result_epoch = run_epoch;
+    return 0;
+}
+
+void DeviceRunnerBase::read_device_run_result(uint32_t pipeline_slot) {
+    if (pipeline_slot >= device_run_results_.size()) return;
+    DeviceRunResultRegion &out = device_run_results_[pipeline_slot];
+    out = DeviceRunResultRegion{};
+    void *slot_ptr = device_run_result_dev_ptrs_[pipeline_slot];
+    if (slot_ptr == nullptr) return;
+    // The region is this slot's, and the slot is not handed to another run until
+    // the run holding it finalizes, so this read races nothing. What makes the
+    // payload this run's rather than a successor's is that its device side wrote
+    // and published it before its kernel returned.
+    int rc = rtMemcpy(&out, sizeof(out), slot_ptr, sizeof(out), RT_MEMCPY_DEVICE_TO_HOST);
+    if (rc != 0) {
+        LOG_WARN("rtMemcpy(run_result) D2H failed: %d", rc);
+        out = DeviceRunResultRegion{};
+    }
 }
 
 void DeviceRunnerBase::ensure_device_wall_buffer(uint32_t pipeline_slot, KernelArgsHelper &kernel_args) {

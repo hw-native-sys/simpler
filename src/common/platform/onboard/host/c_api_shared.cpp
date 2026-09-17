@@ -339,6 +339,17 @@ static void mark_prebuilt_runtime_arena_cached_wrapper(
     } catch (...) {}
 }
 
+static const void *get_run_result(void *runner_ctx, uint32_t pipeline_slot, uint64_t run_epoch, size_t *bytes_out) {
+    if (bytes_out != nullptr) *bytes_out = 0;
+    if (runner_ctx == nullptr) return nullptr;
+    try {
+        return static_cast<DeviceRunnerBase *>(runner_ctx)->device_run_result(pipeline_slot, run_epoch, bytes_out);
+    } catch (...) {
+        if (bytes_out != nullptr) *bytes_out = 0;
+        return nullptr;
+    }
+}
+
 // Weak no-op default lives in device_runner_base.cpp; tensormap_and_ringbuffer
 // links a strong override that builds + caches the prebuilt runtime-arena.
 // simpler_init calls it directly for the fork-constant ring sizing.
@@ -373,6 +384,7 @@ static const HostApiOps g_host_api_ops = {
     .host_phase_pool_arm = host_phase_pool_arm,
     .host_phase_pool_finish = host_phase_pool_finish,
     .publish_chip_swimlane_extension = publish_chip_swimlane_extension,
+    .get_run_result = get_run_result,
 };
 
 /* ===========================================================================
@@ -540,7 +552,7 @@ int simpler_init(
     // sizing is read.
     if (prewarm_config != NULL) {
         try {
-            const HostApi prewarm_api(runner, 0, 0, &g_host_api_ops);
+            const HostApi prewarm_api(runner, 0, 0, 0, &g_host_api_ops);
             rc = prewarm_config_impl(
                 &prewarm_api, prewarm_config->runtime_env.ring_task_window, prewarm_config->runtime_env.ring_heap,
                 prewarm_config->runtime_env.ring_dep_pool
@@ -575,7 +587,7 @@ static int record_callable_on_runner(
             runner->release_chip_callable_buffer(artifacts.chip_buffer_hash);
         }
     });
-    const HostApi host_api(runner, 0, 0, &g_host_api_ops);
+    const HostApi host_api(runner, 0, 0, 0, &g_host_api_ops);
     int rc = register_callable_impl(reinterpret_cast<const ChipCallable *>(callable), &host_api, &artifacts);
     if (rc != 0) return rc;
 
@@ -1142,6 +1154,19 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     try {
         if (!launched) state->runtime.set_gm_sm_ptr(nullptr);
         if (attach_rc == 0) {
+            // Immediately before the consumer, and after whichever drain
+            // completed the run — `simpler_wait_run` may have done it, leaving
+            // nothing for the catch-up drain above. Read only on the error path,
+            // because a failing run is the only thing a producer publishes
+            // today, so the gate is the channel that reports the failure: for a
+            // normal drain that is still the stream synchronize (#2267 is open).
+            // Whatever replaces that channel has to keep reaching here for a
+            // business error too — a run whose error never triggers the read
+            // reports no detail, and an unread region must not be mistaken for
+            // the absence of a failure.
+            if (launched && execution_rc != 0) {
+                state->runner->read_device_run_result(state->descriptor.pipeline_slot);
+            }
             {
                 STRACE("chip.run.validate");
                 validation_rc = validate_runtime_impl(

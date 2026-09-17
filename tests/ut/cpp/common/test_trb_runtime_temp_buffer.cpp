@@ -229,7 +229,7 @@ HostApi make_host_api() {
         .mark_prebuilt_runtime_arena_cached = fake_mark_prebuilt_runtime_arena_cached,
         .upload_chip_callable_buffer = fake_upload_chip_callable_buffer,
     };
-    return HostApi(nullptr, 0, 0, &ops);
+    return HostApi(nullptr, 0, 0, 0, &ops);
 }
 
 ChipTensor make_tensor(std::vector<uint8_t> &storage, bool child_memory = false) {

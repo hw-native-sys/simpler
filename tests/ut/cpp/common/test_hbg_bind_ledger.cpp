@@ -205,7 +205,7 @@ protected:
     }
 
     FakeHostApi fake_;
-    HostApi api_{nullptr, 0, 0, &fake_ops()};
+    HostApi api_{nullptr, 0, 0, 0, &fake_ops()};
     TestHostOrchEntryPoints eps_{empty_orch_entry, empty_orch_bind};
 };
 

@@ -170,6 +170,15 @@ static_assert(
     offsetof(SharedMemoryHeader, sched_stall_task_id) == 832, "SharedMemoryHeader sched_stall_task_id layout drift"
 );
 
+// The error-reporting tail as one contiguous range: `orch_error_code` through
+// the end of the header. A run publishes exactly this range into its own result
+// region, and the host overlays it back at the same offset of a zeroed header,
+// so neither side enumerates the fields and adding one needs no change on
+// either. The static_assert is the guard that keeps the tail last.
+constexpr size_t SHARED_MEMORY_ERROR_TAIL_OFFSET = offsetof(SharedMemoryHeader, orch_error_code);
+constexpr size_t SHARED_MEMORY_ERROR_TAIL_BYTES = sizeof(SharedMemoryHeader) - SHARED_MEMORY_ERROR_TAIL_OFFSET;
+static_assert(SHARED_MEMORY_ERROR_TAIL_BYTES == 112, "SharedMemoryHeader error tail is no longer the header's end");
+
 // =============================================================================
 // Shared Memory Handle
 // =============================================================================

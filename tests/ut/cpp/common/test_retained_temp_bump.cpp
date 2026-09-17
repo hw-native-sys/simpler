@@ -105,7 +105,7 @@ protected:
     }
 
     FakeSlot slot_;
-    HostApi api_{nullptr, 0, 0, &fake_ops()};
+    HostApi api_{nullptr, 0, 0, 0, &fake_ops()};
 };
 
 constexpr size_t kAlign = RetainedTempBump::kAlignment;

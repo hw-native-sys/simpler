@@ -58,6 +58,7 @@
 #include "call_config.h"
 #include "callable.h"
 #include "common/device_phase.h"
+#include "common/device_run_result.h"
 #include "common/dma_workspace.h"
 #include "common/chip_swimlane_profiling.h"
 #include "utils/device_arena.h"
@@ -518,6 +519,38 @@ public:
 
     /** Tick rate the two bounds above are expressed in (50 MHz a2a3, 1 GHz a5). */
     static uint64_t device_sys_cnt_frequency_hz() { return PLATFORM_PROF_SYS_CNT_FREQ; }
+
+    /**
+     * This slot's last run's device-published result payload, or `nullptr` when
+     * that run published none.
+     *
+     * `run_epoch` is the epoch of the run whose result is wanted: a region still
+     * holding an earlier run's epoch is reported as absent rather than returned,
+     * so a caller cannot read a predecessor's payload as this run's. `*bytes_out`
+     * receives the published length.
+     *
+     * Absent carries no further meaning. A producer publishes only when it has
+     * something to preserve, so a run that reported nothing and a run that never
+     * reached its publish point — one the op-execute watchdog reaped, say — both
+     * read as absent. This is therefore not a completion signal: a caller
+     * decides that a run failed from the execution error channel, and comes here
+     * for the detail. A missing result must not become a success, and must not
+     * be answered by reading shared device state, which by then may belong to a
+     * successor.
+     */
+    const uint8_t *device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, size_t *bytes_out) const;
+
+    /**
+     * Copy this slot's result region into the host-side copy `device_run_result`
+     * reads. Call after the run's device work has been synchronized: what makes
+     * the payload this run's rather than a successor's is that its device side
+     * published it before its kernel returned, so this read itself races
+     * nothing — the slot is not handed on until the run holding it finalizes.
+     *
+     * Leaves the host copy empty when there is no region or the copy fails, so a
+     * failed read reports "no result" rather than stale bytes.
+     */
+    void read_device_run_result(uint32_t pipeline_slot);
 
     /**
      * Per-slot task-timing dispatch/finish (ns) on the same device-clock timeline
@@ -1133,6 +1166,16 @@ protected:
     int arm_device_wall_buffer(uint32_t pipeline_slot, KernelArgsHelper &kernel_args);
 
     /**
+     * Point this run's KernelArgs at its slot's result region and stamp the run
+     * epoch the device must publish. Allocated lazily per slot and, unlike the
+     * timing buffer, never gated on diagnostics. Returns non-zero when the
+     * region could not be provided, which the caller must treat as a prepare
+     * failure: continuing would launch a run whose device side has nowhere to
+     * put its result, and whose region still holds a predecessor's payload.
+     */
+    int ensure_device_run_result_region(uint32_t pipeline_slot, uint64_t run_epoch, KernelArgsHelper &kernel_args);
+
+    /**
      * Resolve this run's block_dim: every cluster the device has, i.e.
      * the cached `max_block_dim_`. A run is never narrower than the
      * device — orchestration sizes its cohorts from
@@ -1743,6 +1786,17 @@ protected:
     // clear, so a run whose reset failed does not publish the storage's
     // previous contents as its own timing.
     std::array<bool, PTO_PIPELINE_MAX_DEPTH> device_timing_armed_{};
+    // One result region per pipeline slot: the device address handed to that
+    // slot's runs, and the host's copy of what the last such run published. Not
+    // gated on diagnostics — an error result must survive with capture off.
+    std::array<void *, PTO_PIPELINE_MAX_DEPTH> device_run_result_dev_ptrs_{};
+    std::array<DeviceRunResultRegion, PTO_PIPELINE_MAX_DEPTH> device_run_results_{};
+    // Whether a slot's region has had `published` zeroed since it was
+    // allocated. `allocate_tensor` is an `rtMalloc`, so a fresh region holds
+    // whatever the device left there — which cannot be assumed to differ from
+    // the epoch of the run about to use it. Steady-state reuse needs no clear
+    // because epochs distinguish runs, but the first use of an allocation does.
+    std::array<bool, PTO_PIPELINE_MAX_DEPTH> device_run_result_initialized_{};
 
     // True after AICPU SO loaded; reset by the subclass's `finalize()`.
     bool binaries_loaded_{false};

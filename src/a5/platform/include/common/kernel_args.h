@@ -103,6 +103,19 @@ struct KernelArgs {
     // See the a2a3 kernel_args.h for the full design rationale (CANN's
     // AICPU args copy makes inline fields write-only).
     uint64_t device_wall_data_base{0};
+
+    // Device pointer to this run's result region (DeviceRunResultRegion), and
+    // the run epoch its device side publishes into that region. Same reason the
+    // wall base travels here rather than inline: AICPU gets KernelArgs as a
+    // CANN-private copy, so an inline field would be write-only from AICPU.
+    //
+    // Unlike the wall buffer this is NOT gated on diagnostics — a run's error
+    // result has to survive whether or not timing capture is on. The host does
+    // not clear the region per run; the epoch is what makes a previous run's
+    // payload recognisable as stale, so arming costs no H2D.
+    // Both zero when no region was allocated.
+    uint64_t run_result_data_base{0};
+    uint64_t run_result_epoch{0};
     // 32-bit tail (two adjacent uint32_t — no interior padding).
     uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_args|chip_swimlane|pmu|dep_gen|scope_stats
     // Opaque always-false guard read by the AICore SIMT meta anchor (AIV

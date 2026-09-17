@@ -330,6 +330,12 @@ int DeviceRunner::prepare_execution(
 
     ensure_device_wall_buffer(pipeline_slot, execution->kernel_args);
 
+    // A run without somewhere to publish its result must not launch: it would
+    // leave the host with no way to recover the run's own error scene, and a
+    // region still holding a predecessor's payload.
+    rc = ensure_device_run_result_region(pipeline_slot, identity.run_epoch, execution->kernel_args);
+    if (rc != 0) return rc;
+
     if (block_dim < 1) {
         LOG_ERROR("prepare_execution computed block_dim < 1 from worker_count=%d", runtime.get_worker_count());
         return PTO_RUNTIME_ERR_INTERNAL;

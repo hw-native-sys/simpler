@@ -35,9 +35,15 @@ struct FakeRunner {
         arena_banks.push_back(bank);
     }
 
+    void record_run_epoch(uint64_t epoch) {
+        std::lock_guard<std::mutex> lock(mutex);
+        run_epochs.push_back(epoch);
+    }
+
     std::mutex mutex;
     std::vector<uint32_t> pipeline_slots;
     std::vector<uint32_t> arena_banks;
+    std::vector<uint64_t> run_epochs;
 };
 
 void set_retained_temp_buffer(void *runner_ctx, uint32_t pipeline_slot, void *, size_t) {
@@ -49,11 +55,18 @@ int setup_static_arena(void *runner_ctx, uint32_t arena_bank, size_t, size_t, si
     return 0;
 }
 
+const void *get_run_result(void *runner_ctx, uint32_t, uint64_t run_epoch, size_t *bytes_out) {
+    static_cast<FakeRunner *>(runner_ctx)->record_run_epoch(run_epoch);
+    if (bytes_out != nullptr) *bytes_out = 0;
+    return nullptr;
+}
+
 const HostApiOps &fake_ops() {
     static const HostApiOps ops = []() {
         HostApiOps result{};
         result.set_retained_temp_buffer = set_retained_temp_buffer;
         result.setup_static_arena = setup_static_arena;
+        result.get_run_result = get_run_result;
         return result;
     }();
     return ops;
@@ -79,8 +92,9 @@ private:
     int arrivals_{0};
 };
 
-bool all_equal(const std::vector<uint32_t> &values, uint32_t expected) {
-    return std::all_of(values.begin(), values.end(), [expected](uint32_t value) {
+template <typename T>
+bool all_equal(const std::vector<T> &values, T expected) {
+    return std::all_of(values.begin(), values.end(), [expected](T value) {
         return value == expected;
     });
 }
@@ -91,17 +105,19 @@ bool throwing_extension_callback(void *, ChipSwimlaneExtensionSection, const cha
 
 }  // namespace
 
-TEST(HostApiTest, BoundRunnerSlotAndBankSurviveConcurrentCrossThreadCalls) {
+TEST(HostApiTest, BoundRunnerSlotBankAndEpochSurviveConcurrentCrossThreadCalls) {
     constexpr uint32_t kRunnerASlot = 1;
     constexpr uint32_t kRunnerABank = 3;
+    constexpr uint64_t kRunnerAEpoch = 41;
     constexpr uint32_t kRunnerBSlot = 7;
     constexpr uint32_t kRunnerBBank = 5;
+    constexpr uint64_t kRunnerBEpoch = 97;
     constexpr int kCallsPerThread = 128;
 
     FakeRunner runner_a;
     FakeRunner runner_b;
-    const HostApi api_a(&runner_a, kRunnerASlot, kRunnerABank, &fake_ops());
-    const HostApi api_b(&runner_b, kRunnerBSlot, kRunnerBBank, &fake_ops());
+    const HostApi api_a(&runner_a, kRunnerASlot, kRunnerABank, kRunnerAEpoch, &fake_ops());
+    const HostApi api_b(&runner_b, kRunnerBSlot, kRunnerBBank, kRunnerBEpoch, &fake_ops());
     StartGate start_gate;
 
     std::thread first([&]() {
@@ -109,6 +125,8 @@ TEST(HostApiTest, BoundRunnerSlotAndBankSurviveConcurrentCrossThreadCalls) {
         for (int i = 0; i < kCallsPerThread; ++i) {
             api_a.set_retained_temp_buffer(nullptr, 0);
             api_b.setup_static_arena(0, 0, 0);
+            size_t bytes = 0;
+            api_a.run_result(&bytes);
         }
     });
     std::thread second([&]() {
@@ -116,6 +134,8 @@ TEST(HostApiTest, BoundRunnerSlotAndBankSurviveConcurrentCrossThreadCalls) {
         for (int i = 0; i < kCallsPerThread; ++i) {
             api_b.set_retained_temp_buffer(nullptr, 0);
             api_a.setup_static_arena(0, 0, 0);
+            size_t bytes = 0;
+            api_b.run_result(&bytes);
         }
     });
 
@@ -130,12 +150,25 @@ TEST(HostApiTest, BoundRunnerSlotAndBankSurviveConcurrentCrossThreadCalls) {
     EXPECT_TRUE(all_equal(runner_a.arena_banks, kRunnerABank));
     EXPECT_TRUE(all_equal(runner_b.pipeline_slots, kRunnerBSlot));
     EXPECT_TRUE(all_equal(runner_b.arena_banks, kRunnerBBank));
+    EXPECT_EQ(runner_a.run_epochs.size(), kCallsPerThread);
+    EXPECT_EQ(runner_b.run_epochs.size(), kCallsPerThread);
+    EXPECT_TRUE(all_equal(runner_a.run_epochs, kRunnerAEpoch));
+    EXPECT_TRUE(all_equal(runner_b.run_epochs, kRunnerBEpoch));
+}
+
+TEST(HostApiTest, RunResultIsAbsentWhenTheBackendProvidesNoRegion) {
+    const HostApiOps ops{};
+    const HostApi api(nullptr, 0, 0, 1, &ops);
+
+    size_t bytes = 123;
+    EXPECT_EQ(api.run_result(&bytes), nullptr);
+    EXPECT_EQ(bytes, 0u);
 }
 
 TEST(HostApiTest, PublicationExceptionsBecomeFailureResults) {
     HostApiOps ops{};
     ops.publish_chip_swimlane_extension = throwing_extension_callback;
-    const HostApi api(nullptr, 0, 0, &ops);
+    const HostApi api(nullptr, 0, 0, 0, &ops);
 
     EXPECT_FALSE(api.publish_chip_swimlane_extension(ChipSwimlaneExtensionSection::SchedulerRecords, "{}", 2));
 }
