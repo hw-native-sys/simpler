@@ -1916,7 +1916,33 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     }
     device_timing_armed_.fill(false);
 
-    // Each slot's KernelArgs / runtime / register blocks outlive the runs that
+    // The AICore register-address tables are device constants committed once per
+    // device context, so this is where they are returned — same window and same
+    // ordering constraint as the device-wall buffers above. Release keys on the
+    // address, not the committed flag: a table whose host-to-device copy failed
+    // is still owned and still has to be freed. Both fields are cleared on both
+    // paths, so a re-provisioned runner commits again for its new device
+    // generation, and on the fatal path the allocator has already forgotten the
+    // block. An address whose free fails is retained for a later retry, matching
+    // the slot blocks below.
+    auto release_reg_table = [&](uint64_t &table, bool &committed) {
+        if (table == 0) {
+            committed = false;
+            return;
+        }
+        if (abandon_device_resources) {
+            table = 0;
+        } else if (mem_alloc_.free(reinterpret_cast<void *>(table)) == 0) {
+            table = 0;
+        } else {
+            capture(PTO_RUNTIME_ERR_INTERNAL);
+        }
+        committed = false;
+    };
+    release_reg_table(aicore_ctrl_reg_table_dev_, aicore_ctrl_reg_table_committed_);
+    release_reg_table(aicore_pmu_reg_table_dev_, aicore_pmu_reg_table_committed_);
+
+    // Each slot's KernelArgs / runtime blocks outlive the runs that
     // use them, so this is where they are returned — same reason and same
     // ordering constraint as the device-wall buffer above. A failing free keeps
     // its block recorded, so reporting the error is what lets a caller retry

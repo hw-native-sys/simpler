@@ -48,6 +48,7 @@
 #include "device_runner_base.h"     // common DeviceRunnerBase
 #include "device_runner_helpers.h"  // common KernelArgsHelper
 #include "host/function_cache.h"
+#include "host/host_regs.h"  // AicoreRegKind
 #include "host/memory_allocator.h"
 #include "host/chip_swimlane_collector.h"
 #include "host/args_dump_collector.h"
@@ -253,6 +254,23 @@ private:
     // predecessor's execution and must not destroy the live pair.
     int retire_run_aicore_stream(const void *owner, RunStreamPair::CompletionStatus completion_status);
     int destroy_run_streams();
+
+    // Commit one of this device's AICore register-address tables on first use.
+    // Storage lives on DeviceRunnerBase and is released in finalize_common();
+    // only the driver query is arch-specific, which is why this is not a base
+    // method — a2a3 maps two MMIO pages (AIC_CTRL and AIC_PMU_CTRL) selected by
+    // an AicoreRegKind, a5 one through a different signature.
+    //
+    // Guarded on the committed flag rather than the address: a failed
+    // host-to-device copy whose rollback release also failed retains the
+    // address for teardown, and that block is owned but unwritten. The retained
+    // address is passed back in, which is what lets the driver entry reuse the
+    // block instead of leaking it.
+    //
+    // Failure propagates. The AICPU handshake dereferences these addresses, so
+    // handing the device an uncommitted table would deadlock the next task on a
+    // stream-sync timeout rather than fail the prepare (see host_regs.cpp).
+    int ensure_aicore_reg_table(AicoreRegKind kind);
 
     // Release the resources this run owns, in runtime-argument, register-buffer,
     // then stream order. Collectors are not among them: their device resources

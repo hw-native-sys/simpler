@@ -124,9 +124,10 @@ static_assert(offsetof(KernelArgs, regs) == 8, "KernelArgs::regs offset drift");
  * an async-DMA workspace. The values do not ride on per-run KernelArgs; the
  * resident AICPU SO keeps the latest configuration across task launches.
  *
- * `regs` is intentionally NOT here — on a5 the per-core register table is also
- * read by the AICore KERNEL_ENTRY off the per-run device KernelArgs copy, so it
- * stays in KernelArgs.
+ * `regs` is intentionally NOT here. The host owns the per-core register table
+ * per device context, but on a5 the table is also read by the AICore
+ * KERNEL_ENTRY off the per-run device KernelArgs copy, so it stays in
+ * KernelArgs.
  */
 struct InitArgs {
     uint32_t device_id{0};            // ACL device ordinal -> set_orch_device_id

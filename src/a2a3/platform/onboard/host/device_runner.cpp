@@ -303,36 +303,22 @@ int DeviceRunner::prepare_execution(
     }
     int num_aicore = block_dim * cores_per_blockdim_;
 
-    // Get AICore register addresses for register-based task dispatch. The table
-    // is a property of the device, not of the run, so the slot commits it once
-    // and every later run on that slot reuses the same addresses.
-    SlotPersistentArgs &slot_args = slot_persistent_args(execution->pipeline_slot);
-    if (!slot_args.regs_committed) {
-        rc = init_aicore_register_addresses(
-            &slot_args.regs, static_cast<uint64_t>(device_id_), mem_alloc_, AicoreRegKind::Ctrl
-        );
-        if (rc != 0) {
-            // A retained address stays in `slot_args.regs` for release; it is
-            // not committed, so the next prepare commits again rather than
-            // handing the device an unwritten table.
-            LOG_ERROR("init_aicore_register_addresses(Ctrl) failed: %d", rc);
-            return rc;
-        }
-        slot_args.regs_committed = true;
-    }
-    execution->kernel_args.args.regs = slot_args.regs;
+    // The register tables are device constants, so the runner commits each once
+    // per device context and every run on every pipeline slot reuses the
+    // addresses.
+    rc = ensure_aicore_reg_table(AicoreRegKind::Ctrl);
+    if (rc != 0) return rc;
+    execution->kernel_args.args.regs = aicore_ctrl_reg_table_dev_;
 
-    // Get AICore PMU register addresses (distinct MMIO page from AIC_CTRL).
+    // PMU counters live on a distinct MMIO page (AIC_PMU_CTRL), queried only
+    // once a run asks for PMU. The table then stays committed, including across
+    // later runs that leave PMU off; a run with PMU off publishes 0 so the
+    // device-side collector early-outs.
     if (dfx.pmu_enabled) {
-        rc = init_aicore_register_addresses(
-            &execution->kernel_args.args.pmu_reg_addrs, static_cast<uint64_t>(device_id_), mem_alloc_,
-            AicoreRegKind::Pmu
-        );
-        if (rc != 0) {
-            LOG_ERROR("init_aicore_register_addresses(Pmu) failed: %d", rc);
-            return rc;
-        }
+        rc = ensure_aicore_reg_table(AicoreRegKind::Pmu);
+        if (rc != 0) return rc;
     }
+    execution->kernel_args.args.pmu_reg_addrs = dfx.pmu_enabled ? aicore_pmu_reg_table_dev_ : 0;
 
     // The AICore-visible half of this — the profiling flag and the swimlane /
     // PMU ring tables — is built by `arm_collectors_for_run` at launch and
@@ -400,6 +386,7 @@ int DeviceRunner::prepare_execution(
         return rc;
     }
 
+    SlotPersistentArgs &slot_args = slot_persistent_args(execution->pipeline_slot);
     rc = init_runtime_args_with_metadata(runtime, execution->kernel_args, slot_args);
     if (rc != 0) return rc;
 
@@ -466,9 +453,10 @@ void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool retire_ai
     // Collectors must stop before their backing arguments are released; the
     // per-run stream retires last. Each cleanup operation is idempotent.
     // The collectors' device resources are not per-run, and neither are the
-    // slot's KernelArgs / runtime / register blocks: both are released in
-    // finalize(), which owns them for the worker's lifetime. A run only stops
-    // naming them here.
+    // slot's KernelArgs / runtime blocks or the device's AICore register
+    // tables: the slot blocks are released in finalize() and the register
+    // tables in finalize_common(), both for the worker's lifetime. A run only
+    // stops naming them here.
     if (abandon) {
         prepared.kernel_args.abandon_after_device_failure();
         abandon_slot_persistent_args(slot_persistent_args(prepared.pipeline_slot));
@@ -476,12 +464,7 @@ void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool retire_ai
         prepared.kernel_args.release_run_view();
     }
     prepared.kernel_args.args.regs = 0;
-    if (prepared.kernel_args.args.pmu_reg_addrs != 0) {
-        if (!abandon) {
-            (void)mem_alloc_.free(reinterpret_cast<void *>(prepared.kernel_args.args.pmu_reg_addrs));
-        }
-        prepared.kernel_args.args.pmu_reg_addrs = 0;
-    }
+    prepared.kernel_args.args.pmu_reg_addrs = 0;
     if (retire_aicore && !abandon && !prepared.aicore_retirement_attempted) {
         prepared.aicore_retirement_attempted = true;
         (void)retire_run_aicore_stream(&prepared, RunStreamPair::CompletionStatus::Unproven);
@@ -531,6 +514,30 @@ int DeviceRunner::ensure_run_streams() {
         ACL_LOG_ERROR_DETAIL(rc);
     }
     return rc;
+}
+
+// Both kinds fold in the live AICore power-gating/occupancy bitmap, so a
+// committed table is a snapshot taken at first use. That is already the
+// contract for Ctrl — the dispatch addresses the AICPU handshakes through have
+// never been refreshed once committed — and committing Pmu the same way makes
+// the two tables agree on one snapshot instead of letting a late PMU run
+// observe a newer mask than the dispatch table it is measuring. A gating change
+// mid-worker is not something a per-run PMU re-query could have made safe.
+int DeviceRunner::ensure_aicore_reg_table(AicoreRegKind kind) {
+    const bool is_pmu = kind == AicoreRegKind::Pmu;
+    uint64_t &table = is_pmu ? aicore_pmu_reg_table_dev_ : aicore_ctrl_reg_table_dev_;
+    bool &committed = is_pmu ? aicore_pmu_reg_table_committed_ : aicore_ctrl_reg_table_committed_;
+    if (committed) return 0;
+    // `table` may already hold an address a previous failed release retained;
+    // passing it back in is what lets the driver entry reuse that block instead
+    // of stranding it.
+    const int rc = init_aicore_register_addresses(&table, static_cast<uint64_t>(device_id_), mem_alloc_, kind);
+    if (rc != 0) {
+        LOG_ERROR("init_aicore_register_addresses(%s) failed: %d", is_pmu ? "Pmu" : "Ctrl", rc);
+        return rc;
+    }
+    committed = true;
+    return 0;
 }
 
 int DeviceRunner::retire_run_aicore_stream(const void *owner, RunStreamPair::CompletionStatus completion_status) {

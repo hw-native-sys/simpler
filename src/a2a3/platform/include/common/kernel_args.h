@@ -101,8 +101,11 @@ struct KernelArgs {
     uint64_t dump_data_base{0};  // Dump shared memory base address; use explicit flags to detect enablement
     // chip swimlane shared memory base address; use explicit flags to detect enablement
     uint64_t chip_swimlane_data_base{0};
-    uint64_t pmu_data_base{0};          // PMU shared memory base address; use explicit flags to detect enablement
-    uint64_t pmu_reg_addrs{0};          // Per-core PMU MMIO register base address array (onboard only; 0 on sim)
+    uint64_t pmu_data_base{0};  // PMU shared memory base address; use explicit flags to detect enablement
+    // Per-core PMU MMIO register base address array. 0 on sim, and 0 when this
+    // run leaves PMU off; the table itself is device-constant and outlives any
+    // single run.
+    uint64_t pmu_reg_addrs{0};
     uint64_t dep_gen_data_base{0};      // dep_gen shared memory base address; use explicit flags to detect enablement
     uint64_t scope_stats_data_base{0};  // ScopeStatsBuffer shared memory base; 0 when scope_stats is off.
                                         // Allocated by host's ScopeStatsCollector, read+written by AICPU's
@@ -139,8 +142,10 @@ static_assert(offsetof(KernelArgs, regs) == 8, "KernelArgs::regs offset drift");
  * an async-DMA workspace. The values do not ride on per-run KernelArgs; the
  * resident AICPU SO keeps the latest configuration across task launches.
  *
- * `regs` / `pmu_reg_addrs` are intentionally NOT here — they back per-core
- * register tables consumed on the per-run AICore path and stay in KernelArgs.
+ * `regs` / `pmu_reg_addrs` are intentionally NOT here. The host owns both
+ * tables per device context, but their addresses still reach the device on the
+ * per-run KernelArgs copy the AICPU exec entry latches, so moving them would
+ * change that publication protocol rather than just host-side ownership.
  */
 struct InitArgs {
     uint32_t device_id{0};            // ACL device ordinal -> set_orch_device_id

@@ -337,20 +337,13 @@ int DeviceRunner::prepare_execution(
     int num_aicore = block_dim * cores_per_blockdim_;
 
     // The register table is a property of the device, not of the run, so the
-    // slot commits it once and every later run on that slot reuses it.
-    SlotPersistentArgs &slot_args = slot_persistent_args(execution->pipeline_slot);
-    if (!slot_args.regs_committed) {
-        rc = init_aicore_register_addresses(&slot_args.regs, static_cast<uint64_t>(device_id_), mem_alloc_);
-        if (rc != 0) {
-            // A retained address stays in `slot_args.regs` for release; it is
-            // not committed, so the next prepare commits again rather than
-            // handing the device an unwritten table.
-            LOG_ERROR("init_aicore_register_addresses failed: %d", rc);
-            return rc;
-        }
-        slot_args.regs_committed = true;
-    }
-    execution->kernel_args.args.regs = slot_args.regs;
+    // runner commits it once per device context and every run on every pipeline
+    // slot reuses it. a5's AICore re-reads `regs` at every kernel entry to
+    // resolve its PMU base, so one stable per-device address is strictly safer
+    // here than a per-slot address that alternates between runs.
+    rc = ensure_aicore_reg_table();
+    if (rc != 0) return rc;
+    execution->kernel_args.args.regs = aicore_ctrl_reg_table_dev_;
 
     // The AICore-visible half of this — the profiling flag and the swimlane /
     // PMU ring tables — is built by `arm_collectors_for_run` at launch and
@@ -440,6 +433,7 @@ int DeviceRunner::prepare_execution(
         LOG_ERROR("prepare_orch_so failed: %d", rc);
         return rc;
     }
+    SlotPersistentArgs &slot_args = slot_persistent_args(execution->pipeline_slot);
     rc = init_runtime_args_with_metadata(runtime, execution->kernel_args, slot_args);
     if (rc != 0) return rc;
 
@@ -654,8 +648,9 @@ void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool launched)
 
     // Collectors stop before device/runtime arguments and register buffers.
     // The collectors' device resources are not per-run, and neither are the
-    // slot's KernelArgs / runtime / register blocks: both are released in
-    // finalize(), which owns them for the worker's lifetime. A run only stops
+    // slot's KernelArgs / runtime blocks or the device's AICore register table:
+    // the slot blocks are released in finalize() and the register table in
+    // finalize_common(), both for the worker's lifetime. A run only stops
     // naming them here.
     if (abandon) {
         prepared.kernel_args.abandon_after_device_failure();
@@ -1046,6 +1041,27 @@ void DeviceRunner::finalize_collectors(bool abandon_device_resources) {
     if (scope_stats_collector_.is_initialized()) {
         scope_stats_collector_.finalize(/*unregister_cb=*/nullptr, free_cb);
     }
+}
+
+// The table folds in whatever register windows the driver maps at query time,
+// so a committed table is a snapshot taken at first use. That was already the
+// contract when the table was per pipeline slot — a slot's addresses were never
+// refreshed once committed — and one table per device context additionally
+// halves the per-core halResMap loop and the live driver-side mappings a worker
+// holds.
+int DeviceRunner::ensure_aicore_reg_table() {
+    if (aicore_ctrl_reg_table_committed_) return 0;
+    // The handle may already hold an address a previous failed release retained;
+    // passing it back in is what lets the driver entry reuse that block instead
+    // of stranding it.
+    const int rc =
+        init_aicore_register_addresses(&aicore_ctrl_reg_table_dev_, static_cast<uint64_t>(device_id_), mem_alloc_);
+    if (rc != 0) {
+        LOG_ERROR("init_aicore_register_addresses failed: %d", rc);
+        return rc;
+    }
+    aicore_ctrl_reg_table_committed_ = true;
+    return 0;
 }
 
 int DeviceRunner::arm_collectors_for_run(Runtime &runtime, PreparedExecution &prepared) {

@@ -270,6 +270,27 @@ private:
      */
     int arm_collectors_for_run(Runtime &runtime, PreparedExecution &prepared);
 
+    /**
+     * Commit this device's AICore register-address table on first use.
+     *
+     * Storage lives on DeviceRunnerBase and is released in finalize_common();
+     * only the driver query is arch-specific, which is why this is not a base
+     * method — a5 maps one register window per physical core, a2a3 two MMIO
+     * pages selected by an AicoreRegKind.
+     *
+     * Guarded on the committed flag rather than the address: a failed
+     * host-to-device copy whose rollback release also failed retains the address
+     * for teardown, and that block is owned but unwritten. The retained address
+     * is passed back in, which is what lets the driver entry reuse the block
+     * instead of stranding it.
+     *
+     * Failure propagates. The AICPU handshake and the AICore PMU base both
+     * dereference these addresses, so handing the device an uncommitted table
+     * would deadlock the next task on a stream-sync timeout rather than fail the
+     * prepare (see host_regs.cpp).
+     */
+    int ensure_aicore_reg_table();
+
     int init_chip_swimlane(
         int num_aicore, int aicpu_thread_num, int device_id, KernelArgsHelper &kernel_args,
         ChipSwimlaneLevel chip_swimlane_level

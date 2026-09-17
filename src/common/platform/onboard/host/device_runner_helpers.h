@@ -49,26 +49,23 @@ int query_stream_pair_nonblocking(rtStream_t aicpu_stream, rtStream_t aicore_str
 /**
  * The device blocks one pipeline slot reuses across every run it prepares.
  *
- * All three have a size fixed for the runner's lifetime — `sizeof(KernelArgs)`,
- * the runtime variant's device-copy length, and the architecture register
- * table — so a run rewrites their contents rather than reallocating them. A
- * slot admits at most one run at a time (`try_reserve_native_run` rejects a
- * second reservation on an occupied slot), so one block per slot needs no
- * further serialization.
+ * Both have a size fixed for the runner's lifetime — `sizeof(KernelArgs)` and
+ * the runtime variant's device-copy length — so a run rewrites their contents
+ * rather than reallocating them. A slot admits at most one run at a time
+ * (`try_reserve_native_run` rejects a second reservation on an occupied slot),
+ * so one block per slot needs no further serialization.
  *
  * The runner owns these for its whole lifetime and releases them in
  * `finalize()`, alongside the collector resources that already work this way.
+ *
+ * The AICore register tables are deliberately NOT here: they are device
+ * constants, identical for every slot, and are owned per device context by
+ * `DeviceRunnerBase::aicore_{ctrl,pmu}_reg_table_dev_`.
  */
 struct SlotPersistentArgs {
     Runtime *runtime_args{nullptr};      // device copy of the Runtime prefix
     KernelArgs *device_k_args{nullptr};  // device copy of KernelArgs for AICore
-    uint64_t regs{0};                    // architecture register table
     uint64_t runtime_bytes{0};           // committed length of runtime_args
-    // Whether `regs` names a table whose contents reached the device. A failed
-    // host-to-device copy whose rollback release also failed leaves the block
-    // owned but unwritten, so `regs != 0` alone does not mean "usable": the
-    // address is retained for release, and the next prepare must commit again.
-    bool regs_committed{false};
 };
 
 /**
@@ -78,8 +75,10 @@ struct SlotPersistentArgs {
  * host-side initialization methods for publishing data to the device. The
  * `KernelArgs` value is per-run: every prepare refills it and copies it over.
  * The device blocks it names are not — they live in the slot's
- * `SlotPersistentArgs` and are only rewritten here. Separates device-memory
- * management (host-only) from the structure layout (shared with kernels).
+ * `SlotPersistentArgs`, except the AICore register tables, which are owned per
+ * device context by `DeviceRunnerBase`. Both are only rewritten here. Separates
+ * device-memory management (host-only) from the structure layout (shared with
+ * kernels).
  *
  * The helper provides implicit conversion to `KernelArgs *` for seamless use
  * with runtime APIs.

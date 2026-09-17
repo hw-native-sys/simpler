@@ -135,15 +135,6 @@ int release_slot_persistent_args(SlotPersistentArgs &slot, MemoryAllocator &allo
             slot.runtime_bytes = 0;
         }
     }
-    if (slot.regs != 0) {
-        const int rc = allocator.free(reinterpret_cast<void *>(slot.regs));
-        if (rc != 0) {
-            if (first_error == 0) first_error = rc;
-        } else {
-            slot.regs = 0;
-            slot.regs_committed = false;
-        }
-    }
     return first_error;
 }
 
@@ -151,6 +142,4 @@ void abandon_slot_persistent_args(SlotPersistentArgs &slot) {
     slot.device_k_args = nullptr;
     slot.runtime_args = nullptr;
     slot.runtime_bytes = 0;
-    slot.regs = 0;
-    slot.regs_committed = false;
 }

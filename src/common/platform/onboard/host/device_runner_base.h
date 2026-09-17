@@ -1578,6 +1578,33 @@ protected:
     // `nullptr` before init.
     rtStream_t stream_aicpu_{nullptr};
     rtStream_t stream_aicore_{nullptr};
+    // Device-constant AICore MMIO register-address tables: one 8-byte entry per
+    // physical sub-core, queried from the driver for `device_id_` and copied to
+    // device once per device context. The addresses are a property of the card,
+    // not of a run or a pipeline slot, so every run on both slots reads the same
+    // table. Committed lazily on the prepare path by the subclass's
+    // `ensure_aicore_reg_table` — only the driver query is arch-specific, a2a3
+    // mapping two MMIO pages and a5 one — and released in `finalize_common()`,
+    // the same window as `device_wall_dev_ptr_`.
+    //
+    // `*_dev_` is the block's address and `*_committed_` says whether its
+    // contents reached the device. They are separate because
+    // `init_aicore_register_addresses` records the address before the copy and
+    // clears it on failure only when the rollback release succeeded: a retained
+    // address is owned but unwritten, so a non-zero address alone does not mean
+    // "usable". Release keys on the address; reuse keys on the flag.
+    //
+    // Ctrl backs `KernelArgs::regs` on both arches. Pmu backs a2a3's
+    // `KernelArgs::pmu_reg_addrs` and stays unset on a5, which has no separate
+    // PMU register page and reads the Ctrl table instead.
+    //
+    // Kernel mode owns the same table through `PersistentKernelArgs`
+    // (`kernel_persistent_args.h`) instead; a context latches one mode for its
+    // whole lifetime, so exactly one of the two owners is ever live.
+    uint64_t aicore_ctrl_reg_table_dev_{0};
+    uint64_t aicore_pmu_reg_table_dev_{0};
+    bool aicore_ctrl_reg_table_committed_{false};
+    bool aicore_pmu_reg_table_committed_{false};
     // Platform-level device phase buffer: a header, thread-major phase records,
     // and the optional task-timing tail. Its address rides on
     // `KernelArgs.device_wall_data_base`. AICPU stamps raw sys-counter cycles;
