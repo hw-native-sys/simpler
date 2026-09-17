@@ -289,6 +289,36 @@ RDMA workspace peer MR base plus a local-window offset, not from
 `aclrtMalloc` buffer the HNS1825 NIC can DMA to, and peers are reached over
 RoCE by rkey + VA.
 
+**RDMA-only domain (caller precondition).** Under the RDMA overlay the domain
+allocation path intentionally skips peer import and mapping: `windowsIn[peer]`
+stays zero for every remote rank, and there is no locally addressable mapped VA
+for a peer's window. A peer MR address (`rkey` + VA) is not a substitute — only
+the NIC can dereference it. Consequently, a kernel that computes
+`windowsIn[peer] + offset` and issues a synchronous `TPUT`/`TGET` against that
+address cannot run on an RDMA domain unchanged; it must use the asynchronous
+RDMA path (`TGET_ASYNC`/`TPUT_ASYNC<DmaEngine::RDMA>`), which carries the peer
+MR base and rkey instead of a local VA. Switching a workload from SDMA/URMA to
+RDMA is therefore a kernel contract change, not a configuration flip.
+
+**Single-producer submission (caller precondition).** Multiple AICores (AIVs)
+submitting through the same workspace and the same peer/QP read and write the
+same SQ head and WQE slot with no multi-producer reservation — the posting path
+reads the SQ head, fills the WQE at that slot, and advances the head. Concurrent
+submissions to one peer/QP can therefore overwrite or lose a request. Callers
+must serialize submissions to a given peer/QP; the `rdma_deferred_completion_demo`
+relies on its inter-kernel marker dependencies to order the submissions it makes
+to each peer. This is a documented constraint, not a supported multi-producer
+contract.
+
+**Completion consumption.** Deferred completions are consumed by the AICPU
+scheduler poller, which advances the shared CQ consumer index and mirrors it
+into the CQ tail and the SQ tail record (matching the pinned PTO
+`RingCqDoorbell`). The AICore post path reads that same SQ tail to decide when
+to drain the CQ before the SQ fills (`head - tail >= depth - threshold`).
+Because both the poller and the AICore-side drain advance the same monotonic
+index, a submission that triggers an AICore-side drain consumes only the CQEs
+still outstanding at that point; the AICPU poller never re-consumes them.
+
 ---
 
 ## 5. Staging host data into a window

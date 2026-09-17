@@ -1236,26 +1236,33 @@ static bool aclrt_malloc_low_segment(void **out, size_t size) {
 // AICore rings the SQ hardware doorbell with the NIC-configured class of
 // service. The workspace is device memory (aclrtMalloc'd by the pto-isa
 // workspace manager); we read it back, fix the byte at each RoceSqCtx.dbCos
-// (offset 89), and write it back. See the caller comment for why dbCos must
-// match the NIC.
-static void patch_rdma_workspace_db_cos(void *workspace_addr, uint32_t rank_count) {
+// (offset 89), and write it back. Returns false if the workspace cannot be
+// read or patched back — dbCos is required for the NIC to consume SQ doorbells,
+// so a failed patch leaves the workspace unusable.
+static bool patch_rdma_workspace_db_cos(void *workspace_addr, uint32_t rank_count) {
     using namespace pto::comm::rdma;
     using namespace pto::comm::rdma::hns_1825;
-    if (workspace_addr == nullptr || rank_count == 0) return;
+    if (workspace_addr == nullptr || rank_count == 0) return false;
     constexpr uint8_t kExpectedDbCos = 4;  // NIC-configured cos observed on native pto-isa
     const uint64_t workspace_size = rdma_workspace_bytes(rank_count);
     std::vector<uint8_t> buf(workspace_size);
     if (aclrtMemcpy(buf.data(), buf.size(), workspace_addr, buf.size(), ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
         LOG_ERROR("[comm] rdma workspace dbCos patch: D2H read failed");
-        return;
+        return false;
     }
     RdmaInfo *info = reinterpret_cast<RdmaInfo *>(buf.data());
     const uint64_t sq_ptr = info->sqPtr;
-    if (sq_ptr == 0) return;
+    if (sq_ptr == 0) {
+        LOG_ERROR("[comm] rdma workspace dbCos patch: workspace reports no SQ pointer");
+        return false;
+    }
     bool patched = false;
     for (uint32_t rank = 0; rank < rank_count; ++rank) {
         const uint64_t sq_off = sq_ptr - reinterpret_cast<uint64_t>(workspace_addr) + rank * sizeof(RoceSqCtx);
-        if (sq_off + sizeof(RoceSqCtx) > buf.size()) return;
+        if (sq_off + sizeof(RoceSqCtx) > buf.size()) {
+            LOG_ERROR("[comm] rdma workspace dbCos patch: SQ context %u lies outside workspace", rank);
+            return false;
+        }
         uint8_t *db_cos = buf.data() + sq_off + offsetof(RoceSqCtx, dbCos);
         if (*db_cos == 0) {
             *db_cos = kExpectedDbCos;
@@ -1265,13 +1272,14 @@ static void patch_rdma_workspace_db_cos(void *workspace_addr, uint32_t rank_coun
     if (patched) {
         if (aclrtMemcpy(workspace_addr, buf.size(), buf.data(), buf.size(), ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
             LOG_ERROR("[comm] rdma workspace dbCos patch: H2D write failed");
-            return;
+            return false;
         }
     }
     LOG_INFO(
         "[comm] rdma workspace dbCos patch %s (rank_count=%u)", patched ? "applied" : "already-correct",
         static_cast<unsigned>(rank_count)
     );
+    return true;
 }
 
 static bool init_rdma_workspace(
@@ -1332,7 +1340,10 @@ static bool init_rdma_workspace(
     // pto-isa from the HCOMM DbVendorSpecified field; on some pins it resolves
     // to 0 while the NIC expects 4 (as native pto-isa tests observe). Patch the
     // device workspace so AICore rings the doorbell with the NIC-configured cos.
-    patch_rdma_workspace_db_cos(manager->GetWorkspaceAddr(), static_cast<uint32_t>(rank_count));
+    if (!patch_rdma_workspace_db_cos(manager->GetWorkspaceAddr(), static_cast<uint32_t>(rank_count))) {
+        LOG_ERROR("[comm rank %d] RDMA workspace dbCos patch failed", h->rank);
+        return false;
+    }
 
     workspace = std::move(manager);
     return true;

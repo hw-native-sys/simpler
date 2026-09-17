@@ -603,6 +603,12 @@ class TestRuntimeBuilderGetBinaries:
         self._make_runtime(tmp_path, "a5")
         mock_instance = MockCompiler.get_instance.return_value
         mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
+        for var in (
+            "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE",
+            "SIMPLER_ENABLE_PTO_URMA_WORKSPACE",
+            "SIMPLER_ENABLE_PTO_RDMA_WORKSPACE",
+        ):
+            monkeypatch.delenv(var, raising=False)
         monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: pin)
         monkeypatch.setattr(pto_isa, "ensure_pto_isa_root", lambda verbose=False: "/tmp/pto-isa")
         monkeypatch.setattr(pto_isa, "write_pto_isa_build_metadata", lambda *args: None)
@@ -612,12 +618,17 @@ class TestRuntimeBuilderGetBinaries:
 
         host_call = next(call for call in mock_instance.compile.call_args_list if call.args[0] == "host")
         assert host_call.kwargs["cmake_defines"]["SIMPLER_PTO_ISA_BUILD_COMMIT"] == pin
+        # Default a5 onboard forwards the two cached overlay options explicitly
+        # (both OFF) so a stale cached option cannot survive a reconfigure. SDMA
+        # is the CMakeLists-derived default and is not forwarded.
+        assert host_call.kwargs["cmake_defines"]["SIMPLER_ENABLE_PTO_URMA_WORKSPACE"] == "OFF"
+        assert host_call.kwargs["cmake_defines"]["SIMPLER_ENABLE_PTO_RDMA_WORKSPACE"] == "OFF"
         assert "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE" not in host_call.kwargs["cmake_defines"]
         assert host_call.kwargs["cmake_defines"]["PTO_ISA_ROOT"] == "/tmp/pto-isa"
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_a5_rdma_overlay_host_build_forwards_overlay_defines(self, MockCompiler, tmp_path, monkeypatch):
-        """RDMA overlay is forwarded to host CMake and disables the implicit URMA default."""
+        """RDMA overlay is forwarded to host CMake with URMA pinned off."""
         from simpler_setup import pto_isa  # noqa: PLC0415
         from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
@@ -638,11 +649,16 @@ class TestRuntimeBuilderGetBinaries:
         host_call = next(call for call in mock_instance.compile.call_args_list if call.args[0] == "host")
         assert host_call.kwargs["cmake_defines"]["SIMPLER_ENABLE_PTO_RDMA_WORKSPACE"] == "ON"
         assert host_call.kwargs["cmake_defines"]["SIMPLER_ENABLE_PTO_URMA_WORKSPACE"] == "OFF"
+        assert "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE" not in host_call.kwargs["cmake_defines"]
         assert host_call.kwargs["cmake_defines"]["SIMPLER_PTO_ISA_BUILD_COMMIT"] == pin
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_a5_sdma_overlay_host_build_forwards_overlay_defines(self, MockCompiler, tmp_path, monkeypatch):
-        """Explicit SDMA overlay also turns off the implicit URMA default."""
+        """Selecting SDMA explicitly still forces the URMA option off.
+
+        SDMA is the CMakeLists-derived default, so it is not forwarded; what
+        matters is that URMA is pinned OFF rather than left to a cached value.
+        """
         from simpler_setup import pto_isa  # noqa: PLC0415
         from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
@@ -661,8 +677,77 @@ class TestRuntimeBuilderGetBinaries:
         builder.get_binaries("test_rt", build=True)
 
         host_call = next(call for call in mock_instance.compile.call_args_list if call.args[0] == "host")
-        assert host_call.kwargs["cmake_defines"]["SIMPLER_ENABLE_PTO_SDMA_WORKSPACE"] == "ON"
         assert host_call.kwargs["cmake_defines"]["SIMPLER_ENABLE_PTO_URMA_WORKSPACE"] == "OFF"
+        assert host_call.kwargs["cmake_defines"]["SIMPLER_ENABLE_PTO_RDMA_WORKSPACE"] == "OFF"
+        assert "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE" not in host_call.kwargs["cmake_defines"]
+
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
+    def test_a5_overlay_off_survives_reconfigure_after_rdma_on(self, MockCompiler, tmp_path, monkeypatch):
+        """RDMA=ON then unset must reconfigure RDMA=OFF, not keep the cached option."""
+        from simpler_setup import pto_isa  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        self._make_runtime(tmp_path, "a5")
+        mock_instance = MockCompiler.get_instance.return_value
+        mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
+        for var in (
+            "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE",
+            "SIMPLER_ENABLE_PTO_URMA_WORKSPACE",
+            "SIMPLER_ENABLE_PTO_RDMA_WORKSPACE",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: "e" * 40)
+        monkeypatch.setattr(pto_isa, "ensure_pto_isa_root", lambda verbose=False: "/tmp/pto-isa")
+        monkeypatch.setattr(pto_isa, "write_pto_isa_build_metadata", lambda *args: None)
+
+        def host_defines() -> dict[str, str]:
+            builder = RuntimeBuilder(platform="a5")
+            builder.get_binaries("test_rt", build=True)
+            host_calls = [call for call in mock_instance.compile.call_args_list if call.args[0] == "host"]
+            return host_calls[-1].kwargs["cmake_defines"]
+
+        monkeypatch.setenv("SIMPLER_ENABLE_PTO_RDMA_WORKSPACE", "ON")
+        assert host_defines()["SIMPLER_ENABLE_PTO_RDMA_WORKSPACE"] == "ON"
+
+        monkeypatch.delenv("SIMPLER_ENABLE_PTO_RDMA_WORKSPACE", raising=False)
+        defines = host_defines()
+        assert defines["SIMPLER_ENABLE_PTO_RDMA_WORKSPACE"] == "OFF"
+        assert defines["SIMPLER_ENABLE_PTO_URMA_WORKSPACE"] == "OFF"
+
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
+    def test_a5_overlay_rdma_to_sdma_reconfigures_both(self, MockCompiler, tmp_path, monkeypatch):
+        """RDMA=ON then SDMA=ON must yield SDMA=ON and RDMA=OFF."""
+        from simpler_setup import pto_isa  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        self._make_runtime(tmp_path, "a5")
+        mock_instance = MockCompiler.get_instance.return_value
+        mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
+        for var in (
+            "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE",
+            "SIMPLER_ENABLE_PTO_URMA_WORKSPACE",
+            "SIMPLER_ENABLE_PTO_RDMA_WORKSPACE",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: "e" * 40)
+        monkeypatch.setattr(pto_isa, "ensure_pto_isa_root", lambda verbose=False: "/tmp/pto-isa")
+        monkeypatch.setattr(pto_isa, "write_pto_isa_build_metadata", lambda *args: None)
+
+        def host_defines() -> dict[str, str]:
+            builder = RuntimeBuilder(platform="a5")
+            builder.get_binaries("test_rt", build=True)
+            host_calls = [call for call in mock_instance.compile.call_args_list if call.args[0] == "host"]
+            return host_calls[-1].kwargs["cmake_defines"]
+
+        monkeypatch.setenv("SIMPLER_ENABLE_PTO_RDMA_WORKSPACE", "ON")
+        assert host_defines()["SIMPLER_ENABLE_PTO_RDMA_WORKSPACE"] == "ON"
+
+        monkeypatch.delenv("SIMPLER_ENABLE_PTO_RDMA_WORKSPACE", raising=False)
+        monkeypatch.setenv("SIMPLER_ENABLE_PTO_SDMA_WORKSPACE", "ON")
+        defines = host_defines()
+        assert defines["SIMPLER_ENABLE_PTO_RDMA_WORKSPACE"] == "OFF"
+        assert defines["SIMPLER_ENABLE_PTO_URMA_WORKSPACE"] == "OFF"
+        assert "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE" not in defines
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_sim_direct_build_does_not_write_pto_isa_metadata(self, MockCompiler, tmp_path, monkeypatch):

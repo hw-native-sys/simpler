@@ -319,46 +319,19 @@ inline void store_device_u32(uint64_t addr, uint32_t value) {
 #endif
 }
 
-inline void update_tail_info(const RdmaCqCtx &cq_ctx, const RdmaWqCtx & /*wq_ctx*/, uint32_t cur_tail) {
+inline void update_tail_info(const RdmaCqCtx &cq_ctx, const RdmaWqCtx &wq_ctx, uint32_t cur_tail) {
     if (cq_ctx.tail_addr != 0) {
         store_device_u32(cq_ctx.tail_addr, cur_tail);
     }
     if (cq_ctx.db_sw_addr != 0) {
         store_device_u32(cq_ctx.db_sw_addr, htobe32(cur_tail & kCqUpdateCiMask));
     }
-}
-
-// HNS1825 SQ hardware doorbell bit layout (mirrors pto-isa Hns1825SqDb).
-// AICore posts WQEs and rings this doorbell via st_dev in RingSqDoorbell; if
-// that write never reaches the NIC (head advances, software doorbell written,
-// but NIC never consumes), re-issuing the 64-bit doorbell from AICPU can
-// confirm whether the write path is the gap. This is a diagnostic helper: it
-// reproduces pto-isa's doorbell encoding and stores it to db_addr.
-inline void ring_sq_doorbell_from_aicpu(const RdmaWqCtx &wq_ctx, uint32_t cur_head) {
-    constexpr uint32_t kPiHighShift = 8;
-    constexpr uint32_t kPiFieldShift = 32;
-    constexpr uint32_t kDbTypeSq = 21;
-    constexpr uint32_t kSgidIdx = 1;
-    constexpr uint32_t kCntxSize = 1;
-    // Bit layout mirrors pto-isa Hns1825SqDb: qpn[19:0] cntx_size[21:20]
-    // rsvd0[22] c[23] cos[26:24] type[31:27] pi[39:32] rsvd1[47:40]
-    // xrc_vld[48] rsvd2[49] mtu_shift[52:50] sgid_index[59:53] sub_type[63:60].
-    uint64_t dbValue = 0;
-    dbValue |= static_cast<uint64_t>(wq_ctx.wqn & 0xfffffULL);                                  // qpn
-    dbValue |= static_cast<uint64_t>(kCntxSize) << 20;                                          // cntx_size
-    dbValue |= static_cast<uint64_t>(wq_ctx.db_cos & 0x7ULL) << 24;                             // cos (from workspace)
-    dbValue |= static_cast<uint64_t>(kDbTypeSq) << 27;                                          // type
-    dbValue |= static_cast<uint64_t>(wq_ctx.mtu_shift & 0x7ULL) << 50;                          // mtu_shift
-    dbValue |= static_cast<uint64_t>(kSgidIdx & 0x7fULL) << 53;                                 // sgid_index
-    dbValue |= ((static_cast<uint64_t>(cur_head >> kPiHighShift) & 0xffULL) << kPiFieldShift);  // PI high bits
-    if (wq_ctx.db_addr != 0) {
-        auto *db = reinterpret_cast<volatile uint64_t *>(static_cast<uintptr_t>(wq_ctx.db_addr));
-        __atomic_store_n(db, dbValue, __ATOMIC_RELEASE);
-        LOG_INFO(
-            "[ASYNC_WAIT RDMA] AICPU re-ring SQ doorbell db_addr=0x%llx head=%u db_cos=%u dbValue=0x%llx",
-            static_cast<unsigned long long>(wq_ctx.db_addr), cur_head, static_cast<unsigned>(wq_ctx.db_cos),
-            static_cast<unsigned long long>(dbValue)
-        );
+    // The SQ tail mirror holds the CQ consumer index (pto-isa RingCqDoorbell
+    // writes both mirrors from the same curTail). Advancing it here keeps the
+    // AICore post path's head-minus-tail drain check from seeing a stale
+    // near-full queue after the AICPU poller has already consumed completions.
+    if (wq_ctx.tail_addr != 0) {
+        store_device_u32(wq_ctx.tail_addr, cur_tail);
     }
 }
 
@@ -422,14 +395,7 @@ inline CompletionPollResult poll_rdma_event_handle(uint64_t event_handle, uint64
     cq_ctx.db_sw_addr = __atomic_load_n(&cq_entry->db_sw_addr, __ATOMIC_ACQUIRE);
 
     RdmaWqCtx wq_ctx{};
-    wq_ctx.wqn = __atomic_load_n(&wq_entry->wqn, __ATOMIC_ACQUIRE);
-    wq_ctx.depth = __atomic_load_n(&wq_entry->depth, __ATOMIC_ACQUIRE);
-    wq_ctx.head_addr = __atomic_load_n(&wq_entry->head_addr, __ATOMIC_ACQUIRE);
     wq_ctx.tail_addr = __atomic_load_n(&wq_entry->tail_addr, __ATOMIC_ACQUIRE);
-    wq_ctx.db_addr = __atomic_load_n(&wq_entry->db_addr, __ATOMIC_ACQUIRE);
-    wq_ctx.db_sw_addr = __atomic_load_n(&wq_entry->db_sw_addr, __ATOMIC_ACQUIRE);
-    wq_ctx.mtu_shift = __atomic_load_n(&wq_entry->mtu_shift, __ATOMIC_ACQUIRE);
-    wq_ctx.db_cos = __atomic_load_n(&wq_entry->db_cos, __ATOMIC_ACQUIRE);
     const uint32_t cqe_size = cq_ctx.cqe_size == 0 ? kCqeBytes : cq_ctx.cqe_size;
     const uint32_t cq_ring = cq_ctx.depth;
     if (cqe_size < sizeof(Hns1825Cqe) || cqe_size > kCqeBytes || cq_ctx.buf_addr == 0 || cq_ctx.tail_addr == 0 ||
@@ -492,20 +458,6 @@ inline CompletionPollResult poll_rdma_event_handle(uint64_t event_handle, uint64
 
     if (next_tail != cur_tail) {
         update_tail_info(cq_ctx, wq_ctx, next_tail);
-    }
-    if (!has_reached(next_tail, target_head)) {
-        // Diagnostic: AICore posts WQEs and rings the SQ hardware doorbell via
-        // st_dev, but the NIC is observed never consuming (head>tail, CQ empty).
-        // Re-issue the hardware doorbell from AICPU once per handle to test
-        // whether the AICore doorbell write is the gap. Logged once per handle.
-        static thread_local uint64_t last_ringed_handle = 0;
-        if (last_ringed_handle != event_handle) {
-            last_ringed_handle = event_handle;
-            const uint32_t sq_head = load_device_u32_or_zero(wq_ctx.head_addr);
-            if (sq_head != 0) {
-                ring_sq_doorbell_from_aicpu(wq_ctx, sq_head);
-            }
-        }
     }
     return {
         has_reached(next_tail, target_head) ? CompletionPollState::READY : CompletionPollState::PENDING,

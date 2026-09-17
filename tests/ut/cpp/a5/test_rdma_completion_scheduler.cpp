@@ -192,7 +192,7 @@ TEST(A5RdmaCompletionScheduler, ReadyCqeAdvancesCqDoorbellAndSqTail) {
     EXPECT_EQ(result.error_code, SIMPLER_ERROR_NONE);
     EXPECT_EQ(fixture.ws.cq_tail[1], 1u);
     EXPECT_EQ(fixture.ws.cq_sw_doorbell[1], __builtin_bswap32(1u));
-    EXPECT_EQ(fixture.ws.sq_tail[1], 0u);
+    EXPECT_EQ(fixture.ws.sq_tail[1], 1u);
 }
 
 TEST(A5RdmaCompletionScheduler, ReadyCqeAfterWrapAdvancesCqDoorbellAndSqTail) {
@@ -206,7 +206,7 @@ TEST(A5RdmaCompletionScheduler, ReadyCqeAfterWrapAdvancesCqDoorbellAndSqTail) {
     EXPECT_EQ(result.error_code, SIMPLER_ERROR_NONE);
     EXPECT_EQ(fixture.ws.cq_tail[1], kTestCqDepth + 1);
     EXPECT_EQ(fixture.ws.cq_sw_doorbell[1], __builtin_bswap32(kTestCqDepth + 1));
-    EXPECT_EQ(fixture.ws.sq_tail[1], kTestCqDepth);
+    EXPECT_EQ(fixture.ws.sq_tail[1], kTestCqDepth + 1);
 }
 
 TEST(A5RdmaCompletionScheduler, CqeErrorFailsAfterRetiringCqe) {
@@ -218,7 +218,33 @@ TEST(A5RdmaCompletionScheduler, CqeErrorFailsAfterRetiringCqe) {
     EXPECT_EQ(result.error_code, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
     EXPECT_EQ(fixture.ws.cq_tail[1], 1u);
     EXPECT_EQ(fixture.ws.cq_sw_doorbell[1], __builtin_bswap32(1u));
-    EXPECT_EQ(fixture.ws.sq_tail[1], 0u);
+    EXPECT_EQ(fixture.ws.sq_tail[1], 1u);
+}
+
+TEST(A5RdmaCompletionScheduler, RepeatedPollKeepsSqTailAlignedAcrossWrap) {
+    SchedulerWorkspaceFixture fixture;
+    // Consume several ready CQEs in one poll: the SQ tail mirror must follow
+    // the CQ consumer index, so a reused workspace does not see a stale
+    // near-full SQ that keeps re-entering the AICore drain path.
+    encode_test_cqe(fixture.ws.scq_entries[1][0], 0, false);
+    encode_test_cqe(fixture.ws.scq_entries[1][1], 1, false);
+    encode_test_cqe(fixture.ws.scq_entries[1][2], 2, false);
+
+    auto result = poll_rdma_event_handle(encode_rdma_event_handle(1, 3), fixture.addr());
+    EXPECT_EQ(result.state, CompletionPollState::READY);
+    EXPECT_EQ(fixture.ws.cq_tail[1], 3u);
+    EXPECT_EQ(fixture.ws.sq_tail[1], 3u);
+
+    // Reuse the same workspace from a near-wrap tail, crossing the ring depth.
+    fixture.ws.cq_tail[1] = kTestCqDepth - 1;
+    fixture.ws.sq_tail[1] = kTestCqDepth - 1;
+    encode_test_cqe(fixture.ws.scq_entries[1][kTestCqDepth - 1], kTestCqDepth - 1, false);
+    encode_test_cqe(fixture.ws.scq_entries[1][0], kTestCqDepth, false);
+
+    result = poll_rdma_event_handle(encode_rdma_event_handle(1, kTestCqDepth + 1), fixture.addr());
+    EXPECT_EQ(result.state, CompletionPollState::READY);
+    EXPECT_EQ(fixture.ws.cq_tail[1], kTestCqDepth + 1);
+    EXPECT_EQ(fixture.ws.sq_tail[1], kTestCqDepth + 1);
 }
 
 static_assert(sizeof(TestRdmaCqe) == kCqeBytes);
