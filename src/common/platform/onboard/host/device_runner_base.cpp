@@ -2002,6 +2002,8 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     }
     device_run_results_.fill(DeviceRunResultRegion{});
     device_run_result_initialized_.fill(false);
+    device_run_result_read_epochs_.fill(0);
+    device_run_result_read_ok_.fill(false);
 
     // The AICore register-address tables are device constants committed once per
     // device context, so this is where they are returned — same window and same
@@ -2241,21 +2243,50 @@ int DeviceRunnerBase::ensure_device_run_result_region(
     return 0;
 }
 
-void DeviceRunnerBase::read_device_run_result(uint32_t pipeline_slot) {
+void DeviceRunnerBase::read_device_run_result(uint32_t pipeline_slot, uint64_t run_epoch) {
     if (pipeline_slot >= device_run_results_.size()) return;
+    // One read per run: later consumers share the first read's bytes. A retry
+    // would either cost a second D2H for the same answer or, after a device
+    // recovery, sample a generation this run never wrote.
+    if (run_epoch != 0 && device_run_result_read_epochs_[pipeline_slot] == run_epoch) return;
     DeviceRunResultRegion &out = device_run_results_[pipeline_slot];
     out = DeviceRunResultRegion{};
+    device_run_result_read_epochs_[pipeline_slot] = run_epoch;
+    device_run_result_read_ok_[pipeline_slot] = false;
     void *slot_ptr = device_run_result_dev_ptrs_[pipeline_slot];
     if (slot_ptr == nullptr) return;
     // The region is this slot's, and the slot is not handed to another run until
     // the run holding it finalizes, so this read races nothing. What makes the
-    // payload this run's rather than a successor's is that its device side wrote
+    // record this run's rather than a successor's is that its device side wrote
     // and published it before its kernel returned.
     int rc = rtMemcpy(&out, sizeof(out), slot_ptr, sizeof(out), RT_MEMCPY_DEVICE_TO_HOST);
     if (rc != 0) {
         LOG_WARN("rtMemcpy(run_result) D2H failed: %d", rc);
         out = DeviceRunResultRegion{};
+        return;
     }
+    device_run_result_read_ok_[pipeline_slot] = true;
+}
+
+DeviceRunTerminal DeviceRunnerBase::device_run_terminal(uint32_t pipeline_slot, uint64_t run_epoch) const {
+    DeviceRunTerminal undecided;
+    if (run_epoch == 0) {
+        undecided.reason = "run has no epoch";
+        return undecided;
+    }
+    if (pipeline_slot >= device_run_results_.size()) {
+        undecided.reason = "pipeline slot out of range";
+        return undecided;
+    }
+    if (device_run_result_read_epochs_[pipeline_slot] != run_epoch) {
+        undecided.reason = "no read taken for this run";
+        return undecided;
+    }
+    if (!device_run_result_read_ok_[pipeline_slot]) {
+        undecided.reason = "result read-back failed";
+        return undecided;
+    }
+    return device_run_result_terminal(device_run_results_[pipeline_slot], run_epoch);
 }
 
 void DeviceRunnerBase::ensure_device_wall_buffer(uint32_t pipeline_slot, KernelArgsHelper &kernel_args) {

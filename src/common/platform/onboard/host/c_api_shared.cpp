@@ -787,6 +787,47 @@ int supports_concurrent_native_prepare_ctx(DeviceContextHandle ctx) {
     return ctx != nullptr && concurrent_native_prepare_supported_impl() != 0 ? 1 : 0;
 }
 
+/**
+ * Compare the run's device-published terminal record against the channel that
+ * still decides the run — the stream synchronize behind `execution_rc`.
+ *
+ * The terminal record is being produced but is not yet trusted: #2267's normal
+ * drain still synchronizes the whole stream pair, and the record may only take
+ * that job over once it has been shown to agree. Running both and logging every
+ * disagreement is what produces that evidence, so this reports and never
+ * overrides. A run the record cannot decide is not a disagreement — the
+ * producers that publish nothing on a path are exactly what the audit is for,
+ * and the reason names which path it was.
+ */
+static void report_terminal_disagreement(const OnboardNativeRunContext *state, int execution_rc) {
+    const DeviceRunTerminal terminal =
+        state->runner->device_run_terminal(state->descriptor.pipeline_slot, state->descriptor.run_epoch);
+    switch (terminal.state) {
+    case DeviceRunTerminalState::Succeeded:
+        if (execution_rc != 0) {
+            LOG_ERROR(
+                "run terminal disagreement: device published success, execution reported %d (%s)", execution_rc,
+                state->trace_attrs
+            );
+        }
+        break;
+    case DeviceRunTerminalState::Failed:
+        if (execution_rc == 0) {
+            LOG_ERROR(
+                "run terminal disagreement: device published failure code %d (source %u), execution reported "
+                "success (%s)",
+                terminal.code, static_cast<unsigned>(terminal.source), state->trace_attrs
+            );
+        }
+        break;
+    case DeviceRunTerminalState::Undecided:
+        LOG_INFO(
+            "run terminal undecided: %s; execution reported %d (%s)", terminal.reason, execution_rc, state->trace_attrs
+        );
+        break;
+    }
+}
+
 static int cleanup_failed_prepare(OnboardNativeRunContext *state, int execution_rc, bool clear_gm_sm) {
     const uint64_t trace_inv = state->trace_inv;
     const uint64_t trace_hid = state->trace_hid;
@@ -1156,16 +1197,14 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         if (attach_rc == 0) {
             // Immediately before the consumer, and after whichever drain
             // completed the run — `simpler_wait_run` may have done it, leaving
-            // nothing for the catch-up drain above. Read only on the error path,
-            // because a failing run is the only thing a producer publishes
-            // today, so the gate is the channel that reports the failure: for a
-            // normal drain that is still the stream synchronize (#2267 is open).
-            // Whatever replaces that channel has to keep reaching here for a
-            // business error too — a run whose error never triggers the read
-            // reports no detail, and an unread region must not be mistaken for
-            // the absence of a failure.
-            if (launched && execution_rc != 0) {
-                state->runner->read_device_run_result(state->descriptor.pipeline_slot);
+            // nothing for the catch-up drain above. Read on every launched run,
+            // not only the failing ones: the device now publishes a terminal
+            // record for a success too, and a channel only consulted after some
+            // other channel already decided can never replace that other
+            // channel. One read per run; finalize consumes this copy.
+            if (launched) {
+                state->runner->read_device_run_result(state->descriptor.pipeline_slot, state->descriptor.run_epoch);
+                report_terminal_disagreement(state, execution_rc);
             }
             {
                 STRACE("chip.run.validate");

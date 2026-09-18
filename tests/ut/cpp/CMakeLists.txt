@@ -960,6 +960,26 @@ target_link_libraries(test_dep_gen_collector_aicpu PRIVATE
 add_test(NAME test_dep_gen_collector_aicpu COMMAND test_dep_gen_collector_aicpu)
 set_tests_properties(test_dep_gen_collector_aicpu PROPERTIES LABELS "no_hardware")
 
+# One run's terminal record: the wire layout every arch/runtime pair publishes,
+# the AICPU publisher, and the fold that picks the code. The sim cache_ops give
+# the publisher's flushes a host-side no-op implementation.
+add_executable(test_run_terminal_record
+    common/test_run_terminal_record.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/aicpu/cache_ops.cpp
+)
+target_include_directories(test_run_terminal_record PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+)
+target_link_libraries(test_run_terminal_record PRIVATE
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    pthread
+)
+add_test(NAME test_run_terminal_record COMMAND test_run_terminal_record)
+set_tests_properties(test_run_terminal_record PROPERTIES LABELS "no_hardware")
+
 function(add_pmu_collector_test name platform)
     add_executable(${name}
         common/test_pmu_collector.cpp

@@ -529,28 +529,46 @@ public:
      * so a caller cannot read a predecessor's payload as this run's. `*bytes_out`
      * receives the published length.
      *
-     * Absent carries no further meaning. A producer publishes only when it has
-     * something to preserve, so a run that reported nothing and a run that never
-     * reached its publish point — one the op-execute watchdog reaped, say — both
-     * read as absent. This is therefore not a completion signal: a caller
-     * decides that a run failed from the execution error channel, and comes here
-     * for the detail. A missing result must not become a success, and must not
-     * be answered by reading shared device state, which by then may belong to a
-     * successor.
+     * Absent carries no verdict. A producer attaches a payload only to a
+     * failure, so a successful run, a run that reported no detail and a run
+     * that never reached its publish point — one the op-execute watchdog
+     * reaped, say — all read as absent here. Whether the run succeeded is
+     * `device_run_terminal`'s answer, and it must not be inferred from the
+     * presence or absence of this payload, nor answered by reading shared
+     * device state, which by then may belong to a successor.
      */
     const uint8_t *device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, size_t *bytes_out) const;
 
     /**
      * Copy this slot's result region into the host-side copy `device_run_result`
-     * reads. Call after the run's device work has been synchronized: what makes
-     * the payload this run's rather than a successor's is that its device side
-     * published it before its kernel returned, so this read itself races
-     * nothing — the slot is not handed on until the run holding it finalizes.
+     * and `device_run_terminal` read. Call after the run's own completion
+     * boundaries: what makes the record this run's rather than a successor's is
+     * that its device side published it before its kernel returned, so this read
+     * itself races nothing — the slot is not handed on until the run holding it
+     * finalizes.
      *
-     * Leaves the host copy empty when there is no region or the copy fails, so a
-     * failed read reports "no result" rather than stale bytes.
+     * One read per run. A repeat call for an epoch already read is a no-op, so
+     * every later consumer sees the same bytes and no path pays a second D2H —
+     * in particular a read must not be retried after a device recovery, which
+     * would sample a generation this run never wrote.
+     *
+     * Leaves the host copy empty when there is no region or the copy fails; a
+     * failed copy is recorded as such, so it reads as undecided rather than as
+     * an absent record.
      */
-    void read_device_run_result(uint32_t pipeline_slot);
+    void read_device_run_result(uint32_t pipeline_slot, uint64_t run_epoch);
+
+    /**
+     * What this slot's cached region says about the run whose epoch is
+     * `run_epoch`: succeeded, failed with the runtime's own signed code, or
+     * undecided with the reason.
+     *
+     * This is the run's execution outcome only. It does not say the device is
+     * healthy and it does not say the run's resources are retirable — a device
+     * can publish a failure and keep tearing down. Quiescence comes from the
+     * run's completion boundaries and its outstanding wait references.
+     */
+    DeviceRunTerminal device_run_terminal(uint32_t pipeline_slot, uint64_t run_epoch) const;
 
     /**
      * Per-slot task-timing dispatch/finish (ns) on the same device-clock timeline
@@ -1791,6 +1809,13 @@ protected:
     // gated on diagnostics — an error result must survive with capture off.
     std::array<void *, PTO_PIPELINE_MAX_DEPTH> device_run_result_dev_ptrs_{};
     std::array<DeviceRunResultRegion, PTO_PIPELINE_MAX_DEPTH> device_run_results_{};
+    // The epoch the cached copy was read for, and whether that read succeeded.
+    // Together they make the read once-per-run and keep a failed copy
+    // distinguishable from a region no run published into: an empty copy read
+    // successfully is an absent record, an empty copy left by a failed D2H is
+    // no observation at all.
+    std::array<uint64_t, PTO_PIPELINE_MAX_DEPTH> device_run_result_read_epochs_{};
+    std::array<bool, PTO_PIPELINE_MAX_DEPTH> device_run_result_read_ok_{};
     // Whether a slot's region has had `published` zeroed since it was
     // allocated. `allocate_tensor` is an `rtMalloc`, so a fresh region holds
     // whatever the device left there — which cannot be assumed to differ from
