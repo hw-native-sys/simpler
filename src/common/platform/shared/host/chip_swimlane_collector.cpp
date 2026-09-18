@@ -717,10 +717,11 @@ void ChipSwimlaneCollector::on_buffer_collected(const ReadyBufferInfo &info, int
 // reconcile_counters / read_phase_header_metadata
 // ---------------------------------------------------------------------------
 //
-// Host never recovers records from device-side current_buf_ptr. Device flush
-// is the only data path: a flush failure must bump dropped_record_count and
-// clear current_buf_ptr on the device side. Host's job here is purely
-// accounting + sanity check.
+// Host never recovers records from device-side current_buf_ptr. Device flush is
+// the only data path: a flush failure bumps dropped_record_count and zeroes the
+// buffer's count, but the buffer stays the pool's — AICPU consumes the free
+// queue and never produces into it, so reuse by the next run's init is its only
+// return. Host's job here is purely accounting + sanity check.
 
 void ChipSwimlaneCollector::reconcile_counters() {
     if (shm_host_ == nullptr) {
@@ -745,12 +746,16 @@ void ChipSwimlaneCollector::reconcile_counters() {
     // and any non-zero silent loss flags an unaccounted gap on top of the
     // already-classified dropped losses.
     //
-    // Sanity sub-check: after stop(), any active buffer with records must
-    // have been flushed by AICPU (success → current_buf_ptr=0; failure →
-    // bump dropped, clear count + current_buf_ptr). A non-zero pointer with
-    // non-zero count means records AICPU neither delivered nor accounted
-    // for — i.e. a device-side flush bug. Empty buffers (count=0, never
-    // written) are fine; AICPU's flush legitimately skips them.
+    // Sanity sub-check: after stop(), a retained buffer must hold no records.
+    // Two outcomes leave `current_buf_ptr` set, and both are legitimate: a run
+    // with nothing to publish, and one whose enqueue failed (which charges
+    // `dropped` and zeroes `count` first). Either way the count is 0 and the
+    // next run's init reuses the buffer in place. A non-zero pointer with a
+    // non-zero count is the bug: those records were neither delivered nor
+    // charged to `dropped`.
+    //
+    // This check covers the PERF and PHASE pools. The AICore task pool is not
+    // reconciled here at all, so it says nothing about that pool either way.
     auto reconcile_one = [&](const char *kind, const char *unit_name, int unit_count, auto get_state,
                              auto read_buf_count, size_t buf_size, uint64_t collected, bool optional) {
         int leftover_active = 0;

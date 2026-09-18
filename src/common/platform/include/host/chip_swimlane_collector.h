@@ -338,8 +338,11 @@ using ChipSwimlaneFreeCallback = profiling_common::ProfFreeCallback;
  *   7. export_swimlane_json() / finalize().
  *
  * Host never reads from device-side `current_buf_ptr` to recover records:
- * device flush is the only data path. Any non-zero `current_buf_ptr` after
- * stop() is logged as a bug.
+ * device flush is the only data path. A non-zero `current_buf_ptr` after stop()
+ * means the pool still owns that buffer, which is legitimate — a run with
+ * nothing to publish, or one whose enqueue failed, keeps it for the next run's
+ * init to reuse in place. Only a retained buffer whose `count` is non-zero is a
+ * bug: those records were neither delivered nor charged to `dropped`.
  */
 class ChipSwimlaneCollector : public profiling_common::ProfilerBase<ChipSwimlaneCollector, ChipSwimlaneModule> {
 public:
