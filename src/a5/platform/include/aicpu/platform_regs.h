@@ -127,6 +127,15 @@ void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value);
  */
 void platform_init_aicore_regs(uint64_t reg_addr);
 
+/** Send an AICore exit signal without waiting for its acknowledgement. */
+void platform_signal_aicore_exit(uint64_t reg_addr);
+
+/** Return one absolute timeout deadline shared by a group of exiting cores. */
+uint64_t platform_aicore_exit_deadline();
+
+/** Wait for a previously signalled core, then restore its dispatch register. */
+int32_t platform_finish_aicore_exit(uint64_t reg_addr, uint64_t deadline);
+
 /**
  * Deinitialize AICore registers before termination
  *

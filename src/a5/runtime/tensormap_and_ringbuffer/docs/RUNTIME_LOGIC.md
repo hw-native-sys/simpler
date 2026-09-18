@@ -647,7 +647,7 @@ Public surface (called from `AicpuExecutor::init/run/deinit`):
 | `post_handshake_init(runtime)` | leader, after barrier | Build worker-id lists in core order, assign cores to threads |
 | `bind_runtime(rt)` | device-orch only | Wire `sched_` to `rt->scheduler` once the orchestrator thread creates `rt` |
 | `resolve_and_dispatch(runtime, thread_idx)` | per scheduler thread | Main dispatch loop |
-| `shutdown(thread_idx)` | per thread on exit | `platform_deinit_aicore_regs` for this thread's cores |
+| `shutdown(thread_idx)` | per thread on exit | Signal EXIT to all of this thread's cores, then wait for each ACK against one shared deadline (`platform_signal_aicore_exit` / `platform_finish_aicore_exit`) |
 | `on_orchestration_done(runtime, rt, thread_idx, total_tasks)` | orchestrator thread | Publish core assignments, latch task count, fold inline-completed tasks, flip `orchestrator_done_`, and run `emergency_shutdown` on fatal |
 | `deinit()` | once per run | Reset every scheduler-owned field to its post-construction default |
 | Read-only accessors | various | `aic_count()` / `aiv_count()` / `is_completed()` / `completed_tasks_count()` |

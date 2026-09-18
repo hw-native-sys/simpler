@@ -914,7 +914,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     }
 
     // Always shutdown AICore — even if sched_ctx_.completed_ was already true.
-    // platform_deinit_aicore_regs is idempotent; orchestrator threads have
+    // The exit signal and ACK wait are idempotent; orchestrator threads have
     // core_trackers_[thread_idx].core_num() == 0 so they skip the loop harmlessly.
     int32_t shutdown_rc = sched_ctx_.shutdown(thread_idx);
     if (shutdown_rc != 0 && run_rc == 0) {

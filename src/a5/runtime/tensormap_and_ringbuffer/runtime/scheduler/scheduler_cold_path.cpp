@@ -649,13 +649,22 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx) {
 #endif
 
     LOG_INFO("Thread %d: Shutting down %d cores", thread_idx, core_num);
+    // Every owned core is signalled before any of them is waited on, so their
+    // exit responses overlap.
+    for (int32_t i = 0; i < core_num; i++) {
+        uint64_t reg_addr = core_exec_states_[cores[i]].reg_addr;
+        if (reg_addr != 0) platform_signal_aicore_exit(reg_addr);
+    }
+    // One absolute bound for the whole group: a core that answers late is judged
+    // against the same deadline as its peers.
+    const uint64_t deadline = platform_aicore_exit_deadline();
     int32_t rc = 0;
     for (int32_t i = 0; i < core_num; i++) {
         int32_t core_id = cores[i];
         uint64_t reg_addr = core_exec_states_[core_id].reg_addr;
         if (reg_addr != 0) {
             // Timeout means AICore is unresponsive. Log and continue deiniting remaining cores.
-            if (platform_deinit_aicore_regs(reg_addr) != 0) {
+            if (platform_finish_aicore_exit(reg_addr, deadline) != 0) {
                 LOG_ERROR("Thread %d: Core %d deinit timed out", thread_idx, core_id);
                 rc = -1;
             }
