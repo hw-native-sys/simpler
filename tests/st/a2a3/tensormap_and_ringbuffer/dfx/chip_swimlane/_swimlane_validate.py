@@ -131,8 +131,13 @@ def validate_perf_artifact(case_label: str, *, since: float, expected_task_count
         str(perf),
     ]
     deps_sibling = Path(perf).parent / "deps.json"
-    if deps_sibling.exists():
-        sched_cmd += ["--deps-json", str(deps_sibling)]
+    assert deps_sibling.exists(), (
+        f"deps.json absent beside {perf.name} under {out_dir}. This smoke runs with --enable-dep-gen, so the "
+        f"DAG is expected; its absence means dep_gen collected nothing the completeness gate would emit, not "
+        f"that the tool was invoked wrongly. Grep the step's output for 'count mismatch' / 'silent_loss' to "
+        f"see what the collector lost."
+    )
+    sched_cmd += ["--deps-json", str(deps_sibling)]
     result = subprocess.run(sched_cmd, check=True, timeout=120, capture_output=True, text=True)
     for header in ("Part 1:", "Part 2:", "Part 5:", "Part 6:"):
         assert header in result.stdout, f"sched_overhead missing section header '{header}'\nstdout:\n{result.stdout}"
