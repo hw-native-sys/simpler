@@ -85,7 +85,9 @@ extern "C" {
  *
  * Consumer paths:
  *       - AICPU: receives this KernelArgs directly via rtsLaunchCpuKernel
- *       - AICore: receives device KernelArgs* via KERNEL_ENTRY
+ *       - AICore: receives `AicoreLaunchArgs` via KERNEL_ENTRY, a projection of
+ *         this struct carrying the subset its entry reads. It never reads this
+ *         struct itself.
  */
 struct KernelArgs {
     // Offset-locked front: the front-less launch protocol and the device
@@ -146,6 +148,37 @@ struct KernelArgs {
 
 static_assert(offsetof(KernelArgs, runtime_args) == 0, "KernelArgs::runtime_args offset drift");
 static_assert(offsetof(KernelArgs, regs) == 8, "KernelArgs::regs offset drift");
+
+/**
+ * AicoreLaunchArgs - the AICore entry's launch argument block.
+ *
+ * Mirrors `KERNEL_ENTRY(aicore_kernel)`'s parameter list field for field: ccec
+ * demotes a struct parameter to a hidden pointer, so the entry takes a flat
+ * scalar list and this is the host-side image of it. Changing either without
+ * the other silently mis-decodes the block.
+ *
+ * Every address an AICore entry needs is here, so the entry publishes its
+ * per-core state from these values alone and reads no GM to do it. The driver
+ * copies the block during the launch call, so the host builds it after
+ * collector arming and these are this run's final values.
+ */
+struct AicoreLaunchArgs {
+    uint64_t runtime_args;
+    uint32_t enable_profiling_flag;
+    uint64_t ffts_base_addr;
+    uint64_t chip_swimlane_aicore_rotation_table;
+};
+
+static_assert(sizeof(AicoreLaunchArgs) == 32, "AicoreLaunchArgs size drift");
+
+/**
+ * Fill the fields of `AicoreLaunchArgs` that only this architecture has, so the
+ * shared launch path can build the block without knowing which arch it is on.
+ */
+inline void fill_arch_launch_args(AicoreLaunchArgs &args, const KernelArgs &k_args) {
+    args.ffts_base_addr = k_args.ffts_base_addr;
+    args.chip_swimlane_aicore_rotation_table = k_args.chip_swimlane_aicore_rotation_table;
+}
 
 /**
  * InitArgs - per-device runtime configuration

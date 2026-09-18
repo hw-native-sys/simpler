@@ -65,25 +65,28 @@ int query_stream_pair_nonblocking(rtStream_t aicpu_stream, rtStream_t aicore_str
 int query_stream_pair_error(rtStream_t aicpu_stream, rtStream_t aicore_stream);
 
 /**
- * The device blocks one pipeline slot reuses across every run it prepares.
+ * The device block one pipeline slot reuses across every run it prepares.
  *
- * Both have a size fixed for the runner's lifetime — `sizeof(KernelArgs)` and
- * the runtime variant's device-copy length — so a run rewrites their contents
- * rather than reallocating them. A slot admits at most one run at a time
+ * Its size is fixed for the runner's lifetime — the runtime variant's
+ * device-copy length — so a run rewrites its contents rather than
+ * reallocating it. A slot admits at most one run at a time
  * (`try_reserve_native_run` rejects a second reservation on an occupied slot),
- * so one block per slot needs no further serialization.
+ * so one block per slot needs no further serialization. Per-slot rather than
+ * per-runner because the copy is not ordered on the run stream: a prepared
+ * successor would otherwise overwrite the image its predecessor is executing
+ * against.
  *
- * The runner owns these for its whole lifetime and releases them in
- * `finalize()`, alongside the collector resources that already work this way.
+ * The runner owns this for its whole lifetime and releases it in `finalize()`,
+ * alongside the collector resources that already work this way.
  *
  * The AICore register tables are deliberately NOT here: they are device
  * constants, identical for every slot, and are owned per device context by
- * `DeviceRunnerBase::aicore_{ctrl,pmu}_reg_table_dev_`.
+ * `DeviceRunnerBase::aicore_{ctrl,pmu}_reg_table_dev_`. Nor is a device copy of
+ * `KernelArgs`: AICore receives everything it needs as launch arguments.
  */
 struct SlotPersistentArgs {
-    Runtime *runtime_args{nullptr};      // device copy of the Runtime prefix
-    KernelArgs *device_k_args{nullptr};  // device copy of KernelArgs for AICore
-    uint64_t runtime_bytes{0};           // committed length of runtime_args
+    Runtime *runtime_args{nullptr};  // device copy of the Runtime prefix
+    uint64_t runtime_bytes{0};       // committed length of runtime_args
 };
 
 /**
@@ -110,15 +113,13 @@ struct KernelArgsHelper {
     KernelArgsHelper &operator=(const KernelArgsHelper &) = delete;
     KernelArgsHelper(KernelArgsHelper &&other) noexcept :
         args(other.args),
-        allocator_(std::exchange(other.allocator_, nullptr)),
-        device_k_args_(std::exchange(other.device_k_args_, nullptr)) {
+        allocator_(std::exchange(other.allocator_, nullptr)) {
         other.args = KernelArgs{};
     }
     KernelArgsHelper &operator=(KernelArgsHelper &&) = delete;
 
     KernelArgs args;
     MemoryAllocator *allocator_{nullptr};
-    KernelArgs *device_k_args_{nullptr};  // Device copy of KernelArgs for AICore
 
     /**
      * Publish the host runtime into the slot's device copy, committing that
@@ -132,24 +133,12 @@ struct KernelArgsHelper {
     int init_runtime_args(const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot);
 
     /**
-     * Publish this run's `KernelArgs` into the slot's device copy, committing
-     * that copy on first use. AICore's `KERNEL_ENTRY` expects a `KernelArgs *`
-     * (not a `Runtime *`) so it can read the profiling enablement bits + ring
-     * address tables and forward them into AICore platform state. Call this
-     * after every `kernel_args.args.*` field is populated for the run.
-     */
-    int init_device_kernel_args(MemoryAllocator &allocator, SlotPersistentArgs &slot);
-
-    /**
      * Drop this run's view of the slot's device blocks.
      *
      * The blocks themselves stay committed for the next run on this slot; only
      * the per-run `KernelArgs` stops naming them.
      */
-    void release_run_view() {
-        args.runtime_args = nullptr;
-        device_k_args_ = nullptr;
-    }
+    void release_run_view() { args.runtime_args = nullptr; }
 
     /**
      * Clear device-pointer bookkeeping without calling the allocator.
@@ -158,7 +147,6 @@ struct KernelArgsHelper {
      */
     void abandon_after_device_failure() {
         args.runtime_args = nullptr;
-        device_k_args_ = nullptr;
         allocator_ = nullptr;
     }
 

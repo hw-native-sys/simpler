@@ -928,10 +928,12 @@ public:
      * manifested in CI as 207001 at `rtKernelLaunchWithHandleV2` with a
      * 507899 cascade at `rtStreamCreate`.
      *
-     * `k_args` reaches the AICore kernel through `rtArgsEx_t` as a
-     * device-resident KernelArgs payload pointer.
+     * `k_args` is projected into `AicoreLaunchArgs` and reaches the AICore
+     * kernel as the `rtArgsEx_t` parameter block itself — by value, with no
+     * device-resident copy. The projection carries this run's final values, so
+     * the call must follow collector arming.
      */
-    int launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args);
+    int launch_aicore_kernel(rtStream_t stream, const KernelArgs &k_args);
 
     /**
      * Walk the SDMA control path once per channel, so the first TPREFETCH_ASYNC

@@ -123,9 +123,12 @@ onboard Path A implementation:
 3. **Shared per-task `KernelArgs` payload.**
    `src/{a2a3,a5}/platform/include/common/kernel_args.h` is front-less.
    Runtime state is passed through `KernelArgs::runtime_args`, profiling buffer
-   bases, and register tables. AICore receives only this payload through the
-   host-owned device copy. Per-device invariants (device id, log config) are NOT
-   on `KernelArgs` — they travel once via `InitArgs`.
+   bases, and register tables. **AICPU** receives this payload by value, as the
+   launch argument blob. **AICore** receives `AicoreLaunchArgs`, a projection of
+   the same struct holding the subset its entry reads, also by value in its own
+   launch argument block. Neither side reads a device-resident copy. Per-device
+   invariants (device id, log config) are NOT on `KernelArgs` — they travel once
+   via `InitArgs`.
 
 Keep those channels distinct. The bootstrap ABI still uses the `DeviceArgs`
 name because the dispatcher really reads that structure. The platform per-task

@@ -280,7 +280,10 @@ per callable.
 Onboard per-task launches pass the front-less `KernelArgs` payload directly to
 `rtsLaunchCpuKernel` with no CANN launch front: runtime state flows through
 `runtime_args` (at offset 0) and the other profiling/logging/register fields.
-AICore receives only a device copy of that same `KernelArgs` payload.
+AICore receives `AicoreLaunchArgs` in its own launch argument block — a
+projection of the same struct holding the subset its entry reads, the `Runtime`
+address plus the profiling flag and the addresses it gates. No device copy of
+`KernelArgs` is involved on either side.
 
 ## Execution Lifecycle
 

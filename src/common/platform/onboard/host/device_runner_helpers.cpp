@@ -116,36 +116,8 @@ int KernelArgsHelper::init_runtime_args(
     return 0;
 }
 
-int KernelArgsHelper::init_device_kernel_args(MemoryAllocator &allocator, SlotPersistentArgs &slot) {
-    allocator_ = &allocator;
-    if (slot.device_k_args == nullptr) {
-        void *dev_ptr = allocator_->alloc(sizeof(KernelArgs));
-        if (dev_ptr == nullptr) {
-            LOG_ERROR("Alloc for device KernelArgs failed");
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-        slot.device_k_args = reinterpret_cast<KernelArgs *>(dev_ptr);
-    }
-    device_k_args_ = slot.device_k_args;
-    int rc = rtMemcpy(device_k_args_, sizeof(KernelArgs), &args, sizeof(KernelArgs), RT_MEMCPY_HOST_TO_DEVICE);
-    if (rc != 0) {
-        LOG_ERROR("rtMemcpy for KernelArgs failed: %d", rc);
-        device_k_args_ = nullptr;
-        return rc;
-    }
-    return 0;
-}
-
 int release_slot_persistent_args(SlotPersistentArgs &slot, MemoryAllocator &allocator) {
     int first_error = 0;
-    if (slot.device_k_args != nullptr) {
-        const int rc = allocator.free(slot.device_k_args);
-        if (rc != 0) {
-            first_error = rc;
-        } else {
-            slot.device_k_args = nullptr;
-        }
-    }
     if (slot.runtime_args != nullptr) {
         const int rc = allocator.free(slot.runtime_args);
         if (rc != 0) {
@@ -159,7 +131,6 @@ int release_slot_persistent_args(SlotPersistentArgs &slot, MemoryAllocator &allo
 }
 
 void abandon_slot_persistent_args(SlotPersistentArgs &slot) {
-    slot.device_k_args = nullptr;
     slot.runtime_args = nullptr;
     slot.runtime_bytes = 0;
 }

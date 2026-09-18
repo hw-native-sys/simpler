@@ -61,9 +61,16 @@ struct PersistentArgsOps {
 };
 
 /**
- * Prepare-once / reuse-N-times / release-at-close owner of the three device
- * blocks an AICore launch reads: the device `Runtime` image, the per-core
- * register table, and the device copy of `KernelArgs` itself.
+ * Prepare-once / reuse-N-times / release-at-close owner of the device blocks a
+ * kernel-mode AICore launch will read: the device `Runtime` image, the per-core
+ * register table, and a device copy of `KernelArgs`.
+ *
+ * No launch site consumes these yet — kernel mode has no AICore launch, and
+ * `device_k_args()` has no caller outside the unit tests. Program mode's
+ * AICore launch no longer reads a device `KernelArgs` at all: it projects what
+ * the entry needs into the launch argument block. So the device `KernelArgs`
+ * copy here may turn out to be unnecessary for whichever launch this owner
+ * eventually feeds.
  *
  * Every operation this object performs happens in `prepare_once` and
  * `finalize_once`. The destructor performs none, so an owner that is dropped

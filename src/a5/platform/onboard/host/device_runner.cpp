@@ -443,11 +443,6 @@ int DeviceRunner::prepare_execution(
     rc = init_runtime_args_with_metadata(runtime, execution->kernel_args, slot_args);
     if (rc != 0) return rc;
 
-    rc = execution->kernel_args.init_device_kernel_args(mem_alloc_, slot_args);
-    if (rc != 0) {
-        LOG_ERROR("init_device_kernel_args failed: %d", rc);
-        return rc;
-    }
     execution->num_aicore = num_aicore;
     execution->launch_aicpu_num = active_aicpu_num;
     prepare_rollback.dismiss();
@@ -526,7 +521,7 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
             run_poll_state_.store(RunPollState::Enqueuing, std::memory_order_release);
             LOG_INFO("=== launch_aicore_kernel ===");
             run_poll_state_.store(RunPollState::Submitted, std::memory_order_release);
-            int launch_rc = launch_aicore_kernel(stream_aicore_, prepared->kernel_args.device_k_args_);
+            int launch_rc = launch_aicore_kernel(stream_aicore_, prepared->kernel_args.args);
             if (launch_rc != 0) {
                 LOG_ERROR("launch_aicore_kernel failed: %d", launch_rc);
                 recover_device_or_mark_unusable(launch_rc);
@@ -1179,17 +1174,6 @@ int DeviceRunner::arm_collectors_for_run(Runtime &runtime, PreparedExecution &pr
     if (dfx.scope_stats_enabled) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_SCOPE_STATS);
     prepared.kernel_args.args.enable_profiling_flag = enable_profiling_flag;
 
-    // AICore's KERNEL_ENTRY reads the profiling flag and the swimlane / PMU ring
-    // tables out of the device copy of KernelArgs, and prepare uploaded that copy
-    // before any of the above ran. The AICPU side needs no refresh: it receives
-    // the host-side struct as the launch argument blob.
-    if (dfx.diagnostics_any()) {
-        rc = prepared.kernel_args.init_device_kernel_args(mem_alloc_, slot_persistent_args(prepared.pipeline_slot));
-        if (rc != 0) {
-            LOG_ERROR("KernelArgs refresh after collector arming failed: %d", rc);
-            return rc;
-        }
-    }
     return 0;
 }
 

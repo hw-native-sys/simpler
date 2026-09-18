@@ -2094,7 +2094,7 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     return rc;
 }
 
-int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args) {
+int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, const KernelArgs &k_args) {
     // Lazy-register the AICore binary on first call; reuse cached handle
     // thereafter. CANN has no public rtUnregisterAllKernel, so re-registering
     // every run would pin another device-side copy of the ELF and quickly
@@ -2120,10 +2120,14 @@ int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args
         }
     }
 
-    struct Args {
-        KernelArgs *k_args;
-    };
-    Args args = {k_args};
+    // `AicoreLaunchArgs` is the host-side image of the entry's parameter list
+    // and is defined per-arch beside the entry's ABI, in common/kernel_args.h.
+    // The driver copies `argsSize` bytes during the launch call, so a stack
+    // local satisfies its host-buffer lifetime requirement.
+    AicoreLaunchArgs args{};
+    args.runtime_args = reinterpret_cast<uint64_t>(k_args.runtime_args);
+    args.enable_profiling_flag = k_args.enable_profiling_flag;
+    fill_arch_launch_args(args, k_args);
     rtArgsEx_t rt_args;
     std::memset(&rt_args, 0, sizeof(rt_args));
     rt_args.args = &args;
