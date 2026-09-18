@@ -1687,6 +1687,30 @@ class ChipWorker:
     def _finalize_native_run(self, run):
         self._impl._finalize_native_run(run)
 
+    def _probe_run_retention(
+        self,
+        run,
+        successor,
+        launch_successor=True,
+        boundary_timeout_ms=0,
+        successor_start_timeout_ms=0,
+        use_retained_sync=False,
+    ):
+        """Run #2267's late-read retention fixture; see run_retention_probe.h.
+
+        ``run`` must be launched and undrained, ``successor`` prepared on
+        another slot. Both are left finalizable and the caller still owes
+        ``_finalize_native_run`` for each. Onboard only.
+        """
+        return self._impl._probe_run_retention(
+            run,
+            successor,
+            bool(launch_successor),
+            int(boundary_timeout_ms),
+            int(successor_start_timeout_ms),
+            bool(use_retained_sync),
+        )
+
     def _unregister_slot(self, callable_id):
         self._impl.unregister_callable(int(callable_id))
 

@@ -33,6 +33,7 @@
 #include "host/kernel_pipeline_contract.h"
 #include "worker/pipeline_contract.h"
 #include "prepare_callable_common.h"
+#include "run_retention_probe.h"
 #include "runtime_c_api.h"
 #include "task_args_wire.h"
 #include "native_run_context.h"
@@ -1184,6 +1185,87 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
     emit_native_run_runner_wall(state);
     return state->completion_rc;
+}
+
+/**
+ * #2267's late-read retention fixture. See run_retention_probe.h for what it
+ * replaces and why production cannot produce the state it measures.
+ *
+ * This entry only resolves and validates the two runs; the sequence itself
+ * lives beside the peer. On return the predecessor is still Running and the
+ * successor is Complete, so the caller finalizes each exactly as it would after
+ * an ordinary wait — the predecessor's drain, its DFX teardown and its
+ * copy-back are all the production path, reached from the phase it is left in.
+ */
+int simpler_probe_run_retention(
+    DeviceContextHandle ctx, RuntimeHandle runtime, RuntimeHandle runtime_successor,
+    const RunRetentionProbeConfig *config, RunRetentionProbeReport *report
+) {
+    if (config == nullptr || report == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    OnboardNativeRunContext *state = native_run_context(ctx, runtime, "simpler_probe_run_retention");
+    if (state == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    if (state->phase.load(std::memory_order_acquire) != NativeRunPhase::Running || state->active_execution == nullptr) {
+        LOG_ERROR("simpler_probe_run_retention: the predecessor must be launched and still own device work");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+
+    OnboardNativeRunContext *successor = nullptr;
+    if (config->launch_successor != 0) {
+        successor = native_run_context(ctx, runtime_successor, "simpler_probe_run_retention");
+        if (successor == nullptr || successor == state) {
+            LOG_ERROR("simpler_probe_run_retention: the successor must be a second prepared run");
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        if (successor->phase.load(std::memory_order_acquire) != NativeRunPhase::Prepared ||
+            successor->prepared_execution == nullptr) {
+            LOG_ERROR("simpler_probe_run_retention: the successor must be prepared and not launched");
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+    }
+
+    int rc = PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        rc = state->runner->attach_current_thread(state->runner->device_id());
+    } catch (...) {
+        rc = PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (rc != 0) {
+        LOG_ERROR("simpler_probe_run_retention: attach_current_thread failed: %d", rc);
+        return rc;
+    }
+
+    std::unique_ptr<DeviceRunnerBase::ActiveExecution> active_successor;
+    std::unique_ptr<DeviceRunnerBase::PreparedExecution> no_successor;
+    // Passed as an lvalue so a successor the fixture never consumes — a refused
+    // arm, or a launch that did not reach the device — comes back still owned by
+    // its own context, which is what will release it.
+    std::unique_ptr<DeviceRunnerBase::PreparedExecution> &successor_prepared =
+        successor != nullptr ? successor->prepared_execution : no_successor;
+    try {
+        rc = run_retention_probe(
+            *state->runner, *state->active_execution, successor_prepared, *config, report, &active_successor
+        );
+    } catch (...) {
+        LOG_ERROR("simpler_probe_run_retention: the sequence threw");
+        rc = PTO_RUNTIME_ERR_INTERNAL;
+    }
+
+    if (successor != nullptr) {
+        successor->active_execution = std::move(active_successor);
+        if (successor->active_execution != nullptr) {
+            // The fixture drained it, so it reaches finalize in the same phase an
+            // ordinary wait would leave it in. Set outright rather than only over
+            // a zero: a context starts at -1 so a run that never completed cannot
+            // read as success, and the fixture performed this run's launch and
+            // drain, so it is what decides.
+            successor->completion_rc = report->successor_drain_rc;
+            successor->phase.store(NativeRunPhase::Complete, std::memory_order_release);
+            emit_native_run_runner_wall(successor);
+        }
+        // Otherwise it never reached the device and is still Prepared, which is
+        // the state finalize already knows how to abort.
+    }
+    return rc;
 }
 
 int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {

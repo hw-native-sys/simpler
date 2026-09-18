@@ -17,6 +17,8 @@
 
 #include "device_runner.h"
 
+#include "run_retention_probe.h"
+
 #include "host_log.h"
 #include "aicpu_loader/host/load_aicpu_op.h"
 
@@ -1494,4 +1496,31 @@ void DeviceRunner::finalize_collectors(bool abandon_device_resources) {
     if (scope_stats_collector_.is_initialized()) {
         scope_stats_collector_.finalize(unregister_cb, free_cb);
     }
+}
+
+// =============================================================================
+// Group Z — #2267's late-read retention fixture (see run_retention_probe.h)
+// =============================================================================
+
+void RunRetentionProbePeer::run_streams(DeviceRunnerBase &runner, rtStream_t *aicpu, rtStream_t *aicore) {
+    auto &self = static_cast<DeviceRunner &>(runner);
+    *aicpu = static_cast<rtStream_t>(self.run_streams_.aicpu());
+    *aicore = static_cast<rtStream_t>(self.run_streams_.aicore());
+}
+
+int RunRetentionProbePeer::retire_predecessor_ownership(DeviceRunnerBase &runner, PreparedExecution &prepared) {
+    auto &self = static_cast<DeviceRunner &>(runner);
+    // Publishing the attempt before the call is what `drain_execution` does, and
+    // for the same reason: it keeps this run's later cleanup from replacing a
+    // proven Complete retirement with an Unproven one.
+    prepared.aicore_retirement_attempted = true;
+    // Complete keeps the AICore stream, so the successor's `ensure()` reuses the
+    // pair instead of replacing a stream this run has proven it is done with.
+    return self.retire_run_aicore_stream(&prepared, RunStreamPair::CompletionStatus::Complete);
+}
+
+void RunRetentionProbePeer::adopt_drain_ownership(DeviceRunnerBase &, const PreparedExecution &) {
+    // Poll and drain here key on the submitting run's own pointer, which a
+    // successor's launch does not overwrite, so a predecessor stays drainable
+    // through the ordinary entry with nothing restored.
 }

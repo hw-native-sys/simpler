@@ -141,6 +141,22 @@ public:
     void wait_native_run(const ChipWorkerNativeRun &run);
     void finalize_native_run(const ChipWorkerNativeRun &run);
 
+    /**
+     * Run #2267's late-read retention fixture over a launched predecessor and a
+     * prepared successor on another slot. See `run_retention_probe.h`.
+     *
+     * Onboard only: it measures a stream-level property, and no simulated
+     * backend has the streams. Throws when the loaded runtime does not export
+     * it, which for an onboard module means the build is stale.
+     *
+     * Leaves both runs finalizable, and the caller still owes
+     * `finalize_native_run` for each — the predecessor's drain, copy-back and
+     * DFX teardown are the ordinary path, reached from the phase it is left in.
+     */
+    RunRetentionProbeReport probe_run_retention(
+        const ChipWorkerNativeRun &run, const ChipWorkerNativeRun &successor, const RunRetentionProbeConfig &config
+    );
+
     ChipRun submit_chip_run(
         int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, const PipelineSlotLease &lease,
         uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0,
@@ -272,6 +288,10 @@ private:
     using SimplerRunFn = decltype(&simpler_run);
     using SimplerPrepareRunFn = decltype(&simpler_prepare_run);
     using SimplerNativeRunFn = decltype(&simpler_launch_run);
+    // Resolved optionally rather than through `load_symbol`: only onboard
+    // modules carry the retention fixture, so a hard requirement would oblige
+    // every simulated and stand-in runtime to export a stub of it.
+    using SimplerProbeRunRetentionFn = decltype(&simpler_probe_run_retention);
     using SupportsConcurrentNativePrepareFn = int (*)(void *);
     using GetArenaBankGmHeapBaseFn = uint64_t (*)(void *, uint32_t);
     using GetRetainedTempAddrFn = uint64_t (*)(void *, uint32_t);
@@ -337,6 +357,7 @@ private:
     SimplerNativeRunFn poll_run_fn_ = nullptr;
     SimplerNativeRunFn wait_run_fn_ = nullptr;
     SimplerNativeRunFn finalize_run_fn_ = nullptr;
+    SimplerProbeRunRetentionFn probe_run_retention_fn_ = nullptr;
     SupportsConcurrentNativePrepareFn supports_concurrent_native_prepare_fn_ = nullptr;
     GetArenaBankGmHeapBaseFn get_arena_bank_gm_heap_base_fn_ = nullptr;
     GetRetainedTempAddrFn get_retained_temp_addr_fn_ = nullptr;

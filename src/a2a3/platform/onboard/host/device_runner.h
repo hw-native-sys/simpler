@@ -81,6 +81,12 @@ int kernel_args_init_ffts_base_addr(KernelArgsHelper &helper);
  * - Runtime execution workflow
  */
 class DeviceRunner : public DeviceRunnerBase {
+    // #2267's retention probe retires only this run's stream-pair ownership,
+    // on real boundary completion and without the drain that normally
+    // accompanies it, so its successor's `ensure()` is accepted while the
+    // predecessor's slot, result region and fence arming all stay alive.
+    friend class RunRetentionProbePeer;
+
 public:
     DeviceRunner() = default;
     ~DeviceRunner();

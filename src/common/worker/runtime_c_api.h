@@ -218,6 +218,71 @@ typedef struct NativeRunDescriptor {
     int32_t accepted_value;
 } NativeRunDescriptor;
 
+/**
+ * What one late-read retention probe is asked to do.
+ *
+ * `launch_successor` 0 runs the same sequence with no successor at all, which
+ * is the no-successor baseline the overlapped arms are compared against.
+ *
+ * `use_retained_sync` performs the whole-pair synchronize `wait_run_fence`
+ * still appends, before reading the record. It is the control arm rather than
+ * an option: with a successor in flight that call waits for it, so the
+ * successor's completion boundary reads Complete afterwards where the candidate
+ * leaves it Pending. Running both arms over one sequence is what makes the
+ * Pending observation evidence instead of an assumption.
+ */
+typedef struct RunRetentionProbeConfig {
+    uint32_t launch_successor;
+    uint32_t boundary_timeout_ms;
+    uint32_t successor_start_timeout_ms;
+    uint32_t use_retained_sync;
+} RunRetentionProbeConfig;
+
+/**
+ * What that probe observed. Every `_rc` is 0 on success; the first non-zero one
+ * is the step the sequence stopped at, and the fields after it are unset.
+ *
+ * Durations are monotonic nanoseconds. `record_read_ns` is the measurement the
+ * probe exists for: the time to read the predecessor's result while the
+ * successor is still executing. It is reported beside
+ * `successor_completion_before_read` / `_after_read` because a read that
+ * silently waited for the successor and a read that did not are
+ * indistinguishable from the duration alone — the successor having still been
+ * Pending on both sides of the read is what makes the number mean anything.
+ *
+ * That reading is one-sided, and deliberately so. `Pending` after the read can
+ * only mean the read did not wait. `Complete` after it has two causes — the read
+ * waited, or the successor finished on its own — and **nothing here separates
+ * them.** In particular `successor_drain_ns` does not: a drain costs time even
+ * on an already-finished run, which the retained-sync arm measures directly, so
+ * no threshold on it distinguishes "still had work" from "already done". It is
+ * reported for comparison between arms, never as a per-sample verdict.
+ */
+typedef struct RunRetentionProbeReport {
+    int32_t launch_rc;
+    int32_t boundary_wait_rc;
+    int32_t pair_retire_rc;
+    int32_t successor_launch_rc;
+    int32_t successor_start_rc;
+    int32_t successor_drain_rc;
+    int32_t retained_sync_rc;
+    int32_t execution_state;
+    int32_t execution_code;
+    uint32_t execution_source;
+    uint32_t successor_completion_before_read;
+    uint32_t successor_completion_after_read;
+    uint32_t successor_started;
+    uint32_t reserved;
+    uint64_t boundary_wait_ns;
+    uint64_t successor_start_ns;
+    uint64_t record_read_ns;
+    uint64_t decision_ns;
+    uint64_t candidate_drain_ns;
+    uint64_t reference_sync_ns;
+    uint64_t successor_drain_ns;
+    char execution_reason[96];
+} RunRetentionProbeReport;
+
 /* Per-stage run timing is no longer returned. The platform emits it as
  * `[STRACE]` log markers (host stages + the AICPU device-phase breakdown,
  * gated on SIMPLER_HOST_STRACE) — parse with simpler_setup.tools.strace_timing.
@@ -520,6 +585,39 @@ uint64_t get_retained_temp_addr_ctx(DeviceContextHandle ctx, uint32_t slot_id);
  * @return 0 on success or if callable_id was not registered, negative on error.
  */
 int simpler_unregister_callable(DeviceContextHandle ctx, int32_t callable_id);
+
+/**
+ * Run #2267's late-read retention probe over two already-prepared runs.
+ *
+ * This is a fixture entry, not a production one, and nothing inside the product
+ * calls it: it deliberately creates a state production admission refuses — a
+ * predecessor that has completed and been read but not finalized, while its
+ * successor executes on the same streams. Reaching that state needs a launch
+ * permit minted rather than claimed and a pair-owner retirement performed
+ * without the drain that normally accompanies it, neither of which is
+ * expressible through the ordinary phase entries.
+ *
+ * It exists because the property node #2267 turns on — that a completed run's
+ * result survives its successor, and that reading it does not wait for that
+ * successor — cannot be demonstrated by the production path, whose drain
+ * synchronizes the whole stream pair and therefore waits for the successor by
+ * construction.
+ *
+ * Both runtimes must hold runs prepared on *distinct* pipeline slots and not
+ * yet launched. On return both runs are complete and awaiting
+ * `simpler_finalize_run`, which the caller still owes for each, exactly as
+ * after an ordinary launch/wait. `runtime_successor` may be NULL when
+ * `config->launch_successor` is 0.
+ *
+ * @return 0 when the sequence ran to completion, negative on a setup refusal.
+ *         A device error inside the sequence is reported through the report's
+ *         per-step `_rc` fields and still returns 0 — the probe's job is to
+ *         measure, not to decide.
+ */
+int simpler_probe_run_retention(
+    DeviceContextHandle ctx, RuntimeHandle runtime, RuntimeHandle runtime_successor,
+    const RunRetentionProbeConfig *config, RunRetentionProbeReport *report
+);
 
 /**
  * Number of distinct callable_ids the AICPU has been asked to dlopen for on

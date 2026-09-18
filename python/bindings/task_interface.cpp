@@ -3520,6 +3520,53 @@ NB_MODULE(_task_interface, m) {
             "Validate, copy back, emit diagnostics, and destroy a prepared native run."
         )
         .def(
+            "_probe_run_retention",
+            [](ChipWorker &self, const ChipWorkerNativeRun &run, const ChipWorkerNativeRun &successor,
+               bool launch_successor, uint32_t boundary_timeout_ms, uint32_t successor_start_timeout_ms,
+               bool use_retained_sync) {
+                RunRetentionProbeConfig config{};
+                config.launch_successor = launch_successor ? 1u : 0u;
+                config.boundary_timeout_ms = boundary_timeout_ms;
+                config.successor_start_timeout_ms = successor_start_timeout_ms;
+                config.use_retained_sync = use_retained_sync ? 1u : 0u;
+                RunRetentionProbeReport report{};
+                {
+                    nb::gil_scoped_release unlocked;
+                    report = self.probe_run_retention(run, successor, config);
+                }
+                // A dict rather than a bound struct: the report is a flat set of
+                // measurements read once by one test, so a type would add a
+                // second place to keep in step with the C one.
+                nb::dict out;
+                out["launch_rc"] = report.launch_rc;
+                out["boundary_wait_rc"] = report.boundary_wait_rc;
+                out["pair_retire_rc"] = report.pair_retire_rc;
+                out["successor_launch_rc"] = report.successor_launch_rc;
+                out["successor_start_rc"] = report.successor_start_rc;
+                out["successor_drain_rc"] = report.successor_drain_rc;
+                out["retained_sync_rc"] = report.retained_sync_rc;
+                out["execution_state"] = report.execution_state;
+                out["execution_code"] = report.execution_code;
+                out["execution_source"] = report.execution_source;
+                out["execution_reason"] = report.execution_reason;
+                out["successor_completion_before_read"] = report.successor_completion_before_read;
+                out["successor_completion_after_read"] = report.successor_completion_after_read;
+                out["successor_started"] = report.successor_started != 0;
+                out["boundary_wait_ns"] = report.boundary_wait_ns;
+                out["successor_start_ns"] = report.successor_start_ns;
+                out["record_read_ns"] = report.record_read_ns;
+                out["decision_ns"] = report.decision_ns;
+                out["candidate_drain_ns"] = report.candidate_drain_ns;
+                out["reference_sync_ns"] = report.reference_sync_ns;
+                out["successor_drain_ns"] = report.successor_drain_ns;
+                return out;
+            },
+            nb::arg("run"), nb::arg("successor"), nb::arg("launch_successor") = true,
+            nb::arg("boundary_timeout_ms") = 0, nb::arg("successor_start_timeout_ms") = 0,
+            nb::arg("use_retained_sync") = false,
+            "Run #2267's late-read retention fixture over a launched predecessor and a prepared successor."
+        )
+        .def(
             "run_materialized",
             [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
                uint64_t accepted_state_addr, int32_t accepted_value, uint32_t pipeline_slot,

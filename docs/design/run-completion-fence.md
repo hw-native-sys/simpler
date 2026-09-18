@@ -115,6 +115,49 @@ the whole-pair query it replaced reported — so a poll that used to surface a
 stream left in error still does, and a poll that never detected a device
 exception (measured above: `rtStreamQuery` returns `0`) still does not.
 
+### Measured: the verdict read does wait, and the record read does not
+
+The paragraph above predicts that keeping the verdict read would make a
+predecessor's drain wait for its successor. That is now measured rather than
+argued, on a2a3, both runtimes — by `tests/st/run_retention`, which reaches a
+state production admission refuses (a predecessor complete and read but not
+finalized, while its successor executes on the same streams) through the fixture
+in `src/common/platform/onboard/host/run_retention_probe.h`.
+
+Two arms over one sequence, differing only in whether `sync_stream_pair` runs
+before the predecessor's result is read:
+
+| Arm | Successor's boundary, before → after the read | Successor's drain afterwards |
+| --- | --------------------------------------------- | ---------------------------- |
+| read the published record directly | Pending → **Pending** | 476 µs |
+| `sync_stream_pair` first (what `wait_run_fence` still appends) | Pending → **Complete** | 17 µs |
+
+**The Pending reading is the whole proof, and it is one-sided.** A read that
+waited for the successor could not have produced it, so an observed Pending
+settles the question. `Complete` does not settle the converse — the successor may
+simply have finished on its own — and no recorded quantity separates those two
+causes: a drain costs time on an already-finished run too, which is exactly what
+the control arm's 17 µs measures. The drain column is a cross-arm comparison, not
+a per-sample discriminator. `tests/st/run_retention` therefore treats a `Complete`
+attempt as inconclusive and retries, and fails only when no attempt ever observes
+the overlap.
+
+So:
+
+- **the record read is successor-independent** — 11–13 µs, flat across runtimes
+  and across successor size, and it yields a decided verdict rather than merely
+  returning early;
+- **the retained synchronize costs 283–429 µs with a successor in flight**, which
+  on `host_build_graph` is 3.6× the entire candidate drain (≈77 µs). It scales
+  with the successor's work where the candidate drain does not, which is the
+  argument in one line.
+
+The rule combining the two channels into one outcome is
+`decide_run_execution` (`host/run_outcome_decision.h`), which is pure and covered
+without a device. Wiring it into the drain, and removing the synchronize, is
+still #2267's remaining work — this establishes that the replacement is sound and
+what it saves, not that it has landed.
+
 ## Ownership: the run owns the facts, the runner owns the handles
 
 | Thing | Owner | Released by |

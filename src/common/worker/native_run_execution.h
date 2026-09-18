@@ -16,6 +16,7 @@
 
 class DeviceRunnerBase;
 class NativeRunExecutionTestPeer;
+class RunRetentionProbePeer;
 class SimDeviceRunnerBase;
 
 struct NativeRunIdentity {
@@ -56,6 +57,9 @@ public:
 private:
     friend class DeviceRunnerBase;
     friend class NativeRunExecutionTestPeer;
+    // #2267's retention probe launches a run that holds no C API execution
+    // claim, so it mints its permit instead of receiving one.
+    friend class RunRetentionProbePeer;
     friend class SimDeviceRunnerBase;
     template <typename AicoreSubmit, typename AicpuSubmit>
     friend struct ExactLaunchTransaction;

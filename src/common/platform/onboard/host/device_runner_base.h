@@ -97,6 +97,12 @@ struct HostApi;  // common/host_api.h — fwd-declared to keep task_interface he
  * is safe — it never runs as a virtual base destructor.
  */
 class DeviceRunnerBase {
+    // #2267's late-read retention probe reads this run's completion fence and
+    // result region directly, without the slot-gated poll/drain entries that
+    // a successor's launch takes over. Fixture access only — nothing in the
+    // product reaches these through the peer.
+    friend class RunRetentionProbePeer;
+
 public:
     // Public virtual dtor so the shared c_api can `delete` a polymorphic
     // `DeviceRunnerBase *` (the `destroy_device_context` entrypoint). Each

@@ -1045,6 +1045,20 @@ target_link_libraries(test_run_terminal_record PRIVATE
 add_test(NAME test_run_terminal_record COMMAND test_run_terminal_record)
 set_tests_properties(test_run_terminal_record PROPERTIES LABELS "no_hardware")
 
+# The rule that combines a run's two evidence channels — its completion
+# boundaries and the record its device side published — into one execution
+# outcome. Pure and device-free, so both the poll and the wait path can share it.
+add_executable(test_run_outcome_decision common/test_run_outcome_decision.cpp)
+target_include_directories(test_run_outcome_decision PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+)
+target_link_libraries(test_run_outcome_decision PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_run_outcome_decision COMMAND test_run_outcome_decision)
+set_tests_properties(test_run_outcome_decision PROPERTIES LABELS "no_hardware")
+
 function(add_pmu_collector_test name platform)
     add_executable(${name}
         common/test_pmu_collector.cpp

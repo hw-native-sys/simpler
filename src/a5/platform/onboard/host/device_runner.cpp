@@ -17,6 +17,8 @@
 
 #include "device_runner.h"
 
+#include "run_retention_probe.h"
+
 #include "acl/acl.h"
 #include "host/acl_error_log.h"
 #include "host_log.h"
@@ -1276,4 +1278,34 @@ int DeviceRunner::init_dep_gen(int num_threads, int device_id, KernelArgsHelper 
     }
     kernel_args.args.dep_gen_data_base = reinterpret_cast<uint64_t>(dep_gen_collector_.get_dep_gen_shm_device_ptr());
     return 0;
+}
+
+// =============================================================================
+// #2267's late-read retention fixture (see run_retention_probe.h)
+// =============================================================================
+
+void RunRetentionProbePeer::run_streams(DeviceRunnerBase &runner, rtStream_t *aicpu, rtStream_t *aicore) {
+    // Every run submits on the persistent bootstrap pair; there is no per-run
+    // stream here to look up.
+    *aicpu = runner.stream_aicpu_;
+    *aicore = runner.stream_aicore_;
+}
+
+int RunRetentionProbePeer::retire_predecessor_ownership(DeviceRunnerBase &, PreparedExecution &) {
+    // Nothing to retire: the streams are the runner's for its whole lifetime,
+    // so a successor's launch waits on no ownership a predecessor holds. What
+    // it does take over is the poll slot, which `adopt_drain_ownership` below
+    // restores for teardown.
+    return 0;
+}
+
+void RunRetentionProbePeer::adopt_drain_ownership(DeviceRunnerBase &runner, const PreparedExecution &prepared) {
+    auto &self = static_cast<DeviceRunner &>(runner);
+    // Poll and drain accept exactly one run — whichever launched last — and no
+    // path restores the previous one, so the predecessor is undrainable through
+    // the ordinary entry once the successor has launched. This runs only after
+    // the successor has fully drained, so it hands the seat back rather than
+    // claiming two runs hold it at once.
+    self.run_poll_slot_.store(prepared.pipeline_slot, std::memory_order_relaxed);
+    self.run_poll_state_.store(DeviceRunner::RunPollState::DeviceComplete, std::memory_order_release);
 }

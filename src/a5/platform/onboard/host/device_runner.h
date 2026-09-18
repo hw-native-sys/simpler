@@ -73,6 +73,12 @@
  * - Runtime execution workflow
  */
 class DeviceRunner : public DeviceRunnerBase {
+    // #2267's retention probe. There is no stream pair here to retire — every
+    // run submits on the persistent bootstrap streams — so what the probe needs
+    // instead is the single-run poll slot, which a successor's launch takes
+    // over and no path restores.
+    friend class RunRetentionProbePeer;
+
 public:
     DeviceRunner() = default;
     ~DeviceRunner();
