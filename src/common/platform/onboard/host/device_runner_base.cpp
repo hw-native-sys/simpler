@@ -368,6 +368,40 @@ int DeviceRunnerBase::acquire_sm_mirror(uint32_t pipeline_slot, size_t bytes, si
     return 0;
 }
 
+int DeviceRunnerBase::acquire_run_image_staging(
+    uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out
+) {
+    if (addr_out == nullptr) return -1;
+    *addr_out = nullptr;
+    if (pipeline_slot >= run_image_stagings_.size() || bytes == 0 || alignment == 0 ||
+        (alignment & (alignment - 1)) != 0 || bytes > SIZE_MAX - (alignment - 1)) {
+        return -1;
+    }
+    RetainedSmMirror &staging = run_image_stagings_[pipeline_slot];
+    // Grow-only, like the mirror: an image's size follows the graph a run builds,
+    // so a repeated workload writes host pages that are already mapped.
+    const size_t needed = bytes + alignment - 1;
+    if (staging.capacity < needed) {
+        // `new[]` default-initializes a trivially-typed array, so the block costs
+        // no page until the bind writes one. The outgoing block's bytes are not
+        // carried over: a publication ships what its own bind assembled.
+        std::unique_ptr<std::byte[]> storage(new (std::nothrow) std::byte[needed]);
+        if (storage == nullptr) return -1;
+        staging.storage = std::move(storage);
+        staging.capacity = needed;
+    }
+    const uintptr_t raw = reinterpret_cast<uintptr_t>(staging.storage.get());
+    *addr_out = reinterpret_cast<void *>((raw + alignment - 1) & ~static_cast<uintptr_t>(alignment - 1));
+    return 0;
+}
+
+void DeviceRunnerBase::release_run_image_stagings() {
+    for (RetainedSmMirror &staging : run_image_stagings_) {
+        staging.storage.reset();
+        staging.capacity = 0;
+    }
+}
+
 void DeviceRunnerBase::release_sm_mirrors() {
     for (RetainedSmMirror &mirror : sm_mirrors_) {
         mirror.storage.reset();
@@ -1984,9 +2018,10 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
         release_graph_definition_blocks();
         clear_temporary_buffer();
     }
-    // Pure host memory, so it is returned on both paths — a force reset
+    // Pure host memory, so both are returned on either path — a force reset
     // invalidated device allocations, not these pages.
     release_sm_mirrors();
+    release_run_image_stagings();
 
     // Free each slot's device-phase/task-timing buffer (allocated lazily in
     // run()) while mem_alloc_ and the device context are still live.

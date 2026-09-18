@@ -92,6 +92,19 @@ extern "C" {
  * Runtime Implementation Functions (defined in runtime_maker.cpp)
  * =========================================================================== */
 int register_callable_impl(const ChipCallable *callable, const HostApi *api, CallableArtifacts *out);
+/**
+ * Perform the device write a run's bind prepared.
+ *
+ * The bind computes its device execution image into staging that outlives it and
+ * records where the bytes go; this ships them. Two steps rather than one, so the
+ * write can be ordered against something — or captured and replayed — without
+ * the host graph building that produced the bytes having to run again. Consumes
+ * the record: publishing twice, or publishing a bind that recorded nothing, is an
+ * error, because a run whose image never reached the device must not launch. A
+ * runtime whose bind writes its own image where it builds it implements this as a
+ * no-op.
+ */
+int publish_run_image_impl(Runtime *runtime, const HostApi *api);
 /** @see the onboard c_api_shared.cpp declarations for the three halves' contract. */
 int copy_in_run_inputs_impl(const Runtime *runtime, const HostApi *api);
 int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi *api, int execution_rc, int launched);
@@ -218,6 +231,18 @@ acquire_sm_mirror(void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t
     try {
         return static_cast<SimDeviceRunnerBase *>(runner_ctx)
             ->acquire_sm_mirror(pipeline_slot, bytes, alignment, addr_out);
+    } catch (...) {
+        return -1;
+    }
+}
+
+static int
+acquire_run_image_staging(void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out) {
+    if (addr_out != nullptr) *addr_out = nullptr;
+    if (runner_ctx == nullptr) return -1;
+    try {
+        return static_cast<SimDeviceRunnerBase *>(runner_ctx)
+            ->acquire_run_image_staging(pipeline_slot, bytes, alignment, addr_out);
     } catch (...) {
         return -1;
     }
@@ -351,6 +376,7 @@ static const HostApiOps g_host_api_ops = {
     .acquire_graph_definition_block = acquire_graph_definition_block,
     .get_graph_definition_staging = get_graph_definition_staging,
     .acquire_sm_mirror = acquire_sm_mirror,
+    .acquire_run_image_staging = acquire_run_image_staging,
     .setup_static_arena = setup_static_arena_wrapper,
     .acquire_pooled_gm_heap = acquire_pooled_gm_heap_wrapper,
     .acquire_pooled_gm_sm = acquire_pooled_gm_sm_wrapper,
@@ -802,6 +828,19 @@ int simpler_prepare_run(
             );
         }
         if (rc != 0) return cleanup_failed_prepare(state, rc);
+        // The bind prepared this run's device image into staging the slot owns;
+        // this publishes it, before anything else touches the device arena. Two
+        // calls rather than one because the write is orderable on its own: the
+        // bytes are ready when the bind returns, and shipping them is this
+        // caller's decision.
+        {
+            STRACE("chip.run.publish_image");
+            rc = publish_run_image_impl(&state->runtime, &state->host_api);
+        }
+        if (rc != 0) {
+            LOG_ERROR("simpler_prepare_run: publishing this run's image failed: %d (%s)", rc, state->trace_attrs);
+            return cleanup_failed_prepare(state, rc);
+        }
         emit_host_dep_gen_graph(state->config, state->trace_attrs);
         // This run's own input bytes, into the buffers its bind just named.
         {

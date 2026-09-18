@@ -732,6 +732,7 @@ int DeviceRunner::finalize() {
     unload_executor_binaries();
     release_graph_definition_blocks();
     release_sm_mirrors();
+    release_run_image_stagings();
 
     for (auto &bank : arena_banks_) {
         bank->gm_heap.release();

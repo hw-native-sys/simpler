@@ -281,6 +281,35 @@ private:
         // entry-tensor count, and its std::vector control block holds host heap
         // addresses, which is a second reason this struct cannot travel.
         std::vector<TensorLease> tensor_leases_;
+
+        // What this bind prepared, and where it goes. The bind assembles the
+        // run's device execution image into host staging the runner retains and
+        // records the write here; `publish_run_image_impl` performs it and clears
+        // the record. Two moments rather than one, because the source has to
+        // still exist when the write reads it — which a buffer that died with the
+        // bind's frame could not promise, and which any write that is enqueued
+        // rather than issued immediately requires.
+        //
+        // Host-only by placement: `source` points into host staging, and a device
+        // reader that followed it would be reading host pages. Sitting inside
+        // this struct is what makes that unreachable rather than merely
+        // discouraged.
+        //
+        // `BindArenaH2d` measures the copy, and it is recorded at exactly one
+        // site: the publication. The three pool counters its attribute string
+        // reports are known only to the bind, so they travel here; the rest of
+        // that string the publication rebuilds, since the task count and the
+        // image size are on `dev` and the copied zone is the remainder of
+        // `bytes`.
+        struct RunImagePublication {
+            void *device_target;
+            const void *source;
+            uint64_t bytes;
+            uint64_t fanin_elems;
+            uint64_t tensor_elems;
+            uint64_t scalar_elems;
+        };
+        RunImagePublication pending_publication_;
     };
     HostOnlyState host_;
 
@@ -292,6 +321,21 @@ public:
      * bytes the host never uploaded.
      */
     static size_t device_image_bytes();
+
+    /**
+     * The device write this bind prepared and has not yet performed. `bytes == 0`
+     * means there is nothing outstanding — either the bind recorded nothing or a
+     * publication already consumed it, and publishing twice is an error rather
+     * than a second copy.
+     */
+    const HostOnlyState::RunImagePublication &pending_publication() const { return host_.pending_publication_; }
+    void set_pending_publication(
+        void *device_target, const void *source, uint64_t bytes, uint64_t fanin_elems, uint64_t tensor_elems,
+        uint64_t scalar_elems
+    ) {
+        host_.pending_publication_ = {device_target, source, bytes, fanin_elems, tensor_elems, scalar_elems};
+    }
+    void clear_pending_publication() { host_.pending_publication_ = {}; }
 
     /**
      * Constructor - zero-initialize all arrays

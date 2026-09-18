@@ -1608,11 +1608,21 @@ int32_t run_host_orchestration(
     // vector's data() is not.
     const uint64_t copied_bytes = layout.off_copied_end - layout.off_copied_begin;
     const uint64_t upload_bytes = copied_bytes + image_bytes;
-    std::vector<std::byte> storage(upload_bytes + CHIP_ALIGN_SIZE, std::byte{0});
-    char *upload_base = reinterpret_cast<char *>(
-        (reinterpret_cast<uintptr_t>(storage.data()) + CHIP_ALIGN_SIZE - 1) &
-        ~static_cast<uintptr_t>(CHIP_ALIGN_SIZE - 1)
-    );
+    // Assembled in staging the runner retains rather than in a buffer that dies
+    // with this frame: publication is a separate step, so the bytes have to still
+    // be here when it reads them. Over-allocated by the alignment the layout
+    // needs, and handed over uninitialized: what this bind writes are the copied
+    // zone and the live segments `compact_live_image` emits, so the alignment gaps
+    // between segments carry whatever the block last held. No device code reads a
+    // gap — every reader indexes a segment through the layout — which is what makes
+    // clearing the whole block per bind unnecessary rather than merely expensive.
+    void *staging_addr = nullptr;
+    if (api->acquire_run_image_staging(static_cast<size_t>(upload_bytes), CHIP_ALIGN_SIZE, &staging_addr) != 0 ||
+        staging_addr == nullptr) {
+        LOG_ERROR("host-orch: staging for a %" PRIu64 "-byte runtime image is unavailable", upload_bytes);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    char *upload_base = static_cast<char *>(staging_addr);
 
     // The copied zone carries no host address: the orchestrator and the ops table are
     // both host-only, and no device code may reach host memory through the image.
@@ -1631,24 +1641,14 @@ int32_t run_host_orchestration(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
-    const BindPhaseMark h2d_phase = bind_phase_begin();
-    if (api->copy_to_device(arena_dev + layout.off_copied_begin, upload_base, upload_bytes) != 0) {
-        LOG_ERROR("host-orch: H2D of the runtime image failed");
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    {
-        // The widest attribute string a segment formats: eight uint64 fields plus
-        // their labels. With the counters ahead of it in the recorded string, this
-        // is the tail a truncation eats first.
-        char attrs[kBindAttrsCapacity];
-        snprintf(
-            attrs, sizeof(attrs),
-            "nt=%" PRIu64 " bytes=%" PRIu64 " copied=%" PRIu64 " sm=%" PRIu64 " args=%" PRIu64 "/%" PRIu64 "/%" PRIu64,
-            nt, upload_bytes, copied_bytes, image_bytes, bind_usage.fanin_elems, bind_usage.tensor_elems,
-            bind_usage.scalar_elems
-        );
-        record_bind_phase(HostPhaseKind::BindArenaH2d, h2d_phase, attrs, upload_bytes);
-    }
+    // Prepared, not published: `publish_run_image_impl` performs this write, and
+    // records the BindArenaH2d segment that measures it. The pool counters travel
+    // with the record because only this bind knows them; the rest of that
+    // segment's attributes the publication rebuilds from `dev` and the length.
+    runtime->set_pending_publication(
+        arena_dev + layout.off_copied_begin, upload_base, upload_bytes, bind_usage.fanin_elems, bind_usage.tensor_elems,
+        bind_usage.scalar_elems
+    );
     return total_tasks;
 }
 
@@ -1815,13 +1815,20 @@ extern "C" int bind_callable_to_runtime_impl(
     LOG_INFO("RT2 bind: %d tensors + %d scalars, host orchestration mode", tensor_count, scalar_count);
 
     // Arm before the first segment below: the record pool has to exist for
-    // `args`, which runs well before the device collector is provisioned. The
-    // guard ends the bind on every exit, not just the successful one — a bind
-    // that fails part-way is exactly when its breakdown is worth having, and an
-    // unfinished bind publishes nothing.
+    // `args`, which runs well before the device collector is provisioned.
+    //
+    // One trace spans preparation and publication, because the image's H2D
+    // segment belongs to the publication and a trace that ended at this
+    // function's return would drop it. So the guard ends the trace only on an
+    // exit that leaves nothing to publish — every failure path, where the
+    // breakdown is worth having and no publication will come — and a bind that
+    // recorded one hands the end to `publish_run_image_impl`, which ends it on
+    // its own success and failure alike. `host_phase_trace_end()` ignores a
+    // second call, so the run's release path can close an abandoned trace
+    // without having to know which of the two got there first.
     host_phase_trace_begin(api);
-    auto host_phase_guard = RAIIScopeGuard([]() {
-        host_phase_trace_end();
+    auto host_phase_guard = RAIIScopeGuard([runtime]() {
+        if (runtime == nullptr || runtime->pending_publication().bytes == 0) host_phase_trace_end();
     });
 
     uint64_t task_capacity = 0;
@@ -2016,10 +2023,10 @@ extern "C" int bind_callable_to_runtime_impl(
     runtime_wire_arena_pointers(host_arena, layout, rt);
     // Stash the layout inside the RuntimeContext image so the AICPU can recover every
     // arena-internal offset after the copy. It is written before orchestration
-    // because orchestration is what performs that copy, and the runtime header is
-    // part of what travels. The runtime arena's device base does NOT travel — it is
-    // on the host Runtime (set_prebuilt_arena below), since the AICPU needs that
-    // pointer before it can dereference the image.
+    // because orchestration assembles the image this header is part of, and the
+    // publication uploads what it assembled. The runtime arena's device base does
+    // NOT travel — it is on the host Runtime (set_prebuilt_arena below), since the
+    // AICPU needs that pointer before it can dereference the image.
     rt->prebuilt_layout = layout;
     record_bind_phase(HostPhaseKind::BindRuntimeInit, runtime_init_phase);
 
@@ -2078,6 +2085,62 @@ extern "C" int bind_callable_to_runtime_impl(
 }
 
 /**
+ * Perform the device write this run's bind prepared.
+ *
+ * Separate from the bind because the two moments differ: the bind computes the
+ * image into staging that outlives it, and this ships it. Splitting them is what
+ * lets the write be ordered against something, or captured, without the
+ * orchestration that produced the bytes having to run again — a replay repeats
+ * device operations, not host graph building.
+ *
+ * Consumes the record: a run whose image never reached the device must not
+ * launch, so a second call, or one against a bind that recorded nothing, is an
+ * error rather than a silent success.
+ */
+extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
+    if (runtime == nullptr || api == nullptr) {
+        LOG_ERROR("publish_run_image_impl: null runtime or HostApi");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    const auto &publication = runtime->pending_publication();
+    if (publication.bytes == 0 || publication.device_target == nullptr || publication.source == nullptr) {
+        LOG_ERROR("publish_run_image_impl: no prepared runtime image to publish");
+        host_phase_trace_end();
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    const BindPhaseMark h2d_phase = bind_phase_begin();
+    if (api->copy_to_device(publication.device_target, publication.source, publication.bytes) != 0) {
+        LOG_ERROR("host-orch: H2D of the runtime image failed");
+        host_phase_trace_end();
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    {
+        // The image size and the task count are on the descriptor this bind
+        // filled, and the copied zone is what the length has left over, so only
+        // the pool counters had to travel.
+        const uint64_t image_bytes = runtime->dev.sm_image_bytes;
+        const uint64_t copied_bytes = publication.bytes - image_bytes;
+        // The widest attribute string a segment formats: eight uint64 fields plus
+        // their labels. With the counters ahead of it in the recorded string, this
+        // is the tail a truncation eats first.
+        char attrs[kBindAttrsCapacity];
+        snprintf(
+            attrs, sizeof(attrs),
+            "nt=%" PRIu64 " bytes=%" PRIu64 " copied=%" PRIu64 " sm=%" PRIu64 " args=%" PRIu64 "/%" PRIu64 "/%" PRIu64,
+            static_cast<uint64_t>(runtime->dev.host_total_tasks), publication.bytes, copied_bytes, image_bytes,
+            publication.fanin_elems, publication.tensor_elems, publication.scalar_elems
+        );
+        record_bind_phase(HostPhaseKind::BindArenaH2d, h2d_phase, attrs, publication.bytes);
+    }
+    runtime->clear_pending_publication();
+    // The last segment of this run's prepare path, so the trace the bind armed
+    // closes here: its records reach the pool's readers and the per-kind
+    // breakdown is emitted once, over preparation and publication together.
+    host_phase_trace_end();
+    return 0;
+}
+
+/**
  * Stage one run's inputs. A no-op for this runtime.
  *
  * host_build_graph runs its orchestrator on the host during bind, and that
@@ -2100,6 +2163,11 @@ extern "C" int release_run_bindings_impl(Runtime *runtime, const HostApi *api) {
         LOG_ERROR("release_run_bindings_impl: null runtime or HostApi");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    // A run whose image was never published still armed a trace. Ending it here
+    // is what keeps one trace per run: a no-op when the publication already
+    // closed it, and the only close an abandoned preparation gets.
+    host_phase_trace_end();
+    runtime->clear_pending_publication();
     release_run_tensor_leases(runtime, api);
     release_scheduler_state(runtime, api);
     // The dispatch table is owned by bind_callable_to_runtime, which clears it

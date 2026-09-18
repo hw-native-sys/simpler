@@ -101,6 +101,18 @@ struct HostApiOps {
     // re-writes every segment it ships, so only the pages it touches ever become
     // resident. Returns 0 on success.
     int (*acquire_sm_mirror)(void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out);
+    // Retain the host buffer a run assembles its device execution image in, so
+    // the bytes outlive the preparation that wrote them: the publication that
+    // ships them is a separate step, and a write that is enqueued rather than
+    // issued immediately reads this buffer after its caller has returned.
+    // Host memory only. Same retention contract as acquire_sm_mirror above —
+    // per pipeline slot, grow-only, released at Worker finalization, handed over
+    // uninitialized with no meaning carried between binds. `addr_out` receives a
+    // pointer aligned to `alignment` (a power of two) with at least `bytes`
+    // behind it. Returns 0 on success.
+    int (*acquire_run_image_staging)(
+        void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out
+    );
     // Commit the three pooled regions (GM heap, runtime shared memory, and
     // prebuilt runtime arena) of the arena bank selected by this run, as three
     // independent device allocations. `runtime_arena_size == 0` skips the
@@ -237,6 +249,13 @@ public:
             return -1;
         }
         return ops_->acquire_sm_mirror(runner_ctx_, pipeline_slot_, bytes, alignment, addr_out);
+    }
+    int acquire_run_image_staging(size_t bytes, size_t alignment, void **addr_out) const {
+        if (ops_->acquire_run_image_staging == nullptr) {
+            if (addr_out != nullptr) *addr_out = nullptr;
+            return -1;
+        }
+        return ops_->acquire_run_image_staging(runner_ctx_, pipeline_slot_, bytes, alignment, addr_out);
     }
     int setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size) const {
         return ops_->setup_static_arena(runner_ctx_, arena_bank_, gm_heap_size, gm_sm_size, runtime_arena_size);

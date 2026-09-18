@@ -37,6 +37,7 @@
 #include "runtime.h"
 #include "runtime_core.h"
 #include "task_args.h"
+#include "host/host_phase_records.h"
 #include "worker/runtime_c_api.h"
 
 extern "C" int bind_callable_to_runtime_impl(
@@ -47,6 +48,7 @@ extern "C" int bind_callable_to_runtime_impl(
 extern "C" int copy_in_run_inputs_impl(const Runtime *runtime, const HostApi *api);
 extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi *api, int execution_rc, int launched);
 extern "C" int release_run_bindings_impl(Runtime *runtime, const HostApi *api);
+extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api);
 
 namespace {
 
@@ -75,6 +77,51 @@ struct FakeHostApi {
     std::vector<uint8_t> sm_mirror;
     std::vector<uint8_t> definition_device;
     std::vector<uint8_t> definition_staging;
+    // Retained across binds, like the runner's block: what the bind assembles has
+    // to still be readable when the publication reads it.
+    std::vector<uint8_t> image_staging;
+    // A real record pool, so what the prepare path records is observable. Armed
+    // unconditionally: whether the runner would offer one is the platform's
+    // decision and not what these tests are about.
+    std::vector<HostPhaseRecordBuffer> phase_buffers;
+    HostPhaseRecordPool phase_pool{};
+    uint64_t phase_finish_calls = 0;
+
+    HostPhaseRecordPool *arm_phase_pool() {
+        phase_buffers.assign(PLATFORM_HOST_PHASE_BUFFERS, HostPhaseRecordBuffer{});
+        phase_pool.buffers = phase_buffers.data();
+        phase_pool.buffer_count = static_cast<uint32_t>(phase_buffers.size());
+        phase_pool.next_buffer.store(0);
+        phase_pool.generation.fetch_add(1);
+        phase_pool.dropped.store(0);
+        return &phase_pool;
+    }
+
+    size_t phase_records_of(HostPhaseKind kind, uint64_t *payload_out = nullptr) const {
+        size_t found = 0;
+        for (const HostPhaseRecordBuffer &buffer : phase_buffers) {
+            const uint32_t count = buffer.count;
+            for (uint32_t i = 0; i < count && i < PLATFORM_HOST_PHASE_RECORDS_PER_BUFFER; ++i) {
+                if (buffer.records[i].kind != static_cast<uint32_t>(kind)) continue;
+                if (payload_out != nullptr) *payload_out = buffer.records[i].payload;
+                ++found;
+            }
+        }
+        return found;
+    }
+    size_t phase_records_total() const {
+        size_t found = 0;
+        for (const HostPhaseRecordBuffer &buffer : phase_buffers) {
+            found += buffer.count;
+        }
+        return found;
+    }
+    struct H2D {
+        void *dst;
+        const void *src;
+        size_t bytes;
+    };
+    std::vector<H2D> copies;
 
     ~FakeHostApi() { release_all(); }
     void release_all() {
@@ -101,6 +148,7 @@ void fake_device_free(void *, void *p) {
     std::free(p);
 }
 int fake_copy_to_device(void *, void *dev, const void *host, size_t n) {
+    g_fake->copies.push_back({dev, host, n});
     std::memcpy(dev, host, n);
     return 0;
 }
@@ -130,6 +178,14 @@ void *fake_acquire_runtime_arena(void *, uint32_t) { return aligned_in(g_fake->r
 int fake_acquire_sm_mirror(void *, uint32_t, size_t bytes, size_t alignment, void **out) {
     g_fake->sm_mirror.assign(bytes + alignment, 0);
     auto raw = reinterpret_cast<uintptr_t>(g_fake->sm_mirror.data());
+    *out = reinterpret_cast<void *>((raw + alignment - 1) & ~static_cast<uintptr_t>(alignment - 1));
+    return 0;
+}
+int fake_acquire_run_image_staging(void *, uint32_t, size_t bytes, size_t alignment, void **out) {
+    // Grow-only and never re-seated once large enough, so an address handed to one
+    // bind stays valid — the property the publication depends on.
+    if (g_fake->image_staging.size() < bytes + alignment) g_fake->image_staging.assign(bytes + alignment, 0);
+    auto raw = reinterpret_cast<uintptr_t>(g_fake->image_staging.data());
     *out = reinterpret_cast<void *>((raw + alignment - 1) & ~static_cast<uintptr_t>(alignment - 1));
     return 0;
 }
@@ -167,6 +223,13 @@ const HostApiOps &fake_ops() {
         r.acquire_pooled_gm_heap = fake_acquire_gm_heap;
         r.acquire_pooled_runtime_arena = fake_acquire_runtime_arena;
         r.acquire_sm_mirror = fake_acquire_sm_mirror;
+        r.acquire_run_image_staging = fake_acquire_run_image_staging;
+        r.host_phase_pool_arm = [](void *, uint32_t, int) -> void * {
+            return g_fake->arm_phase_pool();
+        };
+        r.host_phase_pool_finish = [](void *, uint32_t, uint64_t, uint64_t) {
+            ++g_fake->phase_finish_calls;
+        };
         r.acquire_graph_definition_block = fake_acquire_graph_definition_block;
         r.get_graph_definition_staging = fake_get_graph_definition_staging;
         return r;
@@ -240,6 +303,143 @@ TEST_F(HbgBindLedgerTest, AnEmptyTensorIsPassedThroughAndTakesNoSlice) {
     ASSERT_EQ(runtime.tensor_leases().size(), 1u);
     EXPECT_EQ(runtime.tensor_leases()[0].host_ptr, real.data());
     EXPECT_EQ(runtime.tensor_leases()[0].size, 64u);
+}
+
+// Preparation and publication are two steps. The bind assembles the run's device
+// image into staging that outlives it and records where the bytes go; the write
+// happens afterwards, on the caller's schedule. Asserted by which bytes moved
+// when, because that is what a later ordered or captured write depends on — a
+// bind that still performed the copy itself would fail the first assertion.
+TEST_F(HbgBindLedgerTest, PreparingTheRunImageDoesNotPublishIt) {
+    Runtime runtime;
+    init_runtime(runtime);
+    std::vector<uint8_t> payload(64, 0x11);
+    ChipStorageTaskArgs args;
+    args.add_tensor(host_tensor(payload));
+    ArgDirection sig[1] = {ArgDirection::INOUT};
+
+    ASSERT_EQ(bind(runtime, args, sig, 1), 0);
+
+    const auto &publication = runtime.pending_publication();
+    ASSERT_NE(publication.bytes, 0u) << "the bind recorded no image to publish";
+    ASSERT_NE(publication.device_target, nullptr);
+    ASSERT_NE(publication.source, nullptr);
+
+    void *const target = publication.device_target;
+    const uint64_t bytes = publication.bytes;
+    const auto copies_to_target = [this, target]() {
+        size_t n = 0;
+        for (const auto &copy : fake_.copies) {
+            if (copy.dst == target) ++n;
+        }
+        return n;
+    };
+    EXPECT_EQ(copies_to_target(), 0u) << "the bind published the image itself";
+
+    // The staging the slot owns survives the bind, so the source is still
+    // readable here — which is what lets the write happen on the caller's
+    // schedule. Stamp it and watch the stamp arrive.
+    auto *source = const_cast<uint8_t *>(static_cast<const uint8_t *>(publication.source));
+    source[0] = 0xa5;
+    source[bytes - 1] = 0x5a;
+
+    ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
+    ASSERT_EQ(copies_to_target(), 1u) << "the publication did not perform exactly one write";
+    for (const auto &copy : fake_.copies) {
+        if (copy.dst != target) continue;
+        EXPECT_EQ(copy.bytes, bytes);
+    }
+    const auto *published = static_cast<const uint8_t *>(target);
+    EXPECT_EQ(published[0], 0xa5);
+    EXPECT_EQ(published[bytes - 1], 0x5a);
+
+    // Consumed: a second publication is an error, not a second write.
+    EXPECT_EQ(runtime.pending_publication().bytes, 0u);
+    EXPECT_NE(publish_run_image_impl(&runtime, &api_), 0);
+    EXPECT_EQ(copies_to_target(), 1u);
+
+    ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+}
+
+// One trace spans preparation and publication. The image's H2D segment is the
+// publication's to record, and the trace the bind armed has to still be open when
+// it does — a trace that ended at the bind's return would drop the segment
+// silently, leaving the timeline with no host-to-device handover for the run's
+// largest transfer. Asserted against a real record pool: the kind has to be
+// present with the published byte count, and other segments have to be there too,
+// so a recorder that was never armed cannot pass this by recording nothing.
+TEST_F(HbgBindLedgerTest, ThePublicationRecordsTheArenaH2dSegment) {
+    Runtime runtime;
+    init_runtime(runtime);
+    std::vector<uint8_t> payload(64, 0x33);
+    ChipStorageTaskArgs args;
+    args.add_tensor(host_tensor(payload));
+    ArgDirection sig[1] = {ArgDirection::INOUT};
+
+    ASSERT_EQ(bind(runtime, args, sig, 1), 0);
+    const uint64_t published_bytes = runtime.pending_publication().bytes;
+    ASSERT_NE(published_bytes, 0u);
+
+    // The bind recorded its own segments, so the pool is live and armed.
+    EXPECT_GT(fake_.phase_records_total(), 0u) << "no phase records at all: the recorder was never armed";
+    EXPECT_EQ(fake_.phase_records_of(HostPhaseKind::BindArenaH2d), 0u) << "the bind recorded a copy it did not perform";
+
+    ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
+
+    uint64_t recorded_bytes = 0;
+    EXPECT_EQ(fake_.phase_records_of(HostPhaseKind::BindArenaH2d, &recorded_bytes), 1u)
+        << "the publication's host-to-device segment was dropped";
+    EXPECT_EQ(recorded_bytes, published_bytes) << "the segment's byte count is not the one published";
+    // The trace closes once, over preparation and publication together.
+    EXPECT_EQ(fake_.phase_finish_calls, 1u);
+
+    ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+    EXPECT_EQ(fake_.phase_finish_calls, 1u) << "releasing a published run closed a second trace";
+}
+
+// A preparation nobody publishes still closes its trace exactly once, at the
+// point the run's bindings are released — so an abandoned bind reports its
+// breakdown rather than leaving the trace open for the next one to inherit.
+TEST_F(HbgBindLedgerTest, AnAbandonedPreparationClosesItsTraceOnRelease) {
+    Runtime runtime;
+    init_runtime(runtime);
+    std::vector<uint8_t> payload(64, 0x44);
+    ChipStorageTaskArgs args;
+    args.add_tensor(host_tensor(payload));
+    ArgDirection sig[1] = {ArgDirection::INOUT};
+
+    ASSERT_EQ(bind(runtime, args, sig, 1), 0);
+    ASSERT_NE(runtime.pending_publication().bytes, 0u);
+    EXPECT_EQ(fake_.phase_finish_calls, 0u) << "the bind closed a trace the publication still owns";
+
+    ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+    EXPECT_EQ(fake_.phase_finish_calls, 1u);
+    EXPECT_EQ(runtime.pending_publication().bytes, 0u) << "the abandoned record outlived the run";
+}
+
+// A bind whose publication never runs leaves the execution image unwritten: its
+// device target holds none of these bytes, and the record and its staging are
+// still there, so the caller may publish later or abandon the run. Other device
+// writes the bind performs — an INOUT tensor's input copy, for one — are not in
+// question here.
+TEST_F(HbgBindLedgerTest, AnUnpublishedBindLeavesTheImageTargetUnwritten) {
+    Runtime runtime;
+    init_runtime(runtime);
+    std::vector<uint8_t> payload(64, 0x22);
+    ChipStorageTaskArgs args;
+    args.add_tensor(host_tensor(payload));
+    ArgDirection sig[1] = {ArgDirection::INOUT};
+
+    ASSERT_EQ(bind(runtime, args, sig, 1), 0);
+    const auto &publication = runtime.pending_publication();
+    ASSERT_NE(publication.bytes, 0u);
+    for (const auto &copy : fake_.copies) {
+        EXPECT_NE(copy.dst, publication.device_target) << "an unpublished bind wrote to the image target";
+    }
+    // Still publishable, which is what makes abandoning a choice rather than a
+    // loss.
+    EXPECT_EQ(publish_run_image_impl(&runtime, &api_), 0);
+    ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
 }
 
 // What the device image is allowed to contain. The boundary is already a

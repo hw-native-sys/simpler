@@ -46,6 +46,7 @@ Runtime::Runtime() {
     host_.dev_orch_so_size_ = 0;
     host_.device_orch_func_name_[0] = '\0';
     host_.device_orch_config_name_[0] = '\0';
+    host_.pending_publication_ = {};
 
     // Initialize function address mapping
     for (int i = 0; i < RUNTIME_MAX_FUNC_ID; i++) {

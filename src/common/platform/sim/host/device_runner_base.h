@@ -221,6 +221,15 @@ public:
     );
     void get_graph_definition_staging(uint32_t pipeline_slot, void **addr, size_t *size);
     int acquire_sm_mirror(uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out);
+    /**
+     * Retain the host buffer a run assembles its device execution image in.
+     *
+     * Same retention contract as the shared-memory mirror above, and for the
+     * same reason a run needs it: the publication that ships these bytes is a
+     * separate step, so the source has to outlive the preparation that wrote
+     * it rather than dying with the caller's frame.
+     */
+    int acquire_run_image_staging(uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out);
     void clear_temporary_buffer();
 
     // On sim, allocate_tensor returns a plain host pointer, so the "device"
@@ -402,6 +411,7 @@ protected:
 
     /** Drop every retained host SM mirror, returning its pages to the allocator. */
     void release_sm_mirrors();
+    void release_run_image_stagings();
 
     // --- Shared state (protected so subclass execution / init_* / finalize()
     // can read or write directly) ----------------------------------------
@@ -467,6 +477,16 @@ protected:
         size_t capacity{0};
     };
     std::array<RetainedSmMirror, PTO_PIPELINE_MAX_DEPTH> sm_mirrors_{};
+
+    // Host staging for the device execution image, one retained buffer per
+    // pipeline slot — see HostApi acquire_run_image_staging. Same block shape
+    // and the same grow-only retention as the mirror above; what differs is
+    // what it holds and how long it has to hold it. A bind assembles the
+    // bytes here and records where they go; the publication reads them
+    // afterwards, so this buffer is what makes the source outlive the
+    // preparation. Sized to the image a bind ships rather than to the
+    // mirror's capacity.
+    std::array<RetainedSmMirror, PTO_PIPELINE_MAX_DEPTH> run_image_stagings_{};
 
     // Each arena bank backs the three pooled regions (GM heap / shared
     // shared memory / trb prebuilt runtime arena) for one pipeline slot. They

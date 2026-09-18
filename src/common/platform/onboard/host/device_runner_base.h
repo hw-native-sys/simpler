@@ -230,6 +230,15 @@ public:
     );
     void get_graph_definition_staging(uint32_t pipeline_slot, void **addr, std::size_t *size);
     int acquire_sm_mirror(uint32_t pipeline_slot, std::size_t bytes, std::size_t alignment, void **addr_out);
+    /**
+     * Retain the host buffer a run assembles its device execution image in.
+     *
+     * Same retention contract as the shared-memory mirror above, and for the
+     * same reason a run needs it: the publication that ships these bytes is a
+     * separate step, so the source has to outlive the preparation that wrote
+     * it rather than dying with the caller's frame.
+     */
+    int acquire_run_image_staging(uint32_t pipeline_slot, std::size_t bytes, std::size_t alignment, void **addr_out);
     void clear_temporary_buffer();
     /**
      * Map a device buffer into the host address space and return a
@@ -1508,6 +1517,7 @@ protected:
 
     /** Drop every retained host SM mirror, returning its pages to the allocator. */
     void release_sm_mirrors();
+    void release_run_image_stagings();
 
     /**
      * Drop the retained graph-definition blocks without freeing the device side.
@@ -1733,6 +1743,16 @@ protected:
         std::size_t capacity{0};
     };
     std::array<RetainedSmMirror, PTO_PIPELINE_MAX_DEPTH> sm_mirrors_{};
+
+    // Host staging for the device execution image, one retained buffer per
+    // pipeline slot — see HostApi acquire_run_image_staging. Same block shape
+    // and the same grow-only retention as the mirror above; what differs is
+    // what it holds and how long it has to hold it. A bind assembles the
+    // bytes here and records where they go; the publication reads them
+    // afterwards, so this buffer is what makes the source outlive the
+    // preparation. Sized to the image a bind ships rather than to the
+    // mirror's capacity.
+    std::array<RetainedSmMirror, PTO_PIPELINE_MAX_DEPTH> run_image_stagings_{};
 
     // One independently committed set of the three pooled device regions. A
     // run reaches its set through the arena bank its lease selects, so

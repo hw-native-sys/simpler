@@ -516,6 +516,40 @@ int SimDeviceRunnerBase::acquire_sm_mirror(uint32_t pipeline_slot, size_t bytes,
     return 0;
 }
 
+int SimDeviceRunnerBase::acquire_run_image_staging(
+    uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out
+) {
+    if (addr_out == nullptr) return -1;
+    *addr_out = nullptr;
+    if (pipeline_slot >= run_image_stagings_.size() || bytes == 0 || alignment == 0 ||
+        (alignment & (alignment - 1)) != 0 || bytes > SIZE_MAX - (alignment - 1)) {
+        return -1;
+    }
+    RetainedSmMirror &staging = run_image_stagings_[pipeline_slot];
+    // Grow-only, like the mirror: an image's size follows the graph a run builds,
+    // so a repeated workload writes host pages that are already mapped.
+    const size_t needed = bytes + alignment - 1;
+    if (staging.capacity < needed) {
+        // `new[]` default-initializes a trivially-typed array, so the block costs
+        // no page until the bind writes one. The outgoing block's bytes are not
+        // carried over: a publication ships what its own bind assembled.
+        std::unique_ptr<std::byte[]> storage(new (std::nothrow) std::byte[needed]);
+        if (storage == nullptr) return -1;
+        staging.storage = std::move(storage);
+        staging.capacity = needed;
+    }
+    const uintptr_t raw = reinterpret_cast<uintptr_t>(staging.storage.get());
+    *addr_out = reinterpret_cast<void *>((raw + alignment - 1) & ~static_cast<uintptr_t>(alignment - 1));
+    return 0;
+}
+
+void SimDeviceRunnerBase::release_run_image_stagings() {
+    for (RetainedSmMirror &staging : run_image_stagings_) {
+        staging.storage.reset();
+        staging.capacity = 0;
+    }
+}
+
 void SimDeviceRunnerBase::release_sm_mirrors() {
     for (RetainedSmMirror &mirror : sm_mirrors_) {
         mirror.storage.reset();

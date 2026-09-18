@@ -916,6 +916,15 @@ extern "C" int prewarm_config_impl(
 }
 
 /**
+ * Publish the device write a run's bind prepared. Nothing to do for this runtime.
+ *
+ * This runtime's bind writes its own prebuilt arena image where it builds it, so
+ * it records no pending publication. The entry exists on both runtimes so the
+ * platform's prepare path has one shape, the way copy_in_run_inputs_impl does.
+ */
+extern "C" int publish_run_image_impl(Runtime * /*runtime*/, const HostApi * /*api*/) { return 0; }
+
+/**
  * Stage one run's inputs into the device buffers its leases already name.
  *
  * Separate from the bind so that a run's input bytes are its own: the bind
