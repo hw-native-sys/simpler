@@ -351,21 +351,34 @@ void chip_swimlane_aicpu_init(int worker_count) {
             head_table[i] = reinterpret_cast<uint64_t>(&ac_state->head);
         }
 
-        // Pop first buffer from free_queue
+        // Pop the first buffer, or keep the one this pool already holds.
+        //
+        // A buffer is only released by a successful enqueue, so a pointer still
+        // set here means the previous run could not hand that buffer over —
+        // it had nothing to publish, or the ready queue was full. Popping a
+        // replacement would strand it: nothing returns it to the free queue,
+        // because AICPU is the queue's consumer and never its producer. Reusing
+        // it in place is the return. Re-stamping is what makes that safe: the
+        // buffer still carries the previous run's identity, and its count must
+        // start this run at zero.
         rmb();
+        uint64_t buf_ptr = state->head.current_buf_ptr;
+        bool reused = buf_ptr != 0;
         uint32_t head = state->free_queue.head;
         uint32_t tail = state->free_queue.tail;
 
-        if (head != tail) {
-            uint64_t buf_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
-            rmb();
-            state->free_queue.head = head + 1;
+        if (reused || head != tail) {
+            if (!reused) {
+                buf_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
+                rmb();
+                state->free_queue.head = head + 1;
+            }
 
-            // This pop bypasses the engine, so it must stamp the run identity
-            // itself — `on_pop_success` only covers buffers the engine hands
-            // out. Without it a run that never rotates publishes records under
-            // whatever the storage last held: zero on a fresh allocation, and
-            // the *previous* run's epoch on a reused one.
+            // This acquisition bypasses the engine, so it stamps the run
+            // identity itself — `on_pop_success` only covers buffers the engine
+            // hands out. Without it a run that never rotates publishes records
+            // under whatever the storage last held: zero on a fresh allocation,
+            // and the *previous* run's epoch on a reused one.
             ChipSwimlaneAicpuTaskBuffer *buf = reinterpret_cast<ChipSwimlaneAicpuTaskBuffer *>(buf_ptr);
             buf->count = 0;
             buf->run_epoch = get_platform_run_result_epoch();
@@ -376,23 +389,33 @@ void chip_swimlane_aicpu_init(int worker_count) {
             wmb();
             s_current_aicpu_task_buffers[i] = buf;
 
-            LOG_DEBUG("Core %d: popped initial buffer (addr=0x%lx)", i, buf_ptr);
+            LOG_DEBUG(
+                "Core %d: %s task buffer (addr=0x%lx)", i, reused ? "reusing retained" : "popped initial", buf_ptr
+            );
         } else {
             LOG_ERROR("Core %d: free_queue is empty during init!", i);
             state->head.current_buf_ptr = 0;
             s_current_aicpu_task_buffers[i] = nullptr;
         }
 
-        // Prime the AICore head channel with the initial buffer. Seq starts
-        // at 0; AICore's local `cached_buf_seq` defaults to UINT32_MAX so the
-        // first record_task call observes a mismatch and loads the buffer.
+        // Prime the AICore head channel, or keep the buffer this pool already
+        // holds — same retention rule as the task pool above, for the same
+        // reason: only a successful enqueue releases a buffer, so a pointer
+        // still set here is one the previous run could not hand over.
+        // Seq starts at 0; AICore's local `cached_buf_seq` defaults to
+        // UINT32_MAX so the first record_task call observes a mismatch and
+        // loads the buffer.
         rmb();
+        uint64_t ac_buf_ptr = ac_state->head.current_buf_ptr;
+        const bool ac_reused = ac_buf_ptr != 0;
         uint32_t ac_head = ac_state->free_queue.head;
         uint32_t ac_tail = ac_state->free_queue.tail;
-        if (ac_head != ac_tail) {
-            uint64_t ac_buf_ptr = ac_state->free_queue.buffer_ptrs[ac_head % PLATFORM_PROF_SLOT_COUNT];
-            rmb();
-            ac_state->free_queue.head = ac_head + 1;
+        if (ac_reused || ac_head != ac_tail) {
+            if (!ac_reused) {
+                ac_buf_ptr = ac_state->free_queue.buffer_ptrs[ac_head % PLATFORM_PROF_SLOT_COUNT];
+                rmb();
+                ac_state->free_queue.head = ac_head + 1;
+            }
             // Same publish pattern as aicore_rotate: the buffer's own contents
             // first, then a fence, then ptr, then seq. AICore lazy-resolves the
             // head on its first task, so for `count` the ordering would matter
@@ -715,17 +738,17 @@ void chip_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int 
                     s_current_aicpu_task_buffers[core_id] = nullptr;
                     wmb();
                 } else {
-                    // ready_queue full at end-of-run: account the loss and clear the
-                    // buffer so host reconcile sees a clean state (current_buf_ptr=0)
-                    // and dropped == flush failures rather than ring/task_id mismatch.
+                    // ready_queue full at end-of-run: account the loss, but
+                    // keep the buffer. Clearing the pointer here used to strand
+                    // it — the host never saw it, so nothing returned it to the
+                    // free queue. Retaining it lets the next run's init reuse
+                    // it in place, which is the only return available to AICPU.
                     LOG_ERROR(
                         "Thread %d: Core %d failed to enqueue buffer (queue full), %u records lost!", thread_idx,
                         core_id, buf->count
                     );
                     state->head.dropped_record_count = state->head.dropped_record_count + buf->count;
                     buf->count = 0;
-                    state->head.current_buf_ptr = 0;
-                    s_current_aicpu_task_buffers[core_id] = nullptr;
                     wmb();
                 }
             }
@@ -746,35 +769,30 @@ void chip_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int 
         uint64_t ac_buf_ptr = ac_state->head.current_buf_ptr;
         if (ac_buf_ptr == 0) continue;
 
-        // At SCHEDULE_TIMING+, the rotation accounting
-        // (`total_record_count - current_buf_seq * BUFFER_SIZE`) gives the
-        // current buffer's live count, clamped for a failed rotation where seq
-        // did not bump. At TASK_TIMING the code falls back to full capacity.
+        // How many records the current buffer holds, from the rotation
+        // accounting: `total_record_count - current_buf_seq * BUFFER_SIZE`.
+        // `total_record_count` is bumped once per dispatch in
+        // chip_swimlane_aicpu_on_aicore_dispatch, so it is accurate at every
+        // level — including TASK_TIMING, where complete_task is bypassed. The
+        // clamp covers a failed rotation: seq did not bump, so the difference
+        // can exceed capacity while AICore's slot guard refused the overflow,
+        // and the buffer really is full.
         //
-        // That fallback over-states: `total_record_count` is bumped once per
-        // dispatch in chip_swimlane_aicpu_on_aicore_dispatch, so it is accurate
-        // at every level and the fallback is not needed. Two consequences, both
-        // pre-existing: the host scans and warns over ~BUFFER_SIZE empty slots
-        // per core, and the enqueue-failure path below charges `dropped` by the
-        // over-stated mark, which can break the `collected + dropped == total`
-        // reconcile. Left in place deliberately — removing the fallback also
-        // takes the `live == 0` early-continue into the TASK_TIMING path, and
-        // that branch leaves `current_buf_ptr` set, so an idle core's buffer is
-        // never returned to the pool. Fixing the over-count therefore has to
-        // come with fixing that release, which is a separate change.
-        uint32_t ac_mark;
-        if (g_chip_swimlane_level >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
-            uint32_t live = ac_state->head.total_record_count -
-                            ac_state->head.current_buf_seq * static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
-            if (live == 0) {
-                continue;
-            }
-            ac_mark = (live > static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE)) ?
-                          static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE) :
-                          live;
-        } else {
-            ac_mark = static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
+        // Stamping the count rather than the capacity is load-bearing on the
+        // failure path below, which charges `dropped` by exactly this many
+        // records: an over-stated mark inflates `dropped` and breaks the
+        // `collected + dropped == total` reconcile — the same over-count that
+        // was removed from aicore_rotate.
+        uint32_t live = ac_state->head.total_record_count -
+                        ac_state->head.current_buf_seq * static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
+        if (live == 0) {
+            // Nothing to publish. The buffer stays this pool's, for the next
+            // run's init to reuse — see the retention rule there.
+            continue;
         }
+        uint32_t ac_mark = (live > static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE)) ?
+                               static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE) :
+                               live;
         ChipSwimlaneAicoreTaskBuffer *ac_buf = reinterpret_cast<ChipSwimlaneAicoreTaskBuffer *>(ac_buf_ptr);
         ac_buf->count = ac_mark;
         wmb();
@@ -790,9 +808,11 @@ void chip_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int 
             ac_state->head.current_buf_ptr = 0;
             wmb();
         } else {
+            // Same retention rule as the task pool: the buffer stays this
+            // pool's so the next run's init can reuse it, since a cleared
+            // pointer would strand storage the host never received.
             LOG_ERROR("Thread %d: Core %d failed to enqueue AICore buffer at flush (queue full)", thread_idx, core_id);
             ac_state->head.dropped_record_count = ac_state->head.dropped_record_count + ac_mark;
-            ac_state->head.current_buf_ptr = 0;
             wmb();
         }
     }
