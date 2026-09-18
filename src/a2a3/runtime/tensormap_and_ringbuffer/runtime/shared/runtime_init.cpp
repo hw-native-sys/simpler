@@ -159,6 +159,9 @@ bool SchedulerState::init_data_from_layout(const SchedulerLayout &layout, Device
     SchedulerState *sched = this;
     sched->sm_header = reinterpret_cast<SharedMemoryHeader *>(sm_dev_base);
     sched->advance_pending_mask.store(0, std::memory_order_relaxed);
+    // Duration estimates: func_ids are only stable within one run, so a table
+    // carried over from another program would describe different kernels.
+    memset(sched->est_cycles, 0, sizeof(sched->est_cycles));
 #if SIMPLER_SCHED_PROFILING
     sched->tasks_completed.store(0, std::memory_order_relaxed);
     sched->tasks_consumed.store(0, std::memory_order_relaxed);
@@ -218,6 +221,10 @@ void SchedulerState::reset_for_reuse(const SchedulerLayout &layout, void *sm_dev
     SchedulerState *sched = this;
     sched->sm_header = reinterpret_cast<SharedMemoryHeader *>(sm_dev_base);
     sched->advance_pending_mask.store(0, std::memory_order_relaxed);
+    // Duration estimates are deliberately NOT cleared here: reuse in one process
+    // re-runs the same program, so the table still describes its kernels, and a
+    // per-round clear would leave every kernel's first dispatch of every round
+    // with no estimate — which is exactly when the MIX pre-load decides.
 #if SIMPLER_SCHED_PROFILING
     sched->tasks_completed.store(0, std::memory_order_relaxed);
     sched->tasks_consumed.store(0, std::memory_order_relaxed);

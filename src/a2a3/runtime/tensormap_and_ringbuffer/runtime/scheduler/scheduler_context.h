@@ -148,6 +148,12 @@ private:
     // Per-core execution state, indexed by core_id (= worker_id)
     CoreExecState core_exec_states_[RUNTIME_MAX_WORKER];
 
+    // Cycle at which each core's running slot took its current task, indexed by
+    // core id. Written by this thread on a running-slot publish and on
+    // pending->running promotion; read only by the same thread, to derive how
+    // much of the running kernel is likely left. 0 = unknown.
+    uint64_t running_start_cycle_[RUNTIME_MAX_WORKER];
+
     // Cluster-ordered core trackers, one per scheduler thread
     CoreTracker core_trackers_[MAX_AICPU_THREADS];
 
@@ -406,6 +412,15 @@ private:
     // — see the implementation in scheduler_dispatch.cpp for the hint-semantics
     // rationale and the safety argument against the drain worker.
     bool has_idle_in_other_threads(int32_t self_thread_idx, ResourceShape shape) const;
+
+    // True when the cluster's used cores are expected to free soon — i.e. the
+    // running kernel's estimated duration is nearly spent on every core that is
+    // still busy. A pre-load into a cluster that is far from freeing parks a
+    // ready block behind work of unknown (but known-to-be-long) length, and the
+    // block cannot be re-offered to a nearer cluster once committed. When the
+    // estimate is missing for a busy core, the cluster is not vetoed: the
+    // pre-load keeps its previous behaviour until a sample exists.
+    bool mix_preload_target_is_near_free(int32_t thread_idx, int32_t cluster_offset) const;
 
     // True if mix tasks remain in the global MIX ready queue. Approximate —
     // ChipReadyQueue::size() (see scheduler.h) snapshots its enqueue/dequeue

@@ -40,6 +40,13 @@
 #include "shared_memory.h"
 
 #include "aicpu/device_time.h"  // get_sys_cnt_aicpu (weak; used by early-dispatch doorbell timing too)
+
+// est_cycles[] is indexed by func_id, so it needs the runtime's func-id bound.
+// Authoritative value lives in runtime.h, which this header cannot include (it
+// pulls in Handshake); mirror it under the same guard as scheduler_context.h.
+#ifndef RUNTIME_MAX_FUNC_ID
+#define RUNTIME_MAX_FUNC_ID 1024
+#endif
 #if SIMPLER_SCHED_PROFILING
 #define SCHED_CYCLE_START() uint64_t _st0 = get_sys_cnt_aicpu(), _st1
 #define SCHED_CYCLE_LAP(acc)        \
@@ -510,6 +517,39 @@ struct SchedulerState {
     } ring_sched_states[CHIP_MAX_RING_DEPTH];
 
     alignas(64) std::atomic<uint32_t> advance_pending_mask;
+
+    // Per-kernel EWMA of observed task duration, in AICPU sys-cnt cycles. The
+    // MIX pending pre-load commits a block to one cluster before knowing when
+    // that cluster frees, so the one thing the scheduler can know is how long a
+    // kernel usually takes; remaining = est - elapsed keeps a short block from
+    // being parked behind a long one (see
+    // SchedulerContext::mix_preload_target_is_near_free).
+    // Written from the completion path by whichever thread observes the FIN —
+    // concurrent updates only mix samples, which is what an EWMA wants — and
+    // read cross-thread as a hint. 0 = no sample yet, which leaves the pre-load
+    // behaviour untouched. Cleared on init; deliberately kept across reuse so a
+    // replayed program does not re-learn every kernel every round (func_ids are
+    // stable for as long as the program stays loaded — see runtime_init.cpp).
+    uint32_t est_cycles[RUNTIME_MAX_FUNC_ID];
+
+    uint32_t est_cycles_for(int32_t func_id) const {
+        if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return 0;
+        return est_cycles[func_id];
+    }
+
+    // 1/8-weight EWMA of one observed duration. The sample spans running-slot
+    // dispatch -> FIN observation, so it over-estimates by the poll latency;
+    // that bias is small against the durations compared here and applies to
+    // every kernel, so the comparison stays meaningful.
+    void record_est_cycles(int32_t func_id, uint64_t sample_cycles) {
+        if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID || sample_cycles == 0) return;
+        uint32_t sample = sample_cycles > 0xFFFFFFFFu ? 0xFFFFFFFFu : static_cast<uint32_t>(sample_cycles);
+        uint32_t prev = est_cycles[func_id];
+        int64_t next = (prev == 0) ?
+                           static_cast<int64_t>(sample) :
+                           static_cast<int64_t>(prev) + (static_cast<int64_t>(sample) - static_cast<int64_t>(prev)) / 8;
+        est_cycles[func_id] = static_cast<uint32_t>(next);
+    }
 
     // Ready queues remain global (scheduling is ring-agnostic)
     ChipReadyQueue ready_queues[NUM_RESOURCE_SHAPES];
