@@ -256,6 +256,11 @@ parse_timing() {
 #   from the [STRACE] markers in its stderr. Skips the example if it has no
 #   test_*.py. Sets global PASS / FAIL counters.
 # ---------------------------------------------------------------------------
+
+# Enough to carry a Python traceback plus the exception line that follows it,
+# which is where a failing run states its own cause.
+FAILURE_TAIL_LINES=25
+
 run_bench() {
     local example="$1" example_dir="$2" case_name="${3:-}"
     local mode="${4:-parallel}"
@@ -307,7 +312,18 @@ run_bench() {
         cat "$fw_stdout_file" >> "$VERBOSE_LOG"
     fi
     if [[ $rc -ne 0 ]]; then
-        echo "  FAILED: benchmark run returned non-zero"
+        # The captured output is the only record of why the run failed, and it
+        # dies with $fw_stdout_file on return — so echo its tail here rather
+        # than leaving the exit code to stand in for the cause.
+        echo "  FAILED: exit $rc — ${run_cmd[*]}"
+        if [[ -s "$fw_stdout_file" ]]; then
+            echo "  ---- last $FAILURE_TAIL_LINES lines of output ----"
+            tail -n "$FAILURE_TAIL_LINES" "$fw_stdout_file" | sed 's/^/  | /'
+            echo "  ---- end of output ----"
+            [[ -z "$VERBOSE_LOG" ]] && echo "  (re-run with -v to keep the full output)"
+        else
+            echo "  (the run produced no output)"
+        fi
         vlog "FAILED: exit code $rc"
         ((FAIL++)) || true
         return
