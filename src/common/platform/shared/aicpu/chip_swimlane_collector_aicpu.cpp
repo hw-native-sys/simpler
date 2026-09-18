@@ -76,6 +76,7 @@ struct AicorePendingEnqueue {
     uint64_t buf_ptr = 0;  // 0 == nothing pending
     uint32_t buf_seq = 0;
     uint32_t gate_reg_task_id = 0;
+    uint32_t record_count = 0;  // records actually written into buf_ptr
 };
 static AicorePendingEnqueue s_aicore_pending_enqueue[PLATFORM_MAX_CORES] = {};
 
@@ -428,6 +429,12 @@ void chip_swimlane_aicpu_init(int worker_count) {
             ac_buf->count = 0;
             ac_buf->run_epoch = get_platform_run_result_epoch();
             ac_buf->local_seq = 0;
+            // Covers a predecessor that never reached its flush — a kernel the
+            // op-execute watchdog reaped mid-run leaves `live` describing records
+            // in a buffer this run is about to reuse. Every path that does reach
+            // flush already zeroes it in take_aicore_live_count, so this is
+            // unreachable from any completed run.
+            ac_state->head.live_record_count = 0;
             wmb();
             ac_state->head.current_buf_ptr = ac_buf_ptr;
             wmb();
@@ -478,13 +485,39 @@ static void switch_task_buffer(int core_id, int thread_idx) {
 // and run-end flush. No-op when nothing is pending. On ready-queue-full the
 // buffer stays stashed for a later retry; the same no-double-count rationale as
 // the rotation queue-full branch applies (reconcile reports silent_loss).
+// Take the current buffer's record count and reset the live counter, charging
+// anything above capacity to `dropped`.
+//
+// The excess is real loss, and this is the first point at which it is countable.
+// A rotation that finds no free buffer returns with the old buffer still active,
+// so AICore keeps dispatching into a full buffer and its slot guard refuses the
+// writes past the end. `aicore_rotate` cannot charge those when it fails —
+// it does not yet know how many will follow — so the overflow accumulates in
+// `live_record_count` and is settled here.
+//
+// This is what replaces `total_record_count - current_buf_seq * BUFFER_SIZE`.
+// That derivation was only correct while every rotation had been full and while
+// both operands were reset together each run; the count is now tracked instead
+// of inferred, so neither premise is needed.
+static uint32_t take_aicore_live_count(ChipSwimlaneAicoreTaskPool *ac_state) {
+    uint32_t live = ac_state->head.live_record_count;
+    if (live > static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE)) {
+        ac_state->head.dropped_record_count =
+            ac_state->head.dropped_record_count + (live - static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE));
+        live = static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
+    }
+    ac_state->head.live_record_count = 0;
+    wmb();
+    return live;
+}
+
 static void publish_aicore_pending_buffer(int core_id, int thread_idx) {
     AicorePendingEnqueue &pe = s_aicore_pending_enqueue[core_id];
     if (pe.buf_ptr == 0) {
         return;
     }
     ChipSwimlaneAicoreTaskBuffer *old_buf = reinterpret_cast<ChipSwimlaneAicoreTaskBuffer *>(pe.buf_ptr);
-    old_buf->count = static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
+    old_buf->count = pe.record_count;
     wmb();
     int rc = enqueue_ready_buffer(
         s_chip_swimlane_header, thread_idx, core_id, pe.buf_ptr, pe.buf_seq, ChipSwimlaneBufferKind::AicoreTask
@@ -495,6 +528,11 @@ static void publish_aicore_pending_buffer(int core_id, int thread_idx) {
             core_id
         );
         return;
+    }
+    ChipSwimlaneAicoreTaskPool *ac_state = s_aicore_task_pools[core_id];
+    if (ac_state != nullptr) {
+        ac_state->head.published_record_count = ac_state->head.published_record_count + pe.record_count;
+        wmb();
     }
     pe.buf_ptr = 0;
 }
@@ -563,6 +601,9 @@ static void aicore_rotate(int core_id, int thread_idx, uint32_t new_buf_first_re
         pe.buf_ptr = old_buf_ptr;
         pe.buf_seq = seq;
         pe.gate_reg_task_id = new_buf_first_reg_task_id;
+        // Read the count here, while it still describes the buffer being handed
+        // over: the dispatches that follow belong to the replacement.
+        pe.record_count = take_aicore_live_count(ac_state);
     }
 
     // Pop next buffer from free_queue and publish via the head channel.
@@ -624,6 +665,16 @@ void chip_swimlane_aicpu_on_aicore_dispatch(int core_id, int thread_idx, uint32_
     }
     s_aicore_dispatched_count[core_id] = prev + 1;
     ac_state->head.total_record_count += 1;
+    if (ac_state->head.current_buf_ptr == 0) {
+        // No buffer to land in, so this dispatch produces no record: AICore
+        // resolves the head lazily and gets a null buffer, and its reserve
+        // refuses. Charging it to `live` instead would attribute it to whichever
+        // buffer the pool hands over next — a buffer that never received it —
+        // and the flush would then mark that buffer with a count it cannot back.
+        ac_state->head.dropped_record_count += 1;
+    } else {
+        ac_state->head.live_record_count += 1;
+    }
 }
 
 void chip_swimlane_aicpu_on_aicore_ack(int core_id, int thread_idx, uint32_t reg_task_id) {
@@ -769,30 +820,20 @@ void chip_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int 
         uint64_t ac_buf_ptr = ac_state->head.current_buf_ptr;
         if (ac_buf_ptr == 0) continue;
 
-        // How many records the current buffer holds, from the rotation
-        // accounting: `total_record_count - current_buf_seq * BUFFER_SIZE`.
-        // `total_record_count` is bumped once per dispatch in
+        // How many records the current buffer holds, tracked per dispatch rather
+        // than derived. `live_record_count` is bumped in
         // chip_swimlane_aicpu_on_aicore_dispatch, so it is accurate at every
-        // level — including TASK_TIMING, where complete_task is bypassed. The
-        // clamp covers a failed rotation: seq did not bump, so the difference
-        // can exceed capacity while AICore's slot guard refused the overflow,
-        // and the buffer really is full.
+        // level — including TASK_TIMING, where complete_task is bypassed.
         //
-        // Stamping the count rather than the capacity is load-bearing on the
-        // failure path below, which charges `dropped` by exactly this many
-        // records: an over-stated mark inflates `dropped` and breaks the
-        // `collected + dropped == total` reconcile — the same over-count that
-        // was removed from aicore_rotate.
-        uint32_t live = ac_state->head.total_record_count -
-                        ac_state->head.current_buf_seq * static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
-        if (live == 0) {
+        // Stamping the real count is load-bearing on the failure path below,
+        // which charges `dropped` by exactly this many records: an over-stated
+        // mark inflates `dropped` and breaks the accounting identity.
+        if (ac_state->head.live_record_count == 0) {
             // Nothing to publish. The buffer stays this pool's, for the next
             // run's init to reuse — see the retention rule there.
             continue;
         }
-        uint32_t ac_mark = (live > static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE)) ?
-                               static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE) :
-                               live;
+        uint32_t ac_mark = take_aicore_live_count(ac_state);
         ChipSwimlaneAicoreTaskBuffer *ac_buf = reinterpret_cast<ChipSwimlaneAicoreTaskBuffer *>(ac_buf_ptr);
         ac_buf->count = ac_mark;
         wmb();
@@ -805,6 +846,7 @@ void chip_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int 
             LOG_INFO(
                 "Thread %d: Core %d flushed AICore buffer (seq=%u, count=%u)", thread_idx, core_id, ac_seq, ac_mark
             );
+            ac_state->head.published_record_count = ac_state->head.published_record_count + ac_mark;
             ac_state->head.current_buf_ptr = 0;
             wmb();
         } else {

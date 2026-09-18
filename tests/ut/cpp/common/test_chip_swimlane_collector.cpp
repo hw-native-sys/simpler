@@ -202,6 +202,17 @@ bool free_queue_holds(const ChipSwimlaneFreeQueue &fq, uint64_t buf_ptr) {
     return false;
 }
 
+// The same protocol for an AICore pool's free queue. Both pool kinds share the
+// ChipSwimlaneFreeQueue layout and slot count, so this differs from the task-pool
+// helper only in which queue it is handed.
+void host_push_aicore_free_queue(ChipSwimlaneFreeQueue &fq, uint64_t buf_ptr) {
+    ASSERT_LT(fq.tail - fq.head, static_cast<uint32_t>(PLATFORM_PROF_SLOT_COUNT)) << "free queue is full";
+    fq.buffer_ptrs[fq.tail % PLATFORM_PROF_SLOT_COUNT] = buf_ptr;
+    wmb();
+    fq.tail = fq.tail + 1;
+    wmb();
+}
+
 // The host's half of the SPSC protocol: write the slot, fence, then publish the
 // tail. AICPU is the queue's consumer and has no push of its own, so a test
 // that needs a buffer back in the pool has to play the host here.
@@ -632,4 +643,185 @@ TEST(ChipSwimlaneBufferReturnTest, APublishedAicoreBufferIsReturnedByTheHostAndR
     }
 
     collector.finalize(nullptr, swimlane_test_free);
+}
+
+// ---------------------------------------------------------------------------
+// AICore record accounting: published + live + dropped == total, with the
+// current buffer's count tracked per dispatch rather than derived from
+// `total_record_count - current_buf_seq * BUFFER_SIZE`.
+// ---------------------------------------------------------------------------
+
+class ChipSwimlaneAccountingTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        ASSERT_EQ(
+            collector_.initialize(
+                /*num_aicore=*/1, /*aicpu_thread_num=*/1, /*device_id=*/0, ChipSwimlaneLevel::TASK_TIMING,
+                swimlane_test_alloc, nullptr, swimlane_test_free
+            ),
+            0
+        );
+        shm_ = collector_.get_chip_swimlane_setup_device_ptr();
+        ASSERT_NE(shm_, nullptr);
+        set_chip_swimlane_enabled(true);
+        set_platform_chip_swimlane_base(reinterpret_cast<uint64_t>(shm_));
+        set_platform_chip_swimlane_aicore_rotation_table(0);
+    }
+
+    void TearDown() override {
+        set_platform_run_result(0, 0);
+        set_chip_swimlane_enabled(false);
+        collector_.finalize(nullptr, swimlane_test_free);
+    }
+
+    // One run's device sequence. Deliberately does not call begin_run(): the
+    // caller decides whether the host's per-run clear happens, because whether it
+    // does is the thing under test.
+    void device_run(uint64_t epoch, int dispatches) {
+        set_platform_run_result(/*region_base=*/0, epoch);
+        get_chip_swimlane_header(shm_)->chip_swimlane_level = static_cast<uint32_t>(ChipSwimlaneLevel::TASK_TIMING);
+        chip_swimlane_aicpu_init(/*worker_count=*/1);
+        for (int i = 0; i < dispatches; i++) {
+            chip_swimlane_aicpu_on_aicore_dispatch(/*core_id=*/0, /*thread_idx=*/0, static_cast<uint32_t>(i + 1));
+        }
+        const int cores[] = {0};
+        chip_swimlane_aicpu_flush(/*thread_idx=*/0, cores, /*core_num=*/1);
+    }
+
+    // The `count` stamped on every AICore buffer published so far, in order.
+    std::vector<uint32_t> published_marks() const {
+        std::vector<uint32_t> marks;
+        const auto *header = get_chip_swimlane_header(shm_);
+        for (uint32_t i = 0; i < header->queue_tails[0]; i++) {
+            const ReadyQueueEntry &entry = header->queues[0][i];
+            if (entry.kind != ChipSwimlaneBufferKind::AicoreTask) continue;
+            const uint32_t mark = reinterpret_cast<const ChipSwimlaneAicoreTaskBuffer *>(entry.buffer_ptr)->count;
+            marks.push_back(mark);
+        }
+        return marks;
+    }
+
+    static bool accounting_balances(const ChipSwimlaneAicoreTaskPool *ac_state) {
+        const uint32_t published = ac_state->head.published_record_count;
+        const uint32_t live = ac_state->head.live_record_count;
+        const uint32_t dropped = ac_state->head.dropped_record_count;
+        const uint32_t total = ac_state->head.total_record_count;
+        return published + live + dropped == total;
+    }
+
+    ChipSwimlaneCollector collector_;
+    void *shm_ = nullptr;
+};
+
+// The tail count survives a window spanning two runs — which is the whole point
+// of tracking it instead of deriving it.
+//
+// The old form was `total_record_count - current_buf_seq * BUFFER_SIZE`. Both
+// operands were reset together every run: the host cleared `total` in
+// `publish_run_config`, and `init` reset `seq` to 0. Take the per-run clear away —
+// which is exactly what continuous collection does — and the two no longer agree:
+// `total` carries the earlier run's dispatches while `seq` restarts at 0, so the
+// derivation reports the whole window as live in the current buffer.
+//
+// Here run 1 dispatches 3 and publishes them; run 2 starts without the host's
+// clear and dispatches 2. The derivation would have marked run 2's tail 5 — more
+// records than were ever written into that buffer — and charged the difference to
+// whichever side of the accounting read it next. The tracked counter says 2.
+TEST_F(ChipSwimlaneAccountingTest, TheTailCountSurvivesAWindowSpanningTwoRuns) {
+    // Run 1, with the host's per-run clear, as today.
+    collector_.begin_run("run-one", ChipSwimlaneLevel::TASK_TIMING);
+    device_run(/*epoch=*/1, /*dispatches=*/3);
+    ASSERT_EQ(published_marks().size(), 1u);
+    EXPECT_EQ(published_marks()[0], 3u) << "run 1 published something other than its 3 dispatches";
+
+    auto *ac_state = get_aicore_buffer_state(shm_, 0);
+    EXPECT_EQ(ac_state->head.total_record_count, 3u);
+    EXPECT_EQ(ac_state->head.published_record_count, 3u);
+    EXPECT_EQ(ac_state->head.live_record_count, 0u);
+    EXPECT_EQ(ac_state->head.dropped_record_count, 0u);
+
+    // Run 2 without begin_run(): `total_record_count` keeps the first run's 3
+    // while `init` resets `current_buf_seq` to 0. This is the state the old
+    // derivation could not survive.
+    device_run(/*epoch=*/2, /*dispatches=*/2);
+    ASSERT_EQ(published_marks().size(), 2u);
+    EXPECT_EQ(
+        published_marks()[1], 2u
+    ) << "the tail was marked from a cross-run derivation rather than this run's own count";
+
+    EXPECT_EQ(ac_state->head.total_record_count, 5u) << "the window's attempt tally should span both runs";
+    EXPECT_EQ(ac_state->head.published_record_count, 5u);
+    EXPECT_EQ(ac_state->head.live_record_count, 0u);
+    EXPECT_EQ(ac_state->head.dropped_record_count, 0u);
+    EXPECT_TRUE(accounting_balances(ac_state)) << "published + live + dropped != total";
+}
+
+// An idle run leaves the identity trivially satisfied and publishes nothing, so
+// a retained buffer never contributes a phantom count.
+TEST_F(ChipSwimlaneAccountingTest, AnIdleRunLeavesNothingLive) {
+    collector_.begin_run("idle", ChipSwimlaneLevel::TASK_TIMING);
+    device_run(/*epoch=*/7, /*dispatches=*/0);
+
+    auto *ac_state = get_aicore_buffer_state(shm_, 0);
+    EXPECT_TRUE(published_marks().empty()) << "an idle run published a buffer";
+    EXPECT_EQ(ac_state->head.live_record_count, 0u);
+    EXPECT_EQ(ac_state->head.published_record_count, 0u);
+    EXPECT_EQ(ac_state->head.total_record_count, 0u);
+    EXPECT_TRUE(accounting_balances(ac_state));
+}
+
+// Dispatches made with no active buffer belong to `dropped`, not to whichever
+// buffer the pool hands over next.
+//
+// The path, with capacity B: `init` finds the free queue empty and leaves
+// `current_buf_ptr` at 0, so AICore resolves a null buffer and its reserve refuses
+// every record. B dispatches later the host returns a buffer and the B+1'th
+// dispatch rotates into it — a rotation whose outgoing pointer is 0, so it stashes
+// nothing and settles nothing. Had those B dispatches been counted as live, the
+// recovered buffer would be marked with B+1 records while holding 1.
+//
+// Checking only `published + live + dropped == total` cannot see this: the sum
+// balances either way. So this asserts the buffer's own mark and `dropped`
+// separately, which is where the two outcomes actually differ.
+TEST_F(ChipSwimlaneAccountingTest, DispatchesWithNoBufferAreDroppedNotCarriedIntoTheNextOne) {
+    auto *ac_state = get_aicore_buffer_state(shm_, 0);
+
+    // Keep one real buffer aside, then present an empty free queue to init.
+    const uint64_t spare = ac_state->free_queue.buffer_ptrs[ac_state->free_queue.head % PLATFORM_PROF_SLOT_COUNT];
+    ASSERT_NE(spare, 0u);
+    ac_state->free_queue.head = ac_state->free_queue.tail;
+    wmb();
+
+    collector_.begin_run("starved", ChipSwimlaneLevel::TASK_TIMING);
+    set_platform_run_result(/*region_base=*/0, /*run_epoch=*/61);
+    get_chip_swimlane_header(shm_)->chip_swimlane_level = static_cast<uint32_t>(ChipSwimlaneLevel::TASK_TIMING);
+    chip_swimlane_aicpu_init(/*worker_count=*/1);
+    ASSERT_EQ(ac_state->head.current_buf_ptr, 0u) << "init found a buffer; the starvation setup did not take";
+
+    // A full batch of dispatches with nowhere to land.
+    constexpr uint32_t kCapacity = static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
+    for (uint32_t i = 0; i < kCapacity; i++) {
+        chip_swimlane_aicpu_on_aicore_dispatch(/*core_id=*/0, /*thread_idx=*/0, i + 1);
+    }
+    EXPECT_EQ(ac_state->head.live_record_count, 0u)
+        << "dispatches with no active buffer were credited to a buffer that does not exist";
+    EXPECT_EQ(ac_state->head.dropped_record_count, kCapacity);
+
+    // The host returns a buffer; the next dispatch is the rotation boundary, so it
+    // acquires that buffer and is the only record it will hold.
+    host_push_aicore_free_queue(ac_state->free_queue, spare);
+    chip_swimlane_aicpu_on_aicore_dispatch(/*core_id=*/0, /*thread_idx=*/0, kCapacity + 1);
+    ASSERT_NE(ac_state->head.current_buf_ptr, 0u) << "the returned buffer was never picked up";
+    EXPECT_EQ(ac_state->head.live_record_count, 1u);
+
+    const int cores[] = {0};
+    chip_swimlane_aicpu_flush(/*thread_idx=*/0, cores, /*core_num=*/1);
+
+    const std::vector<uint32_t> marks = published_marks();
+    ASSERT_EQ(marks.size(), 1u) << "expected exactly the recovered buffer to be published";
+    EXPECT_EQ(marks[0], 1u) << "the recovered buffer was marked with records it never received";
+    EXPECT_EQ(ac_state->head.published_record_count, 1u);
+    EXPECT_EQ(ac_state->head.dropped_record_count, kCapacity);
+    EXPECT_EQ(ac_state->head.total_record_count, kCapacity + 1);
+    EXPECT_TRUE(accounting_balances(ac_state));
 }

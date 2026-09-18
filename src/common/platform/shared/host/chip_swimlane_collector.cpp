@@ -876,19 +876,22 @@ void ChipSwimlaneCollector::publish_run_config() {
     // device, so they carry the previous run's totals into this run's reconcile
     // unless cleared here.
     //
-    // total_record_count and dropped_record_count are adjacent, so one narrow
-    // write covers both and leaves the device-owned fields in the same cache
-    // line (current_buf_ptr, current_buf_seq) untouched.
+    // The four counters are contiguous, so one narrow write covers all of them
+    // and leaves the device-owned fields in the same cache line
+    // (current_buf_ptr, current_buf_seq) untouched. `live` and `published` have
+    // to be cleared with the other two: the accounting identity
+    // `published + live + dropped == total` is per run, so clearing only part of
+    // it would leave the next run comparing a fresh total against carried-over
+    // published records.
     auto reset_head = [this](ChipSwimlaneActiveHead *head) {
         head->total_record_count = 0;
         head->dropped_record_count = 0;
+        head->live_record_count = 0;
+        head->published_record_count = 0;
         wmb();
-        static_assert(
-            offsetof(ChipSwimlaneActiveHead, dropped_record_count) ==
-                offsetof(ChipSwimlaneActiveHead, total_record_count) + sizeof(uint32_t),
-            "the two counters must stay adjacent for this single write-back to cover both"
-        );
-        (void)manager_.write_range_to_device(&head->total_record_count, 2 * sizeof(uint32_t));
+        // Contiguity is asserted where the struct is declared, next to the field
+        // order it constrains.
+        (void)manager_.write_range_to_device(&head->total_record_count, 4 * sizeof(uint32_t));
     };
 
     // Every slot, not just this run's: the grid is dimensioned by the platform

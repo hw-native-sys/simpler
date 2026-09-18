@@ -315,14 +315,38 @@ static_assert(sizeof(ChipSwimlaneFreeQueue) == 128, "ChipSwimlaneFreeQueue must 
  * old buffer before AICPU enqueues it to ready_queue.
  */
 struct ChipSwimlaneActiveHead {
-    volatile uint64_t current_buf_ptr;       // 8 — active buffer device address (0 = none)
-    volatile uint32_t current_buf_seq;       // 4 — monotonic seq / AICore rotation generation
-    volatile uint32_t total_record_count;    // 4 — producer-attempted writes
-    volatile uint32_t dropped_record_count;  // 4 — producer-dropped writes
-    uint32_t pad[11];                        // 44 → 64B
+    volatile uint64_t current_buf_ptr;         // 8 — active buffer device address (0 = none)
+    volatile uint32_t current_buf_seq;         // 4 — monotonic seq / AICore rotation generation
+    volatile uint32_t total_record_count;      // 4 — producer-attempted writes
+    volatile uint32_t dropped_record_count;    // 4 — producer-dropped writes
+    volatile uint32_t live_record_count;       // 4 — writes into the buffer currently active
+    volatile uint32_t published_record_count;  // 4 — writes in buffers handed to the host
+    uint32_t pad[9];                           // 36 → 64B
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(ChipSwimlaneActiveHead) == 64, "ChipSwimlaneActiveHead must be one cache line");
+
+// The AICore pool's four counters split every dispatch into exactly one bucket:
+// `live` while its buffer is still the active one, `published` once that buffer
+// has been handed to the host, `dropped` when the dispatch had nowhere to land.
+//
+// `published + live + dropped == total` is a **checkpoint** identity, not a
+// running invariant. A rotated-out buffer's count leaves `live` when the rotation
+// stashes it and joins `published` only when the ACK gate releases it, so between
+// those two points it is in neither — it is held in the AICPU-private
+// pending-enqueue slot. The identity therefore holds after a flush whose publishes
+// all succeeded, which is where the host reads these; it does not hold mid-run,
+// and a check that assumes otherwise reports a loss that is really a hand-off in
+// progress.
+static_assert(
+    offsetof(ChipSwimlaneActiveHead, dropped_record_count) ==
+            offsetof(ChipSwimlaneActiveHead, total_record_count) + sizeof(uint32_t) &&
+        offsetof(ChipSwimlaneActiveHead, live_record_count) ==
+            offsetof(ChipSwimlaneActiveHead, dropped_record_count) + sizeof(uint32_t) &&
+        offsetof(ChipSwimlaneActiveHead, published_record_count) ==
+            offsetof(ChipSwimlaneActiveHead, live_record_count) + sizeof(uint32_t),
+    "the four record counters must stay contiguous: the host clears them in one narrow write-back"
+);
 
 // =============================================================================
 // Pool layouts: every pool = ActiveHead (64B) + ChipSwimlaneFreeQueue (128B) = 192B
