@@ -2,15 +2,15 @@
 
 Graph Execution is available only in the `host_build_graph` runtime. A Graph is
 a composite incore task: it occupies one task window slot and completes once,
-like any other task of the run, but contains a recorded DAG of in-graph tasks. It
+like any other task of the run, but contains a recorded DAG of sub-tasks. It
 is a container in the same sense an SPMD task is — SPMD expands one slot into
-`logical_block_num` blocks, a Graph expands one slot into its recorded in-graph
-tasks — where an AIC, AIV or MIX task is a leaf that dispatches straight to cores.
+`logical_block_num` blocks, a Graph expands one slot into its recorded sub-tasks
+— where an AIC, AIV or MIX task is a leaf that dispatches straight to cores.
 
 Every invocation places exactly one `GRAPH` task in the host task window. On a
 first miss, the caller immediately submits an outer task shell keyed by Graph
 identity while a recording thread records the DAG off the ordinary submit path. Internal
-submissions build host-only in-graph task metadata and assign output addresses from the
+submissions build host-only sub-task metadata and assign output addresses from the
 recording's own address space instead of consuming task-window slots or heap.
 Later calls for the same in-flight identity submit more shells without waiting
 for recording, and a call for a *different* identity opens its own recording on
@@ -19,7 +19,7 @@ every recording and fills each shell's heap range and the device address of the
 Definition object it replays.
 Cached invocations submit the same one `GRAPH` task directly — a cache hit never
 waits on a recording. In both cases the device Scheduler expands the saved
-topology and dispatches the in-graph tasks; the Host Orchestrator never submits
+topology and dispatches the sub-tasks; the Host Orchestrator never submits
 them as tasks of the run itself.
 
 Boundary contracts are checked before an in-flight shell is accepted. Once a
@@ -30,7 +30,7 @@ TensorMap producers.
 
 ## API
 
-A Graph boundary uses `GraphTaskArgs`; an in-graph task's arguments use
+A Graph boundary uses `GraphTaskArgs`; a sub-task's arguments use
 `CoreTaskArgs`, the existing incore argument type:
 
 ```cpp
@@ -204,9 +204,9 @@ why it cannot be diagnosed instead:
 - Boundary storage is caller-owned. `INPUT`, `INOUT`, `OUTPUT_EXISTING`, and
   `NO_DEP` are supported. A boundary `TensorCreateInfo` tagged `OUTPUT` is not.
 - Early-resolve hints apply while recording the first invocation. Replayed
-  in-graph tasks use the saved completion topology without the hint.
+  sub-tasks use the saved completion topology without the hint.
 - Every tensor a recorded task uses must come from the Graph's own boundary — a
-  parameter, or a view derived from one — or from another in-graph task's output.
+  parameter, or a view derived from one — or from another sub-task's output.
   A tensor that entered the body any other way, such as a global or one produced
   before the Graph, is refused by name: recording is abandoned and the bind fails
   rather than baking a Definition that would rebind that tensor to someone else's
@@ -219,7 +219,7 @@ why it cannot be diagnosed instead:
   into an absolute GM address, which no Definition can hold, so the Definition
   stores the operand tensor plus the element index within it, and materialize
   rebinds the tensor and resolves the pair per execution. The operand may be a
-  boundary ChipTensor or another in-graph task's output, but not the consuming
+  boundary ChipTensor or another sub-task's output, but not the consuming
   task's own output; the predicate itself creates no dependency, exactly as on
   the ordinary path, so the caller still declares one on the operand's producer.
 
@@ -300,7 +300,7 @@ and is not part of the Graph key.
 
 Recording uses host-only C++ state:
 
-- `std::vector` for in-graph tasks, tensors, scalars, fanins, and pending uploads;
+- `std::vector` for sub-tasks, tensors, scalars, fanins, and pending uploads;
 - `std::unordered_map` for the per-run Definition cache;
 - `std::unordered_map` for the recordings in flight, keyed by Graph identity and
   holding each entry by `std::unique_ptr`, guarded by a mutex and completion
@@ -314,12 +314,12 @@ recording array is copied on a cache hit.
 A recording addresses its body in a space of its own, starting at
 `GRAPH_RECORD_BASE = PACKED_OUTPUT_ALIGN`. The boundary's formal parameters come
 first, one address per buffer — parameters sharing a buffer share an address —
-each claiming as much room as the argument it stands for. An in-graph task's
+each claiming as much room as the argument it stands for. A sub-task's
 packed outputs are bumped from the end of that region. Both are positions in the
 recording's own space, not addresses of anything.
 
 Moving the parameters into that space is what makes a recording closed. The body
-derives every tensor it uses from a parameter or from another in-graph task's
+derives every tensor it uses from a parameter or from another sub-task's
 output, so no address the caller owns reaches the Definition — the caller's real
 addresses travel with the outer shell's own arguments instead. The base is
 non-zero so that no recorded object sits at address 0, which a task slot uses as
@@ -338,7 +338,7 @@ precondition the allocator supplies (see "Supported dynamic and static data").
 
 **Classification is by provenance, not by address range.** Each boundary tensor
 is stamped with `TaskId::Space::PARAM` and its parameter index, each recorded
-output with `Space::IN_GRAPH`, and views propagate the stamp — so a tensor's
+output with `Space::SUB_TASK`, and views propagate the stamp — so a tensor's
 `owner_task_id` says which of the two cases it is. A tensor owned by neither,
 meaning one that entered the body without passing through the boundary, is
 refused by name and the Graph is abandoned rather than recorded. Ranges could not
@@ -361,7 +361,7 @@ replay would otherwise have to supply.
 cache miss, the calling thread allocates a zero-heap outer task shell, records
 its boundary dependency edges, captures the boundary into the in-flight entry,
 and returns. A recording thread reads that entry's parameter list, records the
-in-graph tasks in the recording's own address space, and builds and hashes the
+sub-tasks in the recording's own address space, and builds and hashes the
 Definition. The first call waits only
 until that private job has been installed in the recorder queue; it does not wait
 for the operating system to schedule the thread or for `graph_prepare` to bind
@@ -384,7 +384,7 @@ Growth happens inside the submission that needs it, so it lands on the submittin
 thread: a workload whose Definition count exceeds the prewarmed count pays a
 `pthread_create` (measured 32-74 us each) in the middle of its submission burst.
 Recording touches no shared allocator state and each recording classifies Tensor
-sources only against its own in-graph tasks and its own boundary, so two
+sources only against its own sub-tasks and its own boundary, so two
 recordings cannot see each other's addresses even though both address their
 bodies from `GRAPH_RECORD_BASE`: a tensor's provenance names a parameter or a
 task of the recording that stamped it, and nothing resolves it anywhere else.
@@ -409,7 +409,7 @@ state unrepresentable rather than merely unlikely.
 Calls for the same identity while recording is in flight follow the same shell
 submission path on the calling thread. Their task IDs and TensorMap producers
 therefore enter the ordinary program-order sequence while its recording thread is
-executing `record_in_graph_task` and `build_definition`.
+executing `record_sub_task` and `build_definition`.
 
 **Ordinary submissions do not join the recorders either.** `rt_submit_task`,
 `rt_submit_dummy_task` and `alloc_tensors` proceed while any number of Definitions
@@ -449,16 +449,16 @@ stopped and four recording threads running. With the barrier only at completion,
 the recorders rather than the submitter become the tail.
 
 Host phase records therefore show `graph_submit`, `submit_task` and
-`alloc_tensors` on the main lane overlapping `record_in_graph_task` and
+`alloc_tensors` on the main lane overlapping `record_sub_task` and
 `build_definition` on the recording lanes.
 
 At `graph_end`, recording is compacted into one contiguous, pointer-free POD
 Definition. It contains:
 
-- in-graph task order and AIC/AIV/MIX/SPMD kernel metadata;
+- sub-task order and AIC/AIV/MIX/SPMD kernel metadata;
 - `root_indices` plus both directions of the immutable topology:
   fanin CSR and fanout CSR;
-- each in-graph task's early-dispatch verdicts (`ED_FLAG_CANDIDATE` when every
+- each sub-task's early-dispatch verdicts (`ED_FLAG_CANDIDATE` when every
   producer allows early resolve and the task itself carries no predicate, a
   dispatchable shape and at least one internal producer; `ED_FLAG_TRACKED` when
   some candidate names it as a producer). A candidate's fanin CSR row is stored
@@ -470,8 +470,8 @@ Definition. It contains:
   qualification needs a producer to bet on, and a body root has none inside the
   body — so a root's verdict is not recorded here but decided at
   materialization;
-- one packed-heap offset per in-graph task;
-- each in-graph task's ChipTensors, stored relative to whatever replay rebases
+- one packed-heap offset per sub-task;
+- each sub-task's ChipTensors, stored relative to whatever replay rebases
   them against and carrying the owner that says which that is;
 - fixed scalar values plus boundary-scalar source indices.
 
@@ -492,7 +492,7 @@ element. The upload is therefore one contiguous copy with no raw Host pointers
 and no relocation pass.
 
 Before materialization, the Scheduler re-checks the object framing and validates
-section ranges, topology indices, in-graph task heap offsets, and the
+section ranges, topology indices, sub-task heap offsets, and the
 outer heap extent. A tensor's own geometry is not re-checked there: the host
 resolved each one against the parameter or the producing block it came from and
 refused the body otherwise, so what materialize validates is only the parameter
@@ -509,7 +509,7 @@ For a cache hit, the Host Orchestrator:
 1. validates the fixed boundary contract;
 2. reserves one task-window slot;
 3. reserves one heap block large enough for every internal intermediate, plus
-   the Definition's `execution_storage_bytes` for in-graph task storage and its
+   the Definition's `execution_storage_bytes` for sub-task storage and its
    argument pools;
 4. computes only external fanin and boundary tensormap effects;
 5. emits one outer `GRAPH` task;
@@ -522,7 +522,7 @@ task's tensors in one pass rather than switching element stride on the `GRAPH`
 kind. Graph scheduling never dispatches the outer payload as a kernel payload;
 device materialization reads the boundary from it directly.
 
-In-graph tasks consume no task-table slots. Their descriptor, payload, slot
+Sub-tasks consume no task-table slots. Their descriptor, payload, slot
 state, argument pools, and completion states live in the tail of the outer `GRAPH` task's
 own heap block, past `required_heap`:
 `[GraphExecution][ChipTaskStorage...][tensor pool][scalar pool][task_states]`. The state
@@ -530,12 +530,12 @@ array is last because a byte needs no alignment, so appending it moves no other 
 `TaskAllocator::alloc` covers both the packed outputs and this execution storage,
 so they are reclaimed together without a separate device allocation or release path.
 
-An in-graph task's payload holds no argument array of its own — it names each region by
+A sub-task's payload holds no argument array of its own — it names each region by
 a delta, like any other payload. Its pools are the last two regions of the execution
 storage, sized by the Definition's `tensor_arg_count` / `scalar_arg_count` and indexed by
 the task's own `tensor_offset` / `scalar_offset`, so its arguments occupy the same
-span in the pool as in the Definition's arg table. There is no fanin region: in-graph
-task dependencies come from the Definition's fanin CSR, so such a task's `fanin_count`
+span in the pool as in the Definition's arg table. There is no fanin region:
+sub-task dependencies come from the Definition's fanin CSR, so such a task's `fanin_count`
 stays 0 and its fanin delta unbound.
 
 The Host computes the execution-storage size before allocating the outer task's
@@ -545,7 +545,7 @@ other task's argument pools. The copied arena zone and compact shared-memory
 image travel in one H2D. During the parallel initial classify, the Scheduler
 constructs `GraphExecution` in the outer heap tail, binds it to that Definition
 and the outer payload, and replaces `graph_context` with the execution pointer.
-In-graph task storage remains untouched until bounded materialization begins.
+Sub-task storage remains untouched until bounded materialization begins.
 
 ## Scheduler flow
 
@@ -568,23 +568,23 @@ inside a run.
 
 A Graph is placed in two independent control flows:
 
-- `graph_prepare_queue`: materialize the saved in-graph tasks even while external
+- `graph_prepare_queue`: materialize the saved sub-tasks even while external
   fanin is still pending;
 - `graph_ready_queue`: signal that the outer Graph's external fanin is ready.
 
 Core-owning Scheduler threads pop at most one item from each queue per loop. A
-prepare call expands at most four in-graph tasks and requeues unfinished work,
+prepare call expands at most four sub-tasks and requeues unfinished work,
 interleaving Graph expansion with normal scheduling.
 
 Preparation and external readiness set two bits in one atomic activation gate.
-Whichever operation sets the second bit activates the saved root in-graph tasks
+Whichever operation sets the second bit activates the saved root sub-tasks
 exactly once.
 
 Internal dependency readiness borrows the completion-state polling idea, but
 dependency wiring remains an Orchestrator responsibility:
 
 - recording constructs both fanin and fanout CSR in the immutable Definition;
-- materialization builds each in-graph task's runnable state from the Definition,
+- materialization builds each sub-task's runnable state from the Definition,
   moving each Tensor's buffer onto this invocation's argument or onto the graph
   heap this execution was given;
 - materialization registers each non-root on one producer selected from its
@@ -593,7 +593,7 @@ dependency wiring remains an Orchestrator responsibility:
   operand order, so the tail is exactly the deepest producer only on an
   early-dispatch candidate's row, which recording sorts by producer index;
   elsewhere the direction is a heuristic;
-- an in-graph task's completion truth is its execution's own `task_states` byte,
+- a sub-task's completion truth is its execution's own `task_states` byte,
   the same shape the task header gives a GLOBAL task, so such tasks need neither
   a task-table slot nor a byte in the shared-memory array;
 - producer completion closes and drains only its current wake-list rather than
@@ -628,7 +628,7 @@ different party:
 Which early-dispatch queue a released candidate enters is chosen by the task's
 own `sync_start` attribute, never by its cohort: a `sync_start` candidate needs
 an all-or-nothing stage and parks in the single shape-agnostic queue, every
-other candidate in its per-shape one. An in-graph task reaches that fork by the
+other candidate in its per-shape one. A sub-task reaches that fork by the
 same path a top-level one does.
 
 ### What a `sync_start` cohort is scoped to
@@ -689,7 +689,7 @@ outer GRAPH
   -> final internal completion completes the outer GRAPH
 ```
 
-In-graph tasks count as zero tasks of the run itself. The last one to complete
+Sub-tasks count as zero tasks of the run itself. The last one to complete
 finishes the one outer Graph task, publishes that task's `task_states` byte, wakes
 external consumers, and contributes one to the host-visible completion count.
 
@@ -719,10 +719,10 @@ builds:
 - an explicit dependency naming a task outside the Graph;
 - a ChipTensor that reached the body without coming through the boundary,
   including a dispatch predicate's operand tensor;
-- a dispatch predicate whose operand is the predicated in-graph task's own output;
+- a dispatch predicate whose operand is the predicated sub-task's own output;
 - a dispatch predicate whose index vector leaves the operand tensor's extent;
 - runtime allocation inside the Graph body;
-- more than 1024 in-graph tasks;
+- more than 1024 sub-tasks;
 - insufficient heap capacity while deferred shells are finalized.
 
 An AICPU execution-pool or materialization failure happens after the outer
@@ -730,7 +730,7 @@ Graph has already been submitted. It therefore latches a Scheduler fatal error
 instead of falling back; leaving the outer task pending would otherwise wedge
 completion.
 
-Explicit dependencies between recorded in-graph tasks are preserved when they
+Explicit dependencies between recorded sub-tasks are preserved when they
 are otherwise supported; ordinary ChipTensor dependencies are always preserved.
 
 ## DFX

@@ -72,14 +72,14 @@ struct GraphHostDefinitionList {
 GraphHostStatePtr make_graph_host_state(const GraphDefinitionArena &arena);
 
 /**
- * Stand the calling thread's recording storage up — hazard map, in-graph task slots, the
+ * Stand the calling thread's recording storage up — hazard map, sub-task slots, the
  * flat per-task arrays and the task tensor pool — without recording anything.
  *
  * A recorder worker calls this once as it starts, so the allocations land at callable
  * registration rather than inside the first bind that worker serves, and a failure is
  * reported where the caller can still act on it. It is an optimization, not the only
  * stand-up point: a worker the pool creates after prewarm, and a thread whose storage was
- * dropped for overshooting the in-graph task cap, still stand up lazily on their next recording.
+ * dropped for overshooting the sub-task cap, still stand up lazily on their next recording.
  *
  * @return false when an allocation failed; the failure is also counted for
  *         graph_recorder_storage_failures(), which is how the host notices across the

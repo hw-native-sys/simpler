@@ -82,7 +82,7 @@ manifest's `bin_file` is `null`, and every `bin_size` is `0`.
 `hybrid` deliberately inherits `partial`'s selector semantics; it does not add
 a second mask. `tensormap_and_ringbuffer` registers selection metadata in its
 AICPU per-task table. `host_build_graph` embeds the same mask, ambiguity flags,
-and scalar dtypes in each H2D task image, including cached in-graph task
+and scalar dtypes in each H2D task image, including cached sub-task
 definitions. The device collector consumes either source identically.
 
 ```bash

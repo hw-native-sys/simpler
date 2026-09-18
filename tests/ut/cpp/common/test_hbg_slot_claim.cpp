@@ -89,7 +89,7 @@ protected:
         state.any_subtask_deferred.store(true, std::memory_order_relaxed);
         state.completed_subtasks.store(7, std::memory_order_relaxed);
         state.next_block_idx.store(3, std::memory_order_relaxed);
-        state.in_graph_local_id = 11;
+        state.sub_task_local_id = 11;
         sm_handle->header->tasks.store_completed(slot);
     }
 

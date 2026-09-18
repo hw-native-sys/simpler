@@ -550,6 +550,7 @@ def test_dag_stats_reach_a_thread_whose_stream_was_not_the_first_recorded(tmp_pa
             {
                 "chip_swimlane_level": 3,
                 "metadata": {
+                    "runtime": sc.TMR_RUNTIME,
                     "clock_freq_hz": 1_000_000_000,
                     "num_cores": 2,
                     "core_types": ["aiv", "aiv"],

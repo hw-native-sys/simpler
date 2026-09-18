@@ -166,6 +166,7 @@ The standard SceneTest path
 
 ```json
 {
+  "runtime": "tensormap_and_ringbuffer",
   "tasks": [
     {"task_id": "0",          "scope": "auto", "kernel_ids": [-1,-1,-1], "block_num": 1, "args": []},
     {"task_id": "4294967296", "scope": "auto", "kernel_ids": [7,-1,-1], "block_num": 4, "args": [
@@ -206,16 +207,28 @@ silently lose precision if encoded as numbers. Python consumers pass
 these through `int(v)` which accepts either form, so the schema is
 JS-safe without burdening Python.
 
-Task ids are `TaskId::raw`. The low 32 bits are a local id; the high 32 bits
+Task ids are `TaskId::raw`. The low 32 bits are a local id; the bits above it
 mean whatever the runtime that minted the record says they mean — a ring index
-(`tensormap_and_ringbuffer`, `0..CHIP_MAX_RING_DEPTH-1`) or an id space
-(`host_build_graph`, `0 = GLOBAL`, `1 = IN_GRAPH`). See
+in bits 39:32 (`tensormap_and_ringbuffer`, `0..CHIP_MAX_RING_DEPTH-1`), or an id
+space in bits 63:62 plus a parent task in bits 51:32 (`host_build_graph`,
+`0 = GLOBAL`, `1 = SUB_TASK`, `2 = PARAM`). See
 `src/common/{tensormap_and_ringbuffer,host_build_graph}/task_id.h`.
-Which one a record carries is a property of its runtime, not of the value:
+
+Which one a record carries is a property of its runtime, not of the value, so
+the top-level **`runtime`** key names it. Decode against that key rather than
+guessing from the number — `deps_viewer` does, which is what makes a sub-task
+render as `g{parent}t{index}` instead of a ten-digit high field:
 
 ```python
-high = (raw >> 32) & 0xFF
+runtime = data["runtime"]  # required; a capture without it is refused, not guessed
 local = raw & 0xFFFFFFFF
+if runtime == "host_build_graph":
+    space = (raw >> 62) & 0x3           # 0 GLOBAL, 1 SUB_TASK, 2 PARAM
+    parent = (raw >> 32) & 0xFFFFF      # meaningful for SUB_TASK only
+elif runtime == "tensormap_and_ringbuffer":
+    ring = (raw >> 32) & 0xFF
+else:
+    raise ValueError(f"unsupported runtime: {runtime!r}")
 ```
 
 ### `tasks[]`

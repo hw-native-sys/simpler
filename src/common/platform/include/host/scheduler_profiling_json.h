@@ -14,7 +14,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <ostream>
-#include <string>
 #include <vector>
 
 #include "common/scheduler_profiling.h"
@@ -54,9 +53,14 @@ inline const char *chip_swimlane_scheduler_kind_name(ChipSwimlaneSchedPhaseKind 
     return "unknown";
 }
 
+// A stream carries no runtime name of its own. The runtime is a property of the whole
+// capture -- one run compiles against one runtime -- so it is stated once, in the
+// document's metadata. Repeating it per stream would offer a reader a choice of sources
+// where only one exists, and it would be absent below SCHED_PHASES anyway, where a
+// capture has no streams at all.
 inline void chip_swimlane_write_scheduler_records(
     std::ostream &out, const std::vector<std::vector<CollectedRecord<ChipSwimlaneAicpuSchedPhaseRecord>>> &streams,
-    const std::vector<uint32_t> &dropped_records, const std::string &runtime_name
+    const std::vector<uint32_t> &dropped_records
 ) {
     out << "{\n    \"streams\": [";
     bool first_stream = true;
@@ -65,7 +69,7 @@ inline void chip_swimlane_write_scheduler_records(
         if (records.empty()) continue;
         const uint32_t dropped = stream_index < dropped_records.size() ? dropped_records[stream_index] : 0;
         if (!first_stream) out << ",";
-        out << "\n      {\"platform\": \"" << CHIP_SWIMLANE_ARCHITECTURE_NAME << "\", \"runtime\": \"" << runtime_name
+        out << "\n      {\"platform\": \"" << CHIP_SWIMLANE_ARCHITECTURE_NAME
             << "\", \"producer\": \"aicpu\", \"scheduler_id\": " << stream_index << ", \"worker_id\": " << stream_index
             << ", \"core_type\": \"aicpu\", \"physical_core_id\": null, \"capture\": {\"committed\": " << records.size()
             << ", \"dropped\": " << dropped << ", \"truncated\": " << (dropped == 0 ? "false" : "true")
@@ -78,14 +82,9 @@ inline void chip_swimlane_write_scheduler_records(
                 << ", \"kind\": \"" << chip_swimlane_scheduler_kind_name(record.kind)
                 << "\", \"tasks_processed\": " << record.tasks_processed << ", \"task_id\": ";
             if (record.kind == ChipSwimlaneSchedPhaseKind::DummyTask ||
-                record.kind == ChipSwimlaneSchedPhaseKind::PredicatedSkip) {
-                out
-                    << ((static_cast<uint64_t>(record.phase_data.dummy_task.ring_id) << 32) |
-                        record.phase_data.dummy_task.local_id);
-            } else if (record.kind == ChipSwimlaneSchedPhaseKind::GraphPrepare) {
-                out
-                    << ((static_cast<uint64_t>(record.phase_data.graph_task.ring_id) << 32) |
-                        record.phase_data.graph_task.local_id);
+                record.kind == ChipSwimlaneSchedPhaseKind::PredicatedSkip ||
+                record.kind == ChipSwimlaneSchedPhaseKind::GraphPrepare) {
+                out << record.phase_data.task_id.raw;
             } else {
                 out << "null";
             }

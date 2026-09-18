@@ -211,7 +211,7 @@ signal, so such a queue accepts one push and then reports full. The ramp is
 mandatory but it is a function of `capacity` alone, so
 `SchedulerState::seed_queue_slots()` writes it on the device rather than `bind`
 shipping 1,775,616 bytes of it. The ready queues are still *not* bounded to
-`total_tasks`: graph execution expands a GRAPH task into on-device in-graph tasks that
+`total_tasks`: graph execution expands a GRAPH task into on-device sub-tasks that
 push past the host task count, so every slot must carry a valid sequence.
 
 Both run before the boot thread publishes `runtime_init_ready_`, which is what

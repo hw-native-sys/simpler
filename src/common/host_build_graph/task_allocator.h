@@ -64,9 +64,11 @@ public:
      * `capacity` is the number of task slots the caller's task table holds — what
      * the bind resolved from runtime_env.ring_task_window, defaulting to
      * CHIP_DEFAULT_GRAPH_TASKS. It need not be a power of two: a task id indexes
-     * its slot directly, so nothing masks with it. Because ids are never
-     * reclaimed, alloc() caps them at `capacity` — they cannot run away toward
-     * INT32_MAX.
+     * its slot directly, so no slot lookup masks with it. It is bounded above by
+     * TaskId::GLOBAL_TASK_MAX_NUM, because a sub-task's id carries its modular
+     * task's local id in a fixed-width field — resolve_graph_task_capacity is
+     * where that bound is enforced. Because ids are never reclaimed, alloc() caps
+     * them at `capacity` — they cannot run away toward INT32_MAX.
      */
     void init(int32_t capacity, void *heap_base, uint64_t heap_size, std::atomic<int32_t> *error_code_ptr) {
         capacity_ = capacity;

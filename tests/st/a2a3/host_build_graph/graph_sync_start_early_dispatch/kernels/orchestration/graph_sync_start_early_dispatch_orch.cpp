@@ -10,7 +10,7 @@
  */
 
 /**
- * In-Graph sync_start Early-Dispatch Orchestration (host_build_graph)
+ * Sub-task sync_start Early-Dispatch Orchestration (host_build_graph)
  *
  * A `require_sync_start` root inside a Graph body reaching the early-dispatch
  * sync-start queue and its rendezvous.

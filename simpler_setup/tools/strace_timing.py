@@ -1000,12 +1000,12 @@ _BIND_PHASE_NAMES = frozenset(
 )
 
 # Phases a recorder worker emits, so a record carrying a tid of its own belongs
-# on the recorder lane rather than the main one. "record_node" is the name the
-# runtime emitted for an in-graph task before it was renamed; logs and the
-# archived runs cited in docs/investigations/ still carry it, and an unknown
-# phase name here is silently attributed to host_main rather than rejected, so
-# both spellings stay accepted.
-_RECORD_WORKER_PHASE_NAMES = frozenset({"record_in_graph_task", "record_node", "build_definition"})
+# on the recorder lane rather than the main one. Current names only: the record
+# phase has also been called "record_node" and "record_in_graph_task", and this
+# set accepts neither. An unknown phase name is silently attributed to host_main
+# rather than rejected, so a log from either era draws its recorder work on the
+# main lane -- re-capture rather than read an old log through this tool.
+_RECORD_WORKER_PHASE_NAMES = frozenset({"record_sub_task", "build_definition"})
 
 
 def host_record_spans(spans, passes):

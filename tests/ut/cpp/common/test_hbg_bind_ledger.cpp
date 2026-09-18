@@ -838,26 +838,33 @@ TEST_F(HbgBindLedgerTest, SchedulerModeChangesPublishOnlyThisRunsSources) {
             snapshots.emplace_back(source, source + region.bytes);
         }
         if (a5) {
-            for (int i = 0; i < runtime.get_worker_count(); ++i) {
-                const uint64_t address = runtime.dev.workers[i].task;
-                const uint32_t mode = runtime.dev.workers[i].aicpu_ready;
-                EXPECT_NE(mode, 0u);
-                if (resident) {
-                    if (resident_mode == 0) resident_mode = mode;
-                    EXPECT_EQ(mode, resident_mode);
-                    const auto &scheduler = pending.prerequisites.front();
-                    EXPECT_GE(address, reinterpret_cast<uint64_t>(scheduler.device_target));
-                    EXPECT_LT(address, reinterpret_cast<uint64_t>(scheduler.device_target) + scheduler.bytes);
+            // The bootstrap inputs are host-authored and per run, not per worker:
+            // workers[i].aicpu_ready and .task now carry the AICPU's handshake alone.
+            // Worker i derives its own context from the base, which the AICore does
+            // through scheduler_worker_context_address; that derivation is covered by
+            // test_a5_hbg_scheduler_bootstrap and not re-asserted here.
+            const uint32_t mode = runtime.dev.scheduler_bootstrap.runtime_mode;
+            const uint64_t base = runtime.dev.scheduler_bootstrap.worker_context_base;
+            EXPECT_NE(mode, 0u);
+            if (resident) {
+                if (resident_mode == 0) resident_mode = mode;
+                EXPECT_EQ(mode, resident_mode);
+                const auto &scheduler = pending.prerequisites.front();
+                EXPECT_GE(base, reinterpret_cast<uint64_t>(scheduler.device_target));
+                EXPECT_LT(base, reinterpret_cast<uint64_t>(scheduler.device_target) + scheduler.bytes);
+            } else {
+                EXPECT_EQ(base, 0u) << "legacy launch must not borrow a previous scheduler";
+                EXPECT_NE(mode, resident_mode);
+                if (definitions) {
+                    if (graph_mode == 0) graph_mode = mode;
+                    EXPECT_EQ(mode, graph_mode);
                 } else {
-                    EXPECT_EQ(address, 0u) << "legacy launch must not borrow a previous scheduler";
-                    EXPECT_NE(mode, resident_mode);
-                    if (definitions) {
-                        if (graph_mode == 0) graph_mode = mode;
-                        EXPECT_EQ(mode, graph_mode);
-                    } else {
-                        EXPECT_NE(mode, graph_mode);
-                    }
+                    EXPECT_NE(mode, graph_mode);
                 }
+            }
+            for (int i = 0; i < runtime.get_worker_count(); ++i) {
+                EXPECT_EQ(runtime.dev.workers[i].task, 0u) << "handshake state is the AICPU's to write";
+                EXPECT_EQ(runtime.dev.workers[i].aicpu_ready, 0u);
             }
         }
         destinations.push_back(pending.device_target);
@@ -874,10 +881,10 @@ TEST_F(HbgBindLedgerTest, SchedulerModeChangesPublishOnlyThisRunsSources) {
         EXPECT_TRUE(fake_.live.empty());
         EXPECT_TRUE(runtime.pending_publication().prerequisites.empty());
         if (a5) {
-            for (int i = 0; i < runtime.get_worker_count(); ++i) {
-                EXPECT_EQ(runtime.dev.workers[i].task, 0u);
-                EXPECT_EQ(runtime.dev.workers[i].aicpu_ready, 0u);
-            }
+            // Release clears the host-authored selection, so the next upload cannot
+            // inherit a mode whose allocation this release already freed.
+            EXPECT_EQ(runtime.dev.scheduler_bootstrap.runtime_mode, 0u);
+            EXPECT_EQ(runtime.dev.scheduler_bootstrap.worker_context_base, 0u);
         }
     }
 }
@@ -902,7 +909,7 @@ TEST_F(HbgBindLedgerTest, SchedulerPublicationFailureAllowsFreshModeSelection) {
             ChipStorageTaskArgs args;
             ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
             ASSERT_EQ(runtime.pending_publication().prerequisites.size() + 1, regions);
-            const uint32_t failed_mode = runtime.dev.workers[0].aicpu_ready;
+            const uint32_t failed_mode = runtime.dev.scheduler_bootstrap.runtime_mode;
             fake_.fail_copy_on = static_cast<int>(failure);
             EXPECT_NE(publish_run_image_impl(&runtime, &api_), 0);
             EXPECT_EQ(fake_.copy_count, failure);
@@ -914,10 +921,9 @@ TEST_F(HbgBindLedgerTest, SchedulerPublicationFailureAllowsFreshModeSelection) {
             ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
             EXPECT_TRUE(fake_.live.empty());
             if (a5) {
-                for (int i = 0; i < runtime.get_worker_count(); ++i) {
-                    EXPECT_EQ(runtime.dev.workers[i].task, 0u);
-                    EXPECT_EQ(runtime.dev.workers[i].aicpu_ready, 0u);
-                }
+                // A failed publication must leave no selection behind for the next one.
+                EXPECT_EQ(runtime.dev.scheduler_bootstrap.runtime_mode, 0u);
+                EXPECT_EQ(runtime.dev.scheduler_bootstrap.worker_context_base, 0u);
             }
             fake_.fail_copy_on = 0;
             const bool definitions = entry == ordinary_orch_entry;
@@ -932,18 +938,16 @@ TEST_F(HbgBindLedgerTest, SchedulerPublicationFailureAllowsFreshModeSelection) {
                 EXPECT_EQ(region.phase, definitions ? HostPhaseKind::BindGraphUpload : HostPhaseKind::Count);
             }
             if (a5) {
-                for (int i = 0; i < runtime.get_worker_count(); ++i) {
-                    const uint64_t address = runtime.dev.workers[i].task;
-                    const uint32_t mode = runtime.dev.workers[i].aicpu_ready;
-                    EXPECT_NE(mode, 0u);
-                    EXPECT_NE(mode, failed_mode);
-                    if (resident) {
-                        const auto &scheduler = replacement.prerequisites.front();
-                        EXPECT_GE(address, reinterpret_cast<uint64_t>(scheduler.device_target));
-                        EXPECT_LT(address, reinterpret_cast<uint64_t>(scheduler.device_target) + scheduler.bytes);
-                    } else {
-                        EXPECT_EQ(address, 0u) << "legacy call must not reuse the failed scheduler";
-                    }
+                const uint32_t mode = runtime.dev.scheduler_bootstrap.runtime_mode;
+                const uint64_t base = runtime.dev.scheduler_bootstrap.worker_context_base;
+                EXPECT_NE(mode, 0u);
+                EXPECT_NE(mode, failed_mode);
+                if (resident) {
+                    const auto &scheduler = replacement.prerequisites.front();
+                    EXPECT_GE(base, reinterpret_cast<uint64_t>(scheduler.device_target));
+                    EXPECT_LT(base, reinterpret_cast<uint64_t>(scheduler.device_target) + scheduler.bytes);
+                } else {
+                    EXPECT_EQ(base, 0u) << "legacy call must not reuse the failed scheduler";
                 }
             }
             ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);

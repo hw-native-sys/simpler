@@ -101,5 +101,11 @@ jobs:
           # it runs here rather than in the pyut sweep above (which precedes this
           # build and skips it). Asserting the parser against hand-written JSON
           # would not catch the exporter and the reader drifting apart.
-          test -x tests/ut/cpp/build/test_chip_swimlane_collector
+          #
+          # The collector is built once per runtime, since a platform source ships
+          # inside each runtime's image, and the roundtrip runs under both: the
+          # exporter names its runtime and the parser decodes task ids by it.
+          for runtime in tensormap_and_ringbuffer host_build_graph; do
+            test -x "tests/ut/cpp/build/test_chip_swimlane_collector_$runtime"
+          done
           python -m pytest tests/ut/py/test_swimlane_export_run_identity.py -v

@@ -29,22 +29,33 @@ from pathlib import Path
 
 import pytest
 
-from simpler_setup.tools.swimlane_converter import generate_chrome_trace_json, read_perf_data
+from simpler_setup.tools.swimlane_converter import (
+    HBG_RUNTIME,
+    TMR_RUNTIME,
+    generate_chrome_trace_json,
+    read_perf_data,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_CPPUT_BINARY = _REPO_ROOT / "tests" / "ut" / "cpp" / "build" / "test_chip_swimlane_collector"
 _EXPORT_SUBDIR = "chip_swimlane_export_identity"
+# The collector is built once per runtime, since a platform source ships inside each
+# runtime's image and the exporter names the runtime it was built for. The roundtrip
+# runs under both: the exporter writes metadata.runtime and the parser decodes task
+# ids by it, so a layout that only one of them agrees on shows up here and nowhere
+# else in this file.
+_COLLECTOR_RUNTIMES = (TMR_RUNTIME, HBG_RUNTIME)
 
 
-def _export_two_runs(tmp_path: Path) -> Path:
+def _export_two_runs(tmp_path: Path, runtime: str) -> Path:
     """Produce a two-run capture with the real exporter and return its JSON path."""
-    if not _CPPUT_BINARY.exists():
+    binary = _REPO_ROOT / "tests" / "ut" / "cpp" / "build" / f"test_chip_swimlane_collector_{runtime}"
+    if not binary.exists():
         pytest.skip(
-            f"{_CPPUT_BINARY} not built; the roundtrip runs in the C++ unit test CI step, "
+            f"{binary} not built; the roundtrip runs in the C++ unit test CI step, "
             "after cmake --build tests/ut/cpp/build"
         )
     completed = subprocess.run(
-        [str(_CPPUT_BINARY), "--gtest_filter=*ExportsTwoRunsDistinctly*"],
+        [str(binary), "--gtest_filter=*ExportsTwoRunsDistinctly*"],
         cwd=tmp_path,
         capture_output=True,
         text=True,
@@ -57,9 +68,11 @@ def _export_two_runs(tmp_path: Path) -> Path:
     return path
 
 
-def test_two_runs_reusing_task_ids_stay_attributed(tmp_path):
+@pytest.mark.parametrize("runtime", _COLLECTOR_RUNTIMES)
+def test_two_runs_reusing_task_ids_stay_attributed(tmp_path, runtime):
     """Two runs, same core, same reg_task_ids, different times — each keeps its own."""
-    records = read_perf_data(_export_two_runs(tmp_path))
+    records = read_perf_data(_export_two_runs(tmp_path, runtime))
+    assert records["runtime"] == runtime, "the exporter named a runtime the parser did not read back"
     tasks = records["tasks"]
     assert tasks, "the parser produced no tasks from a real two-run capture"
 
@@ -88,10 +101,12 @@ def test_two_runs_reusing_task_ids_stay_attributed(tmp_path):
         assert task["duration_us"] == pytest.approx(task["end_time_us"] - task["start_time_us"])
 
 
-def test_every_exported_row_carries_an_epoch(tmp_path):
+@pytest.mark.parametrize("runtime", _COLLECTOR_RUNTIMES)
+def test_every_exported_row_carries_an_epoch(tmp_path, runtime):
     """The identity is per row, so the parser must never fall back to None here."""
-    path = _export_two_runs(tmp_path)
+    path = _export_two_runs(tmp_path, runtime)
     data = json.loads(path.read_text())
+    assert data["metadata"]["runtime"] == runtime, "the exporter must name the runtime it was built for"
     assert len(data["aicore_tasks"]) == 6
     for row in data["aicore_tasks"]:
         assert len(row) == 7, f"aicore_tasks row is not seven columns: {row}"
@@ -104,7 +119,12 @@ def test_every_exported_row_carries_an_epoch(tmp_path):
 def _single_run_payload(aicore_rows, scheduler_rows):
     return {
         "chip_swimlane_level": 2,
-        "metadata": {"clock_freq_hz": 50_000_000, "num_cores": 1, "core_types": ["aiv"]},
+        "metadata": {
+            "runtime": TMR_RUNTIME,
+            "clock_freq_hz": 50_000_000,
+            "num_cores": 1,
+            "core_types": ["aiv"],
+        },
         "aicore_tasks": aicore_rows,
         "scheduler_tasks": {
             "producer": "aicpu",
@@ -213,7 +233,7 @@ def test_two_runs_do_not_produce_cross_run_dependency_arrows(tmp_path):
     """
     tasks = _trace_tasks_for_two_runs()
     out = tmp_path / "trace.json"
-    generate_chrome_trace_json(tasks, str(out), deps_edges={0x101: [0x102]})
+    generate_chrome_trace_json(tasks, str(out), deps_edges={0x101: [0x102]}, runtime_name=TMR_RUNTIME)
 
     pairs = _dependency_flow_pairs(out)
     assert pairs, "no dependency arrows were emitted, so this proves nothing"
@@ -251,7 +271,9 @@ def test_two_runs_do_not_produce_cross_run_dependency_arrows(tmp_path):
 def test_two_runs_do_not_report_a_happens_before_violation(tmp_path):
     """A cross-run pairing surfaces as a bogus hb_violation; there must be none."""
     out = tmp_path / "trace.json"
-    generate_chrome_trace_json(_trace_tasks_for_two_runs(), str(out), deps_edges={0x101: [0x102]})
+    generate_chrome_trace_json(
+        _trace_tasks_for_two_runs(), str(out), deps_edges={0x101: [0x102]}, runtime_name=TMR_RUNTIME
+    )
 
     events = json.loads(out.read_text())["traceEvents"]
     violations = [e for e in events if e.get("name") == "hb_violation"]

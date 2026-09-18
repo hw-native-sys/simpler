@@ -335,7 +335,13 @@ bool write_deps_json(
     // storage element count; tasks[].args[] and edges[] carry per-slice
     // geometry as (start_offset uint64, strides[] uint32 — runtime invariant
     // forbids zero / negative strides, see runtime/tensor.h).
-    out << "{\"tasks\":[";
+    // "runtime" names the TaskId layout every id below carries. A task id encodes
+    // whichever layout its runtime uses and nothing in the value says which, so a
+    // reader that decodes one has to be told. The literal rather than
+    // SIMPLER_RUNTIME_NAME: this file only ever builds into
+    // tensormap_and_ringbuffer, and the unit tests that compile it define no such
+    // macro.
+    out << "{\"runtime\":\"tensormap_and_ringbuffer\",\"tasks\":[";
     for (size_t i = 0; i < tasks.size(); i++) {
         if (i > 0) out << ',';
         const auto &t = tasks[i];

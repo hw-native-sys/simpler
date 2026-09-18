@@ -11,6 +11,7 @@
 import json
 
 from simpler_setup.tools import critical_path
+from simpler_setup.tools.swimlane_converter import TMR_RUNTIME
 
 
 def _write_rank_artifacts(rank_dir, name_map_filename):
@@ -18,7 +19,7 @@ def _write_rank_artifacts(rank_dir, name_map_filename):
     (rank_dir / "chip_swimlane_records.json").write_text(
         json.dumps(
             {
-                "metadata": {"clock_freq_hz": 1_000_000},
+                "metadata": {"runtime": TMR_RUNTIME, "clock_freq_hz": 1_000_000},
                 "aicore_tasks": [[0, 1, 0, 0, 10, 0]],
             }
         )
@@ -39,7 +40,7 @@ def _write_visualization_artifacts(rank_dir):
     (rank_dir / "chip_swimlane_records.json").write_text(
         json.dumps(
             {
-                "metadata": {"clock_freq_hz": 1_000_000},
+                "metadata": {"runtime": TMR_RUNTIME, "clock_freq_hz": 1_000_000},
                 "aicore_tasks": [
                     [0, 1, 0, 0, 10, 0],
                     [1, 2, 0, 0, 19, 0],
@@ -134,7 +135,16 @@ def _write_visualization_artifacts(rank_dir):
         {"args": {"taskId": 1}, "cat": "event", "name": "kernel_a(t1)", "ph": "X", "pid": 3, "tid": 1},
     ]
     (rank_dir / "merged_swimlane_20260720_120000.json").write_text(
-        json.dumps({"traceEvents": events, "displayTimeUnit": "us", "source": "unit-test"})
+        json.dumps(
+            {
+                "traceEvents": events,
+                "displayTimeUnit": "us",
+                "source": "unit-test",
+                # Every trace names the TaskId layout its labels follow; critical_path
+                # re-formats ids from this file alone and refuses one that does not.
+                "metadata": {"runtime": TMR_RUNTIME},
+            }
+        )
     )
 
 

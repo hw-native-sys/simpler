@@ -76,6 +76,8 @@ import sys
 from collections import deque
 from pathlib import Path
 
+from .swimlane_converter import HBG_RUNTIME, resolve_runtime
+
 SOURCE_FLAGS = {
     "creator": ("wait", "retain"),
     "tensormap": ("wait",),
@@ -89,6 +91,44 @@ def _edge_flags(edge: dict) -> frozenset[str]:
     if flags is not None:
         return frozenset(flags)
     return frozenset(SOURCE_FLAGS.get(edge.get("source", ""), ("wait", "retain")))
+
+
+def _deps_runtime(path: Path) -> str:
+    """The runtime a deps.json names, refusing a capture that names none.
+
+    Which TaskId layout the ids carry, which is what _scope_key needs — nothing in a
+    task_id value says which runtime minted it.
+
+    Raises:
+        ValueError: the capture names no runtime, or one this tool does not decode.
+    """
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        data = None
+    runtime = data.get("runtime") if isinstance(data, dict) else None
+    return resolve_runtime(runtime, source=f"{path}: runtime")
+
+
+def _scope_key(task_id, runtime: str | None):
+    """The submission scope a task belongs to, for counting edges that cross one.
+
+    A scope boundary is what the runtime's bounded reachability bitmap cannot see
+    across, so the two runtimes name it in their own layouts:
+
+    - ``tensormap_and_ringbuffer``: the ring index in bits 39:32. One ring per scope
+      depth, so a differing ring is a differing scope.
+    - ``host_build_graph``: the id space plus the parent modular task. Tasks of the
+      run itself share one scope (space GLOBAL, parent 0); each modular task's body
+      is its own.
+
+    The runtime must be one of those two; see swimlane_converter.resolve_runtime for
+    why an unnamed or unrecognised one is refused rather than defaulted.
+    """
+    raw = int(task_id)
+    if resolve_runtime(runtime) == HBG_RUNTIME:
+        return ((raw >> 62) & 0x3, (raw >> 32) & 0xFFFFF)
+    return (raw >> 32) & 0xFF
 
 
 def load_wait_graph(
@@ -231,7 +271,10 @@ def simulate(path: Path, bls: list[int]) -> dict:
 
     pair_distances = {(p, s): seq[s] - seq[p] for (p, s) in wait_pairs}
     distances = sorted(d for d in pair_distances.values() if d >= 0)
-    cross_ring_pairs = {(pred, succ) for (pred, succ) in wait_pairs if (int(pred) >> 32) != (int(succ) >> 32)}
+    runtime = _deps_runtime(path)
+    cross_scope_pairs = {
+        (pred, succ) for (pred, succ) in wait_pairs if _scope_key(pred, runtime) != _scope_key(succ, runtime)
+    }
     report: dict = {
         "file": str(path),
         "tasks": len(order),
@@ -253,7 +296,7 @@ def simulate(path: Path, bls: list[int]) -> dict:
         within = sum(1 for d in distances if d <= bl)
         window_miss_pairs = {pair for pair, d in pair_distances.items() if d < 1 or d > bl}
         redundant_within = {pair for pair in redundant if pair_distances[pair] <= bl}
-        cross_ring_redundant = redundant & cross_ring_pairs
+        cross_scope_redundant = redundant & cross_scope_pairs
         report["windows"][str(bl)] = {
             "removed": len(removed),
             "pct_of_upper_bound": (round(100.0 * len(removed) / len(redundant), 2) if redundant else 0.0),
@@ -265,10 +308,10 @@ def simulate(path: Path, bls: list[int]) -> dict:
             "window_miss_wait_pairs": len(window_miss_pairs),
             "redundant_window_misses": len(redundant & window_miss_pairs),
             "bitmap_misses_within_window": len(redundant_within - removed),
-            "cross_ring_wait_pairs": len(cross_ring_pairs),
-            "cross_ring_redundant_wait_pairs": len(cross_ring_redundant),
-            "cross_ring_removed": len(removed & cross_ring_pairs),
-            "cross_ring_misses": len(cross_ring_redundant - removed),
+            "cross_scope_wait_pairs": len(cross_scope_pairs),
+            "cross_scope_redundant_wait_pairs": len(cross_scope_redundant),
+            "cross_scope_removed": len(removed & cross_scope_pairs),
+            "cross_scope_misses": len(cross_scope_redundant - removed),
             "estimated_readiness_fanout_nodes_removed": len(removed),
             "estimated_dep_pool_entries_removed": len(removed),
         }
@@ -315,7 +358,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"({w['pct_of_upper_bound']:>6.2f}% of upper bound; "
                 f"demote {w['demote_to_retain']} / drop {w['pure_drop']}; "
                 f"window misses {w['redundant_window_misses']}; "
-                f"cross-ring misses {w['cross_ring_misses']}; "
+                f"cross-scope misses {w['cross_scope_misses']}; "
                 f"{w['pct_pairs_within_window']:.1f}% pairs within window)"
             )
         print()

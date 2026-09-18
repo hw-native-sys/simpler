@@ -521,7 +521,7 @@ static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const G
         // Handing the recording to a worker. Measured at 10-75 us per start and covered
         // by no other record: it runs after rt_graph_begin returns, so a swimlane shows
         // it as a gap with no recorder active — which is what it is, the recorder has
-        // not reached its first in-graph task yet.
+        // not reached its first sub-task yet.
         rt_record_orch_phase(HostPhaseKind::OrchRecordHandoff, _begun_ns, _exit_ns, graph_key);
     }
     _phase.count++;

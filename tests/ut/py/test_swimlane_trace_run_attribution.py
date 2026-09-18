@@ -28,7 +28,7 @@ from pathlib import Path
 
 import pytest
 
-from simpler_setup.tools.swimlane_converter import generate_chrome_trace_json
+from simpler_setup.tools.swimlane_converter import TMR_RUNTIME, generate_chrome_trace_json
 
 RUN_A = 7
 RUN_B = 8
@@ -70,6 +70,9 @@ def _phase(kind, epoch, start, end, *, task_id=None, processed=0):
 
 def _render(tmp_path, tasks, **kwargs):
     out = Path(tmp_path) / "trace.json"
+    # The trace states the TaskId layout its labels follow; these tests are not about
+    # that choice, so they take tmr.
+    kwargs.setdefault("runtime_name", TMR_RUNTIME)
     generate_chrome_trace_json(tasks, str(out), **kwargs)
     return json.loads(out.read_text())["traceEvents"]
 
@@ -671,7 +674,7 @@ def _count_start_reads(tmp_path, n, label):
             )
         )
     out = Path(tmp_path) / f"{label}.json"
-    generate_chrome_trace_json(tasks, str(out), scheduler_phases=[phases], core_to_thread=[0])
+    generate_chrome_trace_json(tasks, str(out), scheduler_phases=[phases], core_to_thread=[0], runtime_name=TMR_RUNTIME)
     return counter[0]
 
 

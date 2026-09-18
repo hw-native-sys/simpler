@@ -1214,6 +1214,10 @@ int ChipSwimlaneCollector::export_swimlane_json() {
     // clock_freq_hz drives the cycles→µs conversion (a2a3 = 50 MHz, a5 =
     // 1 GHz — must come from the host, not be hardcoded in python).
     outfile << "  \"metadata\": {\n";
+    // Which runtime minted the records. A task_id carries whichever TaskId layout its
+    // runtime uses and nothing in the value says which, so a reader that decodes one
+    // has to be told; the name is a compile-time property of this host_runtime.so.
+    outfile << "    \"runtime\": \"" << SIMPLER_RUNTIME_NAME << "\",\n";
     outfile << "    \"clock_freq_hz\": " << PLATFORM_PROF_SYS_CNT_FREQ << ",\n";
     outfile << "    \"num_cores\": " << num_aicore_ << ",\n";
     outfile << "    \"core_types\": [";
@@ -1410,9 +1414,7 @@ int ChipSwimlaneCollector::export_swimlane_json() {
                 const auto *pool = get_sched_phase_buffer_state(shm_host_, static_cast<int>(t));
                 dropped_records[t] = pool->head.dropped_record_count;
             }
-            chip_swimlane_write_scheduler_records(
-                outfile, collected_sched_phase_records_, dropped_records, SIMPLER_RUNTIME_NAME
-            );
+            chip_swimlane_write_scheduler_records(outfile, collected_sched_phase_records_, dropped_records);
         }
 
         if (has_aicpu_orch_phases) {

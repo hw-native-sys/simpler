@@ -28,7 +28,7 @@ the `chip.run.bind` span:
 | ------- | -------------- |
 | `args` | copying readable caller tensors in H2D, into slices of the pipeline slot's retained temporary buffer, and exposing their existing host buffers to orchestration; pure outputs skip both. The buffer grows to the high-water packed size and is reused, so a steady-state workload allocates no device memory here |
 | `arena_build`, `static_arena`, `gm_heap`, `shared_mem`, `runtime_init` | arena layout, GM heap and shared-memory bring-up |
-| `host_orch` | orchestration and recording: every task submitted and every in-graph task recorded; excludes the later Definition packing and Graph task binding in `bind_graph_definitions` |
+| `host_orch` | orchestration and recording: every task submitted and every sub-task recorded; excludes the later Definition packing and Graph task binding in `bind_graph_definitions` |
 | `graph_upload` | the successful synchronous `copy_to_device` of the prepared Definition block in `publish_run_image_impl`; excludes staging growth, header writes, spill copies and Graph task binding. Absent when there is no Definition block |
 | `arena_h2d` | one H2D of the arena's copied zone and the shared-memory image |
 | `host_view_close` | closing per-run tensor-access regions and any optional device mappings; the bind path installs none of its own (`count=0 bytes=0`). `devcopy=N` counts orchestration accesses to child memory that were served by a PCIe round trip because no host mapping was available — a mapping, where one is available, is held by the runtime for the allocation's lifetime and is not closed here |
@@ -526,7 +526,7 @@ orchestration views, so it performs no `halHostRegister` calls and reports
 the H2D work but removes that registration side.
 
 Three of these deserve reading together. `host_orch` is the whole story on dsv4 —
-839 `submit_task`, 743 `record_in_graph_task` and 272 `alloc_tensors` per bind against qwen's
+839 `submit_task`, 743 `record_sub_task` and 272 `alloc_tensors` per bind against qwen's
 5, 277 and 2 — and its 2.3 ms of scatter is why a claim about it needs a
 sub-counter rather than a stopwatch. At the pinned commit, `args` plus
 `host_view_close` are two orders of magnitude above everything else while being
