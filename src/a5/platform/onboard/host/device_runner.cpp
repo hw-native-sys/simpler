@@ -29,6 +29,7 @@
 
 #include <cassert>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -382,6 +383,23 @@ int DeviceRunner::prepare_execution(
             );
             return PTO_RUNTIME_ERR_INTERNAL;
         }
+        const auto selected_assignment = pto::a5::select_scheduler_cluster_assignment(topology);
+        auto cluster_assignment = selected_assignment;
+        const char *override_mode = "auto";
+        if (const char *env = std::getenv("SIMPLER_SCHEDULER_CLUSTER_ASSIGNMENT")) {
+            if (std::strcmp(env, "contiguous") == 0) {
+                cluster_assignment = pto::a5::SchedulerClusterAssignment::kContiguous;
+                override_mode = "contiguous";
+            } else if (std::strcmp(env, "round_robin") == 0) {
+                cluster_assignment = pto::a5::SchedulerClusterAssignment::kRoundRobin;
+                override_mode = "round_robin";
+            } else if (std::strcmp(env, "auto") != 0 && env[0] != '\0') {
+                LOG_WARN(
+                    "SIMPLER_SCHEDULER_CLUSTER_ASSIGNMENT=%s unrecognized; expected auto|contiguous|round_robin", env
+                );
+            }
+        }
+        runtime.set_scheduler_cluster_assignment(cluster_assignment);
         const auto &allowed = launch_plan.allowed_cpus;
         active_aicpu_num = launch_plan.effective_active_count;
         runtime.set_aicpu_thread_num(active_aicpu_num);
@@ -427,9 +445,13 @@ int DeviceRunner::prepare_execution(
                 );
             }
             LOG_INFO(
-                "AICPU ALLOWED_CPUS = [%s] (scenario=%s active=%d launch=%d user_cpus=%zu)", dump.c_str(),
-                pto::a5::aicpu_scenario_name(topology.scenario_type), active_aicpu_num, launch_plan.launch_count,
-                topology.os_schedulable_cpus.size()
+                "AICPU ALLOWED_CPUS = [%s] (scenario=%s active=%d launch=%d user_cpus=%zu "
+                "cluster_assignment=%s override=%s selected=%s)",
+                dump.c_str(), pto::a5::aicpu_scenario_name(topology.scenario_type), active_aicpu_num,
+                launch_plan.launch_count, topology.os_schedulable_cpus.size(),
+                cluster_assignment == pto::a5::SchedulerClusterAssignment::kContiguous ? "contiguous" : "round_robin",
+                override_mode,
+                selected_assignment == pto::a5::SchedulerClusterAssignment::kContiguous ? "contiguous" : "round_robin"
             );
         }
     }
