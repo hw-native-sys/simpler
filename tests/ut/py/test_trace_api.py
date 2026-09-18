@@ -335,3 +335,48 @@ def test_importing_simpler_does_not_require_the_extension():
         [sys.executable, "-c", code], capture_output=True, text=True, check=True
     )
     assert out.stdout.split() == ["True", "BLOCKED"], f"{out.stdout!r} {out.stderr!r}"
+
+
+def test_st_log_drain_survives_temporary_capture_directories(tmp_path):
+    """The process log outlives captures whose directories are deleted between runs."""
+    script = tmp_path / "test_capture_log_lifetime.py"
+    script.write_text(
+        textwrap.dedent(
+            """
+            import tempfile
+            import pytest
+            from _task_interface import _emit_host_span, _monotonic_now_ns, _set_host_log_directory
+            from simpler import TIMING
+            from simpler.task_interface import _initialize_host_log
+            from simpler_setup.tools.strace_timing import parse_spans
+            from tests.st.conftest import drain_host_log
+
+            @pytest.mark.parametrize("first_invocation", [1, 3])
+            def test_two_captures(capfd, drain_host_log, first_invocation):
+                _initialize_host_log(TIMING)
+                for invocation in (first_invocation, first_invocation + 1):
+                    with tempfile.TemporaryDirectory() as capture:
+                        _set_host_log_directory(capture)
+                        _emit_host_span("chip.run", invocation, 1, 0, _monotonic_now_ns(), 1, "")
+                        spans = list(parse_spans(drain_host_log(capfd).splitlines()))
+                        assert [(span.name, span.inv) for span in spans] == [("chip.run", invocation)]
+            """
+        )
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            str(script),
+            "--confcutdir",
+            str(tmp_path),
+            "-o",
+            "tmp_path_retention_policy=failed",
+            "-q",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr

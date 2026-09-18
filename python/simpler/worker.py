@@ -2950,6 +2950,13 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
         diagnostic_capture_index += 1
         return cfg
 
+    def finish_task_logging(cfg: CallConfig | None, code: int, msg: str) -> tuple[int, str]:
+        # TASK_DONE permits the parent to read this child's completed invocation.
+        if cfg is not None and cfg.enable_chip_swimlane and cfg.output_prefix:
+            if not _flush_host_log_or_warn(f"chip_process dev={device_id}: task completion"):
+                return 1, msg or f"chip_process dev={device_id}: diagnostic Host log flush failed"
+        return code, msg
+
     def handle_task(task_buf) -> tuple[int, str]:
         task_addr = ctypes.addressof(ctypes.c_char.from_buffer(task_buf))
         digest = _read_task_digest(task_buf)
@@ -2958,6 +2965,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
 
         code = 0
         msg = ""
+        cfg = None
         try:
             # Inside the try because it writes the diagnostic sidecar: a full or
             # read-only output_prefix must surface as this task's error, not as
@@ -3010,7 +3018,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
         # staging garbage would mask the real error in post-mortems.
         if code == 0 and on_task_done_success is not None:
             code, msg = on_task_done_success()
-        return code, msg
+        return finish_task_logging(cfg, code, msg)
 
     def handle_control(  # noqa: PLR0912, PLR0915 -- one branch per control sub-command
         sub_cmd: int,
@@ -3351,6 +3359,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                                 except Exception as e:  # noqa: BLE001
                                     code = 1
                                     msg = _format_exc(f"chip_process dev={device_id}: task completion hook", e)
+                            code, msg = finish_task_logging(staged.config, code, msg)
                             _write_error(staged.frame_buf, code, msg)
                             _mailbox_store_i32(
                                 staged.frame_addr + _OFF_STATE,
@@ -11254,6 +11263,12 @@ class Worker:
     def _submit_locked(self, callable, args, config) -> RunHandle:
         cfg = config if config is not None else CallConfig()
 
+        # The first non-empty output prefix binds the persistent process log.
+        # Capture-local timing exports use separate files in each run's prefix.
+        log_directory = getattr(cfg, "output_prefix", "")
+        if log_directory:
+            _native_set_host_log_directory(log_directory)
+
         if self.level == 2:
             assert self._chip_worker is not None
             state = self._resolve_handle(callable, expected_namespace="LOCAL_CHIP")
@@ -11515,13 +11530,6 @@ class Worker:
     def _submit_l3_locked(self, callable, args, cfg: CallConfig) -> RunHandle:
         assert self._orch is not None
         assert self._worker is not None
-        # This process's log belongs beside the run's other diagnostic artifacts,
-        # so the directory comes from the config that already names it. First one
-        # in a process wins; with no prefix the logger stays on stderr. Read
-        # defensively: wiring an output must never be what fails a submit.
-        log_directory = getattr(cfg, "output_prefix", "")
-        if log_directory:
-            _native_set_host_log_directory(log_directory)
         run_id = self._orch._begin_run()
         resources = _RunResources()
         handle = RunHandle(self, run_id, (callable, args, cfg), resources)

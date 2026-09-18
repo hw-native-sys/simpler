@@ -63,6 +63,13 @@ struct HostPhaseRunState {
         return (producer_wants_records && !output_prefix.empty()) || host_orchestrated;
     }
 
+    /** A mixed Host/Device capture needs invocation-local timing logs, including an independently armed level-3 pool.
+     */
+    bool needs_clock_alignment() const {
+        return chip_swimlane_level >= ChipSwimlaneLevel::SCHED_PHASES && !output_prefix.empty() && records.armed() &&
+               records.finished();
+    }
+
     /** Forget the previous run in this slot, before a new one binds into it. */
     void begin(const DfxRunConfig &dfx) {
         chip_swimlane_level = dfx.chip_swimlane_level;

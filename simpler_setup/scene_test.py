@@ -1200,6 +1200,7 @@ def _run_swimlane_converter(
     input_path: Path | None = None,
     func_names_path: Path | None = None,
     enable_overhead: bool = False,
+    host_logs: list[Path] | None = None,
     *,
     dispatch: str | None = None,
     dispatch_id: str | None = None,
@@ -1234,12 +1235,16 @@ def _run_swimlane_converter(
         cmd += ["--dispatch-id", dispatch_id]
     if output_path is not None:
         cmd += ["--output", str(output_path)]
+    for host_log in host_logs or []:
+        cmd += ["--host-log", str(host_log)]
     if enable_overhead:
         cmd.append("--overhead")
     try:
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
         if result.stdout:
             logger.info(result.stdout)
+        if result.stderr:
+            logger.warning(result.stderr.strip())
         logger.info("Swimlane JSON generation completed")
         return True
     except subprocess.CalledProcessError as e:
@@ -1249,6 +1254,22 @@ def _run_swimlane_converter(
         if e.stderr:
             logger.warning(f"stderr: {e.stderr.strip()}")
         return False
+
+
+def _bound_host_logs() -> list[Path]:
+    """Flush this process and locate the persistent process logs without copying."""
+    try:
+        from _task_interface import _host_log_directory  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+    except ImportError:
+        return []
+    bound = _host_log_directory()
+    if not bound:
+        return []
+    from simpler.task_interface import _flush_host_log_or_warn  # noqa: PLC0415
+
+    if not _flush_host_log_or_warn("SceneTest Host log conversion"):
+        return []
+    return sorted(Path(bound).glob("host.*.log"))
 
 
 def _sanitize_for_filename(s: str) -> str:
@@ -1283,6 +1304,7 @@ def _convert_rank_swimlanes(
     callable_spec: dict | None,
     enable_overhead: bool,
     logger: logging.Logger,
+    host_logs: list[Path] | None = None,
 ) -> None:
     """Convert the ``rankN/dN`` captures below one L3 case prefix.
 
@@ -1325,6 +1347,7 @@ def _convert_rank_swimlanes(
             dump_name_map(capture_dir)
         merged = _run_swimlane_converter(
             input_path=output_prefix,
+            host_logs=host_logs,
             enable_overhead=enable_overhead,
             dispatch=target["dispatch"],
             dispatch_id=target["dispatch_id"],
@@ -1334,6 +1357,7 @@ def _convert_rank_swimlanes(
             for capture_dir in target["capture_dirs"]:
                 _run_swimlane_converter(
                     input_path=capture_dir / "chip_swimlane_records.json",
+                    host_logs=host_logs,
                     func_names_path=dump_name_map(capture_dir),
                     enable_overhead=enable_overhead,
                 )
@@ -1356,12 +1380,25 @@ def _convert_case_swimlane(
 
     logger = logging.getLogger(__name__)
     if _rank_dirs(output_prefix):
+        captures = [
+            directory
+            for directory in _rank_capture_dirs(output_prefix)
+            if (directory / "chip_swimlane_records.json").is_file()
+        ]
+        # Runtime-exported timing logs allow capture-local lookup when all are present.
+        # Other Rank merges use the bound persistent logs.
+        host_logs = (
+            None
+            if captures and all(list(path.glob("host_clock_alignment.*.log")) for path in captures)
+            else _bound_host_logs()
+        )
         _convert_rank_swimlanes(
             case_label,
             output_prefix,
             callable_spec=callable_spec,
             enable_overhead=enable_overhead,
             logger=logger,
+            host_logs=host_logs,
         )
         return
 

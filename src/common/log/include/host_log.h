@@ -75,7 +75,8 @@ public:
     // pinned instead of forking while a C++ thread is alive.
     bool prepare_to_fork(uint32_t timeout_ms = 1000);
 
-    // Drain records already accepted by this process owner. Producers must be
+    // Drain accepted records through this process writer, including bound DSOs.
+    // Write failures are tracked separately as drops. Producers must be
     // quiescent if the caller needs a strict shutdown boundary.
     bool flush(uint32_t timeout_ms = 1000);
     uint64_t dropped_records() const;
