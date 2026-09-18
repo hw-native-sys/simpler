@@ -152,7 +152,26 @@ struct PmuRecord {
 struct PmuBuffer {
     PmuRecord records[PLATFORM_PMU_RECORDS_PER_BUFFER];
     volatile uint32_t count;
+    uint32_t pad_align;  // Aligns run_epoch to 8 B
+
+    // Which run produced these records. AICPU stamps it when it acquires the
+    // buffer, so it is fixed before the first record lands; the AICPU thread
+    // that acquired the buffer is its only reader until the ready queue
+    // publishes it, so no barrier is needed between the stamp and the
+    // acquisition. It has to be consumed with the records: the pool reuses this
+    // storage and a later run re-stamps it in place, so nothing may read it back
+    // after the buffer is recycled.
+    volatile uint64_t run_epoch;  // 0 when the producer had no run identity
+    volatile uint32_t local_seq;  // Buffer's position within its own run
 } __attribute__((aligned(64)));
+
+// Identity lives in the alignment tail `count` already had, so the buffer does
+// not grow — it is 32 KB per core.
+static_assert(
+    sizeof(PmuBuffer) == sizeof(PmuRecord) * PLATFORM_PMU_RECORDS_PER_BUFFER + 64,
+    "run identity grew PmuBuffer past its former alignment tail"
+);
+static_assert(offsetof(PmuBuffer, records) == 0, "PmuBuffer::records must stay first");
 
 /**
  * SPSC lock-free queue for free PmuBuffer management.

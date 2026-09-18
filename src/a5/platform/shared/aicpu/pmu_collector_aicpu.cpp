@@ -33,6 +33,7 @@
 #include <cstring>
 
 #include "aicpu/platform_regs.h"
+#include "aicpu/device_run_result_base_aicpu.h"
 #include "aicpu/profiler_device_engine.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
@@ -145,7 +146,10 @@ struct PmuDeviceModule {
     }
 
     static void account_dropped(Context, State *state, uint32_t count) { state->dropped_record_count += count; }
-    static void on_pop_success(Context, State *, Buffer *) {}
+    static void on_pop_success(Context, State *state, Buffer *buffer) {
+        buffer->run_epoch = get_platform_run_result_epoch();
+        buffer->local_seq = state->current_buf_seq;
+    }
     static void on_current_cleared(Context, State *) {}
     static void on_no_replacement(Context, State *) {}
     static void on_null_free_slot(Context, State *) {}
@@ -251,11 +255,31 @@ void pmu_aicpu_init(const uint32_t *physical_core_ids, int num_cores) {
         s_pmu_buffer_states[i] = state;
         s_pmu_aicore_rings[i] = reinterpret_cast<PmuAicoreRing *>(state->aicore_ring_ptr);
 
+        // Keep the buffer this core already holds, or pop the first one.
+        //
+        // A buffer is only released by a successful enqueue, so a pointer still
+        // set here means the previous run could not hand that buffer over — it
+        // had nothing to publish, or the ready queue was full. Popping a
+        // replacement would strand it: nothing returns it to the free queue,
+        // because AICPU is the queue's consumer and never its producer. Reusing
+        // it in place is the return, and re-stamping is what makes that safe —
+        // the buffer still carries the previous run's identity, and its count
+        // must start this run at zero.
         rmb();
+        uint64_t retained = state->current_buf_ptr;
         uint32_t head = state->free_queue.head;
         uint32_t tail = state->free_queue.tail;
 
-        if (head != tail) {
+        if (retained != 0) {
+            PmuBuffer *buf = reinterpret_cast<PmuBuffer *>(retained);
+            buf->count = 0;
+            buf->run_epoch = get_platform_run_result_epoch();
+            buf->local_seq = 0;
+            wmb();
+            state->current_buf_seq = 0;
+            LOG_DEBUG("Core %d: reusing retained PMU buffer (addr=0x%lx)", i, retained);
+        } else if (head != tail) {
+            // The engine's pop stamps identity through on_pop_success.
             (void)try_pop_pmu_buffer(i, state, 0);
         } else {
             LOG_ERROR("Core %d: PMU free_queue is empty during init!", i);
@@ -389,16 +413,19 @@ void pmu_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, int co
             state->current_buf_ptr = 0;
             wmb();
         } else {
-            // ready_queue full at end-of-run: account the loss and clear the
-            // buffer so host reconcile sees a clean state (current_buf_ptr=0)
-            // and dropped == flush failures rather than silent leftover.
+            // ready_queue full at end-of-run: account the loss, but keep the
+            // buffer. Clearing the pointer would strand it — the host never saw
+            // it, so nothing returns it to the free queue. Retaining it lets the
+            // next run's init reuse it in place, which is the only return
+            // available to AICPU. Reconcile only faults a retained buffer that
+            // still has records, and the count is zeroed below. Previously this
+            // reported dropped == flush failures rather than silent leftover.
             LOG_ERROR(
                 "Thread %d: Core %d failed to flush PMU buffer (ready_queue full), %u records lost!", thread_idx,
                 core_id, buf->count
             );
             state->dropped_record_count += buf->count;
             buf->count = 0;
-            state->current_buf_ptr = 0;
             wmb();
         }
     }

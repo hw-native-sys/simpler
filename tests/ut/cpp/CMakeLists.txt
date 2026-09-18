@@ -1102,6 +1102,39 @@ endfunction()
 add_pmu_collector_test(test_pmu_collector_a2a3 a2a3)
 add_pmu_collector_test(test_pmu_collector_a5 a5)
 
+# PMU run identity + buffer ownership: host collector and AICPU producer in one
+# binary so acquire / retain / publish / CSV is production code end to end.
+function(add_pmu_identity_test name platform)
+    add_executable(${name}
+        common/test_pmu_run_identity.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/${platform}/platform/shared/host/pmu_collector.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/${platform}/platform/shared/aicpu/pmu_collector_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/device_run_result_base_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/${platform}/platform/sim/host/profiling_copy.cpp
+        ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
+    )
+    target_include_directories(${name} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/../../../src/${platform}/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common
+    )
+    # a5 declares write_reg out-of-line with a 64-bit value where a2a3 has it
+    # inline; the test supplies the missing definition and needs to know which.
+    # There is no arch macro in the headers — the counter counts are constexpr,
+    # not #defines — so the build says it.
+    if(platform STREQUAL "a5")
+        target_compile_definitions(${name} PRIVATE SIMPLER_TEST_PMU_ARCH_A5=1)
+    endif()
+    target_link_libraries(${name} PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+    add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES LABELS "no_hardware")
+endfunction()
+
+add_pmu_identity_test(test_pmu_run_identity_a2a3 a2a3)
+add_pmu_identity_test(test_pmu_run_identity_a5 a5)
+
 function(add_args_dump_collector_test name platform)
     add_executable(${name}
         common/test_args_dump_collector.cpp
