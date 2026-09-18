@@ -120,3 +120,15 @@ GM-coherent only for genuinely hint-shaped data flows.
   [`docs/hardware/cache-coherency.md`](../hardware/cache-coherency.md)
   — AICore → AICPU is automatic after AICore's `dcci`; AICPU does
   not need to invalidate.
+
+## Addendum (2026-09-18): the exit-path ACK wait
+
+[2026-09-a5-full-a2a3-retirement-port](2026-09-a5-full-a2a3-retirement-port.md)
+measured the one place on A5 where COND polling is still a visible, fixed
+per-call cost: the ACK wait in `SchedulerContext::shutdown()`. The
+one-core-at-a-time loop issues 41 COND reads per thread for its 7 cores. With
+EXIT broadcast to the whole core set first (the batched candidate, #2288), a
+thread issues 20 and waits ~7.7 µs, ~0.39 µs per read amortised (a poll plus the wait
+on the AICore, not the raw LDR above). One read per core would save ~5 µs per
+call. That bounds what a GM ACK channel could buy on this path, and it does
+not change the verdict: ACK stays on COND.
