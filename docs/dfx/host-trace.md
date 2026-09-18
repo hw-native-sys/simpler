@@ -157,12 +157,29 @@ chip.run                                      (= host_wall)
 │  └─ .{arena_build,static_arena,gm_heap,shared_mem,runtime_init,host_orch,
 │       graph_upload,arena_h2d,host_view_close}
 │           HBG host prepare-path segments, with SIMPLER_HBG_BIND_BREAKDOWN_ENABLE=1
+├─ chip.run.stage_inputs        (this run's input bytes into the buffers its bind named)
+├─ chip.run.prepare_execution   (runner prepare: register tables, topology probe, Runtime H2D)
 ├─ chip.run.runner_run          (device enqueue + completion drain)
 │  └─ chip.run.runner_run.device_wall      (whole on-NPU AICPU wall)
 │     └─ .{preamble,so_load,graph_build,config_validate,arena_wire,sm_reset,post_orch,orch,sched}
 │           TMR device-domain (clk=dev): AICPU subdivision of the on-NPU wall
 └─ chip.run.validate
 ```
+
+`chip.run.prepare_execution` brackets exactly one call — the platform runner's
+`prepare_execution`, entry to return, on every path including its early
+failures. Both runtimes emit it, and for TMR it is the only prepare-path span
+beyond `bind`'s two segments. **It is a sibling of `bind`, not a part of it**:
+
+| In the span | Not in the span |
+| ----------- | --------------- |
+| device init, the run-result region, the AICore register tables, the AICPU topology probe, the orchestration-SO resolve, and the synchronous H2D of the `Runtime` device image | *before it:* native-run admission, the prepared-successor compatibility probe, `attach_current_thread`, resource provisioning, `prepare_launch_shape`, `bind`, `stage_inputs` — *after it:* collector arming, the launch, the device run |
+
+The span is host **wall clock**: it contains a blocking `rtMemcpy` and driver
+calls, so `dur` is elapsed time and not a measure of CPU work. The sim platform
+emits the same span, where it covers sim's own host-side prepare — simulated
+register blocks, the orchestration-SO resolve, sim AICPU setup — with no H2D and
+no driver call in it, so a sim duration is not comparable to an onboard one.
 
 The `device_wall` span exists for both runtimes. Its
 `.{preamble,so_load,graph_build,config_validate,arena_wire,sm_reset,post_orch,orch,sched}`
@@ -229,7 +246,7 @@ including time the caller spends polling or doing other host work; blocking
 | Depth | Span names |
 | ----- | ---------- |
 | 0 | `chip.run` |
-| 1 | `chip.run.bind`, `chip.run.runner_run`, `chip.run.claim_release`, `chip.run.validate` |
+| 1 | `chip.run.bind`, `chip.run.stage_inputs`, `chip.run.prepare_execution`, `chip.run.runner_run`, `chip.run.claim_release`, `chip.run.validate` |
 | 2 | `chip.run.bind.args`, `chip.run.bind.prebuilt`, the other HBG `chip.run.bind.*` segments, `chip.run.runner_run.device_wall` |
 | 3 | TMR phase spans `chip.run.runner_run.device_wall.{preamble,so_load,graph_build,config_validate,arena_wire,sm_reset,post_orch,orch,sched}` and optional `task_slot_*` spans |
 
@@ -511,7 +528,11 @@ to start before `claim_release(N)`. It exits nonzero on a missing identity, a
 missing span, or an ordering violation.
 
 Reading `bind` rather than the whole prepare is deliberate: `bind` sits inside
-prepare, so an overlap it reports is one the prepare certainly had.
+prepare, so an overlap it reports is one the prepare certainly had. It stays
+`bind` now that `prepare_execution` has a span of its own: that span is a
+sibling covering a later part of the same prepare, so substituting it would
+answer a different question and widening the window to both would weaken the
+implication rather than strengthen it.
 
 `--require-hidden-prepare` adds the stronger claim that the preparation also
 *finishes* inside the predecessor's device window — fully hidden rather than

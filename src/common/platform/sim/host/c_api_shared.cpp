@@ -812,10 +812,13 @@ int simpler_prepare_run(
             LOG_ERROR("simpler_prepare_run: staging this run's inputs failed: %d (%s)", rc, state->trace_attrs);
             return cleanup_failed_prepare(state, rc);
         }
-        rc = runner->prepare_execution(
-            state->runtime, state->config, state->descriptor.pipeline_slot, state->identity(),
-            &state->prepared_execution
-        );
+        {
+            STRACE("chip.run.prepare_execution");
+            rc = runner->prepare_execution(
+                state->runtime, state->config, state->descriptor.pipeline_slot, state->identity(),
+                &state->prepared_execution
+            );
+        }
         if (rc != 0) return cleanup_failed_prepare(state, rc);
         return 0;
     } catch (...) {

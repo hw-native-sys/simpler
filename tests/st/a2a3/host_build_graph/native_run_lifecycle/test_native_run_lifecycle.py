@@ -82,6 +82,7 @@ class TestNativeRunLifecycle(SceneTestCase):
         common_depths = {
             "chip.run": 0,
             "chip.run.bind": 1,
+            "chip.run.prepare_execution": 1,
             "chip.run.validate": 1,
         }
         launched_depths = {
@@ -97,6 +98,11 @@ class TestNativeRunLifecycle(SceneTestCase):
             assert expected_depths.keys() <= by_name.keys()
             assert len({span.hid for span in invocation.spans}) == 1
             assert sum(span.name == "chip.run" for span in invocation.spans) == 1
+            # One closed record per prepare, on the run that prepared: an
+            # abandoned prepare has one just as a launched run does, and a
+            # successor prepared against an in-flight predecessor stamps its own
+            # invocation rather than appending to the predecessor's.
+            assert sum(span.name == "chip.run.prepare_execution" for span in invocation.spans) == 1
             for name, depth in expected_depths.items():
                 assert by_name[name].depth == depth
 

@@ -382,8 +382,9 @@ python -m simpler_setup.tools.strace_timing path/to/log
 # Per-round Host/Device/Orch/Sched table (the benchmark/--rounds N view)
 python -m simpler_setup.tools.strace_timing path/to/log --rounds-table
 
-# Indented nested span tree per callable (chip.run → bind / runner_run →
-# device_wall → preamble/config_validate/arena_wire/sm_reset/orch/sched/post_orch)
+# Indented nested span tree per callable (chip.run → bind / prepare_execution /
+# runner_run → device_wall → preamble/config_validate/arena_wire/sm_reset/orch/
+# sched/post_orch)
 python -m simpler_setup.tools.strace_timing path/to/log --tree
 
 # Also emit a Chrome-trace / Perfetto JSON (one named lane per invocation, with
@@ -397,7 +398,8 @@ python -m simpler_setup.tools.strace_timing path/to/log --swimlane host_swimlane
 Groups spans by `(pid, inv)`, rebuilds each invocation's tree from `depth`,
 buckets by callable hash `hid`, and reports each callable's mean `chip.run`
 plus per-stage means. It reads the host-emitted `[STRACE]` lines and shows the
-host stages (`bind`/`runner_run`/`validate`) alongside the AICPU phases.
+host stages (`bind`/`stage_inputs`/`prepare_execution`/`runner_run`/`validate`)
+alongside the AICPU phases.
 
 `--tree` renders one nested span tree per callable; each node's duration is the
 **median across every invocation** of that callable (not one invocation's
