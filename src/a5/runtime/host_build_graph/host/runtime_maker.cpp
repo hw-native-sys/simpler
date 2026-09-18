@@ -455,14 +455,41 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
     const auto *traces = scheduler_state_at<SchedulerTaskTrace>(host_base, owner.layout.trace_cells_offset);
     const auto *controls = scheduler_state_at<SchedulerTaskControl>(host_base, owner.layout.task_controls_offset);
 
-    std::ostringstream tasks_json;
-    tasks_json << "[";
-    bool first_task = true;
+    const bool need_scheduler_timing = level >= static_cast<uint32_t>(ChipSwimlaneLevel::SCHEDULE_TIMING);
+
+    // One eligibility pass, before either section is written. The reader requires
+    // Scheduler timing for every AICore task it sees (swimlane_converter.py's
+    // level>=2 join is `set(aicore) - set(scheduler)` and must be empty), so a
+    // task that cannot appear in both sections must appear in neither. Deciding
+    // per-section instead means a single incomplete trace costs this run its
+    // whole Scheduler timing, its AICPU lifecycle records and its Scheduler
+    // activity streams -- every section after the one that gave up -- while
+    // leaving the already-published AicoreTasks in the one shape the reader
+    // rejects.
+    std::vector<uint64_t> emitted_tasks;
+    emitted_tasks.reserve(static_cast<size_t>(owner.layout.task_count));
     for (uint64_t task_id = 0; task_id < owner.layout.task_count; ++task_id) {
         const SchedulerTaskTrace &trace = traces[task_id];
         if (trace.valid == 0 || trace.kernel_start_cycles == 0 || trace.kernel_end_cycles < trace.kernel_start_cycles ||
             trace.worker_id >= SCHEDULER_WORKER_CAPACITY)
             continue;
+        if (need_scheduler_timing &&
+            (trace.dispatch_end_cycles == 0 || trace.complete_start_cycles < trace.kernel_end_cycles)) {
+            LOG_WARN(
+                "A5 HBG: dropping task id=%" PRIu64 " from this run's swimlane — incomplete Scheduler timing "
+                "(dispatch_end=%" PRIu64 ", complete_start=%" PRIu64 ", kernel_end=%" PRIu64 ")",
+                task_id, trace.dispatch_end_cycles, trace.complete_start_cycles, trace.kernel_end_cycles
+            );
+            continue;
+        }
+        emitted_tasks.push_back(task_id);
+    }
+
+    std::ostringstream tasks_json;
+    tasks_json << "[";
+    bool first_task = true;
+    for (uint64_t task_id : emitted_tasks) {
+        const SchedulerTaskTrace &trace = traces[task_id];
         const uint64_t receive_to_start =
             trace.ready_observe_cycles != 0 && trace.kernel_start_cycles >= trace.ready_observe_cycles ?
                 trace.kernel_start_cycles - trace.ready_observe_cycles :
@@ -482,19 +509,12 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         return false;
     }
 
-    if (level >= static_cast<uint32_t>(ChipSwimlaneLevel::SCHEDULE_TIMING)) {
+    if (need_scheduler_timing) {
         std::ostringstream scheduler_tasks_json;
         scheduler_tasks_json << "{\n    \"schema_version\": 1,\n    \"producer\": \"aicore\",\n    \"records\": [";
         bool first_scheduler_task = true;
-        for (uint64_t task_id = 0; task_id < owner.layout.task_count; ++task_id) {
+        for (uint64_t task_id : emitted_tasks) {
             const SchedulerTaskTrace &trace = traces[task_id];
-            if (trace.valid == 0 || trace.kernel_start_cycles == 0 ||
-                trace.kernel_end_cycles < trace.kernel_start_cycles || trace.worker_id >= SCHEDULER_WORKER_CAPACITY)
-                continue;
-            if (trace.dispatch_end_cycles == 0 || trace.complete_start_cycles < trace.kernel_end_cycles) {
-                LOG_WARN("A5 HBG: incomplete Scheduler task timing for task id=%" PRIu64, task_id);
-                return false;
-            }
             if (!first_scheduler_task) scheduler_tasks_json << ",";
             scheduler_tasks_json << "\n      [" << trace.worker_id << ", " << task_id << ", "
                                  << trace.dispatch_end_cycles << ", " << trace.complete_start_cycles << "]";
