@@ -534,33 +534,39 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
             for (int i = 0; i < num_aicore; i++) {
                 CoreType core_type = runtime.get_workers()[i].core_type;
                 uint32_t physical_core_id = static_cast<uint32_t>(i);
-                run->aicore_threads.push_back(create_thread([this, run, i, core_type, physical_core_id]() {
-                    aicore_execute_func_(
-                        run->runtime, i, core_type, physical_core_id, kernel_args_.regs,
-                        kernel_args_.enable_profiling_flag, kernel_args_.chip_swimlane_aicore_rotation_table
-                    );
-                    run_completion_.task_finished();
-                }));
+                run->aicore_threads.push_back(create_thread(
+                    [this, run, i, core_type, physical_core_id]() {
+                        aicore_execute_func_(
+                            run->runtime, i, core_type, physical_core_id, kernel_args_.regs,
+                            kernel_args_.enable_profiling_flag, kernel_args_.chip_swimlane_aicore_rotation_table
+                        );
+                        run_completion_.task_finished();
+                    },
+                    std::string("sim-") + (core_type == CoreType::AIC ? "aic" : "aiv") + "-" + std::to_string(i)
+                ));
             }
             return 0;
         },
         [&](LaunchProgressSink &) -> int {
             LOG_INFO("Launching %d AICPU threads (logical=%d)", over_launch, launch_aicpu_num);
             for (int i = 0; i < over_launch; i++) {
-                run->aicpu_threads.push_back(create_thread([this, run, launch_aicpu_num, over_launch, sim_t0]() {
-                    if (!platform_aicpu_affinity_gate(launch_aicpu_num, over_launch)) {
-                        run_completion_.task_finished();
-                        return;
-                    }
-                    int rc = aicpu_execute_func_(run->runtime);
-                    if (kernel_args_.device_wall_data_base != 0) {
-                        const auto t1 = std::chrono::steady_clock::now();
-                        *reinterpret_cast<uint64_t *>(kernel_args_.device_wall_data_base) = static_cast<uint64_t>(
-                            std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - sim_t0).count()
-                        );
-                    }
-                    run_completion_.task_finished(rc);
-                }));
+                run->aicpu_threads.push_back(create_thread(
+                    [this, run, launch_aicpu_num, over_launch, sim_t0]() {
+                        if (!platform_aicpu_affinity_gate(launch_aicpu_num, over_launch)) {
+                            run_completion_.task_finished();
+                            return;
+                        }
+                        int rc = aicpu_execute_func_(run->runtime);
+                        if (kernel_args_.device_wall_data_base != 0) {
+                            const auto t1 = std::chrono::steady_clock::now();
+                            *reinterpret_cast<uint64_t *>(kernel_args_.device_wall_data_base) = static_cast<uint64_t>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - sim_t0).count()
+                            );
+                        }
+                        run_completion_.task_finished(rc);
+                    },
+                    "sim-aicpu-" + std::to_string(i)
+                ));
             }
             return 0;
         }

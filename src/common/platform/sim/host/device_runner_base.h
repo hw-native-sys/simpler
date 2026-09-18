@@ -204,7 +204,17 @@ public:
         void *runtime_arena_base, size_t runtime_off, const void *image_data, size_t image_size
     );
 
-    std::thread create_thread(std::function<void()> fn);
+    /**
+     * Spawn a device-simulation thread bound to this runner's device.
+     *
+     * `name` is applied to the thread itself (Linux only, truncated to the
+     * kernel's 15-character limit); an empty name leaves the thread unnamed.
+     * A sim run holds one thread per simulated AICore plus one per AICPU, so
+     * over a hundred of them share this factory — without a name every one
+     * reports as the host process's own `comm` and a crash dump cannot say
+     * which tier faulted.
+     */
+    std::thread create_thread(std::function<void()> fn, std::string name = {});
     int attach_current_thread(int device_id);
 
     void *allocate_tensor(size_t bytes);

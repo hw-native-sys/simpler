@@ -13,6 +13,10 @@
 #include <sys/stat.h>
 #include <stdlib.h>
 
+#if defined(__linux__)
+#include <pthread.h>
+#endif
+
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -264,9 +268,16 @@ void *SimDeviceRunnerBase::acquire_pooled_runtime_arena(uint32_t arena_bank) {
     return arena.base();
 }
 
-std::thread SimDeviceRunnerBase::create_thread(std::function<void()> fn) {
+std::thread SimDeviceRunnerBase::create_thread(std::function<void()> fn, std::string name) {
     int dev_id = device_id_;
-    return std::thread([dev_id, fn = std::move(fn)]() {
+    return std::thread([dev_id, fn = std::move(fn), name = std::move(name)]() {
+#if defined(__linux__)
+        // Linux caps a thread name at 15 characters plus NUL and fails the call
+        // outright on a longer one, which would leave the thread unnamed.
+        if (!name.empty()) {
+            pthread_setname_np(pthread_self(), name.substr(0, 15).c_str());
+        }
+#endif
         pto_cpu_sim_bind_device(dev_id);
         fn();
         pto_cpu_sim_bind_device(-1);
