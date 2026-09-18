@@ -138,7 +138,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     // it is parallelized: the leader (tidx 0) does the shared setup, every
     // thread handshakes a disjoint slice of cores, then the leader finishes init
     // after a barrier. Non-leaders spin on init_done_.
-    int32_t nthreads = runtime->aicpu_thread_num;
+    int32_t nthreads = runtime->dev.aicpu_thread_num;
     if (nthreads == 0) nthreads = 1;
     if (nthreads < 1 || nthreads > MAX_AICPU_THREADS) {
         LOG_ERROR("Invalid aicpu_thread_num: %d", nthreads);
@@ -267,8 +267,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // holds exactly that image — so its size comes from the same pitch.
             // attach_populated rejects a pitch outside (0, task_capacity] and a
             // region too small for it.
-            const uint64_t live_slots = sm_layout::live_slot_pitch(static_cast<uint64_t>(runtime->host_total_tasks));
-            const uint64_t sm_size = runtime->sm_image_bytes;
+            const uint64_t live_slots =
+                sm_layout::live_slot_pitch(static_cast<uint64_t>(runtime->dev.host_total_tasks));
+            const uint64_t sm_size = runtime->dev.sm_image_bytes;
             // sm_handle and the scheduler state are the device-only zone: their
             // bytes never travel, so they start as whatever the pooled arena last
             // held. Zeroing the handle first is what makes attach_populated's
@@ -276,7 +277,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // attach_populated.
             memset(rt->sm_handle, 0, sizeof(*rt->sm_handle));
             if (!rt->sm_handle->attach_populated(
-                    sm_ptr, sm_size, rt->prebuilt_layout.task_capacity, live_slots, runtime->sm_image_bytes
+                    sm_ptr, sm_size, rt->prebuilt_layout.task_capacity, live_slots, runtime->dev.sm_image_bytes
                 )) {
                 LOG_ERROR("Thread %d: host-orch: sm_handle->attach_populated failed", thread_idx);
                 rt = nullptr;
@@ -320,8 +321,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // mark_done()'s active_count() read would dereference it and fault the
             // AICPU. on_graph_attached only needs total_tasks and the scalar
             // orchestrator.inline_completed_tasks, both already valid.
-            sched_ctx_.on_graph_attached(rt, thread_idx, runtime->host_total_tasks);
-            LOG_INFO("Thread %d: host-orch boot complete (%d tasks)", thread_idx, runtime->host_total_tasks);
+            sched_ctx_.on_graph_attached(rt, thread_idx, runtime->dev.host_total_tasks);
+            LOG_INFO("Thread %d: host-orch boot complete (%d tasks)", thread_idx, runtime->dev.host_total_tasks);
         }
 
         // Publish "leader setup done" (SM attached, task count latched, queues
@@ -451,7 +452,7 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     //    bypasses this cache. Invalidating now ensures next round reads from HBM.
     //    The length is the uploaded image, not sizeof(Runtime): the host-only
     //    tail past it was never copied, so no device line holds it.
-    cache_invalidate_range(runtime, Runtime::device_image_bytes());
+    cache_invalidate_range(runtime, sizeof(runtime->dev));
 
     // Reset all SchedulerContext-owned state in one place.
     sched_ctx_.deinit();

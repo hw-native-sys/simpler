@@ -24,17 +24,17 @@ inline bool aicore_scheduler_runtime_mode_is_explicit_legacy(uint32_t mode) {
 
 inline bool aicore_scheduler_runtime_enabled(const Runtime *runtime) {
     return runtime != nullptr && runtime->get_worker_count() > 0 &&
-           aicore_scheduler_runtime_mode_is_resident(runtime->workers[0].aicpu_ready);
+           aicore_scheduler_runtime_mode_is_resident(runtime->dev.workers[0].aicpu_ready);
 }
 
 inline bool aicore_scheduler_explicit_legacy_enabled(const Runtime *runtime) {
     return runtime != nullptr && runtime->get_worker_count() > 0 &&
-           aicore_scheduler_runtime_mode_is_explicit_legacy(runtime->workers[0].aicpu_ready);
+           aicore_scheduler_runtime_mode_is_explicit_legacy(runtime->dev.workers[0].aicpu_ready);
 }
 
 inline SchedulerWorkerContext *aicore_scheduler_bootstrap_context(Runtime *runtime) {
-    if (!aicore_scheduler_runtime_enabled(runtime) || runtime->workers[0].task == 0) return nullptr;
-    return reinterpret_cast<SchedulerWorkerContext *>(runtime->workers[0].task);
+    if (!aicore_scheduler_runtime_enabled(runtime) || runtime->dev.workers[0].task == 0) return nullptr;
+    return reinterpret_cast<SchedulerWorkerContext *>(runtime->dev.workers[0].task);
 }
 
 inline void *aicore_scheduler_state_base(SchedulerWorkerContext *context) {

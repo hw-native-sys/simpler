@@ -58,7 +58,7 @@ void record_lifecycle_timeout(Runtime *runtime, SchedulerErrorSite error_site) {
 }  // namespace
 
 int32_t AicoreLifecycle::pre_handshake_init(Runtime *runtime, int32_t aicpu_thread_num, uint64_t regs_base) {
-    if (runtime == nullptr || runtime->worker_count <= 0 || runtime->worker_count > kMaxWorkers) {
+    if (runtime == nullptr || runtime->dev.worker_count <= 0 || runtime->dev.worker_count > kMaxWorkers) {
         LOG_ERROR("Invalid AICore lifecycle worker count");
         return -1;
     }
@@ -66,7 +66,7 @@ int32_t AicoreLifecycle::pre_handshake_init(Runtime *runtime, int32_t aicpu_thre
     std::memset(cores_, 0, sizeof(cores_));
     std::memset(physical_core_ids_, 0, sizeof(physical_core_ids_));
     std::memset(thread_handshake_timing_, 0, sizeof(thread_handshake_timing_));
-    core_count_ = runtime->worker_count;
+    core_count_ = runtime->dev.worker_count;
     aicpu_thread_num_ = aicpu_thread_num;
     regs_base_ = regs_base;
     lifecycle_traces_ = nullptr;
@@ -83,7 +83,7 @@ int32_t AicoreLifecycle::pre_handshake_init(Runtime *runtime, int32_t aicpu_thre
 }
 
 void AicoreLifecycle::handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads) {
-    Handshake *handshakes = runtime->workers;
+    Handshake *handshakes = runtime->dev.workers;
     const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(tidx) * core_count_) / nthreads);
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(tidx + 1) * core_count_) / nthreads);
     const uint32_t physical_core_count = platform_get_physical_cores_count();
@@ -143,7 +143,7 @@ void AicoreLifecycle::handshake_partition(Runtime *runtime, int32_t tidx, int32_
 
 int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
     SchedulerWorkerContext *bootstrap_context = aicore_scheduler_bootstrap_context(runtime);
-    if (bootstrap_context == nullptr || runtime->host_total_tasks < 0 ||
+    if (bootstrap_context == nullptr || runtime->dev.host_total_tasks < 0 ||
         handshake_failed_.load(std::memory_order_acquire))
         return -1;
     cache_invalidate_range(bootstrap_context, 256);
@@ -311,7 +311,7 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
 void AicoreLifecycle::publish_context_partition(Runtime *runtime, int32_t thread_idx) {
     const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(thread_idx) * core_count_) / aicpu_thread_num_);
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(thread_idx + 1) * core_count_) / aicpu_thread_num_);
-    Handshake *handshakes = runtime->workers;
+    Handshake *handshakes = runtime->dev.workers;
     SchedulerWorkerContext *bootstrap_context = aicore_scheduler_bootstrap_context(runtime);
     if (bootstrap_context == nullptr) return;
     AicpuThreadLifecycleTrace *trace = thread_lifecycle_trace(thread_idx);

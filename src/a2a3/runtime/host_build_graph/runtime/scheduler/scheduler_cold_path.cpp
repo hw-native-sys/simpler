@@ -607,7 +607,7 @@ int32_t SchedulerContext::retire_all_cores(Runtime *runtime) {
 // landed, so the shared aic_count_/aiv_count_ are written by one thread only.
 // =============================================================================
 void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads) {
-    Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->workers);
+    Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
     const int32_t total = cores_total_num_;
     const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(tidx) * total) / nthreads);
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(tidx + 1) * total) / nthreads);
@@ -838,7 +838,7 @@ int32_t SchedulerContext::pre_handshake_init(Runtime *runtime, int32_t aicpu_thr
     // hs_setup_done_, so it happens-before every thread's handshake_partition
     // and therefore before any register window is opened.
     if (is_chip_swimlane_enabled()) {
-        chip_swimlane_aicpu_init(runtime->worker_count);
+        chip_swimlane_aicpu_init(runtime->dev.worker_count);
         chip_swimlane_level_ = get_chip_swimlane_level();
         if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
             // Sched-phase pool count must match the dump_args_init thread count
@@ -852,7 +852,7 @@ int32_t SchedulerContext::pre_handshake_init(Runtime *runtime, int32_t aicpu_thr
             // records use the host callback path, so the device initializes no
             // dead AICPU orchestrator pool.
             const int orch_phase_threads = 0;
-            chip_swimlane_aicpu_init_phase(runtime->worker_count, sched_phase_threads, orch_phase_threads);
+            chip_swimlane_aicpu_init_phase(runtime->dev.worker_count, sched_phase_threads, orch_phase_threads);
         }
     } else {
         chip_swimlane_level_ = ChipSwimlaneLevel::DISABLED;
@@ -860,7 +860,7 @@ int32_t SchedulerContext::pre_handshake_init(Runtime *runtime, int32_t aicpu_thr
 #endif
 
     // Core count is needed by every thread to compute its handshake slice.
-    cores_total_num_ = runtime->worker_count;
+    cores_total_num_ = runtime->dev.worker_count;
     if (cores_total_num_ == 0 || cores_total_num_ > RUNTIME_MAX_WORKER) {
         LOG_ERROR("Invalid cores_total_num %d (expected 1-%d)", cores_total_num_, RUNTIME_MAX_WORKER);
         return -1;
@@ -983,7 +983,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
         }
     }
 
-    func_id_to_addr_ = runtime->func_id_to_addr_;
+    func_id_to_addr_ = runtime->dev.func_id_to_addr_;
 
     return 0;
 }

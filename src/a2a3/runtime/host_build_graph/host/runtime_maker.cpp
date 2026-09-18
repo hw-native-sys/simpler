@@ -869,7 +869,7 @@ int32_t run_host_orchestration(
         static_cast<uint64_t>(orch_state.scalar_pool_cursor),
     };
     const uint64_t image_bytes = sm_layout::segment_offsets(sm_layout::image_extents(bind_usage)).end;
-    runtime->sm_image_bytes = image_bytes;
+    runtime->dev.sm_image_bytes = image_bytes;
 
     // Only now are both sizes known, so this is where the two device regions are
     // committed: the arena up to its shared-memory tail, and the graph heap to the
@@ -1404,7 +1404,7 @@ extern "C" int bind_callable_to_runtime_impl(
             LOG_ERROR("host-orch: orchestration run failed");
             return total_tasks;
         }
-        runtime->host_total_tasks = total_tasks;
+        runtime->dev.host_total_tasks = total_tasks;
         LOG_INFO("host-orch: submitted %d tasks on host", total_tasks);
     }
 

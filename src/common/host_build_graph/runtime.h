@@ -131,8 +131,38 @@ struct Task {
  * Task graph construction is handled by RuntimeContext; this class only handles
  * execution control and device orchestration state.
  */
-class Runtime {
-public:
+/**
+ * DeviceRuntimeLaunchDesc - the device-copied half of Runtime, named.
+ *
+ * This is the ONLY part of Runtime that crosses the host->device boundary: the
+ * host fills it, `device_runner_helpers.cpp` rtMemcpy's exactly
+ * `sizeof(DeviceRuntimeLaunchDesc)` bytes from offset 0 of the Runtime image,
+ * and the AICPU/AICore read these fields back. It is the first member of
+ * Runtime (offsetof == 0), so the narrowed copy needs no offset arithmetic.
+ *
+ * The boundary was already load-bearing as an offset — everything host-only
+ * lives in `Runtime::HostOnlyState`, and the image ended where that member
+ * began. Naming the other side makes the image a type rather than a distance:
+ * its size is `sizeof`, not `offsetof` on a class that is not standard-layout,
+ * and a field lands on the device because of where it is declared rather than
+ * because of what it happens to precede. Same split, checked by construction.
+ *
+ * Keep it standard-layout and trivially copyable (the static_asserts below) so
+ * the rtMemcpy is well-defined — Runtime itself is neither, because
+ * HostOnlyState holds a std::vector. alignas(64) plus the whole-cache-line size
+ * assertion keep cache_invalidate_range(runtime, sizeof(dev)) from rounding into
+ * a neighbouring line.
+ *
+ * Membership here says a field is device-visible. It says nothing about
+ * lifetime, and the fields inside do not share one: launch parameters the host
+ * rewrites per run sit beside a dispatch table that is constant per callable and
+ * beside a handshake region the device itself writes and the host must not
+ * overwrite while a run is live. So this being one struct is not licence to
+ * overwrite it early, to reset it as a unit, or to conclude that a run must
+ * re-upload all of it. Splitting it further belongs to whoever establishes the
+ * real read/write relationships, field by field.
+ */
+struct alignas(64) DeviceRuntimeLaunchDesc {
     // Handshake buffers for AICPU-AICore communication
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
     // A2/A3 post-close return gates, one isolated cache line per worker. The
@@ -179,7 +209,6 @@ public:
     // names its argument regions by delta.
     uint64_t sm_image_bytes;
 
-private:
     void *gm_sm_ptr_;  // GM pointer to shared memory (device)
 
     // Prebuilt-arena fast path. Set by the host before rtMemcpy'ing Runtime to
@@ -188,11 +217,42 @@ private:
     // runtime_init_data_from_layout + wire on host).
     void *prebuilt_arena_base_;
     size_t prebuilt_runtime_offset_;
+};
 
-    // The device image ends here: `device_image_bytes()` is this member's
-    // offset, so nothing below travels. Every field inside is written by the
-    // host and read only by the host — a new host-only field belongs in here,
-    // which is what keeps the boundary from drifting.
+static_assert(
+    std::is_standard_layout_v<DeviceRuntimeLaunchDesc>,
+    "DeviceRuntimeLaunchDesc must be standard-layout: it is rtMemcpy'd to device"
+);
+static_assert(
+    std::is_trivially_copyable_v<DeviceRuntimeLaunchDesc>,
+    "DeviceRuntimeLaunchDesc must be trivially copyable: it is rtMemcpy'd to device"
+);
+static_assert(
+    sizeof(DeviceRuntimeLaunchDesc) % 64 == 0,
+    "DeviceRuntimeLaunchDesc size must be a multiple of 64 so cache_invalidate_range(sizeof(dev)) "
+    "stays cache-line aligned"
+);
+
+// =============================================================================
+// Runtime Class
+// =============================================================================
+
+/**
+ * Runtime class for device execution and handshake control
+ *
+ * This class manages AICPU-AICore communication through handshake buffers.
+ * Task graph construction is handled by RuntimeContext; this class only handles
+ * execution control and device orchestration state.
+ */
+class Runtime {
+public:
+    // The device-copied half. First member, so the copy starts at offset 0.
+    DeviceRuntimeLaunchDesc dev;
+
+private:
+    // Everything the host keeps to itself. Outside `dev`, so it cannot travel:
+    // a new host-only field belongs in here, which is what keeps the boundary
+    // from drifting.
     struct HostOnlyState {
         // Entry args, adopted on the host. The host orchestrator is the only
         // reader (runtime_maker.cpp builds its ChipTaskArgs from
@@ -226,10 +286,10 @@ private:
 
 public:
     /**
-     * Bytes of this object that cross to the device, i.e. the offset of the
-     * host-only tail. The AICPU addresses fields inside this prefix directly,
-     * so it is also the only length that may be cache-invalidated: reaching
-     * past it would touch bytes the host never uploaded.
+     * Bytes of this object that cross to the device: the device descriptor's
+     * size. The AICPU addresses fields inside it directly, so it is also the
+     * only length that may be cache-invalidated — reaching past it would touch
+     * bytes the host never uploaded.
      */
     static size_t device_image_bytes();
 
@@ -243,23 +303,25 @@ public:
     //
     // These exist with identical signatures on the tensormap_and_ringbuffer
     // Runtime so the shared platform layer (device_runner*.cpp, kernel.cpp) can
-    // compile against either variant. hbg stores the fields flat (trb keeps
-    // them in a `dev` sub-struct); the accessors hide that difference.
+    // compile against either variant. Both runtimes keep the fields in a `dev`
+    // sub-struct; the accessors keep that out of the callers.
     // =========================================================================
 
-    int get_worker_count() const { return worker_count; }
-    void set_worker_count(int n) { worker_count = n; }
-    int get_aicpu_thread_num() const { return aicpu_thread_num; }
-    void set_aicpu_thread_num(int n) { aicpu_thread_num = n; }
-    Handshake *get_workers() { return workers; }
-    const Handshake *get_workers() const { return workers; }
-    AicoreTeardownControl *get_teardown_gates() { return teardown_gates; }
-    int32_t get_aicpu_allowed_cpu_count() const { return aicpu_allowed_cpu_count; }
-    void set_aicpu_allowed_cpu_count(int32_t n) { aicpu_allowed_cpu_count = n; }
-    int32_t get_aicpu_launch_count() const { return aicpu_launch_count; }
-    void set_aicpu_launch_count(int32_t n) { aicpu_launch_count = n; }
-    int32_t *get_aicpu_allowed_cpus() { return aicpu_allowed_cpus; }
-    size_t aicpu_allowed_cpus_capacity() const { return sizeof(aicpu_allowed_cpus) / sizeof(aicpu_allowed_cpus[0]); }
+    int get_worker_count() const { return dev.worker_count; }
+    void set_worker_count(int n) { dev.worker_count = n; }
+    int get_aicpu_thread_num() const { return dev.aicpu_thread_num; }
+    void set_aicpu_thread_num(int n) { dev.aicpu_thread_num = n; }
+    Handshake *get_workers() { return dev.workers; }
+    const Handshake *get_workers() const { return dev.workers; }
+    AicoreTeardownControl *get_teardown_gates() { return dev.teardown_gates; }
+    int32_t get_aicpu_allowed_cpu_count() const { return dev.aicpu_allowed_cpu_count; }
+    void set_aicpu_allowed_cpu_count(int32_t n) { dev.aicpu_allowed_cpu_count = n; }
+    int32_t get_aicpu_launch_count() const { return dev.aicpu_launch_count; }
+    void set_aicpu_launch_count(int32_t n) { dev.aicpu_launch_count = n; }
+    int32_t *get_aicpu_allowed_cpus() { return dev.aicpu_allowed_cpus; }
+    size_t aicpu_allowed_cpus_capacity() const {
+        return sizeof(dev.aicpu_allowed_cpus) / sizeof(dev.aicpu_allowed_cpus[0]);
+    }
 
     // =========================================================================
     // Performance Profiling
@@ -332,40 +394,36 @@ public:
     Task *get_task(int) { return nullptr; }
 };
 
-// Runtime is not standard-layout (std::vector member + mixed access), so guard
-// the offsetof against -Winvalid-offsetof; offsetof on such a class is
-// conditionally-supported, and both GCC and Clang document that they support
-// it. Mirrors the guard tensormap_and_ringbuffer uses for `offsetof(Runtime,
-// dev)`. Defined inline so the AICPU translation units that size their cache
-// invalidation by it need no extra link dependency.
+// `dev` must be the first member so the narrowed H2D copy starts at offset 0,
+// and the host-only tail must begin no earlier than the descriptor ends — the
+// two together are what keep a field from crossing because of where it was
+// declared. Runtime is not standard-layout (std::vector member + mixed access),
+// so guard the offsetof against -Winvalid-offsetof; offsetof on such a class is
+// conditionally-supported, and both GCC and Clang document that they support it.
+// Mirrors the guard tensormap_and_ringbuffer uses for the same assertion.
 #if defined(__GNUC__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Winvalid-offsetof"
 #endif
 inline size_t Runtime::device_image_bytes() {
-    // The image is [0, offsetof(host_)): it starts at `workers` and ends where
-    // the host-only tail begins. The second assert is what makes the boundary
-    // load-bearing — it fails the build if a device-read member is ever moved
-    // below `host_`, which would stop it being uploaded.
-    static_assert(offsetof(Runtime, workers) == 0, "the device image must start at offset 0");
+    // The image is the descriptor, so its length is a type's size. The two
+    // assertions are what keep that true of the object as well: `dev` first, and
+    // the host-only tail beginning no earlier than the descriptor ends. Between
+    // them a member cannot start travelling, or stop, because of where it was
+    // declared relative to something else.
+    static_assert(offsetof(Runtime, dev) == 0, "DeviceRuntimeLaunchDesc must be the first member of Runtime");
     static_assert(
-        offsetof(Runtime, host_) > offsetof(Runtime, prebuilt_runtime_offset_),
-        "every device-read member must precede host_"
+        offsetof(Runtime, host_) >= sizeof(DeviceRuntimeLaunchDesc),
+        "the host-only tail must start at or after the end of the device image"
     );
-    static_assert(
-        offsetof(Runtime, host_) + sizeof(HostOnlyState) == sizeof(Runtime),
-        "nothing may follow host_: the device image is everything before it, so a member added after it "
-        "would silently stop being uploaded"
-    );
-    return offsetof(Runtime, host_);
+    return sizeof(DeviceRuntimeLaunchDesc);
 }
 #if defined(__GNUC__)
 #pragma GCC diagnostic pop
 #endif
 
-// Number of bytes of the Runtime image that must be copied to the device.
-// host_build_graph returns Runtime::device_image_bytes() (the object without its
-// host-only tail); trb returns sizeof(DeviceRuntimeLaunchDesc). Defined
-// per-runtime so
-// the shared device_runner_helpers.cpp copy path stays runtime-agnostic.
+// Number of bytes of the Runtime image that must be copied to the device. Both
+// runtimes return sizeof(DeviceRuntimeLaunchDesc) — their own, which differ in
+// content. Defined per-runtime so the shared device_runner_helpers.cpp copy path
+// stays runtime-agnostic.
 size_t runtime_device_copy_size(const Runtime &rt);

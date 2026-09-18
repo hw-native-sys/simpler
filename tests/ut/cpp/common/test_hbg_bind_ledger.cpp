@@ -193,10 +193,10 @@ protected:
     // worker_count / PLATFORM_CORES_PER_BLOCKDIM and fails before it reaches the
     // staging ledger if that is zero.
     static void init_runtime(Runtime &rt) {
-        rt.worker_count = PLATFORM_CORES_PER_BLOCKDIM;
-        for (int i = 0; i < rt.worker_count; ++i) {
-            rt.workers[i].core_type = CoreType::AIV;
-            rt.workers[i].physical_core_id = static_cast<uint32_t>(i);
+        rt.dev.worker_count = PLATFORM_CORES_PER_BLOCKDIM;
+        for (int i = 0; i < rt.dev.worker_count; ++i) {
+            rt.dev.workers[i].core_type = CoreType::AIV;
+            rt.dev.workers[i].physical_core_id = static_cast<uint32_t>(i);
         }
     }
 
@@ -240,6 +240,57 @@ TEST_F(HbgBindLedgerTest, AnEmptyTensorIsPassedThroughAndTakesNoSlice) {
     ASSERT_EQ(runtime.tensor_leases().size(), 1u);
     EXPECT_EQ(runtime.tensor_leases()[0].host_ptr, real.data());
     EXPECT_EQ(runtime.tensor_leases()[0].size, 64u);
+}
+
+// What the device image is allowed to contain. The boundary is already a
+// grouped host-only tail; naming the other side makes it checkable by content:
+// the uploaded bytes are the descriptor and nothing behind it, so a value only
+// the host reads cannot ride along. Found by searching for it, not by comparing
+// a size — a size assertion passes even when a member is on the wrong side.
+TEST_F(HbgBindLedgerTest, TheDeviceImageCarriesNoHostOnlyBytes) {
+    Runtime runtime;
+    init_runtime(runtime);
+
+    // Three host-only members, each given a recognisable value: the callable
+    // stamp, an orchestration scalar, and a lease.
+    constexpr int32_t kStamp = 0x5ea15ea1;
+    runtime.set_active_callable_id(kStamp);
+    std::vector<uint8_t> payload(64, 0x11);
+    ChipStorageTaskArgs args;
+    args.add_tensor(host_tensor(payload));
+    constexpr uint64_t kScalar = 0xfeedfacecafebeedULL;
+    args.add_scalar(kScalar);
+    runtime.set_orch_args(args);
+    ArgDirection sig[1] = {ArgDirection::INOUT};
+    ASSERT_EQ(bind(runtime, args, sig, 1), 0);
+    ASSERT_FALSE(runtime.tensor_leases().empty()) << "the bind must have recorded the host-only ledger";
+
+    const size_t image_bytes = runtime_device_copy_size(runtime);
+    ASSERT_EQ(image_bytes, sizeof(DeviceRuntimeLaunchDesc));
+    ASSERT_LT(image_bytes, sizeof(Runtime)) << "the whole object is still crossing to the device";
+
+    // The copy the platform performs: `image_bytes` from offset 0.
+    std::vector<uint8_t> image(image_bytes);
+    std::memcpy(image.data(), &runtime, image_bytes);
+
+    auto contains = [&image](const void *needle, size_t bytes) {
+        const auto *first = static_cast<const uint8_t *>(needle);
+        return std::search(image.begin(), image.end(), first, first + bytes) != image.end();
+    };
+    EXPECT_FALSE(contains(&kStamp, sizeof(kStamp))) << "the callable stamp reached the device image";
+    EXPECT_FALSE(contains(&kScalar, sizeof(kScalar))) << "an orchestration scalar reached the device image";
+    const void *const lease_dev_ptr = runtime.tensor_leases()[0].dev_ptr;
+    EXPECT_FALSE(contains(&lease_dev_ptr, sizeof(lease_dev_ptr))) << "the tensor ledger reached the device image";
+
+    // The device-read fields are in it, so the exclusions above are not vacuous.
+    // Read through an aligned object rather than a cast over the byte buffer:
+    // std::vector<uint8_t> carries no 64-byte guarantee and the descriptor is
+    // alignas(64), so the cast would be a misaligned access.
+    DeviceRuntimeLaunchDesc uploaded;
+    std::memcpy(&uploaded, image.data(), sizeof(uploaded));
+    EXPECT_EQ(uploaded.worker_count, runtime.get_worker_count());
+    EXPECT_EQ(uploaded.sm_image_bytes, runtime.dev.sm_image_bytes);
+    EXPECT_EQ(uploaded.gm_sm_ptr_, runtime.get_gm_sm_ptr());
 }
 
 // The regression barrier: a bind whose validate never ran must not leak its

@@ -205,7 +205,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     // thread handshakes a disjoint slice of cores, then the leader finishes init
     // across two barriers: discovery precedes configuration, and all register
     // releases precede init completion.
-    int32_t nthreads = runtime->aicpu_thread_num;
+    int32_t nthreads = runtime->dev.aicpu_thread_num;
     if (nthreads == 0) nthreads = 1;
     if (nthreads < 1 || nthreads > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR("Invalid aicpu_thread_num: %d", nthreads);
@@ -384,7 +384,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     if (thread_idx == aicpu_thread_num_ - 1) {
         int32_t supervisor_rc = 0;
         SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
-        if (context == nullptr || runtime->host_total_tasks < 0) {
+        if (context == nullptr || runtime->dev.host_total_tasks < 0) {
             LOG_ERROR("A5 HBG AICore scheduler requires an initialized graph");
             supervisor_rc = -1;
         } else {
@@ -560,7 +560,7 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     //    bypasses this cache. Invalidating now ensures next round reads from HBM.
     //    The length is the uploaded image, not sizeof(Runtime): the host-only
     //    tail past it was never copied, so no device line holds it.
-    cache_invalidate_range(runtime, Runtime::device_image_bytes());
+    cache_invalidate_range(runtime, sizeof(runtime->dev));
 
     aicore_lifecycle_.deinit();
 

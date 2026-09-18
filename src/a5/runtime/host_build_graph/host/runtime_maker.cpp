@@ -943,8 +943,8 @@ void release_scheduler_state(Runtime *runtime, const HostApi *api) {
     }
     if (owner.allocation != nullptr) api->device_free(owner.allocation);
     for (int32_t i = 0; i < runtime->get_worker_count(); ++i) {
-        runtime->workers[i].aicpu_ready = 0;
-        runtime->workers[i].task = 0;
+        runtime->dev.workers[i].aicpu_ready = 0;
+        runtime->dev.workers[i].task = 0;
     }
 }
 
@@ -953,8 +953,8 @@ void select_legacy_scheduler(Runtime *runtime, uint32_t mode) {
         mode == SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH || mode == SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE
     );
     for (int32_t i = 0; i < runtime->get_worker_count(); ++i) {
-        runtime->workers[i].aicpu_ready = mode;
-        runtime->workers[i].task = 0;
+        runtime->dev.workers[i].aicpu_ready = mode;
+        runtime->dev.workers[i].task = 0;
     }
 }
 
@@ -1217,7 +1217,7 @@ bool create_scheduler_state(
     int32_t aiv_rank = 0;
     for (int32_t i = 0; i < runtime->get_worker_count(); ++i) {
         SchedulerWorkerContext &context = contexts[i];
-        context.core_type = static_cast<int32_t>(runtime->workers[i].core_type);
+        context.core_type = static_cast<int32_t>(runtime->dev.workers[i].core_type);
         context.physical_core_id = -1;
         context.type_rank = context.core_type == static_cast<int32_t>(CoreType::AIC) ? aic_rank++ : aiv_rank++;
         context.active = 0;
@@ -1258,8 +1258,8 @@ bool create_scheduler_state(
         return false;
     }
     for (int32_t i = 0; i < runtime->get_worker_count(); ++i) {
-        runtime->workers[i].aicpu_ready = SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING;
-        runtime->workers[i].task =
+        runtime->dev.workers[i].aicpu_ready = SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING;
+        runtime->dev.workers[i].task =
             aligned_address + layout.worker_contexts_offset + static_cast<uint64_t>(i) * sizeof(SchedulerWorkerContext);
     }
     {
@@ -1519,7 +1519,7 @@ int32_t run_host_orchestration(
         static_cast<uint64_t>(orch_state.scalar_pool_cursor),
     };
     const uint64_t image_bytes = sm_layout::segment_offsets(sm_layout::image_extents(bind_usage)).end;
-    runtime->sm_image_bytes = image_bytes;
+    runtime->dev.sm_image_bytes = image_bytes;
 
     // Only now are both sizes known, so this is where the two device regions are
     // committed: the arena up to its shared-memory tail, and the graph heap to the
@@ -2059,7 +2059,7 @@ extern "C" int bind_callable_to_runtime_impl(
             LOG_ERROR("host-orch: orchestration run failed");
             return total_tasks;
         }
-        runtime->host_total_tasks = total_tasks;
+        runtime->dev.host_total_tasks = total_tasks;
         LOG_INFO("host-orch: submitted %d tasks on host", total_tasks);
     }
 

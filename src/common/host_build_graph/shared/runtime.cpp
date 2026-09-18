@@ -26,21 +26,19 @@
 // =============================================================================
 
 Runtime::Runtime() {
-    // Initialize handshake buffers
-    std::memset(workers, 0, sizeof(workers));
-    worker_count = 0;
-    aicpu_thread_num = 1;
-    ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
-    std::memset(aicpu_allowed_cpus, 0, sizeof(aicpu_allowed_cpus));
-    aicpu_allowed_cpu_count = 0;
-    aicpu_launch_count = 0;
-    host_total_tasks = 0;
-    sm_image_bytes = 0;
-
-    // Initialize shared-memory / orchestration argument plumbing
-    gm_sm_ptr_ = nullptr;
-    prebuilt_arena_base_ = nullptr;
-    prebuilt_runtime_offset_ = 0;
+    // Initialize the device-copied descriptor (`dev`).
+    std::memset(dev.workers, 0, sizeof(dev.workers));
+    dev.worker_count = 0;
+    dev.aicpu_thread_num = 1;
+    dev.ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
+    std::memset(dev.aicpu_allowed_cpus, 0, sizeof(dev.aicpu_allowed_cpus));
+    dev.aicpu_allowed_cpu_count = 0;
+    dev.aicpu_launch_count = 0;
+    dev.host_total_tasks = 0;
+    dev.sm_image_bytes = 0;
+    dev.gm_sm_ptr_ = nullptr;
+    dev.prebuilt_arena_base_ = nullptr;
+    dev.prebuilt_runtime_offset_ = 0;
 
     host_.orch_args_storage_.clear();
     host_.active_callable_id_ = -1;
@@ -51,7 +49,7 @@ Runtime::Runtime() {
 
     // Initialize function address mapping
     for (int i = 0; i < RUNTIME_MAX_FUNC_ID; i++) {
-        func_id_to_addr_[i] = 0;
+        dev.func_id_to_addr_[i] = 0;
     }
 }
 
@@ -59,9 +57,9 @@ Runtime::Runtime() {
 // Shared-memory / orchestration argument plumbing
 // =============================================================================
 
-void *Runtime::get_gm_sm_ptr() const { return gm_sm_ptr_; }
+void *Runtime::get_gm_sm_ptr() const { return dev.gm_sm_ptr_; }
 const simpler::hbg::EntryArgsStorage &Runtime::get_orch_args() const { return host_.orch_args_storage_; }
-void Runtime::set_gm_sm_ptr(void *p) { gm_sm_ptr_ = p; }
+void Runtime::set_gm_sm_ptr(void *p) { dev.gm_sm_ptr_ = p; }
 // The one place a boundary ChipTensor becomes this runtime's Tensor. Called from
 // the host, before any orchestration runs, so nothing inside the runtime — on the
 // host or on the AICPU — ever holds the boundary form.
@@ -76,11 +74,11 @@ void Runtime::set_orch_args(const ChipStorageTaskArgs &args) {
 }
 
 void Runtime::set_prebuilt_arena(void *arena_base, size_t runtime_off) {
-    prebuilt_arena_base_ = arena_base;
-    prebuilt_runtime_offset_ = runtime_off;
+    dev.prebuilt_arena_base_ = arena_base;
+    dev.prebuilt_runtime_offset_ = runtime_off;
 }
-void *Runtime::get_prebuilt_arena_base() const { return prebuilt_arena_base_; }
-size_t Runtime::get_prebuilt_runtime_offset() const { return prebuilt_runtime_offset_; }
+void *Runtime::get_prebuilt_arena_base() const { return dev.prebuilt_arena_base_; }
+size_t Runtime::get_prebuilt_runtime_offset() const { return dev.prebuilt_runtime_offset_; }
 
 // Orchestration metadata written by the platform host (DeviceRunner) at
 // callable registration. host_build_graph runs the orchestrator on the host so
@@ -115,7 +113,7 @@ void Runtime::set_device_orch_config_name(const char *name) {
 
 uint64_t Runtime::get_function_bin_addr(int func_id) const {
     if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return 0;
-    return func_id_to_addr_[func_id];
+    return dev.func_id_to_addr_[func_id];
 }
 
 void Runtime::replay_function_bin_addr(int func_id, uint64_t addr) {
@@ -123,12 +121,12 @@ void Runtime::replay_function_bin_addr(int func_id, uint64_t addr) {
         LOG_ERROR("[Runtime] func_id=%d is out of range [0, %d)", func_id, RUNTIME_MAX_FUNC_ID);
         return;
     }
-    func_id_to_addr_[func_id] = addr;
+    dev.func_id_to_addr_[func_id] = addr;
 }
 
 void Runtime::clear_function_bin_addrs() {
     for (int i = 0; i < RUNTIME_MAX_FUNC_ID; i++) {
-        func_id_to_addr_[i] = 0;
+        dev.func_id_to_addr_[i] = 0;
     }
 }
 

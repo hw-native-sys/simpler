@@ -69,7 +69,7 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Dispat
  * @param core_type Core type (AIC or AIV)
  */
 __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type) {
-    __gm__ Handshake *my_hank = (__gm__ Handshake *)(&runtime->workers[block_idx]);
+    __gm__ Handshake *my_hank = (__gm__ Handshake *)(&runtime->dev.workers[block_idx]);
 
     // Phase 1: report physical core ID + core type and signal done in one write,
     // with no wait for the AICPU — both fields are self-known. The AICPU opens
@@ -302,5 +302,5 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // EXITED acknowledges quiescence; the AICPU opens this gate only after it
     // has closed this core's fast-path window. The gate is a line of its own,
     // outside the Handshake the dcci above writes back.
-    wait_for_post_close_release(&runtime->teardown_gates[block_idx].post_close_release);
+    wait_for_post_close_release(&runtime->dev.teardown_gates[block_idx].post_close_release);
 }
