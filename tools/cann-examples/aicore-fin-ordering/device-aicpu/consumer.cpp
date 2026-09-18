@@ -209,6 +209,7 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_run(void *ar
 
     // --- Bring-up: start the producer and learn its core id before measuring.
     ctl->round_request = 0;
+    ctl->round_ack = 0;
     ctl->mode = kFinProducerIdle;
     ctl->go = 1;
     CleanLine(ctl);
@@ -422,8 +423,10 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_run(void *ar
                         }
                     }
 
-                    // ACK: only now may the producer move on.
-                    ctl->round_request = round + 1;
+                    // ACK: only now may the producer move on. It waits on this
+                    // counter, not on round_request, so it cannot publish the
+                    // next round before that round has been requested.
+                    ctl->round_ack = round;
                     CleanLine(ctl);
                 }
             }

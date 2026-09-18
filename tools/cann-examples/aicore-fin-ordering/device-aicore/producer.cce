@@ -132,18 +132,22 @@ extern "C" __global__ __aicore__ void PRODUCER_ENTRY(__gm__ FinHandshake *hank) 
         rpt->published_round = round;
         dcci(reinterpret_cast<__gm__ uint64_t *>(rpt), SINGLE_CACHE_LINE, CACHELINE_OUT);
 
-        // Hold payload frozen until the consumer bumps round_request.
-        uint64_t next = round + 1;
+        // Hold payload frozen until the consumer acknowledges THIS round. The
+        // ack is a separate counter from the request: if one counter served as
+        // both, the producer would publish r+1 the moment it saw the ack for r,
+        // which is before the consumer has requested r+1 with that round's mode
+        // — the payload would then already be visible by the time the consumer
+        // starts waiting, and the arm labels would drift by one round.
         while (true) {
             dcci(reinterpret_cast<__gm__ uint64_t *>(ctl), SINGLE_CACHE_LINE);
             if (ctl->go == 0) {
                 return;
             }
-            if (ctl->round_request >= next) {
+            if (ctl->round_ack >= round) {
                 break;
             }
         }
-        round = ctl->round_request;
+        round++;
     }
 #endif
 }

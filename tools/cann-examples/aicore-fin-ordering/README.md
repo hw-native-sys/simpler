@@ -18,7 +18,7 @@ register + launch both                                            dcci(payload)
                                 apply consumer variant             set_cond(FIN|r)
                                 FIRST payload load -> classify
                                 diagnostics
-                                ACK (round_request = r+1)          hold payload frozen until ACK
+                                ACK (round_ack = r)                hold payload frozen until ACK
 D2H result + records, print
 ```
 
@@ -36,10 +36,20 @@ directory as the way to add a new mechanism; this is that copy.
 ## The frozen handoff is what makes a result interpretable
 
 The producer writes `payload` exactly once per round and then must not
-touch it until the consumer bumps `round_request`, which the consumer only
-does after finishing every read and diagnostic. So a first-load value
-*below* the round the FIN carried cannot be explained by the producer
-having advanced.
+touch it until the consumer sets `round_ack` to that round, which the
+consumer does only after finishing every read and diagnostic. So a
+first-load value *below* the round the FIN carried cannot be explained by
+the producer having advanced.
+
+The request and the ACK are **two** counters on purpose. With one counter
+serving as both, the producer publishes round *r+1* the moment it sees the
+ACK for *r* — before the consumer has requested that round with its own arm
+selected — so the payload is already visible by the time the consumer starts
+waiting, and the per-arm attribution drifts by one round. That is not
+hypothetical: it moved measured failure counts by an order of magnitude and
+manufactured an apparent effect (deliberately warming the payload line
+looked like it fixed the unflushed-producer case) that vanished once the
+counters were separated.
 
 Consequently the first load is classified three ways, not two:
 

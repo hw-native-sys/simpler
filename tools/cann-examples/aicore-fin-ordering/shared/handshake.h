@@ -99,8 +99,9 @@ enum FinFirstRead : uint32_t {
 struct alignas(64) FinCtlBlock {
     volatile uint32_t go;             // 0 = producer should exit
     volatile uint32_t mode;           // FinProducerMode
-    volatile uint64_t round_request;  // monotonic; also the ACK of round-1
-    volatile uint64_t _pad[6];
+    volatile uint64_t round_request;  // consumer asks for this round
+    volatile uint64_t round_ack;      // consumer releases it; producer waits for this
+    volatile uint64_t _pad[5];
 };
 static_assert(sizeof(FinCtlBlock) == 64, "FinCtlBlock must own exactly one maintenance block");
 
