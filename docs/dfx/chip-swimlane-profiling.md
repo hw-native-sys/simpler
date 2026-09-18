@@ -357,6 +357,15 @@ Phase records (per Scheduler stream, level >= 3 in raw
 `aicpu_scheduler_phases`—and level >= 4 for
 `aicpu_orchestrator_phases[]`):
 
+On disk, `streams[]` carries only the Schedulers that recorded something — a
+thread that stayed idle is omitted rather than written as an empty stream. In the
+reader's output the list is re-expanded so that **position is the stream's own
+`scheduler_id`**, with the omitted ids left as empty lists. Consumers rely on
+that: `core_to_thread` holds AICPU thread indices, so
+`sched_overhead_analysis.compute_dag_stats_from_deps` and the scene tests index
+`scheduler_records` by those values directly. Keep any new consumer on list
+position, and keep the parallel `scheduler_streams` metadata list aligned to it.
+
 | Field | Meaning |
 | ----- | ------- |
 | `start_time_us` / `end_time_us` | Phase start / end timestamps in microseconds (reader-side cycle→µs conversion) |

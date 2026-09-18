@@ -877,8 +877,12 @@ def test_aicore_scheduler_records_keep_common_shape_and_stream_metadata(tmp_path
     assert data["tasks"][0]["dispatch_time_us"] == pytest.approx(0.025)
     assert data["tasks"][0]["finish_time_us"] == pytest.approx(0.095)
     assert data["scheduler_streams"][0]["producer"] == "aicore"
-    assert data["scheduler_records"][0][0]["claim_retries"] == 2
-    assert data["scheduler_records"][0][1]["task_id"] is None
+    # The stream declares scheduler_id 2, so it occupies slot 2 and the two
+    # unreported ids below it stay empty — list position is the scheduler index.
+    assert [bool(records) for records in data["scheduler_records"]] == [False, False, True]
+    assert data["scheduler_streams"][2]["producer"] == "aicore"
+    assert data["scheduler_records"][2][0]["claim_retries"] == 2
+    assert data["scheduler_records"][2][1]["task_id"] is None
     assert data["aicpu_lifecycle_records"][0]["register_release_start_time_us"] == pytest.approx(0.007)
 
     trace_path = tmp_path / "merged_swimlane.json"
@@ -1086,6 +1090,77 @@ def test_scheduler_tasks_reject_ambiguous_legacy_stream(tmp_path):
 
     with pytest.raises(ValueError, match="both scheduler_tasks and legacy aicpu_tasks"):
         sc.read_perf_data(raw)
+
+
+def _sched_stream(scheduler_id, *, start_cycles, kind="complete", tasks_processed=1, producer="aicpu"):
+    return {
+        "platform": "a5",
+        "runtime": "tensormap_and_ringbuffer",
+        "producer": producer,
+        "scheduler_id": scheduler_id,
+        "worker_id": scheduler_id,
+        "core_type": "aicpu",
+        "physical_core_id": None,
+        "capture": {"committed": 1, "dropped": 0, "truncated": False},
+        "records": [
+            {
+                "start_cycles": start_cycles,
+                "end_cycles": start_cycles + 10,
+                "loop_iter": 1,
+                "kind": kind,
+                "tasks_processed": tasks_processed,
+                "task_id": None,
+            }
+        ],
+        "metrics": [],
+    }
+
+
+def test_sparse_scheduler_streams_keep_their_own_ids_as_list_positions(tmp_path):
+    """A stream that recorded nothing is omitted by the writer; the remaining
+    streams must still land at the index their own ``scheduler_id`` names.
+
+    Consumers treat the position in ``scheduler_records`` as the scheduler
+    thread index and join it against ``core_to_thread``, whose values are AICPU
+    thread indices. Appending the retained streams densely renumbers them, so a
+    run where thread 0 stayed idle charges every later thread's work to the
+    wrong index.
+    """
+    raw = tmp_path / "chip_swimlane_records.json"
+    raw.write_text(
+        json.dumps(
+            {
+                "chip_swimlane_level": 3,
+                "metadata": {"clock_freq_hz": 1_000_000_000, "num_cores": 1, "core_types": ["aiv"]},
+                "scheduler_records": {
+                    "schema_version": 1,
+                    # Thread 0 recorded nothing, so the writer skipped it.
+                    "streams": [
+                        _sched_stream(1, start_cycles=100),
+                        _sched_stream(2, start_cycles=200),
+                        _sched_stream(3, start_cycles=300),
+                    ],
+                },
+            }
+        )
+    )
+
+    data = sc.read_perf_data(raw)
+
+    phases = data["scheduler_records"]
+    assert len(phases) == 4, f"expected slots 0..3, got {len(phases)}"
+    assert phases[0] == [], "the omitted idle thread must stay an empty slot, not be dropped"
+    # Record times are rebased on the run origin, so assert the ordering the
+    # three cycle stamps imply rather than absolute values.
+    starts = [phases[index][0]["start_time_us"] for index in (1, 2, 3)]
+    assert starts == sorted(starts) and len(set(starts)) == 3, f"streams landed out of order: {starts}"
+    assert data["aicpu_scheduler_phases"] is phases
+
+    # The parallel metadata list is indexed by the same position, so it has to
+    # be padded in lockstep or lane naming drifts against the records.
+    streams = data["scheduler_streams"]
+    assert len(streams) == len(phases)
+    assert [stream.get("scheduler_id") for stream in streams] == [0, 1, 2, 3]
 
 
 def test_scheduler_records_reject_schema_drift(tmp_path):

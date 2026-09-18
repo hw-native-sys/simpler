@@ -349,7 +349,9 @@ def print_aicore_scheduler_phase_breakdown(data):
         print("=" * 90)
         return
 
-    print(f"  Scheduler streams: {len(scheduler_records)}")
+    # A scheduler that recorded nothing occupies its own slot so list position
+    # stays the scheduler id, so count the populated ones rather than the slots.
+    print(f"  Scheduler streams: {sum(1 for records in scheduler_records if records)}")
     print("  Phase time is summed over AICore scheduler streams and can exceed wall-clock time.")
     print()
     for kind in sorted(totals):

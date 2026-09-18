@@ -235,6 +235,60 @@ def _collect_graph_execution_instances(tasks, scheduler_phases):  # noqa: PLR091
     return instances
 
 
+# A scheduler thread index has to fit the runtime's `int8_t core_to_thread[]`,
+# and an AICore scheduler index is bounded by the cluster capacity, so no real
+# producer emits an id anywhere near this. It exists only so a corrupt artifact
+# cannot turn one large id into a multi-gigabyte list.
+_MAX_SCHEDULER_ID = 256
+
+
+def _place_streams_by_scheduler_id(streams_records, streams_metadata):
+    """Return the stream lists re-indexed so each stream sits at its own
+    ``scheduler_id``, with the omitted ids left as empty slots.
+
+    The position in these lists *is* the scheduler thread index to every
+    consumer: `sched_overhead_analysis.compute_dag_stats_from_deps` keys its
+    per-thread accumulators on the values in ``core_to_thread`` (which the AICPU
+    fills with its own thread indices), and the scene tests compare list
+    positions against the same table. The writer omits a stream that recorded
+    nothing, so appending the survivors in encounter order would renumber every
+    stream above the gap and charge their work to a thread that does not exist.
+
+    Falls back to the encounter order when any id is missing, negative, out of
+    range, or repeated — the invariant cannot be restored from those, and
+    keeping the previous shape beats raising on an artifact that is merely odd.
+    """
+    ids = [metadata.get("scheduler_id") for metadata in streams_metadata]
+    if not all(isinstance(sid, int) and not isinstance(sid, bool) and 0 <= sid < _MAX_SCHEDULER_ID for sid in ids):
+        return streams_records, streams_metadata
+    if len(set(ids)) != len(ids):
+        return streams_records, streams_metadata
+
+    # Every real producer shares one producer per artifact, so a gap inherits it
+    # and keeps lane naming consistent with the streams around it.
+    producers = {metadata.get("producer") for metadata in streams_metadata if metadata.get("producer")}
+    gap_producer = producers.pop() if len(producers) == 1 else None
+
+    placed_records = [[] for _ in range(max(ids) + 1)] if ids else []
+    placed_metadata = [
+        {
+            "platform": None,
+            "runtime": None,
+            "producer": gap_producer,
+            "scheduler_id": index,
+            "worker_id": index,
+            "core_type": None,
+            "physical_core_id": None,
+            "capture": None,
+        }
+        for index in range(len(placed_records))
+    ]
+    for sid, records, metadata in zip(ids, streams_records, streams_metadata):
+        placed_records[sid] = records
+        placed_metadata[sid] = metadata
+    return placed_records, placed_metadata
+
+
 def read_perf_data(filepath, *, timeline_origin_ns=None, placement=None):
     """Read and decode performance data from a swimlane JSON file."""
     with open(filepath) as file:
@@ -419,6 +473,9 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
                     )
                 }
             )
+        sched_phases_raw, scheduler_stream_metadata = _place_streams_by_scheduler_id(
+            sched_phases_raw, scheduler_stream_metadata
+        )
     else:
         sched_phases_raw = data.get("aicpu_scheduler_phases") or []
         scheduler_stream_metadata = [

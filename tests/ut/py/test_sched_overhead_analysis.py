@@ -8,8 +8,10 @@
 # -----------------------------------------------------------------------------------------------------------
 """Tests for sched_overhead_analysis: overhead model, aicore switch, Head/Tail OH."""
 
+import json
 import os
 
+from simpler_setup.tools import swimlane_converter as sc
 from simpler_setup.tools.sched_overhead_analysis import (
     _scheduler_phases_for_report,
     _summarize_scheduler_loops,
@@ -17,6 +19,7 @@ from simpler_setup.tools.sched_overhead_analysis import (
     auto_select_chip_swimlane_records_json,
     build_task_graph,
     compute_critical_path,
+    compute_dag_stats_from_deps,
     compute_head_tail,
     compute_overhead,
     parse_scheduler_from_json_phases,
@@ -530,3 +533,71 @@ def test_auto_select_reaches_both_the_l2_and_the_l3_capture_depths(tmp_path, mon
 
     os.utime(l2_records, (3_000, 3_000))
     assert auto_select_chip_swimlane_records_json() == l2_records
+
+
+def test_dag_stats_reach_a_thread_whose_stream_was_not_the_first_recorded(tmp_path):
+    """#2237: DAG stats must survive a run whose lowest scheduler thread idled.
+
+    The observed symptom is `Fanout edges mismatch: printed=0, oracle=6` — every
+    edge silently unattributed. It takes all three artifacts disagreeing at
+    once: the writer omits the stream that recorded nothing, the decoder places
+    the survivors by list position, and this function keys `threads` on the
+    values in `core_to_thread`, which are true AICPU thread indices.
+    """
+    records = tmp_path / "chip_swimlane_records.json"
+    records.write_text(
+        json.dumps(
+            {
+                "chip_swimlane_level": 3,
+                "metadata": {
+                    "clock_freq_hz": 1_000_000_000,
+                    "num_cores": 2,
+                    "core_types": ["aiv", "aiv"],
+                    # Both cores belong to scheduler thread 1, so thread 0 owns
+                    # none and records no phases this run.
+                    "core_to_thread": [1, 1],
+                },
+                "aicore_tasks": [[0, 7, 7, 120, 180, 10], [1, 8, 8, 130, 190, 10]],
+                "scheduler_tasks": {
+                    "schema_version": 1,
+                    "producer": "aicpu",
+                    "records": [[0, 7, 115, 185], [1, 8, 125, 195]],
+                },
+                "scheduler_records": {
+                    "schema_version": 1,
+                    "streams": [
+                        {
+                            "platform": "a5",
+                            "runtime": "tensormap_and_ringbuffer",
+                            "producer": "aicpu",
+                            "scheduler_id": 1,
+                            "worker_id": 1,
+                            "core_type": "aicpu",
+                            "physical_core_id": None,
+                            "capture": {"committed": 1, "dropped": 0, "truncated": False},
+                            "records": [
+                                {
+                                    "start_cycles": 100,
+                                    "end_cycles": 200,
+                                    "loop_iter": 4,
+                                    "kind": "complete",
+                                    "tasks_processed": 2,
+                                    "task_id": None,
+                                }
+                            ],
+                            "metrics": [],
+                        }
+                    ],
+                },
+            }
+        )
+    )
+    deps = {"edges": [{"pred": 7, "succ": 8}]}
+
+    data = sc.read_perf_data(records)
+    threads = parse_scheduler_from_json_phases(data)
+    compute_dag_stats_from_deps(deps, data, threads)
+
+    assert set(threads) == {1}, f"the recorded stream is thread 1, not a renumbered 0: {sorted(threads)}"
+    assert threads[1]["fanout_edges"] == 1, "the edge was charged to a thread index that does not exist"
+    assert threads[1]["fanin_edges"] == 1
