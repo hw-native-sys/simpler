@@ -24,6 +24,7 @@
 #include <runtime/rt.h>
 #include <acl/acl.h>
 #include <dlfcn.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cassert>
@@ -702,6 +703,11 @@ int DeviceRunnerBase::ensure_device_initialized() {
     if (rc != 0) {
         return rc;
     }
+
+    // The point this runner is bound to a device is the point it wants to hear
+    // about that device's faults. A failed install is not fatal: the callback
+    // is a reporting channel today, and nothing decides a run from it.
+    (void)acquire_device_fault_monitor();
 
     bool aicpu_created_here = false;
     bool aicore_created_here = false;
@@ -1822,6 +1828,11 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     if (abandon_device_resources) {
         LOG_WARN("Fatal teardown: force reset/quarantine finished; skipping per-resource RTS destroy/free calls");
     }
+    // Anything this device reported and nobody has read yet is reported now:
+    // after this the runner stops looking, and a notification that arrived
+    // during teardown is the one most worth having in the log.
+    (void)report_new_device_fault_notices();
+    release_device_fault_monitor();
     // Completion-boundary events are released ahead of the streams they were
     // recorded on: no run is left to wait on them here, and a destroyed stream
     // cannot be the thing that proves a surviving event safe to drop.
@@ -2561,6 +2572,95 @@ void DeviceRunnerBase::retire_run_fence(const PreparedExecution &prepared) noexc
             prepared.pipeline_slot
         );
     }
+}
+
+DeviceFaultMonitor *DeviceRunnerBase::fault_monitor_if_held() noexcept {
+    if (!fault_monitor_held_) return nullptr;
+    if (fault_monitor_pid_ != static_cast<long>(getpid())) {
+        // Inherited across a fork. The reference belongs to the parent, and the
+        // monitor has already reset itself for this process, so both the hold
+        // and the read position are meaningless here: dropping them is what
+        // stops this runner from releasing a reference it never took, and from
+        // reading a stream that now starts behind its cursor.
+        fault_monitor_held_ = false;
+        fault_monitor_pid_ = -1;
+        fault_notices_ = DeviceFaultNoticeCursor{};
+        return nullptr;
+    }
+    return device_fault_monitor();
+}
+
+int DeviceRunnerBase::acquire_device_fault_monitor() {
+    if (fault_monitor_if_held() != nullptr) return 0;
+    DeviceFaultMonitor *monitor = device_fault_monitor();
+    if (monitor == nullptr) {
+        // Nobody bound the process's monitor into this module — a host runtime
+        // opened directly rather than through a loader. There is nothing to
+        // listen on, and nothing depends on this channel.
+        return 0;
+    }
+    const int rc = monitor->acquire();
+    if (rc != 0) {
+        LOG_WARN("device fault monitor: could not install the process callback: %d", rc);
+        return rc;
+    }
+    fault_monitor_held_ = true;
+    fault_monitor_pid_ = static_cast<long>(getpid());
+    // Whatever this process reported before this runner existed is not this
+    // runner's to report, so start from where the stream already stands.
+    fault_notices_.skip_to_current(*monitor);
+    return 0;
+}
+
+void DeviceRunnerBase::release_device_fault_monitor() noexcept {
+    DeviceFaultMonitor *monitor = fault_monitor_if_held();
+    if (monitor == nullptr) return;
+    fault_monitor_held_ = false;
+    fault_monitor_pid_ = -1;
+    monitor->release();
+}
+
+int DeviceRunnerBase::reinstall_device_fault_monitor_after_reset() noexcept {
+    DeviceFaultMonitor *monitor = fault_monitor_if_held();
+    if (monitor == nullptr) return 0;
+    const int rc = monitor->reinstall_after_device_reset();
+    if (rc != 0) {
+        LOG_WARN("device fault monitor: re-install after device reset failed: %d", rc);
+    }
+    return rc;
+}
+
+uint64_t DeviceRunnerBase::report_new_device_fault_notices() noexcept {
+    DeviceFaultMonitor *monitor = fault_monitor_if_held();
+    if (monitor == nullptr) return 0;
+    const DeviceFaultNoticeCursor::Progress progress =
+        fault_notices_.consume(*monitor, [](const DeviceFaultNotice &notice) {
+            // A device-level fact: the notification carries no run, slot or
+            // generation, so this says which device and which stream faulted
+            // and stops there.
+            LOG_ERROR(
+                "device fault reported: device_id=%u stream_id=%u task_id=%u error_code=%u thread_id=%u "
+                "(device-level; not attributed to any run)",
+                notice.device_id, notice.stream_id, notice.task_id, notice.error_code, notice.thread_id
+            );
+        });
+    // Both counts below are process-wide and deliberately not attributed to
+    // this runner's device: several devices can report into one process, and
+    // the ring reserves no share per device.
+    if (progress.lost != 0) {
+        LOG_ERROR(
+            "device fault notices lost before the host read them: %llu overwritten in this process (ring holds %llu)",
+            static_cast<unsigned long long>(progress.lost),
+            static_cast<unsigned long long>(DeviceFaultMonitor::retained_notices())
+        );
+    }
+    if (progress.newly_dropped != 0) {
+        LOG_ERROR(
+            "device fault notices dropped by the driver-thread reporter: %llu in this process",
+            static_cast<unsigned long long>(progress.newly_dropped)
+        );
+    }
+    return progress.delivered;
 }
 
 void DeviceRunnerBase::read_device_wall_ns(uint32_t pipeline_slot) {

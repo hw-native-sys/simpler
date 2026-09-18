@@ -48,6 +48,7 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/profiling_copy.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime_c_api.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/platform_compile_info.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/device_fault_monitor_binding.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/chip_swimlane_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/host_phase_records.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/clock_correlation.cpp"

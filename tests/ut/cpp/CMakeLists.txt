@@ -227,6 +227,11 @@ add_library(hierarchical_objs OBJECT
     ${HIERARCHICAL_SRC_DIR}/worker.cpp
     ${WORKER_SRC_DIR}/chip_run_lane.cpp
     ${WORKER_SRC_DIR}/chip_worker.cpp
+    # ChipWorker binds the process's device-fault monitor into every host
+    # runtime it loads, so the owner that defines it comes along. In production
+    # this pair is exactly the same: both are compiled into the module the
+    # interpreter never unloads.
+    ${WORKER_SRC_DIR}/device_fault_monitor_host.cpp
     # ChipWorker owns the process log state in production through the binding
     # DSO. These tests link ChipWorker directly, so provide the same logger
     # implementation while retaining their custom host-span capture adapter.
@@ -456,7 +461,14 @@ add_hierarchical_test(test_pipeline_contract hierarchical/test_pipeline_contract
 
 # Exercise ChipWorker's actual dlopen/dlsym admission before a sentinel factory,
 # then the four built sim runtimes through the unchanged public kernel ABI.
-add_library(pipeline_contract_runtime SHARED stubs/pipeline_contract_runtime.cpp)
+# The production binding TU comes along because this library stands in for a
+# host runtime, and ChipWorker binds the process's device-fault monitor into
+# every host runtime it loads. Binding is mandatory, so a stand-in that did
+# not export the binder would be rejected exactly as a stale build is.
+add_library(pipeline_contract_runtime SHARED
+    stubs/pipeline_contract_runtime.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/device_fault_monitor_binding.cpp
+)
 target_include_directories(pipeline_contract_runtime PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/common
     ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
@@ -669,6 +681,42 @@ target_include_directories(test_runtime_orch_so PRIVATE
 add_common_utils_test(test_device_arena common/test_device_arena.cpp)
 add_common_utils_test(test_retained_temp_bump common/test_retained_temp_bump.cpp)
 add_common_utils_test(test_thread_completion_gate common/test_thread_completion_gate.cpp)
+add_common_utils_test(test_device_fault_monitor common/test_device_fault_monitor.cpp)
+
+# Two loadable stand-ins for a host runtime, built from one source under two
+# names so the test can hold two distinct RTLD_LOCAL images at once. Each
+# compiles the production binding translation unit.
+foreach(client_suffix a b)
+    add_library(test_device_fault_client_${client_suffix} SHARED
+        common/test_device_fault_client.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/device_fault_monitor_binding.cpp
+    )
+    target_include_directories(test_device_fault_client_${client_suffix} PRIVATE
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common
+    )
+    target_link_libraries(test_device_fault_client_${client_suffix} PRIVATE pthread)
+endforeach()
+
+add_executable(test_device_fault_cross_dso common/test_device_fault_cross_dso.cpp)
+target_compile_definitions(test_device_fault_cross_dso PRIVATE
+    TEST_DEVICE_FAULT_CLIENT_A_PATH="$<TARGET_FILE:test_device_fault_client_a>"
+    TEST_DEVICE_FAULT_CLIENT_B_PATH="$<TARGET_FILE:test_device_fault_client_b>"
+)
+target_include_directories(test_device_fault_cross_dso PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+)
+target_link_libraries(test_device_fault_cross_dso PRIVATE
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    ${CMAKE_DL_LIBS}
+    pthread
+)
+add_dependencies(test_device_fault_cross_dso test_device_fault_client_a test_device_fault_client_b)
+add_test(NAME test_device_fault_cross_dso COMMAND test_device_fault_cross_dso)
+set_tests_properties(test_device_fault_cross_dso PROPERTIES LABELS "no_hardware")
 add_common_utils_test(test_fatal_shutdown_latch common/test_fatal_shutdown_latch.cpp)
 add_common_utils_test(test_buffer_pool_manager common/test_buffer_pool_manager.cpp)
 target_sources(test_buffer_pool_manager PRIVATE

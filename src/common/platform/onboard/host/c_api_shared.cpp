@@ -1244,6 +1244,10 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
             if (launched) {
                 state->runner->read_device_run_result(state->descriptor.pipeline_slot, state->descriptor.run_epoch);
                 report_terminal_disagreement(state, execution_rc);
+                // Separate axis, reported separately: a notification names a
+                // device and a faulting stream and carries no run identity, so
+                // it is never folded into this run's outcome.
+                (void)state->runner->report_new_device_fault_notices();
             }
             {
                 STRACE("chip.run.validate");

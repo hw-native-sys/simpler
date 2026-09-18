@@ -213,6 +213,11 @@ def kernel_symbol_runtime(tmp_path_factory):
             "static ContextLeakCheck context_leak_check;\n"
             "struct SimplerHostLogState;\n"
             'extern "C" int simpler_host_log_bind_state(SimplerHostLogState *) { return 0; }\n'
+            # ChipWorker binds the process's device-fault monitor into every
+            # host runtime it loads, and does so strictly: a module that does
+            # not export the setter is a stale build, not an opt-out. This stub
+            # accepts the pointer and ignores it, as it does the log state.
+            'extern "C" void simpler_bind_device_fault_monitor(void *) {}\n'
             "DeviceContextHandle create_device_context() { ++live_contexts; return new uint64_t{0}; }\n"
             "void destroy_device_context(DeviceContextHandle ctx) {\n"
             "    --live_contexts; delete static_cast<uint64_t *>(ctx);\n"

@@ -13,6 +13,7 @@
 
 #include "chip_run_lane.h"
 #include "common/host_log_binding.h"
+#include "device_fault_monitor_host.h"
 #include "host_log.h"
 #include "pipeline_contract.h"
 
@@ -74,6 +75,26 @@ void bind_host_log_state(void *handle, const char *module_name) {
     if (simpler::log::bind_loaded_host_log_state(handle, HostLogger::get_instance().state(), &error) != 0) {
         throw std::runtime_error(
             std::string(module_name) + " failed to bind host-log state: " + (error != nullptr ? error : "unknown error")
+        );
+    }
+}
+
+/**
+ * Hand the loaded module the process's device-fault monitor.
+ *
+ * The monitor and the trampoline the driver retains live in this module, which
+ * the interpreter never unloads; a host runtime is opened `RTLD_LOCAL` and
+ * `dlclose`d, so it can only hold a pointer. Binding is mandatory rather than
+ * best-effort for the same reason the host-log binding is: every module built
+ * from this source tree exports the setter, so a missing one means a stale
+ * build, and a silently unbound runtime would report no device fault at all.
+ */
+void bind_device_fault_monitor(void *handle, const char *module_name) {
+    const char *error = nullptr;
+    if (bind_loaded_device_fault_monitor(handle, &error) != 0) {
+        throw std::runtime_error(
+            std::string(module_name) +
+            " failed to bind the device-fault monitor: " + (error != nullptr ? error : "unknown error")
         );
     }
 }
@@ -208,6 +229,7 @@ void ChipWorker::init(
     }
     DlHandleGuard host_guard(handle);
     bind_host_log_state(handle, "host runtime");
+    bind_device_fault_monitor(handle, "host runtime");
 
     GetPipelineContractFn get_pipeline_contract_fn = nullptr;
     KernelSupportedFn kernel_supported_fn = nullptr;

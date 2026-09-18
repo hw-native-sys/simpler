@@ -66,6 +66,7 @@
 #include "device_runner_helpers.h"
 #include "aicpu_loader/host/load_aicpu_op.h"
 #include "host/chip_swimlane_collector.h"
+#include "host/device_fault_monitor.h"
 #include "host/dfx_run_config.h"
 #include "host/execution_mode_latch.h"
 #include "host/host_phase_records.h"
@@ -569,6 +570,18 @@ public:
      * run's completion boundaries and its outstanding wait references.
      */
     DeviceRunTerminal device_run_terminal(uint32_t pipeline_slot, uint64_t run_epoch) const;
+
+    /**
+     * Log every notification reported since this runner last looked, and
+     * return how many there were.
+     *
+     * Reporting only, and deliberately not per-run: a notification names a
+     * device and a faulting stream, and on the measured silicon its task id is
+     * always 0, while a pipelined pair shares one stream pair. So this says
+     * "this device reported a fault" and never "this run failed" — a run's own
+     * verdict comes from the record its device side published.
+     */
+    uint64_t report_new_device_fault_notices() noexcept;
 
     /**
      * Per-slot task-timing dispatch/finish (ns) on the same device-clock timeline
@@ -1297,6 +1310,24 @@ protected:
     void retire_run_fence(const PreparedExecution &prepared) noexcept;
 
     /**
+     * Take this runner's reference on the process's exception-notification
+     * callback, once. Idempotent: the slot is process-global and refcounted
+     * elsewhere, so a runner holds at most one reference no matter how often
+     * its device bring-up runs.
+     */
+    int acquire_device_fault_monitor();
+
+    /** Drop it. A no-op for a runner that never took one. */
+    void release_device_fault_monitor() noexcept;
+
+    /**
+     * Re-register the callback after a confirmed device reset. Whether a
+     * registration survives a force reset is unmeasured, so this re-registers
+     * rather than assuming either answer; registering twice is harmless.
+     */
+    int reinstall_device_fault_monitor_after_reset() noexcept;
+
+    /**
      * Read and reduce this slot's device-phase/task-timing records after stream
      * sync, into that slot's `DeviceRunTiming`. A D2H failure is a soft warning
      * and leaves the record zeroed, as do a capture-disabled run, a missing
@@ -1734,6 +1765,30 @@ protected:
     // pointer because the fence is non-copyable, so the array cannot be
     // brace-initialised without naming every slot.
     std::array<std::unique_ptr<RunCompletionFence>, PTO_PIPELINE_MAX_DEPTH> run_fences_;
+
+    // Whether this runner holds a reference on the process's fault-notification
+    // callback, which process took it, and where this runner has read up to.
+    // The read position is per runner rather than per run because the
+    // notification carries nothing that could place it on a run.
+    //
+    // The pid is what a fork makes necessary. The monitor resets itself in the
+    // child, so a runner that carried an inherited `held` across the fork would
+    // never reacquire — no callback installed for the child, and a read
+    // position sitting past the child's freshly zeroed stream, which reports
+    // nothing for the rest of that process's life. Every entry point therefore
+    // goes through `fault_monitor_if_held()`.
+    bool fault_monitor_held_{false};
+    long fault_monitor_pid_{-1};
+    DeviceFaultNoticeCursor fault_notices_;
+
+    /**
+     * The process monitor this runner holds a reference on, or `nullptr`.
+     *
+     * Answers `nullptr` for a reference inherited across a fork, and drops the
+     * inherited bookkeeping on the way out so the next `acquire` takes a real
+     * reference for this process.
+     */
+    DeviceFaultMonitor *fault_monitor_if_held() noexcept;
 
 public:
     /** The persistent device blocks belonging to one pipeline slot. */
