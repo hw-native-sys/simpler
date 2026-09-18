@@ -89,9 +89,15 @@ class KernelCompiler:
     - compile_incore(): Compile a kernel source file for AICore/AIVector
     - compile_orchestration(): Compile an orchestration function for a given runtime
 
-    Toolchain selection is determined by C++ via get_incore_compiler() and
-    get_orchestration_compiler() (defined in runtime_compile_info.cpp).
-    Falls back to platform-based logic if the library is not yet loaded.
+    Toolchain selection happens here, not in C++. `_orchestration_toolchain()`
+    picks by runtime name — host_build_graph always compiles host-side, while
+    tensormap_and_ringbuffer cross-compiles for the AICPU unless the platform is
+    a sim — and `compile_incore()` picks by platform. The `get_incore_compiler()`
+    / `get_orchestration_compiler()` functions in the three
+    runtime_compile_info.cpp files (a2a3 and a5 host_build_graph, which are
+    identical, plus common/tensormap_and_ringbuffer, which draws the same
+    host-vs-AICPU line this method does) describe the same intent but have no
+    caller; nothing reads them over ctypes or from C++.
 
     Available toolchains:
     - CCEC: ccec compiler for AICore kernels (real hardware)

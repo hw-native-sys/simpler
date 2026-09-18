@@ -20,8 +20,7 @@ ToolchainType get_incore_compiler(void) {
 }
 
 ToolchainType get_orchestration_compiler(void) {
-    // tensormap_and_ringbuffer: a2a3 needs aarch64 cross-compile (AICPU is aarch64)
-    if (strcmp(get_platform(), "a2a3") == 0) return TOOLCHAIN_AARCH64_GXX;
+    // host_build_graph: always host g++ (orchestration runs on host)
     return TOOLCHAIN_HOST_GXX;
 }
 }
