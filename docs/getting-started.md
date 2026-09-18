@@ -84,7 +84,8 @@ your kernels use PTO ISA intrinsics.
 
 ## Prerequisites
 
-- CMake 3.15+
+- CMake 3.20+ — the onboard AICore compiles consume the compiler's depfile, and
+  `DEPFILE` on the Makefile generators this project configures with needs 3.20
 - CANN toolkit with:
   - `ccec` compiler (AICore Bisheng CCE)
   - Cross-compiler for AICPU (aarch64-target-linux-gnu-gcc/g++)
@@ -108,7 +109,7 @@ All workflows assume an activated project-local venv (see [`.claude/rules/venv-i
 python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
 pip install --no-build-isolation \
-  'scikit-build-core>=0.10.0' 'nanobind>=2.0.0,<3' 'cmake>=3.15' 'ninja>=1.11' 'pytest>=6.0' 'torch>=2.3'
+  'scikit-build-core>=0.10.0' 'nanobind>=2.0.0,<3' 'cmake>=3.20' 'ninja>=1.11' 'pytest>=6.0' 'torch>=2.3'
 pip install --no-build-isolation -e .
 ```
 

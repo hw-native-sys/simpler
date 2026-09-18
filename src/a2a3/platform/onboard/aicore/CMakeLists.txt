@@ -9,7 +9,10 @@
 # Build AICore kernel using kernel.cpp + common folder + custom includes and sources (for `Task`)
 # BISHENG_CC and BISHENG_LD are set when calling cmake
 # CUSTOM_INCLUDE_DIRS and CUSTOM_SOURCE_DIRS are set when calling cmake
-cmake_minimum_required(VERSION 3.16.3)
+# The per-source compiles below are add_custom_command, so their header
+# dependencies come from ccec's own depfile. DEPFILE on the Makefile generators
+# this project configures with requires CMake 3.20.
+cmake_minimum_required(VERSION 3.20)
 
 # Build complete include list
 set(CMAKE_CUSTOM_INCLUDE_DIRS "")
@@ -36,7 +39,7 @@ endif()
 set(ALL_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/kernel.cpp")
 if(DEFINED CUSTOM_SOURCE_DIRS)
     foreach(SRC_DIR ${CUSTOM_SOURCE_DIRS})
-        file(GLOB_RECURSE DIR_SOURCES "${SRC_DIR}/*.cpp" "${SRC_DIR}/*.c")
+        file(GLOB_RECURSE DIR_SOURCES CONFIGURE_DEPENDS "${SRC_DIR}/*.cpp" "${SRC_DIR}/*.c")
         list(APPEND ALL_SOURCES ${DIR_SOURCES})
     endforeach()
 else()
@@ -80,12 +83,17 @@ foreach(SRC_FILE ${ALL_SOURCES})
     list(APPEND ALL_AIC_OBJECTS ${OBJ_AIC})
     list(APPEND ALL_AIV_OBJECTS ${OBJ_AIV})
 
-    # Compile for AIC architecture
+    # Each object's header set is whatever ccec reports it read. DEPENDS on the
+    # source alone would leave the object stale after a header-only edit, and
+    # the build would report success — so an A/B that changes a platform header
+    # would run one binary in both arms.
     add_custom_command(
         OUTPUT ${OBJ_AIC}
         COMMAND ${BISHENG_CC} ${AICORE_FLAGS} ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS} --cce-aicore-arch=dav-c220-cube
+                -MD -MF ${OBJ_AIC}.d -MT ${OBJ_AIC}
                 -o ${OBJ_AIC} ${SRC_FILE}
         DEPENDS ${SRC_FILE}
+        DEPFILE ${OBJ_AIC}.d
         COMMENT "Compiling ${SRC_NAME} for AIC"
     )
 
@@ -93,8 +101,10 @@ foreach(SRC_FILE ${ALL_SOURCES})
     add_custom_command(
         OUTPUT ${OBJ_AIV}
         COMMAND ${BISHENG_CC} ${AICORE_FLAGS} ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS} --cce-aicore-arch=dav-c220-vec
+                -MD -MF ${OBJ_AIV}.d -MT ${OBJ_AIV}
                 -o ${OBJ_AIV} ${SRC_FILE}
         DEPENDS ${SRC_FILE}
+        DEPFILE ${OBJ_AIV}.d
         COMMENT "Compiling ${SRC_NAME} for AIV"
     )
 endforeach()
@@ -145,8 +155,10 @@ if(DEFINED PTO_ISA_ROOT AND EXISTS ${SDMA_WARMUP_SRC})
         COMMAND ${BISHENG_CC} ${AICORE_FLAGS} ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS}
                 -I${PTO_ISA_ROOT}/include -I${PTO_ISA_ROOT}/include/pto
                 --cce-aicore-arch=dav-c220-vec
+                -MD -MF ${SDMA_WARMUP_OBJ_AIV}.d -MT ${SDMA_WARMUP_OBJ_AIV}
                 -o ${SDMA_WARMUP_OBJ_AIV} ${SDMA_WARMUP_SRC}
         DEPENDS ${SDMA_WARMUP_SRC}
+        DEPFILE ${SDMA_WARMUP_OBJ_AIV}.d
         COMMENT "Compiling sdma_warmup_kernel for AIV"
     )
 

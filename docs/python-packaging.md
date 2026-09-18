@@ -133,7 +133,7 @@ For developers who don't want to use pip at all:
 
 ```bash
 . .venv/bin/activate
-pip install 'scikit-build-core>=0.10.0' 'nanobind>=2.0.0,<3' 'cmake>=3.15' 'ninja>=1.11' 'pytest>=6.0' 'torch>=2.3'  # one-time
+pip install 'scikit-build-core>=0.10.0' 'nanobind>=2.0.0,<3' 'cmake>=3.20' 'ninja>=1.11' 'pytest>=6.0' 'torch>=2.3'  # one-time
 cmake -S . -B build/cmake_only -Dnanobind_DIR=$(python -c 'import nanobind; print(nanobind.cmake_dir())')
 cmake --build build/cmake_only
 export PYTHONPATH=$(pwd):$(pwd)/python
@@ -168,7 +168,7 @@ Any change that touches:
 ```bash
 # Locally — same script CI runs.
 source .venv/bin/activate
-pip install 'scikit-build-core>=0.10.0' 'nanobind>=2.0.0,<3' 'cmake>=3.15' 'ninja>=1.11' 'pytest>=6.0' 'torch>=2.3'  # one-time
+pip install 'scikit-build-core>=0.10.0' 'nanobind>=2.0.0,<3' 'cmake>=3.20' 'ninja>=1.11' 'pytest>=6.0' 'torch>=2.3'  # one-time
 bash tools/verify_packaging.sh
 ```
 
