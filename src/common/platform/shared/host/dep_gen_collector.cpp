@@ -177,10 +177,10 @@ void DepGenCollector::begin_run() {
     wmb();
     // Narrow write-backs, not the region: a bulk push would clobber the
     // device-owned fields next to these (current_buf_ptr, free_queue.head).
-    (void)manager_.write_range_to_device(&state->total_record_count, sizeof(state->total_record_count));
-    (void)manager_.write_range_to_device(&state->dropped_record_count, sizeof(state->dropped_record_count));
-    (void)manager_.write_range_to_device(
-        &state->total_overflow_record_count, sizeof(state->total_overflow_record_count)
+    publish_field(&state->total_record_count, sizeof(state->total_record_count), "total_record_count");
+    publish_field(&state->dropped_record_count, sizeof(state->dropped_record_count), "dropped_record_count");
+    publish_field(
+        &state->total_overflow_record_count, sizeof(state->total_overflow_record_count), "total_overflow_record_count"
     );
 }
 

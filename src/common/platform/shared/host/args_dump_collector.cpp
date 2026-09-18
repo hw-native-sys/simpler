@@ -81,7 +81,7 @@ void ArgsDumpCollector::begin_run(const std::string &output_prefix, DumpArgsLeve
         DumpDataHeader *header = get_dump_header(shm_host_);
         header->dump_args_level = static_cast<uint32_t>(dump_args_level_);
         wmb();
-        (void)manager_.write_range_to_device(&header->dump_args_level, sizeof(header->dump_args_level));
+        publish_field(&header->dump_args_level, sizeof(header->dump_args_level), "dump_args_level");
 
         // The per-thread payload counters are what reconcile compares against,
         // and nothing on the device resets them. published/completed/dropped are
@@ -105,7 +105,7 @@ void ArgsDumpCollector::begin_run(const std::string &output_prefix, DumpArgsLeve
             state->completed_payload_count = 0;
             state->dropped_record_count = 0;
             wmb();
-            (void)manager_.write_range_to_device(&state->published_payload_count, kCounterSpan);
+            publish_field(&state->published_payload_count, kCounterSpan, "payload counters");
         }
     }
 }

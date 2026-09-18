@@ -940,6 +940,36 @@ public:
     Manager &manager() { return manager_; }
     const Manager &manager() const { return manager_; }
 
+    /**
+     * Push one host-shadow field to its device mirror, naming the subsystem and
+     * the field if the write is rejected.
+     *
+     * `write_range_to_device` rejects a field outside the manager's shm window
+     * and returns non-zero. A caller that discards that result configures
+     * nothing and reports nothing: the device keeps its previous value, and the
+     * only trace is the manager's own log line, which names neither the
+     * subsystem nor what was being published. That is how a base-pointer
+     * disagreement between a collector's `shm_host_` and the manager's copy
+     * reaches a reader as "no records were produced" (#2206).
+     *
+     * Returns false on rejection so a caller that can act on it may; callers
+     * that only need the diagnostic can ignore the result, since the logging has
+     * already happened.
+     *
+     * @param host_field  Address inside the host shm shadow.
+     * @param size        Bytes to publish.
+     * @param what        Field name for the log line.
+     */
+    bool publish_field(const volatile void *host_field, size_t size, const char *what) {
+        if (manager_.write_range_to_device(host_field, size) != 0) {
+            LOG_ERROR(
+                "%s: failed to publish %s to the device; it keeps its previous value", Module::kSubsystemName, what
+            );
+            return false;
+        }
+        return true;
+    }
+
 protected:
     void bind_manager_memory_context() {
         MemoryOps ops;

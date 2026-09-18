@@ -180,7 +180,7 @@ void ScopeStatsCollector::begin_run() {
             offsetof(ScopeStatsBufferState, dropped_record_count) + sizeof(uint32_t),
         "the two counters must stay adjacent for this single write-back to cover both"
     );
-    (void)manager_.write_range_to_device(&state->dropped_record_count, 2 * sizeof(uint32_t));
+    publish_field(&state->dropped_record_count, 2 * sizeof(uint32_t), "record counters");
 }
 
 void ScopeStatsCollector::append_buffer_records(const void *buf_host_ptr) {

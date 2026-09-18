@@ -294,7 +294,7 @@ void PmuCollector::begin_run(const std::string &csv_path, PmuEventType event_typ
         PmuDataHeader *hdr = get_pmu_header(shm_host_);
         hdr->event_type = static_cast<uint32_t>(event_type_);
         wmb();
-        (void)manager_.write_range_to_device(&hdr->event_type, sizeof(hdr->event_type));
+        publish_field(&hdr->event_type, sizeof(hdr->event_type), "event_type");
 
         // The per-core record counters are producer-side and never reset by the
         // device, so they carry the previous run's totals into this run's
@@ -316,7 +316,7 @@ void PmuCollector::begin_run(const std::string &csv_path, PmuEventType event_typ
             state->dropped_record_count = 0;
             state->total_record_count = 0;
             wmb();
-            (void)manager_.write_range_to_device(&state->dropped_record_count, 2 * sizeof(uint32_t));
+            publish_field(&state->dropped_record_count, 2 * sizeof(uint32_t), "record counters");
         }
     }
 }

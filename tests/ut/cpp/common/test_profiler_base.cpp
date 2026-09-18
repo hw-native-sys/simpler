@@ -649,3 +649,95 @@ TEST(ProfilerBaseTest, QuiesceIsANoOpWithoutRunningThreads) {
     collector.quiesce();  // after stop()
     EXPECT_EQ(collector.collected(), 0);
 }
+
+// A device-side publication that the manager rejects must say so. Discarding the
+// result -- which every collector call site used to do -- configures nothing and
+// reports nothing: the device keeps its previous value, and the only trace is the
+// manager's own log line, which names neither the subsystem nor the field. That
+// is how a disagreement between a collector's shm pointer and the manager's copy
+// reaches a reader as "no records were produced" (#2206).
+//
+// The manager is configured directly rather than through init(): publish_field
+// consults only the manager, and the shared fixture's init() leaves
+// copy_to_device null, which makes write_range_to_device succeed trivially.
+namespace {
+
+// A window carved out of the middle of a larger object, so the out-of-window
+// addresses these tests hand to publish_field are still inside one allocation.
+// Stepping off `&header` instead would be pointer arithmetic outside the object:
+// undefined, so UBSan flags it and an optimizer may assume it cannot happen --
+// which would quietly delete the very boundary this file is testing.
+struct PublishWindow {
+    static constexpr size_t kPad = 128;
+
+    TestHeader *header() { return reinterpret_cast<TestHeader *>(backing + kPad); }
+    // Inside the backing object, `n` bytes below the window's base.
+    const char *below(size_t n) { return backing + kPad - n; }
+    // Inside the backing object, at the window's first byte past the end.
+    const char *past_end() { return backing + kPad + sizeof(TestHeader); }
+
+    alignas(64) char backing[kPad + sizeof(TestHeader) + kPad] = {};
+};
+
+void bind_publish_window(TestCollector<SingleShardModule> &collector, PublishWindow &window, int *copies) {
+    profiling_common::MemoryOps ops{};
+    ops.alloc = [](size_t size) {
+        return std::malloc(size);
+    };
+    ops.copy_to_device = [copies](void *, const void *, size_t) {
+        ++*copies;
+        return 0;
+    };
+    collector.manager().set_memory_context(
+        std::move(ops), window.header(), window.header(), sizeof(TestHeader), /*device_id=*/0
+    );
+}
+
+}  // namespace
+
+TEST(ProfilerBaseTest, PublishFieldPushesAFieldInsideTheWindow) {
+    PublishWindow window;
+    int copies = 0;
+    TestCollector<SingleShardModule> collector;
+    bind_publish_window(collector, window, &copies);
+
+    TestHeader *header = window.header();
+    EXPECT_TRUE(collector.publish_field(&header->queue_heads[0], sizeof(header->queue_heads[0]), "queue_heads[0]"));
+    EXPECT_EQ(copies, 1);
+}
+
+TEST(ProfilerBaseTest, PublishFieldReportsAFieldBelowTheWindow) {
+    PublishWindow window;
+    int copies = 0;
+    TestCollector<SingleShardModule> collector;
+    bind_publish_window(collector, window, &copies);
+
+    // One cache line below the base: the shape seen in the field, where the
+    // rejected writes sat 64 bytes under the manager's window.
+    EXPECT_FALSE(collector.publish_field(window.below(64), sizeof(uint32_t), "queue_heads[0]"));
+    EXPECT_EQ(copies, 0) << "a rejected field must not reach copy_to_device";
+}
+
+TEST(ProfilerBaseTest, PublishFieldReportsAFieldStraddlingTheWindowEnd) {
+    PublishWindow window;
+    int copies = 0;
+    TestCollector<SingleShardModule> collector;
+    bind_publish_window(collector, window, &copies);
+
+    // Starts inside, runs off the end. Rejected whole rather than truncated: a
+    // partial push would leave the device holding half of a value.
+    EXPECT_FALSE(collector.publish_field(window.past_end() - sizeof(uint32_t), 2 * sizeof(uint32_t), "counters"));
+    EXPECT_EQ(copies, 0);
+}
+
+// A size larger than the whole window must be rejected without the bounds
+// arithmetic wrapping.
+TEST(ProfilerBaseTest, PublishFieldReportsASizeLargerThanTheWindow) {
+    PublishWindow window;
+    int copies = 0;
+    TestCollector<SingleShardModule> collector;
+    bind_publish_window(collector, window, &copies);
+
+    EXPECT_FALSE(collector.publish_field(window.header(), sizeof(TestHeader) + 1, "whole header"));
+    EXPECT_EQ(copies, 0);
+}

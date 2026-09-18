@@ -543,19 +543,24 @@ public:
             return 0;
         }
         if (!ops_.copy_to_device) return 0;
-        const auto *host_base = static_cast<const char *>(shared_mem_host_);
-        const auto *host_field = const_cast<const char *>(static_cast<const volatile char *>(host_field_ptr));
-        if (host_field < host_base || host_field + size > host_base + shm_size_) {
+        // Integer addresses, not pointer arithmetic. Rejecting a field outside
+        // the window is this function's job, so it is handed such a pointer by
+        // design — and forming `field + size` from one, or comparing it against
+        // an unrelated base, is not defined. `size > shm_size_` is checked first
+        // so the subtraction below cannot wrap.
+        const auto base = reinterpret_cast<uintptr_t>(shared_mem_host_);
+        const auto field = reinterpret_cast<uintptr_t>(host_field_ptr);
+        if (field < base || size > shm_size_ || field - base > shm_size_ - size) {
             LOG_ERROR(
                 "BufferPoolManager::write_range_to_device: field [%p, %p) outside shm [%p, %p)",
-                static_cast<const void *>(host_field), static_cast<const void *>(host_field + size),
-                static_cast<const void *>(host_base), static_cast<const void *>(host_base + shm_size_)
+                reinterpret_cast<const void *>(field), reinterpret_cast<const void *>(field + size),
+                reinterpret_cast<const void *>(base), reinterpret_cast<const void *>(base + shm_size_)
             );
             return PTO_RUNTIME_ERR_INTERNAL;
         }
-        size_t offset = static_cast<size_t>(host_field - host_base);
+        size_t offset = static_cast<size_t>(field - base);
         void *dev_field = static_cast<char *>(shared_mem_dev_) + offset;
-        return ops_.copy_to_device(dev_field, host_field, size);
+        return ops_.copy_to_device(dev_field, const_cast<const void *>(host_field_ptr), size);
     }
 
     /**
@@ -578,19 +583,20 @@ public:
             return 0;
         }
         if (!ops_.copy_from_device) return 0;
-        const auto *host_base = static_cast<const char *>(shared_mem_host_);
-        const auto *host_field = const_cast<const char *>(static_cast<volatile char *>(host_field_ptr));
-        if (host_field < host_base || host_field + size > host_base + shm_size_) {
+        // Integer addresses, for the same reason as write_range_to_device above.
+        const auto base = reinterpret_cast<uintptr_t>(shared_mem_host_);
+        const auto field = reinterpret_cast<uintptr_t>(host_field_ptr);
+        if (field < base || size > shm_size_ || field - base > shm_size_ - size) {
             LOG_ERROR(
                 "BufferPoolManager::read_range_from_device: field [%p, %p) outside shm [%p, %p)",
-                static_cast<const void *>(host_field), static_cast<const void *>(host_field + size),
-                static_cast<const void *>(host_base), static_cast<const void *>(host_base + shm_size_)
+                reinterpret_cast<const void *>(field), reinterpret_cast<const void *>(field + size),
+                reinterpret_cast<const void *>(base), reinterpret_cast<const void *>(base + shm_size_)
             );
             return PTO_RUNTIME_ERR_INTERNAL;
         }
-        size_t offset = static_cast<size_t>(host_field - host_base);
+        size_t offset = static_cast<size_t>(field - base);
         const void *dev_field = static_cast<const char *>(shared_mem_dev_) + offset;
-        return ops_.copy_from_device(const_cast<void *>(static_cast<const void *>(host_field)), dev_field, size);
+        return ops_.copy_from_device(const_cast<void *>(host_field_ptr), dev_field, size);
     }
 
     /**

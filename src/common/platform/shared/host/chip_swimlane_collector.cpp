@@ -870,7 +870,7 @@ void ChipSwimlaneCollector::publish_run_config() {
     // buffer_pool_manager.h's note on narrow write_range_to_device calls. On SVM
     // platforms copy_to_device is null and this is a no-op, because the store
     // above already landed in device-visible memory.
-    (void)manager_.write_range_to_device(&header->chip_swimlane_level, sizeof(header->chip_swimlane_level));
+    publish_field(&header->chip_swimlane_level, sizeof(header->chip_swimlane_level), "chip_swimlane_level");
 
     // The pools' record counters are producer-side and never reset by the
     // device, so they carry the previous run's totals into this run's reconcile
@@ -891,7 +891,7 @@ void ChipSwimlaneCollector::publish_run_config() {
         wmb();
         // Contiguity is asserted where the struct is declared, next to the field
         // order it constrains.
-        (void)manager_.write_range_to_device(&head->total_record_count, 4 * sizeof(uint32_t));
+        publish_field(&head->total_record_count, 4 * sizeof(uint32_t), "record counters");
     };
 
     // Every slot, not just this run's: the grid is dimensioned by the platform
