@@ -14,14 +14,22 @@
 #include <runtime/rt.h>
 
 #include "host/kernel_launch_binder.h"
+#include "host/kernel_pipeline_contract.h"
 #include "tensormap_and_ringbuffer/kernel_clear_plan.h"
 
+int __attribute__((weak))
+DeviceRunnerBase::launch_hbg_kernel_callable(int32_t, const ChipStorageTaskArgs &, void *, const HostApi *) {
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
 int DeviceRunnerBase::launch_kernel_callable(
-    int32_t callable_id, const ChipStorageTaskArgs &args, void *caller_stream
+    int32_t callable_id, const ChipStorageTaskArgs &args, void *caller_stream, const HostApi *api
 ) {
     std::unique_lock<std::mutex> lease(kernel_submission_mutex_, std::try_to_lock);
+    const bool hbg_kernel = runtime_uses_hbg_kernel_impl() != 0;
     if (!lease.owns_lock() || !kernel_context_claim_.held() || !kernel_exec_state_.accepts_dispatch() ||
-        !persistent_args_.is_prepared() || !kernel_coordination_ready_ || !kernel_result_handle_)
+        !persistent_args_.is_prepared() || api == nullptr ||
+        (!hbg_kernel && (!kernel_coordination_ready_ || !kernel_result_handle_)))
         return PTO_RUNTIME_ERR_INVALID_STATE;
     int rc = adopt_borrowed_device(device_id_);
     if (rc != 0) return rc;
@@ -31,6 +39,10 @@ int DeviceRunnerBase::launch_kernel_callable(
     auto it = callables_.find(callable_id);
     if (it == callables_.end() || !kernel_aicpu_handle_ || !aicore_bin_handle_)
         return PTO_RUNTIME_ERR_CALLABLE_NOT_RESIDENT;
+
+    if (hbg_kernel) return launch_hbg_kernel_callable(callable_id, args, caller_stream, api);
+
+    namespace kl = simpler::kernel_launch;
     auto &packet = it->second.kernel_packet;
     const simpler::tmr::TmrExecutionBindingView binding{
         reinterpret_cast<uint64_t>(persistent_args_.device_k_args()), kernel_static_config_.generation()
@@ -41,7 +53,6 @@ int DeviceRunnerBase::launch_kernel_callable(
         ) != simpler::kernel::InvocationStatus::Ok)
         return PTO_RUNTIME_ERR_INTERNAL;
 
-    namespace kl = simpler::kernel_launch;
     struct Submission {
         DeviceRunnerBase *runner;
         void *caller;

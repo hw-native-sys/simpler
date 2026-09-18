@@ -386,6 +386,8 @@ class RuntimeBuilder:
         def _compile_target(target: str) -> Path:
             include_dirs, source_dirs = self._resolve_target_dirs(config_dir, build_config, target)
             defines = dict(effective_profiling_config or {})
+            if variant == "onboard" and name == "host_build_graph" and target in ("host", "aicpu"):
+                defines["SIMPLER_HBG_KERNEL_MODE"] = "ON"
             # Pin-resolved checkout path for CMake include dirs (#1403). Needed by
             # host (SDMA workspace manager) and by aicore (the SDMA warmup kernel's
             # vector-only target). Prefer the path already resolved on the

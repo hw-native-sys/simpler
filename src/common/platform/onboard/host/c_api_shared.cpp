@@ -1307,11 +1307,13 @@ int simpler_kernel_mode_init(
         PipelineContract contract{};
         const int config_rc = KernelStaticConfig::validate(config);
         if (config_rc != 0) return config_rc;
-        const int contract_rc = build_kernel_pipeline_contract_impl(config, &contract);
-        if (contract_rc != 0) return contract_rc;
-        if (!is_valid_pipeline_contract(&contract, SIMPLER_MODE_KERNEL) || !has_serviceable_arena_topology(contract) ||
-            !has_serviceable_stream_topology(contract)) {
-            return PTO_RUNTIME_ERR_INTERNAL;
+        if (!runtime_uses_hbg_kernel_impl()) {
+            const int contract_rc = build_kernel_pipeline_contract_impl(config, &contract);
+            if (contract_rc != 0) return contract_rc;
+            if (!is_valid_pipeline_contract(&contract, SIMPLER_MODE_KERNEL) ||
+                !has_serviceable_arena_topology(contract) || !has_serviceable_stream_topology(contract)) {
+                return PTO_RUNTIME_ERR_INTERNAL;
+            }
         }
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -1406,7 +1408,7 @@ int simpler_kernel_mode_prepare_callable(
         // cannot be recycled until the caller establishes quiescence and closes.
         rollback.dismiss();
         try {
-            rc = runner->prepare_kernel_callable(minted);
+            rc = runner->prepare_kernel_callable(minted, callable_size);
         } catch (...) {
             runner->kernel_execution_state().poison(PTO_RUNTIME_ERR_INTERNAL);
             throw;
@@ -1431,8 +1433,9 @@ int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, con
         return PTO_RUNTIME_ERR_INVALID_STATE;
     if (!runtime_supports_kernel_launch_impl()) return PTO_RUNTIME_ERR_UNSUPPORTED;
     try {
+        const HostApi kernel_api(runner, 0, 0, &g_host_api_ops);
         return runner->launch_kernel_callable(
-            callable_id, *static_cast<const ChipStorageTaskArgs *>(args), caller_stream
+            callable_id, *static_cast<const ChipStorageTaskArgs *>(args), caller_stream, &kernel_api
         );
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;

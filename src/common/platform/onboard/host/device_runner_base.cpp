@@ -68,6 +68,21 @@ static_assert(KERNEL_MAX_FUNC_ID == RUNTIME_MAX_FUNC_ID, "Kernel child function 
 // the common AICPU loader carries no runtime-specific symbol knowledge. TMARB
 // returns simpler_aicpu_register_callable; host_build_graph returns none.
 extern "C" const char *const *runtime_extra_aicpu_symbols(size_t *count);
+extern "C" __attribute__((weak)) const char *const *runtime_l1_extra_aicpu_symbols(size_t *count) {
+    if (count != nullptr) *count = 0;
+    return nullptr;
+}
+extern "C" __attribute__((weak)) int runtime_uses_hbg_kernel_impl(void) { return 0; }
+extern "C" __attribute__((weak)) uint32_t runtime_hbg_kernel_architecture_impl(void) { return 0; }
+
+int __attribute__((weak)) DeviceRunnerBase::prepare_hbg_kernel_runtime(const HostApi *) {
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+int __attribute__((weak)) DeviceRunnerBase::prepare_hbg_kernel_callable_registration(
+    int32_t, size_t, const simpler::kernel::PreparedInvocationView &, void *
+) {
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
 
 namespace {
 
@@ -639,6 +654,7 @@ int DeviceRunnerBase::init_kernel_context(
     if (aicpu_so_binary_.empty()) return PTO_RUNTIME_ERR_INVALID_STATE;
     const uint64_t runtime_fingerprint =
         simpler::common::utils::elf_build_id_64(aicpu_so_binary_.data(), aicpu_so_binary_.size());
+    kernel_runtime_binary_id_ = runtime_fingerprint;
     rc = kernel_context_claim_.acquire(kernel_context_claim_registry(), device_id, runtime_fingerprint);
     if (rc != 0) {
         LOG_ERROR(
@@ -695,11 +711,14 @@ int DeviceRunnerBase::init_kernel_context(
     // its own result, which init may do and a capturing thread may not.
     if (api == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     if (persistent_args_.has_live_resources()) return PTO_RUNTIME_ERR_INVALID_STATE;
-    rc = configure_kernel_runtime_impl(kernel_runtime_, kernel_static_config_.serial_orch_sched());
-    if (rc != 0) return rc;
-    // The context-static device regions are committed here, before the runtime
-    // image that names them is uploaded.
-    rc = prepare_kernel_runtime_impl(kernel_runtime_, api, &kernel_static_config_.request());
+    const bool hbg_kernel = runtime_uses_hbg_kernel_impl() != 0;
+    if (hbg_kernel) {
+        rc = prepare_hbg_kernel_runtime(api);
+    } else {
+        rc = configure_kernel_runtime_impl(kernel_runtime_, kernel_static_config_.serial_orch_sched());
+        if (rc != 0) return rc;
+        rc = prepare_kernel_runtime_impl(kernel_runtime_, api, &kernel_static_config_.request());
+    }
     if (rc != 0) return rc;
     rc = persistent_args_.prepare_once(kernel_runtime_, persistent_args_ops(), static_cast<uint64_t>(device_id_));
     if (rc != 0) return rc;
@@ -712,8 +731,10 @@ int DeviceRunnerBase::init_kernel_context(
     binary.length = aicore_kernel_binary_.size();
     rc = rtRegisterAllKernel(&binary, &aicore_bin_handle_);
     if (rc != 0) return rc;
-    rc = prepare_kernel_coordination();
-    if (rc != 0) return rc;
+    if (!hbg_kernel) {
+        rc = prepare_kernel_coordination();
+        if (rc != 0) return rc;
+    }
 
     claim_rollback.dismiss();
     return 0;
@@ -749,10 +770,10 @@ KernelCallableCache::Ops DeviceRunnerBase::kernel_callable_cache_ops() {
     };
 }
 
-int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id) {
-    // init committed every context-static resource, so preparation owns only
-    // this callable: it uploads, records residency, and enqueues nothing.
-    if (!kernel_static_config_.frozen() || !persistent_args_.is_prepared() || !kernel_coordination_ready_)
+int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id, size_t callable_bytes) {
+    const bool hbg_kernel = runtime_uses_hbg_kernel_impl() != 0;
+    if (!kernel_static_config_.frozen() || !persistent_args_.is_prepared() ||
+        (!hbg_kernel && !kernel_coordination_ready_))
         return PTO_RUNTIME_ERR_INVALID_STATE;
     auto it = callables_.find(callable_id);
     if (it == callables_.end()) return PTO_RUNTIME_ERR_CALLABLE_NOT_RESIDENT;
@@ -763,7 +784,13 @@ int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id) {
             &callable.scalar_count
         ) != simpler::kernel::InvocationStatus::Ok)
         return PTO_RUNTIME_ERR_INTERNAL;
-    if (state.kernel_packet.prepare(callable) != simpler::kernel::InvocationStatus::Ok) return PTO_RUNTIME_ERR_INTERNAL;
+    if (!hbg_kernel && state.kernel_packet.prepare(callable) != simpler::kernel::InvocationStatus::Ok)
+        return PTO_RUNTIME_ERR_INTERNAL;
+
+    if (hbg_kernel) {
+        auto *control_stream = kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu);
+        return prepare_hbg_kernel_callable_registration(callable_id, callable_bytes, callable, control_stream);
+    }
 
     // Preparation publishes the image and its residency; the device learns of
     // this callable from the first launch packet that names it, which carries
@@ -861,6 +888,13 @@ int DeviceRunnerBase::ensure_binaries_loaded(rtStream_t control_stream) {
     const char *const *extra = runtime_extra_aicpu_symbols(&extra_count);
     for (size_t i = 0; i < extra_count && extra != nullptr; ++i) {
         if (extra[i] != nullptr) extra_symbols.emplace_back(extra[i]);
+    }
+    if (execution_mode_latch_.is_kernel()) {
+        size_t kernel_count = 0;
+        const char *const *kernel = runtime_l1_extra_aicpu_symbols(&kernel_count);
+        for (size_t i = 0; i < kernel_count && kernel != nullptr; ++i) {
+            if (kernel[i] != nullptr) extra_symbols.emplace_back(kernel[i]);
+        }
     }
     rc = load_aicpu_op_.Init(extra_symbols);
     if (rc != 0) {
@@ -1668,10 +1702,13 @@ int DeviceRunnerBase::finalize_common() { return finalize_common_impl(false); }
 
 int DeviceRunnerBase::abandon_common_after_device_failure() { return finalize_common_impl(true); }
 
+int __attribute__((weak)) DeviceRunnerBase::finalize_hbg_kernel_registration() { return 0; }
+
 int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     if (!abandon_device_resources && execution_mode_latch_.is_kernel()) {
         kernel_exec_state_.begin_closing();
-        const int coordination_rc = finalize_kernel_coordination();
+        const int coordination_rc =
+            runtime_uses_hbg_kernel_impl() ? finalize_hbg_kernel_registration() : finalize_kernel_coordination();
         if (coordination_rc != 0) return coordination_rc;
         const int args_rc = persistent_args_.finalize_once();
         if (args_rc != 0) {
@@ -1848,6 +1885,7 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     // exists. Both are no-ops on a program-mode context.
     if (abandon_device_resources) {
         abandon_kernel_coordination();
+        hbg_kernel_state_.reset();
         persistent_args_.abandon();
     } else {
         const int args_rc = persistent_args_.finalize_once();
@@ -1883,6 +1921,8 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     max_cube_cores_ = 0;
     max_vector_cores_ = 0;
     aicore_kernel_binary_.clear();
+    hbg_kernel_state_.reset();
+    kernel_runtime_binary_id_ = 0;
     for (auto &bank : arena_banks_) {
         bank->cached_gm_heap_size = 0;
         bank->cached_gm_sm_size = 0;

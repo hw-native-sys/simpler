@@ -111,21 +111,15 @@ clear or replace any buffer. Mutable state must be restored later by the device
 from the invocation's immutable source. Caller must serialize binding/enqueue
 with close and establish external quiescence before closing.
 
-```cpp
-// All known graph requirements have already been collected outside capture.
-hbg::KernelResourcePlan plan;
-// Check each returned status before proceeding.
-hbg::KernelResourcePlan::create(graphs, graph_count, plan);
-plan.prepare(context, KernelResourceOps::from_allocator(allocator));
-context.freeze_resources();
-hbg::prepare_graph_execution_slot(context, device_id, generation, runtime_binary_id, prepare_ops);
-// The AICPU stream's FIFO orders these tasks ahead of every later launch.
-context.mark_ready_enqueued();
-
-// Resource portion of each launch: no allocator argument is available here.
-hbg::KernelWorkingBinding binding;
-hbg::bind_kernel_resources_for_launch(context, device_id, generation, graph, binding);
-```
+The public kernel owner prepares and freezes resources during context init.
+`ring_task_window[0]` declares the maximum outer task window and
+`ring_heap[0]` declares the heap and Definition capacity. Zero selects the
+runtime defaults. The owner derives the compact runtime/SM upper bound, creates
+one plan, prepares and freezes it, and uploads the persistent Runtime/KernelArgs.
+The first callable prepare registers the sealed slot on the dedicated AICPU
+stream, before capture. Later Host builds
+must fit this frozen plan. An overflow is reported as `CAPACITY_EXCEEDED`; launch
+never grows or replaces the slot.
 
 The allocator adapter uses the platform `MemoryAllocator`, preserving existing
 committed-byte accounting (including alignment slack). It must remain alive
@@ -137,14 +131,13 @@ internal slot identity is separate from callable registration: current K1 mints
 an `int32_t callable_id` in `prepare_callable` and carries no callable generation
 in the 32-byte invocation header.
 
-HBG's public kernel launch remains unsupported. The resource lifecycle and
-immutable HBG packet producer are implemented internally, and H4 restores the
-pristine packet into the prepared slot before dispatch. H5 exports the dedicated
-HBG kernel registration entry and symbol manifest. Public HBG owner integration
-is still required before enabling execution. Resource freeze is the internal
-`context.freeze_resources()` transition; the HBG owner must connect it to the
-preparation lifecycle. The TMR public launch implementation has its own
-independent admission path.
+HBG's public kernel launch uses this lifecycle. Context init owns resource
+prepare/freeze, and the first callable prepare registers the slot. Each callable is
+then registered against the same context generation and persistent Runtime.
+Launch receives only frozen bindings. It performs Host build, constructs or
+reuses an immutable graph template, makes a fresh HostArgs copy, and enters the
+shared three-stream binder. The TMR public launch keeps its independent packet
+and admission path.
 
 ## Common contract and stream roles
 
@@ -175,9 +168,11 @@ the shared launch binder. The context retains each
 execution stream under `KernelStreamKind`; its creation/destruction callbacks
 keep the existing `KernelContextOps` signature. The context event set is
 `Start`, `AicoreStart`, `AicoreDone`, `AicpuDone`, and `SerialTail`, chained
-caller ⇄ AICPU ⇄ AICore. The shared binder submits AICore before AICPU. HBG's
-owner still needs to connect this event protocol to graph registration and
-restore.
+caller ⇄ AICPU ⇄ AICore. The shared binder submits AICore before AICPU. HBG
+clears a fixed prelaunch control line together with the worker handshakes;
+AICore waits there until the AICPU restore leader publishes `READY`. If AICPU
+enqueue fails after AICore was submitted, binder compensation publishes
+`CANCEL`, releases that kernel, and poisons the context.
 
 The no-argument C `get_pipeline_contract()` remains the static program contract
 with zero byte fields. The internal TMR-shaped
@@ -205,8 +200,9 @@ fixed while different graphs use different prefixes of it.
 runtime_binary_id, identity, out)` consumes the completed build under its workspace lease and:
 
 1. Checks readiness, graph/window bounds, identity, and frozen context binding.
-2. Allocates Host storage for a complete pristine image of every frozen runtime,
-   Definition and A5 scheduler region. Unused bytes are zero. No device memory
+2. Allocates Host storage for the live runtime/SM, Definition and A5 scheduler
+   images. Frozen capacity remains separate from each invocation's image length;
+   unused capacity is not transmitted. No device memory
    is allocated, accessed, cleared or copied by this operation.
 3. Emits a clean RuntimeContext with no Host/component pointers. Restacks SM
    from the live Host mirror, preserving self-relative argument references and
@@ -224,19 +220,20 @@ The canonical packet layout is:
 
 ```text
 SimplerKernelInvocationHeader (sizeof the shared K1 header)
-GraphPacketHeader            (192 bytes, HBG format version 2)
+GraphPacketHeader            (200 bytes, HBG format version 3)
 GraphImageRegion[]           (32 bytes each)
 zero padding to a 64-byte relative offset
 inline payload:
-  full runtime/SM capacity
-  full Definition capacity, if nonzero
-  full A5 scheduler capacity, if nonzero
+  live runtime/SM image
+  live Definition image, if nonzero
+  live A5 scheduler image, if nonzero
 ```
 
 The HBG header carries an internal context-slot identity, device ID, runtime
 binary identity, per-invocation hashes,
 task count/window, runtime/SM offsets and
-four destination base/capacity pairs. Region source offsets are relative to the
+four destination base/capacity pairs and the live heap length. Region source
+offsets are relative to the
 inline payload; destination offsets are relative to the selected working region.
 The existing runtime image types retain their ABI. Their internal runtime
 pointers are null and rebuilt after restore; task heap/Definition references
@@ -246,7 +243,8 @@ are bound to stable device destinations. Caller tensor contents are not copied.
 and checks framing before accessing the region table or payload: the HBG format
 version and reserved fields, common invocation mode/counts, exact lengths,
 overflow, alignment, disjoint destination
-ranges, canonical region order and full-capacity coverage. A checksum covers the
+ranges, canonical region order and image lengths bounded by capacity. A checksum
+covers the
 common header, HBG binding/identity, descriptors, padding and payload, excluding
 only the checksum and the single patched address. It detects accidental
 corruption; it cannot replace H3's independent device registry trust check or
@@ -256,7 +254,8 @@ the leader image validation and restore described in
 [Execution-slot registration and admission](host-build-graph-kernel-slot.md)
 defines the prepare-time seal, context-owned AICPU registry and read-only
 `admit_graph_packet_for_restore` gate. The registry is not a graph/callable cache
-and no launch payload can choose its address. HBG version 1 packets are rejected;
+and no launch payload can choose its address. HBG version 1 and 2 packets are
+rejected;
 the outer K1 invocation ABI remains unchanged.
 
 `make_graph_host_args` validates the template and produces a fresh writable copy
@@ -268,16 +267,31 @@ a synchronous HostArgs consumer; only task execution is asynchronous.
 `aicpu_loader/host/kernel_graph_launch.h::launch_graph_template` adapts this to
 `aclrtLaunchKernelWithHostArgs`, forwarding the supplied dedicated AICPU stream,
 function, block count and config, with exactly one `aclrtPlaceHolderInfo`.
-Enqueue errors are returned unchanged to the enclosing launch protocol.
+On an RTS memory-allocation error, the adapter synchronizes the AicoreStart
+event recorded before the current AICore launch, then retries once. It never
+waits on the current AicoreDone or stream tail. A failed synchronization or
+retry returns its error to binder cancellation and context poisoning; ordinary
+launches do not synchronize. Capture-time synchronization rejection follows
+the same failure path.
 
 The adapter assumes the enclosing protocol has established entry/exit events
-and retained the function/context leases. It does not create streams, record
-or wait events, implement partial-enqueue recovery, or enable public HBG launch.
-The A5 scheduler region is restored from its zeroed template. The common
+and retained the function/context leases. The public HBG launch owner and shared
+binder create streams, record events, enqueue cross-stream waits and compensate
+for partial enqueue failures.
+Only the live heap prefix is cleared; unused heap capacity is untouched.
+The A5 scheduler image is restored from its zeroed template. The common
 scheduler queues, mailbox and runtime pointers are rebuilt by the leader restore;
 A5 dispatch-specific metadata binding remains with the kernel entry.
 Host framing/ownership tests and compilation against the installed CANN header
 are not evidence of on-device capture/restore correctness.
+The A3 onboard test `tests/st/a2a3/host_build_graph/kernel_mode_capture/`
+exercises real ACLGraph capture/replay through `Worker(execution_mode="kernel")`.
+It covers one-task graphs and two-task graphs with an internal intermediate,
+using 100 replays per case: fresh inputs, dependent calls, batched feedback,
+eager/replay interleaving, graph recreation and a 16-call chain. Captured
+addresses and scalars stay fixed; Host argument objects are cleared after enqueue.
+Each case checks exact FP32 outputs and unchanged context committed memory,
+then destroys captured graphs before closing the Worker.
 
 ## Host tensor-data requirement semantics
 

@@ -157,6 +157,8 @@ bool detach_graph_slot_registry(GraphSlotRegistry *registry) noexcept {
     return current_registry.compare_exchange_strong(registry, nullptr, std::memory_order_acq_rel);
 }
 
+GraphSlotRegistry *current_graph_slot_registry() noexcept { return current_registry.load(std::memory_order_acquire); }
+
 GraphSlotStatus poison_graph_execution_slot(GraphSlotRegistry *registry) noexcept {
     if (!valid_registry(registry)) return GraphSlotStatus::InvalidRegistry;
     __atomic_store_n(&registry->phase, static_cast<uint32_t>(GraphSlotPhase::Poisoned), __ATOMIC_RELEASE);
@@ -210,6 +212,16 @@ GraphSlotStatus admit_graph_packet_for_restore(
         invocation, registration, header,
         static_cast<const std::byte *>(packet) + sizeof(SimplerKernelInvocationHeader) + header.payload_offset
     };
+    for (uint32_t i = 0; i < header.region_count; ++i) {
+        GraphImageRegion region{};
+        std::memcpy(
+            &region,
+            static_cast<const std::byte *>(packet) + sizeof(SimplerKernelInvocationHeader) + sizeof(header) +
+                i * sizeof(region),
+            sizeof(region)
+        );
+        out.regions[static_cast<uint32_t>(region.kind)] = region;
+    }
     return GraphSlotStatus::Ok;
 }
 
@@ -218,4 +230,20 @@ GraphSlotStatus admit_graph_packet_for_restore(
 extern "C" __attribute__((visibility("default"))) int simpler_aicpu_l1_hbg_register_execution_slot(void *arg) {
     const auto status = hbg::install_graph_execution_slot(arg, sizeof(hbg::GraphSlotRegistration));
     return status == hbg::GraphSlotStatus::Ok ? 0 : -1;
+}
+
+extern "C" __attribute__((visibility("default"))) int simpler_aicpu_l1_hbg_detach_execution_slot(void *arg) {
+    if (arg == nullptr) return -1;
+    hbg::GraphSlotDetach detach{};
+    std::memcpy(&detach, arg, sizeof(detach));
+    if (!hbg::valid_graph_slot_detach(detach)) return -1;
+    auto *registry = reinterpret_cast<hbg::GraphSlotRegistry *>(detach.registry_address);
+    if (registry != hbg::current_graph_slot_registry()) return -1;
+    cache_invalidate_range(registry, offsetof(hbg::GraphSlotRegistry, registration));
+    if (registry->magic != hbg::GRAPH_REGISTRY_MAGIC || registry->version != hbg::GRAPH_SLOT_VERSION ||
+        registry->bytes != sizeof(*registry) || registry->device_id != detach.device_id ||
+        registry->context_generation != detach.context_generation ||
+        registry->runtime_binary_id != detach.runtime_binary_id)
+        return -1;
+    return hbg::detach_graph_slot_registry(registry) ? 0 : -1;
 }

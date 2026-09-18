@@ -16,7 +16,7 @@ namespace hbg {
 
 inline constexpr uint32_t GRAPH_SLOT_MAGIC = 0x53474248;      // HBGS
 inline constexpr uint32_t GRAPH_REGISTRY_MAGIC = 0x52474248;  // HBGR
-inline constexpr uint16_t GRAPH_SLOT_VERSION = 2;
+inline constexpr uint16_t GRAPH_SLOT_VERSION = 3;
 inline constexpr uint32_t GRAPH_SLOT_FROZEN_SERIAL = 3;
 
 enum class GraphSlotPhase : uint32_t { Empty, Publishing, Ready, Poisoned };
@@ -56,7 +56,7 @@ struct GraphSlotRegistration {
 
 enum class GraphRestorePhase : uint32_t { Idle, Restoring, Ready, Failed };
 
-// One leader writes this line; peers acquire phase after the entry's invocation
+// One leader writes this record; peers acquire phase after the entry's invocation
 // barrier. attempt is device-owned and advances even when a restore fails.
 struct alignas(64) GraphRestoreControl {
     uint64_t attempt;
@@ -67,9 +67,9 @@ struct alignas(64) GraphRestoreControl {
     uint32_t status;
     uint32_t total_tasks;
     uint32_t reserved0;
-    uint64_t reserved[2];
+    uint64_t live_bytes[4];
 };
-static_assert(sizeof(GraphRestoreControl) == 64);
+static_assert(sizeof(GraphRestoreControl) == 128);
 static_assert(std::is_standard_layout_v<GraphRestoreControl> && std::is_trivially_copyable_v<GraphRestoreControl>);
 
 // Context-owned device memory. Publication lives on a separate cache line from
@@ -87,6 +87,14 @@ struct alignas(64) GraphSlotRegistry {
     GraphRestoreControl restore;
 };
 
+struct GraphSlotDetach {
+    uint64_t registry_address;
+    uint64_t context_generation;
+    uint64_t runtime_binary_id;
+    int32_t device_id;
+    uint32_t reserved;
+};
+
 static_assert(std::is_standard_layout_v<GraphSlotRegistration> && std::is_trivially_copyable_v<GraphSlotRegistration>);
 static_assert(std::is_standard_layout_v<GraphSlotRegistry> && std::is_trivially_copyable_v<GraphSlotRegistry>);
 static_assert(sizeof(GraphSlotRegistration) == 128 && alignof(GraphSlotRegistration) == 8);
@@ -94,7 +102,8 @@ static_assert(offsetof(GraphSlotRegistration, slot_generation) == 16);
 static_assert(offsetof(GraphSlotRegistration, destinations) == 40);
 static_assert(offsetof(GraphSlotRegistration, registry) == 104);
 static_assert(offsetof(GraphSlotRegistration, checksum) == 120);
-static_assert(sizeof(GraphSlotRegistry) == 256 && alignof(GraphSlotRegistry) == 64);
+static_assert(sizeof(GraphSlotRegistry) == 320 && alignof(GraphSlotRegistry) == 64);
+static_assert(sizeof(GraphSlotDetach) == 32 && std::is_trivially_copyable_v<GraphSlotDetach>);
 static_assert(offsetof(GraphSlotRegistry, phase) == 8);
 static_assert(offsetof(GraphSlotRegistry, registration) == 64);
 static_assert(offsetof(GraphSlotRegistry, restore) == 192);
@@ -145,6 +154,11 @@ inline bool valid_graph_slot_registration(const GraphSlotRegistration &registrat
     uint64_t packet_bytes = 0;
     return graph_slot_packet_size(registration.destinations, packet_bytes) &&
            packet_bytes == registration.max_packet_bytes && registration.checksum == graph_slot_checksum(registration);
+}
+
+inline bool valid_graph_slot_detach(const GraphSlotDetach &detach) noexcept {
+    return detach.registry_address != 0 && detach.registry_address % 1024 == 0 && detach.context_generation != 0 &&
+           detach.runtime_binary_id != 0 && detach.device_id >= 0 && detach.reserved == 0;
 }
 
 }  // namespace hbg

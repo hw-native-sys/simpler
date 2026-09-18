@@ -231,8 +231,8 @@ int make_graph_launch_template(
     if (identity.callable_id < 0 || identity.callable_id >= MAX_REGISTERED_CALLABLE_IDS ||
         !simpler::kernel::valid_invocation_counts(identity.tensor_count, identity.scalar_count) ||
         !simpler::kernel::valid_host_copy_tensor_count(identity.tensor_count, identity.host_copy_tensor_count) ||
-        identity.callable_hash == 0 || identity.argument_hash == 0 ||
-        identity.function_hash == 0 || runtime_binary_id == 0)
+        identity.callable_hash == 0 || identity.argument_hash == 0 || identity.function_hash == 0 ||
+        runtime_binary_id == 0)
         return PTO_RUNTIME_ERR_INTERNAL;
     RuntimeArenaLayout layout{};
     int rc = make_kernel_graph_layout(build.workspace.task_capacity, layout);
@@ -267,18 +267,21 @@ int make_graph_launch_template(
     header.sm_offset = layout.off_copied_end;
     header.task_window = build.workspace.task_capacity;
     header.total_tasks = build.total_tasks;
+    header.heap_bytes = build.heap_bytes;
     header.destinations[0] = {binding.heap.address, binding.heap.capacity};
     header.destinations[1] = {binding.runtime_image.address, binding.runtime_image.capacity};
     header.destinations[2] = {binding.definitions.address, binding.definitions.capacity};
     header.destinations[3] = {binding.scheduler.address, binding.scheduler.capacity};
     std::vector<GraphImageRegion> regions;
+    const uint64_t image_bytes[] = {
+        0, required.runtime_arena_bytes, required.graph_definition_bytes, required.scheduler_state_bytes
+    };
     for (uint32_t i = 1; i <= 3; ++i) {
-        const auto &destination = header.destinations[i];
-        if (destination.capacity == 0) continue;
+        if (image_bytes[i] == 0) continue;
         const uint64_t offset = (header.payload_bytes + 63) & ~uint64_t{63};
         header.payload_bytes = offset;
-        if (!add_size(destination.capacity, header.payload_bytes)) return PTO_RUNTIME_ERR_CAPACITY_EXCEEDED;
-        regions.push_back({static_cast<GraphImageKind>(i), 0, offset, destination.capacity, 0});
+        if (!add_size(image_bytes[i], header.payload_bytes)) return PTO_RUNTIME_ERR_CAPACITY_EXCEEDED;
+        regions.push_back({static_cast<GraphImageKind>(i), 0, offset, image_bytes[i], 0});
     }
     header.region_count = regions.size();
     header.payload_offset = (sizeof(header) + regions.size() * sizeof(GraphImageRegion) + 63) & ~uint64_t{63};
@@ -291,7 +294,7 @@ int make_graph_launch_template(
     next.storage_.resize((next.size_ + 7) / 8, 0);
     auto *packet = reinterpret_cast<std::byte *>(next.storage_.data());
     auto *payload = packet + sizeof(SimplerKernelInvocationHeader) + header.payload_offset;
-    AlignedImage runtime_image(binding.runtime_image.capacity);
+    AlignedImage runtime_image(required.runtime_arena_bytes);
     auto *image = runtime_image.data();
     RuntimeContext pristine{};
     pristine.mode = MODE_EXECUTE;
@@ -308,13 +311,13 @@ int make_graph_launch_template(
     std::byte *definition_image = nullptr;
     for (const auto &region : regions)
         if (region.kind == GraphImageKind::Definitions) definition_image = payload + region.source_offset;
-    rc = copy_definitions(build, definition_image, binding.definitions.capacity, definitions);
+    rc = copy_definitions(build, definition_image, required.graph_definition_bytes, definitions);
     if (rc != 0) return rc;
     rc = bind_definition_images(
         build, image + layout.off_copied_end, binding.definitions.address, definitions, layout.sched.capacities.dummy
     );
     if (rc != 0) return rc;
-    std::memcpy(payload, image, binding.runtime_image.capacity);
+    std::memcpy(payload, image, required.runtime_arena_bytes);
     SimplerKernelInvocationHeader invocation{};
     invocation.mode = SIMPLER_MODE_KERNEL;
     invocation.callable_id = identity.callable_id;

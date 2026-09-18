@@ -38,6 +38,8 @@ GraphSlotStatus acquire_graph_execution_slot(
 GraphSlotStatus
 bind_graph_slot_registry(GraphSlotRegistry *registry, int device_id, uint64_t runtime_binary_id) noexcept;
 bool detach_graph_slot_registry(GraphSlotRegistry *registry) noexcept;
+// Borrowed only while the invocation owner holds the context execution lease.
+GraphSlotRegistry *current_graph_slot_registry() noexcept;
 
 // Serialized with control/restore/retirement by the invocation owner. Terminal:
 // no register, bind, admission or retirement may make this storage usable again.
@@ -57,6 +59,7 @@ struct GraphRestoreView {
     GraphSlotRegistration slot{};
     GraphPacketHeader graph{};
     const std::byte *payload{nullptr};
+    GraphImageRegion regions[4]{};  // Indexed by GraphImageKind; absent images have zero bytes.
 };
 
 // Uses the independently latched registry, never an address supplied by packet.
@@ -76,3 +79,4 @@ GraphSlotStatus admit_graph_packet_for_restore(
 // not report this symbol. CANN HostArgs may be unaligned, so the implementation
 // copies the fixed-size record before inspecting it.
 extern "C" __attribute__((visibility("default"))) int simpler_aicpu_l1_hbg_register_execution_slot(void *arg);
+extern "C" __attribute__((visibility("default"))) int simpler_aicpu_l1_hbg_detach_execution_slot(void *arg);

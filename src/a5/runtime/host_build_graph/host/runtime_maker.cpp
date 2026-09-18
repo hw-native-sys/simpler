@@ -112,7 +112,13 @@ int configure_kernel_runtime_impl(Runtime &, bool) { return PTO_RUNTIME_ERR_UNSU
 
 int prepare_kernel_runtime_impl(Runtime &, const HostApi *, const CallConfig *) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
 
-extern "C" int runtime_supports_kernel_launch_impl(void) { return 0; }
+extern "C" int runtime_uses_hbg_kernel_impl(void) { return 1; }
+
+extern "C" uint32_t runtime_hbg_kernel_architecture_impl(void) {
+    return static_cast<uint32_t>(hbg::RuntimeArchitecture::A5);
+}
+
+extern "C" int runtime_supports_kernel_launch_impl(void) { return 1; }
 
 extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *, PipelineContract *) {
     // CallConfig alone cannot determine the graph-dependent heap and image sizes.
@@ -1310,10 +1316,8 @@ int32_t hbg::get_graph_resource_requirements(
     if (build.image_bytes > UINT64_MAX - layout.off_copied_end) return PTO_RUNTIME_ERR_CAPACITY_EXCEEDED;
 
     GraphResourceRequirements next{};
-    next.layout = {
-        HBG_RUNTIME_LAYOUT_ABI_VERSION, RuntimeArchitecture::A5, layout.task_capacity, layout.arena_size,
-        layout.off_copied_begin, layout.off_copied_end
-    };
+    next.layout = {HBG_RUNTIME_LAYOUT_ABI_VERSION, RuntimeArchitecture::A5, layout.task_capacity, layout.arena_size,
+                   layout.off_copied_begin,        layout.off_copied_end};
     next.gm_heap_bytes = build.heap_bytes;
     next.runtime_arena_bytes = layout.off_copied_end + build.image_bytes;
     next.graph_definition_bytes = build.definition_bytes;
@@ -2082,7 +2086,12 @@ extern "C" const char *const *runtime_extra_aicpu_symbols(size_t *count) {
 // Kernel mode uses a separate loader manifest so its context registration
 // cannot change the program-mode runtime's resolved entry set.
 extern "C" const char *const *runtime_l1_extra_aicpu_symbols(size_t *count) {
-    static const char *const kExtra[] = {"simpler_aicpu_l1_hbg_register_execution_slot"};
+    static const char *const kExtra[] = {
+        "simpler_aicpu_l1_hbg_register_execution_slot",
+        "simpler_aicpu_l1_hbg_detach_execution_slot",
+        "simpler_aicpu_l1_hbg_register_callable",
+        "simpler_aicpu_kernel_exec",
+    };
     if (count != nullptr) {
         *count = sizeof(kExtra) / sizeof(kExtra[0]);
     }

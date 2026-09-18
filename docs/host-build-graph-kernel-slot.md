@@ -2,22 +2,22 @@
 
 These internal interfaces implement the execution-slot trust root described in
 [v9 design, sections 3 and 8](https://icc.gt.tc/vllm-pto?i=2#v9-design).
-Public HBG init, prepare and launch are not enabled by these interfaces. H5
-exports the dedicated registration entry and symbol manifest; the owner still
-connects its enqueue and event ordering. The leader restore consumes admission
-to validate and restore image contents.
+The public HBG kernel owner connects prepare-time registration, launch event
+ordering and context-close detachment. The leader restore consumes admission
+to validate and restore image contents before dispatch.
 
 ## Ownership and prepare
 
 `KernelResourcePlan` reserves five logical regions within two physical allocations:
-heap, runtime/SM, Definitions, A5 scheduler, and a 256-byte registry. The last
+heap, runtime/SM, Definitions, A5 scheduler, and a 320-byte registry. The last
 four occupy disjoint aligned slices of the packed runtime arena. The registry
 adds its bytes and preceding alignment padding to the common resource contract,
 but never to a graph's four mutable destination capacities or its payload.
 `GraphResourceRequirements` remains a per-graph size snapshot; the plan accounts
 for the additional per-context control storage.
 
-The resource schema is version 3; slot registration uses version 2. Prepare and close retain existing allocator
+The resource schema and slot registration use version 3. Prepare and close
+retain existing allocator
 accounting and rollback behavior. No third allocation or launch-time allocation
 is introduced. Different graphs use one frozen set of destination addresses and
 capacities. Registry storage has the same context lifetime as those destinations.
@@ -65,10 +65,11 @@ All nonempty bases are aligned, lengths are overflow-checked, and all five regio
 are disjoint. The runtime binary identity must be stable for the registered
 runtime/ABI; it is not a callable ID, argument hash or context generation.
 
-`GraphSlotRegistry` is a 256-byte POD aligned to a cache line. Its first line
+`GraphSlotRegistry` is a 320-byte POD aligned to a cache line. Its first line
 holds the context identity and publication state; the next two lines hold the
-registration. A fourth, independent cache line holds per-execution restore
-publication. Device control code initializes only newly allocated, exclusively
+registration. Two independent cache lines hold per-execution restore publication
+and the four live region lengths. Device control code initializes only newly
+allocated, exclusively
 owned storage, then publishes `Empty -> Publishing -> Ready`. The complete
 candidate is checked before claiming Publishing. Ready is release-published
 only after copying and flushing the record. Acquisition checks state, invalidates
@@ -102,15 +103,15 @@ are required before the next context can register.
 
 Registration is prepare-time control work on the dedicated AICPU stream. It does
 not allocate device memory, build a graph, upload a graph image, synchronize a
-launch, or mutate program-mode callable registration. H7 remains responsible for
-connecting detach to public context close and for end-to-end lifetime handling.
+launch, or mutate program-mode callable registration. The public kernel owner
+connects detach to context close after caller-guaranteed quiescence.
 
 The resident AICPU DSO stores only one atomic registry pointer. Binding requires
 a valid Ready record and refuses a different live pointer. It stores no slot
 contents, generation history, callable table or cross-context conflict state.
 After graph destruction and external quiescence, device control must detach that
-pointer before `context.close()` releases memory. H3 exposes detachment; the
-public close/registration owner still needs to connect this ordered operation.
+pointer before `context.close()` releases memory. The public close owner
+performs this ordered operation.
 
 `poison_graph_execution_slot` publishes a terminal Poisoned registration phase.
 Register, bind and admission reject it. Initialization still requires a new
@@ -120,10 +121,10 @@ Poisoning neither drains device work nor frees resources or resets the device.
 
 ## Invocation admission
 
-HBG packet version 2 uses the former reserved tail of its 192-byte header for
-device ID and runtime binary identity. The common K1 header keeps the integrated
+HBG packet version 3 has a 200-byte header containing device ID, runtime
+binary identity and live heap length. The common K1 header keeps the integrated
 ABI; offsets use `sizeof(SimplerKernelInvocationHeader)` and no common-header
-version fields are added. HBG version 1 packets fail closed.
+version fields are added. HBG version 1 and 2 packets fail closed.
 Callable generation, callable/argument/function
 hashes remain per-invocation fields, so different callables and arguments can
 share a slot. The common callable admission checks ID, effective argument counts and residency
@@ -191,9 +192,10 @@ protection; this interface does not register a CANN entry or enqueue streams.
    and Restoring reject with Busy; Failed rejects with Quarantined. Context and
    callable generations are unchanged. Reject an exhausted attempt counter;
    never wrap a generation to zero.
-3. Clear the full internal heap and copy each complete runtime/SM, Definition and
-   optional A5 scheduler image. Copies cover frozen capacity, including the zero
-   tails emitted by the Host template. Caller-owned tensor storage and persistent
+3. Clear the live internal heap prefix and copy the live runtime/SM, Definition
+   and optional A5 scheduler images. Image descriptors bound all source reads
+   and destination writes; unused frozen capacity remains untouched. Caller-owned
+   tensor storage and persistent
    platform handshake/KernelArgs allocations are outside these regions.
 4. Wire runtime/SM/scheduler pointers against the registered destinations, attach
    the populated SM, initialize scheduler queue headers and sequence ramps, and
@@ -206,13 +208,13 @@ protection; this interface does not register a CANN entry or enqueue streams.
    Return the RuntimeContext address,
    capacity-bounded SM span and task count for the dispatch owner.
 
-The 64-byte `GraphRestoreControl` is part of the context registry allocation,
+The 128-byte `GraphRestoreControl` is part of the context registry allocation,
 never part of a graph image. Resource prepare still performs two physical
 allocations; resource binding and device restore allocate nothing. Host packet
 construction still owns vector storage and must not be described as an entirely
 allocation-free Host launch path. Registration remains immutable
 while its separate restore line changes. Old registry/resource schema versions
-fail closed; public K1 and HBG packet layouts are unchanged.
+fail closed; the public K1 invocation layout is unchanged.
 
 A copy/clear/flush failure may leave partially written working bytes. It publishes
 Failed, preserves the last committed generation and leaves the output unchanged.
@@ -243,7 +245,8 @@ frees memory, resets the device or advances committed_generation.
 After its invocation barrier, a peer calls
 `acquire_graph_restore_result(registry, successful_generation, out)`. It acquires
 the validated, non-poisoned registry and Ready state, checks the exact
-attempt/commit pair and successful status, and invalidates every working region
+attempt/commit pair and successful status, and invalidates only each published
+live working span
 before consuming it. The entry must distribute the leader's status as well as
 its generation: on leader failure, peers exit through failure handling instead
 of polling an old Ready flag. A prevalidation rejection does not mint a new
@@ -251,7 +254,8 @@ attempt and cannot authorize reuse of a prior successful output. The execution
 lease excludes retirement until all readers and AICore work have completed;
 the restore state machine independently refuses reuse before that retirement.
 
-Unit coverage includes repeated full-capacity restoration, corrupted first/middle/
+Unit coverage includes repeated live-image restoration, internal intermediate
+tensors, unused-capacity preservation, corrupted first/middle/
 last source cache lines, forged runtime/relative-pool fields, every memory-operation
 failure (including the pre-publication flush), explicit controlled retry, stale
 retirement/publication rejection, terminal poisoning, peer readers and an empty

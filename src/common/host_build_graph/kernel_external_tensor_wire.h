@@ -29,14 +29,27 @@ inline bool supported_kernel_graph_stride_family(const GraphTensor &tensor) noex
     return true;
 }
 
-// Internal tensors live in the graph's virtual heap window and are rebound to
-// context storage during restore. Addresses below that window remain external
-// caller storage in the captured image and therefore must be DEVICE tensors.
+// Host builds use virtual heap addresses. Restored task payloads use the
+// registered heap window; Definitions retain their virtual internal addresses.
 inline bool valid_kernel_graph_tensor(const GraphTensor &tensor) noexcept {
     if (!graph_tensor_wire_valid(tensor)) return false;
     if (tensor.buffer_addr >= HEAP_VIRTUAL_BASE) return true;
     return tensor.address_space == static_cast<uint8_t>(AddressSpace::DEVICE) &&
            supported_kernel_graph_stride_family(tensor);
+}
+
+inline bool valid_restored_kernel_graph_tensor(const GraphTensor &tensor, uint64_t heap, uint64_t bytes) noexcept {
+    if (!graph_tensor_wire_valid(tensor)) return false;
+    if (tensor.buffer_addr >= heap && tensor.buffer_addr - heap <= bytes)
+        return tensor.buffer_size <= bytes - (tensor.buffer_addr - heap);
+    return tensor.buffer_addr < HEAP_VIRTUAL_BASE &&
+           tensor.address_space == static_cast<uint8_t>(AddressSpace::DEVICE) &&
+           supported_kernel_graph_stride_family(tensor);
+}
+
+inline bool
+valid_restored_kernel_graph_tensor(const simpler::hbg::Tensor &tensor, uint64_t heap, uint64_t bytes) noexcept {
+    return valid_restored_kernel_graph_tensor(graph_tensor_pack(tensor), heap, bytes);
 }
 
 inline bool valid_kernel_graph_tensor(const simpler::hbg::Tensor &tensor) noexcept {

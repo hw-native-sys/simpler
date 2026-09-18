@@ -532,6 +532,15 @@ __aicore__ bool run_ready_dispatch_loop(
 __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type) {
     __gm__ Handshake *handshake = (__gm__ Handshake *)(&runtime->workers[block_idx]);
     const uint32_t profiling_flag = get_aicore_profiling_flag();
+
+    uint32_t prelaunch = HBG_KERNEL_PRELAUNCH_WAIT;
+    do {
+        scheduler_observe_cache_line(&runtime->kernel_prelaunch);
+        prelaunch = runtime->kernel_prelaunch.state;
+        local_backoff(kInitialBackoffIterations);
+    } while (prelaunch == HBG_KERNEL_PRELAUNCH_WAIT);
+    if (prelaunch != HBG_KERNEL_PRELAUNCH_READY) return;
+
     scheduler_observe_cache_line(handshake);
     if ((handshake->aicpu_ready != SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING &&
          handshake->aicpu_ready != SCHEDULER_RUNTIME_MODE_RESIDENT_READY)) {

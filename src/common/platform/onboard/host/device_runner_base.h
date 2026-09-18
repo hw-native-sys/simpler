@@ -91,6 +91,10 @@
 #include "native_run_execution.h"
 
 struct HostApi;  // common/host_api.h — fwd-declared to keep task_interface headers out
+namespace hbg {
+struct KernelCallableLaunchState;
+struct KernelContextLaunchState;
+}  // namespace hbg
 
 /**
  * Common base class for both a2a3 and a5 onboard `DeviceRunner`s.
@@ -175,12 +179,14 @@ public:
     int init_kernel_context(int device_id, const CallConfig &config, uint64_t context_generation, const HostApi *api);
 
     /**
-     * Register one callable on a kernel-mode context and make sure the
-     * context's persistent argument blocks exist. Idempotent in the part that
-     * matters: only the first callable pays for the argument blocks.
+     * Register one callable against the persistent context created by init.
+     * HBG publishes its slot and callable on the dedicated AICPU stream;
+     * TMR conveys callable residency in the first launch packet.
      */
-    int prepare_kernel_callable(int32_t callable_id);
-    int launch_kernel_callable(int32_t callable_id, const ChipStorageTaskArgs &args, void *caller_stream);
+    int prepare_kernel_callable(int32_t callable_id, size_t callable_bytes);
+    int launch_kernel_callable(
+        int32_t callable_id, const ChipStorageTaskArgs &args, void *caller_stream, const HostApi *api
+    );
     std::mutex &kernel_submission_mutex() { return kernel_submission_mutex_; }
     KernelCallableCache &kernel_callable_cache() { return kernel_callable_cache_; }
     KernelCallableCache::Ops kernel_callable_cache_ops();
@@ -1300,6 +1306,7 @@ protected:
         // hbg path (host already dlopen'd the orch SO)
         void *host_dlopen_handle{nullptr};
         void *host_orch_func_ptr{nullptr};
+        std::shared_ptr<hbg::KernelCallableLaunchState> hbg_launch_state;
     };
     std::unordered_map<int32_t, CallableState> callables_;
     // Opaque provider handle from dma_workspace_provision(), owned for the
@@ -1366,9 +1373,20 @@ protected:
     // and per-invocation fields stay at the sentinels Runtime() sets; binding
     // a callable into it is a later step's work.
     Runtime kernel_runtime_;
+    std::shared_ptr<hbg::KernelContextLaunchState> hbg_kernel_state_;
+    uint64_t kernel_runtime_binary_id_{0};
     int prepare_kernel_coordination();
     int finalize_kernel_coordination();
     void abandon_kernel_coordination();
+    int finalize_hbg_kernel_registration();
+    int prepare_hbg_kernel_runtime(const HostApi *api);
+    int prepare_hbg_kernel_callable_registration(
+        int32_t callable_id, size_t callable_bytes, const simpler::kernel::PreparedInvocationView &callable,
+        void *control_stream
+    );
+    int launch_hbg_kernel_callable(
+        int32_t callable_id, const ChipStorageTaskArgs &args, void *caller_stream, const HostApi *api
+    );
     simpler::tmr::TmrKernelContextDescriptor kernel_descriptor_{};
     void *kernel_coordination_block_{nullptr};
     void *kernel_core_envelope_{nullptr};

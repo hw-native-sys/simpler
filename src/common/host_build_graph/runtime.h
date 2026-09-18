@@ -107,6 +107,27 @@ struct Handshake {
 static_assert(sizeof(Handshake) == 64);
 static_assert(std::is_standard_layout_v<Handshake> && std::is_trivially_copyable_v<Handshake>);
 
+enum : uint32_t {
+    HBG_KERNEL_PRELAUNCH_WAIT = 0,
+    HBG_KERNEL_PRELAUNCH_READY = 1,
+    HBG_KERNEL_PRELAUNCH_CANCEL = UINT32_MAX,
+};
+
+// The AICore kernel is enqueued before the AICPU HostArgs task so ACLGraph can
+// capture caller -> AICPU -> AICore as one ordered chain.  It must therefore
+// wait until AICPU has restored the graph snapshot before reading Runtime.  A
+// failed AICPU enqueue publishes CANCEL from the caller stream and releases the
+// already-enqueued AICore.  This line is context-owned and lives immediately
+// before workers[] so launch can clear both with one fixed-address memset.
+struct alignas(64) HbgKernelPrelaunchControl {
+    volatile uint32_t state;
+    uint32_t reserved[15];
+};
+static_assert(sizeof(HbgKernelPrelaunchControl) == 64);
+static_assert(
+    std::is_standard_layout_v<HbgKernelPrelaunchControl> && std::is_trivially_copyable_v<HbgKernelPrelaunchControl>
+);
+
 /**
  * simpler::hbg::Tensor pair for tracking host-device memory mappings.
  * Used for copy-back during finalize.
@@ -146,6 +167,7 @@ struct Task {
  */
 class Runtime {
 public:
+    HbgKernelPrelaunchControl kernel_prelaunch;
     // Handshake buffers for AICPU-AICore communication
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
     // A2/A3 post-close return gates, one isolated cache line per worker. The

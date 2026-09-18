@@ -26,6 +26,11 @@
 // =============================================================================
 
 Runtime::Runtime() {
+    std::memset(&kernel_prelaunch, 0, sizeof(kernel_prelaunch));
+    // Program mode has no three-stream prelaunch gate. Kernel mode clears this
+    // line immediately before each launch and lets the AICPU restore path
+    // publish READY again.
+    kernel_prelaunch.state = HBG_KERNEL_PRELAUNCH_READY;
     // Initialize handshake buffers
     std::memset(workers, 0, sizeof(workers));
     worker_count = 0;

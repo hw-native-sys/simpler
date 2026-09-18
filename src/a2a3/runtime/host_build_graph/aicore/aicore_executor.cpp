@@ -82,6 +82,17 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     my_hank->aicore_done = block_idx + 1;  // Signal ready (use block_idx + 1 to avoid 0)
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
+    // The HBG kernel-mode binder starts AICore before it submits the AICPU
+    // HostArgs task.  Wait until that task restores the captured graph, or
+    // until binder compensation cancels this launch after an enqueue failure.
+    uint32_t prelaunch = HBG_KERNEL_PRELAUNCH_WAIT;
+    do {
+        dcci(&runtime->kernel_prelaunch, SINGLE_CACHE_LINE);
+        prelaunch = runtime->kernel_prelaunch.state;
+        SPIN_WAIT_HINT();
+    } while (prelaunch == HBG_KERNEL_PRELAUNCH_WAIT);
+    if (prelaunch != HBG_KERNEL_PRELAUNCH_READY) return;
+
     // Phase 2: Wait for the AICPU to open our register window. A kernel launch
     // resets DATA_MAIN_BASE to 0 (verified on a2a3 silicon); the AICPU writes
     // DATA_MAIN_BASE = AICPU_IDLE_TASK_ID (non-zero) as it opens FAST_PATH, so a

@@ -39,6 +39,14 @@ int prepare_kernel_runtime_impl(Runtime &runtime, const HostApi *api, const Call
 // launch the runtime cannot service.
 extern "C" int runtime_supports_kernel_launch_impl(void);
 
+// Runtime selector for the shared platform owner. HBG uses a graph packet and
+// execution slot; TMR keeps the fixed dispatch packet path.
+extern "C" int runtime_uses_hbg_kernel_impl(void);
+
+// Runtime-specific architecture tag used by the common HBG context-resource
+// owner. The value is one of hbg::RuntimeArchitecture.
+extern "C" uint32_t runtime_hbg_kernel_architecture_impl(void);
+
 // Borrowed, call-local role bindings; no stream is created or retained here.
 // Caller, dedicated AICPU and hidden AICore are three distinct streams.
 struct KernelStreamBinding {

@@ -680,7 +680,7 @@ def test_simulated_components_report_kernel_mode_unsupported(arch: str, runtime:
 
 @pytest.mark.parametrize(("arch", "runtime"), _ONBOARD_CASES)
 def test_kernel_context_init_respects_runtime_support_on_a_borrowed_device(arch: str, runtime: str, request):
-    """TMR claims the borrowed device; HBG refuses before acquiring resources."""
+    """Both onboard runtimes claim the borrowed device without owning its lifecycle."""
     lib = _load(arch, "onboard", runtime)
     aicpu, aicore, dispatcher = _binaries(arch, runtime)
     config = CallConfig()
@@ -704,20 +704,8 @@ def test_kernel_context_init_respects_runtime_support_on_a_borrowed_device(arch:
                 ctypes.byref(config),
                 1,
             )  # fmt: skip
-        if runtime == "host_build_graph":
-            assert status == PTO_RUNTIME_ERR_UNSUPPORTED
-            assert lib.simpler_kernel_mode_supported(ctx) == 0
-            assert lib.committed_device_memory_ctx(ctx) == 0
-            image = _minimal_callable_image()
-            stream = ctypes.byref((ctypes.c_uint8 * 8)())
-            minted = ctypes.c_int32(99)
-            assert (
-                lib.simpler_kernel_mode_prepare_callable(ctx, image, len(image), ctypes.byref(minted))
-                == PTO_RUNTIME_ERR_INVALID_STATE
-            )
-            assert lib.simpler_kernel_mode_launch(ctx, 0, image, stream) == PTO_RUNTIME_ERR_INVALID_STATE
-            return
         assert status == 0
+        assert lib.simpler_kernel_mode_supported(ctx) == 1
         # The claim is exclusive for the context's whole life.
         assert (
             lib.simpler_init(
@@ -760,6 +748,24 @@ def test_kernel_eager_launch_executes_fresh_tensor_and_scalar_snapshots(request)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.requires_hardware
+@pytest.mark.platforms(["a2a3"])
+@pytest.mark.runtime("host_build_graph")
+@pytest.mark.device_count(1)
+@pytest.mark.parametrize("scenario", ["eager_values", "intermediate_queued"])
+def test_hbg_kernel_eager_launch_executes_graph_snapshots(request, scenario):
+    _binaries("a2a3", "host_build_graph")
+    device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), "a2a3", "host_build_graph", device, scenario],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.parametrize(("arch", "runtime"), _ONBOARD_TMR_CASES)
 @pytest.mark.parametrize("scenario", ["device_query_error", "device_mismatch"])
 def test_kernel_device_query_rejections_keep_context_reusable(arch, runtime, scenario, kernel_close_faults, request):
@@ -778,7 +784,7 @@ def test_kernel_device_query_rejections_keep_context_reusable(arch, runtime, sce
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def _build_eager_callable(arch, runtime):
+def _build_eager_callable(arch, runtime, intermediate=False):
     import tempfile  # noqa: PLC0415
 
     from simpler.task_interface import (  # noqa: PLC0415
@@ -810,7 +816,7 @@ def _build_eager_callable(arch, runtime):
     child = CoreCallable.build(signature=signature, binary=extract_text_section(incore))
     return ChipCallable.build(
         signature=signature,
-        func_name="kernel_eager_orchestration",
+        func_name="kernel_eager_intermediate" if intermediate else "kernel_eager_orchestration",
         binary=orchestration,
         children=[(0, child)],
     )
@@ -837,13 +843,35 @@ def _check_device_query_rejection(lib, ctx, device, scenario, operation, *argume
         faults.clear_device_query_override()
 
 
+def _allocate_eager_invocations(lib, host_array, scalars, allocations):
+    count = host_array._length_
+    bytes_per_tensor = ctypes.sizeof(host_array)
+    invocations = []
+    for round_index, scalar in enumerate(scalars):
+        addresses = []
+        for _ in range(2):
+            address = ctypes.c_void_p()
+            assert lib.aclrtMalloc(ctypes.byref(address), bytes_per_tensor, 0) == 0
+            allocations.append(address)
+            addresses.append(address)
+        source, destination = addresses
+        values = [float(i % 127 + round_index * 257) for i in range(count)]
+        host_input = host_array(*values)
+        host_output = host_array(*([-999.0] * count))
+        assert lib.aclrtMemcpy(source, bytes_per_tensor, host_input, bytes_per_tensor, 1) == 0
+        assert lib.aclrtMemcpy(destination, bytes_per_tensor, host_output, bytes_per_tensor, 1) == 0
+        invocations.append((source, destination, scalar, values, host_output))
+    return invocations
+
+
 def _run_eager_values(arch, runtime, device, scenario="eager_values"):
     import struct  # noqa: PLC0415
 
     from simpler.task_interface import ChipStorageTaskArgs, ChipTensor, DataType  # noqa: PLC0415
 
-    chip = _build_eager_callable(arch, runtime)
-    check_device_query = scenario != "eager_values"
+    queued = scenario == "intermediate_queued"
+    chip = _build_eager_callable(arch, runtime, intermediate=queued)
+    check_device_query = scenario in ("device_query_error", "device_mismatch")
     lib = _load(arch, "onboard", runtime)
     acl_signatures = {
         "aclInit": [ctypes.c_char_p],
@@ -924,19 +952,8 @@ def _run_eager_values(arch, runtime, device, scenario="eager_values"):
         bytes_per_tensor = ctypes.sizeof(host_array)
         results = []
         args = ChipStorageTaskArgs()
-        for round_index, scalar in enumerate((1.25, -3.5)):
-            addresses = []
-            for _ in range(2):
-                address = ctypes.c_void_p()
-                assert lib.aclrtMalloc(ctypes.byref(address), bytes_per_tensor, 0) == 0
-                allocations.append(address)
-                addresses.append(address)
-            source, destination = addresses
-            values = [float(i % 127 + round_index * 257) for i in range(count)]
-            host_input = host_array(*values)
-            host_output = host_array(*([-999.0] * count))
-            assert lib.aclrtMemcpy(source, bytes_per_tensor, host_input, bytes_per_tensor, 1) == 0
-            assert lib.aclrtMemcpy(destination, bytes_per_tensor, host_output, bytes_per_tensor, 1) == 0
+        invocations = _allocate_eager_invocations(lib, host_array, (1.25, -3.5) * (8 if queued else 1), allocations)
+        for round_index, (source, destination, scalar, values, host_output) in enumerate(invocations):
             args.clear()
             args.add_tensor(ChipTensor.make(source.value, (count,), DataType.FLOAT32, child_memory=True))
             args.add_tensor(ChipTensor.make(destination.value, (count,), DataType.FLOAT32, child_memory=True))
@@ -952,20 +969,22 @@ def _run_eager_values(arch, runtime, device, scenario="eager_values"):
             assert launch_rc == 0, f"launch round {round_index} returned {launch_rc}"
             # CANN owns the launch snapshot after enqueue returns.
             args.clear()
-            assert lib.aclrtSynchronizeStreamWithTimeout(caller_stream, 60000) == 0
-            assert lib.aclrtMemcpy(host_output, bytes_per_tensor, destination, bytes_per_tensor, 2) == 0
-            expected = [value + scalar for value in values]
-            assert list(host_output) == expected
+            expected = [value + scalar * (2 if queued else 1) for value in values]
+            if not queued:
+                assert lib.aclrtSynchronizeStreamWithTimeout(caller_stream, 60000) == 0
+                assert lib.aclrtMemcpy(host_output, bytes_per_tensor, destination, bytes_per_tensor, 2) == 0
+                assert list(host_output) == expected
             assert lib.committed_device_memory_ctx(ctx) == committed
             results.append((destination, expected))
             if check_device_query and round_index == 0:
                 # The next round must still execute after a refused close.
                 _check_device_query_rejection(lib, ctx, device, scenario, lib.finalize_device, ctx)
 
-        # The second launch must not target the first invocation's output.
+        assert lib.aclrtSynchronizeStreamWithTimeout(caller_stream, 60000) == 0
         first_output = host_array()
-        assert lib.aclrtMemcpy(first_output, bytes_per_tensor, results[0][0], bytes_per_tensor, 2) == 0
-        assert list(first_output) == results[0][1]
+        for destination, expected in results:
+            assert lib.aclrtMemcpy(first_output, bytes_per_tensor, destination, bytes_per_tensor, 2) == 0
+            assert list(first_output) == expected
         assert _finalize_after_quiescence(lib, ctx) == 0
         initialized = False
         assert lib.committed_device_memory_ctx(ctx) == 0
@@ -986,7 +1005,7 @@ def _run_eager_values(arch, runtime, device, scenario="eager_values"):
 
 
 if __name__ == "__main__":
-    if sys.argv[4] in ("eager_values", "device_query_error", "device_mismatch"):
+    if sys.argv[4] in ("eager_values", "intermediate_queued", "device_query_error", "device_mismatch"):
         _run_eager_values(sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4])
     else:
         _run_lifecycle_retry(sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4])

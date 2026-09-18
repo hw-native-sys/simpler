@@ -11,6 +11,8 @@
 
 #include "kernel_binder_test_support.h"
 #include "kernel_launch_native.h"
+#include "aicpu_loader/host/kernel_graph_launch.h"
+#include <acl/error_codes/rt_error_codes.h>
 
 #include <array>
 #include <cstring>
@@ -27,6 +29,9 @@ struct NativeFake {
     KernelNativeInvocation native;
     std::vector<std::vector<uint8_t>> copies;
     std::vector<int> memset_values;
+    std::vector<int> host_args_errors;
+    int recovery_syncs{0};
+    int recovery_status{0};
     void initialize() {
         fixture.initialize();
         fixture.binding.packet = reinterpret_cast<const uint8_t *>(packet.data());
@@ -101,12 +106,63 @@ extern "C" aclError aclrtLaunchKernelWithHostArgs(
     EXPECT_EQ(stream, ptr(1));
     EXPECT_EQ(count, 1u);
     auto *first = static_cast<uint8_t *>(args);
+    uint64_t placeholder_value = 1;
+    std::memcpy(&placeholder_value, first + placeholders[0].addrOffset, sizeof(placeholder_value));
+    EXPECT_EQ(placeholder_value, 0u);
     active->copies.emplace_back(first, first + bytes);
     auto &copy = active->copies.back();
     const uint64_t address = reinterpret_cast<uintptr_t>(copy.data()) + placeholders[0].dataOffset;
     std::memcpy(copy.data() + placeholders[0].addrOffset, &address, sizeof(address));
     std::memcpy(first + placeholders[0].addrOffset, &address, sizeof(address));
+    if (!active->host_args_errors.empty()) {
+        const int error = active->host_args_errors.front();
+        active->host_args_errors.erase(active->host_args_errors.begin());
+        return error;
+    }
     return active->fixture.fake.append(Step::AicpuLaunch);
+}
+
+extern "C" aclError aclrtSynchronizeEvent(aclrtEvent event) {
+    // This event precedes the current AICore launch; its done event is ptr(5).
+    EXPECT_EQ(event, ptr(4));
+    ++active->recovery_syncs;
+    return active->recovery_status;
+}
+
+TEST(HbgKernelHostArgs, MemoryPressureRetriesOnceAfterThePrelaunchEvent) {
+    for (const auto errors :
+         {std::vector<int>{ACL_ERROR_RT_MEMORY_ALLOCATION, 0},
+          std::vector<int>{ACL_ERROR_RT_MEMORY_ALLOCATION, ACL_ERROR_RT_MEMORY_ALLOCATION}, std::vector<int>{12345},
+          std::vector<int>{0}}) {
+        NativeFake f;
+        active = &f;
+        f.initialize();
+        f.host_args_errors = errors;
+        hbg::GraphHostArgs args;
+        args.storage.assign(10, 0);
+        args.bytes = 80;
+        args.address_offset = 64;
+        args.data_offset = 72;
+        EXPECT_EQ(hbg::launch_graph_host_args(args, ptr(201), 6, ptr(1), nullptr, ptr(4)), errors.back());
+        EXPECT_EQ(f.copies.size(), errors.size());
+        EXPECT_EQ(f.recovery_syncs, errors.size() == 2 ? 1 : 0);
+    }
+}
+
+TEST(HbgKernelHostArgs, FailedRecoverySynchronizationDoesNotRetry) {
+    NativeFake f;
+    active = &f;
+    f.initialize();
+    f.host_args_errors = {ACL_ERROR_RT_MEMORY_ALLOCATION};
+    f.recovery_status = 12346;
+    hbg::GraphHostArgs args;
+    args.storage.assign(10, 0);
+    args.bytes = 80;
+    args.address_offset = 64;
+    args.data_offset = 72;
+    EXPECT_EQ(hbg::launch_graph_host_args(args, ptr(201), 6, ptr(1), nullptr, ptr(4)), 12346);
+    EXPECT_EQ(f.copies.size(), 1u);
+    EXPECT_EQ(f.recovery_syncs, 1);
 }
 
 TEST(KernelNativeBinder, RoutesThreeStreamsAndCopiesIndependentHostArgs) {

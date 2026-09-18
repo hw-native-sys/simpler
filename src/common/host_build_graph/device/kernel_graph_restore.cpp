@@ -128,7 +128,7 @@ bool validate_images(const GraphRestoreView &view, RuntimeArenaLayout &layout, u
     while (ready_capacity < h.task_window)
         ready_capacity <<= 1;
     layout = runtime_reserve_layout(reservations, h.task_window, ready_capacity);
-    const uint64_t capacity = view.slot.destinations[1].capacity;
+    const uint64_t capacity = view.regions[1].bytes;
     if (h.runtime_offset != layout.off_runtime || h.sm_offset != layout.off_copied_end ||
         !graph_span_fits(h.runtime_offset, sizeof(RuntimeContext), capacity) ||
         !graph_span_fits(h.sm_offset, sizeof(SharedMemoryHeader), capacity))
@@ -150,7 +150,7 @@ bool validate_images(const GraphRestoreView &view, RuntimeArenaLayout &layout, u
         return false;
     const auto &heap = view.slot.destinations[0];
     const auto &definitions = view.slot.destinations[2];
-    const uint64_t definition_source = (capacity + 63) & ~uint64_t{63};
+    const uint64_t definition_source = view.regions[2].source_offset;
     for (uint32_t i = 0; i < h.total_tasks; ++i) {
         const uint64_t storage_offset = offsets.storage + i * sizeof(ChipTaskStorage);
         ChipTaskStorage task{};
@@ -183,10 +183,13 @@ bool validate_images(const GraphRestoreView &view, RuntimeArenaLayout &layout, u
             return false;
         for (int32_t j = 0; j < p.tensor_count; ++j) {
             if (graph) {
-                if (!valid_kernel_graph_tensor(read_value<GraphTensor>(sm + tensors + j * sizeof(GraphTensor))))
+                if (!valid_restored_kernel_graph_tensor(
+                        read_value<GraphTensor>(sm + tensors + j * sizeof(GraphTensor)), heap.address, h.heap_bytes
+                    ))
                     return false;
-            } else if (!valid_kernel_graph_tensor(
-                           read_value<simpler::hbg::Tensor>(sm + tensors + j * sizeof(simpler::hbg::Tensor))
+            } else if (!valid_restored_kernel_graph_tensor(
+                           read_value<simpler::hbg::Tensor>(sm + tensors + j * sizeof(simpler::hbg::Tensor)),
+                           heap.address, h.heap_bytes
                        )) {
                 return false;
             }
@@ -198,13 +201,13 @@ bool validate_images(const GraphRestoreView &view, RuntimeArenaLayout &layout, u
         const uint64_t begin = reinterpret_cast<uintptr_t>(task.task.packed_buffer_base);
         const uint64_t end = reinterpret_cast<uintptr_t>(task.task.packed_buffer_end);
         if ((begin != 0 || end != 0) &&
-            (begin < heap.address || end < begin || !graph_span_fits(begin - heap.address, end - begin, heap.capacity)))
+            (begin < heap.address || end < begin || !graph_span_fits(begin - heap.address, end - begin, h.heap_bytes)))
             return false;
         const uint64_t definition = reinterpret_cast<uintptr_t>(task.slot.graph_context);
         if (graph) {
             if (definition < definitions.address ||
                 !validate_definition(
-                    view.payload + definition_source, definitions.capacity, definition - definitions.address, task
+                    view.payload + definition_source, view.regions[2].bytes, definition - definitions.address, task
                 ))
                 return false;
         } else if (definition != 0) return false;
@@ -273,15 +276,13 @@ GraphRestoreStatus restore_graph_packet(
         return GraphRestoreStatus::CopyFailed;
     };
     const auto &heap = view.slot.destinations[0];
-    if (!zero_region(ops, reinterpret_cast<void *>(heap.address), heap.capacity)) return fail();
-    uint64_t cursor = 0;
+    if (!zero_region(ops, reinterpret_cast<void *>(heap.address), view.graph.heap_bytes)) return fail();
     for (size_t i = 1; i < 4; ++i) {
         const auto &dst = view.slot.destinations[i];
-        if (dst.capacity == 0) continue;
-        cursor = (cursor + 63) & ~uint64_t{63};
-        if (!copy_region(ops, reinterpret_cast<void *>(dst.address), view.payload + cursor, dst.capacity))
+        const auto &region = view.regions[i];
+        if (region.bytes == 0) continue;
+        if (!copy_region(ops, reinterpret_cast<void *>(dst.address), view.payload + region.source_offset, region.bytes))
             return fail();
-        cursor += dst.capacity;
     }
     const auto &working = view.slot.destinations[1];
     DeviceArena arena;
@@ -296,11 +297,17 @@ GraphRestoreStatus restore_graph_packet(
         return fail();
     runtime->scheduler->seed_queue_slots();
     runtime->aicore_mailbox->init_empty();
-    for (const auto &dst : view.slot.destinations)
-        if (dst.capacity && !flush_region(ops, reinterpret_cast<void *>(dst.address), dst.capacity)) return fail();
+    if (!flush_region(ops, reinterpret_cast<void *>(heap.address), view.graph.heap_bytes)) return fail();
+    for (size_t i = 1; i < 4; ++i)
+        if (view.regions[i].bytes &&
+            !flush_region(ops, reinterpret_cast<void *>(view.slot.destinations[i].address), view.regions[i].bytes))
+            return fail();
     control.runtime_address = reinterpret_cast<uintptr_t>(runtime);
     control.sm_bytes = sm_bytes;
     control.total_tasks = view.graph.total_tasks;
+    control.live_bytes[0] = view.graph.heap_bytes;
+    for (size_t i = 1; i < 4; ++i)
+        control.live_bytes[i] = view.regions[i].bytes;
     if (!flush_region(ops, &control, sizeof(control))) return fail();
     control.committed_generation = control.attempt;
     publish(control, GraphRestorePhase::Ready, GraphRestoreStatus::Ok);
@@ -363,8 +370,11 @@ acquire_graph_restore_result(const GraphSlotRegistry *registry, uint64_t generat
             slot.destinations[1].capacity
         ))
         return GraphRestoreStatus::NotReady;
-    for (const auto &dst : slot.destinations)
-        if (dst.capacity) cache_invalidate_range(reinterpret_cast<const void *>(dst.address), dst.capacity);
+    for (size_t i = 0; i < 4; ++i)
+        if (control.live_bytes[i] > slot.destinations[i].capacity) return GraphRestoreStatus::NotReady;
+    for (size_t i = 0; i < 4; ++i)
+        if (control.live_bytes[i])
+            cache_invalidate_range(reinterpret_cast<const void *>(slot.destinations[i].address), control.live_bytes[i]);
     out = {
         reinterpret_cast<RuntimeContext *>(control.runtime_address), generation, control.sm_bytes, control.total_tasks
     };

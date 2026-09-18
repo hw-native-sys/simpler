@@ -14,18 +14,17 @@ kernel 模式下，simpler 是一个被调用的库：它借用调用方已经�
 自己的 stream，提交一个有界的异步算子，不自己初始化 ACL，不 reset 设备，launch
 路径上不做任何同步。这正是它区别于 program 模式的地方。
 
-端到端数值用例是
-`tests/ut/py/test_kernel_mode_c_api.py` 里的
-`test_kernel_eager_launch_executes_fresh_tensor_and_scalar_snapshots`。它用 ctypes
-直接调用 host runtime 动态库，自己扮演调用方，不经过 PyTorch，也不经过 simpler
-的 Python Worker。
+端到端数值用例在 `tests/ut/py/test_kernel_mode_c_api.py`。TMR 入口是
+`test_kernel_eager_launch_executes_fresh_tensor_and_scalar_snapshots`，HBG 入口是
+`test_hbg_kernel_eager_launch_executes_graph_snapshots`。它们用 ctypes 直接调用 host
+runtime 动态库，自己扮演调用方，不经过 PyTorch，也不经过 simpler 的 Python Worker。
 
 经过 Worker 的是另外两个文件，入口都是 `Worker(level=2, execution_mode="kernel")`：
 
 | 文件 | 硬件 | 覆盖 |
 | ---- | ---- | ---- |
 | `tests/ut/py/test_worker/test_worker_kernel_mode.py` | 不需要 | 用假的 ChipWorker 检查参数校验、`init(config=...)` 的路由、program 与 kernel 两种模式的接口互斥、prepare/launch/close 之间的串行闸门，以及 teardown 失败后 `close()` 可重试 |
-| `tests/ut/py/test_worker/test_worker_kernel_mode_hw.py` | a2a3 真机 | 调用方自己设卡、建 stream，经 `init(config=...)`、`kernel_prepare_callable`、`kernel_launch(..., caller_stream=...)` 和 `close()` 驱动 kernel 模式，再同步自己的 stream 核对结果 |
+| `tests/ut/py/test_worker/test_worker_kernel_mode_hw.py` | a2a3 真机 | 分别用 TMR 与 HBG 驱动 `init(config=...)`、`kernel_prepare_callable`、`kernel_launch(..., caller_stream=...)` 和 `close()`，再同步调用方 stream 核对结果 |
 
 被执行的算子是一个 AIV 向量加标量，`y[i] = x[i] + scalar`：
 
@@ -80,14 +79,14 @@ simpler 没有调用过它们。
 
 | 入口 | 做什么 |
 | ---- | ------ |
-| `simpler_kernel_mode_init` | 用 `aclrtGetDevice` 确认当前卡与传入卡号一致，只核对不设置；用 `rtStreamCreate` 创建两条私有 stream（AICPU、AICore）和 5 个 event；加载 AICPU 执行体。容量配置此时固定 |
-| `simpler_kernel_mode_prepare_callable` | 上传 callable 镜像并铸造 callable_id（出参返回），把编排 .so 的注册任务下发到设备；首次调用时提交 pooled arena，上传常驻 Runtime 与 KernelArgs。全部 H2D 走 `capture_memcpy_h2d`，可在 capture 内执行 |
-| `simpler_kernel_mode_launch` | 校验上下文与 callable 驻留，把本次参数连同该 callable 的设备镜像地址与长度编码进参数包，在三条 stream 上排布一串异步操作后返回 |
+| `simpler_kernel_mode_init` | 核对当前设备，创建专用 AICPU stream、隐藏 AICore stream 和事件；提交固定执行资源并上传常驻 Runtime/KernelArgs。HBG 同时冻结 heap、runtime/SM、Definition、A5 scheduler 与 registry 容量 |
+| `simpler_kernel_mode_prepare_callable` | 上传 callable 镜像并铸造 callable_id。TMR 在首次 launch 发布设备驻留信息；HBG 在专用 AICPU stream 注册 slot 和 callable，并等待注册完成 |
+| `simpler_kernel_mode_launch` | TMR 编码固定 dispatch packet；HBG 在 Host build 后生成不可变 graph template，并复制本次 HostArgs。两者均通过 binder 在三条 stream 上入队 |
 | `finalize_device` | 释放上下文拥有的资源；测试断言 committed memory 归零 |
 
 init 期间的执行体加载会同步上下文自己的 AICPU stream，因此 init 必须在 capture 之外
-完成。prepare 与 launch 都不同步任何 stream，prepare 因此可以在 capture 内调用；
-它的 H2D 上传走 `capture_memcpy_h2d`，临时切到 RELAXED 模式后同步拷贝再恢复。
+完成。TMR prepare 不同步 stream，因此可以在 capture 内调用；HBG prepare 需在
+capture 之前完成专用 AICPU stream 的注册同步。H2D 上传走 `capture_memcpy_h2d`，临时切到 RELAXED 模式后同步拷贝再恢复。
 TMR close 在调用方已完成执行且销毁相关 graph 之后，等待上下文自有 AICPU stream 完成
 设备注销及回执复制，再释放资源；不替调用方同步 caller stream。等待有超时，注销、
 等待或释放失败均保留相应资源供 close 重试。
@@ -155,6 +154,8 @@ ACLGraph capture 分两跳传播。launch 只负责入队，全部入队成功�
 
 ## 6. 设备侧执行
 
+TMR 的 `simpler_aicpu_kernel_exec` 执行固定参数包：
+
 AICPU 入口 `simpler_aicpu_kernel_exec` 收到参数包后：
 
 1. 校验包头，以及参数包里 callable 镜像跨度的合法性（非零、按 `ChipCallable`
@@ -163,6 +164,14 @@ AICPU 入口 `simpler_aicpu_kernel_exec` 收到参数包后：
 3. 设置平台寄存器，由 leader 线程接纳本次调用，多个 AICPU 线程在 barrier 汇合。
 4. 运行编排函数，编排提交的 AIV 任务经握手区派发给 AICore。
 5. AICore 执行加标量，结果写入测试分配的输出显存。
+
+HBG 使用相同入口名，但由 HBG 目标内的强 `consume_kernel_task` 接管：
+
+1. 按 context generation 读取 prepare 阶段注册的 callable 和 slot，校验 graph packet 的 callable、参数计数、设备与 runtime binary 身份。
+2. leader 把 captured runtime/SM、Definition 和可选 scheduler 镜像恢复到 context 的固定工作区，重建 RuntimeContext 内部指针、队列与 mailbox；整个过程不申请设备内存。
+3. 从已驻留 callable 重绑 AICore 子函数地址，并把外层 Runtime 指向本次恢复出的 SM/arena。
+4. 发布 prelaunch `READY`；已经在隐藏 AICore stream 上启动的 kernel 越过 gate，AICPU 进入既有 `aicpu_execute` 调度路径。
+5. 所有 AICPU 线程结束后 retire 本次 restore；失败会把 slot/context 置为不可继续 dispatch 的状态。
 
 ## 7. 断言了什么
 
@@ -252,8 +261,8 @@ simpler 仍引用主机侧参数，本次执行会读到被清空的数据，结
 
 ## 10. 已知边界
 
-- 公开 HBG kernel 执行尚未打通。H4 没有提交 PR，HBG 的 kernel 能力位为 0，init 返回 `UNSUPPORTED`。
+- HBG 公开 kernel 调用链已经接通，能力位为 1，并增加了 C ABI 与 Worker 两个 eager 数值用例；本地编译和主机单测已覆盖，真机任务仍需实际获得设备后完成结果确认。
 - A5 只经过编译、单元测试与仿真，没有真机结果。
-- 数值用例只覆盖一个固定形状的单算子，不覆盖多算子图、其他形状与并发 launch。
-- 公开 launch 路径尚未在 ACLGraph capture 窗口内验证，见第 8 节。
+- HBG 数值用例只覆盖一个固定形状的单算子，不覆盖多算子图、其他形状与并发 launch。
+- HBG 公开 launch 路径尚未在 ACLGraph capture 窗口内完成真机验证；第 8 节现有公开 capture 场景仍以 TMR 为主。
 - 同一 host runtime 动态库内限制同一设备只能有一个活动 kernel 上下文；跨动态库副本或跨进程需要调用方自行串行化。
