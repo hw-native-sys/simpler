@@ -1129,6 +1129,34 @@ endfunction()
 add_args_dump_collector_test(test_args_dump_collector_a2a3 a2a3)
 add_args_dump_collector_test(test_args_dump_collector_a5 a5)
 
+# args_dump run identity + buffer ownership: host collector and AICPU producer in
+# one binary so the whole chain (acquire -> record -> flush -> host copy ->
+# manifest) is production code.
+function(add_args_dump_identity_test name platform)
+    add_executable(${name}
+        common/test_args_dump_run_identity.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/args_dump_collector.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/device_run_result_base_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/${platform}/platform/sim/host/profiling_copy.cpp
+        ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
+    )
+    target_include_directories(${name} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/../../../src/${platform}/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+        ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common
+    )
+    target_link_libraries(${name} PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+    add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES LABELS "no_hardware")
+endfunction()
+
+add_args_dump_identity_test(test_args_dump_run_identity_a2a3 a2a3)
+add_args_dump_identity_test(test_args_dump_run_identity_a5 a5)
+
 # Per-callable_id orch SO file naming regression (see rtStreamSynchronize
 # 507018 root cause). Compiles the a2a3 onboard `create_orch_so_file`
 # against the test source so it runs on no-hw runners too.

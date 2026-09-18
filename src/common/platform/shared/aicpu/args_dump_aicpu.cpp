@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "aicpu/device_run_result_base_aicpu.h"
 #include "aicpu/profiler_device_engine.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
@@ -381,7 +382,11 @@ struct DumpDeviceModule {
     }
 
     static void account_dropped(Context, State *state, uint32_t count) { account_dropped_records(state, count); }
-    static void on_pop_success(Context ctx, State *, Buffer *buffer) { s_current_dump_buf[ctx.thread_idx] = buffer; }
+    static void on_pop_success(Context ctx, State *state, Buffer *buffer) {
+        buffer->run_epoch = get_platform_run_result_epoch();
+        buffer->local_seq = state->current_buf_seq;
+        s_current_dump_buf[ctx.thread_idx] = buffer;
+    }
     static void on_current_cleared(Context ctx, State *) { s_current_dump_buf[ctx.thread_idx] = nullptr; }
     static void on_null_free_slot(Context, State *) {}
 
@@ -618,10 +623,31 @@ void dump_args_init(int num_dump_threads) {
         DumpBufferState *state = get_dump_buffer_state(dump_base, t);
         s_dump_states[t] = state;
 
+        // Keep the buffer this thread already holds, or pop the first one.
+        //
+        // A buffer is only released by a successful enqueue, so a pointer still
+        // set here means the previous run could not hand that buffer over — it
+        // had nothing to publish, or the ready queue was full. Popping a
+        // replacement would strand it: nothing returns it to the free queue,
+        // because AICPU is the queue's consumer and never its producer. Reusing
+        // it in place is the return, and re-stamping is what makes that safe —
+        // the buffer still carries the previous run's identity, and its count
+        // must start this run at zero.
         rmb();
+        uint64_t retained = state->current_buf_ptr;
         uint32_t head = state->free_queue.head;
         uint32_t tail = state->free_queue.tail;
-        if (head != tail) {
+        if (retained != 0) {
+            DumpMetaBuffer *buf = reinterpret_cast<DumpMetaBuffer *>(retained);
+            buf->count = 0;
+            buf->run_epoch = get_platform_run_result_epoch();
+            buf->local_seq = 0;
+            wmb();
+            state->current_buf_seq = 0;
+            s_current_dump_buf[t] = buf;
+            LOG_DEBUG("Thread %d: reusing retained dump buffer (addr=0x%lx)", t, retained);
+        } else if (head != tail) {
+            // The engine's pop stamps identity through on_pop_success.
             (void)try_pop_dump_meta_buffer(t, state, 0);
             uint64_t buf_ptr = state->current_buf_ptr;
             LOG_DEBUG("Thread %d: popped initial dump buffer (addr=0x%lx)", t, buf_ptr);
@@ -771,19 +797,19 @@ void dump_args_flush(int thread_idx) {
             state->current_buf_ptr = 0;
             wmb();
         } else {
-            // ready_queue full at end-of-run: account the loss and clear the
-            // buffer so host reconcile sees a clean state (current_buf_ptr=0)
-            // and dropped == flush failures rather than silent wip-mismatch.
             // Bounded to one per thread per run (unlike the hot-path
             // dump_arg_record site), so no spam guard is needed here.
             LOG_ERROR(
                 "Thread %d: failed to flush args-dump buffer (ready_queue full), %u records lost!", thread_idx,
                 buf->count
             );
+            // ready_queue full at end-of-run: account the loss, but keep the
+            // buffer. Clearing the pointer would strand it — the host never saw
+            // it, so nothing returns it to the free queue. Retaining it lets the
+            // next run's init reuse it in place, which is the only return
+            // available to AICPU.
             account_dropped_records(state, buf->count);
             buf->count = 0;
-            s_current_dump_buf[thread_idx] = nullptr;
-            state->current_buf_ptr = 0;
             wmb();
         }
     }

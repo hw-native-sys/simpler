@@ -315,6 +315,11 @@ void ArgsDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info, int
 
     if (count == 0) return;
 
+    // Read the identity before the loop: the device buffer goes back to the pool
+    // after this and a later run re-stamps it, so it may not be consulted again.
+    const uint64_t run_epoch = buf->run_epoch;
+    const uint32_t local_seq = buf->local_seq;
+
     if (count > PLATFORM_DUMP_RECORDS_PER_BUFFER) {
         LOG_ERROR(
             "Dump collector: invalid record count %u in buffer (thread=%u, seq=%u, max=%d), skipping", count,
@@ -347,6 +352,8 @@ void ArgsDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info, int
     for (uint32_t i = 0; i < count; i++) {
         const ArgsDumpRecord &rec = buf->records[i];
         DumpedArg dt{};
+        dt.run_epoch = run_epoch;
+        dt.local_seq = local_seq;
         dt.task_id = rec.task_id;
         // rec is read from device shared memory (untrusted): clamp func_count so a
         // corrupt oversized value can't drive an out-of-bounds read of the
@@ -796,8 +803,8 @@ int ArgsDumpCollector::export_dump_files() {
         if (!first_entry) json << ",\n";
         first_entry = false;
 
-        json << "    {\"task_id\": \"0x" << std::hex << std::setfill('0') << std::setw(16) << dt.task_id << std::dec
-             << "\"";
+        json << "    {\"run_epoch\": " << dt.run_epoch << ", \"task_id\": \"0x" << std::hex << std::setfill('0')
+             << std::setw(16) << dt.task_id << std::dec << "\"";
         json << ", \"func_id\": [";
         for (int32_t f = 0; f < dt.func_count; f++) {
             if (f) json << ", ";

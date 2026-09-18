@@ -135,7 +135,30 @@ static_assert(
 struct DumpMetaBuffer {
     ArgsDumpRecord records[PLATFORM_DUMP_RECORDS_PER_BUFFER];
     volatile uint32_t count;  // Current record count
+    uint32_t pad_align;       // Aligns run_epoch to 8 B
+
+    // Which run produced these records. AICPU stamps it when it acquires the
+    // buffer, so it is fixed before the first record lands; the AICPU thread
+    // that acquired the buffer is its only reader until the ready queue
+    // publishes it, so no barrier is needed between the stamp and the
+    // acquisition. It has to be copied out with the records: the pool reuses
+    // this storage, and a later run re-stamps it in place, so a host copy that
+    // pointed back here would report the wrong run.
+    //
+    // Payload bytes need no identity of their own — `arena_write_offset` is a
+    // monotonic cursor the host never resets, so a record's `payload_offset`
+    // stays unique across runs and its identity is the record's.
+    volatile uint64_t run_epoch;  // 0 when the producer had no run identity
+    volatile uint32_t local_seq;  // Buffer's position within its own run
 } __attribute__((aligned(64)));
+
+// Identity lives in the alignment tail `count` already had, so the buffer does
+// not grow — device memory here is per dump thread and this struct is 32 KB.
+static_assert(
+    sizeof(DumpMetaBuffer) == sizeof(ArgsDumpRecord) * PLATFORM_DUMP_RECORDS_PER_BUFFER + 64,
+    "run identity grew DumpMetaBuffer past its former alignment tail"
+);
+static_assert(offsetof(DumpMetaBuffer, records) == 0, "DumpMetaBuffer::records must stay first");
 
 // =============================================================================
 // DumpFreeQueue - SPSC Lock-Free Queue for Free Buffers
