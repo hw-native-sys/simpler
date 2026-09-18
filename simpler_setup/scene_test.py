@@ -1591,6 +1591,71 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
             )
 
 
+def _describe_mismatch(actual, expected, rtol, atol) -> str:
+    """One-line census of a golden mismatch.
+
+    `max_diff` on its own cannot separate "every element is a little off" from
+    "three elements are off by 2x while the other 16381 match", and those two
+    want opposite responses: the first is a tolerance discussion, the second a
+    correctness hunt. The counts and the worst offenders make that visible at the
+    failure instead of requiring a local patch to this function to find out.
+
+    `max_diff=` stays first and unchanged so existing logs and triage notes that
+    quote it still read the same.
+    """
+    import torch  # noqa: PLC0415
+
+    # Widen before subtracting so an fp16 difference cannot overflow to inf on
+    # its own. Complex is carried rather than dropped because the caller decides
+    # failure with torch.allclose, which accepts complex: .float() on a complex
+    # tensor discards the imaginary part with only a warning, so an
+    # imaginary-only mismatch would be reported as max_diff=0.0 -- the exact
+    # misleading number this census exists to replace. abs() of a complex
+    # difference is its real magnitude, so everything below stays real.
+    work = torch.complex64 if actual.is_complex() or expected.is_complex() else torch.float32
+    diff = (actual.to(work) - expected.to(work)).abs()
+    finite = torch.isfinite(diff)
+    max_diff = float(diff[finite].max()) if bool(finite.any()) else float("nan")
+    # Same predicate as the caller's allclose, so over_tol is exactly the set
+    # that made this a failure.
+    over = ~torch.isclose(actual, expected, rtol=rtol, atol=atol)
+    n_over = int(over.sum())
+
+    parts = [
+        f"max_diff={max_diff}",
+        f"rtol={rtol}",
+        f"atol={atol}",
+        f"elems={actual.numel()}",
+        f"differ={int((actual != expected).sum())}",
+        f"over_tol={n_over}",
+    ]
+    n_nonfinite = int((~finite).sum())
+    if n_nonfinite:
+        parts.append(f"non_finite={n_nonfinite}")
+
+    worst = min(3, n_over)
+    if worst:
+        # topk over the offending elements only; nonzero() would allocate one
+        # row per mismatch, which is the whole tensor in the all-wrong case.
+        ranked = torch.where(over.reshape(-1), diff.reshape(-1), torch.zeros_like(diff.reshape(-1)))
+        shape = tuple(actual.shape)
+        samples = []
+        for flat in torch.topk(ranked, worst).indices.tolist():
+            index: list[int] = []
+            remainder = flat
+            for dim in reversed(shape):
+                index.append(remainder % dim)
+                remainder //= dim
+            key = tuple(reversed(index))
+            # .item() rather than float(): it keeps a complex offender intact,
+            # which float() cannot represent at all, and reports an integer
+            # offender as the integer it is instead of widening it to 1.0.
+            samples.append(f"{key}={actual[key].item()!r} vs {expected[key].item()!r}")
+        parts.append("worst=[" + ", ".join(samples) + "]")
+
+    return ", ".join(parts)
+
+
 def _compare_outputs(test_args, golden_args, output_names, rtol, atol):
     """Compare output tensors against golden values."""
     import torch  # noqa: PLC0415
@@ -1599,8 +1664,7 @@ def _compare_outputs(test_args, golden_args, output_names, rtol, atol):
         actual = getattr(test_args, name)
         expected = getattr(golden_args, name)
         if not torch.allclose(actual, expected, rtol=rtol, atol=atol):
-            diff = (actual - expected).abs().max().item()
-            raise AssertionError(f"Golden mismatch on '{name}': max_diff={diff}, rtol={rtol}, atol={atol}")
+            raise AssertionError(f"Golden mismatch on '{name}': {_describe_mismatch(actual, expected, rtol, atol)}")
 
 
 def compile_chip_callable_spec(spec, platform, runtime, cache_key):
