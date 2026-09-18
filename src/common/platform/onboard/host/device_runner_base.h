@@ -1467,7 +1467,6 @@ protected:
     simpler::tmr::TmrContextRevokeReceipt *kernel_revoke_host_receipt_{nullptr};
     KernelContextRevoke kernel_revoke_;
     bool kernel_coordination_ready_{false};
-    rtFuncHandle kernel_result_handle_{nullptr};
     int block_dim_{0};
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
     int worker_count_{0};  // Stored for print_handshake_results

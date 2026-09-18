@@ -14,11 +14,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 get_filename_component(ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." ABSOLUTE)
 set(ASCEND_HOME_PATH $ENV{ASCEND_HOME_PATH})
 include("${ROOT}/cmake/host_log_sources.cmake")
-add_executable(tmr_caller_probe probe.cpp
+add_library(tmr_caller_probe SHARED probe.cpp
     "${ROOT}/src/common/aicpu_loader/host/load_aicpu_op.cpp"
-    "${ROOT}/src/common/platform/shared/host/kernel_execution_state.cpp"
-    "${ROOT}/src/common/platform/shared/host/kernel_device_resources.cpp"
-    "${ROOT}/src/common/platform/onboard/host/kernel_platform_ops.cpp"
     "${ROOT}/src/common/task_interface/assert_compat.cpp"
     ${SIMPLER_HOST_LOG_SOURCES})
 set(RUNTIME "${ROOT}/src/a2a3/runtime/tensormap_and_ringbuffer")
@@ -26,7 +23,6 @@ target_include_directories(tmr_caller_probe PRIVATE
     "${ROOT}/src/common" "${ROOT}/src/common/task_interface" "${ROOT}/src/common/worker"
     "${ROOT}/src/common/platform/include" "${ROOT}/src/a2a3/platform/include"
     "${ROOT}/src/common/log/include" "${ROOT}/src/common/aicpu_loader/host"
-    "${ROOT}/src/common/platform/onboard/host"
     "${RUNTIME}/runtime" "${RUNTIME}/common" "${RUNTIME}/.."
     "${ASCEND_HOME_PATH}/include" "${ASCEND_HOME_PATH}/pkg_inc"
     "${ASCEND_HOME_PATH}/pkg_inc/base" "${ASCEND_HOME_PATH}/pkg_inc/runtime"

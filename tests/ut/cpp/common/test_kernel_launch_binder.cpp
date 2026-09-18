@@ -12,31 +12,6 @@
 #include "kernel_binder_test_support.h"
 
 namespace kernel_binder_test {
-TEST(KernelBinder, CallerResultCheckRunsAfterJoinAndBeforeTail) {
-    for (bool fail : {false, true}) {
-        Fixture f;
-        ASSERT_NO_FATAL_FAILURE(f.initialize());
-        auto ops = f.fake.ops();
-        ops.check_result = [](void *context, void *) noexcept {
-            return static_cast<Fake *>(context)->append(Step::CheckResult);
-        };
-        if (fail) f.fake.fail_at = static_cast<int>(success.size());
-        const auto result = launch_bound_kernel(f.binding, ptr(100), f.fake.gate(), ops);
-        auto expected = success;
-        expected.insert(expected.end() - 1, Step::CheckResult);
-        if (fail) expected.pop_back();
-        EXPECT_EQ(f.fake.trace, expected);
-        EXPECT_EQ(result.tail_recorded, !fail);
-        EXPECT_EQ(f.fake.poisoned, fail);
-        if (fail) {
-            EXPECT_EQ(result.failed_step, Step::CheckResult);
-            EXPECT_NE(result.status, 0);
-        } else {
-            EXPECT_EQ(result.status, 0);
-        }
-    }
-}
-
 TEST(KernelBinder, ThreeStreamSuccessAndSteadyStateHaveExactTrace) {
     Fixture f;
     ASSERT_NO_FATAL_FAILURE(f.initialize());

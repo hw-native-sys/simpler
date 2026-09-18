@@ -38,10 +38,26 @@ int get_current_device(void *, int *device_id) noexcept {
 
 int create_hidden_stream(void *, void **stream) noexcept {
     rtStream_t created = nullptr;
-    const rtError_t rc = rtStreamCreate(&created, 0);
+    rtError_t rc = rtStreamCreate(&created, 0);
     if (rc != RT_ERROR_NONE) {
         LOG_ERROR("kernel context: rtStreamCreate failed: %d", static_cast<int>(rc));
         ACL_LOG_ERROR_DETAIL(rc);
+        return static_cast<int>(rc);
+    }
+    // Kernel-mode work runs on hidden streams, while callers synchronize the
+    // stream connected through the completion-event chain.  Continue mode can
+    // let an event after a failed hidden task complete without making that
+    // failure visible to the caller.  Use RTS' native stop-on-failure handling
+    // instead of enqueueing a second AICPU task to poll a private result.
+    rc = aclrtSetStreamFailureMode(created, ACL_STOP_ON_FAILURE);
+    if (rc != ACL_SUCCESS) {
+        LOG_ERROR("kernel context: aclrtSetStreamFailureMode failed: %d", static_cast<int>(rc));
+        ACL_LOG_ERROR_DETAIL(rc);
+        const rtError_t cleanup = rtStreamDestroy(created);
+        if (cleanup != RT_ERROR_NONE) {
+            LOG_ERROR("kernel context: rtStreamDestroy after mode failure failed: %d", static_cast<int>(cleanup));
+            ACL_LOG_ERROR_DETAIL(cleanup);
+        }
         return static_cast<int>(rc);
     }
     *stream = created;

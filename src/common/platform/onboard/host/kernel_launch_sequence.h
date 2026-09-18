@@ -71,8 +71,6 @@ enqueue_kernel_launch_sequence(const KernelLaunchOps &ops, const KernelLaunchHan
     if (!step(KernelLaunchStep::JoinAicore, ops.wait_event(ops.context, h.aicpu, h.aicore_done))) return result;
     if (!step(KernelLaunchStep::AicpuDone, ops.record_event(ops.context, h.aicpu_done, h.aicpu))) return result;
     if (!step(KernelLaunchStep::JoinAicpu, ops.wait_event(ops.context, h.caller, h.aicpu_done))) return result;
-    if (ops.check_result && !step(KernelLaunchStep::CheckResult, ops.check_result(ops.context, h.caller)))
-        return result;
     if (!step(KernelLaunchStep::SerialTail, ops.record_event(ops.context, h.serial_tail, h.caller))) return result;
     result.tail_recorded = true;
     return result;

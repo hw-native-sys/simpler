@@ -110,26 +110,8 @@ int register_kernel_context(Executor &executor, const void *arg) noexcept {
     set_platform_scope_stats_base(0);
     set_platform_phase_base(0);
     executor.kernel_context_ = candidate;
-    executor.kernel_errors_.reset();
     executor.kernel_context_ready_ = true;
     return 0;
-}
-
-template <typename Executor>
-int check_kernel_result(Executor &executor, const void *arg) noexcept {
-    if (arg == nullptr || !executor.kernel_context_ready_) return -1;
-    TmrContextRegistrationArgs expected{};
-    std::memcpy(&expected, arg, sizeof(expected));
-    const auto &d = executor.kernel_context_.descriptor;
-    if (expected.descriptor_address != d.self_address || expected.context_generation != d.context_generation) return -1;
-    const auto *control = reinterpret_cast<const TmrLaunchControl *>(d.control_address);
-    cache_invalidate_range(control, sizeof(*control));
-    return executor.kernel_errors_.read() == 0 &&
-                   __atomic_load_n(&control->completion, __ATOMIC_ACQUIRE) ==
-                       static_cast<uint32_t>(TmrCompletion::Complete) &&
-                   control->runtime_status == 0 && control->cleanup_status == 0 ?
-               0 :
-               -1;
 }
 
 template <typename Executor>

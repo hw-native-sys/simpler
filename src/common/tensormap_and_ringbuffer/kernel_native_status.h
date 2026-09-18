@@ -11,26 +11,9 @@
 #pragma once
 
 #include <cstdint>
-#include <atomic>
-
 #include "task_interface/kernel_dispatch_args.h"
 
 namespace simpler::tmr {
-
-// Context-lifetime first error, independent of per-round control/report clears.
-class KernelErrorRecord {
-public:
-    void record(int32_t runtime, int32_t cleanup) noexcept {
-        const uint64_t value = (uint64_t{static_cast<uint32_t>(runtime)} << 32) | static_cast<uint32_t>(cleanup);
-        uint64_t empty = 0;
-        if (value != 0) first_.compare_exchange_strong(empty, value, std::memory_order_release);
-    }
-    uint64_t read() const noexcept { return first_.load(std::memory_order_acquire); }
-    void reset() noexcept { first_.store(0, std::memory_order_release); }
-
-private:
-    std::atomic<uint64_t> first_{0};
-};
 
 // CANN's aicpu_common/context/utils/status.h fixes OK=0 and INNER_ERROR=2
 // for direct CPU entries. Keep the SDK dependency out of simulation builds;

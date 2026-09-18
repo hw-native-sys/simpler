@@ -13,8 +13,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 get_filename_component(ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." ABSOLUTE)
 set(ASCEND_HOME_PATH $ENV{ASCEND_HOME_PATH})
-add_library(tmr_caller_probe_device SHARED probe.cpp
-    "${ROOT}/src/common/platform/onboard/aicpu/cache_ops.cpp")
+add_library(tmr_caller_probe_device SHARED probe.cpp)
 target_include_directories(tmr_caller_probe_device PRIVATE
     "${ROOT}/src/common/platform/include"
     "${ASCEND_HOME_PATH}/include" "${ASCEND_HOME_PATH}/pkg_inc")

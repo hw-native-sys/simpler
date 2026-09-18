@@ -165,7 +165,6 @@ struct AicpuExecutor {
     bool kernel_control_attached_{false};
     simpler::tmr::PreparedKernelContext kernel_context_;
     bool kernel_context_ready_{false};
-    simpler::tmr::KernelErrorRecord kernel_errors_;
 
     static bool kernel_arch_argument(const KernelArgs &args, uint64_t *out) noexcept {
         if (args.aicore_pmu_ring_addrs != 0 || args.force_simt_anchor != 0) return false;
@@ -1100,9 +1099,6 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_register_tmr
 }
 extern "C" __attribute__((visibility("default"))) int simpler_aicpu_revoke_tmr_context(void *arg) {
     return simpler::tmr::to_aicpu_native_status(simpler::tmr::revoke_kernel_context(g_aicpu_executor, arg));
-}
-extern "C" __attribute__((visibility("default"))) int simpler_aicpu_check_tmr_result(void *arg) {
-    return simpler::tmr::to_aicpu_native_status(simpler::tmr::check_kernel_result(g_aicpu_executor, arg));
 }
 int simpler::tmr::execute_kernel_task(void *arg) noexcept {
     prepare_kernel_aicpu_thread();

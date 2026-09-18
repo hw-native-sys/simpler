@@ -11,20 +11,8 @@
 
 #pragma once
 #include <cstdint>
-struct alignas(64) CallerProbeReport {
-    uint64_t work_complete;
-    int32_t work_status;
-    uint32_t reserved;
-    uint8_t padding[48];
-    uint64_t check_complete;
-    int32_t observed_status;
-    uint32_t check_reserved;
-    uint8_t check_padding[48];
-};
 struct CallerProbeArgs {
-    uint64_t report;
     int32_t status;
     uint32_t reserved;
 };
-static_assert(sizeof(CallerProbeReport) == 128);
-static_assert(sizeof(CallerProbeArgs) == 16);
+static_assert(sizeof(CallerProbeArgs) == 8);

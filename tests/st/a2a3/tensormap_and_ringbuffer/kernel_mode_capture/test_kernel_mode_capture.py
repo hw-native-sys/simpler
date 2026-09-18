@@ -14,6 +14,7 @@ import platform
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -34,6 +35,7 @@ SCENARIOS = (
     "device_error_replay",
     "runtime_error_eager",
     "runtime_error_replay",
+    "threaded_cross_stream_error",
     "cold_unsynced",
     "warm",
     "multi_callable",
@@ -130,7 +132,9 @@ def test_tmr_kernel_mode(st_platform, st_device_ids, scenario, capture_observer)
     output = (tmp_path / "run.log").read_text()
     assert result.returncode == 0, f"{output}\nArtifacts: {tmp_path}"
     if "_error_" in scenario:
-        assert f"PASS {scenario} caller_error=1 cores_retired=1" in output
+        assert f"PASS {scenario} caller_error=1 cores_retired=1 context_error=1" in output
+    elif scenario == "threaded_cross_stream_error":
+        assert "PASS threaded_cross_stream_error caller_error=1 cores_retired=1 host_reject=1 context_error=1" in output
     elif scenario == "close_fail_free":
         assert "PASS close_fail_free retained_then_retried=1" in output
     elif scenario == "init_fail_handshake":
@@ -187,9 +191,13 @@ def _bind_acl(lib):
         "aclFinalize": [],
         "aclrtSynchronizeDevice": [],
         "aclrtSetDevice": [ctypes.c_int],
+        "aclrtGetCurrentContext": [ctypes.POINTER(ctypes.c_void_p)],
+        "aclrtSetCurrentContext": [ctypes.c_void_p],
         "aclrtResetDevice": [ctypes.c_int],
         "aclrtCreateStream": [ctypes.POINTER(ctypes.c_void_p)],
         "aclrtDestroyStream": [ctypes.c_void_p],
+        "aclrtCreateEvent": [ctypes.POINTER(ctypes.c_void_p)],
+        "aclrtRecordEvent": [ctypes.c_void_p, ctypes.c_void_p],
         "aclrtSynchronizeStreamWithTimeout": [ctypes.c_void_p, ctypes.c_int32],
         "aclrtMalloc": [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_int],
         "aclrtFree": [ctypes.c_void_p],
@@ -554,8 +562,19 @@ def _replay(context, graph, stream=None):
     assert observer.capture_observer_total_queries() == before
 
 
+def _working_event_on_stream(lib, stream):
+    from tests.st.a2a3.tensormap_and_ringbuffer.kernel_mode_capture.kernel_capture_values import _check  # noqa: PLC0415
+
+    event = ctypes.c_void_p()
+    _check(lib.aclrtCreateEvent(ctypes.byref(event)), "create independent stream event")
+    _check(lib.aclrtRecordEvent(event, stream), "record independent stream event")
+    _check(lib.aclrtSynchronizeStreamWithTimeout(stream, 10000), "independent stream before failure")
+    return event
+
+
 def _check_device_failure(context, scenario, launch, record_nodes, replay):
     observer = context.observer
+    independent_event = _working_event_on_stream(context.lib, context.streams[1])
     if scenario.startswith("device_error_"):
         observer.capture_observer_corrupt_next_invocation()
     if scenario.endswith("replay"):
@@ -571,9 +590,101 @@ def _check_device_failure(context, scenario, launch, record_nodes, replay):
     expect_opened = scenario.startswith("runtime_error_")
     retired = observer.capture_observer_failure_retired(int(expect_opened))
     assert retired == 0, f"failed round retirement rc={retired}, expect_opened={expect_opened}"
-    print(f"PASS {scenario} caller_error=1 cores_retired=1", flush=True)
+    assert observer.capture_observer_cpu_launches() == 1
+    assert observer.capture_observer_core_launches() == 1
+    independent_status = context.lib.aclrtRecordEvent(independent_event, context.streams[1])
+    assert independent_status != 0, "unrelated stream accepted new work after context failure"
+    print(
+        f"PASS {scenario} caller_error=1 cores_retired=1 context_error=1 "
+        f"caller_status={status} independent_status={independent_status}",
+        flush=True,
+    )
     # Error streams/graphs are terminal; this test proves retirement,
     # not a D2 recovery policy. Let the isolated process release them.
+    os._exit(0)
+
+
+def _check_threaded_cross_stream_failure(
+    context, guarded, prepare, launch, callable_ids, source, destination, io, initial
+):
+    from simpler.task_interface import ChipStorageTaskArgs, ChipTensor, DataType  # noqa: PLC0415
+
+    from tests.st.a2a3.tensormap_and_ringbuffer.kernel_mode_capture.kernel_capture_values import (  # noqa: PLC0415
+        _COUNT,
+        _check,
+    )
+
+    lib, observer = context.lib, context.observer
+    current = ctypes.c_void_p()
+    _check(lib.aclrtGetCurrentContext(ctypes.byref(current)), "get current context")
+    assert current.value
+
+    def submit_on_second_caller(expected):
+        outcome = []
+
+        def submit():
+            try:
+                _check(lib.aclrtSetCurrentContext(current), "set worker context")
+                args = ChipStorageTaskArgs()
+                args.add_tensor(ChipTensor.make(source.value, (_COUNT,), DataType.FLOAT32, child_memory=True))
+                args.add_tensor(ChipTensor.make(destination.value, (_COUNT,), DataType.FLOAT32, child_memory=True))
+                args.add_scalar(ctypes.c_float(1.25))
+                observer.capture_observer_invocation_scope(1)
+                try:
+                    guarded(
+                        lib.simpler_kernel_mode_launch,
+                        context.handle,
+                        callable_id,
+                        args.__ptr__(),
+                        context.streams[1],
+                        expected=expected,
+                    )
+                finally:
+                    observer.capture_observer_invocation_scope(0)
+                outcome.append(None)
+            except BaseException as error:
+                outcome.append(error)
+
+        worker = threading.Thread(target=submit, daemon=True)
+        worker.start()
+        worker.join(timeout=10)
+        assert not worker.is_alive(), "second caller Host submission stalled"
+        assert outcome, "second caller did not report a result"
+        if outcome[0] is not None:
+            raise outcome[0]
+
+    prepare(0)
+    callable_id = callable_ids[0]
+    observer.capture_gate_arm()
+    launch(0)
+    assert observer.capture_gate_blocked() == 1
+    before = _submission_counts(observer)
+    submit_on_second_caller(-1002)
+    assert _submission_counts(observer) == before, "rejected caller submitted device work"
+    observer.capture_gate_release()
+    _check(observer.capture_gate_finish(), "finish first caller gate")
+    _check(lib.aclrtSynchronizeStreamWithTimeout(context.streams[0], 10000), "first caller")
+    io.verify(destination, [value + 1.25 for value in initial])
+
+    first_caller_event = _working_event_on_stream(lib, context.streams[0])
+    observer.capture_observer_corrupt_next_invocation()
+    submit_on_second_caller(0)
+    started = time.monotonic()
+    status = lib.aclrtSynchronizeStreamWithTimeout(context.streams[1], 10000)
+    elapsed_ms = (time.monotonic() - started) * 1000
+    assert status != 0, "hidden AICPU error was not propagated to second caller"
+    assert elapsed_ms < 9000, "second caller failure only surfaced through timeout"
+    assert observer.capture_observer_failure_retired(0) == 0
+    assert observer.capture_observer_cpu_launches() == 2
+    assert observer.capture_observer_core_launches() == 2
+    first_caller_status = lib.aclrtRecordEvent(first_caller_event, context.streams[0])
+    assert first_caller_status != 0, "first caller accepted work after second caller's context failure"
+    print(
+        f"PASS threaded_cross_stream_error caller_error=1 cores_retired=1 host_reject=1 "
+        f"context_error=1 sync_status={status} first_caller_status={first_caller_status} "
+        f"latency_ms={elapsed_ms:.1f}",
+        flush=True,
+    )
     os._exit(0)
 
 
@@ -713,6 +824,10 @@ def _run(device, scenario, build_dir):
         if scenario.startswith(("device_error_", "runtime_error_")):
             prepare(0)
             _check_device_failure(context, scenario, launch, record_nodes, replay)
+        if scenario == "threaded_cross_stream_error":
+            _check_threaded_cross_stream_failure(
+                context, guarded, prepare, launch, callable_ids, pairs[0][0], pairs[0][1], io, initial
+            )
         if scenario == "close_fail_free":
             _run_close_failure(context, prepare, launch, sync)
             _close(lib, ctx, allocations, streams, device)

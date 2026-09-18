@@ -375,8 +375,8 @@ extern "C" rtError_t rtsLaunchCpuKernel(
     if (invocation_scope) {
         if (const auto rc = capture_gate_install_if_armed(stream); rc != 0) return rc;
     }
-    // The separate caller-result node carries only trusted context identity;
-    // it is not an invocation and must not be counted as a second dispatch.
+    // Context registration/revoke nodes carry only trusted context identity;
+    // they are not invocations and must not be counted as dispatches.
     if (observer.armed && invocation_scope && args != nullptr &&
         args->baseArgs.argsSize != sizeof(simpler::tmr::TmrContextRegistrationArgs))
         observe_cpu(args);

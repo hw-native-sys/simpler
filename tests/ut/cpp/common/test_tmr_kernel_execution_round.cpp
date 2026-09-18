@@ -81,7 +81,6 @@ struct ExecutorModel {
 
     KernelRoundGate kernel_gate_;
     bool kernel_control_attached_{false};
-    simpler::tmr::KernelErrorRecord kernel_errors_;
     TmrLaunchControl control{};
     std::array<TmrCoreReport, 3> reports{};
     const std::array<int32_t, kExecutionThreads> allowed{10, 11, 12};
@@ -173,8 +172,6 @@ TEST(TmrKernelExecutionRoundTest, CompleteInitFailureSkipsAllExecutionAndNextRou
     EXPECT_EQ(executor.completions.load(), 1);
     EXPECT_EQ(executor.kernel_cores_.published.runtime_status, -27);
     EXPECT_EQ(executor.kernel_cores_.published.cleanup_status, 0);
-    const uint64_t first_error = uint64_t{static_cast<uint32_t>(-27)} << 32;
-    EXPECT_EQ(executor.kernel_errors_.read(), first_error);
     EXPECT_EQ(executor.finalizations.load(), 1);
     EXPECT_EQ(executor.clears.load(), 1);
     EXPECT_TRUE(executor.kernel_gate_.idle());
@@ -187,12 +184,6 @@ TEST(TmrKernelExecutionRoundTest, CompleteInitFailureSkipsAllExecutionAndNextRou
     EXPECT_EQ(executor.completions.load(), 2);
     EXPECT_EQ(executor.clears.load(), 2);
     EXPECT_TRUE(executor.kernel_gate_.idle());
-    // An already-enqueued round may finish after the first native error. Its
-    // report/clear must not erase diagnostics when graph execution skips the
-    // caller check node.
-    EXPECT_EQ(executor.kernel_errors_.read(), first_error);
-    executor.kernel_errors_.record(-99, -101);
-    EXPECT_EQ(executor.kernel_errors_.read(), first_error);
 }
 
 TEST(TmrKernelExecutionRoundTest, ThreadFailureCancelsAndEveryThreadReadsTheSameFinalVerdict) {

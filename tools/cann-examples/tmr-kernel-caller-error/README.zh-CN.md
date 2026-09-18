@@ -1,13 +1,38 @@
-# K7 caller 错误传播候选节点探针
+# torch_npu 多流 AICPU 错误传播探针
 
-验证 feat 的真实链式事件序列，在 JoinAicpu 后、SerialTail 前加入 caller 单线程检查节点，能否让调用方感知 hidden AICPU 的 native 0/2 结果。生产入口已接入对应检查节点；本探针仅验证传输机制，不替代生产错误路径验收。
+该探针建立与 Simpler kernel 模式相同的流间依赖：
 
-- 调用正式 LoadAicpuOp / rtsLaunchCpuKernel 和生产 enqueue_kernel_launch_sequence；不安装或使用 Torch。
-- prepare 分配固定 Device report 和锁页 Host 取证区；提交时不分配、不同步。测试末尾的有界同步只用于验收。
-- hidden 主入口仍返回 native=2，不改成成功以强迫 checker 执行。
-- Core 分支只有一项异步 memset，验证事件传播，不验证真实 AICore kernel 或 retirement。
-- 每进程只做一轮 success/error，eager/replay 和 check/no-check 分别运行；终端错误后直接退出，不 reset、不 free、不复用上下文。
-- success 必须有完成回执；error 既要 caller 返回预期 SDK 错误，也要原始执行及 checker 回执。D2H 不可读、超时或意外错误均为失败／未验证。
-- 本探针不修改 borrowed stream 的 failure mode，不证明同图／跨图重叠准入。
+```text
+caller record start
+→ producer wait start
+→ producer launch AICPU task
+→ producer record done
+→ caller wait done
+```
 
-构建时显式设置 checkout-local CCACHE_DIR、四路并行及 ASCEND_HOME_PATH。device 使用 CANN hcc 的 aarch64-target-linux-gnu-g++；host 使用服务器本机编译器。先做架构预检，然后单卡 task-submit，输入依次为 DEVICE、dispatcher SO、probe SO、eager|replay、check|no-check、success|error。
+它不增加结果判断 task。AICPU 入口只返回 CANN 约定的 native `0/2`，由
+RTS 决定错误在 caller stream、device synchronize 和 ACLGraph replay
+中的实际可见行为。Python 侧使用 `torch_npu.npu.Stream/Event/NPUGraph`；
+Host bridge 只负责加载探针 SO 并在 Torch stream 上调用
+`rtsLaunchCpuKernel`。
+
+每个错误观察场景必须在独立进程执行。设备进入错误状态后，进程直接
+退出，不 reset、不卸载 SO、不复用 context。
+
+构建 `device/` 和 `host/` 后运行：
+
+```bash
+python torch_probe.py DEVICE DISPATCHER_SO PROBE_SO HOST_BRIDGE \
+  eager caller success --expect-error 0
+python torch_probe.py DEVICE DISPATCHER_SO PROBE_SO HOST_BRIDGE \
+  eager caller error --expect-error 1
+python torch_probe.py DEVICE DISPATCHER_SO PROBE_SO HOST_BRIDGE \
+  eager device error --expect-error 1
+python torch_probe.py DEVICE DISPATCHER_SO PROBE_SO HOST_BRIDGE \
+  replay device error --expect-error 1
+```
+
+`--aicpu-num` 可将同一入口按多个 AICPU block 启动，用于对照 Simpler 的
+正式 launch。输出中的 `observed_error` 是机制事实；只有传入
+`--expect-error` 时才断言观察结果。预期值应在目标 CANN/torch_npu
+版本上实测后固定到集成测试，而不是由探针预先猜测具体异常码。

@@ -10,26 +10,8 @@
  */
 
 #include "../protocol.h"
-#include "aicpu/cache_maintenance.h"
-#include "aicpu/thread_scheduling.h"
-
 extern "C" __attribute__((visibility("default"))) int simpler_aicpu_init(void *) { return 0; }
 extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *packet) {
-    (void)use_normal_aicpu_scheduling();
-    const auto &args = *static_cast<const CallerProbeArgs *>(packet);
-    auto *report = reinterpret_cast<CallerProbeReport *>(args.report);
-    report->work_status = args.status;
-    report->work_complete = 1;
-    cache_flush_range(report, 64);
-    return args.status == 0 ? 0 : 2;
-}
-extern "C" __attribute__((visibility("default"))) int caller_probe_check(void *packet) {
-    const auto &args = *static_cast<const CallerProbeArgs *>(packet);
-    auto *report = reinterpret_cast<CallerProbeReport *>(args.report);
-    cache_invalidate_range(report, 64);
-    const int status = report->work_complete == 1 ? report->work_status : -91;
-    report->observed_status = status;
-    report->check_complete = 1;
-    cache_flush_range(reinterpret_cast<unsigned char *>(report) + 64, 64);
-    return status == 0 ? 0 : 2;
+    if (packet == nullptr) return 2;
+    return static_cast<const CallerProbeArgs *>(packet)->status == 0 ? 0 : 2;
 }

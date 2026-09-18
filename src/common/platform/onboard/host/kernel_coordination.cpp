@@ -87,8 +87,6 @@ int DeviceRunnerBase::prepare_kernel_coordination() {
     if (rc != 0) return rc;
     kernel_revoke_host_receipt_ = static_cast<TmrContextRevokeReceipt *>(host_receipt);
     std::memcpy(kernel_revoke_host_receipt_, &initial.receipt, sizeof(initial.receipt));
-    kernel_result_handle_ = load_aicpu_op_.BuiltInHandle("simpler_aicpu_check_tmr_result");
-    if (!kernel_result_handle_) return PTO_RUNTIME_ERR_INTERNAL;
     TmrContextRegistrationArgs registration{d.self_address, d.context_generation};
     auto stream = kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu);
     kernel_revoke_.registration_may_exist();

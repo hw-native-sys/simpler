@@ -78,7 +78,6 @@ void platform_init_aicore_regs(uint64_t) { ++opened_windows; }
 uint64_t platform_aicore_exit_deadline() { return get_sys_cnt_aicpu() + 10000000000ULL; }
 void platform_close_aicore_window(uint64_t) { ++closed_windows; }
 
-extern "C" int simpler_aicpu_register_callable(void *);
 extern "C" int simpler_aicpu_prepare_tmr_context(void *);
 extern "C" int simpler_aicpu_register_tmr_kernel_callable(void *);
 extern "C" int simpler_aicpu_revoke_tmr_context(void *);
@@ -112,7 +111,7 @@ protected:
         ASSERT_NE(runtime, nullptr);
         runtime->prebuilt_layout = layout;
         binding = {
-            {reinterpret_cast<uint64_t>(&identity), 13},
+            {reinterpret_cast<uint64_t>(&resident_args), 13},
             resident.get(),
             {sm.region_ptr(sm_offset), sm_size, sm_size},
             {arena.base(), layout.offsets.arena_size, layout.offsets.arena_size},
@@ -130,8 +129,8 @@ protected:
         ASSERT_TRUE(library.is_open());
         binary.assign(std::istreambuf_iterator<char>(library), std::istreambuf_iterator<char>());
         ASSERT_FALSE(binary.empty());
-        register_orchestration(3, "orchestration_a", "config_a");
-        register_orchestration(4, "orchestration_b", "config_b");
+        make_orchestration_image(3, "orchestration_a", "config_a");
+        make_orchestration_image(4, "orchestration_b", "config_b");
     }
 
     void TearDown() override {
@@ -155,26 +154,26 @@ protected:
         return rc;
     }
 
-    void register_orchestration(int id, const char *entry, const char *config) {
-        RegisterCallableArgs args{};
-        args.active_callable_id = id;
-        args.dev_orch_so_addr = reinterpret_cast<uint64_t>(binary.data());
-        args.dev_orch_so_size = binary.size();
-        std::strcpy(args.device_orch_func_name, entry);
-        std::strcpy(args.device_orch_config_name, config);
-        ASSERT_EQ(simpler_aicpu_register_callable(&args), 0);
+    void make_orchestration_image(int id, const char *entry, const char *config) {
+        const ArgDirection signature[]{ArgDirection::OUT, ArgDirection::SCALAR};
+        orchestration_images[id] = make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(
+            signature, 2, entry, binary.data(), binary.size(), nullptr, nullptr, 0, config
+        );
+        ASSERT_FALSE(orchestration_images[id].empty());
     }
 
-    void prepare_native_context(const char *entry = "orchestration_a") {
-        resident->dev.aicpu_launch_count = 3;
-        resident->dev.aicpu_allowed_cpu_count = 2;
-        resident->dev.aicpu_allowed_cpus[0] = 10;
-        resident->dev.aicpu_allowed_cpus[1] = 11;
+    void prepare_native_context(
+        const char *entry = "orchestration_a", int32_t execution_threads = 2, uint64_t generation = 13
+    ) {
+        resident->dev.aicpu_launch_count = execution_threads + 1;
+        resident->dev.aicpu_allowed_cpu_count = execution_threads;
+        for (int32_t i = 0; i < execution_threads; ++i)
+            resident->dev.aicpu_allowed_cpus[i] = 10 + i;
         resident_args.runtime_args = resident.get();
         resident_args.regs = get_platform_regs();
         descriptor.version = kTmrKernelContextVersion;
         descriptor.bytes = sizeof(descriptor);
-        descriptor.context_generation = 13;
+        descriptor.context_generation = generation;
         descriptor.self_address = reinterpret_cast<uint64_t>(&descriptor);
         descriptor.resident_runtime = reinterpret_cast<uint64_t>(resident.get());
         descriptor.resident_kernel_args = reinterpret_cast<uint64_t>(&resident_args);
@@ -189,8 +188,8 @@ protected:
         descriptor.control_bytes = sizeof(control);
         descriptor.reports_address = reinterpret_cast<uint64_t>(reports.data());
         descriptor.reports_bytes = sizeof(reports);
-        descriptor.launch_threads = 3;
-        descriptor.execution_threads = 2;
+        descriptor.launch_threads = execution_threads + 1;
+        descriptor.execution_threads = execution_threads;
         descriptor.worker_count = 3;
         registration = {descriptor.self_address, descriptor.context_generation};
         ASSERT_EQ(simpler_aicpu_prepare_tmr_context(&registration), 0);
@@ -201,7 +200,7 @@ protected:
             signature, 2, entry, binary.data(), binary.size(), nullptr, nullptr, 0, "config_a"
         );
         TmrCallableRegistrationArgs callable_registration{
-            13, reinterpret_cast<uint64_t>(kernel_image.data()), kernel_image.size(), 7, 0
+            generation, reinterpret_cast<uint64_t>(kernel_image.data()), kernel_image.size(), 7, 0
         };
         ASSERT_EQ(simpler_aicpu_register_tmr_kernel_callable(&callable_registration), 0);
         ASSERT_EQ(simpler_aicpu_register_tmr_kernel_callable(&callable_registration), 0);
@@ -242,14 +241,26 @@ protected:
         std::vector<int32_t> allowed(execution_threads);
         for (int32_t i = 0; i < execution_threads; ++i)
             allowed[i] = 10 + i;
-        KernelExecutionRequest request{packet,
-                                       callable,
-                                       binding,
-                                       {&control, reports.data(), 3, 0},
-                                       allowed.data(),
-                                       execution_threads,
-                                       execution_threads + 1,
-                                       admission};
+        if (!native && !registered_context) prepare_native_context();
+        KernelExecutionRequest request;
+        request.packet = packet;
+        request.callable = callable;
+        if (!native) {
+            const auto &image = orchestration_images[callable.identity.callable_id];
+            request.image_address = reinterpret_cast<uint64_t>(image.data());
+            request.image_bytes = image.size();
+            request.callable_id = callable.identity.callable_id;
+            TmrCallableRegistrationArgs registration{
+                binding.identity.context_generation, request.image_address, request.image_bytes, request.callable_id, 0
+            };
+            EXPECT_EQ(simpler_aicpu_register_tmr_kernel_callable(&registration), 0);
+        }
+        request.binding = binding;
+        request.handshake = {&control, reports.data(), 3, 0};
+        request.allowed_cpus = allowed.data();
+        request.execution_threads = execution_threads;
+        request.launched_threads = execution_threads + 1;
+        request.admission_status = admission;
         std::vector<std::thread> cores;
         for (size_t i = 0; i < reports.size(); ++i) {
             cores.emplace_back([&, i] {
@@ -321,8 +332,8 @@ protected:
         EXPECT_EQ(resident->dev.aicpu_thread_num, 2);
         EXPECT_EQ(resident->dev.serial_orch_sched, serial);
         EXPECT_EQ(resident->dev.ready_queue_shards, RUNTIME_DEFAULT_READY_QUEUE_SHARDS);
-        EXPECT_EQ(resident->dev.aicpu_allowed_cpu_count, 0);
-        EXPECT_EQ(resident->dev.aicpu_launch_count, 0);
+        EXPECT_EQ(resident->dev.aicpu_allowed_cpu_count, registered_context ? 2 : 0);
+        EXPECT_EQ(resident->dev.aicpu_launch_count, registered_context ? 3 : 0);
         EXPECT_EQ(resident->get_gm_sm_ptr(), binding.sm.base);
         EXPECT_EQ(resident->get_prebuilt_arena_base(), binding.arena.base);
         EXPECT_EQ(resident->get_prebuilt_runtime_offset(), binding.runtime_offset);
@@ -336,7 +347,7 @@ protected:
     DeviceArena heap;
     std::vector<char> binary;
     std::array<uint64_t, 6> output{};
-    uint64_t identity{0};
+    std::array<std::vector<uint8_t>, 7> orchestration_images;
     TmrLaunchControl control{};
     std::array<TmrCoreReport, 3> reports{};
     TmrKernelContextDescriptor descriptor{};
@@ -530,7 +541,7 @@ TEST_F(TmrExecutorExecutionInputsTest, NativeRegistrationRejectsChangedStaticIde
 }
 
 TEST_F(TmrExecutorExecutionInputsTest, CoordinatedAdmissionAndConfigFailuresCancelUnopenedCoresAndReuse) {
-    register_orchestration(5, "orchestration_a", "config_mismatch");
+    make_orchestration_image(5, "orchestration_a", "config_mismatch");
     for (int32_t fault : {1, 2, 3, 0}) {
         output.fill(0);
         PreparedInvocationView callable{fault == 2 ? 5 : 3, 1, 1};
@@ -555,6 +566,7 @@ TEST_F(TmrExecutorExecutionInputsTest, CoordinatedMultipleSchedulersShareOnePubl
     for (int32_t execution_threads : {3, 4}) {
         SCOPED_TRACE(execution_threads);
         resident->dev.aicpu_thread_num = execution_threads;
+        prepare_native_context("orchestration_a", execution_threads, static_cast<uint64_t>(10 + execution_threads));
         for (bool serial : {false, true}) {
             SCOPED_TRACE(serial);
             resident->dev.serial_orch_sched = serial;
@@ -584,6 +596,7 @@ TEST_F(TmrExecutorExecutionInputsTest, CoordinatedMultipleSchedulersShareOnePubl
                 EXPECT_EQ(resident->dev.aicpu_thread_num, execution_threads);
             }
         }
+        EXPECT_EQ(revoke_context(registration.context_generation), 0);
     }
 }
 
@@ -629,6 +642,7 @@ TEST_F(TmrExecutorExecutionInputsTest, AdmittedSnapshotOwnsTransportAndBusyRejec
 }
 
 TEST_F(TmrExecutorExecutionInputsTest, InvalidExecutionConfigurationCancelsAndNextRoundReusesExecutor) {
+    prepare_native_context();
     for (bool serial : {false, true}) {
         SCOPED_TRACE(serial);
         output.fill(0);
@@ -654,7 +668,7 @@ TEST_F(TmrExecutorExecutionInputsTest, InvalidExecutionConfigurationCancelsAndNe
 }
 
 TEST_F(TmrExecutorExecutionInputsTest, ExpectedCountMismatchCancelsAndNextRoundReusesExecutor) {
-    register_orchestration(5, "orchestration_a", "config_mismatch");
+    make_orchestration_image(5, "orchestration_a", "config_mismatch");
     for (bool serial : {false, true}) {
         SCOPED_TRACE(serial);
         resident->dev.serial_orch_sched = serial;
@@ -683,7 +697,7 @@ TEST_F(TmrExecutorExecutionInputsTest, ExpectedCountMismatchCancelsAndNextRoundR
 }
 
 TEST_F(TmrExecutorExecutionInputsTest, RuntimeErrorIsPublishedBeforeClearAndNextRoundReusesExecutor) {
-    register_orchestration(6, "orchestration_error", "config_a");
+    make_orchestration_image(6, "orchestration_error", "config_a");
     for (bool serial : {false, true}) {
         SCOPED_TRACE(serial);
         output.fill(0);
@@ -723,9 +737,18 @@ TEST_F(TmrExecutorExecutionInputsTest, RejectedAdmissionLeavesActualExecutorInac
         output.fill(0);
         auto trusted_callable = callable;
         const size_t capacity = binding.arena.capacity;
-        if (wrong_signature) ++trusted_callable.scalar_count;
-        else binding.arena.capacity = 0;
-        const auto results = coordinated_round({trusted_callable, {}}, packet.packet());
+        const auto encoded = packet.packet();
+        std::vector<uint8_t> malformed(encoded.data, encoded.data + encoded.size);
+        if (wrong_signature) {
+            SimplerKernelInvocationHeader header{};
+            std::memcpy(&header, malformed.data(), sizeof(header));
+            ++header.scalar_count;
+            std::memcpy(malformed.data(), &header, sizeof(header));
+        } else {
+            binding.arena.capacity = 0;
+        }
+        const ByteSpan round_packet = wrong_signature ? ByteSpan{malformed.data(), malformed.size()} : encoded;
+        const auto results = coordinated_round({trusted_callable, {}}, round_packet);
         binding.arena.capacity = capacity;
         const auto expected =
             wrong_signature ? KernelDispatchStatus::InvalidArgs : KernelDispatchStatus::InvalidBinding;

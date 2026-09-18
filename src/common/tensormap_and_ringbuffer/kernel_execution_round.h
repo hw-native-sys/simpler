@@ -99,7 +99,6 @@ int32_t execute_kernel_round_impl(
         if (!gate.publish_final_status(
                 ticket, sm_status, cleanup,
                 [&](const KernelFinalStatus &final) noexcept {
-                    executor.kernel_errors_.record(final.runtime_status, final.cleanup_status);
                     if (executor.kernel_control_attached_)
                         executor.kernel_cores_.publish_status(final.runtime_status, final.cleanup_status);
                 }

@@ -21,7 +21,7 @@ int DeviceRunnerBase::launch_kernel_callable(
 ) {
     std::unique_lock<std::mutex> lease(kernel_submission_mutex_, std::try_to_lock);
     if (!lease.owns_lock() || !kernel_context_claim_.held() || !kernel_exec_state_.accepts_dispatch() ||
-        !persistent_args_.is_prepared() || !kernel_coordination_ready_ || !kernel_result_handle_)
+        !persistent_args_.is_prepared() || !kernel_coordination_ready_)
         return PTO_RUNTIME_ERR_INVALID_STATE;
     int rc = adopt_borrowed_device(device_id_);
     if (rc != 0) return rc;
@@ -135,18 +135,6 @@ int DeviceRunnerBase::launch_kernel_callable(
         return rtsLaunchCpuKernel(
             s.runner->kernel_aicpu_handle_, s.runner->kernel_runtime_.get_aicpu_launch_count(), stream, &config, &native
         );
-    };
-    ops.check_result = [](void *context, void *stream) noexcept {
-        auto &r = *static_cast<Submission *>(context)->runner;
-        simpler::tmr::TmrContextRegistrationArgs args{
-            r.kernel_descriptor_.self_address, r.kernel_descriptor_.context_generation
-        };
-        rtCpuKernelArgs_t native{};
-        native.baseArgs.args = &args;
-        native.baseArgs.argsSize = sizeof(args);
-        rtLaunchKernelAttr_t attribute{};
-        rtKernelLaunchCfg_t config{&attribute, 0U};
-        return rtsLaunchCpuKernel(r.kernel_result_handle_, 1, stream, &config, &native);
     };
     return kl::launch_bound_kernel({submission.packet, submission.bytes, nullptr, 0}, caller_stream, gate, ops).status;
 }

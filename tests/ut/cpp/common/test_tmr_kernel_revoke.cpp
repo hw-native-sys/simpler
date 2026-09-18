@@ -37,7 +37,6 @@ struct ExecutorModel {
     };
     bool kernel_control_attached_{false};
     bool kernel_context_ready_{false};
-    simpler::tmr::KernelErrorRecord kernel_errors_;
     PreparedKernelContext kernel_context_{};
     std::array<Slot, 3> orch_so_table_{};
 };
