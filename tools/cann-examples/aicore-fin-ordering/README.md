@@ -145,10 +145,12 @@ Both cost a debugging round-trip to rediscover:
   `ccec -c` object, or one holding only the cube half, is rejected with
   `107000`. Hence the two-arch compile plus the
   `ld.lld -m aicorelinux -Ttext=0 -static -n` link, mirroring
-  `src/a2a3/platform/onboard/aicore/CMakeLists.txt`. The vector half must
-  not include `kernel_operator.h` — AscendC's non-weak globals
-  (`g_tilingKey` among them) would then be defined in both halves and the
-  combined link fails on duplicate symbols.
+  `src/a2a3/platform/onboard/aicore/CMakeLists.txt`. Neither half includes
+  `kernel_operator.h`: AscendC's non-weak globals (`g_tilingKey` among them)
+  would be defined twice and the combined link would fail on duplicate symbols,
+  and nothing in the producer needs the header — `dcci`, `dsb`, `set_cond`,
+  `get_coreid` and `get_sys_cnt` are `-x cce` builtins. Leaving it out also
+  keeps the build independent of where a CANN release puts its `tikcpp` subtree.
 - **`get_coreid()` is not a bare core index.** It must be masked with
   `0x0FFF` before indexing the AIC_CTRL window, the way
   `get_physical_core_id()` does. Using the raw value (observed `0x8010`)

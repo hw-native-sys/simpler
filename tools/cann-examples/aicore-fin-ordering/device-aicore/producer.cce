@@ -25,14 +25,12 @@
 // consumer has finished every read for that round, so a first-load value below r
 // cannot be explained by the producer having moved on.
 //
-// AscendC's kernel_operator.h defines non-weak globals (g_tilingKey among them),
-// so including it in both halves of the mix pair breaks the combined link on
-// duplicate symbols. Only the cube half needs it. The runtime's own AICore
-// sources avoid the header entirely for the same reason.
-
-#ifndef __DAV_VEC__
-#include "kernel_operator.h"
-#endif
+// This kernel needs no AscendC header. dcci, dsb, set_cond, get_coreid and
+// get_sys_cnt are all `-x cce` builtins, and the runtime's own AICore sources
+// include no AscendC header either. Including kernel_operator.h would pull in
+// non-weak globals (g_tilingKey among them) that break the combined link of the
+// mix pair, and would tie the build to where a given CANN release puts its
+// tikcpp subtree.
 
 #include "../shared/handshake.h"
 

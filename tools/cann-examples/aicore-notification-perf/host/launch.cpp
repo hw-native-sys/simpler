@@ -282,6 +282,18 @@ void PrintResultTable(const NotifPerfResult &r) {
     std::printf("  consumer_rc        = %d\n", r.consumer_rc);
     std::printf("  magic              = 0x%08x  %s\n", r.magic, r.magic == kNotifPerfResultMagic ? "OK" : "BAD");
     std::printf("  observed_p_seq     = %lu (must be > 0)\n", (unsigned long)r.observed_p_seq);
+    // Names which side ended the run. A producer that stopped on its own budget
+    // did not see the consumer's go transition, so the numbers above are a short
+    // measurement rather than a healthy one.
+    const char *prc = "OK, stopped by the consumer";
+    if (r.producer_rc == kNotifPerfProducerGoTimeout) {
+        prc = "go never reached the producer within its wait budget";
+    } else if (r.producer_rc == kNotifPerfProducerRunTimeout) {
+        prc = "producer hit its run budget; the consumer's stop never arrived";
+    } else if (r.producer_rc != kNotifPerfProducerOk) {
+        prc = "unrecognised";
+    }
+    std::printf("  producer_rc        = %u (%s)\n", r.producer_rc, prc);
 
     std::printf("\n  --- Phase 14: E2E AICore->AICPU latency ---\n");
     if (r.gm_samples > 0) {
@@ -292,7 +304,7 @@ void PrintResultTable(const NotifPerfResult &r) {
             ticks_to_ns(r.gm_min_ticks), (unsigned long)r.gm_max_ticks, ticks_to_ns(r.gm_max_ticks)
         );
     } else {
-        std::printf("  GM   no valid samples\n");
+        std::printf("  GM   no valid samples (%lu observed before their timestamp)\n", (unsigned long)r.gm_unordered);
     }
     if (r.cond_samples > 0) {
         uint64_t avg = r.cond_sum_ticks / r.cond_samples;
@@ -302,8 +314,16 @@ void PrintResultTable(const NotifPerfResult &r) {
             ticks_to_ns(r.cond_min_ticks), (unsigned long)r.cond_max_ticks, ticks_to_ns(r.cond_max_ticks)
         );
     } else {
-        std::printf("  COND no valid samples\n");
+        std::printf("  COND no valid samples (%lu observed before their timestamp)\n", (unsigned long)r.cond_unordered);
     }
+    // Separates "the register never moved" from "every sample was discarded":
+    // a zero unordered count next to zero samples means the wait timed out, and
+    // the core the consumer polled is then the first thing to check.
+    std::printf(
+        "  producer core_id   = 0x%x raw -> %u used%s  [%s]\n", r.core_id_raw, r.core_id_used,
+        (r.core_id_raw == r.core_id_used) ? "" : " (masked)",
+        r.core_id_from_producer ? "reported by producer" : "FALLBACK, producer never reported"
+    );
 
     std::printf("\n  --- Phase 13 supplemental: idle-state LDR rate (10000 LDRs) ---\n");
     std::printf(
@@ -561,6 +581,7 @@ int main(int argc, char **argv) {
     );
     PrintResultTable(result);
 
-    bool ok = (result.magic == kNotifPerfResultMagic) && (result.consumer_rc == 0) && (result.observed_p_seq > 0);
+    bool ok = (result.magic == kNotifPerfResultMagic) && (result.consumer_rc == 0) && (result.observed_p_seq > 0) &&
+              (result.producer_rc == kNotifPerfProducerOk);
     return ok ? 0 : 2;
 }

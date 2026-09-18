@@ -18,6 +18,8 @@ if(NOT DEFINED ENV{ASCEND_HOME_PATH})
 endif()
 set(ASCEND_HOME_PATH $ENV{ASCEND_HOME_PATH})
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/ascend_driver_path.cmake")
+
 add_executable(launch_notif_perf launch.cpp)
 
 target_include_directories(launch_notif_perf PRIVATE
@@ -32,8 +34,7 @@ target_include_directories(launch_notif_perf PRIVATE
 target_link_directories(launch_notif_perf PRIVATE
     "${ASCEND_HOME_PATH}/lib64"
     "${ASCEND_HOME_PATH}/runtime/lib64"
-    "${ASCEND_HOME_PATH}/driver/lib64"
-    "${ASCEND_HOME_PATH}/driver/lib64/driver"
+    "${ASCEND_DRIVER_PATH}/lib64/driver"
 )
 
 # ascendcl for aclrt*, runtime for rt*/rts*, ascend_hal for halMemCtl.

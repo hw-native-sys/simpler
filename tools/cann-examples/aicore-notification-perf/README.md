@@ -33,26 +33,41 @@ add another mode to `producer.cce`, add another subtest to
 ## Pipeline
 
 ```text
-host launch.cpp                 |  AICPU consumer.cpp (block_dim=1)         |  AICore producer.cce (block_dim=1)
+host launch.cpp                 |  AICPU consumer.cpp (block_dim=1)          |  AICore producer.cce (block_dim=1)
 --------------------------------|--------------------------------------------|-----------------------------------
 halMemCtl(REG_AIC_CTRL) -> base |                                            |
 aclrtMalloc handshake, result   |                                            |
 register producer.o             |                                            |
 bootstrap consumer.so (Path A)  |                                            |
-launch producer on aicore stream|                                            |  spin: dcci(go); if go == 0 wait
-launch consumer on aicpu stream |  simpler_aicpu_run entered                 |
-                                |  hank.mode = 0; hank.go = 1                |
-                                |                                            |  see go=1, mode=0 -> GM path
-                                |  for j in N: wait p_seq change, compute    |    p_tw = sys_cnt; p_seq++; dcci
-                                |  hank.go = 0; sweep 10000 LDR on p_seq     |
-                                |  hank.mode = 1; hank.go = 1; *cond_addr=0  |
+launch producer on aicore stream|                                            |  spin: dcci(line 0); wait go == 1
+launch consumer on aicpu stream |  simpler_aicpu_run entered                 |    (bounded, ~5 s)
+                                |  reset line 1 + line 2; clean line 2       |
+                                |  hank.mode = 0; hank.go = 1; clean line 0  |
+                                |                                            |  see go=1 -> publish core_id (line 2)
+                                |  poll core_id_valid (bounded, ~1 s)        |
+                                |                                            |  mode=0 -> GM path
+                                |  for j in N: wait p_seq change, compute    |    p_tw = sys_cnt; p_seq++; dcci line 1
+                                |  hank.mode = 1; clean line 0; *cond_addr=0 |
                                 |                                            |  see mode=1 -> COND path
-                                |  for j in N: wait *cond_addr change        |    p_tw = sys_cnt; dcci(tw); set_cond
-                                |  hank.go = 0; sweep 10000 LDR on COND      |  see go=0 -> return
+                                |  for j in N: wait *cond_addr change        |    p_tw = sys_cnt; dcci line 1; set_cond
+                                |  hank.go = 0; clean line 0                 |  see go=0 -> write producer_rc, return
+                                |  sweep 10000 LDR on p_seq, then on COND    |
                                 |  write NotifPerfResult; return             |
 sync streams                    |                                            |
 D2H result; print table         |                                            |
 ```
+
+`go` is raised once and lowered once: the producer's loop has no re-entry path,
+so bouncing it between the two subtests would end the producer for good and leave
+the COND subtest waiting on a core that has already returned. The mode switch is
+what moves between subtests.
+
+Each of the three cache lines has exactly one writer — line 0 the consumer's
+control words, line 1 and line 2 the producer's. The producer publishes with
+`dcci(..., CACHELINE_OUT)`, which writes back a whole line, so a control word
+sharing a line with a producer-written field gets restored to the producer's
+stale copy every iteration. That is not theoretical: with `go` and `p_seq` on one
+line, the `go = 0` ending the run was undone often enough to hang 3 of 6 runs.
 
 ## Files
 
@@ -121,25 +136,56 @@ task-submit --device auto --device-num 1 \
 Arguments:
 
 - `device_id` — required.
-- `target_core_idx` — which AIC core's COND register the consumer polls (default 0). The producer always runs with `block_dim=1` on the first AIC; this index selects the COND MMIO offset on the AICPU read side.
+- `target_core_idx` — fallback only. The producer publishes the core it actually
+  landed on and the consumer polls that one; `block_dim=1` does **not** pin the
+  kernel to the first AIC (0x8015 → core 21 observed), so a hardcoded index polls
+  a register that never changes and the COND subtest times out. This argument is
+  used only when the producer never reports. The printed
+  `producer core_id = 0x… raw -> … used [reported by producer | FALLBACK …]` line
+  says which happened.
 - `n_samples` — per E2E subtest (default 100).
 
 ## Expected output (a3, ~50 MHz sys counter)
+
+Measured on CANN 9.0.0, driver 26.0.rc1, one locked a2a3 die:
 
 ```text
 === notification-perf result ===
   consumer_rc        = 0
   magic              = 0xc0decafe  OK
-  observed_p_seq     = <large; producer ran for the test duration>
+  observed_p_seq     = 726 (must be > 0)
+  producer_rc        = 0 (OK, stopped by the consumer)
 
   --- Phase 14: E2E AICore->AICPU latency ---
-  GM   N=100  avg=~52 ticks (~1040 ns)  min=~49 (~980 ns)  max=~69 (~1380 ns)
-  COND N=100  avg=~30 ticks (~600 ns)   min=~9  (~180 ns)  max=~101 (~2020 ns)
+  GM   N=100  avg=23 ticks (~460 ns)  min=19 (~380 ns)  max=32 (~640 ns)
+  COND N=100  avg=15 ticks (~300 ns)  min=6 (~120 ns)  max=58 (~1160 ns)
+  producer core_id   = 0x8015 raw -> 21 used (masked)  [reported by producer]
 
   --- Phase 13 supplemental: idle-state LDR rate (10000 LDRs) ---
-  GM   LDR ticks total = ~1500   (~30000 ns)   per LDR ~ 3 ns
-  COND LDR ticks total = ~52000  (~1040000 ns) per LDR ~ 104 ns
+  GM   LDR ticks total = 344  (~6880 ns)  per LDR ~ 0 ns
+  COND LDR ticks total = 53536  (~1070720 ns)  per LDR ~ 107 ns
 ```
+
+**The core id is not stable between runs** — two runs of the same binaries
+reported `0x8015 -> 21` and `0x8 -> 8`. That is why the consumer polls the core
+the producer names rather than an index passed on the command line.
+
+`consumer_rc = 0`, `producer_rc = 0` and a non-zero `N` on **both** rows is the
+pass condition. Three failure shapes to read rather than guess at:
+
+- `COND no valid samples (0 observed before their timestamp)` — the register never
+  changed, so the wait timed out. Check the `producer core_id` line; a `FALLBACK`
+  there means the producer never reported and the poll went to `target_core_idx`.
+- `COND no valid samples (N observed before their timestamp)` with N > 0 — the
+  notification was seen before the timestamp it refers to, i.e. a publication
+  ordering fault rather than a harness problem.
+- `producer_rc` non-zero — the producer ended on its own budget instead of on the
+  consumer's `go = 0`, so the handshake broke rather than the measurement being
+  merely noisy. Both budgets exist so this prints instead of the producer spinning
+  and the host blocking in `aclrtSynchronizeStream` with nothing to show.
+
+The COND path being faster than GM is the point of the tool. The relationship,
+not the absolute figures, is what carries over between chips and CANN versions.
 
 These match the headline numbers cited in
 [`docs/hardware/mmio-performance.md`](../../../docs/hardware/mmio-performance.md).

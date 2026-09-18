@@ -42,12 +42,6 @@ set(CCE_INCLUDE_DIRS
     "${ASCEND_HOME_PATH}/include/external"
     "${ASCEND_HOME_PATH}/include/c_api"
     "${ASCEND_HOME_PATH}/include/c_api/internal"
-    # AscendC kernel headers live under the arch subtree on CANN 9.x, not under
-    # the toolkit root's include/. kernel_operator.h pulls impl/ and interface/
-    # by bare name, so all three are needed.
-    "${ASCEND_HOME_PATH}/aarch64-linux/tikcpp/tikcfw"
-    "${ASCEND_HOME_PATH}/aarch64-linux/tikcpp/tikcfw/impl"
-    "${ASCEND_HOME_PATH}/aarch64-linux/tikcpp/tikcfw/interface"
 )
 set(CCE_INCLUDE_FLAGS "")
 foreach(d ${CCE_INCLUDE_DIRS})

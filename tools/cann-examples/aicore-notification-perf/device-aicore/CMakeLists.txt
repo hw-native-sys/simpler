@@ -25,6 +25,7 @@ endif()
 set(ASCEND_HOME_PATH $ENV{ASCEND_HOME_PATH})
 
 set(CCEC "${ASCEND_HOME_PATH}/bin/ccec")
+set(LD_LLD "${ASCEND_HOME_PATH}/bin/ld.lld")
 if(NOT EXISTS "${CCEC}")
     message(FATAL_ERROR "ccec not found at ${CCEC}")
 endif()
@@ -32,6 +33,9 @@ endif()
 if(NOT DEFINED CCE_AICORE_ARCH)
     set(CCE_AICORE_ARCH "dav-c220-cube")
 endif()
+# The mix pair needs both halves; derive the vector arch from the cube one.
+string(REPLACE "-cube" "-vec" CCE_AICORE_ARCH_VEC "${CCE_AICORE_ARCH}")
+set(CCE_AICORE_ARCH_CUBE "${CCE_AICORE_ARCH}")
 
 set(CCE_INCLUDE_DIRS
     "${ASCEND_HOME_PATH}/include"
@@ -45,24 +49,48 @@ foreach(d ${CCE_INCLUDE_DIRS})
 endforeach()
 
 set(PRODUCER_SRC ${CMAKE_CURRENT_SOURCE_DIR}/producer.cce)
+set(PRODUCER_AIC ${CMAKE_CURRENT_BINARY_DIR}/notif_perf_producer_aic.o)
+set(PRODUCER_AIV ${CMAKE_CURRENT_BINARY_DIR}/notif_perf_producer_aiv.o)
 set(PRODUCER_OBJ ${CMAKE_CURRENT_BINARY_DIR}/notif_perf_producer.o)
 
+set(CCE_COMMON_FLAGS
+    -c -O2 -g -x cce -Wall -std=c++17
+    --cce-aicore-only
+    -mllvm -cce-aicore-stack-size=0x8000
+    -mllvm -cce-aicore-function-stack-size=0x8000
+    -mllvm -cce-aicore-record-overflow=false
+    -mllvm -cce-aicore-addr-transform
+    -mllvm -cce-aicore-dcci-insert-for-scalar=false
+)
+
+add_custom_command(
+    OUTPUT ${PRODUCER_AIC}
+    COMMAND ${CCEC} ${CCE_COMMON_FLAGS} --cce-aicore-arch=${CCE_AICORE_ARCH_CUBE}
+            ${CCE_INCLUDE_FLAGS} -o ${PRODUCER_AIC} ${PRODUCER_SRC}
+    DEPENDS ${PRODUCER_SRC} ${CMAKE_CURRENT_SOURCE_DIR}/../shared/handshake.h
+    COMMENT "ccec compiling AICore producer, cube half (${CCE_AICORE_ARCH_CUBE})"
+    VERBATIM
+)
+
+add_custom_command(
+    OUTPUT ${PRODUCER_AIV}
+    COMMAND ${CCEC} ${CCE_COMMON_FLAGS} --cce-aicore-arch=${CCE_AICORE_ARCH_VEC}
+            ${CCE_INCLUDE_FLAGS} -o ${PRODUCER_AIV} ${PRODUCER_SRC}
+    DEPENDS ${PRODUCER_SRC} ${CMAKE_CURRENT_SOURCE_DIR}/../shared/handshake.h
+    COMMENT "ccec compiling AICore producer, vector half (${CCE_AICORE_ARCH_VEC})"
+    VERBATIM
+)
+
+# rtRegisterAllKernel takes a linked device ELF carrying BOTH halves of the
+# mix-kernel symbol pair (`*_0_mix_aic` and `*_0_mix_aiv`); a raw `ccec -c`
+# object, or one holding only the cube half, is rejected with 107000. Same link
+# line as src/a2a3/platform/onboard/aicore/CMakeLists.txt.
 add_custom_command(
     OUTPUT ${PRODUCER_OBJ}
-    COMMAND ${CCEC}
-            -c -O2 -g -x cce -Wall -std=c++17
-            --cce-aicore-only
-            --cce-aicore-arch=${CCE_AICORE_ARCH}
-            -mllvm -cce-aicore-stack-size=0x8000
-            -mllvm -cce-aicore-function-stack-size=0x8000
-            -mllvm -cce-aicore-record-overflow=false
-            -mllvm -cce-aicore-addr-transform
-            -mllvm -cce-aicore-dcci-insert-for-scalar=false
-            ${CCE_INCLUDE_FLAGS}
-            -o ${PRODUCER_OBJ}
-            ${PRODUCER_SRC}
-    DEPENDS ${PRODUCER_SRC} ${CMAKE_CURRENT_SOURCE_DIR}/../shared/handshake.h
-    COMMENT "ccec compiling AICore producer (arch=${CCE_AICORE_ARCH})"
+    COMMAND ${LD_LLD} -m aicorelinux -Ttext=0 -static -n
+            -o ${PRODUCER_OBJ} ${PRODUCER_AIC} ${PRODUCER_AIV}
+    DEPENDS ${PRODUCER_AIC} ${PRODUCER_AIV}
+    COMMENT "Linking AICore producer mix pair into a registrable ELF"
     VERBATIM
 )
 

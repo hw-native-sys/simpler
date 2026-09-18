@@ -18,6 +18,8 @@ if(NOT DEFINED ENV{ASCEND_HOME_PATH})
 endif()
 set(ASCEND_HOME_PATH $ENV{ASCEND_HOME_PATH})
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/ascend_driver_path.cmake")
+
 add_executable(launch_fin_order launch.cpp)
 
 target_include_directories(launch_fin_order PRIVATE
@@ -32,12 +34,7 @@ target_include_directories(launch_fin_order PRIVATE
 target_link_directories(launch_fin_order PRIVATE
     "${ASCEND_HOME_PATH}/lib64"
     "${ASCEND_HOME_PATH}/runtime/lib64"
-    "${ASCEND_HOME_PATH}/driver/lib64"
-    "${ASCEND_HOME_PATH}/driver/lib64/driver"
-    # libascend_hal.so ships with the driver, which is a sibling of the
-    # toolkit rather than a subdirectory of it, and is not under lib64.
-    "/usr/local/Ascend/driver/lib64/driver"
-    "/usr/local/Ascend/driver/lib64"
+    "${ASCEND_DRIVER_PATH}/lib64/driver"
 )
 
 # ascendcl for aclrt*, runtime for rt*/rts*, ascend_hal for halMemCtl.

@@ -18,6 +18,8 @@ if(NOT DEFINED ENV{ASCEND_HOME_PATH})
 endif()
 set(ASCEND_HOME_PATH $ENV{ASCEND_HOME_PATH})
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/ascend_driver_path.cmake")
+
 add_executable(query_device_hal query_device_hal.cpp)
 
 get_filename_component(SIMPLER_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." ABSOLUTE)
@@ -47,12 +49,10 @@ target_include_directories(query_device_hal PRIVATE
     ${SIMPLER_ROOT}/src/common/log
 )
 
-set(ASCEND_DRIVER_LIB_DIR "/usr/local/Ascend/driver/lib64/driver"
-    CACHE PATH "Directory containing libascend_hal.so")
 target_link_directories(query_device_hal PRIVATE
     ${ASCEND_HOME_PATH}/lib64
     ${ASCEND_HOME_PATH}/runtime/lib64
-    ${ASCEND_DRIVER_LIB_DIR}
+    ${ASCEND_DRIVER_PATH}/lib64/driver
 )
 
 # ascendcl for aclrt*, runtime for rt*/rts* (rtAicpuKernelLaunchExWithArgs,

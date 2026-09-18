@@ -66,35 +66,16 @@ jobs:
           task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
             --run "python -m pytest tests/ut -m requires_hardware --platform a2a3 --device \$TASK_DEVICE -v && python3 -c \"import json,os; ids=os.environ['TASK_DEVICE'].split(','); json.dump({'version':{'major':1,'minor':0},'local':[{'npus':[{'id':i,'slots':1} for i in ids]}]}, open('tests/ut/cpp/build/resources.json','w'))\" && ctest --test-dir tests/ut/cpp/build -L '^requires_hardware(_a2a3)?\$' --resource-spec-file $PWD/tests/ut/cpp/build/resources.json -j$(nproc) --output-on-failure --timeout 300"
 
-      - name: Build cann-examples/query
+      # Every tool under tools/cann-examples, discovered rather than named, and
+      # each one smoke-run on a locked device via its own smoke.sh. The by-name
+      # list this replaces grew one entry per rot incident, so a tool nobody had
+      # listed was a tool nobody compiled: aicore-notification-perf had stopped
+      # building on CANN 9.x (#2333) and aicpu-mmio-probes was failing to link,
+      # both unnoticed. Adding a tool now needs no workflow edit, and a tool that
+      # builds but cannot run is a failure rather than a silent pass.
+      - name: Build and smoke-run tools/cann-examples
         if: inputs.include_cann_examples
         run: |
           source /usr/local/Ascend/cann/set_env.sh
-          cd tools/cann-examples/query
-          cmake -B build .
-          cmake --build build
-          ./build/query version
-
-      - name: Build cann-examples/aicpu-device-query
-        if: inputs.include_cann_examples
-        run: |
-          source /usr/local/Ascend/cann/set_env.sh
-          export CROSS=${ASCEND_HOME_PATH}/tools/hcc/bin/aarch64-target-linux-gnu
-          cd tools/cann-examples/aicpu-device-query/device
-          cmake -B build . -DCMAKE_C_COMPILER=${CROSS}-gcc -DCMAKE_CXX_COMPILER=${CROSS}-g++
-          cmake --build build
-          cd ../host
-          cmake -B build .
-          cmake --build build
-
-      - name: Build cann-examples/aicpu-kernel-launch
-        if: inputs.include_cann_examples
-        run: |
-          source /usr/local/Ascend/cann/set_env.sh
-          export CROSS=${ASCEND_HOME_PATH}/tools/hcc/bin/aarch64-target-linux-gnu
-          cd tools/cann-examples/aicpu-kernel-launch/device
-          cmake -B build . -DCMAKE_C_COMPILER=${CROSS}-gcc -DCMAKE_CXX_COMPILER=${CROSS}-g++
-          cmake --build build
-          cd ../host
-          cmake -B build .
-          cmake --build build
+          task-submit --timeout 1800 --max-time 1800 --device auto --device-num 1 \
+            --run "tools/build_cann_examples.sh dav-c220-cube --run \$TASK_DEVICE"
