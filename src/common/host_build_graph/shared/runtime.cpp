@@ -39,15 +39,15 @@ Runtime::Runtime() {
 
     // Initialize shared-memory / orchestration argument plumbing
     gm_sm_ptr_ = nullptr;
-    orch_args_storage_.clear();
     prebuilt_arena_base_ = nullptr;
     prebuilt_runtime_offset_ = 0;
 
-    active_callable_id_ = -1;
-    dev_orch_so_addr_ = 0;
-    dev_orch_so_size_ = 0;
-    device_orch_func_name_[0] = '\0';
-    device_orch_config_name_[0] = '\0';
+    host_.orch_args_storage_.clear();
+    host_.active_callable_id_ = -1;
+    host_.dev_orch_so_addr_ = 0;
+    host_.dev_orch_so_size_ = 0;
+    host_.device_orch_func_name_[0] = '\0';
+    host_.device_orch_config_name_[0] = '\0';
 
     // Initialize function address mapping
     for (int i = 0; i < RUNTIME_MAX_FUNC_ID; i++) {
@@ -60,18 +60,18 @@ Runtime::Runtime() {
 // =============================================================================
 
 void *Runtime::get_gm_sm_ptr() const { return gm_sm_ptr_; }
-const simpler::hbg::EntryArgsStorage &Runtime::get_orch_args() const { return orch_args_storage_; }
+const simpler::hbg::EntryArgsStorage &Runtime::get_orch_args() const { return host_.orch_args_storage_; }
 void Runtime::set_gm_sm_ptr(void *p) { gm_sm_ptr_ = p; }
 // The one place a boundary ChipTensor becomes this runtime's Tensor. Called from
 // the host, before any orchestration runs, so nothing inside the runtime — on the
 // host or on the AICPU — ever holds the boundary form.
 void Runtime::set_orch_args(const ChipStorageTaskArgs &args) {
-    orch_args_storage_.clear();
+    host_.orch_args_storage_.clear();
     for (int32_t i = 0; i < args.tensor_count(); ++i) {
-        orch_args_storage_.add_tensor(simpler::hbg::Tensor::from_boundary(args.tensor(i)));
+        host_.orch_args_storage_.add_tensor(simpler::hbg::Tensor::from_boundary(args.tensor(i)));
     }
     for (int32_t i = 0; i < args.scalar_count(); ++i) {
-        orch_args_storage_.add_scalar(args.scalar(i));
+        host_.orch_args_storage_.add_scalar(args.scalar(i));
     }
 }
 
@@ -87,30 +87,30 @@ size_t Runtime::get_prebuilt_runtime_offset() const { return prebuilt_runtime_of
 // the device side never reads these back, but the platform registration path is
 // shared with tensormap_and_ringbuffer and still writes them.
 void Runtime::set_dev_orch_so(uint64_t dev_addr, uint64_t size) {
-    dev_orch_so_addr_ = dev_addr;
-    dev_orch_so_size_ = size;
+    host_.dev_orch_so_addr_ = dev_addr;
+    host_.dev_orch_so_size_ = size;
 }
 
-void Runtime::set_active_callable_id(int32_t callable_id) { active_callable_id_ = callable_id; }
+void Runtime::set_active_callable_id(int32_t callable_id) { host_.active_callable_id_ = callable_id; }
 
-int32_t Runtime::get_active_callable_id() const { return active_callable_id_; }
+int32_t Runtime::get_active_callable_id() const { return host_.active_callable_id_; }
 
 void Runtime::set_device_orch_func_name(const char *name) {
     if (name == nullptr) {
-        device_orch_func_name_[0] = '\0';
+        host_.device_orch_func_name_[0] = '\0';
         return;
     }
-    std::strncpy(device_orch_func_name_, name, RUNTIME_MAX_ORCH_SYMBOL_NAME - 1);
-    device_orch_func_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME - 1] = '\0';
+    std::strncpy(host_.device_orch_func_name_, name, RUNTIME_MAX_ORCH_SYMBOL_NAME - 1);
+    host_.device_orch_func_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME - 1] = '\0';
 }
 
 void Runtime::set_device_orch_config_name(const char *name) {
     if (name == nullptr) {
-        device_orch_config_name_[0] = '\0';
+        host_.device_orch_config_name_[0] = '\0';
         return;
     }
-    std::strncpy(device_orch_config_name_, name, RUNTIME_MAX_ORCH_SYMBOL_NAME - 1);
-    device_orch_config_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME - 1] = '\0';
+    std::strncpy(host_.device_orch_config_name_, name, RUNTIME_MAX_ORCH_SYMBOL_NAME - 1);
+    host_.device_orch_config_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME - 1] = '\0';
 }
 
 uint64_t Runtime::get_function_bin_addr(int func_id) const {
@@ -132,6 +132,7 @@ void Runtime::clear_function_bin_addrs() {
     }
 }
 
-// host_build_graph's device image is the whole Runtime object (host-orch builds
-// the graph on the host, but the entire Runtime is still rtMemcpy'd to device).
-size_t runtime_device_copy_size(const Runtime &) { return sizeof(Runtime); }
+// host_build_graph ships the Runtime object without its host-only tail: the
+// AICPU addresses fields inside that prefix directly, and nothing past it has a
+// device reader.
+size_t runtime_device_copy_size(const Runtime &) { return Runtime::device_image_bytes(); }

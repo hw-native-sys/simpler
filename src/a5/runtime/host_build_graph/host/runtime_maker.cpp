@@ -388,7 +388,7 @@ static int32_t read_runtime_status(const Runtime *runtime, const HostApi *api, S
 }
 
 static void release_run_tensor_leases(Runtime *runtime, const HostApi *api) {
-    const TensorLeaseReleaseCounts counts = release_tensor_leases(runtime->tensor_leases_, api);
+    const TensorLeaseReleaseCounts counts = release_tensor_leases(runtime->tensor_leases(), api);
     LOG_DEBUG(
         "Released tensor leases: freed=%d buffer_noop=%d external_noop=%d", counts.freed, counts.buffer_noop,
         counts.external_noop
@@ -1850,7 +1850,7 @@ extern "C" int bind_callable_to_runtime_impl(
     // re-slice, so carrying one over would copy this run's bytes back to that
     // run's host pointer. Every exit path from here on leaves the ledger owned
     // by the caller's Runtime, and this is where it starts empty.
-    runtime->tensor_leases_.clear();
+    runtime->tensor_leases().clear();
 
     // The retained temporary buffer is always used on the hbg path — it is an
     // internal allocation optimization, not user-facing config. The buffer
@@ -1937,7 +1937,7 @@ extern "C" int bind_callable_to_runtime_impl(
         // tensor entries). Anything not provably IN keeps the safe default of
         // copying back.
         bool needs_copy_back = !(signature != nullptr && i < sig_count && signature[i] == ArgDirection::IN);
-        runtime->tensor_leases_.push_back(
+        runtime->tensor_leases().push_back(
             {host_ptr, dev_ptr, size, needs_copy_in, needs_copy_back, TensorReleaseKind::BufferNoop}
         );
         LOG_DEBUG("  ChipTensor %d: %zu bytes at %p", i, size, dev_ptr);
@@ -1973,7 +1973,7 @@ extern "C" int bind_callable_to_runtime_impl(
     // submitted its tasks, and the heap's only once orchestration has allocated
     // its intermediate buffers. Both are committed by the single
     // setup_static_arena in run_host_orchestration. Owned by DeviceRunner across
-    // runs — do NOT record in tensor_leases_; the free is deferred to
+    // runs — do NOT record in tensor_leases(); the free is deferred to
     // DeviceRunner::finalize(). The runtime-arena size is determined by replaying
     // the reserve sequence on a host-side arena.
     uint64_t sm_size = SharedMemoryHandle::calculate_size(task_capacity);
@@ -2141,8 +2141,8 @@ extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi 
     LOG_INFO("=== Copying Results Back to Host ===");
 
     // Copy all recorded tensors from device back to host
-    const TensorLease *tensor_leases = runtime->tensor_leases_.data();
-    int tensor_lease_count = static_cast<int>(runtime->tensor_leases_.size());
+    const TensorLease *tensor_leases = runtime->tensor_leases().data();
+    int tensor_lease_count = static_cast<int>(runtime->tensor_leases().size());
 
     LOG_INFO("ChipTensor leases to process: %d", tensor_lease_count);
 

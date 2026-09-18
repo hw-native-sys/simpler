@@ -180,31 +180,59 @@ public:
     uint64_t sm_image_bytes;
 
 private:
-    // Kernel binary tracking for cleanup
+    void *gm_sm_ptr_;  // GM pointer to shared memory (device)
 
-    void *gm_sm_ptr_;                                   // GM pointer to shared memory (device)
-    simpler::hbg::EntryArgsStorage orch_args_storage_;  // Entry args, adopted on the host
-
-    // Prebuilt-arena fast path (trb only). Set by the host before rtMemcpy'ing
-    // Runtime to device; AICPU reads them in the boot path to skip
-    // runtime_create_from_sm and reuse the pooled, prebuilt arena buffer
-    // (already populated by runtime_init_data_from_layout + wire on host).
+    // Prebuilt-arena fast path. Set by the host before rtMemcpy'ing Runtime to
+    // device; AICPU reads them in the boot path to skip runtime_create_from_sm
+    // and reuse the pooled, prebuilt arena buffer (already populated by
+    // runtime_init_data_from_layout + wire on host).
     void *prebuilt_arena_base_;
     size_t prebuilt_runtime_offset_;
 
-    // Orchestration metadata set by the platform host (DeviceRunner) when
-    // registering a callable. host_build_graph runs the orchestrator on the
-    // host, so the device side no longer reads the SO bytes / symbol names —
-    // but the platform registration path still writes them through these
-    // setters (shared with tensormap_and_ringbuffer), so the fields and their
-    // setters are part of the platform↔runtime ABI and must stay.
-    uint64_t dev_orch_so_addr_;
-    uint64_t dev_orch_so_size_;
-    int32_t active_callable_id_;
-    char device_orch_func_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
-    char device_orch_config_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
+    // The device image ends here: `device_image_bytes()` is this member's
+    // offset, so nothing below travels. Every field inside is written by the
+    // host and read only by the host — a new host-only field belongs in here,
+    // which is what keeps the boundary from drifting.
+    struct HostOnlyState {
+        // Entry args, adopted on the host. The host orchestrator is the only
+        // reader (runtime_maker.cpp builds its ChipTaskArgs from
+        // get_orch_args()); unlike tensormap_and_ringbuffer, no AICPU entry
+        // touches them, which is why they can stay off the device entirely.
+        simpler::hbg::EntryArgsStorage orch_args_storage_;
+
+        // Orchestration metadata set by the platform host (DeviceRunner) when
+        // registering a callable. host_build_graph runs the orchestrator on the
+        // host, so the device side never reads the SO bytes, the symbol names,
+        // or the active callable id — but the platform registration path still
+        // writes them through these setters (shared with
+        // tensormap_and_ringbuffer, whose AICPU does read the callable id), so
+        // the fields and their setters are part of the platform↔runtime ABI and
+        // must stay.
+        uint64_t dev_orch_so_addr_;
+        uint64_t dev_orch_so_size_;
+        int32_t active_callable_id_;
+        char device_orch_func_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
+        char device_orch_config_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
+
+        // Host-side tensor ledger for the run's H2D and D2H transfers.
+        // Populated by runtime_maker.cpp from orch_args at bind time, iterated
+        // by copy_back_run_outputs_impl and released by
+        // release_run_bindings_impl. No fixed cap — grows with the chip-level
+        // entry-tensor count, and its std::vector control block holds host heap
+        // addresses, which is a second reason this struct cannot travel.
+        std::vector<TensorLease> tensor_leases_;
+    };
+    HostOnlyState host_;
 
 public:
+    /**
+     * Bytes of this object that cross to the device, i.e. the offset of the
+     * host-only tail. The AICPU addresses fields inside this prefix directly,
+     * so it is also the only length that may be cache-invalidated: reaching
+     * past it would touch bytes the host never uploaded.
+     */
+    static size_t device_image_bytes();
+
     /**
      * Constructor - zero-initialize all arrays
      */
@@ -286,6 +314,12 @@ public:
      */
     void clear_function_bin_addrs();
 
+    // Host-side tensor ledger for the run's H2D and D2H transfers. Populated by
+    // runtime_maker.cpp from orch_args at bind time, iterated by
+    // copy_back_run_outputs_impl and released by release_run_bindings_impl.
+    std::vector<TensorLease> &tensor_leases() { return host_.tensor_leases_; }
+    const std::vector<TensorLease> &tensor_leases() const { return host_.tensor_leases_; }
+
     // =========================================================================
     // Deprecated API (for platform compatibility, always returns 0/nullptr)
     // Task graph is now managed by RuntimeContext, not Runtime
@@ -296,19 +330,42 @@ public:
 
     /** @deprecated RT2 uses DispatchPayload, not Task. Always returns nullptr. */
     Task *get_task(int) { return nullptr; }
-
-    // Host-side tensor ledger for the run's H2D and D2H transfers. Populated
-    // by runtime_maker.cpp from orch_args at bind time, iterated by
-    // copy_back_run_outputs_impl and released by release_run_bindings_impl.
-    // Not read by AICPU/AICore — the device-side
-    // Runtime image also carries the host-only std::vector control block, which
-    // device code must not inspect. No fixed cap — grows with the chip-level
-    // entry-tensor count.
-    std::vector<TensorLease> tensor_leases_;
 };
 
+// Runtime is not standard-layout (std::vector member + mixed access), so guard
+// the offsetof against -Winvalid-offsetof; offsetof on such a class is
+// conditionally-supported, and both GCC and Clang document that they support
+// it. Mirrors the guard tensormap_and_ringbuffer uses for `offsetof(Runtime,
+// dev)`. Defined inline so the AICPU translation units that size their cache
+// invalidation by it need no extra link dependency.
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
+#endif
+inline size_t Runtime::device_image_bytes() {
+    // The image is [0, offsetof(host_)): it starts at `workers` and ends where
+    // the host-only tail begins. The second assert is what makes the boundary
+    // load-bearing — it fails the build if a device-read member is ever moved
+    // below `host_`, which would stop it being uploaded.
+    static_assert(offsetof(Runtime, workers) == 0, "the device image must start at offset 0");
+    static_assert(
+        offsetof(Runtime, host_) > offsetof(Runtime, prebuilt_runtime_offset_),
+        "every device-read member must precede host_"
+    );
+    static_assert(
+        offsetof(Runtime, host_) + sizeof(HostOnlyState) == sizeof(Runtime),
+        "nothing may follow host_: the device image is everything before it, so a member added after it "
+        "would silently stop being uploaded"
+    );
+    return offsetof(Runtime, host_);
+}
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
 // Number of bytes of the Runtime image that must be copied to the device.
-// host_build_graph returns sizeof(Runtime) (its device image is the whole
-// object); trb returns sizeof(DeviceRuntimeLaunchDesc). Defined per-runtime so
+// host_build_graph returns Runtime::device_image_bytes() (the object without its
+// host-only tail); trb returns sizeof(DeviceRuntimeLaunchDesc). Defined
+// per-runtime so
 // the shared device_runner_helpers.cpp copy path stays runtime-agnostic.
 size_t runtime_device_copy_size(const Runtime &rt);

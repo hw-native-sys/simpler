@@ -504,10 +504,12 @@ TEST(PersistentKernelArgs, CopiesExactlyTheRuntimeDeviceImage) {
     const size_t image_bytes = runtime_device_copy_size(runtime);
 #if defined(SIMPLER_UT_TRB_RUNTIME)
     EXPECT_EQ(image_bytes, sizeof(DeviceRuntimeLaunchDesc));
-    EXPECT_LT(image_bytes, sizeof(Runtime));
 #else
-    EXPECT_EQ(image_bytes, sizeof(Runtime));
+    EXPECT_EQ(image_bytes, Runtime::device_image_bytes());
 #endif
+    // Both runtimes ship a proper prefix: trb narrows to `dev`, hbg stops at its
+    // host-only tail. Neither copies a whole Runtime.
+    EXPECT_LT(image_bytes, sizeof(Runtime));
 
     EXPECT_EQ(ops.copies[0].src_bytes, image_bytes);
     EXPECT_EQ(ops.copies[0].dst_bytes, image_bytes);
@@ -532,10 +534,19 @@ TEST(PersistentKernelArgs, LeavesThePerCallableDispatchFieldsAtTheirSentinels) {
     // The device image starts at offset 0 of Runtime under both variants, so
     // the uploaded bytes answer the accessors the device-side code uses.
     const Runtime *const uploaded = reinterpret_cast<const Runtime *>(args.args().runtime_args);
-    EXPECT_EQ(uploaded->get_active_callable_id(), -1);
     for (int func_id = 0; func_id < RUNTIME_MAX_FUNC_ID; ++func_id) {
         ASSERT_EQ(uploaded->get_function_bin_addr(func_id), 0u) << "func_id=" << func_id;
     }
+#if defined(SIMPLER_UT_TRB_RUNTIME)
+    // trb's AICPU reads the callable id out of the image to pick an entry, so it
+    // has to arrive at its sentinel.
+    EXPECT_EQ(uploaded->get_active_callable_id(), -1);
+#else
+    // hbg's device side never reads the callable id — the platform host does —
+    // and it lives past the image boundary, so no uploaded byte carries it.
+    // Reading it through `uploaded` would read past the block that was copied.
+    EXPECT_EQ(runtime.get_active_callable_id(), -1);
+#endif
 
     EXPECT_EQ(args.finalize_once(), 0);
 }

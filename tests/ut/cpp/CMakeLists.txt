@@ -717,8 +717,8 @@ add_common_utils_test(test_file_marker_handshake common/test_file_marker_handsha
 
 # Context-lifetime AICore argument owner. Built once per runtime variant
 # because the device image length it copies is a per-runtime decision
-# (runtime_device_copy_size): trb narrows to the `dev` descriptor, hbg copies
-# the whole Runtime. The injected alloc/free/copy vocabulary keeps both builds
+# (runtime_device_copy_size): trb narrows to the `dev` descriptor, hbg stops at
+# its host-only tail. The injected alloc/free/copy vocabulary keeps both builds
 # free of CANN.
 set(KERNEL_PERSISTENT_ARGS_SRC
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/onboard/host/kernel_persistent_args.cpp

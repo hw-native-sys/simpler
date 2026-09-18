@@ -237,9 +237,9 @@ TEST_F(HbgBindLedgerTest, AnEmptyTensorIsPassedThroughAndTakesNoSlice) {
 
     ASSERT_EQ(bind(runtime, args, sig, 2), 0);
     // Only the non-empty tensor takes a slice and a lease.
-    ASSERT_EQ(runtime.tensor_leases_.size(), 1u);
-    EXPECT_EQ(runtime.tensor_leases_[0].host_ptr, real.data());
-    EXPECT_EQ(runtime.tensor_leases_[0].size, 64u);
+    ASSERT_EQ(runtime.tensor_leases().size(), 1u);
+    EXPECT_EQ(runtime.tensor_leases()[0].host_ptr, real.data());
+    EXPECT_EQ(runtime.tensor_leases()[0].size, 64u);
 }
 
 // The regression barrier: a bind whose validate never ran must not leak its
@@ -253,7 +253,7 @@ TEST_F(HbgBindLedgerTest, SecondBindDoesNotInheritTheFirstBindsLeases) {
     ArgDirection sig[1] = {ArgDirection::INOUT};
 
     ASSERT_EQ(bind(runtime, args_a, sig, 1), 0);
-    ASSERT_EQ(runtime.tensor_leases_.size(), 1u);
+    ASSERT_EQ(runtime.tensor_leases().size(), 1u);
 
     // No copy-back here: this is the finalize-attach-failure shape.
     std::vector<uint8_t> second(64, 0x22);
@@ -261,8 +261,8 @@ TEST_F(HbgBindLedgerTest, SecondBindDoesNotInheritTheFirstBindsLeases) {
     args_b.add_tensor(host_tensor(second));
 
     ASSERT_EQ(bind(runtime, args_b, sig, 1), 0);
-    EXPECT_EQ(runtime.tensor_leases_.size(), 1u) << "the first bind's lease survived into the second bind";
-    EXPECT_EQ(runtime.tensor_leases_[0].host_ptr, second.data());
+    EXPECT_EQ(runtime.tensor_leases().size(), 1u) << "the first bind's lease survived into the second bind";
+    EXPECT_EQ(runtime.tensor_leases()[0].host_ptr, second.data());
 }
 
 // What the stale lease would actually do: the copy-back walks every recorded
@@ -286,7 +286,7 @@ TEST_F(HbgBindLedgerTest, ValidateAfterARebindLeavesTheEarlierRunsBufferAlone) {
     // Stand in for the kernel writing the second run's output. Written through
     // every recorded slice, so the assertion below still has something to catch
     // when a stale lease is present rather than aborting on the count.
-    for (const TensorLease &lease : runtime.tensor_leases_) {
+    for (const TensorLease &lease : runtime.tensor_leases()) {
         std::memset(lease.dev_ptr, 0x5a, 64);
     }
 
