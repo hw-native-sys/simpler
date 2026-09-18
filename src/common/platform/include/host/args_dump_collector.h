@@ -379,6 +379,15 @@ private:
     std::atomic<uint64_t> bytes_written_{0};
 
     void writer_loop();
+
+    /**
+     * Ask the writer thread to finish, in the one order that cannot lose the
+     * wakeup: set the stop flag under `write_mutex_`, then notify. Both stop
+     * sites (export and finalize) go through here so neither can regress to a
+     * bare atomic store — see the definition for why the mutex is required even
+     * though the flag is atomic.
+     */
+    void request_writer_stop();
 };
 
 #endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_ARGS_DUMP_COLLECTOR_H_

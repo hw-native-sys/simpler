@@ -223,3 +223,50 @@ TEST(ArgsDumpCollectorTest, ArenaAckDoesNotOffsetPayloadsAcrossThreads) {
     collector.finalize(nullptr, test_free);
     std::filesystem::remove_all(test_dir);
 }
+
+// `finalize()` must stop the writer thread when a run never exported.
+//
+// `on_buffer_collected` starts that thread unconditionally, and
+// `export_dump_files()` is the normal way it stops. A run whose export is skipped
+// — the device-error path — leaves `finalize()` as the only join, and that join
+// hangs if the stop request loses its wakeup: the writer evaluates its predicate
+// under `write_mutex_` and only then blocks, so a stop that sets the flag without
+// that mutex can notify an unregistered waiter and leave it asleep on a condition
+// that is already true.
+//
+// This is a coverage barrier for that path rather than a reproduction of the
+// race, which is a timing window a unit test cannot schedule. It fails as a ctest
+// timeout rather than an assertion, so it belongs in a target whose other cases
+// are fast: a sudden 300 s here means the stop protocol regressed.
+TEST(ArgsDumpCollectorTest, FinalizeStopsTheWriterWhenExportIsSkipped) {
+    const std::filesystem::path test_dir =
+        std::filesystem::temp_directory_path() / ("args_dump_no_export_test_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(test_dir);
+    ASSERT_TRUE(std::filesystem::create_directories(test_dir));
+
+    ArgsDumpCollector collector;
+    collector.begin_run(test_dir.string(), DumpArgsLevel::FULL);
+    ASSERT_EQ(collector.initialize(1, 0, DumpArgsLevel::FULL, test_alloc, nullptr, test_free), 0);
+
+    // One collected buffer is all it takes to start the writer thread.
+    DumpMetaBuffer buffer{};
+    buffer.count = 1;
+    buffer.records[0].task_id = 0x1234;
+    buffer.records[0].role = static_cast<uint8_t>(ArgsDumpRole::INPUT);
+    buffer.records[0].stage = static_cast<uint8_t>(ArgsDumpStage::BEFORE_DISPATCH);
+    buffer.records[0].kind = static_cast<uint8_t>(ArgsDumpKind::SCALAR);
+
+    DumpReadyBufferInfo info{};
+    info.thread_index = 0;
+    info.host_buffer_ptr = &buffer;
+    collector.on_buffer_collected(info, 0);
+
+    // No export_dump_files() — finalize is the only thing that can join it.
+    collector.finalize(nullptr, test_free);
+
+    // Reaching here at all is the assertion. A second finalize must stay a no-op
+    // rather than try to join a thread that is already gone.
+    collector.finalize(nullptr, test_free);
+
+    std::filesystem::remove_all(test_dir);
+}
