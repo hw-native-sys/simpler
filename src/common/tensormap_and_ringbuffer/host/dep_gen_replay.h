@@ -14,7 +14,7 @@
  * @brief Host-side replay of in-memory DepGenRecord stream → deps.json.
  *
  * Takes the records the host collector drained from the device ring buffer
- * (``DepGenCollector::records()``) and runs them back through a host-resident
+ * (``DepGenCollector::window_records()``) and runs them back through a host-resident
  * ChipTensorMap using the same ``compute_task_fanin`` / ``register_task_outputs``
  * primitives the device orchestrator uses, emitting the full
  * predecessor → successor edge list to deps.json.
@@ -91,7 +91,7 @@ extern "C" {
  * ring's window covers its observed max local_id without slot aliasing.
  *
  * @param records            Pointer to a contiguous DepGenRecord array
- *                           (typically ``DepGenCollector::records().data()``).
+ *                           (typically ``DepGenCollector::window_records()->data()``).
  * @param num_records        Number of records in the array.
  * @param deps_json_path     Output path; truncated if it exists.
  * @return 0 on success; negative on error (see source for codes).

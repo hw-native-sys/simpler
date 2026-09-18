@@ -677,8 +677,20 @@ void DeviceRunner::emit_device_dep_gen_graph(const DfxRunConfig &dfx) {
     // that failed mid-flight yields a whole graph or none — never a partial one.
     if (!dep_gen_collector_.reconcile_counters()) return;
     const std::string deps = make_deps_json_path(dfx.output_prefix);
-    const auto &records = dep_gen_collector_.records();
-    int rc = dep_gen_replay_emit_deps_json(records.data(), records.size(), deps.c_str());
+    // One deps.json describes one graph. A window with no records still gets a
+    // file — an empty graph is this run's answer, and suppressing it would make
+    // "nothing submitted" indistinguishable from "collection failed". Several
+    // runs in one window is the only case that cannot be emitted, because the
+    // path would have to name which run; that belongs with session output.
+    uint64_t dep_gen_run_epoch = 0;
+    const std::vector<DepGenRecord> *records = dep_gen_collector_.window_records(&dep_gen_run_epoch);
+    if (records == nullptr) {
+        LOG_ERROR(
+            "dep_gen collected %zu runs in one window — deps.json not produced", dep_gen_collector_.runs().size()
+        );
+        return;
+    }
+    int rc = dep_gen_replay_emit_deps_json(records->data(), records->size(), deps.c_str());
     if (rc != 0) {
         LOG_ERROR("dep_gen replay failed (%d) — deps.json not produced", rc);
     }

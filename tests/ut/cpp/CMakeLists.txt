@@ -958,6 +958,7 @@ set_tests_properties(test_async_poll_phase_accumulator PROPERTIES LABELS "no_har
 add_executable(test_dep_gen_collector_aicpu
     common/test_dep_gen_collector_aicpu.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/dep_gen_collector_aicpu.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/device_run_result_base_aicpu.cpp
     ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
 )
 target_include_directories(test_dep_gen_collector_aicpu PRIVATE
@@ -976,6 +977,36 @@ target_link_libraries(test_dep_gen_collector_aicpu PRIVATE
 )
 add_test(NAME test_dep_gen_collector_aicpu COMMAND test_dep_gen_collector_aicpu)
 set_tests_properties(test_dep_gen_collector_aicpu PROPERTIES LABELS "no_hardware")
+
+# dep_gen run identity + buffer ownership, device producer and host collector in
+# one binary so the whole chain (acquire -> record -> flush -> host copy ->
+# return) is production code.
+add_executable(test_dep_gen_run_identity
+    common/test_dep_gen_run_identity.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/dep_gen_collector.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/dep_gen_collector_aicpu.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/device_run_result_base_aicpu.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/sim/host/profiling_copy.cpp
+    ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
+)
+target_compile_definitions(test_dep_gen_run_identity PRIVATE SIMPLER_RUNTIME_NAME="test_runtime")
+target_include_directories(test_dep_gen_run_identity PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${A2A3_RUNTIME_DIR}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/aicpu
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+)
+target_link_libraries(test_dep_gen_run_identity PRIVATE
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    pthread
+)
+add_test(NAME test_dep_gen_run_identity COMMAND test_dep_gen_run_identity)
+set_tests_properties(test_dep_gen_run_identity PROPERTIES LABELS "no_hardware")
 
 # One run's terminal record: the wire layout every arch/runtime pair publishes,
 # the AICPU publisher, and the fold that picks the code. The sim cache_ops give

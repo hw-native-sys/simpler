@@ -201,13 +201,28 @@ inline int dep_gen_records_needed_for(int dc) {
 struct DepGenBuffer {
     // Header (first 64 bytes) — host copies this alone first to learn count.
     volatile uint32_t count;  // Number of valid records committed
-    uint32_t _pad0[15];       // Pad count to 64 B; isolates count's cache line.
+    uint32_t _pad_align;      // Aligns run_epoch to 8 B
+
+    // Which run produced these records. AICPU stamps it when it acquires the
+    // buffer, so it is fixed before the first record lands; the AICPU thread
+    // that acquired the buffer is its only reader until the ready queue
+    // publishes it, so no barrier is needed between the stamp and the
+    // acquisition. It has to be copied out with the records: the pool reuses
+    // this storage, and a later run re-stamps it in place, so a host copy that
+    // pointed back here would report the wrong run.
+    volatile uint64_t run_epoch;  // 0 when the producer had no run identity
+    volatile uint32_t local_seq;  // Buffer's position within its own run
+    uint32_t _pad0[11];           // Pad the header to 64 B; isolates count's cache line.
 
     // Records (flexible-size, up to PLATFORM_DEP_GEN_RECORDS_PER_BUFFER)
     DepGenRecord records[PLATFORM_DEP_GEN_RECORDS_PER_BUFFER];
 } __attribute__((aligned(64)));
 
 static_assert(offsetof(DepGenBuffer, records) == 64, "DepGenBuffer header must be exactly 64 bytes");
+static_assert(
+    offsetof(DepGenBuffer, run_epoch) == 8 && offsetof(DepGenBuffer, local_seq) == 16,
+    "run identity moved inside the DepGenBuffer header"
+);
 
 // =============================================================================
 // SPSC free queue

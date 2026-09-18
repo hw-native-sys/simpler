@@ -15,7 +15,7 @@
  *        lives in profiling_common::BufferPoolManager parameterized by
  *        DepGenModule (host/dep_gen_collector.h); this file owns the
  *        per-buffer on_buffer_collected callback (in-memory append) and the
- *        device-side cross-check. Records stay in ``records_`` and are
+ *        device-side cross-check. Records stay in ``records_by_run_`` and are
  *        consumed directly by the host replay — no on-disk submit_trace.bin
  *        intermediary.
  *
@@ -66,7 +66,7 @@ int DepGenCollector::init(
 
     num_threads_ = num_threads;
     total_collected_ = 0;
-    records_.clear();
+    records_by_run_.clear();
 
     // Stash callbacks on the base up-front so alloc_paired_buffer sees
     // consistent values during init. shm_host_ stays nullptr until the shm
@@ -159,7 +159,7 @@ int DepGenCollector::init(
 void DepGenCollector::begin_run() {
     {
         std::scoped_lock lock(records_mutex_);
-        records_.clear();
+        records_by_run_.clear();
     }
     total_collected_ = 0;
 
@@ -192,8 +192,14 @@ void DepGenCollector::append_buffer_records(const void *buf_host_ptr) {
     }
     if (n == 0) return;
 
+    // Read the identity before copying: it decides which run's graph these
+    // records join. The device buffer goes back to the pool after this and a
+    // later run re-stamps it, so nothing may consult it again.
+    const uint64_t run_epoch = buf->run_epoch;
+
     std::scoped_lock lock(records_mutex_);
-    records_.insert(records_.end(), buf->records, buf->records + n);
+    std::vector<DepGenRecord> &run_records = records_by_run_[run_epoch];
+    run_records.insert(run_records.end(), buf->records, buf->records + n);
     total_collected_ += n;
 }
 
@@ -287,8 +293,7 @@ void DepGenCollector::finalize(DepGenUnregisterCallback unregister_cb, const Dep
 
     {
         std::scoped_lock lock(records_mutex_);
-        records_.clear();
-        records_.shrink_to_fit();
+        records_by_run_.clear();
     }
 
     auto release_dev = [&](void *p) {
