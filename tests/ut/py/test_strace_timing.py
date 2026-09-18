@@ -1033,7 +1033,7 @@ def test_host_record_spans_nest_bind_segments_and_orchestrator_operations(tmp_pa
             "inv": 5,
             "records": [
                 {"phase": "args", "start_ns": 1_000, "end_ns": 1_100, "detail": 4096, "tid": 9},
-                {"phase": "record_in_graph_task", "start_ns": 1_150, "end_ns": 1_230, "detail": 4, "tid": 42},
+                {"phase": "record_sub_task", "start_ns": 1_150, "end_ns": 1_230, "detail": 4, "tid": 42},
                 {"phase": "graph_submit", "start_ns": 1_200, "end_ns": 1_250, "detail": 77, "tid": 9},
             ],
         }
@@ -1049,7 +1049,7 @@ def test_host_record_spans_nest_bind_segments_and_orchestrator_operations(tmp_pa
     assert by_name["chip.run.bind.host_orch.graph_submit"].depth == bind_depth + 2
     assert by_name["chip.run.bind.args"].ts == 1_000
     assert by_name["chip.run.bind.args"].dur == 100
-    assert by_name["chip.run.bind.host_orch.record_in_graph_task"].tid == 42
+    assert by_name["chip.run.bind.host_orch.record_sub_task"].tid == 42
     assert by_name["chip.run.bind.host_orch.graph_submit"].tid == 9
 
     trace = to_host_swimlane(spans + out)
@@ -1062,37 +1062,40 @@ def test_host_record_spans_nest_bind_segments_and_orchestrator_operations(tmp_pa
     assert lane_names[42] == "graph record worker"
 
 
-def test_host_record_spans_put_the_pre_rename_record_phase_on_the_recorder_lane():
-    """A log written before the phase was renamed still lands on the recorder lane.
+def test_host_record_spans_do_not_accept_a_pre_rename_record_phase():
+    """A log from before the rename draws its recorder work on the main lane.
 
-    The runtime emitted `record_node` for what is now `record_in_graph_task`, and
-    an unrecognised phase name is attributed to host_main rather than rejected —
-    so dropping the old spelling would silently redraw every archived log's
-    recorder work onto the main lane.
+    The record phase has also been called `record_node` and `record_in_graph_task`;
+    this tool accepts neither. An unrecognised phase name is attributed to host_main
+    rather than rejected, so an old log renders without an error — re-capture rather
+    than read one through this tool. Pinned so the behaviour is a stated consequence
+    of dropping the aliases, not an accident.
     """
     spans = list(parse_spans([_span_record(pid=9, tid=9, inv=5, name="chip.run.bind", ts=900, dur=500)]))
-    passes = [
-        {
-            "pid": 9,
-            "inv": 5,
-            "records": [
-                {"phase": "record_node", "start_ns": 1_000, "end_ns": 1_080, "detail": 4, "tid": 42},
-            ],
+    for legacy_phase in ("record_node", "record_in_graph_task"):
+        passes = [
+            {
+                "pid": 9,
+                "inv": 5,
+                "records": [
+                    {"phase": legacy_phase, "start_ns": 1_000, "end_ns": 1_080, "detail": 4, "tid": 42},
+                ],
+            }
+        ]
+
+        out, orphaned, _ = host_record_spans(spans, passes)
+
+        assert orphaned == 0, legacy_phase
+        by_name = {span.name: span for span in out}
+        # Recorded under host_main, not the recorder lane its own tid would have earned.
+        assert f"chip.run.bind.host_orch.{legacy_phase}" in by_name, legacy_phase
+        trace = to_host_swimlane(spans + out)
+        lane_names = {
+            event["tid"]: event["args"]["name"]
+            for event in trace["traceEvents"]
+            if event["ph"] == "M" and event["name"] == "thread_name"
         }
-    ]
-
-    out, orphaned, _ = host_record_spans(spans, passes)
-
-    assert orphaned == 0
-    by_name = {span.name: span for span in out}
-    assert by_name["chip.run.bind.host_orch.record_node"].tid == 42
-    trace = to_host_swimlane(spans + out)
-    lane_names = {
-        event["tid"]: event["args"]["name"]
-        for event in trace["traceEvents"]
-        if event["ph"] == "M" and event["name"] == "thread_name"
-    }
-    assert lane_names[42] == "graph record worker"
+        assert lane_names.get(42) != "graph record worker", legacy_phase
 
 
 def test_host_record_spans_keep_legacy_recording_on_main_lane():
@@ -1102,7 +1105,7 @@ def test_host_record_spans_keep_legacy_recording_on_main_lane():
             "pid": 9,
             "inv": 5,
             "records": [
-                {"phase": "record_in_graph_task", "start_ns": 1_000, "end_ns": 1_080, "detail": 4},
+                {"phase": "record_sub_task", "start_ns": 1_000, "end_ns": 1_080, "detail": 4},
                 {"phase": "build_definition", "start_ns": 1_100, "end_ns": 1_180, "detail": 4},
                 {"phase": "graph_submit", "start_ns": 1_200, "end_ns": 1_250, "detail": 77},
             ],

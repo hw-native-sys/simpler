@@ -1022,8 +1022,7 @@ static void record_aicpu_worker_task(
         record, kind, complete_time, complete_time, loop_iter, /*tasks_processed=*/1, /*shared_at_start=*/nullptr,
         /*shared_at_end=*/nullptr
     );
-    record->phase_data.dummy_task.local_id = static_cast<uint32_t>(task_id);
-    record->phase_data.dummy_task.ring_id = static_cast<uint32_t>(task_id >> 32);
+    record->phase_data.task_id = TaskId{task_id};
 }
 
 void chip_swimlane_aicpu_record_dummy_task(
@@ -1048,8 +1047,7 @@ void chip_swimlane_aicpu_record_graph_prepare(
         record, ChipSwimlaneSchedPhaseKind::GraphPrepare, start_time, end_time, loop_iter, tasks_materialized,
         /*shared_at_start=*/nullptr, /*shared_at_end=*/nullptr
     );
-    record->phase_data.graph_task.local_id = static_cast<uint32_t>(task_id);
-    record->phase_data.graph_task.ring_id = static_cast<uint32_t>(task_id >> 32);
+    record->phase_data.task_id = TaskId{task_id};
 }
 
 void chip_swimlane_aicpu_set_orch_thread_idx(int thread_idx) { s_orch_thread_idx = thread_idx; }

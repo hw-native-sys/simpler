@@ -329,13 +329,24 @@ static bool resolve_graph_task_capacity(const uint64_t *ring_task_window, uint64
         *task_capacity = override_value;
     }
 
-    // Any positive count is usable: a task id indexes its slot directly, so
-    // nothing masks with this value. The power-of-two, >= 4 requirement belongs to
-    // tensormap_and_ringbuffer, which does mask, and is enforced in that runtime's
-    // own resolve; neither the RuntimeEnv setter nor Worker.run constrains the
-    // value, so this bound is the only one a ring_task_window passes through.
-    if (*task_capacity < 1 || *task_capacity > static_cast<uint64_t>(INT32_MAX)) {
-        LOG_ERROR("ring_task_window=%" PRIu64 " must be in [1, INT32_MAX]", *task_capacity);
+    // Any positive count is usable: a task id indexes its slot directly, so no slot
+    // lookup masks with this value. The power-of-two, >= 4 requirement belongs to
+    // tensormap_and_ringbuffer, which does mask there, and is enforced in that
+    // runtime's own resolve; neither the RuntimeEnv setter nor Worker.run constrains
+    // the value, so this bound is the only one a ring_task_window passes through.
+    //
+    // The upper bound is the one place a task id IS masked: a sub-task's id carries
+    // its modular task's local id in a fixed-width parent field, and that mint masks
+    // rather than fails, so a count past the field would truncate a parent silently.
+    // The shared-memory limit below is the tighter of the two in practice -- a slot
+    // costs kilobytes, so INT32_MAX bytes runs out first -- which makes this a guard
+    // that should never be the one to fire rather than a cap anyone meets.
+    if (*task_capacity < 1 || *task_capacity > static_cast<uint64_t>(TaskId::GLOBAL_TASK_MAX_NUM)) {
+        LOG_ERROR(
+            "ring_task_window=%" PRIu64 " must be in [1, %d]: a modular task's local id has to fit the parent field "
+            "of the sub-task ids it mints",
+            *task_capacity, TaskId::GLOBAL_TASK_MAX_NUM
+        );
         return false;
     }
     // A slot state reaches its payload and descriptor through a 32-bit
@@ -559,7 +570,7 @@ bool bind_graph_definitions(
             return false;
         }
         GraphExecutionStorageLayout storage_layout{};
-        if (definition->task_count <= 0 || definition->task_count > MAX_IN_GRAPH_TASKS ||
+        if (definition->task_count <= 0 || definition->task_count > SUB_TASK_MAX_NUM ||
             definition->full_key != upload->full_key ||
             !graph_execution_storage_layout(
                 definition->task_count, definition->tensor_arg_count, definition->scalar_arg_count, &storage_layout
@@ -586,11 +597,11 @@ bool bind_graph_definitions(
         }
         PackedDefinition &packed_definition = object_it->second;
         if (!packed_definition.populations_ready) {
-            const InGraphTaskDefinition *tasks = graph_definition_array<InGraphTaskDefinition>(
-                *definition, definition->off_in_graph_tasks, definition->task_count
+            const SubTaskDefinition *tasks = graph_definition_array<SubTaskDefinition>(
+                *definition, definition->off_sub_tasks, definition->task_count
             );
             if (tasks == nullptr) {
-                LOG_ERROR("host-orch: invalid Graph Definition in-graph task array");
+                LOG_ERROR("host-orch: invalid Graph Definition sub-task array");
                 return false;
             }
             for (int32_t i = 0; i < definition->task_count; ++i) {
@@ -946,7 +957,7 @@ int32_t run_host_orchestration(
     );
     static_assert(
         alignof(ChipTaskStorage) <= DeviceArena::kDefaultBaseAlign,
-        "an in-graph task's storage alignment must be covered by the heap region's base alignment"
+        "a sub-task's storage alignment must be covered by the heap region's base alignment"
     );
     always_assert(reinterpret_cast<uint64_t>(gm_heap) % DeviceArena::kDefaultBaseAlign == 0);
     const sm_layout::HeapRebase heap_rebase{reinterpret_cast<uint64_t>(gm_heap), heap_bytes};

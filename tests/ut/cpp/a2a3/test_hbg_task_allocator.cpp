@@ -116,9 +116,11 @@ TEST_F(HbgTaskAllocatorTest, TaskIdIsItsOwnSlot) {
     EXPECT_TRUE(allocator.alloc(0).failed()) << "the capacity is terminal, not a wrap point";
 }
 
-// Nothing masks with the capacity, so it need not be a power of two: an odd count
-// hands out exactly that many ids and then reports exhaustion. This is what lets a
-// bind pass an arbitrary runtime_env.ring_task_window straight through.
+// No slot lookup masks with the capacity, so it need not be a power of two: an odd
+// count hands out exactly that many ids and then reports exhaustion. This is what
+// lets a bind pass any runtime_env.ring_task_window through without rounding it,
+// up to the TaskId::GLOBAL_TASK_MAX_NUM ceiling resolve_graph_task_capacity holds
+// it to.
 TEST_F(HbgTaskAllocatorTest, NonPowerOfTwoCapacitySaturatesExactly) {
     constexpr int32_t ODD_CAPACITY = 10;
     TaskAllocator odd{};

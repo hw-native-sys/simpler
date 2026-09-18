@@ -28,7 +28,7 @@ the `chip.run.bind` span:
 | ------- | -------------- |
 | `args` | copying readable caller tensors in H2D, into slices of the pipeline slot's retained temporary buffer, and exposing their existing host buffers to orchestration; pure outputs skip both. The buffer grows to the high-water packed size and is reused, so a steady-state workload allocates no device memory here |
 | `arena_build`, `static_arena`, `gm_heap`, `shared_mem`, `runtime_init` | arena layout, GM heap and shared-memory bring-up |
-| `host_orch` | **all** orchestration: every task submitted, every in-graph task recorded, the Definition built |
+| `host_orch` | **all** orchestration: every task submitted, every sub-task recorded, the Definition built |
 | `graph_upload` | one H2D of the block holding every Definition object, and binding each Graph task to the one with its key. The recorders built the objects in that block's host staging during `host_orch`, so this segment writes their headers and copies in only what did not fit |
 | `arena_h2d` | one H2D of the arena's copied zone and the shared-memory image |
 | `host_view_close` | closing per-run tensor-access regions and any optional device mappings; the bind path installs none of its own (`count=0 bytes=0`). `devcopy=N` counts orchestration accesses to child memory that were served by a PCIe round trip because no host mapping was available — a mapping, where one is available, is held by the runtime for the allocation's lifetime and is not closed here |
@@ -495,7 +495,7 @@ orchestration views, so it performs no `halHostRegister` calls and reports
 the H2D work but removes that registration side.
 
 Three of these deserve reading together. `host_orch` is the whole story on dsv4 —
-839 `submit_task`, 743 `record_in_graph_task` and 272 `alloc_tensors` per bind against qwen's
+839 `submit_task`, 743 `record_sub_task` and 272 `alloc_tensors` per bind against qwen's
 5, 277 and 2 — and its 2.3 ms of scatter is why a claim about it needs a
 sub-counter rather than a stopwatch. At the pinned commit, `args` plus
 `host_view_close` are two orders of magnitude above everything else while being

@@ -94,8 +94,14 @@ namespace simpler::hbg {
  */
 struct TensorData {
     // === Cache line 1 (64B) — hot path ===
-    PTOBufferHandle buffer;            // Underlying memory buffer (addr in bytes, size in bytes)
-    TaskId owner_task_id;              // Creator task; TaskId::invalid() for external tensors
+    PTOBufferHandle buffer;  // Underlying memory buffer (addr in bytes, size in bytes)
+    // Creator task; TaskId::invalid() for external tensors. On a tensor a modular task's
+    // body recorded, this says where the tensor CAME FROM rather than which run-time task
+    // owns it: the recorder stamps PARAM with a boundary parameter's index, or SUB_TASK
+    // with the producing block's index within that body. A replay rebinds the tensor
+    // without reminting the field (graph_rebind_tensor), so a materialized tensor still
+    // carries the recording's value — nothing on the device reads it back.
+    TaskId owner_task_id;
     uint64_t start_offset;             // 1D ELEMENT offset of the view origin into `buffer`
     int32_t version;                   // Tensor version for overlap detection
     uint8_t ndims;                     // Number of dimensions used; MAX_TENSOR_DIMS bounds it

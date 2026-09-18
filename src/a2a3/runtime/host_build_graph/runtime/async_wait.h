@@ -123,7 +123,7 @@ struct AsyncWaitEntry {
 
 struct AsyncPollResult {
     int32_t completed{0};  // Host-submitted stream tasks completed.
-    int32_t resolved{0};   // All task completions, including in-graph tasks.
+    int32_t resolved{0};   // All task completions, including sub-tasks.
     int32_t error_code{SIMPLER_ERROR_NONE};
     ChipTaskSlotState *failed_slot_state{nullptr};
 };

@@ -16,7 +16,7 @@
  * 1. Maintaining per-resource-shape ready queues
  * 2. Polling-completion dependency resolution: a GLOBAL task is ready when every
  *    producer named in its inline fanin has a COMPLETED task_states byte, an
- *    IN_GRAPH one when every producer in its Graph's fanin wire does — the same
+ *    SUB_TASK one when every producer in its Graph's fanin wire does — the same
  *    array shape, held by the GraphExecution instead of the task header; a
  *    producer publishes completion + drains its wake list on finish
  * 3. Publishing completion (task_states byte PENDING -> COMPLETED)
@@ -753,7 +753,7 @@ struct SchedulerState {
     // per-shape dispatch_shape. An EARLY sync cohort carries a non-zero src_payload
     // gate; its owner stages locally when one tracker fits and uses the global drain
     // otherwise. Any early-dispatch candidate carrying sync_start lands
-    // here, whatever cohort it belongs to: a top-level one, an in-graph one whose
+    // here, whatever cohort it belongs to: a top-level one, a sub-task whose
     // producers published, or a Graph root its shell staged. The queue is chosen
     // by the task's own attribute, never by where it was submitted.
     ChipReadyQueue early_sync_start_queue;
@@ -957,7 +957,7 @@ struct SchedulerState {
     // GLOBAL task. complete_task routes on exactly this pair, and the publish
     // chain follows it for the same reason: a GRAPH shell is a task of the run
     // and takes the global path even though it carries a graph_context.
-    static GraphExecution *in_graph_execution_of(ChipTaskSlotState &slot_state) {
+    static GraphExecution *sub_task_execution_of(ChipTaskSlotState &slot_state) {
         if (slot_state.graph_context == nullptr || slot_state.task_kind == TaskKind::GRAPH) return nullptr;
         return static_cast<GraphExecution *>(slot_state.graph_context);
     }
@@ -991,12 +991,12 @@ struct SchedulerState {
         );
         if (total != slot_state.logical_block_num) return false;
         // Which array carries this task's state is the one thing the two cohorts
-        // do not share: a GLOBAL task has a task-table slot, an IN_GRAPH task has
+        // do not share: a GLOBAL task has a task-table slot, a SUB_TASK has
         // only its execution's array. The bytes are the same shape, so nothing
         // past this line differs.
-        GraphExecution *execution = in_graph_execution_of(slot_state);
+        GraphExecution *execution = sub_task_execution_of(slot_state);
         if (execution != nullptr) {
-            execution->store_published(slot_state.in_graph_local_id);
+            execution->store_published(slot_state.sub_task_local_id);
         } else {
             task_view.tasks->store_published(slot_state.to_descriptor().task_id.local_id());
         }
@@ -1040,12 +1040,12 @@ struct SchedulerState {
         SharedMemoryTaskHeader &tasks = *task_view.tasks;
         // The two cohorts differ in where the row lives and where the states do,
         // and in nothing else: a GLOBAL candidate scans its payload's inline
-        // fanin against the task header, an IN_GRAPH one scans its Definition's
+        // fanin against the task header, a SUB_TASK one scans its Definition's
         // CSR row against its execution. Both rows are sorted by producer index
         // for a candidate, so the cursor means the same thing either way.
-        GraphExecution *execution = in_graph_execution_of(c);
+        GraphExecution *execution = sub_task_execution_of(c);
         const int32_t *fanin = execution == nullptr ? c.to_payload().fanin_data() : nullptr;
-        const int32_t csr_begin = execution == nullptr ? 0 : execution->fanin_offsets[c.in_graph_local_id];
+        const int32_t csr_begin = execution == nullptr ? 0 : execution->fanin_offsets[c.sub_task_local_id];
         int32_t i = c.ed_publish_scan_cursor;
         while (i >= 0) {
             const int32_t producer_index =
@@ -1083,10 +1083,10 @@ struct SchedulerState {
     // is not yet ready (its completion classification hung it on a wake list).
     // Returns true when every producer is already published at intake.
     bool register_on_ed_publish_list(ChipTaskSlotState &c) {
-        const GraphExecution *execution = in_graph_execution_of(c);
+        const GraphExecution *execution = sub_task_execution_of(c);
         const int32_t row_len = execution == nullptr ? c.to_payload().fanin_count :
-                                                       execution->fanin_offsets[c.in_graph_local_id + 1] -
-                                                           execution->fanin_offsets[c.in_graph_local_id];
+                                                       execution->fanin_offsets[c.sub_task_local_id + 1] -
+                                                           execution->fanin_offsets[c.sub_task_local_id];
         c.ed_publish_scan_cursor = static_cast<uint16_t>(row_len - 1);
 #if SIMPLER_SCHED_PROFILING
         ed_publish_stats.registered.fetch_add(1, std::memory_order_relaxed);
@@ -1229,7 +1229,7 @@ struct SchedulerState {
     // last classification and completion is monotonic, so re-walking them
     // cannot change the verdict.
     int32_t graph_first_unmet_producer(const GraphExecution &execution, ChipTaskSlotState &consumer) const {
-        const int32_t task_index = consumer.in_graph_local_id;
+        const int32_t task_index = consumer.sub_task_local_id;
         const int32_t begin = execution.fanin_offsets[task_index];
         const int32_t count = execution.fanin_offsets[task_index + 1] - begin;
         const int32_t start = consumer.wake_scan_cursor < count ? consumer.wake_scan_cursor : count - 1;
@@ -1245,7 +1245,7 @@ struct SchedulerState {
     // The producer a graph_first_unmet_producer row index names.
     ChipTaskSlotState &
     graph_producer_at(const GraphExecution &execution, const ChipTaskSlotState &consumer, int32_t row) const {
-        const int32_t begin = execution.fanin_offsets[consumer.in_graph_local_id];
+        const int32_t begin = execution.fanin_offsets[consumer.sub_task_local_id];
         return execution.task_at(execution.fanin_indices[begin + row]).slot;
     }
 
@@ -1278,7 +1278,7 @@ struct SchedulerState {
         ChipTaskSlotState *waiter = producer.wake_list_head.exchange(WAKE_LIST_SENTINEL, std::memory_order_acq_rel);
         while (waiter != nullptr && waiter != WAKE_LIST_SENTINEL) {
             ChipTaskSlotState *next = waiter->next_in_wake_list;
-            const int32_t local_id = waiter->in_graph_local_id;
+            const int32_t local_id = waiter->sub_task_local_id;
             if (execution.fanin_offsets[local_id + 1] - execution.fanin_offsets[local_id] == 1) {
                 push_ready_routed(waiter);  // single-producer waiter was waiting only on us
                 consumers_resolved++;
@@ -1323,7 +1323,7 @@ struct SchedulerState {
         return routed;
     }
 
-    // Register each newly materialized in-graph task [first, last) on its first unmet
+    // Register each newly materialized sub-task [first, last) on its first unmet
     // producer (or route it immediately when every producer already completed),
     // publish the range for routing, and route any roots the external gate now
     // admits. Runs single-owner per graph via the prepare-queue slot, so the
@@ -1422,7 +1422,7 @@ struct SchedulerState {
             outcome.error_code = SIMPLER_ERROR_INVALID_ARGS;
             return outcome;
         }
-        // Incremental activation routes an in-graph task before the graph reaches
+        // Incremental activation routes a sub-task before the graph reaches
         // ACTIVE, so one can legitimately complete while the graph is still
         // MATERIALIZING or PREPARED. Only SUBMITTED (execution not yet bound) and
         // COMPLETED (execution already retired) are invalid states for such a completion.
@@ -1431,7 +1431,7 @@ struct SchedulerState {
             outcome.error_code = SIMPLER_ERROR_INVALID_ARGS;
             return outcome;
         }
-        const int32_t task_index = slot_state.in_graph_local_id;
+        const int32_t task_index = slot_state.sub_task_local_id;
         if (task_index < 0 || task_index >= execution->task_count) {
             outcome.error_code = SIMPLER_ERROR_INVALID_ARGS;
             return outcome;
@@ -1447,11 +1447,11 @@ struct SchedulerState {
         if ((slot_state.ed_flags & ED_FLAG_TRACKED) != 0) seal_ed_publish_list(slot_state);
         outcome.fanout_edges = drain_graph_wake_list(*execution, slot_state);
 
-        const bool graph_completed = graph_execution_complete_in_graph_task(*execution);
-        graph_execution_retire_in_graph_task(*execution);
+        const bool graph_completed = graph_execution_complete_sub_task(*execution);
+        graph_execution_retire_sub_task(*execution);
         if (!graph_completed) return outcome;
 
-        // Internal tasks count as zero stream tasks. The final in-graph task publishes
+        // Internal tasks count as zero stream tasks. The final sub-task publishes
         // the outer task exactly once, waking external consumers and
         // contributing the one task the host actually submitted.
         if (execution->outer_slot != nullptr) {

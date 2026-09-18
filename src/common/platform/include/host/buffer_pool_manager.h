@@ -695,7 +695,7 @@ public:
     void notify_ready_waiters() {
         for (int shard_index = 0; shard_index < shard_count_; shard_index++) {
             auto &shard = ready_shards_[shard_index];
-            std::lock_guard<std::mutex> lock(shard.wait_mutex);
+            std::scoped_lock lock(shard.wait_mutex);
             shard.cv.notify_all();
         }
     }

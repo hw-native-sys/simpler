@@ -85,9 +85,9 @@ std::vector<std::byte> make_test_definition(
     std::vector<int32_t> fanout_offsets{0, 1, 1};
     std::vector<uint16_t> fanout_indices{1};
     std::vector<uint16_t> roots{0};
-    std::vector<uint64_t> in_graph_task_offsets{0, 64};
-    std::vector<InGraphTaskDefinition> tasks(2);
-    for (InGraphTaskDefinition &task : tasks) {
+    std::vector<uint64_t> sub_task_offsets{0, 64};
+    std::vector<SubTaskDefinition> tasks(2);
+    for (SubTaskDefinition &task : tasks) {
         std::fill(std::begin(task.kernel_id), std::end(task.kernel_id), INVALID_KERNEL_ID);
         task.kernel_id[0] = 42;
         task.active_mask = 1;
@@ -154,7 +154,7 @@ std::vector<std::byte> make_test_definition(
     // Tensor 1 is task 0's output, so its address is an offset into the graph heap.
     std::vector<simpler::hbg::TensorData> tensors{
         make_test_tensor(0, TaskId::make_param(0)),
-        make_test_tensor(16, TaskId::make_in_graph(0, 0)),
+        make_test_tensor(16, TaskId::make_sub_task(0, 0)),
     };
     tensors[1].buffer.size = 32;
     std::vector<uint64_t> scalars{0, 18};
@@ -178,8 +178,8 @@ std::vector<std::byte> make_test_definition(
     definition.off_fanout_offsets = append_section(image, fanout_offsets);
     definition.off_fanout_indices = append_section(image, fanout_indices);
     definition.off_root_indices = append_section(image, roots);
-    definition.off_in_graph_task_offsets = append_section(image, in_graph_task_offsets);
-    definition.off_in_graph_tasks = append_section(image, tasks);
+    definition.off_sub_task_offsets = append_section(image, sub_task_offsets);
+    definition.off_sub_tasks = append_section(image, tasks);
     definition.off_tensors = append_section(image, tensors);
     definition.off_scalars = append_section(image, scalars);
     definition.off_scalar_inheritance = append_section(image, scalar_inheritance);
@@ -566,13 +566,13 @@ TEST(GraphExecutionStorage, NarrowerArgTablesReserveLess) {
     EXPECT_LT(narrow, wide);
 }
 
-TEST(GraphExecutionStorage, RejectsInvalidInGraphTaskCount) {
+TEST(GraphExecutionStorage, RejectsInvalidSubTaskCount) {
     size_t storage_bytes = 0;
 
     EXPECT_FALSE(graph_execution_storage_bytes(0, 1, 1, &storage_bytes));
     EXPECT_FALSE(graph_execution_storage_bytes(-1, 1, 1, &storage_bytes));
-    EXPECT_FALSE(graph_execution_storage_bytes(MAX_IN_GRAPH_TASKS + 1, 1, 1, &storage_bytes));
-    // A Definition with no arguments at all still needs its in-graph task array.
+    EXPECT_FALSE(graph_execution_storage_bytes(SUB_TASK_MAX_NUM + 1, 1, 1, &storage_bytes));
+    // A Definition with no arguments at all still needs its sub-task array.
     EXPECT_TRUE(graph_execution_storage_bytes(1, 0, 0, &storage_bytes));
     EXPECT_GE(storage_bytes, sizeof(GraphExecution) + sizeof(ChipTaskStorage));
 }
@@ -607,7 +607,7 @@ TEST(GraphExecutionReplay, ResubmissionRebuildsFromDefinition) {
     // what makes the root verdict below reachable at all.
     outer_slot.ed_flags = ED_FLAG_CANDIDATE;
 
-    // The execution and in-graph task storage both occupy the outer heap tail after
+    // The execution and sub-task storage both occupy the outer heap tail after
     // required_heap.
     EXPECT_EQ(static_cast<void *>(execution), heap.execution());
     EXPECT_EQ(graph_execution_materialize_slice(outer_slot, *execution, 2), GraphMaterializeResult::PREPARED);
@@ -653,7 +653,7 @@ TEST(GraphExecutionReplay, ResubmissionRebuildsFromDefinition) {
     EXPECT_EQ(storage.payload.scalar_data()[0], 99U);
     EXPECT_EQ(execution->task_at(1).payload.scalar_data()[0], 18U);
     EXPECT_EQ(storage.payload.tensor_data()[0].version, 0);
-    EXPECT_EQ(storage.task.task_id, TaskId::make_in_graph(/*graph_task_id=*/8, /*in_graph_local_id=*/0));
+    EXPECT_EQ(storage.task.task_id, TaskId::make_sub_task(/*parent_id=*/8, /*local_id=*/0));
     EXPECT_EQ(storage.task.packed_buffer_base, heap.base());
     EXPECT_EQ(storage.payload.tensor_data()[0].buffer.addr, reinterpret_cast<uint64_t>(second_boundary.data()));
     EXPECT_EQ(execution->task_at(1).payload.tensor_data()[0].buffer.addr, reinterpret_cast<uint64_t>(heap.base() + 16));
@@ -753,7 +753,7 @@ TEST(GraphExecutionReplay, AcceptsTheSameImageWithoutTheDefect) {
 
 // The boundary scalar pool is bounded by the Graph boundary contract
 // (GRAPH_MAX_SCALAR_ARGS), not by a single task payload's MAX_SCALAR_ARGS —
-// an in-graph task stages at most MAX_SCALAR_ARGS entries from it, but the pool itself
+// a sub-task stages at most MAX_SCALAR_ARGS entries from it, but the pool itself
 // may be wider.
 TEST(GraphExecutionReplay, MaterializesBoundaryScalarPoolWiderThanTaskPayload) {
     constexpr uint64_t GRAPH_KEY_VALUE = 0x1234;
@@ -830,7 +830,7 @@ TEST(GraphDefinitionObject, RejectsHeaderFramingAnotherGraph) {
 // localize. It matters because every CSR section is fetched with `task_count + 1`, so a
 // -1 that reached bind_graph_topology would ask for zero elements, get a live pointer,
 // and read fanin_offsets one slot before the array.
-TEST(GraphDefinitionObject, RejectsNonPositiveInGraphTaskCount) {
+TEST(GraphDefinitionObject, RejectsNonPositiveSubTaskCount) {
     constexpr uint64_t GRAPH_KEY_VALUE = 0x4567;
     std::array<uint8_t, 64> boundary{};
     for (const int32_t task_count : {-1, 0}) {
@@ -846,13 +846,13 @@ TEST(GraphDefinitionObject, RejectsNonPositiveInGraphTaskCount) {
     }
 }
 
-// An in-graph task's pool offsets are signed, which makes a negative one representable
+// A sub-task's pool offsets are signed, which makes a negative one representable
 // where the unsigned span tests used to reject it as a huge value. Signed, those tests go
 // blind: a negative offset is below tensor_arg_count, and subtracting it *widens* the
 // remaining span, so both `offset > count` and `count > total - offset` pass. Only the
 // explicit negative test in bind_graph_topology rejects it, and it belongs there rather
 // than in the per-slice materialize path, which runs after the pointer is bound.
-TEST(GraphDefinitionObject, RejectsNegativeInGraphTaskArgOffset) {
+TEST(GraphDefinitionObject, RejectsNegativeSubTaskArgOffset) {
     constexpr uint64_t GRAPH_KEY_VALUE = 0x4567;
     std::array<uint8_t, 64> boundary{};
     std::vector<std::byte> definition =
@@ -866,7 +866,7 @@ TEST(GraphDefinitionObject, RejectsNegativeInGraphTaskArgOffset) {
     }
 
     auto *header = reinterpret_cast<GraphDefinition *>(definition.data());
-    auto *tasks = reinterpret_cast<InGraphTaskDefinition *>(definition.data() + header->off_in_graph_tasks);
+    auto *tasks = reinterpret_cast<SubTaskDefinition *>(definition.data() + header->off_sub_tasks);
     tasks[1].tensor_offset = -1;
     const TestDefinitionObject definition_object(definition);
     OuterHeap heap(definition);
@@ -989,11 +989,11 @@ TEST(GraphExecutionErrors, GraphPrepareQueueOverflowIsReported) {
     EXPECT_EQ(header.sched_error_bitmap.load(std::memory_order_acquire), 1U << 3);
 }
 
-TEST(GraphExecutionErrors, InvalidInGraphTaskCompletionIsReported) {
+TEST(GraphExecutionErrors, InvalidSubTaskCompletionIsReported) {
     SchedulerState scheduler{};
     ChipTaskSlotState slot{};
     // Membership without a usable execution: graph_context names one, but neither its
-    // definition nor its in-graph task array was ever bound.
+    // definition nor its sub-task array was ever bound.
     GraphExecution execution{};
     slot.graph_context = &execution;
 
@@ -1003,7 +1003,7 @@ TEST(GraphExecutionErrors, InvalidInGraphTaskCompletionIsReported) {
     EXPECT_EQ(outcome.stream_tasks_completed, 0);
 }
 
-TEST(GraphExecutionProgress, InGraphTaskResolutionIsNotAHostCompletion) {
+TEST(GraphExecutionProgress, SubTaskResolutionIsNotAHostCompletion) {
     SchedulerState scheduler{};
     GraphDefinition definition{};
     ChipTaskStorage task{};
@@ -1017,7 +1017,7 @@ TEST(GraphExecutionProgress, InGraphTaskResolutionIsNotAHostCompletion) {
     execution.remaining_tasks.store(1, std::memory_order_relaxed);
     graph_execution_set_state(execution, GraphExecutionState::ACTIVE, std::memory_order_relaxed);
     task.slot.graph_context = &execution;
-    task.slot.in_graph_local_id = 0;
+    task.slot.sub_task_local_id = 0;
 
     AsyncWaitList wait_list{};
     wait_list.entries[0].slot_state = &task.slot;
@@ -1073,14 +1073,14 @@ TEST(GraphExecutionMaterialize, DirtyStorageYieldsValidExecution) {
         // A tensor address of 0xAAAAAAAAAAAAAAAA would mean the fill leaked
         // through into a field the scheduler later dereferences.
         ASSERT_NE(storage.payload.tensor_data()[0].buffer.addr, 0xAAAAAAAAAAAAAAAAULL);
-        // make_test_definition assigns in-graph task i the heap offset 64*i, so the
+        // make_test_definition assigns sub-task i the heap offset 64*i, so the
         // packed window starts at outer_base + 64*i, not at outer_base.
         ASSERT_EQ(storage.task.packed_buffer_base, static_cast<void *>(heap.base() + static_cast<size_t>(i) * 64));
     }
     EXPECT_EQ(execution->materialized_tasks, execution->task_count);
     EXPECT_EQ(execution->consumed_tensor_args, 2U);
 
-    // Localize and materialize read the boundary and write in-graph task arguments; neither may
+    // Localize and materialize read the boundary and write sub-task arguments; neither may
     // touch the tensor region past the packed boundary values.
     const std::byte *tail = heap.boundary_tail(1);
     for (size_t i = 0; i < heap.boundary_tail_bytes(1); ++i) {

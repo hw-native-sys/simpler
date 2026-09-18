@@ -22,19 +22,15 @@
 #include "host_build_graph/runtime_types.h"
 #include "tensor.h"
 
-inline constexpr int32_t MAX_IN_GRAPH_TASKS = 1024;
-static_assert(
-    MAX_IN_GRAPH_TASKS <= (1 << TaskId::IN_GRAPH_LOCAL_ID_BITS),
-    "an in-graph local id must fit the low field of an IN_GRAPH task id"
-);
+inline constexpr int32_t SUB_TASK_MAX_NUM = 1024;
 // A body's producers precede their consumers, so a fanin CSR row holds at most
 // task_count - 1 entries, and both of the slot's row cursors index one of them.
-// An in-graph row has no cap of its own — unlike a GLOBAL task's inline row,
+// A sub-task's row has no cap of its own — unlike a GLOBAL task's inline row,
 // which append_fanin_or_fail holds to CHIP_MAX_FANIN — so this is what bounds
 // them, and a cursor too narrow for it would report a row scanned that was not.
-static_assert(MAX_IN_GRAPH_TASKS - 1 < 0xFFFF, "a fanin CSR row index must fit ChipTaskSlotState::wake_scan_cursor");
+static_assert(SUB_TASK_MAX_NUM - 1 < 0xFFFF, "a fanin CSR row index must fit ChipTaskSlotState::wake_scan_cursor");
 static_assert(
-    MAX_IN_GRAPH_TASKS - 1 < 0xFFFF && CHIP_MAX_FANIN - 1 < 0xFFFF,
+    SUB_TASK_MAX_NUM - 1 < 0xFFFF && CHIP_MAX_FANIN - 1 < 0xFFFF,
     "a fanin row index from either cohort must fit ChipTaskSlotState::ed_publish_scan_cursor"
 );
 inline constexpr int32_t GRAPH_MATERIALIZE_SLICE_TASKS = 4;
@@ -46,7 +42,7 @@ inline constexpr int32_t GRAPH_MATERIALIZE_SLICE_TASKS = 4;
 // A tensor travels as simpler::hbg::TensorData, the 96-byte base simpler::hbg::Tensor
 // derives from -- see its declaration for why the image cannot hold the aligned form.
 
-// Where one in-graph task scalar slot takes its value from: the Definition's own
+// Where one sub-task scalar slot takes its value from: the Definition's own
 // scalars[] entry, or the boundary parameter named by boundary_index(). It is the wire
 // form of the two things recording knows about a slot -- whether it inherits, and which
 // parameter it inherits -- so inherited() is the same predicate as Arg::scalar_inherited.
@@ -83,7 +79,7 @@ private:
     uint16_t inherited_;
 };
 
-// Wire representation of an in-graph task's dispatch predicate. The operand's absolute GM
+// Wire representation of a sub-task's dispatch predicate. The operand's absolute GM
 // address is not replay-invariant, so the Definition names the tensor the
 // operand element sits in plus its element offset within that tensor;
 // materialize rebinds the tensor for the execution and resolves the pair into
@@ -102,7 +98,7 @@ struct GraphPredicate {
     uint8_t reserved[6];
 };
 
-struct InGraphTaskDefinition {
+struct SubTaskDefinition {
     int32_t kernel_id[SUBTASK_SLOT_COUNT];
     uint8_t active_mask;
     uint8_t task_attrs;
@@ -116,7 +112,7 @@ struct InGraphTaskDefinition {
     int16_t logical_block_num;
     int16_t total_required_subtasks;
     // One-based index into the Definition's predicate array; 0 means the task
-    // carries no dispatch predicate. Biased so that a zeroed InGraphTaskDefinition
+    // carries no dispatch predicate. Biased so that a zeroed SubTaskDefinition
     // is a valid predicate-free task. Predicated tasks are rare, so the
     // predicates live in their own array rather than inline.
     uint16_t predicate_slot;
@@ -164,7 +160,7 @@ struct GraphDefinition {
     uint64_t full_key;
     uint64_t required_heap;
     // The header splits by range, not by name. Everything that counts *things* is
-    // signed: each is capped by MAX_IN_GRAPH_TASKS times a per-task constant, so the
+    // signed: each is capped by SUB_TASK_MAX_NUM times a per-task constant, so the
     // largest of them (edge_count, at 1024 x 1023) still clears INT32_MAX by three
     // orders of magnitude, and a signed count makes a corrupt wire value testable
     // with `< 0` instead of turning it into a huge index. Everything that counts
@@ -180,7 +176,7 @@ struct GraphDefinition {
     int32_t tensor_arg_count;
     int32_t scalar_arg_count;
     int32_t predicate_count;
-    // Bytes the GraphExecution header, in-graph task array and in-graph task
+    // Bytes the GraphExecution header, sub-task array and sub-task
     // argument pools need in the outer Graph task's heap tail. Invocation
     // boundaries live in the outer task payload's compact argument-pool regions
     // instead.
@@ -190,9 +186,9 @@ struct GraphDefinition {
     uint32_t off_fanin_offsets;
     uint32_t off_fanin_indices;
     uint32_t off_root_indices;
-    uint32_t off_in_graph_task_offsets;
-    uint32_t off_in_graph_tasks;
-    // Every in-graph task's tensor arguments, concatenated; a task names its own run
+    uint32_t off_sub_task_offsets;
+    uint32_t off_sub_tasks;
+    // Every sub-task's tensor arguments, concatenated; a task names its own run
     // through tensor_offset / tensor_count.
     //
     // These are **relocation records**, not tensors. Every other simpler::hbg::Tensor in
@@ -201,7 +197,7 @@ struct GraphDefinition {
     // two fields replay has a base for are stored relative, and which base to add follows
     // the tensor's own owner_task_id, stamped by the recording.
     //
-    //   field           owner PARAM                           owner IN_GRAPH
+    //   field           owner PARAM                           owner SUB_TASK
     //   buffer_addr     0 -- replay takes the whole buffer     offset into the graph heap,
     //                   from this call's argument              whose base the execution has
     //   start_offset    the view's offset inside that          the view's own origin,
@@ -227,13 +223,13 @@ struct GraphDefinition {
 static_assert(std::is_trivially_copyable_v<GraphScalarInheritance>);
 static_assert(std::is_standard_layout_v<GraphScalarInheritance>);
 static_assert(sizeof(GraphScalarInheritance) == 4, "the image's scalar section assumes this layout");
-static_assert(std::is_trivially_copyable_v<InGraphTaskDefinition>);
-static_assert(std::is_standard_layout_v<InGraphTaskDefinition>);
+static_assert(std::is_trivially_copyable_v<SubTaskDefinition>);
+static_assert(std::is_standard_layout_v<SubTaskDefinition>);
 // graph_fill_definition assigns this struct field by field, so its interior padding
-// is the one part of the in-graph task section no writer reaches. Nothing reads it
+// is the one part of the sub-task section no writer reaches. Nothing reads it
 // either, but pinning the size makes a new field's padding cost visible in the diff
 // that adds it rather than silently.
-static_assert(sizeof(InGraphTaskDefinition) == 80, "an InGraphTaskDefinition field changed the wire layout");
+static_assert(sizeof(SubTaskDefinition) == 80, "a SubTaskDefinition field changed the wire layout");
 static_assert(std::is_trivially_copyable_v<GraphPredicate>);
 static_assert(std::is_standard_layout_v<GraphPredicate>);
 static_assert(std::is_trivially_copyable_v<GraphDefinition>);
@@ -246,7 +242,7 @@ static_assert(std::is_standard_layout_v<GraphDefinition>);
 // type that asked for more would make every one of those stores undefined, with
 // no diagnostic.
 static_assert(
-    alignof(InGraphTaskDefinition) <= alignof(std::max_align_t) &&
+    alignof(SubTaskDefinition) <= alignof(std::max_align_t) &&
         alignof(simpler::hbg::TensorData) <= alignof(std::max_align_t) &&
         alignof(GraphScalarInheritance) <= alignof(std::max_align_t) &&
         alignof(GraphPredicate) <= alignof(std::max_align_t),
@@ -309,10 +305,10 @@ struct GraphExecution {
     ChipTaskSlotState *outer_slot{nullptr};
     ChipTaskStorage *tasks{nullptr};
     ChipTaskStorage *task_storage{nullptr};
-    // Polling-progress state, one ChipTaskState byte per in-graph task, in the
+    // Polling-progress state, one ChipTaskState byte per sub-task, in the
     // storage tail. Carries the same PENDING -> PUBLISHED -> COMPLETED meaning
     // as the shared-memory task_states array a GLOBAL task uses, against
-    // in-graph local ids instead of task-table slots, so both cohorts answer
+    // sub-task local ids instead of task-table slots, so both cohorts answer
     // readiness the same way.
     //
     // A byte array of its own rather than a field of ChipTaskStorage, for the
@@ -370,33 +366,33 @@ struct GraphExecution {
 };
 
 static_assert(std::is_trivially_destructible_v<ChipTaskStorage>);
-// The tensor pool starts right after the in-graph task array, and the scalar pool starts
+// The tensor pool starts right after the sub-task array, and the scalar pool starts
 // after a whole number of ChipTensors.
 static_assert(
     alignof(ChipTaskStorage) % alignof(simpler::hbg::Tensor) == 0,
-    "an in-graph task entry must be at least simpler::hbg::Tensor-aligned: the tensor pool follows the "
-    "in-graph task array"
+    "a sub-task entry must be at least simpler::hbg::Tensor-aligned: the tensor pool follows the "
+    "sub-task array"
 );
 static_assert(
     sizeof(simpler::hbg::Tensor) % alignof(uint64_t) == 0, "the tensor stride must keep the scalar pool aligned"
 );
 static_assert(std::is_trivially_destructible_v<GraphExecution>);
 // The whole storage is aligned for its widest member, so one base check covers the
-// header as well as the in-graph task array that follows it.
+// header as well as the sub-task array that follows it.
 static_assert(
     alignof(ChipTaskStorage) % alignof(GraphExecution) == 0,
-    "the in-graph task array's alignment must subsume the execution header's"
+    "the sub-task array's alignment must subsume the execution header's"
 );
 
 // The outer GRAPH task's heap tail occupies
 // [GraphExecution][ChipTaskStorage x task_count][simpler::hbg::Tensor x tensor_arg_count]
 // [uint64_t x scalar_arg_count].
 //
-// The last two regions are the in-graph task payloads' argument pools, indexed by the
+// The last two regions are the sub-task payloads' argument pools, indexed by the
 // Definition's own tensor_offset / scalar_offset — which is why the Definition's
-// arg-table counts size them rather than a per-task sum: in-graph task i's arguments
+// arg-table counts size them rather than a per-task sum: sub-task i's arguments
 // occupy [offset, offset + count) in both the table and the pool. There is no fanin
-// region: an in-graph task's dependencies live in the Definition's fanin CSR, so its
+// region: a sub-task's dependencies live in the Definition's fanin CSR, so its
 // fanin_count stays 0 and its fanin delta unbound.
 struct GraphExecutionStorageLayout {
     size_t tasks_offset;
@@ -409,7 +405,7 @@ struct GraphExecutionStorageLayout {
 inline bool graph_execution_storage_layout(
     int32_t task_count, int32_t tensor_arg_count, int32_t scalar_arg_count, GraphExecutionStorageLayout *out
 ) {
-    if (out == nullptr || task_count <= 0 || task_count > MAX_IN_GRAPH_TASKS || tensor_arg_count < 0 ||
+    if (out == nullptr || task_count <= 0 || task_count > SUB_TASK_MAX_NUM || tensor_arg_count < 0 ||
         scalar_arg_count < 0) {
         return false;
     }
@@ -498,7 +494,7 @@ inline bool graph_execution_signal_external_ready(GraphExecution &execution) {
             GRAPH_EXECUTION_EXTERNAL_READY) == 0;
 }
 
-inline bool graph_execution_complete_in_graph_task(GraphExecution &execution) {
+inline bool graph_execution_complete_sub_task(GraphExecution &execution) {
     return execution.remaining_tasks.fetch_sub(1, std::memory_order_acq_rel) == 1;
 }
 
@@ -506,6 +502,6 @@ inline void graph_execution_mark_completed(GraphExecution &execution) {
     graph_execution_set_state(execution, GraphExecutionState::COMPLETED);
 }
 
-inline void graph_execution_retire_in_graph_task(GraphExecution &execution) {
+inline void graph_execution_retire_sub_task(GraphExecution &execution) {
     execution.retired_tasks.fetch_add(1, std::memory_order_release);
 }

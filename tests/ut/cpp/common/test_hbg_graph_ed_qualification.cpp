@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * The in-graph twin of the early-dispatch qualification contract. A body is
+ * The sub-task twin of the early-dispatch qualification contract. A body is
  * recorded once per shape, so its verdicts are decided at Definition build time
  * rather than per submit:
  *
@@ -211,7 +211,7 @@ TEST_F(HbgGraphEdQualificationTest, AllFlaggedProducersMakeCandidateAndSortItsRo
     const GraphDefinition *definition = published_definition();
     ASSERT_NE(definition, nullptr);
     ASSERT_EQ(definition->task_count, 3);
-    const auto *tasks = graph_definition_array<InGraphTaskDefinition>(*definition, definition->off_in_graph_tasks, 3);
+    const auto *tasks = graph_definition_array<SubTaskDefinition>(*definition, definition->off_sub_tasks, 3);
     const auto *fanin_offsets = graph_definition_array<int32_t>(*definition, definition->off_fanin_offsets, 4);
     const auto *fanin_indices =
         graph_definition_array<uint16_t>(*definition, definition->off_fanin_indices, definition->edge_count);
@@ -225,7 +225,7 @@ TEST_F(HbgGraphEdQualificationTest, AllFlaggedProducersMakeCandidateAndSortItsRo
     // A body root's real gate is the outer shell's activation, not this CSR.
     EXPECT_EQ(tasks[0].ed_flags & ED_FLAG_CANDIDATE, 0);
     EXPECT_EQ(tasks[1].ed_flags & ED_FLAG_CANDIDATE, 0);
-    // No in-graph task reaches the device carrying the early-resolve bit.
+    // No sub-task reaches the device carrying the early-resolve bit.
     EXPECT_EQ(TaskAttrs{tasks[0].task_attrs}.allow_early_resolve(), false);
 
     ASSERT_EQ(fanin_offsets[3] - fanin_offsets[2], 2);
@@ -246,7 +246,7 @@ TEST_F(HbgGraphEdQualificationTest, OneUnflaggedProducerDisqualifiesAndLeavesIts
     const GraphDefinition *definition = published_definition();
     ASSERT_NE(definition, nullptr);
     ASSERT_EQ(definition->task_count, 3);
-    const auto *tasks = graph_definition_array<InGraphTaskDefinition>(*definition, definition->off_in_graph_tasks, 3);
+    const auto *tasks = graph_definition_array<SubTaskDefinition>(*definition, definition->off_sub_tasks, 3);
     const auto *fanin_offsets = graph_definition_array<int32_t>(*definition, definition->off_fanin_offsets, 4);
     const auto *fanin_indices =
         graph_definition_array<uint16_t>(*definition, definition->off_fanin_indices, definition->edge_count);
@@ -283,7 +283,7 @@ TEST_F(HbgGraphEdQualificationTest, HiddenAllocProducerDoesNotDisqualifyItsConsu
     const GraphDefinition *definition = published_definition();
     ASSERT_NE(definition, nullptr);
     ASSERT_EQ(definition->task_count, 3);
-    const auto *tasks = graph_definition_array<InGraphTaskDefinition>(*definition, definition->off_in_graph_tasks, 3);
+    const auto *tasks = graph_definition_array<SubTaskDefinition>(*definition, definition->off_sub_tasks, 3);
     const auto *fanin_offsets = graph_definition_array<int32_t>(*definition, definition->off_fanin_offsets, 4);
     ASSERT_NE(tasks, nullptr);
     ASSERT_NE(fanin_offsets, nullptr);
@@ -383,7 +383,7 @@ protected:
             fanin_offsets.push_back(static_cast<int32_t>(fanin_indices.size()));
             ChipTaskSlotState &s = storage[i].slot;
             s.reset_for_reuse();
-            s.in_graph_local_id = static_cast<int32_t>(i);
+            s.sub_task_local_id = static_cast<int32_t>(i);
             s.active_mask = ActiveMask(SUBTASK_MASK_AIV0);
             s.graph_context = &execution;
             execution.reset_task_state(static_cast<int32_t>(i));
@@ -403,7 +403,7 @@ protected:
     }
 };
 
-// A wide in-graph row exceeds what a byte cursor can index. The scan must
+// A wide sub-task row exceeds what a byte cursor can index. The scan must
 // report the row unfinished until every producer has published: a truncated
 // cursor would wrap to a low index, find that one entry published, and stage a
 // candidate whose remaining producers have not.

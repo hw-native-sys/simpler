@@ -10,7 +10,7 @@
  */
 /**
  * A recorded task's id is what its entry in the recording's hazard map is keyed on,
- * and that map holds MAX_IN_GRAPH_TASKS task chains. An IN_GRAPH id's low field is the
+ * and that map holds SUB_TASK_MAX_NUM task chains. A SUB_TASK id's low field is the
  * task's index within its body, so the key is in range however far into a run the
  * Graph begins — which a GLOBAL id carrying the allocator's own local id would not
  * be.
@@ -81,7 +81,7 @@ protected:
     }
 };
 
-// A Graph recorded after MAX_IN_GRAPH_TASKS ordinary tasks. Its recorded task registers
+// A Graph recorded after SUB_TASK_MAX_NUM ordinary tasks. Its recorded task registers
 // its outputs in the recording hazard map keyed on its own id, so that id decides
 // whether the key lands inside the map's task chains.
 TEST_F(HbgGraphRecordingBoundsTest, RecordedTaskIsKeyedByItsIndexNotByTheRunsNumbering) {
@@ -92,12 +92,12 @@ TEST_F(HbgGraphRecordingBoundsTest, RecordedTaskIsKeyedByItsIndexNotByTheRunsNum
     orch.begin_scope();
     // Move the allocator's local-id counter past the recording map's task-chain
     // count, the way any run that submits a while before its first Graph does.
-    for (uint32_t i = 0; i < MAX_IN_GRAPH_TASKS; ++i) {
+    for (uint32_t i = 0; i < SUB_TASK_MAX_NUM; ++i) {
         CoreTaskArgs filler;
         filler.add_input(boundary);
         ASSERT_TRUE(orch.submit_dummy_task(filler).task_id().is_valid()) << "filler task " << i;
     }
-    ASSERT_EQ(orch.task_allocator.active_count(), MAX_IN_GRAPH_TASKS);
+    ASSERT_EQ(orch.task_allocator.active_count(), SUB_TASK_MAX_NUM);
 
     GraphTaskArgs boundary_args;
     boundary_args.add_input(boundary);
@@ -114,15 +114,16 @@ TEST_F(HbgGraphRecordingBoundsTest, RecordedTaskIsKeyedByItsIndexNotByTheRunsNum
     // recording's hazard map exists for exactly the write-in-place shape.
     CoreTaskArgs task_args;
     task_args.add_inout(param);
-    const TaskId in_graph_task_id = orch.submit_dummy_task(task_args).task_id();
-    ASSERT_TRUE(in_graph_task_id.is_valid());
-    EXPECT_EQ(in_graph_task_id.space(), TaskId::Space::IN_GRAPH)
+    const TaskId sub_task_id = orch.submit_dummy_task(task_args).task_id();
+    ASSERT_TRUE(sub_task_id.is_valid());
+    EXPECT_EQ(sub_task_id.space(), TaskId::Space::SUB_TASK)
         << "a recorded task must not take a GLOBAL id: nothing resolves it against the task table, and its low "
            "field is what keys the recording's hazard map";
-    EXPECT_EQ(in_graph_task_id.local_id(), 0)
-        << "the first recorded task's low field is task index 0, independent of how many tasks the run has "
-           "already allocated";
-    EXPECT_LT(in_graph_task_id.local_id(), MAX_IN_GRAPH_TASKS);
+    EXPECT_EQ(
+        sub_task_id.local_id(), 0
+    ) << "the first recorded task's low field is task index 0, independent of how many tasks the run has "
+         "already allocated";
+    EXPECT_LT(sub_task_id.local_id(), SUB_TASK_MAX_NUM);
 
     ASSERT_TRUE(orch.graph_end());
 }

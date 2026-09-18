@@ -17,6 +17,24 @@ from simpler_setup.tools import containment
 from simpler_setup.tools import swimlane_converter as sc
 from simpler_setup.tools.strace_timing import parse_spans, to_host_swimlane
 
+# Every capture names the runtime whose TaskId layout its ids follow — the collector
+# writes it unconditionally, and the decoder refuses a document without it. These
+# fixtures carry tmr ids (a ring index above the low word), so they say so.
+TMR = sc.TMR_RUNTIME
+HBG = sc.HBG_RUNTIME
+
+
+def _trace(*args, **kwargs):
+    """generate_chrome_trace_json with a runtime named, as every real caller has one.
+
+    The trace states the TaskId layout its labels follow, so the converter requires the
+    name rather than guessing. Tests that are not about that choice take tmr; pass
+    ``runtime_name=HBG`` to override, or call sc.generate_chrome_trace_json directly to
+    exercise a missing name.
+    """
+    kwargs.setdefault("runtime_name", TMR)
+    return sc.generate_chrome_trace_json(*args, **kwargs)
+
 
 def _containment_placement(document, *, runner_start_ns=1_000, runner_dur_ns=5_000, wall_ns=2_000, sched=(700, 100)):
     """Place a capture inside a synthetic Host window, the way the tools do.
@@ -122,7 +140,7 @@ def _core_tid(core_id):
 
 def _generate_trace(tasks, deps_edges, deps_block_map, tmp_path):
     out = tmp_path / "trace.json"
-    sc.generate_chrome_trace_json(
+    _trace(
         tasks,
         str(out),
         deps_edges=deps_edges,
@@ -162,6 +180,7 @@ def _write_l3_rank(root, rank, *, host_shift_ns, task_id, clock_domain="same-boo
     records = {
         "chip_swimlane_level": 4,
         "metadata": {
+            "runtime": TMR,
             "clock_freq_hz": 1_000_000_000,
             "num_cores": 1,
             "core_types": ["aiv"],
@@ -679,6 +698,7 @@ def test_host_orchestrator_phases_without_a_containing_window_stay_composite(tmp
             {
                 "chip_swimlane_level": 4,
                 "metadata": {
+                    "runtime": TMR,
                     "clock_freq_hz": 1_000_000,
                     "num_cores": 1,
                     "core_types": ["aiv"],
@@ -735,7 +755,7 @@ def test_host_orchestrator_phases_without_a_containing_window_stay_composite(tmp
     }
 
     trace_path = tmp_path / "merged_swimlane.json"
-    sc.generate_chrome_trace_json(
+    _trace(
         data["tasks"],
         str(trace_path),
         scheduler_phases=data["aicpu_scheduler_phases"],
@@ -766,6 +786,7 @@ def test_single_capture_uses_host_timeline_when_a_containing_window_is_given(tmp
     document = {
         "chip_swimlane_level": 4,
         "metadata": {
+            "runtime": TMR,
             "clock_freq_hz": 1_000_000_000,
             "num_cores": 1,
             "core_types": ["aiv"],
@@ -806,7 +827,7 @@ def test_aicore_scheduler_records_keep_common_shape_and_stream_metadata(tmp_path
         json.dumps(
             {
                 "chip_swimlane_level": 3,
-                "metadata": {"clock_freq_hz": 1_000_000_000, "num_cores": 1, "core_types": ["aiv"]},
+                "metadata": {"runtime": TMR, "clock_freq_hz": 1_000_000_000, "num_cores": 1, "core_types": ["aiv"]},
                 "aicore_tasks": [[0, 7, 7, 120, 180, 10]],
                 "scheduler_tasks": {
                     "schema_version": 1,
@@ -882,7 +903,7 @@ def test_aicore_scheduler_records_keep_common_shape_and_stream_metadata(tmp_path
     assert data["aicpu_lifecycle_records"][0]["register_release_start_time_us"] == pytest.approx(0.007)
 
     trace_path = tmp_path / "merged_swimlane.json"
-    sc.generate_chrome_trace_json(
+    _trace(
         data["tasks"],
         str(trace_path),
         scheduler_phases=data["scheduler_records"],
@@ -911,7 +932,7 @@ def test_level_two_rejects_missing_scheduler_task_timing(tmp_path):
         json.dumps(
             {
                 "chip_swimlane_level": 2,
-                "metadata": {"clock_freq_hz": 1_000_000_000, "num_cores": 1, "core_types": ["aiv"]},
+                "metadata": {"runtime": TMR, "clock_freq_hz": 1_000_000_000, "num_cores": 1, "core_types": ["aiv"]},
                 "aicore_tasks": [[0, 7, 7, 120, 180, 10]],
             }
         )
@@ -928,7 +949,7 @@ def test_level_two_accepts_task_timing_from_either_scheduler_producer(tmp_path, 
         json.dumps(
             {
                 "chip_swimlane_level": 2,
-                "metadata": {"clock_freq_hz": 1_000_000_000, "num_cores": 1, "core_types": ["aiv"]},
+                "metadata": {"runtime": TMR, "clock_freq_hz": 1_000_000_000, "num_cores": 1, "core_types": ["aiv"]},
                 "aicore_tasks": [[0, 7, 7, 120, 180, 10]],
                 "scheduler_tasks": {
                     "schema_version": 1,
@@ -953,7 +974,7 @@ def test_level_two_accepts_cross_producer_clock_skew(tmp_path, dispatch_cycles, 
         json.dumps(
             {
                 "chip_swimlane_level": 2,
-                "metadata": {"clock_freq_hz": 1_000_000_000, "num_cores": 1, "core_types": ["aiv"]},
+                "metadata": {"runtime": TMR, "clock_freq_hz": 1_000_000_000, "num_cores": 1, "core_types": ["aiv"]},
                 "aicore_tasks": [[0, 7, 7, 120, 180, 10]],
                 "scheduler_tasks": {
                     "schema_version": 1,
@@ -985,7 +1006,7 @@ def test_level_two_rejects_invalid_same_producer_timing(tmp_path, aicore_timing,
         json.dumps(
             {
                 "chip_swimlane_level": 2,
-                "metadata": {"clock_freq_hz": 1_000_000_000, "num_cores": 1, "core_types": ["aiv"]},
+                "metadata": {"runtime": TMR, "clock_freq_hz": 1_000_000_000, "num_cores": 1, "core_types": ["aiv"]},
                 "aicore_tasks": [[0, 7, 7, start_cycles, end_cycles, receive_to_start_cycles]],
                 "scheduler_tasks": {
                     "schema_version": 1,
@@ -1006,7 +1027,7 @@ def test_level_one_accepts_aicore_only_timing(tmp_path):
         json.dumps(
             {
                 "chip_swimlane_level": 1,
-                "metadata": {"clock_freq_hz": 1_000_000_000, "num_cores": 1, "core_types": ["aiv"]},
+                "metadata": {"runtime": TMR, "clock_freq_hz": 1_000_000_000, "num_cores": 1, "core_types": ["aiv"]},
                 "aicore_tasks": [[0, 7, 7, 120, 180, 10]],
             }
         )
@@ -1022,7 +1043,7 @@ def test_level_one_accepts_aicore_only_timing(tmp_path):
 
 def test_level_one_skips_overhead_counters_without_scheduler_timing(tmp_path):
     trace_path = tmp_path / "merged_swimlane.json"
-    sc.generate_chrome_trace_json(
+    _trace(
         [
             {
                 "task_id": 7,
@@ -1059,7 +1080,7 @@ def test_scheduler_tasks_reject_schema_drift(tmp_path, scheduler_tasks, error):
         json.dumps(
             {
                 "chip_swimlane_level": 2,
-                "metadata": {"clock_freq_hz": 1_000_000_000},
+                "metadata": {"runtime": TMR, "clock_freq_hz": 1_000_000_000},
                 "aicore_tasks": [],
                 "scheduler_tasks": scheduler_tasks,
             }
@@ -1076,7 +1097,7 @@ def test_scheduler_tasks_reject_ambiguous_legacy_stream(tmp_path):
         json.dumps(
             {
                 "chip_swimlane_level": 2,
-                "metadata": {"clock_freq_hz": 1_000_000_000},
+                "metadata": {"runtime": TMR, "clock_freq_hz": 1_000_000_000},
                 "aicore_tasks": [],
                 "scheduler_tasks": {"schema_version": 1, "producer": "aicore", "records": []},
                 "aicpu_tasks": [],
@@ -1094,7 +1115,7 @@ def test_scheduler_records_reject_schema_drift(tmp_path):
         json.dumps(
             {
                 "chip_swimlane_level": 3,
-                "metadata": {"clock_freq_hz": 1_000_000_000},
+                "metadata": {"runtime": TMR, "clock_freq_hz": 1_000_000_000},
                 "scheduler_records": {
                     "schema_version": 1,
                     "streams": [{"records": [{"kind": "idle"}], "metrics": []}],
@@ -1113,7 +1134,7 @@ def test_scheduler_metrics_cannot_overwrite_fixed_record_fields(tmp_path):
         json.dumps(
             {
                 "chip_swimlane_level": 3,
-                "metadata": {"clock_freq_hz": 1_000_000_000},
+                "metadata": {"runtime": TMR, "clock_freq_hz": 1_000_000_000},
                 "scheduler_records": {
                     "schema_version": 1,
                     "streams": [
@@ -1142,7 +1163,7 @@ def test_scheduler_metrics_cannot_overwrite_fixed_record_fields(tmp_path):
 
 def test_lifecycle_interval_can_start_at_relative_time_origin(tmp_path):
     trace_path = tmp_path / "merged_swimlane.json"
-    sc.generate_chrome_trace_json(
+    _trace(
         [],
         str(trace_path),
         aicpu_lifecycle_records=[
@@ -1166,7 +1187,7 @@ def test_lifecycle_register_release_can_be_at_relative_time_origin(tmp_path):
         json.dumps(
             {
                 "chip_swimlane_level": 1,
-                "metadata": {"clock_freq_hz": 1_000_000_000, "num_cores": 1, "core_types": ["aiv"]},
+                "metadata": {"runtime": TMR, "clock_freq_hz": 1_000_000_000, "num_cores": 1, "core_types": ["aiv"]},
                 "aicore_tasks": [[0, 7, 7, 120, 180, 10]],
                 "aicpu_lifecycle_records": [
                     {
@@ -1183,7 +1204,7 @@ def test_lifecycle_register_release_can_be_at_relative_time_origin(tmp_path):
     assert data["aicpu_lifecycle_records"][0]["register_release_start_time_us"] == 0.0
 
     trace_path = tmp_path / "merged_swimlane.json"
-    sc.generate_chrome_trace_json(
+    _trace(
         data["tasks"],
         str(trace_path),
         aicpu_lifecycle_records=data["aicpu_lifecycle_records"],
@@ -1196,7 +1217,7 @@ def test_lifecycle_register_release_can_be_at_relative_time_origin(tmp_path):
 
 def test_lifecycle_omits_missing_register_release(tmp_path):
     trace_path = tmp_path / "merged_swimlane.json"
-    sc.generate_chrome_trace_json(
+    _trace(
         [],
         str(trace_path),
         aicpu_lifecycle_records=[{"aicpu_thread_id": 0}],
@@ -1220,6 +1241,7 @@ def test_host_capture_is_complete_when_the_pool_holds_more_than_the_submit_proje
             {
                 "chip_swimlane_level": 4,
                 "metadata": {
+                    "runtime": TMR,
                     "clock_freq_hz": 1_000_000,
                     "num_cores": 1,
                     "core_types": ["aiv"],
@@ -1267,6 +1289,7 @@ def test_host_and_device_timestamps_share_one_axis_through_containment(tmp_path)
     document = {
         "chip_swimlane_level": 4,
         "metadata": {
+            "runtime": TMR,
             "clock_freq_hz": 1_000_000_000,
             "num_cores": 1,
             "core_types": ["aiv"],
@@ -1327,6 +1350,7 @@ def test_dropped_host_capture_is_visible_and_disables_cross_domain_flows(tmp_pat
                 {
                     "chip_swimlane_level": 4,
                     "metadata": {
+                        "runtime": TMR,
                         "clock_freq_hz": 1_000_000_000,
                         "num_cores": 1,
                         "core_types": ["aiv"],
@@ -1365,7 +1389,7 @@ def test_dropped_host_capture_is_visible_and_disables_cross_domain_flows(tmp_pat
             ]
 
         trace_path = tmp_path / f"{case_name}_trace.json"
-        sc.generate_chrome_trace_json(
+        _trace(
             data["tasks"],
             str(trace_path),
             scheduler_phases=data["aicpu_scheduler_phases"],
@@ -1384,9 +1408,11 @@ def test_graph_prepare_phases_create_graph_execution_envelopes(tmp_path):
     out = tmp_path / "trace.json"
     outer_a = 3
     outer_b = 7
-    task_a0 = (1 << 32) | (outer_a << 10)
-    task_a1 = (1 << 32) | ((outer_a << 10) | 1)
-    task_b0 = (1 << 32) | (outer_b << 10)
+    # A materialized sub-task id: space 1 (SUB_TASK) in bits 63:62, its parent modular
+    # task in bits 51:32, its own index in the low 32. See host_build_graph/task_id.h.
+    task_a0 = (1 << 62) | (outer_a << 32)
+    task_a1 = (1 << 62) | (outer_a << 32) | 1
+    task_b0 = (1 << 62) | (outer_b << 32)
     scheduler_phases = [
         [
             {
@@ -1418,7 +1444,7 @@ def test_graph_prepare_phases_create_graph_execution_envelopes(tmp_path):
         _task_row(task_b0, 0, dispatch=5.3, start=5.5, end=6.0, receive=5.4),
     ]
 
-    sc.generate_chrome_trace_json(tasks, str(out), scheduler_phases=scheduler_phases, core_to_thread=[0, 0])
+    _trace(tasks, str(out), scheduler_phases=scheduler_phases, core_to_thread=[0, 0])
 
     with open(out) as f:
         events = json.load(f)["traceEvents"]
@@ -1428,7 +1454,7 @@ def test_graph_prepare_phases_create_graph_execution_envelopes(tmp_path):
     )
     graph_events = [event for event in events if event.get("cat") == "graph_execution"]
     assert [event["args"]["outer_task_id"] for event in graph_events] == [outer_a, outer_b]
-    assert graph_events[0]["args"]["visible_in_graph_task_count"] == 2
+    assert graph_events[0]["args"]["visible_sub_task_count"] == 2
     assert graph_events[0]["args"]["prepare_slice_count"] == 2
     assert graph_events[0]["ts"] == 1.0
     assert graph_events[0]["dur"] == 4.0
@@ -1672,7 +1698,7 @@ def test_complete_flow_uses_independent_view_anchors(tmp_path):
     core_to_thread = [0] * 34
 
     out = tmp_path / "trace.json"
-    sc.generate_chrome_trace_json(
+    _trace(
         tasks,
         str(out),
         deps_edges=deps_edges,
@@ -1719,7 +1745,7 @@ def test_complete_phase_preserves_runtime_fin_count(tmp_path):
     ]
 
     out = tmp_path / "trace.json"
-    sc.generate_chrome_trace_json(
+    _trace(
         tasks,
         str(out),
         scheduler_phases=scheduler_phases,
@@ -1765,7 +1791,7 @@ def test_hbg_resolution_thread_uses_one_lane_and_exports_queue_depths(tmp_path):
         ],
     ]
 
-    sc.generate_chrome_trace_json([], str(out), scheduler_phases=scheduler_phases, core_to_thread=[0])
+    _trace([], str(out), scheduler_phases=scheduler_phases, core_to_thread=[0])
 
     events = json.loads(out.read_text())["traceEvents"]
     p_phases = [event for event in events if event.get("cat") == "scheduler" and event.get("tid") // 10 == 3001]
@@ -1791,7 +1817,7 @@ def test_tmr_nested_resolve_stays_on_scheduler_sublane(tmp_path):
         ]
     ]
 
-    sc.generate_chrome_trace_json([], str(out), scheduler_phases=scheduler_phases, core_to_thread=[0])
+    _trace([], str(out), scheduler_phases=scheduler_phases, core_to_thread=[0])
 
     events = json.loads(out.read_text())["traceEvents"]
     complete = next(event for event in events if event.get("name") == "complete(0)")
@@ -1858,9 +1884,7 @@ def test_aicore_scheduler_uses_one_lane_and_display_names(tmp_path):
         }
     ]
 
-    sc.generate_chrome_trace_json(
-        [], str(out), scheduler_phases=scheduler_phases, scheduler_streams=scheduler_streams, core_to_thread=[0]
-    )
+    _trace([], str(out), scheduler_phases=scheduler_phases, scheduler_streams=scheduler_streams, core_to_thread=[0])
 
     events = json.loads(out.read_text())["traceEvents"]
     scheduler_metadata = [
@@ -1908,7 +1932,7 @@ def test_aicpu_worker_lanes_and_full_dummy_ids_follow_runtime_threads(tmp_path):
     ]
     orchestrator_phases = [[{"phase": "orch_submit", "task_id": alloc_r3t1, "start_time_us": 3.0, "end_time_us": 4.0}]]
 
-    sc.generate_chrome_trace_json(
+    _trace(
         [],
         str(out),
         scheduler_phases=scheduler_phases,
@@ -1945,7 +1969,7 @@ def test_deps_dummy_without_runtime_record_is_not_rendered_as_alloc(tmp_path, ca
     out = tmp_path / "trace.json"
     dummy_task_id = (1 << 32) | 1
 
-    sc.generate_chrome_trace_json(
+    _trace(
         [],
         str(out),
         scheduler_phases=[[]],
@@ -1972,7 +1996,7 @@ def test_predicated_skip_uses_aicpu_worker_lane_and_dependency_anchor(tmp_path):
         [{"phase": "orch_submit", "task_id": skipped_task_id, "start_time_us": 1.0, "end_time_us": 1.5}]
     ]
 
-    sc.generate_chrome_trace_json(
+    _trace(
         [_task_row(consumer_task_id, 0, dispatch=3.0, start=4.0, end=5.0, receive=3.5)],
         str(out),
         func_id_to_name={"21": "exp_gate_mm"},
@@ -2007,7 +2031,7 @@ def test_predicated_skip_without_deps_is_not_rendered_as_alloc(tmp_path):
     out = tmp_path / "trace.json"
     skipped_task_id = (1 << 32) | 2
 
-    sc.generate_chrome_trace_json(
+    _trace(
         [],
         str(out),
         scheduler_phases=[
@@ -2287,3 +2311,210 @@ def test_l3_directory_merge_draws_the_scheduler_loops_that_carry_no_invocation(t
     assert "node.graph_build" in {
         event["name"] for event in trace["traceEvents"] if event.get("ph") == "X" and event["pid"] == 1
     }
+
+
+# A task_id carries whichever TaskId layout its runtime uses and nothing in the value
+# says which, so every decode in these tools is chosen from the runtime the document
+# names. The tests below pin both halves of that: the per-runtime decoders, and the
+# one place the choice is made.
+#
+# The three minters below are the only place these tests spell the bit positions, so a
+# layout change lands in one spot rather than in every expectation.
+
+
+def _hbg_global(local_id):
+    """A host_build_graph GLOBAL id: space 0 in bits 63:62, local id in the low 32."""
+    return local_id
+
+
+def _hbg_sub_task(parent_id, local_id):
+    """A SUB_TASK id: space 1 in bits 63:62, parent in bits 51:32, index in the low 32."""
+    return (1 << 62) | (parent_id << 32) | local_id
+
+
+def _hbg_param(param_index):
+    """A PARAM id: space 2 in bits 63:62, parameter index in the low 32, parent zero."""
+    return (2 << 62) | param_index
+
+
+def _tmr(ring, local_id):
+    """A tensormap_and_ringbuffer id: ring index in bits 39:32, local id in the low 32."""
+    return (ring << 32) | local_id
+
+
+def test_hbg_task_display_names_the_space_it_decodes():
+    """Each host_build_graph id space gets its own label shape.
+
+    A SUB_TASK label has to carry the parent too: the low field is only an index
+    within one body, so two modular tasks replaying one Definition hold the same low
+    field for their respective first sub-task.
+    """
+    assert sc._hbg_task_display(_hbg_global(12)) == "t12"
+    assert sc._hbg_task_display(_hbg_sub_task(3, 0)) == "g3t0"
+    assert sc._hbg_task_display(_hbg_sub_task(7, 5)) == "g7t5"
+    assert sc._hbg_task_display(_hbg_param(2)) == "p2"
+    # Two bodies' first sub-tasks differ only in the parent, which is exactly what the
+    # label has to show.
+    assert sc._hbg_task_display(_hbg_sub_task(3, 0)) != sc._hbg_task_display(_hbg_sub_task(4, 0))
+    assert sc._hbg_task_display("not-a-number") == "not-a-number"
+
+
+def test_tmr_task_display_keeps_the_ring_form():
+    """The tmr layout is unchanged: ring in bits 39:32, and ring 0 stays bare."""
+    assert sc._tmr_task_display(_tmr(0, 0)) == "t0"
+    assert sc._tmr_task_display(_tmr(0, 100)) == "t100"
+    assert sc._tmr_task_display(_tmr(2, 100)) == "r2t100"
+    assert sc._tmr_task_display("not-a-number") == "not-a-number"
+
+
+def test_the_two_layouts_disagree_on_the_same_word():
+    """The same raw value decodes differently per runtime, which is why the choice matters.
+
+    A tmr id on ring 1 has bit 32 set; read as hbg that is a GLOBAL task whose parent
+    field happens to be 1. Neither decoder can detect the other's value.
+    """
+    raw = _tmr(1, 9)
+    assert sc._tmr_task_display(raw) == "r1t9"
+    assert sc._hbg_task_display(raw) == "t9"
+
+
+@pytest.mark.parametrize(
+    ("runtime_name", "expected_display", "expected_fields"),
+    [
+        ("host_build_graph", sc._hbg_task_display, sc._hbg_task_id_fields),
+        ("tensormap_and_ringbuffer", sc._tmr_task_display, sc._tmr_task_id_fields),
+    ],
+)
+def test_the_decoder_is_chosen_from_the_documents_runtime(runtime_name, expected_display, expected_fields):
+    assert sc.task_display_for(runtime_name) is expected_display
+    assert sc._task_id_fields_for(runtime_name) is expected_fields
+
+
+@pytest.mark.parametrize(
+    "runtime_name",
+    [
+        None,  # a capture from before the name existed
+        "",
+        "   ",
+        "host_build_grpah",  # a typo, one letter from the real thing
+        "future_runtime",
+    ],
+)
+def test_a_runtime_this_tool_cannot_decode_is_refused(runtime_name):
+    """Guessing a layout yields labels that read as valid and are wrong.
+
+    An hbg sub-task decoded as tmr becomes a plausible `r3t5` with a billion-scale
+    ring, so every entry point refuses the name rather than picking a default.
+    """
+    for call in (sc.resolve_runtime, sc.task_display_for, sc._task_id_fields_for):
+        with pytest.raises(ValueError, match="runtime"):
+            call(runtime_name)
+
+
+def test_task_id_fields_split_off_what_each_layout_actually_holds():
+    """A task row exposes the fields above the low 32 bits, under per-layout names.
+
+    `ring_id` is tmr's alone after this split: an hbg row carries `id_space`, plus
+    `parent_task_id` only where there is a parent to name.
+    """
+    assert sc._tmr_task_id_fields(_tmr(2, 100)) == {"ring_id": 2}
+    assert sc._hbg_task_id_fields(_hbg_global(12)) == {"id_space": 0}
+    assert sc._hbg_task_id_fields(_hbg_sub_task(3, 0)) == {"id_space": 1, "parent_task_id": 3}
+    assert sc._hbg_task_id_fields(_hbg_param(2)) == {"id_space": 2}
+
+
+def test_decode_sub_task_id_cannot_match_a_tmr_id_whatever_its_ring():
+    """The space test reads bits 63:62, which a tmr ring never reaches.
+
+    This is what lets the Graph-body join run before anything has named the runtime: a
+    tmr document simply has no id that answers.
+    """
+    for ring in range(256):
+        assert sc._decode_sub_task_id(_tmr(ring, 4)) is None
+    assert sc._decode_sub_task_id(_hbg_sub_task(3, 5)) == (3, 5)
+    assert sc._decode_sub_task_id(_hbg_global(3)) is None
+    assert sc._decode_sub_task_id(_hbg_param(3)) is None
+    assert sc._decode_sub_task_id("not-a-number") is None
+
+
+def _one_task_document(runtime_name, task_id):
+    """A level-1 capture holding exactly one AICore task, optionally naming its runtime."""
+    metadata = {"clock_freq_hz": 1_000_000_000, "num_cores": 1, "core_types": ["aiv"]}
+    if runtime_name is not None:
+        metadata["runtime"] = runtime_name
+    return {
+        "chip_swimlane_level": 1,
+        "metadata": metadata,
+        "aicore_tasks": [[0, task_id, 7, 120, 180, 10]],
+    }
+
+
+def test_an_hbg_document_carries_id_space_and_parent_not_ring_id(tmp_path):
+    raw = tmp_path / "chip_swimlane_records.json"
+    sub_task = _hbg_sub_task(3, 0)
+    raw.write_text(json.dumps(_one_task_document("host_build_graph", sub_task)))
+
+    data = sc.read_perf_data(raw)
+
+    (task,) = data["tasks"]
+    assert task["task_id"] == sub_task
+    assert task["id_space"] == 1
+    assert task["parent_task_id"] == 3
+    assert "ring_id" not in task
+    # Carried through so every downstream stage picks the layout this decode did.
+    assert data["runtime"] == "host_build_graph"
+
+
+def test_a_document_without_a_runtime_is_refused(tmp_path):
+    """A capture from before the name existed cannot be decoded, and says so.
+
+    The collector writes metadata.runtime unconditionally and fails to compile without
+    SIMPLER_RUNTIME_NAME, so a document lacking it predates that writer rather than
+    being a shape to accommodate.
+    """
+    raw = tmp_path / "chip_swimlane_records.json"
+    raw.write_text(json.dumps(_one_task_document(None, _tmr(2, 100))))
+
+    with pytest.raises(ValueError, match="metadata.runtime is missing"):
+        sc.read_perf_data(raw)
+
+
+def test_a_tmr_document_decodes_by_its_own_name(tmp_path):
+    raw = tmp_path / "chip_swimlane_records.json"
+    raw.write_text(json.dumps(_one_task_document(TMR, _tmr(2, 100))))
+
+    data = sc.read_perf_data(raw)
+
+    (task,) = data["tasks"]
+    assert task["ring_id"] == 2
+    assert "id_space" not in task
+    assert data["runtime"] == TMR
+
+
+def test_the_trace_names_the_runtime_its_labels_follow(tmp_path):
+    """critical_path re-formats ids from the merged trace alone, so the trace must say.
+
+    Without the name in `metadata`, that tool would have nothing to pick a decoder
+    from and would silently label hbg ids with the tmr layout.
+    """
+    out = tmp_path / "trace.json"
+    sub_task = _hbg_sub_task(3, 0)
+
+    _trace([_task_row(sub_task, 0)], str(out), runtime_name="host_build_graph", core_to_thread=[0])
+
+    trace = json.loads(out.read_text())
+    assert trace["metadata"]["runtime"] == "host_build_graph"
+    worker_bars = [
+        event
+        for event in trace["traceEvents"]
+        if event.get("ph") == "X" and event.get("pid") == 4 and "g3t0" in event.get("name", "")
+    ]
+    assert worker_bars, "a sub-task's Worker View bar is labelled with its parent and index"
+
+
+def test_a_trace_must_name_the_runtime_its_labels_follow(tmp_path):
+    """The trace is what critical_path reads, so it cannot leave the layout unstated."""
+    out = tmp_path / "trace.json"
+
+    with pytest.raises(ValueError, match="metadata.runtime is missing"):
+        sc.generate_chrome_trace_json([_task_row(_tmr(2, 100), 0)], str(out), core_to_thread=[0])

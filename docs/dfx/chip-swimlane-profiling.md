@@ -262,6 +262,9 @@ layers to be aware of:**
 
   // Everything the python reader needs that isn't a per-record stream.
   "metadata": {
+    "runtime": "<host_build_graph|tensormap_and_ringbuffer>",
+                                       // which TaskId layout every task_id in
+                                       // this document carries; see below.
     "clock_freq_hz": <int>,            // cycle→µs factor. a2a3=50e6, a5=1e9.
     "num_cores": <int>,                // == len(core_types)
     "core_types": ["aic"|"aiv", ...],  // indexed by core_id
@@ -305,7 +308,6 @@ layers to be aware of:**
     "schema_version": 1,
     "streams": [{
       "platform": "<a2a3|a5>",
-      "runtime": "<host_build_graph|tensormap_and_ringbuffer>",
       "producer": "<aicpu|aicore>",
       "scheduler_id": <int>,
       "worker_id": <int>,
@@ -341,12 +343,26 @@ microseconds, downstream code sees:
 
 | Field | Meaning |
 | ----- | ------- |
-| `task_id` | Runtime task id (`TaskId::raw`); its high 32 bits are also exposed split off as `ring_id`, which is a ring index under `tensormap_and_ringbuffer` and an id space under `host_build_graph` |
+| `task_id` | Runtime task id (`TaskId::raw`). The fields above its low 32 bits are also exposed split off, under names that differ by runtime because the layouts do — see the table below |
 | `func_id` | Kernel function id. Always `-1` on disk; resolved post-process from `deps.json::tasks[].kernel_ids[3]` (see `swimlane_converter.resolve_func_id_from_kernel_map`) |
 | `core_id` / `core_type` | Physical core index and `"aic"` / `"aiv"` string |
 | `start_time_us` / `end_time_us` / `duration_us` | AICore execution window in microseconds |
 | `dispatch_time_us` | Scheduler timestamp when dispatch publication completed (filled at level >= 2) |
 | `finish_time_us` | Scheduler timestamp when completion processing began (filled at level >= 2) |
+
+`metadata.runtime` decides which split-off fields a task row carries, because a
+task id carries whichever `TaskId` layout its runtime uses and nothing in the
+value says which. It is stated once, at document level: a stream carries no
+runtime of its own, since one run compiles against one runtime and streams exist
+only at level >= 3. A document without the key, or naming a runtime the tools do
+not decode, is **refused** rather than decoded by guess — guessing yields labels
+that read as valid and are wrong (an hbg sub-task read as tmr becomes a plausible
+`r3t5` with a billion-scale ring). Re-capture with a current build.
+
+| `metadata.runtime` | layout | split-off fields |
+| ------------------ | ------ | ---------------- |
+| `host_build_graph` | id space in bits 63:62 (`0 = GLOBAL`, `1 = SUB_TASK`, `2 = PARAM`), a sub-task's parent modular task in bits 51:32, local id in the low 32 | `id_space`, plus `parent_task_id` for a sub-task |
+| `tensormap_and_ringbuffer` | ring index in bits 39:32, local id in the low 32 | `ring_id` |
 
 Note: per-task records carry **no** fanout edges. Dependency arrows
 come from a separate `deps.json` (dep_gen) joined at convert time —
@@ -367,9 +383,12 @@ Phase records (per Scheduler stream, level >= 3 in raw
 | `pop_hit` / `pop_miss` (dispatch only) | Ready-queue pop deltas since the previous dispatch emit |
 
 The raw scheduler record has a phase-tagged union: `dispatch` stores
-`pop_hit` / `pop_miss`, while `dummy_task` and `predicated_skip` store the
-32-bit `local_id` and `ring_id` components of their full task id. The Host
-collector reconstructs the `task_id` JSON field.
+`pop_hit` / `pop_miss`, while `dummy_task`, `predicated_skip` and
+`graph_prepare` store a whole `TaskId` — the first two naming the task retired,
+`graph_prepare` the outer GRAPH task whose body it materialized. The union sits
+ahead of the record's 32-bit fields so its 8-byte alignment does not pad the
+record past its 64-byte line. The Host collector writes that handle's `raw`
+straight into the `task_id` JSON field.
 
 Scheduler phase taxonomy — three role classes share one `phase`
 field but render differently in Perfetto:

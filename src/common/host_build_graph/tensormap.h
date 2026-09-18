@@ -51,7 +51,6 @@
 
 #include "assert_compat.h"
 #include "host_build_graph/task_id.h"
-#include "host_build_graph/tensor_create_info.h"
 #include "profiling_config.h"
 #include "tensor.h"
 
@@ -184,23 +183,6 @@ struct alignas(64) ChipTensorMapEntry {
             for (uint32_t i = 0; i < tensor.ndims; i++) {
                 strides[i] = tensor.strides[i];
             }
-        }
-    }
-
-    void copy_tensor_create_info(const TensorCreateInfo &tensor_create_info, uint64_t addr) {
-        memcpy(this, &tensor_create_info, 64);
-        buffer_addr = addr;
-        // Create-info outputs are always contiguous with start_offset = 0;
-        // extent_elem = prod(shapes); stride is row-major.
-        uint64_t numel = 1;
-        for (uint32_t i = 0; i < tensor_create_info.ndims; i++) {
-            numel *= tensor_create_info.shapes[i];
-        }
-        extent_elem_cache = numel;
-        uint32_t s = 1;
-        for (int32_t i = static_cast<int32_t>(tensor_create_info.ndims) - 1; i >= 0; i--) {
-            strides[i] = s;
-            s *= tensor_create_info.shapes[i];
         }
     }
 
@@ -579,7 +561,7 @@ struct ChipTensorMap {
         const int32_t task_slot = producer_task_id.local_id();
         // A producer's low id field is a task chain index directly, so the id space a
         // caller inserts under has to be the one this map was dimensioned for: a
-        // whole-run map takes task capacity, a Graph recording's takes MAX_IN_GRAPH_TASKS.
+        // whole-run map takes task capacity, a Graph recording's takes SUB_TASK_MAX_NUM.
         debug_assert(task_slot >= 0 && task_slot < max_tasks);
 
         entry->producer_task_id = producer_task_id;

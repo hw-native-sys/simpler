@@ -117,46 +117,142 @@ def normalize_task_id_int(v):
     return t
 
 
-def format_task_display(task_id):
-    """Format a task_id for human-readable labels.
+def _tmr_task_display(task_id):
+    """Format a ``tensormap_and_ringbuffer`` task_id for human-readable labels.
 
-    The high 32 bits are a ring index under ``tensormap_and_ringbuffer`` (any ring in
-    ``0..CHIP_MAX_RING_DEPTH-1``) and an id space under ``host_build_graph``
-    (0 = GLOBAL, 1 = IN_GRAPH). The short form below therefore covers tmr ring 0 and
-    every hbg GLOBAL task; a tmr task on ring 2 is equally ordinary and gets the long
-    form.
+    That runtime puts a ring index in bits 39:32 and a local id in the low 32.
 
     Returns:
-        ``r{high}t{local}`` when the high field != 0 (e.g. r2t100), else ``t{local}``.
+        ``r{ring}t{local}`` off ring 0 (e.g. r2t100), else ``t{local}``.
 
     For invalid or non-numeric values, returns str(task_id).
     """
     tid = normalize_task_id_int(task_id)
     if tid is None:
         return str(task_id)
-    ring = (tid >> 32) & 0xFF
     local = tid & 0xFFFFFFFF
+    ring = (tid >> 32) & 0xFF
     if ring == 0:
         return f"t{local}"
     return f"r{ring}t{local}"
 
 
-def _decode_in_graph_task_id(task_id):
-    """Decode Scheduler-owned in-graph task ids.
+def _hbg_task_display(task_id):
+    """Format a ``host_build_graph`` task_id for human-readable labels.
 
-    ``host_build_graph`` puts a materialized in-graph task in id space 1 (IN_GRAPH) with
-    ``local=(graph_task_id << 10) | in_graph_local_id``; the stream-visible outer Graph task
-    stays in space 0 (GLOBAL). See src/common/host_build_graph/task_id.h.
+    That runtime puts an id space in bits 63:62 (0 = GLOBAL, 1 = SUB_TASK, 2 = PARAM),
+    a sub-task's parent modular task in bits 51:32, and a local id in the low 32.
+    See src/common/host_build_graph/task_id.h.
+
+    Returns:
+        ``g{parent}t{local}`` for a sub-task: its parent modular task and own index
+        ``p{index}`` for a boundary parameter
+        ``t{local}`` for a task of the run itself
+
+    For invalid or non-numeric values, returns str(task_id).
     """
     tid = normalize_task_id_int(task_id)
-    if tid is None or ((tid >> 32) & 0xFFFFFFFF) != 1:
-        return None
+    if tid is None:
+        return str(task_id)
     local = tid & 0xFFFFFFFF
-    return local >> 10, local & 0x3FF
+    space = (tid >> 62) & 0x3
+    if space == 1:
+        return f"g{(tid >> 32) & 0xFFFFF}t{local}"
+    if space == 2:
+        return f"p{local}"
+    return f"t{local}"
+
+
+HBG_RUNTIME = "host_build_graph"
+TMR_RUNTIME = "tensormap_and_ringbuffer"
+
+
+def resolve_runtime(runtime_name, *, source="metadata.runtime"):
+    """Validate the runtime a document names, refusing anything else.
+
+    A task_id carries whichever TaskId layout its runtime uses and nothing in the value
+    says which, so the layout is chosen from this name alone. Guessing when the name is
+    missing or unrecognised produces labels and id fields that read as valid and are
+    wrong -- an hbg sub-task decoded as tmr becomes a plausible `r3t5` with a
+    billion-scale ring -- so a name this tool does not know is an error rather than a
+    default.
+
+    Every document the repo writes names its runtime unconditionally: the swimlane
+    collector emits `metadata.runtime` (and fails to compile without
+    SIMPLER_RUNTIME_NAME), and both dep_gen writers emit a top-level `runtime`. A
+    missing name therefore means a capture from before those writers, which this tool
+    does not decode.
+
+    Public alongside task_display_for because critical_path and deps_viewer resolve
+    their own documents and must reach the same verdict this module does.
+
+    Raises:
+        ValueError: the name is absent, blank, or not a runtime this tool decodes.
+    """
+    if runtime_name in (HBG_RUNTIME, TMR_RUNTIME):
+        return runtime_name
+    if runtime_name is None or (isinstance(runtime_name, str) and not runtime_name.strip()):
+        raise ValueError(
+            f"{source} is missing; this capture predates the runtime name and its TaskId "
+            f"layout cannot be determined. Re-capture with a current build, which writes "
+            f"{HBG_RUNTIME!r} or {TMR_RUNTIME!r}."
+        )
+    raise ValueError(
+        f"{source} is {runtime_name!r}, which this tool does not decode; expected "
+        f"{HBG_RUNTIME!r} or {TMR_RUNTIME!r}. A task id has no self-describing layout, so "
+        f"an unrecognised runtime cannot be decoded by guessing."
+    )
+
+
+def task_display_for(runtime_name):
+    """Pick the task-id formatter for the runtime that minted the records.
+
+    See resolve_runtime for why an unknown name raises rather than defaulting.
+    """
+    return _hbg_task_display if resolve_runtime(runtime_name) == HBG_RUNTIME else _tmr_task_display
+
+
+def _task_id_fields_for(runtime_name):
+    """Pick the task-row id fields for the runtime that minted the records.
+
+    See resolve_runtime for why an unknown name raises rather than defaulting.
+    """
+    return _hbg_task_id_fields if resolve_runtime(runtime_name) == HBG_RUNTIME else _tmr_task_id_fields
+
+
+def _tmr_task_id_fields(task_id):
+    """The id-layout-dependent fields of a ``tensormap_and_ringbuffer`` task row."""
+    return {"ring_id": (task_id >> 32) & 0xFFFFFFFF}
+
+
+def _hbg_task_id_fields(task_id):
+    """The id-layout-dependent fields of a ``host_build_graph`` task row."""
+    space = (task_id >> 62) & 0x3
+    fields = {"id_space": space}
+    if space == 1:
+        fields["parent_task_id"] = (task_id >> 32) & 0xFFFFF
+    return fields
+
+
+def _decode_sub_task_id(task_id):
+    """Decode Scheduler-owned sub-task ids.
+
+    ``host_build_graph`` puts a materialized sub-task in id space 1 (SUB_TASK), held in
+    the top two bits, with its parent modular task in bits 51:32 and its own index in
+    the low 32; the stream-visible outer modular task stays in space 0 (GLOBAL). See
+    src/common/host_build_graph/task_id.h.
+
+    The space test reads the top two bits, so a ``tensormap_and_ringbuffer`` id -- whose
+    ring sits in bits 39:32 -- never matches, whatever its ring.
+    """
+    tid = normalize_task_id_int(task_id)
+    if tid is None or ((tid >> 62) & 0x3) != 1:
+        return None
+    return (tid >> 32) & 0xFFFFF, tid & 0xFFFFFFFF
 
 
 def _collect_graph_execution_instances(tasks, scheduler_phases):  # noqa: PLR0912
-    """Join in-graph task rows to their outer GraphPrepare records."""
+    """Join sub-task rows to their outer GraphPrepare records."""
     prepare_by_outer = defaultdict(list)
     dummy_rows = []
     for thread_idx, records in enumerate(scheduler_phases or []):
@@ -164,6 +260,11 @@ def _collect_graph_execution_instances(tasks, scheduler_phases):  # noqa: PLR091
             phase = record.get("phase")
             if phase == "graph_prepare":
                 outer_task_id = normalize_task_id_int(record.get("task_id"))
+                # A graph_prepare record names the outer modular task, which is always
+                # GLOBAL. Testing the whole high word rather than the space alone is
+                # the stricter check and the one wanted here: a GLOBAL id has a zero
+                # parent and zero reserved bits too, so anything else in those bits is
+                # a corrupt record rather than a task of another space.
                 if outer_task_id is not None and (outer_task_id >> 32) == 0:
                     prepare_by_outer[outer_task_id].append(record)
             elif phase == "dummy_task":
@@ -171,14 +272,14 @@ def _collect_graph_execution_instances(tasks, scheduler_phases):  # noqa: PLR091
 
     rows_by_outer = defaultdict(list)
     for task in tasks:
-        decoded = _decode_in_graph_task_id(task.get("task_id"))
+        decoded = _decode_sub_task_id(task.get("task_id"))
         if decoded is not None:
             outer_task_id, task_index = decoded
             rows_by_outer[outer_task_id].append((task, task_index))
 
     dummy_by_outer = defaultdict(list)
     for record, thread_idx in dummy_rows:
-        decoded = _decode_in_graph_task_id(record.get("task_id"))
+        decoded = _decode_sub_task_id(record.get("task_id"))
         if decoded is not None:
             outer_task_id, task_index = decoded
             dummy_by_outer[outer_task_id].append((record, task_index, thread_idx))
@@ -409,7 +510,6 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
                     key: stream.get(key)
                     for key in (
                         "platform",
-                        "runtime",
                         "producer",
                         "scheduler_id",
                         "worker_id",
@@ -424,7 +524,6 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
         scheduler_stream_metadata = [
             {
                 "platform": None,
-                "runtime": None,
                 "producer": "aicpu",
                 "scheduler_id": index,
                 "worker_id": index,
@@ -444,6 +543,12 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
     )
     if orch_phases_raw and host_mode:
         raise ValueError("both AICPU and host orchestrator phases are present; clock-domain source is ambiguous")
+
+    # Which TaskId layout the records in this document carry. Resolved once here, and
+    # strictly: nothing in a task_id value says which runtime minted it, so an absent or
+    # unrecognised name is refused rather than guessed at.
+    runtime_name = resolve_runtime(metadata.get("runtime"))
+    task_id_fields = _task_id_fields_for(runtime_name)
 
     actual_host_record_count = sum(len(records) for records in host_orch_phases_raw)
     if isinstance(raw_host_capture, dict):
@@ -664,7 +769,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
                     "func_id": -1,
                     "core_id": core_id,
                     "core_type": _core_type(core_id),
-                    "ring_id": (task_token_raw >> 32) & 0xFFFFFFFF,
+                    **task_id_fields(task_token_raw),
                     "start_time_us": start_us,
                     "end_time_us": end_us,
                     "duration_us": end_us - start_us,
@@ -691,7 +796,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
                     "func_id": -1,
                     "core_id": core_id,
                     "core_type": _core_type(core_id),
-                    "ring_id": (task_token_raw >> 32) & 0xFFFFFFFF,
+                    **task_id_fields(task_token_raw),
                     "start_time_us": start_us,
                     "end_time_us": end_us,
                     "duration_us": end_us - start_us,
@@ -798,6 +903,10 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
         "chip_swimlane_level": level,
         "tasks": tasks,
     }
+    # Carried through so every downstream stage picks the same TaskId layout this
+    # decode did, rather than re-deriving it from something that only correlates.
+    # Unconditional: resolve_runtime above already refused a document without it.
+    out["runtime"] = runtime_name
     if scheduler_task_producer is not None:
         out["scheduler_task_producer"] = scheduler_task_producer
     if aicpu_scheduler_phases:
@@ -1573,6 +1682,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     core_to_thread=None,
     orchestrator_name=None,
     orchestrator_source=None,
+    runtime_name=None,
     timeline_metadata=None,
     deps_edges=None,
     deps_kernel_map=None,
@@ -1622,6 +1732,11 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
 
     if verbose:
         print(f"  Unique cores: {len(unique_cores)}")
+
+    # The TaskId layout every label in this trace is formatted with. Chosen once, from
+    # the runtime the document names, because nothing in a task_id value says which
+    # runtime minted it.
+    task_display = task_display_for(runtime_name)
 
     # Recover func_id for TASK_TIMING (level=1) records, which the host
     # emits as func_id=-1. Resolve once here against dep_gen's per-task
@@ -1722,24 +1837,24 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 }
             )
         for instance in graph_instances:
-            outer_display = format_task_display(instance["outer_task_id"])
+            outer_display = task_display(instance["outer_task_id"])
             task_indices = instance["visible_task_indices"]
             events.append(
                 {
                     "args": {
                         "outer_task_id": instance["outer_task_id"],
-                        "visible_in_graph_task_count": len(task_indices),
-                        "visible_in_graph_local_id_min": min(task_indices),
-                        "visible_in_graph_local_id_max": max(task_indices),
+                        "visible_sub_task_count": len(task_indices),
+                        "visible_sub_task_local_id_min": min(task_indices),
+                        "visible_sub_task_local_id_max": max(task_indices),
                         "prepare_slice_count": instance["prepare_slice_count"],
                         "prepare_duration_us": instance["prepare_duration_us"],
                         "execution_start_us": instance["execution_start_us"],
                         "execution_duration_us": instance["execution_end_us"] - instance["execution_start_us"],
-                        "synthetic_id_layout": "ring1:(outer_task_id << 10) | in_graph_local_id",
+                        "synthetic_id_layout": "space1:(outer_task_id << 32) | sub_task_local_id",
                     },
                     "cat": "graph_execution",
                     "cname": "rail_animation",
-                    "name": f"GraphExecution({outer_display}, {len(task_indices)} visible in-graph tasks)",
+                    "name": f"GraphExecution({outer_display}, {len(task_indices)} visible sub-tasks)",
                     "ph": "X",
                     "pid": 5,
                     "tid": 5000 + instance["lane_idx"],
@@ -1838,7 +1953,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         # dep_gen's kernel_ids up front; see the pre-pass above). Without a
         # deps.json the id stays -1 and the lane is named task(rXtY).
         func_id = task["func_id"]
-        tdisp = format_task_display(task["task_id"])
+        tdisp = task_display(task["task_id"])
         task_name = _task_display_name(func_id, func_id_to_name, tdisp, spmd=task["task_id"] in spmd_task_ids)
 
         # fanout (consumers) / fanin (producers) hints from deps.json — the device
@@ -1846,8 +1961,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         # broadcast / reduction nodes are obvious without expanding the list.
         fanout_ids = deps_edges.get(task["task_id"], []) if deps_edges else []
         fanin_ids = fanin_map.get(task["task_id"], [])
-        fanout_str = f"{len(fanout_ids)}: [" + ", ".join(format_task_display(x) for x in fanout_ids) + "]"
-        fanin_str = f"{len(fanin_ids)}: [" + ", ".join(format_task_display(x) for x in fanin_ids) + "]"
+        fanout_str = f"{len(fanout_ids)}: [" + ", ".join(task_display(x) for x in fanout_ids) + "]"
+        fanin_str = f"{len(fanin_ids)}: [" + ", ".join(task_display(x) for x in fanin_ids) + "]"
 
         events.append(
             {
@@ -1955,7 +2070,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             # Get function name if available (task(rXtY) when no deps.json
             # resolved the func_id; see _task_display_name).
             func_id = task["func_id"]
-            tdisp = format_task_display(task["task_id"])
+            tdisp = task_display(task["task_id"])
             task_name = _task_display_name(func_id, func_id_to_name, tdisp, spmd=task["task_id"] in spmd_task_ids)
 
             events.append(
@@ -2150,7 +2265,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     end_us = record["end_time_us"]
                     dur = max(end_us - start_us, AICPU_WORKER_MARKER_MIN_DUR_US)
                     task_id = normalize_task_id_int(record.get("task_id"))
-                    task_label = format_task_display(task_id) if task_id is not None else "unknown"
+                    task_label = task_display(task_id) if task_id is not None else "unknown"
                     if phase == "dummy_task":
                         event_name = f"dummy({task_label})"
                     else:
@@ -2276,7 +2391,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 if not is_aicore_scheduler:
                     display_name = f"{display_phase}({tasks_processed})"
                 elif task_id is not None:
-                    display_name = f"{display_phase}({format_task_display(task_id)})"
+                    display_name = f"{display_phase}({task_display(task_id)})"
                 else:
                     display_name = display_phase
                 event_tid = (
@@ -2464,7 +2579,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
 
                 # Full TaskId in JSON (device uses task_id.raw, same as TensorMap) → rXtY / tY
                 if task_id >= 0:
-                    label = f"{display_name}({format_task_display(task_id)})"
+                    label = f"{display_name}({task_display(task_id)})"
                 else:
                     label = f"{display_name}({submit_idx})"
 
@@ -2490,7 +2605,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         is_regular = not is_dummy
                         if is_dummy and task_id not in dummy_task_ids and task_id not in missing_dummy_record_warnings:
                             print(
-                                f"Warning: dummy({format_task_display(task_id)}) has no dummy_task scheduler record; "
+                                f"Warning: dummy({task_display(task_id)}) has no dummy_task scheduler record; "
                                 "its Worker View bar cannot be rendered.",
                                 file=sys.stderr,
                             )
@@ -2505,12 +2620,12 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                                 "args": {
                                     "phase": "alloc",
                                     "task_id": task_id,
-                                    "event-hint": f"alloc({format_task_display(task_id)})",
+                                    "event-hint": f"alloc({task_display(task_id)})",
                                 },
                                 "cat": "event",
                                 "cname": "olive",
                                 "id": event_id,
-                                "name": f"alloc({format_task_display(task_id)})",
+                                "name": f"alloc({task_display(task_id)})",
                                 "ph": "X",
                                 "pid": 4,
                                 "tid": AICPU_TID_BASE + orch_worker_thread_idx,
@@ -2544,8 +2659,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             if succ_id not in task_map and succ_id not in aicpu_worker_anchor_map:
                 if verbose:
                     print(
-                        f"Warning: Task {format_task_display(pred_id)} (raw {pred_id}) "
-                        f"references non-existent successor {format_task_display(succ_id)} (raw {succ_id})"
+                        f"Warning: Task {task_display(pred_id)} (raw {pred_id}) "
+                        f"references non-existent successor {task_display(succ_id)} (raw {succ_id})"
                     )
                 continue
 
@@ -3121,9 +3236,14 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         if verbose:
             print(f"  Overhead Analysis: {sum(1 for e in oh if e.get('ph') == 'C')} counter points (8 tracks)")
 
-    trace = {"traceEvents": events}
-    if timeline_metadata:
-        trace["metadata"] = timeline_metadata
+    trace: dict[str, object] = {"traceEvents": events}
+    metadata = dict(timeline_metadata) if timeline_metadata else {}
+    # Downstream tools (critical_path) re-format task ids from this trace alone, so it
+    # has to name the runtime whose TaskId layout its labels and ids follow. Always set:
+    # task_display_for above already refused a caller that named none.
+    metadata["runtime"] = resolve_runtime(runtime_name)
+    if metadata:
+        trace["metadata"] = metadata
     if output_path is not None:
         with open(output_path, "w") as f:
             json.dump(trace, f, indent=2)
@@ -4073,6 +4193,10 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
     global_origin_ns = min([window_lo] + [span.ts for span in dispatcher_spans])
     all_events = _dispatcher_block_events(dispatcher_spans, global_origin_ns)
     rank_metadata = []
+    # Every Rank of one L3 run is the same runtime, so the merged trace names it for
+    # downstream tools. A set rather than a scalar so a mixed input is refused below
+    # instead of silently taking whichever Rank came last.
+    rank_runtimes = set()
     for rank, records_path in rank_inputs:
         placement = placements[rank]
         data = _decode_perf_data(raw_inputs[rank], timeline_origin_ns=global_origin_ns, placement=placement)
@@ -4088,6 +4212,7 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
             scheduler_streams=data.get("scheduler_streams"),
             orchestrator_phases=data.get("aicpu_orchestrator_phases"),
             orchestrator_source=data.get("orchestrator_source"),
+            runtime_name=data.get("runtime"),
             timeline_metadata=data.get("timeline_metadata"),
             core_to_thread=data.get("core_to_thread"),
             host_device_uploads=data.get("host_device_uploads"),
@@ -4113,6 +4238,7 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
         all_events.extend(_placement_bound_events(rank, placement, global_origin_ns))
 
         timeline = data["timeline_metadata"]
+        rank_runtimes.add(data.get("runtime"))
         rank_metadata.append(
             {
                 "rank": rank,
@@ -4126,8 +4252,19 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
             }
         )
 
+    # One merged trace carries one TaskId layout, so Ranks naming different runtimes
+    # have no single answer. Refused rather than left unnamed: an unnamed trace would
+    # push the same guess onto every downstream label instead of stopping here.
+    if len(rank_runtimes) > 1:
+        raise ValueError(
+            "Ranks of this run name different runtimes "
+            f"({', '.join(sorted(str(name) for name in rank_runtimes))}); one merged trace "
+            "carries one TaskId layout, so these captures cannot be spliced together."
+        )
+
     metadata = {
         "layout": "containment_spliced_multi_rank",
+        "runtime": resolve_runtime(next(iter(rank_runtimes)) if rank_runtimes else None),
         "dispatch": args.dispatch,
         "dispatch_id": args.dispatch_id,
         "host_clock_domain_id": next(iter(clock_domains)) if clock_domains else None,
@@ -4225,6 +4362,7 @@ def main():
             scheduler_streams=data.get("scheduler_streams"),
             orchestrator_phases=data.get("aicpu_orchestrator_phases"),
             orchestrator_source=data.get("orchestrator_source"),
+            runtime_name=data.get("runtime"),
             timeline_metadata=data.get("timeline_metadata"),
             core_to_thread=data.get("core_to_thread"),
             host_device_uploads=data.get("host_device_uploads"),
