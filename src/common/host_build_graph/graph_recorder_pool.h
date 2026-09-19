@@ -25,10 +25,10 @@
  * orchestration function), reached through the ops table. Three properties make that
  * sound and are relied on here:
  *
- *   - No job outlives the bind that queued it. rt_orchestration_done() ->
- *     rt_graph_commit() -> graph_record_wait() drains the pool at the end of every
- *     orchestration, so a job's code cannot still be queued when unregister_callable
- *     dlcloses the .so it lives in.
+ *   - No job outlives the bind that queued it. The host entry's scope guard
+ *     drains the pool on both normal return and exception unwinding, before its
+ *     build state is released. A job's code cannot still be queued when the
+ *     caller subsequently unregisters the callable and dlcloses its .so.
  *   - The runtime a job binds to is a plain global in its own .so
  *     (orchestration/common.cpp, deliberately not thread_local), so a worker shared
  *     across callables reads the right one: the job's own inlined code reads its own
@@ -85,9 +85,11 @@ public:
     }
 
     // `args` is the in-flight entry's own boundary and is only forwarded, never copied:
-    // the entry outlives every job that reads it, because graph_commit drains this pool
-    // before freeing one. Const because that boundary is shared -- the submitting thread
-    // compares later same-key submissions against it while a worker records.
+    // the entry outlives every job that reads it. graph_commit frees an entry only once
+    // every recording has left RECORDING, and the host orchestration entry's scope guard
+    // joins this pool before its build state is released. Const because that boundary is
+    // shared -- the submitting thread compares later same-key submissions against it
+    // while a worker records.
     template <typename Job>
     bool start(const GraphTaskArgs &args, Job &&job) {
         std::function<void(const GraphTaskArgs &)> next;

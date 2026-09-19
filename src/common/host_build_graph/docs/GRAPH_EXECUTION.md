@@ -423,11 +423,15 @@ correspondence: reservations are independent bumps, relocation is
 address-window-based rather than order-based, and `host_build_graph` retires
 nothing during a run.
 
-`rt_graph_commit` is therefore a barrier at exactly one point, orchestration
-completion. It waits for **every** recording in flight, then walks deferred
-shells in original submission order, reserves each shell's real heap block using
-its Definition's `required_heap`, patches the task descriptor and the shell's
-Definition address, and lets the image be uploaded. A scope transition is deliberately
+Commit is therefore a barrier at exactly one point, orchestration completion. It
+waits for **every** recording to leave `RECORDING`, then walks deferred shells in
+original submission order, reserves each shell's real heap block using its
+Definition's `required_heap`, patches the task descriptor and the shell's
+Definition address, and lets the image be prepared. That wait is on recording
+*state*, not on the recorder pool: a job returns from `graph_end` before its own
+captures are destroyed, so the host orchestration entry's scope guard joins the
+pool separately, on both normal return and exception unwinding, before the build
+state those jobs borrow goes out of scope. A scope transition is deliberately
 not a barrier either: the main thread has already submitted the outer Graph shell
 into that scope, while scopes executed by a recording thread are no-ops on the
 real scope stack.

@@ -735,9 +735,17 @@ int32_t run_host_orchestration(
     entry_points->bind(rt);
 
     const BindPhaseMark orch_phase = bind_phase_begin();
-    rt_scope_begin(rt);
-    entry_points->entry(orch_l2);
-    rt_scope_end(rt);
+    {
+        // Recorder jobs borrow this build's state and execute code from its SO.
+        // Drain before commit can retire their entries, and before unwinding can
+        // release graph_state, orchestrator, or the tensor-access views.
+        RAIIScopeGuard recorder_completion([rt]() {
+            rt->ops->graph_record_wait(rt);
+        });
+        rt_scope_begin(rt);
+        entry_points->entry(orch_l2);
+        rt_scope_end(rt);
+    }
     rt_orchestration_done(rt);
 #if SIMPLER_ORCH_PROFILING
     // Per-sub-step cumulatives across this bind's submits. The accumulators only

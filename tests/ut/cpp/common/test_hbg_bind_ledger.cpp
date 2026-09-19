@@ -25,15 +25,23 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <mutex>
+#include <stdexcept>
 #include <unordered_set>
 #include <vector>
 
 #include "arg_direction.h"
+#include "callable.h"
 #include "common/host_api.h"
+#include "host_build_graph/graph_host_state.h"
+#include "host/raii_scope_guard.h"
+#include "host_build_graph/runtime_status.h"
 #include "runtime.h"
 #include "runtime_core.h"
 #include "host_build_graph/orchestrator.h"
@@ -68,6 +76,109 @@ struct TestHostOrchEntryPoints {
 // graph with no tasks exercises bind end to end all the same.
 void empty_orch_entry(const ChipTaskArgs & /*args*/) {}
 void empty_orch_bind(RuntimeContext * /*rt*/) {}
+
+// The wait callback releases a real recorder job only while its borrowed build
+// state is still alive. The test's boundary outlives bind even on the negative
+// path, so a missing wait is an assertion failure rather than a use-after-free.
+struct RecordingLifetime {
+    RuntimeOps ops{};
+    GraphTaskArgs boundary;
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool release_job{false};
+    bool job_finished{false};
+    bool throw_from_entry{false};
+    int wait_calls{0};
+};
+
+RecordingLifetime *g_recording = nullptr;
+RuntimeContext *g_recording_runtime = nullptr;
+
+void recording_wait(RuntimeContext *rt) {
+    EXPECT_NE(rt->orchestrator, nullptr);
+    EXPECT_NE(rt->orchestrator->graph_host_state, nullptr);
+    EXPECT_NE(rt->tensor_access, nullptr);
+    ++g_recording->wait_calls;
+    {
+        std::lock_guard<std::mutex> lock(g_recording->mutex);
+        g_recording->release_job = true;
+    }
+    g_recording->cv.notify_all();
+    graph_record_wait_impl(rt);
+    EXPECT_TRUE(g_recording->job_finished);
+}
+
+void recording_bind(RuntimeContext *rt) {
+    g_recording_runtime = rt;
+    g_recording->ops = *rt->ops;
+    g_recording->ops.graph_record_wait = recording_wait;
+    rt->ops = &g_recording->ops;
+}
+
+void recording_entry(const ChipTaskArgs &) {
+    std::function<void(const GraphTaskArgs &)> job = [](const GraphTaskArgs &) {
+        std::unique_lock<std::mutex> lock(g_recording->mutex);
+        g_recording->cv.wait(lock, [] {
+            return g_recording->release_job;
+        });
+        g_recording->job_finished = true;
+    };
+    if (!graph_record_start_impl(g_recording_runtime, g_recording->boundary, &job)) {
+        throw std::runtime_error("could not start recorder");
+    }
+    if (g_recording->throw_from_entry) throw std::runtime_error("host orchestration failed");
+}
+
+enum class InputProducer { None, Allocated, Overlapping, Disjoint };
+
+struct HostAccessProbe {
+    RuntimeContext *runtime{nullptr};
+    InputProducer producer{InputProducer::None};
+    bool write{false};
+    std::vector<uint64_t> reads;
+    int32_t error{0};
+};
+
+HostAccessProbe *g_access = nullptr;
+
+void access_bind(RuntimeContext *rt) { g_access->runtime = rt; }
+
+void access_entry(const ChipTaskArgs &args) {
+    RuntimeContext *rt = g_access->runtime;
+    for (int i = 0; i < args.tensor_count(); ++i) {
+        simpler::hbg::Tensor tensor = args.tensor(i).ref();
+        if (g_access->producer != InputProducer::None) {
+            CoreTaskArgs task_args;
+            MixedKernels kernels{};
+            kernels.aiv0_kernel_id = 0;
+            if (g_access->producer == InputProducer::Allocated) {
+                const uint32_t shape[] = {1};
+                TensorCreateInfo output(shape, 1, DataType::UINT8);
+                task_args.add_output(output);
+                const TaskOutputTensors result = rt->orchestrator->submit_task(kernels, task_args);
+                ASSERT_EQ(result.size(), 1u);
+                tensor = result.get_ref(0);
+                ASSERT_TRUE(tensor.owner_task_id.is_valid());
+            } else {
+                const simpler::hbg::Tensor written = tensor.slice(0, 0, 1);
+                task_args.add_output(written);
+                const TaskOutputTensors result = rt->orchestrator->submit_task(kernels, task_args);
+                ASSERT_TRUE(result.task_id().is_valid());
+                // The input alias has no owner id; rejection must come from the
+                // TensorMap overlap rather than the runtime-allocation branch.
+                ASSERT_FALSE(tensor.owner_task_id.is_valid());
+                tensor = tensor.slice(0, g_access->producer == InputProducer::Disjoint ? 1 : 0, 2);
+            }
+        }
+        const uint32_t index[] = {0};
+        if (g_access->write) {
+            set_tensor_data(rt, tensor, 1, index, 0x5a);
+        } else {
+            g_access->reads.push_back(get_tensor_data(rt, tensor, 1, index));
+        }
+        g_access->error = rt->orchestrator->fatal_code.load(std::memory_order_acquire);
+    }
+}
 
 struct FakeHostApi {
     void *retained_addr = nullptr;
@@ -308,6 +419,37 @@ protected:
         }
     }
 
+    // a5 keeps scheduler allocations in a runtime-address keyed owner table.
+    // Release that ownership while the runtime and its fake bank still exist;
+    // freeing the fake allocations alone leaves a stale owner for a later test.
+    auto cleanup_runtime(Runtime &rt) {
+        return RAIIScopeGuard([this, &rt, bank = g_fake]() {
+            FakeHostApi *saved = g_fake;
+            g_fake = bank;
+            EXPECT_EQ(release_run_bindings_impl(&rt, &api_), 0);
+            g_fake = saved;
+        });
+    }
+
+    // `recording` is a stack object the pool's worker reads through a global, so
+    // every exit from the test body — including an assertion or an exception the
+    // body does not catch — has to release the job, drain the pool, and drop the
+    // global before that object dies.
+    auto enter_recording(RecordingLifetime &recording) {
+        g_recording = &recording;
+        eps_ = {recording_entry, recording_bind};
+        return RAIIScopeGuard([&recording]() {
+            {
+                std::lock_guard<std::mutex> lock(recording.mutex);
+                recording.release_job = true;
+            }
+            recording.cv.notify_all();
+            graph_record_wait_impl(nullptr);
+            g_recording_runtime = nullptr;
+            g_recording = nullptr;
+        });
+    }
+
     int bind(Runtime &rt, const ChipStorageTaskArgs &args, const ArgDirection *sig, int n) {
         // hbg reads only entry 0, through resolve_graph_task_capacity; the four
         // entries match RuntimeEnv's per-ring array width.
@@ -325,6 +467,20 @@ protected:
     FakeHostApi fake_;
     HostApi api_{nullptr, 0, 0, 0, &fake_ops()};
     TestHostOrchEntryPoints eps_{empty_orch_entry, empty_orch_bind};
+};
+
+class HbgHostAccessContractTest : public HbgBindLedgerTest {
+protected:
+    void SetUp() override {
+        HbgBindLedgerTest::SetUp();
+        g_access = &access_;
+        eps_ = {access_entry, access_bind};
+    }
+    void TearDown() override {
+        g_access = nullptr;
+        HbgBindLedgerTest::TearDown();
+    }
+    HostAccessProbe access_;
 };
 
 }  // namespace
@@ -726,4 +882,199 @@ TEST_F(HbgBindLedgerTest, OldReleaseDoesNotCloseSuccessorTrace) {
     ASSERT_EQ(publish_run_image_impl(&successor, &successor_api), 0);
     EXPECT_EQ(fake_.phase_records_of(HostPhaseKind::BindArenaH2d), 1u);
     EXPECT_EQ(release_run_bindings_impl(&successor, &successor_api), 0);
+}
+
+// Normal completion and exception unwinding must both join recorder jobs before
+// the local GraphHostState/OrchestratorState and tensor views leave scope.
+TEST_F(HbgBindLedgerTest, BindDrainsRecordersBeforeReleasingBuildState) {
+    RecordingLifetime recording;
+    auto recording_scope = enter_recording(recording);
+    Runtime runtime;
+    init_runtime(runtime);
+    auto runtime_cleanup = cleanup_runtime(runtime);
+    ChipStorageTaskArgs args;
+
+    EXPECT_EQ(bind(runtime, args, nullptr, 0), 0);
+    EXPECT_EQ(recording.wait_calls, 1);
+}
+
+TEST_F(HbgBindLedgerTest, ThrowingBindDrainsRecordersBeforeReleasingBuildState) {
+    RecordingLifetime recording;
+    recording.throw_from_entry = true;
+    auto recording_scope = enter_recording(recording);
+    Runtime runtime;
+    init_runtime(runtime);
+    auto runtime_cleanup = cleanup_runtime(runtime);
+    ChipStorageTaskArgs args;
+
+    try {
+        (void)bind(runtime, args, nullptr, 0);
+        ADD_FAILURE() << "orchestration exception was swallowed";
+    } catch (const std::runtime_error &error) {
+        EXPECT_STREQ(error.what(), "host orchestration failed");
+        EXPECT_EQ(recording.wait_calls, 1);
+    }
+
+    // A later bind can use the same runtime after the failed build is drained.
+    eps_ = {empty_orch_entry, empty_orch_bind};
+    EXPECT_EQ(bind(runtime, args, nullptr, 0), 0);
+}
+
+TEST_F(HbgHostAccessContractTest, HostInputIsReadableDuringBindAndInoutWritesReachBothCopies) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto runtime_cleanup = cleanup_runtime(runtime);
+    std::vector<uint8_t> input(4, 0x17);
+    ChipStorageTaskArgs args;
+    args.add_tensor(host_tensor(input));
+    ArgDirection sig[] = {ArgDirection::INOUT};
+
+    ASSERT_EQ(bind(runtime, args, sig, 1), 0);
+    ASSERT_EQ(access_.reads.size(), 1u);
+    EXPECT_EQ(access_.reads[0], 0x17u);
+    EXPECT_EQ(access_.error, 0);
+    ASSERT_EQ(runtime.tensor_leases().size(), 1u);
+    EXPECT_EQ(*static_cast<uint8_t *>(runtime.tensor_leases()[0].dev_ptr), 0x17);
+    // An unpublished record belongs to the run that prepared it, so this run ends
+    // before the one below binds.
+    ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+
+    access_.write = true;
+    ASSERT_EQ(bind(runtime, args, sig, 1), 0);
+    EXPECT_EQ(input[0], 0x5a);
+    ASSERT_EQ(runtime.tensor_leases().size(), 1u);
+    EXPECT_EQ(*static_cast<uint8_t *>(runtime.tensor_leases()[0].dev_ptr), 0x5a);
+}
+
+TEST_F(HbgHostAccessContractTest, ChildMemoryInputUsesItsCurrentDeviceBytesDuringBind) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto runtime_cleanup = cleanup_runtime(runtime);
+    std::vector<uint8_t> device_bytes(4, 0x29);
+    ChipTensor child = host_tensor(device_bytes);
+    child.address_space = AddressSpace::DEVICE;
+    ChipStorageTaskArgs args;
+    args.add_tensor(child);
+    ArgDirection sig[] = {ArgDirection::INOUT};
+
+    ASSERT_EQ(bind(runtime, args, sig, 1), 0);
+    ASSERT_EQ(access_.reads.size(), 1u);
+    EXPECT_EQ(access_.reads[0], 0x29u);
+    EXPECT_TRUE(runtime.tensor_leases().empty()) << "child memory must not acquire host staging";
+    ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+    access_.write = true;
+    ASSERT_EQ(bind(runtime, args, sig, 1), 0);
+    EXPECT_EQ(device_bytes[0], 0x5a);
+}
+
+TEST_F(HbgHostAccessContractTest, SuccessorReadsPredecessorOutputAfterExplicitCopyback) {
+    Runtime predecessor;
+    init_runtime(predecessor);
+    auto predecessor_cleanup = cleanup_runtime(predecessor);
+    std::vector<uint8_t> output(4, 0x11);
+    ChipStorageTaskArgs args;
+    args.add_tensor(host_tensor(output));
+    ArgDirection sig[] = {ArgDirection::INOUT};
+    ASSERT_EQ(bind(predecessor, args, sig, 1), 0);
+    ASSERT_EQ(predecessor.tensor_leases().size(), 1u);
+
+    // Model bytes from a completed kernel. A device fence alone would leave
+    // the caller's host buffer stale; the explicit finalize copy-back is needed.
+    *static_cast<uint8_t *>(predecessor.tensor_leases()[0].dev_ptr) = 0x42;
+    EXPECT_EQ(output[0], 0x11);
+    ASSERT_EQ(finish_run(predecessor, 0), 0);
+    ASSERT_EQ(output[0], 0x42);
+
+    Runtime successor;
+    init_runtime(successor);
+    auto successor_cleanup = cleanup_runtime(successor);
+    ASSERT_EQ(bind(successor, args, sig, 1), 0);
+    ASSERT_EQ(access_.reads.size(), 2u);
+    EXPECT_EQ(access_.reads.back(), 0x42u);
+}
+
+TEST_F(HbgHostAccessContractTest, IndependentAndSharedReadOnlyInputsCanPrepareBeforeCopyback) {
+    Runtime predecessor;
+    init_runtime(predecessor);
+    auto predecessor_cleanup = cleanup_runtime(predecessor);
+    std::vector<uint8_t> output(4, 0x11);
+    std::vector<uint8_t> shared_input(4, 0x27);
+    ChipStorageTaskArgs first_args;
+    first_args.add_tensor(host_tensor(output));
+    first_args.add_tensor(host_tensor(shared_input));
+    ArgDirection first_sig[] = {ArgDirection::INOUT, ArgDirection::IN};
+    ASSERT_EQ(bind(predecessor, first_args, first_sig, 2), 0);
+    ASSERT_EQ(predecessor.tensor_leases().size(), 2u);
+    *static_cast<uint8_t *>(predecessor.tensor_leases()[0].dev_ptr) = 0x42;
+
+    // A separate fake bank retains the predecessor's staging, as the runner's
+    // leased slot does. No wait/copy-back is called before this bind.
+    FakeHostApi successor_bank;
+    g_fake = &successor_bank;
+    Runtime successor;
+    init_runtime(successor);
+    auto successor_cleanup = cleanup_runtime(successor);
+    std::vector<uint8_t> independent(4, 0x38);
+    ChipStorageTaskArgs second_args;
+    second_args.add_tensor(host_tensor(shared_input));
+    second_args.add_tensor(host_tensor(independent));
+    ArgDirection second_sig[] = {ArgDirection::IN, ArgDirection::IN};
+    EXPECT_EQ(bind(successor, second_args, second_sig, 2), 0);
+    EXPECT_EQ(access_.reads, (std::vector<uint64_t>{0x11, 0x27, 0x27, 0x38}));
+    EXPECT_EQ(output[0], 0x11);
+    EXPECT_EQ(finish_run(successor, 0), 0);
+
+    g_fake = &fake_;
+    EXPECT_EQ(finish_run(predecessor, 0), 0);
+    EXPECT_EQ(output[0], 0x42);
+    EXPECT_EQ(shared_input[0], 0x27);
+}
+
+TEST_F(HbgHostAccessContractTest, GetAndSetRejectCurrentGraphOutputsAndOverlappingWriters) {
+    for (InputProducer producer : {InputProducer::Allocated, InputProducer::Overlapping}) {
+        for (bool write : {false, true}) {
+            SCOPED_TRACE(static_cast<int>(producer));
+            SCOPED_TRACE(write);
+            access_.producer = producer;
+            access_.write = write;
+            access_.error = 0;
+            Runtime runtime;
+            init_runtime(runtime);
+            auto runtime_cleanup = cleanup_runtime(runtime);
+            std::vector<uint8_t> input(4, 0x17);
+            ChipStorageTaskArgs args;
+            args.add_tensor(host_tensor(input));
+            ArgDirection sig[] = {ArgDirection::INOUT};
+
+            EXPECT_EQ(bind(runtime, args, sig, 1), runtime_status_from_error_code(SIMPLER_ERROR_INVALID_ARGS));
+            EXPECT_EQ(access_.error, SIMPLER_ERROR_INVALID_ARGS);
+            EXPECT_EQ(input[0], 0x17) << "a rejected write must not reach the caller's buffer";
+        }
+    }
+}
+
+TEST_F(HbgHostAccessContractTest, DisjointWriterDoesNotPreventReadyInputAccess) {
+    for (bool write : {false, true}) {
+        access_.producer = InputProducer::Disjoint;
+        access_.write = write;
+        access_.error = 0;
+        Runtime runtime;
+        init_runtime(runtime);
+        auto runtime_cleanup = cleanup_runtime(runtime);
+        // a5sim resolves the callable metadata while constructing its scheduler
+        // image, even though this memory backend never launches the kernel.
+        auto callable = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0);
+        reinterpret_cast<CoreCallable *>(callable.data())->set_resolved_addr(0x1000);
+        runtime.replay_function_bin_addr(0, reinterpret_cast<uint64_t>(callable.data()));
+        std::vector<uint8_t> input(4, 0x17);
+        ChipStorageTaskArgs args;
+        args.add_tensor(host_tensor(input));
+        ArgDirection sig[] = {ArgDirection::INOUT};
+
+        ASSERT_EQ(bind(runtime, args, sig, 1), 0);
+        EXPECT_EQ(access_.error, 0);
+        EXPECT_EQ(input[0], 0x17);
+        EXPECT_EQ(input[1], write ? 0x5a : 0x17);
+        if (!write) EXPECT_EQ(access_.reads.back(), 0x17u);
+    }
 }
