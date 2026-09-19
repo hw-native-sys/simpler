@@ -51,7 +51,6 @@
 // Configuration Macros
 // =============================================================================
 
-#define RUNTIME_MAX_ARGS 128
 #define RUNTIME_MAX_WORKER PLATFORM_MAX_CORES  // 36 AIC + 72 AIV cores
 #define RUNTIME_MAX_FUNC_ID 1024
 #define RUNTIME_MAX_ORCH_SYMBOL_NAME 64

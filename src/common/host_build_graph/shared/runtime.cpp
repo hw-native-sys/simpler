@@ -42,10 +42,6 @@ Runtime::Runtime() {
 
     host_.orch_args_storage_.clear();
     host_.active_callable_id_ = -1;
-    host_.dev_orch_so_addr_ = 0;
-    host_.dev_orch_so_size_ = 0;
-    host_.device_orch_func_name_[0] = '\0';
-    host_.device_orch_config_name_[0] = '\0';
     host_.pending_publication_ = {};
 
     // Initialize function address mapping
@@ -81,36 +77,12 @@ void Runtime::set_prebuilt_arena(void *arena_base, size_t runtime_off) {
 void *Runtime::get_prebuilt_arena_base() const { return dev.prebuilt_arena_base_; }
 size_t Runtime::get_prebuilt_runtime_offset() const { return dev.prebuilt_runtime_offset_; }
 
-// Orchestration metadata written by the platform host (DeviceRunner) at
-// callable registration. host_build_graph runs the orchestrator on the host so
-// the device side never reads these back, but the platform registration path is
-// shared with tensormap_and_ringbuffer and still writes them.
-void Runtime::set_dev_orch_so(uint64_t dev_addr, uint64_t size) {
-    host_.dev_orch_so_addr_ = dev_addr;
-    host_.dev_orch_so_size_ = size;
-}
-
+// The callable this runtime is stamped with. The orchestration .so and its entry
+// symbols stay in the platform's `CallableArtifacts`, because host_build_graph
+// resolves and runs them on the host.
 void Runtime::set_active_callable_id(int32_t callable_id) { host_.active_callable_id_ = callable_id; }
 
 int32_t Runtime::get_active_callable_id() const { return host_.active_callable_id_; }
-
-void Runtime::set_device_orch_func_name(const char *name) {
-    if (name == nullptr) {
-        host_.device_orch_func_name_[0] = '\0';
-        return;
-    }
-    std::strncpy(host_.device_orch_func_name_, name, RUNTIME_MAX_ORCH_SYMBOL_NAME - 1);
-    host_.device_orch_func_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME - 1] = '\0';
-}
-
-void Runtime::set_device_orch_config_name(const char *name) {
-    if (name == nullptr) {
-        host_.device_orch_config_name_[0] = '\0';
-        return;
-    }
-    std::strncpy(host_.device_orch_config_name_, name, RUNTIME_MAX_ORCH_SYMBOL_NAME - 1);
-    host_.device_orch_config_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME - 1] = '\0';
-}
 
 uint64_t Runtime::get_function_bin_addr(int func_id) const {
     if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return 0;

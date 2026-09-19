@@ -206,10 +206,12 @@ worker.run(handle, orch_args, cfg)
 HBG sizes and commits its graph heap after orchestration; `ring_heap` and
 `ring_dep_pool` are TRB settings, not HBG capacity controls.
 
-The HBG orchestration-entry limit is `RUNTIME_MAX_ARGS=128` in
-`src/common/host_build_graph/runtime.h`. Per-task fanin is capped at
-`CHIP_MAX_FANIN=128`; there is no `RUNTIME_MAX_FANOUT` knob. See
-[capacity errors](troubleshooting/device-error-codes/capacity.md) for the
+An HBG orchestration entry takes up to `CHIP_MAX_TENSOR_ARGS=256` tensors and
+`CHIP_MAX_SCALAR_ARGS=128` scalars, both in
+`src/common/task_interface/arg_direction.h` — they size the `EntryArgsStorage`
+the entry reads and the `ChipStorageTaskArgs` that crosses the wire. Per-task
+fanin is capped at `CHIP_MAX_FANIN=128`; there is no `RUNTIME_MAX_FANOUT` knob.
+See [capacity errors](troubleshooting/device-error-codes/capacity.md) for the
 resource-specific limits and diagnostics.
 
 ### Runtime Configuration

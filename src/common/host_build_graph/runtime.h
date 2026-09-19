@@ -49,11 +49,8 @@
 // Configuration Macros
 // =============================================================================
 
-#define RUNTIME_MAX_ARGS 128
 #define RUNTIME_MAX_WORKER PLATFORM_MAX_CORES
 #define RUNTIME_MAX_FUNC_ID 1024
-#define RUNTIME_MAX_ORCH_SO_SIZE (4 * 1024 * 1024)  // 4MB max for orchestration SO
-#define RUNTIME_MAX_ORCH_SYMBOL_NAME 64
 
 // Default number of ready-queue shards.
 constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 1;
@@ -264,19 +261,12 @@ private:
         // touches them, which is why they can stay off the device entirely.
         simpler::hbg::EntryArgsStorage orch_args_storage_;
 
-        // Orchestration metadata set by the platform host (DeviceRunner) when
-        // registering a callable. host_build_graph runs the orchestrator on the
-        // host, so the device side never reads the SO bytes, the symbol names,
-        // or the active callable id — but the platform registration path still
-        // writes them through these setters (shared with
-        // tensormap_and_ringbuffer, whose AICPU does read the callable id), so
-        // the fields and their setters are part of the platform↔runtime ABI and
-        // must stay.
-        uint64_t dev_orch_so_addr_;
-        uint64_t dev_orch_so_size_;
+        // The callable this runtime is stamped with, and the only orchestration
+        // metadata it holds: host_build_graph resolves the orchestration .so and
+        // its entry symbols on the host, where the platform's
+        // `CallableArtifacts` owns them for the callable's lifetime, so neither
+        // the SO bytes nor the symbol names have a home in here.
         int32_t active_callable_id_;
-        char device_orch_func_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
-        char device_orch_config_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
 
         // Host-side tensor ledger for the run's H2D and D2H transfers.
         // Populated by runtime_maker.cpp from orch_args at bind time, iterated
@@ -401,16 +391,11 @@ public:
     void *get_prebuilt_arena_base() const;
     size_t get_prebuilt_runtime_offset() const;
 
-    // Orchestration metadata written by the platform host (DeviceRunner) at
-    // callable registration. Shared ABI with tensormap_and_ringbuffer; the
-    // host_build_graph device side no longer reads them (host-orch builds the
-    // graph on the host), so only the setter + get_active_callable_id() the
-    // platform reads are exposed.
-    void set_dev_orch_so(uint64_t dev_addr, uint64_t size);
+    // The callable this runtime is stamped with. The platform stores it once the
+    // id is known to be registered, and reads it back on the prepare path to
+    // resolve that callable again.
     void set_active_callable_id(int32_t callable_id);
     int32_t get_active_callable_id() const;
-    void set_device_orch_func_name(const char *name);
-    void set_device_orch_config_name(const char *name);
 
     uint64_t get_function_bin_addr(int func_id) const;
     /**
