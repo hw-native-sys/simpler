@@ -591,26 +591,27 @@ public:
      * Consume every notification reported since this runner last looked, and
      * return how many named a stream **this runner's runs submit on**.
      *
-     * Reports; decides nothing. A notice names a device and a stream, carries no
-     * run identity, and arrives up to 16 s late — so on its own it cannot tell a
-     * fault that impaired a run from one that did not. Measured in both
-     * directions: a fault on an auxiliary stream and a fault on a genuine run
-     * stream each arrive while every run on the card succeeds. Acting on either
-     * refuses the next healthy run, so nothing here stops admission or starts
-     * recovery.
+     * A notice that matches refuses this runner's *future* admission, through
+     * the suspicion `accepts_new_run` reads. It decides no run: the notice names
+     * a device and a stream, carries no run identity, and can arrive late (16 s
+     * is the longest lag measured, not a bound), so it can name a fault from an
+     * earlier run than the one being finalized. It starts no drain, reset or
+     * recovery either, and reclaims nothing.
      *
-     * What is missing is not a verdict on the run but which *resources* a fault
-     * touched, so the device-health policy this feeds is still to be designed —
-     * and it stays its own axis: a decided run result neither causes nor vetoes
-     * a health action.
+     * The match is membership, not provenance. It says a fault landed on a
+     * stream this runner's runs use — on a5 that stream also carries binary
+     * load, AICPU init and callable registration — not that a run caused it and
+     * not that a run was impaired. So a control-plane failure the host already
+     * reported synchronously can still refuse later admission.
      *
      * Attribution is per stream, not merely per device: the notice's `device_id`
      * is logical (the same space this runner names its device in) and its
      * `stream_id` is a driver id compared against the ids this device's runs
      * were recorded on at launch. A notice matching none of them is unattributed
      * while that history is complete, and *undecided* once an id is missing —
-     * evicted by capacity, or never obtained because the query failed. The
-     * ring is process-wide, and this runner speaks for its own streams.
+     * evicted by capacity, or never obtained because the query failed. Neither
+     * refuses anything, and neither does a lost or dropped notice; the ring is
+     * process-wide, and this runner speaks for its own streams.
      */
     uint64_t consume_device_fault_notices() noexcept;
 
@@ -821,6 +822,19 @@ public:
      * enqueue fail-fast guard.
      */
     virtual bool can_accept_run() const = 0;
+
+    /**
+     * Whether the shared c_api may admit a new run on this runner.
+     *
+     * Composes the arch's own quarantine with the device-fault channel's
+     * generation-scoped suspicion; `device_admits_new_run` states what each
+     * refusal means and how each clears. Admission sites ask this. The two
+     * diagnostic readers of `can_accept_run()` — the clock-correlation session's
+     * abandon flag — deliberately keep asking the arch flag alone, because a
+     * matched notice says nothing about whether this run's own DFX resources are
+     * safe to release normally.
+     */
+    bool accepts_new_run() const { return device_admits_new_run(!can_accept_run(), device_health_); }
 
     /**
      * An AICore launch or stream sync failed outside the per-run path. The arch
@@ -1825,10 +1839,11 @@ protected:
     bool fault_monitor_held_{false};
     long fault_monitor_pid_{-1};
     DeviceFaultNoticeCursor fault_notices_;
-    // What the fault channel has said about *this* device, per generation. The
-    // quarantine itself lives in each arch's `device_unusable_`, which
-    // `recover_device_or_mark_unusable` sets and `can_accept_run` already reads;
-    // this holds the evidence and the reset fence that lets a card come back.
+    // What the fault channel has said about *this* device, per generation. Its
+    // suspicion is one of the two refusals `accepts_new_run` composes; the other
+    // is each arch's `device_unusable_`, which `recover_device_or_mark_unusable`
+    // sets. The two clear by different routes, and only a confirmed reset retires
+    // this one.
     DeviceHealthState device_health_;
     // Driver ids of the streams this device's runs were launched on, captured at
     // boundary-record time. The fault filter reads these rather than asking a

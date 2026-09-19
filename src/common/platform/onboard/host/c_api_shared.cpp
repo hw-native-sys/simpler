@@ -956,7 +956,7 @@ int simpler_prepare_run(
         LOG_ERROR("simpler_prepare_run: callable_id=%d not registered", callable_id);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    if (!runner->can_accept_run()) {
+    if (!runner->accepts_new_run()) {
         LOG_ERROR("simpler_prepare_run: runner is unusable after a prior device failure");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -1136,7 +1136,7 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
         return 0;
     }
-    if (!state->runner->can_accept_run() || !state->runner_reserved) return PTO_RUNTIME_ERR_INTERNAL;
+    if (!state->runner->accepts_new_run() || !state->runner_reserved) return PTO_RUNTIME_ERR_INTERNAL;
     if (state->prepared_execution == nullptr ||
         !state->runner->try_acquire_native_run(state, state->identity(), &state->launch_permit)) {
         LOG_ERROR("simpler_launch_run: execution claim is occupied (%s)", state->trace_attrs);
@@ -1144,8 +1144,9 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     }
     state->runner_claimed = true;
     // The active predecessor may poison the device after this successor was
-    // prepared but before the execution claim becomes available.
-    if (!state->runner->can_accept_run()) {
+    // prepared but before the execution claim becomes available, and the fault
+    // channel may have matched a notice to this device in the same window.
+    if (!state->runner->accepts_new_run()) {
         state->runner->release_native_run(state);
         state->runner_claimed = false;
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -1368,18 +1369,18 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
             if (launched) {
                 state->runner->read_device_run_result(state->descriptor.pipeline_slot, state->descriptor.run_epoch);
                 report_terminal_disagreement(state, execution_rc);
-                // Separate axis, and it decides nothing: a notification names a
-                // device and a stream, carries no run identity, and arrives up to
-                // 16 s late — so it can name a fault from an earlier run than
-                // this one, and cannot say whether any run was impaired. Recorded
-                // here so the channel's evidence accumulates against the device's
-                // live generation; the run's outcome is settled above and stays
-                // settled.
+                // A separate axis from this run's outcome: a notification names a
+                // device and a stream, carries no run identity, and can arrive
+                // late — 16 s is the longest lag measured, not a bound the SDK
+                // promises — so it can name a fault from an earlier run than this
+                // one, and cannot say whether any run was impaired. `execution_rc`
+                // is settled above and is not read or written here; a matched
+                // notice refuses *future* admission and nothing else.
                 const uint64_t own_stream_faults = state->runner->consume_device_fault_notices();
                 if (own_stream_faults != 0) {
                     LOG_WARN(
-                        "device fault channel reported %llu notice(s) on this runner's run streams while finalizing "
-                        "%s; recorded against the device, and this run's own outcome is unchanged",
+                        "device fault channel matched %llu notice(s) to this runner's run streams while finalizing "
+                        "%s; this run's own outcome is unchanged and the device refuses further admission",
                         static_cast<unsigned long long>(own_stream_faults), state->trace_attrs
                     );
                 }

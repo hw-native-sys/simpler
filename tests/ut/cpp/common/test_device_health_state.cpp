@@ -506,3 +506,116 @@ TEST(ConfirmedDeviceReset, ReportsAFailedReinstallWithoutBlockingRetirement) {
     EXPECT_FALSE(health.suspect());
     EXPECT_EQ(ids.size(), 0u);
 }
+
+// ===== Admission under device health =====
+//
+// `device_admits_new_run` is the predicate the shared c_api asks through
+// `DeviceRunnerBase::accepts_new_run`. What reaches it is already covered above
+// — which notice kinds make a device suspect, and what `attribute` answers for
+// each stream id. These cases pin the consequence: a notice the runner matched
+// to one of its own run streams refuses the *next* run, and nothing else does.
+
+TEST(AdmissionUnderDeviceHealth, AHealthyRunnerAdmits) {
+    const DeviceHealthState health;
+    EXPECT_TRUE(device_admits_new_run(/*arch_quarantined=*/false, health));
+}
+
+TEST(AdmissionUnderDeviceHealth, AMatchedNoticeRefusesTheNextRun) {
+    DeviceHealthState health;
+    RunStreamIdentities ids;
+    ids.note(61);
+    ASSERT_EQ(ids.attribute(61), Attribution::Mine);
+
+    health.note_own_device_fault(kFaultCode);
+
+    EXPECT_FALSE(device_admits_new_run(/*arch_quarantined=*/false, health))
+        << "a matched notice has to refuse admission on its own, with no arch quarantine set";
+    EXPECT_EQ(health.first_error_code(), kFaultCode);
+}
+
+// A missing id is exactly what a stale notice carries, so an incomplete history
+// weakens only the *negative* answer. A positive match is still a match, and it
+// still refuses.
+TEST(AdmissionUnderDeviceHealth, AMatchedNoticeStillRefusesWhenTheHistoryIsIncomplete) {
+    DeviceHealthState health;
+    RunStreamIdentities ids;
+    ids.note(61);
+    ids.note_unidentified_stream();
+    ASSERT_FALSE(ids.complete());
+    ASSERT_EQ(ids.attribute(61), Attribution::Mine);
+
+    health.note_own_device_fault(kFaultCode);
+
+    EXPECT_FALSE(device_admits_new_run(/*arch_quarantined=*/false, health));
+}
+
+// Both of the consumer's non-matching outcomes reach the same record call, so
+// both leave admission open: a stream no run used while the history is whole,
+// and any stream once an id is missing. A notice naming another device reaches
+// it too, without consulting the history at all.
+TEST(AdmissionUnderDeviceHealth, AnUnattributedNoticeAdmits) {
+    DeviceHealthState health;
+    RunStreamIdentities whole;
+    whole.note(61);
+    ASSERT_EQ(whole.attribute(45), Attribution::NotMine);
+
+    RunStreamIdentities partial;
+    partial.note_unidentified_stream();
+    ASSERT_EQ(partial.attribute(45), Attribution::Undecided);
+
+    health.note_unattributed_fault();
+    health.note_unattributed_fault();
+
+    EXPECT_TRUE(device_admits_new_run(/*arch_quarantined=*/false, health));
+    EXPECT_EQ(health.unattributed_faults_total(), 2u) << "recorded, and still admitting";
+    EXPECT_EQ(health.first_error_code(), 0u);
+}
+
+TEST(AdmissionUnderDeviceHealth, LostAndDroppedNoticesAdmit) {
+    DeviceHealthState health;
+    health.note_undelivered_notices(/*lost=*/3, /*dropped=*/2);
+
+    EXPECT_TRUE(device_admits_new_run(/*arch_quarantined=*/false, health))
+        << "a notice that named nothing cannot name a resource to refuse for";
+    EXPECT_EQ(health.undelivered_notices_total(), 5u);
+}
+
+TEST(AdmissionUnderDeviceHealth, AConfirmedResetRestoresAdmission) {
+    CountingMonitorOps ops;
+    DeviceFaultMonitor monitor(ops.make());
+    ASSERT_EQ(monitor.acquire(), 0);
+
+    DeviceHealthState health;
+    RunStreamIdentities ids;
+    DeviceFaultNoticeCursor notices;
+    ids.note(61);
+    health.note_own_device_fault(kFaultCode);
+    ASSERT_FALSE(device_admits_new_run(/*arch_quarantined=*/false, health));
+
+    const DeviceGenerationRetirement retirement = retire_after_confirmed_device_reset(health, ids, &monitor, notices);
+
+    EXPECT_TRUE(retirement.cleared_suspicion);
+    EXPECT_TRUE(device_admits_new_run(/*arch_quarantined=*/false, health))
+        << "the reset that recovered the card has to give it back";
+}
+
+// Only a confirmed reset retires a generation, so a reset that was not confirmed
+// reaches no retirement and the refusal stands.
+TEST(AdmissionUnderDeviceHealth, AResetThatWasNotConfirmedLeavesAdmissionRefused) {
+    DeviceHealthState health;
+    health.note_own_device_fault(kFaultCode);
+
+    EXPECT_FALSE(device_admits_new_run(/*arch_quarantined=*/false, health));
+    EXPECT_EQ(health.generation(), 0u) << "no generation was retired";
+}
+
+// The two refusals are independent, and only one of them is this channel's.
+TEST(AdmissionUnderDeviceHealth, TheArchQuarantineRefusesOnItsOwnAndIsNotRetiredHere) {
+    DeviceHealthState health;
+    EXPECT_FALSE(device_admits_new_run(/*arch_quarantined=*/true, health));
+
+    health.retire_generation();
+    EXPECT_FALSE(device_admits_new_run(/*arch_quarantined=*/true, health))
+        << "retiring the health generation cannot clear the arch's own flag";
+    EXPECT_TRUE(device_admits_new_run(/*arch_quarantined=*/false, health));
+}

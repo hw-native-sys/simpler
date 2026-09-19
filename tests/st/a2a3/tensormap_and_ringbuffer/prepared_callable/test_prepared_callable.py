@@ -34,8 +34,45 @@ _SLOT_PRIMARY = 0
 _SLOT_SECONDARY = 1
 
 
+class _PreparedCallableMixin:
+    """Helpers shared by the prepared-callable classes in this module.
+
+    Plain mixin, so pytest collects nothing from it. It exists because the
+    intentional-failure case lives in its own class (see
+    ``TestPreparedCallableRegistrationFailure``) and needs the same argument
+    construction and single-run helper as the ordinary cases.
+    """
+
+    def generate_args(self, params):
+        size = 128 * 128
+        a, b = params["a"], params["b"]
+        return TaskArgsBuilder(
+            TensorArg("a", torch.full((size,), a, dtype=torch.float32)),
+            TensorArg("b", torch.full((size,), b, dtype=torch.float32)),
+            TensorArg("f", torch.zeros(size, dtype=torch.float32)),
+        )
+
+    def compute_golden(self, args, params):
+        args.f[:] = (args.a + args.b + 1) * (args.a + args.b + 2) + (args.a + args.b)
+
+    def _chip_worker(self, worker):
+        chip_worker = worker._chip_worker
+        assert chip_worker is not None
+        return chip_worker
+
+    def _run_one(self, worker, slot, config, case):
+        params = case["params"]
+        orch_sig = self.CALLABLE["orchestration"]["signature"]
+        test_args = self.generate_args(params)
+        chip_args, output_names = _build_chip_task_args(test_args, orch_sig)
+        golden_args = test_args.clone()
+        self.compute_golden(golden_args, params)
+        self._chip_worker(worker)._run_slot(slot, chip_args, config=config)
+        _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
+
+
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
-class TestPreparedCallable(SceneTestCase):
+class TestPreparedCallable(_PreparedCallableMixin, SceneTestCase):
     """Exercise private prepare / run / unregister slot ABI.
 
     Requires an isolated L2 ``Worker`` (private slot table starts empty); this is
@@ -80,23 +117,6 @@ class TestPreparedCallable(SceneTestCase):
             "params": {"a": 2.0, "b": 3.0},
         },
     ]
-
-    def generate_args(self, params):
-        size = 128 * 128
-        a, b = params["a"], params["b"]
-        return TaskArgsBuilder(
-            TensorArg("a", torch.full((size,), a, dtype=torch.float32)),
-            TensorArg("b", torch.full((size,), b, dtype=torch.float32)),
-            TensorArg("f", torch.zeros(size, dtype=torch.float32)),
-        )
-
-    def compute_golden(self, args, params):
-        args.f[:] = (args.a + args.b + 1) * (args.a + args.b + 2) + (args.a + args.b)
-
-    def _chip_worker(self, worker):
-        chip_worker = worker._chip_worker
-        assert chip_worker is not None
-        return chip_worker
 
     def _run_and_validate_l2(  # noqa: PLR0913
         self,
@@ -163,16 +183,6 @@ class TestPreparedCallable(SceneTestCase):
         callable_obj = self.build_callable(st_platform)
         config = self._build_config(case.get("config", {}))
         return callable_obj, config, case
-
-    def _run_one(self, worker, slot, config, case):
-        params = case["params"]
-        orch_sig = self.CALLABLE["orchestration"]["signature"]
-        test_args = self.generate_args(params)
-        chip_args, output_names = _build_chip_task_args(test_args, orch_sig)
-        golden_args = test_args.clone()
-        self.compute_golden(golden_args, params)
-        self._chip_worker(worker)._run_slot(slot, chip_args, config=config)
-        _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
     def test_dlopen_count_same_slot_repeated_runs(self, st_platform, st_worker):
         """Case A: prepare(primary) prewarms once; run x5 adds no dlopens."""
@@ -269,29 +279,6 @@ class TestPreparedCallable(SceneTestCase):
             if primary_prepared:
                 chip_worker._unregister_slot(_SLOT_PRIMARY)
 
-    def test_prewarm_failure_rolls_back_registration(self, st_platform, st_worker):
-        """Case F: missing AICPU orch entry fails prepare and leaves no prepared slot."""
-
-        class MissingEntryCallable(type(self)):
-            CALLABLE = copy.deepcopy(type(self).CALLABLE)
-
-        MissingEntryCallable.CALLABLE["orchestration"]["function_name"] = "missing_aicpu_orchestration_entry"
-        bad_callable = MissingEntryCallable().build_callable(st_platform)
-        config = self._build_config(self.CASES[0].get("config", {}))
-        case = self.CASES[0]
-        baseline = st_worker.aicpu_dlopen_count
-        chip_worker = self._chip_worker(st_worker)
-
-        with pytest.raises(RuntimeError):
-            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, bad_callable)
-        assert st_worker.aicpu_dlopen_count == baseline
-
-        with pytest.raises(RuntimeError):
-            self._run_one(st_worker, _SLOT_PRIMARY, config, case)
-        assert st_worker.aicpu_dlopen_count == baseline
-
-        chip_worker._unregister_slot(_SLOT_PRIMARY)
-
     def test_dlopen_count_unregister_re_prepare(self, st_platform, st_worker):
         """Case D: prepare+unregister+prepare prewarms twice -> delta == 2.
 
@@ -327,6 +314,64 @@ class TestPreparedCallable(SceneTestCase):
         finally:
             if prepared:
                 chip_worker._unregister_slot(_SLOT_PRIMARY)
+
+
+@scene_test(level=2, runtime="tensormap_and_ringbuffer")
+class TestPreparedCallableRegistrationFailure(_PreparedCallableMixin, SceneTestCase):
+    """Registration failures, on a worker no other case shares.
+
+    This case drives a failure through the device on purpose. The runner state
+    that produces belongs to the case that asked for it, not to whichever case
+    runs next, and ``st_worker`` is class-scoped (see ./conftest.py) — so the
+    boundary is a class of its own.
+
+    ``CASES`` carries this class's platform metadata and nothing else. The root
+    conftest deselects **every** item of a ``SceneTestCase`` class whose cases
+    match no platform, so an empty list here would drop the test below from CI
+    rather than merely quieting the inherited runner. The inherited runner is
+    quieted directly instead, by the shadow under ``test_run``.
+
+    Isolation confines shared mutable runner state. It is not a claim that the
+    device is restored: a notification the driver delivers later can still name
+    it, and only a confirmed reset retires a device generation.
+    """
+
+    CALLABLE = TestPreparedCallable.CALLABLE
+    CASES = TestPreparedCallable.CASES
+
+    # The generic scene-test runner reaches this class by inheritance, and this
+    # class's business is the failure below, not a scene case. `__test__ = False`
+    # keeps pytest from collecting it at all — a non-callable shadow would draw a
+    # PytestCollectionWarning, and a skip would report a case that was never
+    # meant to run here. `CASES` above stays real so platform selection still
+    # sees this class.
+    def test_run(self, *args, **kwargs):
+        raise AssertionError("TestPreparedCallableRegistrationFailure runs no scene case")
+
+    test_run.__test__ = False
+
+    def test_prewarm_failure_rolls_back_registration(self, st_platform, st_worker):
+        """Case F: missing AICPU orch entry fails prepare and leaves no prepared slot."""
+
+        class MissingEntryCallable(type(self)):
+            CALLABLE = copy.deepcopy(type(self).CALLABLE)
+
+        MissingEntryCallable.CALLABLE["orchestration"]["function_name"] = "missing_aicpu_orchestration_entry"
+        bad_callable = MissingEntryCallable().build_callable(st_platform)
+        config = self._build_config(self.CASES[0].get("config", {}))
+        case = self.CASES[0]
+        baseline = st_worker.aicpu_dlopen_count
+        chip_worker = self._chip_worker(st_worker)
+
+        with pytest.raises(RuntimeError):
+            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, bad_callable)
+        assert st_worker.aicpu_dlopen_count == baseline
+
+        with pytest.raises(RuntimeError):
+            self._run_one(st_worker, _SLOT_PRIMARY, config, case)
+        assert st_worker.aicpu_dlopen_count == baseline
+
+        chip_worker._unregister_slot(_SLOT_PRIMARY)
 
 
 if __name__ == "__main__":

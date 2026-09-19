@@ -19,10 +19,11 @@
  *
  * About a **device**, never about a run. Measured on a2a3 in #2303: a notice
  * carries `task_id == 0` for every error class, a pipelined pair shares one
- * stream pair so `stream_id` names the faulting side but not the run, and
- * arrival lag reaches 16 s — wider than the interval between two runs. So a
- * notice can arrive while a later, healthy run is finalizing. That run's verdict
- * is untouched; the device is still suspect, because it did fault.
+ * stream pair so `stream_id` names the faulting side but not the run, and the
+ * longest arrival lag measured is 16 s — wider than the interval between two
+ * runs, and a sample rather than a bound the SDK promises. So a notice can
+ * arrive while a later, healthy run is finalizing. That run's verdict is
+ * untouched; the device is still suspect, because it did fault.
  *
  * Notices are process-wide — the ring reserves no share per device — while a
  * quarantine is per device. The notice's own `device_id` is what resolves that,
@@ -42,14 +43,15 @@
  * retires, because it is a claim about a device generation that no longer
  * exists. The `_total` counters are runner-lifetime: they answer "how much has
  * this channel reported on this card", which a count that reset on every
- * recovery could not. Nothing in the product reads either today; a later health
- * policy must take the generation-scoped state, not the totals.
+ * recovery could not. Admission reads the generation-scoped suspicion through
+ * `device_admits_new_run`; nothing reads the totals.
  */
 class DeviceHealthState {
 public:
     /**
      * A notice naming this device. The device is suspect from here until a
-     * confirmed reset retires the generation.
+     * confirmed reset retires the generation, and admission refuses new runs
+     * while it is — see `device_admits_new_run`.
      *
      * Returns whether this call is what made it suspect, so a caller can log
      * and recover once per fault rather than once per notice.
@@ -71,11 +73,11 @@ public:
      * A notice this runner cannot attribute to its own runs — it names another
      * device in this process, or a stream none of this runner's runs submits on.
      *
-     * Counted so the channel can be seen to be live, and deliberately **not**
-     * acted on. Measured on a2a3: a `507018` on `stream_id=45/46` with
-     * `task_id=10` arrives while every run on the card succeeds, and quarantining
-     * on it refuses the next healthy run. The drain's synchronize never observed
-     * those streams either, so a channel replacing it must not either.
+     * Counted, and it refuses nothing. Measured on a2a3: a `507018` on
+     * `stream_id=45/46` with `task_id=10` arrives while every run on the card
+     * succeeds. The drain's synchronize never observed those streams either, so a
+     * channel replacing it must not either. This is not a claim that such a fault
+     * is harmless — it is that nothing here says which resources it touched.
      */
     void note_unattributed_fault() { unattributed_faults_.fetch_add(1, std::memory_order_acq_rel); }
 
@@ -83,13 +85,12 @@ public:
      * Notices the channel could not deliver — overwritten in the ring, or
      * abandoned by the reporter.
      *
-     * Counted, not acted on, and that is a deliberate asymmetry with the rest of
-     * this class: an undelivered notice names nothing, so it cannot be told from
-     * one that would have named another device or a stream no run of this
-     * runner's uses. Quarantining on it would refuse healthy work on evidence
-     * that identifies no fault — the failure this class exists to avoid. What it
-     * does mean is that the channel is lossy right now, which is worth a
-     * caller's attention rather than a card.
+     * Counted, and it refuses nothing, which is a deliberate asymmetry with
+     * `note_own_device_fault`: an undelivered notice names nothing, so it cannot
+     * be told from one that would have named another device or a stream no run of
+     * this runner's uses. Refusing work on it would refuse on evidence that
+     * identifies no resource. What it does mean is that the channel is lossy right
+     * now — so a suspicion this class does not hold is not evidence of health.
      */
     void note_undelivered_notices(uint64_t lost, uint64_t dropped) {
         if (lost == 0 && dropped == 0) return;
@@ -146,6 +147,31 @@ private:
 };
 
 /**
+ * Whether a runner may take a new run.
+ *
+ * Two independent refusals, and they are not reducible to each other:
+ *
+ * - `arch_quarantined` is the arch's own post-failure flag, set when a launch or
+ *   a sync failed and cleared by its finalize after a confirmed reset.
+ * - a suspicion in `health` is a fault the channel matched to a stream this
+ *   runner's runs were recorded on. It is generation-scoped, so the confirmed
+ *   reset that retires the generation restores admission with no separate clear,
+ *   and a reset that failed leaves the refusal standing.
+ *
+ * Neither is derived from any run's verdict: a successful run does not clear a
+ * suspicion and a failed one does not create one. Refusal applies to *future*
+ * admission only; the run whose finalize recorded the notice keeps its own
+ * outcome, and refusing reclaims nothing and resets nothing.
+ *
+ * Only a notice this runner matched refuses. Unattributed, undecided, lost and
+ * dropped notices leave admission open, and so does the absence of a notice —
+ * which is not evidence of health, only of silence.
+ */
+inline bool device_admits_new_run(bool arch_quarantined, const DeviceHealthState &health) {
+    return !arch_quarantined && !health.suspect();
+}
+
+/**
  * The driver ids of the streams that have carried this device's runs, for the
  * live generation.
  *
@@ -161,10 +187,11 @@ private:
  *
  * **Streams are replaced, and their ids go with them.** Publishing AICore code
  * marks a2a3's AICore stream stale, and the next launch destroys and recreates
- * it. A notice naming the old stream arrives after that — the channel lags by up
- * to 16 s — so a filter that knows only the *current* pair would read a run's own
- * fault as someone else's and step the cursor past it for good. Keeping the ids
- * a run actually submitted on is what makes that notice still attributable.
+ * it. A notice naming the old stream arrives after that — the channel has lagged
+ * by as much as the 16 s longest measured — so a filter that knows only the
+ * *current* pair would read a run's own fault as someone else's and step the
+ * cursor past it for good. Keeping the ids a run actually submitted on is what
+ * makes that notice still attributable.
  *
  * History can be incomplete two ways — capacity refuses a further id, or a query
  * never yielded one. Both are reported rather than hidden: an id that matches

@@ -95,23 +95,59 @@ occurs, so the error arrives without anyone waiting. It is device-scoped rather
 than run-scoped and brings its own threading and lifetime contract, so it is a
 subsystem rather than a call to drop in.
 
-That subsystem now exists and is consumed — as evidence, not yet as a trigger.
-The process owns the driver's single callback slot
-(`host/device_fault_monitor.h`), and each runner records the notices naming
-streams its own runs submit on, against the device's live generation
-(`host/device_health_state.h`, including the fence that retires a generation at a
-confirmed reset so one recovered fault cannot quarantine a card for the life of
-the process).
+That subsystem now exists, is consumed, and refuses admission. The process owns
+the driver's single callback slot (`host/device_fault_monitor.h`), and each
+runner records the notices naming streams its own runs submit on, against the
+device's live generation (`host/device_health_state.h`, including the fence that
+retires a generation at a confirmed reset so one recovered fault cannot
+quarantine a card for the life of the process).
 
-It stops there deliberately. A notice carries no run identity and arrives up to
-16 s late, and that was measured to matter in both directions: a fault on an
-auxiliary stream and a fault on a genuine run stream each arrive while every run
-on the card succeeds, so acting on either refuses the next healthy run.
+**A notice the runner matches to one of its own run streams refuses future
+admission, and does nothing else.** `device_admits_new_run` composes that
+suspicion with the arch's own quarantine, and the shared c_api asks it at
+prepare and at launch. The run whose finalize recorded the notice keeps the
+outcome its own channels gave it; no drain, reset or recovery starts from a
+notice; no resource is reclaimed; and the teardown consumer records only.
+Unattributed, undecided, lost and dropped notices refuse nothing, and neither
+does the absence of a notice — silence is not evidence of health.
 
-What is missing is not a verdict on the run — it is a way to tell which
-*resources* a fault touched, and the streams a run submitted on are the closest
-thing the channel offers. So the trigger a later change adds is about the device,
-and it stays on its own axis: **a decided run result neither causes nor vetoes a
+What the match is, precisely: the notice names this device in the logical id
+space, and its stream id is one this runner's run boundaries were recorded on.
+That is **membership, not provenance.** It does not identify the submission that
+faulted — on a5 the same `stream_aicpu_` also carries binary load, AICPU init
+and callable registration — and it carries no time, so a late or recycled
+identity can refuse work the device would have served. That availability cost is
+the deliberate trade: a notice carries no run identity and can arrive late (16 s
+is the longest lag measured, not a bound the SDK promises), so no rule over this
+channel can distinguish a fault that impaired a run from one that did not.
+
+Two consequences follow from membership-not-provenance, and both are accepted
+rather than worked around:
+
+- **A control-plane failure the host already reported synchronously can still
+  refuse later admission.** On a5 the registration, binary-load and AICPU-init
+  submissions ride `stream_aicpu_`, which is also a run-boundary stream, so a
+  device exception raised by one of them matches. The caller has already seen
+  that failure as a return code; the notice refuses admission on top of it.
+- **There is no guarantee that an ordinary close and re-init is recovery.**
+  Admission returns only through the existing confirmed-generation-retirement
+  path — the force reset that confirms, then `retire_after_confirmed_device_reset`.
+  A reset that was not confirmed, or a notification delivered into the new
+  generation, leaves the runner refusing.
+
+A test that deliberately drives a device-side failure therefore must not share a
+worker with cases that expect a healthy runner. In the `prepared_callable`
+directories that case lives in its own class
+(`TestPreparedCallableRegistrationFailure`), because the worker fixture is
+class-scoped and `DevicePool.allocate` refuses rather than queues — a
+finer-scoped worker requested while the class's is still cached would need a
+second device. Class scope makes the two lifetimes sequential instead. That
+confines shared mutable runner state between an intentional-failure case and the
+positive cases around it; it is not a claim that the device is restored, since a
+notification delivered later can still name it.
+
+What a notice still cannot do is decide a run. The trigger is about the device
+and stays on its own axis: **a decided run result neither causes nor vetoes a
 device-health action.** A run that failed for its own reasons can leave a healthy
 card, and a run that succeeded can sit on a card that faulted underneath it —
 both were measured here. Result, health and resource retirement stay three
@@ -135,10 +171,14 @@ second launched run rather than a task that change can absorb. Concretely, that
 change owes:
 
 - ~~an error channel that reports a device exception without a stream
-  synchronize~~ — **delivered** and recorded per device generation, though not yet
-  a trigger: on its own a notice cannot say which resources a fault touched, so
-  the device-health policy it feeds is still to be designed. That policy is a
-  separate axis from the run result, not a refinement of it;
+  synchronize~~ — **delivered**, recorded per device generation, and refusing
+  future admission on a matched notice. It does **not** make removing the
+  normal-path synchronize safe: the rows that keep synchronizing include the
+  ordinary successful run that produces no notice at all, so this channel is a
+  fallback for uncovered work rather than a replacement for the verdict read;
+- an attributable positive terminal record from every producer, and its promotion
+  from the shadow validation it is today — a5's `host_build_graph` legacy path
+  publishes none;
 - a decision on how a *successor's* fault is attributed, since a stream carries
   its error stickily and the predecessor's drain would otherwise report it.
 

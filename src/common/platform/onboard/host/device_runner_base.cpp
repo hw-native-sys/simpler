@@ -1864,7 +1864,9 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     }
     // Anything this device reported and nobody has read yet is reported now:
     // after this the runner stops looking, and a notification that arrived
-    // during teardown is the one most worth having in the log.
+    // during teardown is the one most worth having in the log. Observation only
+    // — the admission this could refuse is already over, and the consumer itself
+    // starts no drain, reset or recovery, which this path could not survive.
     (void)consume_device_fault_notices();
     release_device_fault_monitor();
     // Completion-boundary events are released ahead of the streams they were
@@ -2744,24 +2746,25 @@ uint64_t DeviceRunnerBase::consume_device_fault_notices() noexcept {
     device_health_.note_undelivered_notices(progress.lost, progress.newly_dropped);
     if (own == 0) return own;
 
-    // Recorded, and nothing is started from it. A notice carries no run identity
-    // and arrives up to 16 s late, so on its own it cannot tell a fault that
-    // impaired a run from one that did not — measured in both directions: a fault
-    // on an auxiliary stream (a2a3, `stream_id=45/46`) and a fault on a genuine
-    // run stream (a5, `stream_id=61`) each arrive while every run on the card
-    // succeeds, and quarantining on either refuses the next healthy run.
+    // A matched notice refuses future admission, and nothing more. `accepts_new_run`
+    // reads the suspicion this recorded; no drain, reset or recovery starts here, and
+    // the run being finalized keeps the outcome its own channels gave it — a notice
+    // carries no run identity and can arrive late (16 s is the longest lag measured,
+    // not a bound), so it can name a fault from an earlier run than this one.
     //
-    // The missing half is not a verdict on the run: it is which *resources* a
-    // fault touched, and a notice's stream is the closest the channel comes to
-    // saying. So the device-health policy this feeds is still to be designed,
-    // and it stays its own axis — a decided run result neither causes nor vetoes
-    // a health action. A run can fail for its own reasons on a healthy card, and
-    // a run can succeed on a card that faulted underneath it; both were measured
-    // here. Result, health and resource retirement are three decisions with
-    // three inputs.
+    // "Matched" is membership, not provenance: the stream is one this device's runs
+    // were recorded on, which on a5 also carries binary load, AICPU init and callable
+    // registration. So a refusal says a fault landed on a stream this runner uses, not
+    // that a run caused it and not that a run was impaired. That is the availability
+    // trade this policy takes deliberately — a late or recycled identity can refuse
+    // work the device would have served.
+    //
+    // Result, health and resource retirement stay three decisions with three inputs:
+    // a run can fail for its own reasons on a healthy card, and can succeed on a card
+    // that faulted underneath it, both measured here.
     LOG_ERROR(
-        "device %d: fault channel reported %llu notice(s) on its run streams (first code=%u, generation=%llu). "
-        "Recorded only: a notice carries no run identity, so nothing is decided or recovered from it here.",
+        "device %d: fault channel matched %llu notice(s) to its run streams (first code=%u, generation=%llu). "
+        "Admission is refused until a confirmed reset retires this generation; no run's outcome is changed by it.",
         device_id_, static_cast<unsigned long long>(own), device_health_.first_error_code(),
         static_cast<unsigned long long>(device_health_.generation())
     );
