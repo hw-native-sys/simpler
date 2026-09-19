@@ -10,6 +10,7 @@
 import struct
 
 import pytest
+from simpler import remote_l3_session
 from simpler.remote_l3_protocol import (
     MAX_ERROR_BYTES,
     REMOTE_BUFFER_ACCESS_READ,
@@ -166,3 +167,64 @@ def test_export_buffer_result_decode_rejects_invalid_live_identity(field, value)
 def test_import_buffer_result_rejects_invalid_live_identity(field, value):
     with pytest.raises(ValueError, match="live imported buffer identity"):
         encode_import_buffer_result(_import_result(**{field: value}))
+
+
+def test_served_frame_span_names_the_frame_the_caller_dispatched(monkeypatch):
+    emitted = []
+    timestamps = iter((1_000, 1_400))
+    monkeypatch.setattr(remote_l3_session, "_host_spans_active", lambda: True)
+    monkeypatch.setattr(remote_l3_session, "_monotonic_now_ns", lambda: next(timestamps))
+    monkeypatch.setattr(remote_l3_session, "_emit_host_span", lambda *args: emitted.append(args))
+
+    with remote_l3_session._served_frame_span(3, session_id=41, sequence=17):
+        pass
+
+    assert emitted == [("node.remote_task", 0, 0, 0, 1_000, 400, "f=15:h")]
+
+
+def test_served_frame_span_compact_key_covers_wire_integer_limits(monkeypatch):
+    emitted = []
+    timestamps = iter((1_000, 1_400))
+    monkeypatch.setattr(remote_l3_session, "_host_spans_active", lambda: True)
+    monkeypatch.setattr(remote_l3_session, "_monotonic_now_ns", lambda: next(timestamps))
+    monkeypatch.setattr(remote_l3_session, "_emit_host_span", lambda *args: emitted.append(args))
+
+    with remote_l3_session._served_frame_span(3, session_id=(1 << 63) - 1, sequence=(1 << 64) - 1):
+        pass
+
+    assert emitted[0][-1] == "f=1y2p0ij32e8e7:3w5e11264sgsf"
+    assert len(emitted[0][-1]) == 29
+
+
+def test_served_frame_span_emits_nothing_while_host_spans_are_off(monkeypatch):
+    emitted = []
+    monkeypatch.setattr(remote_l3_session, "_host_spans_active", lambda: False)
+    monkeypatch.setattr(
+        remote_l3_session,
+        "_monotonic_now_ns",
+        lambda: pytest.fail("a gated-off span must not read the clock"),
+    )
+    monkeypatch.setattr(remote_l3_session, "_emit_host_span", lambda *args: emitted.append(args))
+
+    with remote_l3_session._served_frame_span(3, session_id=41, sequence=17):
+        pass
+
+    assert emitted == []
+
+
+@pytest.mark.parametrize("failure_site", ["prefix", "emit"])
+def test_served_frame_span_diagnostics_cannot_break_task_processing(monkeypatch, failure_site):
+    timestamps = iter((1_000, 1_400))
+    monkeypatch.setattr(remote_l3_session, "_host_spans_active", lambda: True)
+    monkeypatch.setattr(remote_l3_session, "_monotonic_now_ns", lambda: next(timestamps))
+
+    def fail_trace(*_args):
+        raise ValueError("injected trace failure")
+
+    if failure_site == "prefix":
+        monkeypatch.setattr(remote_l3_session, "span_prefix", fail_trace)
+    else:
+        monkeypatch.setattr(remote_l3_session, "_emit_host_span", fail_trace)
+
+    with remote_l3_session._served_frame_span(3, session_id=41, sequence=17):
+        pass

@@ -266,6 +266,7 @@ which every one of those levels runs on:
 | `<level>.graph_build` | serialized Python graph callback |
 | `<level>.submit` | next-level task publication after slot allocation |
 | `<level>.dispatch` | scheduler handoff to a worker thread |
+| `<level>.remote_task` | one dispatched frame, served on the peer that received it |
 | `<level>.frame_submit` | local child mailbox-frame publication |
 | `<level>.activate` | prepared-frame activation |
 | `<level>.complete` | terminal child progress handling |
@@ -275,6 +276,22 @@ which every one of those levels runs on:
 Their attributes carry the available `run_id`, `task_slot`, `group_index`,
 `worker_id`, `dispatch_id`, endpoint kind, and the dispatch's pipeline lease
 (`slot_id` / `generation`).
+
+A dispatch to a remote endpoint also carries an `f=<session>:<sequence>` token.
+Both integers use lower-case base36 without leading zeroes. The peer that serves
+that frame writes the same token on its `<level>.remote_task` span. The session
+identifies one endpoint incarnation and the sequence identifies one command in
+that session; `worker_id` remains a separate dispatch attribute and in the wire
+header, where the protocol validates it. Other dispatch fields, including
+`run_id` and `dispatch_id`, are local to the process that wrote them. Local
+mailbox endpoints do not publish a frame and therefore carry no token.
+
+The two values share one token because host-trace attributes have a fixed
+capacity. Separately named fields can be truncated independently and leave a
+misleading partial key; a malformed or truncated joined token is visibly
+incomplete and must be rejected by offline readers. Base36 bounds the complete
+token, including its leading attribute separator, to 30 bytes for the runtime's
+63-bit session identity and the protocol's 64-bit sequence.
 
 `<level>.scheduler_loop` is the exception to that list and to the tree below: a
 loop iteration serves whichever runs were ready, so it belongs to no run and

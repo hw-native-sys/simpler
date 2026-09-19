@@ -367,7 +367,10 @@ private:
 
 class DeterministicProgressEndpoint final : public WorkerEndpoint {
 public:
-    explicit DeterministicProgressEndpoint(int32_t worker_id = 0, uint32_t max_inflight_tasks = 2) {
+    explicit DeterministicProgressEndpoint(
+        int32_t worker_id = 0, uint32_t max_inflight_tasks = 2, std::string frame_attrs = {}
+    ) :
+        frame_attrs_(std::move(frame_attrs)) {
         caps_.worker_id = worker_id;
         caps_.max_inflight_tasks = max_inflight_tasks;
         caps_.supports_frame_staging = true;
@@ -379,6 +382,8 @@ public:
     }
 
     size_t caps_call_count() const { return caps_call_count_.load(std::memory_order_relaxed); }
+
+    std::string progress_frame_attrs() const override { return frame_attrs_; }
 
     void submit_progress(Ring *ring, const WorkerDispatch &dispatch) override {
         ProgressCall call(*this);
@@ -622,6 +627,7 @@ private:
     }
 
     WorkerEndpointCaps caps_;
+    std::string frame_attrs_;
     mutable std::atomic<size_t> caps_call_count_{0};
     mutable std::mutex mu_;
     std::condition_variable cv_;
@@ -1475,13 +1481,15 @@ TEST(WorkerManagerTest, StopBeforeProgressDoesNotActivatePreparedSuccessor) {
 }
 
 TEST(WorkerManagerTest, SubmitExceptionQuiescesEndpointOwnedPublication) {
+    ScopedHostSpanCapture host_span_capture;
+
     Ring allocator;
     allocator.init(/*heap_bytes=*/0);
     TaskSlot slot = make_progress_slot(allocator, /*run_id=*/21, /*pipeline_slot=*/0, /*generation=*/1);
     ASSERT_NE(slot, INVALID_SLOT);
 
     WorkerThread worker;
-    auto endpoint = std::make_unique<DeterministicProgressEndpoint>();
+    auto endpoint = std::make_unique<DeterministicProgressEndpoint>(0, 2, " f=stale");
     DeterministicProgressEndpoint *endpoint_ptr = endpoint.get();
     endpoint_ptr->throw_after_next_submit_publication();
     std::vector<WorkerCompletion> completed;
@@ -1495,6 +1503,11 @@ TEST(WorkerManagerTest, SubmitExceptionQuiescesEndpointOwnedPublication) {
 
     worker.dispatch(WorkerDispatch{slot, 0});
     EXPECT_TRUE(endpoint_ptr->wait_progress_error());
+    EXPECT_EQ(
+        captured_host_span_attrs(simpler::host_trace::host_span_name(simpler::host_trace::HostSpan::Dispatch))
+            .find(" f="),
+        std::string::npos
+    );
     EXPECT_TRUE(completed.empty()) << "endpoint-owned work must terminalize through endpoint progress";
     EXPECT_TRUE(worker.busy());
 

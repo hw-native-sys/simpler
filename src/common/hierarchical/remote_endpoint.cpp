@@ -27,6 +27,7 @@
 #include <cstring>
 #include <cstdint>
 #include <future>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -83,6 +84,17 @@ uint64_t get_u64(const std::vector<uint8_t> &data, size_t &offset) {
     for (int i = 0; i < 8; ++i)
         v |= static_cast<uint64_t>(data[offset++]) << (8 * i);
     return v;
+}
+
+std::string encode_base36(uint64_t value) {
+    static constexpr char digits[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+    std::array<char, 13> encoded{};
+    auto cursor = encoded.end();
+    do {
+        *--cursor = digits[value % 36];
+        value /= 36;
+    } while (value != 0);
+    return {cursor, encoded.end()};
 }
 
 int32_t get_i32(const std::vector<uint8_t> &data, size_t &offset) {
@@ -1329,12 +1341,21 @@ void RemoteL3Endpoint::submit_progress(Ring *ring, const WorkerDispatch &dispatc
         pending_task_.occupied = true;
         pending_task_.dispatch = dispatch;
         pending_task_.sequence = sequence;
+        published_frame_ = {true, session_id_, sequence};
     } catch (...) {
         try {
             command_lane_.finish_reply(sequence);
         } catch (...) {}
         throw;
     }
+}
+
+std::string RemoteL3Endpoint::progress_frame_attrs() const {
+    std::lock_guard<std::mutex> command_lk(command_mu_);
+    if (!published_frame_.valid) return {};
+    std::ostringstream attrs;
+    attrs << " f=" << encode_base36(published_frame_.session_id) << ":" << encode_base36(published_frame_.sequence);
+    return attrs.str();
 }
 
 bool RemoteL3Endpoint::poll_progress(WorkerEndpointProgress &progress) {
