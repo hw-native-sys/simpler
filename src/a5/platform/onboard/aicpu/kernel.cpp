@@ -186,6 +186,7 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_init(void *a
     for (int k = 0; k < DMA_WORKSPACE_KIND_COUNT; ++k) {
         set_dma_workspace_addr(k, init_args->dma_workspace_addr[k]);
     }
+    set_nocache_offset(init_args->l2_cache_offset);
 
     return 0;
 }

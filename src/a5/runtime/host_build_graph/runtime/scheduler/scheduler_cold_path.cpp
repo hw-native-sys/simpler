@@ -15,6 +15,7 @@
 
 #include "assert_compat.h"
 #include "common/unified_log.h"
+#include "aicpu/aicpu_device_config.h"
 #include "aicpu/device_time.h"
 #include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
@@ -945,6 +946,9 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
             // count (and only when a deferred task dirtied it), never per dispatch.
             slab->count = 0;
             slab->error_code = SIMPLER_ERROR_NONE;
+            // Every core, not just the AIV pair the sub_block_id loop above walks:
+            // an AIC kernel bypasses L2 on the same terms as an AIV one.
+            dp.global_context.l2_cache_offset = get_nocache_offset();
             dp.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.local_context);
             dp.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.global_context);
         }

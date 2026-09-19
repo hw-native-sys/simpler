@@ -125,6 +125,12 @@ struct GlobalContext {
     // config into every core's context during cold start.
     // Read via get_dma_workspace(args, kind).
     uint64_t dma_workspace[DMA_WORKSPACE_KIND_COUNT];
+    // Distance from a GM address to its nocache alias on this device, copied from
+    // the resident config during cold start. The device maps each page twice, once
+    // cached and once not, and adding this reaches the uncached mapping, so a load
+    // through it does not allocate in L2. 0 means the device exposes no alias, and
+    // adding 0 leaves the load ordinary. Read via get_l2_cache_offset(args).
+    uint64_t l2_cache_offset;
 };
 
 struct AsyncCtx {
@@ -198,6 +204,29 @@ static __aicore__ inline __gm__ uint8_t *get_dma_workspace(__gm__ int64_t *args,
     __gm__ GlobalContext *ctx =
         reinterpret_cast<__gm__ GlobalContext *>(static_cast<uint64_t>(args[SPMD_GLOBAL_CONTEXT_INDEX]));
     return reinterpret_cast<__gm__ uint8_t *>(ctx->dma_workspace[kind]);
+}
+
+/**
+ * Return the distance from a GM address to its nocache alias on this device.
+ *
+ * The device maps each page twice, once cached and once not. Adding this to a
+ * base address yields the uncached mapping of the same bytes, so a load through
+ * it does not allocate in L2 — for an operand streamed once and never revisited,
+ * that allocation is dead and evicts data which does have reuse.
+ *
+ * Runtime-provided (like get_dma_workspace): the driver owns the value and
+ * reports it per device, so it is never a constant a kernel may bake in. 0 means
+ * this device exposes no alias; adding 0 leaves the address ordinary, so a caller
+ * needs no special case and an unsupported device degrades to a cached load
+ * rather than a wrong one.
+ *
+ * Read it once at kernel entry into a local — each call re-reads GlobalContext
+ * through args, and the value is fixed for the whole dispatch.
+ */
+static __aicore__ inline uint64_t get_l2_cache_offset(__gm__ int64_t *args) {
+    __gm__ GlobalContext *ctx =
+        reinterpret_cast<__gm__ GlobalContext *>(static_cast<uint64_t>(args[SPMD_GLOBAL_CONTEXT_INDEX]));
+    return ctx->l2_cache_offset;
 }
 
 /**

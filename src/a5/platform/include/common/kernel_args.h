@@ -191,6 +191,12 @@ struct InitArgs {
     // Per-engine async-DMA workspace dev addrs -> set_dma_workspace_addr(kind, .);
     // indexed by DmaWorkspaceKind; 0 = that engine unavailable.
     uint64_t dma_workspace_addr[DMA_WORKSPACE_KIND_COUNT]{};
+    // Distance from a GM address to its nocache alias, as the driver reports it
+    // for this device -> set_l2_cache_offset(.). The device maps each page twice,
+    // once cached and once not; `addr + offset` selects the uncached mapping, so
+    // a load through it does not allocate in L2. 0 means the device exposes no
+    // such alias, and `addr + 0` leaves the load ordinary and cached.
+    uint64_t l2_cache_offset{0};
 };
 
 struct AicpuTopologyQueryResult {

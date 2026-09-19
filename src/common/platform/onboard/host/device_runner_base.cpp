@@ -22,7 +22,10 @@
 #include "device_runner_base.h"
 
 #include <runtime/rt.h>
+// rt.h does not pull this in; it declares rtGetL2CacheOffset.
+#include <runtime/rt_preload_task.h>
 #include <acl/acl.h>
+#include <acl/error_codes/rt_error_codes.h>
 #include <dlfcn.h>
 #include <unistd.h>
 
@@ -840,6 +843,37 @@ int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id) {
     return kernel_exec_state_.mark_ready_enqueued();
 }
 
+/**
+ * Distance from a GM address to its nocache alias on `device_id`, or 0.
+ *
+ * The device maps each page twice, once cached and once not, and the driver owns
+ * that layout — so the distance is a per-device value only it can report, never a
+ * constant a caller may bake in. A kernel adds it to a base address to reach the
+ * uncached mapping.
+ *
+ * Every failure yields 0, which is the value that leaves loads cached, because
+ * the kernel's `addr + 0` is the ordinary address. A device without the alias
+ * answers ACL_ERROR_RT_FEATURE_NOT_SUPPORT, and that is not a defect: the alias
+ * is an L2 optimization, so its absence costs bandwidth, not correctness.
+ */
+static uint64_t query_l2_cache_offset(int device_id) {
+    uint64_t offset = 0;
+    const int rc = rtGetL2CacheOffset(static_cast<uint32_t>(device_id), &offset);
+    if (rc == ACL_ERROR_RT_FEATURE_NOT_SUPPORT) {
+        LOG_INFO("query_l2_cache_offset: device %d has no nocache alias; L2 bypass stays a no-op", device_id);
+        return 0;
+    }
+    if (rc != RT_ERROR_NONE) {
+        LOG_WARN(
+            "query_l2_cache_offset: rtGetL2CacheOffset failed: %d (device_id=%d); L2 bypass stays a no-op", rc,
+            device_id
+        );
+        return 0;
+    }
+    LOG_INFO("query_l2_cache_offset: device %d nocache alias offset=0x%llx", device_id, (unsigned long long)offset);
+    return offset;
+}
+
 int DeviceRunnerBase::ensure_aicpu_init_launched(rtStream_t control_stream) {
     if (aicpu_init_launched_) {
         return 0;
@@ -862,6 +896,7 @@ int DeviceRunnerBase::ensure_aicpu_init_launched(rtStream_t control_stream) {
     for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind) {
         init_args.dma_workspace_addr[kind] = dma_workspace_addr_[kind];
     }
+    init_args.l2_cache_offset = query_l2_cache_offset(device_id_);
 
     LOG_INFO("=== launch_aicpu_payload %s ===", host::KernelNames::InitName);
     int rc = launch_aicpu_payload(
