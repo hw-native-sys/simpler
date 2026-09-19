@@ -63,6 +63,9 @@ def _bind_capture_functions(lib):
         "capture_observer_kernel_args": ctypes.c_uint64,
         "capture_observer_runtime_args": ctypes.c_uint64,
         "capture_observer_regs": ctypes.c_uint64,
+        "capture_observer_clears": ctypes.c_uint64,
+        "capture_observer_waits": ctypes.c_uint64,
+        "capture_observer_records": ctypes.c_uint64,
     }.items():
         function = getattr(observer, symbol)
         function.argtypes = []

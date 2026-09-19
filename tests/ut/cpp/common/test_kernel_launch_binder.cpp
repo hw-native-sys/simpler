@@ -153,6 +153,14 @@ TEST(KernelBinder, EveryEnqueueFailurePoisonsWithExactCompensationTrace) {
                 expected.end(), {Cancel, Step::JoinAicore, Step::AicpuDone, Step::JoinAicpu, Step::SerialTail}
             );
         EXPECT_EQ(f.fake.trace, expected);
+        // The handshake clear and the compensating cancel write the same control
+        // word, so both must ride the AICPU stream: one stream's FIFO is the only
+        // thing that orders the cancel after the clear. A caller-stream cancel
+        // reopens the cross-stream race where the clear lands last, resets the
+        // word to zero, and leaves AICore spinning until op-execute timeout.
+        const unsigned expected_memsets = fail < 3 ? 0u : (fail == 7 || fail == 8 ? 2u : 1u);
+        ASSERT_EQ(f.fake.memset_streams.size(), expected_memsets);
+        for (void *stream : f.fake.memset_streams) EXPECT_EQ(stream, f.fake.handles.aicpu);
         EXPECT_TRUE(f.fake.poisoned);
         EXPECT_EQ(f.fake.runtime_error, result.status);
         f.fake.clear_trace();

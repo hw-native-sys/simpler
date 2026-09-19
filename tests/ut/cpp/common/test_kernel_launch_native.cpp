@@ -77,9 +77,9 @@ extern "C" aclError aclrtMemsetAsync(void *address, size_t maximum, int32_t valu
     EXPECT_EQ(address, active->handshake.data());
     EXPECT_EQ(maximum, sizeof(active->handshake));
     EXPECT_EQ(count, maximum);
-    // The handshake clear belongs to the AICPU branch; only the cancel that
-    // compensation issues runs on the caller's stream.
-    EXPECT_EQ(stream, value == 0xff ? ptr(100) : ptr(1));
+    // The handshake clear and the compensating cancel both belong to the AICPU
+    // branch: stream FIFO is what orders the clear before the cancel.
+    EXPECT_EQ(stream, ptr(1));
     active->memset_values.push_back(value);
     return active->fixture.fake.append(value == 0xff ? Cancel : Step::Clear);
 }

@@ -33,6 +33,10 @@ struct Fake {
     int calls{0}, fail_at{0}, second_fail_at{0}, query_error{0}, validation_error{0};
     int queries{0}, acquisitions{0}, finishes{0}, runtime_error{0}, cleanup_error{0};
     std::vector<Step> trace;
+    // Streams the handshake clear and the compensating cancel were issued on, in
+    // call order. The two write the same control word, so the caller pins them
+    // to one stream instead of trusting two streams to interleave safely.
+    std::vector<void *> memset_streams;
     std::promise<void> *entered{nullptr};
     std::shared_future<void> release;
     KernelLaunchHandles handles{nullptr, ptr(1), ptr(2), ptr(3), ptr(4), ptr(5), ptr(6), ptr(7)};
@@ -93,8 +97,10 @@ struct Fake {
                 (void)stream;
                 return f.append(step);
             },
-            [](void *p, void *) noexcept {
-                return static_cast<Fake *>(p)->append(Step::Clear);
+            [](void *p, void *stream) noexcept {
+                auto &f = *static_cast<Fake *>(p);
+                f.memset_streams.push_back(stream);
+                return f.append(Step::Clear);
             },
             [](void *p, void *event, void *) noexcept {
                 return static_cast<Fake *>(p)->append(
@@ -111,13 +117,16 @@ struct Fake {
             [](void *p, void *) noexcept {
                 return static_cast<Fake *>(p)->append(Step::AicoreLaunch);
             },
-            [](void *p, void *) noexcept {
-                return static_cast<Fake *>(p)->append(Cancel);
+            [](void *p, void *stream) noexcept {
+                auto &f = *static_cast<Fake *>(p);
+                f.memset_streams.push_back(stream);
+                return f.append(Cancel);
             }
         };
     }
     void clear_trace() {
         trace.clear();
+        memset_streams.clear();
         calls = 0;
     }
 };

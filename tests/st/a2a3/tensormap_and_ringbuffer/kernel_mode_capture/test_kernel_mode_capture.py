@@ -58,6 +58,7 @@ SCENARIOS = (
     "long_chain",
     "tmr_dag",
     "eager_dag",
+    "launch_fail_compensation",
 )
 
 
@@ -135,6 +136,8 @@ def test_tmr_kernel_mode(st_platform, st_device_ids, scenario, capture_observer)
         assert "PASS close_fail_free retained_then_retried=1" in output
     elif scenario == "init_fail_handshake":
         assert f"PASS {scenario} rejected_after_failure=1 forbidden_sync=0" in output
+    elif scenario == "launch_fail_compensation":
+        assert "PASS launch_fail_compensation compensated=1 forbidden_sync=0" in output
     elif scenario.startswith("eager_") and scenario != "eager_replay":
         assert f"PASS {scenario} eager=100 forbidden_sync=0" in output
     else:
@@ -310,6 +313,59 @@ def _check_init_failure(observer, lib, ctx, prepare, launch):
     # Previously enqueued initialization still belongs to the refused context.
     _check(lib.aclrtSynchronizeDevice(), "external drain before refused-context close")
     assert lib.committed_device_memory_ctx(ctx) == retained
+
+
+def _run_launch_failure(context, observer, launch):
+    """Fail the launch's own AICPU enqueue and require the ladder to finish.
+
+    The one-shot injection makes the sequence's next rtsLaunchCpuKernel return
+    its error — the host-side enqueue failure the compensation exists for, with
+    AICore already launched and polling. The ladder's only exit is then the
+    cancel word: should the handshake clear land on top of it, the core never
+    retires, AicpuDone never reaches the caller, and this bounded sync times out
+    instead of returning.
+    """
+    observer.capture_observer_fail_prepare(1)
+    # The injection is armed by the registration scope; the launch itself still
+    # runs under the sync guard the launch wrapper installs.
+    observer.capture_observer_prepare_scope(1)
+    clears = observer.capture_observer_clears()
+    waits = observer.capture_observer_waits()
+    records = observer.capture_observer_records()
+    try:
+        launch(0, expected=-4333)
+    finally:
+        observer.capture_observer_prepare_scope(0)
+    assert observer.capture_observer_prepare_failures() == 1
+    started = time.monotonic()
+    assert context.lib.aclrtSynchronizeStreamWithTimeout(context.caller, 10000) == 0
+    assert time.monotonic() - started < 9, "the ladder surfaced only through the op-execute timeout"
+    # "The caller's sync returned" proves nothing by itself: the caller stream
+    # only has to carry Start to drain, so a ladder that bailed out at its first
+    # step would still sync clean. Pin the whole compensating ladder instead, so
+    # the cancel cannot go missing unnoticed.
+    issued = observer.capture_observer_clears() - clears
+    assert issued == 3, f"clear+cancel issued {issued} memsets, expected 2 clear regions + 1 cancel"
+    # Start, AicoreStart, AicoreDone, AicpuDone, SerialTail. JoinAicpu reaching
+    # SerialTail is what proves AICore reported done, i.e. the cancel retired it.
+    seen = observer.capture_observer_records() - records
+    assert seen == 5, f"launch recorded {seen} events, expected 5"
+    # AicpuWait(Start), AicoreWait(AicoreStart), JoinAicore(AicoreDone),
+    # JoinAicpu(AicpuDone).
+    seen = observer.capture_observer_waits() - waits
+    assert seen == 4, f"launch issued {seen} event waits, expected 4"
+
+
+def _run_compensation(context, prepare, launch, allocations, streams, device):
+    """Own the whole launch_fail_compensation scenario, teardown included.
+
+    `_run` sits at pylint's statement ceiling, so the scenario body and its
+    close live here instead of in the scenario table.
+    """
+    prepare(0)
+    _run_launch_failure(context, context.observer, launch)
+    _close(context.lib, context.handle, allocations, streams, device)
+    print("PASS launch_fail_compensation compensated=1 forbidden_sync=0", flush=True)
 
 
 def _seed_tensors(io, chips):
@@ -723,6 +779,11 @@ def _run(device, scenario, build_dir):
             _close(lib, ctx, allocations, streams, device)
             print(f"PASS {scenario} rejected_after_failure=1 forbidden_sync=0", flush=True)
             return
+        if scenario == "launch_fail_compensation":
+            # `return` carries the call so this branch costs two statements:
+            # `_run` sits at pylint's max-statements ceiling. Do not split it
+            # back into "call; return" without giving `_run` a statement back.
+            return _run_compensation(context, prepare, launch, allocations, streams, device)
         caller = _configure(context, scenario, prepare, launch, sync, io, pairs, initial)
         context.caller = caller
         committed = lib.committed_device_memory_ctx(ctx)

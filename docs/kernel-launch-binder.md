@@ -85,9 +85,10 @@ AicoreDone already recorded. Both then drive the chain back to the caller —
 AICPU waits AicoreDone, records AicpuDone, the caller waits it and records
 SerialTail — because AicpuDone is the caller's only path to a tail.
 Cancellation is one all-ones async fill of the prepared 32-bit cancel words,
-publishing `UINT32_MAX`, issued on the caller's stream, which carries nothing
-but Start at that point. After successful AICPU launch, stop on errors without
-Host cancel.
+publishing `UINT32_MAX`, issued on the AICPU stream behind the handshake clear
+so that stream's order places the cancel after that clear: the clear zeroes the
+word the cancel sets, and the core spins until it reads non-zero. After
+successful AICPU launch, stop on errors without Host cancel.
 
 Compensation stops on its first error. `cleanup_status` never replaces the
 original `status`, and `tail_recorded` identifies whether a tail was established.

@@ -37,7 +37,11 @@ enqueue_kernel_launch_sequence(const KernelLaunchOps &ops, const KernelLaunchHan
             result.cleanup_status = rc;
             return false;
         };
-        if (!cleanup(ops.cancel_waiting_aicore(ops.context, h.caller))) return;
+        // Cancellation and the handshake clear write the same control word, so
+        // they must share a stream: FIFO is what orders the cancel after the
+        // clear. Across two streams the clear can land last, reset the cancel,
+        // and leave AICore spinning before its register window opens.
+        if (!cleanup(ops.cancel_waiting_aicore(ops.context, h.aicpu))) return;
         if (retry_core_done && !cleanup(ops.record_event(ops.context, h.aicore_done, h.aicore))) return;
         if (!cleanup(ops.wait_event(ops.context, h.aicpu, h.aicore_done))) return;
         if (!cleanup(ops.record_event(ops.context, h.aicpu_done, h.aicpu))) return;
