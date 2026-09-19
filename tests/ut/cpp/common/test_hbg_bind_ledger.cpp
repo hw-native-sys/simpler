@@ -47,6 +47,7 @@
 #include "host_build_graph/orchestrator.h"
 #include "task_args.h"
 #include "host/host_phase_records.h"
+#include "host/platform_compile_info.h"
 #include "worker/runtime_c_api.h"
 
 extern "C" int bind_callable_to_runtime_impl(
@@ -272,6 +273,21 @@ void recording_orch_entry(const ChipTaskArgs &) {
     ASSERT_TRUE(orch.submit_dummy_task(task).task_id().is_valid());
     ASSERT_TRUE(orch.graph_end());
     orch.graph_commit();
+}
+
+void ordinary_orch_entry(const ChipTaskArgs &) {
+    CoreTaskArgs args;
+    MixedKernels kernels{};
+    kernels.aiv0_kernel_id = 0;
+    ASSERT_TRUE(g_orch_runtime->orchestrator->submit_task(kernels, args).task_id().is_valid());
+}
+
+void mixed_orch_entry(const ChipTaskArgs &) {
+    CoreTaskArgs args;
+    MixedKernels kernels{};
+    kernels.aic_kernel_id = 0;
+    kernels.aiv0_kernel_id = 0;
+    ASSERT_TRUE(g_orch_runtime->orchestrator->submit_task(kernels, args).task_id().is_valid());
 }
 
 void host_get_set_orch_entry(const ChipTaskArgs &args) {
@@ -787,6 +803,154 @@ TEST_F(HbgBindLedgerTest, AllMetadataSourcesSurviveBindAndPublishInOrder) {
     EXPECT_NE(publish_run_image_impl(&runtime, &api_), 0);
     EXPECT_EQ(fake_.copies.size(), 2u);
     EXPECT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+}
+
+TEST_F(HbgBindLedgerTest, SchedulerModeChangesPublishOnlyThisRunsSources) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto cleanup = cleanup_runtime(runtime);
+    auto callable = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0);
+    reinterpret_cast<CoreCallable *>(callable.data())->set_resolved_addr(0x1000);
+    runtime.replay_function_bin_addr(0, reinterpret_cast<uint64_t>(callable.data()));
+    const bool a5 = std::strcmp(get_platform(), "a5sim") == 0;
+    uint32_t resident_mode = 0;
+    uint32_t graph_mode = 0;
+    // A5 selects resident for ordinary tasks and legacy for GRAPH/MIX. A2/A3
+    // uses AICPU scheduling throughout, with no resident scheduler region.
+    for (TestOrchEntryFunc entry : {ordinary_orch_entry, recording_orch_entry, mixed_orch_entry, ordinary_orch_entry}) {
+        SCOPED_TRACE(entry == recording_orch_entry ? "graph" : entry == mixed_orch_entry ? "mixed" : "ordinary");
+        const bool resident = a5 && entry == ordinary_orch_entry;
+        const bool definitions = entry == recording_orch_entry;
+        fake_.copy_count = 0;
+        fake_.copies.clear();
+        eps_ = {entry, capture_orch_bind};
+        ChipStorageTaskArgs args;
+        ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+        EXPECT_EQ(fake_.copy_count, 0);
+        const auto &pending = runtime.pending_publication();
+        ASSERT_EQ(pending.prerequisites.size(), static_cast<size_t>(resident) + static_cast<size_t>(definitions));
+        std::vector<void *> destinations;
+        std::vector<std::vector<uint8_t>> snapshots;
+        for (const auto &region : pending.prerequisites) {
+            EXPECT_EQ(region.phase, definitions ? HostPhaseKind::BindGraphUpload : HostPhaseKind::Count);
+            destinations.push_back(region.device_target);
+            const auto *source = static_cast<const uint8_t *>(region.source);
+            snapshots.emplace_back(source, source + region.bytes);
+        }
+        if (a5) {
+            for (int i = 0; i < runtime.get_worker_count(); ++i) {
+                const uint64_t address = runtime.dev.workers[i].task;
+                const uint32_t mode = runtime.dev.workers[i].aicpu_ready;
+                EXPECT_NE(mode, 0u);
+                if (resident) {
+                    if (resident_mode == 0) resident_mode = mode;
+                    EXPECT_EQ(mode, resident_mode);
+                    const auto &scheduler = pending.prerequisites.front();
+                    EXPECT_GE(address, reinterpret_cast<uint64_t>(scheduler.device_target));
+                    EXPECT_LT(address, reinterpret_cast<uint64_t>(scheduler.device_target) + scheduler.bytes);
+                } else {
+                    EXPECT_EQ(address, 0u) << "legacy launch must not borrow a previous scheduler";
+                    EXPECT_NE(mode, resident_mode);
+                    if (definitions) {
+                        if (graph_mode == 0) graph_mode = mode;
+                        EXPECT_EQ(mode, graph_mode);
+                    } else {
+                        EXPECT_NE(mode, graph_mode);
+                    }
+                }
+            }
+        }
+        destinations.push_back(pending.device_target);
+        const auto *source = static_cast<const uint8_t *>(pending.source);
+        snapshots.emplace_back(source, source + pending.bytes);
+        ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
+        ASSERT_EQ(fake_.copies.size(), snapshots.size());
+        for (size_t i = 0; i < snapshots.size(); ++i) {
+            EXPECT_EQ(fake_.copies[i].dst, destinations[i]);
+            EXPECT_EQ(fake_.copies[i].bytes, snapshots[i].size());
+            EXPECT_EQ(std::memcmp(destinations[i], snapshots[i].data(), snapshots[i].size()), 0);
+        }
+        EXPECT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+        EXPECT_TRUE(fake_.live.empty());
+        EXPECT_TRUE(runtime.pending_publication().prerequisites.empty());
+        if (a5) {
+            for (int i = 0; i < runtime.get_worker_count(); ++i) {
+                EXPECT_EQ(runtime.dev.workers[i].task, 0u);
+                EXPECT_EQ(runtime.dev.workers[i].aicpu_ready, 0u);
+            }
+        }
+    }
+}
+
+TEST_F(HbgBindLedgerTest, SchedulerPublicationFailureAllowsFreshModeSelection) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto cleanup = cleanup_runtime(runtime);
+    auto callable = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0);
+    reinterpret_cast<CoreCallable *>(callable.data())->set_resolved_addr(0x1000);
+    runtime.replay_function_bin_addr(0, reinterpret_cast<uint64_t>(callable.data()));
+    const bool a5 = std::strcmp(get_platform(), "a5sim") == 0;
+    for (TestOrchEntryFunc entry : {ordinary_orch_entry, recording_orch_entry, mixed_orch_entry}) {
+        SCOPED_TRACE(entry == recording_orch_entry ? "graph" : entry == mixed_orch_entry ? "mixed" : "ordinary");
+        const size_t regions = 1 + static_cast<size_t>(entry == recording_orch_entry) +
+                               static_cast<size_t>(a5 && entry == ordinary_orch_entry);
+        for (size_t failure = 1; failure <= regions; ++failure) {
+            SCOPED_TRACE(failure);
+            fake_.copy_count = 0;
+            fake_.copies.clear();
+            eps_ = {entry, capture_orch_bind};
+            ChipStorageTaskArgs args;
+            ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+            ASSERT_EQ(runtime.pending_publication().prerequisites.size() + 1, regions);
+            const uint32_t failed_mode = runtime.dev.workers[0].aicpu_ready;
+            fake_.fail_copy_on = static_cast<int>(failure);
+            EXPECT_NE(publish_run_image_impl(&runtime, &api_), 0);
+            EXPECT_EQ(fake_.copy_count, failure);
+            EXPECT_EQ(fake_.copies.size(), failure - 1);
+            EXPECT_EQ(runtime.pending_publication().bytes, 0u);
+            EXPECT_TRUE(runtime.pending_publication().prerequisites.empty());
+            EXPECT_NE(publish_run_image_impl(&runtime, &api_), 0);
+            EXPECT_EQ(fake_.copy_count, failure);
+            ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+            EXPECT_TRUE(fake_.live.empty());
+            if (a5) {
+                for (int i = 0; i < runtime.get_worker_count(); ++i) {
+                    EXPECT_EQ(runtime.dev.workers[i].task, 0u);
+                    EXPECT_EQ(runtime.dev.workers[i].aicpu_ready, 0u);
+                }
+            }
+            fake_.fail_copy_on = 0;
+            const bool definitions = entry == ordinary_orch_entry;
+            const bool resident = a5 && !definitions;
+            eps_ = {definitions ? recording_orch_entry : ordinary_orch_entry, capture_orch_bind};
+            ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+            const auto &replacement = runtime.pending_publication();
+            ASSERT_EQ(
+                replacement.prerequisites.size(), static_cast<size_t>(resident) + static_cast<size_t>(definitions)
+            );
+            for (const auto &region : replacement.prerequisites) {
+                EXPECT_EQ(region.phase, definitions ? HostPhaseKind::BindGraphUpload : HostPhaseKind::Count);
+            }
+            if (a5) {
+                for (int i = 0; i < runtime.get_worker_count(); ++i) {
+                    const uint64_t address = runtime.dev.workers[i].task;
+                    const uint32_t mode = runtime.dev.workers[i].aicpu_ready;
+                    EXPECT_NE(mode, 0u);
+                    EXPECT_NE(mode, failed_mode);
+                    if (resident) {
+                        const auto &scheduler = replacement.prerequisites.front();
+                        EXPECT_GE(address, reinterpret_cast<uint64_t>(scheduler.device_target));
+                        EXPECT_LT(address, reinterpret_cast<uint64_t>(scheduler.device_target) + scheduler.bytes);
+                    } else {
+                        EXPECT_EQ(address, 0u) << "legacy call must not reuse the failed scheduler";
+                    }
+                }
+            }
+            ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
+            ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+            EXPECT_TRUE(fake_.live.empty());
+        }
+    }
 }
 
 TEST_F(HbgBindLedgerTest, HostGetSetCompletesBeforeMetadataPublication) {
