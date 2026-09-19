@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 
 #include "common/platform_config.h"
+#include "common/kernel_args.h"
 #include "host/runtime_timeout_config.h"
 
 namespace {
@@ -47,15 +48,18 @@ public:
         save(SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV, op_);
         save(SIMPLER_STREAM_SYNC_TIMEOUT_MS_ENV, stream_);
         save(SIMPLER_SCHEDULER_TIMEOUT_MS_ENV, scheduler_);
+        save(SIMPLER_TENSOR_DATA_TIMEOUT_MS_ENV, tensor_);
         unset_env_var(SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV);
         unset_env_var(SIMPLER_STREAM_SYNC_TIMEOUT_MS_ENV);
         unset_env_var(SIMPLER_SCHEDULER_TIMEOUT_MS_ENV);
+        unset_env_var(SIMPLER_TENSOR_DATA_TIMEOUT_MS_ENV);
     }
 
     ~ScopedUnsetTimeoutEnv() {
         restore(SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV, op_);
         restore(SIMPLER_STREAM_SYNC_TIMEOUT_MS_ENV, stream_);
         restore(SIMPLER_SCHEDULER_TIMEOUT_MS_ENV, scheduler_);
+        restore(SIMPLER_TENSOR_DATA_TIMEOUT_MS_ENV, tensor_);
     }
 
 private:
@@ -83,6 +87,7 @@ private:
     SavedValue op_;
     SavedValue stream_;
     SavedValue scheduler_;
+    SavedValue tensor_;
 };
 
 }  // namespace
@@ -186,4 +191,55 @@ TEST(RuntimeTimeoutConfig, SimPlatformSkipsOnboardOrdering) {
         validate_runtime_timeout_order_for_platform(cfg, "a5"),
         RuntimeTimeoutOrderStatus::SCHEDULER_NOT_BELOW_OP_EXECUTE
     );
+}
+
+TEST(RuntimeTimeoutConfig, TensorDefaultsAndWireLayout) {
+    ScopedUnsetTimeoutEnv env;
+    EXPECT_EQ(resolve_runtime_timeout_config(kDefaults).tensor_data_timeout_ms, 15000);
+    auto sim = kDefaults;
+    sim.tensor_data_timeout_ms = SIM_TENSOR_DATA_TIMEOUT_MS;
+    EXPECT_EQ(resolve_runtime_timeout_config(sim).tensor_data_timeout_ms, 30000);
+    EXPECT_EQ(offsetof(InitArgs, tensor_data_timeout_ms), 12u);
+    EXPECT_EQ(offsetof(InitArgs, dma_workspace_addr), 16u);
+    EXPECT_EQ(sizeof(InitArgs), 16u + sizeof(InitArgs::dma_workspace_addr));
+}
+
+TEST(RuntimeTimeoutConfig, TensorOverrideIsIndependentOfSchedulerOrdering) {
+    ScopedUnsetTimeoutEnv env;
+    set_env_var(SIMPLER_TENSOR_DATA_TIMEOUT_MS_ENV, " 60000 ");
+    set_env_var(SIMPLER_SCHEDULER_TIMEOUT_MS_ENV, "90000");
+    RuntimeTimeoutParseStatus status;
+    const auto cfg = resolve_runtime_timeout_config(kDefaults, &status);
+    EXPECT_TRUE(status.tensor_data_env_set);
+    EXPECT_TRUE(status.tensor_data_valid);
+    EXPECT_EQ(cfg.tensor_data_timeout_ms, 60000);
+    EXPECT_EQ(validate_runtime_timeout_order(cfg), RuntimeTimeoutOrderStatus::SCHEDULER_NOT_BELOW_OP_EXECUTE);
+}
+
+TEST(RuntimeTimeoutConfig, InvalidTensorValuesKeepBackendDefault) {
+    ScopedUnsetTimeoutEnv env;
+    for (const char *raw : {"", "0", "-1", "1.5", "bad", "2147483648", "18446744073709551616"}) {
+        SCOPED_TRACE(raw);
+        set_env_var(SIMPLER_TENSOR_DATA_TIMEOUT_MS_ENV, raw);
+        for (int default_ms : {TENSOR_DATA_TIMEOUT_MS, SIM_TENSOR_DATA_TIMEOUT_MS}) {
+            auto defaults = kDefaults;
+            defaults.tensor_data_timeout_ms = default_ms;
+            RuntimeTimeoutParseStatus status;
+            const auto cfg = resolve_runtime_timeout_config(defaults, &status);
+            EXPECT_TRUE(status.tensor_data_env_set);
+            EXPECT_FALSE(status.tensor_data_valid);
+            EXPECT_EQ(cfg.tensor_data_timeout_ms, default_ms);
+        }
+    }
+}
+
+TEST(RuntimeTimeoutConfig, TensorBoundsAreAccepted) {
+    ScopedUnsetTimeoutEnv env;
+    for (const char *raw : {"1", "2147483647"}) {
+        set_env_var(SIMPLER_TENSOR_DATA_TIMEOUT_MS_ENV, raw);
+        RuntimeTimeoutParseStatus status;
+        const auto cfg = resolve_runtime_timeout_config(kDefaults, &status);
+        EXPECT_TRUE(status.tensor_data_valid);
+        EXPECT_EQ(cfg.tensor_data_timeout_ms, std::stoi(raw));
+    }
 }

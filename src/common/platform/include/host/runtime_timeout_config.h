@@ -20,9 +20,12 @@
 #include <limits>
 #include <string>
 
+#include "common/tensor_data_timeout.h"
+
 constexpr const char *SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV = "SIMPLER_OP_EXECUTE_TIMEOUT_US";
 constexpr const char *SIMPLER_STREAM_SYNC_TIMEOUT_MS_ENV = "SIMPLER_STREAM_SYNC_TIMEOUT_MS";
 constexpr const char *SIMPLER_SCHEDULER_TIMEOUT_MS_ENV = "SIMPLER_SCHEDULER_TIMEOUT_MS";
+constexpr const char *SIMPLER_TENSOR_DATA_TIMEOUT_MS_ENV = "SIMPLER_TENSOR_DATA_TIMEOUT_MS";
 
 // Covers the host stream-sync window before the AICPU scheduler no-progress
 // timer is armed: cold kernel registration, orchestration SO dlopen, runtime
@@ -35,6 +38,7 @@ struct RuntimeTimeoutConfig {
     uint64_t op_execute_timeout_us;
     int32_t stream_sync_timeout_ms;
     int32_t scheduler_timeout_ms;
+    int32_t tensor_data_timeout_ms{TENSOR_DATA_TIMEOUT_MS};
 };
 
 struct HostRuntimeTimeoutConfig {
@@ -44,6 +48,7 @@ struct HostRuntimeTimeoutConfig {
     // override" — the device falls back to its compile-time default
     // (SCHEDULER_TIMEOUT_CYCLES). Latched once per device into InitArgs.
     int32_t scheduler_timeout_ms{0};
+    int32_t tensor_data_timeout_ms{TENSOR_DATA_TIMEOUT_MS};
 };
 
 struct RuntimeTimeoutParseStatus {
@@ -53,6 +58,8 @@ struct RuntimeTimeoutParseStatus {
     bool stream_sync_valid{true};
     bool scheduler_env_set{false};
     bool scheduler_valid{true};
+    bool tensor_data_env_set{false};
+    bool tensor_data_valid{true};
 };
 
 enum class RuntimeTimeoutOrderStatus {
@@ -170,6 +177,15 @@ resolve_runtime_timeout_config(const RuntimeTimeoutConfig &defaults, RuntimeTime
             &cfg.scheduler_timeout_ms
         );
         if (status != nullptr) status->scheduler_valid = ok;
+    }
+    const char *tensor_env = std::getenv(SIMPLER_TENSOR_DATA_TIMEOUT_MS_ENV);
+    if (tensor_env != nullptr) {
+        if (status != nullptr) status->tensor_data_env_set = true;
+        bool ok = apply_runtime_timeout_override(
+            SIMPLER_TENSOR_DATA_TIMEOUT_MS_ENV, tensor_env, 1,
+            static_cast<uint64_t>(std::numeric_limits<int32_t>::max()), &cfg.tensor_data_timeout_ms
+        );
+        if (status != nullptr) status->tensor_data_valid = ok;
     }
     return cfg;
 }

@@ -194,9 +194,10 @@ inline void fill_arch_launch_args(AicoreLaunchArgs &args, const KernelArgs &k_ar
  * change that publication protocol rather than just host-side ownership.
  */
 struct InitArgs {
-    uint32_t device_id{0};            // ACL device ordinal -> set_orch_device_id
-    uint32_t log_level{25};           // Threshold: DEBUG=10, INFO=20, TIMING=25, WARN=30, ERROR=40, NUL=60
-    int32_t scheduler_timeout_ms{0};  // AICPU no-progress watchdog (ms); 0 -> compile default
+    uint32_t device_id{0};              // ACL device ordinal -> set_orch_device_id
+    uint32_t log_level{25};             // Threshold: DEBUG=10, INFO=20, TIMING=25, WARN=30, ERROR=40, NUL=60
+    int32_t scheduler_timeout_ms{0};    // AICPU no-progress watchdog (ms); 0 -> compile default
+    int32_t tensor_data_timeout_ms{0};  // Per-dependency wait (ms); 0 -> runtime default
     // Per-engine async-DMA workspace dev addrs -> set_dma_workspace_addr(kind, .);
     // indexed by DmaWorkspaceKind; 0 = that engine unavailable.
     uint64_t dma_workspace_addr[DMA_WORKSPACE_KIND_COUNT]{};

@@ -55,14 +55,19 @@ export ASCEND_PROCESS_LOG_PATH="$LOGDIR"
 
 The timeouts are compile-time defaults — op-execute 45 s, stream-sync 50 s,
 scheduler 20 s — and all three are environment-overridable, with the ordering
-between them validated at startup. Raising them is how you tell "genuinely
-hung" from "legitimately long":
+between them validated at startup. Increase them together when checking whether
+a workload can complete with a larger budget. For a deliberately short onboard
+failure window instead, use this valid ordering:
 
 ```bash
-export SIMPLER_SCHEDULER_TIMEOUT_MS=5000
+export SIMPLER_SCHEDULER_TIMEOUT_MS=2000
 export SIMPLER_OP_EXECUTE_TIMEOUT_US=3000000
 export SIMPLER_STREAM_SYNC_TIMEOUT_MS=4000
 ```
+
+For scalar tensor waits (code 8), `tensormap_and_ringbuffer` has a separate
+`SIMPLER_TENSOR_DATA_TIMEOUT_MS` budget: 30 s in sim, 15 s onboard by default.
+Set it before `Worker.init()`. Raising it does not extend the outer watchdogs.
 
 See [local-timeout-defaults](../../troubleshooting/local-timeout-defaults.md).
 Note CI runs deliberately short timeouts, so a CI failure should be read against

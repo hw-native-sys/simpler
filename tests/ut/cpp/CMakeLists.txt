@@ -417,6 +417,25 @@ endfunction()
 
 enable_testing()
 
+foreach(arch a2a3 a5)
+    set(wait_test test_${arch}_tensor_data_wait)
+    if(arch STREQUAL "a2a3")
+        add_a2a3_orchestrator_runtime_test(${wait_test} common/test_tensor_data_wait.cpp)
+        set(wait_runtime_dir ${A2A3_RUNTIME_DIR})
+    else()
+        add_a5_orchestrator_runtime_test(${wait_test} common/test_tensor_data_wait.cpp)
+        set(wait_runtime_dir ${A5_RUNTIME_DIR})
+    endif()
+    target_sources(${wait_test} PRIVATE
+        ${wait_runtime_dir}/runtime_core.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/aicpu_device_config.cpp
+    )
+    add_test(NAME ${wait_test}_onboard COMMAND ${wait_test} 15)
+    add_test(NAME ${wait_test}_default COMMAND ${wait_test} 0)
+    set_tests_properties(${wait_test} ${wait_test}_onboard ${wait_test}_default
+        PROPERTIES TIMEOUT 30 LABELS "no_hardware")
+endforeach()
+
 foreach(runtime tensormap_and_ringbuffer host_build_graph)
     set(retirement_test test_a2a3_${runtime}_retirement)
     add_executable(${retirement_test}

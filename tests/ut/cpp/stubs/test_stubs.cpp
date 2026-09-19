@@ -84,7 +84,13 @@ void unified_log_debug(const char * /* func */, const char * /* fmt */, ...) {
 // device_time.h stub
 // =============================================================================
 
+// Deadline tests replace the clock without sleeping.
+static uint64_t (*test_clock)() = nullptr;
+
+void set_test_clock(uint64_t (*clock)()) { test_clock = clock; }
+
 uint64_t get_sys_cnt_aicpu() {
+    if (test_clock != nullptr) return test_clock();
     auto now = std::chrono::steady_clock::now();
     uint64_t elapsed_ns =
         static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());

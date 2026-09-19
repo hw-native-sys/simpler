@@ -17,6 +17,7 @@ namespace {
 // survives per-task launches because the inner SO stays dlopen'd.
 int g_orch_device_id = 0;
 int g_scheduler_timeout_ms = 0;
+int g_tensor_data_timeout_ms = 0;
 unsigned long long g_dma_workspace_addr[DMA_WORKSPACE_KIND_COUNT] = {0};
 }  // namespace
 
@@ -27,6 +28,10 @@ int get_orch_device_id() { return g_orch_device_id; }
 void set_scheduler_timeout_ms(int timeout_ms) { g_scheduler_timeout_ms = timeout_ms; }
 
 int get_scheduler_timeout_ms() { return g_scheduler_timeout_ms; }
+
+void set_tensor_data_timeout_ms(int timeout_ms) { g_tensor_data_timeout_ms = timeout_ms; }
+
+int get_tensor_data_timeout_ms() { return g_tensor_data_timeout_ms; }
 
 void set_dma_workspace_addr(int kind, unsigned long long addr) {
     if (kind < 0 || kind >= DMA_WORKSPACE_KIND_COUNT) return;

@@ -172,18 +172,23 @@ int DeviceRunner::ensure_binaries_loaded() {
             return PTO_RUNTIME_ERR_INTERNAL;
         load_optional_sym("set_orch_device_id", reinterpret_cast<void **>(&set_orch_device_id_func_));
         load_optional_sym("set_scheduler_timeout_ms", reinterpret_cast<void **>(&set_scheduler_timeout_ms_func_));
+        // Latch both budgets when this resident SO is first loaded.
+        RuntimeTimeoutParseStatus status;
+        const auto cfg =
+            resolve_runtime_timeout_config(RuntimeTimeoutConfig{1, 1, 0, SIM_TENSOR_DATA_TIMEOUT_MS}, &status);
         if (set_scheduler_timeout_ms_func_ != nullptr) {
-            // Per-device one-shot latch (mirrors the onboard InitArgs path):
-            // honor SIMPLER_SCHEDULER_TIMEOUT_MS once at SO load, not per run. 0 ->
-            // the scheduler keeps its compile-time default. Sim skips the
-            // op/stream ordering check (validate_runtime_timeout_order is onboard).
-            RuntimeTimeoutParseStatus sched_status;
-            RuntimeTimeoutConfig sched_cfg =
-                resolve_runtime_timeout_config(RuntimeTimeoutConfig{1, 1, 0}, &sched_status);
             set_scheduler_timeout_ms_func_(
-                (sched_status.scheduler_env_set && sched_status.scheduler_valid) ? sched_cfg.scheduler_timeout_ms : 0
+                (status.scheduler_env_set && status.scheduler_valid) ? cfg.scheduler_timeout_ms : 0
             );
         }
+        void (*set_tensor_timeout)(int) = nullptr;
+        if (!load_sym("set_tensor_data_timeout_ms", reinterpret_cast<void **>(&set_tensor_timeout)))
+            return PTO_RUNTIME_ERR_INTERNAL;
+        if (status.tensor_data_env_set && !status.tensor_data_valid) {
+            LOG_WARN("Invalid %s; using %d ms", SIMPLER_TENSOR_DATA_TIMEOUT_MS_ENV, cfg.tensor_data_timeout_ms);
+        }
+        LOG_INFO("Tensor data wait timeout: %d ms", cfg.tensor_data_timeout_ms);
+        set_tensor_timeout(cfg.tensor_data_timeout_ms);
         if (!load_sym("set_platform_dump_base", reinterpret_cast<void **>(&set_platform_dump_base_func_)))
             return PTO_RUNTIME_ERR_INTERNAL;
         if (!load_sym("set_platform_phase_base", reinterpret_cast<void **>(&set_platform_phase_base_func_)))

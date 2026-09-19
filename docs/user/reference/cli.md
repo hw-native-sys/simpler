@@ -79,12 +79,14 @@ python -m simpler_setup.tools.swimlane_converter <chip_swimlane_records_*.json>
 | `SIMPLER_OP_EXECUTE_TIMEOUT_US` | Overrides the op-execute timeout (default 45 s) |
 | `SIMPLER_STREAM_SYNC_TIMEOUT_MS` | Overrides the stream-sync timeout (default 50 s) |
 | `SIMPLER_SCHEDULER_TIMEOUT_MS` | Overrides the scheduler timeout (default 20 s) |
+| `SIMPLER_TENSOR_DATA_TIMEOUT_MS` | Per-producer/consumer scalar-wait budget: default 30 s in sim, 15 s onboard; positive milliseconds, latched at Worker init |
 | `ASCEND_PROCESS_LOG_PATH` | Redirects the device log into a directory you own; the directory must already exist |
 | `ASCEND_HOME_PATH` | CANN toolkit location; required for hardware platforms |
 
-The three timeouts are validated against each other at startup, and CI runs
-deliberately shorter values than the defaults — read a CI timeout against the CI
-values. Details in
+Onboard, scheduler/op-execute/stream-sync ordering is validated at startup. The
+tensor-data budget is independent and applies to `tensormap_and_ringbuffer`.
+CI shortens the outer watchdogs; read a CI timeout against the configured values.
+Details in
 [local-timeout-defaults](../../troubleshooting/local-timeout-defaults.md).
 
 ## See also

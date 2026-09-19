@@ -50,6 +50,12 @@ void set_scheduler_timeout_ms(int timeout_ms);
 /** Get the scheduler watchdog timeout override in ms (0 if unset). */
 int get_scheduler_timeout_ms();
 
+// Set once at device initialization, independently of the scheduler watchdog.
+// Host sends a positive budget for its backend. An unset device value (zero)
+// falls back to 15000 ms in the runtime; it does not disable the deadline.
+void set_tensor_data_timeout_ms(int timeout_ms);
+int get_tensor_data_timeout_ms();
+
 /**
  * Set the device address of the per-device async-DMA workspace for one engine
  * kind (see DmaWorkspaceKind). Published by simpler_aicpu_init (from

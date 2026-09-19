@@ -98,6 +98,11 @@ HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
         );
     }
 
+    if (parse_status.tensor_data_env_set && !parse_status.tensor_data_valid) {
+        LOG_WARN("Invalid %s; using %d ms", SIMPLER_TENSOR_DATA_TIMEOUT_MS_ENV, cfg.tensor_data_timeout_ms);
+    }
+    LOG_INFO("Tensor data wait timeout: %d ms", cfg.tensor_data_timeout_ms);
+
     bool host_timeout_env_set =
         parse_status.op_execute_env_set || parse_status.stream_sync_env_set || parse_status.scheduler_env_set;
     RuntimeTimeoutOrderStatus order_status = validate_runtime_timeout_order(cfg);
@@ -111,15 +116,19 @@ HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
                                      0;
     if (host_timeout_env_set && order_status != RuntimeTimeoutOrderStatus::OK) {
         LOG_WARN(
-            "Ignoring timeout env overrides: %s (scheduler=%d ms, op_execute=%llu us, stream_sync=%d ms)",
+            "Ignoring scheduler/op/stream timeout env overrides: %s (scheduler=%d ms, op_execute=%llu us, "
+            "stream_sync=%d ms)",
             runtime_timeout_order_status_name(order_status), cfg.scheduler_timeout_ms,
             (unsigned long long)cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms
         );
         return HostRuntimeTimeoutConfig{
-            order_defaults.op_execute_timeout_us, order_defaults.stream_sync_timeout_ms, scheduler_override
+            order_defaults.op_execute_timeout_us, order_defaults.stream_sync_timeout_ms, scheduler_override,
+            cfg.tensor_data_timeout_ms
         };
     }
-    return HostRuntimeTimeoutConfig{cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms, scheduler_override};
+    return HostRuntimeTimeoutConfig{
+        cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms, scheduler_override, cfg.tensor_data_timeout_ms
+    };
 }
 
 /**
@@ -855,6 +864,7 @@ int DeviceRunnerBase::ensure_aicpu_init_launched(rtStream_t control_stream) {
     // Per-device scheduler watchdog override, resolved once at attach into
     // timeout_config_. 0 -> the AICPU scheduler keeps its compile-time default.
     init_args.scheduler_timeout_ms = timeout_config_.scheduler_timeout_ms;
+    init_args.tensor_data_timeout_ms = timeout_config_.tensor_data_timeout_ms;
     // Publish the provisioned async-DMA workspace addresses (all-zero unless the
     // Worker opted into SDMA). ensure_dma_workspace_provisioned() runs first, so
     // this single launch carries them; the AICPU SO stays resident, and the

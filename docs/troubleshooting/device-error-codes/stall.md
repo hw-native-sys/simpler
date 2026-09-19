@@ -18,7 +18,7 @@ the technique transfers:
 - To make the **scheduler** win (get a `sub_class`), squeeze it below the others:
   `SCHEDULER=2000ms < OP_EXECUTE=3s < STREAM_SYNC=4000ms` (`aicore_hang` case).
 - To let a **slow-but-alive** path finish, push the others out of the way:
-  `SCHEDULER=30000ms`, `OP_EXECUTE=30s`, `STREAM_SYNC=40000ms` — this is how the
+  `SCHEDULER=30000ms`, `OP_EXECUTE=35s`, `STREAM_SYNC=40000ms` — this is how the
   `tensor_wait_timeout` case lets the 15 s tensor-data wait land code 8 instead of
   being reaped first.
 
@@ -62,10 +62,14 @@ exist) before reading. See the "Device logs" section of
 
 ## Code 8, specifically
 
-Only `tensormap_and_ringbuffer` raises this code. Its tensor-data wait defaults to
-15 s (`TENSOR_DATA_TIMEOUT_MS`, frequency-scaled). It means either the producer
-never completed, or a consumer never
-released its fanout reference. Check for a hung producer first (that is S1 above),
+Only `tensormap_and_ringbuffer` raises this code. On both A2A3 and A5 its
+tensor-data wait defaults to 30 s in CPU simulation and 15 s onboard. Set
+`SIMPLER_TENSOR_DATA_TIMEOUT_MS` before `Worker.init()` to override it; zero is
+invalid and does not disable the timeout. Each producer wait, and each subsequent
+consumer wait for writes, has its own deadline. Unrelated task completions do not
+renew it. Diagnostics include `budget_ms`, `elapsed_ms`, producer identity and
+state, or released/expected consumer counts. It means either a producer did not
+complete within its budget or consumers did not release their fanout references. Check for a hung producer first (that is S1 above),
 then verify the consumer really declares the dependency and exits. If the kernel is
 merely slow, raising the timeout will prove it.
 
