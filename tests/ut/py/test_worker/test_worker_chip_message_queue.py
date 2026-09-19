@@ -6,9 +6,10 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ruff: noqa: PLC0415
 
 import ctypes
-import itertools
+import inspect
 import math
 import struct
 from dataclasses import dataclass
@@ -16,9 +17,10 @@ from multiprocessing.shared_memory import SharedMemory
 from typing import Optional
 
 import pytest
+import simpler.worker_chip_message_queue as queue_mod
 from simpler import comm_region
 from simpler import worker as worker_module
-from simpler.buffer import AccessMode, BackendKind, CanonicalIdentity, mint_owner_instance_id, wrap_fork_inherited
+from simpler.buffer import AccessMode, AddressSpace, BackendKind
 from simpler.comm_provider import (
     PosixShmImport,
     ProviderReleaseResult,
@@ -54,7 +56,6 @@ from simpler.worker_chip_message_queue import (
     WORKER_CHIP_QUEUE_COUNTER_BYTES,
     WORKER_CHIP_QUEUE_DESC_SLOT_BYTES,
     WORKER_CHIP_QUEUE_WORKER_ABORT_FLAG_OFFSET,
-    WorkerChipQueue,
     WorkerChipQueueMessage,
     WorkerChipQueueOpcode,
     make_worker_chip_queue_layout,
@@ -62,53 +63,7 @@ from simpler.worker_chip_message_queue import (
 from simpler.worker_chip_orch_comm import (
     NotifyOp,
     WaitCmp,
-    WorkerChipOrchRegion,
-    WorkerChipOrchRegionDesc,
 )
-
-_DESC_BID = itertools.count(1)
-
-
-class _CompatInstance:
-    def __init__(self, payload_handle: int, counter_handle: int, payload_bytes: int, counter_bytes: int) -> None:
-        self.worker_id = 0
-        self._data_plane_error = None
-        self._payload_part = comm_region.PayloadPart(
-            comm_region.RegionPartSpan(offset=0, nbytes=int(payload_bytes)),
-            comm_region.HostVmmCopyAccess(payload_handle),
-        )
-        self._counter_part = comm_region.CounterPart(
-            comm_region.RegionPartSpan(offset=0, nbytes=int(counter_bytes)),
-            comm_region.HostVmmCopyAccess(counter_handle),
-        )
-
-    @property
-    def state(self):
-        return comm_region.RegionInstanceState.LIVE
-
-    @property
-    def data_plane_error(self):
-        return self._data_plane_error
-
-    def payload_write(self, offset, host_buffer, nbytes=None):
-        self._payload_part.write(offset, host_buffer, nbytes)
-
-    def payload_read(self, offset, host_buffer, nbytes=None):
-        self._payload_part.read(offset, host_buffer, nbytes)
-
-    def counter(self, offset):
-        return self._counter_part.counter(offset)
-
-
-def _fake_alloc_handle(orch, nbytes):
-    """A FORK_SHM Buffer over a bare _FakeCOrch alloc — mirrors Orchestrator.alloc for the
-    low-level tests that drive WorkerChipQueue with a fake C orch directly."""
-    oid, bid = mint_owner_instance_id(), next(_DESC_BID)
-    identity = CanonicalIdentity(oid, bid)
-    va = int(orch.alloc([nbytes], DataType.UINT8, identity))
-    return wrap_fork_inherited(
-        va, nbytes, oid, bid, "L3", access=AccessMode.READWRITE, backend_kind=BackendKind.FORK_SHM
-    )
 
 
 @dataclass(frozen=True)
@@ -463,8 +418,8 @@ def test_layout_lockstep_cases_match_cpp_helper_expectations(depth, input_arena_
     assert layout.input_desc_head_offset == 64
     assert layout.output_desc_tail_offset == 128
     assert layout.output_desc_head_offset == 192
-    assert layout.worker_abort_flag_offset == WORKER_CHIP_QUEUE_WORKER_ABORT_FLAG_OFFSET
-    assert layout.chip_abort_flag_offset == WORKER_CHIP_QUEUE_CHIP_ABORT_FLAG_OFFSET
+    assert layout.initiator_abort_offset == WORKER_CHIP_QUEUE_WORKER_ABORT_FLAG_OFFSET
+    assert layout.peer_abort_offset == WORKER_CHIP_QUEUE_CHIP_ABORT_FLAG_OFFSET
     assert layout.counter_bytes == WORKER_CHIP_QUEUE_COUNTER_BYTES
 
 
@@ -477,42 +432,41 @@ def test_create_worker_chip_queue_allocates_region_and_exposes_l2_task_scalars()
         assert alloc_req.cmd == "alloc_region"
         assert alloc_req.payload_bytes == queue.layout.payload_bytes
         assert alloc_req.counter_bytes == WORKER_CHIP_QUEUE_COUNTER_BYTES
-        assert queue.chip_task_arg_scalars() == [
-            *queue.region.descriptor_scalars(),
+        session, transaction_id = queue.region._instance._allocation_identity
+        scalars = queue.chip_task_arg_scalars()
+        assert len(scalars) == 10
+        assert scalars == [
             queue.magic_version,
+            int.from_bytes(session, "little"),
+            transaction_id,
+            queue.region.descriptor.payload_base,
+            queue.region.descriptor.payload_bytes,
+            queue.region.descriptor.counter_base,
+            queue.region.descriptor.counter_bytes,
             4,
             128,
             192,
-            queue.layout.payload_bytes,
-            queue.layout.counter_bytes,
         ]
-        assert fake_client.counters == {
-            queue.layout.input_desc_tail_offset: 0,
-            queue.layout.input_desc_head_offset: 0,
-            queue.layout.output_desc_tail_offset: 0,
-            queue.layout.output_desc_head_offset: 0,
-            queue.layout.worker_abort_flag_offset: 0,
-            queue.layout.chip_abort_flag_offset: 0,
-        }
+        assert queue.magic_version == 0x5350535100010000
+        assert queue.region.descriptor.magic_version != scalars[0]
+        assert queue.region._instance is queue._bound._instance
+        assert all(req.cmd != "counter_notify" for req, _timeout in fake_client.requests)
     finally:
         _close(worker, shm)
 
 
-def test_create_worker_chip_queue_frees_region_on_post_region_alloc_failure():
+def test_create_worker_chip_queue_projector_failure_rolls_back(monkeypatch):
     orch, worker, shm, _fake_client = _make_orchestrator()
-    original_alloc_ref = orch._o.alloc
 
-    def fail_alloc(_shape, _dtype, _identity):
-        raise RuntimeError("injected alloc failure")
+    def fail_desc(*_args, **_kwargs):
+        raise RuntimeError("injected projector failure")
 
-    orch._o.alloc = fail_alloc
+    monkeypatch.setattr(queue_mod, "worker_chip_orch_region_desc_from_local_views", fail_desc)
     try:
-        with pytest.raises(RuntimeError, match="injected alloc failure"):
+        with pytest.raises(RuntimeError, match="injected projector failure"):
             orch.create_worker_chip_queue(worker_id=0, depth=4, input_arena_bytes=128, output_arena_bytes=128)
-
-        assert len(worker._region_instance_registry._instances) == 1
+        assert worker._region_instance_registry._instances == {}
     finally:
-        orch._o.alloc = original_alloc_ref
         _close(worker, shm)
 
 
@@ -594,53 +548,23 @@ def test_enqueue_accepts_ordinary_host_bytes_with_direct_payload_write():
         _close(worker, shm)
 
 
-def test_worker_host_mapped_queue_ordinary_input_uses_direct_payload_write(monkeypatch):
-    orch = _FakeCOrch()
-    layout = make_worker_chip_queue_layout(4, 128, 128)
-    desc = WorkerChipOrchRegionDesc(
-        magic_version=0x4C334C3200030000,
-        region_id=1,
-        payload_base=0x1000_0000,
-        payload_bytes=layout.payload_bytes,
-        counter_base=0x1000_0000 + ((layout.payload_bytes + 63) // 64) * 64,
-        counter_bytes=layout.counter_bytes,
-    )
-    region = WorkerChipOrchRegion(
-        object(),
-        _CompatInstance(44, 45, desc.payload_bytes, desc.counter_bytes),
-        desc,
-    )
-    queue = WorkerChipQueue(
-        orch,
-        region,
-        layout,
-        _fake_alloc_handle(orch, 24),
-        _fake_alloc_handle(orch, 8),
-        _fake_alloc_handle(orch, WORKER_CHIP_QUEUE_DESC_SLOT_BYTES),
-    )
-    alloc_count = len(orch._buffers)
-    payload_writes: list[tuple[int, bytes]] = []
-    counters: dict[int, int] = {}
+def test_create_worker_chip_queue_does_not_call_create_worker_chip_region(monkeypatch):
+    orch, worker, shm, _fake_client = _make_orchestrator()
+    calls: list[str] = []
 
-    def payload_write(_handle: int, offset: int, src: int, nbytes: int) -> None:
-        payload_writes.append((int(offset), ctypes.string_at(int(src), int(nbytes))))
+    def boom(*_args, **_kwargs):
+        calls.append("legacy")
+        raise AssertionError("create_worker_chip_region must not be called")
 
-    def counter_notify(_handle: int, offset: int, value: int, _op: int) -> None:
-        counters[int(offset)] = int(value)
-
-    monkeypatch.setattr(comm_region, "_host_vmm_copy_to", payload_write)
-    monkeypatch.setattr(
-        comm_region,
-        "_region_counter_test",
-        lambda _h, off, _v, _cmp: (False, counters.get(off, 0)),
-    )
-    monkeypatch.setattr(comm_region, "_region_counter_notify", counter_notify)
-
-    queue.input.enqueue(b"ordinary", nbytes=8, timeout=0.001)
-
-    assert (layout.input_arena_offset, b"ordinary") in payload_writes
-    assert len(orch._buffers) == alloc_count
-    assert counters[layout.input_desc_tail_offset] == 1
+    monkeypatch.setattr(orch, "create_worker_chip_region", boom)
+    monkeypatch.setattr(worker, "_create_worker_chip_region", boom)
+    try:
+        queue = orch.create_worker_chip_queue(worker_id=0, depth=4, input_arena_bytes=128, output_arena_bytes=128)
+        assert calls == []
+        assert queue.region._instance is queue._bound._instance
+        assert len(queue.chip_task_arg_scalars()) == 10
+    finally:
+        _close(worker, shm)
 
 
 def test_direct_mapped_ordinary_host_bytearray_does_not_allocate_queue_buffer():
@@ -787,7 +711,7 @@ def test_output_release_inactive_handle_poisons_and_sets_worker_abort_flag():
             queue.output.release(wrong)
 
         assert fake_client.counters[WORKER_CHIP_QUEUE_WORKER_ABORT_FLAG_OFFSET] == 1
-        with pytest.raises(RuntimeError, match="poisoned"):
+        with pytest.raises(RuntimeError, match="not active"):
             queue.output.try_peek()
     finally:
         _close(worker, shm)
@@ -799,7 +723,7 @@ def test_output_stop_descriptor_poisons_and_sets_worker_abort_flag():
         queue = orch.create_worker_chip_queue(worker_id=0, depth=4, input_arena_bytes=128, output_arena_bytes=128)
         _publish_output(fake_client, queue, opcode=int(WorkerChipQueueOpcode.STOP))
 
-        with pytest.raises(RuntimeError, match="cannot be STOP"):
+        with pytest.raises(RuntimeError, match="DATA or ERROR"):
             queue.output.peek(timeout=0.001)
 
         assert fake_client.counters[WORKER_CHIP_QUEUE_WORKER_ABORT_FLAG_OFFSET] == 1
@@ -917,7 +841,7 @@ def test_try_enqueue_wraparound_arena_full_ordinary_buffer_does_not_stage_or_adv
         first = orch.alloc([112], DataType.UINT8)
         queue.input.enqueue(first, nbytes=112, timeout=0.001)
         alloc_count = len(orch._o._buffers)
-        old_payload_tail = queue._input_payload_tail
+        old_payload_tail = queue._bound._input_payload_tail
         fake_client.requests.clear()
         fake_client.payload_writes.clear()
 
@@ -925,7 +849,7 @@ def test_try_enqueue_wraparound_arena_full_ordinary_buffer_does_not_stage_or_adv
 
         assert fake_client.payload_writes == []
         assert len(orch._o._buffers) == alloc_count
-        assert queue._input_payload_tail == old_payload_tail
+        assert queue._bound._input_payload_tail == old_payload_tail
         assert fake_client.counters[queue.layout.input_desc_tail_offset] == 1
         assert fake_client.counters.get(WORKER_CHIP_QUEUE_WORKER_ABORT_FLAG_OFFSET, 0) == 0
     finally:
@@ -967,7 +891,7 @@ def test_enqueue_payload_write_failure_sets_worker_abort_flag():
             queue.input.enqueue(host, nbytes=16, timeout=0.001)
 
         assert fake_client.counters[WORKER_CHIP_QUEUE_WORKER_ABORT_FLAG_OFFSET] == 1
-        with pytest.raises(RuntimeError, match="poisoned"):
+        with pytest.raises(RuntimeError, match="injected failure"):
             queue.input.try_enqueue(None, nbytes=0)
     finally:
         _close(worker, shm)
@@ -1035,3 +959,252 @@ def test_expired_queue_rejects_later_operations_without_abort_flag():
         assert fake_client.counters.get(WORKER_CHIP_QUEUE_WORKER_ABORT_FLAG_OFFSET, 0) == 0
     finally:
         _close(worker, shm)
+
+
+def test_create_worker_chip_queue_free_is_logical_only():
+    orch, worker, shm, fake_client = _make_orchestrator()
+    try:
+        queue = orch.create_worker_chip_queue(worker_id=0, depth=4, input_arena_bytes=128, output_arena_bytes=128)
+        instance = queue.region._instance
+        fake_client.requests.clear()
+        queue.free()
+        queue.free()
+        assert instance.state is comm_region.RegionInstanceState.LIVE
+        assert instance._close_attempted is False
+        with pytest.raises(RuntimeError, match="released"):
+            queue.chip_task_arg_scalars()
+        with pytest.raises(RuntimeError, match="released"):
+            queue.input.try_enqueue(None, nbytes=0)
+        with pytest.raises(RuntimeError, match="released"):
+            queue.region.descriptor_scalars()
+        assert all(req.cmd != "counter_notify" for req, _timeout in fake_client.requests)
+    finally:
+        _close(worker, shm)
+
+
+def test_create_worker_chip_queue_publish_survives_later_caller_failure():
+    orch, worker, shm, _fake_client = _make_orchestrator()
+    try:
+        queue = orch.create_worker_chip_queue(worker_id=0, depth=4, input_arena_bytes=128, output_arena_bytes=128)
+        instance = queue.region._instance
+        try:
+            raise RuntimeError("submit failed")
+        except RuntimeError:
+            pass
+        assert instance.state is comm_region.RegionInstanceState.LIVE
+        assert len(queue.chip_task_arg_scalars()) == 10
+        queue.input.enqueue(None, nbytes=0, timeout=0.001)
+        assert instance._close_attempted is False
+    finally:
+        _close(worker, shm)
+
+
+class _IntOnly:
+    def __int__(self):
+        return 4
+
+
+class _IndexOnly:
+    def __init__(self, value: int) -> None:
+        self._value = value
+
+    def __index__(self):
+        return self._value
+
+
+class _DuckPayload:
+    def __init__(self, base: int, nbytes: int) -> None:
+        self.base = base
+        self.nbytes = nbytes
+
+
+def _shared_snapshot(fake_client: _FakeClient):
+    return (
+        list(fake_client.requests),
+        list(fake_client.payload_writes),
+        dict(fake_client.counters),
+    )
+
+
+def test_layout_and_factory_reject_non_exact_ints_before_materialization(monkeypatch):
+    layout = make_worker_chip_queue_layout(4, 128, 192)
+    assert layout.depth == 4
+    assert layout.input_arena_bytes == 128
+    assert layout.output_arena_bytes == 192
+    invalid_values: list[object] = [True, 4.0, _IntOnly(), _IndexOnly(4)]
+    try:
+        import numpy
+
+        invalid_values.append(numpy.int64(4))
+    except ImportError:
+        pass
+    for value in invalid_values:
+        with pytest.raises(TypeError):
+            make_worker_chip_queue_layout(value, 128, 128)
+        with pytest.raises(TypeError):
+            make_worker_chip_queue_layout(4, value, 128)
+        with pytest.raises(TypeError):
+            make_worker_chip_queue_layout(4, 128, value)
+
+    orch, worker, shm, fake_client = _make_orchestrator()
+    materializations: list[object] = []
+    import simpler.comm_region_template as template_mod
+
+    original = template_mod.materialize_region_instance
+
+    def spy(*args, **kwargs):
+        materializations.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(template_mod, "materialize_region_instance", spy)
+    try:
+        with pytest.raises(TypeError):
+            orch.create_worker_chip_queue(worker_id=0, depth=True, input_arena_bytes=128, output_arena_bytes=128)
+        with pytest.raises(TypeError):
+            orch.create_worker_chip_queue(worker_id=0, depth=4.0, input_arena_bytes=128, output_arena_bytes=128)
+        with pytest.raises(TypeError):
+            orch.create_worker_chip_queue(worker_id=0, depth=_IntOnly(), input_arena_bytes=128, output_arena_bytes=128)
+        with pytest.raises(TypeError):
+            orch.create_worker_chip_queue(
+                worker_id=0, depth=_IndexOnly(4), input_arena_bytes=128, output_arena_bytes=128
+            )
+        with pytest.raises(TypeError):
+            orch.create_worker_chip_queue(worker_id=True, depth=4, input_arena_bytes=128, output_arena_bytes=128)
+        with pytest.raises(TypeError):
+            orch.create_worker_chip_queue(worker_id=0.0, depth=4, input_arena_bytes=128, output_arena_bytes=128)
+        with pytest.raises(TypeError):
+            orch.create_worker_chip_queue(worker_id=_IntOnly(), depth=4, input_arena_bytes=128, output_arena_bytes=128)
+        assert materializations == []
+        queue = orch.create_worker_chip_queue(
+            worker_id=_IndexOnly(0), depth=4, input_arena_bytes=128, output_arena_bytes=128
+        )
+        assert len(queue.chip_task_arg_scalars()) == 10
+        assert materializations == [True]
+        assert fake_client.requests[0][0].cmd == "alloc_region"
+    finally:
+        _close(worker, shm)
+
+
+def test_unbound_orchestrator_rejects_before_admission():
+    orch = Orchestrator(_FakeCOrch(), None)
+    with pytest.raises(RuntimeError, match="bound to a Worker"):
+        orch.create_worker_chip_queue(worker_id=True, depth=True, input_arena_bytes=True, output_arena_bytes=True)
+
+
+def test_payload_admission_accepts_registered_buffer_and_bytes_like():
+    orch, worker, shm, fake_client = _make_orchestrator()
+    try:
+        queue = orch.create_worker_chip_queue(worker_id=0, depth=4, input_arena_bytes=128, output_arena_bytes=128)
+        host = orch.alloc([16], DataType.UINT8)
+        host.access = AccessMode.READ
+        fake_client.requests.clear()
+        fake_client.payload_writes.clear()
+        queue.input.enqueue(host, nbytes=16, timeout=0.001)
+        assert queue.layout.input_arena_offset in [offset for offset, _data in fake_client.payload_writes]
+
+        queue.input.enqueue(b"abcdefgh", nbytes=8, timeout=0.001)
+        queue.input.enqueue(bytearray(b"ijklmnop"), nbytes=8, timeout=0.001)
+        view = memoryview(b"readonly!")
+        assert view.readonly
+        queue.input.enqueue(view, nbytes=8, timeout=0.001)
+
+        _publish_output(fake_client, queue, payload=b"abcdefghijklmnop")
+        dest = bytearray(16)
+        handle = queue.output.peek(timeout=0.001)
+        queue.output.read_into(handle, memoryview(dest))
+        queue.output.release(handle)
+        assert bytes(dest) == b"abcdefghijklmnop"
+    finally:
+        _close(worker, shm)
+
+
+def test_payload_admission_rejects_invalid_objects_without_shared_access():
+    orch, worker, shm, fake_client = _make_orchestrator()
+    try:
+        queue = orch.create_worker_chip_queue(worker_id=0, depth=4, input_arena_bytes=128, output_arena_bytes=128)
+        host = orch.alloc([16], DataType.UINT8)
+        device = orch.alloc([16], DataType.UINT8)
+        device.address_space = AddressSpace.DEVICE
+        closed = orch.alloc([16], DataType.UINT8)
+        closed.close()
+        write_only = orch.alloc([16], DataType.UINT8)
+        write_only.access = AccessMode.WRITE
+        read_only = orch.alloc([16], DataType.UINT8)
+        read_only.access = AccessMode.READ
+        stale = orch.alloc([16], DataType.UINT8)
+        stale.base = int(stale.base) + 4096
+        fake_client.requests.clear()
+        fake_client.payload_writes.clear()
+        before = _shared_snapshot(fake_client)
+
+        def refuse(call):
+            with pytest.raises(ValueError):
+                call()
+            assert _shared_snapshot(fake_client) == before
+            assert queue._bound._state.name == "LIVE"
+
+        refuse(lambda: queue.input.enqueue(device, nbytes=16, timeout=0.001))
+        refuse(lambda: queue.input.enqueue(closed, nbytes=16, timeout=0.001))
+        refuse(lambda: queue.input.enqueue(write_only, nbytes=16, timeout=0.001))
+        refuse(lambda: queue.input.enqueue(stale, nbytes=16, timeout=0.001))
+        refuse(lambda: queue.input.enqueue(_DuckPayload(host.base, 16), nbytes=16, timeout=0.001))
+        refuse(lambda: queue.input.enqueue(memoryview(bytearray(b"abcdefgh"))[::2], nbytes=4, timeout=0.001))
+        refuse(lambda: queue.input.try_enqueue(object(), nbytes=1))
+
+        _publish_output(fake_client, queue, payload=b"abcdefghijklmnop")
+        fake_client.requests.clear()
+        fake_client.payload_writes.clear()
+        before = _shared_snapshot(fake_client)
+        refuse(lambda: queue.output.try_dequeue_into(memoryview(b"xxxxxxxxxxxxxxxx")))
+        refuse(lambda: queue.output.try_dequeue_into(read_only))
+        refuse(lambda: queue.output.try_dequeue_into(device))
+        dest = bytearray(4)
+        with pytest.raises(ValueError):
+            queue.output.try_dequeue_into(dest)
+        assert queue._bound._output_active is not None
+        retry = bytearray(16)
+        message = queue.output.try_dequeue_into(retry)
+        assert message is not None
+        assert bytes(retry) == b"abcdefghijklmnop"
+        assert queue._bound._output_active is None
+    finally:
+        _close(worker, shm)
+
+
+def test_payload_admission_preserves_terminal_and_ownership_errors():
+    orch, worker, shm, fake_client = _make_orchestrator()
+    try:
+        queue = orch.create_worker_chip_queue(worker_id=0, depth=4, input_arena_bytes=128, output_arena_bytes=128)
+        fake_client.fail_next_cmd = "payload_write"
+        with pytest.raises(RuntimeError, match="injected failure") as first:
+            queue.input.enqueue(b"abcdefgh", nbytes=8, timeout=0.001)
+        fake_client.requests.clear()
+        with pytest.raises(RuntimeError, match="injected failure") as later:
+            queue.input.enqueue(object(), nbytes=8, timeout=0.001)
+        assert later.value is first.value
+        assert fake_client.requests == []
+
+        orch2, worker2, shm2, fake_client2 = _make_orchestrator()
+        try:
+            queue2 = orch2.create_worker_chip_queue(worker_id=0, depth=4, input_arena_bytes=128, output_arena_bytes=128)
+            _publish_output(fake_client2, queue2, payload=b"abcdefghijklmnop")
+            handle = queue2.output.peek(timeout=0.001)
+            forged = WorkerChipQueueMessage(handle.seq, handle.opcode, handle.payload_offset, handle.payload_nbytes)
+            fake_client2.requests.clear()
+            with pytest.raises(RuntimeError, match="not active"):
+                queue2.output.read_into(forged, object())
+            assert queue2._bound._state.name == "POISONED_LOCAL"
+        finally:
+            _close(worker2, shm2)
+    finally:
+        _close(worker, shm)
+
+
+def test_facade_source_has_no_queue_algorithm():
+    source = inspect.getsource(queue_mod)
+    assert "_advance_payload_head" not in source
+    assert "payload replay offset mismatch" not in source
+    assert "decode_spsc_queue_descriptor" not in source
+    assert "encode_spsc_queue_descriptor" not in source
+    assert "input_desc_tail_offset" not in source
+    assert "_RegionTemplateCoordinator" in source

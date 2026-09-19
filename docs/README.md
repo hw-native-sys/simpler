@@ -73,7 +73,7 @@ changing simpler's own internals.
 | -------- | -------------- |
 | [Communication Domains](comm-domain.md) | Dynamic `CommDomain` allocation and the symmetric window |
 | [L3-L2 Orchestrator Communication](l3-l2-orch-comm.md) | Host-side L3 talking directly to the L2 AICPU orchestrator |
-| [L3-L2 Message Queue](l3-l2-message-queue.md) | The queue channel between an L3 host and L2 |
+| [L3-L2 Message Queue](l3-l2-message-queue.md) | The current SPSQ binding between an L3 host and one L2 task |
 | [Directed NEXT_LEVEL Scheduling](directed-next-level-scheduling.md) | Targeting a specific next-level child instead of any free one |
 | [Remote L3 Worker Design](remote-l3-worker-design.md) | L4 host-to-host workers — protocol, transports, status |
 | [remote-l3-worker-design/](remote-l3-worker-design/README.md) | Full design set: protocol, buffers and transports, implementation plan and record |

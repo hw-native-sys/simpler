@@ -1353,6 +1353,180 @@ def test_endpoint_duplicate_match_poisons_worker(region_worker):
         worker._require_no_ordered_cleanup_failure("test")
 
 
+def _queue_endpoint_error(session: bytes, transaction_id: int) -> RuntimeError:
+    bits = int.from_bytes(bytes(session), "little")
+    return RuntimeError(
+        "SPSC queue endpoint error op=init kind=6 "
+        f"session=0x{bits:016x} transaction={int(transaction_id)} msg=issued local operation failed"
+    )
+
+
+def test_allocation_identity_returns_bound_session_and_transaction(region_worker):
+    worker, _calls, _leases = region_worker()
+    resources = _RunResources()
+    worker._building_run_resources = resources
+    try:
+        instance = _materialize_default_region(worker)
+    finally:
+        worker._building_run_resources = None
+    session, transaction_id = instance._allocation_identity
+    assert isinstance(session, bytes)
+    assert len(session) == 8
+    assert type(transaction_id) is int
+    assert transaction_id >= 1
+    instance._delegated_session_instance_id = None
+    with pytest.raises(MaterializationError, match="incomplete"):
+        _ = instance._allocation_identity
+
+
+def test_record_data_plane_failure_by_allocation_identity_matches_single_region(region_worker):
+    worker, calls, _leases = region_worker()
+    resources = _RunResources()
+    worker._building_run_resources = resources
+    try:
+        instance = _materialize_default_region(worker)
+    finally:
+        worker._building_run_resources = None
+    session, transaction_id = instance._allocation_identity
+    error = RuntimeError("issued local operation failed")
+    worker._region_instance_registry.record_data_plane_failure_by_allocation_identity(
+        resources, session, transaction_id, error
+    )
+    assert instance.data_plane_error is error
+    assert instance._close_attempted is False
+    assert instance.state is RegionInstanceState.LIVE
+    assert [item for item in calls if item[0] == "release"] == []
+    later = RuntimeError("second failure")
+    worker._region_instance_registry.record_data_plane_failure_by_allocation_identity(
+        resources, session, transaction_id, later
+    )
+    assert instance.data_plane_error is error
+
+
+def test_record_data_plane_failure_by_allocation_identity_unknown_is_routing_error(region_worker):
+    worker, _calls, _leases = region_worker()
+    resources = _RunResources()
+    other = _RunResources()
+    worker._building_run_resources = resources
+    try:
+        instance = _materialize_default_region(worker)
+    finally:
+        worker._building_run_resources = None
+    session, transaction_id = instance._allocation_identity
+    with pytest.raises(MaterializationError, match="no region instance for allocation identity"):
+        worker._region_instance_registry.record_data_plane_failure_by_allocation_identity(
+            other, session, transaction_id, RuntimeError("unused")
+        )
+    with pytest.raises(MaterializationError, match="no region instance for allocation identity"):
+        worker._region_instance_registry.record_data_plane_failure_by_allocation_identity(
+            resources, b"\x00" * 8, 99, RuntimeError("unused")
+        )
+    assert instance.data_plane_error is None
+    assert instance._close_attempted is False
+
+
+def test_record_data_plane_failure_by_allocation_identity_duplicate_match_is_invariant_error(region_worker):
+    worker, _calls, _leases = region_worker()
+    resources = _RunResources()
+    worker._building_run_resources = resources
+    try:
+        first = _materialize_default_region(worker)
+        second = _materialize_default_region(worker)
+    finally:
+        worker._building_run_resources = None
+    session, transaction_id = first._allocation_identity
+    second._delegated_session_instance_id = first._delegated_session_instance_id
+    second._delegated_transaction_id = first._delegated_transaction_id
+    with pytest.raises(MaterializationError, match="duplicate region instances for allocation identity"):
+        worker._region_instance_registry.record_data_plane_failure_by_allocation_identity(
+            resources, session, transaction_id, RuntimeError("unused")
+        )
+    assert first.data_plane_error is None
+    assert second.data_plane_error is None
+
+
+def test_queue_endpoint_error_correlates_unique_allocation_identity(region_worker):
+    worker, calls, _leases = region_worker()
+    resources = _RunResources()
+    worker._building_run_resources = resources
+    try:
+        instance = _materialize_default_region(worker)
+    finally:
+        worker._building_run_resources = None
+    session, transaction_id = instance._allocation_identity
+    error = _queue_endpoint_error(session, transaction_id)
+    assert worker._poison_spsc_queue_from_endpoint_error(error, resources) is True
+    assert instance.data_plane_error is error
+    assert instance._close_attempted is False
+    assert [item for item in calls if item[0] == "release"] == []
+    with pytest.raises(RuntimeError, match="no further work is admitted"):
+        worker._require_no_ordered_cleanup_failure("test")
+
+
+def test_queue_endpoint_error_unknown_identity_fail_closed(region_worker):
+    worker, _calls, _leases = region_worker()
+    resources = _RunResources()
+    worker._building_run_resources = resources
+    try:
+        instance = _materialize_default_region(worker)
+    finally:
+        worker._building_run_resources = None
+    error = _queue_endpoint_error(b"\xff" * 8, 1)
+    assert worker._poison_spsc_queue_from_endpoint_error(error, resources) is True
+    assert instance.data_plane_error is None
+    with pytest.raises(RuntimeError, match="no further work is admitted"):
+        worker._require_no_ordered_cleanup_failure("test")
+
+
+def test_queue_endpoint_error_malformed_does_not_modify_instance_or_fall_back(region_worker):
+    worker, _calls, _leases = region_worker()
+    resources = _RunResources()
+    worker._building_run_resources = resources
+    try:
+        instance = _materialize_default_region(worker)
+    finally:
+        worker._building_run_resources = None
+    error = RuntimeError(
+        "SPSC queue endpoint error op=init kind=2 msg=invalid queue binding "
+        f"L3-L2 endpoint error op=payload_write kind=5 region={int(instance.provider_resource_id)} "
+        "msg=issued local operation failed"
+    )
+    assert worker._poison_spsc_queue_from_endpoint_error(error, resources) is True
+    assert instance.data_plane_error is None
+    with pytest.raises(RuntimeError, match="no further work is admitted"):
+        worker._require_no_ordered_cleanup_failure("test")
+
+
+def test_queue_endpoint_error_zero_transaction_does_not_modify_instance(region_worker):
+    worker, _calls, _leases = region_worker()
+    resources = _RunResources()
+    worker._building_run_resources = resources
+    try:
+        instance = _materialize_default_region(worker)
+    finally:
+        worker._building_run_resources = None
+    session, _transaction_id = instance._allocation_identity
+    error = _queue_endpoint_error(session, 0)
+    assert worker._poison_spsc_queue_from_endpoint_error(error, resources) is True
+    assert instance.data_plane_error is None
+    with pytest.raises(RuntimeError, match="no further work is admitted"):
+        worker._require_no_ordered_cleanup_failure("test")
+
+
+def test_legacy_region_parser_still_handles_independent_region_marker(region_worker):
+    worker, _calls, _leases = region_worker()
+    resources = _RunResources()
+    worker._building_run_resources = resources
+    try:
+        instance = _materialize_default_region(worker)
+    finally:
+        worker._building_run_resources = None
+    error = _endpoint_error(instance.provider_resource_id)
+    assert worker._poison_spsc_queue_from_endpoint_error(error, resources) is False
+    assert worker._poison_worker_chip_region_from_endpoint_error(error, resources) is True
+    assert instance.data_plane_error is error
+
+
 def test_data_plane_poison_still_completes_registry_cleanup_and_release(region_worker):
     worker, calls, _leases = region_worker()
     resources = _RunResources()
