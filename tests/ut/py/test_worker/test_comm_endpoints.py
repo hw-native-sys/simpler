@@ -162,6 +162,16 @@ def _attachments_by_member(part: ce.RegionPartPlan) -> dict[ce.EndpointIdentity,
             ce.AdapterProfile.DEVICE_LOCAL,
             True,
         ),
+        # Shareable-handle overlay, not a local VA, so same-endpoint still offers peer import.
+        (
+            ce.BackendKind.VMM_SHAREABLE,
+            ce.DEVICE_AICPU,
+            True,
+            True,
+            ce.AdapterKind.DEVICE_PEER,
+            ce.AdapterProfile.DEVICE_VMM_PEER_IMPORT,
+            False,
+        ),
         # Offered as the same-node peer mechanism, and refused: nothing materializes a device peer
         # import, so admitting it would name an attachment no materializer can carry out.
         (
@@ -436,9 +446,12 @@ def test_owner_nonce_resolves_to_the_endpoint_that_mints_under_it():
     assert child._owner_instance_id != worker._owner_instance_id
     assert registry.owner_endpoint(child._owner_instance_id) == _record(worker, "L4/L3[0]", ce.HOST_CPU)
 
-    # A device endpoint is a view of a chip, not a buffer owner, so it binds no nonce.
-    device = _record(worker, "L4/L3[0]/L2[0]", ce.DEVICE_AICORE)
-    assert device not in [registry.owner_endpoint(w._owner_instance_id) for w in (worker, child)]
+    child._ensure_local_device_endpoint_identities()
+    aicpu_nonce = child._device_endpoint_identities[(0, ce.DEVICE_AICPU)][0]
+    aicore_nonce = child._device_endpoint_identities[(0, ce.DEVICE_AICORE)][0]
+    assert registry.owner_endpoint(aicpu_nonce) == _record(worker, "L4/L3[0]/L2[0]", ce.DEVICE_AICPU)
+    assert registry.owner_endpoint(aicore_nonce) == _record(worker, "L4/L3[0]/L2[0]", ce.DEVICE_AICORE)
+    assert aicpu_nonce not in (worker._owner_instance_id, child._owner_instance_id)
 
 
 def test_unknown_owner_nonce_is_a_typed_refusal_not_a_guess():
@@ -590,7 +603,7 @@ def test_default_provider_order_aicore_then_aicpu_then_host_cpu():
         worker,
         [ce.at("L3/L2[0]", ce.DEVICE_AICPU), ce.at("L3/L2[0]", ce.DEVICE_AICORE)],
         access=_supported_parts(
-            ce.BackendKind.VMM_WINDOW,
+            ce.BackendKind.VMM_SHAREABLE,
             ce.AdapterKind.DEVICE_PEER,
             ce.AdapterProfile.DEVICE_VMM_PEER_IMPORT,
         ),
@@ -644,8 +657,8 @@ def test_device_backend_default_host_consumer_uses_copy_for_payload_and_counter(
     assert plan.ordered_members == tuple(record.identity for record in resolved)
     assert plan.payload.part is ce.RegionPartKind.PAYLOAD
     assert plan.counter.part is ce.RegionPartKind.COUNTER
-    assert plan.payload.backend_kind is ce.BackendKind.VMM_WINDOW
-    assert plan.counter.backend_kind is ce.BackendKind.VMM_WINDOW
+    assert plan.payload.backend_kind is ce.BackendKind.VMM_SHAREABLE
+    assert plan.counter.backend_kind is ce.BackendKind.VMM_SHAREABLE
 
     host = _record(worker, "L3", ce.HOST_CPU)
     provider = _record(worker, "L3/L2[0]", ce.DEVICE_AICORE)
@@ -701,7 +714,7 @@ def test_device_backend_attempts_are_recorded_when_direct_and_copy_are_absent():
         ce.AdapterProfile.HOST_VMM_COPY,
     ]
     assert all(attempt.part is ce.RegionPartKind.PAYLOAD for attempt in plan.attempted_adapters)
-    assert all(attempt.backend_kind is ce.BackendKind.VMM_WINDOW for attempt in plan.attempted_adapters)
+    assert all(attempt.backend_kind is ce.BackendKind.VMM_SHAREABLE for attempt in plan.attempted_adapters)
     assert all(attempt.member.path == "L3" for attempt in plan.attempted_adapters)
     assert plan.message.count("L3 HOST_CPU") == 1
 

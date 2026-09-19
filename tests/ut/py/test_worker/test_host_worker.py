@@ -226,7 +226,7 @@ def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
             events.append(("finalize",))
 
     def fake_run_chip_main_loop(
-        cw, *_args, chip_platform, chip_runtime, prepared=None, task_frame_count=1, chip_rank=None
+        cw, *_args, chip_platform, chip_runtime, prepared=None, task_frame_count=1, chip_rank=None, **_kwargs
     ):
         assert chip_rank is None
         published_depths.append(worker_mod._PIPELINE_LEASE_FMT.unpack_from(_args[0], worker_mod._OFF_PIPELINE_LEASE)[0])
@@ -246,6 +246,8 @@ def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
             {},
             {},
             {},
+            worker_mod.mint_owner_instance_id(),
+            worker_mod.mint_owner_instance_id(),
             worker_mod.mint_owner_instance_id(),
             platform="a2a3",
             runtime="tensormap_and_ringbuffer",
@@ -298,6 +300,31 @@ class _RecordingDomainImpl:
             raise error
 
 
+def _teardown_identity_allocator():
+    from simpler.comm_provider import LocalEndpointBufferIdentityAllocator
+
+    return LocalEndpointBufferIdentityAllocator(b"\x11\x22\x33\x44\x55\x66\x77\x88")
+
+
+def _chip_loop_provider_region_store(*, device_id: int = 0, chip_platform: str = ""):
+    from simpler.comm_provider import (
+        DeviceAllocationTarget,
+        LocalEndpointBufferIdentityAllocator,
+        ProviderRegionStore,
+        RegionAllocationContext,
+        RegionEnvironmentKind,
+    )
+
+    environment = RegionEnvironmentKind.SIM if str(chip_platform).endswith("sim") else RegionEnvironmentKind.ONBOARD
+    return ProviderRegionStore(
+        RegionAllocationContext(
+            environment_kind=environment,
+            target=DeviceAllocationTarget(int(device_id)),
+        ),
+        identity_allocator=LocalEndpointBufferIdentityAllocator(worker_mod.mint_owner_instance_id()),
+    )
+
+
 class _TeardownPartShell:
     def __init__(self, part, spec) -> None:
         self.part = part
@@ -306,19 +333,23 @@ class _TeardownPartShell:
         self.release_step_failures = []
         self._local_base = 0x1000 if part.name == "PAYLOAD" else 0x2000
 
-    def materialize(self) -> None:
-        return None
+    def materialize(self, identity, diagnostics=None):
+        from _task_interface import AccessMode, AddressSpace, BackendKind
+        from simpler.buffer import Buffer, intern_worker_path
 
-    def mapping_bytes(self) -> int:
-        return self.spec.logical_bytes
-
-    def import_capability(self):
-        from simpler.comm_provider import PosixShmImport
-
-        return PosixShmImport(shm_name=f"smp_{self.part.name.lower()}{id(self):016x}"[:32])
-
-    def local_base(self) -> int:
-        return self._local_base
+        del diagnostics
+        token = f"smp_{self.part.name.lower()}{id(self):016x}"[:32]
+        return Buffer(
+            identity=identity,
+            owner_worker_path_id=intern_worker_path(""),
+            address_space=AddressSpace.HOST,
+            access=AccessMode.READWRITE,
+            backend_kind=BackendKind.POSIX_SHM,
+            nbytes=int(self.spec.logical_bytes),
+            body=token.encode("ascii"),
+            shm=None,
+            base=int(self._local_base),
+        )
 
     def zero_bytes(self, offset: int, nbytes: int) -> None:
         del offset, nbytes
@@ -394,12 +425,13 @@ def test_teardown_chip_process_resources_continues_and_aggregates_in_order():
             environment_kind=RegionEnvironmentKind.SIM,
             target=DeviceAllocationTarget(device_id=0),
         ),
+        _teardown_identity_allocator(),
         _shell_factory=factory,
     )
     result = store.allocate_and_export(
         RegionAllocationSpec(
-            payload=RegionPartAllocationSpec(planned_backing_kind=BackendKind.POSIX_SHM, logical_bytes=64),
-            counter=RegionPartAllocationSpec(planned_backing_kind=BackendKind.POSIX_SHM, logical_bytes=8),
+            payload=RegionPartAllocationSpec(planned_backing_kind=BackendKind.VMM_SHAREABLE, logical_bytes=64),
+            counter=RegionPartAllocationSpec(planned_backing_kind=BackendKind.VMM_SHAREABLE, logical_bytes=8),
         )
     )
     factory.payloads[0].release_step_failures = [
@@ -450,11 +482,12 @@ def test_teardown_chip_process_resources_lists_every_retained_resource():
             environment_kind=RegionEnvironmentKind.SIM,
             target=DeviceAllocationTarget(device_id=0),
         ),
+        _teardown_identity_allocator(),
         _shell_factory=factory,
     )
     spec = RegionAllocationSpec(
-        payload=RegionPartAllocationSpec(planned_backing_kind=BackendKind.POSIX_SHM, logical_bytes=64),
-        counter=RegionPartAllocationSpec(planned_backing_kind=BackendKind.POSIX_SHM, logical_bytes=8),
+        payload=RegionPartAllocationSpec(planned_backing_kind=BackendKind.VMM_SHAREABLE, logical_bytes=64),
+        counter=RegionPartAllocationSpec(planned_backing_kind=BackendKind.VMM_SHAREABLE, logical_bytes=8),
     )
     first = store.allocate_and_export(spec)
     second = store.allocate_and_export(spec)
@@ -511,12 +544,13 @@ def test_teardown_chip_process_resources_ignores_released_and_keeps_each_step_on
             environment_kind=RegionEnvironmentKind.SIM,
             target=DeviceAllocationTarget(device_id=0),
         ),
+        _teardown_identity_allocator(),
         _shell_factory=factory,
     )
     store.allocate_and_export(
         RegionAllocationSpec(
-            payload=RegionPartAllocationSpec(planned_backing_kind=BackendKind.POSIX_SHM, logical_bytes=64),
-            counter=RegionPartAllocationSpec(planned_backing_kind=BackendKind.POSIX_SHM, logical_bytes=8),
+            payload=RegionPartAllocationSpec(planned_backing_kind=BackendKind.VMM_SHAREABLE, logical_bytes=64),
+            counter=RegionPartAllocationSpec(planned_backing_kind=BackendKind.VMM_SHAREABLE, logical_bytes=8),
         )
     )
     worker_mod._teardown_chip_process_resources(
@@ -1060,6 +1094,7 @@ class _TwoFrameLoopHarness:
                 "chip_runtime": chip_runtime,
                 "prepared": self.prepared,
                 "task_frame_count": 2,
+                "provider_region_store": _chip_loop_provider_region_store(chip_platform="a2a3"),
             },
         )
         self._mailbox_load_patch = patch.object(worker_mod, "_mailbox_load_i32", observed_mailbox_load)
@@ -7964,7 +7999,10 @@ class TestChipMainLoopDigestRegister:
         t = threading.Thread(
             target=_run_chip_main_loop,
             args=(cw, buf, 0, state_addr, 0, registry, identity_table, identity_refs, mint_owner_instance_id()),
-            kwargs={"chip_platform": ""},
+            kwargs={
+                "chip_platform": "",
+                "provider_region_store": _chip_loop_provider_region_store(chip_platform=""),
+            },
             daemon=True,
         )
         t.start()
@@ -8238,7 +8276,13 @@ def test_a_failed_diagnostic_sidecar_write_fails_the_task_not_the_loop(tmp_path)
             {digest: 1},
             worker_mod.mint_owner_instance_id(),
         ),
-        kwargs={"chip_platform": "a2a3", "chip_runtime": "", "prepared": {7}, "chip_rank": 0},
+        kwargs={
+            "chip_platform": "a2a3",
+            "chip_runtime": "",
+            "prepared": {7},
+            "chip_rank": 0,
+            "provider_region_store": _chip_loop_provider_region_store(chip_platform="a2a3"),
+        },
         daemon=True,
     )
     try:

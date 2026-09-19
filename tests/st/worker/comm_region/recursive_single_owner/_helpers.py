@@ -19,6 +19,7 @@ from collections.abc import Callable
 from enum import IntEnum
 from typing import Any
 
+from _task_interface import _worker_host_mapped_region_close  # pyright: ignore[reportMissingImports]
 from simpler import comm_provider
 from simpler.comm_endpoints import DEVICE_AICPU, HOST_CPU, RegionLayoutSpec, SingleOwner, at
 from simpler.comm_provider import ProviderRegionStore, RegionPartKind
@@ -357,6 +358,8 @@ class _LeaseProxy:
         closer = getattr(inner, "close", None)
         if closer is not None:
             closer()
+        else:
+            _worker_host_mapped_region_close(int(inner))
         part = object.__getattribute__(self, "_part")
         kind = (
             _LifecycleEventKind.CLOSE_PAYLOAD if part is RegionPartKind.PAYLOAD else _LifecycleEventKind.CLOSE_COUNTER
@@ -375,17 +378,8 @@ class _ShellProxy:
         object.__setattr__(self, "_part", part)
         object.__setattr__(self, "_recorder", recorder)
 
-    def materialize(self) -> Any:
-        return object.__getattribute__(self, "_inner").materialize()
-
-    def mapping_bytes(self) -> Any:
-        return object.__getattribute__(self, "_inner").mapping_bytes()
-
-    def import_capability(self) -> Any:
-        return object.__getattribute__(self, "_inner").import_capability()
-
-    def local_base(self) -> Any:
-        return object.__getattribute__(self, "_inner").local_base()
+    def materialize(self, identity, diagnostics=None) -> Any:
+        return object.__getattribute__(self, "_inner").materialize(identity, diagnostics)
 
     def zero_bytes(self, *args: Any, **kwargs: Any) -> Any:
         return object.__getattribute__(self, "_inner").zero_bytes(*args, **kwargs)
@@ -449,8 +443,8 @@ def install_lifecycle_recorder(worker: Worker) -> _LifecycleRecorder:
     original_dispatcher = comm_provider._closed_part_dispatcher
     import_count = {"n": 0}
 
-    def _import(worker_id: int, resource_id: int, export: Any) -> Any:
-        lease = original_import(worker_id, resource_id, export)
+    def _import(worker_id: int, resource_id: int, export: Any, **kwargs) -> Any:
+        lease = original_import(worker_id, resource_id, export, **kwargs)
         import_count["n"] += 1
         part = RegionPartKind.PAYLOAD if import_count["n"] % 2 == 1 else RegionPartKind.COUNTER
         kind = (

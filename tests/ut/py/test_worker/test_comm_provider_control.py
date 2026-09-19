@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Unit tests for the DRCT v1 delegated-region control codec."""
+"""Unit tests for the DRCT v2 delegated-region control codec."""
 
 from __future__ import annotations
 
@@ -17,10 +17,9 @@ from pathlib import Path
 
 import pytest
 import simpler.comm_provider_control as provider_control
-from simpler.buffer import BackendKind
+from simpler.buffer import AccessMode, AddressSpace, BackendKind, BufferDescriptor, CanonicalIdentity
 from simpler.comm_endpoints import AdapterKind, AdapterProfile, EndpointDeploymentKind, RegionTopologyKind
 from simpler.comm_provider import (
-    PosixShmImport,
     ProviderCleanupFailure,
     ProviderReleaseResult,
     ProviderReleaseStatus,
@@ -31,17 +30,15 @@ from simpler.comm_provider import (
     RegionControlErrorKind,
     RegionExportDescriptor,
     RegionOperationKind,
-    RegionPartExportDescriptor,
     RegionPartKind,
     RegionPartLocalView,
-    VmmShareableHandleImport,
 )
 from simpler.comm_provider_control import (
-    ALLOCATE_COUNTER_EXPORT_OFFSET,
+    ALLOCATE_COUNTER_DESCRIPTOR_OFFSET,
     ALLOCATE_COUNTER_VIEW_OFFSET,
     ALLOCATE_OUTCOME_BYTES,
     ALLOCATE_OUTCOME_OFFSET,
-    ALLOCATE_PAYLOAD_EXPORT_OFFSET,
+    ALLOCATE_PAYLOAD_DESCRIPTOR_OFFSET,
     ALLOCATE_PAYLOAD_VIEW_OFFSET,
     ALLOCATE_PROJECTION_BYTES,
     ALLOCATE_REPLY_BYTES,
@@ -103,15 +100,6 @@ _OCCUPIED_WORKER_CONTROL_COMMANDS = frozenset(
         25,  # _CTRL_DEVICE_MEMORY_INFO
         26,  # _CTRL_DELEGATED_REGION
     }
-)
-_ALLOCATE_SUCCESS_OUTCOME = bytes.fromhex(
-    "0b0000000000000000000000000000000000000000000000"
-    "0200000002000000400000000000000040000000000000000e00000000000000"
-    "2f70746f5f7061796c6f61645f61000000000000000000000000000000000000"
-    "0000000000000000020000000100000008000000000000000800000000000000"
-    "1000000000000000020000000000000015000000000000000000000000000000"
-    "0000000000000000000000000000000001000000000000000010000000000000"
-    "4000000000000000020000000000000000200000000000000800000000000000"
 )
 _ALLOCATE_INACTIVE_TAIL_HEX = "00" * (ALLOCATE_OUTCOME_BYTES - 24)
 _ALLOCATE_REQUEST_ERROR_OUTCOMES = {
@@ -189,21 +177,35 @@ def _release_request(
     )
 
 
-def _posix_part(logical_bytes: int, name: str) -> RegionPartExportDescriptor:
-    return RegionPartExportDescriptor(
-        planned_backing_kind=BackendKind.VMM_WINDOW,
-        logical_bytes=logical_bytes,
-        mapping_bytes=logical_bytes,
-        import_capability=PosixShmImport(shm_name=name),
+_OWNER_NONCE = b"\xaa\xbb\xcc\xdd\xee\xff\x00\x11"
+
+
+def _posix_part(logical_bytes: int, name: str, buffer_id: int = 1) -> BufferDescriptor:
+    token = name.lstrip("/")
+    return BufferDescriptor(
+        CanonicalIdentity(_OWNER_NONCE, int(buffer_id), 1),
+        AddressSpace.HOST,
+        AccessMode.READWRITE,
+        BackendKind.POSIX_SHM,
+        int(logical_bytes),
+        token.encode("ascii"),
     )
 
 
-def _vmm_part(logical_bytes: int, handle: int = 21) -> RegionPartExportDescriptor:
-    return RegionPartExportDescriptor(
-        planned_backing_kind=BackendKind.VMM_WINDOW,
-        logical_bytes=logical_bytes,
-        mapping_bytes=logical_bytes,
-        import_capability=VmmShareableHandleImport(device_id=2, shareable_handle=handle),
+def _vmm_part(logical_bytes: int, handle: int = 21, buffer_id: int = 2) -> BufferDescriptor:
+    body = (
+        (2).to_bytes(4, "little", signed=True)
+        + (0).to_bytes(4, "little")
+        + int(handle).to_bytes(8, "little")
+        + int(logical_bytes).to_bytes(8, "little")
+    )
+    return BufferDescriptor(
+        CanonicalIdentity(_OWNER_NONCE, int(buffer_id), 1),
+        AddressSpace.DEVICE,
+        AccessMode.READWRITE,
+        BackendKind.VMM_SHAREABLE,
+        int(logical_bytes),
+        body,
     )
 
 
@@ -263,7 +265,7 @@ def _kind(exc: RegionControlError) -> RegionControlErrorKind:
     return exc.kind
 
 
-def test_canonical_control_module_is_drct_v1_without_prct_codec():
+def test_canonical_control_module_is_drct_v2_without_prct_codec():
     source = _MODULE_PATH.read_text(encoding="utf-8")
     assert "DELEGATED_REGION_CTRL_MAGIC = 0x44524354" in source
     assert "0x50524354" not in source
@@ -286,21 +288,21 @@ def test_fixed_sizes_and_tag_offset_are_asserted():
     assert ALLOCATE_PROJECTION_BYTES == 64
     assert REPLY_HEADER_BYTES == 40
     assert REPLY_TAG_OFFSET == 12
-    assert ALLOCATE_REPLY_BYTES == 256
+    assert ALLOCATE_REPLY_BYTES == 288
     assert RELEASE_REPLY_BYTES == 72
     assert ALLOCATE_REQUEST_HARD_CEILING == 616
     assert RELEASE_REQUEST_HARD_CEILING == 296
     assert PATH_CEILING_BYTES == 256
-    assert ALLOCATE_PAYLOAD_EXPORT_OFFSET == 64
-    assert ALLOCATE_COUNTER_EXPORT_OFFSET == 136
-    assert ALLOCATE_PAYLOAD_VIEW_OFFSET == 208
-    assert ALLOCATE_COUNTER_VIEW_OFFSET == 232
-    assert DELEGATED_REGION_CTRL_MAGIC_VERSION == 0x4452435400010000
+    assert ALLOCATE_PAYLOAD_DESCRIPTOR_OFFSET == 64
+    assert ALLOCATE_COUNTER_DESCRIPTOR_OFFSET == 152
+    assert ALLOCATE_PAYLOAD_VIEW_OFFSET == 240
+    assert ALLOCATE_COUNTER_VIEW_OFFSET == 264
+    assert DELEGATED_REGION_CTRL_MAGIC_VERSION == 0x4452435400020000
 
 
 def test_allocate_request_round_trip_and_header_layout():
-    staged = encode_request(_allocate_request(), staged_capacity=256)
-    assert len(staged) == 256
+    staged = encode_request(_allocate_request(), staged_capacity=ALLOCATE_REPLY_BYTES)
+    assert len(staged) == ALLOCATE_REPLY_BYTES
     magic, request_bytes, operation, session, transaction_id, provider_len, initiator_len = struct.unpack_from(
         "<QII8sQII", staged, 0
     )
@@ -311,7 +313,7 @@ def test_allocate_request_round_trip_and_header_layout():
     assert initiator_len == len(_INITIATOR_PATH)
     assert provider_len == len(_PROVIDER_PATH)
     assert request_bytes == REQUEST_HEADER_BYTES + ALLOCATE_PROJECTION_BYTES + initiator_len + provider_len
-    assert staged[request_bytes:] == b"\x00" * (256 - request_bytes)
+    assert staged[request_bytes:] == b"\x00" * (ALLOCATE_REPLY_BYTES - request_bytes)
     assert staged[request_bytes - provider_len : request_bytes] == _PROVIDER_PATH
     envelope = parse_request(staged)
     assert envelope.operation is DelegatedRegionOperation.DELEGATED_ALLOCATE
@@ -324,7 +326,7 @@ def test_allocate_request_round_trip_and_header_layout():
     assert decoded.provider_path == _PROVIDER_PATH
     assert decoded.spec.payload.logical_bytes == 64
     assert decoded.spec.counter.logical_bytes == 8
-    assert decoded.spec.payload.planned_backing_kind is BackendKind.VMM_WINDOW
+    assert decoded.spec.payload.planned_backing_kind is BackendKind.VMM_SHAREABLE
     assert decoded.topology is RegionTopologyKind.SINGLE_OWNER
     assert decoded.initiator_deployment is EndpointDeploymentKind.HOST_CPU
     assert decoded.provider_deployment is EndpointDeploymentKind.DEVICE_AICPU
@@ -350,7 +352,9 @@ def test_release_request_round_trip_has_empty_body():
 
 def test_opaque_session_round_trips_byte_for_byte():
     session = bytes(range(8, 0, -1))
-    staged = encode_request(_allocate_request(session_instance_id=session, transaction_id=7), staged_capacity=256)
+    staged = encode_request(
+        _allocate_request(session_instance_id=session, transaction_id=7), staged_capacity=ALLOCATE_REPLY_BYTES
+    )
     envelope = parse_request(staged)
     assert envelope.session_instance_id == session
     assert envelope.session_instance_id is not session
@@ -427,7 +431,7 @@ def test_allocate_and_release_hard_ceilings():
     release = encode_request(_release_request(provider_path=prov), staged_capacity=296)
     assert parse_request(release).request_bytes == 296
 
-    over = bytearray(encode_request(_allocate_request(), staged_capacity=256))
+    over = bytearray(encode_request(_allocate_request(), staged_capacity=ALLOCATE_REPLY_BYTES))
     struct.pack_into("<I", over, 8, 617)
     with pytest.raises(RegionControlError) as allocate_over:
         parse_request(over)
@@ -441,7 +445,7 @@ def test_allocate_and_release_hard_ceilings():
 
 
 def test_owned_envelope_survives_source_zero_and_reuse():
-    staged = encode_request(_allocate_request(transaction_id=9), staged_capacity=256)
+    staged = encode_request(_allocate_request(transaction_id=9), staged_capacity=ALLOCATE_REPLY_BYTES)
     view = memoryview(staged)
     envelope = parse_request(view)
     snapshot = envelope.frame
@@ -454,10 +458,10 @@ def test_owned_envelope_survives_source_zero_and_reuse():
     assert decoded.provider_path == _PROVIDER_PATH
 
     committed = encode_reply(_allocated_reply())
-    reply_buf = bytearray(256)
+    reply_buf = bytearray(ALLOCATE_REPLY_BYTES)
     publish_reply(memoryview(reply_buf), committed)
     reply_env = parse_reply(reply_buf)
-    reply_buf[:] = b"\x00" * 256
+    reply_buf[:] = b"\x00" * ALLOCATE_REPLY_BYTES
     outcome = reply_env.decode_outcome()
     assert outcome.tag is DelegatedAllocateReplyTag.ALLOCATED
     assert outcome.result is not None
@@ -465,7 +469,7 @@ def test_owned_envelope_survives_source_zero_and_reuse():
 
 
 def test_fail_closed_magic_version_operation_length_enum_reserved_and_tail():
-    good = encode_request(_allocate_request(), staged_capacity=256)
+    good = encode_request(_allocate_request(), staged_capacity=ALLOCATE_REPLY_BYTES)
 
     wrong_magic = bytearray(good)
     struct.pack_into("<Q", wrong_magic, 0, _OLD_PRCT_MAGIC)
@@ -474,7 +478,7 @@ def test_fail_closed_magic_version_operation_length_enum_reserved_and_tail():
     assert _kind(magic.value) is RegionControlErrorKind.BAD_MAGIC_VERSION
 
     wrong_version = bytearray(good)
-    struct.pack_into("<Q", wrong_version, 0, (DELEGATED_REGION_CTRL_MAGIC << 32) | 0x00020000)
+    struct.pack_into("<Q", wrong_version, 0, (DELEGATED_REGION_CTRL_MAGIC << 32) | 0x00010000)
     with pytest.raises(RegionControlError) as version:
         parse_request(wrong_version)
     assert _kind(version.value) is RegionControlErrorKind.BAD_MAGIC_VERSION
@@ -523,7 +527,7 @@ def test_fail_closed_magic_version_operation_length_enum_reserved_and_tail():
 
 
 def test_decode_terminal_not_required_for_bounded_routing():
-    staged = encode_request(_allocate_request(), staged_capacity=256)
+    staged = encode_request(_allocate_request(), staged_capacity=ALLOCATE_REPLY_BYTES)
     mutated = bytearray(staged)
     struct.pack_into("<I", mutated, REQUEST_HEADER_BYTES, 99)
     envelope = parse_request(mutated)
@@ -536,13 +540,16 @@ def test_decode_terminal_not_required_for_bounded_routing():
 
 def test_allocate_reply_tags_and_unique_error_kind():
     allocated = encode_reply(_allocated_reply())
-    assert allocated[40:] == _ALLOCATE_SUCCESS_OUTCOME
+    assert len(allocated) == ALLOCATE_REPLY_BYTES
     decoded = parse_reply(allocated).decode_outcome()
     assert decoded.tag is DelegatedAllocateReplyTag.ALLOCATED
     assert decoded.error_kind is RegionControlErrorKind.NONE
     assert decoded.result is not None
     assert decoded.payload_view is not None
     assert decoded.counter_view is not None
+    assert decoded.result.export_descriptor.payload.backend_kind is BackendKind.POSIX_SHM
+    assert decoded.result.export_descriptor.counter.backend_kind is BackendKind.VMM_SHAREABLE
+    assert decoded.result.export_descriptor.payload.identity != decoded.result.export_descriptor.counter.identity
 
     for name, outcome in _ALLOCATE_REQUEST_ERROR_OUTCOMES.items():
         kind = RegionControlErrorKind[name]
@@ -582,6 +589,53 @@ def test_allocate_reply_tags_and_unique_error_kind():
     assert parsed_alloc.error_kind is RegionControlErrorKind.BACKEND_FAILURE
     assert parsed_alloc.provisional_resource_id == 7
     assert parsed_alloc.cleanup_debt_remaining is True
+
+
+def test_allocated_reply_counter_nbytes_not_multiple_of_four_is_typed():
+    frame = bytearray(encode_reply(_allocated_reply()))
+    struct.pack_into("<Q", frame, ALLOCATE_COUNTER_DESCRIPTOR_OFFSET + 40, 5)
+    with pytest.raises(RegionControlError) as exc:
+        parse_reply(frame).decode_outcome()
+    assert _kind(exc.value) is RegionControlErrorKind.INVALID_FIELD_VALUE
+    assert exc.type is RegionControlError
+
+
+def test_allocated_reply_overlapping_local_views_is_typed():
+    frame = bytearray(encode_reply(_allocated_reply()))
+    struct.pack_into("<IIQQ", frame, ALLOCATE_COUNTER_VIEW_OFFSET, int(RegionPartKind.COUNTER), 0, 0x1000, 8)
+    with pytest.raises(RegionControlError) as exc:
+        parse_reply(frame).decode_outcome()
+    assert _kind(exc.value) is RegionControlErrorKind.INVALID_FIELD_VALUE
+    assert exc.type is RegionControlError
+
+
+def test_allocated_reply_single_descriptor_malformed_keeps_invalid_field_value():
+    frame = bytearray(encode_reply(_allocated_reply()))
+    struct.pack_into("<Q", frame, ALLOCATE_COUNTER_DESCRIPTOR_OFFSET + 56 + 8, 0)
+    with pytest.raises(RegionControlError) as exc:
+        parse_reply(frame).decode_outcome()
+    assert _kind(exc.value) is RegionControlErrorKind.INVALID_FIELD_VALUE
+    assert exc.type is RegionControlError
+
+
+def test_allocated_reply_v2_layout_and_legal_decode_are_unchanged():
+    committed = encode_reply(_allocated_reply())
+    assert len(committed) == ALLOCATE_REPLY_BYTES
+    assert ALLOCATE_PAYLOAD_DESCRIPTOR_OFFSET == 64
+    assert ALLOCATE_COUNTER_DESCRIPTOR_OFFSET == 152
+    assert ALLOCATE_PAYLOAD_VIEW_OFFSET == 240
+    assert ALLOCATE_COUNTER_VIEW_OFFSET == 264
+    assert DELEGATED_REGION_CTRL_MAGIC_VERSION == 0x4452435400020000
+    decoded = parse_reply(committed).decode_outcome()
+    assert decoded.tag is DelegatedAllocateReplyTag.ALLOCATED
+    assert decoded.result is not None
+    assert decoded.result.provider_resource_id == 11
+    assert decoded.result.export_descriptor.payload.nbytes == 64
+    assert decoded.result.export_descriptor.counter.nbytes == 8
+    assert decoded.payload_view is not None
+    assert decoded.counter_view is not None
+    assert decoded.payload_view.local_base == 0x1000
+    assert decoded.counter_view.local_base == 0x2000
 
 
 def test_release_reply_tags_and_unknown_transaction_zero_outcome():
@@ -658,11 +712,11 @@ def test_release_reply_tags_and_unknown_transaction_zero_outcome():
 
 def test_publish_reply_zeros_staging_and_commits_tag_last():
     leftover = encode_request(_allocate_request(), staged_capacity=616)
-    assert leftover[256:] != b"" or leftover[40:104]
+    assert leftover[ALLOCATE_REPLY_BYTES:] != b"" or leftover[40:104]
     committed = encode_reply(_allocated_reply())
     publish_reply(memoryview(leftover), committed)
-    assert leftover[256:] == b"\x00" * 360
-    assert leftover[:256] == committed
+    assert leftover[ALLOCATE_REPLY_BYTES:] == b"\x00" * (616 - ALLOCATE_REPLY_BYTES)
+    assert leftover[:ALLOCATE_REPLY_BYTES] == committed
     assert leftover[REPLY_TAG_OFFSET : REPLY_TAG_OFFSET + 4] == int(DelegatedAllocateReplyTag.ALLOCATED).to_bytes(
         4, "little"
     )
@@ -729,7 +783,9 @@ def test_error_kind_lives_only_in_outcome():
     assert failed_part == 0
     assert failed_operation == 0
     assert debt == 0
-    assert frame[ALLOCATE_PAYLOAD_EXPORT_OFFSET:] == b"\x00" * (ALLOCATE_REPLY_BYTES - ALLOCATE_PAYLOAD_EXPORT_OFFSET)
+    assert frame[ALLOCATE_PAYLOAD_DESCRIPTOR_OFFSET:] == b"\x00" * (
+        ALLOCATE_REPLY_BYTES - ALLOCATE_PAYLOAD_DESCRIPTOR_OFFSET
+    )
 
 
 def test_store_lifecycle_allocate_error_is_zero_resource_protocol_outcome():
@@ -929,7 +985,7 @@ def test_handler_invalid_request_does_not_advance_waterline():
     store, _factory = _open_store()
     counted = _CountingStore(store)
     table = ProviderTransactionTable()
-    staged = encode_request(_allocate_request(transaction_id=1), staged_capacity=256)
+    staged = encode_request(_allocate_request(transaction_id=1), staged_capacity=ALLOCATE_REPLY_BYTES)
     staged[REQUEST_HEADER_BYTES + 12 : REQUEST_HEADER_BYTES + 16] = (1).to_bytes(4, "little")
     handle_terminal_delegated_region(memoryview(staged), table, counted)
     invalid = parse_reply(staged).decode_outcome()
@@ -937,7 +993,7 @@ def test_handler_invalid_request_does_not_advance_waterline():
     assert invalid.error_kind is RegionControlErrorKind.RESERVED_NONZERO
     assert counted.allocate_calls == 0
 
-    valid = encode_request(_allocate_request(transaction_id=1), staged_capacity=256)
+    valid = encode_request(_allocate_request(transaction_id=1), staged_capacity=ALLOCATE_REPLY_BYTES)
     handle_terminal_delegated_region(memoryview(valid), table, counted)
     allocated = parse_reply(valid).decode_outcome()
     assert allocated.tag is DelegatedAllocateReplyTag.ALLOCATED
@@ -1002,7 +1058,7 @@ def test_hop_staging_copy_uses_max_of_request_and_fixed_reply():
 
 
 def _projection_from_valid_allocate() -> bytes:
-    staged = encode_request(_allocate_request(), staged_capacity=256)
+    staged = encode_request(_allocate_request(), staged_capacity=ALLOCATE_REPLY_BYTES)
     return bytes(staged[REQUEST_HEADER_BYTES : REQUEST_HEADER_BYTES + ALLOCATE_PROJECTION_BYTES])
 
 
@@ -1049,12 +1105,18 @@ def test_initiator_path_zero_one_255_256_257():
     assert _kind(huge.value) is RegionControlErrorKind.BAD_MESSAGE_SIZE
 
     path_255 = _canonical_path_of_length(255)
-    staged_255 = encode_request(_allocate_request(initiator_path=path_255), staged_capacity=max(256, 40 + 64 + 255 + 8))
+    staged_255 = encode_request(
+        _allocate_request(initiator_path=path_255),
+        staged_capacity=max(ALLOCATE_REPLY_BYTES, 40 + 64 + 255 + 8),
+    )
     decoded_255 = parse_request(staged_255).decode_terminal()
     assert decoded_255.initiator_path == path_255
 
     path_256 = _canonical_path_of_length(256)
-    staged_256 = encode_request(_allocate_request(initiator_path=path_256), staged_capacity=max(256, 40 + 64 + 256 + 8))
+    staged_256 = encode_request(
+        _allocate_request(initiator_path=path_256),
+        staged_capacity=max(ALLOCATE_REPLY_BYTES, 40 + 64 + 256 + 8),
+    )
     decoded_256 = parse_request(staged_256).decode_terminal()
     assert decoded_256.initiator_path == path_256
 
@@ -1155,7 +1217,7 @@ def test_short_staging_does_not_publish_or_touch_store():
     counted = _CountingStore(store)
     table = ProviderTransactionTable()
 
-    allocate = encode_request(_allocate_request(transaction_id=1), staged_capacity=256)
+    allocate = encode_request(_allocate_request(transaction_id=1), staged_capacity=ALLOCATE_REPLY_BYTES)
     short_allocate = bytearray(allocate[: ALLOCATE_REPLY_BYTES - 1])
     allocate_snapshot = bytes(short_allocate)
     handle_terminal_delegated_region(memoryview(short_allocate), table, counted)
@@ -1197,11 +1259,11 @@ def test_publish_reply_tag_last_snapshot_keeps_offset_12_zero():
         provider_control._REPLY_TAG = real_tag
     assert snapshots
     snapshot = snapshots[-1]
-    assert snapshot == b"\x00" * 616 or snapshot[256:] == b"\x00" * 360
-    assert snapshot[256:] == b"\x00" * 360
+    assert snapshot == b"\x00" * 616 or snapshot[ALLOCATE_REPLY_BYTES:] == b"\x00" * (616 - ALLOCATE_REPLY_BYTES)
+    assert snapshot[ALLOCATE_REPLY_BYTES:] == b"\x00" * (616 - ALLOCATE_REPLY_BYTES)
     prefix = bytearray(committed)
     struct.pack_into("<I", prefix, REPLY_TAG_OFFSET, 0)
-    assert snapshot[:256] == bytes(prefix)
+    assert snapshot[:ALLOCATE_REPLY_BYTES] == bytes(prefix)
     assert snapshot[REPLY_TAG_OFFSET : REPLY_TAG_OFFSET + 4] == (0).to_bytes(4, "little")
     assert writes[-1][1] != 0
     assert leftover[REPLY_TAG_OFFSET : REPLY_TAG_OFFSET + 4] == int(DelegatedAllocateReplyTag.ALLOCATED).to_bytes(
@@ -1325,9 +1387,9 @@ def test_release_terminal_then_allocate_returns_store_lifecycle():
 
 
 def test_frozen_outcome_sizes_match_trailing_bytes():
-    assert ALLOCATE_REPLY_BYTES - REPLY_HEADER_BYTES == ALLOCATE_OUTCOME_BYTES == 216
+    assert ALLOCATE_REPLY_BYTES - REPLY_HEADER_BYTES == ALLOCATE_OUTCOME_BYTES == 248
     assert RELEASE_REPLY_BYTES - REPLY_HEADER_BYTES == RELEASE_OUTCOME_BYTES == 32
-    assert len(_ALLOCATE_SUCCESS_OUTCOME) == ALLOCATE_OUTCOME_BYTES
+    assert len(encode_reply(_allocated_reply())[REPLY_HEADER_BYTES:]) == ALLOCATE_OUTCOME_BYTES
     assert len(_UNKNOWN_TRANSACTION_OUTCOME) == RELEASE_OUTCOME_BYTES
     assert _UNKNOWN_TRANSACTION_OUTCOME == bytes(RELEASE_OUTCOME_BYTES)
 
