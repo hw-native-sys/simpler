@@ -931,6 +931,21 @@ void SimDeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &df
     }
 }
 
+// The retained bank is indexed by the run's pipeline slot directly, not by a
+// slot-derived modulus: the slot space and the bank array are the same size, so
+// a slot outside the array is a contract break to report rather than to fold.
+static_assert(
+    PLATFORM_RUN_TERMINAL_BANKS == PTO_PIPELINE_MAX_DEPTH,
+    "swimlane terminal banks must cover exactly the pipeline's retained runs"
+);
+
+uint64_t SimDeviceRunnerBase::arm_chip_swimlane_run_terminal_bank(uint32_t pipeline_slot, uint64_t run_epoch) {
+    // Zero means "publish no snapshot". Every path that cannot resolve a bank —
+    // swimlane off, collector not initialized, slot out of range, no run identity
+    // — returns it rather than letting the device derive an address.
+    return reinterpret_cast<uint64_t>(chip_swimlane_collector_.arm_run_terminal_bank(pipeline_slot, run_epoch));
+}
+
 void SimDeviceRunnerBase::write_host_phase_records_artifact(const std::string &output_prefix, uint32_t pipeline_slot) {
     if (pipeline_slot >= host_phase_runs_.size()) return;
     simpler::dfx::HostPhaseRecordStore &records = host_phase_runs_[pipeline_slot].records;
@@ -945,7 +960,7 @@ void SimDeviceRunnerBase::write_host_phase_records_artifact(const std::string &o
 }
 
 void SimDeviceRunnerBase::teardown_shared_collectors_after_run(
-    const DfxRunConfig &dfx, uint32_t pipeline_slot, bool device_execution_complete
+    const DfxRunConfig &dfx, uint32_t pipeline_slot, uint64_t run_epoch, bool device_execution_complete
 ) {
     // The order is fixed by three couplings, not by preference: the clock
     // correlation session closes before the swimlane export reads it, the host
@@ -958,6 +973,11 @@ void SimDeviceRunnerBase::teardown_shared_collectors_after_run(
         chip_swimlane_collector_.quiesce();
         chip_swimlane_collector_.read_phase_header_metadata();
         chip_swimlane_collector_.reconcile_counters();
+        // Only on the completion path; see the onboard base for why an
+        // incomplete run's bank says nothing about that run.
+        if (device_execution_complete) {
+            chip_swimlane_collector_.report_run_terminal_snapshot(pipeline_slot, run_epoch);
+        }
         publish_host_phase_records_to_swimlane(pipeline_slot);
         publish_chip_swimlane_runtime_extensions();
         chip_swimlane_collector_.export_swimlane_json();

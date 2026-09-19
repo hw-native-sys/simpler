@@ -625,7 +625,7 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
         if (prepared.dfx.chip_swimlane_enabled() && !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
             LOG_WARN("Runtime chip-swimlane extension publication failed");
         }
-        teardown_shared_collectors_after_run(prepared.dfx, prepared.pipeline_slot, false);
+        teardown_shared_collectors_after_run(prepared.dfx, prepared.pipeline_slot, prepared.identity.run_epoch, false);
         emit_device_dep_gen_graph(prepared.dfx);
         return rc;
     }
@@ -634,7 +634,7 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
     if (prepared.dfx.chip_swimlane_enabled() && !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
         LOG_WARN("Runtime chip-swimlane extension publication failed");
     }
-    teardown_shared_collectors_after_run(prepared.dfx, prepared.pipeline_slot, true);
+    teardown_shared_collectors_after_run(prepared.dfx, prepared.pipeline_slot, prepared.identity.run_epoch, true);
     emit_device_dep_gen_graph(prepared.dfx);
 
     // Reads device memory, so it must precede KernelArgs/runtime cleanup.
@@ -1136,6 +1136,11 @@ int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecuti
     // phase pool. Publishing before the release would lose both.
     publish_host_phase_run_to_collector(prepared.pipeline_slot);
 
+    // This run's bank, so a run that arms none publishes 0 rather than whatever
+    // the last run left. Stated unconditionally: the field means "this run's
+    // bank", independently of whether the KernelArgs storage happens to be fresh.
+    prepared.kernel_args.args.chip_swimlane_run_terminal_bank = 0;
+
     int rc = 0;
     if (dfx.chip_swimlane_enabled()) {
         rc =
@@ -1144,6 +1149,11 @@ int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecuti
             LOG_ERROR("init_chip_swimlane failed: %d", rc);
             return rc;
         }
+        // After the init that publishes the region base: the bank is a slice of
+        // that region, and it is resolved per run because it is keyed on this
+        // run's pipeline slot and identity, not on the device's.
+        prepared.kernel_args.args.chip_swimlane_run_terminal_bank =
+            arm_chip_swimlane_run_terminal_bank(prepared.pipeline_slot, prepared.identity.run_epoch);
     }
 
     if (dfx.dump_args_enabled()) {

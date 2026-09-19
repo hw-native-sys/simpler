@@ -575,6 +575,72 @@ public:
     void reconcile_counters();
 
     /**
+     * One producer class's retained terminal accounting for one run.
+     *
+     * `producers` counts the entries that carried the expected epoch, so a class
+     * whose pools were disabled reports zero producers rather than zero records
+     * — the two are different facts.
+     */
+    struct RunTerminalClassSnapshot {
+        int producers{0};
+        uint64_t total{0};
+        uint64_t dropped{0};
+    };
+
+    /**
+     * A run's retained terminal snapshot, read back from its bank.
+     *
+     * `valid` is false whenever the read could not establish the snapshot: no
+     * region, an out-of-range bank, a zero epoch, a failed device copy, or a bank
+     * in which no entry carried the expected epoch. An invalid snapshot reports
+     * nothing about the run — it is *unknown*, never "zero records".
+     *
+     * A matching non-zero epoch is the whole validity test. It also covers the
+     * allocation's lifetime without a second mechanism: `initialize()` refuses
+     * while a region is held, so a new one only follows `finalize()`, which nulls
+     * the region pointer, and the new region's entries start at the zeroed
+     * no-snapshot state.
+     */
+    struct RunTerminalSnapshot {
+        bool valid{false};
+        uint64_t run_epoch{0};
+        int foreign_entries{0};  // entries holding some other run's epoch
+        RunTerminalClassSnapshot aicpu_task;
+        RunTerminalClassSnapshot aicore_task;
+        RunTerminalClassSnapshot sched_phase;
+        RunTerminalClassSnapshot orch_phase;
+    };
+
+    /**
+     * Return the device address of `bank_index`'s first terminal entry for the
+     * run identified by `run_epoch`, or nullptr when there is nothing to arm (no
+     * region, no device allocation, bank out of range, or a zero epoch). The
+     * caller publishes the result into KernelArgs; a nullptr becomes a zero
+     * field, which the device reads as "publish no snapshot".
+     *
+     * Deliberately does not clear the bank. The previous occupant's snapshot
+     * stays readable until this run's producers overwrite their own entries, and
+     * zeroing here would destroy it at the one moment a reader might still want
+     * it. Entries start zeroed by the region's initialization memset.
+     */
+    void *arm_run_terminal_bank(uint32_t bank_index, uint64_t run_epoch);
+
+    /**
+     * Read back the snapshot armed for `run_epoch` at `bank_index`.
+     *
+     * Only sound after that run's completion has been established positively —
+     * this performs no synchronization of its own and assumes no producer is
+     * still writing. Callers gate on the device completion fence.
+     */
+    RunTerminalSnapshot read_run_terminal_snapshot(uint32_t bank_index, uint64_t run_epoch);
+
+    /**
+     * Read the snapshot and log it next to reconcile_counters' accounting, with
+     * its validity stated either way.
+     */
+    void report_run_terminal_snapshot(uint32_t bank_index, uint64_t run_epoch);
+
+    /**
      * @return Per-core ChipSwimlaneAicpuTaskRecord vectors (indexed by core_index). For tests.
      */
     const std::vector<std::vector<CollectedRecord<ChipSwimlaneAicpuTaskRecord>>> &get_records() const {

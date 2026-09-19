@@ -76,6 +76,7 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     set_platform_dump_base(k_args->dump_data_base);
     set_dump_args_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS));
     set_platform_chip_swimlane_base(k_args->chip_swimlane_data_base);
+    set_platform_chip_swimlane_run_terminal_bank(k_args->chip_swimlane_run_terminal_bank);
     set_platform_chip_swimlane_aicore_rotation_table(k_args->chip_swimlane_aicore_rotation_table);
     set_chip_swimlane_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE));
     set_platform_pmu_base(k_args->pmu_data_base);

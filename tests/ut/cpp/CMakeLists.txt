@@ -625,6 +625,35 @@ target_link_libraries(test_chip_swimlane_collector PRIVATE
 add_test(NAME test_chip_swimlane_collector COMMAND test_chip_swimlane_collector)
 set_tests_properties(test_chip_swimlane_collector PROPERTIES LABELS "no_hardware")
 
+# Retained per-run terminal snapshots. Same two real sides as above — the host
+# collector arms and reads the bank, the AICPU producer module closes it.
+add_executable(test_chip_swimlane_run_terminal
+    common/test_chip_swimlane_run_terminal.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/chip_swimlane_collector.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/chip_swimlane_collector_aicpu.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/device_run_result_base_aicpu.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/sim/aicpu/inner_platform_regs.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/clock_correlation.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/sim/host/profiling_copy.cpp
+    ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
+)
+target_compile_definitions(test_chip_swimlane_run_terminal PRIVATE SIMPLER_RUNTIME_NAME="test_runtime")
+target_include_directories(test_chip_swimlane_run_terminal PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/aicpu
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+)
+target_link_libraries(test_chip_swimlane_run_terminal PRIVATE
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    pthread
+)
+add_test(NAME test_chip_swimlane_run_terminal COMMAND test_chip_swimlane_run_terminal)
+set_tests_properties(test_chip_swimlane_run_terminal PROPERTIES LABELS "no_hardware")
+
 # Sim kernel threads publish one sticky completion state. A gated unit test
 # proves submission and completion are separate without relying on kernel
 # duration or host scheduling.

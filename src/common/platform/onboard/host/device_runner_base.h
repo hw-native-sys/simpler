@@ -1243,6 +1243,23 @@ protected:
     int ensure_device_run_result_region(uint32_t pipeline_slot, uint64_t run_epoch, KernelArgsHelper &kernel_args);
 
     /**
+     * Resolve and reserve this run's chip-swimlane terminal-snapshot bank, and
+     * return its device address for KernelArgs.
+     *
+     * The bank is the slice of the collector's retained region into which each
+     * producer copies its settled record totals at its last flush, so those
+     * totals survive the next run's counter reset. Indexed by the run's actual
+     * pipeline slot; returns 0 whenever no bank can be resolved (swimlane off,
+     * collector not initialized, slot out of range, or no run identity), which
+     * the device reads as "publish no snapshot".
+     *
+     * Diagnostic-only and never a prepare failure: a run with no bank simply
+     * reports no retained snapshot, and the existing reconcile remains the
+     * authoritative accounting either way.
+     */
+    uint64_t arm_chip_swimlane_run_terminal_bank(uint32_t pipeline_slot, uint64_t run_epoch);
+
+    /**
      * Resolve this run's block_dim: every cluster the device has, i.e.
      * the cached `max_block_dim_`. A run is never narrower than the
      * device — orchestration sizes its cohorts from
@@ -1415,9 +1432,13 @@ protected:
      * Subclasses with arch-specific collectors (`dep_gen_collector_` + its
      * `dep_gen_replay_emit_deps_json` export) inline their own teardown after
      * calling this helper. The sim base carries the same split.
+     *
+     * `run_epoch` identifies the run whose retained terminal snapshot is read
+     * back, which happens only when `device_execution_complete` says the caller
+     * observed this run's completion fence.
      */
     void teardown_shared_collectors_after_run(
-        const DfxRunConfig &dfx, uint32_t pipeline_slot, bool device_execution_complete
+        const DfxRunConfig &dfx, uint32_t pipeline_slot, uint64_t run_epoch, bool device_execution_complete
     );
 
     /**

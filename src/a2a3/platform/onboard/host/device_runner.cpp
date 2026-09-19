@@ -722,7 +722,7 @@ int DeviceRunner::reap_run(const PreparedExecution &prepared) {
         // JSON manifest, i.e. unusable for triage. reconcile/export are not
         // idempotent, so this runs only on the error return; the success path
         // still exports exactly once below.
-        teardown_shared_collectors_after_run(dfx, pipeline_slot, false);
+        teardown_shared_collectors_after_run(dfx, pipeline_slot, prepared.identity.run_epoch, false);
         emit_device_dep_gen_graph(dfx);
         return rc;
     }
@@ -731,7 +731,7 @@ int DeviceRunner::reap_run(const PreparedExecution &prepared) {
 
     // Tear down collectors. stop() joins mgmt then collector in the only safe
     // order (mgmt's final-drain pass into L2 has poll as its consumer).
-    teardown_shared_collectors_after_run(dfx, pipeline_slot, true);
+    teardown_shared_collectors_after_run(dfx, pipeline_slot, prepared.identity.run_epoch, true);
     emit_device_dep_gen_graph(dfx);
 
     return 0;
@@ -1248,6 +1248,11 @@ int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecuti
     // phase pool. Publishing before the release would lose both.
     publish_host_phase_run_to_collector(prepared.pipeline_slot);
 
+    // This run's bank, so a run that arms none publishes 0 rather than whatever
+    // the last run left. Stated unconditionally: the field means "this run's
+    // bank", independently of whether the KernelArgs storage happens to be fresh.
+    prepared.kernel_args.args.chip_swimlane_run_terminal_bank = 0;
+
     int rc = 0;
     if (dfx.chip_swimlane_enabled()) {
         rc =
@@ -1256,6 +1261,11 @@ int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecuti
             LOG_ERROR("init_chip_swimlane failed: %d", rc);
             return rc;
         }
+        // After the init that publishes the region base: the bank is a slice of
+        // that region, and it is resolved per run because it is keyed on this
+        // run's pipeline slot and identity, not on the device's.
+        prepared.kernel_args.args.chip_swimlane_run_terminal_bank =
+            arm_chip_swimlane_run_terminal_bank(prepared.pipeline_slot, prepared.identity.run_epoch);
     }
 
     if (dfx.dump_args_enabled()) {

@@ -95,6 +95,7 @@ private:
     void (*set_platform_run_result_func_)(uint64_t, uint64_t){nullptr};
     void (*set_dump_args_enabled_func_)(bool){nullptr};
     void (*set_platform_chip_swimlane_base_func_)(uint64_t){nullptr};
+    void (*set_platform_chip_swimlane_run_terminal_bank_func_)(uint64_t){nullptr};
     void (*set_platform_chip_swimlane_aicore_rotation_table_func_)(uint64_t){nullptr};
     void (*set_chip_swimlane_enabled_func_)(bool){nullptr};
     void (*set_platform_pmu_base_func_)(uint64_t){nullptr};

@@ -858,6 +858,121 @@ void ChipSwimlaneCollector::reconcile_counters() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Retained per-run terminal snapshots
+// ---------------------------------------------------------------------------
+//
+// publish_run_config below zeroes every pool head at each begin_run, so a run's
+// record totals do not survive its successor. A producer's last flush copies its
+// settled total/dropped into this run's bank, which the host arms per run from
+// the run's actual pipeline slot and reads back only after that run's completion
+// has been established. The bank is retained storage: nothing clears it between
+// runs, so the previous occupant's snapshot stays readable until this run's
+// producers overwrite their own entries.
+
+void *ChipSwimlaneCollector::arm_run_terminal_bank(uint32_t bank_index, uint64_t run_epoch) {
+    if (shm_host_ == nullptr || perf_shared_mem_dev_ == nullptr) return nullptr;
+    if (bank_index >= static_cast<uint32_t>(PLATFORM_RUN_TERMINAL_BANKS)) {
+        LOG_ERROR(
+            "ChipSwimlane terminal: pipeline slot %u exceeds the %d retained banks — no snapshot armed", bank_index,
+            PLATFORM_RUN_TERMINAL_BANKS
+        );
+        return nullptr;
+    }
+    // Zero is the entries' "no snapshot" state, so it cannot also be a run's
+    // identity; a run without one publishes no bank rather than claiming this
+    // one.
+    if (run_epoch == 0) return nullptr;
+
+    return get_run_terminal_bank(perf_shared_mem_dev_, static_cast<int>(bank_index));
+}
+
+ChipSwimlaneCollector::RunTerminalSnapshot
+ChipSwimlaneCollector::read_run_terminal_snapshot(uint32_t bank_index, uint64_t run_epoch) {
+    RunTerminalSnapshot snapshot;
+    snapshot.run_epoch = run_epoch;
+
+    if (shm_host_ == nullptr) return snapshot;
+    if (bank_index >= static_cast<uint32_t>(PLATFORM_RUN_TERMINAL_BANKS)) return snapshot;
+    if (run_epoch == 0) return snapshot;
+
+    ChipSwimlaneRunTerminal *host_bank = get_run_terminal_bank(shm_host_, static_cast<int>(bank_index));
+    // Narrow and checked, rather than relying on the bulk mirror reconcile does:
+    // this is the only read of these bytes, and an unchecked copy would turn a
+    // failed transfer into a snapshot of whatever the shadow happened to hold.
+    if (perf_shared_mem_dev_ != nullptr) {
+        ChipSwimlaneRunTerminal *dev_bank = get_run_terminal_bank(perf_shared_mem_dev_, static_cast<int>(bank_index));
+        int rc = profiling_copy_from_device(host_bank, dev_bank, calc_run_terminal_bank_size());
+        if (rc != 0) {
+            LOG_WARN(
+                "ChipSwimlane terminal: bank %u copy-from-device failed (rc=%d) — snapshot unknown for epoch %lu",
+                bank_index, rc, static_cast<unsigned long>(run_epoch)
+            );
+            return snapshot;
+        }
+    }
+    rmb();
+
+    auto accumulate = [&](RunTerminalClassSnapshot &cls, int base, int count) {
+        for (int i = 0; i < count; i++) {
+            const ChipSwimlaneRunTerminal *entry = get_run_terminal(host_bank, base + i);
+            uint64_t entry_epoch = entry->run_epoch;
+            if (entry_epoch == 0) continue;  // producer never closed into this entry
+            if (entry_epoch != run_epoch) {
+                snapshot.foreign_entries++;
+                continue;
+            }
+            cls.producers++;
+            cls.total += entry->total;
+            cls.dropped += entry->dropped;
+        }
+    };
+    accumulate(snapshot.aicpu_task, PLATFORM_RUN_TERMINAL_AICPU_TASK_BASE, PLATFORM_MAX_CORES);
+    accumulate(snapshot.aicore_task, PLATFORM_RUN_TERMINAL_AICORE_TASK_BASE, PLATFORM_MAX_CORES);
+    accumulate(snapshot.sched_phase, PLATFORM_RUN_TERMINAL_SCHED_PHASE_BASE, PLATFORM_MAX_AICPU_THREADS);
+    accumulate(snapshot.orch_phase, PLATFORM_RUN_TERMINAL_ORCH_PHASE_BASE, PLATFORM_MAX_AICPU_THREADS);
+
+    snapshot.valid = snapshot.aicpu_task.producers > 0 || snapshot.aicore_task.producers > 0 ||
+                     snapshot.sched_phase.producers > 0 || snapshot.orch_phase.producers > 0;
+    return snapshot;
+}
+
+void ChipSwimlaneCollector::report_run_terminal_snapshot(uint32_t bank_index, uint64_t run_epoch) {
+    if (shm_host_ == nullptr) return;
+
+    RunTerminalSnapshot snapshot = read_run_terminal_snapshot(bank_index, run_epoch);
+    if (!snapshot.valid) {
+        LOG_INFO(
+            "ChipSwimlane terminal: no retained snapshot for epoch %lu in bank %u (foreign_entries=%d)",
+            static_cast<unsigned long>(run_epoch), bank_index, snapshot.foreign_entries
+        );
+        return;
+    }
+
+    auto log_class = [&](const char *kind, const RunTerminalClassSnapshot &cls) {
+        if (cls.producers == 0) return;
+        LOG_INFO(
+            "ChipSwimlane terminal: epoch %lu %s retained total=%lu dropped=%lu across %d producer(s)",
+            static_cast<unsigned long>(run_epoch), kind, static_cast<unsigned long>(cls.total),
+            static_cast<unsigned long>(cls.dropped), cls.producers
+        );
+    };
+    log_class("PERF", snapshot.aicpu_task);
+    log_class("AICORE", snapshot.aicore_task);
+    log_class("SCHED_PHASE", snapshot.sched_phase);
+    log_class("ORCH_PHASE", snapshot.orch_phase);
+
+    if (snapshot.foreign_entries > 0) {
+        // Expected on a reused bank: entries the previous occupant closed that
+        // this run's producers did not overwrite. Counted rather than summed,
+        // because they belong to another run's accounting.
+        LOG_INFO(
+            "ChipSwimlane terminal: bank %u holds %d entr(ies) from an earlier run", bank_index,
+            snapshot.foreign_entries
+        );
+    }
+}
+
 void ChipSwimlaneCollector::publish_run_config() {
     // Nothing to publish before the region exists; initialize() writes the level
     // from the member begin_run() just set.

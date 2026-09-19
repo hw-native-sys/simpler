@@ -197,6 +197,11 @@ int DeviceRunner::ensure_binaries_loaded() {
             ))
             return PTO_RUNTIME_ERR_INTERNAL;
         if (!load_sym(
+                "set_platform_chip_swimlane_run_terminal_bank",
+                reinterpret_cast<void **>(&set_platform_chip_swimlane_run_terminal_bank_func_)
+            ))
+            return PTO_RUNTIME_ERR_INTERNAL;
+        if (!load_sym(
                 "set_platform_chip_swimlane_aicore_rotation_table",
                 reinterpret_cast<void **>(&set_platform_chip_swimlane_aicore_rotation_table_func_)
             ))
@@ -418,6 +423,7 @@ int DeviceRunner::prepare_execution(
         set_platform_dep_gen_base_func_ == nullptr || set_dep_gen_enabled_func_ == nullptr ||
         set_scope_stats_enabled_func_ == nullptr || set_platform_scope_stats_base_func_ == nullptr ||
         set_platform_chip_swimlane_base_func_ == nullptr ||
+        set_platform_chip_swimlane_run_terminal_bank_func_ == nullptr ||
         set_platform_chip_swimlane_aicore_rotation_table_func_ == nullptr ||
         set_chip_swimlane_enabled_func_ == nullptr) {
         LOG_ERROR("Executor functions not loaded. Call ensure_binaries_loaded first.");
@@ -463,6 +469,7 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 set_platform_dump_base_func_(kernel_args_.dump_data_base);
                 set_dump_args_enabled_func_(prepared->dfx.dump_args_enabled());
                 set_platform_chip_swimlane_base_func_(kernel_args_.chip_swimlane_data_base);
+                set_platform_chip_swimlane_run_terminal_bank_func_(kernel_args_.chip_swimlane_run_terminal_bank);
                 set_platform_chip_swimlane_aicore_rotation_table_func_(
                     kernel_args_.chip_swimlane_aicore_rotation_table
                 );
@@ -618,12 +625,16 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
         // them: a failed run is the one whose swimlane, dumped tensors and
         // dep_gen graph are worth reading. `false` withholds only the
         // DeviceExecutionComplete clock anchor, which this run never reached.
-        teardown_shared_collectors_after_run(dfx, active.prepared->pipeline_slot, false);
+        teardown_shared_collectors_after_run(
+            dfx, active.prepared->pipeline_slot, active.prepared->identity.run_epoch, false
+        );
         emit_device_dep_gen_graph(dfx);
         return runtime_rc;
     }
 
-    teardown_shared_collectors_after_run(dfx, active.prepared->pipeline_slot, true);
+    teardown_shared_collectors_after_run(
+        dfx, active.prepared->pipeline_slot, active.prepared->identity.run_epoch, true
+    );
     emit_device_dep_gen_graph(dfx);
 
     print_handshake_results();
@@ -686,6 +697,7 @@ void DeviceRunner::unload_executor_binaries() {
         set_platform_dump_base_func_ = nullptr;
         set_dump_args_enabled_func_ = nullptr;
         set_platform_chip_swimlane_base_func_ = nullptr;
+        set_platform_chip_swimlane_run_terminal_bank_func_ = nullptr;
         set_platform_chip_swimlane_aicore_rotation_table_func_ = nullptr;
         set_chip_swimlane_enabled_func_ = nullptr;
         set_platform_pmu_base_func_ = nullptr;
@@ -823,6 +835,11 @@ int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecuti
     // phase pool. Publishing before the release would lose both.
     publish_host_phase_run_to_collector(prepared.pipeline_slot);
 
+    // This run's bank, so a run that arms none publishes 0 rather than whatever
+    // the last run left. `kernel_args_` is a runner member that outlives the run,
+    // so the reset is load-bearing here, not defensive.
+    kernel_args_.chip_swimlane_run_terminal_bank = 0;
+
     int rc = 0;
     if (dfx.chip_swimlane_enabled()) {
         rc = init_chip_swimlane(num_aicore, aicpu_thread_num, device_id_, dfx.chip_swimlane_level);
@@ -837,6 +854,11 @@ int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecuti
             core_types[i] = runtime.get_workers()[i].core_type;
         }
         chip_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
+        // After the init that publishes the region base: the bank is a slice of
+        // that region, and it is resolved per run because it is keyed on this
+        // run's pipeline slot and identity, not on the device's.
+        kernel_args_.chip_swimlane_run_terminal_bank =
+            arm_chip_swimlane_run_terminal_bank(prepared.pipeline_slot, prepared.identity.run_epoch);
     }
 
     if (dfx.dump_args_enabled()) {

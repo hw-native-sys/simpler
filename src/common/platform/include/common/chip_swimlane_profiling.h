@@ -326,6 +326,83 @@ struct ChipSwimlaneActiveHead {
 
 static_assert(sizeof(ChipSwimlaneActiveHead) == 64, "ChipSwimlaneActiveHead must be one cache line");
 
+// =============================================================================
+// ChipSwimlaneRunTerminal - per-run terminal accounting snapshot
+// =============================================================================
+
+/**
+ * One producer's final record accounting for one run, retained past that run.
+ *
+ * `publish_run_config` zeroes every pool head at each `begin_run`, so a run's
+ * totals do not survive its successor. A producer copies its settled counters
+ * here at its last flush; the entry stays readable until its bank is reused.
+ *
+ * `run_epoch` is the run identity the producer was executing under. Zero means
+ * "no snapshot": it is the initialized state, and it is not a value a live run
+ * can carry (`device_run_result.h` treats `run_epoch != 0` as the validity
+ * test). There is no separate state flag — a matching non-zero epoch is the
+ * whole test, and a second field would imply a concurrent publication protocol
+ * this design does not provide.
+ *
+ * Only `total` and `dropped` are retained. They are the two counters every pool
+ * class maintains and the two the host's reconcile already compares;
+ * `live_record_count` and `published_record_count` are written by the AICore
+ * pool alone, so retaining them would record zero for every AICPU and phase
+ * producer.
+ *
+ * One entry per cache line, and the array start is line-aligned. The producer
+ * publishes with `cache_flush_range`, which rounds to whole 64-byte lines, so
+ * two entries sharing a line would let one producer's flush write back a stale
+ * copy of the other's.
+ */
+struct ChipSwimlaneRunTerminal {
+    volatile uint64_t run_epoch;  // 8 — 0 = no snapshot in this entry
+    volatile uint32_t total;      // 4 — total_record_count when the producer closed
+    volatile uint32_t dropped;    // 4 — dropped_record_count when the producer closed
+    uint32_t pad[12];             // 48 → 64B
+} __attribute__((aligned(64)));
+
+static_assert(sizeof(ChipSwimlaneRunTerminal) == 64, "ChipSwimlaneRunTerminal must be one cache line");
+static_assert(alignof(ChipSwimlaneRunTerminal) == 64, "ChipSwimlaneRunTerminal must be cache-line aligned");
+static_assert(offsetof(ChipSwimlaneRunTerminal, total) == 8, "ChipSwimlaneRunTerminal::total offset drift");
+static_assert(offsetof(ChipSwimlaneRunTerminal, dropped) == 12, "ChipSwimlaneRunTerminal::dropped offset drift");
+// The device writes this entry and the host reads it back with a raw byte copy,
+// so it is a wire struct. The compiler builtins are used rather than the
+// `<type_traits>` spellings because this header is also compiled by ccec, which
+// the standard library headers are not available to.
+static_assert(__is_trivially_copyable(ChipSwimlaneRunTerminal), "ChipSwimlaneRunTerminal must be memcpy-able");
+static_assert(__is_standard_layout(ChipSwimlaneRunTerminal), "ChipSwimlaneRunTerminal must be standard-layout");
+
+/**
+ * Producers that own a terminal entry, in bank order.
+ *
+ * The grid is dimensioned by platform maxima for the same reason the pool
+ * arrays are: host and device must address it from a basis they cannot
+ * disagree about.
+ */
+constexpr int PLATFORM_RUN_TERMINAL_AICPU_TASK_BASE = 0;
+constexpr int PLATFORM_RUN_TERMINAL_AICORE_TASK_BASE = PLATFORM_MAX_CORES;
+constexpr int PLATFORM_RUN_TERMINAL_SCHED_PHASE_BASE = 2 * PLATFORM_MAX_CORES;
+constexpr int PLATFORM_RUN_TERMINAL_ORCH_PHASE_BASE = 2 * PLATFORM_MAX_CORES + PLATFORM_MAX_AICPU_THREADS;
+constexpr int PLATFORM_RUN_TERMINAL_PRODUCERS = 2 * PLATFORM_MAX_CORES + 2 * PLATFORM_MAX_AICPU_THREADS;
+
+// One bank per retained run. This file is compiled by ccec for AICore, which
+// must not pull in the host worker API, so the pipeline depth is mirrored here
+// and cross-checked against PTO_PIPELINE_MAX_DEPTH in the host collector, where
+// both headers are visible.
+constexpr int PLATFORM_RUN_TERMINAL_BANKS = 2;
+
+inline size_t calc_run_terminal_bank_size() {
+    return static_cast<size_t>(PLATFORM_RUN_TERMINAL_PRODUCERS) * sizeof(ChipSwimlaneRunTerminal);
+}
+
+// A whole number of cache lines, so aligning the array start aligns every entry
+// in every bank rather than only the first bank's.
+static_assert(
+    (PLATFORM_RUN_TERMINAL_PRODUCERS * sizeof(ChipSwimlaneRunTerminal)) % 64 == 0,
+    "a terminal bank must be a whole number of cache lines"
+);
+
 // The AICore pool's four counters split every dispatch into exactly one bucket:
 // `live` while its buffer is still the active one, `published` once that buffer
 // has been handed to the host, `dropped` when the dispatch had nowhere to land.
@@ -756,6 +833,8 @@ inline ChipSwimlaneAicpuTaskPool *get_perf_buffer_state(void *base_ptr, int core
  *   [ChipSwimlaneAicoreTaskPool      × PLATFORM_MAX_CORES]
  *   [ChipSwimlaneAicpuSchedPhasePool × PLATFORM_MAX_AICPU_THREADS]
  *   [ChipSwimlaneAicpuOrchPhasePool  × PLATFORM_MAX_AICPU_THREADS]
+ *   [pad to 64B]
+ *   [ChipSwimlaneRunTerminal × PLATFORM_RUN_TERMINAL_PRODUCERS × BANKS]
  *
  * Every array is dimensioned by a platform maximum, not by the run. The host
  * and the AICPU both address this region, and each used to supply its own core
@@ -767,10 +846,24 @@ inline ChipSwimlaneAicpuTaskPool *get_perf_buffer_state(void *base_ptr, int core
  *
  * @return Total bytes needed for header + all buffer states
  */
-inline size_t calc_perf_data_size_with_phases() {
+inline size_t calc_perf_data_size_before_run_terminals() {
     return calc_perf_data_size(PLATFORM_MAX_CORES) + PLATFORM_MAX_CORES * sizeof(ChipSwimlaneAicoreTaskPool) +
            PLATFORM_MAX_AICPU_THREADS * sizeof(ChipSwimlaneAicpuSchedPhasePool) +
            PLATFORM_MAX_AICPU_THREADS * sizeof(ChipSwimlaneAicpuOrchPhasePool);
+}
+
+// Smallest byte offset the terminal bank array may start at: past everything
+// before it, with no alignment assumption of its own. The array's actual start
+// is the next cache line at or after `base + this`, computed on the absolute
+// address by `get_run_terminal_bank` — rounding the offset alone would only
+// line up the entries if the region base were itself line-aligned, which no
+// allocator on either side of this promises.
+inline size_t run_terminal_min_offset() { return calc_perf_data_size_before_run_terminals(); }
+
+inline size_t calc_perf_data_size_with_phases() {
+    // The 63 bytes are the alignment slack the accessor may consume.
+    return run_terminal_min_offset() + 63 +
+           static_cast<size_t>(PLATFORM_RUN_TERMINAL_BANKS) * calc_run_terminal_bank_size();
 }
 
 /**
@@ -823,6 +916,30 @@ inline ChipSwimlaneAicpuOrchPhasePool *get_orch_phase_buffer_states(void *base_p
 
 inline ChipSwimlaneAicpuOrchPhasePool *get_orch_phase_buffer_state(void *base_ptr, int thread_idx) {
     return &get_orch_phase_buffer_states(base_ptr)[thread_idx];
+}
+
+/**
+ * First terminal entry of one retained bank.
+ *
+ * The host resolves this for the run's actual pipeline slot and hands the
+ * device pointer over in KernelArgs; the device never derives a bank from a
+ * slot it does not have.
+ */
+inline ChipSwimlaneRunTerminal *get_run_terminal_bank(void *base_ptr, int bank_index) {
+    // Aligned on the absolute address, not on the offset: the flush that
+    // publishes an entry writes back whole cache lines, so an entry straddling a
+    // line boundary would let one producer's flush restore a stale copy of its
+    // neighbour's. A bank's size is a whole number of lines, so aligning the
+    // array start aligns every entry.
+    const uintptr_t unaligned = reinterpret_cast<uintptr_t>(base_ptr) + run_terminal_min_offset();
+    const uintptr_t array_start = (unaligned + 63) & ~static_cast<uintptr_t>(63);
+    return reinterpret_cast<ChipSwimlaneRunTerminal *>(
+        array_start + static_cast<size_t>(bank_index) * calc_run_terminal_bank_size()
+    );
+}
+
+inline ChipSwimlaneRunTerminal *get_run_terminal(ChipSwimlaneRunTerminal *bank, int producer_index) {
+    return &bank[producer_index];
 }
 
 #ifdef __cplusplus

@@ -103,6 +103,11 @@ struct KernelArgs {
     uint64_t dump_data_base{0};  // Dump shared memory base address; use explicit flags to detect enablement
     // chip swimlane shared memory base address; use explicit flags to detect enablement
     uint64_t chip_swimlane_data_base{0};
+    // This run's chip-swimlane terminal-snapshot bank, resolved by the host from
+    // the run's pipeline slot. 0 whenever the host resolved no bank, including
+    // every run with swimlane off; the device treats 0 as "publish no snapshot"
+    // and never derives an address of its own.
+    uint64_t chip_swimlane_run_terminal_bank{0};
     uint64_t pmu_data_base{0};  // PMU shared memory base address; use explicit flags to detect enablement
     // Per-core PMU MMIO register base address array. 0 on sim, and 0 when this
     // run leaves PMU off; the table itself is device-constant and outlives any
@@ -148,6 +153,24 @@ struct KernelArgs {
 
 static_assert(offsetof(KernelArgs, runtime_args) == 0, "KernelArgs::runtime_args offset drift");
 static_assert(offsetof(KernelArgs, regs) == 8, "KernelArgs::regs offset drift");
+
+// The swimlane bases are not offset-locked by any device contract — AICPU reads
+// them by field name from a CANN-private copy of the whole struct. These pin the
+// measured a2a3 layout so that appending, reordering, or widening a field is a
+// build failure rather than a silently different launch payload: `sizeof` is
+// what `launch_aicpu_payload` hands to `rtsLaunchCpuKernel` as `argsSize`, and
+// what `PersistentKernelArgs::prepare_once` allocates and copies H2D.
+static_assert(offsetof(KernelArgs, chip_swimlane_data_base) == 32, "KernelArgs::chip_swimlane_data_base offset drift");
+static_assert(
+    offsetof(KernelArgs, chip_swimlane_run_terminal_bank) == 40,
+    "KernelArgs::chip_swimlane_run_terminal_bank offset drift"
+);
+static_assert(sizeof(KernelArgs) == 120, "KernelArgs launch-payload size drift");
+static_assert(alignof(KernelArgs) == 8, "KernelArgs launch-payload alignment drift");
+// No conditional members: the struct body carries no preprocessor branch, so
+// these values are the same in every translation unit that sees this header.
+static_assert(__is_trivially_copyable(KernelArgs), "KernelArgs must be memcpy-able to the device");
+static_assert(__is_standard_layout(KernelArgs), "KernelArgs must be standard-layout");
 
 /**
  * AicoreLaunchArgs - the AICore entry's launch argument block.

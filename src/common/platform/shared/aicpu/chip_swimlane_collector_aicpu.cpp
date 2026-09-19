@@ -23,6 +23,7 @@
 #include <cinttypes>
 #include <cstring>
 
+#include "aicpu/cache_maintenance.h"
 #include "aicpu/platform_regs.h"
 #include "aicpu/profiler_device_engine.h"
 #include "aicpu/device_run_result_base_aicpu.h"
@@ -117,6 +118,15 @@ static uint64_t g_platform_chip_swimlane_aicore_rotation_table = 0;
 extern "C" void set_platform_chip_swimlane_base(uint64_t chip_swimlane_data_base) {
     g_platform_chip_swimlane_base = chip_swimlane_data_base;
 }
+
+// This run's terminal-snapshot bank, resolved by the host from the run's actual
+// pipeline slot. Zero when the host published none, which makes every close a
+// no-op — the device never derives a bank from a slot it does not have.
+static uint64_t g_platform_chip_swimlane_run_terminal_bank = 0;
+
+extern "C" void set_platform_chip_swimlane_run_terminal_bank(uint64_t bank_addr) {
+    g_platform_chip_swimlane_run_terminal_bank = bank_addr;
+}
 extern "C" uint64_t get_platform_chip_swimlane_base() { return g_platform_chip_swimlane_base; }
 extern "C" void set_chip_swimlane_enabled(bool enable) {
     // Every launch publishes its enable bit before the onboard affinity barrier
@@ -135,6 +145,33 @@ extern "C" void set_chip_swimlane_enabled(bool enable) {
     }
 }
 extern "C" bool is_chip_swimlane_enabled() { return g_enable_chip_swimlane; }
+
+// Copy one producer's settled counters into its terminal entry and publish it.
+//
+// Called at that producer's last write of the run, after every path that can
+// still change `total` or `dropped`. The entry is one cache line and this
+// producer is its only writer, so the flush — which rounds to whole lines —
+// writes back nothing another producer owns. `run_epoch` is stored last among
+// the three fields, but that ordering carries no publication guarantee on its
+// own: the host reads this only after the run's completion fence, never
+// concurrently.
+static void close_run_terminal(int producer_index, const ChipSwimlaneActiveHead *head) {
+    if (g_platform_chip_swimlane_run_terminal_bank == 0 || head == nullptr) return;
+    if (producer_index < 0 || producer_index >= PLATFORM_RUN_TERMINAL_PRODUCERS) return;
+    const uint64_t epoch = get_platform_run_result_epoch();
+    // Zero is the "no snapshot" state; a run without an identity leaves the
+    // entry as it is rather than claiming this bank.
+    if (epoch == 0) return;
+
+    ChipSwimlaneRunTerminal *entry = get_run_terminal(
+        reinterpret_cast<ChipSwimlaneRunTerminal *>(g_platform_chip_swimlane_run_terminal_bank), producer_index
+    );
+    entry->total = head->total_record_count;
+    entry->dropped = head->dropped_record_count;
+    entry->run_epoch = epoch;
+    wmb();
+    cache_flush_range(entry, sizeof(ChipSwimlaneRunTerminal));
+}
 extern "C" void set_platform_chip_swimlane_aicore_rotation_table(uint64_t table_addr) {
     g_platform_chip_swimlane_aicore_rotation_table = table_addr;
 }
@@ -861,6 +898,22 @@ void chip_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int 
 
     wmb();
 
+    // Terminal snapshots for every core this thread owns, including cores whose
+    // pools stayed idle: an enabled producer that closes with zeros is
+    // distinguishable from one that never reported. Deliberately a second pass,
+    // after the loop above has settled every counter it can change.
+    for (int i = 0; i < core_num; i++) {
+        const int core_id = cur_thread_cores[i];
+        const ChipSwimlaneAicpuTaskPool *task_state = s_aicpu_task_pools[core_id];
+        if (task_state != nullptr) {
+            close_run_terminal(PLATFORM_RUN_TERMINAL_AICPU_TASK_BASE + core_id, &task_state->head);
+        }
+        const ChipSwimlaneAicoreTaskPool *ac_state = s_aicore_task_pools[core_id];
+        if (ac_state != nullptr) {
+            close_run_terminal(PLATFORM_RUN_TERMINAL_AICORE_TASK_BASE + core_id, &ac_state->head);
+        }
+    }
+
     LOG_INFO("Thread %d: Performance buffer flush complete, %d buffers flushed", thread_idx, flushed_count);
 }
 
@@ -1166,6 +1219,12 @@ void chip_swimlane_aicpu_flush_sched_phase_buffer(int thread_idx) {
         ChipSwimlaneBufferKind::AicpuSchedPhase, "sched"
     );
     s_current_sched_phase_buffers[thread_idx] = nullptr;
+    // Here rather than inside flush_phase_pool, which returns early for a pool
+    // with no active buffer or no records — an enabled-but-idle pool must still
+    // close.
+    if (s_sched_phase_pools[thread_idx] != nullptr) {
+        close_run_terminal(PLATFORM_RUN_TERMINAL_SCHED_PHASE_BASE + thread_idx, &s_sched_phase_pools[thread_idx]->head);
+    }
 }
 
 // Final-drain flush of the single orchestrator's orch-phase pool (ordinal 0).
@@ -1175,6 +1234,11 @@ void chip_swimlane_aicpu_flush_orch_phase_buffer(int thread_idx) {
     if (!s_phase_initialized || s_chip_swimlane_header == nullptr) return;
     flush_phase_pool(thread_idx, /*pool_idx=*/0, s_orch_phase_pools[0], ChipSwimlaneBufferKind::AicpuOrchPhase, "orch");
     s_current_orch_phase_buffers[0] = nullptr;
+    // Single orchestrator instance, so the entry is pool 0's regardless of which
+    // thread ran it.
+    if (s_orch_phase_pools[0] != nullptr) {
+        close_run_terminal(PLATFORM_RUN_TERMINAL_ORCH_PHASE_BASE + 0, &s_orch_phase_pools[0]->head);
+    }
 }
 
 void chip_swimlane_aicpu_init_core_assignments(int total_cores) {

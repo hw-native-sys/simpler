@@ -370,6 +370,19 @@ public:
      * open and start their own.
      */
     void start_shared_collectors_for_run(const DfxRunConfig &dfx, uint32_t pipeline_slot);
+    /**
+     * Resolve and reserve this run's chip-swimlane terminal-snapshot bank, and
+     * return its device address for KernelArgs.
+     *
+     * The bank is the slice of the collector's retained region into which each
+     * producer copies its settled record totals at its last flush, so those
+     * totals survive the next run's counter reset. Indexed by the run's actual
+     * pipeline slot; returns 0 whenever no bank can be resolved (swimlane off,
+     * collector not initialized, slot out of range, or no run identity), which
+     * the device reads as "publish no snapshot". Diagnostic-only and never a
+     * prepare failure. Mirrors the onboard base.
+     */
+    uint64_t arm_chip_swimlane_run_terminal_bank(uint32_t pipeline_slot, uint64_t run_epoch);
     /** Write this pass's per-event host phase records, if it collected any. */
     void write_host_phase_records_artifact(const std::string &output_prefix, uint32_t pipeline_slot);
     /**
@@ -382,9 +395,13 @@ public:
      * Subclasses with arch-specific collectors (`dep_gen_collector_` + its
      * `dep_gen_replay_emit_deps_json` export) inline their own teardown after
      * calling this helper, as on onboard.
+     *
+     * `run_epoch` identifies the run whose retained terminal snapshot is read
+     * back, which happens only when `device_execution_complete` says the caller
+     * observed this run's completion.
      */
     void teardown_shared_collectors_after_run(
-        const DfxRunConfig &dfx, uint32_t pipeline_slot, bool device_execution_complete
+        const DfxRunConfig &dfx, uint32_t pipeline_slot, uint64_t run_epoch, bool device_execution_complete
     );
     /** Start the level-4 Host/Device clock correlation once per run. */
     void begin_clock_correlation_session_if_needed(uint32_t pipeline_slot) noexcept;
