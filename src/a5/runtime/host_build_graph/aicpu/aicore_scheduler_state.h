@@ -24,17 +24,22 @@ inline bool aicore_scheduler_runtime_mode_is_explicit_legacy(uint32_t mode) {
 
 inline bool aicore_scheduler_runtime_enabled(const Runtime *runtime) {
     return runtime != nullptr && runtime->get_worker_count() > 0 &&
-           aicore_scheduler_runtime_mode_is_resident(runtime->dev.workers[0].aicpu_ready);
+           aicore_scheduler_runtime_mode_is_resident(runtime->dev.scheduler_bootstrap.runtime_mode);
 }
 
 inline bool aicore_scheduler_explicit_legacy_enabled(const Runtime *runtime) {
     return runtime != nullptr && runtime->get_worker_count() > 0 &&
-           aicore_scheduler_runtime_mode_is_explicit_legacy(runtime->dev.workers[0].aicpu_ready);
+           aicore_scheduler_runtime_mode_is_explicit_legacy(runtime->dev.scheduler_bootstrap.runtime_mode);
 }
 
+// Worker 0's context sits at the published base, so the bootstrap context is the
+// base itself. A zero base is "no resident scheduler state", the same verdict a
+// zero handshake task carried before.
 inline SchedulerWorkerContext *aicore_scheduler_bootstrap_context(Runtime *runtime) {
-    if (!aicore_scheduler_runtime_enabled(runtime) || runtime->dev.workers[0].task == 0) return nullptr;
-    return reinterpret_cast<SchedulerWorkerContext *>(runtime->dev.workers[0].task);
+    if (!aicore_scheduler_runtime_enabled(runtime) || runtime->dev.scheduler_bootstrap.worker_context_base == 0) {
+        return nullptr;
+    }
+    return reinterpret_cast<SchedulerWorkerContext *>(runtime->dev.scheduler_bootstrap.worker_context_base);
 }
 
 inline void *aicore_scheduler_state_base(SchedulerWorkerContext *context) {

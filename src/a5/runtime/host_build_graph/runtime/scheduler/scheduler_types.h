@@ -1295,6 +1295,14 @@ inline __aicore__ __gm__ T *scheduler_state_at(__gm__ void *base, uint64_t offse
     return reinterpret_cast<__gm__ T *>(reinterpret_cast<__gm__ uint8_t *>(base) + offset);
 }
 
+// Worker i's context, from the base worker 0 sits at — the address the host
+// publishes in DeviceRuntimeLaunchDesc::scheduler_bootstrap. The AICore derives
+// its own pre-READY context with this and the AICPU republishes the same address
+// onto each handshake at hand-off, so the stride has one definition.
+inline __aicore__ uint64_t scheduler_worker_context_address(uint64_t worker_context_base, int32_t worker_index) {
+    return worker_context_base + static_cast<uint64_t>(worker_index) * sizeof(SchedulerWorkerContext);
+}
+
 #if !defined(__CCE_AICORE__)
 #include <type_traits>
 static_assert(std::is_standard_layout_v<AicoreSchedulerLayout> && std::is_trivially_copyable_v<AicoreSchedulerLayout>);

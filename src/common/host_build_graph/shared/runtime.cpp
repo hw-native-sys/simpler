@@ -28,6 +28,9 @@
 Runtime::Runtime() {
     // Initialize the device-copied descriptor (`dev`).
     std::memset(dev.workers, 0, sizeof(dev.workers));
+    dev.scheduler_bootstrap.runtime_mode = 0;
+    dev.scheduler_bootstrap.reserved_ = 0;
+    dev.scheduler_bootstrap.worker_context_base = 0;
     dev.worker_count = 0;
     dev.aicpu_thread_num = 1;
     std::memset(dev.aicpu_allowed_cpus, 0, sizeof(dev.aicpu_allowed_cpus));

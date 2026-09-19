@@ -528,11 +528,17 @@ __aicore__ bool run_ready_dispatch_loop(
 }  // namespace
 
 __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type) {
+    // The host's selection and its bootstrap address are on their own line, so
+    // observing the handshake line does not observe them. One observe covers the
+    // whole struct because it is exactly one 64-byte line.
+    __gm__ SchedulerBootstrapInputs *bootstrap = &runtime->dev.scheduler_bootstrap;
+    scheduler_observe_cache_line(bootstrap);
+    const uint32_t runtime_mode = bootstrap->runtime_mode;
     __gm__ Handshake *handshake = (__gm__ Handshake *)(&runtime->dev.workers[block_idx]);
     const uint32_t profiling_flag = get_aicore_profiling_flag();
     scheduler_observe_cache_line(handshake);
-    if ((handshake->aicpu_ready != SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING &&
-         handshake->aicpu_ready != SCHEDULER_RUNTIME_MODE_RESIDENT_READY)) {
+    if (runtime_mode != SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING &&
+        runtime_mode != SCHEDULER_RUNTIME_MODE_RESIDENT_READY) {
         legacy_aicore_execute(runtime, block_idx, core_type);
         return;
     }
@@ -548,10 +554,14 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
     // AICPU publishes the fully configured context through GM. This lets
     // AICore perform all pre-kernel work without consuming a DMB launch.
-    // Host publishes enough immutable scheduler-state addressing for the READY
-    // watchdog. AICPU fills the topology-dependent context fields before READY,
-    // so this pre-publish view must not be reused for execution.
-    __gm__ SchedulerWorkerContext *pending_context = reinterpret_cast<__gm__ SchedulerWorkerContext *>(handshake->task);
+    // The host-published base plus this core's index gives the same address the
+    // AICPU republishes on the handshake at hand-off, so it carries enough
+    // immutable scheduler-state addressing for the READY watchdog. AICPU fills
+    // the topology-dependent context fields before READY, so this pre-publish
+    // view must not be reused for execution.
+    __gm__ SchedulerWorkerContext *pending_context = reinterpret_cast<__gm__ SchedulerWorkerContext *>(
+        scheduler_worker_context_address(bootstrap->worker_context_base, block_idx)
+    );
     scheduler_observe_cache_line(pending_context);
     __gm__ void *pending_scheduler_state_base =
         reinterpret_cast<__gm__ void *>(pending_context->scheduler_state_base_address);

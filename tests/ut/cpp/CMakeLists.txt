@@ -1407,6 +1407,13 @@ add_a5_hbg_runtime_test(test_a5_hbg_scheduler_contracts a5/test_hbg_scheduler_co
 target_include_directories(test_a5_hbg_scheduler_contracts PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/host_build_graph/aicpu
 )
+add_a5_hbg_runtime_test(test_a5_hbg_scheduler_bootstrap a5/test_hbg_scheduler_bootstrap.cpp)
+target_include_directories(test_a5_hbg_scheduler_bootstrap PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/host_build_graph/aicpu
+)
+target_sources(test_a5_hbg_scheduler_bootstrap PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common/host_build_graph/shared/runtime.cpp
+)
 add_a5_hbg_runtime_test(test_a5_hbg_scheduler_ready a5/test_hbg_scheduler_ready.cpp)
 add_a5_hbg_runtime_test(test_a5_hbg_scheduler_dispatch a5/test_hbg_scheduler_dispatch.cpp)
 add_a2a3_hbg_runtime_test(test_hbg_graph_submit_failure common/test_hbg_graph_submit_failure.cpp)

@@ -83,20 +83,21 @@
  * between cores and optimize cache coherency operations.
  *
  * Field Access Patterns:
- * - aicpu_ready: unused on a2a3. On a5 it carries the AICore scheduler runtime
- *   mode (SCHEDULER_RUNTIME_MODE_*): the host publishes the selected mode when
- *   it builds the scheduler state, the AICPU dispatches on worker 0's copy, and
- *   the AICore polls its own for RESIDENT_READY
+ * - aicpu_ready: unused on a2a3. On a5 it is the AICPU's resident hand-off
+ *   publication: the AICPU writes SCHEDULER_RUNTIME_MODE_RESIDENT_READY once a
+ *   worker's context is filled, and that worker's AICore polls its own copy for
+ *   it. The host publishes the selected mode in
+ *   DeviceRuntimeLaunchDesc::scheduler_bootstrap, not here
  * - aicore_done: Written by AICore, read by AICPU (final report; physical_core_id
  *   and core_type are published alongside it in the same write)
  * - task: Written by AICPU before window-open, read by AICore after window-open.
- *   On a5 the host writes it first, holding the address of that worker's
- *   SchedulerWorkerContext, and the AICPU republishes it at resident hand-off
+ *   On a5 the AICPU publishes it again at resident hand-off; the AICore's
+ *   pre-READY context address comes from scheduler_bootstrap instead
  * - core_type: Written by AICore (with aicore_done), read by AICPU (CoreType::AIC or CoreType::AIV)
  * - physical_core_id: Written by AICore (with aicore_done), read by AICPU
  */
 struct Handshake {
-    volatile uint32_t aicpu_ready;  // a2a3: unused. a5: SCHEDULER_RUNTIME_MODE_* (see above)
+    volatile uint32_t aicpu_ready;  // a2a3: unused. a5: AICPU resident hand-off publication (see above)
     volatile uint32_t aicore_done;  // AICore ready signal: 0=not ready, core_id+1=ready
     volatile uint64_t task;         // DispatchPayload*, or on a5 a SchedulerWorkerContext address
     volatile CoreType core_type;    // Core type: CoreType::AIC or CoreType::AIV (reported by AICore with aicore_done)
@@ -110,6 +111,37 @@ struct Handshake {
 // Runtime::teardown_gates, one isolated line each; A5 leaves them unused.
 static_assert(sizeof(Handshake) == 64);
 static_assert(std::is_standard_layout_v<Handshake> && std::is_trivially_copyable_v<Handshake>);
+
+/**
+ * Host-authored scheduler bootstrap inputs, A5 host_build_graph only.
+ *
+ * Both words are written by the host alone and read by the AICPU and the AICore;
+ * no device tier writes them. That is what separates them from `Handshake`, where
+ * `aicpu_ready` doubles as the AICPU's RESIDENT_READY publication and `task` as
+ * the address the AICPU republishes at hand-off.
+ *
+ * `runtime_mode` is 0 until a run publishes a choice: a zero is "no scheduler
+ * selected", not a selection, and every supported fallback is published
+ * explicitly. `worker_context_base` is the device address of worker 0's
+ * SchedulerWorkerContext, so worker i's context is
+ * `worker_context_base + i * sizeof(SchedulerWorkerContext)`; it is 0 whenever
+ * the mode is not resident.
+ *
+ * One 64-byte line of its own so a single AICore `scheduler_observe_cache_line`
+ * covers exactly the words that follow it, and so no field another tier writes
+ * can share the line. Declared on A2/A3 and read and written by no A2/A3 code —
+ * unused reserved storage there.
+ */
+struct alignas(64) SchedulerBootstrapInputs {
+    volatile uint32_t runtime_mode;         // A5 HBG: SCHEDULER_RUNTIME_MODE_*; 0 = none published
+    volatile uint32_t reserved_;            // keeps worker_context_base 8-byte aligned
+    volatile uint64_t worker_context_base;  // device address of worker 0's SchedulerWorkerContext, 0 when unused
+};
+
+static_assert(sizeof(SchedulerBootstrapInputs) == 64);
+static_assert(
+    std::is_standard_layout_v<SchedulerBootstrapInputs> && std::is_trivially_copyable_v<SchedulerBootstrapInputs>
+);
 
 // =============================================================================
 // Runtime Class
@@ -158,7 +190,12 @@ static_assert(std::is_standard_layout_v<Handshake> && std::is_trivially_copyable
 struct alignas(64) DeviceRuntimeLaunchDesc {
     // Handshake buffers for AICPU-AICore communication
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
-    int worker_count;                       // Number of active workers
+
+    // Scheduler selection and the address its bootstrap starts from. Host-written
+    // only; see SchedulerBootstrapInputs.
+    SchedulerBootstrapInputs scheduler_bootstrap;
+
+    int worker_count;  // Number of active workers
 
     // Execution parameters for AICPU scheduling.
     //
@@ -382,6 +419,15 @@ public:
     void set_aicpu_thread_num(int n) { dev.aicpu_thread_num = n; }
     Handshake *get_workers() { return dev.workers; }
     const Handshake *get_workers() const { return dev.workers; }
+
+    // The two bootstrap words move together, so every A5 selection path goes
+    // through here: a resident base surviving a legacy selection would name an
+    // allocation that selection has already released, and a resident mode
+    // without its base would send each AICore to a null context.
+    void publish_scheduler_bootstrap(uint32_t mode, uint64_t worker_context_base) {
+        dev.scheduler_bootstrap.runtime_mode = mode;
+        dev.scheduler_bootstrap.worker_context_base = worker_context_base;
+    }
     AicoreTeardownControl *get_teardown_gates() { return dev.teardown_gates; }
     int32_t get_aicpu_allowed_cpu_count() const { return dev.aicpu_allowed_cpu_count; }
     void set_aicpu_allowed_cpu_count(int32_t n) { dev.aicpu_allowed_cpu_count = n; }

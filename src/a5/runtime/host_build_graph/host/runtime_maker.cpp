@@ -954,6 +954,10 @@ struct GraphHostStateBinding {
     OrchestratorState &orchestrator;
 };
 
+// The two bootstrap words move together: a resident base surviving a legacy
+// selection would name a freed allocation, and a mode without its base would send
+// the AICore to a null context. Every selection path goes through
+// publish_scheduler_bootstrap.
 void release_scheduler_state(Runtime *runtime, const HostApi *api) {
     if (runtime == nullptr || api == nullptr) return;
     SchedulerStateOwner owner{};
@@ -966,6 +970,7 @@ void release_scheduler_state(Runtime *runtime, const HostApi *api) {
         }
     }
     if (owner.allocation != nullptr) api->device_free(owner.allocation);
+    runtime->publish_scheduler_bootstrap(0, 0);
     for (int32_t i = 0; i < runtime->get_worker_count(); ++i) {
         runtime->dev.workers[i].aicpu_ready = 0;
         runtime->dev.workers[i].task = 0;
@@ -976,8 +981,9 @@ void select_legacy_scheduler(Runtime *runtime, uint32_t mode) {
     always_assert(
         mode == SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH || mode == SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE
     );
+    runtime->publish_scheduler_bootstrap(mode, 0);
     for (int32_t i = 0; i < runtime->get_worker_count(); ++i) {
-        runtime->dev.workers[i].aicpu_ready = mode;
+        runtime->dev.workers[i].aicpu_ready = 0;
         runtime->dev.workers[i].task = 0;
     }
 }
@@ -1274,11 +1280,9 @@ bool create_scheduler_state(
         context.worker_index = static_cast<uint64_t>(i);
     }
 
-    for (int32_t i = 0; i < runtime->get_worker_count(); ++i) {
-        runtime->dev.workers[i].aicpu_ready = SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING;
-        runtime->dev.workers[i].task =
-            aligned_address + layout.worker_contexts_offset + static_cast<uint64_t>(i) * sizeof(SchedulerWorkerContext);
-    }
+    runtime->publish_scheduler_bootstrap(
+        SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, aligned_address + layout.worker_contexts_offset
+    );
     {
         std::scoped_lock lock(scheduler_state_owners_mutex);
         scheduler_state_owners.emplace(
@@ -1868,6 +1872,13 @@ extern "C" int bind_callable_to_runtime_impl(
     // run's host pointer. Every exit path from here on leaves the ledger owned
     // by the caller's Runtime, and this is where it starts empty.
     runtime->tensor_leases().clear();
+
+    // No scheduler is selected until this bind selects one. Without this, a bind
+    // that fails before it reaches a selection would leave the previous run's
+    // mode and its base — naming an allocation this bind may already have freed —
+    // in the descriptor the next launch uploads. The handshake words the platform
+    // zeroes in prepare_launch_shape give the same guarantee for their half.
+    runtime->publish_scheduler_bootstrap(0, 0);
 
     // The retained temporary buffer is always used on the hbg path — it is an
     // internal allocation optimization, not user-facing config. The buffer
