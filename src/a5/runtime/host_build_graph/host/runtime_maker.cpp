@@ -488,6 +488,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
     std::ostringstream tasks_json;
     tasks_json << "[";
     bool first_task = true;
+    const uint64_t swimlane_run_epoch = api->run_epoch();
     for (uint64_t task_id : emitted_tasks) {
         const SchedulerTaskTrace &trace = traces[task_id];
         const uint64_t receive_to_start =
@@ -496,7 +497,8 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
                 0;
         if (!first_task) tasks_json << ",";
         tasks_json << "\n    [" << trace.worker_id << ", " << task_id << ", " << task_id << ", "
-                   << trace.kernel_start_cycles << ", " << trace.kernel_end_cycles << ", " << receive_to_start << "]";
+                   << trace.kernel_start_cycles << ", " << trace.kernel_end_cycles << ", " << receive_to_start << ", "
+                   << swimlane_run_epoch << "]";
         first_task = false;
     }
     if (!first_task) tasks_json << "\n  ";
@@ -511,13 +513,14 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
 
     if (need_scheduler_timing) {
         std::ostringstream scheduler_tasks_json;
-        scheduler_tasks_json << "{\n    \"schema_version\": 1,\n    \"producer\": \"aicore\",\n    \"records\": [";
+        scheduler_tasks_json << "{\n    \"producer\": \"aicore\",\n    \"records\": [";
         bool first_scheduler_task = true;
         for (uint64_t task_id : emitted_tasks) {
             const SchedulerTaskTrace &trace = traces[task_id];
             if (!first_scheduler_task) scheduler_tasks_json << ",";
             scheduler_tasks_json << "\n      [" << trace.worker_id << ", " << task_id << ", "
-                                 << trace.dispatch_end_cycles << ", " << trace.complete_start_cycles << "]";
+                                 << trace.dispatch_end_cycles << ", " << trace.complete_start_cycles << ", "
+                                 << swimlane_run_epoch << "]";
             first_scheduler_task = false;
         }
         if (!first_scheduler_task) scheduler_tasks_json << "\n    ";
@@ -649,7 +652,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
     }
 
     std::ostringstream scheduler_json;
-    scheduler_json << "{\n    \"schema_version\": 1,\n    \"streams\": [";
+    scheduler_json << "{\n    \"streams\": [";
     bool first_stream = true;
     for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
         const SchedulerWorkerContext &context = contexts[worker];
@@ -672,9 +675,9 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
             const SchedulerJsonRecord &record = records[worker][index];
             if (index != 0) scheduler_json << ",";
             scheduler_json << "\n        {\"start_cycles\": " << record.start_cycles
-                           << ", \"end_cycles\": " << record.end_cycles << ", \"loop_iter\": " << record.loop_iter
-                           << ", \"kind\": \"" << record.kind << "\", \"tasks_processed\": " << record.tasks_processed
-                           << ", \"task_id\": ";
+                           << ", \"end_cycles\": " << record.end_cycles << ", \"run_epoch\": " << api->run_epoch()
+                           << ", \"loop_iter\": " << record.loop_iter << ", \"kind\": \"" << record.kind
+                           << "\", \"tasks_processed\": " << record.tasks_processed << ", \"task_id\": ";
             if (record.has_task) scheduler_json << record.task_id;
             else scheduler_json << "null";
             scheduler_json << "}";

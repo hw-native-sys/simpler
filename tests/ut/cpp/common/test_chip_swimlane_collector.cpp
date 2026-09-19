@@ -12,6 +12,10 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <string>
 #include <vector>
 
 #include "common/chip_swimlane_extension.h"
@@ -914,4 +918,185 @@ TEST_F(ChipSwimlaneAccountingTest, ARotatedBufferReachesTheHostOnlyOnItsGatingAc
     EXPECT_EQ(ac_state->head.published_record_count, kGate);
     EXPECT_EQ(ac_state->head.live_record_count, 0u);
     EXPECT_TRUE(accounting_balances(ac_state));
+}
+
+// ---------------------------------------------------------------------------
+// Export identity: two runs sharing one file must stay separable.
+//
+// reg_task_id restarts at 0 every run, so (core_id, reg_task_id) is unique
+// within a run and ambiguous across runs. Until the streams carried run_epoch,
+// the only thing keeping two runs apart was the per-run clear plus one file per
+// run — an implicit boundary, not a property of the format.
+//
+// These cases drive the real export_swimlane_json() rather than a hand-built
+// JSON string, so the exporter and its reader cannot drift apart unnoticed.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::string read_whole_file(const std::string &path) {
+    std::ifstream in(path);
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+size_t count_occurrences(const std::string &haystack, const std::string &needle) {
+    size_t n = 0;
+    for (size_t pos = haystack.find(needle); pos != std::string::npos;
+         pos = haystack.find(needle, pos + needle.size())) {
+        n++;
+    }
+    return n;
+}
+
+}  // namespace
+
+class ChipSwimlaneExportIdentityTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        ASSERT_EQ(
+            collector_.initialize(
+                /*num_aicore=*/1, /*aicpu_thread_num=*/1, /*device_id=*/0, ChipSwimlaneLevel::SCHEDULE_TIMING,
+                swimlane_test_alloc, nullptr, swimlane_test_free
+            ),
+            0
+        );
+        shm_ = collector_.get_chip_swimlane_setup_device_ptr();
+        ASSERT_NE(shm_, nullptr);
+        set_chip_swimlane_enabled(true);
+        set_platform_chip_swimlane_base(reinterpret_cast<uint64_t>(shm_));
+        set_platform_chip_swimlane_aicore_rotation_table(0);
+        const CoreType types[] = {CoreType::AIV};
+        collector_.set_core_types(types, 1);
+
+        // Written under the process CWD, so a caller can run this binary with
+        // its working directory set to a scratch dir and read the artifact back.
+        dir_ = "chip_swimlane_export_identity";
+        std::filesystem::remove_all(dir_);
+    }
+
+    void TearDown() override {
+        set_platform_run_result(0, 0);
+        set_chip_swimlane_enabled(false);
+        collector_.finalize(nullptr, swimlane_test_free);
+    }
+
+    // Hand every ready-queue entry published since the last call to the
+    // collector, which is what the polling thread does in production.
+    void drain_ready_queue() {
+        const auto *header = get_chip_swimlane_header(shm_);
+        for (uint32_t i = drained_; i < header->queue_tails[0]; i++) {
+            const ReadyQueueEntry &entry = header->queues[0][i];
+            ReadyBufferInfo info{};
+            if (entry.kind == ChipSwimlaneBufferKind::AicoreTask) {
+                info.type = ProfBufferType::AICORE_TASK;
+            } else if (entry.kind == ChipSwimlaneBufferKind::AicpuTask) {
+                info.type = ProfBufferType::AICPU_TASK;
+            } else {
+                continue;
+            }
+            info.index = entry.core_index;
+            info.dev_buffer_ptr = reinterpret_cast<void *>(entry.buffer_ptr);
+            info.host_buffer_ptr = reinterpret_cast<void *>(entry.buffer_ptr);
+            info.buffer_seq = entry.buffer_seq;
+            collector_.on_buffer_collected(info, /*collector_shard=*/0);
+        }
+        drained_ = header->queue_tails[0];
+    }
+
+    // One run's device sequence: `dispatches` AICore records plus the matching
+    // AICPU task records, both numbering reg_task_id from 1 so every run reuses
+    // the same tokens on the same core. `time_base` is what separates the runs
+    // in the cycle domain. Deliberately no begin_run(): the host's per-run clear
+    // is the implicit boundary this format has to stop depending on.
+    void device_run(uint64_t epoch, int dispatches, uint64_t time_base) {
+        set_platform_run_result(/*region_base=*/0, epoch);
+        get_chip_swimlane_header(shm_)->chip_swimlane_level = static_cast<uint32_t>(ChipSwimlaneLevel::SCHEDULE_TIMING);
+        chip_swimlane_aicpu_init(/*worker_count=*/1);
+        auto *ac_state = get_aicore_buffer_state(shm_, 0);
+        auto *buf = reinterpret_cast<ChipSwimlaneAicoreTaskBuffer *>(ac_state->head.current_buf_ptr);
+        ASSERT_NE(buf, nullptr) << "init found no AICore buffer for run " << epoch;
+        for (int i = 0; i < dispatches; i++) {
+            const uint32_t reg_task_id = static_cast<uint32_t>(i + 1);
+            chip_swimlane_aicpu_on_aicore_dispatch(/*core_id=*/0, /*thread_idx=*/0, reg_task_id);
+            // AICore writes these on device; the host stub stands in for it so
+            // the exported row comes from a real collected record.
+            buf->records[i].task_token_raw = 0x100 + reg_task_id;
+            buf->records[i].reg_task_id = reg_task_id;
+            buf->records[i].start_time = time_base + 10 * (i + 1);
+            buf->records[i].end_time = time_base + 10 * (i + 1) + 5;
+            buf->records[i].receive_to_start_cycles = 2;
+            chip_swimlane_aicpu_complete_task(
+                /*core_id=*/0, /*thread_idx=*/0, reg_task_id, /*dispatch_time=*/time_base + 10 * (i + 1) - 4,
+                /*finish_time=*/time_base + 10 * (i + 1) + 7
+            );
+        }
+        wmb();
+        const int cores[] = {0};
+        chip_swimlane_aicpu_flush(/*thread_idx=*/0, cores, /*core_num=*/1);
+        drain_ready_queue();
+    }
+
+    ChipSwimlaneCollector collector_;
+    void *shm_ = nullptr;
+    uint32_t drained_ = 0;
+    std::string dir_;
+};
+
+// Two runs, same core, same reg_task_ids, different times. Both runs' rows have
+// to reach one file, each carrying its own epoch on the row being keyed.
+TEST_F(ChipSwimlaneExportIdentityTest, ExportsTwoRunsDistinctly) {
+    collector_.begin_run(dir_, ChipSwimlaneLevel::SCHEDULE_TIMING);
+    device_run(/*epoch=*/7, /*dispatches=*/3, /*time_base=*/1000);
+    device_run(/*epoch=*/8, /*dispatches=*/3, /*time_base=*/9000);
+
+    ASSERT_EQ(collector_.export_swimlane_json(), 0);
+    const std::string json = read_whole_file(dir_ + "/chip_swimlane_records.json");
+    ASSERT_FALSE(json.empty()) << "the exporter wrote no file";
+
+    // Three AICore rows and three scheduler rows per run, each ending in its epoch.
+    EXPECT_EQ(count_occurrences(json, ", 7]"), 6u) << "run 7 lost rows or lost its identity";
+    EXPECT_EQ(count_occurrences(json, ", 8]"), 6u) << "run 8 lost rows or lost its identity";
+}
+
+// The identity is per record, not one file-level field: a reader joining by
+// (run_epoch, core_id, reg_task_id) needs it on the row it keys.
+TEST_F(ChipSwimlaneExportIdentityTest, EveryAicoreRowIsSevenColumnsEndingInItsEpoch) {
+    collector_.begin_run(dir_, ChipSwimlaneLevel::SCHEDULE_TIMING);
+    device_run(/*epoch=*/11, /*dispatches=*/2, /*time_base=*/1000);
+
+    ASSERT_EQ(collector_.export_swimlane_json(), 0);
+    const std::string json = read_whole_file(dir_ + "/chip_swimlane_records.json");
+
+    const size_t label = json.find("\"aicore_tasks\"");
+    ASSERT_NE(label, std::string::npos);
+    const size_t open = json.find('[', label);
+    ASSERT_NE(open, std::string::npos);
+    // Match the outer bracket by depth; the section holds nested row arrays, so
+    // the first ']' closes a row rather than the stream.
+    size_t depth = 0;
+    size_t close = std::string::npos;
+    for (size_t i = open; i < json.size(); i++) {
+        if (json[i] == '[') depth++;
+        if (json[i] == ']') {
+            depth--;
+            if (depth == 0) {
+                close = i;
+                break;
+            }
+        }
+    }
+    ASSERT_NE(close, std::string::npos) << "aicore_tasks array is unterminated";
+    const std::string section = json.substr(open, close - open + 1);
+
+    size_t rows = 0;
+    for (size_t pos = section.find('[', 1); pos != std::string::npos; pos = section.find('[', pos + 1)) {
+        const size_t row_end = section.find(']', pos);
+        if (row_end == std::string::npos) break;
+        const std::string row = section.substr(pos + 1, row_end - pos - 1);
+        if (row.find(',') == std::string::npos) continue;
+        EXPECT_EQ(count_occurrences(row, ","), 6u) << "aicore_tasks row is not seven columns: [" << row << "]";
+        rows++;
+    }
+    EXPECT_EQ(rows, 2u) << "expected one row per dispatch";
+    EXPECT_EQ(count_occurrences(section, ", 11]"), 2u) << "a row carries an epoch other than its run's";
 }

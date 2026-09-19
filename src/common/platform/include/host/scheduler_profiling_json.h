@@ -58,7 +58,7 @@ inline void chip_swimlane_write_scheduler_records(
     std::ostream &out, const std::vector<std::vector<CollectedRecord<ChipSwimlaneAicpuSchedPhaseRecord>>> &streams,
     const std::vector<uint32_t> &dropped_records, const std::string &runtime_name
 ) {
-    out << "{\n    \"schema_version\": 1,\n    \"streams\": [";
+    out << "{\n    \"streams\": [";
     bool first_stream = true;
     for (size_t stream_index = 0; stream_index < streams.size(); ++stream_index) {
         const auto &records = streams[stream_index];
@@ -74,8 +74,8 @@ inline void chip_swimlane_write_scheduler_records(
             const ChipSwimlaneAicpuSchedPhaseRecord &record = records[record_index].record;
             if (record_index != 0) out << ",";
             out << "\n        {\"start_cycles\": " << record.start_time << ", \"end_cycles\": " << record.end_time
-                << ", \"loop_iter\": " << record.loop_iter << ", \"kind\": \""
-                << chip_swimlane_scheduler_kind_name(record.kind)
+                << ", \"run_epoch\": " << records[record_index].run_epoch << ", \"loop_iter\": " << record.loop_iter
+                << ", \"kind\": \"" << chip_swimlane_scheduler_kind_name(record.kind)
                 << "\", \"tasks_processed\": " << record.tasks_processed << ", \"task_id\": ";
             if (record.kind == ChipSwimlaneSchedPhaseKind::DummyTask ||
                 record.kind == ChipSwimlaneSchedPhaseKind::PredicatedSkip) {

@@ -559,12 +559,10 @@ def test_dag_stats_reach_a_thread_whose_stream_was_not_the_first_recorded(tmp_pa
                 },
                 "aicore_tasks": [[0, 7, 7, 120, 180, 10], [1, 8, 8, 130, 190, 10]],
                 "scheduler_tasks": {
-                    "schema_version": 1,
                     "producer": "aicpu",
                     "records": [[0, 7, 115, 185], [1, 8, 125, 195]],
                 },
                 "scheduler_records": {
-                    "schema_version": 1,
                     "streams": [
                         {
                             "platform": "a5",

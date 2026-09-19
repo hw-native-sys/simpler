@@ -270,12 +270,18 @@ layers to be aware of:**
 
   // Bulk task streams. Tuple column order is fixed.
   //   aicore_tasks: [core_id, task_token_raw, reg_task_id,
-  //                  start_cycles, end_cycles]
+  //                  start_cycles, end_cycles, receive_to_start_cycles,
+  //                  run_epoch]
   //   scheduler_tasks.records: [core_id, reg_task_id,
-  //                             dispatch_cycles, finish_cycles]
+  //                             dispatch_cycles, finish_cycles, run_epoch]
+  //
+  // run_epoch is the trailing column on every per-task row and the first
+  // component of the join key. reg_task_id restarts at 0 each run and a
+  // graph's task ids repeat when it re-executes, so (core_id, reg_task_id)
+  // is unique only within one run. Readers join on
+  // (run_epoch, core_id, reg_task_id).
   "aicore_tasks": [[...], ...],
   "scheduler_tasks": {
-    "schema_version": 1,
     "producer": "<aicpu|aicore>",
     "records": [[...], ...]
   },
@@ -302,7 +308,6 @@ layers to be aware of:**
 
   // Producer-neutral per-Scheduler streams (level >= 3 only).
   "scheduler_records": {
-    "schema_version": 1,
     "streams": [{
       "platform": "<a2a3|a5>",
       "runtime": "<host_build_graph|tensormap_and_ringbuffer>",
@@ -313,26 +318,44 @@ layers to be aware of:**
       "physical_core_id": "<int|null>",
       "capture": {"committed": <int>, "dropped": <int>, "truncated": <bool>},
       "records": [{"start_cycles": <int>, "end_cycles": <int>,
-                   "loop_iter": <int>, "kind": <str>,
+                   "run_epoch": <int>, "loop_iter": <int>, "kind": <str>,
                    "tasks_processed": <int>, "task_id": "<int|null>"}],
       "metrics": [{"record_index": <int>, ...}]
     }]
   },
 
   // Orchestrator records (level >= 4 only).
-  //   orch record:  {submit_idx, task_id, start_cycles, end_cycles}
+  //   orch record:  {submit_idx, task_id, start_cycles, end_cycles, run_epoch}
   "aicpu_orchestrator_phases": [ [ {...}, ... ], ... ]   // level >= 4 only
 }
 ```
 
 All timestamps on disk are raw `get_sys_cnt` cycles (uint64). The
 join key between `aicore_tasks` and `scheduler_tasks.records` is
-`(core_id, reg_task_id)` — *not* `task_token_raw`, because SPMD
+`(run_epoch, core_id, reg_task_id)` — *not* `task_token_raw`, because SPMD
 `block_num > num_cores` and MIX cluster spread can dispatch the same
-`task_token_raw` to the same core multiple times. AICore is the
+`task_token_raw` to the same core multiple times. `run_epoch` leads the key
+because `core_id, reg_task_id` alone is unique only *within* a run:
+`reg_task_id` restarts at 0 every run, and a graph re-executed later reuses
+its task ids. AICore is the
 canonical producer of `task_token_raw`; the Scheduler producer stamps the
 dispatch / finish timestamps and the per-core join token. Archived raw files
 with the former `aicpu_tasks` array remain readable as `producer: "aicpu"`.
+
+Captures written before run identity existed — `aicore_tasks` rows of five or
+six columns, four-column `scheduler_tasks` rows, phase records without
+`run_epoch` — still read, with `run_epoch` parsed as `None`, meaning "this file
+recorded no identity". It is deliberately not `0`: that is an epoch a device can
+really be given, so defaulting to it would let a legacy capture collide with a
+real run.
+
+These artifacts carry no schema version. They are written by platform C++ in
+this repo and read by `swimlane_converter.py` from the same checkout and the
+same build, so a declared number could never disagree with the rows it
+describes — and a producer wrong about its own rows would stamp a wrong number
+too. Readers therefore key off the data: row width, and whether a phase record
+carries `run_epoch`. What *is* enforced is consistency within one stream, since
+a producer disagreeing with itself is the real defect.
 
 #### Reader output (µs domain)
 

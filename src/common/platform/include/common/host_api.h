@@ -202,6 +202,11 @@ public:
         run_epoch_(run_epoch),
         ops_(ops) {}
 
+    // The epoch this run was given. Runtimes that build their own swimlane
+    // record streams stamp it into each row: per-task tokens restart every run,
+    // so a row without it cannot be attributed once one file holds several runs.
+    uint64_t run_epoch() const { return run_epoch_; }
+
     void *device_malloc(size_t size) const { return ops_->device_malloc(runner_ctx_, size); }
     void device_free(void *dev_ptr) const { ops_->device_free(runner_ctx_, dev_ptr); }
     int copy_to_device(void *dev_ptr, const void *host_ptr, size_t size) const {

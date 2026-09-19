@@ -99,7 +99,7 @@ class TestHbgSingleCoreDag(SceneTestCase):
         if level == 0:
             return
 
-        record_fields = {"start_cycles", "end_cycles", "loop_iter", "kind", "tasks_processed", "task_id"}
+        record_fields = {"start_cycles", "end_cycles", "run_epoch", "loop_iter", "kind", "tasks_processed", "task_id"}
         for case in self._matching_cases(st_platform, request):
             case_label = _sanitize_for_filename(f"TestHbgSingleCoreDag_{case['name']}")
             matches = [
@@ -115,12 +115,13 @@ class TestHbgSingleCoreDag(SceneTestCase):
             assert aicore_rows, "AICore task records are missing"
             if level >= 2:
                 scheduler_tasks = raw["scheduler_tasks"]
-                assert scheduler_tasks["schema_version"] == 1
                 assert scheduler_tasks["producer"] == "aicore"
                 scheduler_rows = scheduler_tasks["records"]
                 aicore_by_key = {(int(row[0]), int(row[2])): row for row in aicore_rows}
                 assert {(int(row[0]), int(row[1])) for row in scheduler_rows} == set(aicore_by_key)
-                for core_id, reg_task_id, dispatch_cycles, finish_cycles in scheduler_rows:
+                # HBG stamps both streams from the same host-side run epoch.
+                assert {int(row[6]) for row in aicore_rows} == {int(row[4]) for row in scheduler_rows}
+                for core_id, reg_task_id, dispatch_cycles, finish_cycles, _run_epoch in scheduler_rows:
                     aicore_row = aicore_by_key[(int(core_id), int(reg_task_id))]
                     assert 0 < dispatch_cycles <= aicore_row[3] <= aicore_row[4] <= finish_cycles
                 assert raw["aicpu_lifecycle_records"], "AICPU lifecycle records are missing"

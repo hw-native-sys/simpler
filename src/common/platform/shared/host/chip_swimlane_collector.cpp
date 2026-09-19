@@ -1223,8 +1223,15 @@ int ChipSwimlaneCollector::export_swimlane_json() {
     // file size). Column order is documented in the schema comment at the top
     // of swimlane_converter.py's v2 reader.
     //
-    //   aicore_tasks: [core_id, task_token_raw, reg_task_id, start_cycles, end_cycles, receive_to_start_cycles]
-    //   scheduler_tasks.records: [core_id, reg_task_id, dispatch_cycles, finish_cycles]
+    //   aicore_tasks: [core_id, task_token_raw, reg_task_id, start_cycles, end_cycles, receive_to_start_cycles,
+    //                  run_epoch]
+    //   scheduler_tasks.records: [core_id, reg_task_id, dispatch_cycles, finish_cycles, run_epoch]
+    //
+    // `run_epoch` is the trailing column on every per-task row and the join key's
+    // first component: reg_task_id restarts at 0 each run, so (core_id,
+    // reg_task_id) alone collides across runs sharing one file. A row whose epoch
+    // is absent is a pre-identity capture, not epoch 0 — the reader distinguishes
+    // by column count, never by value.
     {
         // copy_aicore_buffer already drops r.start_time == 0 slots when
         // collecting from the device side, so no defensive filter here.
@@ -1240,7 +1247,8 @@ int ChipSwimlaneCollector::export_swimlane_json() {
                     const ChipSwimlaneAicoreTaskRecord &r = collected.record;
                     if (!first) outfile << ",";
                     outfile << "\n    [" << core_idx << ", " << r.task_token_raw << ", " << r.reg_task_id << ", "
-                            << r.start_time << ", " << r.end_time << ", " << r.receive_to_start_cycles << "]";
+                            << r.start_time << ", " << r.end_time << ", " << r.receive_to_start_cycles << ", "
+                            << collected.run_epoch << "]";
                     first = false;
                     total++;
                 }
@@ -1256,7 +1264,7 @@ int ChipSwimlaneCollector::export_swimlane_json() {
         if (scheduler_tasks_extension != nullptr) {
             outfile << *scheduler_tasks_extension;
         } else {
-            outfile << "{\n    \"schema_version\": 1,\n    \"producer\": \"aicpu\",\n    \"records\": [";
+            outfile << "{\n    \"producer\": \"aicpu\",\n    \"records\": [";
             bool first = true;
             size_t total = 0;
             for (size_t core_idx = 0; core_idx < collected_perf_records_.size(); core_idx++) {
@@ -1264,7 +1272,7 @@ int ChipSwimlaneCollector::export_swimlane_json() {
                     const ChipSwimlaneAicpuTaskRecord &r = collected.record;
                     if (!first) outfile << ",";
                     outfile << "\n    [" << core_idx << ", " << r.reg_task_id << ", " << r.dispatch_time << ", "
-                            << r.finish_time << "]";
+                            << r.finish_time << ", " << collected.run_epoch << "]";
                     first = false;
                     total++;
                 }
@@ -1304,7 +1312,8 @@ int ChipSwimlaneCollector::export_swimlane_json() {
                     const ChipSwimlaneAicpuOrchPhaseRecord &pr = collected.record;
                     if (!first) outfile << ",";
                     outfile << "\n      {\"submit_idx\": " << pr.submit_idx << ", \"task_id\": " << pr.task_id
-                            << ", \"start_cycles\": " << pr.start_time << ", \"end_cycles\": " << pr.end_time << "}";
+                            << ", \"start_cycles\": " << pr.start_time << ", \"end_cycles\": " << pr.end_time
+                            << ", \"run_epoch\": " << collected.run_epoch << "}";
                     first = false;
                 }
                 if (!first) outfile << "\n    ";

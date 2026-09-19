@@ -92,13 +92,15 @@ class TestSchedulerPhases(SceneTestCase):
 
             if level >= 2:
                 scheduler_tasks = raw["scheduler_tasks"]
-                assert scheduler_tasks["schema_version"] == 1
                 assert scheduler_tasks["producer"] == "aicore"
                 scheduler_rows = scheduler_tasks["records"]
                 assert len(scheduler_rows) == len(aicore_rows)
+                # HBG builds these rows itself from host-side traces, so the
+                # epoch it stamps has to agree with the AICore stream's.
+                assert {int(row[6]) for row in aicore_rows} == {int(row[4]) for row in scheduler_rows}
                 aicore_by_key = {(int(row[0]), int(row[2])): row for row in aicore_rows}
                 assert {(int(row[0]), int(row[1])) for row in scheduler_rows} == set(aicore_by_key)
-                for core_id, reg_task_id, dispatch_cycles, finish_cycles in scheduler_rows:
+                for core_id, reg_task_id, dispatch_cycles, finish_cycles, _run_epoch in scheduler_rows:
                     aicore_row = aicore_by_key[(int(core_id), int(reg_task_id))]
                     assert 0 < dispatch_cycles <= aicore_row[3] <= aicore_row[4] <= finish_cycles
                 lifecycle_records = raw["aicpu_lifecycle_records"]

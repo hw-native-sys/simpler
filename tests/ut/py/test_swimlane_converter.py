@@ -374,7 +374,6 @@ def test_l3_directory_merge_keeps_scheduler_streams_and_lifecycle_records(tmp_pa
         records = json.loads(records_path.read_text())
         device_base = records["aicore_tasks"][0][3] - 1_000
         records["scheduler_records"] = {
-            "schema_version": 1,
             "streams": [
                 {
                     "platform": "a5",
@@ -809,7 +808,6 @@ def test_aicore_scheduler_records_keep_common_shape_and_stream_metadata(tmp_path
                 "metadata": {"clock_freq_hz": 1_000_000_000, "num_cores": 1, "core_types": ["aiv"]},
                 "aicore_tasks": [[0, 7, 7, 120, 180, 10]],
                 "scheduler_tasks": {
-                    "schema_version": 1,
                     "producer": "aicore",
                     "records": [[0, 7, 115, 185]],
                 },
@@ -833,7 +831,6 @@ def test_aicore_scheduler_records_keep_common_shape_and_stream_metadata(tmp_path
                     }
                 ],
                 "scheduler_records": {
-                    "schema_version": 1,
                     "streams": [
                         {
                             "platform": "a5",
@@ -935,7 +932,6 @@ def test_level_two_accepts_task_timing_from_either_scheduler_producer(tmp_path, 
                 "metadata": {"clock_freq_hz": 1_000_000_000, "num_cores": 1, "core_types": ["aiv"]},
                 "aicore_tasks": [[0, 7, 7, 120, 180, 10]],
                 "scheduler_tasks": {
-                    "schema_version": 1,
                     "producer": producer,
                     "records": [[0, 7, 115, 185]],
                 },
@@ -960,7 +956,6 @@ def test_level_two_accepts_cross_producer_clock_skew(tmp_path, dispatch_cycles, 
                 "metadata": {"clock_freq_hz": 1_000_000_000, "num_cores": 1, "core_types": ["aiv"]},
                 "aicore_tasks": [[0, 7, 7, 120, 180, 10]],
                 "scheduler_tasks": {
-                    "schema_version": 1,
                     "producer": "aicpu",
                     "records": [[0, 7, dispatch_cycles, finish_cycles]],
                 },
@@ -992,7 +987,6 @@ def test_level_two_rejects_invalid_same_producer_timing(tmp_path, aicore_timing,
                 "metadata": {"clock_freq_hz": 1_000_000_000, "num_cores": 1, "core_types": ["aiv"]},
                 "aicore_tasks": [[0, 7, 7, start_cycles, end_cycles, receive_to_start_cycles]],
                 "scheduler_tasks": {
-                    "schema_version": 1,
                     "producer": "aicpu",
                     "records": [[0, 7, dispatch_cycles, finish_cycles]],
                 },
@@ -1052,9 +1046,12 @@ def test_level_one_skips_overhead_counters_without_scheduler_timing(tmp_path):
 @pytest.mark.parametrize(
     ("scheduler_tasks", "error"),
     [
-        ({"schema_version": 2, "producer": "aicore", "records": []}, "schema_version"),
-        ({"schema_version": 1, "producer": "host", "records": []}, "producer"),
-        ({"schema_version": 1, "producer": "aicore", "records": [[0, 1, 2]]}, "four-column"),
+        ({"producer": "host", "records": []}, "producer"),
+        ({"producer": "aicore", "records": [[0, 1, 2]]}, "four- or five-column"),
+        # Row width is read from the rows themselves, so the drift a version
+        # field was meant to catch shows up as a producer disagreeing with
+        # itself: some rows carrying run_epoch and some not.
+        ({"producer": "aicore", "records": [[0, 1, 2, 3], [0, 1, 2, 3, 7]]}, "mixes row widths"),
     ],
 )
 def test_scheduler_tasks_reject_schema_drift(tmp_path, scheduler_tasks, error):
@@ -1082,7 +1079,7 @@ def test_scheduler_tasks_reject_ambiguous_legacy_stream(tmp_path):
                 "chip_swimlane_level": 2,
                 "metadata": {"clock_freq_hz": 1_000_000_000},
                 "aicore_tasks": [],
-                "scheduler_tasks": {"schema_version": 1, "producer": "aicore", "records": []},
+                "scheduler_tasks": {"producer": "aicore", "records": []},
                 "aicpu_tasks": [],
             }
         )
@@ -1133,7 +1130,6 @@ def test_sparse_scheduler_streams_keep_their_own_ids_as_list_positions(tmp_path)
                 "chip_swimlane_level": 3,
                 "metadata": {"clock_freq_hz": 1_000_000_000, "num_cores": 1, "core_types": ["aiv"]},
                 "scheduler_records": {
-                    "schema_version": 1,
                     # Thread 0 recorded nothing, so the writer skipped it.
                     "streams": [
                         _sched_stream(1, start_cycles=100),
@@ -1171,7 +1167,6 @@ def test_scheduler_records_reject_schema_drift(tmp_path):
                 "chip_swimlane_level": 3,
                 "metadata": {"clock_freq_hz": 1_000_000_000},
                 "scheduler_records": {
-                    "schema_version": 1,
                     "streams": [{"records": [{"kind": "idle"}], "metrics": []}],
                 },
             }
@@ -1190,7 +1185,6 @@ def test_scheduler_metrics_cannot_overwrite_fixed_record_fields(tmp_path):
                 "chip_swimlane_level": 3,
                 "metadata": {"clock_freq_hz": 1_000_000_000},
                 "scheduler_records": {
-                    "schema_version": 1,
                     "streams": [
                         {
                             "records": [
@@ -1700,7 +1694,9 @@ def test_identify_spmd_task_ids_respects_authoritative_block_num_one():
         2: [_task_row(2, 0), _task_row(2, 1)],
     }
     deps_block_map = {1: 1, 2: 4}
-    spmd_ids = sc._identify_spmd_task_ids(task_map, deps_block_map)
+    # Multiplicity is observed per run, so the helper takes run -> task_id -> rows.
+    # These rows are one capture with no identity, which is its own run domain.
+    spmd_ids = sc._identify_spmd_task_ids({None: task_map}, deps_block_map)
     assert spmd_ids == {2}
 
 
