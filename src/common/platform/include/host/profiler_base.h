@@ -80,8 +80,9 @@
  *
  *   // Resolve a popped ReadyEntry into the originating BufferState's
  *   // free_queue + the partially-filled ReadyBufferInfo. Algorithm fills in
- *   // host_buffer_ptr after a resolve_host_ptr lookup. Return std::nullopt
- *   // to drop the entry (e.g. invalid index).
+ *   // host_buffer_ptr after a resolve_host_ptr lookup. Return std::nullopt to
+ *   // reject the entry (e.g. invalid index); the drain path then retires and
+ *   // counts it rather than delivering it.
  *   static std::optional<EntrySite<Module>> resolve_entry(
  *       void* shm_host, DataHeader*, int q, const ReadyEntry&);
  *
@@ -116,10 +117,32 @@
  *                          publication — which makes every free_queue
  *                          single-writer by structure, not by timing.
  *
- * The above two algorithms live in ProfilerAlgorithms<Module>; Module only
+ * These algorithms live in ProfilerAlgorithms<Module>; Module only
  * supplies the data-access traits above. Implementors must NOT zero `count`
  * (or any other AICPU-owned field) on the host side — AICPU is the sole
  * writer to those fields and resets them itself on flush/drop/pop.
+ *
+ * Drain-path ownership
+ * --------------------
+ *
+ * A device ready entry is acknowledged — `queue_heads[q]` advanced — only once
+ * its payload is in the host shadow, so the device owns the slot for as long as
+ * the host might still fail to read it and a transport failure costs a retry
+ * rather than the record. Two outcomes end that retry loop:
+ *
+ *   - An entry that cannot be resolved, or whose buffer this manager never
+ *     mapped, can never be read; retrying it would block the queue forever and
+ *     quiesce() would never complete. It is acknowledged and counted.
+ *   - An entry whose copy keeps failing is acknowledged and counted once it has
+ *     held the queue head for kStalledDrainEntryTimeout.
+ *
+ * Either way `drain_dropped_buffers()` records it, so a reconcile gap is
+ * attributable to the host instead of being an anonymous silent loss, and the
+ * buffer goes back to the free_queue it came from (or to the manager's retired
+ * pool when that queue is full) so the pool does not shrink. The unresolvable
+ * entry is the exception: its indices did not validate, so its buffer is never
+ * published into a device-visible free_queue — it is parked in the retired pool
+ * when the manager can map it, and withheld entirely when it cannot.
  *
  * Lifecycle (the only correct teardown order):
  *   1. Derived::init() — on the success path, calls set_memory_context() to
@@ -346,6 +369,15 @@ struct TopUpResult {
     bool filled;
 };
 
+// Outcome of one drain-path ready entry. kRetry is the only one that leaves the
+// device's consumer index where it was, so the same entry is seen again by the
+// next peek; the other two have advanced it.
+enum class EntryOutcome {
+    kDelivered,  // in the host hand-off ring, on its way to the collector
+    kRetry,      // neither acknowledged nor delivered
+    kDropped,    // acknowledged and counted as lost; never reached a collector
+};
+
 // Unified mgmt-loop algorithms parameterized on Module's data-access traits.
 // Module supplies the layout (constants + types + resolve_entry +
 // for_each_instance); ProfilerAlgorithms supplies the control flow that used
@@ -357,15 +389,14 @@ struct ProfilerAlgorithms {
     using ReadyBufferInfo = typename Module::ReadyBufferInfo;
     using FreeQueue = typename Module::FreeQueue;
 
-    // Pop one entry from the per-thread ready queue, advancing the head with
-    // the appropriate memory barriers. Returns false if the queue is empty
-    // (or the device wrote an out-of-range head/tail, which is treated as
-    // empty and reported).
+    // Read the entry at the head of the per-thread ready queue without
+    // acknowledging it. Returns false if the queue is empty (or the device wrote
+    // an out-of-range head/tail, which is treated as empty and reported).
     //
-    // a5: the head advance is written back to device immediately via
-    // `mgr.write_range_to_device(&header->queue_heads[q], ...)` so AICPU sees
-    // the consumer-side update without us bulk-mirroring the whole shm region
-    // (which would clobber AICPU-owned fields elsewhere in the shm).
+    // The device still owns the slot on return: only ack_aicpu_entry() advances
+    // the consumer index, and process_entry calls it once the entry's payload is
+    // in the host shadow. So a host-side failure between the two costs a repeat
+    // of this peek rather than the record.
     //
     // Torn-read defense: the per-tick `mirror_shm_from_device` is a single
     // bulk rtMemcpy that is not atomic w.r.t. concurrent AICPU writes. AICPU
@@ -374,11 +405,11 @@ struct ProfilerAlgorithms {
     // bulk mirror happens to scan the entry slot first and the tail counter
     // last, host can observe `head < tail` while the entry it's about to
     // read is still pre-publish (e.g. `buffer_ptr == 0`). We refresh the
-    // entry with `read_range_from_device` and skip the pop if the refreshed
+    // entry with `read_range_from_device` and skip the peek if the refreshed
     // entry still looks empty — try again next tick.
     template <typename Mgr>
     static bool
-    try_pop_aicpu_entry(Mgr &mgr, DataHeader *header, int q, ReadyEntry &out, bool refresh_indices = false) {
+    try_peek_aicpu_entry(Mgr &mgr, DataHeader *header, int q, ReadyEntry &out, bool refresh_indices = false) {
         if (refresh_indices) {
             if (mgr.read_range_from_device(&header->queue_heads[q], sizeof(header->queue_heads[q])) != 0 ||
                 mgr.read_range_from_device(&header->queue_tails[q], sizeof(header->queue_tails[q])) != 0) {
@@ -411,15 +442,23 @@ struct ProfilerAlgorithms {
         }
         rmb();
         out = header->queues[q][head];
-        if (out.buffer_ptr == 0) {
-            return false;
-        }
-        uint32_t old_head = head;
-        uint32_t next_head = (head + 1) % Module::kReadyQueueSize;
-        header->queue_heads[q] = next_head;
+        return out.buffer_ptr != 0;
+    }
+
+    // Hand the slot holding ready queue q's head entry back to the device by
+    // advancing the consumer index.
+    //
+    // a5: the head advance is written back to device immediately via
+    // `mgr.write_range_to_device(&header->queue_heads[q], ...)` so AICPU sees
+    // the consumer-side update without us bulk-mirroring the whole shm region
+    // (which would clobber AICPU-owned fields elsewhere in the shm). A failed
+    // write-back leaves the host-side index where the device has it, so the
+    // entry stays unacknowledged and the next peek sees it again.
+    template <typename Mgr>
+    static bool ack_aicpu_entry(Mgr &mgr, DataHeader *header, int q) {
+        const uint32_t old_head = header->queue_heads[q];
+        header->queue_heads[q] = (old_head + 1) % Module::kReadyQueueSize;
         wmb();
-        // Push the new head value back to device. The bulk mirror_shm_to_device
-        // is intentionally not used here — see buffer_pool_manager.h.
         if (mgr.write_range_to_device(&header->queue_heads[q], sizeof(header->queue_heads[q])) != 0) {
             header->queue_heads[q] = old_head;
             LOG_ERROR("%s: failed to advance ready_queue head for thread %d", Module::kSubsystemName, q);
@@ -437,20 +476,50 @@ struct ProfilerAlgorithms {
     // starved lane could never recover, because this top-up is entry-driven and
     // a lane with no buffer has nothing left to publish.
     //
+    // `retries_exhausted` says this entry has held the queue head long enough
+    // that a still-failing copy must be retired rather than retried again; see
+    // ProfilerBase::kStalledDrainEntryTimeout.
+    //
     // a5 specifics: after resolving the popped buffer's host shadow, copy
     // the buffer contents from device to host before delivery. The host
     // shadow seen by the collector then matches what the device wrote.
     template <typename Mgr>
-    static void
-    process_entry(Mgr &mgr, DataHeader *header, int q, const ReadyEntry &entry, EntrySite<Module> *short_site_out) {
+    static EntryOutcome process_entry(
+        Mgr &mgr, DataHeader *header, int q, const ReadyEntry &entry, EntrySite<Module> *short_site_out,
+        bool retries_exhausted
+    ) {
         auto site_opt = Module::resolve_entry(mgr.shared_mem_host(), header, q, entry);
-        if (!site_opt.has_value()) return;
+        if (!site_opt.has_value()) {
+            // resolve_entry already logged which index failed to validate, and no
+            // retry can make it validate.
+            if (!ack_aicpu_entry(mgr, header, q)) return EntryOutcome::kRetry;
+            // The buffer pointer travelled in the same entry, so it is trustworthy
+            // only as far as the manager can vouch for it, and never trustworthy
+            // enough to publish into a device-visible free_queue for AICPU to
+            // dereference. A pointer inside a block this manager owns is parked in
+            // the host-only retired pool, which teardown releases; one the manager
+            // cannot map is withheld entirely, because release_pointer_for() hands
+            // an unmapped pointer to the free callback unchanged, and freeing a
+            // pointer from a corrupt entry is worse than forgetting it. The kind is
+            // unknown here and 0 is a bucket label only: the retired pools are
+            // drained by iterating every shard and kind, never selectively.
+            void *dev_ptr = reinterpret_cast<void *>(entry.buffer_ptr);
+            const bool parked =
+                mgr.resolve_host_ptr(dev_ptr) != nullptr && mgr.retire_unqueued_buffer(/*kind=*/0, dev_ptr, q);
+            LOG_ERROR(
+                "%s: retired an unresolvable ready entry on thread %d; its records are lost and its buffer %p is %s",
+                Module::kSubsystemName, q, dev_ptr, parked ? "parked until teardown" : "withheld from the pool"
+            );
+            return EntryOutcome::kDropped;
+        }
         auto &site = *site_opt;
 
         site.info.host_buffer_ptr = mgr.resolve_host_ptr(site.info.dev_buffer_ptr);
         if (site.info.host_buffer_ptr == nullptr) {
-            // resolve_host_ptr already logged. Drop rather than deliver null.
-            return;
+            // resolve_host_ptr already logged. Mappings are established when a
+            // buffer is allocated, i.e. before the device can ever publish it,
+            // so an unmappable buffer will not become mappable on a retry.
+            return retire_undeliverable_entry(mgr, header, q, site, "its device buffer is not mapped on this host");
         }
         // a5: pull buffer contents from device into the host shadow before
         // the collector reads `count` and `records[]`.
@@ -458,8 +527,15 @@ struct ProfilerAlgorithms {
             LOG_ERROR(
                 "%s: failed to copy ready buffer from device (kind=%d, thread=%d)", Module::kSubsystemName, site.kind, q
             );
-            return;
+            if (!retries_exhausted) return EntryOutcome::kRetry;
+            return retire_undeliverable_entry(mgr, header, q, site, "its device buffer could not be copied to host");
         }
+
+        // The payload is in the host shadow, so the device's slot can go back.
+        // Doing this before the copy would put a failure between the
+        // acknowledgement and the delivery, which is exactly how a record gets
+        // lost without anything counting it.
+        if (!ack_aicpu_entry(mgr, header, q)) return EntryOutcome::kRetry;
 
         // Drain-driven free_queue top-up. The drain shard that serves ready queue
         // q is the sole runtime writer of every free_queue that q's entries
@@ -470,11 +546,11 @@ struct ProfilerAlgorithms {
             *short_site_out = site;
         }
 
-        // The device ready entry was already acknowledged by
-        // try_pop_aicpu_entry(). Keep ownership here until the collector frees
-        // a host-ring slot; retiring on transient host backpressure would make
-        // the buffer unreachable to Derived::on_buffer_collected().
+        // Ownership stays here until the collector frees a host-ring slot;
+        // retiring on transient host backpressure would make the buffer
+        // unreachable to Derived::on_buffer_collected().
         mgr.wait_push_to_ready(site.info, q);
+        return EntryOutcome::kDelivered;
     }
 
     // Top up every (kind, instance) free_queue to kSlotCount before worker
@@ -590,6 +666,28 @@ private:
         if (p != nullptr) return p;
 
         return nullptr;
+    }
+
+    // Retire a ready entry whose payload the host will never read: acknowledge
+    // the device slot so the queue keeps draining, then put the buffer back into
+    // the free_queue it came from so the pool does not shrink. That queue's sole
+    // runtime writer is this drain shard, which is why the buffer can go straight
+    // back rather than through a recycled lane another thread owns; when it has
+    // no room the manager's retired pool holds the buffer until teardown frees
+    // it, exactly as a failed top-up does.
+    template <typename Mgr>
+    static EntryOutcome
+    retire_undeliverable_entry(Mgr &mgr, DataHeader *header, int q, const EntrySite<Module> &site, const char *reason) {
+        if (!ack_aicpu_entry(mgr, header, q)) return EntryOutcome::kRetry;
+        LOG_ERROR(
+            "%s: retired ready buffer %p (kind=%d, thread=%d) because %s; its records are lost and are part of this "
+            "run's reconcile gap",
+            Module::kSubsystemName, site.info.dev_buffer_ptr, site.kind, q, reason
+        );
+        if (!try_push_to_free_queue(mgr, *site.free_queue, site.info.dev_buffer_ptr)) {
+            (void)mgr.retire_unqueued_buffer(site.kind, site.info.dev_buffer_ptr, q);
+        }
+        return EntryOutcome::kDropped;
     }
 
     // Append one buffer pointer to a per-instance free_queue if it has
@@ -970,7 +1068,48 @@ public:
         return true;
     }
 
+    /**
+     * Ready buffers the drain path has retired without delivering them since the
+     * last report_drain_drops(). The device published them, so their records are
+     * inside `device_total`, but no collector ever saw them: a non-zero value
+     * means part of the reconcile gap is host-side, and each one was logged as an
+     * ERROR naming the buffer and the reason when it was retired.
+     *
+     * Counted in buffers, not records — the record count of a buffer the host
+     * could not read is not recoverable.
+     */
+    uint64_t drain_dropped_buffers() const { return drain_dropped_buffers_.load(std::memory_order_relaxed); }
+
 protected:
+    // How long one ready queue's head entry may keep failing to be delivered
+    // before it is retired. This is what bounds a host-side transport failure:
+    // without it an entry the host can never read would hold its queue's head
+    // forever, and quiesce() — which waits for every drain shard to report its
+    // queues empty — could not complete. Only a broken path ever spends it, and
+    // it is spent once per undeliverable entry.
+    //
+    // A duration rather than a sweep count because what it rides out is measured
+    // in time: a sweep costs microseconds, so any count small enough to bound
+    // teardown would expire long before a transport failure could clear.
+    static constexpr std::chrono::milliseconds kStalledDrainEntryTimeout{1000};
+
+    /**
+     * Name what the drain path lost, so a reconcile gap is attributable instead
+     * of anonymous. Derived::reconcile_counters() is the only caller: the read
+     * consumes the count, which is what makes each run report its own rather
+     * than the collector's cumulative total across a resident lifetime.
+     */
+    void report_drain_drops() {
+        const uint64_t dropped = drain_dropped_buffers_.exchange(0, std::memory_order_relaxed);
+        if (dropped == 0) return;
+        LOG_ERROR(
+            "%s reconcile: the host drain path retired %lu ready buffer(s) without delivering them. Their records are "
+            "inside device_total but were never collected, so any silent_loss reported below is at least this far "
+            "host-side; the per-buffer ERROR lines above name each buffer and why it was retired.",
+            Derived::kSubsystemName, static_cast<unsigned long>(dropped)
+        );
+    }
+
     void bind_manager_memory_context() {
         MemoryOps ops;
         ops.alloc = alloc_cb_;
@@ -1158,24 +1297,60 @@ private:
         // served by exactly one shard, so this shard is their sole writer.
         std::vector<std::pair<int, EntrySite<Module>>> short_sites;
 
+        // When each of this shard's queues first failed to deliver its head
+        // entry, or a default-constructed time point while it is delivering
+        // normally. Per queue so one stalled lane does not spend a sibling's
+        // budget.
+        std::vector<std::chrono::steady_clock::time_point> stalled_since(static_cast<size_t>(queue_count_));
+
         while (mgmt_running_.load(std::memory_order_relaxed)) {
             // An ack covers only a sweep that starts after this epoch is observed.
             const uint64_t requested = drain_quiesce_epoch_.load(std::memory_order_acquire);
+            // `found_any` gates quiescence — it means a queue still holds an entry
+            // that must be delivered. `retired_or_delivered` gates the idle
+            // backoff, and they differ only while an entry is being retried: a
+            // stalled queue is not idle, but it is also not making progress, and
+            // polling it flat out for the whole budget would burn a core.
             bool found_any = false;
+            bool retired_or_delivered = false;
             for (int q = queue_start; q < queue_count_; q += queue_stride) {
                 ReadyEntry entry;
-                while (Alg::try_pop_aicpu_entry(manager_, header, q, entry, true)) {
+                while (Alg::try_peek_aicpu_entry(manager_, header, q, entry, true)) {
                     // A null free_queue is the "nothing to retry" sentinel;
                     // process_entry only writes this on a short top-up.
                     EntrySite<Module> short_site{};
-                    Alg::process_entry(manager_, header, q, entry, &short_site);
+                    auto &since = stalled_since[static_cast<size_t>(q)];
+                    const bool exhausted = entry_retries_exhausted(since);
+                    const EntryOutcome outcome = Alg::process_entry(manager_, header, q, entry, &short_site, exhausted);
+                    if (outcome == EntryOutcome::kRetry) {
+                        if (since == std::chrono::steady_clock::time_point{}) {
+                            since = std::chrono::steady_clock::now();
+                        }
+                        // Within the budget the entry is still deliverable, so the
+                        // queue counts as live and quiesce() must wait for it. Past
+                        // the budget only a failing acknowledgement write can
+                        // produce a retry — the device link is gone and cannot
+                        // recover, so reporting the queue live would hang quiesce()
+                        // instead of letting the logged write failure be the signal.
+                        if (!exhausted) {
+                            found_any = true;
+                        }
+                        // The entry still sits at the head either way, so move on
+                        // to the next queue rather than spinning on it.
+                        break;
+                    }
+                    found_any = true;
+                    retired_or_delivered = true;
+                    since = std::chrono::steady_clock::time_point{};
+                    if (outcome == EntryOutcome::kDropped) {
+                        drain_dropped_buffers_.fetch_add(1, std::memory_order_relaxed);
+                    }
                     if (short_site.free_queue != nullptr) {
                         record_short_site(short_sites, q, short_site);
                     }
-                    found_any = true;
                 }
             }
-            if (found_any) {
+            if (retired_or_delivered) {
                 idle_busy_polls = 0;
             }
 
@@ -1194,7 +1369,7 @@ private:
                 }
             }
 
-            if (!found_any) {
+            if (!retired_or_delivered) {
                 if (idle_busy_polls < kIdleBusyPollLoops) {
                     idle_busy_polls++;
                 } else {
@@ -1205,10 +1380,37 @@ private:
 
         for (int q = queue_start; q < queue_count_; q += queue_stride) {
             ReadyEntry entry;
-            while (Alg::try_pop_aicpu_entry(manager_, header, q, entry, true)) {
-                Alg::process_entry(manager_, header, q, entry, nullptr);
+            auto since = std::chrono::steady_clock::time_point{};
+            while (Alg::try_peek_aicpu_entry(manager_, header, q, entry, true)) {
+                const bool exhausted = entry_retries_exhausted(since);
+                const EntryOutcome outcome = Alg::process_entry(manager_, header, q, entry, nullptr, exhausted);
+                if (outcome == EntryOutcome::kRetry) {
+                    // Past the budget the acknowledgement write is what is
+                    // failing; leave the queue alone rather than retrying a dead
+                    // device link until the pass never ends.
+                    if (exhausted) break;
+                    if (since == std::chrono::steady_clock::time_point{}) {
+                        since = std::chrono::steady_clock::now();
+                    }
+                    // Teardown path, so a sleep is permitted here (codestyle.md
+                    // rule 5): no task's latency passes through it, and it keeps a
+                    // dead device link from pinning a core for the whole budget.
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    continue;
+                }
+                since = std::chrono::steady_clock::time_point{};
+                if (outcome == EntryOutcome::kDropped) {
+                    drain_dropped_buffers_.fetch_add(1, std::memory_order_relaxed);
+                }
             }
         }
+    }
+
+    // A stall that has not started yet is never exhausted; one that has is
+    // exhausted once it has outlived kStalledDrainEntryTimeout.
+    static bool entry_retries_exhausted(std::chrono::steady_clock::time_point stalled_since) {
+        if (stalled_since == std::chrono::steady_clock::time_point{}) return false;
+        return std::chrono::steady_clock::now() - stalled_since >= kStalledDrainEntryTimeout;
     }
 
     // Append a site unless this shard is already tracking that free_queue. The
@@ -1356,6 +1558,9 @@ private:
     std::vector<std::thread> mgmt_drain_threads_;
     std::thread mgmt_replenish_thread_;
     std::atomic<bool> mgmt_running_{false};
+
+    // Written by every drain shard, read once per run by reconcile_counters().
+    std::atomic<uint64_t> drain_dropped_buffers_{0};
 
     // Two-phase quiescence handshake. Each phase is a monotonic epoch the
     // caller publishes and every worker of that phase echoes back once it has

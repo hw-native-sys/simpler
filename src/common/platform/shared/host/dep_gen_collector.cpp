@@ -217,6 +217,7 @@ void DepGenCollector::on_buffer_collected(const DepGenReadyBufferInfo &info) {
 
 bool DepGenCollector::reconcile_counters() {
     if (shm_host_ == nullptr) return false;
+    report_drain_drops();
 
     // mgmt thread is stopped by the caller; pull the latest BufferState
     // (current_buf_ptr, total/dropped counters) from device so the

@@ -502,6 +502,7 @@ void PmuCollector::on_buffer_collected(const PmuReadyBufferInfo &info, int colle
 
 void PmuCollector::reconcile_counters() {
     if (shm_host_ == nullptr) return;
+    report_drain_drops();
 
     rmb();
     flush_collector_shards_to_csv();

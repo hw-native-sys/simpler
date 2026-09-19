@@ -464,6 +464,7 @@ void ArgsDumpCollector::on_buffer_collected(const DumpReadyBufferInfo &info, int
 
 void ArgsDumpCollector::reconcile_counters() {
     if (shm_host_ == nullptr) return;
+    report_drain_drops();
 
     // Pull the latest BufferStates (current_buf_ptr, dropped_record_count)
     // before the per-thread loop so leftovers reflect post-stop() device

@@ -228,6 +228,7 @@ size_t ScopeStatsCollector::collected_for_run(uint64_t run_epoch) const {
 
 bool ScopeStatsCollector::reconcile_counters() {
     if (shm_host_ == nullptr) return false;
+    report_drain_drops();
 
     // Pull the latest BufferState (current_buf_ptr, total/dropped counters)
     // before the cross-check so it sees post-stop() device state.

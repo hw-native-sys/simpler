@@ -76,6 +76,10 @@ struct AlgorithmFreeQueue {
 
 struct AlgorithmHeader {
     AlgorithmFreeQueue free_queue;
+    // process_entry acknowledges the device's ready-queue slot once the payload
+    // is on the host, so the drain-path index it advances has to exist here too.
+    volatile uint32_t queue_heads[1]{};
+    volatile uint32_t queue_tails[1]{};
 };
 
 struct AlgorithmReadyEntry {
@@ -895,7 +899,10 @@ TEST(BufferPoolManagerShardingTest, ShortTopUpIsReportedAndRetryRefillsTheSameLa
 
     profiling_common::EntrySite<AlgorithmModule> short_site{};
     short_site.free_queue = nullptr;
-    Alg::process_entry(manager, &header, 0, AlgorithmReadyEntry{reinterpret_cast<uint64_t>(dev_ptr)}, &short_site);
+    Alg::process_entry(
+        manager, &header, 0, AlgorithmReadyEntry{reinterpret_cast<uint64_t>(dev_ptr)}, &short_site,
+        /*retries_exhausted=*/false
+    );
 
     // The recycled lane was dry, so the site comes back for a retry and the
     // queue is still empty.
@@ -968,7 +975,8 @@ TEST(BufferPoolManagerShardingTest, ProcessEntryWaitsForReadySpaceInsteadOfRetir
     std::future<void> process_done = process_done_promise.get_future();
     std::thread management([&]() {
         profiling_common::ProfilerAlgorithms<AlgorithmModule>::process_entry(
-            manager, &header, 0, AlgorithmReadyEntry{reinterpret_cast<uint64_t>(dev_ptr)}, nullptr
+            manager, &header, 0, AlgorithmReadyEntry{reinterpret_cast<uint64_t>(dev_ptr)}, nullptr,
+            /*retries_exhausted=*/false
         );
         process_done_promise.set_value();
     });

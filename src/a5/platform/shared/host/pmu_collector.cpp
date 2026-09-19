@@ -536,6 +536,7 @@ void PmuCollector::on_buffer_collected(const PmuReadyBufferInfo &info, int colle
 
 void PmuCollector::reconcile_counters() {
     if (shm_host_ == nullptr) return;
+    report_drain_drops();
 
     // Pull the latest BufferStates (current_buf_ptr, total/dropped/mismatch
     // counters) before the per-core sanity loop so the cross-check sees

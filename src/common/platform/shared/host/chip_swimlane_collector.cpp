@@ -727,6 +727,7 @@ void ChipSwimlaneCollector::reconcile_counters() {
     if (shm_host_ == nullptr) {
         return;
     }
+    report_drain_drops();
     merge_collector_shards();
 
     // Refresh the pool states (current_buf_ptr + total/dropped counters) from

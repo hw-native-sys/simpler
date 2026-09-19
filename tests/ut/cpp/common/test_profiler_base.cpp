@@ -24,6 +24,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -740,4 +741,206 @@ TEST(ProfilerBaseTest, PublishFieldReportsASizeLargerThanTheWindow) {
 
     EXPECT_FALSE(collector.publish_field(window.header(), sizeof(TestHeader) + 1, "whole header"));
     EXPECT_EQ(copies, 0);
+}
+
+// A buffer this manager never mapped cannot be delivered however often it is
+// retried, so the drain path retires it: the queue keeps draining, the loss is
+// counted, and the buffer goes back into the free_queue. Before the entry was
+// acknowledged only after delivery, the same entry was acknowledged first and
+// then dropped by a bare return — the records vanished with nothing counting
+// them and the buffer left the pool for good.
+TEST(ProfilerBaseTest, UnmappableBufferIsRetiredCountedAndReturnedToThePool) {
+    TestHeader header{};
+    uint64_t unmapped = 0;
+    uint64_t mapped = 0;
+    TestCollector<SingleShardModule> collector;
+    collector.init(2, &header);
+    register_buffer(collector, &mapped);
+    collector.start(nullptr);
+    // start() tops the free_queue up to kSlotCount, so model the two pops AICPU
+    // makes before publishing the two entries below. Without the room a retired
+    // buffer can only go to the manager's retired pool, which is the fallback
+    // rather than the behaviour under test.
+    header.free_queue.head = 2;
+
+    publish(header, 1, &unmapped);
+    publish(header, 1, &mapped);
+    ASSERT_TRUE(wait_for_collected(collector, 1, std::chrono::seconds(5)));
+    collector.quiesce();
+
+    EXPECT_EQ(collector.collected(), 1);               // the mapped one only
+    EXPECT_EQ(collector.drain_dropped_buffers(), 1u);  // and the loss is named
+    EXPECT_EQ(header.queue_heads[1], 2u);              // neither entry blocks the queue
+
+    bool returned_to_pool = false;
+    for (uint32_t slot = 0; slot < kSlotCount; slot++) {
+        if (header.free_queue.buffer_ptrs[slot] == reinterpret_cast<uint64_t>(&unmapped)) {
+            returned_to_pool = true;
+        }
+    }
+    EXPECT_TRUE(returned_to_pool);
+
+    collector.stop();
+}
+
+// A failing device→host copy is the transport failing, not the entry being
+// unreadable, so the entry keeps its place at the queue head: nothing is
+// acknowledged and nothing is counted while the copy can still succeed. The
+// record then survives a transient failure instead of being dropped by the
+// first attempt at it.
+TEST(ProfilerBaseTest, FailedBufferCopyLeavesTheEntryUnacknowledged) {
+    TestHeader header{};
+    uint64_t buffer = 0;
+    std::atomic<bool> copy_buffer_fails{true};
+    std::atomic<int> buffer_copy_attempts{0};
+
+    // Only the buffer payload copy fails; the header range reads the drain loop
+    // needs to see the queue at all must keep working.
+    auto copy = [&](void *dst, const void *src, size_t size) {
+        if (src == &buffer) {
+            buffer_copy_attempts.fetch_add(1, std::memory_order_relaxed);
+            if (copy_buffer_fails.load(std::memory_order_relaxed)) return -1;
+        }
+        std::memcpy(dst, src, size);
+        return 0;
+    };
+
+    TestCollector<SingleShardModule> collector;
+    collector.init(2, &header, copy);
+    register_buffer(collector, &buffer);
+    collector.start(nullptr);
+
+    publish(header, 1, &buffer);
+    // A second attempt is the observable proof that the entry survived the first
+    // failure. Bounded, because "the entry was consumed and never retried" — the
+    // behaviour this test exists to catch — would otherwise hang it rather than
+    // fail it.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (buffer_copy_attempts.load(std::memory_order_relaxed) < 2 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_GE(buffer_copy_attempts.load(std::memory_order_relaxed), 2);
+    EXPECT_EQ(collector.collected(), 0);
+    EXPECT_EQ(header.queue_heads[1], 0u);              // still the device's slot
+    EXPECT_EQ(collector.drain_dropped_buffers(), 0u);  // nothing given up on yet
+
+    // Recovering the transport delivers the record the drain path held on to.
+    copy_buffer_fails.store(false, std::memory_order_relaxed);
+    collector.quiesce();
+    EXPECT_EQ(collector.collected(), 1);
+    EXPECT_EQ(header.queue_heads[1], 1u);
+    EXPECT_EQ(collector.drain_dropped_buffers(), 0u);
+
+    collector.stop();
+}
+
+// The retry above must be bounded: a copy that never recovers would otherwise
+// hold the queue head forever and quiesce() — which waits for every drain shard
+// to report its queues empty — could never return.
+TEST(ProfilerBaseTest, PermanentlyFailingCopyIsRetiredSoQuiesceCompletes) {
+    TestHeader header{};
+    uint64_t buffer = 0;
+    auto copy = [&](void *dst, const void *src, size_t size) {
+        if (src == &buffer) return -1;
+        std::memcpy(dst, src, size);
+        return 0;
+    };
+
+    TestCollector<SingleShardModule> collector;
+    collector.init(2, &header, copy);
+    register_buffer(collector, &buffer);
+    collector.start(nullptr);
+
+    publish(header, 1, &buffer);
+    collector.quiesce();
+
+    EXPECT_EQ(collector.collected(), 0);
+    EXPECT_EQ(collector.drain_dropped_buffers(), 1u);
+    EXPECT_EQ(header.queue_heads[1], 1u);
+
+    collector.stop();
+}
+
+namespace {
+
+// An entry whose indices do not validate: resolve_entry rejects it, so the
+// drain path never learns its kind or its originating free_queue and cannot
+// hand the buffer back the way the other retire paths do.
+struct RejectingModule : TestModuleBase<1> {
+    static std::optional<profiling_common::EntrySite<RejectingModule>>
+    resolve_entry(void * /*shm*/, DataHeader * /*header*/, int /*q*/, const ReadyEntry & /*entry*/) {
+        return std::nullopt;
+    }
+
+    template <typename Cb>
+    static void for_each_instance(void * /*shm*/, DataHeader *header, Cb &&cb) {
+        cb(0, &header->free_queue, sizeof(uint64_t));
+    }
+};
+
+// Pointers teardown hands to the collector's release callback. Recorded, never
+// freed: these tests point at stack storage on purpose.
+template <typename Collector>
+std::vector<void *> released_at_teardown(Collector &collector) {
+    std::vector<void *> released;
+    collector.manager().release_owned_buffers([&released](void *ptr) {
+        released.push_back(ptr);
+    });
+    return released;
+}
+
+}  // namespace
+
+// A rejected entry's buffer pointer arrived in the same corrupt entry, so it
+// must never reach a device-visible free_queue — but when the manager can map it
+// to a block it owns it is still this collector's buffer, and dropping it on the
+// floor loses it from the pool for the rest of the run. It goes to the retired
+// pool, which teardown releases.
+TEST(ProfilerBaseTest, UnresolvableEntryParksAnOwnedBufferForTeardown) {
+    TestHeader header{};
+    uint64_t buffer = 0;
+    TestCollector<RejectingModule> collector;
+    collector.init(2, &header);
+    register_buffer(collector, &buffer);
+    collector.start(nullptr);
+
+    publish(header, 1, &buffer);
+    collector.quiesce();
+    collector.stop();
+
+    EXPECT_EQ(collector.collected(), 0);
+    EXPECT_EQ(collector.drain_dropped_buffers(), 1u);
+    EXPECT_EQ(header.queue_heads[1], 1u);  // the queue still drains
+    // Not republished to the device: AICPU must never be handed a pointer that
+    // came out of an entry whose own indices were wrong.
+    for (uint32_t slot = 0; slot < kSlotCount; slot++) {
+        EXPECT_NE(header.free_queue.buffer_ptrs[slot], reinterpret_cast<uint64_t>(&buffer));
+    }
+
+    const std::vector<void *> released = released_at_teardown(collector);
+    EXPECT_NE(std::find(released.begin(), released.end(), &buffer), released.end());
+}
+
+// The same rejection, but the pointer maps to nothing this manager owns — the
+// expected shape when the entry is truly corrupt. Parking it would make
+// teardown call the release callback on it, because release_pointer_for()
+// returns an unmapped pointer unchanged, so a wild pointer would be freed.
+// Withholding it is the only safe outcome.
+TEST(ProfilerBaseTest, UnresolvableEntryWithholdsAnUnownedBufferFromTeardown) {
+    TestHeader header{};
+    uint64_t foreign = 0;
+    TestCollector<RejectingModule> collector;
+    collector.init(2, &header);
+    // Deliberately not registered: resolve_host_ptr cannot vouch for it.
+    collector.start(nullptr);
+
+    publish(header, 1, &foreign);
+    collector.quiesce();
+    collector.stop();
+
+    EXPECT_EQ(collector.drain_dropped_buffers(), 1u);
+    EXPECT_EQ(header.queue_heads[1], 1u);
+
+    const std::vector<void *> released = released_at_teardown(collector);
+    EXPECT_EQ(std::find(released.begin(), released.end(), &foreign), released.end());
 }
