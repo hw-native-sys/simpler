@@ -108,32 +108,37 @@ for tool in "$ROOT"/tools/cann-examples/*/; do
 
     echo "=== $name"
     shapes=0
-    status=0
+    # Build and run outcomes are tracked apart so the summary's counts mean what
+    # they say: a tool that compiled and then failed its smoke is still one that
+    # built, and folding the two together under-reported the build coverage by
+    # exactly the tools most worth looking at.
+    build_status=0
+    run_status=0
 
     if [ -f "${tool}CMakeLists.txt" ]; then
         shapes=$((shapes + 1))
-        build_one "${tool%/}" || status=1
+        build_one "${tool%/}" || build_status=1
     fi
     if [ -d "${tool}device-aicore" ]; then
         shapes=$((shapes + 1))
-        build_one "${tool}device-aicore" -DCCE_AICORE_ARCH="$ARCH" || status=1
+        build_one "${tool}device-aicore" -DCCE_AICORE_ARCH="$ARCH" || build_status=1
     fi
     for dev in "${tool}device" "${tool}device-aicpu"; do
         [ -d "$dev" ] || continue
         shapes=$((shapes + 1))
-        build_one "$dev" -DCMAKE_C_COMPILER="${CROSS}-gcc" -DCMAKE_CXX_COMPILER="${CROSS}-g++" || status=1
+        build_one "$dev" -DCMAKE_C_COMPILER="${CROSS}-gcc" -DCMAKE_CXX_COMPILER="${CROSS}-g++" || build_status=1
     done
     if [ -d "${tool}host" ]; then
         shapes=$((shapes + 1))
-        build_one "${tool}host" || status=1
+        build_one "${tool}host" || build_status=1
     fi
 
     if [ "$shapes" -eq 0 ]; then
         echo "  UNRECOGNISED LAYOUT: no CMakeLists.txt, device*/ or host/ — not covered"
-        status=1
+        build_status=1
     fi
 
-    if [ "$status" -eq 0 ] && [ -n "$RUN_DEVICE" ]; then
+    if [ "$build_status" -eq 0 ] && [ -n "$RUN_DEVICE" ]; then
         if [ -x "${tool}smoke.sh" ]; then
             smoke_out="$(timeout "$SMOKE_TIMEOUT" "${tool}smoke.sh" "$RUN_DEVICE" 2>&1)"
             smoke_rc=$?
@@ -152,11 +157,11 @@ for tool in "$ROOT"/tools/cann-examples/*/; do
                 echo "  RUN TIMED OUT: $name exceeded ${SMOKE_TIMEOUT}s and was killed"
                 echo "    re-run to see where it stops: ${tool}smoke.sh $RUN_DEVICE"
                 printf '%s\n' "$smoke_out" | tail -10 | sed 's/^/    /'
-                status=1
+                run_status=1
             else
                 echo "  RUN FAILED: $name (exit $smoke_rc)"
                 printf '%s\n' "$smoke_out" | tail -10 | sed 's/^/    /'
-                status=1
+                run_status=1
             fi
         else
             echo "  no smoke.sh — built but not run"
@@ -164,9 +169,10 @@ for tool in "$ROOT"/tools/cann-examples/*/; do
         fi
     fi
 
-    if [ "$status" -eq 0 ]; then
+    if [ "$build_status" -eq 0 ]; then
         built+=("$name")
-    else
+    fi
+    if [ "$build_status" -ne 0 ] || [ "$run_status" -ne 0 ]; then
         failed+=("$name")
     fi
 done
@@ -178,5 +184,5 @@ if [ -n "$RUN_DEVICE" ]; then
     echo "skipped by arch (${#skipped[@]}): ${skipped[*]:-none}"
     echo "no smoke.sh (${#no_smoke[@]}): ${no_smoke[*]:-none}"
 fi
-echo "failed (${#failed[@]}): ${failed[*]:-none}"
+echo "failed to build or run (${#failed[@]}): ${failed[*]:-none}"
 [ "${#failed[@]}" -eq 0 ]
