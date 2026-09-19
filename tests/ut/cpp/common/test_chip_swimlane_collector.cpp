@@ -825,3 +825,93 @@ TEST_F(ChipSwimlaneAccountingTest, DispatchesWithNoBufferAreDroppedNotCarriedInt
     EXPECT_EQ(ac_state->head.total_record_count, kCapacity + 1);
     EXPECT_TRUE(accounting_balances(ac_state));
 }
+
+// A rotated-out buffer reaches the host only on the ACK that gates it, and the
+// accounting identity is open for exactly that long.
+//
+// The rotation does not hand the just-filled buffer over: tensormap_and_ringbuffer's
+// AICore executor writes FIN before the swimlane record, so the FIN that gated the
+// boundary dispatch does not prove the old buffer's tail record has drained. The
+// buffer is stashed and released only when AICore ACKs the first task of the NEW
+// buffer, whose token the rotation stored as the gate.
+//
+// Nothing here reads the stash itself — it is file-local to the AICPU translation
+// unit — but every effect of it is observable from the shared memory the host reads:
+// the buffer is in neither queue, `published_record_count` has not moved, and the
+// count is missing from the identity. So this pins the window by its consequences
+// rather than by its storage.
+TEST_F(ChipSwimlaneAccountingTest, ARotatedBufferReachesTheHostOnlyOnItsGatingAck) {
+    auto *ac_state = get_aicore_buffer_state(shm_, 0);
+
+    collector_.begin_run("ack-gate", ChipSwimlaneLevel::TASK_TIMING);
+    set_platform_run_result(/*region_base=*/0, /*run_epoch=*/71);
+    get_chip_swimlane_header(shm_)->chip_swimlane_level = static_cast<uint32_t>(ChipSwimlaneLevel::TASK_TIMING);
+    chip_swimlane_aicpu_init(/*worker_count=*/1);
+
+    const uint64_t rotated = ac_state->head.current_buf_ptr;
+    ASSERT_NE(rotated, 0u) << "init found no buffer";
+    ASSERT_GT(aicore_free_queue_depth(shm_, 0), 0u) << "no replacement buffer available for the rotation";
+
+    // Fill the active buffer to capacity. The rotation fires on the NEXT dispatch,
+    // not this batch's last one.
+    constexpr uint32_t kCapacity = static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
+    for (uint32_t i = 0; i < kCapacity; i++) {
+        chip_swimlane_aicpu_on_aicore_dispatch(/*core_id=*/0, /*thread_idx=*/0, i + 1);
+    }
+    ASSERT_EQ(ac_state->head.current_buf_ptr, rotated) << "rotated before the capacity boundary";
+    ASSERT_EQ(ac_state->head.live_record_count, kCapacity);
+
+    // The boundary dispatch. Its token becomes the ACK gate.
+    constexpr uint32_t kGate = kCapacity + 1;
+    chip_swimlane_aicpu_on_aicore_dispatch(/*core_id=*/0, /*thread_idx=*/0, kGate);
+    ASSERT_NE(ac_state->head.current_buf_ptr, rotated) << "the rotation did not take";
+
+    // Mid-hand-off. The rotated buffer belongs to neither side: the host cannot
+    // see it, and AICPU has not put it back — it has no push on the free queue.
+    EXPECT_TRUE(published_marks().empty()) << "the rotated buffer was published before its gating ACK";
+    EXPECT_FALSE(free_queue_holds(ac_state->free_queue, rotated)) << "AICPU pushed a buffer onto the free queue";
+    EXPECT_EQ(ac_state->head.published_record_count, 0u);
+    EXPECT_EQ(ac_state->head.live_record_count, 1u) << "the boundary dispatch belongs to the replacement buffer";
+    EXPECT_EQ(ac_state->head.dropped_record_count, 0u);
+    EXPECT_EQ(ac_state->head.total_record_count, kGate);
+
+    // This is the checkpoint-vs-running-invariant gap, measured rather than
+    // asserted away: the stashed buffer's records are in neither `published` nor
+    // `live`, so the identity is short by exactly that buffer's count.
+    EXPECT_FALSE(accounting_balances(ac_state)) << "the identity closed while a buffer was still mid-hand-off";
+    EXPECT_EQ(
+        ac_state->head.total_record_count - ac_state->head.published_record_count - ac_state->head.live_record_count -
+            ac_state->head.dropped_record_count,
+        kCapacity
+    ) << "the shortfall is not the stashed buffer's count";
+
+    // An ACK for any other task leaves it stashed. The gate is a specific token,
+    // not "the next completion to arrive".
+    chip_swimlane_aicpu_on_aicore_ack(/*core_id=*/0, /*thread_idx=*/0, kGate - 1);
+    EXPECT_TRUE(published_marks().empty()) << "a non-gating ACK released the stashed buffer";
+    EXPECT_EQ(ac_state->head.published_record_count, 0u);
+
+    // The gating ACK releases it, marked with the count captured at rotation.
+    chip_swimlane_aicpu_on_aicore_ack(/*core_id=*/0, /*thread_idx=*/0, kGate);
+    const std::vector<uint32_t> after_ack = published_marks();
+    ASSERT_EQ(after_ack.size(), 1u) << "the gating ACK did not release the stashed buffer";
+    EXPECT_EQ(after_ack[0], kCapacity) << "the released buffer was marked with a count it does not hold";
+    EXPECT_EQ(ac_state->head.published_record_count, kCapacity);
+    EXPECT_TRUE(accounting_balances(ac_state)) << "the identity did not close once the hand-off completed";
+
+    // The gate is consumed, so a repeat of the same ACK cannot publish it twice.
+    chip_swimlane_aicpu_on_aicore_ack(/*core_id=*/0, /*thread_idx=*/0, kGate);
+    EXPECT_EQ(published_marks().size(), 1u) << "a repeated gating ACK published the buffer a second time";
+    EXPECT_EQ(ac_state->head.published_record_count, kCapacity);
+
+    // Run end hands over the replacement, holding just the boundary dispatch.
+    const int cores[] = {0};
+    chip_swimlane_aicpu_flush(/*thread_idx=*/0, cores, /*core_num=*/1);
+
+    const std::vector<uint32_t> marks = published_marks();
+    ASSERT_EQ(marks.size(), 2u) << "the replacement buffer was not published at flush";
+    EXPECT_EQ(marks[1], 1u);
+    EXPECT_EQ(ac_state->head.published_record_count, kGate);
+    EXPECT_EQ(ac_state->head.live_record_count, 0u);
+    EXPECT_TRUE(accounting_balances(ac_state));
+}
