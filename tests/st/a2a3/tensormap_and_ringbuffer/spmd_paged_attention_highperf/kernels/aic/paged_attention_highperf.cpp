@@ -29,49 +29,16 @@
 #include <cstring>
 
 static float half_to_float(uint16_t h) {
-    uint32_t sign = static_cast<uint32_t>(h & 0x8000) << 16;
-    uint32_t exp = (h >> 10) & 0x1f;
-    uint32_t mant = h & 0x03ff;
-    uint32_t bits;
-    if (exp == 0) {
-        if (mant == 0) {
-            bits = sign;
-        } else {
-            exp = 1;
-            while ((mant & 0x0400) == 0) {
-                mant <<= 1;
-                --exp;
-            }
-            mant &= 0x03ff;
-            bits = sign | ((exp + 112) << 23) | (mant << 13);
-        }
-    } else if (exp == 31) {
-        bits = sign | 0x7f800000 | (mant << 13);
-    } else {
-        bits = sign | ((exp + 112) << 23) | (mant << 13);
-    }
-    float out;
-    std::memcpy(&out, &bits, sizeof(out));
-    return out;
+    _Float16 v;
+    std::memcpy(&v, &h, sizeof(v));
+    return static_cast<float>(v);
 }
 
 static uint16_t float_to_half(float f) {
-    uint32_t bits;
-    std::memcpy(&bits, &f, sizeof(bits));
-    uint32_t sign = (bits >> 16) & 0x8000;
-    int32_t exp = static_cast<int32_t>((bits >> 23) & 0xff) - 127 + 15;
-    uint32_t mant = bits & 0x7fffff;
-    if (exp <= 0) {
-        if (exp < -10) {
-            return static_cast<uint16_t>(sign);
-        }
-        mant = (mant | 0x800000) >> (1 - exp);
-        return static_cast<uint16_t>(sign | ((mant + 0x1000) >> 13));
-    }
-    if (exp >= 31) {
-        return static_cast<uint16_t>(sign | 0x7c00);
-    }
-    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) | ((mant + 0x1000) >> 13));
+    const _Float16 v = static_cast<_Float16>(f);
+    uint16_t h;
+    std::memcpy(&h, &v, sizeof(h));
+    return h;
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
