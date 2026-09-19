@@ -16,7 +16,7 @@ This skill produces **four files** in the project root, all keyed to the
 
 | File | What | Built in |
 | ---- | ---- | -------- |
-| `WEEKLY_CHANGES_<Friday>.md` | Curated, user-facing changelog (filtered) | §4 |
+| `WEEKLY_CHANGES_<Friday>.md` | Curated, user-facing changelog (filtered) | §4-5 → [writing-rules.md](writing-rules.md) |
 | `WEEKLY_ALL_PRS_<Friday>.md` | Full inventory of **every** PR in the window | §6 |
 | `WEEKLY_CHANGES_<Friday>_zh.md` | Chinese translation of the changelog | §7c |
 | `WEEKLY_ALL_PRS_<Friday>_zh.md` | Chinese translation of the inventory | §7c |
@@ -114,6 +114,35 @@ gh pr view <num> --json title,body -q '.title + "\n" + .body'
 gh pr diff <num>
 ```
 
+**A PR body is a claim, not a source.** It is the author's narrative, written
+before review, and a later PR in the same window can invalidate it. Every
+statement you write about **what the code looked like before** must be read out
+of the tree, not transcribed from the body:
+
+```bash
+git show <sha>^:path/to/file.h | grep -n -A15 '<symbol>'   # the before state
+git show <sha> --format='' -- path/to/file.cpp             # what actually changed
+git show <sha> --format='' --name-only                      # full paths (see the scope line)
+```
+
+Four kinds of error this catches, all of them observed:
+
+- **A "pre-existing problem" that the series itself created.** A body describes
+  the state its own predecessor left behind. Check the *predecessor's* parent:
+  if `git show <earlier-sha>^:<file>` shows the API in its original form, the
+  problem belongs to the series, not to the world before it — say so, or describe
+  only the state that predates the whole series.
+- **Attributing a shared facility to one component.** Grep for where a helper is
+  actually defined (`git grep -n 'inline .*<name>'`) before writing "X has it and
+  Y does not" — it may live in a header both include.
+- **A mechanism described more loosely than it is.** "Matched by address range"
+  vs. the code's exact-equality search are different claims, and only the second
+  explains why the fix had to change the *criterion* rather than tighten a check.
+- **An example the public API does not accept.** Before writing a call-site
+  snippet, confirm the entry point's signature (`grep -n 'using .*Function\|static
+  inline .* <fn>('`). A capturing lambda against a function-pointer parameter
+  does not compile.
+
 **Pass C — data for the full inventory (§6).** The curated changelog needs
 only kept-PR bodies. The full inventory additionally needs, for **every** PR
 in the window: a 1-3 line description (so fetch the *skipped* PRs' bodies too —
@@ -203,104 +232,51 @@ hides the story. Cross-check before writing: scan kept PRs for shared
 subsystem keywords in titles, shared file paths in their diffs, or
 explicit "stacked on #NNN" / "follow-up to #NNN" language in the body.
 
-## 4. Document structure
+**The test is "same reader", not "same feature".** Two PRs that sound like one
+story still belong in separate entries when they land in different layers,
+because the layer decides who has to act on them:
 
-Every run assumes the project has no prior weekly report — render the full
-structure below, do not "match prior reports." The skeleton is shown using
-four-backtick fences so that the inner triple-backtick example blocks
-render literally. Use the headings literally in the English doc — translation,
-if any, happens only in the `_zh.md` pass (§7c).
+Match **longest prefix first**, so the rows are read top to bottom and the first
+hit wins — `simpler_setup/tools/` is a subpath of `simpler_setup/`, and without
+an order a change to a tool would satisfy two rows at once:
 
-````markdown
-# simpler weekly external changes (YYYY-MM-DD ~ YYYY-MM-DD)
+| Layer | Path signature (first match wins) | Who must read it |
+| ----- | --------------------------------- | ---------------- |
+| Offline tooling | `simpler_setup/tools/` | people reading a capture |
+| Scene test | `simpler_setup/` (excluding `tools/`), `examples/`, `tests/st/` — **no `src/`** | people writing cases in this repo |
+| Runtime / platform | `src/{arch}/runtime/`, `src/common/platform/` | every caller, including other repos |
 
-This document presents core interface and feature changes via example
-comparisons; see each PR for details.
+Merging across that boundary is worse than splitting: a runtime change filed
+under a scene-test entry reads as "only applies to scene tests", which is the
+opposite of true. When two such PRs genuinely interlock, keep two entries and
+give each a scope line ([writing-rules.md](writing-rules.md) §4) plus one
+sentence pointing at the other.
 
----
+The inverse also holds: **two PRs that change the same observable contract
+belong together even when their stated goals differ.** A scheduler optimization
+that alters which profiling phases get emitted changes the same schema the
+profiling PR just defined; filing them apart leaves the reader with two
+half-descriptions of one contract. Detect this by diffing the doc: if PR B's
+diff of a `docs/` file starts from the blob PR A produced, they are a relay.
 
-## I. Interface changes
-
-### N. <short title> — [#NNN](https://github.com/.../pull/NNN)
-
-**Why:** <the problem this change solves — what broke, was missing, or forced a
-migration without it. Give enough context to feel the pain: what the user hit,
-under what condition, and why it mattered. When there is more than one distinct
-problem, enumerate them `1.` / `2.` so the How can answer each by number.>
-
-**How:** <how this change resolves the Why — in the SAME order and numbering:
-point 1 here answers problem 1 above. Name the concrete mechanism (new
-argument, changed default, added validation, new contract), not just "it is
-fixed". One clause per Why point.>
-
-```diff
-- <old code>
-+ <new code>
+```bash
+# The `index` line is the SECOND line of a file's diff — `head -1` returns the
+# `diff --git` line, which is identical for both PRs and would never match.
+git show <shaA> --format='' -- docs/path.md | sed -n '/^index /{p;q}'  # index <old>..<X>
+git show <shaB> --format='' -- docs/path.md | sed -n '/^index /{p;q}'  # index <X>..<new>  ← relay
 ```
 
-<necessary constraints / caveats, 1-3 lines>
+## 4-5. Document structure and writing style
 
----
+**[writing-rules.md](writing-rules.md) holds both, and you must read it before
+writing the first entry.** It carries the §I/§II/§III skeleton, the scope line,
+the retired/added/wire shape for structural changes, the example and
+problem-statement rules, the ~25 line soft cap, and the five-question
+readability check to run before shipping.
 
-## II. New features
-
-### N. <feature name> — [#NNN](https://github.com/.../pull/NNN)
-
-**Why:** <the problem this feature solves — what was impossible, broken, or
-costly before it. Give enough context to feel the gap: what the user could not
-do, or paid for, without it. Enumerate `1.` / `2.` when several drivers
-motivate the feature.>
-
-**How:** <how the feature closes the Why — in the SAME order and numbering: the
-surface the user calls plus what it does underneath, mapped back to the problem
-each part removes. One clause per Why point.>
-
-```<lang>
-<minimum callable example: Python API / orch C++ / shell command>
-```
-
-<necessary supplement / constraints, 1-3 lines>
-
----
-
-## III. User-visible bug fixes
-
-| PR          | Fix description                                                |
-| ----------- | -------------------------------------------------------------- |
-| [#NNN](...) | <one line: user-observable symptom, not the internal cause>    |
-````
-
-## 5. Writing style
-
-- **Examples over prose.** Every interface change has a before/after diff
-  block from a real example file in the repo (`examples/...` or
-  `tests/...`). Pull the snippet directly from the PR diff — do not
-  paraphrase.
-- **Motivation is mandatory for features and interface changes.** Every entry
-  in §I and §II opens with a `**Why:**` that names the concrete problem the
-  change solves — a dropped capability, an error code, a perf cost, a missing
-  surface. Give enough context that a reader feels the problem: what was hit,
-  under what condition, and why it mattered — not a single terse clause. 2-5
-  lines, grounded in the PR body; do not skip it and do not pad it to filler.
-  If you cannot name a concrete problem, re-check whether the PR is actually
-  user-facing (it may belong in the excluded list).
-- **Why and How pair one-to-one.** §I and §II entries follow `**Why:**` with a
-  `**How:**` that explains how the change resolves it, lining up point-for-point
-  with the Why. If Why enumerates `1.` / `2.`, How answers `1.` / `2.` in the
-  same order; if Why is a single problem, How is a single matching answer. How
-  names the concrete mechanism — the new argument, the changed default, the
-  validation added, the contract introduced — so the reader can trace each
-  problem to its fix. Do not bury the solution in the caveat line or leave it
-  implicit in the diff: the diff shows *what* the code is now, the How says
-  *why that resolves the Why*.
-- **Concise elsewhere.** Outside `**Why:**` / `**How:**`, keep each supplement
-  to 1-3 lines.
-- **Bug-fix rows are user-symptom only.** Each §III row is one line, takes no
-  `**Why:**`, and describes what a user would have *observed* before the fix —
-  a log line, an error code, a wrong output, a hang — **not** the internal
-  cause ("missing finalize call", "wrong header order"). If you cannot phrase
-  the user symptom in one line, the PR is internal and belongs in the excluded
-  list, not §III.
+It lives in its own file for two reasons: this one is loaded in full on every
+invocation, and the rules only matter once triage (§1-§3) has already decided
+what goes in the report.
 
 ## 6. Full-PR inventory document
 
@@ -347,7 +323,8 @@ Total N PRs; M user-visible (#NNN #NNN ...).
 Write `<repo_root>/WEEKLY_CHANGES_<Friday>.md` where `<Friday>` is `$START`
 from §1 (NOT the end date). The Friday-anchored filename is reused all cycle,
 so mid-week re-runs overwrite in place and the file grows into the full weekly
-report by cycle close. Contains **only** the three §4 sections — no excluded
+report by cycle close. Contains **only** the three sections of
+[writing-rules.md](writing-rules.md) §4 — no excluded
 list, no window range, no meta commentary (those go in the chat reply, §7d).
 
 ### 7b. Full inventory (English)
@@ -405,10 +382,38 @@ of each section in the `simpler-Wiki.md` index (it is newest-first):
 - [WEEKLY_ALL_PRS_<Friday>_zh (<START> ~ <END>)](WEEKLY_ALL_PRS_<Friday>_zh)
 ```
 
-Match the existing wiki pages' style when copying — reuse the exact Chinese H1
-wording and its full-width parentheses verbatim from a prior week's `_zh` page
-(open one and copy the heading form) rather than re-deriving them, so the title
-stays consistent with the earlier pages. Two gotchas:
+**The wiki's Chinese wording is fixed, and it is not what translating the English
+produces.** Several headings there are established terms that a fresh
+translation of the same English heading will render differently — close enough
+to look right, different enough to break the run of pages. So do not re-derive
+any of them: read the previous week's two pages and copy each string verbatim,
+substituting only the dates.
+
+Six strings drift every run if you skip this (this file cannot quote them —
+`tests/lint` enforces English-only source, and the pages are the authority
+anyway):
+
+```bash
+PREV=<wiki>/WEEKLY_CHANGES_<prev-Friday>_zh.md
+PREVALL=<wiki>/WEEKLY_ALL_PRS_<prev-Friday>_zh.md
+head -3  "$PREV"      # 1. CHANGES H1 (note its full-width parentheses)  2. intro line
+grep -n '^## ' "$PREV"    # 3. the three section headings
+head -5  "$PREVALL"       # 4. ALL_PRS H1 (an em-dash *pair*)  5. its three intro lines
+grep -n '^| PR |' "$PREVALL"   # 6a. overview table header
+# 6b. the count line: it sits INSIDE the first section, after the overview
+# table, so anything anchored on the first `## ` returns the intro lines
+# instead. Take the first section's non-table prose.
+awk '/^## /{n++} n==1 && !/^\||^## |^$/' "$PREVALL"
+```
+
+Two content rules for the count line: it states total PRs and user-visible PRs,
+and when PRs were merged into one curated entry it also reconciles that number
+against the curated entry count — otherwise the two documents appear to
+disagree.
+
+Apply every correction to the **local** `_zh.md` files first, then copy those
+in, so the next run starts from the wiki's wording instead of repeating the same
+edits. Two gotchas:
 
 - **A fresh wiki clone has no git identity** — `commit` fails with an
   unknown-author error. Set it first (reuse the main repo's): `git -C <wiki>
