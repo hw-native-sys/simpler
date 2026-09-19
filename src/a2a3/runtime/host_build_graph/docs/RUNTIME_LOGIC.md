@@ -49,8 +49,25 @@ For each run, the host:
 2. reserves one backing arena for runtime/shared-memory subregions;
 3. binds the runtime to the orchestration DSO;
 4. calls the orchestration entry synchronously;
-5. finalizes task counts and the graph image; and
-6. copies the shared-memory image and the arena's copied zone to the device.
+5. finalizes task counts and records the prepared metadata sources in Runtime's host-only pending publication;
+6. returns from bind, then synchronously publishes Definitions, any resident
+   scheduler state, and finally the shared-memory image with the copied zone.
+
+`publish_run_image_impl` is the single metadata consumer. Definition and compact
+image sources are retained by the exclusive pipeline slot; A5 scheduler source
+storage moves into the same pending record. Device allocations keep their
+existing owners. No rebind/growth may replace borrowed staging before the copy
+returns. Consuming the record also consumes it on failure: later regions are not
+written, launch is forbidden, and failed-prepare cleanup retires run-owned
+allocations. Abandoning a bind clears its sources without performing metadata
+copies. Tensor copy-in and host get/set remain preparation effects; failed
+publication cannot undo them.
+
+One owner-checked host phase trace covers bind and publication. GraphUpload and
+ArenaH2d measure their actual successful copies and preserve byte-count details;
+packing is preparation work. A completed run's release cannot close a successor's
+trace. Publication is synchronous; these lifetimes do not cover asynchronous DMA
+or captured graphs.
 
 An orchestration fatal stops this sequence before the upload. The orchestrator
 runs on the host, so its code is latched in `OrchestratorState::fatal_code` and

@@ -784,14 +784,14 @@ struct DefinitionUploads {
     size_t spilled;
 };
 
-// Ship the run's Definition objects and bind every outer Graph task to the one
+// Prepare the run's Definition objects and bind every outer Graph task to the one
 // with its key. The recorders built most or all of them in place in the block's
 // host staging, each as [GraphDefinitionHeader][Definition image] at the offset it
 // claimed, so this pass writes the headers, copies in whatever did not fit, and
-// issues a single H2D of the used prefix. The device initial classify then replaces
-// each task's graph_context with an execution constructed in its own heap.
+// records the used prefix for synchronous publication. Device initial classify
+// replaces each task's graph_context with an execution constructed in its own heap.
 bool bind_graph_definitions(
-    const HostApi *api, GraphHostState &graph_state, DefinitionUploads *uploads,
+    Runtime *runtime, const HostApi *api, GraphHostState &graph_state, DefinitionUploads *uploads,
     ReadyQueuePopulations *ready_queue_populations
 ) {
     *uploads = DefinitionUploads{};
@@ -857,12 +857,14 @@ bool bind_graph_definitions(
             const size_t padded = align_up(object_bytes);
             std::memset(base + object_bytes, 0, padded - object_bytes);
         }
-        if (api->copy_to_device(block, staging, block_bytes) != 0) {
-            LOG_ERROR("host-orch: failed to upload the Graph Definition block");
-            return false;
-        }
         uploads->count = packed.size();
         uploads->bytes = block_bytes;
+        char attrs[kBindAttrsCapacity];
+        snprintf(
+            attrs, sizeof(attrs), "defs=%zu bytes=%zu submissions=%zu spilled=%zu", uploads->count, block_bytes, count,
+            uploads->spilled
+        );
+        runtime->add_pending_metadata(block, staging, block_bytes, HostPhaseKind::BindGraphUpload, attrs);
     }
 
     for (size_t index = 0; index < count; ++index) {
@@ -873,16 +875,15 @@ bool bind_graph_definitions(
         }
         auto object_it = packed.find(upload->full_key);
         if (object_it == packed.end() || block == nullptr || staging == nullptr) {
-            LOG_ERROR("host-orch: Graph task has no matching uploaded Definition object");
+            LOG_ERROR("host-orch: Graph task has no matching prepared Definition object");
             return false;
         }
-        // The object as it was shipped, so what this validates is the bytes the
-        // device will read rather than a host copy of them.
+        // Validate the prepared bytes that publication will copy to the device.
         const auto *definition = reinterpret_cast<const GraphDefinition *>(
             staging + object_it->second.object_offset + sizeof(GraphDefinitionHeader)
         );
         if (definition->total_bytes != object_it->second.image_bytes) {
-            LOG_ERROR("host-orch: Graph task has no matching uploaded Definition object");
+            LOG_ERROR("host-orch: Graph task has no matching prepared Definition object");
             return false;
         }
         GraphExecutionStorageLayout storage_layout{};
@@ -1270,13 +1271,6 @@ bool create_scheduler_state(
         context.worker_index = static_cast<uint64_t>(i);
     }
 
-    if (api->copy_to_device(
-            reinterpret_cast<void *>(aligned_address), host_base, static_cast<size_t>(layout.total_size)
-        ) != 0) {
-        api->device_free(allocation);
-        LOG_ERROR("A5 HBG AICore scheduler: failed to publish scheduler state");
-        return false;
-    }
     for (int32_t i = 0; i < runtime->get_worker_count(); ++i) {
         runtime->dev.workers[i].aicpu_ready = SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING;
         runtime->dev.workers[i].task =
@@ -1289,6 +1283,10 @@ bool create_scheduler_state(
             SchedulerStateOwner{allocation, reinterpret_cast<void *>(aligned_address), allocation_size, layout, api}
         );
     }
+    runtime->add_pending_metadata(
+        reinterpret_cast<void *>(aligned_address), host_base, static_cast<size_t>(layout.total_size),
+        HostPhaseKind::Count, {}, std::move(storage)
+    );
     LOG_INFO("A5 HBG: selected AICore Scheduler for %d tasks", total_tasks);
     return true;
 }
@@ -1471,27 +1469,11 @@ int32_t run_host_orchestration(
         ready_queue_populations.add_task(slot.active_mask, slot.task_attrs, slot.task_kind);
     }
 
-    // Upload each distinct Definition as its own retained device object and bind
-    // every outer Graph task to it. Per-invocation data already lives in that
-    // task's payload regions and is copied with the shared-memory image below.
-    const BindPhaseMark graph_phase = bind_phase_begin();
+    // Bind Graph tasks to retained Definition addresses. The slot holds the
+    // prepared source until synchronous publication consumes it.
     DefinitionUploads definition_uploads{};
-    if (!bind_graph_definitions(api, *graph_state, &definition_uploads, &ready_queue_populations)) {
+    if (!bind_graph_definitions(runtime, api, *graph_state, &definition_uploads, &ready_queue_populations)) {
         return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    {
-        // `bytes` is what this segment copied: the Definition objects, which are all
-        // it copies. `defs` and `submissions` differ by the replay count — one
-        // Definition serves every Graph task with its key. `spilled` is how many
-        // objects the recorders could not build in the block, and so is 0 for a bind
-        // the retained staging was big enough for. It is deliberately not spelled
-        // `copied=`, which on arena_h2d means a zone rather than a count.
-        char attrs[kBindAttrsCapacity];
-        snprintf(
-            attrs, sizeof(attrs), "defs=%zu bytes=%" PRIu64 " submissions=%zu spilled=%zu", definition_uploads.count,
-            definition_uploads.bytes, graph_host_upload_count(*graph_state), definition_uploads.spilled
-        );
-        record_bind_phase(HostPhaseKind::BindGraphUpload, graph_phase, attrs, definition_uploads.bytes);
     }
 
     ReadyQueueCapacities ready_queue_capacities{};
@@ -1834,21 +1816,18 @@ extern "C" int bind_callable_to_runtime_impl(
     int scalar_count = orch_args->scalar_count();
     LOG_INFO("RT2 bind: %d tensors + %d scalars, host orchestration mode", tensor_count, scalar_count);
 
-    // Arm before the first segment below: the record pool has to exist for
-    // `args`, which runs well before the device collector is provisioned.
-    //
-    // One trace spans preparation and publication, because the image's H2D
-    // segment belongs to the publication and a trace that ended at this
-    // function's return would drop it. So the guard ends the trace only on an
-    // exit that leaves nothing to publish — every failure path, where the
-    // breakdown is worth having and no publication will come — and a bind that
-    // recorded one hands the end to `publish_run_image_impl`, which ends it on
-    // its own success and failure alike. `host_phase_trace_end()` ignores a
-    // second call, so the run's release path can close an abandoned trace
-    // without having to know which of the two got there first.
+    // Rebinding an unpublished run must not replace its source or device owners.
+    if (runtime->pending_publication().bytes != 0 || !runtime->pending_publication().prerequisites.empty()) {
+        LOG_ERROR("bind_callable_to_runtime_impl: unpublished metadata still belongs to this run");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
     host_phase_trace_begin(api);
-    auto host_phase_guard = RAIIScopeGuard([runtime]() {
-        if (runtime == nullptr || runtime->pending_publication().bytes == 0) host_phase_trace_end();
+    bool prepared = false;
+    auto host_phase_guard = RAIIScopeGuard([runtime, api, &prepared]() {
+        if (!prepared) {
+            runtime->clear_pending_publication();
+            host_phase_trace_end(api);
+        }
     });
 
     uint64_t task_capacity = 0;
@@ -2101,37 +2080,41 @@ extern "C" int bind_callable_to_runtime_impl(
 
     LOG_INFO("Device orchestration ready: %d tensors + %d scalars", tensor_count, scalar_count);
 
+    prepared = true;
     return 0;
 }
 
 /**
- * Perform the device write this run's bind prepared.
- *
- * Separate from the bind because the two moments differ: the bind computes the
- * image into staging that outlives it, and this ships it. Splitting them is what
- * lets the write be ordered against something, or captured, without the
- * orchestration that produced the bytes having to run again — a replay repeats
- * device operations, not host graph building.
- *
- * Consumes the record: a run whose image never reached the device must not
- * launch, so a second call, or one against a bind that recorded nothing, is an
- * error rather than a silent success.
+ * Consume this run's metadata in dependency order, synchronously.
+ * A failed copy stops publication and consumes the remaining sources. Device
+ * destinations remain owned until the failed-prepare cleanup releases them.
  */
 extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
     if (runtime == nullptr || api == nullptr) {
         LOG_ERROR("publish_run_image_impl: null runtime or HostApi");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    const auto &publication = runtime->pending_publication();
+    auto host_phase_guard = RAIIScopeGuard([api]() {
+        host_phase_trace_end(api);
+    });
+    auto publication = runtime->take_pending_publication();
     if (publication.bytes == 0 || publication.device_target == nullptr || publication.source == nullptr) {
         LOG_ERROR("publish_run_image_impl: no prepared runtime image to publish");
-        host_phase_trace_end();
         return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    for (const auto &region : publication.prerequisites) {
+        const BindPhaseMark phase = bind_phase_begin();
+        if (api->copy_to_device(region.device_target, region.source, region.bytes) != 0) {
+            LOG_ERROR("host-orch: metadata prerequisite publication failed");
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        if (region.phase != HostPhaseKind::Count) {
+            record_bind_phase(region.phase, phase, region.attributes.c_str(), region.bytes);
+        }
     }
     const BindPhaseMark h2d_phase = bind_phase_begin();
     if (api->copy_to_device(publication.device_target, publication.source, publication.bytes) != 0) {
         LOG_ERROR("host-orch: H2D of the runtime image failed");
-        host_phase_trace_end();
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     {
@@ -2152,11 +2135,6 @@ extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
         );
         record_bind_phase(HostPhaseKind::BindArenaH2d, h2d_phase, attrs, publication.bytes);
     }
-    runtime->clear_pending_publication();
-    // The last segment of this run's prepare path, so the trace the bind armed
-    // closes here: its records reach the pool's readers and the per-kind
-    // breakdown is emitted once, over preparation and publication together.
-    host_phase_trace_end();
     return 0;
 }
 
@@ -2183,10 +2161,8 @@ extern "C" int release_run_bindings_impl(Runtime *runtime, const HostApi *api) {
         LOG_ERROR("release_run_bindings_impl: null runtime or HostApi");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    // A run whose image was never published still armed a trace. Ending it here
-    // is what keeps one trace per run: a no-op when the publication already
-    // closed it, and the only close an abandoned preparation gets.
-    host_phase_trace_end();
+    // Close only this run's trace; another run may already own the recorder.
+    host_phase_trace_end(api);
     runtime->clear_pending_publication();
     release_run_tensor_leases(runtime, api);
     release_scheduler_state(runtime, api);

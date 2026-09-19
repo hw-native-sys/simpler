@@ -31,9 +31,13 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include <cstddef>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "common/core_type.h"
+#include "common/host_phase_kind.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
 #include "task_args.h"
@@ -282,25 +286,17 @@ private:
         // addresses, which is a second reason this struct cannot travel.
         std::vector<TensorLease> tensor_leases_;
 
-        // What this bind prepared, and where it goes. The bind assembles the
-        // run's device execution image into host staging the runner retains and
-        // records the write here; `publish_run_image_impl` performs it and clears
-        // the record. Two moments rather than one, because the source has to
-        // still exist when the write reads it — which a buffer that died with the
-        // bind's frame could not promise, and which any write that is enqueued
-        // rather than issued immediately requires.
-        //
-        // Host-only by placement: `source` points into host staging, and a device
-        // reader that followed it would be reading host pages. Sitting inside
-        // this struct is what makes that unreachable rather than merely
-        // discouraged.
-        //
-        // `BindArenaH2d` measures the copy, and it is recorded at exactly one
-        // site: the publication. The three pool counters its attribute string
-        // reports are known only to the bind, so they travel here; the rest of
-        // that string the publication rebuilds, since the task count and the
-        // image size are on `dev` and the copied zone is the remainder of
-        // `bytes`.
+        // Sources for one synchronous publication. Definition and execution-image
+        // staging belong to the exclusive slot; scheduler staging is owned here.
+        // Destinations remain owned by their existing slot/bank or scheduler owner.
+        struct MetadataRegion {
+            void *device_target;
+            const void *source;
+            size_t bytes;
+            HostPhaseKind phase;
+            std::string attributes;
+            std::vector<uint8_t> storage;
+        };
         struct RunImagePublication {
             void *device_target;
             const void *source;
@@ -308,6 +304,7 @@ private:
             uint64_t fanin_elems;
             uint64_t tensor_elems;
             uint64_t scalar_elems;
+            std::vector<MetadataRegion> prerequisites;
         };
         RunImagePublication pending_publication_;
     };
@@ -323,18 +320,32 @@ public:
     static size_t device_image_bytes();
 
     /**
-     * The device write this bind prepared and has not yet performed. `bytes == 0`
-     * means there is nothing outstanding — either the bind recorded nothing or a
-     * publication already consumed it, and publishing twice is an error rather
-     * than a second copy.
+     * One bind's metadata. A nonzero image byte count seals the record after
+     * its prerequisites are prepared. Consumption empties it on success or
+     * failure; a partial bind is cleared by the bind's failure guard.
      */
     const HostOnlyState::RunImagePublication &pending_publication() const { return host_.pending_publication_; }
     void set_pending_publication(
         void *device_target, const void *source, uint64_t bytes, uint64_t fanin_elems, uint64_t tensor_elems,
         uint64_t scalar_elems
     ) {
-        host_.pending_publication_ = {device_target, source, bytes, fanin_elems, tensor_elems, scalar_elems};
+        auto &pending = host_.pending_publication_;
+        pending.device_target = device_target;
+        pending.source = source;
+        pending.bytes = bytes;
+        pending.fanin_elems = fanin_elems;
+        pending.tensor_elems = tensor_elems;
+        pending.scalar_elems = scalar_elems;
     }
+    void add_pending_metadata(
+        void *target, const void *source, size_t bytes, HostPhaseKind phase, std::string attributes,
+        std::vector<uint8_t> storage = {}
+    ) {
+        host_.pending_publication_.prerequisites.push_back(
+            {target, source, bytes, phase, std::move(attributes), std::move(storage)}
+        );
+    }
+    auto take_pending_publication() { return std::exchange(host_.pending_publication_, {}); }
     void clear_pending_publication() { host_.pending_publication_ = {}; }
 
     /**

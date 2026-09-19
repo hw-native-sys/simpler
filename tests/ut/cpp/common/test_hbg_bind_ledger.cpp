@@ -36,6 +36,7 @@
 #include "common/host_api.h"
 #include "runtime.h"
 #include "runtime_core.h"
+#include "host_build_graph/orchestrator.h"
 #include "task_args.h"
 #include "host/host_phase_records.h"
 #include "worker/runtime_c_api.h"
@@ -77,6 +78,11 @@ struct FakeHostApi {
     std::vector<uint8_t> sm_mirror;
     std::vector<uint8_t> definition_device;
     std::vector<uint8_t> definition_staging;
+    size_t definition_bytes{0};
+    size_t definition_offset{0};
+    int copy_count{0};
+    int fail_copy_on{0};
+    int orchestration_count{0};
     // Retained across binds, like the runner's block: what the bind assembles has
     // to still be readable when the publication reads it.
     std::vector<uint8_t> image_staging;
@@ -135,6 +141,35 @@ struct FakeHostApi {
 
 FakeHostApi *g_fake = nullptr;
 
+RuntimeContext *g_orch_runtime = nullptr;
+void capture_orch_bind(RuntimeContext *rt) { g_orch_runtime = rt; }
+void recording_orch_entry(const ChipTaskArgs &) {
+    ++g_fake->orchestration_count;
+    auto &orch = *g_orch_runtime->orchestrator;
+    uint32_t data[16]{};
+    uint32_t shape[] = {16};
+    GraphTaskArgs boundary;
+    auto input = simpler::hbg::make_tensor_external(data, shape, 1);
+    boundary.add_input(input);
+    auto graph = orch.graph_begin(0x521, boundary, 0x523);
+    ASSERT_TRUE(graph.recording);
+    ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary));
+    CoreTaskArgs task;
+    task.add_input(graph.params->tensor(0).ref());
+    TensorCreateInfo output(shape, 1, DataType::UINT32);
+    task.add_output(output);
+    ASSERT_TRUE(orch.submit_dummy_task(task).task_id().is_valid());
+    ASSERT_TRUE(orch.graph_end());
+    orch.graph_commit();
+}
+
+void host_get_set_orch_entry(const ChipTaskArgs &args) {
+    uint32_t index[] = {0};
+    EXPECT_EQ(get_tensor_data(g_orch_runtime, args.tensor(0).ref(), 1, index), 0x37u);
+    set_tensor_data(g_orch_runtime, args.tensor(0).ref(), 1, index, 0x52);
+    EXPECT_EQ(get_tensor_data(g_orch_runtime, args.tensor(0).ref(), 1, index), 0x52u);
+}
+
 void *fake_device_malloc(void *, size_t size) {
     // Plain malloc, like the sim backend: the bump is what aligns its base.
     void *p = std::malloc(std::max<size_t>(size, 1));
@@ -148,6 +183,8 @@ void fake_device_free(void *, void *p) {
     std::free(p);
 }
 int fake_copy_to_device(void *, void *dev, const void *host, size_t n) {
+    ++g_fake->copy_count;
+    if (g_fake->fail_copy_on == g_fake->copy_count) return -17;
     g_fake->copies.push_back({dev, host, n});
     std::memcpy(dev, host, n);
     return 0;
@@ -190,24 +227,32 @@ int fake_acquire_run_image_staging(void *, uint32_t, size_t bytes, size_t alignm
     return 0;
 }
 int fake_acquire_graph_definition_block(void *, uint32_t, size_t bytes, size_t alignment, void **dev, void **stage) {
-    g_fake->definition_device.assign(bytes + alignment, 0);
-    g_fake->definition_staging.assign(bytes + alignment, 0);
     auto align = [alignment](std::vector<uint8_t> &v) {
         auto raw = reinterpret_cast<uintptr_t>(v.data());
         return reinterpret_cast<void *>((raw + alignment - 1) & ~static_cast<uintptr_t>(alignment - 1));
     };
+    if (bytes > g_fake->definition_bytes) {
+        std::vector<uint8_t> staging(bytes + alignment, 0);
+        void *new_base = align(staging);
+        if (g_fake->definition_bytes != 0) {
+            std::memcpy(
+                new_base, g_fake->definition_staging.data() + g_fake->definition_offset, g_fake->definition_bytes
+            );
+        }
+        g_fake->definition_offset = static_cast<uint8_t *>(new_base) - staging.data();
+        g_fake->definition_staging = std::move(staging);
+        g_fake->definition_device.assign(bytes + alignment, 0);
+        g_fake->definition_bytes = bytes;
+    }
     *dev = align(g_fake->definition_device);
-    *stage = align(g_fake->definition_staging);
+    *stage = g_fake->definition_staging.data() + g_fake->definition_offset;
     return 0;
 }
 void fake_get_graph_definition_staging(void *, uint32_t, void **addr, size_t *size) {
-    if (g_fake->definition_staging.empty()) {
-        if (addr != nullptr) *addr = nullptr;
-        if (size != nullptr) *size = 0;
-        return;
+    if (addr != nullptr) {
+        *addr = g_fake->definition_bytes == 0 ? nullptr : g_fake->definition_staging.data() + g_fake->definition_offset;
     }
-    if (addr != nullptr) *addr = g_fake->definition_staging.data();
-    if (size != nullptr) *size = g_fake->definition_staging.size();
+    if (size != nullptr) *size = g_fake->definition_bytes;
 }
 
 const HostApiOps &fake_ops() {
@@ -303,6 +348,7 @@ TEST_F(HbgBindLedgerTest, AnEmptyTensorIsPassedThroughAndTakesNoSlice) {
     ASSERT_EQ(runtime.tensor_leases().size(), 1u);
     EXPECT_EQ(runtime.tensor_leases()[0].host_ptr, real.data());
     EXPECT_EQ(runtime.tensor_leases()[0].size, 64u);
+    EXPECT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
 }
 
 // Preparation and publication are two steps. The bind assembles the run's device
@@ -491,6 +537,7 @@ TEST_F(HbgBindLedgerTest, TheDeviceImageCarriesNoHostOnlyBytes) {
     EXPECT_EQ(uploaded.worker_count, runtime.get_worker_count());
     EXPECT_EQ(uploaded.sm_image_bytes, runtime.dev.sm_image_bytes);
     EXPECT_EQ(uploaded.gm_sm_ptr_, runtime.get_gm_sm_ptr());
+    EXPECT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
 }
 
 // The regression barrier: a bind whose validate never ran must not leak its
@@ -504,6 +551,7 @@ TEST_F(HbgBindLedgerTest, SecondBindDoesNotInheritTheFirstBindsLeases) {
     ArgDirection sig[1] = {ArgDirection::INOUT};
 
     ASSERT_EQ(bind(runtime, args_a, sig, 1), 0);
+    ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
     ASSERT_EQ(runtime.tensor_leases().size(), 1u);
 
     // No copy-back here: this is the finalize-attach-failure shape.
@@ -514,6 +562,7 @@ TEST_F(HbgBindLedgerTest, SecondBindDoesNotInheritTheFirstBindsLeases) {
     ASSERT_EQ(bind(runtime, args_b, sig, 1), 0);
     EXPECT_EQ(runtime.tensor_leases().size(), 1u) << "the first bind's lease survived into the second bind";
     EXPECT_EQ(runtime.tensor_leases()[0].host_ptr, second.data());
+    EXPECT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
 }
 
 // What the stale lease would actually do: the copy-back walks every recorded
@@ -528,6 +577,7 @@ TEST_F(HbgBindLedgerTest, ValidateAfterARebindLeavesTheEarlierRunsBufferAlone) {
     args_a.add_tensor(host_tensor(first));
     ArgDirection sig[1] = {ArgDirection::INOUT};
     ASSERT_EQ(bind(runtime, args_a, sig, 1), 0);
+    ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
 
     std::vector<uint8_t> second(64, 0x22);
     ChipStorageTaskArgs args_b;
@@ -544,4 +594,136 @@ TEST_F(HbgBindLedgerTest, ValidateAfterARebindLeavesTheEarlierRunsBufferAlone) {
     ASSERT_EQ(finish_run(runtime, 0), 0);
     EXPECT_EQ(second, std::vector<uint8_t>(64, 0x5a));
     EXPECT_EQ(first, first_before) << "the earlier run's host buffer was overwritten by this run's bytes";
+}
+
+TEST_F(HbgBindLedgerTest, AllMetadataSourcesSurviveBindAndPublishInOrder) {
+    Runtime runtime;
+    init_runtime(runtime);
+    eps_ = {recording_orch_entry, capture_orch_bind};
+    ChipStorageTaskArgs args;
+    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+    EXPECT_EQ(fake_.copy_count, 0);
+    EXPECT_EQ(fake_.orchestration_count, 1);
+    const auto &pending = runtime.pending_publication();
+    ASSERT_EQ(pending.prerequisites.size(), 1u);
+    EXPECT_EQ(pending.prerequisites[0].phase, HostPhaseKind::BindGraphUpload);
+    auto *definition_target = pending.prerequisites[0].device_target;
+    auto *image_target = pending.device_target;
+    const auto definition_bytes = pending.prerequisites[0].bytes;
+    const auto image_bytes = pending.bytes;
+    ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
+    ASSERT_EQ(fake_.copies.size(), 2u);
+    EXPECT_EQ(fake_.copies[0].dst, definition_target);
+    EXPECT_EQ(fake_.copies[1].dst, image_target);
+    EXPECT_EQ(fake_.copies[0].bytes, definition_bytes);
+    EXPECT_EQ(fake_.copies[1].bytes, image_bytes);
+    uint64_t recorded_bytes = 0;
+    EXPECT_EQ(fake_.phase_records_of(HostPhaseKind::BindGraphUpload, &recorded_bytes), 1u);
+    EXPECT_EQ(recorded_bytes, definition_bytes);
+    EXPECT_NE(publish_run_image_impl(&runtime, &api_), 0);
+    EXPECT_EQ(fake_.copies.size(), 2u);
+    EXPECT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+}
+
+TEST_F(HbgBindLedgerTest, HostGetSetCompletesBeforeMetadataPublication) {
+    eps_ = {host_get_set_orch_entry, capture_orch_bind};
+    Runtime runtime;
+    init_runtime(runtime);
+    std::vector<uint8_t> input(64, 0x37);
+    ChipStorageTaskArgs args;
+    args.add_tensor(host_tensor(input));
+    ArgDirection sig[] = {ArgDirection::INOUT};
+    ASSERT_EQ(bind(runtime, args, sig, 1), 0);
+    EXPECT_EQ(fake_.copy_count, 2);
+    EXPECT_EQ(input[0], 0x52);
+    ASSERT_EQ(runtime.tensor_leases().size(), 1u);
+    EXPECT_EQ(std::memcmp(runtime.tensor_leases()[0].dev_ptr, input.data(), input.size()), 0);
+    for (const auto &copy : fake_.copies)
+        EXPECT_NE(copy.dst, runtime.pending_publication().device_target);
+    EXPECT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+    EXPECT_EQ(fake_.copy_count, 2);
+    EXPECT_TRUE(runtime.tensor_leases().empty());
+}
+
+TEST_F(HbgBindLedgerTest, EachMetadataFailureConsumesTheRecordAndStopsLaterWrites) {
+    for (bool graph : {false, true}) {
+        eps_ = {graph ? recording_orch_entry : empty_orch_entry, capture_orch_bind};
+        size_t region_count = 0;
+        {
+            Runtime runtime;
+            init_runtime(runtime);
+            ChipStorageTaskArgs args;
+            ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+            region_count = runtime.pending_publication().prerequisites.size() + 1;
+            EXPECT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+            EXPECT_TRUE(fake_.live.empty());
+        }
+        for (size_t failure = 1; failure <= region_count; ++failure) {
+            Runtime runtime;
+            init_runtime(runtime);
+            ChipStorageTaskArgs args;
+            fake_.copy_count = 0;
+            ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+            EXPECT_EQ(fake_.copy_count, 0);
+            fake_.fail_copy_on = static_cast<int>(failure);
+            EXPECT_NE(publish_run_image_impl(&runtime, &api_), 0);
+            EXPECT_EQ(fake_.copy_count, failure);
+            EXPECT_EQ(runtime.pending_publication().bytes, 0u);
+            EXPECT_TRUE(runtime.pending_publication().prerequisites.empty());
+            EXPECT_NE(publish_run_image_impl(&runtime, &api_), 0);
+            EXPECT_EQ(fake_.copy_count, failure);
+            EXPECT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+            EXPECT_TRUE(fake_.live.empty());
+            fake_.fail_copy_on = 0;
+        }
+    }
+}
+
+TEST_F(HbgBindLedgerTest, RepeatedArgumentsStillOrchestrateEveryInvocation) {
+    eps_ = {recording_orch_entry, capture_orch_bind};
+    for (uint64_t value : {11, 22, 11}) {
+        Runtime runtime;
+        init_runtime(runtime);
+        ChipStorageTaskArgs args;
+        args.add_scalar(value);
+        ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+        ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
+        ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+    }
+    EXPECT_EQ(fake_.orchestration_count, 3);
+}
+
+TEST_F(HbgBindLedgerTest, RejectedRebindPreservesTheUnpublishedImage) {
+    Runtime runtime;
+    init_runtime(runtime);
+    ChipStorageTaskArgs args;
+    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+    const void *source = runtime.pending_publication().source;
+    const auto bytes = runtime.pending_publication().bytes;
+    EXPECT_NE(bind(runtime, args, nullptr, 0), 0);
+    EXPECT_EQ(runtime.pending_publication().source, source);
+    EXPECT_EQ(runtime.pending_publication().bytes, bytes);
+    ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
+    EXPECT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+}
+
+TEST_F(HbgBindLedgerTest, OldReleaseDoesNotCloseSuccessorTrace) {
+    Runtime predecessor;
+    Runtime successor;
+    init_runtime(predecessor);
+    init_runtime(successor);
+    ChipStorageTaskArgs args;
+    ASSERT_EQ(bind(predecessor, args, nullptr, 0), 0);
+    ASSERT_EQ(publish_run_image_impl(&predecessor, &api_), 0);
+    HostApi successor_api{nullptr, 1, 1, 0, &fake_ops()};
+    uint64_t win[4] = {8, 0, 0, 0};
+    ASSERT_EQ(
+        bind_callable_to_runtime_impl(&successor, &successor_api, &args, &eps_, nullptr, 0, win, nullptr, nullptr), 0
+    );
+    const auto finishes_before = fake_.phase_finish_calls;
+    ASSERT_EQ(release_run_bindings_impl(&predecessor, &api_), 0);
+    EXPECT_EQ(fake_.phase_finish_calls, finishes_before);
+    ASSERT_EQ(publish_run_image_impl(&successor, &successor_api), 0);
+    EXPECT_EQ(fake_.phase_records_of(HostPhaseKind::BindArenaH2d), 1u);
+    EXPECT_EQ(release_run_bindings_impl(&successor, &successor_api), 0);
 }

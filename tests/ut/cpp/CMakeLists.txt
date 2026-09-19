@@ -1312,6 +1312,24 @@ add_a2a3_hbg_runtime_test(test_hbg_bind_ledger common/test_hbg_bind_ledger.cpp
 )
 target_compile_definitions(test_hbg_bind_ledger PRIVATE SIMPLER_PLATFORM_NAME="a2a3sim")
 
+add_a5_hbg_runtime_test(test_a5_hbg_bind_ledger common/test_hbg_bind_ledger.cpp)
+target_sources(test_a5_hbg_bind_ledger PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/host_build_graph/host/runtime_maker.cpp
+    ${HBG_HOST_DIR}/orchestrator.cpp
+    ${HBG_SHARED_RUNTIME_SOURCES}
+    ${HBG_HOST_DIR}/runtime_core.cpp
+    ${HBG_HOST_DIR}/dep_gen_host_graph.cpp
+    ${HBG_HOST_DIR}/graph_recorder_pool.cpp
+    ${HBG_HOST_DIR}/host_phase_trace.cpp
+    ${HBG_HOST_DIR}/ready_queue_sizing.cpp
+    ${HBG_HOST_DIR}/host_tensor_access.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/platform_compile_info.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
+    # test_stubs.cpp already defines unified_log_*; only HostLogger is missing.
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/host_log.cpp
+)
+target_compile_definitions(test_a5_hbg_bind_ledger PRIVATE SIMPLER_PLATFORM_NAME="a5sim")
+
 add_a2a3_hbg_runtime_test(test_hbg_self_relative_ptr common/test_hbg_self_relative_ptr.cpp)
 add_a2a3_hbg_runtime_test(test_hbg_sm_compaction common/test_hbg_sm_compaction.cpp)
 add_a2a3_hbg_runtime_test(test_hbg_scheduler_drain common/test_hbg_scheduler_drain.cpp)

@@ -28,44 +28,56 @@ the `chip.run.bind` span:
 | ------- | -------------- |
 | `args` | copying readable caller tensors in H2D, into slices of the pipeline slot's retained temporary buffer, and exposing their existing host buffers to orchestration; pure outputs skip both. The buffer grows to the high-water packed size and is reused, so a steady-state workload allocates no device memory here |
 | `arena_build`, `static_arena`, `gm_heap`, `shared_mem`, `runtime_init` | arena layout, GM heap and shared-memory bring-up |
-| `host_orch` | **all** orchestration: every task submitted, every in-graph task recorded, the Definition built |
-| `graph_upload` | one H2D of the block holding every Definition object, and binding each Graph task to the one with its key. The recorders built the objects in that block's host staging during `host_orch`, so this segment writes their headers and copies in only what did not fit |
+| `host_orch` | orchestration and recording: every task submitted and every in-graph task recorded; excludes the later Definition packing and Graph task binding in `bind_graph_definitions` |
+| `graph_upload` | the successful synchronous `copy_to_device` of the prepared Definition block in `publish_run_image_impl`; excludes staging growth, header writes, spill copies and Graph task binding. Absent when there is no Definition block |
 | `arena_h2d` | one H2D of the arena's copied zone and the shared-memory image |
 | `host_view_close` | closing per-run tensor-access regions and any optional device mappings; the bind path installs none of its own (`count=0 bytes=0`). `devcopy=N` counts orchestration accesses to child memory that were served by a PCIe round trip because no host mapping was available — a mapping, where one is available, is held by the runtime for the allocation's lifetime and is not closed here |
 
-The **control plane** is `host_orch + graph_upload + arena_h2d`: everything
-between "the caller's data is in place" and "the device can start". It is what
-the < 1 ms target applies to. `args` is excluded because it scales with the
-caller's tensor bytes, not with the graph. `host_view_close` stays excluded so
-current reports remain comparable with older logs, although the current bind path
-has no device mappings to close.
+The parser's **control plane** label is the instrumented subtotal
+`host_orch + graph_upload + arena_h2d`, not the complete cost between "the
+caller's data is in place" and "the device can start". `bind_graph_definitions`
+runs after `BindHostOrch` is recorded: its staging growth, header writes, spill
+copies and Graph task binding are outside all three segments. A5's resident
+scheduler preparation and publication also have no dedicated segment. These
+costs still exist; the subtotal does not measure them. The < 1 ms target for the
+complete control plane cannot be accepted from this subtotal alone.
+
+`args` scales with caller tensor bytes and is excluded from the subtotal.
+`host_view_close` stays excluded for historical mapped-view logs, although the
+current bind path has no device mappings to close. The enclosing `chip.run.bind`
+span is useful for checking work absent from the segments, but also includes
+`args` and other bind work; it is not a replacement control-plane metric.
 
 **Two kinds were retired from the set, not merely from the output.** `relocate`
 and `sm_h2d` dated from when the shared-memory image was relocated and copied on
 its own; it now travels inside the single `arena_h2d` copy as that segment's
-`sm=`. Neither had a recording site for as long as the change has been in, so
-both were removed from `HostPhaseKind` — a log that predates the change still
-carries their lines, but no current tool totals them. The table above is what a
-current run emits: ten segments, three of them control plane.
+`sm=`. Both were removed from `HostPhaseKind`. The table lists ten possible
+segments; the parser selects three for its subtotal and reports missing ones.
 
-**The control plane is a sum of costs, not an interval.** Its three segments are
-not adjacent: `static_arena`, `shared_mem` and `gm_heap` run between
-`graph_upload` and `arena_h2d`, so the segments do not form one contiguous
-window. Sum the ones the bind has; do not subtract two timestamps.
-
-**A bind runs its segments in one order and emits them in another.** Execution is
-the sequence `runtime_maker.cpp` calls them in, which each span's `ts` records:
+**The subtotal is a sum of measured costs, not an interval.** On a successful
+A2/A3 bind with Definitions, execution follows this order (unmarked work is
+shown in brackets):
 
 ```text
-args, arena_build, runtime_init, host_orch, graph_upload,
-static_arena, shared_mem, gm_heap, arena_h2d, host_view_close
+bind_callable_to_runtime_impl:
+  args, arena_build, runtime_init, host_orch,
+  [Definition packing and Graph task binding],
+  static_arena, shared_mem, gm_heap,
+  [compact execution-image preparation], host_view_close
+publish_run_image_impl:
+  graph_upload, arena_h2d
 ```
 
-That order is what puts `static_arena`, `shared_mem` and `gm_heap` between
-`graph_upload` and `arena_h2d`, which is why the control plane is a sum and not an
-interval. Emission is `HostPhaseKind` order, all of it at the end of the bind —
-which matters to nothing, because each span carries its own `ts` and its own
-`(pid, inv)`. Reading a log by line order is not how the segments are grouped.
+A5 additionally prepares resident scheduler state during bind and publishes it
+between `graph_upload` and `arena_h2d`; neither operation has its own segment.
+The legacy A5 path has no separate resident scheduler publication.
+
+**Execution order, emission order and parser display order differ.** Each
+span's `ts` records execution time. The trace emits in `HostPhaseKind` order
+when publication closes it (or cleanup closes an abandoned bind). The parser's
+`PHASE_ORDER` retains its historical display order. Group by `(pid, inv)` and
+sum each bind's measured segments; neither log line order nor table row order
+is a timeline.
 
 ## Prerequisites
 
@@ -191,8 +203,8 @@ it:
 grep -oE 'name=chip\.run\.bind\.[a-z0-9_]+ ts=[0-9]+ dur=[0-9]+[^[]*' outputs/hbg_bind_stats_<sha>.log
 ```
 
-The character class has to admit digits, or it drops every `arena_h2d` — the only
-H2D left, and the one that itemizes the whole upload.
+The character class has to admit digits, or it drops every `arena_h2d` — the
+segment name containing digits, and the one that itemizes the execution-image upload.
 
 Each span carries `ts` (a `CLOCK_MONOTONIC` timestamp), `dur`, `pid` and `inv`,
 plus the segment's own attributes — the six kernel counters on all of them, then
@@ -206,8 +218,9 @@ total belongs to no bind and can point the wrong way (see below).
 
 **`spilled=` should be 0 on every bind but the first.** It counts the Definition
 objects the recorders could not build inside the retained staging, which
-`graph_upload` then has to copy in. The first bind of a process has nothing
-retained and so spills all of them; a later bind that still spills means the run's
+`bind_graph_definitions` copies into staging before publication. The count is
+reported on `graph_upload`, but that host copy is outside its timing window.
+The first bind of a process has nothing retained and so spills all of them; a later bind that still spills means the run's
 Definitions outgrew the high-water mark the previous one left, and the copies are
 back. It is not spelled `copied=` on purpose: on `arena_h2d` that name means a
 zone, not a count.
@@ -278,6 +291,17 @@ grep -oE 'device_wall ts=0 dur=[0-9]+' <log> | \
 
 A branch comparison is a different measurement from a single reading, and two of
 its failure modes have already produced wrong answers on this box.
+
+**Check source coverage before comparing identically named segments.** #2353
+changes `graph_upload` from Definition packing/binding plus H2D to just the
+publication copy. Packing remains outside `host_orch`, `graph_upload` and
+`arena_h2d`; it has not disappeared or moved into another one of those segments.
+The parser matches names and cannot detect this change. Across that boundary,
+neither `graph_upload` nor the reported control-plane total is a comparable
+host-cost metric, even with identical commands and case counts. Use matching
+instrumentation in both arms that includes preparation and publication, or
+report the separate scopes without claiming an end-to-end improvement. Do not
+apply the < 1 ms target to the partial subtotal.
 
 **Both arms must be the same ruler, and the log is the only witness you get.** A
 baseline missing `TORCH_DEVICE_BACKEND_AUTOLOAD=0` produced a wrong number once:
@@ -421,7 +445,8 @@ signal than any duration on a shared box.
 | `--rounds 6` with `--enable-scope-stats` | no `outputs/<case>_<ts>/` artifacts, plus a `disabled: --rounds > 1` warning | one round for artifacts, many rounds for numbers |
 | Only `SIMPLER_HBG_BIND_BREAKDOWN_ENABLE` set for Recipe B | segment spans present, no `host_phase_records.jsonl` | the records are a separate switch: also export `SIMPLER_HBG_HOST_PHASE_RECORDS_ENABLE=1` |
 | Comparing a log with no `[stamp]` first line | the parser says so above the table | re-run it through the recipe; conditions cannot be recovered from memory |
-| Subtracting timestamps for the control plane | ~300 ms instead of ~3 ms | sum the segments; `arena_h2d` is not adjacent |
+| Treating the parser total as the complete control plane | unmeasured packing looks like a host-side win | check the source coverage in both arms; the three-segment subtotal excludes Definition preparation and A5 scheduler work |
+| Subtracting timestamps for the control-plane subtotal | includes work outside the selected segments | sum the measured segments within each bind; they do not form a contiguous interval |
 | Summing per-segment minima by hand | a total no bind achieved; can invert the sign | read the tool's `total` row — the minimum of the per-bind sums |
 | `--rounds 1` for numbers | the tool refuses: every bind is a rank's warm-up | six rounds; `--keep-first` only to look at the cold bind deliberately |
 | Single bind, or comparing across differently-loaded moments | swings of 3.5× | six rounds, compare minima, keep an untouched segment as a control |
@@ -431,6 +456,12 @@ signal than any duration on a shared box.
 | Stale build | mass collection errors, or a `launch_aicpu_num (0)` failure | `pip install --no-build-isolation -e .` after every `HEAD` move |
 
 ## Reference numbers
+
+**Historical measurement scope.** These numbers predate #2353: their
+`graph_upload` duration includes host preparation as well as H2D. The current
+copy-only marker excludes that preparation, and the current three-segment
+subtotal excludes it too. The table is a record of the old measurement, not a
+current baseline; a smaller current value alone establishes no speedup.
 
 Both columns are one measurement session on `main` at **`777d4171`**, host
 `host_build_graph`, on one a2a3 die for qwen and two for dsv4, four rounds each with
@@ -455,7 +486,7 @@ meant to outlive it.
 
 | Measurement | qwen3-14b decode | dsv4 FLASH decode |
 | ----------- | ---------------- | ----------------- |
-| control plane | 1.11–1.53 ms | 3.63–6.81 ms |
+| historical control-plane total † | 1.11–1.53 ms | 3.63–6.81 ms |
 | `host_orch` | 0.44–0.75 ms (47 tasks) | 2.60–4.91 ms (1131 tasks) |
 | `graph_upload` | 0.56–0.96 ms / 40 submissions, 232,320 B † | 0.39–1.14 ms / 20 submissions, 671,144 B † |
 | `sm_h2d` † | 0.067–0.068 ms / 233,799 B | 0.54–0.98 ms / 5,620,195 B |
@@ -465,13 +496,13 @@ meant to outlive it.
 | `args` (excluded) | 1.37 s / 40.9 GB, 19 of 20 copied in | 1.48 s / 45.8 GB, 77 of 92 copied in |
 | `host_view_close` (excluded, legacy mapping path) | 0.25 s / 40.9 GB | 0.28 s / 45.8 GB |
 
-† The three upload rows are the markers as they read at that commit, before the
-upload was restructured: `graph_upload`'s `bytes=` then also counted the Graph
+† The total and three upload rows use the measurement scopes at that commit. Before the
+upload was restructured, `graph_upload`'s `bytes=` also counted the Graph
 submission block, `sm_h2d` was still a copy of its own, and `arena_h2d` was the
 copied zone alone. A run today has no `sm_h2d` kind at all, counts only the
 Definition objects in `graph_upload`, carries no submission block, and ships both
-remaining regions in `arena_h2d` — so the same case reports different figures for
-the same work.
+remaining regions in `arena_h2d`. The byte accounting and timing boundaries
+have both changed, so the same names do not make these rows comparable.
 
 **dsv4's `args` and `host_view_close` rows no longer describe that case at this
 scale.** Both are per-byte costs over what a bind copies in, and dsv4's parameters

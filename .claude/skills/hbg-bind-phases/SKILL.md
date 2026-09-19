@@ -125,8 +125,13 @@ python -m simpler_setup.tools.strace_timing "$D/bind_timeline.log" \
   `$D/host.*.log` for timeline mode — and the table shows a `[stamp]` line.
 - Quote the stamp with the number. A number without the command and commit that
   produced it cannot be compared to anything.
-- Comparing two branches has three more rules, all of them learned the hard way —
-  follow **Comparing two branches** in the doc rather than reasoning it out here.
+- Before an A/B, check the recording sites at both commits as required by
+  **Comparing two branches** in the doc. Identical segment names do not guarantee
+  identical coverage: #2353 makes `graph_upload` copy-only and leaves Definition
+  preparation outside the reported three-segment subtotal. Do not report that
+  subtotal as the complete control plane or infer a speedup across this boundary.
+- Follow the remaining comparison rules in that section, including interleaving
+  the arms and taking minima of per-bind sums.
 
 For on-device latency instead, use [`benchmark`](../benchmark/SKILL.md) or
 [`perf-example-device`](../perf-example-device/SKILL.md).

@@ -148,9 +148,10 @@ void host_phase_trace_begin(const void *host_api);
 void host_phase_trace_note_submitted(uint64_t submitted_tasks);
 
 /**
- * Close the bind: hand the submitted-task count and the run's invocation id to
+ * Close this run's preparation/publication trace only if host_api still owns it.
+ * Hand the submitted-task count and the run's invocation id to
  * the runner, then emit the per-kind `LOG_TIMING` breakdown from the counters.
  *
  * The records stay in the pool for its readers.
  */
-void host_phase_trace_end();
+void host_phase_trace_end(const void *host_api);
