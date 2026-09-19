@@ -164,16 +164,12 @@ CASES = {
         kernel="aic/kernel_hang.cpp",
         kernel_core="aic",
         onboard_only=True,  # a while(true) kernel would hang the simulator
-        # The data-wait timeout is 15 s on both arches now that it is frequency-
-        # scaled (TENSOR_DATA_TIMEOUT_MS, #1189) -- before that it was 15 s on
-        # a5 but 300 s on a2a3, so this case used to be a5-only. Raise every other
-        # watchdog above 15 s so the tensor-data wait wins the race and latches
-        # code 8 before they reap the hung core.
-        env={
-            "SIMPLER_SCHEDULER_TIMEOUT_MS": 30000,
-            "SIMPLER_OP_EXECUTE_TIMEOUT_US": 30000000,
-            "SIMPLER_STREAM_SYNC_TIMEOUT_MS": 40000,
-        },
+        # Drop the data wait to 1 s so it beats every other watchdog to the hung
+        # core -- including the 2 s scheduler timeout the onboard CI jobs set,
+        # which would otherwise latch code 100 first. The other three keep
+        # whatever the job/platform sets: the tensor-data budget is not part of
+        # their ordering group, so lowering it alone cannot invalidate them.
+        env={"SIMPLER_TENSOR_DATA_TIMEOUT_MS": 1000},
         marker="orch_error_code=8",
         explain="TENSOR_WAIT_TIMEOUT",
     ),

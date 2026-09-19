@@ -20,10 +20,12 @@
 
 namespace {
 
+// The tensor-data budget seeds as 0 ("no override"): its default is compiled
+// into the runtime, which no host translation unit can see.
 constexpr RuntimeTimeoutConfig kDefaults{
-    PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS, PLATFORM_SCHEDULER_TIMEOUT_MS
+    PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS, PLATFORM_SCHEDULER_TIMEOUT_MS, 0
 };
-constexpr RuntimeTimeoutConfig kCiTightTimeouts{3000000, 4000, 2000};
+constexpr RuntimeTimeoutConfig kCiTightTimeouts{3000000, 4000, 2000, 0};
 
 void set_env_var(const char *name, const char *value) {
 #if defined(_WIN32)
@@ -47,15 +49,18 @@ public:
         save(SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV, op_);
         save(SIMPLER_STREAM_SYNC_TIMEOUT_MS_ENV, stream_);
         save(SIMPLER_SCHEDULER_TIMEOUT_MS_ENV, scheduler_);
+        save(SIMPLER_TENSOR_DATA_TIMEOUT_MS_ENV, tensor_data_);
         unset_env_var(SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV);
         unset_env_var(SIMPLER_STREAM_SYNC_TIMEOUT_MS_ENV);
         unset_env_var(SIMPLER_SCHEDULER_TIMEOUT_MS_ENV);
+        unset_env_var(SIMPLER_TENSOR_DATA_TIMEOUT_MS_ENV);
     }
 
     ~ScopedUnsetTimeoutEnv() {
         restore(SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV, op_);
         restore(SIMPLER_STREAM_SYNC_TIMEOUT_MS_ENV, stream_);
         restore(SIMPLER_SCHEDULER_TIMEOUT_MS_ENV, scheduler_);
+        restore(SIMPLER_TENSOR_DATA_TIMEOUT_MS_ENV, tensor_data_);
     }
 
 private:
@@ -83,6 +88,7 @@ private:
     SavedValue op_;
     SavedValue stream_;
     SavedValue scheduler_;
+    SavedValue tensor_data_;
 };
 
 }  // namespace
@@ -94,6 +100,7 @@ TEST(RuntimeTimeoutConfig, UnsetEnvKeepsDefaults) {
     EXPECT_EQ(cfg.op_execute_timeout_us, 45000000u);
     EXPECT_EQ(cfg.stream_sync_timeout_ms, 50000);
     EXPECT_EQ(cfg.scheduler_timeout_ms, 20000);
+    EXPECT_EQ(cfg.tensor_data_timeout_ms, 0);
     EXPECT_EQ(validate_runtime_timeout_order(cfg), RuntimeTimeoutOrderStatus::OK);
 }
 
@@ -102,6 +109,7 @@ TEST(RuntimeTimeoutConfig, ValidEnvOverridesDefaults) {
     set_env_var(SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV, "5000000");
     set_env_var(SIMPLER_STREAM_SYNC_TIMEOUT_MS_ENV, "7000");
     set_env_var(SIMPLER_SCHEDULER_TIMEOUT_MS_ENV, "3000");
+    set_env_var(SIMPLER_TENSOR_DATA_TIMEOUT_MS_ENV, "2500");
 
     RuntimeTimeoutParseStatus status;
     RuntimeTimeoutConfig cfg = resolve_runtime_timeout_config(kDefaults, &status);
@@ -109,13 +117,17 @@ TEST(RuntimeTimeoutConfig, ValidEnvOverridesDefaults) {
     EXPECT_EQ(cfg.op_execute_timeout_us, 5000000u);
     EXPECT_EQ(cfg.stream_sync_timeout_ms, 7000);
     EXPECT_EQ(cfg.scheduler_timeout_ms, 3000);
+    EXPECT_EQ(cfg.tensor_data_timeout_ms, 2500);
     EXPECT_TRUE(status.op_execute_env_set);
     EXPECT_TRUE(status.stream_sync_env_set);
     EXPECT_TRUE(status.scheduler_env_set);
+    EXPECT_TRUE(status.tensor_data_env_set);
     EXPECT_TRUE(status.op_execute_valid);
     EXPECT_TRUE(status.stream_sync_valid);
     EXPECT_TRUE(status.scheduler_valid);
+    EXPECT_TRUE(status.tensor_data_valid);
     EXPECT_EQ(validate_runtime_timeout_order(cfg), RuntimeTimeoutOrderStatus::OK);
+    EXPECT_TRUE(tensor_data_timeout_can_latch(cfg));
 }
 
 TEST(RuntimeTimeoutConfig, InvalidEnvKeepsDefaultAndReportsStatus) {
@@ -186,4 +198,30 @@ TEST(RuntimeTimeoutConfig, SimPlatformSkipsOnboardOrdering) {
         validate_runtime_timeout_order_for_platform(cfg, "a5"),
         RuntimeTimeoutOrderStatus::SCHEDULER_NOT_BELOW_OP_EXECUTE
     );
+}
+
+TEST(RuntimeTimeoutConfig, TensorDataInvalidEnvLeavesNoOverride) {
+    ScopedUnsetTimeoutEnv env;
+    set_env_var(SIMPLER_TENSOR_DATA_TIMEOUT_MS_ENV, "15s");
+
+    RuntimeTimeoutParseStatus status;
+    RuntimeTimeoutConfig cfg = resolve_runtime_timeout_config(kDefaults, &status);
+
+    EXPECT_EQ(cfg.tensor_data_timeout_ms, 0);
+    EXPECT_TRUE(status.tensor_data_env_set);
+    EXPECT_FALSE(status.tensor_data_valid);
+}
+
+// The tensor-data wait stands outside the ordering group: an unreachable value
+// is reported by tensor_data_timeout_can_latch, never by rejecting the group,
+// which would silently drop the op/stream overrides that were valid.
+TEST(RuntimeTimeoutConfig, TensorDataStaysOutOfOrderingVerdict) {
+    RuntimeTimeoutConfig cfg = kCiTightTimeouts;
+    cfg.tensor_data_timeout_ms = 15000;
+
+    EXPECT_EQ(validate_runtime_timeout_order(cfg), RuntimeTimeoutOrderStatus::OK);
+    EXPECT_FALSE(tensor_data_timeout_can_latch(cfg));
+
+    cfg.tensor_data_timeout_ms = 1000;
+    EXPECT_TRUE(tensor_data_timeout_can_latch(cfg));
 }
