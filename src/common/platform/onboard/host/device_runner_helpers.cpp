@@ -80,6 +80,7 @@ int query_stream_pair_error(rtStream_t aicpu_stream, rtStream_t aicore_stream) {
 int KernelArgsHelper::prepare_runtime_args(
     const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot
 ) {
+    if (runtime_args_state_ == RuntimeArgsState::Prepared) return PTO_RUNTIME_ERR_INVALID_STATE;
     release_run_view();
     allocator_ = &allocator;
 
@@ -107,17 +108,24 @@ int KernelArgsHelper::prepare_runtime_args(
     }
     runtime_image_.prepare(host_runtime);
     args.runtime_args = slot.runtime_args;
+    runtime_args_state_ = RuntimeArgsState::Prepared;
     return 0;
 }
 
 int KernelArgsHelper::publish_runtime_args() {
+    if (runtime_args_state_ != RuntimeArgsState::Prepared) return PTO_RUNTIME_ERR_INVALID_STATE;
     if (args.runtime_args == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    // The consumed snapshot is neither pending nor published during the copy.
+    // Reentrant publish is rejected; copy failure leaves fresh prepare admissible.
+    runtime_args_state_ = RuntimeArgsState::Empty;
     const int rc = runtime_image_.publish([this](const void *source, size_t bytes) {
         return rtMemcpy(args.runtime_args, bytes, source, bytes, RT_MEMCPY_HOST_TO_DEVICE);
     });
     if (rc != 0) {
         LOG_ERROR("runtime metadata publication failed: %d", rc);
         args.runtime_args = nullptr;
+    } else {
+        runtime_args_state_ = RuntimeArgsState::Published;
     }
     return rc;
 }

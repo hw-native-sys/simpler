@@ -571,6 +571,12 @@ DeviceRunnerBase::LaunchOutcome
 DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) {
     LaunchOutcome outcome;
     if (prepared == nullptr) return outcome;
+    if (!prepared->kernel_args.runtime_args_published()) {
+        LOG_ERROR("launch_execution: this run's Runtime descriptor has not been published");
+        outcome.rc = PTO_RUNTIME_ERR_INVALID_STATE;
+        outcome.prepared = std::move(prepared);
+        return outcome;
+    }
 
     LaunchTransactionResult transaction = launch_run(*prepared, std::move(permit));
     if (transaction.poisoned()) recover_device_or_mark_unusable(transaction.rc);

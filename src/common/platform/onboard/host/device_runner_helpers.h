@@ -115,7 +115,8 @@ struct KernelArgsHelper {
     KernelArgsHelper(KernelArgsHelper &&other) noexcept :
         args(other.args),
         allocator_(std::exchange(other.allocator_, nullptr)),
-        runtime_image_(std::move(other.runtime_image_)) {
+        runtime_image_(std::move(other.runtime_image_)),
+        runtime_args_state_(std::exchange(other.runtime_args_state_, RuntimeArgsState::Empty)) {
         other.args = KernelArgs{};
     }
     KernelArgsHelper &operator=(KernelArgsHelper &&) = delete;
@@ -124,14 +125,21 @@ struct KernelArgsHelper {
     MemoryAllocator *allocator_{nullptr};
 
     // Reserve the slot's destination and snapshot this invocation's device-read
-    // descriptor. No bytes are published; another prepare discards any pending
-    // snapshot and withdraws the previous run view.
+    // descriptor. An unpublished snapshot rejects another prepare without
+    // changing its source, destination, or allocator. After publication or
+    // release, a fresh prepare withdraws the previous publication status.
     int prepare_runtime_args(const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot);
 
     // Consume the snapshot with a synchronous metadata H2D. The slot remains
     // owned even on failure. Callers must check the return code and abort the
-    // run on error; launch has no independent publication-state gate.
+    // run on error. A repeated publish is rejected without another copy.
     int publish_runtime_args();
+
+    // A non-null destination alone may still contain a previous run's bytes.
+    // This verdict covers only the Runtime descriptor, not late DFX publication.
+    bool runtime_args_published() const {
+        return runtime_args_state_ == RuntimeArgsState::Published && args.runtime_args != nullptr;
+    }
 
     /**
      * Drop this run's view of the slot's device blocks.
@@ -141,6 +149,7 @@ struct KernelArgsHelper {
      */
     void release_run_view() {
         runtime_image_.clear();
+        runtime_args_state_ = RuntimeArgsState::Empty;
         args.runtime_args = nullptr;
     }
 
@@ -164,7 +173,10 @@ struct KernelArgsHelper {
     KernelArgs *operator&() { return &args; }
 
 private:
+    enum class RuntimeArgsState : uint8_t { Empty, Prepared, Published };
+
     RuntimeLaunchImage runtime_image_;
+    RuntimeArgsState runtime_args_state_{RuntimeArgsState::Empty};
 };
 
 /**

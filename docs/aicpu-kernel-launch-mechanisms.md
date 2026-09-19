@@ -165,17 +165,26 @@ intervening Runtime mutation today. The snapshot establishes a boundary for
 later decoupled/asynchronous publication and capture work; it does not fix a
 current mutation race or make publication asynchronous.
 
-Preparation called again discards any pending snapshot and clears the previous
-run view. A failed publication also clears the launch pointer while leaving the
-slot's allocation owned. Skipping publication is different: successful prepare
-already installs a non-null `args.runtime_args`, but the destination still holds
-the previous run's bytes, or uninitialized storage on its first allocation. A
-non-null pointer therefore does not prove publication. The caller must invoke
-`publish_runtime_args`, check its return code and abort preparation on failure;
-checking return codes cannot detect a call that was skipped. There is no
-separate publication-state gate in launch.
-Opening a longer prepare-to-publish window requires an explicit pending-source
-replacement policy and enforcement of publication success before launch.
+An unpublished descriptor rejects another preparation without changing its
+snapshot, destination or allocator. Explicit `release_run_view` discards it;
+a fresh preparation after publication or release withdraws the earlier
+publication status. Move transfers both the snapshot and status, leaving the
+source unable to publish or launch.
+
+`runtime_args_published()` becomes true only after synchronous H2D succeeds.
+Both onboard `launch_execution` entries check it before stream creation, DFX
+arming or kernel submission. A missing or failed publication returns
+`INVALID_STATE` with `NotStarted` and the prepared owner available for cleanup;
+it does not poison the device or start an active execution. A failed copy clears
+the launch pointer while retaining the slot allocation. A repeated publish is
+rejected without a copy and preserves the existing publication verdict.
+
+Successful prepare installs a non-null `args.runtime_args`, but the destination
+still holds the previous run's bytes or uninitialized storage. The launch check
+therefore uses publication status as well as the pointer. This verdict covers
+only the Runtime descriptor: HBG image publication and late DFX arming retain
+their own checked failure paths. A future asynchronous copy must retain its
+source through completion; this synchronous status does not supply that lifetime.
 
 The snapshot adds one host allocation and descriptor-size CPU copy per run;
 those costs are paid even with the adjacent calls. It does not reduce device

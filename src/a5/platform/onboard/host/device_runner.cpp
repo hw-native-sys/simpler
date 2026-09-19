@@ -454,6 +454,12 @@ DeviceRunnerBase::LaunchOutcome
 DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) {
     LaunchOutcome outcome;
     if (prepared == nullptr) return outcome;
+    if (!prepared->kernel_args.runtime_args_published()) {
+        LOG_ERROR("launch_execution: this run's Runtime descriptor has not been published");
+        outcome.rc = PTO_RUNTIME_ERR_INVALID_STATE;
+        outcome.prepared = std::move(prepared);
+        return outcome;
+    }
 
     Runtime &runtime = *prepared->runtime;
     const int num_aicore = prepared->num_aicore;
