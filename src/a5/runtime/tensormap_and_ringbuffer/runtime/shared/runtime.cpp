@@ -33,7 +33,6 @@ Runtime::Runtime() {
     memset(dev.workers, 0, sizeof(dev.workers));
     dev.worker_count = 0;
     dev.aicpu_thread_num = 1;
-    dev.ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
     memset(dev.aicpu_allowed_cpus, 0, sizeof(dev.aicpu_allowed_cpus));
     dev.aicpu_allowed_cpu_count = 0;
     dev.aicpu_launch_count = 0;

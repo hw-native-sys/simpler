@@ -52,9 +52,6 @@
 #define RUNTIME_MAX_WORKER PLATFORM_MAX_CORES
 #define RUNTIME_MAX_FUNC_ID 1024
 
-// Default number of ready-queue shards.
-constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 1;
-
 // =============================================================================
 // Data Structures
 // =============================================================================
@@ -86,17 +83,22 @@ constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 
  * between cores and optimize cache coherency operations.
  *
  * Field Access Patterns:
- * - aicpu_ready: Reserved legacy field; the current handshake does not use it
+ * - aicpu_ready: unused on a2a3. On a5 it carries the AICore scheduler runtime
+ *   mode (SCHEDULER_RUNTIME_MODE_*): the host publishes the selected mode when
+ *   it builds the scheduler state, the AICPU dispatches on worker 0's copy, and
+ *   the AICore polls its own for RESIDENT_READY
  * - aicore_done: Written by AICore, read by AICPU (final report; physical_core_id
  *   and core_type are published alongside it in the same write)
- * - task: Written by AICPU before window-open, read by AICore after window-open
+ * - task: Written by AICPU before window-open, read by AICore after window-open.
+ *   On a5 the host writes it first, holding the address of that worker's
+ *   SchedulerWorkerContext, and the AICPU republishes it at resident hand-off
  * - core_type: Written by AICore (with aicore_done), read by AICPU (CoreType::AIC or CoreType::AIV)
  * - physical_core_id: Written by AICore (with aicore_done), read by AICPU
  */
 struct Handshake {
-    volatile uint32_t aicpu_ready;  // Legacy layout field; unused by the current handshake
+    volatile uint32_t aicpu_ready;  // a2a3: unused. a5: SCHEDULER_RUNTIME_MODE_* (see above)
     volatile uint32_t aicore_done;  // AICore ready signal: 0=not ready, core_id+1=ready
-    volatile uint64_t task;         // DispatchPayload* published before register window-open
+    volatile uint64_t task;         // DispatchPayload*, or on a5 a SchedulerWorkerContext address
     volatile CoreType core_type;    // Core type: CoreType::AIC or CoreType::AIV (reported by AICore with aicore_done)
     volatile uint32_t physical_core_id;  // Physical core ID (reported by AICore with aicore_done)
 } __attribute__((aligned(64)));
@@ -182,7 +184,6 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // to AICore. The highest-index thread additionally performs the one-time
     // host-orch boot (attach SM, latch task count) before it starts dispatching.
     int aicpu_thread_num;
-    int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
 
     // Filter-style affinity gate input (a2a3 onboard). Host fills these
     // before launch from AICPU OCCUPY, and the device gate keeps threads whose

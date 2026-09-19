@@ -55,9 +55,6 @@
 #define RUNTIME_MAX_FUNC_ID 1024
 #define RUNTIME_MAX_ORCH_SYMBOL_NAME 64
 
-// Default ready queue shards: one shard per worker thread (total minus orchestrator)
-constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 1;
-
 // =============================================================================
 // Data Structures
 // =============================================================================
@@ -156,7 +153,6 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // thread (highest idx, runs aicpu_orchestration_entry) and the remaining
     // aicpu_thread_num-1 scheduler threads that dispatch tasks to AICore.
     int aicpu_thread_num;
-    int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
 
     // Filter-style affinity gate input (a5 onboard). Host fills before
     // launch from device-side OCCUPY + DSMI CPU_TOPO via
@@ -344,11 +340,10 @@ static_assert(
     "stays cache-line aligned"
 );
 
-// Number of bytes of the Runtime image that must be copied to the device.
-// trb returns sizeof(DeviceRuntimeLaunchDesc) (only `dev` is device-read);
-// host_build_graph returns sizeof(Runtime) (its device image is the whole
-// object). Defined per-runtime so the shared device_runner_helpers.cpp copy
-// path stays runtime-agnostic.
+// Number of bytes of the Runtime image that must be copied to the device. Both
+// runtimes return sizeof(DeviceRuntimeLaunchDesc) — their own, which differ in
+// content. Defined per-runtime so the shared device_runner_helpers.cpp copy path
+// stays runtime-agnostic.
 size_t runtime_device_copy_size(const Runtime &rt);
 
 #endif  // SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_
