@@ -134,15 +134,29 @@ A cached value from a previous round survives the DMA write, so the
 next AICPU load returns stale data. The original PR #204 fix was:
 
 ```cpp
-// src/a2a3/runtime/host_build_graph/aicpu/aicpu_executor.cpp
-cache_invalidate_range(runtime, sizeof(Runtime));  // before reading host-written Runtime
+// src/a2a3/runtime/host_build_graph/aicpu/aicpu_executor.cpp:455
+cache_invalidate_range(runtime, sizeof(runtime->dev));
 ```
 
 This is **necessary on a2a3** and must not be removed there. It is the
 load-bearing usage of `cache_invalidate_range` in the a2a3 runtime.
 
+Two details of the call as it stands, both verified against the source:
+
+- The extent is the device-copied descriptor, `sizeof(runtime->dev)`, not
+  `sizeof(Runtime)`. The host-only tail is never uploaded (#2309, #2315).
+- The call sits in `AicpuExecutor::deinit()`, at the **end** of a run, so it
+  precedes the *next* invocation's read rather than the current one's. The
+  earliest descriptor read of a run — the platform AICPU kernel's affinity gate —
+  has no cache operation before it.
+
 On a5, host DMA writes to GM are coherent with AICPU reads, so the
 matching runtime hand-off code does not call `cache_invalidate_range`.
+Note that a5 `host_build_graph` does call it, at two sites, while a5
+`tensormap_and_ringbuffer` does not; which of the two matches the rule is
+unresolved, and the basis for the a5 coherency statement above is not recorded
+here. See
+[the descriptor visibility investigation](../investigations/2026-09-runtime-descriptor-input-visibility-chain.md).
 
 ## The "SDMA → AICPU" path: a2a3 is conservative, a5 is coherent
 
