@@ -158,11 +158,28 @@ working on a2a3 onboard across HBG and TRB, so the front was removed.
 
 In the program path, `KernelArgsHelper::prepare_runtime_args` reserves the
 slot-owned destination and snapshots only `DeviceRuntimeLaunchDesc`.
-`publish_runtime_args` then consumes that snapshot with a synchronous H2D, before
-launch. Later host mutations cannot change the prepared descriptor, and a failed
-copy withdraws this run's launch pointer without freeing the slot's destination.
-The snapshot adds one host allocation and descriptor-size CPU copy per run; it
-does not reduce device transfer bytes or establish capture/replay support.
+`publish_runtime_args` consumes that snapshot with a synchronous H2D before
+launch. The sole production caller, `init_runtime_args_with_metadata`, calls
+them consecutively, with only a return-code check between them: there is no
+intervening Runtime mutation today. The snapshot establishes a boundary for
+later decoupled/asynchronous publication and capture work; it does not fix a
+current mutation race or make publication asynchronous.
+
+Preparation called again discards any pending snapshot and clears the previous
+run view. A failed publication also clears the launch pointer while leaving the
+slot's allocation owned. Skipping publication is different: successful prepare
+already installs a non-null `args.runtime_args`, but the destination still holds
+the previous run's bytes, or uninitialized storage on its first allocation. A
+non-null pointer therefore does not prove publication. The caller must invoke
+`publish_runtime_args`, check its return code and abort preparation on failure;
+checking return codes cannot detect a call that was skipped. There is no
+separate publication-state gate in launch.
+Opening a longer prepare-to-publish window requires an explicit pending-source
+replacement policy and enforcement of publication success before launch.
+
+The snapshot adds one host allocation and descriptor-size CPU copy per run;
+those costs are paid even with the adjacent calls. It does not reduce device
+transfer bytes or establish capture/replay support.
 
 ## Method 3: Path B — `KERNEL_TYPE_AICPU_CUSTOM` (broken — #822)
 

@@ -39,6 +39,8 @@ public:
     int publish(Copy &&copy) {
         if (bytes_.empty()) return PTO_RUNTIME_ERR_INTERNAL;
         auto bytes = std::move(bytes_);
+        // The consumed source stays empty unless prepared again; a repeated or
+        // reentrant publish is rejected instead of copying the descriptor twice.
         bytes_.clear();
         return copy(bytes.data(), bytes.size());
     }

@@ -124,11 +124,13 @@ struct KernelArgsHelper {
     MemoryAllocator *allocator_{nullptr};
 
     // Reserve the slot's destination and snapshot this invocation's device-read
-    // descriptor. No bytes are published by preparation.
+    // descriptor. No bytes are published; another prepare discards any pending
+    // snapshot and withdraws the previous run view.
     int prepare_runtime_args(const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot);
 
     // Consume the snapshot with a synchronous metadata H2D. The slot remains
-    // owned even on failure; the run must not launch after an unsuccessful copy.
+    // owned even on failure. Callers must check the return code and abort the
+    // run on error; launch has no independent publication-state gate.
     int publish_runtime_args();
 
     /**
