@@ -152,11 +152,60 @@ Two details of the call as it stands, both verified against the source:
 
 On a5, host DMA writes to GM are coherent with AICPU reads, so the
 matching runtime hand-off code does not call `cache_invalidate_range`.
-Note that a5 `host_build_graph` does call it, at two sites, while a5
-`tensormap_and_ringbuffer` does not; which of the two matches the rule is
-unresolved, and the basis for the a5 coherency statement above is not recorded
-here. See
-[the descriptor visibility investigation](../investigations/2026-09-runtime-descriptor-input-visibility-chain.md).
+
+**Basis: a project architecture premise.** The host↔device distinction is stated by
+the project owner: **A3 host/device is not cache-coherent; A5 host/device is.** Take
+that as the premise this section rests on. It is an architectural statement from the
+project, **not** a vendor specification quoted here and **not** something this
+repository measured — no external citation is linked from this file, and none should
+be inferred.
+
+Three limits on how far that premise reaches, because the rest of this document makes
+endpoint-specific claims that do **not** follow from it:
+
+- **It is about the host↔device edge only.** The `AICore → AICPU` and
+  `SDMA → AICPU` sections below concern on-device producers. Their claims rest on
+  their own basis and are not derived from this premise.
+- **It names A3.** A2 is not covered by it. The `a2a3` tree serves both and remains on
+  the conservative path; this documentation does not change that path. No A2 coherence
+  model follows from the premise, and nothing here establishes that an additional
+  clean-and-invalidate is harmless on any architecture — that would be a separate
+  question about the operation's outbound role, below.
+- **Coherence is not ordering, atomicity or ownership.** It says a host write becomes
+  visible without AICPU-side invalidation. It does not make a multi-field publication
+  atomic, does not supply happens-before between a writer and a reader, and does not
+  permit overwriting a field another agent is live on. Those obligations are tracked
+  separately in
+  [the descriptor visibility investigation](../investigations/2026-09-runtime-descriptor-input-visibility-chain.md).
+
+**Consequently this premise licenses no code change on its own.** In particular it does
+not authorise deleting any cache operation now in the tree: a `dc civac` call also
+cleans, so its outbound role toward on-device readers is a separate question from the
+inbound freshness the premise settles.
+
+**In-tree history of the a5 difference.** a5 `host_build_graph` calls
+`cache_invalidate_range` over the descriptor at two sites while a5
+`tensormap_and_ringbuffer` calls it at none. The statement itself entered the tree with
+[`153daee6b`](https://github.com/hw-native-sys/simpler/commit/153daee6bb302554bbff85e4e91f80e66691df25)
+(#1235), whose message gives the rationale as "per hardware guidance" and names no
+document, version or section. The sequence:
+
+1. [`153daee6b`](https://github.com/hw-native-sys/simpler/commit/153daee6bb302554bbff85e4e91f80e66691df25)
+   (#1235) removed `cache_invalidate_range` over the descriptor from **both** the a5
+   `host_build_graph` and a5 `tensormap_and_ringbuffer` deinit paths.
+2. [`26b67fdb5`](https://github.com/hw-native-sys/simpler/commit/26b67fdb5c54aef29d477698440e6cb612ba5159)
+   (#1661) migrated a5 `host_build_graph` onto the host-orchestrated runtime and the
+   call is present again afterwards. That commit enumerates six deviations from the
+   a2a3 runtime it copied; this call is not among them.
+3. [`52f25af4a`](https://github.com/hw-native-sys/simpler/commit/52f25af4a81b22f39836accefd2fd48db725a06a)
+   (#2090) added `aicpu_legacy_executor.cpp`, which contains the call from the point
+   the file was created.
+
+One reading of 1–3 is that the call returned as part of the migration copy rather than
+by a decision specific to a5. **That is an inference from commit history, and history
+proves neither a hardware model nor its absence** — it records when the call returned,
+not why it was kept. It is kept here because it explains how the two a5 runtimes came
+to differ, which is a maintenance fact, independent of the premise above.
 
 ## The "SDMA → AICPU" path: a2a3 is conservative, a5 is coherent
 
@@ -172,6 +221,10 @@ domain.
 On a5, SDMA writes are coherent with AICPU reads, so the matching a5
 SDMA completion helpers do not invalidate or flush cache lines.
 
+Note the basis: SDMA is an **on-device** engine, so this row is *not* covered by the
+host↔device architecture premise recorded in the host-DMA section above. It rests on
+whatever established it originally, which this file does not record.
+
 ## Quick decision table
 
 When you are about to insert a cache operation, ask in order:
@@ -180,6 +233,9 @@ When you are about to insert a cache operation, ask in order:
    code, not the address.
 2. Is this a5? If yes → no AICPU invalidate/flush for GM reads written
    by host DMA, SDMA, AICPU, or AICore.
+   The **host DMA** arm of this rule is the one the architecture premise in the
+   host-DMA section supports. The other three producers are on-device and rest on
+   their own basis; do not cite that premise for them.
 3. On a2a3, is the producer in the AICPU coherency domain (AICPU itself
    or AICore)? If yes → no invalidate. If no (host, SDMA) → invalidate.
 4. For AICore writes specifically, does the producer already `dcci`

@@ -1,7 +1,9 @@
 # The Runtime descriptor's input-visibility chain: what the code expresses and what remains unestablished
 
 **Date**: 2026-09-19
-**Verdict**: open questions delimited — no defect established, no cache operation changed, no contract proposed or proved
+**Verdict**: host↔device coherence supplied as a project premise; the remaining
+ordering, atomicity, ownership and lifetime obligations stay open — no defect
+established, no cache operation changed, no contract proposed or proved
 **Revision**: the first version of this entry shipped in #2368. Static review found
 that several of its conclusions promoted source control flow, or observations that
 do not discriminate, into hardware guarantees. Those conclusions are withdrawn in
@@ -23,10 +25,13 @@ variant and each processor, and separates three things the earlier note ran
 together: **what the code does**, **what that alone establishes**, and **what it
 merely expresses an intention about**.
 
-The outcome is that the asymmetry is real, is not evidence for any particular
-change, and that no variant's chain is closed by evidence available in this
-repository. Several statements in the first version of this entry are withdrawn
-below and marked as such.
+The outcome is that the asymmetry is real and is not evidence for any particular
+change. The host↔device coherence prerequisite is **supplied as a project
+architectural premise** (A3 not coherent, A5 coherent — see the premise section
+below) and is no longer open; the remaining obligations — ordering, publication
+atomicity, writer ownership, outbound publication, run lifetime and cross-stream
+dependencies — are not settled by it and stay open. Several statements in the first
+version of this entry are withdrawn below and marked as such.
 
 ## Baseline
 
@@ -274,8 +279,16 @@ hardware question, and are corrected in those files by this change:
 A third difference is **not** corrected, because settling it needs evidence this
 entry does not have: the rule says a5 does not call the operation for host-DMA
 reads, and its decision table says so for a5 generally, yet **a5 HBG calls it at
-two sites** while a5 TRB does not. Recorded as an open discrepancy; the rule's own
-a5 basis carries no citation (unknown 1).
+two sites** while a5 TRB does not. Recorded as an open discrepancy.
+
+`cache-coherency.md` now carries the verified history of that discrepancy: the call
+was removed from both a5 runtimes by #1235, is present again in a5 HBG after the
+migration in #1661 whose six enumerated deviations do not mention it, and was carried
+into `aicpu_legacy_executor.cpp` from the point #2090 created that file. A migration
+copy is *one* reading of that sequence, and the provenance note labels it an
+inference: the history fixes when the call returned, not why it was kept. History
+proves neither a hardware model nor its absence, so this lineage is a maintenance
+fact and is independent of the coherence premise recorded above.
 
 ## The a5 HBG resident handshake line: three writers, and a dependency the code expresses
 
@@ -351,25 +364,72 @@ safety argument does not currently exist in written form.
 - **That an end-of-run invalidate establishes next-invocation visibility.** It
   completes before the next launch, but `dsb sy; isb` after `dc civac` orders the
   maintenance, not anything against a *later* host DMA.
-- **That a slot's first run is covered.** On a slot's first run no previous
-  `deinit` ran, so no descriptor-wide maintenance has ever executed for those
-  lines.
+- **That a slot's first run is covered on a non-coherent path.** On a slot's first
+  run no previous `deinit` ran, so no descriptor-wide maintenance has ever executed
+  for those lines. On A5 the premise removes the need; on A3 it does not, and what
+  covers that first read is open.
 - **That invalidation is an acquire.** It is not.
 - **That stores imply a dirty write-back cache** (see step 6).
 - **That passing CI bounds failure frequency.** It is an observation of the
   exercised cases. Without a defined experiment and sampling basis it is not a
   quantitative bound, and the first version of this entry wrongly implied one.
 
+## Supplied premise: the host↔device coherence model
+
+The project owner states the architecture: **A3 host/device is not cache-coherent; A5
+host/device is.** This entry takes that as given and no longer lists it as an open
+question. It is a project architectural premise — **not** a vendor specification quoted
+here, and **not** something measured for this entry.
+
+What it settles: the **inbound host→AICPU freshness edge** per architecture. On A5 a
+host-published descriptor byte becomes visible to an AICPU read without AICPU-side
+invalidation. On A3 it does not, so on that path **some** mechanism must make the host's
+bytes visible before the reader's first read. Which mechanism, and whether the
+descriptor call at its current end-of-previous-run placement supplies it, is not
+established here — the premise states the architecture, not the role of any particular
+call.
+
+What it does **not** settle, and what the rest of this entry is about:
+
+- **Ordering.** Coherence supplies no happens-before between a writer and a reader.
+- **Atomicity of a multi-field publication.** A descriptor or a 64-byte handshake line
+  updated field-by-field is not made a single observable event by coherence.
+- **Writer ownership.** It grants no permission to overwrite a field another agent is
+  live on, which is the whole subject of the three-writer section above.
+- **The outbound direction.** `cache_invalidate_range` is `dc civac`, which also
+  cleans; what that clean publishes to on-device readers is a separate obligation.
+- **Anything off the host↔device edge.** On-device producers — AICore, SDMA — and the
+  question of how GM is mapped are not covered. Nor is **A2**: the owner named A3, the
+  `a2a3` tree serves both and takes the conservative path, and that is where this entry
+  leaves it.
+
+**It authorises no code change.** In particular it does not license deleting any cache
+operation now in the tree, nor a handshake redesign.
+
+## Remaining obligations, with the premise applied
+
+| obligation | status with the premise |
+| ---------- | ----------------------- |
+| inbound host→AICPU freshness, A5 | **supplied** — coherent per the premise |
+| inbound host→AICPU freshness, A3 | non-coherent per the premise, so maintenance is required there. Whether the existing **end-of-previous-run** placement discharges it for the next run's first read is a separate question this entry does not answer — nor is any defect claimed; see step 6 for where the calls sit, and note a slot's first run has no prior `deinit` |
+| launch-time cache state | still open, and now only relevant where the premise leaves work to do: it bears on A3's placement question above, not on A5's inbound edge |
+| outbound AICPU→AICore/host publication | **still open** — the clean half of `dc civac`, untouched by an inbound coherence premise |
+| whole-line / multi-field publication atomicity | **still open** — see the three-writer section |
+| ordering and happens-before between the three writers | **still open** — the marker dependency and its unproved preconditions |
+| allocation and run lifetime, slot reuse | **still open** as described in steps 2 and 7 |
+| cross-stream dependencies (AICore and AICPU launched independently) | **still open** as described in step 4 |
+| GM mapping and write policy | **still open**, and not answerable from the premise |
+
 ## Unknowns, and what each would and would not settle
 
-Three questions are unanswerable from this repository. Crucially, **none of them
+The questions below remain unanswerable from this repository. Crucially, **none of them
 alone licenses removing or relocating an existing operation**, because the
 descriptor-wide call has more than one possible role (step 6).
 
 | unknown | if resolved, addresses | does **not** address |
 | ------- | ---------------------- | -------------------- |
-| **1. Is a5 host-DMA→AICPU coherent?** Asserted in `cache-coherency.md` with no citation to SDK, driver source or measurement. | the **input-freshness edge** on a5: whether host-published bytes reach an AICPU read without maintenance | whether the **clean** half of a5 HBG's `dc civac` has a publication role for device-authored fields; and if a5 is *not* coherent, it still does not make a5 TRB defective — launch-time maintenance and mapping properties remain competing explanations |
-| **2. Does AICPU kernel launch leave the cache cold or perform maintenance?** | the input-freshness edge on **all** variants for the first read | whether prior device-authored bytes needed publishing to another observer before that point — a cold next cache says nothing about the previous run's outbound obligations |
+| **1. Does AICPU kernel launch leave the cache cold or perform maintenance?** | on A3, whether the end-of-previous-run placement suffices for the next run's first read | whether prior device-authored bytes needed publishing to another observer before that point — a cold next cache says nothing about the previous run's outbound obligations. Moot for A5's inbound edge, which the premise settles |
+| **2. What publishes AICPU-authored descriptor bytes outward, and to whom?** The clean half of `dc civac`, plus the `dc cvac` in a5 HBG's context publication. | whether removing or moving either call would drop a publication an on-device reader depends on | inbound freshness, which the premise covers per architecture |
 | **3. Is GM cacheable for the AICPU, and under what write policy?** The documented `Device-nGnRE` attribute covers the **MMIO** window only. | whether cached descriptor lines can exist at all, and whether the clean half can have anything to write back | nothing about externally written staleness **if the answer is write-through**: a write-through cache still holds readable lines, and the write policy alone does not establish that host DMA invalidates or updates them |
 
 > **Withdrawn from the first version:** the claim that an uncached **or
@@ -386,10 +446,12 @@ the call once **every** row it currently covers is accounted for by something:
 
 | obligation | who needs it | currently discharged by |
 | ---------- | ------------ | ----------------------- |
-| host-published bytes visible to the AICPU's first read | AICPU affinity gate, executor init, a5 HBG mode select | nothing in the same invocation; unknowns 1–2 |
-| host-published bytes visible to the AICore's early reads | a5 HBG resident mode + context reads | the AICore's own `scheduler_observe_cache_line` |
-| AICPU-authored descriptor bytes made visible outward | AICore readers of `workers[i].task`; host D2H diagnostics | possibly the clean half of `dc civac`; unknown 3 |
-| a slot's **first**-run reads | every variant | nothing identified |
+| host-published bytes visible to the AICPU's first read | AICPU affinity gate, executor init, a5 HBG mode select | on A5, the coherence premise. On A3 the premise says maintenance is needed, and nothing in the same invocation supplies it — unknown 1 covers whether the end-of-previous-run placement discharges it |
+| host-published bytes visible to the AICore's early reads | a5 HBG resident mode + context reads | the AICore's own `scheduler_observe_cache_line`. The host↔AICPU premise does not speak to an AICore reader |
+| AICPU-authored descriptor bytes made visible outward | AICore readers of `workers[i].task`; host D2H diagnostics | possibly the clean half of `dc civac`; unknowns 2–3 |
+| a slot's **first**-run reads, AICPU observer, A5 | AICPU affinity gate, executor init | the coherence premise — a first run is not a special case for an edge that needs no maintenance |
+| a slot's **first**-run reads, AICPU observer, A3 | same | nothing in that invocation, and no prior `deinit` has run for those lines. What the non-coherent path requires there is open, as above |
+| a slot's **first**-run reads, AICore observer | a5 HBG resident mode + context reads | the AICore's own `scheduler_observe_cache_line`, on every run including the first |
 | line-granular exclusivity on the a5 HBG handshake line | host, AICPU, AICore | a marker dependency with unwritten preconditions |
 
 Relocating the call to before the first read would move it into the platform
@@ -403,15 +465,15 @@ The first version presented these as probes with decisive outcomes. They are
 narrowed here to what each could observe and what would remain ambiguous.
 **Nothing was run for this entry, and none of this is an actionable plan yet.**
 
-**Q1 — is the a5 input edge coherent?** A cross-arch comparison is *not* a
-positive control unless the control's state is independently verified: the same
-launch-maintenance, residency and mapping uncertainties apply to a2a3, so a2a3
-producing fresh reads would not show which mechanism prevented staleness. To have
-any discriminating power, a run must first **establish that a stale readable line
-existed at the moment of the read** — which requires a verified initial cache
-state and a read-back confirming the line's content before the host write, not
-merely the belief that a2a3 is non-coherent. Until that initial state can be
-positively established, this is a comparison, not a control.
+**Q1 — on A3, does the end-of-previous-run placement discharge the inbound
+obligation?** The coherence question this slot used to hold is answered by the premise;
+what is left is the A3 placement question, where the premise says maintenance *is*
+required. Observing it has the same difficulty the original framing did: a run must
+first **establish that a stale readable line existed at the moment of the read** — a
+verified initial cache state plus a read-back confirming the line's content before the
+host write — because fresh reads on their own cannot show which mechanism prevented
+staleness. The premise supplies the architecture, not the initial state of any
+particular line. Without that, a run is a comparison rather than a control.
 
 **Q2 — did the reader's cache survive the kernel boundary?** The
 dirty-sentinel idea does not discriminate. Reading the old value is consistent
@@ -439,15 +501,16 @@ at all.
 
 **What no measurement here can do:** establish an architectural guarantee. It can
 demonstrate a violation. Retiring unknowns 1–3 as guarantees needs an SDK or
-architecture statement.
+architecture statement — the kind the host↔device premise supplies for its own edge,
+and which the remaining unknowns do not have.
 
 ## Why nothing is changed in the runtime
 
-Because no unknown above discharges the full set of obligations, and because the
-asymmetry is not evidence for any particular one of them. Adding an invalidate to
-a5 TRB, or deleting a5 HBG's two calls, or deleting all four, would each encode a
-guess about a different unknown as an invariant — and the clean half of the
-operation would remain unaccounted for in all three.
+The coherence premise settles the inbound edge per architecture; it does not discharge
+the outbound, atomicity, ordering or lifetime obligations, and the remaining unknowns
+do not either. Adding an invalidate to a5 TRB, or deleting a5 HBG's two calls, or
+deleting all four, would each rest on the premise answering more than it does — the
+clean half of the operation stays unaccounted for in all three.
 
 ## What this hands to other work
 
@@ -467,8 +530,10 @@ operation would remain unaccounted for in all three.
 2. Whether to record the a5 HBG three-tier line and its marker dependency as a
    stated *constraint* — not an invariant — near the struct, given that its
    preconditions are unestablished.
-3. Whether `cache-coherency.md`'s a5 claim should be marked unsourced pending
-   evidence. This change does not alter it.
+3. Whether the host↔device premise should also be recorded anywhere beyond
+   `cache-coherency.md` and this entry — and, separately, whether the on-device
+   coherency rows in that file (AICore, SDMA) warrant their own basis being written
+   down, since the premise does not reach them.
 
 ## References
 
