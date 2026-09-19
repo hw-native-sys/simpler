@@ -89,7 +89,7 @@ enum class ScopeMode : uint8_t {
  * LIFETIME — single-pass only:
  *   Internally this class stores pointers into the submitting task's tensor
  *   storage: the region named by TaskPayload::tensors for a plain submit, the
- *   GraphRecording in-graph task's tensors for a submit inside a Graph body. Both belong to
+ *   GraphRecording sub-task's tensors for a submit inside a Graph body. Both belong to
  *   one orchestration pass, which the next bind rebuilds over the same bytes.
  *   Therefore the TaskOutputTensors instance, the const simpler::hbg::Tensor& returned by
  *   get_ref(), and any pointer derived from either MUST NOT outlive the
@@ -507,7 +507,7 @@ public:
      * Add scalar values, declaring each one a **static** parameter regardless of value
      * category.
      *
-     * On an in-graph task's arguments the declaration takes effect at once: recording
+     * On a sub-task's arguments the declaration takes effect at once: recording
      * reads it back through scalar_dynamic() and records the slot as static Definition
      * data instead of following a parameter.
      *
@@ -862,7 +862,7 @@ inline constexpr int32_t GRAPH_MAX_SCALAR_ARGS = 64;
  * that is what a recorded body resolves against.
  *
  * Sized independently of CoreTaskArgs because the outer GRAPH payload carries the whole
- * boundary, while materialize stages only one in-graph task's arguments at a time. The
+ * boundary, while materialize stages only one sub-task's arguments at a time. The
  * compact boundary values live in that payload's argument-pool regions, so widening these
  * caps costs pool bytes only for Graphs that use them; TaskPayload itself stays
  * fixed-size.

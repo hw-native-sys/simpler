@@ -246,7 +246,7 @@ so records and spans read against each other with no alignment step.
 | Group | Kinds |
 | ----- | ----- |
 | Bind segments (one interval each, inside the stage) | `args`, `arena_build`, `static_arena`, `gm_heap`, `shared_mem`, `runtime_init`, `host_orch`, `graph_upload`, `arena_h2d`, `host_view_close` |
-| Orchestrator operations (inside `host_orch`) | `submit_task`, `alloc_tensors`, `record_in_graph_task`, `graph_submit`, `build_definition`, `graph_begin`, `recording_wait`, `graph_commit`, `submit_admit`, `record_handoff`, `generated_args` |
+| Orchestrator operations (inside `host_orch`) | `submit_task`, `alloc_tensors`, `record_sub_task`, `graph_submit`, `build_definition`, `graph_begin`, `recording_wait`, `graph_commit`, `submit_admit`, `record_handoff`, `generated_args` |
 
 Three of the orchestrator kinds end with a task submitted — `submit_task`,
 `alloc_tensors`, `graph_submit` — so their count is the bind's `total_tasks`
@@ -266,7 +266,7 @@ the wrong one produces a number that reads as data and is not:
 
 - **A record is an interval** — one operation, start to end. Its `detail` says
   *which* operation (a task id, a Graph key, the submission index) or *how much*
-  it covered (`build_definition`'s in-graph task count, `recording_wait`'s in-flight
+  it covered (`build_definition`'s sub-task count, `recording_wait`'s in-flight
   count). That is the whole contract.
 - **A quantity about a segment is an attribute** — `bytes=`, `heap_used=`,
   `spilled=`, `minflt=`, `nvcsw=`. It goes in the segment's attribute string,
@@ -334,7 +334,7 @@ python -m pytest <case> --platform <platform> --device 0 --enable-chip-swimlane 
   Both come from per-kind counters, not from the record pool. The counters use
   lock-free atomic additions across the main and recording-worker lanes, with
   every phase isolated on its own cache line so concurrent `graph_submit` and
-  `record_in_graph_task` updates do not false-share. The per-event pool is armed when the
+  `record_sub_task` updates do not false-share. The per-event pool is armed when the
   artifact is wanted (`SIMPLER_HBG_HOST_PHASE_RECORDS_ENABLE` *and* an output
   prefix) or whenever the chip swimlane is at `ORCH_PHASES`; a steady-state run
   satisfies neither, so it pays no pool append and no artifact lock at all. A
@@ -354,7 +354,7 @@ python -m pytest <case> --platform <platform> --device 0 --enable-chip-swimlane 
   This is the channel to read for a distribution or a per-event timeline; the
   summed lines cannot express either. Every record carries its producer Linux
   tid. `strace_timing.py --swimlane --host-phase-records <path>` draws each record
-  inside the matching `chip.run.bind`; `record_in_graph_task` and `build_definition`
+  inside the matching `chip.run.bind`; `record_sub_task` and `build_definition`
   appear on the `graph record worker` lane, while outer `graph_submit` events
   appear on the `graph submit main` lane.
 

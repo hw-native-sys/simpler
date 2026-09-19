@@ -26,7 +26,7 @@ untouched.
 
 Eight Definitions cover all 43 layers:
 
-- `csa_attn_block` (50 in-graph tasks) / `csa_moe_block` (32) and `hca_attn_block` (35) /
+- `csa_attn_block` (50 sub-tasks) / `csa_moe_block` (32) and `hca_attn_block` (35) /
   `hca_moe_block` (31) — the decoder loop's two alternating layer shapes, layers
   2..41, plus layer 42 replaying `csa_attn_block` and `hca_moe_block`.
   `csa_moe_block` records two Definitions: its routing kernel is `route_hash_1`
@@ -34,7 +34,7 @@ Eight Definitions cover all 43 layers:
   key, so the predicate is a Graph config value rather than a host-side `if` the
   first recorded layer would settle for every replay.
 - `swa_attn_block` (28) — the two peeled sliding-window attentions of layers 0
-  and 1. Their in-graph tasks are pairwise alpha-equivalent, so layer 1 replays what layer
+  and 1. Their sub-tasks are pairwise alpha-equivalent, so layer 1 replays what layer
   0 recorded.
 - `hash_moe_l0_block` (31) / `hash_moe_l1_block` (31) — the peeled MoE scopes.
   These cannot share a Definition: `dispatch_wait` folds the MoE epoch in as a
@@ -97,13 +97,13 @@ down:
 
 1. **The recorder inferred dependencies from the allocation site, not the last
    writer.** A recorded task's fanin came only from tensor args classified
-   `INTERNAL` — which names whichever in-graph task's packed window holds the bytes, i.e.
+   `INTERNAL` — which names whichever sub-task's packed window holds the bytes, i.e.
    the allocator — plus explicit `set_dependencies`. Every write-then-read
    through an `alloc_tensors` buffer or a boundary view was therefore unordered,
    and a Definition replayed a DAG the body does not have when its tasks are
    submitted individually. Measured on the pre-split single-Definition form of
    this body: 1348 edges against the 2143 the ordinary path computes for the same
-   tasks, 543 of 561 comparable in-graph tasks short. On device that ran
+   tasks, 543 of 561 comparable sub-tasks short. On device that ran
    `csa_slots_build_valid_qk_plan` before the `topk` that fills its input, so
    `qk_pv_1` gathered KV pages at addresses the bus rejected. The recorder now
    runs the same `compute_task_fanin` / `register_task_outputs` the ring path

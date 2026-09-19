@@ -420,10 +420,10 @@ TEST_F(HbgGraphSubmitFailureTest, AutoScopeNestedInManualScopeRefusesTheRecordin
     EXPECT_TRUE(orch.is_fatal()) << "a shell whose Definition never arrived cannot be completed";
 }
 
-// A Graph body may allocate. The allocation records as a kernel-less in-graph task,
+// A Graph body may allocate. The allocation records as a kernel-less sub-task,
 // the same shape submit_dummy_task records, so the recording stays publishable and
 // the commit latches no fatal.
-TEST_F(HbgGraphSubmitFailureTest, RuntimeAllocationInsideTheBodyRecordsAKernellessInGraphTask) {
+TEST_F(HbgGraphSubmitFailureTest, RuntimeAllocationInsideTheBodyRecordsAKernellessSubTask) {
     std::array<uint32_t, 16> storage{};
     uint32_t shape[] = {static_cast<uint32_t>(storage.size())};
     simpler::hbg::Tensor boundary = simpler::hbg::make_tensor_external(storage.data(), shape, 1);
@@ -718,7 +718,7 @@ TEST_F(HbgGraphSubmitFailureTest, CachedGraphUsesFinalTaskWindowSlot) {
 // it.
 class HbgGraphPredicateRejectionTest : public HbgGraphSubmitFailureTest {
 protected:
-    // Records one predicated in-graph task into a fresh Graph and asserts the recording
+    // Records one predicated sub-task into a fresh Graph and asserts the recording
     // refused it. `build_predicate` receives the boundary parameter the body reads.
     template <typename BuildPredicate>
     void expect_recording_refused(uint64_t graph_key, BuildPredicate build_predicate) {
@@ -780,12 +780,12 @@ TEST_F(HbgGraphPredicateRejectionTest, OperandOnAnUnclassifiableTensorAbortsTheR
     });
 }
 
-// A kernel-less in-graph task never dispatches, so submit_dummy_task and alloc_tensors
+// A kernel-less sub-task never dispatches, so submit_dummy_task and alloc_tensors
 // drop the caller's predicate exactly as they do on the ordinary path. Recording
 // must drop it too: a task whose Definition claimed a predicate its own attribute
 // denies is rejected by materialize, on the device, for a value the scheduler was
 // never going to read.
-TEST_F(HbgGraphPredicateRejectionTest, PredicateOnAKernellessInGraphTaskIsNotRecorded) {
+TEST_F(HbgGraphPredicateRejectionTest, PredicateOnAKernellessSubTaskIsNotRecorded) {
     std::array<uint32_t, 16> storage{};
     uint32_t shape[] = {static_cast<uint32_t>(storage.size())};
     simpler::hbg::Tensor boundary = simpler::hbg::make_tensor_external(storage.data(), shape, 1, DataType::INT32);

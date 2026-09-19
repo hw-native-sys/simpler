@@ -137,10 +137,10 @@ static bool require_no_producer(RuntimeContext *rt, const simpler::hbg::Tensor &
 
     orch.report_fatal(
         SIMPLER_ERROR_INVALID_ARGS, caller,
-        "tensor is produced by task %#llx (id space %u); host_build_graph finishes orchestration before the "
+        "tensor is produced by task %#llx (id space %s); host_build_graph finishes orchestration before the "
         "device starts, so a submitted kernel has not written this buffer and a runtime allocation is "
         "uninitialized -- pass the value as an orchestration argument, or have a task write it",
-        static_cast<unsigned long long>(producer.raw), static_cast<unsigned int>(producer.space())
+        static_cast<unsigned long long>(producer.raw), producer.space_name()
     );
     return false;
 }

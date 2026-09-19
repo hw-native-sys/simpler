@@ -27,12 +27,24 @@
 # produce per-arch object code.
 SHARED = "../../../common/tensormap_and_ringbuffer"
 
+# SHARED sits last in every include_dirs list, the way host_build_graph orders its
+# own: src/common/tensormap_and_ringbuffer and this architecture's "runtime"
+# directory both hold a tensormap.h and a tensor.h, and the bare-name includes
+# described above have to keep resolving to the architecture's. Being on the path at
+# all is what lets platform headers reach task_id.h by bare name.
+
 BUILD_CONFIG = {
-    "aicore": {"include_dirs": ["runtime", "common", ".."], "source_dirs": ["aicore", "orchestration"]},
-    "aicpu": {"include_dirs": ["runtime", "common", ".."], "source_dirs": ["aicpu", "runtime", "orchestration"]},
+    "aicore": {"include_dirs": ["runtime", "common", "..", SHARED], "source_dirs": ["aicore", "orchestration"]},
+    "aicpu": {
+        "include_dirs": ["runtime", "common", "..", SHARED],
+        "source_dirs": ["aicpu", "runtime", "orchestration"],
+    },
     "host": {
-        "include_dirs": ["runtime", "common", ".."],
+        "include_dirs": ["runtime", "common", "..", SHARED],
         "source_dirs": ["host", "runtime/shared", "orchestration", f"{SHARED}/host"],
     },
-    "orchestration": {"include_dirs": ["runtime", "orchestration", "common", ".."], "source_dirs": ["orchestration"]},
+    "orchestration": {
+        "include_dirs": ["runtime", "orchestration", "common", "..", SHARED],
+        "source_dirs": ["orchestration"],
+    },
 }

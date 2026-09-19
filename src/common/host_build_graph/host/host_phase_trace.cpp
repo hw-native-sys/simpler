@@ -51,7 +51,7 @@ namespace {
 // path performs no atomic read-modify-write at all. Sharing them cost the emitting
 // thread about 0.8 us per record at eight producers, purely in cache-line
 // ownership: every producer of a Graph workload records the same kind
-// (`record_in_graph_task`), so a per-kind counter is a single line eight threads fight
+// (`record_sub_task`), so a per-kind counter is a single line eight threads fight
 // over, and the `alignas(64)` that separates one kind from another does nothing
 // about that.
 //

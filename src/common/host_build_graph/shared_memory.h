@@ -70,7 +70,7 @@ struct alignas(64) SharedMemoryTaskHeader {
     // at on_mixed_task_complete (COMPLETED); readers = consumer fanin polling
     // (is_completed) and the ED publish scan (is_published). Reset per-slot in
     // orch::prepare_task as each slot is claimed. Indexed by local task id, like
-    // the storage array — so it covers GLOBAL tasks only. An IN_GRAPH task holds
+    // the storage array — so it covers GLOBAL tasks only. A SUB_TASK holds
     // no slot here and publishes completion through its GraphExecution's array
     // of the same shape; the Graph's outer shell is the GLOBAL task that carries
     // the byte for the whole body.
@@ -466,7 +466,7 @@ inline uint64_t compact_live_image(
     const auto *mirror_fanin = reinterpret_cast<const int32_t *>(mirror_base + from.fanin_pool);
     const auto *mirror_tensors = reinterpret_cast<const simpler::hbg::Tensor *>(mirror_base + from.tensor_pool);
     const auto *mirror_scalars = reinterpret_cast<const uint64_t *>(mirror_base + from.scalar_pool);
-    // An unbound region stays unbound: an in-graph task's payload never gets a fanin
+    // An unbound region stays unbound: a sub-task's payload never gets a fanin
     // region, and its count is 0, so no consumer resolves it. A bound one is inside
     // its own mirror pool by construction — the only binder is a bump cursor on that
     // pool — and the translation below depends on it, so it is asserted rather than

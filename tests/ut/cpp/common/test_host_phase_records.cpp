@@ -52,7 +52,7 @@ TEST(HostPhaseRecords, DisarmedPoolCollectsNothing) {
 
     // The producer's record call must tolerate a null pool — that is the common
     // configuration, where only the per-kind counters run.
-    record_n(pool, HostPhaseKind::OrchRecordInGraphTask, 10);
+    record_n(pool, HostPhaseKind::OrchRecordSubTask, 10);
     store.finish(0, /*invocation_id=*/9);
     EXPECT_TRUE(store.records().empty());
     EXPECT_EQ(store.total_records(), 0u);
@@ -64,7 +64,7 @@ TEST(HostPhaseRecords, RecordsSurviveInOrderWithinOneBuffer) {
     HostPhaseRecordPool *pool = store.arm(true);
     ASSERT_NE(pool, nullptr);
 
-    record_n(pool, HostPhaseKind::OrchRecordInGraphTask, 337, /*first_start=*/1000);
+    record_n(pool, HostPhaseKind::OrchRecordSubTask, 337, /*first_start=*/1000);
     store.finish(0, /*invocation_id=*/9);
 
     const auto records = store.records();
@@ -73,7 +73,7 @@ TEST(HostPhaseRecords, RecordsSurviveInOrderWithinOneBuffer) {
     EXPECT_EQ(store.dropped_records(), 0u);
     for (size_t i = 0; i < records.size(); ++i) {
         EXPECT_EQ(records[i].start_ns, 1000u + i) << "record " << i << " out of rotation order";
-        EXPECT_EQ(records[i].kind, static_cast<uint32_t>(HostPhaseKind::OrchRecordInGraphTask));
+        EXPECT_EQ(records[i].kind, static_cast<uint32_t>(HostPhaseKind::OrchRecordSubTask));
     }
 }
 
@@ -116,7 +116,7 @@ TEST(HostPhaseRecords, ConcurrentProducersLoseNothingAndDoNotOverlapSlots) {
             while (!go.load(std::memory_order_acquire)) {}
             // Disjoint start_ns ranges, so a lost or duplicated record is visible
             // as a hole or a repeat rather than needing per-thread bookkeeping.
-            record_n(pool, HostPhaseKind::OrchRecordInGraphTask, kPerThread, /*first_start=*/1 + t * kPerThread, t);
+            record_n(pool, HostPhaseKind::OrchRecordSubTask, kPerThread, /*first_start=*/1 + t * kPerThread, t);
         });
     }
     go.store(true, std::memory_order_release);
@@ -144,7 +144,7 @@ TEST(HostPhaseRecords, OverflowDropsAndCountsWithoutLosingEarlierRecords) {
 
     const uint32_t capacity = static_cast<uint32_t>(HostPhaseRecordStore::capacity());
     const uint32_t overshoot = 25;
-    record_n(pool, HostPhaseKind::OrchRecordInGraphTask, capacity + overshoot, /*first_start=*/1);
+    record_n(pool, HostPhaseKind::OrchRecordSubTask, capacity + overshoot, /*first_start=*/1);
     store.finish(0, /*invocation_id=*/9);
 
     const auto records = store.records();
@@ -174,7 +174,7 @@ TEST(HostPhaseRecords, AStoreReusingAnAddressDoesNotInheritACachedLane) {
     new (at_address) HostPhaseRecordStore();
     HostPhaseRecordPool *pool = at_address->arm(true);
     ASSERT_NE(pool, nullptr);
-    record_n(pool, HostPhaseKind::OrchRecordInGraphTask, 100, /*first_start=*/1);
+    record_n(pool, HostPhaseKind::OrchRecordSubTask, 100, /*first_start=*/1);
     at_address->finish(0, /*invocation_id=*/9);
     ASSERT_EQ(at_address->records().size(), 100u);
     at_address->~HostPhaseRecordStore();
@@ -183,7 +183,7 @@ TEST(HostPhaseRecords, AStoreReusingAnAddressDoesNotInheritACachedLane) {
     new (at_address) HostPhaseRecordStore();
     pool = at_address->arm(true);
     ASSERT_NE(pool, nullptr);
-    record_n(pool, HostPhaseKind::OrchRecordInGraphTask, 100, /*first_start=*/1000);
+    record_n(pool, HostPhaseKind::OrchRecordSubTask, 100, /*first_start=*/1000);
     at_address->finish(0, /*invocation_id=*/9);
 
     const auto records = at_address->records();
@@ -199,7 +199,7 @@ TEST(HostPhaseRecords, ReArmClearsThePreviousPass) {
     HostPhaseRecordStore store;
     HostPhaseRecordPool *pool = store.arm(true);
     ASSERT_NE(pool, nullptr);
-    record_n(pool, HostPhaseKind::OrchRecordInGraphTask, 50);
+    record_n(pool, HostPhaseKind::OrchRecordSubTask, 50);
     store.finish(7, /*invocation_id=*/9);
     EXPECT_EQ(store.records().size(), 50u);
     EXPECT_EQ(store.submitted_tasks(), 7u);
@@ -219,7 +219,7 @@ TEST(HostPhaseRecords, ProducerThreadIdSurvivesTheArtifactStore) {
     HostPhaseRecordPool *pool = store.arm(true);
     ASSERT_NE(pool, nullptr);
 
-    record_n(pool, HostPhaseKind::OrchRecordInGraphTask, 1, /*first_start=*/10, /*thread_id=*/101);
+    record_n(pool, HostPhaseKind::OrchRecordSubTask, 1, /*first_start=*/10, /*thread_id=*/101);
     record_n(pool, HostPhaseKind::OrchGraphSubmit, 1, /*first_start=*/20, /*thread_id=*/202);
     store.finish(1, /*invocation_id=*/9);
 
@@ -238,7 +238,7 @@ TEST(HostPhaseRecords, SubmitProjectionKeepsOnlyTaskSubmittingKinds) {
     // pass's total_tasks, and the sub-operations do not count.
     record_n(pool, HostPhaseKind::OrchSubmitTask, 5);
     record_n(pool, HostPhaseKind::OrchAllocTensors, 2);
-    record_n(pool, HostPhaseKind::OrchRecordInGraphTask, 277);
+    record_n(pool, HostPhaseKind::OrchRecordSubTask, 277);
     record_n(pool, HostPhaseKind::OrchGraphSubmit, 40);
     record_n(pool, HostPhaseKind::OrchBuildDefinition, 1);
     record_n(pool, HostPhaseKind::BindHostOrch, 1);
@@ -274,7 +274,7 @@ TEST(HostPhaseRecords, APassIsWrittenAtMostOnceAndTheNextPassAppends) {
     HostPhaseRecordStore store;
     HostPhaseRecordPool *pool = store.arm(true);
     ASSERT_NE(pool, nullptr);
-    record_n(pool, HostPhaseKind::OrchRecordInGraphTask, 4);
+    record_n(pool, HostPhaseKind::OrchRecordSubTask, 4);
     store.finish(4, /*invocation_id=*/11);
 
     EXPECT_EQ(store.write_records_jsonl(path), 0);

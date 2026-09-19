@@ -560,7 +560,7 @@ static_assert(sizeof(ChipSwimlaneAicpuOrchPhaseRecord) == 32, "ChipSwimlaneAicpu
  *
  * `payload` is kind-discriminated: a task id for the kinds that submit a task
  * (see host_phase_kind_submits_task), otherwise a per-kind detail count such as
- * a byte or in-graph task count. Readers must consult `kind` before interpreting it.
+ * a byte or sub-task count. Readers must consult `kind` before interpreting it.
  */
 struct HostPhaseRecord {
     uint64_t start_ns;
@@ -642,8 +642,8 @@ inline const char *host_phase_kind_name(HostPhaseKind kind) {
         return "submit_task";
     case HostPhaseKind::OrchAllocTensors:
         return "alloc_tensors";
-    case HostPhaseKind::OrchRecordInGraphTask:
-        return "record_in_graph_task";
+    case HostPhaseKind::OrchRecordSubTask:
+        return "record_sub_task";
     case HostPhaseKind::OrchGraphSubmit:
         return "graph_submit";
     case HostPhaseKind::OrchBuildDefinition:

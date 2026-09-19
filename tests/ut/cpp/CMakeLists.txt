@@ -104,6 +104,9 @@ target_include_directories(a2a3_rt_objs PUBLIC
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
     ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
     ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+    # Mirrors this runtime's own include path: platform headers reach its task_id.h
+    # by bare name, so the runtime being built has to be on the path.
+    ${CMAKE_SOURCE_DIR}/../../../src/common/tensormap_and_ringbuffer
     ${CMAKE_SOURCE_DIR}/../../../src/common
 )
 
@@ -345,6 +348,9 @@ target_include_directories(a5_rt_objs PUBLIC
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
     ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
     ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+    # Mirrors this runtime's own include path: platform headers reach its task_id.h
+    # by bare name, so the runtime being built has to be on the path.
+    ${CMAKE_SOURCE_DIR}/../../../src/common/tensormap_and_ringbuffer
     ${CMAKE_SOURCE_DIR}/../../../src/common
 )
 
@@ -437,7 +443,7 @@ foreach(runtime tensormap_and_ringbuffer host_build_graph)
         ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
         ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
         ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
-        ${CMAKE_SOURCE_DIR}/../../../src/common/host_build_graph
+        ${CMAKE_SOURCE_DIR}/../../../src/common/${runtime}
         ${CMAKE_SOURCE_DIR}/../../../src/common
     )
     target_link_libraries(${retirement_test} PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
@@ -598,32 +604,41 @@ set_tests_properties(test_execution_mode_latch PROPERTIES LABELS "no_hardware")
 # Carries both real sides of the swimlane path: the host collector and the AICPU
 # producer module, so a test can drive init -> complete_task -> flush and read
 # the result back through the production host copy.
-add_executable(test_chip_swimlane_collector
-    common/test_chip_swimlane_collector.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/chip_swimlane_collector.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/chip_swimlane_collector_aicpu.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/device_run_result_base_aicpu.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/sim/aicpu/inner_platform_regs.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/clock_correlation.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/sim/host/profiling_copy.cpp
-    ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
-)
-target_compile_definitions(test_chip_swimlane_collector PRIVATE SIMPLER_RUNTIME_NAME="test_runtime")
-target_include_directories(test_chip_swimlane_collector PRIVATE
-    ${GTEST_INCLUDE_DIRS}
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/aicpu
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
-    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
-    ${CMAKE_SOURCE_DIR}/../../../src/common
-)
-target_link_libraries(test_chip_swimlane_collector PRIVATE
-    ${GTEST_MAIN_LIB}
-    ${GTEST_LIB}
-    pthread
-)
-add_test(NAME test_chip_swimlane_collector COMMAND test_chip_swimlane_collector)
-set_tests_properties(test_chip_swimlane_collector PROPERTIES LABELS "no_hardware")
+#
+# Once per runtime: platform sources have no build of their own -- they compile into
+# each runtime's image, which is why their headers reach task_id.h by bare name. A
+# platform-level test therefore has to run under every runtime it ships in, not under
+# one picked for it.
+foreach(runtime tensormap_and_ringbuffer host_build_graph)
+    set(collector_test test_chip_swimlane_collector_${runtime})
+    add_executable(${collector_test}
+        common/test_chip_swimlane_collector.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/chip_swimlane_collector.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/chip_swimlane_collector_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/device_run_result_base_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/sim/aicpu/inner_platform_regs.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/clock_correlation.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/sim/host/profiling_copy.cpp
+        ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
+    )
+    target_compile_definitions(${collector_test} PRIVATE SIMPLER_RUNTIME_NAME="${runtime}")
+    target_include_directories(${collector_test} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/aicpu
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/${runtime}
+        ${CMAKE_SOURCE_DIR}/../../../src/common
+    )
+    target_link_libraries(${collector_test} PRIVATE
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        pthread
+    )
+    add_test(NAME ${collector_test} COMMAND ${collector_test})
+    set_tests_properties(${collector_test} PROPERTIES LABELS "no_hardware")
+endforeach()
 
 # Sim kernel threads publish one sticky completion state. A gated unit test
 # proves submission and completion are separate without relying on kernel
@@ -949,42 +964,54 @@ target_link_libraries(test_scope_stats_collector PRIVATE
 add_test(NAME test_scope_stats_collector COMMAND test_scope_stats_collector)
 set_tests_properties(test_scope_stats_collector PROPERTIES LABELS "no_hardware")
 
-add_executable(test_host_phase_records
-    common/test_host_phase_records.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/host_phase_records.cpp
-    ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
-)
-target_include_directories(test_host_phase_records PRIVATE
-    ${GTEST_INCLUDE_DIRS}
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
-    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
-    ${CMAKE_SOURCE_DIR}/../../../src/common
-)
-target_link_libraries(test_host_phase_records PRIVATE
-    ${GTEST_MAIN_LIB}
-    ${GTEST_LIB}
-    pthread
-)
-add_test(NAME test_host_phase_records COMMAND test_host_phase_records)
-set_tests_properties(test_host_phase_records PROPERTIES LABELS "no_hardware")
+# Once per runtime, for the reason the collector test gives: a platform source ships
+# inside every runtime's image, so it is tested under each.
+foreach(runtime tensormap_and_ringbuffer host_build_graph)
+    set(phase_records_test test_host_phase_records_${runtime})
+    add_executable(${phase_records_test}
+        common/test_host_phase_records.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/host_phase_records.cpp
+        ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
+    )
+    target_include_directories(${phase_records_test} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/${runtime}
+        ${CMAKE_SOURCE_DIR}/../../../src/common
+    )
+    target_link_libraries(${phase_records_test} PRIVATE
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        pthread
+    )
+    add_test(NAME ${phase_records_test} COMMAND ${phase_records_test})
+    set_tests_properties(${phase_records_test} PROPERTIES LABELS "no_hardware")
+endforeach()
 
-add_executable(test_chip_swimlane_aicore
-    common/test_chip_swimlane_aicore.cpp
-)
-target_include_directories(test_chip_swimlane_aicore PRIVATE
-    ${GTEST_INCLUDE_DIRS}
-    ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/sim/aicore
-    ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/include
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
-)
-target_link_libraries(test_chip_swimlane_aicore PRIVATE
-    ${GTEST_MAIN_LIB}
-    ${GTEST_LIB}
-    pthread
-)
-add_test(NAME test_chip_swimlane_aicore COMMAND test_chip_swimlane_aicore)
-set_tests_properties(test_chip_swimlane_aicore PROPERTIES LABELS "no_hardware")
+# Once per runtime, for the reason the collector test above gives: a platform source
+# ships inside every runtime's image, so it is tested under each.
+foreach(runtime tensormap_and_ringbuffer host_build_graph)
+    set(aicore_test test_chip_swimlane_aicore_${runtime})
+    add_executable(${aicore_test}
+        common/test_chip_swimlane_aicore.cpp
+    )
+    target_include_directories(${aicore_test} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/sim/aicore
+        ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/${runtime}
+    )
+    target_link_libraries(${aicore_test} PRIVATE
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        pthread
+    )
+    add_test(NAME ${aicore_test} COMMAND ${aicore_test})
+    set_tests_properties(${aicore_test} PROPERTIES LABELS "no_hardware")
+endforeach()
 
 add_executable(test_async_poll_phase_accumulator
     common/test_async_poll_phase_accumulator.cpp
@@ -1313,6 +1340,9 @@ add_a2a3_hbg_runtime_test(test_hbg_bind_ledger common/test_hbg_bind_ledger.cpp
 target_compile_definitions(test_hbg_bind_ledger PRIVATE SIMPLER_PLATFORM_NAME="a2a3sim")
 
 add_a2a3_hbg_runtime_test(test_hbg_self_relative_ptr common/test_hbg_self_relative_ptr.cpp)
+# TaskId is arch-agnostic (src/common/host_build_graph/task_id.h) and header-only, so
+# one arch's include path exercises the whole handle.
+add_a2a3_hbg_runtime_test(test_hbg_task_id common/test_hbg_task_id.cpp)
 add_a2a3_hbg_runtime_test(test_hbg_sm_compaction common/test_hbg_sm_compaction.cpp)
 add_a2a3_hbg_runtime_test(test_hbg_scheduler_drain common/test_hbg_scheduler_drain.cpp)
 target_sources(test_hbg_scheduler_drain PRIVATE
@@ -1380,7 +1410,7 @@ target_sources(test_a5_hbg_ed_qualification PRIVATE
     ${HBG_ORCH_SHARED_SOURCES}
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
 )
-# Drives the real recording path to pin the in-graph early-dispatch verdicts a
+# Drives the real recording path to pin the sub-task early-dispatch verdicts a
 # Definition carries and the sorted fanin CSR row of a candidate.
 add_a2a3_hbg_runtime_test(test_hbg_graph_ed_qualification common/test_hbg_graph_ed_qualification.cpp)
 target_sources(test_hbg_graph_ed_qualification PRIVATE

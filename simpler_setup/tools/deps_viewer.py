@@ -71,6 +71,29 @@ import xml.etree.ElementTree as ET
 from collections import deque
 from pathlib import Path
 
+from .swimlane_converter import resolve_runtime, task_display_for
+
+
+def _deps_runtime(deps_path):
+    """The runtime a deps.json names, refusing a document that names none.
+
+    Which TaskId layout every id in the document carries. Read separately from
+    _load_deps_edges so the id-formatting decision does not ride on that function's
+    already-wide return tuple.
+
+    Raises:
+        ValueError: the document names no runtime, or names one this tool does not
+            decode. Both dep_gen writers state it unconditionally, so its absence
+            means a capture from before they did.
+    """
+    try:
+        with open(deps_path) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        data = None
+    runtime = data.get("runtime") if isinstance(data, dict) else None
+    return resolve_runtime(runtime, source=f"{deps_path}: runtime")
+
 
 def _normalize_task_id(v):
     """Unsigned 64-bit task id (matches deps.json edges and chip_swimlane task_id).
@@ -124,47 +147,60 @@ def _normalize_small_int(v):
 def _node_id(task_id):
     """DOT-safe node id: ``T{high}_{local}``.
 
-    The high field is a ring index under ``tensormap_and_ringbuffer`` (any ring in
-    ``0..CHIP_MAX_RING_DEPTH-1``) and an id space under ``host_build_graph``
-    (0 = GLOBAL, 1 = IN_GRAPH), so its meaning depends on which runtime wrote the
-    record. It is printed verbatim either way.
+    Undecoded on purpose, even though the document now names its runtime: a node id
+    only has to be unique and stable, which the two raw halves already are between
+    them. Decoding it would drop the bits a layout does not name (hbg's reserved
+    61:52), so two ids differing only there would collide into one node. Readable
+    labels are a separate concern; see _make_task_formatter.
     """
     tid = _normalize_task_id(task_id)
     if tid is None:
         return f"T_{task_id}"
-    ring = (tid >> 32) & 0xFF
+    high = (tid >> 32) & 0xFFFFFFFF
     local = tid & 0xFFFFFFFF
-    return f"T{ring}_{local}"
+    return f"T{high}_{local}"
 
 
-def _make_task_formatter(nodes):
+def _make_task_formatter(nodes, runtime_name):
     """Build a task-id → display-string formatter sized to the graph.
 
-    If every node has a 0 high field the display is just ``{local}`` (the local
-    counter alone — no noise on workloads that never enter a manual scope).
-    The moment any node has a nonzero one we switch to the explicit
-    ``({high}, {local})`` tuple for *every* node so the asymmetry is visible
-    instead of hidden (you can't have ``t0`` next to ``r1t3`` and know what
-    t0's high field is without context).
+    The layout comes from the runtime the document names, because nothing in a
+    task_id value says which minted it. Under ``host_build_graph`` that yields
+    ``g{parent}t{index}`` for a sub-task, ``p{index}`` for a boundary parameter and
+    ``t{local}`` for a task of the run; under ``tensormap_and_ringbuffer``,
+    ``r{ring}t{local}`` off ring 0. An unnamed or unrecognised runtime raises rather
+    than defaulting — see swimlane_converter.resolve_runtime.
+
+    On a graph where every id decodes to the bare ``t{local}`` form the prefix is
+    dropped and the display is just ``{local}`` — no noise on workloads that never
+    enter a manual scope or a Graph body. The moment one node needs more, every node
+    keeps the explicit form so the asymmetry is visible instead of hidden (you can't
+    have ``0`` next to ``r1t3`` and know what 0's high field is without context).
     """
-    has_multi_ring = False
+    display = task_display_for(runtime_name)
+
+    def decorated(task_id):
+        tid = _normalize_task_id(task_id)
+        if tid is None:
+            return str(task_id)
+        return display(tid)
+
+    all_bare = True
     for n in nodes:
         tid = _normalize_task_id(n)
         if tid is None:
             continue
-        if (tid >> 32) & 0xFF != 0:
-            has_multi_ring = True
+        if decorated(tid) != f"t{tid & 0xFFFFFFFF}":
+            all_bare = False
             break
 
     def fmt(task_id):
         tid = _normalize_task_id(task_id)
         if tid is None:
             return str(task_id)
-        ring = (tid >> 32) & 0xFF
-        local = tid & 0xFFFFFFFF
-        if has_multi_ring:
-            return f"({ring}, {local})"
-        return str(local)
+        if all_bare:
+            return str(tid & 0xFFFFFFFF)
+        return decorated(tid)
 
     return fmt
 
@@ -1038,7 +1074,7 @@ def _plain_node_attrs(task_id, meta, task_table, fmt_task, marker="", fanin=None
     return f'{label_attr}, shape={style["shape"]}, style="{style_attr}", fillcolor="{style["fillcolor"]}"{extra}'
 
 
-def emit_text(edges, nodes, meta, deps_path, annotations=None, tensor_table=None, task_table=None):
+def emit_text(edges, nodes, meta, deps_path, annotations=None, tensor_table=None, task_table=None, runtime_name=None):
     """Render deps.json as grep-friendly plain text.
 
     Output shape:
@@ -1050,7 +1086,7 @@ def emit_text(edges, nodes, meta, deps_path, annotations=None, tensor_table=None
     tensor_table = tensor_table or {}
     task_table = task_table or {}
     sorted_nodes = sorted(nodes, key=_sort_task_id_key)
-    fmt_task = _make_task_formatter(sorted_nodes)
+    fmt_task = _make_task_formatter(sorted_nodes, runtime_name)
     have_perf = bool(meta)
     have_func_name_map = any(entry.get("func_name") for entry in meta.values())
 
@@ -1149,6 +1185,7 @@ def emit_dot(
     task_table=None,
     show_tensor_info=None,
     hidden_edges=None,
+    runtime_name=None,
 ):
     """Graphviz DOT source. Used internally to feed the layout engine before
     wrapping the SVG in HTML.
@@ -1164,7 +1201,7 @@ def emit_dot(
        producer's ``out_<arg_idx>`` port whenever the producer slot's
        tensor_id matches the edge's tensor_id.
     """
-    fmt_task = _make_task_formatter(nodes)
+    fmt_task = _make_task_formatter(nodes, runtime_name)
     annotations = annotations or {}
     tensor_table = tensor_table or {}
     task_table = task_table or {}
@@ -1265,11 +1302,11 @@ def _spmd_badges_json(nodes, task_table):
     return json.dumps(badges, sort_keys=True, separators=(",", ":"))
 
 
-def _dep_stats_json(nodes, edges, meta, task_table):
+def _dep_stats_json(nodes, edges, meta, task_table, runtime_name=None):
     """Per-node fanin/fanout totals plus name_hint histograms for the HTML panel."""
     task_table = task_table or {}
     meta = meta or {}
-    fmt_task = _make_task_formatter(nodes)
+    fmt_task = _make_task_formatter(nodes, runtime_name)
     pred_map, succ_map = _fan_maps(edges, nodes)
     stats = {}
     for tid in nodes:
@@ -1669,7 +1706,7 @@ def _layer_svg_edges(svg_text):
     return ET.tostring(root, encoding="unicode")
 
 
-def emit_html(
+def emit_html(  # noqa: PLR0913
     edges,
     nodes,
     meta,
@@ -1680,6 +1717,7 @@ def emit_html(
     task_table=None,
     show_tensor_info=None,
     html_edge_style=None,
+    runtime_name=None,
 ):
     """Build the pan/zoom HTML page: DOT → Graphviz SVG → inline into template."""
     html_edge_style = html_edge_style or {}
@@ -1697,6 +1735,7 @@ def emit_html(
         task_table=task_table,
         show_tensor_info=show_tensor_info,
         hidden_edges=hidden_edges,
+        runtime_name=runtime_name,
     )
     svg_bytes = render_svg(dot, engine=engine)
     svg_text = svg_bytes.decode("utf-8", errors="replace")
@@ -1708,7 +1747,7 @@ def emit_html(
         n_edges=visible_edge_count,
         svg_body=svg_text,
         spmd_badges_json=_spmd_badges_json(nodes, task_table),
-        dep_stats_json=_dep_stats_json(nodes, edges, meta, task_table),
+        dep_stats_json=_dep_stats_json(nodes, edges, meta, task_table, runtime_name),
     )
 
 
@@ -1830,7 +1869,7 @@ def _validate_args(args, argv):
     return 0
 
 
-def _apply_edge_mode(edge_mode, output_format, edges, nodes, annotations, tensor_table, task_table):
+def _apply_edge_mode(edge_mode, output_format, edges, nodes, annotations, tensor_table, task_table, runtime_name=None):
     """Select rendered edges and HTML visibility metadata for one mode."""
     hidden_html_edges = set()
     visible_html_edge_count = len(edges)
@@ -1850,7 +1889,7 @@ def _apply_edge_mode(edge_mode, output_format, edges, nodes, annotations, tensor
         )
         return edges, annotations, "deps_viewer", hidden_html_edges, visible_html_edge_count
 
-    fmt_task = _make_task_formatter(nodes)
+    fmt_task = _make_task_formatter(nodes, runtime_name)
     is_reduced = edge_mode.startswith("reduced")
     shown = kept if is_reduced else removed
     if is_reduced:
@@ -1896,6 +1935,9 @@ def main(argv=None):
         return 1
 
     edges, nodes, annotations, tensor_table, task_table = _load_deps_edges(input_path)
+    # Which TaskId layout every id in this document carries. Read once here and
+    # threaded down, because nothing in a task_id value says which runtime minted it.
+    runtime_name = _deps_runtime(input_path)
     func_names = _load_func_names_json(args.func_names) if args.func_names else _autoload_name_map(input_path)
     meta = _load_task_meta(input_path, func_names=func_names)
     meta = _merge_task_meta_with_kernel_ids(meta, task_table, func_names=func_names)
@@ -1910,6 +1952,7 @@ def main(argv=None):
         annotations,
         tensor_table,
         task_table,
+        runtime_name=runtime_name,
     )
 
     out = (
@@ -1926,6 +1969,7 @@ def main(argv=None):
             annotations=annotations,
             tensor_table=tensor_table,
             task_table=task_table,
+            runtime_name=runtime_name,
         )
         out.write_text(text)
         annotated_edges = sum(len(rows) for rows in annotations.values())
@@ -1950,6 +1994,7 @@ def main(argv=None):
             "hidden_edges": hidden_html_edges,
             "visible_edge_count": visible_html_edge_count,
         },
+        runtime_name=runtime_name,
     )
     out.write_text(html)
     if hidden_html_edges:

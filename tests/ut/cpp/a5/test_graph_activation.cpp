@@ -11,7 +11,7 @@
 /**
  * Deterministic tests for incremental graph activation.
  *
- * Under incremental activation an in-graph task may reach the ready queue before the
+ * Under incremental activation a sub-task may reach the ready queue before the
  * whole GRAPH task is materialized, so a producer can complete while a later
  * consumer is still being registered. Scene tests hit that interleaving only
  * probabilistically; these host-side tests force it, exercising the exact path
@@ -56,15 +56,14 @@ protected:
         sm_arena.release();
     }
 
-    // One in-graph task whose slot is a routable single-block KERNEL/AIC
+    // One sub-task whose slot is a routable single-block KERNEL/AIC
     // task in the given completion state, with its payload wired the way
     // materialization leaves it for the wake/route path.
-    static void init_in_graph_task(
-        ChipTaskStorage &task, std::atomic<ChipTaskState> *states, int32_t task_index, ChipTaskState state
-    ) {
+    static void
+    init_sub_task(ChipTaskStorage &task, std::atomic<ChipTaskState> *states, int32_t task_index, ChipTaskState state) {
         memset(&task, 0, sizeof(ChipTaskStorage));
         states[task_index].store(state);
-        task.slot.in_graph_local_id = task_index;
+        task.slot.sub_task_local_id = task_index;
         task.slot.active_mask = ActiveMask(SUBTASK_MASK_AIC);
         task.slot.task_kind = TaskKind::KERNEL;
         task.slot.total_required_subtasks = 1;
@@ -78,9 +77,9 @@ protected:
 TEST_F(GraphActivationTest, WakeRoutesConsumerWhenProducerCompletedBeforeRegister) {
     auto tasks = std::make_unique<ChipTaskStorage[]>(2);
     auto states = std::make_unique<std::atomic<ChipTaskState>[]>(2);
-    init_in_graph_task(tasks[0], states.get(), 0, CHIP_TASK_COMPLETED);  // producer, already completed
-    init_in_graph_task(tasks[1], states.get(), 1, CHIP_TASK_PENDING);    // consumer of task 0
-    tasks[0].slot.wake_list_head.store(WAKE_LIST_SENTINEL);              // its wake list already drained
+    init_sub_task(tasks[0], states.get(), 0, CHIP_TASK_COMPLETED);  // producer, already completed
+    init_sub_task(tasks[1], states.get(), 1, CHIP_TASK_PENDING);    // consumer of task 0
+    tasks[0].slot.wake_list_head.store(WAKE_LIST_SENTINEL);         // its wake list already drained
 
     std::vector<int32_t> fanin_offsets{0, 0, 1};  // task 0 is a root; task 1 <- {0}
     std::vector<uint16_t> fanin_indices{0};
@@ -98,16 +97,16 @@ TEST_F(GraphActivationTest, WakeRoutesConsumerWhenProducerCompletedBeforeRegiste
     EXPECT_EQ(out[0], &tasks[1].slot);
 }
 
-// graph_incremental_publish routes an in-graph task whose producers are all COMPLETED at
+// graph_incremental_publish routes a sub-task whose producers are all COMPLETED at
 // publish time, and wake-chains one with a still-pending producer so it
 // routes exactly once that producer completes and drains its wake list.
 TEST_F(GraphActivationTest, IncrementalPublishRoutesCompletedDepsAndWakeChainsPending) {
     auto tasks = std::make_unique<ChipTaskStorage[]>(4);
     auto states = std::make_unique<std::atomic<ChipTaskState>[]>(4);
-    init_in_graph_task(tasks[0], states.get(), 0, CHIP_TASK_COMPLETED);  // root, completed
-    init_in_graph_task(tasks[1], states.get(), 1, CHIP_TASK_PENDING);    // root, pending
-    init_in_graph_task(tasks[2], states.get(), 2, CHIP_TASK_PENDING);    // consumer of task 0 (completed)
-    init_in_graph_task(tasks[3], states.get(), 3, CHIP_TASK_PENDING);    // consumer of task 1 (pending)
+    init_sub_task(tasks[0], states.get(), 0, CHIP_TASK_COMPLETED);  // root, completed
+    init_sub_task(tasks[1], states.get(), 1, CHIP_TASK_PENDING);    // root, pending
+    init_sub_task(tasks[2], states.get(), 2, CHIP_TASK_PENDING);    // consumer of task 0 (completed)
+    init_sub_task(tasks[3], states.get(), 3, CHIP_TASK_PENDING);    // consumer of task 1 (pending)
 
     std::vector<int32_t> fanin_offsets{0, 0, 0, 1, 2};  // task 2 <- {0}, task 3 <- {1}
     std::vector<uint16_t> fanin_indices{0, 1};
@@ -132,7 +131,7 @@ TEST_F(GraphActivationTest, IncrementalPublishRoutesCompletedDepsAndWakeChainsPe
     EXPECT_EQ(out[0], &tasks[3].slot);
 }
 
-// Incremental activation dispatches an in-graph task before the graph reaches ACTIVE, so
+// Incremental activation dispatches a sub-task before the graph reaches ACTIVE, so
 // complete_task must accept such a completion while the graph is MATERIALIZING or
 // PREPARED, and reject it only for SUBMITTED (not yet bound) or COMPLETED
 // (already retired).
@@ -142,7 +141,7 @@ TEST_F(GraphActivationTest, CompleteTaskAcceptsCompletionBeforeActive) {
         auto task = std::make_unique<ChipTaskStorage[]>(1);
         auto states = std::make_unique<std::atomic<ChipTaskState>[]>(1);
         memset(task.get(), 0, sizeof(ChipTaskStorage));
-        task[0].slot.in_graph_local_id = 0;
+        task[0].slot.sub_task_local_id = 0;
         task[0].slot.total_required_subtasks = 1;
 
         GraphExecution exec{};

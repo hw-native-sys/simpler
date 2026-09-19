@@ -100,7 +100,7 @@ public:
             for (int32_t j = 0; j < FANIN_PER_TASK; ++j) {
                 entry.payload.fanin_data()[j] = static_cast<int32_t>(0x50 + i * 0x10 + j);
             }
-            entry.slot.in_graph_local_id = static_cast<int32_t>(200 + i);
+            entry.slot.sub_task_local_id = static_cast<int32_t>(200 + i);
             task_states()[i].store(i & 1 ? CHIP_TASK_COMPLETED : CHIP_TASK_PENDING, std::memory_order_relaxed);
         }
         // A slot past the submitted prefix, to prove it does not travel.
@@ -220,7 +220,7 @@ TEST(HbgSmCompaction, CarriesEveryLiveSlotsContent) {
         EXPECT_EQ(entry.task.task_id.local_id(), static_cast<int32_t>(i)) << "slot " << i;
         EXPECT_EQ(entry.payload.tensor_count, TENSORS_PER_TASK) << "slot " << i;
         EXPECT_EQ(entry.payload.tensor_data()[0].buffer.addr, 0x1000 + i * 0x10) << "slot " << i;
-        EXPECT_EQ(entry.slot.in_graph_local_id, static_cast<int32_t>(200 + i)) << "slot " << i;
+        EXPECT_EQ(entry.slot.sub_task_local_id, static_cast<int32_t>(200 + i)) << "slot " << i;
         const ChipTaskState expected_state = i & 1 ? CHIP_TASK_COMPLETED : CHIP_TASK_PENDING;
         EXPECT_EQ(compacted.task_states()[i].load(std::memory_order_relaxed), expected_state) << "slot " << i;
     }
@@ -409,8 +409,9 @@ TEST(HbgSmCompaction, LayoutStaysWithinDeltaReach) {
     EXPECT_GT(sm_layout::segment_offsets(window).end, REACH);
 }
 
-// A task id indexes its slot directly, so no capacity is masked and a bind may pass
-// any positive runtime_env.ring_task_window through. The layout walk therefore has to
+// A task id indexes its slot directly, so no slot lookup masks the capacity and a
+// bind may pass any runtime_env.ring_task_window through un-rounded, up to the
+// TaskId::GLOBAL_TASK_MAX_NUM ceiling. The layout walk therefore has to
 // hold for a slot count that is not a power of two: every segment stays
 // CHIP_ALIGN_SIZE-aligned, and each one leaves room for its own array at that pitch.
 TEST(HbgSmCompaction, SegmentLayoutHoldsForANonPowerOfTwoCapacity) {

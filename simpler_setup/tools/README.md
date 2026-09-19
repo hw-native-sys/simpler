@@ -710,7 +710,7 @@ the WAIT subgraph:
   fold, `d > BL` window misses kept) at each requested window size.
 
 The report includes per-BL removal counts, `WAIT|RETAIN → RETAIN` demotions
-vs pure WAIT drops, window and cross-ring misses, and the producer→consumer
+vs pure WAIT drops, window and cross-scope misses, and the producer→consumer
 submission-distance CDF. `DepGenRecord` does not preserve explicit
 dependency kinds yet (#1827), so removal counts are accurate while the report
 marks affected demote-vs-drop classifications as uncertain.
@@ -748,9 +748,12 @@ BL, the graph has far-apart producer/consumer pairs that only a wider
 window could cover.
 
 A low `removed / upper_bound` ratio is **not** on its own a case for widening:
-check `cross_ring_misses` first. Qwen3-14B decode removes 1 of 40 redundant
+check `cross_scope_misses` first. Qwen3-14B decode removes 1 of 40 redundant
 edges at BL=64 and the same 1 at BL=256, because 39 of its misses are
-cross-ring long edges that no window in this range reaches. Only
+cross-scope long edges that no window in this range reaches. A scope is the
+boundary the bitmap cannot see across — a ring under
+`tensormap_and_ringbuffer`, a modular task's body under `host_build_graph`,
+picked from the `runtime` the capture names. Only
 `pct_pairs_within_window` being the binding constraint argues for a wider BL —
 see the [investigation entry](../../docs/investigations/2026-09-wait-reduction-bitmap-window-sizing.md)
 for the BL=64/128/256 comparison and why BL=64 is the shipped choice.
@@ -766,13 +769,17 @@ The analysis tools share the same input format - the `chip_swimlane_records_*.js
 ```json
 {
   "chip_swimlane_level": 4,
+  "metadata": {
+    "runtime": "host_build_graph",
+    "clock_freq_hz": 50000000
+  },
   "tasks": [
     {
       "task_id": 0,
       "func_id": 0,
       "core_id": 7,
       "core_type": "aiv",
-      "ring_id": 0,
+      "id_space": 0,
       "start_time_us": 47.46,
       "end_time_us": 55.9,
       "duration_us": 8.44,
@@ -780,11 +787,12 @@ The analysis tools share the same input format - the `chip_swimlane_records_*.js
       "finish_time_us": 60.52
     },
     {
-      "task_id": 4294967296,
+      "task_id": 4611686031312289792,
       "func_id": 1,
       "core_id": 7,
       "core_type": "aiv",
-      "ring_id": 1,
+      "id_space": 1,
+      "parent_task_id": 3,
       "start_time_us": 68.68,
       "end_time_us": 70.42,
       "duration_us": 1.74,
@@ -794,6 +802,16 @@ The analysis tools share the same input format - the `chip_swimlane_records_*.js
   ]
 }
 ```
+
+`metadata.runtime` picks how `task_id` is decoded, because a task id carries whichever
+`TaskId` layout its runtime uses and nothing in the value says which:
+
+| runtime | layout | id fields on a task row |
+| ------- | ------ | ----------------------- |
+| `host_build_graph` | id space in bits 63:62 (0 = GLOBAL, 1 = SUB_TASK, 2 = PARAM), a sub-task's parent modular task in bits 51:32, local id in the low 32 | `id_space`, plus `parent_task_id` for a sub-task |
+| `tensormap_and_ringbuffer` | ring index in bits 39:32, local id in the low 32 | `ring_id` |
+
+The second row above is a sub-task: id space 1, parent modular task 3, local index 0.
 
 Dependency edges come from `deps.json` (dep_gen replay) at post-process time —
 not from the perf JSON. See [`swimlane_converter --deps-json`](#swimlane_converter).
