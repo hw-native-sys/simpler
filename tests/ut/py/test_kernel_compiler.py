@@ -103,6 +103,42 @@ def test_direct_compiler_command_uses_checkout_relative_paths(monkeypatch, tmp_p
     assert f"-I{Path('simpler_setup') / 'incore'}" in captured["cmd"]
 
 
+@pytest.mark.parametrize("core_type", ["aic", "aiv"])
+@pytest.mark.parametrize(
+    ("platform", "expected_target", "other_target"),
+    [
+        ("a2a3sim", "-DPTO_CPU_SIM_TARGET_A2A3", "-DPTO_CPU_SIM_TARGET_A5"),
+        ("a5sim", "-DPTO_CPU_SIM_TARGET_A5", "-DPTO_CPU_SIM_TARGET_A2A3"),
+    ],
+)
+def test_sim_target_flag_matches_platform_in_command_and_cache(
+    monkeypatch, tmp_path, core_type, platform, expected_target, other_target
+):
+    from simpler_setup import kernel_compiler  # noqa: PLC0415
+    from simpler_setup.environment import PROJECT_ROOT  # noqa: PLC0415
+
+    compiler = kernel_compiler.KernelCompiler(platform)
+    source = PROJECT_ROOT / "simpler_setup" / "incore" / "pipe_sync.h"
+    captured = {}
+    monkeypatch.setattr(compiler, "_make_temp_path", lambda **_kwargs: str(tmp_path / "kernel.so"))
+    monkeypatch.setattr(kernel_compiler, "_executable_cache_identity", lambda path: {"name": path})
+
+    def capture_compile(cmd, *_args, **_kwargs):
+        captured["cmd"] = cmd
+        return b"compiled"
+
+    monkeypatch.setattr(compiler, "_compile_to_bytes", capture_compile)
+
+    assert compiler._compile_incore_sim(str(source), core_type=core_type) == b"compiled"
+    cache_flags = compiler.incore_compile_cache_token(core_type)["flags"]
+    assert isinstance(cache_flags, list)
+    command_flags = captured["cmd"][1 : 1 + len(cache_flags)]
+
+    assert command_flags == cache_flags
+    assert cache_flags.count(expected_target) == 1
+    assert other_target not in cache_flags
+
+
 def test_compiler_subprocess_runs_from_checkout_root(monkeypatch):
     from simpler_setup import kernel_compiler  # noqa: PLC0415
     from simpler_setup.environment import PROJECT_ROOT  # noqa: PLC0415
