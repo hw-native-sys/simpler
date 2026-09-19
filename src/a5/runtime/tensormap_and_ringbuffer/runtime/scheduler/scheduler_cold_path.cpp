@@ -640,6 +640,10 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx) {
     const int32_t *cores = core_trackers_[thread_idx].core_ids();
     int32_t core_num = core_trackers_[thread_idx].core_num();
     if (core_num == 0) return 0;
+    // The exit handshake dominates the span between the dispatch windows closing
+    // and graph_build returning; that span is otherwise only obtainable by
+    // differencing the surrounding markers.
+    AicpuPhaseScope shutdown_phase(AicpuPhase::Shutdown);
 
 #if SIMPLER_DFX
     // Restore PMU CTRL registers for this thread's cores before AICore shutdown
