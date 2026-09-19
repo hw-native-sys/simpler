@@ -98,5 +98,9 @@ void Runtime::clear_function_bin_addrs() {
 }
 
 // trb's device image is just the `dev` descriptor (the rest of Runtime is
-// host-only). Mirrors the host_build_graph definition (= sizeof(Runtime)).
+// host-only). A5 has no post-close gate array, so the uploaded prefix and the
+// device extent coincide; both entry points exist so the shared host paths need
+// no per-runtime branch.
 size_t runtime_device_copy_size(const Runtime &) { return sizeof(DeviceRuntimeLaunchDesc); }
+
+size_t runtime_device_extent_size(const Runtime &) { return sizeof(DeviceRuntimeLaunchDesc); }

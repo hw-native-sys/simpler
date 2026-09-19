@@ -102,7 +102,11 @@ void Runtime::clear_function_bin_addrs() {
     }
 }
 
-// host_build_graph ships the Runtime object without its host-only tail: the
-// AICPU addresses fields inside that prefix directly, and nothing past it has a
-// device reader.
+// host_build_graph uploads the device descriptor without its gate tail. No
+// host-supplied gate value is consumed on either arch: on a2a3 the AICPU zeroes
+// the active gates and executes wmb() before publishing hs_setup_done_, with no
+// register window open before that, and a5 neither reads nor initializes them.
+// The allocation still covers the tail.
 size_t runtime_device_copy_size(const Runtime &) { return Runtime::device_image_bytes(); }
+
+size_t runtime_device_extent_size(const Runtime &) { return Runtime::device_extent_bytes(); }

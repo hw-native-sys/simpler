@@ -85,26 +85,29 @@ int KernelArgsHelper::prepare_runtime_args(
     allocator_ = &allocator;
 
     // Both runtime variants publish the descriptor at offset zero. Host-only
-    // orchestration state and tensor leases remain outside this snapshot.
-    const uint64_t runtime_size = runtime_device_copy_size(host_runtime);
+    // orchestration state and tensor leases remain outside this snapshot, and so
+    // does any device-initialized tail the descriptor ends in: the block is sized
+    // to the whole descriptor because the device addresses that range inside it,
+    // while only the uploaded prefix is snapshotted and copied.
+    const uint64_t runtime_extent = runtime_device_extent_size(host_runtime);
     // The length is a property of the runtime variant, which is fixed for a
     // runner, so a committed block always fits. A mismatch would mean the
     // block belongs to a different variant than the run being prepared.
-    if (slot.runtime_args != nullptr && slot.runtime_bytes != runtime_size) {
+    if (slot.runtime_args != nullptr && slot.runtime_bytes != runtime_extent) {
         LOG_ERROR(
             "runtime_args block is %llu bytes but this run needs %llu",
-            static_cast<unsigned long long>(slot.runtime_bytes), static_cast<unsigned long long>(runtime_size)
+            static_cast<unsigned long long>(slot.runtime_bytes), static_cast<unsigned long long>(runtime_extent)
         );
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     if (slot.runtime_args == nullptr) {
-        void *runtime_dev = allocator_->alloc(runtime_size);
+        void *runtime_dev = allocator_->alloc(runtime_extent);
         if (runtime_dev == nullptr) {
             LOG_ERROR("Alloc for runtime_args failed");
             return PTO_RUNTIME_ERR_INTERNAL;
         }
         slot.runtime_args = reinterpret_cast<Runtime *>(runtime_dev);
-        slot.runtime_bytes = runtime_size;
+        slot.runtime_bytes = runtime_extent;
     }
     runtime_image_.prepare(host_runtime);
     args.runtime_args = slot.runtime_args;

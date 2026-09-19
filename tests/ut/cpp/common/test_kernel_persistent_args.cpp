@@ -69,7 +69,11 @@ struct FakeArgsOps {
         const size_t rounded = ((bytes + kBlockAlign - 1) / kBlockAlign) * kBlockAlign;
         void *block = ::aligned_alloc(kBlockAlign, rounded);
         if (block != nullptr) {
-            std::memset(block, 0, rounded);
+            // Every block starts at `fill_byte` (0 unless a test asks otherwise).
+            // A test that needs to see what a copy did NOT overwrite sets this
+            // before preparing, so the mark is already in place when the real
+            // copy runs — writing it afterwards would paint over the evidence.
+            std::memset(block, ops->fill_byte, rounded);
             ops->live.insert(block);
             ops->sizes[block] = bytes;
         }
@@ -97,7 +101,17 @@ struct FakeArgsOps {
         ++ops->copy_calls;
         ops->copies.push_back(Copy{dst, dst_bytes, src_bytes});
         if (ops->copy_calls == ops->fail_copy_on) return kInjectedRc;
-        std::memcpy(dst, src, src_bytes < dst_bytes ? src_bytes : dst_bytes);
+        size_t bytes = src_bytes < dst_bytes ? src_bytes : dst_bytes;
+        // A copy longer than its destination block is the defect this fake exists
+        // to catch, so report it rather than committing it: an unclamped memcpy
+        // would run past the allocation and make a negative control undefined
+        // instead of diagnostic.
+        const auto it = ops->sizes.find(dst);
+        if (it != ops->sizes.end() && bytes > it->second) {
+            ADD_FAILURE() << "copy of " << bytes << " bytes into a block of " << it->second;
+            bytes = it->second;
+        }
+        std::memcpy(dst, src, bytes);
         return 0;
     }
 
@@ -125,6 +139,10 @@ struct FakeArgsOps {
     int free_calls = 0;
     int copy_calls = 0;
     int fill_calls = 0;
+    // Byte every fresh block is filled with. Stands in for what the device left
+    // behind, so a test can tell "this range was not copied into" from "this
+    // range happened to be zero".
+    unsigned char fill_byte = 0;
     int fail_alloc_on = 0;
     int fail_free_on = 0;
     int fail_copy_on = 0;
@@ -503,19 +521,21 @@ TEST(PersistentKernelArgs, CopiesExactlyTheRuntimeDeviceImage) {
     ASSERT_EQ(ops.copies.size(), 2u);
 
     const size_t image_bytes = runtime_device_copy_size(runtime);
-#if defined(SIMPLER_UT_TRB_RUNTIME)
-    EXPECT_EQ(image_bytes, sizeof(DeviceRuntimeLaunchDesc));
-#else
-    EXPECT_EQ(image_bytes, Runtime::device_image_bytes());
-#endif
-    // Both runtimes ship a proper prefix: trb narrows to `dev`, hbg stops at its
-    // host-only tail. Neither copies a whole Runtime.
-    EXPECT_LT(image_bytes, sizeof(Runtime));
+    const size_t extent_bytes = runtime_device_extent_size(runtime);
+    EXPECT_EQ(extent_bytes, sizeof(DeviceRuntimeLaunchDesc));
+    // The upload is a prefix of the extent. It is shorter on a variant with a
+    // device-initialized tail and equal on one without; both descriptors this
+    // file is built against have one.
+    EXPECT_LE(image_bytes, extent_bytes);
+    EXPECT_LT(extent_bytes, sizeof(Runtime));
 
+    // The allocation covers whatever the copy does not: the device addresses the
+    // tail inside this block, so sizing it to the uploaded prefix would put those
+    // reads past its end.
+    EXPECT_EQ(ops.block_size(args.args().runtime_args), extent_bytes);
     EXPECT_EQ(ops.copies[0].src_bytes, image_bytes);
     EXPECT_EQ(ops.copies[0].dst_bytes, image_bytes);
     EXPECT_EQ(ops.copies[0].dst, args.args().runtime_args);
-    EXPECT_EQ(ops.block_size(args.args().runtime_args), image_bytes);
     EXPECT_EQ(std::memcmp(args.args().runtime_args, &runtime, image_bytes), 0);
 
     EXPECT_EQ(ops.copies[1].src_bytes, sizeof(KernelArgs));
@@ -572,6 +592,85 @@ TEST(PersistentKernelArgs, LeavesEveryDfxFieldZero) {
     EXPECT_EQ(args.finalize_once(), 0);
 }
 
+// The gate tail is device-read storage the host never uploads. Two extents, one
+// block: a copy that reached the tail would overwrite what the device put there,
+// and an allocation sized to the copy would leave the device addressing past its
+// end.
+//
+// The mark is seeded by the allocator, so it is already in the block when the
+// real copy runs. Seeding it afterwards would paint over exactly the evidence
+// this case exists to read.
+TEST(PersistentKernelArgs, LeavesTheDeviceInitializedTailUntouched) {
+    constexpr unsigned char kDeviceMark = 0x5A;
+    FakeArgsOps ops;
+    ops.fill_byte = kDeviceMark;
+    Runtime runtime;
+    PersistentKernelArgs args;
+
+    const size_t image_bytes = runtime_device_copy_size(runtime);
+    const size_t extent_bytes = runtime_device_extent_size(runtime);
+    // Both descriptors this file is built against declare the gate array, so the
+    // shortfall is a property of the type, asserted rather than skipped: a change
+    // that widened the copy back to the extent must fail here, not opt out.
+    ASSERT_EQ(extent_bytes, sizeof(DeviceRuntimeLaunchDesc));
+    ASSERT_EQ(image_bytes, offsetof(DeviceRuntimeLaunchDesc, teardown_gates))
+        << "the upload must stop before the device-initialized gate tail";
+    ASSERT_LT(image_bytes, extent_bytes);
+
+    ASSERT_EQ(args.prepare_once(runtime, ops.table(), kDeviceId), 0);
+    void *const block = args.args().runtime_args;
+    ASSERT_NE(block, nullptr);
+
+    // Bounds first: if an allocation shrank to the uploaded prefix, say so here
+    // rather than reading past the block below.
+    ASSERT_EQ(ops.block_size(block), extent_bytes) << "the allocation does not cover the device-read tail";
+    ASSERT_EQ(ops.copies[0].dst, block);
+    ASSERT_EQ(ops.copies[0].dst_bytes, image_bytes) << "the copy was offered more than the uploaded prefix";
+
+    // The mark the allocator seeded survives across the tail: the copy stopped
+    // at the prefix. The prefix itself is checked against the source elsewhere.
+    const auto *const bytes = reinterpret_cast<const unsigned char *>(block);
+    for (size_t i = image_bytes; i < extent_bytes; ++i) {
+        ASSERT_EQ(bytes[i], kDeviceMark) << "the upload reached the device-initialized tail at byte " << i;
+    }
+
+    EXPECT_EQ(args.finalize_once(), 0);
+}
+
+// Prepare-once means one allocation and one metadata copy no matter how often it
+// is called, so a second prepare cannot re-touch the tail either.
+TEST(PersistentKernelArgs, RepeatedPrepareNeitherReallocatesNorRecopies) {
+    constexpr unsigned char kDeviceMark = 0x5A;
+    FakeArgsOps ops;
+    ops.fill_byte = kDeviceMark;
+    Runtime runtime;
+    PersistentKernelArgs args;
+
+    const size_t image_bytes = runtime_device_copy_size(runtime);
+    const size_t extent_bytes = runtime_device_extent_size(runtime);
+    ASSERT_EQ(image_bytes, offsetof(DeviceRuntimeLaunchDesc, teardown_gates));
+    ASSERT_LT(image_bytes, extent_bytes);
+
+    ASSERT_EQ(args.prepare_once(runtime, ops.table(), kDeviceId), 0);
+    const int allocs_after_first = ops.alloc_calls;
+    const size_t copies_after_first = ops.copies.size();
+    void *const block = args.args().runtime_args;
+    ASSERT_NE(block, nullptr);
+
+    ASSERT_EQ(args.prepare_once(runtime, ops.table(), kDeviceId), 0);
+    EXPECT_EQ(ops.alloc_calls, allocs_after_first);
+    EXPECT_EQ(ops.copies.size(), copies_after_first);
+    EXPECT_EQ(args.args().runtime_args, block);
+
+    ASSERT_EQ(ops.block_size(block), extent_bytes);
+    const auto *const bytes = reinterpret_cast<const unsigned char *>(block);
+    for (size_t i = image_bytes; i < extent_bytes; ++i) {
+        ASSERT_EQ(bytes[i], kDeviceMark) << "a repeated prepare reached the tail at byte " << i;
+    }
+
+    EXPECT_EQ(args.finalize_once(), 0);
+}
+
 }  // namespace
 
 TEST(RuntimeLaunchImage, SnapshotIsIndependentOfLaterHostMutationAndConsumedOnce) {
@@ -584,8 +683,12 @@ TEST(RuntimeLaunchImage, SnapshotIsIndependentOfLaterHostMutationAndConsumedOnce
     EXPECT_EQ(
         image.publish([&](const void *source, size_t bytes) {
             ++copies;
-            EXPECT_EQ(bytes, sizeof(DeviceRuntimeLaunchDesc));
-            DeviceRuntimeLaunchDesc descriptor;
+            // The snapshot is the uploaded prefix, which may be shorter than the
+            // descriptor: reconstruct into a zeroed one and take only what the
+            // snapshot holds, or this reads past the source.
+            EXPECT_EQ(bytes, runtime_device_copy_size(runtime));
+            EXPECT_LE(bytes, runtime_device_extent_size(runtime));
+            DeviceRuntimeLaunchDesc descriptor{};
             std::memcpy(&descriptor, source, bytes);
             EXPECT_EQ(descriptor.worker_count, 7);
             return 0;

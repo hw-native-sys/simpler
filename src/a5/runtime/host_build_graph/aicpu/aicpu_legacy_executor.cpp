@@ -409,8 +409,11 @@ void LegacyAicpuExecutor::deinit(Runtime *runtime) {
     // 1. Invalidate AICPU cache for Runtime address range.
     //    Next round's Host DMA (rtMemcpy) writes fresh Runtime to HBM but
     //    bypasses this cache. Invalidating now ensures next round reads from HBM.
-    //    The length is the uploaded image, not sizeof(Runtime): the host-only
-    //    tail past it was never copied, so no device line holds it.
+    //    The length is the device descriptor, not sizeof(Runtime): the host-only
+    //    tail past it is never on the device at all. It deliberately spans more
+    //    than the uploaded prefix, keeping maintenance over the whole allocated
+    //    descriptor — including the gate array, which A5 declares but no A5 code
+    //    reads or writes.
     cache_invalidate_range(runtime, sizeof(runtime->dev));
 
     // Reset all SchedulerContext-owned state in one place.

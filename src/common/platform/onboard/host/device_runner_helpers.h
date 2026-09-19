@@ -68,9 +68,12 @@ int query_stream_pair_error(rtStream_t aicpu_stream, rtStream_t aicore_stream);
 /**
  * The device block one pipeline slot reuses across every run it prepares.
  *
- * Its size is fixed for the runner's lifetime — the runtime variant's
- * device-copy length — so a run rewrites its contents rather than
- * reallocating it. A slot admits at most one run at a time
+ * Its size is fixed for the runner's lifetime — the runtime variant's device
+ * extent — so a run rewrites its contents rather than reallocating it. That
+ * extent is never shorter than what a run uploads, and on a variant whose
+ * descriptor ends in device-initialized storage it is longer: that range lives
+ * inside the block but outside every copy into it. A slot admits at most one run
+ * at a time
  * (`try_reserve_native_run` rejects a second reservation on an occupied slot),
  * so one block per slot needs no further serialization. Per-slot rather than
  * per-runner because the copy is not ordered on the run stream: a prepared
@@ -86,8 +89,8 @@ int query_stream_pair_error(rtStream_t aicpu_stream, rtStream_t aicore_stream);
  * `KernelArgs`: AICore receives everything it needs as launch arguments.
  */
 struct SlotPersistentArgs {
-    Runtime *runtime_args{nullptr};  // device copy of the Runtime prefix
-    uint64_t runtime_bytes{0};       // committed length of runtime_args
+    Runtime *runtime_args{nullptr};  // device block holding the Runtime descriptor
+    uint64_t runtime_bytes{0};       // committed length: the full device extent, not the uploaded prefix
 };
 
 /**

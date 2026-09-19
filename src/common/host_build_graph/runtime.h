@@ -125,11 +125,13 @@ static_assert(std::is_standard_layout_v<Handshake> && std::is_trivially_copyable
 /**
  * DeviceRuntimeLaunchDesc - the device-copied half of Runtime, named.
  *
- * This is the ONLY part of Runtime that crosses the host->device boundary: the
- * host fills it, `device_runner_helpers.cpp` rtMemcpy's exactly
- * `sizeof(DeviceRuntimeLaunchDesc)` bytes from offset 0 of the Runtime image,
- * and the AICPU/AICore read these fields back. It is the first member of
- * Runtime (offsetof == 0), so the narrowed copy needs no offset arithmetic.
+ * This is the ONLY part of Runtime that reaches device memory: the host fills it,
+ * `device_runner_helpers.cpp` allocates `sizeof(DeviceRuntimeLaunchDesc)` bytes
+ * for it and rtMemcpy's the uploaded prefix — `runtime_device_copy_size`, which
+ * stops before the device-initialized `teardown_gates` tail — from offset 0 of
+ * the Runtime image, and the AICPU/AICore read these fields back. It is the first
+ * member of Runtime (offsetof == 0), so the narrowed copy needs no offset
+ * arithmetic.
  *
  * The boundary was already load-bearing as an offset — everything host-only
  * lives in `Runtime::HostOnlyState`, and the image ended where that member
@@ -156,13 +158,7 @@ static_assert(std::is_standard_layout_v<Handshake> && std::is_trivially_copyable
 struct alignas(64) DeviceRuntimeLaunchDesc {
     // Handshake buffers for AICPU-AICore communication
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
-    // A2/A3 post-close return gates, one isolated cache line per worker. The
-    // AICPU stores here only after that worker's register window is closed;
-    // the AICore bypass-loads its own entry and returns once it reads RELEASE.
-    // Separate from workers[] because the AICore flushes its whole Handshake
-    // line, which would overwrite a gate sharing it. Unused on A5.
-    AicoreTeardownControl teardown_gates[RUNTIME_MAX_WORKER];
-    int worker_count;  // Number of active workers
+    int worker_count;                       // Number of active workers
 
     // Execution parameters for AICPU scheduling.
     //
@@ -207,6 +203,23 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // runtime_init_data_from_layout + wire on host).
     void *prebuilt_arena_base_;
     size_t prebuilt_runtime_offset_;
+
+    // A2/A3 post-close return gates, one isolated cache line per worker. The
+    // AICPU stores here only after that worker's register window is closed;
+    // the AICore bypass-loads its own entry and returns once it reads RELEASE.
+    // Separate from workers[] because the AICore flushes its whole Handshake
+    // line, which would overwrite a gate sharing it. Unused reserved storage on
+    // A5 — a declared member that occupies layout, read and written by no A5
+    // code, and A5 runs no gate initialization.
+    //
+    // Last, and outside the uploaded prefix: on A2/A3 the AICPU zeroes every
+    // active entry in `pre_handshake_init` and executes `wmb()` before it
+    // publishes `hs_setup_done_`, and no register window opens before that
+    // publication, so the meaningful initial value is produced on the device
+    // ahead of every read of it. No host-supplied gate value is consumed on
+    // either arch. `device_image_bytes()` ends here; the allocation still covers
+    // this array.
+    AicoreTeardownControl teardown_gates[RUNTIME_MAX_WORKER];
 };
 
 static_assert(
@@ -221,6 +234,17 @@ static_assert(
     sizeof(DeviceRuntimeLaunchDesc) % 64 == 0,
     "DeviceRuntimeLaunchDesc size must be a multiple of 64 so cache_invalidate_range(sizeof(dev)) "
     "stays cache-line aligned"
+);
+static_assert(
+    offsetof(DeviceRuntimeLaunchDesc, teardown_gates) % 64 == 0,
+    "teardown_gates must start on a cache line: the AICore flushes a whole Handshake line and a gate "
+    "sharing one would be overwritten"
+);
+static_assert(
+    offsetof(DeviceRuntimeLaunchDesc, teardown_gates) + sizeof(DeviceRuntimeLaunchDesc::teardown_gates) ==
+        sizeof(DeviceRuntimeLaunchDesc),
+    "teardown_gates must end the descriptor: a field appended behind it would sit outside the uploaded "
+    "prefix and never receive its host value"
 );
 
 // =============================================================================
@@ -291,12 +315,23 @@ private:
 
 public:
     /**
-     * Bytes of this object that cross to the device: the device descriptor's
-     * size. The AICPU addresses fields inside it directly, so it is also the
-     * only length that may be cache-invalidated — reaching past it would touch
-     * bytes the host never uploaded.
+     * Bytes of this object the host uploads: the device descriptor up to, but
+     * not including, `teardown_gates`. The gates are device-initialized before
+     * any read of them, so no host value for them is consumed.
+     *
+     * This is strictly smaller than `device_extent_bytes()`. Use that one to
+     * size an allocation, and this one to size a snapshot or an H2D.
      */
     static size_t device_image_bytes();
+
+    /**
+     * Bytes of device memory the descriptor occupies, including the gate tail
+     * the host does not upload. Every allocation that backs a device `Runtime`
+     * must use this: the AICPU and AICore address `dev.teardown_gates` inside
+     * it, so an allocation sized to the uploaded prefix would place those reads
+     * past its end.
+     */
+    static size_t device_extent_bytes();
 
     /**
      * One bind's metadata. A nonzero image byte count seals the record after
@@ -424,7 +459,7 @@ public:
 #pragma GCC diagnostic ignored "-Winvalid-offsetof"
 #endif
 inline size_t Runtime::device_image_bytes() {
-    // The image is the descriptor, so its length is a type's size. The two
+    // The uploaded image is the descriptor without its gate tail. The two
     // assertions are what keep that true of the object as well: `dev` first, and
     // the host-only tail beginning no earlier than the descriptor ends. Between
     // them a member cannot start travelling, or stop, because of where it was
@@ -434,14 +469,22 @@ inline size_t Runtime::device_image_bytes() {
         offsetof(Runtime, host_) >= sizeof(DeviceRuntimeLaunchDesc),
         "the host-only tail must start at or after the end of the device image"
     );
-    return sizeof(DeviceRuntimeLaunchDesc);
+    return offsetof(DeviceRuntimeLaunchDesc, teardown_gates);
 }
+
+inline size_t Runtime::device_extent_bytes() { return sizeof(DeviceRuntimeLaunchDesc); }
 #if defined(__GNUC__)
 #pragma GCC diagnostic pop
 #endif
 
-// Number of bytes of the Runtime image that must be copied to the device. Both
-// runtimes return sizeof(DeviceRuntimeLaunchDesc) — their own, which differ in
-// content. Defined per-runtime so the shared device_runner_helpers.cpp copy path
-// stays runtime-agnostic.
+// Bytes of the Runtime image the host uploads. Defined per-runtime so the shared
+// device_runner_helpers.cpp / kernel_persistent_args.cpp paths stay
+// runtime-agnostic. host_build_graph stops before the device-initialized gate
+// tail; tensormap_and_ringbuffer answers per its own descriptor.
 size_t runtime_device_copy_size(const Runtime &rt);
+
+// Bytes of device memory a Runtime image occupies. Never smaller than
+// `runtime_device_copy_size`, and the size every allocation backing a device
+// `Runtime` must use: the device addresses fields inside the tail this exceeds
+// the uploaded prefix by.
+size_t runtime_device_extent_size(const Runtime &rt);

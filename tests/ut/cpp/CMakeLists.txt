@@ -764,11 +764,11 @@ target_include_directories(test_profiler_device_engine PRIVATE
 add_common_utils_test(test_worker_chip_orch_comm common/test_worker_chip_orch_comm.cpp)
 add_common_utils_test(test_file_marker_handshake common/test_file_marker_handshake.cpp)
 
-# Context-lifetime AICore argument owner. Built once per runtime variant
-# because the device image length it copies is a per-runtime decision
-# (runtime_device_copy_size): trb narrows to the `dev` descriptor, hbg stops at
-# its host-only tail. The injected alloc/free/copy vocabulary keeps both builds
-# free of CANN.
+# Context-lifetime AICore argument owner. Built once per runtime variant because
+# the two device lengths it uses are per-runtime decisions: it allocates
+# runtime_device_extent_size and copies runtime_device_copy_size, which differ by
+# the device-initialized gate tail. The injected alloc/free/copy vocabulary keeps
+# both builds free of CANN.
 set(KERNEL_PERSISTENT_ARGS_SRC
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/onboard/host/kernel_persistent_args.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/kernel_execution_state.cpp)

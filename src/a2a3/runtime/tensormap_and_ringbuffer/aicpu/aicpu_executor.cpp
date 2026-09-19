@@ -1031,7 +1031,9 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     // 1. Invalidate AICPU cache for the device-copied Runtime range (`dev`).
     //    Next round's Host DMA (rtMemcpy) writes fresh bytes to HBM but
     //    bypasses this cache. Invalidating now ensures next round reads from
-    //    HBM. Only `dev` is uploaded, so only `dev` needs invalidation.
+    //    HBM. `dev` is the device descriptor: it spans more than the uploaded
+    //    prefix, because the gate tail inside it is device-written and still
+    //    needs this maintenance.
     cache_invalidate_range(runtime, sizeof(runtime->dev));
 
     // Reset all SchedulerContext-owned state in one place.

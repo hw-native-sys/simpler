@@ -19,9 +19,13 @@
 #include "runtime.h"
 #include "runtime_c_api.h"
 
-// A host-owned snapshot of only the device-read descriptor for one invocation.
-// The destination is owned separately by the run's persistent slot. Publication
-// is synchronous; consuming a snapshot neither frees nor resets the destination.
+// A host-owned snapshot of only the uploaded prefix of the device descriptor for
+// one invocation. The destination is owned separately by the run's persistent
+// slot and is allocated to the full device extent, which is never shorter and on
+// some variants is longer: a descriptor may end in device-read storage the device
+// itself initializes, and no host bytes for that range are snapshotted or copied.
+// Publication is synchronous; consuming a snapshot neither frees nor resets the
+// destination.
 class RuntimeLaunchImage {
 public:
     RuntimeLaunchImage() = default;

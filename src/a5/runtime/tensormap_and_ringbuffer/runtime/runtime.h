@@ -317,10 +317,15 @@ static_assert(
     "stays cache-line aligned"
 );
 
-// Number of bytes of the Runtime image that must be copied to the device. Both
-// runtimes return sizeof(DeviceRuntimeLaunchDesc) — their own, which differ in
-// content. Defined per-runtime so the shared device_runner_helpers.cpp copy path
-// stays runtime-agnostic.
+// Bytes of the Runtime image the host uploads. Defined per-runtime so the shared
+// device_runner_helpers.cpp / kernel_persistent_args.cpp paths stay
+// runtime-agnostic. A5 trb has no post-close gate array, so this equals the
+// device extent below.
 size_t runtime_device_copy_size(const Runtime &rt);
+
+// Bytes of device memory a Runtime image occupies, and the size every allocation
+// backing a device `Runtime` must use. Never smaller than
+// `runtime_device_copy_size`; equal to it on this runtime.
+size_t runtime_device_extent_size(const Runtime &rt);
 
 #endif  // SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_
