@@ -146,10 +146,10 @@ analysis done at batch level. A controlled A/B on the **total** span is a valid
 way to measure whether the change is worth anything overall.
 
 Sub-spans are a separate tool for a separate question. `prepare_execution` covers
-at least eight operations — `ensure_device_wall_buffer`,
+at least seven operations — `ensure_device_wall_buffer`,
 `ensure_device_run_result_region`, `ensure_aicore_reg_table` twice (Ctrl and Pmu),
-`resolve_task_binary_addrs`, `prepare_orch_so`, `init_runtime_args_with_metadata`
-(the H2D in question) and `kernel_args_init_ffts_base_addr` — so a sub-span around
+`prepare_orch_so`, `init_runtime_args_with_metadata` (the H2D in question) and
+`kernel_args_init_ffts_base_addr` — so a sub-span around
 the transfer would say *where* a measured effect came from. It would not fix
 unequal load, and it is not a substitute for control.
 

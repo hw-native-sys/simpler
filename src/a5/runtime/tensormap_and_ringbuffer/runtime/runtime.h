@@ -111,18 +111,6 @@ struct Handshake {
     volatile uint32_t physical_core_id;  // Physical core ID (reported by AICore with aicore_done)
 } __attribute__((aligned(64)));
 
-/**
- * Task structure - Compatibility stub for platform layer
- *
- * RT2 uses DispatchPayload instead of Task for task dispatch.
- * This stub exists only for API compatibility with device_runner.cpp.
- * Since get_task_count() returns 0, this struct is never actually used.
- */
-struct Task {
-    int func_id;
-    uint64_t function_bin_addr;
-};
-
 // =============================================================================
 // Device launch descriptor
 // =============================================================================
@@ -295,17 +283,6 @@ public:
      * the AICore calls what it finds there.
      */
     void clear_function_bin_addrs();
-
-    // =========================================================================
-    // Deprecated API (for platform compatibility, always returns 0/nullptr)
-    // Task graph is now managed by RuntimeContext, not Runtime
-    // =========================================================================
-
-    /** @deprecated Task count is now in shared memory */
-    int get_task_count() const { return 0; }
-
-    /** @deprecated RT2 uses DispatchPayload, not Task. Always returns nullptr. */
-    Task *get_task(int) { return nullptr; }
 
     // =========================================================================
     // Host-only state (not copied to device)

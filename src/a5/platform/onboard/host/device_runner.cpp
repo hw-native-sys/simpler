@@ -357,8 +357,6 @@ int DeviceRunner::prepare_execution(
     // PMU ring tables — is built by `arm_collectors_for_run` at launch and
     // reaches the device through a refreshed KernelArgs copy.
 
-    resolve_task_binary_addrs(runtime);
-
     // a5-specific: probe the AICPU topology + compute ALLOWED_CPUS for the
     // filter-style gate (see src/common/platform/onboard/aicpu/
     // platform_aicpu_affinity.cpp::platform_aicpu_affinity_gate_filter).

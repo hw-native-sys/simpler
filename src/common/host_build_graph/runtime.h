@@ -109,18 +109,6 @@ struct Handshake {
 static_assert(sizeof(Handshake) == 64);
 static_assert(std::is_standard_layout_v<Handshake> && std::is_trivially_copyable_v<Handshake>);
 
-/**
- * Task structure - Compatibility stub for platform layer
- *
- * RT2 uses DispatchPayload instead of Task for task dispatch.
- * This stub exists only for API compatibility with device_runner.cpp.
- * Since get_task_count() returns 0, this struct is never actually used.
- */
-struct Task {
-    int func_id;
-    uint64_t function_bin_addr;
-};
-
 // =============================================================================
 // Runtime Class
 // =============================================================================
@@ -421,17 +409,6 @@ public:
     // copy_back_run_outputs_impl and released by release_run_bindings_impl.
     std::vector<TensorLease> &tensor_leases() { return host_.tensor_leases_; }
     const std::vector<TensorLease> &tensor_leases() const { return host_.tensor_leases_; }
-
-    // =========================================================================
-    // Deprecated API (for platform compatibility, always returns 0/nullptr)
-    // Task graph is now managed by RuntimeContext, not Runtime
-    // =========================================================================
-
-    /** @deprecated Task count is now in shared memory */
-    int get_task_count() const { return 0; }
-
-    /** @deprecated RT2 uses DispatchPayload, not Task. Always returns nullptr. */
-    Task *get_task(int) { return nullptr; }
 };
 
 // `dev` must be the first member so the narrowed H2D copy starts at offset 0,

@@ -1239,14 +1239,6 @@ protected:
     int resolve_block_dim();
 
     /**
-     * Rewrites each task's `function_bin_addr` from
-     * `runtime.get_function_bin_addr(func_id) +
-     * CoreCallable::binary_data_offset()`. Runs during enqueue, after the
-     * bind that populates the task table.
-     */
-    void resolve_task_binary_addrs(Runtime &runtime);
-
-    /**
      * Wait for an explicit AICPU/AICore stream pair (AICPU first) with the
      * resolved stream-sync timeout. Distinguishes the timeout sentinel
      * `ACL_ERROR_RT_STREAM_SYNC_TIMEOUT` with a stream-id and (device,

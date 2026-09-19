@@ -332,8 +332,6 @@ int DeviceRunner::prepare_execution(
     // PMU ring tables — is built by `arm_collectors_for_run` at launch and
     // reaches the device through a refreshed KernelArgs copy.
 
-    resolve_task_binary_addrs(runtime);
-
     // a2a3 onboard now uses the same host-computed, device-filtered affinity
     // shape as a5. Host probes the AICPU user pool once, chooses the active
     // cpu_ids deterministically, writes them into Runtime, and the AICPU-side

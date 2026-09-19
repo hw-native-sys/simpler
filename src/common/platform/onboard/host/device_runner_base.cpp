@@ -2447,20 +2447,6 @@ void DeviceRunnerBase::activate_launch_shape(const Runtime &runtime) {
     block_dim_ = worker_count_ / cores_per_blockdim_;
 }
 
-void DeviceRunnerBase::resolve_task_binary_addrs(Runtime &runtime) {
-    // Runtime::func_id_to_addr_[] stores a CoreCallable device address; the
-    // binary code address is one compile-time offset further in. The dispatch
-    // path then reads resolved_addr_ from the on-device CoreCallable header.
-    for (int i = 0; i < runtime.get_task_count(); i++) {
-        Task *task = runtime.get_task(i);
-        if (task != nullptr) {
-            uint64_t callable_addr = runtime.get_function_bin_addr(task->func_id);
-            task->function_bin_addr = callable_addr + CoreCallable::binary_data_offset();
-            LOG_DEBUG("Task %d (func_id=%d) -> function_bin_addr=0x%lx", i, task->func_id, task->function_bin_addr);
-        }
-    }
-}
-
 int DeviceRunnerBase::sync_stream_pair(rtStream_t aicpu_stream, rtStream_t aicore_stream) {
     LOG_INFO("=== aclrtSynchronizeStreamWithTimeout AICPU stream ===");
     int rc = aclrtSynchronizeStreamWithTimeout(aicpu_stream, timeout_config_.stream_sync_timeout_ms);
