@@ -1358,7 +1358,7 @@ protected:
      * (`ensure_aicpu_init_launched`) at device init, not carried per-run on
      * KernelArgs.
      *
-     * @return 0 on success, the underlying init_runtime_args rc on failure.
+     * @return 0 on success, the underlying prepare/publish rc on failure.
      */
     int init_runtime_args_with_metadata(Runtime &runtime, KernelArgsHelper &kernel_args, SlotPersistentArgs &slot);
 

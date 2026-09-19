@@ -156,6 +156,14 @@ working on a2a3 onboard across HBG and TRB, so the front was removed.
   per-task AICPU entry launches. Splitting those into separate loader objects
   would be a larger lifecycle refactor.
 
+In the program path, `KernelArgsHelper::prepare_runtime_args` reserves the
+slot-owned destination and snapshots only `DeviceRuntimeLaunchDesc`.
+`publish_runtime_args` then consumes that snapshot with a synchronous H2D, before
+launch. Later host mutations cannot change the prepared descriptor, and a failed
+copy withdraws this run's launch pointer without freeing the slot's destination.
+The snapshot adds one host allocation and descriptor-size CPU copy per run; it
+does not reduce device transfer bytes or establish capture/replay support.
+
 ## Method 3: Path B — `KERNEL_TYPE_AICPU_CUSTOM` (broken — #822)
 
 The path that PR #537 attempted in order to lift Path A's latch and

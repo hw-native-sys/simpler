@@ -14,8 +14,8 @@
  * the device are all observable without a device.
  *
  * Compiled once per runtime variant: the trb build defines
- * SIMPLER_UT_TRB_RUNTIME and copies only the `dev` descriptor, the hbg build
- * copies the whole Runtime.
+ * SIMPLER_UT_TRB_RUNTIME. Both builds copy only their device descriptor,
+ * leaving host-only state out of the image.
  */
 
 #include <gtest/gtest.h>
@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "kernel_persistent_args.h"
+#include "host/runtime_launch_image.h"
 #include "host/kernel_execution_state.h"
 #include "runtime_c_api.h"
 
@@ -572,3 +573,60 @@ TEST(PersistentKernelArgs, LeavesEveryDfxFieldZero) {
 }
 
 }  // namespace
+
+TEST(RuntimeLaunchImage, SnapshotIsIndependentOfLaterHostMutationAndConsumedOnce) {
+    Runtime runtime;
+    runtime.dev.worker_count = 7;
+    RuntimeLaunchImage image;
+    image.prepare(runtime);
+    runtime.dev.worker_count = 19;
+    int copies = 0;
+    EXPECT_EQ(
+        image.publish([&](const void *source, size_t bytes) {
+            ++copies;
+            EXPECT_EQ(bytes, sizeof(DeviceRuntimeLaunchDesc));
+            DeviceRuntimeLaunchDesc descriptor;
+            std::memcpy(&descriptor, source, bytes);
+            EXPECT_EQ(descriptor.worker_count, 7);
+            return 0;
+        }),
+        0
+    );
+    EXPECT_NE(
+        image.publish([&](const void *, size_t) {
+            ++copies;
+            return 0;
+        }),
+        0
+    );
+    EXPECT_EQ(copies, 1);
+}
+
+TEST(RuntimeLaunchImage, FailedPublicationConsumesSourceAndFreshPrepareReplacesIt) {
+    Runtime runtime;
+    RuntimeLaunchImage image;
+    image.prepare(runtime);
+    EXPECT_EQ(
+        image.publish([](const void *, size_t) {
+            return -91;
+        }),
+        -91
+    );
+    EXPECT_NE(
+        image.publish([](const void *, size_t) {
+            return 0;
+        }),
+        0
+    );
+    runtime.dev.worker_count = 3;
+    image.prepare(runtime);
+    EXPECT_EQ(
+        image.publish([](const void *source, size_t bytes) {
+            DeviceRuntimeLaunchDesc descriptor;
+            std::memcpy(&descriptor, source, bytes);
+            EXPECT_EQ(descriptor.worker_count, 3);
+            return 0;
+        }),
+        0
+    );
+}

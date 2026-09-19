@@ -34,6 +34,7 @@
 
 #include "common/kernel_args.h"  // arch-specific KernelArgs layout
 #include "host/memory_allocator.h"
+#include "host/runtime_launch_image.h"
 #include "runtime_c_api.h"
 #include "runtime.h"
 
@@ -113,7 +114,8 @@ struct KernelArgsHelper {
     KernelArgsHelper &operator=(const KernelArgsHelper &) = delete;
     KernelArgsHelper(KernelArgsHelper &&other) noexcept :
         args(other.args),
-        allocator_(std::exchange(other.allocator_, nullptr)) {
+        allocator_(std::exchange(other.allocator_, nullptr)),
+        runtime_image_(std::move(other.runtime_image_)) {
         other.args = KernelArgs{};
     }
     KernelArgsHelper &operator=(KernelArgsHelper &&) = delete;
@@ -121,16 +123,13 @@ struct KernelArgsHelper {
     KernelArgs args;
     MemoryAllocator *allocator_{nullptr};
 
-    /**
-     * Publish the host runtime into the slot's device copy, committing that
-     * copy on first use.
-     *
-     * @param host_runtime  Host-side runtime to copy to device.
-     * @param allocator     Memory allocator to use.
-     * @param slot          The slot's persistent device blocks.
-     * @return 0 on success, error code on failure.
-     */
-    int init_runtime_args(const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot);
+    // Reserve the slot's destination and snapshot this invocation's device-read
+    // descriptor. No bytes are published by preparation.
+    int prepare_runtime_args(const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot);
+
+    // Consume the snapshot with a synchronous metadata H2D. The slot remains
+    // owned even on failure; the run must not launch after an unsuccessful copy.
+    int publish_runtime_args();
 
     /**
      * Drop this run's view of the slot's device blocks.
@@ -138,7 +137,10 @@ struct KernelArgsHelper {
      * The blocks themselves stay committed for the next run on this slot; only
      * the per-run `KernelArgs` stops naming them.
      */
-    void release_run_view() { args.runtime_args = nullptr; }
+    void release_run_view() {
+        runtime_image_.clear();
+        args.runtime_args = nullptr;
+    }
 
     /**
      * Clear device-pointer bookkeeping without calling the allocator.
@@ -146,7 +148,7 @@ struct KernelArgsHelper {
      * Used only by fatal teardown after reset/quarantine.
      */
     void abandon_after_device_failure() {
-        args.runtime_args = nullptr;
+        release_run_view();
         allocator_ = nullptr;
     }
 
@@ -158,6 +160,9 @@ struct KernelArgsHelper {
      */
     operator KernelArgs *() { return &args; }
     KernelArgs *operator&() { return &args; }
+
+private:
+    RuntimeLaunchImage runtime_image_;
 };
 
 /**

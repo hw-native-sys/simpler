@@ -77,15 +77,14 @@ int query_stream_pair_error(rtStream_t aicpu_stream, rtStream_t aicore_stream) {
     return query_stream_error(aicore_stream, "AICore");
 }
 
-int KernelArgsHelper::init_runtime_args(
+int KernelArgsHelper::prepare_runtime_args(
     const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot
 ) {
+    release_run_view();
     allocator_ = &allocator;
 
-    // Only the device-read prefix of Runtime crosses to the device: trb copies
-    // its `dev` descriptor (offset 0), hbg copies the whole object. Both start
-    // at &host_runtime; runtime_device_copy_size() picks the right length per
-    // runtime variant so this shared path stays runtime-agnostic.
+    // Both runtime variants publish the descriptor at offset zero. Host-only
+    // orchestration state and tensor leases remain outside this snapshot.
     const uint64_t runtime_size = runtime_device_copy_size(host_runtime);
     // The length is a property of the runtime variant, which is fixed for a
     // runner, so a committed block always fits. A mismatch would mean the
@@ -106,14 +105,21 @@ int KernelArgsHelper::init_runtime_args(
         slot.runtime_args = reinterpret_cast<Runtime *>(runtime_dev);
         slot.runtime_bytes = runtime_size;
     }
+    runtime_image_.prepare(host_runtime);
     args.runtime_args = slot.runtime_args;
-    int rc = rtMemcpy(args.runtime_args, runtime_size, &host_runtime, runtime_size, RT_MEMCPY_HOST_TO_DEVICE);
-    if (rc != 0) {
-        LOG_ERROR("rtMemcpy for runtime failed: %d", rc);
-        args.runtime_args = nullptr;
-        return rc;
-    }
     return 0;
+}
+
+int KernelArgsHelper::publish_runtime_args() {
+    if (args.runtime_args == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    const int rc = runtime_image_.publish([this](const void *source, size_t bytes) {
+        return rtMemcpy(args.runtime_args, bytes, source, bytes, RT_MEMCPY_HOST_TO_DEVICE);
+    });
+    if (rc != 0) {
+        LOG_ERROR("runtime metadata publication failed: %d", rc);
+        args.runtime_args = nullptr;
+    }
+    return rc;
 }
 
 int release_slot_persistent_args(SlotPersistentArgs &slot, MemoryAllocator &allocator) {

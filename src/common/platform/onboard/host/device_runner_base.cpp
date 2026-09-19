@@ -2796,11 +2796,13 @@ void DeviceRunnerBase::read_device_wall_ns(uint32_t pipeline_slot) {
 int DeviceRunnerBase::init_runtime_args_with_metadata(
     Runtime &runtime, KernelArgsHelper &kernel_args, SlotPersistentArgs &slot
 ) {
-    int rc = kernel_args.init_runtime_args(runtime, mem_alloc_, slot);
+    int rc = kernel_args.prepare_runtime_args(runtime, mem_alloc_, slot);
     if (rc != 0) {
-        LOG_ERROR("init_runtime_args failed: %d", rc);
+        LOG_ERROR("prepare_runtime_args failed: %d", rc);
         return rc;
     }
+    rc = kernel_args.publish_runtime_args();
+    if (rc != 0) return rc;
     // Log config and device ordinal are no longer published per-run on
     // KernelArgs — they were latched once into the AICPU SO globals by
     // simpler_aicpu_init (ensure_aicpu_init_launched) at device init.

@@ -33,8 +33,8 @@ int PersistentKernelArgs::prepare_once(const Runtime &host_runtime, const Persis
     }
     ops_ = ops;
 
-    // Only the device-read prefix of Runtime crosses to the device: trb copies
-    // its `dev` descriptor (offset 0), hbg copies the whole object.
+    // Both runtimes copy only the device-read descriptor at offset zero;
+    // host-only state stays outside this allocation.
     const size_t runtime_bytes = runtime_device_copy_size(host_runtime);
     void *runtime_dev = ops_.alloc(ops_.context, runtime_bytes);
     if (runtime_dev == nullptr) {

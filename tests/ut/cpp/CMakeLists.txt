@@ -1276,6 +1276,24 @@ target_include_directories(test_hbg_kernel_persistent_args PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/onboard/host
     ${CMAKE_SOURCE_DIR}/../../../src/common/worker
 )
+# Compile the actual onboard helper/allocator without an SDK. These stubs are
+# scoped to this pair: both runtime descriptor layouts exercise the same API.
+set(KERNEL_ARGS_HELPER_TEST_SOURCES
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/onboard/host/device_runner_helpers.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/onboard/host/memory_allocator.cpp)
+add_a2a3_runtime_test(test_kernel_args_helper common/test_kernel_args_helper.cpp
+    ${KERNEL_ARGS_HELPER_TEST_SOURCES}
+    ${A2A3_RUNTIME_DIR}/shared/runtime.cpp)
+add_a2a3_hbg_runtime_test(test_hbg_kernel_args_helper common/test_kernel_args_helper.cpp
+    ${KERNEL_ARGS_HELPER_TEST_SOURCES}
+    ${HBG_SHARED_DIR}/runtime.cpp)
+foreach(target test_kernel_args_helper test_hbg_kernel_args_helper)
+    target_include_directories(${target} BEFORE PRIVATE
+        ${CMAKE_SOURCE_DIR}/stubs/kernel_args
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/onboard/host
+        ${CMAKE_SOURCE_DIR}/../../../src/common/worker)
+endforeach()
+
 add_a2a3_hbg_runtime_test(test_hbg_core_tracker common/test_hbg_core_tracker.cpp)
 # The seed test calls the real ready_queue_init_data_from_layout, so it links the
 # shared init TU (and the orchestrator/SM members that TU refers to).
