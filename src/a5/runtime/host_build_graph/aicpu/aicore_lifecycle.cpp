@@ -114,6 +114,11 @@ void AicoreLifecycle::handshake_partition(Runtime *runtime, int32_t tidx, int32_
             }
             observed[i] = true;
             --remaining;
+            // The invalidate above precedes the marker load and is not an
+            // acquire: nothing gives the payload loads an address or data
+            // dependency on that load, so they need a load-load barrier
+            // between. Once per accepted report, not per poll.
+            rmb();
             uint32_t physical_core_id = handshake->physical_core_id;
             if (physical_core_id >= physical_core_count) {
                 LOG_ERROR(
