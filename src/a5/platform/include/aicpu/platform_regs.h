@@ -120,8 +120,8 @@ void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value);
  * Initialize AICore registers after core discovery
  *
  * This function performs platform-agnostic register initialization that works
- * for both a5 and a5sim, including enabling fast path control and clearing
- * dispatch registers.
+ * for both a5 and a5sim. Writing the dispatch register to idle is what opens
+ * the core's window: there is no separate window-enable control on a5.
  *
  * @param reg_addr  Register base address of the AICore
  */

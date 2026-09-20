@@ -94,7 +94,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // Phase 2: Wait for the AICPU to open our register window. A kernel launch
     // resets DATA_MAIN_BASE to 0 (verified on a2a3 silicon; a5 shares this
     // register protocol and relies on CI); the AICPU writes DATA_MAIN_BASE =
-    // AICPU_IDLE_TASK_ID (non-zero) as it opens FAST_PATH, so a non-zero read
+    // AICPU_IDLE_TASK_ID (non-zero) to open the window, so a non-zero read
     // means the window is open and reads/writes are valid. The AICPU runs
     // assign_cores_to_threads (µs) between opening the window and the first
     // dispatch, so this IDLE is observed long before any task_id lands — the
@@ -104,7 +104,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     while (read_reg(RegId::DATA_MAIN_BASE) == 0) {
         SPIN_WAIT_HINT();
     }
-    // Report initial idle status via register (FAST_PATH is now open).
+    // Report initial idle status via register (the window is now open).
     write_reg(RegId::COND, AICORE_IDLE_VALUE);
 
     // The AICPU writes task after observing our report (so our CACHELINE_OUT flush

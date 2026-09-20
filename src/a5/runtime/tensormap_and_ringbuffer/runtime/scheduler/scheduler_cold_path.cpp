@@ -788,7 +788,7 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
     // way RegId::COND polling is.
     //
     // Servicing a core = validate its physical_core_id, then open its register
-    // window (platform_init_aicore_regs: FAST_PATH + DATA_MAIN_BASE=IDLE). That
+    // window (platform_init_aicore_regs: DATA_MAIN_BASE=IDLE). That
     // IDLE write is *also* the signal the core polls for to leave its
     // post-report wait — so opening the window IS the acknowledgement. There is
     // no separate aicpu_regs_ready ack and no second round-trip. AIC/AIV
