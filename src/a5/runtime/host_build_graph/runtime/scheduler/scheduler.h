@@ -530,6 +530,11 @@ struct SchedulerState {
     // An outer Graph is control work, never an AICore task. External dependency
     // readiness and bounded materialization progress independently and meet at
     // the submission's single atomic activation gate.
+    //
+    // graph_ready_queue is unused: a shell's readiness is acted on inline by
+    // push_ready_routed's GRAPH branch, on the completion path. Its allocation
+    // and its teardown occupancy line remain part of the arena layout and of the
+    // host-side capacity plan.
     ChipReadyQueue graph_ready_queue;
     ChipReadyQueue graph_prepare_queue;
 
@@ -587,27 +592,34 @@ struct SchedulerState {
                 return;
             }
         }
-        bool pushed;
+        // A GRAPH shell occupies no core, so its readiness is not a dispatch:
+        // what it releases is the body roots the shell staged. They ring here,
+        // on the completion path, exactly as an ordinary candidate's producer
+        // release does — one mechanism for both sides of a shell, and no queue
+        // of its own. This path is also the only one a release may take: the
+        // scheduler loop stops below the sync_start drain check while a drain is
+        // pending, and a cohort in that drain waits on cores that only these
+        // doorbells free.
         if (slot_state->task_kind == TaskKind::GRAPH) {
-            pushed = graph_ready_queue.push(slot_state);
-        } else {
-            ResourceShape shape = slot_state->active_mask.to_shape();
-            if (shape == ResourceShape::DUMMY ||
-                (slot_state->task_attrs.has_predicate() && !slot_state->to_payload().predicate.pass())) {
-                pushed = dummy_ready_queue.push(slot_state);
-            } else if (slot_state->task_attrs.requires_sync_start()) {
-                pushed = ready_sync_queues[static_cast<int32_t>(shape)].push(slot_state);
-            } else {
-                pushed = ready_queues[static_cast<int32_t>(shape)].push(slot_state);
-            }
+            (void)activate_graph_task(*slot_state);
+            return;
         }
-        // Every ready / sync / dummy / graph task routes to exactly one queue. A
-        // false push means that queue's peak concurrent occupancy exceeded its
+        ResourceShape shape = slot_state->active_mask.to_shape();
+        bool pushed;
+        if (shape == ResourceShape::DUMMY ||
+            (slot_state->task_attrs.has_predicate() && !slot_state->to_payload().predicate.pass())) {
+            pushed = dummy_ready_queue.push(slot_state);
+        } else if (slot_state->task_attrs.requires_sync_start()) {
+            pushed = ready_sync_queues[static_cast<int32_t>(shape)].push(slot_state);
+        } else {
+            pushed = ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+        }
+        // Every ready / sync / dummy task routes to exactly one queue. A false
+        // push means that queue's peak concurrent occupancy exceeded its
         // bind-time capacity — a capacity mis-sizing, not a normal condition.
         // Silently dropping the task would stall the run, so latch a named error
         // (surfaces as READY_QUEUE_OVERFLOW rather than an anonymous
-        // forward-progress timeout). The graph_ready push is checked identically
-        // so a graph task cannot be dropped either.
+        // forward-progress timeout).
         if (!pushed) {
             latch_ready_queue_overflow();
         }
@@ -843,8 +855,9 @@ struct SchedulerState {
     // AICore task — mask, blocks and all — so the shell stages those instead.
     // Each is gated exactly like any pre-staged task and rings when the ordinary
     // route reaches it: the shell's own producers complete, push_ready_routed
-    // hands the shell to graph_ready_queue, and activate_graph_task opens the
-    // external gate graph_route_ready_roots reads. So the data dependency the
+    // takes the GRAPH branch, and activate_graph_task opens the external gate
+    // graph_route_ready_roots reads — all on the completion path, in the same
+    // call an ordinary candidate's release takes. So the data dependency the
     // shell stands for is still honoured. The shell's own completion is a later
     // and unrelated event — the body retiring.
     //
@@ -1390,11 +1403,27 @@ struct SchedulerState {
         return result;
     }
 
+    // The release half of a Graph shell: called from push_ready_routed the moment
+    // the shell's producers resolve, which is the same completion-path event that
+    // releases an ordinary early-dispatch consumer.
+    //
+    // Routing reads external_ready alone (graph_route_ready_roots), so it must not
+    // be gated on the PREPARED -> ACTIVE flip: a shell can resolve while its body is
+    // still MATERIALIZING, and complete_in_graph_task already admits an in-graph
+    // completion in that state. The flip is bookkeeping owned by whichever side finds
+    // the graph PREPARED first — this call, or prepare_graph_task's trailing
+    // activate_prepared_graph — and a graph that stays PREPARED routes and retires
+    // exactly the same.
+    //
+    // Every staged root is covered: staging claims roots below published_tasks at
+    // claim time, published_tasks only grows, and route_cursor starts at 0, so the
+    // range this routes is a superset of what was staged.
     int32_t activate_graph_task(ChipTaskSlotState &outer_slot) {
         GraphExecution *execution = graph_execution_from_outer_slot(outer_slot);
         if (execution == nullptr) return 0;
         graph_execution_signal_external_ready(*execution);
-        return activate_prepared_graph(*execution);
+        (void)graph_execution_transition(*execution, GraphExecutionState::PREPARED, GraphExecutionState::ACTIVE);
+        return graph_route_ready_roots(*execution);
     }
 
     struct TaskCompletionOutcome {

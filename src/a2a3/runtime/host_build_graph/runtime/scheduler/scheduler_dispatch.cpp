@@ -1441,27 +1441,19 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             continue;
         }
 
-        // Graph control work never consumes an AICore. External dependency
-        // readiness and bounded definition materialization progress
-        // independently, then meet in GraphExecution::state.
+        // Bounded definition materialization. It consumes no AICore, and it is
+        // not a release path: a shell's roots are rung on the completion path
+        // (push_ready_routed -> activate_graph_task), and a root published after
+        // the shell's one-shot staging claim is never pre-staged, so nothing
+        // reachable from here can free a core another task waits on. That is
+        // what lets it sit behind the Phase 2 drain check — a drain holding it
+        // back costs a delay, never forward progress.
         //
-        // Keep this ahead of dummy/regular dispatch so a ready Graph can expose
-        // its root tasks without waiting for an otherwise unrelated dispatch
-        // pass. Limiting the work to one activation and one bounded prepare
-        // slice per loop prevents a large definition from monopolizing a
-        // scheduler thread.
+        // Keep it ahead of dummy/regular dispatch so a Graph body can expose its
+        // tasks without waiting for an otherwise unrelated dispatch pass. One
+        // bounded prepare slice per loop prevents a large definition from
+        // monopolizing a scheduler thread.
         if (thread_idx < active_sched_threads_) {
-            ChipTaskSlotState *graph_slot = sched_->graph_ready_queue.pop();
-            if (graph_slot != nullptr) {
-                if (graph_slot->task_kind == TaskKind::GRAPH) {
-                    (void)sched_->activate_graph_task(*graph_slot);
-                    made_progress = true;
-                } else {
-                    fail_scheduler(runtime, thread_idx, SIMPLER_ERROR_INVALID_ARGS);
-                    break;
-                }
-            }
-
             uint64_t prepare_task_id = 0;
             ChipTaskSlotState *prepare_slot = sched_->graph_prepare_queue.pop_tagged(&prepare_task_id);
             if (prepare_slot != nullptr) {

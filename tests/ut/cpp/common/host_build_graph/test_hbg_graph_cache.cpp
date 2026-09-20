@@ -942,7 +942,10 @@ TEST(GraphExecutionErrors, ReadyQueueOverflowHasTriageText) {
     EXPECT_STRNE(error_hint(SIMPLER_ERROR_READY_QUEUE_OVERFLOW), "");
 }
 
-TEST(GraphExecutionErrors, GraphReadyQueueOverflowIsReported) {
+// A shell's readiness is acted on inline, so it reaches no queue and cannot be
+// dropped by one. The queue below holds two entries and three shells arrive: a
+// routing that queued them would overflow it and latch a named error.
+TEST(GraphExecutionActivationState, ShellReadinessOpensTheGateInsteadOfQueueing) {
     SharedMemoryHeader header{};
     SchedulerState scheduler{};
     scheduler.sm_header = &header;
@@ -954,16 +957,23 @@ TEST(GraphExecutionErrors, GraphReadyQueueOverflowIsReported) {
     scheduler.graph_ready_queue.mask = 1;
     scheduler.graph_ready_queue.enqueue_pos.store(0, std::memory_order_relaxed);
     scheduler.graph_ready_queue.dequeue_pos.store(0, std::memory_order_relaxed);
+    GraphExecution executions[3]{};
     ChipTaskSlotState graph_slots[3]{};
-    for (ChipTaskSlotState &slot : graph_slots) {
-        slot.task_kind = TaskKind::GRAPH;
+    for (int32_t i = 0; i < 3; ++i) {
+        graph_slots[i].task_kind = TaskKind::GRAPH;
+        graph_slots[i].graph_context = &executions[i];
+        executions[i].outer_slot = &graph_slots[i];
     }
 
     scheduler.push_ready_routed(&graph_slots[0]);
     scheduler.push_ready_routed(&graph_slots[1]);
     scheduler.push_ready_routed(&graph_slots[2]);
 
-    EXPECT_EQ(header.sched_error_code.load(std::memory_order_acquire), SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
+    for (const GraphExecution &execution : executions) {
+        EXPECT_TRUE(graph_execution_external_ready(execution));
+    }
+    EXPECT_EQ(scheduler.graph_ready_queue.enqueue_pos.load(std::memory_order_acquire), uint64_t{0});
+    EXPECT_EQ(header.sched_error_code.load(std::memory_order_acquire), SIMPLER_ERROR_NONE);
 }
 
 TEST(GraphExecutionErrors, GraphPrepareQueueOverflowIsReported) {

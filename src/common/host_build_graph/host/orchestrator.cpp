@@ -2239,8 +2239,8 @@ bool graph_submit_outer(
     // shell sits in EARLY_DISPATCH_STAGING, so its readiness runs through
     // try_early_dispatch_release, which returns next_block_idx >= this. At zero
     // that is true for a shell's never-advanced cursor, push_ready_routed
-    // returns before graph_ready_queue, and the Graph silently never activates —
-    // visible only as SIMPLER_ERROR_SCHEDULER_TIMEOUT.
+    // returns before its TaskKind::GRAPH branch, and the Graph silently never
+    // activates — visible only as SIMPLER_ERROR_SCHEDULER_TIMEOUT.
     slot.logical_block_num = 1;
     slot.task_kind = TaskKind::GRAPH;
 

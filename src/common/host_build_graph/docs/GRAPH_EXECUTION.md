@@ -569,19 +569,29 @@ Prepared-successor pipelining can overlap preparation of run N+1 with device
 execution of run N, while Graph cache hits reduce repeated orchestration work
 inside a run.
 
-A Graph is placed in two independent control flows:
+A Graph is placed in two independent control flows, which reach the runtime by
+different routes:
 
 - `graph_prepare_queue`: materialize the saved sub-tasks even while external
-  fanin is still pending;
-- `graph_ready_queue`: signal that the outer Graph's external fanin is ready.
+  fanin is still pending. Core-owning Scheduler threads pop at most one item per
+  loop; a prepare call expands at most four sub-tasks and requeues unfinished
+  work, interleaving Graph expansion with normal scheduling.
+- external fanin readiness: acted on inline by `push_ready_routed`, on the
+  completion path, in the same call that releases an ordinary early-dispatch
+  consumer. A shell occupies no core, so its readiness is a release rather than a
+  dispatch and needs no queue of its own.
 
-Core-owning Scheduler threads pop at most one item from each queue per loop. A
-prepare call expands at most four sub-tasks and requeues unfinished work,
-interleaving Graph expansion with normal scheduling.
+Keeping release off the scheduler loop is load-bearing, not incidental. A
+`sync_start` cohort that cannot fit enters the global drain, and every Scheduler
+thread then skips the rest of its loop until the drain clears; a release path
+placed behind that check could not free the cores such a drain waits on, which
+is the deadlock recorded as #2256. The completion path runs on the resolution
+thread, which never takes part in a drain.
 
-Preparation and external readiness set two bits in one atomic activation gate.
-Whichever operation sets the second bit activates the saved root sub-tasks
-exactly once.
+Preparation and external readiness set two bits in one atomic gate. Routing the
+saved root sub-tasks reads the external bit alone and is made exactly-once by
+`route_cursor`, so whichever side observes both bits routes the roots, and a
+Graph that never leaves `PREPARED` routes and retires the same.
 
 Internal dependency readiness borrows the completion-state polling idea, but
 dependency wiring remains an Orchestrator responsibility:
@@ -617,9 +627,9 @@ different party:
   decide it. A qualified shell that its producers release early does not stage
   itself — it has nothing of its own to place — but stages the body's roots,
   each an ordinary AICore task. They ring on the ordinary route, when the
-  shell's producers complete and `activate_graph_task` opens the external gate.
-  A Graph as a *producer* is the direction not supported: a shell publishes no
-  placement of its own for a consumer to bet on.
+  shell's producers complete and `push_ready_routed` calls `activate_graph_task`
+  inline to open the external gate. A Graph as a *producer* is the direction not
+  supported: a shell publishes no placement of its own for a consumer to bet on.
 - **A root's own verdict.** Materialization, not recording, decides it, and the
   decision is three terms rather than the recorded conjunction: the shell must
   itself be a candidate, since staging a root can only ever happen on a shell
@@ -655,7 +665,8 @@ both mean the same thing they do at top level:
 - *the producer released*, i.e. `early_dispatch_state == DISPATCHED`. At top
   level that is the producer completing. For a body root it is the shell's
   producers completing, which lets `activate_graph_task` open the external gate
-  and `graph_route_ready_roots` route the root.
+  and `graph_route_ready_roots` route the root — both inline on the completion
+  path, in the same `push_ready_routed` call that handles a top-level release.
 
 A root has no producer inside the body, so the second half is the shell's
 dependency rather than its own — which is the same dependency the shell stands
