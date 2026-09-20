@@ -427,6 +427,7 @@ public:
         // The previous run's live figures are not this run's; a comparison must
         // report unknown until this run's reconcile has produced its own.
         live_counters_ = LiveTaskCounters{};
+        aicore_accounting_ = AicoreAccounting{};
         reset_collector_shards();
         publish_run_config();
     }
@@ -455,6 +456,30 @@ public:
     const std::vector<std::vector<CollectedRecord<ChipSwimlaneAicpuTaskRecord>>> &
     collected_perf_records_for_test() const {
         return perf_records_by_collector_[0];
+    }
+
+    /**
+     * This run's AICore accounting as `reconcile_aicore_counters` produced it:
+     * the device's own totals, what the host accepted, and what the host
+     * declined. Valid only after a reconcile pass for the same run.
+     */
+    struct AicoreAccountingView {
+        bool known{false};
+        bool identity_ok{false};
+        uint64_t device_total{0};
+        uint64_t device_dropped{0};
+        uint64_t host_collected{0};
+        uint64_t host_skipped{0};
+        uint64_t skipped_unwritten{0};
+        uint64_t skipped_overflow{0};
+        uint64_t skipped_bad_core{0};
+        uint64_t foreign_identity{0};
+    };
+    AicoreAccountingView aicore_accounting_for_test() const {
+        return {aicore_accounting_.known,          aicore_accounting_.identity_ok,    aicore_accounting_.device_total,
+                aicore_accounting_.device_dropped, aicore_accounting_.host_collected, aicore_accounting_.host_skipped,
+                aicore_skipped_unwritten_,         aicore_skipped_overflow_,          aicore_skipped_bad_core_,
+                aicore_foreign_identity_};
     }
 
     /**
@@ -705,12 +730,18 @@ public:
      *
      * Only the task classes are compared. Their expected index set is
      * `[0, num_aicore_)`, which the host supplies to `initialize()` and
-     * therefore knows independently of anything the device reports. The phase
-     * classes report `Unknown`: their producer counts exist only as untagged
-     * device observations in the shared header, which no per-run reset clears,
-     * so a successful read cannot distinguish this run's counts from a previous
-     * run's. Supplying an independent phase denominator needs configuration the
-     * host does not have, and is not attempted here.
+     * therefore knows independently of anything the device reports. Both have a
+     * live counterpart: `reconcile_counters` sums the AICPU pool and
+     * `reconcile_aicore_counters` the AICore one, from the same refreshed
+     * mirror. For either, the sums compared are the producers' own
+     * total/dropped — the host's accepted and declined record counts are a
+     * separate quantity, reported by reconcile and never folded into these.
+     *
+     * The phase classes report `Unknown`: their producer counts exist only as
+     * untagged device observations in the shared header, which no per-run reset
+     * clears, so a successful read cannot distinguish this run's counts from a
+     * previous run's. Supplying an independent phase denominator needs
+     * configuration the host does not have, and is not attempted here.
      *
      * Must be called after `reconcile_counters` for the same run, which is what
      * captures the live side.
@@ -736,6 +767,19 @@ private:
         uint64_t total_perf_collected{0};
         uint64_t total_sched_phase_collected{0};
         uint64_t total_orch_phase_collected{0};
+        // AICore records this shard accepted into its vectors: the device's
+        // buffer count less every slot the host itself declined. The four
+        // reasons are counted separately below rather than folded in, because a
+        // record the host dropped is not a record the device dropped and the
+        // two must not be summed into one figure.
+        uint64_t total_aicore_collected{0};
+        uint64_t aicore_skipped_unwritten{0};  // start_time == 0
+        uint64_t aicore_skipped_overflow{0};   // buffer count above capacity
+        uint64_t aicore_skipped_bad_core{0};   // core index outside this run's set
+        // Records whose buffer carried another run's stamp, or none. Kept out
+        // of both `collected` and the skip tallies: they belong to no side of
+        // this run's conservation check.
+        uint64_t aicore_foreign_identity{0};
         bool has_phase_data{false};
     };
     static_assert(
@@ -802,6 +846,14 @@ private:
     uint64_t total_perf_collected_{0};
     uint64_t total_sched_phase_collected_{0};
     uint64_t total_orch_phase_collected_{0};
+    // Merged AICore accounting. `collected` is what the host accepted; the four
+    // skip tallies are what it declined, each for its own reason. They are
+    // reported beside the device's own totals, never added to them.
+    uint64_t total_aicore_collected_{0};
+    uint64_t aicore_skipped_unwritten_{0};
+    uint64_t aicore_skipped_overflow_{0};
+    uint64_t aicore_skipped_bad_core_{0};
+    uint64_t aicore_foreign_identity_{0};
     bool has_phase_data_{false};
     bool collector_shards_merged_{false};
     // Set once the runner has handed over a pass's host phase records, which is
@@ -819,8 +871,7 @@ private:
     // `live_ok` is false until a reconcile pass for this run has produced them,
     // and `begin_run` clears it: a previous run's live figures are not this
     // run's, and comparing against them would report agreement that was never
-    // established. Only the AICPU task class is captured — reconcile does not
-    // sum the AICore pool at all.
+    // established.
     struct LiveTaskCounters {
         bool live_ok{false};
         bool mirror_ok{false};  // the bulk device mirror reconcile reads succeeded
@@ -829,6 +880,47 @@ private:
     };
     LiveTaskCounters live_counters_{};
 
+    // The AICore pool's per-run accounting, produced by
+    // `reconcile_aicore_counters` from the mirror reconcile already refreshed.
+    //
+    // `host_collected` counts records this host accepted; `host_skipped` counts
+    // the slots it declined for its own four reasons. They are separate fields
+    // because a host-side reduction is not a device-side drop, and the
+    // comparison must never present one as the other.
+    struct AicoreAccounting {
+        bool known{false};
+        // True only when an expected run identity exists AND every record
+        // carried it. False covers both a foreign record and no expected
+        // identity at all; in either case the conservation figures are not
+        // evidence about a run, however few records arrived.
+        bool identity_ok{false};
+        uint64_t device_total{0};
+        uint64_t device_dropped{0};
+        uint64_t host_collected{0};
+        uint64_t host_skipped{0};
+        uint64_t foreign_identity{0};
+    };
+    AicoreAccounting aicore_accounting_{};
+
+    // The run identity the last successful `arm_run_terminal_bank` was given.
+    // 0 whenever this collector holds none: before any arm, after one that
+    // failed for any reason, and after `finalize`. With 0 the host can
+    // attribute no record to a run, so the AICore accounting carries no
+    // verdict rather than inheriting the previous run's identity.
+    uint64_t armed_run_epoch_{0};
+
+    void reconcile_aicore_counters();
+
+    /**
+     * Map a collector thread's shard index onto `collector_counters_`.
+     *
+     * Precondition, and the reason the out-of-range return is unreachable in
+     * production: `ProfilerBase` spawns exactly `shard_count_` collector
+     * threads with indices `[0, shard_count_)` and passes each its own index
+     * down to `on_buffer_collected`, while `reset_collector_shards` sizes
+     * `collector_counters_` to that same count. Returns `shard_count` on a
+     * violation, which callers must treat as "no shard owns this call".
+     */
     size_t normalize_collector_shard(int collector_shard) const;
     void reset_collector_shards();
     void merge_collector_shards();

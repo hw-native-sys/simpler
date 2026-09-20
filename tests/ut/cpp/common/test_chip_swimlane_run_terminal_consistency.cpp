@@ -95,9 +95,11 @@ TEST(ChipSwimlaneRunTerminalConsistencyTest, FullCoverageWithMatchingSumsAgrees)
     EXPECT_EQ(c.aicpu_task.reported_count, 2);
     EXPECT_EQ(c.aicpu_task.missing_count, 0);
     EXPECT_EQ(c.aicpu_task.unexpected_count, 0);
-    // AICore has no live counterpart in reconcile, so coverage is checkable but
-    // sums are not: it can never reach Agree.
-    EXPECT_EQ(c.aicore_task.verdict, Verdict::Unknown);
+    // The AICore class has a live counterpart of its own now, summed by
+    // reconcile_aicore_counters from the same mirror, so it reaches a real
+    // verdict here. This run publishes no AICore records, and an all-zero
+    // retained side matching an all-zero device side is agreement.
+    EXPECT_EQ(c.aicore_task.verdict, Verdict::Agree);
     EXPECT_EQ(c.aicore_task.missing_count, 0);
 
     collector.finalize(nullptr, consistency_test_free);

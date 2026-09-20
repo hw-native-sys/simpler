@@ -199,3 +199,30 @@ TEST_F(RunTerminalTransportFault, FailedLiveMirrorIsNotAgreementOnStaleEqualSums
 
     collector.finalize(nullptr, fault_test_free);
 }
+// The AICore accounting shares the mirror the AICPU comparison uses, so a failed
+// refresh leaves it unknown too — no verdict is reached from device figures that
+// never arrived.
+TEST_F(RunTerminalTransportFault, FailedMirrorLeavesAicoreAccountingUnknown) {
+    ChipSwimlaneCollector collector;
+    ASSERT_EQ(init_collector(collector), 0);
+
+    constexpr uint64_t kEpoch = 2105;
+    run_one_task(collector, /*slot=*/0, kEpoch, "aicore-mirror");
+
+    // A successful pass first: the accounting is produced and known.
+    collector.reconcile_counters();
+    ASSERT_TRUE(collector.aicore_accounting_for_test().known);
+
+    // Now the region-sized mirror refresh fails. The shadow still holds the
+    // same plausible figures.
+    copy_fault::arm({/*fail_from_device_size=*/calc_perf_data_size_with_phases(), /*fail_rc=*/-11});
+    collector.reconcile_counters();
+    EXPECT_FALSE(collector.aicore_accounting_for_test().known)
+        << "AICore accounting was produced from a mirror that did not refresh";
+
+    auto snapshot = collector.read_run_terminal_snapshot(/*slot=*/0, kEpoch);
+    ASSERT_TRUE(snapshot.transport_ok);
+    EXPECT_EQ(collector.run_terminal_consistency(snapshot).aicore_task.verdict, Verdict::Unknown);
+
+    collector.finalize(nullptr, fault_test_free);
+}

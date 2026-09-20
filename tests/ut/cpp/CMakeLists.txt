@@ -710,6 +710,39 @@ foreach(runtime tensormap_and_ringbuffer host_build_graph)
     set_tests_properties(${consistency_test} PROPERTIES LABELS "no_hardware")
 endforeach()
 
+# AICore per-run accounting: device totals vs host-accepted vs host-declined.
+# Per runtime for the same reason as the swimlane targets above.
+foreach(runtime tensormap_and_ringbuffer host_build_graph)
+    set(aicore_test test_chip_swimlane_aicore_accounting_${runtime})
+    add_executable(${aicore_test}
+        common/test_chip_swimlane_aicore_accounting.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/chip_swimlane_collector.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/chip_swimlane_collector_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/device_run_result_base_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/sim/aicpu/inner_platform_regs.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/clock_correlation.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/sim/host/profiling_copy.cpp
+        ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
+    )
+    target_compile_definitions(${aicore_test} PRIVATE SIMPLER_RUNTIME_NAME="${runtime}")
+    target_include_directories(${aicore_test} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/aicpu
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/${runtime}
+        ${CMAKE_SOURCE_DIR}/../../../src/common
+    )
+    target_link_libraries(${aicore_test} PRIVATE
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        pthread
+    )
+    add_test(NAME ${aicore_test} COMMAND ${aicore_test})
+    set_tests_properties(${aicore_test} PROPERTIES LABELS "no_hardware")
+endforeach()
+
 # Device-to-host transfer failures on the consistency consumer's two reads.
 # Links stubs/profiling_copy_fault.cpp in place of an arch's profiling_copy.cpp,
 # which gives the collector separate host and device storage: the arch stubs are

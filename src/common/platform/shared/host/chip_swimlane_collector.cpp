@@ -150,6 +150,11 @@ int ChipSwimlaneCollector::initialize(
     total_perf_collected_ = 0;
     total_sched_phase_collected_ = 0;
     total_orch_phase_collected_ = 0;
+    total_aicore_collected_ = 0;
+    aicore_skipped_unwritten_ = 0;
+    aicore_skipped_overflow_ = 0;
+    aicore_skipped_bad_core_ = 0;
+    aicore_foreign_identity_ = 0;
     has_phase_data_ = false;
     collector_shards_merged_ = false;
     json_extensions_.fill({});
@@ -579,6 +584,11 @@ void ChipSwimlaneCollector::reset_collector_shards() {
     total_perf_collected_ = 0;
     total_sched_phase_collected_ = 0;
     total_orch_phase_collected_ = 0;
+    total_aicore_collected_ = 0;
+    aicore_skipped_unwritten_ = 0;
+    aicore_skipped_overflow_ = 0;
+    aicore_skipped_bad_core_ = 0;
+    aicore_foreign_identity_ = 0;
     has_phase_data_ = false;
     collector_shards_merged_ = false;
 }
@@ -624,11 +634,21 @@ void ChipSwimlaneCollector::merge_collector_shards() {
     total_perf_collected_ = 0;
     total_sched_phase_collected_ = 0;
     total_orch_phase_collected_ = 0;
+    total_aicore_collected_ = 0;
+    aicore_skipped_unwritten_ = 0;
+    aicore_skipped_overflow_ = 0;
+    aicore_skipped_bad_core_ = 0;
+    aicore_foreign_identity_ = 0;
     has_phase_data_ = false;
     for (const auto &counter : collector_counters_) {
         total_perf_collected_ += counter.total_perf_collected;
         total_sched_phase_collected_ += counter.total_sched_phase_collected;
         total_orch_phase_collected_ += counter.total_orch_phase_collected;
+        total_aicore_collected_ += counter.total_aicore_collected;
+        aicore_skipped_unwritten_ += counter.aicore_skipped_unwritten;
+        aicore_skipped_overflow_ += counter.aicore_skipped_overflow;
+        aicore_skipped_bad_core_ += counter.aicore_skipped_bad_core;
+        aicore_foreign_identity_ += counter.aicore_foreign_identity;
         has_phase_data_ = has_phase_data_ || counter.has_phase_data;
     }
     collector_shards_merged_ = true;
@@ -720,27 +740,63 @@ void ChipSwimlaneCollector::copy_aicore_buffer(const ReadyBufferInfo &info, int 
     ChipSwimlaneAicoreTaskBuffer *buf = reinterpret_cast<ChipSwimlaneAicoreTaskBuffer *>(info.host_buffer_ptr);
     rmb();
     uint32_t core_index = info.index;
+    // A shard index outside `collector_counters_` is a contract violation, not
+    // an accountable loss class: the counters are per-shard and non-atomic, so
+    // charging the reduction to any other shard would race that shard's own
+    // live collector thread. Report and return without touching one.
+    size_t shard = normalize_collector_shard(collector_shard);
+    if (shard >= collector_counters_.size() || shard >= aicore_records_by_collector_.size()) {
+        LOG_ERROR(
+            "ChipSwimlane: AICore buffer delivered on collector shard %d, outside [0, %zu) — "
+            "precondition violated, buffer not accounted",
+            collector_shard, collector_counters_.size()
+        );
+        return;
+    }
     if (core_index >= static_cast<uint32_t>(num_aicore_)) {
+        collector_counters_[shard].aicore_skipped_bad_core += buf->count;
         return;
     }
     uint32_t count = buf->count;
+    uint32_t overflow = 0;
     if (count > static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE)) {
+        overflow = count - static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
         count = PLATFORM_AICORE_BUFFER_SIZE;
     }
+
+    // A buffer's records all carry the stamp the producer wrote when it
+    // acquired the buffer, so the identity decision is per buffer.
+    const uint64_t buffer_epoch = buf->run_epoch;
+    const bool identity_matches = armed_run_epoch_ != 0 && buffer_epoch == armed_run_epoch_;
+
     uint32_t skipped = 0;
-    size_t shard = normalize_collector_shard(collector_shard);
-    if (shard < aicore_records_by_collector_.size()) {
-        auto &dst = aicore_records_by_collector_[shard][core_index];
-        dst.reserve(dst.size() + count);
-        for (uint32_t i = 0; i < count; i++) {
-            const ChipSwimlaneAicoreTaskRecord &r = buf->records[i];
-            if (r.start_time == 0) {
-                skipped++;
-                continue;
-            }
-            dst.push_back({r, buf->run_epoch, buf->local_seq, 0});
+    uint32_t accepted = 0;
+    auto &dst = aicore_records_by_collector_[shard][core_index];
+    dst.reserve(dst.size() + count);
+    for (uint32_t i = 0; i < count; i++) {
+        const ChipSwimlaneAicoreTaskRecord &r = buf->records[i];
+        if (r.start_time == 0) {
+            skipped++;
+            continue;
         }
+        // Collected either way, with its own stamp: the artifact keeps every
+        // record the device produced, and the export reads these vectors.
+        dst.push_back({r, buffer_epoch, buf->local_seq, 0});
+        accepted++;
     }
+
+    if (identity_matches) {
+        collector_counters_[shard].total_aicore_collected += accepted;
+        collector_counters_[shard].aicore_skipped_unwritten += skipped;
+        collector_counters_[shard].aicore_skipped_overflow += overflow;
+    } else {
+        // Counted apart from both sides of the conservation check. A record
+        // another run produced is not this run's `collected`, and it is not a
+        // device drop either — folding it into `host_skipped` would let it
+        // balance away as though this run had accounted for it.
+        collector_counters_[shard].aicore_foreign_identity += accepted + skipped + overflow;
+    }
+
     if (skipped > 0) {
         LOG_WARN(
             "Core %u: skipped %u AICore record slot(s) with start_time=0 (race-window write or "
@@ -929,6 +985,130 @@ void ChipSwimlaneCollector::reconcile_counters() {
         },
         sizeof(ChipSwimlaneAicpuOrchPhaseBuffer), total_orch_phase_collected_, /*optional=*/true, nullptr
     );
+
+    reconcile_aicore_counters();
+}
+
+// The AICore pool has no `reconcile_one` form: that helper's leftover check
+// reads the active buffer's settled `count` through a per-buffer
+// `profiling_copy_from_device`, and the AICore active buffer has no such count
+// — `live_record_count` is the device's running tally, settled into `dropped`
+// or `published` by `take_aicore_live_count` at rotation or flush. This
+// reconciles from the mirror the caller already refreshed and adds no transfer.
+//
+//   device_total   — the pool's `total_record_count`, one per dispatch
+//   device_dropped — the pool's `dropped_record_count`
+//   host_collected — records carrying THIS run's identity that the host accepted
+//
+// `host_collected` is not "records the device handed over". Slots the host
+// declines (unwritten, over-capacity, unowned core, unowned shard) are counted
+// separately, and records carrying another run's identity are counted apart
+// from both: folding either into `device_dropped` would relabel it as a
+// device-side loss, and folding a foreign record into `host_skipped` would let
+// it balance away as though this run had accounted for it.
+void ChipSwimlaneCollector::reconcile_aicore_counters() {
+    if (shm_host_ == nullptr) return;
+
+    // Without a trustworthy mirror the device figures are last run's or
+    // uninitialised, and a comparison against them establishes nothing.
+    if (!live_counters_.mirror_ok) {
+        LOG_INFO("ChipSwimlane reconcile: AICORE accounting unknown — the device mirror did not refresh this run");
+        aicore_accounting_.known = false;
+        return;
+    }
+
+    uint64_t total_device = 0;
+    uint64_t dropped_device = 0;
+    for (int i = 0; i < num_aicore_; i++) {
+        const ChipSwimlaneAicoreTaskPool *state = get_aicore_buffer_state(shm_host_, i);
+        total_device += state->head.total_record_count;
+        dropped_device += state->head.dropped_record_count;
+    }
+
+    const uint64_t host_skipped = aicore_skipped_unwritten_ + aicore_skipped_overflow_ + aicore_skipped_bad_core_;
+    aicore_accounting_.known = true;
+    // An expected identity has to exist before a population can be said to
+    // match it. With none, `identity_ok` is false however few records
+    // arrived — zero records under no expected identity is unknown, not a
+    // clean run.
+    aicore_accounting_.identity_ok = armed_run_epoch_ != 0 && aicore_foreign_identity_ == 0;
+    aicore_accounting_.device_total = total_device;
+    aicore_accounting_.device_dropped = dropped_device;
+    aicore_accounting_.host_collected = total_aicore_collected_;
+    aicore_accounting_.host_skipped = host_skipped;
+    aicore_accounting_.foreign_identity = aicore_foreign_identity_;
+
+    if (armed_run_epoch_ == 0) {
+        // No expected identity: nothing here can be attributed to a run, so the
+        // figures are recorded but carry no verdict.
+        LOG_WARN(
+            "ChipSwimlane reconcile: AICORE accounting has no expected run identity — "
+            "not evidence about any run (collected=%lu, device_total=%lu)",
+            static_cast<unsigned long>(total_aicore_collected_), static_cast<unsigned long>(total_device)
+        );
+        return;
+    }
+
+    if (total_device == 0 && total_aicore_collected_ == 0 && dropped_device == 0 && host_skipped == 0 &&
+        aicore_foreign_identity_ == 0) {
+        return;  // nothing happened on this pool; say nothing
+    }
+
+    if (aicore_foreign_identity_ > 0) {
+        // A record produced under another run reached this host. The
+        // conservation figures cover only records carrying this run's identity,
+        // so they cannot establish that this run balanced — whatever they sum to.
+        LOG_ERROR(
+            "ChipSwimlane reconcile: %lu AICORE record(s) carried an identity other than this run's "
+            "(expected epoch=%lu) — AICORE accounting is not evidence about this run",
+            static_cast<unsigned long>(aicore_foreign_identity_), static_cast<unsigned long>(armed_run_epoch_)
+        );
+    }
+
+    if (dropped_device > 0) {
+        LOG_WARN(
+            "ChipSwimlane reconcile: %lu AICORE records dropped on device side.",
+            static_cast<unsigned long>(dropped_device)
+        );
+    }
+    if (host_skipped > 0) {
+        // Host-side, and reported as such: these were delivered and then
+        // declined here, so they are not device drops.
+        LOG_WARN(
+            "ChipSwimlane reconcile: host declined %lu AICORE record slot(s) "
+            "(unwritten=%lu over-capacity=%lu bad-core=%lu)",
+            static_cast<unsigned long>(host_skipped), static_cast<unsigned long>(aicore_skipped_unwritten_),
+            static_cast<unsigned long>(aicore_skipped_overflow_), static_cast<unsigned long>(aicore_skipped_bad_core_)
+        );
+    }
+
+    const uint64_t accounted = total_aicore_collected_ + dropped_device + host_skipped;
+    if (!aicore_accounting_.identity_ok) {
+        // Neither a match nor a mismatch: with part of the population excluded
+        // on identity grounds, neither verdict would be about this run.
+        LOG_WARN(
+            "ChipSwimlane reconcile: AICORE conservation not evaluated (collected=%lu, dropped=%lu, "
+            "host_skipped=%lu, foreign=%lu, device_total=%lu)",
+            static_cast<unsigned long>(total_aicore_collected_), static_cast<unsigned long>(dropped_device),
+            static_cast<unsigned long>(host_skipped), static_cast<unsigned long>(aicore_foreign_identity_),
+            static_cast<unsigned long>(total_device)
+        );
+    } else if (accounted != total_device) {
+        LOG_WARN(
+            "ChipSwimlane reconcile: AICORE count mismatch (collected=%lu + dropped=%lu + host_skipped=%lu != "
+            "device_total=%lu, silent_loss=%ld)",
+            static_cast<unsigned long>(total_aicore_collected_), static_cast<unsigned long>(dropped_device),
+            static_cast<unsigned long>(host_skipped), static_cast<unsigned long>(total_device),
+            static_cast<long>(total_device) - static_cast<long>(accounted)
+        );
+    } else {
+        LOG_INFO(
+            "ChipSwimlane reconcile: AICORE counts match (collected=%lu, dropped=%lu, host_skipped=%lu, "
+            "device_total=%lu)",
+            static_cast<unsigned long>(total_aicore_collected_), static_cast<unsigned long>(dropped_device),
+            static_cast<unsigned long>(host_skipped), static_cast<unsigned long>(total_device)
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -944,6 +1124,11 @@ void ChipSwimlaneCollector::reconcile_counters() {
 // producers overwrite their own entries.
 
 void *ChipSwimlaneCollector::arm_run_terminal_bank(uint32_t bank_index, uint64_t run_epoch) {
+    // Any outcome other than a successful arm leaves this collector with no
+    // expected identity. Keeping the previous run's would make the next run's
+    // records look like they matched, and would make an unarmed collector claim
+    // an identity it was never given.
+    armed_run_epoch_ = 0;
     if (shm_host_ == nullptr || perf_shared_mem_dev_ == nullptr) return nullptr;
     if (bank_index >= static_cast<uint32_t>(PLATFORM_RUN_TERMINAL_BANKS)) {
         LOG_ERROR(
@@ -956,6 +1141,13 @@ void *ChipSwimlaneCollector::arm_run_terminal_bank(uint32_t bank_index, uint64_t
     // identity; a run without one publishes no bank rather than claiming this
     // one.
     if (run_epoch == 0) return nullptr;
+
+    // The run this collector is arming for. `copy_aicore_buffer` compares each
+    // record's stamp against it, so a record produced under another run cannot
+    // count toward this one's accounting. Arming precedes `begin_run` in every
+    // runner, so this is the only point in the existing host flow where the
+    // epoch is in hand before records arrive.
+    armed_run_epoch_ = run_epoch;
 
     return get_run_terminal_bank(perf_shared_mem_dev_, static_cast<int>(bank_index));
 }
@@ -1104,10 +1296,20 @@ ChipSwimlaneCollector::run_terminal_consistency(const RunTerminalSnapshot &snaps
     const bool live_usable = live_counters_.live_ok && live_counters_.mirror_ok;
     result.aicpu_task =
         classify(snapshot.aicpu_task, live_usable, live_counters_.aicpu_task_total, live_counters_.aicpu_task_dropped);
-    // AICore has no live counterpart: reconcile_counters does not sum the
-    // AICore pool, so its coverage can be checked but its sums cannot be
-    // compared. It never reaches Agree or Disagree.
-    result.aicore_task = classify(snapshot.aicore_task, /*have_live=*/false, 0, 0);
+    // The AICore class compares against the device figures
+    // `reconcile_aicore_counters` summed from the same refreshed mirror.
+    //
+    // With no expected run identity there is nothing to attribute a record to,
+    // so the class reports unknown outright rather than a coverage verdict: a
+    // snapshot's entries cannot be called present-or-missing for a run this
+    // collector was never armed for. An accounting whose population included
+    // another run's records is likewise not a live side for this one.
+    if (aicore_accounting_.identity_ok) {
+        result.aicore_task = classify(
+            snapshot.aicore_task, aicore_accounting_.known, aicore_accounting_.device_total,
+            aicore_accounting_.device_dropped
+        );
+    }
     return result;
 }
 
@@ -1818,6 +2020,13 @@ int ChipSwimlaneCollector::finalize(
     total_perf_collected_ = 0;
     total_sched_phase_collected_ = 0;
     total_orch_phase_collected_ = 0;
+    total_aicore_collected_ = 0;
+    aicore_skipped_unwritten_ = 0;
+    aicore_skipped_overflow_ = 0;
+    aicore_skipped_bad_core_ = 0;
+    aicore_foreign_identity_ = 0;
+    // The region this identity was armed against is gone.
+    armed_run_epoch_ = 0;
     collector_shards_merged_ = false;
     host_orchestrated_ = false;
     host_phase_records_present_ = false;
