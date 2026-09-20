@@ -116,10 +116,41 @@ reads from the sweep). The verdict does not, for three reasons.
 3. **Its 59% transfer figure is specific to the per-core claim.** Per thread the
    whole port lands at -1.43 us.
 
+## Fault injection: where it had to move to
+
+None of these mechanisms can be validated by a normal benchmark — their value
+is entirely on the fault path, where a benchmark can only price them. The
+first attempt drove the fault path from the host system tests and established
+nothing: an unresponsive core forces a device reset, so the log line naming
+the core never reaches the host, anything timed around the retirement is
+dominated by the reset instead, and a test that counts retirement log lines
+passes vacuously when no lines arrive at all. All three were withdrawn.
+
+What replaced them is a device-side unit suite driving
+`platform_retire_aicore_group` against simulated register blocks, in the style
+the a2a3 suite already uses (`tests/ut/cpp/a5/test_aicore_retirement.cpp`).
+Seven cases cover: the broadcast completing before any core is waited on; no
+window closing until the group has acknowledged; a silent core left unclosed
+while its answering peers are released; the `released[]` contract; one shared
+budget for the group rather than one per core; address validation; and the
+single-core entry inheriting all of it by delegation.
+
+Each case was confirmed to discriminate by mutating the source it tests —
+closing on acknowledgement, closing an unacknowledged core, retiring serially
+with a per-core budget, reporting every core released, dropping the validation,
+and bypassing the group from the single-core entry. Every mutant fails the
+case that owns its property, and the unmutated source passes repeatedly. Two
+of the seven were rewritten after the first mutation round showed they passed
+against a serialized retirement and against a single-core entry that closed on
+the signal alone.
+
 ## Still open
 
-Fault injection. None of these mechanisms can be validated by a normal
-benchmark — their value is entirely on the fault path, where a benchmark can
-only price them. Coverage needed: slow and unresponsive cores against both
-budget properties, concurrent normal and emergency retirement, and the
-fatal-before-completion ordering. Tracked on #2388.
+Three parts of the fault path remain uncovered. The read-back inside the
+window close has no observable effect on a simulated register block, so
+nothing at this level can distinguish it from its absence; it rests on the
+memory-attribute argument in `docs/hardware/mmio-performance.md`. The
+exactly-once property of the per-thread claim lives in `SchedulerContext`
+rather than in the platform layer and needs more scaffolding to reach.
+Concurrent normal and emergency retirement, and the fatal-before-completion
+ordering, are likewise above this layer. Tracked on #2388.
