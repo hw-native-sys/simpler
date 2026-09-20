@@ -2199,8 +2199,7 @@ int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, const KernelArgs &
     // The driver copies `argsSize` bytes during the launch call, so a stack
     // local satisfies its host-buffer lifetime requirement.
     AicoreLaunchArgs args{};
-    args.runtime_args = reinterpret_cast<uint64_t>(k_args.runtime_args);
-    args.enable_profiling_flag = k_args.enable_profiling_flag;
+    fill_shared_launch_args(args, k_args);
     fill_arch_launch_args(args, k_args);
     rtArgsEx_t rt_args;
     std::memset(&rt_args, 0, sizeof(rt_args));
@@ -2486,6 +2485,11 @@ int DeviceRunnerBase::prepare_launch_shape(Runtime &runtime, const CallConfig &c
         workers[i].aicore_done = 0;
         workers[i].task = 0;
         workers[i].core_type = (i < num_aic) ? CoreType::AIC : CoreType::AIV;
+        // Cleared with the rest of the report so a run's own epoch is the only
+        // value that can ever satisfy its sweep. This upload is what gives the
+        // marker a deterministic initial value on a slot's first use, where the
+        // allocator's bytes are otherwise arbitrary.
+        workers[i].report_epoch = 0;
     }
     return 0;
 }

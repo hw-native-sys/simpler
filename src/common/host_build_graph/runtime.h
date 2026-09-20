@@ -52,6 +52,16 @@
 #define RUNTIME_MAX_WORKER PLATFORM_MAX_CORES
 #define RUNTIME_MAX_FUNC_ID 1024
 
+// The AICore compiler defines these; host and AICPU builds compile the same
+// declarations with them empty. Mirrors the guard in the a5 scheduler's
+// scheduler_types.h so one helper can serve a device producer and a host test.
+#ifndef __gm__
+#define __gm__
+#endif
+#ifndef __aicore__
+#define __aicore__
+#endif
+
 // =============================================================================
 // Data Structures
 // =============================================================================
@@ -95,6 +105,12 @@
  *   pre-READY context address comes from scheduler_bootstrap instead
  * - core_type: Written by AICore (with aicore_done), read by AICPU (CoreType::AIC or CoreType::AIV)
  * - physical_core_id: Written by AICore (with aicore_done), read by AICPU
+ * - report_epoch: This run's identity, written by AICore *after* the payload and
+ *   its store barrier, so it commits the report. A native program run carries a
+ *   non-zero epoch in its launch arguments and the AICPU accepts only a report
+ *   bearing exactly that value; kernel/persistent launches carry 0 and keep the
+ *   `aicore_done != 0` predicate. 0 is never a valid native epoch, so it cannot
+ *   be confused with never-written device memory
  */
 struct Handshake {
     volatile uint32_t aicpu_ready;  // a2a3: unused. a5: AICPU resident hand-off publication (see above)
@@ -102,6 +118,7 @@ struct Handshake {
     volatile uint64_t task;         // DispatchPayload*, or on a5 a SchedulerWorkerContext address
     volatile CoreType core_type;    // Core type: CoreType::AIC or CoreType::AIV (reported by AICore with aicore_done)
     volatile uint32_t physical_core_id;  // Physical core ID (reported by AICore with aicore_done)
+    volatile uint64_t report_epoch;      // Commit marker for a native program run's report; 0 = unstamped
 } __attribute__((aligned(64)));
 
 // The AICore owns this line's writeback: it flushes the whole line with
@@ -111,6 +128,59 @@ struct Handshake {
 // Runtime::teardown_gates, one isolated line each; A5 leaves them unused.
 static_assert(sizeof(Handshake) == 64);
 static_assert(std::is_standard_layout_v<Handshake> && std::is_trivially_copyable_v<Handshake>);
+// The payload offsets are the device-side wire contract: AICore writes them and
+// the AICPU sweeps read them back, so a field that moved would mis-decode
+// silently. `report_epoch` occupies padding the struct already had, which is why
+// adding it moves nothing and leaves the whole report inside one cache line.
+static_assert(offsetof(Handshake, aicpu_ready) == 0);
+static_assert(offsetof(Handshake, aicore_done) == 4);
+static_assert(offsetof(Handshake, task) == 8);
+static_assert(offsetof(Handshake, core_type) == 16);
+static_assert(offsetof(Handshake, physical_core_id) == 20);
+static_assert(offsetof(Handshake, report_epoch) == 24);
+
+/**
+ * Whether `handshake` carries a report this run may act on.
+ *
+ * `expected_epoch` is the run's own identity, which the host supplies in
+ * `KernelArgs::run_result_epoch` and the AICPU reads back through
+ * `get_platform_run_result_epoch()`. A native program run passes a non-zero
+ * value and is answered only by a report stamped with exactly that number, so a
+ * marker left by an earlier run is rejected rather than mistaken for this one's.
+ *
+ * A kernel/persistent launch passes 0 and keeps the original predicate: its
+ * producer writes no stamp, and its per-run reset is what makes `aicore_done`
+ * meaningful. Accepting the epoch here does not order the payload reads that
+ * follow — the caller's existing `rmb()` does that.
+ */
+inline bool aicore_report_accepted(const volatile Handshake *handshake, uint64_t expected_epoch) {
+    if (handshake->aicore_done == 0) return false;
+    return expected_epoch == 0 || handshake->report_epoch == expected_epoch;
+}
+
+/**
+ * Stage everything a native program run's report publishes before its commit
+ * marker, including the reverse hand-off words the AICPU will answer with.
+ *
+ * `pending_mode` is the value that means "no reply yet" for the caller's
+ * protocol. Clearing the reply here is what makes an accepted report also mean
+ * "this is not last run's READY": these stores and the marker that commits them
+ * differ only by the caller's barrier, so an AICPU that accepts this run's
+ * epoch cannot have seen the predecessor's reply still standing.
+ *
+ * The barrier, the marker store and the write-back stay at the call site: they
+ * are architecture intrinsics, and their order relative to this staging is the
+ * protocol.
+ */
+inline __aicore__ void aicore_stage_native_report(
+    __gm__ Handshake *handshake, uint32_t physical_core_id, CoreType core_type, uint32_t done, uint32_t pending_mode
+) {
+    handshake->aicpu_ready = pending_mode;
+    handshake->task = 0;
+    handshake->physical_core_id = physical_core_id;
+    handshake->core_type = core_type;
+    handshake->aicore_done = done;
+}
 
 /**
  * Host-authored scheduler bootstrap inputs, A5 host_build_graph only.

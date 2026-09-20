@@ -544,10 +544,33 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     }
     const bool chip_swimlane_enabled = SIMPLER_GET_DFX_FLAG(profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
     uint64_t aicore_entry_cycles = chip_swimlane_enabled ? get_sys_cnt_aicore() : 0;
-    handshake->physical_core_id = get_physical_core_id();
-    handshake->core_type = core_type;
-    OUT_OF_ORDER_STORE_BARRIER();
-    handshake->aicore_done = block_idx + 1;
+    const uint64_t report_epoch = get_aicore_report_epoch();
+    if (report_epoch != 0) {
+        // Native program run. Everything this report stands for is payload —
+        // `aicore_done` and the two reverse-hand-off words this core is about
+        // to wait on, which a predecessor run left set. Clearing them before
+        // the marker is what makes an accepted report also mean "READY is not
+        // last run's". `report_epoch` alone comes after the barrier, so the
+        // AICPU cannot see this run's epoch without all of it.
+        //
+        // Only a stamped run may clear them: an unstamped one cannot tell its
+        // own leftovers from a predecessor's, and its AICPU does not gate the
+        // reply on the epoch either.
+        aicore_stage_native_report(
+            handshake, get_physical_core_id(), core_type, static_cast<uint32_t>(block_idx) + 1,
+            SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING
+        );
+        OUT_OF_ORDER_STORE_BARRIER();
+        handshake->report_epoch = report_epoch;
+    } else {
+        // Kernel/persistent launch: unchanged. `aicore_done` is itself the
+        // marker, its per-run reset is what makes it meaningful, and no stamp
+        // is written.
+        handshake->physical_core_id = get_physical_core_id();
+        handshake->core_type = core_type;
+        OUT_OF_ORDER_STORE_BARRIER();
+        handshake->aicore_done = block_idx + 1;
+    }
     dcci(handshake, SINGLE_CACHE_LINE, CACHELINE_OUT);
     dsb((mem_dsb_t)0);
     uint64_t handshake_publish_cycles = chip_swimlane_enabled ? get_sys_cnt_aicore() : 0;

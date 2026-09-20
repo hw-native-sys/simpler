@@ -60,6 +60,14 @@ int PersistentKernelArgs::prepare_once(const Runtime &host_runtime, const Persis
         return rc;
     }
 
+    // Kernel mode selects the handshake protocol that predates the report
+    // epoch: its producer writes no stamp and its consumers keep the
+    // `aicore_done != 0` predicate. Written here rather than left to
+    // value-initialization so the choice is this path's own, and so a future
+    // field added to the block cannot make it drift by accident. A run identity
+    // would be wrong here anyway — this block is filled once and relaunched.
+    args_.run_result_epoch = 0;
+
     // Taken last: this is a whole-struct copy of `args_`, so every field the
     // device reads — including the two blocks above — must already be set.
     void *device_args = ops_.alloc(ops_.context, sizeof(KernelArgs));

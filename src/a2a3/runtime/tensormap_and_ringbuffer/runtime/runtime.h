@@ -100,6 +100,7 @@ struct Handshake {
     volatile uint64_t task;         // DispatchPayload* published before register window-open
     volatile CoreType core_type;    // Core type: CoreType::AIC or CoreType::AIV (reported by AICore with aicore_done)
     volatile uint32_t physical_core_id;  // Physical core ID (reported by AICore with aicore_done)
+    volatile uint64_t report_epoch;      // Commit marker for a native program run's report; 0 = unstamped
 } __attribute__((aligned(64)));
 
 // The AICore owns this line's writeback: it flushes the whole line with
@@ -109,6 +110,34 @@ struct Handshake {
 // DeviceRuntimeLaunchDesc::teardown_gates, one isolated line each.
 static_assert(sizeof(Handshake) == 64);
 static_assert(std::is_standard_layout_v<Handshake> && std::is_trivially_copyable_v<Handshake>);
+// The payload offsets are the device-side wire contract: AICore writes them and
+// the AICPU sweeps read them back, so a field that moved would mis-decode
+// silently. `report_epoch` occupies padding the struct already had.
+static_assert(offsetof(Handshake, aicpu_ready) == 0);
+static_assert(offsetof(Handshake, aicore_done) == 4);
+static_assert(offsetof(Handshake, task) == 8);
+static_assert(offsetof(Handshake, core_type) == 16);
+static_assert(offsetof(Handshake, physical_core_id) == 20);
+static_assert(offsetof(Handshake, report_epoch) == 24);
+
+/**
+ * Whether `handshake` carries a report this run may act on.
+ *
+ * `expected_epoch` is the run's own identity, which the host supplies in
+ * `KernelArgs::run_result_epoch` and the AICPU reads back through
+ * `get_platform_run_result_epoch()`. A native program run passes a non-zero
+ * value and is answered only by a report stamped with exactly that number, so a
+ * marker left by an earlier run is rejected rather than mistaken for this one's.
+ *
+ * A kernel/persistent launch passes 0 and keeps the original predicate: its
+ * producer writes no stamp, and its per-run reset is what makes `aicore_done`
+ * meaningful. Accepting the epoch here does not order the payload reads that
+ * follow — the caller's existing `rmb()` does that.
+ */
+inline bool aicore_report_accepted(const volatile Handshake *handshake, uint64_t expected_epoch) {
+    if (handshake->aicore_done == 0) return false;
+    return expected_epoch == 0 || handshake->report_epoch == expected_epoch;
+}
 
 // =============================================================================
 // Device launch descriptor

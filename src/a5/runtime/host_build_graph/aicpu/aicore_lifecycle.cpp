@@ -24,6 +24,7 @@
 #include "aicpu/args_dump_aicpu.h"
 #include "aicpu/aicpu_device_config.h"
 #include "aicpu/cache_maintenance.h"
+#include "aicpu/device_run_result_base_aicpu.h"
 #include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/device_time.h"
 #include "aicpu/platform_regs.h"
@@ -88,6 +89,10 @@ void AicoreLifecycle::handshake_partition(Runtime *runtime, int32_t tidx, int32_
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(tidx + 1) * core_count_) / nthreads);
     const uint32_t physical_core_count = platform_get_physical_cores_count();
     uint64_t *regs = reinterpret_cast<uint64_t *>(regs_base_);
+    // This run's identity, latched from KernelArgs at AICPU entry. Non-zero on a
+    // native program launch, so only a report stamped with it is this run's;
+    // zero on a kernel/persistent launch, which keeps the aicore_done predicate.
+    const uint64_t report_epoch = get_platform_run_result_epoch();
 
     struct ReadyCore {
         int32_t worker_id;
@@ -108,7 +113,7 @@ void AicoreLifecycle::handshake_partition(Runtime *runtime, int32_t tidx, int32_
             if (observed[i]) continue;
             Handshake *handshake = &handshakes[i];
             cache_invalidate_range(handshake, sizeof(*handshake));
-            if (handshake->aicore_done == 0) {
+            if (!aicore_report_accepted(handshake, report_epoch)) {
                 SPIN_WAIT_HINT();
                 continue;
             }
@@ -324,10 +329,19 @@ void AicoreLifecycle::publish_context_partition(Runtime *runtime, int32_t thread
     cache_invalidate_range(bootstrap_context, 256);
     void *scheduler_state_base = aicore_scheduler_state_base(bootstrap_context);
     for (int32_t i = lo; i < hi; ++i) {
+        // Reply only to a worker whose report this run accepted and configured.
+        // Without it a worker that never reported would be told READY against a
+        // context it never asked for, and on a stamped run that reply is
+        // exactly what its epoch check withheld.
+        if (!aicore_context_reply_permitted(bootstrap_context, cores_[i].reg_addr)) continue;
         handshakes[i].task = reinterpret_cast<uint64_t>(scheduler_state_at<SchedulerWorkerContext>(
             scheduler_state_base,
             bootstrap_context->worker_contexts_offset + static_cast<uint64_t>(i) * sizeof(SchedulerWorkerContext)
         ));
+        // The task address must be in memory before the word that tells the
+        // AICore to read it: they share one line, and the flush below carries
+        // both, but only this barrier orders the two stores against each other.
+        OUT_OF_ORDER_STORE_BARRIER();
         handshakes[i].aicpu_ready = SCHEDULER_RUNTIME_MODE_RESIDENT_READY;
     }
     if (hi > lo) cache_flush_range(&handshakes[lo], static_cast<size_t>(hi - lo) * sizeof(Handshake));

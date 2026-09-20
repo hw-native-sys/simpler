@@ -282,7 +282,7 @@ int DeviceRunner::ensure_binaries_loaded() {
         }
 
         aicore_execute_func_ =
-            reinterpret_cast<void (*)(Runtime *, int, CoreType, uint32_t, uint64_t, uint32_t, uint64_t)>(
+            reinterpret_cast<void (*)(Runtime *, int, CoreType, uint32_t, uint64_t, uint32_t, uint64_t, uint64_t)>(
                 dlsym(aicore_so_handle_, "aicore_execute_wrapper")
             );
         if (aicore_execute_func_ == nullptr) {
@@ -367,6 +367,12 @@ int DeviceRunner::prepare_execution(
         LOG_ERROR("ensure_device_initialized failed: %d", rc);
         return rc;
     }
+
+    // Sim runs the same handshake report protocol as onboard, so it supplies the
+    // same per-run identity. `next_native_run_epoch` never returns 0, and 0 is
+    // what selects the kernel/persistent protocol, so a native sim run is
+    // stamped exactly like a native onboard one.
+    kernel_args_.run_result_epoch = identity.run_epoch;
 
     // Lazy-allocate the 8-byte device_wall buffer on first run. Sim's "device
     // pointer" is a host malloc returned by allocate_tensor; the sim AICPU
@@ -535,7 +541,8 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                     [this, run, i, core_type, physical_core_id]() {
                         aicore_execute_func_(
                             run->runtime, i, core_type, physical_core_id, kernel_args_.regs,
-                            kernel_args_.enable_profiling_flag, kernel_args_.chip_swimlane_aicore_rotation_table
+                            kernel_args_.enable_profiling_flag, kernel_args_.chip_swimlane_aicore_rotation_table,
+                            kernel_args_.run_result_epoch
                         );
                         run_completion_.task_finished();
                     },

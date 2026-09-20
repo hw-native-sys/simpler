@@ -1568,6 +1568,13 @@ target_include_directories(test_a5_hbg_scheduler_bootstrap PRIVATE
 target_sources(test_a5_hbg_scheduler_bootstrap PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/common/host_build_graph/shared/runtime.cpp
 )
+add_a5_hbg_runtime_test(test_a5_hbg_report_epoch a5/test_hbg_report_epoch.cpp)
+target_include_directories(test_a5_hbg_report_epoch PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/host_build_graph/aicpu
+)
+target_sources(test_a5_hbg_report_epoch PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common/host_build_graph/shared/runtime.cpp
+)
 # The legacy executor's terminal decision: its own predicate composed with the
 # shared selector and publisher. The helper's test_stubs already supply the
 # cache maintenance the publisher's flushes call.

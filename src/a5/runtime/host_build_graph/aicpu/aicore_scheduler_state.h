@@ -61,6 +61,27 @@ inline SchedulerWorkerContext *aicore_scheduler_bootstrap_context(Runtime *runti
     return reinterpret_cast<SchedulerWorkerContext *>(runtime->dev.scheduler_bootstrap.worker_context_base);
 }
 
+/**
+ * Whether this run may publish a context and READY to a worker.
+ *
+ * Two per-worker conditions. A null bootstrap context means this run has no
+ * resident scheduler state to hand over: the host publishes
+ * `scheduler_bootstrap.worker_context_base` before launch, so a null one is
+ * `aicore_scheduler_bootstrap_context`'s mode-and-base verdict, not a report
+ * that configuration finished. `worker_reg_addr` comes from `cores_`, which
+ * `pre_handshake_init` clears and only an accepted report fills, so a zero one
+ * means this worker did not report to this run — and on a stamped run that is
+ * exactly what the epoch check withheld. Replying anyway would tell a core to
+ * read a context it never asked for.
+ *
+ * Successful configuration is a separate outer gate this predicate does not
+ * observe: `AicpuExecutor::init` calls `publish_context_partition` only after
+ * `hs_config_done_` with `init_failed_` clear.
+ */
+inline bool aicore_context_reply_permitted(const SchedulerWorkerContext *bootstrap_context, uint64_t worker_reg_addr) {
+    return bootstrap_context != nullptr && worker_reg_addr != 0;
+}
+
 inline void *aicore_scheduler_state_base(SchedulerWorkerContext *context) {
     return context == nullptr ? nullptr : reinterpret_cast<void *>(context->scheduler_state_base_address);
 }

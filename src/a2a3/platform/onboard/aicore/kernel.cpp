@@ -47,9 +47,13 @@
 // aicore_profiling_state.h for the lazy-deref contract.
 [[block_local]] static __gm__ uint64_t *s_chip_swimlane_aicore_head_slot;
 [[block_local]] static __gm__ ChipSwimlaneActiveHead *s_chip_swimlane_aicore_head;
+[[block_local]] static uint64_t s_aicore_report_epoch;
 
 __attribute__((weak)) __aicore__ void set_aicore_profiling_flag(uint32_t flag) { s_aicore_profiling_flag = flag; }
 __attribute__((weak)) __aicore__ uint32_t get_aicore_profiling_flag() { return s_aicore_profiling_flag; }
+
+__attribute__((weak)) __aicore__ void set_aicore_report_epoch(uint64_t epoch) { s_aicore_report_epoch = epoch; }
+__attribute__((weak)) __aicore__ uint64_t get_aicore_report_epoch() { return s_aicore_report_epoch; }
 
 __attribute__((weak)) __aicore__ void set_chip_swimlane_aicore_head_slot(__gm__ uint64_t *slot_ptr) {
     s_chip_swimlane_aicore_head_slot = slot_ptr;
@@ -89,10 +93,12 @@ extern __aicore__ void aicore_execute(__gm__ Runtime *runtime, int block_idx, Co
  * @param ffts_base_addr FFTS base for cross-core sync inside user kernels
  * @param chip_swimlane_aicore_rotation_table Device address of the
  *        uint64_t[num_aicore] table of per-core active-head slots, or 0
+ * @param report_epoch This run's handshake report identity; 0 selects the
+ *        pre-existing kernel/persistent report protocol
  */
 extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(
     uint64_t runtime_args, uint32_t enable_profiling_flag, uint64_t ffts_base_addr,
-    uint64_t chip_swimlane_aicore_rotation_table
+    uint64_t chip_swimlane_aicore_rotation_table, uint64_t report_epoch
 ) {
     // Calculate block_idx for this core
 #ifdef __DAV_VEC__
@@ -109,6 +115,11 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(
     // executor runs. AICore reads via get_aicore_profiling_flag() /
     // get_chip_swimlane_aicore_head() — never touches Handshake for profiling.
     set_aicore_profiling_flag(enable_profiling_flag);
+    // Published unconditionally for the same reason as the head slot below:
+    // [[block_local]] storage survives across launches on the same loaded
+    // binary, so a native run followed by a kernel-mode one must not inherit
+    // the native run's epoch.
+    set_aicore_report_epoch(report_epoch);
     // Always publish the head slot (nullptr when this launch is disabled or
     // has no rotation table). [[block_local]] storage persists across launches
     // on the same loaded kernel binary, so without an explicit nullptr

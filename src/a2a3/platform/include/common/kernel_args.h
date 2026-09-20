@@ -190,9 +190,30 @@ struct AicoreLaunchArgs {
     uint32_t enable_profiling_flag;
     uint64_t ffts_base_addr;
     uint64_t chip_swimlane_aicore_rotation_table;
+    // This run's report identity. Non-zero on a native program launch, and the
+    // AICore commits it last in its handshake report so the AICPU accepts only
+    // this run's report. Zero on a kernel/persistent launch, which keeps the
+    // `aicore_done != 0` predicate.
+    uint64_t report_epoch;
 };
 
-static_assert(sizeof(AicoreLaunchArgs) == 32, "AicoreLaunchArgs size drift");
+static_assert(sizeof(AicoreLaunchArgs) == 40, "AicoreLaunchArgs size drift");
+
+/**
+ * Fill the `AicoreLaunchArgs` fields every architecture shares, from the
+ * `KernelArgs` the host already built for the AICPU.
+ *
+ * `report_epoch` is the projection that gives both processors the same run
+ * identity: the AICPU reads `KernelArgs::run_result_epoch` directly, the AICore
+ * has no `KernelArgs`, so the identical value travels here. A native program
+ * launch supplies a non-zero epoch; a kernel/persistent launch leaves it 0,
+ * which selects the protocol that predates the stamp.
+ */
+inline void fill_shared_launch_args(AicoreLaunchArgs &args, const KernelArgs &k_args) {
+    args.runtime_args = reinterpret_cast<uint64_t>(k_args.runtime_args);
+    args.enable_profiling_flag = k_args.enable_profiling_flag;
+    args.report_epoch = k_args.run_result_epoch;
+}
 
 /**
  * Fill the fields of `AicoreLaunchArgs` that only this architecture has, so the

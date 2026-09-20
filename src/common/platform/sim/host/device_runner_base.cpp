@@ -385,6 +385,11 @@ int SimDeviceRunnerBase::prepare_launch_shape(Runtime &runtime, const CallConfig
         workers[i].aicore_done = 0;
         workers[i].task = 0;
         workers[i].core_type = (i < block_dim) ? CoreType::AIC : CoreType::AIV;
+        // Cleared with the rest of the report so a run's own epoch is the only
+        // value that can ever satisfy its sweep. The sim's threads read this
+        // host object in place, so this store is itself the value the sweep
+        // sees; no copy carries it.
+        workers[i].report_epoch = 0;
     }
     return 0;
 }
