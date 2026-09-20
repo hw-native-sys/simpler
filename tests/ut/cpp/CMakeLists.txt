@@ -675,6 +675,78 @@ foreach(runtime tensormap_and_ringbuffer host_build_graph)
     set_tests_properties(${terminal_test} PROPERTIES LABELS "no_hardware")
 endforeach()
 
+# Snapshot-vs-live consistency verdicts. Same two real sides as above, plus the
+# reconcile pass that supplies the live side of the comparison — and likewise
+# built once per runtime, since those platform sources ship inside each
+# runtime's image and reach task_id.h by bare name.
+foreach(runtime tensormap_and_ringbuffer host_build_graph)
+    set(consistency_test test_chip_swimlane_run_terminal_consistency_${runtime})
+    add_executable(${consistency_test}
+        common/test_chip_swimlane_run_terminal_consistency.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/chip_swimlane_collector.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/chip_swimlane_collector_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/device_run_result_base_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/sim/aicpu/inner_platform_regs.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/clock_correlation.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/sim/host/profiling_copy.cpp
+        ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
+    )
+    target_compile_definitions(${consistency_test} PRIVATE SIMPLER_RUNTIME_NAME="${runtime}")
+    target_include_directories(${consistency_test} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/aicpu
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/${runtime}
+        ${CMAKE_SOURCE_DIR}/../../../src/common
+    )
+    target_link_libraries(${consistency_test} PRIVATE
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        pthread
+    )
+    add_test(NAME ${consistency_test} COMMAND ${consistency_test})
+    set_tests_properties(${consistency_test} PROPERTIES LABELS "no_hardware")
+endforeach()
+
+# Device-to-host transfer failures on the consistency consumer's two reads.
+# Links stubs/profiling_copy_fault.cpp in place of an arch's profiling_copy.cpp,
+# which gives the collector separate host and device storage: the arch stubs are
+# no-ops over aliased pointers, under which neither failure branch is reachable.
+# Per runtime for the same reason as the targets above.
+foreach(runtime tensormap_and_ringbuffer host_build_graph)
+    set(transport_test test_chip_swimlane_run_terminal_transport_${runtime})
+    add_executable(${transport_test}
+        common/test_chip_swimlane_run_terminal_transport.cpp
+        stubs/profiling_copy_fault.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/chip_swimlane_collector.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/chip_swimlane_collector_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/device_run_result_base_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/sim/aicpu/inner_platform_regs.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/clock_correlation.cpp
+        ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
+    )
+    target_compile_definitions(${transport_test} PRIVATE SIMPLER_RUNTIME_NAME="${runtime}")
+    target_include_directories(${transport_test} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/stubs
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/aicpu
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/${runtime}
+        ${CMAKE_SOURCE_DIR}/../../../src/common
+    )
+    target_link_libraries(${transport_test} PRIVATE
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        pthread
+    )
+    add_test(NAME ${transport_test} COMMAND ${transport_test})
+    set_tests_properties(${transport_test} PROPERTIES LABELS "no_hardware")
+endforeach()
+
 # Sim kernel threads publish one sticky completion state. A gated unit test
 # proves submission and completion are separate without relying on kernel
 # duration or host scheduling.

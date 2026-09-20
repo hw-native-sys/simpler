@@ -424,6 +424,9 @@ public:
         output_prefix_ = output_prefix;
         chip_swimlane_level_ = chip_swimlane_level;
         json_extensions_.fill({});
+        // The previous run's live figures are not this run's; a comparison must
+        // report unknown until this run's reconcile has produced its own.
+        live_counters_ = LiveTaskCounters{};
         reset_collector_shards();
         publish_run_config();
     }
@@ -580,28 +583,45 @@ public:
      * `producers` counts the entries that carried the expected epoch, so a class
      * whose pools were disabled reports zero producers rather than zero records
      * — the two are different facts.
+     *
+     * `reported_indices` records *which* indices those were, not merely how
+     * many. Cardinality alone cannot tell a complete set from one where an
+     * unexpected index stands in for a missing expected one.
      */
     struct RunTerminalClassSnapshot {
         int producers{0};
         uint64_t total{0};
         uint64_t dropped{0};
+        std::vector<int> reported_indices;
     };
 
     /**
      * A run's retained terminal snapshot, read back from its bank.
      *
-     * `valid` is false whenever the read could not establish the snapshot: no
-     * region, an out-of-range bank, a zero epoch, a failed device copy, or a bank
-     * in which no entry carried the expected epoch. An invalid snapshot reports
-     * nothing about the run — it is *unknown*, never "zero records".
+     * `transport_ok` says the bank's bytes reached the host: the device copy
+     * succeeded, or the platform shares memory and no copy was needed. It is a
+     * property of the read, not of the contents — an all-zero bank and a bank
+     * holding only another run's entries are both successfully read.
      *
-     * A matching non-zero epoch is the whole validity test. It also covers the
+     * `valid` says at least one entry carried this run's epoch. It is entry
+     * presence, never coverage and never read success; a class's `producers`
+     * count is what carries how much of that class reported.
+     *
+     * The two combine into distinct outcomes, and a reader must not collapse
+     * them. `!transport_ok` means the input never arrived: nothing about the run
+     * is known, and no verdict follows. `transport_ok && !valid` means the bank
+     * was read and holds no entry for this run, which is a real observation —
+     * every expected producer is absent, which the consistency verdict reports
+     * as `Partial`, not as unknown.
+     *
+     * A matching non-zero epoch is the per-entry test. It also covers the
      * allocation's lifetime without a second mechanism: `initialize()` refuses
      * while a region is held, so a new one only follows `finalize()`, which nulls
      * the region pointer, and the new region's entries start at the zeroed
      * no-snapshot state.
      */
     struct RunTerminalSnapshot {
+        bool transport_ok{false};
         bool valid{false};
         uint64_t run_epoch{0};
         int foreign_entries{0};  // entries holding some other run's epoch
@@ -609,6 +629,24 @@ public:
         RunTerminalClassSnapshot aicore_task;
         RunTerminalClassSnapshot sched_phase;
         RunTerminalClassSnapshot orch_phase;
+    };
+
+    /**
+     * How one producer class's retained snapshot compares with the live pool
+     * counters that `reconcile_counters` summed for the same run.
+     *
+     * Both sides are device-derived and written by the same producer, so this
+     * states whether the retained copy agrees with the live one. It is not a
+     * record-loss finding: host-collected loss is reconcile's own
+     * `collected + dropped == total` check, which stays authoritative.
+     */
+    enum class RunTerminalVerdict {
+        Unknown,        // a required input was missing or unreadable
+        NotApplicable,  // no producer of this class was expected on this run
+        Unexpected,     // an entry carries this run's epoch at an index outside the expected set
+        Partial,        // an expected index published no entry for this run
+        Disagree,       // the expected indices all reported, but the sums differ
+        Agree,          // the expected indices all reported and the sums match
     };
 
     /**
@@ -635,8 +673,54 @@ public:
     RunTerminalSnapshot read_run_terminal_snapshot(uint32_t bank_index, uint64_t run_epoch);
 
     /**
-     * Read the snapshot and log it next to reconcile_counters' accounting, with
-     * its validity stated either way.
+     * One producer class's snapshot-vs-live consistency result.
+     *
+     * `expected_count` is meaningful only for the task classes, whose expected
+     * index set is `[0, num_aicore_)` and is host-known. The phase classes have
+     * no host-side expected set — see `run_terminal_consistency`.
+     */
+    struct RunTerminalClassConsistency {
+        RunTerminalVerdict verdict{RunTerminalVerdict::Unknown};
+        int expected_count{0};
+        int reported_count{0};
+        int missing_count{0};
+        int unexpected_count{0};
+    };
+
+    struct RunTerminalConsistency {
+        RunTerminalClassConsistency aicpu_task;
+        RunTerminalClassConsistency aicore_task;
+        RunTerminalClassConsistency sched_phase;
+        RunTerminalClassConsistency orch_phase;
+    };
+
+    /**
+     * Compare this run's retained snapshot with the live pool counters
+     * `reconcile_counters` summed for the same run.
+     *
+     * Scope: snapshot-vs-live consistency for one run under the current
+     * exclusivity, per-run reset and completion-fence preconditions. It does
+     * not establish that a run's accounting is complete, that the host lost no
+     * records, or that snapshots would remain sound under overlapping runs.
+     *
+     * Only the task classes are compared. Their expected index set is
+     * `[0, num_aicore_)`, which the host supplies to `initialize()` and
+     * therefore knows independently of anything the device reports. The phase
+     * classes report `Unknown`: their producer counts exist only as untagged
+     * device observations in the shared header, which no per-run reset clears,
+     * so a successful read cannot distinguish this run's counts from a previous
+     * run's. Supplying an independent phase denominator needs configuration the
+     * host does not have, and is not attempted here.
+     *
+     * Must be called after `reconcile_counters` for the same run, which is what
+     * captures the live side.
+     */
+    RunTerminalConsistency run_terminal_consistency(const RunTerminalSnapshot &snapshot) const;
+
+    /**
+     * Read the snapshot, compare it with the live counters, and log both beside
+     * `reconcile_counters`' accounting. Diagnostic only: it changes no run
+     * outcome and reconcile stays authoritative.
      */
     void report_run_terminal_snapshot(uint32_t bank_index, uint64_t run_epoch);
 
@@ -727,6 +811,23 @@ private:
     uint64_t host_phase_total_records_{0};
     uint64_t host_phase_dropped_records_{0};
     uint64_t host_phase_submitted_tasks_{0};
+
+    // The live pool figures reconcile_counters summed for the current run, kept
+    // so the terminal-snapshot comparison reads the same numbers reconcile
+    // logged rather than re-deriving them.
+    //
+    // `live_ok` is false until a reconcile pass for this run has produced them,
+    // and `begin_run` clears it: a previous run's live figures are not this
+    // run's, and comparing against them would report agreement that was never
+    // established. Only the AICPU task class is captured — reconcile does not
+    // sum the AICore pool at all.
+    struct LiveTaskCounters {
+        bool live_ok{false};
+        bool mirror_ok{false};  // the bulk device mirror reconcile reads succeeded
+        uint64_t aicpu_task_total{0};
+        uint64_t aicpu_task_dropped{0};
+    };
+    LiveTaskCounters live_counters_{};
 
     size_t normalize_collector_shard(int collector_shard) const;
     void reset_collector_shards();

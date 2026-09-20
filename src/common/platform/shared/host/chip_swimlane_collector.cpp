@@ -735,8 +735,18 @@ void ChipSwimlaneCollector::reconcile_counters() {
     // state. Per-buffer contents are pulled individually inside reconcile_one —
     // an un-flushed active buffer was never enqueued, so the mgmt loop's
     // process_entry never copied its contents into the shadow.
+    //
+    // `mirror_ok` records whether these bytes actually arrived. The existing
+    // reconcile logging is unchanged by a failure — it reports whatever the
+    // shadow holds, as it always has — but the terminal-snapshot comparison
+    // refuses to call a stale mirror agreement.
+    live_counters_.mirror_ok = true;
     if (manager_.shared_mem_dev() != nullptr && shm_size_ > 0) {
-        profiling_copy_from_device(shm_host_, manager_.shared_mem_dev(), shm_size_);
+        int mirror_rc = profiling_copy_from_device(shm_host_, manager_.shared_mem_dev(), shm_size_);
+        if (mirror_rc != 0) {
+            live_counters_.mirror_ok = false;
+            LOG_WARN("ChipSwimlane reconcile: shared-memory mirror refresh failed (rc=%d)", mirror_rc);
+        }
     }
     rmb();
 
@@ -757,8 +767,12 @@ void ChipSwimlaneCollector::reconcile_counters() {
     //
     // This check covers the PERF and PHASE pools. The AICore task pool is not
     // reconciled here at all, so it says nothing about that pool either way.
+    // `live_out` is non-null only for the PERF class, whose device sums the
+    // terminal-snapshot comparison reads back. Set at the point the sums are
+    // complete, before the early return below can skip the logging.
     auto reconcile_one = [&](const char *kind, const char *unit_name, int unit_count, auto get_state,
-                             auto read_buf_count, size_t buf_size, uint64_t collected, bool optional) {
+                             auto read_buf_count, size_t buf_size, uint64_t collected, bool optional,
+                             LiveTaskCounters *live_out) {
         int leftover_active = 0;
         for (int i = 0; i < unit_count; i++) {
             ChipSwimlaneAicpuTaskPool *state = get_state(i);
@@ -786,6 +800,11 @@ void ChipSwimlaneCollector::reconcile_counters() {
             ChipSwimlaneAicpuTaskPool *state = get_state(i);
             total_device += state->head.total_record_count;
             dropped_device += state->head.dropped_record_count;
+        }
+        if (live_out != nullptr) {
+            live_out->aicpu_task_total = total_device;
+            live_out->aicpu_task_dropped = dropped_device;
+            live_out->live_ok = true;
         }
 
         // PHASE counters are populated only by runtimes that actually emit
@@ -832,7 +851,7 @@ void ChipSwimlaneCollector::reconcile_counters() {
         [](void *host_ptr) {
             return reinterpret_cast<ChipSwimlaneAicpuTaskBuffer *>(host_ptr)->count;
         },
-        sizeof(ChipSwimlaneAicpuTaskBuffer), total_perf_collected_, /*optional=*/false
+        sizeof(ChipSwimlaneAicpuTaskBuffer), total_perf_collected_, /*optional=*/false, &live_counters_
     );
 
     reconcile_one(
@@ -843,7 +862,7 @@ void ChipSwimlaneCollector::reconcile_counters() {
         [](void *host_ptr) {
             return reinterpret_cast<ChipSwimlaneAicpuSchedPhaseBuffer *>(host_ptr)->count;
         },
-        sizeof(ChipSwimlaneAicpuSchedPhaseBuffer), total_sched_phase_collected_, /*optional=*/true
+        sizeof(ChipSwimlaneAicpuSchedPhaseBuffer), total_sched_phase_collected_, /*optional=*/true, nullptr
     );
 
     reconcile_one(
@@ -854,7 +873,7 @@ void ChipSwimlaneCollector::reconcile_counters() {
         [](void *host_ptr) {
             return reinterpret_cast<ChipSwimlaneAicpuOrchPhaseBuffer *>(host_ptr)->count;
         },
-        sizeof(ChipSwimlaneAicpuOrchPhaseBuffer), total_orch_phase_collected_, /*optional=*/true
+        sizeof(ChipSwimlaneAicpuOrchPhaseBuffer), total_orch_phase_collected_, /*optional=*/true, nullptr
     );
 }
 
@@ -900,7 +919,13 @@ ChipSwimlaneCollector::read_run_terminal_snapshot(uint32_t bank_index, uint64_t 
     // Narrow and checked, rather than relying on the bulk mirror reconcile does:
     // this is the only read of these bytes, and an unchecked copy would turn a
     // failed transfer into a snapshot of whatever the shadow happened to hold.
-    if (perf_shared_mem_dev_ != nullptr) {
+    //
+    // A platform whose host and device share the region installs no copy hook,
+    // so `perf_shared_mem_dev_` aliases `shm_host_` and there is nothing to
+    // transfer. That is a successful read of bytes already in place, not a
+    // skipped one: `transport_ok` is true either way, and it stays false only
+    // when a copy was attempted and failed.
+    if (perf_shared_mem_dev_ != nullptr && perf_shared_mem_dev_ != shm_host_) {
         ChipSwimlaneRunTerminal *dev_bank = get_run_terminal_bank(perf_shared_mem_dev_, static_cast<int>(bank_index));
         int rc = profiling_copy_from_device(host_bank, dev_bank, calc_run_terminal_bank_size());
         if (rc != 0) {
@@ -911,6 +936,7 @@ ChipSwimlaneCollector::read_run_terminal_snapshot(uint32_t bank_index, uint64_t 
             return snapshot;
         }
     }
+    snapshot.transport_ok = true;
     rmb();
 
     auto accumulate = [&](RunTerminalClassSnapshot &cls, int base, int count) {
@@ -923,6 +949,10 @@ ChipSwimlaneCollector::read_run_terminal_snapshot(uint32_t bank_index, uint64_t 
                 continue;
             }
             cls.producers++;
+            // Which index reported, not merely how many: a class whose count
+            // matches can still have an unexpected index standing in for a
+            // missing expected one.
+            cls.reported_indices.push_back(i);
             cls.total += entry->total;
             cls.dropped += entry->dropped;
         }
@@ -937,14 +967,104 @@ ChipSwimlaneCollector::read_run_terminal_snapshot(uint32_t bank_index, uint64_t 
     return snapshot;
 }
 
+namespace {
+
+const char *run_terminal_verdict_name(ChipSwimlaneCollector::RunTerminalVerdict v) {
+    switch (v) {
+    case ChipSwimlaneCollector::RunTerminalVerdict::Unknown:
+        return "unknown";
+    case ChipSwimlaneCollector::RunTerminalVerdict::NotApplicable:
+        return "n/a";
+    case ChipSwimlaneCollector::RunTerminalVerdict::Unexpected:
+        return "unexpected";
+    case ChipSwimlaneCollector::RunTerminalVerdict::Partial:
+        return "partial";
+    case ChipSwimlaneCollector::RunTerminalVerdict::Disagree:
+        return "disagree";
+    case ChipSwimlaneCollector::RunTerminalVerdict::Agree:
+        return "agree";
+    }
+    return "unknown";
+}
+
+}  // namespace
+
+ChipSwimlaneCollector::RunTerminalConsistency
+ChipSwimlaneCollector::run_terminal_consistency(const RunTerminalSnapshot &snapshot) const {
+    RunTerminalConsistency result;
+
+    // The phase classes stay Unknown, which is their default. Their producer
+    // counts live in the shared header as untagged device observations that no
+    // per-run reset clears, so a successful read cannot tell this run's counts
+    // from a previous run's — there is no independent denominator to compare
+    // against, and claiming coverage from that would be claiming more than the
+    // data supports.
+
+    // A failed transfer means the bytes examined below are not this run's.
+    if (!snapshot.transport_ok) return result;
+
+    // The expected index set for both task classes is [0, num_aicore_): the
+    // host passed that count to initialize(), so it does not depend on anything
+    // the device reports back.
+    const int expected = num_aicore_;
+
+    auto classify = [&](const RunTerminalClassSnapshot &cls, bool have_live, uint64_t live_total,
+                        uint64_t live_dropped) {
+        RunTerminalClassConsistency out;
+        out.expected_count = expected;
+        out.reported_count = cls.producers;
+
+        for (int index : cls.reported_indices) {
+            if (index >= expected) out.unexpected_count++;
+        }
+        int in_set = cls.producers - out.unexpected_count;
+        out.missing_count = expected - in_set;
+
+        if (out.unexpected_count > 0) {
+            // Ranked above a gap and above a sum difference, and reported even
+            // when the expected set is empty or the cardinality happens to
+            // match: an entry at an index no producer of this run owns says the
+            // identity mapping is wrong, which subsumes either of the others.
+            out.verdict = RunTerminalVerdict::Unexpected;
+            return out;
+        }
+        if (expected == 0) {
+            out.verdict = RunTerminalVerdict::NotApplicable;
+            return out;
+        }
+        if (out.missing_count > 0) {
+            out.verdict = RunTerminalVerdict::Partial;
+            return out;
+        }
+        if (!have_live) {
+            // Every expected producer reported, but there is nothing sound to
+            // compare the sums against.
+            out.verdict = RunTerminalVerdict::Unknown;
+            return out;
+        }
+        out.verdict = (cls.total == live_total && cls.dropped == live_dropped) ? RunTerminalVerdict::Agree :
+                                                                                 RunTerminalVerdict::Disagree;
+        return out;
+    };
+
+    const bool live_usable = live_counters_.live_ok && live_counters_.mirror_ok;
+    result.aicpu_task =
+        classify(snapshot.aicpu_task, live_usable, live_counters_.aicpu_task_total, live_counters_.aicpu_task_dropped);
+    // AICore has no live counterpart: reconcile_counters does not sum the
+    // AICore pool, so its coverage can be checked but its sums cannot be
+    // compared. It never reaches Agree or Disagree.
+    result.aicore_task = classify(snapshot.aicore_task, /*have_live=*/false, 0, 0);
+    return result;
+}
+
 void ChipSwimlaneCollector::report_run_terminal_snapshot(uint32_t bank_index, uint64_t run_epoch) {
     if (shm_host_ == nullptr) return;
 
     RunTerminalSnapshot snapshot = read_run_terminal_snapshot(bank_index, run_epoch);
-    if (!snapshot.valid) {
+    if (!snapshot.transport_ok) {
         LOG_INFO(
-            "ChipSwimlane terminal: no retained snapshot for epoch %lu in bank %u (foreign_entries=%d)",
-            static_cast<unsigned long>(run_epoch), bank_index, snapshot.foreign_entries
+            "ChipSwimlane terminal: bank %u unreadable for epoch %lu — no snapshot and no consistency verdict",
+            bank_index, static_cast<unsigned long>(run_epoch)
         );
         return;
     }
@@ -971,6 +1091,22 @@ void ChipSwimlaneCollector::report_run_terminal_snapshot(uint32_t bank_index, ui
             snapshot.foreign_entries
         );
     }
+
+    // Snapshot-vs-live consistency for this run only. It says whether the
+    // retained copy matches the live counters reconcile summed; it is not a
+    // statement that the run's accounting is complete, that no records were
+    // lost, or that the mechanism is sound under overlapping runs.
+    RunTerminalConsistency consistency = run_terminal_consistency(snapshot);
+    auto log_verdict = [&](const char *kind, const RunTerminalClassConsistency &c) {
+        LOG_INFO(
+            "ChipSwimlane terminal: epoch %lu %s snapshot-vs-live %s "
+            "(expected=%d reported=%d missing=%d unexpected=%d)",
+            static_cast<unsigned long>(run_epoch), kind, run_terminal_verdict_name(c.verdict), c.expected_count,
+            c.reported_count, c.missing_count, c.unexpected_count
+        );
+    };
+    log_verdict("PERF", consistency.aicpu_task);
+    log_verdict("AICORE", consistency.aicore_task);
 }
 
 void ChipSwimlaneCollector::publish_run_config() {
