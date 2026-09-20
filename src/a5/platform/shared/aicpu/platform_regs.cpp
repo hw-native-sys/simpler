@@ -46,6 +46,12 @@ uint64_t platform_aicore_exit_deadline() { return get_sys_cnt_aicpu() + inner_ge
 void platform_close_aicore_window(uint64_t reg_addr) {
     // Initialize task dispatch register to idle state
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
+    // Complete the posted MMIO close. The store retires into the bus's
+    // outstanding queue on its early write-ack and is not a device-write
+    // completion fence on its own; a load to the same register cannot pass it,
+    // so this readback is what drains it. The drain that pairs with this read is
+    // the caller's, so several windows share one.
+    (void)read_reg(reg_addr, RegId::DATA_MAIN_BASE);
 }
 
 int32_t platform_retire_aicore_group(const uint64_t *reg_addrs, size_t count, uint64_t deadline, bool *released) {
@@ -104,6 +110,10 @@ int32_t platform_retire_aicore_group(const uint64_t *reg_addrs, size_t count, ui
             rc = -1;
         }
     }
+    // One drain covers every readback the close pass issued, and it is what
+    // orders every store below after the close it belongs to: a dsb blocks every
+    // later instruction until it completes.
+    rmb();
     if (released != nullptr) {
         for (size_t i = 0; i < count; ++i)
             released[i] = acknowledged[i];
