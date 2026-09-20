@@ -107,10 +107,16 @@ public:
     // Orchestrator threads (core_trackers_[thread_idx].core_num() == 0) are a no-op.
     int32_t shutdown(int32_t thread_idx);
 
-    // Hand a set of cores to the platform as one retirement group.
+    // Hand a set of cores to the platform as one retirement group. The caller
+    // owns them: every path in here either holds the owning thread's claim or is
+    // the only path that can reach the core at all.
     int32_t retire_cores(const int32_t *core_ids, int32_t core_num);
 
-    // Retire every handshake'd core.
+    // Retire the cores one scheduler thread owns, behind that thread's claim.
+    int32_t retire_thread_cores(int32_t owner_thread);
+
+    // Retire every handshake'd core. Claims per owning thread, so it composes
+    // with the per-thread shutdown() already running.
     int32_t retire_all_cores();
 
     // Run all post-orchestration scheduler bookkeeping:
@@ -185,6 +191,16 @@ private:
     // be submitted; schedulers poll it.
     std::atomic<bool> orchestrator_done_{false};
     std::atomic<bool> completed_{false};
+    // Published before completed_, so a thread that observes completion also
+    // observes this and cannot enter the healthy shutdown path for a fatal run.
+    std::atomic<bool> fatal_shutdown_started_{false};
+    // Retirement claim, one per scheduler thread rather than one per core. Core
+    // ownership is a partition -- assign_cores_to_threads hands every cluster to
+    // exactly one scheduler thread -- so a thread's set is the smallest unit the
+    // normal and the emergency path can contend for, and claiming at that unit
+    // is one atomic per thread instead of one per core for the same
+    // exactly-once guarantee. Reset in pre_handshake_init.
+    uint8_t thread_retired_[MAX_AICPU_THREADS];
     // The active callable's registration-owned object-address table and the
     // number of entries it holds, both bound from the descriptor in the cold
     // path. The table is in the callable's registration block, not in the
@@ -237,6 +253,12 @@ private:
     // Emergency shutdown: broadcast exit signal to every handshake'd core and
     // deinit their AICore register blocks. Idempotent.
     void emergency_shutdown(Runtime *runtime);
+
+    // Elect exactly one thread to drive the emergency retirement. Returns true
+    // to the elected caller only; publishes the fatal flag before the
+    // completion latch.
+    bool begin_emergency_shutdown();
+    void signal_emergency_shutdown(Runtime *runtime);
 
     // =========================================================================
     // Dispatch (scheduler_dispatch.cpp)
