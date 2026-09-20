@@ -93,6 +93,25 @@ public:
     std::vector<KernelRoundAdmission> admissions;
 };
 
+TEST(TmrKernelRoundGateTest, SchedulerPublishesInitWhenLaunchLeaderIsOrchestrator) {
+    KernelRoundGate gate;
+    Round round(gate);
+    const int32_t allowed[]{1, 0};
+    ASSERT_TRUE(gate.publish_admission(round.tickets[0], allowed, 2, 0, 0));
+    for (size_t i = 0; i < round.tickets.size(); ++i) {
+        ASSERT_TRUE(gate.wait_admission(round.tickets[i], &round.admissions[i]));
+        if (round.admissions[i].execution_index >= 0) ASSERT_TRUE(gate.report_init(round.tickets[i], 0));
+    }
+    EXPECT_FALSE(gate.publish_init_verdict(round.tickets[0]));
+    ASSERT_TRUE(gate.publish_init_verdict(round.tickets[1]));
+    for (const auto &ticket : round.tickets) {
+        int32_t status = -1;
+        ASSERT_TRUE(gate.wait_init_verdict(ticket, &status));
+        EXPECT_EQ(status, 0);
+    }
+    round.finish(0, 0, 0, 0);
+}
+
 TEST(TmrKernelRoundGateTest, BoundsAndDuplicateProtocolOperationsDoNotAdvanceRound) {
     KernelRoundGate gate;
     KernelRoundTicket unchanged{77, 99};

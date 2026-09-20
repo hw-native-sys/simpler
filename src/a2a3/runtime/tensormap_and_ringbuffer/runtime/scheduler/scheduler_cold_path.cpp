@@ -1295,8 +1295,12 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime, simpler::tmr::Ca
     }
     memcpy(aic_worker_ids_, local_aic, static_cast<size_t>(la) * sizeof(int32_t));
     memcpy(aiv_worker_ids_, local_aiv, static_cast<size_t>(lv) * sizeof(int32_t));
-    aic_count_ = la;
-    aiv_count_ = lv;
+    if (kernel_cores_ == nullptr) {
+        aic_count_ = la;
+        aiv_count_ = lv;
+    } else if (la != aic_count_ || lv != aiv_count_) {
+        return -1;
+    }
     LOG_INFO("Core discovery complete: %d AIC, %d AIV", aic_count_, aiv_count_);
 
     if (!assign_cores_to_threads()) {
@@ -1320,10 +1324,10 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime, simpler::tmr::Ca
 
     // total_tasks_ is read in pre_handshake_init (before the orchestrator's early
     // SM reset on the decoupled path can zero the ring counters).
-    completed_tasks_.store(0, std::memory_order_release);
+    if (kernel_cores_ == nullptr) completed_tasks_.store(0, std::memory_order_release);
 
     // Device orchestration: the orchestrator thread flips this when the graph is built.
-    orchestrator_done_.store(false, std::memory_order_release);
+    if (kernel_cores_ == nullptr) orchestrator_done_.store(false, std::memory_order_release);
 
     // prepare_subtask_to_core fully writes a per-core payload / deferred-slab slot
     // before the AICore is told to read it: build_payload sets
@@ -1379,7 +1383,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime, simpler::tmr::Ca
         }
     }
 
-    functions_ = functions;
+    if (kernel_cores_ == nullptr) functions_ = functions;
 
     return 0;
 }

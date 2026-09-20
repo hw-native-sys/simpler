@@ -47,13 +47,31 @@ int32_t execute_kernel_round_impl(
                 status = -1;
             }
         }
-        if (!gate.publish_admission(ticket, request.allowed_cpus, request.execution_threads, status)) return -1;
+        if (!gate.publish_admission(
+                ticket, request.allowed_cpus, request.execution_threads, status,
+                status == 0 && executor.kernel_orchestration_overlaps() ? 0 : -1
+            ))
+            return -1;
     }
     KernelRoundAdmission admission;
     if (!gate.wait_admission(ticket, &admission)) return -1;
     int32_t status = admission.status;
     const KernelThreadView thread{admission.execution_index, request.execution_threads};
     if (status == 0) {
+        const bool overlap = executor.kernel_orchestration_overlaps();
+        const bool early_orch = overlap && thread.execution_index == thread.execution_threads - 1;
+        const bool init_owner = overlap ? thread.execution_index == 0 : ticket.launch_index == 0;
+        auto run = [&]() noexcept {
+            const auto &invocation = executor.kernel_invocation_;
+            int32_t result;
+            try {
+                result = executor.run(invocation.resident(), invocation.inputs(), &thread);
+            } catch (...) {
+                result = -1;
+            }
+            if (result != 0) executor.kernel_run_failed(thread);
+            return result;
+        };
         if (thread.execution_index >= 0) {
             int32_t initialized;
             try {
@@ -63,7 +81,8 @@ int32_t execute_kernel_round_impl(
             }
             if (!gate.report_init(ticket, initialized)) return -1;
         }
-        if (ticket.launch_index == 0 && !gate.publish_init_verdict(ticket, [&]() noexcept {
+        const int32_t early_status = early_orch ? run() : 0;
+        if (init_owner && !gate.publish_init_verdict(ticket, [&]() noexcept {
                 try {
                     return executor.complete_kernel_init();
                 } catch (...) {
@@ -72,14 +91,10 @@ int32_t execute_kernel_round_impl(
             }))
             return -1;
         if (!gate.wait_init_verdict(ticket, &status)) return -1;
-        if (status == 0 && thread.execution_index >= 0) {
-            const auto &invocation = executor.kernel_invocation_;
-            try {
-                status = executor.run(invocation.resident(), invocation.inputs(), &thread);
-            } catch (...) {
-                status = -1;
-            }
-            if (status != 0) executor.cancel_kernel_round();
+        if (init_owner) executor.publish_kernel_init(status);
+        if (status == 0) {
+            if (early_orch) status = early_status;
+            else if (thread.execution_index >= 0) status = run();
         }
     }
     const auto arrival = gate.arrive(ticket, status);

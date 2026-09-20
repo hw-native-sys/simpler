@@ -14,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <chrono>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -34,6 +35,13 @@ public:
     void wait() {
         std::unique_lock<std::mutex> lock(mutex_);
         condition_.wait(lock, [&] {
+            return ready_;
+        });
+    }
+
+    bool wait_for() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_for(lock, std::chrono::seconds(2), [&] {
             return ready_;
         });
     }
@@ -84,6 +92,11 @@ struct ExecutorModel {
     TmrLaunchControl control{};
     std::array<TmrCoreReport, 3> reports{};
     const std::array<int32_t, kExecutionThreads> allowed{10, 11, 12};
+    bool overlap{false};
+    Signal orch_started;
+    Signal init_completed;
+    std::atomic<bool> overlapped{false};
+    std::atomic<bool> init_finished{false};
     int32_t complete_status{0};
     int32_t finalize_status{0};
     int32_t failing_run_index{-1};
@@ -113,7 +126,15 @@ struct ExecutorModel {
         kernel_invocation_.active = true;
         return 0;
     }
-    int32_t initialize_kernel_thread(const KernelThreadView &) {
+    bool kernel_orchestration_overlaps() const { return overlap; }
+    void publish_kernel_init(int32_t status) {
+        init_finished = true;
+        init_completed.set();
+        if (status != 0 && overlap) cancel_kernel_round();
+    }
+    void kernel_run_failed(const KernelThreadView &) { cancel_kernel_round(); }
+    int32_t initialize_kernel_thread(const KernelThreadView &thread) {
+        if (overlap && thread.execution_index == 0) overlapped = orch_started.wait_for();
         ++initializers;
         return 0;
     }
@@ -124,8 +145,13 @@ struct ExecutorModel {
         return complete_status;
     }
     int32_t run(Runtime *, const ExecutionInputs &, const KernelThreadView *thread) {
-        EXPECT_TRUE(init_published.load());
-        EXPECT_EQ(complete_status, 0);
+        if (overlap && thread->execution_index == kExecutionThreads - 1) {
+            orch_started.set();
+            EXPECT_TRUE(init_completed.wait_for());
+        } else {
+            EXPECT_TRUE(init_published.load());
+            EXPECT_EQ(complete_status, 0);
+        }
         EXPECT_TRUE(kernel_invocation_.active.load());
         EXPECT_EQ(kernel_invocation_.storage.load(), kStorageValue);
         ++runs;
@@ -264,6 +290,30 @@ TEST(TmrKernelExecutionRoundTest, SlowReportPublisherBlocksNativeReturnAndOverwr
     EXPECT_EQ(executor.clears.load(), 1);
     EXPECT_FALSE(executor.kernel_invocation_.active.load());
     EXPECT_EQ(executor.kernel_invocation_.storage.load(), 0u);
+    EXPECT_TRUE(executor.kernel_gate_.idle());
+}
+
+TEST(TmrKernelExecutionRoundTest, OrchestrationOverlapsSchedulerInitialization) {
+    ExecutorModel executor;
+    executor.overlap = true;
+    for (int32_t result : run_round(executor))
+        EXPECT_EQ(result, 0);
+    EXPECT_TRUE(executor.overlapped.load());
+    EXPECT_EQ(executor.runs.load(), ExecutorModel::kExecutionThreads);
+    EXPECT_EQ(executor.completions.load(), 1);
+    EXPECT_EQ(executor.clears.load(), 1);
+}
+
+TEST(TmrKernelExecutionRoundTest, OverlappedInitFailureCancelsOrchAndSkipsDispatch) {
+    ExecutorModel executor;
+    executor.overlap = true;
+    executor.complete_status = -27;
+    for (int32_t result : run_round(executor))
+        EXPECT_EQ(result, -27);
+    EXPECT_TRUE(executor.overlapped.load());
+    EXPECT_EQ(executor.runs.load(), 1);
+    EXPECT_EQ(executor.cancellations.load(), 1);
+    EXPECT_EQ(executor.clears.load(), 1);
     EXPECT_TRUE(executor.kernel_gate_.idle());
 }
 

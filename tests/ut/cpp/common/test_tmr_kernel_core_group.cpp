@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <functional>
 #include <iterator>
+#include <thread>
 #include <vector>
 
 #include "tensormap_and_ringbuffer/kernel_core_group.h"
@@ -261,6 +262,39 @@ TEST_F(TmrKernelCoreGroupTest, InvalidDuplicateAndWrongTypeReportsNeverOpenRegis
         EXPECT_EQ(model.count(EventKind::Open), 0u);
         EXPECT_EQ(model.count(EventKind::PublishOpen), 0u);
         EXPECT_EQ(model.count(EventKind::SignalExit), 0u);
+    }
+}
+
+TEST_F(TmrKernelCoreGroupTest, ParallelPartitionsValidateAcrossPartitionBoundaries) {
+    for (int threads : {2, 3, 4}) {
+        for (int invalid = 0; invalid < 4; ++invalid) {
+            SCOPED_TRACE(threads);
+            SCOPED_TRACE(invalid);
+            model.reset();
+            model.ready_all();
+            if (invalid == 1) model.reports[2].physical_core_id = model.reports[0].physical_core_id;
+            if (invalid == 2) model.reports[1].core_type = static_cast<uint32_t>(CoreType::AIC);
+            if (invalid == 3) model.reports[2].core_type = 99;
+            KernelCoreGroup group;
+            ASSERT_TRUE(group.attach(model.view()));
+            std::vector<int32_t> results(threads);
+            std::vector<std::thread> workers;
+            for (int i = 0; i < threads; ++i)
+                workers.emplace_back([&, i] {
+                    results[i] = group.collect_reports_partition(
+                        model.registers.data(), PlatformModel::kPhysicalCount, i, threads
+                    );
+                });
+            for (auto &worker : workers)
+                worker.join();
+            for (int32_t result : results)
+                EXPECT_EQ(result, invalid == 0 ? 0 : -1);
+            EXPECT_EQ(model.count(EventKind::Open), 0u);
+            if (invalid == 0) {
+                for (int i = 0; i < 3; ++i)
+                    EXPECT_EQ(group.register_address(i), model.registers[i]);
+            }
+        }
     }
 }
 

@@ -170,6 +170,16 @@ launch 不分配设备内存、不创建 stream/event、不同步、不查询 ca
 设备入口先检查公共 framing 和镜像跨度（非零、对齐、不小于 `sizeof(ChipCallable)`、
 不溢出），再由 TMR consumer 建立缓存可见性并校验绑定、大小、参数数量和
 signature，解码到本次调用的私有参数，进入真实 executor。
+TMR 默认多线程启动时，公共参数和 profiling 准备完成后，orchestrator 开始建图，
+scheduler 线程同时分区收集 AICore report。所有 report 收集完成并通过物理核唯一性及
+AIC/AIV 数量校验后，各分区并行开窗；scheduler 在统一初始化判定成功后才派发任务。
+初始化判定由 scheduler 角色 0 发布，不依赖哪个线程最先进入 launch。
+已有串行配置保留建图前的初始化屏障。
+
+初始化失败时，取消信号在 orchestrator 完成 SM 重置后发布；开窗线程全部退出初始化后
+才允许取消。orchestrator 完成建图后的统计和错误处理也等待初始化判定，避免读取尚未
+建立的核分配。最终回收仍等待全部 AICPU 参与者停止使用本轮资源。
+
 HBG 已有内部 packet/restore consumer，公共 kernel launch owner 尚未接线。
 
 部分已提交工作的失败会使 context 进入 Poisoned。若外围包在建立可信绑定前被拒绝，

@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -31,7 +32,7 @@ struct KernelHandshakeView {
 };
 
 // One run's borrowed control region and register mappings. The prepare provider
-// owns/pins every address. Attach, report collection and finish have one owner;
+// owns/pins every address. Attach and finish have one owner; report collection and
 // open is partitioned by worker index and finishes before cancel or dispatch.
 // This class never clears a Host-owned region or infers readiness from an SPR.
 class KernelCoreGroup {
@@ -49,6 +50,9 @@ public:
             !(control + sizeof(TmrLaunchControl) <= reports || reports + reports_bytes <= control))
             return false;
         view_ = view;
+        reports_arrived_.store(0, std::memory_order_relaxed);
+        reports_status_.store(0, std::memory_order_relaxed);
+        reports_ready_.store(false, std::memory_order_relaxed);
         for (int32_t i = 0; i < view.worker_count; ++i) {
             regs_[i] = 0;
             physical_ids_[i] = 0;
@@ -62,6 +66,31 @@ public:
     // reports (including uniqueness) before opening any window: an invalid or
     // duplicate physical ID must not cause MMIO to an unowned core.
     int32_t collect_reports(const uint64_t *registers, uint32_t physical_count) noexcept {
+        return collect_reports_partition(registers, physical_count, 0, 1);
+    }
+
+    // Exactly one caller per partition. No caller opens a window until every
+    // partition has published its reports and the global validation completes.
+    int32_t collect_reports_partition(
+        const uint64_t *registers, uint32_t physical_count, int32_t index, int32_t threads
+    ) noexcept {
+        if (threads <= 0 || index < 0 || index >= threads) return -1;
+        const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(index) * view_.worker_count) / threads);
+        const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(index + 1) * view_.worker_count) / threads);
+        const int32_t status = collect_report_range(registers, physical_count, lo, hi);
+        if (status != 0) reports_status_.store(status, std::memory_order_relaxed);
+        if (reports_arrived_.fetch_add(1, std::memory_order_acq_rel) + 1 == threads) {
+            if (reports_status_.load(std::memory_order_relaxed) == 0)
+                reports_status_.store(validate_reports(), std::memory_order_relaxed);
+            reports_ready_.store(true, std::memory_order_release);
+        } else {
+            while (!reports_ready_.load(std::memory_order_acquire)) {}
+        }
+        return reports_status_.load(std::memory_order_relaxed);
+    }
+
+private:
+    int32_t collect_report_range(const uint64_t *registers, uint32_t physical_count, int32_t lo, int32_t hi) noexcept {
         if (registers == nullptr || physical_count == 0) return -1;
         auto &control = *view_.control;
         cache_invalidate_range(&control, sizeof(control));
@@ -69,8 +98,7 @@ public:
             control.cleanup_status != 0 || control.round_epoch != 0)
             return -1;
         const uint64_t deadline = platform_aicore_exit_deadline();
-        int32_t aic_count = 0;
-        for (int32_t i = 0; i < view_.worker_count; ++i) {
+        for (int32_t i = lo; i < hi; ++i) {
             auto &report = view_.reports[i];
             for (;;) {
                 cache_invalidate_range(&report, sizeof(report));
@@ -86,17 +114,28 @@ public:
             if (pcid >= physical_count || registers[pcid] == 0 ||
                 (type != static_cast<uint32_t>(CoreType::AIC) && type != static_cast<uint32_t>(CoreType::AIV)))
                 return -1;
-            for (int32_t j = 0; j < i; ++j)
-                if (physical_ids_[j] == pcid) return -1;
             physical_ids_[i] = pcid;
             types_[i] = static_cast<CoreType>(type);
-            if (types_[i] == CoreType::AIC) ++aic_count;
             regs_[i] = registers[pcid];
         }
-        // Scheduler cluster assignment requires one AIC and two AIV workers.
+        return 0;
+    }
+
+    int32_t validate_reports() const noexcept {
+        int32_t aic_count = 0;
+        for (int32_t i = 0; i < view_.worker_count; ++i) {
+            for (int32_t j = 0; j < i; ++j)
+                if (physical_ids_[j] == physical_ids_[i]) return -1;
+            if (types_[i] == CoreType::AIC) ++aic_count;
+        }
         return view_.worker_count % 3 == 0 && aic_count == view_.worker_count / 3 ? 0 : -1;
     }
 
+    std::atomic<int32_t> reports_arrived_{0};
+    std::atomic<int32_t> reports_status_{0};
+    std::atomic<bool> reports_ready_{false};
+
+public:
     uint64_t register_address(int32_t index) const noexcept { return regs_[index]; }
     uint32_t physical_id(int32_t index) const noexcept { return physical_ids_[index]; }
     CoreType core_type(int32_t index) const noexcept { return types_[index]; }

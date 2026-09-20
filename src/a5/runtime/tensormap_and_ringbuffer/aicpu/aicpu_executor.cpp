@@ -163,6 +163,7 @@ struct AicpuExecutor {
     simpler::tmr::KernelRoundGate kernel_gate_;
     simpler::tmr::KernelCoreGroup kernel_cores_;
     bool kernel_control_attached_{false};
+    std::atomic<bool> kernel_init_ready_{false};
     simpler::tmr::PreparedKernelContext kernel_context_;
     bool kernel_context_ready_{false};
 
@@ -195,6 +196,9 @@ struct AicpuExecutor {
     int32_t prepare_kernel_round(const simpler::tmr::KernelExecutionRequest &request);
     int32_t initialize_kernel_thread(const simpler::tmr::KernelThreadView &thread);
     int32_t complete_kernel_init();
+    bool kernel_orchestration_overlaps() const { return aicpu_thread_num_ > 1 && !serial_orch_sched_; }
+    void publish_kernel_init(int32_t status) noexcept;
+    void kernel_run_failed(const simpler::tmr::KernelThreadView &thread) noexcept;
     int32_t finalize_kernel_round();
     void clear_kernel_round() noexcept;
     void cancel_kernel_round() noexcept;
@@ -824,6 +828,10 @@ int32_t AicpuExecutor::run(
 #endif
 #endif  // SIMPLER_ORCH_PROFILING
 
+            if (kernel_thread != nullptr && kernel_orchestration_overlaps()) {
+                while (!kernel_init_ready_.load(std::memory_order_acquire)) {}
+            }
+
             // Latch task count from shared memory to hand off to the
             // scheduler. The orchestrator's run window (start_time / end_time /
             // submit_count) is no longer published to shared memory — the
@@ -943,6 +951,7 @@ void AicpuExecutor::deinit(Runtime * /*runtime*/, bool /*invalidate_host_image*/
 
     finished_count_.store(0, std::memory_order_release);
     runtime_init_ready_.store(false, std::memory_order_release);
+    kernel_init_ready_.store(false, std::memory_order_relaxed);
 
     aicpu_thread_num_ = 0;
     sched_thread_num_ = 0;
@@ -1026,9 +1035,7 @@ int32_t AicpuExecutor::prepare_kernel_round(const simpler::tmr::KernelExecutionR
         ) != 0)
         return -1;
     chip_swimlane_aicpu_record_run_boundary();
-    return kernel_cores_.collect_reports(
-        reinterpret_cast<const uint64_t *>(get_platform_regs()), platform_get_physical_cores_count()
-    );
+    return 0;
 }
 
 int32_t AicpuExecutor::initialize_kernel_thread(const simpler::tmr::KernelThreadView &thread) {
@@ -1036,14 +1043,38 @@ int32_t AicpuExecutor::initialize_kernel_thread(const simpler::tmr::KernelThread
         thread.execution_index >= aicpu_thread_num_)
         return -1;
     platform_aicpu_affinity_set_thread_idx(thread.execution_index);
-    sched_ctx_.handshake_kernel_partition(
-        kernel_invocation_.resident(), thread.execution_index, thread.execution_threads
+    const int32_t threads = kernel_orchestration_overlaps() ? thread.execution_threads - 1 : thread.execution_threads;
+    if (thread.execution_index >= threads) return 0;
+    const int32_t status = kernel_cores_.collect_reports_partition(
+        reinterpret_cast<const uint64_t *>(get_platform_regs()), platform_get_physical_cores_count(),
+        thread.execution_index, threads
     );
+    if (status != 0) return status;
+    sched_ctx_.handshake_kernel_partition(kernel_invocation_.resident(), thread.execution_index, threads);
     return 0;
 }
 
 int32_t AicpuExecutor::complete_kernel_init() {
     return sched_ctx_.post_handshake_init(kernel_invocation_.resident(), kernel_invocation_.inputs().functions);
+}
+
+void AicpuExecutor::publish_kernel_init(int32_t status) noexcept {
+    kernel_init_ready_.store(true, std::memory_order_release);
+    if (status != 0 && kernel_orchestration_overlaps()) {
+        // The orchestrator owns the SM reset; cancellation must survive it.
+        while (!runtime_init_ready_.load(std::memory_order_acquire)) {}
+        cancel_kernel_round();
+    }
+}
+
+void AicpuExecutor::kernel_run_failed(const simpler::tmr::KernelThreadView &thread) noexcept {
+    if (thread.execution_index == thread.execution_threads - 1)
+        runtime_init_ready_.store(true, std::memory_order_release);
+    // Cancellation reads opened_ and writes reports shared with the initializers.
+    if (kernel_orchestration_overlaps()) {
+        while (!kernel_init_ready_.load(std::memory_order_acquire)) {}
+    }
+    cancel_kernel_round();
 }
 
 void AicpuExecutor::cancel_kernel_round() noexcept {

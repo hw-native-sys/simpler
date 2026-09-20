@@ -106,10 +106,11 @@ public:
     // verdict. Classification keeps exact CPU matches, then fills missing roles
     // in report order, without touching program's static affinity gate or TLS.
     bool publish_admission(
-        const KernelRoundTicket &leader, const int32_t *allowed_cpus, int32_t count, int32_t status
+        const KernelRoundTicket &leader, const int32_t *allowed_cpus, int32_t count, int32_t status,
+        int32_t init_execution_index = -1
     ) noexcept {
         if (leader.epoch == 0 || leader.epoch > kMaxEpoch || leader.launch_index != 0 || allowed_cpus == nullptr ||
-            count <= 0 || count > MAX_GATE_THREADS)
+            count <= 0 || count > MAX_GATE_THREADS || init_execution_index < -1 || init_execution_index >= count)
             return false;
         for (int32_t i = 0; i < count; ++i) {
             if (allowed_cpus[i] < 0) return false;
@@ -148,6 +149,11 @@ public:
             slots_[i].execution_index = role;
             filled[role++] = true;
         }
+        init_owner_ = 0;
+        if (init_execution_index >= 0) {
+            for (int32_t i = 0; i < launched; ++i)
+                if (slots_[i].execution_index == init_execution_index) init_owner_ = i;
+        }
         execution_count_ = count;
         admission_ = status;
         lifecycle_.store(stamp(leader.epoch, Stage::Admitted), std::memory_order_release);
@@ -175,8 +181,8 @@ public:
         return true;
     }
 
-    // Called after the leader has reported its own init, if selected. A
-    // decoupled orchestrator still waits here before entering orchestration.
+    // Admission selects the init publisher: the launch leader by default,
+    // or a scheduler role when orchestration overlaps initialization.
     bool publish_init_verdict(const KernelRoundTicket &leader) noexcept {
         return publish_init_verdict(leader, []() noexcept {
             return 0;
@@ -185,13 +191,13 @@ public:
 
     template <typename CompleteInit>
     bool publish_init_verdict(const KernelRoundTicket &leader, CompleteInit complete_init) noexcept {
-        if (leader.launch_index != 0) return false;
         Stage previous = Stage::InitDone;
         if (!transition(leader, previous, Stage::InitPublishing)) {
             previous = Stage::AdmissionRead;
             if (!transition(leader, previous, Stage::InitPublishing)) return false;
         }
-        if (admission_ != 0 || (previous == Stage::AdmissionRead && slots_[leader.launch_index].execution_index >= 0)) {
+        if (leader.launch_index != init_owner_ || admission_ != 0 ||
+            (previous == Stage::AdmissionRead && slots_[leader.launch_index].execution_index >= 0)) {
             slots_[leader.launch_index].phase.store(stamp(leader.epoch, previous), std::memory_order_release);
             return false;
         }
@@ -379,6 +385,7 @@ private:
     std::atomic<int32_t> arrived_{0};
     std::atomic<int32_t> departed_{0};
     Slot slots_[MAX_GATE_THREADS];
+    int32_t init_owner_{0};
     int32_t execution_count_{0};
     int32_t admission_{0};
     int32_t init_status_{0};

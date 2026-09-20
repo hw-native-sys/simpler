@@ -230,7 +230,7 @@ protected:
 
     std::vector<int32_t> coordinated_round(
         const KernelCallableView &callable, ByteSpan packet, int32_t admission = 0, int32_t execution_threads = 2,
-        bool native = false
+        bool native = false, bool duplicate_reports = false
     ) {
         opened_windows = 0;
         closed_windows = 0;
@@ -265,7 +265,7 @@ protected:
         for (size_t i = 0; i < reports.size(); ++i) {
             cores.emplace_back([&, i] {
                 auto &report = reports[i];
-                report.physical_core_id = i;
+                report.physical_core_id = duplicate_reports && i == 2 ? 0 : i;
                 report.core_type = static_cast<uint32_t>(i == 0 ? CoreType::AIC : CoreType::AIV);
                 __atomic_store_n(&report.ready, static_cast<uint32_t>(i + 1), __ATOMIC_RELEASE);
                 while (__atomic_load_n(&report.command, __ATOMIC_ACQUIRE) !=
@@ -387,6 +387,21 @@ TEST_F(TmrExecutorExecutionInputsTest, CoordinatedRoundsRunABAWithOneFinalVerdic
             expect_resident_configuration(serial);
         }
     }
+}
+
+TEST_F(TmrExecutorExecutionInputsTest, InvalidReportsCancelOverlappedOrchestrationBeforeAnyWindowOpens) {
+    PreparedInvocationView callable{3, 1, 1};
+    TmrEncodingCandidate packet;
+    TmrEncodingCache cache;
+    auto args = arguments(91);
+    ASSERT_EQ(encode_tmr_invocation(args, callable, binding.identity, cache, &packet), InvocationStatus::Ok);
+    const auto results = coordinated_round({callable, {}}, packet.packet(), 0, 2, false, true);
+    for (int32_t result : results)
+        EXPECT_NE(result, 0);
+    EXPECT_EQ(opened_windows.load(), 0);
+    EXPECT_EQ(closed_windows.load(), 0);
+    EXPECT_EQ(control.cleanup_status, 0);
+    expect_successful_reuse();
 }
 
 TEST_F(TmrExecutorExecutionInputsTest, NativeEntryCancelsMalformedContextAndUnregisteredImagePackets) {
