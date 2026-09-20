@@ -176,9 +176,19 @@ change owes:
   normal-path synchronize safe: the rows that keep synchronizing include the
   ordinary successful run that produces no notice at all, so this channel is a
   fallback for uncovered work rather than a replacement for the verdict read;
-- an attributable positive terminal record from every producer, and its promotion
-  from the shadow validation it is today — a5's `host_build_graph` legacy path
-  publishes none;
+- every supported execution variant now has a terminal publication path. a5's
+  `host_build_graph` legacy executor was the last without one, and it now folds
+  and publishes on the same wire, epoch, selector and publisher as the other
+  three. A publication path is not a record per run: a run that failed in init,
+  one whose participants did not all claim the audited path, and an unmarked
+  fallback the wrapper rejects publish **nothing and stay undecided — but only
+  when no error is attributable to them**. `run_terminal_select` reports a
+  header or participant failure on those paths too; what the missing claim and
+  the unmarked mode withhold is the *success*, never the diagnosis. That is what
+  keeps "no record" from reading as success. What remains owed is
+  **authority** — the record is read diagnostically today, against the drain's
+  rc, and `report_terminal_disagreement` logs a disagreement rather than
+  overriding, so no consumer takes its outcome as the run's;
 - a decision on how a *successor's* fault is attributed, since a stream carries
   its error stickily and the predecessor's drain would otherwise report it.
 

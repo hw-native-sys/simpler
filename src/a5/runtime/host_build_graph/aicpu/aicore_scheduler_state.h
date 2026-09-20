@@ -32,6 +32,25 @@ inline bool aicore_scheduler_explicit_legacy_enabled(const Runtime *runtime) {
            aicore_scheduler_runtime_mode_is_explicit_legacy(runtime->dev.scheduler_bootstrap.runtime_mode);
 }
 
+/**
+ * Whether a legacy run reached the end of the path its terminal record may call
+ * a success — what `LegacyAicpuExecutor::snapshot_run_terminal` passes to
+ * `run_terminal_select` as `normal_path_completed`.
+ *
+ * Two conditions, and the first is this producer's alone. `aicpu_execute`
+ * rejects a legacy run whose mode does not say legacy was chosen, and that
+ * rejection reaches the host only as the kernel's return; a record calling such
+ * a run Ok would contradict it. The second is the shared one: a participant
+ * that never dispatched withholds its claim, so a short tally means some thread
+ * cannot vouch for the path.
+ *
+ * Neither condition suppresses a failure — `run_terminal_select` reports a
+ * header or participant error whatever this answers.
+ */
+inline bool aicore_legacy_run_completed_audited_path(const Runtime *runtime, int32_t claims, int32_t participants) {
+    return aicore_scheduler_explicit_legacy_enabled(runtime) && claims == participants;
+}
+
 // Worker 0's context sits at the published base, so the bootstrap context is the
 // base itself. A zero base is "no resident scheduler state", the same verdict a
 // zero handshake task carried before.
