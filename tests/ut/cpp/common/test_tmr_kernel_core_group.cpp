@@ -245,6 +245,36 @@ protected:
     PlatformModel model;
 };
 
+TEST_F(TmrKernelCoreGroupTest, OwnedReportPollingDoesNotWaitForUnreadyPeers) {
+    model.report_ready(2, 74);
+    KernelCoreGroup group;
+    ASSERT_TRUE(group.attach(model.view()));
+    ASSERT_TRUE(group.control_valid());
+    EXPECT_EQ(group.poll_owned_report(model.registers.data(), PlatformModel::kPhysicalCount, 0), 1);
+    EXPECT_EQ(group.poll_owned_report(model.registers.data(), PlatformModel::kPhysicalCount, 2), 0);
+    EXPECT_EQ(group.physical_id(2), 74u);
+    EXPECT_EQ(model.count(EventKind::Open), 0u);
+    group.request_cancel();
+    EXPECT_EQ(load_word(model.reports[2].command), 0u);
+    EXPECT_EQ(group.poll_owned_report(model.registers.data(), PlatformModel::kPhysicalCount, 0), -1);
+}
+
+TEST_F(TmrKernelCoreGroupTest, OwnedReportsRejectInvalidAddressTypeAndRound) {
+    for (int invalid = 0; invalid < 5; ++invalid) {
+        model.reset();
+        model.ready_all();
+        if (invalid == 0) model.reports[2].physical_core_id = PlatformModel::kPhysicalCount;
+        if (invalid == 1) model.reports[2].core_type = static_cast<uint32_t>(CoreType::AIC);
+        if (invalid == 2) model.reports[2].round_epoch = 1;
+        if (invalid == 3) model.registers[2] = 0;
+        if (invalid == 4) model.control.host_cancel = 1;
+        KernelCoreGroup group;
+        ASSERT_TRUE(group.attach(model.view()));
+        EXPECT_EQ(group.poll_owned_report(model.registers.data(), PlatformModel::kPhysicalCount, 2), -1);
+        EXPECT_EQ(model.count(EventKind::Open), 0u);
+    }
+}
+
 TEST_F(TmrKernelCoreGroupTest, InvalidDuplicateAndWrongTypeReportsNeverOpenRegisters) {
     for (int invalid = 0; invalid < 6; ++invalid) {
         SCOPED_TRACE(invalid);

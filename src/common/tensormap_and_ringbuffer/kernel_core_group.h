@@ -33,7 +33,8 @@ struct KernelHandshakeView {
 
 // One run's borrowed control region and register mappings. The prepare provider
 // owns/pins every address. Attach and finish have one owner; report collection and
-// open is partitioned by worker index and finishes before cancel or dispatch.
+// open is partitioned by worker index. Cancellation and retirement of reports
+// run only after all CPU consumers and initializers stop.
 // This class never clears a Host-owned region or infers readiness from an SPR.
 class KernelCoreGroup {
 public:
@@ -50,6 +51,7 @@ public:
             !(control + sizeof(TmrLaunchControl) <= reports || reports + reports_bytes <= control))
             return false;
         view_ = view;
+        cancel_requested_.store(false, std::memory_order_relaxed);
         reports_arrived_.store(0, std::memory_order_relaxed);
         reports_status_.store(0, std::memory_order_relaxed);
         reports_ready_.store(false, std::memory_order_relaxed);
@@ -88,6 +90,41 @@ public:
         }
         return reports_status_.load(std::memory_order_relaxed);
     }
+
+    // Like program's owned-cluster handshake, physical IDs come from the
+    // device's core-identity instruction; their uniqueness is a platform invariant.
+    // A pending report must not block polling another core in the same cluster set.
+    int32_t poll_owned_report(const uint64_t *registers, uint32_t physical_count, int32_t i) noexcept {
+        if (cancel_requested_.load(std::memory_order_acquire) || registers == nullptr || i < 0 ||
+            i >= view_.worker_count || view_.worker_count % 3 != 0)
+            return -1;
+        auto &report = view_.reports[i];
+        cache_invalidate_range(&report, sizeof(report));
+        if (load(report.command) != 0 || load(report.release) != 0 || report.round_epoch != 0 ||
+            load(report.exited) != 0 || load(view_.control->host_cancel) != 0)
+            return -1;
+        if (load(report.ready) != static_cast<uint32_t>(i + 1)) return 1;
+        rmb();
+        const uint32_t pcid = report.physical_core_id;
+        const auto expected_type = i < view_.worker_count / 3 ? CoreType::AIC : CoreType::AIV;
+        if (pcid >= physical_count || registers[pcid] == 0 || report.core_type != static_cast<uint32_t>(expected_type))
+            return -1;
+        physical_ids_[i] = pcid;
+        types_[i] = expected_type;
+        regs_[i] = registers[pcid];
+        return 0;
+    }
+
+    bool control_valid() noexcept {
+        auto &control = *view_.control;
+        cache_invalidate_range(&control, sizeof(control));
+        return load(control.host_cancel) == 0 && load(control.completion) == 0 && control.runtime_status == 0 &&
+               control.cleanup_status == 0 && control.round_epoch == 0;
+    }
+
+    // Only the all-thread finalizer writes CANCEL to reports. Initializers and
+    // dispatchers may still be publishing OPEN when an error is first observed.
+    void request_cancel() noexcept { cancel_requested_.store(true, std::memory_order_release); }
 
 private:
     int32_t collect_report_range(const uint64_t *registers, uint32_t physical_count, int32_t lo, int32_t hi) noexcept {
@@ -131,6 +168,7 @@ private:
         return view_.worker_count % 3 == 0 && aic_count == view_.worker_count / 3 ? 0 : -1;
     }
 
+    std::atomic<bool> cancel_requested_{false};
     std::atomic<int32_t> reports_arrived_{0};
     std::atomic<int32_t> reports_status_{0};
     std::atomic<bool> reports_ready_{false};
@@ -142,6 +180,11 @@ public:
 
     void open(int32_t index) noexcept {
         platform_init_aicore_regs(regs_[index]);
+        acknowledge_open(index);
+    }
+
+    // Called after the shared batch has issued every owned window write.
+    void acknowledge_open(int32_t index) noexcept {
         (void)read_reg(regs_[index], RegId::DATA_MAIN_BASE);
         rmb();
         auto &report = view_.reports[index];

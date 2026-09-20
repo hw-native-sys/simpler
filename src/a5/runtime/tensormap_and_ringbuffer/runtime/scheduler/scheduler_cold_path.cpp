@@ -860,11 +860,32 @@ void SchedulerContext::handshake_owned_clusters(Runtime *runtime, int32_t tidx, 
     ReadyCore ready[RUNTIME_MAX_WORKER];
     int32_t n_ready = 0;
 
+    const uint64_t deadline = kernel_cores_ != nullptr ? platform_aicore_exit_deadline() : 0;
+    if (kernel_cores_ != nullptr && !kernel_cores_->control_valid()) {
+        handshake_failed_.store(true, std::memory_order_release);
+        return;
+    }
     // Phase 1: collect every reported owned core, prefetch its CoreExecState line.
     for (int32_t remaining = own_n; remaining > 0;) {
         for (int32_t k = 0; k < own_n; k++) {
             int32_t i = owned[k];
             if (core_serviced[i]) continue;
+            if (kernel_cores_ != nullptr) {
+                const int32_t status = kernel_cores_->poll_owned_report(regs, max_physical_cores_count, i);
+                if (status < 0 || (status > 0 && get_sys_cnt_aicpu() > deadline)) {
+                    handshake_failed_.store(true, std::memory_order_release);
+                    kernel_cores_->request_cancel();
+                    return;
+                }
+                if (status > 0) continue;
+                __builtin_prefetch(&core_exec_states_[i], 1, 3);
+                ready[n_ready++] = {
+                    i, kernel_cores_->physical_id(i), kernel_cores_->register_address(i), kernel_cores_->core_type(i)
+                };
+                core_serviced[i] = true;
+                --remaining;
+                continue;
+            }
             Handshake *hank = &all_handshakes[i];
             if (hank->aicore_done == 0) {
                 SPIN_WAIT_HINT();
@@ -892,13 +913,25 @@ void SchedulerContext::handshake_owned_clusters(Runtime *runtime, int32_t tidx, 
     // only after its window opens (Phase 3), so a single barrier orders all task
     // stores before any window STR.
     for (int32_t r = 0; r < n_ready; r++) {
-        all_handshakes[ready[r].i].task = reinterpret_cast<uint64_t>(&payload_per_core_[ready[r].i][0]);
+        const auto &core = ready[r];
+        if (kernel_cores_ != nullptr) {
+            runtime->dev.workers[core.i].physical_core_id = core.pcid;
+            runtime->dev.workers[core.i].core_type = core.core_type;
+            runtime->dev.workers[core.i].task = reinterpret_cast<uint64_t>(&payload_per_core_[core.i][0]);
+        } else {
+            all_handshakes[core.i].task = reinterpret_cast<uint64_t>(&payload_per_core_[core.i][0]);
+        }
     }
     OUT_OF_ORDER_STORE_BARRIER();
 
     // Phase 3: open every window (the IDLE write is also the core's ack).
     for (int32_t r = 0; r < n_ready; r++) {
         platform_init_aicore_regs(ready[r].reg_addr);
+    }
+
+    if (kernel_cores_ != nullptr) {
+        for (int32_t r = 0; r < n_ready; ++r)
+            kernel_cores_->acknowledge_open(ready[r].i);
     }
 
     // Phase 4: publish each CoreExecState (AICPU-private, may follow the windows).
@@ -1009,6 +1042,14 @@ void SchedulerContext::abort_and_shutdown(Runtime *runtime) {
 // Profiling-subsystem init (leader-only). pmu_aicpu_init needs every core's
 // physical_core_id, so the barrier-free init path calls this behind an
 // all-thread barrier compiled only into DFX builds. No-op otherwise.
+bool SchedulerContext::requires_profiling_init_barrier() const {
+#if SIMPLER_DFX
+    return chip_swimlane_level_ != ChipSwimlaneLevel::DISABLED || is_pmu_enabled() || is_dump_args_enabled();
+#else
+    return false;
+#endif
+}
+
 void SchedulerContext::post_handshake_profiling_init() {
 #if SIMPLER_DFX
     if (is_dump_args_enabled()) {
@@ -1089,7 +1130,7 @@ bool SchedulerContext::assign_cores_to_threads() {
 void SchedulerContext::emergency_shutdown(Runtime *runtime) {
     if (kernel_cores_ != nullptr) {
         completed_.store(true, std::memory_order_release);
-        kernel_cores_->cancel();
+        kernel_cores_->request_cancel();
         return;
     }
     (void)runtime;  // exit is now delivered via each core's register block, not GM

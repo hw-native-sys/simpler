@@ -170,15 +170,22 @@ launch 不分配设备内存、不创建 stream/event、不同步、不查询 ca
 设备入口先检查公共 framing 和镜像跨度（非零、对齐、不小于 `sizeof(ChipCallable)`、
 不溢出），再由 TMR consumer 建立缓存可见性并校验绑定、大小、参数数量和
 signature，解码到本次调用的私有参数，进入真实 executor。
-TMR 默认多线程启动时，公共参数和 profiling 准备完成后，orchestrator 开始建图，
-scheduler 线程同时分区收集 AICore report。所有 report 收集完成并通过物理核唯一性及
-AIC/AIV 数量校验后，各分区并行开窗；scheduler 在统一初始化判定成功后才派发任务。
-初始化判定由 scheduler 角色 0 发布，不依赖哪个线程最先进入 launch。
-已有串行配置保留建图前的初始化屏障。
+TMR 默认多线程启动时，公共参数和 profiling 准备完成后，orchestrator 开始建图。
+Kernel 与 program 共用 `handshake_owned_clusters()` 和 `assign_own_clusters()`：每个 scheduler
+轮询自己负责的 cluster，批量发布 task 指针和打开寄存器窗口，再初始化所属核的 tracker、
+payload 和 context。物理核 ID 由设备核身份指令产生，唯一性与 program 一样由平台保证；
+kernel 的 report 适配额外检查 ID 范围、核类型、ready 标识和当前轮次状态，不维护跨 Worker
+的核占用登记表。Kernel 发布 OPEN 前仍对已开的窗口回读，保证 MMIO 完成先于 GM 命令可见。
 
-初始化失败时，取消信号在 orchestrator 完成 SM 重置后发布；开窗线程全部退出初始化后
-才允许取消。orchestrator 完成建图后的统计和错误处理也等待初始化判定，避免读取尚未
-建立的核分配。最终回收仍等待全部 AICPU 参与者停止使用本轮资源。
+未启用泳道图、PMU 或参数 dump 时，各 scheduler 完成本地初始化、等待 orchestrator 发布
+runtime reset 完成后即可派发，不等待其他 scheduler。这个选择按每轮的实际采集开关判断，
+不要求重新编译为非 DFX 版本。启用上述采集时保留初始化屏障，由 scheduler 角色 0 完成
+公共 profiling 初始化。串行配置保留统一 post-init 和建图前的初始化屏障。
+
+初始化失败时，先发布进程内取消请求，让其他初始化线程停止等待；SM 错误在 orchestrator
+完成 reset 后发布。AICore report 的 CANCEL 和窗口关闭由全部 AICPU 参与者停止后的 finalizer
+执行，避免与仍在初始化的线程发布 OPEN 竞争。orchestrator 建图后的统计等待所有 scheduler
+结束初始化，避免读取尚未建立的核分配；该等待不阻止已就绪 scheduler 派发。
 
 HBG 已有内部 packet/restore consumer，公共 kernel launch owner 尚未接线。
 

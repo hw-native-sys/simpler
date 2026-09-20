@@ -93,6 +93,9 @@ struct ExecutorModel {
     std::array<TmrCoreReport, 3> reports{};
     const std::array<int32_t, kExecutionThreads> allowed{10, 11, 12};
     bool overlap{false};
+    bool independent{false};
+    Signal first_scheduler_ran;
+    std::atomic<bool> independent_progress{false};
     Signal orch_started;
     Signal init_completed;
     std::atomic<bool> overlapped{false};
@@ -100,6 +103,7 @@ struct ExecutorModel {
     int32_t complete_status{0};
     int32_t finalize_status{0};
     int32_t failing_run_index{-1};
+    int32_t failing_init_index{-1};
     std::atomic<int32_t> preparations{0};
     std::atomic<int32_t> initializers{0};
     std::atomic<int32_t> completions{0};
@@ -127,6 +131,10 @@ struct ExecutorModel {
         return 0;
     }
     bool kernel_orchestration_overlaps() const { return overlap; }
+    bool kernel_independent_dispatch() const { return independent; }
+    void publish_kernel_thread_init(const KernelThreadView &, int32_t) {
+        if (initializers.load() == kExecutionThreads) init_completed.set();
+    }
     void publish_kernel_init(int32_t status) {
         init_finished = true;
         init_completed.set();
@@ -135,8 +143,9 @@ struct ExecutorModel {
     void kernel_run_failed(const KernelThreadView &) { cancel_kernel_round(); }
     int32_t initialize_kernel_thread(const KernelThreadView &thread) {
         if (overlap && thread.execution_index == 0) overlapped = orch_started.wait_for();
+        if (independent && thread.execution_index == 1) independent_progress = first_scheduler_ran.wait_for();
         ++initializers;
-        return 0;
+        return thread.execution_index == failing_init_index ? -41 : 0;
     }
     int32_t complete_kernel_init() {
         EXPECT_EQ(initializers.load(), kExecutionThreads);
@@ -148,6 +157,8 @@ struct ExecutorModel {
         if (overlap && thread->execution_index == kExecutionThreads - 1) {
             orch_started.set();
             EXPECT_TRUE(init_completed.wait_for());
+        } else if (independent) {
+            first_scheduler_ran.set();
         } else {
             EXPECT_TRUE(init_published.load());
             EXPECT_EQ(complete_status, 0);
@@ -315,6 +326,35 @@ TEST(TmrKernelExecutionRoundTest, OverlappedInitFailureCancelsOrchAndSkipsDispat
     EXPECT_EQ(executor.cancellations.load(), 1);
     EXPECT_EQ(executor.clears.load(), 1);
     EXPECT_TRUE(executor.kernel_gate_.idle());
+}
+
+TEST(TmrKernelExecutionRoundTest, SchedulerDispatchDoesNotWaitForPeerInitialization) {
+    ExecutorModel executor;
+    executor.overlap = true;
+    executor.independent = true;
+    const auto results = run_round(executor);
+    for (int32_t result : results)
+        EXPECT_EQ(result, 0);
+    EXPECT_TRUE(executor.independent_progress.load());
+    EXPECT_EQ(executor.kernel_cores_.finishes.load(), 1);
+    EXPECT_TRUE(executor.kernel_gate_.idle());
+}
+
+TEST(TmrKernelExecutionRoundTest, IndependentInitFailurePublishesOneVerdictAndAllowsReuse) {
+    ExecutorModel executor;
+    executor.overlap = true;
+    executor.independent = true;
+    executor.failing_init_index = 1;
+    for (int32_t result : run_round(executor))
+        EXPECT_EQ(result, -41);
+    EXPECT_TRUE(executor.independent_progress.load());
+    EXPECT_EQ(executor.runs.load(), 2);
+    EXPECT_EQ(executor.cancellations.load(), 1);
+    EXPECT_TRUE(executor.kernel_gate_.idle());
+    executor.failing_init_index = -1;
+    for (int32_t result : run_round(executor))
+        EXPECT_EQ(result, 0);
+    EXPECT_EQ(executor.kernel_cores_.finishes.load(), 2);
 }
 
 }  // namespace

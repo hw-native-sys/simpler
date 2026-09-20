@@ -59,6 +59,7 @@ int32_t execute_kernel_round_impl(
     const KernelThreadView thread{admission.execution_index, request.execution_threads};
     if (status == 0) {
         const bool overlap = executor.kernel_orchestration_overlaps();
+        const bool independent = overlap && executor.kernel_independent_dispatch();
         const bool early_orch = overlap && thread.execution_index == thread.execution_threads - 1;
         const bool init_owner = overlap ? thread.execution_index == 0 : ticket.launch_index == 0;
         auto run = [&]() noexcept {
@@ -72,8 +73,8 @@ int32_t execute_kernel_round_impl(
             if (result != 0) executor.kernel_run_failed(thread);
             return result;
         };
+        int32_t initialized = 0;
         if (thread.execution_index >= 0) {
-            int32_t initialized;
             try {
                 initialized = executor.initialize_kernel_thread(thread);
             } catch (...) {
@@ -81,19 +82,26 @@ int32_t execute_kernel_round_impl(
             }
             if (!gate.report_init(ticket, initialized)) return -1;
         }
-        const int32_t early_status = early_orch ? run() : 0;
+        int32_t early_status = 0;
+        if (independent && thread.execution_index >= 0) {
+            executor.publish_kernel_thread_init(thread, initialized);
+            if (initialized == 0) early_status = run();
+            else executor.kernel_run_failed(thread);
+        } else if (early_orch) {
+            early_status = run();
+        }
         if (init_owner && !gate.publish_init_verdict(ticket, [&]() noexcept {
                 try {
-                    return executor.complete_kernel_init();
+                    return independent ? 0 : executor.complete_kernel_init();
                 } catch (...) {
                     return int32_t{-1};
                 }
             }))
             return -1;
         if (!gate.wait_init_verdict(ticket, &status)) return -1;
-        if (init_owner) executor.publish_kernel_init(status);
+        if (init_owner && !independent) executor.publish_kernel_init(status);
         if (status == 0) {
-            if (early_orch) status = early_status;
+            if (independent || early_orch) status = early_status;
             else if (thread.execution_index >= 0) status = run();
         }
     }

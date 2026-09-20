@@ -230,7 +230,7 @@ protected:
 
     std::vector<int32_t> coordinated_round(
         const KernelCallableView &callable, ByteSpan packet, int32_t admission = 0, int32_t execution_threads = 2,
-        bool native = false, bool duplicate_reports = false
+        bool native = false, bool invalid_reports = false
     ) {
         opened_windows = 0;
         closed_windows = 0;
@@ -265,7 +265,7 @@ protected:
         for (size_t i = 0; i < reports.size(); ++i) {
             cores.emplace_back([&, i] {
                 auto &report = reports[i];
-                report.physical_core_id = duplicate_reports && i == 2 ? 0 : i;
+                report.physical_core_id = invalid_reports && i == 2 ? 75 : i;
                 report.core_type = static_cast<uint32_t>(i == 0 ? CoreType::AIC : CoreType::AIV);
                 __atomic_store_n(&report.ready, static_cast<uint32_t>(i + 1), __ATOMIC_RELEASE);
                 while (__atomic_load_n(&report.command, __ATOMIC_ACQUIRE) !=
