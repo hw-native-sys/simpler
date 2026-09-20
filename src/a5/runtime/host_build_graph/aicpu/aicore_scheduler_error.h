@@ -52,3 +52,31 @@ inline bool record_aicore_scheduler_runtime_error(
     __atomic_store_n(&run_control->scheduler_error, static_cast<uint64_t>(scheduler_error), __ATOMIC_RELEASE);
     return true;
 }
+
+/**
+ * The run's host runtime status with the AICore's recorded error folded into
+ * the shared header first.
+ *
+ * Folding is first-wins (`latch_aicore_scheduler_runtime_error` compare-
+ * exchanges from `SIMPLER_ERROR_NONE`), so an error already latched keeps its
+ * own code and a control holding none writes nothing. A null `sched_error_code`
+ * has nothing to report; a null `run_control` reports the header as it stands,
+ * because a caller that could not look has not established that the run was
+ * clean.
+ *
+ * This folds whatever the control holds **at the moment of the call** and makes
+ * no demand on when that is: the supervisor calls it mid-run and the
+ * failed-init exit calls it before any shutdown. Whether a fold is *complete*
+ * is a property of the call site rather than of this function — only the
+ * finalizer's call runs after every participant has finished its shutdown
+ * partition, which is what lets that one cover every core instead of the
+ * caller's own.
+ */
+inline int32_t
+settle_aicore_runtime_status(const SchedulerRunControl *run_control, std::atomic<int32_t> *sched_error_code) {
+    if (sched_error_code == nullptr) return SIMPLER_ERROR_NONE;
+    if (run_control != nullptr) {
+        (void)latch_aicore_scheduler_runtime_error(sched_error_code, run_control->scheduler_error);
+    }
+    return runtime_status_from_error_code(sched_error_code->load(std::memory_order_acquire));
+}

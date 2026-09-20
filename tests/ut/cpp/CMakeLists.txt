@@ -1643,6 +1643,35 @@ target_include_directories(test_a5_hbg_legacy_terminal_record PRIVATE
 target_sources(test_a5_hbg_legacy_terminal_record PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/common/host_build_graph/shared/runtime.cpp
 )
+
+# The resident executor's finalizer, entered directly. The test compiles
+# aicpu_executor.cpp so it can call AicpuExecutor::snapshot_run_terminal itself
+# rather than restate it. That unit also defines `aicpu_execute`, `init`, `run`
+# and `deinit`, which no case reaches but which reference the AICore lifecycle,
+# the register and swimlane surfaces and `legacy_aicpu_execute` — 16 symbols.
+# Linking the real definitions instead pulls in the scheduler, PMU and
+# dump-args trees after them, so the unreached code is eliminated rather than
+# satisfied: no stand-in is defined for any production symbol.
+#
+# The two supported linker families spell that differently — Apple's ld64 takes
+# -dead_strip, GNU-family takes --gc-sections — so the flag is chosen per
+# platform the way GTEST_SEARCH_PATHS above is. -ffunction-sections and
+# -fdata-sections are what give the GNU linker per-symbol granularity to
+# collect; ld64 works at atom granularity and does not need them, but both
+# compilers accept them.
+add_a5_hbg_runtime_test(test_a5_hbg_resident_late_aicore_error a5/test_hbg_resident_late_aicore_error.cpp)
+target_include_directories(test_a5_hbg_resident_late_aicore_error PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/host_build_graph/aicpu
+)
+target_sources(test_a5_hbg_resident_late_aicore_error PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common/host_build_graph/shared/runtime.cpp
+)
+target_compile_options(test_a5_hbg_resident_late_aicore_error PRIVATE -ffunction-sections -fdata-sections)
+if(APPLE)
+    target_link_options(test_a5_hbg_resident_late_aicore_error PRIVATE -Wl,-dead_strip)
+else()
+    target_link_options(test_a5_hbg_resident_late_aicore_error PRIVATE -Wl,--gc-sections)
+endif()
 add_a5_hbg_runtime_test(test_a5_hbg_scheduler_ready a5/test_hbg_scheduler_ready.cpp)
 add_a5_hbg_runtime_test(test_a5_hbg_scheduler_dispatch a5/test_hbg_scheduler_dispatch.cpp)
 add_a2a3_hbg_runtime_test(test_hbg_graph_submit_failure common/test_hbg_graph_submit_failure.cpp)

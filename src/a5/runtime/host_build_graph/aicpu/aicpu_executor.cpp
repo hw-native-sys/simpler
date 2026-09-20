@@ -152,17 +152,19 @@ static int32_t read_runtime_status(Runtime *runtime) {
 
 static int32_t publish_aicore_scheduler_runtime_error(Runtime *runtime) {
     if (runtime == nullptr || runtime->get_gm_sm_ptr() == nullptr) return 0;
-    SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
-    if (context == nullptr) return 0;
-    cache_invalidate_range(context, 128);
-    auto *run_control = aicore_scheduler_run_control(context);
-    if (run_control == nullptr) return 0;
-    cache_invalidate_range(
-        reinterpret_cast<uint8_t *>(run_control) + offsetof(SchedulerRunControl, error_claimed), 128
-    );
     auto *header = static_cast<SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
-    (void)latch_aicore_scheduler_runtime_error(&header->sched_error_code, run_control->scheduler_error);
-    return read_runtime_status(runtime);
+    SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
+    SchedulerRunControl *run_control = nullptr;
+    if (context != nullptr) {
+        cache_invalidate_range(context, 128);
+        run_control = aicore_scheduler_run_control(context);
+        if (run_control != nullptr) {
+            cache_invalidate_range(
+                reinterpret_cast<uint8_t *>(run_control) + offsetof(SchedulerRunControl, error_claimed), 128
+            );
+        }
+    }
+    return settle_aicore_runtime_status(run_control, &header->sched_error_code);
 }
 
 static void publish_aicore_task_timing(Runtime *runtime) {
@@ -540,7 +542,15 @@ void AicpuExecutor::snapshot_run_terminal(Runtime *runtime) {
     // The shared header outranks a participant's own return: the supervisor
     // latches the AICore scheduler's error there, and a peer thread that only
     // waited on the shutdown barrier returns zero for the same run.
-    const int32_t header_status = read_runtime_status(runtime);
+    //
+    // The header is settled here rather than read as the supervisor left it.
+    // The supervisor's last look at `scheduler_error` precedes the AICore's
+    // exit wait, whose own watchdog can claim that error and then acknowledge
+    // exit normally — leaving the shutdown successful, every participant's rc
+    // zero, and the error carried by nothing. This is the boundary where every
+    // participant has finished its shutdown partition, so one settle covers
+    // every core.
+    const int32_t header_status = publish_aicore_scheduler_runtime_error(runtime);
     const bool normal_path = normal_path_claims_.load(std::memory_order_acquire) == aicpu_thread_num_;
     terminal_publisher_.take(run_terminal_select(normal_path, header_status, terminal_), nullptr, 0);
 }
