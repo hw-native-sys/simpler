@@ -3,7 +3,8 @@
 **Date**: 2026-09-19
 **Verdict**: host↔device coherence supplied as a project premise; the end-of-run
 clean is audited per field — excluded as publisher for three of the four device-writer
-groups with a named dependency each, and **not excluded** for the a2a3 teardown gate;
+groups with a named dependency each, and, since a second owner premise answered the
+AICPU→AICore edge for the gate's access shape, excluded for the a2a3 teardown gate too;
 the remaining ordering, atomicity, ownership and lifetime obligations stay open — no
 defect established, no cache operation changed, no contract proposed or proved
 **Revision**: the first version of this entry shipped in #2368. Static review found
@@ -384,6 +385,15 @@ host/device is.** This entry takes that as given and no longer lists it as an op
 question. It is a project architectural premise — **not** a vendor specification quoted
 here, and **not** something measured for this entry.
 
+A **second** premise from the same source, added later and scoped to a different edge,
+is used in the outbound audit below: on a2a3 an AICPU ordinary GM store is observable by
+an AICore `ld_dev` bypass load of the same address without an AICPU-side clean. It is
+recorded in
+[`cache-coherency.md`](../hardware/cache-coherency.md#the-aicpu-to-aicore-path-for-one-access-shape-the-a2a3-teardown-gate)
+with the same attribution and the same limits, and the two are not interchangeable: this
+one says nothing about the host edge, and the host one says nothing about on-device
+readers.
+
 What it settles: the **inbound host→AICPU freshness edge** per architecture. On A5 a
 host-published descriptor byte becomes visible to an AICPU read without AICPU-side
 invalidation. On A3 it does not, so on that path **some** mechanism must make the host's
@@ -416,7 +426,7 @@ operation now in the tree, nor a handshake redesign.
 | inbound host→AICPU freshness, A5 | **supplied** — coherent per the premise |
 | inbound host→AICPU freshness, A3 | non-coherent per the premise, so maintenance is required there. Whether the existing **end-of-previous-run** placement discharges it for the next run's first read is a separate question this entry does not answer — nor is any defect claimed; see step 6 for where the calls sit, and note a slot's first run has no prior `deinit` |
 | launch-time cache state | still open, and now only relevant where the premise leaves work to do: it bears on A3's placement question above, not on A5's inbound edge |
-| outbound AICPU→AICore publication | **audited per field, not settled as a whole.** Excluded as the clean's beneficiary for the AICore-written trio (their own `CACHELINE_OUT`), for the a5 HBG hand-off (its own `dc cvac`), and for `workers[i].task` on normal exits (the `EXITED` acknowledgment). **Not excluded** for a2a3's `teardown_gates[i].post_close_release`: no acknowledgment orders its bypass read against the clean. See the outbound audit below |
+| outbound AICPU→AICore publication | **audited per field.** Excluded as the clean's beneficiary for the AICore-written trio (their own `CACHELINE_OUT`), for the a5 HBG hand-off (its own `dc cvac`), for `workers[i].task` on normal exits (the `EXITED` acknowledgment), and for a2a3's `teardown_gates[i].post_close_release` — the owner's AICPU→AICore premise says that store needs no clean to reach an `ld_dev` reader. What the premise does **not** supply for any of them is ordering; see the outbound audit below |
 | outbound AICPU→host publication | **narrowed** — the only readers positioned after the clean are host D2H reads of `workers[]`, and the only one on a production path is a `LOG_DEBUG` dump. See the outbound audit below |
 | whole-line / multi-field publication atomicity | **still open** — see the three-writer section |
 | ordering and happens-before between the three writers | **still open** — the marker dependency and its unproved preconditions |
@@ -433,7 +443,7 @@ descriptor-wide call has more than one possible role (step 6).
 | unknown | if resolved, addresses | does **not** address |
 | ------- | ---------------------- | -------------------- |
 | **1. Does AICPU kernel launch leave the cache cold or perform maintenance?** | on A3, whether the end-of-previous-run placement suffices for the next run's first read | whether prior device-authored bytes needed publishing to another observer before that point — a cold next cache says nothing about the previous run's outbound obligations. Moot for A5's inbound edge, which the premise settles |
-| **2. Do the two unflushed AICPU stores reach memory for their readers?** `workers[i].task` (store + `OUT_OF_ORDER_STORE_BARRIER()`) and `teardown_gates[i].post_close_release` (relaxed store after `rmb()`), both read on-device. | whether either store needs a clean that no code performs today | for `task` this is separate from the end-of-run clean, which the `EXITED` acknowledgment places after that read on normal exits. For the **gate** the two questions are not separable: nothing orders its bypass read against the clean, so the clean is a candidate publisher there. Either way this is the AICPU→AICore edge, outside the host↔device premise |
+| **2. Do the two unflushed AICPU stores reach memory for their readers?** `workers[i].task` (store + `OUT_OF_ORDER_STORE_BARRIER()`) and `teardown_gates[i].post_close_release` (relaxed store after `rmb()`), both read on-device. | **Answered for the gate** by the owner's AICPU→AICore premise: an ordinary GM store reaches an `ld_dev` reader with no clean, so the clean is not its publisher. Still open for `task`, whose reader takes a different access path | for `task` this is separate from the end-of-run clean, which the `EXITED` acknowledgment places after that read on normal exits. For neither field does the premise supply ordering, atomicity, or anything about a reader left live by an earlier run |
 | **3. Is GM cacheable for the AICPU, and under what write policy?** The documented `Device-nGnRE` attribute covers the **MMIO** window only. | whether cached descriptor lines can exist at all, and whether the clean half can have anything to write back | nothing about externally written staleness **if the answer is write-through**: a write-through cache still holds readable lines, and the write policy alone does not establish that host DMA invalidates or updates them |
 
 > **Withdrawn from the first version:** the claim that an uncached **or
@@ -452,7 +462,7 @@ the call once **every** row it currently covers is accounted for by something:
 | ---------- | ------------ | ----------------------- |
 | host-published bytes visible to the AICPU's first read | AICPU affinity gate, executor init, a5 HBG mode select | on A5, the coherence premise. On A3 the premise says maintenance is needed, and nothing in the same invocation supplies it — unknown 1 covers whether the end-of-previous-run placement discharges it |
 | host-published bytes visible to the AICore's early reads | a5 HBG resident mode + context reads | the AICore's own `scheduler_observe_cache_line`. The host↔AICPU premise does not speak to an AICore reader |
-| AICPU-authored descriptor bytes made visible outward | AICore readers of `workers[i].task` and `teardown_gates[i]`; host D2H diagnostics | **per field, not uniformly.** For the trio and the a5 HBG hand-off, their own flush; for `task`, ordered before the clean by the `EXITED` acknowledgment on normal exits; for a2a3's teardown gate, **undetermined** — the clean is a candidate. See the outbound audit below |
+| AICPU-authored descriptor bytes made visible outward | AICore readers of `workers[i].task` and `teardown_gates[i]`; host D2H diagnostics | **per field, not uniformly.** For the trio and the a5 HBG hand-off, their own flush; for `task`, ordered before the clean by the `EXITED` acknowledgment on normal exits; for a2a3's teardown gate, by the store itself under the owner's AICPU→AICore premise. See the outbound audit below |
 | a slot's **first**-run reads, AICPU observer, A5 | AICPU affinity gate, executor init | the coherence premise — a first run is not a special case for an edge that needs no maintenance |
 | a slot's **first**-run reads, AICPU observer, A3 | same | nothing in that invocation, and no prior `deinit` has run for those lines. What the non-coherent path requires there is open, as above |
 | a slot's **first**-run reads, AICore observer | a5 HBG resident mode + context reads | the AICore's own `scheduler_observe_cache_line`, on every run including the first |
@@ -485,9 +495,9 @@ in the descriptor is host-written, so the clean has nothing of theirs to publish
 | AICore at entry (`aicore_executor.cpp`, all variants; a5 HBG legacy in `aicore_legacy_executor.cpp`) | `physical_core_id`, `core_type`, `aicore_done` | **yes** — the AICore's own `dcci(…, SINGLE_CACHE_LINE, CACHELINE_OUT)` whole-line write-back | AICPU report poll, during the run | **yes, on publication grounds** — a different agent already flushes these; the AICPU's clean is not their publisher |
 | AICPU scheduler cold path (all four variants) | `workers[i].task` | **partial** — plain stores then `OUT_OF_ORDER_STORE_BARRIER()`, no clean. Consumer invalidates: AICore `dcci(my_hank, SINGLE_CACHE_LINE)` before the read | AICore, after window-open (`a2a3 TRB aicore_executor.cpp:104`) | **yes, on the `EXITED` acknowledgment** — the AICore writes `COND = AICORE_EXITED_VALUE` (`:128`, `:215`) only after that read, and the AICPU polls `COND` for `EXITED` in its quiesce pass before `deinit`. Not every `COND` write qualifies: the initial `AICORE_IDLE_VALUE` report at `:97` **precedes** the read. Normal exits only; see the exceptional paths below |
 | AICPU a5 HBG resident hand-off (`aicore_lifecycle.cpp:322,326`) | `workers[i].task`, `aicpu_ready` = `RESIDENT_READY` | **yes** — its own `cache_flush_range` (`dc cvac`) over those lines, then `wmb()` | AICore READY poll, during the run | **yes, on publication grounds** — the hand-off flushes them itself |
-| AICPU a2a3 window close (`platform/shared/aicpu/platform_regs.cpp:149`) | `teardown_gates[i].post_close_release` | **none** — a relaxed store after `rmb()`, with no flush | AICore `wait_for_post_close_release` — a bypass load (`ld_dev`), `a2a3 TRB aicore_executor.cpp:280`, `HBG :305` | **no — not excluded.** See below |
+| AICPU a2a3 window close (`platform/shared/aicpu/platform_regs.cpp:149`) | `teardown_gates[i].post_close_release` | **none** — a relaxed store after `rmb()`, with no flush | AICore `wait_for_post_close_release` — a bypass load (`ld_dev`), `a2a3 TRB aicore_executor.cpp:280`, `HBG :305` | **yes, on the owner's AICPU→AICore premise** — this store reaches this reader with no clean. See below |
 
-### The teardown gate is the one field the clean cannot be ruled out for
+### The teardown gate: the clean is not its publisher
 
 The store loop at `platform_regs.cpp:149` is followed immediately by `return rc;`. The
 AICPU **receives no acknowledgment that the AICore consumed the gate**, and it has no
@@ -508,14 +518,34 @@ Two arguments that look like they order this, and do not:
   orders the store after the ACK; it says nothing about when the subsequent GM gate read
   happens.
 - **A bypass load is not a substitute for publication.** `ld_dev` reads memory rather
-  than the reader's cache, so the *writer's* value still has to reach that memory.
-  Bypassing on the read side proves the reader will not see its own stale line; it does
-  not prove the writer needed no flush.
+  than the reader's cache, so on the read side it only proves the reader will not see
+  its own stale line.
 
-So for this field the clean remains a **candidate publisher**, and the earlier draft's
-universal exclusion and "no functional consumer" verdict are withdrawn. This is not a
-claim that the clean *is* required here, nor that a race exists — only that nothing in
-the current control flow rules it out.
+**What settles it is a second owner premise, not either argument above.** The project
+owner has confirmed that on a2a3 an AICPU ordinary GM store is observable by an AICore
+`ld_dev` bypass load of the same address with no AICPU-side clean
+([`cache-coherency.md`](../hardware/cache-coherency.md#the-aicpu-to-aicore-path-for-one-access-shape-the-a2a3-teardown-gate)).
+The writer therefore needs no flush for this reader, and the clean is **not** this
+field's publisher. Attribution is the same as for the host↔device premise: an
+architectural statement from the project, not a vendor citation, not proven from the
+public SDK, and not measured here.
+
+The interleaving above is consequently benign rather than resolved-away: the gate read
+may still fall either side of the clean, and now nothing depends on which side.
+
+**Read the premise no wider than it is.** It covers an a2a3 AICPU ordinary GM store
+observed by an AICore `ld_dev` load of the same address. It is not the host↔device
+premise, does not run in reverse, and does not transfer to a reader that reaches a
+field through a different access path — which is why residual 2 below stays open for
+`workers[i].task`. Nor is it ordering: the two edges this gate needs are ordered by
+code, and are cited in the `cache-coherency.md` section above — reset then `wmb()`
+before `hs_setup_done_` and window-open (`scheduler_cold_path.cpp:1183-1184` TRB,
+`:890-891` HBG), and the CLOSE pass with its readbacks then `rmb()` then the RELEASE
+stores (`platform_regs.cpp:82`, `:142`, `:149`).
+
+The earlier draft's universal exclusion and "no functional consumer" verdict stay
+withdrawn. Nothing here claims a race existed, and nothing here licenses removing the
+clean — see the host-direction row and residual 3.
 
 ### Exceptional and partial exits, audited separately
 
@@ -531,6 +561,15 @@ these:
 - **a5** has no gate member on TRB and does not use the gates on HBG, so this whole row
   is a2a3-only.
 
+**Limit of what is established about the failure path.** `retire_cores` logs each
+unreleased core and returns `-1` (`scheduler_cold_path.cpp:695-703` TRB); this entry
+has **not** traced what the host recovery path then does, and no claim is made here
+that an op-execute timeout, a device reset, or any other mechanism retires such a core
+before a later launch touches the same gates. The coherence premise does not help with
+this and slightly sharpens the question, since a still-live reader would observe a
+later store promptly rather than eventually. Recorded as the boundary of what is
+proven, not as a discovered defect: no such sequence is shown to be reachable.
+
 ### Readers positioned after the clean
 
 Two, both host D2H reads of `workers[]`:
@@ -544,8 +583,9 @@ Two, both host D2H reads of `workers[]`:
   production run path. It reads `aicore_done`, which the AICore already flushed.
 
 So on the **host** direction the only identified consumer is a diagnostic log. That is a
-statement about consumers found; combined with the gate row above it does **not** add up
-to "the clean has no consumer".
+statement about consumers found, not a survey that terminated: residual 3 below — whether
+the host's D2H read of AICPU-written `task` needs the clean on A3 — is unexamined and is
+in exactly this direction. It does **not** add up to "the clean has no consumer".
 
 ### Two further facts
 
@@ -567,21 +607,26 @@ reached through — `dev.workers`, `get_workers()`, `all_handshakes`, `handshake
 AICore, platform and host trees for both arches and both runtimes, plus the two D2H
 sites. What remains **unresolved** rather than absent:
 
-1. **Whether the clean is the gate's publisher on a2a3.** No acknowledgment orders the
-   AICore's bypass read against it, and the relaxed store has no flush of its own.
+1. ~~**Whether the clean is the gate's publisher on a2a3.**~~ **Answered**: it is not.
+   The owner's AICPU→AICore premise covers exactly this store and this reader, so the
+   relaxed store needs no flush of its own. What the premise does not give is ordering,
+   which the reset and RELEASE edges get from `wmb()` and `rmb()` respectively, or any
+   statement about a reader left live by an earlier run.
 2. **Whether `workers[i].task`'s unflushed store reaches memory for the AICore's read.**
    The `EXITED` acknowledgment orders that read before `deinit`, so the *clean* is not the
    candidate — but what publishes the store to the AICore in the first place is a
-   separate, still-open question on the AICPU→AICore edge, which the host↔device premise
-   does not cover.
+   separate, still-open question. The AICPU→AICore premise is stated for a bypass `ld_dev`
+   read of the same address; this reader reaches `task` by a different access path, so the
+   premise is not extended to it here.
 3. **Whether the host's D2H read of AICPU-written `task` requires the clean on A3.** The
    premise addresses the inbound host→AICPU direction; this read is the opposite one.
 
-**What this licenses: nothing.** Three of the four writer groups are excluded as the
-clean's beneficiaries with a named dependency each — two by an explicit publication, one
-by the `EXITED` acknowledgment on normal exits. The a2a3 teardown gate is **not** excluded.
-No operation is changed, no defect is claimed, and the residual uncertainty at the
-release-gate boundary is retained rather than resolved in either direction.
+**What this licenses: nothing.** All four writer groups are now excluded as the clean's
+beneficiaries with a named dependency each — two by an explicit publication, one by the
+`EXITED` acknowledgment on normal exits, and the a2a3 teardown gate by the AICPU→AICore
+premise. That is still not a licence to remove the call: residual 3 is an unexamined
+reader in the host direction, which the premise does not address. No operation is
+changed and no defect is claimed.
 
 ## Open questions for future measurement — not a proven probe plan
 
@@ -625,16 +670,19 @@ at all.
 
 **What no measurement here can do:** establish an architectural guarantee. It can
 demonstrate a violation. Retiring unknowns 1–3 as guarantees needs an SDK or
-architecture statement — the kind the host↔device premise supplies for its own edge,
-and which the remaining unknowns do not have.
+architecture statement — the kind the host↔device premise supplies for its own edge, and
+the kind the AICPU→AICore premise now supplies for the gate half of unknown 2. The rest
+do not have one.
 
 ## Why nothing is changed in the runtime
 
-The coherence premise settles the inbound edge per architecture; it does not discharge
-the outbound, atomicity, ordering or lifetime obligations, and the remaining unknowns
-do not either. Adding an invalidate to a5 TRB, or deleting a5 HBG's two calls, or
-deleting all four, would each rest on the premise answering more than it does — the
-clean half of the operation stays unaccounted for in all three.
+The coherence premises settle two visibility edges — inbound host→AICPU per
+architecture, and the a2a3 AICPU→AICore store the gate uses. Neither discharges the
+outbound host-direction question, nor atomicity, ordering or lifetime, and the remaining
+unknowns do not either. Adding an invalidate to a5 TRB, or deleting a5 HBG's two calls,
+or deleting all four, would each rest on the premises answering more than they do — on
+a2a3 the clean's host-direction role stays unaccounted for even with every on-device
+reader excluded.
 
 ## What this hands to other work
 

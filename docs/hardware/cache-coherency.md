@@ -29,7 +29,9 @@ Likewise, **AICore's own cache is non-coherent with GM** in the other
 direction: AICore-side writes stay in its data cache until explicitly
 pushed out with `dcci`. AICPU writes that AICore needs to see follow a
 mirror of this table (AICore must `dcci` to invalidate before reading
-host- or AICPU-written GM).
+host- or AICPU-written GM) — except where the AICore reads with a
+bypass load, for which see
+[the AICPU → AICore section](#the-aicpu-to-aicore-path-for-one-access-shape-the-a2a3-teardown-gate).
 
 The rest of this doc fills in why each row of the table is what it is,
 and what code lives on each side.
@@ -126,6 +128,54 @@ AICPU-side read of an AICore-published value, **stop**. The right fix
 is `rmb()` (for load-load ordering against a prior COND read) plus
 making sure the AICore side does `dcci` before signaling. The cache
 invalidate itself is not needed on this path.
+
+## The "AICPU to AICore" path for one access shape: the a2a3 teardown gate
+
+On a2a3, an AICPU ordinary GM store is observable by an AICore `ld_dev` bypass load of
+the same address **without an AICPU-side cache clean**. No extra maintenance is required
+to expose that store to that reader.
+
+**Basis: a project architecture premise.** This is stated by the project owner as an
+architectural fact. It is **not** a vendor specification quoted here, **not** proven from
+the public SDK, and **not** something this repository measured. Read it exactly as
+written and no wider: it is about an a2a3 AICPU ordinary GM store, observed by an AICore
+`ld_dev` load of the same address. It does not extend to the host↔device edge (a separate
+premise, in the host-DMA section below), to the reverse direction, or to a reader that
+reaches the same field through any other access path.
+
+**Coherence here is not ordering, and does not retire a writer.** The premise says the
+value is visible. It supplies no happens-before between the store and any other
+operation, makes no multi-field publication atomic, and says nothing about whether an
+earlier run's reader is still live on the line. For this one field, existing code
+provides the **two intra-run ordering edges** below, under the lifetime preconditions
+that code already assumes — it does not establish those preconditions:
+
+- **Reset before window-open.** `memset` over the gates then `wmb()`
+  (`scheduler_cold_path.cpp:1183-1184` TRB, `:890-891` HBG). The barrier is what orders
+  the resets before `hs_setup_done_` and before any register window opens — a window is a
+  plain `Device-nGnRE` store carrying no release semantics of its own. No core can read
+  its gate before its window opens.
+- **RELEASE after window-close.** The quiesce pass, then the CLOSE pass and its
+  readbacks, then `rmb()`, then the relaxed `post_close_release` stores
+  (`platform_regs.cpp:82`, `:142`, `:149`). The drain is what orders every store after
+  the CLOSE it belongs to, so an open return gate is never paired with an open window.
+
+**Lifetime across runs is a separate, open question.** Whether a reader left behind by a
+failed or partially retired run can still be live when a later launch resets and
+releases the same gates is **not** established — the recovery path is untraced, and
+neither the premise nor the two edges above settle it. See
+[the exceptional-exit limit in the descriptor visibility investigation](../investigations/2026-09-runtime-descriptor-input-visibility-chain.md#exceptional-and-partial-exits-audited-separately).
+
+The AICore reads that word with `wait_for_post_close_release`
+(`src/a2a3/platform/onboard/aicore/inner_kernel.h:52-59`), a `ld_dev` spin followed by
+`dsb(DSB_DDR)`. Nothing else is published through the gate: it is permission-to-return,
+one `uint32_t` in its own 64-byte line.
+
+**This licenses no deletion.** In particular the descriptor-wide
+`cache_invalidate_range` in `deinit` stays: `dc civac` also cleans, and its role toward
+other readers — including the host's D2H direction, which this premise does not address —
+is a separate question tracked in
+[the descriptor visibility investigation](../investigations/2026-09-runtime-descriptor-input-visibility-chain.md).
 
 ## The "host DMA → AICPU" path: a2a3 MUST invalidate, a5 does not
 
@@ -246,6 +296,11 @@ When you are about to insert a cache operation, ask in order:
    yes, and there is no data/address dependency between that read and
    this one, insert `rmb()` between them — coherency does not imply
    load-load ordering on ARM64.
+6. Am I about to add an AICPU clean so an **AICore** read sees my
+   store? On a2a3, for an ordinary GM store read back by an AICore
+   `ld_dev` bypass load, no clean is needed — see the AICPU → AICore
+   section. What you still owe that reader is *ordering*, from a
+   barrier and the surrounding protocol, not from cache maintenance.
 
 If the answer to (1) is "I'm not sure" — find out. The cost of one
 wrong `cache_invalidate_range` is silent perf rot; the cost of a
