@@ -281,8 +281,6 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
             contexts[worker].scheduler_index = cluster < active_clusters ? static_cast<uint64_t>(cluster) : UINT64_MAX;
             contexts[worker].scheduler_worker_id = scheduler_worker;
             contexts[worker].is_scheduler = scheduler_lane && cluster < active_clusters ? 1 : 0;
-            contexts[worker].inbox_index =
-                contexts[worker].is_scheduler != 0 ? static_cast<uint64_t>(cluster) : UINT64_MAX;
             contexts[worker].scheduler_count = static_cast<uint64_t>(active_clusters);
             for (int32_t member = 0; member < PLATFORM_CORES_PER_BLOCKDIM; ++member)
                 contexts[worker].cluster_worker_ids[member] = static_cast<uint64_t>(cluster_workers[cluster][member]);

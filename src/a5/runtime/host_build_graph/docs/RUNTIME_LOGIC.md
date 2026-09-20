@@ -11,14 +11,14 @@ host run/bind: stage external tensors, execute orchestration to completion
         ↓
 host: copy the prebuilt graph image to device memory
         ↓
-device: attach the image, classify tasks, dispatch with AICPU schedulers
+device: attach the image, classify tasks, dispatch with the selected scheduler
         ↓
 host: collect outputs and destroy/reset per-run state
 ```
 
-The device has no orchestration thread. Every launched AICPU thread participates
-in scheduling its assigned AICore workers; the highest-index thread first
-attaches the prebuilt runtime and publishes the boot barrier.
+The device has no orchestration thread. The resident scheduler uses one AIV
+Scheduler per active cluster; AICPU initializes, monitors, and tears down the
+workers. The explicit legacy path uses AICPU scheduling.
 
 This ordering is the defining constraint of the runtime. The host constructs the
 whole graph before any device task can complete.
@@ -119,8 +119,9 @@ run.
 
 ### 2.3 Device Execution and Teardown
 
-The boot thread attaches the already-populated arena without resetting it. All
-threads classify/dispatch their core partitions and then shut those cores down.
+The highest-index AICPU thread attaches the already-populated arena without
+resetting it and publishes the boot barrier. All threads classify/dispatch their
+core partitions and then shut those cores down.
 The last arriving thread destroys the attached runtime before publishing cleanup
 eligibility. Exactly one returning AICPU thread claims that eligibility and
 resets executor/scheduler state for the next run.
@@ -399,6 +400,29 @@ The drain's `pending_task` stays valid for the complete attempt: all participant
 threads load it before the coordinator can pass the stage-done barrier and clear
 it. A recovery return for a null pointer would describe an unreachable state and
 could strand the drain protocol, so the active path relies on that invariant.
+
+### 7.1 Resident Scheduler Local State
+
+Each READY acquire initializes a fresh core-local configuration. Dispatch and
+completion use cached worker IDs; the Executor derives payload addresses from
+one shared region offset and the worker ID. Narrow offsets are validated before
+conversion, and every cluster member must agree with the fixed payload stride.
+Worker participation remains controlled by the shared GM context.
+
+Owner pending endpoints and publication masks are private to the Scheduler.
+Self-execution notifications contain only a pending-slot mask: the slot stays
+READY with the same generation until the local Executor claims it, so the ready
+token is reconstructed from the slot. Completion generation validation still
+prevents stale notifications from freeing or refilling a pending slot.
+
+The local configuration occupies 96 bytes and the complete local state 336 bytes
+under the 64-bit ABI. Profiling storage is present even when profiling is disabled.
+These sizes exclude other function locals and compiler spills.
+
+Before bootstrap, every participating core invalidates its entire data cache.
+The callable table and task metadata are immutable throughout that run, allowing
+callable lookup and completion resolution to omit repeated invalidation of those
+immutable lines.
 
 ## 8. Scalar Access During Construction
 

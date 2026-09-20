@@ -1268,7 +1268,6 @@ bool create_scheduler_state(
         context.task_metadata_offset = layout.task_metadata_offset;
         context.aicpu_lifecycle_traces_offset = layout.aicpu_lifecycle_traces_offset;
         context.ready_inboxes_offset = layout.ready_inboxes_offset;
-        context.ready_owner_states_offset = layout.ready_owner_states_offset;
         context.ready_directory_offset = layout.ready_directory_offset;
         context.worker_contexts_offset = layout.worker_contexts_offset;
         context.dispatch_slots_offset = layout.dispatch_slots_offset;

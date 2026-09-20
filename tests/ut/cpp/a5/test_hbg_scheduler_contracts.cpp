@@ -28,6 +28,8 @@
 #include "scheduler/scheduler_types.h"
 #include "scheduler/scheduler_watchdog.h"
 
+#include "hbg_scheduler_test_support.h"
+
 namespace {
 
 TEST(AicoreSchedulerError, MapsInternalFailureToExistingHostStatus) {
@@ -81,81 +83,8 @@ TEST(AicoreSchedulerWatchdog, UsesElapsedWallClockBudget) {
     EXPECT_TRUE(scheduler_watchdog_expired(UINT64_MAX - 10, 4, 15));
 }
 
-class SchedulerStateBuffer {
-public:
-    explicit SchedulerStateBuffer(const AicoreSchedulerLayout &layout) :
-        base_(std::aligned_alloc(SCHEDULER_STATE_ALIGNMENT, layout.total_size)) {
-        EXPECT_NE(base_, nullptr);
-        if (base_ != nullptr) EXPECT_TRUE(scheduler_init_data_from_layout(base_, layout));
-    }
-    ~SchedulerStateBuffer() { std::free(base_); }
-    void *base() const { return base_; }
-
-private:
-    void *base_{nullptr};
-};
-
-class GraphBuffer {
-public:
-    explicit GraphBuffer(size_t task_count) :
-        task_count_(task_count),
-        image_(std::make_unique<GraphImage>()) {
-        while (capacity_ < std::max<size_t>(task_count, 1))
-            capacity_ <<= 1;
-        if (capacity_ > kMaxTaskCount) throw std::invalid_argument("test graph exceeds GraphBuffer capacity");
-        storage_ = image_->storage.data();
-        fanins_ = image_->fanins.data();
-        for (size_t task = 0; task < capacity_; ++task) {
-            storage_[task].task.task_id = TaskId{static_cast<uint64_t>(task)};
-            storage_[task].payload.bind_regions(
-                nullptr, nullptr, fanins_ + task * static_cast<size_t>(SCHEDULER_GRAPH_MAX_FANIN)
-            );
-            if (storage_[task].payload.fanin_data() == nullptr) {
-                throw std::logic_error("test graph fanin region must share its contiguous image");
-            }
-            for (int slot = 0; slot < 3; ++slot)
-                storage_[task].task.kernel_id[slot] = INVALID_KERNEL_ID;
-        }
-    }
-
-    void executable(size_t task, uint8_t subtask_slot, std::vector<int32_t> fanins = {}) {
-        ASSERT_LT(task, task_count_);
-        ASSERT_LT(subtask_slot, 3);
-        ASSERT_LE(fanins.size(), static_cast<size_t>(SCHEDULER_GRAPH_MAX_FANIN));
-        storage_[task].task.kernel_id[subtask_slot] = 1;
-        storage_[task].payload.fanin_count = static_cast<int32_t>(fanins.size());
-        ASSERT_TRUE(fanins.empty() || storage_[task].payload.fanin_data() != nullptr);
-        std::copy(fanins.begin(), fanins.end(), storage_[task].payload.fanin_data());
-    }
-
-    TaskPayload &payload(size_t task) { return storage_[task].payload; }
-    ChipTaskStorage *storage() { return storage_; }
-
-    SchedulerGraphView graph() const {
-        return {
-            reinterpret_cast<uint64_t>(storage_),
-            0,
-            task_count_,
-            capacity_ - 1,
-        };
-    }
-
-private:
-    static constexpr size_t kMaxTaskCount = 16;
-    // One storage array, as production has it — the descriptor and payload of a
-    // task are members of one entry. Two parallel arrays would model the layout
-    // this runtime no longer uses and would let the wire strides drift unnoticed.
-    struct alignas(64) GraphImage {
-        std::array<ChipTaskStorage, kMaxTaskCount> storage{};
-        std::array<int32_t, kMaxTaskCount * SCHEDULER_GRAPH_MAX_FANIN> fanins{};
-    };
-
-    size_t task_count_;
-    size_t capacity_{1};
-    std::unique_ptr<GraphImage> image_;
-    ChipTaskStorage *storage_{nullptr};
-    int32_t *fanins_{nullptr};
-};
+using scheduler_test::SchedulerStateBuffer;
+using GraphBuffer = scheduler_test::BasicGraphBuffer<16>;
 
 TEST(SchedulerState, PlansAndInitializesReadyState) {
     // The reverse lookup for the wire constants AICore addresses with. They are
@@ -169,7 +98,6 @@ TEST(SchedulerState, PlansAndInitializesReadyState) {
     EXPECT_EQ(layout.total_size % SCHEDULER_STATE_ALIGNMENT, 0u);
     EXPECT_EQ(layout.task_metadata_offset % alignof(SchedulerTaskMetadata), 0u);
     EXPECT_EQ(layout.ready_inboxes_offset % alignof(SchedulerReadyInbox), 0u);
-    EXPECT_EQ(layout.ready_owner_states_offset % alignof(SchedulerReadyOwnerState), 0u);
     EXPECT_EQ(layout.ready_directory_offset % alignof(SchedulerReadyDirectory), 0u);
     EXPECT_EQ(layout.completion_inboxes_offset % alignof(SchedulerCompletionInbox), 0u);
     EXPECT_EQ(
@@ -191,11 +119,6 @@ TEST(SchedulerState, PlansAndInitializesReadyState) {
     auto *ready = scheduler_state_at<SchedulerReadyInbox>(storage.base(), layout.ready_inboxes_offset);
     for (uint64_t inbox = 0; inbox < SCHEDULER_CORE_TYPE_COUNT * SCHEDULER_WORKER_CAPACITY; ++inbox)
         EXPECT_EQ(ready[inbox].head, SCHEDULER_INBOX_EMPTY);
-    auto *ready_owners = scheduler_state_at<SchedulerReadyOwnerState>(storage.base(), layout.ready_owner_states_offset);
-    for (uint64_t owner = 0; owner < SCHEDULER_CLUSTER_CAPACITY; ++owner) {
-        for (uint32_t type = 0; type < SCHEDULER_CORE_TYPE_COUNT; ++type)
-            EXPECT_EQ(ready_owners[owner].queues[type].pending_endpoints, SCHEDULER_READY_PENDING_EMPTY);
-    }
 
     auto *directory = scheduler_state_at<SchedulerReadyDirectory>(storage.base(), layout.ready_directory_offset);
     auto shard0 = reinterpret_cast<uintptr_t>(&directory->core_types[0][0]);
@@ -208,7 +131,6 @@ TEST(SchedulerState, PlansAndInitializesReadyState) {
 TEST(SchedulerState, PreservesCacheLineAlignmentAndArrayStride) {
     EXPECT_EQ(alignof(SchedulerTaskControl), 128u);
     EXPECT_EQ(alignof(SchedulerCompletionInbox), 64u);
-    EXPECT_EQ(alignof(SchedulerReadyOwnerState), 128u);
     EXPECT_EQ(alignof(SchedulerExecutorTaskTrace), 64u);
     EXPECT_EQ(sizeof(SchedulerExecutorTaskTrace), 64u);
     EXPECT_EQ(alignof(SchedulerDispatchSlot), 64u);

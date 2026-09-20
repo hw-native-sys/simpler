@@ -16,7 +16,7 @@
 #include "scheduler_ready.h"
 
 inline __aicore__ void scheduler_account_failed_completion(
-    const SchedulerGraphView &graph, __gm__ SchedulerWorkerContext *scheduler, __gm__ SchedulerRunControl *run_control,
+    const SchedulerGraphView &graph, SchedulerLocalState *scheduler, __gm__ SchedulerRunControl *run_control,
     int64_t task_id, SchedulerErrorSite error_site
 ) {
     // Preserve a more specific error already latched by the failing helper. The
@@ -31,12 +31,11 @@ inline __aicore__ void scheduler_account_failed_completion(
 }
 
 inline __aicore__ bool scheduler_service_cluster_completion_slot(
-    const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *scheduler,
+    const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
     __gm__ SchedulerRunControl *run_control, uint32_t cluster_lane, uint32_t pending_slot,
     uint32_t completed_generation, SchedulerWakeStats *wake_stats, SchedulerReadyStats *ready_stats,
     SchedulerCompletionStats *completion_stats, uint64_t *ready_victim_cursors, uint64_t profiling_level,
-    const SchedulerReadyClaim *replacement_ready, bool *direct_refilled, __gm__ SchedulerReadyOwnerState *owner_state,
-    SchedulerLocalState *scheduler_local_state
+    const SchedulerReadyClaim *replacement_ready, bool *direct_refilled
 ) {
     if (direct_refilled != nullptr) *direct_refilled = false;
     if (cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM || pending_slot >= SCHEDULER_PENDING_SLOT_COUNT ||
@@ -44,17 +43,15 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
         return false;
     // Callers prefilter consumed tokens. Keep this mutating helper fail-fast if
     // that precondition is violated, so a completion cannot be serviced twice.
-    if (!scheduler_completion_generation_is_new(
-            scheduler_local_state, cluster_lane, pending_slot, completed_generation
-        ))
+    if (!scheduler_completion_generation_is_new(scheduler, cluster_lane, pending_slot, completed_generation))
         return false;
-    const uint64_t worker_id = scheduler->cluster_worker_ids[cluster_lane];
-    if (worker_id >= scheduler->runtime_worker_count) return false;
+    const uint64_t worker_id = scheduler->config.worker_ids[cluster_lane];
+    if (worker_id >= scheduler->config.runtime_worker_count) return false;
     __gm__ SchedulerWorkerContext *target = scheduler_worker_context_at(scheduler_state_base, scheduler, worker_id);
     if (target->active == 0) return false;
     __gm__ SchedulerDispatchSlot *slot =
         scheduler_dispatch_slot_at(scheduler_state_base, scheduler, worker_id, pending_slot);
-    SchedulerLocalSlotState *local_slot = &scheduler_local_state->slots[cluster_lane][pending_slot];
+    SchedulerLocalSlotState *local_slot = &scheduler->slots[cluster_lane][pending_slot];
     const int64_t published_task_id = local_slot->task_id;
     if (local_slot->state != SchedulerDispatchSlotState::READY || local_slot->generation != completed_generation) {
         scheduler_record_error(
@@ -81,7 +78,7 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     __gm__ SchedulerTaskTrace *completed_trace = nullptr;
     if (chip_task_timing_enabled || sampled_task_timing_enabled) {
         __gm__ SchedulerTaskTrace *traces =
-            scheduler_state_at<SchedulerTaskTrace>(scheduler_state_base, scheduler->trace_cells_offset);
+            scheduler_state_at<SchedulerTaskTrace>(scheduler_state_base, scheduler->config.trace_cells_offset);
         completed_trace = &traces[task_id];
     }
     if (chip_task_timing_enabled) {
@@ -101,29 +98,29 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
             completed_trace->completion_bookkeeping_end_cycles = executor_trace->completion_bookkeeping_end_cycles;
             completed_trace->completion_id = executor_trace->completion_id;
             completed_trace->completion_inbox_index = executor_trace->completion_inbox_index;
-            SchedulerWorkerTraceCache *worker_trace = &scheduler_local_state->worker_traces[cluster_lane];
-            if (!worker_trace->valid) {
+            SchedulerWorkerTraceCache *worker_trace = &scheduler->worker_traces[cluster_lane];
+            if ((scheduler->worker_trace_valid_mask & (1U << cluster_lane)) == 0) {
                 scheduler_observe_cache_line(&target->trace_aicore_entry_cycles);
                 scheduler_observe_cache_line(&target->trace_register_release_cycles);
                 worker_trace->descriptor_cache_observed_cycles = target->trace_descriptor_cache_observed_cycles;
                 worker_trace->aicore_entry_cycles = target->trace_aicore_entry_cycles;
                 worker_trace->handshake_publish_cycles = target->trace_handshake_publish_cycles;
                 worker_trace->register_release_cycles = target->trace_register_release_cycles;
-                worker_trace->valid = true;
+                scheduler->worker_trace_valid_mask |= 1U << cluster_lane;
             }
             completed_trace->descriptor_cache_observed_cycles = worker_trace->descriptor_cache_observed_cycles;
             completed_trace->aicore_entry_cycles = worker_trace->aicore_entry_cycles;
             completed_trace->handshake_publish_cycles = worker_trace->handshake_publish_cycles;
             completed_trace->register_release_cycles = worker_trace->register_release_cycles;
-            completed_trace->complete_scheduler_worker_id = scheduler->worker_index;
-            completed_trace->complete_loop_iter = scheduler->profiling_loop_iter;
+            completed_trace->complete_scheduler_worker_id = scheduler->worker_id();
+            completed_trace->complete_loop_iter = scheduler->loop_iter;
         }
     } else if (completed_trace != nullptr) {
         completed_trace->kernel_start_cycles = executor_trace->kernel_start_cycles;
         completed_trace->kernel_end_cycles = executor_trace->kernel_end_cycles;
     }
     const uint8_t completed_subtask_slot = local_slot->subtask_slot;
-    scheduler_mark_completion_consumed(scheduler_local_state, cluster_lane, pending_slot, completed_generation);
+    scheduler_mark_completion_consumed(scheduler, cluster_lane, pending_slot, completed_generation);
     uint64_t refill_start_cycles = 0;
     uint64_t refill_end_cycles = 0;
     bool refilled = false;
@@ -132,11 +129,10 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     const uint64_t completion_phase_end = phase_timing_enabled ? scheduler_cycles() : 0;
     SchedulerReadyClaim resolved_ready{};
     SchedulerReadyClaim *direct_ready =
-        replacement_ready == nullptr && worker_id != scheduler->worker_index ? &resolved_ready : nullptr;
+        replacement_ready == nullptr && worker_id != scheduler->worker_id() ? &resolved_ready : nullptr;
     if (!scheduler_resolve_completion(
             graph, scheduler_state_base, scheduler, run_control, task_id, wake_stats, ready_stats, completion_stats,
-            owner_state, profiling_level, false, direct_ready,
-            scheduler_metadata_core_type_index(completed_subtask_slot), scheduler_local_state
+            profiling_level, false, direct_ready, scheduler_metadata_core_type_index(completed_subtask_slot)
         )) {
         scheduler_account_failed_completion(
             graph, scheduler, run_control, task_id, SchedulerErrorSite::COMPLETION_RESOLVE_FAILED
@@ -150,14 +146,14 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     } else if (resolved_ready.task_id >= 0) {
         ready = resolved_ready;
         ready_available = true;
-    } else if (ready_victim_cursors != nullptr && worker_id != scheduler->worker_index) {
+    } else if (ready_victim_cursors != nullptr && worker_id != scheduler->worker_id()) {
         // A normal AIV task is never refilled directly onto the Scheduler.
         // Its completed slot becomes capacity for late binding instead.
         const uint32_t core_type = scheduler_metadata_core_type_index(completed_subtask_slot);
         const uint64_t state_probe_start_cycles = phase_timing_enabled ? scheduler_cycles() : 0;
         if (!scheduler_claim_ready_for_slot(
-                graph, scheduler_state_base, scheduler, run_control, scheduler->scheduler_count, core_type,
-                &ready_victim_cursors[core_type], ready_stats, &ready, owner_state, scheduler_local_state
+                graph, scheduler_state_base, scheduler, run_control, scheduler->config.scheduler_count, core_type,
+                &ready_victim_cursors[core_type], ready_stats, &ready
             )) {
             scheduler_account_failed_completion(
                 graph, scheduler, run_control, task_id, SchedulerErrorSite::COMPLETION_REFILL_CLAIM_FAILED
@@ -181,8 +177,7 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
             cluster_lane,
         };
         if (!scheduler_fill_dispatch_slot(
-                graph, scheduler_state_base, scheduler, run_control, claim, ready, profiling_level,
-                scheduler_local_state
+                graph, scheduler_state_base, scheduler, run_control, claim, ready, profiling_level
             )) {
             scheduler_account_failed_completion(
                 graph, scheduler, run_control, task_id, SchedulerErrorSite::COMPLETION_REFILL_DISPATCH_FAILED
@@ -204,11 +199,11 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
             completed_trace->complete_end_cycles = completion_phase_end;
         }
         if (phase_timing_enabled && refilled) {
-            completed_trace->refill_scheduler_worker_id = scheduler->worker_index;
+            completed_trace->refill_scheduler_worker_id = scheduler->worker_id();
             completed_trace->refill_start_cycles = refill_start_cycles;
             completed_trace->refill_end_cycles = refill_end_cycles;
             completed_trace->refill_task_id = static_cast<uint64_t>(ready.task_id);
-            completed_trace->refill_loop_iter = scheduler->profiling_loop_iter;
+            completed_trace->refill_loop_iter = scheduler->loop_iter;
         }
         scheduler_writeback_cache_line(completed_trace);
         scheduler_writeback_cache_line(&completed_trace->kernel_start_cycles);
@@ -231,18 +226,17 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
 }
 
 inline __aicore__ bool scheduler_service_cluster_completions(
-    const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *scheduler,
+    const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
     __gm__ SchedulerRunControl *run_control, SchedulerWakeStats *wake_stats, SchedulerReadyStats *ready_stats,
     SchedulerCompletionStats *completion_stats, uint64_t *ready_victim_cursors, uint64_t profiling_level,
-    uint64_t *direct_refilled_slot_mask, __gm__ SchedulerReadyOwnerState *owner_state,
-    SchedulerLocalState *scheduler_local_state
+    uint64_t *direct_refilled_slot_mask
 ) {
-    if (scheduler->is_scheduler == 0) return false;
+    if (!scheduler->is_scheduler()) return false;
     if (direct_refilled_slot_mask != nullptr) *direct_refilled_slot_mask = 0;
     bool progress = false;
     for (uint32_t cluster_lane = 0; cluster_lane < PLATFORM_CORES_PER_BLOCKDIM; ++cluster_lane) {
-        const uint64_t worker_id = scheduler->cluster_worker_ids[cluster_lane];
-        if (worker_id >= scheduler->runtime_worker_count) continue;
+        const uint64_t worker_id = scheduler->config.worker_ids[cluster_lane];
+        if (worker_id >= scheduler->config.runtime_worker_count) continue;
         __gm__ SchedulerWorkerContext *target = scheduler_worker_context_at(scheduler_state_base, scheduler, worker_id);
         if (target->active == 0) continue;
         __gm__ SchedulerCompletionInbox *completion_line =
@@ -252,15 +246,13 @@ inline __aicore__ bool scheduler_service_cluster_completions(
         const uint64_t completed_generations = scheduler_gm_query_u32_pair(completion_line->completed_generations);
         for (uint32_t pending_slot = 0; pending_slot < SCHEDULER_PENDING_SLOT_COUNT; ++pending_slot) {
             const uint32_t completed_generation = static_cast<uint32_t>(completed_generations >> (pending_slot * 32));
-            if (!scheduler_completion_generation_is_new(
-                    scheduler_local_state, cluster_lane, pending_slot, completed_generation
-                ))
+            if (!scheduler_completion_generation_is_new(scheduler, cluster_lane, pending_slot, completed_generation))
                 continue;
             bool direct_refilled = false;
             if (!scheduler_service_cluster_completion_slot(
                     graph, scheduler_state_base, scheduler, run_control, cluster_lane, pending_slot,
                     completed_generation, wake_stats, ready_stats, completion_stats, ready_victim_cursors,
-                    profiling_level, nullptr, &direct_refilled, owner_state, scheduler_local_state
+                    profiling_level, nullptr, &direct_refilled
                 ))
                 return false;
             if (direct_refilled && direct_refilled_slot_mask != nullptr)

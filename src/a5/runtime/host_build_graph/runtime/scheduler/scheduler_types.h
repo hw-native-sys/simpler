@@ -802,18 +802,6 @@ struct alignas(128) SchedulerReadyInbox {
     uint8_t atomic_line_padding[120];
 };
 
-struct alignas(64) SchedulerReadyOwnerQueue {
-    // Head and tail are one owner-only device word so an ld_dev cannot
-    // observe endpoints from different updates.
-    volatile uint64_t pending_endpoints{SCHEDULER_READY_PENDING_EMPTY};
-    volatile uint64_t advertised{0};
-    uint8_t owner_line_padding[48];
-};
-
-struct alignas(128) SchedulerReadyOwnerState {
-    SchedulerReadyOwnerQueue queues[SCHEDULER_CORE_TYPE_COUNT];
-};
-
 enum class SchedulerGangCohortState : uint64_t {
     FREE = 0,
     DRAINING = 1,
@@ -966,7 +954,7 @@ enum class SchedulerErrorSite : uint64_t {
     DEFERRED_PUBLISH_INVALID_RESERVATION = 77,
     NORMAL_DISPATCH_INVALID_TOPOLOGY = 78,
     EXECUTOR_PREFERRED_SLOT_INVALID = 79,
-    READY_OWNER_MAINTENANCE_FAILED = 80,
+    READY_INBOX_REFRESH_FAILED = 80,
     BOOTSTRAP_FAILED = 90,
     CONTEXT_READY_TIMEOUT = 91,
     BOOTSTRAP_SCAN_TIMEOUT = 92,
@@ -1067,11 +1055,10 @@ struct alignas(128) SchedulerWorkerContext {
     volatile uint64_t graph_task_count;
     volatile uint64_t worker_index;
     volatile uint64_t completion_inboxes_offset;
-    volatile uint64_t inbox_index;
-    volatile uint64_t ready_owner_states_offset;
+    volatile uint64_t scheduler_ssbuf_reserved1;
     volatile uint64_t aicpu_lifecycle_traces_offset;
 
-    volatile uint64_t task_metadata_offset;
+    alignas(128) volatile uint64_t task_metadata_offset;
     volatile uint64_t ready_inboxes_offset;
     volatile uint64_t ready_directory_offset;
     volatile uint64_t activity_buffers_offset;
@@ -1098,10 +1085,9 @@ struct alignas(128) SchedulerWorkerContext {
     volatile uint64_t scheduler_worker_id;
     volatile uint64_t is_scheduler;
     volatile uint64_t cluster_worker_ids[3];
-    volatile uint64_t profiling_loop_iter;
-    uint64_t topology_reserved[2];
+    uint64_t topology_reserved[3];
 
-    uint64_t bootstrap_task_count;
+    alignas(128) uint64_t bootstrap_task_count;
     uint64_t ready_enqueue_count;
     uint64_t ready_batch_count;
     uint64_t ready_pop_count;
@@ -1212,10 +1198,6 @@ static_assert(
 );
 static_assert(sizeof(SchedulerReadyInbox) == 128, "ready inbox layout changed");
 static_assert(alignof(SchedulerReadyInbox) == 128, "ready inbox alignment changed");
-static_assert(sizeof(SchedulerReadyOwnerQueue) == 64, "ready owner queue must occupy one cache line");
-static_assert(alignof(SchedulerReadyOwnerQueue) == 64, "ready owner queue alignment changed");
-static_assert(sizeof(SchedulerReadyOwnerState) == 128, "ready owner state must occupy two cache lines");
-static_assert(alignof(SchedulerReadyOwnerState) == 128, "ready owner state alignment changed");
 static_assert(sizeof(SchedulerGangCoordinator) == 256, "gang coordinator layout changed");
 static_assert(alignof(SchedulerGangCoordinator) == 128, "gang coordinator alignment changed");
 static_assert(
@@ -1317,9 +1299,6 @@ static_assert(
 );
 static_assert(std::is_standard_layout_v<SchedulerReadyInbox> && std::is_trivially_copyable_v<SchedulerReadyInbox>);
 static_assert(
-    std::is_standard_layout_v<SchedulerReadyOwnerState> && std::is_trivially_copyable_v<SchedulerReadyOwnerState>
-);
-static_assert(
     std::is_standard_layout_v<SchedulerGangCoordinator> && std::is_trivially_copyable_v<SchedulerGangCoordinator>
 );
 static_assert(std::is_standard_layout_v<SchedulerGangCohort> && std::is_trivially_copyable_v<SchedulerGangCohort>);
@@ -1405,7 +1384,6 @@ inline bool scheduler_plan_layout(
         !SCHEDULER_RESERVE_ARRAY(
             SCHEDULER_CORE_TYPE_COUNT * SCHEDULER_WORKER_CAPACITY, SchedulerReadyInbox, ready_inboxes_offset
         ) ||
-        !SCHEDULER_RESERVE_ARRAY(SCHEDULER_CAPACITY, SchedulerReadyOwnerState, ready_owner_states_offset) ||
         !scheduler_layout_reserve(
             &cursor, sizeof(SchedulerReadyDirectory), alignof(SchedulerReadyDirectory), &next.ready_directory_offset
         ) ||
@@ -1447,11 +1425,6 @@ inline bool scheduler_init_data_from_layout(void *base, const AicoreSchedulerLay
     auto *ready = scheduler_state_at<SchedulerReadyInbox>(base, layout.ready_inboxes_offset);
     for (uint64_t i = 0; i < SCHEDULER_CORE_TYPE_COUNT * SCHEDULER_WORKER_CAPACITY; ++i)
         ready[i].head = SCHEDULER_INBOX_EMPTY;
-    auto *ready_owners = scheduler_state_at<SchedulerReadyOwnerState>(base, layout.ready_owner_states_offset);
-    for (uint64_t owner = 0; owner < SCHEDULER_CAPACITY; ++owner) {
-        for (uint32_t type = 0; type < SCHEDULER_CORE_TYPE_COUNT; ++type)
-            ready_owners[owner].queues[type].pending_endpoints = SCHEDULER_READY_PENDING_EMPTY;
-    }
     auto *contexts = scheduler_state_at<SchedulerWorkerContext>(base, layout.worker_contexts_offset);
     for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
         contexts[worker].physical_core_id = -1;
