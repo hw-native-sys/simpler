@@ -768,6 +768,39 @@ foreach(runtime tensormap_and_ringbuffer host_build_graph)
     set_tests_properties(${aicore_test} PROPERTIES LABELS "no_hardware")
 endforeach()
 
+# Ownership of a completed run's export data. Per runtime for the same reason
+# as the swimlane targets above.
+foreach(runtime tensormap_and_ringbuffer host_build_graph)
+    set(run_export_test test_chip_swimlane_run_export_${runtime})
+    add_executable(${run_export_test}
+        common/test_chip_swimlane_run_export.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/chip_swimlane_collector.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/chip_swimlane_collector_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/device_run_result_base_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/sim/aicpu/inner_platform_regs.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/clock_correlation.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/sim/host/profiling_copy.cpp
+        ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
+    )
+    target_compile_definitions(${run_export_test} PRIVATE SIMPLER_RUNTIME_NAME="${runtime}")
+    target_include_directories(${run_export_test} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/aicpu
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/${runtime}
+        ${CMAKE_SOURCE_DIR}/../../../src/common
+    )
+    target_link_libraries(${run_export_test} PRIVATE
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        pthread
+    )
+    add_test(NAME ${run_export_test} COMMAND ${run_export_test})
+    set_tests_properties(${run_export_test} PROPERTIES LABELS "no_hardware")
+endforeach()
+
 # Device-to-host transfer failures on the consistency consumer's two reads.
 # Links stubs/profiling_copy_fault.cpp in place of an arch's profiling_copy.cpp,
 # which gives the collector separate host and device storage: the arch stubs are

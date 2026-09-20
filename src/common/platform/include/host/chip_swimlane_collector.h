@@ -428,6 +428,9 @@ public:
         // report unknown until this run's reconcile has produced its own.
         live_counters_ = LiveTaskCounters{};
         aicore_accounting_ = AicoreAccounting{};
+        terminal_reported_ = false;
+        terminal_snapshot_ = RunTerminalSnapshot{};
+        terminal_consistency_ = RunTerminalConsistency{};
         reset_collector_shards();
         publish_run_config();
     }
@@ -539,6 +542,10 @@ public:
      * Export collected records as a Chrome Trace Event JSON (swimlane view).
      * Writes <output_prefix>/chip_swimlane_records.json — directory is captured at
      * initialize() time.
+     *
+     * Seals this run's data out of the collector and writes from the sealed
+     * copy, so the writer reads no mutable collector state. The sealed data is
+     * consumed here and released on return.
      *
      * @return 0 on success, error code on failure
      */
@@ -751,9 +758,101 @@ public:
     /**
      * Read the snapshot, compare it with the live counters, and log both beside
      * `reconcile_counters`' accounting. Diagnostic only: it changes no run
-     * outcome and reconcile stays authoritative.
+     * outcome and reconcile stays authoritative. The snapshot and verdict are
+     * retained for `seal_run_export()`; no second bank read is performed.
      */
     void report_run_terminal_snapshot(uint32_t bank_index, uint64_t run_epoch);
+
+    /**
+     * One completed run's diagnostic data, owned by that run.
+     *
+     * A plain owned value: every field is held by value, the record streams are
+     * moved out of the collector and the rest is copied, so no element aliases
+     * collector storage that a later `begin_run()` reuses. It is an ordinary
+     * mutable aggregate — the writer takes it by `const &`, which is what keeps
+     * serialization from touching it; nothing here is enforced by the type.
+     *
+     * The accounting fields are not serialized. They are held so this object is
+     * the whole of the run's diagnostic state and no reader has to go back to
+     * the collector for part of it.
+     *
+     * `sched_phase_dropped_records` and `num_orch_phase_threads` come from the
+     * shared-memory header at seal time, which is what lets the writer run
+     * without a region.
+     */
+    struct RunExport {
+        std::string output_prefix;
+        ChipSwimlaneLevel level{ChipSwimlaneLevel::DISABLED};
+        std::array<std::string, static_cast<size_t>(ChipSwimlaneExtensionSection::Count)> json_extensions{};
+
+        std::vector<std::vector<CollectedRecord<ChipSwimlaneAicpuTaskRecord>>> perf_records;
+        std::vector<std::vector<CollectedRecord<ChipSwimlaneAicoreTaskRecord>>> aicore_records;
+        std::vector<std::vector<CollectedRecord<ChipSwimlaneAicpuSchedPhaseRecord>>> sched_phase_records;
+        std::vector<std::vector<CollectedRecord<ChipSwimlaneAicpuOrchPhaseRecord>>> orch_phase_records;
+
+        int num_aicore{0};
+        std::vector<CoreType> core_types;
+        std::vector<int8_t> core_to_thread;
+
+        bool host_orchestrated{false};
+        bool host_phase_records_present{false};
+        std::vector<HostPhaseRecord> host_submit_records;
+        std::vector<HostPhaseRecord> host_upload_records;
+        uint64_t host_phase_submitted_tasks{0};
+        uint64_t host_phase_total_records{0};
+        uint64_t host_phase_dropped_records{0};
+
+        // Projection of the clock-correlation session. The session object itself
+        // stays on the collector: it is closed again after the artifact, on
+        // paths this data never reaches.
+        bool clock_started{false};
+        std::string clock_provider_name;
+        std::string clock_raw_device_timestamp_unit;
+        std::vector<simpler::dfx::ClockAnchorSample> clock_samples;
+
+        std::vector<uint32_t> sched_phase_dropped_records;
+        uint32_t num_orch_phase_threads{0};
+
+        uint64_t total_perf_collected{0};
+        uint64_t total_sched_phase_collected{0};
+        uint64_t total_orch_phase_collected{0};
+        uint64_t total_aicore_collected{0};
+        AicoreAccountingView aicore_accounting{};
+        bool has_phase_data{false};
+        uint64_t armed_run_epoch{0};
+        bool terminal_reported{false};
+        RunTerminalSnapshot terminal_snapshot;
+        RunTerminalConsistency terminal_consistency;
+    };
+
+    /**
+     * Detach this run's diagnostic data from the collector.
+     *
+     * Merges any unmerged shards, then moves the record streams out and copies
+     * the rest, and releases the per-shard duplicates the merge left behind. On
+     * return the collector holds none of this run's records, so a subsequent
+     * `begin_run()` cannot reach them. Call after the last writer — the
+     * host-phase insertion — and after the metadata and accounting reads;
+     * `export_swimlane_json()` is that point today.
+     *
+     * Shares `merge_collector_shards`' precondition: the collector threads must
+     * be quiesced, since this both reads and clears the per-shard vectors they
+     * would otherwise be appending to.
+     *
+     * Like reconcile and export, not idempotent: a second seal returns a scope
+     * whose record streams are already gone.
+     */
+    RunExport seal_run_export();
+
+    /**
+     * Write `<output_prefix>/chip_swimlane_records.json` from sealed data.
+     *
+     * Static so that the writer reads no collector state at all: the JSON is a
+     * function of the sealed run and of nothing else.
+     *
+     * @return 0 on success, error code on failure
+     */
+    static int write_swimlane_json(const RunExport &data);
 
     /**
      * @return Per-core ChipSwimlaneAicpuTaskRecord vectors (indexed by core_index). For tests.
@@ -908,6 +1007,13 @@ private:
     // attribute no record to a run, so the AICore accounting carries no
     // verdict rather than inheriting the previous run's identity.
     uint64_t armed_run_epoch_{0};
+
+    // What `report_run_terminal_snapshot` read and concluded for this run, kept
+    // so the seal can carry it without a second bank read. `begin_run` clears
+    // the flag: a predecessor's terminal verdict is not this run's.
+    bool terminal_reported_{false};
+    RunTerminalSnapshot terminal_snapshot_{};
+    RunTerminalConsistency terminal_consistency_{};
 
     void reconcile_aicore_counters();
 

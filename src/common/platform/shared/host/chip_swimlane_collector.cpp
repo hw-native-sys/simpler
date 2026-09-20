@@ -1317,6 +1317,11 @@ void ChipSwimlaneCollector::report_run_terminal_snapshot(uint32_t bank_index, ui
     if (shm_host_ == nullptr) return;
 
     RunTerminalSnapshot snapshot = read_run_terminal_snapshot(bank_index, run_epoch);
+    // Retained before the readability branch: an unreadable bank is itself this
+    // run's terminal fact, and the default verdict for it is Unknown.
+    terminal_snapshot_ = snapshot;
+    terminal_consistency_ = RunTerminalConsistency{};
+    terminal_reported_ = true;
     if (!snapshot.transport_ok) {
         LOG_INFO(
             "ChipSwimlane terminal: bank %u unreadable for epoch %lu — no snapshot and no consistency verdict",
@@ -1353,6 +1358,7 @@ void ChipSwimlaneCollector::report_run_terminal_snapshot(uint32_t bank_index, ui
     // statement that the run's accounting is complete, that no records were
     // lost, or that the mechanism is sound under overlapping runs.
     RunTerminalConsistency consistency = run_terminal_consistency(snapshot);
+    terminal_consistency_ = consistency;
     auto log_verdict = [&](const char *kind, const RunTerminalClassConsistency &c) {
         LOG_INFO(
             "ChipSwimlane terminal: epoch %lu %s snapshot-vs-live %s "
@@ -1525,20 +1531,107 @@ void ChipSwimlaneCollector::record_clock_anchor_samples(std::vector<simpler::dfx
 
 void ChipSwimlaneCollector::finish_clock_correlation_session() { clock_correlation_session_.finish(); }
 
+ChipSwimlaneCollector::RunExport ChipSwimlaneCollector::seal_run_export() {
+    RunExport data;
+
+    merge_collector_shards();
+
+    data.output_prefix = output_prefix_;
+    data.level = chip_swimlane_level_;
+    data.json_extensions = json_extensions_;
+
+    data.perf_records = std::move(collected_perf_records_);
+    data.aicore_records = std::move(collected_aicore_records_);
+    data.sched_phase_records = std::move(collected_sched_phase_records_);
+    data.orch_phase_records = std::move(collected_orch_phase_records_);
+    // A moved-from vector's state is valid but unspecified. Clearing makes the
+    // collector's own view of this run's records definite: empty.
+    collected_perf_records_.clear();
+    collected_aicore_records_.clear();
+    collected_sched_phase_records_.clear();
+    collected_orch_phase_records_.clear();
+    // `merge_record_shards` copies rather than moves, so the per-shard vectors
+    // still hold a second copy of every record now owned by `data`. Releasing
+    // them here is what makes "the collector holds none of this run's records"
+    // true, and it needs no precondition the merge above did not already need:
+    // both touch these vectors from the calling thread while the collector
+    // threads are quiesced. The shard and instance extents stay, so the
+    // per-shard accessors remain in range and simply report empty.
+    auto release_shard_copies = [](auto &by_collector) {
+        for (auto &shard : by_collector) {
+            for (auto &instance : shard) {
+                instance.clear();
+                instance.shrink_to_fit();
+            }
+        }
+    };
+    release_shard_copies(perf_records_by_collector_);
+    release_shard_copies(aicore_records_by_collector_);
+    release_shard_copies(sched_phase_records_by_collector_);
+    release_shard_copies(orch_phase_records_by_collector_);
+
+    data.num_aicore = num_aicore_;
+    data.core_types = core_types_;
+    data.core_to_thread = core_to_thread_;
+
+    data.host_orchestrated = host_orchestrated_;
+    data.host_phase_records_present = host_phase_records_present_;
+    data.host_submit_records = host_submit_records_;
+    data.host_upload_records = host_upload_records_;
+    data.host_phase_submitted_tasks = host_phase_submitted_tasks_;
+    data.host_phase_total_records = host_phase_total_records_;
+    data.host_phase_dropped_records = host_phase_dropped_records_;
+
+    data.clock_started = clock_correlation_session_.started();
+    data.clock_provider_name = clock_correlation_session_.provider_name();
+    data.clock_raw_device_timestamp_unit = clock_correlation_session_.raw_device_timestamp_unit();
+    data.clock_samples = clock_correlation_session_.samples();
+
+    // The header fields the writer used to read mid-serialization. Reading them
+    // here is what removes the writer's last dependency on the region.
+    data.sched_phase_dropped_records.assign(data.sched_phase_records.size(), 0);
+    if (shm_host_ != nullptr) {
+        for (size_t t = 0; t < data.sched_phase_records.size(); t++) {
+            data.sched_phase_dropped_records[t] =
+                get_sched_phase_buffer_state(shm_host_, static_cast<int>(t))->head.dropped_record_count;
+        }
+        data.num_orch_phase_threads = get_chip_swimlane_header(shm_host_)->num_orch_phase_threads;
+    }
+
+    data.total_perf_collected = total_perf_collected_;
+    data.total_sched_phase_collected = total_sched_phase_collected_;
+    data.total_orch_phase_collected = total_orch_phase_collected_;
+    data.total_aicore_collected = total_aicore_collected_;
+    data.aicore_accounting = {aicore_accounting_.known,          aicore_accounting_.identity_ok,
+                              aicore_accounting_.device_total,   aicore_accounting_.device_dropped,
+                              aicore_accounting_.host_collected, aicore_accounting_.host_skipped,
+                              aicore_skipped_unwritten_,         aicore_skipped_overflow_,
+                              aicore_skipped_bad_core_,          aicore_foreign_identity_};
+    data.has_phase_data = has_phase_data_;
+    data.armed_run_epoch = armed_run_epoch_;
+    data.terminal_reported = terminal_reported_;
+    data.terminal_snapshot = terminal_snapshot_;
+    data.terminal_consistency = terminal_consistency_;
+
+    return data;
+}
+
+int ChipSwimlaneCollector::export_swimlane_json() {
+    if (shm_host_ == nullptr) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    return write_swimlane_json(seal_run_export());
+}
+
 // JSON v2 emit: the host now dumps raw cycle-domain per-stream records plus
 // metadata, and `swimlane_converter.py` performs the join (AICore↔Scheduler on
 // reg_task_id, base_time normalization, cycles→µs conversion, sort, core_type
 // lookup, func_id resolution against deps.json). Moving the join into Python
 // makes the schema easy to evolve without round-tripping through C++ + a
 // rebuild, and shrinks this file to a pure dump.
-int ChipSwimlaneCollector::export_swimlane_json() {
-    if (shm_host_ == nullptr) {
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    merge_collector_shards();
-
-    auto extension = [this](ChipSwimlaneExtensionSection section) -> const std::string * {
-        const std::string &value = json_extensions_[static_cast<size_t>(section)];
+int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
+    auto extension = [&data](ChipSwimlaneExtensionSection section) -> const std::string * {
+        const std::string &value = data.json_extensions[static_cast<size_t>(section)];
         return value.empty() ? nullptr : &value;
     };
     const std::string *scheduler_extension = extension(ChipSwimlaneExtensionSection::SchedulerRecords);
@@ -1549,19 +1642,19 @@ int ChipSwimlaneCollector::export_swimlane_json() {
     // Every stream is independently useful for DFX. In particular, a legal
     // HBG can contain only host-side dummy/hidden-allocation records and no
     // AICore dispatch at all.
-    bool has_any_records = !host_submit_records_.empty() || !host_upload_records_.empty() ||
-                           clock_correlation_session_.started() ||
-                           std::any_of(json_extensions_.begin(), json_extensions_.end(), [](const auto &value) {
+    bool has_any_records = !data.host_submit_records.empty() || !data.host_upload_records.empty() ||
+                           data.clock_started ||
+                           std::any_of(data.json_extensions.begin(), data.json_extensions.end(), [](const auto &value) {
                                return !value.empty();
                            });
-    for (const auto &core_records : collected_perf_records_) {
+    for (const auto &core_records : data.perf_records) {
         if (!core_records.empty()) {
             has_any_records = true;
             break;
         }
     }
     if (!has_any_records) {
-        for (const auto &ac_records : collected_aicore_records_) {
+        for (const auto &ac_records : data.aicore_records) {
             if (!ac_records.empty()) {
                 has_any_records = true;
                 break;
@@ -1574,44 +1667,44 @@ int ChipSwimlaneCollector::export_swimlane_json() {
         }
         return false;
     };
-    const bool has_aicpu_orch_phases = any_phase_records(collected_orch_phase_records_);
-    const bool has_aicpu_scheduler_records = any_phase_records(collected_sched_phase_records_);
+    const bool has_aicpu_orch_phases = any_phase_records(data.orch_phase_records);
+    const bool has_aicpu_scheduler_records = any_phase_records(data.sched_phase_records);
     if (scheduler_extension != nullptr && has_aicpu_scheduler_records) {
         LOG_ERROR("Both runtime and AICPU scheduler records are present; refusing ambiguous export");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    const bool has_aicore_tasks = any_phase_records(collected_aicore_records_);
-    const bool has_platform_scheduler_tasks = any_phase_records(collected_perf_records_);
+    const bool has_aicore_tasks = any_phase_records(data.aicore_records);
+    const bool has_platform_scheduler_tasks = any_phase_records(data.perf_records);
     if ((aicore_tasks_extension != nullptr && has_aicore_tasks) ||
         (scheduler_tasks_extension != nullptr && has_platform_scheduler_tasks)) {
         LOG_ERROR("Both runtime and platform task records are present; refusing ambiguous export");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    has_any_records = has_any_records || any_phase_records(collected_sched_phase_records_) || has_aicpu_orch_phases;
+    has_any_records = has_any_records || any_phase_records(data.sched_phase_records) || has_aicpu_orch_phases;
     if (!has_any_records) {
         LOG_WARN("Warning: No performance data to export.");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    if (has_aicpu_orch_phases && host_orchestrated_) {
+    if (has_aicpu_orch_phases && data.host_orchestrated) {
         LOG_ERROR("Both host and AICPU orchestrator records are present; refusing mixed clock-domain export");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     std::error_code ec;
-    std::filesystem::create_directories(output_prefix_, ec);
+    std::filesystem::create_directories(data.output_prefix, ec);
     if (ec) {
-        LOG_ERROR("Error: Failed to create output directory %s: %s", output_prefix_.c_str(), ec.message().c_str());
+        LOG_ERROR("Error: Failed to create output directory %s: %s", data.output_prefix.c_str(), ec.message().c_str());
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
-    std::string filepath = output_prefix_ + "/chip_swimlane_records.json";
+    std::string filepath = data.output_prefix + "/chip_swimlane_records.json";
     std::ofstream outfile(filepath);
     if (!outfile.is_open()) {
         LOG_ERROR("Error: Failed to open file: %s", filepath.c_str());
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
-    int chip_swimlane_level = static_cast<int>(chip_swimlane_level_);
+    int chip_swimlane_level = static_cast<int>(data.level);
 
     outfile << "{\n";
     outfile << "  \"chip_swimlane_level\": " << chip_swimlane_level << ",\n";
@@ -1625,19 +1718,19 @@ int ChipSwimlaneCollector::export_swimlane_json() {
     // has to be told; the name is a compile-time property of this host_runtime.so.
     outfile << "    \"runtime\": \"" << SIMPLER_RUNTIME_NAME << "\",\n";
     outfile << "    \"clock_freq_hz\": " << PLATFORM_PROF_SYS_CNT_FREQ << ",\n";
-    outfile << "    \"num_cores\": " << num_aicore_ << ",\n";
+    outfile << "    \"num_cores\": " << data.num_aicore << ",\n";
     outfile << "    \"core_types\": [";
-    for (int i = 0; i < num_aicore_; i++) {
-        CoreType ct = (i < static_cast<int>(core_types_.size())) ? core_types_[i] : CoreType::AIV;
+    for (int i = 0; i < data.num_aicore; i++) {
+        CoreType ct = (i < static_cast<int>(data.core_types.size())) ? data.core_types[i] : CoreType::AIV;
         if (i > 0) outfile << ", ";
         outfile << "\"" << ((ct == CoreType::AIC) ? "aic" : "aiv") << "\"";
     }
     outfile << "]";
-    if (host_phase_records_present_) {
+    if (data.host_phase_records_present) {
         // Earliest of both projections: an upload segment can start before the
         // first submit, and a negative offset from the origin is not renderable.
         uint64_t host_origin_ns = 0;
-        for (const auto *population : {&host_submit_records_, &host_upload_records_}) {
+        for (const auto *population : {&data.host_submit_records, &data.host_upload_records}) {
             for (const auto &record : *population) {
                 if (host_origin_ns == 0 || record.start_ns < host_origin_ns) host_origin_ns = record.start_ns;
             }
@@ -1656,33 +1749,33 @@ int ChipSwimlaneCollector::export_swimlane_json() {
         // host operation, of which the task-submitting kinds are the projection
         // this file carries. Comparing the pool's total against total_tasks would
         // count the sub-operations of a submit as if each were a submit.
-        const bool host_record_count_matches = host_submit_records_.size() == host_phase_submitted_tasks_;
-        const bool host_capture_complete = host_phase_dropped_records_ == 0 && host_record_count_matches;
-        const char *host_capture_status = host_capture_complete           ? "complete" :
-                                          host_phase_dropped_records_ > 0 ? "dropped" :
-                                                                            "incomplete";
+        const bool host_record_count_matches = data.host_submit_records.size() == data.host_phase_submitted_tasks;
+        const bool host_capture_complete = data.host_phase_dropped_records == 0 && host_record_count_matches;
+        const char *host_capture_status = host_capture_complete               ? "complete" :
+                                          data.host_phase_dropped_records > 0 ? "dropped" :
+                                                                                "incomplete";
         outfile << ",\n    \"host_capture\": {\"status\": \"" << host_capture_status
-                << "\", \"expected_records\": " << host_phase_submitted_tasks_
-                << ", \"recorded_records\": " << host_submit_records_.size()
-                << ", \"pool_records\": " << host_phase_total_records_
-                << ", \"dropped_records\": " << host_phase_dropped_records_ << ", \"error\": ";
+                << "\", \"expected_records\": " << data.host_phase_submitted_tasks
+                << ", \"recorded_records\": " << data.host_submit_records.size()
+                << ", \"pool_records\": " << data.host_phase_total_records
+                << ", \"dropped_records\": " << data.host_phase_dropped_records << ", \"error\": ";
         if (host_capture_complete) {
             outfile << "null}";
-        } else if (host_phase_dropped_records_ > 0) {
+        } else if (data.host_phase_dropped_records > 0) {
             outfile << "\"pool_overflow\"}";
         } else {
             outfile << "\"record_count_mismatch\"}";
         }
     }
-    if (host_phase_records_present_ || clock_correlation_session_.started()) {
+    if (data.host_phase_records_present || data.clock_started) {
         const std::string host_clock_domain_id = linux_boot_clock_domain_id();
         if (!host_clock_domain_id.empty()) {
             outfile << ",\n    \"host_clock_domain_id\": \"" << host_clock_domain_id << "\"";
         }
     }
-    if (clock_correlation_session_.started()) {
+    if (data.clock_started) {
         uint64_t host_timeline_origin_ns = 0;
-        for (const auto &sample : clock_correlation_session_.samples()) {
+        for (const auto &sample : data.clock_samples) {
             if (sample.position != simpler::dfx::ClockAnchorPosition::HostOrchestrationBegin || !sample.valid()) {
                 continue;
             }
@@ -1695,14 +1788,13 @@ int ChipSwimlaneCollector::export_swimlane_json() {
             outfile << ",\n    \"host_timeline_origin_ns\": " << host_timeline_origin_ns;
         }
         outfile << ",\n    \"clock_anchors\": {";
-        outfile << "\n      \"provider\": \"" << clock_correlation_session_.provider_name() << "\",";
+        outfile << "\n      \"provider\": \"" << data.clock_provider_name << "\",";
         outfile << "\n      \"device_timestamp_unit\": \"syscnt_cycles\",";
-        outfile << "\n      \"raw_device_timestamp_unit\": \"" << clock_correlation_session_.raw_device_timestamp_unit()
-                << "\",";
+        outfile << "\n      \"raw_device_timestamp_unit\": \"" << data.clock_raw_device_timestamp_unit << "\",";
         outfile << "\n      \"samples_per_position\": " << simpler::dfx::kClockAnchorSamplesPerPosition << ",";
         outfile << "\n      \"samples\": [";
         bool first_anchor = true;
-        for (const auto &sample : clock_correlation_session_.samples()) {
+        for (const auto &sample : data.clock_samples) {
             if (!first_anchor) outfile << ",";
             const uint64_t rtt_ns =
                 sample.host_after_ns >= sample.host_before_ns ? sample.host_after_ns - sample.host_before_ns : 0;
@@ -1734,11 +1826,11 @@ int ChipSwimlaneCollector::export_swimlane_json() {
         if (!first_anchor) outfile << "\n      ";
         outfile << "]\n    }";
     }
-    if (!core_to_thread_.empty()) {
+    if (!data.core_to_thread.empty()) {
         outfile << ",\n    \"core_to_thread\": [";
-        for (size_t i = 0; i < core_to_thread_.size(); i++) {
+        for (size_t i = 0; i < data.core_to_thread.size(); i++) {
             if (i > 0) outfile << ", ";
-            outfile << static_cast<int>(core_to_thread_[i]);
+            outfile << static_cast<int>(data.core_to_thread[i]);
         }
         outfile << "]";
     }
@@ -1768,8 +1860,8 @@ int ChipSwimlaneCollector::export_swimlane_json() {
             outfile << "[";
             bool first = true;
             size_t total = 0;
-            for (size_t core_idx = 0; core_idx < collected_aicore_records_.size(); core_idx++) {
-                for (const auto &collected : collected_aicore_records_[core_idx]) {
+            for (size_t core_idx = 0; core_idx < data.aicore_records.size(); core_idx++) {
+                for (const auto &collected : data.aicore_records[core_idx]) {
                     const ChipSwimlaneAicoreTaskRecord &r = collected.record;
                     if (!first) outfile << ",";
                     outfile << "\n    [" << core_idx << ", " << r.task_token_raw << ", " << r.reg_task_id << ", "
@@ -1784,7 +1876,7 @@ int ChipSwimlaneCollector::export_swimlane_json() {
             LOG_INFO("  aicore_tasks: %zu records", total);
         }
     }
-    if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
+    if (data.level >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
         outfile << ",\n  \"" << chip_swimlane_extension_section_name(ChipSwimlaneExtensionSection::SchedulerTasks)
                 << "\": ";
         if (scheduler_tasks_extension != nullptr) {
@@ -1793,8 +1885,8 @@ int ChipSwimlaneCollector::export_swimlane_json() {
             outfile << "{\n    \"producer\": \"aicpu\",\n    \"records\": [";
             bool first = true;
             size_t total = 0;
-            for (size_t core_idx = 0; core_idx < collected_perf_records_.size(); core_idx++) {
-                for (const auto &collected : collected_perf_records_[core_idx]) {
+            for (size_t core_idx = 0; core_idx < data.perf_records.size(); core_idx++) {
+                for (const auto &collected : data.perf_records[core_idx]) {
                     const ChipSwimlaneAicpuTaskRecord &r = collected.record;
                     if (!first) outfile << ",";
                     outfile << "\n    [" << core_idx << ", " << r.reg_task_id << ", " << r.dispatch_time << ", "
@@ -1809,30 +1901,25 @@ int ChipSwimlaneCollector::export_swimlane_json() {
         }
     }
 
-    if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
+    if (data.level >= ChipSwimlaneLevel::SCHED_PHASES) {
         outfile << ",\n  \"" << chip_swimlane_extension_section_name(ChipSwimlaneExtensionSection::SchedulerRecords)
                 << "\": ";
         if (scheduler_extension != nullptr) {
             outfile << *scheduler_extension;
         } else {
-            std::vector<uint32_t> dropped_records(collected_sched_phase_records_.size());
-            for (size_t t = 0; t < collected_sched_phase_records_.size(); ++t) {
-                const auto *pool = get_sched_phase_buffer_state(shm_host_, static_cast<int>(t));
-                dropped_records[t] = pool->head.dropped_record_count;
-            }
-            chip_swimlane_write_scheduler_records(outfile, collected_sched_phase_records_, dropped_records);
+            chip_swimlane_write_scheduler_records(outfile, data.sched_phase_records, data.sched_phase_dropped_records);
         }
 
         if (has_aicpu_orch_phases) {
-            size_t orch_lanes = static_cast<size_t>(get_chip_swimlane_header(shm_host_)->num_orch_phase_threads);
-            if (orch_lanes == 0 || orch_lanes > collected_orch_phase_records_.size()) {
-                orch_lanes = collected_orch_phase_records_.size();
+            size_t orch_lanes = static_cast<size_t>(data.num_orch_phase_threads);
+            if (orch_lanes == 0 || orch_lanes > data.orch_phase_records.size()) {
+                orch_lanes = data.orch_phase_records.size();
             }
             outfile << ",\n  \"aicpu_orchestrator_phases\": [\n";
             for (size_t t = 0; t < orch_lanes; t++) {
                 outfile << "    [";
                 bool first = true;
-                for (const auto &collected : collected_orch_phase_records_[t]) {
+                for (const auto &collected : data.orch_phase_records[t]) {
                     const ChipSwimlaneAicpuOrchPhaseRecord &pr = collected.record;
                     if (!first) outfile << ",";
                     outfile << "\n      {\"submit_idx\": " << pr.submit_idx << ", \"task_id\": " << pr.task_id
@@ -1847,10 +1934,10 @@ int ChipSwimlaneCollector::export_swimlane_json() {
             }
             outfile << "  ]";
         }
-        if (!host_submit_records_.empty()) {
+        if (!data.host_submit_records.empty()) {
             outfile << ",\n  \"host_orchestrator_phases\": [[";
             bool first = true;
-            for (const auto &record : host_submit_records_) {
+            for (const auto &record : data.host_submit_records) {
                 if (!first) outfile << ",";
                 outfile << "\n      {\"submit_idx\": " << record.index << ", \"task_id\": " << record.payload
                         << ", \"start_host_ns\": " << record.start_ns << ", \"end_host_ns\": " << record.end_ns << "}";
@@ -1859,10 +1946,10 @@ int ChipSwimlaneCollector::export_swimlane_json() {
             if (!first) outfile << "\n    ";
             outfile << "]]";
         }
-        if (!host_upload_records_.empty()) {
+        if (!data.host_upload_records.empty()) {
             outfile << ",\n  \"host_device_uploads\": [";
             bool first = true;
-            for (const auto &record : host_upload_records_) {
+            for (const auto &record : data.host_upload_records) {
                 if (!first) outfile << ",";
                 outfile << "\n      {\"phase\": \"" << host_phase_kind_name(static_cast<HostPhaseKind>(record.kind))
                         << "\", \"start_host_ns\": " << record.start_ns << ", \"end_host_ns\": " << record.end_ns
@@ -2027,6 +2114,10 @@ int ChipSwimlaneCollector::finalize(
     aicore_foreign_identity_ = 0;
     // The region this identity was armed against is gone.
     armed_run_epoch_ = 0;
+    // Read out of the same region, so it goes with it.
+    terminal_reported_ = false;
+    terminal_snapshot_ = RunTerminalSnapshot{};
+    terminal_consistency_ = RunTerminalConsistency{};
     collector_shards_merged_ = false;
     host_orchestrated_ = false;
     host_phase_records_present_ = false;
