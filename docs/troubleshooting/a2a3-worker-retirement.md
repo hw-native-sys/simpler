@@ -102,7 +102,8 @@ behind a latch. An AICore has no logging path, so the AICPU device log is the
 only place a blocked worker is named: grep for
 `AICore retirement: core N not released`. The host's `print_handshake_results`
 covers `workers[]` only and does not read `teardown_gates[]`, so there is no
-host-side view of the gate today.
+host-side view of the gate today; that dump also runs only when the host DEBUG
+threshold is enabled.
 
 The A2/A3 onboard worker uses `ld_dev` for an uncached/bypass read and
 `dsb(DSB_DDR)` before return. The simulation uses an atomic acquire load.

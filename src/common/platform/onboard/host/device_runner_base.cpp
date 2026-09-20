@@ -1006,6 +1006,11 @@ int DeviceRunnerBase::query_max_block_dim(rtStream_t stream, uint32_t *out_cube,
 }
 
 void DeviceRunnerBase::print_handshake_results(const KernelArgsHelper &kernel_args) {
+    // Every consumer of this copy is a DEBUG record below, so the threshold
+    // decides whether the D2H happens at all, not just whether it is printed.
+    if (!HostLogger::get_instance().is_enabled(simpler::log::LogLevel::DEBUG)) {
+        return;
+    }
     if (stream_aicpu_ == nullptr || worker_count_ == 0 || kernel_args.args.runtime_args == nullptr) {
         return;
     }
@@ -1013,15 +1018,21 @@ void DeviceRunnerBase::print_handshake_results(const KernelArgsHelper &kernel_ar
     // Allocate temporary buffer to read handshake data from device
     std::vector<Handshake> workers(worker_count_);
     size_t total_size = sizeof(Handshake) * worker_count_;
-    rtMemcpy(
+    int rc = rtMemcpy(
         workers.data(), total_size, kernel_args.args.runtime_args->get_workers(), total_size, RT_MEMCPY_DEVICE_TO_HOST
     );
+    if (rc != 0) {
+        // The buffer holds no device content on this path, so it is not
+        // printed. A diagnostic read carries no run verdict.
+        LOG_WARN("rtMemcpy(handshake results) D2H failed: %d", rc);
+        return;
+    }
 
     LOG_DEBUG("Handshake results for %d cores:", worker_count_);
     for (int i = 0; i < worker_count_; i++) {
         LOG_DEBUG(
-            "  Core %d: aicore_done=%d aicpu_ready=%d task=%d", i, workers[i].aicore_done, workers[i].aicpu_ready,
-            workers[i].task
+            "  Core %d: aicore_done=%d aicpu_ready=%d task=0x%lx", i, workers[i].aicore_done, workers[i].aicpu_ready,
+            static_cast<uint64_t>(workers[i].task)
         );
     }
 }

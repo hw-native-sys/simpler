@@ -577,7 +577,13 @@ Two, both host D2H reads of `workers[]`:
 - `print_handshake_results` (`device_runner_base.cpp:1008`), called from
   `drain_execution` after `reap_run` (a2a3 `device_runner.cpp:445`, a5 `:641`) — after
   both run boundaries, both stream synchronizes and the AICPU kernel. It reads
-  `aicore_done`, `aicpu_ready` and `task`; its only consumer is `LOG_DEBUG`.
+  `aicore_done`, `aicpu_ready` and `task`; its only consumer is `LOG_DEBUG`, and it now
+  performs no D2H at all unless the host DEBUG threshold is enabled
+  (`HostLogger::is_enabled`). **The obligations recorded here are unchanged for the
+  debug-enabled path**: when the copy does run it is the same read of the same bytes
+  after the same clean, so whether that read needs the clean on A3, and what the clean's
+  lifetime relationship to it is, stay exactly as open as before. Gating removes a copy;
+  it settles nothing about the copy that remains.
 - `run_retention_probe` (`run_retention_probe.cpp:60`), reachable only through
   `simpler_probe_run_retention` (`c_api_shared.cpp:1284`) — a fixture entry, not a
   production run path. It reads `aicore_done`, which the AICore already flushed.
