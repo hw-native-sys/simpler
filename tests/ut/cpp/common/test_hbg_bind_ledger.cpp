@@ -684,15 +684,26 @@ TEST_F(HbgBindLedgerTest, TheDeviceImageCarriesNoHostOnlyBytes) {
     ASSERT_EQ(bind(runtime, args, sig, 1), 0);
     ASSERT_FALSE(runtime.tensor_leases().empty()) << "the bind must have recorded the host-only ledger";
 
-    const size_t image_bytes = runtime_device_copy_size(runtime);
+    // Three boundaries, each with its own reason to exist. A steady-state run
+    // stops before the handshake region, whose words the device writes; the
+    // first publication onto an allocation adds that region and stops before
+    // the gate tail, whose host storage is never initialized; the allocation
+    // covers everything, because the device addresses the tail inside it.
+    const size_t steady_bytes = runtime_device_copy_size(runtime);
+    const size_t image_bytes = runtime_device_initialized_prefix_size(runtime);
     const size_t extent_bytes = runtime_device_extent_size(runtime);
     ASSERT_EQ(extent_bytes, sizeof(DeviceRuntimeLaunchDesc));
+    ASSERT_EQ(steady_bytes, offsetof(DeviceRuntimeLaunchDesc, workers))
+        << "a steady-state run must stop before the handshake region";
     ASSERT_EQ(image_bytes, offsetof(DeviceRuntimeLaunchDesc, teardown_gates))
-        << "the upload must stop before the device-initialized gate tail";
+        << "no publication may reach the device-initialized gate tail";
+    ASSERT_LT(steady_bytes, image_bytes) << "the handshake region is still in the steady upload";
     ASSERT_LT(image_bytes, extent_bytes) << "the gate tail is still crossing to the device";
     ASSERT_LT(image_bytes, sizeof(Runtime)) << "the whole object is still crossing to the device";
 
-    // The copy the platform performs: `image_bytes` from offset 0.
+    // Search the longest thing the host ever publishes — the initializing
+    // prefix — so the exclusions below cover every byte that can cross, not
+    // just the ones a steady-state run re-sends.
     std::vector<uint8_t> image(image_bytes);
     std::memcpy(image.data(), &runtime, image_bytes);
 
@@ -717,7 +728,7 @@ TEST_F(HbgBindLedgerTest, TheDeviceImageCarriesNoHostOnlyBytes) {
     EXPECT_EQ(uploaded.sm_image_bytes, runtime.dev.sm_image_bytes);
     EXPECT_EQ(uploaded.gm_sm_ptr_, runtime.get_gm_sm_ptr());
     EXPECT_EQ(uploaded.prebuilt_runtime_offset_, runtime.get_prebuilt_runtime_offset())
-        << "the last device-read field ahead of the gate tail must be inside the upload";
+        << "the last device-read field ahead of the handshake region must be inside the upload";
     EXPECT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
 }
 

@@ -105,11 +105,18 @@ void Runtime::clear_function_bin_addrs() {
     }
 }
 
-// host_build_graph uploads the device descriptor without its gate tail. No
-// host-supplied gate value is consumed on either arch: on a2a3 the AICPU zeroes
-// the active gates and executes wmb() before publishing hs_setup_done_, with no
-// register window open before that, and a5 neither reads nor initializes them.
-// The allocation still covers the tail.
+// A steady-state host_build_graph run uploads the device descriptor before the
+// handshake region: neither that region nor the gate tail carries a host value
+// the device consumes. On a2a3 the AICPU zeroes the active gates and executes
+// wmb() before publishing hs_setup_done_, with no register window open before
+// that, and a5 neither reads nor initializes them; the handshake words are
+// written by the AICore's report and the AICPU's reply.
 size_t runtime_device_copy_size(const Runtime &) { return Runtime::device_image_bytes(); }
+
+// The first publication onto an allocation adds the handshake region, so it
+// starts from the ctor-zeroed host copy rather than from whatever rtMalloc
+// left. It stops before the gates, whose host storage `Runtime()` never
+// initializes.
+size_t runtime_device_initialized_prefix_size(const Runtime &) { return Runtime::device_initialized_prefix_bytes(); }
 
 size_t runtime_device_extent_size(const Runtime &) { return Runtime::device_extent_bytes(); }

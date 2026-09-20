@@ -29,18 +29,23 @@ struct RtsState {
     int copies = 0;
     int allocations = 0;
     int frees = 0;
-    // What a publication is expected to carry. The fixture sets it from the
-    // runtime under test, because the uploaded prefix is shorter than the block
-    // the slot allocates wherever the descriptor ends in device-initialized
-    // storage.
-    uint64_t expected_copy_bytes = 0;
+    // What a publication is expected to carry. Which of the two prefixes that
+    // is depends on the destination block, not on the case: the first
+    // publication onto a block adds the handshake region, every later one stops
+    // before it. The stub reads the slot rather than a fixed number so each
+    // copy is checked against the state it was actually issued in.
+    uint64_t initializing_copy_bytes = 0;
+    uint64_t steady_copy_bytes = 0;
+    const SlotPersistentArgs *destination = nullptr;
 } rts;
 
 class KernelArgsPublication : public ::testing::Test {
 protected:
     void SetUp() override {
         rts = {};
-        rts.expected_copy_bytes = runtime_device_copy_size(runtime);
+        rts.initializing_copy_bytes = runtime_device_initialized_prefix_size(runtime);
+        rts.steady_copy_bytes = runtime_device_copy_size(runtime);
+        rts.destination = &slot;
     }
     void TearDown() override {
         EXPECT_EQ(release_slot_persistent_args(slot, allocator), 0);
@@ -76,9 +81,12 @@ extern "C" rtError_t rtFree(void *ptr) {
 extern "C" rtError_t rtMemcpy(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind) {
     ++rts.copies;
     EXPECT_EQ(kind, RT_MEMCPY_HOST_TO_DEVICE);
-    // The uploaded prefix, not the allocated extent: a publication that carried
-    // the whole descriptor would reach storage the device initializes itself.
-    EXPECT_EQ(bytes, rts.expected_copy_bytes);
+    // A published prefix, not the allocated extent: a publication that carried
+    // the whole descriptor would reach storage no host value belongs in. The
+    // commit happens after this call returns, so the slot still shows the state
+    // this copy was issued in.
+    const bool initializing = rts.destination != nullptr && !rts.destination->workers_initialized;
+    EXPECT_EQ(bytes, initializing ? rts.initializing_copy_bytes : rts.steady_copy_bytes);
     EXPECT_EQ(capacity, bytes);
     if (rts.copy_rc != 0) return rts.copy_rc;
     std::memcpy(dst, src, bytes);
@@ -273,14 +281,16 @@ TEST_F(KernelArgsPublication, ReleaseAllowsFreshPrepareWithoutRetainingPublicati
 // laid down stands in for the device's own write, so it is already in place when
 // the real publication runs.
 TEST_F(KernelArgsPublication, PublicationLeavesTheDeviceInitializedTailUntouched) {
-    const size_t image_bytes = runtime_device_copy_size(runtime);
+    // The longest publication there is: the first one onto a block, which adds
+    // the handshake region. Anything past it is the tail no host copy reaches.
+    const size_t image_bytes = runtime_device_initialized_prefix_size(runtime);
     const size_t extent_bytes = runtime_device_extent_size(runtime);
     // The descriptor this fixture is built against declares the gate array, so the
     // shortfall is a property of the type, asserted rather than skipped: a change
     // that widened the copy back to the extent must fail here, not opt out.
     ASSERT_EQ(extent_bytes, sizeof(DeviceRuntimeLaunchDesc));
     ASSERT_EQ(image_bytes, offsetof(DeviceRuntimeLaunchDesc, teardown_gates))
-        << "the upload must stop before the device-initialized gate tail";
+        << "no publication may reach the device-initialized gate tail";
     ASSERT_LT(image_bytes, extent_bytes);
 
     runtime.dev.worker_count = 5;
@@ -303,7 +313,7 @@ TEST_F(KernelArgsPublication, PublicationLeavesTheDeviceInitializedTailUntouched
 // than reallocating, and the device's contents there are not the host's to
 // rewrite.
 TEST_F(KernelArgsPublication, RepeatedPublicationPreservesTheDeviceInitializedTail) {
-    const size_t image_bytes = runtime_device_copy_size(runtime);
+    const size_t image_bytes = runtime_device_initialized_prefix_size(runtime);
     const size_t extent_bytes = runtime_device_extent_size(runtime);
     ASSERT_EQ(image_bytes, offsetof(DeviceRuntimeLaunchDesc, teardown_gates));
     ASSERT_LT(image_bytes, extent_bytes);

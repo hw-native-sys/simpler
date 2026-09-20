@@ -97,10 +97,20 @@ void Runtime::clear_function_bin_addrs() {
     }
 }
 
-// trb uploads the `dev` descriptor without its gate tail (the rest of Runtime is
-// host-only). The AICPU zeroes the active gates and executes wmb() before
-// publishing hs_setup_done_, and no register window opens before that, so no
-// host-supplied gate value is ever consumed. The allocation still covers the tail.
-size_t runtime_device_copy_size(const Runtime &) { return offsetof(DeviceRuntimeLaunchDesc, teardown_gates); }
+// A steady-state trb run uploads the `dev` descriptor before the handshake
+// region (the rest of Runtime is host-only). Neither that region nor the gate
+// tail carries a host value the device consumes: the AICore publishes its
+// report, the AICPU writes the task pointer it answers with, and the AICPU
+// zeroes the active gates and executes wmb() before publishing hs_setup_done_,
+// with no register window open before that.
+size_t runtime_device_copy_size(const Runtime &) { return offsetof(DeviceRuntimeLaunchDesc, workers); }
+
+// The first publication onto an allocation adds the handshake region, so it
+// starts from the ctor-zeroed host copy rather than from whatever rtMalloc
+// left. It stops before the gates, whose host storage `Runtime()` never
+// initializes.
+size_t runtime_device_initialized_prefix_size(const Runtime &) {
+    return offsetof(DeviceRuntimeLaunchDesc, teardown_gates);
+}
 
 size_t runtime_device_extent_size(const Runtime &) { return sizeof(DeviceRuntimeLaunchDesc); }

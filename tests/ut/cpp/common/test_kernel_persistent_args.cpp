@@ -520,7 +520,7 @@ TEST(PersistentKernelArgs, CopiesExactlyTheRuntimeDeviceImage) {
     ASSERT_EQ(args.prepare_once(runtime, ops.table(), kDeviceId), 0);
     ASSERT_EQ(ops.copies.size(), 2u);
 
-    const size_t image_bytes = runtime_device_copy_size(runtime);
+    const size_t image_bytes = runtime_device_initialized_prefix_size(runtime);
     const size_t extent_bytes = runtime_device_extent_size(runtime);
     EXPECT_EQ(extent_bytes, sizeof(DeviceRuntimeLaunchDesc));
     // The upload is a prefix of the extent. It is shorter on a variant with a
@@ -607,14 +607,14 @@ TEST(PersistentKernelArgs, LeavesTheDeviceInitializedTailUntouched) {
     Runtime runtime;
     PersistentKernelArgs args;
 
-    const size_t image_bytes = runtime_device_copy_size(runtime);
+    const size_t image_bytes = runtime_device_initialized_prefix_size(runtime);
     const size_t extent_bytes = runtime_device_extent_size(runtime);
     // Both descriptors this file is built against declare the gate array, so the
     // shortfall is a property of the type, asserted rather than skipped: a change
     // that widened the copy back to the extent must fail here, not opt out.
     ASSERT_EQ(extent_bytes, sizeof(DeviceRuntimeLaunchDesc));
     ASSERT_EQ(image_bytes, offsetof(DeviceRuntimeLaunchDesc, teardown_gates))
-        << "the upload must stop before the device-initialized gate tail";
+        << "the upload must stop where host-initialized storage ends, before the gate tail";
     ASSERT_LT(image_bytes, extent_bytes);
 
     ASSERT_EQ(args.prepare_once(runtime, ops.table(), kDeviceId), 0);
@@ -625,13 +625,15 @@ TEST(PersistentKernelArgs, LeavesTheDeviceInitializedTailUntouched) {
     // rather than reading past the block below.
     ASSERT_EQ(ops.block_size(block), extent_bytes) << "the allocation does not cover the device-read tail";
     ASSERT_EQ(ops.copies[0].dst, block);
-    ASSERT_EQ(ops.copies[0].dst_bytes, image_bytes) << "the copy was offered more than the uploaded prefix";
+    ASSERT_EQ(ops.copies[0].dst_bytes, image_bytes) << "the copy was offered more than the host-initialized prefix";
 
     // The mark the allocator seeded survives across the tail: the copy stopped
-    // at the prefix. The prefix itself is checked against the source elsewhere.
+    // where host-initialized storage ends. `Runtime()` never writes that tail,
+    // so a copy reaching it would push indeterminate host bytes to the device.
+    // The prefix itself is checked against the source elsewhere.
     const auto *const bytes = reinterpret_cast<const unsigned char *>(block);
     for (size_t i = image_bytes; i < extent_bytes; ++i) {
-        ASSERT_EQ(bytes[i], kDeviceMark) << "the upload reached the device-initialized tail at byte " << i;
+        ASSERT_EQ(bytes[i], kDeviceMark) << "the upload reached the host-uninitialized tail at byte " << i;
     }
 
     EXPECT_EQ(args.finalize_once(), 0);
@@ -646,7 +648,7 @@ TEST(PersistentKernelArgs, RepeatedPrepareNeitherReallocatesNorRecopies) {
     Runtime runtime;
     PersistentKernelArgs args;
 
-    const size_t image_bytes = runtime_device_copy_size(runtime);
+    const size_t image_bytes = runtime_device_initialized_prefix_size(runtime);
     const size_t extent_bytes = runtime_device_extent_size(runtime);
     ASSERT_EQ(image_bytes, offsetof(DeviceRuntimeLaunchDesc, teardown_gates));
     ASSERT_LT(image_bytes, extent_bytes);
@@ -677,7 +679,7 @@ TEST(RuntimeLaunchImage, SnapshotIsIndependentOfLaterHostMutationAndConsumedOnce
     Runtime runtime;
     runtime.dev.worker_count = 7;
     RuntimeLaunchImage image;
-    image.prepare(runtime);
+    image.prepare(runtime, runtime_device_copy_size(runtime));
     runtime.dev.worker_count = 19;
     int copies = 0;
     EXPECT_EQ(
@@ -708,7 +710,7 @@ TEST(RuntimeLaunchImage, SnapshotIsIndependentOfLaterHostMutationAndConsumedOnce
 TEST(RuntimeLaunchImage, FailedPublicationConsumesSourceAndFreshPrepareReplacesIt) {
     Runtime runtime;
     RuntimeLaunchImage image;
-    image.prepare(runtime);
+    image.prepare(runtime, runtime_device_copy_size(runtime));
     EXPECT_EQ(
         image.publish([](const void *, size_t) {
             return -91;
@@ -722,7 +724,7 @@ TEST(RuntimeLaunchImage, FailedPublicationConsumesSourceAndFreshPrepareReplacesI
         0
     );
     runtime.dev.worker_count = 3;
-    image.prepare(runtime);
+    image.prepare(runtime, runtime_device_copy_size(runtime));
     EXPECT_EQ(
         image.publish([](const void *source, size_t bytes) {
             DeviceRuntimeLaunchDesc descriptor;

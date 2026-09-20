@@ -489,9 +489,10 @@ public:
      * Publish per-core core_type (AIC/AIV/...) so the host emit path can
      * resolve the lane label without consulting an AICPU task record. Required
      * for TASK_TIMING (level=1) where complete_task is bypassed and the
-     * AICore record alone is on disk. Caller is the device_runner — sim sets
-     * it from `runtime.workers[i].core_type` (rule-based), onboard sets it
-     * from the handshake-discovered table.
+     * AICore record alone is on disk. Caller is the device_runner, on both
+     * onboard and sim, and both read the same host-side launch-shape rule
+     * (`Runtime::core_type_rule`) — not the handshake region, whose core_type
+     * word carries each AICore's own report.
      *
      * Safe to call multiple times; the last call wins.
      *

@@ -33,13 +33,16 @@ int PersistentKernelArgs::prepare_once(const Runtime &host_runtime, const Persis
     }
     ops_ = ops;
 
-    // Both runtimes copy only the device-read descriptor at offset zero;
-    // host-only state stays outside this allocation. The allocation covers the
-    // whole descriptor and the copy carries its uploaded prefix: where a variant
-    // ends its descriptor in device-initialized storage the two differ, and the
-    // device addresses that range inside this block.
+    // Both runtimes place the device-read descriptor at offset zero; host-only
+    // state stays outside this allocation. This owner allocates exactly once
+    // and relaunches against the same block, so its single copy is that block's
+    // first publication: it carries the initialized prefix — through the
+    // handshake region, which `Runtime()` zeroes — and not the whole extent,
+    // whose tail on some variants is host storage no constructor ever writes.
+    // The allocation still covers the extent, because the device addresses that
+    // range inside this block.
     const size_t runtime_extent = runtime_device_extent_size(host_runtime);
-    const size_t runtime_bytes = runtime_device_copy_size(host_runtime);
+    const size_t runtime_bytes = runtime_device_initialized_prefix_size(host_runtime);
     void *runtime_dev = ops_.alloc(ops_.context, runtime_extent);
     if (runtime_dev == nullptr) {
         LOG_ERROR("PersistentKernelArgs::prepare_once: alloc for runtime_args failed");
@@ -66,6 +69,11 @@ int PersistentKernelArgs::prepare_once(const Runtime &host_runtime, const Persis
     // value-initialization so the choice is this path's own, and so a future
     // field added to the block cannot make it drift by accident. A run identity
     // would be wrong here anyway — this block is filled once and relaunched.
+    //
+    // That single fill is also this block's only handshake initialization. A
+    // kernel-mode AICore launch that ever relaunches against this same region
+    // owes itself a per-run reset or an epoch of its own, because the zeroed
+    // report it starts from is published once and never again.
     args_.run_result_epoch = 0;
 
     // Taken last: this is a whole-struct copy of `args_`, so every field the

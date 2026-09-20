@@ -150,23 +150,25 @@ inline bool aicore_report_accepted(const volatile Handshake *handshake, uint64_t
  * DeviceRuntimeLaunchDesc - the device-copied half of Runtime.
  *
  * This is the ONLY part of Runtime that crosses the host->device boundary: the
- * host fills it, `device_runner_helpers.cpp` rtMemcpy's exactly
- * `sizeof(DeviceRuntimeLaunchDesc)` bytes from offset 0 of the Runtime image,
- * and the AICPU/AICore read these fields back. It is the first member of
- * Runtime (offsetof == 0), so the narrowed copy needs no offset arithmetic.
+ * host fills it, `device_runner_helpers.cpp` rtMemcpy's a prefix from offset 0
+ * of the Runtime image, and the AICPU/AICore read these fields back. It is the
+ * first member of Runtime (offsetof == 0), so the narrowed copy needs no offset
+ * arithmetic.
+ *
+ * Three lengths, in order. `runtime_device_copy_size` is what a steady-state run
+ * re-publishes and stops before `workers`; `runtime_device_initialized_prefix_size`
+ * adds `workers`, and is what the first publication onto an allocation sends so
+ * the handshake region starts defined. This runtime has no gate tail, so that
+ * second length equals `runtime_device_extent_size`.
  *
  * Adding a field here grows the device image; adding a field to Runtime's
  * host-only tail does not. Keep it standard-layout (static_assert below) so the
  * rtMemcpy is well-defined. alignas(64) keeps sizeof a multiple of the cache
  * line so the device-copied image starts and ends on cache-line boundaries and
- * never shares a line with Runtime's host-only tail (the leading Handshake is
- * already 64-aligned, but the explicit alignas keeps the property if fields are
- * ever reordered).
+ * never shares a line with Runtime's host-only tail.
  */
 struct alignas(64) DeviceRuntimeLaunchDesc {
-    // Handshake buffers for AICPU-AICore communication
-    Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
-    int worker_count;                       // Number of active workers
+    int worker_count;  // Number of active workers
 
     // Execution parameters for AICPU scheduling.
     //
@@ -213,6 +215,18 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // Per-callable_id dispatch. AICPU dispatches via
     // `orch_so_table_[active_callable_id_]`.
     int32_t active_callable_id_;
+
+    // Handshake buffers for AICPU-AICore communication, one 64-byte line per
+    // worker.
+    //
+    // Last, and outside the per-run uploaded prefix: every field the device
+    // reads here is written on the device — the AICore publishes its report and
+    // the AICPU the task pointer it answers with — and no host value is
+    // consumed. A steady-state run re-uploads none of it; the first publication
+    // onto a given allocation carries it once, which is what gives a fresh
+    // block a defined starting value. This runtime has no gate tail, so the
+    // initialized prefix ends with this array, at the end of the descriptor.
+    Handshake workers[RUNTIME_MAX_WORKER];
 };
 
 // =============================================================================
@@ -323,6 +337,36 @@ public:
     // copy_in_run_inputs_impl and copy_back_run_outputs_impl, and released by
     // release_run_bindings_impl. Host-only (after `dev`): never uploaded.
     std::vector<TensorLease> tensor_leases_;
+
+    // The launch shape's AIC/AIV rule, one entry per active worker. Host state
+    // with host readers only: the DFX swimlane collector and the sim's per-core
+    // thread start need the rule before any core has reported, and
+    // `dev.workers[i].core_type` cannot serve them — it is outside the per-run
+    // uploaded prefix and the device overwrites it with each core's own report.
+    std::vector<CoreType> core_type_rule_;
+
+    /**
+     * Record this launch shape's AIC/AIV rule: the first `aic_count` of
+     * `worker_count` workers are AIC and the rest AIV.
+     *
+     * Set wherever `worker_count` is, and read by every host consumer of the
+     * rule. Callers must not read `dev.workers[i].core_type` for it — that word
+     * belongs to the core's own report.
+     */
+    void set_core_type_rule(int worker_count, int aic_count) {
+        core_type_rule_.assign(static_cast<size_t>(worker_count < 0 ? 0 : worker_count), CoreType::AIV);
+        for (size_t i = 0; i < core_type_rule_.size() && i < static_cast<size_t>(aic_count < 0 ? 0 : aic_count); ++i) {
+            core_type_rule_[i] = CoreType::AIC;
+        }
+    }
+
+    /** This launch shape's rule for worker `i`; AIV for an index it never covered. */
+    CoreType core_type_rule(int i) const {
+        if (i < 0 || static_cast<size_t>(i) >= core_type_rule_.size()) return CoreType::AIV;
+        return core_type_rule_[static_cast<size_t>(i)];
+    }
+
+    size_t core_type_rule_count() const { return core_type_rule_.size(); }
 };
 
 // `dev` must be the first member so the narrowed H2D copy starts at offset 0.
@@ -350,16 +394,30 @@ static_assert(
     "DeviceRuntimeLaunchDesc size must be a multiple of 64 so the device-copied image "
     "stays cache-line aligned"
 );
+static_assert(
+    offsetof(DeviceRuntimeLaunchDesc, workers) % 64 == 0,
+    "workers must start on a cache line: each Handshake is one line the AICore writes back whole"
+);
+static_assert(
+    offsetof(DeviceRuntimeLaunchDesc, workers) + sizeof(DeviceRuntimeLaunchDesc::workers) ==
+        sizeof(DeviceRuntimeLaunchDesc),
+    "workers must end the descriptor on this runtime: it has no gate tail, so the initialized prefix is "
+    "the whole extent and a field appended behind it would never be published"
+);
 
-// Bytes of the Runtime image the host uploads. Defined per-runtime so the shared
-// device_runner_helpers.cpp / kernel_persistent_args.cpp paths stay
-// runtime-agnostic. A5 trb has no post-close gate array, so this equals the
-// device extent below.
+// Bytes a steady-state run uploads: the descriptor before the handshake region.
+// Defined per-runtime so the shared device_runner_helpers.cpp /
+// kernel_persistent_args.cpp paths stay runtime-agnostic.
 size_t runtime_device_copy_size(const Runtime &rt);
+
+// Bytes the first publication onto a device allocation uploads: through the end
+// of the handshake region. A5 trb has no post-close gate array, so this equals
+// the device extent below.
+size_t runtime_device_initialized_prefix_size(const Runtime &rt);
 
 // Bytes of device memory a Runtime image occupies, and the size every allocation
 // backing a device `Runtime` must use. Never smaller than
-// `runtime_device_copy_size`; equal to it on this runtime.
+// `runtime_device_initialized_prefix_size`; equal to it on this runtime.
 size_t runtime_device_extent_size(const Runtime &rt);
 
 #endif  // SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_

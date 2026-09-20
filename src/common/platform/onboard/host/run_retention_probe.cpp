@@ -44,12 +44,16 @@ void set_reason(RunRetentionProbeReport &report, const char *reason) {
 /**
  * Whether any AICore of `prepared`'s run has reported itself started.
  *
- * The AICore publishes `aicore_done` on kernel entry, gated by nothing, and the
- * host clears every worker's copy before the launch. So a non-zero entry is a
- * device-written fact that the kernel is executing — which is what the probe
- * needs, because a launch call returning says only that the driver accepted a
- * submission. Read the same way the handshake dump reads it, by copying the
- * region back rather than dereferencing it in place.
+ * The AICore publishes its report on kernel entry, gated by nothing, so a
+ * report this run's epoch accepts is a device-written fact that the kernel is
+ * executing — which is what the probe needs, because a launch call returning
+ * says only that the driver accepted a submission.
+ *
+ * The epoch is what makes the answer this run's. The block is not reset per
+ * run: its handshake region is published once per allocation and carries the
+ * previous run's reports afterwards, so a bare `aicore_done != 0` would report
+ * a predecessor as this successor. Read the same way the handshake dump reads
+ * it, by copying the region back rather than dereferencing it in place.
  */
 bool successor_is_running(const DeviceRunnerBase::PreparedExecution &prepared) {
     const Runtime *device_runtime = prepared.kernel_args.args.runtime_args;
@@ -61,7 +65,7 @@ bool successor_is_running(const DeviceRunnerBase::PreparedExecution &prepared) {
         return false;
     }
     for (const Handshake &worker : workers) {
-        if (worker.aicore_done != 0) return true;
+        if (aicore_report_accepted(&worker, prepared.identity.run_epoch)) return true;
     }
     return false;
 }

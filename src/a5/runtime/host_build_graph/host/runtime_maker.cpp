@@ -1258,7 +1258,7 @@ bool create_scheduler_state(
     int32_t aiv_rank = 0;
     for (int32_t i = 0; i < runtime->get_worker_count(); ++i) {
         SchedulerWorkerContext &context = contexts[i];
-        context.core_type = static_cast<int32_t>(runtime->dev.workers[i].core_type);
+        context.core_type = static_cast<int32_t>(runtime->core_type_rule(i));
         context.physical_core_id = -1;
         context.type_rank = context.core_type == static_cast<int32_t>(CoreType::AIC) ? aic_rank++ : aiv_rank++;
         context.active = 0;

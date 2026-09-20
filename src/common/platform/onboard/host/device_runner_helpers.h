@@ -90,7 +90,18 @@ int query_stream_pair_error(rtStream_t aicpu_stream, rtStream_t aicore_stream);
  */
 struct SlotPersistentArgs {
     Runtime *runtime_args{nullptr};  // device block holding the Runtime descriptor
-    uint64_t runtime_bytes{0};       // committed length: the full device extent, not the uploaded prefix
+    uint64_t runtime_bytes{0};       // committed length: the full device extent, not a published prefix
+
+    // Whether THIS block's handshake region has been published once.
+    //
+    // It states a fact about the allocation named above, not about the slot:
+    // the field lives here so it is adopted, released and abandoned with the
+    // pointer it describes, and the two teardown paths reset the whole struct
+    // rather than named fields, so a later block cannot inherit a predecessor's
+    // verdict. Committed only after the copy carrying that region has
+    // succeeded; a failed publication leaves it false and the next prepare
+    // sends the longer prefix again.
+    bool workers_initialized{false};
 };
 
 /**
@@ -119,7 +130,8 @@ struct KernelArgsHelper {
         args(other.args),
         allocator_(std::exchange(other.allocator_, nullptr)),
         runtime_image_(std::move(other.runtime_image_)),
-        runtime_args_state_(std::exchange(other.runtime_args_state_, RuntimeArgsState::Empty)) {
+        runtime_args_state_(std::exchange(other.runtime_args_state_, RuntimeArgsState::Empty)),
+        initializing_slot_(std::exchange(other.initializing_slot_, nullptr)) {
         other.args = KernelArgs{};
     }
     KernelArgsHelper &operator=(KernelArgsHelper &&) = delete;
@@ -154,6 +166,7 @@ struct KernelArgsHelper {
         runtime_image_.clear();
         runtime_args_state_ = RuntimeArgsState::Empty;
         args.runtime_args = nullptr;
+        initializing_slot_ = nullptr;
     }
 
     /**
@@ -180,6 +193,13 @@ private:
 
     RuntimeLaunchImage runtime_image_;
     RuntimeArgsState runtime_args_state_{RuntimeArgsState::Empty};
+
+    // The slot whose pending snapshot carries the handshake region, or null
+    // when the snapshot is an ordinary shorter one. `publish_runtime_args`
+    // records the block as initialized through this, and only after its copy
+    // returns success — so the fact is committed by the same call that earns
+    // it, and no caller can commit it early by forgetting the order.
+    SlotPersistentArgs *initializing_slot_{nullptr};
 };
 
 /**

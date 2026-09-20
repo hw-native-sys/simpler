@@ -378,7 +378,13 @@ int SimDeviceRunnerBase::prepare_launch_shape(Runtime &runtime, const CallConfig
     worker_count_ = num_aicore;
     runtime.set_aicpu_thread_num(config.aicpu_thread_num);
 
-    // First `block_dim` cores are AIC; remaining ~2/3 are AIV.
+    // First `block_dim` cores are AIC; remaining ~2/3 are AIV. The rule is host
+    // state read by the sim's per-core thread start and by the DFX collector.
+    runtime.set_core_type_rule(num_aicore, block_dim);
+
+    // The sim has no upload: its threads read this host object in place, so
+    // `workers[]` here is the live handshake region and this loop is its
+    // per-run initialization, not a staged copy.
     Handshake *workers = runtime.get_workers();
     for (int i = 0; i < num_aicore; i++) {
         workers[i].aicpu_ready = 0;
@@ -386,9 +392,7 @@ int SimDeviceRunnerBase::prepare_launch_shape(Runtime &runtime, const CallConfig
         workers[i].task = 0;
         workers[i].core_type = (i < block_dim) ? CoreType::AIC : CoreType::AIV;
         // Cleared with the rest of the report so a run's own epoch is the only
-        // value that can ever satisfy its sweep. The sim's threads read this
-        // host object in place, so this store is itself the value the sweep
-        // sees; no copy carries it.
+        // value that can ever satisfy its sweep.
         workers[i].report_epoch = 0;
     }
     return 0;

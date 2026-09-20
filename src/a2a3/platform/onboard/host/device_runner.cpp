@@ -618,9 +618,11 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
     Runtime &runtime = *prepared.runtime;
     const int num_aicore = prepared.num_aicore;
     const int launch_aicpu_num = prepared.launch_aicpu_num;
-    // KernelLaunch is the pipeline boundary: this method clears the handshake
-    // consumed by the launch and submits exactly the AICore and AICPU kernels.
-    // It intentionally performs no stream synchronization or per-run cleanup.
+    // KernelLaunch is the pipeline boundary: this method submits exactly the
+    // AICore and AICPU kernels. It intentionally performs no stream
+    // synchronization, no per-run cleanup, and no handshake reset — the
+    // handshake region belongs to the device, and this run's reports are told
+    // apart from a predecessor's by the report epoch.
     //
     // The pair is readied here rather than at prepare because this is the first
     // point the caller holds the execution claim: a prepared successor overlaps
@@ -654,7 +656,7 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
                 if (prepared.dfx.chip_swimlane_enabled() && chip_swimlane_collector_.is_initialized()) {
                     std::vector<CoreType> core_types(num_aicore);
                     for (int i = 0; i < num_aicore; i++)
-                        core_types[i] = runtime.get_workers()[i].core_type;
+                        core_types[i] = runtime.core_type_rule(i);
                     chip_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
                 }
 
@@ -668,15 +670,10 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
                 // slow-launch / 207001 wedge was measured on a5; this mirror is UNVERIFIED on
                 // a2a3 silicon (the dev box is a5-only), relying on CI. See
                 // docs/investigations/2026-06-pa-unroll-207001-optimeout-window.md.
-                // The AICore publishes aicore_done on launch (gated by nothing), and the
-                // workers region persists across runs in the pooled arena. Clearing each
-                // worker's aicore_done before the AICore kernel launches keeps the AICPU's
-                // handshake sweep from reading a prior run's report — which would open a
-                // window on that run's physical_core_id. Only aicore_done needs clearing; the
-                // AICore overwrites physical_core_id/core_type in the same report.
-                Handshake *workers = runtime.get_workers();
-                for (int i = 0; i < num_aicore; i++)
-                    workers[i].aicore_done = 0;
+                // Nothing clears the handshake region here. It is the device's, and
+                // this run is told apart from its predecessors by identity rather than
+                // by a reset: the AICore stamps its report with this run's epoch and
+                // the AICPU sweep accepts only a report carrying it.
             } catch (...) {
                 LOG_ERROR("launch_run: arming failed before any stream submission");
                 return PTO_RUNTIME_ERR_INTERNAL;

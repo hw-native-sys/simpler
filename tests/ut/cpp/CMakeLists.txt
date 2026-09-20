@@ -978,10 +978,10 @@ add_common_utils_test(test_worker_chip_orch_comm common/test_worker_chip_orch_co
 add_common_utils_test(test_file_marker_handshake common/test_file_marker_handshake.cpp)
 
 # Context-lifetime AICore argument owner. Built once per runtime variant because
-# the two device lengths it uses are per-runtime decisions: it allocates
-# runtime_device_extent_size and copies runtime_device_copy_size, which differ by
-# the device-initialized gate tail. The injected alloc/free/copy vocabulary keeps
-# both builds free of CANN.
+# the device lengths it uses are per-runtime decisions: it allocates
+# runtime_device_extent_size and copies runtime_device_initialized_prefix_size,
+# which differ by the gate tail no host copy reaches. The injected
+# alloc/free/copy vocabulary keeps both builds free of CANN.
 set(KERNEL_PERSISTENT_ARGS_SRC
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/onboard/host/kernel_persistent_args.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/kernel_execution_state.cpp)
@@ -1533,6 +1533,34 @@ foreach(target test_kernel_args_helper test_hbg_kernel_args_helper)
         ${CMAKE_SOURCE_DIR}/../../../src/common/platform/onboard/host
         ${CMAKE_SOURCE_DIR}/../../../src/common/worker)
 endforeach()
+
+# Which prefix a publication carries, through the same real helper/allocator as
+# the pair above and against both a2a3 descriptor layouts.
+add_a2a3_runtime_test(test_runtime_workers_publication common/test_runtime_workers_publication.cpp
+    ${KERNEL_ARGS_HELPER_TEST_SOURCES}
+    ${A2A3_RUNTIME_DIR}/shared/runtime.cpp)
+add_a2a3_hbg_runtime_test(test_hbg_runtime_workers_publication common/test_runtime_workers_publication.cpp
+    ${KERNEL_ARGS_HELPER_TEST_SOURCES}
+    ${HBG_SHARED_DIR}/runtime.cpp)
+foreach(target test_runtime_workers_publication test_hbg_runtime_workers_publication)
+    target_include_directories(${target} BEFORE PRIVATE
+        ${CMAKE_SOURCE_DIR}/stubs/kernel_args
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/onboard/host
+        ${CMAKE_SOURCE_DIR}/../../../src/common/worker)
+endforeach()
+
+# The descriptor boundary itself, once per arch/runtime combination: the four
+# variants must answer the same shape, and only the compiled layout can say so.
+add_a2a3_runtime_test(test_runtime_workers_boundary common/test_runtime_workers_boundary.cpp
+    ${A2A3_RUNTIME_DIR}/shared/runtime.cpp)
+add_a2a3_hbg_runtime_test(test_hbg_runtime_workers_boundary common/test_runtime_workers_boundary.cpp
+    ${HBG_SHARED_DIR}/runtime.cpp)
+# The a5 helpers take a single source, so the variant's size functions are added
+# after the target exists.
+add_a5_runtime_test(test_a5_runtime_workers_boundary common/test_runtime_workers_boundary.cpp)
+target_sources(test_a5_runtime_workers_boundary PRIVATE ${A5_RUNTIME_DIR}/shared/runtime.cpp)
+add_a5_hbg_runtime_test(test_a5_hbg_runtime_workers_boundary common/test_runtime_workers_boundary.cpp)
+target_sources(test_a5_hbg_runtime_workers_boundary PRIVATE ${HBG_SHARED_DIR}/runtime.cpp)
 
 add_a2a3_hbg_runtime_test(test_hbg_core_tracker common/test_hbg_core_tracker.cpp)
 # The seed test calls the real ready_queue_init_data_from_layout, so it links the

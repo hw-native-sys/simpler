@@ -19,11 +19,13 @@
 #include "runtime.h"
 #include "runtime_c_api.h"
 
-// A host-owned snapshot of only the uploaded prefix of the device descriptor for
-// one invocation. The destination is owned separately by the run's persistent
-// slot and is allocated to the full device extent, which is never shorter and on
-// some variants is longer: a descriptor may end in device-read storage the device
-// itself initializes, and no host bytes for that range are snapshotted or copied.
+// A host-owned snapshot of the uploaded prefix of the device descriptor for one
+// invocation. The destination is owned separately by the run's persistent slot
+// and is allocated to the full device extent, which is never shorter: a
+// descriptor may end in storage no host copy reaches — device-initialized, or
+// never host-initialized at all — and no bytes for that range are snapshotted
+// or copied. The caller supplies the length, because which prefix a publication
+// carries depends on whether its destination block has been initialized yet.
 // Publication is synchronous; consuming a snapshot neither frees nor resets the
 // destination.
 class RuntimeLaunchImage {
@@ -34,8 +36,8 @@ public:
     RuntimeLaunchImage(RuntimeLaunchImage &&) noexcept = default;
     RuntimeLaunchImage &operator=(RuntimeLaunchImage &&) noexcept = default;
 
-    void prepare(const Runtime &runtime) {
-        bytes_.resize(runtime_device_copy_size(runtime));
+    void prepare(const Runtime &runtime, size_t bytes) {
+        bytes_.resize(bytes);
         std::memcpy(bytes_.data(), &runtime, bytes_.size());
     }
 

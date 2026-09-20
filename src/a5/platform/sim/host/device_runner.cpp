@@ -515,7 +515,7 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
 
             LOG_INFO("Launching %d AICore thread(s)", num_aicore);
             for (int i = 0; i < num_aicore; i++) {
-                CoreType core_type = runtime.get_workers()[i].core_type;
+                CoreType core_type = runtime.core_type_rule(i);
                 uint32_t physical_core_id = static_cast<uint32_t>(i);
                 run->aicore_threads.push_back(create_thread(
                     [this, run, i, core_type, physical_core_id]() {
@@ -857,7 +857,7 @@ int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecuti
         // emit path can label lanes without an AICPU record.
         std::vector<CoreType> core_types(num_aicore);
         for (int i = 0; i < num_aicore; i++) {
-            core_types[i] = runtime.get_workers()[i].core_type;
+            core_types[i] = runtime.core_type_rule(i);
         }
         chip_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
         // After the init that publishes the region base: the bank is a slice of

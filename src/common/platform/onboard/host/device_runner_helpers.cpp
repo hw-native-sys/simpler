@@ -86,9 +86,9 @@ int KernelArgsHelper::prepare_runtime_args(
 
     // Both runtime variants publish the descriptor at offset zero. Host-only
     // orchestration state and tensor leases remain outside this snapshot, and so
-    // does any device-initialized tail the descriptor ends in: the block is sized
-    // to the whole descriptor because the device addresses that range inside it,
-    // while only the uploaded prefix is snapshotted and copied.
+    // does any tail no host copy reaches: the block is sized to the whole
+    // descriptor because the device addresses that range inside it, while only a
+    // prefix is snapshotted and copied.
     const uint64_t runtime_extent = runtime_device_extent_size(host_runtime);
     // The length is a property of the runtime variant, which is fixed for a
     // runner, so a committed block always fits. A mismatch would mean the
@@ -108,8 +108,18 @@ int KernelArgsHelper::prepare_runtime_args(
         }
         slot.runtime_args = reinterpret_cast<Runtime *>(runtime_dev);
         slot.runtime_bytes = runtime_extent;
+        slot.workers_initialized = false;
     }
-    runtime_image_.prepare(host_runtime);
+    // A block whose handshake region has never been published still holds
+    // whatever the allocator returned, so the first publication onto it carries
+    // that region from the ctor-zeroed host copy. Every later publication stops
+    // before it: the device owns those words from then on, and re-sending them
+    // would overwrite a report or a reply.
+    const bool initializing = !slot.workers_initialized;
+    const size_t publish_bytes =
+        initializing ? runtime_device_initialized_prefix_size(host_runtime) : runtime_device_copy_size(host_runtime);
+    runtime_image_.prepare(host_runtime, publish_bytes);
+    initializing_slot_ = initializing ? &slot : nullptr;
     args.runtime_args = slot.runtime_args;
     runtime_args_state_ = RuntimeArgsState::Prepared;
     return 0;
@@ -127,8 +137,18 @@ int KernelArgsHelper::publish_runtime_args() {
     if (rc != 0) {
         LOG_ERROR("runtime metadata publication failed: %d", rc);
         args.runtime_args = nullptr;
-    } else {
-        runtime_args_state_ = RuntimeArgsState::Published;
+        // The block keeps whatever its handshake region held, so the next
+        // prepare on it must send the initializing prefix again.
+        initializing_slot_ = nullptr;
+        return rc;
+    }
+    runtime_args_state_ = RuntimeArgsState::Published;
+    // Committed here and nowhere earlier: this copy is what put a defined value
+    // in that block's handshake region, so the fact is recorded by the call
+    // that earned it rather than by a caller that has to remember the order.
+    if (initializing_slot_ != nullptr) {
+        initializing_slot_->workers_initialized = true;
+        initializing_slot_ = nullptr;
     }
     return rc;
 }
@@ -140,14 +160,12 @@ int release_slot_persistent_args(SlotPersistentArgs &slot, MemoryAllocator &allo
         if (rc != 0) {
             if (first_error == 0) first_error = rc;
         } else {
-            slot.runtime_args = nullptr;
-            slot.runtime_bytes = 0;
+            // Whole-struct reset, so every fact recorded about the released
+            // block goes with it and a successor allocation starts uninitialized.
+            slot = SlotPersistentArgs{};
         }
     }
     return first_error;
 }
 
-void abandon_slot_persistent_args(SlotPersistentArgs &slot) {
-    slot.runtime_args = nullptr;
-    slot.runtime_bytes = 0;
-}
+void abandon_slot_persistent_args(SlotPersistentArgs &slot) { slot = SlotPersistentArgs{}; }
