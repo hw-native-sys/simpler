@@ -170,7 +170,13 @@ launch 不分配设备内存、不创建 stream/event、不同步、不查询 ca
 设备入口先检查公共 framing 和镜像跨度（非零、对齐、不小于 `sizeof(ChipCallable)`、
 不溢出），再由 TMR consumer 建立缓存可见性并校验绑定、大小、参数数量和
 signature，解码到本次调用的私有参数，进入真实 executor。
-TMR 默认多线程启动时，公共参数和 profiling 准备完成后，orchestrator 开始建图。
+两个入口将不同形式的参数适配为 `ExecutionInputs`，随后共同调用 `AicpuExecutor::execute()`，
+内部的 `init()`、`run()`、初始化计数和就绪发布只有一套。Kernel admission leader 额外完成
+callable 驻留、orch SO 加载和参数绑定，再调用公共 `prepare_execution()`；program 的初始化
+leader 调用同一个准备函数。`KernelRoundGate` 只负责准入、线程筛选、最终结果和全部线程退场，
+不再维护初始化屏障或完成回调。
+
+TMR 默认多线程启动时，公共准备完成后，orchestrator 开始建图。
 Kernel 与 program 共用 `handshake_owned_clusters()` 和 `assign_own_clusters()`：每个 scheduler
 轮询自己负责的 cluster，批量发布 task 指针和打开寄存器窗口，再初始化所属核的 tracker、
 payload 和 context。物理核 ID 由设备核身份指令产生，唯一性与 program 一样由平台保证；
@@ -184,8 +190,8 @@ runtime reset 完成后即可派发，不等待其他 scheduler。这个选择�
 
 初始化失败时，先发布进程内取消请求，让其他初始化线程停止等待；SM 错误在 orchestrator
 完成 reset 后发布。AICore report 的 CANCEL 和窗口关闭由全部 AICPU 参与者停止后的 finalizer
-执行，避免与仍在初始化的线程发布 OPEN 竞争。orchestrator 建图后的统计等待所有 scheduler
-结束初始化，避免读取尚未建立的核分配；该等待不阻止已就绪 scheduler 派发。
+执行，避免与仍在初始化的线程发布 OPEN 竞争。启用采集时，orchestrator 建图后的核分配统计
+等待公共初始化完成，避免读取尚未建立的 tracker；未采集时不增加该等待。
 
 HBG 已有内部 packet/restore consumer，公共 kernel launch owner 尚未接线。
 

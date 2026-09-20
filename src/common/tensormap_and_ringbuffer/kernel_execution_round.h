@@ -47,69 +47,26 @@ int32_t execute_kernel_round_impl(
                 status = -1;
             }
         }
-        if (!gate.publish_admission(
-                ticket, request.allowed_cpus, request.execution_threads, status,
-                status == 0 && executor.kernel_orchestration_overlaps() ? 0 : -1
-            ))
-            return -1;
+        if (!gate.publish_admission(ticket, request.allowed_cpus, request.execution_threads, status)) return -1;
     }
     KernelRoundAdmission admission;
     if (!gate.wait_admission(ticket, &admission)) return -1;
     int32_t status = admission.status;
-    const KernelThreadView thread{admission.execution_index, request.execution_threads};
-    if (status == 0) {
-        const bool overlap = executor.kernel_orchestration_overlaps();
-        const bool independent = overlap && executor.kernel_independent_dispatch();
-        const bool early_orch = overlap && thread.execution_index == thread.execution_threads - 1;
-        const bool init_owner = overlap ? thread.execution_index == 0 : ticket.launch_index == 0;
-        auto run = [&]() noexcept {
-            const auto &invocation = executor.kernel_invocation_;
-            int32_t result;
-            try {
-                result = executor.run(invocation.resident(), invocation.inputs(), &thread);
-            } catch (...) {
-                result = -1;
-            }
-            if (result != 0) executor.kernel_run_failed(thread);
-            return result;
-        };
-        int32_t initialized = 0;
-        if (thread.execution_index >= 0) {
-            try {
-                initialized = executor.initialize_kernel_thread(thread);
-            } catch (...) {
-                initialized = -1;
-            }
-            if (!gate.report_init(ticket, initialized)) return -1;
-        }
-        int32_t early_status = 0;
-        if (independent && thread.execution_index >= 0) {
-            executor.publish_kernel_thread_init(thread, initialized);
-            if (initialized == 0) early_status = run();
-            else executor.kernel_run_failed(thread);
-        } else if (early_orch) {
-            early_status = run();
-        }
-        if (init_owner && !gate.publish_init_verdict(ticket, [&]() noexcept {
-                try {
-                    return independent ? 0 : executor.complete_kernel_init();
-                } catch (...) {
-                    return int32_t{-1};
-                }
-            }))
-            return -1;
-        if (!gate.wait_init_verdict(ticket, &status)) return -1;
-        if (init_owner && !independent) executor.publish_kernel_init(status);
-        if (status == 0) {
-            if (independent || early_orch) status = early_status;
-            else if (thread.execution_index >= 0) status = run();
+    if (status == 0 && admission.execution_index >= 0) {
+        const KernelThreadView thread{admission.execution_index, request.execution_threads};
+        const auto &invocation = executor.kernel_invocation_;
+        try {
+            status = executor.execute(invocation.resident(), invocation.inputs(), &thread);
+        } catch (...) {
+            status = -1;
+            executor.cancel_kernel_round();
         }
     }
     const auto arrival = gate.arrive(ticket, status);
     if (arrival == RoundArrival::Invalid) return -1;
     KernelFinalStatus result;
     if (arrival == RoundArrival::Finalizer) {
-        // The SM error is saved before Runtime destruction changes its views.
+        // Save initialization/SM status before Runtime destruction changes its views.
         const int32_t sm_status = executor.kernel_status();
         int32_t cleanup = executor.kernel_control_attached_ ? executor.kernel_cores_.finish() : -1;
         if (cleanup == 0) {

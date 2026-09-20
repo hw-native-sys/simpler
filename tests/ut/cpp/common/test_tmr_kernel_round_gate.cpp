@@ -57,17 +57,6 @@ public:
         for (size_t i = 0; i < tickets.size(); ++i)
             ASSERT_TRUE(gate.wait_admission(tickets[i], &admissions[i]));
     }
-    void initialize(int32_t error = 0) {
-        for (size_t i = 0; i < tickets.size(); ++i) {
-            if (admissions[i].execution_index >= 0) ASSERT_TRUE(gate.report_init(tickets[i], i == 1 ? error : 0));
-        }
-        ASSERT_TRUE(gate.publish_init_verdict(tickets[0]));
-        for (const auto &ticket : tickets) {
-            int32_t status = 123;
-            ASSERT_TRUE(gate.wait_init_verdict(ticket, &status));
-            EXPECT_EQ(status, error);
-        }
-    }
     void finish(int32_t run, int32_t sm, int32_t cleanup, int32_t expected) {
         for (size_t i = 0; i < tickets.size(); ++i) {
             EXPECT_EQ(
@@ -93,25 +82,6 @@ public:
     std::vector<KernelRoundAdmission> admissions;
 };
 
-TEST(TmrKernelRoundGateTest, SchedulerPublishesInitWhenLaunchLeaderIsOrchestrator) {
-    KernelRoundGate gate;
-    Round round(gate);
-    const int32_t allowed[]{1, 0};
-    ASSERT_TRUE(gate.publish_admission(round.tickets[0], allowed, 2, 0, 0));
-    for (size_t i = 0; i < round.tickets.size(); ++i) {
-        ASSERT_TRUE(gate.wait_admission(round.tickets[i], &round.admissions[i]));
-        if (round.admissions[i].execution_index >= 0) ASSERT_TRUE(gate.report_init(round.tickets[i], 0));
-    }
-    EXPECT_FALSE(gate.publish_init_verdict(round.tickets[0]));
-    ASSERT_TRUE(gate.publish_init_verdict(round.tickets[1]));
-    for (const auto &ticket : round.tickets) {
-        int32_t status = -1;
-        ASSERT_TRUE(gate.wait_init_verdict(ticket, &status));
-        EXPECT_EQ(status, 0);
-    }
-    round.finish(0, 0, 0, 0);
-}
-
 TEST(TmrKernelRoundGateTest, BoundsAndDuplicateProtocolOperationsDoNotAdvanceRound) {
     KernelRoundGate gate;
     KernelRoundTicket unchanged{77, 99};
@@ -131,49 +101,32 @@ TEST(TmrKernelRoundGateTest, BoundsAndDuplicateProtocolOperationsDoNotAdvanceRou
     EXPECT_FALSE(gate.publish_admission(aliased_epoch, allowed, 2, 0));
     round.admit();
     EXPECT_FALSE(gate.publish_admission(round.tickets[0], allowed, 2, 0));
-    EXPECT_FALSE(gate.publish_init_verdict(aliased_epoch));
-    EXPECT_FALSE(gate.publish_init_verdict(round.tickets[0]));
-    EXPECT_EQ(gate.arrive(round.tickets[0], 0), RoundArrival::Invalid);
     EXPECT_EQ(gate.depart(round.tickets[0]), RoundDeparture::Invalid);
     KernelRoundAdmission admission{};
     EXPECT_FALSE(gate.wait_admission(round.tickets[0], &admission));
-    EXPECT_FALSE(gate.report_init(round.tickets[2], 0));
-    round.initialize();
-    EXPECT_FALSE(gate.report_init(round.tickets[0], 0));
     round.finish(0, 0, 0, 0);
     EXPECT_FALSE(gate.complete_departure(round.tickets.back()));
 }
 
-TEST(TmrKernelRoundGateTest, AdmissionInitRunAndCleanupFailuresPreservePriorityAndAllowReuse) {
+TEST(TmrKernelRoundGateTest, AdmissionRunAndCleanupFailuresPreservePriorityAndAllowReuse) {
     KernelRoundGate gate;
     {
         Round round(gate);
         round.admit(-11);
-        EXPECT_FALSE(gate.report_init(round.tickets[0], 0));
-        EXPECT_FALSE(gate.publish_init_verdict(round.tickets[0]));
         round.finish(-33, -44, -55, -11);
     }
     {
         Round round(gate);
         round.admit();
-        round.initialize(-22);
-        round.finish(-33, -44, -55, -22);
-    }
-    {
-        Round round(gate);
-        round.admit();
-        round.initialize();
         round.finish(-33, -44, -55, -44);
     }
     {
         Round round(gate);
         round.admit();
-        round.initialize();
         round.finish(-33, 0, -55, -33);
     }
     Round round(gate);
     round.admit();
-    round.initialize();
     round.finish(0, 0, 0, 0);
 }
 
@@ -181,7 +134,6 @@ TEST(TmrKernelRoundGateTest, OldTicketsCannotWriteNewEpochOrReadItsVerdict) {
     KernelRoundGate gate;
     Round old(gate);
     old.admit();
-    old.initialize();
     old.finish(0, 0, 0, 0);
     Round next(gate);
     EXPECT_GT(next.tickets[0].epoch, old.tickets[0].epoch);
@@ -191,11 +143,7 @@ TEST(TmrKernelRoundGateTest, OldTicketsCannotWriteNewEpochOrReadItsVerdict) {
     for (const auto &ticket : old.tickets) {
         KernelRoundAdmission admission{17, 18};
         KernelFinalStatus final{19, 20};
-        int32_t init = 21;
         EXPECT_FALSE(gate.wait_admission(ticket, &admission));
-        EXPECT_FALSE(gate.report_init(ticket, -1));
-        EXPECT_FALSE(gate.publish_init_verdict(ticket));
-        EXPECT_FALSE(gate.wait_init_verdict(ticket, &init));
         EXPECT_EQ(gate.arrive(ticket, -1), RoundArrival::Invalid);
         EXPECT_FALSE(gate.publish_final_status(ticket, -1, -1));
         EXPECT_FALSE(gate.read_final_status(ticket, &final));
@@ -203,58 +151,14 @@ TEST(TmrKernelRoundGateTest, OldTicketsCannotWriteNewEpochOrReadItsVerdict) {
         EXPECT_FALSE(gate.complete_departure(ticket));
         EXPECT_EQ(admission.status, 17);
         EXPECT_EQ(final.runtime_status, 19);
-        EXPECT_EQ(init, 21);
     }
-    next.initialize();
     next.finish(0, 0, 0, 0);
-}
-
-TEST(TmrKernelRoundGateTest, CompleteInitRunsOnceAfterAllInitializersAndItsFailureAllowsReuse) {
-    KernelRoundGate gate;
-    int32_t complete_calls = 0;
-    for (int32_t complete_status : {-27, 0}) {
-        Round round(gate);
-        round.admit();
-        ASSERT_TRUE(gate.report_init(round.tickets[0], 0));
-        ASSERT_TRUE(gate.report_init(round.tickets[1], 0));
-        ASSERT_TRUE(gate.publish_init_verdict(round.tickets[0], [&] {
-            ++complete_calls;
-            return complete_status;
-        }));
-        EXPECT_FALSE(gate.publish_init_verdict(round.tickets[0], [&] {
-            ADD_FAILURE() << "Duplicate publication invoked CompleteInit";
-            return 0;
-        }));
-        for (const auto &ticket : round.tickets) {
-            int32_t status = 19;
-            ASSERT_TRUE(gate.wait_init_verdict(ticket, &status));
-            EXPECT_EQ(status, complete_status);
-        }
-        round.finish(0, 0, 0, complete_status);
-    }
-    EXPECT_EQ(complete_calls, 2);
-
-    Round failed(gate);
-    failed.admit();
-    ASSERT_TRUE(gate.report_init(failed.tickets[0], 0));
-    ASSERT_TRUE(gate.report_init(failed.tickets[1], -18));
-    ASSERT_TRUE(gate.publish_init_verdict(failed.tickets[0], [&] {
-        ADD_FAILURE() << "CompleteInit ran after a failed initializer";
-        return 0;
-    }));
-    for (const auto &ticket : failed.tickets) {
-        int32_t status = 19;
-        ASSERT_TRUE(gate.wait_init_verdict(ticket, &status));
-        EXPECT_EQ(status, -18);
-    }
-    failed.finish(0, 0, 0, -18);
 }
 
 TEST(TmrKernelRoundGateTest, ConcurrentDuplicateArrivalIsCountedOnce) {
     KernelRoundGate gate;
     Round round(gate, 2);
     round.admit();
-    round.initialize();
     Signal start;
     RoundArrival results[2]{};
     std::thread a([&] {
@@ -285,7 +189,6 @@ TEST(TmrKernelRoundGateTest, SlowFinalizerReaderAndRetiringOwnerKeepStoragePinne
     KernelRoundGate gate;
     Round round(gate, 2);
     round.admit();
-    round.initialize();
     ASSERT_EQ(gate.arrive(round.tickets[0], 0), RoundArrival::Peer);
     ASSERT_EQ(gate.arrive(round.tickets[1], 0), RoundArrival::Finalizer);
     Signal reader_started;
@@ -322,46 +225,7 @@ TEST(TmrKernelRoundGateTest, SlowFinalizerReaderAndRetiringOwnerKeepStoragePinne
     EXPECT_EQ(storage, 0);
     EXPECT_EQ(result.runtime_status, -7);
     following.admit();
-    following.initialize();
     following.finish(0, 0, 0, 0);
-}
-
-TEST(TmrKernelRoundGateTest, SlowInitializerPreventsOrchestrationAndPublishesOneVerdict) {
-    KernelRoundGate gate;
-    Round round(gate, 3);
-    round.admit();
-    ASSERT_TRUE(gate.report_init(round.tickets[0], 0));
-    Signal publishing;
-    Signal reading;
-    std::atomic<bool> published{false};
-    std::atomic<bool> executed{false};
-    std::thread leader([&] {
-        publishing.set();
-        EXPECT_TRUE(gate.publish_init_verdict(round.tickets[0]));
-        published.store(true);
-        int32_t status;
-        EXPECT_TRUE(gate.wait_init_verdict(round.tickets[0], &status));
-        EXPECT_EQ(status, -9);
-    });
-    std::thread filtered([&] {
-        reading.set();
-        int32_t status;
-        EXPECT_TRUE(gate.wait_init_verdict(round.tickets[2], &status));
-        EXPECT_EQ(status, -9);
-        executed.store(status == 0);
-    });
-    publishing.wait();
-    reading.wait();
-    EXPECT_FALSE(published.load());
-    EXPECT_FALSE(executed.load());
-    ASSERT_TRUE(gate.report_init(round.tickets[1], -9));
-    leader.join();
-    filtered.join();
-    int32_t status;
-    ASSERT_TRUE(gate.wait_init_verdict(round.tickets[1], &status));
-    EXPECT_EQ(status, -9);
-    EXPECT_FALSE(executed.load());
-    round.finish(0, 0, 0, -9);
 }
 
 TEST(TmrKernelRoundGateTest, ThreadedRepeatedRoundsIncludeFilteredAndDuplicateCpuReports) {
@@ -385,12 +249,7 @@ TEST(TmrKernelRoundGateTest, ThreadedRepeatedRoundsIncludeFilteredAndDuplicateCp
                     if (admission.execution_index >= 0) {
                         const int32_t bit = 1 << admission.execution_index;
                         EXPECT_EQ(role_bits.fetch_or(bit) & bit, 0);
-                        ASSERT_TRUE(gate.report_init(ticket, 0));
                     }
-                    if (ticket.launch_index == 0) ASSERT_TRUE(gate.publish_init_verdict(ticket));
-                    int32_t init;
-                    ASSERT_TRUE(gate.wait_init_verdict(ticket, &init));
-                    EXPECT_EQ(init, 0);
                     const auto arrival = gate.arrive(ticket, 0);
                     ASSERT_NE(arrival, RoundArrival::Invalid);
                     if (arrival == RoundArrival::Finalizer) {

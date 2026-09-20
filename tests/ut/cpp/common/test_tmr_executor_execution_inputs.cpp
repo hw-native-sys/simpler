@@ -13,7 +13,9 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstring>
+#include <functional>
 #include <fstream>
 #include <iterator>
 #include <memory>
@@ -39,7 +41,7 @@
 namespace {
 thread_local int affinity_index = 0;
 std::array<uint64_t, PLATFORM_MAX_CORES> register_bases{};
-std::array<uint64_t, 3> register_cells{};
+std::array<uint64_t, 6> register_cells{};
 std::atomic<int> opened_windows{0};
 std::atomic<int> closed_windows{0};
 std::atomic<int> register_publications{0};
@@ -78,6 +80,8 @@ void platform_init_aicore_regs(uint64_t) { ++opened_windows; }
 uint64_t platform_aicore_exit_deadline() { return get_sys_cnt_aicpu() + 10000000000ULL; }
 void platform_close_aicore_window(uint64_t) { ++closed_windows; }
 
+extern "C" int32_t aicpu_execute(Runtime *);
+extern "C" int32_t simpler_aicpu_register_callable(void *);
 extern "C" int simpler_aicpu_prepare_tmr_context(void *);
 extern "C" int simpler_aicpu_register_tmr_kernel_callable(void *);
 extern "C" int simpler_aicpu_revoke_tmr_context(void *);
@@ -264,6 +268,7 @@ protected:
         std::vector<std::thread> cores;
         for (size_t i = 0; i < reports.size(); ++i) {
             cores.emplace_back([&, i] {
+                if (before_core_report) before_core_report();
                 auto &report = reports[i];
                 report.physical_core_id = invalid_reports && i == 2 ? 75 : i;
                 report.core_type = static_cast<uint32_t>(i == 0 ? CoreType::AIC : CoreType::AIV);
@@ -355,7 +360,80 @@ protected:
     TmrContextRegistrationArgs registration{};
     std::vector<uint8_t> kernel_image;
     bool registered_context{false};
+    std::function<void()> before_core_report;
 };
+
+TEST_F(TmrExecutorExecutionInputsTest, KernelOrchestrationSubmitsBeforeCoreReports) {
+    before_core_report = [&] {
+        auto *header = static_cast<SharedMemoryHeader *>(binding.sm.base);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (header->rings[0].fc.current_task_index.load(std::memory_order_acquire) == 0 &&
+               std::chrono::steady_clock::now() < deadline) {}
+        EXPECT_GT(header->rings[0].fc.current_task_index.load(std::memory_order_acquire), 0);
+    };
+    expect_successful_reuse();
+}
+
+TEST_F(TmrExecutorExecutionInputsTest, ProgramEntryOverlapsReportsAndReusesSerialInitialization) {
+    resident->dev.worker_count = 6;
+    resident->dev.aicpu_thread_num = 3;
+    RegisterCallableArgs registration;
+    registration.active_callable_id = 3;
+    registration.dev_orch_so_addr = reinterpret_cast<uint64_t>(binary.data());
+    registration.dev_orch_so_size = binary.size();
+    std::strcpy(registration.device_orch_func_name, "orchestration_a");
+    std::strcpy(registration.device_orch_config_name, "config_a");
+    ASSERT_EQ(simpler_aicpu_register_callable(&registration), 0);
+    for (bool serial : {false, true, false}) {
+        resident->dev.serial_orch_sched = serial;
+        resident->set_active_callable_id(3);
+        resident->set_orch_args(arguments(79));
+        auto *header = static_cast<SharedMemoryHeader *>(binding.sm.base);
+        header->rings[0].fc.current_task_index.store(0, std::memory_order_release);
+        for (int i = 0; i < 6; ++i) {
+            auto &worker = resident->dev.workers[i];
+            worker.physical_core_id = i;
+            worker.core_type = i < 2 ? CoreType::AIC : CoreType::AIV;
+            worker.aicore_done = 0;
+            register_cells[i] = 0;
+        }
+        std::atomic<bool> first_scheduler_finished{false};
+        std::thread reports([&] {
+            if (!serial) {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+                while (header->rings[0].fc.current_task_index.load(std::memory_order_acquire) == 0 &&
+                       std::chrono::steady_clock::now() < deadline) {}
+                EXPECT_GT(header->rings[0].fc.current_task_index.load(std::memory_order_acquire), 0);
+            }
+            // Scheduler 0 owns {0,2,3}; scheduler 1 owns {1,4,5}.
+            // With capture disabled, the first must dispatch before the second initializes.
+            for (int i : {0, 2, 3, 1, 4, 5}) {
+                if (!serial && i == 1) {
+                    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+                    while (!first_scheduler_finished.load(std::memory_order_acquire) &&
+                           std::chrono::steady_clock::now() < deadline) {}
+                    EXPECT_TRUE(first_scheduler_finished.load(std::memory_order_acquire));
+                }
+                __atomic_store_n(&resident->dev.workers[i].aicore_done, 1, __ATOMIC_RELEASE);
+            }
+        });
+        std::array<int32_t, 3> results{};
+        std::vector<std::thread> cpus;
+        for (int i = 0; i < 3; ++i)
+            cpus.emplace_back([&, i] {
+                affinity_index = i;
+                results[i] = aicpu_execute(resident.get());
+                if (i == 0) first_scheduler_finished.store(true, std::memory_order_release);
+            });
+        for (auto &cpu : cpus)
+            cpu.join();
+        reports.join();
+        for (int32_t result : results)
+            EXPECT_EQ(result, 0);
+        EXPECT_EQ(output[3], 3u);
+        EXPECT_EQ(output[4], 79u);
+    }
+}
 
 TEST_F(TmrExecutorExecutionInputsTest, CoordinatedRoundsRunABAWithOneFinalVerdictAndStableStorage) {
     uint64_t storage = 0;
@@ -397,7 +475,7 @@ TEST_F(TmrExecutorExecutionInputsTest, InvalidReportsCancelOverlappedOrchestrati
     ASSERT_EQ(encode_tmr_invocation(args, callable, binding.identity, cache, &packet), InvocationStatus::Ok);
     const auto results = coordinated_round({callable, {}}, packet.packet(), 0, 2, false, true);
     for (int32_t result : results)
-        EXPECT_NE(result, 0);
+        EXPECT_EQ(result, -1);
     EXPECT_EQ(opened_windows.load(), 0);
     EXPECT_EQ(closed_windows.load(), 0);
     EXPECT_EQ(control.cleanup_status, 0);

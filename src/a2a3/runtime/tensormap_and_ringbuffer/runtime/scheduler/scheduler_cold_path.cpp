@@ -710,8 +710,8 @@ int32_t SchedulerContext::retire_all_cores(Runtime *runtime) {
 // landed, so the shared aic_count_/aiv_count_ are written by one thread only.
 // =============================================================================
 
-// Reports are fully validated by the admission owner before any partition
-// opens a window. Every worker has one writer; final init runs after all slices.
+// Each initializer owns one kernel report slice; post_handshake_init runs
+// after all slices have published their worker state.
 void SchedulerContext::handshake_kernel_partition(Runtime *runtime, int32_t index, int32_t threads) {
     const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(index) * cores_total_num_) / threads);
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(index + 1) * cores_total_num_) / threads);
@@ -741,6 +741,18 @@ void SchedulerContext::handshake_kernel_partition(Runtime *runtime, int32_t inde
 }
 
 void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads) {
+    if (kernel_cores_ != nullptr) {
+        if (kernel_cores_->collect_reports_partition(
+                reinterpret_cast<const uint64_t *>(get_platform_regs()), platform_get_physical_cores_count(), tidx,
+                nthreads
+            ) != 0) {
+            handshake_failed_.store(true, std::memory_order_release);
+            kernel_cores_->request_cancel();
+            return;
+        }
+        handshake_kernel_partition(runtime, tidx, nthreads);
+        return;
+    }
     Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
     const int32_t total = cores_total_num_;
     const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(tidx) * total) / nthreads);
@@ -1336,12 +1348,8 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime, simpler::tmr::Ca
     }
     memcpy(aic_worker_ids_, local_aic, static_cast<size_t>(la) * sizeof(int32_t));
     memcpy(aiv_worker_ids_, local_aiv, static_cast<size_t>(lv) * sizeof(int32_t));
-    if (kernel_cores_ == nullptr) {
-        aic_count_ = la;
-        aiv_count_ = lv;
-    } else if (la != aic_count_ || lv != aiv_count_) {
-        return -1;
-    }
+    aic_count_ = la;
+    aiv_count_ = lv;
     LOG_INFO("Core discovery complete: %d AIC, %d AIV", aic_count_, aiv_count_);
 
     if (!assign_cores_to_threads()) {
@@ -1365,10 +1373,10 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime, simpler::tmr::Ca
 
     // total_tasks_ is read in pre_handshake_init (before the orchestrator's early
     // SM reset on the decoupled path can zero the ring counters).
-    if (kernel_cores_ == nullptr) completed_tasks_.store(0, std::memory_order_release);
+    completed_tasks_.store(0, std::memory_order_release);
 
     // Device orchestration: the orchestrator thread flips this when the graph is built.
-    if (kernel_cores_ == nullptr) orchestrator_done_.store(false, std::memory_order_release);
+    orchestrator_done_.store(false, std::memory_order_release);
 
     // prepare_subtask_to_core fully writes a per-core payload / deferred-slab slot
     // before the AICore is told to read it: build_payload sets
@@ -1424,7 +1432,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime, simpler::tmr::Ca
         }
     }
 
-    if (kernel_cores_ == nullptr) functions_ = functions;
+    functions_ = functions;
 
     return 0;
 }

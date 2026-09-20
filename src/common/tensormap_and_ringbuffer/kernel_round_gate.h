@@ -60,17 +60,13 @@ public:
                     ))
                     continue;
                 launched_.store(launched, std::memory_order_relaxed);
-                execution_count_ = 0;
                 admission_ = 0;
-                init_status_ = 0;
                 final_ = {};
-                initialized_.store(0, std::memory_order_relaxed);
                 arrived_.store(0, std::memory_order_relaxed);
                 departed_.store(0, std::memory_order_relaxed);
                 for (auto &slot : slots_) {
                     slot.cpu = -1;
                     slot.execution_index = -1;
-                    slot.init_status = 0;
                     slot.run_status = 0;
                     slot.phase.store(stamp(epoch + 1, Stage::Vacant), std::memory_order_relaxed);
                 }
@@ -106,11 +102,10 @@ public:
     // verdict. Classification keeps exact CPU matches, then fills missing roles
     // in report order, without touching program's static affinity gate or TLS.
     bool publish_admission(
-        const KernelRoundTicket &leader, const int32_t *allowed_cpus, int32_t count, int32_t status,
-        int32_t init_execution_index = -1
+        const KernelRoundTicket &leader, const int32_t *allowed_cpus, int32_t count, int32_t status
     ) noexcept {
         if (leader.epoch == 0 || leader.epoch > kMaxEpoch || leader.launch_index != 0 || allowed_cpus == nullptr ||
-            count <= 0 || count > MAX_GATE_THREADS || init_execution_index < -1 || init_execution_index >= count)
+            count <= 0 || count > MAX_GATE_THREADS)
             return false;
         for (int32_t i = 0; i < count; ++i) {
             if (allowed_cpus[i] < 0) return false;
@@ -149,12 +144,6 @@ public:
             slots_[i].execution_index = role;
             filled[role++] = true;
         }
-        init_owner_ = 0;
-        if (init_execution_index >= 0) {
-            for (int32_t i = 0; i < launched; ++i)
-                if (slots_[i].execution_index == init_execution_index) init_owner_ = i;
-        }
-        execution_count_ = count;
         admission_ = status;
         lifecycle_.store(stamp(leader.epoch, Stage::Admitted), std::memory_order_release);
         return true;
@@ -168,87 +157,10 @@ public:
         return true;
     }
 
-    bool report_init(const KernelRoundTicket &ticket, int32_t status) noexcept {
-        if (!transition(ticket, Stage::AdmissionRead, Stage::InitWriting)) return false;
-        auto &slot = slots_[ticket.launch_index];
-        if (admission_ != 0 || slot.execution_index < 0) {
-            slot.phase.store(stamp(ticket.epoch, Stage::AdmissionRead), std::memory_order_release);
-            return false;
-        }
-        slot.init_status = status;
-        slot.phase.store(stamp(ticket.epoch, Stage::InitDone), std::memory_order_release);
-        initialized_.fetch_add(1, std::memory_order_acq_rel);
-        return true;
-    }
-
-    // Admission selects the init publisher: the launch leader by default,
-    // or a scheduler role when orchestration overlaps initialization.
-    bool publish_init_verdict(const KernelRoundTicket &leader) noexcept {
-        return publish_init_verdict(leader, []() noexcept {
-            return 0;
-        });
-    }
-
-    template <typename CompleteInit>
-    bool publish_init_verdict(const KernelRoundTicket &leader, CompleteInit complete_init) noexcept {
-        Stage previous = Stage::InitDone;
-        if (!transition(leader, previous, Stage::InitPublishing)) {
-            previous = Stage::AdmissionRead;
-            if (!transition(leader, previous, Stage::InitPublishing)) return false;
-        }
-        if (leader.launch_index != init_owner_ || admission_ != 0 ||
-            (previous == Stage::AdmissionRead && slots_[leader.launch_index].execution_index >= 0)) {
-            slots_[leader.launch_index].phase.store(stamp(leader.epoch, previous), std::memory_order_release);
-            return false;
-        }
-        uint64_t expected = stamp(leader.epoch, Stage::Admitted);
-        if (!lifecycle_.compare_exchange_strong(
-                expected, stamp(leader.epoch, Stage::Initializing), std::memory_order_acq_rel
-            )) {
-            slots_[leader.launch_index].phase.store(stamp(leader.epoch, previous), std::memory_order_release);
-            return false;
-        }
-        while (initialized_.load(std::memory_order_acquire) != execution_count_) {}
-        for (int32_t i = 0; i < launched_.load(std::memory_order_relaxed); ++i) {
-            if (slots_[i].init_status != 0) {
-                init_status_ = slots_[i].init_status;
-                break;
-            }
-        }
-        if (init_status_ == 0) init_status_ = complete_init();
-        slots_[leader.launch_index].phase.store(stamp(leader.epoch, previous), std::memory_order_release);
-        lifecycle_.store(stamp(leader.epoch, Stage::Initialized), std::memory_order_release);
-        return true;
-    }
-
-    bool wait_init_verdict(const KernelRoundTicket &ticket, int32_t *out) noexcept {
-        if (out == nullptr) return false;
-        if (!transition(ticket, Stage::InitDone, Stage::ReadingInit)) {
-            if (!transition(ticket, Stage::AdmissionRead, Stage::ReadingInit)) return false;
-            // Only filtered threads skip initialization.
-            if (admission_ != 0 || slots_[ticket.launch_index].execution_index >= 0) {
-                slots_[ticket.launch_index].phase.store(
-                    stamp(ticket.epoch, Stage::AdmissionRead), std::memory_order_release
-                );
-                return false;
-            }
-        }
-        wait_phase(ticket.epoch, Stage::Initialized);
-        *out = init_status_;
-        slots_[ticket.launch_index].phase.store(stamp(ticket.epoch, Stage::ReadyToRun), std::memory_order_release);
-        return true;
-    }
-
+    // Execution includes the shared executor's initialization and dispatch.
+    // Filtered threads participate in retirement without entering that executor.
     RoundArrival arrive(const KernelRoundTicket &ticket, int32_t runtime_status) noexcept {
-        if (!transition(ticket, Stage::ReadyToRun, Stage::Arriving)) {
-            if (!transition(ticket, Stage::AdmissionRead, Stage::Arriving)) return RoundArrival::Invalid;
-            if (admission_ == 0) {
-                slots_[ticket.launch_index].phase.store(
-                    stamp(ticket.epoch, Stage::AdmissionRead), std::memory_order_release
-                );
-                return RoundArrival::Invalid;
-            }
-        }
+        if (!transition(ticket, Stage::AdmissionRead, Stage::Arriving)) return RoundArrival::Invalid;
         auto &slot = slots_[ticket.launch_index];
         slot.run_status = runtime_status;
         slot.phase.store(stamp(ticket.epoch, Stage::Arrived), std::memory_order_release);
@@ -259,8 +171,8 @@ public:
     }
 
     // Fallible shutdown/destroy finishes before this call. Preserve cleanup
-    // independently; execution priority is admission, init, SM, then first
-    // launch-index error, never a race between error-reporting threads.
+    // independently; execution priority is admission, executor status, then
+    // first launch-index error, never a race between error-reporting threads.
     bool publish_final_status(const KernelRoundTicket &finalizer, int32_t sm_status, int32_t cleanup_status) noexcept {
         return publish_final_status(finalizer, sm_status, cleanup_status, [](const KernelFinalStatus &) noexcept {});
     }
@@ -272,7 +184,7 @@ public:
         const KernelRoundTicket &finalizer, int32_t sm_status, int32_t cleanup_status, PublishReport publish_report
     ) noexcept {
         if (!transition(finalizer, Stage::Finalizer, Stage::Finalizing)) return false;
-        int32_t status = admission_ != 0 ? admission_ : init_status_;
+        int32_t status = admission_;
         if (status == 0) status = sm_status;
         if (status == 0) {
             for (int32_t i = 0; i < launched_.load(std::memory_order_relaxed); ++i) {
@@ -324,18 +236,11 @@ private:
         Joining,
         Admitting,
         Admitted,
-        Initializing,
-        Initialized,
         Final,
         Vacant,
         Joined,
         ReadingAdmission,
         AdmissionRead,
-        InitWriting,
-        InitDone,
-        InitPublishing,
-        ReadingInit,
-        ReadyToRun,
         Arriving,
         Arrived,
         Finalizer,
@@ -356,7 +261,6 @@ private:
         std::atomic<uint64_t> phase{0};
         int32_t cpu{-1};
         int32_t execution_index{-1};
-        int32_t init_status{0};
         int32_t run_status{0};
     };
 
@@ -381,14 +285,10 @@ private:
     std::atomic<uint64_t> claims_{0};
     std::atomic<int32_t> launched_{0};
     std::atomic<int32_t> published_{0};
-    std::atomic<int32_t> initialized_{0};
     std::atomic<int32_t> arrived_{0};
     std::atomic<int32_t> departed_{0};
     Slot slots_[MAX_GATE_THREADS];
-    int32_t init_owner_{0};
-    int32_t execution_count_{0};
     int32_t admission_{0};
-    int32_t init_status_{0};
     KernelFinalStatus final_{};
 };
 

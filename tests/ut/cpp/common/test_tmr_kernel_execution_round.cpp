@@ -92,26 +92,15 @@ struct ExecutorModel {
     TmrLaunchControl control{};
     std::array<TmrCoreReport, 3> reports{};
     const std::array<int32_t, kExecutionThreads> allowed{10, 11, 12};
-    bool overlap{false};
-    bool independent{false};
-    Signal first_scheduler_ran;
-    std::atomic<bool> independent_progress{false};
-    Signal orch_started;
-    Signal init_completed;
-    std::atomic<bool> overlapped{false};
-    std::atomic<bool> init_finished{false};
-    int32_t complete_status{0};
+    int32_t execute_status{0};
     int32_t finalize_status{0};
     int32_t failing_run_index{-1};
-    int32_t failing_init_index{-1};
+    std::function<void(int32_t)> on_execute;
     std::atomic<int32_t> preparations{0};
-    std::atomic<int32_t> initializers{0};
-    std::atomic<int32_t> completions{0};
     std::atomic<int32_t> runs{0};
     std::atomic<int32_t> cancellations{0};
     std::atomic<int32_t> finalizations{0};
     std::atomic<int32_t> clears{0};
-    std::atomic<bool> init_published{false};
 
     KernelExecutionRequest request() {
         KernelExecutionRequest request;
@@ -124,49 +113,16 @@ struct ExecutorModel {
 
     int32_t prepare_kernel_round(const KernelExecutionRequest &) {
         ++preparations;
-        initializers = 0;
-        init_published = false;
         kernel_invocation_.storage = kStorageValue;
         kernel_invocation_.active = true;
         return 0;
     }
-    bool kernel_orchestration_overlaps() const { return overlap; }
-    bool kernel_independent_dispatch() const { return independent; }
-    void publish_kernel_thread_init(const KernelThreadView &, int32_t) {
-        if (initializers.load() == kExecutionThreads) init_completed.set();
-    }
-    void publish_kernel_init(int32_t status) {
-        init_finished = true;
-        init_completed.set();
-        if (status != 0 && overlap) cancel_kernel_round();
-    }
-    void kernel_run_failed(const KernelThreadView &) { cancel_kernel_round(); }
-    int32_t initialize_kernel_thread(const KernelThreadView &thread) {
-        if (overlap && thread.execution_index == 0) overlapped = orch_started.wait_for();
-        if (independent && thread.execution_index == 1) independent_progress = first_scheduler_ran.wait_for();
-        ++initializers;
-        return thread.execution_index == failing_init_index ? -41 : 0;
-    }
-    int32_t complete_kernel_init() {
-        EXPECT_EQ(initializers.load(), kExecutionThreads);
-        ++completions;
-        init_published = true;
-        return complete_status;
-    }
-    int32_t run(Runtime *, const ExecutionInputs &, const KernelThreadView *thread) {
-        if (overlap && thread->execution_index == kExecutionThreads - 1) {
-            orch_started.set();
-            EXPECT_TRUE(init_completed.wait_for());
-        } else if (independent) {
-            first_scheduler_ran.set();
-        } else {
-            EXPECT_TRUE(init_published.load());
-            EXPECT_EQ(complete_status, 0);
-        }
+    int32_t execute(Runtime *, const ExecutionInputs &, const KernelThreadView *thread) {
         EXPECT_TRUE(kernel_invocation_.active.load());
         EXPECT_EQ(kernel_invocation_.storage.load(), kStorageValue);
+        if (on_execute) on_execute(thread->execution_index);
         ++runs;
-        return thread->execution_index == failing_run_index ? -33 : 0;
+        return thread->execution_index == failing_run_index ? -33 : execute_status;
     }
     void cancel_kernel_round() { ++cancellations; }
     int32_t kernel_status() const { return 0; }
@@ -200,13 +156,12 @@ std::array<int32_t, ExecutorModel::kLaunchedThreads> run_round(ExecutorModel &ex
     return results;
 }
 
-TEST(TmrKernelExecutionRoundTest, CompleteInitFailureSkipsAllExecutionAndNextRoundCanReuse) {
+TEST(TmrKernelExecutionRoundTest, ExecutionFailurePublishesOneVerdictAndNextRoundCanReuse) {
     ExecutorModel executor;
-    executor.complete_status = -27;
+    executor.execute_status = -27;
     for (int32_t result : run_round(executor))
         EXPECT_EQ(result, -27);
-    EXPECT_EQ(executor.runs.load(), 0);
-    EXPECT_EQ(executor.completions.load(), 1);
+    EXPECT_EQ(executor.runs.load(), ExecutorModel::kExecutionThreads);
     EXPECT_EQ(executor.kernel_cores_.published.runtime_status, -27);
     EXPECT_EQ(executor.kernel_cores_.published.cleanup_status, 0);
     EXPECT_EQ(executor.finalizations.load(), 1);
@@ -214,11 +169,10 @@ TEST(TmrKernelExecutionRoundTest, CompleteInitFailureSkipsAllExecutionAndNextRou
     EXPECT_TRUE(executor.kernel_gate_.idle());
     EXPECT_FALSE(executor.kernel_invocation_.active.load());
 
-    executor.complete_status = 0;
+    executor.execute_status = 0;
     for (int32_t result : run_round(executor))
         EXPECT_EQ(result, 0);
-    EXPECT_EQ(executor.runs.load(), ExecutorModel::kExecutionThreads);
-    EXPECT_EQ(executor.completions.load(), 2);
+    EXPECT_EQ(executor.runs.load(), 2 * ExecutorModel::kExecutionThreads);
     EXPECT_EQ(executor.clears.load(), 2);
     EXPECT_TRUE(executor.kernel_gate_.idle());
 }
@@ -229,7 +183,6 @@ TEST(TmrKernelExecutionRoundTest, ThreadFailureCancelsAndEveryThreadReadsTheSame
     for (int32_t result : run_round(executor))
         EXPECT_EQ(result, -33);
     EXPECT_EQ(executor.runs.load(), ExecutorModel::kExecutionThreads);
-    EXPECT_EQ(executor.cancellations.load(), 1);
     EXPECT_EQ(executor.kernel_cores_.finishes.load(), 1);
     EXPECT_EQ(executor.kernel_cores_.published.runtime_status, -33);
     EXPECT_EQ(executor.kernel_cores_.published.cleanup_status, 0);
@@ -264,7 +217,7 @@ TEST(TmrKernelExecutionRoundTest, CleanupFailureRetainsStorageAndRejectsAnotherR
 
 TEST(TmrKernelExecutionRoundTest, SlowReportPublisherBlocksNativeReturnAndOverwrite) {
     ExecutorModel executor;
-    executor.complete_status = -47;
+    executor.execute_status = -47;
     Signal publishing;
     Signal release_finalizer;
     std::atomic<bool> report_complete{false};
@@ -304,57 +257,18 @@ TEST(TmrKernelExecutionRoundTest, SlowReportPublisherBlocksNativeReturnAndOverwr
     EXPECT_TRUE(executor.kernel_gate_.idle());
 }
 
-TEST(TmrKernelExecutionRoundTest, OrchestrationOverlapsSchedulerInitialization) {
+TEST(TmrKernelExecutionRoundTest, DelayedExecutorDoesNotBlockPeerExecution) {
     ExecutorModel executor;
-    executor.overlap = true;
+    Signal peer_executed;
+    executor.on_execute = [&](int32_t index) {
+        if (index == 1) EXPECT_TRUE(peer_executed.wait_for());
+        else peer_executed.set();
+    };
     for (int32_t result : run_round(executor))
         EXPECT_EQ(result, 0);
-    EXPECT_TRUE(executor.overlapped.load());
     EXPECT_EQ(executor.runs.load(), ExecutorModel::kExecutionThreads);
-    EXPECT_EQ(executor.completions.load(), 1);
-    EXPECT_EQ(executor.clears.load(), 1);
-}
-
-TEST(TmrKernelExecutionRoundTest, OverlappedInitFailureCancelsOrchAndSkipsDispatch) {
-    ExecutorModel executor;
-    executor.overlap = true;
-    executor.complete_status = -27;
-    for (int32_t result : run_round(executor))
-        EXPECT_EQ(result, -27);
-    EXPECT_TRUE(executor.overlapped.load());
-    EXPECT_EQ(executor.runs.load(), 1);
-    EXPECT_EQ(executor.cancellations.load(), 1);
-    EXPECT_EQ(executor.clears.load(), 1);
-    EXPECT_TRUE(executor.kernel_gate_.idle());
-}
-
-TEST(TmrKernelExecutionRoundTest, SchedulerDispatchDoesNotWaitForPeerInitialization) {
-    ExecutorModel executor;
-    executor.overlap = true;
-    executor.independent = true;
-    const auto results = run_round(executor);
-    for (int32_t result : results)
-        EXPECT_EQ(result, 0);
-    EXPECT_TRUE(executor.independent_progress.load());
     EXPECT_EQ(executor.kernel_cores_.finishes.load(), 1);
     EXPECT_TRUE(executor.kernel_gate_.idle());
-}
-
-TEST(TmrKernelExecutionRoundTest, IndependentInitFailurePublishesOneVerdictAndAllowsReuse) {
-    ExecutorModel executor;
-    executor.overlap = true;
-    executor.independent = true;
-    executor.failing_init_index = 1;
-    for (int32_t result : run_round(executor))
-        EXPECT_EQ(result, -41);
-    EXPECT_TRUE(executor.independent_progress.load());
-    EXPECT_EQ(executor.runs.load(), 2);
-    EXPECT_EQ(executor.cancellations.load(), 1);
-    EXPECT_TRUE(executor.kernel_gate_.idle());
-    executor.failing_init_index = -1;
-    for (int32_t result : run_round(executor))
-        EXPECT_EQ(result, 0);
-    EXPECT_EQ(executor.kernel_cores_.finishes.load(), 2);
 }
 
 }  // namespace
