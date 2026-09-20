@@ -80,9 +80,7 @@ public:
      * node E will depend on.
      */
     static bool result_read_ok(const DeviceRunnerBase &runner, uint32_t pipeline_slot, uint64_t run_epoch) {
-        return pipeline_slot < runner.device_run_result_read_epochs_.size() &&
-               runner.device_run_result_read_epochs_[pipeline_slot] == run_epoch &&
-               runner.device_run_result_read_ok_[pipeline_slot];
+        return runner.device_run_result_reads_.state(pipeline_slot, run_epoch) == RunRecordRead::Ok;
     }
 
     /**

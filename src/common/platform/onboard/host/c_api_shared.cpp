@@ -844,41 +844,62 @@ int supports_concurrent_native_prepare_ctx(DeviceContextHandle ctx) {
 }
 
 /**
- * Compare the run's device-published terminal record against the channel that
- * still decides the run — the stream synchronize behind `execution_rc`.
+ * Assemble what both of this run's evidence channels observed, without asking
+ * the device anything.
  *
- * The terminal record is being produced but is not yet trusted: #2267's normal
- * drain still synchronizes the whole stream pair, and the record may only take
- * that job over once it has been shown to agree. Running both and logging every
- * disagreement is what produces that evidence, so this reports and never
- * overrides. A run the record cannot decide is not a disagreement — the
- * producers that publish nothing on a path are exactly what the audit is for,
- * and the reason names which path it was.
+ * The boundary half is the observation the run's own drain or poll retained,
+ * not a fresh poll: by the time this runs, that drain's cleanup has retired the
+ * fence's arming, so a poll would answer `Error` about the fence rather than
+ * about the run. The record half is the cached copy `read_device_run_result`
+ * already took, with its read status, so a failed copy stays distinguishable
+ * from a read never attempted. Neither half asks the device anything.
+ */
+static RunOutcomeEvidence collect_run_evidence(const OnboardNativeRunContext *state) {
+    RunOutcomeEvidence evidence;
+    evidence.boundaries = state->runner->observed_run_boundaries(state->identity());
+    evidence.record_read =
+        state->runner->device_run_result_read_status(state->descriptor.pipeline_slot, state->descriptor.run_epoch);
+    evidence.terminal =
+        state->runner->device_run_terminal(state->descriptor.pipeline_slot, state->descriptor.run_epoch);
+    return evidence;
+}
+
+/**
+ * Compare what the shared decision rule makes of this run against the channel
+ * that still decides it — the stream synchronize behind `execution_rc`.
+ *
+ * The rule is `decide_run_execution`, the same one a promotion would put in
+ * charge; running it here is what produces the evidence that it agrees. It
+ * reports and never overrides: `execution_rc` is unchanged by this function and
+ * by everything it calls. A run the rule cannot decide is not a disagreement —
+ * the producers that publish nothing on a path are exactly what the audit is
+ * for, and the reason names which path it was.
  */
 static void report_terminal_disagreement(const OnboardNativeRunContext *state, int execution_rc) {
-    const DeviceRunTerminal terminal =
-        state->runner->device_run_terminal(state->descriptor.pipeline_slot, state->descriptor.run_epoch);
-    switch (terminal.state) {
-    case DeviceRunTerminalState::Succeeded:
+    const RunExecutionOutcome outcome = decide_run_execution(collect_run_evidence(state));
+    switch (outcome.state) {
+    case RunExecutionState::Succeeded:
         if (execution_rc != 0) {
             LOG_ERROR(
-                "run terminal disagreement: device published success, execution reported %d (%s)", execution_rc,
+                "run terminal disagreement: the record decides success, execution reported %d (%s)", execution_rc,
                 state->trace_attrs
             );
         }
         break;
-    case DeviceRunTerminalState::Failed:
+    case RunExecutionState::Failed:
         if (execution_rc == 0) {
             LOG_ERROR(
-                "run terminal disagreement: device published failure code %d (source %u), execution reported "
+                "run terminal disagreement: the record decides failure code %d (source %u), execution reported "
                 "success (%s)",
-                terminal.code, static_cast<unsigned>(terminal.source), state->trace_attrs
+                outcome.code, static_cast<unsigned>(outcome.source), state->trace_attrs
             );
         }
         break;
-    case DeviceRunTerminalState::Undecided:
+    case RunExecutionState::Pending:
+    case RunExecutionState::Undecided:
         LOG_INFO(
-            "run terminal undecided: %s; execution reported %d (%s)", terminal.reason, execution_rc, state->trace_attrs
+            "run outcome %s: %s; execution reported %d (%s)", run_execution_state_name(outcome.state),
+            outcome.reason != nullptr ? outcome.reason : "no reason given", execution_rc, state->trace_attrs
         );
         break;
     }

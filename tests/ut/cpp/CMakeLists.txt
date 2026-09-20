@@ -1225,6 +1225,20 @@ target_link_libraries(test_run_outcome_decision PRIVATE ${GTEST_MAIN_LIB} ${GTES
 add_test(NAME test_run_outcome_decision COMMAND test_run_outcome_decision)
 set_tests_properties(test_run_outcome_decision PROPERTIES LABELS "no_hardware")
 
+# The evidence the shadow consumer assembles before it calls that rule: the
+# drain and poll capture seams driven against a real completion fence, and the
+# record read's three states driven through its own bookkeeping.
+add_executable(test_run_shadow_consumer_evidence common/test_run_shadow_consumer_evidence.cpp)
+target_include_directories(test_run_shadow_consumer_evidence PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+)
+target_link_libraries(test_run_shadow_consumer_evidence PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_run_shadow_consumer_evidence COMMAND test_run_shadow_consumer_evidence)
+set_tests_properties(test_run_shadow_consumer_evidence PROPERTIES LABELS "no_hardware")
+
 function(add_pmu_collector_test name platform)
     add_executable(${name}
         common/test_pmu_collector.cpp

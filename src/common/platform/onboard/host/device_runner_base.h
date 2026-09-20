@@ -77,7 +77,9 @@
 #include "host/kernel_execution_state.h"
 #include "host/memory_allocator.h"
 #include "host/pmu_collector.h"
+#include "host/run_evidence_retention.h"
 #include "host/run_completion_fence.h"
+#include "host/run_outcome_decision.h"
 #include "host/runtime_timeout_config.h"
 #include "host/scope_stats_collector.h"
 #include "host/args_dump_collector.h"
@@ -571,7 +573,7 @@ public:
      *
      * Leaves the host copy empty when there is no region or the copy fails; a
      * failed copy is recorded as such, so it reads as undecided rather than as
-     * an absent record.
+     * an absent record, and a slot with no region records no attempt at all.
      */
     void read_device_run_result(uint32_t pipeline_slot, uint64_t run_epoch);
 
@@ -586,6 +588,27 @@ public:
      * run's completion boundaries and its outstanding wait references.
      */
     DeviceRunTerminal device_run_terminal(uint32_t pipeline_slot, uint64_t run_epoch) const;
+
+    /**
+     * Which of the three read states this slot holds for `run_epoch`.
+     *
+     * The three answers are distinct evidence, which is why the caller gets
+     * them rather than a bool: a read that never happened, a copy that failed,
+     * and a copy that succeeded onto a region no run published into all leave
+     * the same empty bytes behind. A slot holding no region is the first of
+     * those, not the second — nothing was copied, so nothing was lost.
+     */
+    RunRecordRead device_run_result_read_status(uint32_t pipeline_slot, uint64_t run_epoch) const;
+
+    /**
+     * The boundary completion this run's own drain or poll observed, or
+     * `Pending` when none did.
+     *
+     * Retained from the observation rather than re-derived: by the time a
+     * caller asks, the drain's cleanup has retired the fence's arming, so the
+     * fence can no longer answer for this run. Reads no device state.
+     */
+    RunCompletionFence::Completion observed_run_boundaries(const NativeRunIdentity &identity) const;
 
     /**
      * Consume every notification reported since this runner last looked, and
@@ -1958,13 +1981,16 @@ protected:
     // gated on diagnostics — an error result must survive with capture off.
     std::array<void *, PTO_PIPELINE_MAX_DEPTH> device_run_result_dev_ptrs_{};
     std::array<DeviceRunResultRegion, PTO_PIPELINE_MAX_DEPTH> device_run_results_{};
-    // The epoch the cached copy was read for, and whether that read succeeded.
-    // Together they make the read once-per-run and keep a failed copy
-    // distinguishable from a region no run published into: an empty copy read
-    // successfully is an absent record, an empty copy left by a failed D2H is
-    // no observation at all.
-    std::array<uint64_t, PTO_PIPELINE_MAX_DEPTH> device_run_result_read_epochs_{};
-    std::array<bool, PTO_PIPELINE_MAX_DEPTH> device_run_result_read_ok_{};
+    // Which run each cached copy was read for, and what that read left behind.
+    // Together they make the read once-per-run and keep the three read states
+    // apart: an empty copy read successfully is an absent record, an empty copy
+    // left by a failed D2H is no observation at all, and a slot with no region
+    // attempted no copy to lose.
+    RunRecordReadLedgerT<PTO_PIPELINE_MAX_DEPTH> device_run_result_reads_;
+    // The boundary completion each run's own drain or poll observed, retained
+    // because the drain's cleanup retires the fence that could otherwise be
+    // asked. See host/run_evidence_retention.h.
+    RunBoundaryLedgerT<PTO_PIPELINE_MAX_DEPTH> run_boundaries_observed_;
     // Whether a slot's region has had `published` zeroed since it was
     // allocated. `allocate_tensor` is an `rtMalloc`, so a fresh region holds
     // whatever the device left there — which cannot be assumed to differ from

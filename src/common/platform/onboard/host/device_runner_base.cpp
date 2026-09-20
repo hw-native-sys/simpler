@@ -2061,8 +2061,7 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     }
     device_run_results_.fill(DeviceRunResultRegion{});
     device_run_result_initialized_.fill(false);
-    device_run_result_read_epochs_.fill(0);
-    device_run_result_read_ok_.fill(false);
+    device_run_result_reads_.reset();
 
     // The AICore register-address tables are device constants committed once per
     // device context, so this is where they are returned — same window and same
@@ -2323,27 +2322,32 @@ uint64_t DeviceRunnerBase::arm_chip_swimlane_run_terminal_bank(uint32_t pipeline
 
 void DeviceRunnerBase::read_device_run_result(uint32_t pipeline_slot, uint64_t run_epoch) {
     if (pipeline_slot >= device_run_results_.size()) return;
-    // One read per run: later consumers share the first read's bytes. A retry
-    // would either cost a second D2H for the same answer or, after a device
-    // recovery, sample a generation this run never wrote.
-    if (run_epoch != 0 && device_run_result_read_epochs_[pipeline_slot] == run_epoch) return;
-    DeviceRunResultRegion &out = device_run_results_[pipeline_slot];
-    out = DeviceRunResultRegion{};
-    device_run_result_read_epochs_[pipeline_slot] = run_epoch;
-    device_run_result_read_ok_[pipeline_slot] = false;
-    void *slot_ptr = device_run_result_dev_ptrs_[pipeline_slot];
-    if (slot_ptr == nullptr) return;
     // The region is this slot's, and the slot is not handed to another run until
     // the run holding it finalizes, so this read races nothing. What makes the
     // record this run's rather than a successor's is that its device side wrote
     // and published it before its kernel returned.
-    int rc = rtMemcpy(&out, sizeof(out), slot_ptr, sizeof(out), RT_MEMCPY_DEVICE_TO_HOST);
-    if (rc != 0) {
-        LOG_WARN("rtMemcpy(run_result) D2H failed: %d", rc);
-        out = DeviceRunResultRegion{};
-        return;
-    }
-    device_run_result_read_ok_[pipeline_slot] = true;
+    device_run_result_reads_.read(
+        pipeline_slot, run_epoch, device_run_results_[pipeline_slot], device_run_result_dev_ptrs_[pipeline_slot],
+        [](void *dst, const void *src) {
+            int rc = rtMemcpy(
+                dst, sizeof(DeviceRunResultRegion), src, sizeof(DeviceRunResultRegion), RT_MEMCPY_DEVICE_TO_HOST
+            );
+            if (rc != 0) {
+                LOG_WARN("rtMemcpy(run_result) D2H failed: %d", rc);
+                return false;
+            }
+            return true;
+        }
+    );
+}
+
+RunRecordRead DeviceRunnerBase::device_run_result_read_status(uint32_t pipeline_slot, uint64_t run_epoch) const {
+    if (pipeline_slot >= device_run_results_.size()) return RunRecordRead::NotAttempted;
+    return device_run_result_reads_.state(pipeline_slot, run_epoch);
+}
+
+RunCompletionFence::Completion DeviceRunnerBase::observed_run_boundaries(const NativeRunIdentity &identity) const {
+    return run_boundaries_observed_.observed(identity);
 }
 
 DeviceRunTerminal DeviceRunnerBase::device_run_terminal(uint32_t pipeline_slot, uint64_t run_epoch) const {
@@ -2356,13 +2360,15 @@ DeviceRunTerminal DeviceRunnerBase::device_run_terminal(uint32_t pipeline_slot, 
         undecided.reason = "pipeline slot out of range";
         return undecided;
     }
-    if (device_run_result_read_epochs_[pipeline_slot] != run_epoch) {
+    switch (device_run_result_reads_.state(pipeline_slot, run_epoch)) {
+    case RunRecordRead::NotAttempted:
         undecided.reason = "no read taken for this run";
         return undecided;
-    }
-    if (!device_run_result_read_ok_[pipeline_slot]) {
+    case RunRecordRead::Failed:
         undecided.reason = "result read-back failed";
         return undecided;
+    case RunRecordRead::Ok:
+        break;
     }
     return device_run_result_terminal(device_run_results_[pipeline_slot], run_epoch);
 }
@@ -2569,7 +2575,9 @@ int DeviceRunnerBase::record_run_boundary(
 int DeviceRunnerBase::poll_run_fence(
     const PreparedExecution &prepared, rtStream_t aicpu_stream, rtStream_t aicore_stream
 ) {
-    switch (run_fence(prepared.pipeline_slot).poll(prepared.identity)) {
+    const RunCompletionFence::Completion completion =
+        poll_and_retain_run_boundaries(run_fence(prepared.pipeline_slot), run_boundaries_observed_, prepared.identity);
+    switch (completion) {
     case RunCompletionFence::Completion::Complete:
         // Boundaries prove the kernels exited; the streams carry the device's
         // verdict on them, which a completed run still has to be asked for.
@@ -2588,8 +2596,11 @@ int DeviceRunnerBase::poll_run_fence(
 int DeviceRunnerBase::wait_run_fence(
     const PreparedExecution &prepared, rtStream_t aicpu_stream, rtStream_t aicore_stream
 ) {
-    RunCompletionFence &fence = run_fence(prepared.pipeline_slot);
-    if (!fence.fenced(prepared.identity)) {
+    const RunBoundaryWait observed = wait_and_retain_run_boundaries(
+        run_fence(prepared.pipeline_slot), run_boundaries_observed_, prepared.identity,
+        timeout_config_.stream_sync_timeout_ms
+    );
+    if (observed.completion == RunCompletionFence::Completion::Unfenced) {
         LOG_WARN(
             "wait_run_fence: slot %u holds submitted work no boundary covers; falling back to the bounded "
             "whole-stream wait",
@@ -2599,7 +2610,7 @@ int DeviceRunnerBase::wait_run_fence(
     }
 
     LOG_INFO("=== aclrtSynchronizeEventWithTimeout run completion boundaries ===");
-    int rc = fence.wait(prepared.identity, timeout_config_.stream_sync_timeout_ms);
+    int rc = observed.rc;
     if (rc == ACL_ERROR_RT_EVENT_SYNC_TIMEOUT) {
         LOG_ERROR(
             "Run fence wait timeout: timeout_ms=%d device_id=%d block_dim=%d slot=%u",
