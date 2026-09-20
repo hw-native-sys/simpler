@@ -470,6 +470,31 @@ def _local_task_frame_count(platform: str, _runtime: str, pipeline_depth: int) -
     return 1
 
 
+# `Orchestrator::configure_pipeline_depth` takes the budget as a uint32_t.
+_PENDING_RUN_DEPTH_MAX = 2**32 - 1
+
+
+def _validated_pending_run_depth(config: dict, level: int) -> int:
+    """This Worker's `pending_run_depth`, validated before any startup side effect.
+
+    A level < 3 Worker owns no admission FIFO — its runs are the chip child's — so the key is
+    refused there rather than silently ignored.
+    """
+    if "pending_run_depth" not in config:
+        return 0
+    value = config["pending_run_depth"]
+    if level < 3:
+        raise ValueError(f"Worker pending_run_depth requires a level >= 3 Worker, got level {level}")
+    # bool is an int subclass, and True would silently mean depth one.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"Worker pending_run_depth must be an int, got {type(value).__name__}")
+    if value < 0:
+        raise ValueError(f"Worker pending_run_depth must be >= 0, got {value}")
+    if value > _PENDING_RUN_DEPTH_MAX:
+        raise ValueError(f"Worker pending_run_depth must be <= {_PENDING_RUN_DEPTH_MAX}, got {value}")
+    return value
+
+
 def _shm_name(token: str, suffix: str):
     """Deterministic POSIX shm name from the root token and a per-child suffix.
     Returns None (random name) when token is empty. Truncates the token to
@@ -4733,6 +4758,10 @@ class Worker:
         self._startup_timeout_s = float(config.get("startup_timeout_s", _STARTUP_TIMEOUT_S))
         if not (self._startup_timeout_s > 0 and math.isfinite(self._startup_timeout_s)):
             raise ValueError("Worker startup_timeout_s must be a positive finite number of seconds")
+        # Bounds non-terminal logical runs in this Worker's admission FIFO. 0 derives the bound
+        # from the negotiated direct-chip pipeline depth. The cap is a run count: it is not a
+        # memory budget, and a terminal run whose RunHandle is unreleased does not occupy it.
+        self._pending_run_depth = _validated_pending_run_depth(config, int(level))
         # Per-startup bookkeeping consumed by the rollback path: PIDs the barrier
         # already reaped (must not be re-SIGKILLed — the PID may be reused) and
         # PIDs that reached their serve loop (READY → asked to close gracefully
@@ -8291,7 +8320,9 @@ class Worker:
         # the unified mailbox.
         dw = self._worker
         assert dw is not None
-        dw.configure_pipeline_depth(direct_chip_pipeline_depth)
+        # `direct_chip_pipeline_depth` is the native pipeline-slot capability; `_pending_run_depth`
+        # is this Worker's logical admission bound, with 0 deriving it from the first.
+        dw.configure_pipeline_depth(direct_chip_pipeline_depth, self._pending_run_depth)
 
         # Register chip workers as NEXT_LEVEL (L3). The child pid lets the C++
         # endpoint fail a dispatch whose child died instead of spinning on a

@@ -552,11 +552,15 @@ def test_start_hierarchical_passes_each_chip_its_negotiated_frame_count(monkeypa
     class FakeParentWorker:
         def __init__(self) -> None:
             self.configured_depths: list[int] = []
+            self.configured_pending_depths: list[int] = []
             self.next_level_calls: list[tuple[int, int, int]] = []
             self.initialized = False
 
-        def configure_pipeline_depth(self, depth: int) -> None:
+        def configure_pipeline_depth(self, depth: int, pending_depth: int = 0) -> None:
+            # Two budgets: the negotiated native pipeline-slot depth, and the
+            # logical admission cap that defaults to deriving from it.
             self.configured_depths.append(int(depth))
+            self.configured_pending_depths.append(int(pending_depth))
 
         def add_next_level_worker(self, mailbox_addr: int, pid: int, task_frame_count: int) -> None:
             self.next_level_calls.append((int(mailbox_addr), int(pid), int(task_frame_count)))
@@ -612,6 +616,7 @@ def test_start_hierarchical_passes_each_chip_its_negotiated_frame_count(monkeypa
             shm.unlink()
 
     assert fake_parent.configured_depths == [1]
+    assert fake_parent.configured_pending_depths == [0]
     assert [call[1:] for call in fake_parent.next_level_calls] == [(12001, 2), (12002, 1)]
     assert fake_parent.initialized
     assert startup_events[0] == ("log", 60, True)
@@ -631,7 +636,7 @@ def test_start_hierarchical_seeds_the_logger_when_the_process_owns_no_chips(monk
             self.initialized = False
             self.sub_workers: list[int] = []
 
-        def configure_pipeline_depth(self, depth: int) -> None:
+        def configure_pipeline_depth(self, depth: int, pending_depth: int = 0) -> None:
             pass
 
         def add_sub_worker(self, _mailbox_addr: int, pid: int) -> None:

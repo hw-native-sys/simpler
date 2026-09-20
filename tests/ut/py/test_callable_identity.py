@@ -605,8 +605,9 @@ def test_remote_worker_id_stays_stable_when_local_worker_is_added_later(monkeypa
         def add_next_level_worker_at(self, *args):
             pass
 
-        def configure_pipeline_depth(self, depth):
+        def configure_pipeline_depth(self, depth, pending_depth=0):
             self.pipeline_depth = depth
+            self.pending_run_depth = pending_depth
 
         def init(self):
             pass

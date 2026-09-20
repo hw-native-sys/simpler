@@ -429,7 +429,9 @@ inline void bind_worker(nb::module_ &m) {
         )
         .def(
             "configure_pipeline_depth", &Worker::configure_pipeline_depth, nb::arg("depth"),
-            "Set run admission depth from the minimum direct-chip runtime capability before init."
+            nb::arg("pending_depth") = 0,
+            "Set run admission depth from the minimum direct-chip runtime capability before init. "
+            "`pending_depth` bounds non-terminal logical runs instead, and 0 derives it from `depth`."
         )
         .def(
             "add_sub_worker",

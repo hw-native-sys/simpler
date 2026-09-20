@@ -336,22 +336,46 @@ interleave with another run even when both graphs contain ready tasks. TensorMap
 keys remain `(run_id, tensor_key)`, so adjacent runs may reuse the same tensor
 address without creating cross-run dependencies.
 
-The terminal transition releases the reservation and lease exactly once,
-wakes whichever submission was blocked on capacity, and activates the next prepared run. Empty
-runs take the same transition immediately. If graph construction fails, every
-unstarted slot is poisoned and consumed, its ready-queue partition is erased,
-and the lease is returned without dispatching device work.
+The terminal transition releases the reservation exactly once, returns the
+lease if the run actually held one, wakes whichever submission was blocked on
+admission capacity, and re-lends the freed slot before activating the next
+prepared run. Empty runs take the same transition immediately. If graph
+construction fails, every unstarted slot is poisoned and consumed, its
+ready-queue partition is erased, and any lease the run held is returned without
+dispatching device work — a run that never reached an active or preparable role
+holds none and returns none.
 
 Each direct chip child publishes its runtime contract's `pipeline_depth` in
-the startup mailbox before `INIT_READY`. The parent configures admission to the
-minimum published depth. Backends without a depth-two contract therefore keep
-depth-one serial behavior instead of receiving an invalid slot-1 lease.
+the startup mailbox before `INIT_READY`. The parent configures the native
+pipeline-slot lease pool to the minimum published depth. Backends without a
+depth-two contract therefore keep depth-one serial behavior instead of
+receiving an invalid slot-1 lease.
 
-Whole-run admission decides when a slot may be leased and carries the lease
-from `TaskSlot` through the chip mailbox into the runtime slot, so a production
-run executes under the lease its run holds rather than unconditionally on slot
-0. The scheduler dispatches device work only for the run that holds the FIFO
-head and still owns its lease.
+Logical admission and that lease pool are separate budgets. `begin_run` admits
+a run against the admission FIFO's own capacity and gives it no lease; the
+lease is handed to the two roles that can use one — the FIFO head and the first
+eligible preparable successor — when a run reaches that role. A run that has
+not reached one carries the reserved invalid lease encoding
+(`generation == 0`), which is neither dispatchable nor preparable. The FIFO
+bound is `Worker(pending_run_depth=...)` on a level >= 3 Worker; zero, the
+default, derives it from the native depth, so an unconfigured Worker admits
+exactly what it did when the two budgets were one. A positive value below the
+native depth is legal and simply leaves the successor role unfillable, since
+that role needs a second FIFO entry to exist.
+
+`pending_run_depth` bounds the count of non-terminal runs and nothing else. It
+is not a byte budget — the task-slot ring still limits slots and heap bytes
+during submission, waiting and then timing out on its own terms — and it does
+not bound a terminal run whose `RunHandle` the caller has not released, since a
+run leaves the FIFO at retirement rather than at release.
+
+Whole-run admission carries the lease from `TaskSlot` through the chip mailbox
+into the runtime slot, so a production run executes under the lease its run
+holds rather than unconditionally on slot 0. Slots a run registered before it
+acquired a lease are restamped when it does, which is what keeps both the
+`TASK_READY` and `PREPARE_READY` dispatch identities valid. The scheduler
+dispatches device work only for the run that holds the FIFO head and still owns
+its lease.
 
 The L2 host-runtime boundary exposes `prepare -> launch -> poll/wait ->
 finalize`, and the existing `simpler_run` / `ChipWorker.run` surface is the
