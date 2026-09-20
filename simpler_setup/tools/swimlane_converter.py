@@ -1612,7 +1612,16 @@ def build_overhead_counter_events(tasks, deps_edges, pid=2):  # noqa: PLR0912
     return events
 
 
-def _generate_launch_trace(tasks, run_boundaries, output_path, options):  # noqa: PLR0912
+def _remap_trace_ids(events, namespace, id_map):
+    # Perfetto flow IDs are numeric; id and bind_id share the same mapping.
+    for event in events:
+        for field in ("id", "bind_id"):
+            if field in event:
+                key = (namespace, event[field])
+                event[field] = id_map.setdefault(key, len(id_map))
+
+
+def _generate_launch_trace(tasks, run_boundaries, output_path, options):
     launches = {boundary["launch_epoch"]: {"tasks": []} for boundary in run_boundaries}
     for task in tasks:
         launches[task["launch_epoch"]]["tasks"].append(task)
@@ -1630,9 +1639,11 @@ def _generate_launch_trace(tasks, run_boundaries, output_path, options):  # noqa
 
     events = [{"ph": "M", "name": "process_name", "pid": 7, "args": {"name": "Kernel Launches"}}]
     metadata_seen = set()
+    trace_ids = {}
     for boundary in run_boundaries:
         epoch = boundary["launch_epoch"]
         trace = generate_chrome_trace_json(output_path=None, **launches[epoch], **options)
+        _remap_trace_ids(trace["traceEvents"], epoch, trace_ids)
         end = boundary["start_time_us"]
         for event in trace["traceEvents"]:
             if event.get("ph") == "M":
@@ -1644,9 +1655,6 @@ def _generate_launch_trace(tasks, run_boundaries, output_path, options):  # noqa
                 end = max(end, event.get("ts", end) + event.get("dur", 0))
                 if event.get("ph") != "C":
                     event.setdefault("args", {})["launch_epoch"] = epoch
-                for field in ("id", "bind_id"):
-                    if field in event:
-                        event[field] = f"launch{epoch}:{event[field]}"
             events.append(event)
         events.append(
             {
@@ -4099,10 +4107,11 @@ def _load_rank_local_artifacts(records_path):
     }
 
 
-def _namespace_rank_trace(trace, rank, slack_ns):
+def _namespace_rank_trace(trace, rank, slack_ns, *, trace_ids):
     # One stride above the Host block, so `rank0 / Worker View` still sorts
     # below every Rank's placement window.
     pid_base = (rank + 1) * _RANK_PID_STRIDE
+    _remap_trace_ids(trace.get("traceEvents", []), rank, trace_ids)
     for event in trace.get("traceEvents", []):
         if "pid" in event:
             # Every single-Rank view pid must fit inside one stride, or two Ranks
@@ -4119,9 +4128,6 @@ def _namespace_rank_trace(trace, rank, slack_ns):
             # Mirrors the pid, which is what actually orders the groups.
             sort_index = int(event.get("args", {}).get("sort_index", 0))
             event["args"]["sort_index"] = pid_base + sort_index
-        for id_field in ("id", "bind_id"):
-            if id_field in event:
-                event[id_field] = f"r{rank}:{event[id_field]}"
         # Perfetto treats every counter arg as a separate numeric series. Rank
         # identity is already encoded in the PID, so adding it to ``ph: C``
         # would create a bogus constant counter alongside the real values.
@@ -4203,6 +4209,7 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
     global_origin_ns = min([window_lo] + [span.ts for span in dispatcher_spans])
     all_events = _dispatcher_block_events(dispatcher_spans, global_origin_ns)
     rank_metadata = []
+    trace_ids = {}
     for rank, records_path in rank_inputs:
         placement = placements[rank]
         data = _decode_perf_data(raw_inputs[rank], timeline_origin_ns=global_origin_ns, placement=placement)
@@ -4228,7 +4235,7 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
             deps_block_map=artifacts["deps_block_map"],
             emit_overhead=args.overhead,
         )
-        _namespace_rank_trace(trace, rank, int(round(placement.slack_ns)))
+        _namespace_rank_trace(trace, rank, int(round(placement.slack_ns)), trace_ids=trace_ids)
         all_events.extend(trace["traceEvents"])
         invocation = spans_by_invocation[(placement.host.pid, placement.host.inv)]
         all_events.extend(

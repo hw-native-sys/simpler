@@ -239,6 +239,8 @@ dependency arrows, SPMD grouping and `--overhead` calculations stay within it.
 All launches retain their spacing on one device timeline. The **Kernel Launches**
 track labels each epoch; its bar ends at the last observed record, not at a
 measured launch-completion timestamp. Event details include `launch_epoch`.
+Flow IDs and slice bindings use integer IDs unique across launches and Ranks
+so Perfetto retains the dependency arrows when importing the trace.
 The supplied `deps.json` topology and name mapping apply to every launch;
 capture different workloads in separate windows when their mappings differ.
 

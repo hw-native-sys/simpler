@@ -46,6 +46,23 @@ def _kernel_launch_capture(level=4):
     return data
 
 
+def _assert_perfetto_flow_ids(events):
+    slice_ids = {event["id"] for event in events if event.get("ph") == "X" and "id" in event}
+    flow_scopes = {}
+    for event in events:
+        for field in ("id", "bind_id"):
+            if field in event:
+                assert type(event[field]) is int
+                assert 0 <= event[field] < 2**53
+        if "bind_id" in event:
+            assert event["bind_id"] in slice_ids
+        if event.get("ph") in ("s", "t", "f"):
+            args = event.get("args", {})
+            scope = (args.get("rank"), args.get("launch_epoch"))
+            assert flow_scopes.setdefault(event["id"], scope) == scope
+    assert flow_scopes
+
+
 @pytest.mark.parametrize("level", [1, 2, 3, 4])
 def test_kernel_launch_rounds_reuse_task_and_register_ids(level):
     data = sc._decode_perf_data(_kernel_launch_capture(level))
@@ -60,6 +77,7 @@ def test_kernel_launch_rounds_reuse_task_and_register_ids(level):
         deps_edges={0: [1]},
     )
     events = trace["traceEvents"]
+    _assert_perfetto_flow_ids(events)
     launches = [event for event in events if event.get("cat") == "kernel_launch"]
     assert [event["args"]["launch_epoch"] for event in launches] == [0, 1]
     assert [event["ts"] for event in launches] == [0, 100]
@@ -157,6 +175,29 @@ def test_kernel_launch_single_run_consumers_reject_combined_timing(tmp_path, cap
     assert "multiple launches" in capsys.readouterr().err
     assert deps_viewer._load_task_meta(deps) == {}
     assert "multiple launches" in capsys.readouterr().err
+
+
+def test_rank_namespace_preserves_numeric_launch_flows():
+    data = sc._decode_perf_data(_kernel_launch_capture())
+    events = []
+    trace_ids = {}
+    for rank in (0, 1):
+        trace = sc.generate_chrome_trace_json(
+            data["tasks"], None, run_boundaries=data["run_boundaries"], deps_edges={0: [1]}
+        )
+        sc._namespace_rank_trace(trace, rank, 0, trace_ids=trace_ids)
+        events.extend(trace["traceEvents"])
+    _assert_perfetto_flow_ids(events)
+    starts = [event for event in events if event.get("ph") == "s"]
+    finishes = [event for event in events if event.get("ph") == "f"]
+    assert {event["id"] for event in starts} == {event["id"] for event in finishes}
+    assert len({event["id"] for event in starts}) == len(starts)
+    assert {(event["args"]["rank"], event["args"]["launch_epoch"]) for event in starts} == {
+        (0, 0),
+        (0, 1),
+        (1, 0),
+        (1, 1),
+    }
 
 
 def _containment_placement(document, *, runner_start_ns=1_000, runner_dur_ns=5_000, wall_ns=2_000, sched=(700, 100)):
@@ -380,6 +421,7 @@ def test_l3_directory_merge_uses_common_host_origin_and_rank_namespaces(tmp_path
     assert output_path == output
     assert [item["rank"] for item in rank_metadata] == [0, 1]
     trace = json.loads(output.read_text())
+    _assert_perfetto_flow_ids(trace["traceEvents"])
     # The axis starts at the earliest window any Rank can have begun in, and
     # each Rank is drawn at the earliest position its own window allows.
     assert trace["metadata"]["global_origin_ns"] == 1_000
@@ -668,7 +710,7 @@ def test_rank_namespace_does_not_turn_rank_into_a_counter_series():
         ]
     }
 
-    sc._namespace_rank_trace(trace, 2, 6_000)
+    sc._namespace_rank_trace(trace, 2, 6_000, trace_ids={})
 
     counter, task = trace["traceEvents"]
     # Rank 2's views land in the third Chip stride: the first is reserved for
@@ -683,7 +725,7 @@ def test_rank_namespace_rejects_a_view_pid_wider_than_the_stride():
     trace = {"traceEvents": [{"ph": "X", "pid": sc._RANK_PID_STRIDE, "tid": 1, "args": {}}]}
 
     with pytest.raises(ValueError, match="does not fit the per-Rank stride"):
-        sc._namespace_rank_trace(trace, 1, 6_000)
+        sc._namespace_rank_trace(trace, 1, 6_000, trace_ids={})
 
 
 def test_l3_directory_merge_rejects_ranks_from_different_host_clocks(tmp_path, capsys):
