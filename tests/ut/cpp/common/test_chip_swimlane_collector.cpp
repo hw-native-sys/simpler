@@ -1100,3 +1100,79 @@ TEST_F(ChipSwimlaneExportIdentityTest, EveryAicoreRowIsSevenColumnsEndingInItsEp
     EXPECT_EQ(rows, 2u) << "expected one row per dispatch";
     EXPECT_EQ(count_occurrences(section, ", 11]"), 2u) << "a row carries an epoch other than its run's";
 }
+
+// ---------------------------------------------------------------------------
+// Level escalation across runs
+// ---------------------------------------------------------------------------
+//
+// initialize() decides whether a device orch-phase pool exists from the level of
+// the run that first builds the pools, and early-returns on every later call
+// while the region is held. begin_run() then publishes an arbitrary per-run level
+// to the header the device obeys. A run that escalates the level past ORCH_PHASES
+// must not end up asking the device for phases the pool cannot hold.
+
+namespace {
+
+// The orch pool is stocked when init put buffers in its free_queue. `tail` is
+// host-written at seeding time, so a non-zero tail means "this pool can serve
+// the device" and zero means "it has nothing".
+uint32_t orch_pool_depth(ChipSwimlaneCollector &collector) {
+    void *shm = collector.manager().shared_mem_host();
+    if (shm == nullptr) return 0;
+    return get_orch_phase_buffer_state(shm, 0)->free_queue.tail;
+}
+
+uint32_t published_level(ChipSwimlaneCollector &collector) {
+    void *shm = collector.manager().shared_mem_host();
+    if (shm == nullptr) return 0;
+    return get_chip_swimlane_header(shm)->chip_swimlane_level;
+}
+
+}  // namespace
+
+// Positive control for the test below: initialized AT the orch level the pool is
+// stocked, so a zero depth there means the level and not the fixture.
+TEST(ChipSwimlaneLevelEscalationTest, InitializingAtOrchLevelStocksTheOrchPool) {
+    ChipSwimlaneCollector collector;
+    ASSERT_EQ(
+        collector.initialize(
+            /*num_aicore=*/1, /*aicpu_thread_num=*/1, /*device_id=*/0, ChipSwimlaneLevel::ORCH_PHASES,
+            swimlane_test_alloc, nullptr, swimlane_test_free
+        ),
+        0
+    );
+    collector.begin_run("orch", ChipSwimlaneLevel::ORCH_PHASES);
+
+    EXPECT_EQ(published_level(collector), static_cast<uint32_t>(ChipSwimlaneLevel::ORCH_PHASES));
+    EXPECT_GT(orch_pool_depth(collector), 0u);
+}
+
+TEST(ChipSwimlaneLevelEscalationTest, EscalatingTheLevelAfterInitKeepsTheOrchPoolUsable) {
+    ChipSwimlaneCollector collector;
+    ASSERT_EQ(
+        collector.initialize(
+            /*num_aicore=*/1, /*aicpu_thread_num=*/1, /*device_id=*/0, ChipSwimlaneLevel::SCHEDULE_TIMING,
+            swimlane_test_alloc, nullptr, swimlane_test_free
+        ),
+        0
+    );
+    collector.begin_run("first", ChipSwimlaneLevel::SCHEDULE_TIMING);
+    ASSERT_EQ(orch_pool_depth(collector), 0u);
+
+    // The runner arms every run the same way — initialize() with this run's
+    // level, then begin_run() — and initialize() returns early from the second
+    // one onwards because the region is already held.
+    ASSERT_EQ(
+        collector.initialize(
+            /*num_aicore=*/1, /*aicpu_thread_num=*/1, /*device_id=*/0, ChipSwimlaneLevel::ORCH_PHASES,
+            swimlane_test_alloc, nullptr, swimlane_test_free
+        ),
+        0
+    );
+    collector.begin_run("escalated", ChipSwimlaneLevel::ORCH_PHASES);
+
+    EXPECT_EQ(published_level(collector), static_cast<uint32_t>(ChipSwimlaneLevel::ORCH_PHASES));
+    EXPECT_GT(orch_pool_depth(collector), 0u);
+
+    collector.finalize(nullptr, swimlane_test_free);
+}

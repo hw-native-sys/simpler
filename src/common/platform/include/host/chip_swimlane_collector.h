@@ -732,6 +732,22 @@ private:
     void reset_collector_shards();
     void merge_collector_shards();
 
+    /**
+     * Give the device orch-phase pool its buffers when this run's level needs
+     * them and no earlier run built them.
+     *
+     * The pool's existence is the one thing initialize() derives from the level,
+     * and the level is the one part of a run's configuration that begin_run()
+     * re-publishes every run. Since initialize() returns early while the region
+     * is held, a run that escalates past ORCH_PHASES would otherwise publish a
+     * level the pool cannot serve and the device would emit nothing — no error,
+     * no reconcile gap, just an empty orch section.
+     *
+     * Idempotent, and a no-op below ORCH_PHASES or when the host orchestrator is
+     * this run's record source (it needs no device pool at any level).
+     */
+    int ensure_device_orch_pool(ChipSwimlaneLevel chip_swimlane_level);
+
     // Per-buffer-kind handlers used by on_buffer_collected.
     void copy_perf_buffer(const ReadyBufferInfo &info, int collector_shard);
     void copy_sched_phase_buffer(const ReadyBufferInfo &info, int collector_shard);

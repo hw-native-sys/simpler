@@ -114,10 +114,11 @@ int ChipSwimlaneCollector::initialize(
     const ChipSwimlaneFreeCallback &free_cb
 ) {
     if (shm_host_ != nullptr) {
-        // Already holding this run's device resources. They are not per-run:
-        // configuration arrives via begin_run() and the layout is fixed at
-        // compile time, so there is nothing here left to re-apply.
-        return 0;
+        // Already holding this run's device resources. They are not per-run,
+        // with one exception: the level decides whether a device orch-phase
+        // pool exists, and begin_run() re-publishes the level every run, so a
+        // run may ask for a level the pools were not built for.
+        return ensure_device_orch_pool(chip_swimlane_level);
     }
     chip_swimlane_level_ = chip_swimlane_level;
     if (num_aicore <= 0 || num_aicore > PLATFORM_MAX_CORES) {
@@ -501,6 +502,59 @@ size_t ChipSwimlaneCollector::normalize_collector_shard(int collector_shard) con
         return shard_count;
     }
     return static_cast<size_t>(collector_shard);
+}
+
+int ChipSwimlaneCollector::ensure_device_orch_pool(ChipSwimlaneLevel chip_swimlane_level) {
+    if (shm_host_ == nullptr) return 0;
+    if (chip_swimlane_level < ChipSwimlaneLevel::ORCH_PHASES || host_orchestrated_) return 0;
+
+    // Device-orchestrated level 4 uses one orch instance (pool 0). A non-zero
+    // tail is the host's own seeding mark, and nothing lowers it, so it reads
+    // "an earlier run already built this pool".
+    ChipSwimlaneAicpuTaskPool *state = get_orch_phase_buffer_state(shm_host_, 0);
+    if (state->free_queue.tail != 0) return 0;
+
+    constexpr size_t buffer_bytes = sizeof(ChipSwimlaneAicpuOrchPhaseBuffer);
+    constexpr int initial_free_count = (PLATFORM_PROF_ORCH_BUFFERS_PER_THREAD < PLATFORM_PROF_SLOT_COUNT) ?
+                                           PLATFORM_PROF_ORCH_BUFFERS_PER_THREAD :
+                                           PLATFORM_PROF_SLOT_COUNT;
+    // The surplus goes to the lane the orch pool's drain shard owns, matching
+    // where initialize() puts it when it builds this pool up front.
+    const int shard = (aicpu_thread_num_ > 0) ? (aicpu_thread_num_ - 1) : 0;
+    const int kind = static_cast<int>(ProfBufferType::AICPU_ORCH_PHASE);
+
+    for (int s = 0; s < PLATFORM_PROF_ORCH_BUFFERS_PER_THREAD; s++) {
+        void *host_buf_ptr = nullptr;
+        void *dev_buf_ptr = alloc_paired_buffer(buffer_bytes, &host_buf_ptr);
+        if (dev_buf_ptr == nullptr) {
+            LOG_ERROR(
+                "Failed to allocate orch phase buffer %d while raising the level to %d", s,
+                static_cast<int>(chip_swimlane_level)
+            );
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        reinterpret_cast<ChipSwimlaneAicpuOrchPhaseBuffer *>(host_buf_ptr)->count = 0;
+        if (s < initial_free_count) {
+            state->free_queue.buffer_ptrs[s] = reinterpret_cast<uint64_t>(dev_buf_ptr);
+        } else if (!manager_.push_recycled(kind, dev_buf_ptr, shard)) {
+            (void)manager_.retire_unqueued_buffer(kind, dev_buf_ptr, shard);
+        }
+    }
+
+    // Slots before tail, and each published on its own: the region-wide push in
+    // initialize() is not available here, because on a later run it would also
+    // roll back every device-written field the mirror has since advanced.
+    wmb();
+    publish_field(
+        &state->free_queue.buffer_ptrs[0], static_cast<size_t>(initial_free_count) * sizeof(uint64_t),
+        "orch free_queue slots"
+    );
+    state->free_queue.tail = static_cast<uint32_t>(initial_free_count);
+    wmb();
+    publish_field(&state->free_queue.tail, sizeof(state->free_queue.tail), "orch free_queue tail");
+
+    LOG_INFO("Built the device orch-phase pool on demand for level %d", static_cast<int>(chip_swimlane_level));
+    return 0;
 }
 
 void ChipSwimlaneCollector::reset_collector_shards() {
@@ -987,6 +1041,20 @@ void ChipSwimlaneCollector::publish_run_config() {
     // platforms copy_to_device is null and this is a no-op, because the store
     // above already landed in device-visible memory.
     publish_field(&header->chip_swimlane_level, sizeof(header->chip_swimlane_level), "chip_swimlane_level");
+
+    // A level the device orch pool cannot serve produces an empty orch section
+    // and nothing else: the run completes, no buffer is lost, and reconcile
+    // balances, so there is no other signal that the level did not take effect.
+    // initialize() builds the pool on demand for exactly this case, so reaching
+    // here unstocked means a caller armed the run without it.
+    if (chip_swimlane_level_ >= ChipSwimlaneLevel::ORCH_PHASES && !host_orchestrated_ &&
+        get_orch_phase_buffer_state(shm_host_, 0)->free_queue.tail == 0) {
+        LOG_ERROR(
+            "ChipSwimlane: published level %d with no device orch-phase pool; the device will emit no orchestrator "
+            "phases this run",
+            static_cast<int>(chip_swimlane_level_)
+        );
+    }
 
     // The pools' record counters are producer-side and never reset by the
     // device, so they carry the previous run's totals into this run's reconcile
