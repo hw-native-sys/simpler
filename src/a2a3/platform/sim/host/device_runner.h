@@ -90,6 +90,7 @@ private:
     void (*set_platform_regs_func_)(uint64_t){nullptr};
     void (*set_orch_device_id_func_)(int){nullptr};
     void (*set_scheduler_timeout_ms_func_)(int){nullptr};
+    void (*set_mix_preload_max_remaining_us_func_)(int){nullptr};
     void (*set_platform_dump_base_func_)(uint64_t){nullptr};
     void (*set_platform_phase_base_func_)(uint64_t){nullptr};
     void (*set_platform_run_result_func_)(uint64_t, uint64_t){nullptr};

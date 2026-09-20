@@ -17,6 +17,9 @@ namespace {
 // survives per-task launches because the inner SO stays dlopen'd.
 int g_orch_device_id = 0;
 int g_scheduler_timeout_ms = 0;
+// Mirrors the host-side default in runtime_timeout_config.h; the setter
+// overwrites it on every device init that carries the field.
+int g_mix_preload_max_remaining_us = 50;
 unsigned long long g_dma_workspace_addr[DMA_WORKSPACE_KIND_COUNT] = {0};
 }  // namespace
 
@@ -27,6 +30,10 @@ int get_orch_device_id() { return g_orch_device_id; }
 void set_scheduler_timeout_ms(int timeout_ms) { g_scheduler_timeout_ms = timeout_ms; }
 
 int get_scheduler_timeout_ms() { return g_scheduler_timeout_ms; }
+
+void set_mix_preload_max_remaining_us(int max_remaining_us) { g_mix_preload_max_remaining_us = max_remaining_us; }
+
+int get_mix_preload_max_remaining_us() { return g_mix_preload_max_remaining_us; }
 
 void set_dma_workspace_addr(int kind, unsigned long long addr) {
     if (kind < 0 || kind >= DMA_WORKSPACE_KIND_COUNT) return;

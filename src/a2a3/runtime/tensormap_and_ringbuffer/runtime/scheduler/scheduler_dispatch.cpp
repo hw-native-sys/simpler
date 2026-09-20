@@ -52,16 +52,6 @@ static_assert(sizeof(simpler::tmr::Tensor) == TASKPAYLOAD_TENSOR_STRIDE);
 
 namespace {
 inline constexpr int32_t DEFERRED_RELEASE_CAP = 256;
-
-// How much estimated work a MIX pending target may still have before the
-// pre-load is refused. A pre-load is a hardware commitment — the block leaves
-// the ready queue and is promoted on that cluster — so parking a short block
-// behind a long kernel delays it by up to that kernel's remainder while a
-// nearer cluster goes idle (simpler#2279: a ~30 us block waited 163-173 us
-// behind a just-started ~190 us kernel, and 30% of rounds carried a 40-140 us
-// tail from this). What the pre-load buys is the dispatch handshake it hides,
-// roughly 1 us, which is what this threshold balances against.
-inline constexpr uint64_t MIX_PRELOAD_MAX_REMAINING_CYCLES = PLATFORM_PROF_SYS_CNT_FREQ / 20'000;  // 50 us
 }  // namespace
 
 // The early-dispatch core bitmask (EARLY_DISPATCH_CORE_MASK_WORDS * 64 bits) must cover
@@ -109,6 +99,24 @@ bool SchedulerContext::mix_preload_target_is_near_free(int32_t thread_idx, int32
         tracker.get_aic_core_id(cluster_offset), tracker.get_aiv0_core_id(cluster_offset),
         tracker.get_aiv1_core_id(cluster_offset)
     };
+    // Ceiling from the runtime config (SIMPLER_MIX_PRELOAD_MAX_REMAINING_US,
+    // latched into the device config; 0 disables the gate). Read per call rather
+    // than hoisted: it is a resident global behind an extern "C" getter, which
+    // the compiler cannot hoist across the dispatch loop on its own.
+    //
+    // The gate exists because a pre-load is a hardware commitment — the block
+    // leaves the ready queue and is promoted on that cluster — so parking a
+    // short block behind a long kernel delays it by that kernel's remainder
+    // while a nearer cluster goes idle (simpler#2279: a ~30 us block waited
+    // 163-173 us behind a just-started ~190 us kernel, and 30% of rounds
+    // carried a 40-140 us tail). What the pre-load buys is the dispatch
+    // handshake it hides, roughly 1 us, which is what this ceiling balances
+    // against.
+    const int32_t max_remaining_us = get_mix_preload_max_remaining_us();
+    if (max_remaining_us <= 0) return true;
+    const uint64_t max_remaining_cycles =
+        static_cast<uint64_t>(max_remaining_us) * (PLATFORM_PROF_SYS_CNT_FREQ / 1'000'000);
+
     uint64_t worst_remaining = 0;
     for (int32_t core_id : cores) {
         const CoreExecState &core = core_exec_states_[core_id];
@@ -128,7 +136,7 @@ bool SchedulerContext::mix_preload_target_is_near_free(int32_t thread_idx, int32
     // cluster whose cores are all unmeasured therefore still pre-loads, which is
     // the previous behaviour, so a first execution (or a fresh program whose
     // kernels have no samples yet) is unaffected.
-    return worst_remaining < MIX_PRELOAD_MAX_REMAINING_CYCLES;
+    return worst_remaining < max_remaining_cycles;
 }
 
 int SchedulerContext::pop_ready_tasks_batch(
