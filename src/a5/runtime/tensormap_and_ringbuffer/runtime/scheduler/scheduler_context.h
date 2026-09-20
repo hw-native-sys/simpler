@@ -107,6 +107,12 @@ public:
     // Orchestrator threads (core_trackers_[thread_idx].core_num() == 0) are a no-op.
     int32_t shutdown(int32_t thread_idx);
 
+    // Hand a set of cores to the platform as one retirement group.
+    int32_t retire_cores(const int32_t *core_ids, int32_t core_num);
+
+    // Retire every handshake'd core.
+    int32_t retire_all_cores();
+
     // Run all post-orchestration scheduler bookkeeping:
     //  - publishes core assignments to the perf collector (SIMPLER_DFX)
     //  - latches submitted task count from shared memory

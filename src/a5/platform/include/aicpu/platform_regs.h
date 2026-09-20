@@ -127,10 +127,43 @@ void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value);
  */
 void platform_init_aicore_regs(uint64_t reg_addr);
 
+// Signal one core to exit, without waiting for its acknowledgement. The store is
+// posted -- the window is Device-nGnRE, see docs/hardware/mmio-performance.md --
+// so a caller signalling several cores owes one wmb() before it starts polling.
+void platform_signal_aicore_exit(uint64_t reg_addr);
+
+// One absolute timeout deadline shared by a group of exiting cores.
+uint64_t platform_aicore_exit_deadline();
+
+// Quiesce a core whose COND the caller has already observed as EXITED: dispatch
+// back to idle, with that posted store read back so it is complete. The readback
+// targets DATA_MAIN_BASE, the register just written: nR orders accesses within
+// one peripheral, and DATA_MAIN_BASE (0xD0) and COND (0x5108) do not share a
+// 4 KB granule, so a COND load would not order against this store. Issues no
+// fence of its own -- a caller closing several windows owes one rmb() after the
+// last call and before it publishes anything those closes must precede.
+void platform_close_aicore_window(uint64_t reg_addr);
+
+// Retires one exclusively-claimed set of cores: signal every member, collect
+// every ACK against one shared deadline, then close every acknowledged window.
+// Callers claim their targets first, so concurrent callers never name the same
+// core and the set need not be the whole chip. An unacknowledged core is not
+// closed and stays the host recovery path's responsibility.
+//
+// `released`, when non-null, receives one flag per target and lets the caller
+// name the cores it failed to retire; this layer takes no logging dependency.
+// Every path that returns fills those entries first, rejection included, so the
+// caller may read them without initializing the buffer; a `count` above
+// PLATFORM_MAX_CORES is rejected and only that many are filled.
+// Returns 0 when every target was closed, -1 on timeout or invalid targets.
+int32_t
+platform_retire_aicore_group(const uint64_t *reg_addrs, size_t count, uint64_t deadline, bool *released = nullptr);
+
 /**
- * Deinitialize AICore registers before termination
- *
- * This function sends exit signal and closes fast path control.
+ * Retire one AICore: signal it, wait for its acknowledgement, close its
+ * window. Equivalent to platform_retire_aicore_group over a single core;
+ * callers retiring several should use the group directly so they share one
+ * deadline and one sweep.
  *
  * @param reg_addr  Register base address of the AICore
  * @return 0 if the core acknowledged exit, non-zero on timeout
