@@ -74,6 +74,24 @@ public:
     );
 
     void drain();
+
+    /**
+     * Stop admitting runs, and finish every run that has not yet launched
+     * without launching it.
+     *
+     * For a caller that has established nothing further may reach the device —
+     * unknown device-resource ownership, say. The ordinary `close` cannot serve
+     * that: it drains, and a drain launches before it waits, so an activated
+     * prepared successor would be put on the device on the way out. Runs
+     * already launched keep their own outcomes and their own drains, which is
+     * what retires the device work, events and resources they own.
+     *
+     * Idempotent, and non-throwing: a failure finishing an unlaunched run
+     * poisons the lane so `close` reports it, rather than unwinding a caller
+     * that is already on a failure path.
+     */
+    void stop_admission() noexcept;
+
     void close();
     bool poisoned() const;
 

@@ -287,6 +287,34 @@ public:
     }
 
     /**
+     * Query one recorded boundary of one run, without waiting and without
+     * touching that run's own completion facts.
+     *
+     * Separate from `poll` because this answers a question *about* a run asked
+     * by someone else — a successor deciding whether there is anything left to
+     * be ordered behind — rather than deciding the run. It caches nothing for
+     * the same reason: the observation belongs to the asker, and the owner's
+     * `complete` flags stay the record of what the owner itself observed.
+     *
+     * Refuses a run this fence no longer owns and a boundary that was never
+     * recorded, which is what makes a true answer attributable to that exact
+     * run's boundary rather than to a slot that has moved on.
+     */
+    int query_boundary(const NativeRunIdentity &identity, StreamRole role, bool *complete) const {
+        if (complete == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+        *complete = false;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!owns(identity)) return PTO_RUNTIME_ERR_INTERNAL;
+        const Boundary &target = boundary(role);
+        if (!target.recorded || target.event == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+        if (target.complete) {
+            *complete = true;
+            return 0;
+        }
+        return ops_.query(target.event, complete);
+    }
+
+    /**
      * Give up this run's arming so the slot can serve its next run.
      *
      * Idempotent, and a no-op for a caller that does not own the arming, so

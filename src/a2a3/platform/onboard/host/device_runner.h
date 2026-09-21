@@ -115,6 +115,20 @@ public:
     // hand back. launch_run() readies the pair under the execution claim.
     void mark_run_streams_stale() override { run_streams_.mark_stale(); }
 
+    // A joining run shares the pair with the run it is ordered behind, which is
+    // possible only while the pair needs no AICore replacement: the predecessor
+    // is executing on the stream a code publication marked stale, so readying it
+    // for the successor would have to destroy a stream with live work on it.
+    // Answering no here leaves that successor on the ordinary path instead of
+    // turning a fallback into a launch failure.
+    bool ready_to_join_launch() const override { return !run_streams_.aicore_replacement_pending(); }
+
+    // The boundary markers are recorded on this pair's two streams, so the pair's own retirement
+    // is the condition for destroying them. `destroy_run_streams()` runs ahead of
+    // `finalize_common()` but keeps a handle whose destroy failed, and such a stream may still
+    // hold a queued record — so this answers from the handles rather than from that call's rc.
+    bool marker_recording_streams_retired() const override { return run_streams_.retired(); }
+
     // Map/unmap a device buffer into host address space via
     // halHostRegister(DEV_SVM_MAP_HOST) / halHostUnregister. The returned host
     // VA may differ from dev_ptr — callers must use it for host access.
@@ -297,6 +311,18 @@ private:
     // post-run teardown: launch_run() submits and drain_execution() reaps.
     LaunchTransactionResult launch_run(PreparedExecution &prepared, LaunchPermit permit);
     int reap_run(const PreparedExecution &prepared);
+
+    // Queue this run's own AICore boundary into its AICPU stream, ahead of the
+    // AICPU boundary record that then covers the whole operator. The reservation
+    // is taken by the caller, so a refusal costs only joinability; this is the
+    // step that touches the stream, and its failure grades the run Partial.
+    int queue_own_boundary_wait(PreparedExecution &prepared, rtStream_t aicpu_stream, void *core_done);
+
+    // Order this run behind the whole-operator boundary of the predecessor its
+    // join names, on its own AICore stream, and record the event that proves the
+    // wait consumed. Its AICPU side needs no edge: the pair's AICPU stream
+    // already holds the predecessor's kernel and boundary ahead of this run's.
+    int queue_cross_run_wait(PreparedExecution &prepared, rtStream_t waiter_stream, LaunchProgressSink &sink);
 
     // Emit the device-orchestration dep_gen graph, on both the success and the
     // error return of reap_run: the device flushes its dep_gen buffers during

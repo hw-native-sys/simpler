@@ -252,6 +252,7 @@ void ChipWorker::init(
         run_fn_ = load_symbol<SimplerRunFn>(handle, "simpler_run");
         prepare_run_fn_ = load_symbol<SimplerPrepareRunFn>(handle, "simpler_prepare_run");
         launch_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_launch_run");
+        launch_run_joined_fn_ = load_symbol<SimplerJoinedLaunchFn>(handle, "simpler_launch_run_joined");
         poll_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_poll_run");
         wait_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_wait_run");
         finalize_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_finalize_run");
@@ -265,6 +266,8 @@ void ChipWorker::init(
         get_teardown_report_fn_ = reinterpret_cast<GetTeardownReportFn>(dlsym(handle, "get_teardown_report"));
         supports_concurrent_native_prepare_fn_ =
             load_symbol<SupportsConcurrentNativePrepareFn>(handle, "supports_concurrent_native_prepare_ctx");
+        supports_joined_native_launch_fn_ =
+            load_symbol<SupportsConcurrentNativePrepareFn>(handle, "supports_joined_native_launch_ctx");
         get_arena_bank_gm_heap_base_fn_ =
             load_symbol<GetArenaBankGmHeapBaseFn>(handle, "get_arena_bank_gm_heap_base_ctx");
         get_retained_temp_addr_fn_ = load_symbol<GetRetainedTempAddrFn>(handle, "get_retained_temp_addr_ctx");
@@ -413,12 +416,14 @@ void ChipWorker::init(
         run_fn_ = nullptr;
         prepare_run_fn_ = nullptr;
         launch_run_fn_ = nullptr;
+        launch_run_joined_fn_ = nullptr;
         poll_run_fn_ = nullptr;
         wait_run_fn_ = nullptr;
         finalize_run_fn_ = nullptr;
         probe_run_retention_fn_ = nullptr;
         get_teardown_report_fn_ = nullptr;
         supports_concurrent_native_prepare_fn_ = nullptr;
+        supports_joined_native_launch_fn_ = nullptr;
         get_arena_bank_gm_heap_base_fn_ = nullptr;
         get_retained_temp_addr_fn_ = nullptr;
         unregister_callable_fn_ = nullptr;
@@ -477,12 +482,14 @@ void ChipWorker::init(
         run_fn_ = nullptr;
         prepare_run_fn_ = nullptr;
         launch_run_fn_ = nullptr;
+        launch_run_joined_fn_ = nullptr;
         poll_run_fn_ = nullptr;
         wait_run_fn_ = nullptr;
         finalize_run_fn_ = nullptr;
         probe_run_retention_fn_ = nullptr;
         get_teardown_report_fn_ = nullptr;
         supports_concurrent_native_prepare_fn_ = nullptr;
+        supports_joined_native_launch_fn_ = nullptr;
         get_arena_bank_gm_heap_base_fn_ = nullptr;
         get_retained_temp_addr_fn_ = nullptr;
         unregister_callable_fn_ = nullptr;
@@ -617,12 +624,14 @@ void ChipWorker::finalize() {
     run_fn_ = nullptr;
     prepare_run_fn_ = nullptr;
     launch_run_fn_ = nullptr;
+    launch_run_joined_fn_ = nullptr;
     poll_run_fn_ = nullptr;
     wait_run_fn_ = nullptr;
     finalize_run_fn_ = nullptr;
     probe_run_retention_fn_ = nullptr;
     get_teardown_report_fn_ = nullptr;
     supports_concurrent_native_prepare_fn_ = nullptr;
+    supports_joined_native_launch_fn_ = nullptr;
     get_arena_bank_gm_heap_base_fn_ = nullptr;
     get_retained_temp_addr_fn_ = nullptr;
     unregister_callable_fn_ = nullptr;
@@ -760,6 +769,32 @@ bool ChipWorker::supports_concurrent_native_prepare() const {
            supports_concurrent_native_prepare_fn_(device_ctx_) > 0;
 }
 
+bool ChipWorker::supports_joined_native_launch() const {
+    return initialized_ && launch_depth_ > 1 && pipeline_contract_.pipeline_depth > 1 &&
+           supports_joined_native_launch_fn_(device_ctx_) > 0;
+}
+
+bool ChipWorker::holds_live_comm_resources() const {
+    // Unsynchronized: comm sessions, global domains and the exported-region
+    // declaration are all written from the same thread that drives the run lane
+    // — a child's control commands and its task frames arrive on one loop.
+    return !comm_sessions_.empty() || !global_domain_ids_.empty() || exported_device_regions_live_;
+}
+
+void ChipWorker::configure_launch_depth(unsigned depth) {
+    if (initialized_) {
+        throw std::runtime_error("ChipWorker::configure_launch_depth after init");
+    }
+    if (depth == 0) {
+        throw std::runtime_error("ChipWorker::configure_launch_depth requires a depth of at least one");
+    }
+    // Not clamped here: the contract's pipeline depth is unknown until init
+    // binds the runtime, and `supports_joined_native_launch` is where the two
+    // meet. A launched run holds its pipeline slot for its whole lifetime, so
+    // the slot count is the real ceiling.
+    launch_depth_ = depth > PTO_PIPELINE_MAX_DEPTH ? PTO_PIPELINE_MAX_DEPTH : depth;
+}
+
 ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
     int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, uint32_t slot_id,
     uint64_t generation, uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state,
@@ -819,10 +854,10 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
 
     int rc = -1;
     try {
-        const NativeRunDescriptor descriptor{slot_id,        arena_bank_for_slot(slot_id),
-                                             run_id,         generation,
-                                             dispatch_id,    run_epoch,
-                                             accepted_state, accepted_value};
+        const NativeRunDescriptor descriptor{
+            slot_id,        arena_bank_for_slot(slot_id), run_id, generation, dispatch_id, run_epoch, accepted_state,
+            accepted_value, launch_depth_ > 1 ? 1u : 0u
+        };
         rc = prepare_run_fn_(device_ctx_, runtime_bufs_[slot_id].data(), callable_id, args, &config, &descriptor);
     } catch (...) {
         std::lock_guard<std::mutex> lk(native_run_mu_);
@@ -887,6 +922,10 @@ ChipRun ChipWorker::submit_chip_run(
     return run_lane_->submit(callable_id, args, config, accepted_state, accepted_value);
 }
 
+void ChipWorker::stop_chip_run_lane_admission() noexcept {
+    if (run_lane_ != nullptr) run_lane_->stop_admission();
+}
+
 void ChipWorker::close_chip_run_lane() {
     if (run_lane_ != nullptr) run_lane_->close();
 }
@@ -917,6 +956,49 @@ void ChipWorker::launch_native_run(const ChipWorkerNativeRun &run) {
     std::lock_guard<std::mutex> lk(native_run_mu_);
     NativeRunSlotState &state = native_run_states_[run.slot_id];
     state.phase = NativeRunPhase::LAUNCHED;
+}
+
+bool ChipWorker::launch_native_run_joined(const ChipWorkerNativeRun &run, const ChipWorkerNativeRun &predecessor) {
+    if (!supports_joined_native_launch()) return false;
+    {
+        std::lock_guard<std::mutex> lk(native_run_mu_);
+        if (run.slot_id >= runtime_bufs_.size() || predecessor.slot_id >= runtime_bufs_.size()) {
+            throw std::runtime_error("native-run token slot is outside the runtime PipelineContract");
+        }
+        if (run.slot_id == predecessor.slot_id) {
+            throw std::runtime_error("a native run cannot be ordered behind its own pipeline slot");
+        }
+        const NativeRunSlotState &state = native_run_states_[run.slot_id];
+        if (state.run_epoch != run.run_epoch || state.phase != NativeRunPhase::PREPARED) {
+            throw std::runtime_error("native-run token is stale or used in the wrong phase");
+        }
+        // The predecessor has to be executing for there to be anything to order
+        // behind. REAPED is excluded on purpose: its device work is already
+        // over, so the ordinary launch is both correct and cheaper.
+        const NativeRunSlotState &ahead = native_run_states_[predecessor.slot_id];
+        if (ahead.run_epoch != predecessor.run_epoch || ahead.phase != NativeRunPhase::LAUNCHED) return false;
+    }
+
+    int rc = launch_run_joined_fn_(
+        device_ctx_, runtime_bufs_[run.slot_id].data(), runtime_bufs_[predecessor.slot_id].data()
+    );
+    // The backend refuses this way when it cannot order the two right now, and
+    // it changes nothing when it does: the run is still prepared, and the caller
+    // launches it ordinarily once it reaches the front.
+    if (rc == PTO_RUNTIME_ERR_UNSUPPORTED) return false;
+    if (rc != 0) {
+        int poll_rc = poll_run_fn_(device_ctx_, runtime_bufs_[run.slot_id].data());
+        std::lock_guard<std::mutex> lk(native_run_mu_);
+        NativeRunSlotState &state = native_run_states_[run.slot_id];
+        state.phase = poll_rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE ? NativeRunPhase::REAPED : NativeRunPhase::PREPARED;
+        state.wait_rc = poll_rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE ? rc : 0;
+        throw std::runtime_error(
+            "launch_native_run_joined failed with code " + std::to_string(rc) + " " + format_native_run_identity(run)
+        );
+    }
+    std::lock_guard<std::mutex> lk(native_run_mu_);
+    native_run_states_[run.slot_id].phase = NativeRunPhase::LAUNCHED;
+    return true;
 }
 
 bool ChipWorker::poll_native_run(const ChipWorkerNativeRun &run) {

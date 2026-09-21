@@ -186,8 +186,9 @@ def kernel_symbol_runtime(tmp_path_factory):
     unused_symbols = """
         device_malloc_ctx device_free_ctx committed_device_memory_ctx device_memory_info_ctx
         copy_to_device_ctx copy_from_device_ctx simpler_register_callable simpler_run
-        simpler_prepare_run simpler_launch_run simpler_poll_run simpler_wait_run simpler_finalize_run
-        supports_concurrent_native_prepare_ctx get_arena_bank_gm_heap_base_ctx get_retained_temp_addr_ctx
+        simpler_prepare_run simpler_launch_run simpler_launch_run_joined simpler_poll_run simpler_wait_run
+        simpler_finalize_run supports_concurrent_native_prepare_ctx supports_joined_native_launch_ctx
+        get_arena_bank_gm_heap_base_ctx get_retained_temp_addr_ctx
         simpler_unregister_callable get_aicpu_dlopen_count get_host_dlopen_count get_run_stream_set_create_count
         ensure_acl_ready_ctx create_comm_stream_ctx destroy_comm_stream_ctx comm_init comm_alloc_windows
         comm_get_local_window_base comm_get_window_size comm_derive_context comm_alloc_domain_windows

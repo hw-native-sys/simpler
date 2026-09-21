@@ -173,6 +173,10 @@ void Worker::init() {
         },
         [this](WorkerDispatch dispatch) {
             orchestrator_.mark_task_accepted(dispatch.task_slot);
+        },
+        [this](WorkerDispatch dispatch) {
+            TaskSlotState *slot = allocator_.slot_state(dispatch.task_slot);
+            if (slot != nullptr) orchestrator_.notify_run_staged(slot->run_id);
         }
     );
     ready_next_level_queues_.reset(manager_.next_level_worker_ids());
@@ -195,6 +199,9 @@ void Worker::init() {
     };
     cfg.preparable_run_cb = [this] {
         return orchestrator_.preparable_run_id();
+    };
+    cfg.early_launch_run_cb = [this] {
+        return orchestrator_.early_launch_run_id();
     };
     cfg.on_consumed_cb = [this](TaskSlot slot) {
         orchestrator_.on_consumed(slot);

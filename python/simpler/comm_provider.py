@@ -942,6 +942,16 @@ class ProviderRegionStore:
     def state(self) -> ProviderRegionStoreState:
         return self._state
 
+    @property
+    def holds_resources(self) -> bool:
+        """Whether this store still owns any provider resource record.
+
+        Non-mutating, which is the point: a caller asking what is owned must not be the thing that
+        changes it. A record counts whatever state it is in — a resource mid-creation, one whose
+        release left debt behind, and one being swept are all still this store's.
+        """
+        return bool(self._resources)
+
     def allocate_and_export(self, spec: RegionAllocationSpec) -> RegionAllocationResult:
         self._require_open()
         if not isinstance(spec, RegionAllocationSpec):

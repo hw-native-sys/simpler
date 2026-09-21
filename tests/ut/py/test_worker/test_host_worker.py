@@ -553,14 +553,17 @@ def test_start_hierarchical_passes_each_chip_its_negotiated_frame_count(monkeypa
         def __init__(self) -> None:
             self.configured_depths: list[int] = []
             self.configured_pending_depths: list[int] = []
+            self.configured_launch_depths: list[int] = []
             self.next_level_calls: list[tuple[int, int, int]] = []
             self.initialized = False
 
-        def configure_pipeline_depth(self, depth: int, pending_depth: int = 0) -> None:
-            # Two budgets: the negotiated native pipeline-slot depth, and the
-            # logical admission cap that defaults to deriving from it.
+        def configure_pipeline_depth(self, depth: int, pending_depth: int = 0, launch_depth: int = 1) -> None:
+            # Three budgets: the negotiated native pipeline-slot depth, the
+            # logical admission cap that defaults to deriving from it, and how
+            # many of those runs may have device work launched at once.
             self.configured_depths.append(int(depth))
             self.configured_pending_depths.append(int(pending_depth))
+            self.configured_launch_depths.append(int(launch_depth))
 
         def add_next_level_worker(self, mailbox_addr: int, pid: int, task_frame_count: int) -> None:
             self.next_level_calls.append((int(mailbox_addr), int(pid), int(task_frame_count)))
@@ -636,7 +639,7 @@ def test_start_hierarchical_seeds_the_logger_when_the_process_owns_no_chips(monk
             self.initialized = False
             self.sub_workers: list[int] = []
 
-        def configure_pipeline_depth(self, depth: int, pending_depth: int = 0) -> None:
+        def configure_pipeline_depth(self, depth: int, pending_depth: int = 0, launch_depth: int = 1) -> None:
             pass
 
         def add_sub_worker(self, _mailbox_addr: int, pid: int) -> None:
@@ -737,6 +740,8 @@ class _FakeChipRun:
 class _FakeNativeRunImpl:
     def __init__(self, *, supports_concurrent_native_prepare: bool = False) -> None:
         self.supports_concurrent_native_prepare = supports_concurrent_native_prepare
+        # Reached only when the control loop could not establish resource ownership.
+        self.admission_stopped = False
         self.events: list[tuple] = []
         self.completed = [threading.Event(), threading.Event()]
         self.prepared = [threading.Event(), threading.Event()]
@@ -756,6 +761,14 @@ class _FakeNativeRunImpl:
         self._polled_slots: set[int] = set()
         self._runs: list[_FakeChipRun] = []
         self._lane_poisoned = False
+
+    def _stop_chip_run_lane_admission(self) -> None:
+        """The control loop reaches this through ``cw._impl`` when ownership is unknown.
+
+        Stopping admission is not a recovery: whatever poisoned the lane stays poisoned, so a
+        `close` that follows still reports it.
+        """
+        self.admission_stopped = True
 
     def register_callable_from_blob(self, cid: int, blob_addr: int) -> None:
         self.register_calls.append((int(cid), int(blob_addr)))
@@ -998,6 +1011,7 @@ class _FakeTwoFrameChipWorker:
     """
 
     pipeline_depth = 2
+    launch_depth = 1
 
     def __init__(self, *, supports_concurrent_native_prepare: bool = False) -> None:
         self._impl = _FakeNativeRunImpl(supports_concurrent_native_prepare=supports_concurrent_native_prepare)
@@ -1005,6 +1019,13 @@ class _FakeTwoFrameChipWorker:
         self.unregister_calls: list[int] = []
         self.unregister_called = threading.Event()
         self.unregister_error: Optional[BaseException] = None
+        self.exported_device_regions_live: Optional[bool] = None
+
+    # The loop synchronizes exported-region ownership after every control
+    # command, including a failed one: a command that failed can still have
+    # left a region live, and a stale flag would say otherwise.
+    def set_exported_device_regions_live(self, live: bool) -> None:
+        self.exported_device_regions_live = bool(live)
 
     def malloc(self, size: int) -> int:
         self._impl.events.append(("malloc", int(size)))

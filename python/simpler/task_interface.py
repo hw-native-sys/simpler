@@ -1789,6 +1789,40 @@ class ChipWorker:
         return self._impl.pipeline_depth
 
     @property
+    def launch_depth(self):
+        """How many runs this worker may have launched at once, after its request was resolved."""
+        return self._impl.launch_depth
+
+    def configure_launch_depth(self, depth):
+        """Ask, before init, for a launch depth.
+
+        Depth 1 is the serial path: nothing is ordered behind anything, and no run constructs the
+        boundary that would let it be.
+
+        Rejected rather than coerced: ``int(1.9)`` is 1 and ``int(True)`` is 1, so coercion would
+        silently pick a device-work capacity the caller did not ask for. ``bool`` is an ``int``
+        subclass, hence the exact type test.
+        """
+        if type(depth) is not int:
+            raise TypeError(f"launch_depth must be an int, got {type(depth).__name__}")
+        if depth < 1:
+            raise ValueError(f"launch_depth must be >= 1, got {depth}")
+        self._impl.configure_launch_depth(depth)
+
+    @property
+    def supports_joined_native_launch(self):
+        """Whether one run's native submission may be ordered behind another's right now."""
+        return bool(self._impl.supports_joined_native_launch)
+
+    def set_exported_device_regions_live(self, live):
+        """Declare whether this worker's host side still owns exported device regions.
+
+        While it does, no run is ordered behind another: those regions are released before the
+        child's device reset.
+        """
+        self._impl.set_exported_device_regions_live(bool(live))
+
+    @property
     def runtime_slot_count(self):
         return self._impl.runtime_slot_count
 

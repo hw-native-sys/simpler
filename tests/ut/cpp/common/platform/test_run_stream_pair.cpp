@@ -184,9 +184,12 @@ TEST(RunStreamPair, ANonSubmittingOwnerRetiresNothing) {
 
     // The predecessor's own poll and retirement still work.
     EXPECT_EQ(
-        pair.poll([](void *, void *) {
-            return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
-        }),
+        pair.poll(
+            kOwnerA,
+            [](void *, void *) {
+                return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+            }
+        ),
         SIMPLER_NATIVE_RUN_POLL_COMPLETE
     );
     ASSERT_EQ(pair.retire(CompletionStatus::Complete, kOwnerA), 0);
@@ -215,7 +218,11 @@ TEST(RunStreamPair, CompleteRetirementWithoutAHandleIsBenign) {
     EXPECT_EQ(pair.created_count(), 0u);
 }
 
-TEST(RunStreamPair, PollCompletionDoesNotPermitReuseBeforeRetirement) {
+// A device-complete poll is not a retirement, so that run still owns the pair.
+// Readying it for a successor that joins the live run must leave the owner's
+// stream and its recorded completion alone; only *replacing* the AICore stream
+// has to wait for the retirement.
+TEST(RunStreamPair, ReadyingUnderALiveOwnerKeepsItsStreamAndCompletion) {
     FakeStreams fake;
     RunStreamPair pair = make_pair(fake);
 
@@ -223,16 +230,41 @@ TEST(RunStreamPair, PollCompletionDoesNotPermitReuseBeforeRetirement) {
     void *aicore = pair.aicore();
     ASSERT_EQ(pair.mark_submitted(kOwnerA), 0);
     ASSERT_EQ(
-        pair.poll([](void *, void *) {
-            return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
-        }),
+        pair.poll(
+            kOwnerA,
+            [](void *, void *) {
+                return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+            }
+        ),
         SIMPLER_NATIVE_RUN_POLL_COMPLETE
     );
 
-    EXPECT_NE(pair.ensure(), 0) << "a device-complete run is not a finalized one";
+    ASSERT_EQ(pair.ensure(), 0) << "a successor joins the stream its predecessor is still on";
+    EXPECT_EQ(pair.aicore(), aicore);
+    EXPECT_EQ(pair.created_count(), 1u);
+    EXPECT_EQ(pair.live_owner_count(), 1u);
+    EXPECT_EQ(
+        pair.poll(
+            kOwnerA,
+            [](void *, void *) {
+                ADD_FAILURE() << "readying must not discard the live owner's recorded completion";
+                return SIMPLER_NATIVE_RUN_POLL_ERROR;
+            }
+        ),
+        SIMPLER_NATIVE_RUN_POLL_COMPLETE
+    );
+
+    // A publication now needs the stream replaced, and that live owner forbids
+    // it: a device-complete run is not a finalized one.
+    pair.mark_stale();
+    EXPECT_NE(pair.ensure(), 0);
+    EXPECT_EQ(pair.aicore(), aicore) << "the replacement must not strand the live submission";
+    EXPECT_EQ(fake.live_count(), 2u);
+
     ASSERT_EQ(pair.retire(CompletionStatus::Complete, kOwnerA), 0);
     ASSERT_EQ(pair.ensure(), 0);
-    EXPECT_EQ(pair.aicore(), aicore);
+    EXPECT_NE(pair.aicore(), aicore);
+    EXPECT_EQ(pair.created_count(), 2u);
 }
 
 TEST(RunStreamPair, UnprovenRunDestroysTheAicoreStreamAndKeepsTheAicpuOne) {
@@ -327,9 +359,12 @@ TEST(RunStreamPair, UnprovenRetirementClearsAnEarlyCompletion) {
     ASSERT_EQ(pair.mark_submitted(kOwnerA), 0);
 
     EXPECT_EQ(
-        pair.poll([](void *, void *) {
-            return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
-        }),
+        pair.poll(
+            kOwnerA,
+            [](void *, void *) {
+                return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+            }
+        ),
         SIMPLER_NATIVE_RUN_POLL_COMPLETE
     );
 
@@ -337,10 +372,13 @@ TEST(RunStreamPair, UnprovenRetirementClearsAnEarlyCompletion) {
     // reached COMPLETE first. Error-path cleanup must not preserve that fence.
     ASSERT_EQ(pair.retire(CompletionStatus::Unproven, kOwnerA), 0);
     EXPECT_EQ(
-        pair.poll([](void *, void *) {
-            ADD_FAILURE() << "an unproven retired stream must not be queried";
-            return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
-        }),
+        pair.poll(
+            kOwnerA,
+            [](void *, void *) {
+                ADD_FAILURE() << "an unproven retired stream must not be queried";
+                return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+            }
+        ),
         SIMPLER_NATIVE_RUN_POLL_ERROR
     );
 }
@@ -351,16 +389,22 @@ TEST(RunStreamPair, PollRequiresSubmissionAndPropagatesQueryErrors) {
     ASSERT_EQ(pair.ensure(), 0);
 
     EXPECT_EQ(
-        pair.poll([](void *, void *) {
-            return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
-        }),
+        pair.poll(
+            kOwnerA,
+            [](void *, void *) {
+                return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+            }
+        ),
         SIMPLER_NATIVE_RUN_POLL_ERROR
     );
     ASSERT_EQ(pair.mark_submitted(kOwnerA), 0);
     EXPECT_EQ(
-        pair.poll([](void *, void *) {
-            return SIMPLER_NATIVE_RUN_POLL_ERROR;
-        }),
+        pair.poll(
+            kOwnerA,
+            [](void *, void *) {
+                return SIMPLER_NATIVE_RUN_POLL_ERROR;
+            }
+        ),
         SIMPLER_NATIVE_RUN_POLL_ERROR
     );
 }
@@ -385,7 +429,7 @@ TEST(RunStreamPair, RetireWaitsForAnInFlightPoll) {
     std::promise<void> release_query;
     std::shared_future<void> release = release_query.get_future().share();
     auto poll = std::async(std::launch::async, [&]() {
-        return pair.poll([&](void *, void *) {
+        return pair.poll(kOwnerA, [&](void *, void *) {
             query_entered.set_value();
             release.wait();
             return SIMPLER_NATIVE_RUN_POLL_NOT_READY;
@@ -406,9 +450,12 @@ TEST(RunStreamPair, RetireWaitsForAnInFlightPoll) {
     EXPECT_EQ(retire.get(), 0);
     EXPECT_EQ(fake.live_count(), 1u);
     EXPECT_EQ(
-        pair.poll([](void *, void *) {
-            return SIMPLER_NATIVE_RUN_POLL_ERROR;
-        }),
+        pair.poll(
+            kOwnerA,
+            [](void *, void *) {
+                return SIMPLER_NATIVE_RUN_POLL_ERROR;
+            }
+        ),
         SIMPLER_NATIVE_RUN_POLL_ERROR
     );
 }
@@ -439,10 +486,13 @@ TEST(RunStreamPair, PollDoesNotWaitBehindRetirement) {
     // The destroy holds the pair's mutex. Poll reports NOT_READY rather than
     // blocking a progress thread behind a driver call.
     EXPECT_EQ(
-        pair.poll([](void *, void *) {
-            ADD_FAILURE() << "poll must not run its query while retirement holds the pair";
-            return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
-        }),
+        pair.poll(
+            kOwnerA,
+            [](void *, void *) {
+                ADD_FAILURE() << "poll must not run its query while retirement holds the pair";
+                return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+            }
+        ),
         SIMPLER_NATIVE_RUN_POLL_NOT_READY
     );
 
@@ -477,10 +527,13 @@ TEST(RunStreamPair, AbandonClearsHandlesWithoutDestroyingThem) {
     EXPECT_FALSE(pair.ready());
     EXPECT_EQ(fake.live_count(), 2u) << "a reset device invalidated them; destroy must not be called";
     EXPECT_EQ(
-        pair.poll([](void *, void *) {
-            ADD_FAILURE() << "an abandoned pair has nothing to query";
-            return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
-        }),
+        pair.poll(
+            kOwnerA,
+            [](void *, void *) {
+                ADD_FAILURE() << "an abandoned pair has nothing to query";
+                return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+            }
+        ),
         SIMPLER_NATIVE_RUN_POLL_ERROR
     );
     EXPECT_EQ(pair.destroy(), 0);

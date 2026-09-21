@@ -140,6 +140,15 @@ extern "C" int teardown_report_supported_impl(void) {
     return 1;
 }
 
+extern "C" int joined_native_launch_supported_impl(void) {
+    // Every per-run device region this runtime names is selected by the run's
+    // own lease — the graph heap and the runtime image are both HOST_PER_RUN
+    // above — so a second launched run reads and writes nothing the first is
+    // still executing against. What orders the two on the device is a queued
+    // event wait, not this answer.
+    return 1;
+}
+
 // RuntimeEnv (call_config.h) is the cross-runtime ABI for per-ring config and
 // carries RUNTIME_ENV_RING_COUNT slots, shared with tensormap_and_ringbuffer.
 // host_build_graph keeps one task table and reads slot 0, so it only needs the ABI

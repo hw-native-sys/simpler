@@ -1059,6 +1059,13 @@ int simpler_run(
 // dead code when built for sim.
 int supports_concurrent_native_prepare_ctx(DeviceContextHandle) { return 0; }
 
+// Same reason, one step further on: with no second launched run reachable here,
+// there is never a predecessor to order anything behind. The entry exists so the
+// ABI stays uniform across platforms rather than resolving per backend.
+int supports_joined_native_launch_ctx(DeviceContextHandle) { return 0; }
+
+int simpler_launch_run_joined(DeviceContextHandle, RuntimeHandle, RuntimeHandle) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
+
 uint64_t get_arena_bank_gm_heap_base_ctx(DeviceContextHandle ctx, uint32_t bank_id) {
     if (ctx == NULL) return 0;
     return static_cast<SimDeviceRunnerBase *>(ctx)->arena_bank_gm_heap_base(bank_id);

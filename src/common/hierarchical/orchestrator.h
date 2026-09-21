@@ -153,8 +153,16 @@ public:
      * behaviour every caller had before the two budgets were separable. A
      * positive value below `depth` is legal and simply leaves the successor
      * role unfillable, because that role needs a second FIFO entry to exist.
+     *
+     * `launch_depth` bounds how many runs may have their device work launched
+     * at once. One — the default — is the serial behaviour: a successor's work
+     * reaches a child only once its predecessor is terminal. Two authorizes the
+     * staged successor of a run whose every dispatch has already reached an
+     * endpoint outcome, so its work reaches the device while the predecessor is
+     * still executing. It cannot exceed `depth`, since a launched run holds a
+     * pipeline lease for its whole lifetime.
      */
-    void configure_pipeline_depth(uint32_t depth, uint32_t pending_depth = 0);
+    void configure_pipeline_depth(uint32_t depth, uint32_t pending_depth = 0, uint32_t launch_depth = 1);
     void close_run_submission(RunId run_id);
     void fail_run_submission(RunId run_id, std::exception_ptr error = nullptr);
     void wait_run_accepted(RunId run_id);
@@ -185,6 +193,33 @@ public:
     void await_run_admission(RunId run_id);
     RunId active_run_id() const;
     RunId preparable_run_id() const;
+
+    /**
+     * The staged successor authorized to launch its device work while the
+     * active run is still executing, or INVALID_RUN_ID when there is none.
+     *
+     * Authorization needs all of: a configured launch depth above one; an
+     * active, dispatchable, error-free FIFO head whose every dispatch has
+     * reached an endpoint outcome — so no further dispatch of it can be issued;
+     * and a second FIFO entry that is PREPARED and owns a pipeline lease.
+     *
+     * "Every dispatch reached an outcome" is `submission_closed` *and* a zero
+     * acceptance count *and* not terminal. Neither of the first two alone says
+     * it: the flag closes only the build declaration, and the count reads zero
+     * before anything is published. Terminal is excluded because a failed head
+     * must not open the gate.
+     */
+    RunId early_launch_run_id() const;
+
+    /**
+     * A run's dispatch reached a child and was staged there.
+     *
+     * The reverse order of the early-launch predicate's two halves: the active
+     * head may already have had every dispatch accepted when the successor's
+     * frame is staged, and nothing else announces that. Non-throwing by
+     * contract — it is reached from the worker progress driver.
+     */
+    void notify_run_staged(RunId run_id);
     void release_run(RunId run_id);
 
     // Open a nested scope. Every task submitted between this call and the
@@ -252,6 +287,14 @@ private:
     // `admission_depth_` unless a caller configured it, so the default admits
     // exactly the runs a lease was available for before the two budgets split.
     uint32_t pending_run_limit_{PTO_PIPELINE_MAX_DEPTH};
+    // How many runs may have their device work launched at once. One is the
+    // serial behaviour, and at one nothing below reads
+    // `early_launch_run_id_`, which stays invalid.
+    uint32_t launch_depth_{1};
+    // The staged successor currently authorized to launch early, latched so
+    // the transition into that state can be announced once rather than
+    // re-derived by every reader.
+    RunId early_launch_run_id_{INVALID_RUN_ID};
     RunId next_run_id_{1};
     RunId building_run_id_{INVALID_RUN_ID};
     RunId active_run_id_{INVALID_RUN_ID};
@@ -293,6 +336,35 @@ private:
      * wake.
      */
     bool refresh_leases_locked();
+
+    /**
+     * Whether every dispatch this run will ever issue has reached an endpoint
+     * outcome, so no further dispatch of it can be issued.
+     *
+     * One decrement of the acceptance count certifies that *that* dispatch
+     * reached an outcome — an ACCEPTED progress, or a terminal that never saw
+     * one — and not that it succeeded, which is the property a successor needs.
+     * The count is complete because the increment happens synchronously inside
+     * `submit_impl`, in the same step that publishes the slot, and
+     * `close_run_submission` runs afterwards on the same building thread.
+     *
+     * Takes the run's `completion_mu` under `runs_mu_`, the order
+     * `acquire_lease_locked` already establishes.
+     */
+    static bool all_dispatches_accepted(const std::shared_ptr<RunState> &run);
+
+    /**
+     * Re-derive `early_launch_run_id_`, reporting whether this call is the one
+     * that authorized a run. The caller owes the scheduler a wake on true,
+     * issued outside `runs_mu_`.
+     *
+     * Called at every transition that can change the answer: the last
+     * acceptance arriving, submission closing, a lease refresh at retirement,
+     * and a head becoming active. A staged run whose predecessor was already
+     * fully accepted is the reverse order, and reaches this through the
+     * endpoint's staging event.
+     */
+    bool refresh_early_launch_locked();
     void activate_fifo_head();
     void retire_terminal_run(const std::shared_ptr<RunState> &run);
     void cancel_unstarted_run(const std::shared_ptr<RunState> &run, const std::string &message);

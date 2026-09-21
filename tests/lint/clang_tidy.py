@@ -183,11 +183,18 @@ def _reconfigure_compile_database(db_file: Path) -> None:
         shutil.rmtree(target_build_dir)
     target_build_dir.mkdir(parents=True, exist_ok=True)
 
+    # The host target's CMakeLists refuses to configure without this, so a
+    # recovery that omitted it produced a fatal configure, left the database
+    # empty, and sent clang-tidy on to analyse the file with no include paths at
+    # all. The resulting `file not found` errors then degrade the AST enough that
+    # unrelated checks misfire on bodies they cannot resolve, so the omission
+    # cost far more than the failed recovery. Named as the real build names it.
+    cmake_defines = {"SIMPLER_RUNTIME_NAME": runtime_name} if target == "host" else None
     cmake_cmd = [
         "cmake",
         build_target.get_root_dir(),
         "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
-    ] + build_target.gen_cmake_args(include_dirs, source_dirs)
+    ] + build_target.gen_cmake_args(include_dirs, source_dirs, cmake_defines=cmake_defines)
     compiler._run_build_step(cmake_cmd, str(target_build_dir), target.upper(), "CMake configuration")
 
 

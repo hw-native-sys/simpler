@@ -32,6 +32,26 @@ struct NativeRunIdentity {
     bool operator!=(const NativeRunIdentity &other) const { return !(*this == other); }
 };
 
+/**
+ * A successor's statement that it has been ordered behind one named predecessor
+ * on the device.
+ *
+ * Both halves are load-bearing. The owner pointer is what the execution claim
+ * matches against its newest holder, so a join can only ever name the run
+ * immediately ahead of this one; the identity is what makes that holder the run
+ * the caller meant rather than whichever run happens to occupy the slot, since a
+ * pipeline slot is reused and only `run_epoch` is unique for the process
+ * lifetime.
+ *
+ * Carrying no device handle is deliberate: the predecessor's completion
+ * boundary is owned by its own slot's fence, and the successor reaches it
+ * through the identity rather than through a copied event.
+ */
+struct NativeRunJoin {
+    const void *predecessor_owner{nullptr};
+    NativeRunIdentity predecessor_identity{};
+};
+
 class LaunchPermit {
 public:
     LaunchPermit() = default;

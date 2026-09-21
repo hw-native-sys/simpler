@@ -587,8 +587,16 @@ public:
     // on_complete(completion) is called after each endpoint run.
     void start(
         Ring *ring, const std::function<void(WorkerCompletion)> &on_complete,
-        const std::function<void(WorkerDispatch)> &on_accept, std::unique_ptr<WorkerEndpoint> endpoint
+        const std::function<void(WorkerDispatch)> &on_accept, const std::function<void(WorkerDispatch)> &on_staged,
+        std::unique_ptr<WorkerEndpoint> endpoint
     );
+    /** No staging announcement: for a caller that cannot launch a staged run early. */
+    void start(
+        Ring *ring, const std::function<void(WorkerCompletion)> &on_complete,
+        const std::function<void(WorkerDispatch)> &on_accept, std::unique_ptr<WorkerEndpoint> endpoint
+    ) {
+        start(ring, on_complete, on_accept, {}, std::move(endpoint));
+    }
 
     // Submit a dispatch to the endpoint. Non-blocking.
     void dispatch(WorkerDispatch d);
@@ -599,6 +607,18 @@ public:
     void complete_unpublished(WorkerDispatch d, const std::string &error_message);
     bool has_staged_run(RunId run_id) const;
     bool activate_prepared(RunId run_id);
+
+    /**
+     * Authorize the staged run to launch its device work now, without moving it
+     * out of the staged lane.
+     *
+     * Distinct from `activate_prepared`, which promotes a staged run into the
+     * active lane and therefore requires that lane to be free. Here the
+     * predecessor is still executing and still owns the active lane and its
+     * identity; only the staged run's own activation is requested. Reports
+     * whether this call is the one that requested it.
+     */
+    bool authorize_staged_launch(RunId run_id);
     void progress();
 
     // The active lane and staged-successor lane are intentionally distinct.
@@ -702,12 +722,22 @@ private:
         bool activation_requested{false};
         RunId run_id{INVALID_RUN_ID};
         uint64_t dispatch_id{0};
+        // What the child reported it did with the staged frame. Staging admits
+        // both dispositions, and only a natively prepared one holds work that
+        // can be ordered behind another run — a validated-only frame fell back
+        // to depth one and has nothing to launch early. Recorded when the
+        // staging event arrives, so the authorization can refuse rather than
+        // spend an activation the child will decline.
+        MailboxPreparationDisposition preparation_disposition{MailboxPreparationDisposition::NONE};
     };
 
     Ring *ring_{nullptr};
     std::unique_ptr<WorkerEndpoint> endpoint_;
     std::function<void(WorkerCompletion)> on_complete_;
     std::function<void(WorkerDispatch)> on_accept_;
+    // A run's dispatch was staged at its child. Non-throwing by contract, like
+    // the two above: it runs on the progress driver.
+    std::function<void(WorkerDispatch)> on_staged_;
     std::atomic<bool> shutdown_{false};
     std::atomic<uint32_t> inflight_{0};
     uint64_t next_dispatch_id_{1};
@@ -736,6 +766,7 @@ class WorkerManager {
 public:
     using OnCompleteFn = std::function<void(WorkerCompletion)>;
     using OnAcceptFn = std::function<void(WorkerDispatch)>;
+    using OnStagedFn = std::function<void(WorkerDispatch)>;
 
     // Register a worker. `mailbox` is a MAILBOX_SIZE-byte MAP_SHARED
     // region; the real worker (a `ChipWorker` for NEXT_LEVEL, a Python
@@ -753,7 +784,11 @@ public:
     // launch fence; pass an empty function only when nothing waits on that
     // fence, since an omitted callback leaves pending_accepts non-zero forever.
     // No default: the choice is the caller's.
-    void start(Ring *ring, const OnCompleteFn &on_complete, const OnAcceptFn &on_accept);
+    // `on_staged` is optional: it announces that a child holds a prepared
+    // frame, which only a caller that can launch a staged run early has any use
+    // for. Non-throwing on the same terms as the other two.
+    void
+    start(Ring *ring, const OnCompleteFn &on_complete, const OnAcceptFn &on_accept, const OnStagedFn &on_staged = {});
     void stop_workers();
     void stop();
     void progress();
@@ -768,6 +803,8 @@ public:
     bool any_busy() const;
     bool has_staged_run(RunId run_id) const;
     bool activate_prepared_run(RunId run_id);
+    /** @see WorkerThread::authorize_staged_launch. */
+    bool authorize_staged_launch(RunId run_id);
 
     // Forward CTRL_PREPARE to a specific NEXT_LEVEL worker. Thin wrapper
     // over WorkerThread::control_prepare; exposed at manager level so the

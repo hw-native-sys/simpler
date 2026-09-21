@@ -81,6 +81,10 @@ int simpler_prepare_run(
 
 int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) { return PTO_RUNTIME_ERR_INTERNAL; }
 
+int simpler_launch_run_joined(DeviceContextHandle ctx, RuntimeHandle runtime, RuntimeHandle predecessor) {
+    return PTO_RUNTIME_ERR_INTERNAL;
+}
+
 int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime) { return PTO_RUNTIME_ERR_INTERNAL; }
 
 int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) { return PTO_RUNTIME_ERR_INTERNAL; }
@@ -88,6 +92,10 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) { return PT
 int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) { return PTO_RUNTIME_ERR_INTERNAL; }
 
 int supports_concurrent_native_prepare_ctx(DeviceContextHandle ctx) { return PTO_RUNTIME_ERR_INTERNAL; }
+
+// Both capability answers are read as `> 0`, so a failing return is also the
+// safe "cannot" answer for a fixture that executes no run.
+int supports_joined_native_launch_ctx(DeviceContextHandle ctx) { return PTO_RUNTIME_ERR_INTERNAL; }
 
 uint64_t get_arena_bank_gm_heap_base_ctx(DeviceContextHandle ctx, uint32_t bank_id) { return 0; }
 

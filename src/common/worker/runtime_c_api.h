@@ -25,7 +25,8 @@
  *                   committed_device_memory_ctx, device_memory_info_ctx,
  *                   copy_to_device_ctx, copy_from_device_ctx
  *   - prepared run: simpler_register_callable, simpler_prepare_run,
- *                   simpler_launch_run, simpler_poll_run, simpler_wait_run,
+ *                   simpler_launch_run, simpler_launch_run_joined,
+ *                   simpler_poll_run, simpler_wait_run,
  *                   simpler_finalize_run, simpler_run,
  *                   simpler_unregister_callable,
  *                   get_aicpu_dlopen_count, get_host_dlopen_count,
@@ -35,6 +36,7 @@
  *                   simpler_kernel_mode_launch
  *   - pipeline:     get_pipeline_contract,
  *                   supports_concurrent_native_prepare_ctx,
+ *                   supports_joined_native_launch_ctx,
  *                   get_arena_bank_gm_heap_base_ctx,
  *                   get_retained_temp_addr_ctx
  *   - ACL/stream:   ensure_acl_ready_ctx, create_comm_stream_ctx,
@@ -216,6 +218,18 @@ typedef struct NativeRunDescriptor {
     uint64_t run_epoch;
     volatile int32_t *accepted_state;
     int32_t accepted_value;
+    /**
+     * Nonzero to have this run construct a whole-operator completion boundary,
+     * so that another run may later be ordered behind it.
+     *
+     * A property of the launching Worker's configured launch depth rather than
+     * of this run: a predecessor is launched before any successor can be
+     * authorized to join it, so a boundary constructed only once a join were
+     * known would never exist when it is needed. Zero keeps the boundary that
+     * covers one kernel and makes the run unjoinable, which is the behaviour a
+     * Worker at launch depth one gets on every run.
+     */
+    uint32_t joinable_boundary;
 } NativeRunDescriptor;
 
 /**
@@ -633,6 +647,34 @@ int supports_concurrent_native_prepare_ctx(DeviceContextHandle ctx);
  * execution failure before the marker leaves it unchanged.
  */
 int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime);
+
+/**
+ * Return nonzero when this context can order one prepared run's native
+ * submission behind another run that is already executing.
+ *
+ * Time-varying, unlike the compile-time runtime capability it folds in: a code
+ * publication can leave the AICore stream needing replacement, and replacing it
+ * under a run that is still executing on it is not possible. A caller that gets
+ * zero launches ordinarily.
+ */
+int supports_joined_native_launch_ctx(DeviceContextHandle ctx);
+
+/**
+ * Launch a prepared run ordered behind `predecessor`, which must be a run
+ * launched on the same context and still executing.
+ *
+ * The successor's native submission reaches the device while the predecessor is
+ * still executing; the device still executes one at a time, ordered by a queued
+ * wait for the predecessor's whole-operator completion boundary. Neither run's
+ * results, outputs or errors are shared: each is decided from its own evidence.
+ *
+ * Returns PTO_RUNTIME_ERR_UNSUPPORTED, having changed nothing, when this
+ * context, this runtime or this moment cannot order the two — the run is still
+ * prepared and the caller is expected to launch it ordinarily once it reaches
+ * the front. Every other non-zero return is an ordinary launch failure with the
+ * same meaning it has for simpler_launch_run().
+ */
+int simpler_launch_run_joined(DeviceContextHandle ctx, RuntimeHandle runtime, RuntimeHandle predecessor);
 
 /**
  * Non-blocking device-completion query. Returns

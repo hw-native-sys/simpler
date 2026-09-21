@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 
 _compile_cache: dict[tuple, object] = {}
 
-_CASE_CONFIG_KEYS = frozenset({"aicpu_thread_num", "runtime_env", "device_count", "num_sub_workers"})
+_CASE_CONFIG_KEYS = frozenset({"aicpu_thread_num", "runtime_env", "device_count", "num_sub_workers", "launch_depth"})
 _TORCH_BACKEND_AUTOLOAD_ENV = "TORCH_DEVICE_BACKEND_AUTOLOAD"
 _TORCH_BACKEND_AUTOLOAD_VALUE_LIMIT = 64
 _RUNTIME_ENV_KEYS = frozenset({"ring_task_window", "ring_heap", "ring_dep_pool"})
@@ -2948,6 +2948,15 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
         (c.get("config", {}).get("num_sub_workers", 0) for cls in group for c in selected_by_cls.get(cls, [])),
         default=0,
     )
+    # `min`, not `max`: this Worker is shared by every class in the group, and a
+    # depth above one changes how their runs reach the device. A class that asked
+    # for one must get one, so a mixed group runs serially and a class that needs
+    # the greater depth fails visibly on its own assertions rather than silently
+    # imposing it on its neighbours.
+    launch_depth = min(
+        (c.get("config", {}).get("launch_depth", 1) for cls in group for c in selected_by_cls.get(cls, [])),
+        default=1,
+    )
     # Prefer the allocated list (dispatcher child mode), fall back to
     # contiguous range starting at args.device (legacy inline path).
     allocated = getattr(args, "device_ids", None)
@@ -2962,6 +2971,7 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
         platform=args.platform,
         runtime=first_cls._st_runtime,
         enable_sdma=any(_class_wants_sdma(c) for c in group),
+        launch_depth=launch_depth,
     )
     # Prepare sub callables per-class to avoid name collisions.
     per_class_sub_handles: dict[type, dict] = {}

@@ -47,6 +47,8 @@
 #include <utility>
 #include <vector>
 
+#include "common/host_span.h"
+#include "common/platform_config.h"
 #include "common/strace.h"
 #include "common/unified_log.h"
 #include "host/acl_error_log.h"
@@ -158,6 +160,17 @@ __attribute__((weak)) int concurrent_native_prepare_supported_impl(void) { retur
  * reader sees as "no observation" rather than as a teardown that did nothing.
  */
 __attribute__((weak)) int teardown_report_supported_impl(void) { return 0; }
+/**
+ * Whether this runtime may have one run's native submission ordered behind
+ * another's, so that a second run reaches the device while the first is still
+ * executing.
+ *
+ * Per-runtime for the same reason the teardown report is: the platform runner is
+ * shared, and what decides whether two launched runs are safe is the runtime's
+ * own per-run state. A runtime that does not override this keeps the serial
+ * path, where one run reaches the device at a time.
+ */
+__attribute__((weak)) int joined_native_launch_supported_impl(void) { return 0; }
 __attribute__((weak)) int prepared_run_config_compatible_impl(
     const HostApi * /*api*/, const uint64_t * /*ring_task_window*/, const uint64_t * /*ring_heap*/,
     const uint64_t * /*ring_dep_pool*/
@@ -835,6 +848,43 @@ native_run_context(DeviceContextHandle ctx, RuntimeHandle runtime, const char *o
     return state;
 }
 
+/**
+ * Publish one run's passive device-boundary times onto the host trace.
+ *
+ * A sibling of the device-wall span, on its own attribute budget and under the same non-diagnostic
+ * capture gate, because it answers the question that wall cannot: the wall brackets
+ * `aicpu_execute`, which returns at the AICore handshake, while `WholeOperatorEnd` is taken behind
+ * the wait on this run's own AICore boundary and so is an instant at which its AICore kernel had
+ * returned.
+ *
+ * Both values are `aclrtEventGetTimestamp` readings — "syscnt when event recorded", the device's
+ * own counter — so a successor's `aic_start` is comparable with its predecessor's `wo_end` for
+ * exactly the reason two runs' device walls are comparable: one free-running chip counter, never
+ * reset per run. `ts_hz` is carried so a reader converts with the platform's own normalization
+ * rather than assuming one, and so that a reader can see the quantum it is comparing at.
+ *
+ * A position that is unavailable is emitted as `*_rc=<why>` with no time. Nothing is emitted as a
+ * time it does not have, so a reader cannot take an absence or an error for an ordering — and the
+ * line is emitted for every launched run, including one at depth one whose whole-operator marker
+ * was never recorded, so an absence is visible rather than silent.
+ */
+static void emit_device_boundary_marks(OnboardNativeRunContext *state) {
+    if (!device_phase_capture_enabled()) return;
+    const RunBoundaryMarks::Mark start =
+        state->runner->run_boundary_mark(RunBoundaryMarks::Position::AicoreStart, state->identity());
+    const RunBoundaryMarks::Mark end =
+        state->runner->run_boundary_mark(RunBoundaryMarks::Position::WholeOperatorEnd, state->identity());
+    char attrs[SIMPLER_HOST_SPAN_ATTRIBUTES_CAPACITY];
+    (void)std::snprintf(
+        attrs, sizeof(attrs), "clk=dev dev_id=%d aic_start=%llu aic_rc=%d wo_end=%llu wo_rc=%d ts_hz=%llu",
+        state->runner->device_id(), static_cast<unsigned long long>(start.available ? start.timestamp : 0), start.rc,
+        static_cast<unsigned long long>(end.available ? end.timestamp : 0), end.rc,
+        static_cast<unsigned long long>(PLATFORM_ACL_EVENT_TIMESTAMP_FREQ_HZ)
+    );
+    STRACE_CONTEXT(state->trace_inv, state->trace_hid, 1);
+    STRACE_HOST_SPAN_AT_A("chip.run.runner_run.device_boundaries", STRACE_NOW_NS(), 0, 2, attrs);
+}
+
 static void
 emit_native_run_host_wall(uint64_t trace_inv, uint64_t trace_hid, long long trace_start_ns, const char *trace_attrs) {
     const long long end_ns = STRACE_NOW_NS();
@@ -1143,6 +1193,12 @@ int simpler_prepare_run(
             );
         }
         if (rc != 0) return cleanup_failed_prepare(state, rc);
+        // A launch-time property of the run, carried from the descriptor the
+        // caller filled: whether it builds the boundary that makes it joinable.
+        // Only honoured where the runtime supports being joined at all, so no
+        // run constructs an edge the rest of this platform would never use.
+        state->prepared_execution->joinable_boundary =
+            state->descriptor.joinable_boundary != 0 && joined_native_launch_supported_impl() != 0;
         state->runner_resources_owned = false;
         return 0;
     } catch (...) {
@@ -1150,6 +1206,8 @@ int simpler_prepare_run(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 }
+
+static int launch_prepared_run(OnboardNativeRunContext *state, const NativeRunJoin *join);
 
 int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     OnboardNativeRunContext *state = native_run_context(ctx, runtime, "simpler_launch_run");
@@ -1171,10 +1229,100 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
         return 0;
     }
+    return launch_prepared_run(state, nullptr);
+}
+
+int supports_joined_native_launch_ctx(DeviceContextHandle ctx) {
+    if (ctx == nullptr || joined_native_launch_supported_impl() == 0) return 0;
+    return static_cast<DeviceRunnerBase *>(ctx)->ready_to_join_launch() ? 1 : 0;
+}
+
+int simpler_launch_run_joined(DeviceContextHandle ctx, RuntimeHandle runtime, RuntimeHandle predecessor) {
+    OnboardNativeRunContext *state = native_run_context(ctx, runtime, "simpler_launch_run_joined");
+    if (state == nullptr || state->phase.load(std::memory_order_acquire) != NativeRunPhase::Prepared)
+        return PTO_RUNTIME_ERR_INTERNAL;
+    OnboardNativeRunContext *ahead = native_run_context(ctx, predecessor, "simpler_launch_run_joined");
+    if (ahead == nullptr || ahead == state) return PTO_RUNTIME_ERR_INTERNAL;
+
+    // Everything below this point is a refusal the caller is meant to absorb by
+    // launching ordinarily instead, so it reports UNSUPPORTED and mutates
+    // nothing: the run is still Prepared and still launchable once it reaches
+    // the front. Only a malformed request is an error.
+    if (joined_native_launch_supported_impl() == 0) return PTO_RUNTIME_ERR_UNSUPPORTED;
+    if (!state->runner->ready_to_join_launch()) {
+        LOG_INFO(
+            "simpler_launch_run_joined: the runner cannot order a run behind another right now (%s)", state->trace_attrs
+        );
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    }
+    if (ahead->phase.load(std::memory_order_acquire) != NativeRunPhase::Running || !ahead->runner_claimed) {
+        LOG_INFO(
+            "simpler_launch_run_joined: the named predecessor is not executing, so there is nothing to order behind "
+            "(%s)",
+            ahead->trace_attrs
+        );
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    }
+    const NativeRunJoin join{ahead, ahead->identity()};
+    if (!state->runner->has_whole_operator_boundary(join.predecessor_identity)) {
+        LOG_INFO(
+            "simpler_launch_run_joined: the named predecessor published no whole-operator boundary (%s)",
+            ahead->trace_attrs
+        );
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    }
+    // Deliberately *not* gated on whether that boundary has already fired. A
+    // fired boundary is a satisfied ordering dependency, not a reason to refuse:
+    // the queued wait is simply consumed at once, and the successor is still
+    // correctly ordered after the predecessor's whole operator. Refusing there
+    // would add a restriction the ordering model does not need — and it would
+    // not establish anything either, because the boundary can fire in the
+    // window between such a query and the submission completing.
+    return launch_prepared_run(state, &join);
+}
+
+/**
+ * Publish one joined launch's ordering observation onto the host trace.
+ *
+ * A point-in-time host span, on the mechanism the run's other markers already
+ * use, so the record needs no API, no mailbox field and no protocol of its own
+ * — and it is emitted at the default-visible timing tier, unlike a LOG_INFO
+ * that the default threshold would suppress. It rides the run's own invocation
+ * identity because the enclosing STRACE_CONTEXT is still bound here.
+ *
+ * Emitted whatever the answer. A reader that only ever saw the favourable case
+ * could not tell silence from a negative result, and `observed` is separate
+ * from `unfired` so a query that could not answer counts for neither side.
+ */
+static void emit_joined_launch_span(const DeviceRunnerBase::JoinedLaunchRecord &record) {
+    char attrs[SIMPLER_HOST_SPAN_ATTRIBUTES_CAPACITY];
+    (void)std::snprintf(
+        attrs, sizeof(attrs),
+        "s_epoch=%llu s_slot=%u s_disp=%llu p_epoch=%llu p_slot=%u p_disp=%llu observed=%d unfired=%d rc=%d",
+        static_cast<unsigned long long>(record.successor.run_epoch), record.successor.pipeline_slot,
+        static_cast<unsigned long long>(record.successor.dispatch_id),
+        static_cast<unsigned long long>(record.predecessor.run_epoch), record.predecessor.pipeline_slot,
+        static_cast<unsigned long long>(record.predecessor.dispatch_id), record.observed ? 1 : 0,
+        record.predecessor_unfired ? 1 : 0, record.query_rc
+    );
+    STRACE_HOST_SPAN_AT_A("chip.run.joined_launch", STRACE_NOW_NS(), 0, 1, attrs);
+}
+
+/**
+ * Take the execution claim and cross the device launch boundary.
+ *
+ * `join` is null for an ordinary launch, and then the claim is exclusive. A
+ * non-null join is what the claim admits a second holder against, and what the
+ * platform reads to queue the ordering edge; it is attached to the prepared run
+ * at launch rather than at prepare because a prepared successor whose
+ * predecessor retires first launches ordinarily.
+ */
+static int launch_prepared_run(OnboardNativeRunContext *state, const NativeRunJoin *join) {
     if (!state->runner->accepts_new_run() || !state->runner_reserved) return PTO_RUNTIME_ERR_INTERNAL;
-    if (state->prepared_execution == nullptr ||
-        !state->runner->try_acquire_native_run(state, state->identity(), &state->launch_permit)) {
-        LOG_ERROR("simpler_launch_run: execution claim is occupied (%s)", state->trace_attrs);
+    if (state->prepared_execution == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    state->prepared_execution->join = join != nullptr ? *join : NativeRunJoin{};
+    if (!state->runner->try_acquire_native_run(state, state->identity(), &state->launch_permit, join)) {
+        LOG_ERROR("launch_prepared_run: execution claim is occupied (%s)", state->trace_attrs);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     state->runner_claimed = true;
@@ -1202,8 +1350,16 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
             state->prepared_execution = std::move(launch.prepared);
             state->active_execution = std::move(launch.active);
             if (launch.progress == LaunchProgress::Complete && !state->publish_acceptance(launch.receipt)) {
-                LOG_ERROR("simpler_launch_run: launch receipt identity mismatch (%s)", state->trace_attrs);
+                LOG_ERROR("launch_prepared_run: launch receipt identity mismatch (%s)", state->trace_attrs);
                 rc = PTO_RUNTIME_ERR_INTERNAL;
+            }
+            // Only once this submission has succeeded, and only for a joined
+            // one. Read here rather than before the launch because the question
+            // is whether the *completed* enqueue preceded the predecessor's
+            // completion; a read taken earlier leaves the window between it and
+            // the submission returning, which is exactly the window in doubt.
+            if (rc == 0 && join != nullptr && launch.progress == LaunchProgress::Complete) {
+                emit_joined_launch_span(state->runner->note_joined_launch(*join, state->identity()));
             }
         }
     } catch (...) {
@@ -1442,6 +1598,9 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
             }
             if (launched && execution_rc == 0) {
                 emit_device_phase_markers(state->runner, state->descriptor.pipeline_slot);
+                // Placed here and only here: this run's completion is established, which is what
+                // each retrieval's own host-blocking completion step is called after.
+                emit_device_boundary_marks(state);
             }
         } else {
             validation_rc = attach_rc;

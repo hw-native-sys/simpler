@@ -1761,6 +1761,17 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
     elif level == 3:
         max_devices = max((c.get("config", {}).get("device_count", 1) for c in cls.CASES), default=1)
         max_subs = max((c.get("config", {}).get("num_sub_workers", 0) for c in cls.CASES), default=0)
+        # One effective depth per class, because the Worker is shared by every
+        # case in it: taking the maximum would hand depth two to a case that
+        # asked for the serial path and quietly change what it measures. A class
+        # that wants both runs a separate class per depth.
+        requested_depths = {int(c.get("config", {}).get("launch_depth", 1)) for c in cls.CASES}
+        if len(requested_depths) > 1:
+            pytest.fail(
+                f"{cls.__name__} mixes launch_depth values {sorted(requested_depths)} across its cases; "
+                f"launch_depth applies to the whole Worker, so split them into one class per depth"
+            )
+        launch_depth = requested_depths.pop() if requested_depths else 1
         ids = device_pool.allocate(max_devices)
         if not ids:
             pytest.fail(
@@ -1776,6 +1787,7 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
             platform=st_platform,
             runtime=runtime,
             enable_sdma=wants_sdma,
+            launch_depth=launch_depth,
         )
         w._st_device_id = ids[0]  # expose primary device to test_run for profiling snapshots
 

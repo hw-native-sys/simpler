@@ -3477,6 +3477,13 @@ NB_MODULE(_task_interface, m) {
             "Drain active native ownership, abandon unlaunched work, and close the chip run lane."
         )
         .def(
+            "_stop_chip_run_lane_admission", &ChipWorker::stop_chip_run_lane_admission,
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Stop the run lane admitting anything further and finish every not-yet-launched run without "
+            "launching it. For a caller that has established nothing more may reach the device; the ordinary "
+            "close cannot serve that, because a drain launches before it waits."
+        )
+        .def(
             "_submit_chip_run_direct",
             [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config) {
                 return self.submit_chip_run(callable_id, args, config);
@@ -3616,6 +3623,27 @@ NB_MODULE(_task_interface, m) {
         .def_prop_ro(
             "supports_concurrent_native_prepare", &ChipWorker::supports_concurrent_native_prepare,
             "Whether non-diagnostic native preparation may overlap one active run in another slot."
+        )
+        .def_prop_ro(
+            "launch_depth", &ChipWorker::launch_depth,
+            "How many runs this worker may have launched at once, after its request was resolved "
+            "against the runtime's pipeline contract."
+        )
+        .def_prop_ro(
+            "supports_joined_native_launch", &ChipWorker::supports_joined_native_launch,
+            "Whether this worker may order one run's native submission behind another's right now. "
+            "Both a runtime capability and a moment-to-moment fact about the device streams."
+        )
+        .def(
+            "configure_launch_depth", &ChipWorker::configure_launch_depth, nb::arg("depth"),
+            "Ask, before init, for a launch depth. Depth 1 is the serial path: nothing is ordered "
+            "behind anything, and no run constructs the boundary that would let it be."
+        )
+        .def(
+            "set_exported_device_regions_live", &ChipWorker::set_exported_device_regions_live, nb::arg("live"),
+            "Declare whether this worker's host side still owns exported device regions. While it "
+            "does, no run is ordered behind another: those regions are released before the child's "
+            "device reset."
         )
         .def_prop_ro(
             "runtime_buffer_addrs", &ChipWorker::runtime_buffer_addrs,

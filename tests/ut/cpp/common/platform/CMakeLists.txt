@@ -415,6 +415,7 @@ simpler_ut_cases(platform_single_case
     test_file_marker_handshake.cpp
     test_host_api.cpp
     test_kernel_entry_validation.cpp
+    test_queued_stream_waits.cpp
     test_retained_temp_bump.cpp
     test_run_completion_fence.cpp
     test_run_drain_decision.cpp

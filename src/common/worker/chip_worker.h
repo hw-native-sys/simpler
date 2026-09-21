@@ -137,6 +137,21 @@ public:
         int32_t accepted_value = 0
     );
     void launch_native_run(const ChipWorkerNativeRun &run);
+    /**
+     * Launch `run` ordered behind `predecessor`, which must be a run this
+     * ChipWorker launched and has not yet reaped.
+     *
+     * `run`'s native submission reaches the device while `predecessor` is still
+     * executing; the device still executes one operator at a time, ordered by a
+     * queued wait for the predecessor's whole-operator completion boundary.
+     *
+     * Returns false, having launched nothing and consumed nothing, when the
+     * backend cannot order the two — an unsupported runtime, or a moment at
+     * which it cannot. The token is still prepared and the caller is expected
+     * to `launch_native_run` it later. Every other failure throws, exactly as
+     * `launch_native_run` does.
+     */
+    bool launch_native_run_joined(const ChipWorkerNativeRun &run, const ChipWorkerNativeRun &predecessor);
     bool poll_native_run(const ChipWorkerNativeRun &run);
     void wait_native_run(const ChipWorkerNativeRun &run);
     void finalize_native_run(const ChipWorkerNativeRun &run);
@@ -184,6 +199,11 @@ public:
         volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0
     );
     void close_chip_run_lane();
+    /**
+     * Stop the run lane admitting anything further, finishing every run that
+     * has not launched without launching it. @see ChipRunLane::stop_admission.
+     */
+    void stop_chip_run_lane_admission() noexcept;
 
     // Per-callable_id preparation. Requires init() first and a callable_id
     // in [0, MAX_REGISTERED_CALLABLE_IDS) (cap 64).
@@ -266,6 +286,49 @@ public:
     unsigned pipeline_depth() const { return pipeline_contract_.pipeline_depth; }
     size_t runtime_slot_count() const { return runtime_bufs_.size(); }
     bool supports_concurrent_native_prepare() const;
+    /**
+     * Whether this worker may order one run's native submission behind
+     * another's right now, which is both a runtime capability and a
+     * moment-to-moment fact about the device streams.
+     */
+    bool supports_joined_native_launch() const;
+    /**
+     * Whether this worker holds a live communication session or global domain.
+     *
+     * A joined successor must not depend on either: both are released by the
+     * child before its device reset, so a run ordered behind another one cannot
+     * be allowed to still be naming them when that happens.
+     */
+    bool holds_live_comm_resources() const;
+    /**
+     * Declare whether this worker's host side still owns exported device
+     * regions — resources this class does not itself create and so cannot see.
+     *
+     * While it does, no run is ordered behind another: those regions are
+     * released before the child's device reset, so a run that could still be
+     * naming them when a peer's failure ends the generation must not be queued
+     * behind that peer.
+     */
+    void set_exported_device_regions_live(bool live) { exported_device_regions_live_ = live; }
+    bool exported_device_regions_live() const { return exported_device_regions_live_; }
+    /**
+     * How many runs this worker may have launched at once. One unless the
+     * caller configured a greater depth and the backend supports it, and never
+     * more than the contract's pipeline depth.
+     */
+    unsigned launch_depth() const {
+        if (!initialized_ || launch_depth_ <= pipeline_contract_.pipeline_depth) return launch_depth_;
+        return pipeline_contract_.pipeline_depth;
+    }
+    /**
+     * Ask for a launch depth, before init.
+     *
+     * Depth one is the serial path every run took before this existed: nothing
+     * is ordered behind anything, and no run constructs the boundary that would
+     * let it be. A greater depth is a request — `launch_depth()` reports what it
+     * resolved to against the backend's contract.
+     */
+    void configure_launch_depth(unsigned depth);
 
     /// Opaque host native-run storage address for every slot the contract
     /// asked for. Two slots hold distinct storage; tests read this to prove
@@ -302,6 +365,7 @@ private:
     using SimplerRunFn = decltype(&simpler_run);
     using SimplerPrepareRunFn = decltype(&simpler_prepare_run);
     using SimplerNativeRunFn = decltype(&simpler_launch_run);
+    using SimplerJoinedLaunchFn = decltype(&simpler_launch_run_joined);
     // Resolved optionally rather than through `load_symbol`: only onboard
     // modules carry the retention fixture, so a hard requirement would oblige
     // every simulated and stand-in runtime to export a stub of it.
@@ -369,6 +433,7 @@ private:
     SimplerRunFn run_fn_ = nullptr;
     SimplerPrepareRunFn prepare_run_fn_ = nullptr;
     SimplerNativeRunFn launch_run_fn_ = nullptr;
+    SimplerJoinedLaunchFn launch_run_joined_fn_ = nullptr;
     SimplerNativeRunFn poll_run_fn_ = nullptr;
     SimplerNativeRunFn wait_run_fn_ = nullptr;
     SimplerNativeRunFn finalize_run_fn_ = nullptr;
@@ -380,6 +445,7 @@ private:
     SimplerTeardownReport teardown_report_{};
     bool teardown_report_captured_ = false;
     SupportsConcurrentNativePrepareFn supports_concurrent_native_prepare_fn_ = nullptr;
+    SupportsConcurrentNativePrepareFn supports_joined_native_launch_fn_ = nullptr;
     GetArenaBankGmHeapBaseFn get_arena_bank_gm_heap_base_fn_ = nullptr;
     GetRetainedTempAddrFn get_retained_temp_addr_fn_ = nullptr;
     SimplerUnregisterCallableFn unregister_callable_fn_ = nullptr;
@@ -468,6 +534,14 @@ private:
     mutable std::mutex native_run_mu_;
     PipelineSlotGenerationFilter pipeline_generations_;
     PipelineContract pipeline_contract_{PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 1, {}};
+    // How many runs may be launched at once. One is the serial path; a greater
+    // value is clamped to the contract's pipeline depth at init, because a
+    // launched run holds a slot for its whole lifetime.
+    unsigned launch_depth_ = 1;
+    // Set by the host side that owns exported device regions, which this class
+    // neither creates nor tracks. Plain: written and read from the one thread
+    // that drives this worker's control commands and its run lane.
+    bool exported_device_regions_live_ = false;
     std::unique_ptr<ChipRunLane> run_lane_;
     // device_id_ is set once in init() and never modified afterward. All
     // ChipWorker callers run on the thread that called init() (the same

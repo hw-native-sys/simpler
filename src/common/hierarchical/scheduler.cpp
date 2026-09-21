@@ -482,6 +482,14 @@ void Scheduler::dispatch_ready() {
 
     dispatch_preparable_next_level_singles();
 
+    // After staging, so a run staged in this very round can be authorized in
+    // it rather than waiting for the next wake. Authorization does not move the
+    // staged run out of its lane: the predecessor is still executing.
+    if (cfg_.early_launch_run_cb) {
+        const RunId early_launch = cfg_.early_launch_run_cb();
+        if (early_launch != INVALID_RUN_ID) (void)cfg_.manager->authorize_staged_launch(early_launch);
+    }
+
     // Group reservations and every queue pop in one pass belong to the same
     // whole-run FIFO head, even if a completion advances the head mid-pass.
     bool group_arrived_between_phases = false;

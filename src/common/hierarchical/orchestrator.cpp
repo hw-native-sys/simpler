@@ -129,9 +129,12 @@ RunId Orchestrator::begin_run() {
     return run_id;
 }
 
-void Orchestrator::configure_pipeline_depth(uint32_t depth, uint32_t pending_depth) {
+void Orchestrator::configure_pipeline_depth(uint32_t depth, uint32_t pending_depth, uint32_t launch_depth) {
     if (depth == 0 || depth > PTO_PIPELINE_MAX_DEPTH) {
         throw std::invalid_argument("Orchestrator: pipeline depth is outside the supported range");
+    }
+    if (launch_depth == 0 || launch_depth > depth) {
+        throw std::invalid_argument("Orchestrator: launch depth must be between one and the pipeline depth");
     }
     std::lock_guard<std::mutex> lk(runs_mu_);
     if (!runs_.empty() || building_run_id_ != INVALID_RUN_ID || active_run_id_ != INVALID_RUN_ID) {
@@ -142,6 +145,7 @@ void Orchestrator::configure_pipeline_depth(uint32_t depth, uint32_t pending_dep
     // that role needs a second FIFO entry to exist, and admission serializes.
     // That is a caller's choice, not an error.
     pending_run_limit_ = pending_depth == 0 ? depth : pending_depth;
+    launch_depth_ = launch_depth;
 }
 
 bool Orchestrator::acquire_lease_locked(const std::shared_ptr<RunState> &run, bool *assigned) {
@@ -211,6 +215,7 @@ void Orchestrator::clear_run_ready_queues(RunId run_id) {
 
 void Orchestrator::retire_terminal_run(const std::shared_ptr<RunState> &run) {
     bool leased_a_successor = false;
+    bool authorized_early_launch = false;
     {
         std::lock_guard<std::mutex> lk(runs_mu_);
         if (active_run_id_ == run->id) active_run_id_ = INVALID_RUN_ID;
@@ -232,12 +237,13 @@ void Orchestrator::retire_terminal_run(const std::shared_ptr<RunState> &run) {
         // `activate_fifo_head` below returns early while a run is active, which
         // is exactly the case where a successor handed its lease back.
         leased_a_successor = refresh_leases_locked();
+        authorized_early_launch = refresh_early_launch_locked();
     }
     clear_run_ready_queues(run->id);
     runs_cv_.notify_all();
     // A run that gained a lease here becomes preparable with no later event to
     // announce it.
-    if (leased_a_successor && ready_notify_cb_) ready_notify_cb_();
+    if ((leased_a_successor || authorized_early_launch) && ready_notify_cb_) ready_notify_cb_();
     activate_fifo_head();
 }
 
@@ -260,6 +266,7 @@ void Orchestrator::activate_fifo_head() {
         active_run_id_ = run->id;
         run->phase.store(RunPhase::EXECUTING, std::memory_order_release);
         refresh_leases_locked();
+        refresh_early_launch_locked();
     }
     // Direct device control waits on this, not only admission does: a prepared
     // successor blocked in copy_to must wake when it becomes the active run.
@@ -295,6 +302,9 @@ void Orchestrator::close_run_submission(RunId run_id) {
         // active.
         std::lock_guard<std::mutex> runs_lk(runs_mu_);
         refresh_leases_locked();
+        // This run's own closing can be the last thing the early-launch
+        // predicate was waiting on, when it is the active head.
+        refresh_early_launch_locked();
     }
     if (ready_notify_cb_) ready_notify_cb_();
     activate_fifo_head();
@@ -427,6 +437,45 @@ RunId Orchestrator::preparable_run_id() const {
 }
 
 bool Orchestrator::quiescent_locked() const { return runs_.empty() && building_run_id_ == INVALID_RUN_ID; }
+
+bool Orchestrator::all_dispatches_accepted(const std::shared_ptr<RunState> &run) {
+    if (run == nullptr) return false;
+    if (is_terminal(run->phase.load(std::memory_order_acquire))) return false;
+    std::lock_guard<std::mutex> lk(run->completion_mu);
+    // An error already recorded against this run says its remaining work will
+    // not produce the completion a successor would be ordered behind, so it
+    // does not open the gate even while its dispatches have all reported.
+    if (run->first_error) return false;
+    return run->submission_closed && run->pending_accepts.load(std::memory_order_acquire) == 0;
+}
+
+bool Orchestrator::refresh_early_launch_locked() {
+    if (launch_depth_ < 2) {
+        early_launch_run_id_ = INVALID_RUN_ID;
+        return false;
+    }
+    const RunId held = early_launch_run_id_;
+    early_launch_run_id_ = INVALID_RUN_ID;
+    if (!dispatchable_locked(active_run_id_) || run_fifo_.size() < 2 || run_fifo_.front() != active_run_id_) {
+        return false;
+    }
+    auto active = runs_.find(active_run_id_);
+    if (active == runs_.end() || !all_dispatches_accepted(active->second)) return false;
+    auto candidate = runs_.find(run_fifo_[1]);
+    if (candidate == runs_.end()) return false;
+    const std::shared_ptr<RunState> &successor = candidate->second;
+    if (successor->phase.load(std::memory_order_acquire) != RunPhase::PREPARED) return false;
+    if (!pipeline_slots_.owns(successor->lease)) return false;
+    early_launch_run_id_ = successor->id;
+    // Only a *new* authorization owes a wake. Re-deriving the same answer on
+    // every transition would otherwise wake the scheduler for nothing.
+    return held != early_launch_run_id_;
+}
+
+RunId Orchestrator::early_launch_run_id() const {
+    std::lock_guard<std::mutex> lk(runs_mu_);
+    return early_launch_run_id_;
+}
 
 void Orchestrator::compact_if_quiescent() {
     // `begin_run` takes only runs_mu_, and no slot is allocated without a
@@ -594,6 +643,26 @@ void Orchestrator::decrement_run_accepts(RunId run_id) {
         );
     }
     if (notify) run->completion_cv.notify_all();
+    if (!notify) return;
+    // The count reaching zero is what completes "no further dispatch of this
+    // run can be issued", so it is evaluated here — outside completion_mu,
+    // because the predicate takes it under `runs_mu_`.
+    bool authorized_early_launch = false;
+    {
+        std::lock_guard<std::mutex> runs_lk(runs_mu_);
+        authorized_early_launch = refresh_early_launch_locked();
+    }
+    if (authorized_early_launch && ready_notify_cb_) ready_notify_cb_();
+}
+
+void Orchestrator::notify_run_staged(RunId run_id) {
+    if (run_id == INVALID_RUN_ID) return;
+    bool authorized_early_launch = false;
+    {
+        std::lock_guard<std::mutex> runs_lk(runs_mu_);
+        authorized_early_launch = refresh_early_launch_locked();
+    }
+    if (authorized_early_launch && ready_notify_cb_) ready_notify_cb_();
 }
 
 void Orchestrator::record_run_error(const std::shared_ptr<RunState> &run, std::exception_ptr error) {

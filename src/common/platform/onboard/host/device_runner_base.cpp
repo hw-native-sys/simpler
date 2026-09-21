@@ -184,6 +184,66 @@ RunCompletionFence::DeviceEventOps make_acl_event_ops() {
     return ops;
 }
 
+/**
+ * The ACL event operations the passive boundary markers are built on.
+ *
+ * `ACL_EVENT_TIME_LINE` (0x8), not the completion-only `ACL_EVENT_SYNC` (0x1) the fences use:
+ * only the timeline flag carries a timestamp, which `aclrtEventGetTimestamp` documents as "get
+ * syscnt when event recorded" — the device's own system counter at the instant the stream reached
+ * the record, not a host clock. `clock_correlation.cpp` already creates and re-records an event of
+ * this flavour in production, which is where the re-record-without-reset behaviour these markers
+ * rely on comes from.
+ *
+ * Retrieval is `aclrtSynchronizeEventWithTimeout` on the marker itself, then
+ * `aclrtEventGetTimestamp`: the device having passed the record does not by itself make the
+ * timestamp retrievable. The header documents the first as blocking the host, and the timeout form
+ * rather than the plain one bounds that block by the same configured budget the completion fence
+ * waits under. Neither call queues anything on a stream.
+ *
+ * Separate ops rather than the fences', so borrowing a timestamp cannot become a reason to change
+ * what the completion events promise. Which reading belongs to which run is `RunBoundaryMarks`'
+ * business; see that header.
+ */
+RunBoundaryMarks::DeviceEventOps make_acl_timing_event_ops() {
+    RunBoundaryMarks::DeviceEventOps ops;
+    ops.create = [](void **out_event) -> int {
+        aclrtEvent event = nullptr;
+        aclError rc = aclrtCreateEventExWithFlag(&event, ACL_EVENT_TIME_LINE);
+        if (rc != ACL_SUCCESS) {
+            LOG_WARN(
+                "aclrtCreateEventExWithFlag (run boundary marker) failed: %d; device boundary times are "
+                "unavailable for this runner",
+                static_cast<int>(rc)
+            );
+            return static_cast<int>(rc);
+        }
+        *out_event = event;
+        return 0;
+    };
+    ops.record = [](void *event, void *stream) -> int {
+        aclError rc = aclrtRecordEvent(static_cast<aclrtEvent>(event), static_cast<aclrtStream>(stream));
+        return rc == ACL_SUCCESS ? 0 : static_cast<int>(rc);
+    };
+    ops.synchronize = [](void *event, int timeout_ms) -> int {
+        aclError rc = aclrtSynchronizeEventWithTimeout(static_cast<aclrtEvent>(event), timeout_ms);
+        return rc == ACL_SUCCESS ? 0 : static_cast<int>(rc);
+    };
+    ops.read_timestamp = [](void *event, uint64_t *out_timestamp) -> int {
+        aclError rc = aclrtEventGetTimestamp(static_cast<aclrtEvent>(event), out_timestamp);
+        return rc == ACL_SUCCESS ? 0 : static_cast<int>(rc);
+    };
+    ops.destroy = [](void *event) -> int {
+        aclError rc = aclrtDestroyEvent(static_cast<aclrtEvent>(event));
+        if (rc != ACL_SUCCESS) {
+            LOG_ERROR("aclrtDestroyEvent (run boundary marker) failed: %d", static_cast<int>(rc));
+            ACL_LOG_ERROR_DETAIL(rc);
+            return static_cast<int>(rc);
+        }
+        return 0;
+    };
+    return ops;
+}
+
 }  // namespace
 
 DeviceRunnerBase::DeviceRunnerBase() {
@@ -193,6 +253,8 @@ DeviceRunnerBase::DeviceRunnerBase() {
     for (auto &fence : run_fences_) {
         fence = std::make_unique<RunCompletionFence>(make_acl_event_ops());
     }
+    queued_waits_ = std::make_unique<QueuedStreamWaits>(make_acl_event_ops());
+    boundary_marks_ = std::make_unique<RunBoundaryMarks>(make_acl_timing_event_ops());
 }
 
 uint64_t DeviceRunnerBase::arena_bank_gm_heap_base(uint32_t bank_id) const {
@@ -1904,6 +1966,33 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
             capture(fence->release());
         }
     }
+    // After the fences, in both directions. An abandoned fence is what lets its
+    // tokens be dropped at all; a released one refused while any was live, so
+    // reaching here with an undischarged wait means the release above already
+    // reported it and the proof events stay named rather than destroyed.
+    if (abandon_device_resources) {
+        capture(queued_waits_->abandon());
+    } else {
+        capture(queued_waits_->release_events());
+    }
+    // Last of the event owners, and on a condition the others do not have: nothing waits on a
+    // boundary marker, but a *run* stream that kept its handle because its own destroy failed may
+    // still hold a queued record naming one. Destroying the event then is exactly what the
+    // markers must not do, so they are retained instead and the retention is reported. The
+    // bootstrap pair below records no markers, so its own destruction is not this condition.
+    if (abandon_device_resources) {
+        boundary_marks_->abandon();
+    } else if (marker_recording_streams_retired()) {
+        capture(boundary_marks_->release());
+    } else {
+        boundary_marks_->retain();
+        LOG_ERROR(
+            "finalize: a run stream survived its own destroy, so the %zu boundary-marker event(s) it may still "
+            "name are kept for this process rather than destroyed",
+            boundary_marks_->live_event_count()
+        );
+        capture(PTO_RUNTIME_ERR_INVALID_STATE);
+    }
     if (stream_aicpu_ != nullptr) {
         if (!abandon_device_resources) {
             capture(rtStreamDestroy(stream_aicpu_));
@@ -2707,6 +2796,196 @@ void DeviceRunnerBase::retire_run_fence(const PreparedExecution &prepared) noexc
     }
 }
 
+size_t DeviceRunnerBase::queued_boundary_wait_count() const { return queued_waits_->live_count(); }
+
+int DeviceRunnerBase::predecessor_boundary_unfired(const NativeRunJoin &join, bool *unfired) const {
+    if (unfired == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    *unfired = false;
+    const uint32_t slot = join.predecessor_identity.pipeline_slot;
+    if (join.predecessor_owner == nullptr || slot >= PTO_PIPELINE_MAX_DEPTH) return PTO_RUNTIME_ERR_INTERNAL;
+    bool complete = false;
+    const int rc =
+        run_fences_[slot]->query_boundary(join.predecessor_identity, RunCompletionFence::StreamRole::Aicpu, &complete);
+    if (rc != 0) return rc;
+    *unfired = !complete;
+    return 0;
+}
+
+int DeviceRunnerBase::mark_run_boundary(
+    RunBoundaryMarks::Position position, const NativeRunIdentity &identity, void *stream
+) {
+    return boundary_marks_->record(position, identity, stream);
+}
+
+RunBoundaryMarks::Mark
+DeviceRunnerBase::run_boundary_mark(RunBoundaryMarks::Position position, const NativeRunIdentity &identity) {
+    return boundary_marks_->read(position, identity, timeout_config_.stream_sync_timeout_ms);
+}
+
+DeviceRunnerBase::JoinedLaunchRecord
+DeviceRunnerBase::note_joined_launch(const NativeRunJoin &join, const NativeRunIdentity &successor) {
+    JoinedLaunchRecord record;
+    record.successor = successor;
+    record.predecessor = join.predecessor_identity;
+    bool unfired = false;
+    record.query_rc = predecessor_boundary_unfired(join, &unfired);
+    record.observed = record.query_rc == 0;
+    record.predecessor_unfired = record.observed && unfired;
+    // A query that could not answer is an anomaly an operator wants to see
+    // without parsing the trace: the successor is correctly ordered either way,
+    // but nothing is known about when. The favourable case is not a warning and
+    // is carried by the span the caller emits.
+    if (!record.observed) {
+        LOG_WARN(
+            "joined launch: the identified predecessor's whole-operator boundary could not be read: %d "
+            "(successor_epoch=%llu predecessor_epoch=%llu)",
+            record.query_rc, static_cast<unsigned long long>(successor.run_epoch),
+            static_cast<unsigned long long>(join.predecessor_identity.run_epoch)
+        );
+    }
+    return record;
+}
+
+int DeviceRunnerBase::open_own_boundary_wait(const PreparedExecution &prepared, void **core_done_out) {
+    int rc = queued_waits_->open(
+        QueuedStreamWaits::Shape::Own, prepared.identity, prepared.identity, run_fence(prepared.pipeline_slot),
+        RunCompletionFence::StreamRole::Aicore, RunCompletionFence::StreamRole::Aicpu, core_done_out
+    );
+    if (rc != 0) {
+        LOG_ERROR(
+            "open_own_boundary_wait: slot %u cannot reference its own AICore boundary: %d", prepared.pipeline_slot, rc
+        );
+    }
+    return rc;
+}
+
+int DeviceRunnerBase::open_cross_run_wait(const PreparedExecution &prepared, void **predecessor_boundary_out) {
+    const NativeRunJoin &join = prepared.join;
+    if (join.predecessor_owner == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    const uint32_t predecessor_slot = join.predecessor_identity.pipeline_slot;
+    if (predecessor_slot >= PTO_PIPELINE_MAX_DEPTH || predecessor_slot == prepared.pipeline_slot) {
+        LOG_ERROR(
+            "open_cross_run_wait: slot %u was joined to slot %u, which is not another live pipeline slot",
+            prepared.pipeline_slot, predecessor_slot
+        );
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (!has_whole_operator_boundary(join.predecessor_identity)) {
+        LOG_ERROR(
+            "open_cross_run_wait: slot %u was joined to slot %u, whose boundary does not cover its whole operator",
+            prepared.pipeline_slot, predecessor_slot
+        );
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    int rc = queued_waits_->open(
+        QueuedStreamWaits::Shape::CrossRun, prepared.identity, join.predecessor_identity, run_fence(predecessor_slot),
+        RunCompletionFence::StreamRole::Aicpu, RunCompletionFence::StreamRole::Aicore, predecessor_boundary_out
+    );
+    if (rc != 0) {
+        LOG_ERROR(
+            "open_cross_run_wait: slot %u cannot reference the whole-operator boundary of slot %u: %d",
+            prepared.pipeline_slot, predecessor_slot, rc
+        );
+    }
+    return rc;
+}
+
+void DeviceRunnerBase::note_whole_operator_boundary(const PreparedExecution &prepared) {
+    std::lock_guard<std::mutex> lk(whole_operator_mu_);
+    whole_operator_boundaries_[prepared.pipeline_slot] = prepared.identity;
+}
+
+void DeviceRunnerBase::clear_whole_operator_boundary(const PreparedExecution &prepared) noexcept {
+    std::lock_guard<std::mutex> lk(whole_operator_mu_);
+    NativeRunIdentity &published = whole_operator_boundaries_[prepared.pipeline_slot];
+    if (published == prepared.identity) published = NativeRunIdentity{};
+}
+
+bool DeviceRunnerBase::has_whole_operator_boundary(const NativeRunIdentity &identity) const {
+    if (identity.pipeline_slot >= PTO_PIPELINE_MAX_DEPTH || identity.run_epoch == 0) return false;
+    std::lock_guard<std::mutex> lk(whole_operator_mu_);
+    return whole_operator_boundaries_[identity.pipeline_slot] == identity;
+}
+
+int DeviceRunnerBase::commit_boundary_wait(QueuedStreamWaits::Shape shape, const PreparedExecution &prepared) {
+    int rc = queued_waits_->commit(shape, prepared.identity);
+    if (rc != 0) {
+        LOG_ERROR("commit_boundary_wait: slot %u could not commit its queued wait: %d", prepared.pipeline_slot, rc);
+    }
+    return rc;
+}
+
+int DeviceRunnerBase::revoke_boundary_wait(QueuedStreamWaits::Shape shape, const PreparedExecution &prepared) {
+    int rc = queued_waits_->revoke(shape, prepared.identity);
+    if (rc != 0) {
+        LOG_ERROR("revoke_boundary_wait: slot %u could not drop its reservation: %d", prepared.pipeline_slot, rc);
+    }
+    return rc;
+}
+
+int DeviceRunnerBase::record_cross_run_proof(const PreparedExecution &prepared, rtStream_t waiter_stream) {
+    int rc = queued_waits_->record_proof(prepared.identity, static_cast<void *>(waiter_stream));
+    if (rc != 0) {
+        LOG_ERROR(
+            "record_cross_run_proof: slot %u queued its cross-run wait but could not record the event that proves "
+            "the wait consumed: %d; the reference now needs a quiescence proof to retire",
+            prepared.pipeline_slot, rc
+        );
+    }
+    return rc;
+}
+
+int DeviceRunnerBase::discharge_boundary_waits(
+    const PreparedExecution &prepared, bool boundaries_complete, rtStream_t aicpu_stream, rtStream_t aicore_stream
+) {
+    if (!queued_waits_->holds_reference_to(prepared.identity)) return 0;
+
+    int first_rc =
+        queued_waits_->discharge(prepared.identity, boundaries_complete, timeout_config_.stream_sync_timeout_ms);
+    if (!queued_waits_->holds_reference_to(prepared.identity)) return first_rc;
+
+    // Nothing cheaper is left. A pair synchronize covers the boundary and
+    // everything queued behind it, which is exactly what an unproven queued
+    // wait needs — and it is a failure-path cost only, because a successful
+    // drain has already retired both rungs above.
+    LOG_WARN(
+        "discharge_boundary_waits: slot %u still holds a queued wait on its own boundary; falling back to the "
+        "bounded whole-stream synchronize",
+        prepared.pipeline_slot
+    );
+    const int sync_rc = sync_stream_pair(aicpu_stream, aicore_stream);
+    if (sync_rc == 0) {
+        const int quiesce_rc = queued_waits_->discharge_on_quiescence(prepared.identity);
+        if (first_rc == 0) first_rc = quiesce_rc;
+        if (!queued_waits_->holds_reference_to(prepared.identity)) return first_rc;
+    } else if (first_rc == 0) {
+        first_rc = sync_rc;
+    }
+
+    // No proof was obtained, so a queued wait may still name an event of this
+    // run. Nothing may be released against it; the device generation itself has
+    // to end, which is what invalidates the reference.
+    LOG_ERROR(
+        "discharge_boundary_waits: slot %u could not prove its queued waits consumed (synchronize returned %d); "
+        "the device is recovered or marked unusable rather than releasing an event the device may still name",
+        prepared.pipeline_slot, sync_rc
+    );
+    if (first_rc == 0) first_rc = PTO_RUNTIME_ERR_INTERNAL;
+    recover_device_or_mark_unusable(first_rc);
+    return first_rc;
+}
+
+void DeviceRunnerBase::discharge_boundary_waits_noexcept(
+    const PreparedExecution &prepared, bool boundaries_complete, rtStream_t aicpu_stream, rtStream_t aicore_stream
+) noexcept {
+    try {
+        (void)discharge_boundary_waits(prepared, boundaries_complete, aicpu_stream, aicore_stream);
+    } catch (...) {
+        LOG_ERROR("discharge_boundary_waits threw for slot %u", prepared.pipeline_slot);
+        recover_device_or_mark_unusable(PTO_RUNTIME_ERR_INTERNAL);
+    }
+}
+
 DeviceFaultMonitor *DeviceRunnerBase::fault_monitor_if_held() noexcept {
     if (!fault_monitor_held_) return nullptr;
     if (fault_monitor_pid_ != static_cast<long>(getpid())) {
@@ -3061,7 +3340,7 @@ void DeviceRunnerBase::teardown_shared_collectors_after_run(
 }
 
 bool DeviceRunnerBase::try_acquire_native_run(
-    const void *owner, const NativeRunIdentity &identity, LaunchPermit *permit
+    const void *owner, const NativeRunIdentity &identity, LaunchPermit *permit, const NativeRunJoin *join
 ) {
     if (owner == nullptr || permit == nullptr) return false;
     std::lock_guard<std::mutex> lk(native_run_mu_);
@@ -3073,31 +3352,56 @@ bool DeviceRunnerBase::try_acquire_native_run(
         }
     }
     if (!reserved) return false;
-    const void *expected = nullptr;
-    if (!active_native_run_.compare_exchange_strong(
-            expected, owner, std::memory_order_acq_rel, std::memory_order_acquire
-        )) {
-        return false;
+    if (native_run_claim_index(owner) < active_native_run_count_) return false;
+    if (active_native_run_count_ >= active_native_runs_.size()) return false;
+    if (active_native_run_count_ != 0) {
+        // Only a run that presents the predecessor it was ordered behind may
+        // join an occupied claim, and that predecessor must be the newest
+        // holder: a join naming an older one would leave a run between the two
+        // unordered with respect to this one.
+        if (join == nullptr || join->predecessor_owner == nullptr) return false;
+        const NativeRunClaim &newest = active_native_runs_[active_native_run_count_ - 1];
+        if (newest.owner != join->predecessor_owner) return false;
+        if (newest.identity != join->predecessor_identity) return false;
     }
+    active_native_runs_[active_native_run_count_] = NativeRunClaim{owner, identity};
+    ++active_native_run_count_;
     *permit = LaunchPermit(identity);
     return true;
 }
 
 void DeviceRunnerBase::release_native_run(const void *owner) {
     std::lock_guard<std::mutex> lk(native_run_mu_);
-    if (active_native_run_.load(std::memory_order_acquire) != owner) return;
-    const void *expected = owner;
-    (void)active_native_run_.compare_exchange_strong(
-        expected, nullptr, std::memory_order_release, std::memory_order_relaxed
-    );
+    const size_t index = native_run_claim_index(owner);
+    if (index >= active_native_run_count_) return;
+    for (size_t next = index + 1; next < active_native_run_count_; ++next) {
+        active_native_runs_[next - 1] = active_native_runs_[next];
+    }
+    --active_native_run_count_;
+    active_native_runs_[active_native_run_count_] = NativeRunClaim{};
+}
+
+size_t DeviceRunnerBase::native_run_claim_index(const void *owner) const {
+    if (owner == nullptr) return active_native_runs_.size();
+    for (size_t i = 0; i < active_native_run_count_; ++i) {
+        if (active_native_runs_[i].owner == owner) return i;
+    }
+    return active_native_runs_.size();
 }
 
 bool DeviceRunnerBase::native_run_active() const {
-    return active_native_run_.load(std::memory_order_acquire) != nullptr;
+    std::lock_guard<std::mutex> lk(native_run_mu_);
+    return active_native_run_count_ != 0;
 }
 
 bool DeviceRunnerBase::native_run_owned_by(const void *owner) const {
-    return owner != nullptr && active_native_run_.load(std::memory_order_acquire) == owner;
+    std::lock_guard<std::mutex> lk(native_run_mu_);
+    return native_run_claim_index(owner) < active_native_run_count_;
+}
+
+size_t DeviceRunnerBase::native_run_claim_count() const {
+    std::lock_guard<std::mutex> lk(native_run_mu_);
+    return active_native_run_count_;
 }
 
 bool DeviceRunnerBase::try_reserve_native_run(
@@ -3119,9 +3423,13 @@ bool DeviceRunnerBase::try_reserve_native_run(
         existing = &reservation;
     }
     if (occupied != 0) {
-        const void *active = active_native_run_.load(std::memory_order_acquire);
-        if (!allow_prepared_successor || occupied != 1 || existing == nullptr ||
-            !existing->permits_prepared_successor || active != existing->owner) {
+        // The one reservation already held must belong to a run that has taken
+        // the claim: a successor may prepare alongside a *launched* run, not
+        // alongside another merely prepared one.
+        const bool existing_holds_claim =
+            existing != nullptr && native_run_claim_index(existing->owner) < active_native_run_count_;
+        if (!allow_prepared_successor || occupied != 1 || !existing->permits_prepared_successor ||
+            !existing_holds_claim) {
             return false;
         }
     }

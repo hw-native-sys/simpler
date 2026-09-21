@@ -77,6 +77,8 @@
 #include "host/kernel_execution_state.h"
 #include "host/memory_allocator.h"
 #include "host/pmu_collector.h"
+#include "host/queued_stream_waits.h"
+#include "host/run_boundary_marks.h"
 #include "host/run_evidence_retention.h"
 #include "host/run_completion_fence.h"
 #include "host/teardown_recorder.h"
@@ -121,11 +123,106 @@ public:
      * Claim the runner for one native execution. The opaque owner and
      * runner-owned timing and diagnostic state remain exclusive through
      * validation/finalize.
+     *
+     * `join` is null for every ordinary launch, and then the claim is refused
+     * while any other run holds it. A non-null join is the caller's statement
+     * that this run has been ordered behind the named predecessor on the device;
+     * it is admitted only while that predecessor is the newest claim holder and
+     * its recorded identity matches, so a second launched run is reachable
+     * exclusively through the joined path.
      */
-    bool try_acquire_native_run(const void *owner, const NativeRunIdentity &identity, LaunchPermit *permit);
+    bool try_acquire_native_run(
+        const void *owner, const NativeRunIdentity &identity, LaunchPermit *permit, const NativeRunJoin *join = nullptr
+    );
     void release_native_run(const void *owner);
     bool native_run_active() const;
     bool native_run_owned_by(const void *owner) const;
+    /** How many runs currently hold the native execution claim. */
+    size_t native_run_claim_count() const;
+    /** How many stream waits queued on a run completion boundary are live. */
+    size_t queued_boundary_wait_count() const;
+    /**
+     * Whether the predecessor a join names still has its whole-operator
+     * boundary unfired, as observed now. Reports the query's own failure rather
+     * than folding it into the answer.
+     */
+    int predecessor_boundary_unfired(const NativeRunJoin &join, bool *unfired) const;
+
+    /**
+     * Record this run's passive device-timestamp marker for one stream position.
+     *
+     * Adds no stream ordering and no device wait — see host/run_boundary_marks.h for the two
+     * positions, why each latches its own recording run, and why a record failure is remembered
+     * against the position instead of failing the run.
+     */
+    int mark_run_boundary(RunBoundaryMarks::Position position, const NativeRunIdentity &identity, void *stream);
+
+    /**
+     * What one position's marker says for one run, or unavailable with the reason.
+     *
+     * Call once that run's own completion has been established, which is where every caller reads
+     * it: retrieval establishes the marker event's own completion first, a host-blocking step
+     * bounded by the configured stream-synchronize timeout. Whether the reading belongs to the run
+     * that asked is `RunBoundaryMarks`' decision, and it answers unavailable when it cannot tell.
+     * Not `const` because a read advances the attribution state that keeps one run's reading from
+     * being returned as another's.
+     */
+    RunBoundaryMarks::Mark run_boundary_mark(RunBoundaryMarks::Position position, const NativeRunIdentity &identity);
+
+    /**
+     * Whether every stream that could have recorded a boundary marker is proven retired.
+     *
+     * Asked at teardown, immediately before the markers would be destroyed: a stream that kept
+     * its handle because its own destroy failed may still hold a queued record naming one of
+     * them, and destroying an event in that state is the one thing the markers must not do. A
+     * subclass that records markers answers from the pair it recorded them on; one that records
+     * none has nothing to wait for. This is not about the bootstrap stream pair, which records no
+     * markers and is destroyed later in the same teardown.
+     */
+    virtual bool marker_recording_streams_retired() const { return true; }
+
+    /**
+     * One successor's ordering observation, belonging to an exact pair.
+     *
+     * Both identities are carried because the claim is about a pair, and
+     * `observed` is separate from `predecessor_unfired` so a failed query reads
+     * as a failed query rather than as an absence of ordering.
+     */
+    struct JoinedLaunchRecord {
+        NativeRunIdentity successor{};
+        NativeRunIdentity predecessor{};
+        /** The query returned an answer. False means `query_rc` says why not. */
+        bool observed{false};
+        /** The predecessor's whole-operator boundary had not fired. */
+        bool predecessor_unfired{false};
+        int query_rc{0};
+    };
+
+    /**
+     * Record what the predecessor's whole-operator boundary read *after* this
+     * successor's native submission completed successfully, and return it.
+     *
+     * This ordering is the whole point. A query taken before the submission
+     * proves nothing — the boundary may fire in the window between the query
+     * and the submission returning — whereas a not-ready read taken after a
+     * submission that has already succeeded places the completed enqueue
+     * strictly before the predecessor's completion. Only the not-ready case is
+     * evidence; a fired boundary means the submission and the completion raced
+     * and nothing is claimed, and a failed query is recorded as a failed query.
+     *
+     * Safe at that point, and only at that point: the successor holds a
+     * committed reference on that boundary, so the event is alive and the
+     * predecessor's fence cannot have retired the identity out from under the
+     * read.
+     */
+    JoinedLaunchRecord note_joined_launch(const NativeRunJoin &join, const NativeRunIdentity &successor);
+    /**
+     * Whether that run's AICPU completion boundary is known to cover its whole
+     * operator, which is what makes it something another run can be ordered
+     * behind. False for every run launched without the construction, and false
+     * once the run that published it ends.
+     */
+    bool has_whole_operator_boundary(const NativeRunIdentity &identity) const;
 
     /**
      * Reserve caller-owned native-run storage before binding starts. A
@@ -891,6 +988,17 @@ public:
     /** Invalidate retained run streams after new AICore code is published. */
     virtual void mark_run_streams_stale() {}
 
+    /**
+     * Whether this runner can order one run's submission behind another's right
+     * now.
+     *
+     * Base answer: no. The ordering edge is queued onto per-run streams, so a
+     * backend with no such pair has nothing to queue it into, and one whose
+     * AICore stream is awaiting replacement cannot both keep a live run on it
+     * and give a joining run a stream free of the previous code image.
+     */
+    virtual bool ready_to_join_launch() const { return false; }
+
     /** Provision/abandon platform resources owned by one prepared native run. */
     virtual int provision_native_run_resources(uint32_t /*pipeline_slot*/) { return 0; }
     virtual int abandon_native_run_resources(uint32_t /*pipeline_slot*/) { return 0; }
@@ -917,7 +1025,9 @@ public:
             launch_aicpu_num(other.launch_aicpu_num),
             kernel_args(std::move(other.kernel_args)),
             resources_owned(std::exchange(other.resources_owned, false)),
-            aicore_retirement_attempted(std::exchange(other.aicore_retirement_attempted, false)) {}
+            aicore_retirement_attempted(std::exchange(other.aicore_retirement_attempted, false)),
+            joinable_boundary(other.joinable_boundary),
+            join(other.join) {}
         PreparedExecution &operator=(PreparedExecution &&) = delete;
 
         NativeRunIdentity identity{};
@@ -941,6 +1051,25 @@ public:
         KernelArgsHelper kernel_args{};
         bool resources_owned{false};
         bool aicore_retirement_attempted{false};
+        /**
+         * Whether this run constructs a whole-operator completion boundary: an
+         * intra-run wait for its own AICore boundary queued ahead of its AICPU
+         * boundary record, so that the AICPU boundary covers both kernels.
+         *
+         * A property of the launching Worker's configured depth rather than of
+         * this run, because a predecessor is launched before any successor can
+         * be authorized to join it — a boundary constructed only once a join is
+         * known would never exist when it is needed. At depth one it stays
+         * false and the launch path is the one that shipped without it.
+         */
+        bool joinable_boundary{false};
+        /**
+         * The predecessor this run was ordered behind, or an empty join for an
+         * ordinary launch. Set at launch, not at prepare: a prepared successor
+         * whose predecessor retires first launches ordinarily, and a join
+         * decided at prepare would by then name a run that is gone.
+         */
+        NativeRunJoin join{};
     };
 
     struct ActiveExecution {
@@ -1405,11 +1534,11 @@ protected:
      * expiry proves nothing about quiescence either way, so the caller's
      * recover-or-mark-unusable policy still owns the non-zero rc.
      *
-     * The device's verdict is then read with a stream synchronize, which is the
-     * only call on this SDK that produces one — see the measurement in the
-     * definition. That read is what still makes the normal path touch the whole
-     * pair, and it is the piece a change that queues a successor has to replace
-     * before it can rely on the boundaries alone.
+     * The device's verdict is then read from this run's own published record
+     * where that record decides it, and from a stream synchronize on every other
+     * shape — the only call on this SDK that produces one, see the measurement
+     * in the definition. So the branch a successful run takes touches neither
+     * stream of the pair, which is what lets a successor stay queued behind it.
      */
     int wait_run_fence(const PreparedExecution &prepared, rtStream_t aicpu_stream, rtStream_t aicore_stream);
 
@@ -1418,6 +1547,76 @@ protected:
      * armed, so every teardown path may call it.
      */
     void retire_run_fence(const PreparedExecution &prepared) noexcept;
+
+    // ---- Queued waits on this run's boundaries ---------------------------
+    //
+    // A run whose whole operator is one boundary queues a wait for its own
+    // AICore boundary ahead of recording its AICPU one, and a joined successor
+    // queues a wait for that AICPU boundary. Both are references on this run's
+    // fence, and both must be discharged before the fence may retire. See
+    // host/queued_stream_waits.h for the evidence each one takes.
+
+    /**
+     * Reserve this run's own intra-run wait and hand back its AICore boundary
+     * event. The wait is queued by the caller into this run's AICPU stream,
+     * ahead of the AICPU boundary record that then covers the whole operator.
+     */
+    int open_own_boundary_wait(const PreparedExecution &prepared, void **core_done_out);
+
+    /**
+     * Reserve a joined successor's cross-run wait and hand back the
+     * predecessor's whole-operator boundary event.
+     *
+     * Refuses unless this run carries a join naming a predecessor whose fence
+     * still owns that identity and has recorded the boundary, which is what
+     * makes a queued wait unable to name an event nothing will record. It also
+     * refuses unless that predecessor published a whole-operator boundary: its
+     * AICPU boundary alone leaves the AICore kernel's tail uncovered, so a wait
+     * on it would order the successor ahead of work still running.
+     */
+    int open_cross_run_wait(const PreparedExecution &prepared, void **predecessor_boundary_out);
+
+    /**
+     * Publish that this run's AICPU boundary covers its whole operator, which is
+     * what makes the run joinable. Called once the intra-run wait is committed
+     * and the boundary behind it recorded — never on a launch that skipped or
+     * failed either step, so a run whose construction degraded is simply not
+     * joined rather than joined unsafely.
+     */
+    void note_whole_operator_boundary(const PreparedExecution &prepared);
+    /** Withdraw that publication as the run ends. */
+    void clear_whole_operator_boundary(const PreparedExecution &prepared) noexcept;
+
+    /** Promote a queued wait, or drop one that was never queued. */
+    int commit_boundary_wait(QueuedStreamWaits::Shape shape, const PreparedExecution &prepared);
+    int revoke_boundary_wait(QueuedStreamWaits::Shape shape, const PreparedExecution &prepared);
+
+    /**
+     * Record the proof event of this run's cross-run wait into the stream that
+     * holds the wait. A failure costs only the cheap proof: the wait is queued,
+     * and the reference falls back to the quiescence rung at discharge.
+     */
+    int record_cross_run_proof(const PreparedExecution &prepared, rtStream_t waiter_stream);
+
+    /**
+     * Retire every wait naming a boundary of this run, before anything it owns
+     * is released.
+     *
+     * `boundaries_complete` is the caller's own observation that this run's two
+     * boundaries completed. The rungs are tried in order: the run's own
+     * boundaries, then a cross-run wait's proof event, then a stream-pair
+     * synchronize this call itself issues. Exhausting them leaves a queued wait
+     * naming an event that must not be destroyed, so the device is recovered or
+     * marked unusable and the first error is returned.
+     */
+    int discharge_boundary_waits(
+        const PreparedExecution &prepared, bool boundaries_complete, rtStream_t aicpu_stream, rtStream_t aicore_stream
+    );
+
+    /** The same ladder from a path that cannot report, poisoning on failure. */
+    void discharge_boundary_waits_noexcept(
+        const PreparedExecution &prepared, bool boundaries_complete, rtStream_t aicpu_stream, rtStream_t aicore_stream
+    ) noexcept;
 
     /**
      * Take this runner's reference on the process's exception-notification
@@ -1735,7 +1934,27 @@ protected:
     };
     mutable std::mutex native_run_mu_;
     std::array<NativeRunReservation, PTO_PIPELINE_MAX_DEPTH> native_run_reservations_{};
-    std::atomic<const void *> active_native_run_{nullptr};
+    struct NativeRunClaim {
+        const void *owner{nullptr};
+        NativeRunIdentity identity{};
+    };
+    // The runs holding the native execution claim, in the order they took it.
+    //
+    // The claim stays exclusive by default. A second holder is admitted only to
+    // a caller that presents a `NativeRunJoin` naming the newest holder and its
+    // identity, which is why the identity is recorded here rather than only the
+    // owner pointer: the array bounds the resource, and the recorded identity is
+    // what makes "this successor was ordered behind exactly that predecessor" a
+    // checked fact instead of an inference from a free slot.
+    //
+    // A predecessor keeps its claim until it finalizes, and a release names the
+    // run that is leaving, so an out-of-order release — a fast successor
+    // finishing first — removes only its own entry and preserves the order of
+    // the rest.
+    std::array<NativeRunClaim, PTO_PIPELINE_MAX_DEPTH> active_native_runs_{};
+    size_t active_native_run_count_{0};
+    /** Index of `owner` among the claim holders, or the array size when absent. */
+    size_t native_run_claim_index(const void *owner) const;
 
     // ---- State shared by both a2a3 and a5 ---------------------------------
     //
@@ -1898,6 +2117,24 @@ protected:
     // pointer because the fence is non-copyable, so the array cannot be
     // brace-initialised without naming every slot.
     std::array<std::unique_ptr<RunCompletionFence>, PTO_PIPELINE_MAX_DEPTH> run_fences_;
+
+    // Every stream wait queued on one of those boundaries, across all slots.
+    // One table rather than one per slot: a cross-run wait names two runs, and
+    // the entry has to be reachable from the predecessor's drain, which is the
+    // side that must not release anything while the wait is live.
+    std::unique_ptr<QueuedStreamWaits> queued_waits_;
+
+    // Passive device-timestamp markers at two stream positions the fences bracket. Separate
+    // handles with a separate creation flag, because a timestamp needs a capability the
+    // completion flag does not promise and the fence contract must not change to borrow it.
+    std::unique_ptr<RunBoundaryMarks> boundary_marks_;
+
+    // Which run of each slot has published a whole-operator AICPU boundary, or
+    // an empty identity while that slot's run has not. Held beside the claim
+    // because it is read by a *successor's* launch to decide whether the run it
+    // was ordered behind can be joined at all.
+    mutable std::mutex whole_operator_mu_;
+    std::array<NativeRunIdentity, PTO_PIPELINE_MAX_DEPTH> whole_operator_boundaries_{};
 
     // What this runner's finalize() observed about its own device teardown.
     // Outlives nothing: `copy_teardown_report` must be called while the runner

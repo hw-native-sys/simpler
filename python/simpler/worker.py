@@ -523,6 +523,45 @@ def _validated_pending_run_depth(config: dict, level: int) -> int:
     return value
 
 
+def _validated_launch_depth(config: dict, level: int) -> int:
+    """This Worker's ``launch_depth``, validated before any startup side effect.
+
+    How many runs may have their device work launched at once. One — the default — keeps a
+    successor's work off the device until its predecessor is terminal, which is what every Worker
+    did before this key existed. Two lets a staged successor's work reach the device while its
+    predecessor is still executing; the device still runs one operator at a time, ordered by a
+    queued wait for the predecessor's whole-operator completion boundary.
+
+    Bounded by ``PTO_PIPELINE_MAX_DEPTH`` rather than by an arbitrary number: a launched run holds
+    its pipeline slot for its whole lifetime, so the slot count is the real ceiling. Refused on a
+    level < 3 Worker for the same reason ``pending_run_depth`` is — the runs being ordered are the
+    chip child's, and a Worker below the admission FIFO owns neither.
+    """
+    if "launch_depth" not in config:
+        return 1
+    value = config["launch_depth"]
+    if level < 3:
+        raise ValueError(f"Worker launch_depth requires a level >= 3 Worker, got level {level}")
+    # bool is an int subclass, and True would silently mean depth one.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"Worker launch_depth must be an int, got {type(value).__name__}")
+    if value < 1:
+        raise ValueError(f"Worker launch_depth must be >= 1, got {value}")
+    if value > PTO_PIPELINE_MAX_DEPTH:
+        raise ValueError(f"Worker launch_depth must be <= {PTO_PIPELINE_MAX_DEPTH}, got {value}")
+    return value
+
+
+def _validated_run_depths(config: dict, level: int) -> tuple[int, int]:
+    """This Worker's two run budgets, ``(pending_run_depth, launch_depth)``.
+
+    Both are validated before any startup side effect, and both are refused on a Worker below the
+    admission FIFO. They bound different things: how many runs may be admitted, and how many of
+    those may have device work launched at once.
+    """
+    return _validated_pending_run_depth(config, level), _validated_launch_depth(config, level)
+
+
 def _shm_name(token: str, suffix: str):
     """Deterministic POSIX shm name from the root token and a per-child suffix.
     Returns None (random name) when token is empty. Truncates the token to
@@ -3270,6 +3309,54 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                 msg = _format_exc(f"{op} hash={_format_digest(_read_control_digest(buf))} chip={device_id}", e)
             else:
                 msg = _format_exc(f"chip_process dev={device_id} ctrl={int(sub_cmd)}", e)
+        finally:
+            # An exported region is a device resource this child's host side owns and releases
+            # before its reset, so while one is held no run may be ordered behind another.
+            #
+            # In a `finally` covering every sub-command, because a command that *failed* can still
+            # have left the store owning a resource: a delegated allocation publishes its reply
+            # after the resource record exists, and publication allocates, so it can raise with the
+            # region live. The outer loop survives that error, so a flag left at its previous value
+            # would say no region is held while one is. The same reasoning covers a failed release,
+            # whose debt keeps the resource — and the query is non-mutating, so asking costs the
+            # error path nothing and changes nothing about it.
+            try:
+                cw.set_exported_device_regions_live(provider_region_store.holds_resources)
+            except Exception as flag_error:  # noqa: BLE001
+                # The flag could not be refreshed, so what this worker owns is unknown. Declare a
+                # region live: withholding every join is the answer that cannot be unsafe.
+                #
+                # The command's own failure is what the caller asked about, so it is settled first
+                # and anything that happens while cleaning up is appended to it, never over it.
+                if code == 0:
+                    code = 1
+                    msg = _format_exc(f"chip_process dev={device_id} ctrl={int(sub_cmd)} region ownership", flag_error)
+                conservative = False
+                try:
+                    cw.set_exported_device_regions_live(True)
+                    conservative = True
+                except Exception:  # noqa: BLE001
+                    pass
+                if not conservative:
+                    # The native flag may still read false while a region is held, which would let
+                    # a later run be ordered behind another whose failure could end the generation
+                    # those regions belong to. Reporting the command error and carrying on would
+                    # leave exactly that. So the child stops taking work, through the same
+                    # shutdown word the loop already polls and the parent already writes — no new
+                    # teardown path, and the dispatches that would have been admitted fail instead.
+                    #
+                    # The lane is stopped *first*, and separately. Breaking the loop is not enough:
+                    # the ordinary close that follows drains, and a drain launches before it waits,
+                    # so an activated prepared successor would reach the device on the way out —
+                    # moving the unsafe admission into cleanup rather than preventing it. Runs
+                    # already launched keep their own drains.
+                    try:
+                        cw._impl._stop_chip_run_lane_admission()  # noqa: SLF001 -- no public equivalent
+                    except Exception as stop_error:  # noqa: BLE001
+                        msg = (msg + "; " if msg else "") + _format_exc(
+                            f"chip_process dev={device_id} stop chip run lane admission", stop_error
+                        )
+                    _mailbox_store_i32(_buffer_field_addr(buf, _OFF_SHUTDOWN), _SHUTDOWN_REQUESTED)
         return code, msg
 
     def run_two_frame_loop() -> None:  # noqa: PLR0912, PLR0915 -- one progress owner drives control and both task frames
@@ -3406,6 +3493,20 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                         code, msg = handle_control(int(sub_cmd))
                         _write_error(buf, code, msg)
                         _mailbox_store_i32(state_addr, _CONTROL_DONE)
+                        # A handler that could not establish conservative
+                        # resource ownership requests this worker's own stop.
+                        # Honour it here, before anything below stages,
+                        # activates or drives a run: the loop's own check is at
+                        # the top, so waiting for the next iteration would admit
+                        # exactly the work the stop exists to prevent. The
+                        # response above is already published, so the caller
+                        # still gets the command's own error.
+                        if _mailbox_load_i32(shutdown_addr) == _SHUTDOWN_REQUESTED:
+                            shutdown_message = (
+                                f"chip_process dev={device_id}: stopped after a control command left device-resource "
+                                f"ownership unknown"
+                            )
+                            break
 
                 new_frames: list[_StagedFrame] = []
                 for index in range(_TASK_FRAME_COUNT):
@@ -3539,6 +3640,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     prewarm_config=None,
     enable_sdma: bool = False,
     chip_rank: int | None = None,
+    launch_depth: int = 1,
 ) -> None:
     """Runs in forked child process. Loads host_runtime.so in own address space.
 
@@ -3553,6 +3655,10 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
 
     try:
         cw = ChipWorker()
+        # Before init: the backend's own capability is only known once init binds the runtime, and
+        # `ChipWorker.launch_depth` is where the request and that capability meet.
+        if launch_depth > 1:
+            cw.configure_launch_depth(launch_depth)
         cw.init(
             device_id,
             bins,
@@ -4875,10 +4981,13 @@ class Worker:
         self._startup_timeout_s = float(config.get("startup_timeout_s", _STARTUP_TIMEOUT_S))
         if not (self._startup_timeout_s > 0 and math.isfinite(self._startup_timeout_s)):
             raise ValueError("Worker startup_timeout_s must be a positive finite number of seconds")
-        # Bounds non-terminal logical runs in this Worker's admission FIFO. 0 derives the bound
-        # from the negotiated direct-chip pipeline depth. The cap is a run count: it is not a
-        # memory budget, and a terminal run whose RunHandle is unreleased does not occupy it.
-        self._pending_run_depth = _validated_pending_run_depth(config, int(level))
+        # `pending_run_depth` bounds non-terminal logical runs in this Worker's admission FIFO; 0
+        # derives the bound from the negotiated direct-chip pipeline depth. That cap is a run
+        # count: it is not a memory budget, and a terminal run whose RunHandle is unreleased does
+        # not occupy it. `launch_depth` bounds how many of those runs may have their device work
+        # launched at once; 1 keeps a successor's work off the device until its predecessor is
+        # terminal.
+        self._pending_run_depth, self._launch_depth = _validated_run_depths(config, int(level))
         # Per-startup bookkeeping consumed by the rollback path: PIDs the barrier
         # already reaped (must not be re-SIGKILLed — the PID may be reused) and
         # PIDs that reached their serve loop (READY → asked to close gracefully
@@ -8324,6 +8433,7 @@ class Worker:
                             prewarm_config=self._prewarm_config,
                             enable_sdma=bool(self._config.get("enable_sdma", False)),
                             chip_rank=idx,
+                            launch_depth=self._launch_depth,
                         )
                     except BaseException as e:  # noqa: BLE001
                         import traceback as _tb  # noqa: PLC0415
@@ -8442,8 +8552,14 @@ class Worker:
         dw = self._worker
         assert dw is not None
         # `direct_chip_pipeline_depth` is the native pipeline-slot capability; `_pending_run_depth`
-        # is this Worker's logical admission bound, with 0 deriving it from the first.
-        dw.configure_pipeline_depth(direct_chip_pipeline_depth, self._pending_run_depth)
+        # is this Worker's logical admission bound, with 0 deriving it from the first;
+        # `_launch_depth` bounds how many of those runs may have device work launched at once, and
+        # cannot exceed the slot capability because a launched run holds its slot until it ends.
+        dw.configure_pipeline_depth(
+            direct_chip_pipeline_depth,
+            self._pending_run_depth,
+            min(self._launch_depth, direct_chip_pipeline_depth),
+        )
 
         # Register chip workers as NEXT_LEVEL (L3). The child pid lets the C++
         # endpoint fail a dispatch whose child died instead of spinning on a
