@@ -614,6 +614,10 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         SPIN_WAIT_HINT();
     }
     if (startup_signal == AICORE_EXIT_SIGNAL) {
+        // The AICPU reads this acknowledgement as the point this core's writes
+        // have landed, and the timeout above publishes its error through
+        // `pending_run_control`. Complete the preceding GM writes first.
+        OUT_OF_ORDER_STORE_BARRIER();
         write_reg(RegId::COND, AICORE_EXITED_VALUE);
         return;
     }
@@ -725,5 +729,10 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         context->exit_ack_publish_cycles = stats.exit_ack_publish_cycles;
         scheduler_publish_cache_line(&context->completion_enqueue_cycles);
     }
+    // `platform_deinit_aicore_regs` waits for this acknowledgement, and the run's
+    // finalizer folds this core's `scheduler_error` once it is observed. Complete
+    // the preceding GM writes first. Stays outside the profiling block above: the
+    // tail is optional, this is not.
+    OUT_OF_ORDER_STORE_BARRIER();
     write_reg(RegId::COND, AICORE_EXITED_VALUE);
 }
