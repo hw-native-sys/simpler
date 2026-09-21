@@ -226,3 +226,54 @@ TEST_F(RunTerminalTransportFault, FailedMirrorLeavesAicoreAccountingUnknown) {
 
     collector.finalize(nullptr, fault_test_free);
 }
+
+// A failed bank read costs the run its device-side terminal, and nothing else.
+// What the transport handed this host is counted by this host, independently of
+// any bank, and the run whose bank did not arrive is exactly the run where a
+// reader needs those counts — so they must survive the unreadable-bank exit
+// rather than be skipped along with the snapshot.
+TEST_F(RunTerminalTransportFault, FailedBankReadKeepsWhatTheHostItselfCounted) {
+    ChipSwimlaneCollector collector;
+    ASSERT_EQ(init_collector(collector), 0);
+
+    constexpr uint64_t kEpoch = 2106;
+    run_one_task(collector, /*slot=*/0, kEpoch, "transport-counts");
+
+    // Two buffers reach the collector before it merges: one this run owns, and
+    // one of a kind no producer class owns.
+    ChipSwimlaneAicpuTaskBuffer owned{};
+    owned.run_epoch = kEpoch;
+    owned.count = 0;
+    ReadyBufferInfo info{};
+    info.type = ProfBufferType::AICPU_TASK;
+    info.index = 0;
+    info.dev_buffer_ptr = &owned;
+    info.host_buffer_ptr = &owned;
+    collector.on_buffer_collected(info, /*collector_shard=*/0);
+
+    ReadyBufferInfo unroutable = info;
+    unroutable.type = static_cast<ProfBufferType>(9);
+    collector.on_buffer_collected(unroutable, /*collector_shard=*/0);
+
+    collector.reconcile_counters();
+
+    copy_fault::arm({/*fail_from_device_size=*/calc_run_terminal_bank_size(), /*fail_rc=*/-13});
+    collector.report_run_terminal_snapshot(/*bank_index=*/0, kEpoch);
+    EXPECT_EQ(copy_fault::counts().from_device_failures, 1) << "the bank copy was never attempted";
+
+    const auto report = collector.handoff_report_for_test();
+    EXPECT_EQ(report.presented_buffers, 2u) << "the host's own transport count went out with the snapshot";
+    EXPECT_EQ(report.unroutable_buffers, 1u);
+
+    // The device side of the comparison never arrived, so every class stays
+    // unknown and no figure is invented for one.
+    for (const auto *r : {&report.aicpu_task, &report.aicore_task, &report.sched_phase, &report.orch_phase}) {
+        EXPECT_EQ(r->verdict, ChipSwimlaneCollector::HandoffVerdict::Unknown);
+        EXPECT_EQ(r->coverage, ChipSwimlaneCollector::HandoffCoverage::Unknown);
+        EXPECT_EQ(r->published_buffers, 0u);
+        EXPECT_EQ(r->published_records, 0u);
+        EXPECT_FALSE(r->silent_loss_known);
+    }
+
+    collector.finalize(nullptr, fault_test_free);
+}

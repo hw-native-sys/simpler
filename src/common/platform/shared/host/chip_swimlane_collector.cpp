@@ -590,6 +590,8 @@ void ChipSwimlaneCollector::reset_collector_shards() {
     aicore_skipped_bad_core_ = 0;
     aicore_foreign_identity_ = 0;
     has_phase_data_ = false;
+    for (auto &r : merged_receipt_)
+        r = HandoffReceipt{};
     collector_shards_merged_ = false;
 }
 
@@ -640,6 +642,10 @@ void ChipSwimlaneCollector::merge_collector_shards() {
     aicore_skipped_bad_core_ = 0;
     aicore_foreign_identity_ = 0;
     has_phase_data_ = false;
+    for (auto &r : merged_receipt_)
+        r = HandoffReceipt{};
+    merged_presented_buffers_ = 0;
+    merged_unroutable_buffers_ = 0;
     for (const auto &counter : collector_counters_) {
         total_perf_collected_ += counter.total_perf_collected;
         total_sched_phase_collected_ += counter.total_sched_phase_collected;
@@ -650,6 +656,18 @@ void ChipSwimlaneCollector::merge_collector_shards() {
         aicore_skipped_bad_core_ += counter.aicore_skipped_bad_core;
         aicore_foreign_identity_ += counter.aicore_foreign_identity;
         has_phase_data_ = has_phase_data_ || counter.has_phase_data;
+        merged_presented_buffers_ += counter.buffers_presented;
+        merged_unroutable_buffers_ += counter.unroutable_buffers;
+        for (size_t k = 0; k < kProducerClasses; k++) {
+            HandoffReceipt &dst = merged_receipt_[k];
+            const HandoffReceipt &src = counter.receipt[k];
+            dst.observed_buffers += src.observed_buffers;
+            dst.invalid_index_buffers += src.invalid_index_buffers;
+            dst.foreign_epoch_buffers += src.foreign_epoch_buffers;
+            dst.malformed_count_buffers += src.malformed_count_buffers;
+            dst.received_buffers += src.received_buffers;
+            dst.received_records += src.received_records;
+        }
     }
     collector_shards_merged_ = true;
 }
@@ -806,7 +824,117 @@ void ChipSwimlaneCollector::copy_aicore_buffer(const ReadyBufferInfo &info, int 
     }
 }
 
+// Whether a ready entry's index addresses a producer this run owns. Checked
+// before the index reaches any per-producer array.
+bool ChipSwimlaneCollector::producer_index_in_range(ProfBufferType type, uint32_t index) const {
+    switch (type) {
+    case ProfBufferType::AICPU_TASK:
+    case ProfBufferType::AICORE_TASK:
+        return index < static_cast<uint32_t>(num_aicore_);
+    case ProfBufferType::AICPU_SCHED_PHASE:
+    case ProfBufferType::AICPU_ORCH_PHASE:
+        return index < static_cast<uint32_t>(PLATFORM_MAX_AICPU_THREADS);
+    }
+    return false;
+}
+
+// The stamped identity and raw count, read through the buffer type that
+// matches the kind. `count` sits after records[] in TypedBuffer, so a fixed
+// cast would read the wrong offset for three of the four kinds.
+bool ChipSwimlaneCollector::read_buffer_identity(
+    const ReadyBufferInfo &info, uint64_t *epoch_out, uint32_t *count_out, uint32_t *capacity_out
+) const {
+    if (info.host_buffer_ptr == nullptr) return false;
+    rmb();
+    switch (info.type) {
+    case ProfBufferType::AICPU_TASK: {
+        auto *b = reinterpret_cast<ChipSwimlaneAicpuTaskBuffer *>(info.host_buffer_ptr);
+        *epoch_out = b->run_epoch;
+        *count_out = b->count;
+        *capacity_out = PLATFORM_PROF_BUFFER_SIZE;
+        return true;
+    }
+    case ProfBufferType::AICORE_TASK: {
+        auto *b = reinterpret_cast<ChipSwimlaneAicoreTaskBuffer *>(info.host_buffer_ptr);
+        *epoch_out = b->run_epoch;
+        *count_out = b->count;
+        *capacity_out = PLATFORM_AICORE_BUFFER_SIZE;
+        return true;
+    }
+    case ProfBufferType::AICPU_SCHED_PHASE: {
+        auto *b = reinterpret_cast<ChipSwimlaneAicpuSchedPhaseBuffer *>(info.host_buffer_ptr);
+        *epoch_out = b->run_epoch;
+        *count_out = b->count;
+        *capacity_out = PLATFORM_PHASE_RECORDS_PER_THREAD;
+        return true;
+    }
+    case ProfBufferType::AICPU_ORCH_PHASE: {
+        auto *b = reinterpret_cast<ChipSwimlaneAicpuOrchPhaseBuffer *>(info.host_buffer_ptr);
+        *epoch_out = b->run_epoch;
+        *count_out = b->count;
+        *capacity_out = PLATFORM_PHASE_RECORDS_PER_THREAD;
+        return true;
+    }
+    }
+    return false;
+}
+
+// Transport observation and run-owned receipt, before any copy decision.
+//
+// Order matters twice. Every buffer the poll loop hands over is counted
+// globally before its kind selects a class, so a kind outside the four is
+// still a buffer this collector was handed rather than a silent return. Within
+// a class, `observed` is bumped before anything is checked, so a buffer the
+// host declines for any reason is still accounted somewhere. Validation then
+// decides whether this run's producer may also count it as received — an
+// invalid index must never be used to address a per-producer figure, and a
+// foreign epoch must never discharge this run's handoff.
+//
+// This is not the whole transport boundary and does not claim to be.
+// `ChipSwimlaneModule::resolve_entry` validates each ready entry's kind and
+// index before delivery and retires the ones that fail, so those never arrive
+// here; `drain_dropped_buffers()` is their tally and reconcile captures it into
+// the report as `transport_retired_buffers`. What is counted here is what was
+// presented to the collector.
+void ChipSwimlaneCollector::note_buffer_observed(const ReadyBufferInfo &info, int collector_shard) {
+    const size_t shard = normalize_collector_shard(collector_shard);
+    if (shard >= collector_counters_.size()) return;
+    CollectorShardCounters &counters = collector_counters_[shard];
+    counters.buffers_presented++;
+
+    const size_t klass = static_cast<size_t>(info.type);
+    if (klass >= kProducerClasses) {
+        counters.unroutable_buffers++;
+        return;
+    }
+    HandoffReceipt &r = counters.receipt[klass];
+    r.observed_buffers++;
+
+    if (!producer_index_in_range(info.type, info.index)) {
+        r.invalid_index_buffers++;
+        return;
+    }
+    uint64_t buffer_epoch = 0;
+    uint32_t raw_count = 0;
+    uint32_t capacity = 0;
+    if (!read_buffer_identity(info, &buffer_epoch, &raw_count, &capacity)) {
+        r.invalid_index_buffers++;
+        return;
+    }
+    if (armed_run_epoch_ == 0 || buffer_epoch != armed_run_epoch_) {
+        r.foreign_epoch_buffers++;
+        return;
+    }
+    r.received_buffers++;
+    if (raw_count > capacity) {
+        r.malformed_count_buffers++;
+        return;
+    }
+    r.received_records += raw_count;
+}
+
 void ChipSwimlaneCollector::on_buffer_collected(const ReadyBufferInfo &info, int collector_shard) {
+    note_buffer_observed(info, collector_shard);
     switch (info.type) {
     case ProfBufferType::AICPU_TASK:
         copy_perf_buffer(info, collector_shard);
@@ -837,6 +965,11 @@ void ChipSwimlaneCollector::reconcile_counters() {
     if (shm_host_ == nullptr) {
         return;
     }
+    // Captured before the report, which consumes the counter. A buffer the
+    // drain path retired never reached `on_buffer_collected`, so it is in
+    // neither the per-class receipts nor the presented tally, and the handoff
+    // report carries it as its own layer.
+    transport_retired_buffers_ = drain_dropped_buffers();
     report_drain_drops();
     merge_collector_shards();
 
@@ -1201,6 +1334,16 @@ ChipSwimlaneCollector::read_run_terminal_snapshot(uint32_t bank_index, uint64_t 
             cls.reported_indices.push_back(i);
             cls.total += entry->total;
             cls.dropped += entry->dropped;
+            cls.published_records += entry->published_records;
+            cls.published_buffers += entry->published_buffers;
+            cls.live_at_close += entry->live_at_close;
+            // UINT32_MAX is the device's saturation sentinel: past that point
+            // the producer stopped counting rather than wrapping, so no exact
+            // figure can be derived from this entry.
+            if (entry->total == UINT32_MAX || entry->dropped == UINT32_MAX || entry->published_records == UINT32_MAX ||
+                entry->published_buffers == UINT32_MAX) {
+                cls.saturated = true;
+            }
         }
     };
     accumulate(snapshot.aicpu_task, PLATFORM_RUN_TERMINAL_AICPU_TASK_BASE, PLATFORM_MAX_CORES);
@@ -1214,6 +1357,48 @@ ChipSwimlaneCollector::read_run_terminal_snapshot(uint32_t bank_index, uint64_t 
 }
 
 namespace {
+
+const char *handoff_verdict_name(ChipSwimlaneCollector::HandoffVerdict v) {
+    switch (v) {
+    case ChipSwimlaneCollector::HandoffVerdict::Unknown:
+        return "unknown";
+    case ChipSwimlaneCollector::HandoffVerdict::NotApplicable:
+        return "n/a";
+    case ChipSwimlaneCollector::HandoffVerdict::Incomplete:
+        return "incomplete";
+    case ChipSwimlaneCollector::HandoffVerdict::Saturated:
+        return "saturated";
+    case ChipSwimlaneCollector::HandoffVerdict::Unsettled:
+        return "unsettled";
+    case ChipSwimlaneCollector::HandoffVerdict::Inconsistent:
+        return "inconsistent";
+    case ChipSwimlaneCollector::HandoffVerdict::RecordsUntrusted:
+        return "records_untrusted";
+    case ChipSwimlaneCollector::HandoffVerdict::Shortfall:
+        return "shortfall";
+    case ChipSwimlaneCollector::HandoffVerdict::Overrun:
+        return "overrun";
+    case ChipSwimlaneCollector::HandoffVerdict::RecordMismatch:
+        return "record_mismatch";
+    case ChipSwimlaneCollector::HandoffVerdict::Match:
+        return "match";
+    }
+    return "unknown";
+}
+
+const char *handoff_coverage_name(ChipSwimlaneCollector::HandoffCoverage c) {
+    switch (c) {
+    case ChipSwimlaneCollector::HandoffCoverage::Unknown:
+        return "unknown";
+    case ChipSwimlaneCollector::HandoffCoverage::NotApplicable:
+        return "n/a";
+    case ChipSwimlaneCollector::HandoffCoverage::Incomplete:
+        return "incomplete";
+    case ChipSwimlaneCollector::HandoffCoverage::Complete:
+        return "complete";
+    }
+    return "unknown";
+}
 
 const char *run_terminal_verdict_name(ChipSwimlaneCollector::RunTerminalVerdict v) {
     switch (v) {
@@ -1234,6 +1419,28 @@ const char *run_terminal_verdict_name(ChipSwimlaneCollector::RunTerminalVerdict 
 }
 
 }  // namespace
+
+// The expected-index comparison, in one place. `expected` is always a
+// host-known denominator; a class without one does not call this.
+ChipSwimlaneCollector::TerminalIndexCoverage
+ChipSwimlaneCollector::terminal_index_coverage(const RunTerminalClassSnapshot &cls, int expected) {
+    TerminalIndexCoverage cov;
+    cov.expected = expected;
+    cov.reported = cls.producers;
+    for (int index : cls.reported_indices) {
+        if (index >= expected) cov.unexpected++;
+    }
+    cov.missing = expected - (cls.producers - cov.unexpected);
+
+    if (cov.unexpected > 0 || cov.missing > 0) {
+        cov.state = HandoffCoverage::Incomplete;
+    } else if (expected == 0) {
+        cov.state = HandoffCoverage::NotApplicable;
+    } else {
+        cov.state = HandoffCoverage::Complete;
+    }
+    return cov;
+}
 
 ChipSwimlaneCollector::RunTerminalConsistency
 ChipSwimlaneCollector::run_terminal_consistency(const RunTerminalSnapshot &snapshot) const {
@@ -1256,15 +1463,12 @@ ChipSwimlaneCollector::run_terminal_consistency(const RunTerminalSnapshot &snaps
 
     auto classify = [&](const RunTerminalClassSnapshot &cls, bool have_live, uint64_t live_total,
                         uint64_t live_dropped) {
+        const TerminalIndexCoverage cov = terminal_index_coverage(cls, expected);
         RunTerminalClassConsistency out;
-        out.expected_count = expected;
-        out.reported_count = cls.producers;
-
-        for (int index : cls.reported_indices) {
-            if (index >= expected) out.unexpected_count++;
-        }
-        int in_set = cls.producers - out.unexpected_count;
-        out.missing_count = expected - in_set;
+        out.expected_count = cov.expected;
+        out.reported_count = cov.reported;
+        out.unexpected_count = cov.unexpected;
+        out.missing_count = cov.missing;
 
         if (out.unexpected_count > 0) {
             // Ranked above a gap and above a sum difference, and reported even
@@ -1322,6 +1526,23 @@ void ChipSwimlaneCollector::report_run_terminal_snapshot(uint32_t bank_index, ui
     terminal_snapshot_ = snapshot;
     terminal_consistency_ = RunTerminalConsistency{};
     terminal_reported_ = true;
+
+    // Built before the readability branch too, and for the same reason from the
+    // other side: what the transport presented to this host is known whatever
+    // the bank says, and it is exactly the run where the bank is unreadable
+    // that a reader needs it. `build_handoff_report` keeps every class Unknown
+    // when the snapshot did not arrive, so nothing device-side is invented.
+    handoff_report_ = build_handoff_report(snapshot);
+    if (handoff_report_.unroutable_buffers > 0 || handoff_report_.transport_retired_buffers > 0) {
+        LOG_WARN(
+            "ChipSwimlane handoff: epoch %lu transport presented %lu buffer(s), %lu of an unroutable kind; a further "
+            "%lu were retired by the drain path and never presented",
+            static_cast<unsigned long>(run_epoch), static_cast<unsigned long>(handoff_report_.presented_buffers),
+            static_cast<unsigned long>(handoff_report_.unroutable_buffers),
+            static_cast<unsigned long>(handoff_report_.transport_retired_buffers)
+        );
+    }
+
     if (!snapshot.transport_ok) {
         LOG_INFO(
             "ChipSwimlane terminal: bank %u unreadable for epoch %lu — no snapshot and no consistency verdict",
@@ -1369,6 +1590,161 @@ void ChipSwimlaneCollector::report_run_terminal_snapshot(uint32_t bank_index, ui
     };
     log_verdict("PERF", consistency.aicpu_task);
     log_verdict("AICORE", consistency.aicore_task);
+
+    auto log_handoff = [&](const char *kind, const ChipSwimlaneCollector::HandoffClassReport &r) {
+        if (r.verdict == HandoffVerdict::NotApplicable) return;
+        // A class with no entry, no denominator and no traffic has nothing to
+        // state; anything else does, including an incomplete one.
+        if (r.verdict == HandoffVerdict::Unknown && r.reported_producers == 0 && r.observed_buffers == 0) return;
+        LOG_INFO(
+            "ChipSwimlane handoff: epoch %lu %s %s (coverage %s expected=%d reported=%d missing=%d unexpected=%d; "
+            "published buffers=%lu records=%lu; received buffers=%lu records=%lu %s; observed=%lu invalid_index=%lu "
+            "foreign_epoch=%lu malformed=%lu live_at_close=%lu)",
+            static_cast<unsigned long>(run_epoch), kind, handoff_verdict_name(r.verdict),
+            handoff_coverage_name(r.coverage), r.expected_producers, r.reported_producers, r.missing_producers,
+            r.unexpected_producers, static_cast<unsigned long>(r.published_buffers),
+            static_cast<unsigned long>(r.published_records), static_cast<unsigned long>(r.received_buffers),
+            static_cast<unsigned long>(r.received_records), r.records_trusted ? "trusted" : "untrusted",
+            static_cast<unsigned long>(r.observed_buffers), static_cast<unsigned long>(r.invalid_index_buffers),
+            static_cast<unsigned long>(r.foreign_epoch_buffers), static_cast<unsigned long>(r.malformed_count_buffers),
+            static_cast<unsigned long>(r.live_at_close)
+        );
+        if (r.silent_loss_known && r.silent_loss > 0) {
+            LOG_WARN(
+                "ChipSwimlane handoff: epoch %lu %s %lu record(s) the device never handed over",
+                static_cast<unsigned long>(run_epoch), kind, static_cast<unsigned long>(r.silent_loss)
+            );
+        }
+    };
+    log_handoff("PERF", handoff_report_.aicpu_task);
+    log_handoff("AICORE", handoff_report_.aicore_task);
+    log_handoff("SCHED_PHASE", handoff_report_.sched_phase);
+    log_handoff("ORCH_PHASE", handoff_report_.orch_phase);
+}
+
+// Classify one class. Order matters: every state that makes the inputs
+// something other than a closed set is decided before any comparison, so a
+// bound is never reported as a count, an unfinished producer is never reported
+// as loss, and a partial set of terminal entries is never summed as if it were
+// the whole class.
+ChipSwimlaneCollector::HandoffClassReport ChipSwimlaneCollector::classify_handoff(
+    const RunTerminalClassSnapshot &cls, const HandoffReceipt &receipt, const TerminalIndexCoverage &coverage
+) {
+    HandoffClassReport out;
+    out.published_buffers = cls.published_buffers;
+    out.published_records = cls.published_records;
+    out.received_buffers = receipt.received_buffers;
+    out.received_records = receipt.received_records;
+    out.observed_buffers = receipt.observed_buffers;
+    out.invalid_index_buffers = receipt.invalid_index_buffers;
+    out.foreign_epoch_buffers = receipt.foreign_epoch_buffers;
+    out.malformed_count_buffers = receipt.malformed_count_buffers;
+    out.live_at_close = cls.live_at_close;
+    out.coverage = coverage.state;
+    out.expected_producers = coverage.expected;
+    out.reported_producers = coverage.reported;
+    out.missing_producers = coverage.missing;
+    out.unexpected_producers = coverage.unexpected;
+    // Retained whatever the verdict turns out to be: record trust is a
+    // property of the buffers the host received, not of the comparison.
+    out.records_trusted = (receipt.malformed_count_buffers == 0);
+
+    if (coverage.state == HandoffCoverage::NotApplicable) {
+        out.verdict = HandoffVerdict::NotApplicable;
+        return out;
+    }
+    if (coverage.state == HandoffCoverage::Unknown && cls.producers == 0) {
+        // Absence without a denominator. It may be a class with no producer or
+        // a class whose producers all failed to close, and nothing here can
+        // tell those apart, so it is not reported as either.
+        out.verdict = HandoffVerdict::Unknown;
+        return out;
+    }
+    if (cls.saturated) {
+        out.verdict = HandoffVerdict::Saturated;
+        return out;
+    }
+    if (cls.live_at_close != 0) {
+        out.verdict = HandoffVerdict::Unsettled;
+        return out;
+    }
+    if (cls.dropped + cls.published_records > cls.total) {
+        out.verdict = HandoffVerdict::Inconsistent;
+        return out;
+    }
+    if (coverage.state == HandoffCoverage::Complete) {
+        out.silent_loss = cls.total - cls.dropped - cls.published_records;
+        out.silent_loss_known = true;
+    }
+
+    // A producer that published no terminal entry can only understate
+    // `published_*`, so a receipt below it is a shortfall however incomplete
+    // the coverage is. An entry at an unexpected index can overstate it, which
+    // is why that case carries no comparison at all.
+    if (coverage.unexpected == 0 && receipt.received_buffers < cls.published_buffers) {
+        out.verdict = HandoffVerdict::Shortfall;
+        return out;
+    }
+    if (coverage.state != HandoffCoverage::Complete) {
+        // Equality and overrun are both reachable purely from the missing
+        // entries, so neither is evidence of anything about this class.
+        out.verdict =
+            (coverage.state == HandoffCoverage::Incomplete) ? HandoffVerdict::Incomplete : HandoffVerdict::Unknown;
+        return out;
+    }
+    if (receipt.received_buffers > cls.published_buffers) {
+        out.verdict = HandoffVerdict::Overrun;
+        return out;
+    }
+    if (!out.records_trusted) {
+        // The buffers line up, but one of them carried an out-of-range count,
+        // so `received_records` is not a figure the record comparison below
+        // may be run on.
+        out.verdict = HandoffVerdict::RecordsUntrusted;
+        return out;
+    }
+    if (receipt.received_records != cls.published_records) {
+        // Equal buffer totals say nothing about the records inside them.
+        out.verdict = HandoffVerdict::RecordMismatch;
+        return out;
+    }
+    out.verdict = HandoffVerdict::Match;
+    return out;
+}
+
+ChipSwimlaneCollector::HandoffReport ChipSwimlaneCollector::build_handoff_report(const RunTerminalSnapshot &snapshot) {
+    merge_collector_shards();
+    HandoffReport report;
+    report.presented_buffers = merged_presented_buffers_;
+    report.unroutable_buffers = merged_unroutable_buffers_;
+    report.transport_retired_buffers = transport_retired_buffers_;
+    if (!snapshot.transport_ok) {
+        return report;  // every class stays Unknown; no target to compare against
+    }
+
+    // The task classes are judged against the host's own index set; the phase
+    // classes have no host-side denominator, so their coverage stays Unknown
+    // rather than being invented from what the device happened to report.
+    const auto task_coverage = [&](const RunTerminalClassSnapshot &cls) {
+        return terminal_index_coverage(cls, num_aicore_);
+    };
+    const TerminalIndexCoverage phase_coverage{};
+
+    report.aicpu_task = classify_handoff(
+        snapshot.aicpu_task, merged_receipt_[static_cast<size_t>(ProfBufferType::AICPU_TASK)],
+        task_coverage(snapshot.aicpu_task)
+    );
+    report.aicore_task = classify_handoff(
+        snapshot.aicore_task, merged_receipt_[static_cast<size_t>(ProfBufferType::AICORE_TASK)],
+        task_coverage(snapshot.aicore_task)
+    );
+    report.sched_phase = classify_handoff(
+        snapshot.sched_phase, merged_receipt_[static_cast<size_t>(ProfBufferType::AICPU_SCHED_PHASE)], phase_coverage
+    );
+    report.orch_phase = classify_handoff(
+        snapshot.orch_phase, merged_receipt_[static_cast<size_t>(ProfBufferType::AICPU_ORCH_PHASE)], phase_coverage
+    );
+    return report;
 }
 
 void ChipSwimlaneCollector::publish_run_config() {
@@ -1416,10 +1792,11 @@ void ChipSwimlaneCollector::publish_run_config() {
         head->dropped_record_count = 0;
         head->live_record_count = 0;
         head->published_record_count = 0;
+        head->published_buffer_count = 0;
         wmb();
         // Contiguity is asserted where the struct is declared, next to the field
         // order it constrains.
-        publish_field(&head->total_record_count, 4 * sizeof(uint32_t), "record counters");
+        publish_field(&head->total_record_count, 5 * sizeof(uint32_t), "record counters");
     };
 
     // Every slot, not just this run's: the grid is dimensioned by the platform

@@ -59,8 +59,14 @@
  * Buffer kind discriminator carried in ReadyBufferInfo and used to index the
  * per-kind recycled pool inside BufferPoolManager. Values match
  * ChipSwimlaneBufferKind 1:1.
+ *
+ * The underlying type is stated rather than left implicit, so the
+ * representation this shares with the device-side kind is visible at the
+ * declaration. A value outside the four enumerators is representable either
+ * way; the host counts such a buffer as unroutable instead of indexing a
+ * per-class array with it.
  */
-enum class ProfBufferType {
+enum class ProfBufferType : uint32_t {
     AICPU_TASK = 0,
     AICPU_SCHED_PHASE = 1,
     AICPU_ORCH_PHASE = 2,
@@ -431,6 +437,8 @@ public:
         terminal_reported_ = false;
         terminal_snapshot_ = RunTerminalSnapshot{};
         terminal_consistency_ = RunTerminalConsistency{};
+        handoff_report_ = HandoffReport{};
+        transport_retired_buffers_ = 0;
         reset_collector_shards();
         publish_run_config();
     }
@@ -625,6 +633,15 @@ public:
         int producers{0};
         uint64_t total{0};
         uint64_t dropped{0};
+        // What the producers actually committed to the ready queue, and what
+        // was still unsettled when they closed. Summed over the entries that
+        // carried this run's epoch, like `total` / `dropped`.
+        uint64_t published_records{0};
+        uint64_t published_buffers{0};
+        uint64_t live_at_close{0};
+        // At least one entry hit the device's saturation sentinel, so this
+        // class's figures are bounds rather than counts.
+        bool saturated{false};
         std::vector<int> reported_indices;
     };
 
@@ -765,6 +782,103 @@ public:
     void report_run_terminal_snapshot(uint32_t bank_index, uint64_t run_epoch);
 
     /**
+     * How one producer class's handoff compares with what the host received.
+     *
+     * Deliberately refuses a numeric verdict in every state where the inputs
+     * are not a closed set: a saturated counter is a bound, an unsettled
+     * producer never finished its accounting, an inconsistent triple means one
+     * of the three wrapped before saturation was in place, a class whose
+     * expected producers did not all report is a partial sum, and an untrusted
+     * record figure came from a buffer whose own count was out of range. None
+     * of those is a completion signal, and none of them is reported as loss.
+     */
+    enum class HandoffVerdict {
+        Unknown,           // no readable terminal, or no independent coverage to judge this class by
+        NotApplicable,     // this class has no producer on this run
+        Incomplete,        // the reporting producers are not the expected set, so the sums are partial
+        Saturated,         // a device counter reached its sentinel
+        Unsettled,         // live_at_close != 0: the producer's own accounting did not close
+        Inconsistent,      // dropped + published > total
+        RecordsUntrusted,  // buffers agree, but a malformed count means the records cannot be compared
+        Shortfall,         // fewer buffers received than the device committed
+        Overrun,           // more buffers received than the device committed
+        RecordMismatch,    // buffers agree, records do not
+        Match,             // buffers and records both agree
+    };
+
+    /**
+     * Whether the terminal entries summed for a class are the whole class.
+     *
+     * Independent of anything the device reports: the task classes are judged
+     * against `[0, num_aicore_)`, the index set the host itself passed to
+     * `initialize()`. The phase classes have no such denominator — how many
+     * threads produce is not host-known — so their coverage is `Unknown` and
+     * stays that way. An absent phase class is therefore never reported as
+     * `NotApplicable`: "no producer exists" and "the producers did not report"
+     * are not distinguishable without an expected set, and claiming the former
+     * would be claiming more than the data supports.
+     */
+    enum class HandoffCoverage {
+        Unknown,        // this class has no host-independent expected set
+        NotApplicable,  // the expected set is empty: no producer of this class exists on this run
+        Incomplete,     // an expected producer published no entry, or an entry sits at an unexpected index
+        Complete,       // exactly the expected producers published an entry
+    };
+
+    struct HandoffClassReport {
+        HandoffVerdict verdict{HandoffVerdict::Unknown};
+        // Coverage and record trust are orthogonal to the verdict and to each
+        // other, and both are retained whatever the verdict says: a class can
+        // be fully covered with untrusted records, or trusted-but-partial.
+        HandoffCoverage coverage{HandoffCoverage::Unknown};
+        bool records_trusted{false};
+        int expected_producers{0};
+        int reported_producers{0};
+        int missing_producers{0};
+        int unexpected_producers{0};
+        uint64_t published_buffers{0};
+        uint64_t received_buffers{0};
+        uint64_t published_records{0};
+        uint64_t received_records{0};
+        uint64_t observed_buffers{0};
+        uint64_t invalid_index_buffers{0};
+        uint64_t foreign_epoch_buffers{0};
+        uint64_t malformed_count_buffers{0};
+        uint64_t live_at_close{0};
+        // device_total - device_dropped - published_records, and only in the
+        // states where that subtraction is meaningful.
+        uint64_t silent_loss{0};
+        bool silent_loss_known{false};
+    };
+
+    /**
+     * The four classes plus what the transport layer saw around them.
+     *
+     * `presented_buffers` counts every buffer the poll loop handed the
+     * collector, before any classification, so a buffer of an unroutable kind
+     * is still accounted — as `unroutable_buffers`, which no class receipt can
+     * hold.
+     *
+     * `transport_retired_buffers` is the layer above: the drain path resolves
+     * each ready entry before delivery and retires the ones whose kind or index
+     * does not validate, so those never reach the collector at all and are not
+     * in `presented_buffers`. A non-zero value means observation here is not
+     * the whole transport picture for this run.
+     */
+    struct HandoffReport {
+        HandoffClassReport aicpu_task;
+        HandoffClassReport aicore_task;
+        HandoffClassReport sched_phase;
+        HandoffClassReport orch_phase;
+        uint64_t presented_buffers{0};
+        uint64_t unroutable_buffers{0};
+        uint64_t transport_retired_buffers{0};
+    };
+
+    /** This run's handoff report, as `report_run_terminal_snapshot` produced it. */
+    HandoffReport handoff_report_for_test() const { return handoff_report_; }
+
+    /**
      * One completed run's diagnostic data, owned by that run.
      *
      * A plain owned value: every field is held by value, the record streams are
@@ -863,6 +977,35 @@ public:
     }
 
 private:
+    static constexpr size_t kProducerClasses = 4;  // indexed by ProfBufferType
+
+    /**
+     * What the transport presented and what this run validly received, for one
+     * producer class.
+     *
+     * Deliberately three layers rather than one number. `observed_buffers` is a
+     * transport fact and is incremented before anything is checked.
+     * `received_*` are run-owned: a buffer only reaches them once its kind,
+     * index and epoch are valid, so a foreign-epoch buffer can never discharge
+     * the current run's handoff. Retention — how many records the host actually
+     * kept — stays in the `total_*_collected` figures above and is a third
+     * quantity again.
+     *
+     * `received_records` is added only when the buffer's own count is within
+     * capacity; a malformed count still counts the buffer, because the handoff
+     * happened, but its record figure is not trustworthy and
+     * `malformed_count_buffers` is what marks the producer's record verdict
+     * untrusted.
+     */
+    struct HandoffReceipt {
+        uint64_t observed_buffers{0};
+        uint64_t invalid_index_buffers{0};
+        uint64_t foreign_epoch_buffers{0};
+        uint64_t malformed_count_buffers{0};
+        uint64_t received_buffers{0};
+        uint64_t received_records{0};
+    };
+
     struct alignas(64) CollectorShardCounters {
         uint64_t total_perf_collected{0};
         uint64_t total_sched_phase_collected{0};
@@ -881,6 +1024,22 @@ private:
         // this run's conservation check.
         uint64_t aicore_foreign_identity{0};
         bool has_phase_data{false};
+        // Every buffer the poll loop handed this shard, counted before the kind
+        // is used to pick a class — a kind outside the four is `unroutable` and
+        // has no class receipt to land in, but it is still a buffer this
+        // collector was handed.
+        uint64_t buffers_presented{0};
+        uint64_t unroutable_buffers{0};
+        // Handoff receipt, kept apart from retention above. `observed` counts
+        // every buffer the transport presented for this class, before any
+        // validation, so a buffer this host declines is still visible
+        // somewhere. The three reject tallies are the reasons it was declined;
+        // `received_*` count only what was valid enough to attribute to this
+        // run's producer.
+        //
+        // Per shard, so the collector threads never share a counter; merged at
+        // reconcile on the owning thread after quiesce.
+        HandoffReceipt receipt[kProducerClasses]{};
     };
     static_assert(
         sizeof(CollectorShardCounters) % 64 == 0, "CollectorShardCounters must not share cache lines across shards"
@@ -1009,6 +1168,15 @@ private:
     // verdict rather than inheriting the previous run's identity.
     uint64_t armed_run_epoch_{0};
 
+    // Per-class handoff receipt, summed from the shards at merge time.
+    HandoffReceipt merged_receipt_[kProducerClasses]{};
+    uint64_t merged_presented_buffers_{0};
+    uint64_t merged_unroutable_buffers_{0};
+    // What the drain path retired before it could be presented, captured in
+    // reconcile because `report_drain_drops()` consumes the counter.
+    uint64_t transport_retired_buffers_{0};
+    HandoffReport handoff_report_{};
+
     // What `report_run_terminal_snapshot` read and concluded for this run, kept
     // so the seal can carry it without a second bank read. `begin_run` clears
     // the flag: a predecessor's terminal verdict is not this run's.
@@ -1029,6 +1197,34 @@ private:
      * violation, which callers must treat as "no shard owns this call".
      */
     size_t normalize_collector_shard(int collector_shard) const;
+    bool producer_index_in_range(ProfBufferType type, uint32_t index) const;
+    bool read_buffer_identity(
+        const ReadyBufferInfo &info, uint64_t *epoch_out, uint32_t *count_out, uint32_t *capacity_out
+    ) const;
+    void note_buffer_observed(const ReadyBufferInfo &info, int collector_shard);
+
+    /**
+     * Which of `expected`'s indices a class's terminal entries cover.
+     *
+     * The one place the expected-index comparison lives: both the
+     * snapshot-vs-live consistency verdict and the handoff report judge
+     * coverage from this, so they cannot drift into two different answers
+     * about the same bank. `state` is the summary the handoff report uses; a
+     * caller with no expected set of its own overrides it with `Unknown`
+     * rather than passing a fabricated `expected`.
+     */
+    struct TerminalIndexCoverage {
+        HandoffCoverage state{HandoffCoverage::Unknown};
+        int expected{0};
+        int reported{0};
+        int missing{0};
+        int unexpected{0};
+    };
+    static TerminalIndexCoverage terminal_index_coverage(const RunTerminalClassSnapshot &cls, int expected);
+    static HandoffClassReport classify_handoff(
+        const RunTerminalClassSnapshot &cls, const HandoffReceipt &receipt, const TerminalIndexCoverage &coverage
+    );
+    HandoffReport build_handoff_report(const RunTerminalSnapshot &snapshot);
     void reset_collector_shards();
     void merge_collector_shards();
 

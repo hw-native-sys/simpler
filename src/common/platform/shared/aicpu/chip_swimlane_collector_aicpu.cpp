@@ -168,6 +168,9 @@ static void close_run_terminal(int producer_index, const ChipSwimlaneActiveHead 
     );
     entry->total = head->total_record_count;
     entry->dropped = head->dropped_record_count;
+    entry->published_records = head->published_record_count;
+    entry->published_buffers = head->published_buffer_count;
+    entry->live_at_close = head->live_record_count;
     entry->run_epoch = epoch;
     wmb();
     cache_flush_range(entry, sizeof(ChipSwimlaneRunTerminal));
@@ -221,7 +224,14 @@ struct ChipSwimlaneDeviceModule {
     }
 
     static void account_dropped(Context, State *state, uint32_t count) {
-        state->head.dropped_record_count = state->head.dropped_record_count + count;
+        chip_swimlane_add_saturating(state->head.dropped_record_count, count);
+    }
+    // One successful ready-queue commit. `saved_count` was read before
+    // publication, so it stays valid after the host takes the buffer; a
+    // zero-record commit still counts as a handoff.
+    static void on_publish_committed(Context, State *state, uint32_t saved_count) {
+        chip_swimlane_add_saturating(state->head.published_record_count, saved_count);
+        chip_swimlane_add_saturating(state->head.published_buffer_count, 1);
     }
     static const char *phase_label(ChipSwimlaneBufferKind kind) {
         return kind == ChipSwimlaneBufferKind::AicpuOrchPhase ? "orch" : "sched";
@@ -539,8 +549,9 @@ static void switch_task_buffer(int core_id, int thread_idx) {
 static uint32_t take_aicore_live_count(ChipSwimlaneAicoreTaskPool *ac_state) {
     uint32_t live = ac_state->head.live_record_count;
     if (live > static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE)) {
-        ac_state->head.dropped_record_count =
-            ac_state->head.dropped_record_count + (live - static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE));
+        chip_swimlane_add_saturating(
+            ac_state->head.dropped_record_count, live - static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE)
+        );
         live = static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
     }
     ac_state->head.live_record_count = 0;
@@ -568,7 +579,8 @@ static void publish_aicore_pending_buffer(int core_id, int thread_idx) {
     }
     ChipSwimlaneAicoreTaskPool *ac_state = s_aicore_task_pools[core_id];
     if (ac_state != nullptr) {
-        ac_state->head.published_record_count = ac_state->head.published_record_count + pe.record_count;
+        chip_swimlane_add_saturating(ac_state->head.published_record_count, pe.record_count);
+        chip_swimlane_add_saturating(ac_state->head.published_buffer_count, 1);
         wmb();
     }
     pe.buf_ptr = 0;
@@ -701,14 +713,14 @@ void chip_swimlane_aicpu_on_aicore_dispatch(int core_id, int thread_idx, uint32_
         aicore_rotate(core_id, thread_idx, reg_task_id);
     }
     s_aicore_dispatched_count[core_id] = prev + 1;
-    ac_state->head.total_record_count += 1;
+    chip_swimlane_add_saturating(ac_state->head.total_record_count, 1);
     if (ac_state->head.current_buf_ptr == 0) {
         // No buffer to land in, so this dispatch produces no record: AICore
         // resolves the head lazily and gets a null buffer, and its reserve
         // refuses. Charging it to `live` instead would attribute it to whichever
         // buffer the pool hands over next — a buffer that never received it —
         // and the flush would then mark that buffer with a count it cannot back.
-        ac_state->head.dropped_record_count += 1;
+        chip_swimlane_add_saturating(ac_state->head.dropped_record_count, 1);
     } else {
         ac_state->head.live_record_count += 1;
     }
@@ -743,7 +755,7 @@ int chip_swimlane_aicpu_complete_task(
 
     // Account every commit attempt up front so host can detect silent loss as
     // `device_total - (collected + dropped)`.
-    state->head.total_record_count += 1;
+    chip_swimlane_add_saturating(state->head.total_record_count, 1);
 
     ChipSwimlaneAicpuTaskBuffer *chip_swimlane_buf = s_current_aicpu_task_buffers[core_id];
     if (chip_swimlane_buf == nullptr) {
@@ -752,14 +764,14 @@ int chip_swimlane_aicpu_complete_task(
             // No active records buffer (init ran out of free buffers or host has
             // not refilled after the last published full buffer); count as drop
             // so host reconciliation stays consistent.
-            state->head.dropped_record_count += 1;
+            chip_swimlane_add_saturating(state->head.dropped_record_count, 1);
             return -1;
         }
     }
     uint32_t count = chip_swimlane_buf->count;
     if (count >= PLATFORM_PROF_BUFFER_SIZE) {
         // Defensive: should not happen because we rotate at end of every commit.
-        state->head.dropped_record_count += 1;
+        chip_swimlane_add_saturating(state->head.dropped_record_count, 1);
         return -1;
     }
 
@@ -816,11 +828,17 @@ void chip_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int 
             ChipSwimlaneAicpuTaskBuffer *buf = reinterpret_cast<ChipSwimlaneAicpuTaskBuffer *>(buf_ptr);
             if (buf->count > 0) {
                 uint32_t seq = state->head.current_buf_seq;
+                // Read before publication: a successful commit hands the
+                // buffer to the host, which may recycle it before this
+                // function's next statement runs.
+                const uint32_t saved_count = buf->count;
                 int rc = enqueue_ready_buffer(
                     s_chip_swimlane_header, thread_idx, core_id, buf_ptr, seq, ChipSwimlaneBufferKind::AicpuTask
                 );
                 if (rc == 0) {
-                    LOG_INFO("Thread %d: Core %d flushed buffer with %u records", thread_idx, core_id, buf->count);
+                    LOG_INFO("Thread %d: Core %d flushed buffer with %u records", thread_idx, core_id, saved_count);
+                    chip_swimlane_add_saturating(state->head.published_record_count, saved_count);
+                    chip_swimlane_add_saturating(state->head.published_buffer_count, 1);
                     flushed_count++;
                     state->head.current_buf_ptr = 0;
                     s_current_aicpu_task_buffers[core_id] = nullptr;
@@ -833,9 +851,9 @@ void chip_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int 
                     // it in place, which is the only return available to AICPU.
                     LOG_ERROR(
                         "Thread %d: Core %d failed to enqueue buffer (queue full), %u records lost!", thread_idx,
-                        core_id, buf->count
+                        core_id, saved_count
                     );
-                    state->head.dropped_record_count = state->head.dropped_record_count + buf->count;
+                    chip_swimlane_add_saturating(state->head.dropped_record_count, saved_count);
                     buf->count = 0;
                     wmb();
                 }
@@ -883,7 +901,8 @@ void chip_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int 
             LOG_INFO(
                 "Thread %d: Core %d flushed AICore buffer (seq=%u, count=%u)", thread_idx, core_id, ac_seq, ac_mark
             );
-            ac_state->head.published_record_count = ac_state->head.published_record_count + ac_mark;
+            chip_swimlane_add_saturating(ac_state->head.published_record_count, ac_mark);
+            chip_swimlane_add_saturating(ac_state->head.published_buffer_count, 1);
             ac_state->head.current_buf_ptr = 0;
             wmb();
         } else {
@@ -891,7 +910,7 @@ void chip_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int 
             // pool's so the next run's init can reuse it, since a cleared
             // pointer would strand storage the host never received.
             LOG_ERROR("Thread %d: Core %d failed to enqueue AICore buffer at flush (queue full)", thread_idx, core_id);
-            ac_state->head.dropped_record_count = ac_state->head.dropped_record_count + ac_mark;
+            chip_swimlane_add_saturating(ac_state->head.dropped_record_count, ac_mark);
             wmb();
         }
     }
@@ -1059,14 +1078,14 @@ static inline ChipSwimlaneAicpuSchedPhaseRecord *acquire_sched_phase_record(int 
     auto *state = s_sched_phase_pools[thread_idx];
     if (state == nullptr) return nullptr;
 
-    state->head.total_record_count += 1;
+    chip_swimlane_add_saturating(state->head.total_record_count, 1);
 
     auto *record = acquire_phase_slot<ChipSwimlaneAicpuSchedPhaseBuffer, ChipSwimlaneAicpuSchedPhaseRecord>(
         /*thread_idx=*/thread_idx, /*pool_idx=*/static_cast<uint32_t>(thread_idx), state,
         &s_current_sched_phase_buffers[thread_idx], ChipSwimlaneBufferKind::AicpuSchedPhase, "sched"
     );
     if (record == nullptr) {
-        state->head.dropped_record_count += 1;
+        chip_swimlane_add_saturating(state->head.dropped_record_count, 1);
         return nullptr;
     }
     return record;
@@ -1159,14 +1178,14 @@ void chip_swimlane_aicpu_record_orch_phase(
     auto *state = s_orch_phase_pools[0];
     if (state == nullptr) return;
 
-    state->head.total_record_count += 1;
+    chip_swimlane_add_saturating(state->head.total_record_count, 1);
 
     auto *record = acquire_phase_slot<ChipSwimlaneAicpuOrchPhaseBuffer, ChipSwimlaneAicpuOrchPhaseRecord>(
         /*thread_idx=*/s_orch_thread_idx, /*pool_idx=*/0, state, &s_current_orch_phase_buffers[0],
         ChipSwimlaneBufferKind::AicpuOrchPhase, "orch"
     );
     if (record == nullptr) {
-        state->head.dropped_record_count += 1;
+        chip_swimlane_add_saturating(state->head.dropped_record_count, 1);
         return;
     }
     record->start_time = start_time;
@@ -1194,15 +1213,20 @@ static void flush_phase_pool(
                                        &reinterpret_cast<ChipSwimlaneAicpuSchedPhaseBuffer *>(buf_ptr)->count;
     if (*count_ptr == 0) return;
     uint32_t seq = state->head.current_buf_seq;
+    // Read before publication: a successful commit hands the buffer to the
+    // host, which may recycle it before the next statement here runs.
+    const uint32_t saved_count = *count_ptr;
     int rc = enqueue_ready_buffer(s_chip_swimlane_header, thread_idx, pool_idx, buf_ptr, seq, kind);
     if (rc == 0) {
-        LOG_INFO("Thread %d: flushed %s phase buffer with %u records", thread_idx, kind_label, *count_ptr);
+        LOG_INFO("Thread %d: flushed %s phase buffer with %u records", thread_idx, kind_label, saved_count);
+        chip_swimlane_add_saturating(state->head.published_record_count, saved_count);
+        chip_swimlane_add_saturating(state->head.published_buffer_count, 1);
     } else {
         LOG_ERROR(
             "Thread %d: failed to enqueue %s phase buffer (queue full), %u records lost!", thread_idx, kind_label,
-            *count_ptr
+            saved_count
         );
-        state->head.dropped_record_count += *count_ptr;
+        chip_swimlane_add_saturating(state->head.dropped_record_count, saved_count);
         *count_ptr = 0;
     }
     state->head.current_buf_ptr = 0;

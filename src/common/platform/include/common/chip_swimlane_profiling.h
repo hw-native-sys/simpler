@@ -321,10 +321,31 @@ struct ChipSwimlaneActiveHead {
     volatile uint32_t dropped_record_count;    // 4 — producer-dropped writes
     volatile uint32_t live_record_count;       // 4 — writes into the buffer currently active
     volatile uint32_t published_record_count;  // 4 — writes in buffers handed to the host
-    uint32_t pad[9];                           // 36 → 64B
+    volatile uint32_t published_buffer_count;  // 4 — buffers handed to the host, zero-record ones included
+    uint32_t pad[8];                           // 32 → 64B
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(ChipSwimlaneActiveHead) == 64, "ChipSwimlaneActiveHead must be one cache line");
+// `publish_run_config` resets the cumulative counters with one narrow write
+// over this contiguous span, so a gap here would leave a counter carrying the
+// previous run's value into the next one.
+static_assert(offsetof(ChipSwimlaneActiveHead, total_record_count) == 12, "cumulative counter span drift");
+static_assert(offsetof(ChipSwimlaneActiveHead, published_buffer_count) == 28, "cumulative counter span drift");
+
+/**
+ * Add `n` to a cumulative producer counter without wrapping.
+ *
+ * A wrapped counter is indistinguishable from a small one, and two counters
+ * wrapping together can make a producer that lost 2^32 records read as one
+ * that produced nothing. Saturating instead makes UINT32_MAX a reliable
+ * "this count is no longer exact" sentinel that every reader can test.
+ *
+ * Single-writer: the owning AICPU thread is the only mutator of a given head.
+ */
+inline void chip_swimlane_add_saturating(volatile uint32_t &counter, uint32_t n) {
+    const uint32_t current = counter;
+    counter = (n > UINT32_MAX - current) ? UINT32_MAX : current + n;
+}
 
 // =============================================================================
 // ChipSwimlaneRunTerminal - per-run terminal accounting snapshot
@@ -344,11 +365,15 @@ static_assert(sizeof(ChipSwimlaneActiveHead) == 64, "ChipSwimlaneActiveHead must
  * whole test, and a second field would imply a concurrent publication protocol
  * this design does not provide.
  *
- * Only `total` and `dropped` are retained. They are the two counters every pool
- * class maintains and the two the host's reconcile already compares;
- * `live_record_count` and `published_record_count` are written by the AICore
- * pool alone, so retaining them would record zero for every AICPU and phase
- * producer.
+ * `total` and `dropped` are the two counters every pool class maintains.
+ * `published_records` / `published_buffers` are what the producer actually
+ * handed to the host, which no other field states: `total - dropped` counts
+ * what the producer *meant* to deliver, and a handoff can still be lost
+ * afterwards without either moving. `live_at_close` records whatever was still
+ * in the active buffer when the producer closed; a non-zero value means the
+ * settlement step did not run, so the other figures are not a closed set.
+ * Retaining `live_at_close` is also what keeps a reader from having to inspect
+ * the live head after the fence — a head a later run may already have reused.
  *
  * One entry per cache line, and the array start is line-aligned. The producer
  * publishes with `cache_flush_range`, which rounds to whole 64-byte lines, so
@@ -356,16 +381,30 @@ static_assert(sizeof(ChipSwimlaneActiveHead) == 64, "ChipSwimlaneActiveHead must
  * copy of the other's.
  */
 struct ChipSwimlaneRunTerminal {
-    volatile uint64_t run_epoch;  // 8 — 0 = no snapshot in this entry
-    volatile uint32_t total;      // 4 — total_record_count when the producer closed
-    volatile uint32_t dropped;    // 4 — dropped_record_count when the producer closed
-    uint32_t pad[12];             // 48 → 64B
+    volatile uint64_t run_epoch;          // 8 — 0 = no snapshot in this entry
+    volatile uint32_t total;              // 4 — total_record_count when the producer closed
+    volatile uint32_t dropped;            // 4 — dropped_record_count when the producer closed
+    volatile uint32_t published_records;  // 4 — records in buffers committed to the ready queue
+    volatile uint32_t published_buffers;  // 4 — successful ready-queue commits
+    volatile uint32_t live_at_close;      // 4 — records still unsettled in the active buffer
+    uint32_t pad[9];                      // 36 → 64B
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(ChipSwimlaneRunTerminal) == 64, "ChipSwimlaneRunTerminal must be one cache line");
 static_assert(alignof(ChipSwimlaneRunTerminal) == 64, "ChipSwimlaneRunTerminal must be cache-line aligned");
 static_assert(offsetof(ChipSwimlaneRunTerminal, total) == 8, "ChipSwimlaneRunTerminal::total offset drift");
 static_assert(offsetof(ChipSwimlaneRunTerminal, dropped) == 12, "ChipSwimlaneRunTerminal::dropped offset drift");
+static_assert(
+    offsetof(ChipSwimlaneRunTerminal, published_records) == 16,
+    "ChipSwimlaneRunTerminal::published_records offset drift"
+);
+static_assert(
+    offsetof(ChipSwimlaneRunTerminal, published_buffers) == 20,
+    "ChipSwimlaneRunTerminal::published_buffers offset drift"
+);
+static_assert(
+    offsetof(ChipSwimlaneRunTerminal, live_at_close) == 24, "ChipSwimlaneRunTerminal::live_at_close offset drift"
+);
 // The device writes this entry and the host reads it back with a raw byte copy,
 // so it is a wire struct. The compiler builtins are used rather than the
 // `<type_traits>` spellings because this header is also compiled by ccec, which
