@@ -35,9 +35,11 @@
 
 #include "aicpu/scope_stats_collector_aicpu.h"
 #include "common/scope_stats.h"
-// Collector compiled in here (not linked via CMake).
+// Collector compiled in here (not linked via CMake). Reached through the
+// platform/shared include directory this target adds, so the path does not
+// depend on how deep the test file sits.
 // NOLINTNEXTLINE(bugprone-suspicious-include)
-#include "../../../../src/common/platform/shared/aicpu/scope_stats_collector_aicpu.cpp"
+#include "aicpu/scope_stats_collector_aicpu.cpp"
 
 namespace {
 

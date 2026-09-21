@@ -125,7 +125,7 @@ int DeviceRunner::ensure_acl_ready(int device_id) {
     // makes the context a program context. Latching here rather than merely
     // testing is_kernel() closes the unclaimed path: ensure_acl_ready_ctx is a
     // standalone initialization entry that callers reach without simpler_init
-    // (tests/ut/cpp/hardware/test_comm_lifecycle.cpp), and an unlatched context
+    // (tests/ut/cpp/common/platform_comm/test_comm_lifecycle.cpp), and an unlatched context
     // that took ACL ownership would later let a kernel latch coexist with
     // acl_ready_, whose finalize resets a device this context does not own.
     // Latching before the first ACL call is also what keeps the refusal

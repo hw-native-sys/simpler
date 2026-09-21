@@ -215,7 +215,7 @@ enforces coverage. Edit those and the log carries the new code correctly:
 | runtime code names / descriptions / hints | `src/common/runtime_status/error_names.h` |
 | host-side CANN names / descriptions / hints | `src/common/platform/include/host/acl_error_names.h` |
 | `SCHEDULER_TIMEOUT` sub-class labels | `src/common/host_build_graph/runtime_status.h`, `src/{arch}/runtime/tensormap_and_ringbuffer/common/runtime_status.h` |
-| completeness test | `tests/ut/cpp/common/test_error_code_names.cpp` |
+| completeness test | `tests/ut/cpp/common/runtime_status/test_error_code_names.cpp` |
 
 **This page does not need updating for a new code** — deliberately. The tables
 above carry only the triage column and the CANN names, neither of which the log

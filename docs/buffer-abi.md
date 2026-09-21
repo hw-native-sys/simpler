@@ -9,7 +9,7 @@ across the L3→L2 (and L4→L3) boundaries without a side table.
 This page is the user-facing how-to. The byte layout itself is pinned by the
 `static_assert`s in [`src/common/task_interface/buffer.h`](../src/common/task_interface/buffer.h)
 — sizes, field offsets, and enum values all fail the build if they drift, and
-[`tests/ut/cpp/types/test_buffer.cpp`](../tests/ut/cpp/types/test_buffer.cpp)
+[`tests/ut/cpp/common/task_interface/test_buffer.cpp`](../tests/ut/cpp/common/task_interface/test_buffer.cpp)
 pins them again from the outside.
 
 All three types are that header's C++ structs bound directly, so Python and C++

@@ -56,8 +56,11 @@ def test_launch_requires_published_runtime_descriptor(arch: str, runtime: str, t
     binary = tmp_path / "publication_launch_probe"
     command += [
         "-UNDEBUG",
-        str(_ROOT / "tests/ut/cpp/hardware/runtime_publication_launch_probe.cpp"),
-        f"-I{_ROOT / 'tests/ut/cpp/common'}",
+        str(_ROOT / "tests/ut/py/support/runtime_publication_launch_probe.cpp"),
+        # The probe reaches its test fixture by path from the unit-test root, the
+        # same way the C++ targets do, so a fixture that moves stays reachable
+        # from both without this line changing.
+        f"-I{_ROOT / 'tests/ut/cpp'}",
         str(library),
         f"-Wl,-rpath,{library.parent}",
         f"-L{cann / 'lib64'}",

@@ -48,7 +48,7 @@ Tracked local changes after Phase 3 audit fixes:
 | `docs/remote-l3-worker-design.md` | Modified | Adds a link to `pr-split-and-audit-plan.md`; pre-existing audit/doc change |
 | `src/common/hierarchical/remote_wire.cpp` | Modified | Phase 3 fix: include `enable_scope_stats` in `CallConfigWire v1` encode/decode |
 | `python/simpler/remote_l3_protocol.py` | Modified | Phase 3 fix: decode `enable_scope_stats` from TASK payloads |
-| `tests/ut/cpp/hierarchical/test_remote_wire.cpp` | Modified | Phase 3 regression coverage for `enable_scope_stats` TASK round trip |
+| `tests/ut/cpp/common/hierarchical/test_remote_wire.cpp` | Modified | Phase 3 regression coverage for `enable_scope_stats` TASK round trip |
 | `tests/ut/py/test_task_interface.py` | Modified | Phase 3 regression coverage for Python TASK decode of `enable_scope_stats` |
 | `tests/ut/py/test_callable_identity.py` | Modified | Phase 3 coverage for `PYTHON_SERIALIZED` and `STAGED_BLOB` unsupported negotiation paths |
 

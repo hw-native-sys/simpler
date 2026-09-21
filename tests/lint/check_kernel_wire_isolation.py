@@ -67,8 +67,8 @@ ALLOWED = frozenset(
         "src/common/platform/sim/host/c_api_shared.cpp",
         "src/common/platform/sim/host/device_runner_base.cpp",
         # Their unit tests.
-        "tests/ut/cpp/types/test_buffer.cpp",
-        "tests/ut/cpp/types/test_child_memory.cpp",
+        "tests/ut/cpp/common/task_interface/test_buffer.cpp",
+        "tests/ut/cpp/common/task_interface/test_child_memory.cpp",
     }
 )
 

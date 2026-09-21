@@ -163,7 +163,7 @@ Two things this gives up, both deliberately: a stale or mis-packed byte in the
 retained staging block, and "same `full_key`, different bytes", are no longer
 detected at run time. The first is covered instead by
 `GraphDefinitionObject.RejectsHeaderFramingAnotherGraph` in
-`tests/ut/cpp/common/test_hbg_graph_cache.cpp`, which pins that a header framing
+`tests/ut/cpp/common/host_build_graph/test_hbg_graph_cache.cpp`, which pins that a header framing
 an image of another Graph is refused.
 
 ## Notes

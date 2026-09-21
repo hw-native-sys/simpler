@@ -47,6 +47,13 @@ repos:
           files: \.(h|hpp|cpp|cc|cxx)$
           exclude: ^3rdparty/
 
+        - id: check-ut-cpp-case-naming
+          name: check-ut-cpp-case-naming
+          entry: python tests/lint/check_ut_cpp_case_naming.py
+          language: python
+          language_version: python3
+          files: ^tests/ut/cpp/.*\.cpp$
+
     - repo: https://github.com/pre-commit/pre-commit-hooks
       rev: v4.6.0
       hooks:

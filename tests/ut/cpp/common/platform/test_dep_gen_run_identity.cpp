@@ -34,9 +34,14 @@
 #include "common/dep_gen.h"
 #include "common/memory_barrier.h"
 #include "host/dep_gen_collector.h"
-#include "types.h"
 
 namespace {
+
+// The collector stores this byte and never reads it back: DepFlags is declared
+// in each runtime's own types.h, which is why the entry point takes a plain
+// uint8_t. Naming the enumerators here would tie this case to one runtime's
+// spelling of a value the code under test does not interpret.
+constexpr uint8_t kCreatorEdgeDepKinds = 0x3;  // wait | retain
 
 void *dep_gen_test_alloc(size_t size) { return std::calloc(1, size); }
 
@@ -118,7 +123,7 @@ protected:
         dep_gen_aicpu_record_submit(
             task_id_raw, /*in_manual_scope=*/false, /*early_dispatch=*/false, /*tensor_count=*/0,
             /*tensor_ptrs=*/nullptr, /*arg_types=*/nullptr, /*explicit_dep_count=*/0, /*explicit_deps_raw=*/nullptr,
-            /*explicit_dep_kinds_raw=*/nullptr, static_cast<uint8_t>(DEP_WAIT | DEP_RETAIN), /*block_num=*/1, kernel_ids
+            /*explicit_dep_kinds_raw=*/nullptr, kCreatorEdgeDepKinds, /*block_num=*/1, kernel_ids
         );
     }
 

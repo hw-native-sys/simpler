@@ -33,7 +33,7 @@ they cannot be provoked. Recording why, so the next person does not re-derive it
   it gets named instead of mislabelled.
 
 The name tables are held complete for these anyway
-(`tests/ut/cpp/common/test_error_code_names.cpp`) — an unreachable code is exactly
+(`tests/ut/cpp/common/runtime_status/test_error_code_names.cpp`) — an unreachable code is exactly
 the one that would otherwise print as a bare number on the day it finally fires.
 
 If you do hit 10, 11, 103, S4, S5 or unknown, it is a runtime bug. Keep the device

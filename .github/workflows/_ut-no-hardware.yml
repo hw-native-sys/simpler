@@ -89,23 +89,34 @@ jobs:
           fi
           # Real entry tests may skip in a standalone C++ build, but not in CI.
           test -f build/lib/libcpu_sim_context.so
+          # discover_runtimes is the one definition of what a runtime is — a
+          # directory under src/<arch>/runtime with a build_config.py — so a new
+          # one is asserted here without editing this list into existence. An
+          # empty result would make the loop body run zero times and the step
+          # pass having asserted nothing, which `set -e` does not catch in a
+          # `for` list, so it is rejected before the loop.
           for arch in a2a3 a5; do
-            for runtime in tensormap_and_ringbuffer host_build_graph; do
+            runtimes=$(python -c \
+                "from simpler_setup.platform_info import discover_runtimes; print(' '.join(discover_runtimes('$arch')))")
+            test -n "$runtimes"
+            for runtime in $runtimes; do
               test -f "build/lib/$arch/sim/$runtime/libhost_runtime.so"
             done
           done
-          cmake -B tests/ut/cpp/build -S tests/ut/cpp
+          cmake -B tests/ut/cpp/build -S tests/ut/cpp -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
           cmake --build tests/ut/cpp/build --parallel 4
           ctest --test-dir tests/ut/cpp/build -LE requires_hardware -j4 --output-on-failure --timeout 300
+          # A case built once against one arch or one runtime passes exactly like
+          # one that covers every configuration, so the gap is invisible to ctest.
+          # This reads the build's compile lines instead. It needs the configured
+          # build above, which is why it is here and not in pre-commit.
+          python tests/lint/check_ut_cpp_axis.py --jobs 4
+          # A stub the support archive lost to a weak fallback links fine and
+          # then hangs, so ctest only catches it by timing out. This reads the
+          # built binaries' symbol tables and names every target that took one.
+          python tests/lint/check_ut_cpp_stub_linkage.py
           # The swimlane export→parse roundtrip needs the C++ exporter binary, so
           # it runs here rather than in the pyut sweep above (which precedes this
           # build and skips it). Asserting the parser against hand-written JSON
           # would not catch the exporter and the reader drifting apart.
-          #
-          # The collector is built once per runtime, since a platform source ships
-          # inside each runtime's image, and the roundtrip runs under both: the
-          # exporter names its runtime and the parser decodes task ids by it.
-          for runtime in tensormap_and_ringbuffer host_build_graph; do
-            test -x "tests/ut/cpp/build/test_chip_swimlane_collector_$runtime"
-          done
           python -m pytest tests/ut/py/test_swimlane_export_run_identity.py -v

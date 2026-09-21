@@ -14,7 +14,7 @@ coverage follows the device the case runs on. On the sim platforms this file is 
 for, that is ``SIM_AUTO_BLOCKDIM`` (8) clusters — 24 core-state bits, entirely within the
 low 64 of ``CoreTracker::BitStates``. **This case therefore does not reach a cluster
 offset above bit 63**; the >63-bit MIX selection path is covered by the arch-parity unit
-test ``tests/ut/cpp/common/test_hbg_core_tracker.cpp``, which drives ``CoreTracker``
+test ``tests/ut/cpp/common/host_build_graph/test_hbg_core_tracker.cpp``, which drives ``CoreTracker``
 directly at ``MAX_CLUSTERS``. What this case does cover is that MIX placement, sync-start
 drain, and the AIV cohort agree on block-to-core mapping when a single scheduler thread
 (``aicpu_thread_num=2`` leaves one scheduler plus one resolution thread) owns every cluster.

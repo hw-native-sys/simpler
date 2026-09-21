@@ -168,6 +168,7 @@ nav:
   - Build and test:
       - Developer Guide: developer-guide.md
       - Testing: testing.md
+      - Adding a C++ unit test: testing/adding-a-cpp-unit-test.md
       - CI Pipeline: ci.md
       - Python Packaging: python-packaging.md
       - Sanitizers: sanitizers.md

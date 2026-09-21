@@ -17,7 +17,7 @@
 #include <memory>
 #include <utility>
 #include "device_runner.h"
-#include "native_run_execution_test_peer.h"
+#include "common/support/native_run_execution_peer.h"
 
 // These process-local RTS symbols interpose the library calls. No device is
 // initialized; entering stream/event setup is observable and fails closed.

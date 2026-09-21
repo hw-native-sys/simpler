@@ -38,22 +38,56 @@ from simpler_setup.tools.swimlane_converter import (
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _EXPORT_SUBDIR = "chip_swimlane_export_identity"
-# The collector is built once per runtime, since a platform source ships inside each
-# runtime's image and the exporter names the runtime it was built for. The roundtrip
-# runs under both: the exporter writes metadata.runtime and the parser decodes task
-# ids by it, so a layout that only one of them agrees on shows up here and nowhere
-# else in this file.
-_COLLECTOR_RUNTIMES = (TMR_RUNTIME, HBG_RUNTIME)
+# The collector is built once per (arch, runtime) pair: a platform source ships
+# inside each runtime's image, where the exporter names the runtime it was built
+# for, and it compiles against each arch's platform headers, which are not the
+# same file. The roundtrip runs under every pair: the exporter writes
+# metadata.runtime and the parser decodes task ids by it, so a layout that only
+# one of them agrees on shows up here and nowhere else in this file.
+_COLLECTOR_BUILDS = tuple((arch, runtime) for arch in ("a2a3", "a5") for runtime in (TMR_RUNTIME, HBG_RUNTIME))
+# Which binary belongs to which pair is the C++ tree's to say. It assembles
+# target names from the case file and the combination, so spelling one here
+# would be a second implementation of that rule with nothing tying it to the
+# first — and its failure mode is a file this side cannot find, which reads as
+# "not built" and skips. The manifest is written by
+# simpler_ut_write_pyut_manifest() from $<TARGET_FILE:...>, so a renamed target
+# or a relocated binary changes the recorded path and nothing here.
+_PYUT_MANIFEST = _REPO_ROOT / "tests" / "ut" / "cpp" / "build" / "pyut_binaries.json"
+_COLLECTOR_HANDLE = "chip_swimlane_collector"
 
 
-def _export_two_runs(tmp_path: Path, runtime: str) -> Path:
-    """Produce a two-run capture with the real exporter and return its JSON path."""
-    binary = _REPO_ROOT / "tests" / "ut" / "cpp" / "build" / f"test_chip_swimlane_collector_{runtime}"
-    if not binary.exists():
+def _collectors() -> dict[tuple[str, str], Path]:
+    """The exported collector binary for each pair, as the C++ tree recorded it."""
+    if not _PYUT_MANIFEST.exists():
         pytest.skip(
-            f"{binary} not built; the roundtrip runs in the C++ unit test CI step, "
-            "after cmake --build tests/ut/cpp/build"
+            f"{_PYUT_MANIFEST} is absent; the roundtrip runs in the C++ unit test "
+            "CI step, after cmake -B tests/ut/cpp/build -S tests/ut/cpp"
         )
+    exported = {
+        (entry["arch"], entry["runtime"]): Path(entry["path"])
+        for entry in json.loads(_PYUT_MANIFEST.read_text())
+        if entry["handle"] == _COLLECTOR_HANDLE
+    }
+    # The manifest states what configure intended to build, so a pair missing
+    # from it is a declaration that lost an axis — not an unbuilt tree, which
+    # the existence check below is for.
+    assert set(exported) == set(_COLLECTOR_BUILDS), (
+        f"the C++ tree exports {sorted(exported)} for handle {_COLLECTOR_HANDLE!r}, "
+        f"but the roundtrip covers {sorted(_COLLECTOR_BUILDS)}. Its declaration in "
+        "tests/ut/cpp/common/platform/CMakeLists.txt has lost a combination."
+    )
+    return exported
+
+
+def _export_two_runs(tmp_path: Path, arch: str, runtime: str) -> Path:
+    """Produce a two-run capture with the real exporter and return its JSON path."""
+    exported = _collectors()
+    if not any(path.exists() for path in exported.values()):
+        pytest.skip(f"{_PYUT_MANIFEST.parent} is configured but not built; run cmake --build tests/ut/cpp/build")
+    binary = exported[(arch, runtime)]
+    # Some sibling exists, so the tree is built and this one's absence is that
+    # target having failed or been excluded, which is not a skip.
+    assert binary.exists(), f"the tree is built but {binary} is absent"
     completed = subprocess.run(
         [str(binary), "--gtest_filter=*ExportsTwoRunsDistinctly*"],
         cwd=tmp_path,
@@ -68,10 +102,10 @@ def _export_two_runs(tmp_path: Path, runtime: str) -> Path:
     return path
 
 
-@pytest.mark.parametrize("runtime", _COLLECTOR_RUNTIMES)
-def test_two_runs_reusing_task_ids_stay_attributed(tmp_path, runtime):
+@pytest.mark.parametrize(("arch", "runtime"), _COLLECTOR_BUILDS)
+def test_two_runs_reusing_task_ids_stay_attributed(tmp_path, arch, runtime):
     """Two runs, same core, same reg_task_ids, different times — each keeps its own."""
-    records = read_perf_data(_export_two_runs(tmp_path, runtime))
+    records = read_perf_data(_export_two_runs(tmp_path, arch, runtime))
     assert records["runtime"] == runtime, "the exporter named a runtime the parser did not read back"
     tasks = records["tasks"]
     assert tasks, "the parser produced no tasks from a real two-run capture"
@@ -101,10 +135,10 @@ def test_two_runs_reusing_task_ids_stay_attributed(tmp_path, runtime):
         assert task["duration_us"] == pytest.approx(task["end_time_us"] - task["start_time_us"])
 
 
-@pytest.mark.parametrize("runtime", _COLLECTOR_RUNTIMES)
-def test_every_exported_row_carries_an_epoch(tmp_path, runtime):
+@pytest.mark.parametrize(("arch", "runtime"), _COLLECTOR_BUILDS)
+def test_every_exported_row_carries_an_epoch(tmp_path, arch, runtime):
     """The identity is per row, so the parser must never fall back to None here."""
-    path = _export_two_runs(tmp_path, runtime)
+    path = _export_two_runs(tmp_path, arch, runtime)
     data = json.loads(path.read_text())
     assert data["metadata"]["runtime"] == runtime, "the exporter must name the runtime it was built for"
     assert len(data["aicore_tasks"]) == 6

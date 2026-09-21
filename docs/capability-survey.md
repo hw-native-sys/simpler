@@ -304,4 +304,4 @@ re-check before editing.
 | `src/common/worker/runtime_c_api.h:259` | "`config` carries block_dim (0 = auto)" | `CallConfig` has no such field — "There is no block_dim knob" (`src/common/task_interface/call_config.h:22`) |
 | `src/common/platform/sim/host/device_runner_base.h:62-64` | "an explicit block_dim is still honoured" | same as above |
 | `src/common/aicpu_loader/README.md:18-28`, `:47-51` | one `rtsFuncGetByName`; `device_id` in per-task `KernelArgs`; dispatcher under `build/lib/<arch>/onboard/<runtime>/` | loops all symbols; `device_id` lives on `InitArgs`; dispatcher is at `build/lib/<arch>/dispatcher/` |
-| `tests/ut/cpp/a5/test_aicore_completion_mailbox.cpp:139` | "a5 is counter-only (no SDMA event-record backend)" | a5 registers SDMA and URMA ops (`src/a5/.../async_wait.h:90-98`) |
+| `tests/ut/cpp/a5/runtime/test_aicore_completion_mailbox.cpp:139` | "a5 is counter-only (no SDMA event-record backend)" | a5 registers SDMA and URMA ops (`src/a5/.../async_wait.h:90-98`) |

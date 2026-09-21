@@ -392,7 +392,7 @@ decrement one that is not yours. Every rule below closes one route to that.
 | Shared arm / record / poll / wait / retire helpers | `DeviceRunnerBase`, same file |
 | Launch-transaction accounting | `LaunchProgressSink` in `src/common/worker/native_run_execution.h` |
 | Per-arch wiring | `src/{a2a3,a5}/platform/onboard/host/device_runner.cpp` |
-| Tests | `tests/ut/cpp/hierarchical/test_run_completion_fence.cpp` |
+| Tests | `tests/ut/cpp/common/platform/test_run_completion_fence.cpp` |
 
 `LaunchProgressSink` is part of this and not an aside. A submit callback now
 submits a kernel *and then* records its boundary, so it has a step that can fail

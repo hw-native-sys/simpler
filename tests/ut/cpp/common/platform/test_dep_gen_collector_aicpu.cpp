@@ -28,9 +28,13 @@
 #include <cstring>
 #include <vector>
 
-#include "types.h"
-
 namespace {
+
+// The collector stores this byte and never reads it back: DepFlags is declared
+// in each runtime's own types.h, which is why the entry point takes a plain
+// uint8_t. Naming the enumerators here would tie this case to one runtime's
+// spelling of a value the code under test does not interpret.
+constexpr uint8_t kCreatorEdgeDepKinds = 0x3;  // wait | retain
 
 constexpr int kInstanceCount = 1;
 constexpr size_t kShmAlign = alignof(DepGenDataHeader);
@@ -79,8 +83,7 @@ protected:
 
     void record_submit(
         uint64_t task_id_raw, int explicit_dep_count, const uint64_t *explicit_deps_raw,
-        const uint8_t *explicit_dep_kinds_raw,
-        uint8_t default_explicit_dep_kind = static_cast<uint8_t>(DEP_WAIT | DEP_RETAIN)
+        const uint8_t *explicit_dep_kinds_raw, uint8_t default_explicit_dep_kind = kCreatorEdgeDepKinds
     ) {
         const int32_t kernel_ids[3] = {-1, -1, -1};
         dep_gen_aicpu_record_submit(

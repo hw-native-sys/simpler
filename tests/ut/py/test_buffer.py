@@ -765,7 +765,7 @@ def test_descriptor_accepts_legal_combos():
 
 # --- G2: the body must fit the reading its backend_kind implies --------------------------------
 #
-# The exhaustive per-backend cases live in tests/ut/cpp/types/test_buffer.cpp, which can build the
+# The exhaustive per-backend cases live in tests/ut/cpp/common/task_interface/test_buffer.cpp, which can build the
 # malformed bytes Python cannot (a body_len that disagrees with the body, a non-zero reserved tail).
 # What is checked here is that the gate is reachable from construction.
 
@@ -809,7 +809,7 @@ def test_construction_rejects_a_remote_sidecar_body():
 # flip is `TaskArgsView::tensors(i)` in task_args.h. Both are C++, and Python has no way to turn
 # bytes into a Tensor at all — so the malformed-bytes cases (bad magic, unknown backend tag,
 # generation 0, body_len past the array, a view that does not fit) are exercised where they can be
-# built: tests/ut/cpp/types/test_buffer.cpp. What is reachable from here is the construction gate.
+# built: tests/ut/cpp/common/task_interface/test_buffer.cpp. What is reachable from here is the construction gate.
 
 
 def test_construction_rejects_a_view_past_the_backing():

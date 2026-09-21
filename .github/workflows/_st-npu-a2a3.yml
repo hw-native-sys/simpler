@@ -90,8 +90,17 @@ jobs:
           TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
         run: |
           source /usr/local/Ascend/cann/set_env.sh
-          for family in tensormap_and_ringbuffer host_build_graph; do
-            .venv/bin/python "examples/a2a3/$family/qwen3_14b_decode/main.py" \
+          # discover_runtimes is the one definition of what a runtime is — a
+          # directory under src/<arch>/runtime with a build_config.py — so a new
+          # one is compiled here without editing this list into existence. An
+          # empty result would make the loop body run zero times and the step
+          # pass having compiled nothing, which `set -e` does not catch in a
+          # `for` list, so it is rejected before the loop.
+          runtimes=$(.venv/bin/python -c \
+              "from simpler_setup.platform_info import discover_runtimes; print(' '.join(discover_runtimes('a2a3')))")
+          test -n "$runtimes"
+          for runtime in $runtimes; do
+            .venv/bin/python "examples/a2a3/$runtime/qwen3_14b_decode/main.py" \
               --platform a2a3 --compile-only --compile-workers 8
           done
 

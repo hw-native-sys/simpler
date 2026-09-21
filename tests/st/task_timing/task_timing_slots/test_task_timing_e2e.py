@@ -196,7 +196,7 @@ def test_duplicate_slot_merges_window(st_platform, st_device_ids, capfd, drain_h
     # large, highly variable scheduling/cold-start overhead (observed 50k..1M ns on
     # either task across runs), so any cross-run magnitude comparison is inherently
     # flaky. The min/max fold math is covered deterministically by the C++ unit test
-    # (tests/ut/cpp/a2a3/test_task_timing_slots.cpp) and per-task dispatch/finish
+    # (tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_task_timing_slots.cpp) and per-task dispatch/finish
     # ordering by test_distinct_slots_emit_markers.
     assert slot0[0][1] > 0, f"merged task_slot_0 must be a complete window (dispatch < finish), got {slot0}"
 
