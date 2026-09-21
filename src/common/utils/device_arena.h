@@ -130,6 +130,53 @@ public:
     // instead.
     size_t region_size(size_t offset) const noexcept;
 
+    // Staged single-region replacement, for a caller that must not lose the
+    // current backing when the replacement allocation fails.
+    //
+    // The staged backing is a second allocation held alongside the committed
+    // one: base(), region_ptr(), is_committed(), total_size() and the region
+    // table all keep answering from the current backing until
+    // publish_replacement() installs the staged one. Returns the staged
+    // region's base, or nullptr when the size cannot be aligned within a
+    // size_t or the backing allocation failed — in which case nothing at all
+    // has changed. An arena holds at most one staged replacement, and
+    // release() / ~DeviceArena() free it, so a staged block never outlives its
+    // arena.
+    //
+    // The published layout is exactly one region of `size` bytes at offset 0,
+    // which is what reserve(size, align) + commit(base_align) produces on a
+    // fresh arena.
+    //
+    // NOT noexcept, for the same reason commit() is not: the injected alloc_
+    // may throw.
+    void *stage_replacement(size_t size, size_t base_align = kDefaultBaseAlign);
+
+    // Install the staged backing. Allocates nothing, frees nothing and cannot
+    // throw, so a caller that has staged every region it needs can publish all
+    // of them with no failure path in between. The superseded raw block is
+    // returned rather than freed — the caller frees it through
+    // free_superseded() once every region has published, which is what keeps
+    // one region's publication from depending on another region's free
+    // succeeding. Returns nullptr when nothing was staged, or when the arena
+    // had no previous backing of its own.
+    void *publish_replacement() noexcept;
+
+    // Free the staged backing. The current backing, its base and its region
+    // table are untouched.
+    void abort_replacement() noexcept;
+
+    // Reset to the pre-commit state and hand the current backing back instead
+    // of freeing it, so a deferred release joins the same post-publication
+    // free step a replacement's superseded block uses.
+    void *detach_backing() noexcept;
+
+    // Free a block handed back by publish_replacement() or detach_backing(),
+    // through this arena's own backend. Nothrow: the backend's free path
+    // already has to be, because release() runs from the destructor.
+    void free_superseded(void *raw) noexcept;
+
+    bool has_staged_replacement() const noexcept { return staged_raw_ != nullptr; }
+
     // Free the backing buffer (if any) and reset to the pre-commit state so
     // a fresh reserve+commit cycle can run.
     void release() noexcept;
@@ -170,6 +217,14 @@ private:
     // True when committed via attach(): the backing buffer is externally
     // owned, so release() must not call free_().
     bool attached_{false};
+
+    // A replacement backing held while the current one is still visible.
+    // Non-null only between stage_replacement() and whichever of
+    // publish_replacement() / abort_replacement() / release() ends it.
+    void *staged_raw_{nullptr};
+    size_t staged_raw_size_{0};
+    void *staged_base_{nullptr};
+    size_t staged_size_{0};
 
     size_t alloc_count_{0};
     size_t free_count_{0};
@@ -245,7 +300,78 @@ inline size_t DeviceArena::region_size(size_t offset) const noexcept {
     return 0;
 }
 
+inline void *DeviceArena::stage_replacement(size_t size, size_t base_align) {
+    assert(!attached_ && "DeviceArena::stage_replacement() on an attached arena");
+    assert(staged_raw_ == nullptr && "DeviceArena: a staged replacement is already held");
+    assert(base_align > 0 && (base_align & (base_align - 1)) == 0 && "DeviceArena: base_align must be a power of two");
+    // Same sizing as commit(): enough to fit the layout from any pointer the
+    // backend returns, then forward-align the visible base.
+    //
+    // A size whose forward-alignment padding would not fit in a size_t is
+    // refused before the backend sees it: a wrapped raw_size asks for a small
+    // block that the allocator can satisfy, and publication would then
+    // advertise the unwrapped capacity against it.
+    if (size > SIZE_MAX - (base_align - 1)) return nullptr;
+    const size_t raw_size = size + base_align - 1;
+    void *raw = alloc_(ctx_, raw_size);
+    if (raw == nullptr) return nullptr;
+    ++alloc_count_;
+    staged_raw_ = raw;
+    staged_raw_size_ = raw_size;
+    staged_size_ = size;
+    const auto addr = reinterpret_cast<uintptr_t>(raw);
+    staged_base_ = reinterpret_cast<void *>((addr + base_align - 1) & ~(static_cast<uintptr_t>(base_align) - 1));
+    return staged_base_;
+}
+
+inline void *DeviceArena::publish_replacement() noexcept {
+    if (staged_raw_ == nullptr) return nullptr;
+    void *superseded = raw_base_;
+    raw_base_ = staged_raw_;
+    raw_size_ = staged_raw_size_;
+    base_ = staged_base_;
+    regions_[0] = Region{0, staged_size_};
+    region_count_ = 1;
+    cursor_ = staged_size_;
+    committed_ = true;
+    attached_ = false;
+    staged_raw_ = nullptr;
+    staged_raw_size_ = 0;
+    staged_base_ = nullptr;
+    staged_size_ = 0;
+    return superseded;
+}
+
+inline void DeviceArena::abort_replacement() noexcept {
+    if (staged_raw_ == nullptr) return;
+    free_(ctx_, staged_raw_);
+    ++free_count_;
+    staged_raw_ = nullptr;
+    staged_raw_size_ = 0;
+    staged_base_ = nullptr;
+    staged_size_ = 0;
+}
+
+inline void *DeviceArena::detach_backing() noexcept {
+    void *raw = attached_ ? nullptr : raw_base_;
+    raw_base_ = nullptr;
+    base_ = nullptr;
+    raw_size_ = 0;
+    cursor_ = 0;
+    region_count_ = 0;
+    committed_ = false;
+    attached_ = false;
+    return raw;
+}
+
+inline void DeviceArena::free_superseded(void *raw) noexcept {
+    if (raw == nullptr) return;
+    free_(ctx_, raw);
+    ++free_count_;
+}
+
 inline void DeviceArena::release() noexcept {
+    abort_replacement();
     // attached arenas wrap externally-owned memory — never free.
     if (raw_base_ != nullptr && !attached_) {
         free_(ctx_, raw_base_);
@@ -268,4 +394,8 @@ inline void DeviceArena::abandon_after_device_failure() noexcept {
     region_count_ = 0;
     committed_ = false;
     attached_ = false;
+    staged_raw_ = nullptr;
+    staged_raw_size_ = 0;
+    staged_base_ = nullptr;
+    staged_size_ = 0;
 }

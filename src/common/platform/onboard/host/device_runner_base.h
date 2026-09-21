@@ -65,6 +65,7 @@
 #include "device_phase_capture.h"
 #include "device_runner_helpers.h"
 #include "aicpu_loader/host/load_aicpu_op.h"
+#include "host/arena_replacement_transaction.h"
 #include "host/chip_swimlane_collector.h"
 #include "host/device_fault_monitor.h"
 #include "host/device_health_state.h"
@@ -289,20 +290,23 @@ public:
 
     /**
      * Commit the three per-Worker pooled regions (GM heap, shared
-     * shared memory, trb prebuilt runtime arena) as three independent
+     * shared memory, runtime arena) as three independent
      * device allocations. Must be called before any `acquire_pooled_*`.
      * Idempotent on identical (or smaller) sizes; an equal-or-smaller
-     * follow-up request leaves the arena untouched. `runtime_arena_size`
-     * is 0 for the hbg path (no prebuilt runtime arena) — the
-     * corresponding arena stays uncommitted.
+     * follow-up request leaves the arena untouched. A region asked for 0 bytes
+     * stays uncommitted, which is the shape hbg uses for its shared memory —
+     * it calls `(heap_bytes, 0, device_arena_bytes)`, so its runtime arena
+     * carries bytes like trb's does.
      *
-     * On failure to commit a later region, earlier committed regions are
-     * rolled back (a5's prior semantics). This is the safer default: a
-     * partial commit otherwise leaves the caller with pooled pointers
-     * that survive a "failure" return, masking the real error and risking
-     * later mismatched-arena bugs. (The a2a3 implementation that
-     * previously kept earlier committed peers alive on failure is
-     * normalized away.)
+     * A region that must grow is replaced through a staged transaction: every
+     * replacement is allocated before any of them is installed, so a failed
+     * allocation leaves each region with the base and capacity this call found
+     * — including a region whose request was 0, whose release is deferred to
+     * publication for the same reason. The call still fails, and the caller
+     * that asked for the larger layout does not proceed on the old capacity.
+     *
+     * The transaction holds a growing region's old and new backing at the same
+     * time, so it can be refused where a free-first sequence would have fitted.
      *
      * @return 0 on success, -1 on failure.
      */
@@ -312,9 +316,13 @@ public:
      * Return the pooled GM heap / shared memory / runtime arena base pointer of the
      * selected arena bank. `setup_static_arena` (arch subclass) must have
      * already committed the relevant region on that bank; otherwise returns
-     * nullptr. The runtime arena accessor is trb-only — hbg's
-     * `setup_static_arena(...,0)` leaves the runtime pool uncommitted and this
-     * returns nullptr.
+     * nullptr.
+     *
+     * Which regions carry bytes is the caller's shape, and the two runtimes
+     * differ. trb commits all three. hbg calls
+     * `setup_static_arena(heap_bytes, 0, device_arena_bytes)`, so its shared
+     * memory stays uncommitted and `acquire_pooled_gm_sm` returns nullptr for
+     * it, while its runtime arena is committed and is a region it acquires.
      */
     void *acquire_pooled_gm_heap(uint32_t arena_bank);
     void *acquire_pooled_gm_sm(uint32_t arena_bank);
@@ -1945,14 +1953,11 @@ public:
     SlotPersistentArgs &slot_persistent_args(uint32_t pipeline_slot) { return slot_persistent_args_[pipeline_slot]; }
 
 protected:
-    bool prebuilt_runtime_arena_cache_valid_{false};
-    uint64_t prebuilt_runtime_arena_cache_hash_{0};
-    std::vector<uint8_t> prebuilt_runtime_arena_cache_key_;
-    void *prebuilt_runtime_arena_cache_gm_heap_base_{nullptr};
-    void *prebuilt_runtime_arena_cache_sm_base_{nullptr};
-    void *prebuilt_runtime_arena_cache_runtime_arena_base_{nullptr};
-    size_t prebuilt_runtime_arena_cache_runtime_off_{0};
-    std::vector<uint8_t> prebuilt_runtime_arena_cache_image_;
+    // The one prebuilt runtime-arena image entry, describing bank 0's region
+    // bases. `setup_static_arena` settles it alongside the bank's regions, so a
+    // publication that moved a base leaves it invalid and a transaction that
+    // changed nothing leaves it answerable.
+    PrebuiltRuntimeArenaCache prebuilt_runtime_arena_cache_;
 
     // Persistent AICPU / AICore streams created in
     // `ensure_device_initialized()` and torn down in the subclass's

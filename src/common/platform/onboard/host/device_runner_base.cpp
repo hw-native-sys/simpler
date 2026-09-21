@@ -46,6 +46,7 @@
 #include "common/sdma_warmup_layout.h"
 #include "common/unified_log.h"
 #include "host/acl_error_log.h"
+#include "host/arena_replacement_transaction.h"
 #include "kernel_platform_ops.h"
 #include "host/host_phase_records_artifact.h"
 #include "host/raii_scope_guard.h"
@@ -447,8 +448,6 @@ void *DeviceRunnerBase::acquire_pooled_gm_sm(uint32_t arena_bank) {
 
 void *DeviceRunnerBase::acquire_pooled_runtime_arena(uint32_t arena_bank) {
     if (arena_bank >= arena_banks_.size()) return nullptr;
-    // hbg calls setup_static_arena(...,0) and leaves the runtime pool
-    // uncommitted — fail loudly if a caller asks for it anyway.
     DeviceArena &arena = this->arena_bank(arena_bank).runtime_pool;
     if (!arena.is_committed()) return nullptr;
     return arena.base();
@@ -461,22 +460,9 @@ bool DeviceRunnerBase::lookup_prebuilt_runtime_arena_cache(
     // The cache holds one entry and its bases point into bank 0, so any other
     // bank must rebuild rather than be handed a region it does not own.
     if (arena_bank != 0) return false;
-    if (!prebuilt_runtime_arena_cache_valid_ || prebuilt_runtime_arena_cache_hash_ != hash ||
-        prebuilt_runtime_arena_cache_key_.size() != key_size || key_data == nullptr || gm_heap_base == nullptr ||
-        sm_base == nullptr || runtime_arena_base == nullptr || runtime_off == nullptr || image_data == nullptr ||
-        image_size == nullptr) {
-        return false;
-    }
-    if (std::memcmp(prebuilt_runtime_arena_cache_key_.data(), key_data, key_size) != 0) {
-        return false;
-    }
-    *gm_heap_base = prebuilt_runtime_arena_cache_gm_heap_base_;
-    *sm_base = prebuilt_runtime_arena_cache_sm_base_;
-    *runtime_arena_base = prebuilt_runtime_arena_cache_runtime_arena_base_;
-    *runtime_off = prebuilt_runtime_arena_cache_runtime_off_;
-    *image_data = prebuilt_runtime_arena_cache_image_.data();
-    *image_size = prebuilt_runtime_arena_cache_image_.size();
-    return true;
+    return prebuilt_runtime_arena_cache_.lookup(
+        hash, key_data, key_size, gm_heap_base, sm_base, runtime_arena_base, runtime_off, image_data, image_size
+    );
 }
 
 void DeviceRunnerBase::mark_prebuilt_runtime_arena_cached(
@@ -485,19 +471,9 @@ void DeviceRunnerBase::mark_prebuilt_runtime_arena_cached(
 ) {
     // Single-entry cache owned by bank 0; see lookup_prebuilt_runtime_arena_cache.
     if (arena_bank != 0) return;
-    prebuilt_runtime_arena_cache_valid_ = false;
-    prebuilt_runtime_arena_cache_hash_ = hash;
-    prebuilt_runtime_arena_cache_key_.assign(
-        static_cast<const uint8_t *>(key_data), static_cast<const uint8_t *>(key_data) + key_size
+    prebuilt_runtime_arena_cache_.store(
+        hash, key_data, key_size, gm_heap_base, sm_base, runtime_arena_base, runtime_off, image_data, image_size
     );
-    prebuilt_runtime_arena_cache_gm_heap_base_ = gm_heap_base;
-    prebuilt_runtime_arena_cache_sm_base_ = sm_base;
-    prebuilt_runtime_arena_cache_runtime_arena_base_ = runtime_arena_base;
-    prebuilt_runtime_arena_cache_runtime_off_ = runtime_off;
-    prebuilt_runtime_arena_cache_image_.assign(
-        static_cast<const uint8_t *>(image_data), static_cast<const uint8_t *>(image_data) + image_size
-    );
-    prebuilt_runtime_arena_cache_valid_ = true;
 }
 
 int DeviceRunnerBase::setup_static_arena(
@@ -507,25 +483,24 @@ int DeviceRunnerBase::setup_static_arena(
         LOG_ERROR("arena bank %u is outside [0, %zu)", arena_bank, arena_banks_.size());
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    // Three independent device_malloc'd buffers: GM heap, shared memory, prebuilt
-    // runtime arena. Split out from a single large allocation because the
-    // combined size can exceed the device allocator's largest contiguous
+    // Three independent device_malloc'd buffers: GM heap, shared memory,
+    // prebuilt runtime arena. Split out from a single large allocation because
+    // the combined size can exceed the device allocator's largest contiguous
     // block. Each arena commits exactly one region, so its base() is the
     // pooled pointer the caller wants.
     //
-    // Idempotent for the production case (sizes do not change across a
-    // worker's lifetime). If a caller asks for a larger layout on any
-    // region, redo just that region — already-committed peers stay alive
-    // so their callers don't have to re-acquire.
+    // A request an existing region already covers costs nothing: the region is
+    // kept, so a repeated workload allocates nothing here. A region that must
+    // grow is replaced through the staged transaction below, which is what
+    // makes an allocation failure leave every region's address and capacity as
+    // this call found them — at the price of holding old and new backing
+    // together until publication.
     ArenaBank &bank = this->arena_bank(arena_bank);
 
     // Captured graphs can retain committed base addresses, so kernel mode
     // forbids growing or releasing a region that is already committed. The
-    // check covers all three regions and completes before the first
-    // commit_region call, which is what makes the refusal side-effect-free:
-    // a refusal raised from inside the commit sequence would fall into the
-    // unified rollback below, whose release() calls free the very base
-    // addresses the refusal exists to preserve.
+    // check covers all three regions and completes before the transaction
+    // below, so a refusal allocates nothing and frees nothing.
     if (execution_mode_latch().is_kernel()) {
         const struct {
             const DeviceArena &arena;
@@ -552,72 +527,28 @@ int DeviceRunnerBase::setup_static_arena(
         }
     }
 
-    bool arena_changed = false;
-    auto commit_region = [&arena_changed](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
-        if (requested_size == 0) {
-            // hbg's runtime_arena path: caller passed 0 and never reserved
-            // a region. Leave the arena uncommitted; acquire_pooled_* will
-            // return nullptr.
-            if (arena.is_committed() && cached_size != 0) {
-                arena.release();
-                cached_size = 0;
-                arena_changed = true;
-            }
-            return 0;
-        }
-        if (arena.is_committed() && requested_size <= cached_size) {
-            return 0;
-        }
-        arena.release();
-        cached_size = 0;
-        arena_changed = true;
-        arena.reserve(requested_size, DeviceArena::kDefaultBaseAlign);
-        if (arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
-            // commit() failure leaves committed_=false, so the next entry's
-            // is_committed() guard skips the release branch. release() is
-            // idempotent on a never-committed arena (zeroes cursor_).
-            arena.release();
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-        cached_size = requested_size;
-        return 0;
+    ArenaRegionRequest requests[] = {
+        {&bank.gm_heap, &bank.cached_gm_heap_size, gm_heap_size, "gm_heap"},
+        {&bank.gm_sm, &bank.cached_gm_sm_size, gm_sm_size, "gm_sm"},
+        {&bank.runtime_pool, &bank.cached_runtime_arena_size, runtime_arena_size, "runtime_pool"},
     };
-    // Try to commit all three regions; on any failure, fully roll back —
-    // including any earlier-committed peers from a PRIOR successful call.
-    // The simpler "only roll back peers from this call" pattern would
-    // leave stale committed regions when a re-init (e.g., later worker
-    // asking for a larger layout) fails midway, defeating the
-    // "failure means failure" guarantee. Reset everything to the
-    // post-construction state so the caller can retry with a new layout.
-    bool ok = commit_region(bank.gm_heap, bank.cached_gm_heap_size, gm_heap_size) == 0;
-    ok = ok && commit_region(bank.gm_sm, bank.cached_gm_sm_size, gm_sm_size) == 0;
-    ok = ok && commit_region(bank.runtime_pool, bank.cached_runtime_arena_size, runtime_arena_size) == 0;
-    if (!ok) {
-        bank.gm_heap.release();
-        bank.gm_sm.release();
-        bank.runtime_pool.release();
-        bank.cached_gm_heap_size = 0;
-        bank.cached_gm_sm_size = 0;
-        bank.cached_runtime_arena_size = 0;
-        if (arena_bank == 0) {
-            prebuilt_runtime_arena_cache_valid_ = false;
-            prebuilt_runtime_arena_cache_key_.clear();
-            prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
-            prebuilt_runtime_arena_cache_sm_base_ = nullptr;
-            prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
-            prebuilt_runtime_arena_cache_image_.clear();
-        }
-        return PTO_RUNTIME_ERR_INTERNAL;
+    constexpr size_t kRegionCount = sizeof(requests) / sizeof(requests[0]);
+    const BankArenaSetupOutcome outcome = run_bank_arena_setup(
+        requests, kRegionCount, /*owns_prebuilt_cache=*/arena_bank == 0, &prebuilt_runtime_arena_cache_,
+        DeviceArena::kDefaultBaseAlign
+    );
+    if (outcome.rc != 0) {
+        const int failed = outcome.transaction.failed_region;
+        const char *name = (failed >= 0 && static_cast<size_t>(failed) < kRegionCount) ? requests[failed].name : "?";
+        const size_t requested =
+            (failed >= 0 && static_cast<size_t>(failed) < kRegionCount) ? requests[failed].requested_size : 0;
+        LOG_ERROR(
+            "setup_static_arena: staging %s (%zu bytes) failed on bank %u; this bank keeps its committed addresses "
+            "and capacities",
+            name, requested, arena_bank
+        );
     }
-    if (arena_changed && arena_bank == 0) {
-        prebuilt_runtime_arena_cache_valid_ = false;
-        prebuilt_runtime_arena_cache_key_.clear();
-        prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
-        prebuilt_runtime_arena_cache_sm_base_ = nullptr;
-        prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
-        prebuilt_runtime_arena_cache_image_.clear();
-    }
-    return 0;
+    return outcome.rc;
 }
 
 std::thread DeviceRunnerBase::create_thread(std::function<void()> fn) {
@@ -2027,12 +1958,7 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
             bank->runtime_pool.release();
         }
     }
-    prebuilt_runtime_arena_cache_valid_ = false;
-    prebuilt_runtime_arena_cache_key_.clear();
-    prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
-    prebuilt_runtime_arena_cache_sm_base_ = nullptr;
-    prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
-    prebuilt_runtime_arena_cache_image_.clear();
+    prebuilt_runtime_arena_cache_.invalidate();
 
     if (abandon_device_resources) {
         abandon_graph_definition_blocks();
