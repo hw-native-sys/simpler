@@ -16,6 +16,7 @@ prestarts the embedded L3 Worker, then exposes the Remote L3 command lane.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
 import hashlib
 import importlib
@@ -32,6 +33,12 @@ import traceback
 from dataclasses import dataclass
 from multiprocessing import shared_memory
 from typing import Any, Callable
+
+from _task_interface import (  # pyright: ignore[reportMissingImports]
+    _emit_host_span,
+    _host_spans_active,
+    _monotonic_now_ns,
+)
 
 from .buffer import (
     AccessMode,
@@ -102,6 +109,7 @@ from .remote_l3_protocol import (
 )
 from .task_interface import ChipCallable, TaskArgs, get_element_size
 from .worker import Worker, _level_capture_prefix, _NoBufferConsumerError
+from .worker_level import span_prefix
 
 sys.modules.setdefault("simpler.remote_l3_session", sys.modules[__name__])
 
@@ -1213,30 +1221,31 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                 send_frame(conn, FrameHeader(FrameType.COMPLETION, session_id, worker_id, header.sequence), payload)
                 continue
 
-            try:
-                task = decode_task_payload(frame.payload)
-                orch_fn = dispatch_registry.get(task.callable_digest)
-                if orch_fn is None:
-                    raise KeyError(f"remote TASK dispatcher has no callable hashid {task.callable_digest.hex()}")
-                task_args, inline_backings = _materialize_task_args(
-                    task.args, buffers, worker_id, mint_inline_buffer=mint_session_buffer
-                )
+            with _served_frame_span(inner_worker.level, session_id=session_id, sequence=header.sequence):
                 try:
-                    task.config.output_prefix = _level_capture_prefix(task.config.output_prefix, inner_worker)
-                    inner_worker.run(orch_fn, task_args, task.config)
-                finally:
-                    for backing in inline_backings:
-                        backing.close()
-                payload = encode_completion(header.sequence, 0, "")
-            except BaseException as exc:  # noqa: BLE001
-                payload = encode_completion(
-                    header.sequence,
-                    1,
-                    _format_remote_error(
-                        f"remote worker_id={worker_id} hashid={frame.payload[:32].hex()} sequence={header.sequence}",
-                        exc,
-                    ),
-                )
+                    task = decode_task_payload(frame.payload)
+                    orch_fn = dispatch_registry.get(task.callable_digest)
+                    if orch_fn is None:
+                        raise KeyError(f"remote TASK dispatcher has no callable hashid {task.callable_digest.hex()}")
+                    task_args, inline_backings = _materialize_task_args(
+                        task.args, buffers, worker_id, mint_inline_buffer=mint_session_buffer
+                    )
+                    try:
+                        task.config.output_prefix = _level_capture_prefix(task.config.output_prefix, inner_worker)
+                        inner_worker.run(orch_fn, task_args, task.config)
+                    finally:
+                        for backing in inline_backings:
+                            backing.close()
+                    payload = encode_completion(header.sequence, 0, "")
+                except BaseException as exc:  # noqa: BLE001
+                    error_context = (
+                        f"remote worker_id={worker_id} hashid={frame.payload[:32].hex()} sequence={header.sequence}"
+                    )
+                    payload = encode_completion(
+                        header.sequence,
+                        1,
+                        _format_remote_error(error_context, exc),
+                    )
             send_frame(conn, FrameHeader(FrameType.COMPLETION, session_id, worker_id, header.sequence), payload)
     finally:
         for key, entry in list(buffers.items()):
@@ -1244,6 +1253,55 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
         buffers.clear()
         with _INNER_HANDLE_LOCK:
             _INNER_HANDLES.clear()
+
+
+_NO_FRAME_SPAN = contextlib.nullcontext()
+
+
+def _encode_base36(value: int) -> str:
+    if value < 0:
+        raise ValueError("frame trace identity must be non-negative")
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    encoded = []
+    while value:
+        value, remainder = divmod(value, 36)
+        encoded.append(digits[remainder])
+    return "".join(reversed(encoded)) or "0"
+
+
+@contextlib.contextmanager
+def _emitting_frame_span(level: int, session_id: int, sequence: int):
+    try:
+        start_ns = _monotonic_now_ns()
+    except BaseException:  # noqa: BLE001 -- diagnostics must not break the command protocol
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            _emit_host_span(
+                f"{span_prefix(level)}.remote_task",
+                0,
+                0,
+                0,
+                start_ns,
+                _monotonic_now_ns() - start_ns,
+                f"f={_encode_base36(session_id)}:{_encode_base36(sequence)}",
+            )
+        except BaseException:  # noqa: BLE001 -- diagnostics must not break the command protocol
+            pass
+
+
+def _served_frame_span(level: int, *, session_id: int, sequence: int):
+    """Bracket one served TASK frame with the identity shared by both hosts."""
+    try:
+        active = _host_spans_active()
+    except BaseException:  # noqa: BLE001 -- diagnostics must not break the command protocol
+        active = False
+    if not active:
+        return _NO_FRAME_SPAN
+    return _emitting_frame_span(level, session_id, sequence)
 
 
 def run_session(

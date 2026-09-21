@@ -14,11 +14,12 @@ import json
 from typing import Any, cast
 from unittest.mock import MagicMock
 
+import pytest
 import simpler.mpi_group_mailbox as mailbox_mod
 import simpler.worker as worker_mod
 from simpler import mpi_l3_session
 from simpler.mpi_group_mailbox import MAILBOX_SIZE, MailboxGroupState
-from simpler.remote_l3_protocol import ControlName
+from simpler.remote_l3_protocol import ControlName, FrameHeader, FrameType, decode_frame, encode_frame
 from simpler.worker import MpiL3GroupSpec, Worker
 
 
@@ -190,3 +191,52 @@ def test_mpi_rank_worker_uses_parent_topology_id_before_init(monkeypatch):
 
     assert rc == 1
     assert captured["worker"]._topology_worker_id == 7
+
+
+def test_mpi_task_forwarding_preserves_the_callers_frame_identity():
+    original = encode_frame(FrameHeader(FrameType.TASK, session_id=41, worker_id=7, sequence=23), b"task")
+
+    forwarded = mpi_l3_session._rewrite_frame_identity(
+        original,
+        {"session_id": 41, "worker_id": 7},
+    )
+
+    assert decode_frame(forwarded).header == decode_frame(original).header
+
+
+@pytest.mark.parametrize(
+    ("manifest", "expected"),
+    [
+        (
+            {"session_id": 42, "worker_id": 7},
+            "expected session_id=42 worker_id=7, got session_id=41 worker_id=7",
+        ),
+        (
+            {"session_id": 41, "worker_id": 8},
+            "expected session_id=41 worker_id=8, got session_id=41 worker_id=7",
+        ),
+    ],
+)
+def test_mpi_task_forwarding_reports_both_sides_of_an_identity_mismatch(manifest, expected):
+    original = encode_frame(FrameHeader(FrameType.TASK, session_id=41, worker_id=7, sequence=23), b"task")
+
+    with pytest.raises(ValueError, match=expected):
+        mpi_l3_session._rewrite_frame_identity(original, manifest)
+
+
+def test_mpi_control_forwarding_uses_the_rank_local_identity():
+    original = encode_frame(FrameHeader(FrameType.CONTROL, session_id=11, worker_id=3, sequence=5), b"control")
+
+    forwarded = mpi_l3_session._rewrite_frame_identity(
+        original,
+        {"session_id": 41, "worker_id": 7},
+        sequence=99,
+    )
+
+    assert decode_frame(forwarded).header == FrameHeader(
+        FrameType.CONTROL,
+        session_id=41,
+        worker_id=7,
+        sequence=99,
+        payload_bytes=len(b"control"),
+    )

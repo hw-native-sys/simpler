@@ -383,6 +383,12 @@ public:
     // the unpublished dispatch with the caller after endpoint quiescence.
     virtual bool report_submission_error(const WorkerDispatch &dispatch, const std::string &reason);
 
+    // The in-flight published progress frame as host-trace attributes, read
+    // right after the submission that published it. Endpoints that do not
+    // publish a wire frame, and endpoints with nothing in flight, return an
+    // empty string.
+    virtual std::string progress_frame_attrs() const { return {}; }
+
     virtual void shutdown_child() {}
     virtual uint64_t control_malloc(size_t size);
     virtual uint64_t control_committed_device_memory();

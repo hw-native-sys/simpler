@@ -533,6 +533,64 @@ TEST(RemoteEndpoint, TaskDispatchUsesProgressSubmissionAndPolling) {
     ring.shutdown();
 }
 
+TEST(RemoteEndpoint, ProgressFrameAttrsNameTheTaskAcrossPeers) {
+    Ring ring;
+    ring.init(1ULL << 20);
+    TaskSlot slot = make_slot(ring, scalar_args());
+
+    auto *transport = new FakeRemoteTransport();
+    RemoteL3Endpoint endpoint(3, 99, "fake", std::unique_ptr<RemoteL3Transport>(transport));
+    EXPECT_TRUE(endpoint.progress_frame_attrs().empty());
+
+    WorkerDispatch dispatch;
+    dispatch.task_slot = slot;
+    dispatch.dispatch_id = 7;
+    endpoint.submit_progress(&ring, dispatch);
+
+    const auto sent = remote_l3::decode_frame(transport->last_frame);
+    const std::string expected = " f=2r:1";
+    EXPECT_EQ(endpoint.progress_frame_attrs(), expected);
+    EXPECT_EQ(sent.header.worker_id, 3);
+    ring.shutdown();
+}
+
+TEST(RemoteEndpoint, ProgressFrameAttrsBoundTheLargestSessionIdentity) {
+    Ring ring;
+    ring.init(1ULL << 20);
+    TaskSlot slot = make_slot(ring, scalar_args());
+
+    auto *transport = new FakeRemoteTransport();
+    RemoteL3Endpoint endpoint(3, UINT64_MAX, "fake", std::unique_ptr<RemoteL3Transport>(transport));
+
+    WorkerDispatch dispatch;
+    dispatch.task_slot = slot;
+    endpoint.submit_progress(&ring, dispatch);
+
+    EXPECT_EQ(endpoint.progress_frame_attrs(), " f=3w5e11264sgsf:1");
+    EXPECT_LE(endpoint.progress_frame_attrs().size(), 30u);
+    ring.shutdown();
+}
+
+TEST(RemoteEndpoint, AFailedSubmissionDoesNotReplaceThePublishedFrameHeader) {
+    Ring ring;
+    ring.init(1ULL << 20);
+    TaskSlot slot = make_slot(ring, scalar_args());
+
+    auto *transport = new FakeRemoteTransport();
+    RemoteL3Endpoint endpoint(3, 99, "fake", std::unique_ptr<RemoteL3Transport>(transport));
+
+    WorkerDispatch dispatch;
+    dispatch.task_slot = slot;
+    dispatch.dispatch_id = 7;
+    endpoint.submit_progress(&ring, dispatch);
+    const std::string published = endpoint.progress_frame_attrs();
+    EXPECT_FALSE(published.empty());
+
+    EXPECT_THROW(endpoint.submit_progress(&ring, dispatch), std::runtime_error);
+    EXPECT_EQ(endpoint.progress_frame_attrs(), published);
+    ring.shutdown();
+}
+
 TEST(RemoteEndpoint, ProgressStopReleasesWaitingControl) {
     Ring ring;
     ring.init(1ULL << 20);

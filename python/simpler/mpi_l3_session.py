@@ -308,7 +308,18 @@ def _rewrite_frame_identity(
     *,
     sequence: int | None = None,
 ) -> bytes:
+    """Adapt shared group commands to one rank without renaming TASK frames."""
     frame = decode_frame(frame_bytes)
+    if frame.header.frame_type is FrameType.TASK:
+        expected_session_id = int(manifest["session_id"])
+        expected_worker_id = int(manifest["worker_id"])
+        if frame.header.session_id != expected_session_id or frame.header.worker_id != expected_worker_id:
+            raise ValueError(
+                "MPI TASK frame identity mismatch: "
+                f"expected session_id={expected_session_id} worker_id={expected_worker_id}, "
+                f"got session_id={frame.header.session_id} worker_id={frame.header.worker_id}"
+            )
+        return frame_bytes
     header = FrameHeader(
         frame_type=frame.header.frame_type,
         session_id=int(manifest["session_id"]),
@@ -547,9 +558,17 @@ def _run_group_session(  # noqa: PLR0912, PLR0915 -- startup, ordered dispatch, 
                     connection.feed(_rewrite_frame_identity(payload, manifest))
                 elif payload is not None:
                     local_command_sequence += 1
-                    local_reply = connection.exchange(
-                        _rewrite_frame_identity(payload, manifest, sequence=local_command_sequence)
-                    )
+                    if request.opcode is MailboxOpcode.TASK:
+                        forwarded = _rewrite_frame_identity(payload, manifest)
+                    elif request.opcode is MailboxOpcode.CONTROL:
+                        forwarded = _rewrite_frame_identity(
+                            payload,
+                            manifest,
+                            sequence=local_command_sequence,
+                        )
+                    else:
+                        raise ValueError(f"unsupported MPI mailbox opcode {request.opcode}")
+                    local_reply = connection.exchange(forwarded)
             except BaseException as exc:  # noqa: BLE001
                 local_error = MpiRankError(rank, type(exc).__name__, str(exc))
 

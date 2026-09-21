@@ -27,6 +27,7 @@
 #include <cstring>
 #include <cstdint>
 #include <future>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -83,6 +84,17 @@ uint64_t get_u64(const std::vector<uint8_t> &data, size_t &offset) {
     for (int i = 0; i < 8; ++i)
         v |= static_cast<uint64_t>(data[offset++]) << (8 * i);
     return v;
+}
+
+std::string encode_base36(uint64_t value) {
+    static constexpr char digits[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+    std::array<char, 13> encoded{};
+    auto cursor = encoded.end();
+    do {
+        *--cursor = digits[value % 36];
+        value /= 36;
+    } while (value != 0);
+    return {cursor, encoded.end()};
 }
 
 int32_t get_i32(const std::vector<uint8_t> &data, size_t &offset) {
@@ -1335,6 +1347,16 @@ void RemoteL3Endpoint::submit_progress(Ring *ring, const WorkerDispatch &dispatc
         } catch (...) {}
         throw;
     }
+}
+
+std::string RemoteL3Endpoint::progress_frame_attrs() const {
+    // The published TASK frame header is the pending task's own identity: the
+    // caller reads it while admission still holds the just-published dispatch.
+    std::lock_guard<std::mutex> command_lk(command_mu_);
+    if (!pending_task_.occupied) return {};
+    std::ostringstream attrs;
+    attrs << " f=" << encode_base36(session_id_) << ":" << encode_base36(pending_task_.sequence);
+    return attrs.str();
 }
 
 bool RemoteL3Endpoint::poll_progress(WorkerEndpointProgress &progress) {

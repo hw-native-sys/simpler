@@ -209,6 +209,7 @@ public:
     void request_progress_stop() noexcept override;
     void report_progress_error(const std::string &reason) noexcept override;
     bool report_submission_error(const WorkerDispatch &dispatch, const std::string &reason) noexcept override;
+    std::string progress_frame_attrs() const override;
     void shutdown_child() override;
     void control_prepare(const uint8_t *digest) override;
     void control_remote_prepare_register(
@@ -246,7 +247,7 @@ private:
     uint64_t session_id_{0};
     std::unique_ptr<RemoteL3Transport> transport_;
     remote_l3::OrderedCommandLane command_lane_;
-    std::mutex command_mu_;
+    mutable std::mutex command_mu_;
     std::condition_variable command_cv_;
 
     struct PendingTask {
