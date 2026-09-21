@@ -75,15 +75,13 @@ inline __aicore__ void scheduler_observe_data_cache(__gm__ void *address) {
 #endif
 }
 
-inline __aicore__ void scheduler_publish_dispatch_payload(__gm__ DispatchPayload *payload) {
+inline __aicore__ void scheduler_writeback_dispatch_payload(__gm__ DispatchPayload *payload) {
 #if defined(__CCE_AICORE__)
     for (uint64_t offset = 0; offset < sizeof(DispatchPayload); offset += 64) {
         dcci(reinterpret_cast<__gm__ uint8_t *>(payload) + offset, SINGLE_CACHE_LINE, CACHELINE_OUT);
     }
-    dsb((mem_dsb_t)0);
 #else
     (void)payload;
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
 #endif
 }
 

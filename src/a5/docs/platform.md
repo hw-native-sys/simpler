@@ -24,6 +24,10 @@ Key directories:
 
 Thread-based simulation. No hardware or SDK required.
 
+The simulator allocates one aligned 3 KiB SSBUF region per cluster, shared by
+its AIC and two AIV threads and released after those threads exit. The
+[HBG reservation](runtimes.md#host_build_graph) matches onboard execution.
+
 Key directories:
 
 - `src/a5/platform/sim/host/`

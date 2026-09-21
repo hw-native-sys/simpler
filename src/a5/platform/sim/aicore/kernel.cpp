@@ -42,6 +42,7 @@ static pthread_key_t g_chip_swimlane_aicore_head_key;
 static pthread_key_t g_aicore_pmu_ring_key;
 static pthread_key_t g_pmu_reg_base_key;
 static pthread_key_t g_aicore_report_epoch_key;
+static pthread_key_t g_ssbuf_base_key;
 static pthread_once_t g_tls_once = PTHREAD_ONCE_INIT;
 
 static void create_tls_keys() {
@@ -54,12 +55,17 @@ static void create_tls_keys() {
     pthread_key_create(&g_aicore_pmu_ring_key, nullptr);
     pthread_key_create(&g_pmu_reg_base_key, nullptr);
     pthread_key_create(&g_aicore_report_epoch_key, nullptr);
+    pthread_key_create(&g_ssbuf_base_key, nullptr);
 }
 
 volatile uint8_t *sim_get_reg_base() { return static_cast<volatile uint8_t *>(pthread_getspecific(g_reg_base_key)); }
 
 uint32_t sim_get_physical_core_id() {
     return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_core_id_key)));
+}
+
+uint64_t platform_ssbuf_hardware_base_address() {
+    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_ssbuf_base_key)));
 }
 
 // Per-core profiling state setters/getters. Same contract as the onboard
@@ -134,7 +140,7 @@ void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type);
 extern "C" void aicore_execute_wrapper(
     __gm__ Runtime *runtime, int block_idx, CoreType core_type, uint32_t physical_core_id, uint64_t regs,
     uint32_t enable_profiling_flag, uint64_t chip_swimlane_aicore_rotation_table, uint64_t aicore_pmu_ring_addrs,
-    uint64_t report_epoch
+    uint64_t report_epoch, uint64_t ssbuf_base
 ) {
     pthread_once(&g_tls_once, create_tls_keys);
 
@@ -150,6 +156,7 @@ extern "C" void aicore_execute_wrapper(
 
     pthread_setspecific(g_core_id_key, reinterpret_cast<void *>(static_cast<uintptr_t>(physical_core_id)));
     pthread_setspecific(g_block_idx_key, reinterpret_cast<void *>(static_cast<uintptr_t>(block_idx)));
+    pthread_setspecific(g_ssbuf_base_key, reinterpret_cast<void *>(static_cast<uintptr_t>(ssbuf_base)));
 
     // Publish per-core profiling state before the executor runs.
     set_aicore_profiling_flag(enable_profiling_flag);

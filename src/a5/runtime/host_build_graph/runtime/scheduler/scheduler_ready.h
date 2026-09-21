@@ -11,9 +11,9 @@
 
 #pragma once
 
-#include "scheduler_types.h"
 #include "scheduler_memory.h"
 #include "scheduler_graph.h"
+#include "scheduler_ssbuf.h"
 
 enum class SchedulerRouteResult : uint64_t {
     READY_TO_ENQUEUE = 1,
@@ -102,9 +102,12 @@ struct SchedulerFreeSlotClaim {
 struct SchedulerLocalSlotState {
     int64_t task_id{SCHEDULER_TASK_ID_INVALID};
     uint32_t generation{0};
+    int32_t timing_slot{-1};
     SchedulerDispatchSlotState state{SchedulerDispatchSlotState::EMPTY};
     uint8_t subtask_slot{UINT8_MAX};
-    uint8_t sampled_task_timing{0};
+    inline __aicore__ bool sampled_task_timing() const {
+        return timing_slot >= 0 && timing_slot < SCHEDULER_TASK_TIMING_SLOT_COUNT;
+    }
 };
 
 struct SchedulerWorkerTraceCache {
@@ -164,6 +167,8 @@ struct SchedulerLocalState {
 
     SchedulerLocalSlotState slots[PLATFORM_CORES_PER_BLOCKDIM][SCHEDULER_PENDING_SLOT_COUNT]{};
     uint64_t consumed_completion_generations[PLATFORM_CORES_PER_BLOCKDIM]{};
+    uint32_t local_completed_generations[SCHEDULER_PENDING_SLOT_COUNT]{};
+    SchedulerExecutorTaskTrace executor_traces[SCHEDULER_PENDING_SLOT_COUNT]{};
     SchedulerWorkerTraceCache worker_traces[PLATFORM_CORES_PER_BLOCKDIM]{};
     uint64_t owner_pending_endpoints[SCHEDULER_CORE_TYPE_COUNT]{};
     uint32_t loop_iter{0};
@@ -177,6 +182,11 @@ static_assert(SCHEDULER_CAPACITY < UINT16_MAX, "scheduler IDs must fit the local
 static_assert(PLATFORM_CORES_PER_BLOCKDIM <= 8, "worker trace mask must fit one byte");
 static_assert(SCHEDULER_PENDING_SLOT_COUNT <= 8, "local ready mask must fit one byte");
 static_assert(SCHEDULER_CORE_TYPE_COUNT <= 8, "owner ready mask must fit one byte");
+static_assert(alignof(SchedulerLocalSlotState) == alignof(uint64_t));
+static_assert(alignof(SchedulerLocalState) == alignof(uint64_t));
+static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalConfig) == 104, "64-bit local config size changed");
+static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalSlotState) == 24, "64-bit local slot size changed");
+static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 496, "64-bit local state size changed");
 
 // Called once after READY acquire, before any bootstrap or mailbox operation.
 // Each invocation owns a fresh SchedulerLocalState; no cache survives a run.
@@ -188,7 +198,9 @@ inline __aicore__ bool scheduler_initialize_local_config(
     if (base == nullptr || context == nullptr || graph == nullptr || local == nullptr) return false;
     for (uint64_t offset = 0; offset < offsetof(SchedulerWorkerContext, bootstrap_task_count); offset += 64)
         scheduler_observe_cache_line(reinterpret_cast<__gm__ uint8_t *>(context) + offset);
-    if (context->scheduler_ssbuf_reserved1 != 0) return false;
+    if (context->scheduler_ssbuf_reserved0 != 0 || context->scheduler_ssbuf_reserved1 != 0 ||
+        context->scheduler_ssbuf_reserved2 != 0)
+        return false;
     for (uint32_t index = 0; index < 3; ++index)
         if (context->topology_reserved[index] != 0) return false;
     SchedulerLocalConfig &config = local->config;
@@ -412,25 +424,6 @@ inline __aicore__ bool scheduler_lookup_callable_address(
 inline __aicore__ uint64_t
 scheduler_completion_id(const SchedulerLocalState *context, uint64_t local_completion_index) {
     return local_completion_index * context->config.runtime_worker_count + context->worker_id();
-}
-
-inline __aicore__ __gm__ SchedulerDispatchSlot *scheduler_dispatch_slot_at(
-    __gm__ void *scheduler_state_base, const SchedulerLocalState *context, uint64_t worker_id, uint32_t slot
-) {
-    return scheduler_state_at<SchedulerDispatchSlot>(
-        scheduler_state_base,
-        context->config.shared_context->dispatch_slots_offset +
-            (worker_id * SCHEDULER_PENDING_SLOT_COUNT + static_cast<uint64_t>(slot)) * sizeof(SchedulerDispatchSlot)
-    );
-}
-
-inline __aicore__ __gm__ SchedulerCompletionInbox *scheduler_completion_inbox_at(
-    __gm__ void *scheduler_state_base, const SchedulerLocalState *context, uint64_t inbox_index
-) {
-    return scheduler_state_at<SchedulerCompletionInbox>(
-        scheduler_state_base,
-        context->config.shared_context->completion_inboxes_offset + inbox_index * sizeof(SchedulerCompletionInbox)
-    );
 }
 
 inline __aicore__ __gm__ SchedulerTaskControl *
@@ -1102,29 +1095,23 @@ inline __aicore__ bool scheduler_ready_directory_nonempty(
            ) != 0;
 }
 
-inline __aicore__ void
-scheduler_initialize_free_slot(__gm__ SchedulerDispatchSlot *slot, SchedulerLocalSlotState *local_slot) {
-    uint32_t generation = slot->generation + 1;
+inline __aicore__ void scheduler_initialize_free_slot(SchedulerLocalSlotState *local_slot) {
+    uint32_t generation = local_slot->generation + 1;
     if (generation == 0) generation = 1;
-    slot->task_id = SCHEDULER_TASK_ID_INVALID;
-    slot->generation = generation;
-    scheduler_publish_cache_line(slot);
-    scheduler_gm_publish(
-        slot->publication, scheduler_dispatch_publication(generation, SchedulerDispatchSlotState::FREE)
-    );
     local_slot->task_id = SCHEDULER_TASK_ID_INVALID;
+    local_slot->timing_slot = -1;
     local_slot->generation = generation;
     local_slot->state = SchedulerDispatchSlotState::FREE;
     local_slot->subtask_slot = UINT8_MAX;
-    local_slot->sampled_task_timing = 0;
 }
 
 inline __aicore__ bool scheduler_fill_dispatch_slot(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
     __gm__ SchedulerRunControl *run_control, const SchedulerFreeSlotClaim &slot_claim,
-    const SchedulerReadyClaim &ready_claim, uint64_t profiling_level
+    const SchedulerReadyClaim &ready_claim, uint64_t profiling_level, SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region
 ) {
-    if (ready_claim.task_id < 0 || static_cast<uint64_t>(ready_claim.task_id) >= graph.task_count ||
+    if (ssbuf_region == nullptr || scheduler == nullptr || ready_claim.task_id < 0 ||
+        static_cast<uint64_t>(ready_claim.task_id) >= graph.task_count ||
         slot_claim.worker_id >= scheduler->config.runtime_worker_count ||
         slot_claim.slot_index >= SCHEDULER_PENDING_SLOT_COUNT || slot_claim.cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM)
         return false;
@@ -1134,7 +1121,6 @@ inline __aicore__ bool scheduler_fill_dispatch_slot(
     const uint64_t dispatch_start_cycles = phase_timing_enabled ? scheduler_cycles() : 0;
     __gm__ SchedulerTaskMetadata *metadata_source =
         scheduler_task_metadata_at(scheduler_state_base, scheduler, ready_claim.task_id);
-    scheduler_observe_cache_line(metadata_source);
     SchedulerTaskMetadata metadata{};
     metadata.kernel_ids[0] = metadata_source->kernel_ids[0];
     metadata.kernel_ids[1] = metadata_source->kernel_ids[1];
@@ -1147,7 +1133,6 @@ inline __aicore__ bool scheduler_fill_dispatch_slot(
     const uint8_t subtask_slot = scheduler_metadata_single_subtask_slot(metadata.active_mask);
     __gm__ SchedulerWorkerContext *target =
         scheduler_worker_context_at(scheduler_state_base, scheduler, slot_claim.worker_id);
-    scheduler_observe_cache_line(target);
     if (subtask_slot == UINT8_MAX ||
         (target->core_type != static_cast<int32_t>(CoreType::AIC) &&
          target->core_type != static_cast<int32_t>(CoreType::AIV)) ||
@@ -1160,8 +1145,6 @@ inline __aicore__ bool scheduler_fill_dispatch_slot(
         return false;
     }
     const uint16_t kernel_id = metadata.kernel_ids[subtask_slot];
-    __gm__ SchedulerDispatchSlot *slot =
-        scheduler_dispatch_slot_at(scheduler_state_base, scheduler, slot_claim.worker_id, slot_claim.slot_index);
     uint32_t generation = slot_claim.generation + 1;
     if (generation == 0) generation = 1;
     __gm__ uint64_t *callable_addresses =
@@ -1177,12 +1160,6 @@ inline __aicore__ bool scheduler_fill_dispatch_slot(
         );
         return false;
     }
-
-    slot->task_id = ready_claim.task_id;
-    slot->timing_slot = metadata.timing_slot;
-    slot->generation = generation;
-    slot->pending_slot = static_cast<uint8_t>(slot_claim.slot_index);
-    scheduler_writeback_cache_line(slot);
 
     const uint64_t dispatch_payload_offset =
         target->dispatch_payload_offset + static_cast<uint64_t>(slot_claim.slot_index) * sizeof(DispatchPayload);
@@ -1219,7 +1196,18 @@ inline __aicore__ bool scheduler_fill_dispatch_slot(
         );
         return false;
     }
-    scheduler_publish_dispatch_payload(payload);
+    SchedulerLocalSlotState *local_slot = &scheduler->slots[slot_claim.cluster_lane][slot_claim.slot_index];
+    local_slot->task_id = ready_claim.task_id;
+    local_slot->timing_slot = metadata.timing_slot;
+    local_slot->generation = generation;
+    local_slot->state = SchedulerDispatchSlotState::READY;
+    local_slot->subtask_slot = subtask_slot;
+    const bool remote = slot_claim.worker_id != scheduler->worker_id();
+    SCHEDULER_SSBUF SchedulerSsbufDispatchControl *dispatch_control =
+        &ssbuf_region->lanes[slot_claim.cluster_lane].dispatch[slot_claim.slot_index];
+    if (remote) dispatch_control->task_id = ready_claim.task_id;
+    scheduler_writeback_dispatch_payload(payload);
+    scheduler_cache_barrier();
     __gm__ SchedulerTaskControl *control =
         scheduler_task_control_at(scheduler_state_base, scheduler, ready_claim.task_id);
     if (phase_timing_enabled) {
@@ -1251,20 +1239,17 @@ inline __aicore__ bool scheduler_fill_dispatch_slot(
             trace->dispatch_scheduler_worker_id = scheduler->worker_id();
             trace->dispatch_loop_iter = scheduler->loop_iter;
         }
-        if (schedule_timing_enabled) trace->dispatch_end_cycles = scheduler_cycles();
         scheduler_publish_cache_line(trace);
+        if (schedule_timing_enabled) trace->dispatch_end_cycles = scheduler_cycles();
         if (schedule_timing_enabled) scheduler_publish_cache_line(&trace->dispatch_start_cycles);
     }
-    const uint64_t publication = scheduler_dispatch_publication(generation, SchedulerDispatchSlotState::READY);
-    scheduler_gm_publish(slot->publication, publication);
-    SchedulerLocalSlotState *local_slot = &scheduler->slots[slot_claim.cluster_lane][slot_claim.slot_index];
-    local_slot->task_id = ready_claim.task_id;
-    local_slot->generation = generation;
-    local_slot->state = SchedulerDispatchSlotState::READY;
-    local_slot->subtask_slot = subtask_slot;
-    local_slot->sampled_task_timing =
-        metadata.timing_slot >= 0 && metadata.timing_slot < SCHEDULER_TASK_TIMING_SLOT_COUNT ? 1 : 0;
-    if (slot_claim.worker_id == scheduler->worker_id()) scheduler_local_ready_publish(scheduler, slot_claim.slot_index);
+    if (remote) {
+        scheduler_ssbuf_store_relaxed(
+            &dispatch_control->publication, scheduler_ssbuf_pack_ready(generation, metadata.timing_slot)
+        );
+    } else {
+        scheduler_local_ready_publish(scheduler, slot_claim.slot_index);
+    }
     return true;
 }
 

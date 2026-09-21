@@ -791,11 +791,6 @@ struct alignas(128) SchedulerTaskControl {
     uint8_t scheduler_line_padding[8];
 };
 
-struct alignas(64) SchedulerCompletionInbox {
-    volatile uint32_t completed_generations[SCHEDULER_PENDING_SLOT_COUNT];
-    uint8_t completion_line_padding[56];
-};
-
 struct alignas(128) SchedulerReadyInbox {
     volatile int64_t head;
     uint8_t atomic_line_padding[120];
@@ -896,32 +891,15 @@ struct alignas(128) SchedulerReadyDirectory {
 
 // The Executor publishes this per-slot payload before the Completion Inbox
 // generation. Neither side writes the final per-task trace concurrently.
-struct alignas(64) SchedulerExecutorTaskTrace {
+// Local copies have natural alignment; SchedulerSsbufLane supplies the
+// 64-byte alignment and stride of shared trace storage.
+struct SchedulerExecutorTaskTrace {
     uint64_t kernel_start_cycles;
     uint64_t kernel_end_cycles;
     uint64_t ready_scan_start_cycles;
     uint64_t ready_observe_cycles;
-    uint64_t completion_end_cycles;
-    uint64_t completion_bookkeeping_end_cycles;
     uint64_t completion_id;
     uint64_t completion_inbox_index;
-};
-
-// Executor-consumed metadata occupies the first line. The Scheduler publishes
-// it once and subsequently uses SchedulerLocalState instead of reading it back
-// from GM. The Executor polls only publication in the second line and owns the
-// trailing trace payload.
-struct alignas(64) SchedulerDispatchSlot {
-    int64_t task_id;
-    int32_t timing_slot;
-    uint32_t generation;
-    uint8_t pending_slot;
-    uint8_t scheduler_metadata_padding[47];
-
-    volatile uint64_t publication;
-    uint8_t publication_padding[56];
-
-    SchedulerExecutorTaskTrace executor_trace;
 };
 
 // Stable device-side localization for the first scheduler failure. These values
@@ -1053,7 +1031,7 @@ struct alignas(128) SchedulerWorkerContext {
     volatile uint64_t task_window_last_index;
     volatile uint64_t graph_task_count;
     volatile uint64_t worker_index;
-    volatile uint64_t completion_inboxes_offset;
+    volatile uint64_t scheduler_ssbuf_reserved0;
     volatile uint64_t scheduler_ssbuf_reserved1;
     volatile uint64_t aicpu_lifecycle_traces_offset;
 
@@ -1062,7 +1040,7 @@ struct alignas(128) SchedulerWorkerContext {
     volatile uint64_t ready_directory_offset;
     volatile uint64_t activity_buffers_offset;
     volatile uint64_t worker_contexts_offset;
-    volatile uint64_t dispatch_slots_offset;
+    volatile uint64_t scheduler_ssbuf_reserved2;
     // The active callable's registration-owned kernel-entry table: an absolute
     // device address, not a scheduler-state offset, because the table lives in
     // that callable's registration block and outlives every run bound to it.
@@ -1155,14 +1133,12 @@ struct alignas(128) SchedulerTaskTrace {
 
     uint64_t kernel_start_cycles;
     uint64_t kernel_end_cycles;
-    uint64_t completion_end_cycles;
     uint64_t ready_scan_start_cycles;
     uint64_t ready_observe_cycles;
-    uint64_t completion_bookkeeping_end_cycles;
     uint64_t completion_id;
     uint64_t completion_inbox_index;
 
-    uint64_t ready_transition_cycles;
+    alignas(64) uint64_t ready_transition_cycles;
     uint64_t fanin_timing_reserved[4];
     uint64_t aicore_entry_cycles;
     uint64_t handshake_publish_cycles;
@@ -1186,7 +1162,7 @@ struct alignas(128) SchedulerTaskTrace {
 
     // The completion Scheduler consolidates the Executor's staged timing here.
     uint64_t descriptor_cache_observed_cycles;
-    uint64_t executor_reserved[7];
+    uint64_t executor_reserved[3];
 };
 
 static_assert(sizeof(SchedulerTaskMetadata) == 16, "task metadata layout changed");
@@ -1194,13 +1170,6 @@ static_assert(alignof(SchedulerTaskMetadata) == 16, "task metadata alignment cha
 static_assert(sizeof(SchedulerTaskControl) == 128, "task control layout changed");
 static_assert(alignof(SchedulerTaskControl) == 128, "task control alignment changed");
 static_assert(offsetof(SchedulerTaskControl, next_waiter) == 64, "waiter metadata needs its own line");
-static_assert(sizeof(SchedulerCompletionInbox) == 64, "completion line must occupy one cache line");
-static_assert(alignof(SchedulerCompletionInbox) == 64, "completion line alignment changed");
-static_assert(offsetof(SchedulerCompletionInbox, completed_generations) == 0, "completion generations must lead line");
-static_assert(
-    sizeof(decltype(SchedulerCompletionInbox::completed_generations)) == sizeof(uint64_t),
-    "completion generations must fit one 64-bit device load"
-);
 static_assert(sizeof(SchedulerReadyInbox) == 128, "ready inbox layout changed");
 static_assert(alignof(SchedulerReadyInbox) == 128, "ready inbox alignment changed");
 static_assert(sizeof(SchedulerGangCoordinator) == 256, "gang coordinator layout changed");
@@ -1237,14 +1206,9 @@ static_assert(
                                         128 * 128),
     "ready directory layout changed"
 );
-static_assert(sizeof(SchedulerExecutorTaskTrace) == 64, "executor trace must occupy one cache line");
-static_assert(alignof(SchedulerExecutorTaskTrace) == 64, "executor trace alignment changed");
-static_assert(offsetof(SchedulerExecutorTaskTrace, completion_inbox_index) == 56, "executor trace layout changed");
-static_assert(sizeof(SchedulerDispatchSlot) == 192, "dispatch slot must occupy three cache lines");
-static_assert(alignof(SchedulerDispatchSlot) == 64, "dispatch slot alignment changed");
-static_assert(offsetof(SchedulerDispatchSlot, timing_slot) == 8, "dispatch timing slot layout changed");
-static_assert(offsetof(SchedulerDispatchSlot, publication) == 64, "dispatch publication needs its own line");
-static_assert(offsetof(SchedulerDispatchSlot, executor_trace) == 128, "executor trace needs an exclusive cache line");
+static_assert(sizeof(SchedulerExecutorTaskTrace) == 48, "executor trace payload layout changed");
+static_assert(alignof(SchedulerExecutorTaskTrace) == alignof(uint64_t), "executor trace must have natural alignment");
+static_assert(offsetof(SchedulerExecutorTaskTrace, completion_inbox_index) == 40, "executor trace layout changed");
 static_assert(sizeof(SchedulerRunControl) == 384, "run control layout changed");
 static_assert(alignof(SchedulerRunControl) == 128, "run control alignment changed");
 static_assert(offsetof(SchedulerRunControl, executed_task_count) == 128, "lifecycle atomics need their own line");
@@ -1299,9 +1263,6 @@ static_assert(
 );
 static_assert(std::is_standard_layout_v<SchedulerTaskMetadata> && std::is_trivially_copyable_v<SchedulerTaskMetadata>);
 static_assert(std::is_standard_layout_v<SchedulerTaskControl> && std::is_trivially_copyable_v<SchedulerTaskControl>);
-static_assert(
-    std::is_standard_layout_v<SchedulerCompletionInbox> && std::is_trivially_copyable_v<SchedulerCompletionInbox>
-);
 static_assert(std::is_standard_layout_v<SchedulerReadyInbox> && std::is_trivially_copyable_v<SchedulerReadyInbox>);
 static_assert(
     std::is_standard_layout_v<SchedulerGangCoordinator> && std::is_trivially_copyable_v<SchedulerGangCoordinator>
@@ -1314,7 +1275,6 @@ static_assert(std::is_standard_layout_v<SchedulerGangCommand> && std::is_trivial
 static_assert(
     std::is_standard_layout_v<SchedulerReadyDirectory> && std::is_trivially_copyable_v<SchedulerReadyDirectory>
 );
-static_assert(std::is_standard_layout_v<SchedulerDispatchSlot> && std::is_trivially_copyable_v<SchedulerDispatchSlot>);
 static_assert(std::is_standard_layout_v<SchedulerRunControl> && std::is_trivially_copyable_v<SchedulerRunControl>);
 static_assert(
     std::is_standard_layout_v<AicpuThreadLifecycleTrace> && std::is_trivially_copyable_v<AicpuThreadLifecycleTrace>
@@ -1379,12 +1339,8 @@ inline bool scheduler_plan_layout(
         !SCHEDULER_RESERVE_ARRAY(
             SCHEDULER_WORKER_CAPACITY * SCHEDULER_PENDING_SLOT_COUNT, DispatchPayload, dispatch_payloads_offset
         ) ||
-        !SCHEDULER_RESERVE_ARRAY(
-            SCHEDULER_WORKER_CAPACITY * SCHEDULER_PENDING_SLOT_COUNT, SchedulerDispatchSlot, dispatch_slots_offset
-        ) ||
         !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskMetadata, task_metadata_offset) ||
         !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskControl, task_controls_offset) ||
-        !SCHEDULER_RESERVE_ARRAY(SCHEDULER_WORKER_CAPACITY, SchedulerCompletionInbox, completion_inboxes_offset) ||
         !SCHEDULER_RESERVE_ARRAY(
             SCHEDULER_CORE_TYPE_COUNT * SCHEDULER_WORKER_CAPACITY, SchedulerReadyInbox, ready_inboxes_offset
         ) ||
@@ -1420,11 +1376,6 @@ inline bool scheduler_init_data_from_layout(void *base, const AicoreSchedulerLay
         controls[i].wake_list_head = SCHEDULER_WAKE_LIST_OPEN;
         controls[i].next_waiter = SCHEDULER_TASK_ID_INVALID;
         controls[i].waiting_producer = static_cast<int32_t>(SCHEDULER_TASK_ID_INVALID);
-    }
-    auto *slots = scheduler_state_at<SchedulerDispatchSlot>(base, layout.dispatch_slots_offset);
-    for (uint64_t i = 0; i < SCHEDULER_WORKER_CAPACITY * SCHEDULER_PENDING_SLOT_COUNT; ++i) {
-        slots[i].task_id = SCHEDULER_TASK_ID_INVALID;
-        slots[i].publication = static_cast<uint64_t>(SchedulerDispatchSlotState::EMPTY);
     }
     auto *ready = scheduler_state_at<SchedulerReadyInbox>(base, layout.ready_inboxes_offset);
     for (uint64_t i = 0; i < SCHEDULER_CORE_TYPE_COUNT * SCHEDULER_WORKER_CAPACITY; ++i)

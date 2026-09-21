@@ -415,14 +415,56 @@ READY with the same generation until the local Executor claims it, so the ready
 token is reconstructed from the slot. Completion generation validation still
 prevents stale notifications from freeing or refilling a pending slot.
 
-The local configuration occupies 104 bytes and the complete local state 344 bytes
-under the 64-bit ABI. Profiling storage is present even when profiling is disabled.
-These sizes exclude other function locals and compiler spills.
+The local configuration occupies 104 bytes under the 64-bit ABI. Local state also
+contains six timing slots and completion generations. Only the two self-execution
+slots have local Executor traces; remote traces reside in SSBUF. Sampling is
+derived from the timing-slot range. The complete local state occupies 496 bytes.
+Profiling storage is present even when profiling is disabled.
+Compile-time assertions anchor the 64-bit configuration, slot and local-state
+sizes. These sizes exclude other function locals and compiler spills; they do
+not establish the dynamic AICore stack high-water mark.
 
 Before bootstrap, every participating core invalidates its entire data cache.
 The callable table and task metadata are immutable throughout that run, allowing
 callable lookup and completion resolution to omit repeated invalidation of those
 immutable lines.
+
+Dispatch payloads remain in GM. Remote dispatch and completion generations,
+and Executor trace staging, occupy the last contiguous KiB of each cluster's
+3 KiB SSBUF; the low 2 KiB remain available to user kernels. Each of three
+lanes has two dispatch slots, two 64-byte trace slots, and one completion word.
+Local trace payloads have natural alignment independently of shared slots.
+
+A dispatch word packs generation and signed timing slot; the Executor owns a
+completion-word shadow containing both slot generations. Polling misses need
+no barrier. A hit acquires before consuming payload or trace, while payload
+writeback and ready publication share a release barrier. Tokens are SPSC and
+use no SSBUF read-modify-write atomics. The Scheduler initializes every token
+before publishing the header, and each invocation validates the region.
+Self-execution uses local notifications, completion generations and trace storage.
+
+Layout version 3 is an internal contract shared by the Scheduler and Executor
+from the same runtime build, not a negotiated protocol. Consumers require an
+exact version match. Incompatible field-layout or token-semantics changes must
+increment `SCHEDULER_SSBUF_LAYOUT_VERSION` and update both ends together.
+Reserved bytes have unspecified contents and must not be read. Any newly
+introduced field must be explicitly initialized before the header is published.
+
+Initialization and bootstrap precede execution: every Scheduler initializes its
+cluster's SSBUF before reporting bootstrap arrival; AICPU waits for the aggregate
+`bootstrap_complete` before releasing the DATA_MAIN_BASE launch gate. Executors
+validate the header only after that gate opens. The kernel-author storage
+boundary is documented in [A5 runtime variants](../../../docs/runtimes.md#host_build_graph).
+
+The dispatch timing interval ends after publishing the first task-trace cache
+line. It includes that publication's overhead, but excludes the subsequent
+dispatch-timing cache-line publication and READY token publication. Device
+RunWall measures the full on-NPU run independently of this phase boundary.
+
+Simulation allocates an aligned 3 KiB backing region per physical cluster,
+shared by its AIC and two AIV lanes and retired with the run. Initialization
+tolerates nonzero previous contents. Completion counts are published after
+each resolved task and after any associated error.
 
 ## 8. Scalar Access During Construction
 

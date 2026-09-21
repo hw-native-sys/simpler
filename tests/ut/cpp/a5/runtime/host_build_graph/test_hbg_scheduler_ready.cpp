@@ -99,7 +99,7 @@ TEST(SchedulerProfilingLevel, DispatchWritesTaskIdentityBeforePhaseDetails) {
         ASSERT_TRUE(scheduler_fill_dispatch_slot(
             graph.graph(), storage.scheduler_state->base(),
             storage.local_context(&storage.contexts[1], &storage.scheduler_local_state), storage.run_control,
-            SchedulerFreeSlotClaim{1, 0, 0, 0}, ready_claim, level
+            SchedulerFreeSlotClaim{1, 0, 0, 0}, ready_claim, level, storage.ssbuf_region
         ));
         auto *traces =
             scheduler_state_at<SchedulerTaskTrace>(storage.scheduler_state->base(), storage.layout.trace_cells_offset);
@@ -630,7 +630,7 @@ TEST(SchedulerDispatch, RejectsKernelIdBeforeCallableTableAccess) {
     EXPECT_FALSE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
-        ready_claim, 0
+        ready_claim, 0, storage.ssbuf_region
     ));
     EXPECT_EQ(storage.run_control->scheduler_error, static_cast<uint64_t>(SchedulerGraphResult::INVALID_CALLABLE));
     EXPECT_EQ(storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_INVALID_CALLABLE));
@@ -649,7 +649,7 @@ TEST(SchedulerDispatch, RejectsInvalidSingleSubtaskShapeBeforeMetadataIndex) {
     EXPECT_FALSE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
-        ready_claim, 0
+        ready_claim, 0, storage.ssbuf_region
     ));
     EXPECT_EQ(storage.run_control->scheduler_error, static_cast<uint64_t>(SchedulerGraphResult::UNSUPPORTED_SHAPE));
     EXPECT_EQ(storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_INVALID_SHAPE));
@@ -667,7 +667,7 @@ TEST(SchedulerDispatch, RejectsCoreTypeMismatch) {
     EXPECT_FALSE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
-        ready_claim, 0
+        ready_claim, 0, storage.ssbuf_region
     ));
     EXPECT_EQ(storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_INVALID_SHAPE));
 }
@@ -686,7 +686,7 @@ TEST(SchedulerDispatch, RejectsUnknownTargetCoreType) {
     EXPECT_FALSE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
-        ready_claim, 0
+        ready_claim, 0, storage.ssbuf_region
     ));
     EXPECT_EQ(storage.run_control->scheduler_error, static_cast<uint64_t>(SchedulerGraphResult::UNSUPPORTED_SHAPE));
     EXPECT_EQ(storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_INVALID_SHAPE));
@@ -705,7 +705,7 @@ TEST(SchedulerDispatch, WrapsGenerationAndRejectsZeroCallable) {
     ASSERT_TRUE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
-        ready_claim, 0
+        ready_claim, 0, storage.ssbuf_region
     ));
     EXPECT_EQ(storage.scheduler_local_state.slots[0][0].generation, 1u);
     uint32_t pending_slot = UINT32_MAX;
@@ -722,7 +722,7 @@ TEST(SchedulerDispatch, WrapsGenerationAndRejectsZeroCallable) {
     EXPECT_FALSE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
-        ready_claim, 0
+        ready_claim, 0, storage.ssbuf_region
     ));
     EXPECT_EQ(storage.run_control->scheduler_error, static_cast<uint64_t>(SchedulerGraphResult::INVALID_CALLABLE));
     EXPECT_EQ(storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_INVALID_CALLABLE));
@@ -751,7 +751,7 @@ TEST(SchedulerDispatch, RejectsAKernelIdPastThePublishedCallableCount) {
     ASSERT_TRUE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
-        ready_claim, 0
+        ready_claim, 0, storage.ssbuf_region
     ));
     auto *payload = scheduler_state_at<DispatchPayload>(
         storage.scheduler_state->base(), storage.contexts[0].dispatch_payload_offset
@@ -763,7 +763,7 @@ TEST(SchedulerDispatch, RejectsAKernelIdPastThePublishedCallableCount) {
     EXPECT_FALSE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
-        ready_claim, 0
+        ready_claim, 0, storage.ssbuf_region
     ));
     EXPECT_EQ(storage.run_control->scheduler_error, static_cast<uint64_t>(SchedulerGraphResult::INVALID_CALLABLE));
     EXPECT_EQ(storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_INVALID_CALLABLE));
@@ -783,7 +783,7 @@ TEST(SchedulerDispatch, AcceptsLastCallableAndInlineSentinel) {
     ASSERT_TRUE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
-        ready_claim, 0
+        ready_claim, 0, storage.ssbuf_region
     ));
     auto *payload = scheduler_state_at<DispatchPayload>(
         storage.scheduler_state->base(), storage.contexts[0].dispatch_payload_offset
@@ -797,7 +797,7 @@ TEST(SchedulerDispatch, AcceptsLastCallableAndInlineSentinel) {
     ASSERT_TRUE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
-        ready_claim, 0
+        ready_claim, 0, storage.ssbuf_region
     ));
     payload = scheduler_state_at<DispatchPayload>(
         storage.scheduler_state->base(), storage.contexts[0].dispatch_payload_offset + sizeof(DispatchPayload)
@@ -866,7 +866,7 @@ TEST(SchedulerPredicate, MalformedPredicateStopsDispatchWithoutPublishingSlot) {
     EXPECT_FALSE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
-        ready_claim, 0
+        ready_claim, 0, storage.ssbuf_region
     ));
     EXPECT_EQ(storage.run_control->scheduler_error, static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS));
     EXPECT_EQ(storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_INVALID_PREDICATE));
@@ -888,7 +888,7 @@ TEST(SchedulerPredicate, FailedPredicatePublishesDependencyOnlyDispatch) {
     ASSERT_TRUE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
-        ready_claim, 0
+        ready_claim, 0, storage.ssbuf_region
     ));
     const auto *payload = scheduler_state_at<DispatchPayload>(
         storage.scheduler_state->base(), storage.contexts[0].dispatch_payload_offset

@@ -115,6 +115,8 @@ __aicore__ inline void write_reg(RegId reg, uint64_t value) {
  */
 __aicore__ inline uint32_t get_physical_core_id() { return static_cast<uint32_t>(get_coreid()) & AICORE_COREID_MASK; }
 
+__aicore__ inline uint64_t platform_ssbuf_hardware_base_address() { return 0; }
+
 // =============================================================================
 // System Counter
 // =============================================================================

@@ -25,6 +25,10 @@ device, regardless of die count.
 | AIC | 18 | 36 |
 | AIV | 36 | 72 |
 
+Each 1-AIC + 2-AIV cluster shares a 3 KiB SSBUF, represented by
+`PLATFORM_SSBUF_SIZE`. Runtime reservations constrain kernel use; see the
+[host_build_graph SSBUF contract](runtimes.md#host_build_graph).
+
 L1 / L0A / L0B / L0C (per AIC), UB (per AIV), and L2 (per AICore
 cluster) exist per the cross-chip model — sizes are not documented in
 this repo.

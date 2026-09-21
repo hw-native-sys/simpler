@@ -98,6 +98,8 @@ static int prof_free_cb(void *dev_ptr) {
 struct DeviceRunner::ActiveRun {
     Runtime *runtime{nullptr};
     void *reg_blocks{nullptr};
+    void *ssbuf_allocation{nullptr};
+    void *ssbuf_blocks{nullptr};
     std::vector<std::thread> aicpu_threads;
     std::vector<std::thread> aicore_threads;
     DevicePhaseBufferStorage<PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH> phase_buf{};
@@ -128,6 +130,11 @@ void DeviceRunner::cleanup_active_run() noexcept {
     if (active_run_->reg_blocks != nullptr) {
         mem_alloc_.free(active_run_->reg_blocks);
         active_run_->reg_blocks = nullptr;
+    }
+    if (active_run_->ssbuf_allocation != nullptr) {
+        mem_alloc_.free(active_run_->ssbuf_allocation);
+        active_run_->ssbuf_allocation = nullptr;
+        active_run_->ssbuf_blocks = nullptr;
     }
     // The collectors' device resources are not per-run: they are released in
     // finalize(), which owns them for the worker's lifetime.
@@ -289,7 +296,7 @@ int DeviceRunner::ensure_binaries_loaded() {
         }
 
         aicore_execute_func_ = reinterpret_cast<
-            void (*)(Runtime *, int, CoreType, uint32_t, uint64_t, uint32_t, uint64_t, uint64_t, uint64_t)>(
+            void (*)(Runtime *, int, CoreType, uint32_t, uint64_t, uint32_t, uint64_t, uint64_t, uint64_t, uint64_t)>(
             dlsym(aicore_so_handle_, "aicore_execute_wrapper")
         );
         if (aicore_execute_func_ == nullptr) {
@@ -410,6 +417,19 @@ int DeviceRunner::prepare_execution(
     }
     std::memset(active_run_->reg_blocks, 0, total_reg_size);
 
+    constexpr size_t ssbuf_alignment = 64;
+    const size_t total_ssbuf_size = static_cast<size_t>(block_dim) * PLATFORM_SSBUF_SIZE;
+    active_run_->ssbuf_allocation = mem_alloc_.alloc(total_ssbuf_size + ssbuf_alignment - 1);
+    if (active_run_->ssbuf_allocation == nullptr) {
+        LOG_ERROR("Failed to allocate simulated SSBUF memory (%zu bytes)", total_ssbuf_size);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    const uintptr_t ssbuf_unaligned = reinterpret_cast<uintptr_t>(active_run_->ssbuf_allocation);
+    active_run_->ssbuf_blocks = reinterpret_cast<void *>(
+        (ssbuf_unaligned + ssbuf_alignment - 1) & ~(static_cast<uintptr_t>(ssbuf_alignment) - 1)
+    );
+    std::memset(active_run_->ssbuf_blocks, 0xa5, total_ssbuf_size);
+
     size_t regs_array_size = num_aicore * sizeof(uint64_t);
     uint64_t *regs_array = reinterpret_cast<uint64_t *>(mem_alloc_.alloc(regs_array_size));
     if (regs_array == nullptr) {
@@ -514,15 +534,21 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
             }
 
             LOG_INFO("Launching %d AICore thread(s)", num_aicore);
+            const uint32_t block_dim = static_cast<uint32_t>(num_aicore / cores_per_blockdim_);
             for (int i = 0; i < num_aicore; i++) {
                 CoreType core_type = runtime.core_type_rule(i);
                 uint32_t physical_core_id = static_cast<uint32_t>(i);
                 run->aicore_threads.push_back(create_thread(
-                    [this, run, i, core_type, physical_core_id]() {
+                    [this, run, i, core_type, physical_core_id, block_dim]() {
+                        const uint32_t cluster_id = core_type == CoreType::AIC ? physical_core_id :
+                                                                                 (physical_core_id - block_dim) /
+                                                                                     PLATFORM_AIV_CORES_PER_BLOCKDIM;
+                        const uint64_t ssbuf_base = reinterpret_cast<uint64_t>(run->ssbuf_blocks) +
+                                                    static_cast<uint64_t>(cluster_id) * PLATFORM_SSBUF_SIZE;
                         aicore_execute_func_(
                             run->runtime, i, core_type, physical_core_id, kernel_args_.regs,
                             kernel_args_.enable_profiling_flag, kernel_args_.chip_swimlane_aicore_rotation_table,
-                            kernel_args_.aicore_pmu_ring_addrs, kernel_args_.run_result_epoch
+                            kernel_args_.aicore_pmu_ring_addrs, kernel_args_.run_result_epoch, ssbuf_base
                         );
                         run_completion_.task_finished();
                     },

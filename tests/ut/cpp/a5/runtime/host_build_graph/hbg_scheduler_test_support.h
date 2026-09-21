@@ -141,8 +141,6 @@ struct FixtureStorage {
             SchedulerWorkerContext &context = contexts[worker];
             context.core_type = static_cast<int32_t>(CoreType::AIV);
             context.active = 1;
-            context.dispatch_slots_offset = layout.dispatch_slots_offset;
-            context.completion_inboxes_offset = layout.completion_inboxes_offset;
             context.task_controls_offset = layout.task_controls_offset;
             context.task_metadata_offset = layout.task_metadata_offset;
             context.ready_inboxes_offset = layout.ready_inboxes_offset;
@@ -224,6 +222,8 @@ struct FixtureStorage {
         std::make_unique<std::array<uint64_t, kFixtureCallableCount>>()
     };
     uint64_t *callable_addresses{callable_table->data()};
+    alignas(64) std::array<uint8_t, SCHEDULER_SSBUF_HARDWARE_SIZE> ssbuf_storage{};
+    SchedulerSsbufRegion *ssbuf_region{scheduler_ssbuf_region(reinterpret_cast<uint64_t>(ssbuf_storage.data()))};
     std::vector<SchedulerLocalState> local_states;
     SchedulerLocalState *owner_states{local_states.data()};
     SchedulerLocalState scheduler_local_state{};

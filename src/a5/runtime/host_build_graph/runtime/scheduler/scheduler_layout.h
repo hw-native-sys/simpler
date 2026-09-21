@@ -30,10 +30,8 @@ struct AicoreSchedulerLayout {
     uint64_t aicpu_lifecycle_traces_offset;
     uint64_t worker_contexts_offset;
     uint64_t dispatch_payloads_offset;
-    uint64_t dispatch_slots_offset;
     uint64_t task_metadata_offset;
     uint64_t task_controls_offset;
-    uint64_t completion_inboxes_offset;
     uint64_t ready_inboxes_offset;
     uint64_t ready_directory_offset;
     uint64_t trace_cells_offset;
