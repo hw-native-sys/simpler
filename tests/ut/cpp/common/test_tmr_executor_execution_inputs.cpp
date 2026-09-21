@@ -482,6 +482,54 @@ TEST_F(TmrExecutorExecutionInputsTest, ProgramEntryOverlapsReportsAndReusesSeria
     }
 }
 
+TEST_F(TmrExecutorExecutionInputsTest, PartialHandshakeFailureRetiresOpenedCoresWithoutWaitingForOtherReports) {
+    isolated_round([&] {
+        opened_windows = 0;
+        closed_windows = 0;
+        closed_mask = 0;
+        resident->dev.worker_count = 6;
+        resident->dev.aicpu_thread_num = 3;
+        RegisterCallableArgs registration;
+        registration.active_callable_id = 3;
+        registration.dev_orch_so_addr = reinterpret_cast<uint64_t>(binary.data());
+        registration.dev_orch_so_size = binary.size();
+        std::strcpy(registration.device_orch_func_name, "orchestration_a");
+        std::strcpy(registration.device_orch_config_name, "config_a");
+        ASSERT_EQ(simpler_aicpu_register_callable(&registration), 0);
+        resident->set_active_callable_id(3);
+        resident->set_orch_args(arguments(79));
+        for (int i = 0; i < 6; ++i) {
+            auto &worker = resident->dev.workers[i];
+            worker.physical_core_id = i;
+            worker.core_type = i < 2 ? CoreType::AIC : CoreType::AIV;
+            worker.aicore_done = i == 0 || i == 2 || i == 3;
+        }
+        std::thread reports([&] {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (opened_windows.load() < 3 && std::chrono::steady_clock::now() < deadline) {}
+            EXPECT_EQ(opened_windows.load(), 3);
+            auto &invalid = resident->dev.workers[1];
+            invalid.physical_core_id = PLATFORM_MAX_CORES;
+            __atomic_store_n(&invalid.aicore_done, 1, __ATOMIC_RELEASE);
+            // Workers 4 and 5 never report: CPU failure must release that initializer.
+        });
+        std::array<int32_t, 3> results{};
+        std::vector<std::thread> cpus;
+        for (int i = 0; i < 3; ++i) {
+            cpus.emplace_back([&, i] {
+                affinity_index = i;
+                results[i] = aicpu_execute(resident.get());
+            });
+        }
+        for (auto &cpu : cpus)
+            cpu.join();
+        reports.join();
+        EXPECT_EQ(results[1], -1);
+        EXPECT_EQ(opened_windows.load(), 3);
+        EXPECT_EQ(closed_windows.load(), 3);
+    });
+}
+
 TEST_F(TmrExecutorExecutionInputsTest, CoordinatedRoundsRunABAWithOneFinalVerdictAndStableStorage) {
     uint64_t storage = 0;
     uint64_t invocation = 90;
