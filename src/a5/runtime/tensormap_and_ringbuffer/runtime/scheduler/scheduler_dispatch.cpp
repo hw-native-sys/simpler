@@ -870,7 +870,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         return -1;
     }
 
-    Handshake *hank = static_cast<Handshake *>(runtime->dev.workers);
+    Handshake *hank = reports_ != nullptr ? reports_ : runtime->dev.workers;
 
     LOG_INFO("Thread %d: dispatch starting with %d cores", thread_idx, tracker.core_num());
     int32_t cur_thread_completed = 0;

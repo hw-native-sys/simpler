@@ -28,21 +28,14 @@ int validate(void *context, const KernelInvocationBinding &binding) noexcept {
     const auto &n = get(context);
     if (!n.aicore || !n.aicpu || !n.aicore_blocks || !n.aicpu_blocks || !span(n.aicore_args, n.aicore_args_bytes) ||
         n.aicpu_args != binding.packet || n.aicpu_args_bytes != binding.packet_bytes || !n.clear_regions ||
-        !n.clear_region_count || !span(n.cancel.address, n.cancel.bytes) || n.cancel.bytes % sizeof(uint32_t) != 0 ||
-        reinterpret_cast<uintptr_t>(n.cancel.address) % alignof(uint32_t) != 0 ||
-        n.placeholder_count != binding.placeholder_count ||
+        !n.clear_region_count || n.placeholder_count != binding.placeholder_count ||
         (n.placeholder_count && (!n.placeholders || !binding.placeholders)) ||
         n.placeholder_count > n.aicpu_args_bytes / sizeof(uint64_t))
         return PTO_RUNTIME_ERR_INTERNAL;
-    bool cancel_cleared = false;
     for (size_t i = 0; i < n.clear_region_count; ++i) {
         const auto &r = n.clear_regions[i];
         if (!span(r.address, r.bytes)) return PTO_RUNTIME_ERR_INTERNAL;
-        const auto base = reinterpret_cast<uintptr_t>(r.address);
-        const auto cancel = reinterpret_cast<uintptr_t>(n.cancel.address);
-        cancel_cleared |= cancel >= base && cancel - base <= r.bytes && n.cancel.bytes <= r.bytes - (cancel - base);
     }
-    if (!cancel_cleared) return PTO_RUNTIME_ERR_INTERNAL;
     for (size_t i = 0; i < n.placeholder_count; ++i) {
         const auto &p = n.placeholders[i];
         if (p.addrOffset != binding.placeholders[i].address_offset ||
@@ -88,11 +81,6 @@ int clear(void *context, void *stream) noexcept {
     }
     return 0;
 }
-int cancel(void *context, void *stream) noexcept {
-    const auto &r = get(context).cancel;
-    // Every pre-window cancel word remains UINT32_MAX until the AICore tail.
-    return aclrtMemsetAsync(r.address, r.bytes, 0xff, r.bytes, stream);
-}
 int core(void *context, void *stream) noexcept {
     const auto &n = get(context);
     return aclrtLaunchKernel(n.aicore, n.aicore_blocks, n.aicore_args, n.aicore_args_bytes, stream);
@@ -124,7 +112,7 @@ KernelLaunchResult launch_bound_kernel_native(
     }
     NativeCall call{native, owner};
     const KernelLaunchGateOps gate{&call, acquire, finish, query};
-    const KernelLaunchOps ops{&call, wait, clear, record, cpu, core, cancel};
+    const KernelLaunchOps ops{&call, wait, clear, record, cpu, core};
     return launch_bound_kernel(binding, caller_stream, gate, ops);
 }
 

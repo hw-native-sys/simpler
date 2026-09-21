@@ -21,7 +21,7 @@
 namespace {
 using namespace simpler::tmr;
 
-const TmrKernelClearBinding kBinding{11, {0x10000, 128}, {0x20000, 384}, 3};
+const TmrKernelClearBinding kBinding{11, {0x10000, 64}, {0x20000, 192}, 3};
 
 void expect_equal(const TmrKernelClearPlan &actual, const TmrKernelClearPlan &expected) {
     EXPECT_EQ(actual.context_generation, expected.context_generation);
@@ -29,11 +29,9 @@ void expect_equal(const TmrKernelClearPlan &actual, const TmrKernelClearPlan &ex
         EXPECT_EQ(actual.regions[i].address, expected.regions[i].address);
         EXPECT_EQ(actual.regions[i].bytes, expected.regions[i].bytes);
     }
-    EXPECT_EQ(actual.cancel.address, expected.cancel.address);
-    EXPECT_EQ(actual.cancel.bytes, expected.cancel.bytes);
 }
 
-TEST(TmrKernelClearPlan, BuildsOnlyDynamicRegionsAndSingleWordCancel) {
+TEST(TmrKernelClearPlan, BuildsOnlyDynamicRegions) {
     TmrKernelClearPlan plan;
     ASSERT_TRUE(build_tmr_kernel_clear_plan(kBinding, &plan));
     EXPECT_EQ(plan.context_generation, 11u);
@@ -41,8 +39,6 @@ TEST(TmrKernelClearPlan, BuildsOnlyDynamicRegionsAndSingleWordCancel) {
     EXPECT_EQ(plan.regions[0].bytes, sizeof(TmrLaunchControl));
     EXPECT_EQ(plan.regions[1].address, kBinding.reports.address);
     EXPECT_EQ(plan.regions[1].bytes, 3u * sizeof(TmrCoreReport));
-    EXPECT_EQ(plan.cancel.address, kBinding.control.address + offsetof(TmrLaunchControl, host_cancel));
-    EXPECT_EQ(plan.cancel.bytes, sizeof(uint32_t));
 
     auto adjacent = kBinding;
     adjacent.reports.address = adjacent.control.address + adjacent.control.bytes;
@@ -83,8 +79,6 @@ TEST(TmrKernelClearPlan, InvalidBindingPreservesOutput) {
     invalid = kBinding;
     invalid.reports.address = invalid.control.address;
     reject(invalid);
-    invalid.reports.address += 64;
-    reject(invalid);
     invalid = kBinding;
     invalid.control.address = invalid.reports.address + 64;
     reject(invalid);
@@ -123,7 +117,7 @@ bool all_zero(const TmrClearRegion &region) {
     });
 }
 
-TEST(TmrKernelClearPlan, ClearingPreservesSurroundingStaticBytesAndCancelPreservesReports) {
+TEST(TmrKernelClearPlan, ClearingPreservesSurroundingStaticBytes) {
     ClearFixture fixture;
     std::memset(&fixture, 0xa5, sizeof(fixture));
     const auto binding = fixture_binding(fixture);
@@ -138,24 +132,6 @@ TEST(TmrKernelClearPlan, ClearingPreservesSurroundingStaticBytesAndCancelPreserv
             return value == 0xa5;
         }));
     }
-    fixture.control.round_epoch = 9;
-    fixture.reports[0].ready = 1;
-    fixture.reports[1].exited = 1;
-    fixture.reports[2].command = static_cast<uint32_t>(TmrCoreCommand::Open);
-    const auto reports = fixture.reports;
-    const auto control = fixture.control;
-    std::memset(reinterpret_cast<void *>(plan.cancel.address), 0xff, static_cast<size_t>(plan.cancel.bytes));
-    EXPECT_EQ(fixture.control.host_cancel, kTmrHostCancel);
-    EXPECT_EQ(fixture.control.round_epoch, 9u);
-    EXPECT_EQ(std::memcmp(fixture.reports.data(), reports.data(), sizeof(reports)), 0);
-    EXPECT_EQ(
-        std::memcmp(
-            reinterpret_cast<const uint8_t *>(&fixture.control) + sizeof(uint32_t),
-            reinterpret_cast<const uint8_t *>(&control) + sizeof(uint32_t), sizeof(control) - sizeof(uint32_t)
-        ),
-        0
-    );
-    EXPECT_EQ(fixture.control.completion, static_cast<uint32_t>(TmrCompletion::Pending));
 }
 
 TEST(TmrKernelClearPlan, SkippingEitherClearLeavesObservablePriorRoundState) {
@@ -167,9 +143,9 @@ TEST(TmrKernelClearPlan, SkippingEitherClearLeavesObservablePriorRoundState) {
         std::memset(&fixture, 0, sizeof(fixture));
         fixture.control.completion = static_cast<uint32_t>(TmrCompletion::Complete);
         fixture.control.round_epoch = 19;
-        fixture.reports[0].ready = 1;
-        fixture.reports[1].command = static_cast<uint32_t>(TmrCoreCommand::Open);
-        fixture.reports[2].release = static_cast<uint32_t>(TmrCoreRelease::Release);
+        fixture.reports[0].aicore_done = 1;
+        fixture.reports[1].task = uint64_t{73};
+        fixture.reports[2].report_epoch = uint64_t{19};
         clear_region(plan.regions[1 - skipped]);
         EXPECT_FALSE(all_zero(plan.regions[skipped]));
         EXPECT_TRUE(all_zero(plan.regions[1 - skipped]));
@@ -177,9 +153,9 @@ TEST(TmrKernelClearPlan, SkippingEitherClearLeavesObservablePriorRoundState) {
             EXPECT_EQ(fixture.control.round_epoch, 19u);
             EXPECT_EQ(fixture.control.completion, static_cast<uint32_t>(TmrCompletion::Complete));
         } else {
-            EXPECT_EQ(fixture.reports[0].ready, 1u);
-            EXPECT_EQ(fixture.reports[1].command, static_cast<uint32_t>(TmrCoreCommand::Open));
-            EXPECT_EQ(fixture.reports[2].release, static_cast<uint32_t>(TmrCoreRelease::Release));
+            EXPECT_EQ(fixture.reports[0].aicore_done, 1u);
+            EXPECT_EQ(fixture.reports[1].task, uint64_t{73});
+            EXPECT_EQ(fixture.reports[2].report_epoch, uint64_t{19});
         }
     }
 }

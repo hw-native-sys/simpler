@@ -122,28 +122,18 @@ protected:
         model.on_register = {};
     }
 
-    std::thread launch(CoreType core_type) {
-        return std::thread([&, core_type] {
+    std::thread launch(CoreType core_type, bool kernel = true) {
+        return std::thread([&, core_type, kernel] {
             is_worker = true;
-            aicore_execute_kernel(&runtime, &context, 0, core_type);
-            release_at_return.store(load_kernel_gm_word(&report.release), std::memory_order_relaxed);
+            if (kernel) aicore_execute_kernel(&runtime, &context, 0, core_type);
+            else aicore_execute(&runtime, 0, core_type);
             returned.store(true, std::memory_order_release);
             is_worker = false;
         });
     }
 
-    void open(uint64_t epoch) {
-        store_kernel_gm_word(&report.round_epoch, epoch);
-        store_kernel_gm_word(&report.command, static_cast<uint32_t>(TmrCoreCommand::Open));
-    }
-
-    void cancel() { store_kernel_gm_word(&report.command, static_cast<uint32_t>(TmrCoreCommand::Cancel)); }
-
     void release() {
-        // CoreGroup tests cover real close-before-release operation ordering.
-        // Here the CPU fixture leaves the register idle before opening the gate.
-        write_reg(RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
-        store_kernel_gm_word(&report.release, static_cast<uint32_t>(TmrCoreRelease::Release));
+        store_kernel_gm_word(&runtime.dev.teardown_gates[0].post_close_release, AICORE_POST_CLOSE_RELEASE);
     }
 
     SimState model;
@@ -157,231 +147,81 @@ protected:
     std::atomic<uint32_t> release_at_return{0};
 };
 
-TEST_F(TmrKernelAicoreTest, OldNonzeroDispatchNeverOpensAWaitingKernelWindow) {
-    for (CoreType core_type : {CoreType::AIC, CoreType::AIV}) {
-        for (uint32_t old_dispatch : {uint32_t{2}, uint32_t{AICPU_IDLE_TASK_ID}, AICORE_EXIT_SIGNAL}) {
+TEST_F(TmrKernelAicoreTest, BothEntriesPublishIdentityBeforeRegisterOpenAndExecuteRepeatedRounds) {
+    for (bool kernel : {false, true}) {
+        for (uint32_t token : {uint32_t{2}, uint32_t{3}}) {
             clear_launch_words();
-            write_reg(RegId::DATA_MAIN_BASE, old_dispatch);
+            runtime.dev.workers[0] = {};
+            runtime.dev.teardown_gates[0].post_close_release = 0;
+            write_reg(RegId::DATA_MAIN_BASE, 0);
             write_reg(RegId::COND, 0);
-            Signal waiting;
-            Signal cancel_ready;
-            bool first_wait = true;
+            auto &handshake = kernel ? report : runtime.dev.workers[0];
+            Signal reported;
+            Signal open;
+            Signal executed;
+            Signal exit;
+            bool saw_report = false;
+            bool saw_execution = false;
             model.on_spin = [&] {
-                if (!first_wait) return;
-                first_wait = false;
-                waiting.set();
-                cancel_ready.wait();
+                if (!saw_report) {
+                    saw_report = true;
+                    reported.set();
+                    open.wait();
+                } else if (!saw_execution && model.calls.load(std::memory_order_acquire) != 0) {
+                    saw_execution = true;
+                    executed.set();
+                    exit.wait();
+                }
             };
-            auto worker = launch(core_type);
-            waiting.wait();
-            EXPECT_EQ(load_kernel_gm_word(&report.ready), 1u);
-            EXPECT_EQ(report.physical_core_id, 7u);
-            EXPECT_EQ(report.core_type, static_cast<uint32_t>(core_type));
-            EXPECT_EQ(model.register_accesses.load(), 0u);
+            auto worker = launch(CoreType::AIV, kernel);
+            reported.wait();
+            EXPECT_EQ(handshake.aicore_done, 1u);
+            EXPECT_EQ(handshake.physical_core_id, 7u);
+            EXPECT_EQ(static_cast<CoreType>(handshake.core_type), CoreType::AIV);
             EXPECT_EQ(model.calls.load(), 0u);
             EXPECT_FALSE(returned.load());
-            cancel();
-            cancel_ready.set();
+            handshake.task = reinterpret_cast<uint64_t>(payloads.data());
+            write_reg(RegId::DATA_MAIN_BASE, token);
+            open.set();
+            executed.wait();
+            EXPECT_EQ(model.calls.load(), 1u);
+            EXPECT_EQ(model.last_argument.load(), 73u);
+            EXPECT_EQ(read_reg(RegId::COND), MAKE_FIN_VALUE(token));
+            write_reg(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
+            release();
+            exit.set();
             worker.join();
-            EXPECT_EQ(model.register_accesses.load(), 0u);
-            EXPECT_EQ(read_reg(RegId::COND), 0u);
-            EXPECT_EQ(read_reg(RegId::DATA_MAIN_BASE), old_dispatch);
-            EXPECT_EQ(report.exited, 1u);
-            EXPECT_EQ(release_at_return.load(), 0u);
+            EXPECT_TRUE(returned.load());
+            EXPECT_EQ(read_reg(RegId::COND), AICORE_EXITED_VALUE);
         }
     }
 }
 
-TEST_F(TmrKernelAicoreTest, PreWindowHostCancelNeedsNeitherMmioNorRelease) {
-    for (bool already_canceled : {false, true}) {
-        clear_launch_words();
-        write_reg(RegId::DATA_MAIN_BASE, 2);
-        if (already_canceled) store_kernel_gm_word(&control.host_cancel, kTmrHostCancel);
-        Signal waiting;
-        Signal cancel_ready;
-        bool first_wait = true;
-        model.on_spin = [&] {
-            if (!first_wait) return;
-            first_wait = false;
-            waiting.set();
-            cancel_ready.wait();
-        };
-        auto worker = launch(CoreType::AIV);
-        if (!already_canceled) {
-            waiting.wait();
-            EXPECT_EQ(model.register_accesses.load(), 0u);
-            store_kernel_gm_word(&control.host_cancel, kTmrHostCancel);
-            cancel_ready.set();
-        }
-        worker.join();
-        EXPECT_EQ(report.ready, 1u);
-        EXPECT_EQ(report.exited, 1u);
-        EXPECT_EQ(model.register_accesses.load(), 0u);
-        EXPECT_EQ(model.calls.load(), 0u);
-        EXPECT_EQ(release_at_return.load(), 0u);
-    }
-}
-
-TEST_F(TmrKernelAicoreTest, CpuCancelBeforeOpenReturnsWithoutRegisterAcknowledgment) {
-    for (CoreType core_type : {CoreType::AIC, CoreType::AIV}) {
-        clear_launch_words();
-        write_reg(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
-        write_reg(RegId::COND, 31);
-        cancel();
-        auto worker = launch(core_type);
-        worker.join();
-        EXPECT_EQ(report.ready, 1u);
-        EXPECT_EQ(report.exited, 1u);
-        EXPECT_EQ(model.register_accesses.load(), 0u);
-        EXPECT_EQ(read_reg(RegId::COND), 31u);
-        EXPECT_EQ(release_at_return.load(), 0u);
-    }
-}
-
-TEST_F(TmrKernelAicoreTest, CancelHidingAnOpenedWindowStillWaitsForRelease) {
-    for (CoreType core_type : {CoreType::AIC, CoreType::AIV}) {
-        clear_launch_words();
-        write_reg(RegId::DATA_MAIN_BASE, 2);
-        store_kernel_gm_word(&report.round_epoch, uint64_t{17});
-        cancel();
-        Signal waiting_for_release;
-        Signal allow_return;
-        model.on_spin = [&] {
-            EXPECT_EQ(load_kernel_gm_word(&report.exited), 1u);
-            EXPECT_EQ(load_kernel_gm_word(&report.release), 0u);
-            waiting_for_release.set();
-            allow_return.wait();
-        };
-        auto worker = launch(core_type);
-        waiting_for_release.wait();
-        EXPECT_EQ(read_reg(RegId::COND), AICORE_EXITED_VALUE);
-        EXPECT_EQ(model.calls.load(), 0u);
-        EXPECT_FALSE(returned.load());
-        release();
-        allow_return.set();
-        worker.join();
-        EXPECT_TRUE(returned.load());
-        EXPECT_EQ(release_at_return.load(), static_cast<uint32_t>(TmrCoreRelease::Release));
-    }
-}
-
-TEST_F(TmrKernelAicoreTest, CancelAfterOrdinaryPickupPreventsAckAndExecution) {
-    write_reg(RegId::DATA_MAIN_BASE, 2);
-    open(17);
-    // First access writes initial IDLE; the next one picks up the dispatch.
-    // Cancel at that platform boundary exercises the pre-ACK recheck.
-    model.on_register = [&](uint32_t access) {
-        if (access == 2) cancel();
-    };
-    Signal waiting_for_release;
-    Signal allow_return;
-    model.on_spin = [&] {
-        EXPECT_EQ(load_kernel_gm_word(&report.exited), 1u);
-        waiting_for_release.set();
-        allow_return.wait();
-    };
-    auto worker = launch(CoreType::AIC);
-    waiting_for_release.wait();
-    EXPECT_EQ(model.calls.load(), 0u);
-    EXPECT_EQ(read_reg(RegId::COND), AICORE_EXITED_VALUE);
-    EXPECT_FALSE(returned.load());
-    release();
-    allow_return.set();
-    worker.join();
-    EXPECT_EQ(release_at_return.load(), static_cast<uint32_t>(TmrCoreRelease::Release));
-}
-
-TEST_F(TmrKernelAicoreTest, EarlyDispatchCancelDoesNotNeedDoorbellOrExecutePayload) {
+TEST_F(TmrKernelAicoreTest, RegisterExitReleasesEarlyDispatchWithoutDoorbellOrExecution) {
     constexpr uint32_t token = 2;
     source.tensor_count = 0;
     source.scalar_count = 1;
     source.scalars[0] = 84;
     payloads[token & 1u].src_payload = reinterpret_cast<uint64_t>(&source);
-    // No high-word doorbell is ever published in this test.
+    report.task = reinterpret_cast<uint64_t>(payloads.data());
     write_reg(RegId::DATA_MAIN_BASE, token);
-    open(17);
     Signal gated;
-    Signal allow_cancel;
-    Signal waiting_for_release;
-    Signal allow_return;
-    bool saw_gate = false;
+    Signal exit;
     model.on_spin = [&] {
-        if (load_kernel_gm_word(&report.exited) != 0) {
-            waiting_for_release.set();
-            allow_return.wait();
-        } else if (!saw_gate) {
-            saw_gate = true;
-            gated.set();
-            allow_cancel.wait();
-        }
+        gated.set();
+        exit.wait();
     };
     auto worker = launch(CoreType::AIV);
     gated.wait();
     EXPECT_EQ(payloads[token & 1u].args[0], 84u);
     EXPECT_EQ(model.calls.load(), 0u);
-    EXPECT_EQ(read_reg(RegId::COND), AICORE_IDLE_VALUE);
     EXPECT_EQ(read_dmb_high32(), 0u);
-    cancel();
-    allow_cancel.set();
-    waiting_for_release.wait();
-    EXPECT_EQ(read_reg(RegId::DATA_MAIN_BASE), token);
-    EXPECT_EQ(read_reg(RegId::COND), AICORE_EXITED_VALUE);
-    EXPECT_EQ(model.calls.load(), 0u);
-    EXPECT_FALSE(returned.load());
+    write_reg(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
     release();
-    allow_return.set();
+    exit.set();
     worker.join();
-    EXPECT_EQ(release_at_return.load(), static_cast<uint32_t>(TmrCoreRelease::Release));
-}
-
-TEST_F(TmrKernelAicoreTest, TwoOrdinaryRoundsReuseRegistersAndReturnOnlyAfterRelease) {
-    for (uint32_t token : {uint32_t{2}, uint32_t{3}}) {
-        clear_launch_words();
-        // No register block reset occurs between rounds: the previous CPU close
-        // leaves a nonzero idle value, which is not this round's OPEN command.
-        Signal before_open;
-        Signal publish_open;
-        Signal executed;
-        Signal publish_cancel;
-        Signal waiting_for_release;
-        Signal allow_return;
-        bool saw_pre_window = false;
-        bool saw_execution = false;
-        model.on_spin = [&] {
-            if (load_kernel_gm_word(&report.exited) != 0) {
-                waiting_for_release.set();
-                allow_return.wait();
-            } else if (!saw_pre_window) {
-                saw_pre_window = true;
-                before_open.set();
-                publish_open.wait();
-            } else if (model.calls.load(std::memory_order_acquire) != 0 && !saw_execution) {
-                saw_execution = true;
-                executed.set();
-                publish_cancel.wait();
-            }
-        };
-        auto worker = launch(CoreType::AIV);
-        before_open.wait();
-        EXPECT_EQ(model.register_accesses.load(), 0u);
-        write_reg(RegId::DATA_MAIN_BASE, token);
-        open(20 + token);
-        publish_open.set();
-        executed.wait();
-        EXPECT_EQ(model.calls.load(), 1u);
-        EXPECT_EQ(model.last_argument.load(), 73u);
-        EXPECT_EQ(read_reg(RegId::COND), MAKE_FIN_VALUE(token));
-        cancel();
-        publish_cancel.set();
-        waiting_for_release.wait();
-        EXPECT_EQ(read_reg(RegId::COND), AICORE_EXITED_VALUE);
-        EXPECT_FALSE(returned.load());
-        release();
-        allow_return.set();
-        worker.join();
-        EXPECT_EQ(release_at_return.load(), static_cast<uint32_t>(TmrCoreRelease::Release));
-        EXPECT_EQ(read_reg(RegId::DATA_MAIN_BASE), AICPU_IDLE_TASK_ID);
-    }
+    EXPECT_EQ(model.calls.load(), 0u);
+    EXPECT_EQ(read_reg(RegId::COND), AICORE_EXITED_VALUE);
 }
 
 }  // namespace

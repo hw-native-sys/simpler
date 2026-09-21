@@ -109,11 +109,6 @@ int DeviceRunnerBase::launch_kernel_callable(
         }
         return 0;
     };
-    ops.cancel_waiting_aicore = [](void *context, void *stream) noexcept {
-        const auto &s = *static_cast<Submission *>(context);
-        const auto &cancel = s.clear.cancel;
-        return aclrtMemsetAsync(reinterpret_cast<void *>(cancel.address), cancel.bytes, 0xff, cancel.bytes, stream);
-    };
     ops.launch_aicore = [](void *context, void *stream) noexcept {
         auto &r = *static_cast<Submission *>(context)->runner;
         void *device_args = r.kernel_core_envelope_;

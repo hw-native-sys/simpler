@@ -67,6 +67,7 @@
 #include "tensormap_and_ringbuffer/kernel_execution.h"
 #include "tensormap_and_ringbuffer/kernel_execution_round.h"
 #include "tensormap_and_ringbuffer/kernel_registration.h"
+#include "utils/thread_completion_gate.h"
 
 using simpler::tmr::ExecutionInputs;
 
@@ -130,7 +131,8 @@ struct AicpuExecutor {
     std::atomic<int32_t> thread_idx_{0};
     std::atomic<bool> init_done_{false};
     std::atomic<bool> init_failed_{false};
-    std::atomic<bool> finished_{false};
+    simpler::ThreadCompletionGate completion_gate_;
+    std::atomic<int32_t> execution_error_{0};
 
     // Parallel-handshake coordination (see AicpuExecutor::init). hs_setup_done_
     // is published by the leader once the shared pre-handshake setup is visible;
@@ -146,7 +148,6 @@ struct AicpuExecutor {
 
     // ===== Task queue state (managed by scheduler ready queues) =====
 
-    std::atomic<int32_t> finished_count_{0};
     std::atomic<bool> runtime_init_ready_{false};
 
     // Per-Worker arena backing the RuntimeContext + sm_handle + orch/sched/mailbox
@@ -159,8 +160,8 @@ struct AicpuExecutor {
     ChipTaskArgs orch_args_cached_;
     simpler::tmr::KernelInvocationState kernel_invocation_;
     simpler::tmr::KernelRoundGate kernel_gate_;
-    simpler::tmr::KernelCoreGroup kernel_cores_;
-    bool kernel_control_attached_{false};
+    simpler::tmr::KernelRoundStorage kernel_storage_;
+    bool kernel_storage_attached_{false};
     simpler::tmr::PreparedKernelContext kernel_context_;
     bool kernel_context_ready_{false};
 
@@ -194,12 +195,14 @@ struct AicpuExecutor {
     int32_t prepare_execution(Runtime *runtime, const ExecutionInputs &inputs);
     int32_t
     execute(Runtime *runtime, const ExecutionInputs &inputs, const simpler::tmr::KernelThreadView *thread = nullptr);
-    int32_t finalize_kernel_round();
+    int32_t finalize_execution(const ExecutionInputs &inputs);
     void clear_kernel_round() noexcept;
     void cancel_kernel_round() noexcept;
     int32_t kernel_status() const {
         if (init_failed_.load(std::memory_order_acquire)) return -1;
-        return kernel_invocation_.active() ? read_runtime_status(kernel_invocation_.inputs().sm) : 0;
+        const int32_t error = execution_error_.load(std::memory_order_acquire);
+        return error != 0 ? error :
+                            (kernel_invocation_.active() ? read_runtime_status(kernel_invocation_.inputs().sm) : 0);
     }
     void deinit(Runtime *runtime, bool invalidate_host_image);
 
@@ -264,6 +267,7 @@ int32_t AicpuExecutor::init(Runtime *runtime, const ExecutionInputs &inputs) {
         LOG_ERROR("AICPU affinity thread idx %d out of range [0,%d) in init", tidx, nthreads);
         return -1;
     }
+    platform_aicpu_affinity_set_thread_idx(tidx);
     const bool is_leader = (tidx == 0);
 
     if (is_leader && !hs_setup_done_.load(std::memory_order_acquire)) {
@@ -295,7 +299,8 @@ int32_t AicpuExecutor::init(Runtime *runtime, const ExecutionInputs &inputs) {
     // in this branch, so handshake ownership matches assign_own_clusters'.
     if (decouple_orch) {
         sched_ctx_.handshake_owned_clusters(runtime, tidx, hs_nthreads);
-        if (!sched_ctx_.handshake_failed()) sched_ctx_.assign_own_clusters(tidx);
+        if (!sched_ctx_.handshake_failed() && !sched_ctx_.initialization_aborted())
+            sched_ctx_.assign_own_clusters(tidx);
     } else {
         sched_ctx_.handshake_partition(runtime, tidx, hs_nthreads);
     }
@@ -303,14 +308,19 @@ int32_t AicpuExecutor::init(Runtime *runtime, const ExecutionInputs &inputs) {
         init_failed_.store(true, std::memory_order_release);
         sched_ctx_.abort_and_shutdown(runtime);
     }
+    const auto initialization_status = [&] {
+        if (init_failed_.load(std::memory_order_acquire)) return int32_t{-1};
+        if (!sched_ctx_.initialization_aborted()) return int32_t{0};
+        const int32_t error = read_runtime_status(inputs.sm);
+        return error != 0 ? error : int32_t{-1};
+    };
     // Without capture, a scheduler's own clusters are sufficient to dispatch.
     // Profiling and the serial layout require every initializer to finish.
-    if (decouple_orch && !sched_ctx_.requires_profiling_init_barrier())
-        return init_failed_.load(std::memory_order_acquire) ? -1 : 0;
+    if (decouple_orch && !sched_ctx_.requires_profiling_init_barrier()) return initialization_status();
     hs_arrived_.fetch_add(1, std::memory_order_acq_rel);
     if (is_leader) {
         while (hs_arrived_.load(std::memory_order_acquire) < hs_nthreads) {}
-        if (!init_failed_.load(std::memory_order_acquire)) {
+        if (initialization_status() == 0) {
             if (decouple_orch) sched_ctx_.post_handshake_profiling_init();
             else if (sched_ctx_.post_handshake_init(runtime, inputs.functions) != 0)
                 init_failed_.store(true, std::memory_order_release);
@@ -319,7 +329,7 @@ int32_t AicpuExecutor::init(Runtime *runtime, const ExecutionInputs &inputs) {
     } else {
         while (!init_done_.load(std::memory_order_acquire)) {}
     }
-    return init_failed_.load(std::memory_order_acquire) ? -1 : 0;
+    return initialization_status();
 }
 
 int32_t AicpuExecutor::prepare_execution(Runtime *runtime, const ExecutionInputs &inputs) {
@@ -353,14 +363,27 @@ AicpuExecutor::execute(Runtime *runtime, const ExecutionInputs &inputs, const si
             status = -1;
         }
     }
-    if (status != 0 && thread != nullptr) {
-        if (thread->execution_index == thread->execution_threads - 1)
-            runtime_init_ready_.store(true, std::memory_order_release);
-        kernel_cores_.request_cancel();
-        // The error must be published after the orchestrator's SM reset.
+    const int32_t index = platform_aicpu_affinity_thread_idx();
+    if (status != 0) {
+        int32_t expected = 0;
+        execution_error_.compare_exchange_strong(expected, status, std::memory_order_acq_rel);
+        if (index == aicpu_thread_num_ - 1) runtime_init_ready_.store(true, std::memory_order_release);
         while (!runtime_init_ready_.load(std::memory_order_acquire)) {}
-        cancel_kernel_round();
+        sched_ctx_.abort_and_shutdown(runtime);
     }
+    if (index >= 0 && index < aicpu_thread_num_) {
+        const int32_t shutdown = sched_ctx_.shutdown(index, runtime);
+        if (status == 0) status = shutdown;
+    }
+    if (status == 0) status = read_runtime_status(inputs.sm);
+    if (status != 0) {
+        int32_t expected = 0;
+        execution_error_.compare_exchange_strong(expected, status, std::memory_order_acq_rel);
+    }
+    completion_gate_.arrive_and_finalize_if_last(aicpu_thread_num_, [&] {
+        aicpu_publish_task_timing_tail_usage(aicpu_thread_num_);
+        if (execution_error_.load(std::memory_order_acquire) == 0) finalize_execution(inputs);
+    });
     return status;
 }
 
@@ -810,6 +833,7 @@ int32_t AicpuExecutor::run(
 
             // Core-assignment capture reads every scheduler's initialized tracker.
             if (sched_ctx_.requires_profiling_init_barrier()) {
+                if (read_runtime_status(inputs.sm) != 0) sched_ctx_.abort_and_shutdown(runtime);
                 while (!init_done_.load(std::memory_order_acquire)) {}
             }
 
@@ -883,47 +907,6 @@ int32_t AicpuExecutor::run(
         }
     }
 
-    // Kernel retirement and Runtime destruction belong to the all-thread finalizer.
-    if (kernel_thread != nullptr) return run_rc;
-
-    // This thread has stopped dispatching, so it can retire the cores it owns
-    // without waiting for its peers. Retirement stays ahead of the completion
-    // count below because that count is a last-one-out latch, not a barrier: a
-    // thread that returns early never reaches it, and a worker whose gate was
-    // never released would spin until the op-execute timeout.
-    // platform_retire_aicore_group claims per core, so a concurrent
-    // emergency_shutdown sweep and this call retire each core exactly once.
-    int32_t shutdown_rc = sched_ctx_.shutdown(thread_idx, runtime);
-    if (shutdown_rc != 0 && run_rc == 0) {
-        run_rc = shutdown_rc;
-    }
-
-    LOG_INFO("Thread %d: Completed", thread_idx);
-
-    // Check if this is the last thread to finish
-    int32_t prev_finished = finished_count_.fetch_add(1, std::memory_order_acq_rel);
-    if (prev_finished + 1 == aicpu_thread_num_) {
-        aicpu_publish_task_timing_tail_usage(aicpu_thread_num_);
-        finished_.store(true, std::memory_order_release);
-        // Destroy the runtime context. sm_handle / rt are recreated every run so we
-        // always tear them down here, but we keep the per-cid orch SO entries
-        // alive — they are loaded once by register_callable and consumed by
-        // every subsequent run.
-        if (rt != nullptr) {
-            // Clear g_current_runtime in this DSO and in the orchestration SO before destroying rt.
-            const int32_t callable_id = inputs.callable_id;
-            framework_bind_runtime(nullptr);
-            if (callable_id >= 0 && callable_id < MAX_REGISTERED_CALLABLE_IDS) {
-                DeviceOrchestrationBindRuntimeFunc bind = orch_so_table_[callable_id].bind;
-                if (bind != nullptr) {
-                    bind(nullptr);
-                }
-            }
-            runtime_destroy(rt, runtime_arena_);
-            rt = nullptr;
-        }
-    }
-
     return run_rc;
 }
 
@@ -937,7 +920,8 @@ void AicpuExecutor::deinit(Runtime *runtime, bool invalidate_host_image) {
     // Reset all SchedulerContext-owned state in one place.
     sched_ctx_.deinit();
 
-    finished_count_.store(0, std::memory_order_release);
+    completion_gate_.reset();
+    execution_error_.store(0, std::memory_order_release);
     runtime_init_ready_.store(false, std::memory_order_release);
 
     aicpu_thread_num_ = 0;
@@ -963,7 +947,6 @@ void AicpuExecutor::deinit(Runtime *runtime, bool invalidate_host_image) {
     hs_arrived_.store(0, std::memory_order_release);
     hs_thread_seq_.store(0, std::memory_order_release);
     thread_idx_.store(0, std::memory_order_release);
-    finished_.store(false, std::memory_order_release);
 
     LOG_INFO("DeInit: AicpuExecutor reset complete");
 }
@@ -1013,7 +996,7 @@ int32_t AicpuExecutor::prepare_kernel_round(const simpler::tmr::KernelExecutionR
     if (!configure_orchestration_args(inputs, orch_args_cached_, orch_so_table_[cid].config_func))
         return static_cast<int32_t>(KernelDispatchStatus::InvalidArgs);
     Runtime *resident = kernel_invocation_.resident();
-    sched_ctx_.bind_kernel_core_group(&kernel_cores_);
+    sched_ctx_.bind_handshakes(kernel_storage_.reports());
     const int32_t status = prepare_execution(resident, inputs);
     if (status != 0) return status;
     chip_swimlane_aicpu_record_run_boundary();
@@ -1032,10 +1015,10 @@ void AicpuExecutor::cancel_kernel_round() noexcept {
     }
 }
 
-int32_t AicpuExecutor::finalize_kernel_round() {
+int32_t AicpuExecutor::finalize_execution(const ExecutionInputs &inputs) {
     if (rt == nullptr) return 0;
     framework_bind_runtime(nullptr);
-    const int32_t cid = kernel_invocation_.inputs().callable_id;
+    const int32_t cid = inputs.callable_id;
     if (cid >= 0 && cid < MAX_REGISTERED_CALLABLE_IDS && orch_so_table_[cid].bind != nullptr)
         orch_so_table_[cid].bind(nullptr);
     runtime_destroy(rt, runtime_arena_);
@@ -1046,7 +1029,7 @@ int32_t AicpuExecutor::finalize_kernel_round() {
 void AicpuExecutor::clear_kernel_round() noexcept {
     deinit(kernel_invocation_.resident(), false);
     kernel_invocation_.clear();
-    kernel_control_attached_ = false;
+    kernel_storage_attached_ = false;
 }
 
 namespace simpler::tmr {
@@ -1141,16 +1124,10 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     // sched overlap into post_orch — inflating it well past the actual teardown.
     // read_runtime_status is two atomic loads every thread needs, so it
     // stays outside the scope.
-    int32_t runtime_rc = read_runtime_status(runtime->get_gm_sm_ptr());
-    if (g_aicpu_executor.finished_.load(std::memory_order_acquire)) {
+    if (g_aicpu_executor.completion_gate_.claim_cleanup()) {
         AicpuPhaseScope post_orch(AicpuPhase::PostOrch);
         LOG_INFO("aicpu_execute: Last thread finished, cleaning up");
         g_aicpu_executor.deinit(runtime, true);
-    }
-
-    if (runtime_rc != 0) {
-        LOG_ERROR("aicpu_execute: simpler runtime failed with rc=%d", runtime_rc);
-        return runtime_rc;
     }
 
     if (rc != 0) {

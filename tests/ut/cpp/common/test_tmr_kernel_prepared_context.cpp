@@ -142,7 +142,7 @@ TEST_F(TmrKernelPreparedContextTest, AcceptsIndependentSnapshotsAndSeparatelyAll
 }
 
 TEST_F(TmrKernelPreparedContextTest, RejectsHeaderIdentityAndReservedFieldsTransactionally) {
-    for (uint32_t version : {0u, 2u}) {
+    for (uint32_t version : {0u, kTmrKernelContextVersion + 1}) {
         auto d = arena.descriptor;
         d.version = version;
         reject(registration, d);
@@ -314,10 +314,10 @@ TEST_F(TmrKernelPreparedContextTest, RejectsInvalidStaticAndClearSpansWithoutDer
         reject(registration, d);
     }
     auto d = arena.descriptor;
-    d.reports_address = d.control_address + 64;
+    d.reports_address = d.control_address;
     reject(registration, d);
     d = arena.descriptor;
-    d.control_address = d.arena_base + d.arena_capacity - 64;
+    d.control_address = d.arena_base + d.arena_capacity - 32;
     reject(registration, d);
     d = arena.descriptor;
     d.resident_kernel_args = d.resident_runtime;

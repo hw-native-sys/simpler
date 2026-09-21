@@ -31,6 +31,7 @@ RUNTIME = "tensormap_and_ringbuffer"
 SCENARIOS = (
     "cold_synced",
     "close_fail_free",
+    "host_submit_failure",
     "device_error_eager",
     "device_error_replay",
     "runtime_error_eager",
@@ -132,9 +133,13 @@ def test_tmr_kernel_mode(st_platform, st_device_ids, scenario, capture_observer)
     output = (tmp_path / "run.log").read_text()
     assert result.returncode == 0, f"{output}\nArtifacts: {tmp_path}"
     if "_error_" in scenario:
-        assert f"PASS {scenario} caller_error=1 cores_retired=1 context_error=1" in output
+        assert f"PASS {scenario} caller_error=1 failure_reported=1 context_error=1" in output
     elif scenario == "threaded_cross_stream_error":
-        assert "PASS threaded_cross_stream_error caller_error=1 cores_retired=1 host_reject=1 context_error=1" in output
+        assert (
+            "PASS threaded_cross_stream_error caller_error=1 failure_reported=1 host_reject=1 context_error=1" in output
+        )
+    elif scenario == "host_submit_failure":
+        assert "PASS host_submit_failure host_status=-4334 retained=1" in output
     elif scenario == "close_fail_free":
         assert "PASS close_fail_free retained_then_retried=1" in output
     elif scenario == "init_fail_handshake":
@@ -234,8 +239,10 @@ def _bind_observer_guards(observer):
     observer.capture_observer_override_query.restype = None
     observer.capture_observer_fail_prepare.argtypes = [ctypes.c_int]
     observer.capture_observer_fail_prepare.restype = None
-    observer.capture_observer_failure_retired.argtypes = [ctypes.c_int]
-    observer.capture_observer_failure_retired.restype = ctypes.c_int
+    observer.capture_observer_fail_next_invocation.argtypes = []
+    observer.capture_observer_fail_next_invocation.restype = None
+    observer.capture_observer_failure_reported.argtypes = []
+    observer.capture_observer_failure_reported.restype = ctypes.c_int
     for name in ("query_calls", "total_queries", "waits", "records", "clears", "prepare_failures"):
         function = getattr(observer, "capture_observer_" + name)
         function.argtypes = []
@@ -572,6 +579,24 @@ def _working_event_on_stream(lib, stream):
     return event
 
 
+def _check_host_submission_failure(scenario, observer, prepare, launch):
+    if scenario != "host_submit_failure":
+        return
+    prepare(0)
+    observer.capture_observer_fail_next_invocation()
+    started = time.monotonic()
+    launch(0, expected=-4334)
+    assert time.monotonic() - started < 1
+    assert observer.capture_observer_core_launches() == 1
+    assert observer.capture_observer_cpu_launches() == 0
+    before = _submission_counts(observer)
+    launch(0, expected=-1003)
+    assert _submission_counts(observer) == before
+    print("PASS host_submit_failure host_status=-4334 retained=1", flush=True)
+    # AICore may be running without an AICPU task: retain until process recovery.
+    os._exit(0)
+
+
 def _check_device_failure(context, scenario, launch, record_nodes, replay):
     observer = context.observer
     independent_event = _working_event_on_stream(context.lib, context.streams[1])
@@ -586,21 +611,20 @@ def _check_device_failure(context, scenario, launch, record_nodes, replay):
     status = context.lib.aclrtSynchronizeStreamWithTimeout(context.caller, 10000)
     assert status != 0, "hidden AICPU error was not propagated to caller"
     assert time.monotonic() - started < 9, "failure only surfaced through timeout"
-    # Generation rejection precedes window-open; the config failure follows it.
-    expect_opened = scenario.startswith("runtime_error_")
-    retired = observer.capture_observer_failure_retired(int(expect_opened))
-    assert retired == 0, f"failed round retirement rc={retired}, expect_opened={expect_opened}"
+    elapsed_ms = (time.monotonic() - started) * 1000
+    reported = observer.capture_observer_failure_reported()
+    assert reported == 0, f"failed round diagnostic rc={reported}"
     assert observer.capture_observer_cpu_launches() == 1
     assert observer.capture_observer_core_launches() == 1
     independent_status = context.lib.aclrtRecordEvent(independent_event, context.streams[1])
     assert independent_status != 0, "unrelated stream accepted new work after context failure"
     print(
-        f"PASS {scenario} caller_error=1 cores_retired=1 context_error=1 "
-        f"caller_status={status} independent_status={independent_status}",
+        f"PASS {scenario} caller_error=1 failure_reported=1 context_error=1 "
+        f"caller_status={status} independent_status={independent_status} elapsed_ms={elapsed_ms:.3f}",
         flush=True,
     )
-    # Error streams/graphs are terminal; this test proves retirement,
-    # not a D2 recovery policy. Let the isolated process release them.
+    # Failed streams/graphs retain their allocations until process teardown.
+    # Stop-on-failure is not evidence that already running AICores have stopped.
     os._exit(0)
 
 
@@ -674,13 +698,13 @@ def _check_threaded_cross_stream_failure(
     elapsed_ms = (time.monotonic() - started) * 1000
     assert status != 0, "hidden AICPU error was not propagated to second caller"
     assert elapsed_ms < 9000, "second caller failure only surfaced through timeout"
-    assert observer.capture_observer_failure_retired(0) == 0
+    assert observer.capture_observer_failure_reported() == 0
     assert observer.capture_observer_cpu_launches() == 2
     assert observer.capture_observer_core_launches() == 2
     first_caller_status = lib.aclrtRecordEvent(first_caller_event, context.streams[0])
     assert first_caller_status != 0, "first caller accepted work after second caller's context failure"
     print(
-        f"PASS threaded_cross_stream_error caller_error=1 cores_retired=1 host_reject=1 "
+        f"PASS threaded_cross_stream_error caller_error=1 failure_reported=1 host_reject=1 "
         f"context_error=1 sync_status={status} first_caller_status={first_caller_status} "
         f"latency_ms={elapsed_ms:.1f}",
         flush=True,
@@ -754,12 +778,12 @@ def _run(device, scenario, build_dir):
     callable_ids = {}
 
     guarded = partial(_guarded, observer)
-    prepared = partial(_prepared, observer)
 
     def prepare(cid, expected=0):
         chip = chips[cid]
         minted = ctypes.c_int32(99)
-        prepared(
+        _prepared(
+            observer,
             lib.simpler_kernel_mode_prepare_callable,
             ctx,
             chip.buffer_ptr(),
@@ -821,6 +845,7 @@ def _run(device, scenario, build_dir):
     replay = partial(_replay, context)
 
     try:
+        _check_host_submission_failure(scenario, observer, prepare, launch)
         if scenario.startswith(("device_error_", "runtime_error_")):
             prepare(0)
             _check_device_failure(context, scenario, launch, record_nodes, replay)

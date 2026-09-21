@@ -38,7 +38,6 @@ struct KernelNativeInvocation {
     aclrtLaunchKernelCfg *aicpu_config{nullptr};
     const KernelClearRegion *clear_regions{nullptr};
     size_t clear_region_count{0};
-    KernelClearRegion cancel;
 };
 
 KernelLaunchResult launch_bound_kernel_native(

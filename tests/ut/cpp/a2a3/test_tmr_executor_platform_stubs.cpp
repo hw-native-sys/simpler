@@ -17,7 +17,9 @@ void corrupt_kernel_arch_argument(KernelArgs &args, int fault) {
     else args.pmu_reg_addrs = 64;
 }
 
-int32_t platform_retire_aicore_group(const AicoreExitTarget *, size_t count, uint64_t, bool *released) {
+int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t count, uint64_t, bool *released) {
+    for (size_t i = 0; i < count; ++i)
+        platform_close_aicore_window(targets[i].reg_addr);
     if (released != nullptr) {
         for (size_t i = 0; i < count; ++i)
             released[i] = true;

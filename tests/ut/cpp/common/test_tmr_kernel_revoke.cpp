@@ -35,7 +35,7 @@ struct ExecutorModel {
         bool kernel_owned{false};
         uint64_t handle{0};
     };
-    bool kernel_control_attached_{false};
+    bool kernel_storage_attached_{false};
     bool kernel_context_ready_{false};
     PreparedKernelContext kernel_context_{};
     std::array<Slot, 3> orch_so_table_{};
@@ -215,7 +215,7 @@ TEST_F(TmrKernelRevokeTest, ActiveOrRetiringConsumersLeaveReceiptAndMetadataUnto
     executor.kernel_invocation_.borrowed = true;
     expect_rejected(args);
     executor.kernel_invocation_.borrowed = false;
-    executor.kernel_control_attached_ = true;
+    executor.kernel_storage_attached_ = true;
     expect_rejected(args);
 }
 

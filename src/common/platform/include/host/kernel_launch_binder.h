@@ -38,10 +38,7 @@ struct KernelLaunchOps {
     int (*record_event)(void *, void *event, void *stream) noexcept {nullptr};
     int (*launch_aicpu)(void *, void *stream) noexcept {nullptr};
     int (*launch_aicore)(void *, void *stream) noexcept {nullptr};
-    int (*cancel_waiting_aicore)(void *, void *stream) noexcept {nullptr};
-    bool valid() const {
-        return wait_event && memset_handshake && record_event && launch_aicpu && launch_aicore && cancel_waiting_aicore;
-    }
+    bool valid() const { return wait_event && memset_handshake && record_event && launch_aicpu && launch_aicore; }
 };
 
 struct KernelLaunchHandles {

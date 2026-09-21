@@ -11,7 +11,7 @@
 
 #pragma once
 
-#include "kernel_core_group.h"
+#include "kernel_round_storage.h"
 #include "kernel_execution_inputs.h"
 #include "kernel_round_gate.h"
 #include "task_interface/kernel_dispatch_args.h"

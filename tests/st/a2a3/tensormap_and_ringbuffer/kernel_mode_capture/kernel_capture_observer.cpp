@@ -67,6 +67,7 @@ std::unordered_set<void *> large_prepare_allocations;
 bool fail_large_free{false};
 uint64_t failed_frees{0};
 bool corrupt_next_invocation{false};
+bool fail_next_invocation{false};
 
 bool fail_prepare_step(int kind) {
     if (!prepare_scope || prepare_failure != kind) return false;
@@ -178,6 +179,7 @@ extern "C" uint64_t capture_observer_prepare_failures() { return prepare_failure
 extern "C" void capture_observer_fail_large_free(int enabled) { fail_large_free = enabled != 0; }
 extern "C" uint64_t capture_observer_failed_frees() { return failed_frees; }
 extern "C" void capture_observer_corrupt_next_invocation() { corrupt_next_invocation = true; }
+extern "C" void capture_observer_fail_next_invocation() { fail_next_invocation = true; }
 
 extern "C" rtError_t rtMalloc(void **address, uint64_t bytes, uint32_t kind, uint16_t module) {
     static const auto real = reinterpret_cast<decltype(&rtMalloc)>(resolve_cann_symbol("rtMalloc"));
@@ -310,7 +312,7 @@ extern "C" int capture_observer_check_resident() {
     return static_cast<int>(observer.error);
 }
 
-extern "C" int capture_observer_failure_retired(int expect_opened) {
+extern "C" int capture_observer_failure_reported() {
     using namespace simpler::tmr;
     const auto copy = reinterpret_cast<decltype(&aclrtMemcpy)>(resolve_cann_symbol("aclrtMemcpy"));
     if (copy == nullptr || observer.core_envelope == 0) return -1;
@@ -327,30 +329,11 @@ extern "C" int capture_observer_failure_retired(int expect_opened) {
     if (control.completion != static_cast<uint32_t>(TmrCompletion::Complete) || control.runtime_status == 0 ||
         control.cleanup_status != 0 || control.round_epoch == 0 || descriptor.worker_count <= 0) {
         std::fprintf(
-            stderr, "retirement control: completion=%u runtime=%d cleanup=%d epoch=%" PRIu64 " workers=%d\n",
+            stderr, "failure control: completion=%u runtime=%d cleanup=%d epoch=%" PRIu64 " workers=%d\n",
             control.completion, control.runtime_status, control.cleanup_status, control.round_epoch,
             descriptor.worker_count
         );
         return -3;
-    }
-    const uint64_t expected_epoch = expect_opened ? control.round_epoch : 0;
-    const auto expected_release = static_cast<uint32_t>(expect_opened ? TmrCoreRelease::Release : TmrCoreRelease::Wait);
-    for (int32_t i = 0; i < descriptor.worker_count; ++i) {
-        TmrCoreReport report{};
-        const int rc = read(&report, descriptor.reports_address + i * sizeof(report), sizeof(report));
-        // Unopened cores exit on CANCEL without waiting for a window release.
-        if (rc != 0 || report.ready != static_cast<uint32_t>(i + 1) || report.exited != static_cast<uint32_t>(i + 1) ||
-            report.command != static_cast<uint32_t>(TmrCoreCommand::Cancel) || report.round_epoch != expected_epoch ||
-            report.release != expected_release) {
-            std::fprintf(
-                stderr,
-                "retirement core=%d read=%d ready=%u exited=%u command=%u release=%u epoch=%" PRIu64
-                " expected_release=%u expected_epoch=%" PRIu64 "\n",
-                i, rc, report.ready, report.exited, report.command, report.release, report.round_epoch,
-                expected_release, expected_epoch
-            );
-            return -4;
-        }
     }
     return 0;
 }
@@ -370,6 +353,10 @@ extern "C" rtError_t rtsLaunchCpuKernel(
     rtCpuKernelArgs_t *args
 ) {
     if (fail_prepare_step(1)) return -4333;
+    if (invocation_scope && fail_next_invocation) {
+        fail_next_invocation = false;
+        return -4334;
+    }
     // Ahead of this invocation's own AICPU work, so a gate armed for it holds
     // the whole chained sequence and the caller's serial tail with it.
     if (invocation_scope) {

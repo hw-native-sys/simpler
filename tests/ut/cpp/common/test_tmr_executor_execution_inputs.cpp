@@ -21,6 +21,7 @@
 #include <memory>
 #include <thread>
 #include <vector>
+#include <unistd.h>
 
 #include "aicpu/device_log.h"
 #include "aicpu/device_time.h"
@@ -44,6 +45,7 @@ std::array<uint64_t, PLATFORM_MAX_CORES> register_bases{};
 std::array<uint64_t, 6> register_cells{};
 std::atomic<int> opened_windows{0};
 std::atomic<int> closed_windows{0};
+std::atomic<uint64_t> closed_mask{0};
 std::atomic<int> register_publications{0};
 std::atomic<const void *> watched_image{nullptr};
 std::atomic<int> image_invalidations{0};
@@ -78,7 +80,11 @@ uint32_t reg_load_acquire(const volatile uint32_t *ptr) { return __atomic_load_n
 void reg_store_release(volatile uint32_t *, uint32_t) {}
 void platform_init_aicore_regs(uint64_t) { ++opened_windows; }
 uint64_t platform_aicore_exit_deadline() { return get_sys_cnt_aicpu() + 10000000000ULL; }
-void platform_close_aicore_window(uint64_t) { ++closed_windows; }
+void platform_close_aicore_window(uint64_t base) {
+    const uint64_t index = (base - reinterpret_cast<uint64_t>(register_cells.data())) / sizeof(uint64_t);
+    if (index < register_cells.size() && (closed_mask.fetch_or(uint64_t{1} << index) & (uint64_t{1} << index)) == 0)
+        ++closed_windows;
+}
 
 extern "C" int32_t aicpu_execute(Runtime *);
 extern "C" int32_t simpler_aicpu_register_callable(void *);
@@ -89,6 +95,26 @@ void corrupt_kernel_arch_argument(KernelArgs &args, int fault);
 
 namespace {
 using namespace simpler::tmr;
+
+void isolated_round(const std::function<void()> &body) {
+    EXPECT_EXIT(
+        {
+            const auto *result = ::testing::UnitTest::GetInstance()->current_test_info()->result();
+            const int before = result->total_part_count();
+            body();
+            bool failed = false;
+            for (int i = before; i < result->total_part_count(); ++i) {
+                const auto &part = result->GetTestPartResult(i);
+                if (part.failed()) {
+                    fprintf(stderr, "%s:%d %s\n", part.file_name(), part.line_number(), part.message());
+                    failed = true;
+                }
+            }
+            _exit(failed ? 1 : 0);
+        },
+        ::testing::ExitedWithCode(0), ""
+    );
+}
 
 class TmrExecutorExecutionInputsTest : public ::testing::Test {
 protected:
@@ -238,6 +264,7 @@ protected:
     ) {
         opened_windows = 0;
         closed_windows = 0;
+        closed_mask = 0;
         control = {};
         reports = {};
         for (auto &cell : register_cells)
@@ -270,18 +297,9 @@ protected:
             cores.emplace_back([&, i] {
                 if (before_core_report) before_core_report();
                 auto &report = reports[i];
-                report.physical_core_id = invalid_reports && i == 2 ? 75 : i;
-                report.core_type = static_cast<uint32_t>(i == 0 ? CoreType::AIC : CoreType::AIV);
-                __atomic_store_n(&report.ready, static_cast<uint32_t>(i + 1), __ATOMIC_RELEASE);
-                while (__atomic_load_n(&report.command, __ATOMIC_ACQUIRE) !=
-                       static_cast<uint32_t>(TmrCoreCommand::Cancel)) {}
-                const bool opened = report.round_epoch != 0;
-                if (opened) __atomic_store_n(&register_cells[i], uint64_t{AICORE_EXITED_VALUE}, __ATOMIC_RELEASE);
-                __atomic_store_n(&report.exited, static_cast<uint32_t>(i + 1), __ATOMIC_RELEASE);
-                if (opened) {
-                    while (__atomic_load_n(&report.release, __ATOMIC_ACQUIRE) !=
-                           static_cast<uint32_t>(TmrCoreRelease::Release)) {}
-                }
+                report.physical_core_id = invalid_reports && i == 2 ? PLATFORM_MAX_CORES : i;
+                report.core_type = i == 0 ? CoreType::AIC : CoreType::AIV;
+                __atomic_store_n(&report.aicore_done, static_cast<uint32_t>(i + 1), __ATOMIC_RELEASE);
             });
         }
         std::vector<int32_t> result(execution_threads + 1);
@@ -299,7 +317,7 @@ protected:
         EXPECT_EQ(control.completion, static_cast<uint32_t>(TmrCompletion::Complete));
         EXPECT_EQ(control.cleanup_status, 0);
         for (size_t i = 0; i < reports.size(); ++i)
-            EXPECT_EQ(reports[i].exited, i + 1);
+            EXPECT_EQ(reports[i].aicore_done, i + 1);
         return result;
     }
 
@@ -372,6 +390,35 @@ TEST_F(TmrExecutorExecutionInputsTest, KernelOrchestrationSubmitsBeforeCoreRepor
         EXPECT_GT(header->rings[0].fc.current_task_index.load(std::memory_order_acquire), 0);
     };
     expect_successful_reuse();
+}
+
+TEST_F(TmrExecutorExecutionInputsTest, OrchestrationFailureReturnsBeforeDelayedCoreReports) {
+    isolated_round([&] {
+        make_orchestration_image(6, "orchestration_error", "config_a");
+        std::atomic<bool> release_reports{false};
+        before_core_report = [&] {
+            while (!release_reports.load(std::memory_order_acquire)) {}
+        };
+        PreparedInvocationView callable{6, 1, 1};
+        TmrEncodingCandidate packet;
+        TmrEncodingCache cache;
+        auto args = arguments(57);
+        ASSERT_EQ(encode_tmr_invocation(args, callable, binding.identity, cache, &packet), InvocationStatus::Ok);
+        std::vector<int32_t> results;
+        std::thread round([&] {
+            results = coordinated_round({callable, {}}, packet.packet());
+        });
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (__atomic_load_n(&control.completion, __ATOMIC_ACQUIRE) == 0 &&
+               std::chrono::steady_clock::now() < deadline) {}
+        EXPECT_EQ(__atomic_load_n(&control.completion, __ATOMIC_ACQUIRE), 1u);
+        EXPECT_EQ(opened_windows.load(), 0);
+        release_reports.store(true, std::memory_order_release);
+        round.join();
+        for (int32_t result : results)
+            EXPECT_EQ(result, -SIMPLER_ERROR_INVALID_ARGS);
+        EXPECT_EQ(revoke_context(registration.context_generation), kAicpuKernelInnerError);
+    });
 }
 
 TEST_F(TmrExecutorExecutionInputsTest, ProgramEntryOverlapsReportsAndReusesSerialInitialization) {
@@ -467,22 +514,23 @@ TEST_F(TmrExecutorExecutionInputsTest, CoordinatedRoundsRunABAWithOneFinalVerdic
     }
 }
 
-TEST_F(TmrExecutorExecutionInputsTest, InvalidReportsCancelOverlappedOrchestrationBeforeAnyWindowOpens) {
-    PreparedInvocationView callable{3, 1, 1};
-    TmrEncodingCandidate packet;
-    TmrEncodingCache cache;
-    auto args = arguments(91);
-    ASSERT_EQ(encode_tmr_invocation(args, callable, binding.identity, cache, &packet), InvocationStatus::Ok);
-    const auto results = coordinated_round({callable, {}}, packet.packet(), 0, 2, false, true);
-    for (int32_t result : results)
-        EXPECT_EQ(result, -1);
-    EXPECT_EQ(opened_windows.load(), 0);
-    EXPECT_EQ(closed_windows.load(), 0);
-    EXPECT_EQ(control.cleanup_status, 0);
-    expect_successful_reuse();
+TEST_F(TmrExecutorExecutionInputsTest, InvalidReportsReportFailureBeforeAnyWindowOpens) {
+    isolated_round([&] {
+        PreparedInvocationView callable{3, 1, 1};
+        TmrEncodingCandidate packet;
+        TmrEncodingCache cache;
+        auto args = arguments(91);
+        ASSERT_EQ(encode_tmr_invocation(args, callable, binding.identity, cache, &packet), InvocationStatus::Ok);
+        const auto results = coordinated_round({callable, {}}, packet.packet(), 0, 2, false, true);
+        for (int32_t result : results)
+            EXPECT_EQ(result, -1);
+        EXPECT_EQ(opened_windows.load(), 0);
+        EXPECT_EQ(closed_windows.load(), 0);
+        EXPECT_EQ(control.cleanup_status, 0);
+    });
 }
 
-TEST_F(TmrExecutorExecutionInputsTest, NativeEntryCancelsMalformedContextAndUnregisteredImagePackets) {
+TEST_F(TmrExecutorExecutionInputsTest, NativeEntryReportsMalformedContextAndUnregisteredImagePackets) {
     ASSERT_EQ(simpler_aicpu_kernel_exec(nullptr), kAicpuKernelInnerError);
     prepare_native_context();
     ASSERT_TRUE(registered_context);
@@ -496,34 +544,35 @@ TEST_F(TmrExecutorExecutionInputsTest, NativeEntryCancelsMalformedContextAndUnre
     std::memcpy(stable_layout.data(), &arena_runtime->prebuilt_layout, stable_layout.size());
     const PreparedInvocationView callable{7, 1, 1};
     for (int fault : {0, 1, 2, 3, 4, 5, 0}) {
-        SCOPED_TRACE(fault);
-        output.fill(0);
-        auto args = arguments(83);
-        TmrEncodingCandidate candidate;
-        TmrEncodingCache cache;
-        ASSERT_EQ(encode_tmr_invocation(args, callable, binding.identity, cache, &candidate), InvocationStatus::Ok);
-        auto packet = native_packet(args, callable);
-        SimplerKernelDispatchArgs envelope;
-        std::memcpy(&envelope, packet.data(), sizeof(envelope));
-        if (fault == 2) ++envelope.context_generation;
-        if (fault == 3) envelope.chip_callable_address = 0x1000;
-        if (fault == 4) envelope.invocation.scalar_count = -1;
-        if (fault == 5) --envelope.packet_bytes;
-        std::memcpy(packet.data(), &envelope, sizeof(envelope));
-        const ByteSpan bytes{fault == 1 ? nullptr : packet.data(), packet.size()};
-        const auto results = coordinated_round({}, bytes, 0, 2, true);
-        const int expected = fault == 0 ? 0 : ((fault == 2 || fault == 3) ? 5 : 1);
-        for (int result : results)
-            EXPECT_EQ(result, fault == 0 ? kAicpuKernelSuccess : kAicpuKernelInnerError);
-        EXPECT_EQ(opened_windows.load(), fault == 0 ? 3 : 0);
-        EXPECT_EQ(closed_windows.load(), fault == 0 ? 3 : 0);
-        EXPECT_EQ(control.runtime_status, expected);
-        EXPECT_EQ(output[3], fault == 0 ? 3u : 0u);
-        EXPECT_EQ(kernel_execution_status(), -1);
-        EXPECT_EQ(&resident_args, stable_args_address);
-        EXPECT_EQ(std::memcmp(&resident_args, &stable_args, sizeof(resident_args)), 0);
-        EXPECT_EQ(std::memcmp(&descriptor, &stable_descriptor, sizeof(descriptor)), 0);
-        EXPECT_EQ(std::memcmp(&arena_runtime->prebuilt_layout, stable_layout.data(), stable_layout.size()), 0);
+        isolated_round([&] {
+            SCOPED_TRACE(fault);
+            output.fill(0);
+            auto args = arguments(83);
+            TmrEncodingCandidate candidate;
+            TmrEncodingCache cache;
+            ASSERT_EQ(encode_tmr_invocation(args, callable, binding.identity, cache, &candidate), InvocationStatus::Ok);
+            auto packet = native_packet(args, callable);
+            SimplerKernelDispatchArgs envelope;
+            std::memcpy(&envelope, packet.data(), sizeof(envelope));
+            if (fault == 2) ++envelope.context_generation;
+            if (fault == 3) envelope.chip_callable_address = 0x1000;
+            if (fault == 4) envelope.invocation.scalar_count = -1;
+            if (fault == 5) --envelope.packet_bytes;
+            std::memcpy(packet.data(), &envelope, sizeof(envelope));
+            const ByteSpan bytes{fault == 1 ? nullptr : packet.data(), packet.size()};
+            const auto results = coordinated_round({}, bytes, 0, 2, true);
+            const int expected = fault == 0 ? 0 : ((fault == 2 || fault == 3) ? 5 : 1);
+            for (int result : results)
+                EXPECT_EQ(result, fault == 0 ? kAicpuKernelSuccess : kAicpuKernelInnerError);
+            EXPECT_EQ(opened_windows.load(), fault == 0 ? 3 : 0);
+            EXPECT_EQ(closed_windows.load(), fault == 0 ? 3 : 0);
+            EXPECT_EQ(control.runtime_status, expected);
+            EXPECT_EQ(output[3], fault == 0 ? 3u : 0u);
+            EXPECT_EQ(&resident_args, stable_args_address);
+            EXPECT_EQ(std::memcmp(&resident_args, &stable_args, sizeof(resident_args)), 0);
+            EXPECT_EQ(std::memcmp(&descriptor, &stable_descriptor, sizeof(descriptor)), 0);
+            EXPECT_EQ(std::memcmp(&arena_runtime->prebuilt_layout, stable_layout.data(), stable_layout.size()), 0);
+        });
     }
     EXPECT_EQ(revoke_context(registration.context_generation + 1), kAicpuKernelInnerError);
     auto wrong_slot =
@@ -545,29 +594,30 @@ TEST(TmrNativeStatusTest, SeparatesDispatchAndRuntimeDiagnosticsFromCannStatus) 
 }
 
 TEST_F(TmrExecutorExecutionInputsTest, NativeRuntimeFailureKeepsRawReportAndReturnsCannInnerError) {
-    prepare_native_context("orchestration_error");
-    ASSERT_TRUE(registered_context);
-    const PreparedInvocationView callable{7, 1, 1};
-    auto args = arguments(57);
-    TmrEncodingCandidate candidate;
-    TmrEncodingCache cache;
-    ASSERT_EQ(encode_tmr_invocation(args, callable, binding.identity, cache, &candidate), InvocationStatus::Ok);
-    auto packet = native_packet(args, callable);
-    const auto results = coordinated_round({}, {packet.data(), packet.size()}, 0, 2, true);
-    for (int32_t result : results)
-        EXPECT_EQ(result, kAicpuKernelInnerError);
-    EXPECT_EQ(control.runtime_status, -SIMPLER_ERROR_INVALID_ARGS);
-    EXPECT_EQ(control.cleanup_status, 0);
-    EXPECT_EQ(opened_windows.load(), 3);
-    EXPECT_EQ(closed_windows.load(), 3);
-    EXPECT_EQ(output[0], 3u);
-    EXPECT_EQ(output[3], 3u);
-    EXPECT_EQ(output[1], 57u);
-    EXPECT_EQ(output[4], 57u);
-    EXPECT_NE(output[2], 0u);
-    EXPECT_EQ(output[2], output[5]);
-    EXPECT_EQ(kernel_execution_status(), -1);
-    // Direct Host execution tests cleanup, not recovery after a CANN error.
+    isolated_round([&] {
+        prepare_native_context("orchestration_error");
+        ASSERT_TRUE(registered_context);
+        const PreparedInvocationView callable{7, 1, 1};
+        auto args = arguments(57);
+        TmrEncodingCandidate candidate;
+        TmrEncodingCache cache;
+        ASSERT_EQ(encode_tmr_invocation(args, callable, binding.identity, cache, &candidate), InvocationStatus::Ok);
+        auto packet = native_packet(args, callable);
+        const auto results = coordinated_round({}, {packet.data(), packet.size()}, 0, 2, true);
+        for (int32_t result : results)
+            EXPECT_EQ(result, kAicpuKernelInnerError);
+        EXPECT_EQ(control.runtime_status, -SIMPLER_ERROR_INVALID_ARGS);
+        EXPECT_EQ(control.cleanup_status, 0);
+        EXPECT_EQ(opened_windows.load(), 3);
+        EXPECT_EQ(closed_windows.load(), 3);
+        EXPECT_EQ(output[0], 3u);
+        EXPECT_EQ(output[3], 3u);
+        EXPECT_EQ(output[1], 57u);
+        EXPECT_EQ(output[4], 57u);
+        EXPECT_NE(output[2], 0u);
+        EXPECT_EQ(output[2], output[5]);
+        // Direct Host execution tests cleanup, not recovery after a CANN error.
+    });
 }
 
 TEST_F(TmrExecutorExecutionInputsTest, NativeRegistrationRejectsChangedStaticIdentityAndInvalidCallableSpans) {
@@ -633,25 +683,27 @@ TEST_F(TmrExecutorExecutionInputsTest, NativeRegistrationRejectsChangedStaticIde
     watched_image = nullptr;
 }
 
-TEST_F(TmrExecutorExecutionInputsTest, CoordinatedAdmissionAndConfigFailuresCancelUnopenedCoresAndReuse) {
+TEST_F(TmrExecutorExecutionInputsTest, CoordinatedAdmissionAndConfigFailuresReturnWithoutCoreAcknowledgments) {
+    prepare_native_context();
     make_orchestration_image(5, "orchestration_a", "config_mismatch");
     for (int32_t fault : {1, 2, 3, 0}) {
-        output.fill(0);
-        PreparedInvocationView callable{fault == 2 ? 5 : 3, 1, 1};
-        TmrEncodingCandidate packet;
-        TmrEncodingCache cache;
-        auto args = arguments(33);
-        ASSERT_EQ(encode_tmr_invocation(args, callable, binding.identity, cache, &packet), InvocationStatus::Ok);
-        if (fault == 3) resident->dev.aicpu_thread_num = -1;
-        const auto results = coordinated_round({callable, {}}, packet.packet(), fault == 1 ? -19 : 0);
-        resident->dev.aicpu_thread_num = 2;
-        const int32_t expected = fault == 0 ? 0 : (fault == 1 ? -19 : (fault == 2 ? 1 : 5));
-        for (int32_t result : results)
-            EXPECT_EQ(result, expected);
-        EXPECT_EQ(opened_windows.load(), fault == 0 ? 3 : 0);
-        EXPECT_EQ(closed_windows.load(), fault == 0 ? 3 : 0);
-        EXPECT_EQ(output[3], fault == 0 ? 3u : 0u);
-        EXPECT_EQ(kernel_execution_status(), -1);
+        isolated_round([&] {
+            output.fill(0);
+            PreparedInvocationView callable{fault == 2 ? 5 : 3, 1, 1};
+            TmrEncodingCandidate packet;
+            TmrEncodingCache cache;
+            auto args = arguments(33);
+            ASSERT_EQ(encode_tmr_invocation(args, callable, binding.identity, cache, &packet), InvocationStatus::Ok);
+            if (fault == 3) resident->dev.aicpu_thread_num = -1;
+            const auto results = coordinated_round({callable, {}}, packet.packet(), fault == 1 ? -19 : 0);
+            resident->dev.aicpu_thread_num = 2;
+            const int32_t expected = fault == 0 ? 0 : (fault == 1 ? -19 : (fault == 2 ? 1 : 5));
+            for (int32_t result : results)
+                EXPECT_EQ(result, expected);
+            EXPECT_EQ(opened_windows.load(), fault == 0 ? 3 : 0);
+            EXPECT_EQ(closed_windows.load(), fault == 0 ? 3 : 0);
+            EXPECT_EQ(output[3], fault == 0 ? 3u : 0u);
+        });
     }
 }
 
@@ -734,126 +786,126 @@ TEST_F(TmrExecutorExecutionInputsTest, AdmittedSnapshotOwnsTransportAndBusyRejec
     }
 }
 
-TEST_F(TmrExecutorExecutionInputsTest, InvalidExecutionConfigurationCancelsAndNextRoundReusesExecutor) {
+TEST_F(TmrExecutorExecutionInputsTest, InvalidExecutionConfigurationReportsFailure) {
     prepare_native_context();
     for (bool serial : {false, true}) {
-        SCOPED_TRACE(serial);
-        output.fill(0);
-        resident->dev.serial_orch_sched = serial;
-        resident->dev.aicpu_thread_num = -1;
-        PreparedInvocationView callable{3, 1, 1};
-        TmrEncodingCandidate packet;
-        TmrEncodingCache cache;
-        auto args = arguments(9);
-        ASSERT_EQ(encode_tmr_invocation(args, callable, binding.identity, cache, &packet), InvocationStatus::Ok);
-        const auto results = coordinated_round({callable, {}}, packet.packet());
-        for (int32_t result : results)
-            EXPECT_EQ(result, static_cast<int32_t>(KernelDispatchStatus::InvalidBinding));
-        EXPECT_EQ(control.runtime_status, static_cast<int32_t>(KernelDispatchStatus::InvalidBinding));
-        EXPECT_EQ(opened_windows.load(), 0);
-        EXPECT_EQ(closed_windows.load(), 0);
-        EXPECT_EQ(output[0], 0u);
-        EXPECT_EQ(output[3], 0u);
-        EXPECT_EQ(kernel_execution_status(), -1);
-        resident->dev.aicpu_thread_num = 2;
-        ASSERT_NO_FATAL_FAILURE(expect_successful_reuse());
+        isolated_round([&] {
+            SCOPED_TRACE(serial);
+            output.fill(0);
+            resident->dev.serial_orch_sched = serial;
+            resident->dev.aicpu_thread_num = -1;
+            PreparedInvocationView callable{3, 1, 1};
+            TmrEncodingCandidate packet;
+            TmrEncodingCache cache;
+            auto args = arguments(9);
+            ASSERT_EQ(encode_tmr_invocation(args, callable, binding.identity, cache, &packet), InvocationStatus::Ok);
+            const auto results = coordinated_round({callable, {}}, packet.packet());
+            for (int32_t result : results)
+                EXPECT_EQ(result, static_cast<int32_t>(KernelDispatchStatus::InvalidBinding));
+            EXPECT_EQ(control.runtime_status, static_cast<int32_t>(KernelDispatchStatus::InvalidBinding));
+            EXPECT_EQ(opened_windows.load(), 0);
+            EXPECT_EQ(closed_windows.load(), 0);
+            EXPECT_EQ(output[0], 0u);
+            EXPECT_EQ(output[3], 0u);
+            resident->dev.aicpu_thread_num = 2;
+        });
     }
 }
 
-TEST_F(TmrExecutorExecutionInputsTest, ExpectedCountMismatchCancelsAndNextRoundReusesExecutor) {
+TEST_F(TmrExecutorExecutionInputsTest, ExpectedCountMismatchReportsFailure) {
     make_orchestration_image(5, "orchestration_a", "config_mismatch");
     for (bool serial : {false, true}) {
-        SCOPED_TRACE(serial);
-        resident->dev.serial_orch_sched = serial;
-        output.fill(0);
-        PreparedInvocationView callable{5, 1, 1};
-        TmrEncodingCandidate packet;
-        TmrEncodingCache cache;
-        auto args = arguments(9);
-        ASSERT_EQ(encode_tmr_invocation(args, callable, binding.identity, cache, &packet), InvocationStatus::Ok);
-        const auto results = coordinated_round({callable, {}}, packet.packet());
-        for (int32_t result : results)
-            EXPECT_EQ(result, static_cast<int32_t>(KernelDispatchStatus::InvalidArgs));
-        EXPECT_EQ(control.runtime_status, static_cast<int32_t>(KernelDispatchStatus::InvalidArgs));
-        EXPECT_EQ(opened_windows.load(), 0);
-        EXPECT_EQ(closed_windows.load(), 0);
-        EXPECT_EQ(output[0], 5u);
-        EXPECT_EQ(output[1], 9u);
-        EXPECT_NE(output[2], 0u);
-        EXPECT_EQ(output[3], 0u);
-        EXPECT_EQ(output[4], 0u);
-        EXPECT_EQ(output[5], 0u);
-        expect_resident_configuration(serial);
-        EXPECT_EQ(kernel_execution_status(), -1);
-        ASSERT_NO_FATAL_FAILURE(expect_successful_reuse());
+        isolated_round([&] {
+            SCOPED_TRACE(serial);
+            resident->dev.serial_orch_sched = serial;
+            output.fill(0);
+            PreparedInvocationView callable{5, 1, 1};
+            TmrEncodingCandidate packet;
+            TmrEncodingCache cache;
+            auto args = arguments(9);
+            ASSERT_EQ(encode_tmr_invocation(args, callable, binding.identity, cache, &packet), InvocationStatus::Ok);
+            const auto results = coordinated_round({callable, {}}, packet.packet());
+            for (int32_t result : results)
+                EXPECT_EQ(result, static_cast<int32_t>(KernelDispatchStatus::InvalidArgs));
+            EXPECT_EQ(control.runtime_status, static_cast<int32_t>(KernelDispatchStatus::InvalidArgs));
+            EXPECT_EQ(opened_windows.load(), 0);
+            EXPECT_EQ(closed_windows.load(), 0);
+            EXPECT_EQ(output[0], 5u);
+            EXPECT_EQ(output[1], 9u);
+            EXPECT_NE(output[2], 0u);
+            EXPECT_EQ(output[3], 0u);
+            EXPECT_EQ(output[4], 0u);
+            EXPECT_EQ(output[5], 0u);
+            expect_resident_configuration(serial);
+        });
     }
 }
 
-TEST_F(TmrExecutorExecutionInputsTest, RuntimeErrorIsPublishedBeforeClearAndNextRoundReusesExecutor) {
+TEST_F(TmrExecutorExecutionInputsTest, RuntimeErrorIsPublishedAndContextIsRetained) {
     make_orchestration_image(6, "orchestration_error", "config_a");
     for (bool serial : {false, true}) {
-        SCOPED_TRACE(serial);
-        output.fill(0);
-        resident->dev.serial_orch_sched = serial;
-        PreparedInvocationView callable{6, 1, 1};
-        TmrEncodingCandidate packet;
-        TmrEncodingCache cache;
-        auto args = arguments(57);
-        ASSERT_EQ(encode_tmr_invocation(args, callable, binding.identity, cache, &packet), InvocationStatus::Ok);
-        const auto results = coordinated_round({callable, {}}, packet.packet());
-        for (int32_t result : results)
-            EXPECT_EQ(result, -SIMPLER_ERROR_INVALID_ARGS);
-        EXPECT_EQ(control.runtime_status, -SIMPLER_ERROR_INVALID_ARGS);
-        EXPECT_EQ(control.cleanup_status, 0);
-        EXPECT_EQ(opened_windows.load(), 3);
-        EXPECT_EQ(closed_windows.load(), 3);
-        EXPECT_EQ(output[0], 3u);
-        EXPECT_EQ(output[3], 3u);
-        EXPECT_EQ(output[1], 57u);
-        EXPECT_EQ(output[4], 57u);
-        EXPECT_NE(output[2], 0u);
-        EXPECT_EQ(output[2], output[5]);
-        EXPECT_EQ(kernel_execution_status(), -1);
-        expect_resident_configuration(serial);
-        ASSERT_NO_FATAL_FAILURE(expect_successful_reuse());
+        isolated_round([&] {
+            SCOPED_TRACE(serial);
+            output.fill(0);
+            resident->dev.serial_orch_sched = serial;
+            PreparedInvocationView callable{6, 1, 1};
+            TmrEncodingCandidate packet;
+            TmrEncodingCache cache;
+            auto args = arguments(57);
+            ASSERT_EQ(encode_tmr_invocation(args, callable, binding.identity, cache, &packet), InvocationStatus::Ok);
+            const auto results = coordinated_round({callable, {}}, packet.packet());
+            for (int32_t result : results)
+                EXPECT_EQ(result, -SIMPLER_ERROR_INVALID_ARGS);
+            EXPECT_EQ(control.runtime_status, -SIMPLER_ERROR_INVALID_ARGS);
+            EXPECT_EQ(control.cleanup_status, 0);
+            EXPECT_EQ(opened_windows.load(), 3);
+            EXPECT_EQ(closed_windows.load(), 3);
+            EXPECT_EQ(output[0], 3u);
+            EXPECT_EQ(output[3], 3u);
+            EXPECT_EQ(output[1], 57u);
+            EXPECT_EQ(output[4], 57u);
+            EXPECT_NE(output[2], 0u);
+            EXPECT_EQ(output[2], output[5]);
+            expect_resident_configuration(serial);
+        });
     }
 }
 
-TEST_F(TmrExecutorExecutionInputsTest, RejectedAdmissionLeavesActualExecutorInactive) {
+TEST_F(TmrExecutorExecutionInputsTest, RejectedAdmissionReportsOriginalError) {
     PreparedInvocationView callable{3, 1, 1};
     TmrEncodingCandidate packet;
     TmrEncodingCache cache;
     auto args = arguments(9);
     ASSERT_EQ(encode_tmr_invocation(args, callable, binding.identity, cache, &packet), InvocationStatus::Ok);
     for (bool wrong_signature : {false, true}) {
-        SCOPED_TRACE(wrong_signature);
-        output.fill(0);
-        auto trusted_callable = callable;
-        const size_t capacity = binding.arena.capacity;
-        const auto encoded = packet.packet();
-        std::vector<uint8_t> malformed(encoded.data, encoded.data + encoded.size);
-        if (wrong_signature) {
-            SimplerKernelInvocationHeader header{};
-            std::memcpy(&header, malformed.data(), sizeof(header));
-            ++header.scalar_count;
-            std::memcpy(malformed.data(), &header, sizeof(header));
-        } else {
-            binding.arena.capacity = 0;
-        }
-        const ByteSpan round_packet = wrong_signature ? ByteSpan{malformed.data(), malformed.size()} : encoded;
-        const auto results = coordinated_round({trusted_callable, {}}, round_packet);
-        binding.arena.capacity = capacity;
-        const auto expected =
-            wrong_signature ? KernelDispatchStatus::InvalidArgs : KernelDispatchStatus::InvalidBinding;
-        for (int32_t result : results)
-            EXPECT_EQ(result, static_cast<int32_t>(expected));
-        EXPECT_EQ(control.runtime_status, static_cast<int32_t>(expected));
-        EXPECT_EQ(opened_windows.load(), 0);
-        EXPECT_EQ(closed_windows.load(), 0);
-        EXPECT_EQ(output[0], 0u);
-        EXPECT_EQ(output[3], 0u);
-        EXPECT_EQ(kernel_execution_status(), -1);
-        ASSERT_NO_FATAL_FAILURE(expect_successful_reuse());
+        isolated_round([&] {
+            SCOPED_TRACE(wrong_signature);
+            output.fill(0);
+            auto trusted_callable = callable;
+            const size_t capacity = binding.arena.capacity;
+            const auto encoded = packet.packet();
+            std::vector<uint8_t> malformed(encoded.data, encoded.data + encoded.size);
+            if (wrong_signature) {
+                SimplerKernelInvocationHeader header{};
+                std::memcpy(&header, malformed.data(), sizeof(header));
+                ++header.scalar_count;
+                std::memcpy(malformed.data(), &header, sizeof(header));
+            } else {
+                binding.arena.capacity = 0;
+            }
+            const ByteSpan round_packet = wrong_signature ? ByteSpan{malformed.data(), malformed.size()} : encoded;
+            const auto results = coordinated_round({trusted_callable, {}}, round_packet);
+            binding.arena.capacity = capacity;
+            const auto expected =
+                wrong_signature ? KernelDispatchStatus::InvalidArgs : KernelDispatchStatus::InvalidBinding;
+            for (int32_t result : results)
+                EXPECT_EQ(result, static_cast<int32_t>(expected));
+            EXPECT_EQ(control.runtime_status, static_cast<int32_t>(expected));
+            EXPECT_EQ(opened_windows.load(), 0);
+            EXPECT_EQ(closed_windows.load(), 0);
+            EXPECT_EQ(output[0], 0u);
+            EXPECT_EQ(output[3], 0u);
+        });
     }
 }
 

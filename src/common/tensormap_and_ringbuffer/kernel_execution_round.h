@@ -37,9 +37,9 @@ int32_t execute_kernel_round_impl(
     if (ticket.launch_index == 0) {
         auto handshake = request.handshake;
         handshake.epoch = ticket.epoch;
-        executor.kernel_control_attached_ = executor.kernel_cores_.attach(handshake);
+        executor.kernel_storage_attached_ = executor.kernel_storage_.attach(handshake);
         int32_t status = request.admission_status;
-        if (!executor.kernel_control_attached_) status = -1;
+        if (!executor.kernel_storage_attached_) status = -1;
         if (status == 0) {
             try {
                 status = executor.prepare_kernel_round(request);
@@ -66,21 +66,14 @@ int32_t execute_kernel_round_impl(
     if (arrival == RoundArrival::Invalid) return -1;
     KernelFinalStatus result;
     if (arrival == RoundArrival::Finalizer) {
-        // Save initialization/SM status before Runtime destruction changes its views.
+        // All execution threads have published their status before the native result.
         const int32_t sm_status = executor.kernel_status();
-        int32_t cleanup = executor.kernel_control_attached_ ? executor.kernel_cores_.finish() : -1;
-        if (cleanup == 0) {
-            try {
-                cleanup = executor.finalize_kernel_round();
-            } catch (...) {
-                cleanup = -1;
-            }
-        }
+        const int32_t cleanup = 0;
         if (!gate.publish_final_status(
                 ticket, sm_status, cleanup,
                 [&](const KernelFinalStatus &final) noexcept {
-                    if (executor.kernel_control_attached_)
-                        executor.kernel_cores_.publish_status(final.runtime_status, final.cleanup_status);
+                    if (executor.kernel_storage_attached_)
+                        executor.kernel_storage_.publish_status(final.runtime_status, final.cleanup_status);
                 }
             ) ||
             !gate.read_final_status(ticket, &result))
@@ -91,11 +84,11 @@ int32_t execute_kernel_round_impl(
     if (out != nullptr) *out = result;
     const auto departure = gate.depart(ticket);
     if (departure == RoundDeparture::Invalid) return -1;
-    if (departure == RoundDeparture::Last && result.cleanup_status == 0) {
+    if (departure == RoundDeparture::Last && result.cleanup_status == 0 && result.runtime_status == 0) {
         executor.clear_kernel_round();
         if (!gate.complete_departure(ticket)) return -1;
     }
-    // Cleanup failure retains the retiring gate and every borrowed argument;
+    // Any failed round retains the retiring gate and every borrowed argument;
     // a timeout is not proof that an AICore stopped reading the storage.
     return result.cleanup_status != 0 ? result.cleanup_status : result.runtime_status;
 }

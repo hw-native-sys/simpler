@@ -9,7 +9,6 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include "scheduler_context.h"
-#include "tensormap_and_ringbuffer/kernel_core_group.h"
 
 #include "utils/fatal_shutdown_latch.h"
 
@@ -710,50 +709,8 @@ int32_t SchedulerContext::retire_all_cores(Runtime *runtime) {
 // landed, so the shared aic_count_/aiv_count_ are written by one thread only.
 // =============================================================================
 
-// Each initializer owns one kernel report slice; post_handshake_init runs
-// after all slices have published their worker state.
-void SchedulerContext::handshake_kernel_partition(Runtime *runtime, int32_t index, int32_t threads) {
-    const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(index) * cores_total_num_) / threads);
-    const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(index + 1) * cores_total_num_) / threads);
-    for (int32_t i = lo; i < hi; ++i) {
-        auto &worker = runtime->dev.workers[i];
-        worker.task = reinterpret_cast<uint64_t>(&payload_per_core_[i][0]);
-        worker.physical_core_id = kernel_cores_->physical_id(i);
-        worker.core_type = kernel_cores_->core_type(i);
-        OUT_OF_ORDER_STORE_BARRIER();
-        kernel_cores_->open(i);
-        CoreExecState state{};
-        state.reg_addr = kernel_cores_->register_address(i);
-        state.cond_ptr = get_reg_ptr(state.reg_addr, RegId::COND);
-        state.running_reg_task_id = AICPU_TASK_INVALID;
-        state.pending_reg_task_id = AICPU_TASK_INVALID;
-#if !SIMPLER_DFX
-        state.worker_id = i;
-        state.physical_core_id = kernel_cores_->physical_id(i);
-        state.core_type = kernel_cores_->core_type(i);
-#endif
-        core_exec_states_[i] = state;
-        core_type_compact_[i] = static_cast<uint8_t>(kernel_cores_->core_type(i));
-#if SIMPLER_DFX
-        physical_core_ids_[i] = kernel_cores_->physical_id(i);
-#endif
-    }
-}
-
 void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads) {
-    if (kernel_cores_ != nullptr) {
-        if (kernel_cores_->collect_reports_partition(
-                reinterpret_cast<const uint64_t *>(get_platform_regs()), platform_get_physical_cores_count(), tidx,
-                nthreads
-            ) != 0) {
-            handshake_failed_.store(true, std::memory_order_release);
-            kernel_cores_->request_cancel();
-            return;
-        }
-        handshake_kernel_partition(runtime, tidx, nthreads);
-        return;
-    }
-    Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
+    Handshake *all_handshakes = reports_ != nullptr ? reports_ : runtime->dev.workers;
     const int32_t total = cores_total_num_;
     const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(tidx) * total) / nthreads);
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(tidx + 1) * total) / nthreads);
@@ -804,6 +761,7 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
     // Phase 1: collect every reported core in this slice and prefetch its
     // CoreExecState line for write, so the Phase 4 struct store hits a warm line.
     for (int32_t remaining = hi - lo; remaining > 0;) {
+        if (handshake_failed_.load(std::memory_order_acquire) || initialization_aborted()) return;
         for (int32_t i = lo; i < hi; i++) {
             if (core_serviced[i]) continue;
             Handshake *hank = &all_handshakes[i];
@@ -811,8 +769,9 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
                 SPIN_WAIT_HINT();
                 continue;
             }
+            rmb();
             uint32_t physical_core_id = hank->physical_core_id;
-            if (physical_core_id >= max_physical_cores_count) {
+            if (physical_core_id >= max_physical_cores_count || regs[physical_core_id] == 0) {
                 LOG_ERROR(
                     "Core %d reported invalid physical_core_id=%u (platform max=%u)", i, physical_core_id,
                     max_physical_cores_count
@@ -828,6 +787,8 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
             remaining--;
         }
     }
+
+    if (handshake_failed_.load(std::memory_order_acquire) || initialization_aborted()) return;
 
     // Phase 2: publish every task pointer, then ONE barrier. The core reads task
     // only after its window opens (Phase 3); a single barrier orders all task
@@ -874,7 +835,7 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
 // ci % active_threads. Same protocol as handshake_partition, but over the owned
 // set instead of a contiguous slice.
 void SchedulerContext::handshake_owned_clusters(Runtime *runtime, int32_t tidx, int32_t active_threads) {
-    Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
+    Handshake *all_handshakes = reports_ != nullptr ? reports_ : runtime->dev.workers;
     const int32_t aic_n = cores_total_num_ / PLATFORM_CORES_PER_BLOCKDIM;
 
     int32_t owned[RUNTIME_MAX_WORKER];
@@ -902,39 +863,20 @@ void SchedulerContext::handshake_owned_clusters(Runtime *runtime, int32_t tidx, 
     ReadyCore ready[RUNTIME_MAX_WORKER];
     int32_t n_ready = 0;
 
-    const uint64_t deadline = kernel_cores_ != nullptr ? platform_aicore_exit_deadline() : 0;
-    if (kernel_cores_ != nullptr && !kernel_cores_->control_valid()) {
-        handshake_failed_.store(true, std::memory_order_release);
-        return;
-    }
     // Phase 1: collect every reported owned core, prefetch its CoreExecState line.
     for (int32_t remaining = own_n; remaining > 0;) {
+        if (handshake_failed_.load(std::memory_order_acquire) || initialization_aborted()) return;
         for (int32_t k = 0; k < own_n; k++) {
             int32_t i = owned[k];
             if (core_serviced[i]) continue;
-            if (kernel_cores_ != nullptr) {
-                const int32_t status = kernel_cores_->poll_owned_report(regs, max_physical_cores_count, i);
-                if (status < 0 || (status > 0 && get_sys_cnt_aicpu() > deadline)) {
-                    handshake_failed_.store(true, std::memory_order_release);
-                    kernel_cores_->request_cancel();
-                    return;
-                }
-                if (status > 0) continue;
-                __builtin_prefetch(&core_exec_states_[i], 1, 3);
-                ready[n_ready++] = {
-                    i, kernel_cores_->physical_id(i), kernel_cores_->register_address(i), kernel_cores_->core_type(i)
-                };
-                core_serviced[i] = true;
-                --remaining;
-                continue;
-            }
             Handshake *hank = &all_handshakes[i];
             if (hank->aicore_done == 0) {
                 SPIN_WAIT_HINT();
                 continue;
             }
+            rmb();
             uint32_t physical_core_id = hank->physical_core_id;
-            if (physical_core_id >= max_physical_cores_count) {
+            if (physical_core_id >= max_physical_cores_count || regs[physical_core_id] == 0) {
                 LOG_ERROR(
                     "Core %d reported invalid physical_core_id=%u (platform max=%u)", i, physical_core_id,
                     max_physical_cores_count
@@ -951,29 +893,20 @@ void SchedulerContext::handshake_owned_clusters(Runtime *runtime, int32_t tidx, 
         }
     }
 
+    if (handshake_failed_.load(std::memory_order_acquire) || initialization_aborted()) return;
+
     // Phase 2: publish every task pointer, then ONE barrier. The core reads task
     // only after its window opens (Phase 3), so a single barrier orders all task
     // stores before any window STR.
     for (int32_t r = 0; r < n_ready; r++) {
         const auto &core = ready[r];
-        if (kernel_cores_ != nullptr) {
-            runtime->dev.workers[core.i].physical_core_id = core.pcid;
-            runtime->dev.workers[core.i].core_type = core.core_type;
-            runtime->dev.workers[core.i].task = reinterpret_cast<uint64_t>(&payload_per_core_[core.i][0]);
-        } else {
-            all_handshakes[core.i].task = reinterpret_cast<uint64_t>(&payload_per_core_[core.i][0]);
-        }
+        all_handshakes[core.i].task = reinterpret_cast<uint64_t>(&payload_per_core_[core.i][0]);
     }
     OUT_OF_ORDER_STORE_BARRIER();
 
     // Phase 3: open every window (the IDLE write is also the core's ack).
     for (int32_t r = 0; r < n_ready; r++) {
         platform_init_aicore_regs(ready[r].reg_addr);
-    }
-
-    if (kernel_cores_ != nullptr) {
-        for (int32_t r = 0; r < n_ready; ++r)
-            kernel_cores_->acknowledge_open(ready[r].i);
     }
 
     // Phase 4: publish each CoreExecState (AICPU-private, may follow the windows).
@@ -1172,12 +1105,6 @@ bool SchedulerContext::begin_emergency_shutdown() {
 }
 
 void SchedulerContext::signal_emergency_shutdown(Runtime *runtime) {
-    if (kernel_cores_ != nullptr) {
-        // Kernel windows retire only after every CPU consumer has arrived at
-        // the outer gate, including the scheduler-timeout diagnostic path.
-        kernel_cores_->request_cancel();
-        return;
-    }
     // Sweeps every core rather than one thread's slice: a fatal run must not
     // depend on the owning threads reaching their own shutdown. Per-core
     // claiming keeps whatever they already retired untouched. Cores whose
@@ -1188,11 +1115,8 @@ void SchedulerContext::signal_emergency_shutdown(Runtime *runtime) {
 }
 
 void SchedulerContext::emergency_shutdown(Runtime *runtime) {
-    if (kernel_cores_ != nullptr) {
-        completed_.store(true, std::memory_order_release);
-        kernel_cores_->request_cancel();
-        return;
-    }
+    initialization_aborted_.store(true, std::memory_order_release);
+
     if (begin_emergency_shutdown()) {
         signal_emergency_shutdown(runtime);
     }
@@ -1292,6 +1216,7 @@ int32_t SchedulerContext::pre_handshake_init(
     aiv_count_ = cluster_num * PLATFORM_AIV_CORES_PER_BLOCKDIM;
     active_sched_threads_ = (sched_thread_num_ > 0) ? sched_thread_num_ : aicpu_thread_num_;
     handshake_failed_.store(false, std::memory_order_release);
+    initialization_aborted_.store(false, std::memory_order_release);
 
     // State the barrier-free per-thread init path no longer reaches via
     // post_handshake_init; reset on the leader before any scheduler thread is
@@ -1438,7 +1363,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime, simpler::tmr::Ca
 }
 
 void SchedulerContext::deinit() {
-    kernel_cores_ = nullptr;
+    reports_ = nullptr;
     // Reset all per-core execution state
     for (int32_t i = 0; i < RUNTIME_MAX_WORKER; i++) {
         core_exec_states_[i] = {};

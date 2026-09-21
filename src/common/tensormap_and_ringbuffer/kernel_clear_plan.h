@@ -37,12 +37,11 @@ struct TmrKernelClearBinding {
 struct TmrKernelClearPlan {
     uint64_t context_generation{0};
     std::array<TmrClearRegion, 2> regions{};
-    TmrClearRegion cancel{};
 };
 
 inline bool valid_tmr_clear_binding(const TmrKernelClearBinding &binding) noexcept {
     if (binding.context_generation == 0 || binding.worker_count <= 0) return false;
-    // A positive int32_t worker count times a 128-byte report fits uint64_t.
+    // A positive int32_t worker count times a 64-byte report fits uint64_t.
     const uint64_t report_bytes = static_cast<uint64_t>(binding.worker_count) * sizeof(TmrCoreReport);
     if (binding.control.bytes != sizeof(TmrLaunchControl) || binding.reports.bytes != report_bytes) return false;
     const auto valid_region = [](const TmrClearRegion &region) {
@@ -61,7 +60,6 @@ inline bool build_tmr_kernel_clear_plan(const TmrKernelClearBinding &binding, Tm
     TmrKernelClearPlan candidate;
     candidate.context_generation = binding.context_generation;
     candidate.regions = {binding.control, binding.reports};
-    candidate.cancel = {binding.control.address + offsetof(TmrLaunchControl, host_cancel), sizeof(uint32_t)};
     *out = candidate;
     return true;
 }

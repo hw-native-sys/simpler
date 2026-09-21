@@ -45,7 +45,6 @@ struct NativeFake {
         native.placeholder_count = 1;
         native.clear_regions = &clear;
         native.clear_region_count = 1;
-        native.cancel = {handshake.data(), sizeof(handshake)};
     }
     KernelLaunchResult launch(void *caller = ptr(100)) {
         return launch_bound_kernel_native(fixture.binding, native, caller, fixture.fake.gate());
@@ -77,11 +76,10 @@ extern "C" aclError aclrtMemsetAsync(void *address, size_t maximum, int32_t valu
     EXPECT_EQ(address, active->handshake.data());
     EXPECT_EQ(maximum, sizeof(active->handshake));
     EXPECT_EQ(count, maximum);
-    // The handshake clear belongs to the AICPU branch; only the cancel that
-    // compensation issues runs on the caller's stream.
-    EXPECT_EQ(stream, value == 0xff ? ptr(100) : ptr(1));
+    EXPECT_EQ(stream, ptr(1));
+    EXPECT_EQ(value, 0);
     active->memset_values.push_back(value);
-    return active->fixture.fake.append(value == 0xff ? Cancel : Step::Clear);
+    return active->fixture.fake.append(Step::Clear);
 }
 extern "C" aclError
 aclrtLaunchKernel(aclrtFuncHandle function, uint32_t blocks, const void *args, size_t bytes, aclrtStream stream) {
@@ -132,7 +130,7 @@ TEST(KernelNativeBinder, RoutesThreeStreamsAndCopiesIndependentHostArgs) {
     EXPECT_EQ(f.fixture.fake.queries, 1);
 }
 
-TEST(KernelNativeBinder, AicpuFailureCancelsWithSingleAllOnesFillAndRestoresPlaceholder) {
+TEST(KernelNativeBinder, AicpuFailurePoisonsWithoutCompensationAndRestoresPlaceholder) {
     NativeFake f;
     active = &f;
     f.initialize();
@@ -140,9 +138,9 @@ TEST(KernelNativeBinder, AicpuFailureCancelsWithSingleAllOnesFillAndRestoresPlac
     const auto result = f.launch();
     EXPECT_EQ(result.status, -1708);
     EXPECT_EQ(result.cleanup_status, 0);
-    EXPECT_TRUE(result.tail_recorded);
+    EXPECT_FALSE(result.tail_recorded);
     EXPECT_EQ(f.packet[8], 0u);
-    EXPECT_EQ(f.memset_values, (std::vector<int>{0, 0xff}));
+    EXPECT_EQ(f.memset_values, (std::vector<int>{0}));
     EXPECT_TRUE(f.fixture.fake.poisoned);
 }
 
@@ -160,10 +158,10 @@ TEST(KernelNativeBinder, InvalidPreparedArgumentsRejectBeforeAnyEnqueue) {
             f.native.aicpu_args_bytes -= 8;
             break;
         case 2:
-            f.native.cancel.bytes -= 1;
+            f.clear.bytes = 0;
             break;
         case 3:
-            f.native.cancel.address = ptr(4096);
+            f.clear.address = nullptr;
             break;
         case 4:
             f.placeholder.addrOffset = 0;

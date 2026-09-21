@@ -43,6 +43,7 @@
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
 #include "dispatch_payload.h"
 #include "aicore_teardown.h"
+#include "tmr_kernel_control.h"
 #include "task_args.h"
 #include "tensormap_and_ringbuffer/entry_args.h"  // EntryArgsStorage
 
@@ -103,13 +104,7 @@ constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 
  * - core_type: Written by AICore (with aicore_done), read by AICPU
  * - physical_core_id: Written by AICore (with aicore_done), read by AICPU
  */
-struct Handshake {
-    volatile uint32_t aicpu_ready;  // Legacy layout field; unused by the current handshake
-    volatile uint32_t aicore_done;  // AICore ready signal: 0=not ready, core_id+1=ready
-    volatile uint64_t task;         // DispatchPayload* published before register window-open
-    volatile CoreType core_type;    // Core type: CoreType::AIC or CoreType::AIV (reported by AICore with aicore_done)
-    volatile uint32_t physical_core_id;  // Physical core ID (reported by AICore with aicore_done)
-} __attribute__((aligned(64)));
+using Handshake = simpler::tmr::TmrCoreReport;
 
 enum class TensorReleaseKind {
     Free,

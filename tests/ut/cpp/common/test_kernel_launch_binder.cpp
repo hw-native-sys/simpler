@@ -115,18 +115,6 @@ TEST(KernelBinder, EveryEnqueueFailurePoisonsWithExactCompensationTrace) {
         EXPECT_EQ(result.status, -1700 - fail);
         EXPECT_EQ(result.failed_step, success[fail - 1]);
         auto expected = std::vector<Step>(success.begin(), success.begin() + fail);
-        // Only a failure between the AICore launch and the AICPU launch can
-        // leave AICore spinning on a handshake no AICPU will write, so only
-        // those two sites cancel and then drive the chain back to the caller.
-        if (fail == 7)
-            expected.insert(
-                expected.end(),
-                {Cancel, Step::AicoreDone, Step::JoinAicore, Step::AicpuDone, Step::JoinAicpu, Step::SerialTail}
-            );
-        if (fail == 8)
-            expected.insert(
-                expected.end(), {Cancel, Step::JoinAicore, Step::AicpuDone, Step::JoinAicpu, Step::SerialTail}
-            );
         EXPECT_EQ(f.fake.trace, expected);
         EXPECT_TRUE(f.fake.poisoned);
         EXPECT_EQ(f.fake.runtime_error, result.status);
@@ -137,24 +125,17 @@ TEST(KernelBinder, EveryEnqueueFailurePoisonsWithExactCompensationTrace) {
     }
 }
 
-TEST(KernelBinder, CompensationFailuresKeepBothErrorsAndStopAtFailure) {
+TEST(KernelBinder, PartialLaunchFailureStopsWithoutClaimingQuiescence) {
     for (int primary : {7, 8}) {
-        const int cleanup_steps = primary == 7 ? 6 : 5;
-        for (int step = 1; step <= cleanup_steps; ++step) {
-            SCOPED_TRACE(primary * 100 + step);
-            Fixture f;
-            ASSERT_NO_FATAL_FAILURE(f.initialize());
-            f.fake.fail_at = primary;
-            f.fake.second_fail_at = primary + step;
-            const auto result = f.launch();
-            EXPECT_EQ(result.status, -1700 - primary);
-            EXPECT_EQ(result.cleanup_status, -1700 - primary - step);
-            EXPECT_FALSE(result.tail_recorded);
-            EXPECT_EQ(f.fake.calls, primary + step);
-            EXPECT_EQ(f.fake.runtime_error, result.status);
-            EXPECT_EQ(f.fake.cleanup_error, result.cleanup_status);
-            EXPECT_EQ(f.fake.acquisitions, f.fake.finishes);
-        }
+        Fixture f;
+        ASSERT_NO_FATAL_FAILURE(f.initialize());
+        f.fake.fail_at = primary;
+        const auto result = f.launch();
+        EXPECT_EQ(result.status, -1700 - primary);
+        EXPECT_EQ(result.cleanup_status, 0);
+        EXPECT_FALSE(result.tail_recorded);
+        EXPECT_EQ(f.fake.calls, primary);
+        EXPECT_TRUE(f.fake.poisoned);
     }
 }
 

@@ -171,7 +171,7 @@ launch 不分配设备内存、不创建 stream/event、不同步、不查询 ca
 不溢出），再由 TMR consumer 建立缓存可见性并校验绑定、大小、参数数量和
 signature，解码到本次调用的私有参数，进入真实 executor。
 两个入口将不同形式的参数适配为 `ExecutionInputs`，随后共同调用 `AicpuExecutor::execute()`，
-内部的 `init()`、`run()`、初始化计数和就绪发布只有一套。Kernel admission leader 额外完成
+内部的 `init()`、`run()`、初始化计数、就绪发布、逐 scheduler 退核和完成协调只有一套。Kernel admission leader 额外完成
 callable 驻留、orch SO 加载和参数绑定，再调用公共 `prepare_execution()`；program 的初始化
 leader 调用同一个准备函数。`KernelRoundGate` 只负责准入、线程筛选、最终结果和全部线程退场，
 不再维护初始化屏障或完成回调。
@@ -180,18 +180,29 @@ TMR 默认多线程启动时，公共准备完成后，orchestrator 开始建图
 Kernel 与 program 共用 `handshake_owned_clusters()` 和 `assign_own_clusters()`：每个 scheduler
 轮询自己负责的 cluster，批量发布 task 指针和打开寄存器窗口，再初始化所属核的 tracker、
 payload 和 context。物理核 ID 由设备核身份指令产生，唯一性与 program 一样由平台保证；
-kernel 的 report 适配额外检查 ID 范围、核类型、ready 标识和当前轮次状态，不维护跨 Worker
-的核占用登记表。Kernel 发布 OPEN 前仍对已开的窗口回读，保证 MMIO 完成先于 GM 命令可见。
+两种入口使用相同的 64 字节身份报告布局。Program 使用 Runtime 内嵌的报告，kernel 使用
+context 持有的独立报告区；Host 在启动前按轮清零，AICPU 在 kernel 准入时处理 DMA 清零的
+缓存可见性。AICore 写回身份后，scheduler 接受报告并执行读屏障，再发布 task 指针。
+两种入口都由 AICore 读取自己的 DATA_MAIN_BASE 判断开窗，不使用额外的 GM OPEN 通知。
+正常任务循环和退出逻辑共用；A2/A3 保留 EXIT → EXITED → 关窗 → post-close release，
+A5 使用其平台既有的寄存器退出协议。A2/A3 的 release gate 由公共初始化在开窗前清零。
+本分支的报告有效性仍基于每轮清零，不声明主线非零 report_epoch 的运行身份保证。
 
 未启用泳道图、PMU 或参数 dump 时，各 scheduler 完成本地初始化、等待 orchestrator 发布
 runtime reset 完成后即可派发，不等待其他 scheduler。这个选择按每轮的实际采集开关判断，
 不要求重新编译为非 DFX 版本。启用上述采集时保留初始化屏障，由 scheduler 角色 0 完成
 公共 profiling 初始化。串行配置保留统一 post-init 和建图前的初始化屏障。
 
-初始化失败时，先发布进程内取消请求，让其他初始化线程停止等待；SM 错误在 orchestrator
-完成 reset 后发布。AICore report 的 CANCEL 和窗口关闭由全部 AICPU 参与者停止后的 finalizer
-执行，避免与仍在初始化的线程发布 OPEN 竞争。启用采集时，orchestrator 建图后的核分配统计
-等待公共初始化完成，避免读取尚未建立的 tracker；未采集时不增加该等待。
+初始化或运行失败时，公共执行器发布失败，释放 CPU 等待者并汇总原始错误。
+已开窗核使用公共退出手段；未开窗核不参与额外取消握手，也不阻挡 AICPU 返回 CANN 错误。
+最终状态在所有 AICPU 参与者汇合后写入 context 的诊断区。失败轮次保留 Runtime、参数和
+报告存储并拒绝再次调用，恢复由调用方负责；ACL_STOP_ON_FAILURE 不证明正在执行的
+AICore 已经停止。Host 在 AICore 提交后、AICPU 提交失败时同样立即返回原错误并 poison
+context，不发布假完成 event，不尝试写 GM 取消。调用方确认设备静止前不得释放相关资源。
+启用采集时，orchestrator 建图后的核分配统计等待公共初始化完成，避免读取未建立的 tracker。
+
+Context descriptor 版本为 2：身份报告与最终状态各占 64 字节，取消字段和独立退出确认已删除。
+Host、AICPU、AICore 必须使用同一 runtime revision；不支持复用版本 1 的 descriptor。
 
 HBG 已有内部 packet/restore consumer，公共 kernel launch owner 尚未接线。
 

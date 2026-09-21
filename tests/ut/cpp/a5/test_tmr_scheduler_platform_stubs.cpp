@@ -20,4 +20,8 @@ void corrupt_kernel_arch_argument(KernelArgs &args, int fault) {
 void write_reg(uint64_t base, RegId reg, uint64_t value) {
     reg_store_release(reinterpret_cast<volatile uint32_t *>(base + reg_offset(reg)), static_cast<uint32_t>(value));
 }
-int32_t platform_deinit_aicore_regs(uint64_t) { return 0; }
+void platform_close_aicore_window(uint64_t) __attribute__((weak));
+int32_t platform_deinit_aicore_regs(uint64_t base) {
+    if (platform_close_aicore_window != nullptr) platform_close_aicore_window(base);
+    return 0;
+}

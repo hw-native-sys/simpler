@@ -22,7 +22,6 @@
 namespace kernel_binder_test {
 using namespace simpler::kernel_launch;
 using Step = KernelLaunchStep;
-constexpr Step Cancel = static_cast<Step>(100);
 inline void *ptr(uintptr_t n) { return reinterpret_cast<void *>(n); }
 
 struct Fake {
@@ -110,9 +109,6 @@ struct Fake {
             },
             [](void *p, void *) noexcept {
                 return static_cast<Fake *>(p)->append(Step::AicoreLaunch);
-            },
-            [](void *p, void *) noexcept {
-                return static_cast<Fake *>(p)->append(Cancel);
             }
         };
     }

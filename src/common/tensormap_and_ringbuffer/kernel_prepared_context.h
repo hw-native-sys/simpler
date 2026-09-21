@@ -18,7 +18,7 @@
 
 #include "common/kernel_args.h"
 #include "kernel_clear_plan.h"
-#include "kernel_core_group.h"
+#include "kernel_round_storage.h"
 #include "kernel_execution_inputs.h"
 #include "task_interface/tmr_kernel_context.h"
 

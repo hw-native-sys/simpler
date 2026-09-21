@@ -207,7 +207,7 @@ bool ensure_kernel_residency(
 template <typename Executor>
 int revoke_kernel_context(Executor &executor, const void *arg) noexcept {
     if (arg == nullptr || !executor.kernel_gate_.idle() || executor.kernel_invocation_.active() ||
-        executor.kernel_control_attached_)
+        executor.kernel_storage_attached_)
         return -1;
     TmrContextRevokeArgs args{};
     std::memcpy(&args, arg, sizeof(args));

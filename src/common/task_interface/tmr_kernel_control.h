@@ -15,38 +15,27 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "common/core_type.h"
+
 namespace simpler::tmr {
 
-enum class TmrCoreCommand : uint32_t { Wait = 0, Open = 1, Cancel = 2 };
-enum class TmrCoreRelease : uint32_t { Wait = 0, Release = 1 };
 enum class TmrCompletion : uint32_t { Pending = 0, Complete = 1 };
 
-constexpr uint32_t kTmrHostCancel = 0xffffffffu;
-
-// AICore writes the first cache line; AICPU writes the second. Host clears both only between
-// non-overlapping invocations; architecture-specific cache maintenance is required.
+// AICore publishes identity before AICPU writes task and opens the register window.
 struct alignas(64) TmrCoreReport {
-    uint32_t physical_core_id;
-    uint32_t core_type;
-    uint32_t ready;
-    uint32_t exited;
-    uint8_t report_reserved[48];
-    uint32_t command;
-    uint32_t release;
-    uint64_t round_epoch;
-    uint8_t command_reserved[48];
+    volatile uint32_t aicpu_ready;
+    volatile uint32_t aicore_done;
+    volatile uint64_t task;
+    volatile CoreType core_type;
+    volatile uint32_t physical_core_id;
+    volatile uint64_t report_epoch;
 };
 
-// Host cancel occupies its own cache line. Once AICPU is submitted, Host
-// cannot cancel by overwriting either the live report pool or this device line.
 struct alignas(64) TmrLaunchControl {
-    uint32_t host_cancel;
-    uint8_t host_reserved[60];
     int32_t runtime_status;
     int32_t cleanup_status;
     uint64_t round_epoch;
     uint32_t completion;
-    uint8_t device_reserved[44];
 };
 
 // Both addresses identify stable device allocations owned by the context.
@@ -56,26 +45,12 @@ struct TmrKernelAicoreArgs {
 };
 
 static_assert(std::is_standard_layout_v<TmrCoreReport> && std::is_trivially_copyable_v<TmrCoreReport>);
-static_assert(sizeof(TmrCoreReport) == 128 && alignof(TmrCoreReport) == 64);
-static_assert(offsetof(TmrCoreReport, physical_core_id) == 0);
-static_assert(offsetof(TmrCoreReport, core_type) == 4);
-static_assert(offsetof(TmrCoreReport, ready) == 8);
-static_assert(offsetof(TmrCoreReport, exited) == 12);
-static_assert(offsetof(TmrCoreReport, report_reserved) == 16);
-static_assert(offsetof(TmrCoreReport, command) == 64);
-static_assert(offsetof(TmrCoreReport, release) == 68);
-static_assert(offsetof(TmrCoreReport, round_epoch) == 72);
-static_assert(offsetof(TmrCoreReport, command_reserved) == 80);
-
+static_assert(sizeof(TmrCoreReport) == 64 && alignof(TmrCoreReport) == 64);
+static_assert(offsetof(TmrCoreReport, task) == 8);
+static_assert(offsetof(TmrCoreReport, physical_core_id) == 20);
+static_assert(offsetof(TmrCoreReport, report_epoch) == 24);
 static_assert(std::is_standard_layout_v<TmrLaunchControl> && std::is_trivially_copyable_v<TmrLaunchControl>);
-static_assert(sizeof(TmrLaunchControl) == 128 && alignof(TmrLaunchControl) == 64);
-static_assert(offsetof(TmrLaunchControl, host_cancel) == 0);
-static_assert(offsetof(TmrLaunchControl, host_reserved) == 4);
-static_assert(offsetof(TmrLaunchControl, runtime_status) == 64);
-static_assert(offsetof(TmrLaunchControl, cleanup_status) == 68);
-static_assert(offsetof(TmrLaunchControl, round_epoch) == 72);
-static_assert(offsetof(TmrLaunchControl, completion) == 80);
-static_assert(offsetof(TmrLaunchControl, device_reserved) == 84);
+static_assert(sizeof(TmrLaunchControl) == 64 && alignof(TmrLaunchControl) == 64);
 
 static_assert(std::is_standard_layout_v<TmrKernelAicoreArgs> && std::is_trivially_copyable_v<TmrKernelAicoreArgs>);
 static_assert(sizeof(TmrKernelAicoreArgs) == 16 && alignof(TmrKernelAicoreArgs) == 8);

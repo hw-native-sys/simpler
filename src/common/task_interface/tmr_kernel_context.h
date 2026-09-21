@@ -16,7 +16,7 @@
 
 namespace simpler::tmr {
 
-inline constexpr uint32_t kTmrKernelContextVersion = 1;
+inline constexpr uint32_t kTmrKernelContextVersion = 2;
 
 // Published once by prepare. The owner retains every referenced allocation
 // until all executions complete and all referring graphs are destroyed.
