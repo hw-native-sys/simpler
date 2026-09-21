@@ -866,15 +866,17 @@ static RunOutcomeEvidence collect_run_evidence(const OnboardNativeRunContext *st
 }
 
 /**
- * Compare what the shared decision rule makes of this run against the channel
- * that still decides it — the stream synchronize behind `execution_rc`.
+ * Compare what the shared decision rule makes of this run against the
+ * `execution_rc` the drain returned.
  *
- * The rule is `decide_run_execution`, the same one a promotion would put in
- * charge; running it here is what produces the evidence that it agrees. It
- * reports and never overrides: `execution_rc` is unchanged by this function and
- * by everything it calls. A run the rule cannot decide is not a disagreement —
- * the producers that publish nothing on a path are exactly what the audit is
- * for, and the reason names which path it was.
+ * The rule is `decide_run_execution`, the same one the fenced drain uses to
+ * decide a normal success. The two agree by construction on that branch; what
+ * this still covers is every shape the drain answered from the stream
+ * synchronize or from a boundary failure instead. It reports and never
+ * overrides: `execution_rc` is unchanged by this function and by everything it
+ * calls. A run the rule cannot decide is not a disagreement — the producers
+ * that publish nothing on a path are exactly what the audit is for, and the
+ * reason names which path it was.
  */
 static void report_terminal_disagreement(const OnboardNativeRunContext *state, int execution_rc) {
     const RunExecutionOutcome outcome = decide_run_execution(collect_run_evidence(state));
@@ -1391,12 +1393,15 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
             // Immediately before the consumer, and after whichever drain
             // completed the run — `simpler_wait_run` may have done it, leaving
             // nothing for the catch-up drain above. Read on every launched run,
-            // not only the failing ones: the device now publishes a terminal
-            // record for a success too, and a channel only consulted after some
-            // other channel already decided can never replace that other
-            // channel. One read per run; finalize consumes this copy.
+            // not only the failing ones: the device publishes a terminal record
+            // for a success too. One read per run, and a fenced drain has
+            // already taken it to decide the run, so this call reuses those
+            // bytes; it still owns the read for a run whose drain never
+            // reached that point.
             if (launched) {
-                state->runner->read_device_run_result(state->descriptor.pipeline_slot, state->descriptor.run_epoch);
+                (void)state->runner->read_device_run_result(
+                    state->descriptor.pipeline_slot, state->descriptor.run_epoch
+                );
                 report_terminal_disagreement(state, execution_rc);
                 // A separate axis from this run's outcome: a notification names a
                 // device and a stream, carries no run identity, and can arrive

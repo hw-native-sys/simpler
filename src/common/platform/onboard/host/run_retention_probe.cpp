@@ -93,8 +93,8 @@ int run_retention_probe(
     }
 
     // Step 1 — the predecessor's own two boundaries, and nothing else. This is
-    // `wait_run_fence` minus the `sync_stream_pair` it appends, which is the
-    // call that would wait for the successor once one is queued.
+    // `wait_run_fence`'s boundary wait without any `sync_stream_pair`, which is
+    // the call that would wait for the successor once one is queued.
     const int boundary_timeout_ms = config.boundary_timeout_ms != 0 ?
                                         static_cast<int>(config.boundary_timeout_ms) :
                                         RunRetentionProbePeer::stream_sync_timeout_ms(runner);
@@ -174,11 +174,11 @@ int run_retention_probe(
         );
     }
 
-    // The control arm. This is the call `wait_run_fence` appends after the
-    // boundaries and that node E would remove: with a successor in flight it
-    // waits for that successor, which is exactly what the candidate read must
-    // not do. Running it here, against the same sequence, is what turns the
-    // Pending reading below into evidence.
+    // The control arm. This is the call `wait_run_fence` falls back to after
+    // the boundaries: with a successor in flight it waits for that successor,
+    // which is exactly what the record read must not do. Running it here,
+    // against the same sequence, is what turns the Pending reading below into
+    // evidence.
     if (config.use_retained_sync != 0) {
         rtStream_t aicpu = nullptr;
         rtStream_t aicore = nullptr;

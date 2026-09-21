@@ -2333,23 +2333,27 @@ uint64_t DeviceRunnerBase::arm_chip_swimlane_run_terminal_bank(uint32_t pipeline
     return reinterpret_cast<uint64_t>(chip_swimlane_collector_.arm_run_terminal_bank(pipeline_slot, run_epoch));
 }
 
-void DeviceRunnerBase::read_device_run_result(uint32_t pipeline_slot, uint64_t run_epoch) {
-    if (pipeline_slot >= device_run_results_.size()) return;
+int DeviceRunnerBase::read_device_run_result(uint32_t pipeline_slot, uint64_t run_epoch) {
+    if (pipeline_slot >= device_run_results_.size()) return 0;
     // The region is this slot's, and the slot is not handed to another run until
     // the run holding it finalizes, so this read races nothing. What makes the
     // record this run's rather than a successor's is that its device side wrote
     // and published it before its kernel returned.
-    device_run_result_reads_.read(
+    return device_run_result_reads_.read_with_status(
         pipeline_slot, run_epoch, device_run_results_[pipeline_slot], device_run_result_dev_ptrs_[pipeline_slot],
         [](void *dst, const void *src) {
+            // The copy's own status is the caller's: this is an SDK call on the
+            // run's drain path, and a code it reports is an error this thread
+            // has observed. Returning it rather than a bool is what keeps a
+            // later zero from standing in for it.
             int rc = rtMemcpy(
                 dst, sizeof(DeviceRunResultRegion), src, sizeof(DeviceRunResultRegion), RT_MEMCPY_DEVICE_TO_HOST
             );
             if (rc != 0) {
                 LOG_WARN("rtMemcpy(run_result) D2H failed: %d", rc);
-                return false;
+                ACL_LOG_ERROR_DETAIL(rc);
             }
-            return true;
+            return rc;
         }
     );
 }
@@ -2636,12 +2640,49 @@ int DeviceRunnerBase::wait_run_fence(
         return rc;
     }
 
-    // Completion is settled above; this reads the device's verdict on the work
-    // that completed, and on this SDK a stream synchronize is the only call
-    // that produces one. Measured on a2a3 for a run whose AICPU kernel returned
-    // a fatal status: both boundaries complete (so the kernels did exit),
-    // rtStreamQuery reports both streams drained and error-free,
-    // aclrtPeekAtLastError reports nothing, and only
+    // Completion is settled above. What decides the run is this run's own
+    // evidence: the boundaries just observed plus the record its device side
+    // published before its kernel returned. The read is taken here, ahead of
+    // any verdict, and it is the run's one read — finalize's later call for
+    // the same epoch reuses these bytes.
+    const int transfer_rc = read_device_run_result(prepared.pipeline_slot, prepared.identity.run_epoch);
+    RunOutcomeEvidence evidence;
+    evidence.boundaries = observed.completion;
+    evidence.record_read = device_run_result_read_status(prepared.pipeline_slot, prepared.identity.run_epoch);
+    evidence.terminal = device_run_terminal(prepared.pipeline_slot, prepared.identity.run_epoch);
+
+    switch (decide_run_drain(transfer_rc, evidence)) {
+    case RunDrainAction::ReportTransferError: {
+        // An SDK error this thread has already observed. The synchronize still
+        // runs so the pair converges and the health path sees a code, but the
+        // observed error is what the run returns: a later zero does not annul
+        // it, and a later non-zero does not replace it.
+        const int sync_rc = sync_stream_pair(aicpu_stream, aicore_stream);
+        LOG_ERROR(
+            "Run result transfer failed: %d (device_id=%d block_dim=%d slot=%u); the converging stream "
+            "synchronize returned %d and does not replace it",
+            transfer_rc, device_id_, block_dim_, prepared.pipeline_slot, sync_rc
+        );
+        return transfer_rc;
+    }
+    case RunDrainAction::AcceptRecordedSuccess:
+        // Both this run's boundaries completed, its transfer reported nothing,
+        // and the record it published for this exact identity says Ok. That is
+        // what this branch asserts — not that the device raised no exception
+        // for anything else on the stream. A fault no participant recorded can
+        // still reach the caller only through a later API call or the health
+        // channel, which is the accepted cost of not waiting here for runs
+        // queued behind this one. See docs/design/run-completion-fence.md.
+        return 0;
+    case RunDrainAction::Synchronize:
+        break;
+    }
+
+    // Every other shape keeps the device's verdict, and on this SDK a stream
+    // synchronize is the only call measured to produce one. Measured on a2a3
+    // for a run whose AICPU kernel returned a fatal status: both boundaries
+    // complete (so the kernels did exit), rtStreamQuery reports both streams
+    // drained and error-free, aclrtPeekAtLastError reports nothing, and only
     // aclrtSynchronizeStreamWithTimeout surfaces the 507018 — after which peek
     // reports it too. A zero timeout is rejected outright (107000), so there is
     // no non-blocking form of the same check. See

@@ -47,6 +47,7 @@
 
 #include "host/run_completion_fence.h"
 #include "host/run_outcome_decision.h"
+#include "runtime_c_api.h"
 #include "worker/native_run_execution.h"
 
 /** One retained boundary observation per pipeline slot. */
@@ -133,22 +134,30 @@ RunCompletionFence::Completion poll_and_retain_run_boundaries(
 }
 
 /**
- * One read of the result region per run, and which of the three read states
- * that run's slot is in.
+ * One read of the result region per run, which of the three read states that
+ * run's slot is in, and the status the transfer itself reported.
  */
 template <size_t Slots>
 class RunRecordReadLedgerT {
 public:
     /**
-     * Take this run's one read of `region` into `out`.
+     * Take this run's one read of `region` into `out`, retaining the
+     * transfer's own status.
      *
-     * `copy_in(void *dst, const void *src)` performs the copy and reports
-     * whether the bytes landed. It is invoked exactly when this run has not
-     * read yet and a region exists, so an absent region costs no copy and is
-     * not reported as one that failed: a run that never launched has no region
-     * and did not lose a read. `out` is emptied whenever a read is taken, so a
-     * run never reads a predecessor's bytes, and emptied again when the copy
-     * fails, so it never reads a partial one.
+     * `copy_in(void *dst, const void *src)` performs the copy and returns the
+     * transfer's status code: zero when the bytes landed, otherwise the code
+     * the transfer itself reported. It is invoked exactly when this run has
+     * not read yet and a region exists, so an absent region costs no copy and
+     * is not reported as one that failed: a run that never launched has no
+     * region and did not lose a read. `out` is emptied whenever a read is
+     * taken, so a run never reads a predecessor's bytes, and emptied again
+     * when the copy fails, so it never reads a partial one.
+     *
+     * Returns the status retained for this run, which is the copy's code on
+     * the read this run takes and the same code on every later call for it.
+     * A caller that acts on the status therefore reads the same value however
+     * many times it asks, and a deduplicated call is not mistaken for a
+     * transfer that succeeded.
      *
      * One read per run: later consumers share the first read's bytes. A retry
      * would either cost a second D2H for the same answer or, after a device
@@ -156,19 +165,37 @@ public:
      * is not a run that can own a read, so it is never deduplicated against.
      */
     template <typename Region, typename CopyIn>
-    void read(uint32_t slot, uint64_t run_epoch, Region &out, const void *region, const CopyIn &copy_in) {
-        if (slot >= Slots) return;
-        if (run_epoch != 0 && epochs_[slot] == run_epoch) return;
+    int read_with_status(uint32_t slot, uint64_t run_epoch, Region &out, const void *region, const CopyIn &copy_in) {
+        if (slot >= Slots) return 0;
+        if (run_epoch != 0 && epochs_[slot] == run_epoch) return transfer_statuses_[slot];
         epochs_[slot] = run_epoch;
         states_[slot] = RunRecordRead::NotAttempted;
+        transfer_statuses_[slot] = 0;
         out = Region{};
-        if (region == nullptr) return;
-        if (!copy_in(static_cast<void *>(&out), region)) {
+        if (region == nullptr) return 0;
+        const int status = copy_in(static_cast<void *>(&out), region);
+        if (status != 0) {
             out = Region{};
             states_[slot] = RunRecordRead::Failed;
-            return;
+            transfer_statuses_[slot] = status;
+            return status;
         }
         states_[slot] = RunRecordRead::Ok;
+        return 0;
+    }
+
+    /**
+     * Take this run's one read from a copy that reports only success.
+     *
+     * A caller with no status code to retain reports a failed copy as
+     * `PTO_RUNTIME_ERR_INTERNAL`, which is the same read state as the
+     * status-carrying form and carries no claim about what the transport said.
+     */
+    template <typename Region, typename CopyIn>
+    void read(uint32_t slot, uint64_t run_epoch, Region &out, const void *region, const CopyIn &copy_in) {
+        (void)read_with_status(slot, run_epoch, out, region, [&copy_in](void *dst, const void *src) {
+            return copy_in(dst, src) ? 0 : PTO_RUNTIME_ERR_INTERNAL;
+        });
     }
 
     /**
@@ -183,13 +210,27 @@ public:
         return states_[slot];
     }
 
+    /**
+     * The status this slot's transfer reported for `run_epoch`.
+     *
+     * Zero for a run whose copy landed and for a run that owns no read here,
+     * so a caller must pair a non-zero answer with `state()` rather than read
+     * zero as evidence that a transfer happened.
+     */
+    int transfer_status(uint32_t slot, uint64_t run_epoch) const {
+        if (slot >= Slots || run_epoch == 0 || epochs_[slot] != run_epoch) return 0;
+        return transfer_statuses_[slot];
+    }
+
     /** Forget every slot's read, for a runner starting a fresh device generation. */
     void reset() {
         epochs_.fill(0);
         states_.fill(RunRecordRead::NotAttempted);
+        transfer_statuses_.fill(0);
     }
 
 private:
     std::array<uint64_t, Slots> epochs_{};
     std::array<RunRecordRead, Slots> states_{};
+    std::array<int, Slots> transfer_statuses_{};
 };

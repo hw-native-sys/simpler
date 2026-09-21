@@ -33,8 +33,9 @@
  * So the fixture reaches it by replacing exactly three decisions, each of which
  * is one node E changes:
  *
- *   1. the predecessor's wait becomes its own two boundary events, without the
- *      `sync_stream_pair` that `wait_run_fence` still appends;
+ *   1. the predecessor's wait becomes its own two boundary events, with no
+ *      `sync_stream_pair` on any shape — `wait_run_fence` reaches that call on
+ *      every shape but a normal success;
  *   2. the predecessor's stream-pair ownership is retired on that boundary
  *      evidence alone, without the drain that normally accompanies it;
  *   3. the successor's launch permit is minted rather than claimed.
@@ -61,7 +62,7 @@ public:
         return runner.run_fence(pipeline_slot);
     }
 
-    /** The bounded whole-pair synchronize `wait_run_fence` still appends. */
+    /** The bounded whole-pair synchronize `wait_run_fence` falls back to. */
     static int sync_streams(DeviceRunnerBase &runner, rtStream_t aicpu, rtStream_t aicore) {
         return runner.sync_stream_pair(aicpu, aicore);
     }

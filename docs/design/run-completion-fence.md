@@ -81,13 +81,15 @@ That splits the drain path in two, and the split is deliberate:
 - **the device's verdict** — `sync_stream_pair`, because no other call produces
   one.
 
-The verdict read is the reason the normal drain path still touches the whole
-pair. It is not a hidden completion dependency — completion is already settled
-before it runs, and under the present one-launched-run-at-a-time invariant the
-streams are drained by then, so it returns immediately. But a change that
-queues a successor **cannot keep it**: it would wait for the successor's kernels
-to answer a question about the predecessor's. Replacing it is a prerequisite of
-opening admission, not an afterthought of it.
+The verdict read is why the drain path can still touch the whole pair. It is
+not a hidden completion dependency — completion is already settled before it
+runs. **On a normal success it no longer runs at all**: when both boundaries
+complete, the run's own record transfer reports nothing and that record says
+`Ok`, `wait_run_fence` returns on that evidence alone. Every other shape still
+reaches `sync_stream_pair`, and on those shapes a change that queues a
+successor makes it wait for the successor's kernels to answer a question about
+the predecessor's. That cost is bounded by the stream-sync timeout and is
+disclosed rather than solved.
 
 The candidate that does not require a synchronize is
 `aclrtSetExceptionInfoCallback` — the driver invokes it when a device exception
@@ -164,11 +166,10 @@ claiming a notice is not its own.
 
 ### What this leaves open
 
-Run-scoped completion is delivered; a run-scoped *normal drain* is not, because
-that verdict read still waits on the whole pair. Issue #2267 therefore stays
-open on this point, and replacing the read is a prerequisite of admitting a
-second launched run rather than a task that change can absorb. Concretely, that
-change owes:
+Run-scoped completion is delivered, and so is a run-scoped *normal* drain: a
+run whose boundaries completed, whose record transfer reported nothing and
+whose own record says `Ok` no longer waits on the pair. Issue #2267 stays open
+for the shapes that still do. Concretely, what remains owed:
 
 - ~~an error channel that reports a device exception without a stream
   synchronize~~ — **delivered**, recorded per device generation, and refusing
@@ -185,12 +186,14 @@ change owes:
   when no error is attributable to them**. `run_terminal_select` reports a
   header or participant failure on those paths too; what the missing claim and
   the unmarked mode withhold is the *success*, never the diagnosis. That is what
-  keeps "no record" from reading as success. What remains owed is
-  **authority** — the record is read diagnostically today, against the drain's
-  rc, and `report_terminal_disagreement` logs a disagreement rather than
-  overriding, so no consumer takes its outcome as the run's;
+  keeps "no record" from reading as success. **Authority is now partial**: the
+  fenced drain acts on the record to conclude a normal success, and every other
+  shape still answers from the stream synchronize, with
+  `report_terminal_disagreement` covering those shapes by logging rather than
+  overriding;
 - a decision on how a *successor's* fault is attributed, since a stream carries
-  its error stickily and the predecessor's drain would otherwise report it.
+  its error stickily and a predecessor's drain that falls back to the
+  synchronize would otherwise report it.
 
 `poll_execution` needs none of this. It reports completion from the boundaries
 and additionally reads the streams' *sticky* error state, which is exactly what
@@ -213,7 +216,7 @@ before the predecessor's result is read:
 | Arm | Successor's boundary, before → after the read | Successor's drain afterwards |
 | --- | --------------------------------------------- | ---------------------------- |
 | read the published record directly | Pending → **Pending** | 476 µs |
-| `sync_stream_pair` first (what `wait_run_fence` still appends) | Pending → **Complete** | 17 µs |
+| `sync_stream_pair` first (the fallback shapes' path) | Pending → **Complete** | 17 µs |
 
 **The Pending reading is the whole proof, and it is one-sided.** A read that
 waited for the successor could not have produced it, so an observed Pending
@@ -237,9 +240,10 @@ So:
 
 The rule combining the two channels into one outcome is
 `decide_run_execution` (`host/run_outcome_decision.h`), which is pure and covered
-without a device. Wiring it into the drain, and removing the synchronize, is
-still #2267's remaining work — this establishes that the replacement is sound and
-what it saves, not that it has landed.
+without a device. It is now what the fenced drain acts on for a normal success.
+These numbers are what that path was expected to save; they were taken on the
+fixture, not on the production drain, and nothing here measures the production
+change.
 
 ## Ownership: the run owns the facts, the runner owns the handles
 
@@ -332,10 +336,10 @@ queued, and no wait may point back at a successor, or the pair deadlocks.
 
 `RunCompletionFence` carries the reference protocol this needs today, with no
 production caller — inserting the waits and admitting a second launched run
-belong to the change that opens admission. That change also owes the verdict
-channel described above: with a successor queued, the `sync_stream_pair` at the
-end of `wait_run_fence` stops being free and has to be replaced before the
-boundaries can stand alone.
+belong to the change that opens admission. The normal success path no longer
+synchronizes, but the fallback shapes still do, so that change also owes a
+decision on what a fallback synchronize means once a successor is queued
+behind the run it is draining.
 
 1. `reserve_wait_reference(identity, boundary, waiter)` before queueing the
    wait. Reserving first is what makes the failure path decidable.

@@ -574,8 +574,17 @@ public:
      * Leaves the host copy empty when there is no region or the copy fails; a
      * failed copy is recorded as such, so it reads as undecided rather than as
      * an absent record, and a slot with no region records no attempt at all.
+     *
+     * Returns the status the transfer itself reported for this run: zero when
+     * the bytes landed, when there was no region, and when no read is owned
+     * here. A non-zero answer is an error this host thread has already
+     * observed from the SDK, and the same value is returned by every later
+     * call for the same run — so a caller may act on it without a
+     * deduplicated call looking like a transfer that succeeded. Pair it with
+     * `device_run_result_read_status` rather than reading zero as proof a
+     * transfer happened.
      */
-    void read_device_run_result(uint32_t pipeline_slot, uint64_t run_epoch);
+    int read_device_run_result(uint32_t pipeline_slot, uint64_t run_epoch);
 
     /**
      * What this slot's cached region says about the run whose epoch is

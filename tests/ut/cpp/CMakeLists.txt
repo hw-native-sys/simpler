@@ -1331,6 +1331,20 @@ target_link_libraries(test_run_shadow_consumer_evidence PRIVATE ${GTEST_MAIN_LIB
 add_test(NAME test_run_shadow_consumer_evidence COMMAND test_run_shadow_consumer_evidence)
 set_tests_properties(test_run_shadow_consumer_evidence PROPERTIES LABELS "no_hardware")
 
+# What a fenced drain does with that evidence: which shapes return on the run's
+# own record and which keep the whole-stream synchronize, and what happens to a
+# status the record transfer itself reported.
+add_executable(test_run_drain_decision common/test_run_drain_decision.cpp)
+target_include_directories(test_run_drain_decision PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+)
+target_link_libraries(test_run_drain_decision PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_run_drain_decision COMMAND test_run_drain_decision)
+set_tests_properties(test_run_drain_decision PROPERTIES LABELS "no_hardware")
+
 function(add_pmu_collector_test name platform)
     add_executable(${name}
         common/test_pmu_collector.cpp
