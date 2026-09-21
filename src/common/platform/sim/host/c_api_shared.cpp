@@ -581,17 +581,11 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
             }
         });
 
-        std::vector<std::pair<int, uint64_t>> kernel_addrs;
-        kernel_addrs.reserve(artifacts.kernel_addrs.size());
-        for (const ChildKernelAddr &c : artifacts.kernel_addrs) {
-            kernel_addrs.emplace_back(c.func_id, c.device_addr);
-        }
-
         bool needs_aicpu_register = false;
         if (artifacts.host_dlopen_handle != nullptr) {
             rc = runner->record_host_orch_callable(
                 callable_id, artifacts.chip_buffer_hash, artifacts.host_dlopen_handle, artifacts.host_orch_func_ptr,
-                std::move(kernel_addrs), std::move(artifacts.signature)
+                std::move(artifacts.signature)
             );
             if (rc == 0) {
                 host_dlopen_guard.dismiss();
@@ -601,7 +595,7 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
             rc = runner->record_device_orch_callable(
                 callable_id, artifacts.chip_buffer_hash, artifacts.chip_buffer_dev, artifacts.orch_so_data,
                 artifacts.orch_so_size, artifacts.func_name.c_str(), artifacts.config_name.c_str(),
-                std::move(kernel_addrs), std::move(artifacts.signature)
+                std::move(artifacts.signature)
             );
             if (rc == 0) {
                 chip_buffer_guard.dismiss();

@@ -1214,20 +1214,6 @@ bool create_scheduler_state(
         task_controls[task_id].state = static_cast<int64_t>(SchedulerTaskState::DONE);
         task_controls[task_id].wake_list_head = SCHEDULER_WAKE_LIST_CLOSED;
     }
-    static_assert(
-        SCHEDULER_CALLABLE_CAPACITY == RUNTIME_MAX_FUNC_ID,
-        "scheduler state callable table must cover the runtime table"
-    );
-    auto *callable_addresses = scheduler_state_at<uint64_t>(host_base, layout.callable_addresses_offset);
-    const bool cpu_sim = std::strcmp(get_platform(), "a5sim") == 0;
-    for (uint32_t func_id = 0; func_id < SCHEDULER_CALLABLE_CAPACITY; ++func_id) {
-        const uint64_t callable_address = runtime->get_function_bin_addr(static_cast<int32_t>(func_id));
-        callable_addresses[func_id] =
-            callable_address == 0 ?
-                0 :
-                (cpu_sim ? reinterpret_cast<const CoreCallable *>(callable_address)->resolved_addr() :
-                           callable_address + CoreCallable::binary_data_offset());
-    }
     auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(host_base, layout.task_metadata_offset);
     std::copy(task_metadata.begin(), task_metadata.end(), metadata);
 
@@ -1271,7 +1257,12 @@ bool create_scheduler_state(
         context.ready_directory_offset = layout.ready_directory_offset;
         context.worker_contexts_offset = layout.worker_contexts_offset;
         context.dispatch_slots_offset = layout.dispatch_slots_offset;
-        context.callable_addresses_offset = layout.callable_addresses_offset;
+        // The absolute address of the callable's registration-owned entry
+        // table, with its own length: nothing in this per-bind allocation holds
+        // that table, so it is named by address rather than by offset from the
+        // base above.
+        context.callable_addresses_address = runtime->callable_entry_table_addr();
+        context.callable_addresses_count = runtime->callable_table_len();
         context.runtime_worker_count = static_cast<uint64_t>(runtime->get_worker_count());
         context.bootstrap_done = 0;
         context.gang_coordinator_offset = layout.gang_coordinator_offset;
@@ -1801,6 +1792,13 @@ extern "C" int register_callable_impl(const ChipCallable *callable, const HostAp
     LOG_INFO("Orchestration SO: %zu bytes uploaded", orch_so_size);
     return 0;
 }
+
+/**
+ * The A5 host_build_graph AICore scheduler dispatches from resolved kernel-entry
+ * addresses it reads out of the registration-owned entry table, so registration
+ * builds that view alongside the object one.
+ */
+extern "C" bool runtime_uses_callable_entry_table_impl() { return true; }
 
 /**
  * Per-run binding: build device-side argument storage (tensor copy-out, GM

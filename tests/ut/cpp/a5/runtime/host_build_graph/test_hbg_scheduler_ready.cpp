@@ -29,6 +29,7 @@ namespace {
 
 using scheduler_test::FixtureStorage;
 using scheduler_test::GraphBuffer;
+using scheduler_test::kFixtureCallableCount;
 using scheduler_test::SchedulerStateBuffer;
 
 TEST(SchedulerActivityBuffer, IsAllocatedOnlyWhenRequestedAndNeverWraps) {
@@ -621,7 +622,7 @@ TEST(SchedulerDispatch, RejectsKernelIdBeforeCallableTableAccess) {
     GraphBuffer graph(1);
     graph.executable(0, 0);
     storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIC);
-    storage.metadata[0].kernel_ids[0] = static_cast<uint16_t>(SCHEDULER_CALLABLE_CAPACITY);
+    storage.metadata[0].kernel_ids[0] = static_cast<uint16_t>(kFixtureCallableCount);
     SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
     SchedulerReadyClaim ready_claim{};
     ready_claim.task_id = 0;
@@ -727,14 +728,55 @@ TEST(SchedulerDispatch, WrapsGenerationAndRejectsZeroCallable) {
     EXPECT_EQ(storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_INVALID_CALLABLE));
 }
 
+// The bound is the count this worker context publishes, not the capacity the
+// scheduler state used to reserve. Both ids below are mapped to a non-zero
+// address, so a zero entry cannot be what refuses the second one: only the
+// length can. An implementation that kept the former fixed 1024 bound accepts
+// it and fails here.
+TEST(SchedulerDispatch, RejectsAKernelIdPastThePublishedCallableCount) {
+    FixtureStorage storage(2, 1);
+    GraphBuffer graph(2);
+    graph.executable(0, 0);
+    graph.executable(1, 0);
+    storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIC);
+    storage.contexts[0].callable_addresses_count = 2;
+    storage.callable_addresses[1] = UINT64_C(0x1000);
+    storage.callable_addresses[2] = UINT64_C(0x3000);
+    storage.metadata[0].kernel_ids[0] = 1;
+    storage.metadata[1].kernel_ids[0] = 2;
+
+    SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
+    SchedulerReadyClaim ready_claim{};
+    ready_claim.task_id = 0;
+    ASSERT_TRUE(scheduler_fill_dispatch_slot(
+        graph.graph(), storage.scheduler_state->base(),
+        storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
+        ready_claim, 0
+    ));
+    auto *payload = scheduler_state_at<DispatchPayload>(
+        storage.scheduler_state->base(), storage.contexts[0].dispatch_payload_offset
+    );
+    EXPECT_EQ(payload->function_bin_addr, UINT64_C(0x1000)) << "the last id inside the count still dispatches";
+
+    slot_claim.slot_index = 1;
+    ready_claim.task_id = 1;
+    EXPECT_FALSE(scheduler_fill_dispatch_slot(
+        graph.graph(), storage.scheduler_state->base(),
+        storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
+        ready_claim, 0
+    ));
+    EXPECT_EQ(storage.run_control->scheduler_error, static_cast<uint64_t>(SchedulerGraphResult::INVALID_CALLABLE));
+    EXPECT_EQ(storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_INVALID_CALLABLE));
+}
+
 TEST(SchedulerDispatch, AcceptsLastCallableAndInlineSentinel) {
     FixtureStorage storage(2, 1);
     GraphBuffer graph(2);
     graph.executable(0, 0);
     graph.executable(1, 0);
     storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIC);
-    storage.metadata[0].kernel_ids[0] = static_cast<uint16_t>(SCHEDULER_CALLABLE_CAPACITY - 1);
-    storage.callable_addresses[SCHEDULER_CALLABLE_CAPACITY - 1] = UINT64_C(0x2000);
+    storage.metadata[0].kernel_ids[0] = static_cast<uint16_t>(kFixtureCallableCount - 1);
+    storage.callable_addresses[kFixtureCallableCount - 1] = UINT64_C(0x2000);
     SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
     SchedulerReadyClaim ready_claim{};
     ready_claim.task_id = 0;

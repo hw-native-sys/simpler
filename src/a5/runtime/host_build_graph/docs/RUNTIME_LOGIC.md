@@ -415,7 +415,7 @@ READY with the same generation until the local Executor claims it, so the ready
 token is reconstructed from the slot. Completion generation validation still
 prevents stale notifications from freeing or refilling a pending slot.
 
-The local configuration occupies 96 bytes and the complete local state 336 bytes
+The local configuration occupies 104 bytes and the complete local state 344 bytes
 under the 64-bit ABI. Profiling storage is present even when profiling is disabled.
 These sizes exclude other function locals and compiler spills.
 

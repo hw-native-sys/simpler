@@ -18,7 +18,7 @@
  * - Execution parameters (block_dim, aicpu_thread_num)
  * - simpler::tmr::Tensor pair management for host-device memory tracking
  * - Device orchestration state (gm_sm_ptr_, orch_args_)
- * - Function address mapping (func_id_to_addr_)
+ * - The reference to the active callable's registration-owned function tables
  *
  * Task dispatch uses a per-core DispatchPayload written by the scheduler.
  * At dispatch time, build_payload() copies tensor pointers and scalars from
@@ -193,8 +193,15 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // src/common/host_build_graph/runtime.h for rationale.
     int32_t aicpu_launch_count;
 
-    // kernel binary resolution: kernel_id -> GM function_bin_addr mapping
-    uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
+    // Reference to the active callable's registration-owned func_id ->
+    // CoreCallable object address table: the device address of entry 0 and the
+    // number of entries the table holds. The table itself lives in that
+    // callable's retained registration block and is written by the single
+    // registration copy that also delivers the code those addresses name, so a
+    // run publishes the reference and never the contents. Both are zero until a
+    // bind names a callable; a func_id at or past the length is unmapped.
+    uint64_t callable_table_addr_;
+    uint32_t callable_table_len_;
 
     // Serial orchestrator -> scheduler start control.
     // When true, scheduler threads wait until orchestration has fully built the
@@ -309,24 +316,43 @@ public:
     void set_active_callable_id(int32_t callable_id);
     int32_t get_active_callable_id() const;
 
-    uint64_t get_function_bin_addr(int func_id) const;
     /**
-     * Replay a previously-uploaded kernel address onto a fresh Runtime.
-     * Used by DeviceRunner::bind_callable_to_runtime to rebind prepared
-     * kernel binaries onto the runtime before each run.
+     * The active callable's CoreCallable object address for `func_id`, read
+     * through the host view of the registration-owned table.
+     *
+     * Returns 0 for a func_id at or past the table's length, and for every
+     * func_id while no callable is bound. Reads host memory: the device address
+     * the descriptor carries is never dereferenced here.
      */
-    void replay_function_bin_addr(int func_id, uint64_t addr);
+    uint64_t get_function_bin_addr(int func_id) const;
 
     /**
-     * Drop every func_id -> CoreCallable address mapping.
+     * Bind this run to one registration-owned function-table pair.
      *
-     * Each mapping points into one callable's retained ChipCallable buffer,
-     * which unregistering that callable frees. `bind_callable_to_runtime` calls
-     * this before replaying the active callable's addresses so no entry outlives
-     * the buffer it points into: the scheduler dereferences these addresses and
-     * the AICore calls what it finds there.
+     * `host_view` addresses `len` object-address entries the registration owns
+     * for as long as the callable stays registered; `object_table_addr` is that
+     * same table's device address, and `entry_table_addr` names its
+     * resolved-entry sibling — zero on a runtime whose device scheduler reads
+     * no such view.
      */
-    void clear_function_bin_addrs();
+    void
+    set_callable_tables(const uint64_t *host_view, uint64_t object_table_addr, uint64_t entry_table_addr, uint32_t len);
+
+    /**
+     * Drop the function-table reference.
+     *
+     * A bind installs the reference, and a bind that fails afterwards must not
+     * leave the previous callable's standing: unregistering that callable frees
+     * the block these addresses point into, the scheduler dereferences them,
+     * and the AICore calls what it finds there.
+     */
+    void clear_callable_tables();
+
+    /** Device address of the bound resolved-entry table, 0 when none is bound. */
+    uint64_t callable_entry_table_addr() const;
+
+    /** Entries in the bound function tables, 0 when none is bound. */
+    uint32_t callable_table_len() const;
 
     // =========================================================================
     // Host-only state (not copied to device)
@@ -337,6 +363,14 @@ public:
     // copy_in_run_inputs_impl and copy_back_run_outputs_impl, and released by
     // release_run_bindings_impl. Host-only (after `dev`): never uploaded.
     std::vector<TensorLease> tensor_leases_;
+
+    // Host view of the active callable's registration-owned object-address
+    // table, borrowed for as long as that callable stays registered, plus the
+    // device address of its resolved-entry sibling. Host-only because the first
+    // is a host pointer, and because the host lookup must not reach for the
+    // device address `dev` carries.
+    const uint64_t *callable_table_host_{nullptr};
+    uint64_t callable_entry_table_addr_{0};
 
     // The launch shape's AIC/AIV rule, one entry per active worker. Host state
     // with host readers only: the DFX swimlane collector and the sim's per-core

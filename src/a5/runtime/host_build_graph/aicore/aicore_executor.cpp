@@ -30,8 +30,6 @@ constexpr uint32_t kInitialBackoffIterations = 8;
 constexpr uint32_t kMaximumBackoffIterations = 128;
 constexpr uint32_t kSchedulerErrorPollInterval = 64;
 
-static_assert(SCHEDULER_CALLABLE_CAPACITY == RUNTIME_MAX_FUNC_ID, "AICore ready scheduler layout mismatch");
-
 struct SchedulerWorkerStats {
     uint64_t bootstrap_task_count{0};
     SchedulerReadyStats ready{};

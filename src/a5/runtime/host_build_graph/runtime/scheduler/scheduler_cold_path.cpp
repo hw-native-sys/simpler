@@ -978,7 +978,8 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
         }
     }
 
-    func_id_to_addr_ = runtime->dev.func_id_to_addr_;
+    func_id_to_addr_ = reinterpret_cast<uint64_t *>(runtime->dev.callable_table_addr_);
+    func_id_to_addr_count_ = runtime->dev.callable_table_len_;
 
     return 0;
 }
@@ -1036,6 +1037,7 @@ void SchedulerContext::deinit() {
     sched_ = nullptr;
     rt_ = nullptr;
     func_id_to_addr_ = nullptr;
+    func_id_to_addr_count_ = 0;
 }
 
 void SchedulerContext::bind_runtime(RuntimeContext *rt) {

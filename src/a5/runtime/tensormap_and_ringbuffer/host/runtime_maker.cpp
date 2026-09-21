@@ -774,6 +774,13 @@ static bool build_and_cache_prebuilt_arena(
 }
 
 /**
+ * This runtime resolves a kernel entry from the CoreCallable object the
+ * dispatch path is handed, so its registration blocks carry the object table
+ * alone and no resolved-entry view is built for them.
+ */
+extern "C" bool runtime_uses_callable_entry_table_impl() { return false; }
+
+/**
  * Per-run binding: build device-side argument storage (tensor copy-out, GM
  * heap, shared memory) and publish it to the runtime. Assumes the
  * callable-side state (kernel binaries, orch SO bytes, func/config names)

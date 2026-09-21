@@ -9,12 +9,13 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Platform-agnostic ChipCallable layout / content-hash helpers used by
- * DeviceRunner::upload_chip_callable_buffer on every platform variant.
+ * Platform-agnostic ChipCallable layout / content-hash / function-table helpers
+ * used by DeviceRunner::upload_chip_callable_buffer on every platform variant.
  *
- * The byte-size math (mirroring make_callable<>()'s layout) and FNV-1a dedup
- * hash are identical on onboard and sim. Only the H2D mechanism diverges:
- * onboard rtMemcpy's the scratch into device GM after rewriting each child's
+ * The byte-size math (mirroring make_callable<>()'s layout), the FNV-1a dedup
+ * hash, and the derivation of the callable's two func_id-indexed tables are
+ * identical on onboard and sim. Only the H2D mechanism diverges: onboard
+ * rtMemcpy's the scratch into device GM after rewriting each child's
  * resolved_addr_ to a device offset; sim instead dlopen's each child kernel
  * and writes the resulting function pointer into resolved_addr_. The
  * device-offset patch is exposed here so onboard can share it; the dlopen
@@ -65,6 +66,65 @@ inline ChipCallableLayout compute_chip_callable_layout(const ChipCallable *calla
     const size_t total_size = kHeaderSize + storage_used;
     const uint64_t hash = simpler::common::utils::fnv1a_64(reinterpret_cast<const uint8_t *>(callable), total_size);
     return ChipCallableLayout{kHeaderSize, total_size, hash, aicore_image_hash};
+}
+
+/**
+ * Length of the dense func_id-indexed table `callable`'s children need: one
+ * past their largest func_id, or 0 for a callable with no children.
+ *
+ * `max_func_id` is the exclusive bound the consuming runtime's tables can
+ * address. Returns false without writing `*length` when a child names a
+ * func_id outside [0, max_func_id), reporting it in `*bad_func_id` so the
+ * caller can refuse the registration before it allocates anything.
+ */
+inline bool
+chip_callable_table_length(const ChipCallable *callable, uint32_t max_func_id, uint32_t *length, int32_t *bad_func_id) {
+    uint32_t longest = 0;
+    for (int32_t i = 0; i < callable->child_count(); ++i) {
+        const int32_t func_id = callable->child_func_id(i);
+        if (func_id < 0 || static_cast<uint32_t>(func_id) >= max_func_id) {
+            *bad_func_id = func_id;
+            return false;
+        }
+        const uint32_t needed = static_cast<uint32_t>(func_id) + 1;
+        if (needed > longest) longest = needed;
+    }
+    *length = longest;
+    return true;
+}
+
+/**
+ * Fill the two func_id-indexed views of `callable` from `scratch`, a byte copy
+ * of it whose children's resolved_addr_ already hold the address the dispatch
+ * path will use.
+ *
+ * `object_base` is the address that scratch becomes readable at — a device base
+ * onboard, the scratch's own host address in sim — so `object[func_id]` is
+ * where that child's CoreCallable lands there. `entry[func_id]` takes the
+ * child's resolved_addr_ verbatim, which is that same object plus
+ * CoreCallable::binary_data_offset() onboard and the dlopen'd host function
+ * pointer in sim; one formula therefore serves both platforms. Entries no child
+ * claims stay 0, which is what an unmapped func_id must read.
+ *
+ * Both spans hold `length` entries, as chip_callable_table_length() computed
+ * for this same callable. `entry` may be null on a runtime whose consumers
+ * resolve the entry out of the object themselves.
+ */
+inline void chip_callable_fill_tables(
+    const ChipCallable *callable, const ChipCallableLayout &layout, const uint8_t *scratch, uint64_t object_base,
+    uint32_t length, uint64_t *object, uint64_t *entry
+) {
+    for (uint32_t i = 0; i < length; ++i) {
+        object[i] = 0;
+        if (entry != nullptr) entry[i] = 0;
+    }
+    for (int32_t i = 0; i < callable->child_count(); ++i) {
+        const uint32_t off = callable->child_offset(i);
+        const auto *child = reinterpret_cast<const CoreCallable *>(scratch + layout.header_size + off);
+        const uint32_t func_id = static_cast<uint32_t>(callable->child_func_id(i));
+        object[func_id] = object_base + layout.header_size + off;
+        if (entry != nullptr) entry[func_id] = child->resolved_addr();
+    }
 }
 
 /**

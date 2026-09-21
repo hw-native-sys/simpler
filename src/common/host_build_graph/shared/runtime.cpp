@@ -19,8 +19,6 @@
 
 #include <cstring>
 
-#include "common/unified_log.h"
-
 // =============================================================================
 // Constructor
 // =============================================================================
@@ -42,14 +40,14 @@ Runtime::Runtime() {
     dev.prebuilt_arena_base_ = nullptr;
     dev.prebuilt_runtime_offset_ = 0;
 
+    dev.callable_table_addr_ = 0;
+    dev.callable_table_len_ = 0;
+
     host_.orch_args_storage_.clear();
     host_.active_callable_id_ = -1;
     host_.pending_publication_ = {};
-
-    // Initialize function address mapping
-    for (int i = 0; i < RUNTIME_MAX_FUNC_ID; i++) {
-        dev.func_id_to_addr_[i] = 0;
-    }
+    host_.callable_table_host_ = nullptr;
+    host_.callable_entry_table_addr_ = 0;
 }
 
 // =============================================================================
@@ -87,23 +85,36 @@ void Runtime::set_active_callable_id(int32_t callable_id) { host_.active_callabl
 int32_t Runtime::get_active_callable_id() const { return host_.active_callable_id_; }
 
 uint64_t Runtime::get_function_bin_addr(int func_id) const {
-    if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return 0;
-    return dev.func_id_to_addr_[func_id];
+    if (host_.callable_table_host_ == nullptr || func_id < 0 ||
+        static_cast<uint32_t>(func_id) >= dev.callable_table_len_) {
+        return 0;
+    }
+    return host_.callable_table_host_[func_id];
 }
 
-void Runtime::replay_function_bin_addr(int func_id, uint64_t addr) {
-    if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
-        LOG_ERROR("[Runtime] func_id=%d is out of range [0, %d)", func_id, RUNTIME_MAX_FUNC_ID);
+void Runtime::set_callable_tables(
+    const uint64_t *host_view, uint64_t object_table_addr, uint64_t entry_table_addr, uint32_t len
+) {
+    if (host_view == nullptr || object_table_addr == 0 || len == 0) {
+        clear_callable_tables();
         return;
     }
-    dev.func_id_to_addr_[func_id] = addr;
+    host_.callable_table_host_ = host_view;
+    host_.callable_entry_table_addr_ = entry_table_addr;
+    dev.callable_table_addr_ = object_table_addr;
+    dev.callable_table_len_ = len;
 }
 
-void Runtime::clear_function_bin_addrs() {
-    for (int i = 0; i < RUNTIME_MAX_FUNC_ID; i++) {
-        dev.func_id_to_addr_[i] = 0;
-    }
+void Runtime::clear_callable_tables() {
+    host_.callable_table_host_ = nullptr;
+    host_.callable_entry_table_addr_ = 0;
+    dev.callable_table_addr_ = 0;
+    dev.callable_table_len_ = 0;
 }
+
+uint64_t Runtime::callable_entry_table_addr() const { return host_.callable_entry_table_addr_; }
+
+uint32_t Runtime::callable_table_len() const { return dev.callable_table_len_; }
 
 // A steady-state host_build_graph run uploads the device descriptor before the
 // handshake region: neither that region nor the gate tail carries a host value

@@ -22,4 +22,9 @@ endmacro()
 task_interface_case(test_chip_callable_upload_immutable.cpp
     INCLUDES ${SIMPLER_SRC}/common)
 
+# Same reason: chip_callable_layout.h reaches utils/fnv1a_64.h for the dedup
+# hash the function-table derivation is keyed by.
+task_interface_case(test_callable_function_tables.cpp
+    INCLUDES ${SIMPLER_SRC}/common)
+
 simpler_ut_glob_cases(task_interface_case)

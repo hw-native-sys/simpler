@@ -241,6 +241,70 @@ hbg_case(test_runtime_workers_publication.cpp
     SOURCES ${KERNEL_ARGS_HELPER_TEST_SOURCES} ${HBG_COMMON_SHARED_DIR}/runtime.cpp
     INCLUDES_BEFORE ${CMAKE_SOURCE_DIR}/support/kernel_args ${KERNEL_ARGS_INCLUDES})
 
+# A loadable stand-in for a compiled AICore child kernel. The sim
+# registration writes each child's binary to a temp file, dlopens it and
+# resolves kernel_entry, so a case wanting that path to succeed needs bytes
+# that really are a shared object exporting that symbol. MODULE, because
+# nothing links it — the case reads the file and hands the registration its
+# contents.
+add_library(test_fake_child_kernel MODULE
+    ${CMAKE_CURRENT_SOURCE_DIR}/support/fake_child_kernel.cpp)
+set_target_properties(test_fake_child_kernel PROPERTIES PREFIX "" POSITION_INDEPENDENT_CODE ON)
+
+# Registration ownership and the per-run function-table reference, driven
+# through the real sim runner pool: its upload, record, bind, unregister and
+# release are production code here. Sim is the variant whose registration needs
+# no SDK — its "upload" is a host scratch plus a real dlopen of each child — so
+# this reaches src/common/platform/sim and the arch's own collectors, and takes
+# the hbg Runtime because a bind installs the reference into that descriptor.
+set(SIM_CALLABLE_POOL_SOURCES
+    ${SIMPLER_COMMON_PLATFORM_DIR}/sim/host/device_runner_base.cpp
+    ${SIMPLER_COMMON_PLATFORM_DIR}/sim/host/memory_allocator.cpp
+    ${SIMPLER_COMMON_PLATFORM_DIR}/sim/sim_context/cpu_sim_context.cpp
+    ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_collector.cpp
+    ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/chip_swimlane_collector.cpp
+    ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/scope_stats_collector.cpp
+    ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/host_phase_records.cpp
+    ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/platform_compile_info.cpp
+    ${SIMPLER_SRC}/@arch@/platform/shared/host/pmu_collector.cpp
+    ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp
+    ${SIMPLER_SRC}/common/platform_comm/comm_sim.cpp
+    # support/unified_log_stubs.cpp already defines unified_log_*; only
+    # HostLogger is missing, so this takes host_log.cpp for that alone.
+    ${SIMPLER_SRC}/common/log/host_log.cpp)
+set(SIM_CALLABLE_POOL_INCLUDES
+    ${SIMPLER_COMMON_PLATFORM_DIR}/sim/host
+    ${SIMPLER_COMMON_PLATFORM_DIR}/sim/sim_context
+    ${SIMPLER_SRC}/common/worker)
+
+hbg_case(test_sim_callable_pool.cpp
+    SOURCES  ${SIM_CALLABLE_POOL_SOURCES} ${HBG_COMMON_SHARED_DIR}/runtime.cpp
+    INCLUDES ${SIM_CALLABLE_POOL_INCLUDES}
+    # chip_swimlane_collector.cpp refuses to compile without the runtime name,
+    # and this case's runtime is fixed by the macro it is declared with.
+    DEFINES
+        SIMPLER_RUNTIME_NAME="host_build_graph"
+        FAKE_KERNEL_SO_PATH="$<TARGET_FILE:test_fake_child_kernel>"
+    LINK    ${CMAKE_DL_LIBS}
+    DEPENDS test_fake_child_kernel)
+
+# The same case against the other runtime: the registration-owned tables are a
+# contract all four (arch, runtime) pairs carry, and the runner resolves its
+# bare "runtime.h" to whichever Runtime it was built for. Declared twice rather
+# than once with @runtime@ because the two runtimes keep their shared runtime.cpp
+# at different levels of src, so there is no single path template — the same
+# reason test_runtime_workers_publication above is a pair.
+tmr_case(test_sim_callable_pool.cpp
+    SOURCES
+        ${SIM_CALLABLE_POOL_SOURCES}
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
+    INCLUDES ${SIM_CALLABLE_POOL_INCLUDES}
+    DEFINES
+        SIMPLER_RUNTIME_NAME="tensormap_and_ringbuffer"
+        FAKE_KERNEL_SO_PATH="$<TARGET_FILE:test_fake_child_kernel>"
+    LINK    ${CMAKE_DL_LIBS}
+    DEPENDS test_fake_child_kernel)
+
 # One source, three builds differing only in how capture is switched on: the
 # compile-time flag, the environment variable, and both. A separate process
 # verifies the private pre-bind fallback before another test target binds its

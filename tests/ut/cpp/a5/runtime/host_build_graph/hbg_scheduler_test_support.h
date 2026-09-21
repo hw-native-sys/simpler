@@ -121,6 +121,11 @@ private:
 
 using GraphBuffer = BasicGraphBuffer<8192>;
 
+// Entries the fixture's own callable table can address. Published as each
+// worker context's count, so a case that wants the length to be the bound
+// overrides that context rather than resizing this.
+inline constexpr uint64_t kFixtureCallableCount = 1024;
+
 struct FixtureStorage {
     explicit FixtureStorage(uint64_t task_count, uint64_t workers = 2) :
         test_contexts(workers),
@@ -144,7 +149,8 @@ struct FixtureStorage {
             context.ready_directory_offset = layout.ready_directory_offset;
             context.trace_cells_offset = layout.trace_cells_offset;
             context.worker_contexts_offset = layout.worker_contexts_offset;
-            context.callable_addresses_offset = layout.callable_addresses_offset;
+            context.callable_addresses_address = reinterpret_cast<uint64_t>(callable_addresses);
+            context.callable_addresses_count = kFixtureCallableCount;
             context.gang_coordinator_offset = layout.gang_coordinator_offset;
             context.gang_cohorts_offset = layout.gang_cohorts_offset;
             context.gang_participants_offset = layout.gang_participants_offset;
@@ -157,7 +163,6 @@ struct FixtureStorage {
             context.scheduler_index = worker;
         }
         metadata = scheduler_state_at<SchedulerTaskMetadata>(scheduler_state->base(), layout.task_metadata_offset);
-        callable_addresses = scheduler_state_at<uint64_t>(scheduler_state->base(), layout.callable_addresses_offset);
         callable_addresses[1] = UINT64_C(0x1000);
         for (uint64_t task = 0; task < task_count; ++task) {
             metadata[task].kernel_ids[0] = 1;
@@ -187,7 +192,8 @@ struct FixtureStorage {
         config.trace_cells_offset = context->trace_cells_offset;
         config.activity_buffers_offset = context->activity_buffers_offset;
         config.worker_contexts_offset = context->worker_contexts_offset;
-        config.callable_addresses_offset = context->callable_addresses_offset;
+        config.callable_addresses_address = context->callable_addresses_address;
+        config.callable_addresses_count = static_cast<uint32_t>(context->callable_addresses_count);
         config.gang_coordinator_offset = context->gang_coordinator_offset;
         config.runtime_worker_count = context->runtime_worker_count;
         config.scheduler_index = context->scheduler_index;
@@ -210,7 +216,14 @@ struct FixtureStorage {
     SchedulerRunControl *run_control{nullptr};
     SchedulerWorkerContext *contexts{nullptr};
     SchedulerTaskMetadata *metadata{nullptr};
-    uint64_t *callable_addresses{nullptr};
+    // The callable's registration-owned entry table. It is not part of the
+    // scheduler state, so the fixture owns one and hands every worker context
+    // its address, exactly as a bind hands over the address of the block a
+    // registration retained.
+    std::unique_ptr<std::array<uint64_t, kFixtureCallableCount>> callable_table{
+        std::make_unique<std::array<uint64_t, kFixtureCallableCount>>()
+    };
+    uint64_t *callable_addresses{callable_table->data()};
     std::vector<SchedulerLocalState> local_states;
     SchedulerLocalState *owner_states{local_states.data()};
     SchedulerLocalState scheduler_local_state{};

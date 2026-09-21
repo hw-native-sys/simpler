@@ -631,7 +631,6 @@ inline uint64_t sync_start_drain_ack_subtree_token(uint64_t attempt) {
 inline constexpr uint64_t SCHEDULER_STATE_ALIGNMENT = 128;
 inline constexpr uint64_t SCHEDULER_WORKER_CAPACITY = 108;
 inline constexpr uint32_t SCHEDULER_PENDING_SLOT_COUNT = 2;
-inline constexpr uint32_t SCHEDULER_CALLABLE_CAPACITY = 1024;
 inline constexpr uint32_t SCHEDULER_CORE_TYPE_COUNT = 2;
 inline constexpr uint32_t SCHEDULER_CLUSTER_CAPACITY = SCHEDULER_WORKER_CAPACITY / 3;
 inline constexpr uint32_t SCHEDULER_CAPACITY = SCHEDULER_CLUSTER_CAPACITY;
@@ -1064,7 +1063,12 @@ struct alignas(128) SchedulerWorkerContext {
     volatile uint64_t activity_buffers_offset;
     volatile uint64_t worker_contexts_offset;
     volatile uint64_t dispatch_slots_offset;
-    volatile uint64_t callable_addresses_offset;
+    // The active callable's registration-owned kernel-entry table: an absolute
+    // device address, not a scheduler-state offset, because the table lives in
+    // that callable's registration block and outlives every run bound to it.
+    // `callable_addresses_count` is the table's own length, and the only
+    // bound available here: the scheduler state reserves no callable array.
+    volatile uint64_t callable_addresses_address;
     volatile uint64_t runtime_worker_count;
     volatile uint64_t bootstrap_done;
     uint64_t bootstrap_scan_end_cycles;
@@ -1072,7 +1076,8 @@ struct alignas(128) SchedulerWorkerContext {
     uint64_t target_bootstrap_end_cycles;
     uint64_t bootstrap_target_aic_cycles;
     uint64_t bootstrap_target_aiv_cycles;
-    uint64_t bootstrap_timing_reserved[2];
+    volatile uint64_t callable_addresses_count;
+    uint64_t bootstrap_timing_reserved;
 
     volatile uint64_t gang_coordinator_offset;
     volatile uint64_t gang_cohorts_offset;
@@ -1377,7 +1382,6 @@ inline bool scheduler_plan_layout(
         !SCHEDULER_RESERVE_ARRAY(
             SCHEDULER_WORKER_CAPACITY * SCHEDULER_PENDING_SLOT_COUNT, SchedulerDispatchSlot, dispatch_slots_offset
         ) ||
-        !SCHEDULER_RESERVE_ARRAY(SCHEDULER_CALLABLE_CAPACITY, uint64_t, callable_addresses_offset) ||
         !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskMetadata, task_metadata_offset) ||
         !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskControl, task_controls_offset) ||
         !SCHEDULER_RESERVE_ARRAY(SCHEDULER_WORKER_CAPACITY, SchedulerCompletionInbox, completion_inboxes_offset) ||

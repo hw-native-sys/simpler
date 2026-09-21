@@ -224,7 +224,13 @@ private:
     std::atomic<int32_t> completed_tasks_{0};
     int32_t total_tasks_{0};
     std::atomic<bool> completed_{false};
+    // The active callable's registration-owned object-address table and the
+    // number of entries it holds, both bound from the descriptor in the cold
+    // path. The table is in the callable's registration block, not in the
+    // descriptor, so the length is the only bound available here: an index past
+    // it is unmapped rather than in-range-and-zero.
     uint64_t *func_id_to_addr_{nullptr};
+    uint32_t func_id_to_addr_count_{0};
 
     // --- Thread/core configuration ---
     int32_t active_sched_threads_{0};
@@ -583,8 +589,8 @@ private:
     // =========================================================================
 
     uint64_t get_function_bin_addr(int func_id) const {
-        if (!func_id_to_addr_ || func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
-            LOG_ERROR("func_id=%d is out of range [0, %d) or map is null", func_id, RUNTIME_MAX_FUNC_ID);
+        if (!func_id_to_addr_ || func_id < 0 || static_cast<uint32_t>(func_id) >= func_id_to_addr_count_) {
+            LOG_ERROR("func_id=%d is out of range [0, %u) or the table is unbound", func_id, func_id_to_addr_count_);
             return 0;
         }
         return func_id_to_addr_[func_id];

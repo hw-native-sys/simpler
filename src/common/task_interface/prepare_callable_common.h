@@ -13,11 +13,11 @@
  *
  * Each runtime variant (host_build_graph, tensormap_and_ringbuffer, ...) needs
  * to: upload the ChipCallable buffer to device once, then translate each child
- * kernel's storage offset into a device address that AICPU dispatch can read
- * out of Runtime::func_id_to_addr_[]. The upload + offset arithmetic does not
- * depend on the surrounding runtime, only on the ChipCallable layout and the
- * platform's upload entry point. Callers retain the func_id range check
- * because RUNTIME_MAX_FUNC_ID lives in each runtime's own headers.
+ * kernel's storage offset into that child's device address. The upload + offset
+ * arithmetic does not depend on the surrounding runtime, only on the
+ * ChipCallable layout and the platform's upload entry point. Callers retain the
+ * func_id range check because RUNTIME_MAX_FUNC_ID lives in each runtime's own
+ * headers.
  */
 
 #pragma once
@@ -85,7 +85,7 @@ struct CallableArtifacts {
  * @param out        Cleared on entry; on success, populated with one
  *                   {func_id, device_addr} entry per child kernel. Caller is
  *                   responsible for validating func_id against its runtime's
- *                   RUNTIME_MAX_FUNC_ID before writing to func_id_to_addr_[].
+ *                   RUNTIME_MAX_FUNC_ID.
  * @return 0 on success, -1 on argument error or upload failure.
  */
 inline int upload_and_collect_child_addrs(

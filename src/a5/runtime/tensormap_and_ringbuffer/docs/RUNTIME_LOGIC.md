@@ -819,10 +819,12 @@ Built by the scheduler from `TaskDescriptor`:
    orchestration SO.
 2. `host_api.upload_chip_callable_buffer(callable)` H2Ds the whole buffer
    once and returns the device address of the ChipCallable header.
-3. For each child, host computes
+3. For each child, the same call computes
    `chip_dev + offsetof(ChipCallable, storage_) + callable->child_offset(i)`
-   and stores it in `Runtime.dev.func_id_to_addr_[child_func_id(i)]`.
-4. When dispatching, the scheduler reads `func_id_to_addr_[fid]`, casts to
+   and stores it at index `child_func_id(i)` of a table it lays in the aligned
+   tail of that same allocation. A bind publishes that table's device address
+   and length in `Runtime.dev.callable_table_addr_` / `callable_table_len_`.
+4. When dispatching, the scheduler reads the table entry for `fid`, casts to
    `const CoreCallable*`, reads `resolved_addr_`, and copies that into
    `DispatchPayload.function_bin_addr`.
 

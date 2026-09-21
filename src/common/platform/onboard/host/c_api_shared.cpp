@@ -677,22 +677,12 @@ static int record_callable_on_runner(
         }
     });
 
-    // Re-pack ChildKernelAddr -> std::pair to match the existing
-    // record_device_orch_callable* signature. The named struct only crosses
-    // the runtime-maker / device-runner interface; CallableState stores the
-    // historical pair shape.
-    std::vector<std::pair<int, uint64_t>> kernel_addrs;
-    kernel_addrs.reserve(artifacts.kernel_addrs.size());
-    for (const ChildKernelAddr &c : artifacts.kernel_addrs) {
-        kernel_addrs.emplace_back(c.func_id, c.device_addr);
-    }
-
     // hbg's register_callable_impl populates host_dlopen_handle; trb's leaves
     // it null and fills orch_so_data + func_name/config_name.
     if (artifacts.host_dlopen_handle != nullptr) {
         rc = runner->record_host_orch_callable(
             callable_id, artifacts.chip_buffer_hash, artifacts.aicore_image_hash, artifacts.host_dlopen_handle,
-            artifacts.host_orch_func_ptr, std::move(kernel_addrs), std::move(artifacts.signature)
+            artifacts.host_orch_func_ptr, std::move(artifacts.signature)
         );
         if (rc != 0) return rc;
         host_dlopen_guard.dismiss();
@@ -703,7 +693,7 @@ static int record_callable_on_runner(
     rc = runner->record_device_orch_callable(
         callable_id, artifacts.chip_buffer_hash, artifacts.aicore_image_hash, artifacts.chip_buffer_dev,
         artifacts.orch_so_data, artifacts.orch_so_size, artifacts.func_name.c_str(), artifacts.config_name.c_str(),
-        std::move(kernel_addrs), std::move(artifacts.signature)
+        std::move(artifacts.signature)
     );
     if (rc != 0) return rc;
     chip_buffer_guard.dismiss();

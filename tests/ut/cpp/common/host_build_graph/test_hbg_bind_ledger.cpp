@@ -823,7 +823,14 @@ TEST_F(HbgBindLedgerTest, SchedulerModeChangesPublishOnlyThisRunsSources) {
     auto cleanup = cleanup_runtime(runtime);
     auto callable = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0);
     reinterpret_cast<CoreCallable *>(callable.data())->set_resolved_addr(0x1000);
-    runtime.replay_function_bin_addr(0, reinterpret_cast<uint64_t>(callable.data()));
+    // The one-entry function tables a registration would own for this callable:
+    // the object view addresses the CoreCallable, the entry view carries the
+    // address the a5 AICore scheduler dispatches through.
+    const uint64_t object_table[] = {reinterpret_cast<uint64_t>(callable.data())};
+    const uint64_t entry_table[] = {0x1000};
+    runtime.set_callable_tables(
+        object_table, reinterpret_cast<uint64_t>(object_table), reinterpret_cast<uint64_t>(entry_table), 1
+    );
     const bool a5 = std::strcmp(get_platform(), "a5sim") == 0;
     uint32_t resident_mode = 0;
     uint32_t graph_mode = 0;
@@ -907,7 +914,14 @@ TEST_F(HbgBindLedgerTest, SchedulerPublicationFailureAllowsFreshModeSelection) {
     auto cleanup = cleanup_runtime(runtime);
     auto callable = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0);
     reinterpret_cast<CoreCallable *>(callable.data())->set_resolved_addr(0x1000);
-    runtime.replay_function_bin_addr(0, reinterpret_cast<uint64_t>(callable.data()));
+    // The one-entry function tables a registration would own for this callable:
+    // the object view addresses the CoreCallable, the entry view carries the
+    // address the a5 AICore scheduler dispatches through.
+    const uint64_t object_table[] = {reinterpret_cast<uint64_t>(callable.data())};
+    const uint64_t entry_table[] = {0x1000};
+    runtime.set_callable_tables(
+        object_table, reinterpret_cast<uint64_t>(object_table), reinterpret_cast<uint64_t>(entry_table), 1
+    );
     const bool a5 = std::strcmp(get_platform(), "a5sim") == 0;
     for (TestOrchEntryFunc entry : {ordinary_orch_entry, recording_orch_entry, mixed_orch_entry}) {
         SCOPED_TRACE(entry == recording_orch_entry ? "graph" : entry == mixed_orch_entry ? "mixed" : "ordinary");
@@ -1312,7 +1326,11 @@ TEST_F(HbgHostAccessContractTest, DisjointWriterDoesNotPreventReadyInputAccess) 
         // image, even though this memory backend never launches the kernel.
         auto callable = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0);
         reinterpret_cast<CoreCallable *>(callable.data())->set_resolved_addr(0x1000);
-        runtime.replay_function_bin_addr(0, reinterpret_cast<uint64_t>(callable.data()));
+        const uint64_t object_table[] = {reinterpret_cast<uint64_t>(callable.data())};
+        const uint64_t entry_table[] = {0x1000};
+        runtime.set_callable_tables(
+            object_table, reinterpret_cast<uint64_t>(object_table), reinterpret_cast<uint64_t>(entry_table), 1
+        );
         std::vector<uint8_t> input(4, 0x17);
         ChipStorageTaskArgs args;
         args.add_tensor(host_tensor(input));

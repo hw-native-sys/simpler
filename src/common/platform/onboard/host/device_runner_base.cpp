@@ -1116,6 +1116,13 @@ void DeviceRunnerBase::print_handshake_results(const KernelArgsHelper &kernel_ar
 // Group D — chip-callable upload + per-callable_id registration
 // =============================================================================
 
+// Whether this runtime's device scheduler dispatches from resolved kernel-entry
+// addresses rather than resolving each entry out of the CoreCallable object it
+// is handed. Defined by every runtime's runtime_maker.cpp, so adding a runtime
+// cannot leave the answer implicit, and true only where a device consumer reads
+// the entry view.
+extern "C" bool runtime_uses_callable_entry_table_impl();
+
 uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *callable) {
     if (callable == nullptr) {
         return 0;
@@ -1150,23 +1157,93 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
         return it->second.chip_dev;
     }
 
-    void *gm_addr = mem_alloc_.alloc(layout.total_size);
+    // Sizing, before anything is allocated, so an unaddressable func_id refuses
+    // the registration rather than leaving a block behind. Each table starts on
+    // a CALLABLE_ALIGN boundary past the code, which is also the alignment the
+    // block's own base carries, so a table entry's address is the base plus a
+    // known constant on every callable.
+    //
+    // The arithmetic is 64-bit over sources the ChipCallable wire ABI caps at
+    // 32 bits: `layout.total_size` is the header plus a `storage_used` bounded
+    // by one `uint32_t` binary size plus one `uint32_t` child offset plus a
+    // CoreCallable header, the tables add at most `RUNTIME_MAX_FUNC_ID`
+    // eight-byte entries each, and each alignment step adds less than one line.
+    // The static_assert states that bound, so no checked addition is needed
+    // here.
+    static_assert(sizeof(size_t) >= 8, "the chip-callable tail sizing below assumes a 64-bit size_t");
+    static_assert(
+        static_cast<uint64_t>(offsetof(ChipCallable, storage_)) + UINT32_MAX + UINT32_MAX +
+                CoreCallable::binary_data_offset() + 2 * CALLABLE_ALIGN +
+                2 * static_cast<uint64_t>(RUNTIME_MAX_FUNC_ID) * sizeof(uint64_t) <
+            static_cast<uint64_t>(SIZE_MAX),
+        "a ChipCallable plus both function tables must not be able to overflow size_t"
+    );
+    uint32_t table_len = 0;
+    int32_t bad_func_id = 0;
+    if (!chip_callable_table_length(callable, RUNTIME_MAX_FUNC_ID, &table_len, &bad_func_id)) {
+        LOG_ERROR("Chip callable declares func_id=%d outside [0, %d)", bad_func_id, RUNTIME_MAX_FUNC_ID);
+        return 0;
+    }
+    const bool want_entry_table = table_len != 0 && runtime_uses_callable_entry_table_impl();
+    const size_t table_bytes = static_cast<size_t>(table_len) * sizeof(uint64_t);
+    const auto align_up = [](size_t bytes) {
+        return (bytes + CALLABLE_ALIGN - 1) & ~(static_cast<size_t>(CALLABLE_ALIGN) - 1);
+    };
+    const size_t object_table_off = align_up(layout.total_size);
+    const size_t entry_table_off = align_up(object_table_off + table_bytes);
+    const size_t alloc_size = want_entry_table ? entry_table_off + table_bytes : object_table_off + table_bytes;
+
+    // Every host allocation this upload needs is taken before the device one,
+    // so no allocation that can throw sits between the device block's creation
+    // and the publication that gives it an owner. What runs in between — the
+    // scratch fill, the patch, the table fill and the copy — allocates nothing.
+    std::vector<uint8_t> scratch(alloc_size);
+    std::vector<uint64_t> object_table(table_len, 0);
+    std::vector<uint64_t> entry_table;
+    if (want_entry_table) entry_table.assign(table_len, 0);
+
+    void *gm_addr = mem_alloc_.alloc(alloc_size);
     if (gm_addr == nullptr) {
-        LOG_ERROR("Failed to allocate device GM for ChipCallable buffer (size=%zu)", layout.total_size);
+        LOG_ERROR("Failed to allocate device GM for ChipCallable buffer (size=%zu)", alloc_size);
         return 0;
     }
     const uint64_t chip_dev = reinterpret_cast<uint64_t>(gm_addr);
     assert((chip_dev & (CALLABLE_ALIGN - 1)) == 0 && "device alloc must be CALLABLE_ALIGN-byte aligned");
 
-    // Build a host scratch with each child's resolved_addr_ fixed up to the
+    // Ownership of the device block until the map entry has it. Only the
+    // publication below can still fail once the copy has succeeded, and it
+    // allocates a map node; this releases the block if it does. The
+    // copy-failure path keeps its own rollback, because that is the one that
+    // can retain a reportable owner — an allocation this guard must not make,
+    // since it also runs while an exception is propagating.
+    bool published = false;
+    auto block_guard = RAIIScopeGuard([&]() {
+        if (published) return;
+        if (mem_alloc_.free(gm_addr) != 0) {
+            LOG_ERROR("Upload rollback: free of chip_dev=0x%lx failed — block leaks until device reset", chip_dev);
+        }
+    });
+
+    // Fill the host scratch with each child's resolved_addr_ fixed up to the
     // device-side address of that child's binary code (so the AICPU dispatch
     // path's `reinterpret_cast<CoreCallable*>(addr)->resolved_addr()` lands
     // on the right device offset).
-    std::vector<uint8_t> scratch(layout.total_size);
     std::memcpy(scratch.data(), callable, layout.total_size);
     patch_chip_callable_scratch_for_device(callable, layout, chip_dev, scratch.data());
 
-    int rc = rtMemcpy(gm_addr, layout.total_size, scratch.data(), layout.total_size, RT_MEMCPY_HOST_TO_DEVICE);
+    // The function tables go in the alignment-padded tail of that same scratch,
+    // so the one copy below delivers them alongside the code their entries
+    // name.
+    chip_callable_fill_tables(
+        callable, layout, scratch.data(), chip_dev, table_len, object_table.data(),
+        want_entry_table ? entry_table.data() : nullptr
+    );
+    if (table_len != 0) {
+        std::memcpy(scratch.data() + object_table_off, object_table.data(), table_bytes);
+        if (want_entry_table) std::memcpy(scratch.data() + entry_table_off, entry_table.data(), table_bytes);
+    }
+
+    int rc = rtMemcpy(gm_addr, alloc_size, scratch.data(), alloc_size, RT_MEMCPY_HOST_TO_DEVICE);
     if (rc != 0) {
         LOG_ERROR("rtMemcpy chip callable H2D failed: %d", rc);
         ACL_LOG_ERROR_DETAIL(rc);
@@ -1182,20 +1259,33 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
                     "Upload rollback: free of chip_dev=0x%lx failed — retaining ownership for retry at close", chip_dev
                 );
                 chip_callable_buffers_.emplace(
-                    layout.content_hash, ChipCallableBuffer{chip_dev, layout.total_size, 0, /*release_pending=*/true}
+                    layout.content_hash, ChipCallableBuffer{chip_dev, alloc_size, 0, /*release_pending=*/true}
                 );
             } else {
                 LOG_ERROR("Upload rollback: free of chip_dev=0x%lx failed — block leaks until device reset", chip_dev);
             }
         }
+        block_guard.dismiss();
         return 0;
     }
     mark_run_streams_stale();
 
-    chip_callable_buffers_.emplace(layout.content_hash, ChipCallableBuffer{chip_dev, layout.total_size, 1});
+    // One publication point. The entry is inserted with no tables and the
+    // vectors moved in afterwards through `std::vector`'s noexcept move
+    // assignment, so the insertion is the last thing that can fail and no
+    // caller can reach a published entry whose tables are missing.
+    ChipCallableBuffer retained{chip_dev, alloc_size, 1};
+    retained.table_len = table_len;
+    if (table_len != 0) {
+        retained.object_table_dev = chip_dev + object_table_off;
+        if (want_entry_table) retained.entry_table_dev = chip_dev + entry_table_off;
+    }
+    auto inserted = chip_callable_buffers_.emplace(layout.content_hash, std::move(retained));
+    inserted.first->second.object_table = std::move(object_table);
+    published = true;
     LOG_DEBUG(
-        "Uploaded chip callable: chip_dev=0x%lx, size=%zu, child_count=%d, hash=0x%lx", chip_dev, layout.total_size,
-        callable->child_count(), layout.content_hash
+        "Uploaded chip callable: chip_dev=0x%lx, size=%zu, child_count=%d, table_len=%u, hash=0x%lx", chip_dev,
+        alloc_size, callable->child_count(), table_len, layout.content_hash
     );
     return chip_dev;
 }
@@ -1374,7 +1464,7 @@ int DeviceRunnerBase::register_callable_on_device(int32_t callable_id, rtStream_
 int DeviceRunnerBase::record_device_orch_callable(
     int32_t callable_id, uint64_t chip_buffer_hash, uint64_t aicore_image_hash, uint64_t chip_dev,
     const void *orch_so_data, size_t orch_so_size, const char *func_name, const char *config_name,
-    std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
+    std::vector<ArgDirection> signature
 ) {
     // The AICPU executor reserves `orch_so_table_[MAX_REGISTERED_CALLABLE_IDS]`
     // (declared in src/common/task_interface/callable_protocol.h) and indexes
@@ -1409,7 +1499,6 @@ int DeviceRunnerBase::record_device_orch_callable(
     state.dev_orch_so_size = orch_so_size;
     state.func_name = (func_name != nullptr) ? func_name : "";
     state.config_name = (config_name != nullptr) ? config_name : "";
-    state.kernel_addrs = std::move(kernel_addrs);
     state.signature = std::move(signature);
     callables_.emplace(callable_id, std::move(state));
     LOG_INFO(
@@ -1421,7 +1510,7 @@ int DeviceRunnerBase::record_device_orch_callable(
 
 int DeviceRunnerBase::record_host_orch_callable(
     int32_t callable_id, uint64_t chip_buffer_hash, uint64_t aicore_image_hash, void *host_dlopen_handle,
-    void *host_orch_func_ptr, std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
+    void *host_orch_func_ptr, std::vector<ArgDirection> signature
 ) {
     if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) {
         LOG_ERROR(
@@ -1447,7 +1536,6 @@ int DeviceRunnerBase::record_host_orch_callable(
     state.aicore_image_hash = aicore_image_hash;
     state.host_dlopen_handle = host_dlopen_handle;
     state.host_orch_func_ptr = host_orch_func_ptr;
-    state.kernel_addrs = std::move(kernel_addrs);
     state.signature = std::move(signature);
     callables_.emplace(callable_id, std::move(state));
     ++host_dlopen_total_;
@@ -1700,6 +1788,12 @@ int DeviceRunnerBase::bind_callable_to_runtime(
     Runtime &runtime, int32_t callable_id, const HostApi *api, const void *orch_args, const uint64_t *ring_task_window,
     const uint64_t *ring_heap, const uint64_t *ring_dep_pool
 ) {
+    // Clear before anything else, including before the registry lookup: an id
+    // that is gone is exactly the case where the reference still standing names
+    // a block `unregister_callable` already freed, and the scheduler
+    // dereferences these addresses for the AICore to call what it finds there.
+    // So no bind — refused, failed, or successful — may leave a predecessor's.
+    runtime.clear_callable_tables();
     auto it = callables_.find(callable_id);
     if (it == callables_.end()) {
         LOG_ERROR("bind_callable_to_runtime: callable_id=%d not registered", callable_id);
@@ -1707,24 +1801,21 @@ int DeviceRunnerBase::bind_callable_to_runtime(
     }
     const auto &state = it->second;
 
-    // runtime.func_id_to_addr_ holds exactly the active callable's mappings.
-    //
-    // Each entry is an address inside that callable's retained ChipCallable
-    // buffer, which `unregister_callable` frees once its last handle goes away.
-    // The table is zeroed only in Runtime's constructor and a Runtime outlives
-    // many register/unregister cycles, so an entry left behind by a previous
-    // callable dangles into GM the allocator can hand out again. The scheduler
-    // dereferences that address to read CoreCallable::resolved_addr() and the
-    // AICore calls the result, so a stale entry is executed as code. Replaying
-    // only this callable's func_ids would leave every other entry standing.
-    runtime.clear_function_bin_addrs();
-    for (const auto &kv : state.kernel_addrs) {
-        if (kv.first < 0 || kv.first >= RUNTIME_MAX_FUNC_ID) {
-            LOG_ERROR("bind_callable_to_runtime: func_id=%d out of range", kv.first);
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-        runtime.replay_function_bin_addr(kv.first, kv.second);
+    auto block = chip_callable_buffers_.find(state.chip_buffer_hash);
+    if (block == chip_callable_buffers_.end() || block->second.release_pending) {
+        LOG_ERROR("bind_callable_to_runtime: callable_id=%d has no retained registration block", callable_id);
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
+    // The tables were built and copied by the registration that retained this
+    // block, and the content hash keying it covers the child func_ids and
+    // offsets they are derived from, so every callable_id sharing the block
+    // binds the same complete view. A callable with no children publishes no
+    // table and every lookup against it reads 0.
+    const ChipCallableBuffer &tables = block->second;
+    runtime.set_callable_tables(
+        tables.object_table.empty() ? nullptr : tables.object_table.data(), tables.object_table_dev,
+        tables.entry_table_dev, tables.table_len
+    );
     // Tell the AICPU which orch_so_table_ slot this run dispatches. The orch SO
     // descriptor itself was delivered at register time via RegisterCallableArgs.
     runtime.set_active_callable_id(callable_id);

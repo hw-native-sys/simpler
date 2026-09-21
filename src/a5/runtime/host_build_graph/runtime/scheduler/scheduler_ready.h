@@ -126,8 +126,13 @@ struct SchedulerLocalConfig {
     uint64_t trace_cells_offset{0};
     uint64_t activity_buffers_offset{0};
     uint64_t gang_coordinator_offset{0};
+    // The callable's registration-owned entry table, named by absolute address
+    // because it is not part of the scheduler state these offsets index. The
+    // address cannot be narrowed the way the offsets are; the length can, and
+    // is validated below.
+    uint64_t callable_addresses_address{0};
     uint32_t worker_contexts_offset{0};
-    uint32_t callable_addresses_offset{0};
+    uint32_t callable_addresses_count{0};
     uint32_t task_metadata_offset{0};
     uint32_t dispatch_payloads_offset{0};
     uint16_t worker_ids[PLATFORM_CORES_PER_BLOCKDIM]{};
@@ -188,7 +193,7 @@ inline __aicore__ bool scheduler_initialize_local_config(
         if (context->topology_reserved[index] != 0) return false;
     SchedulerLocalConfig &config = local->config;
     const uint64_t payload_stride = SCHEDULER_PENDING_SLOT_COUNT * sizeof(DispatchPayload);
-    if (context->worker_contexts_offset > UINT32_MAX || context->callable_addresses_offset > UINT32_MAX ||
+    if (context->worker_contexts_offset > UINT32_MAX || context->callable_addresses_count > UINT32_MAX ||
         context->task_metadata_offset > UINT32_MAX || context->runtime_worker_count == 0 ||
         context->runtime_worker_count > SCHEDULER_WORKER_CAPACITY ||
         context->worker_index >= context->runtime_worker_count ||
@@ -206,7 +211,8 @@ inline __aicore__ bool scheduler_initialize_local_config(
     config.trace_cells_offset = context->trace_cells_offset;
     config.activity_buffers_offset = context->activity_buffers_offset;
     config.worker_contexts_offset = static_cast<uint32_t>(context->worker_contexts_offset);
-    config.callable_addresses_offset = static_cast<uint32_t>(context->callable_addresses_offset);
+    config.callable_addresses_address = context->callable_addresses_address;
+    config.callable_addresses_count = static_cast<uint32_t>(context->callable_addresses_count);
     config.gang_coordinator_offset = context->gang_coordinator_offset;
     const uint64_t runtime_worker_count = context->runtime_worker_count;
     const uint64_t scheduler_count = context->scheduler_count;
@@ -390,10 +396,15 @@ scheduler_evaluate_task_predicate(const SchedulerGraphView &graph, int64_t task_
     }
 }
 
-inline __aicore__ bool
-scheduler_lookup_callable_address(__gm__ uint64_t *callable_addresses, uint16_t kernel_id, uint64_t *callable_address) {
-    if (callable_addresses == nullptr || callable_address == nullptr || kernel_id >= SCHEDULER_CALLABLE_CAPACITY)
-        return false;
+// `callable_count` is the table's own published length, not a capacity the
+// scheduler state reserves: the table belongs to the callable's registration
+// block, so an index past the length addresses memory no table occupies. The
+// read needs no cache maintenance of its own — the AICore invalidates its
+// whole data cache once at bootstrap, before any dispatch can reach here.
+inline __aicore__ bool scheduler_lookup_callable_address(
+    __gm__ uint64_t *callable_addresses, uint32_t callable_count, uint16_t kernel_id, uint64_t *callable_address
+) {
+    if (callable_addresses == nullptr || callable_address == nullptr || kernel_id >= callable_count) return false;
     *callable_address = callable_addresses[kernel_id];
     return *callable_address != 0;
 }
@@ -1154,10 +1165,12 @@ inline __aicore__ bool scheduler_fill_dispatch_slot(
     uint32_t generation = slot_claim.generation + 1;
     if (generation == 0) generation = 1;
     __gm__ uint64_t *callable_addresses =
-        scheduler_state_at<uint64_t>(scheduler_state_base, scheduler->config.callable_addresses_offset);
+        reinterpret_cast<__gm__ uint64_t *>(scheduler->config.callable_addresses_address);
     const bool inline_task = scheduler_task_is_inline(metadata.flags);
     uint64_t callable_address = UINT64_C(1);
-    if (!inline_task && !scheduler_lookup_callable_address(callable_addresses, kernel_id, &callable_address)) {
+    if (!inline_task && !scheduler_lookup_callable_address(
+                            callable_addresses, scheduler->config.callable_addresses_count, kernel_id, &callable_address
+                        )) {
         scheduler_record_error(
             run_control, ready_claim.task_id, SchedulerGraphResult::INVALID_CALLABLE, &graph, scheduler,
             SchedulerErrorSite::DISPATCH_INVALID_CALLABLE

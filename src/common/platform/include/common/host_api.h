@@ -155,11 +155,9 @@ struct HostApiOps {
     // address of the ChipCallable header. Pool-managed: identical buffer
     // contents (FNV-1a 64-bit) hit the dedup cache; all chip buffers are
     // bulk-freed in DeviceRunner::finalize(). Returns 0 on error or when
-    // child_count() == 0. Caller computes child addrs as
-    //     chip_dev + offsetof(ChipCallable, storage_) + child_offset(i)
-    // and records them in the CallableArtifacts kernel_addrs table, which
-    // DeviceRunner::bind_callable_to_runtime replays onto the runtime's
-    // func_id_to_addr_ before each run.
+    // child_count() == 0. The same call builds the callable's func_id-indexed
+    // function tables in the aligned tail of that one allocation, so a bind
+    // publishes a reference to them and no run rebuilds them.
     uint64_t (*upload_chip_callable_buffer)(void *runner_ctx, const void *callable);
     // Host phase records. The pool is platform-allocated but written directly by
     // the runtime through the inline path in host/host_phase_records.h, so these

@@ -264,17 +264,17 @@ public:
 
     int record_device_orch_callable(
         int32_t callable_id, uint64_t chip_buffer_hash, uint64_t chip_dev, const void *orch_so_data,
-        size_t orch_so_size, const char *func_name, const char *config_name,
-        std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
+        size_t orch_so_size, const char *func_name, const char *config_name, std::vector<ArgDirection> signature
     );
     int record_host_orch_callable(
         int32_t callable_id, uint64_t chip_buffer_hash, void *host_dlopen_handle, void *host_orch_func_ptr,
-        std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
+        std::vector<ArgDirection> signature
     );
     int unregister_callable(int32_t callable_id);
     bool has_callable(int32_t callable_id) const;
-    // One-step bind: replay CallableState (kernel addrs + active_callable_id)
-    // then run the per-run bind_callable_to_runtime_impl with the state's
+    // One-step bind: install the reference to the callable's
+    // registration-owned function tables and its active_callable_id, then run
+    // the per-run bind_callable_to_runtime_impl with the state's
     // host_orch_func_ptr + signature. `api` is bound to this run; `orch_args` is a
     // const ChipStorageTaskArgs* (void* keeps task_interface headers out of this
     // header). Returns 0 on success, non-zero on failure.
@@ -587,6 +587,18 @@ protected:
         size_t total_size{0};
         int refcount{0};
         std::vector<void *> dlopen_handles;
+        // The callable's registration-owned function tables, dense over
+        // [0, table_len). Sim performs no upload, so the "device" addresses
+        // below are the vectors' own host addresses and the AICPU reads them in
+        // place. The object view holds the CoreCallable objects inside
+        // `host_scratch`; the entry view holds the host function pointers this
+        // registration's dlopen resolved, which is what a device consumer of
+        // resolved entries would dispatch through.
+        std::vector<uint64_t> object_table;
+        std::vector<uint64_t> entry_table;
+        uint64_t object_table_dev{0};
+        uint64_t entry_table_dev{0};
+        uint32_t table_len{0};
     };
     std::unordered_map<uint64_t, ChipCallableBuffer> chip_callable_buffers_;
 
@@ -600,7 +612,6 @@ protected:
         std::string func_name;
         std::string config_name;
         // common
-        std::vector<std::pair<int, uint64_t>> kernel_addrs;
         std::vector<ArgDirection> signature;
         // hbg path
         void *host_dlopen_handle{nullptr};

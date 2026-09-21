@@ -553,11 +553,16 @@ TEST(PersistentKernelArgs, LeavesThePerCallableDispatchFieldsAtTheirSentinels) {
     ASSERT_EQ(args.prepare_once(runtime, ops.table(), kDeviceId), 0);
 
     // The device image starts at offset 0 of Runtime under both variants, so
-    // the uploaded bytes answer the accessors the device-side code uses.
+    // the uploaded bytes answer the fields the device-side code reads.
     const Runtime *const uploaded = reinterpret_cast<const Runtime *>(args.args().runtime_args);
-    for (int func_id = 0; func_id < RUNTIME_MAX_FUNC_ID; ++func_id) {
-        ASSERT_EQ(uploaded->get_function_bin_addr(func_id), 0u) << "func_id=" << func_id;
-    }
+    // A kernel launch binds no callable, so the reference to a callable's
+    // function tables has to arrive naming nothing: the device-side guard then
+    // short-circuits instead of dereferencing an address no table lives at.
+    EXPECT_EQ(uploaded->dev.callable_table_addr_, 0u);
+    EXPECT_EQ(uploaded->dev.callable_table_len_, 0u);
+    // The host view of that table is host-only on both variants, so reading it
+    // through `uploaded` would read past the block that was copied.
+    EXPECT_EQ(runtime.get_function_bin_addr(0), 0u);
 #if defined(SIMPLER_UT_TRB_RUNTIME)
     // trb's AICPU reads the callable id out of the image to pick an entry, so it
     // has to arrive at its sentinel.

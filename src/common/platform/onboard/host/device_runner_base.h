@@ -775,9 +775,9 @@ public:
      *
      * Callers compute child addresses as
      *     chip_dev + offsetof(ChipCallable, storage_) + child_offset(i)
-     * and record them in the callable's kernel_addrs table, which
-     * bind_callable_to_runtime replays into Runtime::func_id_to_addr_[fid]
-     * before each run.
+     * for their own validation. The same arithmetic also builds the callable's
+     * function tables here, in the aligned tail of this one allocation, so a run
+     * binds a reference to them instead of rebuilding them.
      *
      * @param callable  Host-side ChipCallable pointer.
      * @return Device GM address of the ChipCallable header, or 0 on failure.
@@ -787,9 +787,10 @@ public:
 
     /**
      * Stage a per-callable_id orchestration SO from the retained ChipCallable and
-     * remember the supporting metadata (entry/config symbol names,
-     * kernel func_id ↔ dev_addr table). The orchestration SO is the leading
-     * slice of ChipCallable::storage_ inside the retained chip buffer.
+     * remember the supporting metadata (entry/config symbol names). The
+     * orchestration SO is the leading slice of ChipCallable::storage_ inside the
+     * retained chip buffer, whose hash is also how a bind reaches that
+     * callable's function tables.
      *
      * @param callable_id   Caller-stable id, must be in [0, MAX_REGISTERED_CALLABLE_IDS).
      * @param chip_buffer_hash  FNV-1a hash of the retained ChipCallable buffer.
@@ -798,16 +799,12 @@ public:
      * @param orch_so_size  Size of orchestration SO in bytes.
      * @param func_name     Entry symbol name (copied).
      * @param config_name   Config symbol name (copied).
-     * @param kernel_addrs  func_id ↔ dev_addr pairs already uploaded by
-     *                      the caller. Stored verbatim so subsequent
-     *                      runs can replay them onto a fresh Runtime
-     *                      without re-uploading.
      * @return 0 on success, negative on failure.
      */
     int record_device_orch_callable(
         int32_t callable_id, uint64_t chip_buffer_hash, uint64_t aicore_image_hash, uint64_t chip_dev,
         const void *orch_so_data, size_t orch_so_size, const char *func_name, const char *config_name,
-        std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
+        std::vector<ArgDirection> signature
     );
 
     /**
@@ -822,8 +819,7 @@ public:
      */
     int record_host_orch_callable(
         int32_t callable_id, uint64_t chip_buffer_hash, uint64_t aicore_image_hash, void *host_dlopen_handle,
-        void *host_orch_func_ptr, std::vector<std::pair<int, uint64_t>> kernel_addrs,
-        std::vector<ArgDirection> signature
+        void *host_orch_func_ptr, std::vector<ArgDirection> signature
     );
 
     /**
@@ -876,8 +872,9 @@ public:
     void activate_launch_shape(const Runtime &runtime);
 
     /**
-     * Replay a previously-registered callable's state onto a fresh Runtime and
-     * complete the per-run binding in one step. Writes back kernel addrs and
+     * Point a fresh Runtime at a previously-registered callable and complete
+     * the per-run binding in one step. Installs the reference to that
+     * callable's registration-owned function tables and its
      * active_callable_id, then calls the runtime's bind_callable_to_runtime_impl
      * with the CallableState-derived host_orch_func_ptr + signature (kept
      * internal to the runner rather than returned across the c_api boundary).
@@ -886,8 +883,9 @@ public:
      * @param orch_args         const ChipStorageTaskArgs* for this run (void* to
      *                          keep task_interface headers out of this header).
      * @param ring_task_window  Per-ring overrides (trb); ignored by hbg.
-     * @return 0 on success, non-zero on failure (unregistered id, out-of-range
-     *         func_id, or the underlying bind_callable_to_runtime_impl rc).
+     * @return 0 on success, non-zero on failure (unregistered id, a callable
+     *         whose registration block is gone, or the underlying
+     *         bind_callable_to_runtime_impl rc).
      */
     int bind_callable_to_runtime(
         Runtime &runtime, int32_t callable_id, const HostApi *api, const void *orch_args,
@@ -1847,17 +1845,29 @@ protected:
     // the ChipCallable bytes. Each entry owns one device GM allocation
     // holding the entire ChipCallable buffer (header + storage_, with
     // each child's resolved_addr_ fixed up to its post-H2D device
-    // address). Identical buffer bytes share one entry across cids; refcount
-    // drops on unregister and finalize bulk-frees any leftovers.
+    // address) followed by that callable's function tables. Identical buffer
+    // bytes share one entry across cids; refcount drops on unregister and
+    // finalize bulk-frees any leftovers.
     struct ChipCallableBuffer {
         uint64_t chip_dev{0};  // device GM address of the ChipCallable header
-        size_t total_size{0};  // byte size of the device allocation
+        size_t total_size{0};  // byte size of the device allocation, tables included
         int refcount{0};
         // The entry exists only so a release whose free failed still has an
         // owner to retry through, and names no callable a caller may use: its
         // contents either never reached the device or are already released. The
         // dedup lookup skips it, and finalize retries the free.
         bool release_pending{false};
+        // The callable's func_id -> CoreCallable object address table, dense
+        // over [0, table_len) and the host source the device copy was made
+        // from. `table_len` is one past the callable's largest child func_id,
+        // never RUNTIME_MAX_FUNC_ID: the content hash covers the child func_ids
+        // and offsets, so every cid sharing this entry has exactly this table.
+        std::vector<uint64_t> object_table;
+        uint64_t object_table_dev{0};
+        // The same domain resolved to kernel-entry addresses, present only on a
+        // runtime whose device scheduler dispatches from them.
+        uint64_t entry_table_dev{0};
+        uint32_t table_len{0};
     };
     std::unordered_map<uint64_t, ChipCallableBuffer> chip_callable_buffers_;
 
@@ -1879,7 +1889,6 @@ protected:
         std::string func_name;
         std::string config_name;
         // common
-        std::vector<std::pair<int, uint64_t>> kernel_addrs;
         std::vector<ArgDirection> signature;
         // hbg path (host already dlopen'd the orch SO)
         void *host_dlopen_handle{nullptr};

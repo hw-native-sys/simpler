@@ -227,8 +227,9 @@ worker.run(callable, args, CallConfig(aicpu_thread_num))
   │
   └─→ run_runtime(ctx, runtime, callable, args, ...)
        │
-       ├─→ Upload the entire ChipCallable buffer (upload_chip_callable_buffer)
-       │      then fill func_id_to_addr_[fid] = chip_dev + storage_offset + child_offset(i)
+       ├─→ Upload the entire ChipCallable buffer once per callable, and build its
+       │      function tables once with it (upload_chip_callable_buffer); a run
+       │      references them rather than rebuilding them
        ├─→ Allocate device tensors via MemoryAllocator
        ├─→ Copy input data to device
        ├─→ Build task graph with dependencies

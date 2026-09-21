@@ -675,8 +675,7 @@ int SimDeviceRunnerBase::launch_device_register(int32_t callable_id) {
 
 int SimDeviceRunnerBase::record_device_orch_callable(
     int32_t callable_id, uint64_t chip_buffer_hash, uint64_t chip_dev, const void *orch_so_data, size_t orch_so_size,
-    const char *func_name, const char *config_name, std::vector<std::pair<int, uint64_t>> kernel_addrs,
-    std::vector<ArgDirection> signature
+    const char *func_name, const char *config_name, std::vector<ArgDirection> signature
 ) {
     // The AICPU executor reserves `orch_so_table_[MAX_REGISTERED_CALLABLE_IDS]`
     // (declared in src/common/task_interface/callable_protocol.h) and indexes
@@ -710,7 +709,6 @@ int SimDeviceRunnerBase::record_device_orch_callable(
     state.dev_orch_so_size = orch_so_size;
     state.func_name = (func_name != nullptr) ? func_name : "";
     state.config_name = (config_name != nullptr) ? config_name : "";
-    state.kernel_addrs = std::move(kernel_addrs);
     state.signature = std::move(signature);
     callables_.emplace(callable_id, std::move(state));
     LOG_INFO(
@@ -722,7 +720,7 @@ int SimDeviceRunnerBase::record_device_orch_callable(
 
 int SimDeviceRunnerBase::record_host_orch_callable(
     int32_t callable_id, uint64_t chip_buffer_hash, void *host_dlopen_handle, void *host_orch_func_ptr,
-    std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
+    std::vector<ArgDirection> signature
 ) {
     if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) {
         LOG_ERROR(
@@ -747,7 +745,6 @@ int SimDeviceRunnerBase::record_host_orch_callable(
     state.chip_buffer_hash = chip_buffer_hash;
     state.host_dlopen_handle = host_dlopen_handle;
     state.host_orch_func_ptr = host_orch_func_ptr;
-    state.kernel_addrs = std::move(kernel_addrs);
     state.signature = std::move(signature);
     callables_.emplace(callable_id, std::move(state));
     ++host_dlopen_total_;
@@ -790,19 +787,30 @@ int SimDeviceRunnerBase::bind_callable_to_runtime(
     Runtime &runtime, int32_t callable_id, const HostApi *api, const void *orch_args, const uint64_t *ring_task_window,
     const uint64_t *ring_heap, const uint64_t *ring_dep_pool
 ) {
+    // Clear before anything else, including before the registry lookup: an id
+    // that is gone is exactly the case where the reference still standing names
+    // a scratch `unregister_callable` already freed. So no bind — refused,
+    // failed, or successful — may leave a predecessor's.
+    runtime.clear_callable_tables();
     auto it = callables_.find(callable_id);
     if (it == callables_.end()) {
         LOG_ERROR("bind_callable_to_runtime: callable_id=%d not registered", callable_id);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     const auto &state = it->second;
-    for (const auto &kv : state.kernel_addrs) {
-        if (kv.first < 0 || kv.first >= RUNTIME_MAX_FUNC_ID) {
-            LOG_ERROR("bind_callable_to_runtime: func_id=%d out of range", kv.first);
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-        runtime.replay_function_bin_addr(kv.first, kv.second);
+
+    auto block = chip_callable_buffers_.find(state.chip_buffer_hash);
+    if (block == chip_callable_buffers_.end()) {
+        LOG_ERROR("bind_callable_to_runtime: callable_id=%d has no retained registration block", callable_id);
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
+    // Sim holds the tables in host memory the registration built, so the
+    // reference is the same on both sides and nothing is copied per run.
+    const ChipCallableBuffer &tables = block->second;
+    runtime.set_callable_tables(
+        tables.object_table.empty() ? nullptr : tables.object_table.data(), tables.object_table_dev,
+        tables.entry_table_dev, tables.table_len
+    );
     // The AICPU dispatches the orch SO via this callable_id; the SO descriptor
     // was already delivered at launch_device_register time.
     runtime.set_active_callable_id(callable_id);
@@ -967,6 +975,13 @@ void SimDeviceRunnerBase::teardown_shared_collectors_after_run(
     }
 }
 
+// Whether this runtime's device scheduler dispatches from resolved kernel-entry
+// addresses rather than resolving each entry out of the CoreCallable object it
+// is handed. Defined by every runtime's runtime_maker.cpp, so adding a runtime
+// cannot leave the answer implicit, and true only where a device consumer reads
+// the entry view.
+extern "C" bool runtime_uses_callable_entry_table_impl();
+
 uint64_t SimDeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *callable) {
     if (callable == nullptr) {
         return 0;
@@ -984,23 +999,48 @@ uint64_t SimDeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *ca
         return it->second.chip_dev;
     }
 
+    // Sized before anything is allocated, so an unaddressable func_id refuses
+    // the registration rather than leaving a scratch behind.
+    uint32_t table_len = 0;
+    int32_t bad_func_id = 0;
+    if (!chip_callable_table_length(callable, RUNTIME_MAX_FUNC_ID, &table_len, &bad_func_id)) {
+        LOG_ERROR("Chip callable declares func_id=%d outside [0, %d)", bad_func_id, RUNTIME_MAX_FUNC_ID);
+        return 0;
+    }
+    const bool want_entry_table = table_len != 0 && runtime_uses_callable_entry_table_impl();
+
+    // Every allocation this upload makes is taken before the scratch, so the
+    // only raw resource it owns is created with nothing fallible left between
+    // it and the guard that owns it. Filling these below allocates nothing.
+    std::vector<uint64_t> object_table(table_len, 0);
+    std::vector<uint64_t> entry_table;
+    if (want_entry_table) entry_table.assign(table_len, 0);
+    std::vector<void *> dlopen_handles;
+    dlopen_handles.reserve(callable->child_count());
+    bool published = false;
+
     // Allocate host scratch (host == device in sim). Plain new[] keeps
     // ChipCallableBuffer::host_scratch ownership symmetric with finalize().
     auto *scratch = new uint8_t[layout.total_size];
-    std::memcpy(scratch, callable, layout.total_size);
 
-    // Per-child dlopen + dlsym kernel_entry + register pto-sim hooks, then
-    // patch the child's resolved_addr_ to the function pointer. A scope guard
-    // owns scratch and any dlopen'd handles until the success path dismisses
-    // it; every early return unwinds cleanly.
-    std::vector<void *> dlopen_handles;
-    dlopen_handles.reserve(callable->child_count());
+    // The guard owns the scratch and every handle until the map entry does,
+    // and it takes that ownership on the statement after the allocation:
+    // `RAIIScopeGuard` stores the by-reference lambda in place, so nothing
+    // between the two can throw. It decides by `published` rather than by
+    // being dismissed, because the handles move into the published entry only
+    // after the insertion returns and a guard consulting a moved-from vector
+    // could not close them. Every early return and every throw before that
+    // point unwinds through here.
     auto cleanup = RAIIScopeGuard([&]() {
+        if (published) return;
         for (void *h : dlopen_handles)
             dlclose(h);
         delete[] scratch;
     });
+    std::memcpy(scratch, callable, layout.total_size);
 
+    // Per-child dlopen + dlsym kernel_entry + register pto-sim hooks, then
+    // patch the child's resolved_addr_ to the function pointer.
     for (int32_t i = 0; i < callable->child_count(); ++i) {
         const uint32_t off = callable->child_offset(i);
         auto *child_in_scratch = reinterpret_cast<CoreCallable *>(scratch + layout.header_size + off);
@@ -1041,11 +1081,35 @@ uint64_t SimDeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *ca
         child_in_scratch->set_resolved_addr(reinterpret_cast<uint64_t>(func));
     }
 
-    cleanup.dismiss();
     const uint64_t chip_dev = reinterpret_cast<uint64_t>(scratch);
-    chip_callable_buffers_.emplace(
-        layout.content_hash, ChipCallableBuffer{chip_dev, scratch, layout.total_size, 1, std::move(dlopen_handles)}
+
+    // The tables are filled from the same scratch the dlopen loop just patched,
+    // by the same helper the onboard path uses: sim's own host addresses stand
+    // in for the device base, so the object view addresses each CoreCallable
+    // inside the scratch and the entry view carries the host function pointer
+    // that child's resolved_addr_ now holds.
+    chip_callable_fill_tables(
+        callable, layout, scratch, chip_dev, table_len, object_table.data(),
+        want_entry_table ? entry_table.data() : nullptr
     );
+
+    // One publication point. The entry is built with no handles and inserted
+    // first: the insertion is the last thing that can fail, and until it
+    // returns the guard above is still the only owner of the scratch and the
+    // handles. The moves that follow are `std::vector`'s noexcept move
+    // assignment, so the entry cannot end up published and incomplete.
+    ChipCallableBuffer retained{chip_dev, scratch, layout.total_size, 1, {}};
+    retained.table_len = table_len;
+    if (table_len != 0) {
+        retained.object_table_dev = reinterpret_cast<uint64_t>(object_table.data());
+        if (want_entry_table) retained.entry_table_dev = reinterpret_cast<uint64_t>(entry_table.data());
+    }
+    auto inserted = chip_callable_buffers_.emplace(layout.content_hash, std::move(retained));
+    ChipCallableBuffer &owner = inserted.first->second;
+    owner.object_table = std::move(object_table);
+    owner.entry_table = std::move(entry_table);
+    owner.dlopen_handles = std::move(dlopen_handles);
+    published = true;
     LOG_DEBUG(
         "Uploaded chip callable (sim): chip_dev=0x%lx, size=%zu, child_count=%d, hash=0x%lx", chip_dev,
         layout.total_size, callable->child_count(), layout.content_hash

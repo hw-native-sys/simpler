@@ -39,8 +39,7 @@ void configure_normal_aiv_cluster(FixtureStorage &storage, uint64_t task_count) 
     scheduler.cluster_worker_ids[1] = 1;
     scheduler.cluster_worker_ids[2] = 2;
     storage.run_control->scheduler_count = 1;
-    auto *callables =
-        scheduler_state_at<uint64_t>(storage.scheduler_state->base(), storage.layout.callable_addresses_offset);
+    uint64_t *callables = storage.callable_addresses;
     callables[1] = 0x1000;
     for (uint64_t worker = 0; worker < 3; ++worker) {
         for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot)
@@ -310,8 +309,7 @@ TEST(SchedulerClusterCompletion, PropagatesTraceToCompletionAndWokenTask) {
     scheduler.cluster_worker_ids[0] = 0;
     scheduler.cluster_worker_ids[1] = 1;
     scheduler.cluster_worker_ids[2] = 2;
-    auto *callables =
-        scheduler_state_at<uint64_t>(storage.scheduler_state->base(), storage.layout.callable_addresses_offset);
+    uint64_t *callables = storage.callable_addresses;
     callables[1] = 0x1000;
     auto *producer = scheduler_task_control_at(storage.scheduler_state->base(), storage.local_context(&scheduler), 0);
     producer->state = static_cast<int64_t>(SchedulerTaskState::BLOCKED);
@@ -381,8 +379,7 @@ TEST(SchedulerClusterCompletion, DirectlyRefillsCompletedSlotWhenReadyTaskExists
     scheduler.cluster_worker_ids[0] = 0;
     scheduler.cluster_worker_ids[1] = 1;
     scheduler.cluster_worker_ids[2] = 2;
-    auto *callables =
-        scheduler_state_at<uint64_t>(storage.scheduler_state->base(), storage.layout.callable_addresses_offset);
+    uint64_t *callables = storage.callable_addresses;
     callables[1] = 0x1000;
 
     auto *slot = scheduler_dispatch_slot_at(storage.scheduler_state->base(), storage.local_context(&scheduler), 0, 0);
@@ -465,8 +462,7 @@ TEST(SchedulerClusterCompletion, UsesSchedulerLocalSlotStateWithoutRereadingDisp
     scheduler.cluster_worker_ids[0] = 0;
     scheduler.cluster_worker_ids[1] = 1;
     scheduler.cluster_worker_ids[2] = 2;
-    auto *callables =
-        scheduler_state_at<uint64_t>(storage.scheduler_state->base(), storage.layout.callable_addresses_offset);
+    uint64_t *callables = storage.callable_addresses;
     callables[1] = 0x1000;
 
     SchedulerLocalState scheduler_local_state{};
@@ -530,8 +526,7 @@ TEST(SchedulerClusterCompletion, CachesStableWorkerTraceAfterFirstCompletion) {
     scheduler.cluster_worker_ids[0] = 0;
     scheduler.cluster_worker_ids[1] = 1;
     scheduler.cluster_worker_ids[2] = 2;
-    auto *callables =
-        scheduler_state_at<uint64_t>(storage.scheduler_state->base(), storage.layout.callable_addresses_offset);
+    uint64_t *callables = storage.callable_addresses;
     callables[1] = 0x1000;
     target.trace_aicore_entry_cycles = 11;
     target.trace_handshake_publish_cycles = 12;
@@ -593,8 +588,7 @@ TEST(SchedulerClusterCompletion, DeferredRefillPreservesOriginalStateProbeAndRea
     storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIC);
     SchedulerWorkerContext &scheduler = storage.contexts[1];
     SchedulerDispatchSlot *slot = prepare_completed_normal_slot(storage, scheduler);
-    auto *callables =
-        scheduler_state_at<uint64_t>(storage.scheduler_state->base(), storage.layout.callable_addresses_offset);
+    uint64_t *callables = storage.callable_addresses;
     callables[1] = 0x1000;
 
     SchedulerReadyClaim replacement{};
@@ -631,8 +625,7 @@ TEST(SchedulerNormalDispatch, FillsFreshAicSlot) {
     scheduler.cluster_worker_ids[1] = 1;
     scheduler.cluster_worker_ids[2] = 0;
     storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIC);
-    auto *callables =
-        scheduler_state_at<uint64_t>(storage.scheduler_state->base(), storage.layout.callable_addresses_offset);
+    uint64_t *callables = storage.callable_addresses;
     callables[1] = 0x1000;
     auto *slot = scheduler_dispatch_slot_at(storage.scheduler_state->base(), storage.local_context(&scheduler), 0, 0);
     scheduler_initialize_free_slot(slot, &storage.scheduler_local_state.slots[2][0]);
@@ -672,8 +665,7 @@ TEST(SchedulerNormalDispatch, PreservesProgressWhenALaterFillFails) {
     scheduler.cluster_worker_ids[2] = 2;
     storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIC);
     storage.metadata[1].active_mask = 3;
-    auto *callables =
-        scheduler_state_at<uint64_t>(storage.scheduler_state->base(), storage.layout.callable_addresses_offset);
+    uint64_t *callables = storage.callable_addresses;
     callables[1] = 0x1000;
     for (uint32_t slot_index = 0; slot_index < SCHEDULER_PENDING_SLOT_COUNT; ++slot_index)
         scheduler_initialize_free_slot(
@@ -1320,7 +1312,7 @@ TEST(SchedulerLocalConfig, RejectsTruncatedOffsetsAndInconsistentPayloadRoutes) 
     SchedulerLocalState local{};
     EXPECT_EQ(local.worker_id(), UINT64_MAX);
     for (auto field :
-         {&SchedulerWorkerContext::worker_contexts_offset, &SchedulerWorkerContext::callable_addresses_offset,
+         {&SchedulerWorkerContext::worker_contexts_offset, &SchedulerWorkerContext::callable_addresses_count,
           &SchedulerWorkerContext::task_metadata_offset}) {
         const uint64_t original = context.*field;
         context.*field = UINT64_C(1) << 32;
@@ -1353,9 +1345,9 @@ TEST(SchedulerLocalConfig, RejectsTruncatedOffsetsAndInconsistentPayloadRoutes) 
 }
 
 TEST(SchedulerLocalState, CompactLayoutAndPendingEndpointBoundaries) {
-    EXPECT_EQ(sizeof(SchedulerLocalConfig), 96u);
+    EXPECT_EQ(sizeof(SchedulerLocalConfig), 104u);
     EXPECT_EQ(sizeof(SchedulerLocalSlotState), 16u);
-    EXPECT_EQ(sizeof(SchedulerLocalState), 336u);
+    EXPECT_EQ(sizeof(SchedulerLocalState), 344u);
     SchedulerLocalState local{};
     for (auto endpoints : local.owner_pending_endpoints)
         EXPECT_EQ(endpoints, UINT64_MAX);
