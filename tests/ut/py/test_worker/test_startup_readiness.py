@@ -1356,7 +1356,7 @@ class TestLevel2Lifecycle:
         monkeypatch.setattr(Worker, "_release_all_buffers", consume_pre_child_budget)
         captured: dict = {}
 
-        def capture_reap(groups, deadline):
+        def capture_reap(groups, deadline, report_pids=None, reports=None):
             captured["remaining"] = deadline - clock.monotonic()
 
         monkeypatch.setattr(Worker, "_reap_child_groups", staticmethod(capture_reap))

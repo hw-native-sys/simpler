@@ -288,6 +288,107 @@ typedef struct RunRetentionProbeReport {
  * gated on SIMPLER_HOST_STRACE) — parse with simpler_setup.tools.strace_timing.
  * See docs/dfx/host-trace.md. */
 
+/**
+ * Which teardown branch `finalize_device` took.
+ *
+ * NORMAL and FATAL are different code paths, not severities: the fatal branch
+ * is the one `device_unusable_` selects, and it is the only one that runs a
+ * recovery wrapper with a post-reset probe.
+ */
+typedef enum TeardownPath {
+    TEARDOWN_PATH_UNKNOWN = 0,
+    TEARDOWN_PATH_NORMAL = 1,
+    TEARDOWN_PATH_FATAL = 2,
+} TeardownPath;
+
+/**
+ * How far the *last* reset attempt got. Describes that attempt alone — the
+ * cumulative counters beside it are what say whether any earlier attempt
+ * reached a reset API.
+ *
+ * TEARDOWN_STAGE_API_OK_NO_PROBE and TEARDOWN_STAGE_API_OK_PROBE_RUN are
+ * orthogonal facts rather than an ordering: the first is a reset call that
+ * returned 0 with nothing checked afterwards, the second is a reset call that
+ * returned 0 with a post-reset probe behind it.
+ */
+typedef enum TeardownResetStage {
+    TEARDOWN_STAGE_UNKNOWN = 0,
+    /* No reset arm was reached at all. */
+    TEARDOWN_STAGE_NOT_ATTEMPTED = 1,
+    /* The branch declined to attempt: a kernel context owns no device reset. */
+    TEARDOWN_STAGE_REFUSED = 2,
+    /* ACL init or the device bind failed, so this attempt called no reset API. */
+    TEARDOWN_STAGE_PREAMBLE_FAILED = 3,
+    /* A reset API ran in this attempt and returned non-zero. */
+    TEARDOWN_STAGE_API_FAILED = 4,
+    /* A reset API returned 0 and this path runs no probe behind it. */
+    TEARDOWN_STAGE_API_OK_NO_PROBE = 5,
+    /* A reset API returned 0 and the post-reset probe ran; the
+       TEARDOWN_FLAG_PROBE_CONFIRMED bit says whether it passed. */
+    TEARDOWN_STAGE_API_OK_PROBE_RUN = 6,
+} TeardownResetStage;
+
+/** Which reset entry the recorded invocations used. */
+typedef enum TeardownResetApi {
+    TEARDOWN_RESET_API_NONE = 0,
+    TEARDOWN_RESET_API_RT_DEVICE_RESET = 1,
+    TEARDOWN_RESET_API_ACL_RESET_DEVICE = 2,
+    TEARDOWN_RESET_API_ACL_RESET_DEVICE_FORCE = 3,
+} TeardownResetApi;
+
+enum {
+    /* `last_reset_api_rc` holds a real return value. Clear means no reset API
+       was invoked, which is a different fact from one that returned 0. */
+    TEARDOWN_FLAG_LAST_RESET_API_RC_VALID = 1u << 0,
+    /* `recovery_sequence_rc` holds a real return value. Only the fatal branch
+       runs a recovery wrapper, so the normal branch leaves this clear rather
+       than reporting a zero it never obtained. */
+    TEARDOWN_FLAG_RECOVERY_SEQUENCE_RC_VALID = 1u << 1,
+    /* The post-reset probe ran and passed. Set only with
+       TEARDOWN_STAGE_API_OK_PROBE_RUN and a valid zero recovery rc. */
+    TEARDOWN_FLAG_PROBE_CONFIRMED = 1u << 2,
+    TEARDOWN_FLAG_RESERVED_MASK = ~0x7u,
+    /* Bumped when a field changes meaning; a reader that does not recognise
+       the value treats the whole record as absent. */
+    TEARDOWN_REPORT_SCHEMA = 1,
+};
+
+/**
+ * What one `finalize_device` observed about the device teardown it performed.
+ *
+ * Observation only. No field asserts that device work has stopped, and a
+ * confirmed reset invalidates that device generation's allocations rather than
+ * making an old pointer reusable.
+ *
+ * Two scopes coexist and are named apart on purpose. `reset_stage` is the last
+ * attempt's stage; `last_reset_api_rc`, its validity bit and both counters are
+ * cumulative over the whole teardown, which is what keeps a final
+ * PREAMBLE_FAILED from implying no reset API ever ran.
+ *
+ * `schema` is the commit marker on the wire: the producer fills every other
+ * field first and releases `schema` last, so a reader that sees
+ * TEARDOWN_REPORT_SCHEMA has the whole record.
+ */
+typedef struct SimplerTeardownReport {
+    uint32_t schema;
+    int32_t child_pid;
+    int32_t device_id;
+    uint8_t path;
+    uint8_t reset_stage;
+    uint8_t reset_api;
+    uint8_t flags;
+    int32_t last_reset_api_rc;
+    int32_t recovery_sequence_rc;
+    int32_t teardown_rc;
+    uint16_t reset_api_invocations_total;
+    uint16_t recovery_attempts_total;
+    uint64_t reserved;
+} SimplerTeardownReport;
+
+enum {
+    SIMPLER_TEARDOWN_REPORT_BYTES = 40,
+};
+
 /* ===========================================================================
  * Public API (resolved by ChipWorker via dlsym)
  * =========================================================================== */
@@ -645,6 +746,30 @@ size_t get_host_dlopen_count(DeviceContextHandle ctx);
  * bootstrap pair.
  */
 size_t get_run_stream_set_create_count(DeviceContextHandle ctx);
+
+/**
+ * Copy out what this context's `finalize_device` observed about its own device
+ * teardown.
+ *
+ * Optional: ChipWorker resolves it with a bare dlsym, so a module that does
+ * not export it is a fact about the backend rather than a stale build.
+ *
+ * Exporting it is not the same as publishing one. A platform runner is shared
+ * by every runtime built on it, so a module answers
+ * PTO_RUNTIME_ERR_UNSUPPORTED unless its own runtime opts in — the record's
+ * fields describe that runtime's actual reset paths, and a runtime whose paths
+ * were not traced against them publishes nothing rather than a report it
+ * cannot stand behind.
+ *
+ * Call it after `finalize_device` returns and before the context is destroyed;
+ * there is no other window in which the recording owner is still alive.
+ *
+ * @return 0 when `out` was filled, PTO_RUNTIME_ERR_UNSUPPORTED when this
+ *         runtime publishes no teardown report or this context recorded none,
+ *         PTO_RUNTIME_ERR_INVALID_ARGUMENT on a null or wrongly sized
+ *         destination.
+ */
+int get_teardown_report(DeviceContextHandle ctx, void *out, size_t out_bytes);
 
 /* ===========================================================================
  * Kernel-mode lifecycle (four entries + finalize_device)

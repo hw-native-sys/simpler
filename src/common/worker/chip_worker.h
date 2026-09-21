@@ -157,6 +157,20 @@ public:
         const ChipWorkerNativeRun &run, const ChipWorkerNativeRun &successor, const RunRetentionProbeConfig &config
     );
 
+    /**
+     * What the *first* captured `finalize()` observed about its device
+     * teardown, or false when none was captured.
+     *
+     * First rather than latest: a teardown that failed keeps the context and
+     * the module loaded so an explicit retry can finish the job, and the
+     * attempt that failed is the one describing what happened to the device.
+     * A retry therefore does not overwrite it.
+     *
+     * Empty on a module that exports no report accessor, on a capture that
+     * itself failed, and on every `finalize()` reached with no context.
+     */
+    bool teardown_report(SimplerTeardownReport *out) const;
+
     ChipRun submit_chip_run(
         int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, const PipelineSlotLease &lease,
         uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0,
@@ -292,6 +306,7 @@ private:
     // modules carry the retention fixture, so a hard requirement would oblige
     // every simulated and stand-in runtime to export a stub of it.
     using SimplerProbeRunRetentionFn = decltype(&simpler_probe_run_retention);
+    using GetTeardownReportFn = decltype(&get_teardown_report);
     using SupportsConcurrentNativePrepareFn = int (*)(void *);
     using GetArenaBankGmHeapBaseFn = uint64_t (*)(void *, uint32_t);
     using GetRetainedTempAddrFn = uint64_t (*)(void *, uint32_t);
@@ -358,6 +373,12 @@ private:
     SimplerNativeRunFn wait_run_fn_ = nullptr;
     SimplerNativeRunFn finalize_run_fn_ = nullptr;
     SimplerProbeRunRetentionFn probe_run_retention_fn_ = nullptr;
+    GetTeardownReportFn get_teardown_report_fn_ = nullptr;
+    // The first captured teardown observation, kept by value so it outlives
+    // the context destruction and the dlclose that follow a successful
+    // finalize. Write-once: a later finalize cannot replace a real result.
+    SimplerTeardownReport teardown_report_{};
+    bool teardown_report_captured_ = false;
     SupportsConcurrentNativePrepareFn supports_concurrent_native_prepare_fn_ = nullptr;
     GetArenaBankGmHeapBaseFn get_arena_bank_gm_heap_base_fn_ = nullptr;
     GetRetainedTempAddrFn get_retained_temp_addr_fn_ = nullptr;
@@ -416,6 +437,9 @@ private:
         bool pipeline_leased
     );
     void cleanup_native_runs_noexcept() noexcept;
+
+    /** Fill the write-once teardown copy from the still-live context; never throws. */
+    void capture_teardown_report_noexcept() noexcept;
 
     friend struct ChipRunLaneState;
 

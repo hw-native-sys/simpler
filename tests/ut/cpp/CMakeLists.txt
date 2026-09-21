@@ -966,6 +966,7 @@ add_dependencies(test_device_fault_cross_dso test_device_fault_client_a test_dev
 add_test(NAME test_device_fault_cross_dso COMMAND test_device_fault_cross_dso)
 set_tests_properties(test_device_fault_cross_dso PROPERTIES LABELS "no_hardware")
 add_common_utils_test(test_fatal_shutdown_latch common/test_fatal_shutdown_latch.cpp)
+add_common_utils_test(test_teardown_recorder common/test_teardown_recorder.cpp)
 add_common_utils_test(test_buffer_pool_manager common/test_buffer_pool_manager.cpp)
 target_sources(test_buffer_pool_manager PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/common/log/host_log.cpp

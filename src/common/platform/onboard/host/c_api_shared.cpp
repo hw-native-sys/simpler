@@ -148,6 +148,16 @@ int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi *api, int e
  */
 int release_run_bindings_impl(Runtime *runtime, const HostApi *api);
 __attribute__((weak)) int concurrent_native_prepare_supported_impl(void) { return 0; }
+/**
+ * Whether this runtime publishes a device-teardown report.
+ *
+ * The onboard platform runner is shared by every runtime built against it, so
+ * the record it keeps is not by itself a statement about coverage. This is the
+ * per-runtime gate that decides whether the record is a supported public
+ * answer; a runtime that does not override it publishes nothing, which the
+ * reader sees as "no observation" rather than as a teardown that did nothing.
+ */
+__attribute__((weak)) int teardown_report_supported_impl(void) { return 0; }
 __attribute__((weak)) int prepared_run_config_compatible_impl(
     const HostApi * /*api*/, const uint64_t * /*ring_task_window*/, const uint64_t * /*ring_heap*/,
     const uint64_t * /*ring_dep_pool*/
@@ -1565,6 +1575,26 @@ size_t get_run_stream_set_create_count(DeviceContextHandle ctx) {
         return static_cast<DeviceRunnerBase *>(ctx)->run_stream_set_create_count();
     } catch (...) {
         return 0;
+    }
+}
+
+int get_teardown_report(DeviceContextHandle ctx, void *out, size_t out_bytes) {
+    if (ctx == NULL || out == nullptr || out_bytes != sizeof(SimplerTeardownReport)) {
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    }
+    // The runner is shared across the runtimes built on this platform, so the
+    // gate is the runtime's own capability rather than whether a record
+    // happens to exist.
+    if (teardown_report_supported_impl() == 0) return PTO_RUNTIME_ERR_UNSUPPORTED;
+    try {
+        // A runner outside the recording scope answers false, which is the
+        // difference between "this backend observed nothing" and "a teardown
+        // that did nothing".
+        return static_cast<DeviceRunnerBase *>(ctx)->copy_teardown_report(static_cast<SimplerTeardownReport *>(out)) ?
+                   0 :
+                   PTO_RUNTIME_ERR_UNSUPPORTED;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 }
 

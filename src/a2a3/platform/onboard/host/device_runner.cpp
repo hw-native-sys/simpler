@@ -901,6 +901,7 @@ private:
 
 int DeviceRunner::force_reset_device() {
     if (device_id_ < 0) {
+        teardown_recorder_.note_stage(TEARDOWN_STAGE_REFUSED);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     // aclrtResetDeviceForce would reset the caller's device and ACL context;
@@ -909,6 +910,7 @@ int DeviceRunner::force_reset_device() {
     // process.
     if (execution_mode_latch().is_kernel()) {
         LOG_ERROR("force_reset_device: refused — a kernel-mode context does not own the caller's device");
+        teardown_recorder_.note_stage(TEARDOWN_STAGE_REFUSED);
         return PTO_RUNTIME_ERR_INVALID_STATE;
     }
     // aclrtResetDeviceForce is an ACL API; bring ACL up for the whole sequence,
@@ -917,6 +919,7 @@ int DeviceRunner::force_reset_device() {
     AclInitGuard acl_guard;
     if (!acl_guard.ok()) {
         LOG_ERROR("force_reset_device: ACL init failed; cannot reset device %d", device_id_);
+        teardown_recorder_.note_stage(TEARDOWN_STAGE_PREAMBLE_FAILED);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     {
@@ -929,14 +932,20 @@ int DeviceRunner::force_reset_device() {
         DeviceBindGuard bind_guard(device_id_);
         if (!bind_guard.bound()) {
             LOG_ERROR("force_reset_device: could not bind device %d; reset skipped", device_id_);
+            teardown_recorder_.note_stage(TEARDOWN_STAGE_PREAMBLE_FAILED);
             return PTO_RUNTIME_ERR_INTERNAL;
         }
         (void)aclrtSynchronizeDeviceWithTimeout(timeout_config_.stream_sync_timeout_ms);
         aclError rc = aclrtResetDeviceForce(device_id_);
+        teardown_recorder_.note_reset_api(TEARDOWN_RESET_API_ACL_RESET_DEVICE_FORCE, static_cast<int>(rc));
         if (rc != ACL_SUCCESS) {
             LOG_ERROR("force_reset_device: aclrtResetDeviceForce(%d) failed: %d", device_id_, static_cast<int>(rc));
+            teardown_recorder_.note_stage(TEARDOWN_STAGE_API_FAILED);
             return static_cast<int>(rc);
         }
+        // Past this point the reset call succeeded and the probe below is what
+        // the attempt's verdict rests on, so the stage names both facts.
+        teardown_recorder_.note_stage(TEARDOWN_STAGE_API_OK_PROBE_RUN);
         bind_guard.dismiss_after_force_reset();
     }
     // Post-reset self-check: a 0 rc from aclrtResetDeviceForce does not by itself
@@ -990,6 +999,7 @@ int DeviceRunner::force_reset_device() {
     // slot — that is unmeasured — so the registration is remade rather than
     // assumed to have survived into this device generation. The evidence this
     // generation accumulated retires here either way.
+    teardown_recorder_.note_probe_confirmed();
     (void)retire_device_generation_after_confirmed_reset();
     return 0;
 }
@@ -1055,6 +1065,7 @@ int DeviceRunner::finalize() {
     // force-reset the card, then forget old handles without per-resource
     // RTS/HAL calls.
     if (device_unusable_.load(std::memory_order_acquire)) {
+        teardown_recorder_.begin(TEARDOWN_PATH_FATAL, device_id_);
         // A Worker that provisioned SDMA holds 48 CP-process streams, which is
         // what makes both the handoff delay and the single reset attempt below
         // necessary. Read before abandon_common_after_device_failure() clears
@@ -1093,14 +1104,19 @@ int DeviceRunner::finalize() {
         // clean", which reads as a failed reset rather than the designed
         // refusal it is.
         const bool owns_device_reset = !execution_mode_latch().is_kernel();
+        if (!owns_device_reset) teardown_recorder_.note_stage(TEARDOWN_STAGE_REFUSED);
         constexpr int kFatalResetAttempts = 3;
         int reset_rc = owns_device_reset ? attempt_fatal_reset(
                                                [this]() {
+                                                   teardown_recorder_.note_recovery_attempt();
                                                    return force_reset_device();
                                                },
                                                sdma_provisioned ? 1 : kFatalResetAttempts
                                            ) :
                                            0;
+        // The wrapper's verdict, which the post-reset probe is part of, is a
+        // different value from the reset call's own return.
+        if (owns_device_reset) teardown_recorder_.note_recovery_sequence(reset_rc);
         const bool reset_confirmed = owns_device_reset && reset_rc == 0;
         if (!reset_confirmed && owns_device_reset) {
             LOG_ERROR(
@@ -1147,7 +1163,9 @@ int DeviceRunner::finalize() {
                 "process lifetime; no later close can retire them",
                 device_id_
             );
-            return abandon_rc != 0 ? abandon_rc : PTO_RUNTIME_ERR_INVALID_STATE;
+            const int quarantine_rc = abandon_rc != 0 ? abandon_rc : PTO_RUNTIME_ERR_INVALID_STATE;
+            teardown_recorder_.finish(quarantine_rc);
+            return quarantine_rc;
         }
 
         device_id_ = -1;
@@ -1155,8 +1173,12 @@ int DeviceRunner::finalize() {
             device_unusable_.store(false, std::memory_order_release);
         }
         LOG_WARN("DeviceRunner finalized after fatal device failure");
-        return abandon_rc != 0 ? abandon_rc : reset_rc;
+        const int fatal_rc = abandon_rc != 0 ? abandon_rc : reset_rc;
+        teardown_recorder_.finish(fatal_rc);
+        return fatal_rc;
     }
+
+    teardown_recorder_.begin(TEARDOWN_PATH_NORMAL, device_id_);
 
     // A kernel-mode context runs on the caller's already-current device, so
     // this thread needs no bind and the context owns no device state to adopt.
@@ -1165,6 +1187,7 @@ int DeviceRunner::finalize() {
         rc = attach_current_thread(device_id_);
         if (rc != 0) {
             LOG_ERROR("Failed to attach finalize thread to device %d: %d", device_id_, rc);
+            teardown_recorder_.finish(rc);
             return rc;
         }
     }
@@ -1184,7 +1207,10 @@ int DeviceRunner::finalize() {
     // mem_alloc_.finalize(), and cached arena sizes.
     rc = finalize_common();
     if (rc == 0) rc = stream_rc;
-    if (rc != 0 && execution_mode_latch().is_kernel()) return rc;
+    if (rc != 0 && execution_mode_latch().is_kernel()) {
+        teardown_recorder_.finish(rc);
+        return rc;
+    }
 
     // Reset device AFTER all device memory is freed. Two paths:
     //
@@ -1205,6 +1231,10 @@ int DeviceRunner::finalize() {
         bool reset_completed = false;
         if (acl_ready_) {
             int reset_rc = aclrtResetDevice(device_id_);
+            teardown_recorder_.note_reset_api(TEARDOWN_RESET_API_ACL_RESET_DEVICE, reset_rc);
+            // No probe follows this arm, so a zero here is a reset call that
+            // returned, never a confirmed device generation.
+            teardown_recorder_.note_stage(reset_rc == 0 ? TEARDOWN_STAGE_API_OK_NO_PROBE : TEARDOWN_STAGE_API_FAILED);
             if (reset_rc != 0) {
                 LOG_ERROR("aclrtResetDevice(%d) failed during finalize: %d", device_id_, reset_rc);
                 if (rc == 0) rc = reset_rc;
@@ -1218,6 +1248,8 @@ int DeviceRunner::finalize() {
             acl_ready_ = false;
         } else if (!execution_mode_latch().is_kernel()) {
             int reset_rc = rtDeviceReset(device_id_);
+            teardown_recorder_.note_reset_api(TEARDOWN_RESET_API_RT_DEVICE_RESET, reset_rc);
+            teardown_recorder_.note_stage(reset_rc == 0 ? TEARDOWN_STAGE_API_OK_NO_PROBE : TEARDOWN_STAGE_API_FAILED);
             if (reset_rc != 0) {
                 LOG_ERROR("rtDeviceReset(%d) failed during finalize: %d", device_id_, reset_rc);
                 if (rc == 0) rc = reset_rc;
@@ -1241,6 +1273,7 @@ int DeviceRunner::finalize() {
     // released or abandoned, so there is nothing a later close could reach.
     device_id_ = -1;
     device_unusable_.store(false, std::memory_order_release);
+    teardown_recorder_.finish(rc);
     return rc;
 }
 

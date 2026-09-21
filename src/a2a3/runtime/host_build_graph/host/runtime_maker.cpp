@@ -133,6 +133,13 @@ extern "C" int concurrent_native_prepare_supported_impl(void) {
     return 1;
 }
 
+extern "C" int teardown_report_supported_impl(void) {
+    // The onboard platform runner records a teardown for whichever runtime is
+    // built on it; this runtime is the one whose reset paths the record's
+    // stage and rc fields describe, so it is the one that publishes them.
+    return 1;
+}
+
 // RuntimeEnv (call_config.h) is the cross-runtime ABI for per-ring config and
 // carries RUNTIME_ENV_RING_COUNT slots, shared with tensormap_and_ringbuffer.
 // host_build_graph keeps one task table and reads slot 0, so it only needs the ABI

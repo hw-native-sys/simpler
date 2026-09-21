@@ -50,16 +50,21 @@ if TYPE_CHECKING:
 
 import _task_interface as _ti_module  # pyright: ignore[reportMissingImports]
 from _task_interface import (  # pyright: ignore[reportMissingImports]
+    MAILBOX_ARGS_CAPACITY,
     MAILBOX_ERROR_MSG_SIZE,
     MAILBOX_FRAME_SIZE,
     MAILBOX_OFF_ERROR_MSG,
+    MAILBOX_OFF_TEARDOWN_REPORT,
     MAILBOX_PREPARATION_DISPOSITION_VALUES,
     MAILBOX_SIZE,
     MAILBOX_STATE_VALUES,
+    MAILBOX_TASK_PROTOCOL_VERSION,
     MAX_REGISTERED_CALLABLE_IDS,
     MAX_TENSOR_DIMS,
     PROV_DESCRIPTOR_MISMATCH,
     PROV_NOT_LIVE,
+    SIMPLER_TEARDOWN_REPORT_BYTES,
+    TEARDOWN_REPORT_SCHEMA,
     ArgDirection,
     CallConfig,
     ChipCallable,
@@ -216,6 +221,11 @@ __all__ = [
     "MAILBOX_ERROR_MSG_SIZE",
     "MAILBOX_STATE_VALUES",
     "MAILBOX_PREPARATION_DISPOSITION_VALUES",
+    "MAILBOX_ARGS_CAPACITY",
+    "MAILBOX_OFF_TEARDOWN_REPORT",
+    "MAILBOX_TASK_PROTOCOL_VERSION",
+    "SIMPLER_TEARDOWN_REPORT_BYTES",
+    "TEARDOWN_REPORT_SCHEMA",
     "read_args_from_blob",
     # Dynamic CommDomain allocation (orch-only API)
     "CommBufferSpec",

@@ -44,6 +44,7 @@
 #include "../task_interface/buffer.h"
 #include "../task_interface/call_config.h"
 #include "../worker/device_memory_info.h"
+#include "../worker/runtime_c_api.h"
 #include "remote_wire.h"
 #include "types.h"
 
@@ -99,7 +100,7 @@ static constexpr size_t MAILBOX_TASK_FRAME_COUNT = 2;
 static constexpr size_t MAILBOX_CONTROL_FRAME = 0;
 static constexpr size_t MAILBOX_FIRST_TASK_FRAME = 1;
 static constexpr size_t MAILBOX_SIZE = MAILBOX_FRAME_SIZE * (1 + MAILBOX_TASK_FRAME_COUNT);
-static constexpr uint32_t MAILBOX_TASK_PROTOCOL_VERSION = 4;
+static constexpr uint32_t MAILBOX_TASK_PROTOCOL_VERSION = 5;
 
 // Error message region lives at the mailbox tail. 256 B of headroom is
 // enough for `<ExceptionType>: <short message>` produced by the child-side
@@ -163,6 +164,18 @@ static constexpr ptrdiff_t MAILBOX_OFF_FRAME_GROUP_SIZE = MAILBOX_OFF_ACCEPTED -
 // matter what state word a concurrent control command leaves behind.
 static constexpr ptrdiff_t MAILBOX_OFF_SHUTDOWN = MAILBOX_OFF_ACCEPTED - 72;
 static constexpr int32_t MAILBOX_SHUTDOWN_REQUESTED = 1;
+// The chip child's teardown observation, published once on the control frame
+// after its device teardown returns. Reserved on every frame for the same
+// reason the shutdown word is: a task-args blob must not be able to reach it.
+//
+// It is a record rather than a state word because its fields are only
+// meaningful together, and `schema` at offset 0 is what makes that safe: the
+// producer fills the payload first and releases `schema` last, so a reader
+// that acquire-loads TEARDOWN_REPORT_SCHEMA has the whole record and a reader
+// that finds anything else has none of it.
+static constexpr ptrdiff_t MAILBOX_OFF_TEARDOWN_REPORT =
+    MAILBOX_OFF_SHUTDOWN - static_cast<ptrdiff_t>(SIMPLER_TEARDOWN_REPORT_BYTES) - 8;
+static constexpr ptrdiff_t MAILBOX_OFF_TEARDOWN_REPORT_SCHEMA = MAILBOX_OFF_TEARDOWN_REPORT;
 static constexpr ptrdiff_t MAILBOX_OFF_TASK_CALLABLE_HASH = MAILBOX_OFF_ARGS;
 static constexpr ptrdiff_t MAILBOX_OFF_TASK_ARGS_BLOB =
     MAILBOX_OFF_TASK_CALLABLE_HASH + static_cast<ptrdiff_t>(CALLABLE_HASH_DIGEST_SIZE);
@@ -170,13 +183,19 @@ static constexpr size_t CTRL_SHM_NAME_BYTES = 32;
 static constexpr ptrdiff_t MAILBOX_OFF_CONTROL_CALLABLE_HASH =
     MAILBOX_OFF_ARGS + static_cast<ptrdiff_t>(CTRL_SHM_NAME_BYTES);
 static_assert(
-    MAILBOX_OFF_TASK_ARGS_BLOB < MAILBOX_OFF_SHUTDOWN,
-    "mailbox task-args region must precede the shutdown word and the frame protocol trailer"
+    MAILBOX_OFF_TASK_ARGS_BLOB < MAILBOX_OFF_TEARDOWN_REPORT,
+    "mailbox task-args region must precede the teardown record, the shutdown word and the frame "
+    "protocol trailer"
 );
-// The shutdown word is reserved on every frame, not just the control frame, so
-// the args region a task frame accepts can never reach it.
+static_assert(
+    MAILBOX_OFF_TEARDOWN_REPORT % 8 == 0,
+    "the teardown record starts 8-aligned so its schema word is atomically storable"
+);
+// The teardown record and the shutdown word are reserved on every frame, not
+// just the control frame, so the args region a task frame accepts can never
+// reach either.
 static constexpr size_t MAILBOX_ARGS_CAPACITY =
-    static_cast<size_t>(MAILBOX_OFF_SHUTDOWN) - static_cast<size_t>(MAILBOX_OFF_TASK_ARGS_BLOB);
+    static_cast<size_t>(MAILBOX_OFF_TEARDOWN_REPORT) - static_cast<size_t>(MAILBOX_OFF_TASK_ARGS_BLOB);
 // The blob's element is the wire `Tensor` (144 B), not the device `ChipTensor` (128 B), so a frozen
 // descriptor size and a frame size that cannot hold CHIP_MAX_TENSOR_ARGS of them fail the build
 // rather than the first 256-tensor task.

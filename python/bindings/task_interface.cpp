@@ -3600,6 +3600,17 @@ NB_MODULE(_task_interface, m) {
         )
         .def_prop_ro("device_id", &ChipWorker::device_id)
         .def_prop_ro("initialized", &ChipWorker::initialized)
+        .def(
+            "teardown_report_bytes",
+            [](const ChipWorker &self) -> nb::object {
+                SimplerTeardownReport report{};
+                if (!self.teardown_report(&report)) return nb::none();
+                return nb::bytes(reinterpret_cast<const char *>(&report), sizeof(report));
+            },
+            "The first captured finalize()'s teardown observation as its exact wire bytes, or "
+            "None when this worker captured none. Observation only: no field asserts that device "
+            "work has stopped or that an old device pointer may be reused."
+        )
         .def_prop_ro("pipeline_depth", &ChipWorker::pipeline_depth)
         .def_prop_ro("runtime_slot_count", &ChipWorker::runtime_slot_count)
         .def_prop_ro(

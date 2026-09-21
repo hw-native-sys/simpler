@@ -317,6 +317,7 @@ MAILBOX_OFF_PIPELINE_LEASE:       PipelineSlotLease
 MAILBOX_OFF_TASK_CALLABLE_HASH:   uint8[32] callable digest
 MAILBOX_OFF_TASK_ARGS_BLOB:       bytes [int32 T][int32 S]
                                         [Tensor x T][uint64_t x S]
+MAILBOX_OFF_TEARDOWN_REPORT:      SimplerTeardownReport (40 B)
 MAILBOX_OFF_SHUTDOWN:             int32 sticky shutdown request
 task-frame trailer:               protocol, run id, lease slot,
                                   lease generation, dispatch id
@@ -326,8 +327,9 @@ frame tail:                       fixed-size NUL-terminated error message
 
 The C++ `MAILBOX_FRAME_SIZE` and `MAILBOX_SIZE` constants are exported through
 the nanobind module. Python derives frame slicing and offsets from those
-bindings where possible. `MAILBOX_ARGS_CAPACITY` ends before the shutdown word,
-protocol trailer, acceptance word, and error-message tail.
+bindings where possible. `MAILBOX_ARGS_CAPACITY` ends before the teardown
+record, shutdown word, protocol trailer, acceptance word, and error-message
+tail.
 
 `MAILBOX_OFF_SHUTDOWN` carries the termination request on the control base
 frame. The state word has three writers — the parent's `CONTROL_REQUEST`, the
@@ -337,6 +339,33 @@ state store is erasable. Only a terminating parent writes the shutdown word,
 request after an in-flight control command completes over it. Both sides write
 it before the `SHUTDOWN` state store and read it at the top of every serve-loop
 iteration alongside the state word.
+
+`MAILBOX_OFF_TEARDOWN_REPORT` carries the chip child's observation of its own
+device teardown, published once on the control base frame after the child's
+`ChipWorker::finalize()` returns or raises. It is a record rather than a state
+word because its fields only mean anything together: which reset entry ran,
+what that call returned, what the recovery wrapper and its post-reset probe
+returned, and what the teardown returned, each kept separate so a single error
+code cannot conflate "no reset ran", "the reset failed" and "the reset
+returned 0 but nothing confirmed it". `schema` at offset 0 is the commit
+marker — the child fills the payload first and releases `schema` last, so a
+parent that acquire-loads it has the whole record and a parent that finds
+anything else has none of it. The parent copies it out in its child-reap loop,
+after the child is reaped and before the shared memory is closed, and exposes
+it through `Worker.teardown_reports()`.
+
+It is observation only: no field asserts that device work has stopped, and a
+confirmed reset invalidates that device generation's allocations rather than
+making an old device pointer reusable. The onboard platform runner is shared
+by every runtime built on it, so publishing is gated on the runtime's own
+`teardown_report_supported_impl` — a2a3 `host_build_graph` opts in, and every
+other runtime answers "no observation", which reads back as an uncommitted
+record. Remote endpoints have no local mailbox and produce no entry at all.
+
+A chip child that outlives the close deadline is handed to the cleanup
+journal, and its record is read there instead: inside the same retry closure,
+after the reap succeeds and before the shm is closed. So a late publication is
+still collected, and a missing key keeps meaning "never reaped".
 
 ### 3.5 Stop and child shutdown
 

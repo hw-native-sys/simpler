@@ -257,13 +257,18 @@ from .global_comm_domain import (
 from .orchestrator import Orchestrator, _callback_frame_for, _callback_run, direct_control
 from .remote_l3_protocol import HOST_TCP_TRANSPORT_PROFILE
 from .task_interface import (
+    MAILBOX_ARGS_CAPACITY,
     MAILBOX_ERROR_MSG_SIZE,
     MAILBOX_FRAME_SIZE,
     MAILBOX_OFF_ERROR_MSG,
+    MAILBOX_OFF_TEARDOWN_REPORT,
     MAILBOX_PREPARATION_DISPOSITION_VALUES,
     MAILBOX_SIZE,
     MAILBOX_STATE_VALUES,
+    MAILBOX_TASK_PROTOCOL_VERSION,
     PROV_NOT_LIVE,
+    SIMPLER_TEARDOWN_REPORT_BYTES,
+    TEARDOWN_REPORT_SCHEMA,
     CallConfig,
     ChipCallable,
     ChipDomainContext,
@@ -283,6 +288,11 @@ from .task_interface import (
     _initialize_host_log,
     _start_host_log_writer,
     _Worker,
+)
+from .teardown_report import (
+    TeardownReport,
+    decode_teardown_report,
+    encode_teardown_report_payload,
 )
 from .worker_chip_orch_comm import (
     WorkerChipOrchRegion,
@@ -363,7 +373,7 @@ _OFF_FRAME_DISPATCH_ID = _OFF_ACCEPTED - 8
 _OFF_FRAME_TASK_SLOT = _OFF_ACCEPTED - 48
 _OFF_FRAME_GROUP_INDEX = _OFF_ACCEPTED - 56
 _OFF_FRAME_GROUP_SIZE = _OFF_ACCEPTED - 64
-_TASK_PROTOCOL_VERSION = 4
+_TASK_PROTOCOL_VERSION = 5
 # Mirrors MAILBOX_OFF_SHUTDOWN / MAILBOX_SHUTDOWN_REQUESTED: termination is a
 # sticky one-way word on the control frame, not a MailboxState. _OFF_STATE has
 # three writers (parent CONTROL_REQUEST, child CONTROL_DONE, C++
@@ -372,7 +382,13 @@ _TASK_PROTOCOL_VERSION = 4
 # is reserved on every frame so a task-args blob can never reach it.
 _OFF_SHUTDOWN = _OFF_ACCEPTED - 72
 _SHUTDOWN_REQUESTED = 1
-_MAILBOX_ARGS_CAPACITY = _OFF_SHUTDOWN - _OFF_TASK_ARGS_BLOB
+# The chip child's teardown observation. Like the shutdown word it is reserved
+# on every frame so a task-args blob can never reach it, and it is a record
+# rather than a state word because its fields only mean anything together.
+# `schema` sits at offset 0 of the record and is released last, so a reader
+# that acquire-loads _TEARDOWN_REPORT_SCHEMA has the whole record.
+_OFF_TEARDOWN_REPORT = _OFF_SHUTDOWN - SIMPLER_TEARDOWN_REPORT_BYTES - 8
+_MAILBOX_ARGS_CAPACITY = _OFF_TEARDOWN_REPORT - _OFF_TASK_ARGS_BLOB
 _OFF_CONTROL_CALLABLE_HASH = _OFF_ARGS + 32
 # MAILBOX_OFF_ERROR_MSG / MAILBOX_ERROR_MSG_SIZE come from the C++
 # nanobind module so the two sides cannot drift.
@@ -457,6 +473,20 @@ def _assert_mailbox_wire_constants() -> None:
                 f"{name} has enumerators the Python side does not declare: {', '.join(missing)}. "
                 "A child can publish them and this module would not recognise the value."
             )
+
+    # Layout rather than enumerators: these offsets are derived independently
+    # on both sides from the same rules, so a disagreement is a silently
+    # misplaced read in one process rather than a compile error.
+    layout = {
+        "MAILBOX_OFF_TEARDOWN_REPORT": (_OFF_TEARDOWN_REPORT, MAILBOX_OFF_TEARDOWN_REPORT),
+        "MAILBOX_ARGS_CAPACITY": (_MAILBOX_ARGS_CAPACITY, MAILBOX_ARGS_CAPACITY),
+        "MAILBOX_TASK_PROTOCOL_VERSION": (_TASK_PROTOCOL_VERSION, MAILBOX_TASK_PROTOCOL_VERSION),
+    }
+    drifted = sorted(f"{key}: python={mine} c++={theirs}" for key, (mine, theirs) in layout.items() if mine != theirs)
+    if drifted:
+        raise RuntimeError(
+            "mailbox frame layout in simpler.worker disagrees with the C++ header: " + "; ".join(drifted)
+        )
 
 
 _assert_mailbox_wire_constants()
@@ -2827,6 +2857,61 @@ def _provider_sweep_debt_errors(results: tuple[ProviderReleaseResult, ...]) -> l
     return errors
 
 
+def _read_teardown_report(shm: SharedMemory, child_pid: int) -> TeardownReport:
+    """Copy one reaped child's teardown record out of its mailbox.
+
+    Acquire-loads the schema word first, so a record whose payload write was
+    cut short by a killed child never reads as a partly populated success. Any
+    failure here is the reader's unknown answer, never an error: close is
+    already reporting whatever went wrong with the teardown itself.
+    """
+    try:
+        buf = shm.buf
+        if buf is None:
+            return TeardownReport()
+        if _mailbox_load_i32(_buffer_field_addr(buf, _OFF_TEARDOWN_REPORT)) != TEARDOWN_REPORT_SCHEMA:
+            return TeardownReport()
+        raw = bytes(buf[_OFF_TEARDOWN_REPORT : _OFF_TEARDOWN_REPORT + SIMPLER_TEARDOWN_REPORT_BYTES])
+        return decode_teardown_report(raw, expected_pid=child_pid)
+    except BaseException:  # noqa: BLE001
+        return TeardownReport()
+
+
+def _finalize_chip_worker_and_publish(buf: memoryview, cw: ChipWorker) -> None:
+    """Run this child's one device teardown, then publish what it observed.
+
+    Both child exits that own a teardown — the startup preparation failure and
+    the main loop's own exit — go through here, so there is exactly one
+    ``finalize()`` call on each and the record is published from a ``finally``
+    on both. Publication adds no finalize or reset call and swallows its own
+    failures, so a teardown that raises still raises, unchanged.
+    """
+    try:
+        cw.finalize()
+    finally:
+        _publish_teardown_report(buf, cw)
+
+
+def _publish_teardown_report(buf: memoryview, cw: ChipWorker) -> None:
+    """Publish this child's teardown observation on the control frame, payload first.
+
+    The schema word is released last, so a parent that acquire-loads it has the
+    whole record and a parent that finds anything else has none of it. Every
+    failure here is swallowed: the observation must never displace the teardown
+    outcome the parent is about to be told about, and an unpublished record is
+    already the reader's unknown answer.
+    """
+    try:
+        raw = cw.teardown_report_bytes()
+        if raw is None:
+            return
+        payload = encode_teardown_report_payload(raw, child_pid=os.getpid())
+        buf[_OFF_TEARDOWN_REPORT + 4 : _OFF_TEARDOWN_REPORT + SIMPLER_TEARDOWN_REPORT_BYTES] = payload[4:]
+        _mailbox_store_i32(_buffer_field_addr(buf, _OFF_TEARDOWN_REPORT), TEARDOWN_REPORT_SCHEMA)
+    except BaseException:  # noqa: BLE001
+        return
+
+
 def _teardown_chip_process_resources(
     import_registry: ImportRegistry,
     cw: ChipWorker,
@@ -3499,7 +3584,10 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
         _tb.print_exc()
         _write_error(buf, 1, _format_exc(f"chip_process dev={device_id} prepare", e))
         _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _INIT_FAILED)
-        cw.finalize()
+        # This branch already owns a real device teardown, and the child exits
+        # normally from it, so its observation is publishable — the same
+        # finalize-then-publish shape the main loop's exit uses.
+        _finalize_chip_worker_and_publish(buf, cw)
         return
 
     mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
@@ -3534,7 +3622,10 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             chip_rank=chip_rank,
         )
     finally:
-        cw.finalize()
+        # After the teardown, whether or not it raised: the C++ side captured
+        # its observation before throwing, and the parent's shared mailbox
+        # outlives this process.
+        _finalize_chip_worker_and_publish(buf, cw)
 
 
 def _level_capture_prefix(prefix: str, worker: Worker) -> str:
@@ -3812,21 +3903,34 @@ def _child_worker_loop(
     )
 
 
-def _journal_child_survivors(journal, sub_shms, sub_pids, chip_shms, chip_pids, next_shms, next_pids, reaped):
+def _journal_child_survivors(  # noqa: PLR0913 -- one (shms, pids) pair per child kind, plus the report sink
+    journal, sub_shms, sub_pids, chip_shms, chip_pids, next_shms, next_pids, reaped, reports=None
+):
     """Register unreaped child processes and their paired shms in the cleanup
-    journal so a subsequent close() can retry."""
+    journal so a subsequent close() can retry.
+
+    A chip child journaled here is one that outlived the close deadline, so the
+    first reap pass could not read its teardown record. The retry owns that
+    read: it happens inside the same closure, after the reap succeeds and
+    before the shm is closed, which is the last moment the record exists.
+    Without it a child that publishes late would vanish from
+    ``teardown_reports()``, which would say "never reaped" about a child that
+    was.
+    """
     for shms, pids, kind in (
         (sub_shms, sub_pids, "sub"),
         (chip_shms, chip_pids, "chip"),
         (next_shms, next_pids, "next"),
     ):
+        # Only chip children run a device teardown, so only they carry a record.
+        kind_reports = reports if kind == "chip" else None
         for i in range(min(len(shms), len(pids))):
             pid = pids[i]
             if pid in reaped:
                 continue
             shm = shms[i]
 
-            def _make_cleanup(_shm=shm, _pid=pid, _kind=kind):
+            def _make_cleanup(_shm=shm, _pid=pid, _kind=kind, _reports=kind_reports):
                 def _cleanup_child():
                     try:
                         wpid, _status = os.waitpid(_pid, os.WNOHANG)
@@ -3836,6 +3940,12 @@ def _journal_child_survivors(journal, sub_shms, sub_pids, chip_shms, chip_pids, 
                         wpid = 0
                     if wpid == 0:
                         raise RuntimeError(f"child {_kind} pid {_pid} still alive; shm not freed")
+                    # Reaped, so nothing can still be writing the record, and
+                    # the shm is about to go. Read once: a journal retry after
+                    # a close failure must not replace what the first read
+                    # already established.
+                    if _reports is not None and _pid not in _reports:
+                        _reports[_pid] = _read_teardown_report(_shm, _pid)
                     cleanup_error = None
                     try:
                         _shm.close()
@@ -4855,6 +4965,10 @@ class Worker:
         self._orch: Orchestrator | None = None
         self._chip_shms: list[SharedMemory] = []
         self._chip_pids: list[int] = []
+        # Teardown observations copied out of each reaped chip child's mailbox,
+        # keyed by that child's pid. Absent means the child never reaped, which
+        # is a different answer from an uncommitted record.
+        self._teardown_reports: dict[int, TeardownReport] = {}
         self._sub_shms: list[SharedMemory] = []
         self._sub_pids: list[int] = []
 
@@ -11216,6 +11330,29 @@ class Worker:
             if self._buffers.get(buffer_id) is buffer:
                 del self._buffers[buffer_id]
 
+    def teardown_reports(self) -> dict[int, TeardownReport]:
+        """What each reaped chip child observed about its own device teardown.
+
+        Keyed by the child's pid; the device it held is a field of the record.
+        Valid once ``close()`` has reaped the children — before that the map is
+        empty, because the record is copied out of a child's mailbox only after
+        that child is reaped and before its shared memory is closed. A child
+        that outlives the close deadline is read by the cleanup journal's retry
+        at the same two points, so a late publication is still collected.
+
+        Three answers, deliberately distinct. A missing key is a child this
+        Worker never reaped. A key whose record has ``committed`` false is a
+        child that was reaped but published nothing valid — it died before or
+        during the write, or its backend records no teardown. Anything else is
+        what that child's teardown did.
+
+        Observation only. A confirmed reset invalidates that device
+        generation's allocations rather than making an old device pointer
+        reusable, a reset call that returned 0 on the normal path has no probe
+        behind it, and an unknown record asserts nothing at all.
+        """
+        return dict(self._teardown_reports)
+
     def _release_all_buffers(self) -> None:
         """Close + unlink every owner Buffer (called from close()).
 
@@ -12223,7 +12360,10 @@ class Worker:
 
     @staticmethod
     def _reap_child_groups(  # noqa: PLR0912 -- interleaved reap across groups / bounded poll / conditional shm-free
-        groups: list[tuple[list[SharedMemory], list[int]]], deadline: float
+        groups: list[tuple[list[SharedMemory], list[int]]],
+        deadline: float,
+        report_pids: set[int] | None = None,
+        reports: dict[int, TeardownReport] | None = None,
     ) -> None:
         """Reap + free every child across ALL groups within one shared deadline.
 
@@ -12238,6 +12378,13 @@ class Worker:
         to transfer into the retry journal. An abnormal exit (signal / non-zero
         code) is likewise reported. The first error is raised after every child
         is attempted.
+
+        A pid in ``report_pids`` also has its teardown record copied out of the
+        mailbox here — after the child is reaped, so nothing can still be
+        writing it, and before the shm is closed, which is the last moment it
+        is readable. A reaped child that published nothing valid yields an
+        uncommitted record; a child that never reaps yields no entry at all,
+        which is a different answer.
         """
         errors: list[BaseException] = []
         bad_exits: list[str] = []
@@ -12283,6 +12430,8 @@ class Worker:
                     keep_shms.append(shms[i])
                     continue
                 try:
+                    if report_pids is not None and reports is not None and pids[i] in report_pids:
+                        reports[pids[i]] = _read_teardown_report(shms[i], pids[i])
                     shms[i].close()
                     try:
                         shms[i].unlink()
@@ -12332,7 +12481,9 @@ class Worker:
         ]
         reap_error: BaseException | None = None
         try:
-            self._reap_child_groups(groups, deadline)
+            # Only chip children run a device teardown, so only their mailboxes
+            # carry a record to collect.
+            self._reap_child_groups(groups, deadline, set(self._chip_pids), self._teardown_reports)
         except BaseException as exc:  # noqa: BLE001
             reap_error = exc
 
@@ -12348,6 +12499,7 @@ class Worker:
             self._next_level_shms,
             self._next_level_pids,
             set(),
+            self._teardown_reports,
         )
         self._sub_pids.clear()
         self._chip_pids.clear()

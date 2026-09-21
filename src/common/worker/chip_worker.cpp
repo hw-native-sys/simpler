@@ -260,6 +260,9 @@ void ChipWorker::init(
         // caller reports it.
         probe_run_retention_fn_ =
             reinterpret_cast<SimplerProbeRunRetentionFn>(dlsym(handle, "simpler_probe_run_retention"));
+        // Optional for the same reason: a module that records no teardown does
+        // not export this, and a null is that fact rather than a stale build.
+        get_teardown_report_fn_ = reinterpret_cast<GetTeardownReportFn>(dlsym(handle, "get_teardown_report"));
         supports_concurrent_native_prepare_fn_ =
             load_symbol<SupportsConcurrentNativePrepareFn>(handle, "supports_concurrent_native_prepare_ctx");
         get_arena_bank_gm_heap_base_fn_ =
@@ -414,6 +417,7 @@ void ChipWorker::init(
         wait_run_fn_ = nullptr;
         finalize_run_fn_ = nullptr;
         probe_run_retention_fn_ = nullptr;
+        get_teardown_report_fn_ = nullptr;
         supports_concurrent_native_prepare_fn_ = nullptr;
         get_arena_bank_gm_heap_base_fn_ = nullptr;
         get_retained_temp_addr_fn_ = nullptr;
@@ -477,6 +481,7 @@ void ChipWorker::init(
         wait_run_fn_ = nullptr;
         finalize_run_fn_ = nullptr;
         probe_run_retention_fn_ = nullptr;
+        get_teardown_report_fn_ = nullptr;
         supports_concurrent_native_prepare_fn_ = nullptr;
         get_arena_bank_gm_heap_base_fn_ = nullptr;
         get_retained_temp_addr_fn_ = nullptr;
@@ -523,6 +528,29 @@ void ChipWorker::init(
     run_lane_ = std::make_unique<ChipRunLane>(*this);
 }
 
+void ChipWorker::capture_teardown_report_noexcept() noexcept {
+    if (teardown_report_captured_ || get_teardown_report_fn_ == nullptr || device_ctx_ == nullptr) return;
+    SimplerTeardownReport report{};
+    int rc = PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        rc = get_teardown_report_fn_(device_ctx_, &report, sizeof(report));
+    } catch (...) {
+        // Observation must never displace the teardown outcome the caller is
+        // about to be told about, so a capture failure stays silent and leaves
+        // the record absent.
+        return;
+    }
+    if (rc != 0 || report.schema != TEARDOWN_REPORT_SCHEMA) return;
+    teardown_report_ = report;
+    teardown_report_captured_ = true;
+}
+
+bool ChipWorker::teardown_report(SimplerTeardownReport *out) const {
+    if (out == nullptr || !teardown_report_captured_) return false;
+    *out = teardown_report_;
+    return true;
+}
+
 void ChipWorker::finalize() {
     if (run_lane_ != nullptr) {
         try {
@@ -550,6 +578,12 @@ void ChipWorker::finalize() {
     int device_finalize_rc = 0;
     if (device_ctx_ != nullptr && finalize_device_fn_ != nullptr && initialized_) {
         device_finalize_rc = finalize_device_fn_(device_ctx_);
+        // Immediately after the teardown call and before both the throw below
+        // and the context destruction / dlclose a success runs into: that is
+        // the only window in which the recording owner is still reachable.
+        // `finalize_device` catches everything and returns an rc, so a
+        // sequential call here covers the failing teardown too.
+        capture_teardown_report_noexcept();
     }
     // A context whose teardown did not complete still owns device resources,
     // and unloading the library that owns their release routines — or
@@ -587,6 +621,7 @@ void ChipWorker::finalize() {
     wait_run_fn_ = nullptr;
     finalize_run_fn_ = nullptr;
     probe_run_retention_fn_ = nullptr;
+    get_teardown_report_fn_ = nullptr;
     supports_concurrent_native_prepare_fn_ = nullptr;
     get_arena_bank_gm_heap_base_fn_ = nullptr;
     get_retained_temp_addr_fn_ = nullptr;

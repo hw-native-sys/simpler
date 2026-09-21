@@ -79,6 +79,7 @@
 #include "host/pmu_collector.h"
 #include "host/run_evidence_retention.h"
 #include "host/run_completion_fence.h"
+#include "host/teardown_recorder.h"
 #include "host/run_outcome_decision.h"
 #include "host/runtime_timeout_config.h"
 #include "host/scope_stats_collector.h"
@@ -820,6 +821,16 @@ public:
      * same AICore image. Arches whose runs use the persistent pair report 0.
      */
     virtual size_t run_stream_set_create_count() const { return 0; }
+
+    /**
+     * Copy out what this runner's `finalize()` observed about its own device
+     * teardown, if it recorded one.
+     *
+     * A runner that records nothing answers false, which is how a backend
+     * outside the recording scope reports "no observation" rather than a
+     * teardown that did not happen.
+     */
+    bool copy_teardown_report(SimplerTeardownReport *out) const { return teardown_recorder_.copy_to(out); }
 
     /**
      * Device-orchestration callable registration used internally by
@@ -1887,6 +1898,11 @@ protected:
     // pointer because the fence is non-copyable, so the array cannot be
     // brace-initialised without naming every slot.
     std::array<std::unique_ptr<RunCompletionFence>, PTO_PIPELINE_MAX_DEPTH> run_fences_;
+
+    // What this runner's finalize() observed about its own device teardown.
+    // Outlives nothing: `copy_teardown_report` must be called while the runner
+    // is alive, which is why the C entry sits before context destruction.
+    TeardownRecorder teardown_recorder_;
 
     // Whether this runner holds a reference on the process's fault-notification
     // callback, which process took it, and where this runner has read up to.
