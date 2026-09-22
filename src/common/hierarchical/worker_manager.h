@@ -246,6 +246,10 @@ static constexpr uint64_t CTRL_COMMITTED_DEVICE_MEMORY = 18;
 // L4-to-local-L3 envelope. Query a chip child's device-wide ACL_HBM_MEM
 // snapshot; the child writes one DeviceMemoryInfo at CTRL_OFF_RESULT.
 static constexpr uint64_t CTRL_DEVICE_MEMORY_INFO = 25;
+// 26 is reserved by the Python delegated-region control (below). Publish every
+// diagnostic run this chip child has closed, and report what it published. The
+// child writes one DfxFlushReport at CTRL_OFF_RESULT.
+static constexpr uint64_t CTRL_DFX_FLUSH = 27;
 // 26 is reserved by the Python delegated-region control. It carries the DRCT
 // envelope on control_payload at every hop of the recursive single-owner
 // region protocol, so no C++ endpoint method claims it.
@@ -255,6 +259,21 @@ static constexpr uint64_t CTRL_DEVICE_MEMORY_INFO = 25;
 //   offset 40: uint64 result (returned ptr from malloc)
 static constexpr ptrdiff_t CTRL_OFF_ARG0 = 16;
 static constexpr ptrdiff_t CTRL_OFF_RESULT = 40;
+
+/**
+ * CTRL_DFX_FLUSH result, written by the child at CTRL_OFF_RESULT.
+ *
+ * Fixed width and small enough to share the control frame's existing result
+ * slot, so the mailbox gains no bytes. `published` counts runs whose artifact
+ * exists, which includes a partial one — an incomplete receipt that is
+ * represented in a published file is a verdict, not a missing output.
+ */
+struct DfxFlushReport {
+    uint64_t session_id;
+    uint64_t watermark_epoch;
+    uint64_t published;
+    uint64_t failed;
+};
 
 // CTRL_REGISTER puts the NUL-terminated POSIX shm name at MAILBOX_OFF_ARGS,
 // the exact staged blob size at CTRL_OFF_ARG0, and the callable digest
@@ -406,6 +425,15 @@ public:
     virtual uint64_t control_malloc(size_t size);
     virtual uint64_t control_committed_device_memory();
     virtual DeviceMemoryInfo control_device_memory_info();
+    /**
+     * Publish every diagnostic run this child has closed, and report.
+     *
+     * `timeout_s` bounds only the waits it is passed to; the mailbox mutex and
+     * the caller-side leases are not timed, so the call can exceed it in
+     * wall-clock terms. A timeout poisons this endpoint — see
+     * run_control_command — after which no control command may reuse it.
+     */
+    virtual DfxFlushReport control_dfx_flush(double timeout_s);
     virtual void control_free(uint64_t ptr);
     virtual void control_copy_to(const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span);
     virtual void control_copy_from(const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span);
@@ -469,6 +497,7 @@ public:
     uint64_t control_malloc(size_t size) override;
     uint64_t control_committed_device_memory() override;
     DeviceMemoryInfo control_device_memory_info() override;
+    DfxFlushReport control_dfx_flush(double timeout_s) override;
     void control_free(uint64_t ptr) override;
     void control_copy_to(const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span) override;
     void control_copy_from(const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span) override;
@@ -643,6 +672,7 @@ public:
     uint64_t control_malloc(size_t size);
     uint64_t control_committed_device_memory();
     DeviceMemoryInfo control_device_memory_info();
+    DfxFlushReport control_dfx_flush(double timeout_s);
     void control_free(uint64_t ptr);
     void control_copy_to(const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span);
     void control_copy_from(const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span);

@@ -1451,6 +1451,7 @@ class ChipWorker:
         log_level: int | None = None,
         prewarm_config: CallConfig | None = None,
         enable_sdma: bool = False,
+        dfx_session: bool = False,
     ):
         """Attach the calling thread to ``device_id``, load the host runtime
         library, and cache platform binaries.
@@ -1476,6 +1477,11 @@ class ChipWorker:
             log_level: Threshold (10=DEBUG, 20=INFO, 25=TIMING, 30=WARN,
                 40=ERROR, 60=NUL). Defaults to a snapshot of the simpler
                 logger via `_log.get_current_config()`.
+            dfx_session: Keep one continuous diagnostic collection session
+                across runs instead of draining and exporting at every run
+                boundary. Off by default, and off means today's behaviour in
+                every respect — including that a run's swimlane file exists
+                when its `run()` returns.
 
         For tests that need to drive the binding directly with arbitrary path
         strings (e.g. to assert dlopen failure on `/nonexistent/foo.so`), call
@@ -1509,12 +1515,22 @@ class ChipWorker:
                 bool(enable_sdma),
                 "" if sim_context_path is None else str(sim_context_path),
                 "" if sdma_warmup_path is None else str(sdma_warmup_path),
+                bool(dfx_session),
             )
             for slot_id, callable_obj in list(self._callable_registry.items()):
                 self._impl.register_callable(int(slot_id), callable_obj)
         finally:
             with self._lifecycle_lock:
                 self._init_in_progress = False
+
+    def flush_diagnostics(self, timeout_ms: int = 30000) -> None:
+        """Publish every diagnostic run this chip has closed.
+
+        A no-op unless `init(dfx_session=True)` opened a session. Raises
+        RuntimeError when a run that was promised a file did not get one; a
+        published partial carries its verdict in the file and is not a failure.
+        """
+        self._impl.flush_diagnostics(int(timeout_ms))
 
     def finalize(self):
         """Tear down everything: device resources and runtime library.

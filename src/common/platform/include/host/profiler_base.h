@@ -224,11 +224,13 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <limits>
 #include <optional>
+#include <mutex>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -238,6 +240,7 @@
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "host/buffer_pool_manager.h"
+#include "host/chip_swimlane_session.h"
 #include "host/profiling_copy.h"
 #include "../../../worker/runtime_c_api.h"
 
@@ -314,7 +317,10 @@ public:
         if (committed_) return;
         for (void *p : direct_ptrs_) {
             if (p != nullptr && release_fn_) {
-                release_fn_(p);
+                // The status is observed, not discarded: a rollback that could
+                // not free what it allocated leaves memory held, and the
+                // manager's paired occupancy has to keep reflecting it.
+                if (int rc = release_fn_(p); rc != 0) manager_.note_release_failed(p, rc);
             }
         }
         // Call release_all_owned unconditionally: it also frees malloc'd
@@ -324,7 +330,7 @@ public:
         // lambda instead.
         manager_.release_all_owned([this](void *p) {
             if (p != nullptr && release_fn_) {
-                release_fn_(p);
+                if (int rc = release_fn_(p); rc != 0) manager_.note_release_failed(p, rc);
             }
         });
     }
@@ -1203,7 +1209,10 @@ protected:
             }
         }
         if (free_cb) {
-            free_cb(release_ptr);
+            // A release that does not report success leaves memory held, so the
+            // manager's paired occupancy keeps counting it rather than treating
+            // an emptied mapping table as proof.
+            if (int rc = free_cb(release_ptr); rc != 0) manager_.note_release_failed(release_ptr, rc);
         }
     }
 
@@ -1243,7 +1252,7 @@ protected:
             int rc = register_cb_(dev_ptr, size, device_id_, &host_ptr);
             if (rc != 0 || host_ptr == nullptr) {
                 LOG_ERROR("ProfilerBase::alloc_paired_buffer: register_cb_ failed: %d", rc);
-                if (free_cb_) free_cb_(dev_ptr);
+                release_unregistered_buffer(dev_ptr);
                 return nullptr;
             }
         } else if (copy_to_device_) {
@@ -1251,7 +1260,7 @@ protected:
             host_ptr = std::malloc(size);
             if (host_ptr == nullptr) {
                 LOG_ERROR("ProfilerBase::alloc_paired_buffer: host shadow alloc failed for %zu bytes", size);
-                if (free_cb_) free_cb_(dev_ptr);
+                release_unregistered_buffer(dev_ptr);
                 return nullptr;
             }
             std::memset(host_ptr, 0, size);
@@ -1259,7 +1268,7 @@ protected:
             if (rc != 0) {
                 LOG_ERROR("ProfilerBase::alloc_paired_buffer: copy_to_device failed: %d", rc);
                 std::free(host_ptr);
-                if (free_cb_) free_cb_(dev_ptr);
+                release_unregistered_buffer(dev_ptr);
                 return nullptr;
             }
             manager_.add_malloc_shadow(host_ptr);
@@ -1273,7 +1282,318 @@ protected:
         return dev_ptr;
     }
 
+    /**
+     * Release a device pointer this allocation never registered, recording a
+     * release that did not report success.
+     *
+     * Each of the three paths above returns before `register_mapping`, so the
+     * pointer never reaches the manager's mapping table and the init rollback
+     * guard can neither release it nor observe what happened to it: this is the
+     * only place its outcome can be recorded. A context with no free callback
+     * cannot release the pointer at all, which is the same conclusion — the
+     * memory is still held — and is recorded the same way.
+     */
+    void release_unregistered_buffer(void *dev_ptr) {
+        if (dev_ptr == nullptr) return;
+        const int rc = free_cb_ ? free_cb_(dev_ptr) : -1;
+        if (rc != 0) manager_.note_release_failed(dev_ptr, rc);
+    }
+
+    // -------------------------------------------------------------------------
+    // Continuous-session transport cut
+    // -------------------------------------------------------------------------
+    //
+    // A finite, per-queue proof that one run's published buffers have all been
+    // delivered and processed, usable while a successor keeps publishing. An
+    // empty-sweep observation cannot do that: `found_any` is set by any entry on
+    // any queue, so a busy successor keeps every sweep non-empty and the
+    // quiescence ack never lands. The cut instead fixes a *target count* per
+    // queue at one instant and then watches monotonic counters reach it.
+    //
+    // Every value below is written by exactly one thread: a queue's counters by
+    // the drain owner that serves it (owner `q % shard_count_`), a shard's
+    // processed counter by that collector thread. Nothing here is read or
+    // written unless a session has armed a slot, so the five other profilers
+    // pay one relaxed load per sweep and nothing else.
+
+    static constexpr size_t kMaxCutSlots = 2;
+    static constexpr size_t kMaxCutQueues = static_cast<size_t>(PLATFORM_MAX_AICPU_THREADS);
+
+    /**
+     * A cut slot's lifecycle.
+     *
+     * `Published` is the only state in which a drain owner may touch the
+     * per-queue arrays, and a slot reaches it only after they are initialized.
+     * It returns to `Free` only once every owner has proved it is no longer
+     * inside them, so the next arm cannot reinitialize an array under a reader
+     * that observed the previous incarnation.
+     */
+    enum class CutState : int { Free = 0, Reserved, Published, Retiring };
+
+    struct CutSlot {
+        std::atomic<int> state{static_cast<int>(CutState::Free)};
+        // Per queue, written once by that queue's owner when it captures the cut
+        // at an entry boundary and read afterwards by that same owner. No other
+        // thread reads `target`.
+        std::array<uint64_t, kMaxCutQueues> target{};
+        // 0 unarmed, 1 armed, 2 capture failed. Written by the queue's owner and
+        // read by the session thread, so the access is atomic even though the
+        // writer is unique.
+        std::array<std::atomic<uint8_t>, kMaxCutQueues> qstate{};
+        // Per drain owner, published when every queue it serves has reached its
+        // own target. The count of pushes at or before that instant is what the
+        // collector side must catch up to.
+        std::array<std::atomic<uint64_t>, Manager::kMaxCollectorShards> push_watermark{};
+        std::array<std::atomic<uint8_t>, Manager::kMaxCollectorShards> stage1{};
+    };
+
+    /**
+     * Arm a cut. Returns its slot index, or -1 when both slots are in use.
+     *
+     * `request_out` receives the capture request this arm published; every
+     * later question about the cut is asked against that value, because an ack
+     * for a *different* request says nothing about this capture.
+     *
+     * The caller must be holding the run's execution claim: the capture reads
+     * `queue_tails[q]`, which is stable only while no producer is running.
+     */
+    int cut_arm(uint64_t *request_out) {
+        if (request_out == nullptr) return -1;
+        *request_out = 0;
+        if (!simpler::dfx::session::counter_headroom(cut_request_.load(std::memory_order_relaxed))) {
+            note_counter_exhausted("cut request generation");
+            return -1;
+        }
+        for (size_t slot = 0; slot < kMaxCutSlots; slot++) {
+            int expected = static_cast<int>(CutState::Free);
+            if (!cut_slots_[slot].state.compare_exchange_strong(
+                    expected, static_cast<int>(CutState::Reserved), std::memory_order_acq_rel
+                )) {
+                continue;
+            }
+            // Reserved and not yet published, so no drain owner may read any of
+            // this: initialize first, publish second.
+            CutSlot &s = cut_slots_[slot];
+            s.target.fill(0);
+            for (size_t q = 0; q < kMaxCutQueues; q++)
+                s.qstate[q].store(0, std::memory_order_relaxed);
+            for (int i = 0; i < Manager::kMaxCollectorShards; i++) {
+                s.push_watermark[i].store(0, std::memory_order_relaxed);
+                s.stage1[i].store(0, std::memory_order_relaxed);
+            }
+            s.state.store(static_cast<int>(CutState::Published), std::memory_order_release);
+            *request_out = cut_bump_request();
+            return static_cast<int>(slot);
+        }
+        return -1;
+    }
+
+    /** Every drain owner has acknowledged a boundary pass at or after `request`. */
+    bool cut_acked(uint64_t request) const {
+        for (int i = 0; i < shard_count_; i++) {
+            // `>=` and not `==`: an ack is monotonic, so an owner that has moved
+            // past this request has certainly passed a boundary after it.
+            if (cut_ack_[i].load(std::memory_order_acquire) < request) return false;
+        }
+        return true;
+    }
+
+    /** Block until `request` is acknowledged by every owner, or the budget runs out. */
+    bool cut_wait_for_ack(uint64_t request, int timeout_ms) {
+        if (!mgmt_running_.load(std::memory_order_acquire)) return cut_acked(request);
+        std::unique_lock<std::mutex> lk(cut_mu_);
+        return cut_cv_.wait_for(lk, std::chrono::milliseconds(timeout_ms), [this, request] {
+            return cut_acked(request);
+        });
+    }
+
+    /** Stage 1: every owner reports all of its own queues at their targets. */
+    bool cut_stage1_done(int slot) const {
+        if (slot < 0 || static_cast<size_t>(slot) >= kMaxCutSlots) return false;
+        const CutSlot &s = cut_slots_[static_cast<size_t>(slot)];
+        if (s.state.load(std::memory_order_acquire) != static_cast<int>(CutState::Published)) return false;
+        for (int i = 0; i < shard_count_; i++) {
+            if (s.stage1[i].load(std::memory_order_acquire) == 0) return false;
+        }
+        return true;
+    }
+
+    /** Stage 2: every collector shard has processed up to its owner's watermark. */
+    bool cut_stage2_done(int slot) const {
+        if (!cut_stage1_done(slot)) return false;
+        const CutSlot &s = cut_slots_[static_cast<size_t>(slot)];
+        for (int i = 0; i < shard_count_; i++) {
+            if (ring_processed_[i].load(std::memory_order_acquire) <
+                s.push_watermark[i].load(std::memory_order_acquire)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * How many of this cut's queues could not be captured.
+     *
+     * False means *unknown*, not zero: until every drain owner has
+     * acknowledged the capture request, a queue that has not been visited yet
+     * is indistinguishable from one that succeeded, so reporting zero failures
+     * would be the absence of a report dressed up as a clean one.
+     */
+    bool cut_failed_queues(int slot, uint64_t request, int *failed_out) const {
+        if (failed_out == nullptr) return false;
+        if (slot < 0 || static_cast<size_t>(slot) >= kMaxCutSlots) return false;
+        const CutSlot &s = cut_slots_[static_cast<size_t>(slot)];
+        if (s.state.load(std::memory_order_acquire) != static_cast<int>(CutState::Published)) return false;
+        if (!cut_acked(request)) return false;
+        int failed = 0;
+        for (int q = 0; q < queue_count_ && static_cast<size_t>(q) < kMaxCutQueues; q++) {
+            if (s.qstate[static_cast<size_t>(q)].load(std::memory_order_acquire) == 2) failed++;
+        }
+        *failed_out = failed;
+        return true;
+    }
+
+    /**
+     * Retire a cut and hand its slot back.
+     *
+     * Marking the slot non-published is not enough on its own: a drain owner
+     * that already observed `Published` may still be inside the slot's arrays,
+     * and the next arm would reinitialize them under it. So the retirement
+     * publishes a fresh capture request *after* the state change and waits for
+     * every owner to acknowledge a boundary pass that began after it — a pass
+     * that, by the acquire on the request, must have observed `Retiring` and
+     * therefore touched nothing. Earlier passes on that thread are finished by
+     * program order.
+     *
+     * Returns false on timeout; the slot then stays retired for good rather
+     * than being handed to a reader-visible reuse.
+     */
+    bool cut_release(int slot, int timeout_ms) {
+        if (slot < 0 || static_cast<size_t>(slot) >= kMaxCutSlots) return true;
+        CutSlot &s = cut_slots_[static_cast<size_t>(slot)];
+        int expected = static_cast<int>(CutState::Published);
+        if (!s.state.compare_exchange_strong(
+                expected, static_cast<int>(CutState::Retiring), std::memory_order_acq_rel
+            )) {
+            if (expected == static_cast<int>(CutState::Reserved)) {
+                // Reserved but never published: no drain owner can have seen it.
+                s.state.store(static_cast<int>(CutState::Free), std::memory_order_release);
+                return true;
+            }
+            // Already free, or being retired by somebody else — either way this
+            // caller must not hand it back a second time.
+            return expected == static_cast<int>(CutState::Free);
+        }
+        if (!mgmt_running_.load(std::memory_order_acquire)) {
+            // No drain owner is running, so there is no reader to retire behind.
+            s.state.store(static_cast<int>(CutState::Free), std::memory_order_release);
+            return true;
+        }
+        const uint64_t request = cut_bump_request();
+        if (!cut_wait_for_ack(request, timeout_ms)) {
+            LOG_ERROR(
+                "%s: cut slot %d could not be retired within %d ms; it is not reused", Module::kSubsystemName, slot,
+                timeout_ms
+            );
+            return false;
+        }
+        s.state.store(static_cast<int>(CutState::Free), std::memory_order_release);
+        return true;
+    }
+
+    /**
+     * Bound the entries one queue may consume before the sweep rotates.
+     *
+     * Zero keeps today's behaviour — drain each queue until it reports empty —
+     * which starves a quiet queue while a busy sibling is served, and therefore
+     * starves that queue's stage 1. A session sets a finite quantum; nothing
+     * else does.
+     */
+    void set_drain_quantum(int quantum) { drain_quantum_.store(quantum, std::memory_order_relaxed); }
+
+    /**
+     * Arm or disarm the session's per-entry transport counters.
+     *
+     * Armed for a session's whole life, not per cut: a counter that started
+     * counting at the first arm would have missed every entry consumed before
+     * it, and stage 1 compares a target captured from that same counter. While
+     * disarmed — which is every profiler that never opens a session — the drain
+     * loop pays one relaxed load per queue visit and the collector one per
+     * buffer, and no atomic is written.
+     */
+    void set_session_counters(bool on) { session_counters_on_.store(on, std::memory_order_release); }
+
+    /** A transport counter ran out of headroom; no cut can be trusted after this. */
+    bool cut_counters_exhausted() const { return cut_counter_exhausted_.load(std::memory_order_acquire); }
+
+    /**
+     * Publish a reference-release request and wait for every collector shard.
+     *
+     * The shard loads this epoch *before* refreshing its own view of the
+     * session's epoch table, so an ack can never describe a view taken before
+     * the caller marked an epoch non-admitting. Returns false on timeout, and a
+     * false return is never permission to free: the caller quarantines.
+     */
+    bool session_request_reference_release(int timeout_ms) {
+        // One requester at a time. Two overlapping requests would each wait for
+        // their own epoch value while a shard, which only ever adopts the
+        // newest, could skip the older one entirely — so the older waiter would
+        // time out and quarantine a bucket that was in fact released.
+        std::lock_guard<std::mutex> lk(session_control_mu_);
+        if (!simpler::dfx::session::counter_headroom(session_control_epoch_.load(std::memory_order_relaxed))) {
+            note_counter_exhausted("session control epoch");
+            return false;
+        }
+        const uint64_t epoch = session_control_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        manager_.notify_ready_waiters();
+        std::unique_lock<std::mutex> wait_lk(cut_mu_);
+        return cut_cv_.wait_for(wait_lk, std::chrono::milliseconds(timeout_ms), [this, epoch] {
+            for (int i = 0; i < shard_count_; i++) {
+                // `>=` and not `==`: an ack is monotonic, and a shard that has
+                // already moved past this epoch has certainly passed it.
+                if (session_control_acked_[i].load(std::memory_order_acquire) < epoch) return false;
+            }
+            return true;
+        });
+    }
+
 private:
+    /** Publish a capture request and return it. Acks are compared against it. */
+    uint64_t cut_bump_request() { return cut_request_.fetch_add(1, std::memory_order_acq_rel) + 1; }
+
+    /**
+     * A transport counter has come within `kCounterMargin` of wrapping.
+     *
+     * Reported once and sticky: a wrapped counter makes every target
+     * comparison meaningless, so the session refuses rather than publishing a
+     * cut it cannot justify. Waiters are woken because the refusal is what they
+     * are waiting to learn.
+     */
+    void note_counter_exhausted(const char *what) {
+        bool expected = false;
+        if (!cut_counter_exhausted_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
+        LOG_ERROR(
+            "%s: session %s counter is out of headroom; no further cut is trustworthy", Module::kSubsystemName, what
+        );
+        {
+            std::lock_guard<std::mutex> lk(cut_mu_);
+            cut_cv_.notify_all();
+        }
+        notify_session_progress(0);
+    }
+
+    /**
+     * Wake anything waiting on an ack.
+     *
+     * The mutex is taken after the ack store is already visible, so a waiter
+     * either evaluates its predicate afterwards and sees the ack, or is already
+     * blocked and is woken here. There is no window in between.
+     */
+    void cut_notify_ack() {
+        std::lock_guard<std::mutex> lk(cut_mu_);
+        cut_cv_.notify_all();
+    }
+
     // Teardown-path wait, so a sleep is permitted here: no task's latency
     // passes through it (codestyle.md rule 5 exempts teardown).
     template <typename Acks>
@@ -1314,7 +1634,16 @@ private:
             bool found_any = false;
             bool retired_or_delivered = false;
             for (int q = queue_start; q < queue_count_; q += queue_stride) {
+                // Entry boundary: nothing of this queue's head is half-processed
+                // here, so the session's capture and its stage-1 check see a
+                // consistent (head, consumed, queue contents) triple. Checked on
+                // every visit, including a queue that turns out to be empty and
+                // one whose last outcome was a retry, so a busy sibling can never
+                // hide a pending request.
+                session_drain_boundary(header, queue_start, queue_stride);
                 ReadyEntry entry;
+                int served = 0;
+                const int quantum = drain_quantum_.load(std::memory_order_relaxed);
                 while (Alg::try_peek_aicpu_entry(manager_, header, q, entry, true)) {
                     // A null free_queue is the "nothing to retry" sentinel;
                     // process_entry only writes this on a short top-up.
@@ -1344,12 +1673,20 @@ private:
                     since = std::chrono::steady_clock::time_point{};
                     if (outcome == EntryOutcome::kDropped) {
                         drain_dropped_buffers_.fetch_add(1, std::memory_order_relaxed);
+                        session_note_retired(q);
+                    } else {
+                        session_note_delivered(q, queue_start);
                     }
                     if (short_site.free_queue != nullptr) {
                         record_short_site(short_sites, q, short_site);
                     }
+                    // Rotate after a bounded number of entries so a sustained
+                    // producer on this queue cannot starve a sibling — and with
+                    // it, that sibling's cut. Zero means today's drain-to-empty.
+                    if (quantum > 0 && ++served >= quantum) break;
                 }
             }
+            session_drain_boundary(header, queue_start, queue_stride);
             if (retired_or_delivered) {
                 idle_busy_polls = 0;
             }
@@ -1404,6 +1741,121 @@ private:
                 }
             }
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Session cut bookkeeping, all single-writer
+    // -------------------------------------------------------------------------
+
+    /** Count one entry this owner delivered to its collector shard. */
+    void session_note_delivered(int q, int owner) {
+        if (!session_counters_on_.load(std::memory_order_relaxed)) return;
+        if (static_cast<size_t>(q) >= kMaxCutQueues || owner < 0 || owner >= Manager::kMaxCollectorShards) return;
+        const bool ok = simpler::dfx::session::checked_increment(consumed_total_[static_cast<size_t>(q)]) &&
+                        simpler::dfx::session::checked_increment(pushed_total_[static_cast<size_t>(owner)]);
+        if (!ok) note_counter_exhausted("per-queue transport");
+    }
+
+    /**
+     * Count one entry this owner consumed without delivering it.
+     *
+     * A retired entry is consumed as far as the cut is concerned — its slot is
+     * gone and no collector will ever see it — so the target stays reachable.
+     * The loss itself is already reported by `drain_dropped_buffers_`.
+     */
+    void session_note_retired(int q) {
+        if (!session_counters_on_.load(std::memory_order_relaxed)) return;
+        if (static_cast<size_t>(q) >= kMaxCutQueues) return;
+        if (!simpler::dfx::session::checked_increment(consumed_total_[static_cast<size_t>(q)])) {
+            note_counter_exhausted("per-queue transport");
+        }
+    }
+
+    /**
+     * The only place a cut is captured or advanced.
+     *
+     * Called at entry boundaries only, which is what makes the triple it reads
+     * consistent. Arming refreshes the tail narrowly through the same
+     * per-word call `try_peek_aicpu_entry` uses, and issues it from the word's
+     * sole owner so the host shadow keeps one writer.
+     *
+     * A slot is touched only in `Published`, which is published after its
+     * arrays are initialized and withdrawn before they are reinitialized — and
+     * the ack this pass writes at the end is what proves to a retiring cut that
+     * this owner is no longer inside them.
+     */
+    void session_drain_boundary(DataHeader *header, int queue_start, int queue_stride) {
+        if (!session_counters_on_.load(std::memory_order_relaxed)) return;
+        const uint64_t request = cut_request_.load(std::memory_order_acquire);
+        const bool capture_pending = cut_ack_[queue_start].load(std::memory_order_relaxed) < request;
+        bool progressed = false;
+
+        for (size_t slot = 0; slot < kMaxCutSlots; slot++) {
+            CutSlot &s = cut_slots_[slot];
+            if (s.state.load(std::memory_order_acquire) != static_cast<int>(CutState::Published)) continue;
+            for (int q = queue_start; q < queue_count_ && static_cast<size_t>(q) < kMaxCutQueues; q += queue_stride) {
+                if (s.qstate[static_cast<size_t>(q)].load(std::memory_order_relaxed) != 0) continue;
+                uint32_t tail = 0;
+                uint32_t head = 0;
+                if (!session_capture_queue(header, q, &head, &tail)) {
+                    // CaptureFailed: this queue's stage 1 is unknown and is
+                    // never satisfied by default.
+                    s.qstate[static_cast<size_t>(q)].store(2, std::memory_order_release);
+                    continue;
+                }
+                const uint32_t outstanding = (tail + Module::kReadyQueueSize - head) % Module::kReadyQueueSize;
+                s.target[static_cast<size_t>(q)] =
+                    consumed_total_[static_cast<size_t>(q)].load(std::memory_order_relaxed) + outstanding;
+                s.qstate[static_cast<size_t>(q)].store(1, std::memory_order_release);
+            }
+            if (s.stage1[queue_start].load(std::memory_order_relaxed) != 0) continue;
+            bool all_reached = true;
+            for (int q = queue_start; q < queue_count_ && static_cast<size_t>(q) < kMaxCutQueues; q += queue_stride) {
+                const uint8_t state = s.qstate[static_cast<size_t>(q)].load(std::memory_order_relaxed);
+                if (state == 0) {
+                    all_reached = false;  // not captured yet
+                    break;
+                }
+                if (state == 2) continue;  // failed queues cannot be waited for
+                if (consumed_total_[static_cast<size_t>(q)].load(std::memory_order_relaxed) <
+                    s.target[static_cast<size_t>(q)]) {
+                    all_reached = false;
+                    break;
+                }
+            }
+            if (all_reached) {
+                s.push_watermark[queue_start].store(
+                    pushed_total_[static_cast<size_t>(queue_start)].load(std::memory_order_relaxed),
+                    std::memory_order_release
+                );
+                s.stage1[queue_start].store(1, std::memory_order_release);
+                progressed = true;
+            }
+        }
+        if (capture_pending) {
+            cut_ack_[queue_start].store(request, std::memory_order_release);
+            cut_notify_ack();
+        }
+        // Stage 1 is what a publisher waits for, so it is woken by the
+        // transition rather than by a timer.
+        if (progressed) notify_session_progress(0);
+    }
+
+    /** Narrow, owner-issued refresh of one queue's cursors. */
+    bool session_capture_queue(DataHeader *header, int q, uint32_t *head_out, uint32_t *tail_out) {
+        if (header == nullptr) return false;
+        if (manager_.read_range_from_device(&header->queue_heads[q], sizeof(header->queue_heads[q])) != 0 ||
+            manager_.read_range_from_device(&header->queue_tails[q], sizeof(header->queue_tails[q])) != 0) {
+            LOG_ERROR("%s: session cut could not refresh ready_queue cursors for thread %d", Module::kSubsystemName, q);
+            return false;
+        }
+        rmb();
+        const uint32_t head = header->queue_heads[q];
+        const uint32_t tail = header->queue_tails[q];
+        if (head >= Module::kReadyQueueSize || tail >= Module::kReadyQueueSize) return false;
+        *head_out = head;
+        *tail_out = tail;
+        return true;
     }
 
     // A stall that has not started yet is never exhausted; one that has is
@@ -1464,6 +1916,27 @@ private:
     }
 
     /**
+     * This shard owes an acknowledgement for the session's epoch table.
+     *
+     * Part of the ready-ring wait predicate, and level-triggered like the
+     * quiescence term: it stays true until the shard stores its ack at the top
+     * of the loop, after the refresh. Notifying the ring is not enough on its
+     * own — `notify_ready_waiters` wakes the consumer but advances no ready
+     * shard's `state_epoch`, so a consumer asleep on an unchanging empty ring
+     * would re-test a predicate that knows nothing about control, find it
+     * false, and sleep out the rest of its 100 ms tick. A request that lands
+     * between the epoch load at the top of the loop and the wait is the same
+     * case with the same answer: the condition is in the predicate, so the wait
+     * returns at once instead of timing out. `session_run_begin` blocks on this
+     * acknowledgement before a device launch, so that tick would be paid by
+     * every run.
+     */
+    bool session_control_pending(int shard_index) const {
+        return session_control_epoch_.load(std::memory_order_acquire) !=
+               session_control_acked_[shard_index].load(std::memory_order_relaxed);
+    }
+
+    /**
      * Main collector loop. Blocks on one manager ready-queue shard. Ready
      * buffers and lifecycle control requests wake it immediately; the 100 ms
      * cv-wait tick is a fallback for missed data-path notifications and idle
@@ -1485,9 +1958,27 @@ private:
         bool has_seen_buffer = false;
 
         while (true) {
+            // Reference-release handshake, at the top of every iteration and
+            // under load — not only when this shard's ring runs dry. The control
+            // epoch is read *before* the snapshot refresh so this ack can never
+            // describe a view taken before the session marked an epoch
+            // non-admitting, and it is emitted while this shard holds no bucket
+            // reference.
+            {
+                const uint64_t ctrl = session_control_epoch_.load(std::memory_order_acquire);
+                if (ctrl != session_control_acked_[shard_index].load(std::memory_order_relaxed)) {
+                    refresh_session_view(shard_index, 0);
+                    session_control_acked_[shard_index].store(ctrl, std::memory_order_release);
+                    cut_notify_ack();
+                }
+            }
+            // Refreshed and acked above, so the control term of the wait
+            // predicate below is false again by the time the wait is entered
+            // unless a newer request has already arrived.
             ReadyBufferInfo info;
             if (manager_.wait_pop_ready(info, wait_tick, shard_index, [this, shard_index] {
-                    return execution_complete_.load(std::memory_order_acquire) || quiesce_pending(shard_index);
+                    return execution_complete_.load(std::memory_order_acquire) || quiesce_pending(shard_index) ||
+                           session_control_pending(shard_index);
                 })) {
                 consume(info, shard_index);
                 has_seen_buffer = true;
@@ -1548,11 +2039,35 @@ private:
         } else {
             static_cast<Derived *>(this)->on_buffer_collected(info);
         }
+        // After the copy, never before: a session's stage 2 is what licenses
+        // moving this shard's records, so the count must not run ahead of them.
+        if (session_counters_on_.load(std::memory_order_relaxed) && shard_index >= 0 &&
+            shard_index < Manager::kMaxCollectorShards) {
+            const uint64_t processed =
+                ring_processed_[static_cast<size_t>(shard_index)].fetch_add(1, std::memory_order_release) + 1;
+            if (!simpler::dfx::session::counter_headroom(processed, 0)) {
+                note_counter_exhausted("per-shard processed");
+            }
+            // Exactly the instant this shard satisfies an armed cut's stage 2,
+            // so the publisher is woken by the event and not by a timer.
+            if (cut_watermark_reached(shard_index, processed)) notify_session_progress(0);
+        }
         if constexpr (Module::kBufferKinds > 1) {
             (void)manager_.notify_copy_done(info.dev_buffer_ptr, Module::kind_of(info), shard_index);
         } else {
             (void)manager_.notify_copy_done(info.dev_buffer_ptr, 0, shard_index);
         }
+    }
+
+    /** True at the step on which this shard reaches an armed cut's watermark. */
+    bool cut_watermark_reached(int shard_index, uint64_t processed) const {
+        for (size_t slot = 0; slot < kMaxCutSlots; slot++) {
+            const CutSlot &s = cut_slots_[slot];
+            if (s.state.load(std::memory_order_acquire) != static_cast<int>(CutState::Published)) continue;
+            if (s.stage1[shard_index].load(std::memory_order_acquire) == 0) continue;
+            if (s.push_watermark[shard_index].load(std::memory_order_acquire) == processed) return true;
+        }
+        return false;
     }
 
     std::vector<std::thread> mgmt_drain_threads_;
@@ -1574,6 +2089,54 @@ private:
     std::atomic<uint64_t> collect_quiesce_epoch_{0};
     std::array<std::atomic<uint64_t>, Manager::kMaxCollectorShards> drain_acked_{};
     std::array<std::atomic<uint64_t>, Manager::kMaxCollectorShards> collect_acked_{};
+
+    // Continuous-session cut state. Inert while no session has armed the
+    // counters: the drain loop pays one relaxed load per queue visit and the
+    // collector one per buffer, and no other profiler arms them.
+    std::array<CutSlot, kMaxCutSlots> cut_slots_{};
+    std::atomic<uint64_t> cut_request_{0};
+    std::array<std::atomic<uint64_t>, Manager::kMaxCollectorShards> cut_ack_{};
+    std::array<std::atomic<uint64_t>, kMaxCutQueues> consumed_total_{};
+    std::array<std::atomic<uint64_t>, Manager::kMaxCollectorShards> pushed_total_{};
+    std::array<std::atomic<uint64_t>, Manager::kMaxCollectorShards> ring_processed_{};
+    std::atomic<int> drain_quantum_{0};
+    std::atomic<bool> session_counters_on_{false};
+    std::atomic<bool> cut_counter_exhausted_{false};
+    std::atomic<uint64_t> session_control_epoch_{0};
+    std::array<std::atomic<uint64_t>, Manager::kMaxCollectorShards> session_control_acked_{};
+    std::mutex session_control_mu_;
+    // Wakeups for the two ack handshakes — capture/retirement and reference
+    // release. Both are waited on by a caller and satisfied by a drain owner or
+    // a collector shard, so neither side spins.
+    std::mutex cut_mu_;
+    std::condition_variable cut_cv_;
+
+    /**
+     * Optional Derived hook: refresh that shard's private view of the session's
+     * epoch table. A collector that defines no such method gets the `long`
+     * overload and no behaviour change — the same overload-rank idiom
+     * `refresh_replenish_metadata` already uses here.
+     */
+    template <typename D = Derived>
+    auto refresh_session_view(int shard_index, int)
+        -> decltype(static_cast<D *>(this)->refresh_session_epoch_view(shard_index), void()) {
+        static_cast<D *>(this)->refresh_session_epoch_view(shard_index);
+    }
+    template <typename D = Derived>
+    void refresh_session_view(int, long) {}
+
+    /**
+     * Optional Derived hook: transport progress a session's publisher is
+     * waiting on has happened. Called only at the exact transitions — a
+     * stage-1 publication, a shard reaching its watermark, a counter refusal —
+     * so the publisher needs no periodic poll to notice them.
+     */
+    template <typename D = Derived>
+    auto notify_session_progress(int) -> decltype(static_cast<D *>(this)->session_note_progress(), void()) {
+        static_cast<D *>(this)->session_note_progress();
+    }
+    template <typename D = Derived>
+    void notify_session_progress(long) {}
 };
 
 }  // namespace profiling_common

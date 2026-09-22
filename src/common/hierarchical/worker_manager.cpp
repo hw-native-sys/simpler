@@ -20,8 +20,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -111,6 +113,19 @@ std::string trace_lease_attrs(Ring *ring, TaskSlot task_slot) {
 // so an iteration count would not map to a bounded wall time.
 constexpr std::chrono::milliseconds kChildLivenessPollPeriod{10};
 
+// Held back from a flush budget so the child has time to pack its report and
+// this side to observe CONTROL_DONE. It shortens the child's wait relative to
+// the parent's; it is not an ordering guarantee — the child's scheduling and
+// reply can exceed it, and a request smaller than the margin leaves the child
+// 1 ms. The parent's own timeout, poisoning and late-response ownership are
+// what remain load-bearing when that happens.
+constexpr uint64_t kChildFlushReplyMarginMs = 250;
+
+// The child's stand-in for an unbounded wait. Its own budget is a millisecond
+// count in an `int`, so "no deadline" is the largest count that fits rather
+// than a sentinel the child would have to special-case.
+constexpr uint64_t kUnboundedChildFlushBudgetMs = static_cast<uint64_t>(std::numeric_limits<int>::max());
+
 std::string child_status_message(int child_pid, int status) {
     std::string msg = "child process pid=" + std::to_string(child_pid) + " exited before mailbox completion";
     if (WIFEXITED(status)) {
@@ -140,6 +155,7 @@ uint64_t WorkerEndpoint::control_committed_device_memory() {
 DeviceMemoryInfo WorkerEndpoint::control_device_memory_info() {
     throw_unsupported_control("control_device_memory_info");
 }
+DfxFlushReport WorkerEndpoint::control_dfx_flush(double) { throw_unsupported_control("control_dfx_flush"); }
 void WorkerEndpoint::control_free(uint64_t) { throw_unsupported_control("control_free"); }
 void WorkerEndpoint::control_copy_to(const BufferDescriptor &, const BufferDescriptor &, const CopySpan &) {
     throw_unsupported_control("control_copy_to");
@@ -1349,6 +1365,58 @@ DeviceMemoryInfo LocalMailboxEndpoint::control_device_memory_info() {
     return info;
 }
 
+DfxFlushReport LocalMailboxEndpoint::control_dfx_flush(double timeout_s) {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    // Checked under the mutex and before any frame byte is written. The other
+    // control methods write their args first and let run_control_command throw,
+    // which leaves a poisoned endpoint's frame mutated; a flush must not, since
+    // the whole point of the poison is that this mailbox is never reused.
+    if (mailbox_control_timed_out_.load(std::memory_order_acquire)) {
+        throw std::runtime_error("control_dfx_flush failed: mailbox has an unresolved timed-out control command");
+    }
+    if (std::isnan(timeout_s)) {
+        throw std::runtime_error("control_dfx_flush: timeout is not a number");
+    }
+    // The child's own budget travels in a0, so its native flush is bounded by
+    // the caller's budget rather than by a ceiling of its own.
+    //
+    //   negative   unbounded, the convention `run_control_command` uses. The
+    //              child's half is the largest millisecond count its `int`
+    //              holds: finite, and far past any real flush.
+    //   < 1 ms     refused here, before a frame byte is written. There is no
+    //              time in which to flush, and issuing a command whose
+    //              deadline has already passed would poison an otherwise
+    //              healthy endpoint. Reachable: both callers hand out a
+    //              clamped remaining budget, and zero is one of its values.
+    //   finite     the request less `kChildFlushReplyMarginMs`, floored at
+    //              1 ms. Shorter than this thread's wait, which makes a
+    //              reported failure the likely answer and not a guaranteed
+    //              one — the wait below still times out and poisons when the
+    //              child does not answer in time, and that poison is what
+    //              keeps a late reply away from a frame somebody else owns.
+    //   huge       clamped to the same `int` ceiling, so no narrowing turns a
+    //              long budget into a short one.
+    uint64_t child_budget_ms = kUnboundedChildFlushBudgetMs;
+    if (timeout_s >= 0.0) {
+        const double requested_ms = timeout_s * 1000.0;
+        if (requested_ms < 1.0) {
+            throw std::runtime_error(
+                "control_dfx_flush: no remaining budget to flush in; the close or flush deadline is already spent"
+            );
+        }
+        const double budget_ms = requested_ms - static_cast<double>(kChildFlushReplyMarginMs);
+        const double kMaxChildBudgetMs = static_cast<double>(kUnboundedChildFlushBudgetMs);
+        child_budget_ms = budget_ms < 1.0               ? 1ULL :
+                          budget_ms > kMaxChildBudgetMs ? kUnboundedChildFlushBudgetMs :
+                                                          static_cast<uint64_t>(budget_ms);
+    }
+    write_control_args(mbox(), CTRL_DFX_FLUSH, child_budget_ms);
+    run_control_command("control_dfx_flush", timeout_s);
+    DfxFlushReport report{};
+    std::memcpy(&report, mbox() + CTRL_OFF_RESULT, sizeof(report));
+    return report;
+}
+
 void LocalMailboxEndpoint::control_prepare(const uint8_t *digest) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
     write_control_args(mbox(), CTRL_PREPARE);
@@ -1538,6 +1606,11 @@ uint64_t WorkerThread::control_committed_device_memory() {
 DeviceMemoryInfo WorkerThread::control_device_memory_info() {
     if (!endpoint_) throw std::runtime_error("control_device_memory_info: null endpoint");
     return endpoint_->control_device_memory_info();
+}
+
+DfxFlushReport WorkerThread::control_dfx_flush(double timeout_s) {
+    if (!endpoint_) throw std::runtime_error("control_dfx_flush: null endpoint");
+    return endpoint_->control_dfx_flush(timeout_s);
 }
 
 void WorkerThread::control_prepare(const uint8_t *digest) {

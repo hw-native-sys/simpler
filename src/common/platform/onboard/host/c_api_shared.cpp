@@ -540,6 +540,10 @@ int finalize_device(DeviceContextHandle ctx) {
             LOG_ERROR("finalize_device: native run must be finalized first");
             return PTO_RUNTIME_ERR_INTERNAL;
         }
+        // Publish whatever the session can still publish and join its thread
+        // before any collector storage is released. A no-op when no session is
+        // open, which is the default.
+        runner->close_diagnostics_session();
         const int rc = runner->finalize();
         return rc;
     } catch (...) {
@@ -1066,6 +1070,22 @@ int simpler_prepare_run(
             static_cast<unsigned long long>(state->descriptor.generation),
             static_cast<unsigned long long>(state->descriptor.run_epoch)
         );
+        // Rejected before any collector, producer or claim mutation. A
+        // host-orchestrated run's orchestrator phases come from a host pool with
+        // its own window rather than from the device producers the session's cut
+        // covers, and whether a bind is host-orchestrating is only known after
+        // it has already mutated state — so the level, which is known here, is
+        // what the session refuses on.
+        if (runner->dfx_session_enabled() &&
+            config->enable_chip_swimlane >= static_cast<int32_t>(ChipSwimlaneLevel::ORCH_PHASES)) {
+            LOG_ERROR(
+                "simpler_prepare_run: dfx_session does not support chip_swimlane level %d (ORCH_PHASES); "
+                "run it without dfx_session",
+                config->enable_chip_swimlane
+            );
+            destroy_native_run_context(state);
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
         const bool allow_prepared_successor = concurrent_native_prepare_supported_impl() != 0;
         if (!runner->try_reserve_native_run(
                 state, state->descriptor.pipeline_slot, state->descriptor.arena_bank, allow_prepared_successor
@@ -1754,6 +1774,34 @@ size_t committed_device_memory_ctx(DeviceContextHandle ctx) {
         return static_cast<DeviceRunnerBase *>(ctx)->committed_device_memory();
     } catch (...) {
         return 0;
+    }
+}
+
+int simpler_set_dfx_session_ctx(DeviceContextHandle ctx, int32_t enabled) {
+    if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        static_cast<DeviceRunnerBase *>(ctx)->set_dfx_session_enabled(enabled != 0);
+        return 0;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int simpler_flush_diagnostics_ctx(DeviceContextHandle ctx, int32_t timeout_ms, char *error, size_t error_capacity) {
+    if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        std::string reason;
+        const int budget = timeout_ms > 0 ? timeout_ms : 30000;
+        const int rc = static_cast<DeviceRunnerBase *>(ctx)->flush_diagnostics(budget, &reason);
+        if (rc != 0 && error != NULL && error_capacity > 0) {
+            std::snprintf(error, error_capacity, "%s", reason.c_str());
+        }
+        return rc;
+    } catch (const std::exception &e) {
+        if (error != NULL && error_capacity > 0) std::snprintf(error, error_capacity, "%s", e.what());
+        return PTO_RUNTIME_ERR_INTERNAL;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 }
 

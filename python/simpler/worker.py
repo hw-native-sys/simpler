@@ -724,6 +724,14 @@ _CTRL_COMMITTED_DEVICE_MEMORY = 18
 _CTRL_GLOBAL_DOMAIN_NODE = 24
 _CTRL_DEVICE_MEMORY_INFO = 25
 _CTRL_OP_NAMES[_CTRL_DEVICE_MEMORY_INFO] = "device_memory_info"
+# Publish every diagnostic run this chip child has closed. 26 is the delegated
+# region control; 27 mirrors worker_manager.h::CTRL_DFX_FLUSH.
+_CTRL_DFX_FLUSH = 27
+_CTRL_OP_NAMES[_CTRL_DFX_FLUSH] = "flush_diagnostics"
+# The native flush wait takes a millisecond count in a C `int`. The wire field
+# is 64-bit, so a malformed frame is clamped here rather than left to fail
+# inside the binding with an overflow that says nothing about the cause.
+_MAX_FLUSH_TIMEOUT_MS = 2**31 - 1
 _CTRL_DELEGATED_REGION = 26
 _LOCAL_GLOBAL_CONTROL_HEADER = struct.Struct("<IIQ")
 _CTRL_OP_NAMES[_CTRL_GLOBAL_DOMAIN_NODE] = "global_domain"
@@ -775,6 +783,9 @@ _OFF_DOMAIN_REPLY_COMMITTED = 0
 _CTRL_OFF_ARG0 = 16
 _CTRL_OFF_RESULT = 40
 _DEVICE_MEMORY_INFO = struct.Struct("<QQ")
+# Mirrors worker_manager.h::DfxFlushReport — session_id, watermark_epoch,
+# published, failed. Fixed width so it rides the existing control result slot.
+_DFX_FLUSH_REPORT = struct.Struct("<QQQQ")
 
 
 class _NoBufferConsumerError(RuntimeError):
@@ -3278,6 +3289,19 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             elif sub_cmd == _CTRL_DEVICE_MEMORY_INFO:
                 info = cw.device_memory_info()
                 _DEVICE_MEMORY_INFO.pack_into(buf, _CTRL_OFF_RESULT, info.free_bytes, info.total_bytes)
+            elif sub_cmd == _CTRL_DFX_FLUSH:
+                # Synchronous in the serve loop. The parent only issues this
+                # with no run outstanding, so no task frame is staged behind it
+                # and the handler cannot collide with an active run.
+                #
+                # The budget is the parent's, carried in a0, and a frame
+                # without one is a malformed request rather than an invitation
+                # to pick a ceiling here.
+                timeout_ms = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                if timeout_ms == 0:
+                    raise RuntimeError("flush_diagnostics: control frame carried no timeout budget")
+                cw.flush_diagnostics(min(int(timeout_ms), _MAX_FLUSH_TIMEOUT_MS))
+                _DFX_FLUSH_REPORT.pack_into(buf, _CTRL_OFF_RESULT, 0, 0, 0, 0)
             elif sub_cmd == _CTRL_IMPORT_RELEASE:
                 import_registry.unregister(_unpack_identity_wire(_read_control_digest(buf)))
             elif sub_cmd == CTRL_GLOBAL_DOMAIN_PREPARE:
@@ -3641,6 +3665,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     enable_sdma: bool = False,
     chip_rank: int | None = None,
     launch_depth: int = 1,
+    dfx_session: bool = False,
 ) -> None:
     """Runs in forked child process. Loads host_runtime.so in own address space.
 
@@ -3665,6 +3690,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             log_level=log_level,
             prewarm_config=prewarm_config,
             enable_sdma=enable_sdma,
+            dfx_session=dfx_session,
         )
     except Exception as e:
         _tb.print_exc()
@@ -8161,6 +8187,7 @@ class Worker:
             binaries,
             prewarm_config=self._prewarm_config,
             enable_sdma=bool(self._config.get("enable_sdma", False)),
+            dfx_session=bool(self._config.get("dfx_session", False)),
         )
 
         # Pre-warm any registered ChipCallable so the first run(handle, …)
@@ -8429,6 +8456,7 @@ class Worker:
                             enable_sdma=bool(self._config.get("enable_sdma", False)),
                             chip_rank=idx,
                             launch_depth=self._launch_depth,
+                            dfx_session=bool(self._config.get("dfx_session", False)),
                         )
                     except BaseException as e:  # noqa: BLE001
                         import traceback as _tb  # noqa: PLC0415
@@ -11032,6 +11060,51 @@ class Worker:
             assert self._orch is not None
             return self._orch.device_memory_info(worker_id)
 
+    def flush_diagnostics(self, timeout: float | None = None) -> None:
+        """Publish every diagnostic run this worker's chip children have closed.
+
+        Only meaningful with ``dfx_session=True``: a session publishes on its
+        own in the background, and this is the barrier that says *the files up
+        to here exist now*. Returns normally when every run up to the close
+        watermark has its artifact — a published partial counts, and carries
+        its verdict inside the file. Raises ``RuntimeError`` when any of them
+        left no file, when a child reports a failure, or when the wait ran out.
+
+        Callable only with no run outstanding, and never from inside a graph
+        callback: it seals whole runs, which is not something a run may do to
+        itself. The admission order is callback rejection, then the operation
+        lease (so a concurrent ``close()`` drains this call instead of tearing
+        the tree down under it), then the control reservation (so no run is
+        admitted while it runs), then each child's mailbox mutex.
+
+        ``timeout`` bounds the waits it is passed to and is re-checked before
+        each child; it does **not** bound the untimed acquisitions — the two
+        leases and the C++ mailbox mutex — so the call can exceed it.
+        """
+        if self.level != 3:
+            raise RuntimeError("Worker.flush_diagnostics: only a level-3 worker with local chip children supports it")
+        if threading.get_ident() in self._run_finalization_depth:
+            raise RuntimeError("Worker.flush_diagnostics: cannot be called from within run finalization")
+        if _callback_frame_for(self) is not None:
+            raise RuntimeError(
+                "Worker.flush_diagnostics: cannot be called from inside a graph callback — it seals whole runs, "
+                "which is not something a run may do to itself"
+            )
+        deadline = None if timeout is None else _monotonic() + float(timeout)
+        with self._operation_lease("flush_diagnostics"), self._control_reservation("flush_diagnostics"):
+            if not self._chip_shms:
+                raise NotImplementedError("flush_diagnostics requires at least one forked chip worker")
+            assert self._orch is not None
+            errors: list[str] = []
+            for worker_id in range(len(self._chip_shms)):
+                remaining = -1.0 if deadline is None else max(0.0, deadline - _monotonic())
+                try:
+                    self._orch.flush_diagnostics(worker_id, remaining)
+                except Exception as e:  # noqa: BLE001
+                    errors.append(_format_exc(f"flush_diagnostics chip {worker_id}", e))
+            if errors:
+                raise RuntimeError("; ".join(errors))
+
     @staticmethod
     def _copy_extent(
         host_nbytes: int, device_offset: int, host_offset: int, nbytes: int | None, *, host_side: str, api: str
@@ -12368,6 +12441,15 @@ class Worker:
                         self._teardown_attempted = (
                             teardown_tree or result is not None or deferred_native_cleanup_error is not None
                         )
+            if drain_complete:
+                # Every accepted fence has drained and CLOSED already rejects
+                # admission, so the public lease would only reject this — the
+                # endpoint call goes direct. Attempted for every child and
+                # aggregated: one child's failure must not skip the others, and
+                # none of it may skip teardown below.
+                flush_error = self._close_flush_diagnostics()
+                if flush_error is not None and result is None:
+                    result = flush_error
             if teardown_tree:
                 self._teardown_ready_tree()
                 teardown_completed = True
@@ -12582,6 +12664,42 @@ class Worker:
                 errors.append(exc)
         if errors:
             raise errors[0]
+
+    def _close_flush_diagnostics(self) -> BaseException | None:
+        """Final diagnostic flush, from inside close(), after the drains.
+
+        Returns the aggregated failure rather than raising: teardown, shutdown
+        and reap must run in every case, so this never leaves the close path
+        early. A worker with no session, no chip children or no orchestrator
+        has nothing deferred and reports nothing.
+
+        One absolute budget covers the whole phase, re-derived per chip, so N
+        children cost one budget and not N of them. That budget is this phase's
+        own rather than a share of ``drain_deadline``: that one bounds admitted
+        work — leases and accepted run fences — and this runs only once all of
+        it has drained. So close() is bounded phase by phase and this phase is
+        N-independent; the sum over phases is not bounded by anything here, and
+        neither are the untimed acquisitions inside each endpoint call.
+
+        A chip whose share is already spent is refused by the endpoint rather
+        than given a fresh wait, and the refusal aggregates like any other
+        failure.
+        """
+        if self.level != 3 or not self._chip_shms or self._orch is None:
+            return None
+        if not bool(self._config.get("dfx_session", False)):
+            return None
+        deadline = _monotonic() + float(_ROLLBACK_GRACEFUL_TIMEOUT_S)
+        errors: list[str] = []
+        for worker_id in range(len(self._chip_shms)):
+            remaining = max(0.0, deadline - _monotonic())
+            try:
+                self._orch.flush_diagnostics(worker_id, remaining)
+            except Exception as e:  # noqa: BLE001
+                errors.append(_format_exc(f"close flush_diagnostics chip {worker_id}", e))
+        if not errors:
+            return None
+        return RuntimeError("Worker.close(): " + "; ".join(errors))
 
     def _reclaim_child_groups(self, deadline: float) -> None:
         """One waitpid→mailbox-release sequence shared by abort and close."""

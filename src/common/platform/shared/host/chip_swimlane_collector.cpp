@@ -20,6 +20,13 @@
 
 #include "host/chip_swimlane_collector.h"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstring>
+
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -156,7 +163,7 @@ int ChipSwimlaneCollector::initialize(
     aicore_skipped_bad_core_ = 0;
     aicore_foreign_identity_ = 0;
     has_phase_data_ = false;
-    collector_shards_merged_ = false;
+    merged_slot_ = -1;
     json_extensions_.fill({});
 
     // Stash the memory context on the base up-front so alloc_paired_buffer
@@ -283,6 +290,11 @@ int ChipSwimlaneCollector::initialize(
             ChipSwimlaneAicpuTaskBuffer *buf = reinterpret_cast<ChipSwimlaneAicpuTaskBuffer *>(host_buf_ptr);
             memset(buf, 0, sizeof(ChipSwimlaneAicpuTaskBuffer));
             buf->count = 0;
+            // Part of this kind's paired seed, which is what a session's cap is
+            // twice of.
+            manager_.note_paired_allocation(
+                static_cast<int>(ProfBufferType::AICPU_TASK), sizeof(ChipSwimlaneAicpuTaskBuffer)
+            );
 
             if (s < initial_free_count) {
                 state->free_queue.buffer_ptrs[s] = reinterpret_cast<uint64_t>(dev_buf_ptr);
@@ -326,6 +338,9 @@ int ChipSwimlaneCollector::initialize(
             ChipSwimlaneAicoreTaskBuffer *buf = reinterpret_cast<ChipSwimlaneAicoreTaskBuffer *>(host_buf_ptr);
             memset(buf, 0, sizeof(ChipSwimlaneAicoreTaskBuffer));
             buf->count = 0;
+            manager_.note_paired_allocation(
+                static_cast<int>(ProfBufferType::AICORE_TASK), sizeof(ChipSwimlaneAicoreTaskBuffer)
+            );
 
             if (s < initial_free_count) {
                 ac_state->free_queue.buffer_ptrs[s] = reinterpret_cast<uint64_t>(dev_buf_ptr);
@@ -406,6 +421,7 @@ int ChipSwimlaneCollector::initialize(
                 // matching Buffer type. The records payload is overwritten by
                 // AICPU on first use.
                 reinterpret_cast<Buffer *>(host_buf_ptr)->count = 0;
+                manager_.note_paired_allocation(static_cast<int>(recycle_kind), buffer_bytes);
                 if (s < initial_free_count) {
                     state->free_queue.buffer_ptrs[s] = reinterpret_cast<uint64_t>(dev_buf_ptr);
                 } else {
@@ -500,7 +516,7 @@ int ChipSwimlaneCollector::initialize(
 // ---------------------------------------------------------------------------
 
 size_t ChipSwimlaneCollector::normalize_collector_shard(int collector_shard) const {
-    const size_t shard_count = collector_counters_.size();
+    const size_t shard_count = epoch_stores_[0].counters.size();
     const bool valid_shard = collector_shard >= 0 && static_cast<size_t>(collector_shard) < shard_count;
     if (!valid_shard) {
         assert(false && "collector_shard out of range");
@@ -562,25 +578,30 @@ int ChipSwimlaneCollector::ensure_device_orch_pool(ChipSwimlaneLevel chip_swimla
     return 0;
 }
 
-void ChipSwimlaneCollector::reset_collector_shards() {
+void ChipSwimlaneCollector::reset_collector_shards() { reset_epoch_store(0, /*reset_merged_view=*/true); }
+
+void ChipSwimlaneCollector::reset_epoch_store(size_t slot, bool reset_merged_view) {
     const size_t shard_count = static_cast<size_t>(manager_.shard_count());
 
-    collected_perf_records_.assign(num_aicore_, {});
-    collected_aicore_records_.assign(num_aicore_, {});
-    collected_sched_phase_records_.assign(PLATFORM_MAX_AICPU_THREADS, {});
-    collected_orch_phase_records_.assign(PLATFORM_MAX_AICPU_THREADS, {});
-
-    perf_records_by_collector_.assign(shard_count, {});
-    aicore_records_by_collector_.assign(shard_count, {});
-    sched_phase_records_by_collector_.assign(shard_count, {});
-    orch_phase_records_by_collector_.assign(shard_count, {});
-    for (size_t shard = 0; shard < shard_count; shard++) {
-        perf_records_by_collector_[shard].assign(num_aicore_, {});
-        aicore_records_by_collector_[shard].assign(num_aicore_, {});
-        sched_phase_records_by_collector_[shard].assign(PLATFORM_MAX_AICPU_THREADS, {});
-        orch_phase_records_by_collector_[shard].assign(PLATFORM_MAX_AICPU_THREADS, {});
+    if (reset_merged_view) {
+        collected_perf_records_.assign(num_aicore_, {});
+        collected_aicore_records_.assign(num_aicore_, {});
+        collected_sched_phase_records_.assign(PLATFORM_MAX_AICPU_THREADS, {});
+        collected_orch_phase_records_.assign(PLATFORM_MAX_AICPU_THREADS, {});
     }
-    collector_counters_.assign(shard_count, {});
+
+    store(slot).perf.assign(shard_count, {});
+    store(slot).aicore.assign(shard_count, {});
+    store(slot).sched_phase.assign(shard_count, {});
+    store(slot).orch_phase.assign(shard_count, {});
+    for (size_t shard = 0; shard < shard_count; shard++) {
+        store(slot).perf[shard].assign(num_aicore_, {});
+        store(slot).aicore[shard].assign(num_aicore_, {});
+        store(slot).sched_phase[shard].assign(PLATFORM_MAX_AICPU_THREADS, {});
+        store(slot).orch_phase[shard].assign(PLATFORM_MAX_AICPU_THREADS, {});
+    }
+    store(slot).counters.assign(shard_count, {});
+    if (!reset_merged_view) return;
     total_perf_collected_ = 0;
     total_sched_phase_collected_ = 0;
     total_orch_phase_collected_ = 0;
@@ -592,7 +613,7 @@ void ChipSwimlaneCollector::reset_collector_shards() {
     has_phase_data_ = false;
     for (auto &r : merged_receipt_)
         r = HandoffReceipt{};
-    collector_shards_merged_ = false;
+    merged_slot_ = -1;
 }
 
 template <typename T>
@@ -618,19 +639,20 @@ static void merge_record_shards(
     }
 }
 
-void ChipSwimlaneCollector::merge_collector_shards() {
-    if (collector_shards_merged_) {
+void ChipSwimlaneCollector::merge_collector_shards() { merge_epoch_store(0); }
+
+void ChipSwimlaneCollector::merge_epoch_store(size_t slot) {
+    if (merged_slot_ == static_cast<int>(slot)) {
         return;
     }
 
-    merge_record_shards(perf_records_by_collector_, collected_perf_records_, static_cast<size_t>(num_aicore_));
-    merge_record_shards(aicore_records_by_collector_, collected_aicore_records_, static_cast<size_t>(num_aicore_));
+    merge_record_shards(store(slot).perf, collected_perf_records_, static_cast<size_t>(num_aicore_));
+    merge_record_shards(store(slot).aicore, collected_aicore_records_, static_cast<size_t>(num_aicore_));
     merge_record_shards(
-        sched_phase_records_by_collector_, collected_sched_phase_records_,
-        static_cast<size_t>(PLATFORM_MAX_AICPU_THREADS)
+        store(slot).sched_phase, collected_sched_phase_records_, static_cast<size_t>(PLATFORM_MAX_AICPU_THREADS)
     );
     merge_record_shards(
-        orch_phase_records_by_collector_, collected_orch_phase_records_, static_cast<size_t>(PLATFORM_MAX_AICPU_THREADS)
+        store(slot).orch_phase, collected_orch_phase_records_, static_cast<size_t>(PLATFORM_MAX_AICPU_THREADS)
     );
 
     total_perf_collected_ = 0;
@@ -646,7 +668,7 @@ void ChipSwimlaneCollector::merge_collector_shards() {
         r = HandoffReceipt{};
     merged_presented_buffers_ = 0;
     merged_unroutable_buffers_ = 0;
-    for (const auto &counter : collector_counters_) {
+    for (const auto &counter : store(slot).counters) {
         total_perf_collected_ += counter.total_perf_collected;
         total_sched_phase_collected_ += counter.total_sched_phase_collected;
         total_orch_phase_collected_ += counter.total_orch_phase_collected;
@@ -669,10 +691,10 @@ void ChipSwimlaneCollector::merge_collector_shards() {
             dst.received_records += src.received_records;
         }
     }
-    collector_shards_merged_ = true;
+    merged_slot_ = static_cast<int>(slot);
 }
 
-void ChipSwimlaneCollector::copy_perf_buffer(const ReadyBufferInfo &info, int collector_shard) {
+void ChipSwimlaneCollector::copy_perf_buffer(const ReadyBufferInfo &info, int collector_shard, size_t slot) {
     ChipSwimlaneAicpuTaskBuffer *buf = reinterpret_cast<ChipSwimlaneAicpuTaskBuffer *>(info.host_buffer_ptr);
     rmb();
     uint32_t count = buf->count;
@@ -681,17 +703,19 @@ void ChipSwimlaneCollector::copy_perf_buffer(const ReadyBufferInfo &info, int co
     }
     uint32_t core_index = info.index;
     size_t shard = normalize_collector_shard(collector_shard);
-    if (core_index < static_cast<uint32_t>(num_aicore_) && shard < perf_records_by_collector_.size()) {
-        auto &dst = perf_records_by_collector_[shard][core_index];
-        dst.reserve(dst.size() + count);
+    if (core_index < static_cast<uint32_t>(num_aicore_) && shard < store(slot).perf.size()) {
+        auto &dst = store(slot).perf[shard][core_index];
+        if (!session_reserve_records(dst, count, slot)) return;
         for (uint32_t i = 0; i < count; i++) {
             dst.push_back({buf->records[i], buf->run_epoch, buf->local_seq, 0});
         }
-        collector_counters_[shard].total_perf_collected += count;
+        if (!simpler::dfx::session::checked_increment(store(slot).counters[shard].total_perf_collected, count)) {
+            session_set_fatal("aicpu-task record counter is out of headroom");
+        }
     }
 }
 
-void ChipSwimlaneCollector::copy_sched_phase_buffer(const ReadyBufferInfo &info, int collector_shard) {
+void ChipSwimlaneCollector::copy_sched_phase_buffer(const ReadyBufferInfo &info, int collector_shard, size_t slot) {
     auto *buf = reinterpret_cast<ChipSwimlaneAicpuSchedPhaseBuffer *>(info.host_buffer_ptr);
     rmb();
     uint32_t count = buf->count;
@@ -700,20 +724,22 @@ void ChipSwimlaneCollector::copy_sched_phase_buffer(const ReadyBufferInfo &info,
     }
     uint32_t tidx = info.index;
     size_t shard = normalize_collector_shard(collector_shard);
-    if (shard < sched_phase_records_by_collector_.size() && tidx < sched_phase_records_by_collector_[shard].size()) {
-        auto &dst = sched_phase_records_by_collector_[shard][tidx];
-        dst.reserve(dst.size() + count);
+    if (shard < store(slot).sched_phase.size() && tidx < store(slot).sched_phase[shard].size()) {
+        auto &dst = store(slot).sched_phase[shard][tidx];
+        if (!session_reserve_records(dst, count, slot)) return;
         for (uint32_t i = 0; i < count; i++) {
             dst.push_back({buf->records[i], buf->run_epoch, buf->local_seq, 0});
         }
-        collector_counters_[shard].total_sched_phase_collected += count;
+        if (!simpler::dfx::session::checked_increment(store(slot).counters[shard].total_sched_phase_collected, count)) {
+            session_set_fatal("sched-phase record counter is out of headroom");
+        }
         if (count > 0) {
-            collector_counters_[shard].has_phase_data = true;
+            store(slot).counters[shard].has_phase_data = true;
         }
     }
 }
 
-void ChipSwimlaneCollector::copy_orch_phase_buffer(const ReadyBufferInfo &info, int collector_shard) {
+void ChipSwimlaneCollector::copy_orch_phase_buffer(const ReadyBufferInfo &info, int collector_shard, size_t slot) {
     auto *buf = reinterpret_cast<ChipSwimlaneAicpuOrchPhaseBuffer *>(info.host_buffer_ptr);
     rmb();
     uint32_t count = buf->count;
@@ -722,15 +748,17 @@ void ChipSwimlaneCollector::copy_orch_phase_buffer(const ReadyBufferInfo &info, 
     }
     uint32_t tidx = info.index;
     size_t shard = normalize_collector_shard(collector_shard);
-    if (shard < orch_phase_records_by_collector_.size() && tidx < orch_phase_records_by_collector_[shard].size()) {
-        auto &dst = orch_phase_records_by_collector_[shard][tidx];
-        dst.reserve(dst.size() + count);
+    if (shard < store(slot).orch_phase.size() && tidx < store(slot).orch_phase[shard].size()) {
+        auto &dst = store(slot).orch_phase[shard][tidx];
+        if (!session_reserve_records(dst, count, slot)) return;
         for (uint32_t i = 0; i < count; i++) {
             dst.push_back({buf->records[i], buf->run_epoch, buf->local_seq, 0});
         }
-        collector_counters_[shard].total_orch_phase_collected += count;
+        if (!simpler::dfx::session::checked_increment(store(slot).counters[shard].total_orch_phase_collected, count)) {
+            session_set_fatal("orch-phase record counter is out of headroom");
+        }
         if (count > 0) {
-            collector_counters_[shard].has_phase_data = true;
+            store(slot).counters[shard].has_phase_data = true;
         }
     }
 }
@@ -754,25 +782,27 @@ void ChipSwimlaneCollector::copy_orch_phase_buffer(const ReadyBufferInfo &info, 
 //     propagated). The "missing" slot's previous contents are zero because
 //     allocate_single_buffer memsets at allocation.
 //   - Flush-path partial buffer whose tail wasn't reached.
-void ChipSwimlaneCollector::copy_aicore_buffer(const ReadyBufferInfo &info, int collector_shard) {
+void ChipSwimlaneCollector::copy_aicore_buffer(
+    const ReadyBufferInfo &info, int collector_shard, size_t slot, uint64_t expected_epoch
+) {
     ChipSwimlaneAicoreTaskBuffer *buf = reinterpret_cast<ChipSwimlaneAicoreTaskBuffer *>(info.host_buffer_ptr);
     rmb();
     uint32_t core_index = info.index;
-    // A shard index outside `collector_counters_` is a contract violation, not
+    // A shard index outside `store(slot).counters` is a contract violation, not
     // an accountable loss class: the counters are per-shard and non-atomic, so
     // charging the reduction to any other shard would race that shard's own
     // live collector thread. Report and return without touching one.
     size_t shard = normalize_collector_shard(collector_shard);
-    if (shard >= collector_counters_.size() || shard >= aicore_records_by_collector_.size()) {
+    if (shard >= store(slot).counters.size() || shard >= store(slot).aicore.size()) {
         LOG_ERROR(
             "ChipSwimlane: AICore buffer delivered on collector shard %d, outside [0, %zu) — "
             "precondition violated, buffer not accounted",
-            collector_shard, collector_counters_.size()
+            collector_shard, store(slot).counters.size()
         );
         return;
     }
     if (core_index >= static_cast<uint32_t>(num_aicore_)) {
-        collector_counters_[shard].aicore_skipped_bad_core += buf->count;
+        store(slot).counters[shard].aicore_skipped_bad_core += buf->count;
         return;
     }
     uint32_t count = buf->count;
@@ -783,14 +813,24 @@ void ChipSwimlaneCollector::copy_aicore_buffer(const ReadyBufferInfo &info, int 
     }
 
     // A buffer's records all carry the stamp the producer wrote when it
-    // acquired the buffer, so the identity decision is per buffer.
+    // acquired the buffer, so the identity decision is per buffer, and it is
+    // made against the epoch that owns the slot this buffer resolved to.
+    // `armed_run_epoch_` is a different thing: the newest armed run, which
+    // with a session open is the successor of every late predecessor buffer.
+    // The caller passes that field itself when no session is open, so the
+    // default path compares against the only identity it has.
     const uint64_t buffer_epoch = buf->run_epoch;
-    const bool identity_matches = armed_run_epoch_ != 0 && buffer_epoch == armed_run_epoch_;
+    const bool identity_matches = expected_epoch != 0 && buffer_epoch == expected_epoch;
 
     uint32_t skipped = 0;
     uint32_t accepted = 0;
-    auto &dst = aicore_records_by_collector_[shard][core_index];
-    dst.reserve(dst.size() + count);
+    auto &dst = store(slot).aicore[shard][core_index];
+    if (!session_reserve_records(dst, count, slot)) {
+        // The budget declined this epoch's records. The receipt for this buffer
+        // is already taken, so the loss is accounted; the epoch's verdict says
+        // its content is incomplete.
+        return;
+    }
     for (uint32_t i = 0; i < count; i++) {
         const ChipSwimlaneAicoreTaskRecord &r = buf->records[i];
         if (r.start_time == 0) {
@@ -804,15 +844,17 @@ void ChipSwimlaneCollector::copy_aicore_buffer(const ReadyBufferInfo &info, int 
     }
 
     if (identity_matches) {
-        collector_counters_[shard].total_aicore_collected += accepted;
-        collector_counters_[shard].aicore_skipped_unwritten += skipped;
-        collector_counters_[shard].aicore_skipped_overflow += overflow;
+        const bool ok =
+            simpler::dfx::session::checked_increment(store(slot).counters[shard].total_aicore_collected, accepted) &&
+            simpler::dfx::session::checked_increment(store(slot).counters[shard].aicore_skipped_unwritten, skipped) &&
+            simpler::dfx::session::checked_increment(store(slot).counters[shard].aicore_skipped_overflow, overflow);
+        if (!ok) session_set_fatal("aicore record counter is out of headroom");
     } else {
         // Counted apart from both sides of the conservation check. A record
         // another run produced is not this run's `collected`, and it is not a
         // device drop either — folding it into `host_skipped` would let it
         // balance away as though this run had accounted for it.
-        collector_counters_[shard].aicore_foreign_identity += accepted + skipped + overflow;
+        store(slot).counters[shard].aicore_foreign_identity += accepted + skipped + overflow;
     }
 
     if (skipped > 0) {
@@ -896,10 +938,12 @@ bool ChipSwimlaneCollector::read_buffer_identity(
 // here; `drain_dropped_buffers()` is their tally and reconcile captures it into
 // the report as `transport_retired_buffers`. What is counted here is what was
 // presented to the collector.
-void ChipSwimlaneCollector::note_buffer_observed(const ReadyBufferInfo &info, int collector_shard) {
+void ChipSwimlaneCollector::note_buffer_observed(
+    const ReadyBufferInfo &info, int collector_shard, size_t slot, uint64_t expected_epoch
+) {
     const size_t shard = normalize_collector_shard(collector_shard);
-    if (shard >= collector_counters_.size()) return;
-    CollectorShardCounters &counters = collector_counters_[shard];
+    if (shard >= store(slot).counters.size()) return;
+    CollectorShardCounters &counters = store(slot).counters[shard];
     counters.buffers_presented++;
 
     const size_t klass = static_cast<size_t>(info.type);
@@ -921,7 +965,7 @@ void ChipSwimlaneCollector::note_buffer_observed(const ReadyBufferInfo &info, in
         r.invalid_index_buffers++;
         return;
     }
-    if (armed_run_epoch_ == 0 || buffer_epoch != armed_run_epoch_) {
+    if (expected_epoch == 0 || buffer_epoch != expected_epoch) {
         r.foreign_epoch_buffers++;
         return;
     }
@@ -934,19 +978,52 @@ void ChipSwimlaneCollector::note_buffer_observed(const ReadyBufferInfo &info, in
 }
 
 void ChipSwimlaneCollector::on_buffer_collected(const ReadyBufferInfo &info, int collector_shard) {
-    note_buffer_observed(info, collector_shard);
+    size_t slot = 0;
+    uint64_t expected_epoch = armed_run_epoch_;
+    bool retain = true;
+    if (session_active_.load(std::memory_order_acquire)) {
+        // Route by the identity the producer stamped on the buffer, using only
+        // this shard's private view of the epoch table. A buffer whose epoch is
+        // not in that view belongs to a sealed run or to none, and either way it
+        // is counted and dropped — never appended, and never able to reopen a
+        // bucket the session has already moved.
+        uint64_t buffer_epoch = 0;
+        uint32_t raw_count = 0;
+        uint32_t capacity = 0;
+        const size_t shard = normalize_collector_shard(collector_shard);
+        if (shard >= shard_views_.size() || !read_buffer_identity(info, &buffer_epoch, &raw_count, &capacity)) {
+            session_no_bucket_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        const int resolved = shard_views_[shard].slot_for(buffer_epoch, &retain);
+        if (resolved < 0) {
+            if (session_epoch_is_tombstoned(buffer_epoch)) {
+                session_late_after_seal_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                session_unknown_epoch_.fetch_add(1, std::memory_order_relaxed);
+            }
+            return;
+        }
+        slot = static_cast<size_t>(resolved);
+        expected_epoch = buffer_epoch;
+    }
+
+    note_buffer_observed(info, collector_shard, slot, expected_epoch);
+    // A budget refusal declines the records, never the transport: the buffer is
+    // still received, still counted and still recycled by the caller.
+    if (!retain) return;
     switch (info.type) {
     case ProfBufferType::AICPU_TASK:
-        copy_perf_buffer(info, collector_shard);
+        copy_perf_buffer(info, collector_shard, slot);
         break;
     case ProfBufferType::AICPU_SCHED_PHASE:
-        copy_sched_phase_buffer(info, collector_shard);
+        copy_sched_phase_buffer(info, collector_shard, slot);
         break;
     case ProfBufferType::AICPU_ORCH_PHASE:
-        copy_orch_phase_buffer(info, collector_shard);
+        copy_orch_phase_buffer(info, collector_shard, slot);
         break;
     case ProfBufferType::AICORE_TASK:
-        copy_aicore_buffer(info, collector_shard);
+        copy_aicore_buffer(info, collector_shard, slot, expected_epoch);
         break;
     }
 }
@@ -1275,11 +1352,14 @@ void *ChipSwimlaneCollector::arm_run_terminal_bank(uint32_t bank_index, uint64_t
     // one.
     if (run_epoch == 0) return nullptr;
 
-    // The run this collector is arming for. `copy_aicore_buffer` compares each
-    // record's stamp against it, so a record produced under another run cannot
-    // count toward this one's accounting. Arming precedes `begin_run` in every
-    // runner, so this is the only point in the existing host flow where the
-    // epoch is in hand before records arrive.
+    // The run this collector is arming for. On the default path it is also the
+    // identity each arriving record's stamp is compared against, so a record
+    // produced under another run cannot count toward this one's accounting.
+    // Arming precedes `begin_run` in every runner, so this is the only point in
+    // the existing host flow where the epoch is in hand before records arrive.
+    // With a session open the comparison uses the epoch that owns the buffer's
+    // slot instead: this field names the newest armed run, which is not the
+    // owner of a predecessor's late buffer.
     armed_run_epoch_ = run_epoch;
 
     return get_run_terminal_bank(perf_shared_mem_dev_, static_cast<int>(bank_index));
@@ -1532,7 +1612,7 @@ void ChipSwimlaneCollector::report_run_terminal_snapshot(uint32_t bank_index, ui
     // the bank says, and it is exactly the run where the bank is unreadable
     // that a reader needs it. `build_handoff_report` keeps every class Unknown
     // when the snapshot did not arrive, so nothing device-side is invented.
-    handoff_report_ = build_handoff_report(snapshot);
+    handoff_report_ = build_handoff_report(snapshot, 0);
     if (handoff_report_.unroutable_buffers > 0 || handoff_report_.transport_retired_buffers > 0) {
         LOG_WARN(
             "ChipSwimlane handoff: epoch %lu transport presented %lu buffer(s), %lu of an unroutable kind; a further "
@@ -1712,8 +1792,9 @@ ChipSwimlaneCollector::HandoffClassReport ChipSwimlaneCollector::classify_handof
     return out;
 }
 
-ChipSwimlaneCollector::HandoffReport ChipSwimlaneCollector::build_handoff_report(const RunTerminalSnapshot &snapshot) {
-    merge_collector_shards();
+ChipSwimlaneCollector::HandoffReport
+ChipSwimlaneCollector::build_handoff_report(const RunTerminalSnapshot &snapshot, size_t slot) {
+    merge_epoch_store(slot);
     HandoffReport report;
     report.presented_buffers = merged_presented_buffers_;
     report.unroutable_buffers = merged_unroutable_buffers_;
@@ -1896,10 +1977,12 @@ void ChipSwimlaneCollector::set_host_phase_records(
     host_phase_records_present_ = true;
 }
 
-ChipSwimlaneCollector::RunExport ChipSwimlaneCollector::seal_run_export() {
+ChipSwimlaneCollector::RunExport ChipSwimlaneCollector::seal_run_export() { return seal_epoch_store(0); }
+
+ChipSwimlaneCollector::RunExport ChipSwimlaneCollector::seal_epoch_store(size_t slot) {
     RunExport data;
 
-    merge_collector_shards();
+    merge_epoch_store(slot);
 
     data.output_prefix = output_prefix_;
     data.level = chip_swimlane_level_;
@@ -1930,10 +2013,10 @@ ChipSwimlaneCollector::RunExport ChipSwimlaneCollector::seal_run_export() {
             }
         }
     };
-    release_shard_copies(perf_records_by_collector_);
-    release_shard_copies(aicore_records_by_collector_);
-    release_shard_copies(sched_phase_records_by_collector_);
-    release_shard_copies(orch_phase_records_by_collector_);
+    release_shard_copies(store(slot).perf);
+    release_shard_copies(store(slot).aicore);
+    release_shard_copies(store(slot).sched_phase);
+    release_shard_copies(store(slot).orch_phase);
 
     data.num_aicore = num_aicore_;
     data.core_types = core_types_;
@@ -2040,9 +2123,19 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     has_any_records = has_any_records || any_phase_records(data.sched_phase_records) || has_aicpu_orch_phases;
-    if (!has_any_records) {
+    if (!has_any_records && !data.collection.present) {
         LOG_WARN("Warning: No performance data to export.");
         return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (!has_any_records) {
+        // A session has already promised this file exists, and its `collection`
+        // object is what reports why the run carries no records — a refused
+        // budget, an evicted epoch, a run that produced nothing. Refusing to
+        // write would turn an accounted emptiness into a missing artifact.
+        LOG_WARN(
+            "ChipSwimlane session: epoch %lu has no records; publishing its verdict alone",
+            static_cast<unsigned long>(data.collection.run_epoch)
+        );
     }
     if (has_aicpu_orch_phases && data.host_orchestrated) {
         LOG_ERROR("Both host and AICPU orchestrator records are present; refusing mixed clock-domain export");
@@ -2056,7 +2149,10 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
-    std::string filepath = data.output_prefix + "/chip_swimlane_records.json";
+    // A session names its own file inside the directory it reserved; with the
+    // session off this is empty and the legacy name is what it always was.
+    std::string filepath =
+        data.artifact_path.empty() ? data.output_prefix + "/chip_swimlane_records.json" : data.artifact_path;
     std::ofstream outfile(filepath);
     if (!outfile.is_open()) {
         LOG_ERROR("Error: Failed to open file: %s", filepath.c_str());
@@ -2076,6 +2172,22 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
     // runtime uses and nothing in the value says which, so a reader that decodes one
     // has to be told; the name is a compile-time property of this host_runtime.so.
     outfile << "    \"runtime\": \"" << SIMPLER_RUNTIME_NAME << "\",\n";
+    if (data.collection.present) {
+        // Additive: a reader that does not know this key is unaffected, and the
+        // default path never emits it.
+        outfile << "    \"collection\": {\n";
+        outfile << "      \"run_epoch\": " << data.collection.run_epoch << ",\n";
+        outfile << "      \"session_id\": " << data.collection.session_id << ",\n";
+        outfile << "      \"processing_complete\": " << (data.collection.processing_complete ? "true" : "false")
+                << ",\n";
+        outfile << "      \"metadata_complete\": " << (data.collection.metadata_complete ? "true" : "false") << ",\n";
+        outfile << "      \"not_received_buffers\": " << data.collection.not_received_buffers << ",\n";
+        outfile << "      \"unpublished_loss\": " << data.collection.unpublished_loss << ",\n";
+        outfile << "      \"transport_retired\": " << data.collection.transport_retired << ",\n";
+        outfile << "      \"cut_failed_queues\": " << data.collection.cut_failed_queues << ",\n";
+        outfile << "      \"verdict\": \"" << simpler::dfx::session::verdict_name(data.collection.verdict) << "\"\n";
+        outfile << "    },\n";
+    }
     outfile << "    \"clock_freq_hz\": " << PLATFORM_PROF_SYS_CNT_FREQ << ",\n";
     outfile << "    \"num_cores\": " << data.num_aicore << ",\n";
     outfile << "    \"core_types\": [";
@@ -2294,8 +2406,20 @@ int ChipSwimlaneCollector::finalize(
         return 0;
     }
 
+    // A session that is still open owns the publisher thread and may hold
+    // epoch storage; closing it here keeps `finalize()` correct for a caller
+    // that never called `close_diagnostics_session()`. Idempotent.
+    session_close();
+
     // Stop mgmt + collector threads if the caller didn't already (idempotent).
     stop();
+
+    // `stop()` has joined every drain owner and every collector shard, so
+    // storage a close could not prove safe to touch is now unreachable by any
+    // reader. This is the only point at which that is true: the production
+    // close path runs before this, and joining the publisher says nothing about
+    // the readers.
+    session_release_deferred_storage();
 
     LOG_DEBUG("Cleaning up performance profiling resources");
 
@@ -2402,11 +2526,13 @@ int ChipSwimlaneCollector::finalize(
     collected_orch_phase_records_.clear();
     host_submit_records_.clear();
     host_upload_records_.clear();
-    perf_records_by_collector_.clear();
-    aicore_records_by_collector_.clear();
-    sched_phase_records_by_collector_.clear();
-    orch_phase_records_by_collector_.clear();
-    collector_counters_.clear();
+    for (EpochStore &slot_store : epoch_stores_) {
+        slot_store.perf.clear();
+        slot_store.aicore.clear();
+        slot_store.sched_phase.clear();
+        slot_store.orch_phase.clear();
+        slot_store.counters.clear();
+    }
     core_to_thread_.clear();
     has_phase_data_ = false;
     total_perf_collected_ = 0;
@@ -2423,7 +2549,7 @@ int ChipSwimlaneCollector::finalize(
     terminal_reported_ = false;
     terminal_snapshot_ = RunTerminalSnapshot{};
     terminal_consistency_ = RunTerminalConsistency{};
-    collector_shards_merged_ = false;
+    merged_slot_ = -1;
     host_orchestrated_ = false;
     host_phase_records_present_ = false;
     host_phase_total_records_ = 0;
@@ -2434,4 +2560,961 @@ int ChipSwimlaneCollector::finalize(
 
     LOG_DEBUG("Performance profiling cleanup complete");
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Continuous-collection session
+// ---------------------------------------------------------------------------
+//
+// One run's receipt, sealing and file write continue on this host while the
+// next run executes on the device. Device execution stays serial and the run
+// boundary keeps its completion fence, its terminal read and its execution
+// claim. The boundary drains no pipeline and wipes no record store, so a
+// predecessor's buffers keep arriving into a store of its own.
+//
+// Threads: the runtime thread opens and closes epochs, the drain owners
+// capture the per-queue cut, the collector shards copy into the epoch their
+// buffer names, and one session thread seals and publishes. The session thread
+// never waits on a caller, which is what keeps the capacity backstop free of a
+// cycle.
+
+namespace {
+
+// Bounded, monotonic session identity. A process-local run epoch repeats
+// across processes, so the directory reservation below is what actually makes
+// an artifact path unique; this only labels the file's contents.
+std::atomic<uint64_t> g_session_seq{0};
+
+}  // namespace
+
+size_t ChipSwimlaneCollector::session_epoch_fixed_bytes() const {
+    // Everything an admitted epoch holds whose size a platform maximum already
+    // bounds, plus an allowance for the two paths a run and its writer keep.
+    // Reserved rather than charged, so an epoch that has been admitted can
+    // never be refused the storage its own artifact needs — a refusal there
+    // could only answer by omitting metadata the file is not readable without.
+    //
+    // The terminal snapshot's per-class index vectors are owned storage the
+    // `RunExport` shell does not cover: the shell holds the vector objects, not
+    // the blocks they allocate. One entry per producer that reported, so two
+    // classes bounded by the core count and two by the thread count.
+    const size_t terminal_indices =
+        (2 * static_cast<size_t>(PLATFORM_MAX_CORES) + 2 * static_cast<size_t>(PLATFORM_MAX_AICPU_THREADS)) *
+        sizeof(int);
+    return sizeof(RunExport) + static_cast<size_t>(PLATFORM_MAX_CORES) * sizeof(int8_t) +
+           static_cast<size_t>(PLATFORM_MAX_CORES) * sizeof(CoreType) +
+           static_cast<size_t>(PLATFORM_MAX_AICPU_THREADS) * sizeof(uint32_t) + terminal_indices +
+           2 * simpler::dfx::session::kPathAllowanceBytes;
+}
+
+size_t ChipSwimlaneCollector::session_fixed_overhead() const {
+    const size_t shards = static_cast<size_t>(manager_.shard_count() > 0 ? manager_.shard_count() : 1);
+    const size_t instances = static_cast<size_t>(num_aicore_) + static_cast<size_t>(PLATFORM_MAX_AICPU_THREADS);
+    // Two record classes per instance group, one vector header each, in every
+    // slot; plus the per-shard counters, the per-shard epoch views (a shard
+    // holds its current view and, across one refresh, the new one), the
+    // permanent error summary, each slot's bounded run metadata, and the
+    // writer's scratch.
+    const size_t skeleton =
+        simpler::dfx::session::kMaxOpenEpochs * shards * 2 * instances * sizeof(std::vector<CollectedRecord<int>>);
+    const size_t counters = simpler::dfx::session::kMaxOpenEpochs * shards * sizeof(CollectorShardCounters);
+    const size_t views = (2 * shards + 1) * sizeof(ShardEpochView);
+    const size_t buckets = simpler::dfx::session::kMaxOpenEpochs * sizeof(EpochBucket);
+    const size_t tombstones = simpler::dfx::session::kMaxTombstones * sizeof(uint64_t);
+    const size_t epoch_metadata = simpler::dfx::session::kMaxOpenEpochs * session_epoch_fixed_bytes();
+    return skeleton + counters + views + buckets + tombstones + epoch_metadata + sizeof(session_errors_) +
+           simpler::dfx::session::kWriterScratchBytes;
+}
+
+bool ChipSwimlaneCollector::session_reserve_directory(const std::string &output_root) {
+    // Atomic reservation: `mkdir` fails EEXIST without a window, so two
+    // processes sharing a prefix take different directories by construction and
+    // no identity is derived from a pid, which repeats.
+    std::error_code ec;
+    std::filesystem::create_directories(output_root, ec);
+    if (ec) {
+        LOG_ERROR("ChipSwimlane session: cannot create output root %s: %s", output_root.c_str(), ec.message().c_str());
+        return false;
+    }
+    for (int k = 0; k < 4096; k++) {
+        std::string candidate = output_root + "/swimlane-" + std::to_string(k);
+        if (::mkdir(candidate.c_str(), 0755) == 0) {
+            session_dir_ = candidate;
+            return true;
+        }
+        if (errno != EEXIST) {
+            LOG_ERROR("ChipSwimlane session: cannot reserve %s: %s", candidate.c_str(), std::strerror(errno));
+            return false;
+        }
+    }
+    LOG_ERROR("ChipSwimlane session: no free session directory under %s", output_root.c_str());
+    return false;
+}
+
+bool ChipSwimlaneCollector::session_open(const SessionOptions &options, const std::string &output_root) {
+    if (!options.enabled) return false;
+    if (session_active_.load(std::memory_order_acquire)) return true;
+    if (shm_host_ == nullptr) {
+        LOG_ERROR("ChipSwimlane session: collector is not initialized");
+        return false;
+    }
+    // A session's device-side bound is a byte figure, and a release that did
+    // not report success leaves bytes this pool may still hold. The release
+    // surface reports a status per pointer and no size, so there is no honest
+    // figure to carry forward — the session refuses instead of admitting
+    // against an occupancy it cannot state.
+    if (manager_.release_unproven()) {
+        LOG_ERROR(
+            "ChipSwimlane session: refused, an earlier buffer release did not report success and its paired "
+            "occupancy cannot be established"
+        );
+        return false;
+    }
+    // The per-epoch reservation covers a path of at most this length, and an
+    // artifact name is the reserved directory plus a bounded suffix. Refusing
+    // here is what lets every later path be reserved rather than charged.
+    if (output_root.size() + 64 > simpler::dfx::session::kPathAllowanceBytes) {
+        LOG_ERROR(
+            "ChipSwimlane session: output root of %zu bytes exceeds the %zu byte path allowance", output_root.size(),
+            simpler::dfx::session::kPathAllowanceBytes
+        );
+        return false;
+    }
+    const size_t fixed = session_fixed_overhead();
+    if (!session_budget_.open(options.budget_bytes, fixed)) return false;
+    if (!session_reserve_directory(output_root)) {
+        session_budget_.close();
+        return false;
+    }
+
+    // Twice the paired bytes `init()` seeded, per kind: one replenishment
+    // generation beyond the seed is admitted and the rest refused. The seed is
+    // a figure growth does not enter, so a session that grew and a session
+    // opened after it get the same cap; the live total that admissions are
+    // compared against does include that growth, so a pool already holding
+    // more than twice its seed admits nothing further.
+    //
+    // A kind whose seed is zero has no instance in this run's configuration and
+    // so never asks for a block. It takes a small floor rather than zero, which
+    // this manager reads as uncapped: the floor is unreachable for such a kind,
+    // and "uncapped" would not be. The doubling is clamped, because a wrapped
+    // cap would refuse every allocation rather than bound it.
+    constexpr size_t kMinPairedCapBytes = sizeof(ChipSwimlaneAicoreTaskBuffer);
+    for (int kind = 0; kind < ChipSwimlaneModule::kBufferKinds; kind++) {
+        const size_t seeded = manager_.paired_initial(kind);
+        const size_t baseline = seeded > kMinPairedCapBytes ? seeded : kMinPairedCapBytes;
+        const size_t cap = baseline > SIZE_MAX / 2 ? SIZE_MAX : baseline * 2;
+        manager_.set_paired_cap(kind, cap);
+    }
+
+    session_id_ = g_session_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    session_fatal_.store(false, std::memory_order_release);
+    session_fatal_reason_.clear();
+    session_release_deferred_.store(false, std::memory_order_release);
+    session_aicore_collected_.store(0, std::memory_order_relaxed);
+    session_aicore_foreign_.store(0, std::memory_order_relaxed);
+    session_close_watermark_.store(0, std::memory_order_release);
+    for (auto &t : session_tombstones_)
+        t.store(0, std::memory_order_relaxed);
+    for (size_t slot = 0; slot < session_buckets_.size(); slot++) {
+        session_buckets_[slot].state.store(static_cast<int>(EpochState::Free), std::memory_order_relaxed);
+        session_buckets_[slot].epoch.store(0, std::memory_order_relaxed);
+        session_buckets_[slot].charged_bytes.store(0, std::memory_order_relaxed);
+        reset_epoch_store(slot, /*reset_merged_view=*/slot == 0);
+    }
+    set_drain_quantum(simpler::dfx::session::kDrainQuantum);
+    // Armed before the first run is admitted, not at the first cut: a target is
+    // captured from the same counters, so they have to have been counting for
+    // the whole span the target covers.
+    set_session_counters(true);
+    session_active_.store(true, std::memory_order_release);
+    session_thread_running_.store(true, std::memory_order_release);
+    session_thread_ = std::thread(&ChipSwimlaneCollector::session_thread_main, this);
+    LOG_INFO(
+        "ChipSwimlane session %lu open: dir=%s budget=%zu B (fixed %zu B)", static_cast<unsigned long>(session_id_),
+        session_dir_.c_str(), options.budget_bytes, fixed
+    );
+    return true;
+}
+
+void ChipSwimlaneCollector::session_close() {
+    if (!session_active_.load(std::memory_order_acquire)) return;
+    // Stop admitting first, then let the thread finish whatever it can.
+    {
+        std::lock_guard<std::mutex> lk(session_mu_);
+        session_close_watermark_.store(UINT64_MAX, std::memory_order_release);
+        session_progress_++;
+    }
+    session_cv_.notify_all();
+    std::string ignored;
+    (void)session_flush(simpler::dfx::session::kCutAckBudgetMs * 8, &ignored);
+
+    {
+        std::lock_guard<std::mutex> lk(session_mu_);
+        session_thread_running_.store(false, std::memory_order_release);
+        session_progress_++;
+    }
+    session_cv_.notify_all();
+    if (session_thread_.joinable()) session_thread_.join();
+    session_active_.store(false, std::memory_order_release);
+    set_drain_quantum(0);
+    set_session_counters(false);
+    // The pools go back to uncapped, which is what a collector without a
+    // session has.
+    for (int kind = 0; kind < ChipSwimlaneModule::kBufferKinds; kind++) {
+        manager_.set_paired_cap(kind, 0);
+    }
+
+    // Whatever is still occupied here is storage a *collector shard* may be
+    // writing, and joining the publisher proves nothing about the readers —
+    // the production close path runs before the collector's threads are joined
+    // at all (`finalize_device` calls this, then `runner->finalize()`). So
+    // nothing is reset or freed here: `session_release_deferred_storage()`,
+    // which `finalize()` calls once `stop()` has joined every reader, is the
+    // only place that may touch it.
+    for (size_t slot = 0; slot < session_buckets_.size(); slot++) {
+        if (session_buckets_[slot].state.load(std::memory_order_acquire) == static_cast<int>(EpochState::Free)) {
+            continue;
+        }
+        session_release_deferred_.store(true, std::memory_order_release);
+        LOG_WARN(
+            "ChipSwimlane session %lu: epoch %lu storage is held until the collector threads are joined",
+            static_cast<unsigned long>(session_id_),
+            static_cast<unsigned long>(session_buckets_[slot].epoch.load(std::memory_order_acquire))
+        );
+    }
+    session_budget_.close();
+    LOG_INFO(
+        "ChipSwimlane session %lu closed: %s", static_cast<unsigned long>(session_id_), session_errors_.report().c_str()
+    );
+}
+
+void ChipSwimlaneCollector::session_release_deferred_storage() {
+    if (!session_release_deferred_.exchange(false, std::memory_order_acq_rel)) return;
+    for (size_t slot = 0; slot < session_buckets_.size(); slot++) {
+        if (session_buckets_[slot].state.load(std::memory_order_acquire) == static_cast<int>(EpochState::Free)) {
+            continue;
+        }
+        reset_epoch_store(slot, /*reset_merged_view=*/false);
+        session_release_slot(slot);
+    }
+}
+
+void ChipSwimlaneCollector::session_set_fatal(const std::string &reason) {
+    bool first = false;
+    {
+        // The flag is published under the same mutex a capacity or flush waiter
+        // holds across its check and its wait, so a fatal cannot land in the
+        // window between them and leave that waiter asleep for good.
+        std::lock_guard<std::mutex> lk(session_mu_);
+        if (!session_fatal_.load(std::memory_order_relaxed)) {
+            session_fatal_.store(true, std::memory_order_release);
+            session_fatal_reason_ = reason;
+            first = true;
+        }
+        session_progress_++;
+    }
+    if (first) {
+        // Recorded in the permanent summary, not only in the flag: a writer
+        // that died before sealing anything leaves no epoch-scoped verdict, and
+        // a flush that tested only those rows would call that a clean session.
+        session_errors_.record_fatal(reason.c_str());
+        LOG_ERROR("ChipSwimlane session %lu fatal: %s", static_cast<unsigned long>(session_id_), reason.c_str());
+    }
+    // Wake every caller that could otherwise wait for a count no one will
+    // reach: a capacity wait, and a flush barrier.
+    session_cv_.notify_all();
+}
+
+void ChipSwimlaneCollector::session_note_progress() {
+    if (!session_active_.load(std::memory_order_acquire)) return;
+    {
+        std::lock_guard<std::mutex> lk(session_mu_);
+        session_progress_++;
+    }
+    session_cv_.notify_all();
+}
+
+bool ChipSwimlaneCollector::session_charge(size_t slot, size_t bytes) {
+    if (!session_active_.load(std::memory_order_acquire)) return true;
+    if (bytes == 0) return true;
+    if (slot >= session_buckets_.size()) return false;
+    if (!session_budget_.charge(bytes)) {
+        EpochBucket &bucket = session_buckets_[slot];
+        // Withdraw retention for the rest of this epoch rather than blocking
+        // this shard: a shard parked here is a shard that cannot acknowledge a
+        // reference release, which is exactly what the publisher is waiting
+        // for. Receipts keep counting and the verdict reports the loss.
+        if (bucket.retain.exchange(false, std::memory_order_acq_rel)) {
+            LOG_WARN(
+                "ChipSwimlane session %lu: epoch %lu stops retaining records — %zu B would exceed the %zu B budget",
+                static_cast<unsigned long>(session_id_),
+                static_cast<unsigned long>(bucket.epoch.load(std::memory_order_acquire)), bytes, session_budget_.limit()
+            );
+        }
+        return false;
+    }
+    session_buckets_[slot].charged_bytes.fetch_add(bytes, std::memory_order_acq_rel);
+    return true;
+}
+
+void ChipSwimlaneCollector::session_credit(size_t slot, size_t bytes) {
+    if (bytes == 0 || slot >= session_buckets_.size()) return;
+    session_budget_.credit(bytes);
+    EpochBucket &bucket = session_buckets_[slot];
+    size_t held = bucket.charged_bytes.load(std::memory_order_acquire);
+    while (true) {
+        const size_t next = bytes > held ? 0 : held - bytes;
+        if (bucket.charged_bytes.compare_exchange_weak(held, next, std::memory_order_acq_rel)) return;
+    }
+}
+
+bool ChipSwimlaneCollector::session_admit_run_metadata(size_t slot) {
+    // Measured at the sources, before any copy exists, and conservatively: the
+    // charge counts what a copy can allocate, never only what it shows.
+    size_t total = 0;
+    auto add = [&total](size_t bytes) {
+        if (bytes > SIZE_MAX - total) return false;
+        total += bytes;
+        return true;
+    };
+
+    // Per extension, the element object *and* the block a copy of its payload
+    // allocates. `capacity() + 1` rather than `size()` because a string owns a
+    // terminator and may hold more than it shows; the per-element term is
+    // charged even though this container keeps its elements inline, so the
+    // accounting does not silently depend on that staying true — many short or
+    // empty extensions would otherwise charge nothing for storage that exists.
+    for (const auto &ext : json_extensions_) {
+        if (!add(sizeof(std::string)) || !add(ext.capacity()) || !add(1)) return false;
+    }
+
+    // Capacity and not size, for the same reason: charging the source's reserve
+    // is the direction that cannot come out short.
+    size_t submit_bytes = 0;
+    size_t upload_bytes = 0;
+    if (!simpler::dfx::session::checked_bytes(
+            host_submit_records_.capacity(), sizeof(HostPhaseRecord), &submit_bytes
+        )) {
+        return false;
+    }
+    if (!simpler::dfx::session::checked_bytes(
+            host_upload_records_.capacity(), sizeof(HostPhaseRecord), &upload_bytes
+        )) {
+        return false;
+    }
+    if (!add(submit_bytes) || !add(upload_bytes)) return false;
+    return session_charge(slot, total);
+}
+
+bool ChipSwimlaneCollector::session_read_shm_field(const volatile void *host_field, void *dst, size_t size) {
+    if (dst == nullptr || host_field == nullptr || shm_host_ == nullptr || size == 0) return false;
+    const auto base = reinterpret_cast<uintptr_t>(shm_host_);
+    const auto field = reinterpret_cast<uintptr_t>(host_field);
+    if (field < base || size > shm_size_ || field - base > shm_size_ - size) {
+        LOG_ERROR("ChipSwimlane session: a field of %zu bytes lies outside the shared region", size);
+        return false;
+    }
+    void *dev = manager_.shared_mem_dev();
+    if (dev == nullptr || dev == shm_host_) {
+        // Host and device share the region, so the bytes are already in place
+        // and a transfer would be the shadow write this exists to avoid.
+        std::memcpy(dst, const_cast<const void *>(host_field), size);
+        return true;
+    }
+    void *dev_field = static_cast<char *>(dev) + (field - base);
+    return profiling_copy_from_device(dst, dev_field, size) == 0;
+}
+
+int ChipSwimlaneCollector::session_find_slot(uint64_t run_epoch) const {
+    for (size_t slot = 0; slot < session_buckets_.size(); slot++) {
+        if (session_buckets_[slot].state.load(std::memory_order_acquire) == static_cast<int>(EpochState::Free)) {
+            continue;
+        }
+        if (session_buckets_[slot].epoch.load(std::memory_order_acquire) == run_epoch) return static_cast<int>(slot);
+    }
+    return -1;
+}
+
+bool ChipSwimlaneCollector::session_epoch_is_tombstoned(uint64_t run_epoch) const {
+    for (const auto &t : session_tombstones_) {
+        if (t.load(std::memory_order_relaxed) == run_epoch) return true;
+    }
+    return false;
+}
+
+void ChipSwimlaneCollector::session_bump_control_view() {
+    // Publish the table, then make every shard adopt it before returning. A
+    // shard reads the control epoch before refreshing, so an ack can never
+    // describe a view taken before this change.
+    if (!session_request_reference_release(simpler::dfx::session::kControlAckBudgetMs)) {
+        session_set_fatal("a collector shard did not acknowledge the epoch table in time");
+    }
+}
+
+bool ChipSwimlaneCollector::session_run_begin(
+    uint64_t run_epoch, const std::string &output_prefix, ChipSwimlaneLevel level
+) {
+    if (!session_active_.load(std::memory_order_acquire)) return false;
+    // Refused before a slot is claimed or a byte copied: the path an admitted
+    // epoch retains is reserved, not charged, so a prefix the reservation
+    // cannot hold has to be turned away here rather than discovered later by a
+    // charge that would have to keep what it could not pay for.
+    if (output_prefix.size() > simpler::dfx::session::kPathAllowanceBytes) {
+        LOG_ERROR(
+            "ChipSwimlane session: run %lu refused, its output prefix of %zu bytes exceeds the %zu byte allowance",
+            static_cast<unsigned long>(run_epoch), output_prefix.size(), simpler::dfx::session::kPathAllowanceBytes
+        );
+        return false;
+    }
+    size_t slot = 0;
+    {
+        std::unique_lock<std::mutex> lk(session_mu_);
+        // Capacity backstop. The session thread is what frees a slot and it
+        // never waits on this thread, so this wait cannot close a cycle; it is
+        // bounded by that thread's progress, which file I/O does not bound in
+        // wall-clock terms. Both a slot release and a fatal publish under this
+        // same mutex, so there is nothing here to poll for.
+        while (true) {
+            if (session_fatal_.load(std::memory_order_acquire)) {
+                LOG_ERROR(
+                    "ChipSwimlane session: run %lu refused, session is fatal", static_cast<unsigned long>(run_epoch)
+                );
+                return false;
+            }
+            bool found = false;
+            for (size_t i = 0; i < session_buckets_.size(); i++) {
+                if (session_buckets_[i].state.load(std::memory_order_acquire) == static_cast<int>(EpochState::Free)) {
+                    slot = i;
+                    found = true;
+                    break;
+                }
+            }
+            if (found) break;
+            session_cv_.wait(lk);
+        }
+
+        EpochBucket &bucket = session_buckets_[slot];
+        bucket.epoch.store(run_epoch, std::memory_order_relaxed);
+        bucket.retain.store(true, std::memory_order_relaxed);
+        bucket.target_installed = false;
+        bucket.cut_slot = -1;
+        bucket.cut_request = 0;
+        bucket.pending = RunExport{};
+        bucket.pending.output_prefix = output_prefix;
+        bucket.pending.level = level;
+        bucket.pending.armed_run_epoch = run_epoch;
+        bucket.terminal_ok = false;
+        bucket.transport_retired = 0;
+        bucket.charged_bytes.store(0, std::memory_order_relaxed);
+        bucket.verdict = simpler::dfx::session::CollectionVerdict{};
+        bucket.state.store(static_cast<int>(EpochState::Admitting), std::memory_order_release);
+        reset_epoch_store(slot, /*reset_merged_view=*/false);
+
+        // The per-run collector state a producer and an exporter both read.
+        // Deliberately not `begin_run`: that clears the one record store, which
+        // is exactly what a predecessor's still-arriving buffers need to keep.
+        output_prefix_ = output_prefix;
+        chip_swimlane_level_ = level;
+        json_extensions_.fill({});
+    }
+    // Per-run device counter reset, unchanged from the legacy path.
+    publish_run_config();
+    // Every shard must see this epoch before the device can publish into it,
+    // or its first buffers would be classified as belonging to no bucket.
+    session_bump_control_view();
+    return !session_fatal_.load(std::memory_order_acquire);
+}
+
+void ChipSwimlaneCollector::session_run_close(uint64_t run_epoch, uint32_t bank_index, bool device_execution_complete) {
+    if (!session_active_.load(std::memory_order_acquire)) return;
+    const int found = session_find_slot(run_epoch);
+    if (found < 0) return;
+    const size_t slot = static_cast<size_t>(found);
+    EpochBucket &bucket = session_buckets_[slot];
+
+    // Device-side capture, on the teardown thread, while this run still holds
+    // its claim: the successor has not launched, so the ready-queue tails the
+    // cut reads are stable and the terminal bank is this run's.
+    //
+    // Every read below lands in this bucket's own storage. Nothing is written
+    // into the host shadow: the drain owners keep refreshing their queue
+    // cursors and pool metadata there for as long as they run, and a bulk — or
+    // even a narrow — write from this thread would put a second writer on words
+    // that have exactly one.
+    bucket.transport_retired = drain_dropped_buffers();
+    report_drain_drops();
+    bool reads_ok = true;
+    uint64_t total_device = 0;
+    uint64_t dropped_device = 0;
+    for (int i = 0; i < num_aicore_; i++) {
+        ChipSwimlaneActiveHead head{};
+        ChipSwimlaneAicpuTaskPool *state = get_perf_buffer_state(shm_host_, i);
+        if (!session_read_shm_field(&state->head, &head, sizeof(head))) {
+            reads_ok = false;
+            break;
+        }
+        total_device += head.total_record_count;
+        dropped_device += head.dropped_record_count;
+    }
+    bucket.live.mirror_ok = reads_ok;
+    bucket.live.aicpu_task_total = total_device;
+    bucket.live.aicpu_task_dropped = dropped_device;
+    bucket.live.live_ok = reads_ok;
+
+    // Caller-sized metadata is admitted before a byte of it is copied. A
+    // refusal after the copy could only answer by keeping storage the budget
+    // said it could not pay for, or by freeing records whose readers have not
+    // been released yet — neither of which the hard total bound survives.
+    const bool metadata_admitted = session_admit_run_metadata(slot);
+    bucket.verdict.metadata_complete = metadata_admitted;
+
+    ChipSwimlaneDataHeader *header = get_chip_swimlane_header(shm_host_);
+    uint32_t num_orch_phase_threads = 0;
+    if (session_read_shm_field(&header->num_orch_phase_threads, &num_orch_phase_threads, sizeof(uint32_t))) {
+        bucket.pending.num_orch_phase_threads = num_orch_phase_threads;
+    }
+    std::array<int8_t, PLATFORM_MAX_CORES> core_to_thread{};
+    if (session_read_shm_field(header->core_to_thread, core_to_thread.data(), core_to_thread.size())) {
+        bucket.pending.core_to_thread.assign(core_to_thread.begin(), core_to_thread.end());
+    } else {
+        bucket.pending.core_to_thread.assign(static_cast<size_t>(PLATFORM_MAX_CORES), -1);
+    }
+    bucket.pending.num_aicore = num_aicore_;
+    bucket.pending.core_types = core_types_;
+    bucket.pending.host_orchestrated = host_orchestrated_;
+    if (metadata_admitted) {
+        bucket.pending.json_extensions = json_extensions_;
+        bucket.pending.host_submit_records = host_submit_records_;
+        bucket.pending.host_upload_records = host_upload_records_;
+        bucket.pending.host_phase_records_present = !host_submit_records_.empty() || !host_upload_records_.empty();
+    } else {
+        // Reported in the artifact rather than left to be inferred from a
+        // missing section. The records this epoch already holds are untouched:
+        // nothing may be freed before its readers are proved released.
+        LOG_ERROR(
+            "ChipSwimlane session %lu: epoch %lu publishes without its caller-sized metadata — the %zu B budget "
+            "cannot admit it",
+            static_cast<unsigned long>(session_id_), static_cast<unsigned long>(run_epoch), session_budget_.limit()
+        );
+    }
+    bucket.pending.sched_phase_dropped_records.assign(static_cast<size_t>(PLATFORM_MAX_AICPU_THREADS), 0);
+    for (int t = 0; t < PLATFORM_MAX_AICPU_THREADS; t++) {
+        ChipSwimlaneAicpuSchedPhasePool *state = get_sched_phase_buffer_state(shm_host_, t);
+        uint32_t dropped = 0;
+        if (!session_read_shm_field(&state->head.dropped_record_count, &dropped, sizeof(dropped))) {
+            bucket.live.mirror_ok = false;
+            break;
+        }
+        bucket.pending.sched_phase_dropped_records[static_cast<size_t>(t)] = dropped;
+    }
+
+    if (device_execution_complete) {
+        bucket.terminal = read_run_terminal_snapshot(bank_index, run_epoch);
+        bucket.terminal_ok = bucket.terminal.transport_ok;
+    }
+
+    // Arm the per-queue cut. Every buffer this run will ever publish is already
+    // in a device ready queue at this instant, so each queue's target is finite
+    // and a successor's later traffic cannot discharge it.
+    uint64_t request = 0;
+    bucket.cut_slot = cut_arm(&request);
+    bucket.cut_request = request;
+    if (bucket.cut_slot < 0) {
+        LOG_WARN("ChipSwimlane session: no cut slot for epoch %lu", static_cast<unsigned long>(run_epoch));
+    } else if (!cut_wait_for_ack(request, simpler::dfx::session::kCutAckBudgetMs)) {
+        LOG_WARN(
+            "ChipSwimlane session: epoch %lu cut capture did not complete in %d ms",
+            static_cast<unsigned long>(run_epoch), simpler::dfx::session::kCutAckBudgetMs
+        );
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(session_mu_);
+        bucket.target_installed = true;
+        bucket.closed_at = std::chrono::steady_clock::now();
+        uint64_t watermark = session_close_watermark_.load(std::memory_order_acquire);
+        if (watermark != UINT64_MAX && run_epoch > watermark) {
+            session_close_watermark_.store(run_epoch, std::memory_order_release);
+        }
+        session_progress_++;
+    }
+    session_cv_.notify_all();
+}
+
+void ChipSwimlaneCollector::refresh_session_epoch_view(int collector_shard) {
+    if (collector_shard < 0 || static_cast<size_t>(collector_shard) >= shard_views_.size()) return;
+    ShardEpochView view;
+    {
+        std::lock_guard<std::mutex> lk(session_mu_);
+        for (size_t slot = 0; slot < session_buckets_.size(); slot++) {
+            const int state = session_buckets_[slot].state.load(std::memory_order_acquire);
+            if (state != static_cast<int>(EpochState::Admitting)) continue;
+            view.entries[view.count].epoch = session_buckets_[slot].epoch.load(std::memory_order_acquire);
+            view.entries[view.count].slot = static_cast<int>(slot);
+            view.entries[view.count].retain = session_buckets_[slot].retain.load(std::memory_order_acquire);
+            view.count++;
+        }
+    }
+    shard_views_[static_cast<size_t>(collector_shard)] = view;
+}
+
+void ChipSwimlaneCollector::session_release_slot(size_t slot) {
+    EpochBucket &bucket = session_buckets_[slot];
+    const uint64_t epoch = bucket.epoch.load(std::memory_order_acquire);
+    const size_t cursor = session_tombstone_cursor_.fetch_add(1, std::memory_order_relaxed);
+    session_tombstones_[cursor % session_tombstones_.size()].store(epoch, std::memory_order_relaxed);
+    // Free the storage first, then give its bytes back: a credit ahead of the
+    // release would let an admission see headroom that does not exist yet.
+    bucket.pending = RunExport{};
+    const size_t charged = bucket.charged_bytes.exchange(0, std::memory_order_acq_rel);
+    if (charged > 0) session_budget_.credit(charged);
+    // Published under `session_mu_` so an admission waiting for capacity cannot
+    // miss the transition between its scan and its wait.
+    {
+        std::lock_guard<std::mutex> lk(session_mu_);
+        bucket.state.store(static_cast<int>(EpochState::Free), std::memory_order_release);
+        session_progress_++;
+    }
+    session_cv_.notify_all();
+}
+
+int ChipSwimlaneCollector::session_publish_file(RunExport &data, const std::string &path) {
+    const std::string tmp = path + ".tmp";
+    // Exclusive create: no other writer can share this temp file, and a stale
+    // one from an earlier crash is an error rather than a silent reuse.
+    int fd = ::open(tmp.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
+    if (fd < 0) {
+        LOG_ERROR("ChipSwimlane session: cannot create %s: %s", tmp.c_str(), std::strerror(errno));
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    ::close(fd);
+    // The writer fills the temp file, never the published path: the final name
+    // must come into existence only through the link below, or a reader could
+    // see a half-written artifact under the name that means "complete".
+    data.artifact_path = tmp;
+    const int rc = write_swimlane_json(data);
+    if (rc != 0) {
+        ::unlink(tmp.c_str());
+        return rc;
+    }
+    // Publication that cannot replace: `link` fails EEXIST atomically, so a
+    // second epoch targeting an occupied path reports a collision instead of
+    // overwriting somebody's artifact. No fsync — this is crash atomicity
+    // against process death, not durability.
+    if (::link(tmp.c_str(), path.c_str()) != 0) {
+        LOG_ERROR("ChipSwimlane session: cannot publish %s: %s", path.c_str(), std::strerror(errno));
+        ::unlink(tmp.c_str());
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    ::unlink(tmp.c_str());
+    return 0;
+}
+
+bool ChipSwimlaneCollector::session_seal_and_publish(size_t slot, simpler::dfx::session::Verdict verdict) {
+    EpochBucket &bucket = session_buckets_[slot];
+    const uint64_t epoch = bucket.epoch.load(std::memory_order_acquire);
+
+    // Withdraw admission, then wait for every shard to drop its reference.
+    // Nothing is moved or freed before the last ack; a timeout quarantines.
+    bucket.state.store(static_cast<int>(EpochState::Closing), std::memory_order_release);
+    if (!session_request_reference_release(simpler::dfx::session::kControlAckBudgetMs)) {
+        bucket.state.store(static_cast<int>(EpochState::Quarantined), std::memory_order_release);
+        session_finish_bucket(
+            slot, simpler::dfx::session::Verdict::Quarantined, "a collector shard still holds a reference"
+        );
+        return false;
+    }
+
+    // The merged copy every record needs here was charged when the record was
+    // retained, so this cannot run out of budget and cannot answer by dropping
+    // records it has already accepted.
+    merge_epoch_store(slot);
+    RunExport &data = bucket.pending;
+    data.perf_records = std::move(collected_perf_records_);
+    data.aicore_records = std::move(collected_aicore_records_);
+    data.sched_phase_records = std::move(collected_sched_phase_records_);
+    data.orch_phase_records = std::move(collected_orch_phase_records_);
+    collected_perf_records_.clear();
+    collected_aicore_records_.clear();
+    collected_sched_phase_records_.clear();
+    collected_orch_phase_records_.clear();
+    for (auto &shard : store(slot).perf)
+        for (auto &instance : shard) {
+            instance.clear();
+            instance.shrink_to_fit();
+        }
+    for (auto &shard : store(slot).aicore)
+        for (auto &instance : shard) {
+            instance.clear();
+            instance.shrink_to_fit();
+        }
+    for (auto &shard : store(slot).sched_phase)
+        for (auto &instance : shard) {
+            instance.clear();
+            instance.shrink_to_fit();
+        }
+    for (auto &shard : store(slot).orch_phase)
+        for (auto &instance : shard) {
+            instance.clear();
+            instance.shrink_to_fit();
+        }
+    data.total_perf_collected = total_perf_collected_;
+    data.total_sched_phase_collected = total_sched_phase_collected_;
+    data.total_orch_phase_collected = total_orch_phase_collected_;
+    data.total_aicore_collected = total_aicore_collected_;
+    // The merged view is this epoch's, so these are its figures. Accumulated
+    // because the artifact carries the AICore rows and not the count behind
+    // them, so this is where that count is observable.
+    session_aicore_collected_.fetch_add(total_aicore_collected_, std::memory_order_relaxed);
+    session_aicore_foreign_.fetch_add(aicore_foreign_identity_, std::memory_order_relaxed);
+    data.has_phase_data = has_phase_data_;
+    data.terminal_snapshot = bucket.terminal;
+    data.terminal_reported = bucket.terminal_ok;
+    const HandoffReport report = build_handoff_report(bucket.terminal, slot);
+    // The merged view's records have been moved out, so it describes no slot.
+    // The next epoch's merge tests this, and a stale slot number would make it
+    // short-circuit and seal an empty artifact.
+    merged_slot_ = -1;
+    data.collection.present = true;
+    data.collection.run_epoch = epoch;
+    data.collection.session_id = session_id_;
+    data.collection.processing_complete =
+        verdict == simpler::dfx::session::Verdict::Published || verdict == simpler::dfx::session::Verdict::PartialSafe;
+    data.collection.transport_retired = bucket.transport_retired;
+    data.collection.metadata_complete = bucket.verdict.metadata_complete;
+    // Decided when this epoch was serviced, against that cut's own request. A
+    // second reading here could find a count the retirement below has already
+    // made meaningless.
+    data.collection.cut_failed_queues = bucket.verdict.cut_failed_queues;
+    data.collection.unpublished_loss = report.aicore_task.silent_loss_known ? report.aicore_task.silent_loss : 0;
+    data.collection.not_received_buffers =
+        report.aicore_task.published_buffers > report.aicore_task.received_buffers ?
+            report.aicore_task.published_buffers - report.aicore_task.received_buffers :
+            0;
+    if (verdict == simpler::dfx::session::Verdict::Published &&
+        (data.collection.transport_retired != 0 || data.collection.not_received_buffers != 0 ||
+         data.collection.unpublished_loss != 0 || !data.collection.metadata_complete ||
+         !bucket.retain.load(std::memory_order_acquire))) {
+        verdict = simpler::dfx::session::Verdict::PartialSafe;
+    }
+    data.collection.verdict = verdict;
+
+    bucket.state.store(static_cast<int>(EpochState::Sealed), std::memory_order_release);
+
+    // A verdict that leaves no artifact still has to come through here: the
+    // records were only safe to move because the handshake above proved every
+    // shard had dropped its reference, and the slot has to be handed back
+    // either way.
+    if (!simpler::dfx::session::verdict_publishes(verdict)) {
+        session_finish_bucket(slot, verdict, "no artifact is written for this verdict");
+        return false;
+    }
+
+    const std::string path = session_dir_ + "/records_e" + std::to_string(epoch) + ".json";
+    const int rc = session_publish_file(data, path);
+    if (rc != 0) {
+        session_finish_bucket(slot, simpler::dfx::session::Verdict::WriteFailed, path.c_str());
+        return false;
+    }
+    session_finish_bucket(slot, verdict, nullptr);
+    return true;
+}
+
+void ChipSwimlaneCollector::session_finish_bucket(
+    size_t slot, simpler::dfx::session::Verdict verdict, const char *detail
+) {
+    EpochBucket &bucket = session_buckets_[slot];
+    const uint64_t epoch = bucket.epoch.load(std::memory_order_acquire);
+    session_errors_.record(epoch, verdict, detail);
+    if (bucket.cut_slot >= 0) {
+        // Retiring waits for every drain owner to prove it is out of this
+        // slot's arrays. A failure leaves the slot retired for good rather than
+        // handing a live reader's memory to the next arm.
+        if (!cut_release(bucket.cut_slot, simpler::dfx::session::kCutAckBudgetMs)) {
+            session_set_fatal("cut slot " + std::to_string(bucket.cut_slot) + " was not retired by every drain owner");
+        }
+        bucket.cut_slot = -1;
+        bucket.cut_request = 0;
+    }
+    if (verdict == simpler::dfx::session::Verdict::Quarantined) {
+        // No release: the references were never proved gone. The slot stays
+        // occupied, admission fails from here on, and only the reader-join
+        // teardown in `session_release_deferred_storage()` may touch this
+        // storage.
+        session_set_fatal("epoch " + std::to_string(epoch) + " quarantined: " + (detail != nullptr ? detail : ""));
+        return;
+    }
+    if (verdict == simpler::dfx::session::Verdict::WriteFailed ||
+        verdict == simpler::dfx::session::Verdict::CounterExhausted) {
+        // Sealed already moved the records out of the shards, so the memory is
+        // this thread's to release even though no file exists.
+        LOG_ERROR(
+            "ChipSwimlane session: epoch %lu ended %s (%s)", static_cast<unsigned long>(epoch),
+            simpler::dfx::session::verdict_name(verdict), detail != nullptr ? detail : ""
+        );
+    } else {
+        LOG_INFO(
+            "ChipSwimlane session: epoch %lu %s", static_cast<unsigned long>(epoch),
+            simpler::dfx::session::verdict_name(verdict)
+        );
+    }
+    reset_epoch_store(slot, /*reset_merged_view=*/false);
+    session_release_slot(slot);
+}
+
+void ChipSwimlaneCollector::session_service_once() {
+    for (size_t slot = 0; slot < session_buckets_.size(); slot++) {
+        EpochBucket &bucket = session_buckets_[slot];
+        if (bucket.state.load(std::memory_order_acquire) != static_cast<int>(EpochState::Admitting)) continue;
+        bool ready = false;
+        {
+            std::lock_guard<std::mutex> lk(session_mu_);
+            ready = bucket.target_installed;
+        }
+        if (!ready) continue;
+
+        // Every terminal input acts, not only a pass: a cut that can never
+        // settle still has to release its slot, or two failed epochs would
+        // strand the capacity for good.
+        simpler::dfx::session::Verdict verdict = simpler::dfx::session::Verdict::Published;
+        int failed = 0;
+        const bool cut_known = bucket.cut_slot >= 0 && cut_failed_queues(bucket.cut_slot, bucket.cut_request, &failed);
+        bucket.verdict.cut_failed_queues = static_cast<uint64_t>(failed);
+        if (cut_counters_exhausted()) {
+            // A counter within its wrap margin makes every target comparison
+            // meaningless, so no cut after it can be justified.
+            verdict = simpler::dfx::session::Verdict::CounterExhausted;
+        } else if (!cut_known || failed != 0) {
+            verdict = simpler::dfx::session::Verdict::CutUnknown;
+        } else if (!cut_stage2_done(bucket.cut_slot)) {
+            const auto waited = std::chrono::steady_clock::now() - bucket.closed_at;
+            if (waited < std::chrono::milliseconds(simpler::dfx::session::kCutAckBudgetMs * 4)) continue;
+            verdict = simpler::dfx::session::Verdict::CutUnknown;
+        }
+        if (!bucket.terminal_ok && verdict == simpler::dfx::session::Verdict::Published) {
+            verdict = simpler::dfx::session::Verdict::CutUnknown;
+        }
+        (void)session_seal_and_publish(slot, verdict);
+    }
+}
+
+std::optional<std::chrono::steady_clock::time_point> ChipSwimlaneCollector::session_next_wakeup() const {
+    // The only thing this thread ever needs a clock for: an epoch whose cut has
+    // not settled gives up after a bounded wait, and that expiry is not an
+    // event anybody can signal. Everything else — a target landing, stage 1
+    // publishing, a shard reaching its watermark, a fatal, a close — bumps
+    // `session_progress_` and wakes this thread on the spot.
+    std::optional<std::chrono::steady_clock::time_point> earliest;
+    for (const auto &bucket : session_buckets_) {
+        if (bucket.state.load(std::memory_order_acquire) != static_cast<int>(EpochState::Admitting)) continue;
+        if (!bucket.target_installed) continue;
+        const auto expiry = bucket.closed_at + std::chrono::milliseconds(simpler::dfx::session::kCutAckBudgetMs * 4);
+        if (!earliest.has_value() || expiry < earliest.value()) earliest = expiry;
+    }
+    return earliest;
+}
+
+void ChipSwimlaneCollector::session_thread_main() {
+    while (session_thread_running_.load(std::memory_order_acquire)) {
+        uint64_t seen = 0;
+        {
+            std::lock_guard<std::mutex> lk(session_mu_);
+            seen = session_progress_;
+        }
+        try {
+            session_service_once();
+        } catch (const std::exception &e) {
+            // A background writer that dies silently strands every waiter, so
+            // the fatal is published and broadcast before anything else.
+            session_set_fatal(std::string("session thread failed: ") + e.what());
+        } catch (...) {
+            session_set_fatal("session thread failed with an unknown exception");
+        }
+        std::unique_lock<std::mutex> lk(session_mu_);
+        if (!session_thread_running_.load(std::memory_order_acquire)) break;
+        // Progress that landed while this pass was running is not a missed
+        // wakeup: the counter says so, and the next pass picks it up.
+        if (session_progress_ != seen) continue;
+        const auto deadline = session_next_wakeup();
+        if (deadline.has_value()) {
+            session_cv_.wait_until(lk, deadline.value());
+        } else {
+            session_cv_.wait(lk);
+        }
+    }
+}
+
+bool ChipSwimlaneCollector::session_flush(int timeout_ms, std::string *error) {
+    if (!session_active_.load(std::memory_order_acquire)) return true;
+    const uint64_t watermark = session_close_watermark_.load(std::memory_order_acquire);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (true) {
+        bool pending = false;
+        {
+            std::unique_lock<std::mutex> lk(session_mu_);
+            for (size_t slot = 0; slot < session_buckets_.size(); slot++) {
+                const int state = session_buckets_[slot].state.load(std::memory_order_acquire);
+                if (state == static_cast<int>(EpochState::Free)) continue;
+                if (state == static_cast<int>(EpochState::Quarantined)) continue;  // terminal, reported below
+                const uint64_t epoch = session_buckets_[slot].epoch.load(std::memory_order_acquire);
+                if (epoch <= watermark && session_buckets_[slot].target_installed) pending = true;
+            }
+            if (!pending) break;
+            if (session_fatal_.load(std::memory_order_acquire)) break;
+            if (session_cv_.wait_until(lk, deadline) == std::cv_status::timeout &&
+                std::chrono::steady_clock::now() >= deadline) {
+                if (error != nullptr) {
+                    *error = "chip swimlane flush timed out with epochs still unpublished; " + session_errors_.report();
+                }
+                return false;
+            }
+        }
+    }
+    // A fatal is a failure of the session itself and is reported as one even
+    // when no epoch has a verdict yet: a writer that died before sealing
+    // anything leaves no per-epoch row, and a promised file does not exist.
+    if (session_fatal_.load(std::memory_order_acquire)) {
+        if (error != nullptr) {
+            std::lock_guard<std::mutex> lk(session_mu_);
+            *error = "chip swimlane session is fatal: " + session_fatal_reason_ + "; " + session_errors_.report();
+        }
+        return false;
+    }
+    // A published partial is a verdict, not a failure; anything that left no
+    // file is reported, and the permanent summary is what remembers a failure
+    // from more than `kMaxTombstones` epochs ago.
+    if (session_errors_.has_error()) {
+        if (error != nullptr) *error = "chip swimlane session reported failures: " + session_errors_.report();
+        return false;
+    }
+    return true;
+}
+
+ChipSwimlaneCollector::SessionStats ChipSwimlaneCollector::session_stats_for_test() const {
+    SessionStats stats;
+    stats.active = session_active_.load(std::memory_order_acquire);
+    stats.fatal = session_fatal_.load(std::memory_order_acquire);
+    stats.late_after_seal = session_late_after_seal_.load(std::memory_order_relaxed);
+    stats.unknown_epoch = session_unknown_epoch_.load(std::memory_order_relaxed);
+    stats.no_bucket = session_no_bucket_.load(std::memory_order_relaxed);
+    stats.aicore_collected = session_aicore_collected_.load(std::memory_order_relaxed);
+    stats.aicore_foreign = session_aicore_foreign_.load(std::memory_order_relaxed);
+    stats.host_charged = session_budget_.charged();
+    stats.budget_refusals = session_budget_.refusals();
+    stats.release_deferred = session_release_deferred_.load(std::memory_order_acquire);
+    for (const auto &bucket : session_buckets_) {
+        if (bucket.state.load(std::memory_order_acquire) != static_cast<int>(EpochState::Free)) stats.open_slots++;
+    }
+    // One locked read, so the per-verdict rows and the aggregate cannot
+    // disagree. `published` is every epoch that left a readable artifact:
+    // settled, content-partial and cut-unknown together.
+    const auto counts = session_errors_.counts();
+    stats.partial = counts.partial;
+    stats.cut_unknown = counts.cut_unknown;
+    stats.write_failed = counts.write_failed;
+    stats.quarantined = counts.quarantined;
+    stats.counter_exhausted = counts.counter_exhausted;
+    stats.published = counts.published + counts.partial + counts.cut_unknown;
+    return stats;
 }

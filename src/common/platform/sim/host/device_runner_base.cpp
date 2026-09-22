@@ -873,14 +873,29 @@ void SimDeviceRunnerBase::publish_host_phase_records_to_swimlane(uint32_t pipeli
     );
 }
 
-void SimDeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &dfx) {
+void SimDeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch) {
     // Opening a resident collector's window drops the previous run's records and
     // republishes the device level, so it belongs with the start, at launch.
     auto thread_factory = [this](std::function<void()> fn) {
         return create_thread(std::move(fn));
     };
     if (dfx.chip_swimlane_enabled()) {
-        chip_swimlane_collector_.begin_run(dfx.output_prefix, dfx.chip_swimlane_level);
+        // Same session rule as the onboard base: open once, then admit each run
+        // instead of running the destructive per-run reset.
+        if (dfx_session_enabled_ && !chip_swimlane_collector_.session_active()) {
+            ChipSwimlaneCollector::SessionOptions options;
+            options.enabled = true;
+            if (!chip_swimlane_collector_.session_open(options, dfx.output_prefix)) {
+                LOG_ERROR("ChipSwimlane session could not open; this run collects nothing");
+            }
+        }
+        if (chip_swimlane_collector_.session_active()) {
+            if (!chip_swimlane_collector_.session_run_begin(run_epoch, dfx.output_prefix, dfx.chip_swimlane_level)) {
+                LOG_ERROR("ChipSwimlane session refused run_epoch %llu", static_cast<unsigned long long>(run_epoch));
+            }
+        } else {
+            chip_swimlane_collector_.begin_run(dfx.output_prefix, dfx.chip_swimlane_level);
+        }
         chip_swimlane_collector_.start(thread_factory);
     }
     if (dfx.dump_args_enabled()) {
@@ -912,6 +927,13 @@ uint64_t SimDeviceRunnerBase::arm_chip_swimlane_run_terminal_bank(uint32_t pipel
     return reinterpret_cast<uint64_t>(chip_swimlane_collector_.arm_run_terminal_bank(pipeline_slot, run_epoch));
 }
 
+int SimDeviceRunnerBase::flush_diagnostics(int timeout_ms, std::string *error) {
+    if (!chip_swimlane_collector_.session_active()) return 0;
+    return chip_swimlane_collector_.session_flush(timeout_ms, error) ? 0 : PTO_RUNTIME_ERR_INTERNAL;
+}
+
+void SimDeviceRunnerBase::close_diagnostics_session() { chip_swimlane_collector_.session_close(); }
+
 void SimDeviceRunnerBase::write_host_phase_records_artifact(const std::string &output_prefix, uint32_t pipeline_slot) {
     if (pipeline_slot >= host_phase_runs_.size()) return;
     simpler::dfx::HostPhaseRecordStore &records = host_phase_runs_[pipeline_slot].records;
@@ -933,6 +955,27 @@ void SimDeviceRunnerBase::teardown_shared_collectors_after_run(
     // and each collector drains before it reconciles before it exports.
     // Diagnostic exports use the per-task output prefix the user set on
     // CallConfig (CallConfig::validate() enforces non-empty upstream).
+    if (dfx.chip_swimlane_enabled() && chip_swimlane_collector_.session_active()) {
+        chip_swimlane_collector_.session_run_close(run_epoch, pipeline_slot, device_execution_complete);
+        publish_host_phase_records_to_swimlane(pipeline_slot);
+        publish_chip_swimlane_runtime_extensions();
+        write_host_phase_records_artifact(dfx.output_prefix, pipeline_slot);
+        if (dfx.dump_args_enabled()) {
+            dump_collector_.quiesce();
+            dump_collector_.reconcile_counters();
+            dump_collector_.export_dump_files();
+        }
+        if (dfx.pmu_enabled) {
+            pmu_collector_.quiesce();
+            pmu_collector_.reconcile_counters();
+        }
+        if (dfx.scope_stats_enabled) {
+            scope_stats_collector_.quiesce();
+            scope_stats_collector_.reconcile_counters();
+            scope_stats_collector_.write_jsonl(dfx.output_prefix);
+        }
+        return;
+    }
     if (dfx.chip_swimlane_enabled()) {
         chip_swimlane_collector_.quiesce();
         chip_swimlane_collector_.read_phase_header_metadata();

@@ -219,8 +219,8 @@ def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
     class FakeChipWorker:
         pipeline_depth = 2
 
-        def init(self, device_id, bins, *, log_level, prewarm_config=None, enable_sdma=False):
-            events.append(("init", device_id, bins, log_level, prewarm_config, enable_sdma))
+        def init(self, device_id, bins, *, log_level, prewarm_config=None, enable_sdma=False, dfx_session=False):
+            events.append(("init", device_id, bins, log_level, prewarm_config, enable_sdma, dfx_session))
 
         def finalize(self) -> None:
             events.append(("finalize",))
@@ -254,7 +254,7 @@ def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
         shm.close()
         shm.unlink()
 
-    assert events[0] == ("init", 7, "bins", 25, None, False)
+    assert events[0] == ("init", 7, "bins", 25, None, False, False)
     assert events[1][0] == "main_loop"
     assert events[1][2:] == ("a2a3", "tensormap_and_ringbuffer")
     assert events[2] == ("finalize",)

@@ -47,6 +47,7 @@
 #include "../task_interface/tensor.h"
 #include "../worker/pipeline_slot_pool.h"
 #include "../worker/device_memory_info.h"
+#include "worker_manager.h"
 #include "ring.h"
 #include "scope.h"
 #include "tensormap.h"
@@ -109,6 +110,15 @@ public:
     // target worker is running a task (MemoryAllocator is mutex-protected).
     uint64_t committed_device_memory(int worker_id);
     DeviceMemoryInfo device_memory_info(int worker_id);
+
+    /**
+     * Publish every diagnostic run a next-level worker has closed.
+     *
+     * Serialized against the other control commands by that endpoint's mailbox
+     * mutex, like every command here. The caller is responsible for issuing it
+     * only when no run of its own is outstanding.
+     */
+    DfxFlushReport flush_diagnostics(int worker_id, double timeout_s);
 
     // Submit a NEXT_LEVEL task. `callable` is the stable identity returned
     // by Worker.register(); the child resolves its digest to a private slot.

@@ -3158,7 +3158,7 @@ int DeviceRunnerBase::init_runtime_args_with_metadata(
     return 0;
 }
 
-void DeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &dfx) {
+void DeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch) {
     // Open each enabled collector's window and start its mgmt + poll threads
     // now, just before kernels launch. Both halves belong here: begin_run()
     // drops the previous run's records and republishes the device level, which
@@ -3169,7 +3169,24 @@ void DeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &dfx) 
         return create_thread(std::move(fn));
     };
     if (dfx.chip_swimlane_enabled()) {
-        chip_swimlane_collector_.begin_run(dfx.output_prefix, dfx.chip_swimlane_level);
+        // A continuous session opens once, on the first profiled run, and then
+        // admits each run instead of wiping the collector. `run_begin` is the
+        // destructive per-run reset and is exactly what a session must not do
+        // while a predecessor's buffers are still arriving.
+        if (dfx_session_enabled_ && !chip_swimlane_collector_.session_active()) {
+            ChipSwimlaneCollector::SessionOptions options;
+            options.enabled = true;
+            if (!chip_swimlane_collector_.session_open(options, dfx.output_prefix)) {
+                LOG_ERROR("ChipSwimlane session could not open; this run collects nothing");
+            }
+        }
+        if (chip_swimlane_collector_.session_active()) {
+            if (!chip_swimlane_collector_.session_run_begin(run_epoch, dfx.output_prefix, dfx.chip_swimlane_level)) {
+                LOG_ERROR("ChipSwimlane session refused run_epoch %llu", static_cast<unsigned long long>(run_epoch));
+            }
+        } else {
+            chip_swimlane_collector_.begin_run(dfx.output_prefix, dfx.chip_swimlane_level);
+        }
         chip_swimlane_collector_.start(thread_factory);
     }
     if (dfx.dump_args_enabled()) {
@@ -3185,6 +3202,13 @@ void DeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &dfx) 
         scope_stats_collector_.start(thread_factory);
     }
 }
+
+int DeviceRunnerBase::flush_diagnostics(int timeout_ms, std::string *error) {
+    if (!chip_swimlane_collector_.session_active()) return 0;
+    return chip_swimlane_collector_.session_flush(timeout_ms, error) ? 0 : PTO_RUNTIME_ERR_INTERNAL;
+}
+
+void DeviceRunnerBase::close_diagnostics_session() { chip_swimlane_collector_.session_close(); }
 
 void DeviceRunnerBase::write_host_phase_records_artifact(const std::string &output_prefix, uint32_t pipeline_slot) {
     if (pipeline_slot >= host_phase_runs_.size()) return;
@@ -3209,6 +3233,30 @@ void DeviceRunnerBase::teardown_shared_collectors_after_run(
     // order (mgmt's final-drain pass into L2 has poll as its consumer).
     // Diagnostic exports use the per-task output prefix the user set on
     // CallConfig (CallConfig::validate() enforces non-empty upstream).
+    if (dfx.chip_swimlane_enabled() && chip_swimlane_collector_.session_active()) {
+        // The session keeps the run boundary's device-side reads — terminal and
+        // live counters — and hands the rest to its own thread. No quiesce: the
+        // pipeline is shared with the successor and draining it here is what
+        // the per-queue cut replaces.
+        chip_swimlane_collector_.session_run_close(run_epoch, pipeline_slot, device_execution_complete);
+        publish_host_phase_records_to_swimlane(pipeline_slot);
+        write_host_phase_records_artifact(dfx.output_prefix, pipeline_slot);
+        if (dfx.dump_args_enabled()) {
+            dump_collector_.quiesce();
+            dump_collector_.reconcile_counters();
+            dump_collector_.export_dump_files();
+        }
+        if (dfx.pmu_enabled) {
+            pmu_collector_.quiesce();
+            pmu_collector_.reconcile_counters();
+        }
+        if (dfx.scope_stats_enabled) {
+            scope_stats_collector_.quiesce();
+            scope_stats_collector_.reconcile_counters();
+            scope_stats_collector_.write_jsonl(dfx.output_prefix);
+        }
+        return;
+    }
     if (dfx.chip_swimlane_enabled()) {
         chip_swimlane_collector_.quiesce();
         chip_swimlane_collector_.read_phase_header_metadata();

@@ -479,7 +479,7 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 if (int fence_rc = arm_run_fence(*prepared); fence_rc != 0) return fence_rc;
                 (void)arm_device_wall_buffer(prepared->pipeline_slot, prepared->kernel_args);
                 if (int arm_rc = arm_collectors_for_run(runtime, *prepared); arm_rc != 0) return arm_rc;
-                start_shared_collectors_for_run(prepared->dfx);
+                start_shared_collectors_for_run(prepared->dfx, prepared->identity.run_epoch);
                 if (prepared->dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
                     auto thread_factory = [this](std::function<void()> fn) {
                         return create_thread(std::move(fn));

@@ -451,6 +451,7 @@ public:
         block_ranges_.clear();
         released_allocations_.clear();
         malloc_shadows_.clear();
+        reset_paired_accounting_locked();
     }
 
     /**
@@ -505,6 +506,7 @@ public:
         block_ranges_.clear();
         released_allocations_.clear();
         malloc_shadows_.clear();
+        reset_paired_accounting_locked();
     }
 
     // -------------------------------------------------------------------------
@@ -743,6 +745,141 @@ public:
     }
 
     // -------------------------------------------------------------------------
+    // Paired-byte pool accounting
+    // -------------------------------------------------------------------------
+    //
+    // One charge covers a device block **and** the host shadow it is paired
+    // with, because `alloc_and_register_block` produces both and a real free
+    // releases both. On an SVM platform the shadow is the same memory, so it is
+    // counted once. Uncapped unless a caller sets a cap, which only the
+    // continuous-collection session does.
+    //
+    // Two figures, because a cap and an occupancy are different questions. The
+    // seed is what `init()` allocated and is the only thing a cap is derived
+    // from, so growth cannot widen its own bound. The live total is the seed
+    // plus every block replenishment has added, and is what an admission is
+    // compared against.
+    //
+    // Neither is credited when a buffer is recycled: a recycled buffer's block
+    // is still allocated, so handing capacity back would hand back capacity
+    // that is still occupied. Both return to zero only where this manager stops
+    // tracking every allocation it had — `clear_mappings()` and
+    // `release_all_owned()`, which empty the mapping table and every queue.
+    // They describe what is tracked, not what the operating system holds: a
+    // release callback that fails leaves memory allocated that this manager no
+    // longer has a record of either way.
+
+    /** Paired bytes `init()` seeded. A cap is derived from this and nothing else. */
+    size_t paired_initial(int kind) const {
+        if (kind < 0 || kind >= Module::kBufferKinds) return 0;
+        return paired_initial_[static_cast<size_t>(kind)].load(std::memory_order_relaxed);
+    }
+
+    /** Paired bytes charged and not given back: the seed plus retained growth. */
+    size_t paired_charged(int kind) const {
+        if (kind < 0 || kind >= Module::kBufferKinds) return 0;
+        return paired_charged_[static_cast<size_t>(kind)].load(std::memory_order_relaxed);
+    }
+
+    /**
+     * A release attempt did not report success, so memory this manager charged
+     * for may still be held.
+     *
+     * Sticky for the manager's life, and per manager rather than per byte: the
+     * release surface reports a status per pointer and carries no size, so the
+     * honest granularity is "something was not proved released". A caller whose
+     * correctness rests on a byte bound — the continuous-collection session —
+     * refuses to admit anything while this is set, which is what keeps an
+     * unproved release from being spent as capacity.
+     */
+    bool release_unproven() const { return release_unproven_.load(std::memory_order_acquire); }
+
+    /** Record a release whose callback did not report success. */
+    void note_release_failed(void *dev_ptr, int rc) {
+        if (!release_unproven_.exchange(true, std::memory_order_acq_rel)) {
+            LOG_ERROR(
+                "BufferPoolManager: releasing %p reported %d; paired occupancy stays charged and no further "
+                "capped session is admitted",
+                dev_ptr, rc
+            );
+        }
+    }
+
+    /** Zero means uncapped, which is the default for every profiler. */
+    void set_paired_cap(int kind, size_t bytes) {
+        if (kind < 0 || kind >= Module::kBufferKinds) return;
+        paired_cap_[static_cast<size_t>(kind)].store(bytes, std::memory_order_relaxed);
+    }
+
+    /**
+     * Count an allocation this manager did not make itself, as part of the seed.
+     *
+     * A collector's `init()` allocates its own buffers through
+     * `alloc_paired_buffer`, which knows no kind; this is how those reach the
+     * per-kind figures. Uncapped at init time, so the charge cannot be refused
+     * — it records, it does not admit.
+     */
+    void note_paired_allocation(int kind, size_t device_bytes) {
+        if (kind < 0 || kind >= Module::kBufferKinds) return;
+        (void)charge_paired(kind, device_bytes);
+        const size_t seeded = paired_bytes(device_bytes);
+        auto &initial = paired_initial_[static_cast<size_t>(kind)];
+        size_t current = initial.load(std::memory_order_relaxed);
+        while (true) {
+            const size_t next = seeded > SIZE_MAX - current ? SIZE_MAX : current + seeded;
+            if (initial.compare_exchange_weak(current, next, std::memory_order_acq_rel)) return;
+        }
+    }
+
+private:
+    size_t paired_bytes(size_t device_bytes) const {
+        // A separate host shadow exists exactly when the platform needs a copy
+        // to reach the device; SVM aliases the two and must not double count.
+        return ops_.copy_to_device ? device_bytes * 2 : device_bytes;
+    }
+
+    bool charge_paired(int kind, size_t device_bytes) {
+        if (kind < 0 || kind >= Module::kBufferKinds) return true;
+        const size_t want = paired_bytes(device_bytes);
+        const size_t cap = paired_cap_[static_cast<size_t>(kind)].load(std::memory_order_relaxed);
+        auto &charged = paired_charged_[static_cast<size_t>(kind)];
+        size_t current = charged.load(std::memory_order_relaxed);
+        while (true) {
+            if (cap != 0 && (want > cap || current > cap - want)) return false;
+            if (charged.compare_exchange_weak(current, current + want, std::memory_order_acq_rel)) return true;
+        }
+    }
+
+    void credit_paired(int kind, size_t device_bytes) {
+        if (kind < 0 || kind >= Module::kBufferKinds) return;
+        const size_t give = paired_bytes(device_bytes);
+        auto &charged = paired_charged_[static_cast<size_t>(kind)];
+        size_t current = charged.load(std::memory_order_relaxed);
+        while (true) {
+            const size_t next = give > current ? 0 : current - give;
+            if (charged.compare_exchange_weak(current, next, std::memory_order_acq_rel)) return;
+        }
+    }
+
+    /**
+     * Both paired figures return to zero, for every kind.
+     *
+     * Called from the two places that empty the mapping table and every queue.
+     * An empty table is not proof of release, so this reconciles only when
+     * every release in that pass reported success: once `release_unproven()` is
+     * set the occupancy stays charged, which keeps a capped session from
+     * spending capacity whose memory may still be held.
+     */
+    void reset_paired_accounting_locked() {
+        if (release_unproven_.load(std::memory_order_acquire)) return;
+        for (int kind = 0; kind < Module::kBufferKinds; kind++) {
+            paired_charged_[static_cast<size_t>(kind)].store(0, std::memory_order_relaxed);
+            paired_initial_[static_cast<size_t>(kind)].store(0, std::memory_order_relaxed);
+        }
+    }
+
+public:
+    // -------------------------------------------------------------------------
     // Helpers used from Module::process_entry / proactive_replenish
     // -------------------------------------------------------------------------
 
@@ -766,9 +903,27 @@ public:
             return 0;
         }
         size_t block_size = stride * static_cast<size_t>(count);
+        // Charged before the allocation, in paired units, and credited only by a
+        // real free — an orphaned buffer keeps occupying memory and keeps
+        // occupying the cap. Uncapped by default, so no existing profiler's
+        // replenishment behaviour changes.
+        if (!charge_paired(kind, block_size)) {
+            LOG_WARN(
+                "BufferPoolManager: kind %d refused a %zu B block: the paired pool cap is reached", kind, block_size
+            );
+            return 0;
+        }
         void *host_base = nullptr;
-        void *dev_base = alloc_and_register_block(block_size, &host_base);
-        if (dev_base == nullptr) return 0;
+        bool release_proved = true;
+        void *dev_base = alloc_and_register_block(block_size, &host_base, &release_proved);
+        if (dev_base == nullptr) {
+            // Credited only when the failed attempt left nothing allocated. A
+            // best-effort free that did not report success leaves memory this
+            // charge paid for, so giving the charge back would hand a capped
+            // caller capacity that is still occupied.
+            if (release_proved) credit_paired(kind, block_size);
+            return 0;
+        }
         (void)host_base;
 
         size_t published = 0;
@@ -795,7 +950,8 @@ public:
      * @param[out] host_ptr_out Host shadow pointer.
      * @return                  Device pointer, or nullptr on failure.
      */
-    void *alloc_and_register_block(size_t size, void **host_ptr_out) {
+    void *alloc_and_register_block(size_t size, void **host_ptr_out, bool *release_proved_out = nullptr) {
+        if (release_proved_out != nullptr) *release_proved_out = true;
         void *dev_ptr = ops_.alloc(size);
         if (dev_ptr == nullptr) {
             *host_ptr_out = nullptr;
@@ -805,9 +961,14 @@ public:
         int rc = ops_.reg(dev_ptr, size, device_id_, &host_ptr);
         if (rc != 0 || host_ptr == nullptr) {
             LOG_ERROR("BufferPoolManager: register failed: %d", rc);
-            // Best-effort dev free; no shadow was registered yet.
-            if (ops_.free_) {
-                ops_.free_(dev_ptr);
+            // Best-effort dev free; no shadow was registered yet. Its status is
+            // reported, because a caller that pre-charged for these bytes may
+            // only give them back if they are actually gone. A context with no
+            // free callback cannot release them at all.
+            const int free_rc = ops_.free_ ? ops_.free_(dev_ptr) : -1;
+            if (free_rc != 0) {
+                note_release_failed(dev_ptr, free_rc);
+                if (release_proved_out != nullptr) *release_proved_out = false;
             }
             *host_ptr_out = nullptr;
             return nullptr;
@@ -1179,6 +1340,10 @@ private:
 
     // Local recycled buffer pools indexed by collector shard, then Module-defined kind id.
     std::array<std::array<RecycledRing, Module::kBufferKinds>, kMaxCollectorShards> recycled_;
+    std::array<std::atomic<size_t>, Module::kBufferKinds> paired_charged_{};
+    std::array<std::atomic<size_t>, Module::kBufferKinds> paired_initial_{};
+    std::array<std::atomic<size_t>, Module::kBufferKinds> paired_cap_{};
+    std::atomic<bool> release_unproven_{false};
 
     // Error-path holding pools for buffers removed from recycled_ or popped
     // from device ready queues but not published to a collector/free_queue.

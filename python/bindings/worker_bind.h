@@ -338,6 +338,15 @@ inline void bind_worker(nb::module_ &m) {
             "Device-wide ACL_HBM_MEM free/total byte snapshot for a next-level worker."
         )
         .def(
+            "flush_diagnostics",
+            [](Orchestrator &self, int worker_id, double timeout_s) {
+                DfxFlushReport report = self.flush_diagnostics(worker_id, timeout_s);
+                return nb::make_tuple(report.session_id, report.watermark_epoch, report.published, report.failed);
+            },
+            nb::arg("worker_id"), nb::arg("timeout_s"), nb::call_guard<nb::gil_scoped_release>(),
+            "Publish every diagnostic run a next-level worker has closed; raises when a promised file is missing."
+        )
+        .def(
             "alloc",
             [](Orchestrator &self, const std::vector<uint32_t> &shape, DataType dtype,
                const CanonicalIdentity &identity) {

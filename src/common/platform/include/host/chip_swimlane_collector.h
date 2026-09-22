@@ -26,14 +26,22 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <mutex>
+#include <new>
+#include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "common/chip_swimlane_extension.h"
 #include "common/chip_swimlane_profiling.h"
+#include "host/chip_swimlane_session.h"
 #include "host/collected_record.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
@@ -459,13 +467,13 @@ public:
      */
     const std::vector<std::vector<CollectedRecord<ChipSwimlaneAicoreTaskRecord>>> &
     collected_aicore_records_for_test() const {
-        return aicore_records_by_collector_[0];
+        return epoch_stores_[0].aicore[0];
     }
 
     /** Per-shard AICPU task records as collected, each with its run. */
     const std::vector<std::vector<CollectedRecord<ChipSwimlaneAicpuTaskRecord>>> &
     collected_perf_records_for_test() const {
-        return perf_records_by_collector_[0];
+        return epoch_stores_[0].perf[0];
     }
 
     /**
@@ -924,6 +932,12 @@ public:
         bool terminal_reported{false};
         RunTerminalSnapshot terminal_snapshot;
         RunTerminalConsistency terminal_consistency;
+
+        // Session-only. Empty `artifact_path` keeps the legacy location and
+        // name; an absent `collection` keeps the legacy metadata object
+        // byte-for-byte, which is what makes the default path unchanged.
+        std::string artifact_path;
+        simpler::dfx::session::CollectionVerdict collection{};
     };
 
     /**
@@ -1080,11 +1094,26 @@ private:
     // Core-to-thread mapping (core_id → scheduler thread index, -1 = unassigned)
     std::vector<int8_t> core_to_thread_;
 
-    RecordsByCollector<CollectedRecord<ChipSwimlaneAicpuTaskRecord>> perf_records_by_collector_;
-    RecordsByCollector<CollectedRecord<ChipSwimlaneAicoreTaskRecord>> aicore_records_by_collector_;
-    RecordsByCollector<CollectedRecord<ChipSwimlaneAicpuSchedPhaseRecord>> sched_phase_records_by_collector_;
-    RecordsByCollector<CollectedRecord<ChipSwimlaneAicpuOrchPhaseRecord>> orch_phase_records_by_collector_;
-    std::vector<CollectorShardCounters> collector_counters_;
+    /**
+     * One epoch's host-side record storage.
+     *
+     * The legacy per-run path uses slot 0 and nothing else, so its layout and
+     * lifetime are exactly what they were. A continuous session gives each open
+     * epoch its own store, which is what lets a predecessor's buffers keep
+     * arriving after a successor's `run_begin` — the reset that used to wipe
+     * "the" store now only ever clears one epoch's.
+     */
+    struct EpochStore {
+        RecordsByCollector<CollectedRecord<ChipSwimlaneAicpuTaskRecord>> perf;
+        RecordsByCollector<CollectedRecord<ChipSwimlaneAicoreTaskRecord>> aicore;
+        RecordsByCollector<CollectedRecord<ChipSwimlaneAicpuSchedPhaseRecord>> sched_phase;
+        RecordsByCollector<CollectedRecord<ChipSwimlaneAicpuOrchPhaseRecord>> orch_phase;
+        std::vector<CollectorShardCounters> counters;
+    };
+    std::array<EpochStore, simpler::dfx::session::kMaxOpenEpochs> epoch_stores_{};
+
+    EpochStore &store(size_t slot) { return epoch_stores_[slot < epoch_stores_.size() ? slot : 0]; }
+    const EpochStore &store(size_t slot) const { return epoch_stores_[slot < epoch_stores_.size() ? slot : 0]; }
 
     // Running totals used at reconcile time to cross-check device-side counters.
     uint64_t total_perf_collected_{0};
@@ -1099,7 +1128,10 @@ private:
     uint64_t aicore_skipped_bad_core_{0};
     uint64_t aicore_foreign_identity_{0};
     bool has_phase_data_{false};
-    bool collector_shards_merged_{false};
+    // Which epoch store the merged view currently holds, or -1 for none. A
+    // bare flag could not tell one epoch's merge from another's, which is how
+    // a session's second seal ends up exporting an empty artifact.
+    int merged_slot_{-1};
     // Set once the runner has handed over a pass's host phase records, which is
     // also what makes the host orchestrator this run's record source.
     bool host_orchestrated_{false};
@@ -1169,6 +1201,283 @@ private:
     RunTerminalSnapshot terminal_snapshot_{};
     RunTerminalConsistency terminal_consistency_{};
 
+    // -------------------------------------------------------------------------
+    // Continuous-collection session
+    // -------------------------------------------------------------------------
+
+    enum class EpochState : int {
+        Free = 0,
+        Admitting,    // run_begin through run_close; buffers may still arrive after the target lands
+        Closing,      // admission withdrawn, waiting for every shard to drop its reference
+        Sealed,       // records moved out; the session thread owns them until the file is published
+        Quarantined,  // a close that could not be proved safe: nothing is moved, nothing is freed
+    };
+
+    /**
+     * One open epoch. Slots are the capacity bound: a bucket occupies one in
+     * every state except `Free`, and only publication (or a terminal release
+     * that proved its references gone) hands it back.
+     */
+    struct EpochBucket {
+        std::atomic<uint64_t> epoch{0};
+        std::atomic<int> state{static_cast<int>(EpochState::Free)};
+        // False after a budget refusal: the class receipts keep counting, the
+        // records are not kept, and the artifact says so.
+        std::atomic<bool> retain{true};
+        bool target_installed{false};
+        int cut_slot{-1};
+        // The capture request this run's cut published. Every question about
+        // that cut is asked against it, because an acknowledgement of a later
+        // request says nothing about this capture.
+        uint64_t cut_request{0};
+        std::chrono::steady_clock::time_point closed_at{};
+        // Everything the writer needs, captured at run_close while the device
+        // state is still this run's.
+        RunExport pending{};
+        LiveTaskCounters live{};
+        AicoreAccounting aicore{};
+        RunTerminalSnapshot terminal{};
+        bool terminal_ok{false};
+        uint64_t transport_retired{0};
+        // Host bytes this epoch holds, charged before each retained allocation
+        // by whichever collector shard made it and credited when the storage is
+        // actually released.
+        std::atomic<size_t> charged_bytes{0};
+        simpler::dfx::session::CollectionVerdict verdict{};
+    };
+
+    /**
+     * A collector shard's private view of the epoch table.
+     *
+     * Refreshed only at the top of a poll iteration, while the shard holds no
+     * bucket reference, and only after it has read the control epoch — which is
+     * what makes the ack it then publishes unable to describe a stale view.
+     */
+    struct ShardEpochView {
+        struct Entry {
+            uint64_t epoch{0};
+            int slot{-1};
+            bool retain{true};
+        };
+        std::array<Entry, simpler::dfx::session::kMaxOpenEpochs> entries{};
+        size_t count{0};
+
+        int slot_for(uint64_t epoch, bool *retain_out) const {
+            for (size_t i = 0; i < count; i++) {
+                if (entries[i].epoch == epoch && entries[i].slot >= 0) {
+                    if (retain_out != nullptr) *retain_out = entries[i].retain;
+                    return entries[i].slot;
+                }
+            }
+            return -1;
+        }
+    };
+
+public:
+    /** Enable knob and its bound; `enabled` false leaves every path as it is. */
+    struct SessionOptions {
+        bool enabled{false};
+        size_t budget_bytes{simpler::dfx::session::kDefaultBudgetBytes};
+    };
+
+    /** Counts a test can assert on without reaching into session internals. */
+    struct SessionStats {
+        bool active{false};
+        // Every epoch that left a readable artifact: settled, content-partial
+        // and cut-unknown together. The rows below say which kind each was.
+        uint64_t published{0};
+        uint64_t partial{0};
+        uint64_t cut_unknown{0};
+        uint64_t write_failed{0};
+        uint64_t quarantined{0};
+        uint64_t counter_exhausted{0};
+        uint64_t late_after_seal{0};
+        uint64_t unknown_epoch{0};
+        uint64_t no_bucket{0};
+        // AICore records the session sealed as belonging to the epoch that owns
+        // them, and records whose stamp matched no open epoch's identity. Summed
+        // over every sealed epoch, which is what makes a late predecessor
+        // buffer's classification visible at all: the artifact carries the rows
+        // but not the count behind them.
+        uint64_t aicore_collected{0};
+        uint64_t aicore_foreign{0};
+        size_t open_slots{0};
+        size_t host_charged{0};
+        uint64_t budget_refusals{0};
+        // Storage a close could not prove safe to release; freed only once the
+        // collector's reader threads have actually been joined.
+        bool release_deferred{false};
+        bool fatal{false};
+    };
+
+    /**
+     * Open a continuous-collection session over this collector.
+     *
+     * Reserves the output directory and the host budget, caps each pool at
+     * twice the paired bytes it has already allocated, arms the fair drain
+     * quantum, and starts the single session thread that seals and publishes.
+     * Returns false and changes nothing on a refused budget or an unusable
+     * output directory.
+     */
+    bool session_open(const SessionOptions &options, const std::string &output_root);
+
+    /** Close every open epoch, join the session thread, release the budget. */
+    void session_close();
+
+    bool session_active() const { return session_active_.load(std::memory_order_acquire); }
+
+    /**
+     * Admit one run into the session. Blocks while both slots are occupied —
+     * the session thread is what frees them, and it never waits on a caller —
+     * and fails once the session is fatal.
+     */
+    bool session_run_begin(uint64_t run_epoch, const std::string &output_prefix, ChipSwimlaneLevel level);
+
+    /**
+     * Install this run's target and hand it to the session thread.
+     *
+     * Called on the teardown thread while the run still holds its execution
+     * claim, which is what makes the per-queue capture consistent: the device
+     * has stopped and the successor has not launched.
+     */
+    void session_run_close(uint64_t run_epoch, uint32_t bank_index, bool device_execution_complete);
+
+    /**
+     * Wait until every epoch up to the current close watermark is published.
+     *
+     * Returns false and fills `error` when any of them ended without a file, or
+     * when the wait ran out. A published partial is a verdict, not a failure.
+     */
+    bool session_flush(int timeout_ms, std::string *error);
+
+    /** Collector-shard hook called by ProfilerBase's poll loop. */
+    void refresh_session_epoch_view(int collector_shard);
+
+    /**
+     * Transport progress hook called by ProfilerBase at the transitions a
+     * publisher waits on. Cheap and a no-op with no session open.
+     */
+    void session_note_progress();
+
+    SessionStats session_stats_for_test() const;
+
+private:
+    bool session_reserve_directory(const std::string &output_root);
+    int session_find_slot(uint64_t run_epoch) const;
+    void session_thread_main();
+    void session_service_once();
+    void session_finish_bucket(size_t slot, simpler::dfx::session::Verdict verdict, const char *detail);
+    bool session_seal_and_publish(size_t slot, simpler::dfx::session::Verdict verdict);
+    int session_publish_file(RunExport &data, const std::string &path);
+    void session_set_fatal(const std::string &reason);
+    void session_release_slot(size_t slot);
+    void session_bump_control_view();
+    size_t session_fixed_overhead() const;
+    /**
+     * Charge host bytes to one epoch before the allocation they pay for.
+     *
+     * Called from collector-shard threads, so every figure it touches is
+     * atomic. A refusal withdraws retention for the rest of that epoch —
+     * receipts keep counting and the artifact reports the loss — rather than
+     * blocking the shard, which would hold up the very acknowledgement the
+     * publisher is waiting for.
+     */
+    bool session_charge(size_t slot, size_t bytes);
+    void session_credit(size_t slot, size_t bytes);
+
+    /**
+     * Make room for `count` more records in one instance's vector, charged to
+     * the epoch before the allocation happens.
+     *
+     * The charge is **twice** the bytes the vector retains, because that is
+     * what the epoch actually costs: the seal builds a merged copy of every
+     * record while the per-shard vectors are still allocated, so the peak is
+     * two copies. Paying for both here is what makes the seal unable to refuse
+     * — a merge that ran out of budget at that point could only answer by
+     * dropping records it had already accepted.
+     *
+     * False means the records are not to be kept: either the byte arithmetic
+     * was not representable or the budget declined. A failed allocation hands
+     * the charge straight back, so neither a refusal nor a failure leaves bytes
+     * charged for memory that does not exist.
+     */
+    template <typename T>
+    bool session_reserve_records(std::vector<T> &dst, uint32_t count, size_t slot) {
+        const size_t want = dst.size() + static_cast<size_t>(count);
+        // With no session open this is the reservation the legacy path has
+        // always made, exceptions and all: nothing about the default path's
+        // behaviour is decided by an accountant it does not have.
+        if (!session_active_.load(std::memory_order_acquire)) {
+            dst.reserve(want);
+            return true;
+        }
+        if (want <= dst.capacity()) return true;
+        size_t bytes = 0;
+        if (!simpler::dfx::session::checked_bytes(want - dst.capacity(), 2 * sizeof(T), &bytes)) return false;
+        if (!session_charge(slot, bytes)) return false;
+        try {
+            dst.reserve(want);
+        } catch (const std::bad_alloc &) {
+            session_credit(slot, bytes);
+            return false;
+        }
+        return true;
+    }
+    /**
+     * Read a field of the shared-memory region into caller-owned storage.
+     *
+     * Never into the host shadow: the drain owners keep refreshing their own
+     * queue cursors and pool metadata there while a run closes, so a bulk or
+     * even a narrow write into the shadow from this thread would be a second
+     * writer on words that have exactly one.
+     */
+    bool session_read_shm_field(const volatile void *host_field, void *dst, size_t size);
+    /** Release storage a close deferred, after the reader threads are joined. */
+    void session_release_deferred_storage();
+    /** Earliest instant an unpublished epoch needs servicing again, if any. */
+    std::optional<std::chrono::steady_clock::time_point> session_next_wakeup() const;
+    /** Bytes every admitted epoch reserves for metadata a platform maximum bounds. */
+    size_t session_epoch_fixed_bytes() const;
+    /**
+     * Charge this run's caller-sized metadata, measured at its sources.
+     *
+     * Called before a byte of it is copied, so a refusal costs nothing and
+     * leaves nothing unaccounted. False means the copies must not be made and
+     * the artifact has to say its metadata is incomplete.
+     */
+    bool session_admit_run_metadata(size_t slot);
+
+    std::atomic<bool> session_active_{false};
+    std::atomic<bool> session_fatal_{false};
+    std::string session_fatal_reason_;
+    std::string session_dir_;
+    uint64_t session_id_{0};
+    std::array<EpochBucket, simpler::dfx::session::kMaxOpenEpochs> session_buckets_{};
+    std::array<ShardEpochView, profiling_common::BufferPoolManager<ChipSwimlaneModule>::kMaxCollectorShards>
+        shard_views_{};
+    mutable std::mutex session_mu_;
+    std::condition_variable session_cv_;
+    std::thread session_thread_;
+    std::atomic<bool> session_thread_running_{false};
+    // Bumped under `session_mu_` by everything the publisher waits on, so a
+    // wakeup that lands before the publisher reaches its wait is not lost: it
+    // compares the counter it read before servicing against the current one.
+    uint64_t session_progress_{0};
+    // Slots whose storage a close could not prove safe to free. Released only
+    // by `session_release_deferred_storage()`, which the collector's finalize
+    // calls after `stop()` has joined every reader.
+    std::atomic<bool> session_release_deferred_{false};
+    simpler::dfx::session::HostBudget session_budget_;
+    simpler::dfx::session::ErrorSummary session_errors_;
+    std::atomic<uint64_t> session_close_watermark_{0};
+    std::atomic<uint64_t> session_late_after_seal_{0};
+    std::atomic<uint64_t> session_unknown_epoch_{0};
+    std::atomic<uint64_t> session_no_bucket_{0};
+    std::atomic<uint64_t> session_aicore_collected_{0};
+    std::atomic<uint64_t> session_aicore_foreign_{0};
+    std::array<std::atomic<uint64_t>, simpler::dfx::session::kMaxTombstones> session_tombstones_{};
+    std::atomic<size_t> session_tombstone_cursor_{0};
+
     void reconcile_aicore_counters();
 
     /**
@@ -1186,7 +1495,7 @@ private:
     bool read_buffer_identity(
         const ReadyBufferInfo &info, uint64_t *epoch_out, uint32_t *count_out, uint32_t *capacity_out
     ) const;
-    void note_buffer_observed(const ReadyBufferInfo &info, int collector_shard);
+    void note_buffer_observed(const ReadyBufferInfo &info, int collector_shard, size_t slot, uint64_t expected_epoch);
 
     /**
      * Which of `expected`'s indices a class's terminal entries cover.
@@ -1209,7 +1518,7 @@ private:
     static HandoffClassReport classify_handoff(
         const RunTerminalClassSnapshot &cls, const HandoffReceipt &receipt, const TerminalIndexCoverage &coverage
     );
-    HandoffReport build_handoff_report(const RunTerminalSnapshot &snapshot);
+    HandoffReport build_handoff_report(const RunTerminalSnapshot &snapshot, size_t slot);
     void reset_collector_shards();
     void merge_collector_shards();
 
@@ -1229,9 +1538,21 @@ private:
      */
     int ensure_device_orch_pool(ChipSwimlaneLevel chip_swimlane_level);
 
-    // Per-buffer-kind handlers used by on_buffer_collected.
-    void copy_perf_buffer(const ReadyBufferInfo &info, int collector_shard);
-    void copy_sched_phase_buffer(const ReadyBufferInfo &info, int collector_shard);
-    void copy_orch_phase_buffer(const ReadyBufferInfo &info, int collector_shard);
-    void copy_aicore_buffer(const ReadyBufferInfo &info, int collector_shard);
+    // Per-buffer-kind handlers used by on_buffer_collected. `slot` names the
+    // epoch store the records belong to; the legacy path always passes 0.
+    void copy_perf_buffer(const ReadyBufferInfo &info, int collector_shard, size_t slot);
+    void copy_sched_phase_buffer(const ReadyBufferInfo &info, int collector_shard, size_t slot);
+    void copy_orch_phase_buffer(const ReadyBufferInfo &info, int collector_shard, size_t slot);
+    /**
+     * `expected_epoch` is the identity that owns the slot this buffer resolved
+     * to, not the most recently armed run. With a session open the two differ
+     * for every late predecessor buffer, which is the case the per-epoch stores
+     * exist to serve.
+     */
+    void copy_aicore_buffer(const ReadyBufferInfo &info, int collector_shard, size_t slot, uint64_t expected_epoch);
+
+    void reset_epoch_store(size_t slot, bool reset_merged_view);
+    void merge_epoch_store(size_t slot);
+    RunExport seal_epoch_store(size_t slot);
+    bool session_epoch_is_tombstoned(uint64_t run_epoch) const;
 };

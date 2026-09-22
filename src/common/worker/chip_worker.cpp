@@ -195,7 +195,7 @@ ChipWorker::~ChipWorker() {
 void ChipWorker::init(
     const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
     const std::string &dispatcher_path, int device_id, const CallConfig *prewarm_config, bool enable_sdma,
-    const std::string &sim_context_path, const std::string &sdma_warmup_path
+    const std::string &sim_context_path, const std::string &sdma_warmup_path, bool dfx_session
 ) {
     if (finalized_) {
         throw std::runtime_error("ChipWorker already finalized; cannot reinitialize");
@@ -264,6 +264,12 @@ void ChipWorker::init(
         // Optional for the same reason: a module that records no teardown does
         // not export this, and a null is that fact rather than a stale build.
         get_teardown_report_fn_ = reinterpret_cast<GetTeardownReportFn>(dlsym(handle, "get_teardown_report"));
+        // Diagnostic-session entry points. Resolved by name rather than added
+        // to `simpler_init`'s signature, which every runtime module must match
+        // exactly; a module built without them simply has no session.
+        set_dfx_session_fn_ = reinterpret_cast<SimplerSetDfxSessionFn>(dlsym(handle, "simpler_set_dfx_session_ctx"));
+        flush_diagnostics_fn_ =
+            reinterpret_cast<SimplerFlushDiagnosticsFn>(dlsym(handle, "simpler_flush_diagnostics_ctx"));
         supports_concurrent_native_prepare_fn_ =
             load_symbol<SupportsConcurrentNativePrepareFn>(handle, "supports_concurrent_native_prepare_ctx");
         supports_joined_native_launch_fn_ =
@@ -393,6 +399,17 @@ void ChipWorker::init(
         // `prewarm_config` (fork-constant, COW-delivered) rides simpler_init: the
         // platform builds + caches the prebuilt runtime-arena for its ring sizing
         // right after the device comes up. Null => no prewarm.
+        // Latched before the first run so the collector's lazy initialize()
+        // sees it; a module without the symbol reports the refusal rather than
+        // silently running without a session.
+        if (dfx_session) {
+            if (set_dfx_session_fn_ == nullptr) {
+                throw std::runtime_error("ChipWorker::init: this runtime module has no dfx_session support");
+            }
+            if (set_dfx_session_fn_(device_ctx_, 1) != 0) {
+                throw std::runtime_error("ChipWorker::init: dfx_session could not be enabled");
+            }
+        }
         init_rc = simpler_init_fn_(
             device_ctx_, device_id, aicpu_bytes.data(), aicpu_bytes.size(), aicore_bytes.data(), aicore_bytes.size(),
             dispatcher_ptr, dispatcher_bytes.size(), prewarm_config, enable_sdma ? 1 : 0, warmup_ptr,
@@ -1189,6 +1206,18 @@ size_t ChipWorker::aicpu_dlopen_count() const {
         return 0;
     }
     return get_aicpu_dlopen_count_fn_(device_ctx_);
+}
+
+void ChipWorker::flush_diagnostics(int timeout_ms) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    if (flush_diagnostics_fn_ == nullptr) return;  // no session support in this module: nothing is deferred
+    char error[512] = {};
+    const int rc = flush_diagnostics_fn_(device_ctx_, timeout_ms, error, sizeof(error));
+    if (rc != 0) {
+        throw std::runtime_error(std::string("ChipWorker::flush_diagnostics failed: ") + error);
+    }
 }
 
 size_t ChipWorker::committed_device_memory() const {

@@ -487,7 +487,7 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 set_scope_stats_enabled_func_(prepared->dfx.scope_stats_enabled);
                 set_platform_scope_stats_base_func_(kernel_args_.scope_stats_data_base);
 
-                start_shared_collectors_for_run(prepared->dfx);
+                start_shared_collectors_for_run(prepared->dfx, prepared->identity.run_epoch);
                 if (prepared->dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
                     auto thread_factory = [this](std::function<void()> fn) {
                         return create_thread(std::move(fn));

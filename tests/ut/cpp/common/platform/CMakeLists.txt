@@ -308,7 +308,7 @@ platform_case(test_args_dump_run_identity.cpp PER_ARCH
 # The two production sides every chip_swimlane case compiles — the host
 # collector and the AICPU producer module — with the arch's sim regs and
 # profiling copy under them. @arch@ expands per combination, in the factory.
-# The five cases below all take this list; it is one list because they cover
+# The six cases below all take this list; it is one list because they cover
 # one pair of sides.
 set(CHIP_SWIMLANE_CASE_SOURCES
     ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/chip_swimlane_collector.cpp
@@ -320,8 +320,9 @@ set(CHIP_SWIMLANE_CASE_SOURCES
 # The collector pair carries both real sides: the host collector fills the bank
 # and the AICPU producer module drives init -> complete_task -> flush, so a test
 # can read the result back through the production host copy. The others read
-# the retained per-run terminal snapshots and the AICore and handoff accounting
-# off those same two sides. Both axes: the swimlane record reaches the arch's
+# the retained per-run terminal snapshots, the AICore and handoff accounting,
+# and the continuous session's receipt, seal, budget and control paths off those
+# same two sides. Both axes: the swimlane record reaches the arch's
 # platform_regs and scheduler_profiling as well as the runtime's task_id.
 #
 # The collector has a consumer outside ctest —
@@ -329,7 +330,7 @@ set(CHIP_SWIMLANE_CASE_SOURCES
 # the real Python parser real exporter bytes — and PYUT_EXPORT is what gives
 # that consumer each build's path. That is a difference in who reads the
 # target, not in the case's shape, which is why it stands alone: grouping
-# asserts the cases are the same kind, and the other four are read by ctest
+# asserts the cases are the same kind, and the other five are read by ctest
 # alone.
 platform_case(test_chip_swimlane_collector.cpp
     PER_ARCH PER_RUNTIME TIER aicpu
@@ -341,6 +342,7 @@ platform_cases(
     test_chip_swimlane_run_terminal_consistency.cpp
     test_chip_swimlane_aicore_accounting.cpp
     test_chip_swimlane_handoff_accounting.cpp
+    test_chip_swimlane_session.cpp
     PER_ARCH PER_RUNTIME TIER aicpu
     SOURCES ${CHIP_SWIMLANE_CASE_SOURCES})
 

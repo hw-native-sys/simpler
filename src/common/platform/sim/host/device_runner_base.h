@@ -370,7 +370,13 @@ public:
      * with arch-specific collectors (`dep_gen_collector_`) call this and then
      * open and start their own.
      */
-    void start_shared_collectors_for_run(const DfxRunConfig &dfx);
+    void start_shared_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch);
+
+    /** Continuous-collection session gate; see the onboard base. Default off. */
+    void set_dfx_session_enabled(bool enabled) { dfx_session_enabled_ = enabled; }
+    bool dfx_session_enabled() const { return dfx_session_enabled_; }
+    int flush_diagnostics(int timeout_ms, std::string *error);
+    void close_diagnostics_session();
     /**
      * Resolve and reserve this run's chip-swimlane terminal-snapshot bank, and
      * return its device address for KernelArgs.
@@ -630,6 +636,7 @@ protected:
 
     // Performance / diagnostics collectors shared across arches.
     ChipSwimlaneCollector chip_swimlane_collector_;
+    bool dfx_session_enabled_{false};
     // Not a collector: the pool the runtime's prepare path writes into, read by
     // whichever per-event views the run enabled. Its two readers are gated
     // independently, so it belongs to neither.
