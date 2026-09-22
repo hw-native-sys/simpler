@@ -51,6 +51,9 @@ static std::atomic<int32_t> s_filter_published{0};
 static std::atomic<int32_t> s_filter_classify_init{0};
 static std::atomic<int32_t> s_filter_classify_ready{0};
 static std::atomic<int32_t> s_filter_cleanup{0};
+// Published by the classifying thread before it releases its peers, then read
+// by survivors after the release — the classify_ready store/load pair orders it.
+static bool s_filter_exact_match = false;
 static int32_t s_filter_thread_cpu[MAX_GATE_THREADS];
 static int32_t s_filter_thread_exec_idx[MAX_GATE_THREADS];
 
@@ -121,6 +124,9 @@ bool platform_aicpu_affinity_gate_filter(const int32_t *allowed_cpus, int32_t al
         // If that happens, keep the exact-match assignments and fill the
         // missing exec slots by reported thread order so sched/orch roles are
         // still all present instead of timing out the AICore side.
+        // Latched before the recovery loop restores filled_count.
+        s_filter_exact_match = (filled_count == allowed_count);
+
         if (filled_count < allowed_count) {
             LOG_WARN(
                 "AICPU filter gate: only matched %d/%d allowed cpus; filling missing exec slots by report order",
@@ -180,5 +186,7 @@ bool platform_aicpu_affinity_gate_filter(const int32_t *allowed_cpus, int32_t al
 }
 
 int32_t platform_aicpu_affinity_thread_idx() { return tl_exec_idx; }
+
+bool platform_aicpu_affinity_exact_match() { return s_filter_exact_match; }
 
 void platform_aicpu_affinity_set_thread_idx(int32_t idx) { tl_exec_idx = idx; }

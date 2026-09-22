@@ -203,14 +203,23 @@ private:
     // handshake_partition; checked by the leader in post_handshake_init.
     std::atomic<bool> handshake_failed_{false};
 
-#if SIMPLER_DFX
-    // Physical core ids keyed by logical worker id. Populated by
-    // handshake_all_cores() and handed to pmu_aicpu_init() so the platform
-    // can resolve per-core PMU MMIO bases. Only needed when SIMPLER_DFX=1
-    // — without it, PMU is compiled out and core_exec_states_ already
-    // carries the field.
+    // Physical core ids keyed by logical worker id, from each AICore's
+    // handshake report. Two readers: pmu_aicpu_init resolves per-core PMU MMIO
+    // bases from it (SIMPLER_DFX only), and cluster assignment derives each
+    // cluster's die from it (every build), which is why it is not DFX-gated.
     uint32_t physical_core_ids_[RUNTIME_MAX_WORKER]{};
-#endif
+
+    // Die-affinity ownership, resolved once per thread by the barrier-free
+    // handshake and replayed by assign_own_clusters so both agree on the set.
+    // Inactive means the round-robin stride is in force.
+    int32_t owned_clusters_[MAX_AICPU_THREADS][CoreTracker::MAX_CLUSTERS]{};
+    int32_t owned_cluster_count_[MAX_AICPU_THREADS]{};
+    bool die_affinity_active_{false};
+
+    // Fill owned_clusters_[tidx] from the die map. False leaves the caller on
+    // round-robin: an unpublished die vector, a bad handshake report, or a
+    // shape the partition cannot serve.
+    bool resolve_die_affinity_clusters(Runtime *runtime, int32_t tidx, int32_t active_threads, int32_t aic_n);
 
     // Platform AICore-register base array (set by AicpuExecutor before init()).
     uint64_t regs_{0};

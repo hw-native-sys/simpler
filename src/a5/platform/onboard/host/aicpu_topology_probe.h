@@ -15,6 +15,8 @@
 #include <string>
 #include <vector>
 
+#include "common/scheduler_die_partition.h"
+
 namespace pto::a5 {
 
 // Per-cpu_id metadata used by the packing algorithm. Filled from CPU_TOPO
@@ -169,6 +171,24 @@ bool compute_unknown_allowed_cpus(
 // stably reachable. Manual mode is exact. Launch coverage is never clamped.
 bool build_aicpu_launch_plan(
     const AicpuTopology &topology, int32_t requested_active_count, AicpuLaunchPlan &out_plan, std::string &out_error
+);
+
+// Pack the AICPU die of each scheduler slot of `allowed_cpus` for the device,
+// in the encoding of common/scheduler_die_partition.h. `sched_count` counts the
+// scheduler slots only — the trailing orchestrator slot owns no cores and is
+// not published.
+//
+// Returns 0 ("nothing known") rather than a partial word whenever the mapping
+// cannot be trusted, which makes the device fall back to round-robin ownership:
+//
+//   * any scenario other than FG. `die_id` is `phy_cpu_id / 4`, which holds only
+//     while phy_cpu_id is the fault-free numbering; BIOS renumbers the surviving
+//     CPUs under PG and the runtime cannot yet tell the two apart (see the
+//     a5 die-affinity prerequisites issue).
+//   * an OCCUPY-only topology, whose phy/cluster/die fields are all -1.
+//   * a scheduler cpu_id absent from the schedulable pool.
+uint64_t compute_sched_thread_die_bits(
+    const AicpuTopology &topology, const std::vector<int32_t> &allowed_cpus, int32_t sched_count
 );
 
 const char *aicpu_scenario_name(AicpuScenarioType scenario);

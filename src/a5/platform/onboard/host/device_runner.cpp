@@ -427,10 +427,16 @@ int DeviceRunner::prepare_execution(
                     active_aicpu_num, dump.c_str()
                 );
             }
+            // Scheduler slots are 0..active-2; the trailing slot is the
+            // orchestrator, which owns no cores. 0 leaves the device on
+            // round-robin cluster ownership.
+            execution->kernel_args.args.sched_thread_die_bits =
+                pto::a5::compute_sched_thread_die_bits(topology, allowed, active_aicpu_num - 1);
             LOG_INFO(
-                "AICPU ALLOWED_CPUS = [%s] (scenario=%s active=%d launch=%d user_cpus=%zu)", dump.c_str(),
-                pto::a5::aicpu_scenario_name(topology.scenario_type), active_aicpu_num, launch_plan.launch_count,
-                topology.os_schedulable_cpus.size()
+                "AICPU ALLOWED_CPUS = [%s] (scenario=%s active=%d launch=%d user_cpus=%zu sched_die_bits=0x%llx)",
+                dump.c_str(), pto::a5::aicpu_scenario_name(topology.scenario_type), active_aicpu_num,
+                launch_plan.launch_count, topology.os_schedulable_cpus.size(),
+                static_cast<unsigned long long>(execution->kernel_args.args.sched_thread_die_bits)
             );
         }
     }

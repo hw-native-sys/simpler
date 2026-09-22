@@ -24,6 +24,7 @@
 #include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "aicpu/platform_aicpu_affinity.h"
+#include "aicpu/sched_die_config.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/scope_stats_collector_aicpu.h"
 #include "aicpu/args_dump_aicpu.h"
@@ -104,6 +105,9 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     set_dep_gen_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_DEP_GEN));
     set_scope_stats_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_SCOPE_STATS));
     set_platform_scope_stats_base(k_args->scope_stats_data_base);
+    // Latched before any scheduler thread reaches cluster assignment, which is
+    // the only reader.
+    set_sched_thread_die_bits(k_args->sched_thread_die_bits);
 
     // Filter-style affinity gate (a5). Host probed the topology, computed
     // ALLOWED_CPUS, and wrote it into runtime->aicpu_allowed_cpus[]. The

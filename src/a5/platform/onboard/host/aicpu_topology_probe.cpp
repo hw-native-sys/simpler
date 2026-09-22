@@ -767,6 +767,29 @@ bool build_aicpu_launch_plan(
     return true;
 }
 
+uint64_t compute_sched_thread_die_bits(
+    const AicpuTopology &topology, const std::vector<int32_t> &allowed_cpus, int32_t sched_count
+) {
+    if (sched_count <= 0 || sched_count > SCHED_DIE_MAX_THREADS ||
+        static_cast<size_t>(sched_count) > allowed_cpus.size()) {
+        return 0;
+    }
+    if (topology.scenario_type != AicpuScenarioType::kFg) return 0;
+    if (topology.source == AicpuTopologySource::kOccupyFallback) return 0;
+
+    uint64_t bits = 0;
+    for (int32_t t = 0; t < sched_count; ++t) {
+        const auto it = std::find_if(
+            topology.os_schedulable_cpus.begin(), topology.os_schedulable_cpus.end(), [&](const AicpuLogicalCpu &cpu) {
+                return cpu.cpu_id == allowed_cpus[t];
+            }
+        );
+        if (it == topology.os_schedulable_cpus.end() || it->die_id < 0 || it->die_id > 1) return 0;
+        bits = sched_die_bits_with(bits, t, it->die_id);
+    }
+    return bits;
+}
+
 const char *aicpu_scenario_name(AicpuScenarioType scenario) {
     switch (scenario) {
     case AicpuScenarioType::kNotApplicable:
