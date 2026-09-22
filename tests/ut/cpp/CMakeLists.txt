@@ -7,12 +7,13 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-# C++ unit tests for src/common/hierarchical using GoogleTest.
-# Run with: cmake --build . --target run_ut_cpp
-# Or directly: ctest --test-dir build/ut_cpp
+# GoogleTest unit tests for src/, in a tree that mirrors it. Each subdirectory
+# declares the targets covering its own mirror; this file holds what more than
+# one of them reads. How to configure, build and check the tree:
+# docs/testing/adding-a-cpp-unit-test.md.
 
 cmake_minimum_required(VERSION 3.15)
-project(hierarchical_ut CXX)
+project(simpler_ut_cpp CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
