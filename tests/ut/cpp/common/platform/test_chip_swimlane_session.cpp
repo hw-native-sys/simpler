@@ -27,13 +27,17 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "common/chip_swimlane_profiling.h"
 #include "host/chip_swimlane_collector.h"
+#include "host/session_run_boundary.h"
 
 namespace fs = std::filesystem;
 
@@ -186,6 +190,20 @@ struct SessionFixture {
         collector.session_run_close(epoch, /*bank_index=*/0, /*device_execution_complete=*/true);
     }
 
+    /**
+     * Close a run the way both runner bases do: whatever this run produced on
+     * the host reaches the collector through the shared boundary helper, which
+     * is what orders it against the epoch's metadata snapshot.
+     */
+    template <typename PublishHostState>
+    void close_through_boundary(uint64_t epoch, const int *cores, int core_num, PublishHostState &&publish) {
+        chip_swimlane_aicpu_flush(/*thread_idx=*/0, cores, core_num);
+        simpler::dfx::session::close_session_run(
+            collector, epoch, /*bank_index=*/0, /*device_execution_complete=*/true,
+            std::forward<PublishHostState>(publish)
+        );
+    }
+
     bool wait_for_files(size_t count, int timeout_ms = 8000) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
         while (std::chrono::steady_clock::now() < deadline) {
@@ -205,6 +223,30 @@ size_t rows_for_epoch(const std::string &body, uint64_t epoch) {
     }
     return rows;
 }
+
+/**
+ * `count` host submit records, the shape a run hands the collector at its
+ * boundary. The count is what tells two runs' publications apart in the
+ * artifact: the writer reports it as `recorded_records`, in a metadata block
+ * every level emits, where the rows themselves are rendered only from
+ * SCHED_PHASES up.
+ */
+std::vector<HostPhaseRecord> host_submit_rows(size_t count) {
+    std::vector<HostPhaseRecord> rows(count);
+    for (size_t i = 0; i < count; i++) {
+        rows[i].start_ns = 100 + i;
+        rows[i].end_ns = 200 + i;
+        rows[i].payload = 4000 + i;
+        rows[i].kind = 0;
+        rows[i].index = static_cast<uint32_t>(i + 1);
+        rows[i].thread_id = 7;
+        rows[i]._pad = 0;
+    }
+    return rows;
+}
+
+/** The writer's rendering of how many host submit records an epoch carries. */
+std::string recorded_records_field(size_t count) { return "\"recorded_records\": " + std::to_string(count); }
 
 /**
  * A collector with a session open but no reader threads started.
@@ -954,4 +996,257 @@ TEST(ChipSwimlaneSessionTest, OversizedRunMetadataIsRefusedBeforeItIsCopied) {
     // The epoch's own records survived the refusal: only the metadata was
     // declined, and nothing was freed ahead of its reference proof.
     EXPECT_EQ(rows_for_epoch(body, kEpoch), 3u) << "the refusal took this epoch's records with it";
+}
+
+// Two session runs, each publishing host phase records of its own. The epoch's
+// metadata snapshot copies whatever the collector holds when the run closes,
+// and the collector holds one copy of it across every run it serves — so the
+// artifact describes its own run only when the publication precedes the
+// snapshot. Driven through the boundary helper both runner bases call, which
+// is where that order lives. The two runs publish different counts, which is
+// what the metadata reports at every level.
+TEST(ChipSwimlaneSessionTest, HostPhaseRecordsReachTheEpochThatProducedThem) {
+    SessionFixture fx("host-phase-own-epoch", /*cores=*/1, /*threads=*/1);
+    const int cores[] = {0};
+    constexpr uint64_t kFirst = 700;
+    constexpr uint64_t kSecond = 701;
+
+    fx.begin(kFirst);
+    fx.dispatch(0, 1);
+    fx.close_through_boundary(kFirst, cores, 1, [&fx] {
+        fx.collector.set_host_phase_records(host_submit_rows(1), {}, 1, 1, 0);
+    });
+
+    fx.begin(kSecond);
+    fx.dispatch(0, 1);
+    fx.close_through_boundary(kSecond, cores, 1, [&fx] {
+        fx.collector.set_host_phase_records(host_submit_rows(2), {}, 2, 2, 0);
+    });
+
+    ASSERT_TRUE(fx.wait_for_files(2));
+    size_t seen = 0;
+    for (const auto &f : published_files(fx.dir.path())) {
+        const std::string name = f.filename().string();
+        const std::string body = read_file(f);
+        if (name == "records_e700.json") {
+            seen++;
+            EXPECT_NE(body.find(recorded_records_field(1)), std::string::npos)
+                << "epoch 700 did not carry the host phase records it produced";
+            EXPECT_EQ(body.find(recorded_records_field(2)), std::string::npos)
+                << "epoch 700 carried its successor's host phase records";
+        } else if (name == "records_e701.json") {
+            seen++;
+            EXPECT_NE(body.find(recorded_records_field(2)), std::string::npos)
+                << "epoch 701 did not carry the host phase records it produced";
+            EXPECT_EQ(body.find(recorded_records_field(1)), std::string::npos)
+                << "epoch 701 carried its predecessor's host phase records";
+        }
+    }
+    EXPECT_EQ(seen, 2u) << "one of the two epochs published no artifact";
+}
+
+// A run that produces no host phase records at all. The collector's copy is
+// per run, so this one contributes none rather than inheriting what its
+// predecessor left in the same fields.
+TEST(ChipSwimlaneSessionTest, ASessionRunWithoutHostPhaseRecordsInheritsNone) {
+    SessionFixture fx("host-phase-empty-successor", /*cores=*/1, /*threads=*/1);
+    const int cores[] = {0};
+    constexpr uint64_t kFirst = 710;
+    constexpr uint64_t kSecond = 711;
+
+    fx.begin(kFirst);
+    fx.dispatch(0, 1);
+    fx.close_through_boundary(kFirst, cores, 1, [&fx] {
+        fx.collector.set_host_phase_records(host_submit_rows(1), {}, 1, 1, 0);
+    });
+
+    // Nothing published: the production path skips the publication entirely
+    // when a run's host phase store never finished a pass.
+    fx.begin(kSecond);
+    fx.dispatch(0, 1);
+    fx.close_through_boundary(kSecond, cores, 1, [] {});
+
+    ASSERT_TRUE(fx.wait_for_files(2));
+    size_t seen = 0;
+    for (const auto &f : published_files(fx.dir.path())) {
+        const std::string name = f.filename().string();
+        const std::string body = read_file(f);
+        if (name == "records_e710.json") {
+            seen++;
+            EXPECT_NE(body.find(recorded_records_field(1)), std::string::npos)
+                << "epoch 710 lost the host phase records it produced";
+        } else if (name == "records_e711.json") {
+            seen++;
+            EXPECT_EQ(body.find("\"orchestrator_source\": \"host\""), std::string::npos)
+                << "epoch 711 produced no host phase records but reported its predecessor's";
+            EXPECT_EQ(body.find("\"host_capture\""), std::string::npos)
+                << "epoch 711 reported a host capture it never made";
+        }
+    }
+    EXPECT_EQ(seen, 2u) << "one of the two epochs published no artifact";
+}
+
+// The close is what hands an epoch to the session thread and releases its
+// slot, so a publication that throws must not skip it: two slots exist, and an
+// epoch left open holds one for the session's whole life. The failure still
+// reaches the caller, and the epoch reports no host capture it did not make.
+TEST(ChipSwimlaneSessionTest, AFailedHostPublicationStillClosesItsEpoch) {
+    SessionFixture fx("host-phase-failed-publication", /*cores=*/1, /*threads=*/1);
+    const int cores[] = {0};
+    constexpr uint64_t kFirst = 720;
+    constexpr uint64_t kSecond = 721;
+
+    fx.begin(kFirst);
+    fx.dispatch(0, 1);
+    EXPECT_THROW(
+        fx.close_through_boundary(
+            kFirst, cores, 1,
+            [] {
+                throw std::runtime_error("host phase publication failed");
+            }
+        ),
+        std::runtime_error
+    );
+    ASSERT_TRUE(fx.wait_for_files(1)) << "the epoch was never closed, so it never published";
+
+    // The slot came back, so a later run is still admissible and publishes its
+    // own host phase records.
+    fx.begin(kSecond);
+    fx.dispatch(0, 1);
+    fx.close_through_boundary(kSecond, cores, 1, [&fx] {
+        fx.collector.set_host_phase_records(host_submit_rows(1), {}, 1, 1, 0);
+    });
+    ASSERT_TRUE(fx.wait_for_files(2)) << "the failed publication's slot was never released";
+    size_t seen = 0;
+    for (const auto &f : published_files(fx.dir.path())) {
+        const std::string name = f.filename().string();
+        const std::string body = read_file(f);
+        if (name == "records_e720.json") {
+            seen++;
+            EXPECT_EQ(body.find("\"host_capture\""), std::string::npos)
+                << "the epoch whose publication threw reported a host capture anyway";
+        } else if (name == "records_e721.json") {
+            seen++;
+            EXPECT_NE(body.find(recorded_records_field(1)), std::string::npos)
+                << "the run after the failed publication lost its own host phase records";
+        }
+    }
+    EXPECT_EQ(seen, 2u) << "one of the two epochs published no artifact";
+}
+
+// A publication that writes part of its host state and then fails — the shape
+// the sim base has, where the phase records land and the runtime extensions
+// throw part-way. What it published is kept, and the epoch says it is
+// incomplete: a partial verdict rather than a publication, so a reader is
+// never told a half-written capture is the whole run. The session carries on,
+// and the next epoch settles complete.
+TEST(ChipSwimlaneSessionTest, APartialHostPublicationMarksItsEpochIncomplete) {
+    SessionFixture fx("host-phase-partial-publication", /*cores=*/1, /*threads=*/1);
+    const int cores[] = {0};
+    constexpr uint64_t kPartial = 730;
+    constexpr uint64_t kWhole = 731;
+
+    fx.begin(kPartial);
+    fx.dispatch(0, 1);
+    EXPECT_THROW(
+        fx.close_through_boundary(
+            kPartial, cores, 1,
+            [&fx] {
+                fx.collector.set_host_phase_records(host_submit_rows(1), {}, 1, 1, 0);
+                throw std::runtime_error("runtime extension publication failed");
+            }
+        ),
+        std::runtime_error
+    );
+
+    fx.begin(kWhole);
+    fx.dispatch(0, 1);
+    fx.close_through_boundary(kWhole, cores, 1, [&fx] {
+        fx.collector.set_host_phase_records(host_submit_rows(2), {}, 2, 2, 0);
+    });
+
+    ASSERT_TRUE(fx.wait_for_files(2)) << "the partial epoch stopped the session from making progress";
+    size_t seen = 0;
+    for (const auto &f : published_files(fx.dir.path())) {
+        const std::string name = f.filename().string();
+        const std::string body = read_file(f);
+        if (name == "records_e730.json") {
+            seen++;
+            EXPECT_NE(body.find("\"metadata_complete\": false"), std::string::npos)
+                << "a publication that failed part-way was sealed as complete";
+            EXPECT_NE(body.find("partial_safe"), std::string::npos)
+                << "an epoch with incomplete metadata settled as a publication";
+            // What did land is kept rather than discarded: the artifact
+            // reports the one record the publication managed.
+            EXPECT_NE(body.find(recorded_records_field(1)), std::string::npos)
+                << "the part that published was thrown away with the part that did not";
+        } else if (name == "records_e731.json") {
+            seen++;
+            EXPECT_NE(body.find("\"metadata_complete\": true"), std::string::npos)
+                << "the epoch after a partial one inherited its incompleteness";
+            EXPECT_NE(body.find(recorded_records_field(2)), std::string::npos)
+                << "the epoch after a partial one lost its own host phase records";
+        }
+    }
+    EXPECT_EQ(seen, 2u) << "one of the two epochs published no artifact";
+}
+
+namespace {
+/** A failure the boundary's report cannot describe: it carries no message. */
+struct UnnameableFailure {};
+}  // namespace
+
+// The boundary sets its state before it describes anything, so a failure the
+// report cannot name costs neither the epoch's verdict nor its close. This one
+// throws an object with no message at all, which is the shape every step of
+// the diagnostic gives up on — and the epoch is still marked incomplete, still
+// closed, still published, and its slot still comes back for the next run.
+TEST(ChipSwimlaneSessionTest, AnUnnameableHostPublicationFailureStillClosesItsEpoch) {
+    SessionFixture fx("host-phase-unnameable-failure", /*cores=*/1, /*threads=*/1);
+    const int cores[] = {0};
+    constexpr uint64_t kUnnameable = 740;
+    constexpr uint64_t kNext = 741;
+
+    fx.begin(kUnnameable);
+    fx.dispatch(0, 1);
+    EXPECT_THROW(
+        fx.close_through_boundary(
+            kUnnameable, cores, 1,
+            [&fx] {
+                fx.collector.set_host_phase_records(host_submit_rows(1), {}, 1, 1, 0);
+                throw UnnameableFailure{};
+            }
+        ),
+        UnnameableFailure
+    );
+
+    fx.begin(kNext);
+    fx.dispatch(0, 1);
+    fx.close_through_boundary(kNext, cores, 1, [&fx] {
+        fx.collector.set_host_phase_records(host_submit_rows(2), {}, 2, 2, 0);
+    });
+
+    ASSERT_TRUE(fx.wait_for_files(2)) << "an unnameable failure cost the epoch its close or the session its slot";
+    size_t seen = 0;
+    for (const auto &f : published_files(fx.dir.path())) {
+        const std::string name = f.filename().string();
+        const std::string body = read_file(f);
+        if (name == "records_e740.json") {
+            seen++;
+            EXPECT_NE(body.find("\"metadata_complete\": false"), std::string::npos)
+                << "a failure the report could not name was sealed as complete";
+            EXPECT_NE(body.find("partial_safe"), std::string::npos);
+            EXPECT_NE(body.find(recorded_records_field(1)), std::string::npos)
+                << "the part that published before the failure was discarded";
+        } else if (name == "records_e741.json") {
+            seen++;
+            EXPECT_NE(body.find("\"metadata_complete\": true"), std::string::npos)
+                << "the epoch after an unnameable failure inherited its incompleteness";
+        }
+    }
+    EXPECT_EQ(seen, 2u) << "one of the two epochs published no artifact";
+    // The session is still usable: an epoch-scoped failure is not a
+    // session-level one, so nothing here may have raised the sticky fatal.
+    EXPECT_FALSE(fx.collector.session_stats_for_test().fatal)
+        << "an epoch's publication failure was escalated to a session fatal";
 }

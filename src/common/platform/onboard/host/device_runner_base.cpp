@@ -50,6 +50,7 @@
 #include "kernel_platform_ops.h"
 #include "host/host_phase_records_artifact.h"
 #include "host/raii_scope_guard.h"
+#include "host/session_run_boundary.h"
 #include "host_log.h"
 #include "platform_comm/comm.h"
 #include "runtime_c_api.h"
@@ -3254,8 +3255,15 @@ void DeviceRunnerBase::teardown_shared_collectors_after_run(
         // live counters — and hands the rest to its own thread. No quiesce: the
         // pipeline is shared with the successor and draining it here is what
         // the per-queue cut replaces.
-        chip_swimlane_collector_.session_run_close(run_epoch, pipeline_slot, device_execution_complete);
-        publish_host_phase_records_to_swimlane(pipeline_slot);
+        //
+        // This run's host phase records go in first: the epoch's metadata
+        // snapshot inside the close is what copies them, and the collector
+        // holds one copy of them for every run it serves.
+        simpler::dfx::session::close_session_run(
+            chip_swimlane_collector_, run_epoch, pipeline_slot, device_execution_complete, [this, pipeline_slot] {
+                publish_host_phase_records_to_swimlane(pipeline_slot);
+            }
+        );
         write_host_phase_records_artifact(dfx.output_prefix, pipeline_slot);
         if (dfx.dump_args_enabled()) {
             dump_collector_.quiesce();

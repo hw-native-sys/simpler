@@ -35,6 +35,7 @@
 #include "cpu_sim_context.h"
 #include "host/host_phase_records_artifact.h"
 #include "host/raii_scope_guard.h"
+#include "host/session_run_boundary.h"
 #include "task_args_wire.h"
 #include "utils/elf_build_id.h"
 
@@ -964,9 +965,17 @@ void SimDeviceRunnerBase::teardown_shared_collectors_after_run(
     // Diagnostic exports use the per-task output prefix the user set on
     // CallConfig (CallConfig::validate() enforces non-empty upstream).
     if (dfx.chip_swimlane_enabled() && chip_swimlane_collector_.session_active()) {
-        chip_swimlane_collector_.session_run_close(run_epoch, pipeline_slot, device_execution_complete);
-        publish_host_phase_records_to_swimlane(pipeline_slot);
-        publish_chip_swimlane_runtime_extensions();
+        // Both publications precede the epoch's metadata snapshot, which is
+        // what copies them. The extensions belong here for the same reason the
+        // host phase records do: a5's host_build_graph supplies a real
+        // publisher for them at every enabled level, and the collector holds
+        // one copy of the sections for every run it serves.
+        simpler::dfx::session::close_session_run(
+            chip_swimlane_collector_, run_epoch, pipeline_slot, device_execution_complete, [this, pipeline_slot] {
+                publish_host_phase_records_to_swimlane(pipeline_slot);
+                publish_chip_swimlane_runtime_extensions();
+            }
+        );
         write_host_phase_records_artifact(dfx.output_prefix, pipeline_slot);
         if (dfx.dump_args_enabled()) {
             dump_collector_.quiesce();

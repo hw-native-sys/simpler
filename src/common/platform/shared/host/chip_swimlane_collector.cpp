@@ -2800,6 +2800,51 @@ void ChipSwimlaneCollector::session_release_deferred_storage() {
     }
 }
 
+void ChipSwimlaneCollector::session_note_host_state_incomplete() {
+    if (!session_active_.load(std::memory_order_acquire)) return;
+    host_state_incomplete_ = true;
+}
+
+void ChipSwimlaneCollector::session_note_boundary_close_failed() {
+    // A fixed reason, not a composed one: the summary copies it into its own
+    // storage and nothing here has to build a string before the flag is set.
+    static constexpr const char *kReason = "a run boundary could not close its epoch";
+    bool first = false;
+    {
+        // Same mutex as session_set_fatal, and for the same reason: a capacity
+        // or flush waiter holds it across its check and its wait.
+        std::lock_guard<std::mutex> lk(session_mu_);
+        if (!session_fatal_.load(std::memory_order_relaxed)) {
+            session_fatal_.store(true, std::memory_order_release);
+            first = true;
+            // A display value, and the only allocation this function makes
+            // before its state is complete. A reason that cannot be stored
+            // leaves the fatal set and unnamed; the flag above, the count
+            // below and the summary's own copy do not depend on it.
+            try {
+                session_fatal_reason_ = kReason;
+            } catch (...) {}
+        }
+        session_progress_++;
+    }
+    // The permanent summary writes through snprintf into its own fixed buffer,
+    // so it needs nothing this path may be out of.
+    if (first) session_errors_.record_fatal(kReason);
+    // Ahead of the log line, because the log line is not a non-throwing call:
+    // with no writer bound the host logger takes its synchronous path, which
+    // constructs the process file sink and assigns its directory string. Every
+    // caller that could otherwise wait for a count no one will reach — a
+    // capacity wait, a flush barrier — is released before that can matter, and
+    // a diagnostic that throws cannot replace the failure that brought us
+    // here.
+    session_cv_.notify_all();
+    if (first) {
+        try {
+            LOG_ERROR("ChipSwimlane session %lu fatal: %s", static_cast<unsigned long>(session_id_), kReason);
+        } catch (...) {}
+    }
+}
+
 void ChipSwimlaneCollector::session_set_fatal(const std::string &reason) {
     bool first = false;
     {
@@ -3017,6 +3062,20 @@ bool ChipSwimlaneCollector::session_run_begin(
         output_prefix_ = output_prefix;
         chip_swimlane_level_ = level;
         json_extensions_.fill({});
+        // Host-side per-run state, cleared for the same reason the extensions
+        // are. `session_run_close` copies whatever the collector holds into
+        // this epoch's metadata, and the collector holds one copy across every
+        // run it serves, so a run that produces none of it carries none rather
+        // than its predecessor's. The vectors keep their capacity: the
+        // metadata charge is taken from capacity and is conservative by
+        // design, so carrying it forward can only over-charge.
+        host_submit_records_.clear();
+        host_upload_records_.clear();
+        host_phase_records_present_ = false;
+        host_phase_submitted_tasks_ = 0;
+        host_phase_total_records_ = 0;
+        host_phase_dropped_records_ = 0;
+        host_state_incomplete_ = false;
     }
     // Per-run device counter reset, unchanged from the legacy path.
     publish_run_config();
@@ -3067,7 +3126,12 @@ void ChipSwimlaneCollector::session_run_close(uint64_t run_epoch, uint32_t bank_
     // said it could not pay for, or by freeing records whose readers have not
     // been released yet — neither of which the hard total bound survives.
     const bool metadata_admitted = session_admit_run_metadata(slot);
-    bucket.verdict.metadata_complete = metadata_admitted;
+    // Both ways this epoch's metadata can fall short of its run: a budget that
+    // could not admit the caller-sized part, and a host-side publication that
+    // did not complete. They settle the same way — the artifact carries what
+    // there is and says so — so a run whose publication failed can never be
+    // read as one that had nothing to publish.
+    bucket.verdict.metadata_complete = metadata_admitted && !host_state_incomplete_;
 
     ChipSwimlaneDataHeader *header = get_chip_swimlane_header(shm_host_);
     uint32_t num_orch_phase_threads = 0;
@@ -3087,7 +3151,14 @@ void ChipSwimlaneCollector::session_run_close(uint64_t run_epoch, uint32_t bank_
         bucket.pending.json_extensions = json_extensions_;
         bucket.pending.host_submit_records = host_submit_records_;
         bucket.pending.host_upload_records = host_upload_records_;
-        bucket.pending.host_phase_records_present = !host_submit_records_.empty() || !host_upload_records_.empty();
+        // The publication's own figures travel with its records. The writer's
+        // host-capture status compares the two, so deriving presence from an
+        // empty vector and leaving the counts at zero would report every
+        // session run's capture as a count mismatch.
+        bucket.pending.host_phase_records_present = host_phase_records_present_;
+        bucket.pending.host_phase_submitted_tasks = host_phase_submitted_tasks_;
+        bucket.pending.host_phase_total_records = host_phase_total_records_;
+        bucket.pending.host_phase_dropped_records = host_phase_dropped_records_;
     } else {
         // Reported in the artifact rather than left to be inferred from a
         // missing section. The records this epoch already holds are untouched:

@@ -1139,6 +1139,10 @@ private:
     uint64_t host_phase_total_records_{0};
     uint64_t host_phase_dropped_records_{0};
     uint64_t host_phase_submitted_tasks_{0};
+    // Set when a run's host-side publication did not complete, so the epoch's
+    // metadata snapshot knows the state above describes less than the run
+    // produced. Per run: `session_run_begin` clears it with the state itself.
+    bool host_state_incomplete_{false};
 
     // The live pool figures reconcile_counters summed for the current run, kept
     // so the terminal-snapshot comparison reads the same numbers reconcile
@@ -1358,6 +1362,45 @@ public:
      * publisher waits on. Cheap and a no-op with no session open.
      */
     void session_note_progress();
+
+    /**
+     * Report that this run's host-side publication did not complete.
+     *
+     * The epoch's metadata snapshot copies whatever the collector holds when
+     * the run closes, so a publication that failed — before it wrote anything,
+     * or part-way through — leaves that snapshot describing less than the run
+     * produced. The epoch settles in the same state a refused metadata charge
+     * leaves it in: the artifact still carries whatever did reach the
+     * collector, reports `metadata_complete: false`, and its verdict is a
+     * partial rather than a publication.
+     *
+     * Takes no reason and writes no log line. It runs on a path where an
+     * allocation has just failed, and building a message there could throw
+     * before this flag — the part a reader depends on — was ever set. Naming
+     * the failure is the caller's, after this returns.
+     */
+    void session_note_host_state_incomplete();
+
+    /**
+     * Report that a run's epoch could not be closed.
+     *
+     * The close is an epoch's only exit and the only thing that hands its slot
+     * back, so a close that failed leaves the session one slot short for the
+     * rest of its life. That is a session-level failure rather than one run's,
+     * and it belongs where a flush and `close()` both read it.
+     *
+     * The sticky flag, the progress bump, the permanent summary's own copy and
+     * the wakeup are all in place before anything that can throw is attempted,
+     * for the same reason: they are what a waiting flush reads, and this runs
+     * where an allocation may have just failed. Two things here can throw and
+     * neither is load-bearing — the human-readable `session_fatal_reason_`,
+     * and the log line, which is not a non-throwing call because an unbound
+     * host logger writes synchronously through a file sink it constructs on
+     * first use. Both are guarded, so failing to name the fatal leaves it
+     * recorded and unnamed rather than unrecorded, and cannot displace the
+     * failure that brought the caller here.
+     */
+    void session_note_boundary_close_failed();
 
     SessionStats session_stats_for_test() const;
 
