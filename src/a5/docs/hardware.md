@@ -173,15 +173,6 @@ runtime uses the set bits in OCCUPY as schedulable CPU IDs and applies the
 unknown-topology fallback without inferring physical cores, SMT siblings,
 clusters, or dies.
 
-AICore clusters use the balanced contiguous scheduler partition only when the
-**same** topology object used for launch planning exactly covers the device-side
-OCCUPY population (live driver or a probe that already fell back to a verified
-JSON entry). Contiguous ownership is balanced ranges over cluster **indices**
-`0..N-1` — it is not die affinity and does not read `die_id`. An incomplete or
-unmatched topology keeps cluster round-robin. Override with
-`SIMPLER_SCHEDULER_CLUSTER_ASSIGNMENT=auto|contiguous|round_robin` (default
-`auto`).
-
 Live driver topology is still preferred when present. Hardware signatures
 without a matching packaged entry use the generic OCCUPY-only fallback and
 emit a CPU_TOPO-unavailable warning.

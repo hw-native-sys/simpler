@@ -185,45 +185,6 @@ bool enumerate_cpus_from_occupy(uint64_t occupy, std::vector<AicpuLogicalCpu> &o
 }
 
 namespace {
-
-bool is_topology_complete_for_occupy_pool(const AicpuTopology &topology) {
-    if (topology.source == AicpuTopologySource::kOccupyFallback || !topology.device_occupancy.occupy_valid ||
-        topology.device_occupancy.occupy == 0) {
-        return false;
-    }
-    std::vector<AicpuLogicalCpu> occupy_cpus;
-    if (!enumerate_cpus_from_occupy(topology.device_occupancy.occupy, occupy_cpus) ||
-        occupy_cpus.size() > static_cast<size_t>(PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH)) {
-        return false;
-    }
-    std::vector<int32_t> topology_cpu_ids;
-    topology_cpu_ids.reserve(topology.os_schedulable_cpus.size());
-    for (const auto &cpu : topology.os_schedulable_cpus)
-        topology_cpu_ids.push_back(cpu.cpu_id);
-    std::sort(topology_cpu_ids.begin(), topology_cpu_ids.end());
-    if (std::unique(topology_cpu_ids.begin(), topology_cpu_ids.end()) != topology_cpu_ids.end() ||
-        topology_cpu_ids.size() != occupy_cpus.size()) {
-        return false;
-    }
-    for (size_t idx = 0; idx < occupy_cpus.size(); ++idx) {
-        if (topology_cpu_ids[idx] != occupy_cpus[idx].cpu_id) return false;
-    }
-    return true;
-}
-
-}  // namespace
-
-SchedulerClusterAssignment select_scheduler_cluster_assignment(const AicpuTopology &topology) {
-    // Contiguous ownership is gated only on the topology object that also drives
-    // launch planning. Do not side-load a packaged JSON just for this decision —
-    // that could enable contiguous while allowed_cpus still came from an incomplete
-    // live topology. When probe already selected kJsonFallback, that same object
-    // is passed here and Contiguous applies iff it covers OCCUPY.
-    return is_topology_complete_for_occupy_pool(topology) ? SchedulerClusterAssignment::kContiguous :
-                                                           SchedulerClusterAssignment::kRoundRobin;
-}
-
-namespace {
 bool validate_cpu_topology(const std::vector<AicpuLogicalCpu> &cpus);
 bool validate_cpu_ids(const std::vector<AicpuLogicalCpu> &cpus);
 std::vector<int32_t> clusters_of(const std::vector<AicpuLogicalCpu> &cpus);
