@@ -75,6 +75,15 @@ constexpr uint64_t SCHEDULER_TIMEOUT_CYCLES =
 constexpr int32_t STALL_DUMP_READY_MAX = 8;
 constexpr int32_t STALL_DUMP_WAIT_MAX = 4;
 constexpr int32_t STALL_DUMP_CORE_MAX = 8;
+
+// Which report a stall dump belongs to, and therefore what log level its lines
+// take. A periodic round fires every STALL_LOG_INTERVAL idle iterations on a run
+// that may still be making progress elsewhere, so it stays at INFO and is read by
+// raising the device log level. A shutdown snapshot fires once, on the run the
+// scheduler is about to kill, and carries the only record of what was still
+// pending — so it takes the level of the SHUTDOWN_SNAPSHOT line that announces it,
+// which the default device log level keeps.
+enum class StallDumpReport : int32_t { Periodic, Shutdown };
 constexpr int32_t PROGRESS_VERBOSE_THRESHOLD = 10;  // log every completion for the first N tasks
 constexpr int32_t PROGRESS_LOG_INTERVAL = 250;      // log every N completions after threshold
 

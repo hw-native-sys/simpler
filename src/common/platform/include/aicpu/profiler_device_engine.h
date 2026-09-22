@@ -194,6 +194,18 @@ struct DeviceProfilerEngine {
         return claim_free(ctx, state, free_queue, head, next_seq);
     }
 
+    // Optional Module hook, reported once per successful commit with the count
+    // read before publication. A Module that does not define it gets the
+    // `long` overload and no behaviour change: the overload-rank trick keeps
+    // the five other profilers on this engine untouched.
+    template <typename M = Module>
+    static auto report_committed(Context ctx, State *state, uint32_t saved_count, int)
+        -> decltype(M::on_publish_committed(ctx, state, saved_count), void()) {
+        M::on_publish_committed(ctx, state, saved_count);
+    }
+    template <typename M = Module>
+    static void report_committed(Context, State *, uint32_t, long) {}
+
     static void switch_buffer(Context ctx, State *state) {
         if (state == nullptr) {
             return;
@@ -205,14 +217,19 @@ struct DeviceProfilerEngine {
         }
 
         uint32_t seq = Module::current_seq(state);
+        // Read before publication: a successful enqueue advances the ready
+        // queue tail, after which the host owns the buffer and may recycle it.
+        const uint32_t saved_count = Module::count(full_buf);
         int rc = enqueue_ready(ctx, Module::current_ptr(state), seq);
         if (rc != 0) {
-            Module::account_dropped(ctx, state, Module::count(full_buf));
+            Module::account_dropped(ctx, state, saved_count);
             Module::on_enqueue_failed(ctx, state, full_buf);
             Module::set_count(full_buf, 0);
             wmb();
             return;
         }
+
+        report_committed(ctx, state, saved_count, 0);
 
         uint32_t next_seq = seq + 1;
         Module::set_current_ptr(state, 0);

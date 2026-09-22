@@ -237,6 +237,13 @@ inline void emit_host_span_at(const char *name, long long ts_ns, long long dur_n
 /** Emit a device-domain span (device-clock start `ts_ns` + measured `dur_ns`). */
 #define STRACE_DEV_SPAN_AT(name, ts_ns, dur_ns, depth) \
     ::simpler::strace::emit_span_at((name), (ts_ns), (dur_ns), (depth))
+/**
+ * Like STRACE_DEV_SPAN_AT with caller-formatted attributes. `attrs` must carry
+ * `clk=dev` itself — the parser keys the device clock domain off that token, and
+ * supplying attrs replaces the default that would otherwise provide it.
+ */
+#define STRACE_DEV_SPAN_AT_A(name, ts_ns, dur_ns, depth, attrs) \
+    ::simpler::strace::emit_span_at((name), (ts_ns), (dur_ns), (depth), (attrs))
 
 #else  // !SIMPLER_HOST_STRACE
 

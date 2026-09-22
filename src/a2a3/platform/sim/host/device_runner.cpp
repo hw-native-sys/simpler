@@ -178,10 +178,17 @@ int DeviceRunner::ensure_binaries_loaded() {
             return PTO_RUNTIME_ERR_INTERNAL;
         if (!load_sym("set_platform_phase_base", reinterpret_cast<void **>(&set_platform_phase_base_func_)))
             return PTO_RUNTIME_ERR_INTERNAL;
+        if (!load_sym("set_platform_run_result", reinterpret_cast<void **>(&set_platform_run_result_func_)))
+            return PTO_RUNTIME_ERR_INTERNAL;
         if (!load_sym("set_dump_args_enabled", reinterpret_cast<void **>(&set_dump_args_enabled_func_)))
             return PTO_RUNTIME_ERR_INTERNAL;
         if (!load_sym(
                 "set_platform_chip_swimlane_base", reinterpret_cast<void **>(&set_platform_chip_swimlane_base_func_)
+            ))
+            return PTO_RUNTIME_ERR_INTERNAL;
+        if (!load_sym(
+                "set_platform_chip_swimlane_run_terminal_bank",
+                reinterpret_cast<void **>(&set_platform_chip_swimlane_run_terminal_bank_func_)
             ))
             return PTO_RUNTIME_ERR_INTERNAL;
         if (!load_sym(
@@ -217,7 +224,7 @@ int DeviceRunner::ensure_binaries_loaded() {
         }
 
         // The AICPU sim SO binds its private HostLogger before the compatibility
-        // level setter can emit a clock anchor.
+        // level setter can log through it.
         using SetLogLevelFunc = void (*)(int);
         SetLogLevelFunc set_log_level_func = nullptr;
         if (!load_sym("set_log_level", reinterpret_cast<void **>(&set_log_level_func))) return PTO_RUNTIME_ERR_INTERNAL;
@@ -275,7 +282,7 @@ int DeviceRunner::ensure_binaries_loaded() {
         }
 
         aicore_execute_func_ =
-            reinterpret_cast<void (*)(Runtime *, int, CoreType, uint32_t, uint64_t, uint32_t, uint64_t)>(
+            reinterpret_cast<void (*)(Runtime *, int, CoreType, uint32_t, uint64_t, uint32_t, uint64_t, uint64_t)>(
                 dlsym(aicore_so_handle_, "aicore_execute_wrapper")
             );
         if (aicore_execute_func_ == nullptr) {
@@ -312,10 +319,10 @@ int DeviceRunner::invoke_device_register(const RegisterCallableArgs &reg_args) {
     return aicpu_register_callable_func_(const_cast<RegisterCallableArgs *>(&reg_args));
 }
 
-void DeviceRunner::set_dep_gen_enabled(bool enable) {
-    enable_dep_gen_ = enable;
+void DeviceRunner::arm_host_dep_gen_capture(bool enable) {
     // Arms host-side capture for a host-orch runtime (no-op weak stub for the
-    // device-orch one). The c_api latches the CallConfig before bind, and the
+    // device-orch one). The capture is thread-local between orchestration and
+    // emit, so the c_api calls this on the binding thread before every bind; the
     // orchestration entry resets the graph before recording it.
     dep_gen_host_graph_set_enabled(enable);
 }
@@ -325,15 +332,14 @@ int DeviceRunner::prepare_execution(
     std::unique_ptr<PreparedExecution> *prepared
 ) {
     if (prepared == nullptr || *prepared != nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-    // Resolved from this run's own CallConfig rather than read off the runner:
-    // apply_call_config() is skipped when this prepare overlaps an in-flight
-    // predecessor, so the members still describe that predecessor.
-    const DfxRunConfig dfx = DfxRunConfig::from(config);
     if (active_run_ != nullptr) {
         LOG_ERROR("prepare_execution called while another simulated run still owns execution state");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     auto execution = std::make_unique<PreparedExecution>(identity, runtime, config, pipeline_slot);
+    // This run's own diagnostics configuration, carried on the prepared run so
+    // that arming at launch and teardown at drain read the same value.
+    const DfxRunConfig &dfx = execution->dfx;
     active_run_ = std::make_unique<ActiveRun>();
     active_run_->runtime = &runtime;
     run_completion_.reset(1);
@@ -362,6 +368,12 @@ int DeviceRunner::prepare_execution(
         return rc;
     }
 
+    // Sim runs the same handshake report protocol as onboard, so it supplies the
+    // same per-run identity. `next_native_run_epoch` never returns 0, and 0 is
+    // what selects the kernel/persistent protocol, so a native sim run is
+    // stamped exactly like a native onboard one.
+    kernel_args_.run_result_epoch = identity.run_epoch;
+
     // Lazy-allocate the 8-byte device_wall buffer on first run. Sim's "device
     // pointer" is a host malloc returned by allocate_tensor; the sim AICPU
     // thread writes through this pointer just like onboard's AICPU does.
@@ -374,35 +386,8 @@ int DeviceRunner::prepare_execution(
     }
 
     int num_aicore = block_dim * cores_per_blockdim_;
-    uint32_t enable_profiling_flag = SIMPLER_DFX_FLAG_NONE;
-    if (dfx.dump_args_enabled()) {
-        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS);
-    }
-    if (dfx.chip_swimlane_enabled()) {
-        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
-    }
-    if (dfx.pmu_enabled) {
-        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_PMU);
-    }
-    // The device flag drives the AICPU writer only; a host-orch runtime has no
-    // device-side dep_gen to switch on.
-    if (dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
-        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DEP_GEN);
-    }
-    if (dfx.scope_stats_enabled) {
-        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_SCOPE_STATS);
-    }
-    kernel_args_.enable_profiling_flag = enable_profiling_flag;
-
-    for (int i = 0; i < runtime.get_task_count(); i++) {
-        Task *task = runtime.get_task(i);
-        if (task != nullptr) {
-            uint64_t callable_addr = runtime.get_function_bin_addr(task->func_id);
-            const CoreCallable *c = reinterpret_cast<const CoreCallable *>(callable_addr);
-            task->function_bin_addr = c->resolved_addr();
-            LOG_DEBUG("Task %d (func_id=%d) -> function_bin_addr=0x%lx", i, task->func_id, task->function_bin_addr);
-        }
-    }
+    // The profiling flag is built by `arm_collectors_for_run` at launch, beside
+    // the collector pools it describes.
 
     rc = prepare_orch_so(runtime);
     if (rc != 0) {
@@ -411,69 +396,6 @@ int DeviceRunner::prepare_execution(
     }
 
     last_runtime_ = &runtime;
-
-    // Collectors stay initialized across runs, so pools built for an earlier
-    // run's core / AICPU-thread counts have to go before this run seeds pools
-    // and recycled lanes at different ones.
-    if (collector_shape_is_stale(num_aicore, runtime.get_aicpu_thread_num(), launch_aicpu_num)) {
-        finalize_collectors();
-    }
-    latch_collector_shape(num_aicore, runtime.get_aicpu_thread_num(), launch_aicpu_num);
-
-    if (dfx.chip_swimlane_enabled()) {
-        rc = init_chip_swimlane(
-            num_aicore, runtime.get_aicpu_thread_num(), device_id_, dfx.output_prefix, dfx.chip_swimlane_level
-        );
-        if (rc != 0) {
-            LOG_ERROR("init_chip_swimlane failed: %d", rc);
-            return rc;
-        }
-        // Publish per-core core_type to the collector so the level=1 host
-        // emit path can label lanes without an AICPU record. prepare_launch_shape
-        // already typed workers[i].core_type (first block_dim cores are AIC).
-        std::vector<CoreType> core_types(num_aicore);
-        for (int i = 0; i < num_aicore; i++) {
-            core_types[i] = runtime.get_workers()[i].core_type;
-        }
-        chip_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
-    }
-
-    if (dfx.dump_args_enabled()) {
-        rc = init_args_dump(runtime, device_id_, dfx.output_prefix, dfx.dump_args_level);
-        if (rc != 0) {
-            LOG_ERROR("init_args_dump failed: %d", rc);
-            return rc;
-        }
-    }
-
-    if (dfx.pmu_enabled) {
-        rc = init_pmu(
-            num_aicore, launch_aicpu_num, make_pmu_csv_path(dfx.output_prefix), dfx.pmu_event_type, device_id_
-        );
-        if (rc != 0) {
-            LOG_ERROR("init_pmu failed: %d", rc);
-            return rc;
-        }
-    }
-
-    // A host-orch runtime already holds the graph in host memory; standing up
-    // the device ring and its collector would allocate shared memory and a
-    // drain thread for a stream that never produces a record.
-    if (dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
-        rc = init_dep_gen(launch_aicpu_num, device_id_);
-        if (rc != 0) {
-            LOG_ERROR("init_dep_gen failed: %d", rc);
-            return rc;
-        }
-    }
-
-    if (dfx.scope_stats_enabled) {
-        rc = init_scope_stats(launch_aicpu_num);
-        if (rc != 0) {
-            LOG_ERROR("init_scope_stats failed: %d", rc);
-            return rc;
-        }
-    }
 
     size_t total_reg_size = num_aicore * SIM_REG_BLOCK_SIZE;
     active_run_->reg_blocks = mem_alloc_.alloc(total_reg_size);
@@ -521,11 +443,12 @@ int DeviceRunner::prepare_execution(
 
     if (aicpu_execute_func_ == nullptr || aicore_execute_func_ == nullptr || set_platform_regs_func_ == nullptr ||
         set_platform_dump_base_func_ == nullptr || set_platform_phase_base_func_ == nullptr ||
-        set_dump_args_enabled_func_ == nullptr || set_platform_pmu_base_func_ == nullptr ||
-        set_platform_pmu_reg_addrs_func_ == nullptr || set_pmu_enabled_func_ == nullptr ||
-        set_platform_dep_gen_base_func_ == nullptr || set_dep_gen_enabled_func_ == nullptr ||
-        set_scope_stats_enabled_func_ == nullptr || set_platform_scope_stats_base_func_ == nullptr ||
-        set_platform_chip_swimlane_base_func_ == nullptr ||
+        set_platform_run_result_func_ == nullptr || set_dump_args_enabled_func_ == nullptr ||
+        set_platform_pmu_base_func_ == nullptr || set_platform_pmu_reg_addrs_func_ == nullptr ||
+        set_pmu_enabled_func_ == nullptr || set_platform_dep_gen_base_func_ == nullptr ||
+        set_dep_gen_enabled_func_ == nullptr || set_scope_stats_enabled_func_ == nullptr ||
+        set_platform_scope_stats_base_func_ == nullptr || set_platform_chip_swimlane_base_func_ == nullptr ||
+        set_platform_chip_swimlane_run_terminal_bank_func_ == nullptr ||
         set_platform_chip_swimlane_aicore_rotation_table_func_ == nullptr ||
         set_chip_swimlane_enabled_func_ == nullptr) {
         LOG_ERROR("Executor functions not loaded. Call ensure_binaries_loaded first.");
@@ -560,33 +483,36 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
 
     LaunchTransactionResult result = exact_launch_transaction(
         prepared->identity, std::move(permit),
-        [&]() -> int {
+        [&](LaunchProgressSink &) -> int {
             // Arming precedes any simulated-core thread, so its failures — including
             // a thread-spawn or allocation throw — are reported as an rc and leave
             // the run safely rollback-able.
             try {
+                if (int arm_rc = arm_collectors_for_run(runtime, *prepared); arm_rc != 0) return arm_rc;
                 set_platform_regs_func_(kernel_args_.regs);
                 if (set_orch_device_id_func_ != nullptr) set_orch_device_id_func_(device_id_);
                 set_platform_dump_base_func_(kernel_args_.dump_data_base);
-                set_dump_args_enabled_func_(enable_dump_args_);
+                set_dump_args_enabled_func_(prepared->dfx.dump_args_enabled());
                 set_platform_chip_swimlane_base_func_(kernel_args_.chip_swimlane_data_base);
+                set_platform_chip_swimlane_run_terminal_bank_func_(kernel_args_.chip_swimlane_run_terminal_bank);
                 set_platform_chip_swimlane_aicore_rotation_table_func_(
                     kernel_args_.chip_swimlane_aicore_rotation_table
                 );
-                set_chip_swimlane_enabled_func_(enable_chip_swimlane_);
+                set_chip_swimlane_enabled_func_(prepared->dfx.chip_swimlane_enabled());
                 set_platform_pmu_base_func_(kernel_args_.pmu_data_base);
                 set_platform_pmu_reg_addrs_func_(kernel_args_.pmu_reg_addrs);
-                set_pmu_enabled_func_(enable_pmu_);
+                set_pmu_enabled_func_(prepared->dfx.pmu_enabled);
                 set_platform_dep_gen_base_func_(kernel_args_.dep_gen_data_base);
-                set_dep_gen_enabled_func_(enable_dep_gen_ && !dep_gen_host_graph_active());
-                set_scope_stats_enabled_func_(enable_scope_stats_);
+                set_dep_gen_enabled_func_(prepared->dfx.dep_gen_enabled && !dep_gen_host_graph_active());
+                set_scope_stats_enabled_func_(prepared->dfx.scope_stats_enabled);
                 set_platform_scope_stats_base_func_(kernel_args_.scope_stats_data_base);
 
-                start_shared_collectors_for_run();
-                if (enable_dep_gen_ && !dep_gen_host_graph_active()) {
+                start_shared_collectors_for_run(prepared->dfx);
+                if (prepared->dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
                     auto thread_factory = [this](std::function<void()> fn) {
                         return create_thread(std::move(fn));
                     };
+                    dep_gen_collector_.begin_run();
                     dep_gen_collector_.start(thread_factory);
                 }
 
@@ -595,6 +521,11 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 }
                 reset_device_phase_buffer(&run->phase_buf, over_launch);
                 set_platform_phase_base_func_(reinterpret_cast<uint64_t>(&run->phase_buf));
+                // Sim allocates no result region, so there is no base to publish —
+                // but the epoch still has to reach the AICPU SO, because the
+                // collectors stamp it onto every buffer they acquire. Without
+                // it sim records carry no run identity at all.
+                set_platform_run_result_func_(/*region_base=*/0, prepared->identity.run_epoch);
                 sim_t0 = std::chrono::steady_clock::now();
                 run_completion_.reset(static_cast<size_t>(over_launch) + static_cast<size_t>(num_aicore));
             } catch (...) {
@@ -604,35 +535,42 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
 
             LOG_INFO("Launching %d AICore thread(s)", num_aicore);
             for (int i = 0; i < num_aicore; i++) {
-                CoreType core_type = runtime.get_workers()[i].core_type;
+                CoreType core_type = runtime.core_type_rule(i);
                 uint32_t physical_core_id = static_cast<uint32_t>(i);
-                run->aicore_threads.push_back(create_thread([this, run, i, core_type, physical_core_id]() {
-                    aicore_execute_func_(
-                        run->runtime, i, core_type, physical_core_id, kernel_args_.regs,
-                        kernel_args_.enable_profiling_flag, kernel_args_.chip_swimlane_aicore_rotation_table
-                    );
-                    run_completion_.task_finished();
-                }));
+                run->aicore_threads.push_back(create_thread(
+                    [this, run, i, core_type, physical_core_id]() {
+                        aicore_execute_func_(
+                            run->runtime, i, core_type, physical_core_id, kernel_args_.regs,
+                            kernel_args_.enable_profiling_flag, kernel_args_.chip_swimlane_aicore_rotation_table,
+                            kernel_args_.run_result_epoch
+                        );
+                        run_completion_.task_finished();
+                    },
+                    std::string("sim-") + (core_type == CoreType::AIC ? "aic" : "aiv") + "-" + std::to_string(i)
+                ));
             }
             return 0;
         },
-        [&]() -> int {
+        [&](LaunchProgressSink &) -> int {
             LOG_INFO("Launching %d AICPU threads (logical=%d)", over_launch, launch_aicpu_num);
             for (int i = 0; i < over_launch; i++) {
-                run->aicpu_threads.push_back(create_thread([this, run, launch_aicpu_num, over_launch, sim_t0]() {
-                    if (!platform_aicpu_affinity_gate(launch_aicpu_num, over_launch)) {
-                        run_completion_.task_finished();
-                        return;
-                    }
-                    int rc = aicpu_execute_func_(run->runtime);
-                    if (kernel_args_.device_wall_data_base != 0) {
-                        const auto t1 = std::chrono::steady_clock::now();
-                        *reinterpret_cast<uint64_t *>(kernel_args_.device_wall_data_base) = static_cast<uint64_t>(
-                            std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - sim_t0).count()
-                        );
-                    }
-                    run_completion_.task_finished(rc);
-                }));
+                run->aicpu_threads.push_back(create_thread(
+                    [this, run, launch_aicpu_num, over_launch, sim_t0]() {
+                        if (!platform_aicpu_affinity_gate(launch_aicpu_num, over_launch)) {
+                            run_completion_.task_finished();
+                            return;
+                        }
+                        int rc = aicpu_execute_func_(run->runtime);
+                        if (kernel_args_.device_wall_data_base != 0) {
+                            const auto t1 = std::chrono::steady_clock::now();
+                            *reinterpret_cast<uint64_t *>(kernel_args_.device_wall_data_base) = static_cast<uint64_t>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - sim_t0).count()
+                            );
+                        }
+                        run_completion_.task_finished(rc);
+                    },
+                    "sim-aicpu-" + std::to_string(i)
+                ));
             }
             return 0;
         }
@@ -651,11 +589,12 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
 
 int DeviceRunner::poll_execution(const ActiveExecution &) { return run_completion_.poll(); }
 
-int DeviceRunner::drain_execution(ActiveExecution &) {
-    if (active_run_ == nullptr) {
+int DeviceRunner::drain_execution(ActiveExecution &active) {
+    if (active_run_ == nullptr || active.prepared == nullptr) {
         LOG_ERROR("drain_execution called without a launched simulated run");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    const DfxRunConfig &dfx = active.prepared->dfx;
     auto run_cleanup = RAIIScopeGuard([this]() {
         cleanup_active_run();
     });
@@ -707,26 +646,22 @@ int DeviceRunner::drain_execution(ActiveExecution &) {
     int runtime_rc = run_completion_.first_error();
     if (runtime_rc != 0) {
         LOG_ERROR("AICPU execution failed with rc=%d", runtime_rc);
-        finish_clock_correlation_session(false);
+        // The AICPU threads are joined above, so every collector's producer has
+        // stopped and its records are as complete as the run made them. Export
+        // them: a failed run is the one whose swimlane, dumped tensors and
+        // dep_gen graph are worth reading. `false` withholds only the run
+        // terminal snapshot, which this run never reached.
+        teardown_shared_collectors_after_run(
+            dfx, active.prepared->pipeline_slot, active.prepared->identity.run_epoch, false
+        );
+        emit_device_dep_gen_graph(dfx);
         return runtime_rc;
     }
 
-    teardown_shared_collectors_after_run(true);
-
-    // Device-orch shape: the collector stops, the ring reconciles, and the
-    // records replay. The host-orch shape emits at the end of bind instead, where
-    // its capture window closes — see `emit_host_dep_gen_graph` in c_api_shared.cpp.
-    if (enable_dep_gen_ && !dep_gen_host_graph_active()) {
-        dep_gen_collector_.quiesce();
-        if (dep_gen_collector_.reconcile_counters()) {
-            const std::string deps = make_deps_json_path(output_prefix_);
-            const auto &records = dep_gen_collector_.records();
-            int rc = dep_gen_replay_emit_deps_json(records.data(), records.size(), deps.c_str());
-            if (rc != 0) {
-                LOG_ERROR("dep_gen replay failed (%d) — deps.json not produced", rc);
-            }
-        }
-    }
+    teardown_shared_collectors_after_run(
+        dfx, active.prepared->pipeline_slot, active.prepared->identity.run_epoch, true
+    );
+    emit_device_dep_gen_graph(dfx);
 
     print_handshake_results();
 
@@ -746,6 +681,35 @@ int DeviceRunner::drain_execution(ActiveExecution &) {
     return 0;
 }
 
+void DeviceRunner::emit_device_dep_gen_graph(const DfxRunConfig &dfx) {
+    // The host-orch shape emits at the end of bind instead, where its capture
+    // window closes — see `emit_host_dep_gen_graph` in c_api_shared.cpp.
+    if (!dfx.dep_gen_enabled || dep_gen_host_graph_active()) return;
+    dep_gen_collector_.quiesce();
+    // reconcile_counters() is the completeness gate: an un-flushed device buffer
+    // or a dropped record makes it false and no deps.json is written, so a run
+    // that failed mid-flight yields a whole graph or none — never a partial one.
+    if (!dep_gen_collector_.reconcile_counters()) return;
+    const std::string deps = make_deps_json_path(dfx.output_prefix);
+    // One deps.json describes one graph. A window with no records still gets a
+    // file — an empty graph is this run's answer, and suppressing it would make
+    // "nothing submitted" indistinguishable from "collection failed". Several
+    // runs in one window is the only case that cannot be emitted, because the
+    // path would have to name which run; that belongs with session output.
+    uint64_t dep_gen_run_epoch = 0;
+    const std::vector<DepGenRecord> *records = dep_gen_collector_.window_records(&dep_gen_run_epoch);
+    if (records == nullptr) {
+        LOG_ERROR(
+            "dep_gen collected %zu runs in one window — deps.json not produced", dep_gen_collector_.runs().size()
+        );
+        return;
+    }
+    int rc = dep_gen_replay_emit_deps_json(records->data(), records->size(), deps.c_str());
+    if (rc != 0) {
+        LOG_ERROR("dep_gen replay failed (%d) — deps.json not produced", rc);
+    }
+}
+
 void DeviceRunner::abandon_prepared_execution(PreparedExecution &) noexcept {
     run_completion_.abandon();
     cleanup_active_run();
@@ -762,6 +726,7 @@ void DeviceRunner::unload_executor_binaries() {
         set_platform_dump_base_func_ = nullptr;
         set_dump_args_enabled_func_ = nullptr;
         set_platform_chip_swimlane_base_func_ = nullptr;
+        set_platform_chip_swimlane_run_terminal_bank_func_ = nullptr;
         set_platform_chip_swimlane_aicore_rotation_table_func_ = nullptr;
         set_chip_swimlane_enabled_func_ = nullptr;
         set_platform_pmu_base_func_ = nullptr;
@@ -805,6 +770,7 @@ int DeviceRunner::finalize() {
     unload_executor_binaries();
     release_graph_definition_blocks();
     release_sm_mirrors();
+    release_run_image_stagings();
 
     // Release the three per-Worker pooled arenas. Must precede mem_alloc_.finalize()
     // so the arenas free through the still-live allocator, not after it.
@@ -855,9 +821,116 @@ int DeviceRunner::finalize() {
 // Performance Profiling Implementation
 // =============================================================================
 
+int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecution &prepared) {
+    const DfxRunConfig &dfx = prepared.dfx;
+    const int num_aicore = prepared.num_aicore;
+    const int launch_aicpu_num = prepared.launch_aicpu_num;
+    const int aicpu_thread_num = runtime.get_aicpu_thread_num();
+
+    // Collectors stay initialized across runs, so pools built for an earlier
+    // run's core / AICPU-thread counts have to go before this run seeds pools
+    // and recycled lanes at different ones. Mirrors the onboard runner, where
+    // doing this under the execution claim is what keeps the release off a live
+    // predecessor's pools.
+    if (collector_shape_is_stale(num_aicore, aicpu_thread_num, launch_aicpu_num)) {
+        finalize_collectors();
+    }
+    latch_collector_shape(num_aicore, aicpu_thread_num, launch_aicpu_num);
+
+    // Between the stale-shape release and the init: finalize() resets
+    // host_orchestrated_, and initialize() reads it when it decides whether to
+    // size a device orch phase pool. Publishing before the release would lose
+    // that state.
+    publish_host_phase_run_to_collector(prepared.pipeline_slot);
+
+    // This run's bank, so a run that arms none publishes 0 rather than whatever
+    // the last run left. `kernel_args_` is a runner member that outlives the run,
+    // so the reset is load-bearing here, not defensive.
+    kernel_args_.chip_swimlane_run_terminal_bank = 0;
+
+    int rc = 0;
+    if (dfx.chip_swimlane_enabled()) {
+        rc = init_chip_swimlane(num_aicore, aicpu_thread_num, device_id_, dfx.chip_swimlane_level);
+        if (rc != 0) {
+            LOG_ERROR("init_chip_swimlane failed: %d", rc);
+            return rc;
+        }
+        // Publish per-core core_type to the collector so the level=1 host
+        // emit path can label lanes without an AICPU record. prepare_launch_shape
+        // recorded the rule (first block_dim cores are AIC).
+        std::vector<CoreType> core_types(num_aicore);
+        for (int i = 0; i < num_aicore; i++) {
+            core_types[i] = runtime.core_type_rule(i);
+        }
+        chip_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
+        // After the init that publishes the region base: the bank is a slice of
+        // that region, and it is resolved per run because it is keyed on this
+        // run's pipeline slot and identity, not on the device's.
+        kernel_args_.chip_swimlane_run_terminal_bank =
+            arm_chip_swimlane_run_terminal_bank(prepared.pipeline_slot, prepared.identity.run_epoch);
+    }
+
+    if (dfx.dump_args_enabled()) {
+        rc = init_args_dump(runtime, device_id_, dfx.dump_args_level);
+        if (rc != 0) {
+            LOG_ERROR("init_args_dump failed: %d", rc);
+            return rc;
+        }
+    }
+
+    if (dfx.pmu_enabled) {
+        rc = init_pmu(num_aicore, launch_aicpu_num, device_id_);
+        if (rc != 0) {
+            LOG_ERROR("init_pmu failed: %d", rc);
+            return rc;
+        }
+    }
+
+    // A host-orch runtime already holds the graph in host memory; standing up
+    // the device ring and its collector would allocate shared memory and a
+    // drain thread for a stream that never produces a record.
+    if (dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
+        rc = init_dep_gen(launch_aicpu_num, device_id_);
+        if (rc != 0) {
+            LOG_ERROR("init_dep_gen failed: %d", rc);
+            return rc;
+        }
+    }
+
+    if (dfx.scope_stats_enabled) {
+        rc = init_scope_stats(launch_aicpu_num);
+        if (rc != 0) {
+            LOG_ERROR("init_scope_stats failed: %d", rc);
+            return rc;
+        }
+    }
+
+    // Built here rather than during preparation because the dep_gen bit depends
+    // on the same host-orch check the init above makes.
+    uint32_t enable_profiling_flag = SIMPLER_DFX_FLAG_NONE;
+    if (dfx.dump_args_enabled()) {
+        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS);
+    }
+    if (dfx.chip_swimlane_enabled()) {
+        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
+    }
+    if (dfx.pmu_enabled) {
+        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_PMU);
+    }
+    // The device flag drives the AICPU writer only; a host-orch runtime has no
+    // device-side dep_gen to switch on.
+    if (dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
+        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DEP_GEN);
+    }
+    if (dfx.scope_stats_enabled) {
+        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_SCOPE_STATS);
+    }
+    kernel_args_.enable_profiling_flag = enable_profiling_flag;
+    return 0;
+}
+
 int DeviceRunner::init_chip_swimlane(
-    int num_aicore, int aicpu_thread_num, int device_id, const std::string &output_prefix,
-    ChipSwimlaneLevel chip_swimlane_level
+    int num_aicore, int aicpu_thread_num, int device_id, ChipSwimlaneLevel chip_swimlane_level
 ) {
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);
@@ -866,8 +939,9 @@ int DeviceRunner::init_chip_swimlane(
         return mem_alloc_.free(dev_ptr);
     };
 
-    chip_swimlane_collector_.begin_run(output_prefix, chip_swimlane_level);
-    int rc = chip_swimlane_collector_.initialize(num_aicore, aicpu_thread_num, device_id, alloc_cb, nullptr, free_cb);
+    int rc = chip_swimlane_collector_.initialize(
+        num_aicore, aicpu_thread_num, device_id, chip_swimlane_level, alloc_cb, nullptr, free_cb
+    );
     if (rc != 0) {
         return rc;
     }
@@ -879,9 +953,7 @@ int DeviceRunner::init_chip_swimlane(
     return 0;
 }
 
-int DeviceRunner::init_args_dump(
-    Runtime &runtime, int device_id, const std::string &output_prefix, DumpArgsLevel dump_args_level
-) {
+int DeviceRunner::init_args_dump(const Runtime &runtime, int device_id, DumpArgsLevel dump_args_level) {
     int num_dump_threads = runtime.get_aicpu_thread_num();
 
     auto alloc_cb = [this](size_t size) -> void * {
@@ -891,8 +963,7 @@ int DeviceRunner::init_args_dump(
         return mem_alloc_.free(dev_ptr);
     };
 
-    dump_collector_.begin_run(output_prefix, dump_args_level);
-    int rc = dump_collector_.initialize(num_dump_threads, device_id, alloc_cb, nullptr, free_cb);
+    int rc = dump_collector_.initialize(num_dump_threads, device_id, dump_args_level, alloc_cb, nullptr, free_cb);
     if (rc != 0) {
         return rc;
     }
@@ -901,9 +972,7 @@ int DeviceRunner::init_args_dump(
     return 0;
 }
 
-int DeviceRunner::init_pmu(
-    int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int /*device_id*/
-) {
+int DeviceRunner::init_pmu(int num_cores, int num_threads, int /*device_id*/) {
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);
     };
@@ -911,7 +980,6 @@ int DeviceRunner::init_pmu(
         return mem_alloc_.free(dev_ptr);
     };
 
-    pmu_collector_.begin_run(csv_path, event_type);
     int rc = pmu_collector_.init(num_cores, num_threads, alloc_cb, nullptr, free_cb, -1);
     if (rc != 0) {
         return rc;
@@ -922,7 +990,6 @@ int DeviceRunner::init_pmu(
 }
 
 int DeviceRunner::init_dep_gen(int num_threads, int /*device_id*/) {
-    dep_gen_collector_.begin_run();
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);
     };
@@ -940,7 +1007,6 @@ int DeviceRunner::init_dep_gen(int num_threads, int /*device_id*/) {
 }
 
 int DeviceRunner::init_scope_stats(int num_threads) {
-    scope_stats_collector_.begin_run();
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);
     };

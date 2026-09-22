@@ -49,12 +49,73 @@ For each run, the host:
 2. reserves one backing arena for runtime/shared-memory subregions;
 3. binds the runtime to the orchestration DSO;
 4. calls the orchestration entry synchronously;
-5. finalizes task counts and the graph image; and
-6. copies the shared-memory image and the arena's copied zone to the device.
+5. finalizes task counts and records the prepared metadata sources in Runtime's host-only pending publication;
+6. returns from bind, then synchronously publishes Definitions, any resident
+   scheduler state, and finally the shared-memory image with the copied zone.
+
+`publish_run_image_impl` is the single metadata consumer. Definition and compact
+image sources are retained by the exclusive pipeline slot; A5 scheduler source
+storage moves into the same pending record. Device allocations keep their
+existing owners. No rebind/growth may replace borrowed staging before the copy
+returns. Consuming the record also consumes it on failure: later regions are not
+written, launch is forbidden, and failed-prepare cleanup retires run-owned
+allocations. Abandoning a bind clears its sources without performing metadata
+copies. Tensor copy-in and host get/set remain preparation effects; failed
+publication cannot undo them.
+
+One owner-checked host phase trace covers bind and publication. GraphUpload and
+ArenaH2d measure their actual successful copies and preserve byte-count details;
+packing is preparation work. A completed run's release cannot close a successor's
+trace. Publication is synchronous; these lifetimes do not cover asynchronous DMA
+or captured graphs.
 
 An orchestration fatal stops this sequence before the upload. The orchestrator
 runs on the host, so its code is latched in `OrchestratorState::fatal_code` and
 never reaches shared memory; the bind maps it onto the status the caller sees.
+
+Step 1 gives each caller tensor a slice of the runner's retained temporary buffer
+rather than a per-run `device_malloc` / `device_free` pair: bind packs the run's
+non-child tensors to a 1024-aligned required size, grows the buffer only when a
+run needs more than is currently retained, and bump-slices each tensor from it,
+so a steady-state workload performs no temporary device allocation at all. The
+slices are recorded as `BufferNoop` leases — validate copies the written ones
+back and releases none, and the buffer itself is freed once at Worker finalize.
+The buffer is per pipeline slot; a run holds its slot from bind through validate
+and a concurrent reservation is admitted only on a distinct slot, so no other
+run can re-slice a buffer whose slices are still live. The mechanism
+(`RetainedTempBump`, `src/common/utils/retained_temp_bump.h`) is shared with
+`tensormap_and_ringbuffer`; that runtime's `RUNTIME_LOGIC.md` §2.4 carries the
+grow/slice details.
+
+The H2D copy-in of a tensor precedes its registration with the run's host
+accessor, so a reused slice can never expose the previous run's bytes to
+orchestration.
+
+An empty caller tensor addresses nothing, so it takes no slice and reaches
+orchestration with a null address. **This is a change in what hbg accepts.**
+Before the retained temporary buffer, a zero-byte non-child tensor that was not a pure
+`OUT` failed the bind: it was handed to `HostTensorAccessor::add`, which rejects
+an empty region, and the bind reported `no host view for tensor N`. It is now
+passed through, which is what `tensormap_and_ringbuffer` has always done.
+
+A pure `OUT` tensor gets a slice but is never copied in, and nothing
+zero-fills it, so the bytes a kernel does not write are whatever the slice last
+held. That was already true of a fresh `device_malloc` — the allocator pools and
+reuses device memory — but the residue is no longer always arbitrary. **On a run
+that reuses the retained buffer unchanged, it is whatever the previous tensor
+occupying that byte range left there.** The slot is keyed by pipeline slot
+alone, not by callable or by tensor identity, so that is the same tensor's own
+bytes only when the same callable runs consecutively with the same argument
+layout; a slot alternating between callables leaves another callable's bytes.
+A run that allocated or grew the buffer gets uninitialized allocator memory as
+before, and so does the first run of any Worker, because
+`RetainedTempBump::begin()` neither preserves nor initializes a buffer it
+replaces. So a kernel that writes only part of its output fails
+deterministically across the steady-state rounds of a fixed-shape workload —
+where a golden check is least likely to catch it — and randomly everywhere
+else. `device_memset` exists for zero-filling pure outputs;
+neither runtime uses it, because it would cost a device operation per output per
+run.
 
 ### 2.3 Device Execution and Teardown
 
@@ -150,7 +211,7 @@ signal, so such a queue accepts one push and then reports full. The ramp is
 mandatory but it is a function of `capacity` alone, so
 `SchedulerState::seed_queue_slots()` writes it on the device rather than `bind`
 shipping 1,775,616 bytes of it. The ready queues are still *not* bounded to
-`total_tasks`: graph execution expands a GRAPH task into on-device in-graph tasks that
+`total_tasks`: graph execution expands a GRAPH task into on-device sub-tasks that
 push past the host task count, so every slot must carry a valid sequence.
 
 Both run before the boot thread publishes `runtime_init_ready_`, which is what

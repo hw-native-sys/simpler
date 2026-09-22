@@ -19,6 +19,7 @@ only, and the chip-callable cascade gives them a fake chip (``_harness``).
 from __future__ import annotations
 
 import ast
+import os
 import struct
 import threading
 from multiprocessing.shared_memory import SharedMemory
@@ -387,6 +388,53 @@ class TestL4ToL3MultipleDispatches:
         finally:
             counter_shm.close()
             counter_shm.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Test: L4 → L3 — per-child capture namespace
+# ---------------------------------------------------------------------------
+
+
+class TestL4ChildCaptureNamespace:
+    def test_attached_l3_children_write_under_distinct_namespaces(self, tmp_path):
+        """Two attached L3 children never share one artifact directory.
+
+        Every diagnostic below `output_prefix` uses a fixed filename, and each
+        L3 numbers its own chips from zero, so siblings handed one prefix write
+        over each other. The probe stands in for such an artifact: it is
+        written at the prefix the child was actually handed, so both survive
+        only if the two children were handed different ones.
+        """
+
+        def l3_orch(orch, args, config):
+            os.makedirs(config.output_prefix, exist_ok=True)
+            with open(os.path.join(config.output_prefix, "probe.txt"), "w") as probe:
+                probe.write(str(os.getpid()))
+
+        first = Worker(level=3, num_sub_workers=1)
+        first.register(lambda args: None)
+        second = Worker(level=3, num_sub_workers=1)
+        second.register(lambda args: None)
+
+        w4 = Worker(level=4, num_sub_workers=0)
+        l3_handle = w4.register(l3_orch)
+        first_id = w4.add_worker(first)
+        second_id = w4.add_worker(second)
+        w4.init()
+
+        child_config = CallConfig()
+        child_config.output_prefix = str(tmp_path)
+
+        def l4_orch(orch, args, config):
+            for worker_id in (first_id, second_id):
+                orch.submit_next_level(l3_handle, TaskArgs(), child_config, worker=worker_id)
+
+        w4.run(l4_orch)
+        w4.close()
+
+        probes = {path.parent.name: path.read_text() for path in tmp_path.rglob("probe.txt")}
+        assert set(probes) == {f"node{first_id}", f"node{second_id}"}
+        assert len(set(probes.values())) == 2
 
 
 # ---------------------------------------------------------------------------

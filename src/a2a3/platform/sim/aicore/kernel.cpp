@@ -37,6 +37,7 @@ static pthread_key_t g_aicore_profiling_flag_key;
 // aicore_profiling_state.h for the lazy-deref contract.
 static pthread_key_t g_chip_swimlane_aicore_head_slot_key;
 static pthread_key_t g_chip_swimlane_aicore_head_key;
+static pthread_key_t g_aicore_report_epoch_key;
 static pthread_once_t g_tls_once = PTHREAD_ONCE_INIT;
 
 static void create_tls_keys() {
@@ -45,6 +46,7 @@ static void create_tls_keys() {
     pthread_key_create(&g_aicore_profiling_flag_key, nullptr);
     pthread_key_create(&g_chip_swimlane_aicore_head_slot_key, nullptr);
     pthread_key_create(&g_chip_swimlane_aicore_head_key, nullptr);
+    pthread_key_create(&g_aicore_report_epoch_key, nullptr);
 }
 
 volatile uint8_t *sim_get_reg_base() { return static_cast<volatile uint8_t *>(pthread_getspecific(g_reg_base_key)); }
@@ -63,6 +65,13 @@ __aicore__ void set_aicore_profiling_flag(uint32_t flag) {
 }
 __aicore__ uint32_t get_aicore_profiling_flag() {
     return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_aicore_profiling_flag_key)));
+}
+
+__aicore__ void set_aicore_report_epoch(uint64_t epoch) {
+    pthread_setspecific(g_aicore_report_epoch_key, reinterpret_cast<void *>(static_cast<uintptr_t>(epoch)));
+}
+__aicore__ uint64_t get_aicore_report_epoch() {
+    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_aicore_report_epoch_key)));
 }
 
 __aicore__ void set_chip_swimlane_aicore_head_slot(__gm__ uint64_t *slot_ptr) {
@@ -103,7 +112,7 @@ void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type);
 // executor with its original signature.
 extern "C" void aicore_execute_wrapper(
     __gm__ Runtime *runtime, int block_idx, CoreType core_type, uint32_t physical_core_id, uint64_t regs,
-    uint32_t enable_profiling_flag, uint64_t chip_swimlane_aicore_rotation_table
+    uint32_t enable_profiling_flag, uint64_t chip_swimlane_aicore_rotation_table, uint64_t report_epoch
 ) {
     pthread_once(&g_tls_once, create_tls_keys);
 
@@ -119,6 +128,7 @@ extern "C" void aicore_execute_wrapper(
 
     // Publish per-core profiling state before the executor runs.
     set_aicore_profiling_flag(enable_profiling_flag);
+    set_aicore_report_epoch(report_epoch);
     if (chip_swimlane_aicore_rotation_table != 0) {
         // Stash only the slot pointer; the executor dereferences it via
         // get_chip_swimlane_aicore_head() after observing Phase 2 window-open.

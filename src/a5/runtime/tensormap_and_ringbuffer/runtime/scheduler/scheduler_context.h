@@ -414,8 +414,10 @@ private:
     __attribute__((noinline, cold)) LoopAction
     check_idle_fatal_error(int32_t thread_idx, SharedMemoryHeader *header, Runtime *runtime);
 
-    __attribute__((noinline, cold)) void
-    log_stall_diagnostics(int32_t thread_idx, int32_t task_count, int32_t idle_iterations, int32_t last_progress_count);
+    __attribute__((noinline, cold)) void log_stall_diagnostics(
+        int32_t thread_idx, int32_t task_count, int32_t idle_iterations, int32_t last_progress_count,
+        StallDumpReport report
+    );
 
     __attribute__((noinline, cold)) void log_shutdown_stall_snapshot(
         int32_t trigger_thread_idx, int32_t trigger_idle_iterations, int32_t trigger_last_progress_count

@@ -98,6 +98,10 @@ void SchedulerContext::complete_slot_task(
 
     if (slot_state.payload != nullptr) {
         volatile DeferredCompletionSlab *deferred_slab = &deferred_slab_per_core_[core_id][expected_reg_task_id & 1];
+        cache_invalidate_range(
+            reinterpret_cast<const void *>(const_cast<DeferredCompletionSlab *>(deferred_slab)),
+            offsetof(DeferredCompletionSlab, entries)
+        );
         int32_t slab_err = deferred_slab->error_code;
         if (slab_err != SIMPLER_ERROR_NONE) {
             int32_t expected = SIMPLER_ERROR_NONE;
@@ -119,6 +123,10 @@ void SchedulerContext::complete_slot_task(
         }
 
         if (cond_count > 0) {
+            cache_invalidate_range(
+                reinterpret_cast<const void *>(const_cast<DeferredCompletionEntry *>(deferred_slab->entries)),
+                cond_count * sizeof(DeferredCompletionEntry)
+            );
             slot_state.mark_any_subtask_deferred();
 
             const TaskId token = slot_state.task->task_id;

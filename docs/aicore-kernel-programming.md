@@ -47,8 +47,8 @@ accessor functions defined in that header.
 
 ## 2. SPMD execution context
 
-The runtime context exposes three topology values plus an optional async-DMA
-workspace address:
+The runtime context exposes three topology values plus device configuration
+shared by every incore kernel on the Worker:
 
 | Accessor (use these) | Returns | Lifetime | Source |
 | -------------------- | ------- | -------- | ------ |
@@ -56,6 +56,7 @@ workspace address:
 | `get_block_num(args)` | total logical blocks for this task | per-dispatch | `LocalContext.block_num` |
 | `get_sub_block_id(args)` | AIV lane in cluster (0 = AIV0, 1 = AIV1) | per-core, init once | `GlobalContext.sub_block_id` |
 | `get_dma_workspace(args, kind)` | engine workspace GM pointer, or `nullptr` | Worker init (SDMA-enabled) | `GlobalContext.dma_workspace[kind]` |
+| `get_l2_cache_offset(args)` | distance to this device's nocache GM alias, or zero | Worker init | `GlobalContext.l2_cache_offset` |
 
 `sub_block_id` is **only meaningful for AIV kernels in MIX tasks**.
 AIC kernels and single-AIV tasks should not depend on it. AIV0 is the
@@ -79,6 +80,13 @@ mechanism.
 An invalid kind or unprovisioned slot returns `nullptr` and must not be used to
 submit DMA work. `LocalContext` is rewritten by `build_payload()` before each
 dispatch.
+
+The L2 offset is queried from the driver once and copied into every core's
+`GlobalContext` during scheduler cold start. Read it once at `kernel_entry`;
+zero means that the device exposes no nocache alias and leaves an address
+unchanged. See [L2 Cache Bypass](l2-cache-bypass.md) for the native CANN
+delivery path, why it cannot configure a text-only incore payload, and the
+remaining PTOAS handoff.
 
 ### Logical vs physical block_dim
 
@@ -361,6 +369,9 @@ AIC/AIV comparison to be meaningful.
 
 ## 6. Related
 
+- [`docs/l2-cache-bypass.md`](l2-cache-bypass.md) — why native CANN's
+  `.ascend.meta` / `.data` patching cannot configure a text-only incore payload,
+  and the args-based nocache-offset contract used instead.
 - [`src/a2a3/runtime/tensormap_and_ringbuffer/common/intrinsic.h`](../src/a2a3/runtime/tensormap_and_ringbuffer/common/intrinsic.h)
   — declarations of the args-based accessors and the
   `LocalContext` / `GlobalContext` layout. Same file for a5 under

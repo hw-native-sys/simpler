@@ -13,6 +13,10 @@
 #include <sys/stat.h>
 #include <stdlib.h>
 
+#if defined(__linux__)
+#include <pthread.h>
+#endif
+
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -264,9 +268,16 @@ void *SimDeviceRunnerBase::acquire_pooled_runtime_arena(uint32_t arena_bank) {
     return arena.base();
 }
 
-std::thread SimDeviceRunnerBase::create_thread(std::function<void()> fn) {
+std::thread SimDeviceRunnerBase::create_thread(std::function<void()> fn, std::string name) {
     int dev_id = device_id_;
-    return std::thread([dev_id, fn = std::move(fn)]() {
+    return std::thread([dev_id, fn = std::move(fn), name = std::move(name)]() {
+#if defined(__linux__)
+        // Linux caps a thread name at 15 characters plus NUL and fails the call
+        // outright on a longer one, which would leave the thread unnamed.
+        if (!name.empty()) {
+            pthread_setname_np(pthread_self(), name.substr(0, 15).c_str());
+        }
+#endif
         pto_cpu_sim_bind_device(dev_id);
         fn();
         pto_cpu_sim_bind_device(-1);
@@ -367,13 +378,22 @@ int SimDeviceRunnerBase::prepare_launch_shape(Runtime &runtime, const CallConfig
     worker_count_ = num_aicore;
     runtime.set_aicpu_thread_num(config.aicpu_thread_num);
 
-    // First `block_dim` cores are AIC; remaining ~2/3 are AIV.
+    // First `block_dim` cores are AIC; remaining ~2/3 are AIV. The rule is host
+    // state read by the sim's per-core thread start and by the DFX collector.
+    runtime.set_core_type_rule(num_aicore, block_dim);
+
+    // The sim has no upload: its threads read this host object in place, so
+    // `workers[]` here is the live handshake region and this loop is its
+    // per-run initialization, not a staged copy.
     Handshake *workers = runtime.get_workers();
     for (int i = 0; i < num_aicore; i++) {
         workers[i].aicpu_ready = 0;
         workers[i].aicore_done = 0;
         workers[i].task = 0;
         workers[i].core_type = (i < block_dim) ? CoreType::AIC : CoreType::AIV;
+        // Cleared with the rest of the report so a run's own epoch is the only
+        // value that can ever satisfy its sweep.
+        workers[i].report_epoch = 0;
     }
     return 0;
 }
@@ -384,6 +404,25 @@ void SimDeviceRunnerBase::free_tensor(void *dev_ptr) {
     if (dev_ptr != nullptr) {
         mem_alloc_.free(dev_ptr);
     }
+}
+
+void *SimDeviceRunnerBase::acquire_child_memory_host_view(void *dev_ptr, size_t bytes) {
+    if (dev_ptr == nullptr || bytes == 0) return nullptr;
+    void *alloc_base = nullptr;
+    size_t alloc_size = 0;
+    if (!mem_alloc_.owning_allocation(dev_ptr, &alloc_base, &alloc_size)) {
+        LOG_ERROR("acquire_child_memory_host_view: %p is not inside a tracked device allocation", dev_ptr);
+        return nullptr;
+    }
+    const auto *end = static_cast<const unsigned char *>(dev_ptr) + bytes;
+    if (end > static_cast<const unsigned char *>(alloc_base) + alloc_size) {
+        LOG_ERROR(
+            "acquire_child_memory_host_view: [%p, +%zu) overruns its allocation [%p, +%zu)", dev_ptr, bytes, alloc_base,
+            alloc_size
+        );
+        return nullptr;
+    }
+    return dev_ptr;
 }
 
 int SimDeviceRunnerBase::copy_to_device(void *dev_ptr, const void *host_ptr, size_t bytes) {
@@ -495,6 +534,40 @@ int SimDeviceRunnerBase::acquire_sm_mirror(uint32_t pipeline_slot, size_t bytes,
     const uintptr_t raw = reinterpret_cast<uintptr_t>(mirror.storage.get());
     *addr_out = reinterpret_cast<void *>((raw + alignment - 1) & ~static_cast<uintptr_t>(alignment - 1));
     return 0;
+}
+
+int SimDeviceRunnerBase::acquire_run_image_staging(
+    uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out
+) {
+    if (addr_out == nullptr) return -1;
+    *addr_out = nullptr;
+    if (pipeline_slot >= run_image_stagings_.size() || bytes == 0 || alignment == 0 ||
+        (alignment & (alignment - 1)) != 0 || bytes > SIZE_MAX - (alignment - 1)) {
+        return -1;
+    }
+    RetainedSmMirror &staging = run_image_stagings_[pipeline_slot];
+    // Grow-only, like the mirror: an image's size follows the graph a run builds,
+    // so a repeated workload writes host pages that are already mapped.
+    const size_t needed = bytes + alignment - 1;
+    if (staging.capacity < needed) {
+        // `new[]` default-initializes a trivially-typed array, so the block costs
+        // no page until the bind writes one. The outgoing block's bytes are not
+        // carried over: a publication ships what its own bind assembled.
+        std::unique_ptr<std::byte[]> storage(new (std::nothrow) std::byte[needed]);
+        if (storage == nullptr) return -1;
+        staging.storage = std::move(storage);
+        staging.capacity = needed;
+    }
+    const uintptr_t raw = reinterpret_cast<uintptr_t>(staging.storage.get());
+    *addr_out = reinterpret_cast<void *>((raw + alignment - 1) & ~static_cast<uintptr_t>(alignment - 1));
+    return 0;
+}
+
+void SimDeviceRunnerBase::release_run_image_stagings() {
+    for (RetainedSmMirror &staging : run_image_stagings_) {
+        staging.storage.reset();
+        staging.capacity = 0;
+    }
 }
 
 void SimDeviceRunnerBase::release_sm_mirrors() {
@@ -757,158 +830,141 @@ extern "C" __attribute__((weak)) int prewarm_config_impl(
 
 void SimDeviceRunnerBase::apply_call_config(const CallConfig &config) {
     set_chip_swimlane_enabled(config.enable_chip_swimlane);
-    set_dump_args_enabled(config.enable_dump_args);
-    set_pmu_enabled(config.enable_pmu);
-    // a2a3 and a5 override set_dep_gen_enabled; an arch without dep_gen no-ops.
-    set_dep_gen_enabled(config.enable_dep_gen != 0);
-    set_scope_stats_enabled(config.enable_scope_stats != 0);
-    capture_clock_anchors_ = config.capture_clock_anchors != 0;
     set_output_prefix(config.output_prefix);
 }
 
-HostPhaseRecordPool *SimDeviceRunnerBase::host_phase_pool_arm(bool producer_wants_records) noexcept {
-    if (clock_correlation_provider_ != nullptr) {
-        clock_correlation_provider_->release(false);
-        clock_correlation_provider_.reset();
-    }
-    const bool swimlane_wants_records = chip_swimlane_level_ == ChipSwimlaneLevel::ORCH_PHASES;
-    const bool artifact_wants_records = producer_wants_records && !output_prefix_.empty();
-    chip_swimlane_collector_.set_host_orchestrated(swimlane_wants_records);
+void SimDeviceRunnerBase::begin_host_phase_run(uint32_t pipeline_slot, const DfxRunConfig &dfx) {
+    if (pipeline_slot >= host_phase_runs_.size()) return;
+    host_phase_runs_[pipeline_slot].begin(dfx);
+}
+
+HostPhaseRecordPool *
+SimDeviceRunnerBase::host_phase_pool_arm(uint32_t pipeline_slot, bool producer_wants_records) noexcept {
+    if (pipeline_slot >= host_phase_runs_.size()) return nullptr;
+    HostPhaseRunState &run = host_phase_runs_[pipeline_slot];
+    run.host_orchestrated = run.chip_swimlane_level == ChipSwimlaneLevel::ORCH_PHASES;
     // arm() allocates the pool's buffers, so it can throw; this path is noexcept,
     // where an escaping exception is std::terminate. A pass that cannot get its
     // storage collects no records and says so by handing back nullptr.
     HostPhaseRecordPool *pool = nullptr;
     try {
-        pool = host_phase_records_.arm(artifact_wants_records || swimlane_wants_records);
+        pool = run.records.arm(run.wants_records(producer_wants_records));
     } catch (...) {
         LOG_WARN("Host phase pool could not be armed; this pass collects no per-event records");
     }
-    if (!swimlane_wants_records) return pool;
+    if (!run.host_orchestrated) return pool;
 
-    begin_clock_correlation_session_if_needed();
     return pool;
 }
 
-void SimDeviceRunnerBase::begin_clock_correlation_session_if_needed() noexcept {
-    if (chip_swimlane_level_ != ChipSwimlaneLevel::ORCH_PHASES || chip_swimlane_collector_.clock_correlation_active()) {
-        return;
-    }
-    try {
-        clock_correlation_provider_ = simpler::dfx::make_clock_correlation_provider();
-        chip_swimlane_collector_.begin_clock_correlation_session(
-            clock_correlation_provider_->name(), clock_correlation_provider_->raw_device_timestamp_unit()
-        );
-        chip_swimlane_collector_.record_clock_anchor_samples(
-            simpler::dfx::capture_clock_anchor_group(
-                *clock_correlation_provider_, simpler::dfx::ClockAnchorPosition::HostOrchestrationBegin
-            )
-        );
-    } catch (...) {
-        clock_correlation_provider_.reset();
-        try {
-            chip_swimlane_collector_.begin_clock_correlation_session("unavailable", "unknown");
-        } catch (...) {
-            // begin() stores diagnostic strings and can still fail under
-            // allocation pressure. Keep this noexcept path fail-closed.
-            chip_swimlane_collector_.finish_clock_correlation_session();
-        }
-    }
+void SimDeviceRunnerBase::publish_host_phase_run_to_collector(uint32_t pipeline_slot) noexcept {
+    if (pipeline_slot >= host_phase_runs_.size()) return;
+    const HostPhaseRunState &run = host_phase_runs_[pipeline_slot];
+    chip_swimlane_collector_.set_host_orchestrated(run.host_orchestrated);
 }
 
-void SimDeviceRunnerBase::publish_host_phase_records_to_swimlane() {
-    if (!host_phase_records_.finished()) return;
+void SimDeviceRunnerBase::publish_host_phase_records_to_swimlane(uint32_t pipeline_slot) {
+    if (pipeline_slot >= host_phase_runs_.size()) return;
+    const simpler::dfx::HostPhaseRecordStore &records = host_phase_runs_[pipeline_slot].records;
+    if (!records.finished()) return;
     chip_swimlane_collector_.set_host_phase_records(
-        host_phase_records_.submit_records(), host_phase_records_.device_upload_records(),
-        host_phase_records_.submitted_tasks(), host_phase_records_.total_records(),
-        host_phase_records_.dropped_records()
+        records.submit_records(), records.device_upload_records(), records.submitted_tasks(), records.total_records(),
+        records.dropped_records()
     );
 }
 
-void SimDeviceRunnerBase::start_shared_collectors_for_run() {
+void SimDeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &dfx) {
+    // Opening a resident collector's window drops the previous run's records and
+    // republishes the device level, so it belongs with the start, at launch.
     auto thread_factory = [this](std::function<void()> fn) {
         return create_thread(std::move(fn));
     };
-    if (enable_chip_swimlane_) {
-        if (capture_clock_anchors_) begin_clock_correlation_session_if_needed();
+    if (dfx.chip_swimlane_enabled()) {
+        chip_swimlane_collector_.begin_run(dfx.output_prefix, dfx.chip_swimlane_level);
         chip_swimlane_collector_.start(thread_factory);
     }
-    if (enable_dump_args_) {
+    if (dfx.dump_args_enabled()) {
+        dump_collector_.begin_run(dfx.output_prefix, dfx.dump_args_level);
         dump_collector_.start(thread_factory);
     }
-    if (enable_pmu_) {
+    if (dfx.pmu_enabled) {
+        pmu_collector_.begin_run(make_pmu_csv_path(dfx.output_prefix), dfx.pmu_event_type);
         pmu_collector_.start(thread_factory);
     }
-    if (enable_scope_stats_) {
+    if (dfx.scope_stats_enabled) {
+        scope_stats_collector_.begin_run();
         scope_stats_collector_.start(thread_factory);
     }
 }
 
-void SimDeviceRunnerBase::write_host_phase_records_artifact() {
+// The retained bank is indexed by the run's pipeline slot directly, not by a
+// slot-derived modulus: the slot space and the bank array are the same size, so
+// a slot outside the array is a contract break to report rather than to fold.
+static_assert(
+    PLATFORM_RUN_TERMINAL_BANKS == PTO_PIPELINE_MAX_DEPTH,
+    "swimlane terminal banks must cover exactly the pipeline's retained runs"
+);
+
+uint64_t SimDeviceRunnerBase::arm_chip_swimlane_run_terminal_bank(uint32_t pipeline_slot, uint64_t run_epoch) {
+    // Zero means "publish no snapshot". Every path that cannot resolve a bank —
+    // swimlane off, collector not initialized, slot out of range, no run identity
+    // — returns it rather than letting the device derive an address.
+    return reinterpret_cast<uint64_t>(chip_swimlane_collector_.arm_run_terminal_bank(pipeline_slot, run_epoch));
+}
+
+void SimDeviceRunnerBase::write_host_phase_records_artifact(const std::string &output_prefix, uint32_t pipeline_slot) {
+    if (pipeline_slot >= host_phase_runs_.size()) return;
+    simpler::dfx::HostPhaseRecordStore &records = host_phase_runs_[pipeline_slot].records;
     // Every phase this records is produced on the host during bind and the store
     // is finished before launch, so it touches no device state and is callable
-    // from any point after bind — including a path that never launched.
-    // `output_prefix_` is non-empty exactly when this run produces diagnostic
-    // artifacts, and the store writes a pass at most once.
-    if (!output_prefix_.empty() && host_phase_records_.finished()) {
-        (void)host_phase_records_.write_records_jsonl(make_host_phase_records_path(output_prefix_));
+    // from any point after bind — including a path that never launched. The run's
+    // output prefix is non-empty exactly when it produces diagnostic artifacts,
+    // and the store writes a pass at most once.
+    if (!output_prefix.empty() && records.finished()) {
+        (void)records.write_records_jsonl(make_host_phase_records_path(output_prefix));
     }
 }
 
-void SimDeviceRunnerBase::teardown_shared_collectors_after_run(bool device_execution_complete) {
-    // The order is fixed by three couplings, not by preference: the clock
-    // correlation session closes before the swimlane export reads it, the host
-    // phase records reach the collector before that same export serializes them,
+void SimDeviceRunnerBase::teardown_shared_collectors_after_run(
+    const DfxRunConfig &dfx, uint32_t pipeline_slot, uint64_t run_epoch, bool device_execution_complete
+) {
+    // The order is fixed by two couplings, not by preference: the host phase
+    // records reach the collector before the swimlane export serializes them,
     // and each collector drains before it reconciles before it exports.
-    // Diagnostic exports use the per-task `output_prefix_` directory the user set
-    // on CallConfig (CallConfig::validate() enforces non-empty upstream).
-    finish_clock_correlation_session(device_execution_complete);
-    if (enable_chip_swimlane_) {
+    // Diagnostic exports use the per-task output prefix the user set on
+    // CallConfig (CallConfig::validate() enforces non-empty upstream).
+    if (dfx.chip_swimlane_enabled()) {
         chip_swimlane_collector_.quiesce();
         chip_swimlane_collector_.read_phase_header_metadata();
         chip_swimlane_collector_.reconcile_counters();
-        publish_host_phase_records_to_swimlane();
+        // Only on the completion path; see the onboard base for why an
+        // incomplete run's bank says nothing about that run.
+        if (device_execution_complete) {
+            chip_swimlane_collector_.report_run_terminal_snapshot(pipeline_slot, run_epoch);
+        }
+        publish_host_phase_records_to_swimlane(pipeline_slot);
         publish_chip_swimlane_runtime_extensions();
         chip_swimlane_collector_.export_swimlane_json();
     }
 
-    write_host_phase_records_artifact();
+    write_host_phase_records_artifact(dfx.output_prefix, pipeline_slot);
 
-    if (enable_dump_args_) {
+    if (dfx.dump_args_enabled()) {
         dump_collector_.quiesce();
         dump_collector_.reconcile_counters();
         dump_collector_.export_dump_files();
     }
 
-    if (enable_pmu_) {
+    if (dfx.pmu_enabled) {
         pmu_collector_.quiesce();
         pmu_collector_.reconcile_counters();
     }
 
-    if (enable_scope_stats_) {
+    if (dfx.scope_stats_enabled) {
         scope_stats_collector_.quiesce();
         scope_stats_collector_.reconcile_counters();
-        scope_stats_collector_.write_jsonl(output_prefix_);
+        scope_stats_collector_.write_jsonl(dfx.output_prefix);
     }
-}
-
-void SimDeviceRunnerBase::finish_clock_correlation_session(bool capture_device_complete) noexcept {
-    if (!chip_swimlane_collector_.clock_correlation_active()) {
-        if (clock_correlation_provider_ != nullptr) clock_correlation_provider_->release(false);
-        clock_correlation_provider_.reset();
-        return;
-    }
-    if (capture_device_complete && clock_correlation_provider_ != nullptr) {
-        try {
-            chip_swimlane_collector_.record_clock_anchor_samples(
-                simpler::dfx::capture_clock_anchor_group(
-                    *clock_correlation_provider_, simpler::dfx::ClockAnchorPosition::DeviceExecutionComplete
-                )
-            );
-        } catch (...) {}
-    }
-    chip_swimlane_collector_.finish_clock_correlation_session();
-    if (clock_correlation_provider_ != nullptr) clock_correlation_provider_->release(false);
-    clock_correlation_provider_.reset();
 }
 
 uint64_t SimDeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *callable) {

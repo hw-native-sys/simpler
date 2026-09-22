@@ -26,9 +26,13 @@ Usage:
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import ctypes
+import os
+import shutil
 import sys
+import tempfile
 import threading
 import uuid
 import weakref
@@ -46,16 +50,21 @@ if TYPE_CHECKING:
 
 import _task_interface as _ti_module  # pyright: ignore[reportMissingImports]
 from _task_interface import (  # pyright: ignore[reportMissingImports]
+    MAILBOX_ARGS_CAPACITY,
     MAILBOX_ERROR_MSG_SIZE,
     MAILBOX_FRAME_SIZE,
     MAILBOX_OFF_ERROR_MSG,
+    MAILBOX_OFF_TEARDOWN_REPORT,
     MAILBOX_PREPARATION_DISPOSITION_VALUES,
     MAILBOX_SIZE,
     MAILBOX_STATE_VALUES,
+    MAILBOX_TASK_PROTOCOL_VERSION,
     MAX_REGISTERED_CALLABLE_IDS,
     MAX_TENSOR_DIMS,
     PROV_DESCRIPTOR_MISMATCH,
     PROV_NOT_LIVE,
+    SIMPLER_TEARDOWN_REPORT_BYTES,
+    TEARDOWN_REPORT_SCHEMA,
     ArgDirection,
     CallConfig,
     ChipCallable,
@@ -97,7 +106,13 @@ from _task_interface import (
     _initialize_host_log as _native_initialize_host_log,
 )
 from _task_interface import (
+    _set_host_log_directory as _native_set_host_log_directory,
+)
+from _task_interface import (
     _start_host_log_writer as _native_start_host_log_writer,
+)
+from _task_interface import (
+    scalar_to_uint64 as _native_scalar_to_uint64,
 )
 
 from .buffer import Buffer, Tensor
@@ -206,6 +221,11 @@ __all__ = [
     "MAILBOX_ERROR_MSG_SIZE",
     "MAILBOX_STATE_VALUES",
     "MAILBOX_PREPARATION_DISPOSITION_VALUES",
+    "MAILBOX_ARGS_CAPACITY",
+    "MAILBOX_OFF_TEARDOWN_REPORT",
+    "MAILBOX_TASK_PROTOCOL_VERSION",
+    "SIMPLER_TEARDOWN_REPORT_BYTES",
+    "TEARDOWN_REPORT_SCHEMA",
     "read_args_from_blob",
     # Dynamic CommDomain allocation (orch-only API)
     "CommBufferSpec",
@@ -957,26 +977,46 @@ assert ctypes.sizeof(_CommContextStruct) == 1056
 def scalar_to_uint64(value) -> int:
     """Convert a scalar value to ``uint64``.
 
-    *value* can be a Python int, float, a ctypes scalar (``c_int64``,
-    ``c_float``, etc.), or any object convertible to ``int``.
+    *value* can be a Python int, float, bool, a numpy integer scalar, an
+    ``IntEnum`` member, or a ctypes scalar.
 
-    Python float values are converted to IEEE 754 single precision (32-bit)
-    and their bit pattern is zero-extended to uint64. This may cause a loss of
-    precision. For double precision, use ``ctypes.c_double``.
+    The accepted ctypes types are the integer widths (``c_int8`` ..
+    ``c_uint64``), ``c_float``, ``c_double`` and ``c_bool``, and any subclass
+    of one of them. A pointer or character type (``c_void_p``, ``c_char_p``,
+    ``c_char``, ``c_wchar``) is refused: its buffer holds an address or a
+    character rather than a number a slot can carry.
+
+    A byte-order-qualified variant (``c_uint32.__ctype_be__`` on a
+    little-endian host, and its ``__ctype_le__`` counterpart on a big-endian
+    one) is also refused. Its bytes are stored in the opposite order, so
+    copying them would encode a different number than the same value written
+    from orchestration, and ``to_u64`` has no reversed-order form to agree
+    with.
+
+    The encoding matches C++ ``to_u64()`` bit for bit, so a slot written from
+    Python and one written from orchestration read back identically.
+
+    A ctypes scalar is read at its own width and **zero-extended**, never
+    sign-extended: ``c_int8(-1)`` is ``0xFF``, matching ``to_u64(int8_t{-1})``.
+    Reading it back with the matching width (``scalar<int8_t>``) still yields
+    ``-1``.
+
+    Python float values (and ``numpy.float64``, which is itself a ``float``
+    subclass) are converted to IEEE 754 single precision (32-bit) and their
+    bit pattern is zero-extended to uint64. This may cause a loss of
+    precision. A finite value outside single-precision range (``1e100``)
+    raises rather than being stored as an infinity; ``inf`` and ``nan`` pass
+    through as themselves. For double precision, use ``ctypes.c_double`` -- a
+    bare Python float carries no width, so this is the one encoding that
+    cannot align with its C++ counterpart, where ``to_u64(1.5)`` is a double.
+    A narrower numpy float (e.g. ``numpy.float32``) is rejected rather than
+    silently coerced through ``int()`` -- wrap it in ``float(...)`` first if
+    that narrowing is what you want.
+
+    An integer outside the 64-bit two's-complement range raises rather than
+    truncating to its low 64 bits.
     """
-    import struct as _struct
-
-    if isinstance(value, float):
-        bits = _struct.unpack("<I", _struct.pack("<f", value))[0]
-        return bits
-    import ctypes as _ct
-
-    if isinstance(value, _ct._SimpleCData):
-        if isinstance(value, (_ct.c_float, _ct.c_double)):
-            uint_type = _ct.c_uint32 if isinstance(value, _ct.c_float) else _ct.c_uint64
-            return uint_type.from_buffer_copy(value).value
-        return int(value.value) & 0xFFFFFFFFFFFFFFFF
-    return int(value) & 0xFFFFFFFFFFFFFFFF
+    return _native_scalar_to_uint64(value)
 
 
 @dataclass
@@ -1269,6 +1309,38 @@ class GlobalCommDomainView:
         return self._committed
 
 
+_HOST_LOG_SESSION_OWNER_PID = os.getpid()
+_HOST_LOG_SESSION_DIRECTORY = Path(tempfile.gettempdir()) / (
+    f"simpler-host-logs-{_HOST_LOG_SESSION_OWNER_PID}-{uuid.uuid4().hex}"
+)
+
+
+def _bind_host_log_session_directory() -> str:
+    """Bind the process tree to one log directory that outlives every capture."""
+    bound = _native_host_log_directory()
+    if bound:
+        return str(bound)
+    _HOST_LOG_SESSION_DIRECTORY.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _native_set_host_log_directory(str(_HOST_LOG_SESSION_DIRECTORY))
+    bound = _native_host_log_directory()
+    if not bound:
+        raise RuntimeError(f"cannot bind simpler Host log directory {_HOST_LOG_SESSION_DIRECTORY}")
+    return str(bound)
+
+
+def _cleanup_host_log_session_directory() -> None:
+    """Remove the transient spool at normal owner-process exit."""
+    if os.getpid() != _HOST_LOG_SESSION_OWNER_PID:
+        return
+    with contextlib.suppress(BaseException):
+        _native_flush_host_log(1000)
+    with contextlib.suppress(OSError):
+        shutil.rmtree(_HOST_LOG_SESSION_DIRECTORY)
+
+
+atexit.register(_cleanup_host_log_session_directory)
+
+
 def _initialize_host_log(log_level: int | None = None, *, defer_writer: bool = False) -> None:
     """Seed host-log state, optionally leaving its writer stopped for local forks.
 
@@ -1457,12 +1529,17 @@ class ChipWorker:
                 raise RuntimeError("ChipWorker.finalize() cannot run while ChipWorker.init() is in progress")
         try:
             self._impl.finalize()
-        finally:
+        except BaseException:
+            # The registries name what the native side still holds. A teardown
+            # that did not complete leaves those resources alive, so dropping
+            # the registries would hide them from a retry and from the caller.
             _flush_host_log_or_warn("ChipWorker.finalize()")
-            with self._registry_lock:
-                self._callable_registry.clear()
-                self._identity_registry.clear()
-                self._live_handles.clear()
+            raise
+        _flush_host_log_or_warn("ChipWorker.finalize()")
+        with self._registry_lock:
+            self._callable_registry.clear()
+            self._identity_registry.clear()
+            self._live_handles.clear()
 
     def _allocate_slot_locked(self) -> int:
         for slot_id in range(MAX_REGISTERED_CALLABLE_IDS):
@@ -1620,6 +1697,8 @@ class ChipWorker:
             config = CallConfig()
         for k, v in kwargs.items():
             setattr(config, k, v)
+        if config.output_prefix:
+            _bind_host_log_session_directory()
         # Returns None; per-stage timing is emitted as `[STRACE]` log markers.
         self._impl.run(int(callable_id), args, config)
 
@@ -1628,6 +1707,8 @@ class ChipWorker:
             config = CallConfig()
         for k, v in kwargs.items():
             setattr(config, k, v)
+        if config.output_prefix:
+            _bind_host_log_session_directory()
         self._impl._run_with_pipeline_lease(int(callable_id), args, config, int(slot_id), int(generation))
 
     def _prepare_native_run_with_pipeline_lease(self, callable_id, args, slot_id, generation, config=None, **kwargs):
@@ -1643,6 +1724,8 @@ class ChipWorker:
             config = CallConfig()
         for k, v in kwargs.items():
             setattr(config, k, v)
+        if config.output_prefix:
+            _bind_host_log_session_directory()
         return self._impl._prepare_native_run_with_pipeline_lease(
             int(callable_id), args, config, int(slot_id), int(generation)
         )
@@ -1658,6 +1741,30 @@ class ChipWorker:
 
     def _finalize_native_run(self, run):
         self._impl._finalize_native_run(run)
+
+    def _probe_run_retention(
+        self,
+        run,
+        successor,
+        launch_successor=True,
+        boundary_timeout_ms=0,
+        successor_start_timeout_ms=0,
+        use_retained_sync=False,
+    ):
+        """Run #2267's late-read retention fixture; see run_retention_probe.h.
+
+        ``run`` must be launched and undrained, ``successor`` prepared on
+        another slot. Both are left finalizable and the caller still owes
+        ``_finalize_native_run`` for each. Onboard only.
+        """
+        return self._impl._probe_run_retention(
+            run,
+            successor,
+            bool(launch_successor),
+            int(boundary_timeout_ms),
+            int(successor_start_timeout_ms),
+            bool(use_retained_sync),
+        )
 
     def _unregister_slot(self, callable_id):
         self._impl.unregister_callable(int(callable_id))
@@ -1680,6 +1787,40 @@ class ChipWorker:
     @property
     def pipeline_depth(self):
         return self._impl.pipeline_depth
+
+    @property
+    def launch_depth(self):
+        """How many runs this worker may have launched at once, after its request was resolved."""
+        return self._impl.launch_depth
+
+    def configure_launch_depth(self, depth):
+        """Ask, before init, for a launch depth.
+
+        Depth 1 is the serial path: nothing is ordered behind anything, and no run constructs the
+        boundary that would let it be.
+
+        Rejected rather than coerced: ``int(1.9)`` is 1 and ``int(True)`` is 1, so coercion would
+        silently pick a device-work capacity the caller did not ask for. ``bool`` is an ``int``
+        subclass, hence the exact type test.
+        """
+        if type(depth) is not int:
+            raise TypeError(f"launch_depth must be an int, got {type(depth).__name__}")
+        if depth < 1:
+            raise ValueError(f"launch_depth must be >= 1, got {depth}")
+        self._impl.configure_launch_depth(depth)
+
+    @property
+    def supports_joined_native_launch(self):
+        """Whether one run's native submission may be ordered behind another's right now."""
+        return bool(self._impl.supports_joined_native_launch)
+
+    def set_exported_device_regions_live(self, live):
+        """Declare whether this worker's host side still owns exported device regions.
+
+        While it does, no run is ordered behind another: those regions are released before the
+        child's device reset.
+        """
+        self._impl.set_exported_device_regions_live(bool(live))
 
     @property
     def runtime_slot_count(self):

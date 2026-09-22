@@ -4,8 +4,8 @@
 **Verdict**: adopted at seven Definitions, once #1929 removed the single recording slot the first measurement failed against — the win is smaller than the orchestration window alone suggests, because seven Definitions are seven images to upload
 
 > **Names in this entry are the ones in use at the time.** A task inside a Graph
-> body was a "node" and the record phase was `record_node`; they are now an
-> in-graph task and `record_in_graph_task`. `strace_timing.py` still accepts the
+> body was a "node" and the record phase was `record_node`; they are now a
+> sub-task and `record_sub_task`. `strace_timing.py` still accepts the
 > old phase name, so logs from this investigation remain readable.
 
 ## Question

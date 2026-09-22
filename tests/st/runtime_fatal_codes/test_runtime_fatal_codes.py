@@ -23,7 +23,7 @@ Two host behaviours are exercised, because they genuinely differ:
   wins the race and masks the real code with a generic CANN ``507xxx``; the
   device-classified info (orchestrator code, the #1180 ``sub_class`` for the
   scheduler stall, or the async ``sched_error_code``) still reaches the host via
-  the ``validate_runtime_impl`` log line. That race is the exact scenario #1180
+  the ``copy_back_run_outputs_impl`` log line. That race is the exact scenario #1180
   exists for and only hardware reproduces it; the onboard test therefore asserts
   on the host log rather than the masked exception code.
 """
@@ -84,7 +84,7 @@ def _wait_for_host_log(capfd, markers: tuple[str, ...], dropped_before: int, tim
 #   code       : runtime status the host reports in sim (orch_error_code or sched_error_code)
 #   runtime_env: CallConfig.runtime_env overrides that pin the offending resource small
 #   kernel     : AIV kernel (rel to kernels/) for the async cases, else None
-#   marker     : substring of the validate_runtime_impl host-log line proving the
+#   marker     : substring of the copy_back_run_outputs_impl host-log line proving the
 #                device error class reached the host (the assertion that holds on
 #                both sim and onboard, even when onboard masks the code as 507xxx)
 #   explain    : SIMPLER_ERROR_* name the "error detail:" annotation line must carry, so
@@ -164,11 +164,11 @@ CASES = {
         kernel="aic/kernel_hang.cpp",
         kernel_core="aic",
         onboard_only=True,  # a while(true) kernel would hang the simulator
-        # The data-wait timeout is 15 s on both arches now that it is frequency-
-        # scaled (TENSOR_DATA_TIMEOUT_MS, #1189) -- before that it was 15 s on
-        # a5 but 300 s on a2a3, so this case used to be a5-only. Raise every other
-        # watchdog above 15 s so the tensor-data wait wins the race and latches
-        # code 8 before they reap the hung core.
+        # The onboard data-wait timeout is 15 s on both arches now that it is
+        # frequency-scaled (#1189) -- before that it was 15 s on a5 but 300 s on
+        # a2a3, so this case used to be a5-only. Raise every other watchdog above
+        # 15 s so the tensor-data wait wins the race and latches code 8 before
+        # they reap the hung core.
         env={
             "SIMPLER_SCHEDULER_TIMEOUT_MS": 30000,
             "SIMPLER_OP_EXECUTE_TIMEOUT_US": 30000000,
@@ -362,7 +362,8 @@ def test_fatal_code_surfaces_on_sim(st_platform, st_device_ids, case_name, monke
 @pytest.mark.parametrize("case_name", list(CASES))
 def test_device_error_class_reaches_host_log(st_platform, st_device_ids, case_name, monkeypatch, capfd):
     """onboard: the watchdog may mask the code as 507xxx, but the device class still reaches the host log."""
-    configure_logging("error")
+    # warning, not error: the run-result fallback asserted below is a LOG_WARN.
+    configure_logging("warning")
     case = CASES[case_name]
     dropped_before = _host_log_dropped_records()
     worker, handle, config = _make_worker(st_platform, int(st_device_ids[0]), case_name, monkeypatch)
@@ -378,5 +379,53 @@ def test_device_error_class_reaches_host_log(st_platform, st_device_ids, case_na
             dropped_before,
         )
         _assert_annotated(log, case)
+        # The detail must come from the result the run's own device side
+        # published, not from the shared header a successor may already have
+        # reset. The runtime warns whenever it falls back to that header, and
+        # that warning is a real discriminator: disabling the device-side
+        # publish makes it fire on every case here.
+        assert "read from the shared header" not in log, (
+            "the failure detail came from the shared header, so this run published no result"
+        )
     finally:
         worker.close()
+
+
+# The orchestrator fatals before any task completes, so this case leaves the
+# swimlane collector empty and only the two collectors asserted below hold
+# anything. That is deliberate: the point is the teardown, not the volume.
+_DFX_ON_FAILURE_CASE = "scope_deadlock"
+
+
+@pytest.mark.platforms(["a5sim", "a2a3sim", "a2a3"])
+@pytest.mark.device_count(1)
+@pytest.mark.runtime(RUNTIME)
+def test_failed_run_exports_its_diagnostics(st_platform, st_device_ids, monkeypatch, tmp_path):
+    """A run that fails still exports the collectors it armed."""
+    configure_logging("error")
+    worker, handle, config = _make_worker(st_platform, int(st_device_ids[0]), _DFX_ON_FAILURE_CASE, monkeypatch)
+    out = tmp_path / "fatal_dfx"
+    config.output_prefix = str(out)
+    # chip_swimlane is enabled but not asserted: it exports nothing when a run
+    # holds no task records, so its artifact cannot witness the teardown. It is
+    # on so the failure path drives its export too.
+    config.enable_chip_swimlane = 1
+    config.enable_scope_stats = True
+    config.enable_dep_gen = True
+    try:
+        with pytest.raises(RuntimeError):
+            worker.run(handle, None, config)
+    finally:
+        worker.close()
+
+    produced = sorted(str(p.relative_to(out)) for p in out.rglob("*")) if out.is_dir() else []
+    # scope_stats writes whenever its collector initialized, so it carries no
+    # record-count precondition, and it is written last in the teardown: its
+    # absence means the teardown did not run, or did not run to the end.
+    assert (out / "scope_stats" / "scope_stats.jsonl").is_file(), (
+        f"the failed run exported no scope_stats; {out} holds {produced}"
+    )
+    # The dep_gen emit follows the teardown and has its own completeness gate,
+    # so it needs its own assertion. The device flushes its dep_gen buffers
+    # during emergency shutdown, which is what lets the gate pass here.
+    assert (out / "deps.json").is_file(), f"the failed run emitted no deps.json; {out} holds {produced}"

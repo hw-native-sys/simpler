@@ -22,12 +22,15 @@ that variant exercises the per-task dedup branch in
 ``compute_dag_stats_from_deps`` which this AIV-only workload doesn't.
 """
 
+import json
 import time
+from pathlib import Path
 
 import torch
 from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
+from simpler_setup.scene_test import build_output_prefix
 
 from ._swimlane_validate import validate_perf_artifact
 
@@ -110,6 +113,38 @@ class TestChipSwimlane(SceneTestCase):
             validate_perf_artifact(
                 f"TestChipSwimlane_{case['name']}", since=run_marker, expected_task_count=_EXPECTED_TASK_COUNT
             )
+
+
+@scene_test(level=2, runtime="tensormap_and_ringbuffer")
+class TestDeviceOrchestrationClockCapture(TestChipSwimlane):
+    """Clock captures and disabled runs alternate on the same worker."""
+
+    _swimlane_level = 4
+    _clock_capture_paths: tuple[Path, ...] = ()
+
+    def test_run(self, st_platform, st_worker, request):
+        for level in (4, 0, 4, 0):
+            self._swimlane_level = level
+            self._clock_capture_paths = ()
+            SceneTestCase.test_run(self, st_platform, st_worker, request)
+            # Artifact checks cover every case even when golden comparison is disabled.
+            for path in self._clock_capture_paths:
+                assert path.is_file(), f"missing device orchestration capture: {path}"
+                records = json.loads(path.read_text())
+                assert any(records.get("aicpu_orchestrator_phases", [])), "AICPU orchestration records missing"
+                assert "orchestrator_source" not in records["metadata"]
+
+    def _build_config(self, config_dict, *args, **kwargs):
+        config = super()._build_config(config_dict, *args, **kwargs)
+        config.enable_chip_swimlane = self._swimlane_level
+        if not config.output_prefix:
+            config.output_prefix = str(build_output_prefix(f"{type(self).__name__}_{time.monotonic_ns()}"))
+        if self._swimlane_level:
+            path = Path(config.output_prefix) / "chip_swimlane_records.json"
+            # CLI-generated prefixes can repeat for the same case within one second.
+            path.unlink(missing_ok=True)
+            self._clock_capture_paths += (path,)
+        return config
 
 
 if __name__ == "__main__":

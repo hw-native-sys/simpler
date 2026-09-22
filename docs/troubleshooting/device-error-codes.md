@@ -33,7 +33,7 @@ The `host_build_graph` runtime runs orchestration on the host, transfers the
 prepared image to the AICPU, and runs scheduling there. The
 `tensormap_and_ringbuffer` runtime runs both orchestration and scheduling on the
 AICPU. On a fatal condition the runtime **latches** a code, which the host reads
-back in `validate_runtime_impl` to print the lines above. Where it is latched
+back in `copy_back_run_outputs_impl` to print the lines above. Where it is latched
 follows where the reporter runs: a scheduler code goes into the shared-memory
 header, and so does an orchestrator code under `tensormap_and_ringbuffer`, whose
 orchestrator is on the AICPU. `host_build_graph`'s orchestrator is host-side, so
@@ -215,7 +215,7 @@ enforces coverage. Edit those and the log carries the new code correctly:
 | runtime code names / descriptions / hints | `src/common/runtime_status/error_names.h` |
 | host-side CANN names / descriptions / hints | `src/common/platform/include/host/acl_error_names.h` |
 | `SCHEDULER_TIMEOUT` sub-class labels | `src/common/host_build_graph/runtime_status.h`, `src/{arch}/runtime/tensormap_and_ringbuffer/common/runtime_status.h` |
-| completeness test | `tests/ut/cpp/common/test_error_code_names.cpp` |
+| completeness test | `tests/ut/cpp/common/runtime_status/test_error_code_names.cpp` |
 
 **This page does not need updating for a new code** — deliberately. The tables
 above carry only the triage column and the CANN names, neither of which the log
@@ -226,7 +226,7 @@ time, so there is nothing to drift out of sync.
 
 - Code definitions: `src/common/host_build_graph/runtime_status.h`,
   `src/{arch}/runtime/tensormap_and_ringbuffer/common/runtime_status.h`
-- Host print site: `.../host/runtime_maker.cpp` (`validate_runtime_impl`)
+- Host print site: `.../host/runtime_maker.cpp` (`copy_back_run_outputs_impl`)
 - Sub-class logic: `.../runtime/scheduler/scheduler_cold_path.cpp` (`classify_stall_reason`)
 - End-to-end negative tests: `tests/st/runtime_fatal_codes/`
 - Onboard `507018` mechanism triage + device logs: [`running-onboard.md`](../../.claude/rules/running-onboard.md)

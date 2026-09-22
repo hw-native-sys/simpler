@@ -33,7 +33,6 @@ Runtime::Runtime() {
     memset(dev.workers, 0, sizeof(dev.workers));
     dev.worker_count = 0;
     dev.aicpu_thread_num = 1;
-    dev.ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
     memset(dev.aicpu_allowed_cpus, 0, sizeof(dev.aicpu_allowed_cpus));
     dev.aicpu_allowed_cpu_count = 0;
     dev.aicpu_launch_count = 0;
@@ -99,5 +98,16 @@ void Runtime::clear_function_bin_addrs() {
 }
 
 // trb's device image is just the `dev` descriptor (the rest of Runtime is
-// host-only). Mirrors the host_build_graph definition (= sizeof(Runtime)).
-size_t runtime_device_copy_size(const Runtime &) { return sizeof(DeviceRuntimeLaunchDesc); }
+// host-only). A steady-state run re-publishes it up to the handshake region:
+// the AICore writes its report there and the AICPU the task pointer it answers
+// with, so no host value is consumed. A5 has no post-close gate array, so the
+// initialized prefix and the device extent coincide; all three entry points
+// exist so the shared host paths need no per-runtime branch.
+size_t runtime_device_copy_size(const Runtime &) { return offsetof(DeviceRuntimeLaunchDesc, workers); }
+
+// The first publication onto an allocation adds the handshake region, so it
+// starts from the ctor-zeroed host copy rather than from whatever rtMalloc
+// left. This runtime has no host-uninitialized tail, so that reaches the end.
+size_t runtime_device_initialized_prefix_size(const Runtime &) { return sizeof(DeviceRuntimeLaunchDesc); }
+
+size_t runtime_device_extent_size(const Runtime &) { return sizeof(DeviceRuntimeLaunchDesc); }

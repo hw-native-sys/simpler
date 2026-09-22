@@ -77,7 +77,7 @@ used as the source for two additional Perfetto-compatible traces:
 
 Both files retain every view, metadata event, bar, and flow from the merged
 trace. Only AIC/AIV task bars in Worker View (`pid=4`) outside the selected path
-are renamed to `·(rXtY)` (or `·(tY)` for ring 0); path bars and every slice
+are renamed to `·(<task-id>)`; TMR labels include the explicit `r0` for ring 0, while path bars and every slice
 in other views keep their original names. With Perfetto's default name-based
 coloring, the middle dot maps to a light blue-purple while digits are removed
 before hashing, so anonymous Worker View bars share a subdued color and path
@@ -167,14 +167,57 @@ python -m simpler_setup.tools.swimlane_converter build_output/<case>/dfx_outputs
     --dispatch-id 17:5 -o build_output/<case>/dfx_outputs/l3_swimlane.json
 ```
 
+For level-3/4 `host_build_graph` captures containing Host records or Host capture
+metadata, single-file conversion attempts containment when matching Host logs are
+available beside the capture (or supplied with `--host-log`). Level 4 enables
+Host records automatically; level 3 can include them through
+`SIMPLER_HBG_HOST_PHASE_RECORDS_ENABLE=1` with an output prefix. Levels 1-2 and
+Device-only single-file captures, including TMR captures, skip this step.
+This runs inside `swimlane_converter.py`; no additional command is needed. It saves
+`metadata.clock_alignment` in the source JSON, so subsequent conversion and IDE
+readers that consume this field can use that one file without logs. Device-only
+single-file conversion does not compute containment or rewrite its source.
+Missing or unusable logs skip
+alignment; a valid saved mapping is reused. Raw timestamps are preserved.
+The saved object contains only `status`, `device_anchor_cycles`, `host_anchor_ns`,
+`host_anchor_min_ns`, and `host_anchor_max_ns`. Frequency comes from the capture
+metadata and uncertainty is the upper bound minus the lower bound. Unavailable
+alignment contains `status` and `reason`. Saved mappings assume unchanged raw
+capture data; full placement diagnostics stay in traces calculated from logs.
+The first output run binds cumulative process logs to a stable transient
+process-session spool under `${TMPDIR:-/tmp}/simpler-host-logs-<root-pid>-<uuid>/`, not to a
+capture directory. After successful execution and validation of a mixed HBG capture with Host
+recording armed and finished and an output prefix, native finalize flushes the
+executing process's
+accepted Host-log records and atomically exports that invocation's original timing
+spans as `host_clock_alignment.<pid>.log` beside the capture before publishing
+completion. Direct L2 and forked ChipWorker executions share this path, so ST,
+PyPTO, pypto-lib, and models using these execution paths need no SceneTest log
+preparation. The exporter starts at the file position recorded before the invocation,
+filters by its PID/invocation, and keeps the complete process log unchanged.
+Other diagnostic flags and Device-only captures do not trigger this export.
+TIMING-or-finer logging is required; coarser logging warns and skips export.
+Flush or artifact-export failures are reported as diagnostic errors.
+A TIMING `chip.run.runner_run.aicpu_launch` marker raises the Device placement
+lower bound to the later of the runner start and launch. Required Host spans
+need a TIMING-or-finer log threshold. The remaining interval bounds placement
+freedom; saved anchor bounds also include phase-join freedom. Old logs without
+the marker retain the original containment bounds.
+Directory conversion also saves alignment metadata in mixed HBG source captures.
+The converter reads runtime-exported timing logs and does not create them.
+See [the single-capture schema](../../docs/dfx/chip-swimlane-profiling.md#optional-alignment-embedded-in-a-single-capture).
+
 Directory mode puts the Ranks on one axis by containment, not by calibration:
 each Rank's device work is placed inside the `chip.run.runner_run` window that
-held it, read from the run's `host.<pid>.log`. It therefore needs those logs
-(`--host-log` overrides the default of every `host.*.log` beside the captures)
-and works at any capture level. Every drawn slice carries the `slack_ns` its Rank was placed under, each
-Rank's metadata carries the full `placement` record, and the top level carries
-`cross_rank_uncertainty_ns` — the sum of the two widest, which bounds any
-interval read between two Ranks. See
+held it, read from persistent or capture-local timing logs. Default lookup reads
+`host.*.log` and `host_clock_alignment.*.log` directly under the input directory,
+plus `rank*/d*/host_clock_alignment.*.log` (`--host-log` overrides this lookup)
+and works at any capture level. Device slices carry their Rank's `slack_ns`.
+Each Rank's metadata carries the full `placement` record, and the top level carries
+`cross_rank_uncertainty_ns` — the sum of the two widest slacks, bounding
+placement freedom between two Ranks for their selected joins. Phase-join freedom
+is reported separately as `join.residual_ns` and must also be considered when
+interpreting cross-Rank gaps. See
 [`containment.py`](containment.py) for the mechanism.
 
 The merged trace also carries the processes that dispatched to the Ranks —
@@ -245,7 +288,7 @@ per-subtask crossbar.
 
 SPMD lane labels append `_spmd` before `(rXtY)` unless the function
 name already contains `spmd` (case-insensitive), e.g.
-`v_proj_spmd(r2t10)` vs `SPMD_WRITE_AIV(t0)`.
+`v_proj_spmd(r2t10)` vs `SPMD_WRITE_AIV(r0t0)`.
 
 With `-v`, the converter prints
 `dependency arrows anchor on min core_id subtask per core_type` when
@@ -259,7 +302,7 @@ SPMD tasks are present.
 | `--output` | `-o` | Output JSON file (default: `merged_swimlane.json` beside a file input, `l3_swimlane.json` inside a directory input) |
 | `--dispatch` | | Directory mode only: local capture directory to merge across Ranks, e.g. `d0`. Mutually exclusive with `--dispatch-id` |
 | `--dispatch-id` | | Directory mode only: parent dispatch identity to merge, formatted `RUN_ID:TASK_SLOT`. Resolves each Rank's own `dN` through `dispatch_identity.json`. Mutually exclusive with `--dispatch` |
-| `--host-log` | | Directory mode: Host `[STRACE]` log holding the `chip.run.runner_run` windows the captures are placed in (repeatable). Defaults to every `host.*.log` in the input directory |
+| `--host-log` | | Host `[STRACE]` log holding the `chip.run.runner_run` windows (repeatable). Single-file mode prefers sibling `host_clock_alignment.*.log`, falling back to `host.*.log`; directory mode reads both at the root plus `rank*/d*/host_clock_alignment.*.log`. An explicit argument recalculates single-file alignment |
 | `--rank-pid` | | Directory mode: pin one Rank's capture to the Host invocation that ran it, `RANK=PID` or `RANK=PID:INV` (repeatable). Only needed when the captures carry no `dispatch_identity.json` and Ranks running the same shape cannot be told apart by their device windows |
 | `--kernel-config` | `-k` | Path to kernel_config.py, used for function name mapping. Rejected in directory mode |
 | `--func-names` | | Path to name_map*.json (SceneTest format) for function name mapping. Rejected in directory mode |
@@ -359,7 +402,7 @@ Emitted in six parts:
 - **Part 1: Overhead verdict** — per-engine overhead (idle T-core *and* a ready, undispatched T-task, MIX-aware) + system `all_overhead` / `has_overhead`, all as % of makespan. An engine with no ready work is not overhead (dependency-mandated idle, not waste).
 - **Part 2: aicore switch** — the pre-dispatched pickup gap (`dispatch < prev_end`), reported **per core** (min/mean/max, ~0.8 µs each), the overhead-vs-independent split, and the makespan switch bound `[min over cores, sum of per-engine minima]`.
 - **Part 3 / 4: Head / Tail OH distributions** — P10–P99 + mean + total (per-task pickup and detect-latency magnitude).
-- **Part 5: Scheduler phase breakdown** — Level >= 3 reports the producer's phases. AICPU includes per-thread loop, queue-pop, fanout/fanin, and tail-vs-loop metrics; AICore reports its bootstrap/fanin/ready/dispatch/complete/refill/resolve/idle phase totals without applying AICPU-only queue formulas. At Level 2 this section is explicitly marked unavailable while Parts 1–4 and 6 remain available.
+- **Part 5: Scheduler phase breakdown** — Level >= 3 reports the producer's phases. AICPU includes per-thread loop, queue-pop, fanout/fanin, and tail-vs-loop metrics; AICore reports its flat bootstrap, completion, resolve, StateProbe, dispatch/worksteal/refill, and idle phase totals without applying AICPU-only queue formulas. Deferred waiting is left as an empty interval between StateProbe and publication. At Level 2 this section is explicitly marked unavailable while Parts 1–4 and 6 remain available.
 - **Part 6: Critical-path latency attribution** — along the makespan path, scheduler-injected µs vs compute µs ("scheduler adds X% to the critical path").
 
 The common dependency-aware analysis works at chip_swimlane_level >= 2 for
@@ -382,8 +425,9 @@ python -m simpler_setup.tools.strace_timing path/to/log
 # Per-round Host/Device/Orch/Sched table (the benchmark/--rounds N view)
 python -m simpler_setup.tools.strace_timing path/to/log --rounds-table
 
-# Indented nested span tree per callable (chip.run → bind / runner_run →
-# device_wall → preamble/config_validate/arena_wire/sm_reset/orch/sched/post_orch)
+# Indented nested span tree per callable (chip.run → bind / prepare_execution /
+# runner_run → device_wall → preamble/config_validate/arena_wire/sm_reset/orch/
+# sched/post_orch)
 python -m simpler_setup.tools.strace_timing path/to/log --tree
 
 # Also emit a Chrome-trace / Perfetto JSON (one named lane per invocation, with
@@ -397,7 +441,8 @@ python -m simpler_setup.tools.strace_timing path/to/log --swimlane host_swimlane
 Groups spans by `(pid, inv)`, rebuilds each invocation's tree from `depth`,
 buckets by callable hash `hid`, and reports each callable's mean `chip.run`
 plus per-stage means. It reads the host-emitted `[STRACE]` lines and shows the
-host stages (`bind`/`runner_run`/`validate`) alongside the AICPU phases.
+host stages (`bind`/`stage_inputs`/`prepare_execution`/`runner_run`/`validate`)
+alongside the AICPU phases.
 
 `--tree` renders one nested span tree per callable; each node's duration is the
 **median across every invocation** of that callable (not one invocation's
@@ -610,8 +655,8 @@ python -m simpler_setup.tools.deps_viewer outputs/<case>_<ts>/deps.json \
 
 All reduction modes print the redundant edges to stdout as a
 `<task> -> <task>` list, where each task uses the same label as the rendered
-graph — the bare `local` counter when every task is in ring 0, or the explicit
-`(ring, local)` tuple once any task lives in ring >= 1. Text output emits only
+graph. HBG graphs containing only GLOBAL tasks use the bare `local` counter;
+TMR graphs always use the explicit `r{ring}t{local}` label, including ring 0. Text output emits only
 the selected edge set. HTML output keeps every edge in the Graphviz layout and
 colors unselected edges like the page background, so `reduced` / `omitted`
 preserve the full-graph node placement and routing while showing only the
@@ -708,7 +753,7 @@ the WAIT subgraph:
   fold, `d > BL` window misses kept) at each requested window size.
 
 The report includes per-BL removal counts, `WAIT|RETAIN → RETAIN` demotions
-vs pure WAIT drops, window and cross-ring misses, and the producer→consumer
+vs pure WAIT drops, window and cross-scope misses, and the producer→consumer
 submission-distance CDF. `DepGenRecord` does not preserve explicit
 dependency kinds yet (#1827), so removal counts are accurate while the report
 marks affected demote-vs-drop classifications as uncertain.
@@ -746,9 +791,12 @@ BL, the graph has far-apart producer/consumer pairs that only a wider
 window could cover.
 
 A low `removed / upper_bound` ratio is **not** on its own a case for widening:
-check `cross_ring_misses` first. Qwen3-14B decode removes 1 of 40 redundant
+check `cross_scope_misses` first. Qwen3-14B decode removes 1 of 40 redundant
 edges at BL=64 and the same 1 at BL=256, because 39 of its misses are
-cross-ring long edges that no window in this range reaches. Only
+cross-scope long edges that no window in this range reaches. A scope is the
+boundary the bitmap cannot see across — a ring under
+`tensormap_and_ringbuffer`, a modular task's body under `host_build_graph`,
+picked from the `runtime` the capture names. Only
 `pct_pairs_within_window` being the binding constraint argues for a wider BL —
 see the [investigation entry](../../docs/investigations/2026-09-wait-reduction-bitmap-window-sizing.md)
 for the BL=64/128/256 comparison and why BL=64 is the shipped choice.
@@ -764,13 +812,17 @@ The analysis tools share the same input format - the `chip_swimlane_records_*.js
 ```json
 {
   "chip_swimlane_level": 4,
+  "metadata": {
+    "runtime": "host_build_graph",
+    "clock_freq_hz": 50000000
+  },
   "tasks": [
     {
       "task_id": 0,
       "func_id": 0,
       "core_id": 7,
       "core_type": "aiv",
-      "ring_id": 0,
+      "id_space": 0,
       "start_time_us": 47.46,
       "end_time_us": 55.9,
       "duration_us": 8.44,
@@ -778,11 +830,12 @@ The analysis tools share the same input format - the `chip_swimlane_records_*.js
       "finish_time_us": 60.52
     },
     {
-      "task_id": 4294967296,
+      "task_id": 4611686031312289792,
       "func_id": 1,
       "core_id": 7,
       "core_type": "aiv",
-      "ring_id": 1,
+      "id_space": 1,
+      "parent_task_id": 3,
       "start_time_us": 68.68,
       "end_time_us": 70.42,
       "duration_us": 1.74,
@@ -793,6 +846,16 @@ The analysis tools share the same input format - the `chip_swimlane_records_*.js
 }
 ```
 
+`metadata.runtime` picks how `task_id` is decoded, because a task id carries whichever
+`TaskId` layout its runtime uses and nothing in the value says which:
+
+| runtime | layout | id fields on a task row |
+| ------- | ------ | ----------------------- |
+| `host_build_graph` | id space in bits 63:62 (0 = GLOBAL, 1 = SUB_TASK, 2 = PARAM), a sub-task's parent modular task in bits 51:32, local id in the low 32 | `id_space`, plus `parent_task_id` for a sub-task |
+| `tensormap_and_ringbuffer` | ring index in bits 39:32, local id in the low 32 | `ring_id` |
+
+The second row above is a sub-task: id space 1, parent modular task 3, local index 0.
+
 Dependency edges come from `deps.json` (dep_gen replay) at post-process time —
 not from the perf JSON. See [`swimlane_converter --deps-json`](#swimlane_converter).
 
@@ -801,11 +864,14 @@ Top-level layout depends on `chip_swimlane_level`:
 - All levels: `chip_swimlane_level`, `tasks[]` (per-task fields above).
 - A5 HBG `>= 2`: also `aicpu_lifecycle_records[]`; the converter renders the
   real handshake, topology/configuration, context-publication, bootstrap-wait,
-  register-release, and exit timestamps under `AICPU Lifecycle`.
+  register-release, and exit intervals under `AICPU Lifecycle`, with one record
+  and lane per participating AICPU thread.
 - `>= 3`: also `scheduler_records.streams[]`. Every Record has the common
   `start_cycles`, `end_cycles`, `loop_iter`, `kind`, `tasks_processed`, and
   nullable `task_id` fields. Stream metadata selects the AICPU or AICore
   interpretation; producer-specific counters live in `metrics[]`.
+  A5 HBG task-bound phase labels use the actual task id, for example
+  `StateProbe(t23)`; Bootstrap and Idle use the phase name alone.
 - `>= 4`: also `aicpu_orchestrator_phases[]` (per-task orchestrator
   phase records).
 

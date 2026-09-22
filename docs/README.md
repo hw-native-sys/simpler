@@ -52,6 +52,7 @@ changing simpler's own internals.
 | Document | What it covers |
 | -------- | -------------- |
 | [AICore Kernel Programming](aicore-kernel-programming.md) | Writing AICore kernels for this runtime |
+| [L2 Cache Bypass](l2-cache-bypass.md) | Native CANN ELF patching vs. simpler's args-based nocache-offset delivery |
 | [a5 AICore SIMT Launch](simt-launch.md) | a5 SIMT launch metadata and the `ChipCallable` alignment constraint |
 | [Manual Scope V0](manual-scope.md) | Explicit scope control from orchestration code |
 | [WAR Anti-Dependencies](war-anti-dependency.md) | Write-after-read hazards and how the runtime orders them |

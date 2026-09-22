@@ -17,6 +17,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
+from simpler import task_interface
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -24,6 +26,18 @@ ROOT = Path(__file__).resolve().parents[3]
 class _Payload:
     def __init__(self, name: str):
         self.name = name
+        self.shape = (1,)
+        self.dtype = torch.float32
+        self.device = SimpleNamespace(type="cpu")
+
+    def numel(self):
+        return 1
+
+    def element_size(self):
+        return 4
+
+    def is_contiguous(self):
+        return True
 
 
 class _FakeBuffer:
@@ -90,6 +104,9 @@ class _FakeWorker:
     def copy_from(self, actual, buffer) -> None:
         self.copy_from_count += 1
 
+    def free(self, buffer) -> None:
+        self.events.append(f"free:{buffer.index}")
+
     def close(self) -> None:
         self.closed = True
         self.events.append("close")
@@ -126,15 +143,16 @@ def _fixture_stream(driver, *, n_layers: int):
         ("examples/a5/tensormap_and_ringbuffer/qwen3_14b_decode/main.py", "a5", 65536),
     ],
 )
+@pytest.mark.parametrize("runtime", ["host_build_graph", "tensormap_and_ringbuffer"])
 def test_standalone_driver_keeps_one_device_fixture_across_rounds(
-    monkeypatch, relative_path: str, platform: str, expected_dep_pool: int
+    monkeypatch, relative_path: str, platform: str, expected_dep_pool: int, runtime: str
 ):
     driver = _load_driver(relative_path)
     _FakeWorker.instances.clear()
     chip = object()
 
     monkeypatch.setattr(driver, "Worker", _FakeWorker)
-    monkeypatch.setattr(driver, "TaskArgs", _FakeTaskArgs)
+    monkeypatch.setattr(task_interface, "TaskArgs", _FakeTaskArgs)
     monkeypatch.setattr(driver, "CallConfig", _FakeCallConfig)
     monkeypatch.setattr(driver, "compile_chip_callable_spec", lambda *args: chip)
     monkeypatch.setattr(driver, "l3_compile_cache_key", lambda *args: "cache-key")
@@ -167,11 +185,11 @@ def test_standalone_driver_keeps_one_device_fixture_across_rounds(
     monkeypatch.setattr(driver, "_decode_generate_inputs", unexpected_golden)
     monkeypatch.setattr(driver, "_decode_golden", unexpected_golden)
 
-    assert driver.run([7], platform, rounds=3, skip_golden=True) == 0
+    assert driver.run([7], platform, runtime=runtime, rounds=3, skip_golden=True) == 0
 
     [worker] = _FakeWorker.instances
     names = [param.name for param in driver.param_specs(driver.N_LAYERS)]
-    assert worker.kwargs == {"level": 2, "platform": platform, "runtime": "tensormap_and_ringbuffer", "device_id": 7}
+    assert worker.kwargs == {"level": 2, "platform": platform, "runtime": runtime, "device_id": 7}
     assert len(worker.allocations) == 20 == len(names)
     assert [name for _, name in worker.uploads] == [name for name in names if name != "out"]
     assert len(worker.runs) == 3
@@ -179,11 +197,19 @@ def test_standalone_driver_keeps_one_device_fixture_across_rounds(
     assert len({id(config) for _, _, config in worker.runs}) == 1
     task_args = worker.runs[0][1]
     signature = driver.TestQwen314BDecode.CALLABLE["orchestration"]["signature"]
-    assert [tag for _, tag in task_args.tensors] == [driver._DIRECTION_TAGS[direction] for direction in signature]
+    assert [tag for _, tag in task_args.tensors] == [
+        {
+            driver.D.IN: task_interface.TensorArgType.INPUT,
+            driver.D.INOUT: task_interface.TensorArgType.INOUT,
+            driver.D.OUT: task_interface.TensorArgType.OUTPUT_EXISTING,
+        }[direction]
+        for direction in signature
+    ]
     assert worker.runs[0][2].runtime_env.ring_dep_pool == expected_dep_pool
     assert worker.copy_from_count == 0
     assert worker.events.index("autoload") > max(i for i, event in enumerate(worker.events) if event == "copy_to")
     assert worker.events.index("autoload") < worker.events.index("run")
+    assert [event for event in worker.events if event.startswith("free:")] == [f"free:{i}" for i in reversed(range(20))]
     assert worker.closed
 
 
@@ -206,7 +232,7 @@ def test_correctness_reuses_one_materialized_fixture(monkeypatch, relative_path:
     finalized = []
 
     monkeypatch.setattr(driver, "Worker", _FakeWorker)
-    monkeypatch.setattr(driver, "TaskArgs", _FakeTaskArgs)
+    monkeypatch.setattr(task_interface, "TaskArgs", _FakeTaskArgs)
     monkeypatch.setattr(driver, "CallConfig", _FakeCallConfig)
     monkeypatch.setattr(driver, "compile_chip_callable_spec", lambda *args: chip)
     monkeypatch.setattr(driver, "l3_compile_cache_key", lambda *args: "cache-key")

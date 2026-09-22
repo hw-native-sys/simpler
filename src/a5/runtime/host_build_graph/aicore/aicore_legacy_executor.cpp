@@ -70,17 +70,30 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Dispat
  */
 __aicore__ __attribute__((weak)) void
 legacy_aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type) {
-    __gm__ Handshake *my_hank = (__gm__ Handshake *)(&runtime->workers[block_idx]);
+    __gm__ Handshake *my_hank = (__gm__ Handshake *)(&runtime->dev.workers[block_idx]);
 
     // Phase 1: report physical core ID + core type and signal done in one write,
     // with no wait for the AICPU — both fields are self-known. The AICPU opens
     // this core's register window only after it observes aicore_done, so a single
     // report suffices. The host clears aicore_done before this kernel launches,
     // so the value the AICPU reads is this run's report, never a stale prior one.
+    const uint64_t report_epoch = get_aicore_report_epoch();
     my_hank->physical_core_id = get_physical_core_id();
     my_hank->core_type = core_type;
-    OUT_OF_ORDER_STORE_BARRIER();
-    my_hank->aicore_done = block_idx + 1;  // Signal ready (use block_idx + 1 to avoid 0)
+    if (report_epoch != 0) {
+        // Native program run: `aicore_done` is payload, and `report_epoch` is
+        // the marker that commits it. The barrier separates the two, so the
+        // AICPU cannot see this run's epoch without the report it stands for.
+        my_hank->aicore_done = block_idx + 1;
+        OUT_OF_ORDER_STORE_BARRIER();
+        my_hank->report_epoch = report_epoch;
+    } else {
+        // Kernel/persistent launch: unchanged. `aicore_done` is itself the
+        // marker, its per-run reset is what makes it meaningful, and no stamp
+        // is written.
+        OUT_OF_ORDER_STORE_BARRIER();
+        my_hank->aicore_done = block_idx + 1;
+    }
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
     // Phase 2: Wait for the AICPU to open our register window. A kernel launch

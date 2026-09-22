@@ -1666,6 +1666,67 @@ nb::tuple dims_tuple(const uint32_t *dims, uint32_t ndims) {
     return nb::tuple(out);
 }
 
+// `ctypes._SimpleCData` is the common base of every ctypes scalar. Cached after the first
+// lookup: importing `ctypes` and walking its attributes on every add_scalar call would cost far
+// more than the check it guards.
+PyObject *ctypes_simple_cdata_type() {
+    static PyObject *cached = nb::module_::import_("ctypes").attr("_SimpleCData").inc_ref().ptr();
+    return cached;
+}
+
+// A ctypes scalar's buffer format is a byte-order prefix plus one `struct` format character
+// ("<I", ">d"). Both halves decide whether it can encode, which is why the buffer's format
+// answers this rather than the type's `_type_`: `_type_` carries the character alone.
+//
+// **The prefix is the scalar's actual byte order**, and ctypes spells it out even for a native
+// type, so admission is a match against the host's. `ctypes.c_uint32.__ctype_be__` is an
+// ordinary `_SimpleCData` subclass whose `_type_` is `'I'`, indistinguishable from `c_uint32`,
+// but whose format is `">I"` and whose bytes for the value 1 are `00 00 00 01`. Copying those
+// raw would store `0x01000000` where `to_u64(uint32_t{1})` is `0x1`. A reversed-order scalar has
+// no native C++ counterpart to agree with, so it is refused rather than byte-swapped into one.
+//
+// **The character decides whether the value is a number at all**: the integer widths, `f`, `d`
+// and `?` encode. The pointer and character types (`P`, `z`, `Z`, `c`, `u`) and long double
+// (`g`) do not — they name no number a slot can carry, and encoding a host pointer into a
+// device-bound slot is a defect wherever it happens. A subclass inherits its base's format, so
+// it is admitted with the base, which dispatching on the type's `__name__` would not do.
+enum class CtypesFormat { Encodable, ForeignByteOrder, NotNumeric };
+
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+constexpr char NATIVE_BYTE_ORDER = '>';
+#else
+constexpr char NATIVE_BYTE_ORDER = '<';
+#endif
+
+CtypesFormat classify_ctypes_format(const char *format) {
+    // ctypes always emits the prefix, so a format without one did not come from one of its
+    // scalars and is refused rather than guessed at.
+    if (format == nullptr || (format[0] != '<' && format[0] != '>')) {
+        return CtypesFormat::NotNumeric;
+    }
+    if (format[1] == '\0' || format[2] != '\0') {
+        return CtypesFormat::NotNumeric;
+    }
+    switch (format[1]) {
+    case 'b':
+    case 'B':
+    case 'h':
+    case 'H':
+    case 'i':
+    case 'I':
+    case 'l':
+    case 'L':
+    case 'q':
+    case 'Q':
+    case 'f':
+    case 'd':
+    case '?':
+        return format[0] == NATIVE_BYTE_ORDER ? CtypesFormat::Encodable : CtypesFormat::ForeignByteOrder;
+    default:
+        return CtypesFormat::NotNumeric;
+    }
+}
+
 // Resolve one wire tensor onto a local base and build the address-bearing device POD.
 // `resolved` maps CanonicalIdentity -> (local_base, address_space); the caller populates it by
 // materializing each embedded descriptor.
@@ -1690,6 +1751,129 @@ ChipTensor materialize_one(const Tensor &r, nb::dict resolved) {
         reinterpret_cast<void *>(static_cast<uintptr_t>(base + r.byte_offset)), r.shapes, r.strides, r.ndims, r.dtype,
         static_cast<AddressSpace>(addr_space)
     );
+}
+
+// Read an exact PyLong as the 64-bit pattern a slot stores, accepting the whole two's-complement
+// range: signed first, then unsigned for anything above INT64_MAX. Out of that range is an error
+// rather than a silent truncation to the low 64 bits.
+uint64_t encode_python_int(PyObject *long_ptr) {
+    int64_t signed_value = PyLong_AsLongLong(long_ptr);
+    if (signed_value == -1 && PyErr_Occurred()) {
+        PyErr_Clear();
+        unsigned long long unsigned_value = PyLong_AsUnsignedLongLong(long_ptr);
+        if (PyErr_Occurred()) {
+            PyErr_Clear();
+            throw std::overflow_error("add_scalar: integer value out of 64-bit range");
+        }
+        return static_cast<uint64_t>(unsigned_value);
+    }
+    return static_cast<uint64_t>(signed_value);
+}
+
+// The one place a Python scalar becomes the uint64_t a wire slot stores. Its output must match
+// C++ `to_u64` bit for bit for the same value, so that a slot written from Python and one written
+// from orchestration read back identically.
+//
+// Three encodings, in the order checked:
+//
+// - A Python int is read as a 64-bit quantity, which is what `to_u64(int64_t)` / `to_u64(uint64_t)`
+//   also produce. PyLong_CheckExact short-circuits the common case; the general branch further
+//   down goes through __index__ (PyIndex_Check), not PyLong_Check, so bool, IntEnum members, and
+//   numpy integer scalars are admitted -- none of which are actual `int` instances -- while every
+//   float type, numpy's included, is still rejected, since none of them define __index__.
+// - A ctypes scalar is read through the buffer protocol and **zero-extended** into the slot, which
+//   is exactly what to_u64's union does. Reading `.value` instead would sign-extend a narrow
+//   signed type (c_int8(-1) -> 0xFFFF'FFFF'FFFF'FFFF where to_u64(int8_t{-1}) is 0xFF), and
+//   dispatching on the type's __name__ to find the float types would miss their subclasses and
+//   silently narrow a c_double subclass to single precision. One buffer read has neither problem,
+//   and its format answers admission and byte order in the same step -- see classify_ctypes_format.
+// - A native Python float narrows to IEEE-754 single precision, matching to_u64(float). Out of
+//   single-precision range is an error, not an infinity: a finite input that narrowed to inf would
+//   be stored as a different number. This is the one encoding that cannot align with its C++
+//   counterpart by construction, because a Python float carries no width: to_u64(1.5) in
+//   orchestration is a double. ctypes.c_double is the spelling for full precision, and the
+//   docstrings say so.
+uint64_t encode_scalar(nb::handle value) {
+    PyObject *ptr = value.ptr();
+
+    if (PyLong_CheckExact(ptr)) {
+        return encode_python_int(ptr);
+    }
+
+    // PyObject_IsInstance answers -1 on error, which is truthy -- test for it explicitly rather
+    // than walking into the ctypes branch with a Python exception already set.
+    int is_ctypes = PyObject_IsInstance(ptr, ctypes_simple_cdata_type());
+    if (is_ctypes < 0) {
+        throw nb::python_error();
+    }
+    if (is_ctypes) {
+        // One buffer request answers both questions: its format decides admission and byte
+        // order, its length decides the width. Taking the width from the buffer rather than
+        // inferring it from the format character is what keeps a subclass whose format
+        // disagrees with its layout from reading past its own storage.
+        Py_buffer view;
+        if (PyObject_GetBuffer(ptr, &view, PyBUF_FORMAT) != 0) {
+            throw std::invalid_argument("add_scalar: ctypes scalar does not support the buffer protocol");
+        }
+        CtypesFormat verdict = classify_ctypes_format(view.format);
+        size_t width = static_cast<size_t>(view.len);
+        uint64_t bits = 0;
+        if (verdict == CtypesFormat::Encodable && width <= sizeof(uint64_t)) {
+            std::memcpy(&bits, view.buf, width);
+        }
+        PyBuffer_Release(&view);
+
+        if (verdict == CtypesFormat::ForeignByteOrder) {
+            throw std::invalid_argument(
+                "add_scalar: ctypes scalar is not in host byte order (e.g. c_uint32.__ctype_be__ on a "
+                "little-endian host); its bytes would encode to a different number than the same value "
+                "written from orchestration"
+            );
+        }
+        if (verdict == CtypesFormat::NotNumeric) {
+            throw std::invalid_argument(
+                "add_scalar: ctypes scalar must be an integer width (c_int8..c_uint64), c_float, "
+                "c_double or c_bool -- a pointer or character type carries no value a slot can hold"
+            );
+        }
+        if (width > sizeof(uint64_t)) {
+            throw std::invalid_argument("add_scalar: ctypes scalar is wider than the 8-byte slot");
+        }
+        return bits;
+    }
+
+    if (PyFloat_Check(ptr)) {
+        double d = PyFloat_AsDouble(ptr);
+        if (d == -1.0 && PyErr_Occurred()) {
+            throw nb::python_error();
+        }
+        float f = static_cast<float>(d);
+        // A finite value that narrows to an infinity is out of single-precision range, and
+        // storing that infinity would silently be a different number. An input that is already
+        // infinite or NaN passes through as itself.
+        if (std::isfinite(d) && !std::isfinite(f)) {
+            throw std::overflow_error(
+                "add_scalar: float value out of IEEE-754 single-precision range; pass ctypes.c_double "
+                "for full precision"
+            );
+        }
+        uint32_t bits;
+        std::memcpy(&bits, &f, sizeof(bits));
+        return static_cast<uint64_t>(bits);
+    }
+
+    if (PyIndex_Check(ptr)) {
+        // Normalize through __index__ into an exact PyLong first: PyLong_As* is only
+        // guaranteed against one, and ptr may be a numpy integer scalar or an IntEnum member,
+        // neither of which is a PyLong itself.
+        nb::object as_long = nb::steal<nb::object>(PyNumber_Index(ptr));
+        if (!as_long.is_valid()) {
+            throw nb::python_error();
+        }
+        return encode_python_int(as_long.ptr());
+    }
+
+    throw std::invalid_argument("add_scalar: value must be int, float, bool, or a ctypes scalar");
 }
 
 // Which device allocations a dispatch's operands may name: the private snapshot of every live
@@ -2333,8 +2517,18 @@ NB_MODULE(_task_interface, m) {
         )
 
         .def(
-            "add_scalar", &ChipStorageTaskArgs::add_scalar, nb::arg("s"),
-            "Add a uint64_t scalar. After this, add_tensor() is no longer allowed."
+            "add_scalar",
+            [](ChipStorageTaskArgs &self, nb::object value) {
+                self.add_scalar(encode_scalar(value));
+            },
+            nb::arg("s"),
+            "Add a scalar -- Python int, float, bool, or a ctypes scalar (c_int8..c_uint64, "
+            "c_float, c_double, c_bool; a pointer or character type, and any scalar not in host "
+            "byte order, is refused). Bit-encoded exactly like scalar_to_uint64(), which matches "
+            "C++ to_u64(): a ctypes scalar zero-extends from its own width, and a native float "
+            "narrows to IEEE-754 single precision -- a finite value out of that range raises "
+            "rather than becoming an infinity, so use ctypes.c_double for full precision. "
+            "After this, add_tensor() is no longer allowed."
         )
 
         .def(
@@ -2413,8 +2607,18 @@ NB_MODULE(_task_interface, m) {
         )
 
         .def(
-            "add_scalar", &TaskArgs::add_scalar, nb::arg("s"),
-            "Add a uint64_t scalar. After this, add_tensor() is no longer allowed."
+            "add_scalar",
+            [](TaskArgs &self, nb::object value) {
+                self.add_scalar(encode_scalar(value));
+            },
+            nb::arg("s"),
+            "Add a scalar -- Python int, float, bool, or a ctypes scalar (c_int8..c_uint64, "
+            "c_float, c_double, c_bool; a pointer or character type, and any scalar not in host "
+            "byte order, is refused). Bit-encoded exactly like scalar_to_uint64(), which matches "
+            "C++ to_u64(): a ctypes scalar zero-extends from its own width, and a native float "
+            "narrows to IEEE-754 single precision -- a finite value out of that range raises "
+            "rather than becoming an infinity, so use ctypes.c_double for full precision. "
+            "After this, add_tensor() is no longer allowed."
         )
 
         .def(
@@ -2779,6 +2983,14 @@ NB_MODULE(_task_interface, m) {
         )
 
         .def_prop_ro(
+            "scalar_count",
+            [](const PyChipCallable &self) -> int32_t {
+                return self.get().scalar_count();
+            },
+            "Number of SCALAR entries in the orchestration signature."
+        )
+
+        .def_prop_ro(
             "child_count",
             [](const PyChipCallable &self) -> int32_t {
                 return self.get().child_count();
@@ -2975,10 +3187,15 @@ NB_MODULE(_task_interface, m) {
                 }
             }
         )
-        // Accept either an int dump level (0=off, 1=partial, 2=full,
-        // 3=hybrid) or a Python bool. `True` maps to level 1
-        // (partial) — the default when --dump-args is passed without a
-        // value; `False` maps to 0.
+        // Accepts the mode's name ("off" / "partial" / "hybrid" / "full"), a
+        // Python bool (`True` == "partial", the mode a bare `--dump-args`
+        // selects), or the raw int. Reads back as the int, which is what the
+        // CallConfig wire codecs pack.
+        //
+        // An out-of-range int raises rather than clamping: the values are a
+        // superset ladder, so clamping a too-large value to the numeric maximum
+        // would silently hand back a different mode than the caller asked for
+        // if that ladder ever changes shape.
         .def_prop_rw(
             "enable_dump_args",
             [](const CallConfig &c) {
@@ -2987,10 +3204,33 @@ NB_MODULE(_task_interface, m) {
             [](CallConfig &c, nb::object v) {
                 if (PyBool_Check(v.ptr())) {
                     c.enable_dump_args = nb::cast<bool>(v) ? 1 : 0;
-                } else {
-                    int level = nb::cast<int>(v);
-                    c.enable_dump_args = (level < 0) ? 0 : (level > 3) ? 3 : level;
+                    return;
                 }
+                if (nb::isinstance<nb::str>(v)) {
+                    const std::string name = nb::cast<std::string>(v);
+                    if (name == "off") {
+                        c.enable_dump_args = 0;
+                    } else if (name == "partial") {
+                        c.enable_dump_args = 1;
+                    } else if (name == "hybrid") {
+                        c.enable_dump_args = 2;
+                    } else if (name == "full") {
+                        c.enable_dump_args = 3;
+                    } else {
+                        throw std::invalid_argument(
+                            "enable_dump_args: unknown mode '" + name + "' (off / partial / hybrid / full)"
+                        );
+                    }
+                    return;
+                }
+                int level = nb::cast<int>(v);
+                if (level < 0 || level > 3) {
+                    throw std::invalid_argument(
+                        "enable_dump_args: " + std::to_string(level) +
+                        " is out of range (0=off, 1=partial, 2=hybrid, 3=full)"
+                    );
+                }
+                c.enable_dump_args = level;
             }
         )
         .def_rw("enable_pmu", &CallConfig::enable_pmu)
@@ -3011,15 +3251,6 @@ NB_MODULE(_task_interface, m) {
             },
             [](CallConfig &c, bool v) {
                 c.enable_scope_stats = v ? 1 : 0;
-            }
-        )
-        .def_prop_rw(
-            "capture_clock_anchors",
-            [](const CallConfig &c) {
-                return static_cast<bool>(c.capture_clock_anchors);
-            },
-            [](CallConfig &c, bool v) {
-                c.capture_clock_anchors = v ? 1 : 0;
             }
         )
         .def_prop_rw(
@@ -3044,8 +3275,7 @@ NB_MODULE(_task_interface, m) {
                << ", enable_chip_swimlane=" << self.enable_chip_swimlane
                << ", enable_dump_args=" << self.enable_dump_args << ", enable_pmu=" << self.enable_pmu
                << ", enable_dep_gen=" << (self.enable_dep_gen ? "True" : "False")
-               << ", enable_scope_stats=" << (self.enable_scope_stats ? "True" : "False")
-               << ", capture_clock_anchors=" << (self.capture_clock_anchors ? "True" : "False");
+               << ", enable_scope_stats=" << (self.enable_scope_stats ? "True" : "False");
             if (self.runtime_env.any()) {
                 append_ring_values(os, "runtime_env.ring_task_window", true, self.runtime_env.ring_task_window);
                 append_ring_values(os, "runtime_env.ring_heap", true, self.runtime_env.ring_heap);
@@ -3237,6 +3467,13 @@ NB_MODULE(_task_interface, m) {
             "Drain active native ownership, abandon unlaunched work, and close the chip run lane."
         )
         .def(
+            "_stop_chip_run_lane_admission", &ChipWorker::stop_chip_run_lane_admission,
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Stop the run lane admitting anything further and finish every not-yet-launched run without "
+            "launching it. For a caller that has established nothing more may reach the device; the ordinary "
+            "close cannot serve that, because a drain launches before it waits."
+        )
+        .def(
             "_submit_chip_run_direct",
             [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config) {
                 return self.submit_chip_run(callable_id, args, config);
@@ -3280,6 +3517,53 @@ NB_MODULE(_task_interface, m) {
             "Validate, copy back, emit diagnostics, and destroy a prepared native run."
         )
         .def(
+            "_probe_run_retention",
+            [](ChipWorker &self, const ChipWorkerNativeRun &run, const ChipWorkerNativeRun &successor,
+               bool launch_successor, uint32_t boundary_timeout_ms, uint32_t successor_start_timeout_ms,
+               bool use_retained_sync) {
+                RunRetentionProbeConfig config{};
+                config.launch_successor = launch_successor ? 1u : 0u;
+                config.boundary_timeout_ms = boundary_timeout_ms;
+                config.successor_start_timeout_ms = successor_start_timeout_ms;
+                config.use_retained_sync = use_retained_sync ? 1u : 0u;
+                RunRetentionProbeReport report{};
+                {
+                    nb::gil_scoped_release unlocked;
+                    report = self.probe_run_retention(run, successor, config);
+                }
+                // A dict rather than a bound struct: the report is a flat set of
+                // measurements read once by one test, so a type would add a
+                // second place to keep in step with the C one.
+                nb::dict out;
+                out["launch_rc"] = report.launch_rc;
+                out["boundary_wait_rc"] = report.boundary_wait_rc;
+                out["pair_retire_rc"] = report.pair_retire_rc;
+                out["successor_launch_rc"] = report.successor_launch_rc;
+                out["successor_start_rc"] = report.successor_start_rc;
+                out["successor_drain_rc"] = report.successor_drain_rc;
+                out["retained_sync_rc"] = report.retained_sync_rc;
+                out["execution_state"] = report.execution_state;
+                out["execution_code"] = report.execution_code;
+                out["execution_source"] = report.execution_source;
+                out["execution_reason"] = report.execution_reason;
+                out["successor_completion_before_read"] = report.successor_completion_before_read;
+                out["successor_completion_after_read"] = report.successor_completion_after_read;
+                out["successor_started"] = report.successor_started != 0;
+                out["boundary_wait_ns"] = report.boundary_wait_ns;
+                out["successor_start_ns"] = report.successor_start_ns;
+                out["record_read_ns"] = report.record_read_ns;
+                out["decision_ns"] = report.decision_ns;
+                out["candidate_drain_ns"] = report.candidate_drain_ns;
+                out["reference_sync_ns"] = report.reference_sync_ns;
+                out["successor_drain_ns"] = report.successor_drain_ns;
+                return out;
+            },
+            nb::arg("run"), nb::arg("successor"), nb::arg("launch_successor") = true,
+            nb::arg("boundary_timeout_ms") = 0, nb::arg("successor_start_timeout_ms") = 0,
+            nb::arg("use_retained_sync") = false,
+            "Run #2267's late-read retention fixture over a launched predecessor and a prepared successor."
+        )
+        .def(
             "run_materialized",
             [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
                uint64_t accepted_state_addr, int32_t accepted_value, uint32_t pipeline_slot,
@@ -3313,11 +3597,43 @@ NB_MODULE(_task_interface, m) {
         )
         .def_prop_ro("device_id", &ChipWorker::device_id)
         .def_prop_ro("initialized", &ChipWorker::initialized)
+        .def(
+            "teardown_report_bytes",
+            [](const ChipWorker &self) -> nb::object {
+                SimplerTeardownReport report{};
+                if (!self.teardown_report(&report)) return nb::none();
+                return nb::bytes(reinterpret_cast<const char *>(&report), sizeof(report));
+            },
+            "The first captured finalize()'s teardown observation as its exact wire bytes, or "
+            "None when this worker captured none. Observation only: no field asserts that device "
+            "work has stopped or that an old device pointer may be reused."
+        )
         .def_prop_ro("pipeline_depth", &ChipWorker::pipeline_depth)
         .def_prop_ro("runtime_slot_count", &ChipWorker::runtime_slot_count)
         .def_prop_ro(
             "supports_concurrent_native_prepare", &ChipWorker::supports_concurrent_native_prepare,
             "Whether non-diagnostic native preparation may overlap one active run in another slot."
+        )
+        .def_prop_ro(
+            "launch_depth", &ChipWorker::launch_depth,
+            "How many runs this worker may have launched at once, after its request was resolved "
+            "against the runtime's pipeline contract."
+        )
+        .def_prop_ro(
+            "supports_joined_native_launch", &ChipWorker::supports_joined_native_launch,
+            "Whether this worker may order one run's native submission behind another's right now. "
+            "Both a runtime capability and a moment-to-moment fact about the device streams."
+        )
+        .def(
+            "configure_launch_depth", &ChipWorker::configure_launch_depth, nb::arg("depth"),
+            "Ask, before init, for a launch depth. Depth 1 is the serial path: nothing is ordered "
+            "behind anything, and no run constructs the boundary that would let it be."
+        )
+        .def(
+            "set_exported_device_regions_live", &ChipWorker::set_exported_device_regions_live, nb::arg("live"),
+            "Declare whether this worker's host side still owns exported device regions. While it "
+            "does, no run is ordered behind another: those regions are released before the child's "
+            "device reset."
         )
         .def_prop_ro(
             "runtime_buffer_addrs", &ChipWorker::runtime_buffer_addrs,
@@ -3465,6 +3781,19 @@ NB_MODULE(_task_interface, m) {
         .def("comm_destroy_all", &ChipWorker::comm_destroy_all, "Destroy all owned communicators in LIFO order.");
 
     // --- Standalone blob helpers ---
+
+    m.def(
+        "scalar_to_uint64", &encode_scalar, nb::arg("value"),
+        "Bit-encode a Python int, float, bool, or ctypes scalar into the uint64 a scalar slot "
+        "stores, matching C++ to_u64() bit for bit. A ctypes scalar is read at its own width and "
+        "zero-extended, so ctypes.c_int8(-1) is 0xFF rather than a sign-extended 0xFF..FF; the "
+        "admitted ctypes types are c_int8..c_uint64, c_float, c_double and c_bool in host byte "
+        "order, and a pointer type, a character type, or a byte-order-qualified variant such as "
+        "c_uint32.__ctype_be__ is refused. A native Python float narrows to IEEE-754 single "
+        "precision and zero-extends, and a finite value out of single-precision range raises "
+        "rather than becoming an infinity; pass ctypes.c_double for full precision, or another "
+        "ctypes scalar for exact width."
+    );
 
     m.def(
         "materialize_task_args",

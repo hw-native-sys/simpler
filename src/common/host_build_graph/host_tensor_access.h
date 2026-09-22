@@ -20,32 +20,52 @@
  * that capability is resolved, so the orchestrator core never dereferences a
  * device address itself.
  *
- * The current bind path registers one region per staged tensor, backed by the
- * caller's host tensor buffer:
+ * The current bind path registers one region per host-memory tensor, backed by
+ * the caller's host tensor buffer, which the bind has just copied in H2D:
  *
  *   - A read observes that caller buffer.
  *   - A write mutates that caller buffer, then uses the device-copy hook so the
  *     device observes it too. This is visible even for an `IN` argument if its
  *     host orchestration calls `set_tensor_data`.
  *
+ * A child-memory tensor has no such buffer: it arrives already on the device
+ * and the bind stages nothing for it. Its region is therefore added
+ * **unresolved** (`add_child_memory`) and costs nothing until an access lands
+ * inside it, at which point one of two means is chosen for the whole
+ * allocation:
+ *
+ *   - `acquire_child_memory_host_view` returns a host mapping the platform owns
+ *     and keeps for the allocation's lifetime — reads and writes go straight
+ *     through it, coherent by construction.
+ *   - It returns null (a5 onboard has no host-map path; issue #1531 refuses
+ *     ordinary-page small allocations on 64 KiB-page hosts), and every access
+ *     is served by a device copy instead. That path holds no state, so a read
+ *     cannot observe stale bytes and a write lands on the device immediately.
+ *
+ * Resolving on access rather than at bind means the set that gets a mapping is
+ * exactly the set the orchestration touched — a tensor it never reads costs a
+ * vector entry and nothing else.
+ *
  * `add` also retains a null-fallback platform path: it asks the platform for a
  * host-readable mapping whose address may equal or differ from `dev_base`, and
  * always accesses the returned address. The current runtime-maker path cannot
- * reach it: staged tensors always have the caller buffer, while pure outputs
+ * reach it: host-memory tensors always have the caller buffer, while pure outputs
  * are deliberately left unregistered. The path remains as an explicit
  * platform-capability escape hatch in `add` and is covered directly by unit
  * tests; no current production caller reaches it.
  *
- * An address no registered region covers is a failure, never a raw
- * dereference. Pure outputs, GM-heap tensors and pass-through child-memory
- * buffers have no region, so both reads and writes resolve to nothing.
+ * An address no region covers is a failure, never a raw dereference. Pure
+ * outputs and GM-heap tensors the orchestrator created have no region, so both
+ * reads and writes resolve to nothing.
  *
  * Regions and any optional mappings are owned by one orchestration run — the
- * window between staging and the first dispatched task. A caller-buffer view
- * holds the staged bytes, and nothing has executed yet to make it stale; once
+ * window between copy-in and the first dispatched task. A caller-buffer view
+ * holds the copied-in bytes, and nothing has executed yet to make it stale; once
  * tasks run, that view would be indistinguishable from live device memory.
  * `HostTensorAccessor` bounds the window and releases its mappings on every
- * exit path.
+ * exit path. A child-memory mapping is the exception it does not own: the
+ * platform holds that one for the allocation's lifetime, so `close` leaves it
+ * alone.
  *
  * `host/host_tensor_access.cpp` holds the only definitions of the read/write
  * pair, and libhost_runtime.so links them. Nothing in the AICPU build reaches
@@ -93,15 +113,28 @@ public:
      * Register `[dev_base, dev_base + size)`, using `fallback_host_view` (the
      * caller's host tensor buffer) when available and asking the platform for a
      * host mapping otherwise. The current runtime-maker always supplies the
-     * fallback for staged tensors and skips pure outputs, so its bind path does
+     * fallback for host-memory tensors and skips pure outputs, so its bind path does
      * not install mappings.
      *
      * @return false for an empty region, a null `api`, or when neither a
      *         mapping nor a fallback view is available.
      */
     bool add(uint64_t dev_base, uint64_t size, void *fallback_host_view);
-    bool read(uint64_t dev_addr, void *dst, uint64_t bytes) const;
-    bool write(uint64_t dev_addr, const void *src, uint64_t bytes) const;
+
+    /**
+     * Register `[dev_base, dev_base + size)` as a child-memory region, with no
+     * means of access yet.
+     *
+     * A plain push: the platform is not consulted and nothing is mapped. The
+     * first read or write landing inside the region resolves it, so an
+     * orchestration that never touches this tensor pays nothing for it.
+     *
+     * @return false for an empty region or a null `api`.
+     */
+    bool add_child_memory(uint64_t dev_base, uint64_t size);
+
+    bool read(uint64_t dev_addr, void *dst, uint64_t bytes);
+    bool write(uint64_t dev_addr, const void *src, uint64_t bytes);
 
     /** Drop every region and unregister every mapping this accessor installed. */
     void close() noexcept;
@@ -109,8 +142,17 @@ public:
     /** Mappings installed by `add` and not yet dropped by `close`. */
     size_t mapping_count() const noexcept;
 
-    /** Total bytes covered by those mappings; excludes fallback staging views. */
+    /** Total bytes covered by those mappings; excludes caller-buffer views. */
     uint64_t mapped_bytes() const noexcept;
+
+    /**
+     * Accesses served by a device copy because no host mapping was available.
+     *
+     * One PCIe round trip each, so this is the number to look at when a host
+     * that cannot map (a5, or a 64 KiB-page host per issue #1531) orchestrates
+     * more slowly than one that can.
+     */
+    uint64_t device_copy_count() const noexcept;
 
 private:
     struct Impl;

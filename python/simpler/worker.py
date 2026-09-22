@@ -108,9 +108,6 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
 from _task_interface import (
     _host_spans_active as _native_host_spans_active,
 )
-from _task_interface import (
-    _set_host_log_directory as _native_set_host_log_directory,
-)
 
 from . import _log as _simpler_log
 from .buffer import (
@@ -260,13 +257,18 @@ from .global_comm_domain import (
 from .orchestrator import Orchestrator, _callback_frame_for, _callback_run, direct_control
 from .remote_l3_protocol import HOST_TCP_TRANSPORT_PROFILE
 from .task_interface import (
+    MAILBOX_ARGS_CAPACITY,
     MAILBOX_ERROR_MSG_SIZE,
     MAILBOX_FRAME_SIZE,
     MAILBOX_OFF_ERROR_MSG,
+    MAILBOX_OFF_TEARDOWN_REPORT,
     MAILBOX_PREPARATION_DISPOSITION_VALUES,
     MAILBOX_SIZE,
     MAILBOX_STATE_VALUES,
+    MAILBOX_TASK_PROTOCOL_VERSION,
     PROV_NOT_LIVE,
+    SIMPLER_TEARDOWN_REPORT_BYTES,
+    TEARDOWN_REPORT_SCHEMA,
     CallConfig,
     ChipCallable,
     ChipDomainContext,
@@ -281,10 +283,16 @@ from .task_interface import (
     RemoteBufferExport,
     RemoteBufferHandle,
     TaskArgs,
+    _bind_host_log_session_directory,
     _flush_host_log_or_warn,
     _initialize_host_log,
     _start_host_log_writer,
     _Worker,
+)
+from .teardown_report import (
+    TeardownReport,
+    decode_teardown_report,
+    encode_teardown_report_payload,
 )
 from .worker_chip_orch_comm import (
     WorkerChipOrchRegion,
@@ -323,14 +331,14 @@ _OFF_ERROR = 4
 _OFF_CALLABLE = 8
 _OFF_CONFIG = 16
 # Packed CallConfig wire layout — must match call_config.h byte for byte:
-# 7 int32 (aicpu_thread_num, enable_chip_swimlane, enable_dump_args,
-# enable_pmu, enable_dep_gen, enable_scope_stats, capture_clock_anchors) + uint64
+# 6 int32 (aicpu_thread_num, enable_chip_swimlane, enable_dump_args,
+# enable_pmu, enable_dep_gen, enable_scope_stats) + uint64
 # ring sizing overrides (3 per-ring arrays of RUNTIME_ENV_RING_COUNT:
 # ring_task_window, ring_heap, ring_dep_pool) + 1024-byte NUL-terminated
 # output_prefix. Log config travels separately via ChipWorker.init(log_level) —
 # not on per-task wire.
 _RUNTIME_ENV_UINT64_FIELD_COUNT = 3 * RUNTIME_ENV_RING_COUNT
-_CFG_FMT = struct.Struct("=iiiiiii" + ("Q" * _RUNTIME_ENV_UINT64_FIELD_COUNT) + "1024s")
+_CFG_FMT = struct.Struct("=iiiiii" + ("Q" * _RUNTIME_ENV_UINT64_FIELD_COUNT) + "1024s")
 # The generation-safe pipeline lease follows CONFIG. Args start after the
 # lease, rounded up to 8 bytes so the first
 # Tensor.data (uint64_t at OFF_ARGS+8) is 8-byte aligned, avoiding
@@ -365,7 +373,7 @@ _OFF_FRAME_DISPATCH_ID = _OFF_ACCEPTED - 8
 _OFF_FRAME_TASK_SLOT = _OFF_ACCEPTED - 48
 _OFF_FRAME_GROUP_INDEX = _OFF_ACCEPTED - 56
 _OFF_FRAME_GROUP_SIZE = _OFF_ACCEPTED - 64
-_TASK_PROTOCOL_VERSION = 4
+_TASK_PROTOCOL_VERSION = 5
 # Mirrors MAILBOX_OFF_SHUTDOWN / MAILBOX_SHUTDOWN_REQUESTED: termination is a
 # sticky one-way word on the control frame, not a MailboxState. _OFF_STATE has
 # three writers (parent CONTROL_REQUEST, child CONTROL_DONE, C++
@@ -374,7 +382,13 @@ _TASK_PROTOCOL_VERSION = 4
 # is reserved on every frame so a task-args blob can never reach it.
 _OFF_SHUTDOWN = _OFF_ACCEPTED - 72
 _SHUTDOWN_REQUESTED = 1
-_MAILBOX_ARGS_CAPACITY = _OFF_SHUTDOWN - _OFF_TASK_ARGS_BLOB
+# The chip child's teardown observation. Like the shutdown word it is reserved
+# on every frame so a task-args blob can never reach it, and it is a record
+# rather than a state word because its fields only mean anything together.
+# `schema` sits at offset 0 of the record and is released last, so a reader
+# that acquire-loads _TEARDOWN_REPORT_SCHEMA has the whole record.
+_OFF_TEARDOWN_REPORT = _OFF_SHUTDOWN - SIMPLER_TEARDOWN_REPORT_BYTES - 8
+_MAILBOX_ARGS_CAPACITY = _OFF_TEARDOWN_REPORT - _OFF_TASK_ARGS_BLOB
 _OFF_CONTROL_CALLABLE_HASH = _OFF_ARGS + 32
 # MAILBOX_OFF_ERROR_MSG / MAILBOX_ERROR_MSG_SIZE come from the C++
 # nanobind module so the two sides cannot drift.
@@ -460,6 +474,20 @@ def _assert_mailbox_wire_constants() -> None:
                 "A child can publish them and this module would not recognise the value."
             )
 
+    # Layout rather than enumerators: these offsets are derived independently
+    # on both sides from the same rules, so a disagreement is a silently
+    # misplaced read in one process rather than a compile error.
+    layout = {
+        "MAILBOX_OFF_TEARDOWN_REPORT": (_OFF_TEARDOWN_REPORT, MAILBOX_OFF_TEARDOWN_REPORT),
+        "MAILBOX_ARGS_CAPACITY": (_MAILBOX_ARGS_CAPACITY, MAILBOX_ARGS_CAPACITY),
+        "MAILBOX_TASK_PROTOCOL_VERSION": (_TASK_PROTOCOL_VERSION, MAILBOX_TASK_PROTOCOL_VERSION),
+    }
+    drifted = sorted(f"{key}: python={mine} c++={theirs}" for key, (mine, theirs) in layout.items() if mine != theirs)
+    if drifted:
+        raise RuntimeError(
+            "mailbox frame layout in simpler.worker disagrees with the C++ header: " + "; ".join(drifted)
+        )
+
 
 _assert_mailbox_wire_constants()
 
@@ -468,6 +496,70 @@ def _local_task_frame_count(platform: str, _runtime: str, pipeline_depth: int) -
     if platform == "a2a3" and pipeline_depth >= 2:
         return _TASK_FRAME_COUNT
     return 1
+
+
+# `Orchestrator::configure_pipeline_depth` takes the budget as a uint32_t.
+_PENDING_RUN_DEPTH_MAX = 2**32 - 1
+
+
+def _validated_pending_run_depth(config: dict, level: int) -> int:
+    """This Worker's `pending_run_depth`, validated before any startup side effect.
+
+    A level < 3 Worker owns no admission FIFO — its runs are the chip child's — so the key is
+    refused there rather than silently ignored.
+    """
+    if "pending_run_depth" not in config:
+        return 0
+    value = config["pending_run_depth"]
+    if level < 3:
+        raise ValueError(f"Worker pending_run_depth requires a level >= 3 Worker, got level {level}")
+    # bool is an int subclass, and True would silently mean depth one.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"Worker pending_run_depth must be an int, got {type(value).__name__}")
+    if value < 0:
+        raise ValueError(f"Worker pending_run_depth must be >= 0, got {value}")
+    if value > _PENDING_RUN_DEPTH_MAX:
+        raise ValueError(f"Worker pending_run_depth must be <= {_PENDING_RUN_DEPTH_MAX}, got {value}")
+    return value
+
+
+def _validated_launch_depth(config: dict, level: int) -> int:
+    """This Worker's ``launch_depth``, validated before any startup side effect.
+
+    How many runs may have their device work launched at once. One — the default — keeps a
+    successor's work off the device until its predecessor is terminal, which is what every Worker
+    did before this key existed. Two lets a staged successor's work reach the device while its
+    predecessor is still executing; the device still runs one operator at a time, ordered by a
+    queued wait for the predecessor's whole-operator completion boundary.
+
+    Bounded by ``PTO_PIPELINE_MAX_DEPTH`` rather than by an arbitrary number: a launched run holds
+    its pipeline slot for its whole lifetime, so the slot count is the real ceiling. Refused on a
+    level < 3 Worker for the same reason ``pending_run_depth`` is — the runs being ordered are the
+    chip child's, and a Worker below the admission FIFO owns neither.
+    """
+    if "launch_depth" not in config:
+        return 1
+    value = config["launch_depth"]
+    if level < 3:
+        raise ValueError(f"Worker launch_depth requires a level >= 3 Worker, got level {level}")
+    # bool is an int subclass, and True would silently mean depth one.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"Worker launch_depth must be an int, got {type(value).__name__}")
+    if value < 1:
+        raise ValueError(f"Worker launch_depth must be >= 1, got {value}")
+    if value > PTO_PIPELINE_MAX_DEPTH:
+        raise ValueError(f"Worker launch_depth must be <= {PTO_PIPELINE_MAX_DEPTH}, got {value}")
+    return value
+
+
+def _validated_run_depths(config: dict, level: int) -> tuple[int, int]:
+    """This Worker's two run budgets, ``(pending_run_depth, launch_depth)``.
+
+    Both are validated before any startup side effect, and both are refused on a Worker below the
+    admission FIFO. They bound different things: how many runs may be admitted, and how many of
+    those may have device work launched at once.
+    """
+    return _validated_pending_run_depth(config, level), _validated_launch_depth(config, level)
 
 
 def _shm_name(token: str, suffix: str):
@@ -2804,6 +2896,61 @@ def _provider_sweep_debt_errors(results: tuple[ProviderReleaseResult, ...]) -> l
     return errors
 
 
+def _read_teardown_report(shm: SharedMemory, child_pid: int) -> TeardownReport:
+    """Copy one reaped child's teardown record out of its mailbox.
+
+    Acquire-loads the schema word first, so a record whose payload write was
+    cut short by a killed child never reads as a partly populated success. Any
+    failure here is the reader's unknown answer, never an error: close is
+    already reporting whatever went wrong with the teardown itself.
+    """
+    try:
+        buf = shm.buf
+        if buf is None:
+            return TeardownReport()
+        if _mailbox_load_i32(_buffer_field_addr(buf, _OFF_TEARDOWN_REPORT)) != TEARDOWN_REPORT_SCHEMA:
+            return TeardownReport()
+        raw = bytes(buf[_OFF_TEARDOWN_REPORT : _OFF_TEARDOWN_REPORT + SIMPLER_TEARDOWN_REPORT_BYTES])
+        return decode_teardown_report(raw, expected_pid=child_pid)
+    except BaseException:  # noqa: BLE001
+        return TeardownReport()
+
+
+def _finalize_chip_worker_and_publish(buf: memoryview, cw: ChipWorker) -> None:
+    """Run this child's one device teardown, then publish what it observed.
+
+    Both child exits that own a teardown — the startup preparation failure and
+    the main loop's own exit — go through here, so there is exactly one
+    ``finalize()`` call on each and the record is published from a ``finally``
+    on both. Publication adds no finalize or reset call and swallows its own
+    failures, so a teardown that raises still raises, unchanged.
+    """
+    try:
+        cw.finalize()
+    finally:
+        _publish_teardown_report(buf, cw)
+
+
+def _publish_teardown_report(buf: memoryview, cw: ChipWorker) -> None:
+    """Publish this child's teardown observation on the control frame, payload first.
+
+    The schema word is released last, so a parent that acquire-loads it has the
+    whole record and a parent that finds anything else has none of it. Every
+    failure here is swallowed: the observation must never displace the teardown
+    outcome the parent is about to be told about, and an unpublished record is
+    already the reader's unknown answer.
+    """
+    try:
+        raw = cw.teardown_report_bytes()
+        if raw is None:
+            return
+        payload = encode_teardown_report_payload(raw, child_pid=os.getpid())
+        buf[_OFF_TEARDOWN_REPORT + 4 : _OFF_TEARDOWN_REPORT + SIMPLER_TEARDOWN_REPORT_BYTES] = payload[4:]
+        _mailbox_store_i32(_buffer_field_addr(buf, _OFF_TEARDOWN_REPORT), TEARDOWN_REPORT_SCHEMA)
+    except BaseException:  # noqa: BLE001
+        return
+
+
 def _teardown_chip_process_resources(
     import_registry: ImportRegistry,
     cw: ChipWorker,
@@ -2950,6 +3097,13 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
         diagnostic_capture_index += 1
         return cfg
 
+    def finish_task_logging(cfg: CallConfig | None, code: int, msg: str) -> tuple[int, str]:
+        # TASK_DONE permits the parent to read this child's completed invocation.
+        if cfg is not None and cfg.enable_chip_swimlane and cfg.output_prefix:
+            if not _flush_host_log_or_warn(f"chip_process dev={device_id}: task completion"):
+                return 1, msg or f"chip_process dev={device_id}: diagnostic Host log flush failed"
+        return code, msg
+
     def handle_task(task_buf) -> tuple[int, str]:
         task_addr = ctypes.addressof(ctypes.c_char.from_buffer(task_buf))
         digest = _read_task_digest(task_buf)
@@ -2958,6 +3112,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
 
         code = 0
         msg = ""
+        cfg = None
         try:
             # Inside the try because it writes the diagnostic sidecar: a full or
             # read-only output_prefix must surface as this task's error, not as
@@ -2990,6 +3145,8 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             chip_args = materialize_task_args(args, resolved)
             # The acceptance flag lives in the mailbox, not in the materialized args, so
             # the fence still publishes through the address the parent polls.
+            if cfg.output_prefix:
+                _bind_host_log_session_directory()
             cw._impl.run_materialized(
                 cid,
                 chip_args,
@@ -3010,7 +3167,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
         # staging garbage would mask the real error in post-mortems.
         if code == 0 and on_task_done_success is not None:
             code, msg = on_task_done_success()
-        return code, msg
+        return finish_task_logging(cfg, code, msg)
 
     def handle_control(  # noqa: PLR0912, PLR0915 -- one branch per control sub-command
         sub_cmd: int,
@@ -3152,6 +3309,54 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                 msg = _format_exc(f"{op} hash={_format_digest(_read_control_digest(buf))} chip={device_id}", e)
             else:
                 msg = _format_exc(f"chip_process dev={device_id} ctrl={int(sub_cmd)}", e)
+        finally:
+            # An exported region is a device resource this child's host side owns and releases
+            # before its reset, so while one is held no run may be ordered behind another.
+            #
+            # In a `finally` covering every sub-command, because a command that *failed* can still
+            # have left the store owning a resource: a delegated allocation publishes its reply
+            # after the resource record exists, and publication allocates, so it can raise with the
+            # region live. The outer loop survives that error, so a flag left at its previous value
+            # would say no region is held while one is. The same reasoning covers a failed release,
+            # whose debt keeps the resource — and the query is non-mutating, so asking costs the
+            # error path nothing and changes nothing about it.
+            try:
+                cw.set_exported_device_regions_live(provider_region_store.holds_resources)
+            except Exception as flag_error:  # noqa: BLE001
+                # The flag could not be refreshed, so what this worker owns is unknown. Declare a
+                # region live: withholding every join is the answer that cannot be unsafe.
+                #
+                # The command's own failure is what the caller asked about, so it is settled first
+                # and anything that happens while cleaning up is appended to it, never over it.
+                if code == 0:
+                    code = 1
+                    msg = _format_exc(f"chip_process dev={device_id} ctrl={int(sub_cmd)} region ownership", flag_error)
+                conservative = False
+                try:
+                    cw.set_exported_device_regions_live(True)
+                    conservative = True
+                except Exception:  # noqa: BLE001
+                    pass
+                if not conservative:
+                    # The native flag may still read false while a region is held, which would let
+                    # a later run be ordered behind another whose failure could end the generation
+                    # those regions belong to. Reporting the command error and carrying on would
+                    # leave exactly that. So the child stops taking work, through the same
+                    # shutdown word the loop already polls and the parent already writes — no new
+                    # teardown path, and the dispatches that would have been admitted fail instead.
+                    #
+                    # The lane is stopped *first*, and separately. Breaking the loop is not enough:
+                    # the ordinary close that follows drains, and a drain launches before it waits,
+                    # so an activated prepared successor would reach the device on the way out —
+                    # moving the unsafe admission into cleanup rather than preventing it. Runs
+                    # already launched keep their own drains.
+                    try:
+                        cw._impl._stop_chip_run_lane_admission()  # noqa: SLF001 -- no public equivalent
+                    except Exception as stop_error:  # noqa: BLE001
+                        msg = (msg + "; " if msg else "") + _format_exc(
+                            f"chip_process dev={device_id} stop chip run lane admission", stop_error
+                        )
+                    _mailbox_store_i32(_buffer_field_addr(buf, _OFF_SHUTDOWN), _SHUTDOWN_REQUESTED)
         return code, msg
 
     def run_two_frame_loop() -> None:  # noqa: PLR0912, PLR0915 -- one progress owner drives control and both task frames
@@ -3245,6 +3450,8 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             args = read_args_from_blob(args_ptr, _MAILBOX_ARGS_CAPACITY)
             resolved = import_registry.materialize_args(args)
             chip_args = materialize_task_args(args, resolved)
+            if frame.config.output_prefix:
+                _bind_host_log_session_directory()
             frame.chip_run = cw._impl._submit_chip_run_materialized(
                 frame.cid,
                 chip_args,
@@ -3286,6 +3493,20 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                         code, msg = handle_control(int(sub_cmd))
                         _write_error(buf, code, msg)
                         _mailbox_store_i32(state_addr, _CONTROL_DONE)
+                        # A handler that could not establish conservative
+                        # resource ownership requests this worker's own stop.
+                        # Honour it here, before anything below stages,
+                        # activates or drives a run: the loop's own check is at
+                        # the top, so waiting for the next iteration would admit
+                        # exactly the work the stop exists to prevent. The
+                        # response above is already published, so the caller
+                        # still gets the command's own error.
+                        if _mailbox_load_i32(shutdown_addr) == _SHUTDOWN_REQUESTED:
+                            shutdown_message = (
+                                f"chip_process dev={device_id}: stopped after a control command left device-resource "
+                                f"ownership unknown"
+                            )
+                            break
 
                 new_frames: list[_StagedFrame] = []
                 for index in range(_TASK_FRAME_COUNT):
@@ -3351,6 +3572,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                                 except Exception as e:  # noqa: BLE001
                                     code = 1
                                     msg = _format_exc(f"chip_process dev={device_id}: task completion hook", e)
+                            code, msg = finish_task_logging(staged.config, code, msg)
                             _write_error(staged.frame_buf, code, msg)
                             _mailbox_store_i32(
                                 staged.frame_addr + _OFF_STATE,
@@ -3418,6 +3640,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     prewarm_config=None,
     enable_sdma: bool = False,
     chip_rank: int | None = None,
+    launch_depth: int = 1,
 ) -> None:
     """Runs in forked child process. Loads host_runtime.so in own address space.
 
@@ -3432,6 +3655,10 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
 
     try:
         cw = ChipWorker()
+        # Before init: the backend's own capability is only known once init binds the runtime, and
+        # `ChipWorker.launch_depth` is where the request and that capability meet.
+        if launch_depth > 1:
+            cw.configure_launch_depth(launch_depth)
         cw.init(
             device_id,
             bins,
@@ -3463,7 +3690,10 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
         _tb.print_exc()
         _write_error(buf, 1, _format_exc(f"chip_process dev={device_id} prepare", e))
         _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _INIT_FAILED)
-        cw.finalize()
+        # This branch already owns a real device teardown, and the child exits
+        # normally from it, so its observation is publishable — the same
+        # finalize-then-publish shape the main loop's exit uses.
+        _finalize_chip_worker_and_publish(buf, cw)
         return
 
     mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
@@ -3498,7 +3728,25 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             chip_rank=chip_rank,
         )
     finally:
-        cw.finalize()
+        # After the teardown, whether or not it raised: the C++ side captured
+        # its observation before throwing, and the parent's shared mailbox
+        # outlives this process.
+        _finalize_chip_worker_and_publish(buf, cw)
+
+
+def _level_capture_prefix(prefix: str, worker: Worker) -> str:
+    """The diagnostics prefix one level hands to the level below it.
+
+    A Worker its parent attached owns a namespace under that parent's, named by
+    the role it plays and the id the parent gave it. Without one, two Workers at
+    the same level write over each other: each numbers its own chips from zero,
+    so both claim `rank0/d0`, and on two machines neither even sees the
+    collision. A Worker with no parent is the top of its own tree and keeps the
+    prefix it was handed, which leaves a single-tree layout as it was.
+    """
+    if not prefix or worker._topology_worker_id is None:
+        return prefix
+    return os.path.join(prefix, f"{_span_prefix(worker.level)}{worker._topology_worker_id}")
 
 
 def _read_config_from_mailbox(
@@ -3506,6 +3754,7 @@ def _read_config_from_mailbox(
     *,
     chip_rank: int | None = None,
     capture_index: int | None = None,
+    level_worker: Worker | None = None,
 ) -> CallConfig:
     """Reconstruct a CallConfig from the unified mailbox layout."""
     (
@@ -3515,7 +3764,6 @@ def _read_config_from_mailbox(
         pmu,
         dep_gen,
         scope_stats,
-        _capture_clock_anchors,
         *ring_values,
         prefix_bytes,
     ) = _CFG_FMT.unpack_from(buf, _OFF_CONFIG)
@@ -3534,11 +3782,10 @@ def _read_config_from_mailbox(
     cfg.runtime_env.ring_dep_pool = ring_dep_pool
     # NUL-terminated C string in a 1024-byte field.
     cfg.output_prefix = prefix_bytes.split(b"\x00", 1)[0].decode("utf-8")
-    # Keep per-process host logs at the case root. Profiling artifacts are
-    # routed below, after the log directory has been configured, so changing
-    # capture directories does not add log-directory churn to every dispatch.
-    if cfg.output_prefix:
-        _native_set_host_log_directory(cfg.output_prefix)
+    # Applied before the log directory is bound, so this Worker's own records
+    # land in the namespace it owns rather than in its parent's.
+    if level_worker is not None:
+        cfg.output_prefix = _level_capture_prefix(cfg.output_prefix, level_worker)
     if cfg.output_prefix and chip_rank is not None and capture_index is not None and _config_diagnostics_any(cfg):
         # Every diagnostic below output_prefix uses a fixed filename, so N
         # ChipWorker children sharing one prefix overwrite each other's
@@ -3546,10 +3793,6 @@ def _read_config_from_mailbox(
         # it is read only by the offline tools: no runtime or platform code
         # parses this path, or knows that a Rank is what produced it.
         cfg.output_prefix = os.path.join(cfg.output_prefix, f"rank{chip_rank}", f"d{capture_index}")
-        # Only the swimlane reader places its records against a Host timeline,
-        # so it alone needs both clocks anchored; the other diagnostics get the
-        # directory separation without paying for the anchors.
-        cfg.capture_clock_anchors = bool(cfg.enable_chip_swimlane)
     return cfg
 
 
@@ -3663,7 +3906,7 @@ def _child_worker_loop(
             # handle H' (per-backing, no map) so the inner orch sees only its own handles;
             # pure forwarding to L2 carries no map cost.
             args = _reexport_args_from_mailbox(task_buf, inner_worker)
-            cfg = _read_config_from_mailbox(task_buf)
+            cfg = _read_config_from_mailbox(task_buf, level_worker=inner_worker)
             inner_worker.run(orch_fn, args, cfg)
         except Exception as e:  # noqa: BLE001
             return 1, _format_exc(f"child_worker level={inner_worker.level}", e)
@@ -3761,21 +4004,34 @@ def _child_worker_loop(
     )
 
 
-def _journal_child_survivors(journal, sub_shms, sub_pids, chip_shms, chip_pids, next_shms, next_pids, reaped):
+def _journal_child_survivors(  # noqa: PLR0913 -- one (shms, pids) pair per child kind, plus the report sink
+    journal, sub_shms, sub_pids, chip_shms, chip_pids, next_shms, next_pids, reaped, reports=None
+):
     """Register unreaped child processes and their paired shms in the cleanup
-    journal so a subsequent close() can retry."""
+    journal so a subsequent close() can retry.
+
+    A chip child journaled here is one that outlived the close deadline, so the
+    first reap pass could not read its teardown record. The retry owns that
+    read: it happens inside the same closure, after the reap succeeds and
+    before the shm is closed, which is the last moment the record exists.
+    Without it a child that publishes late would vanish from
+    ``teardown_reports()``, which would say "never reaped" about a child that
+    was.
+    """
     for shms, pids, kind in (
         (sub_shms, sub_pids, "sub"),
         (chip_shms, chip_pids, "chip"),
         (next_shms, next_pids, "next"),
     ):
+        # Only chip children run a device teardown, so only they carry a record.
+        kind_reports = reports if kind == "chip" else None
         for i in range(min(len(shms), len(pids))):
             pid = pids[i]
             if pid in reaped:
                 continue
             shm = shms[i]
 
-            def _make_cleanup(_shm=shm, _pid=pid, _kind=kind):
+            def _make_cleanup(_shm=shm, _pid=pid, _kind=kind, _reports=kind_reports):
                 def _cleanup_child():
                     try:
                         wpid, _status = os.waitpid(_pid, os.WNOHANG)
@@ -3785,6 +4041,12 @@ def _journal_child_survivors(journal, sub_shms, sub_pids, chip_shms, chip_pids, 
                         wpid = 0
                     if wpid == 0:
                         raise RuntimeError(f"child {_kind} pid {_pid} still alive; shm not freed")
+                    # Reaped, so nothing can still be writing the record, and
+                    # the shm is about to go. Read once: a journal retry after
+                    # a close failure must not replace what the first read
+                    # already established.
+                    if _reports is not None and _pid not in _reports:
+                        _reports[_pid] = _read_teardown_report(_shm, _pid)
                     cleanup_error = None
                     try:
                         _shm.close()
@@ -4714,6 +4976,13 @@ class Worker:
         self._startup_timeout_s = float(config.get("startup_timeout_s", _STARTUP_TIMEOUT_S))
         if not (self._startup_timeout_s > 0 and math.isfinite(self._startup_timeout_s)):
             raise ValueError("Worker startup_timeout_s must be a positive finite number of seconds")
+        # `pending_run_depth` bounds non-terminal logical runs in this Worker's admission FIFO; 0
+        # derives the bound from the negotiated direct-chip pipeline depth. That cap is a run
+        # count: it is not a memory budget, and a terminal run whose RunHandle is unreleased does
+        # not occupy it. `launch_depth` bounds how many of those runs may have their device work
+        # launched at once; 1 keeps a successor's work off the device until its predecessor is
+        # terminal.
+        self._pending_run_depth, self._launch_depth = _validated_run_depths(config, int(level))
         # Per-startup bookkeeping consumed by the rollback path: PIDs the barrier
         # already reaped (must not be re-SIGKILLed — the PID may be reused) and
         # PIDs that reached their serve loop (READY → asked to close gracefully
@@ -4800,12 +5069,21 @@ class Worker:
         self._orch: Orchestrator | None = None
         self._chip_shms: list[SharedMemory] = []
         self._chip_pids: list[int] = []
+        # Teardown observations copied out of each reaped chip child's mailbox,
+        # keyed by that child's pid. Absent means the child never reaped, which
+        # is a different answer from an uncommitted record.
+        self._teardown_reports: dict[int, TeardownReport] = {}
         self._sub_shms: list[SharedMemory] = []
         self._sub_pids: list[int] = []
 
         # L4+ next-level Worker children (added via add_worker before init)
         self._next_level_workers: list[Worker] = []
         self._topology_parent: Worker | None = None
+        # The id a parent gave this Worker, which is also the namespace its
+        # diagnostics go under. Held here and not only in the parent's list
+        # because the process that writes them is the forked child, which
+        # reaches the parent's bookkeeping no more easily than any other.
+        self._topology_worker_id: int | None = None
         self._next_level_worker_ids: list[int] = []
         self._next_level_shms: list[SharedMemory] = []
         self._next_level_pids: list[int] = []
@@ -7632,6 +7910,7 @@ class Worker:
                 raise RuntimeError("Child worker is already attached to another parent")
             worker_id = self._allocate_next_level_worker_id()
             worker._topology_parent = self
+            worker._topology_worker_id = worker_id
             self._next_level_workers.append(worker)
             self._next_level_worker_ids.append(worker_id)
             return worker_id
@@ -8149,6 +8428,7 @@ class Worker:
                             prewarm_config=self._prewarm_config,
                             enable_sdma=bool(self._config.get("enable_sdma", False)),
                             chip_rank=idx,
+                            launch_depth=self._launch_depth,
                         )
                     except BaseException as e:  # noqa: BLE001
                         import traceback as _tb  # noqa: PLC0415
@@ -8266,7 +8546,15 @@ class Worker:
         # the unified mailbox.
         dw = self._worker
         assert dw is not None
-        dw.configure_pipeline_depth(direct_chip_pipeline_depth)
+        # `direct_chip_pipeline_depth` is the native pipeline-slot capability; `_pending_run_depth`
+        # is this Worker's logical admission bound, with 0 deriving it from the first;
+        # `_launch_depth` bounds how many of those runs may have device work launched at once, and
+        # cannot exceed the slot capability because a launched run holds its slot until it ends.
+        dw.configure_pipeline_depth(
+            direct_chip_pipeline_depth,
+            self._pending_run_depth,
+            min(self._launch_depth, direct_chip_pipeline_depth),
+        )
 
         # Register chip workers as NEXT_LEVEL (L3). The child pid lets the C++
         # endpoint fail a dispatch whose child died instead of spinning on a
@@ -11153,6 +11441,29 @@ class Worker:
             if self._buffers.get(buffer_id) is buffer:
                 del self._buffers[buffer_id]
 
+    def teardown_reports(self) -> dict[int, TeardownReport]:
+        """What each reaped chip child observed about its own device teardown.
+
+        Keyed by the child's pid; the device it held is a field of the record.
+        Valid once ``close()`` has reaped the children — before that the map is
+        empty, because the record is copied out of a child's mailbox only after
+        that child is reaped and before its shared memory is closed. A child
+        that outlives the close deadline is read by the cleanup journal's retry
+        at the same two points, so a late publication is still collected.
+
+        Three answers, deliberately distinct. A missing key is a child this
+        Worker never reaped. A key whose record has ``committed`` false is a
+        child that was reaped but published nothing valid — it died before or
+        during the write, or its backend records no teardown. Anything else is
+        what that child's teardown did.
+
+        Observation only. A confirmed reset invalidates that device
+        generation's allocations rather than making an old device pointer
+        reusable, a reset call that returned 0 on the normal path has no probe
+        behind it, and an unknown record asserts nothing at all.
+        """
+        return dict(self._teardown_reports)
+
     def _release_all_buffers(self) -> None:
         """Close + unlink every owner Buffer (called from close()).
 
@@ -11232,6 +11543,8 @@ class Worker:
         if self.level == 2:
             assert self._chip_worker is not None
             state = self._resolve_handle(callable, expected_namespace="LOCAL_CHIP")
+            if getattr(cfg, "output_prefix", ""):
+                _bind_host_log_session_directory()
             return self._submit_l2_locked(state.slot_id, args, cfg)
 
         with self._submit_mu.exclusive():
@@ -11490,13 +11803,8 @@ class Worker:
     def _submit_l3_locked(self, callable, args, cfg: CallConfig) -> RunHandle:
         assert self._orch is not None
         assert self._worker is not None
-        # This process's log belongs beside the run's other diagnostic artifacts,
-        # so the directory comes from the config that already names it. First one
-        # in a process wins; with no prefix the logger stays on stderr. Read
-        # defensively: wiring an output must never be what fails a submit.
-        log_directory = getattr(cfg, "output_prefix", "")
-        if log_directory:
-            _native_set_host_log_directory(log_directory)
+        if getattr(cfg, "output_prefix", ""):
+            _bind_host_log_session_directory()
         run_id = self._orch._begin_run()
         resources = _RunResources()
         handle = RunHandle(self, run_id, (callable, args, cfg), resources)
@@ -12163,7 +12471,10 @@ class Worker:
 
     @staticmethod
     def _reap_child_groups(  # noqa: PLR0912 -- interleaved reap across groups / bounded poll / conditional shm-free
-        groups: list[tuple[list[SharedMemory], list[int]]], deadline: float
+        groups: list[tuple[list[SharedMemory], list[int]]],
+        deadline: float,
+        report_pids: set[int] | None = None,
+        reports: dict[int, TeardownReport] | None = None,
     ) -> None:
         """Reap + free every child across ALL groups within one shared deadline.
 
@@ -12178,6 +12489,13 @@ class Worker:
         to transfer into the retry journal. An abnormal exit (signal / non-zero
         code) is likewise reported. The first error is raised after every child
         is attempted.
+
+        A pid in ``report_pids`` also has its teardown record copied out of the
+        mailbox here — after the child is reaped, so nothing can still be
+        writing it, and before the shm is closed, which is the last moment it
+        is readable. A reaped child that published nothing valid yields an
+        uncommitted record; a child that never reaps yields no entry at all,
+        which is a different answer.
         """
         errors: list[BaseException] = []
         bad_exits: list[str] = []
@@ -12223,6 +12541,8 @@ class Worker:
                     keep_shms.append(shms[i])
                     continue
                 try:
+                    if report_pids is not None and reports is not None and pids[i] in report_pids:
+                        reports[pids[i]] = _read_teardown_report(shms[i], pids[i])
                     shms[i].close()
                     try:
                         shms[i].unlink()
@@ -12272,7 +12592,9 @@ class Worker:
         ]
         reap_error: BaseException | None = None
         try:
-            self._reap_child_groups(groups, deadline)
+            # Only chip children run a device teardown, so only their mailboxes
+            # carry a record to collect.
+            self._reap_child_groups(groups, deadline, set(self._chip_pids), self._teardown_reports)
         except BaseException as exc:  # noqa: BLE001
             reap_error = exc
 
@@ -12288,6 +12610,7 @@ class Worker:
             self._next_level_shms,
             self._next_level_pids,
             set(),
+            self._teardown_reports,
         )
         self._sub_pids.clear()
         self._chip_pids.clear()

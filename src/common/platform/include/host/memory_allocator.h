@@ -106,6 +106,33 @@ public:
     }
 
     /**
+     * Resolve an address to the tracked allocation that contains it.
+     *
+     * An address inside an allocation is not itself a key: a tensor may sit at
+     * an offset into a larger buffer. Callers that must act on the allocation
+     * as a whole — a host mapping, which is established and released per
+     * allocation — recover its base and size here.
+     *
+     * @param ptr   Any address, allocation base or interior
+     * @param base  Receives the containing allocation's base
+     * @param size  Receives its requested size
+     * @return true when a tracked allocation covers `ptr`
+     */
+    bool owning_allocation(const void *ptr, void **base, size_t *size) const {
+        if (ptr == nullptr) return false;
+        const auto *addr = static_cast<const unsigned char *>(ptr);
+        std::scoped_lock lk(mu_);
+        for (const auto &[alloc_ptr, alloc_size] : ptr_size_map_) {
+            const auto *alloc_addr = static_cast<const unsigned char *>(alloc_ptr);
+            if (addr < alloc_addr || addr >= alloc_addr + alloc_size) continue;
+            if (base != nullptr) *base = alloc_ptr;
+            if (size != nullptr) *size = alloc_size;
+            return true;
+        }
+        return false;
+    }
+
+    /**
      * Get number of tracked allocations
      *
      * @return Number of currently tracked pointers

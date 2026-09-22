@@ -10,7 +10,10 @@
 
 import json
 import os
+import shutil
+import subprocess
 import threading
+from pathlib import Path
 
 import pytest
 from _task_interface import CallConfig, RuntimeEnv, _ChipWorker  # pyright: ignore[reportMissingImports]
@@ -164,6 +167,191 @@ class TestCallConfig:
 # ============================================================================
 # ChipWorker state machine tests
 # ============================================================================
+
+
+_KERNEL_LIFECYCLE_SYMBOLS = (
+    "simpler_kernel_mode_init",
+    "simpler_kernel_mode_prepare_callable",
+    "simpler_kernel_mode_launch",
+)
+
+
+@pytest.fixture(scope="module")
+def kernel_symbol_runtime(tmp_path_factory):
+    """Build real DSOs with a selectable kernel capability and export surface."""
+    compiler = shutil.which("c++") or shutil.which("g++")
+    assert compiler is not None, "kernel symbol tests require a C++ compiler"
+    build_dir = tmp_path_factory.mktemp("kernel_symbol_runtime")
+    worker_headers = Path(__file__).resolve().parents[3] / "src" / "common" / "worker"
+    unused_symbols = """
+        device_malloc_ctx device_free_ctx committed_device_memory_ctx device_memory_info_ctx
+        copy_to_device_ctx copy_from_device_ctx simpler_register_callable simpler_run
+        simpler_prepare_run simpler_launch_run simpler_launch_run_joined simpler_poll_run simpler_wait_run
+        simpler_finalize_run supports_concurrent_native_prepare_ctx supports_joined_native_launch_ctx
+        get_arena_bank_gm_heap_base_ctx get_retained_temp_addr_ctx
+        simpler_unregister_callable get_aicpu_dlopen_count get_host_dlopen_count get_run_stream_set_create_count
+        ensure_acl_ready_ctx create_comm_stream_ctx destroy_comm_stream_ctx comm_init comm_alloc_windows
+        comm_get_local_window_base comm_get_window_size comm_derive_context comm_alloc_domain_windows
+        comm_release_domain_windows comm_global_domain_prepare comm_global_domain_import
+        comm_global_domain_release comm_barrier comm_destroy
+    """.split()
+    cache = {}
+
+    def build(*, supported=0, missing=(), init_result=0, finalize_failures=0):
+        key = (supported, missing, init_result, finalize_failures)
+        if key in cache:
+            return cache[key]
+        source = build_dir / f"runtime_{len(cache)}.cpp"
+        sentinels = source.with_suffix(".sentinels.cpp")
+        library = source.with_suffix(".so")
+        source.write_text(
+            '#include "runtime_c_api.h"\n'
+            "#include <cstdlib>\n"
+            "static int live_contexts = 0;\n"
+            "struct ContextLeakCheck {\n"
+            "    ~ContextLeakCheck() { if (live_contexts != 0) std::abort(); }\n"
+            "};\n"
+            "static ContextLeakCheck context_leak_check;\n"
+            "struct SimplerHostLogState;\n"
+            'extern "C" int simpler_host_log_bind_state(SimplerHostLogState *) { return 0; }\n'
+            # ChipWorker binds the process's device-fault monitor into every
+            # host runtime it loads, and does so strictly: a module that does
+            # not export the setter is a stale build, not an opt-out. This stub
+            # accepts the pointer and ignores it, as it does the log state.
+            'extern "C" void simpler_bind_device_fault_monitor(void *) {}\n'
+            "DeviceContextHandle create_device_context() { ++live_contexts; return new uint64_t{0}; }\n"
+            "void destroy_device_context(DeviceContextHandle ctx) {\n"
+            "    --live_contexts; delete static_cast<uint64_t *>(ctx);\n"
+            "}\n"
+            f"static int finalize_failures = {finalize_failures};\n"
+            "int finalize_device(DeviceContextHandle) {\n"
+            "    if (finalize_failures > 0) { --finalize_failures; return -77; }\n"
+            "    return 0;\n"
+            "}\n"
+            "size_t get_runtime_size() { return sizeof(uint64_t); }\n"
+            "size_t get_runtime_alignment() { return alignof(uint64_t); }\n"
+            "const PipelineContract *get_pipeline_contract() {\n"
+            "    static const PipelineContract contract{PTO_PIPELINE_CONTRACT_ABI_VERSION, 2, 1, {\n"
+            "        {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},\n"
+            "        {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0}}};\n"
+            "    return &contract;\n"
+            "}\n"
+            "int simpler_init(DeviceContextHandle ctx, int, const uint8_t *, size_t, const uint8_t *, size_t,\n"
+            "                 const uint8_t *, size_t, const CallConfig *, int, const void *, uint64_t) {\n"
+            "    *static_cast<uint64_t *>(ctx) = 1;\n"
+            f"    return {init_result};\n"
+            "}\n"
+            + (
+                "int simpler_kernel_mode_supported(DeviceContextHandle ctx) {\n"
+                "    if (ctx == nullptr || *static_cast<uint64_t *>(ctx) != 0) std::abort();\n"
+                f"    return {supported};\n"
+                "}\n"
+                if "simpler_kernel_mode_supported" not in missing
+                else ""
+            ),
+            encoding="utf-8",
+        )
+        # These symbols are only resolved during init; any invocation is a test failure.
+        # A separate TU keeps the sentinels independent of the C ABI parameter lists.
+        sentinels.write_text(
+            "#include <cstdlib>\n"
+            + "".join(
+                f'extern "C" void {symbol}() {{ std::abort(); }}\n'
+                for symbol in (*unused_symbols, *_KERNEL_LIFECYCLE_SYMBOLS)
+                if symbol not in missing
+            ),
+            encoding="utf-8",
+        )
+        subprocess.run(
+            [
+                compiler,
+                "-std=c++17",
+                "-shared",
+                "-fPIC",
+                "-I",
+                str(worker_headers),
+                str(source),
+                str(sentinels),
+                "-o",
+                str(library),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        cache[key] = library
+        return library
+
+    return build
+
+
+class TestChipWorkerKernelSymbols:
+    def test_unsupported_runtime_still_exports_lifecycle_symbols(self, kernel_symbol_runtime):
+        # A runtime that cannot run kernel mode reports so through supported()
+        # and still exports the whole family, the same way the comm group ships
+        # not-supported stubs rather than omitting symbols.
+        runtime = kernel_symbol_runtime(supported=0)
+        worker = _ChipWorker()
+        try:
+            worker.init(str(runtime), os.devnull, os.devnull, "", device_id=0)
+            assert worker.initialized
+            assert worker.device_id == 0
+        finally:
+            worker.finalize()
+        assert not worker.initialized
+        assert worker.runtime_slot_count == 0
+
+    def test_supported_runtime_with_complete_lifecycle_symbols(self, kernel_symbol_runtime):
+        runtime = kernel_symbol_runtime(supported=1)
+        worker = _ChipWorker()
+        try:
+            worker.init(str(runtime), os.devnull, os.devnull, "", device_id=0)
+            assert worker.initialized
+        finally:
+            worker.finalize()
+
+    @pytest.mark.parametrize("missing", (*_KERNEL_LIFECYCLE_SYMBOLS, "simpler_kernel_mode_supported"))
+    def test_missing_required_kernel_symbol_allows_retry(self, kernel_symbol_runtime, missing):
+        # Every kernel-mode entry is required of every runtime, so any one of
+        # them missing fails init regardless of what supported() would answer.
+        incomplete = kernel_symbol_runtime(supported=1, missing=(missing,))
+        complete = kernel_symbol_runtime(supported=0)
+        worker = _ChipWorker()
+        try:
+            with pytest.raises(RuntimeError, match=f"dlsym failed for '{missing}'"):
+                worker.init(str(incomplete), os.devnull, os.devnull, "", device_id=0)
+            assert not worker.initialized
+            assert worker.device_id == -1
+            assert worker.runtime_slot_count == 0
+            worker.init(str(complete), os.devnull, os.devnull, "", device_id=0)
+            assert worker.initialized
+        finally:
+            worker.finalize()
+
+    def test_program_init_failure_after_kernel_symbol_resolution_allows_retry(self, kernel_symbol_runtime):
+        failing = kernel_symbol_runtime(supported=1, init_result=-1000)
+        complete = kernel_symbol_runtime(supported=0)
+        worker = _ChipWorker()
+        try:
+            with pytest.raises(RuntimeError, match="simpler_init failed with code -1000"):
+                worker.init(str(failing), os.devnull, os.devnull, "", device_id=0)
+            assert not worker.initialized
+            assert worker.runtime_slot_count == 0
+            worker.init(str(complete), os.devnull, os.devnull, "", device_id=0)
+            assert worker.initialized
+        finally:
+            worker.finalize()
+
+    def test_native_finalize_failure_is_reported_and_retriable(self, kernel_symbol_runtime):
+        runtime = kernel_symbol_runtime(finalize_failures=1)
+        worker = _ChipWorker()
+        worker.init(str(runtime), os.devnull, os.devnull, "", device_id=0)
+        with pytest.raises(RuntimeError, match=r"device teardown failed \(-77\)"):
+            worker.finalize()
+        assert worker.initialized
+        assert worker.device_id == 0
+        worker.finalize()
+        assert not worker.initialized
 
 
 class TestChipWorkerStateMachine:
@@ -380,6 +568,33 @@ class TestChipWorkerPython:
         )
         assert expected_warning in capsys.readouterr().err
 
+    def test_public_wrapper_keeps_registries_when_native_finalize_fails(self):
+        from _task_interface import ChipCallable  # noqa: PLC0415
+        from simpler.task_interface import ChipWorker  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
+
+        class FakeImpl:
+            initialized = True
+            device_id = 0
+
+            def finalize(self):
+                raise RuntimeError("injected device teardown failure")
+
+        worker = ChipWorker()
+        worker._impl = FakeImpl()
+        worker._callable_registry[0] = ChipCallable.build(signature=[], func_name="test", binary=b"\x00", children=[])
+        worker._identity_registry[b"digest"] = object()
+        worker._live_handles[1] = b"digest"
+
+        with pytest.raises(RuntimeError, match="injected device teardown failure"):
+            worker.finalize()
+
+        # The registries name what the native side still holds. A teardown that
+        # did not complete leaves those resources alive, so dropping the
+        # registries would hide them from a retry and from the caller.
+        assert list(worker._callable_registry) == [0]
+        assert list(worker._identity_registry) == [b"digest"]
+        assert worker._live_handles == {1: b"digest"}
+
     def test_public_wrapper_flush_timeout_is_reported_with_loss_counters(self, monkeypatch, capsys):
         import simpler.task_interface as task_interface_mod  # noqa: PLC0415
         from simpler.task_interface import ChipWorker  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
@@ -419,6 +634,7 @@ class TestMailboxConfigRoundtrip:
         from simpler.worker import (  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
             _CFG_FMT,
             _OFF_CONFIG,
+            Worker,
             _read_config_from_mailbox,
         )
 
@@ -444,7 +660,6 @@ class TestMailboxConfigRoundtrip:
             cfg.enable_pmu,
             int(cfg.enable_dep_gen),
             int(cfg.enable_scope_stats),
-            int(cfg.capture_clock_anchors),
             *cfg.runtime_env.ring_task_window,
             *cfg.runtime_env.ring_heap,
             *cfg.runtime_env.ring_dep_pool,
@@ -462,16 +677,33 @@ class TestMailboxConfigRoundtrip:
         assert decoded.runtime_env.ring_heap == [1024, 2048, 4096, 8192]
         assert decoded.runtime_env.ring_dep_pool == [64, 128, 256, 512]
         assert decoded.output_prefix == "/tmp/out"
-        assert decoded.capture_clock_anchors is False
-
         ranked = _read_config_from_mailbox(memoryview(buf), chip_rank=2, capture_index=7)
         assert ranked.output_prefix == "/tmp/out/rank2/d7"
-        assert ranked.capture_clock_anchors is True
 
-    def test_rank_directory_covers_every_diagnostic_but_anchors_stay_swimlane_only(self):
+        level_worker = Worker(level=3, num_sub_workers=0)
+        level_worker._topology_worker_id = 5
+        nested = _read_config_from_mailbox(
+            memoryview(buf),
+            chip_rank=2,
+            capture_index=7,
+            level_worker=level_worker,
+        )
+        assert nested.output_prefix == "/tmp/out/node5/rank2/d7"
+
+    def test_level_directory_needs_both_a_prefix_and_parent_identity(self):
+        from simpler.worker import Worker, _level_capture_prefix  # noqa: PLC0415
+
+        unattached = Worker(level=3, num_sub_workers=0)
+        attached = Worker(level=3, num_sub_workers=0)
+        attached._topology_worker_id = 4
+
+        assert _level_capture_prefix("/tmp/out", unattached) == "/tmp/out"
+        assert _level_capture_prefix("", attached) == ""
+        assert _level_capture_prefix("/tmp/out", attached) == "/tmp/out/node4"
+
+    def test_rank_directory_covers_every_diagnostic(self):
         # rankN/dN separates one ChipWorker child's artifacts from its siblings',
-        # which every diagnostic needs; capture_clock_anchors only turns on the
-        # Host/Device clock anchors, which only the swimlane reader consumes.
+        # which every diagnostic needs.
         from simpler.worker import (  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
             _CFG_FMT,
             _OFF_CONFIG,
@@ -493,7 +725,6 @@ class TestMailboxConfigRoundtrip:
                 cfg.enable_pmu,
                 int(cfg.enable_dep_gen),
                 int(cfg.enable_scope_stats),
-                int(cfg.capture_clock_anchors),
                 *cfg.runtime_env.ring_task_window,
                 *cfg.runtime_env.ring_heap,
                 *cfg.runtime_env.ring_dep_pool,
@@ -503,11 +734,8 @@ class TestMailboxConfigRoundtrip:
 
         dep_gen_only = decode(enable_dep_gen=True)
         assert dep_gen_only.output_prefix == "/tmp/out/rank1/d0"
-        assert dep_gen_only.capture_clock_anchors is False
-
         swimlane = decode(enable_chip_swimlane=4)
         assert swimlane.output_prefix == "/tmp/out/rank1/d0"
-        assert swimlane.capture_clock_anchors is True
 
         # No diagnostic at all: nothing is written below output_prefix, so the
         # child leaves the case root alone.

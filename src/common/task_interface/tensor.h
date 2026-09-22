@@ -39,7 +39,7 @@ struct PTOBufferHandle {
  * A per-tensor tag carried by TaskArgs (drives dependency inference at submit
  * time; stripped before the args cross the dispatch boundary).
  */
-enum class TensorArgType : int32_t {
+enum class TensorArgType : uint8_t {
     INPUT = 0,            // Read-only input buffer
     OUTPUT = 1,           // Write-only output buffer (runtime allocates)
     INOUT = 2,            // Read-then-write: modifier for downstream

@@ -51,7 +51,7 @@ namespace {
 // path performs no atomic read-modify-write at all. Sharing them cost the emitting
 // thread about 0.8 us per record at eight producers, purely in cache-line
 // ownership: every producer of a Graph workload records the same kind
-// (`record_in_graph_task`), so a per-kind counter is a single line eight threads fight
+// (`record_sub_task`), so a per-kind counter is a single line eight threads fight
 // over, and the `alignas(64)` that separates one kind from another does nothing
 // about that.
 //
@@ -165,11 +165,9 @@ void drain_in_flight_records(TraceState &s) {
 
 bool is_bind_kind(uint32_t kind) { return kind < static_cast<uint32_t>(HostPhaseKind::OrchSubmitTask); }
 
-// The stage these segments subdivide, and their level in the span tree. The
-// platform opens `chip.run.bind` at depth 1 (src/common/platform/{onboard,sim}/
-// host/c_api_shared.cpp) and the flush below runs inside that scope on the same
-// thread, so a segment of it is depth 2 — the level a lexical STRACE scope there
-// would print, and the one the tensormap runtime's own chip.run.bind.args uses.
+// Segment names are stable for log consumers. Records use their
+// measured timestamps; flush occurs after publication, outside chip.run.bind.
+// Both bind and publication are depth-one children of the prepare span.
 constexpr const char *kBindSpanName = "chip.run.bind";
 constexpr int kBindSegmentSpanDepth = 2;
 
@@ -352,10 +350,10 @@ void host_phase_trace_note_submitted(uint64_t submitted_tasks) {
     state().submitted_tasks.store(submitted_tasks, std::memory_order_relaxed);
 }
 
-void host_phase_trace_end() {
+void host_phase_trace_end(const void *host_api) {
     TraceState &s = state();
     std::scoped_lock lifecycle_lock(s.lifecycle_mutex);
-    if (!s.active.load(std::memory_order_relaxed)) {
+    if (s.api != host_api || !s.active.load(std::memory_order_relaxed)) {
         return;
     }
     s.active.store(false, std::memory_order_release);

@@ -36,6 +36,8 @@ def test_a5_dfx_smokes_adapt_to_device_count_without_overlap(tmp_path: Path, dev
         directory.mkdir(parents=True)
 
     (workspace / ".venv/bin/activate").write_text(":\n")
+    cann_env = tmp_path / "set_env.sh"
+    cann_env.write_text(":\n")
     task_submit = bin_dir / "task-submit"
     task_submit.write_text(
         textwrap.dedent(
@@ -103,6 +105,7 @@ def test_a5_dfx_smokes_adapt_to_device_count_without_overlap(tmp_path: Path, dev
     env = os.environ.copy()
     env.update(
         {
+            "CANN_ENV": str(cann_env),
             "DEVICE_RANGE": f"7-{6 + device_count}",
             "DEVICE_NUM": str(device_count),
             "DFX_PLATFORM": "a5",
@@ -126,8 +129,9 @@ def test_a5_dfx_smokes_adapt_to_device_count_without_overlap(tmp_path: Path, dev
     assert result.returncode == 0, result.stdout + result.stderr
     assert not (state_dir / "overlap").exists()
     invocations = (state_dir / "invocations").read_text().splitlines()
-    assert len(invocations) == 4
+    expected_jobs = 5
+    assert len(invocations) == expected_jobs
     for device in range(7, 7 + device_count):
-        expected_count = 4 // device_count + (device - 7 < 4 % device_count)
+        expected_count = expected_jobs // device_count + (device - 7 < expected_jobs % device_count)
         assert sum(f"--device {device}" in invocation for invocation in invocations) == expected_count
     assert (state_dir / "parallel").exists() == (device_count > 1)

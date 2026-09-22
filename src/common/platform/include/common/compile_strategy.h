@@ -11,15 +11,27 @@
 /**
  * Compile Strategy - Toolchain Type Definitions
  *
- * Defines the available toolchains for compiling incore kernels and
- * orchestration functions. Each value maps to a specific compiler binary.
- * Compile arguments differ per situation and are handled in Python.
+ * Names the toolchains that compile incore kernels and orchestration functions.
+ * Each value maps to a specific compiler binary. Compile arguments differ per
+ * situation and are handled in Python.
  *
- * Used by:
- * - Platform: get_platform() declares platform identity
- * - Runtime: get_incore_compiler() / get_orchestration_compiler() return
- *   the appropriate toolchain based on the current platform
- * - Python (via ctypes): dispatches compilation based on the returned toolchain
+ * The choice itself is made in Python, by
+ * `simpler_setup/kernel_compiler.py`: `_orchestration_toolchain()` picks by
+ * runtime name and `compile_incore()` by platform. Three
+ * `runtime_compile_info.cpp` files return one of these values from
+ * `get_incore_compiler()` / `get_orchestration_compiler()` to state the same
+ * intent, but nothing calls those — there is no ctypes dispatch on them. Keep
+ * them in step with the Python when either changes, or retire them; a value
+ * that disagrees with the Python is a trap, because it reads as the decision
+ * and is not one.
+ *
+ * Those three are not three copies of one answer. The two under
+ * `src/{a2a3,a5}/runtime/host_build_graph/host/` are identical and move
+ * together; the one under `src/common/tensormap_and_ringbuffer/host/` returns
+ * `TOOLCHAIN_AARCH64_GXX` for `a2a3` orchestration and does not follow them,
+ * because tensormap_and_ringbuffer orchestration executes on the AICPU while
+ * host_build_graph's executes on the host. The Python draws the same line by
+ * runtime name.
  */
 
 #ifndef COMPILE_STRATEGY_H

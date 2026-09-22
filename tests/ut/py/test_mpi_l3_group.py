@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 
 import simpler.mpi_group_mailbox as mailbox_mod
 import simpler.worker as worker_mod
+from simpler import mpi_l3_session
 from simpler.mpi_group_mailbox import MAILBOX_SIZE, MailboxGroupState
 from simpler.remote_l3_protocol import ControlName
 from simpler.worker import MpiL3GroupSpec, Worker
@@ -141,3 +142,51 @@ def test_mpi_spec_tcp_fields_are_optional_and_control_18_stays_reserved():
     assert spec.connect_hosts == ()
     assert worker_mod._CTRL_COMMITTED_DEVICE_MEMORY == 18
     assert 18 not in {int(control) for control in ControlName}
+
+
+def test_mpi_rank_worker_uses_parent_topology_id_before_init(monkeypatch):
+    captured = {}
+
+    class FakeWorker:
+        def __init__(self, *args, **kwargs):
+            self._topology_worker_id = None
+            captured["worker"] = self
+
+        def init(self, *args, **kwargs):
+            raise RuntimeError("stop after worker construction")
+
+        def close(self):
+            pass
+
+    class FailedStartupComm:
+        def Get_rank(self):
+            return 1
+
+        def allgather(self, value):
+            return [value]
+
+        def bcast(self, value, root=0):
+            return False, "stop after startup"
+
+    monkeypatch.setattr(mpi_l3_session, "Worker", FakeWorker)
+    monkeypatch.setattr(mpi_l3_session, "_install_manifest_dispatcher_registry", lambda manifest: {})
+    monkeypatch.setattr(mpi_l3_session, "_install_manifest_inner_registry", lambda manifest, worker: {})
+
+    rc = mpi_l3_session._run_group_session(
+        dispatch_comm=FailedStartupComm(),
+        domain_comm=None,
+        group_manifest={"worker_ids": [3, 7]},
+        manifest={
+            "worker_id": 7,
+            "platform": "a2a3sim",
+            "runtime": "tensormap_and_ringbuffer",
+            "device_ids": [1],
+            "num_sub_workers": 0,
+            "heap_ring_size": None,
+            "startup_remaining_s": 1.0,
+            "session_timeout_s": 1.0,
+        },
+    )
+
+    assert rc == 1
+    assert captured["worker"]._topology_worker_id == 7

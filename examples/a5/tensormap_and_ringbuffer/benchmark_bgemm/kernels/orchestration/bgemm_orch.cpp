@@ -39,10 +39,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     const simpler::tmr::Tensor &ext_B = orch_args.tensor(1).ref();
     const simpler::tmr::Tensor &ext_C = orch_args.tensor(2).ref();
 
-    int tile_size = static_cast<int>(orch_args.scalar(0));
-    int grid_k = static_cast<int>(orch_args.scalar(1));
-    int num_groups = static_cast<int>(orch_args.scalar(2));
-    int incore_loop = static_cast<int>(orch_args.scalar(3));
+    int tile_size = orch_args.scalar<int>(0);
+    int grid_k = orch_args.scalar<int>(1);
+    int num_groups = orch_args.scalar<int>(2);
+    int incore_loop = orch_args.scalar<int>(3);
     uint64_t tile_elems = static_cast<uint64_t>(tile_size) * tile_size;
 
     LOG_INFO(

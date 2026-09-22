@@ -35,8 +35,12 @@
 // SPIN_WAIT_HINT - no-op on real hardware (AICore has dedicated polling support)
 #define SPIN_WAIT_HINT() ((void)0)
 
-// OUT_OF_ORDER_STORE_BARRIER - no-op on real hardware (dcci handles cache coherency)
-#define OUT_OF_ORDER_STORE_BARRIER() ((void)0)
+// A kernel's output dcci issues a write-back; it does not wait for one. The task
+// reports FIN right after, and a consumer that observes FIN then reads that
+// output, so the flush has to have completed first. pto-isa documents the pair
+// for this chip family and the runtime already pairs dsb with its own flushes
+// when it publishes completion data (runtime/async_kernel_api.h).
+#define OUT_OF_ORDER_STORE_BARRIER() dsb(DSB_DDR)
 
 // OUT_OF_ORDER_LOAD_BARRIER - no-op on real hardware (dcci handles cache coherency)
 #define OUT_OF_ORDER_LOAD_BARRIER() ((void)0)

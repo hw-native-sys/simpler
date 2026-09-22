@@ -166,6 +166,7 @@ The standard SceneTest path
 
 ```json
 {
+  "runtime": "tensormap_and_ringbuffer",
   "tasks": [
     {"task_id": "0",          "scope": "auto", "kernel_ids": [-1,-1,-1], "block_num": 1, "args": []},
     {"task_id": "4294967296", "scope": "auto", "kernel_ids": [7,-1,-1], "block_num": 4, "args": [
@@ -206,16 +207,28 @@ silently lose precision if encoded as numbers. Python consumers pass
 these through `int(v)` which accepts either form, so the schema is
 JS-safe without burdening Python.
 
-Task ids are `TaskId::raw`. The low 32 bits are a local id; the high 32 bits
+Task ids are `TaskId::raw`. The low 32 bits are a local id; the bits above it
 mean whatever the runtime that minted the record says they mean — a ring index
-(`tensormap_and_ringbuffer`, `0..CHIP_MAX_RING_DEPTH-1`) or an id space
-(`host_build_graph`, `0 = GLOBAL`, `1 = IN_GRAPH`). See
+in bits 39:32 (`tensormap_and_ringbuffer`, `0..CHIP_MAX_RING_DEPTH-1`), or an id
+space in bits 63:62 plus a parent task in bits 51:32 (`host_build_graph`,
+`0 = GLOBAL`, `1 = SUB_TASK`, `2 = PARAM`). See
 `src/common/{tensormap_and_ringbuffer,host_build_graph}/task_id.h`.
-Which one a record carries is a property of its runtime, not of the value:
+
+Which one a record carries is a property of its runtime, not of the value, so
+the top-level **`runtime`** key names it. Decode against that key rather than
+guessing from the number — `deps_viewer` does, which is what makes a sub-task
+render as `g{parent}t{index}` instead of a ten-digit high field:
 
 ```python
-high = (raw >> 32) & 0xFF
+runtime = data["runtime"]  # required; a capture without it is refused, not guessed
 local = raw & 0xFFFFFFFF
+if runtime == "host_build_graph":
+    space = (raw >> 62) & 0x3           # 0 GLOBAL, 1 SUB_TASK, 2 PARAM
+    parent = (raw >> 32) & 0xFFFFF      # meaningful for SUB_TASK only
+elif runtime == "tensormap_and_ringbuffer":
+    ring = (raw >> 32) & 0xFF
+else:
+    raise ValueError(f"unsupported runtime: {runtime!r}")
 ```
 
 ### `tasks[]`
@@ -431,7 +444,7 @@ list; only the dep_gen replay graph loses the tail.
 | AICPU writer | `src/{a2a3,a5}/platform/include/aicpu/dep_gen_collector_aicpu.h`, `src/common/platform/shared/aicpu/dep_gen_collector_aicpu.cpp` | Single-instance write path; weak-fallback exported to host build. Both platforms share the same writer implementation — the writer accesses its own device-side view of shared memory, independent of how host↔device transport is implemented. |
 | Host collector | `src/common/platform/include/host/dep_gen_collector.h`, `src/common/platform/shared/host/dep_gen_collector.cpp` | `ProfilerBase<DepGenCollector, DepGenModule>` — drains ring → `records_` vector. On non-SVM platforms it uses the base `alloc_paired_buffer`, which malloc's a host shadow + `copy_to_device`'s it and registers it via `add_malloc_shadow` so teardown can free it; `reconcile_counters` explicitly `copy_from_device`'s the BufferState before reading, and `finalize` lets `BufferPoolManager::clear_mappings()` release all shadows as the single source of truth. |
 | Capture call site (device-orch) | `src/{a2a3,a5}/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp` `submit_task_common` | One conditional block that snapshots inputs into the ring when `is_dep_gen_enabled()`; fires for both `submit_task` and `submit_dummy_task`. The schema carries `kernel_ids[3] = {aic, aiv0, aiv1}` so the swimlane post-processor can resolve `task_id → kernel` from `deps.json` at level=1 where the AICore record is the sole device-side identity source. Inactive subslots stay at `INVALID_KERNEL_ID = -1`. It also carries the SPMD logical block num (`block_num` on a2a3, `core_num` on a5's launch spec) as `tasks[].block_num`. |
-| Replay | `src/{a2a3,a5}/runtime/tensormap_and_ringbuffer/host/dep_gen_replay.{h,cpp}` | Pure CPU; runs dual-pass differential replay — `compute_task_fanin` (oracle) + inlined STEP A/B mirror (annotated) against two `ChipTensorMap` instances. Emits `deps.json` when both passes agree per record. Platform-agnostic — a5 reuses the a2a3 source verbatim. |
+| Replay | `src/common/tensormap_and_ringbuffer/host/dep_gen_replay.{h,cpp}` | Pure CPU; runs dual-pass differential replay — `compute_task_fanin` (oracle) + inlined STEP A/B mirror (annotated) against two `ChipTensorMap` instances. Emits `deps.json` when both passes agree per record. One source for both platforms: it includes `dep_compute.h`, `tensormap.h` and `tensor.h` by bare name, so each architecture's host target compiles it against its own runtime headers. |
 | Host-direct capture (host-orch) | `src/common/host_build_graph/dep_gen_host_graph.h`, `src/common/host_build_graph/host/dep_gen_host_graph.cpp` | Task / tensor / edge tables filled from `submit_task_common` + `compute_task_fanin`'s `Annotate` hooks (`src/common/host_build_graph/dep_compute.h`), reset per orchestration by `run_host_orchestration`, serialized by the same `deps.json` writer. The runtime translation unit carries weak no-op fallbacks so the AICPU build links without it. |
 | Device-runner hookup | `src/{a2a3,a5}/platform/{onboard,sim}/host/device_runner.cpp` | `dep_gen_host_graph_active()` picks the shape: host-orch calls `dep_gen_host_graph_emit(deps_path)` at teardown — reading the thread-local graph its own orchestration built on the same child progress thread — and skips collector init/start/reconcile entirely; device-orch calls `dep_gen_replay_emit_deps_json(records.data(), records.size(), deps_path)` post-`reconcile_counters`. The c_api latches the CallConfig before the bind so host capture is armed before the orchestration it records. |
 | Viewer | `simpler_setup/tools/deps_viewer.py` | `deps.json` → text (default) or pan/zoom HTML |

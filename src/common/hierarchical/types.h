@@ -146,6 +146,9 @@ struct RunState {
         lease(slot_lease) {}
 
     RunId id{INVALID_RUN_ID};
+    // Written only while holding both the Orchestrator's `runs_mu_` and this
+    // run's `completion_mu`, so a reader holding either sees a whole value.
+    // Generation zero means no native pipeline slot is held.
     PipelineSlotLease lease{};
     std::atomic<RunPhase> phase{RunPhase::RESERVED};
     std::atomic<int32_t> active_tasks{0};

@@ -54,9 +54,13 @@ class Runtime;
 [[block_local]] static __gm__ ChipSwimlaneActiveHead *s_chip_swimlane_aicore_head;
 [[block_local]] static __gm__ PmuAicoreRing *s_aicore_pmu_ring;
 [[block_local]] static uint64_t s_aicore_pmu_reg_base;
+[[block_local]] static uint64_t s_aicore_report_epoch;
 
 __attribute__((weak)) __aicore__ void set_aicore_profiling_flag(uint32_t flag) { s_aicore_profiling_flag = flag; }
 __attribute__((weak)) __aicore__ uint32_t get_aicore_profiling_flag() { return s_aicore_profiling_flag; }
+
+__attribute__((weak)) __aicore__ void set_aicore_report_epoch(uint64_t epoch) { s_aicore_report_epoch = epoch; }
+__attribute__((weak)) __aicore__ uint64_t get_aicore_report_epoch() { return s_aicore_report_epoch; }
 
 __attribute__((weak)) __aicore__ void set_chip_swimlane_aicore_head_slot(__gm__ uint64_t *slot_ptr) {
     s_chip_swimlane_aicore_head_slot = slot_ptr;
@@ -92,15 +96,30 @@ extern __aicore__ void aicore_execute(__gm__ Runtime *runtime, int block_idx, Co
  *    - Use DCCI to ensure cache coherency with AICPU
  *
  * Each core (AIC or AIV) gets its own handshake buffer indexed by block_idx.
- * Profiling state flows from KernelArgs into platform-owned per-core slots
- * via set_aicore_profiling_flag() / set_chip_swimlane_aicore_head_slot() /
- * set_aicore_pmu_ring() / set_aicore_pmu_reg_base(); the runtime's
- * Handshake stays profiling-free and aicore_execute keeps its original
- * signature.
+ * Every value this entry needs arrives in the launch parameter block, so the
+ * per-core state below is published before the executor runs and without any
+ * GM read. The host builds that block after collector arming, which is what
+ * makes these addresses this run's final ones.
  *
- * @param k_args Address of KernelArgs structure (contains runtime_args + profiling tables)
+ * @param runtime_args Device address of this run's Runtime image
+ * @param enable_profiling_flag Profiling umbrella bitmask for this run
+ * @param force_simt_anchor Always-zero guard for the AIV SIMT meta anchor; a
+ *        launch argument rather than a GM field so the value stays opaque to
+ *        the optimizer at the point the never-taken branch is emitted
+ * @param chip_swimlane_aicore_rotation_table Device address of the
+ *        uint64_t[num_aicore] table of per-core active-head slots, or 0
+ * @param aicore_pmu_ring_addrs Device address of the uint64_t[num_aicore] table
+ *        of per-core PmuAicoreRing addresses, or 0
+ * @param pmu_reg_addrs Device address of the per-core PMU MMIO register table,
+ *        indexed by physical core id, or 0
+ * @param report_epoch This run's handshake report identity; 0 selects the
+ *        pre-existing kernel/persistent report protocol
  */
-extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ KernelArgs *k_args) {
+extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(
+    uint64_t runtime_args, uint32_t enable_profiling_flag, uint32_t force_simt_anchor,
+    uint64_t chip_swimlane_aicore_rotation_table, uint64_t aicore_pmu_ring_addrs, uint64_t pmu_reg_addrs,
+    uint64_t report_epoch
+) {
     // Calculate block_idx for this core
 #ifdef __DAV_VEC__
     block_idx = get_block_idx() * get_subblockdim() + get_subblockid() + get_block_num();
@@ -113,36 +132,41 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ KernelA
     // Publish per-core profiling state into platform-owned slots before the
     // executor runs. AICore reads via get_aicore_*() — never touches Handshake
     // for profiling. The PMU MMIO base is resolved here from
-    // `regs[physical_core_id]`; both fields are filled by the host before
-    // kernel launch, so the resolved base is valid from Phase 1 onward and
+    // `pmu_reg_addrs[physical_core_id]`; every address arrives in the launch
+    // parameter block, so the resolved base is valid from Phase 1 onward and
     // does not depend on any AICPU init ordering.
-    set_aicore_profiling_flag(k_args->enable_profiling_flag);
+    set_aicore_profiling_flag(enable_profiling_flag);
+    // Published unconditionally for the same reason as the head slot below:
+    // [[block_local]] storage survives across launches on the same loaded
+    // binary, so a native run followed by a kernel-mode one must not inherit
+    // the native run's epoch.
+    set_aicore_report_epoch(report_epoch);
     // Always publish the head slot (nullptr when this launch is disabled or
     // has no rotation table). [[block_local]] storage persists across launches
     // on the same loaded kernel binary, so without an explicit nullptr
     // publication a sequence like enabled(valid)→enabled(NULL table) or
     // enabled→disabled would leave `get_chip_swimlane_aicore_head()` returning
     // the prior launch's freed pointer.
-    if (SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE) &&
-        k_args->chip_swimlane_aicore_rotation_table != 0) {
+    if (SIMPLER_GET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE) &&
+        chip_swimlane_aicore_rotation_table != 0) {
         // Stash only the slot pointer. The slot CONTENTS are written by
         // AICPU's `chip_swimlane_aicpu_init`, which races with this entry but
         // publishes the slot before opening any register window. The executor
         // dereferences via `get_chip_swimlane_aicore_head()` only after it
         // observes Phase 2 exit.
-        __gm__ uint64_t *head_table = reinterpret_cast<__gm__ uint64_t *>(k_args->chip_swimlane_aicore_rotation_table);
+        __gm__ uint64_t *head_table = reinterpret_cast<__gm__ uint64_t *>(chip_swimlane_aicore_rotation_table);
         set_chip_swimlane_aicore_head_slot(&head_table[block_idx]);
     } else {
         set_chip_swimlane_aicore_head_slot(nullptr);
     }
-    if (SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_PMU)) {
-        __gm__ uint64_t *pmu_ring_table = reinterpret_cast<__gm__ uint64_t *>(k_args->aicore_pmu_ring_addrs);
+    if (SIMPLER_GET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_PMU)) {
+        __gm__ uint64_t *pmu_ring_table = reinterpret_cast<__gm__ uint64_t *>(aicore_pmu_ring_addrs);
         if (pmu_ring_table != nullptr) {
             set_aicore_pmu_ring(reinterpret_cast<__gm__ PmuAicoreRing *>(pmu_ring_table[block_idx]));
         } else {
             set_aicore_pmu_ring(nullptr);
         }
-        __gm__ uint64_t *regs_array = reinterpret_cast<__gm__ uint64_t *>(k_args->regs);
+        __gm__ uint64_t *regs_array = reinterpret_cast<__gm__ uint64_t *>(pmu_reg_addrs);
         if (regs_array != nullptr) {
             set_aicore_pmu_reg_base(regs_array[get_physical_core_id()]);
         } else {
@@ -156,13 +180,15 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ KernelA
 #ifdef __DAV_VEC__
     // SIMT classification anchor (AIV only). Never executes —
     // `force_simt_anchor` is always 0 — but the compiler cannot prove the
-    // GM-loaded condition false, so the never-taken SIMT launch survives DCE
-    // and bisheng auto-emits this entry's SIMT meta TLVs (UB size + AIV type)
-    // that runtime reads at register time. See simt_anchor.h.
-    if (k_args->force_simt_anchor) {
-        simt_meta_anchor(reinterpret_cast<__gm__ uint32_t *>(k_args));
+    // launch-argument condition false, so the never-taken SIMT launch survives
+    // DCE and bisheng auto-emits this entry's SIMT meta TLVs (UB size + AIV
+    // type) that runtime reads at register time. See simt_anchor.h.
+    if (force_simt_anchor) {
+        // The sink is only a plausible never-written GM store target. The
+        // Runtime address is the GM pointer this entry already holds.
+        simt_meta_anchor(reinterpret_cast<__gm__ uint32_t *>(runtime_args));
     }
 #endif
 
-    aicore_execute(k_args->runtime_args, block_idx, core_type);
+    aicore_execute(reinterpret_cast<__gm__ Runtime *>(runtime_args), block_idx, core_type);
 }

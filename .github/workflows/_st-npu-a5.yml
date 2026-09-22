@@ -64,14 +64,15 @@ jobs:
       - name: Set up environment
         uses: ./.github/actions/setup-venv
         with:
-          build-packages: "scikit-build-core nanobind<3 cmake>=3.15"
+          build-packages: "scikit-build-core nanobind<3 cmake>=3.20"
           packages: "--no-build-isolation --config-settings=build.targets=build_package_a5 .[test]"
           install-torch: "false"
           system-site-packages: "true"
-          source-cann: "false"
+          source-cann: "true"
 
       - name: Compile scene-test kernels (a5)
         run: |
+          source /usr/local/Ascend/cann/set_env.sh
           .venv/bin/python -m simpler_setup.tools.scene_test_compile examples tests/st \
             --platform a5 --exclude-level 4 --require-pto-isa --compile-workers 8 -q \
             --manual "$MANUAL_MODE"
@@ -81,13 +82,24 @@ jobs:
         env:
           TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
         run: |
-          for family in tensormap_and_ringbuffer host_build_graph; do
-            .venv/bin/python "examples/a5/$family/qwen3_14b_decode/main.py" \
+          source /usr/local/Ascend/cann/set_env.sh
+          # discover_runtimes is the one definition of what a runtime is — a
+          # directory under src/<arch>/runtime with a build_config.py — so a new
+          # one is compiled here without editing this list into existence. An
+          # empty result would make the loop body run zero times and the step
+          # pass having compiled nothing, which `set -e` does not catch in a
+          # `for` list, so it is rejected before the loop.
+          runtimes=$(.venv/bin/python -c \
+              "from simpler_setup.platform_info import discover_runtimes; print(' '.join(discover_runtimes('a5')))")
+          test -n "$runtimes"
+          for runtime in $runtimes; do
+            .venv/bin/python "examples/a5/$runtime/qwen3_14b_decode/main.py" \
               --platform a5 --compile-only --compile-workers 8
           done
 
       - name: Run pytest scene tests (a5)
         run: |
+          source /usr/local/Ascend/cann/set_env.sh
           task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
             --run ".venv/bin/python -m pytest examples tests/st --platform a5 --exclude-level 4 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 1200 --manual '$MANUAL_MODE'"
 

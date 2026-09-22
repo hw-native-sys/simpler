@@ -32,7 +32,9 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     const simpler::hbg::Tensor &a = args.tensor(0).ref();
     const simpler::hbg::Tensor &b = args.tensor(1).ref();
     const simpler::hbg::Tensor &out = args.tensor(2).ref();
-    const uint64_t spin_iters = args.scalar(0);
+    const uint64_t spin_iters = args.scalar<uint64_t>(0);
+    const uint32_t control_index[] = {0};
+    const float host_control = get_tensor_data<float>(b, 1, control_index);
     uint32_t shape[1] = {a.shapes[0]};
     TensorCreateInfo temporary(shape, 1, DataType::FLOAT32);
 
@@ -48,7 +50,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         float f32;
         uint64_t u64;
     } scalar{};
-    scalar.f32 = 1.0F;
+    scalar.f32 = host_control;
     for (int i = 0; i < kChainLength; ++i) {
         CoreTaskArgs step_args;
         step_args.add_input(current);

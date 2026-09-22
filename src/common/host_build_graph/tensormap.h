@@ -51,7 +51,6 @@
 
 #include "assert_compat.h"
 #include "host_build_graph/task_id.h"
-#include "host_build_graph/tensor_create_info.h"
 #include "profiling_config.h"
 #include "tensor.h"
 
@@ -71,6 +70,21 @@ struct Segment {
     bool line_segment_intersection(const Segment &other) const { return end > other.begin && other.end > begin; }
     bool contains(const Segment &other) const { return begin <= other.begin && other.end <= end; }
 };
+
+// Slot index for `addr` in a power-of-two table of 2^slot_bits entries. Shared by every
+// table in this runtime that is keyed by a buffer address: this map's buckets, and the
+// boundary alias partition in the host orchestrator.
+//
+// Multiplicative hash on the golden-ratio constant. The multiply mixes all of the input's
+// bits into the *high* bits of the product, and taking the top `slot_bits` is what makes
+// aligned keys distribute -- every buffer here is at least PACKED_OUTPUT_ALIGN-aligned, so
+// its low bits are constant and masking them would collide every key onto one slot.
+//
+// Returns the slot and not the hash, so that truncation cannot be done wrong by a caller:
+// there is one correct way to narrow this product and it lives here.
+inline uint32_t addr_to_slot(uint64_t addr, uint32_t slot_bits) {
+    return static_cast<uint32_t>((addr * 0x9E3779B97F4A7C15ULL) >> (64 - slot_bits));
+}
 
 // TensorMap Lookup Profiling (must precede inline lookup/insert methods).
 #if SIMPLER_TENSORMAP_PROFILING
@@ -120,11 +134,12 @@ struct alignas(64) ChipTensorMapEntry {
     TaskId producer_task_id;           // 8B [16,24):  mirrors simpler::hbg::Tensor::owner_task_id slot
     uint64_t start_offset;             // 8B [24,32):  mirrors simpler::hbg::Tensor::start_offset (element offset)
     int32_t version;                   // 4B [32,36):  mirrors simpler::hbg::Tensor::version
-    uint32_t ndims;                    // 4B [36,40):  mirrors simpler::hbg::Tensor::ndims
-    DataType dtype;                    // 1B [40,41):  mirrors simpler::hbg::Tensor::dtype
-    bool manual_dep;                   // 1B [41,42):  mirrors simpler::hbg::Tensor::manual_dep
-    bool is_contiguous;                // 1B [42,43):  mirrors simpler::hbg::Tensor::is_contiguous
-    uint8_t __padding1__;              // 1B [43,44):  mirrors simpler::hbg::Tensor padding
+    uint8_t ndims;                     // 1B [36,37):  mirrors simpler::hbg::Tensor::ndims
+    DataType dtype;                    // 1B [37,38):  mirrors simpler::hbg::Tensor::dtype
+    bool manual_dep;                   // 1B [38,39):  mirrors simpler::hbg::Tensor::manual_dep
+    bool is_contiguous;                // 1B [39,40):  mirrors simpler::hbg::Tensor::is_contiguous
+    uint8_t __padding1__[4];           // 4B [40,44):  spans simpler::hbg::Tensor::address_space, which an
+                                       //              entry never reads, and the padding after it
     uint32_t shapes[MAX_TENSOR_DIMS];  // 20B [44,64): mirrors simpler::hbg::Tensor::shapes
 
     // === Cache line 2 (64B) — chain manipulation + non-contiguous overlap data ===
@@ -168,23 +183,6 @@ struct alignas(64) ChipTensorMapEntry {
             for (uint32_t i = 0; i < tensor.ndims; i++) {
                 strides[i] = tensor.strides[i];
             }
-        }
-    }
-
-    void copy_tensor_create_info(const TensorCreateInfo &tensor_create_info, uint64_t addr) {
-        memcpy(this, &tensor_create_info, 64);
-        buffer_addr = addr;
-        // Create-info outputs are always contiguous with start_offset = 0;
-        // extent_elem = prod(shapes); stride is row-major.
-        uint64_t numel = 1;
-        for (uint32_t i = 0; i < tensor_create_info.ndims; i++) {
-            numel *= tensor_create_info.shapes[i];
-        }
-        extent_elem_cache = numel;
-        uint32_t s = 1;
-        for (int32_t i = static_cast<int32_t>(tensor_create_info.ndims) - 1; i >= 0; i--) {
-            strides[i] = s;
-            s *= tensor_create_info.shapes[i];
         }
     }
 
@@ -547,15 +545,10 @@ struct ChipTensorMap {
     /**
      * Compute hash for tensor addr
      *
-     * Multiplicative hash using the golden-ratio constant.  Multiplication
-     * mixes ALL input bits into the high bits of the product, so aligned
-     * addresses (low bits all-zero) still distribute evenly.  We extract
-     * the top log2(num_buckets) bits which carry the most entropy.
+     * addr_to_slot over this table's bucket count, which is a power of two so its
+     * trailing-zero count is log2 of it.
      */
-    uint32_t hash(uint64_t key) {
-        key *= 0x9E3779B97F4A7C15ULL;
-        return static_cast<uint32_t>(key >> (64 - __builtin_ctz(num_buckets)));
-    }
+    uint32_t hash(uint64_t key) { return addr_to_slot(key, static_cast<uint32_t>(__builtin_ctz(num_buckets))); }
 
     /**
      * Link an initialized entry into bucket and task chains.
@@ -568,7 +561,7 @@ struct ChipTensorMap {
         const int32_t task_slot = producer_task_id.local_id();
         // A producer's low id field is a task chain index directly, so the id space a
         // caller inserts under has to be the one this map was dimensioned for: a
-        // whole-run map takes task capacity, a Graph recording's takes MAX_IN_GRAPH_TASKS.
+        // whole-run map takes task capacity, a Graph recording's takes SUB_TASK_MAX_NUM.
         debug_assert(task_slot >= 0 && task_slot < max_tasks);
 
         entry->producer_task_id = producer_task_id;

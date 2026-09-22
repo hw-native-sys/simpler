@@ -9,22 +9,29 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Runtime Builder - rt2 Implementation (host_build_graph: Host Orchestration)
+ * host_build_graph runtime maker (host orchestration).
  *
- * Provides init_runtime_impl and validate_runtime_impl functions for rt2 runtime.
  * The HOST runs the orchestrator to completion, populates shared memory + the
  * prebuilt arena, and H2Ds the image; the device boots scheduler-only.
  *
- * init_runtime_impl:
- *   - Converts host tensor pointers to device pointers (all inputs copied H2D;
- *     only OUTPUT/INOUT tensors are copied back D2H)
- *   - dlopens the orchestration SO on the host and runs it to build the graph
+ * register_callable_impl:
+ *   - dlopens the orchestration SO on the host and resolves its entry points,
+ *     which bind then invokes per run
+ *
+ * bind_callable_to_runtime_impl:
+ *   - Gives host-memory tensor arguments slices of the pipeline slot's retained
+ *     temporary buffer, copies every readable input H2D, and records one lease
+ *     each with its transfer directions. The copy is here rather than in
+ *     copy_in_run_inputs_impl because the orchestration entry below reads these
+ *     tensors while it builds the graph
+ *   - Runs the resolved orchestration entry to build the graph
  *   - Sets up runtime state for host orchestration
  *
- * validate_runtime_impl:
+ * copy_back_run_outputs_impl / release_run_bindings_impl:
  *   - Copies OUTPUT/INOUT tensors back from device to host (read-only inputs
  *     are skipped)
- *   - Frees device memory
+ *   - Releases the run's leases. The slices are no-ops: the retained buffer
+ *     outlives the run and is freed once at Worker finalization.
  */
 
 #include <dlfcn.h>
@@ -76,7 +83,11 @@
 #include "common/unified_log.h"
 #include "host_log.h"
 #include "host/raii_scope_guard.h"
+#include "host/kernel_pipeline_contract.h"
 #include "utils/device_arena.h"
+#include "utils/retained_temp_bump.h"
+#include "utils/temp_buffer_plan.h"
+#include "utils/tensor_lease_release.h"
 #include "prepare_callable_common.h"
 
 // This file returns both kinds of negative status — a latched device code
@@ -90,6 +101,10 @@ static_assert(
         PTO_RUNTIME_ERR_BASE < -PTO_RUNTIME_LATCHED_CODE_MAX,
     "host-side C API codes must stay below the negation of every latched device code"
 );
+
+extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *, PipelineContract *) {
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
 
 extern "C" const PipelineContract *get_pipeline_contract(void) {
     // Host orchestration materializes this run's own graph into the image it
@@ -114,8 +129,23 @@ extern "C" const PipelineContract *get_pipeline_contract(void) {
 
 extern "C" int concurrent_native_prepare_supported_impl(void) {
     // HBG can materialize a complete graph into the lease-selected unpublished
-    // arena bank. The common C API keeps collector-bearing configurations on
-    // the sequential path until their state is per-epoch.
+    // arena bank.
+    return 1;
+}
+
+extern "C" int teardown_report_supported_impl(void) {
+    // The onboard platform runner records a teardown for whichever runtime is
+    // built on it; this runtime is the one whose reset paths the record's
+    // stage and rc fields describe, so it is the one that publishes them.
+    return 1;
+}
+
+extern "C" int joined_native_launch_supported_impl(void) {
+    // Every per-run device region this runtime names is selected by the run's
+    // own lease — the graph heap and the runtime image are both HOST_PER_RUN
+    // above — so a second launched run reads and writes nothing the first is
+    // still executing against. What orders the two on the device is a queued
+    // event wait, not this answer.
     return 1;
 }
 
@@ -315,13 +345,24 @@ static bool resolve_graph_task_capacity(const uint64_t *ring_task_window, uint64
         *task_capacity = override_value;
     }
 
-    // Any positive count is usable: a task id indexes its slot directly, so
-    // nothing masks with this value. The power-of-two, >= 4 requirement belongs to
-    // tensormap_and_ringbuffer, which does mask, and is enforced in that runtime's
-    // own resolve; neither the RuntimeEnv setter nor Worker.run constrains the
-    // value, so this bound is the only one a ring_task_window passes through.
-    if (*task_capacity < 1 || *task_capacity > static_cast<uint64_t>(INT32_MAX)) {
-        LOG_ERROR("ring_task_window=%" PRIu64 " must be in [1, INT32_MAX]", *task_capacity);
+    // Any positive count is usable: a task id indexes its slot directly, so no slot
+    // lookup masks with this value. The power-of-two, >= 4 requirement belongs to
+    // tensormap_and_ringbuffer, which does mask there, and is enforced in that
+    // runtime's own resolve; neither the RuntimeEnv setter nor Worker.run constrains
+    // the value, so this bound is the only one a ring_task_window passes through.
+    //
+    // The upper bound is the one place a task id IS masked: a sub-task's id carries
+    // its modular task's local id in a fixed-width parent field, and that mint masks
+    // rather than fails, so a count past the field would truncate a parent silently.
+    // The shared-memory limit below is the tighter of the two in practice -- a slot
+    // costs kilobytes, so INT32_MAX bytes runs out first -- which makes this a guard
+    // that should never be the one to fire rather than a cap anyone meets.
+    if (*task_capacity < 1 || *task_capacity > static_cast<uint64_t>(TaskId::GLOBAL_TASK_MAX_NUM)) {
+        LOG_ERROR(
+            "ring_task_window=%" PRIu64 " must be in [1, %d]: a modular task's local id has to fit the parent field "
+            "of the sub-task ids it mints",
+            *task_capacity, TaskId::GLOBAL_TASK_MAX_NUM
+        );
         return false;
     }
     // A slot state reaches its payload and descriptor through a 32-bit
@@ -340,7 +381,7 @@ static bool resolve_graph_task_capacity(const uint64_t *ring_task_window, uint64
     return true;
 }
 
-static int32_t read_runtime_status(Runtime *runtime, const HostApi *api, SharedMemoryHeader *host_header) {
+static int32_t read_runtime_status(const Runtime *runtime, const HostApi *api, SharedMemoryHeader *host_header) {
     if (runtime == nullptr || api == nullptr || host_header == nullptr) {
         return 0;
     }
@@ -358,6 +399,14 @@ static int32_t read_runtime_status(Runtime *runtime, const HostApi *api, SharedM
 
     int32_t sched_error_code = host_header->sched_error_code.load(std::memory_order_relaxed);
     return runtime_status_from_error_code(sched_error_code);
+}
+
+static void release_run_tensor_leases(Runtime *runtime, const HostApi *api) {
+    const TensorLeaseReleaseCounts counts = release_tensor_leases(runtime->tensor_leases(), api);
+    LOG_DEBUG(
+        "Released tensor leases: freed=%d buffer_noop=%d external_noop=%d", counts.freed, counts.buffer_noop,
+        counts.external_noop
+    );
 }
 
 namespace {
@@ -435,14 +484,14 @@ struct DefinitionUploads {
     size_t spilled;
 };
 
-// Ship the run's Definition objects and bind every outer Graph task to the one
+// Prepare the run's Definition objects and bind every outer Graph task to the one
 // with its key. The recorders built most or all of them in place in the block's
 // host staging, each as [GraphDefinitionHeader][Definition image] at the offset it
 // claimed, so this pass writes the headers, copies in whatever did not fit, and
-// issues a single H2D of the used prefix. The device initial classify then replaces
-// each task's graph_context with an execution constructed in its own heap.
+// records the used prefix for synchronous publication. Device initial classify
+// replaces each task's graph_context with an execution constructed in its own heap.
 bool bind_graph_definitions(
-    const HostApi *api, GraphHostState &graph_state, DefinitionUploads *uploads,
+    Runtime *runtime, const HostApi *api, GraphHostState &graph_state, DefinitionUploads *uploads,
     ReadyQueuePopulations *ready_queue_populations
 ) {
     *uploads = DefinitionUploads{};
@@ -508,12 +557,14 @@ bool bind_graph_definitions(
             const size_t padded = align_up(object_bytes);
             std::memset(base + object_bytes, 0, padded - object_bytes);
         }
-        if (api->copy_to_device(block, staging, block_bytes) != 0) {
-            LOG_ERROR("host-orch: failed to upload the Graph Definition block");
-            return false;
-        }
         uploads->count = packed.size();
         uploads->bytes = block_bytes;
+        char attrs[kBindAttrsCapacity];
+        snprintf(
+            attrs, sizeof(attrs), "defs=%zu bytes=%zu submissions=%zu spilled=%zu", uploads->count, block_bytes, count,
+            uploads->spilled
+        );
+        runtime->add_pending_metadata(block, staging, block_bytes, HostPhaseKind::BindGraphUpload, attrs);
     }
 
     for (size_t index = 0; index < count; ++index) {
@@ -524,26 +575,25 @@ bool bind_graph_definitions(
         }
         auto object_it = packed.find(upload->full_key);
         if (object_it == packed.end() || block == nullptr || staging == nullptr) {
-            LOG_ERROR("host-orch: Graph task has no matching uploaded Definition object");
+            LOG_ERROR("host-orch: Graph task has no matching prepared Definition object");
             return false;
         }
-        // The object as it was shipped, so what this validates is the bytes the
-        // device will read rather than a host copy of them.
+        // Validate the prepared bytes that publication will copy to the device.
         const auto *definition = reinterpret_cast<const GraphDefinition *>(
             staging + object_it->second.object_offset + sizeof(GraphDefinitionHeader)
         );
         if (definition->total_bytes != object_it->second.image_bytes) {
-            LOG_ERROR("host-orch: Graph task has no matching uploaded Definition object");
+            LOG_ERROR("host-orch: Graph task has no matching prepared Definition object");
             return false;
         }
         GraphExecutionStorageLayout storage_layout{};
-        if (definition->task_count <= 0 || definition->task_count > MAX_IN_GRAPH_TASKS ||
+        if (definition->task_count <= 0 || definition->task_count > SUB_TASK_MAX_NUM ||
             definition->full_key != upload->full_key ||
             !graph_execution_storage_layout(
                 definition->task_count, definition->tensor_arg_count, definition->scalar_arg_count, &storage_layout
             ) ||
             storage_layout.total_bytes != definition->execution_storage_bytes ||
-            upload->outer_slot->to_payload().tensor_count != definition->boundary_count ||
+            upload->outer_slot->to_payload().tensor_count != definition->boundary_tensor_count ||
             upload->outer_slot->to_payload().scalar_count != definition->boundary_scalar_count) {
             LOG_ERROR("host-orch: invalid Graph Definition for task");
             return false;
@@ -564,11 +614,11 @@ bool bind_graph_definitions(
         }
         PackedDefinition &packed_definition = object_it->second;
         if (!packed_definition.populations_ready) {
-            const InGraphTaskDefinition *tasks = graph_definition_array<InGraphTaskDefinition>(
-                *definition, definition->off_in_graph_tasks, definition->task_count
+            const SubTaskDefinition *tasks = graph_definition_array<SubTaskDefinition>(
+                *definition, definition->off_sub_tasks, definition->task_count
             );
             if (tasks == nullptr) {
-                LOG_ERROR("host-orch: invalid Graph Definition in-graph task array");
+                LOG_ERROR("host-orch: invalid Graph Definition sub-task array");
                 return false;
             }
             for (int32_t i = 0; i < definition->task_count; ++i) {
@@ -640,9 +690,7 @@ int32_t run_host_orchestration(
     // region is committed below, once this pass has revealed how many bytes it
     // actually needs, and compact_live_image moves every address the orchestrator
     // wrote onto the real base before the image travels.
-    if (!orchestrator.init(
-            host_sm, reinterpret_cast<void *>(HEAP_VIRTUAL_BASE), HEAP_VIRTUAL_CAPACITY, task_capacity
-        )) {
+    if (!orchestrator.init(host_sm, reinterpret_cast<void *>(HEAP_VIRTUAL_BASE), MAX_HEAP_CAPACITY, task_capacity)) {
         LOG_ERROR("host-orch: orchestrator init against host SM failed");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -694,7 +742,7 @@ int32_t run_host_orchestration(
     orchestrator.total_aiv_count = block_dim * PLATFORM_AIV_CORES_PER_BLOCKDIM;
     rt->mode = MODE_EXECUTE;
     // get_tensor_data/set_tensor_data resolve buffer.addr through the host
-    // views registered at staging time (host_build_graph/host_tensor_access.h),
+    // views registered at copy-in time (host_build_graph/host_tensor_access.h),
     // so the host orchestrator can read control tensors (e.g. paged_attention's
     // context_lens/block_table) whether or not the platform maps device memory
     // into the host address space.
@@ -714,9 +762,17 @@ int32_t run_host_orchestration(
     entry_points->bind(rt);
 
     const BindPhaseMark orch_phase = bind_phase_begin();
-    rt_scope_begin(rt);
-    entry_points->entry(orch_l2);
-    rt_scope_end(rt);
+    {
+        // Recorder jobs borrow this build's state and execute code from its SO.
+        // Drain before commit can retire their entries, and before unwinding can
+        // release graph_state, orchestrator, or the tensor-access views.
+        RAIIScopeGuard recorder_completion([rt]() {
+            rt->ops->graph_record_wait(rt);
+        });
+        rt_scope_begin(rt);
+        entry_points->entry(orch_l2);
+        rt_scope_end(rt);
+    }
     rt_orchestration_done(rt);
 #if SIMPLER_ORCH_PROFILING
     // Per-sub-step cumulatives across this bind's submits. The accumulators only
@@ -781,27 +837,11 @@ int32_t run_host_orchestration(
         ready_queue_populations.add_task(slot.active_mask, slot.task_attrs, slot.task_kind);
     }
 
-    // Upload each distinct Definition as its own retained device object and bind
-    // every outer Graph task to it. Per-invocation data already lives in that
-    // task's payload regions and is copied with the shared-memory image below.
-    const BindPhaseMark graph_phase = bind_phase_begin();
+    // Bind Graph tasks to retained Definition addresses. The slot holds the
+    // prepared source until synchronous publication consumes it.
     DefinitionUploads definition_uploads{};
-    if (!bind_graph_definitions(api, *graph_state, &definition_uploads, &ready_queue_populations)) {
+    if (!bind_graph_definitions(runtime, api, *graph_state, &definition_uploads, &ready_queue_populations)) {
         return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    {
-        // `bytes` is what this segment copied: the Definition objects, which are all
-        // it copies. `defs` and `submissions` differ by the replay count — one
-        // Definition serves every Graph task with its key. `spilled` is how many
-        // objects the recorders could not build in the block, and so is 0 for a bind
-        // the retained staging was big enough for. It is deliberately not spelled
-        // `copied=`, which on arena_h2d means a zone rather than a count.
-        char attrs[kBindAttrsCapacity];
-        snprintf(
-            attrs, sizeof(attrs), "defs=%zu bytes=%" PRIu64 " submissions=%zu spilled=%zu", definition_uploads.count,
-            definition_uploads.bytes, graph_host_upload_count(*graph_state), definition_uploads.spilled
-        );
-        record_bind_phase(HostPhaseKind::BindGraphUpload, graph_phase, attrs, definition_uploads.bytes);
     }
 
     ReadyQueueCapacities ready_queue_capacities{};
@@ -849,7 +889,7 @@ int32_t run_host_orchestration(
         static_cast<uint64_t>(orch_state.scalar_pool_cursor),
     };
     const uint64_t image_bytes = sm_layout::segment_offsets(sm_layout::image_extents(bind_usage)).end;
-    runtime->sm_image_bytes = image_bytes;
+    runtime->dev.sm_image_bytes = image_bytes;
 
     // Only now are both sizes known, so this is where the two device regions are
     // committed: the arena up to its shared-memory tail, and the graph heap to the
@@ -926,7 +966,7 @@ int32_t run_host_orchestration(
     );
     static_assert(
         alignof(ChipTaskStorage) <= DeviceArena::kDefaultBaseAlign,
-        "an in-graph task's storage alignment must be covered by the heap region's base alignment"
+        "a sub-task's storage alignment must be covered by the heap region's base alignment"
     );
     always_assert(reinterpret_cast<uint64_t>(gm_heap) % DeviceArena::kDefaultBaseAlign == 0);
     const sm_layout::HeapRebase heap_rebase{reinterpret_cast<uint64_t>(gm_heap), heap_bytes};
@@ -938,11 +978,21 @@ int32_t run_host_orchestration(
     // vector's data() is not.
     const uint64_t copied_bytes = layout.off_copied_end - layout.off_copied_begin;
     const uint64_t upload_bytes = copied_bytes + image_bytes;
-    std::vector<std::byte> storage(upload_bytes + CHIP_ALIGN_SIZE, std::byte{0});
-    char *upload_base = reinterpret_cast<char *>(
-        (reinterpret_cast<uintptr_t>(storage.data()) + CHIP_ALIGN_SIZE - 1) &
-        ~static_cast<uintptr_t>(CHIP_ALIGN_SIZE - 1)
-    );
+    // Assembled in staging the runner retains rather than in a buffer that dies
+    // with this frame: publication is a separate step, so the bytes have to still
+    // be here when it reads them. Over-allocated by the alignment the layout
+    // needs, and handed over uninitialized: what this bind writes are the copied
+    // zone and the live segments `compact_live_image` emits, so the alignment gaps
+    // between segments carry whatever the block last held. No device code reads a
+    // gap — every reader indexes a segment through the layout — which is what makes
+    // clearing the whole block per bind unnecessary rather than merely expensive.
+    void *staging_addr = nullptr;
+    if (api->acquire_run_image_staging(static_cast<size_t>(upload_bytes), CHIP_ALIGN_SIZE, &staging_addr) != 0 ||
+        staging_addr == nullptr) {
+        LOG_ERROR("host-orch: staging for a %" PRIu64 "-byte runtime image is unavailable", upload_bytes);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    char *upload_base = static_cast<char *>(staging_addr);
 
     // The copied zone carries no host address: the orchestrator and the ops table are
     // both host-only, and no device code may reach host memory through the image.
@@ -956,24 +1006,14 @@ int32_t run_host_orchestration(
     );
     always_assert(compacted == image_bytes);
 
-    const BindPhaseMark h2d_phase = bind_phase_begin();
-    if (api->copy_to_device(arena_dev + layout.off_copied_begin, upload_base, upload_bytes) != 0) {
-        LOG_ERROR("host-orch: H2D of the runtime image failed");
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    {
-        // The widest attribute string a segment formats: eight uint64 fields plus
-        // their labels. With the counters ahead of it in the recorded string, this
-        // is the tail a truncation eats first.
-        char attrs[kBindAttrsCapacity];
-        snprintf(
-            attrs, sizeof(attrs),
-            "nt=%" PRIu64 " bytes=%" PRIu64 " copied=%" PRIu64 " sm=%" PRIu64 " args=%" PRIu64 "/%" PRIu64 "/%" PRIu64,
-            nt, upload_bytes, copied_bytes, image_bytes, bind_usage.fanin_elems, bind_usage.tensor_elems,
-            bind_usage.scalar_elems
-        );
-        record_bind_phase(HostPhaseKind::BindArenaH2d, h2d_phase, attrs, upload_bytes);
-    }
+    // Prepared, not published: `publish_run_image_impl` performs this write, and
+    // records the BindArenaH2d segment that measures it. The pool counters travel
+    // with the record because only this bind knows them; the rest of that
+    // segment's attributes the publication rebuilds from `dev` and the length.
+    runtime->set_pending_publication(
+        arena_dev + layout.off_copied_begin, upload_base, upload_bytes, bind_usage.fanin_elems, bind_usage.tensor_elems,
+        bind_usage.scalar_elems
+    );
     return total_tasks;
 }
 
@@ -1096,7 +1136,7 @@ extern "C" int register_callable_impl(const ChipCallable *callable, const HostAp
         out->host_orch_func_ptr = eps;
         LOG_INFO("host-orch: loaded orchestration entry '%s' on host", orch_func_name);
     }
-    LOG_INFO("Orchestration SO: %zu bytes staged", orch_so_size);
+    LOG_INFO("Orchestration SO: %zu bytes uploaded", orch_so_size);
     return 0;
 }
 
@@ -1139,14 +1179,18 @@ extern "C" int bind_callable_to_runtime_impl(
     int scalar_count = orch_args->scalar_count();
     LOG_INFO("RT2 bind: %d tensors + %d scalars, host orchestration mode", tensor_count, scalar_count);
 
-    // Arm before the first segment below: the record pool has to exist for
-    // `args`, which runs well before the device collector is provisioned. The
-    // guard ends the bind on every exit, not just the successful one — a bind
-    // that fails part-way is exactly when its breakdown is worth having, and an
-    // unfinished bind publishes nothing.
+    // Rebinding an unpublished run must not replace its source or device owners.
+    if (runtime->pending_publication().bytes != 0 || !runtime->pending_publication().prerequisites.empty()) {
+        LOG_ERROR("bind_callable_to_runtime_impl: unpublished metadata still belongs to this run");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
     host_phase_trace_begin(api);
-    auto host_phase_guard = RAIIScopeGuard([]() {
-        host_phase_trace_end();
+    bool prepared = false;
+    auto host_phase_guard = RAIIScopeGuard([runtime, api, &prepared]() {
+        if (!prepared) {
+            runtime->clear_pending_publication();
+            host_phase_trace_end(api);
+        }
     });
 
     uint64_t task_capacity = 0;
@@ -1171,9 +1215,32 @@ extern "C" int bind_callable_to_runtime_impl(
     // the point at which a task could make it stale.
     HostTensorAccessor tensor_access(api);
 
+    // A lease recorded by an earlier bind names an offset this bind is about to
+    // re-slice, so carrying one over would copy this run's bytes back to that
+    // run's host pointer. Every exit path from here on leaves the ledger owned
+    // by the caller's Runtime, and this is where it starts empty.
+    runtime->tensor_leases().clear();
+
+    // The retained temporary buffer is always used on the hbg path — it is an
+    // internal allocation optimization, not user-facing config. The buffer
+    // lives on the runner across runs, one per pipeline slot; here we grow it
+    // to this run's packed size and bump-slice from it. A run holds its
+    // pipeline slot from bind through validate and a concurrent reservation is
+    // admitted only on a distinct slot, so no other run can re-slice this
+    // buffer while these slices are live.
+    //
+    // Inside the args span: growing the buffer is the only device allocation
+    // this phase can make, so a steady-state workload reporting no allocation
+    // cost here is a measurement rather than a definition.
     const BindPhaseMark args_phase = bind_phase_begin();
-    uint64_t staged_bytes = 0;
-    int staged_tensors = 0;
+    RetainedTempBump bump;
+    const size_t required_temp_bytes = packed_temp_bytes(orch_args);
+    if (!bump.begin(api, required_temp_bytes)) {
+        LOG_ERROR("Retained temp buffer grow failed: required bytes %zu", required_temp_bytes);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    uint64_t h2d_bytes = 0;
+    int h2d_tensors = 0;
     for (int i = 0; i < tensor_count; i++) {
         ChipTensor t = orch_args->tensor(i);
 
@@ -1184,33 +1251,53 @@ extern "C" int bind_callable_to_runtime_impl(
         if (t.is_device_memory()) {
             always_assert(t.buffer.addr < HEAP_VIRTUAL_BASE && "caller tensor reaches into the virtual heap window");
             LOG_DEBUG("  ChipTensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.buffer.addr);
+            // The bytes stay where the caller put them, so orchestration has no
+            // copy-in buffer to read them from. Claim the span now and let the
+            // platform resolve a means only if an access actually lands in it.
+            if (!tensor_access.add_child_memory(t.buffer.addr, t.buffer.size)) {
+                LOG_ERROR("host-orch: could not claim child-memory tensor %d (0x%" PRIx64 ")", i, t.buffer.addr);
+                return PTO_RUNTIME_ERR_INTERNAL;
+            }
             device_args.add_tensor(t);
             continue;
         }
 
         void *host_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(t.buffer.addr));
         size_t size = static_cast<size_t>(t.nbytes());
+        // An empty tensor addresses nothing, so it takes no slice and carries a
+        // null address rather than one aliasing the next tensor's.
+        if (size == 0) {
+            t.buffer.addr = 0;
+            device_args.add_tensor(t);
+            continue;
+        }
 
-        void *dev_ptr = api->device_malloc(size);
+        void *dev_ptr = bump.acquire(size);
         if (dev_ptr == nullptr) {
-            LOG_ERROR("Failed to allocate device memory for tensor %d", i);
+            LOG_ERROR(
+                "Retained temp buffer slice miss for tensor %d: bytes=%zu offset=%zu capacity=%zu", i, size,
+                bump.next_offset(), bump.capacity()
+            );
             return PTO_RUNTIME_ERR_INTERNAL;
         }
 
         // Pure write-only OUTPUT buffers are never read by the kernel and hold
-        // no meaningful host content, so they need no device staging — the
+        // no meaningful host content, so they need no copy-in — the
         // kernel defines what it writes and any unwritten bytes are undefined.
-        // IN / INOUT (read-before-write) are staged H2D.
+        // IN / INOUT (read-before-write) are copied in H2D. The copy happens here
+        // rather than in copy_in_run_inputs_impl because the orchestrator below
+        // runs on the host and reads these tensors while it builds the graph;
+        // that function documents what makes the earlier copy sound.
         bool is_pure_output = (signature != nullptr && i < sig_count && signature[i] == ArgDirection::OUT);
-        if (!is_pure_output) {
+        bool needs_copy_in = !is_pure_output;
+        if (needs_copy_in) {
             int rc = api->copy_to_device(dev_ptr, host_ptr, size);
             if (rc != 0) {
-                LOG_ERROR("Failed to stage tensor %d to device", i);
-                api->device_free(dev_ptr);
+                LOG_ERROR("Failed to copy tensor %d in to the device", i);
                 return PTO_RUNTIME_ERR_INTERNAL;
             }
-            staged_bytes += static_cast<uint64_t>(size);
-            ++staged_tensors;
+            h2d_bytes += static_cast<uint64_t>(size);
+            ++h2d_tensors;
         }
         // Read-only INPUT tensors are never written by the kernel, so there is
         // no point copying them back D2H at the end. Index the signature
@@ -1219,11 +1306,13 @@ extern "C" int bind_callable_to_runtime_impl(
         // tensor entries). Anything not provably IN keeps the safe default of
         // copying back.
         bool needs_copy_back = !(signature != nullptr && i < sig_count && signature[i] == ArgDirection::IN);
-        runtime->tensor_pairs_.push_back({host_ptr, dev_ptr, size, needs_copy_back});
+        runtime->tensor_leases().push_back(
+            {host_ptr, dev_ptr, size, needs_copy_in, needs_copy_back, TensorReleaseKind::BufferNoop}
+        );
         LOG_DEBUG("  ChipTensor %d: %zu bytes at %p", i, size, dev_ptr);
 
         // host_build_graph runs the orchestrator on the host, which may read
-        // staged control tensors (e.g. paged_attention's context_lens and
+        // host-memory control tensors (e.g. paged_attention's context_lens and
         // block_table) via get_tensor_data to shape the graph. A pure output
         // has no valid readable bytes before execution, and a5 cannot map it;
         // exposing its caller buffer would therefore make reads unsafe. Leave
@@ -1235,7 +1324,7 @@ extern "C" int bind_callable_to_runtime_impl(
         }
 
         t.buffer.addr = reinterpret_cast<uint64_t>(dev_ptr);
-        always_assert(t.buffer.addr < HEAP_VIRTUAL_BASE && "device_malloc reaches into the virtual heap window");
+        always_assert(t.buffer.addr < HEAP_VIRTUAL_BASE && "an argument slice reaches into the virtual heap window");
         device_args.add_tensor(t);
     }
     for (int i = 0; i < scalar_count; i++) {
@@ -1243,9 +1332,7 @@ extern "C" int bind_callable_to_runtime_impl(
     }
     {
         char attrs[kBindAttrsCapacity];
-        snprintf(
-            attrs, sizeof(attrs), "ntensor=%d staged=%d bytes=%" PRIu64, tensor_count, staged_tensors, staged_bytes
-        );
+        snprintf(attrs, sizeof(attrs), "ntensor=%d h2d=%d bytes=%" PRIu64, tensor_count, h2d_tensors, h2d_bytes);
         record_bind_phase(HostPhaseKind::BindArgs, args_phase, attrs);
     }
 
@@ -1255,7 +1342,7 @@ extern "C" int bind_callable_to_runtime_impl(
     // submitted its tasks, and the heap's only once orchestration has allocated
     // its intermediate buffers. Both are committed by the single
     // setup_static_arena in run_host_orchestration. Owned by DeviceRunner across
-    // runs — do NOT record in tensor_pairs_; the free is deferred to
+    // runs — do NOT record in tensor_leases(); the free is deferred to
     // DeviceRunner::finalize(). The runtime-arena size is determined by replaying
     // the reserve sequence on a host-side arena.
     uint64_t sm_size = SharedMemoryHandle::calculate_size(task_capacity);
@@ -1272,11 +1359,6 @@ extern "C" int bind_callable_to_runtime_impl(
         snprintf(attrs, sizeof(attrs), "bytes=%" PRIu64, static_cast<uint64_t>(layout.arena_size));
         record_bind_phase(HostPhaseKind::BindArenaBuild, arena_build_phase, attrs);
     }
-
-    // The shared memory is placed at the end of orchestration, so until then this
-    // bind has none. Clearing the pointer keeps a failure before that point from
-    // leaving the previous bind's address for the error-code read to follow.
-    runtime->set_gm_sm_ptr(nullptr);
 
     // Set up orchestration state (consumed by the host orchestrator below)
     runtime->set_orch_args(device_args);
@@ -1303,10 +1385,10 @@ extern "C" int bind_callable_to_runtime_impl(
     runtime_wire_arena_pointers(host_arena, layout, rt);
     // Stash the layout inside the RuntimeContext image so the AICPU can recover every
     // arena-internal offset after the copy. It is written before orchestration
-    // because orchestration is what performs that copy, and the runtime header is
-    // part of what travels. The runtime arena's device base does NOT travel — it is
-    // on the host Runtime (set_prebuilt_arena below), since the AICPU needs that
-    // pointer before it can dereference the image.
+    // because orchestration assembles the image this header is part of, and the
+    // publication uploads what it assembled. The runtime arena's device base does
+    // NOT travel — it is on the host Runtime (set_prebuilt_arena below), since the
+    // AICPU needs that pointer before it can dereference the image.
     rt->prebuilt_layout = layout;
     record_bind_phase(HostPhaseKind::BindRuntimeInit, runtime_init_phase);
 
@@ -1331,18 +1413,22 @@ extern "C" int bind_callable_to_runtime_impl(
         // owns these buffers, so drop the window on both exits.
         const size_t view_count = tensor_access.mapping_count();
         const uint64_t view_bytes = tensor_access.mapped_bytes();
+        const uint64_t device_copies = tensor_access.device_copy_count();
         const BindPhaseMark view_close_phase = bind_phase_begin();
         tensor_access.close();
         {
             char attrs[kBindAttrsCapacity];
-            snprintf(attrs, sizeof(attrs), "count=%zu bytes=%" PRIu64, view_count, view_bytes);
+            snprintf(
+                attrs, sizeof(attrs), "count=%zu bytes=%" PRIu64 " devcopy=%" PRIu64, view_count, view_bytes,
+                device_copies
+            );
             record_bind_phase(HostPhaseKind::BindHostViewClose, view_close_phase, attrs);
         }
         if (total_tasks < 0) {
             LOG_ERROR("host-orch: orchestration run failed");
             return total_tasks;
         }
-        runtime->host_total_tasks = total_tasks;
+        runtime->dev.host_total_tasks = total_tasks;
         LOG_INFO("host-orch: submitted %d tasks on host", total_tasks);
     }
 
@@ -1357,23 +1443,116 @@ extern "C" int bind_callable_to_runtime_impl(
 
     LOG_INFO("Device orchestration ready: %d tensors + %d scalars", tensor_count, scalar_count);
 
+    prepared = true;
     return 0;
 }
 
 /**
- * Validate runtime results and cleanup.
+ * Consume this run's metadata in dependency order, synchronously.
+ * A failed copy stops publication and consumes the remaining sources. Device
+ * destinations remain owned until the failed-prepare cleanup releases them.
+ */
+extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
+    if (runtime == nullptr || api == nullptr) {
+        LOG_ERROR("publish_run_image_impl: null runtime or HostApi");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    auto host_phase_guard = RAIIScopeGuard([api]() {
+        host_phase_trace_end(api);
+    });
+    auto publication = runtime->take_pending_publication();
+    if (publication.bytes == 0 || publication.device_target == nullptr || publication.source == nullptr) {
+        LOG_ERROR("publish_run_image_impl: no prepared runtime image to publish");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    for (const auto &region : publication.prerequisites) {
+        const BindPhaseMark phase = bind_phase_begin();
+        if (api->copy_to_device(region.device_target, region.source, region.bytes) != 0) {
+            LOG_ERROR("host-orch: metadata prerequisite publication failed");
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        if (region.phase != HostPhaseKind::Count) {
+            record_bind_phase(region.phase, phase, region.attributes.c_str(), region.bytes);
+        }
+    }
+    const BindPhaseMark h2d_phase = bind_phase_begin();
+    if (api->copy_to_device(publication.device_target, publication.source, publication.bytes) != 0) {
+        LOG_ERROR("host-orch: H2D of the runtime image failed");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    {
+        // The image size and the task count are on the descriptor this bind
+        // filled, and the copied zone is what the length has left over, so only
+        // the pool counters had to travel.
+        const uint64_t image_bytes = runtime->dev.sm_image_bytes;
+        const uint64_t copied_bytes = publication.bytes - image_bytes;
+        // The widest attribute string a segment formats: eight uint64 fields plus
+        // their labels. With the counters ahead of it in the recorded string, this
+        // is the tail a truncation eats first.
+        char attrs[kBindAttrsCapacity];
+        snprintf(
+            attrs, sizeof(attrs),
+            "nt=%" PRIu64 " bytes=%" PRIu64 " copied=%" PRIu64 " sm=%" PRIu64 " args=%" PRIu64 "/%" PRIu64 "/%" PRIu64,
+            static_cast<uint64_t>(runtime->dev.host_total_tasks), publication.bytes, copied_bytes, image_bytes,
+            publication.fanin_elems, publication.tensor_elems, publication.scalar_elems
+        );
+        record_bind_phase(HostPhaseKind::BindArenaH2d, h2d_phase, attrs, publication.bytes);
+    }
+    return 0;
+}
+
+/**
+ * Stage one run's inputs. A no-op for this runtime.
+ *
+ * host_build_graph runs its orchestrator on the host during bind, and that
+ * orchestrator reads the input tensors it was given while it builds the graph,
+ * so the bytes have to be in place before orchestration rather than after it —
+ * `bind_callable_to_runtime_impl` copies them there. What makes that sound is
+ * that a bind serves exactly one run: the graph this bind materializes carries
+ * the values it read, so the bytes and the graph belong to the same run.
+ */
+extern "C" int copy_in_run_inputs_impl(const Runtime * /*runtime*/, const HostApi * /*api*/) { return 0; }
+
+/**
+ * Release the tensor bindings the bind recorded.
+ *
+ * Its own entry rather than the tail of the copy-back, so that reading a run's
+ * results and retiring the device memory behind them are separately orderable.
+ */
+extern "C" int release_run_bindings_impl(Runtime *runtime, const HostApi *api) {
+    if (runtime == nullptr || api == nullptr) {
+        LOG_ERROR("release_run_bindings_impl: null runtime or HostApi");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    // Close only this run's trace; another run may already own the recorder.
+    host_phase_trace_end(api);
+    runtime->clear_pending_publication();
+    release_run_tensor_leases(runtime, api);
+    // The dispatch table is owned by bind_callable_to_runtime, which clears it
+    // before replaying the active callable's addresses. The chip-callable device
+    // buffer behind those addresses is pool-managed by DeviceRunner (keyed by
+    // content hash) and bulk-freed in DeviceRunner::finalize(), so re-running the
+    // same callable repeatedly does not re-upload.
+    return 0;
+}
+
+/**
+ * Inspect one run's results.
  *
  * This function:
- * 1. Copies recorded tensors from device back to host
- * 2. Frees device memory for recorded tensors
- * 3. Clears tensor pair state
+ * 1. Reads the device-side runtime status when the run failed on the device
+ * 2. Copies written tensors from device back to host
+ *
+ * It releases nothing; `release_run_bindings_impl` ends the bindings it reads.
  *
  * @param runtime       Pointer to Runtime
  * @param execution_rc  Device-runner drain status after successful enqueue,
  *                      or enqueue status on failure
+ * @param launched      Nonzero when this run reached a stream, and its
+ *                      device-side status is therefore readable
  * @return 0 on success, -1 on failure
  */
-extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc) {
+extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi *api, int execution_rc, int launched) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -1388,17 +1567,19 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
     LOG_INFO("=== Copying Results Back to Host ===");
 
     // Copy all recorded tensors from device back to host
-    TensorPair *tensor_pairs = runtime->tensor_pairs_.data();
-    int tensor_pair_count = static_cast<int>(runtime->tensor_pairs_.size());
+    const TensorLease *tensor_leases = runtime->tensor_leases().data();
+    int tensor_lease_count = static_cast<int>(runtime->tensor_leases().size());
 
-    LOG_INFO("ChipTensor pairs to process: %d", tensor_pair_count);
+    LOG_INFO("ChipTensor leases to process: %d", tensor_lease_count);
 
     bool skip_tensor_copy_back = execution_rc != 0;
     int32_t runtime_status = 0;
     SharedMemoryHeader host_header;
     memset(&host_header, 0, sizeof(host_header));
 
-    if (execution_rc != 0) {
+    // The shared-memory status is device state, readable only for a run that
+    // reached a stream.
+    if (execution_rc != 0 && launched != 0) {
         runtime_status = read_runtime_status(runtime, api, &host_header);
     }
     if (runtime_status != 0) {
@@ -1409,58 +1590,40 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
     if (skip_tensor_copy_back) {
         LOG_WARN("Skipping tensor copy-back because execution failed");
     } else {
-        for (int i = 0; i < tensor_pair_count; i++) {
-            const TensorPair &pair = tensor_pairs[i];
+        for (int i = 0; i < tensor_lease_count; i++) {
+            const TensorLease &lease = tensor_leases[i];
 
             // Skip if device pointer is null
-            if (pair.dev_ptr == nullptr) {
+            if (lease.dev_ptr == nullptr) {
                 LOG_WARN("ChipTensor %d has null device pointer, skipping", i);
                 continue;
             }
 
             // If host pointer is null, this is a device-only allocation (no copy-back)
-            if (pair.host_ptr == nullptr) {
+            if (lease.host_ptr == nullptr) {
                 LOG_DEBUG("ChipTensor %d: device-only allocation (no copy-back)", i);
                 continue;
             }
 
             // Read-only INPUT tensors were uploaded H2D but the kernel never
             // wrote them — copying them back (potentially ~GB) is pure waste.
-            // They are still device_free'd in the cleanup loop below.
-            if (!pair.needs_copy_back) {
+            // They are still released through release_kind below.
+            if (!lease.needs_copy_back) {
                 LOG_DEBUG("ChipTensor %d: read-only input, skipping copy-back", i);
                 continue;
             }
 
-            int copy_rc = api->copy_from_device(pair.host_ptr, pair.dev_ptr, pair.size);
+            int copy_rc = api->copy_from_device(lease.host_ptr, lease.dev_ptr, lease.size);
             if (copy_rc != 0) {
                 LOG_ERROR("Failed to copy tensor %d from device: %d", i, copy_rc);
                 rc = copy_rc;
             } else {
-                LOG_DEBUG("ChipTensor %d: %zu bytes copied to host", i, pair.size);
+                LOG_DEBUG("ChipTensor %d: %zu bytes copied to host", i, lease.size);
             }
         }
     }
 
-    // Cleanup device tensors
-    LOG_INFO("=== Cleaning Up ===");
-    for (int i = 0; i < tensor_pair_count; i++) {
-        if (tensor_pairs[i].dev_ptr != nullptr) {
-            api->device_free(tensor_pairs[i].dev_ptr);
-        }
-    }
-    LOG_INFO("Freed %d device allocations", tensor_pair_count);
-
-    // The dispatch table is owned by bind_callable_to_runtime, which clears it
-    // before replaying the active callable's addresses. The chip-callable device
-    // buffer behind those addresses is pool-managed by DeviceRunner (keyed by
-    // content hash) and bulk-freed in DeviceRunner::finalize(), so re-running the
-    // same callable repeatedly does not re-upload.
-
-    // Clear tensor pairs
-    runtime->tensor_pairs_.clear();
-
-    LOG_INFO("=== Finalize Complete ===");
+    LOG_INFO("=== Result Copy-Back Complete ===");
 
     if (rc == 0 && runtime_status != 0) {
         rc = runtime_status;

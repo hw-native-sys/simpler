@@ -19,6 +19,14 @@ Override ``st_worker`` here as class-scope, building a fresh L2 worker
 that does **not** enter ``_l2_worker_pool``. Cost: one extra init/close
 per prepared_callable test class.
 
+Class scope is also the isolation boundary for a case that deliberately drives
+a failure through the device: such a case lives in its own class, so the runner
+state it produces is not handed to cases that expect a healthy runner. The
+boundary has to be the class rather than a second, finer-scoped fixture —
+``DevicePool.allocate`` (root ``conftest.py``) returns ``[]`` rather than
+queueing, so a per-test worker requested while the class's worker is still
+cached would need a second device and fail outright on a single-device pool.
+
 The 4 prepared_callable directories (a2a3/a5 × tensormap_and_ringbuffer/
 host_build_graph) share identical conftest content — keep them in sync.
 """

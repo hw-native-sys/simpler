@@ -123,9 +123,12 @@ onboard Path A implementation:
 3. **Shared per-task `KernelArgs` payload.**
    `src/{a2a3,a5}/platform/include/common/kernel_args.h` is front-less.
    Runtime state is passed through `KernelArgs::runtime_args`, profiling buffer
-   bases, and register tables. AICore receives only this payload through the
-   host-owned device copy. Per-device invariants (device id, log config) are NOT
-   on `KernelArgs` — they travel once via `InitArgs`.
+   bases, and register tables. **AICPU** receives this payload by value, as the
+   launch argument blob. **AICore** receives `AicoreLaunchArgs`, a projection of
+   the same struct holding the subset its entry reads, also by value in its own
+   launch argument block. Neither side reads a device-resident copy. Per-device
+   invariants (device id, log config) are NOT on `KernelArgs` — they travel once
+   via `InitArgs`.
 
 Keep those channels distinct. The bootstrap ABI still uses the `DeviceArgs`
 name because the dispatcher really reads that structure. The platform per-task
@@ -152,6 +155,40 @@ working on a2a3 onboard across HBG and TRB, so the front was removed.
 - `LoadAicpuOp` still owns both dispatcher bootstrap registration and cached
   per-task AICPU entry launches. Splitting those into separate loader objects
   would be a larger lifecycle refactor.
+
+In the program path, `KernelArgsHelper::prepare_runtime_args` reserves the
+slot-owned destination and snapshots only `DeviceRuntimeLaunchDesc`.
+`publish_runtime_args` consumes that snapshot with a synchronous H2D before
+launch. The sole production caller, `init_runtime_args_with_metadata`, calls
+them consecutively, with only a return-code check between them: there is no
+intervening Runtime mutation today. The snapshot establishes a boundary for
+later decoupled/asynchronous publication and capture work; it does not fix a
+current mutation race or make publication asynchronous.
+
+An unpublished descriptor rejects another preparation without changing its
+snapshot, destination or allocator. Explicit `release_run_view` discards it;
+a fresh preparation after publication or release withdraws the earlier
+publication status. Move transfers both the snapshot and status, leaving the
+source unable to publish or launch.
+
+`runtime_args_published()` becomes true only after synchronous H2D succeeds.
+Both onboard `launch_execution` entries check it before stream creation, DFX
+arming or kernel submission. A missing or failed publication returns
+`INVALID_STATE` with `NotStarted` and the prepared owner available for cleanup;
+it does not poison the device or start an active execution. A failed copy clears
+the launch pointer while retaining the slot allocation. A repeated publish is
+rejected without a copy and preserves the existing publication verdict.
+
+Successful prepare installs a non-null `args.runtime_args`, but the destination
+still holds the previous run's bytes or uninitialized storage. The launch check
+therefore uses publication status as well as the pointer. This verdict covers
+only the Runtime descriptor: HBG image publication and late DFX arming retain
+their own checked failure paths. A future asynchronous copy must retain its
+source through completion; this synchronous status does not supply that lifetime.
+
+The snapshot adds one host allocation and descriptor-size CPU copy per run;
+those costs are paid even with the adjacent calls. It does not reduce device
+transfer bytes or establish capture/replay support.
 
 ## Method 3: Path B — `KERNEL_TYPE_AICPU_CUSTOM` (broken — #822)
 

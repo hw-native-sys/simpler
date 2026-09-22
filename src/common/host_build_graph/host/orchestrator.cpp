@@ -251,45 +251,18 @@ bool OrchestratorState::init(void *sm_base, void *gm_heap, uint64_t heap_size, u
     return true;
 }
 
-// The recorder's own form of GraphTensorSourceKind. Its Ref counterpart carries a
-// size_t index, which graph_pack_tensor_source narrows to the wire form's uint16.
-enum class GraphRecordedTensorSourceKind : uint8_t {
-    BOUNDARY_EXACT,
-    BOUNDARY_VIEW,
-    INTERNAL,
-    OWN_OUTPUT,
-};
-
-struct GraphRecordedTensorSourceRef {
-    GraphRecordedTensorSourceKind source_kind{GraphRecordedTensorSourceKind::BOUNDARY_EXACT};
-    size_t source_index{0};
-    uint64_t packed_offset{0};
-};
-
-enum class GraphRecordedScalarSourceKind : uint8_t {
-    STATIC_VALUE,
-    BOUNDARY,
-    INVALIDATED_BOUNDARY,
-};
-
-struct GraphRecordedScalarSourceRef {
-    GraphRecordedScalarSourceKind source_kind{GraphRecordedScalarSourceKind::STATIC_VALUE};
-    size_t source_index{0};
-};
-
 // A recorded task's dispatch predicate, held as the operand tensor plus the element
 // index within it rather than the absolute address submit would resolve. The tensor is
 // copied because the caller only lends it for the duration of the submit call.
 struct GraphRecordedPredicate {
     simpler::hbg::Tensor operand;
-    GraphRecordedTensorSourceRef source;
     uint64_t elem_offset{0};
     int64_t target{0};
     uint8_t elem_size{0};
     PredicateOp op{PredicateOp::NONE};
 };
 
-struct RecordedInGraphTask {
+struct RecordedSubTask {
     std::array<int32_t, SUBTASK_SLOT_COUNT> kernel_ids{};
     ActiveMask active_mask{};
     TaskAttrs task_attrs{};
@@ -303,9 +276,6 @@ struct RecordedInGraphTask {
     // body records, which the pool satisfies by being allocated at the cap and never growing.
     int32_t tensor_offset{0};
     int32_t tensor_count{0};
-    // Ranges into the recording's flat arrays. tensor_sources has one entry per
-    // tensor, so tensor_count is its count too.
-    int32_t tensor_source_offset{0};
     int32_t scalar_offset{0};
     int32_t scalar_count{0};
     int32_t fanin_offset{0};
@@ -319,7 +289,7 @@ struct RecordedInGraphTask {
     // records a Definition that body never had, and predicate_index and dump_metadata are
     // written only on the paths that have one, so neither can be left to the fill.
     //
-    // Field by field rather than `*this = RecordedInGraphTask{}`: the latter is immune to
+    // Field by field rather than `*this = RecordedSubTask{}`: the latter is immune to
     // fields added later, but it costs a second write of the whole struct on every recorded
     // task and measured 350-700 us per bind on dsv4's 1679 tasks. The static_assert below is
     // the cheap half of that guarantee -- adding a field breaks the build here, which is
@@ -334,7 +304,6 @@ struct RecordedInGraphTask {
         record_packed_base = 0;
         tensor_offset = 0;
         tensor_count = 0;
-        tensor_source_offset = 0;
         scalar_offset = 0;
         scalar_count = 0;
         fanin_offset = 0;
@@ -348,31 +317,265 @@ struct RecordedInGraphTask {
 // from the previous body into the next recording -- silently, as a Definition that body
 // never had. Adding a field changes this size, so the build stops here instead.
 static_assert(
-    sizeof(RecordedInGraphTask) == 104, "RecordedInGraphTask gained or lost a field: extend reset() to match, then "
-                                        "update this size"
+    sizeof(RecordedSubTask) == 104, "RecordedSubTask gained or lost a field: extend reset() to match, then "
+                                    "update this size"
 );
 
-// One boundary tensor keyed by the address a lookup arrives with. The address is held
-// here rather than followed through `index` so a search touches this array alone: the
-// boundary tensors are 128 bytes apiece, and reading one only to compare eight of its
-// bytes is what makes a scan over them a scan over memory.
-struct GraphBoundaryByAddress {
-    uint64_t addr;
-    uint32_t index;
+// One boundary parameter reduced to what a later invocation is checked against.
+//
+// The match path reads every parameter on every same-key submission, and a parameter's own
+// form is a 128-byte simpler::hbg::Tensor whose compared fields straddle both of its cache
+// lines. Here one parameter's comparison is one cache line, and a boundary is a contiguous
+// run of them carrying only what the comparison reads.
+//
+// Each field keeps the type it is compared against, so a comparison is a comparison rather
+// than a cast.
+//
+// start_offset is here but is not compared directly: an argument may slide between
+// invocations, and what is pinned is its offset from its alias partition's representative
+// (see graph_boundary_arrangement_matches), which needs both this and the representative's.
+struct GraphBoundaryParamMatch {
+    uint64_t buffer_size;
+    uint64_t start_offset;
+    uint32_t shapes[MAX_TENSOR_DIMS];
+    uint32_t strides[MAX_TENSOR_DIMS];
+    // The lowest-numbered parameter sharing this one's buffer, itself when none earlier
+    // does. A relation between parameters rather than a property of one, carried here so
+    // the arrangement check reads it from the same line as the offset it pairs with.
+    uint16_t alias_rep;
+    uint8_t ndims;
+    TensorArgType tag;
+    DataType dtype;
+    bool manual_dep;
+    bool is_contiguous;
+};
+static_assert(sizeof(GraphBoundaryParamMatch) == 64, "one parameter's comparison must stay one cache line");
+
+GraphBoundaryParamMatch graph_boundary_param_match_of(const simpler::hbg::Tensor &tensor, TensorArgType tag) {
+    GraphBoundaryParamMatch match{};
+    match.buffer_size = tensor.buffer.size;
+    match.start_offset = tensor.start_offset;
+    // Only the dimensions in use, which is also the range graph_boundary_param_matches
+    // compares: a value-initialized record then holds zero past ndims rather than
+    // whatever the argument's unused slots happened to carry.
+    std::copy(std::begin(tensor.shapes), std::begin(tensor.shapes) + tensor.ndims, std::begin(match.shapes));
+    std::copy(std::begin(tensor.strides), std::begin(tensor.strides) + tensor.ndims, std::begin(match.strides));
+    match.ndims = static_cast<uint8_t>(tensor.ndims);
+    match.tag = tag;
+    match.dtype = tensor.dtype;
+    match.manual_dep = tensor.manual_dep;
+    match.is_contiguous = tensor.is_contiguous;
+    return match;
+}
+
+// The Graph boundary as the submitting thread captured it, deep-copied because the caller
+// only lends its arguments for the duration of the submit call.
+//
+// This is the boundary: the recorded body reads it, later same-key submissions compare
+// against it, and a task slot that follows one of its parameters names a slot in `params`.
+// Everything is written once, by the submitting thread in graph_begin, and only read
+// afterwards -- the recorder never writes here.
+//
+// `tensors` is the storage `params` points into: a TensorRef holds a Tensor*, so holding a
+// GraphTaskArgs is not the same as owning its tensor data. The array is fixed-size so
+// those pointers cannot be invalidated by a reallocation.
+struct GraphBoundary {
+    // Deliberately user-provided rather than `= default`: a defaulted constructor here is
+    // trivial, so make_unique<GraphInflightRecording>()'s value-initialization would zero
+    // all 13.3 KB of `tensors` on the submitting thread. A user-provided one leaves the
+    // array default-initialized -- Tensor is trivially default constructible, so those
+    // pages cost nothing until a Graph writes the tensors it actually has.
+    // NOLINTNEXTLINE(modernize-use-equals-default)
+    GraphBoundary() {}
+
+    // Each tensor carries a recording-space address and an owner of
+    // TaskId::Space::PARAM naming its own index; graph_begin writes both over the caller's
+    // after copying the geometry, which is what makes a recording a closed address space.
+    // Every other field is the caller's, so a later same-key submission compares against
+    // these directly -- size, origin, geometry and flags are all still what the argument
+    // had, and the alias partition is computed within each set rather than across them.
+    std::array<simpler::hbg::Tensor, GRAPH_MAX_TENSOR_ARGS> tensors;
+    // A dynamic parameter here names itself, a static one names nothing -- so this list is
+    // the basis recording resolves against: scalar(i) folds to &params.scalars_[i] either
+    // way, and graph_classify_scalars turns that into the index i. A parameter that named
+    // the caller's variable instead would hand out an address outside this array, the task
+    // slot following it would be recorded as static, and it would silently stop being
+    // refreshed on replay.
+    GraphTaskArgs params;
+
+    // What a later invocation of this key is checked against, one entry per parameter.
+    // The match path walks the whole of this on every same-key submission, so it carries
+    // the compared fields directly and is sized to the boundary, not to the cap.
+    std::vector<GraphBoundaryParamMatch> param_match;
+    // Bytes the parameters occupy in the recording's space. A sub-task's outputs are
+    // bumped from GRAPH_RECORD_BASE + this, so the two regions of one simulated heap do
+    // not overlap.
+    uint64_t param_used_heap_size{0};
 };
 
-// The Graph boundary as the submitting thread captured it, deep-copied because the
-// caller only lends its arguments for the duration of the submit call. It anchors
-// boundary scalar sources while the main thread submits outer shells from later
-// invocation arguments, and later same-key submissions compare against it under
-// recording_mutex — so it belongs to the in-flight entry, not to the recorder's
-// storage, which the submitting thread must never touch.
-struct GraphBoundary {
-    const GraphTaskArgs *args{nullptr};
-    int32_t scalar_count{0};
-    std::vector<simpler::hbg::Tensor> tensors;
-    std::vector<TensorArgType> types;
-};
+// Settle the alias partition of a boundary's parameters: which of them share a buffer.
+// Fills `rep_out[i]` with the lowest-numbered parameter sharing parameter i's buffer --
+// itself when no earlier one does -- which names the partition uniquely, so two boundaries
+// form the same partition exactly when their rep arrays are equal.
+//
+// Grouping is by buffer address alone, so the answer needs no ordering: each parameter's
+// representative is the first parameter that reached its address, and argument order is
+// the scan order, so "first to arrive" is "lowest-numbered" for free. There are two
+// implementations of that one contract below -- a hash and a sort -- and they agree on
+// `rep_out` for every boundary either accepts.
+//
+// That two parameters over *different* addresses name non-overlapping memory is a
+// precondition here, not something either checks. Every buffer a boundary can name comes
+// from the one allocator, which hands out disjoint blocks. Proving it instead would need
+// the addresses in order, and a sort cannot be narrowed to the pairs at risk because any
+// pair may be the overlapping one.
+//
+// Two refusals remain, and both are answerable from one address's own group:
+//   - an empty buffer, which holds no tensor and whose zero-width window would share an
+//     address with the parameter after it;
+//   - one address carrying two sizes, which contradicts what a parameter's recording-space
+//     window is: graph_boundary_relocate_params reserves one window per address and sizes
+//     it from the representative, so the group has to agree on how wide that is.
+//
+// Any edit to one of the two must land in the other: a boundary they disagree about would
+// be accepted or refused depending on how much probing it happened to cost.
+bool graph_alias_partition_sorted(const GraphTaskArgs &args, uint16_t *rep_out) {
+    const int32_t count = args.tensor_count();
+    std::array<int32_t, GRAPH_MAX_TENSOR_ARGS> order{};
+    for (int32_t i = 0; i < count; ++i) {
+        order[i] = i;
+    }
+    // Address, then argument index to make the order total -- so equal addresses come out
+    // in argument order and a run's first entry is its representative.
+    std::sort(order.begin(), order.begin() + count, [&args](int32_t lhs, int32_t rhs) {
+        const uint64_t a = args.tensor(lhs).ref().buffer.addr;
+        const uint64_t b = args.tensor(rhs).ref().buffer.addr;
+        if (a != b) return a < b;
+        return lhs < rhs;
+    });
+
+    for (int32_t k = 0; k < count;) {
+        const int32_t rep = order[k];
+        const uint64_t addr = args.tensor(rep).ref().buffer.addr;
+        const uint64_t size = args.tensor(rep).ref().buffer.size;
+        if (size == 0) return false;
+        for (; k < count; ++k) {
+            const int32_t member = order[k];
+            if (args.tensor(member).ref().buffer.addr != addr) break;
+            if (args.tensor(member).ref().buffer.size != size) return false;
+            rep_out[member] = static_cast<uint16_t>(rep);
+        }
+    }
+    return true;
+}
+
+bool graph_alias_partition(const GraphTaskArgs &args, uint16_t *rep_out) {
+    // A slot holds a parameter index, not a key, so the table is one byte per slot and
+    // clearing it is a single small memset. The keys stay in the parameters themselves: a
+    // probe re-reads one, and that read costs nothing the pass did not already pay, since
+    // the compare lands on the same simpler::hbg::Tensor cache line as the buffer.size
+    // test above. At half load a parameter takes barely more than one probe.
+    static_assert(GRAPH_MAX_TENSOR_ARGS < 0xFF, "a parameter index must fit the slot byte");
+    constexpr uint32_t SLOT_BITS = 8;
+    constexpr size_t SLOT_COUNT = size_t{1} << SLOT_BITS;
+    static_assert(
+        SLOT_COUNT >= 2 * size_t{GRAPH_MAX_TENSOR_ARGS}, "the table must stay under half full at the boundary cap"
+    );
+    constexpr uint8_t SLOT_EMPTY = 0xFF;
+    // Probes this may spend before conceding to the sort, per parameter. Linear probing is
+    // quadratic once the addresses cluster onto one slot, and the table's half-load bound
+    // caps the average probe count but not that tail; conceding is what keeps an
+    // O(n log n) ceiling under the routine as a whole.
+    //
+    // Half load costs about 1.5 probes per parameter, so four leaves room for ordinary
+    // clustering while staying far below what a degenerate boundary spends. A concession
+    // costs one sort, which bounds what an over-tight budget can cost.
+    constexpr int32_t MAX_PROBES_PER_PARAM = 4;
+
+    const int32_t count = args.tensor_count();
+    std::array<uint8_t, SLOT_COUNT> slots;
+    memset(slots.data(), SLOT_EMPTY, slots.size());
+    int32_t probes_left = count * MAX_PROBES_PER_PARAM;
+
+    for (int32_t i = 0; i < count; ++i) {
+        const PTOBufferHandle &buffer = args.tensor(i).ref().buffer;
+        if (buffer.size == 0) return false;
+        size_t slot = addr_to_slot(buffer.addr, SLOT_BITS);
+        while (true) {
+            // The sort rewrites every entry of rep_out, so the entries this pass already
+            // settled are replaced rather than mixed with.
+            if (--probes_left < 0) return graph_alias_partition_sorted(args, rep_out);
+            const uint8_t occupant = slots[slot];
+            if (occupant == SLOT_EMPTY) {
+                slots[slot] = static_cast<uint8_t>(i);
+                rep_out[i] = static_cast<uint16_t>(i);
+                break;
+            }
+            const PTOBufferHandle &held = args.tensor(occupant).ref().buffer;
+            if (held.addr == buffer.addr) {
+                if (held.size != buffer.size) return false;
+                rep_out[i] = static_cast<uint16_t>(occupant);
+                break;
+            }
+            slot = (slot + 1) & (SLOT_COUNT - 1);
+        }
+    }
+    return true;
+}
+
+// Move a captured boundary's parameters into the recording's own address space: each
+// tensor takes a recording-space address and an owner naming its own parameter index.
+// Returns false when the boundary is not one this runtime can represent. No tensor is
+// rewritten on that path, so the boundary still holds the caller's own addresses and owners.
+//
+// This is what closes the recording: after it, no address or provenance the caller owns is
+// reachable from the body, so a Definition recorded from it is a faithful relocatable
+// image. The caller's real addresses reach the device through the outer shell's own
+// arguments instead.
+//
+// Parameters over one buffer land on one address, and parameters over different buffers
+// on different ones. The shadow tensor map infers WAR/WAW edges by buffer address equality,
+// so splitting one buffer across two addresses drops the edges between its views and
+// replays a DAG the body never had, while merging two buffers onto one invents edges it
+// never had. The partition graph_alias_partition settles is what makes both impossible.
+//
+// Runs on the submitting thread, before the entry is published, which is what keeps
+// GraphBoundary written once and read-only thereafter.
+bool graph_boundary_relocate_params(GraphBoundary &boundary) {
+    boundary.param_used_heap_size = 0;
+    const int32_t tensor_count = boundary.params.tensor_count();
+    if (tensor_count <= 0) return true;
+
+    // Built before the rewrite below, so it holds the caller's own geometry: this is what
+    // a later invocation's arguments are compared against, and the rewrite only replaces
+    // the buffer address and the owner, neither of which is compared.
+    boundary.param_match.resize(static_cast<size_t>(tensor_count));
+    for (int32_t i = 0; i < tensor_count; ++i) {
+        boundary.param_match[i] = graph_boundary_param_match_of(boundary.tensors[i], boundary.params.tag(i));
+    }
+
+    std::array<uint16_t, GRAPH_MAX_TENSOR_ARGS> alias_rep{};
+    if (!graph_alias_partition(boundary.params, alias_rep.data())) return false;
+
+    // A parameter takes as much of the recording space as its argument takes of the real
+    // heap, so the space stays a mirror of the heap a replay will need. Only a
+    // representative claims room; the rest of its partition joins it at the same address.
+    std::array<uint64_t, GRAPH_MAX_TENSOR_ARGS> base_of_rep{};
+    uint64_t cursor = 0;
+    for (int32_t i = 0; i < tensor_count; ++i) {
+        simpler::hbg::Tensor &owned = boundary.tensors[i];
+        const int32_t rep = alias_rep[i];
+        boundary.param_match[i].alias_rep = alias_rep[i];
+        if (rep == i) {
+            base_of_rep[rep] = GRAPH_RECORD_BASE + cursor;
+            cursor += CHIP_ALIGN_UP(owned.buffer.size, PACKED_OUTPUT_ALIGN);
+        }
+        owned.buffer.addr = base_of_rep[rep];
+        owned.owner_task_id = TaskId::make_param(i);
+    }
+    boundary.param_used_heap_size = cursor;
+    return true;
+}
 
 // Storage for one recorded body, owned by the recorder thread and reset per
 // recording rather than allocated per recording — see recorder_recording().
@@ -384,12 +587,12 @@ struct GraphRecording {
     // boundary matching while this thread records.
     const GraphBoundary *boundary{nullptr};
     bool unsupported{false};
-    std::vector<RecordedInGraphTask> tasks;
+    std::vector<RecordedSubTask> tasks;
     // How many of `tasks` this recording has filled. The array itself is never cleared
-    // and graph_recording_reserve_storage sizes it to the in-graph task cap, so a body is
+    // and graph_recording_reserve_storage sizes it to the sub-task cap, so a body is
     // recorded into slots that already exist: a recorded task makes no allocation at all.
     // An over-cap body is marked unsupported but keeps recording so it can finish, so this
-    // is not bounded by MAX_IN_GRAPH_TASKS while it runs -- what bounds it is the storage
+    // is not bounded by SUB_TASK_MAX_NUM while it runs -- what bounds it is the storage
     // each further task claims, which exhausts memory long before the counter's range.
     int32_t task_count{0};
     // Every recorded task's tensor arguments, packed end to end in one region this
@@ -403,22 +606,18 @@ struct GraphRecording {
     // value-initialized before it is filled.
     std::unique_ptr<simpler::hbg::Tensor[]> task_tensor_pool;
     int32_t task_tensor_cursor{0};
-    // Flat per-task arrays, indexed by the ranges on RecordedInGraphTask. Held here rather
+    // Flat per-task arrays, indexed by the ranges on RecordedSubTask. Held here rather
     // than on each recorded task so recording a graph pays no allocation per task per array,
-    // and reserved to the in-graph task cap by graph_recording_reserve_storage so it pays no
+    // and reserved to the sub-task cap by graph_recording_reserve_storage so it pays no
     // growth either.
-    std::vector<GraphRecordedTensorSourceRef> tensor_sources;
     std::vector<uint64_t> scalars;
-    std::vector<GraphRecordedScalarSourceRef> scalar_sources;
+    // The wire form directly: recording resolves an inherited slot into a boundary
+    // parameter index as it classifies, so there is no host-side kind left to translate.
+    std::vector<GraphScalarInheritance> scalar_inheritance;
     std::vector<int32_t> internal_fanins;
-    // Indexed by RecordedInGraphTask::predicate_index; only predicated tasks
+    // Indexed by RecordedSubTask::predicate_index; only predicated tasks
     // contribute an entry.
     std::vector<GraphRecordedPredicate> predicates;
-    // The boundary tensors ordered by the buffer address both boundary kinds require,
-    // built once when the boundary is bound. Ties keep the boundary's own order, which
-    // is what lets a walk over one address's entries pick the same tensor the boundary
-    // order would have.
-    std::vector<GraphBoundaryByAddress> boundary_by_address;
     // Hazard state for the recorded body, owned per recorder thread because
     // several graphs record at once, each on its own thread.
     //
@@ -431,7 +630,7 @@ struct GraphRecording {
     // i.e. who ALLOCATED the buffer, never who wrote it last. A body that
     // allocates once with alloc_tensors and then writes in place with add_inout
     // (the shape every generated orchestration uses) would therefore record an
-    // in-graph task with no edge to its actual producer, and the Definition would replay
+    // sub-task with no edge to its actual producer, and the Definition would replay
     // a DAG the same body never had when submitted task by task.
     ChipTensorMap tensor_map{};
     // Set once both the hazard map and the tensor pool are up, and only then: the two
@@ -447,14 +646,18 @@ struct GraphRecording {
 
     bool in_manual_scope() const { return scope_stack_top >= manual_begin_depth; }
 
-    simpler::hbg::Tensor *task_tensors(const RecordedInGraphTask &task) const {
+    simpler::hbg::Tensor *task_tensors(const RecordedSubTask &task) const {
         return task_tensor_pool.get() + task.tensor_offset;
     }
 
-    const GraphTaskArgs *boundary_args() const { return boundary == nullptr ? nullptr : boundary->args; }
-    int32_t boundary_scalar_count() const { return boundary == nullptr ? 0 : boundary->scalar_count; }
-    const std::vector<simpler::hbg::Tensor> &boundary_tensors() const { return boundary->tensors; }
-    const std::vector<TensorArgType> &boundary_types() const { return boundary->types; }
+    // The entry's boundary this recording is bound to. graph_prepare binds it and
+    // graph_end/graph_abort clears it, so every read below sits between those two points:
+    // a body only runs once graph_prepare has succeeded, and graph_layout_definition runs
+    // before the unbind.
+    const GraphBoundary &bound_boundary() const {
+        debug_assert(boundary != nullptr && "a recording reads its boundary only while bound");
+        return *boundary;
+    }
 };
 
 struct GraphPendingUpload {
@@ -494,6 +697,15 @@ struct GraphDefinitionRecord {
     size_t object_offset{GRAPH_NO_OBJECT_OFFSET};
     size_t bytes{0};
     std::vector<std::byte> spill;
+    // The boundary this Definition was recorded against, reduced to what a later
+    // invocation is checked against. Never reaches the device: materialize takes the
+    // boundary from the outer task's own payload, which carries that invocation's
+    // arguments.
+    //
+    // One entry per parameter, sized to the boundary rather than to the cap. The match
+    // path walks the whole of this on every same-key submission, so its size is a
+    // per-submission cost: a boundary of N parameters is N contiguous cache lines.
+    std::vector<GraphBoundaryParamMatch> boundary_match;
 };
 
 struct GraphHostState {
@@ -579,87 +791,64 @@ uint64_t graph_full_key(uint64_t callable_hash, uint64_t graph_key) {
     return graph_hash_bytes(h, &graph_key, sizeof(graph_key));
 }
 
-bool graph_tensor_exact(const simpler::hbg::Tensor &lhs, const simpler::hbg::Tensor &rhs) {
-    if (lhs.ndims > MAX_TENSOR_DIMS || rhs.ndims > MAX_TENSOR_DIMS || lhs.buffer.addr != rhs.buffer.addr ||
-        lhs.buffer.size != rhs.buffer.size || lhs.start_offset != rhs.start_offset || lhs.version != rhs.version ||
-        lhs.ndims != rhs.ndims || lhs.dtype != rhs.dtype || lhs.manual_dep != rhs.manual_dep ||
-        lhs.is_contiguous != rhs.is_contiguous || lhs.address_space != rhs.address_space) {
-        return false;
-    }
-    return std::equal(std::begin(lhs.shapes), std::begin(lhs.shapes) + lhs.ndims, std::begin(rhs.shapes)) &&
-           std::equal(std::begin(lhs.strides), std::begin(lhs.strides) + lhs.ndims, std::begin(rhs.strides));
-}
-
+// Whether a tensor the body derived from boundary parameter `param_index` is one this
+// parameter can stand for.
+//
+// Against that one parameter and no other: the owner says which parameter this came from,
+// and a view op copies `buffer` wholesale while changing only `start_offset`, so anything
+// legitimately derived from a parameter still carries that parameter's buffer. Comparing
+// the buffer is therefore the bounds check -- an address that moved cannot have come from
+// a view, and replay resolves the buffer through this parameter alone.
+//
+// The origin needs no comparison: it travels absolutely, and the argument's own origin is
+// part of the reuse condition, so a call that shifted it does not
+// reach a replay at all.
 bool graph_tensor_from_boundary(
-    const GraphRecording &recording, const simpler::hbg::Tensor &tensor, GraphRecordedTensorSourceRef *source
+    const GraphRecording &recording, const simpler::hbg::Tensor &tensor, int32_t param_index
 ) {
-    // Both kinds require the boundary tensor's whole buffer, so the search is over the
-    // entries sharing this tensor's buffer address and nothing else. Within them an exact
-    // match wins wherever it sits, so it returns on sight; a view match cannot, because an
-    // exact one may still lie ahead of it, so the earliest view is carried to the end of
-    // the run and used only if none was found. Entries of one address are in boundary
-    // order, so "earliest" is the same tensor a walk over the whole boundary would pick.
-    const size_t boundary_count = recording.boundary_tensors().size();
-    size_t view_index = boundary_count;
-    uint64_t view_offset = 0;
-    const auto &by_address = recording.boundary_by_address;
-    auto entry = std::lower_bound(
-        by_address.begin(), by_address.end(), tensor.buffer.addr, [](const GraphBoundaryByAddress &lhs, uint64_t addr) {
-            return lhs.addr < addr;
-        }
-    );
-    for (; entry != by_address.end() && entry->addr == tensor.buffer.addr; ++entry) {
-        const size_t i = entry->index;
-        const simpler::hbg::Tensor &boundary = recording.boundary_tensors()[i];
-        if (tensor.buffer.size != boundary.buffer.size) continue;
-        if (graph_tensor_exact(tensor, boundary)) {
-            source->source_kind = GraphRecordedTensorSourceKind::BOUNDARY_EXACT;
-            source->source_index = i;
-            source->packed_offset = 0;
-            return true;
-        }
-        if (view_index == boundary_count && tensor.start_offset >= boundary.start_offset) {
-            view_index = i;
-            view_offset = tensor.start_offset - boundary.start_offset;
-        }
-    }
-    if (view_index == boundary_count) return false;
-    source->source_kind = GraphRecordedTensorSourceKind::BOUNDARY_VIEW;
-    source->source_index = view_index;
-    source->packed_offset = view_offset;
-    return true;
+    const GraphTaskArgs &params = recording.bound_boundary().params;
+    if (param_index < 0 || param_index >= params.tensor_count()) return false;
+    const simpler::hbg::Tensor &param_tensor = params.tensor(param_index).ref();
+    return tensor.buffer.addr == param_tensor.buffer.addr && tensor.buffer.size == param_tensor.buffer.size;
 }
 
+// Turn one task's scalar slots into wire source refs. A slot is BOUNDARY exactly when it
+// inherits a parameter of THIS recording's boundary, which the subtraction below both
+// converts to an index and proves; everything else is static Definition data.
+//
+// Recording is where this must happen: an origin is only valid while the body runs, and
+// the Definition it feeds has to be position-independent.
 template <typename ArgT>
-GraphRecordedScalarSourceRef
-graph_classify_scalar(const GraphRecording &recording, const ArgT &args, int32_t scalar_index) {
-    if (recording.boundary_args() == nullptr) return {};
-    // Identity, not type: an in-graph task's Arg and the boundary Arg have
-    // different capacities, so compare the addresses through void.
-    if (static_cast<const void *>(&args) == static_cast<const void *>(recording.boundary_args()) &&
-        scalar_index < recording.boundary_args()->scalar_count()) {
-        return GraphRecordedScalarSourceRef{GraphRecordedScalarSourceKind::BOUNDARY, static_cast<size_t>(scalar_index)};
-    }
-
-    const void *source = args.scalar_source(scalar_index);
-    const void *invalidated_source = args.invalidated_scalar_source(scalar_index);
-    if (source == nullptr && invalidated_source == nullptr) return {};
-    for (int32_t i = 0; i < recording.boundary_args()->scalar_count(); ++i) {
-        const void *boundary_source = static_cast<const void *>(&recording.boundary_args()->scalar(i));
-        if (source == boundary_source) {
-            return GraphRecordedScalarSourceRef{GraphRecordedScalarSourceKind::BOUNDARY, static_cast<size_t>(i)};
+void graph_classify_scalars(GraphRecording &recording, const ArgT &args, int32_t scalar_offset) {
+    const GraphTaskArgs &params = recording.bound_boundary().params;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(params.scalar_slot_base());
+    const uintptr_t span = static_cast<uintptr_t>(params.scalar_count()) * sizeof(uint64_t);
+    for (int32_t i = 0; i < args.scalar_count(); ++i) {
+        GraphScalarInheritance &ref = recording.scalar_inheritance[scalar_offset + i];
+        if (!args.scalar_dynamic(i)) {
+            ref = GraphScalarInheritance::self_value();
+            continue;
         }
-        if (invalidated_source == boundary_source) {
-            return GraphRecordedScalarSourceRef{
-                GraphRecordedScalarSourceKind::INVALIDATED_BOUNDARY, static_cast<size_t>(i)
-            };
+        // Integer arithmetic, not pointer comparison: relational operators on pointers are
+        // only defined within one array object, and an origin outside this boundary's slot
+        // array is admitted here. The origin is never dereferenced -- it may already point
+        // at a caller local that has gone out of scope.
+        const uintptr_t origin = reinterpret_cast<uintptr_t>(args.scalar_origin(i));
+        if (origin < base || origin - base >= span || (origin - base) % sizeof(uint64_t) != 0) {
+            // A parameter whose origin is not one of this boundary's own is static
+            // Definition data: the Definition's inheritance entries index this boundary
+            // alone, so no other slot can be refreshed on replay, and the value the handle
+            // already carried into this slot is what the image should hold.
+            // GRAPH_EXECUTION.md states this as part of the boundary-scalar contract.
+            ref = GraphScalarInheritance::self_value();
+            continue;
         }
+        ref = GraphScalarInheritance::from_boundary(static_cast<uint16_t>((origin - base) / sizeof(uint64_t)));
     }
-    return {};
 }
 
 // Entry capacity for one recorded body's hazard map. A Definition is capped at
-// MAX_IN_GRAPH_TASKS tasks and each recorded task registers at most its INOUT/OUTPUT_EXISTING
+// SUB_TASK_MAX_NUM tasks and each recorded task registers at most its INOUT/OUTPUT_EXISTING
 // args, so this bounds the worst realistic body while staying a small fraction of
 // the ordinary path's whole-orchestration pool (CHIP_TENSORMAP_POOL_SIZE). Exhausting
 // it marks the recording unsupported, which graph_commit reports as
@@ -667,18 +856,18 @@ graph_classify_scalar(const GraphRecording &recording, const ArgT &args, int32_t
 // is no ordinary-path fallback left to take.
 constexpr int32_t GRAPH_RECORD_TENSORMAP_POOL_SIZE = 16384;
 
-// Elements in the recording's tensor pool: every in-graph task a body can hold, times
+// Elements in the recording's tensor pool: every sub-task a body can hold, times
 // every tensor argument one such task can carry. An in-cap body therefore always fits, and
-// the bump cursor is checked anyway because a body that overshoots MAX_IN_GRAPH_TASKS keeps
+// the bump cursor is checked anyway because a body that overshoots SUB_TASK_MAX_NUM keeps
 // recording so it can finish.
 constexpr size_t GRAPH_RECORD_TENSOR_POOL_ELEMS =
-    static_cast<size_t>(MAX_IN_GRAPH_TASKS) * static_cast<size_t>(CORE_MAX_TENSOR_ARGS);
+    static_cast<size_t>(SUB_TASK_MAX_NUM) * static_cast<size_t>(CORE_MAX_TENSOR_ARGS);
 
-// The graph_local_id a recorded task's IN_GRAPH id carries. A recorded task belongs
+// The graph_local_id a recorded task's SUB_TASK id carries. A recorded task belongs
 // to no Graph task yet -- every shell replaying the Definition re-mints the id with
 // its own local id at materialize -- so record time names a task by its index alone,
 // and the id's low field is that index and nothing else. That is what keeps the
-// index inside the MAX_IN_GRAPH_TASKS task chains the recording's hazard map is
+// index inside the SUB_TASK_MAX_NUM task chains the recording's hazard map is
 // dimensioned for.
 constexpr int32_t GRAPH_RECORD_NO_OWNING_GRAPH = 0;
 
@@ -686,7 +875,7 @@ constexpr int32_t GRAPH_RECORD_NO_OWNING_GRAPH = 0;
 // reported to the caller, which abandons the recording rather than producing a
 // Definition with inferred edges missing.
 bool graph_recording_init_tensor_map(GraphRecording &recording) {
-    return recording.tensor_map.init(CHIP_TENSORMAP_NUM_BUCKETS, GRAPH_RECORD_TENSORMAP_POOL_SIZE, MAX_IN_GRAPH_TASKS);
+    return recording.tensor_map.init(CHIP_TENSORMAP_NUM_BUCKETS, GRAPH_RECORD_TENSORMAP_POOL_SIZE, SUB_TASK_MAX_NUM);
 }
 
 // The recorder thread's own storage for the body it is recording, and the reason none
@@ -733,15 +922,15 @@ void unbind_recorder_boundary() {
 // 1336 of the 1679 `tasks` slots that body needed. Standing everything up at the cap makes a
 // thread's storage independent of the order it saw bodies in.
 //
-// Each bound is a per-task cap times the in-graph task cap, so these are the recorded
-// body's own limits rather than a worst case invented here: the tensor pool and
-// tensor_sources are one entry per tensor argument (CORE_MAX_TENSOR_ARGS), the two scalar
+// Each bound is a per-task cap times the sub-task cap, so these are the recorded
+// body's own limits rather than a worst case invented here: the tensor pool is one entry
+// per tensor argument (CORE_MAX_TENSOR_ARGS), the two scalar
 // arrays one per scalar argument (CORE_MAX_SCALAR_ARGS), and predicates at
 // most one per task.
 //
 // internal_fanins is the one array left growing, and the reason is the size it grows to
-// rather than the bound it could reach. It has no per-in-graph-task cap: CHIP_MAX_FANIN
-// bounds a global task's inline fanin, but an in-graph task's producers travel in the
+// rather than the bound it could reach. It has no per-sub-task cap: CHIP_MAX_FANIN
+// bounds a global task's inline fanin, but a sub-task's producers travel in the
 // Definition's own CSR, which the scheduler reads directly, so the only limits are uint16
 // producer indices and each producer being an earlier task of the same body — a structural
 // 1024 x 1023 / 2 edges, 4.2 MB.
@@ -760,14 +949,13 @@ void unbind_recorder_boundary() {
 // Returns false when the pool cannot be allocated, which the caller treats like a hazard
 // map it could not stand up.
 bool graph_recording_reserve_storage(GraphRecording &recording) {
-    constexpr size_t kInGraphTaskCap = static_cast<size_t>(MAX_IN_GRAPH_TASKS);
+    constexpr size_t kSubTaskCap = static_cast<size_t>(SUB_TASK_MAX_NUM);
     recording.task_tensor_pool.reset(new (std::nothrow) simpler::hbg::Tensor[GRAPH_RECORD_TENSOR_POOL_ELEMS]);
     if (recording.task_tensor_pool == nullptr) return false;
-    recording.tasks.resize(kInGraphTaskCap);
-    recording.tensor_sources.reserve(kInGraphTaskCap * static_cast<size_t>(CORE_MAX_TENSOR_ARGS));
-    recording.scalars.reserve(kInGraphTaskCap * static_cast<size_t>(CORE_MAX_SCALAR_ARGS));
-    recording.scalar_sources.reserve(kInGraphTaskCap * static_cast<size_t>(CORE_MAX_SCALAR_ARGS));
-    recording.predicates.reserve(kInGraphTaskCap);
+    recording.tasks.resize(kSubTaskCap);
+    recording.scalars.reserve(kSubTaskCap * static_cast<size_t>(CORE_MAX_SCALAR_ARGS));
+    recording.scalar_inheritance.reserve(kSubTaskCap * static_cast<size_t>(CORE_MAX_SCALAR_ARGS));
+    recording.predicates.reserve(kSubTaskCap);
     return true;
 }
 
@@ -801,12 +989,12 @@ bool graph_recording_stand_up(GraphRecording &recording) {
 // Bind this thread's storage to one in-flight entry and empty it. Returns false when the
 // hazard map or the tensor pool cannot be stood up.
 bool graph_recording_reset(GraphRecording &recording, const GraphInflightRecording &entry) {
-    // A body over MAX_IN_GRAPH_TASKS is abandoned, but it still grew every array to its real
+    // A body over SUB_TASK_MAX_NUM is abandoned, but it still grew every array to its real
     // size while it ran. Handing that to the next recording would retain storage for a
     // Definition that can never be published, unbounded, for the process's life -- so an
     // over-cap recording gives its storage back instead of passing it on. This is what
     // makes the bound documented on GraphRecording::task_count true rather than nominal.
-    if (recording.tasks.size() > static_cast<size_t>(MAX_IN_GRAPH_TASKS)) {
+    if (recording.tasks.size() > static_cast<size_t>(SUB_TASK_MAX_NUM)) {
         recording = GraphRecording{};
     }
     if (!graph_recording_stand_up(recording)) {
@@ -824,145 +1012,97 @@ bool graph_recording_reset(GraphRecording &recording, const GraphInflightRecordi
     // tasks is deliberately not cleared: see GraphRecording::task_count.
     recording.task_count = 0;
     recording.task_tensor_cursor = 0;
-    recording.tensor_sources.clear();
     recording.scalars.clear();
-    recording.scalar_sources.clear();
+    recording.scalar_inheritance.clear();
     recording.internal_fanins.clear();
     recording.predicates.clear();
-    // Built once here rather than per lookup: a body classifies every tensor argument of
-    // every task against this boundary, so one ordering serves them all. stable_sort keeps
-    // equal addresses in boundary order, which is what makes the walk in
-    // graph_tensor_from_boundary pick the same tensor the boundary order would.
-    recording.boundary_by_address.clear();
-    recording.boundary_by_address.reserve(recording.boundary_tensors().size());
-    for (size_t i = 0; i < recording.boundary_tensors().size(); ++i) {
-        recording.boundary_by_address.push_back(
-            {recording.boundary_tensors()[i].buffer.addr, static_cast<uint32_t>(i)}
-        );
-    }
-    std::stable_sort(
-        recording.boundary_by_address.begin(), recording.boundary_by_address.end(),
-        [](const GraphBoundaryByAddress &lhs, const GraphBoundaryByAddress &rhs) {
-            return lhs.addr < rhs.addr;
-        }
-    );
     return true;
 }
 
-bool graph_classify_tensor(
-    const GraphRecording &recording, const RecordedInGraphTask &current, int32_t task_index,
-    const simpler::hbg::Tensor &tensor, GraphRecordedTensorSourceRef *source
-) {
+// Whether a tensor the body used is one this recording can represent, and against the
+// thing it actually came from: the parameter its owner names, or the producing task's own
+// output block. Both containment tests live here rather than at replay -- the recorder has
+// those objects in front of it, and the device is then handed a tensor it can rebase
+// without looking anything up.
+bool graph_classify_tensor(const GraphRecording &recording, int32_t task_index, const simpler::hbg::Tensor &tensor) {
     const uintptr_t tensor_addr = static_cast<uintptr_t>(tensor.buffer.addr);
-    // The address alone decides which half of the classification can match, because the
-    // three windows are disjoint: recording is the only thing that hands out an address
-    // at or above GRAPH_RECORD_VIRTUAL_BASE, and a boundary tensor always names a
-    // graph-heap or device address below it.
-    if (!is_graph_record_address(tensor_addr)) {
-        return graph_tensor_from_boundary(recording, tensor, source);
-    }
-    // Whether `addr` lies in the output window task `index` was given. Written as a
-    // subtraction on unsigned values so a window ending past the address space cannot
-    // wrap the bound.
-    auto window_offset = [&recording](int32_t index, uintptr_t addr, uint64_t *offset_out) {
-        const RecordedInGraphTask &producer = recording.tasks[static_cast<size_t>(index)];
-        if (producer.total_output_size == 0 || addr < producer.record_packed_base) return false;
-        const uint64_t offset = addr - producer.record_packed_base;
-        if (offset >= producer.total_output_size) return false;
-        *offset_out = offset;
-        return true;
-    };
-
-    // The task being recorded owns a window like any other, but it is a source of its own
-    // outputs rather than a dependency, so it is asked first and answers OWN_OUTPUT.
-    uint64_t offset = 0;
-    if (current.record_packed_base != 0 && current.total_output_size != 0) {
-        const uintptr_t begin = current.record_packed_base;
-        if (tensor_addr >= begin && tensor_addr - begin < current.total_output_size) {
-            source->source_kind = GraphRecordedTensorSourceKind::OWN_OUTPUT;
-            source->source_index = static_cast<size_t>(task_index);
-            source->packed_offset = tensor_addr - begin;
-            return true;
-        }
-    }
-
-    // owner_task_id names the task that created this tensor, so it reaches the producer
-    // without a search. It is a hint and not the answer: a Tensor built from a bare
-    // address carries no owner, and the classification a Definition replays has to follow
-    // the address. So the window is checked, and a hint that does not hold falls through
-    // to the scan below rather than deciding anything.
     const TaskId owner = tensor.owner_task_id;
-    if (owner.is_valid() && !owner.is_global()) {
-        const int32_t owner_index = owner.local_id();
-        if (owner_index >= 0 && owner_index < task_index && window_offset(owner_index, tensor_addr, &offset)) {
-            source->source_kind = GraphRecordedTensorSourceKind::INTERNAL;
-            source->source_index = static_cast<size_t>(owner_index);
-            source->packed_offset = offset;
-            return true;
-        }
+
+    // Provenance decides which classification applies, not the address. A recording's
+    // space starts just above zero, and a real device address is 48-bit, so the two
+    // overlap: an object that entered the body without passing through the boundary can
+    // hold an address inside the parameter region, and an address test would attribute it
+    // to a parameter and bake a Definition that rebinds it to someone else's buffer.
+    // owner_task_id is stamped by this recording -- PARAM on the boundary tensors, SUB_TASK
+    // on what the body produced -- and views propagate it, so it answers the question the
+    // address cannot.
+    if (!owner.is_valid() || owner.is_global()) {
+        LOG_WARN(
+            "[GraphExecution] sub-task %d uses a tensor (addr=0x%llx) that did not come through the Graph "
+            "boundary; pass it as a GraphTaskArgs parameter instead",
+            task_index, static_cast<unsigned long long>(tensor_addr)
+        );
+        return false;
+    }
+    if (owner.space() == TaskId::Space::PARAM) {
+        return graph_tensor_from_boundary(recording, tensor, owner.local_id());
     }
 
-    // The windows are disjoint, so at most one holds the address and the order of the
-    // walk does not change the answer.
-    for (int32_t i = 0; i < task_index; ++i) {
-        if (!window_offset(i, tensor_addr, &offset)) continue;
-        source->source_kind = GraphRecordedTensorSourceKind::INTERNAL;
-        source->source_index = static_cast<size_t>(i);
-        source->packed_offset = offset;
-        return true;
+    // A task of this body, which may be the consuming task itself reading back an output it
+    // is about to write -- its slot is already filled, so both resolve the same way. What
+    // neither may do is name a task that is not recorded yet.
+    const int32_t producer_index = owner.local_id();
+    if (producer_index < 0 || producer_index > task_index) {
+        LOG_WARN(
+            "[GraphExecution] sub-task %d uses a tensor (addr=0x%llx) owned by task %d, which it cannot depend "
+            "on: a Definition's edges run from tasks already recorded",
+            task_index, static_cast<unsigned long long>(tensor_addr), producer_index
+        );
+        return false;
     }
-    return false;
+    const RecordedSubTask &producer = recording.tasks[producer_index];
+    // Compared as a subtraction on unsigned values so a block ending past the address space
+    // cannot wrap the bound.
+    if (producer.total_output_size == 0 || tensor_addr < producer.record_packed_base ||
+        tensor_addr - producer.record_packed_base >= producer.total_output_size) {
+        LOG_WARN(
+            "[GraphExecution] sub-task %d uses a tensor (addr=0x%llx) addressed outside the output of task %d "
+            "that owns it; a Graph body may only use a boundary parameter, a view of one, or a task's output",
+            task_index, static_cast<unsigned long long>(tensor_addr), producer_index
+        );
+        return false;
+    }
+    return true;
 }
 
-GraphBoundarySignature
-graph_boundary_signature(const simpler::hbg::Tensor &tensor, TensorArgType type, uint16_t alias_rep) {
-    GraphBoundarySignature signature{};
-    signature.buffer_size = tensor.buffer.size;
-    std::copy(std::begin(tensor.shapes), std::end(tensor.shapes), std::begin(signature.shapes));
-    std::copy(std::begin(tensor.strides), std::end(tensor.strides), std::begin(signature.strides));
-    signature.alias_rep = alias_rep;
-    signature.ndims = static_cast<uint8_t>(tensor.ndims);
-    signature.dtype = static_cast<uint8_t>(tensor.dtype);
-    signature.tag = static_cast<uint8_t>(type);
-    signature.manual_dep = tensor.manual_dep ? 1 : 0;
-    signature.is_contiguous = tensor.is_contiguous ? 1 : 0;
-    return signature;
-}
-
-std::optional<GraphTensorSourceRef> graph_pack_tensor_source(const GraphRecordedTensorSourceRef &source) {
-    if (source.source_index > UINT16_MAX) return std::nullopt;
-
-    GraphTensorSourceRef packed{};
-    switch (source.source_kind) {
-    case GraphRecordedTensorSourceKind::BOUNDARY_EXACT:
-        packed.source_kind = static_cast<uint8_t>(GraphTensorSourceKind::BOUNDARY_EXACT);
-        break;
-    case GraphRecordedTensorSourceKind::BOUNDARY_VIEW:
-        packed.source_kind = static_cast<uint8_t>(GraphTensorSourceKind::BOUNDARY_VIEW);
-        break;
-    case GraphRecordedTensorSourceKind::INTERNAL:
-        packed.source_kind = static_cast<uint8_t>(GraphTensorSourceKind::INTERNAL);
-        break;
-    case GraphRecordedTensorSourceKind::OWN_OUTPUT:
-        packed.source_kind = static_cast<uint8_t>(GraphTensorSourceKind::OWN_OUTPUT);
-        break;
+// A recorded tensor as the relocation record graph_execution.h describes: the two fields
+// replay has a base for are relative here, and which base follows the owner.
+//
+// A parameter's buffer is replaced wholesale by this call's argument, so its recorded
+// address means nothing outside the recording that issued it and leaves as zero; its
+// origin becomes the view's offset inside that parameter, which replay adds the
+// argument's own origin to. A body tensor's buffer address becomes an offset into the
+// recording's output region -- an affine image of the heap a replay commits -- and its
+// origin is already its own.
+//
+// Between them the image holds no address from the recording's own space, and none from
+// the caller's either: it is readable knowing only the heap it will be bound to and the
+// arguments it will be bound against.
+void graph_tensor_relocation_record(
+    const GraphRecording &recording, const simpler::hbg::Tensor &tensor, simpler::hbg::TensorData *record
+) {
+    record->init_from(tensor);
+    const TaskId owner = tensor.owner_task_id;
+    if (owner.space() == TaskId::Space::PARAM) {
+        record->buffer.addr = 0;
+        // No view op lowers start_offset, so a tensor owned by parameter i has an origin at
+        // or after that parameter's own. The subtraction below is unsigned.
+        const uint64_t param_origin = recording.bound_boundary().params.tensor(owner.local_id()).ref().start_offset;
+        debug_assert(record->start_offset >= param_origin);
+        record->start_offset -= param_origin;
+    } else {
+        record->buffer.addr -= GRAPH_RECORD_BASE + recording.bound_boundary().param_used_heap_size;
     }
-    packed.source_index = static_cast<uint16_t>(source.source_index);
-    packed.packed_offset = source.packed_offset;
-    return packed;
-}
-
-std::optional<GraphScalarSourceRef> graph_pack_scalar_source(const GraphRecordedScalarSourceRef &source) {
-    if (source.source_kind == GraphRecordedScalarSourceKind::INVALIDATED_BOUNDARY || source.source_index > UINT16_MAX) {
-        return std::nullopt;
-    }
-
-    GraphScalarSourceRef packed{};
-    packed.source_kind = source.source_kind == GraphRecordedScalarSourceKind::BOUNDARY ?
-                             static_cast<uint8_t>(GraphScalarSourceKind::BOUNDARY) :
-                             static_cast<uint8_t>(GraphScalarSourceKind::STATIC_VALUE);
-    packed.source_index = static_cast<uint16_t>(source.source_index);
-    return packed;
 }
 
 template <typename T>
@@ -990,10 +1130,9 @@ T *graph_image_section(std::byte *image, uint32_t offset) {
 // exact size. required_heap comes from the fill, which is the pass that walks the
 // tasks in order.
 std::optional<GraphDefinition> graph_layout_definition(const GraphRecording &recording) {
-    if (recording.unsupported || recording.task_count == 0 || recording.task_count > MAX_IN_GRAPH_TASKS ||
-        recording.boundary_tensors().empty() || recording.boundary_tensors().size() > UINT16_MAX ||
-        recording.boundary_tensors().size() != recording.boundary_types().size() ||
-        recording.boundary_args() == nullptr) {
+    if (recording.unsupported || recording.task_count == 0 || recording.task_count > SUB_TASK_MAX_NUM ||
+        recording.bound_boundary().params.tensor_count() <= 0 ||
+        recording.bound_boundary().params.tensor_count() > UINT16_MAX) {
         return std::nullopt;
     }
 
@@ -1005,26 +1144,23 @@ std::optional<GraphDefinition> graph_layout_definition(const GraphRecording &rec
     // task_count, not tasks.size(): the array keeps the slots a longer body left behind,
     // and those are not part of this recording.
     // The flat arrays a recorded task indexes into. Each is grown only by the recorder,
-    // bounded by MAX_IN_GRAPH_TASKS times a per-task constant, so its length is an
+    // bounded by SUB_TASK_MAX_NUM times a per-task constant, so its length is an
     // int32 and every range test below stays in the offsets' own domain.
-    const int32_t recorded_tensor_sources = static_cast<int32_t>(recording.tensor_sources.size());
     const int32_t recorded_scalars = static_cast<int32_t>(recording.scalars.size());
-    const int32_t recorded_scalar_sources = static_cast<int32_t>(recording.scalar_sources.size());
+    const int32_t recorded_scalar_inheritance = static_cast<int32_t>(recording.scalar_inheritance.size());
     const int32_t recorded_fanins = static_cast<int32_t>(recording.internal_fanins.size());
     for (int32_t i = 0; i < recording.task_count; ++i) {
-        const RecordedInGraphTask &source = recording.tasks[i];
+        const RecordedSubTask &source = recording.tasks[i];
         // Negative first, so every count and offset below is a valid length by the time
         // it is compared and each remaining-span subtraction is non-negative. The
         // running-total tests bound each accumulator at the width its Definition field
         // carries rather than at the accumulator's own.
-        if (source.tensor_count < 0 || source.scalar_count < 0 || source.fanin_count < 0 ||
-            source.tensor_source_offset < 0 || source.scalar_offset < 0 || source.fanin_offset < 0 ||
-            source.tensor_count > INT32_MAX - total_tensors || source.scalar_count > INT32_MAX - total_scalars ||
-            source.fanin_count > INT32_MAX - total_fanins || source.tensor_source_offset > recorded_tensor_sources ||
-            source.tensor_count > recorded_tensor_sources - source.tensor_source_offset ||
+        if (source.tensor_count < 0 || source.scalar_count < 0 || source.fanin_count < 0 || source.scalar_offset < 0 ||
+            source.fanin_offset < 0 || source.tensor_count > INT32_MAX - total_tensors ||
+            source.scalar_count > INT32_MAX - total_scalars || source.fanin_count > INT32_MAX - total_fanins ||
             source.scalar_offset > recorded_scalars || source.scalar_count > recorded_scalars - source.scalar_offset ||
-            source.scalar_offset > recorded_scalar_sources ||
-            source.scalar_count > recorded_scalar_sources - source.scalar_offset ||
+            source.scalar_offset > recorded_scalar_inheritance ||
+            source.scalar_count > recorded_scalar_inheritance - source.scalar_offset ||
             source.fanin_offset > recorded_fanins || source.fanin_count > recorded_fanins - source.fanin_offset) {
             return std::nullopt;
         }
@@ -1041,8 +1177,8 @@ std::optional<GraphDefinition> graph_layout_definition(const GraphRecording &rec
     definition.task_count = recording.task_count;
     definition.edge_count = total_fanins;
     definition.root_count = root_count;
-    definition.boundary_count = static_cast<int32_t>(recording.boundary_tensors().size());
-    definition.boundary_scalar_count = recording.boundary_scalar_count();
+    definition.boundary_tensor_count = recording.bound_boundary().params.tensor_count();
+    definition.boundary_scalar_count = recording.bound_boundary().params.scalar_count();
     definition.tensor_arg_count = total_tensors;
     definition.scalar_arg_count = total_scalars;
     definition.predicate_count = predicate_count;
@@ -1061,16 +1197,12 @@ std::optional<GraphDefinition> graph_layout_definition(const GraphRecording &rec
         !graph_layout_section<int32_t>(recording.task_count + 1, &image_bytes, &definition.off_fanin_offsets) ||
         !graph_layout_section<uint16_t>(total_fanins, &image_bytes, &definition.off_fanin_indices) ||
         !graph_layout_section<uint16_t>(root_count, &image_bytes, &definition.off_root_indices) ||
-        !graph_layout_section<uint64_t>(recording.task_count, &image_bytes, &definition.off_in_graph_task_offsets) ||
-        !graph_layout_section<InGraphTaskDefinition>(
-            recording.task_count, &image_bytes, &definition.off_in_graph_tasks
-        ) ||
-        !graph_layout_section<GraphTensor>(total_tensors, &image_bytes, &definition.off_tensors) ||
-        !graph_layout_section<GraphTensorSourceRef>(total_tensors, &image_bytes, &definition.off_tensor_sources) ||
+        !graph_layout_section<uint64_t>(recording.task_count, &image_bytes, &definition.off_sub_task_offsets) ||
+        !graph_layout_section<SubTaskDefinition>(recording.task_count, &image_bytes, &definition.off_sub_tasks) ||
+        !graph_layout_section<simpler::hbg::TensorData>(total_tensors, &image_bytes, &definition.off_tensors) ||
         !graph_layout_section<uint64_t>(total_scalars, &image_bytes, &definition.off_scalars) ||
-        !graph_layout_section<GraphScalarSourceRef>(total_scalars, &image_bytes, &definition.off_scalar_sources) ||
-        !graph_layout_section<GraphBoundarySignature>(
-            recording.boundary_tensors().size(), &image_bytes, &definition.off_boundary_signatures
+        !graph_layout_section<GraphScalarInheritance>(
+            total_scalars, &image_bytes, &definition.off_scalar_inheritance
         ) ||
         !graph_layout_section<GraphPredicate>(predicate_count, &image_bytes, &definition.off_predicates)) {
         return std::nullopt;
@@ -1087,7 +1219,7 @@ std::optional<GraphDefinition> graph_layout_definition(const GraphRecording &rec
 // reach the device — with one exception, `fanout_offsets`, which is accumulated
 // rather than assigned and is therefore zeroed below before its first increment.
 // Two kinds of byte are written by nobody and read by nobody: the alignment slack
-// between sections, and `InGraphTaskDefinition`'s interior padding, which the
+// between sections, and `SubTaskDefinition`'s interior padding, which the
 // per-field assignment below cannot reach and a static_assert on that struct's
 // size pins against further growth.
 bool graph_fill_definition(const GraphRecording &recording, GraphDefinition definition, std::byte *image) {
@@ -1106,13 +1238,11 @@ bool graph_fill_definition(const GraphRecording &recording, GraphDefinition defi
     auto *fanin_offsets = graph_image_section<int32_t>(image, definition.off_fanin_offsets);
     auto *fanin_indices = graph_image_section<uint16_t>(image, definition.off_fanin_indices);
     auto *roots = graph_image_section<uint16_t>(image, definition.off_root_indices);
-    auto *in_graph_task_offsets = graph_image_section<uint64_t>(image, definition.off_in_graph_task_offsets);
-    auto *tasks = graph_image_section<InGraphTaskDefinition>(image, definition.off_in_graph_tasks);
-    auto *tensors = graph_image_section<GraphTensor>(image, definition.off_tensors);
-    auto *tensor_sources = graph_image_section<GraphTensorSourceRef>(image, definition.off_tensor_sources);
+    auto *sub_task_offsets = graph_image_section<uint64_t>(image, definition.off_sub_task_offsets);
+    auto *tasks = graph_image_section<SubTaskDefinition>(image, definition.off_sub_tasks);
+    auto *tensors = graph_image_section<simpler::hbg::TensorData>(image, definition.off_tensors);
     auto *scalars = graph_image_section<uint64_t>(image, definition.off_scalars);
-    auto *scalar_sources = graph_image_section<GraphScalarSourceRef>(image, definition.off_scalar_sources);
-    auto *signatures = graph_image_section<GraphBoundarySignature>(image, definition.off_boundary_signatures);
+    auto *scalar_inheritance = graph_image_section<GraphScalarInheritance>(image, definition.off_scalar_inheritance);
     auto *predicates = graph_image_section<GraphPredicate>(image, definition.off_predicates);
     uint64_t required_heap = 0;
     size_t tensor_cursor = 0;
@@ -1126,11 +1256,11 @@ bool graph_fill_definition(const GraphRecording &recording, GraphDefinition defi
     std::fill_n(fanout_offsets, recording.task_count + 1, 0);
     fanin_offsets[0] = 0;
     for (int32_t i = 0; i < recording.task_count; ++i) {
-        const RecordedInGraphTask &source = recording.tasks[i];
+        const RecordedSubTask &source = recording.tasks[i];
         if (source.total_output_size > static_cast<size_t>(INT32_MAX) || source.fanin_count > UINT16_MAX) {
             return false;
         }
-        in_graph_task_offsets[i] = required_heap;
+        sub_task_offsets[i] = required_heap;
         const uint64_t output_bytes = CHIP_ALIGN_UP(source.total_output_size, CHIP_ALIGN_SIZE);
         if (required_heap > UINT64_MAX - output_bytes) return false;
         required_heap += output_bytes;
@@ -1171,11 +1301,11 @@ bool graph_fill_definition(const GraphRecording &recording, GraphDefinition defi
             }
         }
 
-        InGraphTaskDefinition &task = tasks[i];
+        SubTaskDefinition &task = tasks[i];
         std::copy(source.kernel_ids.begin(), source.kernel_ids.end(), std::begin(task.kernel_id));
         task.active_mask = source.active_mask.raw();
         // The recorded attrs carry the caller's early-resolve intent, which the
-        // qualification above consumes; no in-graph task reaches the device with
+        // qualification above consumes; no sub-task reaches the device with
         // that bit set.
         TaskAttrs wire_attrs = source.task_attrs;
         wire_attrs.set_early_resolve(false);
@@ -1197,11 +1327,9 @@ bool graph_fill_definition(const GraphRecording &recording, GraphDefinition defi
         if (source.predicate_index >= 0) {
             if (static_cast<size_t>(source.predicate_index) >= recording.predicates.size()) return false;
             const GraphRecordedPredicate &recorded = recording.predicates[source.predicate_index];
-            std::optional<GraphTensorSourceRef> packed_source = graph_pack_tensor_source(recorded.source);
-            if (!packed_source.has_value() || recorded.operand.ndims > MAX_TENSOR_DIMS) return false;
+            if (recorded.operand.ndims > MAX_TENSOR_DIMS) return false;
             GraphPredicate packed{};
-            packed.operand = graph_tensor_pack(recorded.operand);
-            packed.operand_source = *packed_source;
+            graph_tensor_relocation_record(recording, recorded.operand, &packed.operand);
             packed.elem_offset = recorded.elem_offset;
             packed.target = recorded.target;
             packed.elem_size = recorded.elem_size;
@@ -1212,26 +1340,23 @@ bool graph_fill_definition(const GraphRecording &recording, GraphDefinition defi
         const simpler::hbg::Tensor *source_tensors = recording.task_tensors(source);
         for (int32_t t = 0; t < source.tensor_count; ++t) {
             if (source_tensors[t].ndims > MAX_TENSOR_DIMS) return false;
-            tensors[tensor_cursor] = graph_tensor_pack(source_tensors[t]);
-            std::optional<GraphTensorSourceRef> packed_source =
-                graph_pack_tensor_source(recording.tensor_sources[source.tensor_source_offset + t]);
-            if (!packed_source.has_value()) return false;
-            tensor_sources[tensor_cursor] = *packed_source;
+            graph_tensor_relocation_record(recording, source_tensors[t], &tensors[tensor_cursor]);
             tensor_cursor++;
         }
         for (int32_t scalar_index = 0; scalar_index < source.scalar_count; ++scalar_index) {
-            std::optional<GraphScalarSourceRef> packed_source =
-                graph_pack_scalar_source(recording.scalar_sources[source.scalar_offset + scalar_index]);
-            if (!packed_source.has_value() ||
-                (packed_source->source_kind == static_cast<uint8_t>(GraphScalarSourceKind::BOUNDARY) &&
-                 packed_source->source_index >= recording.boundary_args()->scalar_count())) {
+            const GraphScalarInheritance &inheritance =
+                recording.scalar_inheritance[source.scalar_offset + scalar_index];
+            // The last guard before the device indexes this: classification accounting
+            // being right does not prove the image's own layout is.
+            if (inheritance.inherited() &&
+                inheritance.boundary_index() >= recording.bound_boundary().params.scalar_count()) {
                 return false;
             }
-            scalar_sources[scalar_cursor] = *packed_source;
+            scalar_inheritance[scalar_cursor] = inheritance;
+            // An inherited slot's Definition value is a placeholder: materialize overwrites
+            // it from the invocation's own boundary.
             scalars[scalar_cursor++] =
-                packed_source->source_kind == static_cast<uint8_t>(GraphScalarSourceKind::BOUNDARY) ?
-                    0 :
-                    recording.scalars[source.scalar_offset + scalar_index];
+                inheritance.inherited() ? 0 : recording.scalars[source.scalar_offset + scalar_index];
         }
     }
     if (tensor_cursor != total_tensors || scalar_cursor != total_scalars || fanin_cursor != total_fanins ||
@@ -1248,18 +1373,10 @@ bool graph_fill_definition(const GraphRecording &recording, GraphDefinition defi
             fanout_indices[cursors[producer]++] = static_cast<uint16_t>(consumer);
         }
     }
-    for (size_t i = 0; i < recording.boundary_tensors().size(); ++i) {
-        const simpler::hbg::Tensor &tensor = recording.boundary_tensors()[i];
-        if (tensor.ndims > MAX_TENSOR_DIMS) return false;
-        uint16_t alias_rep = static_cast<uint16_t>(i);
-        for (size_t j = 0; j < i; ++j) {
-            if (recording.boundary_tensors()[j].buffer.addr == tensor.buffer.addr &&
-                recording.boundary_tensors()[j].buffer.size == tensor.buffer.size) {
-                alias_rep = static_cast<uint16_t>(j);
-                break;
-            }
-        }
-        signatures[i] = graph_boundary_signature(tensor, recording.boundary_types()[i], alias_rep);
+    const GraphBoundary &boundary = recording.bound_boundary();
+    const GraphTaskArgs &boundary_params = boundary.params;
+    for (int32_t i = 0; i < boundary_params.tensor_count(); ++i) {
+        if (boundary_params.tensor(i).ref().ndims > MAX_TENSOR_DIMS) return false;
     }
     std::memcpy(image, &definition, sizeof(definition));
     return true;
@@ -1372,10 +1489,10 @@ static bool fanin_mark_seen(OrchestratorState &orch, TaskId producer_task_id) {
 // the count accumulates in place instead of being copied back at the end.
 static bool
 append_fanin_or_fail(OrchestratorState &orch, TaskId producer_task_id, int32_t *fanin_slots, int32_t &fanin_count) {
-    // Only a GLOBAL producer has an entry in the task table. An IN_GRAPH id's low
+    // Only a GLOBAL producer has an entry in the task table. A SUB_TASK id's low
     // bits are a packed (Graph task, task index) pair, so using them as a table
     // index names an unrelated task — or, since get_slot_state_by_task_id does not
-    // bounds-check, no task at all. A recorded task's id is IN_GRAPH and the
+    // bounds-check, no task at all. A recorded task's id is SUB_TASK and the
     // recorder resolves it against its own body, never here, so a foreign space
     // reaching this point is an id that escaped its Graph — a caller error, not a
     // case to tolerate.
@@ -1386,9 +1503,9 @@ append_fanin_or_fail(OrchestratorState &orch, TaskId producer_task_id, int32_t *
     if (!producer_task_id.is_global()) {
         orch.report_fatal(
             SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
-            "producer task %#llx is in id space %u, not GLOBAL; host_build_graph resolves every fanin edge against "
+            "producer task %#llx is in id space %s, not GLOBAL; host_build_graph resolves every fanin edge against "
             "its one task table",
-            static_cast<unsigned long long>(producer_task_id.raw), static_cast<unsigned int>(producer_task_id.space())
+            static_cast<unsigned long long>(producer_task_id.raw), producer_task_id.space_name()
         );
         return false;
     }
@@ -1708,7 +1825,7 @@ resolve_dispatch_predicate(OrchestratorState *orch, const CoreTaskPredicate &pre
 }
 
 // Shared body for submit_task / submit_dummy_task. Caller has already validated
-// args.has_error, decided active_mask (empty for dummy), and resolved the per-slot
+// args.has_error(), decided active_mask (empty for dummy), and resolved the per-slot
 // kernel_ids (all INVALID_KERNEL_ID for dummy). Performs tensormap sync, fanin
 // computation (explicit_deps + auto), output registration, slot init, and
 // Orch-side wiring/ready publication.
@@ -1908,109 +2025,129 @@ static TaskOutputTensors submit_task_common(
 
 namespace {
 
-bool graph_boundary_matches(const GraphDefinition &definition, const GraphTaskArgs &args) {
+// Whether one boundary parameter is presented again as it was recorded.
+//
+// Deliberately not compared: `buffer.addr` and `owner_task_id`, which a captured parameter
+// carries in the recording's own terms rather than the caller's; `version` and
+// `address_space`, which the contract lets vary; `extent_elem_cache`, which shapes and
+// strides already settle; and start_offset, which an argument may slide between
+// invocations -- what may not change is its offset *within its alias partition*, which
+// graph_boundary_arrangement_matches checks for the boundary as a whole.
+bool graph_boundary_param_matches(
+    const GraphBoundaryParamMatch &expected, const simpler::hbg::Tensor &actual, TensorArgType actual_tag
+) {
+    return actual.buffer.size == expected.buffer_size && actual.ndims == expected.ndims &&
+           actual.dtype == expected.dtype && actual_tag == expected.tag && actual.manual_dep == expected.manual_dep &&
+           actual.is_contiguous == expected.is_contiguous &&
+           std::equal(
+               std::begin(actual.shapes), std::begin(actual.shapes) + actual.ndims, std::begin(expected.shapes)
+           ) &&
+           std::equal(
+               std::begin(actual.strides), std::begin(actual.strides) + actual.ndims, std::begin(expected.strides)
+           );
+}
+
+// Whether `args` presents the alias partition the recording was captured with, and each
+// parameter at the same offset within its partition.
+//
+// Two things are checked together because they are one property. A partition's members
+// share a buffer, and the body's WAR/WAW edges were inferred from where their views sat
+// in it; those edges are fixed in the Definition, so the arrangement has to come back.
+// What may change is where the partition as a whole sits: every recorded tensor is rebuilt
+// against the origin of the parameter it came from, so a uniform slide moves them all with
+// it and the distances survive. A differential slide does not, which is what the offset
+// comparison refuses.
+//
+// The partition is compared as the whole rep array rather than parameter by parameter: an
+// array names its partition uniquely, so equality catches a class that split and a class
+// that merged alike, and one parameter's rep on its own answers neither.
+bool graph_boundary_arrangement_matches(const GraphBoundaryParamMatch *recorded, const GraphTaskArgs &args) {
+    std::array<uint16_t, GRAPH_MAX_TENSOR_ARGS> actual_rep{};
+    if (!graph_alias_partition(args, actual_rep.data())) return false;
+    for (int32_t i = 0; i < args.tensor_count(); ++i) {
+        if (actual_rep[i] != recorded[i].alias_rep) return false;
+        // Signed, because a partition's representative is its lowest-numbered member
+        // rather than its lowest-addressed one, so a member may sit before it.
+        const int32_t rep = recorded[i].alias_rep;
+        const int64_t actual_delta = static_cast<int64_t>(args.tensor(i).ref().start_offset) -
+                                     static_cast<int64_t>(args.tensor(rep).ref().start_offset);
+        const int64_t recorded_delta =
+            static_cast<int64_t>(recorded[i].start_offset) - static_cast<int64_t>(recorded[rep].start_offset);
+        if (actual_delta != recorded_delta) return false;
+    }
+    return true;
+}
+
+bool graph_boundary_matches(
+    const GraphDefinition &definition, const GraphDefinitionRecord &record, const GraphTaskArgs &args
+) {
     if (args.scalar_count() != definition.boundary_scalar_count || args.explicit_dep_count() != 0 ||
-        args.tensor_count() != definition.boundary_count) {
+        args.tensor_count() != definition.boundary_tensor_count) {
         LOG_WARN(
             "[GraphExecution] fixed boundary contract mismatch: tensors=%d/%d scalars=%d/%d explicit_deps=%u",
-            args.tensor_count(), definition.boundary_count, args.scalar_count(), definition.boundary_scalar_count,
-            args.explicit_dep_count()
+            args.tensor_count(), definition.boundary_tensor_count, args.scalar_count(),
+            definition.boundary_scalar_count, args.explicit_dep_count()
         );
         return false;
     }
-    const auto *signatures = graph_definition_array<GraphBoundarySignature>(
-        definition, definition.off_boundary_signatures, definition.boundary_count
-    );
-    if (signatures == nullptr) return false;
-
-    bool alias_mismatch = false;
     for (int32_t i = 0; i < args.tensor_count(); ++i) {
-        const simpler::hbg::Tensor &tensor = args.tensor(i).ref();
-        const GraphBoundarySignature &signature = signatures[i];
-        if (tensor.ndims > MAX_TENSOR_DIMS) {
+        const simpler::hbg::Tensor &actual = args.tensor(i).ref();
+        if (actual.ndims > MAX_TENSOR_DIMS) {
             debug_assert(
-                tensor.ndims <= MAX_TENSOR_DIMS && "Graph boundary simpler::hbg::Tensor rank is not supported"
+                actual.ndims <= MAX_TENSOR_DIMS && "Graph boundary simpler::hbg::Tensor rank is not supported"
             );
             LOG_WARN(
-                "[GraphExecution] simpler::hbg::Tensor rank %u exceeds the fixed Graph boundary limit", tensor.ndims
+                "[GraphExecution] simpler::hbg::Tensor rank %u exceeds the fixed Graph boundary limit",
+                static_cast<unsigned>(actual.ndims)
             );
             return false;
         }
-        const auto shape_end = std::begin(tensor.shapes) + tensor.ndims;
-        const auto stride_end = std::begin(tensor.strides) + tensor.ndims;
-        const bool metadata_match = tensor.buffer.size == signature.buffer_size && tensor.ndims == signature.ndims &&
-                                    static_cast<uint8_t>(tensor.dtype) == signature.dtype &&
-                                    static_cast<uint8_t>(args.tag(i)) == signature.tag &&
-                                    static_cast<uint8_t>(tensor.manual_dep ? 1 : 0) == signature.manual_dep &&
-                                    static_cast<uint8_t>(tensor.is_contiguous ? 1 : 0) == signature.is_contiguous &&
-                                    std::equal(std::begin(tensor.shapes), shape_end, std::begin(signature.shapes)) &&
-                                    std::equal(std::begin(tensor.strides), stride_end, std::begin(signature.strides));
-        if (!metadata_match) {
-            debug_assert(metadata_match && "Variable Graph boundary tensor shape/metadata is not supported");
+        const GraphBoundaryParamMatch &expected = record.boundary_match[i];
+        if (!graph_boundary_param_matches(expected, actual, args.tag(i))) {
+            // Logged before the assertion, which aborts a debug build: an assertion that
+            // fires first takes the one line saying what actually moved down with it.
+            //
+            // start_offset is not among these: an argument may slide, and what that costs
+            // is checked as an arrangement below rather than per parameter.
             LOG_WARN(
-                "[GraphExecution] fixed tensor shape/metadata mismatch at boundary arg %d; using ordinary path", i
+                "[GraphExecution] fixed tensor metadata mismatch at boundary arg %d; using ordinary path: "
+                "size=%llu/%llu ndims=%u/%u dtype=%u/%u tag=%u/%u manual_dep=%d/%d contiguous=%d/%d",
+                i, static_cast<unsigned long long>(actual.buffer.size),
+                static_cast<unsigned long long>(expected.buffer_size), static_cast<unsigned>(actual.ndims),
+                static_cast<unsigned>(expected.ndims), static_cast<unsigned>(actual.dtype),
+                static_cast<unsigned>(expected.dtype), static_cast<unsigned>(args.tag(i)),
+                static_cast<unsigned>(expected.tag), static_cast<int>(actual.manual_dep),
+                static_cast<int>(expected.manual_dep), static_cast<int>(actual.is_contiguous),
+                static_cast<int>(expected.is_contiguous)
             );
+            debug_assert(false && "Variable Graph boundary tensor shape/metadata is not supported");
             return false;
         }
-        uint16_t alias_rep = static_cast<uint16_t>(i);
-        for (int32_t j = 0; j < i; ++j) {
-            const simpler::hbg::Tensor &other = args.tensor(j).ref();
-            if (other.buffer.addr == tensor.buffer.addr && other.buffer.size == tensor.buffer.size) {
-                alias_rep = static_cast<uint16_t>(j);
-                break;
-            }
-        }
-        alias_mismatch |= alias_rep != signature.alias_rep;
     }
-    if (alias_mismatch) {
-        debug_assert(!alias_mismatch && "Changing the Graph boundary alias partition is not supported");
-        LOG_WARN("%s", "[GraphExecution] boundary alias partition differs from recording; using ordinary path");
+    if (!graph_boundary_arrangement_matches(record.boundary_match.data(), args)) {
+        LOG_WARN(
+            "%s", "[GraphExecution] boundary alias partition or intra-partition offsets differ from recording; "
+                  "using ordinary path"
+        );
+        debug_assert(false && "Changing the Graph boundary arrangement is not supported");
         return false;
     }
     return true;
 }
 
 bool graph_boundary_matches(const GraphBoundary &boundary, const GraphTaskArgs &args) {
-    if (args.scalar_count() != boundary.scalar_count || args.explicit_dep_count() != 0 ||
-        args.tensor_count() != static_cast<int32_t>(boundary.tensors.size()) ||
-        boundary.tensors.size() != boundary.types.size()) {
+    if (args.scalar_count() != boundary.params.scalar_count() || args.explicit_dep_count() != 0 ||
+        args.tensor_count() != boundary.params.tensor_count()) {
         return false;
     }
     for (int32_t i = 0; i < args.tensor_count(); ++i) {
-        const simpler::hbg::Tensor &expected = boundary.tensors[static_cast<size_t>(i)];
         const simpler::hbg::Tensor &actual = args.tensor(i).ref();
-        if (actual.ndims > MAX_TENSOR_DIMS || actual.buffer.size != expected.buffer.size ||
-            actual.ndims != expected.ndims || actual.dtype != expected.dtype ||
-            args.tag(i) != boundary.types[static_cast<size_t>(i)] || actual.manual_dep != expected.manual_dep ||
-            actual.is_contiguous != expected.is_contiguous ||
-            !std::equal(
-                std::begin(actual.shapes), std::begin(actual.shapes) + actual.ndims, std::begin(expected.shapes)
-            ) ||
-            !std::equal(
-                std::begin(actual.strides), std::begin(actual.strides) + actual.ndims, std::begin(expected.strides)
-            )) {
+        if (actual.ndims > MAX_TENSOR_DIMS ||
+            !graph_boundary_param_matches(boundary.param_match[i], actual, args.tag(i))) {
             return false;
         }
-        uint16_t expected_alias = static_cast<uint16_t>(i);
-        uint16_t actual_alias = static_cast<uint16_t>(i);
-        for (int32_t j = 0; j < i; ++j) {
-            const simpler::hbg::Tensor &expected_other = boundary.tensors[static_cast<size_t>(j)];
-            if (expected_other.buffer.addr == expected.buffer.addr &&
-                expected_other.buffer.size == expected.buffer.size) {
-                expected_alias = static_cast<uint16_t>(j);
-                break;
-            }
-        }
-        for (int32_t j = 0; j < i; ++j) {
-            const simpler::hbg::Tensor &actual_other = args.tensor(j).ref();
-            if (actual_other.buffer.addr == actual.buffer.addr && actual_other.buffer.size == actual.buffer.size) {
-                actual_alias = static_cast<uint16_t>(j);
-                break;
-            }
-        }
-        if (actual_alias != expected_alias) return false;
     }
-    return true;
+    return graph_boundary_arrangement_matches(boundary.param_match.data(), args);
 }
 
 void graph_reset_outer_payload(TaskPayload &payload) {
@@ -2048,8 +2185,7 @@ bool graph_submit_outer(
     // ahead of the slot claim and decline the Graph path, which leaves the caller to
     // replay the block as ordinary tasks.
     const uint64_t max_tasks = static_cast<uint64_t>(orch->task_allocator.capacity());
-    const int32_t tensor_slots =
-        static_cast<int32_t>(graph_boundary_tensor_pool_slots(static_cast<uint32_t>(args.tensor_count())));
+    const int32_t tensor_slots = args.tensor_count();
     const int32_t scalar_span = CHIP_ALIGN_UP(args.scalar_count(), ARG_POOL_ALIGN / (int32_t)sizeof(uint64_t));
     if (static_cast<uint64_t>(orch->tensor_pool_cursor) + tensor_slots > max_tasks * MAX_TENSOR_ARGS ||
         static_cast<uint64_t>(orch->scalar_pool_cursor) + scalar_span > max_tasks * MAX_SCALAR_ARGS) {
@@ -2099,6 +2235,12 @@ bool graph_submit_outer(
     slot.active_mask = ActiveMask{};
     slot.task_attrs = TaskAttrs{};
     slot.total_required_subtasks = 0;
+    // A shell places no block, but this must stay positive: an early-released
+    // shell sits in EARLY_DISPATCH_STAGING, so its readiness runs through
+    // try_early_dispatch_release, which returns next_block_idx >= this. At zero
+    // that is true for a shell's never-advanced cursor, push_ready_routed
+    // returns before graph_ready_queue, and the Graph silently never activates —
+    // visible only as SIMPLER_ERROR_SCHEDULER_TIMEOUT.
     slot.logical_block_num = 1;
     slot.task_kind = TaskKind::GRAPH;
 
@@ -2109,14 +2251,14 @@ bool graph_submit_outer(
     graph_reset_outer_payload(payload);
     payload.tensor_count = args.tensor_count();
     payload.scalar_count = args.scalar_count();
-    auto *boundary_tensors = reinterpret_cast<GraphTensor *>(payload.tensor_data());
+    auto *boundary_tensors = payload.tensor_data();
     for (int32_t i = 0; i < args.tensor_count(); ++i)
-        new (&boundary_tensors[i]) GraphTensor{graph_tensor_pack(args.tensor(i).ref())};
+        boundary_tensors[i] = args.tensor(i).ref();
     if (args.scalar_count() != 0) {
-        std::memcpy(
-            payload.scalar_data(), args.scalar_data(),
-            CHIP_ALIGN_UP(static_cast<size_t>(args.scalar_count()) * sizeof(uint64_t), ARG_POOL_ALIGN)
-        );
+        // Resolved, not copied: this is the boundary the device patches BOUNDARY-sourced
+        // sub-task scalars from, so it has to hold values. Only scalar_count entries
+        // are written; the region's alignment padding keeps whatever it held.
+        args.pack_scalars(payload.scalar_data());
     }
 
     // graph_reset_outer_payload above zeroed the count; the region delta is resolved
@@ -2159,6 +2301,32 @@ bool graph_submit_outer(
     debug_assert(orch->fanin_pool_cursor == static_cast<int32_t>(payload.fanin_data() - orch->fanin_pool));
     orch->fanin_pool_cursor += CHIP_ALIGN_UP(payload.fanin_count, ARG_POOL_ALIGN / (int32_t)sizeof(int32_t));
 
+    // Early-dispatch qualification for the shell. Its fanin is an ordinary
+    // inline row of GLOBAL producers, so the rule is the top-level one, minus
+    // the terms that describe dispatching a task to cores: a shell has no
+    // predicate, no resource shape, and never occupies a core itself. What its
+    // release does instead is admit the body's roots, which is why a shell
+    // qualifies on producers alone.
+    //
+    // A GRAPH producer still disqualifies, as it does at top level: a shell
+    // publishes no placement of its own, so there is nothing for a consumer to
+    // bet on. That is the graph-as-producer direction, deliberately left out.
+    int32_t *const shell_fanin = payload.fanin_data();
+    bool shell_candidate = payload.fanin_count > 0;
+    for (int32_t i = 0; shell_candidate && i < payload.fanin_count; i++) {
+        const ChipTaskSlotState &producer = orch->sm_header->tasks.get_slot_state_by_task_id(shell_fanin[i]);
+        if (producer.task_kind == TaskKind::GRAPH || !producer.task_attrs.allow_early_resolve()) {
+            shell_candidate = false;
+        }
+    }
+    if (shell_candidate) {
+        std::sort(shell_fanin, shell_fanin + payload.fanin_count);
+        slot.ed_flags |= ED_FLAG_CANDIDATE;
+        for (int32_t i = 0; i < payload.fanin_count; i++) {
+            orch->sm_header->tasks.get_slot_state_by_task_id(shell_fanin[i]).ed_flags |= ED_FLAG_TRACKED;
+        }
+    }
+
     pending.outer_slot = &slot;
     state->pending_uploads.push_back(pending);
     if (submitted_id != nullptr) *submitted_id = task_id;
@@ -2169,10 +2337,10 @@ bool graph_submit_outer(
 }
 
 bool graph_submit_definition(
-    OrchestratorState *orch, GraphHostState *state, const GraphDefinition *definition, const GraphTaskArgs &args,
-    TaskId *submitted_id
+    OrchestratorState *orch, GraphHostState *state, const GraphDefinition *definition,
+    const GraphDefinitionRecord &record, const GraphTaskArgs &args, TaskId *submitted_id
 ) {
-    if (definition == nullptr || !graph_boundary_matches(*definition, args) ||
+    if (definition == nullptr || !graph_boundary_matches(*definition, record, args) ||
         definition->execution_storage_bytes == 0 ||
         definition->required_heap > UINT64_MAX - definition->execution_storage_bytes) {
         return false;
@@ -2222,16 +2390,16 @@ bool graph_finalize_pending_submissions(OrchestratorState *orch, GraphHostState 
     return true;
 }
 
-// Record one in-graph task while recording, without consuming a task-table
+// Record one sub-task while recording, without consuming a task-table
 // slot. Builds the task's metadata and materialized outputs exactly as
-// submit_task_common would, but assigns output buffers from the bit-63 virtual
-// address range and derives internal fanins from tensor-source classification — so
+// submit_task_common would, but assigns output buffers from the recording's own
+// address space and derives internal fanins from each argument's owner — so
 // no task-table slot, tensormap entry, fanin-pool entry, or upload is produced for
 // it. The resulting Definition is later attached to the outer GRAPH shells already
 // submitted by the main thread. The returned TaskOutputTensors point into the
 // recording's tensor pool, which is allocated at the cap and never grows, so they
 // stay valid for the rest of the recording.
-TaskOutputTensors graph_record_submit_in_graph_task(
+TaskOutputTensors graph_record_submit_sub_task(
     OrchestratorState *orch, const CoreTaskArgs &args, ActiveMask active_mask, TaskAttrs task_attrs,
     int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id
 ) {
@@ -2240,26 +2408,30 @@ TaskOutputTensors graph_record_submit_in_graph_task(
     GraphRecording &recording = *active_graph_recording(orch);
 
     const int32_t task_index = recording.task_count;
-    // A recorded task lives in the IN_GRAPH id space, so an id the body hands
+    // A recorded task lives in the SUB_TASK id space, so an id the body hands
     // around says which of the two kinds of thing it names without any arithmetic:
-    // an IN_GRAPH id is a task of this body, indexed by its low field; a GLOBAL id is
+    // a SUB_TASK id is a task of this body, indexed by its low field; a GLOBAL id is
     // a task submitted before the Graph, which nothing in the body may depend on.
-    const TaskId task_id = TaskId::make_in_graph(GRAPH_RECORD_NO_OWNING_GRAPH, task_index);
+    const TaskId task_id = TaskId::make_sub_task(GRAPH_RECORD_NO_OWNING_GRAPH, task_index);
     result.set_task_id(task_id);
 
-    if (task_index >= MAX_IN_GRAPH_TASKS || args.has_error) {
+    if (task_index >= SUB_TASK_MAX_NUM || args.has_error()) {
         recording.unsupported = true;
     }
 
     const OutputLayout layout = calculate_output_layout(args);
-    const uint64_t aligned_output =
-        layout.total_output_size > 0 ? CHIP_ALIGN_UP(static_cast<uint64_t>(layout.total_output_size), CHIP_ALIGN_SIZE) :
-                                       0;
-    if (recording.next_virtual_offset > GRAPH_RECORD_VIRTUAL_BASE - aligned_output) {
+    const uint64_t aligned_output = CHIP_ALIGN_UP(static_cast<uint64_t>(layout.total_output_size), CHIP_ALIGN_SIZE);
+    // Outputs are bumped past the parameter windows: both regions belong to one simulated
+    // heap, so the bound counts them together. That is deliberately conservative -- the
+    // parameter windows stand for the caller's own buffers and never reach the graph heap
+    // a replay commits -- and costs nothing at this scale.
+    const uint64_t param_used = recording.bound_boundary().param_used_heap_size;
+    const uint64_t reserved = param_used + aligned_output;
+    if (reserved > MAX_HEAP_CAPACITY || recording.next_virtual_offset > MAX_HEAP_CAPACITY - reserved) {
         recording.unsupported = true;
         return result;
     }
-    const uintptr_t packed_base_addr = GRAPH_RECORD_VIRTUAL_BASE + recording.next_virtual_offset;
+    const uintptr_t packed_base_addr = GRAPH_RECORD_BASE + param_used + recording.next_virtual_offset;
     recording.next_virtual_offset += aligned_output;
 
     // The task is filled in place, in the slot it will keep, and reset() puts the rest of
@@ -2267,7 +2439,7 @@ TaskOutputTensors graph_record_submit_in_graph_task(
     // which moves the slots, but the addresses handed to the caller live in the recording's
     // tensor pool rather than in a slot, so a move cannot invalidate them.
     if (task_index >= static_cast<int32_t>(recording.tasks.size())) recording.tasks.emplace_back();
-    RecordedInGraphTask &task = recording.tasks[task_index];
+    RecordedSubTask &task = recording.tasks[task_index];
     task.reset();
     task.kernel_ids[static_cast<int>(SubtaskSlot::AIC)] = aic_kernel_id;
     task.kernel_ids[static_cast<int>(SubtaskSlot::AIV0)] = aiv0_kernel_id;
@@ -2275,7 +2447,7 @@ TaskOutputTensors graph_record_submit_in_graph_task(
     task.active_mask = active_mask;
     // The recorded copy keeps the caller's early-resolve intent, which is the input
     // graph_fill_definition qualifies this body's early dispatch against. The bit is
-    // cleared on the way into the Definition instead, so no in-graph task reaches
+    // cleared on the way into the Definition instead, so no sub-task reaches
     // the device carrying it.
     task.task_attrs = task_attrs;
     task.logical_block_num = args.launch_spec.block_num();
@@ -2283,7 +2455,7 @@ TaskOutputTensors graph_record_submit_in_graph_task(
     // count must fit int16_t. An out-of-contract value marks asynchronous
     // recording unsupported and makes commit fail-fast, rather than baking a
     // truncated or negative count into the cached Definition (which the device
-    // would expand into an in-graph task that never completes).
+    // would expand into a sub-task that never completes).
     const int32_t required_subtasks =
         static_cast<int32_t>(task.logical_block_num) * __builtin_popcount(active_mask.core_mask());
     if (task.logical_block_num <= 0 || required_subtasks > std::numeric_limits<int16_t>::max()) {
@@ -2335,33 +2507,24 @@ TaskOutputTensors graph_record_submit_in_graph_task(
     }
     task.scalar_offset = static_cast<int32_t>(recording.scalars.size());
     task.scalar_count = args.scalar_count();
-    recording.scalars.insert(recording.scalars.end(), args.scalars(), args.scalars() + args.scalar_count());
+    // Resolved values, not slots: an inherited slot's word is a host pointer, and this is
+    // the recording's working copy of what the task passed. What a BOUNDARY-sourced slot
+    // contributes to the Definition is overwritten with a placeholder at build time.
+    recording.scalars.resize(recording.scalars.size() + static_cast<size_t>(task.scalar_count));
+    args.pack_scalars(recording.scalars.data() + task.scalar_offset);
 #if SIMPLER_DFX
     task.dump_metadata.dump_arg_mask = args.dump_arg_mask();
     task.dump_metadata.dump_arg_flags = args.dump_arg_index_ambiguous_mask();
     memcpy(task.dump_metadata.scalar_dtypes, args.scalar_dtypes(), args.scalar_count() * sizeof(uint8_t));
 #endif
 
-    // Classify each scalar's source: a plain literal is static Definition data,
-    // while a value copied from a boundary scalar is refreshed on replay. A
-    // mutable tracked boundary scalar is not supported and falls back.
-    recording.scalar_sources.resize(task.scalar_offset + task.scalar_count);
-    for (int32_t i = 0; i < args.scalar_count(); ++i) {
-        GraphRecordedScalarSourceRef source = graph_classify_scalar(recording, args, i);
-        if (source.source_kind == GraphRecordedScalarSourceKind::INVALIDATED_BOUNDARY) recording.unsupported = true;
-        recording.scalar_sources[task.scalar_offset + i] = source;
-    }
+    // Classify each scalar's source: a slot holding its own value is static Definition
+    // data, while an inherited slot names a boundary parameter refreshed on every replay.
+    recording.scalar_inheritance.resize(task.scalar_offset + task.scalar_count);
+    graph_classify_scalars(recording, args, task.scalar_offset);
 
-    // Classify each tensor's source, then derive internal fanins from the
-    // INTERNAL classifications plus any explicit internal dependency.
-    task.tensor_source_offset = static_cast<int32_t>(recording.tensor_sources.size());
-    recording.tensor_sources.resize(task.tensor_source_offset + tensor_count);
     for (int32_t i = 0; i < tensor_count; ++i) {
-        // The out-pointer is used only for the duration of the call, so pointing
-        // it into the flat array is safe even though a later task of this body grows it.
-        if (!graph_classify_tensor(
-                recording, task, task_index, task_tensors[i], &recording.tensor_sources[task.tensor_source_offset + i]
-            )) {
+        if (!graph_classify_tensor(recording, task_index, task_tensors[i])) {
             recording.unsupported = true;
         }
     }
@@ -2383,17 +2546,18 @@ TaskOutputTensors graph_record_submit_in_graph_task(
         recorded.op = pred.op;
         recorded.target = pred.target;
         const simpler::hbg::Tensor *operand = pred.operand.tensor;
-        // OWN_OUTPUT would read the task's own output before the task runs, so it
-        // names no value the predicate could be evaluating. An index vector that
-        // leaves the operand's extent is caught here too: materialize would
-        // otherwise reject the baked offset on the device, where the failure is a
+        // A predicate on the consuming task's own output would read the buffer that task
+        // has yet to write, so it names no value the predicate could be evaluating. An
+        // index vector that leaves the operand's extent is caught here too: materialize
+        // would otherwise reject the baked offset on the device, where the failure is a
         // Scheduler fatal rather than a named unsupported construct.
         const uint64_t flat_offset =
             operand == nullptr ? 0 : operand->compute_flat_offset(pred.operand.indices, pred.operand.ndims);
         if (operand == nullptr || operand->ndims > MAX_TENSOR_DIMS || pred.operand.ndims > operand->ndims ||
             flat_offset < operand->start_offset || flat_offset - operand->start_offset >= operand->extent_elem_cache ||
-            !graph_classify_tensor(recording, task, task_index, *operand, &recorded.source) ||
-            recorded.source.source_kind == GraphRecordedTensorSourceKind::OWN_OUTPUT) {
+            !graph_classify_tensor(recording, task_index, *operand) ||
+            (operand->owner_task_id.space() == TaskId::Space::SUB_TASK &&
+             operand->owner_task_id.local_id() == task_index)) {
             recording.unsupported = true;
         } else {
             recorded.operand.copy(*operand);
@@ -2413,15 +2577,18 @@ TaskOutputTensors graph_record_submit_in_graph_task(
             recording.internal_fanins.push_back(producer);
         }
     };
+    // An argument produced by an earlier task of this body is an edge. The owner says which
+    // task that is; the consuming task's own outputs are not edges, which is why this asks
+    // for a strictly earlier one.
     for (int32_t i = 0; i < tensor_count; ++i) {
-        const GraphRecordedTensorSourceRef &source = recording.tensor_sources[task.tensor_source_offset + i];
-        if (source.source_kind == GraphRecordedTensorSourceKind::INTERNAL) {
-            add_fanin(static_cast<int32_t>(source.source_index));
-        }
+        const TaskId owner = task_tensors[i].owner_task_id;
+        if (owner.space() != TaskId::Space::SUB_TASK) continue;
+        const int32_t producer = owner.local_id();
+        if (producer >= 0 && producer < task_index) add_fanin(producer);
     }
 
     // Inferred hazards, on the same terms as the ordinary path. The loop above only
-    // names the in-graph task that ALLOCATED each buffer; every write-then-read through a
+    // names the sub-task that ALLOCATED each buffer; every write-then-read through a
     // buffer someone else allocated — an alloc_tensors output written in place
     // with add_inout, or a view of a boundary tensor — needs the last-writer
     // lookup compute_task_fanin performs. Running the very same function against
@@ -2440,9 +2607,9 @@ TaskOutputTensors graph_record_submit_in_graph_task(
             args.explicit_deps_data(),
         };
         const bool manual_scope = recording.in_manual_scope();
-        if (!recording.storage_ready || task_index >= MAX_IN_GRAPH_TASKS) {
+        if (!recording.storage_ready || task_index >= SUB_TASK_MAX_NUM) {
             // An over-cap body is already abandoned, and its task ids have run past
-            // the low field TaskId::make_in_graph packs them into, so registering one
+            // the low field TaskId::make_sub_task packs them into, so registering one
             // would key the map outside its task chains.
             recording.unsupported = true;
         } else if (recording.tensor_map.free_entries() < count_registrable_outputs(dep_inputs, manual_scope)) {
@@ -2450,17 +2617,21 @@ TaskOutputTensors graph_record_submit_in_graph_task(
             // Definition instead, so the run fails by name at graph_commit rather
             // than on a hard assert here.
             LOG_WARN(
-                "[GraphExecution] recording hazard map exhausted at in-graph task %d (%d entries); Graph abandoned",
+                "[GraphExecution] recording hazard map exhausted at sub-task %d (%d entries); Graph abandoned",
                 task_index, GRAPH_RECORD_TENSORMAP_POOL_SIZE
             );
             recording.unsupported = true;
         } else {
             auto emit_inferred = [&add_fanin, task_index](TaskId producer) -> bool {
-                // A GLOBAL producer is a task submitted before the Graph. The outer shell
-                // was submitted through the ordinary path against this same boundary, so
-                // its own fanin already orders the whole body behind that task and the
-                // Definition carries no edge of its own.
-                if (producer.is_global()) return true;
+                // Only a task of this body can be an edge in the Definition. A GLOBAL
+                // producer is a task submitted before the Graph, and a PARAM "producer" is
+                // a boundary parameter, which names no task at all -- the outer shell was
+                // submitted through the ordinary path against this same boundary, so its
+                // own fanin already orders the whole body behind whatever produced it, and
+                // the Definition carries no edge of its own. Reading either one's low bits
+                // as a task index would invent an edge onto whichever task happens to sit
+                // there.
+                if (producer.space() != TaskId::Space::SUB_TASK) return true;
                 const int32_t producer_index = producer.local_id();
                 if (producer_index < task_index) {
                     add_fanin(producer_index);
@@ -2477,17 +2648,30 @@ TaskOutputTensors graph_record_submit_in_graph_task(
             recording.unsupported = true;
             continue;
         }
-        if (dep.is_global()) {
-            // Only the outer shell can order the body behind a pre-Graph task, and it
-            // does so through its boundary args -- so a dep no boundary tensor carries
-            // has no edge in the Definition and the body cannot be recorded.
-            const bool represented_by_boundary = std::any_of(
-                recording.boundary_tensors().begin(), recording.boundary_tensors().end(),
-                [dep](const simpler::hbg::Tensor &tensor) {
-                    return tensor.owner_task_id == dep;
-                }
+        if (dep.space() == TaskId::Space::PARAM) {
+            // A dependency named off a boundary parameter -- the shape an orchestration
+            // writes as set_dependencies({param.owner_task_id}). It orders the body behind
+            // whatever produced that argument, and the outer shell already carries exactly
+            // that ordering through its own args, so the Definition needs no edge of its
+            // own. Admitted without one, like the GLOBAL case below.
+            debug_assert(
+                dep.local_id() < recording.bound_boundary().params.tensor_count() &&
+                "a PARAM id names a parameter of the boundary it was stamped from"
             );
-            if (!represented_by_boundary) recording.unsupported = true;
+            continue;
+        }
+        if (dep.is_global()) {
+            // A body reaches a GLOBAL id only through a variable it did not receive: every
+            // tensor it can name carries a PARAM owner, handled above. So this is the
+            // explicit-dependency form of using something that never came through the
+            // boundary, and it is refused for the same reason -- the Definition has no edge
+            // that could express it.
+            LOG_WARN(
+                "[GraphExecution] sub-task %d depends on a task outside the Graph; order the body behind it by "
+                "passing that task's output as a GraphTaskArgs parameter",
+                task_index
+            );
+            recording.unsupported = true;
             continue;
         }
         const int32_t dep_index = dep.local_id();
@@ -2504,7 +2688,7 @@ TaskOutputTensors graph_record_submit_in_graph_task(
     // Published last: until this advances, the slot is not part of the recording, so
     // nothing that scans the recorded tasks can see the task being built.
     recording.task_count = task_index + 1;
-    ORCH_PHASE_END(HostPhaseKind::OrchRecordInGraphTask, task_id.raw);
+    ORCH_PHASE_END(HostPhaseKind::OrchRecordSubTask, task_id.raw);
     return result;
 }
 
@@ -2544,7 +2728,8 @@ OrchestratorState::graph_begin_inner(uint64_t graph_key, const GraphTaskArgs &ar
         TaskId submitted = TaskId::invalid();
         ORCH_PHASE_START();
         if (graph_submit_definition(
-                orch, state, graph_record_definition(*state, definition_it->second), args, &submitted
+                orch, state, graph_record_definition(*state, definition_it->second), definition_it->second, args,
+                &submitted
             )) {
             result.execute_block = false;
             result.task_id = submitted;
@@ -2602,13 +2787,64 @@ OrchestratorState::graph_begin_inner(uint64_t graph_key, const GraphTaskArgs &ar
     // up here would sit on the submitting thread, between two outer shells.
     auto entry = std::make_unique<GraphInflightRecording>();
     entry->full_key = full_key;
-    entry->boundary.scalar_count = args.scalar_count();
-    entry->boundary.tensors.reserve(static_cast<size_t>(args.tensor_count()));
-    entry->boundary.types.reserve(static_cast<size_t>(args.tensor_count()));
+    // The boundary is built once, here, and only read afterwards -- by the recorder that
+    // picks this entry up, and by later same-key submissions comparing against it.
+    //
+    // Tensors are filled before any TensorRef is made to point at them: `tensors` is a
+    // fixed-size array precisely so those pointers cannot move, but a slot must still hold
+    // its value before args names it.
+    GraphBoundary &boundary = entry->boundary;
     for (int32_t i = 0; i < args.tensor_count(); ++i) {
-        entry->boundary.tensors.push_back(args.tensor(i).ref());
-        entry->boundary.types.push_back(args.tag(i));
+        boundary.tensors[i] = args.tensor(i).ref();
     }
+    // Each parameter is named by reference, so the tensors below stay the storage `params`
+    // reads through.
+    for (int32_t i = 0; i < args.tensor_count(); ++i) {
+        simpler::hbg::Tensor &owned = boundary.tensors[i];
+        switch (args.tag(i)) {
+        case TensorArgType::INPUT:
+            boundary.params.add_input(owned);
+            break;
+        case TensorArgType::OUTPUT_EXISTING:
+            boundary.params.add_output(owned);
+            break;
+        case TensorArgType::INOUT:
+            boundary.params.add_inout(owned);
+            break;
+        case TensorArgType::NO_DEP:
+            boundary.params.add_no_dep(owned);
+            break;
+        case TensorArgType::OUTPUT:
+            // GraphTaskArgs::add_output rejects a TensorCreateInfo at compile time, so no
+            // boundary carries this tag. The case exists because the switch is exhaustive.
+            debug_assert(false && "a Graph boundary cannot hold a runtime-allocated output");
+            break;
+        }
+    }
+    // Values resolved, declarations carried over. A dynamic parameter names itself, so
+    // `params` stays the basis recording resolves against.
+    boundary.params.gen_scalar_params_from_args(args);
+    boundary.params.launch_spec = args.launch_spec;
+    boundary.params.set_allow_early_resolve(args.allow_early_resolve());
+    if (args.task_timing_slot() != TASK_TIMING_SLOT_NONE) {
+        boundary.params.set_task_timing_slot(args.task_timing_slot());
+    }
+    // Before anything reads these tensors: the parameters move into the recording's own
+    // address space here, so every reader downstream -- the body, the recorder, a later
+    // same-key submission -- sees one consistent set of addresses. `params` already names
+    // them, and by reference, so it carries the move across.
+    //
+    // A boundary this runtime cannot represent takes the ordinary path, like a structural
+    // mismatch does: the entry is dropped before it is published, the body runs against the
+    // caller's own arguments, and the run stays correct without a Definition.
+    if (!graph_boundary_relocate_params(boundary)) {
+        LOG_WARN(
+            "%s", "[GraphExecution] boundary tensors must name non-empty buffers, and two at one address must "
+                  "name one size; using ordinary path"
+        );
+        return result;
+    }
+    boundary.params.set_predicate(args.predicate());
     GraphInflightRecording *entry_ptr = entry.get();
     state->inflight.emplace(full_key, std::move(entry));
     state->inflight_count.store(state->inflight.size(), std::memory_order_release);
@@ -2619,6 +2855,7 @@ OrchestratorState::graph_begin_inner(uint64_t graph_key, const GraphTaskArgs &ar
         result.execute_block = false;
         result.recording = true;
         result.recording_handle = entry_ptr;
+        result.params = &entry_ptr->boundary.params;
         result.task_id = submitted;
         ORCH_PHASE_END(HostPhaseKind::OrchGraphSubmit, submitted.raw);
 #if SIMPLER_DFX
@@ -2634,7 +2871,13 @@ OrchestratorState::graph_begin_inner(uint64_t graph_key, const GraphTaskArgs &ar
     return result;
 }
 
-bool OrchestratorState::graph_prepare(void *recording_handle, const GraphTaskArgs &args) {
+// The parameter list is the entry's own -- graph_begin published it as
+// GraphScopeResult::params, and both the queued job and the synchronous fallback forward
+// that same object here, which is why it arrives unnamed: there is no second boundary for
+// it to agree with. A later same-key submission does arrive with the caller's own args,
+// and graph_begin_inner compares those against this entry before publishing a shell
+// against it.
+bool OrchestratorState::graph_prepare(void *recording_handle, const GraphTaskArgs &) {
     GraphHostState *state = graph_state_from(this);
     if (state == nullptr || recording_handle == nullptr || g_active_graph_recording != nullptr) return false;
     auto *entry = static_cast<GraphInflightRecording *>(recording_handle);
@@ -2642,22 +2885,13 @@ bool OrchestratorState::graph_prepare(void *recording_handle, const GraphTaskArg
     // the entry's address is stable for as long as the recording lives, so the
     // recording thread reaches its own state without searching for it. Until this
     // thread calls graph_end/graph_abort, later graph_begin calls only read the
-    // boundary vectors under recording_mutex, and only this thread writes the
+    // boundary under recording_mutex, and only this thread writes the
     // fields it binds below. Taking that mutex here lets the main thread's
     // same-key submit burst starve prepare and collapse the intended overlap, so
     // the status read goes through the atomic instead.
     if (entry->status() != GraphRecordingStatus::RECORDING) {
         return false;
     }
-    // The entry was created from this very boundary at graph_begin, and the handle names
-    // that entry rather than being searched for, so a mismatch here is unreachable. The
-    // comparison walks up to 128 simpler::hbg::Tensor descriptors on the thread whose start-up
-    // latency this path exists to keep short, so it is an assertion: debug builds still
-    // catch a boundary that stopped matching, release builds compile it out.
-    debug_assert(
-        graph_boundary_matches(entry->boundary, args) &&
-        "the entry's boundary copy must match the boundary graph_begin recorded"
-    );
     // This thread's own storage, emptied rather than allocated -- see
     // recorder_recording(). Failure is reachable only on this thread's first recording,
     // where the hazard map is stood up; the caller then aborts the recording, and the
@@ -2667,8 +2901,6 @@ bool OrchestratorState::graph_prepare(void *recording_handle, const GraphTaskArg
         LOG_WARN("%s", "[GraphExecution] recording hazard map allocation failed; recording abandoned");
         return false;
     }
-    args.anchor_scalar_sources();
-    entry->boundary.args = &args;
     g_active_graph_entry = entry;
     g_active_graph_recording = &recording;
     g_active_graph_owner = state;
@@ -2686,8 +2918,9 @@ void OrchestratorState::graph_abort(void *recording_handle) {
     // The storage outlives the entry it was bound to, and graph_commit destroys the
     // entries, so leaving the pointer behind parks a stale one in thread_local state for
     // the rest of the process. The next graph_prepare rebinds before anything reads it,
-    // which is why this is hygiene rather than a fix -- but boundary_tensors() does not
-    // null-check, so a future reader outside a recording would follow it.
+    // which is why this is hygiene rather than a fix -- but clearing it turns a dangling
+    // boundary into a null one, and null is the only state bound_boundary()'s assertion
+    // can catch a read outside a recording by.
     unbind_recorder_boundary();
     g_active_graph_entry = nullptr;
     g_active_graph_recording = nullptr;
@@ -2738,6 +2971,11 @@ bool OrchestratorState::graph_end() {
     }
     const bool built = layout.has_value() && graph_fill_definition(*recording, *layout, image);
     if (built) {
+        // The boundary the reuse condition is checked against. Copied because the entry
+        // holding it is drained at graph_commit while the Definition stays in the cache.
+        // The counts are not copied: they are in the image, where the device checks this
+        // invocation's argument counts against them.
+        record.boundary_match = recording->bound_boundary().param_match;
         ORCH_PHASE_END(HostPhaseKind::OrchBuildDefinition, recording->task_count);
     }
     const GraphDefinition *header = built ? graph_record_definition(*state, record) : nullptr;
@@ -2828,11 +3066,11 @@ TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kerne
     }
 
     // Validate Arg construction (errors recorded by add_input/add_output/etc.)
-    if (args.has_error) {
+    if (args.has_error()) {
         LOG_ERROR("========================================");
         LOG_ERROR("FATAL: Invalid Arg Detected!");
         LOG_ERROR("========================================");
-        LOG_ERROR("Error: %s", args.error_msg ? args.error_msg : "(unknown)");
+        LOG_ERROR("Error: %s", args.error_msg() ? args.error_msg() : "(unknown)");
         LOG_ERROR("  tensor_count: %d, scalar_count: %d", args.tensor_count(), args.scalar_count());
         LOG_ERROR("This is a bug in the orchestration code.");
         LOG_ERROR("========================================");
@@ -2892,7 +3130,7 @@ TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kerne
     }
 
     if (active_graph_recording(orch) != nullptr) {
-        return graph_record_submit_in_graph_task(
+        return graph_record_submit_sub_task(
             orch, args, active_mask, task_attrs, normalized.aic_kernel_id, normalized.aiv0_kernel_id,
             normalized.aiv1_kernel_id
         );
@@ -2916,11 +3154,11 @@ TaskOutputTensors OrchestratorState::submit_dummy_task(const CoreTaskArgs &args)
         return TaskOutputTensors{};
     }
 
-    if (args.has_error) {
+    if (args.has_error()) {
         LOG_ERROR("========================================");
         LOG_ERROR("FATAL: Invalid Arg in submit_dummy_task!");
         LOG_ERROR("========================================");
-        LOG_ERROR("Error: %s", args.error_msg ? args.error_msg : "(unknown)");
+        LOG_ERROR("Error: %s", args.error_msg() ? args.error_msg() : "(unknown)");
         LOG_ERROR("  tensor_count: %d, scalar_count: %d", args.tensor_count(), args.scalar_count());
         LOG_ERROR("========================================");
         orch_mark_fatal(orch, SIMPLER_ERROR_INVALID_ARGS);
@@ -2934,7 +3172,7 @@ TaskOutputTensors OrchestratorState::submit_dummy_task(const CoreTaskArgs &args)
     task_attrs.set_timing_slot(args.task_timing_slot());
 
     if (active_graph_recording(orch) != nullptr) {
-        return graph_record_submit_in_graph_task(
+        return graph_record_submit_sub_task(
             orch, args, ActiveMask{}, task_attrs, INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID
         );
     }
@@ -2974,17 +3212,17 @@ TaskOutputTensors OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
     ORCH_STEP_START();
     ORCH_PHASE_START();
 
-    if (args.has_error) {
+    if (args.has_error()) {
         report_fatal(
             SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "%s",
-            args.error_msg ? args.error_msg : "alloc_tensors failed to construct output-only Arg"
+            args.error_msg() ? args.error_msg() : "alloc_tensors failed to construct output-only Arg"
         );
         return TaskOutputTensors{};
     }
 
-    // A Graph body may allocate. The allocation records as a kernel-less in-graph
-    // task — the same shape submit_dummy_task records — and replay reserves the
-    // intermediate heap for every in-graph task anyway, so the outputs land at
+    // A Graph body may allocate. The allocation records as a kernel-less sub-task
+    // — the same shape submit_dummy_task records — and replay reserves the
+    // intermediate heap for every sub-task anyway, so the outputs land at
     // addresses the replayed Definition derives for itself.
     //
     // An allocation is transparent to early-dispatch qualification inside a body
@@ -2995,7 +3233,7 @@ TaskOutputTensors OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
     if (active_graph_recording(orch) != nullptr) {
         TaskAttrs alloc_attrs;
         alloc_attrs.set_early_resolve(true);
-        return graph_record_submit_in_graph_task(
+        return graph_record_submit_sub_task(
             orch, args, ActiveMask{}, alloc_attrs, INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID
         );
     }

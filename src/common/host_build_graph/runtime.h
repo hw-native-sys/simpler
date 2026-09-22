@@ -16,7 +16,7 @@
  * only handles:
  * - Handshake buffers for AICPU-AICore communication
  * - Execution parameters (block_dim, aicpu_thread_num)
- * - simpler::hbg::Tensor pair management for host-device memory tracking
+ * - simpler::hbg::Tensor lease management for host-device memory tracking
  * - Device orchestration state (gm_sm_ptr_, orch_args_)
  * - Function address mapping (func_id_to_addr_)
  *
@@ -31,27 +31,36 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include <cstddef>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "common/core_type.h"
+#include "common/host_phase_kind.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
 #include "task_args.h"
 #include "aicore_teardown.h"
 #include "host_build_graph/entry_args.h"  // EntryArgsStorage
+#include "utils/tensor_lease.h"
 
 // =============================================================================
 // Configuration Macros
 // =============================================================================
 
-#define RUNTIME_MAX_ARGS 128
 #define RUNTIME_MAX_WORKER PLATFORM_MAX_CORES
 #define RUNTIME_MAX_FUNC_ID 1024
-#define RUNTIME_MAX_ORCH_SO_SIZE (4 * 1024 * 1024)  // 4MB max for orchestration SO
-#define RUNTIME_MAX_ORCH_SYMBOL_NAME 64
 
-// Default number of ready-queue shards.
-constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 1;
+// The AICore compiler defines these; host and AICPU builds compile the same
+// declarations with them empty. Mirrors the guard in the a5 scheduler's
+// scheduler_types.h so one helper can serve a device producer and a host test.
+#ifndef __gm__
+#define __gm__
+#endif
+#ifndef __aicore__
+#define __aicore__
+#endif
 
 // =============================================================================
 // Data Structures
@@ -84,19 +93,32 @@ constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 
  * between cores and optimize cache coherency operations.
  *
  * Field Access Patterns:
- * - aicpu_ready: Reserved legacy field; the current handshake does not use it
+ * - aicpu_ready: unused on a2a3. On a5 it is the AICPU's resident hand-off
+ *   publication: the AICPU writes SCHEDULER_RUNTIME_MODE_RESIDENT_READY once a
+ *   worker's context is filled, and that worker's AICore polls its own copy for
+ *   it. The host publishes the selected mode in
+ *   DeviceRuntimeLaunchDesc::scheduler_bootstrap, not here
  * - aicore_done: Written by AICore, read by AICPU (final report; physical_core_id
  *   and core_type are published alongside it in the same write)
- * - task: Written by AICPU before window-open, read by AICore after window-open
+ * - task: Written by AICPU before window-open, read by AICore after window-open.
+ *   On a5 the AICPU publishes it again at resident hand-off; the AICore's
+ *   pre-READY context address comes from scheduler_bootstrap instead
  * - core_type: Written by AICore (with aicore_done), read by AICPU (CoreType::AIC or CoreType::AIV)
  * - physical_core_id: Written by AICore (with aicore_done), read by AICPU
+ * - report_epoch: This run's identity, written by AICore *after* the payload and
+ *   its store barrier, so it commits the report. A native program run carries a
+ *   non-zero epoch in its launch arguments and the AICPU accepts only a report
+ *   bearing exactly that value; kernel/persistent launches carry 0 and keep the
+ *   `aicore_done != 0` predicate. 0 is never a valid native epoch, so it cannot
+ *   be confused with never-written device memory
  */
 struct Handshake {
-    volatile uint32_t aicpu_ready;  // Legacy layout field; unused by the current handshake
+    volatile uint32_t aicpu_ready;  // a2a3: unused. a5: AICPU resident hand-off publication (see above)
     volatile uint32_t aicore_done;  // AICore ready signal: 0=not ready, core_id+1=ready
-    volatile uint64_t task;         // DispatchPayload* published before register window-open
+    volatile uint64_t task;         // DispatchPayload*, or on a5 a SchedulerWorkerContext address
     volatile CoreType core_type;    // Core type: CoreType::AIC or CoreType::AIV (reported by AICore with aicore_done)
     volatile uint32_t physical_core_id;  // Physical core ID (reported by AICore with aicore_done)
+    volatile uint64_t report_epoch;      // Commit marker for a native program run's report; 0 = unstamped
 } __attribute__((aligned(64)));
 
 // The AICore owns this line's writeback: it flushes the whole line with
@@ -106,32 +128,90 @@ struct Handshake {
 // Runtime::teardown_gates, one isolated line each; A5 leaves them unused.
 static_assert(sizeof(Handshake) == 64);
 static_assert(std::is_standard_layout_v<Handshake> && std::is_trivially_copyable_v<Handshake>);
+// The payload offsets are the device-side wire contract: AICore writes them and
+// the AICPU sweeps read them back, so a field that moved would mis-decode
+// silently. `report_epoch` occupies padding the struct already had, which is why
+// adding it moves nothing and leaves the whole report inside one cache line.
+static_assert(offsetof(Handshake, aicpu_ready) == 0);
+static_assert(offsetof(Handshake, aicore_done) == 4);
+static_assert(offsetof(Handshake, task) == 8);
+static_assert(offsetof(Handshake, core_type) == 16);
+static_assert(offsetof(Handshake, physical_core_id) == 20);
+static_assert(offsetof(Handshake, report_epoch) == 24);
 
 /**
- * simpler::hbg::Tensor pair for tracking host-device memory mappings.
- * Used for copy-back during finalize.
- */
-struct TensorPair {
-    void *host_ptr;
-    void *dev_ptr;
-    size_t size;
-    // false for read-only INPUT tensors: they are never written by the kernel,
-    // so the end-of-run D2H copy-back is skipped. OUTPUT/INOUT/unknown
-    // keep the safe default of copying back.
-    bool needs_copy_back = true;
-};
-
-/**
- * Task structure - Compatibility stub for platform layer
+ * Whether `handshake` carries a report this run may act on.
  *
- * RT2 uses DispatchPayload instead of Task for task dispatch.
- * This stub exists only for API compatibility with device_runner.cpp.
- * Since get_task_count() returns 0, this struct is never actually used.
+ * `expected_epoch` is the run's own identity, which the host supplies in
+ * `KernelArgs::run_result_epoch` and the AICPU reads back through
+ * `get_platform_run_result_epoch()`. A native program run passes a non-zero
+ * value and is answered only by a report stamped with exactly that number, so a
+ * marker left by an earlier run is rejected rather than mistaken for this one's.
+ *
+ * A kernel/persistent launch passes 0 and keeps the original predicate: its
+ * producer writes no stamp, and its per-run reset is what makes `aicore_done`
+ * meaningful. Accepting the epoch here does not order the payload reads that
+ * follow — the caller's existing `rmb()` does that.
  */
-struct Task {
-    int func_id;
-    uint64_t function_bin_addr;
+inline bool aicore_report_accepted(const volatile Handshake *handshake, uint64_t expected_epoch) {
+    if (handshake->aicore_done == 0) return false;
+    return expected_epoch == 0 || handshake->report_epoch == expected_epoch;
+}
+
+/**
+ * Stage everything a native program run's report publishes before its commit
+ * marker, including the reverse hand-off words the AICPU will answer with.
+ *
+ * `pending_mode` is the value that means "no reply yet" for the caller's
+ * protocol. Clearing the reply here is what makes an accepted report also mean
+ * "this is not last run's READY": these stores and the marker that commits them
+ * differ only by the caller's barrier, so an AICPU that accepts this run's
+ * epoch cannot have seen the predecessor's reply still standing.
+ *
+ * The barrier, the marker store and the write-back stay at the call site: they
+ * are architecture intrinsics, and their order relative to this staging is the
+ * protocol.
+ */
+inline __aicore__ void aicore_stage_native_report(
+    __gm__ Handshake *handshake, uint32_t physical_core_id, CoreType core_type, uint32_t done, uint32_t pending_mode
+) {
+    handshake->aicpu_ready = pending_mode;
+    handshake->task = 0;
+    handshake->physical_core_id = physical_core_id;
+    handshake->core_type = core_type;
+    handshake->aicore_done = done;
+}
+
+/**
+ * Host-authored scheduler bootstrap inputs, A5 host_build_graph only.
+ *
+ * Both words are written by the host alone and read by the AICPU and the AICore;
+ * no device tier writes them. That is what separates them from `Handshake`, where
+ * `aicpu_ready` doubles as the AICPU's RESIDENT_READY publication and `task` as
+ * the address the AICPU republishes at hand-off.
+ *
+ * `runtime_mode` is 0 until a run publishes a choice: a zero is "no scheduler
+ * selected", not a selection, and every supported fallback is published
+ * explicitly. `worker_context_base` is the device address of worker 0's
+ * SchedulerWorkerContext, so worker i's context is
+ * `worker_context_base + i * sizeof(SchedulerWorkerContext)`; it is 0 whenever
+ * the mode is not resident.
+ *
+ * One 64-byte line of its own so a single AICore `scheduler_observe_cache_line`
+ * covers exactly the words that follow it, and so no field another tier writes
+ * can share the line. Declared on A2/A3 and read and written by no A2/A3 code —
+ * unused reserved storage there.
+ */
+struct alignas(64) SchedulerBootstrapInputs {
+    volatile uint32_t runtime_mode;         // A5 HBG: SCHEDULER_RUNTIME_MODE_*; 0 = none published
+    volatile uint32_t reserved_;            // keeps worker_context_base 8-byte aligned
+    volatile uint64_t worker_context_base;  // device address of worker 0's SchedulerWorkerContext, 0 when unused
 };
+
+static_assert(sizeof(SchedulerBootstrapInputs) == 64);
+static_assert(
+    std::is_standard_layout_v<SchedulerBootstrapInputs> && std::is_trivially_copyable_v<SchedulerBootstrapInputs>
+);
 
 // =============================================================================
 // Runtime Class
@@ -144,16 +224,47 @@ struct Task {
  * Task graph construction is handled by RuntimeContext; this class only handles
  * execution control and device orchestration state.
  */
-class Runtime {
-public:
-    // Handshake buffers for AICPU-AICore communication
-    Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
-    // A2/A3 post-close return gates, one isolated cache line per worker. The
-    // AICPU stores here only after that worker's register window is closed;
-    // the AICore bypass-loads its own entry and returns once it reads RELEASE.
-    // Separate from workers[] because the AICore flushes its whole Handshake
-    // line, which would overwrite a gate sharing it. Unused on A5.
-    AicoreTeardownControl teardown_gates[RUNTIME_MAX_WORKER];
+/**
+ * DeviceRuntimeLaunchDesc - the device-copied half of Runtime, named.
+ *
+ * This is the ONLY part of Runtime that reaches device memory: the host fills it,
+ * `device_runner_helpers.cpp` allocates `sizeof(DeviceRuntimeLaunchDesc)` bytes
+ * for it and rtMemcpy's a prefix from offset 0 of the Runtime image, and the
+ * AICPU/AICore read these fields back. It is the first member of Runtime
+ * (offsetof == 0), so the narrowed copy needs no offset arithmetic.
+ *
+ * Which prefix depends on the destination block: `runtime_device_copy_size`
+ * for a steady-state run, which stops before `workers`, and
+ * `runtime_device_initialized_prefix_size` for the first publication onto an
+ * allocation, which adds `workers` and stops before `teardown_gates`.
+ *
+ * The boundary was already load-bearing as an offset — everything host-only
+ * lives in `Runtime::HostOnlyState`, and the image ended where that member
+ * began. Naming the other side makes the image a type rather than a distance:
+ * its size is `sizeof`, not `offsetof` on a class that is not standard-layout,
+ * and a field lands on the device because of where it is declared rather than
+ * because of what it happens to precede. Same split, checked by construction.
+ *
+ * Keep it standard-layout and trivially copyable (the static_asserts below) so
+ * the rtMemcpy is well-defined — Runtime itself is neither, because
+ * HostOnlyState holds a std::vector. alignas(64) plus the whole-cache-line size
+ * assertion keep cache_invalidate_range(runtime, sizeof(dev)) from rounding into
+ * a neighbouring line.
+ *
+ * Membership here says a field is device-visible. It says nothing about
+ * lifetime, and the fields inside do not share one: launch parameters the host
+ * rewrites per run sit beside a dispatch table that is constant per callable and
+ * beside a handshake region the device itself writes and the host must not
+ * overwrite while a run is live. So this being one struct is not licence to
+ * overwrite it early, to reset it as a unit, or to conclude that a run must
+ * re-upload all of it. Splitting it further belongs to whoever establishes the
+ * real read/write relationships, field by field.
+ */
+struct alignas(64) DeviceRuntimeLaunchDesc {
+    // Scheduler selection and the address its bootstrap starts from. Host-written
+    // only; see SchedulerBootstrapInputs.
+    SchedulerBootstrapInputs scheduler_bootstrap;
+
     int worker_count;  // Number of active workers
 
     // Execution parameters for AICPU scheduling.
@@ -164,7 +275,6 @@ public:
     // to AICore. The highest-index thread additionally performs the one-time
     // host-orch boot (attach SM, latch task count) before it starts dispatching.
     int aicpu_thread_num;
-    int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
 
     // Filter-style affinity gate input (a2a3 onboard). Host fills these
     // before launch from AICPU OCCUPY, and the device gate keeps threads whose
@@ -192,32 +302,222 @@ public:
     // names its argument regions by delta.
     uint64_t sm_image_bytes;
 
-private:
-    // Kernel binary tracking for cleanup
+    void *gm_sm_ptr_;  // GM pointer to shared memory (device)
 
-    void *gm_sm_ptr_;                                   // GM pointer to shared memory (device)
-    simpler::hbg::EntryArgsStorage orch_args_storage_;  // Entry args, adopted on the host
-
-    // Prebuilt-arena fast path (trb only). Set by the host before rtMemcpy'ing
-    // Runtime to device; AICPU reads them in the boot path to skip
-    // runtime_create_from_sm and reuse the pooled, prebuilt arena buffer
-    // (already populated by runtime_init_data_from_layout + wire on host).
+    // Prebuilt-arena fast path. Set by the host before rtMemcpy'ing Runtime to
+    // device; AICPU reads them in the boot path to skip runtime_create_from_sm
+    // and reuse the pooled, prebuilt arena buffer (already populated by
+    // runtime_init_data_from_layout + wire on host).
     void *prebuilt_arena_base_;
     size_t prebuilt_runtime_offset_;
 
-    // Orchestration metadata set by the platform host (DeviceRunner) when
-    // registering a callable. host_build_graph runs the orchestrator on the
-    // host, so the device side no longer reads the SO bytes / symbol names —
-    // but the platform registration path still writes them through these
-    // setters (shared with tensormap_and_ringbuffer), so the fields and their
-    // setters are part of the platform↔runtime ABI and must stay.
-    uint64_t dev_orch_so_addr_;
-    uint64_t dev_orch_so_size_;
-    int32_t active_callable_id_;
-    char device_orch_func_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
-    char device_orch_config_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
+    // Handshake buffers for AICPU-AICore communication, one 64-byte line per
+    // worker.
+    //
+    // Outside the per-run uploaded prefix: every field the device reads here is
+    // written on the device — the AICore publishes its report and the AICPU its
+    // reply — and no host value is consumed. `device_image_bytes()` ends where
+    // this array begins, so a steady-state run re-uploads none of it. The
+    // allocation still covers it, and the first publication onto a given
+    // allocation carries it once (`device_initialized_prefix_bytes()`), which is
+    // what gives a fresh block a defined starting value.
+    Handshake workers[RUNTIME_MAX_WORKER];
+
+    // A2/A3 post-close return gates, one isolated cache line per worker. The
+    // AICPU stores here only after that worker's register window is closed;
+    // the AICore bypass-loads its own entry and returns once it reads RELEASE.
+    // Separate from workers[] because the AICore flushes its whole Handshake
+    // line, which would overwrite a gate sharing it. Unused reserved storage on
+    // A5 — a declared member that occupies layout, read and written by no A5
+    // code, and A5 runs no gate initialization.
+    //
+    // Last, and outside both the uploaded prefix and the initialized prefix: on
+    // A2/A3 the AICPU zeroes every active entry in `pre_handshake_init` and
+    // executes `wmb()` before it publishes `hs_setup_done_`, and no register
+    // window opens before that publication, so the meaningful initial value is
+    // produced on the device ahead of every read of it. No host-supplied gate
+    // value is consumed on either arch, and the host storage here is never
+    // initialized — `Runtime()` does not touch it — so no host copy may reach
+    // this range. `device_initialized_prefix_bytes()` ends where this array
+    // begins; the allocation still covers it.
+    AicoreTeardownControl teardown_gates[RUNTIME_MAX_WORKER];
+};
+
+static_assert(
+    std::is_standard_layout_v<DeviceRuntimeLaunchDesc>,
+    "DeviceRuntimeLaunchDesc must be standard-layout: it is rtMemcpy'd to device"
+);
+static_assert(
+    std::is_trivially_copyable_v<DeviceRuntimeLaunchDesc>,
+    "DeviceRuntimeLaunchDesc must be trivially copyable: it is rtMemcpy'd to device"
+);
+static_assert(
+    sizeof(DeviceRuntimeLaunchDesc) % 64 == 0,
+    "DeviceRuntimeLaunchDesc size must be a multiple of 64 so cache_invalidate_range(sizeof(dev)) "
+    "stays cache-line aligned"
+);
+static_assert(
+    offsetof(DeviceRuntimeLaunchDesc, workers) % 64 == 0,
+    "workers must start on a cache line: each Handshake is one line the AICore writes back whole"
+);
+static_assert(
+    offsetof(DeviceRuntimeLaunchDesc, teardown_gates) % 64 == 0,
+    "teardown_gates must start on a cache line: the AICore flushes a whole Handshake line and a gate "
+    "sharing one would be overwritten"
+);
+static_assert(
+    offsetof(DeviceRuntimeLaunchDesc, workers) + sizeof(DeviceRuntimeLaunchDesc::workers) ==
+        offsetof(DeviceRuntimeLaunchDesc, teardown_gates),
+    "workers must be the last host-initialized member: the initialized prefix ends where it ends, and a "
+    "field placed between it and the gates would be uploaded once instead of every run"
+);
+static_assert(
+    offsetof(DeviceRuntimeLaunchDesc, teardown_gates) + sizeof(DeviceRuntimeLaunchDesc::teardown_gates) ==
+        sizeof(DeviceRuntimeLaunchDesc),
+    "teardown_gates must end the descriptor: a field appended behind it would sit outside the uploaded "
+    "prefix and never receive its host value"
+);
+
+// =============================================================================
+// Runtime Class
+// =============================================================================
+
+/**
+ * Runtime class for device execution and handshake control
+ *
+ * This class manages AICPU-AICore communication through handshake buffers.
+ * Task graph construction is handled by RuntimeContext; this class only handles
+ * execution control and device orchestration state.
+ */
+class Runtime {
+public:
+    // The device-copied half. First member, so the copy starts at offset 0.
+    DeviceRuntimeLaunchDesc dev;
+
+private:
+    // Everything the host keeps to itself. Outside `dev`, so it cannot travel:
+    // a new host-only field belongs in here, which is what keeps the boundary
+    // from drifting.
+    struct HostOnlyState {
+        // Entry args, adopted on the host. The host orchestrator is the only
+        // reader (runtime_maker.cpp builds its ChipTaskArgs from
+        // get_orch_args()); unlike tensormap_and_ringbuffer, no AICPU entry
+        // touches them, which is why they can stay off the device entirely.
+        simpler::hbg::EntryArgsStorage orch_args_storage_;
+
+        // The callable this runtime is stamped with, and the only orchestration
+        // metadata it holds: host_build_graph resolves the orchestration .so and
+        // its entry symbols on the host, where the platform's
+        // `CallableArtifacts` owns them for the callable's lifetime, so neither
+        // the SO bytes nor the symbol names have a home in here.
+        int32_t active_callable_id_;
+
+        // Host-side tensor ledger for the run's H2D and D2H transfers.
+        // Populated by runtime_maker.cpp from orch_args at bind time, iterated
+        // by copy_back_run_outputs_impl and released by
+        // release_run_bindings_impl. No fixed cap — grows with the chip-level
+        // entry-tensor count, and its std::vector control block holds host heap
+        // addresses, which is a second reason this struct cannot travel.
+        std::vector<TensorLease> tensor_leases_;
+
+        // The launch shape's AIC/AIV rule, one entry per active worker, sized to
+        // this run's worker count. This is host state with host readers only —
+        // the DFX swimlane collector, the sim's per-core thread start, and the
+        // a5 scheduler-context build all need the rule before any core has
+        // reported, and `dev.workers[i].core_type` cannot serve them: it is
+        // outside the per-run uploaded prefix and the device overwrites it with
+        // each core's own report.
+        std::vector<CoreType> core_type_rule_;
+
+        // Sources for one synchronous publication. Definition and execution-image
+        // staging belong to the exclusive slot; scheduler staging is owned here.
+        // Destinations remain owned by their existing slot/bank or scheduler owner.
+        struct MetadataRegion {
+            void *device_target;
+            const void *source;
+            size_t bytes;
+            HostPhaseKind phase;
+            std::string attributes;
+            std::vector<uint8_t> storage;
+        };
+        struct RunImagePublication {
+            void *device_target;
+            const void *source;
+            uint64_t bytes;
+            uint64_t fanin_elems;
+            uint64_t tensor_elems;
+            uint64_t scalar_elems;
+            std::vector<MetadataRegion> prerequisites;
+        };
+        RunImagePublication pending_publication_;
+    };
+    HostOnlyState host_;
 
 public:
+    /**
+     * Bytes a steady-state run uploads: the device descriptor up to, but not
+     * including, `workers`. Neither the handshake region nor the gate tail
+     * carries a host value the device consumes, so a run that re-publishes only
+     * this prefix leaves both alone.
+     *
+     * Strictly smaller than `device_initialized_prefix_bytes()`.
+     */
+    static size_t device_image_bytes();
+
+    /**
+     * Bytes the first publication onto a given device allocation uploads: the
+     * steady-state prefix plus `workers`, stopping where `teardown_gates`
+     * begins.
+     *
+     * `rtMalloc` returns whatever the device left in the block, so the handshake
+     * region needs one defined starting value per allocation; `Runtime()` zeroes
+     * `workers` and nothing writes it afterwards, so publishing this length is
+     * that initialization. The gates are excluded because their host storage is
+     * never initialized at all — copying them would push indeterminate bytes —
+     * and the device produces their value itself.
+     *
+     * Between `device_image_bytes()` and `device_extent_bytes()`.
+     */
+    static size_t device_initialized_prefix_bytes();
+
+    /**
+     * Bytes of device memory the descriptor occupies, including the gate tail
+     * no host copy reaches. Every allocation that backs a device `Runtime`
+     * must use this: the AICPU and AICore address `dev.teardown_gates` inside
+     * it, so an allocation sized to a shorter prefix would place those reads
+     * past its end.
+     */
+    static size_t device_extent_bytes();
+
+    /**
+     * One bind's metadata. A nonzero image byte count seals the record after
+     * its prerequisites are prepared. Consumption empties it on success or
+     * failure; a partial bind is cleared by the bind's failure guard.
+     */
+    const HostOnlyState::RunImagePublication &pending_publication() const { return host_.pending_publication_; }
+    void set_pending_publication(
+        void *device_target, const void *source, uint64_t bytes, uint64_t fanin_elems, uint64_t tensor_elems,
+        uint64_t scalar_elems
+    ) {
+        auto &pending = host_.pending_publication_;
+        pending.device_target = device_target;
+        pending.source = source;
+        pending.bytes = bytes;
+        pending.fanin_elems = fanin_elems;
+        pending.tensor_elems = tensor_elems;
+        pending.scalar_elems = scalar_elems;
+    }
+    void add_pending_metadata(
+        void *target, const void *source, size_t bytes, HostPhaseKind phase, std::string attributes,
+        std::vector<uint8_t> storage = {}
+    ) {
+        host_.pending_publication_.prerequisites.push_back(
+            {target, source, bytes, phase, std::move(attributes), std::move(storage)}
+        );
+    }
+    auto take_pending_publication() { return std::exchange(host_.pending_publication_, {}); }
+    void clear_pending_publication() { host_.pending_publication_ = {}; }
+
     /**
      * Constructor - zero-initialize all arrays
      */
@@ -228,22 +528,34 @@ public:
     //
     // These exist with identical signatures on the tensormap_and_ringbuffer
     // Runtime so the shared platform layer (device_runner*.cpp, kernel.cpp) can
-    // compile against either variant. hbg stores the fields flat (trb keeps
-    // them in a `dev` sub-struct); the accessors hide that difference.
+    // compile against either variant. Both runtimes keep the fields in a `dev`
+    // sub-struct; the accessors keep that out of the callers.
     // =========================================================================
 
-    int get_worker_count() const { return worker_count; }
-    void set_worker_count(int n) { worker_count = n; }
-    int get_aicpu_thread_num() const { return aicpu_thread_num; }
-    void set_aicpu_thread_num(int n) { aicpu_thread_num = n; }
-    Handshake *get_workers() { return workers; }
-    AicoreTeardownControl *get_teardown_gates() { return teardown_gates; }
-    int32_t get_aicpu_allowed_cpu_count() const { return aicpu_allowed_cpu_count; }
-    void set_aicpu_allowed_cpu_count(int32_t n) { aicpu_allowed_cpu_count = n; }
-    int32_t get_aicpu_launch_count() const { return aicpu_launch_count; }
-    void set_aicpu_launch_count(int32_t n) { aicpu_launch_count = n; }
-    int32_t *get_aicpu_allowed_cpus() { return aicpu_allowed_cpus; }
-    size_t aicpu_allowed_cpus_capacity() const { return sizeof(aicpu_allowed_cpus) / sizeof(aicpu_allowed_cpus[0]); }
+    int get_worker_count() const { return dev.worker_count; }
+    void set_worker_count(int n) { dev.worker_count = n; }
+    int get_aicpu_thread_num() const { return dev.aicpu_thread_num; }
+    void set_aicpu_thread_num(int n) { dev.aicpu_thread_num = n; }
+    Handshake *get_workers() { return dev.workers; }
+    const Handshake *get_workers() const { return dev.workers; }
+
+    // The two bootstrap words move together, so every A5 selection path goes
+    // through here: a resident base surviving a legacy selection would name an
+    // allocation that selection has already released, and a resident mode
+    // without its base would send each AICore to a null context.
+    void publish_scheduler_bootstrap(uint32_t mode, uint64_t worker_context_base) {
+        dev.scheduler_bootstrap.runtime_mode = mode;
+        dev.scheduler_bootstrap.worker_context_base = worker_context_base;
+    }
+    AicoreTeardownControl *get_teardown_gates() { return dev.teardown_gates; }
+    int32_t get_aicpu_allowed_cpu_count() const { return dev.aicpu_allowed_cpu_count; }
+    void set_aicpu_allowed_cpu_count(int32_t n) { dev.aicpu_allowed_cpu_count = n; }
+    int32_t get_aicpu_launch_count() const { return dev.aicpu_launch_count; }
+    void set_aicpu_launch_count(int32_t n) { dev.aicpu_launch_count = n; }
+    int32_t *get_aicpu_allowed_cpus() { return dev.aicpu_allowed_cpus; }
+    size_t aicpu_allowed_cpus_capacity() const {
+        return sizeof(dev.aicpu_allowed_cpus) / sizeof(dev.aicpu_allowed_cpus[0]);
+    }
 
     // =========================================================================
     // Performance Profiling
@@ -268,16 +580,11 @@ public:
     void *get_prebuilt_arena_base() const;
     size_t get_prebuilt_runtime_offset() const;
 
-    // Orchestration metadata written by the platform host (DeviceRunner) at
-    // callable registration. Shared ABI with tensormap_and_ringbuffer; the
-    // host_build_graph device side no longer reads them (host-orch builds the
-    // graph on the host), so only the setter + get_active_callable_id() the
-    // platform reads are exposed.
-    void set_dev_orch_so(uint64_t dev_addr, uint64_t size);
+    // The callable this runtime is stamped with. The platform stores it once the
+    // id is known to be registered, and reads it back on the prepare path to
+    // resolve that callable again.
     void set_active_callable_id(int32_t callable_id);
     int32_t get_active_callable_id() const;
-    void set_device_orch_func_name(const char *name);
-    void set_device_orch_config_name(const char *name);
 
     uint64_t get_function_bin_addr(int func_id) const;
     /**
@@ -298,28 +605,88 @@ public:
      */
     void clear_function_bin_addrs();
 
-    // =========================================================================
-    // Deprecated API (for platform compatibility, always returns 0/nullptr)
-    // Task graph is now managed by RuntimeContext, not Runtime
-    // =========================================================================
+    // Host-side tensor ledger for the run's H2D and D2H transfers. Populated by
+    // runtime_maker.cpp from orch_args at bind time, iterated by
+    // copy_back_run_outputs_impl and released by release_run_bindings_impl.
+    std::vector<TensorLease> &tensor_leases() { return host_.tensor_leases_; }
+    const std::vector<TensorLease> &tensor_leases() const { return host_.tensor_leases_; }
 
-    /** @deprecated Task count is now in shared memory */
-    int get_task_count() const { return 0; }
+    /**
+     * Record this launch shape's AIC/AIV rule: the first `aic_count` of
+     * `worker_count` workers are AIC and the rest AIV.
+     *
+     * Set wherever `worker_count` is, and read by every host consumer of the
+     * rule. Callers must not read `dev.workers[i].core_type` for it — that word
+     * belongs to the core's own report.
+     */
+    void set_core_type_rule(int worker_count, int aic_count) {
+        host_.core_type_rule_.assign(static_cast<size_t>(worker_count < 0 ? 0 : worker_count), CoreType::AIV);
+        for (size_t i = 0; i < host_.core_type_rule_.size() && i < static_cast<size_t>(aic_count < 0 ? 0 : aic_count);
+             ++i) {
+            host_.core_type_rule_[i] = CoreType::AIC;
+        }
+    }
 
-    /** @deprecated RT2 uses DispatchPayload, not Task. Always returns nullptr. */
-    Task *get_task(int) { return nullptr; }
+    /** This launch shape's rule for worker `i`; AIV for an index it never covered. */
+    CoreType core_type_rule(int i) const {
+        if (i < 0 || static_cast<size_t>(i) >= host_.core_type_rule_.size()) return CoreType::AIV;
+        return host_.core_type_rule_[static_cast<size_t>(i)];
+    }
 
-    // Host-side tensor ledger for D2H copy-back at finalize. Populated by
-    // runtime_maker.cpp from orch_args at bind time, then iterated in
-    // validate_runtime_impl. Not read by AICPU/AICore — the device-side
-    // Runtime image also carries the host-only std::vector control block, which
-    // device code must not inspect. No fixed cap — grows with the chip-level
-    // entry-tensor count.
-    std::vector<TensorPair> tensor_pairs_;
+    size_t core_type_rule_count() const { return host_.core_type_rule_.size(); }
 };
 
-// Number of bytes of the Runtime image that must be copied to the device.
-// host_build_graph returns sizeof(Runtime) (its device image is the whole
-// object); trb returns sizeof(DeviceRuntimeLaunchDesc). Defined per-runtime so
-// the shared device_runner_helpers.cpp copy path stays runtime-agnostic.
+// `dev` must be the first member so the narrowed H2D copy starts at offset 0,
+// and the host-only tail must begin no earlier than the descriptor ends — the
+// two together are what keep a field from crossing because of where it was
+// declared. Runtime is not standard-layout (std::vector member + mixed access),
+// so guard the offsetof against -Winvalid-offsetof; offsetof on such a class is
+// conditionally-supported, and both GCC and Clang document that they support it.
+// Mirrors the guard tensormap_and_ringbuffer uses for the same assertion.
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
+#endif
+inline size_t Runtime::device_image_bytes() {
+    // The steady-state image is the descriptor without its handshake region or
+    // its gate tail. The two assertions are what keep that true of the object as
+    // well: `dev` first, and the host-only tail beginning no earlier than the
+    // descriptor ends. Between them a member cannot start travelling, or stop,
+    // because of where it was declared relative to something else.
+    static_assert(offsetof(Runtime, dev) == 0, "DeviceRuntimeLaunchDesc must be the first member of Runtime");
+    static_assert(
+        offsetof(Runtime, host_) >= sizeof(DeviceRuntimeLaunchDesc),
+        "the host-only tail must start at or after the end of the device image"
+    );
+    return offsetof(DeviceRuntimeLaunchDesc, workers);
+}
+
+inline size_t Runtime::device_initialized_prefix_bytes() { return offsetof(DeviceRuntimeLaunchDesc, teardown_gates); }
+
+inline size_t Runtime::device_extent_bytes() { return sizeof(DeviceRuntimeLaunchDesc); }
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
+// The three device lengths of a Runtime image, defined per-runtime so the shared
+// device_runner_helpers.cpp / kernel_persistent_args.cpp paths stay
+// runtime-agnostic. They are ordered
+//   copy_size <= initialized_prefix_size <= extent_size
+// and each names a different question:
+//
+//   copy_size              what a steady-state run re-publishes
+//   initialized_prefix_size what the first publication onto an allocation
+//                          publishes, so the handshake region starts defined
+//   extent_size            what an allocation must reserve
+//
+// Bytes a steady-state run uploads: the descriptor before the handshake region.
 size_t runtime_device_copy_size(const Runtime &rt);
+
+// Bytes the first publication onto a device allocation uploads: through the end
+// of the handshake region, stopping before any host-uninitialized tail.
+size_t runtime_device_initialized_prefix_size(const Runtime &rt);
+
+// Bytes of device memory a Runtime image occupies, and the size every allocation
+// backing a device `Runtime` must use: the device addresses fields inside the
+// tail this exceeds the published prefixes by.
+size_t runtime_device_extent_size(const Runtime &rt);

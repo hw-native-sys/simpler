@@ -50,8 +50,8 @@ __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_c
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &orch_args) {
     const simpler::tmr::Tensor &producer_outputs = orch_args.tensor(0).ref();
     const simpler::tmr::Tensor &consumer_outputs = orch_args.tensor(1).ref();
-    int32_t producer_count = static_cast<int32_t>(orch_args.scalar(0));
-    int32_t consumer_count = static_cast<int32_t>(orch_args.scalar(1));
+    int32_t producer_count = orch_args.scalar<int32_t>(0);
+    int32_t consumer_count = orch_args.scalar<int32_t>(1);
     bool use_real_kernels = orch_args.scalar(2) != 0;
     if (producer_count < 1 || producer_count > MAX_PRODUCERS || consumer_count < 1 || consumer_count > MAX_CONSUMERS) {
         rt_report_fatal(

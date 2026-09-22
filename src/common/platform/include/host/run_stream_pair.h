@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <functional>
@@ -22,11 +23,10 @@
 /**
  * The one AICPU + AICore stream pair every run submits on.
  *
- * A stream is an ordered queue and the execution claim is exclusive, so runs
- * reach the device one at a time and a single pair carries all of them. The
- * pair is not indexed by pipeline slot: a slot exists for resources that
- * *preparation* mutates, and preparing a run writes nothing to a stream — only
- * launch submits, and launch holds the claim.
+ * A stream is an ordered queue, so one pair carries every run. The pair is not
+ * indexed by pipeline slot: a slot exists for resources that *preparation*
+ * mutates, and preparing a run writes nothing to a stream — only launch
+ * submits.
  *
  * The two streams must stay distinct. The AICPU Run kernel spins in the
  * handshake waiting for the AICore workers, so serializing both onto one queue
@@ -38,9 +38,13 @@
  * launch destroys it and creates a replacement. Creating a stream is the only
  * operation known to leave a core free of the previous image's instructions.
  *
- * Only the run that submitted the pair may retire it. A prepared successor
- * overlaps its predecessor's execution, so an unproven retirement from a run
- * that never submitted must leave the live pair alone.
+ * **Submission state is per owner.** More than one run may have submitted and
+ * not yet retired, so a completion, a query and a retirement each name the run
+ * they belong to; a successor's poll must never be answered by a predecessor's
+ * result. Owners are kept in submission order, which is also retirement order.
+ * Replacing the AICore stream still requires that no owner holds the pair, and
+ * an unproven retirement while another owner is live marks the stream stale
+ * instead of destroying it out from under live work.
  *
  * Threading: launch and drain are the owning operations, but poll may query the
  * pair from a progress thread while the executor retires it. The pair therefore
@@ -63,7 +67,10 @@ public:
     /**
      * Ready the pair for a launch: both streams on first use, and a
      * replacement AICore stream when a code publication marked it stale.
-     * Callers hold the execution claim, so the pair is idle here.
+     *
+     * A live owner blocks only the replacement: readying the pair for a run
+     * that joins one already submitted must leave that run's stream and its
+     * recorded state alone.
      */
     int ensure() {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -75,15 +82,11 @@ public:
             }
         }
         if (aicore_ != nullptr) {
+            if (!stale_) return 0;
             // A run that has not retired still owns the pair: a device-complete
             // poll is not a finalized run, and replacing the stream under it
             // would strand a live submission.
-            if (owner_ != nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-            if (!stale_) {
-                submitted_ = false;
-                complete_ = false;
-                return 0;
-            }
+            if (owner_count_ != 0) return PTO_RUNTIME_ERR_INTERNAL;
             int rc = destroy_(aicore_);
             if (rc != 0) return rc;
             aicore_ = nullptr;
@@ -95,8 +98,8 @@ public:
         }
         created_count_.fetch_add(1, std::memory_order_relaxed);
         stale_ = false;
-        submitted_ = false;
-        complete_ = false;
+        last_retired_owner_ = nullptr;
+        last_retired_complete_ = false;
         return 0;
     }
 
@@ -106,56 +109,73 @@ public:
         stale_ = true;
     }
 
-    /** Make the pair visible to non-blocking poll and record its submitter. */
+    /** Make this run's submission visible to poll, in submission order. */
     int mark_submitted(const void *owner) {
         if (owner == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
         std::lock_guard<std::mutex> lock(mutex_);
         if (aicpu_ == nullptr || aicore_ == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-        owner_ = owner;
-        submitted_ = true;
-        complete_ = false;
+        if (owner_count_ >= owners_.size()) return PTO_RUNTIME_ERR_INTERNAL;
+        if (find_owner(owner) != nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+        owners_[owner_count_] = OwnerSlot{owner, false};
+        ++owner_count_;
+        if (last_retired_owner_ == owner) {
+            last_retired_owner_ = nullptr;
+            last_retired_complete_ = false;
+        }
         return 0;
     }
 
     /**
-     * Query both streams without waiting behind retirement.
+     * Query this run's streams without waiting behind retirement.
      *
-     * A completed result is sticky until the pair is readied for its next run,
-     * so a poll racing with successful stream destruction never observes a
-     * missing handle as an error.
+     * A completed result is sticky for the run that produced it until the pair
+     * is readied again, so a poll racing with successful stream destruction
+     * never observes a missing handle as an error. A run that never submitted,
+     * or one whose unproven retirement cleared its completion, answers ERROR.
      */
     template <typename QueryPairFn>
-    int poll(QueryPairFn &&query) {
+    int poll(const void *owner, QueryPairFn &&query) {
         std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
         if (!lock.owns_lock()) return SIMPLER_NATIVE_RUN_POLL_NOT_READY;
-        if (complete_) return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
-        if (!submitted_ || aicpu_ == nullptr || aicore_ == nullptr) {
-            return SIMPLER_NATIVE_RUN_POLL_ERROR;
+        OwnerSlot *slot = find_owner(owner);
+        if (slot == nullptr) {
+            const bool sticky = owner != nullptr && owner == last_retired_owner_ && last_retired_complete_;
+            return sticky ? SIMPLER_NATIVE_RUN_POLL_COMPLETE : SIMPLER_NATIVE_RUN_POLL_ERROR;
         }
+        if (slot->complete) return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+        if (aicpu_ == nullptr || aicore_ == nullptr) return SIMPLER_NATIVE_RUN_POLL_ERROR;
         const int rc = std::forward<QueryPairFn>(query)(aicpu_, aicore_);
-        if (rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE) complete_ = true;
+        if (rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE) slot->complete = true;
         return rc;
     }
 
     /**
-     * Retire the pair on behalf of the run that submitted it. Complete keeps
-     * the AICore stream for the next launch. Unproven destroys it: a failed
-     * launch or an abandoned drain may leave the stream in the error state
-     * rtStreamDestroy is the supported teardown for, and the handle survives a
-     * failed destroy so teardown can retry it. A caller that never submitted
-     * retires nothing.
+     * Retire the pair on behalf of one run that submitted it.
+     *
+     * Complete keeps the AICore stream for the next launch. Unproven with no
+     * other owner destroys it: a failed launch or an abandoned drain may leave
+     * the stream in the error state rtStreamDestroy is the supported teardown
+     * for, and the handle survives a failed destroy so teardown can retry it.
+     * Unproven *while another run still owns the pair* cannot destroy it —
+     * that run's work is still queued on it — so the stream is marked stale
+     * and the last owner's retirement replaces it. A caller that never
+     * submitted retires nothing.
      */
     int retire(CompletionStatus completion_status, const void *owner) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (owner == nullptr || owner_ != owner) return 0;
+        if (owner == nullptr || find_owner(owner) == nullptr) return 0;
         // Publish the proven terminal state before destroying the handle. Poll
         // either finishes its in-flight query first or observes this result.
         // An error-path retirement clears a completion that raced ahead of a
         // later failing sync, so the sync error remains authoritative.
-        submitted_ = false;
-        complete_ = completion_status == CompletionStatus::Complete;
-        owner_ = nullptr;
+        erase_owner(owner);
+        last_retired_owner_ = owner;
+        last_retired_complete_ = completion_status == CompletionStatus::Complete;
         if (completion_status == CompletionStatus::Complete) return 0;
+        if (owner_count_ != 0) {
+            stale_ = true;
+            return 0;
+        }
         if (aicore_ == nullptr) return 0;
         int rc = destroy_(aicore_);
         if (rc != 0) return rc;
@@ -167,9 +187,9 @@ public:
     int destroy() {
         std::lock_guard<std::mutex> lock(mutex_);
         int first_error = 0;
-        submitted_ = false;
-        complete_ = false;
-        owner_ = nullptr;
+        owner_count_ = 0;
+        last_retired_owner_ = nullptr;
+        last_retired_complete_ = false;
         for (void **stream : {&aicpu_, &aicore_}) {
             if (*stream == nullptr) continue;
             int rc = destroy_(*stream);
@@ -191,9 +211,9 @@ public:
         aicpu_ = nullptr;
         aicore_ = nullptr;
         stale_ = false;
-        submitted_ = false;
-        complete_ = false;
-        owner_ = nullptr;
+        owner_count_ = 0;
+        last_retired_owner_ = nullptr;
+        last_retired_complete_ = false;
     }
 
     // Handle reads are unsynchronized: the claim holder is the only writer once
@@ -201,17 +221,70 @@ public:
     void *aicpu() const { return aicpu_; }
     void *aicore() const { return aicore_; }
     bool ready() const { return aicpu_ != nullptr && aicore_ != nullptr; }
+    /**
+     * Whether both handles are gone — a `destroy()` that reported no failure, or an `abandon()`.
+     *
+     * The negation is the load-bearing case: a handle this pair kept because its own destroy
+     * failed may still hold queued instructions, so anything whose safety rests on this pair
+     * being finished has to ask rather than assume the destroy succeeded.
+     */
+    bool retired() const { return aicpu_ == nullptr && aicore_ == nullptr; }
     size_t created_count() const { return created_count_.load(std::memory_order_relaxed); }
+    /** How many runs have submitted on this pair and not yet retired. */
+    size_t live_owner_count() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return owner_count_;
+    }
+
+    /**
+     * Whether the next `ensure()` must replace the AICore stream.
+     *
+     * A joined launch cannot happen across that replacement: the predecessor
+     * is still running on the stream a publication marked stale, so `ensure()`
+     * refuses. Asking first lets the caller leave the successor on the
+     * ordinary path instead of turning a fallback into a launch failure.
+     */
+    bool aicore_replacement_pending() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return stale_ || aicore_ == nullptr;
+    }
 
 private:
+    struct OwnerSlot {
+        const void *owner{nullptr};
+        bool complete{false};
+    };
+
+    OwnerSlot *find_owner(const void *owner) {
+        if (owner == nullptr) return nullptr;
+        for (size_t i = 0; i < owner_count_; ++i) {
+            if (owners_[i].owner == owner) return &owners_[i];
+        }
+        return nullptr;
+    }
+
+    void erase_owner(const void *owner) {
+        for (size_t i = 0; i < owner_count_; ++i) {
+            if (owners_[i].owner != owner) continue;
+            for (size_t j = i + 1; j < owner_count_; ++j)
+                owners_[j - 1] = owners_[j];
+            --owner_count_;
+            owners_[owner_count_] = OwnerSlot{};
+            return;
+        }
+    }
+
     mutable std::mutex mutex_;
     void *aicpu_{nullptr};
     void *aicore_{nullptr};
-    // The run that submitted the pair, or null while no run owns it.
-    const void *owner_{nullptr};
+    // Runs that submitted and have not retired, in submission order.
+    std::array<OwnerSlot, PTO_PIPELINE_MAX_DEPTH> owners_{};
+    size_t owner_count_{0};
+    // The most recent retirement, so a poll arriving after it still reads that
+    // run's proven result instead of an error.
+    const void *last_retired_owner_{nullptr};
+    bool last_retired_complete_{false};
     bool stale_{false};
-    bool submitted_{false};
-    bool complete_{false};
 
     CreateFn create_;
     DestroyFn destroy_;

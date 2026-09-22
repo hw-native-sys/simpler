@@ -315,9 +315,6 @@ std::vector<uint8_t> encode_call_config(const CallConfig &config) {
     put_i32(out, config.enable_pmu);
     put_i32(out, config.enable_dep_gen);
     put_i32(out, config.enable_scope_stats);
-    // CallConfig::capture_clock_anchors is absent on purpose: every ChipWorker
-    // child decides it locally when it reads the config out of its mailbox, so a
-    // transported value would be overwritten before any runtime reads it.
     put_string(out, call_config_prefix(config), MAX_STRING_BYTES, "CallConfig.output_prefix");
     return out;
 }

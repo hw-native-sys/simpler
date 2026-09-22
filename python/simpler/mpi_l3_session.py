@@ -423,6 +423,7 @@ def _run_group_session(  # noqa: PLR0912, PLR0915 -- startup, ordered dispatch, 
         num_sub_workers=int(manifest.get("num_sub_workers", 0)),
         heap_ring_size=int(manifest["heap_ring_size"]) if manifest.get("heap_ring_size") is not None else None,
     )
+    inner_worker._topology_worker_id = int(manifest["worker_id"])
     connection = _InMemoryCommandConnection()
     processor_thread: threading.Thread | None = None
     startup_ok = True

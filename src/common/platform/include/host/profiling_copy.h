@@ -51,7 +51,7 @@ inline int profiling_copy_from_device_for_ops(void *host_dst, const void *dev_sr
 // empty `std::function`, so the leaf collector can call them blindly and
 // `MemoryOps::copy_to_device`/`copy_from_device` ends up correctly null on
 // SVM. Without this, passing `&profiling_copy_to_device_for_ops`
-// unconditionally on a2a3 sim makes `ProfilerBase::start()` pick the
+// unconditionally on a2a3 sim makes `ProfilerBase::set_memory_context()` pick the
 // host-shadow malloc path even though the per-arch copy stubs are no-ops;
 // the shadow ends up detached from the device buffer and AICPU writes
 // never surface to the host (segfault on read).

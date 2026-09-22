@@ -66,12 +66,31 @@ detect_silicon() {
 
     # The retry is keyed on the exit status: a DCMI refusal is written to
     # stdout, so an emptiness test would never fire.
-    local query="npu-smi info -t board -i 0 -c 0"
-    local board chip npu
-    if ! board=$($query 2>/dev/null); then
-        if command -v task-submit >/dev/null 2>&1; then
-            board=$(task-submit --run "$query" 2>/dev/null)
+    local query output status chip npu
+    local board="" errors="" query_ok=0
+    for query in "npu-smi info -t board -i 0 -c 0" "npu-smi info -t board -i 0"; do
+        if output=$($query 2>&1); then
+            board="$output"
+            query_ok=1
+            break
+        else
+            status=$?
         fi
+        errors+="$query (exit=$status):"$'\n'"$output"$'\n'
+        if command -v task-submit >/dev/null 2>&1; then
+            if output=$(task-submit --run "$query" 2>&1); then
+                board="$output"
+                query_ok=1
+                break
+            else
+                status=$?
+            fi
+            errors+="task-submit --run \"$query\" (exit=$status):"$'\n'"$output"$'\n'
+        fi
+    done
+    if [ "$query_ok" -eq 0 ]; then
+        printf 'onboard-arch-precheck: all board queries failed.\n%s' "$errors" >&2
+        return 1
     fi
     chip=$(awk -F: '/Chip Name/ { gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit }' <<<"$board")
     npu=$(awk -F:  '/NPU Name/  { gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit }' <<<"$board")
@@ -98,7 +117,7 @@ detect_silicon() {
     # Construct candidate SoC ini filename. Naming differs per family:
     #   910B series:  Ascend910B3   (chip + npu, no separator)
     #   910 9xxx:     Ascend910_9392 (chip _ npu)
-    #   950 DT/PR:    Ascend950DT_9586 / Ascend950PR_9579 (need glob)
+    #   950 DT/PR:    Ascend950DT_9586 / Ascend950PR_9579
     local soc=""
     case "$chip" in
         Ascend910)
@@ -116,6 +135,9 @@ detect_silicon() {
                 fi
             done
             [ -z "$soc" ] && soc="${chip}_${npu}"
+            ;;
+        Ascend950DT|Ascend950PR)
+            soc="${chip}_${npu}"
             ;;
         *)
             echo "onboard-arch-precheck: unrecognized Chip Name '$chip'. Update check.sh + docs/hardware/chip-architecture.md if a new family was added." >&2

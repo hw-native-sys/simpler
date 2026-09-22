@@ -1,0 +1,137 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+/**
+ * PersistentKernelArgs implementation.
+ *
+ * Linked into both a2a3 and a5 `libhost_runtime.so`, once per runtime variant:
+ * the `KernelArgs` layout and the `Runtime` device-image length both come from
+ * the include path the arch/runtime CMake sets up.
+ */
+
+#include "kernel_persistent_args.h"
+
+#include "common/unified_log.h"
+#include "runtime_c_api.h"
+
+int PersistentKernelArgs::prepare_once(const Runtime &host_runtime, const PersistentArgsOps &ops, uint64_t device_id) {
+    if (prepared_) return 0;
+    if (device_k_args_ != nullptr || args_.runtime_args != nullptr || args_.regs != 0) {
+        LOG_ERROR("PersistentKernelArgs::prepare_once: failed rollback still owns device blocks");
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    if (!ops.valid()) {
+        LOG_ERROR("PersistentKernelArgs::prepare_once: incomplete operation table");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    ops_ = ops;
+
+    // Both runtimes place the device-read descriptor at offset zero; host-only
+    // state stays outside this allocation. This owner allocates exactly once
+    // and relaunches against the same block, so its single copy is that block's
+    // first publication: it carries the initialized prefix — through the
+    // handshake region, which `Runtime()` zeroes — and not the whole extent,
+    // whose tail on some variants is host storage no constructor ever writes.
+    // The allocation still covers the extent, because the device addresses that
+    // range inside this block.
+    const size_t runtime_extent = runtime_device_extent_size(host_runtime);
+    const size_t runtime_bytes = runtime_device_initialized_prefix_size(host_runtime);
+    void *runtime_dev = ops_.alloc(ops_.context, runtime_extent);
+    if (runtime_dev == nullptr) {
+        LOG_ERROR("PersistentKernelArgs::prepare_once: alloc for runtime_args failed");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    args_.runtime_args = reinterpret_cast<Runtime *>(runtime_dev);
+    int rc = ops_.copy_h2d(ops_.context, runtime_dev, runtime_bytes, &host_runtime, runtime_bytes);
+    if (rc != 0) {
+        LOG_ERROR("PersistentKernelArgs::prepare_once: copy of runtime_args failed: %d", rc);
+        (void)finalize_once();
+        return rc;
+    }
+
+    rc = ops_.fill_arch_fields(ops_.context, &args_, device_id);
+    if (rc != 0) {
+        LOG_ERROR("PersistentKernelArgs::prepare_once: arch field init failed: %d", rc);
+        (void)finalize_once();
+        return rc;
+    }
+
+    // Kernel mode selects the handshake protocol that predates the report
+    // epoch: its producer writes no stamp and its consumers keep the
+    // `aicore_done != 0` predicate. Written here rather than left to
+    // value-initialization so the choice is this path's own, and so a future
+    // field added to the block cannot make it drift by accident. A run identity
+    // would be wrong here anyway — this block is filled once and relaunched.
+    //
+    // That single fill is also this block's only handshake initialization. A
+    // kernel-mode AICore launch that ever relaunches against this same region
+    // owes itself a per-run reset or an epoch of its own, because the zeroed
+    // report it starts from is published once and never again.
+    args_.run_result_epoch = 0;
+
+    // Taken last: this is a whole-struct copy of `args_`, so every field the
+    // device reads — including the two blocks above — must already be set.
+    void *device_args = ops_.alloc(ops_.context, sizeof(KernelArgs));
+    if (device_args == nullptr) {
+        LOG_ERROR("PersistentKernelArgs::prepare_once: alloc for device KernelArgs failed");
+        rc = PTO_RUNTIME_ERR_INTERNAL;
+    } else {
+        device_k_args_ = reinterpret_cast<KernelArgs *>(device_args);
+        rc = ops_.copy_h2d(ops_.context, device_args, sizeof(KernelArgs), &args_, sizeof(KernelArgs));
+        if (rc != 0) {
+            LOG_ERROR("PersistentKernelArgs::prepare_once: copy of device KernelArgs failed: %d", rc);
+        }
+    }
+    if (rc != 0) {
+        (void)finalize_once();
+        return rc;
+    }
+
+    prepared_ = true;
+    return 0;
+}
+
+int PersistentKernelArgs::release_block(void *block, int &first_error) {
+    const int rc = ops_.free_(ops_.context, block);
+    if (rc != 0 && first_error == 0) first_error = rc;
+    return rc;
+}
+
+int PersistentKernelArgs::finalize_once() {
+    if (ops_.free_ == nullptr) {
+        device_k_args_ = nullptr;
+        args_ = KernelArgs{};
+        prepared_ = false;
+        return 0;
+    }
+
+    int first_error = 0;
+    if (device_k_args_ != nullptr && release_block(device_k_args_, first_error) == 0) {
+        device_k_args_ = nullptr;
+    }
+    if (args_.regs != 0 && release_block(reinterpret_cast<void *>(args_.regs), first_error) == 0) {
+        args_.regs = 0;
+    }
+    if (args_.runtime_args != nullptr && release_block(args_.runtime_args, first_error) == 0) {
+        args_.runtime_args = nullptr;
+    }
+    if (first_error != 0) return first_error;
+
+    args_ = KernelArgs{};
+    prepared_ = false;
+    return 0;
+}
+
+void PersistentKernelArgs::abandon() {
+    args_ = KernelArgs{};
+    device_k_args_ = nullptr;
+    ops_ = {};
+    prepared_ = false;
+}

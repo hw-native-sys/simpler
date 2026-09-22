@@ -111,8 +111,8 @@ echo "$RECORDS"          # must name exactly one file; empty ⇒ this run wrote 
                          # so stop rather than reading a previous run's artifact
 D=$(dirname "$RECORDS")
 grep -c 'name=chip.run.bind\.' "$D"/host.*.log   # must be > 0; $LOG has none in this mode
-# The clock anchors are split — the invoking process wrote its own to $LOG, each
-# chip child wrote its own under $D — so parse the concatenation, not either half.
+# The spans are split — the invoking process wrote its own to $LOG, each chip
+# child wrote its own under $D — so parse the concatenation, not either half.
 cat "$LOG" "$D"/host.*.log > "$D/bind_timeline.log"
 python -m simpler_setup.tools.strace_timing "$D/bind_timeline.log" \
   --host-phase-records "$RECORDS" \
@@ -125,8 +125,13 @@ python -m simpler_setup.tools.strace_timing "$D/bind_timeline.log" \
   `$D/host.*.log` for timeline mode — and the table shows a `[stamp]` line.
 - Quote the stamp with the number. A number without the command and commit that
   produced it cannot be compared to anything.
-- Comparing two branches has three more rules, all of them learned the hard way —
-  follow **Comparing two branches** in the doc rather than reasoning it out here.
+- Before an A/B, check the recording sites at both commits as required by
+  **Comparing two branches** in the doc. Identical segment names do not guarantee
+  identical coverage: #2353 makes `graph_upload` copy-only and leaves Definition
+  preparation outside the reported three-segment subtotal. Do not report that
+  subtotal as the complete control plane or infer a speedup across this boundary.
+- Follow the remaining comparison rules in that section, including interleaving
+  the arms and taking minima of per-bind sums.
 
 For on-device latency instead, use [`benchmark`](../benchmark/SKILL.md) or
 [`perf-example-device`](../perf-example-device/SKILL.md).

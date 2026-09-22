@@ -216,7 +216,7 @@ symmetric window is realized:
 | Window memory | POSIX shm + `ftruncate`, mmap'd per rank | a2a3: Fabric V2 handle exchange (`ACL_MEM_SHARE_HANDLE_TYPE_FABRIC`), falling back to VMM + shareable-handle IPC where Fabric is unsupported. a5: VMM shareable handles only. Cross-card P2P via `aclrtDeviceEnablePeerAccess` on both |
 | Subset barrier | shm-header atomic, `allocation_id`-scoped | file barriers, `allocation_id`-scoped |
 | Window init | window zeroed before the subset barrier (`memset`) | window zeroed before the handle is announced (`aclrtMemset`) |
-| Async-DMA workspace | opt-in per Worker (`enable_sdma`, provisions inert 16 KiB scratch without STARS streams) | a2a3: opt-in per Worker (`enable_sdma`); a5: SDMA by default, URMA as an opt-in alternative |
+| Async-DMA workspace | opt-in per Worker (`enable_sdma`, provisions inert 16 KiB scratch without STARS streams) | a2a3: opt-in per Worker (`enable_sdma`); a5: SDMA by default, URMA or RDMA as an opt-in alternative |
 
 The window is zero-initialized on both backends so scratch/signal protocols see
 a known starting state (matching the historical static-path contract).
@@ -277,6 +277,47 @@ kernel's `get_dma_workspace` is unverified rather than closed. Simulation, a5,
 and provider-disabled builds fail Worker init fast when it is set. A5 provisions
 its communication-context SDMA workspace by default; this is separate from
 the Worker-level workspace mechanism controlled by `enable_sdma`.
+
+On a5, `SIMPLER_ENABLE_PTO_RDMA_WORKSPACE=ON` selects the HNS1825 RDMA
+workspace overlay instead. RDMA is mutually exclusive with the SDMA and URMA
+overlays because `CommContext` exposes a single `workSpace`/`workSpaceSize`
+pair. The first RDMA integration only supports `orch.allocate_domain()`
+dynamic domains; it does not support `comm_derive_context()`, sim platforms,
+a2a3, or `host_build_graph`. RDMA kernels derive remote WQE addresses from the
+RDMA workspace peer MR base plus a local-window offset, not from
+`CommContext::windowsIn[peer]` — the symmetric window is a low-GM-segment
+`aclrtMalloc` buffer the HNS1825 NIC can DMA to, and peers are reached over
+RoCE by rkey + VA.
+
+**RDMA-only domain (caller precondition).** Under the RDMA overlay the domain
+allocation path intentionally skips peer import and mapping: `windowsIn[peer]`
+stays zero for every remote rank, and there is no locally addressable mapped VA
+for a peer's window. A peer MR address (`rkey` + VA) is not a substitute — only
+the NIC can dereference it. Consequently, a kernel that computes
+`windowsIn[peer] + offset` and issues a synchronous `TPUT`/`TGET` against that
+address cannot run on an RDMA domain unchanged; it must use the asynchronous
+RDMA path (`TGET_ASYNC`/`TPUT_ASYNC<DmaEngine::RDMA>`), which carries the peer
+MR base and rkey instead of a local VA. Switching a workload from SDMA/URMA to
+RDMA is therefore a kernel contract change, not a configuration flip.
+
+**Single-producer submission (caller precondition).** Multiple AICores (AIVs)
+submitting through the same workspace and the same peer/QP read and write the
+same SQ head and WQE slot with no multi-producer reservation — the posting path
+reads the SQ head, fills the WQE at that slot, and advances the head. Concurrent
+submissions to one peer/QP can therefore overwrite or lose a request. Callers
+must serialize submissions to a given peer/QP; the `rdma_deferred_completion_demo`
+relies on its inter-kernel marker dependencies to order the submissions it makes
+to each peer. This is a documented constraint, not a supported multi-producer
+contract.
+
+**Completion consumption.** Deferred completions are consumed by the AICPU
+scheduler poller, which advances the shared CQ consumer index and mirrors it
+into the CQ tail and the SQ tail record (matching the pinned PTO
+`RingCqDoorbell`). The AICore post path reads that same SQ tail to decide when
+to drain the CQ before the SQ fills (`head - tail >= depth - threshold`).
+Because both the poller and the AICore-side drain advance the same monotonic
+index, a submission that triggers an AICore-side drain consumes only the CQEs
+still outstanding at that point; the AICPU poller never re-consumes them.
 
 ---
 

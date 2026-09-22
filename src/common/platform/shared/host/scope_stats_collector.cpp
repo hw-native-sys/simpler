@@ -180,7 +180,7 @@ void ScopeStatsCollector::begin_run() {
             offsetof(ScopeStatsBufferState, dropped_record_count) + sizeof(uint32_t),
         "the two counters must stay adjacent for this single write-back to cover both"
     );
-    (void)manager_.write_range_to_device(&state->dropped_record_count, 2 * sizeof(uint32_t));
+    publish_field(&state->dropped_record_count, 2 * sizeof(uint32_t), "record counters");
 }
 
 void ScopeStatsCollector::append_buffer_records(const void *buf_host_ptr) {
@@ -192,12 +192,34 @@ void ScopeStatsCollector::append_buffer_records(const void *buf_host_ptr) {
     if (n == 0) return;
 
     std::scoped_lock lock(records_mutex_);
-    records_.insert(records_.end(), buf->records, buf->records + n);
+    // Identity comes from the same 64-byte header copy that carried `count`,
+    // and is stored per record so it survives the device buffer going back to
+    // the pool and being re-stamped by a later run.
+    const uint64_t run_epoch = buf->run_epoch;
+    const uint32_t local_seq = buf->local_seq;
+    records_.reserve(records_.size() + n);
+    for (uint32_t i = 0; i < n; i++) {
+        records_.push_back(CollectedScopeStatsRecord{buf->records[i], run_epoch, local_seq, 0});
+    }
     total_collected_ += n;
 }
 
 void ScopeStatsCollector::on_buffer_collected(const ScopeStatsReadyBufferInfo &info) {
     append_buffer_records(info.host_buffer_ptr);
+}
+
+std::vector<CollectedScopeStatsRecord> ScopeStatsCollector::collected_records() const {
+    std::scoped_lock lock(records_mutex_);
+    return records_;
+}
+
+size_t ScopeStatsCollector::collected_for_run(uint64_t run_epoch) const {
+    std::scoped_lock lock(records_mutex_);
+    size_t n = 0;
+    for (const CollectedScopeStatsRecord &collected : records_) {
+        if (collected.run_epoch == run_epoch) n++;
+    }
+    return n;
 }
 
 // ---------------------------------------------------------------------------
@@ -206,6 +228,7 @@ void ScopeStatsCollector::on_buffer_collected(const ScopeStatsReadyBufferInfo &i
 
 bool ScopeStatsCollector::reconcile_counters() {
     if (shm_host_ == nullptr) return false;
+    report_drain_drops();
 
     // Pull the latest BufferState (current_buf_ptr, total/dropped counters)
     // before the cross-check so it sees post-stop() device state.
@@ -332,9 +355,10 @@ int ScopeStatsCollector::write_jsonl(const std::string &output_dir) {
     // parsing + per-call FILE locking on ~6×N calls was the dominant host cost.
     std::scoped_lock lock(records_mutex_);
     std::string out;
-    out.reserve(records_.size() * 384);
-    char line[512];
-    for (const ScopeStatsRecord &rec : records_) {
+    out.reserve(records_.size() * 448);
+    char line[640];
+    for (const CollectedScopeStatsRecord &collected : records_) {
+        const ScopeStatsRecord &rec = collected.record;
         const int site_len = static_cast<int>(strnlen(rec.site_file_basename, sizeof(rec.site_file_basename)));
         const char *phase = (rec.phase == SCOPE_STATS_PHASE_BEGIN) ? "begin" : "end";
         int n = std::snprintf(
@@ -343,9 +367,10 @@ int ScopeStatsCollector::write_jsonl(const std::string &output_dir) {
             "\"task_window_start\": %d, \"task_window_end\": %d, "
             "\"heap_start\": %" PRIu64 ", \"heap_end\": %" PRIu64 ", "
             "\"dep_pool_start\": %d, \"dep_pool_end\": %d, "
-            "\"tensormap\": %d}\n",
+            "\"tensormap\": %d, \"run_epoch\": %" PRIu64 ", \"buf_seq\": %u}\n",
             site_len, rec.site_file_basename, rec.site_line, phase, rec.depth, rec.ring_id, rec.task_start,
-            rec.task_end, rec.heap_start, rec.heap_end, rec.dep_pool_start, rec.dep_pool_end, rec.tensormap_used
+            rec.task_end, rec.heap_start, rec.heap_end, rec.dep_pool_start, rec.dep_pool_end, rec.tensormap_used,
+            collected.run_epoch, collected.local_seq
         );
         if (n > 0) out.append(line, static_cast<size_t>(n < static_cast<int>(sizeof(line)) ? n : sizeof(line) - 1));
     }

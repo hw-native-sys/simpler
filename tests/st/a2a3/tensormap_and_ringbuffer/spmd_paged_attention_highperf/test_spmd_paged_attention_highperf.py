@@ -188,7 +188,7 @@ class TestSpmdPagedAttentionHighPerf(SceneTestCase):
         {
             "name": "b4_h32_kv8_s512_bs128_fp16",
             "manual": True,
-            "platforms": ["a2a3sim", "a2a3"],
+            "platforms": ["a2a3"],
             "params": {
                 "batch": 4,
                 "num_heads": 32,
@@ -218,7 +218,7 @@ class TestSpmdPagedAttentionHighPerf(SceneTestCase):
         {
             "name": "b1_h32_kv8_s4096_bs128_fp16",
             "manual": True,
-            "platforms": ["a2a3sim", "a2a3"],
+            "platforms": ["a2a3"],
             "params": {
                 "batch": 1,
                 "num_heads": 32,

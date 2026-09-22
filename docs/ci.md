@@ -427,6 +427,16 @@ GoogleTest-based tests for pure C++ modules. Run via ctest, filtered by label `-
 | a2a3 | `ctest --test-dir tests/ut/cpp/build -L "^requires_hardware(_a2a3)?$"` |
 | a5 | `ctest --test-dir tests/ut/cpp/build -L "^requires_hardware(_a5)?$"` |
 
+The no-hardware job follows ctest with two checks that read the build rather
+than run it, catching what ctest structurally cannot.
+`tests/lint/check_ut_cpp_axis.py`: a case built for one arch or one runtime
+passes exactly like one built for every configuration.
+`tests/lint/check_ut_cpp_stub_linkage.py`: a stub the support archive lost to a
+weak fallback links fine and then hangs, so ctest only reaches it by timing
+out. The first reads the build's compile lines, so that job configures with
+`-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`. See
+[testing.md](testing.md#how-many-times-a-case-is-built).
+
 ### `examples/` — Small examples (sim + onboard)
 
 Small, fast examples that run on both simulation and real hardware. Organized as `examples/{arch}/{runtime}/{name}/`. Discovered and executed by pytest via each example's `test_*.py` (`@scene_test` format).

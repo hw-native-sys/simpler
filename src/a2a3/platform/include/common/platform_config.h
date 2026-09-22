@@ -90,6 +90,15 @@ constexpr uint64_t PLATFORM_OP_EXECUTE_TIMEOUT_US = 45000000;  // 45s
 constexpr int32_t PLATFORM_SCHEDULER_TIMEOUT_MS = 20000;
 
 /**
+ * Tensor data spin-wait timeout defaults (milliseconds).
+ * The AICPU platform variant selects one value as
+ * PLATFORM_TENSOR_DATA_WAIT_TIMEOUT_MS in spin_hint.h. Simulation keeps a
+ * larger budget because its AICPU and AICore threads share host CPU resources.
+ */
+constexpr int32_t PLATFORM_ONBOARD_TENSOR_DATA_WAIT_TIMEOUT_MS = 15000;
+constexpr int32_t PLATFORM_SIM_TENSOR_DATA_WAIT_TIMEOUT_MS = 30000;
+
+/**
  * Default host-side stream synchronization timeout (milliseconds).
  * Passed to aclrtSynchronizeStreamWithTimeout to detect stream sync hangs.
  * Must be longer than PLATFORM_OP_EXECUTE_TIMEOUT_US so the host waits for

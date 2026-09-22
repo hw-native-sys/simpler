@@ -429,7 +429,11 @@ inline void bind_worker(nb::module_ &m) {
         )
         .def(
             "configure_pipeline_depth", &Worker::configure_pipeline_depth, nb::arg("depth"),
-            "Set run admission depth from the minimum direct-chip runtime capability before init."
+            nb::arg("pending_depth") = 0, nb::arg("launch_depth") = 1,
+            "Set run admission depth from the minimum direct-chip runtime capability before init. "
+            "`pending_depth` bounds non-terminal logical runs instead, and 0 derives it from `depth`. "
+            "`launch_depth` bounds how many runs may have their device work launched at once; 1 keeps a "
+            "successor's work off the device until its predecessor is terminal."
         )
         .def(
             "add_sub_worker",
@@ -898,6 +902,13 @@ inline void bind_worker(nb::module_ &m) {
     mailbox_dispositions["NATIVE_PREPARED"] = static_cast<int32_t>(MailboxPreparationDisposition::NATIVE_PREPARED);
     m.attr("MAILBOX_PREPARATION_DISPOSITION_VALUES") = mailbox_dispositions;
     m.attr("PTO_PIPELINE_MAX_DEPTH") = static_cast<uint32_t>(PTO_PIPELINE_MAX_DEPTH);
+    // The teardown record's placement and size, so the Python producer and
+    // consumer cannot drift from the C++ trailer layout.
+    m.attr("MAILBOX_OFF_TEARDOWN_REPORT") = static_cast<int>(MAILBOX_OFF_TEARDOWN_REPORT);
+    m.attr("SIMPLER_TEARDOWN_REPORT_BYTES") = static_cast<int>(SIMPLER_TEARDOWN_REPORT_BYTES);
+    m.attr("TEARDOWN_REPORT_SCHEMA") = static_cast<int>(TEARDOWN_REPORT_SCHEMA);
+    m.attr("MAILBOX_ARGS_CAPACITY") = static_cast<int>(MAILBOX_ARGS_CAPACITY);
+    m.attr("MAILBOX_TASK_PROTOCOL_VERSION") = static_cast<uint32_t>(MAILBOX_TASK_PROTOCOL_VERSION);
     m.attr("MAX_RING_DEPTH") = static_cast<int32_t>(MAX_RING_DEPTH);
     m.attr("MAX_SCOPE_DEPTH") = static_cast<int32_t>(MAX_SCOPE_DEPTH);
 

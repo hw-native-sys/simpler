@@ -17,10 +17,34 @@
 # The "orchestration" directory contains source files compiled into both
 # runtime targets AND the orchestration .so (e.g., tensor methods needed
 # by the Tensor constructor's validation logic).
+#
+# src/common/tensormap_and_ringbuffer holds the sources shared with the other
+# architecture. Its .cpp files sit under a "host" subdirectory naming the target
+# that compiles them; headers stay flat there. Those sources still include this
+# runtime's headers by bare name (dep_gen_replay.cpp takes dep_compute.h,
+# tensormap.h and tensor.h) and resolve them to whichever architecture's
+# "runtime" directory is on the include path, which is what lets one source
+# produce per-arch object code.
+SHARED = "../../../common/tensormap_and_ringbuffer"
+
+# SHARED sits last in every include_dirs list, the way host_build_graph orders its
+# own: src/common/tensormap_and_ringbuffer and this architecture's "runtime"
+# directory both hold a tensormap.h and a tensor.h, and the bare-name includes
+# described above have to keep resolving to the architecture's. Being on the path at
+# all is what lets platform headers reach task_id.h by bare name.
 
 BUILD_CONFIG = {
-    "aicore": {"include_dirs": ["runtime", "common", ".."], "source_dirs": ["aicore", "orchestration"]},
-    "aicpu": {"include_dirs": ["runtime", "common", ".."], "source_dirs": ["aicpu", "runtime", "orchestration"]},
-    "host": {"include_dirs": ["runtime", "common", ".."], "source_dirs": ["host", "runtime/shared", "orchestration"]},
-    "orchestration": {"include_dirs": ["runtime", "orchestration", "common", ".."], "source_dirs": ["orchestration"]},
+    "aicore": {"include_dirs": ["runtime", "common", "..", SHARED], "source_dirs": ["aicore", "orchestration"]},
+    "aicpu": {
+        "include_dirs": ["runtime", "common", "..", SHARED],
+        "source_dirs": ["aicpu", "runtime", "orchestration"],
+    },
+    "host": {
+        "include_dirs": ["runtime", "common", "..", SHARED],
+        "source_dirs": ["host", "runtime/shared", "orchestration", f"{SHARED}/host"],
+    },
+    "orchestration": {
+        "include_dirs": ["runtime", "orchestration", "common", "..", SHARED],
+        "source_dirs": ["orchestration"],
+    },
 }

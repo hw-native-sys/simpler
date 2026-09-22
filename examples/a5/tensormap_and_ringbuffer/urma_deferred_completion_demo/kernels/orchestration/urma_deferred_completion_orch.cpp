@@ -35,7 +35,7 @@ __attribute__((visibility("default"))) void urma_deferred_completion_orchestrati
     const simpler::tmr::Tensor &input = orch_args.tensor(0).ref();
     const simpler::tmr::Tensor &out = orch_args.tensor(1).ref();
     const simpler::tmr::Tensor &result = orch_args.tensor(2).ref();
-    auto *comm_ctx = reinterpret_cast<CommContext *>(static_cast<uintptr_t>(orch_args.scalar(0)));
+    auto *comm_ctx = reinterpret_cast<CommContext *>(orch_args.scalar<uintptr_t>(0));
 
     CoreTaskArgs producer_args;
     producer_args.add_input(input);

@@ -70,9 +70,11 @@ EXPECTED_TASKS = 5
 EXPECTED_EDGES = 6
 
 # An aicore_tasks record is
-# [core_id, task_token_raw, reg_task_id, start_cycles, end_cycles, receive_to_start_cycles].
+# [core_id, task_token_raw, reg_task_id, start_cycles, end_cycles,
+#  receive_to_start_cycles, run_epoch].
 RECORD_START = 3
 RECORD_END = 4
+RECORD_EPOCH = 6
 
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
@@ -193,10 +195,25 @@ class TestCollectorResidency(SceneTestCase):
         # the previous one's. Re-exported stale records fail this while matching
         # on every other observable.
         previous_end = None
+        previous_epoch = None
         for run_index, prefix in enumerate(artifacts):
             records = self._aicore_records(prefix)
             first_start = min(record[RECORD_START] for record in records)
             last_end = max(record[RECORD_END] for record in records)
+            # The time window is a proxy; the stamped identity is the direct
+            # discriminator. A re-exported stale record carries the epoch of the
+            # run that produced it, so it cannot pass as this run's.
+            epochs = {record[RECORD_EPOCH] for record in records}
+            assert len(epochs) == 1, f"run {run_index}'s export mixes epochs {sorted(epochs)}"
+            epoch = epochs.pop()
+            assert epoch != 0, f"run {run_index}'s records carry no run identity"
+            if previous_epoch is not None:
+                assert epoch > previous_epoch, (
+                    f"run {run_index} exported epoch {epoch}, which does not follow run "
+                    f"{run_index - 1}'s {previous_epoch}. A resident collector that re-exports the "
+                    f"previous run's merged records shows up here as a repeated epoch."
+                )
+            previous_epoch = epoch
             if previous_end is not None:
                 assert first_start > previous_end, (
                     f"run {run_index}'s records start at {first_start}, which is not after run "

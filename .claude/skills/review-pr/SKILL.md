@@ -110,8 +110,8 @@ avoid overwhelming context.
 ## Step 3.5: Categorize and Size the Changes
 
 Break the diff into buckets and count changed lines (added + deleted,
-i.e. churn) per bucket. This feeds the Step 8 "Change Breakdown"
-section and drives the oversized-PR warnings.
+i.e. churn) per bucket. This feeds Step 8's Appendix A (Change
+Breakdown) and drives the oversized-PR warnings.
 
 **Precedence:** classify by file type / purpose first (Test/Examples,
 Build, Docs), then by source-tree location (Core), then everything
@@ -188,8 +188,8 @@ git diff "$MERGE_BASE"...HEAD --numstat | awk -F'\t' '
 - **Core churn > 1000 lines** → ❌ stronger oversized-PR warning. Core
   is the real logic under `src/` / `python/` / `simpler_setup/`; when
   it alone exceeds 1000 lines the PR cannot be held in head in one
-  pass. Recommend split and require the Step 5.5 Mechanism Brief plus a
-  reviewer-friendly commit review order.
+  pass. Recommend split and require the Mechanism Brief (Step 5.5,
+  rendered in §2) plus a reviewer-friendly commit review order.
 
 ## Step 4: Extract the Stated Goal(s)
 
@@ -229,9 +229,9 @@ git log --format='%s%n%n%b%n---' "$MERGE_BASE"..HEAD
 
 ### Producing the Stated Goal
 
-Write your Stated Goal section using **the most ambitious / most
-authoritative** source that's coherent with the others. Then explicitly
-note any *narrower* sources:
+Record the stated goal (rendered in §1 of the review) using **the most
+ambitious / most authoritative** source that's coherent with the
+others. Then explicitly note any *narrower* sources:
 
 - If the user said "should do X" and the PR body says "adds primitive
   for X-helper", **state X as the goal** and record "PR body downgrades
@@ -279,7 +279,8 @@ goal to match the code.
 
 ## Step 5.5: Mechanism Brief
 
-**Required for PRs over ~500 lines or 3+ files. Recommended otherwise.**
+**Required for PRs over ~500 lines or 3+ files; recommended
+otherwise; a trivial PR (single-file, < ~50 lines) may omit it.**
 
 Write a Mechanism Brief that walks a reader through the PR's design from
 scratch. The audience is anyone who will later need to reason about this
@@ -326,7 +327,7 @@ For each row, mark one of:
   the goal, or the code needs to go.
 
 ❌ and ➕ rows are must-discuss before approval. ⚠️ rows feed Step 8's
-Issues list (typically as Should-fix or Consider). ✅ rows need no
+§4 issue list (typically as Should-fix or Consider). ✅ rows need no
 further action but document that the goal landed.
 
 This table also makes asymmetries obvious: if a PR has 8 stated goals
@@ -470,7 +471,7 @@ echo "new pto includes:";        printf '%s\n' "$NEW_PTO_INC"
 **Decision — two severity levels:**
 
 - `PIN_ACTIVE=0` → pin check is **skipped** (repo runs on latest main/master). Record one line ("pto-isa unpinned — using latest; pin check skipped") and stop this step.
-- `PIN_ACTIVE=1` **and no** pto-isa header-reference change (`PTO_REFS` and `NEW_PTO_INC` both empty) → render the Step 8 "pto-isa Pin Check" paragraph at the default level, an **advisory**: a light, always-on reminder that the pin exists and may need bumping. This level surfaces whenever the pin is active — even when the diff does not touch the pto-isa cone — so the human is nudged to confirm the pinned commit is still adequate. It does not by itself block the merge.
+- `PIN_ACTIVE=1` **and no** pto-isa header-reference change (`PTO_REFS` and `NEW_PTO_INC` both empty) → render the Step 8 Appendix B (pto-isa Pin Check) paragraph at the default level, an **advisory**: a light, always-on reminder that the pin exists and may need bumping. This level surfaces whenever the pin is active — even when the diff does not touch the pto-isa cone — so the human is nudged to confirm the pinned commit is still adequate. It does not by itself block the merge.
 - `PIN_ACTIVE=1` **and** a pto-isa header reference changed (`PTO_REFS` or `NEW_PTO_INC` non-empty) → escalate one level to a **recommendation**: the pinned commit likely no longer matches the headers the PR references, so a bump is probably required, not merely worth checking. Escalating signals:
   1. `PTO_REFS` — a referenced pto-isa header **path** changed (e.g. `pto/npu/comm/async/sdma/sdma_workspace_manager.hpp` → `pto/comm/async/sdma/sdma_workspace_manager.hpp`). The PR is adapting to a pto-isa header-tree reorg → the pinned commit almost certainly must bump to the revision with the new layout. This is the strongest pin-bump signal.
   2. `NEW_PTO_INC` — the PR newly references a pto-isa header not used before → may need a newer pin that provides it.
@@ -479,7 +480,7 @@ echo "new pto includes:";        printf '%s\n' "$NEW_PTO_INC"
 
 Note: this detects *include-path* changes, **not** edits to files that merely happen to `#include` pto-isa. A logic-only change inside an existing pto-isa consumer keeps the paragraph at the default advisory level — it does not by itself escalate.
 
-**What to convey (both levels):** the current pinned SHA from `pto_isa.pin`; and that a pin bump requires rebuilding onboard `a2a3` `host_runtime.so` against the new commit via `--config-settings=cmake.define.SIMPLER_PTO_ISA_BUILD_COMMIT=<sha>` (the SDMA headers are compiled into `host_runtime.so`; see `docs/developer-guide.md`, issue #1067). The exact wording per level is given by the Step 8 blockquotes.
+**What to convey (both levels):** the current pinned SHA from `pto_isa.pin`; and that a pin bump requires rebuilding onboard `a2a3` `host_runtime.so` against the new commit via `--config-settings=cmake.define.SIMPLER_PTO_ISA_BUILD_COMMIT=<sha>` (the SDMA headers are compiled into `host_runtime.so`; see `docs/developer-guide.md`, issue #1067). The exact wording per level is given by the Appendix B blockquotes in Step 8.
 
 ## Step 7: Optional Cross-Check with External CLI Reviewers
 
@@ -511,7 +512,7 @@ case " $REVIEW_ARGS " in *" gemini "*) WANT_GEMINI=1 ;; esac
 ```
 
 If the user opted in but the requested binary isn't on PATH, note it
-in "Independent Reviewer Notes" and proceed without it. If neither
+in Appendix C (Independent Reviewer Notes) and proceed without it. If neither
 flag is set, skip the rest of Step 7 entirely.
 
 The CLIs run as **independent** second opinions — each runs in its
@@ -653,24 +654,165 @@ check:
    without a concrete "allocated here, never freed on path X" trace is
    speculative. Drop it.
 
-Only findings that survive these checks land in Step 8's Independent
-Reviewer Notes. In that section, also record findings you dropped (one
+Only findings that survive these checks may be surfaced in the review
+itself — they enter the §4 issue list like any of your own findings.
+Step 8's Appendix C (Independent Reviewer Notes) then records, per
+reviewer, both the findings you surfaced and the ones you dropped (one
 line each) so the human can audit your filtering.
 
 ## Step 8: Write the Review
 
-Structure:
+Order the review by **reader logic** — background/problem → solution →
+coverage → residual → verdict — not by the order the analysis steps
+ran. Sections 0–5 are a fixed frame: fill each one, in order, and put
+each piece of analysis output in the section named below — the frame
+exists precisely so the review cannot drift into free-form commentary.
+The mechanical outputs (change breakdown, pin check, external-reviewer
+notes) go in the appendices so they support the narrative without
+interrupting it. Everything Steps 3.5–7 produced still lands somewhere
+below — nothing is dropped, only reordered.
 
-### Stated Goal
+**Trivial-PR exception**: a trivial PR (single-file, < ~50 changed
+lines) may collapse the frame to §0, §4, and §5 — §0 then carries the
+problem and the solution in one sentence each. Anything larger fills
+every section, in order. The appendices follow their own rules
+regardless of size.
 
-From Step 4.
+### 0. Summary
 
-### Real Goal (as read from the code)
+One or two lines: *this PR solves problem P by method M; remaining
+R; verdict: approve / request changes / needs discussion.* After
+this line the reader knows whether they need to read further.
 
-From Step 5. If it matches the stated goal, say so in one line and move
-on. If it mismatches, this section is the headline finding.
+### 1. Background and Problem Statement
 
-### Change Breakdown
+Written for a reviewer who does **not** know this corner of the
+codebase. Two layers, in this order:
+
+- **Background first.** What the relevant mechanism does today and why
+  it has its current shape — the minimum context (from your Step 5.5
+  reading of the surrounding code) without which the problem statement
+  reads as jargon. The test: after the background paragraph, the
+  reader must be able to see *why this problem can arise at all*.
+- **Then the problem.** What is wrong or missing in the current
+  behavior. Merge Step 4 (stated goal) here: state the goal in your
+  own words, and if the goal sources disagree — user description vs.
+  linked issue vs. PR body, especially a goal downgrade — that
+  discrepancy is the **headline of this section**.
+
+**A concrete example is mandatory:**
+
+- Bugfix → the triggering input/state and the wrong behavior ("with
+  input X in state Y, output is Z instead of W").
+- Feature → one concrete use case impossible before and possible
+  after (ideally a short code/command snippet).
+- Refactor/chore → a snippet of current code that shows the pain.
+
+### 2. Solution and Rationale
+
+Two questions, both answered here:
+
+- **What the method is** — the Mechanism Brief (Step 5.5): mechanism,
+  central abstractions, key design choices. Depth scales with PR size
+  exactly as Step 5.5 prescribes — required over ~500 lines or 3+
+  files; recommended otherwise; omittable only for trivial PRs
+  (single-file, < ~50 lines).
+- **Why this method solves the §1 problem** — the causal argument
+  from mechanism to problem. This absorbs the type-specific
+  correctness reasoning from Step 6 (bugfix: how the changed lines
+  restore correct behavior under the trigger; feature: how it fits
+  the existing design and extension points). Also: why this shape
+  rather than the plausible alternatives (Feature checklist #8).
+  The routing rule for all of Step 6's output: checklist items that
+  yield design reasoning (needed-ness, design fit, blast radius,
+  boundary and error-path walkthroughs, the concurrency model) are
+  woven into this section; items that yield findings go to the §4
+  issue list.
+
+**Reuse the §1 example as a before/after**: show the behavior or code
+path with and without the PR. One example threaded through §1 and §2
+costs the reader one mental context, not two. This is the section
+that proves you understood the PR; omitting it on a large PR makes
+the rest of the review look like nitpicking.
+
+### 3. Implementation–Claim Consistency
+
+A solution narrative can read as valid while the diff does not deliver
+it. This section checks the implementation against the PR body and
+commit messages, in **both** directions:
+
+- The Goal-Method Traceability table (Step 5.7), rendered as a
+  **markdown table plus footnotes — never reformatted into a
+  vertical list or card layout**, no matter how long the content
+  is. Cells hold short phrases only; the detailed explanation of any
+  ⚠️ / ❌ / ➕ row goes into a numbered footnote (`[1]`, `[2]`, ...)
+  directly below the table, referenced from the Assessment cell.
+  ❌ rows = claimed but not implemented (incomplete work); ➕ rows =
+  implemented but never claimed (scope creep). Both are must-discuss.
+  Sole exception to the table form: when the table is short (< 3
+  rows) and every row is ✅, it may be replaced by one prose sentence
+  stating that every stated goal traced to its implementation; any
+  ⚠️ / ❌ / ➕ row forces the table.
+- The stated-vs-real mismatch classes from Step 5 (stated as bugfix
+  but adds functionality, stated as refactor but changes behavior)
+  are reported here — never silently papered over. When the stated
+  and real goals match, say so explicitly in one line: the reader
+  must be able to tell "checked and consistent" from "not checked".
+- Test coverage as claimed: does the PR body's Testing section match
+  what the diff and CI actually ran? For a bugfix, does a regression
+  test exist that fails pre-fix and passes post-fix (Bugfix checklist
+  #4)? A gap found here is recorded and carried into §4 as an issue.
+
+### 4. Residual Issues and Risks
+
+Three sub-lists; give each entry a concrete example where possible:
+
+- **Uncovered cases** — ❌ traceability rows and stated-goal parts not
+  done; name an input/scenario that still fails after merge.
+- **New risks/costs introduced** — ➕ rows, concurrency or ABI
+  hazards, maintenance weight from churn.
+- **Follow-up work** — TODOs, deferred items, docs to sync.
+
+Then the severity-ranked issue list:
+
+- **Must fix**: bugs, correctness issues, security problems,
+  unresolved goal-vs-code mismatches, ❌ / ➕ traceability rows.
+  **Every Must-fix carries a failure example** — concrete input/state
+  → wrong result. "There is a race here" without a named interleaving
+  is not a Must-fix.
+- **Should fix**: style violations per `.claude/rules/`, missing
+  tests for bugfixes, doc/comment drift, ⚠️ traceability rows with
+  user-visible impact, string-matching error translations across
+  boundaries, missing version stories on new ABIs.
+- **Consider**: suggestions, optional improvements, ⚠️ rows that
+  only affect future maintainability.
+
+### 5. Merge Recommendation
+
+Not a bare word — an explicit chain over the sections above:
+
+> problem is real (§1) → method solves it (§2) → implementation
+> matches the claims (§3) → residual is acceptable (§4) →
+> **approve** (list follow-ups)
+
+Decision rule:
+
+- Real problem + working method + claims-matching implementation +
+  residual is only acceptable follow-up → **approve**.
+- Any Must-fix, an unexplained goal-vs-code mismatch, or an
+  unresolved ❌ coverage row (§3) → **request changes**.
+- Method works but a design choice is contested, a goal downgrade
+  has not been confirmed with the author, or an unresolved ➕
+  coverage row still awaits the author's rationale →
+  **needs discussion**.
+
+If the chain breaks, say at which link and why — that link *is* the
+verdict's justification. The oversized-PR warnings from Appendix A
+feed in here: Core churn > 1000 lines biases the verdict toward
+"request changes / needs discussion" unless the author justifies the
+size.
+
+### Appendix A: Change Breakdown
 
 From Step 3.5. Render the bucket table (Core / Build / Test-Ex / Docs /
 Uncategorized, each with file count and +/−/= churn, plus TOTAL) so the
@@ -685,9 +827,8 @@ section:
   still be approvable.
 - **Core > 1000 lines** → `❌ Oversized PR (core logic)`: stronger
   signal — the PR cannot be reviewed in one pass. Recommend split
-  *and* require the Mechanism Brief (Step 5.5) plus a commit review
-  order; bias the Verdict toward "request changes / needs discussion"
-  unless the author justifies the size.
+  *and* require the Mechanism Brief (§2) plus a commit review order;
+  the §5 decision rule picks this warning up.
 
 Both warnings quote the actual numbers (e.g. "Core 1180 lines").
 
@@ -696,27 +837,7 @@ sanity-check it — it may be mis-bucketed real logic (living outside
 `src/`/`python/`/`simpler_setup/`) or out-of-scope files the reviewer
 should question before approval.
 
-### Mechanism Brief
-
-**Required for PRs over ~500 lines; recommended for medium PRs; may be
-omitted only for trivial PRs (single-file, < ~50 lines).**
-
-From Step 5.5. This is the section that proves you understood the PR.
-Omitting it on a large PR makes the rest of the review look like
-nitpicking.
-
-### Goal-Method Traceability
-
-From Step 5.7. Include the table verbatim; let ❌ / ➕ / ⚠️ rows speak
-for themselves. May be folded into Issues Found if the table is short
-(< 3 rows) and every row is ✅.
-
-### Type-specific Analysis
-
-The checklist output from Step 6, organized by type if the PR mixes
-several.
-
-### pto-isa Pin Check
+### Appendix B: pto-isa Pin Check
 
 From Step 6.5. **Always rendered when the pin is active** (`PIN_ACTIVE=1`), at one of two severity levels chosen by whether a pto-isa header reference changed — the level is the whole point of this section, so state it explicitly in the heading:
 
@@ -724,7 +845,7 @@ From Step 6.5. **Always rendered when the pin is active** (`PIN_ACTIVE=1`), at o
 
   > ℹ️ **pto-isa pin:** `pto_isa.pin` is pinned to `<sha>`. No pto-isa header references changed in this PR — confirm the pinned commit is still adequate; bump + rebuild onboard `a2a3` `host_runtime.so` (`SIMPLER_PTO_ISA_BUILD_COMMIT`) only if needed.
 
-- **Header-reference changed** (`PTO_REFS` or `NEW_PTO_INC` non-empty) → escalate to **recommendation**. Surface a visible reminder and mirror it as a **Should-fix / check** row in Issues Found below so it cannot be missed at Verdict time:
+- **Header-reference changed** (`PTO_REFS` or `NEW_PTO_INC` non-empty) → escalate to **recommendation**. Surface a visible reminder and mirror it as a **Should-fix / check** row in the §4 issue list so it cannot be missed when writing the §5 Merge Recommendation:
 
   > ⚠️ **pto-isa pin check:** this PR changes how it references pto-isa while `pto_isa.pin` is pinned to `<sha>`. Verify the pinned commit still provides every pto-isa header the PR references — a **changed pto-isa include path** (e.g. `pto/npu/...` → `pto/...`) is the strongest hint a bump is needed; a newly added pto-isa include is a weaker hint. If the pin is bumped, rebuild onboard `a2a3` `host_runtime.so` against the new commit (`SIMPLER_PTO_ISA_BUILD_COMMIT`).
 
@@ -732,20 +853,7 @@ From Step 6.5. **Always rendered when the pin is active** (`PIN_ACTIVE=1`), at o
 
 When the pin is not active, emit the one-line skip note and move on.
 
-### Issues Found
-
-Categorize by severity:
-
-- **Must fix**: bugs, correctness issues, security problems,
-  unresolved goal-vs-code mismatches, ❌ / ➕ traceability rows
-- **Should fix**: style violations per `.claude/rules/`, missing
-  tests for bugfixes, doc/comment drift, ⚠️ traceability rows with
-  user-visible impact, string-matching error translations across
-  boundaries, missing version stories on new ABIs
-- **Consider**: suggestions, optional improvements, ⚠️ rows that
-  only affect future maintainability
-
-### Independent Reviewer Notes
+### Appendix C: Independent Reviewer Notes
 
 A short subsection per external reviewer (codex, gemini) listing:
 
@@ -756,10 +864,6 @@ A short subsection per external reviewer (codex, gemini) listing:
 The dropped-list is part of the review's audit trail — do not omit it
 when there were dropped findings. A reader needs to see what filtering
 you did.
-
-### Verdict
-
-approve / request changes / needs discussion.
 
 ## Common Pitfalls
 

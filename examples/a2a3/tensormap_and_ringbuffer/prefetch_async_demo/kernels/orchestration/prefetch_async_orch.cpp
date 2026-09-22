@@ -13,7 +13,7 @@
  *
  * Only user data (in, out) is threaded: the SDMA workspace is a runtime-owned
  * device resource the kernel reads via get_dma_workspace(args, DMA_WORKSPACE_SDMA),
- * so it is neither an orchestration arg nor staged H2D.
+ * so it is neither an orchestration arg nor copied in H2D.
  */
 
 #include <stdint.h>

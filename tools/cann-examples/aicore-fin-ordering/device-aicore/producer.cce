@@ -1,0 +1,151 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+// producer.cce — AICore half of the FIN-ordering test. Single block on one AIC.
+//
+// Frozen handoff, one round at a time:
+//
+//   wait for ctl.round_request == r      (invalidate ctl each poll: the AICore's
+//                                         L1 is not coherent with AICPU writes)
+//   pay.payload = r                      <- the ONLY write to payload this round
+//   dcci(&pay.payload, SINGLE_CACHE_LINE, CACHELINE_OUT)
+//   [P1 only] dsb(DSB_DDR)
+//   set_cond(FIN | r)                    <- the notification under test
+//   publish rpt.published_round = r
+//   wait for ctl.round_request == r + 1  <- consumer's ACK; payload stays frozen
+//
+// payload is therefore provably constant from before the FIN until after the
+// consumer has finished every read for that round, so a first-load value below r
+// cannot be explained by the producer having moved on.
+//
+// This kernel needs no AscendC header. dcci, dsb, set_cond, get_coreid and
+// get_sys_cnt are all `-x cce` builtins, and the runtime's own AICore sources
+// include no AscendC header either. Including kernel_operator.h would pull in
+// non-weak globals (g_tilingKey among them) that break the combined link of the
+// mix pair, and would tie the build to where a given CANN release puts its
+// tikcpp subtree.
+
+#include "../shared/handshake.h"
+
+#ifndef __aicore__
+#define __aicore__ [aicore]
+#endif
+
+// rtRegisterAllKernel enumerates kernels by the `<name>_0_mix_aic` /
+// `_0_mix_aiv` symbol pair and the registered ELF must carry both halves; a
+// plainly-named entry is rejected with 107000. Same shape as
+// src/a2a3/platform/onboard/aicore/kernel.cpp.
+#ifdef __DAV_VEC__
+#define PRODUCER_ENTRY fin_ordering_producer_0_mix_aiv
+#else
+#define PRODUCER_ENTRY fin_ordering_producer_0_mix_aic
+#endif
+
+extern "C" __global__ __aicore__ void PRODUCER_ENTRY(__gm__ FinHandshake *hank) {
+#ifdef __DAV_VEC__
+    // The vector half exists only to complete the mix pair; the measurement
+    // runs entirely on the cube.
+    (void)hank;
+    return;
+#else
+    if (hank == nullptr) {
+        return;
+    }
+
+    __gm__ FinCtlBlock *ctl = &hank->ctl;
+    __gm__ FinRptBlock *rpt = &hank->rpt;
+    __gm__ FinPayBlock *pay = &hank->pay;
+
+    // Report the full physical core id so the consumer can resolve the COND
+    // address for the core this actually landed on: block_dim=1 does not pin
+    // the kernel to AIC[0]. Publish core_id before the valid flag, and flush
+    // the block once — both live in rpt, which only this side writes.
+    rpt->core_id = static_cast<uint32_t>(get_coreid());
+    rpt->publish_count = 0;
+    rpt->published_round = 0;
+    rpt->core_id_valid = 1;
+    dcci(reinterpret_cast<__gm__ uint64_t *>(rpt), SINGLE_CACHE_LINE, CACHELINE_OUT);
+    dsb(DSB_DDR);
+
+    // Startup wait. `go == 0` means BOTH "the consumer has not started yet" and
+    // "shut down", so the round loop below cannot treat it as exit until we have
+    // seen go == 1 at least once — otherwise the producer reads the launcher's
+    // zero-filled handshake and exits before the first request. This is the
+    // shape the original fin-ordering producer used.
+    while (true) {
+        dcci(reinterpret_cast<__gm__ uint64_t *>(ctl), SINGLE_CACHE_LINE);
+        if (ctl->go == 1) {
+            break;
+        }
+    }
+
+    uint64_t round = 1;
+    uint64_t publishes = 0;
+    while (true) {
+        // Wait for this round's request. Invalidate ctl every poll or the AICore
+        // caches the old value forever.
+        uint32_t go = 1;
+        while (true) {
+            dcci(reinterpret_cast<__gm__ uint64_t *>(ctl), SINGLE_CACHE_LINE);
+            go = ctl->go;
+            if (go == 0) {
+                break;
+            }
+            if (ctl->round_request >= round) {
+                break;
+            }
+        }
+        if (go == 0) {
+            break;
+        }
+
+        uint32_t mode = ctl->mode;
+        if (mode != kFinProducerP0 && mode != kFinProducerP1) {
+            // Unknown/idle mode: acknowledge the round without publishing so the
+            // consumer's wait times out visibly instead of hanging.
+            round = ctl->round_request + 1;
+            continue;
+        }
+
+        // The sequence under test. Exactly one store to payload per round.
+        pay->payload = round;
+        dcci(reinterpret_cast<__gm__ uint64_t *>(pay), SINGLE_CACHE_LINE, CACHELINE_OUT);
+        if (mode == kFinProducerP1) {
+            dsb(DSB_DDR);
+        }
+        set_cond((static_cast<uint32_t>(round) & kFinTaskIdMask) | kFinTaskStateMask);
+
+        // Round bookkeeping goes out AFTER the FIN so it can never be the thing
+        // that made payload visible. Its own block, so this does not touch the
+        // payload line.
+        publishes++;
+        rpt->publish_count = publishes;
+        rpt->published_round = round;
+        dcci(reinterpret_cast<__gm__ uint64_t *>(rpt), SINGLE_CACHE_LINE, CACHELINE_OUT);
+
+        // Hold payload frozen until the consumer acknowledges THIS round. The
+        // ack is a separate counter from the request: if one counter served as
+        // both, the producer would publish r+1 the moment it saw the ack for r,
+        // which is before the consumer has requested r+1 with that round's mode
+        // — the payload would then already be visible by the time the consumer
+        // starts waiting, and the arm labels would drift by one round.
+        while (true) {
+            dcci(reinterpret_cast<__gm__ uint64_t *>(ctl), SINGLE_CACHE_LINE);
+            if (ctl->go == 0) {
+                return;
+            }
+            if (ctl->round_ack >= round) {
+                break;
+            }
+        }
+        round++;
+    }
+#endif
+}

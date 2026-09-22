@@ -31,6 +31,10 @@ KERNELS_BASE = "../../../../../../examples/a2a3/tensormap_and_ringbuffer/vector_
 # Required leading columns — keep in sync with build_csv_header() in
 # pmu_collector.cpp. Counter columns follow these and vary per event_type.
 _REQUIRED_HEADER_PREFIX = ("thread_id", "core_id", "task_id", "func_id", "core_type", "pmu_total_cycles")
+# Run identity is the last column, after the variable-length counter block. It
+# says which run produced the row; without it, attribution rests entirely on the
+# host clearing its state between runs.
+_REQUIRED_TRAILING_COLUMNS = ("event_type", "run_epoch")
 
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
@@ -110,10 +114,27 @@ class TestPmu(SceneTestCase):
         header_cols = lines[0].split(",")
         prefix = list(_REQUIRED_HEADER_PREFIX)
         assert header_cols[: len(prefix)] == prefix, f"header must start with {prefix} in order: {header_cols}"
+        assert tuple(header_cols[-len(_REQUIRED_TRAILING_COLUMNS) :]) == _REQUIRED_TRAILING_COLUMNS, (
+            f"header must end with {_REQUIRED_TRAILING_COLUMNS} in order: {header_cols}"
+        )
         # At least one data row — sim runs all 5 vector_example tasks; expect ≥1
         # to keep the assertion robust if a future scheduler change collapses
         # / batches per-task PMU sampling.
         assert len(lines) >= 2, f"pmu.csv has no data rows (only header): {lines}"
+
+        # Every row carries a run identity, and it is the one the producer
+        # stamped rather than the zero a buffer starts life with. A row whose
+        # column count disagrees with the header would make this read the wrong
+        # field, so check the shape first.
+        epoch_index = header_cols.index("run_epoch")
+        epochs = set()
+        for row in lines[1:]:
+            cols = row.split(",")
+            assert len(cols) == len(header_cols), f"row has {len(cols)} columns, header has {len(header_cols)}: {row}"
+            epochs.add(cols[epoch_index])
+        assert epochs, "no data rows to check run_epoch on"
+        assert "0" not in epochs, f"a row carries run_epoch=0, i.e. no identity was stamped: {sorted(epochs)}"
+        assert len(epochs) == 1, f"a single run produced more than one run_epoch: {sorted(epochs)}"
 
 
 if __name__ == "__main__":

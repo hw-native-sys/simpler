@@ -5,6 +5,10 @@ inputs:
   platform:
     description: Onboard platform, either a2a3 or a5.
     required: true
+  cann-env:
+    description: CANN environment setup script.
+    required: false
+    default: /usr/local/Ascend/cann/set_env.sh
 
 runs:
   using: composite
@@ -13,15 +17,15 @@ runs:
       shell: bash
       working-directory: ${{ github.workspace }}
       env:
+        CANN_ENV: ${{ inputs.cann-env }}
         DFX_PLATFORM: ${{ inputs.platform }}
       run: |
         set -euo pipefail
 
         case "$DFX_PLATFORM" in
-          a2a3)
-            source /usr/local/Ascend/cann/set_env.sh
+          a2a3|a5)
+            source "$CANN_ENV"
             ;;
-          a5) ;;
           *)
             echo "::error::unsupported onboard platform: $DFX_PLATFORM"
             exit 2
@@ -131,13 +135,26 @@ runs:
           "tests/st/$platform/tensormap_and_ringbuffer/dfx/chip_swimlane/" \
           --enable-chip-swimlane --enable-dep-gen
 
+        if [[ "$platform" == "a5" ]]; then
+          start_job "chip_swimlane (host_build_graph)" \
+            tests/st/a5/host_build_graph/dfx/chip_swimlane/test_scheduler_phases.py::TestConsecutiveClockAlignment::test_run \
+            --manual include --enable-chip-swimlane 4
+        fi
+
         start_job "PMU" \
           "tests/st/$platform/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py" \
           --enable-pmu 2
 
-        start_job "args_dump" \
+        # Mode "full" here; see the mode-per-lane rationale in _st-sim-a2a3.yml.
+        # This action runs for both a2a3 and a5 onboard, so full -- the only
+        # mode that ignores the Arg::dump() masks and writes payload for every
+        # arg -- is the one that gets hardware coverage on both architectures.
+        # The sim lanes take partial and hybrid.
+        # No backticks in this comment: the heredoc above is quoted today, but
+        # they would become command substitution if it were ever unquoted.
+        start_job "args_dump (full)" \
           "tests/st/$platform/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py" \
-          --dump-args
+          --dump-args full
 
         if [[ "$platform" == "a2a3" ]]; then
           start_job "dep_gen (host_build_graph)" \

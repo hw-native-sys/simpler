@@ -32,26 +32,42 @@ Two-ring push design: parallel push in both HCCS directions on disjoint data hal
 
 Paper-faithful interleaved RS+AG with AtomicAdd/AtomicNone phases. P=2 only — for P≥4 the AtomicNone forward phase overwrites peer chunks (shared-memory push-model race).
 
+## Reduce Operations
+
+Each mode's task args carry a `reduce_op` scalar (`CollectiveReduceOp` in
+`simpler_setup/incore/collectives_reduce_op.hpp`): `0=Sum`, `1=Max`, `2=Min`,
+`3=Prod`. `onephase`, `twophase`, and `ring` dispatch to the matching tile op
+(`TADD`/`TMAX`/`TMIN`/`TMUL`) for all four. `bidirectional_ring` and `ibing`
+implement only `Sum` — their orchestration rejects any other `reduce_op` via
+`rt_report_fatal(SIMPLER_ERROR_INVALID_ARGS, ...)` before task submission (the
+AIV kernel's `TPUT<AtomicAdd>` has no Max/Min variant).
+
 ## Golden Check
 
-`output[i] = nranks*i + 100*nranks*(nranks-1)//2`
+`output[i] = nranks*i + 100*nranks*(nranks-1)//2` for Sum; see
+`allreduce_expected_output` in `_helpers.py` for the Max/Min/Prod goldens.
 
-Each rank's input: `[i + rank*100 for i in range(256)]`. Allreduce produces the element-wise sum.
+Each rank's input: `[i + rank*100 for i in range(256)]`.
 
 ## Test Classes
 
-| Class | Ranks | Mode |
-| ----- | ----- | ---- |
-| `TestAllreduceOnephaseP2` | 2 | onephase |
-| `TestAllreduceTwophaseP2` | 2 | twophase |
-| `TestAllreduceRingP2` | 2 | ring |
-| `TestAllreduceBidirectionalRingP2` | 2 | bidirectional_ring |
-| `TestAllreduceIbingP2` | 2 | ibing |
-| `TestAllreduceOnephaseP4` | 4 | onephase |
-| `TestAllreduceTwophaseP4` | 4 | twophase |
-| `TestAllreduceRingP4` | 4 | ring |
-| `TestAllreduceBidirectionalRingP4` | 4 | bidirectional_ring |
-| `TestAllreduceIbingNranksError` | 4 | ibing (negative: expects `ValueError`) |
+| Class | Ranks | Mode | Reduce Ops |
+| ----- | ----- | ---- | ---------- |
+| `TestAllreduceOnephaseP2` | 2 | onephase | Sum |
+| `TestAllreduceTwophaseP2` | 2 | twophase | Sum |
+| `TestAllreduceRingP2` | 2 | ring | Sum |
+| `TestAllreduceBidirectionalRingP2` | 2 | bidirectional_ring | Sum |
+| `TestAllreduceIbingP2` | 2 | ibing | Sum |
+| `TestAllreduceOnephaseP4` | 4 | onephase | Sum |
+| `TestAllreduceTwophaseP4` | 4 | twophase | Sum |
+| `TestAllreduceRingP4` | 4 | ring | Sum |
+| `TestAllreduceBidirectionalRingP4` | 4 | bidirectional_ring | Sum |
+| `TestAllreduceIbingNranksError` | 4 | ibing (negative: expects `ValueError`) | Sum |
+| `TestAllreduceOnephaseP2MaxMinProd` | 2 | onephase | Max, Min, Prod |
+| `TestAllreduceTwophaseP2MaxMinProd` | 2 | twophase | Max, Min, Prod |
+| `TestAllreduceRingP2MaxMinProd` | 2 | ring | Max, Min, Prod |
+| `TestAllreduceBidirectionalRingRejectNonSum` | 2 | bidirectional_ring (negative: expects `RuntimeError`) | Max |
+| `TestAllreduceIbingRejectNonSum` | 2 | ibing (negative: expects `RuntimeError`) | Max |
 
 ## Run
 

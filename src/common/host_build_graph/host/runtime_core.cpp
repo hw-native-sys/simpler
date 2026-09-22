@@ -137,10 +137,10 @@ static bool require_no_producer(RuntimeContext *rt, const simpler::hbg::Tensor &
 
     orch.report_fatal(
         SIMPLER_ERROR_INVALID_ARGS, caller,
-        "tensor is produced by task %#llx (id space %u); host_build_graph finishes orchestration before the "
+        "tensor is produced by task %#llx (id space %s); host_build_graph finishes orchestration before the "
         "device starts, so a submitted kernel has not written this buffer and a runtime allocation is "
         "uninitialized -- pass the value as an orchestration argument, or have a task write it",
-        static_cast<unsigned long long>(producer.raw), static_cast<unsigned int>(producer.space())
+        static_cast<unsigned long long>(producer.raw), producer.space_name()
     );
     return false;
 }
@@ -166,8 +166,9 @@ get_tensor_data(RuntimeContext *rt, const simpler::hbg::Tensor &tensor, uint32_t
     if (!host_tensor_read(rt->tensor_access, elem_addr, &result, elem_size)) {
         rt->orchestrator->report_fatal(
             SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
-            "no host view for device address %#llx (%llu bytes): during host orchestration only tensors the "
-            "runtime staged are readable, not runtime-created or child-memory buffers",
+            "no host view for device address %#llx (%llu bytes): during host orchestration only host-memory "
+            "tensors the runtime copied in and child-memory tensors the caller passed in are readable, not "
+            "runtime-created buffers",
             (unsigned long long)elem_addr, (unsigned long long)elem_size
         );
         return 0;
@@ -196,8 +197,9 @@ void set_tensor_data(
     if (!host_tensor_write(rt->tensor_access, elem_addr, &value, elem_size)) {
         rt->orchestrator->report_fatal(
             SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
-            "no writable host view for device address %#llx (%llu bytes): during host orchestration only tensors "
-            "the runtime staged are writable, not runtime-created or child-memory buffers",
+            "no writable host view for device address %#llx (%llu bytes): during host orchestration only "
+            "host-memory tensors the runtime copied in and child-memory tensors the caller passed in are "
+            "writable, not runtime-created buffers",
             (unsigned long long)elem_addr, (unsigned long long)elem_size
         );
     }

@@ -42,6 +42,13 @@ a task is enqueued under its own `run_id`, and the Scheduler pops only from the
 partition of the run that currently holds the FIFO head. That is what keeps two
 admitted runs from interleaving their device work while both are live.
 
+An empty ready partition is removed, so a later task of that run re-enters
+partition insertion order. Whole-run ordering comes from the active-run
+snapshot, which is shared by group, single and SUB dispatch in one pass.
+For N: A -> B and N+1: C, C may stage while B is PENDING; it activates only
+after N becomes terminal. Successor staging uses a separate `prepare_only`
+path; see [Orchestrator lifecycle](orchestrator.md#1-python-facade-and-c-internal-api).
+
 Root submission, run activation, stop requests, a worker publishing itself
 idle, and group-member completions that do not enqueue a terminal task
 completion all advance a wake generation under the Scheduler

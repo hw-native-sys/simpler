@@ -38,19 +38,30 @@ struct HostApiOps {
     // backend without a host-map path return nullptr / no-op.
     void *(*register_device_memory_to_host)(void *runner_ctx, void *dev_ptr, size_t bytes);
     void (*unregister_device_memory_from_host)(void *runner_ctx, void *dev_ptr);
+    // Host view of a child-memory address, for a host-side orchestrator
+    // (host_build_graph) that reads or writes a device-resident tensor's bytes
+    // to shape the graph. Unlike the pair above, the runner owns the mapping:
+    // it is established over the whole containing allocation on first request
+    // and released by the free of that allocation, so a bind neither pays for
+    // it again nor has to pair an unregister. Returns a host address carrying
+    // dev_ptr's offset, or nullptr when this backend cannot map device memory
+    // to the host (a5 onboard) or the mapping was refused for this allocation
+    // (see issue #1531) — the caller then serves each access with a copy.
+    void *(*acquire_child_memory_host_view)(void *runner_ctx, void *dev_ptr, size_t bytes);
     // Set a device buffer to a byte value (device-side, no PCIe). Used to
     // zero-init pure OUTPUT buffers in lieu of an H2D copy-in.
     int (*device_memset)(void *runner_ctx, void *dev_ptr, int value, size_t size);
-    // Runner-scoped retained temporary buffer for TRB device-arg staging.
-    // This is NOT an allocator — it is a single {addr, size} slot that lives
-    // across runs on the DeviceRunner. trb bind reads the slot, and if the
-    // retained buffer is too small for this run's packed temporary size it
-    // device_free's the old one, device_malloc's a bigger one, and writes the
-    // new {addr, size} back. The grow/pack/slice logic lives in trb bind
-    // (runtime_maker); the platform only remembers the slot so it can be reused
-    // by later runs and freed at finalize. The slot is per pipeline slot, so
-    // two runs in different slots never share a staging buffer. `get` returns
-    // {nullptr, 0} when nothing is retained yet.
+    // Runner-scoped retained temporary buffer for device arguments, used by
+    // every host runtime that gives caller tensors a device buffer. This is NOT an allocator —
+    // it is a single {addr, size} slot that lives across runs on the
+    // DeviceRunner. A bind reads the slot, and if the retained buffer is too
+    // small for this run's packed temporary size it device_free's the old one,
+    // device_malloc's a bigger one, and writes the new {addr, size} back. The
+    // grow/slice logic lives in utils/retained_temp_bump.h; the platform only
+    // remembers the slot so it can be reused by later runs and freed at
+    // finalize. The slot is per pipeline slot, so two runs in different slots
+    // never share a staging buffer. `get` returns {nullptr, 0} when nothing is
+    // retained yet.
     void (*get_retained_temp_buffer)(void *runner_ctx, uint32_t pipeline_slot, void **addr, size_t *size);
     void (*set_retained_temp_buffer)(void *runner_ctx, uint32_t pipeline_slot, void *addr, size_t size);
     // Runner-owned Graph Definition storage: one device block per pipeline slot
@@ -90,6 +101,18 @@ struct HostApiOps {
     // re-writes every segment it ships, so only the pages it touches ever become
     // resident. Returns 0 on success.
     int (*acquire_sm_mirror)(void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out);
+    // Retain the host buffer a run assembles its device execution image in, so
+    // the bytes outlive the preparation that wrote them: the publication that
+    // ships them is a separate step, and a write that is enqueued rather than
+    // issued immediately reads this buffer after its caller has returned.
+    // Host memory only. Same retention contract as acquire_sm_mirror above —
+    // per pipeline slot, grow-only, released at Worker finalization, handed over
+    // uninitialized with no meaning carried between binds. `addr_out` receives a
+    // pointer aligned to `alignment` (a power of two) with at least `bytes`
+    // behind it. Returns 0 on success.
+    int (*acquire_run_image_staging)(
+        void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out
+    );
     // Commit the three pooled regions (GM heap, runtime shared memory, and
     // prebuilt runtime arena) of the arena bank selected by this run, as three
     // independent device allocations. `runtime_arena_size == 0` skips the
@@ -145,26 +168,44 @@ struct HostApiOps {
     // chip-swimlane level, `producer_wants_records` carries the producer's own
     // (a runtime knob the platform does not read).
     uint32_t (*get_chip_swimlane_level)(void *runner_ctx);
-    void *(*host_phase_pool_arm)(void *runner_ctx, int producer_wants_records);
-    void (*host_phase_pool_finish)(void *runner_ctx, uint64_t submitted_tasks, uint64_t invocation_id);
+    void *(*host_phase_pool_arm)(void *runner_ctx, uint32_t pipeline_slot, int producer_wants_records);
+    void (*host_phase_pool_finish)(
+        void *runner_ctx, uint32_t pipeline_slot, uint64_t submitted_tasks, uint64_t invocation_id
+    );
     bool (*publish_chip_swimlane_extension)(
         void *runner_ctx, ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size
     );
+    // This run's device-published result payload, or nullptr when the run
+    // published none. The platform holds one region per pipeline slot and never
+    // interprets the bytes — the layout is the runtime's own. `run_epoch` is the
+    // epoch the caller's run was given: a region still carrying an earlier run's
+    // epoch reads as absent, so a predecessor's payload cannot be returned as
+    // this run's. See common/device_run_result.h for why the region exists and
+    // for what "absent" does and does not mean.
+    const void *(*get_run_result)(void *runner_ctx, uint32_t pipeline_slot, uint64_t run_epoch, size_t *bytes_out);
 };
 
 /**
  * One run's binding of the immutable function table to a runner and that run's
- * slot/bank selection. Constructed per run and passed by const pointer into the
- * runtime impls; a callback reaches its runner and resources through the bound
- * members instead of a thread-local.
+ * slot/bank selection and epoch. Constructed per run and passed by const
+ * pointer into the runtime impls; a callback reaches its runner and resources
+ * through the bound members instead of a thread-local.
  */
 struct HostApi {
 public:
-    HostApi(void *runner_ctx, uint32_t pipeline_slot, uint32_t arena_bank, const HostApiOps *ops) noexcept :
+    HostApi(
+        void *runner_ctx, uint32_t pipeline_slot, uint32_t arena_bank, uint64_t run_epoch, const HostApiOps *ops
+    ) noexcept :
         runner_ctx_(runner_ctx),
         pipeline_slot_(pipeline_slot),
         arena_bank_(arena_bank),
+        run_epoch_(run_epoch),
         ops_(ops) {}
+
+    // The epoch this run was given. Runtimes that build their own swimlane
+    // record streams stamp it into each row: per-task tokens restart every run,
+    // so a row without it cannot be attributed once one file holds several runs.
+    uint64_t run_epoch() const { return run_epoch_; }
 
     void *device_malloc(size_t size) const { return ops_->device_malloc(runner_ctx_, size); }
     void device_free(void *dev_ptr) const { ops_->device_free(runner_ctx_, dev_ptr); }
@@ -179,6 +220,10 @@ public:
     }
     void unregister_device_memory_from_host(void *dev_ptr) const {
         ops_->unregister_device_memory_from_host(runner_ctx_, dev_ptr);
+    }
+    void *acquire_child_memory_host_view(void *dev_ptr, size_t bytes) const {
+        if (ops_->acquire_child_memory_host_view == nullptr) return nullptr;
+        return ops_->acquire_child_memory_host_view(runner_ctx_, dev_ptr, bytes);
     }
     int device_memset(void *dev_ptr, int value, size_t size) const {
         return ops_->device_memset(runner_ctx_, dev_ptr, value, size);
@@ -209,6 +254,13 @@ public:
             return -1;
         }
         return ops_->acquire_sm_mirror(runner_ctx_, pipeline_slot_, bytes, alignment, addr_out);
+    }
+    int acquire_run_image_staging(size_t bytes, size_t alignment, void **addr_out) const {
+        if (ops_->acquire_run_image_staging == nullptr) {
+            if (addr_out != nullptr) *addr_out = nullptr;
+            return -1;
+        }
+        return ops_->acquire_run_image_staging(runner_ctx_, pipeline_slot_, bytes, alignment, addr_out);
     }
     int setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size) const {
         return ops_->setup_static_arena(runner_ctx_, arena_bank_, gm_heap_size, gm_sm_size, runtime_arena_size);
@@ -243,6 +295,11 @@ public:
     /**
      * Arm this pass's host phase pool.
      *
+     * The pool is one per pipeline slot, not one per runner: a host-orchestrating
+     * bind is preparation, and a prepared successor prepares while its
+     * predecessor is still executing. `pipeline_slot_` is this run's, so the
+     * hook needs no argument for it.
+     *
      * @param producer_wants_records  the producer's own enabling condition; the
      *                                runner ORs it with the chip-swimlane level
      * @return HostPhaseRecordPool* to record into, or nullptr when this pass
@@ -251,11 +308,11 @@ public:
      */
     void *host_phase_pool_arm(bool producer_wants_records) const noexcept {
         if (ops_->host_phase_pool_arm == nullptr) return nullptr;
-        return ops_->host_phase_pool_arm(runner_ctx_, producer_wants_records ? 1 : 0);
+        return ops_->host_phase_pool_arm(runner_ctx_, pipeline_slot_, producer_wants_records ? 1 : 0);
     }
     void host_phase_pool_finish(uint64_t submitted_tasks, uint64_t invocation_id) const noexcept {
         if (ops_->host_phase_pool_finish != nullptr) {
-            ops_->host_phase_pool_finish(runner_ctx_, submitted_tasks, invocation_id);
+            ops_->host_phase_pool_finish(runner_ctx_, pipeline_slot_, submitted_tasks, invocation_id);
         }
     }
     bool publish_chip_swimlane_extension(
@@ -270,10 +327,27 @@ public:
             return false;
         }
     }
+    /**
+     * What this run's device side published for the host to read, or nullptr
+     * when it published nothing. `*bytes_out` receives the payload length.
+     *
+     * Absent is not "succeeded": a producer publishes only what it wants
+     * preserved, so a run with nothing to report and a run that never reached
+     * its publish point both read as absent. A caller decides that a run failed
+     * from the execution error channel and comes here for the detail.
+     */
+    const void *run_result(size_t *bytes_out) const noexcept {
+        if (ops_->get_run_result == nullptr) {
+            if (bytes_out != nullptr) *bytes_out = 0;
+            return nullptr;
+        }
+        return ops_->get_run_result(runner_ctx_, pipeline_slot_, run_epoch_, bytes_out);
+    }
 
 private:
     void *runner_ctx_{nullptr};
     uint32_t pipeline_slot_{0};
     uint32_t arena_bank_{0};
+    uint64_t run_epoch_{0};
     const HostApiOps *ops_{nullptr};
 };

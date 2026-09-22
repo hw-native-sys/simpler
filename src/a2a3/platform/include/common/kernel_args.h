@@ -85,7 +85,9 @@ extern "C" {
  *
  * Consumer paths:
  *       - AICPU: receives this KernelArgs directly via rtsLaunchCpuKernel
- *       - AICore: receives device KernelArgs* via KERNEL_ENTRY
+ *       - AICore: receives `AicoreLaunchArgs` via KERNEL_ENTRY, a projection of
+ *         this struct carrying the subset its entry reads. It never reads this
+ *         struct itself.
  */
 struct KernelArgs {
     // Offset-locked front: the front-less launch protocol and the device
@@ -101,8 +103,16 @@ struct KernelArgs {
     uint64_t dump_data_base{0};  // Dump shared memory base address; use explicit flags to detect enablement
     // chip swimlane shared memory base address; use explicit flags to detect enablement
     uint64_t chip_swimlane_data_base{0};
-    uint64_t pmu_data_base{0};          // PMU shared memory base address; use explicit flags to detect enablement
-    uint64_t pmu_reg_addrs{0};          // Per-core PMU MMIO register base address array (onboard only; 0 on sim)
+    // This run's chip-swimlane terminal-snapshot bank, resolved by the host from
+    // the run's pipeline slot. 0 whenever the host resolved no bank, including
+    // every run with swimlane off; the device treats 0 as "publish no snapshot"
+    // and never derives an address of its own.
+    uint64_t chip_swimlane_run_terminal_bank{0};
+    uint64_t pmu_data_base{0};  // PMU shared memory base address; use explicit flags to detect enablement
+    // Per-core PMU MMIO register base address array. 0 on sim, and 0 when this
+    // run leaves PMU off; the table itself is device-constant and outlives any
+    // single run.
+    uint64_t pmu_reg_addrs{0};
     uint64_t dep_gen_data_base{0};      // dep_gen shared memory base address; use explicit flags to detect enablement
     uint64_t scope_stats_data_base{0};  // ScopeStatsBuffer shared memory base; 0 when scope_stats is off.
                                         // Allocated by host's ScopeStatsCollector, read+written by AICPU's
@@ -124,12 +134,95 @@ struct KernelArgs {
     // single-uint64 wall_ns write-through (sim AICPU and host share memory).
     // Zero when the buffer was not allocated.
     uint64_t device_wall_data_base{0};
+
+    // Device pointer to this run's result region (DeviceRunResultRegion), and
+    // the run epoch its device side publishes into that region. Same reason the
+    // wall base travels here rather than inline: AICPU gets KernelArgs as a
+    // CANN-private copy, so an inline field would be write-only from AICPU.
+    //
+    // Unlike the wall buffer this is NOT gated on diagnostics — a run's error
+    // result has to survive whether or not timing capture is on. The host does
+    // not clear the region per run; the epoch is what makes a previous run's
+    // payload recognisable as stale, so arming costs no H2D.
+    // Both zero when no region was allocated.
+    uint64_t run_result_data_base{0};
+    uint64_t run_result_epoch{0};
     // 32-bit tail.
     uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_args|chip_swimlane|pmu|dep_gen|scope_stats
 };
 
 static_assert(offsetof(KernelArgs, runtime_args) == 0, "KernelArgs::runtime_args offset drift");
 static_assert(offsetof(KernelArgs, regs) == 8, "KernelArgs::regs offset drift");
+
+// The swimlane bases are not offset-locked by any device contract — AICPU reads
+// them by field name from a CANN-private copy of the whole struct. These pin the
+// measured a2a3 layout so that appending, reordering, or widening a field is a
+// build failure rather than a silently different launch payload: `sizeof` is
+// what `launch_aicpu_payload` hands to `rtsLaunchCpuKernel` as `argsSize`, and
+// what `PersistentKernelArgs::prepare_once` allocates and copies H2D.
+static_assert(offsetof(KernelArgs, chip_swimlane_data_base) == 32, "KernelArgs::chip_swimlane_data_base offset drift");
+static_assert(
+    offsetof(KernelArgs, chip_swimlane_run_terminal_bank) == 40,
+    "KernelArgs::chip_swimlane_run_terminal_bank offset drift"
+);
+static_assert(sizeof(KernelArgs) == 120, "KernelArgs launch-payload size drift");
+static_assert(alignof(KernelArgs) == 8, "KernelArgs launch-payload alignment drift");
+// No conditional members: the struct body carries no preprocessor branch, so
+// these values are the same in every translation unit that sees this header.
+static_assert(__is_trivially_copyable(KernelArgs), "KernelArgs must be memcpy-able to the device");
+static_assert(__is_standard_layout(KernelArgs), "KernelArgs must be standard-layout");
+
+/**
+ * AicoreLaunchArgs - the AICore entry's launch argument block.
+ *
+ * Mirrors `KERNEL_ENTRY(aicore_kernel)`'s parameter list field for field: ccec
+ * demotes a struct parameter to a hidden pointer, so the entry takes a flat
+ * scalar list and this is the host-side image of it. Changing either without
+ * the other silently mis-decodes the block.
+ *
+ * Every address an AICore entry needs is here, so the entry publishes its
+ * per-core state from these values alone and reads no GM to do it. The driver
+ * copies the block during the launch call, so the host builds it after
+ * collector arming and these are this run's final values.
+ */
+struct AicoreLaunchArgs {
+    uint64_t runtime_args;
+    uint32_t enable_profiling_flag;
+    uint64_t ffts_base_addr;
+    uint64_t chip_swimlane_aicore_rotation_table;
+    // This run's report identity. Non-zero on a native program launch, and the
+    // AICore commits it last in its handshake report so the AICPU accepts only
+    // this run's report. Zero on a kernel/persistent launch, which keeps the
+    // `aicore_done != 0` predicate.
+    uint64_t report_epoch;
+};
+
+static_assert(sizeof(AicoreLaunchArgs) == 40, "AicoreLaunchArgs size drift");
+
+/**
+ * Fill the `AicoreLaunchArgs` fields every architecture shares, from the
+ * `KernelArgs` the host already built for the AICPU.
+ *
+ * `report_epoch` is the projection that gives both processors the same run
+ * identity: the AICPU reads `KernelArgs::run_result_epoch` directly, the AICore
+ * has no `KernelArgs`, so the identical value travels here. A native program
+ * launch supplies a non-zero epoch; a kernel/persistent launch leaves it 0,
+ * which selects the protocol that predates the stamp.
+ */
+inline void fill_shared_launch_args(AicoreLaunchArgs &args, const KernelArgs &k_args) {
+    args.runtime_args = reinterpret_cast<uint64_t>(k_args.runtime_args);
+    args.enable_profiling_flag = k_args.enable_profiling_flag;
+    args.report_epoch = k_args.run_result_epoch;
+}
+
+/**
+ * Fill the fields of `AicoreLaunchArgs` that only this architecture has, so the
+ * shared launch path can build the block without knowing which arch it is on.
+ */
+inline void fill_arch_launch_args(AicoreLaunchArgs &args, const KernelArgs &k_args) {
+    args.ffts_base_addr = k_args.ffts_base_addr;
+    args.chip_swimlane_aicore_rotation_table = k_args.chip_swimlane_aicore_rotation_table;
+}
 
 /**
  * InitArgs - per-device runtime configuration
@@ -139,8 +232,10 @@ static_assert(offsetof(KernelArgs, regs) == 8, "KernelArgs::regs offset drift");
  * an async-DMA workspace. The values do not ride on per-run KernelArgs; the
  * resident AICPU SO keeps the latest configuration across task launches.
  *
- * `regs` / `pmu_reg_addrs` are intentionally NOT here — they back per-core
- * register tables consumed on the per-run AICore path and stay in KernelArgs.
+ * `regs` / `pmu_reg_addrs` are intentionally NOT here. The host owns both
+ * tables per device context, but their addresses still reach the device on the
+ * per-run KernelArgs copy the AICPU exec entry latches, so moving them would
+ * change that publication protocol rather than just host-side ownership.
  */
 struct InitArgs {
     uint32_t device_id{0};            // ACL device ordinal -> set_orch_device_id
@@ -149,6 +244,12 @@ struct InitArgs {
     // Per-engine async-DMA workspace dev addrs -> set_dma_workspace_addr(kind, .);
     // indexed by DmaWorkspaceKind; 0 = that engine unavailable.
     uint64_t dma_workspace_addr[DMA_WORKSPACE_KIND_COUNT]{};
+    // Distance from a GM address to its nocache alias, as the driver reports it
+    // for this device -> set_dev_l2_cache_offset(.). The device maps each page twice,
+    // once cached and once not; `addr + offset` selects the uncached mapping, so
+    // a load through it does not allocate in L2. 0 means the device exposes no
+    // such alias, and `addr + 0` leaves the load ordinary and cached.
+    uint64_t l2_cache_offset{0};
 };
 
 /**

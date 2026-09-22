@@ -24,9 +24,13 @@
 #include "runtime_c_api.h"
 
 #include "callable.h"
+#include "callable_protocol.h"
 #include "call_config.h"
 #include "device_runner_base.h"
 #include "host/dep_gen_collector.h"  // make_deps_json_path
+#include "host/kernel_entry_validation.h"
+#include "host/kernel_pipeline_contract.h"
+#include "worker/pipeline_contract.h"
 #include "prepare_callable_common.h"
 #include "task_args_wire.h"
 #include "native_run_context.h"
@@ -41,6 +45,7 @@
 
 #include "common/device_phase.h"
 #include "common/strace.h"
+#include "host/host_clock_alignment_log.h"
 #include "common/unified_log.h"
 #include "cpu_sim_context.h"
 #include "host/raii_scope_guard.h"
@@ -88,7 +93,23 @@ extern "C" {
  * Runtime Implementation Functions (defined in runtime_maker.cpp)
  * =========================================================================== */
 int register_callable_impl(const ChipCallable *callable, const HostApi *api, CallableArtifacts *out);
-int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc);
+/**
+ * Perform the device write a run's bind prepared.
+ *
+ * The bind computes its device execution image into staging that outlives it and
+ * records where the bytes go; this ships them. Two steps rather than one, so the
+ * write can be ordered against something — or captured and replayed — without
+ * the host graph building that produced the bytes having to run again. Consumes
+ * the record: publishing twice, or publishing a bind that recorded nothing, is an
+ * error, because a run whose image never reached the device must not launch. A
+ * runtime whose bind writes its own image where it builds it implements this as a
+ * no-op.
+ */
+int publish_run_image_impl(Runtime *runtime, const HostApi *api);
+/** @see the onboard c_api_shared.cpp declarations for the three halves' contract. */
+int copy_in_run_inputs_impl(const Runtime *runtime, const HostApi *api);
+int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi *api, int execution_rc, int launched);
+int release_run_bindings_impl(Runtime *runtime, const HostApi *api);
 
 /* ===========================================================================
  * Context-bound HostApi functions passed to runtime implementations.
@@ -142,6 +163,15 @@ static void unregister_device_memory_from_host(void *runner_ctx, void *dev_ptr) 
     try {
         static_cast<SimDeviceRunnerBase *>(runner_ctx)->unregister_device_memory_from_host(dev_ptr);
     } catch (...) {}
+}
+
+static void *acquire_child_memory_host_view(void *runner_ctx, void *dev_ptr, size_t bytes) {
+    if (runner_ctx == nullptr) return nullptr;
+    try {
+        return static_cast<SimDeviceRunnerBase *>(runner_ctx)->acquire_child_memory_host_view(dev_ptr, bytes);
+    } catch (...) {
+        return nullptr;
+    }
 }
 
 static int device_memset(void *runner_ctx, void *dev_ptr, int value, size_t size) {
@@ -207,6 +237,18 @@ acquire_sm_mirror(void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t
     }
 }
 
+static int
+acquire_run_image_staging(void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out) {
+    if (addr_out != nullptr) *addr_out = nullptr;
+    if (runner_ctx == nullptr) return -1;
+    try {
+        return static_cast<SimDeviceRunnerBase *>(runner_ctx)
+            ->acquire_run_image_staging(pipeline_slot, bytes, alignment, addr_out);
+    } catch (...) {
+        return -1;
+    }
+}
+
 static uint64_t upload_chip_callable_buffer_wrapper(void *runner_ctx, const void *callable) {
     if (runner_ctx == nullptr) return 0;
     try {
@@ -229,14 +271,17 @@ static bool publish_chip_swimlane_extension(
                                         ->publish_chip_swimlane_extension(section, json_value, json_size);
 }
 
-static void *host_phase_pool_arm(void *runner_ctx, int producer_wants_records) {
+static void *host_phase_pool_arm(void *runner_ctx, uint32_t pipeline_slot, int producer_wants_records) {
     if (runner_ctx == nullptr) return nullptr;
-    return static_cast<SimDeviceRunnerBase *>(runner_ctx)->host_phase_pool_arm(producer_wants_records != 0);
+    return static_cast<SimDeviceRunnerBase *>(runner_ctx)
+        ->host_phase_pool_arm(pipeline_slot, producer_wants_records != 0);
 }
 
-static void host_phase_pool_finish(void *runner_ctx, uint64_t submitted_tasks, uint64_t invocation_id) {
+static void
+host_phase_pool_finish(void *runner_ctx, uint32_t pipeline_slot, uint64_t submitted_tasks, uint64_t invocation_id) {
     if (runner_ctx == nullptr) return;
-    static_cast<SimDeviceRunnerBase *>(runner_ctx)->host_phase_pool_finish(submitted_tasks, invocation_id);
+    static_cast<SimDeviceRunnerBase *>(runner_ctx)
+        ->host_phase_pool_finish(pipeline_slot, submitted_tasks, invocation_id);
 }
 
 static int setup_static_arena_wrapper(
@@ -325,12 +370,14 @@ static const HostApiOps g_host_api_ops = {
     .copy_from_device = copy_from_device,
     .register_device_memory_to_host = register_device_memory_to_host,
     .unregister_device_memory_from_host = unregister_device_memory_from_host,
+    .acquire_child_memory_host_view = acquire_child_memory_host_view,
     .device_memset = device_memset,
     .get_retained_temp_buffer = get_retained_temp_buffer,
     .set_retained_temp_buffer = set_retained_temp_buffer,
     .acquire_graph_definition_block = acquire_graph_definition_block,
     .get_graph_definition_staging = get_graph_definition_staging,
     .acquire_sm_mirror = acquire_sm_mirror,
+    .acquire_run_image_staging = acquire_run_image_staging,
     .setup_static_arena = setup_static_arena_wrapper,
     .acquire_pooled_gm_heap = acquire_pooled_gm_heap_wrapper,
     .acquire_pooled_gm_sm = acquire_pooled_gm_sm_wrapper,
@@ -342,6 +389,10 @@ static const HostApiOps g_host_api_ops = {
     .host_phase_pool_arm = host_phase_pool_arm,
     .host_phase_pool_finish = host_phase_pool_finish,
     .publish_chip_swimlane_extension = publish_chip_swimlane_extension,
+    // The simulated AICPU runs in this process and shares the runtime's
+    // address space, so a run's result never has to leave a device: nothing
+    // allocates a result region and nothing publishes into one.
+    .get_run_result = nullptr,
 };
 
 /* ===========================================================================
@@ -433,6 +484,18 @@ int simpler_init(
     if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
 
     SimDeviceRunnerBase *runner = static_cast<SimDeviceRunnerBase *>(ctx);
+
+    // Latching the identity is the first thing this entry does, so a context
+    // that already belongs to kernel mode is refused before any process- or
+    // runner-state mutation below. Latching PROGRAM is idempotent, which is
+    // what lets an init -> finalize -> init sequence on the same device run
+    // again.
+    const int latch_rc = runner->execution_mode_latch().latch(SIMPLER_MODE_PROGRAM);
+    if (latch_rc != 0) {
+        LOG_ERROR("simpler_init: refused — this context already belongs to kernel mode");
+        return latch_rc;
+    }
+
     runner->set_dma_workspace_request(enable_sdma != 0);
 
     int rc;
@@ -475,7 +538,7 @@ int simpler_init(
     // runtimes link the weak no-op. Only the ring sizing is read.
     if (prewarm_config != NULL) {
         try {
-            const HostApi prewarm_api(runner, 0, 0, &g_host_api_ops);
+            const HostApi prewarm_api(runner, 0, 0, 0, &g_host_api_ops);
             rc = prewarm_config_impl(
                 &prewarm_api, prewarm_config->runtime_env.ring_task_window, prewarm_config->runtime_env.ring_heap,
                 prewarm_config->runtime_env.ring_dep_pool
@@ -507,7 +570,7 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
                 runner->release_chip_callable_buffer(artifacts.chip_buffer_hash);
             }
         });
-        const HostApi host_api(runner, 0, 0, &g_host_api_ops);
+        const HostApi host_api(runner, 0, 0, 0, &g_host_api_ops);
         int rc = register_callable_impl(reinterpret_cast<const ChipCallable *>(callable), &host_api, &artifacts);
         if (rc != 0) {
             return rc;
@@ -665,15 +728,16 @@ static void emit_native_run_runner_wall(SimNativeRunContext *state) {
     state->runner_trace_start_ns = 0;
 }
 
-static int cleanup_failed_prepare(SimNativeRunContext *state, int execution_rc, bool clear_gm_sm) {
+static int cleanup_failed_prepare(SimNativeRunContext *state, int execution_rc) {
     const uint64_t trace_inv = state->trace_inv;
     const uint64_t trace_hid = state->trace_hid;
     const long long trace_start_ns = state->trace_start_ns;
-    if (clear_gm_sm) state->runtime.set_gm_sm_ptr(nullptr);
-    state->runner->finish_clock_correlation_session(false);
+    // A prepare that failed produced no device work, so there is no status to
+    // read and nothing written to copy back. Whatever bindings its bind got as
+    // far as recording are this attempt's, and end with it.
     int validation_rc = PTO_RUNTIME_ERR_INTERNAL;
     try {
-        validation_rc = validate_runtime_impl(&state->runtime, &state->host_api, execution_rc);
+        validation_rc = release_run_bindings_impl(&state->runtime, &state->host_api);
     } catch (...) {
         validation_rc = PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -740,15 +804,22 @@ int simpler_prepare_run(
         state->runner_claimed = true;
         state->trace_inv = trace_inv;
         state->trace_start_ns = trace_start_ns;
+        if (config->enable_chip_swimlane >= 3) state->clock_log_offset = host_clock_alignment_log_offset();
         STRACE_CONTEXT(state->trace_inv, state->trace_hid, 1);
 
         int rc = runner->attach_current_thread(runner->device_id());
-        if (rc != 0) return cleanup_failed_prepare(state, rc, true);
+        if (rc != 0) return cleanup_failed_prepare(state, rc);
 
         rc = runner->prepare_launch_shape(state->runtime, state->config);
-        if (rc != 0) return cleanup_failed_prepare(state, rc, true);
+        if (rc != 0) return cleanup_failed_prepare(state, rc);
 
         runner->apply_call_config(state->config);
+        // This run's host-phase state, before its bind records into it.
+        runner->begin_host_phase_run(state->descriptor.pipeline_slot, DfxRunConfig::from(state->config));
+        // Armed from this run's own config on the thread that is about to bind:
+        // a host-orchestrating runtime keeps the capture in thread-local state
+        // between orchestration and emit. Mirrors the onboard c_api.
+        runner->arm_host_dep_gen_capture(state->config.enable_dep_gen != 0);
 
         {
             STRACE("chip.run.bind");
@@ -757,16 +828,41 @@ int simpler_prepare_run(
                 state->config.runtime_env.ring_heap, state->config.runtime_env.ring_dep_pool
             );
         }
-        if (rc != 0) return cleanup_failed_prepare(state, rc, true);
+        if (rc != 0) return cleanup_failed_prepare(state, rc);
+        // The bind prepared this run's device image into staging the slot owns;
+        // this publishes it, before anything else touches the device arena. Two
+        // calls rather than one because the write is orderable on its own: the
+        // bytes are ready when the bind returns, and shipping them is this
+        // caller's decision.
+        {
+            STRACE("chip.run.publish_image");
+            rc = publish_run_image_impl(&state->runtime, &state->host_api);
+        }
+        if (rc != 0) {
+            LOG_ERROR("simpler_prepare_run: publishing this run's image failed: %d (%s)", rc, state->trace_attrs);
+            return cleanup_failed_prepare(state, rc);
+        }
         emit_host_dep_gen_graph(state->config, state->trace_attrs);
-        rc = runner->prepare_execution(
-            state->runtime, state->config, state->descriptor.pipeline_slot, state->identity(),
-            &state->prepared_execution
-        );
-        if (rc != 0) return cleanup_failed_prepare(state, rc, true);
+        // This run's own input bytes, into the buffers its bind just named.
+        {
+            STRACE("chip.run.stage_inputs");
+            rc = copy_in_run_inputs_impl(&state->runtime, &state->host_api);
+        }
+        if (rc != 0) {
+            LOG_ERROR("simpler_prepare_run: staging this run's inputs failed: %d (%s)", rc, state->trace_attrs);
+            return cleanup_failed_prepare(state, rc);
+        }
+        {
+            STRACE("chip.run.prepare_execution");
+            rc = runner->prepare_execution(
+                state->runtime, state->config, state->descriptor.pipeline_slot, state->identity(),
+                &state->prepared_execution
+            );
+        }
+        if (rc != 0) return cleanup_failed_prepare(state, rc);
         return 0;
     } catch (...) {
-        if (state != nullptr) return cleanup_failed_prepare(state, PTO_RUNTIME_ERR_INTERNAL, true);
+        if (state != nullptr) return cleanup_failed_prepare(state, PTO_RUNTIME_ERR_INTERNAL);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 }
@@ -856,6 +952,8 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     const uint64_t trace_inv = state->trace_inv;
     const uint64_t trace_hid = state->trace_hid;
     const long long trace_start_ns = state->trace_start_ns;
+    const uint64_t clock_log_offset = state->clock_log_offset;
+    const std::string output_prefix = state->config.output_prefix;
 
     STRACE_CONTEXT(state->trace_inv, state->trace_hid, 1);
 
@@ -897,13 +995,17 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
 
     int validation_rc = PTO_RUNTIME_ERR_INTERNAL;
     try {
-        if (!launched) state->runtime.set_gm_sm_ptr(nullptr);
         if (attach_rc == 0) {
             {
                 STRACE("chip.run.validate");
-                validation_rc = validate_runtime_impl(
-                    &state->runtime, &state->host_api, launched ? execution_rc : PTO_RUNTIME_ERR_INTERNAL
+                validation_rc = copy_back_run_outputs_impl(
+                    &state->runtime, &state->host_api, launched ? execution_rc : PTO_RUNTIME_ERR_INTERNAL,
+                    launched ? 1 : 0
                 );
+                // This run is the only user of its bindings, so they end here,
+                // after its outputs have come back through them.
+                const int release_rc = release_run_bindings_impl(&state->runtime, &state->host_api);
+                if (validation_rc == 0) validation_rc = release_rc;
             }
             if (launched && execution_rc == 0) emit_device_phase_markers(state->runner);
         } else {
@@ -917,15 +1019,17 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         state->runner->abandon_prepared_execution(*state->prepared_execution);
     }
 
-    // Correlation state is runner-wide. Finish it before releasing the claim,
-    // after which a successor may begin capture and replace the provider/session.
-    state->runner->finish_clock_correlation_session(false);
+    const bool export_clock_log = launched && execution_rc == 0 && validation_rc == 0 &&
+                                  state->runner->host_clock_alignment_log_required(state->descriptor.pipeline_slot);
     if (state->runner_claimed) {
         state->runner->release_native_run(state);
         state->runner_claimed = false;
     }
     destroy_native_run_context(state);
     emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns);
+    if (export_clock_log && !export_host_clock_alignment_log(output_prefix, trace_inv, clock_log_offset)) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
     if (validation_rc != 0) return validation_rc;
     return launched ? execution_rc : 0;
 }
@@ -942,7 +1046,21 @@ int simpler_run(
     return finalize_rc != 0 ? finalize_rc : rc;
 }
 
+// Sim prepares under the exclusive execution claim: `simpler_prepare_run` takes
+// `try_acquire_native_run` before it binds, and rejects a second run with
+// "another native run is active on this device context". There is also no
+// `try_reserve_native_run` on this base for a successor to hold — reservation
+// exists only onboard. So depth-2 pipelining is unreachable here rather than
+// switched off, and every overlap-dependent path in the shared runner base is
+// dead code when built for sim.
 int supports_concurrent_native_prepare_ctx(DeviceContextHandle) { return 0; }
+
+// Same reason, one step further on: with no second launched run reachable here,
+// there is never a predecessor to order anything behind. The entry exists so the
+// ABI stays uniform across platforms rather than resolving per backend.
+int supports_joined_native_launch_ctx(DeviceContextHandle) { return 0; }
+
+int simpler_launch_run_joined(DeviceContextHandle, RuntimeHandle, RuntimeHandle) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
 
 uint64_t get_arena_bank_gm_heap_base_ctx(DeviceContextHandle ctx, uint32_t bank_id) {
     if (ctx == NULL) return 0;
@@ -1010,6 +1128,61 @@ size_t committed_device_memory_ctx(DeviceContextHandle ctx) {
 int device_memory_info_ctx(DeviceContextHandle ctx, DeviceMemoryInfo *info) {
     if (ctx == NULL || info == NULL) return PTO_RUNTIME_ERR_INTERNAL;
     return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
+/* ===========================================================================
+ * Kernel-mode lifecycle
+ *
+ * Simulation never supports kernel mode: it has no real streams for a caller
+ * to lend. supported() is 0 and init refuses after the shared structural
+ * validation, so no context here ever latches kernel mode and
+ * prepare/launch reject with INVALID_STATE. Argument validation is shared
+ * with every other component through kernel_entry_validation.h, so an
+ * argument this stub accepts is one the onboard path accepts too.
+ * =========================================================================== */
+
+int simpler_kernel_mode_supported(DeviceContextHandle) { return 0; }
+
+int simpler_kernel_mode_init(
+    DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
+    const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,
+    const CallConfig *config, uint64_t context_generation
+) {
+    const int rc = validate_kernel_init_args(
+        ctx, device_id, aicpu_binary, aicpu_size, aicore_binary, aicore_size, dispatcher_binary, dispatcher_size,
+        config, context_generation
+    );
+    if (rc != 0) return rc;
+    try {
+        PipelineContract contract{};
+        const int contract_rc = build_kernel_pipeline_contract_impl(config, &contract);
+        if (contract_rc != 0 && contract_rc != PTO_RUNTIME_ERR_UNSUPPORTED) return contract_rc;
+        if (contract_rc == 0 &&
+            (!is_valid_pipeline_contract(&contract, SIMPLER_MODE_KERNEL) || !has_serviceable_arena_topology(contract) ||
+             !has_serviceable_stream_topology(contract))) {
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    LOG_ERROR("simpler_kernel_mode_init: kernel mode is not supported by the simulator");
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
+int simpler_kernel_mode_prepare_callable(
+    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size
+) {
+    const int rc = validate_kernel_prepare_callable_args(ctx, callable_id, callable, callable_size);
+    if (rc != 0) return rc;
+    LOG_ERROR("simpler_kernel_mode_prepare_callable: no live kernel context on this device context");
+    return PTO_RUNTIME_ERR_INVALID_STATE;
+}
+
+int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, const void *args, void *caller_stream) {
+    const int rc = validate_kernel_launch_args(ctx, callable_id, args, caller_stream);
+    if (rc != 0) return rc;
+    LOG_ERROR("simpler_kernel_mode_launch: no live kernel context on this device context");
+    return PTO_RUNTIME_ERR_INVALID_STATE;
 }
 
 }  // extern "C"

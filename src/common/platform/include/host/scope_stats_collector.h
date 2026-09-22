@@ -50,7 +50,7 @@
  *            "ring":int,"task_window_start":int,"task_window_end":int,
  *            "heap_start":uint,"heap_end":uint,
  *            "dep_pool_start":int,"dep_pool_end":int,
- *            "tensormap":int}
+ *            "tensormap":int,"run_epoch":uint,"buf_seq":uint}
  */
 
 #ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_SCOPE_STATS_COLLECTOR_H_
@@ -66,6 +66,7 @@
 #include "common/platform_config.h"
 #include "common/scope_stats.h"
 #include "common/unified_log.h"
+#include "host/collected_record.h"
 #include "host/profiler_base.h"
 
 // ---------------------------------------------------------------------------
@@ -79,6 +80,12 @@ struct ScopeStatsReadyBufferInfo {
     void *host_buffer_ptr;
     uint32_t buffer_seq;
 };
+
+/**
+ * A collected scope_stats record with its run. Alias over the shared wrapper —
+ * see host/collected_record.h for why identity is copied rather than referenced.
+ */
+using CollectedScopeStatsRecord = CollectedRecord<ScopeStatsRecord>;
 
 struct ScopeStatsModule {
     using DataHeader = ScopeStatsDataHeader;
@@ -198,6 +205,19 @@ public:
     bool is_initialized() const { return initialized_; }
     uint64_t total_collected() const { return total_collected_; }
 
+    /**
+     * Collected records, each carrying the run that produced it.
+     *
+     * Returned by value because the collector thread appends concurrently. A
+     * record's `run_epoch` is the one stamped on the device buffer it was
+     * copied from, so grouping by it attributes records to runs without relying
+     * on the collector having been cleared between them.
+     */
+    std::vector<CollectedScopeStatsRecord> collected_records() const;
+
+    /** How many collected records belong to `run_epoch`. */
+    size_t collected_for_run(uint64_t run_epoch) const;
+
 private:
     bool initialized_ = false;
 
@@ -206,8 +226,8 @@ private:
     // set_memory_context in init()).
     void *shm_dev_ = nullptr;
 
-    std::vector<ScopeStatsRecord> records_;
-    std::mutex records_mutex_;
+    std::vector<CollectedScopeStatsRecord> records_;
+    mutable std::mutex records_mutex_;
     uint64_t total_collected_ = 0;
     uint64_t recovered_current_buf_ = 0;
     uint64_t recovered_current_total_ = 0;

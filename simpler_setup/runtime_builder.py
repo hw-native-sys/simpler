@@ -60,6 +60,36 @@ def _get_git_head(repo_root: Path) -> str:
         return ""
 
 
+def _normalize_overlay_env(name: str) -> Optional[str]:
+    """Return "ON"/"OFF" for a CMake-style bool env var, or None if unset/invalid."""
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    normalized = value.strip().upper()
+    if normalized in {"1", "ON", "TRUE", "YES", "Y"}:
+        return "ON"
+    if normalized in {"0", "OFF", "FALSE", "NO", "N"}:
+        return "OFF"
+    return None
+
+
+def _a5_async_workspace_overlay_defines() -> dict[str, str]:
+    """Explicit a5 host backend selection for the two cached overlay options.
+
+    `SIMPLER_ENABLE_PTO_URMA_WORKSPACE` and `SIMPLER_ENABLE_PTO_RDMA_WORKSPACE`
+    are the host CMakeLists' only cached options, so each is forwarded with an
+    explicit ON/OFF: a value left in the CMake cache by an earlier build cannot
+    otherwise survive a reconfigure (build once with RDMA=ON, then unset it, and
+    the cached option stays ON). `SIMPLER_ENABLE_PTO_SDMA_WORKSPACE` is not
+    forwarded — it is an internal marker the CMakeLists derives from these two,
+    and a `-D` value for it is overwritten unconditionally.
+    """
+    return {
+        "SIMPLER_ENABLE_PTO_URMA_WORKSPACE": _normalize_overlay_env("SIMPLER_ENABLE_PTO_URMA_WORKSPACE") or "OFF",
+        "SIMPLER_ENABLE_PTO_RDMA_WORKSPACE": _normalize_overlay_env("SIMPLER_ENABLE_PTO_RDMA_WORKSPACE") or "OFF",
+    }
+
+
 def _abbrev_stamp(stamp: str) -> str:
     """Abbreviate each commit in a (possibly composite) cache stamp for logging.
 
@@ -396,9 +426,12 @@ class RuntimeBuilder:
                 defines["SIMPLER_RUNTIME_NAME"] = name
                 if build_pto_isa_commit:
                     defines["SIMPLER_PTO_ISA_BUILD_COMMIT"] = build_pto_isa_commit
-                for opt_in_define in ("SIMPLER_ENABLE_PTO_URMA_WORKSPACE",):
-                    if os.environ.get(opt_in_define, "").upper() in {"1", "ON", "TRUE", "YES"}:
-                        defines[opt_in_define] = "ON"
+                # Forward the full a5 backend selection — one explicit value per
+                # overlay — so a value left in the CMake cache by an earlier
+                # build cannot survive a reconfigure (see
+                # _a5_async_workspace_overlay_defines).
+                if self._arch == "a5" and self._variant == "onboard":
+                    defines.update(_a5_async_workspace_overlay_defines())
             cmake_defines = defines or None
             # compile() adds a {target}/ subdirectory inside build_dir
             cache_dir = self._CACHE_DIR / arch / variant / name

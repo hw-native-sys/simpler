@@ -10,7 +10,7 @@
  */
 /**
  * @file spin_hint.h
- * @brief Platform-specific spin-wait hint for AICPU (simulation)
+ * @brief Platform-specific spin-wait policy for AICPU (simulation)
  *
  * In simulation, all AICPU scheduler threads share a small number of host CPU
  * cores with AICore threads. Without explicit yielding, idle scheduler threads
@@ -27,8 +27,7 @@
  * lives in platform_config.h.
  */
 
-#ifndef PLATFORM_A2A3SIM_AICPU_SPIN_HINT_H_
-#define PLATFORM_A2A3SIM_AICPU_SPIN_HINT_H_
+#pragma once
 
 #include <cstdint>
 #include <sched.h>
@@ -51,4 +50,4 @@
 #define SPIN_WAIT_HINT() sched_yield()
 #endif
 
-#endif  // PLATFORM_A2A3SIM_AICPU_SPIN_HINT_H_
+constexpr int32_t PLATFORM_TENSOR_DATA_WAIT_TIMEOUT_MS = PLATFORM_SIM_TENSOR_DATA_WAIT_TIMEOUT_MS;

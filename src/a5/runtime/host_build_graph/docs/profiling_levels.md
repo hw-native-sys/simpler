@@ -10,7 +10,8 @@ The runtime uses a hierarchical profiling system with compile-time macros to con
 > Ordinary DAGs remain on the A5 HBG AICore Scheduler, while Graph replay
 > remains on its explicit AICPU compatibility path. Both producers export the
 > same `scheduler_records` schema; stream metadata identifies `producer` so
-> tools never apply AICPU scheduling assumptions to AICore intervals.
+> tools never apply AICPU scheduling assumptions to AICore intervals. The runtime
+> is stated once in the capture's document-level `metadata.runtime`.
 > **host_build_graph (host-orch) note.** The profiling **macros** below
 > (`SIMPLER_DFX`, `SIMPLER_ORCH_PROFILING`, …) are shared with
 > `tensormap_and_ringbuffer`. But the orchestrator-timing **device-log lines**
@@ -251,7 +252,7 @@ so records and spans read against each other with no alignment step.
 | Group | Kinds |
 | ----- | ----- |
 | Bind segments (one interval each, inside the stage) | `args`, `arena_build`, `static_arena`, `gm_heap`, `shared_mem`, `runtime_init`, `host_orch`, `graph_upload`, `arena_h2d`, `host_view_close` |
-| Orchestrator operations (inside `host_orch`) | `submit_task`, `alloc_tensors`, `record_in_graph_task`, `graph_submit`, `build_definition`, `graph_begin`, `recording_wait`, `graph_commit`, `submit_admit`, `record_handoff`, `generated_args` |
+| Orchestrator operations (inside `host_orch`) | `submit_task`, `alloc_tensors`, `record_sub_task`, `graph_submit`, `build_definition`, `graph_begin`, `recording_wait`, `graph_commit`, `submit_admit`, `record_handoff`, `generated_args` |
 
 Three of the orchestrator kinds end with a task submitted — `submit_task`,
 `alloc_tensors`, `graph_submit` — so their count is the bind's `total_tasks`
@@ -271,7 +272,7 @@ the wrong one produces a number that reads as data and is not:
 
 - **A record is an interval** — one operation, start to end. Its `detail` says
   *which* operation (a task id, a Graph key, the submission index) or *how much*
-  it covered (`build_definition`'s in-graph task count, `recording_wait`'s in-flight
+  it covered (`build_definition`'s sub-task count, `recording_wait`'s in-flight
   count). That is the whole contract.
 - **A quantity about a segment is an attribute** — `bytes=`, `heap_used=`,
   `spilled=`, `minflt=`, `nvcsw=`. It goes in the segment's attribute string,
@@ -339,7 +340,7 @@ python -m pytest <case> --platform <platform> --device 0 --enable-chip-swimlane 
   Both come from per-kind counters, not from the record pool. The counters use
   lock-free atomic additions across the main and recording-worker lanes, with
   every phase isolated on its own cache line so concurrent `graph_submit` and
-  `record_in_graph_task` updates do not false-share. The per-event pool is armed when the
+  `record_sub_task` updates do not false-share. The per-event pool is armed when the
   artifact is wanted (`SIMPLER_HBG_HOST_PHASE_RECORDS_ENABLE` *and* an output
   prefix) or whenever the chip swimlane is at `ORCH_PHASES`; a steady-state run
   satisfies neither, so it pays no pool append and no artifact lock at all. A
@@ -359,15 +360,23 @@ python -m pytest <case> --platform <platform> --device 0 --enable-chip-swimlane 
   This is the channel to read for a distribution or a per-event timeline; the
   summed lines cannot express either. Every record carries its producer Linux
   tid. `strace_timing.py --swimlane --host-phase-records <path>` draws each record
-  inside the matching `chip.run.bind`; `record_in_graph_task` and `build_definition`
+  inside the matching `chip.run.bind`; `record_sub_task` and `build_definition`
   appear on the `graph record worker` lane, while outer `graph_submit` events
   appear on the `graph submit main` lane.
 
-- **The host lanes of `chip_swimlane_records.json`**, at level 4 only. These
-  records are already Host ns; the device records reach the same axis through
-  the `chip.run.runner_run` window that contained them, which bounds the seam
-  rather than closing it (see `simpler_setup/tools/containment.py`). Two
-  projections of the pool land there:
+- **The host lanes of `chip_swimlane_records.json`**, normally at level 4.
+  An independently enabled `SIMPLER_HBG_HOST_PHASE_RECORDS_ENABLE=1` pool can
+  also supply them at level 3 through the shared export path. These records are
+  already Host ns. At level 3 or 4, automatic single-file conversion uses matching
+  TIMING-or-finer Host logs to place Device records within `chip.run.runner_run`.
+  The AICPU launch marker, when present, narrows the placement range. Conversion
+  saves `metadata.clock_alignment` anchors and bounds for source-file readers
+  (see `simpler_setup/tools/containment.py`). Without usable logs or a valid saved
+  mapping, the view remains unaligned. Captures with Host recording armed and finished at level 3 or 4
+  export `host_clock_alignment.<pid>.log` beside the swimlane during native
+  finalize, after the executing process's TIMING-or-finer logs are flushed.
+  This applies to direct L2 and forked ChipWorker runs without SceneTest.
+  Two projections land there:
 
   | Key | Kinds | Rendered as |
   | --- | ----- | ----------- |
@@ -444,7 +453,9 @@ AICPU Scheduler: `dispatch_time` is the end of dispatch publication and
 `scheduler_tasks.producer` field identifies which Scheduler produced these
 timestamps. At level 2 and above, A5 HBG also exports AICPU lifecycle timestamps
 for handshake, topology/configuration, context publication, bootstrap wait,
-register release, and exit; these are supplemental control-plane records.
+register release, and exit. Collection and rendering use one record per AICPU
+thread; topology/configuration is present only on the leader thread. These are
+supplemental control-plane records.
 
 At level 3 and above, A5 HBG AICore Scheduler task intervals reuse the per-task
 trace. Consecutive taskless scheduler-loop iterations are coalesced into one
@@ -454,6 +465,33 @@ keeps capture size dependent on idle-to-active transitions instead of Host CPU
 speed in simulation. The buffer is not allocated below level 3. Interval
 endpoints are captured at operation entry and exit; no interval is synthesized
 from aggregate durations.
+
+Each AICore Scheduler stream renders on one lane. Bootstrap covers dependency
+initialization and Slot setup, then ends before the initial task dispatch; the
+per-task Fanin work is therefore not emitted as a nested phase. Runtime task
+processing uses flat, non-overlapping phases:
+
+- `complete` consumes a Completion Inbox entry and marks the task done.
+- `resolve` updates successor dependencies and publishes newly Ready tasks.
+- `state_probe` checks Scheduler-local Dispatch Slot / Ready state, acquires a task from a Ready
+  Inbox locally or by stealing, and decides immediate or deferred placement.
+- `dispatch` fills and publishes a task acquired from the local Inbox.
+- `worksteal` fills and publishes a task acquired from another Inbox; the steal
+  operation itself is included in `state_probe`.
+- `refill` republishes a completed Slot with replacement work.
+
+A compatible single-fanin successor selected during completion resolution uses
+the `DIRECT_RESOLVE` source and moves directly from `resolve` to `refill`
+without a `state_probe`. A replacement acquired from a Ready Inbox retains its
+`state_probe` even when the completed Slot is reused through `refill`.
+
+Deferred waiting is not emitted as a Scheduler phase. The original
+`state_probe` ends before the wait, and the eventual publication begins at its
+actual `dispatch` or `refill` start.
+
+Every executed task is published by exactly one of `dispatch`, `worksteal`, or
+`refill`. The converter displays these phases as Completion, Resolve,
+StateProbe, Dispatch, Worksteal, and Refill.
 
 At level 1 the AICore record carries the full `task_token_raw`
 (a `TaskId::raw`; see `src/common/host_build_graph/task_id.h`), read straight from

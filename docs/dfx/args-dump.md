@@ -26,7 +26,7 @@ saw, without the timing distortion of inline printing.
   reconstructable.
 - **Manifest + level-dependent binary payload.** Once at least one record is
   collected, every enabled level writes `args_dump.json`. Levels 1 and 2 then
-  create `args.bin` eagerly; hybrid Level 3 creates it lazily only when an
+  create `args.bin` eagerly; `hybrid` creates it lazily only when an
   `Arg::dump(...)`-selected tensor contributes payload. Tensor payload records
   carry `bin_offset` / `bin_size`, while scalar values remain manifest-only.
 - **Unified scalar args.** Scalar values are emitted as
@@ -39,70 +39,70 @@ saw, without the timing distortion of inline printing.
   Real tensor-payload consumption is currently supported only on the
   `a2a3` platform family; see the platform scope below.
 
-Enable in one line (`2` = full dump, every task):
+Enable in one line (`full` = every task, every arg):
 
 ```bash
-python tests/st/<case>/test_<name>.py -p a2a3sim --dump-args 2
+python tests/st/<case>/test_<name>.py -p a2a3sim --dump-args full
 ```
 
 ## 3. How to Use
 
 ### 3.1 Enable Args Dump
 
-`--dump-args` takes an optional **level**:
+`--dump-args` takes an optional **mode**. The modes are two independent
+choices — which tasks reach `args_dump.json`, and which of those also write
+payload bytes into `args.bin` — rather than a severity dial, so they are named
+rather than numbered:
 
-| Level | Meaning |
-| ----- | ------- |
-| `0` (or flag absent) | off — zero overhead |
-| `1` (bare `--dump-args`) | **partial** — only args marked with `CoreTaskArgs::dump(...)` (see §3.2) |
-| `2` (`--dump-args 2`) | **full** — every task's tensor inputs/outputs and scalar args |
-| `3` (`--dump-args 3`) | **hybrid** — every task's tensor/scalar metadata goes to `args_dump.json`; tensors marked with `CoreTaskArgs::dump(...)` also contribute payload to `args.bin` |
+| Mode | Manifest | Payload |
+| ---- | -------- | ------- |
+| flag absent, or `off` | — | — |
+| `partial` (bare `--dump-args`) | args marked with `CoreTaskArgs::dump(...)` (see §3.2) | the same marked args |
+| `hybrid` | every task | marked args only |
+| `full` | every task | every arg |
 
-> **Tensor-payload platform scope:** levels 1/2 and marked level 3 are
-> currently supported for payload consumers only on `a2a3` / `a2a3sim`.
-> On `a5` / `a5sim`, payload truth remains outside the supported consumer
-> contract while [#1560](https://github.com/hw-native-sys/simpler/issues/1560)
-> is open. Do not use an a5 dump as a source of tensor truth. A marked
-> level-3 payload still produces `args.bin` on that platform family, but it is
-> not trustworthy for a Core swimlane replay that restores it.
-> Plain level-3 metadata, including inline scalar values, does not consume
+> **Tensor-payload platform scope:** payload is written on both platform
+> families. a5 payload truth was broken by
+> [#1560](https://github.com/hw-native-sys/simpler/issues/1560) and is fixed;
+> the scene test now asserts a known payload value in every mode that writes
+> one, on a2a3 and a5 alike.
+> Plain `hybrid` metadata, including inline scalar values, does not consume
 > tensor payload and remains available.
 
-The hybrid Level 3 is the capture mode used by
+`hybrid` is the capture mode used by
 `python -m simpler_setup.tools.core_swimlane` to build a Core swimlane simulator replay:
 it provides complete per-task argument metadata without dumping every tensor's
 element data. It reuses the exact task/argument mask produced by
-`CoreTaskArgs::dump(...)` for Level 1: every argument still gets a JSON record,
+`CoreTaskArgs::dump(...)` for `partial`: every argument still gets a JSON record,
 while only marked tensors contribute bytes to `args.bin`.
 Scalar values already live inline in the manifest and never need payload copy.
 With no `dump(...)` markers, the AICPU skips all arena payload copies, the
 manifest's `bin_file` is `null`, and every `bin_size` is `0`.
 
-Level 3 deliberately inherits Level 1's selector semantics; it does not add a
-second mask. `tensormap_and_ringbuffer` registers selection metadata in its
+`hybrid` deliberately inherits `partial`'s selector semantics; it does not add
+a second mask. `tensormap_and_ringbuffer` registers selection metadata in its
 AICPU per-task table. `host_build_graph` embeds the same mask, ambiguity flags,
-and scalar dtypes in each H2D task image, including cached in-graph task
-definitions. The device collector consumes either source identically. On `a5`,
-however, the resulting tensor bytes remain untrusted under #1560, so payload
-restoration stays outside this change until that issue is fixed.
+and scalar dtypes in each H2D task image, including cached sub-task
+definitions. The device collector consumes either source identically.
 
 ```bash
 # Standalone runner
-python tests/st/<case>/test_<name>.py -p a2a3sim --dump-args 2  # full
-python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --dump-args   # partial (level 1)
+python tests/st/<case>/test_<name>.py -p a2a3sim --dump-args full
+python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --dump-args        # partial
 
 # pytest
-pytest tests/st/<case> --platform a5sim --dump-args 2
+pytest tests/st/<case> --platform a5sim --dump-args full
 # a5 host_build_graph has no examples — use the scene test
-pytest tests/st/a5/host_build_graph/dump_args --platform a5sim --dump-args 2
-pytest tests/st/<case> --platform a2a3sim --dump-args 2
-pytest tests/st/a2a3/host_build_graph/vector_example --platform a2a3sim --manual include --dump-args 2
+pytest tests/st/a5/host_build_graph/dump_args --platform a5sim --dump-args full
+pytest tests/st/<case> --platform a2a3sim --dump-args full
+pytest tests/st/a2a3/host_build_graph/vector_example --platform a2a3sim --manual include --dump-args full
 ```
 
-The level sets `CallConfig::enable_dump_args` (0/1/2/3). The host then
+The mode sets `CallConfig::enable_dump_args` (`off`/`partial`/`hybrid`/`full`,
+stored as 0/1/2/3). The host then
 allocates dump storage, publishes its base address through
 `kernel_args.dump_data_base`, and sets `SIMPLER_DFX_FLAG_DUMP_ARGS`
-(levels 1, 2, and 3) in each worker handshake's `enable_profiling_flag` for
+(every mode but `off`) in each worker handshake's `enable_profiling_flag` for
 the enable/disable decision. The **partial / full / hybrid**
 distinction is carried as a `DumpArgsLevel` in the dump shared-memory header
 (`DumpDataHeader::dump_args_level`, host-written before launch) rather
@@ -122,7 +122,7 @@ bit to insert a `pipe_barrier(PIPE_ALL)` before FIN when dump is on, so
 
 ### 3.2 Partial Dump — Select Specific Args
 
-Partial dump (level 1) captures only the tasks whose `CoreTaskArgs` is marked
+`partial` captures only the tasks whose `CoreTaskArgs` is marked
 with `dump(...)`; every unmarked task is skipped. Within a marked task,
 only the selected tensor/scalar args are recorded. Mark the arguments on
 the relevant `CoreTaskArgs` before submission:
@@ -176,19 +176,18 @@ Selective dump comes at two granularities, both expressed with the same
   rt_submit_aiv_task(FUNC_ADD, args);
   ```
 
-Partial vs full is chosen by the **dump level** (§3.1), latched host-side
-before any dispatch — not inferred from the markers, so it never depends
-on task submission order. At level 1, tasks without a marker are skipped
-and marked tasks dump only their selected arguments. At level 2, the
-markers are ignored and every task's tensors/scalars are dumped. At level
-3, every task's tensors/scalars are dumped as metadata and the same markers
-control which tensor records carry payload. A5 tensor payload remains
-unsupported under [#1560](https://github.com/hw-native-sys/simpler/issues/1560).
-With no `--dump-args` (level 0) dump is off entirely.
+Which tasks and args are captured is chosen by the **mode** (§3.1), latched
+host-side before any dispatch — not inferred from the markers, so it never
+depends on task submission order. Under `partial`, tasks without a marker are
+skipped and marked tasks dump only their selected arguments. Under `full`, the
+markers are ignored and every task's tensors/scalars are dumped. Under
+`hybrid`, every task's tensors/scalars are dumped as metadata and the same
+markers control which tensor records carry payload. With no `--dump-args`, dump
+is off entirely.
 
-If you run at level 1 but place no `dump(...)` markers anywhere, the
-collector receives no records and exports no manifest — that is the deliberate
-"only what I marked" contract. Use `--dump-args 2` when you want everything.
+If you run `partial` but place no `dump(...)` markers anywhere, the collector
+receives no records and exports no manifest — that is the deliberate "only what
+I marked" contract. Use `--dump-args full` when you want everything.
 
 ### 3.3 Output
 
@@ -201,27 +200,25 @@ The dump artifacts land under the per-task output prefix
 <output_prefix>/
 └── args_dump/
     ├── args_dump.json  # unified argument manifest (`--dump-args`)
-    └── [args.bin]      # eager at levels 1/2; present at level 3 only with selected tensor payload
+    └── [args.bin]      # eager for partial/full; present for hybrid only with selected tensor payload
 ```
 
 Filenames are fixed (no per-file timestamp) — the directory is the
 per-task uniqueness boundary. Once at least one record reaches the collector,
-levels 1/2 create `args.bin`, which may be empty when no tensor payload was
-selected or recorded. Hybrid Level 3 with records but no selected tensor
+`partial` and `full` create `args.bin`, which may be empty when no tensor
+payload was selected or recorded. `hybrid` with records but no selected tensor
 payload emits only `args_dump.json`; otherwise it also emits `args.bin`.
-On a5, a present and correctly sized `args.bin` does not establish payload
-truth while [#1560](https://github.com/hw-native-sys/simpler/issues/1560) is
-open.
 
 #### `args_dump.json` — Unified manifest
 
 `args_dump.json` is the manifest; its `bin_file` field points at
-the sibling binary payload. A plain level-3 capture has `bin_file: null`, no
-`.bin`, and `bin_size: 0` for every entry. A level-3 capture with marked tensors
-has `bin_file: "args.bin"`; only the `CoreTaskArgs::dump(...)`-marked tensor
-records have a non-zero `bin_size`.
+the sibling binary payload. A `hybrid` capture with no marked tensors has
+`bin_file: null`, no `.bin`, and `bin_size: 0` for every entry. A `hybrid`
+capture with marked tensors has `bin_file: "args.bin"`; only the
+`CoreTaskArgs::dump(...)`-marked tensor records have a non-zero `bin_size`.
 
-Example manifest (one input tensor captured before dispatch):
+Example manifest, from a `full` capture (one input tensor captured before
+dispatch):
 
 ```json
 {
@@ -230,7 +227,7 @@ Example manifest (one input tensor captured before dispatch):
     "type": "logical_contiguous",
     "byte_order": "little_endian"
   },
-  "dump_args_level": 2,
+  "dump_args_level": 3,
   "total_args": 1,
   "before_dispatch": 1,
   "after_completion": 0,
@@ -263,7 +260,8 @@ Example manifest (one input tensor captured before dispatch):
 
 Key fields:
 
-- `dump_args_level` — the capture mode (`0` / `1` / `2` / `3`).
+- `dump_args_level` — the capture mode, as its wire value
+  (`0` off / `1` partial / `2` hybrid / `3` full).
 - `task_id` — runtime task identity. Use to correlate with swimlane / PMU
   output.
 - `func_id` — **array** of the task's active-subtask kernel ids (its mix
@@ -399,7 +397,7 @@ DumpDataHeader                                  (host init, AICPU reads)
 ├── num_dump_threads
 ├── records_per_buffer
 ├── magic = 0x44554D50 ("DUMP")
-└── dump_args_level  (DumpArgsLevel: 0=off, 1=partial, 2=full, 3=hybrid; AICPU latches before dispatch)
+└── dump_args_level  (DumpArgsLevel: 0=off, 1=partial, 2=hybrid, 3=full; AICPU latches before dispatch)
 
 DumpBufferState[num_dump_threads]               (per-thread)
 ├── free_queue {buffer_ptrs[SLOT_COUNT], head, tail}
@@ -710,7 +708,7 @@ before that flush runs, `reconcile_counters` recovers a non-empty
 | Host transport | `halHostRegister` shared memory | host-shadow `malloc` + targeted `rtMemcpy`/`memcpy` |
 | `MemoryOps` callbacks | 3 (`alloc`, `reg`, `free_`) | 5 (+ `copy_to_device`, `copy_from_device`) |
 | Arena access | direct via SVM | targeted `copy_from_device` inside `on_buffer_collected` |
-| Tensor-payload support | Supported | payload consumers remain unsupported while #1560 is open |
+| Tensor-payload support | Supported | Supported |
 | `reconcile_counters` | recover leftover current buffers + dropped accounting | identical |
 | Lifecycle | `initialize` → `start` → `stop` → `reconcile_counters` → `export_dump_files` → `finalize` | identical |
 
@@ -721,7 +719,7 @@ Args Dump is opt-in and zero-overhead when disabled — without
 AICore skip the dump-specific code paths. The `pipe_barrier(PIPE_ALL)`
 before FIN is also gated on the same handshake bit.
 
-With `--dump-args`, AICPU records level-selected tensor/scalar metadata and
+With `--dump-args`, AICPU records mode-selected tensor/scalar metadata and
 copies tensor payload according to the level table in §3.1. Scalar values stay
 manifest-only. When tensor payload is selected, the per-task overhead is
 dominated by:
@@ -861,17 +859,16 @@ Per-thread arena =
 ## 8. FAQ and Debug Guide
 
 **No `args_dump/` directory or `args_dump.json` in the output.** Check that
-`--dump-args` was passed; without it (level 0) the host does not allocate dump
-storage. The collector exports files only after receiving at least one record,
-so the same result is expected when the kernel dispatches no arguments or when
-Level 1 has no `CoreTaskArgs::dump(...)` markers. Add markers (§3.2), or pass
-`--dump-args 2` for a full dump.
+`--dump-args` was passed; without it the host does not allocate dump storage.
+The collector exports files only after receiving at least one record, so the
+same result is expected when the kernel dispatches no arguments or when
+`partial` has no `CoreTaskArgs::dump(...)` markers. Add markers (§3.2), or pass
+`--dump-args full`.
 
-**a5 `args.bin` fails known-value validation.** Treat this as the payload-truth
-problem tracked by [#1560](https://github.com/hw-native-sys/simpler/issues/1560)
-while that issue remains open; it is not evidence that the recorded tensors
-were actually zero. Use `a2a3` / `a2a3sim` for any payload consumer. Plain
-level-3 metadata remains usable on a5 because it does not read tensor bytes.
+**`args.bin` fails known-value validation.** The scene test asserts a known
+payload value in every mode that writes one, on both platform families, so a
+fresh failure here is a real capture defect rather than an accepted platform
+limitation.
 
 **Manifest has tasks but expected tensor records are missing.** AICPU received
 a payload whose tensor count or metadata did not match what the orchestrator

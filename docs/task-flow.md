@@ -192,7 +192,7 @@ snapshot for that purpose.
 ④ ChipStorageTaskArgs (ChipTensor records + scalars)
      │ native run or prepare/launch/poll/finalize lifecycle
      ▼
-    chip runtime stages host-backed data or uses owned device memory
+    chip runtime copies host-backed data in or uses owned device memory
 ```
 
 A public L2 `Worker.run()` performs the same materialization in its own
@@ -210,7 +210,6 @@ struct CallConfig {
     int32_t enable_pmu = 0;           // 0 = disabled; >0 selects PMU event type
     int32_t enable_dep_gen = 0;
     int32_t enable_scope_stats = 0;
-    int32_t capture_clock_anchors = 0; // set by the ChipWorker child, not by callers
     RuntimeEnv runtime_env;      // three arrays of four uint64_t overrides
     char    output_prefix[1024] = {};
 };
@@ -248,7 +247,7 @@ run token for the staged prepare/launch/poll/finalize path.
 
 This boundary is a descriptor resolution and materialization step, not a
 memcpy from the mailbox tensor array into `ChipTensor[]`. Host-backed arguments
-may need device staging and output copy-back; device-backed arguments must
+may need a device copy-in and output copy-back; device-backed arguments must
 resolve to allocations owned by the target chip. The native `ChipWorker`
 consumes the resulting POD and invokes the runtime's execution lifecycle.
 
@@ -336,22 +335,46 @@ interleave with another run even when both graphs contain ready tasks. TensorMap
 keys remain `(run_id, tensor_key)`, so adjacent runs may reuse the same tensor
 address without creating cross-run dependencies.
 
-The terminal transition releases the reservation and lease exactly once,
-wakes whichever submission was blocked on capacity, and activates the next prepared run. Empty
-runs take the same transition immediately. If graph construction fails, every
-unstarted slot is poisoned and consumed, its ready-queue partition is erased,
-and the lease is returned without dispatching device work.
+The terminal transition releases the reservation exactly once, returns the
+lease if the run actually held one, wakes whichever submission was blocked on
+admission capacity, and re-lends the freed slot before activating the next
+prepared run. Empty runs take the same transition immediately. If graph
+construction fails, every unstarted slot is poisoned and consumed, its
+ready-queue partition is erased, and any lease the run held is returned without
+dispatching device work — a run that never reached an active or preparable role
+holds none and returns none.
 
 Each direct chip child publishes its runtime contract's `pipeline_depth` in
-the startup mailbox before `INIT_READY`. The parent configures admission to the
-minimum published depth. Backends without a depth-two contract therefore keep
-depth-one serial behavior instead of receiving an invalid slot-1 lease.
+the startup mailbox before `INIT_READY`. The parent configures the native
+pipeline-slot lease pool to the minimum published depth. Backends without a
+depth-two contract therefore keep depth-one serial behavior instead of
+receiving an invalid slot-1 lease.
 
-Whole-run admission decides when a slot may be leased and carries the lease
-from `TaskSlot` through the chip mailbox into the runtime slot, so a production
-run executes under the lease its run holds rather than unconditionally on slot
-0. The scheduler dispatches device work only for the run that holds the FIFO
-head and still owns its lease.
+Logical admission and that lease pool are separate budgets. `begin_run` admits
+a run against the admission FIFO's own capacity and gives it no lease; the
+lease is handed to the two roles that can use one — the FIFO head and the first
+eligible preparable successor — when a run reaches that role. A run that has
+not reached one carries the reserved invalid lease encoding
+(`generation == 0`), which is neither dispatchable nor preparable. The FIFO
+bound is `Worker(pending_run_depth=...)` on a level >= 3 Worker; zero, the
+default, derives it from the native depth, so an unconfigured Worker admits
+exactly what it did when the two budgets were one. A positive value below the
+native depth is legal and simply leaves the successor role unfillable, since
+that role needs a second FIFO entry to exist.
+
+`pending_run_depth` bounds the count of non-terminal runs and nothing else. It
+is not a byte budget — the task-slot ring still limits slots and heap bytes
+during submission, waiting and then timing out on its own terms — and it does
+not bound a terminal run whose `RunHandle` the caller has not released, since a
+run leaves the FIFO at retirement rather than at release.
+
+Whole-run admission carries the lease from `TaskSlot` through the chip mailbox
+into the runtime slot, so a production run executes under the lease its run
+holds rather than unconditionally on slot 0. Slots a run registered before it
+acquired a lease are restamped when it does, which is what keeps both the
+`TASK_READY` and `PREPARE_READY` dispatch identities valid. The scheduler
+dispatches device work only for the run that holds the FIFO head and still owns
+its lease.
 
 The L2 host-runtime boundary exposes `prepare -> launch -> poll/wait ->
 finalize`, and the existing `simpler_run` / `ChipWorker.run` surface is the
@@ -363,6 +386,96 @@ concurrent native preparation may own one active token and one prepared but
 unlaunched and unaccepted successor token in separate lease-selected banks.
 Other backends permit only one unfinished native run, including a
 prepared-but-not-launched run.
+
+#### HBG build ownership
+
+A loaded host-orchestration SO keeps its current `RuntimeContext` in a
+module-local global. One build owns that binding until **all recorder jobs
+have returned**, including their captured-object cleanup. A later build must
+not rebind it early. Recording different Graph bodies within the same build
+remains parallel, and host construction may overlap an earlier run's device
+execution.
+
+The supported entry paths establish this ownership as follows:
+
+| Boundary | Ownership rule |
+| -------- | -------------- |
+| `Worker.submit` | The submission lock serializes the Python construction callback. |
+| `ChipWorker::prepare_native_run_on_slot` | A slot in `PREPARING` or `PREPARED` rejects another prepare; a successor may prepare only beside a `LAUNCHED` or `REAPED` predecessor. |
+| `simpler_prepare_run` | The runner reservation is acquired before bind and permits only one reserved successor beside the active owner. |
+| Callable registration | Each registration materializes a unique temporary SO and loads it with `RTLD_LOCAL`; separate registrations do not intentionally share a binding global. |
+| Host orchestration entry | A scope guard drains the recorder pool on normal return and exception unwinding, before Graph commit or destruction of the local build state. |
+
+The pool borrows each in-flight entry's formal parameters; it does not own the
+Graph state, orchestrator, tensor views, or SO code its jobs use. Finishing a
+Graph recording is therefore insufficient to release these resources: the
+worker must also finish the rest of its job and destroy its captures. The
+entry guard joins that work while all borrowed state is alive and preserves
+the original construction exception. Unregistration remains subject to the
+existing lifecycle contract; this is not support for unloading a callable
+concurrently with a build.
+
+Tests in `test_hbg_bind_ledger.cpp` drive each architecture's real bind with
+resolved test entry points and the real recorder pool. They check the normal
+and throwing-entry cleanup boundaries and a successful bind after failure.
+They do not load a generated SO or establish device concurrency. If admission
+is widened, retain the one-build-per-loaded-SO contract and recheck these
+boundaries; adding a lock to every Graph recording would serialize the wrong
+unit.
+
+#### HBG host access and input readiness
+
+HBG reads control values while constructing the graph on the host. Those
+values must already exist when bind begins; ordering device launches on a
+stream cannot make an earlier host read wait for a kernel that has not run.
+
+| Access during host construction | Contract |
+| ------------------------------- | -------- |
+| Host-backed `IN` / `INOUT` argument | Bind copies input bytes before calling the orchestration entry and exposes the caller's host view. A host scalar write updates that view and pushes the scalar to its device staging slice. |
+| Child-memory argument | The caller supplies ready device data. The accessor uses a host mapping when available, otherwise a device copy for each scalar access. |
+| Runtime-created output, or an alias the overlap checker cannot prove disjoint from a writer in this graph | Both `get_tensor_data` and `set_tensor_data` reject the access with `INVALID_ARGS`; they do not wait for the current graph to execute. |
+| A region the overlap checker proves disjoint, or an independent / shared read-only input | A writer elsewhere does not impose a wait on this host access. The data still has to satisfy the caller's cross-run contract. |
+| Host-backed pure `OUT` argument | It has no initialized input value or registered host view during bind. |
+
+Disjointness is decided by `ChipTensorMap::lookup` and
+`ChipTensorMapEntry::check_overlap`, and it is proven two ways: the two views'
+flat element ranges do not intersect, which needs no shared layout, or both
+views share the same canonical row-major layout and the per-dimension check
+finds no intersection. When the flat ranges do intersect and that per-dimension
+check does not apply — a differing dtype or rank, a stride mismatch, a stepped
+or permuted view, a start offset that does not decompose, or a higher tensor
+version — the checker conservatively reports an overlap. A host access to such
+a view of a buffer this graph writes is therefore refused even where the two
+regions are in fact disjoint, and the refusal names a producer task.
+
+Across runs, the caller owns readiness and conflicting access ordering. Before
+constructing a successor that reads or modifies a predecessor's output, wait
+for that predecessor and complete any required device-to-host copy-back. With
+the public API, finish the producer handle's `result()` before submitting the
+consumer whose host construction needs those bytes. A native device fence by
+itself is insufficient when the host view still holds the old value. For
+child memory, preserve the allocation and wait for the device writer; there
+is no host staging copy-back to substitute for that wait.
+
+An independent successor or one sharing only read-only inputs may prepare
+early. No global cross-run tensor reader/writer registry or implicit accessor
+wait enforces this caller contract. The current-graph producer check is local
+to that build and does not prove cross-run readiness. In particular, a host
+`set_tensor_data` must not race a predecessor device reader, even if a later
+kernel launch would be ordered behind that predecessor.
+
+`copy_in_run_inputs_impl` therefore remains a no-op for HBG: moving its input
+copy after bind would leave host construction without its promised input
+view. TMR's device-side ordering and WAR/INOUT dependency handling are separate
+contracts.
+
+`HbgHostAccessContractTest` exercises the real bind, scalar accessors and
+copy-back against a fake memory backend on both architectures. It covers
+ready host/child inputs, explicit predecessor copy-back, independent early
+preparation, producer and overlapping-writer rejection, and disjoint access.
+It models completed device writes; it does not prove hardware completion,
+cache visibility, or the public handle's scheduling behavior. Those boundaries
+must remain covered when native admission or `Worker.submit` changes.
 
 #### Two-frame endpoint staging lane
 
@@ -431,22 +544,23 @@ long run; a finite control timeout includes this deferral interval, and expiry
 poisons the local endpoint because the pending command's completion is
 uncertain.
 
-#### TRB temporary buffer
+#### Retained temporary buffer
 
-`tensormap_and_ringbuffer` stages ordinary non-child tensor arguments through a
+Both host runtimes copy ordinary non-child tensor arguments in through a
 retained temporary buffer owned per pipeline slot, instead of a per-run `device_malloc()` /
-`device_free()` pair. This is always on for TRB — an internal allocation
+`device_free()` pair. This is always on — an internal allocation
 optimization with no user-facing switch. It is not serialized in task mailboxes
 and does not change `TaskArgs`, `CallConfig`, child-memory tensors, or public
 `Worker.malloc()` / `Worker.free()` semantics.
 
-On each TRB bind the host runtime sizes the retained buffer from the run's
+On each bind the host runtime sizes the retained buffer from the run's
 non-child tensors, growing it (free old + malloc new) only when a run needs
 more than is currently retained, and bump-slices each tensor from it. The
 buffer lives on the `DeviceRunner` across runs (freed once at finalize); the
 platform only stores its `{addr, size}` slot. If a grow allocation fails the
-run fails before device argument staging. See the runtime's `RUNTIME_LOGIC.md`
-§2.4 for the grow/reuse mechanics.
+run fails before the device arguments are copied in. The grow/slice logic is
+`RetainedTempBump` in `src/common/utils/retained_temp_bump.h`; see
+`tensormap_and_ringbuffer`'s `RUNTIME_LOGIC.md` §2.4 for the mechanics.
 
 ### SUB-type child loop (Python callable leaf)
 
@@ -753,7 +867,7 @@ Step-by-step (one chip worker):
 | 5 | WT_chip_0 parent side | encode one leased task frame: write `config`, digest prefix, and the args blob; publish `TASK_READY` for the active lane or `PREPARE_READY` for a staged successor |
 | 6 | chip_0 child process | validate the frame and resolve its digest; ordinary HBG with an active predecessor also prepares the leased inactive arena bank before publishing `FRAME_STAGED`, while a frame with no active predecessor, diagnostic HBG, and TMR publish after validation and defer native prepare |
 | 7 | chip_0 native-run path | after activation and the predecessor's finalization fence, launch an already-prepared HBG run or finish deferred native preparation and then launch; poll it to completion and finalize it before another staged frame may launch. Compatibility endpoints perform the equivalent operation through blocking `ChipWorker::run` |
-| 8 | runtime.so | stage resolved host-backed tensors on the device; dispatch AICPU / AICore; copy output back to `c` during finalization |
+| 8 | runtime.so | copy resolved host-backed tensors in to the device; dispatch AICPU / AICore; copy output back to `c` during finalization |
 | 9 | chip_0 child | native finalization returns; write `TASK_DONE` |
 | 10 | WT_chip_0 parent | observe `TASK_DONE`; push success completion |
 | 11 | Scheduler | mark slot COMPLETED; fanout release (none in this DAG); scope_end will release scope ref |

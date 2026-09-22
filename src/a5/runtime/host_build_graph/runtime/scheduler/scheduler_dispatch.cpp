@@ -1226,7 +1226,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         return -1;
     }
 
-    Handshake *hank = static_cast<Handshake *>(runtime->workers);
+    Handshake *hank = static_cast<Handshake *>(runtime->dev.workers);
 
     LOG_INFO("Thread %d: dispatch starting with %d cores", thread_idx, core_trackers_[thread_idx].core_num());
     int32_t cur_thread_completed = 0;
@@ -1603,7 +1603,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             }
 
             if (idle_iterations % STALL_LOG_INTERVAL == 0) {
-                log_stall_diagnostics(thread_idx, total_tasks_, idle_iterations, last_progress_count);
+                log_stall_diagnostics(
+                    thread_idx, total_tasks_, idle_iterations, last_progress_count, StallDumpReport::Periodic
+                );
             }
             // Wall-clock budget gate, with two fatal-latch branches:
             //

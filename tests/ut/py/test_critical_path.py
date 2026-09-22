@@ -11,6 +11,7 @@
 import json
 
 from simpler_setup.tools import critical_path
+from simpler_setup.tools.swimlane_converter import TMR_RUNTIME
 
 
 def _write_rank_artifacts(rank_dir, name_map_filename):
@@ -18,7 +19,7 @@ def _write_rank_artifacts(rank_dir, name_map_filename):
     (rank_dir / "chip_swimlane_records.json").write_text(
         json.dumps(
             {
-                "metadata": {"clock_freq_hz": 1_000_000},
+                "metadata": {"runtime": TMR_RUNTIME, "clock_freq_hz": 1_000_000},
                 "aicore_tasks": [[0, 1, 0, 0, 10, 0]],
             }
         )
@@ -39,7 +40,7 @@ def _write_visualization_artifacts(rank_dir):
     (rank_dir / "chip_swimlane_records.json").write_text(
         json.dumps(
             {
-                "metadata": {"clock_freq_hz": 1_000_000},
+                "metadata": {"runtime": TMR_RUNTIME, "clock_freq_hz": 1_000_000},
                 "aicore_tasks": [
                     [0, 1, 0, 0, 10, 0],
                     [1, 2, 0, 0, 19, 0],
@@ -85,7 +86,7 @@ def _write_visualization_artifacts(rank_dir):
             "args": {"taskId": 1},
             "cat": "event",
             "id": 10,
-            "name": "kernel_a(t1)",
+            "name": "kernel_a(r0t1)",
             "ph": "X",
             "pid": 4,
             "tid": 10000,
@@ -96,7 +97,7 @@ def _write_visualization_artifacts(rank_dir):
             "args": {"taskId": 2},
             "cat": "event",
             "id": 11,
-            "name": "kernel_b(t2)",
+            "name": "kernel_b(r0t2)",
             "ph": "X",
             "pid": 4,
             "tid": 10010,
@@ -107,7 +108,7 @@ def _write_visualization_artifacts(rank_dir):
             "args": {"taskId": 3},
             "cat": "event",
             "id": 12,
-            "name": "kernel_c(t3)",
+            "name": "kernel_c(r0t3)",
             "ph": "X",
             "pid": 4,
             "tid": 10010,
@@ -118,7 +119,7 @@ def _write_visualization_artifacts(rank_dir):
             "args": {"phase": "dummy_task", "task_id": 99},
             "cat": "event",
             "id": 13,
-            "name": "dummy(t99)",
+            "name": "dummy(r0t99)",
             "ph": "X",
             "pid": 4,
             "tid": 19000,
@@ -131,10 +132,19 @@ def _write_visualization_artifacts(rank_dir):
         {"cat": "flow", "id": 101, "name": "dispatch", "ph": "f", "pid": 4, "tid": 10000, "ts": 0},
         {"cat": "flow", "id": 102, "name": "complete", "ph": "s", "pid": 4, "tid": 10010, "ts": 30},
         {"cat": "flow", "id": 102, "name": "complete", "ph": "f", "pid": 2, "tid": 0, "ts": 31},
-        {"args": {"taskId": 1}, "cat": "event", "name": "kernel_a(t1)", "ph": "X", "pid": 3, "tid": 1},
+        {"args": {"taskId": 1}, "cat": "event", "name": "kernel_a(r0t1)", "ph": "X", "pid": 3, "tid": 1},
     ]
     (rank_dir / "merged_swimlane_20260720_120000.json").write_text(
-        json.dumps({"traceEvents": events, "displayTimeUnit": "us", "source": "unit-test"})
+        json.dumps(
+            {
+                "traceEvents": events,
+                "displayTimeUnit": "us",
+                "source": "unit-test",
+                # Every trace names the TaskId layout its labels follow; critical_path
+                # re-formats ids from this file alone and refuses one that does not.
+                "metadata": {"runtime": TMR_RUNTIME},
+            }
+        )
     )
 
 
@@ -180,22 +190,22 @@ def test_main_writes_static_and_observed_full_traces(tmp_path):
         }
 
     assert worker_task_names(static_events) == {
-        1: "kernel_a(t1)",
-        2: "·(t2)",
-        3: "kernel_c(t3)",
+        1: "kernel_a(r0t1)",
+        2: "·(r0t2)",
+        3: "kernel_c(r0t3)",
     }
     assert worker_task_names(observed_events) == {
-        1: "·(t1)",
-        2: "kernel_b(t2)",
-        3: "kernel_c(t3)",
+        1: "·(r0t1)",
+        2: "kernel_b(r0t2)",
+        3: "kernel_c(r0t3)",
     }
     for events in (static_events, observed_events):
         other_view_tasks = [event for event in events if event.get("ph") == "X" and event.get("pid") != 4]
         assert other_view_tasks == [
-            {"args": {"taskId": 1}, "cat": "event", "name": "kernel_a(t1)", "ph": "X", "pid": 3, "tid": 1}
+            {"args": {"taskId": 1}, "cat": "event", "name": "kernel_a(r0t1)", "ph": "X", "pid": 3, "tid": 1}
         ]
-    assert "dummy(t99)" in {event.get("name") for event in static_events}
-    assert "dummy(t99)" in {event.get("name") for event in observed_events}
+    assert "dummy(r0t99)" in {event.get("name") for event in static_events}
+    assert "dummy(r0t99)" in {event.get("name") for event in observed_events}
     assert {event["id"] for event in static_events if event.get("cat") == "flow"} == {100, 101, 102}
     assert {event["id"] for event in observed_events if event.get("cat") == "flow"} == {100, 101, 102}
 

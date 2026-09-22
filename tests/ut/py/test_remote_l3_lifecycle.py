@@ -361,6 +361,35 @@ def test_run_session_forces_command_conn_blocking_for_idle(monkeypatch):
     assert fake_conn.timeout is None
 
 
+def test_run_session_gives_remote_worker_its_parent_topology_id(monkeypatch):
+    captured = {}
+
+    class FakeWorker:
+        def __init__(self, *args, **kwargs):
+            captured["worker"] = self
+
+        def init(self, *args, **kwargs):
+            raise RuntimeError("stop after worker construction")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(remote_l3_session, "Worker", FakeWorker)
+    monkeypatch.setattr(remote_l3_session, "_install_manifest_dispatcher_registry", lambda manifest: {})
+    monkeypatch.setattr(remote_l3_session, "_install_manifest_inner_registry", lambda manifest, worker: {})
+
+    ready = []
+    rc = remote_l3_session.run_session(
+        _manifest(worker_id=7, startup_remaining_s=1.0),
+        None,
+        ready_writer=ready.append,
+    )
+
+    assert rc == 1
+    assert captured["worker"]._topology_worker_id == 7
+    assert ready and ready[0]["ok"] is False
+
+
 def test_run_session_bounds_subtree_by_startup_remaining_not_session_timeout(monkeypatch):
     """The inner subtree deadline comes from the parent's startup_remaining_s
     (its slice of the single root startup budget), not the runtime command

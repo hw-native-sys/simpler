@@ -332,3 +332,14 @@ def test_builder_valid_args_order_named_access_and_clone():
     # Clone is deep: mutating the clone does not touch the original.
     clone.a.copy_(torch.full((4,), 9.0))
     assert torch.equal(ta.a, torch.arange(4, dtype=torch.float32))
+
+
+def test_rehost_and_release_preserve_declarations():
+    args = TaskArgsBuilder(TensorArg("x", torch.ones(4), child_memory=True))
+    original = args.x
+    worker = _FakeWorker()
+    rehosted = _RehostedTaskArgs(worker, args)
+    assert args.specs[0].child_memory
+    rehosted.release()
+    assert args.specs[0].value is original
+    assert args.specs[0].child_memory

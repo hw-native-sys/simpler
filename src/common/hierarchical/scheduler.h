@@ -95,6 +95,10 @@ public:
         // that omit this callback retain the legacy unpartitioned queue path.
         std::function<RunId()> active_run_cb;
         std::function<RunId()> preparable_run_cb;
+        // The staged successor authorized to launch its device work while the
+        // active run is still executing, or INVALID_RUN_ID. Omitted by callers
+        // configured at launch depth one, which authorize nothing.
+        std::function<RunId()> early_launch_run_cb;
         // Called when a task reaches CONSUMED (TensorMap cleanup + ring release).
         std::function<void(TaskSlot)> on_consumed_cb;
         // Called as soon as an endpoint reports failure so the error is

@@ -27,13 +27,36 @@
 // Args contract (host passes via KernelArgs):
 //   args[0] = &NotifPerfHandshake (GM device pointer)
 
-#include "kernel_operator.h"
+// This kernel needs no AscendC header. dcci, dsb, set_cond, get_coreid and
+// get_sys_cnt are all `-x cce` builtins, and the runtime's own AICore sources
+// include no AscendC header either. Including kernel_operator.h would pull in
+// non-weak globals (g_tilingKey among them) that break the combined link of the
+// mix pair, and would tie the build to where a given CANN release puts its
+// tikcpp subtree.
 
 #include "../shared/handshake.h"
 
-using AscendC::GlobalTensor;
+#ifndef __aicore__
+#define __aicore__ [aicore]
+#endif
 
-extern "C" __global__ __aicore__ void notif_perf_producer(__gm__ NotifPerfHandshake *hank) {
+// rtRegisterAllKernel enumerates kernels by the `<name>_0_mix_aic` /
+// `_0_mix_aiv` symbol pair and the registered ELF must carry both halves; a
+// plainly-named entry is rejected with 107000. Same shape as
+// src/a2a3/platform/onboard/aicore/kernel.cpp.
+#ifdef __DAV_VEC__
+#define PRODUCER_ENTRY notif_perf_producer_0_mix_aiv
+#else
+#define PRODUCER_ENTRY notif_perf_producer_0_mix_aic
+#endif
+
+extern "C" __global__ __aicore__ void PRODUCER_ENTRY(__gm__ NotifPerfHandshake *hank) {
+#ifdef __DAV_VEC__
+    // The vector half exists only to complete the mix pair; the measurement
+    // runs entirely on the cube.
+    (void)hank;
+    return;
+#else
     if (hank == nullptr) {
         return;
     }
@@ -41,20 +64,54 @@ extern "C" __global__ __aicore__ void notif_perf_producer(__gm__ NotifPerfHandsh
     // Wait until AICPU sets go=1. AICore's L1 cache for GM is non-coherent
     // with AICPU writes, so dcci-invalidate the line before re-reading each
     // time. Without dcci, AICore's L1 caches go=0 forever.
-    while (true) {
+    //
+    // Bounded: a consumer that never launched, or died before releasing the
+    // producer, would otherwise leave this kernel spinning and the host blocked
+    // in aclrtSynchronizeStream with nothing to report.
+    bool released = false;
+    uint64_t go_t0 = get_sys_cnt();
+    while (get_sys_cnt() - go_t0 < kNotifPerfProducerGoWaitTicks) {
         dcci(reinterpret_cast<__gm__ uint64_t *>(hank), SINGLE_CACHE_LINE);
         if (hank->go == 1) {
+            released = true;
             break;
         }
     }
+    if (!released) {
+        hank->producer_rc = kNotifPerfProducerGoTimeout;
+        dcci(&hank->producer_rc, SINGLE_CACHE_LINE, CACHELINE_OUT);
+        dsb(DSB_DDR);
+        return;
+    }
+
+    // block_dim=1 does not pin this kernel to AIC[0], and the consumer polls one
+    // core's COND register, so it has to learn which core this is rather than
+    // assume. Published raw; the consumer applies AICORE_COREID_MASK and keeps
+    // both values, so a surprising id is visible rather than silently folded.
+    //
+    // Published after go rather than at entry: the consumer clears
+    // core_id_valid as part of its own setup, and this kernel reports once, so
+    // a report written before that clear would be erased and never repeated.
+    hank->core_id = static_cast<uint32_t>(get_coreid());
+    hank->core_id_valid = 1;
+    dcci(&hank->core_id, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    dsb(DSB_DDR);
 
     uint64_t seq = 0;
+    uint32_t rc = kNotifPerfProducerOk;
+    uint64_t run_t0 = get_sys_cnt();
     while (true) {
-        // Re-read mode + go each iter. The first cache line of the handshake
-        // holds {go, mode, throttle_iter, _pad0}, so a single SINGLE_CACHE_LINE
-        // dcci refreshes both.
+        // Re-read mode + go each iter. Line 0 of the handshake holds only the
+        // AICPU-owned {go, mode, throttle_iter, _pad0}, so a single
+        // SINGLE_CACHE_LINE dcci refreshes all of them — and because nothing
+        // this kernel writes lives on that line, no CACHELINE_OUT below can
+        // push a stale copy of them back over the consumer's updates.
         dcci(reinterpret_cast<__gm__ uint64_t *>(hank), SINGLE_CACHE_LINE);
         if (hank->go == 0) {
+            break;
+        }
+        if (get_sys_cnt() - run_t0 > kNotifPerfProducerRunTicks) {
+            rc = kNotifPerfProducerRunTimeout;
             break;
         }
         uint32_t mode = hank->mode;
@@ -73,8 +130,17 @@ extern "C" __global__ __aicore__ void notif_perf_producer(__gm__ NotifPerfHandsh
         } else {
             // COND path: tw must still be visible to AICPU so it can compute
             // the (t_obs - tw) latency once it sees the COND change.
+            //
+            // dcci issues the write-back without waiting for it, and set_cond
+            // is an SPR write that does not travel with it, so the barrier is
+            // what keeps tw ahead of the notification carrying its sequence.
+            // Without it the consumer can observe COND and still read the
+            // previous tw, which makes t_obs - tw meaningless (usually
+            // negative, so the sample is not merely noisy but unusable). Same
+            // requirement the runtime's own FIN path carries (#2233 / #2324).
             hank->p_tw = tw;
             dcci(&hank->p_tw, SINGLE_CACHE_LINE, CACHELINE_OUT);
+            dsb(DSB_DDR);
             // Write COND via SPR — production set_cond writes the same FIN
             // encoding the scheduler expects.
             uint32_t cond_val = (static_cast<uint32_t>(seq) & kNotifPerfTaskIdMask) | kNotifPerfTaskStateMask;
@@ -89,4 +155,9 @@ extern "C" __global__ __aicore__ void notif_perf_producer(__gm__ NotifPerfHandsh
             // empty
         }
     }
+
+    hank->producer_rc = rc;
+    dcci(&hank->producer_rc, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    dsb(DSB_DDR);
+#endif
 }

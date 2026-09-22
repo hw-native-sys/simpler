@@ -19,6 +19,7 @@
 #include "aicpu/dep_gen_collector_aicpu.h"
 #include "aicpu/device_log.h"
 #include "aicpu/device_phase_aicpu.h"
+#include "aicpu/device_run_result_base_aicpu.h"
 #include "aicpu/device_time.h"
 #include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
@@ -94,6 +95,7 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     set_platform_dump_base(k_args->dump_data_base);
     set_dump_args_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS));
     set_platform_chip_swimlane_base(k_args->chip_swimlane_data_base);
+    set_platform_chip_swimlane_run_terminal_bank(k_args->chip_swimlane_run_terminal_bank);
     set_platform_chip_swimlane_aicore_rotation_table(k_args->chip_swimlane_aicore_rotation_table);
     set_chip_swimlane_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE));
     set_platform_pmu_base(k_args->pmu_data_base);
@@ -136,6 +138,14 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     // (no C++ thread_local — see docs/dynamic-linking.md). Idempotent across the
     // concurrent exec threads (same base). Run-wall is stamped here.
     set_platform_phase_base(k_args->device_wall_data_base);
+    // Publish this run's result region and the epoch its device side stamps
+    // into it, for the same reason as the phase base: AICPU receives KernelArgs
+    // as a CANN-private copy, so the runtime reaches these through the resident
+    // SO globals rather than the struct. Every concurrent exec thread stores the
+    // same pair here, which is why that storage is atomic. Both zero when the
+    // host allocated no region, which every publisher treats as "nothing to
+    // publish into".
+    set_platform_run_result(k_args->run_result_data_base, k_args->run_result_epoch);
     AicpuPhaseScope run_wall(AicpuPhase::RunWall);
 
     int rc = aicpu_execute(runtime);

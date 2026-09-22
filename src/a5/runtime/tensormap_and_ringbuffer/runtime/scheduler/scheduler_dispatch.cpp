@@ -1341,7 +1341,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 }
 
                 if (idle_iterations % STALL_LOG_INTERVAL == 0) {
-                    log_stall_diagnostics(thread_idx, total_tasks_, idle_iterations, last_progress_count);
+                    log_stall_diagnostics(
+                        thread_idx, total_tasks_, idle_iterations, last_progress_count, StallDumpReport::Periodic
+                    );
                 }
                 // Wall-clock budget gate, with two fatal-latch branches:
                 //

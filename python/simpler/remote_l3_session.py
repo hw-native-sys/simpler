@@ -101,7 +101,7 @@ from .remote_l3_protocol import (
     send_frame,
 )
 from .task_interface import ChipCallable, TaskArgs, get_element_size
-from .worker import Worker, _NoBufferConsumerError
+from .worker import Worker, _level_capture_prefix, _NoBufferConsumerError
 
 sys.modules.setdefault("simpler.remote_l3_session", sys.modules[__name__])
 
@@ -1222,6 +1222,7 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                     task.args, buffers, worker_id, mint_inline_buffer=mint_session_buffer
                 )
                 try:
+                    task.config.output_prefix = _level_capture_prefix(task.config.output_prefix, inner_worker)
                     inner_worker.run(orch_fn, task_args, task.config)
                 finally:
                     for backing in inline_backings:
@@ -1260,6 +1261,9 @@ def run_session(
         num_sub_workers=int(manifest.get("num_sub_workers", 0)),
         heap_ring_size=int(manifest["heap_ring_size"]) if manifest.get("heap_ring_size") is not None else None,
     )
+    # The parent-assigned id names this Worker's diagnostics namespace in the
+    # collected hierarchy, including when sibling Workers run on other hosts.
+    inner_worker._topology_worker_id = int(manifest["worker_id"])
     command_sock: socket.socket | None = None
     health_sock: socket.socket | None = None
     stop_health = threading.Event()

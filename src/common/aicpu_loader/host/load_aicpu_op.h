@@ -42,8 +42,7 @@
  * fingerprint-named preinstall files).
  */
 
-#ifndef COMMON_HOST_LOAD_AICPU_OP_H_
-#define COMMON_HOST_LOAD_AICPU_OP_H_
+#pragma once
 
 #include <cstdint>
 #include <string>
@@ -119,16 +118,49 @@ public:
      */
     int Init(const std::vector<std::string> &extra_symbols);
 
-    /** @brief Release binary handle + function handles + temporary JSON. */
-    void Finalize();
+    /**
+     * @brief Release binary handle + function handles + temporary JSON.
+     *
+     * All-or-nothing, and idempotent once it has succeeded. A failing
+     * `rtsBinaryUnload` leaves the loader in its loaded state — handle, entry
+     * handles and JSON descriptor all retained — and returns the error, so the
+     * binary keeps an owner able to retry the unload. Clearing the handle over
+     * a failed unload would leave the device-side binary loaded with nothing
+     * naming it.
+     *
+     * @return 0 when the loader holds nothing, the unload error otherwise.
+     */
+    int Finalize();
 
     /**
-     * @brief Forget runtime handles without calling rtsBinaryUnload.
+     * @brief Whether a device-side binary is still loaded under this loader.
      *
-     * Used after a force reset, or when the device is already unusable and
-     * another runtime teardown request could block waiting for device service.
+     * True between a successful `Init` and a successful `Finalize`, which makes
+     * it true after a failed `Finalize` as well. A context's destruction guard
+     * reads this, because a close that released every other owner and failed to
+     * unload the binary has not closed the context.
      */
-    void AbandonAfterDeviceFailure();
+    bool has_live_resources() const { return binary_handle_ != nullptr; }
+
+    /**
+     * @brief Forget the binary and entry handles without calling rtsBinaryUnload.
+     *
+     * Two distinct conditions reach this, and only the first ends the binary's
+     * life on the device:
+     *
+     *   - Confirmed retirement. A force reset, or a completed reset on a
+     *     healthy close, ended the device generation those handles belonged
+     *     to, so a handle retained by a failed unload names a binary that no
+     *     longer exists.
+     *   - Terminal abandonment. The device is already unusable — where another
+     *     runtime teardown request could block waiting for device service — or
+     *     its reset did not complete. The binary may well still be resident;
+     *     forgetting the handle is what keeps a later implicit unload from
+     *     being issued against a device whose state is unconfirmed.
+     *
+     * Neither is a successful device release, and a caller must not report one.
+     */
+    void ForgetWithoutUnload();
 
     /**
      * @brief Launch a runtime SO entry point via rtsLaunchCpuKernel.
@@ -167,5 +199,3 @@ constexpr const char *RegisterCallableName = "simpler_aicpu_register_callable";
 }  // namespace KernelNames
 
 }  // namespace host
-
-#endif  // COMMON_HOST_LOAD_AICPU_OP_H_

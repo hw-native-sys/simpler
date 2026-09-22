@@ -58,6 +58,10 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     // AIC writes at fixed cache line 0 (no sub_block_id needed)
     out[0] = static_cast<float>(get_block_idx(args));
     out[1] = static_cast<float>(get_block_num(args));
+    // Presence, not the value: the offset is whatever the driver reports for this
+    // device, so only "does this core see one at all" is predictable off-device.
+    // A uint64 cannot be cast to float in an aicore function, hence the predicate.
+    out[3] = (get_l2_cache_offset(args) != 0) ? 1.0f : 0.0f;
 
     // Flush this cache line to HBM so host can read the output.
     dcci(&out[0], SINGLE_CACHE_LINE, CACHELINE_OUT);

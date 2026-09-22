@@ -34,7 +34,9 @@
  *
  * Two-channel level transport (mirrors the PMU pattern):
  *   - binary on/off — `enable_profiling_flag` bit1 → `set_chip_swimlane_enabled(bool)`
- *     at kernel entry; queried via `is_chip_swimlane_enabled()`.
+ *     at kernel entry; queried via `is_chip_swimlane_enabled()`. Each call
+ *     invalidates the preceding launch's cached level and phase writers,
+ *     including when profiling is disabled and init will not run.
  *   - granular ChipSwimlaneLevel — `ChipSwimlaneDataHeader::chip_swimlane_level`
  *     (shared memory); read in `chip_swimlane_aicpu_init` and cached, then queried
  *     via `get_chip_swimlane_level()` for
@@ -42,6 +44,13 @@
  */
 extern "C" void set_platform_chip_swimlane_base(uint64_t chip_swimlane_data_base);
 extern "C" uint64_t get_platform_chip_swimlane_base();
+
+/**
+ * This run's terminal-snapshot bank address, resolved by the host from the
+ * run's actual pipeline slot. Zero disables every terminal close: the device
+ * has no pipeline slot of its own and never derives a bank without this.
+ */
+extern "C" void set_platform_chip_swimlane_run_terminal_bank(uint64_t bank_addr);
 extern "C" void set_chip_swimlane_enabled(bool enable);
 extern "C" bool is_chip_swimlane_enabled();
 

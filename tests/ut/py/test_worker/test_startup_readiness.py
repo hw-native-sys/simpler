@@ -335,7 +335,15 @@ class TestNextLevelStartupFailure:
 
     def test_failed_startup_reaps_children_no_leak(self, monkeypatch):
         """After a startup failure the forked children are killed and reaped."""
-        _install_manual_worker_clock(monkeypatch)
+        # Real clock, deliberately. This case asserts an OS-level fact about real
+        # forked pids -- that `os.waitpid` no longer knows them -- and
+        # `_abort_hierarchical` bounds its reap with a `_monotonic()` deadline it
+        # is allowed to give up on ("a survivor still alive at the deadline is
+        # left to the OS/init"). A manual clock advances that deadline in zero
+        # real time, so the budget can expire before a child has actually died
+        # and the rollback takes the give-up path while the assertion below still
+        # demands a reap. The sibling deadline tests may use one: logical elapsed
+        # time is their subject, and they assert bookkeeping rather than pids.
         l3 = _l3_child()
         l3.init = _init_hangs  # noqa: SLF001
 
@@ -1348,7 +1356,7 @@ class TestLevel2Lifecycle:
         monkeypatch.setattr(Worker, "_release_all_buffers", consume_pre_child_budget)
         captured: dict = {}
 
-        def capture_reap(groups, deadline):
+        def capture_reap(groups, deadline, report_pids=None, reports=None):
             captured["remaining"] = deadline - clock.monotonic()
 
         monkeypatch.setattr(Worker, "_reap_child_groups", staticmethod(capture_reap))
@@ -1988,10 +1996,11 @@ class TestTerminalStateContract:
     def test_add_worker_freezes_child_before_topology_publication(self):
         parent = Worker(level=4, num_sub_workers=0)
         child = Worker(level=3, num_sub_workers=0)
-        parent.add_worker(child)
+        worker_id = parent.add_worker(child)
 
         with child._hierarchical_start_cv:
             assert child._topology_parent is parent
+            assert child._topology_worker_id == worker_id == 0
         with pytest.raises(RuntimeError, match="attached as a child"):
             child.init()
 

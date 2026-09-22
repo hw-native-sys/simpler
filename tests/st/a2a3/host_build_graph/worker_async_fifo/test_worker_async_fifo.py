@@ -28,7 +28,7 @@ from pathlib import Path
 import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import DataType, TaskArgs, TensorArgType, scalar_to_uint64
+from simpler.task_interface import DataType, TaskArgs, TensorArgType
 from simpler.worker import (
     _FRAME_STAGED,
     _OFF_ACCEPTED,
@@ -73,7 +73,7 @@ def _chip_args(handles, orch_signature, *scalars):
     for handle, direction in zip(handles, orch_signature):
         args.add_tensor(handle.tensor((_SIZE,), DataType.FLOAT32), _DIR_TAGS[direction])
     for value in scalars:
-        args.add_scalar(scalar_to_uint64(value))
+        args.add_scalar(value)
     return args
 
 
@@ -235,7 +235,8 @@ class TestWorkerAsyncWholeRunFifo(SceneTestCase):
         assert platform in case["platforms"]
         self.test_prepared_run_device_control_waits_for_the_active_run(platform, worker)
         self.test_a_run_whose_cleanup_touches_the_device_degrades_to_depth_one(platform, worker)
-        self.test_run(platform, worker)
+        for shared_control in (False, True):
+            self.test_run(platform, worker, shared_control)
 
     def test_prepared_run_device_control_waits_for_the_active_run(self, st_platform, st_worker):
         """A prepared run's malloc/free/copy must not overtake the active run.
@@ -391,7 +392,8 @@ class TestWorkerAsyncWholeRunFifo(SceneTestCase):
                     with suppress(Exception):
                         handle.wait(30.0)
 
-    def test_run(self, st_platform, st_worker):
+    @pytest.mark.parametrize("shared_control", [False, True], ids=["independent-input", "shared-read-only-input"])
+    def test_run(self, st_platform, st_worker, shared_control):
         if st_platform != "a2a3":
             pytest.skip("whole-run FIFO leases require an a2a3 onboard worker")
 
@@ -411,6 +413,9 @@ class TestWorkerAsyncWholeRunFifo(SceneTestCase):
                 tensors.append(tensor)
             first_a, first_b, first_out, second_a, second_b, second_out = tensors
             first_bufs, second_bufs = buffers[:3], buffers[3:]
+            if shared_control:
+                second_bufs[1] = first_bufs[1]
+                second_b = first_b
             vector_handle = type(self)._st_chip_handles["vector"]
             vector_signature = type(self)._st_chip_handles["vector_sig"]
             sub_handle = type(self)._st_sub_handles["wait_for_release"]
@@ -424,7 +429,10 @@ class TestWorkerAsyncWholeRunFifo(SceneTestCase):
             first = st_worker.submit(
                 lambda orch, _args, _cfg: submit_vector(orch, first_bufs, spin_iters=_DEVICE_SPIN_ITERS, hold_open=True)
             )
-            first_expected = first_a + first_b + _CHAIN_LENGTH
+            # HBG reads the scalar from b during native host construction;
+            # TMR's device orchestration uses its constant step increment.
+            first_scalar = first_b[0] if self._st_runtime == "host_build_graph" else 1
+            first_expected = first_a + first_b + _CHAIN_LENGTH * first_scalar
             # Run-level acceptance also includes the intentionally blocked SUB
             # task, whose compatibility endpoint acknowledges only on return.
             # Observe the chip frame directly so that fence cannot postpone the
@@ -477,7 +485,8 @@ class TestWorkerAsyncWholeRunFifo(SceneTestCase):
                 raise third_result["error"]
             assert third_callback.is_set(), "the third submission did not enter after the first run freed its slot"
             second.wait(10.0)
-            second_expected = second_a + second_b + _CHAIN_LENGTH
+            second_scalar = second_b[0] if self._st_runtime == "host_build_graph" else 1
+            second_expected = second_a + second_b + _CHAIN_LENGTH * second_scalar
             assert torch.allclose(first_out, first_expected), "the first run did not execute correctly on the NPU"
             assert torch.allclose(second_out, second_expected), "the prepared run did not execute correctly on the NPU"
             third_result["handle"].wait(10.0)

@@ -20,10 +20,10 @@ export SIMPLER_OP_EXECUTE_TIMEOUT_US=3000000
 export SIMPLER_STREAM_SYNC_TIMEOUT_MS=4000
 ```
 
-For sim-only runs, CI sets only:
+For sim-only CI runs, CI sets:
 
 ```bash
-export SIMPLER_SCHEDULER_TIMEOUT_MS=5000
+export SIMPLER_SCHEDULER_TIMEOUT_MS=10000
 ```
 
 Use the same variables locally when you want faster failure while debugging a

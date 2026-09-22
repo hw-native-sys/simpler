@@ -1,8 +1,8 @@
 # 2026-08 — The host-orchestration phase tail is page faults, not the code in the phase
 
 > **Phase and type names in this entry are the ones the tooling emitted at the
-> time.** The per-in-graph-task record phase was `record_node` and is now
-> `record_in_graph_task`; `GraphRecordedNode` is now `RecordedInGraphTask` and
+> time.** The per-sub-task record phase was `record_node` and is now
+> `record_sub_task`; `GraphRecordedNode` is now `RecordedSubTask` and
 > `recording.nodes` is `recording.tasks`. The measurements and the archived run
 > directories below keep the old spellings because that is what the logs say, and
 > `strace_timing.py` still accepts `record_node` so those logs remain readable.
@@ -96,7 +96,7 @@ where the fault landed. Over the 447 faulting calls above 10 µs (867 faults, 19
 | `recording.tensor_sources`, doubles | 24 B | 70 | 174 | **16.1%** |
 | `recording.internal_fanins` (8 B) and `.predicates` (192 B), double | — | 77 | 195 | **14.7%** |
 | `recording.tensor_map` entry pool, initialized on write | 128 B | 36 | 43 | 4.5% |
-| `recording.scalars` (8 B) / `.scalar_sources` (16 B), double | — | 16 | 25 | 2.7% |
+| `recording.scalars` (8 B) / `.scalar_sources` (16 B, since renamed `.scalar_inheritance` and narrowed to 4 B), double | — | 16 | 25 | 2.7% |
 
 165 of the 447 faulting calls reallocated no recording-owned container at all, which
 leaves the per-node vector as the allocation: it is the single largest source.

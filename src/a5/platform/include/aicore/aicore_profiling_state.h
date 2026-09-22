@@ -103,3 +103,18 @@ __aicore__ __gm__ PmuAicoreRing *get_aicore_pmu_ring();
  */
 __aicore__ void set_aicore_pmu_reg_base(uint64_t reg_base);
 __aicore__ uint64_t get_aicore_pmu_reg_base();
+
+/**
+ * This run's handshake report identity, from `AicoreLaunchArgs::report_epoch`.
+ *
+ * Non-zero on a native program launch: the executor commits it into
+ * `Handshake::report_epoch` after the payload and its store barrier, and the
+ * AICPU accepts only a report carrying exactly this value. Zero on a
+ * kernel/persistent launch, which keeps the `aicore_done != 0` predicate.
+ *
+ * Carried on the per-core state rather than in `aicore_execute`'s signature,
+ * for the same reason the profiling state is: the runtime executors' signature
+ * and the `Handshake` layout stay independent of what the launch block grows.
+ */
+__aicore__ void set_aicore_report_epoch(uint64_t epoch);
+__aicore__ uint64_t get_aicore_report_epoch();

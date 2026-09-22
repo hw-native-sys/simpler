@@ -349,7 +349,9 @@ def print_aicore_scheduler_phase_breakdown(data):
         print("=" * 90)
         return
 
-    print(f"  Scheduler streams: {len(scheduler_records)}")
+    # A scheduler that recorded nothing occupies its own slot so list position
+    # stays the scheduler id, so count the populated ones rather than the slots.
+    print(f"  Scheduler streams: {sum(1 for records in scheduler_records if records)}")
     print("  Phase time is summed over AICore scheduler streams and can exceed wall-clock time.")
     print()
     for kind in sorted(totals):
@@ -1034,7 +1036,10 @@ def run_analysis(  # noqa: PLR0912, PLR0915
     phase_labels = {
         "complete": "Complete (poll handshake, completion handling)",
         "async_poll": "AsyncPoll (async-wait completion: SDMA/RoCE/URMA/CCU)",
+        "state_probe": "StateProbe (Scheduler-local Dispatch Slot / Ready state)",
         "dispatch": "Dispatch (pop queue, build payload, flush)",
+        "worksteal": "Worksteal (remote Inbox claim and dispatch)",
+        "refill": "Refill (completed Slot reuse)",
         "release": "Release (deferred producer release)",
         "dummy": "Dummy (dependency-only task resolution)",
         "early_dispatch": "EarlyDispatch (speculative staging)",

@@ -49,6 +49,53 @@ Standalone runnable references for the CANN host-side ACL APIs. Each
 subdirectory is its own minimal CMake project — build and run on a host
 with `ASCEND_HOME_PATH` set.
 
+To build them all, and to build *and run* them all — the latter is what the
+`ut-a2a3` / `ut-a5` jobs do:
+
+```bash
+export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest
+
+./tools/build_cann_examples.sh                    # build only; dav-c220-cube default
+
+task-submit --device auto --device-num 1 \
+  --run "./tools/build_cann_examples.sh dav-c220-cube --run \$TASK_DEVICE"
+```
+
+Pass `dav-c310-cube` for a5. Under `--run`, each tool's own `smoke.sh` executes
+after it builds, and the script derives `SIMPLER_DISPATCHER_SO` from the arch
+unless you set it.
+
+That script **discovers** each tool's shape rather than naming it, so a new tool
+under `cann-examples/` is covered by CI without a workflow edit. It recognises
+three layouts — a bare `CMakeLists.txt`, `device/` + `host/`, and
+`device-aicore/` + `device-aicpu/` + `host/` — and reports a tool matching none of
+them as a failure rather than skipping it.
+
+Each tool carries its own `smoke.sh` taking a device id, because the env var names
+it reads, the directory it runs from and the argv that makes a short run differ per
+tool; a shared runner cannot know them, and a by-name list in CI would have to. A
+tool with no `smoke.sh` is reported as build-only in the summary rather than
+passed over, so a gap in run coverage is a number instead of a silence.
+
+A `smoke.sh` may also decline the current arch by exiting **77**, printing the
+reason; the runner counts those separately from passes and failures. Three tools
+do, so on a5 their build is covered and their run is not:
+
+| tool | why a2a3-only at run time |
+| ---- | ------------------------- |
+| `aicore-notification-perf` | hardcodes a2a3's COND offset `0x4C8`; a5 uses `0x5108` |
+| `aicore-fin-ordering` | same |
+| `aicpu-mmio-probes` | needs the AIC_CTRL window via `halMemCtl`, which exists only under `src/a2a3/` |
+
+All three compile for either arch — it is the runtime constants and the HAL path
+that are a2a3's. Making them per-arch would remove the skips. So a full sweep is
+7 built + 7 run on a2a3, and 7 built + 4 run + 3 skipped on a5.
+
+Tools that link `libascend_hal.so` resolve the driver package through
+`cann-examples/cmake/ascend_driver_path.cmake` (overridable with
+`-DASCEND_DRIVER_PATH=`), which fails the configure naming the missing library
+instead of leaving a bare `cannot find -lascend_hal`.
+
 ### cann-examples/query
 
 Host-side device-info CLI. Subcommands wrap individual clusters of CANN

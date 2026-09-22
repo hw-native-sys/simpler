@@ -18,6 +18,7 @@
 #include <stdint.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <sstream>
 #include <string>
 #include <type_traits>
@@ -62,7 +63,9 @@ namespace simpler::hbg {
  *
  * Layout: cache line 1 holds hot-path fields (buffer, owner_task_id,
  * start_offset, version, ndims, dtype, flags, shapes); cache line 2 holds
- * stride + cached extent_elem.
+ * stride + cached extent_elem. The fields themselves live in TensorData, which is
+ * the same set packed to 96 bytes for the Definition image; Tensor adds only the
+ * alignment that puts the hot set in one line.
  *
  * Construction:
  * Default construction is public (Tensor doubles as wire / TaskArgs / blob
@@ -74,13 +77,34 @@ namespace simpler::hbg {
  *   - TaskOutputTensors returned by submit(...)
  *   - Tensor::view() / reshape() / transpose() / permute() / slice() on an existing valid Tensor
  */
-struct alignas(64) Tensor {
+/**
+ * TensorData — every field a Tensor has (96B), and the form one travels in.
+ *
+ * A Definition image is built in a byte vector, which has nowhere to put a
+ * 64-byte-aligned element, so the image stores this instead: the same fields in the
+ * same types, packed to 8-byte alignment. Tensor derives from it, so one field set
+ * serves both forms and a tensor moves between them by base-class assignment.
+ *
+ * The field order is the aligned form's, not the packing-optimal one: the hot set
+ * (buffer, owner, origin, version, flags, shapes) ends exactly at offset 64, so a
+ * Tensor's first cache line holds all of it and the warm view metadata sits past it.
+ *
+ * A Tensor array is NOT a TensorData array: the element strides are 128 and 96.
+ * Convert one element at a time; never cast the array base and index it.
+ */
+struct TensorData {
     // === Cache line 1 (64B) — hot path ===
-    PTOBufferHandle buffer;            // Underlying memory buffer (addr in bytes, size in bytes)
-    TaskId owner_task_id;              // Creator task; TaskId::invalid() for external tensors
+    PTOBufferHandle buffer;  // Underlying memory buffer (addr in bytes, size in bytes)
+    // Creator task; TaskId::invalid() for external tensors. On a tensor a modular task's
+    // body recorded, this says where the tensor CAME FROM rather than which run-time task
+    // owns it: the recorder stamps PARAM with a boundary parameter's index, or SUB_TASK
+    // with the producing block's index within that body. A replay rebinds the tensor
+    // without reminting the field (graph_rebind_tensor), so a materialized tensor still
+    // carries the recording's value — nothing on the device reads it back.
+    TaskId owner_task_id;
     uint64_t start_offset;             // 1D ELEMENT offset of the view origin into `buffer`
     int32_t version;                   // Tensor version for overlap detection
-    uint32_t ndims;                    // Number of dimensions used
+    uint8_t ndims;                     // Number of dimensions used; MAX_TENSOR_DIMS bounds it
     DataType dtype;                    // Data type of tensor elements
     bool manual_dep;                   // True when dependency tracking is creator-only (skip OverlapMap lookup/insert)
     bool is_contiguous;                // Cached: strides[] == row_major_stride(shapes)
@@ -89,11 +113,83 @@ struct alignas(64) Tensor {
 
     // === Cache line 2 (64B) — warm path (view metadata) ===
     // Field order: place the 8B-aligned cache before the 4B-aligned strides[]
-    // to avoid 4B padding between them (sizeof(Tensor) must stay 128).
+    // to avoid 4B padding between them.
     uint64_t extent_elem_cache;         // Cached extent_elem (see extent_elem()); maintained by ops
     uint32_t strides[MAX_TENSOR_DIMS];  // Element stride per dimension; ALWAYS > 0 (type-enforced)
-    uint8_t _pad_cl2[36];               // Reserved for future extension
 
+    /// Deep copy. `strides` / `extent_elem_cache` are derived from the geometry,
+    /// so a canonically contiguous source (is_contiguous && start_offset == 0)
+    /// has them recomputed from `shapes` rather than read across — which leaves the
+    /// second cache line untouched entirely for the common case.
+    ///
+    /// This is also how a tensor crosses between its working and image forms: both are
+    /// TensorData, so neither direction needs a conversion of its own.
+    void init_from(const TensorData &other) {
+        init_geometry_from(other);
+        if (other.is_contiguous && other.start_offset == 0) {
+            refresh_row_major_derived();
+        } else {
+            extent_elem_cache = other.extent_elem_cache;
+            for (uint32_t i = 0; i < other.ndims; i++) {
+                strides[i] = other.strides[i];
+            }
+        }
+    }
+
+    /// Copy everything except the derived `strides` / `extent_elem_cache`. A view
+    /// op then mutates `shapes` / `start_offset` and calls `refresh_derived()`
+    /// once, so writing the derived pair here would only be overwritten.
+    ///
+    /// Only the `ndims` slots in use are copied. A slot past ndims describes no axis and
+    /// every reader bounds its loop by ndims; the one op that raises ndims (reshape)
+    /// writes the slots it adds before anything can read them.
+    void init_geometry_from(const TensorData &other) {
+        buffer = other.buffer;
+        owner_task_id = other.owner_task_id;
+        start_offset = other.start_offset;
+        version = other.version;
+        ndims = other.ndims;
+        dtype = other.dtype;
+        manual_dep = other.manual_dep;
+        is_contiguous = other.is_contiguous;
+        address_space = other.address_space;
+        for (uint32_t i = 0; i < other.ndims; i++) {
+            shapes[i] = other.shapes[i];
+        }
+    }
+
+    /// Set `strides` to the row-major stride of `shapes` and `extent_elem_cache`
+    /// to the resulting element count — the derived pair of a contiguous view.
+    void refresh_row_major_derived() {
+        uint32_t s = 1;
+        for (int32_t i = static_cast<int32_t>(ndims) - 1; i >= 0; --i) {
+            strides[i] = s;
+            s *= shapes[i];
+        }
+        extent_elem_cache = s;
+    }
+};
+
+static_assert(
+    std::is_trivially_copyable_v<TensorData> && std::is_standard_layout_v<TensorData>,
+    "a Definition image holds these as raw bytes"
+);
+static_assert(sizeof(TensorData) == 96, "the wire layout is fixed: host and device read the same bytes");
+static_assert(MAX_TENSOR_DIMS <= UINT8_MAX, "a tensor's rank must fit the byte that records it");
+static_assert(offsetof(TensorData, extent_elem_cache) == 64, "the hot set must end at the first cache line");
+
+/**
+ * Tensor — TensorData in the runtime's own working form.
+ *
+ * Adds 64-byte alignment and nothing else: the hot set then occupies exactly one
+ * cache line, so every field a dispatch reads comes in a single fetch. The alignment
+ * is also what rounds 96 up to 128, which is where the second line's spare 32 bytes
+ * come from — they are padding, not a field, and no reader may rely on their content.
+ *
+ * Declaring a data member here would end the standard layout the device copy requires:
+ * at most one class in a hierarchy may have non-static data members.
+ */
+struct alignas(64) Tensor : TensorData {
     // Default construction is public: the payload stores these by value in a
     // fixed array, which requires a default-constructible element. A
     // default-constructed Tensor is uninitialized and must be filled via
@@ -132,7 +228,7 @@ struct alignas(64) Tensor {
     }
 
     /// True when `buffer.addr` is a device pointer allocated by the child process
-    /// (host skips the H2D copy in init_runtime_impl). Host-side concept carried
+    /// (host skips the H2D copy-in for bind's arguments). Host-side concept carried
     /// across the wire; runtime views inherit it via the cache-line-1 copy.
     [[nodiscard]] bool is_device_memory() const { return address_space == AddressSpace::DEVICE; }
 
@@ -182,58 +278,9 @@ struct alignas(64) Tensor {
         extent_elem_cache = s;
     }
 
-    /// Deep copy. `strides` / `extent_elem_cache` are derived from the geometry,
-    /// so a canonically contiguous source (is_contiguous && start_offset == 0)
-    /// has them recomputed from `shapes` rather than read across.
-    void init_from(const Tensor &other) {
-        init_geometry_from(other);
-        if (other.is_contiguous && other.start_offset == 0) {
-            refresh_row_major_derived();
-        } else {
-            extent_elem_cache = other.extent_elem_cache;
-            for (uint32_t i = 0; i < other.ndims; i++) {
-                strides[i] = other.strides[i];
-            }
-            // _pad_cl2 left stale on purpose — reserved bytes are not
-            // semantically read by any consumer.
-        }
-    }
-
-    /// Copy everything except the derived `strides` / `extent_elem_cache`. A view
-    /// op then mutates `shapes` / `start_offset` and calls `refresh_derived()`
-    /// once, so writing the derived pair here would only be overwritten.
-    /// All MAX_TENSOR_DIMS shape slots are copied, not just the first `ndims`:
-    /// a reshape raises `ndims`, and the trailing slots must not be left holding
-    /// whatever the uninitialized destination had.
-    void init_geometry_from(const Tensor &other) {
-        buffer = other.buffer;
-        owner_task_id = other.owner_task_id;
-        start_offset = other.start_offset;
-        version = other.version;
-        ndims = other.ndims;
-        dtype = other.dtype;
-        manual_dep = other.manual_dep;
-        is_contiguous = other.is_contiguous;
-        address_space = other.address_space;
-        for (uint32_t i = 0; i < MAX_TENSOR_DIMS; i++) {
-            shapes[i] = other.shapes[i];
-        }
-    }
-
-    /// Set `strides` to the row-major stride of `shapes` and `extent_elem_cache`
-    /// to the resulting element count — the derived pair of a contiguous view.
-    void refresh_row_major_derived() {
-        uint32_t s = 1;
-        for (int32_t i = static_cast<int32_t>(ndims) - 1; i >= 0; --i) {
-            strides[i] = s;
-            s *= shapes[i];
-        }
-        extent_elem_cache = s;
-    }
-
     /// Backward-compat alias used by orchestrator hot paths that need a full
     /// deep copy. Equivalent to `init_from(other)`.
-    void copy(const Tensor &other) { init_from(other); }
+    void copy(const TensorData &other) { init_from(other); }
 
     // Materialization from a TensorCreateInfo (runtime-allocated outputs) lives
     // in the runtime tensor_create_info.h as init_tensor_from_create_info(), which
@@ -442,7 +489,7 @@ struct alignas(64) Tensor {
         ss << indent << "buffer.addr: " << buffer.addr << '\n';
         ss << indent << "buffer.size: " << buffer.size << " bytes" << '\n';
         ss << indent << "dtype: " << get_dtype_name(dtype) << '\n';
-        ss << indent << "ndims: " << ndims << '\n';
+        ss << indent << "ndims: " << static_cast<unsigned>(ndims) << '\n';
         ss << indent << "version: " << version << '\n';
         ss << indent << "start_offset: " << start_offset << " (elements)" << '\n';
         ss << indent << "is_contiguous: " << (is_contiguous ? "true" : "false") << '\n';

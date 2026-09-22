@@ -184,23 +184,6 @@ struct alignas(64) ChipTensorMapEntry {
         }
     }
 
-    void copy_tensor_create_info(const TensorCreateInfo &tensor_create_info, uint64_t addr) {
-        memcpy(this, &tensor_create_info, 64);
-        buffer_addr = addr;
-        // Create-info outputs are always contiguous with start_offset = 0;
-        // extent_elem = prod(shapes); stride is row-major.
-        uint64_t numel = 1;
-        for (uint32_t i = 0; i < tensor_create_info.ndims; i++) {
-            numel *= tensor_create_info.shapes[i];
-        }
-        extent_elem_cache = numel;
-        uint32_t s = 1;
-        for (int32_t i = static_cast<int32_t>(tensor_create_info.ndims) - 1; i >= 0; i--) {
-            strides[i] = s;
-            s *= tensor_create_info.shapes[i];
-        }
-    }
-
     /**
      * Effective element extent of this entry.
      * Contiguous-aligned views compute it from shapes alone (line 1 hit only);

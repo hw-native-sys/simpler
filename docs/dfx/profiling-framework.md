@@ -187,16 +187,33 @@ Provides:
 [profiler_base.h](../../src/common/platform/include/host/profiler_base.h))
 is where the unified algorithms live:
 
-- `try_pop_aicpu_entry` — barrier-correct head/tail advance over the
-  per-thread ready queue, with a range-check guard against device-side
-  corruption.
-- `process_entry` — resolve/copy the popped buffer, refill the originating
-  free queue only from the current drain shard's local recycled lane, then
-  push to the host ready shard. Runtime drain does not allocate and does not
-  consume done shards directly. If the host ready shard is full, the drain
-  thread retains the buffer and waits until its collector frees a slot. This
-  makes the device-ready pop to host-ready push a lossless hand-off while
-  keeping the done shard's producer side collector-only.
+- `try_peek_aicpu_entry` / `ack_aicpu_entry` — barrier-correct read of the
+  per-thread ready queue's head entry and, separately, the head advance that
+  hands its slot back to the device, both with a range-check guard against
+  device-side corruption.
+- `process_entry` — resolve/copy the peeked buffer, acknowledge the device
+  slot, refill the originating free queue only from the current drain shard's
+  local recycled lane, then push to the host ready shard. Runtime drain does not
+  allocate and does not consume done shards directly. If the host ready shard is
+  full, the drain thread retains the buffer and waits until its collector frees a
+  slot. This makes the device-ready read to host-ready push a lossless hand-off
+  while keeping the done shard's producer side collector-only.
+
+  The acknowledgement sits after the copy on purpose: until it happens the
+  device still owns the slot, so a failed resolve or a failed device→host copy
+  costs a retry on the next sweep instead of the record. An entry that can never
+  be delivered — indices that do not validate, a buffer this manager never
+  mapped, or a copy still failing after `kStalledDrainEntryTimeout` — is
+  acknowledged so the queue keeps draining, counted in
+  `ProfilerBase::drain_dropped_buffers()` so `reconcile_counters()` can name it
+  rather than leaving an anonymous `silent_loss`, and its buffer is put back
+  where the pool can use it again: into the free_queue it came from, or into
+  `retired_[q][kind]` when that queue is already at `kSlotCount` — the same
+  fallback a short top-up takes (§4). An entry whose *indices* did not validate
+  is the exception, because its buffer pointer arrived in the same corrupt
+  entry: that pointer is never published into a device-visible free_queue, only
+  parked in the retired pool when the manager can map it to a block it owns, and
+  withheld entirely when it cannot.
 - `proactive_replenish` — before worker threads start, top every
   (kind, instance) free queue up to `kSlotCount` and optionally warm
   recycled lanes. If recycled is dry while filling free queues it
@@ -328,10 +345,12 @@ Current users:
 ```text
   AICPU                       mgmt thread(s)                    collector shard(s)
   ─────                       ──────────────                    ──────────────────
-  write record into         try_pop_aicpu_entry(q)
+  write record into         try_peek_aicpu_entry(q)
   current free buffer       ──────────────────────────►
                             process_entry:
                               resolve_host_ptr
+                              copy buffer from device
+                              ack_aicpu_entry(q)
                               pop recycled[q]
                                 (top up originating free_queue)
                               wait_push_to_ready(shard q) ────► wait_pop_ready(q)
@@ -414,7 +433,7 @@ mid-run by the framework.
 | `done_shards_[q]` | replenish | collector q | fixed-capacity SPSC ring |
 | `recycled_[shard][kind]` | drain shard at runtime | replenish | fixed-capacity SPSC ring; startup code may pop any shard before threads start |
 | `retired_[shard][kind]` | teardown | exceptional fallback paths | mutex-protected holding pool; not used by the hot recycle path |
-| `dev_to_host_` / block ranges | mgmt (`resolve_host_ptr`) | init/startup allocation | `mapping_mutex_`; collector touches it only in `release_owned_buffers` / `clear_mappings`, after `stop()` has joined mgmt |
+| `dev_to_host_` / block ranges | drain shards (`resolve_host_ptr`) | init/startup allocation, runtime replenish, teardown | shared `mapping_mutex_` for resolution; exclusive `mapping_mutex_` for mutation |
 | `MemoryOps` / `shared_mem_host_` / `device_id_` | both threads | start-only | `set_memory_context` is called once before threads spawn; read-only afterwards |
 | AICPU per-thread ready queues (`header->queues[q]`) | mgmt (head advance) | AICPU (tail advance) | `read_range_from_device` in split drain, then `write_range_to_device` for `queue_heads[q]` |
 | Per-instance `FreeQueue` | AICPU (head advance) | owning drain shard (tail advance) | SPSC ownership; host refreshes `head` before writing `buffer_ptrs[]` / `tail` |

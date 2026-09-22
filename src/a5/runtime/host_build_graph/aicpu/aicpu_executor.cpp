@@ -22,6 +22,8 @@
 #include "aicpu/cache_maintenance.h"
 #include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/device_phase_aicpu.h"
+#include "aicpu/device_run_result_aicpu.h"
+#include "aicpu/device_run_result_base_aicpu.h"
 #include "aicpu/device_time.h"
 #include "host_build_graph/runtime_status.h"
 #include "host_build_graph/shared_memory.h"
@@ -30,6 +32,7 @@
 #include "scheduler/scheduler_watchdog.h"
 #include "spin_hint.h"
 
+#include "common/run_terminal_accumulator.h"
 #include "common/unified_log.h"
 
 // Register-based communication
@@ -62,6 +65,19 @@ struct AicpuExecutor {
     int32_t aicpu_thread_num_{0};
 
     simpler::ThreadCompletionGate completion_gate_;
+
+    // This run's terminal record. `terminal_` collects each participant's own
+    // failure as it retires; `normal_path_claims_` counts the participants that
+    // positively reached the end of their audited path, so a run is a success
+    // only when every one of them did rather than when none of them complained;
+    // `terminal_publisher_` carries the finalizer's decision across teardown to
+    // the sole cleanup owner that publishes it. This runtime attaches no
+    // diagnostic payload: its scene lives in the AICore run control, which the
+    // supervisor already latches into the shared header.
+    RunTerminalAccumulator terminal_;
+    std::atomic<int32_t> normal_path_claims_{0};
+    RunTerminalPublisher terminal_publisher_;
+
     std::atomic<bool> shutdown_ready_{false};
     std::atomic<int32_t> shutdown_signaled_{0};
     std::atomic<int32_t> run_status_{0};
@@ -75,6 +91,13 @@ struct AicpuExecutor {
     int32_t run(Runtime *runtime);
     void deinit(Runtime *runtime);
     int32_t finish_failed_init(Runtime *runtime);
+    // Decide this run's terminal record while the state it reads is still
+    // valid. Runs inside the completion gate's finalizer, on the last
+    // participant out.
+    void snapshot_run_terminal(Runtime *runtime);
+    // Commit the decided record. Runs on the thread that claims cleanup, after
+    // teardown and before it returns from the kernel.
+    void publish_run_terminal();
 };
 
 static AicpuExecutor g_aicpu_executor;
@@ -129,17 +152,19 @@ static int32_t read_runtime_status(Runtime *runtime) {
 
 static int32_t publish_aicore_scheduler_runtime_error(Runtime *runtime) {
     if (runtime == nullptr || runtime->get_gm_sm_ptr() == nullptr) return 0;
-    SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
-    if (context == nullptr) return 0;
-    cache_invalidate_range(context, 128);
-    auto *run_control = aicore_scheduler_run_control(context);
-    if (run_control == nullptr) return 0;
-    cache_invalidate_range(
-        reinterpret_cast<uint8_t *>(run_control) + offsetof(SchedulerRunControl, error_claimed), 128
-    );
     auto *header = static_cast<SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
-    (void)latch_aicore_scheduler_runtime_error(&header->sched_error_code, run_control->scheduler_error);
-    return read_runtime_status(runtime);
+    SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
+    SchedulerRunControl *run_control = nullptr;
+    if (context != nullptr) {
+        cache_invalidate_range(context, 128);
+        run_control = aicore_scheduler_run_control(context);
+        if (run_control != nullptr) {
+            cache_invalidate_range(
+                reinterpret_cast<uint8_t *>(run_control) + offsetof(SchedulerRunControl, error_claimed), 128
+            );
+        }
+    }
+    return settle_aicore_runtime_status(run_control, &header->sched_error_code);
 }
 
 static void publish_aicore_task_timing(Runtime *runtime) {
@@ -182,7 +207,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     // thread handshakes a disjoint slice of cores, then the leader finishes init
     // across two barriers: discovery precedes configuration, and all register
     // releases precede init completion.
-    int32_t nthreads = runtime->aicpu_thread_num;
+    int32_t nthreads = runtime->dev.aicpu_thread_num;
     if (nthreads == 0) nthreads = 1;
     if (nthreads < 1 || nthreads > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR("Invalid aicpu_thread_num: %d", nthreads);
@@ -270,6 +295,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     // Only the leader polls the shared bootstrap line. Peers wait in AICPU
     // local memory, avoiding six concurrent cache invalidates on the same GM
     // cache line. The following release is the sole AICore-wide DMB gate.
+    aicore_lifecycle_.begin_bootstrap_wait(tidx);
     if (is_leader) {
         if (!init_failed_.load(std::memory_order_acquire) && aicore_lifecycle_.wait_bootstrap_complete(runtime) != 0) {
             init_failed_.store(true, std::memory_order_release);
@@ -284,6 +310,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
             init_failed_.store(true, std::memory_order_release);
         }
     }
+    aicore_lifecycle_.end_bootstrap_wait(tidx);
 
     // The DMB register is the only execution gate. On failure the same
     // partitioned path sends EXIT and waits for every ACK.
@@ -359,7 +386,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     if (thread_idx == aicpu_thread_num_ - 1) {
         int32_t supervisor_rc = 0;
         SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
-        if (context == nullptr || runtime->host_total_tasks < 0) {
+        if (context == nullptr || runtime->dev.host_total_tasks < 0) {
             LOG_ERROR("A5 HBG AICore scheduler requires an initialized graph");
             supervisor_rc = -1;
         } else {
@@ -489,22 +516,74 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         if (run_rc == 0) run_rc = -SIMPLER_ERROR_SCHEDULER_TIMEOUT;
     }
     int32_t shutdown_rc = aicore_lifecycle_.finish_shutdown_partition(thread_idx, runtime);
+    // Both outcomes reach the terminal record before this thread's arrival, and
+    // with the state that produced each: folding shutdown_rc into run_rc first
+    // would publish a teardown failure as an execution one. Every exit above
+    // carries a code of its own today, so every arrival claims the audited
+    // path — the claim is still counted rather than assumed, so a future exit
+    // that reaches here without a code stops the run being publishable as Ok
+    // instead of silently keeping it.
+    terminal_.record_participant(run_rc, shutdown_rc);
+    normal_path_claims_.fetch_add(1, std::memory_order_acq_rel);
     if (shutdown_rc != 0 && run_rc == 0) run_rc = shutdown_rc;
-    completion_gate_.arrive_and_finalize_if_last(aicpu_thread_num_, [runtime] {
+    completion_gate_.arrive_and_finalize_if_last(aicpu_thread_num_, [&] {
+        // Every other participant's writes are visible here — the gate's
+        // arrival is acq_rel and this is the thread that closed it — so this is
+        // the one point where the run's final state can be read. Deciding the
+        // record here and committing it after teardown is what keeps a teardown
+        // fault from landing behind an already-published success.
+        snapshot_run_terminal(runtime);
         publish_aicore_task_timing(runtime);
     });
     return run_rc;
+}
+
+void AicpuExecutor::snapshot_run_terminal(Runtime *runtime) {
+    // The shared header outranks a participant's own return: the supervisor
+    // latches the AICore scheduler's error there, and a peer thread that only
+    // waited on the shutdown barrier returns zero for the same run.
+    //
+    // The header is settled here rather than read as the supervisor left it.
+    // The supervisor's last look at `scheduler_error` precedes the AICore's
+    // exit wait, whose own watchdog can claim that error and then acknowledge
+    // exit normally — leaving the shutdown successful, every participant's rc
+    // zero, and the error carried by nothing. This is the boundary where every
+    // participant has finished its shutdown partition, so one settle covers
+    // every core.
+    const int32_t header_status = publish_aicore_scheduler_runtime_error(runtime);
+    const bool normal_path = normal_path_claims_.load(std::memory_order_acquire) == aicpu_thread_num_;
+    terminal_publisher_.take(run_terminal_select(normal_path, header_status, terminal_), nullptr, 0);
+}
+
+void AicpuExecutor::publish_run_terminal() {
+    if (!terminal_publisher_.publish(get_platform_run_result_base(), get_platform_run_result_epoch())) {
+        // Nothing to publish is the normal shape for a run that never reached
+        // its rendezvous; a refused record is a producer defect. Either way the
+        // host reads the run as undecided, so say which one happened.
+        LOG_INFO("%s", "aicpu_execute: no terminal record published for this run");
+    }
 }
 
 void AicpuExecutor::deinit(Runtime *runtime) {
     // 1. Invalidate AICPU cache for Runtime address range.
     //    Next round's Host DMA (rtMemcpy) writes fresh Runtime to HBM but
     //    bypasses this cache. Invalidating now ensures next round reads from HBM.
-    cache_invalidate_range(runtime, sizeof(Runtime));
+    //    The length is the device descriptor, not sizeof(Runtime): the host-only
+    //    tail past it is never on the device at all. It deliberately spans more
+    //    than the uploaded prefix, keeping maintenance over the whole allocated
+    //    descriptor — including the gate array, which A5 declares but no A5 code
+    //    reads or writes.
+    cache_invalidate_range(runtime, sizeof(runtime->dev));
 
     aicore_lifecycle_.deinit();
 
     completion_gate_.reset();
+    // Both are this run's inputs to the terminal record, already folded into
+    // terminal_publisher_ by the finalizer. That snapshot is deliberately not
+    // cleared here: the thread running this deinit is the one that publishes it
+    // next, after teardown.
+    terminal_.reset();
+    normal_path_claims_.store(0, std::memory_order_release);
     shutdown_ready_.store(false, std::memory_order_release);
     shutdown_signaled_.store(0, std::memory_order_release);
     run_status_.store(0, std::memory_order_release);
@@ -592,6 +671,7 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     if (g_aicpu_executor.completion_gate_.claim_cleanup()) {
         LOG_INFO("aicpu_execute: All threads finished, cleaning up");
         g_aicpu_executor.deinit(runtime);
+        g_aicpu_executor.publish_run_terminal();
     }
 
     if (runtime_rc != 0) {

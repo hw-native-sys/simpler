@@ -22,96 +22,72 @@
 #include "host_build_graph/runtime_types.h"
 #include "tensor.h"
 
-inline constexpr int32_t MAX_IN_GRAPH_TASKS = 1024;
-static_assert(
-    MAX_IN_GRAPH_TASKS <= (1 << TaskId::IN_GRAPH_LOCAL_ID_BITS),
-    "an in-graph local id must fit the low field of an IN_GRAPH task id"
-);
+inline constexpr int32_t SUB_TASK_MAX_NUM = 1024;
 // A body's producers precede their consumers, so a fanin CSR row holds at most
-// task_count - 1 entries and the wake-scan cursor indexes one of them.
-static_assert(MAX_IN_GRAPH_TASKS - 1 < 0xFFFF, "a fanin CSR row index must fit ChipTaskSlotState::wake_scan_cursor");
+// task_count - 1 entries, and both of the slot's row cursors index one of them.
+// A sub-task's row has no cap of its own — unlike a GLOBAL task's inline row,
+// which append_fanin_or_fail holds to CHIP_MAX_FANIN — so this is what bounds
+// them, and a cursor too narrow for it would report a row scanned that was not.
+static_assert(SUB_TASK_MAX_NUM - 1 < 0xFFFF, "a fanin CSR row index must fit ChipTaskSlotState::wake_scan_cursor");
+static_assert(
+    SUB_TASK_MAX_NUM - 1 < 0xFFFF && CHIP_MAX_FANIN - 1 < 0xFFFF,
+    "a fanin row index from either cohort must fit ChipTaskSlotState::ed_publish_scan_cursor"
+);
 inline constexpr int32_t GRAPH_MATERIALIZE_SLICE_TASKS = 4;
 
-enum class GraphTensorSourceKind : uint8_t {
-    BOUNDARY_EXACT = 0,
-    BOUNDARY_VIEW = 1,
-    INTERNAL = 2,
-    OWN_OUTPUT = 3,
-};
-
-// Wire representation of simpler::hbg::Tensor. simpler::hbg::Tensor itself is a host/runtime C++ type with
-// 64-byte alignment and helper methods; placing it inside vector<std::byte>
-// would not guarantee that alignment. Keep the boundary image C-compatible and
-// copy only semantic fields into this naturally 8-byte-aligned POD.
-struct GraphTensor {
-    uint64_t buffer_addr;
-    uint64_t buffer_size;
-    uint64_t owner_task_id;
-    uint64_t start_offset;
-    uint64_t extent_elem;
-    int32_t version;
-    uint32_t shapes[MAX_TENSOR_DIMS];
-    uint32_t strides[MAX_TENSOR_DIMS];
-    uint8_t ndims;
-    uint8_t dtype;
-    uint8_t manual_dep;
-    uint8_t is_contiguous;
-    uint8_t address_space;
-    uint8_t reserved[3];
-};
-
-// Definition records are copied across the host-device boundary. Keep them
-// pointer-free, fixed-width and position-independent: every reference is an
-// offset from its owning header.
+// Every type a Definition section holds is copied across the host-device boundary, so all
+// of them are pointer-free, fixed-width and position-independent: a reference is an offset
+// from its owning header, never an address.
 //
-// How one recorded tensor argument is rebuilt for an execution: which object of
-// that execution supplies its storage, and where inside that object it starts.
-// `source_kind` decides what the other two fields mean, because each kind adds its
-// offset to a different field of the rebound tensor (graph_rebind_tensor):
+// A tensor travels as simpler::hbg::TensorData, the 96-byte base simpler::hbg::Tensor
+// derives from -- see its declaration for why the image cannot hold the aligned form.
+
+// Where one sub-task scalar slot takes its value from: the Definition's own
+// scalars[] entry, or the boundary parameter named by boundary_index(). It is the wire
+// form of the two things recording knows about a slot -- whether it inherits, and which
+// parameter it inherits -- so inherited() is the same predicate as Arg::scalar_inherited.
 //
-//   source_kind     source_index indexes       packed_offset adds to     unit
-//   BOUNDARY_EXACT  the boundary tensors       nothing (must be zero)    --
-//   BOUNDARY_VIEW   the boundary tensors       rebound.start_offset      elements
-//   INTERNAL        the in-graph tasks         rebound.buffer_addr       bytes
-//   OWN_OUTPUT      the consuming task itself  rebound.buffer_addr       bytes
-//
-// The unit follows the field the offset lands in rather than being a choice. A
-// BOUNDARY kind keeps the boundary tensor's whole buffer, since that buffer is what
-// graph_tensor_wire_valid bounds the view against, so its offset has nowhere to go
-// but start_offset — which simpler::hbg::Tensor counts in elements. An INTERNAL
-// tensor instead owns the slice it names, so its offset moves the buffer itself.
-// An element offset is meaningful only while the consumer and the boundary tensor
-// share a dtype.
-//
-// OWN_OUTPUT carries a source_index equal to the consuming task's own index, which
-// replay checks rather than reads.
-struct GraphTensorSourceRef {
-    uint8_t source_kind;
-    uint8_t reserved;
-    uint16_t source_index;
-    uint32_t reserved2;
-    uint64_t packed_offset;
+// Only a parameter of the replaying Graph's boundary can be refreshed; the index reaches
+// that boundary and nothing else, and means nothing while inherited() is false. The
+// fields are private so the pair can only be set together, through a factory that decides
+// both: an entry carrying an index while claiming not to inherit, or the reverse, cannot
+// be spelled. What the index means is still a claim about a boundary this entry cannot
+// see, so the readers bound it against the boundary they do have.
+class GraphScalarInheritance {
+public:
+    // The image's scalar section is allocated as an array, so a default-constructible
+    // slot is required; the factories below are what a caller fills one with.
+    GraphScalarInheritance() = default;
+
+    static GraphScalarInheritance self_value() { return {0, false}; }
+    static GraphScalarInheritance from_boundary(uint16_t index) { return {index, true}; }
+
+    bool inherited() const { return inherited_ != 0; }
+    uint16_t boundary_index() const { return boundary_index_; }
+
+private:
+    GraphScalarInheritance(uint16_t index, bool inherits) :
+        boundary_index_(index),
+        inherited_(inherits ? 1 : 0) {}
+
+    // One access level for every field, which is what keeps this standard-layout and so
+    // safe to memcpy to the device. inherited_ is a uint16_t rather than a bool so the
+    // two fields fill the size alignof(uint16_t) rounds this type up to: there is no
+    // padding byte, and so no indeterminate byte in the image's scalar section, which the
+    // static_assert below pins the size of because that is what the section indexes by.
+    uint16_t boundary_index_;
+    uint16_t inherited_;
 };
 
-enum class GraphScalarSourceKind : uint8_t {
-    STATIC_VALUE = 0,
-    BOUNDARY = 1,
-};
-
-struct GraphScalarSourceRef {
-    uint16_t source_index;
-    uint8_t source_kind;
-    uint8_t reserved;
-};
-
-// Wire representation of an in-graph task's dispatch predicate. The operand's absolute GM
+// Wire representation of a sub-task's dispatch predicate. The operand's absolute GM
 // address is not replay-invariant, so the Definition names the tensor the
 // operand element sits in plus its element offset within that tensor;
 // materialize rebinds the tensor for the execution and resolves the pair into
 // the address the scheduler reads at the dispatch point.
 struct GraphPredicate {
-    GraphTensor operand;
-    GraphTensorSourceRef operand_source;
+    // A relocation record on the same terms as the off_tensors section: replay rebinds it
+    // before resolving the address below.
+    simpler::hbg::TensorData operand;
     // Element index into the rebound operand tensor, added to its start_offset.
     // Fixed at record time: a Graph with a variable simpler::hbg::Tensor shape is rejected
     // before recording, so the operand's strides cannot change across replays.
@@ -122,7 +98,7 @@ struct GraphPredicate {
     uint8_t reserved[6];
 };
 
-struct InGraphTaskDefinition {
+struct SubTaskDefinition {
     int32_t kernel_id[SUBTASK_SLOT_COUNT];
     uint8_t active_mask;
     uint8_t task_attrs;
@@ -136,7 +112,7 @@ struct InGraphTaskDefinition {
     int16_t logical_block_num;
     int16_t total_required_subtasks;
     // One-based index into the Definition's predicate array; 0 means the task
-    // carries no dispatch predicate. Biased so that a zeroed InGraphTaskDefinition
+    // carries no dispatch predicate. Biased so that a zeroed SubTaskDefinition
     // is a valid predicate-free task. Predicated tasks are rare, so the
     // predicates live in their own array rather than inline.
     uint16_t predicate_slot;
@@ -149,19 +125,6 @@ struct InGraphTaskDefinition {
     int32_t tensor_offset;
     int32_t scalar_offset;
     ArgsDumpTaskMetadata dump_metadata;
-};
-
-struct GraphBoundarySignature {
-    uint64_t buffer_size;
-    uint32_t shapes[MAX_TENSOR_DIMS];
-    uint32_t strides[MAX_TENSOR_DIMS];
-    uint16_t alias_rep;
-    uint8_t ndims;
-    uint8_t dtype;
-    uint8_t tag;
-    uint8_t manual_dep;
-    uint8_t is_contiguous;
-    uint8_t reserved;
 };
 
 inline constexpr uint64_t GRAPH_DEFINITION_OBJECT_MAGIC = 0x4752415048455844ULL;
@@ -197,7 +160,7 @@ struct GraphDefinition {
     uint64_t full_key;
     uint64_t required_heap;
     // The header splits by range, not by name. Everything that counts *things* is
-    // signed: each is capped by MAX_IN_GRAPH_TASKS times a per-task constant, so the
+    // signed: each is capped by SUB_TASK_MAX_NUM times a per-task constant, so the
     // largest of them (edge_count, at 1024 x 1023) still clears INT32_MAX by three
     // orders of magnitude, and a signed count makes a corrupt wire value testable
     // with `< 0` instead of turning it into a huge index. Everything that counts
@@ -208,12 +171,12 @@ struct GraphDefinition {
     int32_t task_count;
     int32_t edge_count;
     int32_t root_count;
-    int32_t boundary_count;
+    int32_t boundary_tensor_count;
     int32_t boundary_scalar_count;
     int32_t tensor_arg_count;
     int32_t scalar_arg_count;
     int32_t predicate_count;
-    // Bytes the GraphExecution header, in-graph task array and in-graph task
+    // Bytes the GraphExecution header, sub-task array and sub-task
     // argument pools need in the outer Graph task's heap tail. Invocation
     // boundaries live in the outer task payload's compact argument-pool regions
     // instead.
@@ -223,33 +186,52 @@ struct GraphDefinition {
     uint32_t off_fanin_offsets;
     uint32_t off_fanin_indices;
     uint32_t off_root_indices;
-    uint32_t off_in_graph_task_offsets;
-    uint32_t off_in_graph_tasks;
+    uint32_t off_sub_task_offsets;
+    uint32_t off_sub_tasks;
+    // Every sub-task's tensor arguments, concatenated; a task names its own run
+    // through tensor_offset / tensor_count.
+    //
+    // These are **relocation records**, not tensors. Every other simpler::hbg::Tensor in
+    // this runtime -- a boundary parameter, an invocation's argument, a materialized task
+    // argument -- holds values that mean something on their own. One here does not: the
+    // two fields replay has a base for are stored relative, and which base to add follows
+    // the tensor's own owner_task_id, stamped by the recording.
+    //
+    //   field           owner PARAM                           owner SUB_TASK
+    //   buffer_addr     0 -- replay takes the whole buffer     offset into the graph heap,
+    //                   from this call's argument              whose base the execution has
+    //   start_offset    the view's offset inside that          the view's own origin,
+    //                   parameter; replay adds the             absolute in its own buffer
+    //                   argument's origin
+    //
+    // Geometry, dtype and flags travel absolute, because graph_boundary_matches pins those
+    // equal before a Definition may be reused.
+    //
+    // So start_offset here does not mean what it means on the boundary tensors this is
+    // matched against: there it is the caller's own origin, here an offset from it. A
+    // parameter's offset is relative to its own parameter rather than to its alias
+    // partition's, so a tensor is rebuilt against the argument it came from; two tensors
+    // over one buffer keep their recorded distance only while the arguments keep theirs,
+    // which is what graph_boundary_matches checks and what the recorded WAR/WAW edges were
+    // inferred from.
     uint32_t off_tensors;
-    uint32_t off_tensor_sources;
     uint32_t off_scalars;
-    uint32_t off_scalar_sources;
-    uint32_t off_boundary_signatures;
+    uint32_t off_scalar_inheritance;
     uint32_t off_predicates;
 };
 
-static_assert(std::is_trivially_copyable_v<GraphTensorSourceRef>);
-static_assert(std::is_standard_layout_v<GraphTensorSourceRef>);
-static_assert(std::is_trivially_copyable_v<GraphTensor>);
-static_assert(std::is_standard_layout_v<GraphTensor>);
-static_assert(std::is_trivially_copyable_v<GraphScalarSourceRef>);
-static_assert(std::is_standard_layout_v<GraphScalarSourceRef>);
-static_assert(std::is_trivially_copyable_v<InGraphTaskDefinition>);
-static_assert(std::is_standard_layout_v<InGraphTaskDefinition>);
+static_assert(std::is_trivially_copyable_v<GraphScalarInheritance>);
+static_assert(std::is_standard_layout_v<GraphScalarInheritance>);
+static_assert(sizeof(GraphScalarInheritance) == 4, "the image's scalar section assumes this layout");
+static_assert(std::is_trivially_copyable_v<SubTaskDefinition>);
+static_assert(std::is_standard_layout_v<SubTaskDefinition>);
 // graph_fill_definition assigns this struct field by field, so its interior padding
-// is the one part of the in-graph task section no writer reaches. Nothing reads it
+// is the one part of the sub-task section no writer reaches. Nothing reads it
 // either, but pinning the size makes a new field's padding cost visible in the diff
 // that adds it rather than silently.
-static_assert(sizeof(InGraphTaskDefinition) == 80, "an InGraphTaskDefinition field changed the wire layout");
+static_assert(sizeof(SubTaskDefinition) == 80, "a SubTaskDefinition field changed the wire layout");
 static_assert(std::is_trivially_copyable_v<GraphPredicate>);
 static_assert(std::is_standard_layout_v<GraphPredicate>);
-static_assert(std::is_trivially_copyable_v<GraphBoundarySignature>);
-static_assert(std::is_standard_layout_v<GraphBoundarySignature>);
 static_assert(std::is_trivially_copyable_v<GraphDefinition>);
 static_assert(std::is_standard_layout_v<GraphDefinition>);
 
@@ -260,78 +242,12 @@ static_assert(std::is_standard_layout_v<GraphDefinition>);
 // type that asked for more would make every one of those stores undefined, with
 // no diagnostic.
 static_assert(
-    alignof(InGraphTaskDefinition) <= alignof(std::max_align_t) && alignof(GraphTensor) <= alignof(std::max_align_t) &&
-        alignof(GraphTensorSourceRef) <= alignof(std::max_align_t) &&
-        alignof(GraphScalarSourceRef) <= alignof(std::max_align_t) &&
-        alignof(GraphBoundarySignature) <= alignof(std::max_align_t) &&
+    alignof(SubTaskDefinition) <= alignof(std::max_align_t) &&
+        alignof(simpler::hbg::TensorData) <= alignof(std::max_align_t) &&
+        alignof(GraphScalarInheritance) <= alignof(std::max_align_t) &&
         alignof(GraphPredicate) <= alignof(std::max_align_t),
     "a Definition section type must not be over-aligned: its storage is a byte vector"
 );
-
-inline GraphTensor graph_tensor_pack(const simpler::hbg::Tensor &tensor) {
-    GraphTensor packed{};
-    packed.buffer_addr = tensor.buffer.addr;
-    packed.buffer_size = tensor.buffer.size;
-    packed.owner_task_id = tensor.owner_task_id.raw;
-    packed.start_offset = tensor.start_offset;
-    packed.extent_elem = tensor.extent_elem_cache;
-    packed.version = tensor.version;
-    for (uint32_t i = 0; i < tensor.ndims; ++i) {
-        packed.shapes[i] = tensor.shapes[i];
-        packed.strides[i] = tensor.strides[i];
-    }
-    packed.ndims = static_cast<uint8_t>(tensor.ndims);
-    packed.dtype = static_cast<uint8_t>(tensor.dtype);
-    packed.manual_dep = tensor.manual_dep ? 1 : 0;
-    packed.is_contiguous = tensor.is_contiguous ? 1 : 0;
-    packed.address_space = static_cast<uint8_t>(tensor.address_space);
-    return packed;
-}
-
-inline void graph_tensor_unpack(const GraphTensor &packed, simpler::hbg::Tensor *tensor) {
-    tensor->buffer = PTOBufferHandle{packed.buffer_addr, packed.buffer_size};
-    tensor->owner_task_id = TaskId{packed.owner_task_id};
-    tensor->start_offset = packed.start_offset;
-    tensor->extent_elem_cache = packed.extent_elem;
-    tensor->version = packed.version;
-    tensor->ndims = packed.ndims;
-    tensor->dtype = static_cast<DataType>(packed.dtype);
-    tensor->manual_dep = packed.manual_dep != 0;
-    tensor->is_contiguous = packed.is_contiguous != 0;
-    tensor->address_space = static_cast<AddressSpace>(packed.address_space);
-    for (uint32_t i = 0; i < MAX_TENSOR_DIMS; ++i) {
-        tensor->shapes[i] = packed.shapes[i];
-        tensor->strides[i] = packed.strides[i];
-    }
-    for (uint8_t &byte : tensor->_pad_cl2)
-        byte = 0;
-}
-
-inline bool graph_tensor_wire_valid(const GraphTensor &tensor) {
-    if (tensor.buffer_addr == 0 || tensor.ndims == 0 || tensor.ndims > MAX_TENSOR_DIMS ||
-        tensor.dtype >= static_cast<uint8_t>(DataType::DATA_TYPE_NUM) || tensor.manual_dep > 1 ||
-        tensor.is_contiguous > 1 || tensor.address_space > 1) {
-        return false;
-    }
-
-    uint64_t extent = 1;
-    uint64_t expected_stride = 1;
-    bool contiguous = true;
-    for (int32_t i = static_cast<int32_t>(tensor.ndims) - 1; i >= 0; --i) {
-        const uint64_t shape = tensor.shapes[i];
-        const uint64_t stride = tensor.strides[i];
-        if (shape == 0 || stride == 0) return false;
-        contiguous &= stride == expected_stride;
-        if (shape - 1 > (UINT64_MAX - extent) / stride || expected_stride > UINT64_MAX / shape) return false;
-        extent += (shape - 1) * stride;
-        expected_stride *= shape;
-    }
-    if (extent != tensor.extent_elem || contiguous != (tensor.is_contiguous != 0)) return false;
-
-    const uint64_t element_size = get_element_size(static_cast<DataType>(tensor.dtype));
-    const uint64_t buffer_elements = tensor.buffer_size / element_size;
-    return tensor.start_offset <= buffer_elements && tensor.extent_elem <= buffer_elements - tensor.start_offset;
-}
 
 // A section's length is the same int32 every counting field of the header carries.
 // A negative one is rejected outright rather than left to wrap through the size_t
@@ -389,10 +305,10 @@ struct GraphExecution {
     ChipTaskSlotState *outer_slot{nullptr};
     ChipTaskStorage *tasks{nullptr};
     ChipTaskStorage *task_storage{nullptr};
-    // Polling-progress state, one ChipTaskState byte per in-graph task, in the
+    // Polling-progress state, one ChipTaskState byte per sub-task, in the
     // storage tail. Carries the same PENDING -> PUBLISHED -> COMPLETED meaning
     // as the shared-memory task_states array a GLOBAL task uses, against
-    // in-graph local ids instead of task-table slots, so both cohorts answer
+    // sub-task local ids instead of task-table slots, so both cohorts answer
     // readiness the same way.
     //
     // A byte array of its own rather than a field of ChipTaskStorage, for the
@@ -410,7 +326,15 @@ struct GraphExecution {
     const GraphDefinition *definition{nullptr};
     const int32_t *fanin_offsets{nullptr};
     const uint16_t *fanin_indices{nullptr};
-    const GraphTensor *boundary_tensors{nullptr};
+    // Base of the graph heap this execution was given. A body tensor's recorded offset is
+    // relative to the recording's own output region, which is an affine image of this heap,
+    // so the two added together are the real address.
+    uintptr_t heap_base{0};
+    // This invocation's actual arguments, held in the outer Graph task's own argument
+    // pool. They are simpler::hbg::Tensors like every other task's, so a rebind that
+    // resolves to one copies it across rather than converting: the boundary is the one
+    // input that does not come from the image.
+    const simpler::hbg::Tensor *boundary_tensors{nullptr};
     int32_t boundary_tensor_count{0};
     const uint64_t *boundary_scalars{nullptr};
     int32_t boundary_scalar_count{0};
@@ -428,45 +352,47 @@ struct GraphExecution {
         task_states[index].store(CHIP_TASK_COMPLETED, order);
     }
 
+    bool is_published(int32_t index, std::memory_order order = std::memory_order_acquire) const {
+        return task_states[index].load(order) >= CHIP_TASK_PUBLISHED;
+    }
+
+    void store_published(int32_t index, std::memory_order order = std::memory_order_release) const {
+        task_states[index].store(CHIP_TASK_PUBLISHED, order);
+    }
+
     void reset_task_state(int32_t index) const {
         task_states[index].store(CHIP_TASK_PENDING, std::memory_order_relaxed);
     }
 };
 
 static_assert(std::is_trivially_destructible_v<ChipTaskStorage>);
-// The tensor pool starts right after the in-graph task array, and the scalar pool starts
+// The tensor pool starts right after the sub-task array, and the scalar pool starts
 // after a whole number of ChipTensors.
 static_assert(
     alignof(ChipTaskStorage) % alignof(simpler::hbg::Tensor) == 0,
-    "an in-graph task entry must be at least simpler::hbg::Tensor-aligned: the tensor pool follows the "
-    "in-graph task array"
+    "a sub-task entry must be at least simpler::hbg::Tensor-aligned: the tensor pool follows the "
+    "sub-task array"
 );
 static_assert(
     sizeof(simpler::hbg::Tensor) % alignof(uint64_t) == 0, "the tensor stride must keep the scalar pool aligned"
 );
 static_assert(std::is_trivially_destructible_v<GraphExecution>);
 // The whole storage is aligned for its widest member, so one base check covers the
-// header as well as the in-graph task array that follows it.
+// header as well as the sub-task array that follows it.
 static_assert(
     alignof(ChipTaskStorage) % alignof(GraphExecution) == 0,
-    "the in-graph task array's alignment must subsume the execution header's"
+    "the sub-task array's alignment must subsume the execution header's"
 );
-static_assert(sizeof(GraphTensor) <= sizeof(simpler::hbg::Tensor));
-
-inline constexpr size_t graph_boundary_tensor_pool_slots(uint32_t tensor_count) {
-    const size_t bytes = static_cast<size_t>(tensor_count) * sizeof(GraphTensor);
-    return (bytes + sizeof(simpler::hbg::Tensor) - 1) / sizeof(simpler::hbg::Tensor);
-}
 
 // The outer GRAPH task's heap tail occupies
 // [GraphExecution][ChipTaskStorage x task_count][simpler::hbg::Tensor x tensor_arg_count]
 // [uint64_t x scalar_arg_count].
 //
-// The last two regions are the in-graph task payloads' argument pools, indexed by the
+// The last two regions are the sub-task payloads' argument pools, indexed by the
 // Definition's own tensor_offset / scalar_offset — which is why the Definition's
-// arg-table counts size them rather than a per-task sum: in-graph task i's arguments
+// arg-table counts size them rather than a per-task sum: sub-task i's arguments
 // occupy [offset, offset + count) in both the table and the pool. There is no fanin
-// region: an in-graph task's dependencies live in the Definition's fanin CSR, so its
+// region: a sub-task's dependencies live in the Definition's fanin CSR, so its
 // fanin_count stays 0 and its fanin delta unbound.
 struct GraphExecutionStorageLayout {
     size_t tasks_offset;
@@ -479,7 +405,7 @@ struct GraphExecutionStorageLayout {
 inline bool graph_execution_storage_layout(
     int32_t task_count, int32_t tensor_arg_count, int32_t scalar_arg_count, GraphExecutionStorageLayout *out
 ) {
-    if (out == nullptr || task_count <= 0 || task_count > MAX_IN_GRAPH_TASKS || tensor_arg_count < 0 ||
+    if (out == nullptr || task_count <= 0 || task_count > SUB_TASK_MAX_NUM || tensor_arg_count < 0 ||
         scalar_arg_count < 0) {
         return false;
     }
@@ -568,7 +494,7 @@ inline bool graph_execution_signal_external_ready(GraphExecution &execution) {
             GRAPH_EXECUTION_EXTERNAL_READY) == 0;
 }
 
-inline bool graph_execution_complete_in_graph_task(GraphExecution &execution) {
+inline bool graph_execution_complete_sub_task(GraphExecution &execution) {
     return execution.remaining_tasks.fetch_sub(1, std::memory_order_acq_rel) == 1;
 }
 
@@ -576,6 +502,6 @@ inline void graph_execution_mark_completed(GraphExecution &execution) {
     graph_execution_set_state(execution, GraphExecutionState::COMPLETED);
 }
 
-inline void graph_execution_retire_in_graph_task(GraphExecution &execution) {
+inline void graph_execution_retire_sub_task(GraphExecution &execution) {
     execution.retired_tasks.fetch_add(1, std::memory_order_release);
 }

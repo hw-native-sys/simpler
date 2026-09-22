@@ -19,8 +19,9 @@
  *   polls per-thread ready queues, drains done-queue shards, and replenishes
  *   the single instance's free_queue from shard-local recycled lanes.
  * - DepGenCollector: collector thread shards pop full DepGenBuffers from the
- *   manager and append their DepGenRecords to an in-memory vector consumed by
- *   host replay after device execution completes.
+ *   manager and append their DepGenRecords to in-memory storage consumed by
+ *   host replay after device execution completes, grouped by the run that
+ *   produced them.
  *
  * Lifecycle:
  *   init()                       — Allocate header + 1 BufferState + N DepGenBuffers
@@ -29,16 +30,20 @@
  *   start(tf)                    — Inherited: launches mgmt + collector threads.
  *   [device execution]
  *   stop()                       — Inherited: drain queues, join threads.
- *   reconcile_counters()         — Sanity-check current_buf_ptr is cleared by
- *                                  AICPU flush, run collected+dropped==total
- *                                  cross-check. If dropped_record_count > 0,
- *                                  the host caller skips deps.json emission
- *                                  (incomplete graph; user gets a warning).
+ *   reconcile_counters()         — Sanity-check that no buffer the device still
+ *                                  holds has records in it, run the
+ *                                  collected+dropped==total cross-check. A
+ *                                  buffer AICPU could not hand over stays the
+ *                                  pool's with count 0, which is not a failure;
+ *                                  records left in one are. If
+ *                                  dropped_record_count > 0, the host caller
+ *                                  skips deps.json emission (incomplete graph;
+ *                                  user gets a warning).
  *   finalize()                   — Free all device memory, unregister.
  *
- * Output contract: a contiguous in-memory stream of DepGenRecord values.
- * Host replay consumes this stream directly; no submit_trace.bin intermediary
- * is written by the collector.
+ * Output contract: per run, a contiguous in-memory stream of DepGenRecord
+ * values. Host replay consumes one run's stream directly; no submit_trace.bin
+ * intermediary is written by the collector.
  */
 
 #ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_DEP_GEN_COLLECTOR_H_
@@ -48,6 +53,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -218,9 +224,10 @@ public:
 
     /**
      * Per-buffer callback invoked by ProfilerBase's poll loop. Appends the
-     * buffer's DepGenRecord entries to the in-memory ``records_`` vector
-     * (no disk I/O — the host replay consumes that vector directly via
-     * ``records()`` once the device run completes).
+     * buffer's DepGenRecord entries to in-memory storage, grouped by the run
+     * that produced them (no disk I/O — the host replay consumes one run's
+     * records directly via ``window_records()`` once the device run
+     * completes).
      */
     void on_buffer_collected(const DepGenReadyBufferInfo &info);
 
@@ -249,11 +256,50 @@ public:
     uint64_t total_collected() const { return total_collected_; }
 
     /**
-     * In-memory record buffer (host replay's input). Valid between init()
-     * and finalize(); pointer/size stay stable after stop() returns, which
-     * is when the caller hands them to ``dep_gen_replay_emit_deps_json``.
+     * Every run whose records this collector holds, keyed by run epoch, each
+     * run's records contiguous and in arrival order.
+     *
+     * Records are grouped rather than flattened because a buffer's identity is
+     * the only thing that says which graph its records belong to, and the pool
+     * hands the same storage to a later run. Today the collection window holds
+     * exactly one run — ``begin_run()`` clears this — so there is exactly one
+     * entry; the grouping is what lets that stop being true without silently
+     * merging two graphs.
      */
-    const std::vector<DepGenRecord> &records() const { return records_; }
+    const std::map<uint64_t, std::vector<DepGenRecord>> &runs() const { return records_by_run_; }
+
+    /**
+     * The records this collection window should emit as its graph.
+     *
+     * Three cases, and the distinction matters because a window with no records
+     * is not the same as a window whose contents are ambiguous:
+     *
+     *   - one run  — that run's records, and its epoch through @p run_epoch_out.
+     *   - no run   — an **empty** span, epoch 0. A run that submitted nothing
+     *                has an empty graph, not a missing one, and the replay
+     *                writer accepts `num_records == 0` to emit exactly that.
+     *   - several  — nullptr. One path names one graph, so the caller cannot
+     *                emit; silently picking one would produce a deps.json that
+     *                claims to be the whole graph.
+     *
+     * A run present in ``runs()`` always has at least one record, because
+     * ``append_buffer_records`` never creates an entry for an empty buffer — so
+     * the one-run case can never masquerade as the no-run one.
+     *
+     * Valid between init() and finalize(); pointer/size stay stable after
+     * stop() returns, which is when the caller hands them to
+     * ``dep_gen_replay_emit_deps_json``.
+     */
+    const std::vector<DepGenRecord> *window_records(uint64_t *run_epoch_out = nullptr) const {
+        if (records_by_run_.size() > 1) return nullptr;
+        if (records_by_run_.empty()) {
+            if (run_epoch_out != nullptr) *run_epoch_out = 0;
+            return &kNoRecords;
+        }
+        const auto &entry = *records_by_run_.begin();
+        if (run_epoch_out != nullptr) *run_epoch_out = entry.first;
+        return &entry.second;
+    }
 
 private:
     bool initialized_ = false;
@@ -265,16 +311,22 @@ private:
     void *shm_dev_ = nullptr;
     size_t shm_size_ = 0;
 
-    // In-memory record buffer — drained from the device ring on
-    // on_buffer_collected() and consumed by the host replay directly (no
-    // disk hop). Mutex serializes the mgmt thread's appends against the
-    // (rare) reader on the same collector instance.
-    std::vector<DepGenRecord> records_;
+    // In-memory records — drained from the device ring on
+    // on_buffer_collected() and consumed by the host replay directly (no disk
+    // hop), grouped by the run that produced them. Mutex serializes the mgmt
+    // thread's appends against the (rare) reader on the same collector
+    // instance.
+    std::map<uint64_t, std::vector<DepGenRecord>> records_by_run_;
     std::mutex records_mutex_;
 
-    // Running total of records appended. Equal to ``records_.size()`` after
-    // every append; kept separately for the reconcile_counters cross-check
-    // even when records_ may be inspected concurrently.
+    // Returned by window_records() when no run produced anything, so the caller
+    // gets an empty span rather than having to special-case a null.
+    static inline const std::vector<DepGenRecord> kNoRecords{};
+
+    // Running total of records appended across every run held here. Equal to
+    // the summed sizes in ``records_by_run_`` after every append; kept
+    // separately for the reconcile_counters cross-check even when the records
+    // may be inspected concurrently.
     uint64_t total_collected_ = 0;
 
     DepGenDataHeader *dep_gen_header() const { return get_dep_gen_header(shm_host_); }

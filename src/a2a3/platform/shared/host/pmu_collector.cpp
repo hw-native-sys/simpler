@@ -270,7 +270,7 @@ void PmuCollector::rebuild_csv_header() {
         header += ',';
         header += name;
     }
-    header += ",event_type\n";
+    header += ",event_type,run_epoch\n";
     csv_header_ = std::move(header);
 }
 
@@ -294,7 +294,7 @@ void PmuCollector::begin_run(const std::string &csv_path, PmuEventType event_typ
         PmuDataHeader *hdr = get_pmu_header(shm_host_);
         hdr->event_type = static_cast<uint32_t>(event_type_);
         wmb();
-        (void)manager_.write_range_to_device(&hdr->event_type, sizeof(hdr->event_type));
+        publish_field(&hdr->event_type, sizeof(hdr->event_type), "event_type");
 
         // The per-core record counters are producer-side and never reset by the
         // device, so they carry the previous run's totals into this run's
@@ -316,7 +316,7 @@ void PmuCollector::begin_run(const std::string &csv_path, PmuEventType event_typ
             state->dropped_record_count = 0;
             state->total_record_count = 0;
             wmb();
-            (void)manager_.write_range_to_device(&state->dropped_record_count, 2 * sizeof(uint32_t));
+            publish_field(&state->dropped_record_count, 2 * sizeof(uint32_t), "record counters");
         }
     }
 }
@@ -390,6 +390,8 @@ void PmuCollector::append_buffer_to_csv_shard(
         evt = &PMU_EVENTS_A2A3_PIPE_UTIL;
     }
 
+    const uint64_t run_epoch = buf->run_epoch;
+
     auto &rows = csv_shard_files_[shard];
     for (uint32_t i = 0; i < n; i++) {
         const PmuRecord &r = buf->records[i];
@@ -403,7 +405,7 @@ void PmuCollector::append_buffer_to_csv_shard(
             }
             rows << ',' << r.pmu_counters[k];
         }
-        rows << ',' << static_cast<uint32_t>(event_type_) << '\n';
+        rows << ',' << static_cast<uint32_t>(event_type_) << ',' << run_epoch << '\n';
     }
     if (!rows.good()) {
         LOG_ERROR("PmuCollector: failed to write CSV shard file: %s", csv_shard_paths_[shard].c_str());
@@ -492,21 +494,24 @@ void PmuCollector::on_buffer_collected(const PmuReadyBufferInfo &info, int colle
 // ---------------------------------------------------------------------------
 //
 // Host never recovers records from device-side current_buf_ptr. Device flush
-// (pmu_aicpu_flush_buffers) is the only data path: a flush failure must bump
-// dropped_record_count and clear current_buf_ptr on the device side. Host's
-// job here is purely accounting + sanity assertion — recovering would mask
-// AICPU flush bugs.
+// (pmu_aicpu_flush_buffers) is the only data path: a flush failure bumps
+// dropped_record_count and zeroes the buffer's count, but the buffer stays the
+// core's — AICPU consumes the free queue and never produces into it, so reuse by
+// the next run's init is its only return. Host's job here is purely accounting +
+// sanity assertion — recovering would mask AICPU flush bugs.
 
 void PmuCollector::reconcile_counters() {
     if (shm_host_ == nullptr) return;
+    report_drain_drops();
 
     rmb();
     flush_collector_shards_to_csv();
 
-    // After stop(), pmu_aicpu_flush_buffers should have either enqueued the
-    // active buffer (success → current_buf_ptr=0) or counted it as dropped
-    // and cleared it. A non-zero pointer with non-zero count means records
-    // AICPU neither delivered nor accounted for — a device-side flush bug.
+    // After stop(), a buffer the core still holds must hold no records. Two
+    // outcomes leave the pointer set and both are legitimate: a core with
+    // nothing to publish, and one whose enqueue failed (which charges dropped
+    // and zeroes the count first). A non-zero pointer with a non-zero count is
+    // the bug — records AICPU neither delivered nor accounted for.
     for (int c = 0; c < num_cores_; c++) {
         PmuBufferState *state = pmu_state(c);
         uint64_t buf_dev = state->current_buf_ptr;

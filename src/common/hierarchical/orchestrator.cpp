@@ -73,27 +73,33 @@ RunId Orchestrator::begin_run() {
         if (building_run_id_ != INVALID_RUN_ID) {
             throw std::logic_error("Orchestrator::begin_run: another run is still building");
         }
-        std::optional<PipelineSlotLease> lease;
         ++begin_run_waiters_;
         try {
-            runs_cv_.wait(lk, [this, &lease] {
-                lease = pipeline_slots_.try_acquire(admission_depth_);
-                return lease.has_value();
+            // Admission is bounded by the FIFO alone. A run takes no native
+            // pipeline-slot lease here; `refresh_leases_locked` hands one out
+            // when a run reaches a role that can use it.
+            runs_cv_.wait(lk, [this] {
+                return run_fifo_.size() < pending_run_limit_;
             });
         } catch (...) {
             --begin_run_waiters_;
             throw;
         }
         --begin_run_waiters_;
+        // The pre-wait check was evaluated before the wait released the mutex,
+        // so several callers can pass it and wake to find a builder published.
+        if (building_run_id_ != INVALID_RUN_ID) {
+            throw std::logic_error("Orchestrator::begin_run: another run is still building");
+        }
         if (next_run_id_ == INVALID_RUN_ID || next_run_id_ == std::numeric_limits<RunId>::max()) {
-            pipeline_slots_.release(*lease);
             throw std::overflow_error("Orchestrator::begin_run: run id space exhausted");
         }
         run_id = next_run_id_++;
         bool map_published = false;
         bool fifo_published = false;
         try {
-            auto run = std::make_shared<RunState>(run_id, *lease);
+            // Generation zero is the reserved "no slot held" lease encoding.
+            auto run = std::make_shared<RunState>(run_id, PipelineSlotLease{});
             bool inserted = runs_.emplace(run_id, run).second;
             if (!inserted) throw std::logic_error("Orchestrator::begin_run: duplicate run id");
             map_published = true;
@@ -108,7 +114,8 @@ RunId Orchestrator::begin_run() {
         } catch (...) {
             if (fifo_published) run_fifo_.pop_back();
             if (map_published) runs_.erase(run_id);
-            pipeline_slots_.release(*lease);
+            // No lease was taken, so none is returned. The notify still owes a
+            // waiter the FIFO entry this rollback freed.
             runs_cv_.notify_all();
             throw;
         }
@@ -122,15 +129,64 @@ RunId Orchestrator::begin_run() {
     return run_id;
 }
 
-void Orchestrator::configure_pipeline_depth(uint32_t depth) {
+void Orchestrator::configure_pipeline_depth(uint32_t depth, uint32_t pending_depth, uint32_t launch_depth) {
     if (depth == 0 || depth > PTO_PIPELINE_MAX_DEPTH) {
         throw std::invalid_argument("Orchestrator: pipeline depth is outside the supported range");
+    }
+    if (launch_depth == 0 || launch_depth > depth) {
+        throw std::invalid_argument("Orchestrator: launch depth must be between one and the pipeline depth");
     }
     std::lock_guard<std::mutex> lk(runs_mu_);
     if (!runs_.empty() || building_run_id_ != INVALID_RUN_ID || active_run_id_ != INVALID_RUN_ID) {
         throw std::logic_error("Orchestrator: pipeline depth cannot change after admission starts");
     }
     admission_depth_ = depth;
+    // Below `depth` is legal: it leaves the successor role unfillable, because
+    // that role needs a second FIFO entry to exist, and admission serializes.
+    // That is a caller's choice, not an error.
+    pending_run_limit_ = pending_depth == 0 ? depth : pending_depth;
+    launch_depth_ = launch_depth;
+}
+
+bool Orchestrator::acquire_lease_locked(const std::shared_ptr<RunState> &run, bool *assigned) {
+    if (run->lease_released) return false;
+    if (pipeline_slots_.owns(run->lease)) return true;
+    std::optional<PipelineSlotLease> lease = pipeline_slots_.try_acquire(admission_depth_);
+    if (!lease.has_value()) return false;
+
+    // Publishing the lease and restamping the slots already registered under it
+    // is one step under `completion_mu`, the same mutex `register_run_slot`
+    // holds. A builder registering concurrently therefore either registers
+    // before this and is restamped here, or registers after and reads the new
+    // lease — no ordering leaves a slot on the invalid encoding while its run
+    // owns a pipeline slot.
+    {
+        std::lock_guard<std::mutex> run_lk(run->completion_mu);
+        run->lease = *lease;
+        for (TaskSlot slot : run->task_slots) {
+            TaskSlotState *state = allocator_->slot_state(slot);
+            if (state != nullptr) state->pipeline_lease = run->lease;
+        }
+    }
+    if (assigned != nullptr) *assigned = true;
+    return true;
+}
+
+bool Orchestrator::refresh_leases_locked() {
+    bool assigned = false;
+    if (run_fifo_.empty()) return assigned;
+    auto head = runs_.find(run_fifo_.front());
+    if (head == runs_.end()) return assigned;
+    if (is_terminal(head->second->phase.load(std::memory_order_acquire))) return assigned;
+    if (!acquire_lease_locked(head->second, &assigned)) return assigned;
+    if (run_fifo_.size() < 2) return assigned;
+    auto successor = runs_.find(run_fifo_[1]);
+    if (successor == runs_.end()) return assigned;
+    // Only a closed successor can be prepared, the same condition
+    // `preparable_run_id` reports on.
+    if (successor->second->phase.load(std::memory_order_acquire) != RunPhase::PREPARED) return assigned;
+    (void)acquire_lease_locked(successor->second, &assigned);
+    return assigned;
 }
 
 void Orchestrator::finish_run_if_ready(const std::shared_ptr<RunState> &run) {
@@ -158,25 +214,36 @@ void Orchestrator::clear_run_ready_queues(RunId run_id) {
 }
 
 void Orchestrator::retire_terminal_run(const std::shared_ptr<RunState> &run) {
+    bool leased_a_successor = false;
+    bool authorized_early_launch = false;
     {
         std::lock_guard<std::mutex> lk(runs_mu_);
         if (active_run_id_ == run->id) active_run_id_ = INVALID_RUN_ID;
         auto pos = std::find(run_fifo_.begin(), run_fifo_.end(), run->id);
         if (pos != run_fifo_.end()) run_fifo_.erase(pos);
-        // The lease goes back under runs_mu_, not after it. begin_run evaluates
-        // "is a slot free" as its wait predicate while holding this mutex, so a
-        // release that lands outside it can fall between that evaluation and the
-        // waiter registering on the condition variable — the notify finds nobody
-        // and the free slot is stranded for good. At depth one that is the only
-        // slot there is. The pool takes its own mutex under this one, which is
-        // the order try_acquire already uses from inside the predicate.
+        // The lease goes back under runs_mu_, not after it. The FIFO entry this
+        // erase frees is what begin_run's wait predicate tests, so a release or
+        // an erase that lands outside this mutex can fall between that
+        // evaluation and the waiter registering on the condition variable — the
+        // notify finds nobody and the capacity is stranded for good. The pool
+        // takes its own mutex under this one, the order acquisition uses too.
+        //
+        // Only a lease this run holds is returned; a run that never reached an
+        // active or preparable role has the invalid encoding.
         if (!run->lease_released) {
             run->lease_released = true;
-            pipeline_slots_.release(run->lease);
+            if (run->lease.generation != 0) pipeline_slots_.release(run->lease);
         }
+        // `activate_fifo_head` below returns early while a run is active, which
+        // is exactly the case where a successor handed its lease back.
+        leased_a_successor = refresh_leases_locked();
+        authorized_early_launch = refresh_early_launch_locked();
     }
     clear_run_ready_queues(run->id);
     runs_cv_.notify_all();
+    // A run that gained a lease here becomes preparable with no later event to
+    // announce it.
+    if ((leased_a_successor || authorized_early_launch) && ready_notify_cb_) ready_notify_cb_();
     activate_fifo_head();
 }
 
@@ -190,8 +257,16 @@ void Orchestrator::activate_fifo_head() {
         run = it->second;
         RunPhase phase = run->phase.load(std::memory_order_acquire);
         if (phase != RunPhase::BUILDING && phase != RunPhase::PREPARED) return;
+        // A head with no slot is not dispatchable, so promoting it to
+        // EXECUTING would strand the scheduler on a run it cannot reach.
+        if (!acquire_lease_locked(run)) {
+            run.reset();
+            return;
+        }
         active_run_id_ = run->id;
         run->phase.store(RunPhase::EXECUTING, std::memory_order_release);
+        refresh_leases_locked();
+        refresh_early_launch_locked();
     }
     // Direct device control waits on this, not only admission does: a prepared
     // successor blocked in copy_to must wake when it becomes the active run.
@@ -220,6 +295,17 @@ void Orchestrator::close_run_submission(RunId run_id) {
         }
     }
     run->completion_cv.notify_all();
+    {
+        // Before the wake, not after: the scheduler's wake is a generation
+        // counter, so one consumed while the successor is still lease-less is
+        // spent, and `activate_fifo_head` below issues none while a run is
+        // active.
+        std::lock_guard<std::mutex> runs_lk(runs_mu_);
+        refresh_leases_locked();
+        // This run's own closing can be the last thing the early-launch
+        // predicate was waiting on, when it is the active head.
+        refresh_early_launch_locked();
+    }
     if (ready_notify_cb_) ready_notify_cb_();
     activate_fifo_head();
     finish_run_if_ready(run);
@@ -352,6 +438,45 @@ RunId Orchestrator::preparable_run_id() const {
 
 bool Orchestrator::quiescent_locked() const { return runs_.empty() && building_run_id_ == INVALID_RUN_ID; }
 
+bool Orchestrator::all_dispatches_accepted(const std::shared_ptr<RunState> &run) {
+    if (run == nullptr) return false;
+    if (is_terminal(run->phase.load(std::memory_order_acquire))) return false;
+    std::lock_guard<std::mutex> lk(run->completion_mu);
+    // An error already recorded against this run says its remaining work will
+    // not produce the completion a successor would be ordered behind, so it
+    // does not open the gate even while its dispatches have all reported.
+    if (run->first_error) return false;
+    return run->submission_closed && run->pending_accepts.load(std::memory_order_acquire) == 0;
+}
+
+bool Orchestrator::refresh_early_launch_locked() {
+    if (launch_depth_ < 2) {
+        early_launch_run_id_ = INVALID_RUN_ID;
+        return false;
+    }
+    const RunId held = early_launch_run_id_;
+    early_launch_run_id_ = INVALID_RUN_ID;
+    if (!dispatchable_locked(active_run_id_) || run_fifo_.size() < 2 || run_fifo_.front() != active_run_id_) {
+        return false;
+    }
+    auto active = runs_.find(active_run_id_);
+    if (active == runs_.end() || !all_dispatches_accepted(active->second)) return false;
+    auto candidate = runs_.find(run_fifo_[1]);
+    if (candidate == runs_.end()) return false;
+    const std::shared_ptr<RunState> &successor = candidate->second;
+    if (successor->phase.load(std::memory_order_acquire) != RunPhase::PREPARED) return false;
+    if (!pipeline_slots_.owns(successor->lease)) return false;
+    early_launch_run_id_ = successor->id;
+    // Only a *new* authorization owes a wake. Re-deriving the same answer on
+    // every transition would otherwise wake the scheduler for nothing.
+    return held != early_launch_run_id_;
+}
+
+RunId Orchestrator::early_launch_run_id() const {
+    std::lock_guard<std::mutex> lk(runs_mu_);
+    return early_launch_run_id_;
+}
+
 void Orchestrator::compact_if_quiescent() {
     // `begin_run` takes only runs_mu_, and no slot is allocated without a
     // building run, so holding runs_mu_ across both the test and the reset is
@@ -395,6 +520,11 @@ void Orchestrator::release_run(RunId run_id) {
 
 void Orchestrator::register_run_slot(const std::shared_ptr<RunState> &run, TaskSlot slot) {
     std::lock_guard<std::mutex> lk(run->completion_mu);
+    // Registration and the identity stamp are one step, paired with the
+    // publication in `acquire_lease_locked`: whichever of the two runs second
+    // sees the other's effect.
+    TaskSlotState *state = allocator_->slot_state(slot);
+    if (state != nullptr) state->pipeline_lease = run->lease;
     run->task_slots.push_back(slot);
     run->active_tasks.fetch_add(1, std::memory_order_relaxed);
 }
@@ -513,6 +643,26 @@ void Orchestrator::decrement_run_accepts(RunId run_id) {
         );
     }
     if (notify) run->completion_cv.notify_all();
+    if (!notify) return;
+    // The count reaching zero is what completes "no further dispatch of this
+    // run can be issued", so it is evaluated here — outside completion_mu,
+    // because the predicate takes it under `runs_mu_`.
+    bool authorized_early_launch = false;
+    {
+        std::lock_guard<std::mutex> runs_lk(runs_mu_);
+        authorized_early_launch = refresh_early_launch_locked();
+    }
+    if (authorized_early_launch && ready_notify_cb_) ready_notify_cb_();
+}
+
+void Orchestrator::notify_run_staged(RunId run_id) {
+    if (run_id == INVALID_RUN_ID) return;
+    bool authorized_early_launch = false;
+    {
+        std::lock_guard<std::mutex> runs_lk(runs_mu_);
+        authorized_early_launch = refresh_early_launch_locked();
+    }
+    if (authorized_early_launch && ready_notify_cb_) ready_notify_cb_();
 }
 
 void Orchestrator::record_run_error(const std::shared_ptr<RunState> &run, std::exception_ptr error) {
@@ -625,7 +775,6 @@ uint64_t Orchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype,
     TaskSlotState &s = slot_state(ar.slot);
     s.reset();
     s.run_id = run->id;
-    s.pipeline_lease = run->lease;
     // From the moment the run owns this slot until COMPLETED publication, a
     // failed alloc must remain claimable by run cancellation. FREE would make
     // cancellation skip the registered slot and strand active_tasks forever.
@@ -779,7 +928,6 @@ SubmitResult Orchestrator::submit_impl(
     TaskSlotState &s = slot_state(slot);
     s.reset();
     s.run_id = run->id;
-    s.pipeline_lease = run->lease;
     // BUILDING until the publication at the end of this function. Step 2
     // registers this slot's outputs in the tensormap and Step 5 appends it to
     // its producers' fanout lists, so it is observable well before its

@@ -78,7 +78,9 @@
 // The task table is a flat array of slots, indexed directly by local task id:
 // ids start at 0, are never recycled, and alloc() caps them at the table's size,
 // so there is no wrap and no slot mask. The size need not be a power of two —
-// nothing masks with it.
+// no slot lookup masks with it. It is bounded above by
+// TaskId::GLOBAL_TASK_MAX_NUM, which is the width of the parent field a
+// sub-task's id carries its modular task's local id in.
 //
 // This is the default; `CallConfig.runtime_env.ring_task_window` overrides it per
 // task. The host mirror is allocated at whatever size is in effect and committed
@@ -100,40 +102,43 @@
 #define CHIP_TENSORMAP_POOL_SIZE (65536)  // TensorMap entry pool
 #define CHIP_TENSORMAP_NUM_BUCKETS 4096   // Power of 2 for fast hash (4096×8B=32KB fits L1)
 
-// Three address classes coexist during orchestration, in windows the two constants
-// below keep disjoint: real device addresses stay below HEAP_VIRTUAL_BASE, since
-// Ascend VA is 48-bit and the asserts named further down hold caller-owned ones
-// there; the graph heap spans HEAP_VIRTUAL_BASE up to GRAPH_RECORD_VIRTUAL_BASE;
-// Graph recording takes everything above.
+// Two address classes coexist during orchestration: real device addresses, which
+// stay below HEAP_VIRTUAL_BASE since Ascend VA is 48-bit and the asserts in the
+// host's bind path hold caller-owned ones there, and the graph heap, which spans
+// MAX_HEAP_CAPACITY bytes from HEAP_VIRTUAL_BASE.
+//
+// "Graph heap" here is the output heap of THIS orchestration's task DAG. It
+// exists on every bind, whether or not the bind holds a Graph task, and it is
+// addressed virtually only because the device region is committed after
+// orchestration, from the byte count orchestration turned out to need. It is a
+// different mechanism from the recording address space a Graph (the
+// rt_submit_graph feature) builds its body in, which is a per-recording space
+// starting at GRAPH_RECORD_BASE and never leaves the host.
 //
 // Base of the window the graph heap is allocated out of during orchestration.
-// The heap's device region is committed only once orchestration has run and its
-// exact size is known, so the addresses handed out while the graph is being
-// built cannot be the device ones; compact_live_image rewrites them to the real
-// base before the image travels. Nothing dereferences an address in this window.
+// compact_live_image rewrites an address in this window to the real device base
+// before the image travels. Nothing dereferences one.
 inline constexpr uint64_t HEAP_VIRTUAL_BASE = 1ULL << 62;
 
-// Base of the address range Graph recording hands to an in-graph task's packed
-// outputs. Recorded addresses are never dereferenced: they exist so
-// graph_classify_tensor can tell an internal producer's output from a boundary
-// tensor by address-range containment alone, and the Definition stores them as
-// offsets. That classification is only sound while the range is disjoint from
-// every graph-heap address, which TaskAllocator::init() asserts, and from
-// every real device address, which the two asserts in the host's bind path
-// (the acquired heap base, and each caller tensor as it enters device_args)
-// keep below HEAP_VIRTUAL_BASE.
-inline constexpr uint64_t GRAPH_RECORD_VIRTUAL_BASE = 1ULL << 63;
+// Upper bound on a graph heap, simulated or real. A recording's address space
+// mirrors the heap a replay will need, so the same bound governs both: a graph
+// too large to commit fails at the recording cursor instead of wrapping. Stays
+// well below HEAP_VIRTUAL_BASE so the graph-heap window it also sizes cannot
+// reach the recording space.
+inline constexpr uint64_t MAX_HEAP_CAPACITY = 1ULL << 60;
 
-// Whether an address was handed out by Graph recording rather than naming a
-// graph-heap block or a real device buffer. Exact because the three windows above
-// are disjoint: a recorded in-graph task's output is the only thing at or above
-// the base.
-inline constexpr bool is_graph_record_address(uint64_t addr) { return addr >= GRAPH_RECORD_VIRTUAL_BASE; }
-
-// Span of the graph-heap window: everything between the two virtual bases. This
-// is the bound orchestration allocates against, so a graph is limited by what
-// the device can commit afterwards rather than by a configured heap size.
-inline constexpr uint64_t HEAP_VIRTUAL_CAPACITY = GRAPH_RECORD_VIRTUAL_BASE - HEAP_VIRTUAL_BASE;
+// Base of a recording's own address space. A recording hands out positions in
+// this space rather than any address the caller owns: the formal parameters take
+// one each, and a sub-task's packed outputs follow them. It is non-zero so
+// that no recorded object sits at address 0, which a task slot uses as its "has
+// no packed output" sentinel, and PACKED_OUTPUT_ALIGN specifically because that
+// is the finest granularity any recorded address takes, so a recorded address
+// keeps the alignment the real one had.
+//
+// Nothing in this space reaches a Definition: a parameter's recorded address is
+// dropped when the image is packed, and a body tensor's is stored relative to the
+// output region, so an image is readable knowing only the heap it binds to.
+inline constexpr uint64_t GRAPH_RECORD_BASE = PACKED_OUTPUT_ALIGN;
 
 // Scope management
 #define CHIP_MAX_SCOPE_DEPTH 64  // Maximum nesting depth
@@ -355,7 +360,7 @@ struct TaskPayload {
     // fanin holds flat position-independent producer local task ids. A producer is
     // named by its local id alone, so no per-edge indirection is stored. Scanned by
     // classify_fanin_state against the shared-memory task_states. Hard-capped at
-    // CHIP_MAX_FANIN (no dep-pool spill). Unbound on an in-graph task, whose
+    // CHIP_MAX_FANIN (no dep-pool spill). Unbound on a sub-task, whose
     // dependencies live in the Definition's fanin CSR instead.
     simpler::hbg::SelfRelativePtr<simpler::hbg::Tensor> tensors;
     simpler::hbg::SelfRelativePtr<uint64_t> scalars;
@@ -426,7 +431,7 @@ struct TaskPayload {
      * Point this payload's three argument regions at pool-resident storage. Must run
      * before prefetch() and init(), which dereference them.
      *
-     * An in-graph task passes nullptr for fanin: its dependencies come from the
+     * A sub-task passes nullptr for fanin: its dependencies come from the
      * Definition's CSR, so the region does not exist and fanin_count stays 0.
      */
     void bind_regions(simpler::hbg::Tensor *tensor_region, uint64_t *scalar_region, int32_t *fanin_region) {
@@ -491,11 +496,10 @@ struct TaskPayload {
                 result.materialize_output(dst[i]);
             }
         }
-        // Round up to cache line boundary. Every scalar region is a whole number of
-        // cache lines (ARG_POOL_ALIGN), so the rounded copy stays inside this
-        // task's own region. Eliminates branches; extra bytes within the same CL have
-        // zero additional cost.
-        memcpy(scalar_data(), args.scalars(), CHIP_ALIGN_UP(args.scalar_count() * sizeof(uint64_t), 64));
+        // A slot is a value, so this is one memcpy of scalar_count entries. The trailing
+        // padding of this task's cache-line-aligned region keeps whatever it held --
+        // nothing reads past the count.
+        args.pack_scalars(scalar_data());
 
         // The task table's payload storage is raw shared memory that no constructor
         // runs over, so an unset predicate reads back as whatever the slot last held —
@@ -570,7 +574,7 @@ static_assert(sizeof(simpler::hbg::Tensor) == 128, "simpler::hbg::Tensor must be
 /**
  * Per-task slot scheduling state. Only the scheduler mutates it, but it lives
  * wherever its ChipTaskStorage does: the SM image's storage segment for a
- * GLOBAL task, the GraphExecution image for an IN_GRAPH one.
+ * GLOBAL task, the GraphExecution image for a SUB_TASK one.
  *
  * 64 bytes = one cache line. Under the polling completion model a task's
  * readiness is derived from its producers' completion state; producer completion
@@ -578,7 +582,7 @@ static_assert(sizeof(simpler::hbg::Tensor) == 128, "simpler::hbg::Tensor must be
  * no fanout adjacency, refcount, or per-task lock here.
  *
  * Completion state is not here. It lives in a byte-per-task array — the shared
- * memory task header's for a GLOBAL task, the GraphExecution's for an IN_GRAPH
+ * memory task header's for a GLOBAL task, the GraphExecution's for a SUB_TASK
  * one — because a fanin scan reads many producers' states at once, which a
  * cache line of that array answers and would take one line per producer inside
  * this struct's stride.
@@ -612,21 +616,21 @@ struct alignas(64) ChipTaskSlotState {
     //   != nullptr, task_kind == GRAPH the outer Graph task, pointing at the
     //                                  shared GraphDefinition until localize
     //                                  swaps in its GraphExecution
-    //   != nullptr, task_kind != GRAPH an in-graph task, pointing at the
+    //   != nullptr, task_kind != GRAPH a sub-task, pointing at the
     //                                  GraphExecution it belongs to
     //
     // So every reader must test task_kind before casting, and complete_task
     // routes on exactly that pair: a null context or a GRAPH kind takes the
     // ordinary global fanout, anything else is counted against its Graph. A
     // localize that fails puts this back to nullptr (scheduler_cold_path.cpp),
-    // so the outer task cannot be mistaken for an in-graph one.
+    // so the outer task cannot be mistaken for a sub-task.
     void *graph_context{nullptr};
 
     // Graph-only scheduling metadata, paired with graph_context above. Readiness
     // uses the shared intrusive wake-list fields; this local id identifies the task
-    // in the saved fanin CSR, and is the same value TaskId::make_in_graph packs into
+    // in the saved fanin CSR, and is the same value TaskId::make_sub_task packs into
     // the low field. Ordinary tasks leave both Graph fields -1/null.
-    int32_t in_graph_local_id{-1};
+    int32_t sub_task_local_id{-1};
 
     std::atomic<int16_t> completed_subtasks{0};  // Each core completion increments by 1
     int16_t total_required_subtasks{0};          // = logical_block_num * popcount(active_mask)
@@ -645,10 +649,24 @@ struct alignas(64) ChipTaskSlotState {
     // suffices.
     //
     // The row it indexes is the payload's inline fanin region for a GLOBAL task
-    // and the Definition's fanin CSR row for an IN_GRAPH one. The CSR row is
-    // bounded by the in-graph task cap rather than by CHIP_MAX_FANIN, which is
-    // what makes this wider than its early-dispatch twin below.
+    // and the Definition's fanin CSR row for a SUB_TASK one. The CSR row is
+    // bounded by the sub-task cap rather than by CHIP_MAX_FANIN, which is
+    // why neither cursor is a byte.
     uint16_t wake_scan_cursor{0xFFFF};
+
+    // Publish-list scan cursor of an ED candidate: the fanin-row index this
+    // task is hung on in the publish list. The row is sorted and the state byte
+    // is monotone, so indices above the cursor are known-published forever
+    // and every rescan resumes here — each row entry is loaded once per life.
+    //
+    // The row it indexes is the payload's inline fanin region for a GLOBAL task
+    // and the Definition's fanin CSR row for a SUB_TASK one, so it is bounded
+    // by the wider of the two: append_fanin_or_fail hard-caps an inline row at
+    // CHIP_MAX_FANIN, while a sub-task's row has no cap of its own and is
+    // bounded only by the body's task count. That is why this is not a byte —
+    // a truncated cursor would report a row scanned that was not, and stage a
+    // candidate whose producers have not all published.
+    uint16_t ed_publish_scan_cursor{0};
 
     // --- Set per-submit (depend on task inputs) ---
     ActiveMask active_mask;  // Bitmask of active subtask slots (set once)
@@ -665,29 +683,21 @@ struct alignas(64) ChipTaskSlotState {
     std::atomic<bool> any_subtask_deferred{false};
     TaskKind task_kind{TaskKind::KERNEL};
 
-    // Early-dispatch verdicts, decided by the host orchestrator once this task's
-    // fanin region is final (this slot is part of the host-built SM image).
-    // Plain-write on the single-threaded submit path, before the slot is
-    // scheduler-visible; the device only ever reads them.
+    // Early-dispatch verdicts. A GLOBAL task's are decided by the host
+    // orchestrator once its fanin region is final, and a sub-task's are
+    // replayed from its Definition at materialization, which also decides
+    // whether a root is stageable. Both writers are single-owner and both
+    // precede the slot becoming schedulable, so these are plain writes; every
+    // reader past that point only loads them.
     //   ED_FLAG_CANDIDATE  every producer carries allow_early_resolve, no
     //                      dispatch predicate, dispatchable shape, fanin >= 1
     //   ED_FLAG_TRACKED    at least one candidate names this task as a producer,
     //                      so its publication state must be recorded
     uint8_t ed_flags{0};
 
-    // Publish-list scan cursor of an ED candidate: the fanin-row index this
-    // task is hung on in the publish list. The row is sorted and the state byte
-    // is monotone, so indices above the cursor are known-published forever
-    // and every rescan resumes here — each row entry is loaded once per life.
-    // Only a GLOBAL task holds a publish list, so this indexes the payload's
-    // inline fanin region alone, which append_fanin_or_fail hard-caps at
-    // CHIP_MAX_FANIN with a named fatal.
-    uint8_t ed_publish_scan_cursor{0};
-    static_assert(CHIP_MAX_FANIN <= 0xFF, "ed_publish_scan_cursor is a uint8_t fanin-row index");
-
     // Keeps the record at one cache line. Members run widest-first up to the
     // byte block above, so their sizes sum to exactly the bytes this leaves.
-    uint8_t reserved[4];
+    uint8_t reserved[3];
 
     int32_t claim_block_range(int32_t block_limit, int32_t max_count, int32_t &start) {
         int16_t current = next_block_idx.load(std::memory_order_relaxed);
@@ -713,7 +723,7 @@ struct alignas(64) ChipTaskSlotState {
     /**
      * Reset dynamic scheduling fields to their pristine values. Called once per
      * slot as the orchestrator claims it in prepare_task, and again as an
-     * in-graph task's storage is materialized — whole-graph-resident hbg has no
+     * sub-task's storage is materialized — whole-graph-resident hbg has no
      * execution-time slot recycle. The task's completion state is not here; its
      * owning array is cleared alongside this call.
      * wake_list_head starts nullptr (open for registration), NOT SENTINEL.
@@ -724,7 +734,7 @@ struct alignas(64) ChipTaskSlotState {
         any_subtask_deferred.store(false, std::memory_order_relaxed);
         completed_subtasks.store(0, std::memory_order_relaxed);
         next_block_idx.store(0, std::memory_order_relaxed);
-        in_graph_local_id = -1;
+        sub_task_local_id = -1;
         graph_context = nullptr;
         task_kind = TaskKind::KERNEL;
         // ED_FLAG_TRACKED is only ever set by a consumer submitted AFTER this
@@ -756,7 +766,7 @@ static_assert(sizeof(ChipTaskSlotState) == 64);
 static_assert(
     offsetof(ChipTaskSlotState, ed_publish_list_head) == 16, "the ED publish pair sits right after its wake-list twin"
 );
-static_assert(offsetof(ChipTaskSlotState, reserved) == 60, "ChipTaskSlotState grew interior padding");
+static_assert(offsetof(ChipTaskSlotState, reserved) == 61, "ChipTaskSlotState grew interior padding");
 
 // =============================================================================
 // Per-Task Storage
@@ -769,7 +779,7 @@ static_assert(offsetof(ChipTaskSlotState, reserved) == 60, "ChipTaskSlotState gr
  * Every hbg task's records live in one of these — that is the invariant the
  * accessors below rest on, and none of the three types may be instantiated on its
  * own. A GLOBAL task's storage sits in the shared-memory storage segment, indexed by
- * its local task id (SharedMemoryTaskHeader::storage_at); an IN_GRAPH task's sits in
+ * its local task id (SharedMemoryTaskHeader::storage_at); a sub-task's sits in
  * its Graph's own heap tail, indexed by its position in the body
  * (GraphExecution::task_at). The two therefore share one addressing rule, which is
  * what lets the scheduler reach a task's descriptor and payload from its slot state

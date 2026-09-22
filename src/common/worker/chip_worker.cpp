@@ -13,6 +13,7 @@
 
 #include "chip_run_lane.h"
 #include "common/host_log_binding.h"
+#include "device_fault_monitor_host.h"
 #include "host_log.h"
 #include "pipeline_contract.h"
 
@@ -20,6 +21,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -73,6 +75,26 @@ void bind_host_log_state(void *handle, const char *module_name) {
     if (simpler::log::bind_loaded_host_log_state(handle, HostLogger::get_instance().state(), &error) != 0) {
         throw std::runtime_error(
             std::string(module_name) + " failed to bind host-log state: " + (error != nullptr ? error : "unknown error")
+        );
+    }
+}
+
+/**
+ * Hand the loaded module the process's device-fault monitor.
+ *
+ * The monitor and the trampoline the driver retains live in this module, which
+ * the interpreter never unloads; a host runtime is opened `RTLD_LOCAL` and
+ * `dlclose`d, so it can only hold a pointer. Binding is mandatory rather than
+ * best-effort for the same reason the host-log binding is: every module built
+ * from this source tree exports the setter, so a missing one means a stale
+ * build, and a silently unbound runtime would report no device fault at all.
+ */
+void bind_device_fault_monitor(void *handle, const char *module_name) {
+    const char *error = nullptr;
+    if (bind_loaded_device_fault_monitor(handle, &error) != 0) {
+        throw std::runtime_error(
+            std::string(module_name) +
+            " failed to bind the device-fault monitor: " + (error != nullptr ? error : "unknown error")
         );
     }
 }
@@ -160,7 +182,15 @@ ChipWorker::RuntimeStorage &ChipWorker::RuntimeStorage::operator=(RuntimeStorage
     return *this;
 }
 
-ChipWorker::~ChipWorker() { finalize(); }
+ChipWorker::~ChipWorker() {
+    try {
+        finalize();
+    } catch (const std::exception &error) {
+        std::fprintf(stderr, "ChipWorker::~ChipWorker: teardown failed: %s\n", error.what());
+    } catch (...) {
+        std::fprintf(stderr, "ChipWorker::~ChipWorker: teardown failed with an unknown error\n");
+    }
+}
 
 void ChipWorker::init(
     const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
@@ -199,8 +229,13 @@ void ChipWorker::init(
     }
     DlHandleGuard host_guard(handle);
     bind_host_log_state(handle, "host runtime");
+    bind_device_fault_monitor(handle, "host runtime");
 
     GetPipelineContractFn get_pipeline_contract_fn = nullptr;
+    KernelSupportedFn kernel_supported_fn = nullptr;
+    KernelInitFn kernel_init_fn = nullptr;
+    KernelPrepareCallableFn kernel_prepare_callable_fn = nullptr;
+    KernelLaunchFn kernel_launch_fn = nullptr;
     try {
         create_device_context_fn_ = load_symbol<CreateDeviceContextFn>(handle, "create_device_context");
         destroy_device_context_fn_ = load_symbol<DestroyDeviceContextFn>(handle, "destroy_device_context");
@@ -217,11 +252,22 @@ void ChipWorker::init(
         run_fn_ = load_symbol<SimplerRunFn>(handle, "simpler_run");
         prepare_run_fn_ = load_symbol<SimplerPrepareRunFn>(handle, "simpler_prepare_run");
         launch_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_launch_run");
+        launch_run_joined_fn_ = load_symbol<SimplerJoinedLaunchFn>(handle, "simpler_launch_run_joined");
         poll_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_poll_run");
         wait_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_wait_run");
         finalize_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_finalize_run");
+        // Absent on every simulated and stand-in module by construction, so a
+        // null here is a fact about the backend rather than a stale build. The
+        // caller reports it.
+        probe_run_retention_fn_ =
+            reinterpret_cast<SimplerProbeRunRetentionFn>(dlsym(handle, "simpler_probe_run_retention"));
+        // Optional for the same reason: a module that records no teardown does
+        // not export this, and a null is that fact rather than a stale build.
+        get_teardown_report_fn_ = reinterpret_cast<GetTeardownReportFn>(dlsym(handle, "get_teardown_report"));
         supports_concurrent_native_prepare_fn_ =
             load_symbol<SupportsConcurrentNativePrepareFn>(handle, "supports_concurrent_native_prepare_ctx");
+        supports_joined_native_launch_fn_ =
+            load_symbol<SupportsConcurrentNativePrepareFn>(handle, "supports_joined_native_launch_ctx");
         get_arena_bank_gm_heap_base_fn_ =
             load_symbol<GetArenaBankGmHeapBaseFn>(handle, "get_arena_bank_gm_heap_base_ctx");
         get_retained_temp_addr_fn_ = load_symbol<GetRetainedTempAddrFn>(handle, "get_retained_temp_addr_ctx");
@@ -232,11 +278,20 @@ void ChipWorker::init(
         get_run_stream_set_create_count_fn_ =
             load_symbol<GetAicpuDlopenCountFn>(handle, "get_run_stream_set_create_count");
         finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "finalize_device");
-        // ACL lifecycle + comm_* are part of the uniform host_runtime.so ABI.
-        // Every platform runtime exports all of them — runtimes that do not
-        // have a real backend (today: a5) ship not-supported stubs rather
-        // than omitting the symbols.  This keeps ChipWorker.init platform-
-        // agnostic: no per-symbol probing, no half-loaded extension groups.
+        // ACL lifecycle + comm_* + kernel mode are part of the uniform
+        // host_runtime.so ABI. Every platform runtime exports all of them —
+        // a runtime without a real backend (today: a5 for comm) ships
+        // not-supported stubs rather than omitting the symbols, so these groups
+        // resolve unconditionally and never half-load.
+        //
+        // simpler_kernel_mode_supported does not answer which runtime has a
+        // kernel backend: it answers whether kernel-mode launches are
+        // available, and stays zero while simpler_kernel_mode_launch is a
+        // rejecting stub — so it is zero on a runtime that can already
+        // establish a kernel context. The runtime-capability question is
+        // answered by simpler_kernel_mode_init, which refuses with
+        // PTO_RUNTIME_ERR_UNSUPPORTED and establishes nothing when its runtime
+        // cannot size kernel resources. Neither gates symbol resolution.
         ensure_acl_ready_fn_ = load_symbol<EnsureAclReadyFn>(handle, "ensure_acl_ready_ctx");
         create_comm_stream_fn_ = load_symbol<CreateCommStreamFn>(handle, "create_comm_stream_ctx");
         destroy_comm_stream_fn_ = load_symbol<DestroyCommStreamFn>(handle, "destroy_comm_stream_ctx");
@@ -253,12 +308,18 @@ void ChipWorker::init(
         comm_global_domain_release_fn_ = load_symbol<CommGlobalDomainReleaseFn>(handle, "comm_global_domain_release");
         comm_barrier_fn_ = load_symbol<CommBarrierFn>(handle, "comm_barrier");
         comm_destroy_fn_ = load_symbol<CommDestroyFn>(handle, "comm_destroy");
+        kernel_supported_fn = load_symbol<KernelSupportedFn>(handle, "simpler_kernel_mode_supported");
+        kernel_init_fn = load_symbol<KernelInitFn>(handle, "simpler_kernel_mode_init");
+        kernel_prepare_callable_fn =
+            load_symbol<KernelPrepareCallableFn>(handle, "simpler_kernel_mode_prepare_callable");
+        kernel_launch_fn = load_symbol<KernelLaunchFn>(handle, "simpler_kernel_mode_launch");
     } catch (...) {
         throw;
     }
 
     const PipelineContract *contract = get_pipeline_contract_fn();
-    if (!is_valid_pipeline_contract(contract) || !has_serviceable_arena_topology(*contract)) {
+    if (!is_valid_pipeline_contract(contract) || !has_serviceable_arena_topology(*contract) ||
+        !has_serviceable_stream_topology(*contract)) {
         throw std::runtime_error("host runtime returned a PipelineContract this build cannot accept");
     }
     const PipelineContract resolved_contract = *contract;
@@ -355,10 +416,14 @@ void ChipWorker::init(
         run_fn_ = nullptr;
         prepare_run_fn_ = nullptr;
         launch_run_fn_ = nullptr;
+        launch_run_joined_fn_ = nullptr;
         poll_run_fn_ = nullptr;
         wait_run_fn_ = nullptr;
         finalize_run_fn_ = nullptr;
+        probe_run_retention_fn_ = nullptr;
+        get_teardown_report_fn_ = nullptr;
         supports_concurrent_native_prepare_fn_ = nullptr;
+        supports_joined_native_launch_fn_ = nullptr;
         get_arena_bank_gm_heap_base_fn_ = nullptr;
         get_retained_temp_addr_fn_ = nullptr;
         unregister_callable_fn_ = nullptr;
@@ -380,6 +445,10 @@ void ChipWorker::init(
         comm_global_domain_release_fn_ = nullptr;
         comm_barrier_fn_ = nullptr;
         comm_destroy_fn_ = nullptr;
+        kernel_supported_fn_ = nullptr;
+        kernel_init_fn_ = nullptr;
+        kernel_prepare_callable_fn_ = nullptr;
+        kernel_launch_fn_ = nullptr;
         runtime_bufs_.clear();
         throw;
     }
@@ -413,10 +482,14 @@ void ChipWorker::init(
         run_fn_ = nullptr;
         prepare_run_fn_ = nullptr;
         launch_run_fn_ = nullptr;
+        launch_run_joined_fn_ = nullptr;
         poll_run_fn_ = nullptr;
         wait_run_fn_ = nullptr;
         finalize_run_fn_ = nullptr;
+        probe_run_retention_fn_ = nullptr;
+        get_teardown_report_fn_ = nullptr;
         supports_concurrent_native_prepare_fn_ = nullptr;
+        supports_joined_native_launch_fn_ = nullptr;
         get_arena_bank_gm_heap_base_fn_ = nullptr;
         get_retained_temp_addr_fn_ = nullptr;
         unregister_callable_fn_ = nullptr;
@@ -439,11 +512,19 @@ void ChipWorker::init(
         comm_global_domain_release_fn_ = nullptr;
         comm_barrier_fn_ = nullptr;
         comm_destroy_fn_ = nullptr;
+        kernel_supported_fn_ = nullptr;
+        kernel_init_fn_ = nullptr;
+        kernel_prepare_callable_fn_ = nullptr;
+        kernel_launch_fn_ = nullptr;
         runtime_bufs_.clear();
         throw std::runtime_error("simpler_init failed with code " + std::to_string(init_rc));
     }
 
     lib_handle_ = host_guard.release();
+    kernel_supported_fn_ = kernel_supported_fn;
+    kernel_init_fn_ = kernel_init_fn;
+    kernel_prepare_callable_fn_ = kernel_prepare_callable_fn;
+    kernel_launch_fn_ = kernel_launch_fn;
     device_id_ = device_id;
     // Published only once the runtime is up: the rollback paths above leave the
     // default K=1 contract in place, so a failed init never reports the counts
@@ -452,6 +533,29 @@ void ChipWorker::init(
     initialized_ = true;
 
     run_lane_ = std::make_unique<ChipRunLane>(*this);
+}
+
+void ChipWorker::capture_teardown_report_noexcept() noexcept {
+    if (teardown_report_captured_ || get_teardown_report_fn_ == nullptr || device_ctx_ == nullptr) return;
+    SimplerTeardownReport report{};
+    int rc = PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        rc = get_teardown_report_fn_(device_ctx_, &report, sizeof(report));
+    } catch (...) {
+        // Observation must never displace the teardown outcome the caller is
+        // about to be told about, so a capture failure stays silent and leaves
+        // the record absent.
+        return;
+    }
+    if (rc != 0 || report.schema != TEARDOWN_REPORT_SCHEMA) return;
+    teardown_report_ = report;
+    teardown_report_captured_ = true;
+}
+
+bool ChipWorker::teardown_report(SimplerTeardownReport *out) const {
+    if (out == nullptr || !teardown_report_captured_) return false;
+    *out = teardown_report_;
+    return true;
 }
 
 void ChipWorker::finalize() {
@@ -478,8 +582,25 @@ void ChipWorker::finalize() {
     // communicator handles and streams before tearing down the device context.
     clear_comm_sessions();
 
+    int device_finalize_rc = 0;
     if (device_ctx_ != nullptr && finalize_device_fn_ != nullptr && initialized_) {
-        finalize_device_fn_(device_ctx_);
+        device_finalize_rc = finalize_device_fn_(device_ctx_);
+        // Immediately after the teardown call and before both the throw below
+        // and the context destruction / dlclose a success runs into: that is
+        // the only window in which the recording owner is still reachable.
+        // `finalize_device` catches everything and returns an rc, so a
+        // sequential call here covers the failing teardown too.
+        capture_teardown_report_noexcept();
+    }
+    // A context whose teardown did not complete still owns device resources,
+    // and unloading the library that owns their release routines — or
+    // destroying the context that holds them — is unrecoverable. Both the
+    // context and the handle stay, so an explicit retry can finish the job.
+    if (device_finalize_rc != 0) {
+        throw std::runtime_error(
+            "ChipWorker::finalize: device teardown failed (" + std::to_string(device_finalize_rc) +
+            "); keeping the context and host runtime loaded"
+        );
     }
     if (device_ctx_ != nullptr && destroy_device_context_fn_ != nullptr) {
         destroy_device_context_fn_(device_ctx_);
@@ -503,10 +624,14 @@ void ChipWorker::finalize() {
     run_fn_ = nullptr;
     prepare_run_fn_ = nullptr;
     launch_run_fn_ = nullptr;
+    launch_run_joined_fn_ = nullptr;
     poll_run_fn_ = nullptr;
     wait_run_fn_ = nullptr;
     finalize_run_fn_ = nullptr;
+    probe_run_retention_fn_ = nullptr;
+    get_teardown_report_fn_ = nullptr;
     supports_concurrent_native_prepare_fn_ = nullptr;
+    supports_joined_native_launch_fn_ = nullptr;
     get_arena_bank_gm_heap_base_fn_ = nullptr;
     get_retained_temp_addr_fn_ = nullptr;
     unregister_callable_fn_ = nullptr;
@@ -529,6 +654,10 @@ void ChipWorker::finalize() {
     comm_global_domain_release_fn_ = nullptr;
     comm_barrier_fn_ = nullptr;
     comm_destroy_fn_ = nullptr;
+    kernel_supported_fn_ = nullptr;
+    kernel_init_fn_ = nullptr;
+    kernel_prepare_callable_fn_ = nullptr;
+    kernel_launch_fn_ = nullptr;
     runtime_bufs_.clear();
     pipeline_generations_.reset();
     pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 1, {}};
@@ -640,6 +769,32 @@ bool ChipWorker::supports_concurrent_native_prepare() const {
            supports_concurrent_native_prepare_fn_(device_ctx_) > 0;
 }
 
+bool ChipWorker::supports_joined_native_launch() const {
+    return initialized_ && launch_depth_ > 1 && pipeline_contract_.pipeline_depth > 1 &&
+           supports_joined_native_launch_fn_(device_ctx_) > 0;
+}
+
+bool ChipWorker::holds_live_comm_resources() const {
+    // Unsynchronized: comm sessions, global domains and the exported-region
+    // declaration are all written from the same thread that drives the run lane
+    // — a child's control commands and its task frames arrive on one loop.
+    return !comm_sessions_.empty() || !global_domain_ids_.empty() || exported_device_regions_live_;
+}
+
+void ChipWorker::configure_launch_depth(unsigned depth) {
+    if (initialized_) {
+        throw std::runtime_error("ChipWorker::configure_launch_depth after init");
+    }
+    if (depth == 0) {
+        throw std::runtime_error("ChipWorker::configure_launch_depth requires a depth of at least one");
+    }
+    // Not clamped here: the contract's pipeline depth is unknown until init
+    // binds the runtime, and `supports_joined_native_launch` is where the two
+    // meet. A launched run holds its pipeline slot for its whole lifetime, so
+    // the slot count is the real ceiling.
+    launch_depth_ = depth > PTO_PIPELINE_MAX_DEPTH ? PTO_PIPELINE_MAX_DEPTH : depth;
+}
+
 ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
     int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, uint32_t slot_id,
     uint64_t generation, uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state,
@@ -657,7 +812,7 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
     }
     const uint64_t run_epoch = next_native_run_epoch();
     const ChipWorkerNativeRun run_identity{slot_id, generation, run_epoch, run_id, dispatch_id};
-    const bool allow_prepared_successor = supports_concurrent_native_prepare() && !config.diagnostics_any();
+    const bool allow_prepared_successor = supports_concurrent_native_prepare();
     {
         std::lock_guard<std::mutex> lk(native_run_mu_);
         NativeRunSlotState &state = native_run_states_[slot_id];
@@ -699,10 +854,10 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
 
     int rc = -1;
     try {
-        const NativeRunDescriptor descriptor{slot_id,        arena_bank_for_slot(slot_id),
-                                             run_id,         generation,
-                                             dispatch_id,    run_epoch,
-                                             accepted_state, accepted_value};
+        const NativeRunDescriptor descriptor{
+            slot_id,        arena_bank_for_slot(slot_id), run_id, generation, dispatch_id, run_epoch, accepted_state,
+            accepted_value, launch_depth_ > 1 ? 1u : 0u
+        };
         rc = prepare_run_fn_(device_ctx_, runtime_bufs_[slot_id].data(), callable_id, args, &config, &descriptor);
     } catch (...) {
         std::lock_guard<std::mutex> lk(native_run_mu_);
@@ -767,6 +922,10 @@ ChipRun ChipWorker::submit_chip_run(
     return run_lane_->submit(callable_id, args, config, accepted_state, accepted_value);
 }
 
+void ChipWorker::stop_chip_run_lane_admission() noexcept {
+    if (run_lane_ != nullptr) run_lane_->stop_admission();
+}
+
 void ChipWorker::close_chip_run_lane() {
     if (run_lane_ != nullptr) run_lane_->close();
 }
@@ -797,6 +956,49 @@ void ChipWorker::launch_native_run(const ChipWorkerNativeRun &run) {
     std::lock_guard<std::mutex> lk(native_run_mu_);
     NativeRunSlotState &state = native_run_states_[run.slot_id];
     state.phase = NativeRunPhase::LAUNCHED;
+}
+
+bool ChipWorker::launch_native_run_joined(const ChipWorkerNativeRun &run, const ChipWorkerNativeRun &predecessor) {
+    if (!supports_joined_native_launch()) return false;
+    {
+        std::lock_guard<std::mutex> lk(native_run_mu_);
+        if (run.slot_id >= runtime_bufs_.size() || predecessor.slot_id >= runtime_bufs_.size()) {
+            throw std::runtime_error("native-run token slot is outside the runtime PipelineContract");
+        }
+        if (run.slot_id == predecessor.slot_id) {
+            throw std::runtime_error("a native run cannot be ordered behind its own pipeline slot");
+        }
+        const NativeRunSlotState &state = native_run_states_[run.slot_id];
+        if (state.run_epoch != run.run_epoch || state.phase != NativeRunPhase::PREPARED) {
+            throw std::runtime_error("native-run token is stale or used in the wrong phase");
+        }
+        // The predecessor has to be executing for there to be anything to order
+        // behind. REAPED is excluded on purpose: its device work is already
+        // over, so the ordinary launch is both correct and cheaper.
+        const NativeRunSlotState &ahead = native_run_states_[predecessor.slot_id];
+        if (ahead.run_epoch != predecessor.run_epoch || ahead.phase != NativeRunPhase::LAUNCHED) return false;
+    }
+
+    int rc = launch_run_joined_fn_(
+        device_ctx_, runtime_bufs_[run.slot_id].data(), runtime_bufs_[predecessor.slot_id].data()
+    );
+    // The backend refuses this way when it cannot order the two right now, and
+    // it changes nothing when it does: the run is still prepared, and the caller
+    // launches it ordinarily once it reaches the front.
+    if (rc == PTO_RUNTIME_ERR_UNSUPPORTED) return false;
+    if (rc != 0) {
+        int poll_rc = poll_run_fn_(device_ctx_, runtime_bufs_[run.slot_id].data());
+        std::lock_guard<std::mutex> lk(native_run_mu_);
+        NativeRunSlotState &state = native_run_states_[run.slot_id];
+        state.phase = poll_rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE ? NativeRunPhase::REAPED : NativeRunPhase::PREPARED;
+        state.wait_rc = poll_rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE ? rc : 0;
+        throw std::runtime_error(
+            "launch_native_run_joined failed with code " + std::to_string(rc) + " " + format_native_run_identity(run)
+        );
+    }
+    std::lock_guard<std::mutex> lk(native_run_mu_);
+    native_run_states_[run.slot_id].phase = NativeRunPhase::LAUNCHED;
+    return true;
 }
 
 bool ChipWorker::poll_native_run(const ChipWorkerNativeRun &run) {
@@ -886,6 +1088,65 @@ void ChipWorker::finalize_native_run(const ChipWorkerNativeRun &run) {
             "finalize_native_run failed with code " + std::to_string(rc) + " " + format_native_run_identity(run)
         );
     }
+}
+
+RunRetentionProbeReport ChipWorker::probe_run_retention(
+    const ChipWorkerNativeRun &run, const ChipWorkerNativeRun &successor, const RunRetentionProbeConfig &config
+) {
+    if (probe_run_retention_fn_ == nullptr) {
+        throw std::runtime_error(
+            "this runtime module exports no run-retention fixture; it measures a stream-level property and only "
+            "onboard modules carry it"
+        );
+    }
+    const bool want_successor = config.launch_successor != 0;
+    {
+        std::lock_guard<std::mutex> lk(native_run_mu_);
+        if (run.slot_id >= runtime_bufs_.size()) {
+            throw std::runtime_error("native-run token slot is outside the runtime PipelineContract");
+        }
+        const NativeRunSlotState &state = native_run_states_[run.slot_id];
+        if (state.run_epoch != run.run_epoch || state.phase != NativeRunPhase::LAUNCHED) {
+            throw std::runtime_error(
+                "probe_run_retention needs a launched, undrained predecessor " + format_native_run_identity(run)
+            );
+        }
+        if (want_successor) {
+            if (successor.slot_id >= runtime_bufs_.size() || successor.slot_id == run.slot_id) {
+                throw std::runtime_error("probe_run_retention needs the successor on a different pipeline slot");
+            }
+            const NativeRunSlotState &next = native_run_states_[successor.slot_id];
+            if (next.run_epoch != successor.run_epoch || next.phase != NativeRunPhase::PREPARED) {
+                throw std::runtime_error(
+                    "probe_run_retention needs a prepared, unlaunched successor " +
+                    format_native_run_identity(successor)
+                );
+            }
+        }
+    }
+
+    RunRetentionProbeReport report{};
+    const int rc = probe_run_retention_fn_(
+        device_ctx_, runtime_bufs_[run.slot_id].data(),
+        want_successor ? runtime_bufs_[successor.slot_id].data() : nullptr, &config, &report
+    );
+    if (rc != 0) {
+        throw std::runtime_error(
+            "probe_run_retention refused its arguments with code " + std::to_string(rc) + " " +
+            format_native_run_identity(run)
+        );
+    }
+    if (want_successor) {
+        // The fixture drained the successor, so it is where an ordinary wait
+        // would have left it. The predecessor stays LAUNCHED on purpose: its
+        // drain, copy-back and DFX teardown are the production path, and
+        // finalize reaches all three from that phase.
+        std::lock_guard<std::mutex> lk(native_run_mu_);
+        NativeRunSlotState &next = native_run_states_[successor.slot_id];
+        next.wait_rc = report.successor_launch_rc != 0 ? report.successor_launch_rc : report.successor_drain_rc;
+        next.phase = NativeRunPhase::REAPED;
+    }
+    return report;
 }
 
 void ChipWorker::cleanup_native_runs_noexcept() noexcept {

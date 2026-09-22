@@ -258,13 +258,3 @@ The variable track is intentionally left as a follow-up: a `name_hash`-tagged
 RAII scope writing the swimlane ring, with the host recovering hash → name from
 the orch SO's `.rodata` (or a dedicated section) so no hand-maintained map is
 needed.
-
-## Aligning host and device on one timeline (future)
-
-Host spans use `CLOCK_MONOTONIC` ns; device phases use AICPU cycles. They are
-reported in the same `[STRACE]` grammar (`clk=dev` marks the cycle-derived
-durations). To place both on **one** Perfetto timeline later, the device side
-would emit a periodic `clock.anchor` line pairing one `host_ns` with one
-`dev_cyc` + `dev_freq`; the parser then maps device spans onto the host axis.
-The marker `v=` field and `k=v` extensibility reserve room for this — it is not
-part of the current host-only work.

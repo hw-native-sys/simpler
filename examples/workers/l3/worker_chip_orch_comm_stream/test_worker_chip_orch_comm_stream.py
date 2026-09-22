@@ -20,7 +20,7 @@ import struct
 
 import pytest
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import CallConfig, ChipCallable, CoreCallable, DataType, TaskArgs, scalar_to_uint64
+from simpler.task_interface import CallConfig, ChipCallable, CoreCallable, DataType, TaskArgs
 from simpler.worker import Worker
 from simpler.worker_chip_orch_comm import NotifyOp, WaitCmp
 
@@ -139,7 +139,7 @@ def run_closed_loop_stream(platform: str, device_id: int) -> None:
             task_args.add_scalar(_NUMEL)
             task_args.add_scalar(DataType.FLOAT32.value)
             task_args.add_scalar(_NBYTES)
-            task_args.add_scalar(scalar_to_uint64(_SCALAR))
+            task_args.add_scalar(_SCALAR)
             task_args.add_scalar(_DATA_READY_COUNTER)
             task_args.add_scalar(_COMPLETION_COUNTER)
             orch_handle.submit_next_level(handle, task_args, cfg, worker=0)

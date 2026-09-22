@@ -9,9 +9,30 @@
 """Contract tests for simpler_setup.tools.deps_viewer text output."""
 
 import json
+from typing import Optional
+
+import pytest
 
 from simpler_setup.tools import deps_viewer
-from simpler_setup.tools.deps_viewer import _merge_task_meta_with_kernel_ids, emit_text
+from simpler_setup.tools.deps_viewer import _merge_task_meta_with_kernel_ids
+from simpler_setup.tools.swimlane_converter import HBG_RUNTIME, TMR_RUNTIME
+
+
+# The renderers state which TaskId layout their labels follow, so they require the
+# runtime name rather than guessing. Tests that are not about that choice take tmr.
+def emit_text(*args, **kwargs):
+    kwargs.setdefault("runtime_name", TMR_RUNTIME)
+    return deps_viewer.emit_text(*args, **kwargs)
+
+
+def _emit_dot(*args, **kwargs):
+    kwargs.setdefault("runtime_name", TMR_RUNTIME)
+    return getattr(deps_viewer, "emit_dot")(*args, **kwargs)
+
+
+def _emit_html(*args, **kwargs):
+    kwargs.setdefault("runtime_name", TMR_RUNTIME)
+    return getattr(deps_viewer, "emit_html")(*args, **kwargs)
 
 
 def test_autoload_name_map_accepts_exact_name(tmp_path):
@@ -33,8 +54,8 @@ def test_emit_text_marks_alloc_without_task_entry():
         task_table={},
     )
 
-    assert "TASK 1 kind=alloc func_id=none fanin=0 fanout=0" in text
-    assert "=== TASK 1 kind=alloc func_id=none ===" in text
+    assert "TASK r0t1 kind=alloc func_id=none fanin=0 fanout=0" in text
+    assert "=== TASK r0t1 kind=alloc func_id=none ===" in text
 
 
 def test_emit_text_marks_dummy_without_kernel_slots():
@@ -48,8 +69,8 @@ def test_emit_text_marks_dummy_without_kernel_slots():
         task_table={1: {"task_id": 1, "kernel_ids": [-1, -1, -1]}},
     )
 
-    assert "TASK 1 kind=dummy func_id=none fanin=0 fanout=0" in text
-    assert "=== TASK 1 kind=dummy func_id=none ===" in text
+    assert "TASK r0t1 kind=dummy func_id=none fanin=0 fanout=0" in text
+    assert "=== TASK r0t1 kind=dummy func_id=none ===" in text
 
 
 def test_emit_text_marks_func_name_map_yes_only_with_named_func():
@@ -91,7 +112,7 @@ def test_kernel_ids_fill_func_id_when_perf_sidecar_is_absent():
         task_table={1: {"task_id": 1, "kernel_ids": [-1, 2, -1]}},
     )
 
-    assert "TASK 1 kind=submit func_id=[-1,2,-1] fanin=0 fanout=0" in text
+    assert "TASK r0t1 kind=submit func_id=[-1,2,-1] fanin=0 fanout=0" in text
     assert "func_name_map: no" in text
 
 
@@ -111,8 +132,8 @@ def test_emit_text_marks_spmd_block_count():
         task_table={1: {"task_id": 1, "kernel_ids": [-1, 2, -1], "block_num": 4}},
     )
 
-    assert "TASK 1 kind=submit func_id=[-1,2,-1] SPMD block num = 4 fanin=0 fanout=0" in text
-    assert "=== TASK 1 kind=submit func_id=[-1,2,-1] SPMD block num = 4 ===" in text
+    assert "TASK r0t1 kind=submit func_id=[-1,2,-1] SPMD block num = 4 fanin=0 fanout=0" in text
+    assert "=== TASK r0t1 kind=submit func_id=[-1,2,-1] SPMD block num = 4 ===" in text
 
 
 def test_kernel_ids_render_all_active_funcs_for_mixed_task():
@@ -139,9 +160,9 @@ def test_kernel_ids_render_all_active_funcs_for_mixed_task():
         },
     )
 
-    assert "TASK 1 kind=submit func_id=[0,1,2] fanin=0 fanout=0" in text
-    assert "TASK 2 kind=submit func_id=[0,1,-1] fanin=0 fanout=0" in text
-    assert "TASK 3 kind=submit func_id=[-1,3,4] fanin=0 fanout=0" in text
+    assert "TASK r0t1 kind=submit func_id=[0,1,2] fanin=0 fanout=0" in text
+    assert "TASK r0t2 kind=submit func_id=[0,1,-1] fanin=0 fanout=0" in text
+    assert "TASK r0t3 kind=submit func_id=[-1,3,4] fanin=0 fanout=0" in text
     assert "func_name_map: no" in text
 
 
@@ -177,7 +198,7 @@ def test_kernel_ids_use_func_name_map_when_available():
         task_table={1: {"task_id": 1, "kernel_ids": [-1, 2, -1]}},
     )
 
-    assert "TASK 1 kind=submit func_id=[-1,2,-1] fanin=0 fanout=0" in text
+    assert "TASK r0t1 kind=submit func_id=[-1,2,-1] fanin=0 fanout=0" in text
     assert "func_name_map: yes" in text
 
 
@@ -198,7 +219,7 @@ def test_kernel_ids_use_all_named_funcs_when_available():
         task_table={1: {"task_id": 1, "kernel_ids": [0, 1, 2]}},
     )
 
-    assert "TASK 1 kind=submit func_id=[0,1,2] fanin=0 fanout=0" in text
+    assert "TASK r0t1 kind=submit func_id=[0,1,2] fanin=0 fanout=0" in text
     assert "func_name_map: yes" in text
 
 
@@ -206,7 +227,7 @@ def test_emit_dot_marks_spmd_nodes_without_expanding_labels():
     task_table = {1: {"task_id": 1, "kernel_ids": [-1, 2, -1], "block_num": 4, "args": []}}
     meta = _merge_task_meta_with_kernel_ids({}, task_table)
 
-    plain = deps_viewer.emit_dot(
+    plain = _emit_dot(
         edges=[],
         nodes=[1],
         meta=meta,
@@ -214,14 +235,14 @@ def test_emit_dot_marks_spmd_nodes_without_expanding_labels():
         show_tensor_info=False,
     )
 
-    assert 'label="1 ↓0 ↑0"' in plain
+    assert 'label="r0t1 ↓0 ↑0"' in plain
     assert 'color="#C62828"' in plain
     assert "penwidth=1.5" in plain
     assert 'style="filled"' in plain
     assert "SPMD" not in plain
     assert "4 blocks" not in plain
 
-    rich = deps_viewer.emit_dot(
+    rich = _emit_dot(
         edges=[],
         nodes=[1],
         meta=meta,
@@ -268,6 +289,7 @@ def test_dep_stats_json_groups_peers_by_name_hint():
             edges=[(1, 5), (2, 5), (3, 5), (4, 5), (5, 1)],
             meta=meta,
             task_table=task_table,
+            runtime_name=TMR_RUNTIME,
         )
     )
 
@@ -279,13 +301,13 @@ def test_dep_stats_json_groups_peers_by_name_hint():
 
 
 def test_emit_dot_handles_missing_task_table():
-    dot = deps_viewer.emit_dot(edges=[], nodes=[1], meta={}, task_table=None)
+    dot = _emit_dot(edges=[], nodes=[1], meta={}, task_table=None)
 
-    assert 'label="🔥 1 · alloc ↓0 ↑0"' in dot
+    assert 'label="🔥 r0t1 · alloc ↓0 ↑0"' in dot
 
 
 def test_emit_dot_does_not_mark_alloc_only_successor_with_star():
-    dot = deps_viewer.emit_dot(
+    dot = _emit_dot(
         edges=[(1, 3), (2, 3)],
         nodes=[1, 2, 3],
         meta={},
@@ -293,13 +315,13 @@ def test_emit_dot_does_not_mark_alloc_only_successor_with_star():
         show_tensor_info=False,
     )
 
-    assert 'label="🔥 1 · alloc ↓0 ↑1"' in dot
-    assert 'label="🔥 2 · alloc ↓0 ↑1"' in dot
-    assert 'label="3 ↓2 ↑0"' in dot
+    assert 'label="🔥 r0t1 · alloc ↓0 ↑1"' in dot
+    assert 'label="🔥 r0t2 · alloc ↓0 ↑1"' in dot
+    assert 'label="r0t3 ↓2 ↑0"' in dot
 
 
 def test_emit_dot_marks_star_with_alloc_and_early_dispatch_predecessors():
-    dot = deps_viewer.emit_dot(
+    dot = _emit_dot(
         edges=[(1, 3), (2, 3)],
         nodes=[1, 2, 3],
         meta={},
@@ -310,13 +332,13 @@ def test_emit_dot_marks_star_with_alloc_and_early_dispatch_predecessors():
         show_tensor_info=False,
     )
 
-    assert 'label="🔥 1 · alloc ↓0 ↑1"' in dot
-    assert 'label="🔥 2 ↓0 ↑1"' in dot
-    assert 'label="⭐ 3 ↓2 ↑0"' in dot
+    assert 'label="🔥 r0t1 · alloc ↓0 ↑1"' in dot
+    assert 'label="🔥 r0t2 ↓0 ↑1"' in dot
+    assert 'label="⭐ r0t3 ↓2 ↑0"' in dot
 
 
 def test_emit_dot_does_not_mark_star_when_any_predecessor_lacks_fire():
-    dot = deps_viewer.emit_dot(
+    dot = _emit_dot(
         edges=[(1, 4), (2, 4), (3, 4)],
         nodes=[1, 2, 3, 4],
         meta={},
@@ -328,7 +350,7 @@ def test_emit_dot_does_not_mark_star_when_any_predecessor_lacks_fire():
         show_tensor_info=False,
     )
 
-    assert 'label="4 ↓3 ↑0"' in dot
+    assert 'label="r0t4 ↓3 ↑0"' in dot
 
 
 def test_emit_html_includes_dep_stats_and_detail_panel(monkeypatch):
@@ -343,7 +365,7 @@ def test_emit_html_includes_dep_stats_and_detail_panel(monkeypatch):
         lambda dot, engine="dot": b"<svg><g class='node'><title>T0_1</title></g></svg>",
     )
 
-    html = deps_viewer.emit_html(
+    html = _emit_html(
         edges=[(1, 2)],
         nodes=[1, 2],
         meta={2: {"func_name": "q_proj", "func_id": 7}},
@@ -361,7 +383,7 @@ def test_emit_html_includes_dep_stats_and_detail_panel(monkeypatch):
 
 
 def test_emit_dot_hides_selected_edges_with_background_color():
-    dot = deps_viewer.emit_dot(
+    dot = _emit_dot(
         edges=[(1, 2), (2, 3)],
         nodes=[1, 2, 3],
         meta={},
@@ -383,7 +405,7 @@ def test_emit_html_default_preserves_task_table_rendering(monkeypatch):
     monkeypatch.setattr(deps_viewer, "emit_dot", fake_emit_dot)
     monkeypatch.setattr(deps_viewer, "render_svg", lambda dot, engine="dot": b"<svg></svg>")
 
-    deps_viewer.emit_html(edges=[], nodes=[1], meta={}, task_table={1: {"task_id": 1, "args": []}})
+    _emit_html(edges=[], nodes=[1], meta={}, task_table={1: {"task_id": 1, "args": []}})
 
     assert captured["show_tensor_info"] is None
 
@@ -397,7 +419,7 @@ def test_validate_args_rejects_show_tensor_info_in_text_mode(capsys):
 
 def test_main_passes_task_table_when_show_tensor_info_enabled(tmp_path, monkeypatch):
     deps_json = tmp_path / "deps.json"
-    deps_json.write_text("{}")
+    deps_json.write_text(json.dumps({"runtime": TMR_RUNTIME}))
 
     monkeypatch.setattr(
         deps_viewer,
@@ -433,7 +455,7 @@ def test_main_passes_task_table_when_show_tensor_info_enabled(tmp_path, monkeypa
 
 def test_main_keeps_task_metadata_when_show_tensor_info_disabled(tmp_path, monkeypatch):
     deps_json = tmp_path / "deps.json"
-    deps_json.write_text("{}")
+    deps_json.write_text(json.dumps({"runtime": TMR_RUNTIME}))
 
     monkeypatch.setattr(
         deps_viewer,
@@ -688,6 +710,7 @@ def _write_output_lifetime_deps(tmp_path):
         else:
             annotated_edges.append({"pred": str(pred), "succ": str(succ), "arg": -1, "source": "explicit"})
     deps = {
+        "runtime": TMR_RUNTIME,
         "tasks": list(task_table.values()),
         "tensors": list(tensor_table.values()),
         "edges": annotated_edges,
@@ -709,11 +732,16 @@ def test_main_dataflow_edge_modes_keep_lifetime_boundaries_and_omit_middle(tmp_p
     assert omitted_rc == 0
     assert "unique_task_edges: 4" in reduced_out.read_text()
     assert "unique_task_edges: 1" in omitted_out.read_text()
-    assert "=== TASK 1" in omitted_out.read_text()
-    assert "  -> 3" in omitted_out.read_text()
+    assert "=== TASK r0t1" in omitted_out.read_text()
+    assert "  -> r0t3" in omitted_out.read_text()
 
 
-def _write_deps_edges(tmp_path, edges, sources=None):
+def _write_deps_edges(tmp_path, edges, sources=None, runtime: Optional[str] = TMR_RUNTIME):
+    """Write a deps.json. Names tmr by default, as every dep_gen writer names its runtime.
+
+    Pass ``runtime=None`` to build a capture from before that field existed, which the
+    viewer refuses rather than decoding by guess.
+    """
     sources = sources or {}
     annotated_edges = []
     for pred, succ in edges:
@@ -722,11 +750,13 @@ def _write_deps_edges(tmp_path, edges, sources=None):
         if source != "explicit":
             edge["tensor_id"] = "7"
         annotated_edges.append(edge)
-    deps = {
+    deps: dict[str, object] = {
         "tasks": [],
         "tensors": [],
         "edges": annotated_edges,
     }
+    if runtime is not None:
+        deps["runtime"] = runtime
     path = tmp_path / "deps.json"
     path.write_text(json.dumps(deps))
     return path
@@ -749,8 +779,9 @@ def test_main_reduced_mode_drops_edge_and_prints_removed(tmp_path, capsys):
     assert "annotated_edges: 2" in text
     stdout = capsys.readouterr().out
     assert "removed 1 redundant edge(s)" in stdout
-    # ring>=1 nodes render as the explicit (ring, local) tuple.
-    assert "(1, 1) -> (1, 3)" in stdout
+    # A document that names no runtime decodes as tmr, so ring>=1 nodes render in
+    # that layout's readable form.
+    assert "r1t1 -> r1t3" in stdout
 
 
 def test_main_reduced_mode_keeps_transitive_creator_reference(tmp_path, capsys):
@@ -846,12 +877,12 @@ def test_main_omitted_mode_draws_only_redundant_edges(tmp_path, capsys):
     assert "unique_task_edges: 1" in text
     assert "annotated_edges: 1" in text
     # The drawn edge is the redundant A->C, not the chain edges.
-    assert "=== TASK (1, 1)" in text
-    assert "  -> (1, 3)" in text
-    assert "  -> (1, 2)" not in text
+    assert "=== TASK r1t1" in text
+    assert "  -> r1t3" in text
+    assert "  -> r1t2" not in text
     stdout = capsys.readouterr().out
     assert "showing 1 redundant edge(s)" in stdout
-    assert "(1, 1) -> (1, 3)" in stdout
+    assert "r1t1 -> r1t3" in stdout
 
 
 def test_main_omitted_default_output_stem(tmp_path):
@@ -863,3 +894,97 @@ def test_main_omitted_default_output_stem(tmp_path):
     assert rc == 0
     assert (tmp_path / "deps_viewer_omitted.txt").exists()
     assert not (tmp_path / "deps_viewer.txt").exists()
+
+
+# deps.json names the runtime that minted its ids, because a task id carries
+# whichever TaskId layout its runtime uses and nothing in the value says which.
+# Without that name every label falls back to the tmr layout, which is what the
+# labels meant before the key existed.
+
+
+def _hbg_sub_task(parent_id, local_id):
+    """A SUB_TASK id: space 1 in bits 63:62, parent in bits 51:32, index in the low 32."""
+    return (1 << 62) | (parent_id << 32) | local_id
+
+
+def _hbg_param(param_index):
+    """A PARAM id: space 2 in bits 63:62, parameter index in the low 32."""
+    return (2 << 62) | param_index
+
+
+def test_deps_runtime_reads_the_name_from_the_document(tmp_path):
+    (tmp_path / "a").mkdir()
+    named = _write_deps_edges(tmp_path / "a", [(1, 2)], runtime=HBG_RUNTIME)
+
+    assert deps_viewer._deps_runtime(named) == HBG_RUNTIME
+
+    # An unreadable path names no runtime either, and is refused the same way.
+    with pytest.raises(ValueError, match="runtime"):
+        deps_viewer._deps_runtime(tmp_path / "missing.json")
+
+
+def test_hbg_labels_name_the_parent_instead_of_a_raw_high_field():
+    """A sub-task renders as g{parent}t{index}, not as the ten-digit high word.
+
+    The high field holds the id space in bits 63:62, so printing it verbatim put a
+    number above 10^9 on every hbg label.
+    """
+    nodes = [_hbg_sub_task(3, 0), _hbg_sub_task(4, 1), _hbg_param(5), 12]
+    fmt = deps_viewer._make_task_formatter(nodes, "host_build_graph")
+
+    assert fmt(_hbg_sub_task(3, 0)) == "g3t0"
+    assert fmt(_hbg_sub_task(4, 1)) == "g4t1"
+    assert fmt(_hbg_param(5)) == "p5"
+    assert fmt(12) == "t12"
+
+
+def test_tmr_labels_keep_the_ring_form():
+    nodes = [(2 << 32) | 100, 5]
+    fmt = deps_viewer._make_task_formatter(nodes, "tensormap_and_ringbuffer")
+
+    assert fmt((2 << 32) | 100) == "r2t100"
+    assert fmt(5) == "r0t5"
+
+
+def test_formatter_keeps_tmr_ring_zero_explicit_and_compacts_plain_hbg_ids():
+    hbg = deps_viewer._make_task_formatter([1, 2, 3], HBG_RUNTIME)
+    tmr = deps_viewer._make_task_formatter([1, 2, 3], TMR_RUNTIME)
+
+    assert [hbg(n) for n in (1, 2, 3)] == ["1", "2", "3"]
+    assert [tmr(n) for n in (1, 2, 3)] == ["r0t1", "r0t2", "r0t3"]
+
+
+def test_a_document_naming_no_runtime_is_refused(tmp_path):
+    """Both dep_gen writers name their runtime, so a document without one predates them."""
+    deps_path = _write_deps_edges(tmp_path, [(1, 2)], runtime=None)
+
+    with pytest.raises(ValueError, match="runtime"):
+        deps_viewer._deps_runtime(deps_path)
+
+
+def test_node_ids_stay_undecoded_so_they_cannot_collide(tmp_path):
+    """A decoded label drops bits; a node id must not, or two tasks merge into one.
+
+    hbg leaves bits 61:52 reserved, and its labels do not show them. Node ids keep
+    both raw halves, so ids differing only there stay distinct nodes.
+    """
+    reserved_bit = 1 << 52
+    a = _hbg_sub_task(3, 0)
+    b = a | reserved_bit
+
+    fmt = deps_viewer._make_task_formatter([a, b], "host_build_graph")
+    assert fmt(a) == fmt(b), "the label cannot tell them apart -- that is the premise"
+    assert deps_viewer._node_id(a) != deps_viewer._node_id(b)
+
+
+def test_main_labels_an_hbg_capture_by_its_runtime(tmp_path, capsys):
+    """End to end: the name in deps.json reaches the text report's labels."""
+    a, b = _hbg_sub_task(3, 0), _hbg_sub_task(3, 1)
+    deps_path = _write_deps_edges(tmp_path, [(a, b)], runtime="host_build_graph")
+
+    assert deps_viewer.main([str(deps_path)]) == 0
+
+    text = (tmp_path / "deps_viewer.txt").read_text()
+    assert "g3t0" in text
+    assert "g3t1" in text
+    assert "1073741827" not in text, "the raw high field must not reach a label"

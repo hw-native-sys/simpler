@@ -112,16 +112,33 @@ worker.run(orchestration, args, config)
 worker.submit(orchestration, args, config).wait()
 ```
 
-The current L2 backend is synchronous, so L2 `submit()` executes the existing
-blocking path and returns an already-completed handle. At L3 and above, graph
-callbacks remain serialized, and what admits a later submit is a free pipeline
-slot rather than the prior run's acceptance: `begin_run` reserves a
-generation-safe lease before the callback is invoked and blocks there when the
-negotiated depth is already spent. Endpoint acceptance remains the launch fence
-a run's own dispatches advance — on A2A3 onboard, after both device kernels are
+L2 `submit()` returns a `RunHandle` for the chip run admitted by its native
+lane. The backend's negotiated capability determines whether a successor may
+prepare early or submission must drain its predecessor. Successful `wait()` /
+`result()` completes the run and its required finalization. At L3 and above, graph
+callbacks remain serialized. A later `submit` is admitted while logical
+pending-run capacity remains available; the default capacity follows the
+negotiated depth. `begin_run` may construct such a pending run without a native
+lease, and `refresh_leases_locked` assigns the lease when the run enters an
+active or preparable role. Endpoint acceptance remains the launch fence a run's
+own dispatches advance — on A2A3 onboard, after both device kernels are
 enqueued and before stream synchronization, with endpoints lacking an earlier
 signal falling back to completion — but it no longer gates the next callback.
 Each run still owns its completion error, keepalives, and cleanup independently.
+
+`close_run_submission()` closes task declarations; tasks may still be PENDING
+or READY. A second `begin_run()` is rejected while construction remains open,
+but the executing FIFO head can dispatch tasks before its callback returns.
+An eligible successor may be sent to its endpoint with `prepare_only` while
+the predecessor executes. Closing submission or accepting every predecessor
+task does not activate that successor: the current FIFO advances only when
+the predecessor becomes terminal. A successor promoted while its callback is
+still open may then execute its ready tasks.
+
+Python direct-control calls inside a callback must precede its first task
+submission and wait for that run to hold the FIFO head. Ownerless control
+requires the Worker's control reservation and quiescence. Device-touching
+run cleanup additionally retains its ordered-cleanup barrier until published.
 
 Remote L3 submit adds two hidden pieces of metadata: final eligible worker-id
 sets and optional `RemoteTaskArgsSidecar` entries aligned by tensor index.

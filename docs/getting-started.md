@@ -84,7 +84,8 @@ your kernels use PTO ISA intrinsics.
 
 ## Prerequisites
 
-- CMake 3.15+
+- CMake 3.20+ — the onboard AICore compiles consume the compiler's depfile, and
+  `DEPFILE` on the Makefile generators this project configures with needs 3.20
 - CANN toolkit with:
   - `ccec` compiler (AICore Bisheng CCE)
   - Cross-compiler for AICPU (aarch64-target-linux-gnu-gcc/g++)
@@ -108,7 +109,7 @@ All workflows assume an activated project-local venv (see [`.claude/rules/venv-i
 python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
 pip install --no-build-isolation \
-  'scikit-build-core>=0.10.0' 'nanobind>=2.0.0,<3' 'cmake>=3.15' 'ninja>=1.11' 'pytest>=6.0' 'torch>=2.3'
+  'scikit-build-core>=0.10.0' 'nanobind>=2.0.0,<3' 'cmake>=3.20' 'ninja>=1.11' 'pytest>=6.0' 'torch>=2.3'
 pip install --no-build-isolation -e .
 ```
 
@@ -205,10 +206,12 @@ worker.run(handle, orch_args, cfg)
 HBG sizes and commits its graph heap after orchestration; `ring_heap` and
 `ring_dep_pool` are TRB settings, not HBG capacity controls.
 
-The HBG orchestration-entry limit is `RUNTIME_MAX_ARGS=128` in
-`src/common/host_build_graph/runtime.h`. Per-task fanin is capped at
-`CHIP_MAX_FANIN=128`; there is no `RUNTIME_MAX_FANOUT` knob. See
-[capacity errors](troubleshooting/device-error-codes/capacity.md) for the
+An HBG orchestration entry takes up to `CHIP_MAX_TENSOR_ARGS=256` tensors and
+`CHIP_MAX_SCALAR_ARGS=128` scalars, both in
+`src/common/task_interface/arg_direction.h` — they size the `EntryArgsStorage`
+the entry reads and the `ChipStorageTaskArgs` that crosses the wire. Per-task
+fanin is capped at `CHIP_MAX_FANIN=128`; there is no `RUNTIME_MAX_FANOUT` knob.
+See [capacity errors](troubleshooting/device-error-codes/capacity.md) for the
 resource-specific limits and diagnostics.
 
 ### Runtime Configuration

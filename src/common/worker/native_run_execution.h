@@ -16,6 +16,7 @@
 
 class DeviceRunnerBase;
 class NativeRunExecutionTestPeer;
+class RunRetentionProbePeer;
 class SimDeviceRunnerBase;
 
 struct NativeRunIdentity {
@@ -29,6 +30,26 @@ struct NativeRunIdentity {
                pipeline_slot == other.pipeline_slot;
     }
     bool operator!=(const NativeRunIdentity &other) const { return !(*this == other); }
+};
+
+/**
+ * A successor's statement that it has been ordered behind one named predecessor
+ * on the device.
+ *
+ * Both halves are load-bearing. The owner pointer is what the execution claim
+ * matches against its newest holder, so a join can only ever name the run
+ * immediately ahead of this one; the identity is what makes that holder the run
+ * the caller meant rather than whichever run happens to occupy the slot, since a
+ * pipeline slot is reused and only `run_epoch` is unique for the process
+ * lifetime.
+ *
+ * Carrying no device handle is deliberate: the predecessor's completion
+ * boundary is owned by its own slot's fence, and the successor reaches it
+ * through the identity rather than through a copied event.
+ */
+struct NativeRunJoin {
+    const void *predecessor_owner{nullptr};
+    NativeRunIdentity predecessor_identity{};
 };
 
 class LaunchPermit {
@@ -56,6 +77,9 @@ public:
 private:
     friend class DeviceRunnerBase;
     friend class NativeRunExecutionTestPeer;
+    // #2267's retention probe launches a run that holds no C API execution
+    // claim, so it mints its permit instead of receiving one.
+    friend class RunRetentionProbePeer;
     friend class SimDeviceRunnerBase;
     template <typename AicoreSubmit, typename AicpuSubmit>
     friend struct ExactLaunchTransaction;
@@ -115,6 +139,27 @@ enum class LaunchProgress : uint8_t {
     Complete,
 };
 
+/**
+ * A submit callback's channel for reporting that its submission reached the
+ * device queue.
+ *
+ * A callback does more than one thing — it submits a kernel and then records
+ * that kernel's completion boundary — and only the first of those is what
+ * grades the run. Without this, a boundary-record failure returned from the
+ * callback would be read as a failure before any submission and the run graded
+ * `NotStarted`, i.e. an already-submitted kernel reported as never launched.
+ * Callbacks therefore mark this the instant the device accepts a submission,
+ * ahead of anything that can still fail.
+ */
+class LaunchProgressSink {
+public:
+    void mark_submitted() { submitted_ = true; }
+    bool submitted() const { return submitted_; }
+
+private:
+    bool submitted_{false};
+};
+
 struct LaunchTransactionResult {
     int rc{-1};
     LaunchProgress progress{LaunchProgress::NotStarted};
@@ -140,7 +185,9 @@ struct LaunchTransactionResult {
  * non-zero return rather than an exception. An escaping exception is therefore
  * evidence that the submission itself was attempted, and grades the run
  * `Partial`. Returning non-zero from `submit_aicore` is by contrast a
- * before-first-submission failure, so it stays `NotStarted`.
+ * before-first-submission failure, so it stays `NotStarted` — unless the
+ * callback marked its `LaunchProgressSink`, which says the device already
+ * accepted a submission and the failure came from a later step.
  */
 template <typename AicoreSubmit, typename AicpuSubmit>
 struct ExactLaunchTransaction {
@@ -150,18 +197,22 @@ struct ExactLaunchTransaction {
         LaunchTransactionResult result;
         if (!permit.consume(identity)) return result;
 
+        LaunchProgressSink sink;
         try {
-            result.rc = std::forward<AicoreSubmit>(submit_aicore)();
+            result.rc = std::forward<AicoreSubmit>(submit_aicore)(sink);
         } catch (...) {
             result.rc = -1;
             result.progress = LaunchProgress::Partial;
             return result;
         }
-        if (result.rc != 0) return result;
+        if (result.rc != 0) {
+            if (sink.submitted()) result.progress = LaunchProgress::Partial;
+            return result;
+        }
 
         result.progress = LaunchProgress::Partial;
         try {
-            result.rc = std::forward<AicpuSubmit>(submit_aicpu)();
+            result.rc = std::forward<AicpuSubmit>(submit_aicpu)(sink);
         } catch (...) {
             result.rc = -1;
         }

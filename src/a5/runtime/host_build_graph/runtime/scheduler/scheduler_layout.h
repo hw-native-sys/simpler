@@ -36,7 +36,6 @@ struct AicoreSchedulerLayout {
     uint64_t task_controls_offset;
     uint64_t completion_inboxes_offset;
     uint64_t ready_inboxes_offset;
-    uint64_t ready_owner_states_offset;
     uint64_t ready_directory_offset;
     uint64_t trace_cells_offset;
     uint64_t activity_buffers_offset;

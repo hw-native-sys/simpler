@@ -17,9 +17,10 @@
  * array, and embedded SPMD context (LocalContext + GlobalContext).  AICPU
  * maintains a static array of these (one per core).
  *
- * GlobalContext (sub_block_id plus async-DMA workspace addresses) is
- * initialized during scheduler cold start from core topology and the resident
- * per-device config, then remains stable for that scheduler instance.
+ * GlobalContext (sub_block_id, async-DMA workspace addresses, and the L2
+ * nocache-alias offset) is initialized during scheduler cold start from core
+ * topology and the resident per-device config, then remains stable for that
+ * scheduler instance.
  *
  * The scheduler prefills the AsyncCtx slab pointers and capacity, along with
  * both context pointers in the args[] suffix, during cold initialization.
@@ -113,9 +114,10 @@ struct alignas(64) DispatchPayload {
      *  the idle AICore fills them from src_payload during its gate wait. */
     uint64_t args[DISPATCH_MAX_ARGS];
 
-    /** Per-core global context: sub_block_id (AIV lane identity) plus optional
-     *  async-DMA workspace addresses. Cold: written during scheduler init, never
-     *  per dispatch, so it lives in the tail (not the CL0 control block).
+    /** Per-core global context: sub_block_id (AIV lane identity), optional
+     *  async-DMA workspace addresses, and the L2 nocache-alias offset. Cold:
+     *  written during scheduler init, never per dispatch, so it lives in the
+     *  tail (not the CL0 control block).
      *  args[SPMD_GLOBAL_CONTEXT_INDEX] points here. */
     GlobalContext global_context;
     // No explicit tail padding: alignas(64) rounds sizeof up to 512 (8 cache lines).

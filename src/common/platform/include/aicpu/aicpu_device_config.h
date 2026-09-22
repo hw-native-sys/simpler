@@ -65,6 +65,21 @@ void set_dma_workspace_addr(int kind, unsigned long long addr);
 /** Get the async-DMA workspace device address for one engine kind (0 if unavailable). */
 unsigned long long get_dma_workspace_addr(int kind);
 
+/**
+ * Set the distance from a GM address to its nocache alias on this device.
+ * Published by simpler_aicpu_init (from InitArgs.l2_cache_offset) into a
+ * resident-SO slot; the scheduler copies it into every core's GlobalContext, so
+ * kernels read it via get_l2_cache_offset(args) and add it to a base address to
+ * reach the uncached mapping of the same pages. The driver owns the value and
+ * reports it per device — it is not a constant any caller may assume. 0 means
+ * this device exposes no alias, and a kernel adding 0 gets an ordinary cached
+ * load, which is the correct degradation rather than a defect.
+ */
+void set_dev_l2_cache_offset(unsigned long long offset);
+
+/** Get the nocache-alias offset for this device (0 when the device has none). */
+unsigned long long get_dev_l2_cache_offset();
+
 #ifdef __cplusplus
 }
 #endif

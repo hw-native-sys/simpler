@@ -24,6 +24,11 @@ body:
 
   - type: dropdown
     id: runtime_variant
+    # Written out because a GitHub form cannot compute its options. Everywhere
+    # else derives the list from simpler_setup.platform_info.discover_runtimes
+    # — a directory under src/<arch>/runtime with a build_config.py — so adding
+    # a runtime means editing this file and its twin in bug_report.yml, and
+    # nothing else.
     attributes:
       label: Runtime Variant
       description: Which runtime variant is affected?

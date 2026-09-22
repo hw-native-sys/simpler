@@ -329,12 +329,14 @@ char *LocalMailboxEndpoint::task_frame(size_t index) const {
 
 void WorkerThread::start(
     Ring *ring, const std::function<void(WorkerCompletion)> &on_complete,
-    const std::function<void(WorkerDispatch)> &on_accept, std::unique_ptr<WorkerEndpoint> endpoint
+    const std::function<void(WorkerDispatch)> &on_accept, const std::function<void(WorkerDispatch)> &on_staged,
+    std::unique_ptr<WorkerEndpoint> endpoint
 ) {
     if (!endpoint) throw std::invalid_argument("WorkerThread::start: null endpoint");
     ring_ = ring;
     on_complete_ = on_complete;
     on_accept_ = on_accept;
+    on_staged_ = on_staged;
     endpoint_ = std::move(endpoint);
     shutdown_ = false;
     if (endpoint_->caps().max_inflight_tasks == 0) {
@@ -510,6 +512,23 @@ bool WorkerThread::activate_prepared(RunId run_id) {
     return true;
 }
 
+bool WorkerThread::authorize_staged_launch(RunId run_id) {
+    if (run_id == INVALID_RUN_ID) return false;
+    std::lock_guard<std::mutex> admission_lk(admission_mu_);
+    if (shutdown_.load(std::memory_order_acquire)) return false;
+    std::lock_guard<std::mutex> lane_lk(lane_mu_);
+    LaneState &staged = lane(LaneKind::STAGED);
+    if (!staged.occupied || staged.run_id != run_id || staged.dispatch_id == 0) return false;
+    // Only a natively prepared frame holds work that can be ordered behind
+    // another run. A validated-only one fell back to depth one at the child, and
+    // a frame whose staging has not been observed yet has said nothing at all;
+    // both take the ordinary path when they reach the front.
+    if (staged.preparation_disposition != MailboxPreparationDisposition::NATIVE_PREPARED) return false;
+    if (staged.activation_requested) return false;
+    staged.activation_requested = true;
+    return true;
+}
+
 bool WorkerThread::has_staged_run(RunId run_id) const {
     std::lock_guard<std::mutex> lane_lk(lane_mu_);
     const LaneState &staged = lane(LaneKind::STAGED);
@@ -575,21 +594,32 @@ void WorkerThread::progress() {
         endpoint_->request_progress_stop();
     }
 
-    RunId activated = INVALID_RUN_ID;
+    // Both lanes, oldest first. Only the active lane can hold an activation
+    // while the launch depth is one; above it, a staged run authorized to
+    // launch early keeps its own lane — the predecessor still owns the active
+    // one — so its activation has to be published from there.
+    std::array<RunId, 2> activate{INVALID_RUN_ID, INVALID_RUN_ID};
     {
         std::lock_guard<std::mutex> admission_lk(admission_mu_);
         if (!shutdown_.load(std::memory_order_acquire)) {
             {
                 std::lock_guard<std::mutex> lane_lk(lane_mu_);
-                const LaneState &active = lane(LaneKind::ACTIVE);
-                if (active.occupied && active.activation_requested) activated = active.run_id;
+                for (size_t index = 0; index < lanes_.size(); ++index) {
+                    const LaneState &dispatch_lane = lanes_[index];
+                    if (dispatch_lane.occupied && dispatch_lane.activation_requested) {
+                        activate[index] = dispatch_lane.run_id;
+                    }
+                }
             }
-            if (activated != INVALID_RUN_ID) {
+            for (size_t index = 0; index < activate.size(); ++index) {
+                if (activate[index] == INVALID_RUN_ID) continue;
                 try {
-                    if (endpoint_->activate_progress(activated)) {
+                    if (endpoint_->activate_progress(activate[index])) {
                         std::lock_guard<std::mutex> lane_lk(lane_mu_);
-                        LaneState &active = lane(LaneKind::ACTIVE);
-                        if (active.occupied && active.run_id == activated) active.activation_requested = false;
+                        LaneState &dispatch_lane = lanes_[index];
+                        if (dispatch_lane.occupied && dispatch_lane.run_id == activate[index]) {
+                            dispatch_lane.activation_requested = false;
+                        }
                     }
                 } catch (const std::exception &e) {
                     fail_progress_driver(std::string("activate_progress failed: ") + e.what());
@@ -636,6 +666,29 @@ void WorkerThread::finish_progress_dispatch(const WorkerEndpointProgress &progre
         // The endpoint already owns the prepared frame. This cursor-only event
         // keeps the progress poll moving; acceptance, completion, and inflight
         // ownership intentionally remain unchanged until activation/terminal.
+        //
+        // What it does settle is whether that frame can be launched early at
+        // all. Staging admits a validated-only frame too, and such a frame fell
+        // back to depth one at the child: it holds no native preparation, so
+        // authorizing it would spend an activation the child then declines.
+        // Recording the disposition here is what lets the authorization refuse.
+        {
+            std::lock_guard<std::mutex> lane_lk(lane_mu_);
+            LaneState &staged = lane(LaneKind::STAGED);
+            if (staged.occupied && staged.dispatch_id == dispatch.dispatch_id) {
+                staged.preparation_disposition = progress.preparation_disposition;
+            }
+        }
+        // Announced because this is one of the two orders in which a staged run
+        // can become launchable early: the run ahead of it may already have had
+        // every dispatch accepted, and then nothing later says so. The callback
+        // is non-throwing by contract, and a throw here would take the progress
+        // driver down, so it is contained.
+        if (on_staged_) {
+            try {
+                on_staged_(dispatch);
+            } catch (...) {}
+        }
         return;
     }
 
@@ -1081,7 +1134,9 @@ void WorkerManager::add_next_level_endpoint(std::unique_ptr<WorkerEndpoint> endp
 
 void WorkerManager::add_sub(void *mailbox, int child_pid) { sub_entries_.push_back(LocalSubEntry{mailbox, child_pid}); }
 
-void WorkerManager::start(Ring *ring, const OnCompleteFn &on_complete, const OnAcceptFn &on_accept) {
+void WorkerManager::start(
+    Ring *ring, const OnCompleteFn &on_complete, const OnAcceptFn &on_accept, const OnStagedFn &on_staged
+) {
     if (ring == nullptr) throw std::invalid_argument("WorkerManager::start: null ring");
 
     std::vector<int32_t> next_level_worker_ids;
@@ -1111,7 +1166,7 @@ void WorkerManager::start(Ring *ring, const OnCompleteFn &on_complete, const OnA
             auto endpoint = std::make_unique<LocalMailboxEndpoint>(
                 entry.worker_id, entry.mailbox, entry.child_pid, entry.task_frame_count
             );
-            wt->start(ring, on_complete, on_accept, std::move(endpoint));
+            wt->start(ring, on_complete, on_accept, on_staged, std::move(endpoint));
             next_level_threads_.push_back(std::move(wt));
         }
     };
@@ -1122,14 +1177,14 @@ void WorkerManager::start(Ring *ring, const OnCompleteFn &on_complete, const OnA
             auto endpoint = std::make_unique<LocalMailboxEndpoint>(
                 static_cast<int32_t>(i), entries[i].mailbox, entries[i].child_pid
             );
-            wt->start(ring, on_complete, on_accept, std::move(endpoint));
+            wt->start(ring, on_complete, on_accept, on_staged, std::move(endpoint));
             threads.push_back(std::move(wt));
         }
     };
     make_next_level_threads();
     for (auto &endpoint : next_level_endpoint_entries_) {
         auto wt = std::make_unique<WorkerThread>();
-        wt->start(ring, on_complete, on_accept, std::move(endpoint));
+        wt->start(ring, on_complete, on_accept, on_staged, std::move(endpoint));
         next_level_threads_.push_back(std::move(wt));
     }
     next_level_endpoint_entries_.clear();
@@ -1634,6 +1689,13 @@ bool WorkerManager::activate_prepared_run(RunId run_id) {
     for (const auto &worker : next_level_threads_)
         activated = worker->activate_prepared(run_id) || activated;
     return activated;
+}
+
+bool WorkerManager::authorize_staged_launch(RunId run_id) {
+    bool authorized = false;
+    for (const auto &worker : next_level_threads_)
+        authorized = worker->authorize_staged_launch(run_id) || authorized;
+    return authorized;
 }
 
 // =============================================================================

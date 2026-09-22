@@ -89,7 +89,7 @@ def test_join_narrows_the_offset_to_the_window_the_records_do_not_fill():
 
     assert join.sources == ("sched", "device_wall")
     assert join.interval_cycles == (1_150, 1_200)
-    assert join.residual_ns == 50
+    assert join.residual_cycles == 50
     assert join.origin_cycles == 1_175
 
 
@@ -239,6 +239,11 @@ def test_identity_is_the_same_four_numbers_under_two_spellings():
     )
 
 
+def test_synchronous_launch_zero_ids_do_not_claim_a_dispatch_identity():
+    (window,) = containment.host_windows(parse_spans(_host_log(dispatch=(0, 0, 0, 1))))
+    assert window.identity is None
+
+
 def test_a_log_without_the_identity_attributes_still_pairs_by_window_fit():
     """Old logs keep working; they just fall back to the looser route."""
     hosts = [
@@ -299,7 +304,7 @@ def test_the_extent_counts_every_record_the_converter_draws():
     assert with_receive.extent == (1_800, 2_200)
 
     with_lifecycle = containment.capture_windows(
-        _capture(aicpu_lifecycle_records=[{"worker_id": 0, "exit_ack_cycles": 3_400}])
+        _capture(aicpu_lifecycle_records=[{"aicpu_thread_id": 0, "exit_wait_end_cycles": 3_400}])
     )
     assert with_lifecycle.extent == (1_900, 3_400)
 
@@ -307,7 +312,7 @@ def test_the_extent_counts_every_record_the_converter_draws():
 def test_a_record_outside_the_run_wall_is_caught_rather_than_drawn_outside_it():
     """The join is what enforces containment, so the extent has to feed it."""
     capture = containment.capture_windows(
-        _capture(aicpu_lifecycle_records=[{"worker_id": 0, "exit_ack_cycles": 9_000}])
+        _capture(aicpu_lifecycle_records=[{"aicpu_thread_id": 0, "exit_wait_end_cycles": 9_000}])
     )
 
     with pytest.raises(containment.ContainmentError, match="do not overlap"):
@@ -356,3 +361,17 @@ def test_host_pid_alone_still_needs_the_dispatch_when_the_process_ran_twice():
 
     assert (pairs[0].pid, pairs[0].inv) == (11, 2)
     assert diagnostics[0]["source"] == "capture_sidecar"
+
+
+def test_capture_windows_includes_aicore_scheduler_streams_in_extent():
+    raw = _capture()
+    raw["scheduler_records"] = {
+        "streams": [
+            {"producer": "aicpu", "records": raw.pop("aicpu_scheduler_phases")[0]},
+            {"producer": "aicore", "records": [{"start_cycles": 1800, "end_cycles": 2300}]},
+        ],
+    }
+    capture = containment.capture_windows(raw)
+    assert capture.extent == (1800, 2300)
+    # The Host log's AICPU sched phase does not bracket AICore producers.
+    assert capture.windows["sched"] == (1900, 1950)

@@ -35,7 +35,7 @@ __attribute__((visibility("default"))) OrchestrationConfig
 allreduce_bidirectional_ring_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;
     return OrchestrationConfig{
-        .expected_arg_count = 5,  // 3 tensors + 2 scalars
+        .expected_arg_count = 6,  // 3 tensors + 3 scalars
     };
 }
 
@@ -44,12 +44,25 @@ __attribute__((visibility("default"))) void allreduce_bidirectional_ring_orchest
     const simpler::tmr::Tensor &output = orch_args.tensor(1).ref();
     const simpler::tmr::Tensor &scratch = orch_args.tensor(2).ref();
 
+    // TPUT<AtomicAdd> only supports Sum reduction (CollectiveReduceOp::kSum == 0
+    // in simpler_setup/incore/collectives_reduce_op.hpp); the AIV kernel silently
+    // skips writing `output` for any other op, so reject before submission.
+    uint64_t reduce_op = orch_args.scalar(2);
+    if (reduce_op != 0) {
+        rt_report_fatal(
+            SIMPLER_ERROR_INVALID_ARGS, "allreduce_bidirectional_ring_orch: reduce_op=%llu unsupported, only Sum (0)",
+            static_cast<unsigned long long>(reduce_op)
+        );
+        return;
+    }
+
     CoreTaskArgs params;
     params.add_input(input);
     params.add_output(output);
     params.add_inout(scratch);
     params.add_scalar(orch_args.scalar(0));  // nranks
     params.add_scalar(orch_args.scalar(1));  // CommContext
+    params.add_scalar(orch_args.scalar(2));  // reduce_op
     rt_submit_aiv_task(0, params);
 }
 

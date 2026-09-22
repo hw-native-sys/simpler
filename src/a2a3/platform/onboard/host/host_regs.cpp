@@ -219,20 +219,60 @@ int init_aicore_register_addresses(
     }
 
     size_t regs_size = host_regs.size() * sizeof(int64_t);
-    void *reg_ptr = allocator.alloc(regs_size);
-    if (reg_ptr == nullptr) {
-        LOG_ERROR("Failed to allocate device memory for %s register addresses", kind_to_name(kind));
-        return PTO_RUNTIME_ERR_INTERNAL;
+
+    // Retain the caller-owned block from an earlier failed release.
+    // Reuse it after validating ownership and capacity below, so allocating
+    // a replacement cannot overwrite the only handle to the old block.
+    void *reg_ptr = reinterpret_cast<void *>(*runtime_regs_ptr);
+    const bool reusing_retained = reg_ptr != nullptr;
+    if (reusing_retained) {
+        // Require an allocation owned by this allocator, starting at reg_ptr,
+        // with enough capacity for this upload. This prevents an out-of-bounds
+        // copy; it does not validate device or register-kind identity.
+        void *base = nullptr;
+        size_t retained_size = 0;
+        if (!allocator.owning_allocation(reg_ptr, &base, &retained_size) || base != reg_ptr ||
+            retained_size < regs_size) {
+            LOG_ERROR(
+                "init_aicore_register_addresses: retained table 0x%llx is %zu bytes but this attempt needs %zu",
+                static_cast<unsigned long long>(*runtime_regs_ptr), retained_size, regs_size
+            );
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+    }
+    if (!reusing_retained) {
+        reg_ptr = allocator.alloc(regs_size);
+        if (reg_ptr == nullptr) {
+            LOG_ERROR("Failed to allocate device memory for %s register addresses", kind_to_name(kind));
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        // Recorded before the copy, and cleared on failure only when the
+        // release succeeded: a caller that has to retry a teardown needs the
+        // address of a block whose free failed, and `MemoryAllocator` is not a
+        // reportable owner — its finalize() clears the tracking map even when
+        // rtFree fails.
+        *runtime_regs_ptr = reinterpret_cast<uint64_t>(reg_ptr);
     }
 
     int ret = rtMemcpy(reg_ptr, regs_size, host_regs.data(), regs_size, RT_MEMCPY_HOST_TO_DEVICE);
     if (ret != 0) {
         LOG_ERROR("Failed to copy %s register addresses to device (rc=%d)", kind_to_name(kind), ret);
-        allocator.free(reg_ptr);
+        if (reusing_retained) {
+            // Already the caller's to release, and its previous release failed;
+            // retrying that belongs to teardown, not to preparation.
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        if (allocator.free(reg_ptr) == 0) {
+            *runtime_regs_ptr = 0;
+        } else {
+            LOG_ERROR(
+                "init_aicore_register_addresses(%s): release of the rolled-back table failed; retaining 0x%llx for "
+                "the caller to retry",
+                kind_to_name(kind), static_cast<unsigned long long>(*runtime_regs_ptr)
+            );
+        }
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-
-    *runtime_regs_ptr = reinterpret_cast<uint64_t>(reg_ptr);
 
     LOG_DEBUG(
         "Successfully initialized %s register addresses: %zu addresses at device 0x%llx", kind_to_name(kind),

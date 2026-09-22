@@ -11,30 +11,35 @@
 #pragma once
 
 /**
- * The bounded pool of threads that record Graph bodies, and the copy of a boundary's
- * arguments each queued recording owns.
+ * The bounded pool of threads that record Graph bodies.
  *
  * Runtime-owned, and only in the host target: one pool per process, serving every
  * registered callable. It used to live in orchestration_api.h, which put a
- * function-local static — and therefore a pool, eight threads and their recording
- * storage — inside every orchestration .so. Those are dlopen'd one per callable with
- * RTLD_LOCAL and are not released as cases finish, so a process held one pool per
- * registered callable: measured at 3 concurrently mapped orchestration images over a
- * four-case pytest session and 5 over the a2a3 host_build_graph corpus, i.e. 24-40
- * recorder threads where 8 suffice.
+ * function-local static — and therefore a pool and eight threads — inside every
+ * orchestration .so. Those are dlopen'd one per callable with RTLD_LOCAL and are not
+ * released as cases finish, so a process held one pool per registered callable: measured
+ * at 3 concurrently mapped orchestration images over a four-case pytest session and 5
+ * over the a2a3 host_build_graph corpus, i.e. 24-40 recorder threads where 8 suffice.
  *
  * A worker runs jobs the orchestration .so builds (each captures that .so's generated
- * orchestration function), reached through the ops table. Two properties make that
+ * orchestration function), reached through the ops table. Three properties make that
  * sound and are relied on here:
  *
- *   - No job outlives the bind that queued it. rt_orchestration_done() ->
- *     rt_graph_commit() -> graph_record_wait() drains the pool at the end of every
- *     orchestration, so a job's code cannot still be queued when unregister_callable
- *     dlcloses the .so it lives in.
+ *   - No job outlives the bind that queued it. The host entry's scope guard
+ *     drains that bind's jobs on both normal return and exception unwinding, before its
+ *     build state is released. A job's code cannot still be queued when the
+ *     caller subsequently unregisters the callable and dlcloses its .so.
  *   - The runtime a job binds to is a plain global in its own .so
  *     (orchestration/common.cpp, deliberately not thread_local), so a worker shared
  *     across callables reads the right one: the job's own inlined code reads its own
  *     .so's global.
+ *   - **The boundary a job reads is owned by the in-flight entry, not by this pool.**
+ *     start() forwards that reference rather than copying the arguments, so the entry
+ *     must outlive the job. It does: graph_end only marks the entry, and graph_commit
+ *     frees it only after waiting for every recording to finish. Teardown does not
+ *     escape that either -- shutdown() drains the queue before it sets stopping_, so a
+ *     worker's stopping_ exit always finds an empty queue and no job runs after the
+ *     entry it would read.
  */
 
 #include <pthread.h>
@@ -45,6 +50,7 @@
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -54,62 +60,9 @@
 #include "graph_host_state.h"        // GRAPH_MAX_DEFINITIONS
 #include "host_build_graph/types.h"  // GraphTaskArgs, GRAPH_MAX_{TENSOR,SCALAR}_ARGS
 
-class GraphOwnedArgs {
-public:
-    GraphOwnedArgs() { std::memset(tensors_.data(), 0, sizeof(tensors_)); }
-
-    // The arrays below are sized to the Graph boundary's own capacity, so a
-    // source GraphTaskArgs cannot report more args than they hold and the copy
-    // loops need no runtime bound.
-    void assign(const GraphTaskArgs &source) {
-        args_.reset();
-        for (int32_t i = 0; i < source.tensor_count(); ++i) {
-            tensors_[static_cast<size_t>(i)].copy(source.tensor(i).ref());
-            switch (source.tag(i)) {
-            case TensorArgType::INPUT:
-                args_.add_input(tensors_[static_cast<size_t>(i)]);
-                break;
-            case TensorArgType::OUTPUT_EXISTING:
-                args_.add_output(tensors_[static_cast<size_t>(i)]);
-                break;
-            case TensorArgType::INOUT:
-                args_.add_inout(tensors_[static_cast<size_t>(i)]);
-                break;
-            case TensorArgType::NO_DEP:
-                args_.add_no_dep(tensors_[static_cast<size_t>(i)]);
-                break;
-            case TensorArgType::OUTPUT:
-                args_.set_error("Runtime-allocated output is not supported at a Graph boundary");
-                break;
-            }
-        }
-        for (int32_t i = 0; i < source.scalar_count(); ++i) {
-            scalars_[static_cast<size_t>(i)] = source.scalar(i);
-            args_.add_scalar(scalars_[static_cast<size_t>(i)]);
-        }
-        args_.launch_spec = source.launch_spec;
-        args_.set_allow_early_resolve(source.allow_early_resolve());
-        if (source.task_timing_slot() != TASK_TIMING_SLOT_NONE) {
-            args_.set_task_timing_slot(source.task_timing_slot());
-        }
-        args_.set_predicate(source.predicate());
-    }
-
-    GraphTaskArgs &args() { return args_; }
-
-private:
-    std::array<simpler::hbg::Tensor, GRAPH_MAX_TENSOR_ARGS> tensors_{};
-    std::array<uint64_t, GRAPH_MAX_SCALAR_ARGS> scalars_{};
-    GraphTaskArgs args_;
-};
-
 class GraphAsyncRecordingState {
 public:
-    GraphAsyncRecordingState() {
-        for (size_t i = 0; i < kJobCapacity; ++i) {
-            free_owned_args_[i] = kJobCapacity - i - 1;
-        }
-    }
+    GraphAsyncRecordingState() = default;
     ~GraphAsyncRecordingState() { shutdown(); }
 
     GraphAsyncRecordingState(const GraphAsyncRecordingState &) = delete;
@@ -132,31 +85,32 @@ public:
         return !stopping_ && !storage_failed_ && target == kPrewarmedWorkerCount;
     }
 
+    // `args` is the in-flight entry's own boundary and is only forwarded, never copied:
+    // the entry outlives every job that reads it. graph_commit frees an entry only once
+    // every recording has left RECORDING, and the host orchestration entry's scope guard
+    // joins its own jobs before its build state is released. Const because that boundary is
+    // shared -- the submitting thread compares later same-key submissions against it
+    // while a worker records.
     template <typename Job>
-    bool start(const GraphTaskArgs &args, Job &&job) {
-        std::function<void(GraphTaskArgs &)> next;
+    bool start(const GraphTaskArgs &args, Job &&job, const void *owner = nullptr) {
+        std::function<void(const GraphTaskArgs &)> next;
         try {
             next = std::forward<Job>(job);
         } catch (...) {
             return false;
         }
 
-        size_t owned_args_index;
-        {
-            std::scoped_lock lock(mutex_);
-            if (stopping_ || free_owned_args_count_ == 0 || job_count_ == kJobCapacity) return false;
-            owned_args_index = free_owned_args_[--free_owned_args_count_];
-        }
-        owned_args_[owned_args_index].assign(args);
-
         std::unique_lock<std::mutex> lock(mutex_);
-        if (stopping_) {
-            free_owned_args_[free_owned_args_count_++] = owned_args_index;
+        if (stopping_ || job_count_ == kJobCapacity) return false;
+        try {
+            if (owner != nullptr) ++pending_by_owner_[owner];
+        } catch (...) {
             return false;
         }
         PendingJob &pending = jobs_[job_tail_];
-        pending.function = std::move(next);
-        pending.owned_args_index = owned_args_index;
+        pending.function.swap(next);
+        pending.args = &args;
+        pending.owner = owner;
         job_tail_ = (job_tail_ + 1) % kJobCapacity;
         job_count_++;
         const size_t desired_workers = std::min(kMaxWorkerCount, job_count_ + active_jobs_);
@@ -167,12 +121,15 @@ public:
             job_tail_ = (job_tail_ + kJobCapacity - 1) % kJobCapacity;
             PendingJob &rollback = jobs_[job_tail_];
             rollback.function = {};
+            rollback.args = nullptr;
+            finish_owner_locked(rollback.owner);
+            rollback.owner = nullptr;
             job_count_--;
-            free_owned_args_[free_owned_args_count_++] = rollback.owned_args_index;
             return false;
         }
         lock.unlock();
-        cv_.notify_one();
+        // Workers and owner-specific waiters share this condition variable.
+        cv_.notify_all();
         // graph_begin() has already installed the keyed in-flight entry and
         // submitted the zero-heap outer shell. Enqueuing the private job is
         // therefore the last dependency of the caller; graph_prepare() and the
@@ -180,15 +137,19 @@ public:
         return true;
     }
 
-    // Wait for every queued and running recording. A recording thread returns
+    // A non-null owner waits for its queued and running jobs, including closure
+    // destruction. The caller keeps the owner alive through its final drain;
+    // no submitting thread may enqueue more of that owner's jobs afterwards.
+    // A null owner drains the whole pool. A recording thread returns
     // immediately: it may reach this through rt_orchestration_done in a Graph body
     // and must never wait for its own job, nor for a sibling's — the sibling makes
     // progress independently and waiting on it would trade a recording thread for
     // nothing.
-    void wait() {
+    void wait(const void *owner = nullptr) {
         std::unique_lock<std::mutex> lock(mutex_);
         if (is_worker_thread_locked(std::this_thread::get_id())) return;
         cv_.wait(lock, [&]() {
+            if (owner != nullptr) return pending_by_owner_.find(owner) == pending_by_owner_.end();
             return job_count_ == 0 && active_jobs_ == 0;
         });
     }
@@ -235,9 +196,17 @@ private:
     static constexpr size_t kJobCapacity = GRAPH_MAX_DEFINITIONS;
 
     struct PendingJob {
-        std::function<void(GraphTaskArgs &)> function;
-        size_t owned_args_index{0};
+        std::function<void(const GraphTaskArgs &)> function;
+        // The in-flight entry's boundary. Borrowed, not owned -- see start().
+        const GraphTaskArgs *args{nullptr};
+        const void *owner{nullptr};
     };
+
+    void finish_owner_locked(const void *owner) {
+        if (owner == nullptr) return;
+        auto it = pending_by_owner_.find(owner);
+        if (--it->second == 0) pending_by_owner_.erase(it);
+    }
 
     bool is_worker_thread_locked(std::thread::id id) const {
         for (const std::thread &worker : workers_) {
@@ -287,18 +256,22 @@ private:
                 });
                 if (stopping_ && job_count_ == 0) return;
                 PendingJob &pending = jobs_[job_head_];
-                current.function = std::move(pending.function);
-                current.owned_args_index = pending.owned_args_index;
+                // The queue slot releases its closure before the job can finish.
+                current.function.swap(pending.function);
+                current.args = pending.args;
+                current.owner = pending.owner;
+                pending.args = nullptr;
+                pending.owner = nullptr;
                 job_head_ = (job_head_ + 1) % kJobCapacity;
                 job_count_--;
                 active_jobs_++;
             }
-            current.function(owned_args_[current.owned_args_index].args());
+            current.function(*current.args);
             current.function = {};
             {
                 std::scoped_lock lock(mutex_);
-                free_owned_args_[free_owned_args_count_++] = current.owned_args_index;
                 active_jobs_--;
+                finish_owner_locked(current.owner);
             }
             cv_.notify_all();
         }
@@ -326,10 +299,8 @@ private:
     std::vector<std::thread> workers_;
     std::mutex mutex_;
     std::condition_variable cv_;
-    std::array<GraphOwnedArgs, kJobCapacity> owned_args_;
-    std::array<size_t, kJobCapacity> free_owned_args_{};
     std::array<PendingJob, kJobCapacity> jobs_;
-    size_t free_owned_args_count_{kJobCapacity};
+    std::unordered_map<const void *, size_t> pending_by_owner_;
     size_t job_head_{0};
     size_t job_tail_{0};
     size_t job_count_{0};

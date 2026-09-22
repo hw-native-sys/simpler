@@ -17,6 +17,7 @@ from typing import Optional
 
 import pytest
 
+from simpler_setup.scene_test import DUMP_ARGS_MODES
 from simpler_setup.tools import core_swimlane
 
 
@@ -72,7 +73,9 @@ def _write_dump(
                     "byte_order": "little_endian",
                 },
                 "bin_file": bin_file,
-                "dump_args_level": 3,
+                # The fixture models a hybrid dump: every task in the manifest,
+                # payload only for Arg::dump()-marked tensors.
+                "dump_args_level": DUMP_ARGS_MODES["hybrid"],
                 "args": records,
             }
         )
@@ -204,7 +207,7 @@ def test_restore_arg_rejects_scalar_slot(tmp_path):
         core_swimlane.restore_arg_payloads(manifest, kargs, [17])
 
 
-def test_get_or_run_dump_uses_level3_without_payload_selector(tmp_path, monkeypatch):
+def test_get_or_run_dump_uses_hybrid_without_payload_selector(tmp_path, monkeypatch):
     commands = []
     monkeypatch.setattr(core_swimlane, "PROJECT_ROOT", tmp_path)
 
@@ -218,7 +221,7 @@ def test_get_or_run_dump_uses_level3_without_payload_selector(tmp_path, monkeypa
     manifest = core_swimlane.get_or_run_dump(tmp_path / "test_case.py", "a2a3sim", "sim", None)
 
     flag_index = commands[0].index("--dump-args")
-    assert commands[0][flag_index + 1] == "3"
+    assert commands[0][flag_index + 1] == "hybrid"
     assert not any(value.startswith("--dump-args-payload") for value in commands[0])
     assert manifest.name == "args_dump.json"
 

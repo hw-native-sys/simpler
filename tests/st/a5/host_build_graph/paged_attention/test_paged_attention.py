@@ -132,6 +132,26 @@ class TestPagedAttentionHostBuildGraphA5(SceneTestCase):
             },
         },
         {
+            # Same workload as SmallCase1 with every tensor in child memory,
+            # including the context_lens and block_table this orchestration
+            # reads on the host to shape the graph. a5 onboard has no host-map
+            # path, so this is also the arch where those reads are served by
+            # device copies rather than by a mapping.
+            "name": "SmallCase1ChildMemory",
+            "platforms": ["a5sim", "a5"],
+            "params": {
+                "batch": 1,
+                "num_heads": 16,
+                "kv_head_num": 1,
+                "head_dim": 16,
+                "block_size": 16,
+                "context_len": 33,
+                "max_model_len": 256,
+                "dtype": "bfloat16",
+                "child_memory": True,
+            },
+        },
+        {
             "name": "SmallCase2",
             "platforms": ["a5sim", "a5"],
             "manual": True,
@@ -182,10 +202,11 @@ class TestPagedAttentionHostBuildGraphA5(SceneTestCase):
 
     def generate_args(self, params):
         inputs = _pa_generate_inputs(params)
+        child_memory = params.get("child_memory", False)
         specs = []
         for name, val in inputs:
             if isinstance(val, torch.Tensor):
-                specs.append(TensorArg(name, val))
+                specs.append(TensorArg(name, val, child_memory=child_memory))
             else:
                 specs.append(Scalar(name, val))
         return TaskArgsBuilder(*specs)

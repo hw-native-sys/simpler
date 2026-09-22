@@ -18,6 +18,7 @@ namespace {
 int g_orch_device_id = 0;
 int g_scheduler_timeout_ms = 0;
 unsigned long long g_dma_workspace_addr[DMA_WORKSPACE_KIND_COUNT] = {0};
+unsigned long long g_l2_cache_offset = 0;
 }  // namespace
 
 void set_orch_device_id(int device_id) { g_orch_device_id = device_id; }
@@ -37,3 +38,7 @@ unsigned long long get_dma_workspace_addr(int kind) {
     if (kind < 0 || kind >= DMA_WORKSPACE_KIND_COUNT) return 0;
     return g_dma_workspace_addr[kind];
 }
+
+void set_dev_l2_cache_offset(unsigned long long offset) { g_l2_cache_offset = offset; }
+
+unsigned long long get_dev_l2_cache_offset() { return g_l2_cache_offset; }

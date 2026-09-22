@@ -84,11 +84,11 @@ void read_alloc_tensors_output() {
     (void)get_tensor_data<int32_t>(outs.get_ref(0), 1, index);
 }
 
-// An IN_GRAPH id names storage inside one Graph task's body, not a task-table slot,
+// A SUB_TASK id names storage inside one modular task's body, not a task-table slot,
 // so it can never be a fanin producer. Declaring one as an explicit dependency is
 // the caller error append_fanin_or_fail rejects.
-void submit_task_depending_on_in_graph_task() {
-    const TaskId deps[1] = {TaskId::make_in_graph(/*graph_task_id=*/1, /*in_graph_local_id=*/0)};
+void submit_task_depending_on_sub_task() {
+    const TaskId deps[1] = {TaskId::make_sub_task(/*parent_id=*/1, /*local_id=*/0)};
     CoreTaskArgs args;
     args.launch_spec.set_block_num(1);
     args.set_dependencies(deps, 1);
@@ -106,7 +106,7 @@ __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_c
 
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &orch_args) {
     const simpler::hbg::Tensor &external = orch_args.tensor(0).ref();
-    uint64_t case_id = orch_args.scalar(0);
+    uint64_t case_id = orch_args.scalar<uint64_t>(0);
     uint32_t index[1] = {0};
 
     switch (case_id) {
@@ -123,7 +123,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         set_tensor_data<int32_t>(tensor_with_unbound_owner(external), 1, index, 7);
         return;
     case 4:
-        submit_task_depending_on_in_graph_task();
+        submit_task_depending_on_sub_task();
         return;
     case 5:
         read_output_of_submitted_task();

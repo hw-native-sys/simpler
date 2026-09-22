@@ -204,6 +204,20 @@ template <typename Record, size_t N>
 struct TypedBuffer {
     Record records[N];
     volatile uint32_t count;
+    // Which run's records these are, stamped once when the buffer is acquired
+    // and not rewritten while it is owned. The host copies identity out with
+    // the records, so a host-side copy keeps its run after the device buffer
+    // has been returned to the pool and re-stamped by a later run. Zero when
+    // the producer had no run identity to stamp.
+    //
+    // These land in the alignment tail the `records[] + count` layout already
+    // had, so the buffer does not grow — the size assertions below hold that.
+    uint64_t run_epoch;
+    // Buffer generation within that run. Restarts per run, so it identifies a
+    // buffer only together with `run_epoch`. Distinct from
+    // `ChipSwimlaneActiveHead::current_buf_seq`, which AICore reads as a
+    // rotation generation and which must keep that meaning.
+    uint32_t local_seq;
 } __attribute__((aligned(64)));
 
 using ChipSwimlaneAicpuTaskBuffer = TypedBuffer<ChipSwimlaneAicpuTaskRecord, PLATFORM_PROF_BUFFER_SIZE>;
@@ -223,6 +237,21 @@ static_assert(
 // burst depth alongside the AICPU and Phase pools.
 
 using ChipSwimlaneAicoreTaskBuffer = TypedBuffer<ChipSwimlaneAicoreTaskRecord, PLATFORM_AICORE_BUFFER_SIZE>;
+
+// The run identity in TypedBuffer costs no device memory: it occupies the
+// alignment tail `records[] + count` already had. These pin that — a record
+// size or capacity change that makes identity grow the buffer has to be a
+// deliberate decision, not a silent allocation increase on every core's pool.
+static_assert(
+    sizeof(ChipSwimlaneAicpuTaskBuffer) ==
+        ((sizeof(ChipSwimlaneAicpuTaskRecord) * PLATFORM_PROF_BUFFER_SIZE + 4 + 63) / 64) * 64,
+    "run identity grew ChipSwimlaneAicpuTaskBuffer past its former alignment tail"
+);
+static_assert(
+    sizeof(ChipSwimlaneAicoreTaskBuffer) ==
+        ((sizeof(ChipSwimlaneAicoreTaskRecord) * PLATFORM_AICORE_BUFFER_SIZE + 4 + 63) / 64) * 64,
+    "run identity grew ChipSwimlaneAicoreTaskBuffer past its former alignment tail"
+);
 
 // =============================================================================
 // ChipSwimlaneFreeQueue - SPSC Lock-Free Queue for Free Buffers
@@ -286,14 +315,154 @@ static_assert(sizeof(ChipSwimlaneFreeQueue) == 128, "ChipSwimlaneFreeQueue must 
  * old buffer before AICPU enqueues it to ready_queue.
  */
 struct ChipSwimlaneActiveHead {
-    volatile uint64_t current_buf_ptr;       // 8 — active buffer device address (0 = none)
-    volatile uint32_t current_buf_seq;       // 4 — monotonic seq / AICore rotation generation
-    volatile uint32_t total_record_count;    // 4 — producer-attempted writes
-    volatile uint32_t dropped_record_count;  // 4 — producer-dropped writes
-    uint32_t pad[11];                        // 44 → 64B
+    volatile uint64_t current_buf_ptr;         // 8 — active buffer device address (0 = none)
+    volatile uint32_t current_buf_seq;         // 4 — monotonic seq / AICore rotation generation
+    volatile uint32_t total_record_count;      // 4 — producer-attempted writes
+    volatile uint32_t dropped_record_count;    // 4 — producer-dropped writes
+    volatile uint32_t live_record_count;       // 4 — writes into the buffer currently active
+    volatile uint32_t published_record_count;  // 4 — writes in buffers handed to the host
+    volatile uint32_t published_buffer_count;  // 4 — buffers handed to the host, zero-record ones included
+    uint32_t pad[8];                           // 32 → 64B
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(ChipSwimlaneActiveHead) == 64, "ChipSwimlaneActiveHead must be one cache line");
+// `publish_run_config` resets the cumulative counters with one narrow write
+// over this contiguous span, so a gap here would leave a counter carrying the
+// previous run's value into the next one.
+static_assert(offsetof(ChipSwimlaneActiveHead, total_record_count) == 12, "cumulative counter span drift");
+static_assert(offsetof(ChipSwimlaneActiveHead, published_buffer_count) == 28, "cumulative counter span drift");
+
+/**
+ * Add `n` to a cumulative producer counter without wrapping.
+ *
+ * A wrapped counter is indistinguishable from a small one, and two counters
+ * wrapping together can make a producer that lost 2^32 records read as one
+ * that produced nothing. Saturating instead makes UINT32_MAX a reliable
+ * "this count is no longer exact" sentinel that every reader can test.
+ *
+ * Single-writer: the owning AICPU thread is the only mutator of a given head.
+ */
+inline void chip_swimlane_add_saturating(volatile uint32_t &counter, uint32_t n) {
+    const uint32_t current = counter;
+    counter = (n > UINT32_MAX - current) ? UINT32_MAX : current + n;
+}
+
+// =============================================================================
+// ChipSwimlaneRunTerminal - per-run terminal accounting snapshot
+// =============================================================================
+
+/**
+ * One producer's final record accounting for one run, retained past that run.
+ *
+ * `publish_run_config` zeroes every pool head at each `begin_run`, so a run's
+ * totals do not survive its successor. A producer copies its settled counters
+ * here at its last flush; the entry stays readable until its bank is reused.
+ *
+ * `run_epoch` is the run identity the producer was executing under. Zero means
+ * "no snapshot": it is the initialized state, and it is not a value a live run
+ * can carry (`device_run_result.h` treats `run_epoch != 0` as the validity
+ * test). There is no separate state flag — a matching non-zero epoch is the
+ * whole test, and a second field would imply a concurrent publication protocol
+ * this design does not provide.
+ *
+ * `total` and `dropped` are the two counters every pool class maintains.
+ * `published_records` / `published_buffers` are what the producer actually
+ * handed to the host, which no other field states: `total - dropped` counts
+ * what the producer *meant* to deliver, and a handoff can still be lost
+ * afterwards without either moving. `live_at_close` records whatever was still
+ * in the active buffer when the producer closed; a non-zero value means the
+ * settlement step did not run, so the other figures are not a closed set.
+ * Retaining `live_at_close` is also what keeps a reader from having to inspect
+ * the live head after the fence — a head a later run may already have reused.
+ *
+ * One entry per cache line, and the array start is line-aligned. The producer
+ * publishes with `cache_flush_range`, which rounds to whole 64-byte lines, so
+ * two entries sharing a line would let one producer's flush write back a stale
+ * copy of the other's.
+ */
+struct ChipSwimlaneRunTerminal {
+    volatile uint64_t run_epoch;          // 8 — 0 = no snapshot in this entry
+    volatile uint32_t total;              // 4 — total_record_count when the producer closed
+    volatile uint32_t dropped;            // 4 — dropped_record_count when the producer closed
+    volatile uint32_t published_records;  // 4 — records in buffers committed to the ready queue
+    volatile uint32_t published_buffers;  // 4 — successful ready-queue commits
+    volatile uint32_t live_at_close;      // 4 — records still unsettled in the active buffer
+    uint32_t pad[9];                      // 36 → 64B
+} __attribute__((aligned(64)));
+
+static_assert(sizeof(ChipSwimlaneRunTerminal) == 64, "ChipSwimlaneRunTerminal must be one cache line");
+static_assert(alignof(ChipSwimlaneRunTerminal) == 64, "ChipSwimlaneRunTerminal must be cache-line aligned");
+static_assert(offsetof(ChipSwimlaneRunTerminal, total) == 8, "ChipSwimlaneRunTerminal::total offset drift");
+static_assert(offsetof(ChipSwimlaneRunTerminal, dropped) == 12, "ChipSwimlaneRunTerminal::dropped offset drift");
+static_assert(
+    offsetof(ChipSwimlaneRunTerminal, published_records) == 16,
+    "ChipSwimlaneRunTerminal::published_records offset drift"
+);
+static_assert(
+    offsetof(ChipSwimlaneRunTerminal, published_buffers) == 20,
+    "ChipSwimlaneRunTerminal::published_buffers offset drift"
+);
+static_assert(
+    offsetof(ChipSwimlaneRunTerminal, live_at_close) == 24, "ChipSwimlaneRunTerminal::live_at_close offset drift"
+);
+// The device writes this entry and the host reads it back with a raw byte copy,
+// so it is a wire struct. The compiler builtins are used rather than the
+// `<type_traits>` spellings because this header is also compiled by ccec, which
+// the standard library headers are not available to.
+static_assert(__is_trivially_copyable(ChipSwimlaneRunTerminal), "ChipSwimlaneRunTerminal must be memcpy-able");
+static_assert(__is_standard_layout(ChipSwimlaneRunTerminal), "ChipSwimlaneRunTerminal must be standard-layout");
+
+/**
+ * Producers that own a terminal entry, in bank order.
+ *
+ * The grid is dimensioned by platform maxima for the same reason the pool
+ * arrays are: host and device must address it from a basis they cannot
+ * disagree about.
+ */
+constexpr int PLATFORM_RUN_TERMINAL_AICPU_TASK_BASE = 0;
+constexpr int PLATFORM_RUN_TERMINAL_AICORE_TASK_BASE = PLATFORM_MAX_CORES;
+constexpr int PLATFORM_RUN_TERMINAL_SCHED_PHASE_BASE = 2 * PLATFORM_MAX_CORES;
+constexpr int PLATFORM_RUN_TERMINAL_ORCH_PHASE_BASE = 2 * PLATFORM_MAX_CORES + PLATFORM_MAX_AICPU_THREADS;
+constexpr int PLATFORM_RUN_TERMINAL_PRODUCERS = 2 * PLATFORM_MAX_CORES + 2 * PLATFORM_MAX_AICPU_THREADS;
+
+// One bank per retained run. This file is compiled by ccec for AICore, which
+// must not pull in the host worker API, so the pipeline depth is mirrored here
+// and cross-checked against PTO_PIPELINE_MAX_DEPTH in the host collector, where
+// both headers are visible.
+constexpr int PLATFORM_RUN_TERMINAL_BANKS = 2;
+
+inline size_t calc_run_terminal_bank_size() {
+    return static_cast<size_t>(PLATFORM_RUN_TERMINAL_PRODUCERS) * sizeof(ChipSwimlaneRunTerminal);
+}
+
+// A whole number of cache lines, so aligning the array start aligns every entry
+// in every bank rather than only the first bank's.
+static_assert(
+    (PLATFORM_RUN_TERMINAL_PRODUCERS * sizeof(ChipSwimlaneRunTerminal)) % 64 == 0,
+    "a terminal bank must be a whole number of cache lines"
+);
+
+// The AICore pool's four counters split every dispatch into exactly one bucket:
+// `live` while its buffer is still the active one, `published` once that buffer
+// has been handed to the host, `dropped` when the dispatch had nowhere to land.
+//
+// `published + live + dropped == total` is a **checkpoint** identity, not a
+// running invariant. A rotated-out buffer's count leaves `live` when the rotation
+// stashes it and joins `published` only when the ACK gate releases it, so between
+// those two points it is in neither — it is held in the AICPU-private
+// pending-enqueue slot. The identity therefore holds after a flush whose publishes
+// all succeeded, which is where the host reads these; it does not hold mid-run,
+// and a check that assumes otherwise reports a loss that is really a hand-off in
+// progress.
+static_assert(
+    offsetof(ChipSwimlaneActiveHead, dropped_record_count) ==
+            offsetof(ChipSwimlaneActiveHead, total_record_count) + sizeof(uint32_t) &&
+        offsetof(ChipSwimlaneActiveHead, live_record_count) ==
+            offsetof(ChipSwimlaneActiveHead, dropped_record_count) + sizeof(uint32_t) &&
+        offsetof(ChipSwimlaneActiveHead, published_record_count) ==
+            offsetof(ChipSwimlaneActiveHead, live_record_count) + sizeof(uint32_t),
+    "the four record counters must stay contiguous: the host clears them in one narrow write-back"
+);
 
 // =============================================================================
 // Pool layouts: every pool = ActiveHead (64B) + ChipSwimlaneFreeQueue (128B) = 192B
@@ -507,7 +676,7 @@ static_assert(sizeof(ChipSwimlaneAicpuOrchPhaseRecord) == 32, "ChipSwimlaneAicpu
  *
  * `payload` is kind-discriminated: a task id for the kinds that submit a task
  * (see host_phase_kind_submits_task), otherwise a per-kind detail count such as
- * a byte or in-graph task count. Readers must consult `kind` before interpreting it.
+ * a byte or sub-task count. Readers must consult `kind` before interpreting it.
  */
 struct HostPhaseRecord {
     uint64_t start_ns;
@@ -589,8 +758,8 @@ inline const char *host_phase_kind_name(HostPhaseKind kind) {
         return "submit_task";
     case HostPhaseKind::OrchAllocTensors:
         return "alloc_tensors";
-    case HostPhaseKind::OrchRecordInGraphTask:
-        return "record_in_graph_task";
+    case HostPhaseKind::OrchRecordSubTask:
+        return "record_sub_task";
     case HostPhaseKind::OrchGraphSubmit:
         return "graph_submit";
     case HostPhaseKind::OrchBuildDefinition:
@@ -703,6 +872,8 @@ inline ChipSwimlaneAicpuTaskPool *get_perf_buffer_state(void *base_ptr, int core
  *   [ChipSwimlaneAicoreTaskPool      × PLATFORM_MAX_CORES]
  *   [ChipSwimlaneAicpuSchedPhasePool × PLATFORM_MAX_AICPU_THREADS]
  *   [ChipSwimlaneAicpuOrchPhasePool  × PLATFORM_MAX_AICPU_THREADS]
+ *   [pad to 64B]
+ *   [ChipSwimlaneRunTerminal × PLATFORM_RUN_TERMINAL_PRODUCERS × BANKS]
  *
  * Every array is dimensioned by a platform maximum, not by the run. The host
  * and the AICPU both address this region, and each used to supply its own core
@@ -714,10 +885,24 @@ inline ChipSwimlaneAicpuTaskPool *get_perf_buffer_state(void *base_ptr, int core
  *
  * @return Total bytes needed for header + all buffer states
  */
-inline size_t calc_perf_data_size_with_phases() {
+inline size_t calc_perf_data_size_before_run_terminals() {
     return calc_perf_data_size(PLATFORM_MAX_CORES) + PLATFORM_MAX_CORES * sizeof(ChipSwimlaneAicoreTaskPool) +
            PLATFORM_MAX_AICPU_THREADS * sizeof(ChipSwimlaneAicpuSchedPhasePool) +
            PLATFORM_MAX_AICPU_THREADS * sizeof(ChipSwimlaneAicpuOrchPhasePool);
+}
+
+// Smallest byte offset the terminal bank array may start at: past everything
+// before it, with no alignment assumption of its own. The array's actual start
+// is the next cache line at or after `base + this`, computed on the absolute
+// address by `get_run_terminal_bank` — rounding the offset alone would only
+// line up the entries if the region base were itself line-aligned, which no
+// allocator on either side of this promises.
+inline size_t run_terminal_min_offset() { return calc_perf_data_size_before_run_terminals(); }
+
+inline size_t calc_perf_data_size_with_phases() {
+    // The 63 bytes are the alignment slack the accessor may consume.
+    return run_terminal_min_offset() + 63 +
+           static_cast<size_t>(PLATFORM_RUN_TERMINAL_BANKS) * calc_run_terminal_bank_size();
 }
 
 /**
@@ -770,6 +955,30 @@ inline ChipSwimlaneAicpuOrchPhasePool *get_orch_phase_buffer_states(void *base_p
 
 inline ChipSwimlaneAicpuOrchPhasePool *get_orch_phase_buffer_state(void *base_ptr, int thread_idx) {
     return &get_orch_phase_buffer_states(base_ptr)[thread_idx];
+}
+
+/**
+ * First terminal entry of one retained bank.
+ *
+ * The host resolves this for the run's actual pipeline slot and hands the
+ * device pointer over in KernelArgs; the device never derives a bank from a
+ * slot it does not have.
+ */
+inline ChipSwimlaneRunTerminal *get_run_terminal_bank(void *base_ptr, int bank_index) {
+    // Aligned on the absolute address, not on the offset: the flush that
+    // publishes an entry writes back whole cache lines, so an entry straddling a
+    // line boundary would let one producer's flush restore a stale copy of its
+    // neighbour's. A bank's size is a whole number of lines, so aligning the
+    // array start aligns every entry.
+    const uintptr_t unaligned = reinterpret_cast<uintptr_t>(base_ptr) + run_terminal_min_offset();
+    const uintptr_t array_start = (unaligned + 63) & ~static_cast<uintptr_t>(63);
+    return reinterpret_cast<ChipSwimlaneRunTerminal *>(
+        array_start + static_cast<size_t>(bank_index) * calc_run_terminal_bank_size()
+    );
+}
+
+inline ChipSwimlaneRunTerminal *get_run_terminal(ChipSwimlaneRunTerminal *bank, int producer_index) {
+    return &bank[producer_index];
 }
 
 #ifdef __cplusplus

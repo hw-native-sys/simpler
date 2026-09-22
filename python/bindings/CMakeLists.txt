@@ -52,6 +52,7 @@ target_compile_definitions(_task_interface PRIVATE
 target_sources(_task_interface PRIVATE
     ${CMAKE_SOURCE_DIR}/src/common/worker/chip_worker.cpp
     ${CMAKE_SOURCE_DIR}/src/common/worker/chip_run_lane.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/worker/device_fault_monitor_host.cpp
     ${CMAKE_SOURCE_DIR}/src/common/log/host_log.cpp
     ${CMAKE_SOURCE_DIR}/src/common/log/unified_log_host.cpp
     # Host-side assert_impl / get_stacktrace for the unified Tensor's

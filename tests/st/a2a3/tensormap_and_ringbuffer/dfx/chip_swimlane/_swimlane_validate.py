@@ -77,10 +77,23 @@ def validate_perf_artifact(case_label: str, *, since: float, expected_task_count
     data = read_perf_data(perf)
     level = data.get("chip_swimlane_level")
     assert level in (1, 2, 3, 4), f"unexpected chip_swimlane_level: {level}"
+    # Identity reaches the artifact, not just the device buffer: every row carries
+    # the epoch the join keys on. One capture is one run, so exactly one epoch,
+    # and never 0 — that would mean the stamp never happened.
+    aicore_rows = raw["aicore_tasks"]
+    assert all(len(row) == 7 for row in aicore_rows), "an aicore_tasks row is not seven columns (missing run_epoch)"
+    aicore_epochs = {row[6] for row in aicore_rows}
+    assert len(aicore_epochs) == 1, f"a single capture produced more than one AICore epoch: {sorted(aicore_epochs)}"
+    assert 0 not in aicore_epochs, "aicore_tasks rows carry epoch 0, so the run identity was never stamped"
     if level >= 2:
         assert data.get("scheduler_task_producer") == "aicpu"
-        assert raw["scheduler_tasks"]["schema_version"] == 1
         assert raw["scheduler_tasks"]["producer"] == "aicpu"
+        task_epochs = {row[4] for row in raw["scheduler_tasks"]["records"]}
+        # Both streams describe the same run, so a disagreement means one of the
+        # two producers is stamping from a different source.
+        assert task_epochs == aicore_epochs, (
+            f"scheduler_tasks epochs {sorted(task_epochs)} disagree with aicore_tasks {sorted(aicore_epochs)}"
+        )
     tasks = data.get("tasks")
     assert isinstance(tasks, list), "tasks field missing or not a list"
     assert len(tasks) > 0, f"perf records empty under {perf}"
@@ -131,8 +144,13 @@ def validate_perf_artifact(case_label: str, *, since: float, expected_task_count
         str(perf),
     ]
     deps_sibling = Path(perf).parent / "deps.json"
-    if deps_sibling.exists():
-        sched_cmd += ["--deps-json", str(deps_sibling)]
+    assert deps_sibling.exists(), (
+        f"deps.json absent beside {perf.name} under {out_dir}. This smoke runs with --enable-dep-gen, so the "
+        f"DAG is expected; its absence means dep_gen collected nothing the completeness gate would emit, not "
+        f"that the tool was invoked wrongly. Grep the step's output for 'count mismatch' / 'silent_loss' to "
+        f"see what the collector lost."
+    )
+    sched_cmd += ["--deps-json", str(deps_sibling)]
     result = subprocess.run(sched_cmd, check=True, timeout=120, capture_output=True, text=True)
     for header in ("Part 1:", "Part 2:", "Part 5:", "Part 6:"):
         assert header in result.stdout, f"sched_overhead missing section header '{header}'\nstdout:\n{result.stdout}"

@@ -198,6 +198,11 @@ class _FakeChipImpl:
         # Set when _close_chip_run_lane ran while the device was still up.
         # Draining after finalize would wait on a device that is already gone.
         self.lane_closed_before_finalize: bool | None = None
+        self.admission_stopped = False
+
+    def _stop_chip_run_lane_admission(self) -> None:
+        """Reached only when the control loop could not establish resource ownership."""
+        self.admission_stopped = True
 
     def register_callable_from_blob(self, cid: int, addr: int) -> None:
         if self._register_error is not None:
@@ -235,7 +240,20 @@ class FakeChipWorker:
     """
 
     pipeline_depth = 1
+    launch_depth = 1
     committed_device_memory = 0
+
+    # Part of the surface the production chip loop drives, so a stand-in that
+    # omits either raises from inside the loop instead of publishing the
+    # command's response. `configure_launch_depth` is reached only above depth
+    # one; `set_exported_device_regions_live` runs after *every* control
+    # command, including a failed one, because a command that failed can still
+    # have left an exported region live.
+    def configure_launch_depth(self, depth: int) -> None:
+        self.launch_depth = int(depth)
+
+    def set_exported_device_regions_live(self, live: bool) -> None:
+        self.exported_device_regions_live = bool(live)
 
     def __init__(self, *, script: str = "ok", register_error: str | None = None) -> None:
         if script not in _SCRIPTS:

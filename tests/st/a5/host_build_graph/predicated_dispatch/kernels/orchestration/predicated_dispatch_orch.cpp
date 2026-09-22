@@ -57,7 +57,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     const simpler::hbg::Tensor &ext_Y = orch_args.tensor(1).ref();
     const simpler::hbg::Tensor &ext_gate = orch_args.tensor(2).ref();
 
-    uint64_t case_id = orch_args.scalar(0);
+    uint64_t case_id = orch_args.scalar<uint64_t>(0);
     if (case_id != 1 && case_id != 2) {
         rt_report_fatal(
             SIMPLER_ERROR_INVALID_ARGS, "unsupported case_id=%llu", static_cast<unsigned long long>(case_id)

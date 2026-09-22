@@ -26,20 +26,38 @@ initialization-time policy described in [logging.md](../logging.md).
 
 ## Where the records go
 
-The host logger writes to stderr until it is given a directory, and then it
-writes to `<directory>/host.<pid>.log` instead. The directory is
-`CallConfig.output_prefix` — the one every other diagnostic artifact already goes
-under — so a run that has one gets its host log beside its other artifacts, and a
-run that does not keeps its records on the console. There is no separate switch to
-configure, and the runtime never derives the path itself.
+The host logger writes to stderr until an output run enables file logging.
+Worker then binds the whole process tree to one stable transient directory,
+`${TMPDIR:-/tmp}/simpler-host-logs-<root-pid>-<uuid>/`, and each process writes
+`host.<pid>.log` there. Every later capture in that Worker session reuses the
+same spool, so deleting an earlier `CallConfig.output_prefix` cannot break the
+writer. The root process removes the spool at normal interpreter exit. Until it
+is bound, records stay on the console. An embedding that needs a persistent
+complete trace may explicitly call `_set_host_log_directory(path)` before the
+first output run; the automatic binder preserves an existing destination.
+
+After successful execution and validation of an HBG level-3/4 capture with Host
+recording armed and finished and an output prefix, native finalize
+flushes the executing process's log and exports a capture-local
+`host_clock_alignment.<pid>.log` beside the raw swimlane file, before completion
+is published. Level 4 enables Host records automatically; level 3 requires the
+independent `SIMPLER_HBG_HOST_PHASE_RECORDS_ENABLE=1` switch and an output prefix.
+This works for direct L2 and forked ChipWorker runs without SceneTest. The file
+contains only the current invocation's original alignment spans and is not the
+cumulative logger destination. It requires TIMING-or-finer logging. While the
+process is alive, use the session spool's `host.<pid>.log` files for ordinary
+messages or the complete Host call tree; prebind an explicit directory when that
+complete trace must survive process exit. The AICPU-launch marker is a TIMING Host-clock point sampled immediately
+before the launch API call (`dur=0`, `depth=2`), not a Device-start or
+launch-completion timestamp.
 
 **The destination belongs to the logger, not to a record.** Everything that logger
-writes follows it: `LOG_*` records, `[STRACE]` spans, `[CLOCK_ANCHOR]`, the
-`host-orch phase=` cost-share summaries, and the spans Python emits through
+writes follows it: `LOG_*` records, `[STRACE]` spans, the `host-orch phase=`
+cost-share summaries, and the spans Python emits through
 `unified_log_host_span`. Nothing declares an intent and no record kind is treated
 specially, so there is no state in which part of a run's log is in one place and
-part in another. The first non-empty directory in a process wins, and it is the
-destination rather than a preference: a record the file cannot take — a path
+part in another. The first non-empty session or explicit directory in a process
+wins, and it is the destination rather than a preference: a record the file cannot take — a path
 that does not fit, a failed open, a failed write — is dropped and counted, not
 relocated to stderr. That is what keeps "the log is complete" and
 "`dropped_record_count` is zero" the same statement. stderr is the destination
@@ -83,15 +101,8 @@ Every record carries its own `pid`, so the tools take several inputs and
 concatenate them, and a directory expands to the `host.*.log` files inside it:
 
 ```bash
-python -m simpler_setup.tools.strace_timing <output_prefix> --swimlane swimlane.json
+python -m simpler_setup.tools.strace_timing <host-log-directory> --swimlane swimlane.json
 ```
-
-A process writes its `[CLOCK_ANCHOR]` ahead of its first record and into the same
-stream, so each file is self-contained for wall-clock recovery. If an input is
-truncated or a process's file is missing, the pids in it stay monotonic-only and
-`clockAnchors` is absent from the output rather than wrong — the tool warns when a
-pid emitted spans and no anchor was found for it, which is the signal that this
-happened.
 
 ## Marker grammar
 
@@ -101,27 +112,8 @@ Every host log record starts with a `CLOCK_MONOTONIC` nanosecond timestamp:
 [mono_ns=<ns>][T0x<thread>][<level>] <func>: ...
 ```
 
-Each process emits one TIMING-level mapping from that clock to wall time when
-its logger starts:
-
-```text
-[CLOCK_ANCHOR] v=1 pid=<pid> mono_ns=<ns> wall_ns=<ns>
-```
-
-For host-clock records, consumers recover an approximate absolute timestamp
-with `wall_ns + record_mono_ns - mono_ns`. Their event ordering and duration
-calculations remain entirely on the monotonic clock and are unaffected by
-wall-clock corrections. Records tagged `clk=dev` use the separate device-clock
-domain described below and do not use this anchor.
-
-`strace_timing.py` applies that mapping to both `--trace-out` and `--swimlane`.
-The visible Perfetto axis remains monotonic; each mapped host event exposes the
-exact decimal `wall_ts_ns` and a UTC `wall_time` in its arguments, while the JSON
-top level retains the source mappings in `clockAnchors`. Nanosecond epoch values
-are strings because JSON consumers commonly use IEEE-754 numbers, which cannot
-represent current epoch nanoseconds exactly. A log with no anchor for a pid gets
-no wall time for that pid's events and is otherwise unaffected, and `clk=dev`
-records never receive host wall time.
+The Perfetto axis remains monotonic. Records tagged `clk=dev` use the separate
+device-clock domain described below.
 
 One line per span, emitted on scope exit
 (`src/common/log/include/common/strace.h`):
@@ -138,7 +130,7 @@ One line per span, emitted on scope exit
 | `hid` | callable content hash (ELF Build-ID 64), stable across slot reuse / processes / runs. The parser buckets by `hid`; the most-frequent bucket is decode (one invocation per token), a once-seen bucket is prefill. |
 | `depth` | thread-local nesting depth (`++` on enter, `--` on exit). The parser rebuilds the call tree from `depth` — **not** from timestamp containment. |
 | `name` | dotted span name (self-locating even without the tree). |
-| `ts` `dur` | start + duration in ns. Maps 1:1 onto a Chrome-trace `"X"` event. For host spans `ts` is `CLOCK_MONOTONIC` (`steady_clock`), same-host cross-process comparable. For `clk=dev` device spans (see below) `ts` is instead a **device-clock** start offset on a per-invocation origin — comparable to the other device spans (so the orch∪sched window is recoverable), not the host clock. |
+| `ts` `dur` | start + duration in ns. Maps 1:1 onto a Chrome-trace `"X"` event. For host spans `ts` is `CLOCK_MONOTONIC` (`steady_clock`), same-host cross-process comparable. For `clk=dev` device spans (see below) `ts` is instead a **device-clock** start offset on a per-invocation origin — comparable to the other device spans (so the orch∪sched window is recoverable), not the host clock, and **not comparable between invocations**; for that, see [Comparing device spans across runs](#comparing-device-spans-across-runs). |
 | `k=v ...` | optional per-span attributes (e.g. `ntensor=4`); a parser that doesn't recognize one ignores it. |
 
 Span names and attributes percent-encode control bytes and record delimiters.
@@ -152,17 +144,34 @@ output sees the original text; a consumer reading the raw log does not.
 ```text
 chip.run                                      (= host_wall)
 ├─ chip.run.bind
-│  ├─ chip.run.bind.args        (ntensor=N: per-tensor device_malloc + H2D)
+│  ├─ chip.run.bind.args        (ntensor=N: per-tensor retained-buffer slice + H2D)
 │  ├─ chip.run.bind.prebuilt    (TMR: prebuilt runtime-arena cache hit or build + upload)
 │  └─ .{arena_build,static_arena,gm_heap,shared_mem,runtime_init,host_orch,
 │       graph_upload,arena_h2d,host_view_close}
 │           HBG host prepare-path segments, with SIMPLER_HBG_BIND_BREAKDOWN_ENABLE=1
+├─ chip.run.stage_inputs        (this run's input bytes into the buffers its bind named)
+├─ chip.run.prepare_execution   (runner prepare: register tables, topology probe, Runtime H2D)
 ├─ chip.run.runner_run          (device enqueue + completion drain)
 │  └─ chip.run.runner_run.device_wall      (whole on-NPU AICPU wall)
 │     └─ .{preamble,so_load,graph_build,config_validate,arena_wire,sm_reset,post_orch,orch,sched}
 │           TMR device-domain (clk=dev): AICPU subdivision of the on-NPU wall
 └─ chip.run.validate
 ```
+
+`chip.run.prepare_execution` brackets exactly one call — the platform runner's
+`prepare_execution`, entry to return, on every path including its early
+failures. Both runtimes emit it, and for TMR it is the only prepare-path span
+beyond `bind`'s two segments. **It is a sibling of `bind`, not a part of it**:
+
+| In the span | Not in the span |
+| ----------- | --------------- |
+| device init, the run-result region, the AICore register tables, the AICPU topology probe, the orchestration-SO resolve, and the synchronous H2D of the `Runtime` device image | *before it:* native-run admission, the prepared-successor compatibility probe, `attach_current_thread`, resource provisioning, `prepare_launch_shape`, `bind`, `stage_inputs` — *after it:* collector arming, the launch, the device run |
+
+The span is host **wall clock**: it contains a blocking `rtMemcpy` and driver
+calls, so `dur` is elapsed time and not a measure of CPU work. The sim platform
+emits the same span, where it covers sim's own host-side prepare — simulated
+register blocks, the orchestration-SO resolve, sim AICPU setup — with no H2D and
+no driver call in it, so a sim duration is not comparable to an onboard one.
 
 The `device_wall` span exists for both runtimes. Its
 `.{preamble,so_load,graph_build,config_validate,arena_wire,sm_reset,post_orch,orch,sched}`
@@ -175,6 +184,45 @@ back after stream-sync, converts cycles → ns, and emits the marker. `orch`/
 device-log lines. A phase that was never stamped
 (0 ns) is skipped — e.g. `so_load` is ~0 on a cached-callable run. See
 [device-phases.md](device-phases.md) for the device-side mechanism.
+
+### Comparing device spans across runs
+
+A device span's `ts` is rebased on its own invocation's origin, so it orders
+spans *within* one run and says nothing about the interval *between* two runs.
+`device_wall` therefore also carries its raw bounds:
+
+| attribute | meaning |
+| --------- | ------- |
+| `dev_id` | the device these ticks were stamped on; ticks from different devices are not comparable |
+| `dev_start_cycle` | RunWall's `min_start` across AICPU threads, in sys-counter ticks |
+| `dev_end_cycle` | RunWall's `max_end` across AICPU threads, same unit |
+| `dev_cnt_hz` | tick rate those two are expressed in (50 MHz a2a3, 1 GHz a5) |
+
+The ticks come from `get_sys_cnt_aicpu()`, which reads the free-running
+`CNTVCT_EL0` **rescaled into the `PLATFORM_PROF_SYS_CNT_FREQ` unit**
+(`sys_cnt_now_ticks()`: `cntvct * PROF / cntfrq_el0`, an identity on real
+silicon where the two agree). So `dev_cnt_hz` is the divisor — **not**
+`cntfrq_el0`, which differs from it wherever that identity does not hold. The
+rescaled counter is a monotone function of `CNTVCT_EL0` and is never reset per
+run, so consecutive runs' ticks are directly comparable and the device-side
+inter-run gap is
+
+```text
+gap = (dev_start_cycle(N+1) - dev_end_cycle(N)) / dev_cnt_hz
+```
+
+**Difference the ticks, then convert.** Converting each bound to ns first rounds
+both ends and can consume a sub-microsecond gap entirely. `sys_cnt_elapsed_ns()`
+in `aicpu/device_time.h` is that operation with the overflow guards already in
+place. `ts` stays 0 on this
+span because it is the origin the depth-3 sub-phases are positioned against;
+moving it to an absolute instant would invert their containment. Comparability
+holds within one device and one counter epoch — it says nothing across a device
+reset, and these ticks are never comparable to the host clock. Both bounds read
+back as 0 when the phase went unstamped, which also covers the misconfigured
+counter (`cntfrq_el0` unset makes every stamp 0, so no interval is derived from
+it rather than a bogus one). The onboard platform emits them; the
+sim platform derives `device_wall` from `steady_clock` and emits `ts`/`dur` only.
 
 The phased native-run interface preserves this same marker contract. Prepare
 allocates one `inv` and records the host-wall start; prepare, the child progress
@@ -190,8 +238,8 @@ including time the caller spends polling or doing other host work; blocking
 | Depth | Span names |
 | ----- | ---------- |
 | 0 | `chip.run` |
-| 1 | `chip.run.bind`, `chip.run.runner_run`, `chip.run.claim_release`, `chip.run.validate` |
-| 2 | `chip.run.bind.args`, `chip.run.bind.prebuilt`, the other HBG `chip.run.bind.*` segments, `chip.run.runner_run.device_wall` |
+| 1 | `chip.run.bind`, `chip.run.stage_inputs`, `chip.run.prepare_execution`, `chip.run.runner_run`, `chip.run.claim_release`, `chip.run.validate` |
+| 2 | `chip.run.bind.args`, `chip.run.bind.prebuilt`, the other HBG `chip.run.bind.*` segments, `chip.run.runner_run.aicpu_launch` (onboard point), `chip.run.runner_run.device_wall` |
 | 3 | TMR phase spans `chip.run.runner_run.device_wall.{preamble,so_load,graph_build,config_validate,arena_wire,sm_reset,post_orch,orch,sched}` and optional `task_slot_*` spans |
 
 ## Host scheduler spans
@@ -472,7 +520,11 @@ to start before `claim_release(N)`. It exits nonzero on a missing identity, a
 missing span, or an ordering violation.
 
 Reading `bind` rather than the whole prepare is deliberate: `bind` sits inside
-prepare, so an overlap it reports is one the prepare certainly had.
+prepare, so an overlap it reports is one the prepare certainly had. It stays
+`bind` now that `prepare_execution` has a span of its own: that span is a
+sibling covering a later part of the same prepare, so substituting it would
+answer a different question and widening the window to both would weaken the
+implication rather than strengthen it.
 
 `--require-hidden-prepare` adds the stronger claim that the preparation also
 *finishes* inside the predecessor's device window — fully hidden rather than
@@ -490,7 +542,8 @@ from the positive arm in exactly one variable:
 | --- | -------------- | ---------------- |
 | overlap stress | — | accepted, one check per adjacent pair |
 | serial submission | one run in flight instead of two | rejected, `did not overlap` |
-| diagnostics config | `enable_scope_stats` set | rejected, `did not overlap` |
+| diagnostics config | `enable_scope_stats` set | accepted |
+| orch-phase swimlane | `enable_chip_swimlane` 4 | accepted |
 
 The second arm is what makes the first a detector rather than a formality.
 Between the pipeline and the verdict sits a chain — which spans are emitted,
@@ -500,14 +553,17 @@ intersection independent of real concurrency, the positive arm would still be
 green. Matching the message matters: it separates a real rejection from the
 vacuous "need at least two complete native runs" one.
 
-The third arm covers a fallback that is otherwise silent. `allow_prepared_successor`
-folds in `CallConfig::diagnostics_any()` — the OR of all five diagnostic flags —
-because a collector's setup mutates runner-global state that is not yet
-per-epoch, so *any* one of them keeps a run and its successor on separate device
-windows even at depth 2. The lane's own check declines to stage rather than
-raising, so the submissions still succeed and the goldens still pass; nothing
-else would notice. Which flag is set does not matter, only that
-`diagnostics_any()` becomes true, so the arm picks the lightest.
+The last two exercise collector-bearing configurations that previously forced
+serialization. The serial arm above is the permanent negative control: one run
+in flight cannot overlap under any admission policy.
+`allow_prepared_successor` once folded in `CallConfig::diagnostics_any()` — the
+OR of all five diagnostic flags — because a collector's setup wrote
+runner-global state during preparation, which a prepared successor would have
+done while its predecessor was still running against it. The pools and that
+per-run state are now built and reset under the execution claim, so a diagnostic
+configuration overlaps like any other. Host-orchestration phase records are
+held per pipeline slot and published to the resident collector at launch, so a
+level-4 run can overlap without resetting its predecessor's records.
 
 Staging has three inputs and only that one is reachable from a submission. The
 other two — the runtime PipelineContract's `pipeline_depth` and the runtime's

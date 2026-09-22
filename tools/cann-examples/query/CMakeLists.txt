@@ -27,29 +27,7 @@ if(NOT DEFINED ENV{ASCEND_HOME_PATH})
 endif()
 set(ASCEND_HOME_PATH $ENV{ASCEND_HOME_PATH})
 
-# The Ascend driver package sits as a sibling of the CANN toolkit install
-# (e.g. /usr/local/Ascend/{cann-9.0.0, driver}). Driver ships
-# libdrvdsmi_host.so which CANN does not. HAL is available in both places;
-# we use the driver-side copy for consistency. Resolution order:
-#   1. Cmake-line override:  cmake -DASCEND_DRIVER_PATH=/opt/ascend/driver
-#   2. Sibling of ASCEND_HOME_PATH if it exists
-#   3. Standard install at /usr/local/Ascend/driver
-if(NOT DEFINED ASCEND_DRIVER_PATH)
-    get_filename_component(_ASCEND_PARENT "${ASCEND_HOME_PATH}" DIRECTORY)
-    set(_DERIVED_DRIVER_PATH "${_ASCEND_PARENT}/driver")
-    if(EXISTS "${_DERIVED_DRIVER_PATH}")
-        set(ASCEND_DRIVER_PATH "${_DERIVED_DRIVER_PATH}")
-    else()
-        set(ASCEND_DRIVER_PATH "/usr/local/Ascend/driver")
-    endif()
-endif()
-if(NOT EXISTS "${ASCEND_DRIVER_PATH}/lib64/driver/libascend_hal.so")
-    message(FATAL_ERROR
-        "libascend_hal.so not found under ${ASCEND_DRIVER_PATH}/lib64/driver/. "
-        "Set ASCEND_DRIVER_PATH explicitly (cmake -DASCEND_DRIVER_PATH=...).")
-endif()
-message(STATUS "ASCEND_HOME_PATH   = ${ASCEND_HOME_PATH}")
-message(STATUS "ASCEND_DRIVER_PATH = ${ASCEND_DRIVER_PATH}")
+include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/ascend_driver_path.cmake")
 
 add_executable(query query.cpp)
 

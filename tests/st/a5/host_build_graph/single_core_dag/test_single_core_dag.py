@@ -11,6 +11,7 @@
 
 import ctypes
 import json
+from collections import Counter
 
 import torch
 from simpler.task_interface import ArgDirection as D
@@ -98,7 +99,7 @@ class TestHbgSingleCoreDag(SceneTestCase):
         if level == 0:
             return
 
-        record_fields = {"start_cycles", "end_cycles", "loop_iter", "kind", "tasks_processed", "task_id"}
+        record_fields = {"start_cycles", "end_cycles", "run_epoch", "loop_iter", "kind", "tasks_processed", "task_id"}
         for case in self._matching_cases(st_platform, request):
             case_label = _sanitize_for_filename(f"TestHbgSingleCoreDag_{case['name']}")
             matches = [
@@ -114,12 +115,13 @@ class TestHbgSingleCoreDag(SceneTestCase):
             assert aicore_rows, "AICore task records are missing"
             if level >= 2:
                 scheduler_tasks = raw["scheduler_tasks"]
-                assert scheduler_tasks["schema_version"] == 1
                 assert scheduler_tasks["producer"] == "aicore"
                 scheduler_rows = scheduler_tasks["records"]
                 aicore_by_key = {(int(row[0]), int(row[2])): row for row in aicore_rows}
                 assert {(int(row[0]), int(row[1])) for row in scheduler_rows} == set(aicore_by_key)
-                for core_id, reg_task_id, dispatch_cycles, finish_cycles in scheduler_rows:
+                # HBG stamps both streams from the same host-side run epoch.
+                assert {int(row[6]) for row in aicore_rows} == {int(row[4]) for row in scheduler_rows}
+                for core_id, reg_task_id, dispatch_cycles, finish_cycles, _run_epoch in scheduler_rows:
                     aicore_row = aicore_by_key[(int(core_id), int(reg_task_id))]
                     assert 0 < dispatch_cycles <= aicore_row[3] <= aicore_row[4] <= finish_cycles
                 assert raw["aicpu_lifecycle_records"], "AICPU lifecycle records are missing"
@@ -128,23 +130,47 @@ class TestHbgSingleCoreDag(SceneTestCase):
             streams = raw["scheduler_records"]["streams"]
             assert streams, "A5 HBG AICore Scheduler records are missing"
             assert all(stream["producer"] == "aicore" for stream in streams)
-            assert all(stream["platform"] == "a5" and stream["runtime"] == "host_build_graph" for stream in streams)
+            assert all(stream["platform"] == "a5" for stream in streams)
+            assert all("runtime" not in stream for stream in streams)
             records = [record for stream in streams for record in stream["records"]]
             assert all(set(record) == record_fields for record in records)
             assert all(0 < record["start_cycles"] <= record["end_cycles"] for record in records)
-            required_kinds = {"bootstrap", "dispatch", "complete", "resolve", "idle"}
-            if case["params"]["graph_case"] != GRAPH_CASES["multi_root_64"][0]:
-                required_kinds.add("fanin")
+            required_kinds = {"bootstrap", "state_probe", "complete", "resolve", "idle"}
             emitted_kinds = {record["kind"] for record in records}
             assert required_kinds <= emitted_kinds, f"missing Scheduler kinds: {sorted(required_kinds - emitted_kinds)}"
             profiled_task_ids = {int(row[1]) for row in raw["aicore_tasks"]}
-            for kind in ("dispatch", "complete"):
-                recorded_task_ids = {int(record["task_id"]) for record in records if record["kind"] == kind}
-                assert recorded_task_ids == profiled_task_ids, (
-                    f"{kind} records do not cover every profiled task: "
-                    f"missing={sorted(profiled_task_ids - recorded_task_ids)} "
-                    f"unexpected={sorted(recorded_task_ids - profiled_task_ids)}"
-                )
+            launch_kinds = {"dispatch", "worksteal", "refill"}
+            launches_by_task = Counter(
+                int(record["task_id"])
+                for record in records
+                if record["kind"] in launch_kinds and record["task_id"] is not None
+            )
+            assert set(launches_by_task) == profiled_task_ids, (
+                "launch records do not cover every profiled task: "
+                f"missing={sorted(profiled_task_ids - set(launches_by_task))} "
+                f"unexpected={sorted(set(launches_by_task) - profiled_task_ids)}"
+            )
+            assert set(launches_by_task.values()) == {1}
+            completed_task_ids = {int(record["task_id"]) for record in records if record["kind"] == "complete"}
+            assert completed_task_ids == profiled_task_ids, (
+                "complete records do not cover every profiled task: "
+                f"missing={sorted(profiled_task_ids - completed_task_ids)} "
+                f"unexpected={sorted(completed_task_ids - profiled_task_ids)}"
+            )
+            state_probe_task_ids = {int(record["task_id"]) for record in records if record["kind"] == "state_probe"}
+            assert state_probe_task_ids <= profiled_task_ids
+            inbox_launch_task_ids = {
+                int(record["task_id"]) for record in records if record["kind"] in {"dispatch", "worksteal"}
+            }
+            assert inbox_launch_task_ids <= state_probe_task_ids, (
+                "Ready Inbox launches are missing state_probe records: "
+                f"{sorted(inbox_launch_task_ids - state_probe_task_ids)}"
+            )
+            refill_task_ids = {int(record["task_id"]) for record in records if record["kind"] == "refill"}
+            assert profiled_task_ids - state_probe_task_ids <= refill_task_ids, (
+                "tasks without state_probe were not launched by refill: "
+                f"{sorted(profiled_task_ids - state_probe_task_ids - refill_task_ids)}"
+            )
 
 
 if __name__ == "__main__":

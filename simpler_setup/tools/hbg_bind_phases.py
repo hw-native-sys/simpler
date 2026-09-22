@@ -11,7 +11,9 @@
 
 Reads the log a `SIMPLER_HBG_BIND_BREAKDOWN_ENABLE=1 --rounds N` run leaves
 behind and reports each bind segment's minimum, median and maximum across the
-warm binds, plus the control-plane total.
+warm binds, plus the subtotal historically labelled "control plane". This sum
+does not include uninstrumented Definition preparation or A5 scheduler work;
+matching segment names across commits does not establish matching coverage.
 
 The spread is the point: a change smaller than the range beside it cannot be
 demonstrated. `strace_timing --tree` gives the median alone, and its default
@@ -45,12 +47,13 @@ TORCH_AUTOLOAD_LINE = re.compile(
     r"torch_imported=(?:true|false) torch_npu_loaded=(?:true|false))"
 )
 
-# The segments between "the caller's data is in place" and "the device can run".
+# Instrumented subtotal, not the full interval before device execution.
+# Definition preparation and A5 scheduler work have no segment in this sum.
 # `args` is a per-byte staging cost. `host_view_close` remains excluded for
 # comparison with historical mapped-view logs; current binds close no mappings.
 CONTROL_PLANE = ("host_orch", "graph_upload", "arena_h2d")
 
-# Display order: the bind stage's own sequence, so a reader can follow it down.
+# Historical display order; spans carry timestamps for the actual execution order.
 PHASE_ORDER = (
     "args",
     "arena_build",
@@ -159,9 +162,9 @@ def main() -> int:
     if not binds:
         print(
             f"{' '.join(args.log)}: no `chip.run.bind.<segment>` spans. Either "
-            "SIMPLER_HBG_BIND_BREAKDOWN_ENABLE=1 was not set, or a diagnostic flag made "
-            "CallConfig.output_prefix non-empty and moved the whole host log to "
-            "outputs/<case>_<ts>/host.<pid>.log -- parse those instead. The log level is not a "
+            "SIMPLER_HBG_BIND_BREAKDOWN_ENABLE=1 was not set, or an output run moved the whole "
+            "host log into the process-session spool -- parse those host.*.log files instead. "
+            "The log level is not a "
             "cause: TIMING is the default. See docs/dfx/hbg-bind-phases.md.",
             file=sys.stderr,
         )

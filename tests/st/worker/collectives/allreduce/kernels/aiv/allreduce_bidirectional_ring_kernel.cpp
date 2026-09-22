@@ -36,6 +36,7 @@
 #include "pto/comm/pto_comm_inst.hpp"
 #include "platform_comm/comm_context.h"
 #include "tensor.h"
+#include "collectives_reduce_op.hpp"
 
 #ifndef __gm__
 #define __gm__
@@ -93,6 +94,12 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     __gm__ Tensor *scratch_tensor = reinterpret_cast<__gm__ Tensor *>(args[2]);
     int nranks = static_cast<int>(args[3]);
     __gm__ CommContext *commCtx = reinterpret_cast<__gm__ CommContext *>(args[4]);
+    CollectiveReduceOp reduce_op = static_cast<CollectiveReduceOp>(args[5]);
+    // TPUT<AtomicAdd> only supports Sum reduction.
+    if (reduce_op != CollectiveReduceOp::kSum) {
+        pipe_barrier(PIPE_ALL);
+        return;
+    }
 
     __gm__ float *input = reinterpret_cast<__gm__ float *>(input_tensor->buffer.addr) + input_tensor->start_offset;
     __gm__ float *output = reinterpret_cast<__gm__ float *>(output_tensor->buffer.addr) + output_tensor->start_offset;

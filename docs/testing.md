@@ -314,7 +314,8 @@ Layer 1  Level axis
     │       └─ Layer 4  Class — one ChipWorker per (runtime, device), reused
     │                   across every class assigned to that device
     │           └─ Layer 5  Case — serial within a class
-    │               └─ Layer 6  Rounds — `--rounds N` loop, reuses Worker
+    │               └─ Layer 6  Rounds — `--rounds N` loop, reuses Worker;
+    │                           L2 child memory is declared per tensor, independent of N
 ```
 
 ### Quick examples
@@ -540,6 +541,74 @@ cmake --build tests/ut/cpp/build
 ctest --test-dir tests/ut/cpp/build --output-on-failure
 ```
 
+#### How many times a case is built
+
+Most trees under `src/` are compiled more than once by the product: each arch's
+platform tree is its own code, and the arch-independent trees compile into every
+runtime's image, resolving their bare-name headers to that runtime's copy. A
+case covering such a tree therefore has to be built for each value of the axis
+it varies over, and the declaration says which:
+
+| Declaration | Builds |
+| ----------- | ------ |
+| `simpler_ut_platform_case(... PER_ARCH)` | one per arch |
+| `simpler_ut_platform_case(... PER_RUNTIME)` | one per runtime |
+| `simpler_ut_platform_case(... PER_ARCH PER_RUNTIME)` | one per pair |
+| `simpler_ut_platform_case(... SINGLE)` | one, and asserts the case reaches neither tree |
+| `hbg_case(...)` / `tmr_case(...)` | one per arch; `ARCHS` narrows it |
+
+None of these is a default — omitting the axis is a configure error, because a
+case built once looks exactly like a case that does not vary, and ctest reports
+both as passing.
+
+`tests/lint/check_ut_cpp_axis.py` keeps those declarations honest by
+measurement. It preprocesses every target's translation units with `-H`, reads
+which files each one opened, and reports a case whose code differs along an
+applicable axis but is not built for every value of it. Known gaps live in its
+`WAIVERS` table with a reason, and a waiver whose gap has been closed is an
+error, so the table only shrinks.
+
+It needs the compile lines, so configure with `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`:
+
+```bash
+cmake -B tests/ut/cpp/build -S tests/ut/cpp -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+cmake --build tests/ut/cpp/build --parallel 4
+python tests/lint/check_ut_cpp_axis.py
+```
+
+CI runs it in the `ut` job, right after ctest. It is not a pre-commit hook —
+it reads a configured build, which pre-commit does not have.
+
+#### Where the stand-ins come from
+
+`tests/ut/cpp/support/` holds the stand-ins for the CANN platform API, built
+into one static archive per arch. A case takes what it needs and says nothing:
+an archive member is pulled only to resolve a symbol nothing else defined, so a
+case that compiles the real `unified_log_host.cpp`, `device_time.cpp` or
+`cache_ops.cpp` simply never pulls that stub.
+
+That is why each file there holds one group of symbols. The linker's unit is
+the object file, so a file bundling four groups is pulled for any one of them
+and brings the other three along — which is what forced a case wanting one real
+implementation to give up the rest.
+
+One thing defeats it: **a weak definition already satisfies the reference, so
+the linker never searches the archive.** Product code has such fallbacks on
+purpose — the tmr runtime defines `get_sys_cnt_aicpu` weakly as `return 0` so a
+host build links without the AICPU side. A test that takes that fallback
+compiles, links, and then hangs. Where that applies, the stub is compiled
+straight into the library that also compiles the weak definition, and left in
+the archive as well: the archive copy is not pulled there, and everything else
+still gets it.
+
+`tests/lint/check_ut_cpp_stub_linkage.py` holds that line. For every symbol the
+archive defines strongly, it fails if any test binary resolved it to a weak
+definition:
+
+```bash
+python tests/lint/check_ut_cpp_stub_linkage.py
+```
+
 ### Python Unit Tests (`tests/ut/`)
 
 Tests for the nanobind extension and the Python build pipeline:
@@ -579,32 +648,24 @@ Hardware-only scene tests for large-scale and feature-rich scenarios that are to
 
 ### New C++ Unit Test
 
-Add a new test file to `tests/ut/cpp/` and register it in `tests/ut/cpp/CMakeLists.txt`:
+Put the file in the mirror of the tree it covers and stop: the directory gives
+it a target, a name, an include contract, and how many times it is built. A
+case that needs nothing beyond that is never named in a CMakeLists.
 
-```cmake
-add_executable(test_my_component
-    test_my_component.cpp
-    test_stubs.cpp
-)
-target_include_directories(test_my_component PRIVATE ${COMMON_DIR} ${TMR_RUNTIME_DIR} ${PLATFORM_INCLUDE_DIR})
-target_link_libraries(test_my_component gtest_main)
-add_test(NAME test_my_component COMMAND test_my_component)
-
-# If hardware required:
-# set_tests_properties(test_my_component PROPERTIES LABELS "requires_hardware")
-# If specific platform required:
-# set_tests_properties(test_my_component PROPERTIES LABELS "requires_hardware_a2a3")
-```
+[Adding a C++ unit test](testing/adding-a-cpp-unit-test.md) covers the rest —
+which directory, the per-directory macros and their keywords, how many builds
+a case gets and how to have that measured rather than guessed, and where the
+CANN stand-ins come from.
 
 #### C++ hardware tests needing NPU devices
 
-Tests that need specific NPU devices use CTest's [resource allocation](https://cmake.org/cmake/help/latest/prop_test/RESOURCE_GROUPS.html). Declare `RESOURCE_GROUPS` alongside the hardware label:
+Tests that need specific NPU devices use CTest's [resource allocation](https://cmake.org/cmake/help/latest/prop_test/RESOURCE_GROUPS.html). The label and the devices are keywords on the case, usually already carried by the directory's macro:
 
 ```cmake
-set_tests_properties(my_hw_test PROPERTIES
-    LABELS "requires_hardware_a2a3"
-    RESOURCE_GROUPS "2,npus:1"    # 2 groups × 1 NPU slot each = 2 distinct devices
-)
+simpler_ut_add_target(NAME my_hw_test
+    SOURCES my_hw_test.cpp
+    LABEL requires_hardware_a2a3
+    RESOURCES "2,npus:1")    # 2 groups × 1 NPU slot each = 2 distinct devices
 ```
 
 The CI generates a resource spec file from `${DEVICE_RANGE}` and passes it to ctest:
@@ -901,3 +962,64 @@ This eliminates the need for separate `examples/` (sim) and `tests/st/` (device)
 ### When separate directories are still needed
 
 When kernels themselves differ (e.g., templated tile sizes tuned for device), separate test files remain the correct approach.
+
+## Explicit L2 child memory
+
+`TensorArg(name, value, child_memory=True)` keeps a case-owned device buffer
+across all rounds, including `--rounds 1`. `TaskArgsBuilder.add_tensor` accepts
+the same keyword. The default remains host memory; IN and INOUT tensors are copied in on every round, while pure OUT buffers skip the copy.
+
+| Declaration / direction | Setup | Between rounds | Validation |
+| ----------------------- | ----- | -------------- | ---------- |
+| Host memory (default) | Existing path | Restore OUT/INOUT host fixtures | Existing per-round copy-back |
+| Child-memory IN | Allocate and upload once | Keep device address and input contents | No output readback |
+| Child-memory OUT | Allocate without upload | Keep device contents; the case must define all compared elements | Final readback |
+| Child-memory INOUT | Allocate and upload once | Keep device state | Final readback |
+
+Golden evaluation follows the same state evolution: child-memory outputs retain
+state and host-memory outputs reset. Cases with child-memory outputs compare after
+the final round; other cases continue comparing every round.
+
+A tensor whose contents the HBG host orchestration reads (`get_tensor_data`) or
+writes (`set_tensor_data`) may be child memory. The declaration needs no extra
+opt-in: the runtime claims each child-memory span at bind and picks how to reach
+it only if an access actually lands there, so a tensor the orchestration never
+touches costs nothing.
+
+| Platform | Means | Per-access cost |
+| -------- | ----- | --------------- |
+| Host map available (a2a3 onboard, sim) | one mapping of the allocation, held by the runtime for the allocation's lifetime | none |
+| Host map unavailable (a5 onboard, or a 64 KiB-page host — issue #1531) | a device copy per access | one synchronous driver round trip, ~9.5 µs† |
+
+† Measured on a2a3 with 4 KiB host pages (CANN 9.0.0), which is neither
+configuration in that row — a2a3 on ordinary pages takes the mapping. It is
+what a small synchronous `aclrtMemcpy` costs against this driver; a5 and
+64 KiB-page hosts are unmeasured. See
+[the investigation](investigations/2026-09-hbg-per-run-host-view-rebuild.md).
+
+On the second row the cost is per access, not per tensor, so a tensor the
+orchestration reads thousands of times — `paged_attention`'s `block_table` is
+read once per (batch, block) pair, 16,384 times in Case1, which is ~156 ms — is
+better left in host memory there. The declaration is per argument, so a
+data-dependent case can mix freely. The bind's `BindHostViewClose` phase
+attributes report `devcopy=N` when this path was taken.
+
+Runtime-created tensors (graph-heap allocations the orchestration made itself)
+remain unreadable: they are uninitialized until a task writes them, and
+`get_tensor_data` rejects a tensor with a producer outright.
+
+Declarations currently require L2, contiguous CPU fixtures, and non-overlapping
+storage. Empty fixtures allocate no device buffer; the existing transport
+still rejects zero-shaped Tensor arguments. Clone and rehost operations preserve
+declaration metadata. An in-repo standalone driver that owns its own `Worker`
+reuses the same owner, `simpler_setup.scene_test.ChildMemoryTaskArgs`, as a
+context manager, adding one fixture at a time so each large fixture can be
+released before the next is materialized. It is a scene-test helper, not part of
+the `simpler_setup` public surface — it builds `TaskArgs` and copies back through
+a `TaskArgsBuilder`, so it has no meaning outside this corpus.
+
+The HBG `paged_attention_unroll_manual_scope` examples include matched manual
+`HostStaged` and `ChildMemory` cases, the latter declaring every tensor —
+including the two the orchestration reads. The HBG `paged_attention` scene tests
+carry the same pairing as non-manual cases, so CI covers an orchestration
+reading child memory on both arches. Existing default cases retain host memory.

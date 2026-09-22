@@ -74,6 +74,12 @@ must launch as one cohort:
 - AIV-only: `block_num <= rt_available_aiv_count()`
 - AIC or MIX: `block_num <= rt_available_cluster_count()`
 
+The cohort is that one task's blocks. Two `sync_start` tasks never launch as
+one unit, and the constraint above is per task regardless of where it was
+submitted: a task inside a Graph body is bounded by the same device width as a
+top-level one. GRAPH_EXECUTION.md, under `src/common/host_build_graph/docs`,
+describes the rendezvous itself and what the cohort is scoped to.
+
 ## Dependency and Readiness Flow
 
 1. Host orchestration allocates a task slot and builds its payload.

@@ -14,6 +14,12 @@
 #include <cstddef>
 #include <cstdint>
 
+// The owning runtime's task handle. Each runtime has its own TaskId in its own
+// namespace, and the include path resolves this bare name to whichever runtime is
+// being built: src/common/<runtime> is on that build's include path, and reaching
+// both headers from one scope is a compile error rather than a silent pick.
+#include "task_id.h"
+
 inline constexpr const char *CHIP_SWIMLANE_ARCHITECTURE_NAME = "a2a3";
 
 /** Discriminator for Scheduler phase records.
@@ -58,7 +64,7 @@ enum class ChipSwimlaneSchedPhaseKind : uint32_t {
     PredicatedSkip = 12,     // Zero-width identity marker for a task retired
                              // because its dispatch predicate was false.
     GraphPrepare = 13,       // Bounded Graph Definition materialization slice.
-                             // tasks_processed = in-graph tasks patched.
+                             // tasks_processed = sub-tasks patched.
     ResolveStandalone = 14,  // Dedicated HBG resolution-thread work.
                              // tasks_processed = completed SPSC slots.
 };
@@ -76,34 +82,35 @@ constexpr int CHIP_SWIMLANE_NUM_QUEUE_SHAPES = 3;
  * Position in the per-thread buffer is the thread identity. All timestamps are
  * raw system-counter cycles.
  *
- * ``phase_data`` is tagged by ``kind``: Dispatch uses ``dispatch``;
- * DummyTask and PredicatedSkip use ``dummy_task``; GraphPrepare uses
- * ``graph_task``. Other kinds store zero in the union.
+ * ``phase_data`` is tagged by ``kind``: Dispatch uses ``dispatch``; DummyTask,
+ * PredicatedSkip and GraphPrepare use ``task_id`` -- the first two naming the task
+ * retired, GraphPrepare the outer GRAPH task whose body it materialized. Other kinds
+ * store zero in the union.
  *
  * Queue-depth snapshots use the [AIC, AIV, MIX] indexes above and capture
  * ready-queue occupancy at phase boundaries. They remain zero below
  * SCHED_PHASES.
  */
 struct ChipSwimlaneAicpuSchedPhaseRecord {
-    uint64_t start_time;              // Phase start, in system-counter cycles
-    uint64_t end_time;                // Phase end, in system-counter cycles
-    uint32_t loop_iter;               // Scheduler-loop iteration on this thread
-    ChipSwimlaneSchedPhaseKind kind;  // Tagged-union discriminator
-    uint32_t tasks_processed;         // Work items processed in this phase
+    uint64_t start_time;  // Phase start, in system-counter cycles
+    uint64_t end_time;    // Phase end, in system-counter cycles
+    // Ahead of the 32-bit fields because TaskId is 8-byte aligned: after them this
+    // union would land on offset 28 and the compiler would pad it to 32, growing the
+    // record past its 64-byte line.
     union {
         struct {
             uint32_t pop_hit;   // Ready-queue hit delta since the previous Dispatch
             uint32_t pop_miss;  // Ready-queue miss delta since the previous Dispatch
         } dispatch;
-        struct {
-            uint32_t local_id;  // task_id bits [31:0]
-            uint32_t ring_id;   // task_id bits [63:32]
-        } dummy_task;
-        struct {
-            uint32_t local_id;  // outer Graph task_id bits [31:0]
-            uint32_t ring_id;   // outer Graph task_id bits [63:32]
-        } graph_task;
+        // The task this phase acted on, as the handle itself rather than a raw word:
+        // its fields are the owning runtime's to name, and nothing here reads them.
+        // Whole handle rather than two halves -- a 64-bit id is one value, and
+        // splitting it made this header claim to know the layout inside.
+        TaskId task_id;
     } phase_data;
+    uint32_t loop_iter;                                             // Scheduler-loop iteration on this thread
+    ChipSwimlaneSchedPhaseKind kind;                                // Tagged-union discriminator
+    uint32_t tasks_processed;                                       // Work items processed in this phase
     int16_t shared_depth_at_start[CHIP_SWIMLANE_NUM_QUEUE_SHAPES];  // Ready depths at phase entry
     int16_t shared_depth_at_end[CHIP_SWIMLANE_NUM_QUEUE_SHAPES];    // Ready depths at phase exit
     uint32_t _pad[4];                                               // Keep the wire record at 64 bytes
@@ -114,7 +121,7 @@ static_assert(
     "ChipSwimlaneAicpuSchedPhaseRecord phase data must remain 8 bytes"
 );
 static_assert(
-    offsetof(ChipSwimlaneAicpuSchedPhaseRecord, phase_data) == 28,
+    offsetof(ChipSwimlaneAicpuSchedPhaseRecord, phase_data) == 16,
     "ChipSwimlaneAicpuSchedPhaseRecord phase data offset drift"
 );
 static_assert(sizeof(ChipSwimlaneAicpuSchedPhaseRecord) == 64, "ChipSwimlaneAicpuSchedPhaseRecord layout drift");

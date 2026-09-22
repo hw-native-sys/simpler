@@ -13,7 +13,7 @@
 
 #include <stdint.h>
 
-/* Matches CallConfig::output_prefix, which is where the path comes from. */
+/* Holds either an explicitly selected directory or the process-session spool. */
 #define SIMPLER_HOST_LOG_DIR_CAPACITY 1024
 
 #ifdef __cplusplus
@@ -26,24 +26,20 @@ extern "C" {
  * independent of the C++ library ABI; host_log.cpp performs all mutable scalar
  * accesses with compiler atomic builtins.
  *
- * clock_anchor_pid is positive after a successful anchor write and temporarily
- * negative while one writer owns the claim for that PID. Linux PIDs are
- * positive and bounded well below INT32_MAX.
- *
  * log_directory is where the process writer appends records, one file per
- * process. It is empty until a caller that knows the run's artifact directory
- * supplies it, and the writer uses stderr while it is. The destination is a
- * property of the logger, so it applies to every record from every caller —
- * there is no per-record or per-call-site routing.
+ * process. It is empty until a caller supplies either an explicit destination
+ * or the process tree's stable session spool, and the writer uses stderr while
+ * it is. The destination is a property of the logger, so it applies to every
+ * record from every caller — there is no per-record or per-call-site routing.
  *
  * The first non-empty path wins: log_directory_bound is release-stored after the
  * path is filled and acquire-loaded before it is read, so a reader sees either no
  * directory or the whole one, and a reader that has already opened the file never
  * has the path change under it.
  *
- * sink_owner_pid follows the anchor's claim convention while the process owner
- * creates the bounded sink. sink_process_pid distinguishes a parent restarting
- * after a quiescent fork boundary from a child that inherited owner=0; the child
+ * sink_owner_pid is negative while the process owner creates the bounded sink.
+ * sink_process_pid distinguishes a parent restarting after a quiescent fork
+ * boundary from a child that inherited owner=0; the child
  * starts fresh counters. The high bit of sink_producer_state closes admission;
  * its low bits count callers that may still hold sink_context. Bound private
  * logger copies submit complete records through sink_enqueue without exporting
@@ -77,12 +73,11 @@ enum SimplerHostLogDropReason {
  * process sink. A zero return has already been attributed to a reason by the
  * callee, so the caller must not count it again. */
 typedef int (*SimplerHostLogEnqueueFn)(
-    void *context, struct SimplerHostLogState *state, const char *record, uint32_t size, int32_t anchor_pid
+    void *context, struct SimplerHostLogState *state, const char *record, uint32_t size
 );
 
 typedef struct SimplerHostLogState {
     int32_t threshold;
-    int32_t clock_anchor_pid;
     int32_t log_directory_bound;
     char log_directory[SIMPLER_HOST_LOG_DIR_CAPACITY];
     int32_t sink_owner_pid;

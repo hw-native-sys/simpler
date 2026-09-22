@@ -69,8 +69,7 @@
  * SVM path).
  */
 
-#ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_BUFFER_POOL_MANAGER_H_
-#define SRC_COMMON_PLATFORM_INCLUDE_HOST_BUFFER_POOL_MANAGER_H_
+#pragma once
 
 #include <algorithm>
 #include <array>
@@ -83,6 +82,7 @@
 #include <functional>
 #include <limits>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
@@ -110,7 +110,7 @@ using ThreadFactory = std::function<std::thread(std::function<void()>)>;
  * - reg:              "register" dev_ptr for host visibility. On a5 this
  *                     allocates a paired host shadow (malloc + memset 0 +
  *                     copy_to_device of the zeros) and writes its address to
- *                     *host_ptr_out. ProfilerBase::start always installs a
+ *                     *host_ptr_out. ProfilerBase::set_memory_context always installs a
  *                     non-null reg wrapper — collectors do not need to
  *                     branch.
  * - free_:            free a previously allocated device pointer.
@@ -328,7 +328,7 @@ public:
     BufferPoolManager &operator=(const BufferPoolManager &) = delete;
 
     /**
-     * Configure the buffer pool's memory context. Called by ProfilerBase::start()
+     * Configure the buffer pool's memory context. Called by ProfilerBase::set_memory_context()
      * before any allocator-touching method (alloc_and_register_block /
      * free_buffer / resolve_host_ptr / drain_done_into_recycled) is invoked.
      * Must NOT be called concurrently with the mgmt thread.
@@ -347,6 +347,19 @@ public:
         shared_mem_host_ = shared_mem_host;
         shm_size_ = shm_size;
         device_id_ = device_id;
+    }
+
+    /**
+     * Forget the memory context without freeing buffers or clearing mappings.
+     * Call only after worker threads have stopped and resource cleanup is done;
+     * cleanup may still need the callbacks being cleared here.
+     */
+    void clear_memory_context() {
+        ops_ = MemoryOps{};
+        shared_mem_dev_ = nullptr;
+        shared_mem_host_ = nullptr;
+        shm_size_ = 0;
+        device_id_ = -1;
     }
 
     /**
@@ -428,6 +441,7 @@ public:
      * HAL mappings are not touched.
      */
     void clear_mappings() {
+        std::unique_lock<std::shared_mutex> lock(mapping_mutex_);
         for (auto &kv : dev_to_host_) {
             if (kv.second != nullptr && malloc_shadows_.erase(kv.second) > 0) {
                 std::free(kv.second);
@@ -454,6 +468,7 @@ public:
      */
     template <typename ReleaseFn>
     void release_all_owned(const ReleaseFn &release_fn) {
+        std::unique_lock<std::shared_mutex> lock(mapping_mutex_);
         for (auto &shard_pools : recycled_) {
             for (auto &pool : shard_pools)
                 pool.clear();
@@ -528,19 +543,24 @@ public:
             return 0;
         }
         if (!ops_.copy_to_device) return 0;
-        const auto *host_base = static_cast<const char *>(shared_mem_host_);
-        const auto *host_field = const_cast<const char *>(static_cast<const volatile char *>(host_field_ptr));
-        if (host_field < host_base || host_field + size > host_base + shm_size_) {
+        // Integer addresses, not pointer arithmetic. Rejecting a field outside
+        // the window is this function's job, so it is handed such a pointer by
+        // design — and forming `field + size` from one, or comparing it against
+        // an unrelated base, is not defined. `size > shm_size_` is checked first
+        // so the subtraction below cannot wrap.
+        const auto base = reinterpret_cast<uintptr_t>(shared_mem_host_);
+        const auto field = reinterpret_cast<uintptr_t>(host_field_ptr);
+        if (field < base || size > shm_size_ || field - base > shm_size_ - size) {
             LOG_ERROR(
                 "BufferPoolManager::write_range_to_device: field [%p, %p) outside shm [%p, %p)",
-                static_cast<const void *>(host_field), static_cast<const void *>(host_field + size),
-                static_cast<const void *>(host_base), static_cast<const void *>(host_base + shm_size_)
+                reinterpret_cast<const void *>(field), reinterpret_cast<const void *>(field + size),
+                reinterpret_cast<const void *>(base), reinterpret_cast<const void *>(base + shm_size_)
             );
             return PTO_RUNTIME_ERR_INTERNAL;
         }
-        size_t offset = static_cast<size_t>(host_field - host_base);
+        size_t offset = static_cast<size_t>(field - base);
         void *dev_field = static_cast<char *>(shared_mem_dev_) + offset;
-        return ops_.copy_to_device(dev_field, host_field, size);
+        return ops_.copy_to_device(dev_field, const_cast<const void *>(host_field_ptr), size);
     }
 
     /**
@@ -563,19 +583,20 @@ public:
             return 0;
         }
         if (!ops_.copy_from_device) return 0;
-        const auto *host_base = static_cast<const char *>(shared_mem_host_);
-        const auto *host_field = const_cast<const char *>(static_cast<volatile char *>(host_field_ptr));
-        if (host_field < host_base || host_field + size > host_base + shm_size_) {
+        // Integer addresses, for the same reason as write_range_to_device above.
+        const auto base = reinterpret_cast<uintptr_t>(shared_mem_host_);
+        const auto field = reinterpret_cast<uintptr_t>(host_field_ptr);
+        if (field < base || size > shm_size_ || field - base > shm_size_ - size) {
             LOG_ERROR(
                 "BufferPoolManager::read_range_from_device: field [%p, %p) outside shm [%p, %p)",
-                static_cast<const void *>(host_field), static_cast<const void *>(host_field + size),
-                static_cast<const void *>(host_base), static_cast<const void *>(host_base + shm_size_)
+                reinterpret_cast<const void *>(field), reinterpret_cast<const void *>(field + size),
+                reinterpret_cast<const void *>(base), reinterpret_cast<const void *>(base + shm_size_)
             );
             return PTO_RUNTIME_ERR_INTERNAL;
         }
-        size_t offset = static_cast<size_t>(host_field - host_base);
+        size_t offset = static_cast<size_t>(field - base);
         const void *dev_field = static_cast<const char *>(shared_mem_dev_) + offset;
-        return ops_.copy_from_device(const_cast<void *>(static_cast<const void *>(host_field)), dev_field, size);
+        return ops_.copy_from_device(const_cast<void *>(host_field_ptr), dev_field, size);
     }
 
     /**
@@ -693,7 +714,7 @@ public:
     void notify_ready_waiters() {
         for (int shard_index = 0; shard_index < shard_count_; shard_index++) {
             auto &shard = ready_shards_[shard_index];
-            std::lock_guard<std::mutex> lock(shard.wait_mutex);
+            std::scoped_lock lock(shard.wait_mutex);
             shard.cv.notify_all();
         }
     }
@@ -793,7 +814,7 @@ public:
         }
         *host_ptr_out = host_ptr;
         {
-            std::scoped_lock<std::mutex> lock(mapping_mutex_);
+            std::unique_lock<std::shared_mutex> lock(mapping_mutex_);
             dev_to_host_[dev_ptr] = host_ptr;
             block_ranges_.push_back(
                 BlockRange{
@@ -817,7 +838,7 @@ public:
         void *host_ptr = nullptr;
         bool free_host_shadow = false;
         {
-            std::scoped_lock<std::mutex> lock(mapping_mutex_);
+            std::unique_lock<std::shared_mutex> lock(mapping_mutex_);
             auto it = dev_to_host_.find(release_ptr);
             host_ptr = (it != dev_to_host_.end()) ? it->second : nullptr;
             if (it != dev_to_host_.end()) {
@@ -838,7 +859,7 @@ public:
             ops_.free_(release_ptr);
         }
         {
-            std::scoped_lock<std::mutex> lock(mapping_mutex_);
+            std::unique_lock<std::shared_mutex> lock(mapping_mutex_);
             released_allocations_.erase(release_ptr);
         }
         if (free_host_shadow) {
@@ -848,11 +869,12 @@ public:
 
     /**
      * Resolve a device pointer to the host-mapped pointer recorded at
-     * alloc_and_register_block / register_mapping time. Mappings are built
-     * during init/proactive refill and are immutable while mgmt/collector
-     * threads run, so this hot path is read-only and lock-free.
+     * alloc_and_register_block / register_mapping time. Runtime replenishment
+     * may grow the exact and range mappings while drain shards resolve buffers,
+     * so readers hold a shared lock across both lookups.
      */
     void *resolve_host_ptr(void *dev_ptr) const {
+        std::shared_lock<std::shared_mutex> lock(mapping_mutex_);
         const auto &exact_mappings = dev_to_host_;
         auto it = exact_mappings.find(dev_ptr);
         if (it != exact_mappings.end()) return it->second;
@@ -869,7 +891,7 @@ public:
      * to be able to resolve them later.
      */
     void register_mapping(void *dev_ptr, void *host_ptr) {
-        std::scoped_lock<std::mutex> lock(mapping_mutex_);
+        std::unique_lock<std::shared_mutex> lock(mapping_mutex_);
         dev_to_host_[dev_ptr] = host_ptr;
     }
 
@@ -881,7 +903,7 @@ public:
      */
     void add_malloc_shadow(void *host_ptr) {
         if (host_ptr != nullptr) {
-            std::scoped_lock<std::mutex> lock(mapping_mutex_);
+            std::unique_lock<std::shared_mutex> lock(mapping_mutex_);
             malloc_shadows_.insert(host_ptr);
         }
     }
@@ -1000,7 +1022,7 @@ public:
      * the pointer itself.
      */
     void *release_pointer_for(void *dev_ptr) const {
-        std::scoped_lock<std::mutex> lock(mapping_mutex_);
+        std::shared_lock<std::shared_mutex> lock(mapping_mutex_);
         return allocation_base_for_locked(dev_ptr);
     }
 
@@ -1010,7 +1032,7 @@ public:
      */
     bool claim_release_pointer(void *dev_ptr, void **release_ptr_out) {
         if (release_ptr_out == nullptr) return false;
-        std::scoped_lock<std::mutex> lock(mapping_mutex_);
+        std::unique_lock<std::shared_mutex> lock(mapping_mutex_);
         void *release_ptr = tracked_allocation_base_for_locked(dev_ptr);
         if (release_ptr == nullptr) {
             *release_ptr_out = nullptr;
@@ -1121,7 +1143,7 @@ private:
         return nullptr;
     }
 
-    // Subsystem inputs (set by ProfilerBase::start via set_memory_context).
+    // Subsystem inputs (set by ProfilerBase via set_memory_context).
     void *shared_mem_dev_{nullptr};
     void *shared_mem_host_{nullptr};
     size_t shm_size_{0};
@@ -1142,7 +1164,7 @@ private:
     std::array<DoneQueueShard, kMaxCollectorShards> done_shards_;
 
     // Host-side pointer mappings are shared across all collector shards.
-    mutable std::mutex mapping_mutex_;
+    mutable std::shared_mutex mapping_mutex_;
 
     // dev → host exact mappings plus block ranges for carved buffers.
     std::unordered_map<void *, void *> dev_to_host_;
@@ -1164,5 +1186,3 @@ private:
 };
 
 }  // namespace profiling_common
-
-#endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_BUFFER_POOL_MANAGER_H_

@@ -552,11 +552,18 @@ def test_start_hierarchical_passes_each_chip_its_negotiated_frame_count(monkeypa
     class FakeParentWorker:
         def __init__(self) -> None:
             self.configured_depths: list[int] = []
+            self.configured_pending_depths: list[int] = []
+            self.configured_launch_depths: list[int] = []
             self.next_level_calls: list[tuple[int, int, int]] = []
             self.initialized = False
 
-        def configure_pipeline_depth(self, depth: int) -> None:
+        def configure_pipeline_depth(self, depth: int, pending_depth: int = 0, launch_depth: int = 1) -> None:
+            # Three budgets: the negotiated native pipeline-slot depth, the
+            # logical admission cap that defaults to deriving from it, and how
+            # many of those runs may have device work launched at once.
             self.configured_depths.append(int(depth))
+            self.configured_pending_depths.append(int(pending_depth))
+            self.configured_launch_depths.append(int(launch_depth))
 
         def add_next_level_worker(self, mailbox_addr: int, pid: int, task_frame_count: int) -> None:
             self.next_level_calls.append((int(mailbox_addr), int(pid), int(task_frame_count)))
@@ -612,6 +619,7 @@ def test_start_hierarchical_passes_each_chip_its_negotiated_frame_count(monkeypa
             shm.unlink()
 
     assert fake_parent.configured_depths == [1]
+    assert fake_parent.configured_pending_depths == [0]
     assert [call[1:] for call in fake_parent.next_level_calls] == [(12001, 2), (12002, 1)]
     assert fake_parent.initialized
     assert startup_events[0] == ("log", 60, True)
@@ -631,7 +639,7 @@ def test_start_hierarchical_seeds_the_logger_when_the_process_owns_no_chips(monk
             self.initialized = False
             self.sub_workers: list[int] = []
 
-        def configure_pipeline_depth(self, depth: int) -> None:
+        def configure_pipeline_depth(self, depth: int, pending_depth: int = 0, launch_depth: int = 1) -> None:
             pass
 
         def add_sub_worker(self, _mailbox_addr: int, pid: int) -> None:
@@ -732,6 +740,8 @@ class _FakeChipRun:
 class _FakeNativeRunImpl:
     def __init__(self, *, supports_concurrent_native_prepare: bool = False) -> None:
         self.supports_concurrent_native_prepare = supports_concurrent_native_prepare
+        # Reached only when the control loop could not establish resource ownership.
+        self.admission_stopped = False
         self.events: list[tuple] = []
         self.completed = [threading.Event(), threading.Event()]
         self.prepared = [threading.Event(), threading.Event()]
@@ -751,6 +761,14 @@ class _FakeNativeRunImpl:
         self._polled_slots: set[int] = set()
         self._runs: list[_FakeChipRun] = []
         self._lane_poisoned = False
+
+    def _stop_chip_run_lane_admission(self) -> None:
+        """The control loop reaches this through ``cw._impl`` when ownership is unknown.
+
+        Stopping admission is not a recovery: whatever poisoned the lane stays poisoned, so a
+        `close` that follows still reports it.
+        """
+        self.admission_stopped = True
 
     def register_callable_from_blob(self, cid: int, blob_addr: int) -> None:
         self.register_calls.append((int(cid), int(blob_addr)))
@@ -993,6 +1011,7 @@ class _FakeTwoFrameChipWorker:
     """
 
     pipeline_depth = 2
+    launch_depth = 1
 
     def __init__(self, *, supports_concurrent_native_prepare: bool = False) -> None:
         self._impl = _FakeNativeRunImpl(supports_concurrent_native_prepare=supports_concurrent_native_prepare)
@@ -1000,6 +1019,13 @@ class _FakeTwoFrameChipWorker:
         self.unregister_calls: list[int] = []
         self.unregister_called = threading.Event()
         self.unregister_error: Optional[BaseException] = None
+        self.exported_device_regions_live: Optional[bool] = None
+
+    # The loop synchronizes exported-region ownership after every control
+    # command, including a failed one: a command that failed can still have
+    # left a region live, and a stale flag would say otherwise.
+    def set_exported_device_regions_live(self, live: bool) -> None:
+        self.exported_device_regions_live = bool(live)
 
     def malloc(self, size: int) -> int:
         self._impl.events.append(("malloc", int(size)))
@@ -1087,6 +1113,7 @@ class _TwoFrameLoopHarness:
         state: int = worker_mod._TASK_READY,
         generation: int = 11,
         diagnostics: bool = False,
+        chip_swimlane: int = 0,
         task_slot: Optional[int] = None,
         group_index: int = 0,
         group_size: int = 1,
@@ -1096,9 +1123,10 @@ class _TwoFrameLoopHarness:
         try:
             frame[worker_mod._OFF_TASK_CALLABLE_HASH : worker_mod._OFF_TASK_ARGS_BLOB] = self.digest
             struct.pack_into("=ii", frame, worker_mod._OFF_TASK_ARGS_BLOB, 0, 0)
-            cfg_values = [0] * (7 + 3 * worker_mod.RUNTIME_ENV_RING_COUNT)
+            cfg_values = [0] * (6 + 3 * worker_mod.RUNTIME_ENV_RING_COUNT)
+            cfg_values[1] = chip_swimlane
             cfg_values[3] = int(diagnostics)
-            output_prefix = b"/tmp/simpler-test" if diagnostics else b""
+            output_prefix = b"/tmp/simpler-test" if diagnostics or chip_swimlane else b""
             worker_mod._CFG_FMT.pack_into(frame, worker_mod._OFF_CONFIG, *cfg_values, output_prefix)
             worker_mod._PIPELINE_LEASE_FMT.pack_into(frame, worker_mod._OFF_PIPELINE_LEASE, index, 0, generation)
             struct.pack_into("=Q", frame, worker_mod._OFF_FRAME_PROTOCOL, worker_mod._TASK_PROTOCOL_VERSION)
@@ -1209,6 +1237,38 @@ def test_two_frame_stages_b_without_native_prepare_until_a_finalizes():
             ("launch_enter", 1, 0, worker_mod._FRAME_STAGED),
         ]
     finally:
+        harness.close()
+
+
+@pytest.mark.parametrize("chip_swimlane,flushed", [(4, True), (4, False), (0, False)])
+def test_two_frame_swimlane_log_flush_before_completion(monkeypatch, chip_swimlane, flushed):
+    entered = threading.Event()
+    release = threading.Event()
+
+    def flush(context):
+        entered.set()
+        if chip_swimlane:
+            assert release.wait(5.0)
+        return flushed
+
+    monkeypatch.setattr(worker_mod, "_flush_host_log_or_warn", flush)
+    harness = _TwoFrameLoopHarness(chip_runtime="host_build_graph")
+    try:
+        harness.publish(0, 1, diagnostics=True, chip_swimlane=chip_swimlane)
+        harness.start()
+        assert harness.cw._impl.launched[0].wait(5.0)
+        harness.cw._impl.completed[0].set()
+        if not chip_swimlane:
+            harness.wait_state(0, worker_mod._TASK_DONE)
+            assert not entered.is_set(), "PMU-only completion must not flush the Host log"
+            return
+        assert entered.wait(5.0), "completion did not flush the swimlane Host log"
+        assert _mailbox_load_i32(harness.state_addr(0)) == worker_mod._TASK_LAUNCHED
+        release.set()
+        expected = worker_mod._TASK_DONE if flushed else worker_mod._TASK_FAILED
+        harness.wait_state(0, expected)
+    finally:
+        release.set()
         harness.close()
 
 
@@ -3182,35 +3242,29 @@ class TestRunHandle:
         with pytest.raises(ValueError, match="bad graph"):
             worker._submit_l3_locked(bad_graph, None, cast(Any, object()))
 
-    def test_submit_seeds_the_log_directory_from_the_run_output_prefix(self, monkeypatch):
-        """This process's log lands beside the run's other diagnostic artifacts.
-
-        `CallConfig.output_prefix` is the directory every diagnostic artifact
-        already goes under, and its contract is that the runtime never derives a
-        path itself — so the submit path hands that directory to the log layer
-        rather than the log layer reading one from the environment.
-        """
+    def test_submit_enables_the_process_log_only_for_output_runs(self, monkeypatch):
+        """An output run enables the stable process log before it builds the graph."""
         worker, _events = self._submission_failure_worker(failures=0)
-        seeded: list[str] = []
-        monkeypatch.setattr(worker_mod, "_native_set_host_log_directory", seeded.append)
+        bindings: list[None] = []
+        monkeypatch.setattr(worker_mod, "_bind_host_log_session_directory", lambda: bindings.append(None))
 
         def bad_graph(*_args):
             raise ValueError("bad graph")
 
         with pytest.raises(ValueError, match="bad graph"):
-            worker._submit_l3_locked(bad_graph, None, cast(Any, SimpleNamespace(output_prefix="/tmp/run-artifacts")))
-        assert seeded == ["/tmp/run-artifacts"]
+            worker._submit_locked(bad_graph, None, cast(Any, SimpleNamespace(output_prefix="/tmp/run-artifacts")))
+        assert bindings == [None]
 
-        # No prefix means no directory to seed, and spans stay on stderr.
-        seeded.clear()
+        # An empty prefix leaves the logger on stderr.
+        bindings.clear()
         with pytest.raises(ValueError, match="bad graph"):
-            worker._submit_l3_locked(bad_graph, None, cast(Any, SimpleNamespace(output_prefix="")))
-        assert seeded == []
+            worker._submit_locked(bad_graph, None, cast(Any, SimpleNamespace(output_prefix="")))
+        assert bindings == []
 
         # A config without the field at all must not be what fails a submit.
         with pytest.raises(ValueError, match="bad graph"):
-            worker._submit_l3_locked(bad_graph, None, cast(Any, object()))
-        assert seeded == []
+            worker._submit_locked(bad_graph, None, cast(Any, object()))
+        assert bindings == []
 
     def test_unsettled_graph_cancellation_abandons_the_handle_before_close(self):
         worker, events = self._submission_failure_worker(failures=2)
@@ -8210,7 +8264,7 @@ def test_a_failed_diagnostic_sidecar_write_fails_the_task_not_the_loop(tmp_path)
     try:
         frame[worker_mod._OFF_TASK_CALLABLE_HASH : worker_mod._OFF_TASK_ARGS_BLOB] = digest
         struct.pack_into("=ii", frame, worker_mod._OFF_TASK_ARGS_BLOB, 0, 0)
-        cfg_values = [0] * (7 + 3 * worker_mod.RUNTIME_ENV_RING_COUNT)
+        cfg_values = [0] * (6 + 3 * worker_mod.RUNTIME_ENV_RING_COUNT)
         cfg_values[1] = 4  # enable_chip_swimlane
         worker_mod._CFG_FMT.pack_into(frame, worker_mod._OFF_CONFIG, *cfg_values, str(tmp_path).encode())
         worker_mod._PIPELINE_LEASE_FMT.pack_into(frame, worker_mod._OFF_PIPELINE_LEASE, 0, 0, 11)

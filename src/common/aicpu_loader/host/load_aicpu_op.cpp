@@ -222,11 +222,15 @@ int LoadAicpuOp::BootstrapDispatcher(
     return 0;
 }
 
-void LoadAicpuOp::Finalize() {
+int LoadAicpuOp::Finalize() {
     if (binary_handle_ != nullptr) {
         rtError_t rc = rtsBinaryUnload(binary_handle_);
         if (rc != RT_ERROR_NONE) {
-            LOG_WARN("rtsBinaryUnload failed: %d", rc);
+            // The binary is still loaded on the device, and this handle is the
+            // only thing that names it. Retaining the whole loaded state keeps
+            // a retry a plain re-invocation rather than a half-cleared object.
+            LOG_ERROR("rtsBinaryUnload failed: %d — loader retains its handle for a close retry", rc);
+            return rc;
         }
         binary_handle_ = nullptr;
     }
@@ -237,9 +241,10 @@ void LoadAicpuOp::Finalize() {
         std::remove(json_file_path_.c_str());
         json_file_path_.clear();
     }
+    return 0;
 }
 
-void LoadAicpuOp::AbandonAfterDeviceFailure() {
+void LoadAicpuOp::ForgetWithoutUnload() {
     binary_handle_ = nullptr;
     func_handles_.clear();
     inner_fp_ = 0;
@@ -250,7 +255,9 @@ void LoadAicpuOp::AbandonAfterDeviceFailure() {
     }
 }
 
-LoadAicpuOp::~LoadAicpuOp() { Finalize(); }
+// Destruction cannot return an unload error to the caller. Explicit runner
+// finalization reports that error; this fallback discards the return value.
+LoadAicpuOp::~LoadAicpuOp() { (void)Finalize(); }
 
 bool LoadAicpuOp::GenerateAicpuOpJson(const std::string &json_path, const std::string &kernel_so) {
     // Inputs are a closed set: opType / functionName are KernelNames::*
@@ -304,6 +311,13 @@ int LoadAicpuOp::Init(const std::vector<std::string> &extra_symbols) {
         LOG_ERROR("LoadAicpuOp::Init: BootstrapDispatcher must be called first");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    if (binary_handle_ != nullptr) {
+        // A retained handle means a previous unload failed and the binary is
+        // still loaded. Loading a second one would overwrite the only record of
+        // it; a successful Finalize is the only way past this.
+        LOG_ERROR("LoadAicpuOp::Init: a binary is still loaded; Finalize must retire it first");
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
 
     // Base entries are exported by every runtime; the runtime reports any extra
     // entries it additionally exports (TMARB: register_callable; hbg: none), so
@@ -342,8 +356,15 @@ int LoadAicpuOp::Init(const std::vector<std::string> &extra_symbols) {
         void *&handle;
         bool active = true;
         ~BinaryGuard() {
+            // A rollback whose unload fails keeps the handle: the binary is
+            // still loaded, and `Finalize()` is the only thing that can retry
+            // it. Clearing here would strand it for the process's life.
             if (active && handle != nullptr) {
-                (void)rtsBinaryUnload(handle);
+                rtError_t rc = rtsBinaryUnload(handle);
+                if (rc != RT_ERROR_NONE) {
+                    LOG_ERROR("Init rollback: rtsBinaryUnload failed: %d — retaining handle for a close retry", rc);
+                    return;
+                }
                 handle = nullptr;
             }
         }
