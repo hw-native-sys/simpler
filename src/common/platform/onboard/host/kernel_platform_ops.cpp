@@ -118,12 +118,18 @@ int ensure_onboard_kernel_hardware_events() noexcept {
     rc = rtEventWorkModeSet(hardware_mode);
     if (rc == RT_ERROR_NONE) return 0;
     // CANN rejects a second setter, including concurrent requests for the same mode.
-    if (rtEventWorkModeGet(&mode) == RT_ERROR_NONE && mode == hardware_mode) return 0;
-    LOG_ERROR(
-        "kernel init: cannot enable process-wide hardware events (rtEventWorkModeSet failed: %d); "
-        "an explicitly configured software event mode cannot be replaced",
-        static_cast<int>(rc)
-    );
+    if (rtEventWorkModeGet(&mode) == RT_ERROR_NONE) {
+        if (mode == hardware_mode) return 0;
+        if (rc == ACL_ERROR_RT_PARAM_INVALID && mode == 0) {
+            LOG_ERROR(
+                "kernel init: warning: process-wide software event mode is already explicitly configured; "
+                "continuing with software events (rtEventWorkModeSet returned %d)",
+                static_cast<int>(rc)
+            );
+            return 0;
+        }
+    }
+    LOG_ERROR("kernel init: rtEventWorkModeSet failed: %d", static_cast<int>(rc));
     ACL_LOG_ERROR_DETAIL(rc);
     return static_cast<int>(rc);
 }

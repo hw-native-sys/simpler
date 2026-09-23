@@ -14,6 +14,8 @@
 #include <acl/acl.h>
 #include <runtime/rt.h>
 
+#include <string>
+
 #include "kernel_platform_ops.h"
 
 namespace {
@@ -23,6 +25,8 @@ bool configured = false;
 bool competing_hardware_setter = false;
 rtError_t query_error = 0;
 rtError_t setter_error = 0;
+rtError_t requery_error = 0;
+std::string last_error_log;
 int query_calls = 0;
 int setter_calls = 0;
 int resource_calls = 0;
@@ -33,7 +37,8 @@ protected:
         event_mode = 0;
         configured = false;
         competing_hardware_setter = false;
-        query_error = setter_error = 0;
+        query_error = setter_error = requery_error = 0;
+        last_error_log.clear();
         query_calls = setter_calls = resource_calls = 0;
     }
     void TearDown() override { EXPECT_EQ(resource_calls, 0); }
@@ -43,6 +48,7 @@ protected:
 extern "C" rtError_t rtEventWorkModeGet(uint8_t *mode) {
     ++query_calls;
     if (query_error != 0) return query_error;
+    if (query_calls > 1 && requery_error != 0) return requery_error;
     *mode = event_mode;
     return RT_ERROR_NONE;
 }
@@ -76,11 +82,21 @@ TEST_F(KernelEventMode, ExistingHardwareModeNeverCallsSetter) {
     EXPECT_EQ(setter_calls, 0);
 }
 
-TEST_F(KernelEventMode, ExplicitSoftwareModeIsAConflict) {
+TEST_F(KernelEventMode, ExplicitSoftwareModeLogsAndContinues) {
     configured = true;
-    EXPECT_EQ(ensure_onboard_kernel_hardware_events(), configured_error);
+    EXPECT_EQ(ensure_onboard_kernel_hardware_events(), 0);
     EXPECT_EQ(event_mode, 0);
     EXPECT_EQ(setter_calls, 1);
+    EXPECT_NE(last_error_log.find("continuing with software events"), std::string::npos);
+    EXPECT_EQ(ensure_onboard_kernel_hardware_events(), 0);
+    EXPECT_EQ(event_mode, 0);
+}
+
+TEST_F(KernelEventMode, SoftwareConflictRequiresSuccessfulModeRequery) {
+    configured = true;
+    requery_error = 507000;
+    EXPECT_EQ(ensure_onboard_kernel_hardware_events(), configured_error);
+    EXPECT_EQ(last_error_log.find("continuing with software events"), std::string::npos);
 }
 
 TEST_F(KernelEventMode, ConcurrentHardwareSelectionIsAcceptedAfterRequery) {
@@ -118,4 +134,4 @@ extern "C" aclError aclrtDestroyEvent(aclrtEvent) { return ++resource_calls; }
 extern "C" rtError_t rtStreamCreate(rtStream_t *, int32_t) { return ++resource_calls; }
 extern "C" rtError_t rtStreamDestroy(rtStream_t) { return ++resource_calls; }
 extern "C" const char *aclGetRecentErrMsg() { return nullptr; }
-extern "C" void unified_log_error(const char *, const char *, ...) {}
+extern "C" void unified_log_error(const char *, const char *format, ...) { last_error_log = format; }

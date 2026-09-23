@@ -85,8 +85,9 @@ simpler 没有调用过它们。
 | `finalize_device` | 释放上下文拥有的资源；测试断言 committed memory 归零 |
 
 kernel init 在核对借用的设备之后、创建 stream/event 之前，选择 CANN **进程级硬件
-capture event** 模式。已有硬件设置直接复用；如果应用已显式固定为软件模式，则返回
-CANN 配置错误，并且尚未创建上下文 stream/event。设置失败后会再次查询，允许另一
+capture event** 模式。已有硬件设置直接复用；如果应用已显式固定为软件模式，则以
+ERROR 日志等级输出警告，继续使用软件 event 完成初始化。其他查询或设置错误仍导致
+初始化失败。设置失败后会再次查询，允许另一
 初始化调用并发地先选中硬件模式。CANN 固定使用硬件模式且不支持模式 API 的平台，
 保留其原生行为。该设置影响同进程其他框架算子，close 不会恢复；program 模式的 init
 不执行这项设置。应用应在 kernel Worker 初始化之前确定进程级 event 策略。

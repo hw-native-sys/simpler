@@ -16,6 +16,7 @@ using aclrtStream = void *;
 using aclrtEvent = void *;
 constexpr uint32_t ACL_EVENT_SYNC = 1;
 constexpr uint64_t ACL_STOP_ON_FAILURE = 1;
+constexpr aclError ACL_ERROR_RT_PARAM_INVALID = 107000;
 constexpr aclError ACL_ERROR_RT_FEATURE_NOT_SUPPORT = 207000;
 
 extern "C" aclError aclrtGetDevice(int32_t *device);

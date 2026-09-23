@@ -45,8 +45,9 @@ distinct/non-null handles but cannot establish their creation flags.
 Kernel-mode initialization selects CANN's process-wide **hardware capture event**
 mode after validating the borrowed device and before creating streams or events.
 An existing hardware setting is reused. If the application explicitly fixed
-software event mode, initialization returns CANN's configuration error before
-creating context resources. A failed setter is rechecked in case another
+software event mode, initialization logs a warning at ERROR severity and
+continues using software events. Other query/set errors still fail initialization.
+A failed setter is rechecked in case another
 initializer selected hardware mode concurrently. Platforms where CANN fixes
 hardware mode and reports the mode API unsupported retain that native behavior.
 The setting affects other framework operators in the same process, survives
