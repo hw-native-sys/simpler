@@ -72,10 +72,14 @@ int query_stream_pair_error(rtStream_t aicpu_stream, rtStream_t aicore_stream);
  *
  * True only when the stream answers that it is capturing nothing. A capturing
  * or invalidated stream, an unavailable answer, and a null stream all say no,
- * which routes the values through the descriptor instead — the behaviour every
- * run had before the launch route existed. Read-only: it neither readies nor
- * retires the stream pair, and asking costs the run nothing when the answer is
- * no.
+ * which sends the values through the descriptor — the route every run took
+ * before this one existed. That is what saying no preserves, and all it
+ * preserves: it is not a statement that a capture would have worked, and this
+ * repo demonstrates no capture support. The descriptor route is also not free —
+ * it publishes the longer prefix — so a persistently unavailable answer costs
+ * every run those bytes.
+ *
+ * Read-only with respect to the stream pair: it neither readies nor retires it.
  *
  * Pass the same stream handle the launch will submit on, resolved and about to
  * be used, so the answer describes the stream that actually carries the launch.
@@ -86,7 +90,10 @@ bool launch_entry_args_permitted(rtStream_t aicpu_stream);
  * How one capture-status answer routes this run, given as its two halves so the
  * mapping is stated once and separately from the call that obtains it.
  *
- * Only a successful query reporting no capture opens the launch route.
+ * Only a successful query reporting no capture opens the launch route. Every
+ * other answer — including a status this build does not name — is treated as
+ * capturing, which is conservative about the route and says nothing about
+ * whether that capture is supported.
  */
 bool launch_route_permitted_by_capture(int query_rc, int capture_status);
 

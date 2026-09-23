@@ -642,12 +642,28 @@ int32_t AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx) {
             // the orchestrator thread: the scheduler threads are still waiting
             // on runtime_init_ready_, and nothing else reads these values.
             if (!adopt_launch_entry_args(runtime, thread_idx)) {
-                // Pre-runtime failure: rt and the SM header do not exist yet, so
-                // this reports through the thread's own return. Releasing the
-                // scheduler threads first is what keeps them from spinning on
-                // runtime_init_ready_ forever; they then see rt null, skip
-                // dispatch, and still retire their cores and reach the
-                // completion gate, which is what publishes the terminal record.
+                // Pre-runtime failure, reported by the thread's own return: rt
+                // and the SM header do not exist yet, so there is no shared
+                // error state to latch. The two statements below are the same
+                // pair the arg-count rejection a few lines down already uses,
+                // and what follows them is that path's, not new code:
+                //
+                //   `run` sees a non-zero run_orchestration and withholds this
+                //   thread's `normal_path` claim -> the release below frees the
+                //   scheduler threads from their runtime_init_ready_ spin ->
+                //   each sees `rt` null (file-scope, nulled by every run's gate
+                //   cleanup), skips dispatch and withholds its own claim ->
+                //   every thread still calls sched_ctx_.shutdown to retire the
+                //   cores it owns, then terminal_.record_participant, then
+                //   arrives at completion_gate_ -> the last arrival runs
+                //   snapshot_run_terminal, where run_terminal_select turns an
+                //   incomplete normal path carrying a participant failure into
+                //   an Error terminal rather than a success or an undecided
+                //   read.
+                //
+                // Returning out of the entry instead would leave the AICore
+                // workers waiting on gates nobody releases until the
+                // op-execute timeout.
                 runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;
             }

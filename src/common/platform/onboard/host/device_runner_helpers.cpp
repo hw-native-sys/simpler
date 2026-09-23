@@ -82,9 +82,11 @@ int query_stream_pair_error(rtStream_t aicpu_stream, rtStream_t aicore_stream) {
 
 bool launch_route_permitted_by_capture(int query_rc, int capture_status) {
     // Anything but a successful "capturing nothing" routes through the
-    // descriptor. An answer the query could not give is treated as capturing:
-    // the descriptor route is always correct, so an unavailable answer costs
-    // this run a longer copy and nothing else.
+    // descriptor. An answer the query could not give is treated as capturing,
+    // which keeps the route this run would have taken before the launch route
+    // existed — a preserved behaviour, not a demonstration that a capture
+    // would have been handled. It is not free either: that route publishes the
+    // longer prefix.
     if (query_rc != ACL_SUCCESS) return false;
     return capture_status == static_cast<int>(ACL_MODEL_RI_CAPTURE_STATUS_NONE);
 }
@@ -95,6 +97,8 @@ bool launch_entry_args_permitted(rtStream_t aicpu_stream) {
     aclmdlRI model_ri = nullptr;
     const aclError rc = aclmdlRICaptureGetInfo(aicpu_stream, &status, &model_ri);
     if (rc != ACL_SUCCESS) {
+        // Not a run failure, and not retried. Logged because a persistent one
+        // silently costs every run the longer descriptor prefix.
         LOG_INFO("aclmdlRICaptureGetInfo unavailable (%d); entry args take the descriptor route", static_cast<int>(rc));
     }
     return launch_route_permitted_by_capture(static_cast<int>(rc), static_cast<int>(status));

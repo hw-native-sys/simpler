@@ -224,7 +224,8 @@ hbg_case(test_kernel_args_helper.cpp
 # directory to mirror, and the case stays beside the platform helper that
 # publishes the prefixes it measures.
 tmr_case(test_runtime_workers_boundary.cpp
-    SOURCES ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp)
+    SOURCES ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
+    DEFINES SIMPLER_UT_TRB_RUNTIME)
 
 hbg_case(test_runtime_workers_boundary.cpp
     SOURCES ${HBG_COMMON_SHARED_DIR}/runtime.cpp)
