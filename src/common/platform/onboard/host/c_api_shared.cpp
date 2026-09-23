@@ -1393,6 +1393,14 @@ static int launch_prepared_run(OnboardNativeRunContext *state, const NativeRunJo
             DeviceRunnerBase::LaunchOutcome launch =
                 state->runner->launch_execution(std::move(state->prepared_execution), std::move(state->launch_permit));
             rc = launch.rc;
+            // Where the fact becomes true, and from the transaction's own
+            // report of how far it got rather than from a pointer that a later
+            // unwind could clear: any progress past NotStarted means this run
+            // owns device work. Recorded before the receipt check below, so a
+            // failure there cannot lose it.
+            if (launch.progress != LaunchProgress::NotStarted) {
+                note_workspace_fact(state, WorkspaceManager::RunFact::Launched);
+            }
             state->prepared_execution = std::move(launch.prepared);
             state->active_execution = std::move(launch.active);
             if (launch.progress == LaunchProgress::Complete && !state->publish_acceptance(launch.receipt)) {
@@ -1540,6 +1548,9 @@ int simpler_probe_run_retention(
     if (successor != nullptr) {
         successor->active_execution = std::move(active_successor);
         if (successor->active_execution != nullptr) {
+            // The fixture launched it, so the successor owns device work from
+            // here. Reported for the successor's own identity, not this run's.
+            note_workspace_fact(successor, WorkspaceManager::RunFact::Launched);
             // The fixture drained it, so it reaches finalize in the same phase an
             // ordinary wait would leave it in. Set outright rather than only over
             // a zero: a context starts at -1 so a run that never completed cannot
@@ -1577,11 +1588,11 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     // that must be drained, whose rc is the run's result, and whose runtime
     // holds a live GM/SM pointer, from one that never touched a stream.
     const bool launched = state->active_execution != nullptr;
-    // An ownership fact, not a code: the launch transaction hands back an
-    // ActiveExecution only once the run reached the device. A launch that got
-    // that far already reported it, and the ledger keeps that report even if a
-    // partial unwind left this pointer null, so "never submitted" is only ever
-    // recorded for a run no launch claimed.
+    // An ownership fact, not a code. A live ActiveExecution proves this run
+    // reached the device, so reporting a launch from it is sound; the converse
+    // is not, which is why the launch transaction reports its own progress
+    // where it happens. The ledger keeps that earlier report, so the branch
+    // below can only ever add "never submitted" to a run no launch claimed.
     note_workspace_fact(
         state, launched ? WorkspaceManager::RunFact::Launched : WorkspaceManager::RunFact::NoDeviceSubmission
     );
