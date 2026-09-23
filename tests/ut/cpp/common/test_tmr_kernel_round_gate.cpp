@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -32,6 +33,12 @@ public:
     void wait() {
         std::unique_lock<std::mutex> lock(mutex_);
         condition_.wait(lock, [&] {
+            return ready_;
+        });
+    }
+    bool wait_for(std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_for(lock, timeout, [&] {
             return ready_;
         });
     }
@@ -277,4 +284,95 @@ TEST(TmrKernelRoundGateTest, ThreadedRepeatedRoundsIncludeFilteredAndDuplicateCp
         }
     }
 }
+
+void finish_tickets(KernelRoundGate &gate, const std::vector<KernelRoundTicket> &tickets, int32_t status = 0) {
+    for (size_t i = 0; i < tickets.size(); ++i) {
+        EXPECT_EQ(gate.arrive(tickets[i], 0), i + 1 == tickets.size() ? RoundArrival::Finalizer : RoundArrival::Peer);
+    }
+    ASSERT_TRUE(gate.publish_final_status(tickets.back(), 0, 0));
+    for (size_t i = 0; i < tickets.size(); ++i) {
+        KernelFinalStatus result;
+        ASSERT_TRUE(gate.read_final_status(tickets[i], &result));
+        EXPECT_EQ(result.runtime_status, status);
+        EXPECT_EQ(gate.depart(tickets[i]), i + 1 == tickets.size() ? RoundDeparture::Last : RoundDeparture::Peer);
+    }
+    EXPECT_FALSE(gate.idle());
+    ASSERT_TRUE(gate.complete_departure(tickets.back()));
+    EXPECT_TRUE(gate.idle());
+}
+
+TEST(TmrKernelRoundGateTest, ExactPrefixAdmitsBeforeLateDuplicateCpuReports) {
+    for (int32_t status : {0, -19}) {
+        KernelRoundGate gate;
+        std::vector<KernelRoundTicket> tickets(4);
+        ASSERT_TRUE(gate.join(4, 10, &tickets[0]));
+        ASSERT_TRUE(gate.join(4, 11, &tickets[1]));
+        const int32_t allowed[]{10, 11};
+        ASSERT_TRUE(gate.publish_admission(tickets[0], allowed, 2, status));
+        for (int32_t i = 0; i < 2; ++i) {
+            KernelRoundAdmission admission;
+            ASSERT_TRUE(gate.wait_admission(tickets[i], &admission));
+            EXPECT_EQ(admission.execution_index, i);
+            EXPECT_EQ(admission.status, status);
+        }
+        EXPECT_FALSE(gate.idle());
+        for (int32_t i = 2; i < 4; ++i) {
+            ASSERT_TRUE(gate.join(4, 10, &tickets[i]));
+            KernelRoundAdmission admission;
+            ASSERT_TRUE(gate.wait_admission(tickets[i], &admission));
+            EXPECT_EQ(admission.execution_index, -1);
+            EXPECT_EQ(admission.status, status);
+        }
+        KernelRoundTicket extra;
+        EXPECT_FALSE(gate.join(4, 11, &extra));
+        finish_tickets(gate, tickets, status);
+        Round following(gate);
+        following.admit();
+        following.finish(0, 0, 0, 0);
+    }
+}
+
+TEST(TmrKernelRoundGateTest, FallbackWaitsForEveryReportAndPreservesExactMatches) {
+    KernelRoundGate gate;
+    std::vector<KernelRoundTicket> tickets(4);
+    ASSERT_TRUE(gate.join(4, 90, &tickets[0]));
+    ASSERT_TRUE(gate.join(4, 91, &tickets[1]));
+    const int32_t allowed[]{10, 11};
+    Signal admitted;
+    std::thread publisher([&] {
+        EXPECT_TRUE(gate.publish_admission(tickets[0], allowed, 2, 0));
+        admitted.set();
+    });
+    EXPECT_FALSE(admitted.wait_for(std::chrono::milliseconds(20)));
+    EXPECT_TRUE(gate.join(4, 10, &tickets[2]));
+    EXPECT_FALSE(admitted.wait_for(std::chrono::milliseconds(20)));
+    EXPECT_TRUE(gate.join(4, 92, &tickets[3]));
+    publisher.join();
+    const int32_t expected[]{1, -1, 0, -1};
+    for (size_t i = 0; i < tickets.size(); ++i) {
+        KernelRoundAdmission admission;
+        ASSERT_TRUE(gate.wait_admission(tickets[i], &admission));
+        EXPECT_EQ(admission.execution_index, expected[i]);
+    }
+    finish_tickets(gate, tickets);
+}
+
+TEST(TmrKernelRoundGateTest, EarliestDuplicateWinsBeforeExactPrefixCompletes) {
+    KernelRoundGate gate;
+    std::vector<KernelRoundTicket> tickets(4);
+    ASSERT_TRUE(gate.join(4, 10, &tickets[0]));
+    ASSERT_TRUE(gate.join(4, 10, &tickets[1]));
+    ASSERT_TRUE(gate.join(4, 11, &tickets[2]));
+    const int32_t allowed[]{10, 11};
+    ASSERT_TRUE(gate.publish_admission(tickets[0], allowed, 2, 0));
+    ASSERT_TRUE(gate.join(4, 11, &tickets[3]));
+    const int32_t expected[]{0, -1, 1, -1};
+    for (size_t i = 0; i < tickets.size(); ++i) {
+        KernelRoundAdmission admission;
+        ASSERT_TRUE(gate.wait_admission(tickets[i], &admission));
+        EXPECT_EQ(admission.execution_index, expected[i]);
+    }
+    finish_tickets(gate, tickets);
+}
+
 }  // namespace

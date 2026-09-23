@@ -73,7 +73,6 @@ public:
                 slots_[0].cpu = reported_cpu;
                 slots_[0].phase.store(stamp(epoch + 1, Stage::Joined), std::memory_order_relaxed);
                 claims_.store(stamp(epoch + 1, 1), std::memory_order_relaxed);
-                published_.store(1, std::memory_order_relaxed);
                 *out = {epoch + 1, 0};
                 lifecycle_.store(stamp(epoch + 1, Stage::Joining), std::memory_order_release);
                 return true;
@@ -82,7 +81,10 @@ public:
                 state = lifecycle_.load(std::memory_order_acquire);
                 continue;
             }
-            if (stage(state) != Stage::Joining || launched_.load(std::memory_order_relaxed) != launched) return false;
+            if ((stage(state) != Stage::Joining && stage(state) != Stage::Admitting &&
+                 stage(state) != Stage::Admitted) ||
+                launched_.load(std::memory_order_relaxed) != launched)
+                return false;
             uint64_t claim = claims_.load(std::memory_order_relaxed);
             for (;;) {
                 const int32_t index = static_cast<int32_t>(stage(claim));
@@ -91,8 +93,6 @@ public:
                 slots_[index].cpu = reported_cpu;
                 slots_[index].phase.store(stamp(epoch, Stage::Joined), std::memory_order_release);
                 *out = {epoch, index};
-                // A claim alone does not publish the slot's CPU report.
-                published_.fetch_add(1, std::memory_order_acq_rel);
                 return true;
             }
         }
@@ -113,27 +113,37 @@ public:
                 if (allowed_cpus[i] == allowed_cpus[j]) return false;
         }
         const uint64_t joining = stamp(leader.epoch, Stage::Joining);
-        int32_t launched;
-        for (;;) {
-            if (lifecycle_.load(std::memory_order_acquire) != joining) return false;
-            launched = launched_.load(std::memory_order_relaxed);
-            if (count > launched) return false;
-            if (published_.load(std::memory_order_acquire) == launched) break;
-        }
+        if (lifecycle_.load(std::memory_order_acquire) != joining) return false;
+        const int32_t launched = launched_.load(std::memory_order_relaxed);
+        if (count > launched) return false;
         uint64_t expected = joining;
         if (!lifecycle_.compare_exchange_strong(
                 expected, stamp(leader.epoch, Stage::Admitting), std::memory_order_acq_rel
             ))
             return false;
         bool filled[MAX_GATE_THREADS]{};
+        int32_t exact_matches = 0;
         for (int32_t i = 0; i < launched; ++i) {
+            // Consume a contiguous slot prefix. A lower claimed slot may
+            // still publish the first occurrence of an allowed CPU.
+            for (;;) {
+                const uint64_t phase = slots_[i].phase.load(std::memory_order_acquire);
+                if (phase == stamp(leader.epoch, Stage::Joined) ||
+                    phase == stamp(leader.epoch, Stage::ReadingAdmission))
+                    break;
+            }
             for (int32_t role = 0; role < count; ++role) {
                 if (!filled[role] && slots_[i].cpu == allowed_cpus[role]) {
                     slots_[i].execution_index = role;
                     filled[role] = true;
+                    ++exact_matches;
                     break;
                 }
             }
+            // Remaining slots have larger launch indices and cannot replace
+            // these exact matches. They may join after admission as filtered
+            // participants and still pin final status and retirement.
+            if (exact_matches == count) break;
         }
         int32_t role = 0;
         for (int32_t i = 0; i < launched; ++i) {
@@ -284,7 +294,6 @@ private:
     std::atomic<uint64_t> lifecycle_{0};
     std::atomic<uint64_t> claims_{0};
     std::atomic<int32_t> launched_{0};
-    std::atomic<int32_t> published_{0};
     std::atomic<int32_t> arrived_{0};
     std::atomic<int32_t> departed_{0};
     Slot slots_[MAX_GATE_THREADS];

@@ -68,11 +68,15 @@ void platform_signal_aicore_exit(uint64_t reg_addr) { write_reg(reg_addr, RegId:
 
 uint64_t platform_aicore_exit_deadline() { return get_sys_cnt_aicpu() + inner_get_deinit_timeout_ticks(); }
 
-void platform_close_aicore_window(uint64_t reg_addr) {
+static void write_aicore_window_close(uint64_t reg_addr) {
     // Initialize task dispatch register to idle state
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
     // Close fast path control
     write_reg(reg_addr, RegId::FAST_PATH_ENABLE, REG_SPR_FAST_PATH_CLOSE);
+}
+
+void platform_close_aicore_window(uint64_t reg_addr) {
+    write_aicore_window_close(reg_addr);
     // Complete the posted MMIO close. A release store alone is not a
     // device-write completion fence; the drain that pairs with this read is the
     // caller's, so several windows share one.
@@ -130,10 +134,15 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
     int32_t rc = 0;
     for (size_t i = 0; i < count; ++i) {
         if (acknowledged[i]) {
-            platform_close_aicore_window(targets[i].reg_addr);
+            write_aicore_window_close(targets[i].reg_addr);
         } else {
             rc = -1;
         }
+    }
+    // Issue the whole group's posted CLOSE writes before reading back any
+    // window. Each acknowledged window still needs its own completion read.
+    for (size_t i = 0; i < count; ++i) {
+        if (acknowledged[i]) (void)read_reg(targets[i].reg_addr, RegId::FAST_PATH_ENABLE);
     }
     // One drain covers every readback the close pass issued, and it is what
     // orders every store below after the CLOSE it belongs to: a dsb blocks

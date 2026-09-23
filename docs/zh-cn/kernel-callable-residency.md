@@ -176,6 +176,13 @@ callable 驻留、orch SO 加载和参数绑定，再调用公共 `prepare_execu
 leader 调用同一个准备函数。`KernelRoundGate` 只负责准入、线程筛选、最终结果和全部线程退场，
 不再维护初始化屏障或完成回调。
 
+准入按 launch index 的连续已发布前缀检查 CPU 报告；请求的角色全部精确匹配后即可放行，
+不必等待剩余线程。尚未发布的低 index slot 仍须等待，避免错过更早的同 CPU 报告。
+若精确匹配不足，则等全部线程报告后按原有顺序 fallback。晚到线程作为 filtered participant
+继续参与最终结果和退场，全部 launched 线程退出前不能复用本轮状态。
+A2/A3 host 查询 `OCCUPY` 与 `PHY_DIE_ID`，用 `die_id * 8 + local_cpu_id` 生成与设备
+`sched_getcpu()` 一致的 CPU 编号；例如 die 1 的 `0xfc` 对应 CPU 10–15，四线程选择 12–15。
+
 TMR 默认多线程启动时，公共准备完成后，orchestrator 开始建图。
 Kernel 与 program 共用 `handshake_owned_clusters()` 和 `assign_own_clusters()`：每个 scheduler
 轮询自己负责的 cluster，批量发布 task 指针和打开寄存器窗口，再初始化所属核的 tracker、

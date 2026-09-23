@@ -21,6 +21,12 @@
 #include "aicore/aicore.h"
 #include "aicore/aicore_profiling_state.h"
 #include "aicpu/platform_regs.h"
+#include "aicpu/device_time.h"
+#pragma push_macro("OUT_OF_ORDER_STORE_BARRIER")
+#undef OUT_OF_ORDER_STORE_BARRIER
+#include "common/memory_barrier.h"
+#pragma pop_macro("OUT_OF_ORDER_STORE_BARRIER")
+#include "aicore_teardown.h"
 #include "runtime.h"
 
 void aicore_execute(Runtime *runtime, int block_idx, CoreType core_type);
@@ -258,3 +264,127 @@ volatile uint8_t *sim_get_reg_base() { return reinterpret_cast<volatile uint8_t 
 uint32_t sim_get_physical_core_id() { return 0; }
 uint32_t get_aicore_profiling_flag() { return 0; }
 ChipSwimlaneActiveHead *get_chip_swimlane_aicore_head() { return nullptr; }
+
+// This copy executes the production control flow against observable MMIO and
+// barrier operations. The executor tests above link the normal platform TU.
+namespace retirement_order_probe {
+constexpr size_t kWindowCount = 3;
+using RegisterWindow = std::array<uint32_t, 0x500 / sizeof(uint32_t)>;
+alignas(64) std::array<RegisterWindow, kWindowCount> windows{};
+AicoreTeardownControl controls[kWindowCount]{};
+AicoreExitTarget targets[kWindowCount]{};
+std::array<bool, kWindowCount> expected_ack{};
+std::array<bool, kWindowCount> readback_seen{};
+size_t active_count = 0;
+size_t readbacks = 0;
+bool drained = false;
+
+void prepare(const std::array<bool, kWindowCount> &acks, size_t count = kWindowCount) {
+    expected_ack = acks;
+    readback_seen.fill(false);
+    active_count = count;
+    readbacks = 0;
+    drained = false;
+    for (size_t i = 0; i < kWindowCount; ++i) {
+        windows[i].fill(0);
+        controls[i].post_close_release = 0;
+        windows[i][reg_offset(RegId::FAST_PATH_ENABLE) / sizeof(uint32_t)] = REG_SPR_FAST_PATH_OPEN;
+        windows[i][reg_offset(RegId::COND) / sizeof(uint32_t)] = acks[i] ? AICORE_EXITED_VALUE : AICORE_IDLE_VALUE;
+        targets[i] = {reinterpret_cast<uint64_t>(windows[i].data()), &controls[i]};
+    }
+}
+
+uint32_t observe_reg_load(const volatile uint32_t *ptr) {
+    for (size_t i = 0; i < active_count; ++i) {
+        if (ptr != &windows[i][reg_offset(RegId::FAST_PATH_ENABLE) / sizeof(uint32_t)]) continue;
+        EXPECT_TRUE(expected_ack[i]);
+        EXPECT_FALSE(readback_seen[i]);
+        readback_seen[i] = true;
+        EXPECT_FALSE(drained);
+        for (size_t j = 0; j < active_count; ++j) {
+            EXPECT_EQ(
+                windows[j][reg_offset(RegId::FAST_PATH_ENABLE) / sizeof(uint32_t)],
+                expected_ack[j] ? REG_SPR_FAST_PATH_CLOSE : REG_SPR_FAST_PATH_OPEN
+            ) << "Window "
+              << j << " at readback of window " << i;
+            EXPECT_EQ(controls[j].post_close_release, 0U);
+        }
+        ++readbacks;
+    }
+    return *ptr;
+}
+
+void observe_write_reg(uint64_t base, RegId reg, uint32_t value) {
+    *reinterpret_cast<uint32_t *>(base + reg_offset(reg)) = value;
+}
+
+void observe_read_barrier() {
+    size_t acknowledged_count = 0;
+    for (size_t i = 0; i < active_count; ++i) {
+        acknowledged_count += expected_ack[i] ? 1 : 0;
+        EXPECT_EQ(readback_seen[i], expected_ack[i]);
+        EXPECT_EQ(controls[i].post_close_release, 0U);
+    }
+    EXPECT_EQ(readbacks, acknowledged_count);
+    EXPECT_FALSE(drained);
+    drained = true;
+}
+
+void observe_write_barrier() {}
+
+#pragma push_macro("rmb")
+#pragma push_macro("wmb")
+#undef rmb
+#undef wmb
+#define rmb() observe_read_barrier()
+#define wmb() observe_write_barrier()
+#define get_reg_ptr observed_reg_ptr
+#define read_reg observed_read_reg
+#define reg_load_acquire observe_reg_load
+#define write_reg observe_write_reg
+#include "../../../../src/a2a3/platform/shared/aicpu/platform_regs.cpp"
+#undef write_reg
+#undef reg_load_acquire
+#undef read_reg
+#undef get_reg_ptr
+#pragma pop_macro("wmb")
+#pragma pop_macro("rmb")
+
+TEST(AicoreRetirementOrdering, ClosesWholeGroupBeforeFirstReadbackAndDrainsBeforeRelease) {
+    prepare({true, true, true});
+    bool released[kWindowCount]{};
+    EXPECT_EQ(retirement_order_probe::platform_retire_aicore_group(targets, kWindowCount, 0, released), 0);
+    EXPECT_TRUE(drained);
+    EXPECT_EQ(readbacks, kWindowCount);
+    for (size_t i = 0; i < kWindowCount; ++i) {
+        EXPECT_TRUE(released[i]);
+        EXPECT_EQ(controls[i].post_close_release, AICORE_POST_CLOSE_RELEASE);
+        EXPECT_EQ(windows[i][reg_offset(RegId::DATA_MAIN_BASE) / sizeof(uint32_t)], AICPU_IDLE_TASK_ID);
+    }
+}
+
+TEST(AicoreRetirementOrdering, TimeoutClosesAndReadsOnlyAcknowledgedWindowsBeforeRelease) {
+    prepare({true, false, true});
+    bool released[kWindowCount]{};
+    EXPECT_EQ(retirement_order_probe::platform_retire_aicore_group(targets, kWindowCount, 0, released), -1);
+    EXPECT_TRUE(drained);
+    EXPECT_EQ(readbacks, 2U);
+    for (size_t i = 0; i < kWindowCount; ++i) {
+        EXPECT_EQ(released[i], expected_ack[i]);
+        EXPECT_EQ(controls[i].post_close_release, expected_ack[i] ? AICORE_POST_CLOSE_RELEASE : 0U);
+        EXPECT_EQ(
+            windows[i][reg_offset(RegId::DATA_MAIN_BASE) / sizeof(uint32_t)],
+            expected_ack[i] ? AICPU_IDLE_TASK_ID : AICORE_EXIT_SIGNAL
+        );
+    }
+}
+
+TEST(AicoreRetirementOrdering, SingleWindowCloseIncludesReadbackAndLeavesDrainToCaller) {
+    prepare({true, false, false}, 1);
+    platform_close_aicore_window(targets[0].reg_addr);
+    EXPECT_EQ(readbacks, 1U);
+    EXPECT_FALSE(drained);
+    EXPECT_EQ(controls[0].post_close_release, 0U);
+    EXPECT_EQ(windows[0][reg_offset(RegId::DATA_MAIN_BASE) / sizeof(uint32_t)], AICPU_IDLE_TASK_ID);
+}
+}  // namespace retirement_order_probe

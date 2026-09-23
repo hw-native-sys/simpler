@@ -223,4 +223,38 @@ TEST(TmrKernelExecutionRoundTest, DelayedExecutorDoesNotBlockPeerExecution) {
     EXPECT_TRUE(executor.kernel_gate_.idle());
 }
 
+TEST(TmrKernelExecutionRoundTest, ExactParticipantsExecuteBeforeFilteredThreadJoins) {
+    for (int32_t status : {0, -47}) {
+        ExecutorModel executor;
+        executor.execute_status = status;
+        Signal executing;
+        executor.on_execute = [&](int32_t) {
+            executing.set();
+        };
+        const auto request = executor.request();
+        std::array<int32_t, ExecutorModel::kLaunchedThreads> results{};
+        std::vector<std::thread> threads;
+        for (int32_t i = 0; i < ExecutorModel::kExecutionThreads; ++i) {
+            threads.emplace_back([&, i] {
+                results[i] = execute_kernel_round_impl(executor, request, 10 + i);
+            });
+        }
+        EXPECT_TRUE(executing.wait_for());
+        EXPECT_EQ(executor.clears.load(), 0);
+        EXPECT_EQ(executor.kernel_storage_.publications.load(), 0);
+        EXPECT_TRUE(executor.kernel_invocation_.active.load());
+        EXPECT_FALSE(executor.kernel_gate_.idle());
+        results.back() = execute_kernel_round_impl(executor, request, 13);
+        for (auto &thread : threads)
+            thread.join();
+        for (int32_t result : results)
+            EXPECT_EQ(result, status);
+        EXPECT_EQ(executor.kernel_storage_.published.runtime_status, status);
+        EXPECT_EQ(executor.kernel_storage_.publications.load(), 1);
+        EXPECT_EQ(executor.clears.load(), status == 0 ? 1 : 0);
+        EXPECT_EQ(executor.kernel_gate_.idle(), status == 0);
+        if (status != 0) EXPECT_EQ(execute_kernel_round_impl(executor, request, 10), -1);
+    }
+}
+
 }  // namespace

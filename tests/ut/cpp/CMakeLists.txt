@@ -1727,28 +1727,26 @@ target_link_libraries(test_sim_device_log PRIVATE
 add_test(NAME test_sim_device_log COMMAND test_sim_device_log)
 set_tests_properties(test_sim_device_log PROPERTIES LABELS "no_hardware")
 
-# a2a3 host-side AICPU affinity selection (compute_allowed_cpus). Pure logic —
-# no CANN headers, no hardware: compile the probe .cpp alongside the test. The
-# test provides its own no-op logger stubs, so no logger sources are linked.
-# The dlopen/dlsym HAL path is never exercised by these tests (only
-# compute_allowed_cpus is), but the .cpp references libdl symbols, so link it.
+# a2a3 host-side AICPU affinity selection. aicpu_affinity_select.cpp holds the
+# arithmetic half of the probe and reaches for neither CANN nor libdl, so it
+# compiles here as-is; its sibling aicpu_topology_probe.cpp owns the driver
+# queries and includes ascend_hal.h, which this CANN-free build cannot see.
+# The test provides its own no-op logger stubs, so no logger sources are linked.
 # Regression barrier for issue #1045 (all survivors in one cluster).
 set(A2A3_ONBOARD_HOST_DIR ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/onboard/host)
 set(SIMPLER_COMMON_PLATFORM_DIR ${CMAKE_SOURCE_DIR}/../../../src/common/platform)
 add_executable(test_a2a3_aicpu_affinity_select
     a2a3/test_aicpu_affinity_select.cpp
-    ${A2A3_ONBOARD_HOST_DIR}/aicpu_topology_probe.cpp
+    ${A2A3_ONBOARD_HOST_DIR}/aicpu_affinity_select.cpp
 )
 target_include_directories(test_a2a3_aicpu_affinity_select PRIVATE
     ${GTEST_INCLUDE_DIRS}
     ${A2A3_ONBOARD_HOST_DIR}
     ${SIMPLER_LOG_DIR}/include
-    ${SIMPLER_COMMON_PLATFORM_DIR}/include
 )
 target_link_libraries(test_a2a3_aicpu_affinity_select PRIVATE
     ${GTEST_MAIN_LIB}
     ${GTEST_LIB}
-    ${CMAKE_DL_LIBS}
     pthread
 )
 add_test(NAME test_a2a3_aicpu_affinity_select COMMAND test_a2a3_aicpu_affinity_select)

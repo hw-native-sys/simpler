@@ -10,7 +10,7 @@
  */
 /**
  * Unit tests for a2a3 host-side AICPU affinity selection
- * (compute_allowed_cpus from src/a2a3/platform/onboard/host/aicpu_topology_probe).
+ * (src/a2a3/platform/onboard/host/aicpu_affinity_select.cpp).
  *
  * This is the regression barrier for issue #1045: AICPU survivors must all
  * land in one NUMA cluster. Moving selection host-side (PR #1119) made it a
@@ -30,9 +30,9 @@
 
 #include "aicpu_topology_probe.h"
 
-// Minimal logger stubs so aicpu_topology_probe.cpp links without pulling in
-// HostLogger. compute_allowed_cpus only emits LOG_WARN; the probe path (not
-// exercised here) also uses LOG_INFO. The unified_log symbols have C
+// Minimal logger stubs so aicpu_affinity_select.cpp links without pulling in
+// HostLogger. It reaches for only unified_log_error and unified_log_warn; the
+// rest are here to cover the whole unified_log surface. The symbols have C
 // linkage (see common/unified_log.h), so match it. No-ops — these tests
 // assert on return values, not log text.
 extern "C" {
@@ -45,6 +45,7 @@ void unified_log_debug(const char *, const char *, ...) {}
 
 using pto::a2a3::AicpuLogicalCpu;
 using pto::a2a3::compute_allowed_cpus;
+using pto::a2a3::resolve_aicpu_cpu_id_base;
 
 namespace {
 
@@ -79,6 +80,34 @@ TEST(A2a3AffinitySelect, HbgThreeThreadsLandInOneCluster) {
     const int32_t c = cluster_of(allowed[0]);
     for (int32_t id : allowed)
         EXPECT_EQ(cluster_of(id), c) << "cpu " << id << " crossed a cluster";
+}
+
+TEST(A2a3AffinitySelect, DieZeroUsesLocalCpuIds) {
+    int32_t base = -1;
+    ASSERT_TRUE(resolve_aicpu_cpu_id_base(/*phy_die_id=*/0, base));
+    EXPECT_EQ(base, 0);
+}
+
+TEST(A2a3AffinitySelect, A3OffsetsTheSecondDieInTheSharedAicpuOs) {
+    int32_t die0_base = -1;
+    int32_t die1_base = -1;
+    ASSERT_TRUE(resolve_aicpu_cpu_id_base(/*phy_die_id=*/0, die0_base));
+    ASSERT_TRUE(resolve_aicpu_cpu_id_base(/*phy_die_id=*/1, die1_base));
+    EXPECT_EQ(die0_base, 0);
+    EXPECT_EQ(die1_base, 8);
+
+    auto die1_pool = standard_pool();
+    for (auto &entry : die1_pool)
+        entry.cpu_id += die1_base;
+    std::vector<int32_t> allowed;
+    ASSERT_TRUE(compute_allowed_cpus(die1_pool, /*active_count=*/4, allowed));
+    EXPECT_EQ(allowed, (std::vector<int32_t>{12, 13, 14, 15}));
+}
+
+TEST(A2a3AffinitySelect, RejectsInvalidDie) {
+    int32_t base = -1;
+    EXPECT_FALSE(resolve_aicpu_cpu_id_base(/*phy_die_id=*/-1, base));
+    EXPECT_FALSE(resolve_aicpu_cpu_id_base(/*phy_die_id=*/2, base));
 }
 
 // Selection is a pure function of its input — repeated calls are identical.

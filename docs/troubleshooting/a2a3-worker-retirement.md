@@ -86,8 +86,10 @@ cost every core on the chip.
    case to a single timeout, but a core whose turn came after it expired never
    got a wait of its own; this second read decides such a core on its own
    evidence rather than on a peer's timeout.
-4. Reset dispatch to IDLE and close every acknowledged window. Read back the
-   MMIO window and complete that read before publishing a GM return gate.
+4. Reset dispatch to IDLE and close every acknowledged window before starting
+   any readback. Then read back each acknowledged window individually and
+   drain all those reads before publishing any GM return gate. This lets the
+   group's posted writes overlap without removing per-window completion evidence.
 5. Store `AICORE_POST_CLOSE_RELEASE` to each closed core's gate. The stores are
    relaxed: step 4's drain is what orders them after the CLOSE they belong to,
    and the gates are independent of one another.
