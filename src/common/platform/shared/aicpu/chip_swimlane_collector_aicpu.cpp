@@ -936,23 +936,69 @@ void chip_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int 
     LOG_INFO("Thread %d: Performance buffer flush complete, %d buffers flushed", thread_idx, flushed_count);
 }
 
-// Pop the first buffer from a pool's free_queue and cache it as the current
-// active buffer. Uses the same engine path as subsequent phase rotations.
+// Make a pool's current active buffer available to this run: adopt the one a
+// previous run's final drain left on the head, or pop the first free_queue
+// entry. Uses the same engine path as subsequent phase rotations.
+//
+// Same retention rule the task and AICore pools follow in
+// chip_swimlane_aicpu_init(): only a successful enqueue releases a buffer, so a
+// pointer still set here is one the previous run could not hand over — it had
+// nothing to publish, or its enqueue failed. AICPU is the free queue's consumer
+// and never its producer, so popping a replacement would strand that buffer;
+// reusing it in place is the return, and re-stamping is what makes the reuse
+// safe.
+//
+// Unlike those two pools this one does not zero a non-empty retained buffer:
+// the phase flush already resets `count` when it charges `dropped`, so a
+// non-zero count here is an unaccounted lifecycle rather than a charged one.
 template <typename Buffer>
 static Buffer *prime_phase_pool(
     ChipSwimlaneAicpuTaskPool *state, int thread_idx, ChipSwimlaneBufferKind kind, Buffer **current_buf_out,
     const char *kind_label
 ) {
+    using Module = ChipSwimlaneDeviceModule<Buffer>;
+    using Engine = profiling_device::DeviceProfilerEngine<Module>;
+    if (state == nullptr) return nullptr;
     auto ctx = l2_buffer_context(thread_idx, 0, kind, current_buf_out);
-    Buffer *buf = profiling_device::DeviceProfilerEngine<ChipSwimlaneDeviceModule<Buffer>>::try_pop_free(
-        ctx, state, /*next_seq=*/0
-    );
+
+    rmb();
+    auto *retained = reinterpret_cast<Buffer *>(state->head.current_buf_ptr);
+    if (retained != nullptr && Module::count(retained) == 0) {
+        // claim_free()'s publication order without the free-queue head advance:
+        // the sequence this run numbers from, then the run identity through the
+        // same hook the pop path stamps with, then one barrier so both are
+        // visible before the first record and before any enqueue_ready().
+        // `count` is already zero, established with a barrier by whichever path
+        // left the buffer here.
+        Module::set_current_seq(state, 0);
+        Module::on_pop_success(ctx, state, retained);
+        wmb();
+        LOG_DEBUG(
+            "Thread %d: adopted retained %s phase buffer (addr=0x%lx)", thread_idx, kind_label,
+            reinterpret_cast<uint64_t>(retained)
+        );
+        return retained;
+    }
+    if (retained != nullptr) {
+        // Records on a retained head were neither handed to the host nor
+        // charged to `dropped`; the host reconcile reports them against the run
+        // that wrote them. They stay as they are — this run neither publishes
+        // nor re-stamps them — and the pop below replaces the head that owns
+        // them, so the buffer itself is not recovered.
+        LOG_ERROR(
+            "Thread %d: %s phase head still holds %u unflushed records, not reusing it", thread_idx, kind_label,
+            Module::count(retained)
+        );
+    }
+
+    Buffer *buf = Engine::try_pop_free(ctx, state, /*next_seq=*/0);
     if (buf == nullptr) {
         LOG_ERROR("Thread %d: %s phase free_queue is empty during init!", thread_idx, kind_label);
         if (current_buf_out != nullptr) {
             *current_buf_out = nullptr;
         }
-        state->head.current_buf_ptr = 0;
+        // The head is left as it is: either already clear, or still the only
+        // reference to the buffer this run refused to reuse.
         return nullptr;
     }
 
@@ -1196,6 +1242,12 @@ void chip_swimlane_aicpu_record_orch_phase(
 
 // Final-drain flush of one phase pool's active buffer. `thread_idx` / `pool_idx`
 // as in switch_phase_buffer.
+//
+// The head is cleared only when the host took the buffer. A failed enqueue
+// keeps it on the head with `count` reset — the same ownership rule
+// switch_buffer() follows for in-run rotation — so the buffer stays reachable
+// through the head and prime_phase_pool() adopts it for the next run. Clearing
+// it on that branch would leave it in neither the head nor the free_queue.
 static void flush_phase_pool(
     int thread_idx, uint32_t pool_idx, ChipSwimlaneAicpuTaskPool *state, ChipSwimlaneBufferKind kind,
     const char *kind_label
@@ -1221,6 +1273,7 @@ static void flush_phase_pool(
         LOG_INFO("Thread %d: flushed %s phase buffer with %u records", thread_idx, kind_label, saved_count);
         chip_swimlane_add_saturating(state->head.published_record_count, saved_count);
         chip_swimlane_add_saturating(state->head.published_buffer_count, 1);
+        state->head.current_buf_ptr = 0;
     } else {
         LOG_ERROR(
             "Thread %d: failed to enqueue %s phase buffer (queue full), %u records lost!", thread_idx, kind_label,
@@ -1229,7 +1282,6 @@ static void flush_phase_pool(
         chip_swimlane_add_saturating(state->head.dropped_record_count, saved_count);
         *count_ptr = 0;
     }
-    state->head.current_buf_ptr = 0;
     wmb();
 }
 

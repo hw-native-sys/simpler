@@ -685,3 +685,208 @@ TEST(ChipSwimlaneHandoffAccountingTest, AbsentPhaseClassIsUnknownNotNotApplicabl
 
     collector.finalize(nullptr, ha_free);
 }
+
+namespace {
+
+uint32_t sched_phase_free_depth(void *shm, int thread_idx) {
+    const auto *pool = get_sched_phase_buffer_state(shm, thread_idx);
+    return pool->free_queue.tail - pool->free_queue.head;
+}
+
+uint32_t orch_phase_free_depth(void *shm) {
+    const auto *pool = get_orch_phase_buffer_state(shm, 0);
+    return pool->free_queue.tail - pool->free_queue.head;
+}
+
+void record_orch_phases(int records) {
+    for (int i = 0; i < records; i++) {
+        chip_swimlane_aicpu_record_orch_phase(
+            /*start_time=*/300 + i, /*end_time=*/400 + i, /*task_id=*/static_cast<uint64_t>(i), /*submit_idx=*/i
+        );
+    }
+}
+
+}  // namespace
+
+// A run that publishes nothing keeps its primed sched-phase buffer on the head,
+// and the next run takes that same allocation over. Popping a replacement would
+// strand it: the host never received it, and AICPU is the free queue's consumer
+// and never its producer.
+TEST(ChipSwimlaneHandoffAccountingTest, AnEmptySchedPhaseFlushGivesItsBufferToTheNextRun) {
+    ChipSwimlaneCollector collector;
+    ASSERT_EQ(init_collector(collector, /*num_aicore=*/1, ChipSwimlaneLevel::SCHED_PHASES), 0);
+    constexpr uint64_t kFirst = 8940;
+    constexpr uint64_t kSecond = 8950;
+    arm_run(collector, /*num_aicore=*/1, kFirst, "phase-empty", ChipSwimlaneLevel::SCHED_PHASES);
+    chip_swimlane_aicpu_init_phase(/*worker_count=*/1, /*num_sched_phase_threads=*/1, /*num_orch_phase_threads=*/0);
+
+    void *shm = collector.get_chip_swimlane_setup_device_ptr();
+    auto *state = get_sched_phase_buffer_state(shm, 0);
+    const uint64_t primed = state->head.current_buf_ptr;
+    ASSERT_NE(primed, 0u);
+    const uint32_t depth_after_prime = sched_phase_free_depth(shm, 0);
+
+    chip_swimlane_aicpu_flush_sched_phase_buffer(/*thread_idx=*/0);
+
+    EXPECT_EQ(state->head.current_buf_ptr, primed) << "an empty final flush released a buffer the host never took";
+    EXPECT_EQ(state->head.published_buffer_count, 0u);
+    const ChipSwimlaneRunTerminal *first = terminal_at(collector, PLATFORM_RUN_TERMINAL_SCHED_PHASE_BASE + 0);
+    EXPECT_EQ(first->run_epoch, kFirst) << "an enabled-but-idle pool still closes its terminal";
+    EXPECT_EQ(first->total, 0u);
+    EXPECT_EQ(first->published_buffers, 0u);
+
+    arm_run(collector, /*num_aicore=*/1, kSecond, "phase-reuse", ChipSwimlaneLevel::SCHED_PHASES);
+    chip_swimlane_aicpu_init_phase(/*worker_count=*/1, /*num_sched_phase_threads=*/1, /*num_orch_phase_threads=*/0);
+
+    EXPECT_EQ(state->head.current_buf_ptr, primed) << "init drew a replacement instead of reusing the retained buffer";
+    EXPECT_EQ(sched_phase_free_depth(shm, 0), depth_after_prime) << "the adopted buffer cost a free-queue entry";
+    const auto *reused = reinterpret_cast<const ChipSwimlaneAicpuSchedPhaseBuffer *>(primed);
+    EXPECT_EQ(reused->count, 0u);
+    EXPECT_EQ(reused->run_epoch, kSecond) << "a reused buffer kept the previous run's identity";
+    EXPECT_EQ(reused->local_seq, 0u);
+    EXPECT_EQ(state->head.current_buf_seq, 0u);
+
+    // The adopted buffer is this run's writable head, and what it carries
+    // reaches the host under this run's identity.
+    record_sched_phases(/*thread_idx=*/0, 3);
+    chip_swimlane_aicpu_flush_sched_phase_buffer(/*thread_idx=*/0);
+
+    const ChipSwimlaneRunTerminal *second = terminal_at(collector, PLATFORM_RUN_TERMINAL_SCHED_PHASE_BASE + 0);
+    EXPECT_EQ(second->run_epoch, kSecond);
+    EXPECT_EQ(second->published_buffers, 1u);
+    EXPECT_EQ(second->published_records, 3u);
+    EXPECT_EQ(second->dropped, 0u);
+
+    EXPECT_EQ(collect_published(collector, 0), 1u);
+    settle_run(collector, kSecond);
+    const auto r = collector.handoff_report_for_test().sched_phase;
+    EXPECT_EQ(r.received_buffers, 1u);
+    EXPECT_EQ(r.received_records, 3u);
+
+    collector.finalize(nullptr, ha_free);
+}
+
+// A failed final handoff charges the buffer's records to `dropped`, resets its
+// count and keeps it: the host never took it, so nothing else can return it.
+// The next run adopts that buffer and republishes from it under its own epoch.
+//
+// The production cause is a full ready queue, and reaching it means sitting in
+// the backpressure gate for PLATFORM_DFX_BACKPRESSURE_TIMEOUT_CYCLES — 30
+// seconds of spinning, which a unit test has no business doing. The gate also
+// rejects an out-of-range thread index outright, which fails the same
+// `enqueue_ready` from the same caller and runs the same branch; the orch flush
+// reads its pool at ordinal 0, so that index reaches nothing but the enqueue.
+// The gate's own timeout behaviour is not covered here.
+TEST(ChipSwimlaneHandoffAccountingTest, AFailedOrchPhaseHandoffKeepsItsBufferForTheNextRun) {
+    ChipSwimlaneCollector collector;
+    ASSERT_EQ(init_collector(collector, /*num_aicore=*/1, ChipSwimlaneLevel::ORCH_PHASES), 0);
+    constexpr uint64_t kFirst = 8960;
+    constexpr uint64_t kSecond = 8970;
+    arm_run(collector, /*num_aicore=*/1, kFirst, "orch-refused", ChipSwimlaneLevel::ORCH_PHASES);
+    chip_swimlane_aicpu_init_phase(/*worker_count=*/1, /*num_sched_phase_threads=*/1, /*num_orch_phase_threads=*/1);
+    chip_swimlane_aicpu_set_orch_thread_idx(/*thread_idx=*/0);
+
+    void *shm = collector.get_chip_swimlane_setup_device_ptr();
+    auto *state = get_orch_phase_buffer_state(shm, 0);
+    const uint64_t held = state->head.current_buf_ptr;
+    ASSERT_NE(held, 0u);
+    const uint32_t depth_after_prime = orch_phase_free_depth(shm);
+    record_orch_phases(4);
+    ASSERT_EQ(reinterpret_cast<const ChipSwimlaneAicpuOrchPhaseBuffer *>(held)->count, 4u);
+
+    chip_swimlane_aicpu_flush_orch_phase_buffer(/*thread_idx=*/PLATFORM_MAX_AICPU_THREADS);
+
+    EXPECT_EQ(state->head.current_buf_ptr, held) << "a buffer the host never received was released";
+    EXPECT_EQ(reinterpret_cast<const ChipSwimlaneAicpuOrchPhaseBuffer *>(held)->count, 0u)
+        << "a retained buffer must hold no records once they are charged";
+    EXPECT_EQ(state->head.dropped_record_count, 4u);
+    EXPECT_EQ(state->head.published_buffer_count, 0u);
+    EXPECT_EQ(orch_phase_free_depth(shm), depth_after_prime) << "the failed flush drew from the free queue";
+    const ChipSwimlaneRunTerminal *first = terminal_at(collector, PLATFORM_RUN_TERMINAL_ORCH_PHASE_BASE + 0);
+    EXPECT_EQ(first->run_epoch, kFirst);
+    EXPECT_EQ(first->total, 4u);
+    EXPECT_EQ(first->dropped, 4u) << "the refusal is charged, not silent";
+
+    arm_run(collector, /*num_aicore=*/1, kSecond, "orch-reuse", ChipSwimlaneLevel::ORCH_PHASES);
+    chip_swimlane_aicpu_init_phase(/*worker_count=*/1, /*num_sched_phase_threads=*/1, /*num_orch_phase_threads=*/1);
+    chip_swimlane_aicpu_set_orch_thread_idx(/*thread_idx=*/0);
+
+    EXPECT_EQ(state->head.current_buf_ptr, held) << "init drew a replacement instead of reusing the retained buffer";
+    EXPECT_EQ(orch_phase_free_depth(shm), depth_after_prime);
+    const auto *reused = reinterpret_cast<const ChipSwimlaneAicpuOrchPhaseBuffer *>(held);
+    EXPECT_EQ(reused->run_epoch, kSecond) << "the second run would publish under the first run's identity";
+    EXPECT_EQ(reused->local_seq, 0u);
+
+    record_orch_phases(2);
+    chip_swimlane_aicpu_flush_orch_phase_buffer(/*thread_idx=*/0);
+
+    const ChipSwimlaneRunTerminal *second = terminal_at(collector, PLATFORM_RUN_TERMINAL_ORCH_PHASE_BASE + 0);
+    EXPECT_EQ(second->run_epoch, kSecond);
+    EXPECT_EQ(second->published_buffers, 1u);
+    EXPECT_EQ(second->published_records, 2u);
+    EXPECT_EQ(second->dropped, 0u) << "the predecessor's charge is not this run's";
+
+    EXPECT_EQ(collect_published(collector, 0), 1u);
+    settle_run(collector, kSecond);
+    const auto r = collector.handoff_report_for_test().orch_phase;
+    EXPECT_EQ(r.received_buffers, 1u);
+    EXPECT_EQ(r.received_records, 2u);
+
+    collector.finalize(nullptr, ha_free);
+}
+
+// A pool that is primed and then neither written nor flushed still owns its
+// buffer at the next run's init.
+//
+// This is the orchestrator's pool on a run below ORCH_PHASES: the
+// tensormap_and_ringbuffer cold path passes `orch_phase_threads = 1` for every
+// run at SCHED_PHASES or above, while both the orch emit and the orch flush
+// require ORCH_PHASES. The pool's buffers come from a run that did ask for
+// ORCH_PHASES — the host stocks the device orch pool at that level and nothing
+// returns those buffers between runs — which is why the level the collector is
+// initialized at differs from the level the runs below arm.
+//
+// The sched pool is driven through its whole successful lifecycle alongside, so
+// the two dispositions are asserted against each other: a pool whose buffer the
+// host took draws a replacement, a pool that still owns its buffer does not.
+TEST(ChipSwimlaneHandoffAccountingTest, AnUnflushedOrchPhasePoolStaysOwnedAcrossRuns) {
+    ChipSwimlaneCollector collector;
+    ASSERT_EQ(init_collector(collector, /*num_aicore=*/1, ChipSwimlaneLevel::ORCH_PHASES), 0);
+    constexpr uint64_t kFirst = 8980;
+    constexpr uint64_t kSecond = 8990;
+    arm_run(collector, /*num_aicore=*/1, kFirst, "orch-idle", ChipSwimlaneLevel::SCHED_PHASES);
+    chip_swimlane_aicpu_init_phase(/*worker_count=*/1, /*num_sched_phase_threads=*/1, /*num_orch_phase_threads=*/1);
+
+    void *shm = collector.get_chip_swimlane_setup_device_ptr();
+    auto *orch = get_orch_phase_buffer_state(shm, 0);
+    auto *sched = get_sched_phase_buffer_state(shm, 0);
+    const uint64_t orch_primed = orch->head.current_buf_ptr;
+    ASSERT_NE(orch_primed, 0u);
+    const uint32_t orch_depth = orch_phase_free_depth(shm);
+    const uint32_t sched_depth = sched_phase_free_depth(shm, 0);
+
+    // The sched side's run, end to end. The orch pool is never emitted into and
+    // never flushed, exactly as the level gates leave it.
+    record_sched_phases(/*thread_idx=*/0, 2);
+    chip_swimlane_aicpu_flush_sched_phase_buffer(/*thread_idx=*/0);
+    ASSERT_EQ(sched->head.current_buf_ptr, 0u) << "a published buffer belongs to the host";
+    EXPECT_EQ(orch->head.current_buf_ptr, orch_primed);
+    EXPECT_EQ(orch->head.total_record_count, 0u);
+
+    arm_run(collector, /*num_aicore=*/1, kSecond, "orch-idle-next", ChipSwimlaneLevel::SCHED_PHASES);
+    chip_swimlane_aicpu_init_phase(/*worker_count=*/1, /*num_sched_phase_threads=*/1, /*num_orch_phase_threads=*/1);
+
+    EXPECT_EQ(orch->head.current_buf_ptr, orch_primed) << "an unflushed pool lost the buffer it still owned";
+    EXPECT_EQ(orch_phase_free_depth(shm), orch_depth) << "the adopted buffer cost a free-queue entry";
+    const auto *reused = reinterpret_cast<const ChipSwimlaneAicpuOrchPhaseBuffer *>(orch_primed);
+    EXPECT_EQ(reused->count, 0u);
+    EXPECT_EQ(reused->run_epoch, kSecond);
+    EXPECT_EQ(reused->local_seq, 0u);
+
+    EXPECT_NE(sched->head.current_buf_ptr, 0u);
+    EXPECT_NE(sched->head.current_buf_ptr, orch_primed);
+    EXPECT_EQ(sched_phase_free_depth(shm, 0), sched_depth - 1)
+        << "a pool whose buffer the host took must draw a replacement";
+
+    collector.finalize(nullptr, ha_free);
+}

@@ -1529,10 +1529,15 @@ benchmark is not perturbed.
   pool. If `dropped > 0`, raise `PLATFORM_PROF_BUFFERS_PER_CORE` /
   `PLATFORM_PROF_{SCHED,ORCH}_BUFFERS_PER_THREAD` so the recycle pool has more
   headroom.
-- A non-zero `current_buf_ptr` after `stop()` is logged as ERROR
-  and never recovered — host treats device flush as the sole data
-  path. Such a leftover indicates an AICPU flush bug, not a tail
-  loss to tune around.
+- A non-zero `current_buf_ptr` **over a non-empty buffer** after
+  `stop()` is logged as ERROR and never recovered — host treats
+  device flush as the sole data path. Such a leftover indicates an
+  AICPU flush bug, not a tail loss to tune around. A non-zero
+  pointer over an *empty* buffer is normal: a phase pool that
+  published nothing, or whose final enqueue failed (charged to
+  `dropped`, count reset), keeps that buffer on its head, and the
+  next run's `chip_swimlane_aicpu_init_phase()` reuses it in place
+  rather than popping another free-queue entry.
 - `a2a3sim` exercises the export pipeline; the simulated device
   clock is not realistic for absolute-timing analysis. Use real
   hardware for steady-state numbers.
