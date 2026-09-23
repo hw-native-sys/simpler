@@ -123,6 +123,10 @@ struct KernelArgs {
     // Both zero when no region was allocated.
     uint64_t run_result_data_base{0};
     uint64_t run_result_epoch{0};
+    // AICPU die of each scheduler slot, packed per common/scheduler_die_partition.h.
+    // 0 means "no slot known", which keeps the device on round-robin cluster
+    // ownership. a5-only: the host_build_graph runtime ignores it.
+    uint64_t sched_thread_die_bits{0};
     // 32-bit tail (two adjacent uint32_t — no interior padding).
     uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_args|chip_swimlane|pmu|dep_gen|scope_stats
     // Opaque always-false guard read by the AICore SIMT meta anchor (AIV
@@ -149,7 +153,7 @@ static_assert(
     offsetof(KernelArgs, chip_swimlane_run_terminal_bank) == 32,
     "KernelArgs::chip_swimlane_run_terminal_bank offset drift"
 );
-static_assert(sizeof(KernelArgs) == 112, "KernelArgs launch-payload size drift");
+static_assert(sizeof(KernelArgs) == 120, "KernelArgs launch-payload size drift");
 static_assert(alignof(KernelArgs) == 8, "KernelArgs launch-payload alignment drift");
 // No conditional members: the struct body carries no preprocessor branch, so
 // these values are the same in every translation unit that sees this header.
