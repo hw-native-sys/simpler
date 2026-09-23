@@ -1830,19 +1830,13 @@ void DeviceRunnerBase::publish_host_phase_records_to_swimlane(uint32_t pipeline_
 // Group E (minimal) — shared AICPU launch helper
 // =============================================================================
 
-int DeviceRunnerBase::launch_aicpu_kernel(
-    rtStream_t stream, KernelArgs *k_args, const char *kernel_name, int aicpu_num
-) {
-    // kernel_name is host::KernelNames::RunName — the runtime SO's actual
-    // exported symbol (simpler_aicpu_exec). LaunchBuiltInOp dispatches via
-    // rtsLaunchCpuKernel on the cached rtFuncHandle resolved by
-    // LoadAicpuOp::Init at first-time bootstrap.
-    return load_aicpu_op_.LaunchBuiltInOp(stream, k_args, sizeof(KernelArgs), aicpu_num, kernel_name);
-}
-
 int DeviceRunnerBase::launch_aicpu_payload(
     rtStream_t stream, void *args, size_t args_size, const char *kernel_name, int aicpu_num
 ) {
+    // For the run entry, kernel_name is host::KernelNames::RunName — the runtime
+    // SO's actual exported symbol (simpler_aicpu_exec). LaunchBuiltInOp
+    // dispatches via rtsLaunchCpuKernel on the cached rtFuncHandle resolved by
+    // LoadAicpuOp::Init at first-time bootstrap.
     return load_aicpu_op_.LaunchBuiltInOp(stream, args, args_size, aicpu_num, kernel_name);
 }
 
@@ -2510,6 +2504,31 @@ void DeviceRunnerBase::activate_launch_shape(const Runtime &runtime) {
     block_dim_ = worker_count_ / cores_per_blockdim_;
 }
 
+bool DeviceRunnerBase::launch_entry_args_permitted(rtStream_t aicpu_stream) {
+    if (aicpu_stream == nullptr) return false;
+    aclmdlRICaptureStatus status = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    aclmdlRI model_ri = nullptr;
+    const aclError rc = aclmdlRICaptureGetInfo(aicpu_stream, &status, &model_ri);
+    if (rc != ACL_SUCCESS) {
+        // Unknown is treated as capturing. The descriptor route is always
+        // correct, so an unavailable answer costs this run a longer copy and
+        // nothing else; it is not a run failure and is not retried.
+        LOG_INFO("aclmdlRICaptureGetInfo unavailable (%d); entry args take the descriptor route", static_cast<int>(rc));
+        return false;
+    }
+    return status == ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+}
+
+int DeviceRunnerBase::publish_for_launch(PreparedExecution &prepared, rtStream_t aicpu_stream) {
+    if (prepared.kernel_args.runtime_args_published()) return 0;
+    const bool permitted = launch_entry_args_permitted(aicpu_stream);
+    const int rc = prepared.kernel_args.publish_runtime_args(permitted);
+    if (rc != 0) {
+        LOG_ERROR("publish_for_launch: this run's Runtime descriptor did not reach the device: %d", rc);
+    }
+    return rc;
+}
+
 int DeviceRunnerBase::sync_stream_pair(rtStream_t aicpu_stream, rtStream_t aicore_stream) {
     LOG_INFO("=== aclrtSynchronizeStreamWithTimeout AICPU stream ===");
     int rc = aclrtSynchronizeStreamWithTimeout(aicpu_stream, timeout_config_.stream_sync_timeout_ms);
@@ -3167,8 +3186,15 @@ int DeviceRunnerBase::init_runtime_args_with_metadata(
         LOG_ERROR("prepare_runtime_args failed: %d", rc);
         return rc;
     }
-    rc = kernel_args.publish_runtime_args();
-    if (rc != 0) return rc;
+    // A runtime whose entry values can travel as launch arguments publishes at
+    // launch instead, because which route they take is only answerable once the
+    // run holds the stream it will submit on. The snapshot taken above is what
+    // that publication sends, so the values are still this run's either way.
+    // Every other runtime publishes here, as it always has.
+    if (!runtime_launch_entry_args_plan(runtime).supported) {
+        rc = kernel_args.publish_runtime_args(/*launch_route_permitted=*/false);
+        if (rc != 0) return rc;
+    }
     // Log config and device ordinal are no longer published per-run on
     // KernelArgs — they were latched once into the AICPU SO globals by
     // simpler_aicpu_init (ensure_aicpu_init_launched) at device init.

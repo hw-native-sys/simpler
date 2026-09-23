@@ -55,7 +55,7 @@ protected:
     int publish_once() {
         const int prepare_rc = helper.prepare_runtime_args(runtime, allocator, slot);
         if (prepare_rc != 0) return prepare_rc;
-        return helper.publish_runtime_args();
+        return helper.publish_runtime_args(/*launch_route_permitted=*/false);
     }
 
     // The block's handshake region, as the device would see it.

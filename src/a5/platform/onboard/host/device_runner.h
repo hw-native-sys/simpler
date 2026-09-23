@@ -88,7 +88,7 @@ public:
     // `acquire_pooled_{gm_heap,gm_sm,runtime_arena}`, `create_thread`,
     // `attach_current_thread`, `ensure_device_initialized`,
     // `print_handshake_results`, `set_executors`, `set_dispatcher_binary`,
-    // `device_id`, `last_device_wall_ns`, `launch_aicpu_kernel`, and
+    // `device_id`, `last_device_wall_ns`, `launch_aicpu_payload`, and
     // `launch_aicore_kernel` are inherited from `DeviceRunnerBase`.
 
     // The blocking entry point composes these operations. enqueue owns rollback
@@ -105,7 +105,7 @@ public:
 
     // `set_chip_swimlane_enabled`, `set_dump_args_enabled`,
     // `set_pmu_enabled`, `set_scope_stats_enabled`, `set_output_prefix`,
-    // `output_prefix()`, and `launch_aicpu_kernel` live on
+    // `output_prefix()`, and `launch_aicpu_payload` live on
     // `DeviceRunnerBase`.
 
     /**

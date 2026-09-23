@@ -688,25 +688,31 @@ TEST(RuntimeLaunchImage, SnapshotIsIndependentOfLaterHostMutationAndConsumedOnce
     runtime.dev.worker_count = 19;
     int copies = 0;
     EXPECT_EQ(
-        image.publish([&](const void *source, size_t bytes) {
-            ++copies;
-            // The snapshot is the uploaded prefix, which may be shorter than the
-            // descriptor: reconstruct into a zeroed one and take only what the
-            // snapshot holds, or this reads past the source.
-            EXPECT_EQ(bytes, runtime_device_copy_size(runtime));
-            EXPECT_LE(bytes, runtime_device_extent_size(runtime));
-            DeviceRuntimeLaunchDesc descriptor{};
-            std::memcpy(&descriptor, source, bytes);
-            EXPECT_EQ(descriptor.worker_count, 7);
-            return 0;
-        }),
+        image.publish(
+            [&](const void *source, size_t bytes) {
+                ++copies;
+                // The snapshot is the uploaded prefix, which may be shorter than the
+                // descriptor: reconstruct into a zeroed one and take only what the
+                // snapshot holds, or this reads past the source.
+                EXPECT_EQ(bytes, runtime_device_copy_size(runtime));
+                EXPECT_LE(bytes, runtime_device_extent_size(runtime));
+                DeviceRuntimeLaunchDesc descriptor{};
+                std::memcpy(&descriptor, source, bytes);
+                EXPECT_EQ(descriptor.worker_count, 7);
+                return 0;
+            },
+            runtime_device_copy_size(runtime)
+        ),
         0
     );
     EXPECT_NE(
-        image.publish([&](const void *, size_t) {
-            ++copies;
-            return 0;
-        }),
+        image.publish(
+            [&](const void *, size_t) {
+                ++copies;
+                return 0;
+            },
+            runtime_device_copy_size(runtime)
+        ),
         0
     );
     EXPECT_EQ(copies, 1);
@@ -717,26 +723,35 @@ TEST(RuntimeLaunchImage, FailedPublicationConsumesSourceAndFreshPrepareReplacesI
     RuntimeLaunchImage image;
     image.prepare(runtime, runtime_device_copy_size(runtime));
     EXPECT_EQ(
-        image.publish([](const void *, size_t) {
-            return -91;
-        }),
+        image.publish(
+            [](const void *, size_t) {
+                return -91;
+            },
+            runtime_device_copy_size(runtime)
+        ),
         -91
     );
     EXPECT_NE(
-        image.publish([](const void *, size_t) {
-            return 0;
-        }),
+        image.publish(
+            [](const void *, size_t) {
+                return 0;
+            },
+            runtime_device_copy_size(runtime)
+        ),
         0
     );
     runtime.dev.worker_count = 3;
     image.prepare(runtime, runtime_device_copy_size(runtime));
     EXPECT_EQ(
-        image.publish([](const void *source, size_t bytes) {
-            DeviceRuntimeLaunchDesc descriptor;
-            std::memcpy(&descriptor, source, bytes);
-            EXPECT_EQ(descriptor.worker_count, 3);
-            return 0;
-        }),
+        image.publish(
+            [](const void *source, size_t bytes) {
+                DeviceRuntimeLaunchDesc descriptor;
+                std::memcpy(&descriptor, source, bytes);
+                EXPECT_EQ(descriptor.worker_count, 3);
+                return 0;
+            },
+            runtime_device_copy_size(runtime)
+        ),
         0
     );
 }

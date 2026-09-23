@@ -28,6 +28,7 @@
 #include "aicpu/device_run_result_aicpu.h"
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "aicpu/orch_so_file.h"
+#include "aicpu/platform_entry_args.h"
 #include "callable_protocol.h"
 #include "common/kernel_args.h"
 #include "dispatch_payload.h"
@@ -228,6 +229,44 @@ static_assert(
 );
 
 // ===== AicpuExecutor Method Implementations =====
+
+namespace {
+
+// Whether this launch's entry-argument header names values the descriptor
+// agrees with, adopting them when it does. A descriptor-route run consumes
+// nothing: its values are already in place, and the header only has to say so.
+bool adopt_launch_entry_args(Runtime *runtime, int32_t thread_idx) {
+    const uint32_t source = get_platform_entry_args_source();
+    const uint32_t offset = get_platform_entry_args_offset();
+    const uint32_t tensors = get_platform_entry_tensor_count();
+    const uint32_t scalars = get_platform_entry_scalar_count();
+    // Decided before any address is formed from these values; the verdict says
+    // which check refused, and Adopt is the only one that licenses the read.
+    const LaunchEntryArgsVerdict verdict = classify_launch_entry_args(*runtime, source, offset, tensors, scalars);
+    if (verdict == LaunchEntryArgsVerdict::Descriptor) return true;
+    if (verdict != LaunchEntryArgsVerdict::Adopt) {
+        LOG_ERROR(
+            "Thread %d: launch entry-args rejected (verdict=%d, source=%u/%u, offset=%u, counts=%u/%u vs %u/%u)",
+            thread_idx, static_cast<int32_t>(verdict), source, static_cast<uint32_t>(runtime->get_entry_args_source()),
+            offset, tensors, scalars, runtime->get_entry_tensor_count(), runtime->get_entry_scalar_count()
+        );
+        return false;
+    }
+
+    const void *base = get_platform_entry_args_base();
+    if (base == nullptr) {
+        LOG_ERROR("Thread %d: launch entry-args base is null", thread_idx);
+        return false;
+    }
+    const void *payload = static_cast<const unsigned char *>(base) + LAUNCH_ENVELOPE_HEADER_BYTES;
+    if (!runtime->adopt_entry_args_from_launch(payload, tensors, scalars)) {
+        LOG_ERROR("Thread %d: launch entry-args %u/%u were rejected by the storage", thread_idx, tensors, scalars);
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
 
 int32_t AicpuExecutor::init(Runtime *runtime) {
     if (runtime == nullptr) {
@@ -588,6 +627,25 @@ int32_t AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx) {
             p_func = &entry.func;
             p_bind = &entry.bind;
             DeviceOrchestrationConfigFunc *p_config_func = &entry.config_func;
+
+            // Entry values arrive either in the descriptor already or as raw
+            // bytes appended to this launch's arguments. Adopt the launch form
+            // before anything reads the storage, and only after the offset, the
+            // counts and the source agree with the descriptor's own — a payload
+            // address formed from unchecked values is what this ordering
+            // prevents. Runs before create_from_entry_storage below, and only on
+            // the orchestrator thread: the scheduler threads are still waiting
+            // on runtime_init_ready_, and nothing else reads these values.
+            if (!adopt_launch_entry_args(runtime, thread_idx)) {
+                // Pre-runtime failure: rt and the SM header do not exist yet, so
+                // this reports through the thread's own return. Releasing the
+                // scheduler threads first is what keeps them from spinning on
+                // runtime_init_ready_ forever; they then see rt null, skip
+                // dispatch, and still retire their cores and reach the
+                // completion gate, which is what publishes the terminal record.
+                runtime_init_ready_.store(true, std::memory_order_release);
+                return -1;
+            }
 
             // Build the entry-arg once per run; both the config call below and
             // the orchestration entry (consumed at orch_args_cached_) use it.

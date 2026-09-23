@@ -31,8 +31,10 @@
 
 #include <cstdint>
 #include <utility>
+#include <vector>
 
 #include "common/kernel_args.h"  // arch-specific KernelArgs layout
+#include "common/launch_entry_args.h"
 #include "host/memory_allocator.h"
 #include "host/runtime_launch_image.h"
 #include "runtime_c_api.h"
@@ -102,6 +104,15 @@ struct SlotPersistentArgs {
     // succeeded; a failed publication leaves it false and the next prepare
     // sends the longer prefix again.
     bool workers_initialized{false};
+
+    // Host staging for this slot's AICPU launch package, on a runtime whose
+    // entry values can travel as launch arguments. Grow-only across the runs a
+    // slot serves, and host memory only — RTS makes its own device copy from it
+    // during the launch call. Per slot rather than per run because a slot admits
+    // one run at a time, which is the same reservation that protects the device
+    // block above; and here rather than in the per-run helper so the growth is
+    // paid once per slot instead of once per run.
+    std::vector<std::byte> launch_package;
 };
 
 /**
@@ -131,7 +142,19 @@ struct KernelArgsHelper {
         allocator_(std::exchange(other.allocator_, nullptr)),
         runtime_image_(std::move(other.runtime_image_)),
         runtime_args_state_(std::exchange(other.runtime_args_state_, RuntimeArgsState::Empty)),
-        initializing_slot_(std::exchange(other.initializing_slot_, nullptr)) {
+        initializing_slot_(std::exchange(other.initializing_slot_, nullptr)),
+        slot_(std::exchange(other.slot_, nullptr)),
+        plan_(other.plan_),
+        launch_payload_(nullptr),
+        launch_payload_bytes_(std::exchange(other.launch_payload_bytes_, 0)) {
+        // The payload points either into the slot's staging or at this object's
+        // own `args`, so the moved-to object re-derives it rather than
+        // inheriting a pointer into the source.
+        launch_payload_ = (other.launch_payload_ == nullptr)            ? nullptr :
+                          (launch_payload_bytes_ == sizeof(KernelArgs)) ? static_cast<void *>(&args) :
+                                                                          other.launch_payload_;
+        other.launch_payload_ = nullptr;
+        other.plan_ = LaunchEntryArgsPlan{};
         other.args = KernelArgs{};
     }
     KernelArgsHelper &operator=(KernelArgsHelper &&) = delete;
@@ -145,16 +168,58 @@ struct KernelArgsHelper {
     // release, a fresh prepare withdraws the previous publication status.
     int prepare_runtime_args(const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot);
 
-    // Consume the snapshot with a synchronous metadata H2D. The slot remains
-    // owned even on failure. Callers must check the return code and abort the
-    // run on error. A repeated publish is rejected without another copy.
-    int publish_runtime_args();
+    /**
+     * Consume the snapshot with one synchronous metadata H2D, having recorded
+     * which route this run's entry values take.
+     *
+     * `launch_route_permitted` says the caller has established that this
+     * launch may carry the values as launch arguments — on the streams this
+     * repo owns, that this run's own AICPU stream is not capturing. It is a
+     * permission, not a request: a runtime with no launch route, and the first
+     * publication onto a block (which sends the whole initialized prefix
+     * anyway), stay on the descriptor route regardless.
+     *
+     * Everything published comes from the snapshot taken at prepare. The route
+     * decision and this run's counts are patched into it; nothing is re-read
+     * from the caller's `Runtime`, which by now may hold a successor's values.
+     *
+     * The slot remains owned even on failure. Callers must check the return
+     * code and abort the run on error — the state stays unpublished, so no
+     * kernel may be submitted. A repeated publish is rejected without another
+     * copy.
+     */
+    int publish_runtime_args(bool launch_route_permitted);
 
     // A non-null destination alone may still contain a previous run's bytes.
     // This verdict covers only the Runtime descriptor, not late DFX publication.
     bool runtime_args_published() const {
         return runtime_args_state_ == RuntimeArgsState::Published && args.runtime_args != nullptr;
     }
+
+    // Whether this run holds a snapshot that has yet to be published. A launch
+    // entry admits this as well as Published, because publication is what the
+    // launch does first; only a kernel submission requires Published.
+    bool runtime_args_prepared() const {
+        return runtime_args_state_ == RuntimeArgsState::Prepared && args.runtime_args != nullptr;
+    }
+
+    /**
+     * The AICPU launch payload and its length for this run.
+     *
+     * The envelope — this header followed by the entry values — when the launch
+     * route was taken, and `KernelArgs` alone otherwise. Meaningful only once
+     * `publish_runtime_args` has returned success; before that no route has
+     * been recorded and this is null.
+     *
+     * Call it at the submission, not before: it re-copies the header from
+     * `args` as it now stands, so fields armed after publication — the wall
+     * buffer, the collector bases, this run's terminal bank — are the ones RTS
+     * copies. That is the same point the AICore launch reads `args` from, and
+     * it costs no second device copy. The entry region is untouched: those
+     * bytes came from the prepare snapshot and stay that run's.
+     */
+    void *launch_payload();
+    size_t launch_payload_bytes() const { return launch_payload_bytes_; }
 
     /**
      * Drop this run's view of the slot's device blocks.
@@ -167,6 +232,10 @@ struct KernelArgsHelper {
         runtime_args_state_ = RuntimeArgsState::Empty;
         args.runtime_args = nullptr;
         initializing_slot_ = nullptr;
+        slot_ = nullptr;
+        plan_ = LaunchEntryArgsPlan{};
+        launch_payload_ = nullptr;
+        launch_payload_bytes_ = 0;
     }
 
     /**
@@ -200,6 +269,24 @@ private:
     // returns success — so the fact is committed by the same call that earns
     // it, and no caller can commit it early by forgetting the order.
     SlotPersistentArgs *initializing_slot_{nullptr};
+
+    // The slot this run prepared against, which owns both the destination and
+    // the host staging a launch package is built in. Held for the whole run
+    // because publication happens at launch, by which time the caller's
+    // `Runtime` is no longer this run's only reader.
+    SlotPersistentArgs *slot_{nullptr};
+
+    // This run's entry-argument routing facts, read while the source was still
+    // this run's. The launch side works from this and the snapshot alone.
+    LaunchEntryArgsPlan plan_{};
+
+    void *launch_payload_{nullptr};
+    size_t launch_payload_bytes_{0};
+
+    // Fill the slot's staging with this run's launch package, reading the entry
+    // values out of the captured snapshot. Returns false when the snapshot does
+    // not contain the windows the plan names.
+    bool build_launch_package();
 };
 
 /**

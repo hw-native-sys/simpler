@@ -131,3 +131,7 @@ size_t runtime_device_copy_size(const Runtime &) { return Runtime::device_image_
 size_t runtime_device_initialized_prefix_size(const Runtime &) { return Runtime::device_initialized_prefix_bytes(); }
 
 size_t runtime_device_extent_size(const Runtime &) { return Runtime::device_extent_bytes(); }
+
+// Unsupported, so this runtime's host path keeps publishing the whole descriptor
+// prefix at prepare time and never builds a launch package.
+LaunchEntryArgsPlan runtime_launch_entry_args_plan(const Runtime &) { return LaunchEntryArgsPlan{}; }

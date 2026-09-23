@@ -455,9 +455,27 @@ DeviceRunnerBase::LaunchOutcome
 DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) {
     LaunchOutcome outcome;
     if (prepared == nullptr) return outcome;
-    if (!prepared->kernel_args.runtime_args_published()) {
-        LOG_ERROR("launch_execution: this run's Runtime descriptor has not been published");
+    // Prepared is admitted as well as Published: publication happens below,
+    // once this run holds the stream it will submit on. What a kernel
+    // submission requires is Published, which is established before the
+    // transaction opens.
+    if (!prepared->kernel_args.runtime_args_prepared() && !prepared->kernel_args.runtime_args_published()) {
+        LOG_ERROR("launch_execution: this run holds no Runtime descriptor to publish");
         outcome.rc = PTO_RUNTIME_ERR_INVALID_STATE;
+        outcome.prepared = std::move(prepared);
+        return outcome;
+    }
+
+    // The one descriptor H2D for this run, ahead of activate_launch_shape, DFX
+    // arming and every kernel or event this run submits. It is here rather than
+    // at prepare because the route its entry values take is a question about
+    // `stream_aicpu_` — the same handle the AICPU launch below submits on, held
+    // under this run's execution claim. A failure carries its own error out
+    // with the run NotStarted, so nothing was submitted and the run stays
+    // rollback-able.
+    if (const int publish_rc = publish_for_launch(*prepared, stream_aicpu_); publish_rc != 0) {
+        outcome.rc = publish_rc;
+        outcome.progress = LaunchProgress::NotStarted;
         outcome.prepared = std::move(prepared);
         return outcome;
     }
@@ -543,11 +561,12 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
             int aicpu_launch_n =
                 (runtime.get_aicpu_launch_count() > 0) ? runtime.get_aicpu_launch_count() : launch_aicpu_num;
             STRACE_HOST_SPAN_AT("chip.run.runner_run.aicpu_launch", STRACE_NOW_NS(), 0, 2);
-            int launch_rc = launch_aicpu_kernel(
-                stream_aicpu_, &prepared->kernel_args.args, host::KernelNames::RunName, aicpu_launch_n
+            int launch_rc = launch_aicpu_payload(
+                stream_aicpu_, prepared->kernel_args.launch_payload(), prepared->kernel_args.launch_payload_bytes(),
+                host::KernelNames::RunName, aicpu_launch_n
             );
             if (launch_rc != 0) {
-                LOG_ERROR("launch_aicpu_kernel (main) failed: %d", launch_rc);
+                LOG_ERROR("launch_aicpu_payload (main) failed: %d", launch_rc);
                 return launch_rc;
             }
             sink.mark_submitted();
@@ -1059,7 +1078,7 @@ int DeviceRunner::finalize() {
     return rc;
 }
 
-// `launch_aicpu_kernel` and `launch_aicore_kernel` live on `DeviceRunnerBase`.
+// `launch_aicpu_payload` and `launch_aicore_kernel` live on `DeviceRunnerBase`.
 
 void DeviceRunner::finalize_collectors(bool abandon_device_resources) {
     // Release the diagnostics collectors' shared memory. Collectors survive an

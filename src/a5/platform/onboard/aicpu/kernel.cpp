@@ -15,6 +15,7 @@
 #include "common/unified_log.h"
 #include "common/kernel_args.h"
 #include "common/platform_config.h"
+#include "aicpu/platform_entry_args.h"
 #include "aicpu/aicpu_device_config.h"
 #include "aicpu/dep_gen_collector_aicpu.h"
 #include "aicpu/device_log.h"
@@ -92,6 +93,12 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     // Handshake), so decode the umbrella bitmask once and hand it to the
     // existing platform-state setters.
     set_platform_regs(k_args->regs);
+    // Base and offset stay separate: the runtime forms the payload address only
+    // after checking both against its descriptor.
+    set_platform_entry_args(
+        arg, k_args->entry_args_offset, k_args->entry_tensor_count, k_args->entry_scalar_count,
+        k_args->entry_args_source
+    );
     set_platform_dump_base(k_args->dump_data_base);
     set_dump_args_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS));
     set_platform_chip_swimlane_base(k_args->chip_swimlane_data_base);

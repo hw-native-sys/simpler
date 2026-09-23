@@ -622,8 +622,12 @@ DeviceRunnerBase::LaunchOutcome
 DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) {
     LaunchOutcome outcome;
     if (prepared == nullptr) return outcome;
-    if (!prepared->kernel_args.runtime_args_published()) {
-        LOG_ERROR("launch_execution: this run's Runtime descriptor has not been published");
+    // Prepared is admitted as well as Published: publication happens inside
+    // `launch_run`, once this run holds the stream it will submit on. What a
+    // kernel submission requires is Published, which `launch_run` establishes
+    // before it submits anything.
+    if (!prepared->kernel_args.runtime_args_prepared() && !prepared->kernel_args.runtime_args_published()) {
+        LOG_ERROR("launch_execution: this run holds no Runtime descriptor to publish");
         outcome.rc = PTO_RUNTIME_ERR_INVALID_STATE;
         outcome.prepared = std::move(prepared);
         return outcome;
@@ -660,6 +664,16 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
         return LaunchTransactionResult{};
     }
     RunStreamSet streams{static_cast<rtStream_t>(run_streams_.aicpu()), static_cast<rtStream_t>(run_streams_.aicore())};
+    // The one descriptor H2D for this run, ahead of activate_launch_shape, DFX
+    // arming and every kernel or event this run submits. It is here rather than
+    // at prepare because the route its entry values take is a question about
+    // `streams.aicpu` — the same handle the AICPU launch below submits on, held
+    // under this run's execution claim. A failure carries its own error out
+    // with the run NotStarted, so nothing was submitted and the run stays
+    // rollback-able.
+    if (const int publish_rc = publish_for_launch(prepared, streams.aicpu); publish_rc != 0) {
+        return LaunchTransactionResult{publish_rc, LaunchProgress::NotStarted, LaunchReceipt{}};
+    }
     LaunchTransactionResult result = exact_launch_transaction(
         prepared.identity, std::move(permit),
         [&](LaunchProgressSink &sink) -> int {
@@ -742,11 +756,12 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
             int aicpu_launch_n =
                 (runtime.get_aicpu_launch_count() > 0) ? runtime.get_aicpu_launch_count() : launch_aicpu_num;
             STRACE_HOST_SPAN_AT("chip.run.runner_run.aicpu_launch", STRACE_NOW_NS(), 0, 2);
-            int launch_rc = launch_aicpu_kernel(
-                streams.aicpu, &prepared.kernel_args.args, host::KernelNames::RunName, aicpu_launch_n
+            int launch_rc = launch_aicpu_payload(
+                streams.aicpu, prepared.kernel_args.launch_payload(), prepared.kernel_args.launch_payload_bytes(),
+                host::KernelNames::RunName, aicpu_launch_n
             );
             if (launch_rc != 0) {
-                LOG_ERROR("launch_aicpu_kernel (main) failed: %d", launch_rc);
+                LOG_ERROR("launch_aicpu_payload (main) failed: %d", launch_rc);
                 return launch_rc;
             }
             sink.mark_submitted();
@@ -1384,7 +1399,7 @@ int DeviceRunner::finalize() {
     return rc;
 }
 
-// `launch_aicpu_kernel` and `launch_aicore_kernel` live on `DeviceRunnerBase`.
+// `launch_aicpu_payload` and `launch_aicore_kernel` live on `DeviceRunnerBase`.
 
 int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecution &prepared) {
     const DfxRunConfig &dfx = prepared.dfx;

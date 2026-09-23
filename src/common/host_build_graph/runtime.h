@@ -42,6 +42,7 @@
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
 #include "task_args.h"
 #include "aicore_teardown.h"
+#include "common/launch_entry_args.h"     // LaunchEntryArgsPlan
 #include "host_build_graph/entry_args.h"  // EntryArgsStorage
 #include "utils/tensor_lease.h"
 
@@ -723,3 +724,8 @@ size_t runtime_device_initialized_prefix_size(const Runtime &rt);
 // backing a device `Runtime` must use: the device addresses fields inside the
 // tail this exceeds the published prefixes by.
 size_t runtime_device_extent_size(const Runtime &rt);
+
+// This runtime has no launch route for entry arguments: they travel inside the
+// descriptor, which its host path publishes at prepare time. Present so the
+// shared host launch path needs no runtime-specific branch of its own.
+LaunchEntryArgsPlan runtime_launch_entry_args_plan(const Runtime &rt);

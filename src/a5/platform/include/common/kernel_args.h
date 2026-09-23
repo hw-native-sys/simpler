@@ -39,6 +39,7 @@
 #include <type_traits>
 
 #include "common/dma_workspace.h"
+#include "common/launch_entry_args.h"
 
 // Forward declarations
 class Runtime;
@@ -123,13 +124,25 @@ struct KernelArgs {
     // Both zero when no region was allocated.
     uint64_t run_result_data_base{0};
     uint64_t run_result_epoch{0};
-    // 32-bit tail (two adjacent uint32_t — no interior padding).
+    // 32-bit tail: no interior padding, and no field here is offset-locked.
     uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_args|chip_swimlane|pmu|dep_gen|scope_stats
+    // How this run's entry arguments reached the AICPU, restated from the
+    // descriptor so the device can reject a pair that disagrees.
+    // `entry_args_offset` is where the entry region starts inside this launch
+    // package, `LAUNCH_ENVELOPE_HEADER_BYTES` when the launch route carries the
+    // values and 0 when it does not. The region itself is raw bytes appended
+    // after this header — tensor descriptors then scalars — and is not part of
+    // this struct: `argsSize` is what tells RTS how far past it to copy.
+    uint32_t entry_args_offset{0};
+    uint32_t entry_tensor_count{0};
+    uint32_t entry_scalar_count{0};
+    uint32_t entry_args_source{static_cast<uint32_t>(EntryArgsSource::Descriptor)};
+
     // Opaque always-false guard read by the AICore SIMT meta anchor (AIV
     // KERNEL_ENTRY). The host never sets it non-zero; its only purpose is to be
     // a runtime-valued condition the compiler cannot constant-fold, so the
     // never-executed SIMT launch in simt_anchor.h survives DCE and bisheng
-    // still classifies the entry as SIMT. Keep it last (trailing field).
+    // still classifies the entry as SIMT. It is the trailing field.
     uint32_t force_simt_anchor{0};
 };
 
@@ -149,12 +162,18 @@ static_assert(
     offsetof(KernelArgs, chip_swimlane_run_terminal_bank) == 32,
     "KernelArgs::chip_swimlane_run_terminal_bank offset drift"
 );
-static_assert(sizeof(KernelArgs) == 112, "KernelArgs launch-payload size drift");
+static_assert(sizeof(KernelArgs) == 128, "KernelArgs launch-payload size drift");
 static_assert(alignof(KernelArgs) == 8, "KernelArgs launch-payload alignment drift");
 // No conditional members: the struct body carries no preprocessor branch, so
 // these values are the same in every translation unit that sees this header.
 static_assert(__is_trivially_copyable(KernelArgs), "KernelArgs must be memcpy-able to the device");
 static_assert(__is_standard_layout(KernelArgs), "KernelArgs must be standard-layout");
+// The launch package puts the entry region at a fixed offset on every arch, so
+// this header has to fit inside it.
+static_assert(
+    sizeof(KernelArgs) <= LAUNCH_ENVELOPE_HEADER_BYTES,
+    "KernelArgs must fit in the launch package header the entry region starts after"
+);
 
 /**
  * AicoreLaunchArgs - the AICore entry's launch argument block.

@@ -45,6 +45,7 @@
 #include "dispatch_payload.h"
 #include "task_args.h"
 #include "aicore_teardown.h"
+#include "common/launch_entry_args.h"             // EntryArgsSource, LaunchEntryArgsPlan
 #include "tensormap_and_ringbuffer/entry_args.h"  // EntryArgsStorage
 #include "utils/tensor_lease.h"
 
@@ -153,11 +154,14 @@ inline bool aicore_report_accepted(const volatile Handshake *handshake, uint64_t
  * (offsetof == 0), so the narrowed copy needs no offset arithmetic.
  *
  * Three lengths, in order. `runtime_device_copy_size` is what a steady-state run
- * re-publishes and stops before `workers`; `runtime_device_initialized_prefix_size`
- * adds `workers` and stops before `teardown_gates`, and is what the first
- * publication onto an allocation sends so the handshake region starts defined;
- * `runtime_device_extent_size` is the whole allocation. The gate tail is in no
- * copy: its host storage is never initialized.
+ * re-publishes: it stops inside `orch_args_storage_`, after the tensor slots that
+ * run filled, and so is the only one of the three that varies per run rather than
+ * per runtime — at capacity it reaches exactly `workers`.
+ * `runtime_device_initialized_prefix_size` is the full range through `workers`,
+ * stopping before `teardown_gates`, and is what the first publication onto an
+ * allocation sends so the handshake region and every args slot start defined;
+ * `runtime_device_extent_size` is the whole allocation. Both remain per-runtime
+ * constants. The gate tail is in no copy: its host storage is never initialized.
  *
  * Adding a field here grows the device image; adding a field to Runtime's
  * host-only tail does not. Keep it standard-layout (static_assert below) so the
@@ -201,8 +205,7 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // Controlled via SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE environment variable.
     bool serial_orch_sched;
 
-    void *gm_sm_ptr_;                                   // GM pointer to shared memory (device)
-    simpler::tmr::EntryArgsStorage orch_args_storage_;  // Entry args, adopted on the host
+    void *gm_sm_ptr_;  // GM pointer to shared memory (device)
 
     // Prebuilt-arena fast path (trb only). Set by the host before rtMemcpy'ing
     // Runtime to device; AICPU reads them in the boot path to skip
@@ -214,6 +217,28 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // Per-callable_id dispatch. AICPU dispatches via
     // `orch_so_table_[active_callable_id_]`.
     int32_t active_callable_id_;
+
+    // How this run's entry arguments reached the device, and how many of each
+    // the sender put there. Ahead of the storage they describe, so the shortest
+    // publication still carries them: on the launch route that publication ends
+    // at `orch_args_storage_` and the values arrive as launch arguments
+    // instead.
+    //
+    // Duplicated in the launch header, where the AICPU compares the two. That
+    // comparison finds a run whose two sides disagree; it says nothing about
+    // whether values carrying the same counts are this run's.
+    uint32_t entry_tensor_count_;
+    uint32_t entry_scalar_count_;
+    uint32_t entry_args_source_;  // EntryArgsSource
+
+    // Entry args, adopted on the host. Last of the uploaded fields, because it
+    // is the only one whose useful length is a property of the run: a
+    // steady-state publication stops after `tensor_count_` of its
+    // CHIP_MAX_TENSOR_ARGS slots (`runtime_device_copy_size`), and every field
+    // above it is therefore inside every publication regardless of that count.
+    // Slots past the count keep whatever an earlier run of this allocation
+    // wrote; the consumers are count-bounded and must stay so.
+    simpler::tmr::EntryArgsStorage orch_args_storage_;
 
     // Handshake buffers for AICPU-AICore communication, one 64-byte line per
     // worker.
@@ -304,6 +329,26 @@ public:
     const simpler::tmr::EntryArgsStorage &get_orch_args() const;
     void set_gm_sm_ptr(void *p);
     void set_orch_args(const ChipStorageTaskArgs &args);
+
+    // Entry-argument route, as the run that published this descriptor named it.
+    // The host writes these three words into the publication itself rather than
+    // into this object, because which route a run takes is decided after the
+    // values were captured — so on the host these read what `Runtime()` set,
+    // and on the device they read what that run published.
+    EntryArgsSource get_entry_args_source() const;
+    uint32_t get_entry_tensor_count() const;
+    uint32_t get_entry_scalar_count() const;
+
+    /**
+     * Adopt entry values from raw launch-argument bytes.
+     *
+     * `payload` is the launch package's entry region, read as bytes: its base
+     * alignment belongs to whoever allocated the launch arguments, so nothing
+     * types it until it has landed in the 64-byte-aligned storage above.
+     * Rejects counts outside capacity or disagreeing with the descriptor's own,
+     * and writes nothing when it rejects.
+     */
+    bool adopt_entry_args_from_launch(const void *payload, uint32_t tensor_count, uint32_t scalar_count);
 
     // Prebuilt-arena fast path (trb only). Set by host's
     // bind_callable_to_runtime_impl; consumed by AICPU at boot to attach a
@@ -435,6 +480,17 @@ static_assert(
     "stays cache-line aligned"
 );
 static_assert(
+    offsetof(DeviceRuntimeLaunchDesc, orch_args_storage_) + sizeof(simpler::tmr::EntryArgsStorage) ==
+        offsetof(DeviceRuntimeLaunchDesc, workers),
+    "orch_args_storage_ must be the last uploaded member: runtime_device_copy_size() stops inside it, so a "
+    "field placed between it and workers would fall outside every steady-state publication"
+);
+static_assert(
+    offsetof(DeviceRuntimeLaunchDesc, orch_args_storage_) % 64 == 0,
+    "orch_args_storage_ must start on a cache line: the steady-state length is its offset plus a whole "
+    "number of 64-byte-aligned Tensor slots, and both halves have to stay line-aligned"
+);
+static_assert(
     offsetof(DeviceRuntimeLaunchDesc, workers) % 64 == 0,
     "workers must start on a cache line: each Handshake is one line the AICore writes back whole"
 );
@@ -470,3 +526,32 @@ size_t runtime_device_initialized_prefix_size(const Runtime &rt);
 // backing a device `Runtime` must use: the device addresses gates inside the
 // tail this exceeds the published prefixes by.
 size_t runtime_device_extent_size(const Runtime &rt);
+
+// This run's entry-argument routing facts, captured from `rt` while it is still
+// this run's. Defined per-runtime, and `supported` is false on a runtime with no
+// launch route, which is what keeps the shared host launch path runtime-agnostic.
+LaunchEntryArgsPlan runtime_launch_entry_args_plan(const Runtime &rt);
+/**
+ * Whether a launch header may be adopted, decided before any payload address is
+ * formed from it.
+ *
+ * Every rejection is its own verdict so a caller can say which check failed,
+ * and the order is the contract: an undefined source is refused before it is
+ * compared, the comparison before the offset, the offset before the counts, and
+ * the counts — both against capacity and against the descriptor's own — before
+ * anything derives an address. `Descriptor` means this run's values are already
+ * in place and there is nothing to adopt.
+ */
+enum class LaunchEntryArgsVerdict : int32_t {
+    Descriptor,
+    Adopt,
+    UndefinedSource,
+    SourceMismatch,
+    UnexpectedOffset,
+    CountsPastCapacity,
+    CountsMismatch,
+};
+
+LaunchEntryArgsVerdict classify_launch_entry_args(
+    const Runtime &rt, uint32_t source, uint32_t offset, uint32_t tensor_count, uint32_t scalar_count
+);

@@ -39,6 +39,7 @@
 #include <cstdint>
 
 #include "common/dma_workspace.h"
+#include "common/launch_entry_args.h"
 
 // Forward declarations
 class Runtime;
@@ -123,7 +124,7 @@ struct KernelArgs {
     uint64_t chip_swimlane_aicore_rotation_table{0};
     // Device pointer to the run-wall buffer the platform AICPU entry writes.
     // Allocated once and kept resident, reset each run. Onboard AICPU receives
-    // KernelArgs as a CANN-private copy (see launch_aicpu_kernel), so an
+    // KernelArgs as a CANN-private copy (see launch_aicpu_payload), so an
     // inline field would be write-only from AICPU;
     // the dedicated host-allocated buffer's address travels via this field.
     // Onboard layout: one { start_cycle, end_cycle } pair per launched AICPU
@@ -149,6 +150,18 @@ struct KernelArgs {
     uint64_t run_result_epoch{0};
     // 32-bit tail.
     uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_args|chip_swimlane|pmu|dep_gen|scope_stats
+
+    // How this run's entry arguments reached the AICPU, restated from the
+    // descriptor so the device can reject a pair that disagrees.
+    // `entry_args_offset` is where the entry region starts inside this launch
+    // package, `LAUNCH_ENVELOPE_HEADER_BYTES` when the launch route carries the
+    // values and 0 when it does not. The region itself is raw bytes appended
+    // after this header — tensor descriptors then scalars — and is not part of
+    // this struct: `argsSize` is what tells RTS how far past it to copy.
+    uint32_t entry_args_offset{0};
+    uint32_t entry_tensor_count{0};
+    uint32_t entry_scalar_count{0};
+    uint32_t entry_args_source{static_cast<uint32_t>(EntryArgsSource::Descriptor)};
 };
 
 static_assert(offsetof(KernelArgs, runtime_args) == 0, "KernelArgs::runtime_args offset drift");
@@ -165,12 +178,18 @@ static_assert(
     offsetof(KernelArgs, chip_swimlane_run_terminal_bank) == 40,
     "KernelArgs::chip_swimlane_run_terminal_bank offset drift"
 );
-static_assert(sizeof(KernelArgs) == 120, "KernelArgs launch-payload size drift");
+static_assert(sizeof(KernelArgs) == 136, "KernelArgs launch-payload size drift");
 static_assert(alignof(KernelArgs) == 8, "KernelArgs launch-payload alignment drift");
 // No conditional members: the struct body carries no preprocessor branch, so
 // these values are the same in every translation unit that sees this header.
 static_assert(__is_trivially_copyable(KernelArgs), "KernelArgs must be memcpy-able to the device");
 static_assert(__is_standard_layout(KernelArgs), "KernelArgs must be standard-layout");
+// The launch package puts the entry region at a fixed offset on every arch, so
+// this header has to fit inside it.
+static_assert(
+    sizeof(KernelArgs) <= LAUNCH_ENVELOPE_HEADER_BYTES,
+    "KernelArgs must fit in the launch package header the entry region starts after"
+);
 
 /**
  * AicoreLaunchArgs - the AICore entry's launch argument block.

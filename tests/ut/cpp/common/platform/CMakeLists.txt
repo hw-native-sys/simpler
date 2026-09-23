@@ -241,6 +241,21 @@ hbg_case(test_runtime_workers_publication.cpp
     SOURCES ${KERNEL_ARGS_HELPER_TEST_SOURCES} ${HBG_COMMON_SHARED_DIR}/runtime.cpp
     INCLUDES_BEFORE ${CMAKE_SOURCE_DIR}/support/kernel_args ${KERNEL_ARGS_INCLUDES})
 
+# Which route a run's entry values take, and that the route is chosen after
+# prepare captured them. Same pairing as the publication case above, and for the
+# same reason: one source, one build per runtime, each resolving "runtime.h" to
+# its own. The trb build additionally covers the descriptor's wire offsets and
+# the raw-byte decode, so it defines SIMPLER_UT_TRB_RUNTIME.
+tmr_case(test_launch_entry_args.cpp
+    SOURCES ${KERNEL_ARGS_HELPER_TEST_SOURCES}
+            ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
+    INCLUDES_BEFORE ${CMAKE_SOURCE_DIR}/support/kernel_args ${KERNEL_ARGS_INCLUDES}
+    DEFINES SIMPLER_UT_TRB_RUNTIME)
+
+hbg_case(test_launch_entry_args.cpp
+    SOURCES ${KERNEL_ARGS_HELPER_TEST_SOURCES} ${HBG_COMMON_SHARED_DIR}/runtime.cpp
+    INCLUDES_BEFORE ${CMAKE_SOURCE_DIR}/support/kernel_args ${KERNEL_ARGS_INCLUDES})
+
 # A loadable stand-in for a compiled AICore child kernel. The sim
 # registration writes each child's binary to a temp file, dlopens it and
 # resolves kernel_entry, so a case wanting that path to succeed needs bytes

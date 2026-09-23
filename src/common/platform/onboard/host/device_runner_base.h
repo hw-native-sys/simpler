@@ -903,6 +903,36 @@ public:
     void activate_launch_shape(const Runtime &runtime);
 
     /**
+     * Whether this run may carry its entry values as launch arguments on
+     * `aicpu_stream`.
+     *
+     * True only when the stream answers that it is capturing nothing. A
+     * capturing or invalidated stream, an unavailable answer, and a null stream
+     * all say no, which routes the values through the descriptor instead — the
+     * behaviour every run had before the launch route existed. Read-only: it
+     * neither readies nor retires the stream pair, and asking costs the run
+     * nothing when the answer is no.
+     *
+     * Pass the same stream handle the launch will submit on, resolved and about
+     * to be used, so the answer describes the stream that actually carries the
+     * launch.
+     */
+    bool launch_entry_args_permitted(rtStream_t aicpu_stream);
+
+    struct PreparedExecution;
+
+    /**
+     * Publish this run's descriptor, once, immediately before its launch.
+     *
+     * Consumes the snapshot prepare captured, having first asked
+     * `aicpu_stream` whether the launch route is open. Returns 0 only when the
+     * copy succeeded and the run is Published — the state a kernel submission
+     * requires. A non-zero return is the copy's own error and leaves the run
+     * unpublished with no kernel submitted.
+     */
+    int publish_for_launch(PreparedExecution &prepared, rtStream_t aicpu_stream);
+
+    /**
      * Point a fresh Runtime at a previously-registered callable and complete
      * the per-run binding in one step. Installs the reference to that
      * callable's registration-owned function tables and its
@@ -1177,24 +1207,14 @@ public:
     virtual void arm_host_dep_gen_capture(bool /*enable*/) {}
 
     /**
-     * Launch an AICPU kernel. Internal helper used by the subclass's
-     * `launch_execution()`; thin wrapper that dispatches through `load_aicpu_op_`'s
-     * cached `rtFuncHandle` (resolved by `LoadAicpuOp::Init` at first
-     * bootstrap).
+     * Launch an AICPU entry with an arbitrary launch-arg payload.
      *
-     * @param stream       AICPU stream
-     * @param k_args       Front-less KernelArgs payload (runtime_args @ 0)
-     * @param kernel_name  Name of the kernel to launch (e.g.
-     *                     `host::KernelNames::RunName`)
-     * @param aicpu_num    Number of AICPU instances to launch
-     * @return 0 on success, error code on failure
-     */
-    int launch_aicpu_kernel(rtStream_t stream, KernelArgs *k_args, const char *kernel_name, int aicpu_num);
-
-    /**
-     * Launch an AICPU entry with an arbitrary launch-arg payload. Used by the
-     * non-exec entries whose payload is not KernelArgs: `simpler_aicpu_init`
+     * Every AICPU launch goes through here: the run entry, whose payload is
+     * `KernelArgs` alone or that header followed by this run's entry values,
+     * and the non-exec entries whose payload is neither — `simpler_aicpu_init`
      * (InitArgs) and `simpler_aicpu_register_callable` (RegisterCallableArgs).
+     * `args_size` is what reaches `rtsLaunchCpuKernel` as `argsSize`, so it is
+     * how far past the header RTS copies.
      *
      * @param stream       AICPU stream
      * @param args         Payload pointer (host memory; CANN copies it in)
