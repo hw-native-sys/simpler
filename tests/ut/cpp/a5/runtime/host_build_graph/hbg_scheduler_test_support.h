@@ -128,6 +128,7 @@ inline constexpr uint64_t kFixtureCallableCount = 1024;
 
 struct FixtureStorage {
     explicit FixtureStorage(uint64_t task_count, uint64_t workers = 2) :
+        test_profiles(workers),
         test_contexts(workers),
         test_graphs(workers),
         local_states(workers) {
@@ -140,7 +141,6 @@ struct FixtureStorage {
         for (uint64_t worker = 0; worker < workers; ++worker) {
             SchedulerWorkerContext &context = contexts[worker];
             context.core_type = static_cast<int32_t>(CoreType::AIV);
-            context.active = 1;
             context.task_controls_offset = layout.task_controls_offset;
             context.task_metadata_offset = layout.task_metadata_offset;
             context.ready_inboxes_offset = layout.ready_inboxes_offset;
@@ -177,6 +177,7 @@ struct FixtureStorage {
     // their immutable fields into the local state used by the operation under test.
     SchedulerLocalState *local_context(const SchedulerWorkerContext *context, SchedulerLocalState *local = nullptr) {
         if (local == nullptr) local = &test_contexts[context - contexts];
+        if (local->profiling == nullptr) local->profiling = &test_profiles[context - contexts];
         auto &config = local->config;
         config.dispatch_payloads_offset = static_cast<uint32_t>(layout.dispatch_payloads_offset);
         config.shared_context = context;
@@ -187,8 +188,8 @@ struct FixtureStorage {
         config.task_metadata_offset = context->task_metadata_offset;
         config.ready_inboxes_offset = context->ready_inboxes_offset;
         config.ready_directory_offset = context->ready_directory_offset;
-        config.trace_cells_offset = context->trace_cells_offset;
-        config.activity_buffers_offset = context->activity_buffers_offset;
+        local->profiling->trace_cells_offset = context->trace_cells_offset;
+        local->profiling->activity_buffers_offset = context->activity_buffers_offset;
         config.worker_contexts_offset = context->worker_contexts_offset;
         config.callable_addresses_address = context->callable_addresses_address;
         config.callable_addresses_count = static_cast<uint32_t>(context->callable_addresses_count);
@@ -206,6 +207,7 @@ struct FixtureStorage {
         if (context->is_scheduler != 0) config.scheduler_lane = config.self_lane;
         return local;
     }
+    std::vector<SchedulerLocalProfilingState> test_profiles;
     std::vector<SchedulerLocalState> test_contexts;
     std::vector<SchedulerGraphView> test_graphs;
 
@@ -226,7 +228,8 @@ struct FixtureStorage {
     SchedulerSsbufRegion *ssbuf_region{scheduler_ssbuf_region(reinterpret_cast<uint64_t>(ssbuf_storage.data()))};
     std::vector<SchedulerLocalState> local_states;
     SchedulerLocalState *owner_states{local_states.data()};
-    SchedulerLocalState scheduler_local_state{};
+    SchedulerLocalProfilingState scheduler_profile{};
+    SchedulerLocalState scheduler_local_state{&scheduler_profile};
 };
 
 }  // namespace scheduler_test

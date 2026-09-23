@@ -18,7 +18,8 @@ constexpr int32_t kAivFuncId = 1;
 constexpr int32_t kTaskCapacity = 64;
 
 TaskId submit_task(
-    const simpler::hbg::Tensor &task_state, int64_t core_mode, int64_t logical_id, const TaskId *deps, int32_t dep_count
+    const simpler::hbg::Tensor &task_state, int64_t core_mode, int64_t logical_id, const TaskId *deps,
+    int32_t dep_count, int64_t kernel_repeats = 1
 ) {
     CoreTaskArgs task;
     task.add_no_dep(task_state);
@@ -27,16 +28,17 @@ TaskId submit_task(
     for (int32_t i = 0; i < dep_count; ++i)
         producer_mask |= UINT64_C(1) << deps[i].local_id();
     task.add_scalar(producer_mask);
+    task.add_scalar(kernel_repeats);
     task.set_dependencies(deps, static_cast<uint32_t>(dep_count));
     const bool use_aic = core_mode == 0 || (core_mode == 2 && (logical_id & 1) == 0);
     return (use_aic ? rt_submit_aic_task(kAicFuncId, task) : rt_submit_aiv_task(kAivFuncId, task)).task_id();
 }
 
-void build_chain(const simpler::hbg::Tensor &task_state, int64_t core_type) {
+void build_chain(const simpler::hbg::Tensor &task_state, int64_t core_type, int64_t kernel_repeats) {
     TaskId ids[kTaskCapacity];
-    ids[0] = submit_task(task_state, core_type, 0, nullptr, 0);
+    ids[0] = submit_task(task_state, core_type, 0, nullptr, 0, kernel_repeats);
     for (int64_t task_id = 1; task_id < kTaskCapacity; ++task_id)
-        ids[task_id] = submit_task(task_state, core_type, task_id, &ids[task_id - 1], 1);
+        ids[task_id] = submit_task(task_state, core_type, task_id, &ids[task_id - 1], 1, kernel_repeats);
 }
 
 void build_diamonds(const simpler::hbg::Tensor &task_state, int64_t core_type) {
@@ -102,7 +104,7 @@ extern "C" {
 
 __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &args) {
     (void)args;
-    return OrchestrationConfig{.expected_arg_count = 3};
+    return OrchestrationConfig{.expected_arg_count = 4};
 }
 
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &args) {
@@ -111,7 +113,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     int64_t core_type = args.scalar<int64_t>(1);
     switch (graph_case) {
     case 0:
-        build_chain(task_state, core_type);
+        build_chain(task_state, core_type, args.scalar<int64_t>(2));
         break;
     case 1:
         build_diamonds(task_state, core_type);

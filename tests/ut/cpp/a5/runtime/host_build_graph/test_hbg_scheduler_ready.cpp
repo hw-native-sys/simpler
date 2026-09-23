@@ -51,11 +51,13 @@ TEST(SchedulerActivityBuffer, IsAllocatedOnlyWhenRequestedAndNeverWraps) {
     contexts[0].is_scheduler = 1;
     contexts[0].scheduler_index = SCHEDULER_CLUSTER_CAPACITY - 1;
     SchedulerLocalState local{};
-    local.config.activity_buffers_offset = contexts[0].activity_buffers_offset;
+    SchedulerLocalProfilingState profile{};
+    local.profiling = &profile;
+    local.profiling->activity_buffers_offset = contexts[0].activity_buffers_offset;
     local.config.scheduler_index = contexts[0].scheduler_index;
     local.config.self_lane = 0;
     local.config.scheduler_lane = 0;
-    local.loop_iter = 17;
+    local.profiling->loop_iter = 17;
     SchedulerActivityBuffer &buffer = buffers[SCHEDULER_CLUSTER_CAPACITY - 1];
     buffer.committed = SCHEDULER_ACTIVITY_CAPACITY - 1;
 

@@ -1027,6 +1027,7 @@ bool create_scheduler_state(
     std::vector<int64_t> inline_completed_task_ids;
     std::vector<SchedulerTaskMetadata> task_metadata(static_cast<size_t>(total_tasks));
     uint64_t aic_task_count = 0;
+    bool sampled_task_timing_enabled = false;
     uint64_t aiv_task_count = 0;
     uint64_t executable_task_count = 0;
     uint64_t executable_subtask_count = 0;
@@ -1147,6 +1148,9 @@ bool create_scheduler_state(
         metadata.logical_block_num = static_cast<uint16_t>(logical_block_num);
         metadata.total_required_subtasks = static_cast<uint16_t>(expected_subtasks);
         metadata.timing_slot = slot.task_attrs.timing_slot();
+        sampled_task_timing_enabled =
+            sampled_task_timing_enabled ||
+            (metadata.timing_slot >= 0 && metadata.timing_slot < SCHEDULER_TASK_TIMING_SLOT_COUNT);
         if ((active_mask & 1U) != 0) {
             ++aic_task_count;
             aic_worker_demand = std::max<uint64_t>(aic_worker_demand, logical_block_num);
@@ -1226,6 +1230,7 @@ bool create_scheduler_state(
     run_control->aic_worker_demand = aic_worker_demand;
     run_control->aiv_worker_demand = aiv_worker_demand;
     run_control->chip_swimlane_level = api->chip_swimlane_level();
+    run_control->sampled_task_timing_enabled = sampled_task_timing_enabled ? 1 : 0;
     run_control->dispatch_payloads_offset = layout.dispatch_payloads_offset;
     run_control->task_metadata_offset = layout.task_metadata_offset;
     run_control->ready_inboxes_offset = layout.ready_inboxes_offset;
@@ -1247,7 +1252,6 @@ bool create_scheduler_state(
         context.core_type = static_cast<int32_t>(runtime->core_type_rule(i));
         context.physical_core_id = -1;
         context.type_rank = context.core_type == static_cast<int32_t>(CoreType::AIC) ? aic_rank++ : aiv_rank++;
-        context.active = 0;
         context.run_control_offset = layout.run_control_offset;
         context.task_controls_offset = layout.task_controls_offset;
         context.scheduler_ssbuf_reserved0 = 0;

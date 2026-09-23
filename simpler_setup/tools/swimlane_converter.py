@@ -1880,7 +1880,7 @@ def print_task_statistics(tasks, func_id_to_name=None, chip_swimlane_level=None)
             "propagations": [],  # dispatch_ts → AICore receive_time (NoC + FFTS)
             "local_setups": [],  # receive_time → start_time (dcci + ack on AICore)
             "latencies": [],
-            "total_exec_time": 0.0,
+            "valid_timing_exec_time": 0.0,
             "total_latency": 0.0,
         }
     )
@@ -1905,8 +1905,8 @@ def print_task_statistics(tasks, func_id_to_name=None, chip_swimlane_level=None)
         if "local_setup_us" in task:
             func_stats[func_id]["local_setups"].append(task["local_setup_us"])
 
-        # Calculate new metrics if dispatch_time_us and finish_time_us are available
-        if has_scheduler_timing and "dispatch_time_us" in task and "finish_time_us" in task:
+        # Scheduler metrics require valid timestamps for this task.
+        if task.get("dispatch_time_us", -1) >= 0 and task.get("finish_time_us", 0) > 0:
             dispatch_time = task["dispatch_time_us"]
             finish_time = task["finish_time_us"]
 
@@ -1928,7 +1928,7 @@ def print_task_statistics(tasks, func_id_to_name=None, chip_swimlane_level=None)
             func_stats[func_id]["latencies"].append(latency)
 
             # Accumulate execution time and latency for ratio calculation
-            func_stats[func_id]["total_exec_time"] += duration
+            func_stats[func_id]["valid_timing_exec_time"] += duration
             func_stats[func_id]["total_latency"] += latency
 
             # Track global times
@@ -1989,20 +1989,23 @@ def print_task_statistics(tasks, func_id_to_name=None, chip_swimlane_level=None)
         avg_tail_overhead = (
             sum(stats["tail_overheads"]) / len(stats["tail_overheads"]) if stats["tail_overheads"] else 0
         )
-        avg_latency = stats["total_latency"] / count if count > 0 else 0
+        valid_timing_count = len(stats["latencies"])
+        avg_latency = stats["total_latency"] / valid_timing_count if valid_timing_count else 0
         # `None` (not NaN) signals "no v3 receive_time data on this func" so
         # the print line below renders a dash. NaN would force ruff's
         # PLR0124 self-compare idiom.
         avg_propagation = sum(stats["propagations"]) / len(stats["propagations"]) if stats["propagations"] else None
         avg_local_setup = sum(stats["local_setups"]) / len(stats["local_setups"]) if stats["local_setups"] else None
 
-        # Calculate execution ratio: total_exec_time / total_latency
-        exec_ratio = (stats["total_exec_time"] / stats["total_latency"] * 100) if stats["total_latency"] > 0 else 0
+        # Execution and latency use the same valid scheduler timing samples.
+        exec_ratio = (
+            (stats["valid_timing_exec_time"] / stats["total_latency"] * 100) if stats["total_latency"] > 0 else 0
+        )
 
-        latency_str = f"{avg_latency:.2f}" if has_scheduler_timing else "-"
-        exec_ratio_str = f"{exec_ratio:.1f}%" if has_scheduler_timing else "-"
-        head_str = f"{avg_head_overhead:.2f}" if has_scheduler_timing else "-"
-        tail_str = f"{avg_tail_overhead:.2f}" if has_scheduler_timing else "-"
+        latency_str = f"{avg_latency:.2f}" if valid_timing_count else "-"
+        exec_ratio_str = f"{exec_ratio:.1f}%" if valid_timing_count else "-"
+        head_str = f"{avg_head_overhead:.2f}" if valid_timing_count else "-"
+        tail_str = f"{avg_tail_overhead:.2f}" if valid_timing_count else "-"
         prop_str = f"{avg_propagation:>12.2f}" if avg_propagation is not None else f"{'-':>12}"
         local_str = f"{avg_local_setup:>13.2f}" if avg_local_setup is not None else f"{'-':>13}"
         print(
@@ -2030,17 +2033,25 @@ def print_task_statistics(tasks, func_id_to_name=None, chip_swimlane_level=None)
         )
 
     # Task execution vs Scheduler overhead summary
-    if has_scheduler_timing and total_count > 0 and total_latency_sum > 0:
-        avg_exec_us = total_duration / total_count
-        avg_latency_us = total_latency_sum / total_count
-        exec_latency_ratio_pct = total_duration / total_latency_sum * 100
+    valid_timing_count = sum(len(stats["latencies"]) for stats in func_stats.values())
+    valid_timing_exec_time = sum(stats["valid_timing_exec_time"] for stats in func_stats.values())
+    if valid_timing_count > 0 and total_latency_sum > 0:
+        avg_exec_us = valid_timing_exec_time / valid_timing_count
+        avg_latency_us = total_latency_sum / valid_timing_count
+        exec_latency_ratio_pct = valid_timing_exec_time / total_latency_sum * 100
         print("\n--- Task execution vs Scheduler overhead ---")
         print(
-            f"  Per-task (all):  Avg Exec = {avg_exec_us:.2f} us,  "
+            f"  Per-task (valid scheduler timing):  Avg Exec = {avg_exec_us:.2f} us,  "
             f"Avg Latency (dispatch->finish) = {avg_latency_us:.2f} us,  "
             f"Exec/Latency = {exec_latency_ratio_pct:.2f}%"
         )
         print("  (Latency = dispatch→finish; Exec = AICore kernel time per task)")
+        handoff_delays = [delay for stats in func_stats.values() for delay in stats["head_overheads"]]
+        if handoff_delays:
+            print(
+                f"  Dispatch→kernel start (Host-computed): Total = {sum(handoff_delays):.2f} us, "
+                f"Max = {max(handoff_delays):.2f} us"
+            )
 
     print("=" * 110)
 

@@ -78,11 +78,21 @@ class TestHbgSingleCoreDag(SceneTestCase):
         for graph_case, task_count in (GRAPH_CASES[name],)
     ]
 
+    CASES.append(
+        {
+            "name": "aic_chain_64_work8",
+            "platforms": ["a5sim", "a5"],
+            "params": {"graph_case": 0, "task_count": 64, "core_type": "aic", "kernel_repeats": 8},
+            "manual": True,
+        }
+    )
+
     def generate_args(self, params):
         return TaskArgsBuilder(
             TensorArg("task_state", torch.zeros(64 * 8, dtype=torch.int64)),
             Scalar("graph_case", ctypes.c_int64(params["graph_case"])),
             Scalar("core_type", ctypes.c_int64({"aic": 0, "aiv": 1, "mixed": 2}[params["core_type"]])),
+            Scalar("kernel_repeats", ctypes.c_int64(params.get("kernel_repeats", 1))),
         )
 
     def compute_golden(self, args, params):

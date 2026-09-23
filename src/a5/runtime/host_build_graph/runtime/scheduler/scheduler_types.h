@@ -785,7 +785,7 @@ struct alignas(128) SchedulerTaskControl {
     int32_t waiting_producer;
     uint64_t completion_resolve_start_cycles;
     uint64_t completion_resolve_end_cycles;
-    uint64_t ready_publish_cycles;
+    uint64_t reserved_ready_publish;
     uint64_t scheduler_worker_id;
     uint64_t completion_resolve_loop_iter;
     uint8_t scheduler_line_padding[8];
@@ -977,7 +977,7 @@ struct alignas(128) SchedulerRunControl {
     volatile uint64_t bootstrap_scan_complete;
     volatile uint64_t scheduler_timeout_cycles;
     volatile uint64_t chip_swimlane_level;
-    uint64_t lifecycle_reserved;
+    volatile uint64_t sampled_task_timing_enabled;
 
     volatile uint64_t error_claimed;
     volatile uint64_t scheduler_error;
@@ -1015,7 +1015,7 @@ struct alignas(128) SchedulerWorkerContext {
     volatile int32_t core_type;
     int32_t physical_core_id;
     volatile int32_t type_rank;
-    volatile int32_t active;
+    uint32_t worker_reserved;
     volatile uint64_t run_control_offset;
     volatile uint64_t task_controls_offset;
     // Base of this run's ChipTaskStorage array. One address: a task's descriptor
@@ -1096,8 +1096,8 @@ struct alignas(128) SchedulerWorkerContext {
     uint64_t trace_register_release_cycles;
     uint64_t trace_descriptor_cache_observed_cycles;
     uint64_t completion_stats_reserved[2];
-    uint64_t ready_to_kernel_cycles;
-    uint64_t ready_to_kernel_max_cycles;
+    uint64_t reserved_ready_to_kernel_cycles;
+    uint64_t reserved_ready_to_kernel_max_cycles;
     uint64_t payload_cycles;
     uint64_t kernel_cycles;
 

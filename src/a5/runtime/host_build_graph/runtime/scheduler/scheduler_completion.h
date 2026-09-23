@@ -15,6 +15,17 @@
 
 #include "scheduler_ready.h"
 
+// The caller publishes only at idle or in the common run epilogue. A barrier
+// keeps trace/error publication ahead of the terminal completion count.
+inline __aicore__ void
+scheduler_flush_completions(__gm__ SchedulerRunControl *run_control, SchedulerLocalState *local) {
+    const uint64_t completed = local->pending_completed;
+    if (completed == 0) return;
+    scheduler_cache_barrier();
+    scheduler_gm_fetch_add(run_control->resolved_task_count, completed);
+    local->pending_completed = 0;
+}
+
 inline __aicore__ void scheduler_account_failed_completion(
     const SchedulerGraphView &graph, SchedulerLocalState *scheduler, __gm__ SchedulerRunControl *run_control,
     int64_t task_id, SchedulerErrorSite error_site
@@ -24,10 +35,7 @@ inline __aicore__ void scheduler_account_failed_completion(
     scheduler_record_error(
         run_control, task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler, error_site
     );
-    // AICPU may treat the completion count as the terminal graph token. Publish
-    // the error first so this failed completion can never look like success.
-    scheduler_cache_barrier();
-    scheduler_gm_fetch_add(run_control->resolved_task_count, UINT64_C(1));
+    ++scheduler->pending_completed;
 }
 
 inline __aicore__ bool scheduler_service_cluster_completion_slot(
@@ -49,7 +57,6 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     const uint64_t worker_id = scheduler->config.worker_ids[cluster_lane];
     if (worker_id >= scheduler->config.runtime_worker_count) return false;
     __gm__ SchedulerWorkerContext *target = scheduler_worker_context_at(scheduler_state_base, scheduler, worker_id);
-    if (target->active == 0) return false;
     SchedulerLocalSlotState *local_slot = &scheduler->slots[cluster_lane][pending_slot];
     const int64_t published_task_id = local_slot->task_id;
     if (local_slot->state != SchedulerDispatchSlotState::READY || local_slot->generation != completed_generation) {
@@ -69,11 +76,11 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
         scheduler_record_error(run_control, task_id, SchedulerGraphResult::INVALID_TASK_ID, &graph, scheduler);
         return false;
     }
-    const bool sampled_task_timing_enabled = local_slot->sampled_task_timing();
+    const bool sampled_task_timing_enabled = scheduler->sampled_task_timing(cluster_lane, pending_slot);
     SchedulerExecutorTaskTrace executor_trace{};
     if (chip_task_timing_enabled || sampled_task_timing_enabled) {
         if (worker_id == scheduler->worker_id()) {
-            executor_trace = scheduler->executor_traces[pending_slot];
+            executor_trace = scheduler->profiling->executor_traces[pending_slot];
         } else {
             const SCHEDULER_SSBUF volatile SchedulerExecutorTaskTrace *published_trace =
                 &ssbuf_region->lanes[cluster_lane].traces[pending_slot].payload;
@@ -88,7 +95,7 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     __gm__ SchedulerTaskTrace *completed_trace = nullptr;
     if (chip_task_timing_enabled || sampled_task_timing_enabled) {
         __gm__ SchedulerTaskTrace *traces =
-            scheduler_state_at<SchedulerTaskTrace>(scheduler_state_base, scheduler->config.trace_cells_offset);
+            scheduler_state_at<SchedulerTaskTrace>(scheduler_state_base, scheduler->profiling->trace_cells_offset);
         completed_trace = &traces[task_id];
     }
     if (chip_task_timing_enabled) {
@@ -106,22 +113,22 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
             completed_trace->ready_scan_start_cycles = executor_trace.ready_scan_start_cycles;
             completed_trace->completion_id = executor_trace.completion_id;
             completed_trace->completion_inbox_index = executor_trace.completion_inbox_index;
-            SchedulerWorkerTraceCache *worker_trace = &scheduler->worker_traces[cluster_lane];
-            if ((scheduler->worker_trace_valid_mask & (1U << cluster_lane)) == 0) {
+            SchedulerWorkerTraceCache *worker_trace = &scheduler->profiling->worker_traces[cluster_lane];
+            if ((scheduler->profiling->worker_trace_valid_mask & (1U << cluster_lane)) == 0) {
                 scheduler_observe_cache_line(&target->trace_aicore_entry_cycles);
                 scheduler_observe_cache_line(&target->trace_register_release_cycles);
                 worker_trace->descriptor_cache_observed_cycles = target->trace_descriptor_cache_observed_cycles;
                 worker_trace->aicore_entry_cycles = target->trace_aicore_entry_cycles;
                 worker_trace->handshake_publish_cycles = target->trace_handshake_publish_cycles;
                 worker_trace->register_release_cycles = target->trace_register_release_cycles;
-                scheduler->worker_trace_valid_mask |= 1U << cluster_lane;
+                scheduler->profiling->worker_trace_valid_mask |= 1U << cluster_lane;
             }
             completed_trace->descriptor_cache_observed_cycles = worker_trace->descriptor_cache_observed_cycles;
             completed_trace->aicore_entry_cycles = worker_trace->aicore_entry_cycles;
             completed_trace->handshake_publish_cycles = worker_trace->handshake_publish_cycles;
             completed_trace->register_release_cycles = worker_trace->register_release_cycles;
             completed_trace->complete_scheduler_worker_id = scheduler->worker_id();
-            completed_trace->complete_loop_iter = scheduler->loop_iter;
+            completed_trace->complete_loop_iter = scheduler->profiling->loop_iter;
         }
     } else if (completed_trace != nullptr) {
         completed_trace->kernel_start_cycles = executor_trace.kernel_start_cycles;
@@ -200,7 +207,7 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
         local_slot->task_id = SCHEDULER_TASK_ID_INVALID;
         local_slot->state = SchedulerDispatchSlotState::FREE;
         local_slot->subtask_slot = UINT8_MAX;
-        local_slot->timing_slot = -1;
+        scheduler->set_timing_slot(cluster_lane, pending_slot, -1);
     }
     if (chip_task_timing_enabled) {
         if (phase_timing_enabled) {
@@ -211,7 +218,7 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
             completed_trace->refill_start_cycles = refill_start_cycles;
             completed_trace->refill_end_cycles = refill_end_cycles;
             completed_trace->refill_task_id = static_cast<uint64_t>(ready.task_id);
-            completed_trace->refill_loop_iter = scheduler->loop_iter;
+            completed_trace->refill_loop_iter = scheduler->profiling->loop_iter;
         }
         scheduler_writeback_cache_line(completed_trace);
         scheduler_writeback_cache_line(&completed_trace->kernel_start_cycles);
@@ -228,7 +235,7 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     } else if (completed_trace != nullptr) {
         scheduler_publish_cache_line(&completed_trace->kernel_start_cycles);
     }
-    scheduler_gm_fetch_add(run_control->resolved_task_count, UINT64_C(1));
+    ++scheduler->pending_completed;
     if (direct_refilled != nullptr) *direct_refilled = refilled;
     return true;
 }
@@ -245,8 +252,6 @@ inline __aicore__ bool scheduler_service_cluster_completions(
     for (uint32_t cluster_lane = 0; cluster_lane < PLATFORM_CORES_PER_BLOCKDIM; ++cluster_lane) {
         const uint64_t worker_id = scheduler->config.worker_ids[cluster_lane];
         if (worker_id >= scheduler->config.runtime_worker_count) continue;
-        __gm__ SchedulerWorkerContext *target = scheduler_worker_context_at(scheduler_state_base, scheduler, worker_id);
-        if (target->active == 0) continue;
         const bool remote = cluster_lane != scheduler->config.self_lane;
         const uint64_t publication =
             remote ? scheduler_ssbuf_load_relaxed(&ssbuf_region->lanes[cluster_lane].completion.publication) : 0;

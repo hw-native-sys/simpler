@@ -163,11 +163,10 @@ TEST(SchedulerSsbuf, InitializesDirtyMailboxWithoutTouchingUserStorage) {
     alignas(64) std::array<uint8_t, SCHEDULER_SSBUF_HARDWARE_SIZE> hardware{};
     hardware.fill(0xa5);
     auto *region = scheduler_ssbuf_region(reinterpret_cast<uint64_t>(hardware.data()));
-    scheduler_ssbuf_initialize(region, 1, 0x7);
+    scheduler_ssbuf_initialize(region, 1);
 
     EXPECT_EQ(reinterpret_cast<uint8_t *>(region) - hardware.data(), SCHEDULER_SSBUF_REGION_OFFSET);
     EXPECT_TRUE(scheduler_ssbuf_is_initialized(region, 1));
-    EXPECT_EQ(region->header.active_lane_mask, 0x7u);
     for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
         for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot) {
             EXPECT_EQ(scheduler_ssbuf_load_relaxed(&region->lanes[lane].dispatch[slot].publication), 0u);

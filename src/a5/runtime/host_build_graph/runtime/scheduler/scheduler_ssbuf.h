@@ -28,16 +28,13 @@
 constexpr uint32_t SCHEDULER_SSBUF_HARDWARE_SIZE = PLATFORM_SSBUF_SIZE;
 constexpr uint32_t SCHEDULER_SSBUF_REGION_OFFSET = 2 * 1024;
 constexpr uint32_t SCHEDULER_SSBUF_REGION_SIZE = 1024;
-constexpr uint32_t SCHEDULER_SSBUF_LAYOUT_VERSION = 3;
 constexpr uint32_t SCHEDULER_SSBUF_INIT_GENERATION = 1;
 
 struct alignas(64) SchedulerSsbufHeader {
     volatile uint32_t init_generation;
-    volatile uint32_t layout_version;
     volatile uint32_t region_size;
     volatile uint32_t scheduler_lane;
-    volatile uint32_t active_lane_mask;
-    uint8_t reserved[44];
+    uint8_t reserved[52];
 };
 
 struct alignas(32) SchedulerSsbufDispatchControl {
@@ -147,9 +144,8 @@ inline __aicore__ void scheduler_ssbuf_store_release(SCHEDULER_SSBUF volatile ui
 #endif
 }
 
-inline __aicore__ void scheduler_ssbuf_initialize(
-    SCHEDULER_SSBUF SchedulerSsbufRegion *region, uint32_t scheduler_lane, uint32_t active_lane_mask
-) {
+inline __aicore__ void
+scheduler_ssbuf_initialize(SCHEDULER_SSBUF SchedulerSsbufRegion *region, uint32_t scheduler_lane) {
     // SSBUF may contain user data from an earlier launch. Only generation
     // tokens gate consumers; publish the header token after every lane token
     // and all immutable metadata have been initialized. Consumers enter only
@@ -163,16 +159,13 @@ inline __aicore__ void scheduler_ssbuf_initialize(
         }
         scheduler_ssbuf_store_relaxed(&region->lanes[lane].completion.publication, 0);
     }
-    region->header.layout_version = SCHEDULER_SSBUF_LAYOUT_VERSION;
     region->header.region_size = SCHEDULER_SSBUF_REGION_SIZE;
     region->header.scheduler_lane = scheduler_lane;
-    region->header.active_lane_mask = active_lane_mask;
     scheduler_ssbuf_store_release(&region->header.init_generation, SCHEDULER_SSBUF_INIT_GENERATION);
 }
 
 inline __aicore__ bool
 scheduler_ssbuf_is_initialized(const SCHEDULER_SSBUF SchedulerSsbufRegion *region, uint32_t scheduler_lane) {
     return scheduler_ssbuf_load_acquire(&region->header.init_generation) == SCHEDULER_SSBUF_INIT_GENERATION &&
-           region->header.layout_version == SCHEDULER_SSBUF_LAYOUT_VERSION &&
            region->header.region_size == SCHEDULER_SSBUF_REGION_SIZE && region->header.scheduler_lane == scheduler_lane;
 }

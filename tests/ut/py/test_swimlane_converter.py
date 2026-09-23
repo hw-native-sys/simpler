@@ -808,6 +808,71 @@ def test_task_statistics_without_scheduler_timestamps_hides_scheduler_metrics(ca
     assert total.split() == ["TOTAL", "1", "5.00", "-"]
     assert "AICore Observed Span: 5.50 us (from earliest AICore receive to latest AICore end)" in output
     assert "Total Test Time" not in output
+    assert "Host-computed" not in output
+
+
+def test_task_statistics_computes_dispatch_to_kernel_delay_on_host(capsys):
+    tasks = [
+        {
+            "task_id": i,
+            "func_id": 0,
+            "core_id": 0,
+            "core_type": "aic",
+            "start_time_us": start,
+            "end_time_us": start + 5,
+            "duration_us": 5,
+            "dispatch_time_us": dispatch,
+            "finish_time_us": start + 6,
+        }
+        for i, (dispatch, start) in enumerate([(1.0, 3.0), (10.0, 13.0)])
+    ]
+    sc.print_task_statistics(tasks, {"0": "kernel"}, chip_swimlane_level=3)
+    assert "Dispatch→kernel start (Host-computed): Total = 5.00 us, Max = 3.00 us" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "invalid_timing",
+    [
+        {"dispatch_time_us": 0.0, "finish_time_us": 0.0},
+        {"dispatch_time_us": 0.0, "finish_time_us": -100.0},
+        {"dispatch_time_us": -1.0, "finish_time_us": 106.0},
+        {"finish_time_us": 106.0},
+        {"dispatch_time_us": 0.0},
+        {},
+    ],
+)
+@pytest.mark.parametrize("invalid_func_id", [0, 1])
+def test_task_statistics_delay_summary_excludes_invalid_scheduler_timing(capsys, invalid_timing, invalid_func_id):
+    tasks = [
+        {
+            "task_id": 0,
+            "func_id": 0,
+            "start_time_us": 2.0,
+            "end_time_us": 7.0,
+            "duration_us": 5.0,
+            "dispatch_time_us": 0.0,
+            "finish_time_us": 8.0,
+        },
+        {
+            "task_id": 1,
+            "func_id": invalid_func_id,
+            "start_time_us": 100.0,
+            "end_time_us": 105.0,
+            "duration_us": 5.0,
+            **invalid_timing,
+        },
+    ]
+
+    sc.print_task_statistics(tasks, chip_swimlane_level=3)
+
+    output = capsys.readouterr().out
+    assert "Dispatch→kernel start (Host-computed): Total = 2.00 us, Max = 2.00 us" in output
+    row = next(line for line in output.splitlines() if line.startswith("0 "))
+    assert row.split()[2:] == ["2" if invalid_func_id == 0 else "1", "5.00", "8.00", "62.5%", "2.00", "1.00", "-", "-"]
+    assert "Avg Exec = 5.00 us,  Avg Latency (dispatch->finish) = 8.00 us,  Exec/Latency = 62.50%" in output
+    if invalid_func_id == 1:
+        invalid_row = next(line for line in output.splitlines() if line.startswith("1 "))
+        assert invalid_row.split()[2:] == ["1", "5.00", "-", "-", "-", "-", "-", "-"]
 
 
 def test_load_func_names_auto_discovery_and_explicit_precedence(tmp_path):

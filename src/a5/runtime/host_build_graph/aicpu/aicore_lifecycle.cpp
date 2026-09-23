@@ -195,7 +195,6 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
         }
         contexts[i].core_type = static_cast<int32_t>(cores_[i].core_type);
         contexts[i].physical_core_id = static_cast<int32_t>(cores_[i].physical_core_id);
-        contexts[i].active = 0;
     }
     LOG_INFO("Core discovery complete: %d AIC, %d AIV", aic_count, aiv_count);
 
@@ -236,22 +235,8 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
         }
     }
 
-    const uint64_t executable_task_count = run_control->expected_task_count - run_control->inline_completed_count;
-    const int32_t requested_aic = static_cast<int32_t>(
-        std::min<uint64_t>(aic_count, std::max(run_control->aic_worker_demand, run_control->aic_task_count))
-    );
-    const int32_t requested_aiv = static_cast<int32_t>(
-        std::min<uint64_t>(aiv_count, std::max(run_control->aiv_worker_demand, run_control->aiv_task_count))
-    );
-    uint64_t required_clusters = std::max<uint64_t>(
-        requested_aic,
-        (static_cast<uint64_t>(requested_aiv) + PLATFORM_AIV_CORES_PER_BLOCKDIM - 1) / PLATFORM_AIV_CORES_PER_BLOCKDIM
-    );
-    if (executable_task_count != 0) required_clusters = std::max<uint64_t>(required_clusters, 1);
-    const int32_t active_clusters = static_cast<int32_t>(std::min<uint64_t>(required_clusters, aic_count));
     if (run_control->aic_worker_demand > static_cast<uint64_t>(aic_count) ||
-        run_control->aiv_worker_demand > static_cast<uint64_t>(aiv_count) ||
-        (executable_task_count != 0 && active_clusters == 0)) {
+        run_control->aiv_worker_demand > static_cast<uint64_t>(aiv_count)) {
         LOG_ERROR(
             "A5 HBG AICore scheduler: topology cannot execute graph (demand AIC=%" PRIu64 " AIV=%" PRIu64
             ", cores AIC=%d AIV=%d)",
@@ -271,39 +256,21 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
         for (int32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
             const int32_t worker = cluster_workers[cluster][lane];
             const bool scheduler_lane = static_cast<uint64_t>(worker) == scheduler_worker;
-            const bool additional_aiv_lane =
-                lane != 0 && !scheduler_lane && cluster * PLATFORM_AIV_CORES_PER_BLOCKDIM + 1 < requested_aiv;
-            const bool active_lane = cluster < active_clusters &&
-                                     (scheduler_lane || (lane == 0 && cluster < requested_aic) || additional_aiv_lane);
-            contexts[worker].active = active_lane ? 1 : 0;
-            contexts[worker].cluster_count = static_cast<uint64_t>(active_clusters);
+            contexts[worker].cluster_count = static_cast<uint64_t>(aic_count);
             contexts[worker].cluster_index = static_cast<uint64_t>(cluster);
-            contexts[worker].scheduler_index = cluster < active_clusters ? static_cast<uint64_t>(cluster) : UINT64_MAX;
+            contexts[worker].scheduler_index = static_cast<uint64_t>(cluster);
             contexts[worker].scheduler_worker_id = scheduler_worker;
-            contexts[worker].is_scheduler = scheduler_lane && cluster < active_clusters ? 1 : 0;
-            contexts[worker].scheduler_count = static_cast<uint64_t>(active_clusters);
+            contexts[worker].is_scheduler = scheduler_lane ? 1 : 0;
+            contexts[worker].scheduler_count = static_cast<uint64_t>(aic_count);
             for (int32_t member = 0; member < PLATFORM_CORES_PER_BLOCKDIM; ++member)
                 contexts[worker].cluster_worker_ids[member] = static_cast<uint64_t>(cluster_workers[cluster][member]);
         }
     }
-    int32_t active_aic = 0;
-    int32_t active_aiv = 0;
-    for (int32_t worker = 0; worker < core_count_; ++worker) {
-        if (contexts[worker].active == 0) continue;
-        if (cores_[worker].core_type == CoreType::AIC) ++active_aic;
-        else ++active_aiv;
-    }
-    run_control->active_worker_count = static_cast<uint64_t>(active_aic) + static_cast<uint64_t>(active_aiv);
-    run_control->aic_active_worker_count = static_cast<uint64_t>(active_aic);
-    run_control->aiv_active_worker_count = static_cast<uint64_t>(active_aiv);
-    run_control->scheduler_count = static_cast<uint64_t>(active_clusters);
+    run_control->active_worker_count = static_cast<uint64_t>(core_count_);
+    run_control->aic_active_worker_count = static_cast<uint64_t>(aic_count);
+    run_control->aiv_active_worker_count = static_cast<uint64_t>(aiv_count);
+    run_control->scheduler_count = static_cast<uint64_t>(aic_count);
     run_control->scheduler_timeout_cycles = resident_scheduler_timeout_cycles();
-    if (executable_task_count == 0) {
-        run_control->bootstrap_scan_arrived_count = static_cast<uint64_t>(active_clusters);
-        run_control->bootstrap_scan_complete = 1;
-        run_control->bootstrap_arrived_count = static_cast<uint64_t>(active_clusters);
-        run_control->bootstrap_complete = 1;
-    }
 
     const uint64_t topology_complete_cycles = record_lifecycle_timing ? get_sys_cnt_aicpu() : 0;
     lifecycle_traces[0].topology_complete_cycles = topology_complete_cycles;

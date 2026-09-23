@@ -17,7 +17,7 @@ host: collect outputs and destroy/reset per-run state
 ```
 
 The device has no orchestration thread. The resident scheduler uses one AIV
-Scheduler per active cluster; AICPU initializes, monitors, and tears down the
+Scheduler per discovered cluster; AICPU initializes, monitors, and tears down the
 workers. The explicit legacy path uses AICPU scheduling.
 
 This ordering is the defining constraint of the runtime. The host constructs the
@@ -407,7 +407,12 @@ Each READY acquire initializes a fresh core-local configuration. Dispatch and
 completion use cached worker IDs; the Executor derives payload addresses from
 one shared region offset and the worker ID. Narrow offsets are validated before
 conversion, and every cluster member must agree with the fixed payload stride.
-Worker participation remains controlled by the shared GM context.
+All discovered clusters and all three lanes in each cluster participate.
+Graph demand is checked against available capacity; it does not mask workers.
+Partial-core masking has no current workload requirement and would add a
+separate participation policy to bootstrap, dispatch and shutdown. All discovered
+lanes therefore participate, and bootstrap partitions the task scan across their
+Schedulers. This scan parallelism is not an isolated performance measurement.
 
 Owner pending endpoints and publication masks are private to the Scheduler.
 Self-execution notifications contain only a pending-slot mask: the slot stays
@@ -415,13 +420,19 @@ READY with the same generation until the local Executor claims it, so the ready
 token is reconstructed from the slot. Completion generation validation still
 prevents stale notifications from freeing or refilling a pending slot.
 
-The local configuration occupies 104 bytes under the 64-bit ABI. Local state also
-contains six timing slots and completion generations. Only the two self-execution
-slots have local Executor traces; remote traces reside in SSBUF. Sampling is
-derived from the timing-slot range. The complete local state occupies 496 bytes.
-Profiling storage is present even when profiling is disabled.
-Compile-time assertions anchor the 64-bit configuration, slot and local-state
-sizes. These sizes exclude other function locals and compiler spills; they do
+The local configuration occupies 88 bytes and the base local state 256 bytes
+under the 64-bit ABI, including its optional profiling pointer. A separate
+240-byte profiling state holds six timing slots, two self-execution traces,
+worker trace caches, profiling offsets, and the loop counter/valid mask.
+Remote traces reside in SSBUF. Sampling is derived from the timing-slot range.
+
+The host records whether any task requests sampled timing in the run control.
+Only a run with chip profiling or sampled timing enters the resident function
+specialization that allocates profiling state; the plain specialization does
+not allocate it. These functions do not inline into the common entry. The
+combined local state with profiling is 496 bytes. These sizes exclude other
+function locals, worker statistics and compiler spills. Compile-time assertions
+anchor the 64-bit configuration, slot, base and profiling state sizes; they do
 not establish the dynamic AICore stack high-water mark.
 
 Before bootstrap, every participating core invalidates its entire data cache.
@@ -443,10 +454,12 @@ use no SSBUF read-modify-write atomics. The Scheduler initializes every token
 before publishing the header, and each invocation validates the region.
 Self-execution uses local notifications, completion generations and trace storage.
 
-Layout version 3 is an internal contract shared by the Scheduler and Executor
-from the same runtime build, not a negotiated protocol. Consumers require an
-exact version match. Incompatible field-layout or token-semantics changes must
-increment `SCHEDULER_SSBUF_LAYOUT_VERSION` and update both ends together.
+The Scheduler and Executor share the SSBUF structure definitions in the same
+runtime build. Each run initializes the region before use.
+There is no compatibility contract between SSBUF layouts from different runtime
+builds: a launch replaces prior tokens and metadata instead of consuming them.
+Header validation checks the initialized region; initialization and the launch
+gate, rather than a layout-version field, establish its freshness.
 Reserved bytes have unspecified contents and must not be read. Any newly
 introduced field must be explicitly initialized before the header is published.
 
@@ -456,15 +469,29 @@ cluster's SSBUF before reporting bootstrap arrival; AICPU waits for the aggregat
 validate the header only after that gate opens. The kernel-author storage
 boundary is documented in [A5 runtime variants](../../../docs/runtimes.md#host_build_graph).
 
-The dispatch timing interval ends after publishing the first task-trace cache
-line. It includes that publication's overhead, but excludes the subsequent
-dispatch-timing cache-line publication and READY token publication. Device
-RunWall measures the full on-NPU run independently of this phase boundary.
+The dispatch timing interval ends at `ready_publish_cycles`, immediately before
+READY token publication. It excludes READY publication and all subsequent
+dispatch-trace GM writes. Device RunWall measures the full on-NPU run
+independently of this phase boundary.
 
 Simulation allocates an aligned 3 KiB backing region per physical cluster,
 shared by its AIC and two AIV lanes and retired with the run. Initialization
-tolerates nonzero previous contents. Completion counts are published after
-each resolved task and after any associated error.
+tolerates nonzero previous contents.
+
+Resolved counts accumulate locally until an idle pass with no local executable
+task or deferred reservation, or the common run epilogue. Trace and error
+publication precedes each count flush. The AICPU watchdog remains 20 seconds
+by default, so continuously busy work without count publication can reach
+that timeout.
+The intended runs normally complete in under one second. Completion accounting
+therefore avoids periodic publication on the busy path; the continuous-busy
+timeout is an accepted limit outside that expected duration, not evidence that
+busy execution has stopped making progress.
+
+Directory queries are skipped when no unreserved FREE slot can accept
+work. Idle polling backs off from 8 to at most 32 iterations. Dispatch trace
+GM writes follow ready publication; Host tooling computes ready-to-kernel
+latency from the recorded timestamps.
 
 ## 8. Scalar Access During Construction
 
