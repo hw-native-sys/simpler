@@ -84,6 +84,27 @@ void fake_set_retained_temp_buffer(void * /*runner_ctx*/, uint32_t /*pipeline_sl
     g_slot->size = size;
 }
 
+// The grow the platform now owns, as the sequence the bump used to run
+// itself: release the old block, take a bigger one, and stop naming the old
+// one either way.
+int fake_acquire_retained_temp(
+    void *runner_ctx, uint32_t pipeline_slot, size_t bytes, void **addr_out, size_t *size_out
+) {
+    fake_get_retained_temp_buffer(runner_ctx, pipeline_slot, addr_out, size_out);
+    if (bytes == 0 || bytes <= *size_out) return 0;
+    if (*addr_out != nullptr) fake_device_free(runner_ctx, *addr_out);
+    void *grown = fake_device_malloc(runner_ctx, bytes);
+    fake_set_retained_temp_buffer(runner_ctx, pipeline_slot, grown, grown == nullptr ? 0 : bytes);
+    if (grown == nullptr) {
+        *addr_out = nullptr;
+        *size_out = 0;
+        return -1;
+    }
+    *addr_out = grown;
+    *size_out = bytes;
+    return 0;
+}
+
 const HostApiOps &fake_ops() {
     static const HostApiOps ops = []() {
         HostApiOps result{};
@@ -91,6 +112,7 @@ const HostApiOps &fake_ops() {
         result.device_free = fake_device_free;
         result.get_retained_temp_buffer = fake_get_retained_temp_buffer;
         result.set_retained_temp_buffer = fake_set_retained_temp_buffer;
+        result.acquire_retained_temp = fake_acquire_retained_temp;
         return result;
     }();
     return ops;

@@ -204,6 +204,32 @@ static void set_retained_temp_buffer(void *runner_ctx, uint32_t pipeline_slot, v
     } catch (...) {}
 }
 
+static int
+acquire_retained_temp(void *runner_ctx, uint32_t pipeline_slot, size_t bytes, void **addr_out, size_t *size_out) {
+    if (runner_ctx == nullptr || addr_out == nullptr || size_out == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    // The sim backend manages no workspace, so this is the sequence
+    // RetainedTempBump used to run itself: release the old block, take a bigger
+    // one, and stop naming the old one either way.
+    try {
+        auto *runner = static_cast<SimDeviceRunnerBase *>(runner_ctx);
+        runner->get_retained_temp_buffer(pipeline_slot, addr_out, size_out);
+        if (bytes == 0 || bytes <= *size_out) return 0;
+        if (*addr_out != nullptr) runner->free_tensor(*addr_out);
+        void *grown = runner->allocate_tensor(bytes);
+        runner->set_retained_temp_buffer(pipeline_slot, grown, grown == nullptr ? 0 : bytes);
+        if (grown == nullptr) {
+            *addr_out = nullptr;
+            *size_out = 0;
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        *addr_out = grown;
+        *size_out = bytes;
+        return 0;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
 static int acquire_graph_definition_block(
     void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **staging_out
 ) {
@@ -374,6 +400,7 @@ static const HostApiOps g_host_api_ops = {
     .device_memset = device_memset,
     .get_retained_temp_buffer = get_retained_temp_buffer,
     .set_retained_temp_buffer = set_retained_temp_buffer,
+    .acquire_retained_temp = acquire_retained_temp,
     .acquire_graph_definition_block = acquire_graph_definition_block,
     .get_graph_definition_staging = get_graph_definition_staging,
     .acquire_sm_mirror = acquire_sm_mirror,

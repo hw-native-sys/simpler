@@ -383,6 +383,25 @@ void fake_get_graph_definition_staging(void *, uint32_t, void **addr, size_t *si
     if (size != nullptr) *size = g_fake->definition_bytes;
 }
 
+// The grow the platform now owns, as the sequence the bump used to run itself.
+int fake_acquire_retained_temp(
+    void *runner_ctx, uint32_t pipeline_slot, size_t bytes, void **addr_out, size_t *size_out
+) {
+    fake_get_retained(runner_ctx, pipeline_slot, addr_out, size_out);
+    if (bytes == 0 || bytes <= *size_out) return 0;
+    if (*addr_out != nullptr) fake_device_free(runner_ctx, *addr_out);
+    void *grown = fake_device_malloc(runner_ctx, bytes);
+    fake_set_retained(runner_ctx, pipeline_slot, grown, grown == nullptr ? 0 : bytes);
+    if (grown == nullptr) {
+        *addr_out = nullptr;
+        *size_out = 0;
+        return -1;
+    }
+    *addr_out = grown;
+    *size_out = bytes;
+    return 0;
+}
+
 const HostApiOps &fake_ops() {
     static const HostApiOps ops = []() {
         HostApiOps r{};
@@ -392,6 +411,7 @@ const HostApiOps &fake_ops() {
         r.copy_from_device = fake_copy_from_device;
         r.get_retained_temp_buffer = fake_get_retained;
         r.set_retained_temp_buffer = fake_set_retained;
+        r.acquire_retained_temp = fake_acquire_retained_temp;
         r.setup_static_arena = fake_setup_static_arena;
         r.acquire_pooled_gm_heap = fake_acquire_gm_heap;
         r.acquire_pooled_runtime_arena = fake_acquire_runtime_arena;

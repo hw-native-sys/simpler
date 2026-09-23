@@ -27,16 +27,18 @@ namespace {
 // intended change updates this alias and says so.
 // Appended (never inserted) since the last revision: `sdma_warmup_path`, the
 // vector-only ELF used to warm the SDMA control path during init-time workspace
-// provisioning; and `dfx_session`, the opt-in that keeps one diagnostic
-// collection session across this chip's runs instead of rebuilding it at every
-// run boundary.
+// provisioning; `dfx_session`, the opt-in that keeps one diagnostic collection
+// session across this chip's runs instead of rebuilding it at every run
+// boundary; and `workspace_budget_bytes`, the finite budget that puts this
+// context's retained temporary buffer and three pooled arena regions under one
+// owner. Zero is the default and manages none of them.
 // Retyped in place, not moved: the async-DMA parameter is `bool enable_sdma`
 // rather than a DmaWorkspaceKind bitmask. SDMA is the only engine a caller can
 // decline, so a set was never the question being asked; every other supported
 // engine is provisioned unconditionally.
 using ExpectedChipWorkerInit = void (ChipWorker::*)(
     const std::string &, const std::string &, const std::string &, const std::string &, int, const CallConfig *, bool,
-    const std::string &, const std::string &, bool
+    const std::string &, const std::string &, bool, uint64_t
 );
 static_assert(
     std::is_same_v<decltype(&ChipWorker::init), ExpectedChipWorkerInit>,

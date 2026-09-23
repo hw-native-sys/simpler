@@ -77,6 +77,7 @@
 #include "host/child_memory_host_view.h"
 #include "host/kernel_execution_state.h"
 #include "host/memory_allocator.h"
+#include "host/workspace_manager.h"
 #include "host/pmu_collector.h"
 #include "host/queued_stream_waits.h"
 #include "host/run_boundary_marks.h"
@@ -372,6 +373,67 @@ public:
      */
     int acquire_run_image_staging(uint32_t pipeline_slot, std::size_t bytes, std::size_t alignment, void **addr_out);
     void clear_temporary_buffer();
+
+    /**
+     * Latch this context's finite workspace budget, once.
+     *
+     * @return 0 on success; PTO_RUNTIME_ERR_INVALID_ARGUMENT for a zero budget
+     *         or a second call.
+     */
+    int set_workspace_budget(std::uint64_t limit_bytes);
+
+    /** Fill one workspace report. False when no budget is latched. */
+    bool workspace_report(SimplerWorkspaceReport *out) const;
+
+    /** Whether a workspace budget is latched on this context. */
+    bool workspace_enabled() const { return workspace_.enabled(); }
+
+    /**
+     * Report one run fact at the boundary that produced it.
+     *
+     * Called from the run phase entries, never derived from a phase word or
+     * from the code a caller received.
+     */
+    void note_workspace_run_fact(uint32_t pipeline_slot, std::uint64_t run_epoch, WorkspaceManager::RunFact fact) {
+        workspace_.note_run_fact(pipeline_slot, run_epoch, fact);
+    }
+
+    /**
+     * Publish the run identity this thread's workspace requests belong to.
+     *
+     * The arena callbacks and the retained-temp grow carry no identity of their
+     * own, so the prepare driving them names one around the call. Thread-scoped
+     * because a prepared successor may be built on another thread while this
+     * one still holds its own plan.
+     */
+    static void begin_workspace_plan(uint32_t pipeline_slot, std::uint64_t run_epoch) noexcept;
+    static void end_workspace_plan() noexcept;
+
+    /** Scopes one thread's workspace plan identity to a prepare. */
+    class WorkspacePlanScope {
+    public:
+        WorkspacePlanScope(uint32_t pipeline_slot, std::uint64_t run_epoch) noexcept {
+            begin_workspace_plan(pipeline_slot, run_epoch);
+        }
+        ~WorkspacePlanScope() { end_workspace_plan(); }
+        WorkspacePlanScope(const WorkspacePlanScope &) = delete;
+        WorkspacePlanScope &operator=(const WorkspacePlanScope &) = delete;
+    };
+
+    /** Runs still holding workspace whose completion a caller can still prove. */
+    std::uint32_t workspace_live_consumers() const { return workspace_.live_drainable_consumers(); }
+
+    /**
+     * Acquire this slot's retained temporary staging buffer.
+     *
+     * Managed contexts answer from the ledger; unmanaged ones allocate exactly
+     * as `RetainedTempBump` did on its own. Either way the slot ends up naming
+     * the returned block, and a failure leaves the previous block named and
+     * intact.
+     *
+     * @return 0 on success, non-zero when no block of `bytes` could be had
+     */
+    int acquire_retained_temp(uint32_t pipeline_slot, std::size_t bytes, void **addr_out, std::size_t *size_out);
     /**
      * Map a device buffer into the host address space and return a
      * host-readable VA (or nullptr on failure); the paired unregister releases
@@ -1326,14 +1388,29 @@ protected:
 
     /**
      * `DeviceArena` callback trampolines bridging from C-style
-     * `void *(void *ctx, size_t)` / `void (void *ctx, void *)` to the
-     * `MemoryAllocator` member function calls. The `ctx` opaque pointer
-     * passed at arena construction time is `&mem_alloc_`.
+     * `void *(void *ctx, size_t)` / `void (void *ctx, void *)` to this runner.
+     * The `ctx` opaque pointer passed at arena construction time is the runner,
+     * not the allocator: a context with a latched workspace budget routes its
+     * arena backing through the ledger that owns those blocks, and one without
+     * a budget reaches the same allocator calls it always did.
      */
     static void *arena_alloc_trampoline(void *ctx, std::size_t size) {
-        return static_cast<MemoryAllocator *>(ctx)->alloc(size);
+        return static_cast<DeviceRunnerBase *>(ctx)->acquire_arena_backing(size);
     }
-    static void arena_free_trampoline(void *ctx, void *p) { static_cast<MemoryAllocator *>(ctx)->free(p); }
+    static void arena_free_trampoline(void *ctx, void *p) {
+        static_cast<DeviceRunnerBase *>(ctx)->release_arena_backing(p);
+    }
+
+    /**
+     * Arena backing acquisition and hand-back for one bank region.
+     *
+     * Unmanaged: the allocator, as before. Managed: the workspace ledger, which
+     * may hand back a block an earlier generation still fits and no consumer
+     * references, and which treats the hand-back as dropping this run's
+     * reference rather than as permission to free.
+     */
+    void *acquire_arena_backing(std::size_t size);
+    void release_arena_backing(void *p);
 
     /**
      * Configure STARS op execution timeout (once per DeviceRunner lifetime).
@@ -2065,6 +2142,11 @@ protected:
     host::LoadAicpuOp load_aicpu_op_;
 
     MemoryAllocator mem_alloc_;
+
+    // One budget and one ownership ledger for this context's workspace
+    // regions. Off unless a caller latches a budget.
+    WorkspaceManager workspace_;
+
     // Host mappings of child-memory allocations a host-side orchestrator has
     // touched — see HostApi acquire_child_memory_host_view. Keyed by allocation
     // base and dropped by that allocation's free, which is what keeps a cached

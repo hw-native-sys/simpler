@@ -271,6 +271,17 @@ static void set_retained_temp_buffer(void *runner_ctx, uint32_t pipeline_slot, v
     } catch (...) {}
 }
 
+static int
+acquire_retained_temp(void *runner_ctx, uint32_t pipeline_slot, size_t bytes, void **addr_out, size_t *size_out) {
+    if (runner_ctx == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        return static_cast<DeviceRunnerBase *>(runner_ctx)
+            ->acquire_retained_temp(pipeline_slot, bytes, addr_out, size_out);
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
 static int acquire_graph_definition_block(
     void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **staging_out
 ) {
@@ -449,6 +460,7 @@ static const HostApiOps g_host_api_ops = {
     .device_memset = device_memset,
     .get_retained_temp_buffer = get_retained_temp_buffer,
     .set_retained_temp_buffer = set_retained_temp_buffer,
+    .acquire_retained_temp = acquire_retained_temp,
     .acquire_graph_definition_block = acquire_graph_definition_block,
     .get_graph_definition_staging = get_graph_definition_staging,
     .acquire_sm_mirror = acquire_sm_mirror,
@@ -962,6 +974,17 @@ static void report_terminal_disagreement(const OnboardNativeRunContext *state, i
     }
 }
 
+/**
+ * Report one workspace fact for this run, at the boundary that produced it.
+ *
+ * A fact is never derived from a phase word or from the code a caller will
+ * receive: this is called where the fact became true, and only there.
+ */
+static void note_workspace_fact(OnboardNativeRunContext *state, WorkspaceManager::RunFact fact) {
+    if (state == nullptr || state->runner == nullptr) return;
+    state->runner->note_workspace_run_fact(state->descriptor.pipeline_slot, state->descriptor.run_epoch, fact);
+}
+
 static int cleanup_failed_prepare(OnboardNativeRunContext *state, int execution_rc) {
     const uint64_t trace_inv = state->trace_inv;
     const uint64_t trace_hid = state->trace_hid;
@@ -977,6 +1000,13 @@ static int cleanup_failed_prepare(OnboardNativeRunContext *state, int execution_
     } catch (...) {
         validation_rc = PTO_RUNTIME_ERR_INTERNAL;
     }
+    // A prepare that failed reached no launch transaction, so it owns no device
+    // work. Its host borrowers are only proven gone when the release above both
+    // returned and succeeded — a throw or a non-zero code leaves them unproven,
+    // which is what keeps this run's blocks out of reuse.
+    note_workspace_fact(state, WorkspaceManager::RunFact::NoDeviceSubmission);
+    note_workspace_fact(state, WorkspaceManager::RunFact::CopybackReturned);
+    if (validation_rc == 0) note_workspace_fact(state, WorkspaceManager::RunFact::BindingsReleased);
     int resources_rc = 0;
     if (state->prepared_execution != nullptr) {
         try {
@@ -1002,6 +1032,9 @@ static int cleanup_failed_prepare(OnboardNativeRunContext *state, int execution_
         state->runner->release_native_run_reservation(state);
         state->runner_reserved = false;
     }
+    // Last: after this the run object is gone, so no further fact about it can
+    // arrive and whatever it still references becomes unprovable.
+    note_workspace_fact(state, WorkspaceManager::RunFact::ContextDestroyed);
     destroy_native_run_context(state);
     emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns, trace_attrs);
     if (validation_rc != 0) return validation_rc;
@@ -1085,6 +1118,12 @@ int simpler_prepare_run(
             return PTO_RUNTIME_ERR_INTERNAL;
         }
         state->runner_reserved = true;
+        // Names the run every workspace request inside this prepare belongs to:
+        // the arena commits below and the retained-temp grow record their
+        // references against this identity.
+        DeviceRunnerBase::WorkspacePlanScope workspace_plan(
+            state->descriptor.pipeline_slot, state->descriptor.run_epoch
+        );
         const bool overlaps_active_run = allow_prepared_successor && runner->native_run_active();
         state->trace_inv = trace_inv;
         state->trace_start_ns = trace_start_ns;
@@ -1409,6 +1448,9 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     // and frees device allocations, all of which need this thread's CANN
     // device context. rtSetDevice is idempotent on an already-attached thread.
     int drain_rc = PTO_RUNTIME_ERR_INTERNAL;
+    // Published before the call, so a drain that lost its attach or threw is
+    // never mistaken for one that never ran.
+    note_workspace_fact(state, WorkspaceManager::RunFact::DrainAttempted);
     try {
         drain_rc = state->runner->attach_current_thread(state->runner->device_id());
         if (drain_rc != 0) {
@@ -1424,6 +1466,9 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         LOG_ERROR("simpler_wait_run: drain threw (%s)", state->trace_attrs);
     }
     if (state->completion_rc == 0) state->completion_rc = drain_rc;
+    // Only a drain that returned success proves this run's device work
+    // finished; the phase below is set on every path and proves nothing.
+    if (drain_rc == 0) note_workspace_fact(state, WorkspaceManager::RunFact::DrainProvedComplete);
     state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
     emit_native_run_runner_wall(state);
     return state->completion_rc;
@@ -1532,6 +1577,13 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     // that must be drained, whose rc is the run's result, and whose runtime
     // holds a live GM/SM pointer, from one that never touched a stream.
     const bool launched = state->active_execution != nullptr;
+    // An ownership fact, not a code: the launch transaction hands back an
+    // ActiveExecution only once the run reached the device, so its absence is
+    // this run having submitted nothing and therefore owning no device
+    // consumer of its workspace.
+    note_workspace_fact(
+        state, launched ? WorkspaceManager::RunFact::Launched : WorkspaceManager::RunFact::NoDeviceSubmission
+    );
     // Both drain_execution() and copy_back_run_outputs_impl() touch the device,
     // so the attach covers each of them. rtSetDevice is idempotent on an
     // already-attached thread.
@@ -1546,6 +1598,7 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     }
     if (phase == NativeRunPhase::Running && launched) {
         int drain_rc = attach_rc;
+        note_workspace_fact(state, WorkspaceManager::RunFact::DrainAttempted);
         if (attach_rc == 0) {
             drain_rc = PTO_RUNTIME_ERR_INTERNAL;
             try {
@@ -1555,6 +1608,7 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
             }
         }
         if (execution_rc == 0) execution_rc = drain_rc;
+        if (drain_rc == 0) note_workspace_fact(state, WorkspaceManager::RunFact::DrainProvedComplete);
         state->completion_rc = execution_rc;
         state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
     }
@@ -1600,7 +1654,13 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
                 );
                 // This run is the only user of its bindings, so they end here,
                 // after its outputs have come back through them.
+                // Returning at all is what ends the copy-back reader, whether
+                // it read this run's outputs or skipped them for a failed run;
+                // the bindings are only proven released when their own code is
+                // zero, because a failed release may leave a borrower behind.
+                note_workspace_fact(state, WorkspaceManager::RunFact::CopybackReturned);
                 const int release_rc = release_run_bindings_impl(&state->runtime, &state->host_api);
+                if (release_rc == 0) note_workspace_fact(state, WorkspaceManager::RunFact::BindingsReleased);
                 if (validation_rc == 0) validation_rc = release_rc;
             }
             if (launched && execution_rc == 0) {
@@ -1655,6 +1715,9 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         state->runner->release_native_run_reservation(state);
         state->runner_reserved = false;
     }
+    // Last: after this the run object is gone, so no further fact about it can
+    // arrive and whatever it still references becomes unprovable.
+    note_workspace_fact(state, WorkspaceManager::RunFact::ContextDestroyed);
     destroy_native_run_context(state);
     emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns, trace_attrs);
     if (export_clock_log && !export_host_clock_alignment_log(output_prefix, trace_inv, clock_log_offset)) {
@@ -1764,6 +1827,28 @@ size_t committed_device_memory_ctx(DeviceContextHandle ctx) {
         return static_cast<DeviceRunnerBase *>(ctx)->committed_device_memory();
     } catch (...) {
         return 0;
+    }
+}
+
+int simpler_set_workspace_budget_ctx(DeviceContextHandle ctx, uint64_t limit_bytes) {
+    if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->set_workspace_budget(limit_bytes);
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int simpler_get_workspace_report_ctx(DeviceContextHandle ctx, SimplerWorkspaceReport *out, size_t out_bytes) {
+    if (ctx == NULL || out == NULL) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    // The caller's own sizeof: a module built against a shorter record is
+    // refused rather than written past.
+    if (out_bytes < sizeof(SimplerWorkspaceReport)) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    try {
+        if (!static_cast<DeviceRunnerBase *>(ctx)->workspace_report(out)) return PTO_RUNTIME_ERR_UNSUPPORTED;
+        return 0;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 }
 

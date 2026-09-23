@@ -4929,6 +4929,25 @@ class _DeviceAllocations:
         return len(self._snapshots)
 
 
+# One arena base alignment (DeviceArena::kDefaultBaseAlign). A budget below
+# this could not serve a single region, so it is refused rather than latched.
+_WORKSPACE_MIN_BUDGET_BYTES = 1024
+
+
+def _config_with_valid_workspace_budget_shape(config: dict) -> dict:
+    """Return `config`, having rejected a workspace budget of the wrong shape.
+
+    Shape only: what values are allowed, and which routes may carry the key at
+    all, is decided where the route is known (``_validated_workspace_budget`` /
+    ``_init_hierarchical``) so the two cannot drift apart.
+    """
+    budget = config.get("workspace_budget_bytes")
+    # bool is an int subclass, and True would silently mean one byte.
+    if budget is not None and (isinstance(budget, bool) or not isinstance(budget, int)):
+        raise TypeError("workspace_budget_bytes must be an int")
+    return config
+
+
 class Worker:
     """Unified worker for all hierarchy levels.
 
@@ -4951,7 +4970,10 @@ class Worker:
         # Rebound from the level in `init()`; the default matches the C++ table's
         # so a span emitted before init names L3 rather than nothing.
         self._host_span_prefix = _span_prefix(WorkerLevel.node)
-        self._config = _adopt_canonical_collect_across_runs(config)
+        # Both checks run as the config is stored, so neither a key of the wrong
+        # type nor a stale alias can reach any later stage; the budget's value
+        # range and supported routes are checked where the route is known.
+        self._config = _config_with_valid_workspace_budget_shape(_adopt_canonical_collect_across_runs(config))
         self._callable_registry: dict[int, Any] = {}
         self._identity_registry: dict[bytes, _CallableIdentityState] = {}
         self._live_handles: dict[int, bytes] = {}
@@ -8184,6 +8206,66 @@ class Worker:
                     self._hierarchical_start_cv.notify_all()
             raise
 
+    def _validated_workspace_budget(self, platform: str) -> int:
+        """Resolve this Worker's workspace budget, or refuse the request.
+
+        Absent is the default and changes nothing. A present value is checked
+        here — where the platform and the route are both known — rather than at
+        construction, so an unsupported combination fails before the ChipWorker
+        and its device attach exist.
+        """
+        if "workspace_budget_bytes" not in self._config:
+            return 0
+        budget = int(self._config["workspace_budget_bytes"])
+        if budget <= 0:
+            raise ValueError(f"workspace_budget_bytes must be a positive byte count, got {budget}")
+        # Below one base alignment no region can be served, so the budget could
+        # only ever refuse every request.
+        if budget < _WORKSPACE_MIN_BUDGET_BYTES:
+            raise ValueError(
+                f"workspace_budget_bytes must be at least {_WORKSPACE_MIN_BUDGET_BYTES} bytes, got {budget}"
+            )
+        if str(platform).endswith("sim"):
+            raise ValueError(
+                f"workspace_budget_bytes is not supported on platform {platform!r}: "
+                "the simulation backend manages no device workspace"
+            )
+        return budget
+
+    def _check_workspace_live(self) -> None:
+        """Refuse a protected teardown while workspace still has a drainable consumer.
+
+        Driven on its own, before the pre-transport batch is registered, because
+        ``CleanupJournal.drive`` continues past a failing entry: an entry that
+        merely sorts first would not stop the owner Buffers from being released.
+
+        Three outcomes, and the two failures are not the same. ``disabled`` means
+        no budget was ever latched, which is the default and protects nothing.
+        ``unavailable`` means one *was* latched and its accounting could not be
+        read — treating that as ``disabled`` would release the Buffers a live
+        consumer may still be reading, so it refuses instead. A context that
+        never published a block has no ownership fact to protect and is exempt
+        on that fact alone.
+        """
+        cw = self._chip_worker
+        if cw is None:
+            return
+        status, report = cw._impl.workspace_report()
+        if status == "disabled":
+            return
+        if status == "unavailable":
+            raise RuntimeError(
+                "workspace: a budget is enabled but its accounting could not be read; "
+                "refusing to release owner Buffers while its consumers are unknown"
+            )
+        if not report["blocks_published"]:
+            return
+        if report["live_blocked"]:
+            raise RuntimeError(
+                f"workspace: {report['live_blocked']} run(s) still hold workspace and can still be "
+                "drained; finalize those runs and close again"
+            )
+
     def _init_level2(self) -> None:
         from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
@@ -8194,6 +8276,10 @@ class Worker:
         builder = RuntimeBuilder(platform)
         binaries = builder.get_binaries(runtime)
 
+        # This is the one route whose teardown can be fenced before the public
+        # Buffer release (see _check_workspace_live), so it is the one route the
+        # budget is supported on. Validated here, before the ChipWorker exists.
+        workspace_budget = self._validated_workspace_budget(platform)
         self._chip_worker = ChipWorker()
         # The prebuilt runtime-arena is prewarmed inside cw.init for the declared
         # config's ring sizing (built right after the device comes up), so the
@@ -8206,6 +8292,7 @@ class Worker:
             prewarm_config=self._prewarm_config,
             enable_sdma=bool(self._config.get("enable_sdma", False)),
             collect_across_runs=bool(self._config.get("collect_across_runs", False)),
+            workspace_budget_bytes=workspace_budget,
         )
 
         # Pre-warm any registered ChipCallable so the first run(handle, …)
@@ -8229,6 +8316,18 @@ class Worker:
         # partially-built subtree to roll back.
         if self._remote_worker_specs or self._mpi_l3_groups:
             self._remote_session_timeout_s()
+
+        # Rejected here for the same reason, and in the same window, as the
+        # timeout above: a chip child owns its own ChipWorker, and this process
+        # has no way to ask that child whether its workspace still has a
+        # drainable consumer before it broadcasts SHUTDOWN and reaps it. Without
+        # that question the budget's teardown protection does not exist on this
+        # route, so asking for it fails instead of running unprotected.
+        if "workspace_budget_bytes" in self._config:
+            raise ValueError(
+                "workspace_budget_bytes is only supported on a same-process level-2 Worker; "
+                "this Worker owns chip children, whose workspace cannot be checked before shutdown"
+            )
 
         # 1. Allocate sub-worker mailboxes (unified layout, MAILBOX_SIZE each).
         for i in range(n_sub):
@@ -12792,6 +12891,18 @@ class Worker:
                 fn()
             except BaseException as exc:  # noqa: BLE001
                 errors.append(exc)
+
+        # Driven alone, and checked here: the journal below attempts every
+        # entry even after one fails, so a workspace consumer that can still be
+        # drained has to stop this teardown before the owner Buffers in that
+        # batch are released. Both paths raise — a partially-built tree is
+        # exempt only on the fact that it never published a block, which
+        # _check_workspace_live reads for itself.
+        self._cleanup_journal.add_once("native", "workspace live-consumer gate", self._check_workspace_live)
+        gate_err = self._cleanup_journal.drive({("native", "workspace live-consumer gate")})
+        if gate_err is not None:
+            errors.append(gate_err)
+            raise gate_err
 
         # Register the whole pre-transport ownership set before driving it. The
         # journal attempts every independent action and removes only successful

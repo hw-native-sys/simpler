@@ -248,7 +248,7 @@ RunBoundaryMarks::DeviceEventOps make_acl_timing_event_ops() {
 
 DeviceRunnerBase::DeviceRunnerBase() {
     for (auto &bank : arena_banks_) {
-        bank = std::make_unique<ArenaBank>(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_);
+        bank = std::make_unique<ArenaBank>(&arena_alloc_trampoline, &arena_free_trampoline, this);
     }
     for (auto &fence : run_fences_) {
         fence = std::make_unique<RunCompletionFence>(make_acl_event_ops());
@@ -318,8 +318,109 @@ void *DeviceRunnerBase::acquire_child_memory_host_view(void *dev_ptr, std::size_
 
 void DeviceRunnerBase::release_child_memory_host_views() {
     for (void *alloc_base : child_memory_host_views_.take_all()) {
+        // A block whose last consumer could not be proven finished keeps its
+        // mapping: unregistering returns the host range that covers the whole
+        // allocation, and the bytes behind it may still be written. The record
+        // is dropped either way, so nothing reaches this allocation again.
+        if (workspace_.must_keep(alloc_base)) {
+            std::size_t mapped = workspace_.block_bytes(alloc_base);
+            workspace_.note_mapping_retained(alloc_base, mapped);
+            continue;
+        }
         unregister_device_memory_from_host(alloc_base);
     }
+}
+
+namespace {
+// The run identity this thread's workspace requests belong to. Thread-scoped so
+// a prepared successor built on another thread cannot be charged to this one.
+struct WorkspacePlanIdentity {
+    uint32_t slot{0};
+    std::uint64_t epoch{0};
+};
+thread_local WorkspacePlanIdentity g_workspace_plan;
+}  // namespace
+
+void DeviceRunnerBase::begin_workspace_plan(uint32_t pipeline_slot, std::uint64_t run_epoch) noexcept {
+    g_workspace_plan.slot = pipeline_slot;
+    g_workspace_plan.epoch = run_epoch;
+}
+
+void DeviceRunnerBase::end_workspace_plan() noexcept { g_workspace_plan = WorkspacePlanIdentity{}; }
+
+void *DeviceRunnerBase::acquire_arena_backing(std::size_t size) {
+    if (!workspace_.enabled()) return mem_alloc_.alloc(size);
+    return workspace_.acquire(
+        WorkspaceManager::Domain::ExecScratch, g_workspace_plan.slot, g_workspace_plan.epoch, size
+    );
+}
+
+void DeviceRunnerBase::release_arena_backing(void *p) {
+    // A managed block is owned by the ledger, not by the arena that was using
+    // it: the arena dropping its base is not permission to free, and the bytes
+    // stay charged until the last run referencing them retires. An unmanaged
+    // context frees exactly as it always did.
+    if (workspace_.owns(p)) return;
+    mem_alloc_.free(p);
+}
+
+int DeviceRunnerBase::set_workspace_budget(std::uint64_t limit_bytes) {
+    WorkspaceManager::Backend backend{};
+    backend.ctx = this;
+    backend.acquire = [](void *ctx, std::size_t bytes) -> void * {
+        // Both ownership records exist before the device call: the ledger
+        // reserved its node, and this reservation holds the allocator's lock
+        // and its tracking node until the commit that follows.
+        auto *self = static_cast<DeviceRunnerBase *>(ctx);
+        MemoryAllocator::Reservation res = self->mem_alloc_.begin_reservation();
+        return res.commit_alloc(bytes);
+    };
+    backend.release = [](void *ctx, void *base) -> int {
+        return static_cast<DeviceRunnerBase *>(ctx)->mem_alloc_.free(base);
+    };
+    if (!workspace_.configure(limit_bytes, backend)) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    return 0;
+}
+
+bool DeviceRunnerBase::workspace_report(SimplerWorkspaceReport *out) const { return workspace_.report(out); }
+
+int DeviceRunnerBase::acquire_retained_temp(
+    uint32_t pipeline_slot, std::size_t bytes, void **addr_out, std::size_t *size_out
+) {
+    if (addr_out == nullptr || size_out == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    if (pipeline_slot >= retained_temp_addrs_.size()) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    *addr_out = retained_temp_addrs_[pipeline_slot];
+    *size_out = retained_temp_sizes_[pipeline_slot];
+    if (bytes == 0 || bytes <= retained_temp_sizes_[pipeline_slot]) return 0;
+
+    if (!workspace_.enabled()) {
+        // Unmanaged: the sequence RetainedTempBump used to run itself — release
+        // the old block, take a bigger one, and stop naming the old one either
+        // way, so a later run cannot free it twice.
+        void *previous = retained_temp_addrs_[pipeline_slot];
+        if (previous != nullptr) mem_alloc_.free(previous);
+        void *grown = mem_alloc_.alloc(bytes);
+        set_retained_temp_buffer(pipeline_slot, grown, grown == nullptr ? 0 : bytes);
+        if (grown == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+        *addr_out = grown;
+        *size_out = bytes;
+        return 0;
+    }
+
+    // Managed: the previous generation keeps its address and its contents until
+    // its last consumer retires, so this request takes a block of its own
+    // inside the budget. A refusal leaves the slot naming the old block.
+    void *grown =
+        workspace_.acquire(WorkspaceManager::Domain::HostStaging, pipeline_slot, g_workspace_plan.epoch, bytes);
+    if (grown == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    void *previous = retained_temp_addrs_[pipeline_slot];
+    if (previous != nullptr && previous != grown) {
+        workspace_.release_ref(previous, pipeline_slot, g_workspace_plan.epoch);
+    }
+    set_retained_temp_buffer(pipeline_slot, grown, bytes);
+    *addr_out = grown;
+    *size_out = bytes;
+    return 0;
 }
 
 int DeviceRunnerBase::copy_to_device(void *dev_ptr, const void *host_ptr, std::size_t bytes) {
@@ -487,7 +588,11 @@ void DeviceRunnerBase::abandon_graph_definition_blocks() {
 void DeviceRunnerBase::clear_temporary_buffer() {
     for (size_t slot = 0; slot < retained_temp_addrs_.size(); ++slot) {
         if (retained_temp_addrs_[slot] == nullptr) continue;
-        mem_alloc_.free(retained_temp_addrs_[slot]);
+        // A managed block is released by the ledger that owns it, once no
+        // consumer references it; the slot only stops naming it here.
+        if (!workspace_.owns(retained_temp_addrs_[slot])) {
+            mem_alloc_.free(retained_temp_addrs_[slot]);
+        }
         retained_temp_addrs_[slot] = nullptr;
         retained_temp_sizes_[slot] = 0;
     }
@@ -2153,8 +2258,26 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
         // The mappings name the allocations mem_alloc_ is about to free, so
         // they cannot be released after it. A force reset already invalidated
         // both, and the unregister would be a further device call.
+        // Every block no consumer references goes back the ordinary way first,
+        // so the sweep below is left with what could not be proven unused.
+        capture(workspace_.release_unreferenced());
         release_child_memory_host_views();
-        capture(mem_alloc_.finalize());
+        // Terminal: the classifier keeps what cannot be proven unused, the
+        // recorder lands each outcome in storage that already exists, and the
+        // tracking map is cleared either way — so no second close and no
+        // destructor can reach an address this call has accounted for.
+        capture(mem_alloc_.finalize_except(
+            [](void *base, std::size_t /*bytes*/, void *ctx) {
+                return static_cast<WorkspaceManager *>(ctx)->must_keep(base) ? MemoryAllocator::SweepAction::KeepIt :
+                                                                               MemoryAllocator::SweepAction::FreeIt;
+            },
+            [](void *base, int rc, MemoryAllocator::SweepAction acted, void *ctx) {
+                static_cast<WorkspaceManager *>(ctx)->note_sweep_result(
+                    base, rc, acted == MemoryAllocator::SweepAction::KeepIt
+                );
+            },
+            &workspace_
+        ));
     }
 
     block_dim_ = 0;

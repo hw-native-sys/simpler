@@ -54,13 +54,15 @@ public:
     static size_t align_up(size_t v) { return (v + (kAlignment - 1)) & ~(kAlignment - 1); }
 
     /**
-     * Grow the retained slot to `required` bytes if it is too small (free old +
-     * malloc new + write back) and reset the slice cursor.
+     * Grow the retained slot to `required` bytes if it is too small and reset
+     * the slice cursor. The grow itself belongs to the platform, which decides
+     * whether the previous block may be released yet.
      *
      * @param required  packed size of this run's slices, each aligned up to
      *                  kAlignment by the caller
-     * @return false only if the (grow) device_malloc fails; a run needing 0
-     *         bytes leaves the slot untouched and succeeds
+     * @return false only if the grow failed, in which case the slot still names
+     *         the block it had; a run needing 0 bytes leaves the slot untouched
+     *         and succeeds
      */
     bool begin(const HostApi *api, size_t required) {
         offset_ = 0;
@@ -77,18 +79,12 @@ public:
             // bytes whatever address the backend returns.
             const size_t wanted = required + kAlignment - 1;
             if (wanted > size) {
-                if (raw != nullptr) {
-                    api->device_free(raw);
-                }
-                raw = api->device_malloc(wanted);
-                if (raw == nullptr) {
-                    // The old buffer is already released, so the slot must stop
-                    // naming it — a later run would otherwise free it twice.
-                    api->set_retained_temp_buffer(nullptr, 0);
+                // The platform owns the grow: whether the previous block may be
+                // released depends on facts only it tracks, and a refusal must
+                // leave the slot naming the block it already had.
+                if (api->acquire_retained_temp(wanted, &raw, &size) != 0) {
                     return false;
                 }
-                api->set_retained_temp_buffer(raw, wanted);
-                size = wanted;
             }
         }
         if (raw == nullptr) {

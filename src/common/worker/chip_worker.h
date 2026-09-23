@@ -91,7 +91,7 @@ public:
         const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
         const std::string &dispatcher_path, int device_id, const CallConfig *prewarm_config = nullptr,
         bool enable_sdma = false, const std::string &sim_context_path = "", const std::string &sdma_warmup_path = "",
-        bool collect_across_runs = false
+        bool collect_across_runs = false, uint64_t workspace_budget_bytes = 0
     );
 
     /**
@@ -195,6 +195,27 @@ public:
      * itself failed, and on every `finalize()` reached with no context.
      */
     bool teardown_report(SimplerTeardownReport *out) const;
+
+    /** Whether one workspace report could be produced, and why not. */
+    enum class WorkspaceReportStatus : uint32_t {
+        /** No budget was ever latched on this context: the default. */
+        Disabled = 0,
+        /** `out` carries this context's accounting. */
+        Available = 1,
+        /** A budget is latched but its accounting could not be read. */
+        Unavailable = 2,
+    };
+
+    /**
+     * Read this context's workspace accounting.
+     *
+     * Three answers rather than two, because "no budget" and "a budget whose
+     * accounting cannot be read" have opposite safety consequences: a caller
+     * that protects teardown on this must refuse on `Unavailable` and must not
+     * mistake it for `Disabled`. Whether a budget is latched is this object's
+     * own recorded fact, independent of any query succeeding.
+     */
+    WorkspaceReportStatus workspace_report(SimplerWorkspaceReport *out) const noexcept;
 
     ChipRun submit_chip_run(
         int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, const PipelineSlotLease &lease,
@@ -457,6 +478,14 @@ private:
     using SimplerSetRetainRunsFn = decltype(&simpler_set_retain_runs_ctx);
     using SimplerFlushDiagnosticsFn = decltype(&simpler_flush_diagnostics_ctx);
     SimplerSetRetainRunsFn set_retain_runs_fn_ = nullptr;
+    using SimplerSetWorkspaceBudgetFn = decltype(&simpler_set_workspace_budget_ctx);
+    using SimplerGetWorkspaceReportFn = decltype(&simpler_get_workspace_report_ctx);
+    SimplerSetWorkspaceBudgetFn set_workspace_budget_fn_ = nullptr;
+    SimplerGetWorkspaceReportFn get_workspace_report_fn_ = nullptr;
+    // Latched when init accepted a budget. A caller protecting teardown reads
+    // this, never "the last query worked", so a failed query cannot pass for a
+    // context that never had a budget.
+    bool workspace_budget_latched_ = false;
     SimplerFlushDiagnosticsFn flush_diagnostics_fn_ = nullptr;
     SupportsConcurrentNativePrepareFn supports_concurrent_native_prepare_fn_ = nullptr;
     SupportsConcurrentNativePrepareFn supports_joined_native_launch_fn_ = nullptr;

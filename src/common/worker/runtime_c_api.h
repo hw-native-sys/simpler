@@ -383,6 +383,59 @@ enum {
  * field first and releases `schema` last, so a reader that sees
  * TEARDOWN_REPORT_SCHEMA has the whole record.
  */
+enum {
+    /* Bumped when a field changes meaning; a reader that does not recognise
+       the value treats the whole record as absent. */
+    WORKSPACE_REPORT_SCHEMA = 1,
+};
+
+/**
+ * What the workspace manager of one device context currently accounts for.
+ *
+ * Observation plus one safety input. `live_blocked` is the only field a caller
+ * acts on: it counts runs that still reference workspace and whose completion
+ * a caller can still prove by finalizing them, which is what makes refusing a
+ * teardown on it a refusal the caller can resolve.
+ *
+ * `budget_enforced` is 0 for every context that never latched a budget, which
+ * is the default. `coverage_is_partial` is always 1: external tensors,
+ * run-result and diagnostics regions, registered code, device ELF, RTS
+ * argument blocks and provider memory are outside this budget, so
+ * `limit_bytes` is not a Worker-wide or device-wide memory ceiling.
+ *
+ * `blocks_published` never wraps: it saturates, because a caller uses "this
+ * context never published a block" as the one fact that exempts it from the
+ * teardown check, and a wrapped counter would fake that exemption.
+ *
+ * `schema` is the commit marker on the wire: the producer fills every other
+ * field first and releases `schema` last, so a reader that sees
+ * WORKSPACE_REPORT_SCHEMA has the whole record.
+ */
+typedef struct SimplerWorkspaceReport {
+    uint32_t schema;
+    uint32_t budget_enforced;
+    uint32_t coverage_is_partial;
+    /* Runs still holding workspace whose proof can still arrive. */
+    uint32_t live_blocked;
+    uint64_t limit_bytes;
+    /* Backing bytes charged against the budget, retained generations included. */
+    uint64_t reserved_bytes;
+    /* Bytes forgotten without being freed, because their last consumer could
+       not be proven finished. Device reclamation of these is unknown. */
+    uint64_t relinquished_bytes;
+    /* Host mappings deliberately left registered for the same reason. */
+    uint64_t quarantined_mapped_bytes;
+    uint32_t release_unconfirmed_blocks;
+    uint32_t quarantined_blocks;
+    /* 1 when any block's release or retirement could not be proven. */
+    uint32_t proof_unavailable;
+    /* Saturating count of blocks this context ever published. */
+    uint32_t blocks_published;
+    /* Terminal-sweep release failures for allocations outside this budget. */
+    uint32_t foreign_release_failures;
+    int32_t last_foreign_release_rc;
+} SimplerWorkspaceReport;
+
 typedef struct SimplerTeardownReport {
     uint32_t schema;
     int32_t child_pid;
@@ -485,6 +538,41 @@ int simpler_set_retain_runs_ctx(DeviceContextHandle ctx, int32_t enabled);
  * different builds still find one name in common.
  */
 int simpler_set_dfx_session_ctx(DeviceContextHandle ctx, int32_t enabled);
+
+/**
+ * Latch a finite workspace budget on this context, once, at init.
+ *
+ * Optional capability: a module that does not export this symbol cannot manage
+ * workspace, and a caller that asked for a budget must fail rather than run
+ * unmanaged. Off by default — a context that never calls this keeps every
+ * allocation path it had.
+ *
+ * Separate from `simpler_init` for the same reason the diagnostics session gate
+ * is: the init signature is resolved by name across the runtime .so boundary,
+ * so extending it would break every module that does not ship in lockstep.
+ *
+ * The budget covers the per-slot retained temporary buffer and the three pooled
+ * arena regions. It is not a device-wide ceiling; see SimplerWorkspaceReport.
+ *
+ * @return 0 on success, PTO_RUNTIME_ERR_INVALID_ARGUMENT for a zero budget or a
+ *         second call, PTO_RUNTIME_ERR_UNSUPPORTED on a backend that manages no
+ *         workspace.
+ */
+int simpler_set_workspace_budget_ctx(DeviceContextHandle ctx, uint64_t limit_bytes);
+
+/**
+ * Read this context's workspace accounting into a caller-owned record.
+ *
+ * `out_bytes` is the caller's `sizeof`, so a module built against a shorter
+ * record is refused rather than written past. Valid output is published only
+ * when the call returns 0 and `schema` is recognised; a caller that has a
+ * latched budget must treat any other outcome as "unknown", never as "no
+ * budget" — the two have opposite safety consequences.
+ *
+ * @return 0 on success, PTO_RUNTIME_ERR_INVALID_ARGUMENT for a null or short
+ *         record, PTO_RUNTIME_ERR_UNSUPPORTED when no budget is latched.
+ */
+int simpler_get_workspace_report_ctx(DeviceContextHandle ctx, SimplerWorkspaceReport *out, size_t out_bytes);
 
 /**
  * Publish every diagnostic run this context has closed, then report.

@@ -60,3 +60,38 @@ int MemoryAllocator::finalize() {
     committed_bytes_ = 0;
     return 0;
 }
+
+void *MemoryAllocator::Reservation::commit_alloc(size_t size) {
+    if (!valid()) {
+        LOG_ERROR("commit_alloc without a valid reservation (size=%zu)", size);
+        return nullptr;
+    }
+    void *ptr = std::malloc(size);
+    if (ptr == nullptr) {
+        LOG_ERROR("malloc failed (size=%zu)", size);
+        return nullptr;
+    }
+    // Under the lock this reservation has held since it was taken, into the
+    // node it created then: no allocation, no rehash, nothing left to fail.
+    node_.key() = ptr;
+    node_.mapped() = size;
+    owner_->ptr_size_map_.insert(std::move(node_));
+    owner_->committed_bytes_ += size;
+    return ptr;
+}
+
+int MemoryAllocator::finalize_except(SweepClassifyFn classify, SweepRecordFn record, void *ctx) {
+    std::scoped_lock<std::mutex> lk(mu_);
+    for (const auto &kv : ptr_size_map_) {
+        const SweepAction acted = classify == nullptr ? SweepAction::FreeIt : classify(kv.first, kv.second, ctx);
+        if (acted == SweepAction::KeepIt) {
+            relinquished_bytes_ += kv.second;
+        } else {
+            std::free(kv.first);
+        }
+        if (record != nullptr) record(kv.first, 0, acted, ctx);
+    }
+    ptr_size_map_.clear();
+    committed_bytes_ = 0;
+    return 0;
+}

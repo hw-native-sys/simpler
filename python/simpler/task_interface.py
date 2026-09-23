@@ -1469,6 +1469,7 @@ class ChipWorker:
         enable_sdma: bool = False,
         collect_across_runs: bool | None = None,
         dfx_session: bool | None = None,
+        workspace_budget_bytes: int = 0,
     ):
         """Attach the calling thread to ``device_id``, load the host runtime
         library, and cache platform binaries.
@@ -1494,6 +1495,14 @@ class ChipWorker:
             log_level: Threshold (10=DEBUG, 20=INFO, 25=TIMING, 30=WARN,
                 40=ERROR, 60=NUL). Defaults to a snapshot of the simpler
                 logger via `_log.get_current_config()`.
+            workspace_budget_bytes: Finite budget for this context's workspace
+                regions — the per-slot retained temporary buffer and the three
+                pooled arena regions. 0 (the default) manages none of them and
+                leaves every allocation path unchanged. A non-zero value on a
+                module without workspace support raises rather than running
+                unmanaged. Partial accounting: external tensors, run-result and
+                diagnostics regions, code and device ELF, RTS and provider
+                memory are outside it, so it is not a device-wide ceiling.
             collect_across_runs: Let a run's records outlive its own boundary,
                 so the sealing and the file write happen while the next run
                 executes instead of at the boundary. Off when neither this nor
@@ -1536,6 +1545,7 @@ class ChipWorker:
                 "" if sim_context_path is None else str(sim_context_path),
                 "" if sdma_warmup_path is None else str(sdma_warmup_path),
                 bool(_resolve_collect_across_runs(collect_across_runs, dfx_session)),
+                int(workspace_budget_bytes),
             )
             for slot_id, callable_obj in list(self._callable_registry.items()):
                 self._impl.register_callable(int(slot_id), callable_obj)

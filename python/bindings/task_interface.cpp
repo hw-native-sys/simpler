@@ -3372,16 +3372,18 @@ NB_MODULE(_task_interface, m) {
             [](ChipWorker &self, const std::string &host_lib_path, const std::string &aicpu_path,
                const std::string &aicore_path, const std::string &dispatcher_path, int device_id,
                std::optional<CallConfig> prewarm_config, bool enable_sdma, const std::string &sim_context_path,
-               const std::string &sdma_warmup_path, bool collect_across_runs) {
+               const std::string &sdma_warmup_path, bool collect_across_runs,
+               uint64_t workspace_budget_bytes) {
                 self.init(
                     host_lib_path, aicpu_path, aicore_path, dispatcher_path, device_id,
                     prewarm_config.has_value() ? &(*prewarm_config) : nullptr, enable_sdma, sim_context_path,
-                    sdma_warmup_path, collect_across_runs
+                    sdma_warmup_path, collect_across_runs, workspace_budget_bytes
                 );
             },
             nb::arg("host_lib_path"), nb::arg("aicpu_path"), nb::arg("aicore_path"), nb::arg("dispatcher_path"),
             nb::arg("device_id"), nb::arg("prewarm_config") = nb::none(), nb::arg("enable_sdma") = false,
             nb::arg("sim_context_path") = "", nb::arg("sdma_warmup_path") = "", nb::arg("collect_across_runs") = false,
+            nb::arg("workspace_budget_bytes") = 0,
             // Release the GIL for the (potentially long) native device attach so
             // another Python thread can run during it — e.g. a concurrent close()
             // observing INITIALIZING and failing fast (a GIL held for the whole
@@ -3613,6 +3615,40 @@ NB_MODULE(_task_interface, m) {
             "The first captured finalize()'s teardown observation as its exact wire bytes, or "
             "None when this worker captured none. Observation only: no field asserts that device "
             "work has stopped or that an old device pointer may be reused."
+        )
+        .def(
+            "workspace_report",
+            [](const ChipWorker &self) -> nb::object {
+                SimplerWorkspaceReport report{};
+                const ChipWorker::WorkspaceReportStatus status = self.workspace_report(&report);
+                if (status == ChipWorker::WorkspaceReportStatus::Disabled) {
+                    return nb::make_tuple(nb::str("disabled"), nb::none());
+                }
+                if (status == ChipWorker::WorkspaceReportStatus::Unavailable) {
+                    return nb::make_tuple(nb::str("unavailable"), nb::none());
+                }
+                nb::dict d;
+                d["budget_enforced"] = report.budget_enforced;
+                d["coverage_is_partial"] = report.coverage_is_partial;
+                d["live_blocked"] = report.live_blocked;
+                d["limit_bytes"] = report.limit_bytes;
+                d["reserved_bytes"] = report.reserved_bytes;
+                d["relinquished_bytes"] = report.relinquished_bytes;
+                d["quarantined_mapped_bytes"] = report.quarantined_mapped_bytes;
+                d["release_unconfirmed_blocks"] = report.release_unconfirmed_blocks;
+                d["quarantined_blocks"] = report.quarantined_blocks;
+                d["proof_unavailable"] = report.proof_unavailable;
+                d["blocks_published"] = report.blocks_published;
+                d["foreign_release_failures"] = report.foreign_release_failures;
+                d["last_foreign_release_rc"] = report.last_foreign_release_rc;
+                return nb::make_tuple(nb::str("available"), d);
+            },
+            "This context's workspace accounting as (status, fields). status is \"disabled\" when no "
+            "budget was latched, \"unavailable\" when one was but its accounting could not be read, and "
+            "\"available\" otherwise. The two failure statuses are distinct on purpose: a caller "
+            "protecting teardown must refuse on \"unavailable\" rather than treat it as no budget. "
+            "limit_bytes covers the retained temporary buffer and the three pooled arena regions only "
+            "(coverage_is_partial is always 1), so it is not a device-wide ceiling."
         )
         .def_prop_ro("pipeline_depth", &ChipWorker::pipeline_depth)
         .def_prop_ro("runtime_slot_count", &ChipWorker::runtime_slot_count)

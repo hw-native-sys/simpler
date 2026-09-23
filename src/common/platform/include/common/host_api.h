@@ -64,6 +64,17 @@ struct HostApiOps {
     // retained yet.
     void (*get_retained_temp_buffer)(void *runner_ctx, uint32_t pipeline_slot, void **addr, size_t *size);
     void (*set_retained_temp_buffer)(void *runner_ctx, uint32_t pipeline_slot, void *addr, size_t size);
+    // Grow that slot to at least `bytes` and report the block naming it. The
+    // platform owns the sequence because a managed context must not release the
+    // previous block while a consumer may still read it: there the request takes
+    // a block of its own inside the workspace budget and the previous one stays
+    // where it is until its last consumer retires. A failure leaves the slot
+    // naming whatever it named before, so the caller's old capacity survives.
+    // `bytes` at or below the retained size is answered from the slot with no
+    // allocation. Returns 0 on success.
+    int (*acquire_retained_temp)(
+        void *runner_ctx, uint32_t pipeline_slot, size_t bytes, void **addr_out, size_t *size_out
+    );
     // Runner-owned Graph Definition storage: one device block per pipeline slot
     // holding every Definition object of a run end to end, plus the host block
     // the caller assembles them in before the single H2D that ships them.
@@ -231,6 +242,9 @@ public:
     }
     void set_retained_temp_buffer(void *addr, size_t size) const {
         ops_->set_retained_temp_buffer(runner_ctx_, pipeline_slot_, addr, size);
+    }
+    int acquire_retained_temp(size_t bytes, void **addr_out, size_t *size_out) const {
+        return ops_->acquire_retained_temp(runner_ctx_, pipeline_slot_, bytes, addr_out, size_out);
     }
     int acquire_graph_definition_block(size_t bytes, size_t alignment, void **device_out, void **staging_out) const {
         if (ops_->acquire_graph_definition_block == nullptr) return -1;

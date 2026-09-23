@@ -213,6 +213,25 @@ void fake_mark_prebuilt_runtime_arena_cached(
 ) {}
 uint64_t fake_upload_chip_callable_buffer(void * /*runner_ctx*/, const void * /* callable */) { return 0; }
 
+// The grow the platform now owns, as the sequence the bump used to run itself.
+int fake_acquire_retained_temp(
+    void *runner_ctx, uint32_t pipeline_slot, size_t bytes, void **addr_out, size_t *size_out
+) {
+    fake_get_retained_temp_buffer(runner_ctx, pipeline_slot, addr_out, size_out);
+    if (bytes == 0 || bytes <= *size_out) return 0;
+    if (*addr_out != nullptr) fake_device_free(runner_ctx, *addr_out);
+    void *grown = fake_device_malloc(runner_ctx, bytes);
+    fake_set_retained_temp_buffer(runner_ctx, pipeline_slot, grown, grown == nullptr ? 0 : bytes);
+    if (grown == nullptr) {
+        *addr_out = nullptr;
+        *size_out = 0;
+        return -1;
+    }
+    *addr_out = grown;
+    *size_out = bytes;
+    return 0;
+}
+
 HostApi make_host_api() {
     static const HostApiOps ops = {
         .device_malloc = fake_device_malloc,
@@ -224,6 +243,7 @@ HostApi make_host_api() {
         .device_memset = fake_device_memset,
         .get_retained_temp_buffer = fake_get_retained_temp_buffer,
         .set_retained_temp_buffer = fake_set_retained_temp_buffer,
+        .acquire_retained_temp = fake_acquire_retained_temp,
         .setup_static_arena = fake_setup_static_arena,
         .acquire_pooled_gm_heap = fake_acquire_pooled_gm_heap,
         .acquire_pooled_gm_sm = fake_acquire_pooled_gm_sm,

@@ -30,8 +30,10 @@
 #define SRC_COMMON_PLATFORM_INCLUDE_HOST_MEMORY_ALLOCATOR_H_
 
 #include <cstddef>
+#include <cstdint>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 
 /**
  * MemoryAllocator class for managing memory allocations
@@ -79,6 +81,110 @@ public:
      * @return 0 on success, error code on failure, 0 if ptr not tracked
      */
     int free(void *ptr);
+
+    /** Which action a sweep took on one tracked allocation. */
+    enum class SweepAction : uint32_t { FreeIt = 0, KeepIt = 1 };
+
+    /**
+     * Whether the sweep may release this allocation. Called under the
+     * allocator's lock, once per tracked allocation, before anything is freed.
+     * An allocation the callback does not recognise is freed, which is what
+     * every allocation outside the workspace ledger needs.
+     */
+    using SweepClassifyFn = SweepAction (*)(void *base, size_t bytes, void *ctx);
+
+    /**
+     * Where one allocation's sweep outcome is recorded. Called under the same
+     * lock, immediately after the action and therefore before the tracking map
+     * is cleared: the map carries no result field, so a caller that needs the
+     * outcome has to receive it here, into storage it already owns.
+     */
+    using SweepRecordFn = void (*)(void *base, int rc, SweepAction acted, void *ctx);
+
+    /**
+     * A tracking slot taken before the platform allocation it will describe.
+     *
+     * Holds the allocator's lock and a pre-created map node for its whole
+     * lifetime, so the capacity it reserved cannot be consumed by another
+     * writer between the reservation and the insertion, and the bookkeeping
+     * commit that follows a successful platform allocation needs no further
+     * host allocation. Destroying it without committing cancels: the node is
+     * returned and nothing was changed.
+     *
+     * Move-only, and the platform allocation happens inside the held lock —
+     * which serializes this allocator's own bookkeeping, and is why the caller
+     * must not hold a reservation across unrelated work.
+     */
+    class Reservation {
+    public:
+        Reservation() = default;
+        Reservation(const Reservation &) = delete;
+        Reservation &operator=(const Reservation &) = delete;
+        Reservation(Reservation &&) noexcept = default;
+        Reservation &operator=(Reservation &&) noexcept = default;
+
+        bool valid() const noexcept { return owner_ != nullptr && !node_.empty(); }
+
+        /**
+         * Allocate `size` bytes and commit this slot's bookkeeping.
+         *
+         * @return the allocation, or nullptr when the platform call failed or
+         *         this reservation is not valid. Nothing is changed on failure.
+         */
+        void *commit_alloc(size_t size);
+
+    private:
+        friend class MemoryAllocator;
+        MemoryAllocator *owner_{nullptr};
+        std::unique_lock<std::mutex> lock_;
+        std::unordered_map<void *, size_t>::node_type node_;
+    };
+
+    /**
+     * Take a tracking slot for one upcoming allocation.
+     *
+     * May throw (it reserves bucket capacity and creates a map node); performs
+     * no platform allocation, so a throw here leaves no allocation behind.
+     */
+    Reservation begin_reservation() {
+        Reservation res;
+        res.lock_ = std::unique_lock<std::mutex>(mu_);
+        ptr_size_map_.reserve(ptr_size_map_.size() + 1);
+        // The sentinel is created and extracted under the lock this reservation
+        // keeps, so it is never observable in the map. Its value is not a
+        // possible allocation: no platform allocator returns address 1.
+        void *sentinel = reinterpret_cast<void *>(static_cast<uintptr_t>(1));
+        auto [it, inserted] = ptr_size_map_.try_emplace(sentinel, 0);
+        if (!inserted) return res;  // invalid: commit_alloc refuses rather than allocating
+        res.node_ = ptr_size_map_.extract(it);
+        res.owner_ = this;
+        return res;
+    }
+
+    /**
+     * Free every tracked allocation the classifier does not keep, then clear
+     * the tracking map unconditionally.
+     *
+     * Terminal by construction: the map is empty when this returns whether or
+     * not a platform free failed, so no later free path — a second close, the
+     * destructor — can reach an address this call has already accounted for.
+     * A kept allocation is not freed and its bytes move to the relinquished
+     * total, which is what keeps a caller that could not prove its last
+     * consumer finished from handing those bytes back to the platform.
+     *
+     * Records reach the caller through `record` before the clear. Diagnostics
+     * are emitted after it, so a logging failure cannot leave the map holding
+     * addresses this call has already decided about.
+     *
+     * @return the last platform free error, or 0
+     */
+    int finalize_except(SweepClassifyFn classify, SweepRecordFn record, void *ctx);
+
+    /** Bytes forgotten without being freed by `finalize_except`. */
+    uint64_t relinquished_bytes() const {
+        std::scoped_lock lk(mu_);
+        return relinquished_bytes_;
+    }
 
     /**
      * Free all remaining tracked allocations
@@ -160,6 +266,7 @@ private:
     mutable std::mutex mu_;
     std::unordered_map<void *, size_t> ptr_size_map_;
     size_t committed_bytes_ = 0;
+    uint64_t relinquished_bytes_ = 0;
 };
 
 #endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_MEMORY_ALLOCATOR_H_
