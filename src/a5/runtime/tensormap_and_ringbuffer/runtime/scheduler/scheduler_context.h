@@ -49,6 +49,8 @@ struct RuntimeContext;
  *   - scheduler_dispatch.cpp    (task dispatch loop and helpers)
  */
 class SchedulerContext {
+    friend class SchedulerRetirementTestPeer;
+
 public:
     // =========================================================================
     // Lifecycle
@@ -107,16 +109,14 @@ public:
     // Orchestrator threads (core_trackers_[thread_idx].core_num() == 0) are a no-op.
     int32_t shutdown(int32_t thread_idx);
 
-    // Hand a set of cores to the platform as one retirement group. The caller
-    // owns them: every path in here either holds the owning thread's claim or is
-    // the only path that can reach the core at all.
+    // Hand an exclusively claimed, fully initialized set to the platform.
     int32_t retire_cores(const int32_t *core_ids, int32_t core_num);
 
     // Retire the cores one scheduler thread owns, behind that thread's claim.
     int32_t retire_thread_cores(int32_t owner_thread);
 
-    // Retire every handshake'd core. Claims per owning thread, so it composes
-    // with the per-thread shutdown() already running.
+    // Request retirement for every owner. Initializers service pending requests
+    // when they publish their complete group; ready groups retire here.
     int32_t retire_all_cores();
 
     // Run all post-orchestration scheduler bookkeeping:
@@ -194,13 +194,14 @@ private:
     // Published before completed_, so a thread that observes completion also
     // observes this and cannot enter the healthy shutdown path for a fatal run.
     std::atomic<bool> fatal_shutdown_started_{false};
-    // Retirement claim, one per scheduler thread rather than one per core. Core
-    // ownership is a partition -- assign_cores_to_threads hands every cluster to
-    // exactly one scheduler thread -- so a thread's set is the smallest unit the
-    // normal and the emergency path can contend for, and claiming at that unit
-    // is one atomic per thread instead of one per core for the same
-    // exactly-once guarantee. Reset in pre_handshake_init.
-    uint8_t thread_retired_[MAX_AICPU_THREADS];
+    // Both participants modify the same atomic byte: the operation that sees
+    // the other bit alone owns retirement. READY publishes all group writes;
+    // REQUESTED can arrive before initialization without consuming an empty set.
+    static constexpr uint8_t RETIREMENT_READY = 1;
+    static constexpr uint8_t RETIREMENT_REQUESTED = 2;
+    uint8_t retirement_state_[MAX_AICPU_THREADS]{};
+    bool retirement_blocked_layout_{false};
+    bool retirement_unassigned_{false};
     // The active callable's registration-owned object-address table and the
     // number of entries it holds, both bound from the descriptor in the cold
     // path. The table is in the callable's registration block, not in the
@@ -259,6 +260,9 @@ private:
     // completion latch.
     bool begin_emergency_shutdown();
     void signal_emergency_shutdown(Runtime *runtime);
+    bool claim_retirement(int32_t owner_thread);
+    void publish_retirement_group(int32_t owner_thread);
+    int32_t retire_owned_cores(int32_t owner_thread);
 
     // =========================================================================
     // Dispatch (scheduler_dispatch.cpp)

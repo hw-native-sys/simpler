@@ -31,6 +31,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <thread>
 
 #include "aicpu/device_time.h"
@@ -115,9 +116,15 @@ TEST(AicoreRetirement, ClosesNoWindowUntilTheGroupHasAcknowledged) {
 
     std::atomic<int32_t> result{1};
     std::thread caller([&] {
-        result.store(platform_retire_aicore_group(addrs, 2, short_deadline()), std::memory_order_release);
+        // This case tests ACK ordering, not timeout. The observation thread can
+        // be descheduled arbitrarily without consuming the retirement budget.
+        // CTest bounds a broken implementation that never returns.
+        result.store(
+            platform_retire_aicore_group(addrs, 2, std::numeric_limits<uint64_t>::max()), std::memory_order_release
+        );
     });
-    ASSERT_TRUE(wait_until(
+    // Nonfatal: both ACKs and join must run even when signal observation fails.
+    EXPECT_TRUE(wait_until(
         [&] {
             return cores[0].signalled() && cores[1].signalled();
         },

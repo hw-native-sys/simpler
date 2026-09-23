@@ -128,7 +128,8 @@ passes vacuously when no lines arrive at all. All three were withdrawn.
 
 What replaced them is a device-side unit suite driving
 `platform_retire_aicore_group` against simulated register blocks, in the style
-the a2a3 suite already uses (`tests/ut/cpp/a5/test_aicore_retirement.cpp`).
+the a2a3 suite already uses
+(`tests/ut/cpp/a5/platform/test_aicore_retirement.cpp`).
 Seven cases cover: the broadcast completing before any core is waited on; no
 window closing until the group has acknowledged; a silent core left unclosed
 while its answering peers are released; the `released[]` contract; one shared
@@ -144,13 +145,35 @@ of the seven were rewritten after the first mutation round showed they passed
 against a serialized retirement and against a single-core entry that closed on
 the signal alone.
 
+## Initialization and retirement ownership
+
+An emergency can precede a peer's barrier-free assignment. Reading that
+peer's tracker as a stable partition can retire an incomplete set, consume
+its claim before its cores initialize, or retire the same cores again as
+orphans. Clearing trackers between runs does not synchronize this run's
+initialization.
+
+Each owner's atomic retirement state has READY and REQUESTED bits. Publishing
+READY releases the group's initialization; requesting retirement acquires it.
+The operation that observes only the other bit owns retirement. A request
+before READY is serviced by the initializer, without requiring it to reach
+the dispatch loop or normal shutdown. Barrier-free groups use the handshake's
+fixed blocked partition even when tracker assignment fails. Serial startup
+publishes assigned groups after its handshake barrier, or gives all cores to
+one fallback owner if assignment cannot complete. There is no orphan rescan.
+
+`test_scheduler_retirement.cpp` in the A5 TMR unit directory drives the
+production scheduler cold path with an observable retirement sink. It covers
+late and partial initialization, concurrent publication and retirement,
+normal/emergency exactly-once ownership, serial failure and success, reset
+between generations, and fatal publication observed through completion.
+The late and partial initialization cases fail against the original claim.
+The historical costs above predate this initialization handoff; they do not
+measure its additional publication operation or group construction.
+
 ## Still open
 
-Three parts of the fault path remain uncovered. The read-back inside the
-window close has no observable effect on a simulated register block, so
-nothing at this level can distinguish it from its absence; it rests on the
-memory-attribute argument in `docs/hardware/mmio-performance.md`. The
-exactly-once property of the per-thread claim lives in `SchedulerContext`
-rather than in the platform layer and needs more scaffolding to reach.
-Concurrent normal and emergency retirement, and the fatal-before-completion
-ordering, are likewise above this layer. Tracked on #2388.
+The read-back inside the window close has no observable effect on a simulated
+register block; its justification remains the memory-attribute argument in
+`docs/hardware/mmio-performance.md`. The scheduler tests use DFX disabled and
+do not validate PMU finalization or device MMIO behavior on silicon.

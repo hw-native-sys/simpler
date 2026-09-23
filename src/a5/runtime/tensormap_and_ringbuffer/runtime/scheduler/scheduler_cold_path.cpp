@@ -649,45 +649,64 @@ void SchedulerContext::log_chip_swimlane_summary(int32_t thread_idx, [[maybe_unu
 
 // =============================================================================
 // Shutdown: each thread retires the cores it owns, on its own way out.
-// Core ownership is a partition — assign_cores_to_threads hands every cluster to
-// exactly one scheduler thread — so concurrent retirements never name the same
-// core. Emergency shutdown sweeps the whole table and claims per core, so a core
-// is retired exactly once no matter which path reaches it first.
-// Orchestrator threads have core_trackers_[thread_idx].core_num() == 0 -> no-op.
+// Normal shutdown and emergency requests share the initialization/retirement
+// handoff. Only its winner can read the published group or finalize its PMU.
 // =============================================================================
 int32_t SchedulerContext::shutdown(int32_t thread_idx) {
-    const int32_t *cores = core_trackers_[thread_idx].core_ids();
-    int32_t core_num = core_trackers_[thread_idx].core_num();
-    if (core_num == 0) return 0;
-    // The claim gates everything this thread does to its cores, not just the
-    // register retirement: PMU finalization below reads and writes per-core
-    // state, and the emergency sweep must not be doing the same to those cores
-    // at the same time. Whichever path takes the claim owns the rest.
-    if (__atomic_exchange_n(&thread_retired_[thread_idx], 1, __ATOMIC_ACQ_REL)) return 0;
+    if (!claim_retirement(thread_idx)) return 0;
 
 #if SIMPLER_DFX
     // Restore PMU CTRL registers for this thread's cores before AICore
     // shutdown. A fatal run ends in a host-side device reset, so counters read
     // here would not survive into the next generation.
     if (is_pmu_enabled() && !fatal_shutdown_started_.load(std::memory_order_acquire)) {
-        pmu_aicpu_finalize(cores, core_num);
+        pmu_aicpu_finalize(core_trackers_[thread_idx].core_ids(), core_trackers_[thread_idx].core_num());
     }
 #endif
 
-    LOG_INFO("Thread %d: retiring %d cores", thread_idx, core_num);
-    return retire_cores(cores, core_num);
+    return retire_owned_cores(thread_idx);
 }
 
-// Claim the owning thread's whole set rather than each core in it: that set is
-// the unit two paths can contend for, so one atomic per thread carries the same
-// exactly-once guarantee as one per core. On this chip the per-core form is not
-// free -- it measures 8.24 us per shutdown against an otherwise identical build,
-// and the cost is thread scatter rather than work, so it does not shrink by
-// spreading the flags apart or relaxing their ordering.
+bool SchedulerContext::claim_retirement(int32_t owner_thread) {
+    if (owner_thread < 0 || owner_thread >= aicpu_thread_num_) return false;
+    return __atomic_fetch_or(&retirement_state_[owner_thread], RETIREMENT_REQUESTED, __ATOMIC_ACQ_REL) ==
+           RETIREMENT_READY;
+}
+
+void SchedulerContext::publish_retirement_group(int32_t owner_thread) {
+    if (__atomic_fetch_or(&retirement_state_[owner_thread], RETIREMENT_READY, __ATOMIC_ACQ_REL) ==
+        RETIREMENT_REQUESTED) {
+        (void)retire_owned_cores(owner_thread);
+    }
+}
+
 int32_t SchedulerContext::retire_thread_cores(int32_t owner_thread) {
-    if (owner_thread < 0 || owner_thread >= aicpu_thread_num_) return 0;
-    if (__atomic_exchange_n(&thread_retired_[owner_thread], 1, __ATOMIC_ACQ_REL)) return 0;
-    return retire_cores(core_trackers_[owner_thread].core_ids(), core_trackers_[owner_thread].core_num());
+    return claim_retirement(owner_thread) ? retire_owned_cores(owner_thread) : 0;
+}
+
+int32_t SchedulerContext::retire_owned_cores(int32_t owner_thread) {
+    // A failed assignment can leave the tracker empty or incomplete. The
+    // barrier-free handshake has a fixed blocked partition independent of it.
+    int32_t ids[PLATFORM_MAX_CORES];
+    int32_t count = 0;
+    if (retirement_blocked_layout_) {
+        if (owner_thread >= active_sched_threads_) return 0;
+        const int32_t aic_n = cores_total_num_ / PLATFORM_CORES_PER_BLOCKDIM;
+        for (int32_t ci = owner_thread; ci < aic_n; ci += active_sched_threads_) {
+            ids[count++] = ci;
+            ids[count++] = aic_n + 2 * ci;
+            ids[count++] = aic_n + 2 * ci + 1;
+        }
+    } else if (retirement_unassigned_) {
+        // The serial initializer has joined every handshake before publishing
+        // this fallback. One owner covers every initialized core on failure.
+        if (owner_thread != 0) return 0;
+        for (int32_t i = 0; i < cores_total_num_; ++i)
+            ids[count++] = i;
+    } else {
+        return retire_cores(core_trackers_[owner_thread].core_ids(), core_trackers_[owner_thread].core_num());
+    }
+    return retire_cores(ids, count);
 }
 
 int32_t SchedulerContext::retire_cores(const int32_t *core_ids, int32_t core_num) {
@@ -725,24 +744,9 @@ int32_t SchedulerContext::retire_cores(const int32_t *core_ids, int32_t core_num
 
 int32_t SchedulerContext::retire_all_cores() {
     int32_t rc = 0;
-    bool owned[PLATFORM_MAX_CORES] = {};
     for (int32_t t = 0; t < aicpu_thread_num_; ++t) {
-        const int32_t *ids = core_trackers_[t].core_ids();
-        const int32_t n = core_trackers_[t].core_num();
-        for (int32_t i = 0; i < n; ++i) {
-            if (ids[i] >= 0 && ids[i] < cores_total_num_) owned[ids[i]] = true;
-        }
         if (retire_thread_cores(t) != 0) rc = -1;
     }
-    // A core whose window opened but which no thread owns can only exist when
-    // assignment never ran, and then no thread will ever retire it: this path is
-    // its only owner, so it needs no claim.
-    int32_t orphans[PLATFORM_MAX_CORES];
-    int32_t n_orphan = 0;
-    for (int32_t i = 0; i < cores_total_num_; ++i) {
-        if (!owned[i] && core_exec_states_[i].reg_addr != 0) orphans[n_orphan++] = i;
-    }
-    if (n_orphan != 0 && retire_cores(orphans, n_orphan) != 0) rc = -1;
     return rc;
 }
 
@@ -1015,6 +1019,7 @@ void SchedulerContext::assign_own_clusters(int32_t tidx) {
             CoreTracker::MAX_CLUSTERS
         );
         handshake_failed_.store(true, std::memory_order_release);
+        publish_retirement_group(tidx);
         return;
     }
     tracker.init(own_n);
@@ -1059,6 +1064,7 @@ void SchedulerContext::assign_own_clusters(int32_t tidx) {
             }
         }
     }
+    publish_retirement_group(tidx);
 }
 
 // Abort the run on a handshake failure discovered without the all-thread barrier
@@ -1153,8 +1159,8 @@ bool SchedulerContext::begin_emergency_shutdown() {
 void SchedulerContext::signal_emergency_shutdown(Runtime *runtime) {
     (void)runtime;  // exit is delivered via each core's register block, not GM
     // Sweeps every core rather than one thread's slice: a fatal run must not
-    // depend on the owning threads reaching their own shutdown. Per-core
-    // claiming keeps whatever they already retired untouched. The retirement
+    // depend on ready owners reaching their own shutdown. Owners still in init
+    // service the request when they publish their group. The retirement
     // writes DATA_MAIN_BASE=EXIT, which both releases a core still polling for
     // its window to open and signals it to exit. Cores whose windows never
     // opened (reg_addr==0) remain the host recovery path's responsibility.
@@ -1178,8 +1184,10 @@ int32_t SchedulerContext::pre_handshake_init(
 
     // Zero all per-core execution state before handshake
     memset(core_exec_states_, 0, sizeof(core_exec_states_));
-    // No thread has claimed its set yet in this generation.
-    memset(thread_retired_, 0, sizeof(thread_retired_));
+    // Reset before hs_setup_done_ releases any initializer or emergency caller.
+    memset(retirement_state_, 0, sizeof(retirement_state_));
+    retirement_blocked_layout_ = aicpu_thread_num > 1 && !runtime->dev.serial_orch_sched;
+    retirement_unassigned_ = false;
 
     // Wire thread/transition configuration that handshake/assign need to read.
     aicpu_thread_num_ = aicpu_thread_num;
@@ -1279,6 +1287,9 @@ int32_t SchedulerContext::pre_handshake_init(
 
 int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     if (handshake_failed_.load(std::memory_order_acquire)) {
+        retirement_unassigned_ = true;
+        for (int32_t t = 0; t < aicpu_thread_num_; ++t)
+            publish_retirement_group(t);
         emergency_shutdown(runtime);
         return -1;
     }
@@ -1306,6 +1317,10 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     LOG_INFO("Core discovery complete: %d AIC, %d AIV", aic_count_, aiv_count_);
 
     if (!assign_cores_to_threads()) {
+        retirement_unassigned_ = true;
+        for (int32_t t = 0; t < aicpu_thread_num_; ++t)
+            publish_retirement_group(t);
+        emergency_shutdown(runtime);
         return -1;
     }
 
@@ -1381,6 +1396,8 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     func_id_to_addr_ = reinterpret_cast<uint64_t *>(runtime->dev.callable_table_addr_);
     func_id_to_addr_count_ = runtime->dev.callable_table_len_;
 
+    for (int32_t t = 0; t < aicpu_thread_num_; ++t)
+        publish_retirement_group(t);
     return 0;
 }
 
