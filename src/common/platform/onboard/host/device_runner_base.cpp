@@ -327,8 +327,27 @@ void DeviceRunnerBase::release_child_memory_host_views() {
             workspace_.note_mapping_retained(alloc_base, mapped);
             continue;
         }
-        unregister_device_memory_from_host(alloc_base);
+        if (unregister_device_memory_from_host(alloc_base) == 0) continue;
+        // Still mapped, and this registry no longer names it. A managed block
+        // is quarantined so that nothing — the sweep below, a later growth, or
+        // a second close — releases storage a live host address still covers.
+        // An unmanaged allocation keeps the behaviour it always had: the
+        // allocator's finalize frees it regardless.
+        if (workspace_.note_mapping_unregister_failed(alloc_base)) {
+            LOG_ERROR(
+                "release_child_memory_host_views: %p could not be unmapped; its workspace block is quarantined",
+                alloc_base
+            );
+        }
     }
+}
+
+int DeviceRunnerBase::drop_child_memory_host_view(void *alloc_base) {
+    if (alloc_base == nullptr) return 0;
+    if (child_memory_host_views_.lookup(alloc_base, alloc_base) == nullptr) return 0;
+    const int rc = unregister_device_memory_from_host(alloc_base);
+    if (rc == 0) child_memory_host_views_.take(alloc_base);
+    return rc;
 }
 
 namespace {
@@ -364,7 +383,14 @@ int DeviceRunnerBase::reference_bank_arenas(
             WorkspaceManager::arena_region(arena_bank, static_cast<WorkspaceManager::ArenaRegion>(i));
         // The base an attached arena reports is the block's own base, which is
         // what the ledger is keyed by.
-        if (workspace_.reference(arena->base(), g_workspace_plan.epoch)) continue;
+        if (workspace_.reference(arena->base(), g_workspace_plan.epoch)) {
+            // The transaction published every region before this ran, so this
+            // address is what the region is using now: any earlier generation
+            // of it becomes obsolete and its bytes become reclaimable once its
+            // own consumers retire.
+            workspace_.note_published(region, arena->base());
+            continue;
+        }
         LOG_ERROR(
             "setup_static_arena: bank %u region %s could not register this run as a consumer of %p", arena_bank,
             requests[i].name, arena->base()
@@ -404,7 +430,16 @@ int DeviceRunnerBase::set_workspace_budget(std::uint64_t limit_bytes) {
         return res.commit_alloc(bytes);
     };
     backend.release = [](void *ctx, void *base) -> int {
-        return static_cast<DeviceRunnerBase *>(ctx)->mem_alloc_.free(base);
+        auto *self = static_cast<DeviceRunnerBase *>(ctx);
+        // Unmap first, and only free what is proven unmapped. A host mapping
+        // covers the whole allocation, so freeing bytes still behind one would
+        // give the next allocation a range this process holds a live host
+        // address over. A failed unmap is reported as a failed release, which
+        // keeps the block owned and charged here instead of leaving a mapping
+        // with nothing naming it.
+        const int unmap_rc = self->drop_child_memory_host_view(base);
+        if (unmap_rc != 0) return unmap_rc;
+        return self->mem_alloc_.free(base);
     };
     if (!workspace_.configure(limit_bytes, backend)) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     return 0;
@@ -452,11 +487,15 @@ int DeviceRunnerBase::acquire_retained_temp(
     // Managed: the previous generation keeps its address and its contents until
     // its last consumer retires, so this request takes a block of its own
     // inside the budget. A refusal leaves the slot naming the old block.
-    void *grown = workspace_.acquire(WorkspaceManager::staging_region(pipeline_slot), g_workspace_plan.epoch, bytes);
+    const WorkspaceManager::RegionKey region = WorkspaceManager::staging_region(pipeline_slot);
+    void *grown = workspace_.acquire(region, g_workspace_plan.epoch, bytes);
     if (grown == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     // The previous block keeps its address and its contents: the slot stops
     // naming it, and its earlier consumers release it when they retire.
     set_retained_temp_buffer(pipeline_slot, grown, bytes);
+    // The slot names the new block from here on, which makes the one it named
+    // before an obsolete generation.
+    workspace_.note_published(region, grown);
     *addr_out = grown;
     *size_out = bytes;
     return 0;
@@ -2325,11 +2364,17 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
             release_child_memory_host_views();
             capture(mem_alloc_.finalize());
         } else {
+            // Mappings first, exactly as the unmanaged path does: the releases
+            // below hand allocations back to the platform, and a host mapping
+            // over one of them would outlive its pages. The ledger keeps the
+            // block of any mapping that could not be dropped, and the managed
+            // release path unmaps each block it frees, so no ordering here can
+            // leave a freed range mapped.
+            release_child_memory_host_views();
             // Every block no consumer references goes back the ordinary way
             // first, so the sweep below is left with what could not be proven
             // unused.
             capture(workspace_.release_unreferenced());
-            release_child_memory_host_views();
             // The sweep holds the ledger's lock for its whole duration, taken
             // before the allocator's — the order every other path uses. Its
             // callbacks work through a view that assumes that lock is held, so

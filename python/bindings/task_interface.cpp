@@ -3372,8 +3372,7 @@ NB_MODULE(_task_interface, m) {
             [](ChipWorker &self, const std::string &host_lib_path, const std::string &aicpu_path,
                const std::string &aicore_path, const std::string &dispatcher_path, int device_id,
                std::optional<CallConfig> prewarm_config, bool enable_sdma, const std::string &sim_context_path,
-               const std::string &sdma_warmup_path, bool collect_across_runs,
-               uint64_t workspace_budget_bytes) {
+               const std::string &sdma_warmup_path, bool collect_across_runs, uint64_t workspace_budget_bytes) {
                 self.init(
                     host_lib_path, aicpu_path, aicore_path, dispatcher_path, device_id,
                     prewarm_config.has_value() ? &(*prewarm_config) : nullptr, enable_sdma, sim_context_path,

@@ -40,6 +40,25 @@
  * consumer retires. Growth therefore means "a newer plan got a bigger block",
  * never "the old block moved".
  *
+ * Two kinds of ownership are also kept apart, and conflating them is what makes
+ * a close either unsafe or impossible:
+ *
+ *   - the **current backing** of a region is the address that region is
+ *     published at right now. It belongs to the device context, not to any run,
+ *     so it survives every run retiring and is never taken away to fund another
+ *     region's growth. It is released when the context tears down.
+ *   - a **run reference** is one executing run's claim on a block, identified by
+ *     its run epoch. Only these decide whether a close must wait.
+ *
+ * Epoch 0 is not a run: it is the context itself, which is what the eager
+ * device initialization allocates under. Recording it as a run reference would
+ * leave a consumer that no run can ever finish, so it names a current backing
+ * and nothing else.
+ *
+ * An **obsolete generation** — a block its region has since republished
+ * elsewhere, with no run reference left — is the only storage growth may
+ * reclaim, and only after its host mapping is gone.
+ *
  * Retirement is decided from facts the run path reports at the boundaries that
  * produce them (`note_run_fact`), never inferred from a phase word or from the
  * return code a caller happens to receive. A block whose last consumer cannot
@@ -162,6 +181,9 @@ public:
      */
     static constexpr size_t kMaxBlockRefs = PTO_PIPELINE_MAX_DEPTH + 2;
 
+    /** The identity workspace requests made outside any run belong to. */
+    static constexpr uint64_t kContextEpoch = 0;
+
     WorkspaceManager() = default;
     WorkspaceManager(const WorkspaceManager &) = delete;
     WorkspaceManager &operator=(const WorkspaceManager &) = delete;
@@ -213,6 +235,11 @@ public:
             if (b.bytes < bytes) continue;
             if (b.ref_count != 0) continue;  // capacity is not permission
             if (!add_ref(b, run_epoch)) return nullptr;
+            // Handed out as this region's backing, so it stops being an
+            // obsolete generation now rather than at publication: between the
+            // two, growth elsewhere must not reclaim the block this plan is
+            // already writing.
+            b.current = true;
             return b.base;
         }
         return publish_new_block(region, run_epoch, bytes);
@@ -227,6 +254,10 @@ public:
      * contents as free to overwrite. Reuse has to register ownership for the
      * same reason a fresh allocation does.
      *
+     * `kContextEpoch` records no reference: it says the context, not a run, is
+     * using its own current backing. The ownership and quarantine checks still
+     * apply, so a caller's failure path stays truthful.
+     *
      * @return false when `base` is not a live block of this manager, or when
      *         its reference table is full — a refusal, never a silent drop
      */
@@ -235,6 +266,28 @@ public:
         Block *b = find_locked(base);
         if (b == nullptr || b->quarantined) return false;
         return add_ref(*b, run_epoch);
+    }
+
+    /**
+     * Record that `region` is now published at `base`.
+     *
+     * Called only once the plan that took `base` is live — after the arena
+     * transaction published every region, or after the slot started naming a
+     * grown staging block. Every older generation of the same region becomes
+     * obsolete here and nowhere else: a plan that failed leaves its predecessor
+     * current, so the addresses that failure preserved stay protected from the
+     * reclamation below.
+     */
+    void note_published(const RegionKey &region, void *base) {
+        std::scoped_lock lk(mu_);
+        Block *published = find_locked(base);
+        if (published == nullptr) return;
+        for (Block &b : blocks_) {
+            if (b.released || b.base == base) continue;
+            if (!(b.region == region)) continue;
+            b.current = false;
+        }
+        published->current = true;
     }
 
     /**
@@ -436,6 +489,31 @@ public:
         quarantined_mapped_bytes_ += bytes;
     }
 
+    /**
+     * Record that `base` could not be unmapped from this process.
+     *
+     * A host mapping covers the whole allocation, so storage still behind one
+     * cannot be released to the platform: the range would be handed to another
+     * allocation while this process still holds a host address over it. The
+     * block is therefore quarantined — excluded from reuse, from growth's
+     * reclamation, and from the terminal sweep — rather than freed with a
+     * dropped mapping record.
+     *
+     * @return true when `base` is a block this manager owns
+     */
+    bool note_mapping_unregister_failed(void *base) {
+        std::scoped_lock lk(mu_);
+        Block *b = find_locked(base);
+        if (b == nullptr) return false;
+        b->quarantined = true;
+        b->state = BlockState::Quarantined;
+        if (!b->mapping_retained) {
+            b->mapping_retained = true;
+            quarantined_mapped_bytes_ += b->bytes;
+        }
+        return true;
+    }
+
     /** Fill one report. Returns false when the manager is off. */
     bool report(SimplerWorkspaceReport *out) const {
         if (out == nullptr) return false;
@@ -497,6 +575,10 @@ private:
         bool release_unconfirmed{false};
         bool released{false};
         bool mapping_retained{false};
+        // The address its region is published at right now. Cleared only when
+        // that region publishes a newer generation, which makes this block
+        // obsolete and its bytes reclaimable once no run references it.
+        bool current{true};
         // Accounted for by a release or by the terminal sweep already. A second
         // close finds the same record and must not charge or credit it twice.
         bool swept{false};
@@ -616,6 +698,10 @@ private:
     }
 
     static bool add_ref(Block &b, uint64_t epoch) {
+        // The context's own backing carries no run reference: nothing can ever
+        // report this identity finished, so counting it would leave a consumer
+        // no close could resolve.
+        if (epoch == kContextEpoch) return true;
         for (uint32_t i = 0; i < b.ref_count; ++i) {
             if (b.refs[i] == epoch) return true;
         }
@@ -666,9 +752,43 @@ private:
         }
     }
 
+    /**
+     * Release obsolete generations until `bytes` fits, and report whether it
+     * does.
+     *
+     * Only a block its region has since republished elsewhere is eligible, and
+     * only with no run reference left, no quarantine, no unconfirmed release
+     * and no host mapping still standing. That excludes, deliberately: the
+     * current backing of every region — which is the context's, not any run's,
+     * and whose zero references mean "idle", not "abandoned"; the addresses a
+     * failed plan preserved, which stay current; and any block the backend's
+     * unmap could not clear.
+     */
+    bool make_room_locked(size_t bytes) {
+        if (reserved_bytes_ + bytes <= limit_bytes_) return true;
+        for (Block &b : blocks_) {
+            if (reserved_bytes_ + bytes <= limit_bytes_) break;
+            if (b.current || b.released || b.swept) continue;
+            if (b.quarantined || b.release_unconfirmed || b.mapping_retained) continue;
+            if (b.ref_count != 0) continue;
+            if (backend_.release(backend_.ctx, b.base) != 0) {
+                // Still on the device, so still charged: reporting these bytes
+                // as reclaimed would let the budget hand them out twice.
+                b.release_unconfirmed = true;
+                b.state = BlockState::ReleaseUnconfirmed;
+                continue;
+            }
+            b.released = true;
+            b.swept = true;  // accounted for here; the terminal sweep skips it
+            b.state = BlockState::ProvenUnused;
+            reserved_bytes_ -= b.bytes;
+        }
+        return reserved_bytes_ + bytes <= limit_bytes_;
+    }
+
     void *publish_new_block(const RegionKey &region, uint64_t run_epoch, size_t bytes) {
         if (reserved_bytes_ + bytes < reserved_bytes_) return nullptr;  // overflow
-        if (reserved_bytes_ + bytes > limit_bytes_) return nullptr;
+        if (!make_room_locked(bytes)) return nullptr;
         // Both ownership records exist before the device allocation: this vector
         // may reallocate here, where nothing has been allocated on the device
         // yet, and the backend reserves its own tracking node before its own
@@ -680,9 +800,11 @@ private:
         b.base = base;
         b.bytes = bytes;
         b.region = region;
-        b.refs[0] = run_epoch;
-        b.ref_count = 1;
-        b.state = BlockState::Referenced;
+        b.state = BlockState::ProvenUnused;
+        // The predecessor stays current until this plan publishes, so a failure
+        // between here and `note_published` leaves the address the region is
+        // still using protected from the reclamation above.
+        add_ref(b, run_epoch);
         blocks_.push_back(b);  // into the capacity reserved above
         reserved_bytes_ += bytes;
         if (blocks_published_ != UINT32_MAX) ++blocks_published_;

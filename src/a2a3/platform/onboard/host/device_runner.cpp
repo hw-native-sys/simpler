@@ -1163,29 +1163,33 @@ void *DeviceRunner::register_device_memory_to_host(void *dev_ptr, std::size_t by
     return host_va;
 }
 
-void DeviceRunner::unregister_device_memory_from_host(void *dev_ptr) {
+int DeviceRunner::unregister_device_memory_from_host(void *dev_ptr) {
     if (dev_ptr == nullptr) {
-        return;
+        return 0;  // nothing was mapped
     }
+    // Every early exit below leaves the range mapped, so each reports failure:
+    // an owner that read "unmapped" from one of them would release storage this
+    // process still holds a host address over.
     if (device_id_ < 0) {
         LOG_ERROR("unregister_device_memory_from_host: invalid device_id %d", device_id_);
-        return;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     if (load_hal_if_needed() != 0) {
         LOG_ERROR("unregister_device_memory_from_host: failed to load ascend_hal: %s", dlerror());
-        return;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     // halHostUnregister is keyed by the device pointer; the HAL maps it back to
     // the host VA internally.
     HalHostUnregisterFn fn = get_halHostUnregister();
     if (fn == nullptr) {
         LOG_ERROR("unregister_device_memory_from_host: halHostUnregister symbol not found: %s", dlerror());
-        return;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     int rc = fn(dev_ptr, device_id_);
     if (rc != 0) {
         LOG_ERROR("unregister_device_memory_from_host: halHostUnregister failed for dev_ptr %p (rc=%d)", dev_ptr, rc);
     }
+    return rc;
 }
 
 int DeviceRunner::finalize() {

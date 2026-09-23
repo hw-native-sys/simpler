@@ -133,7 +133,7 @@ public:
     // halHostRegister(DEV_SVM_MAP_HOST) / halHostUnregister. The returned host
     // VA may differ from dev_ptr — callers must use it for host access.
     void *register_device_memory_to_host(void *dev_ptr, std::size_t bytes) override;
-    void unregister_device_memory_from_host(void *dev_ptr) override;
+    int unregister_device_memory_from_host(void *dev_ptr) override;
 
     /**
      * a2a3-only `dep_gen` enablement setter. Also arms the loaded runtime's

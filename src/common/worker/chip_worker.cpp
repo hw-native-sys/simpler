@@ -444,6 +444,12 @@ void ChipWorker::init(
     } catch (...) {
         destroy_device_context_fn_(device_ctx_);
         device_ctx_ = nullptr;
+        // The context is gone, and its own teardown already released or
+        // quarantined every block it owned. So this generation's budget is
+        // resolved and the latch must not outlive it: a later unmanaged init
+        // would otherwise be unable to tell "no budget" from "a budget whose
+        // accounting cannot be read" and refuse every close.
+        workspace_budget_latched_ = false;
         create_device_context_fn_ = nullptr;
         destroy_device_context_fn_ = nullptr;
         device_malloc_ctx_fn_ = nullptr;
@@ -512,6 +518,8 @@ void ChipWorker::init(
         // sim context.
         destroy_device_context_fn_(device_ctx_);
         device_ctx_ = nullptr;
+        // Resolved with the context, as in the catch above.
+        workspace_budget_latched_ = false;
         create_device_context_fn_ = nullptr;
         destroy_device_context_fn_ = nullptr;
         device_malloc_ctx_fn_ = nullptr;
@@ -695,6 +703,13 @@ void ChipWorker::finalize() {
     finalize_run_fn_ = nullptr;
     probe_run_retention_fn_ = nullptr;
     get_teardown_report_fn_ = nullptr;
+    // Reached only past the throw a failed teardown takes, which keeps the
+    // latch — and with it a readable report — for the retry. Past it, every
+    // block this generation owned has been released or quarantined, so the
+    // latch is resolved and must not outlive the generation that set it.
+    workspace_budget_latched_ = false;
+    set_workspace_budget_fn_ = nullptr;
+    get_workspace_report_fn_ = nullptr;
     supports_concurrent_native_prepare_fn_ = nullptr;
     supports_joined_native_launch_fn_ = nullptr;
     get_arena_bank_gm_heap_base_fn_ = nullptr;

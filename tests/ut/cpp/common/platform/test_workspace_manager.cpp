@@ -598,4 +598,187 @@ TEST(WorkspaceManagerOwnership, ALaunchedRunKeepsThatFactAgainstALateNoSubmissio
     EXPECT_EQ(m.block_state(block), WorkspaceManager::BlockState::ProvenUnused);
 }
 
+// One region's generations under a finite budget, sized so the arithmetic of a
+// reclaim is visible: 1 + 2 fits, 1 + 2 + 4 does not, and 2 + 4 does.
+constexpr uint64_t kSixMiB = 6u << 20;
+constexpr size_t kOneMiB = 1u << 20;
+constexpr size_t kTwoMiB = 2u << 20;
+constexpr size_t kFourMiB = 4u << 20;
+
+void retire(WorkspaceManager &m, uint32_t slot, uint64_t epoch) {
+    report_launched_and_drained(m, slot, epoch);
+    report_host_side_done(m, slot, epoch);
+}
+
+TEST(WorkspaceManagerLifecycle, TheContextsOwnBackingIsNoConsumerACloseMustWaitFor) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(kBudget, backend.ops()));
+    const WorkspaceManager::RegionKey region =
+        WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::RuntimePool);
+
+    // The eager device initialization allocates before any run exists, so its
+    // requests carry the context identity rather than a run epoch.
+    void *block = m.acquire(region, WorkspaceManager::kContextEpoch, 4096);
+    ASSERT_NE(block, nullptr);
+    m.note_published(region, block);
+
+    // No run can ever report this identity finished, so counting it as a
+    // consumer would refuse every close for the life of the context.
+    EXPECT_EQ(m.live_drainable_consumers(), 0u);
+    SimplerWorkspaceReport report{};
+    ASSERT_TRUE(m.report(&report));
+    EXPECT_EQ(report.live_blocked, 0u);
+    EXPECT_EQ(report.blocks_published, 1u);
+
+    // And it is the context's to release when the context tears down.
+    EXPECT_EQ(m.release_unreferenced(), 0);
+    EXPECT_EQ(backend.released, std::vector<void *>{block});
+    EXPECT_EQ(m.reserved_bytes(), 0u);
+}
+
+TEST(WorkspaceManagerLifecycle, ARunOnTheContextsBackingLeavesNothingBehindWhenItRetires) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(kBudget, backend.ops()));
+    const WorkspaceManager::RegionKey region = WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmHeap);
+
+    void *block = m.acquire(region, WorkspaceManager::kContextEpoch, 4096);
+    ASSERT_NE(block, nullptr);
+    m.note_published(region, block);
+
+    // A run whose request that block already covers registers against it and is
+    // then the only consumer a close has to wait for.
+    ASSERT_TRUE(m.reference(block, 7));
+    EXPECT_EQ(m.live_drainable_consumers(), 1u);
+    retire(m, 0, 7);
+    EXPECT_EQ(m.live_drainable_consumers(), 0u);
+    EXPECT_EQ(m.block_state(block), WorkspaceManager::BlockState::ProvenUnused);
+    EXPECT_EQ(backend.acquire_calls, 1);
+
+    // A second run over the same block leaves the same state behind.
+    ASSERT_TRUE(m.reference(block, 8));
+    EXPECT_EQ(m.live_drainable_consumers(), 1u);
+    retire(m, 0, 8);
+    EXPECT_EQ(m.live_drainable_consumers(), 0u);
+
+    EXPECT_EQ(m.release_unreferenced(), 0);
+    EXPECT_EQ(m.reserved_bytes(), 0u);
+}
+
+TEST(WorkspaceManagerBudget, GrowthReclaimsAnObsoleteGenerationRatherThanRefusing) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(kSixMiB, backend.ops()));
+    const WorkspaceManager::RegionKey region = WorkspaceManager::staging_region(0);
+
+    void *first = m.acquire(region, 1, kOneMiB);
+    ASSERT_NE(first, nullptr);
+    m.note_published(region, first);
+    retire(m, 0, 1);
+
+    // The region republishes bigger, which makes the 1 MiB generation obsolete:
+    // nothing names it and nothing can come to name it again.
+    void *second = m.acquire(region, 2, kTwoMiB);
+    ASSERT_NE(second, first);
+    m.note_published(region, second);
+    retire(m, 0, 2);
+    EXPECT_EQ(m.reserved_bytes(), kOneMiB + kTwoMiB);
+
+    // 3 MiB charged and 4 MiB asked for exceeds the budget, and refusing here
+    // would be wrong: the obsolete 1 MiB is reclaimable, and 2 + 4 fits.
+    void *third = m.acquire(region, 3, kFourMiB);
+    ASSERT_NE(third, nullptr);
+    EXPECT_EQ(m.reserved_bytes(), kTwoMiB + kFourMiB);
+    EXPECT_EQ(backend.released, std::vector<void *>{first});
+    // The generation the region is published at was not touched to fund it.
+    EXPECT_EQ(m.block_bytes(second), kTwoMiB);
+    EXPECT_TRUE(m.owns(second));
+}
+
+TEST(WorkspaceManagerBudget, GrowthNeverReclaimsTheAddressAFailedPlanPreserved) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(kSixMiB, backend.ops()));
+    const WorkspaceManager::RegionKey region = WorkspaceManager::staging_region(0);
+
+    void *published = m.acquire(region, 1, kOneMiB);
+    ASSERT_NE(published, nullptr);
+    m.note_published(region, published);
+    retire(m, 0, 1);
+
+    // A plan that took a bigger block and then failed before publication: the
+    // region still uses the old address, so that address is still current and
+    // the new one never became a generation anybody names.
+    void *abandoned = m.acquire(region, 2, kTwoMiB);
+    ASSERT_NE(abandoned, nullptr);
+    retire(m, 0, 2);
+    EXPECT_EQ(m.reserved_bytes(), kOneMiB + kTwoMiB);
+
+    // Neither may fund this: freeing the published one would pull the region's
+    // storage out from under it, and the abandoned one is not provably unnamed.
+    EXPECT_EQ(m.acquire(region, 3, kFourMiB), nullptr);
+    EXPECT_TRUE(backend.released.empty());
+    EXPECT_EQ(m.reserved_bytes(), kOneMiB + kTwoMiB);
+    EXPECT_TRUE(m.owns(published));
+    EXPECT_TRUE(m.owns(abandoned));
+}
+
+TEST(WorkspaceManagerBudget, AnIdleCurrentBackingIsNotEvictableForAnotherRegion) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(kSixMiB, backend.ops()));
+    const WorkspaceManager::RegionKey heap = WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmHeap);
+    const WorkspaceManager::RegionKey sm = WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmSm);
+
+    void *heap_block = m.acquire(heap, 1, kFourMiB);
+    ASSERT_NE(heap_block, nullptr);
+    m.note_published(heap, heap_block);
+    retire(m, 0, 1);
+    // Idle, not abandoned: no run holds it, and the heap is published at it.
+    EXPECT_EQ(m.block_state(heap_block), WorkspaceManager::BlockState::ProvenUnused);
+
+    EXPECT_EQ(m.acquire(sm, 2, kFourMiB), nullptr);
+    EXPECT_TRUE(backend.released.empty());
+    EXPECT_EQ(m.reserved_bytes(), kFourMiB);
+    EXPECT_TRUE(m.owns(heap_block));
+}
+
+TEST(WorkspaceManagerOwnership, AnUnmappableBlockIsKeptRatherThanFreedUnderItsMapping) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(kSixMiB, backend.ops()));
+    const WorkspaceManager::RegionKey region = WorkspaceManager::staging_region(0);
+
+    void *mapped = m.acquire(region, 1, kOneMiB);
+    ASSERT_NE(mapped, nullptr);
+    m.note_published(region, mapped);
+    retire(m, 0, 1);
+
+    // The unmap failed, so a host address still covers this whole allocation.
+    // Releasing the bytes would hand that range to the next allocation.
+    EXPECT_TRUE(m.note_mapping_unregister_failed(mapped));
+    EXPECT_EQ(m.block_state(mapped), WorkspaceManager::BlockState::Quarantined);
+    EXPECT_TRUE(m.must_keep(mapped));
+    EXPECT_FALSE(m.note_mapping_unregister_failed(reinterpret_cast<void *>(0xdead)));
+
+    SimplerWorkspaceReport report{};
+    ASSERT_TRUE(m.report(&report));
+    EXPECT_EQ(report.quarantined_blocks, 1u);
+    EXPECT_EQ(report.quarantined_mapped_bytes, kOneMiB);
+    EXPECT_EQ(report.proof_unavailable, 1u);
+
+    // Not by an ordinary release, and not by growth's reclamation either — even
+    // once the region has republished elsewhere and left it obsolete.
+    EXPECT_EQ(m.release_unreferenced(), 0);
+    EXPECT_TRUE(backend.released.empty());
+    void *successor = m.acquire(region, 2, kTwoMiB);
+    ASSERT_NE(successor, nullptr);
+    m.note_published(region, successor);
+    retire(m, 0, 2);
+    EXPECT_EQ(m.acquire(region, 3, kFourMiB), nullptr);
+    EXPECT_TRUE(backend.released.empty());
+    EXPECT_TRUE(m.owns(mapped));
+}
+
 }  // namespace

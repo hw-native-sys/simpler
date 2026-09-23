@@ -461,7 +461,18 @@ public:
         (void)bytes;
         return nullptr;
     }
-    virtual void unregister_device_memory_from_host(void *dev_ptr) { (void)dev_ptr; }
+    /**
+     * Release a mapping established above.
+     *
+     * @return 0 once the range is no longer mapped into this process, non-zero
+     *         when it still is. A caller that owns the storage must keep it: the
+     *         mapping covers the whole allocation, so releasing the bytes behind
+     *         one would hand a live host address to the next allocation.
+     */
+    virtual int unregister_device_memory_from_host(void *dev_ptr) {
+        (void)dev_ptr;
+        return 0;
+    }
 
     /**
      * Host view of a child-memory address for a host-side orchestrator, with
@@ -488,6 +499,18 @@ public:
      * map: past that point the pages are gone and the mapping cannot be named.
      */
     void release_child_memory_host_views();
+
+    /**
+     * Unregister the one mapping over `alloc_base`, if it has one.
+     *
+     * The record is dropped only once the platform confirms the range is
+     * unmapped, so a failure leaves this runner still naming the mapping it
+     * still holds instead of forgetting it.
+     *
+     * @return 0 when `alloc_base` is no longer mapped into this process —
+     *         including the common case of never having been mapped
+     */
+    int drop_child_memory_host_view(void *alloc_base);
 
     /**
      * Commit the three per-Worker pooled regions (GM heap, shared
