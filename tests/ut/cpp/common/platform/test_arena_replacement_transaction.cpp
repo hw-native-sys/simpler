@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <set>
+#include <vector>
 
 #include "host/arena_replacement_transaction.h"
 #include "utils/device_arena.h"
@@ -141,6 +142,43 @@ void commit_initial_bank(BankFixture &bank) {
     for (size_t i = 0; i < 3; ++i) {
         ASSERT_TRUE(bank.arena(i)->is_committed());
         ASSERT_NE(bank.arena(i)->base(), nullptr);
+    }
+}
+
+/**
+ * What an owner that keeps its own ledger of these allocations is told.
+ *
+ * Such an owner refuses the arena's frees, so the free callback cannot tell it
+ * that a claim ended; these reports are the only thing that can.
+ */
+struct DispositionLog {
+    struct Entry {
+        size_t region;
+        ArenaRegionDisposition what;
+        void *base;
+    };
+    std::vector<Entry> entries;
+
+    static void record(void *ctx, size_t region, ArenaRegionDisposition what, void *base) {
+        static_cast<DispositionLog *>(ctx)->entries.push_back(Entry{region, what, base});
+    }
+
+    size_t count(ArenaRegionDisposition what) const {
+        size_t n = 0;
+        for (const Entry &entry : entries) {
+            if (entry.what == what) ++n;
+        }
+        return n;
+    }
+};
+
+void fill_reporting_requests(
+    BankFixture &bank, size_t heap, size_t sm, size_t runtime, DispositionLog *log, ArenaRegionRequest (&out)[3]
+) {
+    (void)bank.requests(heap, sm, runtime, out);
+    for (ArenaRegionRequest &request : out) {
+        request.disposition = &DispositionLog::record;
+        request.disposition_ctx = log;
     }
 }
 
@@ -597,6 +635,57 @@ TEST(ArenaReplacementTransaction, RefusedFreesAreReclaimedByTheBackendAfterItsAr
         EXPECT_EQ(reclaimed, 0u) << "cleanup ran before the arenas were done with the blocks";
     }
     EXPECT_EQ(reclaimed, 4u) << "the backend left blocks behind after its arenas were destroyed";
+}
+
+TEST(ArenaReplacementTransaction, ClaimEndingBoundariesAreReportedToTheAllocationsOwner) {
+    BankFixture bank;
+    ASSERT_NO_FATAL_FAILURE(commit_initial_bank(bank));
+    void *committed[3];
+    for (size_t i = 0; i < 3; ++i)
+        committed[i] = bank.arena(i)->raw_backing();
+
+    // A later region's staging failure drops the blocks its peers already
+    // staged. Those never became the generation their region publishes, so an
+    // owner has to hear that the claim ended — otherwise it keeps protecting a
+    // block nothing will ever name.
+    DispositionLog aborted;
+    ArenaRegionRequest grow[3];
+    fill_reporting_requests(bank, kHeap * 2, kSm * 2, kRuntime * 2, &aborted, grow);
+    bank.backend.fail_alloc_at = bank.backend.allocs + 2;
+    const ArenaTransactionResult failed = run_arena_replacement_transaction(grow, 3, DeviceArena::kDefaultBaseAlign);
+
+    ASSERT_FALSE(failed.published);
+    ASSERT_EQ(aborted.entries.size(), 1u);
+    EXPECT_EQ(aborted.entries[0].region, 0u);
+    EXPECT_EQ(aborted.entries[0].what, ArenaRegionDisposition::StageAborted);
+    ASSERT_NE(aborted.entries[0].base, nullptr);
+    // The block reported is the staged one, never a committed backing: giving up
+    // a claim on one of those would abandon storage its region is still using.
+    for (size_t i = 0; i < 3; ++i)
+        EXPECT_NE(aborted.entries[0].base, committed[i]) << "reported region " << i << "'s live backing";
+    EXPECT_EQ(aborted.count(ArenaRegionDisposition::Detached), 0u);
+
+    // A region reduced to nothing publishes no address at all, so its old block
+    // is reported too — there is no successor for an owner to settle it
+    // against.
+    DispositionLog detached;
+    ArenaRegionRequest release[3];
+    fill_reporting_requests(bank, kHeap, 0, kRuntime, &detached, release);
+    const ArenaTransactionResult published =
+        run_arena_replacement_transaction(release, 3, DeviceArena::kDefaultBaseAlign);
+
+    ASSERT_TRUE(published.published);
+    ASSERT_EQ(detached.entries.size(), 1u);
+    EXPECT_EQ(detached.entries[0].region, 1u);
+    EXPECT_EQ(detached.entries[0].what, ArenaRegionDisposition::Detached);
+    EXPECT_EQ(detached.entries[0].base, committed[1]);
+    EXPECT_FALSE(bank.arena(1)->is_committed());
+    // The regions that kept their backing report nothing, and a publication
+    // that merely replaced one would not either: its successor is the fact an
+    // owner settles the old generation against.
+    EXPECT_EQ(detached.count(ArenaRegionDisposition::StageAborted), 0u);
+    EXPECT_EQ(bank.arena(0)->raw_backing(), committed[0]);
+    EXPECT_EQ(bank.arena(2)->raw_backing(), committed[2]);
 }
 
 }  // namespace

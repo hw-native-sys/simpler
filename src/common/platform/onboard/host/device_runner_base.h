@@ -1454,6 +1454,20 @@ protected:
     };
 
     /**
+     * Record that a bank region has given up the block at `base`.
+     *
+     * A managed block outlives the arena that was using it, so the arena's own
+     * free callback cannot end its ownership — and the same callback serves a
+     * stage abort, a superseded backing and a teardown, which mean different
+     * things here. This is the transaction telling the ledger which of them
+     * happened, so a claim that ends stops holding budget: an aborted staging
+     * never became a generation anybody named, and a detached region publishes
+     * no address at all. Neither drops a run reference or lifts a quarantine,
+     * so the bytes still wait for their last true consumer.
+     */
+    void note_arena_region_disposition(uint32_t arena_bank, ArenaRegionDisposition what, void *base);
+
+    /**
      * Register this plan as a consumer of every region the bank now publishes.
      *
      * A region whose existing capacity was enough allocates nothing, so it

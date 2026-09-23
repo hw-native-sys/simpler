@@ -189,6 +189,17 @@ public:
     bool is_committed() const noexcept { return committed_; }
     void *base() const noexcept { return base_; }
 
+    // The block the backend returned for the current backing, and the one
+    // staged but not yet published (null when nothing is staged).
+    //
+    // `base()` is the forward-aligned address inside the first of these, which
+    // is what a consumer reads and writes. A caller that owns its allocations
+    // keys them by what its own callback handed over, which is these — so an
+    // owner asking "is the block I am about to give up the one this arena is
+    // still committed at?" has to compare these, not `base()`.
+    void *raw_backing() const noexcept { return raw_base_; }
+    void *staged_raw_backing() const noexcept { return staged_raw_; }
+
     // Total bytes reserved across all regions (excludes base_align padding).
     size_t total_size() const noexcept { return cursor_; }
 

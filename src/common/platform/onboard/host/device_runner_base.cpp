@@ -378,22 +378,28 @@ int DeviceRunnerBase::reference_bank_arenas(
 ) {
     for (std::size_t i = 0; i < count; ++i) {
         const DeviceArena *arena = requests[i].arena;
+        // A region asked to hold nothing has no backing and no consumer. Its
+        // previous block was reported detached by the transaction, so nothing
+        // here has to speak for it.
         if (arena == nullptr || !arena->is_committed()) continue;
         const WorkspaceManager::RegionKey region =
             WorkspaceManager::arena_region(arena_bank, static_cast<WorkspaceManager::ArenaRegion>(i));
-        // The base an attached arena reports is the block's own base, which is
-        // what the ledger is keyed by.
-        if (workspace_.reference(arena->base(), g_workspace_plan.epoch)) {
+        // The ledger is keyed by what its own allocation callback handed over,
+        // which is the raw block — `base()` is the forward-aligned address
+        // inside it and is not the same value when the platform returns an
+        // under-aligned pointer.
+        void *const owned = arena->raw_backing();
+        if (workspace_.reference(owned, g_workspace_plan.epoch)) {
             // The transaction published every region before this ran, so this
             // address is what the region is using now: any earlier generation
             // of it becomes obsolete and its bytes become reclaimable once its
             // own consumers retire.
-            workspace_.note_published(region, arena->base());
+            workspace_.note_published(region, owned);
             continue;
         }
         LOG_ERROR(
             "setup_static_arena: bank %u region %s could not register this run as a consumer of %p", arena_bank,
-            requests[i].name, arena->base()
+            requests[i].name, owned
         );
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -407,6 +413,18 @@ void *DeviceRunnerBase::acquire_arena_backing(std::size_t size) {
     // region of every bank would share one pool, and a growing GM heap could be
     // handed the block a still-attached shared-memory region is published at.
     return workspace_.acquire(g_workspace_plan.region, g_workspace_plan.epoch, size);
+}
+
+void DeviceRunnerBase::note_arena_region_disposition(uint32_t arena_bank, ArenaRegionDisposition what, void *base) {
+    if (!workspace_.enabled() || base == nullptr) return;
+    if (!workspace_.note_unpublished(base)) return;
+    const char *reason =
+        what == ArenaRegionDisposition::StageAborted ? "its staging was aborted" : "its region now holds nothing";
+    LOG_INFO(
+        "setup_static_arena: bank %u gave up workspace block %p (%s); its bytes are reclaimable once its last "
+        "consumer retires",
+        arena_bank, base, reason
+    );
 }
 
 void DeviceRunnerBase::release_arena_backing(void *p) {
@@ -781,11 +799,20 @@ int DeviceRunnerBase::setup_static_arena(
             WorkspaceManager::arena_region(a->bank, static_cast<WorkspaceManager::ArenaRegion>(region_index))
         );
     };
+    // The two boundaries at which a region stops publishing a block without a
+    // successor taking over. Reported to the ledger, which owns the block the
+    // arena is only using.
+    auto region_gave_up = [](void *ctx, std::size_t region_index, ArenaRegionDisposition what, void *base) {
+        auto *a = static_cast<ArenaRegionAnnounce *>(ctx);
+        (void)region_index;
+        a->runner->note_arena_region_disposition(a->bank, what, base);
+    };
     ArenaRegionRequest requests[] = {
-        {&bank.gm_heap, &bank.cached_gm_heap_size, gm_heap_size, "gm_heap", name_region, &announce},
-        {&bank.gm_sm, &bank.cached_gm_sm_size, gm_sm_size, "gm_sm", name_region, &announce},
-        {&bank.runtime_pool, &bank.cached_runtime_arena_size, runtime_arena_size, "runtime_pool", name_region,
+        {&bank.gm_heap, &bank.cached_gm_heap_size, gm_heap_size, "gm_heap", name_region, &announce, region_gave_up,
          &announce},
+        {&bank.gm_sm, &bank.cached_gm_sm_size, gm_sm_size, "gm_sm", name_region, &announce, region_gave_up, &announce},
+        {&bank.runtime_pool, &bank.cached_runtime_arena_size, runtime_arena_size, "runtime_pool", name_region,
+         &announce, region_gave_up, &announce},
     };
     constexpr size_t kRegionCount = sizeof(requests) / sizeof(requests[0]);
     // One region at a time, each named to the ledger, because the allocation

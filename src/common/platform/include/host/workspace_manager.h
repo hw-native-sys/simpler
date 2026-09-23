@@ -56,8 +56,9 @@
  * and nothing else.
  *
  * An **obsolete generation** — a block its region has since republished
- * elsewhere, with no run reference left — is the only storage growth may
- * reclaim, and only after its host mapping is gone.
+ * elsewhere, or given up without republishing at all, with no run reference
+ * left — is the only storage growth may reclaim, and only after its host
+ * mapping is gone.
  *
  * Retirement is decided from facts the run path reports at the boundaries that
  * produce them (`note_run_fact`), never inferred from a phase word or from the
@@ -288,6 +289,34 @@ public:
             b.current = false;
         }
         published->current = true;
+    }
+
+    /**
+     * Relinquish the published-owner claim on `base`.
+     *
+     * Two boundaries end such a claim without another generation taking it
+     * over: a staging that was aborted, so the generation it would have become
+     * never existed and no plan ever read it; and a region detached to hold
+     * nothing, which leaves that region published at no address at all. Either
+     * way this block is no longer what protects a region, so it becomes an
+     * obsolete generation — reclaimable by a later request *once its last true
+     * consumer retires*, never before.
+     *
+     * What this does not do: it drops no run reference and lifts no quarantine.
+     * Giving up a claim is the region's decision; whether the bytes may be
+     * released is still the consumers' to answer. Nor does it apply to the
+     * block a publication superseded — that one is settled by
+     * `note_published` at the region's new base, which is the fact that a
+     * successor exists.
+     *
+     * @return true when `base` is a block this manager owns
+     */
+    bool note_unpublished(void *base) {
+        std::scoped_lock lk(mu_);
+        Block *b = find_locked(base);
+        if (b == nullptr) return false;
+        b->current = false;
+        return true;
     }
 
     /**

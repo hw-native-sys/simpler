@@ -707,21 +707,32 @@ TEST(WorkspaceManagerBudget, GrowthNeverReclaimsTheAddressAFailedPlanPreserved) 
     m.note_published(region, published);
     retire(m, 0, 1);
 
-    // A plan that took a bigger block and then failed before publication: the
-    // region still uses the old address, so that address is still current and
-    // the new one never became a generation anybody names.
+    // A plan that took a bigger block and then failed before publication. The
+    // region still uses the old address, which is therefore still current.
     void *abandoned = m.acquire(region, 2, kTwoMiB);
     ASSERT_NE(abandoned, nullptr);
     retire(m, 0, 2);
     EXPECT_EQ(m.reserved_bytes(), kOneMiB + kTwoMiB);
 
-    // Neither may fund this: freeing the published one would pull the region's
-    // storage out from under it, and the abandoned one is not provably unnamed.
+    // Until the plan's abort is reported, this manager cannot tell the two
+    // apart: both are current, so neither funds the request. That is the state
+    // between the two events, not a resting state — the block is still charged
+    // because nothing has yet said the staging ended.
     EXPECT_EQ(m.acquire(region, 3, kFourMiB), nullptr);
     EXPECT_TRUE(backend.released.empty());
     EXPECT_EQ(m.reserved_bytes(), kOneMiB + kTwoMiB);
+
+    // The abort ends that claim, and only that one. The published address is
+    // the one a failure has to preserve, so it is still current and still
+    // unreclaimable; the abandoned block is now the obsolete generation the
+    // request may reclaim.
+    EXPECT_TRUE(m.note_unpublished(abandoned));
+    void *grown = m.acquire(region, 3, kFourMiB);
+    ASSERT_NE(grown, nullptr);
+    EXPECT_EQ(backend.released, std::vector<void *>{abandoned});
+    EXPECT_EQ(m.reserved_bytes(), kOneMiB + kFourMiB);
     EXPECT_TRUE(m.owns(published));
-    EXPECT_TRUE(m.owns(abandoned));
+    EXPECT_EQ(m.block_bytes(published), kOneMiB);
 }
 
 TEST(WorkspaceManagerBudget, AnIdleCurrentBackingIsNotEvictableForAnotherRegion) {
@@ -779,6 +790,64 @@ TEST(WorkspaceManagerOwnership, AnUnmappableBlockIsKeptRatherThanFreedUnderItsMa
     EXPECT_EQ(m.acquire(region, 3, kFourMiB), nullptr);
     EXPECT_TRUE(backend.released.empty());
     EXPECT_TRUE(m.owns(mapped));
+}
+
+TEST(WorkspaceManagerBudget, AGivenUpClaimStillWaitsForItsLastConsumer) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(kSixMiB, backend.ops()));
+    const WorkspaceManager::RegionKey region = WorkspaceManager::staging_region(0);
+    const WorkspaceManager::RegionKey peer = WorkspaceManager::staging_region(1);
+
+    void *given_up = m.acquire(region, 4, kFourMiB);
+    ASSERT_NE(given_up, nullptr);
+    m.note_published(region, given_up);
+
+    // The region gives up its claim while a run is still using the block — a
+    // detach ordered mid-flight, or a staging aborted after its run had already
+    // registered. The claim is the region's to end; whether the bytes may go is
+    // still the consumer's to answer.
+    EXPECT_TRUE(m.note_unpublished(given_up));
+    EXPECT_EQ(m.live_drainable_consumers(), 1u);
+    EXPECT_EQ(m.block_state(given_up), WorkspaceManager::BlockState::Referenced);
+    EXPECT_EQ(m.acquire(peer, 5, kFourMiB), nullptr);
+    EXPECT_TRUE(backend.released.empty());
+
+    // Once that consumer retires the bytes are reclaimable, and a peer region's
+    // growth takes them.
+    retire(m, 0, 4);
+    void *peer_block = m.acquire(peer, 5, kFourMiB);
+    ASSERT_NE(peer_block, nullptr);
+    EXPECT_EQ(backend.released, std::vector<void *>{given_up});
+    EXPECT_EQ(m.reserved_bytes(), kFourMiB);
+}
+
+TEST(WorkspaceManagerOwnership, AGivenUpClaimLiftsNoQuarantine) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(kSixMiB, backend.ops()));
+    const WorkspaceManager::RegionKey region = WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmSm);
+    const WorkspaceManager::RegionKey peer = WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmHeap);
+
+    void *unprovable = m.acquire(region, 6, kFourMiB);
+    ASSERT_NE(unprovable, nullptr);
+    m.note_published(region, unprovable);
+    // Its context went away, so no further fact about its consumer can arrive.
+    m.note_run_fact(0, 6, WorkspaceManager::RunFact::ContextDestroyed);
+    ASSERT_EQ(m.block_state(unprovable), WorkspaceManager::BlockState::Quarantined);
+
+    // The region may still stop publishing it. What that must not do is turn an
+    // unprovable last consumer into a reclaimable block: nothing here knows
+    // whether those bytes are still being written.
+    EXPECT_TRUE(m.note_unpublished(unprovable));
+    EXPECT_EQ(m.block_state(unprovable), WorkspaceManager::BlockState::Quarantined);
+    EXPECT_TRUE(m.must_keep(unprovable));
+    EXPECT_EQ(m.acquire(peer, 7, kFourMiB), nullptr);
+    EXPECT_TRUE(backend.released.empty());
+    EXPECT_EQ(m.reserved_bytes(), kFourMiB);
+
+    // And an address this manager never owned is not a claim it can end.
+    EXPECT_FALSE(m.note_unpublished(reinterpret_cast<void *>(0xfeed)));
 }
 
 }  // namespace
