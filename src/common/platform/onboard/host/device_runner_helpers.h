@@ -79,10 +79,22 @@ int query_stream_pair_error(rtStream_t aicpu_stream, rtStream_t aicore_stream);
  * it publishes the longer prefix — so a persistently unavailable answer costs
  * every run those bytes.
  *
- * Read-only with respect to the stream pair: it neither readies nor retires it.
+ * Read-only with respect to the stream pair: it neither readies nor retires it,
+ * and it does not touch the calling thread's capture mode.
  *
  * Pass the same stream handle the launch will submit on, resolved and about to
  * be used, so the answer describes the stream that actually carries the launch.
+ *
+ * Who this is asked about, and who it is not: the only callers are the two
+ * program `DeviceRunner` launch paths, and the stream each passes is one the
+ * runner created itself — a2a3's per-run `RunStreamPair`, a5's persistent
+ * `stream_aicpu_`. Neither is ever supplied by a caller, so a capture would
+ * have to begin on a private member. Kernel/persistent mode does not reach
+ * here at all: it publishes once at `prepare_once` and keeps its own streams,
+ * which `tests/st/a2a3/kernel_capture/native/driver.cpp` depends on — that
+ * driver captures a stream of its own, asserts the kernel context's streams are
+ * different objects, and link-wraps this very query as a forbidden call whose
+ * count must stay zero.
  */
 bool launch_entry_args_permitted(rtStream_t aicpu_stream);
 
@@ -332,6 +344,15 @@ private:
  * is Published — the state a kernel submission requires. A non-zero return is
  * the copy's own error and leaves the run unpublished with no launch payload,
  * so the caller reports it with the run NotStarted and submits nothing.
+ *
+ * The copy is a blocking, stream-less `rtMemcpy`, and it happens here rather
+ * than at prepare because the route is a question about the stream this launch
+ * will use. A caller that captured this window would therefore find a
+ * synchronous copy inside it — but it would find more than that: the same
+ * window records this run's boundary events on these streams and
+ * `wait_run_fence` then synchronizes both, neither of which a capture admits
+ * either, and both of which predate the move. Capturing a program run is
+ * outside the current contract for that reason, not for this copy's.
  *
  * Idempotent on an already-published run, which is what lets a launch path call
  * it unconditionally.
