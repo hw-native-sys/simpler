@@ -35,7 +35,7 @@
 #include "cpu_sim_context.h"
 #include "host/host_phase_records_artifact.h"
 #include "host/raii_scope_guard.h"
-#include "host/session_run_boundary.h"
+#include "host/run_boundary.h"
 #include "task_args_wire.h"
 #include "utils/elf_build_id.h"
 
@@ -882,30 +882,31 @@ void SimDeviceRunnerBase::publish_host_phase_records_to_swimlane(uint32_t pipeli
     );
 }
 
-void SimDeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch) {
+int SimDeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch) {
     // Opening a resident collector's window drops the previous run's records and
     // republishes the device level, so it belongs with the start, at launch.
     auto thread_factory = [this](std::function<void()> fn) {
         return create_thread(std::move(fn));
     };
     if (dfx.chip_swimlane_enabled()) {
-        // Same session rule as the onboard base: open once, then admit each run
-        // instead of running the destructive per-run reset.
-        if (dfx_session_enabled_ && !chip_swimlane_collector_.session_active()) {
-            ChipSwimlaneCollector::SessionOptions options;
-            options.enabled = true;
-            if (!chip_swimlane_collector_.session_open(options, dfx.output_prefix)) {
-                LOG_ERROR("ChipSwimlane session could not open; this run collects nothing");
-            }
-        }
-        if (chip_swimlane_collector_.session_active()) {
-            if (!chip_swimlane_collector_.session_run_begin(run_epoch, dfx.output_prefix, dfx.chip_swimlane_level)) {
-                LOG_ERROR("ChipSwimlane session refused run_epoch %llu", static_cast<unsigned long long>(run_epoch));
+        // Same rule as the onboard base: configuration picks the path, and a
+        // run the retaining collector will not admit fails here rather than
+        // falling into the single-run reset, which would drop a predecessor's
+        // records. The reader shards start first because admission waits for
+        // their acknowledgement of the run table.
+        if (chip_swimlane_collector_.retains_runs()) {
+            chip_swimlane_collector_.start(thread_factory);
+            if (!chip_swimlane_collector_.run_begin(run_epoch, dfx.output_prefix, dfx.chip_swimlane_level)) {
+                LOG_ERROR(
+                    "ChipSwimlane: run %llu was not admitted for retained collection",
+                    static_cast<unsigned long long>(run_epoch)
+                );
+                return PTO_RUNTIME_ERR_INTERNAL;
             }
         } else {
             chip_swimlane_collector_.begin_run(dfx.output_prefix, dfx.chip_swimlane_level);
+            chip_swimlane_collector_.start(thread_factory);
         }
-        chip_swimlane_collector_.start(thread_factory);
     }
     if (dfx.dump_args_enabled()) {
         dump_collector_.begin_run(dfx.output_prefix, dfx.dump_args_level);
@@ -919,6 +920,7 @@ void SimDeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &df
         scope_stats_collector_.begin_run();
         scope_stats_collector_.start(thread_factory);
     }
+    return 0;
 }
 
 // The retained bank is indexed by the run's pipeline slot directly, not by a
@@ -936,12 +938,24 @@ uint64_t SimDeviceRunnerBase::arm_chip_swimlane_run_terminal_bank(uint32_t pipel
     return reinterpret_cast<uint64_t>(chip_swimlane_collector_.arm_run_terminal_bank(pipeline_slot, run_epoch));
 }
 
-int SimDeviceRunnerBase::flush_diagnostics(int timeout_ms, std::string *error) {
-    if (!chip_swimlane_collector_.session_active()) return 0;
-    return chip_swimlane_collector_.session_flush(timeout_ms, error) ? 0 : PTO_RUNTIME_ERR_INTERNAL;
+void SimDeviceRunnerBase::withdraw_unlaunched_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch) noexcept {
+    // Same rule as the onboard base: a launch that submitted nothing leaves an
+    // admitted, targetless slot that neither the writer nor a flush can see,
+    // and `kMaxOpenEpochs` of them exhaust the capacity the next admission
+    // waits on. Nothing may escape, for the reason the onboard base gives.
+    if (!dfx.chip_swimlane_enabled()) return;
+    if (!chip_swimlane_collector_.retains_runs()) return;
+    try {
+        (void)chip_swimlane_collector_.abandon_run(run_epoch);
+    } catch (...) {}
 }
 
-void SimDeviceRunnerBase::close_diagnostics_session() { chip_swimlane_collector_.session_close(); }
+int SimDeviceRunnerBase::flush_diagnostics(int timeout_ms, std::string *error) {
+    if (!chip_swimlane_collector_.retains_runs()) return 0;
+    return chip_swimlane_collector_.flush_retained_runs(timeout_ms, error) ? 0 : PTO_RUNTIME_ERR_INTERNAL;
+}
+
+void SimDeviceRunnerBase::finish_retained_runs() { chip_swimlane_collector_.finish_retained_runs(); }
 
 void SimDeviceRunnerBase::write_host_phase_records_artifact(const std::string &output_prefix, uint32_t pipeline_slot) {
     if (pipeline_slot >= host_phase_runs_.size()) return;
@@ -964,13 +978,13 @@ void SimDeviceRunnerBase::teardown_shared_collectors_after_run(
     // and each collector drains before it reconciles before it exports.
     // Diagnostic exports use the per-task output prefix the user set on
     // CallConfig (CallConfig::validate() enforces non-empty upstream).
-    if (dfx.chip_swimlane_enabled() && chip_swimlane_collector_.session_active()) {
+    if (dfx.chip_swimlane_enabled() && chip_swimlane_collector_.retains_runs()) {
         // Both publications precede the epoch's metadata snapshot, which is
         // what copies them. The extensions belong here for the same reason the
         // host phase records do: a5's host_build_graph supplies a real
         // publisher for them at every enabled level, and the collector holds
         // one copy of the sections for every run it serves.
-        simpler::dfx::session::close_session_run(
+        simpler::dfx::runs::close_run_boundary(
             chip_swimlane_collector_, run_epoch, pipeline_slot, device_execution_complete, [this, pipeline_slot] {
                 publish_host_phase_records_to_swimlane(pipeline_slot);
                 publish_chip_swimlane_runtime_extensions();

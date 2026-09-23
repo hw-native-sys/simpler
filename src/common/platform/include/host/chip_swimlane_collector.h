@@ -41,7 +41,7 @@
 
 #include "common/chip_swimlane_extension.h"
 #include "common/chip_swimlane_profiling.h"
-#include "host/chip_swimlane_session.h"
+#include "host/chip_swimlane_runs.h"
 #include "host/collected_record.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
@@ -359,6 +359,8 @@ using ChipSwimlaneFreeCallback = profiling_common::ProfFreeCallback;
  */
 class ChipSwimlaneCollector : public profiling_common::ProfilerBase<ChipSwimlaneCollector, ChipSwimlaneModule> {
 public:
+    using Base = profiling_common::ProfilerBase<ChipSwimlaneCollector, ChipSwimlaneModule>;
+
     ChipSwimlaneCollector() = default;
     ~ChipSwimlaneCollector();
 
@@ -572,6 +574,20 @@ public:
      * @return 0 on success, error code on failure
      */
     int finalize(ChipSwimlaneUnregisterCallback unregister_cb, const ChipSwimlaneFreeCallback &free_cb);
+
+    /**
+     * Join every thread this collector owns, writer first.
+     *
+     * The order is the contract: a seal waits on the reader shards'
+     * acknowledgement that they hold no reference, so the writer has to finish
+     * while those shards are still running. Idempotent, and the sole owner of
+     * the writer's lifetime — no close path joins it, and the only place it is
+     * spawned is the preparation that gives it something to seal.
+     */
+    void stop() {
+        stop_run_writer();
+        Base::stop();
+    }
 
     /**
      * @return true if initialize() succeeded and finalize() has not run.
@@ -933,11 +949,11 @@ public:
         RunTerminalSnapshot terminal_snapshot;
         RunTerminalConsistency terminal_consistency;
 
-        // Session-only. Empty `artifact_path` keeps the legacy location and
+        // Retained runs only. Empty `artifact_path` keeps the legacy location and
         // name; an absent `collection` keeps the legacy metadata object
         // byte-for-byte, which is what makes the default path unchanged.
         std::string artifact_path;
-        simpler::dfx::session::CollectionVerdict collection{};
+        simpler::dfx::runs::CollectionVerdict collection{};
     };
 
     /**
@@ -1098,7 +1114,7 @@ private:
      * One epoch's host-side record storage.
      *
      * The legacy per-run path uses slot 0 and nothing else, so its layout and
-     * lifetime are exactly what they were. A continuous session gives each open
+     * lifetime are exactly what they were. Retaining runs gives each open
      * epoch its own store, which is what lets a predecessor's buffers keep
      * arriving after a successor's `run_begin` — the reset that used to wipe
      * "the" store now only ever clears one epoch's.
@@ -1110,7 +1126,7 @@ private:
         RecordsByCollector<CollectedRecord<ChipSwimlaneAicpuOrchPhaseRecord>> orch_phase;
         std::vector<CollectorShardCounters> counters;
     };
-    std::array<EpochStore, simpler::dfx::session::kMaxOpenEpochs> epoch_stores_{};
+    std::array<EpochStore, simpler::dfx::runs::kMaxOpenEpochs> epoch_stores_{};
 
     EpochStore &store(size_t slot) { return epoch_stores_[slot < epoch_stores_.size() ? slot : 0]; }
     const EpochStore &store(size_t slot) const { return epoch_stores_[slot < epoch_stores_.size() ? slot : 0]; }
@@ -1130,7 +1146,7 @@ private:
     bool has_phase_data_{false};
     // Which epoch store the merged view currently holds, or -1 for none. A
     // bare flag could not tell one epoch's merge from another's, which is how
-    // a session's second seal ends up exporting an empty artifact.
+    // a second seal ends up exporting an empty artifact.
     int merged_slot_{-1};
     // Set once the runner has handed over a pass's host phase records, which is
     // also what makes the host orchestrator this run's record source.
@@ -1141,7 +1157,7 @@ private:
     uint64_t host_phase_submitted_tasks_{0};
     // Set when a run's host-side publication did not complete, so the epoch's
     // metadata snapshot knows the state above describes less than the run
-    // produced. Per run: `session_run_begin` clears it with the state itself.
+    // produced. Per run: `run_begin` clears it with the state itself.
     bool host_state_incomplete_{false};
 
     // The live pool figures reconcile_counters summed for the current run, kept
@@ -1206,14 +1222,14 @@ private:
     RunTerminalConsistency terminal_consistency_{};
 
     // -------------------------------------------------------------------------
-    // Continuous-collection session
+    // Cross-run collection
     // -------------------------------------------------------------------------
 
     enum class EpochState : int {
         Free = 0,
         Admitting,    // run_begin through run_close; buffers may still arrive after the target lands
         Closing,      // admission withdrawn, waiting for every shard to drop its reference
-        Sealed,       // records moved out; the session thread owns them until the file is published
+        Sealed,       // records moved out; the writer owns them until the file is published
         Quarantined,  // a close that could not be proved safe: nothing is moved, nothing is freed
     };
 
@@ -1247,7 +1263,7 @@ private:
         // by whichever collector shard made it and credited when the storage is
         // actually released.
         std::atomic<size_t> charged_bytes{0};
-        simpler::dfx::session::CollectionVerdict verdict{};
+        simpler::dfx::runs::CollectionVerdict verdict{};
     };
 
     /**
@@ -1263,7 +1279,7 @@ private:
             int slot{-1};
             bool retain{true};
         };
-        std::array<Entry, simpler::dfx::session::kMaxOpenEpochs> entries{};
+        std::array<Entry, simpler::dfx::runs::kMaxOpenEpochs> entries{};
         size_t count{0};
 
         int slot_for(uint64_t epoch, bool *retain_out) const {
@@ -1278,15 +1294,10 @@ private:
     };
 
 public:
-    /** Enable knob and its bound; `enabled` false leaves every path as it is. */
-    struct SessionOptions {
-        bool enabled{false};
-        size_t budget_bytes{simpler::dfx::session::kDefaultBudgetBytes};
-    };
-
-    /** Counts a test can assert on without reaching into session internals. */
-    struct SessionStats {
-        bool active{false};
+    /** Counts a test can assert on without reaching into collector internals. */
+    struct RetainedRunStats {
+        // Whether the preparation a retained run needs is in place.
+        bool ready{false};
         // Every epoch that left a readable artifact: settled, content-partial
         // and cut-unknown together. The rows below say which kind each was.
         uint64_t published{0};
@@ -1298,7 +1309,7 @@ public:
         uint64_t late_after_seal{0};
         uint64_t unknown_epoch{0};
         uint64_t no_bucket{0};
-        // AICore records the session sealed as belonging to the epoch that owns
+        // AICore records sealed as belonging to the run that owns
         // them, and records whose stamp matched no open epoch's identity. Summed
         // over every sealed epoch, which is what makes a late predecessor
         // buffer's classification visible at all: the artifact carries the rows
@@ -1315,53 +1326,105 @@ public:
     };
 
     /**
-     * Open a continuous-collection session over this collector.
+     * Whether this collector holds a run past its own boundary, and the host
+     * budget the retained runs' records share. Configuration, latched before
+     * `initialize()`; nothing is allocated here.
      *
-     * Reserves the output directory and the host budget, caps each pool at
-     * twice the paired bytes it has already allocated, arms the fair drain
-     * quantum, and starts the single session thread that seals and publishes.
-     * Returns false and changes nothing on a refused budget or an unusable
-     * output directory.
+     * Off is the shipped shape: each run's window replaces the last and its
+     * artifact is written at its own boundary. On lets a run's records outlive
+     * its boundary — up to `kMaxOpenEpochs` at once — which is what moves the
+     * sealing and the file write off it.
      */
-    bool session_open(const SessionOptions &options, const std::string &output_root);
+    void configure_retained_runs(bool retain_across_runs, size_t budget_bytes);
 
-    /** Close every open epoch, join the session thread, release the budget. */
-    void session_close();
-
-    bool session_active() const { return session_active_.load(std::memory_order_acquire); }
+    /** Whether this collector is configured to hold a run past its boundary. */
+    bool retains_runs() const { return retain_across_runs_; }
 
     /**
-     * Admit one run into the session. Blocks while both slots are occupied —
-     * the session thread is what frees them, and it never waits on a caller —
-     * and fails once the session is fatal.
+     * Open one run's window on a collector that retains runs.
+     *
+     * The first such run also reserves the artifact directory and the host
+     * budget. Blocks while every retained slot is occupied — the writer frees
+     * them and never waits on a caller — and fails once the collector is
+     * fatal.
+     *
+     * False is an admission result, never a configuration answer: it says this
+     * run cannot be retained, not that the collector does not retain runs.
+     * `retains_runs()` answers the second question, and a caller that reads a
+     * refusal as "take the single-run path" would run `begin_run()`, whose
+     * reset drops the records a predecessor is still publishing. So a refusal
+     * fails the run.
      */
-    bool session_run_begin(uint64_t run_epoch, const std::string &output_prefix, ChipSwimlaneLevel level);
+    bool run_begin(uint64_t run_epoch, const std::string &output_prefix, ChipSwimlaneLevel level);
 
     /**
-     * Install this run's target and hand it to the session thread.
+     * Install this run's target and hand it to the writer.
      *
      * Called on the teardown thread while the run still holds its execution
      * claim, which is what makes the per-queue capture consistent: the device
      * has stopped and the successor has not launched.
      */
-    void session_run_close(uint64_t run_epoch, uint32_t bank_index, bool device_execution_complete);
+    void run_close(uint64_t run_epoch, uint32_t bank_index, bool device_execution_complete);
 
     /**
-     * Wait until every epoch up to the current close watermark is published.
+     * Withdraw a run that was admitted and never launched.
+     *
+     * `run_begin` claims a slot before anything is submitted, so a launch that
+     * ends having submitted nothing leaves that slot occupied with no target:
+     * the writer services only closed runs, a flush waits only for them, and
+     * `kMaxOpenEpochs` such runs exhaust the capacity the next admission waits
+     * on. This is the non-publishing counterpart of `run_close` — it withdraws
+     * admission and proves every shard has dropped its reference, exactly as a
+     * seal does, then releases the slot without promising a file, because the
+     * run produced none.
+     *
+     * Acts only on a run matching `run_epoch` that is still admitting and has
+     * no target installed, so a predecessor's records — closed, or open under
+     * another identity — are unreachable from here. An admission that never
+     * happened is a no-op.
+     *
+     * Returns false when the release could not be proved: the storage then
+     * stays quarantined for the reader-join teardown, as it does for any other
+     * unprovable release. Callers must not reach here for a run whose
+     * submission is partial or ambiguous — a device-side producer may still be
+     * writing into that slot.
+     *
+     * Every outcome is published before anything fallible is attempted. The
+     * slot goes back before the line that reports it, and an unprovable
+     * release — including one whose acknowledgement could not be asked for at
+     * all — quarantines with the fatal set and every waiter woken first. So a
+     * diagnostic that cannot allocate can neither strand the slot outside the
+     * writer's service nor replace the failure that brought the caller here.
+     */
+    bool abandon_run(uint64_t run_epoch);
+
+    /**
+     * Stop admitting runs and publish every retained run up to that point.
+     *
+     * The pre-teardown step: it does not join the writer and frees nothing,
+     * because the reader shards whose acknowledgement a seal waits on are
+     * still running. `stop()` owns the writer's lifetime and `finalize()` owns
+     * the storage. Idempotent — a second call finds the watermark already set
+     * and flushes an empty set.
+     */
+    void finish_retained_runs();
+
+    /**
+     * Wait until every run up to the current close watermark is published.
      *
      * Returns false and fills `error` when any of them ended without a file, or
      * when the wait ran out. A published partial is a verdict, not a failure.
      */
-    bool session_flush(int timeout_ms, std::string *error);
+    bool flush_retained_runs(int timeout_ms, std::string *error);
 
     /** Collector-shard hook called by ProfilerBase's poll loop. */
-    void refresh_session_epoch_view(int collector_shard);
+    void refresh_retained_run_view(int collector_shard);
 
     /**
      * Transport progress hook called by ProfilerBase at the transitions a
-     * publisher waits on. Cheap and a no-op with no session open.
+     * publisher waits on. Cheap and a no-op while no run is retained.
      */
-    void session_note_progress();
+    void note_transport_progress();
 
     /**
      * Report that this run's host-side publication did not complete.
@@ -1379,43 +1442,92 @@ public:
      * before this flag — the part a reader depends on — was ever set. Naming
      * the failure is the caller's, after this returns.
      */
-    void session_note_host_state_incomplete();
+    void note_host_state_incomplete();
 
     /**
      * Report that a run's epoch could not be closed.
      *
      * The close is an epoch's only exit and the only thing that hands its slot
-     * back, so a close that failed leaves the session one slot short for the
-     * rest of its life. That is a session-level failure rather than one run's,
+     * back, so a close that failed leaves the collector one slot short for the
+     * rest of its life. That is a collector-level failure rather than one run's,
      * and it belongs where a flush and `close()` both read it.
      *
-     * The sticky flag, the progress bump, the permanent summary's own copy and
-     * the wakeup are all in place before anything that can throw is attempted,
-     * for the same reason: they are what a waiting flush reads, and this runs
-     * where an allocation may have just failed. Two things here can throw and
-     * neither is load-bearing — the human-readable `session_fatal_reason_`,
-     * and the log line, which is not a non-throwing call because an unbound
-     * host logger writes synchronously through a file sink it constructs on
-     * first use. Both are guarded, so failing to name the fatal leaves it
-     * recorded and unnamed rather than unrecorded, and cannot displace the
-     * failure that brought the caller here.
+     * A fixed reason, published through `publish_fatal()`: this runs where an
+     * allocation may have just failed, so nothing a waiter reads may depend on
+     * building a string.
      */
-    void session_note_boundary_close_failed();
+    void note_boundary_close_failed();
 
-    SessionStats session_stats_for_test() const;
+    RetainedRunStats retained_run_stats_for_test() const;
 
 private:
-    bool session_reserve_directory(const std::string &output_root);
-    int session_find_slot(uint64_t run_epoch) const;
-    void session_thread_main();
-    void session_service_once();
-    void session_finish_bucket(size_t slot, simpler::dfx::session::Verdict verdict, const char *detail);
-    bool session_seal_and_publish(size_t slot, simpler::dfx::session::Verdict verdict);
-    int session_publish_file(RunExport &data, const std::string &path);
-    void session_set_fatal(const std::string &reason);
-    void session_release_slot(size_t slot);
-    void session_bump_control_view();
-    size_t session_fixed_overhead() const;
+    bool reserve_artifact_directory(const std::string &output_root, std::string *reserved_dir);
+
+    /**
+     * Take everything retaining a run needs, on the first run that needs it.
+     *
+     * Lazy because `initialize()` is given no output prefix, and reserving a
+     * directory for a run that arms and then fails to launch would leave one
+     * behind. Readiness is the single `retained_ready_` latch and it is
+     * published last: every step before it either succeeded or undid itself,
+     * and a step that fails after the latch undoes the whole preparation, so
+     * no half-prepared collector can be mistaken for a prepared one.
+     */
+    bool ensure_retained_runs_ready(const std::string &output_root);
+
+    /**
+     * Spawn the writer. A no-op before a run can be retained, and idempotent.
+     *
+     * The writer exists exactly while `writer_thread_` is joinable, which is
+     * also the condition `stop_run_writer()` tests — so a spawn that throws
+     * leaves no state claiming a writer that is not there, and the original
+     * exception reaches the caller.
+     */
+    void start_run_writer();
+
+    /** Stop and join the writer. Idempotent, and the only place that joins it. */
+    void stop_run_writer();
+
+    /**
+     * Give back the budget, the caps and the artifact directory.
+     *
+     * Only from `finalize()`, after `stop()` has joined the writer and every
+     * reader shard: a slot still occupied here belonged to a reader, and only
+     * `release_deferred_run_storage()` may touch it.
+     */
+    void release_retained_run_resources();
+
+    int find_run_slot(uint64_t run_epoch) const;
+    void writer_main();
+    void service_retained_runs();
+    void finish_retained_run(size_t slot, simpler::dfx::runs::Verdict verdict, const char *detail);
+    bool seal_and_publish_run(size_t slot, simpler::dfx::runs::Verdict verdict);
+    int publish_run_file(RunExport &data, const std::string &path);
+    /**
+     * Publish the collector's fatal state and wake every waiter, allocating
+     * nothing.
+     *
+     * The sticky flag, the progress bump, the permanent summary's own copy and
+     * the wakeup are all in place before anything that can throw is attempted:
+     * they are what a waiting capacity claim or flush barrier reads, and a
+     * caller often reaches here because an allocation has just failed. Two
+     * things here can throw and neither is load-bearing — the human-readable
+     * `fatal_reason_`, and the log line, which is not a non-throwing call
+     * because an unbound host logger writes synchronously through a file sink
+     * it constructs on first use. Both are guarded, so failing to name the
+     * fatal leaves it recorded and unnamed rather than unrecorded, and cannot
+     * displace the failure that brought the caller here.
+     *
+     * `reason` must outlive the call; the summary copies it into its own fixed
+     * buffer.
+     */
+    void publish_fatal(const char *reason);
+
+    /** `publish_fatal` with a composed reason the caller already built. */
+    void set_fatal(const std::string &reason);
+    void release_run_slot(size_t slot);
+    void bump_control_view();
+    size_t retained_fixed_overhead() const;
     /**
      * Charge host bytes to one epoch before the allocation they pay for.
      *
@@ -1425,8 +1537,8 @@ private:
      * blocking the shard, which would hold up the very acknowledgement the
      * publisher is waiting for.
      */
-    bool session_charge(size_t slot, size_t bytes);
-    void session_credit(size_t slot, size_t bytes);
+    bool charge_run_bytes(size_t slot, size_t bytes);
+    void credit_run_bytes(size_t slot, size_t bytes);
 
     /**
      * Make room for `count` more records in one instance's vector, charged to
@@ -1445,23 +1557,23 @@ private:
      * charged for memory that does not exist.
      */
     template <typename T>
-    bool session_reserve_records(std::vector<T> &dst, uint32_t count, size_t slot) {
+    bool reserve_run_records(std::vector<T> &dst, uint32_t count, size_t slot) {
         const size_t want = dst.size() + static_cast<size_t>(count);
-        // With no session open this is the reservation the legacy path has
+        // With no retained run this is the reservation the legacy path has
         // always made, exceptions and all: nothing about the default path's
         // behaviour is decided by an accountant it does not have.
-        if (!session_active_.load(std::memory_order_acquire)) {
+        if (!retained_ready_.load(std::memory_order_acquire)) {
             dst.reserve(want);
             return true;
         }
         if (want <= dst.capacity()) return true;
         size_t bytes = 0;
-        if (!simpler::dfx::session::checked_bytes(want - dst.capacity(), 2 * sizeof(T), &bytes)) return false;
-        if (!session_charge(slot, bytes)) return false;
+        if (!simpler::dfx::runs::checked_bytes(want - dst.capacity(), 2 * sizeof(T), &bytes)) return false;
+        if (!charge_run_bytes(slot, bytes)) return false;
         try {
             dst.reserve(want);
         } catch (const std::bad_alloc &) {
-            session_credit(slot, bytes);
+            credit_run_bytes(slot, bytes);
             return false;
         }
         return true;
@@ -1474,13 +1586,13 @@ private:
      * even a narrow write into the shadow from this thread would be a second
      * writer on words that have exactly one.
      */
-    bool session_read_shm_field(const volatile void *host_field, void *dst, size_t size);
+    bool read_shm_field(const volatile void *host_field, void *dst, size_t size);
     /** Release storage a close deferred, after the reader threads are joined. */
-    void session_release_deferred_storage();
+    void release_deferred_run_storage();
     /** Earliest instant an unpublished epoch needs servicing again, if any. */
-    std::optional<std::chrono::steady_clock::time_point> session_next_wakeup() const;
+    std::optional<std::chrono::steady_clock::time_point> next_writer_wakeup() const;
     /** Bytes every admitted epoch reserves for metadata a platform maximum bounds. */
-    size_t session_epoch_fixed_bytes() const;
+    size_t retained_run_fixed_bytes() const;
     /**
      * Charge this run's caller-sized metadata, measured at its sources.
      *
@@ -1488,38 +1600,49 @@ private:
      * leaves nothing unaccounted. False means the copies must not be made and
      * the artifact has to say its metadata is incomplete.
      */
-    bool session_admit_run_metadata(size_t slot);
+    bool admit_run_metadata(size_t slot);
 
-    std::atomic<bool> session_active_{false};
-    std::atomic<bool> session_fatal_{false};
-    std::string session_fatal_reason_;
-    std::string session_dir_;
-    uint64_t session_id_{0};
-    std::array<EpochBucket, simpler::dfx::session::kMaxOpenEpochs> session_buckets_{};
+    // Configuration, latched before initialize(); no state of its own.
+    bool retain_across_runs_{false};
+    size_t retained_budget_bytes_{simpler::dfx::runs::kDefaultBudgetBytes};
+    // The whole readiness condition for retaining a run: published by
+    // `ensure_retained_runs_ready()` after every step it takes has succeeded,
+    // and cleared by `release_retained_run_resources()`. Atomic because the
+    // reader shards and the writer test it.
+    std::atomic<bool> retained_ready_{false};
+    std::atomic<bool> fatal_{false};
+    std::string fatal_reason_;
+    std::string artifact_dir_;
+    uint64_t artifact_dir_index_{0};
+    std::array<EpochBucket, simpler::dfx::runs::kMaxOpenEpochs> retained_runs_{};
     std::array<ShardEpochView, profiling_common::BufferPoolManager<ChipSwimlaneModule>::kMaxCollectorShards>
         shard_views_{};
-    mutable std::mutex session_mu_;
-    std::condition_variable session_cv_;
-    std::thread session_thread_;
-    std::atomic<bool> session_thread_running_{false};
-    // Bumped under `session_mu_` by everything the publisher waits on, so a
+    mutable std::mutex retained_mu_;
+    std::condition_variable retained_cv_;
+    std::thread writer_thread_;
+    // The writer's own loop condition, not a record of whether one exists:
+    // `writer_thread_.joinable()` is that record, and the two are set and
+    // cleared together so a failed spawn leaves neither.
+    std::atomic<bool> writer_running_{false};
+    // Bumped under `retained_mu_` by everything the publisher waits on, so a
     // wakeup that lands before the publisher reaches its wait is not lost: it
     // compares the counter it read before servicing against the current one.
-    uint64_t session_progress_{0};
-    // Slots whose storage a close could not prove safe to free. Released only
-    // by `session_release_deferred_storage()`, which the collector's finalize
-    // calls after `stop()` has joined every reader.
-    std::atomic<bool> session_release_deferred_{false};
-    simpler::dfx::session::HostBudget session_budget_;
-    simpler::dfx::session::ErrorSummary session_errors_;
-    std::atomic<uint64_t> session_close_watermark_{0};
-    std::atomic<uint64_t> session_late_after_seal_{0};
-    std::atomic<uint64_t> session_unknown_epoch_{0};
-    std::atomic<uint64_t> session_no_bucket_{0};
-    std::atomic<uint64_t> session_aicore_collected_{0};
-    std::atomic<uint64_t> session_aicore_foreign_{0};
-    std::array<std::atomic<uint64_t>, simpler::dfx::session::kMaxTombstones> session_tombstones_{};
-    std::atomic<size_t> session_tombstone_cursor_{0};
+    uint64_t progress_{0};
+    // Some slot's storage is held pending a reader join. Raised where the
+    // deferral is decided — a quarantined seal, or a slot still occupied at
+    // teardown — and cleared only by `release_deferred_run_storage()`, which
+    // the collector's finalize calls after `stop()` has joined every reader.
+    std::atomic<bool> release_deferred_{false};
+    simpler::dfx::runs::HostBudget host_budget_;
+    simpler::dfx::runs::ErrorSummary run_errors_;
+    std::atomic<uint64_t> close_watermark_{0};
+    std::atomic<uint64_t> late_after_seal_{0};
+    std::atomic<uint64_t> unknown_epoch_{0};
+    std::atomic<uint64_t> no_run_slot_{0};
+    std::atomic<uint64_t> retained_aicore_collected_{0};
+    std::atomic<uint64_t> retained_aicore_foreign_{0};
+    std::array<std::atomic<uint64_t>, simpler::dfx::runs::kMaxTombstones> tombstones_{};
+    std::atomic<size_t> tombstone_cursor_{0};
 
     void reconcile_aicore_counters();
 
@@ -1588,7 +1711,7 @@ private:
     void copy_orch_phase_buffer(const ReadyBufferInfo &info, int collector_shard, size_t slot);
     /**
      * `expected_epoch` is the identity that owns the slot this buffer resolved
-     * to, not the most recently armed run. With a session open the two differ
+     * to, not the most recently armed run. With a retained run the two differ
      * for every late predecessor buffer, which is the case the per-epoch stores
      * exist to serve.
      */
@@ -1597,5 +1720,5 @@ private:
     void reset_epoch_store(size_t slot, bool reset_merged_view);
     void merge_epoch_store(size_t slot);
     RunExport seal_epoch_store(size_t slot);
-    bool session_epoch_is_tombstoned(uint64_t run_epoch) const;
+    bool run_is_tombstoned(uint64_t run_epoch) const;
 };

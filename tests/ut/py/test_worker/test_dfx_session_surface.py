@@ -7,13 +7,13 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ruff: noqa: PLC0415
-"""Public surface of the continuous diagnostic session.
+"""Public surface of cross-run diagnostic collection.
 
 These assert the parts that hold without a device: the admission rules of
 `Worker.flush_diagnostics`, and that the enable flag is a Worker-level option
-travelling the same path `enable_sdma` already takes. What a session actually
-collects is covered by the C++ session cases, which drive the collector, its
-threads and the device-side producer directly.
+travelling the same path `enable_sdma` already takes. What a retained run
+actually collects is covered by the C++ retained-run cases, which drive the
+collector, its threads and the device-side producer directly.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ def _session_worker():
     from simpler.worker import Worker
 
     return Worker(
-        3, device_ids=[0], num_sub_workers=0, platform="a2a3sim", runtime="host_build_graph", dfx_session=True
+        3, device_ids=[0], num_sub_workers=0, platform="a2a3sim", runtime="host_build_graph", collect_across_runs=True
     )
 
 
@@ -61,24 +61,29 @@ def test_dfx_session_is_a_worker_option_and_defaults_off():
     from simpler.task_interface import CallConfig
 
     default_worker = _make_worker(3)
-    assert default_worker._config.get("dfx_session", False) is False
+    assert default_worker._config.get("collect_across_runs", False) is False
 
     enabled = _session_worker()
-    assert enabled._config["dfx_session"] is True
+    assert enabled._config["collect_across_runs"] is True
 
-    assert not hasattr(CallConfig(), "dfx_session"), "the session gate must not be a per-task wire field"
+    assert not hasattr(CallConfig(), "collect_across_runs"), "the gate must not be a per-task wire field"
 
 
 def test_chip_worker_init_accepts_the_session_flag():
     """The flag reaches the native init through the same keyword path
-    `enable_sdma` uses, so a session is latched before the first run."""
+    `enable_sdma` uses, so runs can be retained before the first one starts.
+    The name it shipped under stays accepted beside the canonical one, and
+    neither has a boolean default: `None` is what lets the two be told apart
+    from each other and from not being given at all."""
     import inspect
 
     from simpler.task_interface import ChipWorker
 
     signature = inspect.signature(ChipWorker.init)
-    assert "dfx_session" in signature.parameters
-    assert signature.parameters["dfx_session"].default is False
+    assert "collect_across_runs" in signature.parameters
+    assert signature.parameters["collect_across_runs"].default is None
+    assert "dfx_session" in signature.parameters, "the name this option shipped under stopped being accepted"
+    assert signature.parameters["dfx_session"].default is None
     assert hasattr(ChipWorker, "flush_diagnostics")
 
 
@@ -114,7 +119,7 @@ def test_close_flush_shares_one_budget_across_chips(monkeypatch):
     worker._orch = orch
     # Only counted, never mapped: this phase reads the child count.
     worker._chip_shms = [object(), object(), object(), object()]
-    worker._config["dfx_session"] = True
+    worker._config["collect_across_runs"] = True
 
     assert worker._close_flush_diagnostics() is None
     assert len(orch.budgets) == 4, "a chip was skipped, so one child's artifacts would go unflushed"
@@ -141,7 +146,7 @@ def test_close_flush_aggregates_every_chips_failure():
     orch = _FailingOrch()
     worker._orch = orch
     worker._chip_shms = [object(), object()]
-    worker._config["dfx_session"] = True
+    worker._config["collect_across_runs"] = True
 
     error = worker._close_flush_diagnostics()
     assert orch.calls == 2, "the first failure stopped the phase"

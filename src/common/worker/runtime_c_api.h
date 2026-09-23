@@ -462,17 +462,27 @@ size_t committed_device_memory_ctx(DeviceContextHandle ctx);
 int device_memory_info_ctx(DeviceContextHandle ctx, DeviceMemoryInfo *info);
 
 /**
- * Continuous-collection session gate, latched once at device init.
+ * Let the swimlane collector hold a run past its own boundary. Latched once at
+ * device init.
  *
  * Off by default: every diagnostic path keeps today's behaviour, including the
  * artifact's name and the guarantee that a run's file exists when its `run()`
- * returns. With it on, the swimlane collector keeps one session across runs,
- * a predecessor's host-side ingest and file write overlap the successor's
- * device execution, and the files appear under a reserved session directory.
+ * returns. With it on, a run's records outlive its boundary, a predecessor's
+ * host-side ingest and file write overlap the successor's device execution, and
+ * the files appear under a reserved artifact directory.
  *
  * Separate from `simpler_init` rather than an argument to it: the init
  * signature is resolved by name across the runtime .so boundary, so extending
  * it would break every module that does not ship in lockstep.
+ */
+int simpler_set_retain_runs_ctx(DeviceContextHandle ctx, int32_t enabled);
+
+/**
+ * The name the gate above shipped under, forwarding to it.
+ *
+ * Both are exported by every runtime module built from this tree, and each is
+ * resolved by `dlsym` rather than linked, so a caller and a module from
+ * different builds still find one name in common.
  */
 int simpler_set_dfx_session_ctx(DeviceContextHandle ctx, int32_t enabled);
 
@@ -482,7 +492,7 @@ int simpler_set_dfx_session_ctx(DeviceContextHandle ctx, int32_t enabled);
  * Returns 0 when each promised file exists — a published partial counts, an
  * absent file does not. `error` receives a NUL-terminated reason on failure
  * and is untouched on success. A zero or negative `timeout_ms` waits with the
- * session's own budget.
+ * collector's own budget.
  */
 int simpler_flush_diagnostics_ctx(DeviceContextHandle ctx, int32_t timeout_ms, char *error, size_t error_capacity);
 

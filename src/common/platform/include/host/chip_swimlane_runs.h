@@ -20,15 +20,15 @@
 #include "common/unified_log.h"
 
 /**
- * Continuous-collection session support types: the memory accountant, the
- * per-run verdict carried into the artifact, and the session's permanent
+ * Cross-run collection support types: the memory accountant, the
+ * per-run verdict carried into the artifact, and the collector's permanent
  * error summary.
  *
  * These are host-only and are reached exclusively through the swimlane
- * collector's session path. With the session disabled none of them is
+ * collector's retained-run path. With retention off none of them is
  * constructed against a budget and every collector behaves as it does today.
  */
-namespace simpler::dfx::session {
+namespace simpler::dfx::runs {
 
 // Policy constants. Each is a minimum viable default, not a tuned value; every
 // one of them is a bound the contract promises rather than a performance knob.
@@ -91,6 +91,10 @@ inline bool verdict_publishes(Verdict v) {
 struct CollectionVerdict {
     bool present{false};
     uint64_t run_epoch{0};
+    // Which collector wrote this file, for a reader that finds two artifact
+    // directories under one output root. The field keeps the name it is
+    // published under; the collector member behind it is
+    // `artifact_dir_index_`.
     uint64_t session_id{0};
     bool processing_complete{false};
     // False when the budget could not admit this run's caller-sized metadata —
@@ -106,19 +110,19 @@ struct CollectionVerdict {
 };
 
 /**
- * The session's permanent progress and error record.
+ * The collector's permanent progress and error record.
  *
  * Deliberately not the tombstone ring: that ring exists to classify late
  * buffers and is 16 entries deep, so a flush spanning more epochs than that
  * must not depend on it to remember a failure. Every counter here is
- * cumulative for the session's whole life and the first error is retained
+ * cumulative for the collector's whole life and the first error is retained
  * verbatim, so neither a later flush nor `close()` can forget an earlier
  * failed publication.
  *
- * A session-level fatal is recorded here too, and is an error in its own
+ * A collector-level fatal is recorded here too, and is an error in its own
  * right: a background writer that died before sealing anything leaves no
  * epoch-scoped verdict behind, so an emptiness test over the per-epoch rows
- * would report a clean flush over a session that published nothing.
+ * would report a clean flush over a collector that published nothing.
  */
 class ErrorSummary {
 public:
@@ -159,7 +163,7 @@ public:
     }
 
     /**
-     * A failure that belongs to the session rather than to one epoch.
+     * A failure that belongs to the collector rather than to one run.
      *
      * Epoch zero is the "no snapshot" value everywhere else in this subsystem,
      * so a fatal cannot be represented as `record(0, …)`: the flag below is
@@ -194,7 +198,7 @@ public:
         size_t used = static_cast<size_t>(n) < sizeof(buf) ? static_cast<size_t>(n) : sizeof(buf) - 1;
         if (fatal_ != 0) {
             used += static_cast<size_t>(std::snprintf(
-                buf + used, sizeof(buf) - used, "; session fatal (%llu): %s", static_cast<unsigned long long>(fatal_),
+                buf + used, sizeof(buf) - used, "; collector fatal (%llu): %s", static_cast<unsigned long long>(fatal_),
                 fatal_msg_
             ));
             if (used >= sizeof(buf)) return {buf};
@@ -251,13 +255,13 @@ private:
 };
 
 /**
- * The session's host-memory accountant.
+ * The retained runs' host-memory accountant.
  *
  * Every charge is taken **before** the allocation it pays for, so a refusal
  * never leaves an allocation unaccounted, and a failed allocation releases its
  * charge in the same scope. The fixed part is reserved once at open, which is
  * why `open()` refuses a budget that cannot also hold a minimum working set:
- * a session that could not grow a single record vector would report emptiness
+ * a collector that could not grow a single record vector would report emptiness
  * rather than pressure.
  *
  * Device buffers are not here — they are capped in paired units by the buffer
@@ -268,12 +272,12 @@ class HostBudget {
 public:
     bool open(size_t budget_bytes, size_t fixed_overhead) {
         if (budget_bytes == 0) {
-            LOG_ERROR("ChipSwimlane session: budget must be a positive byte count");
+            LOG_ERROR("ChipSwimlane: budget must be a positive byte count");
             return false;
         }
         if (budget_bytes < fixed_overhead + kMinWorkingSetBytes) {
             LOG_ERROR(
-                "ChipSwimlane session: budget %zu B cannot hold the fixed overhead %zu B plus a %zu B working set",
+                "ChipSwimlane: budget %zu B cannot hold the fixed overhead %zu B plus a %zu B working set",
                 budget_bytes, fixed_overhead, kMinWorkingSetBytes
             );
             return false;
@@ -281,7 +285,7 @@ public:
         limit_.store(budget_bytes, std::memory_order_relaxed);
         charged_.store(fixed_overhead, std::memory_order_relaxed);
         fixed_.store(fixed_overhead, std::memory_order_relaxed);
-        // Session-scoped, like every other figure a session publishes.
+        // Collector-scoped, like every other figure it publishes.
         refusals_.store(0, std::memory_order_relaxed);
         return true;
     }
@@ -367,4 +371,4 @@ inline bool checked_bytes(size_t count, size_t unit, size_t *out) {
     return true;
 }
 
-}  // namespace simpler::dfx::session
+}  // namespace simpler::dfx::runs

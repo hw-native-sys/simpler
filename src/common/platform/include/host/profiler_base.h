@@ -240,7 +240,7 @@
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "host/buffer_pool_manager.h"
-#include "host/chip_swimlane_session.h"
+#include "host/chip_swimlane_runs.h"
 #include "host/profiling_copy.h"
 #include "../../../worker/runtime_c_api.h"
 
@@ -1300,7 +1300,7 @@ protected:
     }
 
     // -------------------------------------------------------------------------
-    // Continuous-session transport cut
+    // Cross-run transport cut
     // -------------------------------------------------------------------------
     //
     // A finite, per-queue proof that one run's published buffers have all been
@@ -1313,7 +1313,7 @@ protected:
     // Every value below is written by exactly one thread: a queue's counters by
     // the drain owner that serves it (owner `q % shard_count_`), a shard's
     // processed counter by that collector thread. Nothing here is read or
-    // written unless a session has armed a slot, so the five other profilers
+    // written unless a run has been retained, so the five other profilers
     // pay one relaxed load per sweep and nothing else.
 
     static constexpr size_t kMaxCutSlots = 2;
@@ -1337,7 +1337,7 @@ protected:
         // thread reads `target`.
         std::array<uint64_t, kMaxCutQueues> target{};
         // 0 unarmed, 1 armed, 2 capture failed. Written by the queue's owner and
-        // read by the session thread, so the access is atomic even though the
+        // read by the writer, so the access is atomic even though the
         // writer is unique.
         std::array<std::atomic<uint8_t>, kMaxCutQueues> qstate{};
         // Per drain owner, published when every queue it serves has reached its
@@ -1360,7 +1360,7 @@ protected:
     int cut_arm(uint64_t *request_out) {
         if (request_out == nullptr) return -1;
         *request_out = 0;
-        if (!simpler::dfx::session::counter_headroom(cut_request_.load(std::memory_order_relaxed))) {
+        if (!simpler::dfx::runs::counter_headroom(cut_request_.load(std::memory_order_relaxed))) {
             note_counter_exhausted("cut request generation");
             return -1;
         }
@@ -1506,22 +1506,22 @@ protected:
      *
      * Zero keeps today's behaviour — drain each queue until it reports empty —
      * which starves a quiet queue while a busy sibling is served, and therefore
-     * starves that queue's stage 1. A session sets a finite quantum; nothing
+     * starves that queue's stage 1. Retaining runs sets a finite quantum; nothing
      * else does.
      */
     void set_drain_quantum(int quantum) { drain_quantum_.store(quantum, std::memory_order_relaxed); }
 
     /**
-     * Arm or disarm the session's per-entry transport counters.
+     * Arm or disarm the per-entry transport counters retention needs.
      *
-     * Armed for a session's whole life, not per cut: a counter that started
+     * Armed for the whole time runs are retained, not per cut: a counter that started
      * counting at the first arm would have missed every entry consumed before
      * it, and stage 1 compares a target captured from that same counter. While
-     * disarmed — which is every profiler that never opens a session — the drain
+     * disarmed — which is every profiler that never retains a run — the drain
      * loop pays one relaxed load per queue visit and the collector one per
      * buffer, and no atomic is written.
      */
-    void set_session_counters(bool on) { session_counters_on_.store(on, std::memory_order_release); }
+    void set_run_counters(bool on) { run_counters_on_.store(on, std::memory_order_release); }
 
     /** A transport counter ran out of headroom; no cut can be trusted after this. */
     bool cut_counters_exhausted() const { return cut_counter_exhausted_.load(std::memory_order_acquire); }
@@ -1530,28 +1530,28 @@ protected:
      * Publish a reference-release request and wait for every collector shard.
      *
      * The shard loads this epoch *before* refreshing its own view of the
-     * session's epoch table, so an ack can never describe a view taken before
+     * retained-run table, so an ack can never describe a view taken before
      * the caller marked an epoch non-admitting. Returns false on timeout, and a
      * false return is never permission to free: the caller quarantines.
      */
-    bool session_request_reference_release(int timeout_ms) {
+    bool request_run_reference_release(int timeout_ms) {
         // One requester at a time. Two overlapping requests would each wait for
         // their own epoch value while a shard, which only ever adopts the
         // newest, could skip the older one entirely — so the older waiter would
         // time out and quarantine a bucket that was in fact released.
-        std::lock_guard<std::mutex> lk(session_control_mu_);
-        if (!simpler::dfx::session::counter_headroom(session_control_epoch_.load(std::memory_order_relaxed))) {
-            note_counter_exhausted("session control epoch");
+        std::lock_guard<std::mutex> lk(control_mu_);
+        if (!simpler::dfx::runs::counter_headroom(control_epoch_.load(std::memory_order_relaxed))) {
+            note_counter_exhausted("retained-run control epoch");
             return false;
         }
-        const uint64_t epoch = session_control_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        const uint64_t epoch = control_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
         manager_.notify_ready_waiters();
         std::unique_lock<std::mutex> wait_lk(cut_mu_);
         return cut_cv_.wait_for(wait_lk, std::chrono::milliseconds(timeout_ms), [this, epoch] {
             for (int i = 0; i < shard_count_; i++) {
                 // `>=` and not `==`: an ack is monotonic, and a shard that has
                 // already moved past this epoch has certainly passed it.
-                if (session_control_acked_[i].load(std::memory_order_acquire) < epoch) return false;
+                if (control_acked_[i].load(std::memory_order_acquire) < epoch) return false;
             }
             return true;
         });
@@ -1565,21 +1565,19 @@ private:
      * A transport counter has come within `kCounterMargin` of wrapping.
      *
      * Reported once and sticky: a wrapped counter makes every target
-     * comparison meaningless, so the session refuses rather than publishing a
+     * comparison meaningless, so the collector refuses rather than publishing a
      * cut it cannot justify. Waiters are woken because the refusal is what they
      * are waiting to learn.
      */
     void note_counter_exhausted(const char *what) {
         bool expected = false;
         if (!cut_counter_exhausted_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
-        LOG_ERROR(
-            "%s: session %s counter is out of headroom; no further cut is trustworthy", Module::kSubsystemName, what
-        );
+        LOG_ERROR("%s: %s counter is out of headroom; no further cut is trustworthy", Module::kSubsystemName, what);
         {
             std::lock_guard<std::mutex> lk(cut_mu_);
             cut_cv_.notify_all();
         }
-        notify_session_progress(0);
+        notify_transport_progress(0);
     }
 
     /**
@@ -1635,12 +1633,12 @@ private:
             bool retired_or_delivered = false;
             for (int q = queue_start; q < queue_count_; q += queue_stride) {
                 // Entry boundary: nothing of this queue's head is half-processed
-                // here, so the session's capture and its stage-1 check see a
+                // here, so the capture and its stage-1 check see a
                 // consistent (head, consumed, queue contents) triple. Checked on
                 // every visit, including a queue that turns out to be empty and
                 // one whose last outcome was a retry, so a busy sibling can never
                 // hide a pending request.
-                session_drain_boundary(header, queue_start, queue_stride);
+                run_drain_boundary(header, queue_start, queue_stride);
                 ReadyEntry entry;
                 int served = 0;
                 const int quantum = drain_quantum_.load(std::memory_order_relaxed);
@@ -1673,9 +1671,9 @@ private:
                     since = std::chrono::steady_clock::time_point{};
                     if (outcome == EntryOutcome::kDropped) {
                         drain_dropped_buffers_.fetch_add(1, std::memory_order_relaxed);
-                        session_note_retired(q);
+                        note_buffer_retired(q);
                     } else {
-                        session_note_delivered(q, queue_start);
+                        note_buffer_delivered(q, queue_start);
                     }
                     if (short_site.free_queue != nullptr) {
                         record_short_site(short_sites, q, short_site);
@@ -1686,7 +1684,7 @@ private:
                     if (quantum > 0 && ++served >= quantum) break;
                 }
             }
-            session_drain_boundary(header, queue_start, queue_stride);
+            run_drain_boundary(header, queue_start, queue_stride);
             if (retired_or_delivered) {
                 idle_busy_polls = 0;
             }
@@ -1744,15 +1742,15 @@ private:
     }
 
     // -------------------------------------------------------------------------
-    // Session cut bookkeeping, all single-writer
+    // Transport cut bookkeeping, all single-writer
     // -------------------------------------------------------------------------
 
     /** Count one entry this owner delivered to its collector shard. */
-    void session_note_delivered(int q, int owner) {
-        if (!session_counters_on_.load(std::memory_order_relaxed)) return;
+    void note_buffer_delivered(int q, int owner) {
+        if (!run_counters_on_.load(std::memory_order_relaxed)) return;
         if (static_cast<size_t>(q) >= kMaxCutQueues || owner < 0 || owner >= Manager::kMaxCollectorShards) return;
-        const bool ok = simpler::dfx::session::checked_increment(consumed_total_[static_cast<size_t>(q)]) &&
-                        simpler::dfx::session::checked_increment(pushed_total_[static_cast<size_t>(owner)]);
+        const bool ok = simpler::dfx::runs::checked_increment(consumed_total_[static_cast<size_t>(q)]) &&
+                        simpler::dfx::runs::checked_increment(pushed_total_[static_cast<size_t>(owner)]);
         if (!ok) note_counter_exhausted("per-queue transport");
     }
 
@@ -1763,10 +1761,10 @@ private:
      * gone and no collector will ever see it — so the target stays reachable.
      * The loss itself is already reported by `drain_dropped_buffers_`.
      */
-    void session_note_retired(int q) {
-        if (!session_counters_on_.load(std::memory_order_relaxed)) return;
+    void note_buffer_retired(int q) {
+        if (!run_counters_on_.load(std::memory_order_relaxed)) return;
         if (static_cast<size_t>(q) >= kMaxCutQueues) return;
-        if (!simpler::dfx::session::checked_increment(consumed_total_[static_cast<size_t>(q)])) {
+        if (!simpler::dfx::runs::checked_increment(consumed_total_[static_cast<size_t>(q)])) {
             note_counter_exhausted("per-queue transport");
         }
     }
@@ -1784,8 +1782,8 @@ private:
      * the ack this pass writes at the end is what proves to a retiring cut that
      * this owner is no longer inside them.
      */
-    void session_drain_boundary(DataHeader *header, int queue_start, int queue_stride) {
-        if (!session_counters_on_.load(std::memory_order_relaxed)) return;
+    void run_drain_boundary(DataHeader *header, int queue_start, int queue_stride) {
+        if (!run_counters_on_.load(std::memory_order_relaxed)) return;
         const uint64_t request = cut_request_.load(std::memory_order_acquire);
         const bool capture_pending = cut_ack_[queue_start].load(std::memory_order_relaxed) < request;
         bool progressed = false;
@@ -1797,7 +1795,7 @@ private:
                 if (s.qstate[static_cast<size_t>(q)].load(std::memory_order_relaxed) != 0) continue;
                 uint32_t tail = 0;
                 uint32_t head = 0;
-                if (!session_capture_queue(header, q, &head, &tail)) {
+                if (!capture_run_queue(header, q, &head, &tail)) {
                     // CaptureFailed: this queue's stage 1 is unknown and is
                     // never satisfied by default.
                     s.qstate[static_cast<size_t>(q)].store(2, std::memory_order_release);
@@ -1838,15 +1836,15 @@ private:
         }
         // Stage 1 is what a publisher waits for, so it is woken by the
         // transition rather than by a timer.
-        if (progressed) notify_session_progress(0);
+        if (progressed) notify_transport_progress(0);
     }
 
     /** Narrow, owner-issued refresh of one queue's cursors. */
-    bool session_capture_queue(DataHeader *header, int q, uint32_t *head_out, uint32_t *tail_out) {
+    bool capture_run_queue(DataHeader *header, int q, uint32_t *head_out, uint32_t *tail_out) {
         if (header == nullptr) return false;
         if (manager_.read_range_from_device(&header->queue_heads[q], sizeof(header->queue_heads[q])) != 0 ||
             manager_.read_range_from_device(&header->queue_tails[q], sizeof(header->queue_tails[q])) != 0) {
-            LOG_ERROR("%s: session cut could not refresh ready_queue cursors for thread %d", Module::kSubsystemName, q);
+            LOG_ERROR("%s: cut could not refresh ready_queue cursors for thread %d", Module::kSubsystemName, q);
             return false;
         }
         rmb();
@@ -1916,7 +1914,7 @@ private:
     }
 
     /**
-     * This shard owes an acknowledgement for the session's epoch table.
+     * This shard owes an acknowledgement for the retained-run table.
      *
      * Part of the ready-ring wait predicate, and level-triggered like the
      * quiescence term: it stays true until the shard stores its ack at the top
@@ -1927,13 +1925,13 @@ private:
      * false, and sleep out the rest of its 100 ms tick. A request that lands
      * between the epoch load at the top of the loop and the wait is the same
      * case with the same answer: the condition is in the predicate, so the wait
-     * returns at once instead of timing out. `session_run_begin` blocks on this
+     * returns at once instead of timing out. `run_begin` blocks on this
      * acknowledgement before a device launch, so that tick would be paid by
      * every run.
      */
-    bool session_control_pending(int shard_index) const {
-        return session_control_epoch_.load(std::memory_order_acquire) !=
-               session_control_acked_[shard_index].load(std::memory_order_relaxed);
+    bool control_pending(int shard_index) const {
+        return control_epoch_.load(std::memory_order_acquire) !=
+               control_acked_[shard_index].load(std::memory_order_relaxed);
     }
 
     /**
@@ -1961,14 +1959,14 @@ private:
             // Reference-release handshake, at the top of every iteration and
             // under load — not only when this shard's ring runs dry. The control
             // epoch is read *before* the snapshot refresh so this ack can never
-            // describe a view taken before the session marked an epoch
+            // describe a view taken before the collector marked a run
             // non-admitting, and it is emitted while this shard holds no bucket
             // reference.
             {
-                const uint64_t ctrl = session_control_epoch_.load(std::memory_order_acquire);
-                if (ctrl != session_control_acked_[shard_index].load(std::memory_order_relaxed)) {
-                    refresh_session_view(shard_index, 0);
-                    session_control_acked_[shard_index].store(ctrl, std::memory_order_release);
+                const uint64_t ctrl = control_epoch_.load(std::memory_order_acquire);
+                if (ctrl != control_acked_[shard_index].load(std::memory_order_relaxed)) {
+                    refresh_retained_run_view(shard_index, 0);
+                    control_acked_[shard_index].store(ctrl, std::memory_order_release);
                     cut_notify_ack();
                 }
             }
@@ -1978,7 +1976,7 @@ private:
             ReadyBufferInfo info;
             if (manager_.wait_pop_ready(info, wait_tick, shard_index, [this, shard_index] {
                     return execution_complete_.load(std::memory_order_acquire) || quiesce_pending(shard_index) ||
-                           session_control_pending(shard_index);
+                           control_pending(shard_index);
                 })) {
                 consume(info, shard_index);
                 has_seen_buffer = true;
@@ -2039,18 +2037,18 @@ private:
         } else {
             static_cast<Derived *>(this)->on_buffer_collected(info);
         }
-        // After the copy, never before: a session's stage 2 is what licenses
+        // After the copy, never before: stage 2 is what licenses
         // moving this shard's records, so the count must not run ahead of them.
-        if (session_counters_on_.load(std::memory_order_relaxed) && shard_index >= 0 &&
+        if (run_counters_on_.load(std::memory_order_relaxed) && shard_index >= 0 &&
             shard_index < Manager::kMaxCollectorShards) {
             const uint64_t processed =
                 ring_processed_[static_cast<size_t>(shard_index)].fetch_add(1, std::memory_order_release) + 1;
-            if (!simpler::dfx::session::counter_headroom(processed, 0)) {
+            if (!simpler::dfx::runs::counter_headroom(processed, 0)) {
                 note_counter_exhausted("per-shard processed");
             }
             // Exactly the instant this shard satisfies an armed cut's stage 2,
             // so the publisher is woken by the event and not by a timer.
-            if (cut_watermark_reached(shard_index, processed)) notify_session_progress(0);
+            if (cut_watermark_reached(shard_index, processed)) notify_transport_progress(0);
         }
         if constexpr (Module::kBufferKinds > 1) {
             (void)manager_.notify_copy_done(info.dev_buffer_ptr, Module::kind_of(info), shard_index);
@@ -2090,7 +2088,7 @@ private:
     std::array<std::atomic<uint64_t>, Manager::kMaxCollectorShards> drain_acked_{};
     std::array<std::atomic<uint64_t>, Manager::kMaxCollectorShards> collect_acked_{};
 
-    // Continuous-session cut state. Inert while no session has armed the
+    // Cross-run cut state. Inert while no run has been retained in the
     // counters: the drain loop pays one relaxed load per queue visit and the
     // collector one per buffer, and no other profiler arms them.
     std::array<CutSlot, kMaxCutSlots> cut_slots_{};
@@ -2100,11 +2098,11 @@ private:
     std::array<std::atomic<uint64_t>, Manager::kMaxCollectorShards> pushed_total_{};
     std::array<std::atomic<uint64_t>, Manager::kMaxCollectorShards> ring_processed_{};
     std::atomic<int> drain_quantum_{0};
-    std::atomic<bool> session_counters_on_{false};
+    std::atomic<bool> run_counters_on_{false};
     std::atomic<bool> cut_counter_exhausted_{false};
-    std::atomic<uint64_t> session_control_epoch_{0};
-    std::array<std::atomic<uint64_t>, Manager::kMaxCollectorShards> session_control_acked_{};
-    std::mutex session_control_mu_;
+    std::atomic<uint64_t> control_epoch_{0};
+    std::array<std::atomic<uint64_t>, Manager::kMaxCollectorShards> control_acked_{};
+    std::mutex control_mu_;
     // Wakeups for the two ack handshakes — capture/retirement and reference
     // release. Both are waited on by a caller and satisfied by a drain owner or
     // a collector shard, so neither side spins.
@@ -2112,31 +2110,31 @@ private:
     std::condition_variable cut_cv_;
 
     /**
-     * Optional Derived hook: refresh that shard's private view of the session's
+     * Optional Derived hook: refresh that shard's private view of the
      * epoch table. A collector that defines no such method gets the `long`
      * overload and no behaviour change — the same overload-rank idiom
      * `refresh_replenish_metadata` already uses here.
      */
     template <typename D = Derived>
-    auto refresh_session_view(int shard_index, int)
-        -> decltype(static_cast<D *>(this)->refresh_session_epoch_view(shard_index), void()) {
-        static_cast<D *>(this)->refresh_session_epoch_view(shard_index);
+    auto refresh_retained_run_view(int shard_index, int)
+        -> decltype(static_cast<D *>(this)->refresh_retained_run_view(shard_index), void()) {
+        static_cast<D *>(this)->refresh_retained_run_view(shard_index);
     }
     template <typename D = Derived>
-    void refresh_session_view(int, long) {}
+    void refresh_retained_run_view(int, long) {}
 
     /**
-     * Optional Derived hook: transport progress a session's publisher is
+     * Optional Derived hook: transport progress the writer is
      * waiting on has happened. Called only at the exact transitions — a
      * stage-1 publication, a shard reaching its watermark, a counter refusal —
      * so the publisher needs no periodic poll to notice them.
      */
     template <typename D = Derived>
-    auto notify_session_progress(int) -> decltype(static_cast<D *>(this)->session_note_progress(), void()) {
-        static_cast<D *>(this)->session_note_progress();
+    auto notify_transport_progress(int) -> decltype(static_cast<D *>(this)->note_transport_progress(), void()) {
+        static_cast<D *>(this)->note_transport_progress();
     }
     template <typename D = Derived>
-    void notify_session_progress(long) {}
+    void notify_transport_progress(long) {}
 };
 
 }  // namespace profiling_common

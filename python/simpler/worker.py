@@ -600,6 +600,24 @@ _ROLLBACK_GRACEFUL_TIMEOUT_S = 10.0
 _CLOSE_CHILD_REAP_TIMEOUT_S = 60.0
 
 
+def _adopt_canonical_collect_across_runs(config: dict) -> dict:
+    """Resolve the cross-run collection opt-in to its canonical config key.
+
+    `collect_across_runs` is the key everything downstream reads;
+    `dfx_session` is the name the option shipped under and resolves to the same
+    key, on the rule the `ChipWorker.init` keywords follow: either spelling
+    alone decides, and the two carrying different values is an error rather
+    than a silent winner. Returns the same mapping it was given.
+    """
+    if "dfx_session" not in config:
+        return config
+    alias = bool(config["dfx_session"])
+    if "collect_across_runs" in config and bool(config["collect_across_runs"]) != alias:
+        raise ValueError("Worker config gives collect_across_runs and dfx_session different values; pass one of them")
+    config["collect_across_runs"] = alias
+    return config
+
+
 def _monotonic() -> float:
     return time.monotonic()
 
@@ -3665,7 +3683,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     enable_sdma: bool = False,
     chip_rank: int | None = None,
     launch_depth: int = 1,
-    dfx_session: bool = False,
+    collect_across_runs: bool = False,
 ) -> None:
     """Runs in forked child process. Loads host_runtime.so in own address space.
 
@@ -3690,7 +3708,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             log_level=log_level,
             prewarm_config=prewarm_config,
             enable_sdma=enable_sdma,
-            dfx_session=dfx_session,
+            collect_across_runs=collect_across_runs,
         )
     except Exception as e:
         _tb.print_exc()
@@ -4933,7 +4951,7 @@ class Worker:
         # Rebound from the level in `init()`; the default matches the C++ table's
         # so a span emitted before init names L3 rather than nothing.
         self._host_span_prefix = _span_prefix(WorkerLevel.node)
-        self._config = config
+        self._config = _adopt_canonical_collect_across_runs(config)
         self._callable_registry: dict[int, Any] = {}
         self._identity_registry: dict[bytes, _CallableIdentityState] = {}
         self._live_handles: dict[int, bytes] = {}
@@ -8187,7 +8205,7 @@ class Worker:
             binaries,
             prewarm_config=self._prewarm_config,
             enable_sdma=bool(self._config.get("enable_sdma", False)),
-            dfx_session=bool(self._config.get("dfx_session", False)),
+            collect_across_runs=bool(self._config.get("collect_across_runs", False)),
         )
 
         # Pre-warm any registered ChipCallable so the first run(handle, …)
@@ -8456,7 +8474,7 @@ class Worker:
                             enable_sdma=bool(self._config.get("enable_sdma", False)),
                             chip_rank=idx,
                             launch_depth=self._launch_depth,
-                            dfx_session=bool(self._config.get("dfx_session", False)),
+                            collect_across_runs=bool(self._config.get("collect_across_runs", False)),
                         )
                     except BaseException as e:  # noqa: BLE001
                         import traceback as _tb  # noqa: PLC0415
@@ -11063,8 +11081,8 @@ class Worker:
     def flush_diagnostics(self, timeout: float | None = None) -> None:
         """Publish every diagnostic run this worker's chip children have closed.
 
-        Only meaningful with ``dfx_session=True``: a session publishes on its
-        own in the background, and this is the barrier that says *the files up
+        Only meaningful with ``collect_across_runs=True``: each chip publishes
+        in the background, and this is the barrier that says *the files up
         to here exist now*. Returns normally when every run up to the close
         watermark has its artifact — a published partial counts, and carries
         its verdict inside the file. Raises ``RuntimeError`` when any of them
@@ -12687,7 +12705,7 @@ class Worker:
         """
         if self.level != 3 or not self._chip_shms or self._orch is None:
             return None
-        if not bool(self._config.get("dfx_session", False)):
+        if not bool(self._config.get("collect_across_runs", False)):
             return None
         deadline = _monotonic() + float(_ROLLBACK_GRACEFUL_TIMEOUT_S)
         errors: list[str] = []

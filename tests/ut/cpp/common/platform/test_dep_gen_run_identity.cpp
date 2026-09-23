@@ -346,7 +346,7 @@ TEST_F(DepGenRunIdentityTest, WindowRecordsRefusesOnlyWhenSeveralRunsShareAWindo
     EXPECT_EQ(epoch, 61u);
 
     // A second run collected without an intervening begin_run() is what
-    // continuous collection will look like. Until session output decides how a
+    // cross-run collection will look like. Until dep_gen output decides how a
     // path names its run, that must not resolve to one graph.
     run_once_without_begin_run(/*epoch=*/62, /*submits=*/1);
     ASSERT_EQ(collect_published(), 1);

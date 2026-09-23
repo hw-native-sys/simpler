@@ -751,8 +751,8 @@ public:
     // One charge covers a device block **and** the host shadow it is paired
     // with, because `alloc_and_register_block` produces both and a real free
     // releases both. On an SVM platform the shadow is the same memory, so it is
-    // counted once. Uncapped unless a caller sets a cap, which only the
-    // continuous-collection session does.
+    // counted once. Uncapped unless a caller sets a cap, which only a
+    // collector retaining runs does.
     //
     // Two figures, because a cap and an occupancy are different questions. The
     // seed is what `init()` allocated and is the only thing a cap is derived
@@ -788,7 +788,7 @@ public:
      * Sticky for the manager's life, and per manager rather than per byte: the
      * release surface reports a status per pointer and carries no size, so the
      * honest granularity is "something was not proved released". A caller whose
-     * correctness rests on a byte bound — the continuous-collection session —
+     * correctness rests on a byte bound — a collector retaining runs —
      * refuses to admit anything while this is set, which is what keeps an
      * unproved release from being spent as capacity.
      */
@@ -799,7 +799,7 @@ public:
         if (!release_unproven_.exchange(true, std::memory_order_acq_rel)) {
             LOG_ERROR(
                 "BufferPoolManager: releasing %p reported %d; paired occupancy stays charged and no further "
-                "capped session is admitted",
+                "capped kind is admitted",
                 dev_ptr, rc
             );
         }
@@ -867,7 +867,7 @@ private:
      * Called from the two places that empty the mapping table and every queue.
      * An empty table is not proof of release, so this reconciles only when
      * every release in that pass reported success: once `release_unproven()` is
-     * set the occupancy stays charged, which keeps a capped session from
+     * set the occupancy stays charged, which keeps a capped pool from
      * spending capacity whose memory may still be held.
      */
     void reset_paired_accounting_locked() {

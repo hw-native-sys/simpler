@@ -219,8 +219,17 @@ def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
     class FakeChipWorker:
         pipeline_depth = 2
 
-        def init(self, device_id, bins, *, log_level, prewarm_config=None, enable_sdma=False, dfx_session=False):
-            events.append(("init", device_id, bins, log_level, prewarm_config, enable_sdma, dfx_session))
+        def init(
+            self,
+            device_id,
+            bins,
+            *,
+            log_level,
+            prewarm_config=None,
+            enable_sdma=False,
+            collect_across_runs=False,
+        ):
+            events.append(("init", device_id, bins, log_level, prewarm_config, enable_sdma, collect_across_runs))
 
         def finalize(self) -> None:
             events.append(("finalize",))

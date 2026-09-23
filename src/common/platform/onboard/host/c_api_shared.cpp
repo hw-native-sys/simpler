@@ -540,10 +540,10 @@ int finalize_device(DeviceContextHandle ctx) {
             LOG_ERROR("finalize_device: native run must be finalized first");
             return PTO_RUNTIME_ERR_INTERNAL;
         }
-        // Publish whatever the session can still publish and join its thread
-        // before any collector storage is released. A no-op when no session is
-        // open, which is the default.
-        runner->close_diagnostics_session();
+        // Publish whatever is still retained before any collector storage is
+        // released. A no-op on a collector that retains no run, which is the
+        // default.
+        runner->finish_retained_runs();
         const int rc = runner->finalize();
         return rc;
     } catch (...) {
@@ -1062,15 +1062,15 @@ int simpler_prepare_run(
         );
         // Rejected before any collector, producer or claim mutation. A
         // host-orchestrated run's orchestrator phases come from a host pool with
-        // its own window rather than from the device producers the session's cut
+        // its own window rather than from the device producers the per-queue cut
         // covers, and whether a bind is host-orchestrating is only known after
         // it has already mutated state — so the level, which is known here, is
-        // what the session refuses on.
-        if (runner->dfx_session_enabled() &&
+        // what the refusal is taken on.
+        if (runner->retains_runs() &&
             config->enable_chip_swimlane >= static_cast<int32_t>(ChipSwimlaneLevel::ORCH_PHASES)) {
             LOG_ERROR(
-                "simpler_prepare_run: dfx_session does not support chip_swimlane level %d (ORCH_PHASES); "
-                "run it without dfx_session",
+                "simpler_prepare_run: retaining runs does not support chip_swimlane level %d (ORCH_PHASES); "
+                "run it without collect_across_runs",
                 config->enable_chip_swimlane
             );
             destroy_native_run_context(state);
@@ -1767,14 +1767,18 @@ size_t committed_device_memory_ctx(DeviceContextHandle ctx) {
     }
 }
 
-int simpler_set_dfx_session_ctx(DeviceContextHandle ctx, int32_t enabled) {
+int simpler_set_retain_runs_ctx(DeviceContextHandle ctx, int32_t enabled) {
     if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
     try {
-        static_cast<DeviceRunnerBase *>(ctx)->set_dfx_session_enabled(enabled != 0);
+        static_cast<DeviceRunnerBase *>(ctx)->set_retain_runs(enabled != 0);
         return 0;
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+}
+
+int simpler_set_dfx_session_ctx(DeviceContextHandle ctx, int32_t enabled) {
+    return simpler_set_retain_runs_ctx(ctx, enabled);
 }
 
 int simpler_flush_diagnostics_ctx(DeviceContextHandle ctx, int32_t timeout_ms, char *error, size_t error_capacity) {

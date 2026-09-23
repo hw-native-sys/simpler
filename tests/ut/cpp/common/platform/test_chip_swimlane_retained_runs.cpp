@@ -9,11 +9,11 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Continuous-collection session: a run's host-side receipt, sealing and file
+ * Retained runs: a run's host-side receipt, sealing and file
  * write continue while the next run executes.
  *
  * These drive the real thing — the collector's mgmt and poll threads, the
- * device-side producer, the per-queue transport cut and the session thread
+ * device-side producer, the per-queue transport cut and the writer
  * that publishes — rather than a model of it. Host and device share process
  * memory here, so nothing below is evidence about device cache visibility.
  */
@@ -37,39 +37,39 @@
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "common/chip_swimlane_profiling.h"
 #include "host/chip_swimlane_collector.h"
-#include "host/session_run_boundary.h"
+#include "host/run_boundary.h"
 
 namespace fs = std::filesystem;
 
 namespace {
 
-void *session_alloc(size_t size) { return std::calloc(1, size); }
+void *retained_alloc(size_t size) { return std::calloc(1, size); }
 
 // An allocator that runs out after a fixed number of successful calls, so a
 // collector's `init()` fails part-way and its rollback guard runs.
 int g_alloc_budget = -1;
 
-void *session_alloc_limited(size_t size) {
+void *retained_alloc_limited(size_t size) {
     if (g_alloc_budget == 0) return nullptr;
     if (g_alloc_budget > 0) g_alloc_budget--;
     return std::calloc(1, size);
 }
 
-int session_free(void *ptr) {
+int retained_free(void *ptr) {
     std::free(ptr);
     return 0;
 }
 
 // A free that reports failure while still reclaiming the memory, so the case
 // leaks nothing and the collector sees only the status a real failure carries.
-int session_free_failing(void *ptr) {
+int retained_free_failing(void *ptr) {
     std::free(ptr);
     return -1;
 }
 
 // A host-mapping registration that refuses, which is what drives `init()` into
 // the cleanup path for a device pointer it never registered with the manager.
-int session_register_failing(void *dev_ptr, size_t size, int device_id, void **host_ptr_out) {
+int retained_register_failing(void *dev_ptr, size_t size, int device_id, void **host_ptr_out) {
     (void)dev_ptr;
     (void)size;
     (void)device_id;
@@ -77,19 +77,19 @@ int session_register_failing(void *dev_ptr, size_t size, int device_id, void **h
     return -1;
 }
 
-std::thread session_thread_factory(std::function<void()> fn) { return std::thread(std::move(fn)); }
+std::thread retained_thread_factory(std::function<void()> fn) { return std::thread(std::move(fn)); }
 
 /** A private output root per case, removed at teardown. */
-class SessionDir {
+class ArtifactRoot {
 public:
-    explicit SessionDir(const char *name) {
-        path_ =
-            fs::temp_directory_path() / ("simpler-dfx-session-" + std::string(name) + "-" + std::to_string(::getpid()));
+    explicit ArtifactRoot(const char *name) {
+        path_ = fs::temp_directory_path() /
+                ("simpler-dfx-retained-" + std::string(name) + "-" + std::to_string(::getpid()));
         std::error_code ec;
         fs::remove_all(path_, ec);
         fs::create_directories(path_, ec);
     }
-    ~SessionDir() {
+    ~ArtifactRoot() {
         std::error_code ec;
         fs::remove_all(path_, ec);
     }
@@ -100,7 +100,7 @@ private:
     fs::path path_;
 };
 
-/** Files a session published, across every reserved session directory. */
+/** Files a collector published, across every reserved artifact directory. */
 std::vector<fs::path> published_files(const fs::path &root) {
     std::vector<fs::path> found;
     std::error_code ec;
@@ -120,37 +120,63 @@ std::string read_file(const fs::path &p) {
 }
 
 /**
- * One collector with its threads running and a session open.
+ * Ordered teardown for a collector a case started for itself.
+ *
+ * A failed `ASSERT_*` returns from the case body, so this belongs on a
+ * destructor rather than at the end of the function: stop admitting, join the
+ * writer, then join the readers and free. Every step is idempotent, so a case
+ * that tears its collector down explicitly — with a free callback of its own,
+ * say — leaves this with nothing to do.
+ */
+class RetainedRunsTeardown {
+public:
+    RetainedRunsTeardown(ChipSwimlaneCollector &collector, ChipSwimlaneFreeCallback free_cb) :
+        collector_(collector),
+        free_cb_(std::move(free_cb)) {}
+    RetainedRunsTeardown(const RetainedRunsTeardown &) = delete;
+    RetainedRunsTeardown &operator=(const RetainedRunsTeardown &) = delete;
+    ~RetainedRunsTeardown() {
+        collector_.finish_retained_runs();
+        collector_.stop();
+        collector_.finalize(nullptr, free_cb_);
+    }
+
+private:
+    ChipSwimlaneCollector &collector_;
+    ChipSwimlaneFreeCallback free_cb_;
+};
+
+/**
+ * One collector with its threads running and a retained run.
  *
  * `aicpu_thread_num` is what gives the run more than one device ready queue,
  * which the cross-queue case needs: a queue is owned by exactly one drain
  * thread and its target may only ever be discharged by its own traffic.
  */
-struct SessionFixture {
+struct RetainedRunsFixture {
     ChipSwimlaneCollector collector;
-    SessionDir dir;
+    ArtifactRoot dir;
     int num_aicore;
 
-    SessionFixture(const char *name, int cores, int threads, size_t budget_bytes = 0) :
+    RetainedRunsFixture(const char *name, int cores, int threads, size_t budget_bytes = 0) :
         dir(name),
         num_aicore(cores) {
         EXPECT_EQ(
             collector.initialize(
-                cores, threads, /*device_id=*/0, ChipSwimlaneLevel::TASK_TIMING, session_alloc, nullptr, session_free
+                cores, threads, /*device_id=*/0, ChipSwimlaneLevel::TASK_TIMING, retained_alloc, nullptr, retained_free
             ),
             0
         );
-        ChipSwimlaneCollector::SessionOptions options;
-        options.enabled = true;
-        if (budget_bytes != 0) options.budget_bytes = budget_bytes;
-        EXPECT_TRUE(collector.session_open(options, dir.str()));
-        collector.start(session_thread_factory);
+        collector.configure_retained_runs(
+            /*retain_across_runs=*/true, budget_bytes != 0 ? budget_bytes : simpler::dfx::runs::kDefaultBudgetBytes
+        );
+        collector.start(retained_thread_factory);
     }
 
-    ~SessionFixture() {
-        collector.session_close();
+    ~RetainedRunsFixture() {
+        collector.finish_retained_runs();
         collector.stop();
-        collector.finalize(nullptr, session_free);
+        collector.finalize(nullptr, retained_free);
     }
 
     void *shm() { return collector.get_chip_swimlane_setup_device_ptr(); }
@@ -158,7 +184,7 @@ struct SessionFixture {
     /** Open a run: arm its bank, admit the epoch, bring the device side up. */
     void begin(uint64_t epoch) {
         ASSERT_NE(shm(), nullptr);
-        EXPECT_TRUE(collector.session_run_begin(epoch, dir.str(), ChipSwimlaneLevel::TASK_TIMING));
+        EXPECT_TRUE(collector.run_begin(epoch, dir.str(), ChipSwimlaneLevel::TASK_TIMING));
         set_platform_run_result(/*region_base=*/0, epoch);
         set_chip_swimlane_enabled(true);
         set_platform_chip_swimlane_base(reinterpret_cast<uint64_t>(shm()));
@@ -184,10 +210,10 @@ struct SessionFixture {
         }
     }
 
-    /** Close the device side of a run, then hand the epoch to the session. */
+    /** Close the device side of a run, then hand the run to the writer. */
     void close(uint64_t epoch, const int *cores, int core_num, int thread_idx = 0) {
         chip_swimlane_aicpu_flush(thread_idx, cores, core_num);
-        collector.session_run_close(epoch, /*bank_index=*/0, /*device_execution_complete=*/true);
+        collector.run_close(epoch, /*bank_index=*/0, /*device_execution_complete=*/true);
     }
 
     /**
@@ -198,7 +224,7 @@ struct SessionFixture {
     template <typename PublishHostState>
     void close_through_boundary(uint64_t epoch, const int *cores, int core_num, PublishHostState &&publish) {
         chip_swimlane_aicpu_flush(/*thread_idx=*/0, cores, core_num);
-        simpler::dfx::session::close_session_run(
+        simpler::dfx::runs::close_run_boundary(
             collector, epoch, /*bank_index=*/0, /*device_execution_complete=*/true,
             std::forward<PublishHostState>(publish)
         );
@@ -249,49 +275,75 @@ std::vector<HostPhaseRecord> host_submit_rows(size_t count) {
 std::string recorded_records_field(size_t count) { return "\"recorded_records\": " + std::to_string(count); }
 
 /**
- * A collector with a session open but no reader threads started.
+ * A collector with a retained run but no reader threads started.
  *
  * This is the shape every unprovable close has: with no collector shard
- * polling, no reference-release acknowledgement can ever land, so the session
+ * polling, no reference-release acknowledgement can ever land, so the collector
  * reaches its fatal and quarantine paths through production code rather than
  * through an injected failure.
  */
-struct ReaderlessSession {
+struct ReaderlessCollector {
     ChipSwimlaneCollector collector;
-    SessionDir dir;
+    ArtifactRoot dir;
 
-    explicit ReaderlessSession(const char *name) :
+    explicit ReaderlessCollector(const char *name) :
         dir(name) {
         EXPECT_EQ(
             collector.initialize(
-                /*cores=*/1, /*threads=*/1, /*device_id=*/0, ChipSwimlaneLevel::TASK_TIMING, session_alloc, nullptr,
-                session_free
+                /*cores=*/1, /*threads=*/1, /*device_id=*/0, ChipSwimlaneLevel::TASK_TIMING, retained_alloc, nullptr,
+                retained_free
             ),
             0
         );
-        ChipSwimlaneCollector::SessionOptions options;
-        options.enabled = true;
-        EXPECT_TRUE(collector.session_open(options, dir.str()));
+        collector.configure_retained_runs(/*retain_across_runs=*/true, simpler::dfx::runs::kDefaultBudgetBytes);
+    }
+
+    /**
+     * Wait until a seal has marked storage as held pending the reader join.
+     *
+     * The seal happens on the writer's own thread, and a `finish` or a `flush`
+     * on a collector that is already fatal returns on that fatal rather than
+     * waiting for it — which is the right contract, because nothing the writer
+     * could still do would change a fatal answer. So a case that is about the
+     * verdict has to await the verdict itself.
+     *
+     * The deferral flag and not the verdict count: `finish_retained_run`
+     * records the row first and raises the flag after retiring the cut, so a
+     * wait on the count could observe the flag still unset. This is the last
+     * thing the quarantine branch publishes before the fatal, so everything
+     * that branch does is visible once it is true.
+     *
+     * Bounded, and an expired deadline fails the caller: the writer is alive
+     * here and `run_close` has already bumped its progress counter, so a
+     * verdict that never arrives is a defect and not a slow machine.
+     */
+    bool wait_for_deferred_release(int timeout_ms = 8000) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (collector.retained_run_stats_for_test().release_deferred) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return collector.retained_run_stats_for_test().release_deferred;
     }
 };
 
 }  // namespace
 
-// Three runs in a row, with nobody calling flush. The session thread is what
+// Three runs in a row, with nobody calling flush. The writer is what
 // frees a slot, so if publication were only a caller's job the third
 // `run_begin` would block for ever against a two-slot cap.
-TEST(ChipSwimlaneSessionTest, ThreeRunsProgressWithoutAnyFlush) {
-    SessionFixture fx("progress", /*cores=*/1, /*threads=*/1);
+TEST(ChipSwimlaneRetainedRunsTest, ThreeRunsProgressWithoutAnyFlush) {
+    RetainedRunsFixture fx("progress", /*cores=*/1, /*threads=*/1);
     const int cores[] = {0};
     for (uint64_t epoch = 9001; epoch <= 9003; epoch++) {
         fx.begin(epoch);
         fx.dispatch(/*core_id=*/0, 4);
         fx.close(epoch, cores, 1);
     }
-    EXPECT_TRUE(fx.wait_for_files(3)) << "the session thread did not publish on its own";
+    EXPECT_TRUE(fx.wait_for_files(3)) << "the writer did not publish on its own";
 
     std::string error;
-    EXPECT_TRUE(fx.collector.session_flush(4000, &error)) << error;
+    EXPECT_TRUE(fx.collector.flush_retained_runs(4000, &error)) << error;
     const auto files = published_files(fx.dir.path());
     ASSERT_EQ(files.size(), 3u);
     for (const auto &f : files) {
@@ -304,8 +356,8 @@ TEST(ChipSwimlaneSessionTest, ThreeRunsProgressWithoutAnyFlush) {
 // A predecessor's records survive a successor's admission. This is the whole
 // point of the per-epoch store: the legacy `begin_run` wipes one shared set,
 // which would take N's buffers away while they are still arriving.
-TEST(ChipSwimlaneSessionTest, PredecessorRecordsSurviveSuccessorAdmission) {
-    SessionFixture fx("overlap", /*cores=*/1, /*threads=*/1);
+TEST(ChipSwimlaneRetainedRunsTest, PredecessorRecordsSurviveSuccessorAdmission) {
+    RetainedRunsFixture fx("overlap", /*cores=*/1, /*threads=*/1);
     const int cores[] = {0};
     constexpr uint64_t kFirst = 9101;
     constexpr uint64_t kSecond = 9102;
@@ -314,7 +366,7 @@ TEST(ChipSwimlaneSessionTest, PredecessorRecordsSurviveSuccessorAdmission) {
     fx.dispatch(/*core_id=*/0, 6);
     chip_swimlane_aicpu_flush(0, cores, 1);
     // The successor is admitted before the predecessor is sealed.
-    fx.collector.session_run_close(kFirst, 0, true);
+    fx.collector.run_close(kFirst, 0, true);
     fx.begin(kSecond);
     fx.dispatch(/*core_id=*/0, 2);
     fx.close(kSecond, cores, 1);
@@ -338,6 +390,142 @@ TEST(ChipSwimlaneSessionTest, PredecessorRecordsSurviveSuccessorAdmission) {
     EXPECT_TRUE(saw_first);
 }
 
+// The refusal side of the same invariant: a run the collector will not admit
+// must leave the predecessor's store untouched. `run_begin` returning false is
+// an admission result, so the runner fails the run on it rather than falling
+// back to `begin_run` — whose reset is what would take the predecessor's
+// records away. Nothing here calls `begin_run`, which is the point: the
+// predecessor's record count is what proves no reset happened.
+TEST(ChipSwimlaneRetainedRunsTest, ARefusedAdmissionKeepsThePredecessorsRecords) {
+    RetainedRunsFixture fx("refusal", /*cores=*/1, /*threads=*/1);
+    constexpr uint64_t kFirst = 9121;
+    constexpr uint64_t kSecond = 9122;
+
+    fx.begin(kFirst);
+    // Handed straight to the collector: no producer is running on this shard,
+    // so this thread is its only writer, and the count is then exact rather
+    // than a wait.
+    ChipSwimlaneAicoreTaskBuffer held{};
+    held.run_epoch = kFirst;
+    held.count = 3;
+    for (uint32_t i = 0; i < held.count; i++) {
+        held.records[i].start_time = 4000 + i;
+        held.records[i].end_time = 5000 + i;
+    }
+    ReadyBufferInfo info{};
+    info.type = ProfBufferType::AICORE_TASK;
+    info.index = 0;
+    info.dev_buffer_ptr = &held;
+    info.host_buffer_ptr = &held;
+    fx.collector.on_buffer_collected(info, /*collector_shard=*/0);
+    ASSERT_EQ(fx.collector.collected_aicore_records_for_test()[0].size(), 3u);
+
+    // Joining the reader shards is what makes the next admission unprovable:
+    // no shard is left to acknowledge the run table, so the collector refuses
+    // the successor and records its own fatal — a refusal reached through
+    // production code rather than an injected failure.
+    fx.collector.stop();
+    EXPECT_FALSE(fx.collector.run_begin(kSecond, fx.dir.str(), ChipSwimlaneLevel::TASK_TIMING));
+    EXPECT_TRUE(fx.collector.retained_run_stats_for_test().fatal);
+
+    EXPECT_EQ(fx.collector.collected_aicore_records_for_test()[0].size(), 3u)
+        << "the refused admission dropped the predecessor's records";
+    EXPECT_TRUE(published_files(fx.dir.path()).empty()) << "a run that was never admitted published an artifact";
+}
+
+// A run the collectors admitted and nothing submitted for gives its slot back.
+// Left in place it is invisible to both the writer and a flush — it has no
+// target — so it would hold retained capacity for the collector's whole life.
+// Two rollbacks through the same single free slot are what prove the capacity
+// actually comes back, and a predecessor open across both must come through
+// untouched. The slot count is asserted before the second admission, because a
+// capacity wait is what an unreleased slot would produce.
+TEST(ChipSwimlaneRetainedRunsTest, UnlaunchedRunsGiveTheirSlotsBackAndKeepAPredecessor) {
+    RetainedRunsFixture fx("abandon", /*cores=*/1, /*threads=*/1);
+    const int cores[] = {0};
+    constexpr uint64_t kKept = 9601;
+    constexpr uint64_t kFirstRolled = 9602;
+    constexpr uint64_t kSecondRolled = 9603;
+
+    // A predecessor that stays open across every rollback below, with records
+    // handed straight to the collector: no producer runs on this shard, so
+    // this thread is its only writer and the count is exact.
+    fx.begin(kKept);
+    ChipSwimlaneAicoreTaskBuffer held{};
+    held.run_epoch = kKept;
+    held.count = 4;
+    for (uint32_t i = 0; i < held.count; i++) {
+        held.records[i].start_time = 7000 + i;
+        held.records[i].end_time = 8000 + i;
+    }
+    ReadyBufferInfo info{};
+    info.type = ProfBufferType::AICORE_TASK;
+    info.index = 0;
+    info.dev_buffer_ptr = &held;
+    info.host_buffer_ptr = &held;
+    fx.collector.on_buffer_collected(info, /*collector_shard=*/0);
+    ASSERT_EQ(fx.collector.collected_aicore_records_for_test()[0].size(), 4u);
+
+    // Admitted, then withdrawn without a launch — the shape a transaction that
+    // ends at `NotStarted` leaves behind.
+    ASSERT_TRUE(fx.collector.run_begin(kFirstRolled, fx.dir.str(), ChipSwimlaneLevel::TASK_TIMING));
+    ASSERT_EQ(fx.collector.retained_run_stats_for_test().open_slots, 2u);
+    ASSERT_TRUE(fx.collector.abandon_run(kFirstRolled)) << "the withdrawal could not prove the references released";
+    ASSERT_EQ(fx.collector.retained_run_stats_for_test().open_slots, 1u)
+        << "the unlaunched run kept its slot, so retained capacity is gone for good";
+
+    // The same free slot again: only a rollback that really released it can
+    // admit this one without waiting for capacity.
+    ASSERT_TRUE(fx.collector.run_begin(kSecondRolled, fx.dir.str(), ChipSwimlaneLevel::TASK_TIMING));
+    ASSERT_TRUE(fx.collector.abandon_run(kSecondRolled));
+    EXPECT_EQ(fx.collector.retained_run_stats_for_test().open_slots, 1u);
+
+    EXPECT_EQ(fx.collector.collected_aicore_records_for_test()[0].size(), 4u)
+        << "a rollback took the predecessor's records";
+    EXPECT_TRUE(published_files(fx.dir.path()).empty()) << "a run that submitted nothing published an artifact";
+    EXPECT_FALSE(fx.collector.retained_run_stats_for_test().fatal);
+
+    // And no rollback is remembered as a lost artifact: the predecessor
+    // publishes and the flush is clean.
+    fx.close(kKept, cores, 1);
+    ASSERT_TRUE(fx.wait_for_files(1));
+    std::string error;
+    EXPECT_TRUE(fx.collector.flush_retained_runs(4000, &error)) << error;
+    EXPECT_EQ(published_files(fx.dir.path()).size(), 1u) << "a withdrawn run left an artifact of its own";
+}
+
+// The other half of the same rollback: a withdrawal whose acknowledgement
+// cannot land must publish that it failed before it reports anything. The
+// deferral flag, the sticky fatal and the waiter wakeup are what a capacity
+// claim and a flush barrier read, and this path runs where an allocation may
+// have just failed — so the slot stays occupied and every one of those is set,
+// rather than the bucket being left mid-withdrawal with nothing said about it.
+TEST(ChipSwimlaneRetainedRunsTest, AnUnprovableWithdrawalQuarantinesAndPublishesItsFailure) {
+    RetainedRunsFixture fx("abandonfail", /*cores=*/1, /*threads=*/1);
+    constexpr uint64_t kEpoch = 9611;
+
+    fx.begin(kEpoch);
+    ASSERT_FALSE(fx.collector.retained_run_stats_for_test().fatal);
+
+    // Joining the reader shards is what makes the withdrawal unprovable: no
+    // shard is left to acknowledge that it dropped its reference.
+    fx.collector.stop();
+    EXPECT_FALSE(fx.collector.abandon_run(kEpoch)) << "a withdrawal no shard acknowledged reported success";
+
+    const auto stats = fx.collector.retained_run_stats_for_test();
+    EXPECT_EQ(stats.open_slots, 1u) << "storage was released without proof that its readers had let go";
+    EXPECT_EQ(stats.quarantined, 1u) << "the unprovable withdrawal reached no quarantine verdict";
+    EXPECT_TRUE(stats.release_deferred) << "storage was not marked as held pending the reader join";
+    EXPECT_TRUE(stats.fatal) << "a waiter would have no way to learn the withdrawal failed";
+    EXPECT_TRUE(published_files(fx.dir.path()).empty()) << "a withdrawn run published an artifact";
+
+    // A flush reports the failure rather than reading the empty per-epoch rows
+    // as a clean collector.
+    std::string error;
+    EXPECT_FALSE(fx.collector.flush_retained_runs(200, &error));
+    EXPECT_NE(error.find("fatal"), std::string::npos) << error;
+}
+
 // A predecessor's AICore buffer that arrives *after* the successor was armed is
 // still the predecessor's. The arm moves the collector's "most recently armed
 // run", so comparing a record's stamp against that field classifies every late
@@ -346,8 +534,8 @@ TEST(ChipSwimlaneSessionTest, PredecessorRecordsSurviveSuccessorAdmission) {
 // AICore is its own path: it is the only producer class whose records carry a
 // per-buffer identity decision, so the AICPU-record cases above do not cover
 // it.
-TEST(ChipSwimlaneSessionTest, LatePredecessorAicoreBufferCountsAsItsOwnEpochsRecords) {
-    SessionFixture fx("lateaicore", /*cores=*/1, /*threads=*/1);
+TEST(ChipSwimlaneRetainedRunsTest, LatePredecessorAicoreBufferCountsAsItsOwnEpochsRecords) {
+    RetainedRunsFixture fx("lateaicore", /*cores=*/1, /*threads=*/1);
     const int cores[] = {0};
     constexpr uint64_t kFirst = 9111;
     constexpr uint64_t kSecond = 9112;
@@ -379,7 +567,7 @@ TEST(ChipSwimlaneSessionTest, LatePredecessorAicoreBufferCountsAsItsOwnEpochsRec
     fx.close(kSecond, cores, 1);
     ASSERT_TRUE(fx.wait_for_files(2));
 
-    const auto stats = fx.collector.session_stats_for_test();
+    const auto stats = fx.collector.retained_run_stats_for_test();
     EXPECT_EQ(stats.aicore_collected, 2u) << "the late buffer's records were not counted as their epoch's";
     EXPECT_EQ(stats.aicore_foreign, 0u) << "a record was charged to an identity its own epoch did not have";
     EXPECT_EQ(stats.unknown_epoch, 0u);
@@ -399,8 +587,8 @@ TEST(ChipSwimlaneSessionTest, LatePredecessorAicoreBufferCountsAsItsOwnEpochsRec
 // Two device ready queues, one owner each. A queue's target may only be
 // discharged by its own traffic: sustained work on queue 0 must not settle a
 // run whose buffer is still sitting on queue 1.
-TEST(ChipSwimlaneSessionTest, OneQueuesTrafficDoesNotDischargeAnother) {
-    SessionFixture fx("twoqueue", /*cores=*/2, /*threads=*/2);
+TEST(ChipSwimlaneRetainedRunsTest, OneQueuesTrafficDoesNotDischargeAnother) {
+    RetainedRunsFixture fx("twoqueue", /*cores=*/2, /*threads=*/2);
     const int all_cores[] = {0, 1};
     constexpr uint64_t kEpoch = 9201;
 
@@ -410,7 +598,7 @@ TEST(ChipSwimlaneSessionTest, OneQueuesTrafficDoesNotDischargeAnother) {
     fx.dispatch(/*core_id=*/1, 5);
     chip_swimlane_aicpu_flush(/*thread_idx=*/0, &all_cores[0], 1);
     chip_swimlane_aicpu_flush(/*thread_idx=*/1, &all_cores[1], 1);
-    fx.collector.session_run_close(kEpoch, 0, true);
+    fx.collector.run_close(kEpoch, 0, true);
 
     ASSERT_TRUE(fx.wait_for_files(1));
     const auto files = published_files(fx.dir.path());
@@ -424,8 +612,8 @@ TEST(ChipSwimlaneSessionTest, OneQueuesTrafficDoesNotDischargeAnother) {
 // A run whose device execution never completed has no terminal to read. It
 // still has to reach a verdict and release its slot, or two such runs would
 // strand the capacity for the rest of the process.
-TEST(ChipSwimlaneSessionTest, RunWithoutTerminalStillPublishesAndReleasesItsSlot) {
-    SessionFixture fx("noterminal", /*cores=*/1, /*threads=*/1);
+TEST(ChipSwimlaneRetainedRunsTest, RunWithoutTerminalStillPublishesAndReleasesItsSlot) {
+    RetainedRunsFixture fx("noterminal", /*cores=*/1, /*threads=*/1);
     const int cores[] = {0};
     constexpr uint64_t kEpoch = 9301;
 
@@ -434,7 +622,7 @@ TEST(ChipSwimlaneSessionTest, RunWithoutTerminalStillPublishesAndReleasesItsSlot
     chip_swimlane_aicpu_flush(0, cores, 1);
     // device_execution_complete = false: the recovery path, where the bank says
     // nothing about this run.
-    fx.collector.session_run_close(kEpoch, 0, /*device_execution_complete=*/false);
+    fx.collector.run_close(kEpoch, 0, /*device_execution_complete=*/false);
 
     ASSERT_TRUE(fx.wait_for_files(1));
     const std::string body = read_file(published_files(fx.dir.path())[0]);
@@ -442,15 +630,15 @@ TEST(ChipSwimlaneSessionTest, RunWithoutTerminalStillPublishesAndReleasesItsSlot
     EXPECT_NE(body.find("partial_cut_unknown"), std::string::npos);
 
     // The slot came back: a further run is admitted without waiting.
-    const auto stats = fx.collector.session_stats_for_test();
+    const auto stats = fx.collector.retained_run_stats_for_test();
     EXPECT_EQ(stats.open_slots, 0u);
     EXPECT_FALSE(stats.fatal);
 }
 
 // A publication that cannot happen must not be silently forgotten: no file, an
-// error from flush, and the slot still released so the session keeps running.
-TEST(ChipSwimlaneSessionTest, WriteFailureIsReportedAndStillReleasesTheSlot) {
-    SessionFixture fx("writefail", /*cores=*/1, /*threads=*/1);
+// error from flush, and the slot still released so the collector keeps running.
+TEST(ChipSwimlaneRetainedRunsTest, WriteFailureIsReportedAndStillReleasesTheSlot) {
+    RetainedRunsFixture fx("writefail", /*cores=*/1, /*threads=*/1);
     const int cores[] = {0};
     constexpr uint64_t kEpoch = 9401;
 
@@ -475,7 +663,7 @@ TEST(ChipSwimlaneSessionTest, WriteFailureIsReportedAndStillReleasesTheSlot) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
     bool reported = false;
     while (std::chrono::steady_clock::now() < deadline) {
-        if (!fx.collector.session_flush(200, &error)) {
+        if (!fx.collector.flush_retained_runs(200, &error)) {
             reported = true;
             break;
         }
@@ -484,17 +672,23 @@ TEST(ChipSwimlaneSessionTest, WriteFailureIsReportedAndStillReleasesTheSlot) {
     EXPECT_TRUE(reported) << "a run that produced no file was reported as a clean flush";
     EXPECT_NE(error.find("write_failed"), std::string::npos) << error;
     EXPECT_EQ(read_file(taken), "not this run's artifact") << "an existing artifact was overwritten";
-    EXPECT_EQ(fx.collector.session_stats_for_test().open_slots, 0u);
+    EXPECT_EQ(fx.collector.retained_run_stats_for_test().open_slots, 0u);
 }
 
 // The tombstone ring holds 16 epochs and exists to classify late buffers. A
 // failure from further back than that must still be reported, which it is only
-// because the session's error summary is separate and never evicted.
-TEST(ChipSwimlaneSessionTest, FailureIsRememberedPastTheTombstoneRing) {
-    SessionFixture fx("memory", /*cores=*/1, /*threads=*/1);
+// because the collector's error summary is separate and never evicted.
+TEST(ChipSwimlaneRetainedRunsTest, FailureIsRememberedPastTheTombstoneRing) {
+    RetainedRunsFixture fx("memory", /*cores=*/1, /*threads=*/1);
     const int cores[] = {0};
     constexpr uint64_t kFailing = 9501;
 
+    fx.begin(kFailing);
+
+    // The artifact directory is reserved by the first admission, so it exists
+    // only from here. The squatter occupies the name this epoch will publish
+    // under, and publication is a `link` that cannot replace — so planting it
+    // any time before the seal is what makes the write fail.
     fs::path taken;
     for (const auto &entry : fs::directory_iterator(fx.dir.path())) {
         if (entry.is_directory()) taken = entry.path() / ("records_e" + std::to_string(kFailing) + ".json");
@@ -505,7 +699,6 @@ TEST(ChipSwimlaneSessionTest, FailureIsRememberedPastTheTombstoneRing) {
         squatter << "occupied";
     }
 
-    fx.begin(kFailing);
     fx.dispatch(0, 1);
     fx.close(kFailing, cores, 1);
 
@@ -525,15 +718,15 @@ TEST(ChipSwimlaneSessionTest, FailureIsRememberedPastTheTombstoneRing) {
     }
 
     std::string error;
-    EXPECT_FALSE(fx.collector.session_flush(4000, &error)) << "the old failure was forgotten";
+    EXPECT_FALSE(fx.collector.flush_retained_runs(4000, &error)) << "the old failure was forgotten";
     EXPECT_NE(error.find("write_failed"), std::string::npos) << error;
     EXPECT_NE(error.find(std::to_string(kFailing)), std::string::npos) << error;
 }
 
-// A buffer whose epoch the session has already sealed is counted and dropped.
-// It must never append to a bucket the session has moved, and never reopen one.
-TEST(ChipSwimlaneSessionTest, LateBufferForASealedEpochIsCountedNotAppended) {
-    SessionFixture fx("late", /*cores=*/1, /*threads=*/1);
+// A buffer whose run the collector has already sealed is counted and dropped.
+// It must never append to a slot the writer has moved, and never reopen one.
+TEST(ChipSwimlaneRetainedRunsTest, LateBufferForASealedEpochIsCountedNotAppended) {
+    RetainedRunsFixture fx("late", /*cores=*/1, /*threads=*/1);
     const int cores[] = {0};
     constexpr uint64_t kEpoch = 9601;
 
@@ -552,7 +745,7 @@ TEST(ChipSwimlaneSessionTest, LateBufferForASealedEpochIsCountedNotAppended) {
     info.host_buffer_ptr = &late;
     fx.collector.on_buffer_collected(info, /*collector_shard=*/0);
 
-    const auto stats = fx.collector.session_stats_for_test();
+    const auto stats = fx.collector.retained_run_stats_for_test();
     EXPECT_EQ(stats.late_after_seal, 1u);
     EXPECT_EQ(stats.unknown_epoch, 0u);
     EXPECT_EQ(published_files(fx.dir.path()).size(), 1u) << "a late buffer produced a second artifact";
@@ -560,8 +753,8 @@ TEST(ChipSwimlaneSessionTest, LateBufferForASealedEpochIsCountedNotAppended) {
 
 // An epoch nobody opened is counted separately from one that was sealed: the
 // two are different facts and the tombstone ring is what tells them apart.
-TEST(ChipSwimlaneSessionTest, BufferForAnUnknownEpochIsCountedSeparately) {
-    SessionFixture fx("unknown", /*cores=*/1, /*threads=*/1);
+TEST(ChipSwimlaneRetainedRunsTest, BufferForAnUnknownEpochIsCountedSeparately) {
+    RetainedRunsFixture fx("unknown", /*cores=*/1, /*threads=*/1);
     fx.begin(9701);
 
     ChipSwimlaneAicoreTaskBuffer stray{};
@@ -574,69 +767,128 @@ TEST(ChipSwimlaneSessionTest, BufferForAnUnknownEpochIsCountedSeparately) {
     info.host_buffer_ptr = &stray;
     fx.collector.on_buffer_collected(info, /*collector_shard=*/0);
 
-    const auto stats = fx.collector.session_stats_for_test();
+    const auto stats = fx.collector.retained_run_stats_for_test();
     EXPECT_EQ(stats.unknown_epoch, 1u);
     EXPECT_EQ(stats.late_after_seal, 0u);
 }
 
-// The session reserves its directory by exclusive creation, so a second
-// session over the same output root cannot land on the first one's files.
-TEST(ChipSwimlaneSessionTest, TwoSessionsOverOneRootReserveDistinctDirectories) {
-    SessionDir root("reserve");
+// A collector reserves its artifact directory by exclusive creation, so a
+// second collector over the same output root cannot land on the first's files.
+TEST(ChipSwimlaneRetainedRunsTest, TwoCollectorsOverOneRootReserveDistinctDirectories) {
+    ArtifactRoot root("reserve");
     ChipSwimlaneCollector first;
     ChipSwimlaneCollector second;
-    ChipSwimlaneCollector::SessionOptions options;
-    options.enabled = true;
-    ASSERT_EQ(first.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, session_alloc, nullptr, session_free), 0);
-    ASSERT_EQ(second.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, session_alloc, nullptr, session_free), 0);
-    EXPECT_TRUE(first.session_open(options, root.str()));
-    EXPECT_TRUE(second.session_open(options, root.str()));
+    // Declared after both collectors, so each is torn down before it is
+    // destroyed and a failed assertion below still joins their threads.
+    RetainedRunsTeardown teardown_first(first, retained_free);
+    RetainedRunsTeardown teardown_second(second, retained_free);
+    ASSERT_EQ(first.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, retained_alloc, nullptr, retained_free), 0);
+    ASSERT_EQ(second.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, retained_alloc, nullptr, retained_free), 0);
+    first.configure_retained_runs(true, simpler::dfx::runs::kDefaultBudgetBytes);
+    second.configure_retained_runs(true, simpler::dfx::runs::kDefaultBudgetBytes);
+    // Reader shards before the first admission, the order both runner bases
+    // take: admitting a run waits for every collector shard to acknowledge the
+    // run table, and `initialize()` creates no shard to acknowledge it.
+    first.start(retained_thread_factory);
+    second.start(retained_thread_factory);
+    EXPECT_TRUE(first.run_begin(1, root.str(), ChipSwimlaneLevel::TASK_TIMING));
+    EXPECT_TRUE(second.run_begin(1, root.str(), ChipSwimlaneLevel::TASK_TIMING));
 
     int dirs = 0;
     for (const auto &entry : fs::directory_iterator(root.path())) {
         if (entry.is_directory()) dirs++;
     }
-    EXPECT_EQ(dirs, 2) << "the second session reused the first one's directory";
-
-    first.session_close();
-    second.session_close();
-    first.finalize(nullptr, session_free);
-    second.finalize(nullptr, session_free);
+    EXPECT_EQ(dirs, 2) << "the second collector reused the first one's directory";
 }
 
-// A budget that cannot hold the fixed overhead plus a working set is refused at
-// open rather than discovered as emptiness later.
-TEST(ChipSwimlaneSessionTest, AnUnworkableBudgetIsRefusedAtOpen) {
-    SessionDir root("budget");
+// A budget that cannot hold the fixed overhead plus a working set is refused
+// when the first run asks to be retained, rather than discovered as emptiness
+// later.
+TEST(ChipSwimlaneRetainedRunsTest, AnUnworkableBudgetIsRefusedAtOpen) {
+    ArtifactRoot root("budget");
     ChipSwimlaneCollector collector;
-    ASSERT_EQ(collector.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, session_alloc, nullptr, session_free), 0);
-    ChipSwimlaneCollector::SessionOptions options;
-    options.enabled = true;
-    options.budget_bytes = 1024;  // below the minimum working set by construction
-    EXPECT_FALSE(collector.session_open(options, root.str()));
-    EXPECT_FALSE(collector.session_active());
-    // Refusing to open leaves the collector usable on the legacy path.
+    ASSERT_EQ(collector.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, retained_alloc, nullptr, retained_free), 0);
+    // Below the minimum working set by construction.
+    collector.configure_retained_runs(/*retain_across_runs=*/true, /*budget_bytes=*/1024);
+    EXPECT_FALSE(collector.run_begin(1, root.str(), ChipSwimlaneLevel::TASK_TIMING));
+    // A refusal costs the collector nothing: the single-run path it would have
+    // taken with retention off still works on it.
     collector.begin_run(root.str(), ChipSwimlaneLevel::TASK_TIMING);
-    collector.finalize(nullptr, session_free);
+    collector.finalize(nullptr, retained_free);
 }
 
-// A session's per-kind paired cap is twice the bytes `init()` seeded, so the
+// Readiness is one latch, taken only after every step of the preparation has
+// succeeded — so a preparation that failed leaves nothing a later run could
+// mistake for a prepared collector, and no directory behind either. The retry
+// then prepares for real, and the two idempotent exits can each be called
+// twice without releasing anything a second time.
+TEST(ChipSwimlaneRetainedRunsTest, AFailedPreparationLeavesNothingReadyAndRetries) {
+    ArtifactRoot root("retry");
+    ChipSwimlaneCollector collector;
+    // The explicit exits below are this case's subject; this one only covers an
+    // early return on a failed assertion, and finds nothing left to do
+    // otherwise.
+    RetainedRunsTeardown teardown(collector, retained_free);
+    ASSERT_EQ(collector.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, retained_alloc, nullptr, retained_free), 0);
+
+    auto artifact_dirs = [&root]() {
+        int dirs = 0;
+        std::error_code ec;
+        for (const auto &entry : fs::directory_iterator(root.path(), ec)) {
+            if (entry.is_directory()) dirs++;
+        }
+        return dirs;
+    };
+
+    // Reader shards before the first admission, which is the order both runner
+    // bases take: admitting a run waits for every shard to acknowledge the run
+    // table.
+    collector.configure_retained_runs(/*retain_across_runs=*/true, /*budget_bytes=*/1024);
+    collector.start(retained_thread_factory);
+
+    // The budget is taken before the directory, so a budget this small refuses
+    // before anything is reserved.
+    EXPECT_FALSE(collector.run_begin(1, root.str(), ChipSwimlaneLevel::TASK_TIMING));
+    EXPECT_EQ(artifact_dirs(), 0) << "a failed preparation left a directory that reads as this collector's";
+
+    // The same collector, a budget that works: the retry prepares and reserves
+    // exactly one directory.
+    collector.configure_retained_runs(/*retain_across_runs=*/true, simpler::dfx::runs::kDefaultBudgetBytes);
+    ASSERT_TRUE(collector.run_begin(2, root.str(), ChipSwimlaneLevel::TASK_TIMING));
+    EXPECT_EQ(artifact_dirs(), 1) << "the retry did not reserve its own directory";
+
+    collector.run_close(2, /*bank_index=*/0, /*device_execution_complete=*/true);
+
+    // Both exits twice. The first pair publishes and stops admitting; the
+    // second finds the watermark already set and the resources already gone.
+    collector.finish_retained_runs();
+    collector.finish_retained_runs();
+    EXPECT_EQ(published_files(root.path()).size(), 1u) << "the retried run did not publish exactly one artifact";
+    collector.stop();
+    collector.finalize(nullptr, retained_free);
+    collector.finalize(nullptr, retained_free);
+    EXPECT_EQ(published_files(root.path()).size(), 1u) << "a second finalize changed what had been published";
+}
+
+// The per-kind paired cap is twice the bytes `init()` seeded, so the
 // seed has to mean one initialization's allocations and nothing else. Two
 // lifecycle events would otherwise inflate it: an aborted init whose rollback
-// frees everything it charged, and a session's own pool growth. Both are
+// frees everything it charged, and the pool's own growth. Both are
 // reachable — the rollback guard runs on any late init failure, and `finalize`
 // permits re-initialization on the same collector.
-TEST(ChipSwimlaneSessionTest, PairedSeedIsPerInitAndUnmovedByGrowth) {
-    SessionDir root("pairedseed");
+TEST(ChipSwimlaneRetainedRunsTest, PairedSeedIsPerInitAndUnmovedByGrowth) {
+    ArtifactRoot root("pairedseed");
     constexpr int kKind = static_cast<int>(ProfBufferType::AICPU_TASK);
 
     // What one clean initialization seeds, and what a finalize leaves behind.
     size_t clean_seed = 0;
     {
         ChipSwimlaneCollector control;
-        ASSERT_EQ(control.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, session_alloc, nullptr, session_free), 0);
+        ASSERT_EQ(
+            control.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, retained_alloc, nullptr, retained_free), 0
+        );
         clean_seed = control.manager().paired_initial(kKind);
-        control.finalize(nullptr, session_free);
+        control.finalize(nullptr, retained_free);
         EXPECT_EQ(control.manager().paired_initial(kKind), 0u) << "finalize left a seed behind for a re-init to add to";
         EXPECT_EQ(control.manager().paired_charged(kKind), 0u);
     }
@@ -647,14 +899,14 @@ TEST(ChipSwimlaneSessionTest, PairedSeedIsPerInitAndUnmovedByGrowth) {
     // finish: the shm block comes first and is charged to no kind.
     g_alloc_budget = 3;
     EXPECT_NE(
-        collector.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, session_alloc_limited, nullptr, session_free), 0
+        collector.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, retained_alloc_limited, nullptr, retained_free), 0
     );
     g_alloc_budget = -1;
-    ASSERT_EQ(collector.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, session_alloc, nullptr, session_free), 0);
+    ASSERT_EQ(collector.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, retained_alloc, nullptr, retained_free), 0);
     EXPECT_EQ(collector.manager().paired_initial(kKind), clean_seed)
         << "the aborted init's charges outlived the rollback that freed them";
 
-    // Growth moves the live total and leaves the seed alone, so a session
+    // Growth moves the live total and leaves the seed alone, so a collector
     // opened after it derives the same cap as one opened before.
     const size_t live_before = collector.manager().paired_charged(kKind);
     const size_t published =
@@ -663,49 +915,55 @@ TEST(ChipSwimlaneSessionTest, PairedSeedIsPerInitAndUnmovedByGrowth) {
     EXPECT_GT(collector.manager().paired_charged(kKind), live_before) << "growth was not charged";
     EXPECT_EQ(collector.manager().paired_initial(kKind), clean_seed) << "growth redefined the seed a cap comes from";
 
-    collector.finalize(nullptr, session_free);
+    collector.finalize(nullptr, retained_free);
 }
 
-// A session's device-side bound is a byte figure, so an emptied mapping table
+// The device-side bound is a byte figure, so an emptied mapping table
 // is not enough to reconcile it: the release surface reports a status per
 // pointer and carries no size, and a release that did not succeed leaves bytes
-// the pool may still hold. Occupancy therefore stays charged, and the session
+// the pool may still hold. Occupancy therefore stays charged, and the collector
 // refuses rather than admitting against a figure it cannot state.
-TEST(ChipSwimlaneSessionTest, UnprovedReleaseKeepsOccupancyAndRefusesAnotherSession) {
-    SessionDir root("unproved");
+TEST(ChipSwimlaneRetainedRunsTest, UnprovedReleaseKeepsOccupancyAndRefusesRetention) {
+    ArtifactRoot root("unproved");
     constexpr int kKind = static_cast<int>(ProfBufferType::AICPU_TASK);
 
     ChipSwimlaneCollector collector;
-    ASSERT_EQ(collector.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, session_alloc, nullptr, session_free), 0);
+    // Declared before the first assertion, so an early return still joins.
+    RetainedRunsTeardown teardown(collector, retained_free);
+    ASSERT_EQ(collector.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, retained_alloc, nullptr, retained_free), 0);
     const size_t seeded = collector.manager().paired_initial(kKind);
     ASSERT_GT(seeded, 0u);
     EXPECT_FALSE(collector.manager().release_unproven());
 
-    // A session opens against a proved-clean pool, and closing it leaves the
-    // seed a reopened session's cap comes from untouched.
-    ChipSwimlaneCollector::SessionOptions options;
-    options.enabled = true;
-    ASSERT_TRUE(collector.session_open(options, root.str()));
-    collector.session_close();
-    ASSERT_TRUE(collector.session_open(options, root.str()));
-    collector.session_close();
-    EXPECT_EQ(collector.manager().paired_initial(kKind), seeded) << "a session reopen moved the seed";
+    // Retention is prepared against a proved-clean pool, and releasing it
+    // leaves the seed a later preparation's cap comes from untouched. The
+    // reader shards start first, the order both runner bases take: admitting a
+    // run waits for every collector shard to acknowledge the run table.
+    collector.configure_retained_runs(true, simpler::dfx::runs::kDefaultBudgetBytes);
+    collector.start(retained_thread_factory);
+    ASSERT_TRUE(collector.run_begin(1, root.str(), ChipSwimlaneLevel::TASK_TIMING));
+    collector.finish_retained_runs();
+    EXPECT_EQ(collector.manager().paired_initial(kKind), seeded) << "preparing retention moved the seed";
 
     // Finalize with a free that reports failure. The mapping table empties
-    // either way, which is exactly why emptiness cannot be the proof.
-    collector.finalize(nullptr, session_free_failing);
+    // either way, which is exactly why emptiness cannot be the proof. This
+    // joins the writer and the reader shards before it frees, as production
+    // does.
+    collector.finalize(nullptr, retained_free_failing);
     EXPECT_TRUE(collector.manager().release_unproven());
     EXPECT_GT(collector.manager().paired_charged(kKind), 0u) << "occupancy was erased without proof of release";
     EXPECT_GT(collector.manager().paired_initial(kKind), 0u);
 
-    // And no further session is admitted against that occupancy.
-    ASSERT_EQ(collector.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, session_alloc, nullptr, session_free), 0);
-    EXPECT_FALSE(collector.session_open(options, root.str()))
-        << "a session was admitted while an unproved release was outstanding";
-    EXPECT_FALSE(collector.session_active());
-    // The legacy path stays usable, as it does for every other refusal.
+    // And no further run is retained against that occupancy. This refusal is
+    // on the unproved release, which the preparation tests before it takes the
+    // budget and before it publishes anything for a shard to acknowledge — so
+    // it needs no reader shard, and starting one would prove nothing about it.
+    ASSERT_EQ(collector.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, retained_alloc, nullptr, retained_free), 0);
+    collector.configure_retained_runs(true, simpler::dfx::runs::kDefaultBudgetBytes);
+    EXPECT_FALSE(collector.run_begin(2, root.str(), ChipSwimlaneLevel::TASK_TIMING))
+        << "a run was retained while an unproved release was outstanding";
+    // The single-run path stays usable, as it does for every other refusal.
     collector.begin_run(root.str(), ChipSwimlaneLevel::TASK_TIMING);
-    collector.finalize(nullptr, session_free);
 }
 
 // The same admission rule has to hold for a buffer that never reached the
@@ -714,40 +972,38 @@ TEST(ChipSwimlaneSessionTest, UnprovedReleaseKeepsOccupancyAndRefusesAnotherSess
 // registering it — so the rollback guard never sees that pointer, and this is
 // the only place the outcome of its release can be recorded. A cleanup that did
 // not report success leaves memory held just the same.
-TEST(ChipSwimlaneSessionTest, UnregisteredInitCleanupFailureAlsoRefusesAnotherSession) {
-    SessionDir root("initcleanup");
+TEST(ChipSwimlaneRetainedRunsTest, UnregisteredInitCleanupFailureAlsoRefusesRetention) {
+    ArtifactRoot root("initcleanup");
     ChipSwimlaneCollector collector;
 
     // Registration refuses on the very first paired allocation, and the free
     // that follows reports failure while still reclaiming the memory.
     EXPECT_NE(
         collector.initialize(
-            1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, session_alloc, session_register_failing, session_free_failing
+            1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, retained_alloc, retained_register_failing, retained_free_failing
         ),
         0
     );
     EXPECT_TRUE(collector.manager().release_unproven())
         << "a cleanup the rollback guard cannot see reported nothing at all";
 
-    // A later initialization succeeds, and the session is still refused: the
+    // A later initialization succeeds, and the run is still not retained: the
     // unproved occupancy belongs to the pool, not to the failed attempt.
-    ASSERT_EQ(collector.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, session_alloc, nullptr, session_free), 0);
-    ChipSwimlaneCollector::SessionOptions options;
-    options.enabled = true;
-    EXPECT_FALSE(collector.session_open(options, root.str()))
-        << "a session was admitted after an unregistered buffer's cleanup failed";
-    EXPECT_FALSE(collector.session_active());
+    ASSERT_EQ(collector.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, retained_alloc, nullptr, retained_free), 0);
+    collector.configure_retained_runs(true, simpler::dfx::runs::kDefaultBudgetBytes);
+    EXPECT_FALSE(collector.run_begin(1, root.str(), ChipSwimlaneLevel::TASK_TIMING))
+        << "a run was retained after an unregistered buffer's cleanup failed";
     collector.begin_run(root.str(), ChipSwimlaneLevel::TASK_TIMING);
-    collector.finalize(nullptr, session_free);
+    collector.finalize(nullptr, retained_free);
 }
 
-// With the session off nothing about the existing path moves: the legacy
+// With retention off nothing about the existing path moves: the legacy
 // artifact name, the legacy location, and no `collection` object.
-TEST(ChipSwimlaneSessionTest, SessionOffKeepsTheLegacyArtifactExactly) {
-    SessionDir root("legacy");
+TEST(ChipSwimlaneRetainedRunsTest, RetentionOffKeepsTheLegacyArtifactExactly) {
+    ArtifactRoot root("legacy");
     ChipSwimlaneCollector collector;
-    ASSERT_EQ(collector.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, session_alloc, nullptr, session_free), 0);
-    EXPECT_FALSE(collector.session_active());
+    ASSERT_EQ(collector.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, retained_alloc, nullptr, retained_free), 0);
+    EXPECT_FALSE(collector.retains_runs());
 
     collector.begin_run(root.str(), ChipSwimlaneLevel::TASK_TIMING);
     set_platform_run_result(0, 9801);
@@ -766,7 +1022,7 @@ TEST(ChipSwimlaneSessionTest, SessionOffKeepsTheLegacyArtifactExactly) {
     const int cores[] = {0};
     chip_swimlane_aicpu_flush(0, cores, 1);
 
-    collector.start(session_thread_factory);
+    collector.start(retained_thread_factory);
     collector.quiesce();
     collector.stop();
     collector.reconcile_counters();
@@ -775,10 +1031,10 @@ TEST(ChipSwimlaneSessionTest, SessionOffKeepsTheLegacyArtifactExactly) {
     const fs::path legacy = root.path() / "chip_swimlane_records.json";
     ASSERT_TRUE(fs::exists(legacy)) << "the legacy artifact name or location changed";
     EXPECT_EQ(read_file(legacy).find("\"collection\""), std::string::npos)
-        << "the default path emitted the session's metadata object";
-    EXPECT_TRUE(published_files(root.path()).empty()) << "the default path created a session directory";
+        << "the default path emitted the retained-run metadata object";
+    EXPECT_TRUE(published_files(root.path()).empty()) << "the default path created an artifact directory";
 
-    collector.finalize(nullptr, session_free);
+    collector.finalize(nullptr, retained_free);
 }
 
 // Six runs over two slots, so every slot is armed, retired and armed again
@@ -787,8 +1043,8 @@ TEST(ChipSwimlaneSessionTest, SessionOffKeepsTheLegacyArtifactExactly) {
 // one of them, and the run whose arrays were overwritten would have its records
 // land in the wrong artifact or in none. Each run's own count in its own file is
 // what rules that out.
-TEST(ChipSwimlaneSessionTest, SlotReuseAcrossRunsKeepsEachRunsRecordsInItsOwnFile) {
-    SessionFixture fx("reuse", /*cores=*/1, /*threads=*/1);
+TEST(ChipSwimlaneRetainedRunsTest, SlotReuseAcrossRunsKeepsEachRunsRecordsInItsOwnFile) {
+    RetainedRunsFixture fx("reuse", /*cores=*/1, /*threads=*/1);
     const int cores[] = {0};
     constexpr uint64_t kBase = 9901;
     constexpr int kRuns = 6;
@@ -799,10 +1055,10 @@ TEST(ChipSwimlaneSessionTest, SlotReuseAcrossRunsKeepsEachRunsRecordsInItsOwnFil
         fx.dispatch(/*core_id=*/0, i + 1);
         fx.close(epoch, cores, 1);
     }
-    ASSERT_TRUE(fx.wait_for_files(kRuns)) << "the session did not publish every run";
+    ASSERT_TRUE(fx.wait_for_files(kRuns)) << "the collector did not publish every run";
 
     std::string error;
-    EXPECT_TRUE(fx.collector.session_flush(8000, &error)) << error;
+    EXPECT_TRUE(fx.collector.flush_retained_runs(8000, &error)) << error;
     for (int i = 0; i < kRuns; i++) {
         const uint64_t epoch = kBase + static_cast<uint64_t>(i);
         const fs::path expected = fx.dir.path() / "swimlane-0" / ("records_e" + std::to_string(epoch) + ".json");
@@ -810,17 +1066,17 @@ TEST(ChipSwimlaneSessionTest, SlotReuseAcrossRunsKeepsEachRunsRecordsInItsOwnFil
         EXPECT_EQ(rows_for_epoch(read_file(expected), epoch), static_cast<size_t>(i + 1))
             << "epoch " << epoch << " did not carry exactly its own records";
     }
-    EXPECT_EQ(fx.collector.session_stats_for_test().open_slots, 0u);
+    EXPECT_EQ(fx.collector.retained_run_stats_for_test().open_slots, 0u);
 }
 
 // The host budget is a bound on retained records, not a number in a log line.
 // Past it the epoch stops retaining, keeps its receipts, and publishes an
 // artifact that says its content is incomplete — and the charge never goes
-// beyond the limit the session was opened with.
-TEST(ChipSwimlaneSessionTest, BudgetExhaustionStopsRetentionAndPublishesAPartial) {
+// beyond the limit retention was configured with.
+TEST(ChipSwimlaneRetainedRunsTest, BudgetExhaustionStopsRetentionAndPublishesAPartial) {
     // Fixed overhead plus a little over the minimum working set.
     constexpr size_t kBudget = 18ull * 1024 * 1024;
-    SessionFixture fx("exhaust", /*cores=*/1, /*threads=*/1, kBudget);
+    RetainedRunsFixture fx("exhaust", /*cores=*/1, /*threads=*/1, kBudget);
     const int cores[] = {0};
     constexpr uint64_t kEpoch = 9801;
     fx.begin(kEpoch);
@@ -848,9 +1104,9 @@ TEST(ChipSwimlaneSessionTest, BudgetExhaustionStopsRetentionAndPublishesAPartial
     size_t fed = 0;
     for (; fed < cap; fed++) {
         fx.collector.on_buffer_collected(info, /*collector_shard=*/0);
-        if (fx.collector.session_stats_for_test().budget_refusals > 0) break;
+        if (fx.collector.retained_run_stats_for_test().budget_refusals > 0) break;
     }
-    const auto stats = fx.collector.session_stats_for_test();
+    const auto stats = fx.collector.retained_run_stats_for_test();
     ASSERT_GT(stats.budget_refusals, 0u) << "fed " << fed << " buffers of " << per_buffer << " B without a refusal";
     EXPECT_LE(stats.host_charged, kBudget) << "the charge went past the budget it was opened with";
     EXPECT_FALSE(stats.fatal);
@@ -861,58 +1117,76 @@ TEST(ChipSwimlaneSessionTest, BudgetExhaustionStopsRetentionAndPublishesAPartial
     EXPECT_NE(body.find("partial_safe"), std::string::npos) << body.substr(0, 600);
 }
 
-// A session whose control handshake never completes is fatal before any epoch
+// A collector whose control handshake never completes is fatal before any epoch
 // has a verdict of its own. Flush has to fail on the fatal itself: the
 // per-epoch rows are empty, and reading empty as clean would report a
-// successful flush over a session that wrote nothing.
-TEST(ChipSwimlaneSessionTest, FatalWithNoEpochVerdictStillFailsFlush) {
-    ReaderlessSession rs("fatalflush");
+// successful flush over a collector that wrote nothing.
+TEST(ChipSwimlaneRetainedRunsTest, FatalWithNoEpochVerdictStillFailsFlush) {
+    ReaderlessCollector rs("fatalflush");
 
     // No collector shard is polling, so the epoch table can never be
-    // acknowledged and admission ends in the session's fatal.
-    EXPECT_FALSE(rs.collector.session_run_begin(9001, rs.dir.str(), ChipSwimlaneLevel::TASK_TIMING));
-    ASSERT_TRUE(rs.collector.session_stats_for_test().fatal);
-    EXPECT_EQ(rs.collector.session_stats_for_test().published, 0u);
+    // acknowledged and admission ends in the collector's fatal.
+    EXPECT_FALSE(rs.collector.run_begin(9001, rs.dir.str(), ChipSwimlaneLevel::TASK_TIMING));
+    ASSERT_TRUE(rs.collector.retained_run_stats_for_test().fatal);
+    EXPECT_EQ(rs.collector.retained_run_stats_for_test().published, 0u);
 
     std::string error;
-    EXPECT_FALSE(rs.collector.session_flush(200, &error)) << "a fatal session reported a successful flush";
+    EXPECT_FALSE(rs.collector.flush_retained_runs(200, &error)) << "a fatal collector reported a successful flush";
     EXPECT_NE(error.find("fatal"), std::string::npos) << error;
     EXPECT_TRUE(published_files(rs.dir.path()).empty());
 
-    rs.collector.session_close();
+    rs.collector.finish_retained_runs();
     rs.collector.stop();
-    rs.collector.finalize(nullptr, session_free);
+    rs.collector.finalize(nullptr, retained_free);
 }
 
 // A close cannot prove a stalled reader has let go, so it must not free that
 // epoch's storage. The publisher's join says nothing about the collector
 // shards, and the production close path runs before they are joined at all —
 // so the release waits for `finalize()`, which joins them first.
-TEST(ChipSwimlaneSessionTest, CloseDefersQuarantinedStorageUntilReadersAreJoined) {
-    ReaderlessSession rs("deferred");
+//
+// The shape: no shard ever polls, which is what makes every acknowledgement
+// unprovable. That also makes admission itself end in the collector's fatal,
+// so this case names that state rather than assuming a clean admission, and it
+// awaits the seal's verdict on its own observable rather than through a
+// `finish` that returns on the fatal.
+TEST(ChipSwimlaneRetainedRunsTest, CloseDefersQuarantinedStorageUntilReadersAreJoined) {
+    ReaderlessCollector rs("deferred");
     constexpr uint64_t kEpoch = 9002;
 
-    EXPECT_FALSE(rs.collector.session_run_begin(kEpoch, rs.dir.str(), ChipSwimlaneLevel::TASK_TIMING));
-    // The epoch is open and now has a target, so the publisher tries to seal it
-    // and cannot prove the reference released. `session_close` waits for that
-    // attempt to reach its verdict before it returns.
-    rs.collector.session_run_close(kEpoch, /*bank_index=*/0, /*device_execution_complete=*/true);
-    rs.collector.session_close();
+    // Admission publishes the fatal, because the epoch table can never be
+    // acknowledged. The slot is claimed either way, which is what gives the
+    // writer something to seal below.
+    EXPECT_FALSE(rs.collector.run_begin(kEpoch, rs.dir.str(), ChipSwimlaneLevel::TASK_TIMING));
+    ASSERT_TRUE(rs.collector.retained_run_stats_for_test().fatal);
+    ASSERT_EQ(rs.collector.retained_run_stats_for_test().open_slots, 1u);
 
-    const auto after_close = rs.collector.session_stats_for_test();
-    EXPECT_EQ(after_close.open_slots, 1u) << "close freed storage a stalled reader may still hold";
-    EXPECT_TRUE(after_close.release_deferred);
+    // The epoch now has a target, so the writer seals it and cannot prove the
+    // reference released. `finish_retained_runs` is still called, because that
+    // is what production does, but its flush returns on the fatal — so the
+    // verdict is awaited directly.
+    rs.collector.run_close(kEpoch, /*bank_index=*/0, /*device_execution_complete=*/true);
+    rs.collector.finish_retained_runs();
+    ASSERT_TRUE(rs.wait_for_deferred_release()) << "the unprovable seal never reached a quarantine verdict";
+
+    // Reached that verdict without freeing anything: the slot is still
+    // occupied, the verdict says the reference was never proved released, and
+    // no file was written. The verdict row is recorded before the flag waited
+    // on above, so reading it here cannot race the seal.
+    const auto after_close = rs.collector.retained_run_stats_for_test();
+    EXPECT_EQ(after_close.open_slots, 1u) << "the seal freed storage a stalled reader may still hold";
+    EXPECT_EQ(after_close.quarantined, 1u) << "the storage was held on something other than a quarantine";
     EXPECT_TRUE(published_files(rs.dir.path()).empty());
 
     // stop() joins every reader; only then may the storage go back.
     rs.collector.stop();
-    rs.collector.finalize(nullptr, session_free);
-    const auto after_join = rs.collector.session_stats_for_test();
+    rs.collector.finalize(nullptr, retained_free);
+    const auto after_join = rs.collector.retained_run_stats_for_test();
     EXPECT_EQ(after_join.open_slots, 0u) << "the deferred release did not happen after the readers were joined";
     EXPECT_FALSE(after_join.release_deferred);
 }
 
-// `session_run_begin` blocks on the epoch table being acknowledged by every
+// `run_begin` blocks on the epoch table being acknowledged by every
 // collector shard, and a shard with an empty ready ring is asleep in a 100 ms
 // cv tick. Notifying that ring is not enough on its own: the notification
 // advances no ready shard's state epoch, so a predicate that knows nothing
@@ -921,8 +1195,8 @@ TEST(ChipSwimlaneSessionTest, CloseDefersQuarantinedStorageUntilReadersAreJoined
 // instead of a timer. Timed with the ring deliberately empty and each epoch
 // published before the next admission, so the interval measured contains the
 // handshake and not a wait for capacity.
-TEST(ChipSwimlaneSessionTest, ControlHandshakeWakesAnIdleCollectorWithoutItsRingTick) {
-    SessionFixture fx("ctrlwake", /*cores=*/1, /*threads=*/1);
+TEST(ChipSwimlaneRetainedRunsTest, ControlHandshakeWakesAnIdleCollectorWithoutItsRingTick) {
+    RetainedRunsFixture fx("ctrlwake", /*cores=*/1, /*threads=*/1);
     const int cores[] = {0};
     constexpr uint64_t kBase = 9951;
     constexpr int kCycles = 8;
@@ -934,7 +1208,7 @@ TEST(ChipSwimlaneSessionTest, ControlHandshakeWakesAnIdleCollectorWithoutItsRing
     for (int i = 0; i < kCycles; i++) {
         const uint64_t epoch = kBase + static_cast<uint64_t>(i);
         const auto started = std::chrono::steady_clock::now();
-        ASSERT_TRUE(fx.collector.session_run_begin(epoch, fx.dir.str(), ChipSwimlaneLevel::TASK_TIMING));
+        ASSERT_TRUE(fx.collector.run_begin(epoch, fx.dir.str(), ChipSwimlaneLevel::TASK_TIMING));
         admitting += std::chrono::steady_clock::now() - started;
 
         set_platform_run_result(/*region_base=*/0, epoch);
@@ -961,9 +1235,9 @@ TEST(ChipSwimlaneSessionTest, ControlHandshakeWakesAnIdleCollectorWithoutItsRing
 // storage the budget said it could not pay for, or by freeing records whose
 // readers have not been released — so the copy never happens, the artifact
 // says its metadata is incomplete, and the charge stays inside the limit.
-TEST(ChipSwimlaneSessionTest, OversizedRunMetadataIsRefusedBeforeItIsCopied) {
+TEST(ChipSwimlaneRetainedRunsTest, OversizedRunMetadataIsRefusedBeforeItIsCopied) {
     constexpr size_t kBudget = 18ull * 1024 * 1024;
-    SessionFixture fx("metabudget", /*cores=*/1, /*threads=*/1, kBudget);
+    RetainedRunsFixture fx("metabudget", /*cores=*/1, /*threads=*/1, kBudget);
     const int cores[] = {0};
     constexpr uint64_t kEpoch = 9851;
 
@@ -990,7 +1264,7 @@ TEST(ChipSwimlaneSessionTest, OversizedRunMetadataIsRefusedBeforeItIsCopied) {
     EXPECT_EQ(body.find(marker), std::string::npos) << "the refused metadata was copied into the artifact anyway";
     EXPECT_NE(body.find("partial_safe"), std::string::npos) << "an incomplete artifact was reported as settled";
 
-    const auto stats = fx.collector.session_stats_for_test();
+    const auto stats = fx.collector.retained_run_stats_for_test();
     EXPECT_LE(stats.host_charged, kBudget) << "the refused charge was taken anyway";
     EXPECT_GT(stats.budget_refusals, 0u);
     // The epoch's own records survived the refusal: only the metadata was
@@ -998,15 +1272,15 @@ TEST(ChipSwimlaneSessionTest, OversizedRunMetadataIsRefusedBeforeItIsCopied) {
     EXPECT_EQ(rows_for_epoch(body, kEpoch), 3u) << "the refusal took this epoch's records with it";
 }
 
-// Two session runs, each publishing host phase records of its own. The epoch's
+// Two retained runs, each publishing host phase records of its own. The epoch's
 // metadata snapshot copies whatever the collector holds when the run closes,
 // and the collector holds one copy of it across every run it serves — so the
 // artifact describes its own run only when the publication precedes the
 // snapshot. Driven through the boundary helper both runner bases call, which
 // is where that order lives. The two runs publish different counts, which is
 // what the metadata reports at every level.
-TEST(ChipSwimlaneSessionTest, HostPhaseRecordsReachTheEpochThatProducedThem) {
-    SessionFixture fx("host-phase-own-epoch", /*cores=*/1, /*threads=*/1);
+TEST(ChipSwimlaneRetainedRunsTest, HostPhaseRecordsReachTheEpochThatProducedThem) {
+    RetainedRunsFixture fx("host-phase-own-epoch", /*cores=*/1, /*threads=*/1);
     const int cores[] = {0};
     constexpr uint64_t kFirst = 700;
     constexpr uint64_t kSecond = 701;
@@ -1048,8 +1322,8 @@ TEST(ChipSwimlaneSessionTest, HostPhaseRecordsReachTheEpochThatProducedThem) {
 // A run that produces no host phase records at all. The collector's copy is
 // per run, so this one contributes none rather than inheriting what its
 // predecessor left in the same fields.
-TEST(ChipSwimlaneSessionTest, ASessionRunWithoutHostPhaseRecordsInheritsNone) {
-    SessionFixture fx("host-phase-empty-successor", /*cores=*/1, /*threads=*/1);
+TEST(ChipSwimlaneRetainedRunsTest, ARetainedRunWithoutHostPhaseRecordsInheritsNone) {
+    RetainedRunsFixture fx("host-phase-empty-successor", /*cores=*/1, /*threads=*/1);
     const int cores[] = {0};
     constexpr uint64_t kFirst = 710;
     constexpr uint64_t kSecond = 711;
@@ -1086,12 +1360,12 @@ TEST(ChipSwimlaneSessionTest, ASessionRunWithoutHostPhaseRecordsInheritsNone) {
     EXPECT_EQ(seen, 2u) << "one of the two epochs published no artifact";
 }
 
-// The close is what hands an epoch to the session thread and releases its
+// The close is what hands an epoch to the writer and releases its
 // slot, so a publication that throws must not skip it: two slots exist, and an
-// epoch left open holds one for the session's whole life. The failure still
+// run left open holds one for the collector's whole life. The failure still
 // reaches the caller, and the epoch reports no host capture it did not make.
-TEST(ChipSwimlaneSessionTest, AFailedHostPublicationStillClosesItsEpoch) {
-    SessionFixture fx("host-phase-failed-publication", /*cores=*/1, /*threads=*/1);
+TEST(ChipSwimlaneRetainedRunsTest, AFailedHostPublicationStillClosesItsEpoch) {
+    RetainedRunsFixture fx("host-phase-failed-publication", /*cores=*/1, /*threads=*/1);
     const int cores[] = {0};
     constexpr uint64_t kFirst = 720;
     constexpr uint64_t kSecond = 721;
@@ -1138,10 +1412,10 @@ TEST(ChipSwimlaneSessionTest, AFailedHostPublicationStillClosesItsEpoch) {
 // the sim base has, where the phase records land and the runtime extensions
 // throw part-way. What it published is kept, and the epoch says it is
 // incomplete: a partial verdict rather than a publication, so a reader is
-// never told a half-written capture is the whole run. The session carries on,
+// never told a half-written capture is the whole run. The collector carries on,
 // and the next epoch settles complete.
-TEST(ChipSwimlaneSessionTest, APartialHostPublicationMarksItsEpochIncomplete) {
-    SessionFixture fx("host-phase-partial-publication", /*cores=*/1, /*threads=*/1);
+TEST(ChipSwimlaneRetainedRunsTest, APartialHostPublicationMarksItsEpochIncomplete) {
+    RetainedRunsFixture fx("host-phase-partial-publication", /*cores=*/1, /*threads=*/1);
     const int cores[] = {0};
     constexpr uint64_t kPartial = 730;
     constexpr uint64_t kWhole = 731;
@@ -1165,7 +1439,7 @@ TEST(ChipSwimlaneSessionTest, APartialHostPublicationMarksItsEpochIncomplete) {
         fx.collector.set_host_phase_records(host_submit_rows(2), {}, 2, 2, 0);
     });
 
-    ASSERT_TRUE(fx.wait_for_files(2)) << "the partial epoch stopped the session from making progress";
+    ASSERT_TRUE(fx.wait_for_files(2)) << "the partial epoch stopped the collector from making progress";
     size_t seen = 0;
     for (const auto &f : published_files(fx.dir.path())) {
         const std::string name = f.filename().string();
@@ -1201,8 +1475,8 @@ struct UnnameableFailure {};
 // throws an object with no message at all, which is the shape every step of
 // the diagnostic gives up on — and the epoch is still marked incomplete, still
 // closed, still published, and its slot still comes back for the next run.
-TEST(ChipSwimlaneSessionTest, AnUnnameableHostPublicationFailureStillClosesItsEpoch) {
-    SessionFixture fx("host-phase-unnameable-failure", /*cores=*/1, /*threads=*/1);
+TEST(ChipSwimlaneRetainedRunsTest, AnUnnameableHostPublicationFailureStillClosesItsEpoch) {
+    RetainedRunsFixture fx("host-phase-unnameable-failure", /*cores=*/1, /*threads=*/1);
     const int cores[] = {0};
     constexpr uint64_t kUnnameable = 740;
     constexpr uint64_t kNext = 741;
@@ -1226,7 +1500,7 @@ TEST(ChipSwimlaneSessionTest, AnUnnameableHostPublicationFailureStillClosesItsEp
         fx.collector.set_host_phase_records(host_submit_rows(2), {}, 2, 2, 0);
     });
 
-    ASSERT_TRUE(fx.wait_for_files(2)) << "an unnameable failure cost the epoch its close or the session its slot";
+    ASSERT_TRUE(fx.wait_for_files(2)) << "an unnameable failure cost the run its close or the collector its slot";
     size_t seen = 0;
     for (const auto &f : published_files(fx.dir.path())) {
         const std::string name = f.filename().string();
@@ -1245,8 +1519,8 @@ TEST(ChipSwimlaneSessionTest, AnUnnameableHostPublicationFailureStillClosesItsEp
         }
     }
     EXPECT_EQ(seen, 2u) << "one of the two epochs published no artifact";
-    // The session is still usable: an epoch-scoped failure is not a
-    // session-level one, so nothing here may have raised the sticky fatal.
-    EXPECT_FALSE(fx.collector.session_stats_for_test().fatal)
-        << "an epoch's publication failure was escalated to a session fatal";
+    // The collector is still usable: a run-scoped failure is not a
+    // collector-level one, so nothing here may have raised the sticky fatal.
+    EXPECT_FALSE(fx.collector.retained_run_stats_for_test().fatal)
+        << "a run's publication failure was escalated to a collector fatal";
 }

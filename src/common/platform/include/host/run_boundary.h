@@ -17,7 +17,7 @@
 
 #include "host/chip_swimlane_collector.h"
 
-namespace simpler::dfx::session {
+namespace simpler::dfx::runs {
 
 /**
  * Name a boundary failure in the log, best effort.
@@ -36,15 +36,15 @@ inline void log_boundary_failure(const char *what_failed, const std::exception_p
                 text = e.what();
             } catch (...) {}
         }
-        LOG_ERROR("ChipSwimlane session: %s: %s", what_failed, text.c_str());
+        LOG_ERROR("ChipSwimlane: %s: %s", what_failed, text.c_str());
     } catch (...) {}
 }
 
 /**
- * Close one session run's boundary: publish what this run produced on the
+ * Close one retained run's boundary: publish what this run produced on the
  * host, then snapshot its epoch.
  *
- * `session_run_close` copies the collector's host-phase records — and, where a
+ * `run_close` copies the collector's host-phase records — and, where a
  * runtime has one, its extension sections — into the epoch's own metadata. The
  * collector holds exactly one copy of that state, so the publication has to
  * reach it first; a snapshot taken ahead of the publication carries whatever
@@ -65,7 +65,7 @@ inline void log_boundary_failure(const char *what_failed, const std::exception_p
  *   carries the evidence, and the publication's exception is re-raised.
  * - **close fails** — the epoch may never be sealed at all, so *no* file need
  *   carry a verdict for it, and the slot it holds is not returned. The
- *   evidence is then the session's sticky fatal, which a flush and `close()`
+ *   evidence is then the collector's sticky fatal, which a flush and `close()`
  *   both read, plus the log lines above; the close's own exception propagates,
  *   and when the publication had failed too, that one is logged rather than
  *   raised, because only one can be.
@@ -74,7 +74,7 @@ inline void log_boundary_failure(const char *what_failed, const std::exception_p
  * same.
  */
 template <typename PublishHostState>
-void close_session_run(
+void close_run_boundary(
     ChipSwimlaneCollector &collector, uint64_t run_epoch, uint32_t pipeline_slot, bool device_execution_complete,
     PublishHostState &&publish_host_state
 ) {
@@ -87,17 +87,17 @@ void close_session_run(
     if (publication_failure) {
         // State first, and it allocates nothing. Describing the failure comes
         // after, where throwing costs only the description.
-        collector.session_note_host_state_incomplete();
+        collector.note_host_state_incomplete();
         log_boundary_failure("a run's host state did not fully publish", publication_failure);
     }
     try {
-        collector.session_run_close(run_epoch, pipeline_slot, device_execution_complete);
+        collector.run_close(run_epoch, pipeline_slot, device_execution_complete);
     } catch (...) {
         std::exception_ptr close_failure;
         try {
             close_failure = std::current_exception();
         } catch (...) {}
-        collector.session_note_boundary_close_failed();
+        collector.note_boundary_close_failed();
         log_boundary_failure("a run boundary could not close its epoch", close_failure);
         if (publication_failure) {
             log_boundary_failure("the boundary that could not close had also failed to publish", publication_failure);
@@ -107,4 +107,4 @@ void close_session_run(
     if (publication_failure) std::rethrow_exception(publication_failure);
 }
 
-}  // namespace simpler::dfx::session
+}  // namespace simpler::dfx::runs

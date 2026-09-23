@@ -861,7 +861,7 @@ void chip_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int 
         }
 
         // Also flush the current AICore buffer to the ready queue so the host
-        // sees this session's final batch of AICore timestamps.
+        // sees this run's final batch of AICore timestamps.
         ChipSwimlaneAicoreTaskPool *ac_state = s_aicore_task_pools[core_id];
         if (ac_state == nullptr) continue;
 

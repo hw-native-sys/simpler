@@ -50,7 +50,7 @@
 #include "kernel_platform_ops.h"
 #include "host/host_phase_records_artifact.h"
 #include "host/raii_scope_guard.h"
-#include "host/session_run_boundary.h"
+#include "host/run_boundary.h"
 #include "host_log.h"
 #include "platform_comm/comm.h"
 #include "runtime_c_api.h"
@@ -3176,7 +3176,7 @@ int DeviceRunnerBase::init_runtime_args_with_metadata(
     return 0;
 }
 
-void DeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch) {
+int DeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch) {
     // Open each enabled collector's window and start its mgmt + poll threads
     // now, just before kernels launch. Both halves belong here: begin_run()
     // drops the previous run's records and republishes the device level, which
@@ -3187,25 +3187,30 @@ void DeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &dfx, 
         return create_thread(std::move(fn));
     };
     if (dfx.chip_swimlane_enabled()) {
-        // A continuous session opens once, on the first profiled run, and then
-        // admits each run instead of wiping the collector. `run_begin` is the
-        // destructive per-run reset and is exactly what a session must not do
-        // while a predecessor's buffers are still arriving.
-        if (dfx_session_enabled_ && !chip_swimlane_collector_.session_active()) {
-            ChipSwimlaneCollector::SessionOptions options;
-            options.enabled = true;
-            if (!chip_swimlane_collector_.session_open(options, dfx.output_prefix)) {
-                LOG_ERROR("ChipSwimlane session could not open; this run collects nothing");
-            }
-        }
-        if (chip_swimlane_collector_.session_active()) {
-            if (!chip_swimlane_collector_.session_run_begin(run_epoch, dfx.output_prefix, dfx.chip_swimlane_level)) {
-                LOG_ERROR("ChipSwimlane session refused run_epoch %llu", static_cast<unsigned long long>(run_epoch));
+        // Which of the two paths a run takes is decided by configuration, not
+        // by what the collector answers: `run_begin` refusing means this run
+        // cannot be retained, and falling back to `begin_run` would then reset
+        // a store a predecessor is still publishing into. So a refusal fails
+        // the run, here, before any kernel is submitted and before any
+        // predecessor's records or slots are touched.
+        if (chip_swimlane_collector_.retains_runs()) {
+            // Reader shards before admission: admitting a run waits for every
+            // shard to acknowledge the new run table, and a shard that has not
+            // been spawned cannot acknowledge anything. From the second run on
+            // they are already running, so this is what puts the first run on
+            // the same path as the rest.
+            chip_swimlane_collector_.start(thread_factory);
+            if (!chip_swimlane_collector_.run_begin(run_epoch, dfx.output_prefix, dfx.chip_swimlane_level)) {
+                LOG_ERROR(
+                    "ChipSwimlane: run %llu was not admitted for retained collection",
+                    static_cast<unsigned long long>(run_epoch)
+                );
+                return PTO_RUNTIME_ERR_INTERNAL;
             }
         } else {
             chip_swimlane_collector_.begin_run(dfx.output_prefix, dfx.chip_swimlane_level);
+            chip_swimlane_collector_.start(thread_factory);
         }
-        chip_swimlane_collector_.start(thread_factory);
     }
     if (dfx.dump_args_enabled()) {
         dump_collector_.begin_run(dfx.output_prefix, dfx.dump_args_level);
@@ -3219,14 +3224,34 @@ void DeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &dfx, 
         scope_stats_collector_.begin_run();
         scope_stats_collector_.start(thread_factory);
     }
+    return 0;
+}
+
+void DeviceRunnerBase::withdraw_unlaunched_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch) noexcept {
+    // Only for a launch that submitted nothing. `start_shared_collectors_for_run`
+    // admits a run into a retained slot before any submission, so a transaction
+    // that ends at `NotStarted` would otherwise leave that slot occupied and
+    // targetless — invisible to the writer and to a flush, and two of them
+    // exhaust the capacity the next admission waits on.
+    if (!dfx.chip_swimlane_enabled()) return;
+    if (!chip_swimlane_collector_.retains_runs()) return;
+    // Nothing may escape a rollback path: the caller owes the layer above its
+    // own transaction's rc and the ownership of this run's `prepared`. The
+    // withdrawal publishes its outcome — a released slot, or a quarantine with
+    // the fatal set and every waiter woken — before anything that can throw, so
+    // this boundary cannot be what hides unreachable capacity; it exists so a
+    // failure past that point cannot displace the launch failure either.
+    try {
+        (void)chip_swimlane_collector_.abandon_run(run_epoch);
+    } catch (...) {}
 }
 
 int DeviceRunnerBase::flush_diagnostics(int timeout_ms, std::string *error) {
-    if (!chip_swimlane_collector_.session_active()) return 0;
-    return chip_swimlane_collector_.session_flush(timeout_ms, error) ? 0 : PTO_RUNTIME_ERR_INTERNAL;
+    if (!chip_swimlane_collector_.retains_runs()) return 0;
+    return chip_swimlane_collector_.flush_retained_runs(timeout_ms, error) ? 0 : PTO_RUNTIME_ERR_INTERNAL;
 }
 
-void DeviceRunnerBase::close_diagnostics_session() { chip_swimlane_collector_.session_close(); }
+void DeviceRunnerBase::finish_retained_runs() { chip_swimlane_collector_.finish_retained_runs(); }
 
 void DeviceRunnerBase::write_host_phase_records_artifact(const std::string &output_prefix, uint32_t pipeline_slot) {
     if (pipeline_slot >= host_phase_runs_.size()) return;
@@ -3251,16 +3276,16 @@ void DeviceRunnerBase::teardown_shared_collectors_after_run(
     // order (mgmt's final-drain pass into L2 has poll as its consumer).
     // Diagnostic exports use the per-task output prefix the user set on
     // CallConfig (CallConfig::validate() enforces non-empty upstream).
-    if (dfx.chip_swimlane_enabled() && chip_swimlane_collector_.session_active()) {
-        // The session keeps the run boundary's device-side reads — terminal and
-        // live counters — and hands the rest to its own thread. No quiesce: the
+    if (dfx.chip_swimlane_enabled() && chip_swimlane_collector_.retains_runs()) {
+        // A retained run keeps the run boundary's device-side reads — terminal
+        // and live counters — and hands the rest to the writer. No quiesce: the
         // pipeline is shared with the successor and draining it here is what
         // the per-queue cut replaces.
         //
         // This run's host phase records go in first: the epoch's metadata
         // snapshot inside the close is what copies them, and the collector
         // holds one copy of them for every run it serves.
-        simpler::dfx::session::close_session_run(
+        simpler::dfx::runs::close_run_boundary(
             chip_swimlane_collector_, run_epoch, pipeline_slot, device_execution_complete, [this, pipeline_slot] {
                 publish_host_phase_records_to_swimlane(pipeline_slot);
             }

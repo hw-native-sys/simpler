@@ -454,9 +454,9 @@ int finalize_device(DeviceContextHandle ctx) {
             LOG_ERROR("finalize_device: native run must be finalized first");
             return PTO_RUNTIME_ERR_INTERNAL;
         }
-        // Publish what the session can still publish and join its thread before
-        // any collector storage is released. A no-op with no session open.
-        runner->close_diagnostics_session();
+        // Publish what is still retained before any collector storage is
+        // released. A no-op on a collector that retains no run.
+        runner->finish_retained_runs();
         int rc = runner->finalize();
         int dev = pto_cpu_sim_get_bound_device();
         if (dev >= 0) {
@@ -795,11 +795,11 @@ int simpler_prepare_run(
         state = new (runtime) SimNativeRunContext(runner, *config, trace_hid, *descriptor, &g_host_api_ops);
         // Refused before any collector, producer or claim mutation — see the
         // onboard path for why the level is the only thing knowable this early.
-        if (runner->dfx_session_enabled() &&
+        if (runner->retains_runs() &&
             config->enable_chip_swimlane >= static_cast<int32_t>(ChipSwimlaneLevel::ORCH_PHASES)) {
             LOG_ERROR(
-                "simpler_prepare_run: dfx_session does not support chip_swimlane level %d (ORCH_PHASES); "
-                "run it without dfx_session",
+                "simpler_prepare_run: retaining runs does not support chip_swimlane level %d (ORCH_PHASES); "
+                "run it without collect_across_runs",
                 config->enable_chip_swimlane
             );
             destroy_native_run_context(state);
@@ -1134,14 +1134,18 @@ size_t committed_device_memory_ctx(DeviceContextHandle ctx) {
     }
 }
 
-int simpler_set_dfx_session_ctx(DeviceContextHandle ctx, int32_t enabled) {
+int simpler_set_retain_runs_ctx(DeviceContextHandle ctx, int32_t enabled) {
     if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
     try {
-        static_cast<SimDeviceRunnerBase *>(ctx)->set_dfx_session_enabled(enabled != 0);
+        static_cast<SimDeviceRunnerBase *>(ctx)->set_retain_runs(enabled != 0);
         return 0;
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+}
+
+int simpler_set_dfx_session_ctx(DeviceContextHandle ctx, int32_t enabled) {
+    return simpler_set_retain_runs_ctx(ctx, enabled);
 }
 
 int simpler_flush_diagnostics_ctx(DeviceContextHandle ctx, int32_t timeout_ms, char *error, size_t error_capacity) {

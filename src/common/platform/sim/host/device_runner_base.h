@@ -369,14 +369,30 @@ public:
      * a resident collector's per-run state off a live predecessor. Subclasses
      * with arch-specific collectors (`dep_gen_collector_`) call this and then
      * open and start their own.
+     *
+     * Returns non-zero when a collector that retains runs would not admit this
+     * one; see the onboard base for why that fails the run.
      */
-    void start_shared_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch);
+    int start_shared_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch);
 
-    /** Continuous-collection session gate; see the onboard base. Default off. */
-    void set_dfx_session_enabled(bool enabled) { dfx_session_enabled_ = enabled; }
-    bool dfx_session_enabled() const { return dfx_session_enabled_; }
+    /**
+     * Give back what the call above admitted for a run that submitted nothing.
+     * Only for a `LaunchProgress::NotStarted` transaction; see the onboard base
+     * for why a partial submission must keep its slot.
+     */
+    void withdraw_unlaunched_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch) noexcept;
+
+    /**
+     * Whether the swimlane collector may hold a run past its boundary. Default
+     * off, and the collector is configured here for the reason the onboard base
+     * gives.
+     */
+    void set_retain_runs(bool enabled) {
+        chip_swimlane_collector_.configure_retained_runs(enabled, simpler::dfx::runs::kDefaultBudgetBytes);
+    }
+    bool retains_runs() const { return chip_swimlane_collector_.retains_runs(); }
     int flush_diagnostics(int timeout_ms, std::string *error);
-    void close_diagnostics_session();
+    void finish_retained_runs();
     /**
      * Resolve and reserve this run's chip-swimlane terminal-snapshot bank, and
      * return its device address for KernelArgs.
@@ -647,7 +663,6 @@ protected:
 
     // Performance / diagnostics collectors shared across arches.
     ChipSwimlaneCollector chip_swimlane_collector_;
-    bool dfx_session_enabled_{false};
     // Not a collector: the pool the runtime's prepare path writes into, read by
     // whichever per-event views the run enabled. Its two readers are gated
     // independently, so it belongs to neither.

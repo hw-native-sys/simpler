@@ -507,7 +507,10 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 set_scope_stats_enabled_func_(prepared->dfx.scope_stats_enabled);
                 set_platform_scope_stats_base_func_(kernel_args_.scope_stats_data_base);
 
-                start_shared_collectors_for_run(prepared->dfx, prepared->identity.run_epoch);
+                if (int collect_rc = start_shared_collectors_for_run(prepared->dfx, prepared->identity.run_epoch);
+                    collect_rc != 0) {
+                    return collect_rc;
+                }
                 if (prepared->dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
                     auto thread_factory = [this](std::function<void()> fn) {
                         return create_thread(std::move(fn));
@@ -580,7 +583,15 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
     outcome.progress = result.progress;
     outcome.receipt = std::move(result.receipt);
     if (result.progress == LaunchProgress::NotStarted) {
+        // Ownership first, then the withdrawal. Nothing was submitted, so the
+        // collectors' admission for this run is the runner's to give back —
+        // left in place it holds a retained slot that neither the writer nor a
+        // flush can see — but handing this rollback's `prepared` back to the
+        // caller is what lets it roll back at all, so it cannot come second to
+        // a diagnostic. The withdrawal itself reports nothing to this caller
+        // and throws nothing at it.
         outcome.prepared = std::move(prepared);
+        withdraw_unlaunched_collectors_for_run(outcome.prepared->dfx, outcome.prepared->identity.run_epoch);
     } else {
         outcome.active = std::make_unique<ActiveExecution>(std::move(prepared), result.progress);
     }

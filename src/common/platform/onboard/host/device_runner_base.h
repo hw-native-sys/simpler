@@ -323,26 +323,33 @@ public:
     std::size_t committed_device_memory() const { return mem_alloc_.committed_bytes(); }
 
     /**
-     * Continuous-collection session gate, latched once at device init.
+     * Whether the swimlane collector may hold a run past its own boundary.
+     * Latched once at device init.
      *
      * Default false: every collector behaves exactly as it does today, the
      * swimlane artifact keeps its name and location, and `run()` returning
      * still implies the file is written.
+     *
+     * The collector is configured in the same breath, because this is the one
+     * point at which the choice is known and it is before the collector's lazy
+     * `initialize()`.
      */
-    void set_dfx_session_enabled(bool enabled) { dfx_session_enabled_ = enabled; }
-    bool dfx_session_enabled() const { return dfx_session_enabled_; }
+    void set_retain_runs(bool enabled) {
+        chip_swimlane_collector_.configure_retained_runs(enabled, simpler::dfx::runs::kDefaultBudgetBytes);
+    }
+    bool retains_runs() const { return chip_swimlane_collector_.retains_runs(); }
 
     /**
-     * Publish every run the session has closed up to now, then report.
+     * Publish every run closed up to now, then report.
      *
      * Returns 0 when each promised file exists; a published partial counts as
-     * promised, and anything that left no file does not. The session thread
+     * promised, and anything that left no file does not. The collector's writer
      * publishes on its own, so this is a barrier, not the only publisher.
      */
     int flush_diagnostics(int timeout_ms, std::string *error);
 
-    /** Close the session: publish what can be published, then join its thread. */
-    void close_diagnostics_session();
+    /** Stop admitting runs and publish what is still retained. */
+    void finish_retained_runs();
 
     void free_tensor(void *dev_ptr);
     int copy_to_device(void *dev_ptr, const void *host_ptr, std::size_t bytes);
@@ -1689,8 +1696,26 @@ protected:
      * Subclasses with arch-specific collectors (`dep_gen_collector_`) call
      * this helper and then open and start their own. The sim base carries the
      * same split.
+     *
+     * Returns non-zero when a collector that retains runs would not admit this
+     * one. Nothing execution-visible has been submitted at that point, so the
+     * caller propagates the rc and the run is rolled back rather than collected
+     * by the destructive single-run path.
      */
-    void start_shared_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch);
+    int start_shared_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch);
+
+    /**
+     * Give back what `start_shared_collectors_for_run` admitted for a run that
+     * ended up submitting nothing.
+     *
+     * Call this on, and only on, a launch transaction that reached
+     * `LaunchProgress::NotStarted`: a partial or ambiguous submission may have
+     * left a device-side producer writing into that run's slot, and nothing may
+     * be freed under it. A no-op with retention off, and a no-op for a run that
+     * was never admitted, so a failure before admission cannot reach a
+     * predecessor's records.
+     */
+    void withdraw_unlaunched_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch) noexcept;
 
     /**
      * Tear down the four shared diagnostics collectors after the launched
@@ -2294,9 +2319,6 @@ protected:
     // on the base. `DepGenCollector` is not shared — each arch that
     // implements dep_gen (a2a3, a5) keeps it on its own subclass.
     ChipSwimlaneCollector chip_swimlane_collector_;
-    // Latched at device init from ChipWorker::init(dfx_session=...). Off by
-    // default, which is what keeps every existing path byte-identical.
-    bool dfx_session_enabled_{false};
     // Not a collector: the state the runtime's bind writes into, read by
     // whichever per-event views the run enabled. Its two readers are gated
     // independently, so it belongs to neither. One per pipeline slot, because a

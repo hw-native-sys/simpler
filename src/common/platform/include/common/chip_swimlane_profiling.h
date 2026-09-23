@@ -197,8 +197,8 @@ static_assert(sizeof(ChipSwimlaneAicoreTaskRecord) == 32, "ChipSwimlaneAicoreTas
  *
  * Concrete instantiations live below as `using` aliases.
  *   - ChipSwimlaneAicpuTaskBuffer        — AICPU-written, rotated, ready-queue tagged kind=AicpuTask
- *   - ChipSwimlaneAicoreTaskBuffer  — AICore-written, NOT rotated (sized for the full
- *                           session), read by host at flush time
+ *   - ChipSwimlaneAicoreTaskBuffer  — AICore-written, NOT rotated (sized for the whole
+ *                           run), read by host at flush time
  */
 template <typename Record, size_t N>
 struct TypedBuffer {
@@ -223,7 +223,7 @@ struct TypedBuffer {
 using ChipSwimlaneAicpuTaskBuffer = TypedBuffer<ChipSwimlaneAicpuTaskRecord, PLATFORM_PROF_BUFFER_SIZE>;
 
 // AICore buffer is rotated like ChipSwimlaneAicpuTaskBuffer: a small fixed capacity per
-// buffer plus a per-core pool, so an arbitrarily long session never wraps.
+// buffer plus a per-core pool, so an arbitrarily long run never wraps.
 // Per-buffer capacity is a power of two so the AICore-local
 // `slot_within_buf` increment lowers to a bitwise AND for boundary checks.
 constexpr int PLATFORM_AICORE_BUFFER_SIZE = 1024;

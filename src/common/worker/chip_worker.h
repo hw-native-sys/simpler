@@ -91,13 +91,13 @@ public:
         const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
         const std::string &dispatcher_path, int device_id, const CallConfig *prewarm_config = nullptr,
         bool enable_sdma = false, const std::string &sim_context_path = "", const std::string &sdma_warmup_path = "",
-        bool dfx_session = false
+        bool collect_across_runs = false
     );
 
     /**
      * Publish every diagnostic run this chip has closed, then report.
      *
-     * Only meaningful when the worker was initialized with `dfx_session`; a
+     * Only meaningful when the worker was initialized with `collect_across_runs`; a
      * chip without one has nothing deferred and returns success. Throws on a
      * run whose artifact is missing.
      */
@@ -454,9 +454,9 @@ private:
     // finalize. Write-once: a later finalize cannot replace a real result.
     SimplerTeardownReport teardown_report_{};
     bool teardown_report_captured_ = false;
-    using SimplerSetDfxSessionFn = decltype(&simpler_set_dfx_session_ctx);
+    using SimplerSetRetainRunsFn = decltype(&simpler_set_retain_runs_ctx);
     using SimplerFlushDiagnosticsFn = decltype(&simpler_flush_diagnostics_ctx);
-    SimplerSetDfxSessionFn set_dfx_session_fn_ = nullptr;
+    SimplerSetRetainRunsFn set_retain_runs_fn_ = nullptr;
     SimplerFlushDiagnosticsFn flush_diagnostics_fn_ = nullptr;
     SupportsConcurrentNativePrepareFn supports_concurrent_native_prepare_fn_ = nullptr;
     SupportsConcurrentNativePrepareFn supports_joined_native_launch_fn_ = nullptr;

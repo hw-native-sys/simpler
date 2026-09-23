@@ -1411,6 +1411,22 @@ def _flush_host_log_or_warn(context: str, timeout_ms: int = 1000) -> bool:
     return False
 
 
+def _resolve_collect_across_runs(collect_across_runs: bool | None, dfx_session: bool | None) -> bool:
+    """One value from the canonical name and the name the option shipped under.
+
+    `None` is "not given" for both, which is what makes the two spellings
+    symmetric: either one alone decides, giving both different values is an
+    error rather than a silent winner, and giving neither leaves the option off.
+    """
+    if dfx_session is None:
+        return bool(collect_across_runs)
+    if collect_across_runs is not None and bool(collect_across_runs) != bool(dfx_session):
+        raise ValueError(
+            f"collect_across_runs={collect_across_runs!r} and dfx_session={dfx_session!r} disagree; pass one of them"
+        )
+    return bool(dfx_session)
+
+
 class ChipWorker:
     """Unified execution interface wrapping the host runtime C API.
 
@@ -1451,7 +1467,8 @@ class ChipWorker:
         log_level: int | None = None,
         prewarm_config: CallConfig | None = None,
         enable_sdma: bool = False,
-        dfx_session: bool = False,
+        collect_across_runs: bool | None = None,
+        dfx_session: bool | None = None,
     ):
         """Attach the calling thread to ``device_id``, load the host runtime
         library, and cache platform binaries.
@@ -1477,11 +1494,14 @@ class ChipWorker:
             log_level: Threshold (10=DEBUG, 20=INFO, 25=TIMING, 30=WARN,
                 40=ERROR, 60=NUL). Defaults to a snapshot of the simpler
                 logger via `_log.get_current_config()`.
-            dfx_session: Keep one continuous diagnostic collection session
-                across runs instead of draining and exporting at every run
-                boundary. Off by default, and off means today's behaviour in
+            collect_across_runs: Let a run's records outlive its own boundary,
+                so the sealing and the file write happen while the next run
+                executes instead of at the boundary. Off when neither this nor
+                `dfx_session` is given, and off means today's behaviour in
                 every respect — including that a run's swimlane file exists
                 when its `run()` returns.
+            dfx_session: The name this option shipped under, accepted as an
+                alias. Giving both spellings different values is an error.
 
         For tests that need to drive the binding directly with arbitrary path
         strings (e.g. to assert dlopen failure on `/nonexistent/foo.so`), call
@@ -1515,7 +1535,7 @@ class ChipWorker:
                 bool(enable_sdma),
                 "" if sim_context_path is None else str(sim_context_path),
                 "" if sdma_warmup_path is None else str(sdma_warmup_path),
-                bool(dfx_session),
+                bool(_resolve_collect_across_runs(collect_across_runs, dfx_session)),
             )
             for slot_id, callable_obj in list(self._callable_registry.items()):
                 self._impl.register_callable(int(slot_id), callable_obj)
@@ -1526,9 +1546,10 @@ class ChipWorker:
     def flush_diagnostics(self, timeout_ms: int = 30000) -> None:
         """Publish every diagnostic run this chip has closed.
 
-        A no-op unless `init(dfx_session=True)` opened a session. Raises
-        RuntimeError when a run that was promised a file did not get one; a
-        published partial carries its verdict in the file and is not a failure.
+        A no-op unless `init(collect_across_runs=True)` let runs be retained.
+        Raises RuntimeError when a run that was promised a file did not get
+        one; a published partial carries its verdict in the file and is not a
+        failure.
         """
         self._impl.flush_diagnostics(int(timeout_ms))
 

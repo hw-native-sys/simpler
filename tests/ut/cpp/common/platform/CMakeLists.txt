@@ -401,7 +401,7 @@ set(CHIP_SWIMLANE_CASE_SOURCES
 # and the AICPU producer module drives init -> complete_task -> flush, so a test
 # can read the result back through the production host copy. The others read
 # the retained per-run terminal snapshots, the AICore and handoff accounting,
-# and the continuous session's receipt, seal, budget and control paths off those
+# and the retained runs' receipt, seal, budget and control paths off those
 # same two sides. Both axes: the swimlane record reaches the arch's
 # platform_regs and scheduler_profiling as well as the runtime's task_id.
 #
@@ -422,7 +422,7 @@ platform_cases(
     test_chip_swimlane_run_terminal_consistency.cpp
     test_chip_swimlane_aicore_accounting.cpp
     test_chip_swimlane_handoff_accounting.cpp
-    test_chip_swimlane_session.cpp
+    test_chip_swimlane_retained_runs.cpp
     PER_ARCH PER_RUNTIME TIER aicpu
     SOURCES ${CHIP_SWIMLANE_CASE_SOURCES})
 
