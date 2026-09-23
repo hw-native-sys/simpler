@@ -54,6 +54,12 @@ struct ArenaRegionRequest {
     size_t *cached_size;
     size_t requested_size;
     const char *name;
+    // Announced immediately before this region's backing is staged, for a
+    // caller whose allocation callback needs to know which region is asking —
+    // the callback's own arguments carry only a byte count. Null when the
+    // caller has no such need, which is every caller that owns one pool.
+    void (*announce)(void *ctx, size_t region_index){nullptr};
+    void *announce_ctx{nullptr};
 };
 
 enum class ArenaRegionAction {
@@ -125,6 +131,7 @@ inline ArenaTransactionResult run_arena_replacement_transaction(
 
     for (size_t i = 0; i < count; ++i) {
         if (actions[i] != ArenaRegionAction::Replace) continue;
+        if (requests[i].announce != nullptr) requests[i].announce(requests[i].announce_ctx, i);
         if (requests[i].arena->stage_replacement(requests[i].requested_size, base_align) != nullptr) continue;
         result.failed_region = static_cast<int>(i);
         return result;

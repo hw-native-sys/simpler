@@ -409,6 +409,18 @@ public:
     static void begin_workspace_plan(uint32_t pipeline_slot, std::uint64_t run_epoch) noexcept;
     static void end_workspace_plan() noexcept;
 
+    /**
+     * Name the consumer region this thread's next workspace request serves.
+     *
+     * The arena allocation callback receives only a byte count, so the setup
+     * driving it announces each region just before that region's backing is
+     * staged. A block belongs to exactly one region, which is what stops a
+     * growing GM heap from being handed the block a still-attached
+     * shared-memory region is published at.
+     */
+    static void set_workspace_plan_region(const WorkspaceManager::RegionKey &region) noexcept;
+    static WorkspaceManager::RegionKey workspace_plan_region() noexcept;
+
     /** Scopes one thread's workspace plan identity to a prepare. */
     class WorkspacePlanScope {
     public:
@@ -1411,6 +1423,25 @@ protected:
      */
     void *acquire_arena_backing(std::size_t size);
     void release_arena_backing(void *p);
+
+    /** The runner and bank one arena setup announces its regions against. */
+    struct ArenaRegionAnnounce {
+        DeviceRunnerBase *runner;
+        uint32_t bank;
+    };
+
+    /**
+     * Register this plan as a consumer of every region the bank now publishes.
+     *
+     * A region whose existing capacity was enough allocates nothing, so it
+     * reaches no allocation callback — and a plan that read and wrote it
+     * without registering would let a later growth treat those bytes as free
+     * to overwrite.
+     *
+     * @return 0, or PTO_RUNTIME_ERR_INTERNAL when a reference could not be
+     *         recorded — refused rather than silently unprotected
+     */
+    int reference_bank_arenas(uint32_t arena_bank, const ArenaRegionRequest *requests, std::size_t count);
 
     /**
      * Configure STARS op execution timeout (once per DeviceRunner lifetime).

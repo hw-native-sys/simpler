@@ -1578,9 +1578,10 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     // holds a live GM/SM pointer, from one that never touched a stream.
     const bool launched = state->active_execution != nullptr;
     // An ownership fact, not a code: the launch transaction hands back an
-    // ActiveExecution only once the run reached the device, so its absence is
-    // this run having submitted nothing and therefore owning no device
-    // consumer of its workspace.
+    // ActiveExecution only once the run reached the device. A launch that got
+    // that far already reported it, and the ledger keeps that report even if a
+    // partial unwind left this pointer null, so "never submitted" is only ever
+    // recorded for a run no launch claimed.
     note_workspace_fact(
         state, launched ? WorkspaceManager::RunFact::Launched : WorkspaceManager::RunFact::NoDeviceSubmission
     );

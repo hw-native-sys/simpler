@@ -55,13 +55,43 @@
  */
 class WorkspaceManager {
 public:
-    /** Which consumer family a subregion belongs to. */
+    /** Which consumer family a block belongs to. */
     enum class Domain : uint32_t {
         /** The three pooled arena regions: device-side execution scratch. */
         ExecScratch = 0,
         /** The per-slot retained temporary buffer: host argument staging. */
         HostStaging = 1,
     };
+
+    /**
+     * Which single consumer region a block belongs to.
+     *
+     * `domain` alone is too coarse to own anything: the three arena regions of
+     * every bank would share one pool, so a growing GM heap could be handed a
+     * block a still-attached shared-memory region is published at. `index`
+     * names the one region — the arena region within its bank, or the pipeline
+     * slot of a staging buffer — and a block is only ever offered back to the
+     * region that published it.
+     */
+    struct RegionKey {
+        Domain domain{Domain::ExecScratch};
+        uint32_t index{0};
+
+        bool operator==(const RegionKey &other) const { return domain == other.domain && index == other.index; }
+    };
+
+    /** The three regions one arena bank publishes, in their commit order. */
+    enum class ArenaRegion : uint32_t { GmHeap = 0, GmSm = 1, RuntimePool = 2, kCount = 3 };
+
+    /** The key naming one bank's arena region. */
+    static RegionKey arena_region(uint32_t bank, ArenaRegion region) {
+        return RegionKey{
+            Domain::ExecScratch, bank * static_cast<uint32_t>(ArenaRegion::kCount) + static_cast<uint32_t>(region)
+        };
+    }
+
+    /** The key naming one pipeline slot's staging buffer. */
+    static RegionKey staging_region(uint32_t pipeline_slot) { return RegionKey{Domain::HostStaging, pipeline_slot}; }
 
     /** How a block's last-consumer state stands right now. */
     enum class BlockState : uint32_t {
@@ -169,20 +199,42 @@ public:
      * @param slot       pipeline slot this plan belongs to
      * @param run_epoch  process-unique identity of the run making the plan
      */
-    void *acquire(Domain domain, uint32_t slot, uint64_t run_epoch, size_t bytes) {
+    void *acquire(const RegionKey &region, uint64_t run_epoch, size_t bytes) {
         std::scoped_lock lk(mu_);
         if (!enabled_ || bytes == 0) return nullptr;
         if (admission_ != Admission::Open && admission_ != Admission::DrainOnly) return nullptr;
 
         for (Block &b : blocks_) {
-            if (b.domain != domain || b.slot != slot) continue;
+            // A released block's address belongs to the platform again, so the
+            // record is history: reusing it would hand back freed memory.
+            if (b.released) continue;
+            if (!(b.region == region)) continue;
             if (b.quarantined || b.release_unconfirmed) continue;
             if (b.bytes < bytes) continue;
             if (b.ref_count != 0) continue;  // capacity is not permission
-            if (!add_ref(b, slot, run_epoch)) return nullptr;
+            if (!add_ref(b, run_epoch)) return nullptr;
             return b.base;
         }
-        return publish_new_block(domain, slot, run_epoch, bytes);
+        return publish_new_block(region, run_epoch, bytes);
+    }
+
+    /**
+     * Record that this run uses the block already published at `base`.
+     *
+     * A run whose request the current block satisfies allocates nothing, so
+     * without this it would read and write a block it never registered as a
+     * consumer of — and a later growth would see no reference and treat the
+     * contents as free to overwrite. Reuse has to register ownership for the
+     * same reason a fresh allocation does.
+     *
+     * @return false when `base` is not a live block of this manager, or when
+     *         its reference table is full — a refusal, never a silent drop
+     */
+    bool reference(void *base, uint64_t run_epoch) {
+        std::scoped_lock lk(mu_);
+        Block *b = find_locked(base);
+        if (b == nullptr || b->quarantined) return false;
+        return add_ref(*b, run_epoch);
     }
 
     /**
@@ -194,11 +246,11 @@ public:
      *
      * @return true when `base` is a block this manager owns
      */
-    bool release_ref(void *base, uint32_t slot, uint64_t run_epoch) {
+    bool release_ref(void *base, uint64_t run_epoch) {
         std::scoped_lock lk(mu_);
         Block *b = find_locked(base);
         if (b == nullptr) return false;
-        drop_ref(*b, slot, run_epoch);
+        drop_ref(*b, run_epoch);
         return true;
     }
 
@@ -244,7 +296,10 @@ public:
             r.drain_proved = true;
             break;
         case RunFact::NoDeviceSubmission:
-            r.no_submission = true;
+            // Ignored once a launch has claimed this run: a partial unwind can
+            // leave the caller's pointer null, and that is not the same fact as
+            // never having reached the device.
+            if (!r.launched) r.no_submission = true;
             break;
         case RunFact::CopybackReturned:
             r.copyback_returned = true;
@@ -257,10 +312,10 @@ public:
             break;
         }
         if (retired(r)) {
-            drop_run_refs(slot, run_epoch);
+            drop_run_refs(run_epoch);
             return;
         }
-        if (r.context_destroyed) quarantine_run_refs(slot, run_epoch);
+        if (r.context_destroyed) quarantine_run_refs(run_epoch);
     }
 
     /** Stop admitting new plans; already-accepted work keeps its path. */
@@ -275,24 +330,23 @@ public:
     }
 
     /**
-     * Runs that still reference a block and whose proof can still arrive.
+     * Runs that still reference a block and whose completion a caller can
+     * still establish.
      *
-     * A run holds this state only while its context exists, it owns device work
-     * and no drain has been entered yet — exactly the case a caller can resolve
-     * by finalizing that run and closing again. Everything else unprovable is
-     * quarantined instead, because refusing on it would promise a retry that
-     * cannot succeed.
+     * Any run holding a reference counts while its context exists: one that has
+     * only prepared, one executing, and one whose device work is done but whose
+     * copy-back or bindings have not reported. All three are resolvable the
+     * same way — finalize that run and close again — and a prior drain attempt
+     * is not proof its host consumers are gone.
+     *
+     * A destroyed context is the one thing that stops counting: no further fact
+     * about that run can arrive, so its blocks are quarantined instead. Which
+     * is also why a refusal always clears: finalizing a run reaches either
+     * retirement or context destruction.
      */
     uint32_t live_drainable_consumers() const {
         std::scoped_lock lk(mu_);
-        uint32_t live = 0;
-        for (uint32_t slot = 0; slot < PTO_PIPELINE_MAX_DEPTH; ++slot) {
-            const RunRecord &r = runs_[slot];
-            if (r.epoch == 0 || r.context_destroyed || r.drain_attempted || !r.launched) continue;
-            if (!references_run(slot, r.epoch)) continue;
-            ++live;
-        }
-        return live;
+        return count_live_locked();
     }
 
     /**
@@ -305,10 +359,11 @@ public:
         std::scoped_lock lk(mu_);
         int last_error = 0;
         for (Block &b : blocks_) {
-            if (b.quarantined || b.ref_count != 0 || b.released) continue;
+            if (b.quarantined || b.ref_count != 0 || b.released || b.swept) continue;
             const int rc = backend_.release(backend_.ctx, b.base);
             if (rc == 0) {
                 b.released = true;
+                b.swept = true;  // accounted for here; the terminal sweep skips it
                 b.state = BlockState::ProvenUnused;
                 reserved_bytes_ -= b.bytes;
                 continue;
@@ -326,9 +381,38 @@ public:
     /** Whether the allocator's terminal sweep must keep `base`. */
     bool must_keep(void *base) const {
         std::scoped_lock lk(mu_);
-        const Block *b = find_locked(base);
-        return b != nullptr && b->quarantined;
+        return must_keep_locked(base);
     }
+
+    /**
+     * One terminal sweep, holding this manager's lock for its whole duration.
+     *
+     * Every other path takes this manager's lock and then the allocator's, so
+     * the sweep — which runs inside the allocator's lock — must take this one
+     * first or the two orders meet head-on. The view is what the sweep's
+     * callbacks use: its methods assume the lock is already held, allocate
+     * nothing, and cannot throw, so a callback can never leave the allocator's
+     * tracking map half-cleared.
+     */
+    class TerminalSweep {
+    public:
+        TerminalSweep(const TerminalSweep &) = delete;
+        TerminalSweep &operator=(const TerminalSweep &) = delete;
+
+        bool must_keep(void *base) const noexcept { return owner_->must_keep_locked(base); }
+        void note_result(void *base, int rc, bool kept) noexcept { owner_->note_sweep_result_locked(base, rc, kept); }
+
+    private:
+        friend class WorkspaceManager;
+        explicit TerminalSweep(WorkspaceManager *owner) :
+            owner_(owner),
+            lock_(owner->mu_) {}
+        WorkspaceManager *owner_;
+        std::unique_lock<std::mutex> lock_;
+    };
+
+    /** Take the manager's lock for one terminal sweep. */
+    TerminalSweep begin_terminal_sweep() { return TerminalSweep(this); }
 
     /**
      * Record one terminal sweep outcome into the block it belongs to.
@@ -340,26 +424,7 @@ public:
      */
     void note_sweep_result(void *base, int rc, bool kept) {
         std::scoped_lock lk(mu_);
-        Block *b = find_locked(base);
-        if (b == nullptr) {
-            if (rc != 0) {
-                ++foreign_release_failures_;
-                last_foreign_release_rc_ = rc;
-            }
-            return;
-        }
-        if (kept) {
-            b->state = BlockState::Quarantined;
-            return;
-        }
-        b->released = true;
-        if (rc == 0) {
-            b->state = BlockState::ProvenUnused;
-            return;
-        }
-        b->release_unconfirmed = true;
-        b->release_rc = rc;
-        b->state = BlockState::ReleaseUnconfirmed;
+        note_sweep_result_locked(base, rc, kept);
     }
 
     /** Remember that a quarantined block's host mapping was left in place. */
@@ -390,13 +455,7 @@ public:
             if (b.quarantined) ++r.quarantined_blocks;
             if (b.release_unconfirmed) ++r.release_unconfirmed_blocks;
         }
-        r.live_blocked = 0;
-        for (uint32_t slot = 0; slot < PTO_PIPELINE_MAX_DEPTH; ++slot) {
-            const RunRecord &rec = runs_[slot];
-            if (rec.epoch == 0 || rec.context_destroyed || rec.drain_attempted || !rec.launched) continue;
-            if (!references_run(slot, rec.epoch)) continue;
-            ++r.live_blocked;
-        }
+        r.live_blocked = count_live_locked();
         r.proof_unavailable = (r.quarantined_blocks != 0 || r.release_unconfirmed_blocks != 0) ? 1u : 0u;
         // Released last: a reader that sees the schema has the whole record.
         r.schema = WORKSPACE_REPORT_SCHEMA;
@@ -424,24 +483,23 @@ public:
     }
 
 private:
-    struct Ref {
-        uint32_t slot{0};
-        uint64_t epoch{0};
-    };
-
     struct Block {
         void *base{nullptr};
         uint64_t bytes{0};
-        Domain domain{Domain::ExecScratch};
-        uint32_t slot{0};
+        RegionKey region{};
         BlockState state{BlockState::ProvenUnused};
-        Ref refs[kMaxBlockRefs]{};
+        // Run epochs currently using this block. The region already pins which
+        // consumer the block belongs to, so an epoch identifies a reference.
+        uint64_t refs[kMaxBlockRefs]{};
         uint32_t ref_count{0};
         int release_rc{0};
         bool quarantined{false};
         bool release_unconfirmed{false};
         bool released{false};
         bool mapping_retained{false};
+        // Accounted for by a release or by the terminal sweep already. A second
+        // close finds the same record and must not charge or credit it twice.
+        bool swept{false};
     };
 
     struct RunRecord {
@@ -454,6 +512,89 @@ private:
         bool bindings_released{false};
         bool context_destroyed{false};
     };
+
+    bool must_keep_locked(void *base) const noexcept {
+        const Block *b = find_locked(base);
+        return b != nullptr && b->quarantined;
+    }
+
+    /**
+     * Land one terminal outcome in the block it belongs to, accounting for it
+     * exactly once. No allocation and no throw: every field already exists,
+     * and an address outside this ledger only bumps a fixed aggregate.
+     */
+    void note_sweep_result_locked(void *base, int rc, bool kept) noexcept {
+        Block *b = find_locked(base);
+        if (b == nullptr) {
+            if (rc != 0) {
+                if (foreign_release_failures_ != UINT32_MAX) ++foreign_release_failures_;
+                last_foreign_release_rc_ = rc;
+            }
+            return;
+        }
+        if (b->swept) return;  // a second close must not account for it twice
+        b->swept = true;
+        if (kept) {
+            // Forgotten without being freed: the charge moves rather than
+            // disappearing, because these bytes are still on the device.
+            b->quarantined = true;
+            b->state = BlockState::Quarantined;
+            relinquished_bytes_ += b->bytes;
+            reserved_bytes_ -= b->bytes;
+            return;
+        }
+        if (rc == 0) {
+            b->released = true;
+            b->state = BlockState::ProvenUnused;
+            reserved_bytes_ -= b->bytes;
+            return;
+        }
+        // A failed free is not a reclamation: the bytes keep their charge and
+        // are reported as unconfirmed rather than as returned.
+        b->release_unconfirmed = true;
+        b->release_rc = rc;
+        b->state = BlockState::ReleaseUnconfirmed;
+    }
+
+    /**
+     * Distinct runs still holding a reference whose completion a caller can
+     * establish.
+     *
+     * Counted from the references, not from the fact records: a run that has
+     * acquired workspace but reported nothing yet — a prepare that has not
+     * launched — has no record at all, and it is exactly the consumer a close
+     * must not step over. A retired run has already dropped its references, and
+     * a destroyed context's are quarantined, so both drop out naturally.
+     */
+    uint32_t count_live_locked() const {
+        uint64_t counted[PTO_PIPELINE_MAX_DEPTH * kMaxBlockRefs] = {};
+        size_t counted_n = 0;
+        uint32_t live = 0;
+        for (const Block &b : blocks_) {
+            if (b.released) continue;
+            for (uint32_t i = 0; i < b.ref_count; ++i) {
+                const uint64_t epoch = b.refs[i];
+                bool seen = false;
+                for (size_t j = 0; j < counted_n; ++j) {
+                    if (counted[j] == epoch) seen = true;
+                }
+                if (seen) continue;
+                if (counted_n < sizeof(counted) / sizeof(counted[0])) counted[counted_n++] = epoch;
+                const RunRecord *r = record_for_locked(epoch);
+                if (r != nullptr && (r->context_destroyed || retired(*r))) continue;
+                ++live;
+            }
+        }
+        return live;
+    }
+
+    /** This epoch's fact record, or null when it has reported nothing yet. */
+    const RunRecord *record_for_locked(uint64_t epoch) const {
+        for (uint32_t slot = 0; slot < PTO_PIPELINE_MAX_DEPTH; ++slot) {
+            if (runs_[slot].epoch == epoch) return &runs_[slot];
+        }
+        return nullptr;
+    }
 
     static bool retired(const RunRecord &r) {
         const bool device_settled = r.drain_proved || r.no_submission;
@@ -474,58 +615,58 @@ private:
         return nullptr;
     }
 
-    static bool add_ref(Block &b, uint32_t slot, uint64_t epoch) {
+    static bool add_ref(Block &b, uint64_t epoch) {
         for (uint32_t i = 0; i < b.ref_count; ++i) {
-            if (b.refs[i].slot == slot && b.refs[i].epoch == epoch) return true;
+            if (b.refs[i] == epoch) return true;
         }
         if (b.ref_count >= kMaxBlockRefs) return false;  // refuse, never truncate
-        b.refs[b.ref_count++] = Ref{slot, epoch};
-        b.state = BlockState::Referenced;
+        b.refs[b.ref_count++] = epoch;
+        if (!b.quarantined && !b.release_unconfirmed) b.state = BlockState::Referenced;
         return true;
     }
 
-    static void drop_ref(Block &b, uint32_t slot, uint64_t epoch) {
+    static void drop_ref(Block &b, uint64_t epoch) {
         for (uint32_t i = 0; i < b.ref_count; ++i) {
-            if (b.refs[i].slot != slot || b.refs[i].epoch != epoch) continue;
+            if (b.refs[i] != epoch) continue;
             b.refs[i] = b.refs[b.ref_count - 1];
-            b.refs[--b.ref_count] = Ref{};
+            b.refs[--b.ref_count] = 0;
             break;
         }
         if (b.ref_count == 0 && !b.quarantined && !b.release_unconfirmed) b.state = BlockState::ProvenUnused;
     }
 
-    bool references_run(uint32_t slot, uint64_t epoch) const {
+    bool references_run(uint64_t epoch) const {
         for (const Block &b : blocks_) {
+            if (b.released) continue;
             for (uint32_t i = 0; i < b.ref_count; ++i) {
-                if (b.refs[i].slot == slot && b.refs[i].epoch == epoch) return true;
+                if (b.refs[i] == epoch) return true;
             }
         }
         return false;
     }
 
-    void drop_run_refs(uint32_t slot, uint64_t epoch) {
+    void drop_run_refs(uint64_t epoch) {
         for (Block &b : blocks_)
-            drop_ref(b, slot, epoch);
+            drop_ref(b, epoch);
     }
 
-    void quarantine_run_refs(uint32_t slot, uint64_t epoch) {
+    void quarantine_run_refs(uint64_t epoch) {
         for (Block &b : blocks_) {
             bool held = false;
             for (uint32_t i = 0; i < b.ref_count; ++i) {
-                if (b.refs[i].slot == slot && b.refs[i].epoch == epoch) held = true;
+                if (b.refs[i] == epoch) held = true;
             }
             if (!held) continue;
             // Whole-block: the allocator and the host-mapping registry are both
-            // keyed by allocation base, so a subregion whose last consumer
-            // cannot be proven finished takes its neighbours with it.
+            // keyed by allocation base, so a region whose last consumer cannot
+            // be proven finished takes the rest of its block with it.
             b.quarantined = true;
-            b.state = BlockState::Quarantined;
-            drop_ref(b, slot, epoch);
+            drop_ref(b, epoch);
             b.state = BlockState::Quarantined;
         }
     }
 
-    void *publish_new_block(Domain domain, uint32_t slot, uint64_t run_epoch, size_t bytes) {
+    void *publish_new_block(const RegionKey &region, uint64_t run_epoch, size_t bytes) {
         if (reserved_bytes_ + bytes < reserved_bytes_) return nullptr;  // overflow
         if (reserved_bytes_ + bytes > limit_bytes_) return nullptr;
         // Both ownership records exist before the device allocation: this vector
@@ -538,9 +679,8 @@ private:
         Block b;
         b.base = base;
         b.bytes = bytes;
-        b.domain = domain;
-        b.slot = slot;
-        b.refs[0] = Ref{slot, run_epoch};
+        b.region = region;
+        b.refs[0] = run_epoch;
         b.ref_count = 1;
         b.state = BlockState::Referenced;
         blocks_.push_back(b);  // into the capacity reserved above

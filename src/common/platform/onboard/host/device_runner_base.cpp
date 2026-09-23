@@ -335,24 +335,52 @@ namespace {
 // The run identity this thread's workspace requests belong to. Thread-scoped so
 // a prepared successor built on another thread cannot be charged to this one.
 struct WorkspacePlanIdentity {
-    uint32_t slot{0};
     std::uint64_t epoch{0};
+    WorkspaceManager::RegionKey region{};
 };
 thread_local WorkspacePlanIdentity g_workspace_plan;
 }  // namespace
 
 void DeviceRunnerBase::begin_workspace_plan(uint32_t pipeline_slot, std::uint64_t run_epoch) noexcept {
-    g_workspace_plan.slot = pipeline_slot;
     g_workspace_plan.epoch = run_epoch;
+    g_workspace_plan.region = WorkspaceManager::staging_region(pipeline_slot);
 }
 
 void DeviceRunnerBase::end_workspace_plan() noexcept { g_workspace_plan = WorkspacePlanIdentity{}; }
 
+void DeviceRunnerBase::set_workspace_plan_region(const WorkspaceManager::RegionKey &region) noexcept {
+    g_workspace_plan.region = region;
+}
+
+WorkspaceManager::RegionKey DeviceRunnerBase::workspace_plan_region() noexcept { return g_workspace_plan.region; }
+
+int DeviceRunnerBase::reference_bank_arenas(
+    uint32_t arena_bank, const ArenaRegionRequest *requests, std::size_t count
+) {
+    for (std::size_t i = 0; i < count; ++i) {
+        const DeviceArena *arena = requests[i].arena;
+        if (arena == nullptr || !arena->is_committed()) continue;
+        const WorkspaceManager::RegionKey region =
+            WorkspaceManager::arena_region(arena_bank, static_cast<WorkspaceManager::ArenaRegion>(i));
+        // The base an attached arena reports is the block's own base, which is
+        // what the ledger is keyed by.
+        if (workspace_.reference(arena->base(), g_workspace_plan.epoch)) continue;
+        LOG_ERROR(
+            "setup_static_arena: bank %u region %s could not register this run as a consumer of %p", arena_bank,
+            requests[i].name, arena->base()
+        );
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    return 0;
+}
+
 void *DeviceRunnerBase::acquire_arena_backing(std::size_t size) {
     if (!workspace_.enabled()) return mem_alloc_.alloc(size);
-    return workspace_.acquire(
-        WorkspaceManager::Domain::ExecScratch, g_workspace_plan.slot, g_workspace_plan.epoch, size
-    );
+    // Which region is asking is not in the callback's arguments, so the setup
+    // that drives the arenas names it around each commit. Without that every
+    // region of every bank would share one pool, and a growing GM heap could be
+    // handed the block a still-attached shared-memory region is published at.
+    return workspace_.acquire(g_workspace_plan.region, g_workspace_plan.epoch, size);
 }
 
 void DeviceRunnerBase::release_arena_backing(void *p) {
@@ -391,7 +419,21 @@ int DeviceRunnerBase::acquire_retained_temp(
     if (pipeline_slot >= retained_temp_addrs_.size()) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     *addr_out = retained_temp_addrs_[pipeline_slot];
     *size_out = retained_temp_sizes_[pipeline_slot];
-    if (bytes == 0 || bytes <= retained_temp_sizes_[pipeline_slot]) return 0;
+    if (bytes == 0 || bytes <= retained_temp_sizes_[pipeline_slot]) {
+        // A request the retained block already covers allocates nothing, but
+        // this run is about to write and read it, so it registers as a consumer
+        // anyway — otherwise a later growth would find no reference and treat
+        // those bytes as free to overwrite.
+        if (bytes != 0 && workspace_.enabled() && *addr_out != nullptr &&
+            !workspace_.reference(*addr_out, g_workspace_plan.epoch)) {
+            LOG_ERROR(
+                "acquire_retained_temp: slot %u could not register this run as a consumer of %p", pipeline_slot,
+                *addr_out
+            );
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        return 0;
+    }
 
     if (!workspace_.enabled()) {
         // Unmanaged: the sequence RetainedTempBump used to run itself — release
@@ -410,13 +452,10 @@ int DeviceRunnerBase::acquire_retained_temp(
     // Managed: the previous generation keeps its address and its contents until
     // its last consumer retires, so this request takes a block of its own
     // inside the budget. A refusal leaves the slot naming the old block.
-    void *grown =
-        workspace_.acquire(WorkspaceManager::Domain::HostStaging, pipeline_slot, g_workspace_plan.epoch, bytes);
+    void *grown = workspace_.acquire(WorkspaceManager::staging_region(pipeline_slot), g_workspace_plan.epoch, bytes);
     if (grown == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-    void *previous = retained_temp_addrs_[pipeline_slot];
-    if (previous != nullptr && previous != grown) {
-        workspace_.release_ref(previous, pipeline_slot, g_workspace_plan.epoch);
-    }
+    // The previous block keeps its address and its contents: the slot stops
+    // naming it, and its earlier consumers release it when they retire.
     set_retained_temp_buffer(pipeline_slot, grown, bytes);
     *addr_out = grown;
     *size_out = bytes;
@@ -693,16 +732,39 @@ int DeviceRunnerBase::setup_static_arena(
         }
     }
 
+    // The ledger keys a block by the one region that owns it, and the arena
+    // allocation callback sees only a byte count, so each region names itself
+    // just before its own backing is staged.
+    ArenaRegionAnnounce announce{this, arena_bank};
+    auto name_region = [](void *ctx, std::size_t region_index) {
+        auto *a = static_cast<ArenaRegionAnnounce *>(ctx);
+        a->runner->set_workspace_plan_region(
+            WorkspaceManager::arena_region(a->bank, static_cast<WorkspaceManager::ArenaRegion>(region_index))
+        );
+    };
     ArenaRegionRequest requests[] = {
-        {&bank.gm_heap, &bank.cached_gm_heap_size, gm_heap_size, "gm_heap"},
-        {&bank.gm_sm, &bank.cached_gm_sm_size, gm_sm_size, "gm_sm"},
-        {&bank.runtime_pool, &bank.cached_runtime_arena_size, runtime_arena_size, "runtime_pool"},
+        {&bank.gm_heap, &bank.cached_gm_heap_size, gm_heap_size, "gm_heap", name_region, &announce},
+        {&bank.gm_sm, &bank.cached_gm_sm_size, gm_sm_size, "gm_sm", name_region, &announce},
+        {&bank.runtime_pool, &bank.cached_runtime_arena_size, runtime_arena_size, "runtime_pool", name_region,
+         &announce},
     };
     constexpr size_t kRegionCount = sizeof(requests) / sizeof(requests[0]);
+    // One region at a time, each named to the ledger, because the allocation
+    // callbacks carry no region of their own and a capacity hit calls none at
+    // all. The transaction itself is unchanged: it still stages every region
+    // and publishes only when all of them succeeded.
     const BankArenaSetupOutcome outcome = run_bank_arena_setup(
         requests, kRegionCount, /*owns_prebuilt_cache=*/arena_bank == 0, &prebuilt_runtime_arena_cache_,
         DeviceArena::kDefaultBaseAlign
     );
+    if (outcome.rc == 0 && workspace_.enabled()) {
+        // Every region this bank now publishes is used by this plan, including
+        // the ones whose existing capacity was enough and therefore allocated
+        // nothing. A plan that read and wrote a region without registering as
+        // its consumer would let a later growth treat those bytes as free.
+        const int ref_rc = reference_bank_arenas(arena_bank, requests, kRegionCount);
+        if (ref_rc != 0) return ref_rc;
+    }
     if (outcome.rc != 0) {
         const int failed = outcome.transaction.failed_region;
         const char *name = (failed >= 0 && static_cast<size_t>(failed) < kRegionCount) ? requests[failed].name : "?";
@@ -2258,26 +2320,36 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
         // The mappings name the allocations mem_alloc_ is about to free, so
         // they cannot be released after it. A force reset already invalidated
         // both, and the unregister would be a further device call.
-        // Every block no consumer references goes back the ordinary way first,
-        // so the sweep below is left with what could not be proven unused.
-        capture(workspace_.release_unreferenced());
-        release_child_memory_host_views();
-        // Terminal: the classifier keeps what cannot be proven unused, the
-        // recorder lands each outcome in storage that already exists, and the
-        // tracking map is cleared either way — so no second close and no
-        // destructor can reach an address this call has accounted for.
-        capture(mem_alloc_.finalize_except(
-            [](void *base, std::size_t /*bytes*/, void *ctx) {
-                return static_cast<WorkspaceManager *>(ctx)->must_keep(base) ? MemoryAllocator::SweepAction::KeepIt :
-                                                                               MemoryAllocator::SweepAction::FreeIt;
-            },
-            [](void *base, int rc, MemoryAllocator::SweepAction acted, void *ctx) {
-                static_cast<WorkspaceManager *>(ctx)->note_sweep_result(
-                    base, rc, acted == MemoryAllocator::SweepAction::KeepIt
-                );
-            },
-            &workspace_
-        ));
+        if (!workspace_.enabled()) {
+            // Unmanaged: the original terminal sequence, unchanged.
+            release_child_memory_host_views();
+            capture(mem_alloc_.finalize());
+        } else {
+            // Every block no consumer references goes back the ordinary way
+            // first, so the sweep below is left with what could not be proven
+            // unused.
+            capture(workspace_.release_unreferenced());
+            release_child_memory_host_views();
+            // The sweep holds the ledger's lock for its whole duration, taken
+            // before the allocator's — the order every other path uses. Its
+            // callbacks work through a view that assumes that lock is held, so
+            // they allocate nothing, cannot throw, and cannot leave the
+            // allocator's tracking map half-cleared.
+            WorkspaceManager::TerminalSweep sweep = workspace_.begin_terminal_sweep();
+            capture(mem_alloc_.finalize_except(
+                [](void *base, std::size_t /*bytes*/, void *ctx) {
+                    return static_cast<WorkspaceManager::TerminalSweep *>(ctx)->must_keep(base) ?
+                               MemoryAllocator::SweepAction::KeepIt :
+                               MemoryAllocator::SweepAction::FreeIt;
+                },
+                [](void *base, int rc, MemoryAllocator::SweepAction acted, void *ctx) {
+                    static_cast<WorkspaceManager::TerminalSweep *>(ctx)->note_result(
+                        base, rc, acted == MemoryAllocator::SweepAction::KeepIt
+                    );
+                },
+                &sweep
+            ));
+        }
     }
 
     block_dim_ = 0;
