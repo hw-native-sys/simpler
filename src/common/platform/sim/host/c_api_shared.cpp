@@ -820,18 +820,6 @@ int simpler_prepare_run(
     const long long trace_start_ns = STRACE_NOW_NS();
     try {
         state = new (runtime) SimNativeRunContext(runner, *config, trace_hid, *descriptor, &g_host_api_ops);
-        // Refused before any collector, producer or claim mutation — see the
-        // onboard path for why the level is the only thing knowable this early.
-        if (runner->retains_runs() &&
-            config->enable_chip_swimlane >= static_cast<int32_t>(ChipSwimlaneLevel::ORCH_PHASES)) {
-            LOG_ERROR(
-                "simpler_prepare_run: retaining runs does not support chip_swimlane level %d (ORCH_PHASES); "
-                "run it without collect_across_runs",
-                config->enable_chip_swimlane
-            );
-            destroy_native_run_context(state);
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
         if (!runner->try_acquire_native_run(state, state->identity(), &state->launch_permit)) {
             LOG_ERROR("simpler_prepare_run: another native run is active on this device context");
             destroy_native_run_context(state);

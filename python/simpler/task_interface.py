@@ -1509,6 +1509,21 @@ class ChipWorker:
                 `dfx_session` is given, and off means today's behaviour in
                 every respect — including that a run's swimlane file exists
                 when its `run()` returns.
+
+                Every collection level is served, orchestrator phases (level 4)
+                included: each run's phases go to its own background file.
+                The level a collector serves is the one its device pools were
+                built for — the first collected run's, or the first run after a
+                shape change rebuilt them — so a device-orchestrated run that
+                would need an orchestrator pool an earlier, lower level did not
+                build is refused before anything is allocated, leaving every
+                earlier run's records intact. Profile at the level you want from
+                the first collected run.
+
+                Completion has two halves: a run returning means its own
+                per-run files are written, `flush_diagnostics()` returning means
+                the background record files are published. Wait for every run,
+                then flush, then convert.
             dfx_session: The name this option shipped under, accepted as an
                 alias. Giving both spellings different values is an error.
 

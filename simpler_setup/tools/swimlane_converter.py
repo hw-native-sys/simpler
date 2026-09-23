@@ -575,6 +575,39 @@ def _host_record_bounds(raw):
     return (min(values), max(values)) if values else None
 
 
+def _capture_run_epoch(raw):
+    """The run a background-collected capture names, or ``None`` for any other.
+
+    ``metadata.collection`` is written only for a capture the collector kept
+    past its own run boundary, so its absence is what a single-run capture
+    looks like and not a defect.
+    """
+    collection = (raw.get("metadata") or {}).get("collection")
+    if not isinstance(collection, dict):
+        return None
+    epoch = collection.get("run_epoch")
+    return epoch if isinstance(epoch, int) and not isinstance(epoch, bool) and epoch > 0 else None
+
+
+def _span_run_epoch(span):
+    """``run_epoch`` off a root ``chip.run`` span's attrs, or ``None``.
+
+    The same number the capture carries, written by the run that produced both.
+    Read on its own rather than through ``containment._host_identity``, whose
+    four-field key is absent for a synchronous launch that still has an epoch.
+    """
+    if span is None:
+        return None
+    for item in span.attrs.split():
+        key, separator, value = item.partition("=")
+        if separator and key == "run_epoch":
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None
+
+
 def _matching_capture_host_windows(raw, spans, sidecar):
     windows = containment.host_windows(spans)
     by_name = {(span.pid, span.inv, span.name): span for span in spans}
@@ -602,6 +635,26 @@ def _matching_capture_host_windows(raw, spans, sidecar):
     windows = [
         window for window in windows if window.start_ns > 0 and window.duration_ns > 0 and window.device_wall_ns > 0
     ]
+    # A background-collected capture names its run, and that run's root
+    # `chip.run` span carries the same number. Adjacent runs overlap on the Host
+    # clock — a predecessor's root span is still open while its successor binds
+    # — so containment alone can leave one candidate per overlapping run.
+    #
+    # The number is per process and nothing in a capture names its own process,
+    # so a candidate set the pid and identity filters did not collapse carries
+    # no comparable identity. Where the logs identify runs, this capture's run
+    # must be among them; logs carrying no `run_epoch` predate it, and absence
+    # is not contradiction.
+    epoch = _capture_run_epoch(raw)
+    if epoch is not None and windows:
+        if len({window.pid for window in windows}) > 1:
+            raise ValueError("candidate Host invocations span processes, and a run_epoch is per process")
+        identified = [(window, _span_run_epoch(roots.get((window.pid, window.inv)))) for window in windows]
+        if any(found is not None for _, found in identified):
+            matched = [window for window, found in identified if found == epoch]
+            if len(matched) != 1:
+                raise ValueError(f"no single Host invocation carries this capture's run_epoch {epoch}")
+            windows = matched
     if not windows:
         raise ValueError("no matching Host runner_run/device_wall windows")
     return windows

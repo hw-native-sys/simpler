@@ -157,18 +157,23 @@ struct RetainedRunsFixture {
     ChipSwimlaneCollector collector;
     ArtifactRoot dir;
     int num_aicore;
+    ChipSwimlaneLevel level;
 
-    RetainedRunsFixture(const char *name, int cores, int threads, size_t budget_bytes = 0) :
+    RetainedRunsFixture(
+        const char *name, int cores, int threads, size_t budget_bytes = 0,
+        ChipSwimlaneLevel collection_level = ChipSwimlaneLevel::TASK_TIMING, bool host_orchestrated = false
+    ) :
         dir(name),
-        num_aicore(cores) {
-        EXPECT_EQ(
-            collector.initialize(
-                cores, threads, /*device_id=*/0, ChipSwimlaneLevel::TASK_TIMING, retained_alloc, nullptr, retained_free
-            ),
-            0
-        );
+        num_aicore(cores),
+        level(collection_level) {
         collector.configure_retained_runs(
             /*retain_across_runs=*/true, budget_bytes != 0 ? budget_bytes : simpler::dfx::runs::kDefaultBudgetBytes
+        );
+        // Before init, as the runner publishes it: initialize() reads this when
+        // it decides whether to size a device orch-phase pool.
+        if (host_orchestrated) collector.set_host_orchestrated(true);
+        EXPECT_EQ(
+            collector.initialize(cores, threads, /*device_id=*/0, level, retained_alloc, nullptr, retained_free), 0
         );
         collector.start(retained_thread_factory);
     }
@@ -184,7 +189,7 @@ struct RetainedRunsFixture {
     /** Open a run: arm its bank, admit the epoch, bring the device side up. */
     void begin(uint64_t epoch) {
         ASSERT_NE(shm(), nullptr);
-        EXPECT_TRUE(collector.run_begin(epoch, dir.str(), ChipSwimlaneLevel::TASK_TIMING));
+        EXPECT_TRUE(collector.run_begin(epoch, dir.str(), level));
         set_platform_run_result(/*region_base=*/0, epoch);
         set_chip_swimlane_enabled(true);
         set_platform_chip_swimlane_base(reinterpret_cast<uint64_t>(shm()));
@@ -1523,4 +1528,247 @@ TEST(ChipSwimlaneRetainedRunsTest, AnUnnameableHostPublicationFailureStillCloses
     // collector-level one, so nothing here may have raised the sticky fatal.
     EXPECT_FALSE(fx.collector.retained_run_stats_for_test().fatal)
         << "a run's publication failure was escalated to a collector fatal";
+}
+
+// ---------------------------------------------------------------------------
+// ORCH_PHASES across retained runs
+// ---------------------------------------------------------------------------
+
+namespace {
+
+int g_orch_alloc_calls = 0;
+
+void *counting_alloc(size_t size) {
+    g_orch_alloc_calls++;
+    return std::calloc(1, size);
+}
+
+/** Emit `count` orchestrator-phase records through the production entries. */
+void record_orch_phases(int count) {
+    chip_swimlane_aicpu_set_orch_thread_idx(/*thread_idx=*/0);
+    for (int i = 0; i < count; i++) {
+        chip_swimlane_aicpu_record_orch_phase(
+            /*start_time=*/300 + i, /*end_time=*/400 + i, /*task_id=*/static_cast<uint64_t>(i), /*submit_idx=*/i
+        );
+    }
+}
+
+/** Orchestrator-phase rows an artifact carries for `epoch`. */
+size_t orch_rows_for_epoch(const std::string &body, uint64_t epoch) {
+    // Every row of that section ends with its own identity, and no other
+    // section renders `run_epoch` as an object's last member.
+    const std::string needle = "\"run_epoch\": " + std::to_string(epoch) + "}";
+    size_t rows = 0;
+    for (size_t at = body.find(needle); at != std::string::npos; at = body.find(needle, at + 1)) {
+        rows++;
+    }
+    return rows;
+}
+
+const ChipSwimlaneAicpuTaskPool *orch_pool(void *shm) { return get_orch_phase_buffer_state(shm, 0); }
+
+}  // namespace
+
+// Two ORCH_PHASES runs against one resident collector: each run's orchestrator
+// records reach its own file, and the second run reuses the pool the first one
+// built rather than drawing a new one.
+TEST(ChipSwimlaneRetainedRunsTest, OrchPhaseRecordsGoToTheRunThatProducedThem) {
+    RetainedRunsFixture fx(
+        "orch-two-runs", /*cores=*/1, /*threads=*/1, /*budget_bytes=*/0, ChipSwimlaneLevel::ORCH_PHASES
+    );
+    constexpr int kOrchKind = static_cast<int>(ProfBufferType::AICPU_ORCH_PHASE);
+    ASSERT_NE(orch_pool(fx.shm())->free_queue.tail, 0u)
+        << "a first ORCH_PHASES run must build the device orch pool on the full init path";
+    // What one seeding of this kind recorded. A second seeding — another full
+    // init path for the same kind — would add to it; the free queue's `tail` is
+    // no such witness, because it also advances every time the host recycles a
+    // published buffer back into the queue.
+    const size_t seeded_paired = fx.collector.manager().paired_initial(kOrchKind);
+    ASSERT_GT(seeded_paired, 0u) << "the orch pool was not seeded, so this case cannot discriminate";
+
+    const int cores[] = {0};
+    constexpr uint64_t kFirst = 41100;
+    constexpr uint64_t kSecond = 41200;
+
+    fx.begin(kFirst);
+    chip_swimlane_aicpu_init_phase(/*worker_count=*/1, /*num_sched_phase_threads=*/1, /*num_orch_phase_threads=*/1);
+    record_orch_phases(3);
+    chip_swimlane_aicpu_flush_orch_phase_buffer(/*thread_idx=*/0);
+    fx.close(kFirst, cores, 1);
+
+    fx.begin(kSecond);
+    chip_swimlane_aicpu_init_phase(/*worker_count=*/1, /*num_sched_phase_threads=*/1, /*num_orch_phase_threads=*/1);
+    record_orch_phases(5);
+    chip_swimlane_aicpu_flush_orch_phase_buffer(/*thread_idx=*/0);
+    fx.close(kSecond, cores, 1);
+
+    ASSERT_TRUE(fx.wait_for_files(2));
+    size_t seen = 0;
+    for (const auto &f : published_files(fx.dir.path())) {
+        const std::string name = f.filename().string();
+        const std::string body = read_file(f);
+        if (name == "records_e41100.json") {
+            seen++;
+            EXPECT_EQ(orch_rows_for_epoch(body, kFirst), 3u) << "epoch 41100 lost the phases it produced";
+            EXPECT_EQ(orch_rows_for_epoch(body, kSecond), 0u) << "epoch 41100 carried its successor's phases";
+        } else if (name == "records_e41200.json") {
+            seen++;
+            EXPECT_EQ(orch_rows_for_epoch(body, kSecond), 5u) << "epoch 41200 lost the phases it produced";
+            EXPECT_EQ(orch_rows_for_epoch(body, kFirst), 0u) << "epoch 41200 carried its predecessor's phases";
+        }
+    }
+    EXPECT_EQ(seen, 2u) << "one of the two epochs published no artifact";
+    EXPECT_NE(orch_pool(fx.shm())->free_queue.tail, 0u) << "the pool stopped being stocked while runs were using it";
+    EXPECT_EQ(fx.collector.manager().paired_initial(kOrchKind), seeded_paired)
+        << "the orch pool was seeded a second time, so a later run did not reuse the first run's";
+    EXPECT_FALSE(fx.collector.retained_run_stats_for_test().fatal);
+}
+
+// A collector whose pools were built for a lower level refuses an ORCH_PHASES
+// run at the point it would have had to build the orch pool: nothing is
+// allocated, nothing is published into the pool, and the predecessor's artifact
+// and the collector itself are untouched.
+TEST(ChipSwimlaneRetainedRunsTest, EscalatingARetainedCollectorToOrchPhasesIsRefusedWithoutAllocating) {
+    RetainedRunsFixture fx("orch-escalate", /*cores=*/1, /*threads=*/1);
+    const int cores[] = {0};
+    constexpr uint64_t kFirst = 41300;
+    constexpr uint64_t kLater = 41400;
+
+    fx.begin(kFirst);
+    fx.dispatch(0, 2);
+    fx.close(kFirst, cores, 1);
+    ASSERT_TRUE(fx.wait_for_files(1));
+    const fs::path first_file = published_files(fx.dir.path()).front();
+    const std::string first_body = read_file(first_file);
+    ASSERT_EQ(orch_pool(fx.shm())->free_queue.tail, 0u) << "a TASK_TIMING collector holds no orch pool";
+
+    // What a later run's arm does: publish this run's orchestration source,
+    // then initialize for its own level. The allocator handed in here is the
+    // case's own, so a refusal that still allocated would be visible.
+    g_orch_alloc_calls = 0;
+    EXPECT_NE(
+        fx.collector.initialize(
+            /*cores=*/1, /*threads=*/1, /*device_id=*/0, ChipSwimlaneLevel::ORCH_PHASES, counting_alloc, nullptr,
+            retained_free
+        ),
+        0
+    ) << "a retained collector built for a lower level must refuse to serve ORCH_PHASES";
+    EXPECT_EQ(g_orch_alloc_calls, 0) << "the refusal allocated device buffers anyway";
+    EXPECT_EQ(orch_pool(fx.shm())->free_queue.tail, 0u) << "the refusal published free-queue state anyway";
+    EXPECT_EQ(read_file(first_file), first_body) << "the refusal disturbed a predecessor's published artifact";
+    EXPECT_FALSE(fx.collector.retained_run_stats_for_test().fatal) << "a refused run raised a collector fatal";
+
+    // The collector still serves the level it was built for.
+    fx.begin(kLater);
+    fx.dispatch(0, 1);
+    fx.close(kLater, cores, 1);
+    EXPECT_TRUE(fx.wait_for_files(2)) << "the refusal left the collector unable to serve its own level";
+}
+
+// The shape change a runner detects at arm releases the collector and publishes
+// what it held first; the collector the next run initializes is a new one and
+// takes the full path, so it can serve ORCH_PHASES.
+TEST(ChipSwimlaneRetainedRunsTest, AShapeRebuildLetsTheNextCollectorServeOrchPhases) {
+    RetainedRunsFixture fx("orch-rebuild", /*cores=*/1, /*threads=*/1);
+    const int cores[] = {0};
+    constexpr uint64_t kFirst = 41500;
+
+    fx.begin(kFirst);
+    fx.dispatch(0, 1);
+    fx.close(kFirst, cores, 1);
+    ASSERT_TRUE(fx.wait_for_files(1));
+
+    // `collector_shape_is_stale` → `finalize_collectors()`, which for a
+    // retained collector publishes and joins before it releases.
+    fx.collector.finish_retained_runs();
+    fx.collector.stop();
+    ASSERT_EQ(fx.collector.finalize(nullptr, retained_free), 0);
+    EXPECT_EQ(published_files(fx.dir.path()).size(), 1u) << "the release dropped what the collector held";
+
+    // The next run's init, at the new shape and its own level.
+    ASSERT_EQ(
+        fx.collector.initialize(
+            /*cores=*/2, /*threads=*/1, /*device_id=*/0, ChipSwimlaneLevel::ORCH_PHASES, retained_alloc, nullptr,
+            retained_free
+        ),
+        0
+    ) << "a rebuilt collector must be able to serve ORCH_PHASES from its full init path";
+    EXPECT_NE(orch_pool(fx.collector.get_chip_swimlane_setup_device_ptr())->free_queue.tail, 0u)
+        << "the rebuilt collector serves the level without an orch pool";
+}
+
+// A host-orchestrated run needs no device orch pool at any level, so the
+// escalation refusal must not reach it: this is the runner's own order —
+// `publish_host_phase_run_to_collector` precedes `init_chip_swimlane`.
+TEST(ChipSwimlaneRetainedRunsTest, AHostOrchestratedRetainedRunNeedsNoDeviceOrchPool) {
+    ChipSwimlaneCollector collector;
+    ArtifactRoot dir("orch-host-source");
+    collector.configure_retained_runs(/*retain_across_runs=*/true, simpler::dfx::runs::kDefaultBudgetBytes);
+    collector.set_host_orchestrated(true);
+    ASSERT_EQ(
+        collector.initialize(
+            /*cores=*/1, /*threads=*/1, /*device_id=*/0, ChipSwimlaneLevel::SCHED_PHASES, retained_alloc, nullptr,
+            retained_free
+        ),
+        0
+    );
+    RetainedRunsTeardown teardown(collector, retained_free);
+    void *shm = collector.get_chip_swimlane_setup_device_ptr();
+    ASSERT_NE(shm, nullptr);
+    EXPECT_EQ(orch_pool(shm)->free_queue.tail, 0u) << "a host-orchestrated collector built a device orch pool";
+
+    collector.set_host_orchestrated(true);
+    EXPECT_EQ(
+        collector.initialize(
+            /*cores=*/1, /*threads=*/1, /*device_id=*/0, ChipSwimlaneLevel::ORCH_PHASES, retained_alloc, nullptr,
+            retained_free
+        ),
+        0
+    ) << "a host-orchestrated ORCH_PHASES run was refused a pool it never needed";
+    EXPECT_EQ(orch_pool(shm)->free_queue.tail, 0u) << "an admitted host-orchestrated run built a device orch pool";
+}
+
+// The host-produced half of the capability: two ORCH_PHASES runs whose
+// orchestrator records come from the host each publish their own.
+TEST(ChipSwimlaneRetainedRunsTest, HostOrchestratedRunsPublishTheirOwnPhasesAtOrchPhases) {
+    RetainedRunsFixture fx(
+        "orch-host-two-runs", /*cores=*/1, /*threads=*/1, /*budget_bytes=*/0, ChipSwimlaneLevel::ORCH_PHASES,
+        /*host_orchestrated=*/true
+    );
+    ASSERT_EQ(orch_pool(fx.shm())->free_queue.tail, 0u) << "a host-orchestrated collector built a device orch pool";
+    const int cores[] = {0};
+    constexpr uint64_t kFirst = 41600;
+    constexpr uint64_t kSecond = 41700;
+
+    fx.begin(kFirst);
+    fx.dispatch(0, 1);
+    fx.close_through_boundary(kFirst, cores, 1, [&fx] {
+        fx.collector.set_host_phase_records(host_submit_rows(2), {}, 2, 2, 0);
+    });
+
+    fx.begin(kSecond);
+    fx.dispatch(0, 1);
+    fx.close_through_boundary(kSecond, cores, 1, [&fx] {
+        fx.collector.set_host_phase_records(host_submit_rows(4), {}, 4, 4, 0);
+    });
+
+    ASSERT_TRUE(fx.wait_for_files(2));
+    size_t seen = 0;
+    for (const auto &f : published_files(fx.dir.path())) {
+        const std::string name = f.filename().string();
+        const std::string body = read_file(f);
+        if (name == "records_e41600.json" || name == "records_e41700.json") {
+            seen++;
+            const bool first = name == "records_e41600.json";
+            EXPECT_NE(body.find("\"orchestrator_source\": \"host\""), std::string::npos)
+                << name << " does not name its orchestration source";
+            EXPECT_NE(body.find(recorded_records_field(first ? 2 : 4)), std::string::npos)
+                << name << " lost the host phases it produced";
+            EXPECT_EQ(body.find(recorded_records_field(first ? 4 : 2)), std::string::npos)
+                << name << " carried the other run's host phases";
+            EXPECT_NE(body.find("\"host_orchestrator_phases\""), std::string::npos)
+                << name << " renders no host orchestrator section at ORCH_PHASES";
+        }
+    }
+    EXPECT_EQ(seen, 2u) << "one of the two epochs published no artifact";
 }

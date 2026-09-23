@@ -262,3 +262,143 @@ def test_invalid_launch_marker_does_not_produce_alignment(tmp_path, monkeypatch,
     log.write_text(log.read_text() + f"{head} depth=2 name=chip.run.runner_run.aicpu_launch {attributes}\n")
     _convert(monkeypatch, path)
     assert json.loads(path.read_text())["metadata"]["clock_alignment"]["status"] == "unavailable"
+
+
+def _invocation_lines(*, pid, inv, epoch, root_ts, runner_ts):
+    """One Host invocation's alignment markers, as a run writes them.
+
+    `run_epoch` rides the root span, which is where the runner puts it and
+    where `strace_timing` already reads it from.
+    """
+    head = f"[mono_ns=3000000][T0x1][TIMING] emit_host_span: [STRACE] v=1 pid={pid} tid={pid} inv={inv} hid=abc"
+    return [
+        f"{head} depth=0 name=chip.run ts={root_ts} dur=1010000 "
+        f"run_id=1 dispatch_id=3 slot_id=0 generation=1 run_epoch={epoch}",
+        f"{head} depth=1 name=chip.run.runner_run ts={runner_ts} dur=5000",
+        f"{head} depth=2 name=chip.run.runner_run.device_wall ts=0 dur=2000 clk=dev",
+        f"{head} depth=3 name=chip.run.runner_run.device_wall.sched ts=700 dur=500 clk=dev",
+    ]
+
+
+def _background_capture(tmp_path, epoch):
+    """A capture the collector kept past its own run, named by its run.
+
+    Written where a background-collected artifact lives — a directory of its
+    own, with no `dispatch_identity.json`, because that sidecar stays with the
+    run that produced it.
+    """
+    raw = _capture()
+    raw["metadata"]["collection"] = {
+        "run_epoch": epoch,
+        "session_id": 1,
+        "processing_complete": True,
+        "metadata_complete": True,
+        "verdict": "published",
+    }
+    path = tmp_path / f"records_e{epoch}.json"
+    path.write_text(json.dumps(raw))
+    return path
+
+
+# Two runs of one process overlap on the Host clock — a predecessor's root span
+# is still open while its successor binds — so both contain a successor's host
+# records and containment alone cannot say which invocation produced a capture.
+# The run each capture names is what resolves it, and it resolves to that run's
+# own window rather than to whichever one sorted first.
+def test_background_capture_epoch_picks_its_own_overlapping_invocation(tmp_path, monkeypatch):
+    log = tmp_path / "host_clock_alignment.42.log"
+    log.write_text(
+        "\n".join(
+            _invocation_lines(pid=42, inv=1, epoch=11, root_ts=999_000, runner_ts=2_000_000)
+            + _invocation_lines(pid=42, inv=2, epoch=12, root_ts=999_500, runner_ts=2_500_000)
+        )
+        + "\n"
+    )
+    anchors = {}
+    for epoch in (11, 12):
+        path = _background_capture(tmp_path, epoch)
+        _convert(monkeypatch, path)
+        alignment = json.loads(path.read_text())["metadata"]["clock_alignment"]
+        assert alignment["status"] == "bounded", f"epoch {epoch} did not resolve to one invocation"
+        anchors[epoch] = alignment["host_anchor_ns"]
+    # The two windows are one runner span apart, so each capture landing on its
+    # own run is exactly that difference; landing on the same one would be zero.
+    assert anchors[12] - anchors[11] == 500_000
+
+
+# The counter is per process, so two processes' runs can carry the same number.
+# That is the domain the pid and identity filters own: a bare epoch match must
+# not merge across processes, and the capture stays unaligned instead.
+def test_background_capture_epoch_does_not_match_across_processes(tmp_path, monkeypatch, capsys):
+    log = tmp_path / "host_clock_alignment.42.log"
+    log.write_text(
+        "\n".join(
+            _invocation_lines(pid=42, inv=1, epoch=12, root_ts=999_000, runner_ts=2_000_000)
+            + _invocation_lines(pid=43, inv=1, epoch=12, root_ts=999_500, runner_ts=2_500_000)
+        )
+        + "\n"
+    )
+    path = _background_capture(tmp_path, 12)
+    _convert(monkeypatch, path)
+    assert json.loads(path.read_text())["metadata"]["clock_alignment"]["status"] == "unavailable"
+    assert "clock alignment skipped" in capsys.readouterr().err
+
+
+# The window that fits in time is a different run. Where the logs identify runs
+# at all, the capture's own run has to be among them: a sole surviving candidate
+# is still a candidate, and mapping onto it would publish one run's device
+# timeline against another run's Host clock.
+def test_background_capture_refuses_a_sole_window_from_another_run(tmp_path, monkeypatch, capsys):
+    log = tmp_path / "host_clock_alignment.42.log"
+    log.write_text("\n".join(_invocation_lines(pid=42, inv=1, epoch=11, root_ts=999_000, runner_ts=2_000_000)) + "\n")
+    path = _background_capture(tmp_path, 12)
+    original = copy.deepcopy(json.loads(path.read_text()))
+    _convert(monkeypatch, path)
+    alignment = json.loads(path.read_text())["metadata"]["clock_alignment"]
+    assert alignment["status"] == "unavailable", "a capture was mapped onto another run's invocation"
+    assert "run_epoch" in alignment["reason"]
+    assert "clock alignment skipped" in capsys.readouterr().err
+    result = json.loads(path.read_text())
+    result["metadata"].pop("clock_alignment")
+    assert result == original
+    assert not sc.read_perf_data(path)["timeline_metadata"]["cross_domain_latency_available"]
+
+
+# A capture whose own process contributed no log must not be attributed to
+# another process's run just because that run's number happens to be the only
+# one supplied. Nothing in a capture names its process, so a candidate set the
+# pid and identity filters did not collapse is refused.
+def test_background_capture_refuses_a_candidate_domain_spanning_processes(tmp_path, monkeypatch, capsys):
+    log = tmp_path / "host_clock_alignment.42.log"
+    log.write_text(
+        "\n".join(
+            _invocation_lines(pid=42, inv=1, epoch=11, root_ts=999_000, runner_ts=2_000_000)
+            + _invocation_lines(pid=43, inv=1, epoch=12, root_ts=999_500, runner_ts=2_500_000)
+        )
+        + "\n"
+    )
+    path = _background_capture(tmp_path, 12)
+    _convert(monkeypatch, path)
+    alignment = json.loads(path.read_text())["metadata"]["clock_alignment"]
+    assert alignment["status"] == "unavailable", "a capture was attributed to another process's run"
+    assert "process" in alignment["reason"]
+    assert "clock alignment skipped" in capsys.readouterr().err
+
+
+# Logs written before the root span carried a run: absence of identity is not
+# contradiction, so such a capture keeps the containment behaviour it had.
+def test_background_capture_accepts_logs_without_run_identity(tmp_path, monkeypatch):
+    path, log = _artifacts(tmp_path)
+    (tmp_path / "dispatch_identity.json").unlink()
+    raw = json.loads(path.read_text())
+    raw["metadata"]["collection"] = {
+        "run_epoch": 12,
+        "session_id": 1,
+        "processing_complete": True,
+        "metadata_complete": True,
+        "verdict": "published",
+    }
+    path.write_text(json.dumps(raw))
+    assert "run_epoch" not in log.read_text()
+    _convert(monkeypatch, path)
+    assert json.loads(path.read_text())["metadata"]["clock_alignment"]["status"] == "bounded"

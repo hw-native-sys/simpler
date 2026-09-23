@@ -1093,22 +1093,6 @@ int simpler_prepare_run(
             static_cast<unsigned long long>(state->descriptor.generation),
             static_cast<unsigned long long>(state->descriptor.run_epoch)
         );
-        // Rejected before any collector, producer or claim mutation. A
-        // host-orchestrated run's orchestrator phases come from a host pool with
-        // its own window rather than from the device producers the per-queue cut
-        // covers, and whether a bind is host-orchestrating is only known after
-        // it has already mutated state — so the level, which is known here, is
-        // what the refusal is taken on.
-        if (runner->retains_runs() &&
-            config->enable_chip_swimlane >= static_cast<int32_t>(ChipSwimlaneLevel::ORCH_PHASES)) {
-            LOG_ERROR(
-                "simpler_prepare_run: retaining runs does not support chip_swimlane level %d (ORCH_PHASES); "
-                "run it without collect_across_runs",
-                config->enable_chip_swimlane
-            );
-            destroy_native_run_context(state);
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
         const bool allow_prepared_successor = concurrent_native_prepare_supported_impl() != 0;
         if (!runner->try_reserve_native_run(
                 state, state->descriptor.pipeline_slot, state->descriptor.arena_bank, allow_prepared_successor

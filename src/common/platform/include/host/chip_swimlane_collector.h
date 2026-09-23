@@ -1701,6 +1701,12 @@ private:
      *
      * Idempotent, and a no-op below ORCH_PHASES or when the host orchestrator is
      * this run's record source (it needs no device pool at any level).
+     *
+     * On a collector that retains runs this builds nothing: the run is refused
+     * instead, so the on-demand path stays out of a configuration whose pools
+     * are capped per kind, whose drain owners are resident, and whose earlier
+     * runs may still be unpublished. The level such a collector can serve is
+     * the one its pools were built for on initialize()'s full path.
      */
     int ensure_device_orch_pool(ChipSwimlaneLevel chip_swimlane_level);
 

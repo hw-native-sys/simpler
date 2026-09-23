@@ -535,6 +535,25 @@ int ChipSwimlaneCollector::ensure_device_orch_pool(ChipSwimlaneLevel chip_swimla
     ChipSwimlaneAicpuTaskPool *state = get_orch_phase_buffer_state(shm_host_, 0);
     if (state->free_queue.tail != 0) return 0;
 
+    // A collector that retains runs serves the level its pools were built for
+    // on initialize()'s full path; this on-demand build is not available to it.
+    // The allocations below are charged against no per-kind paired cap and
+    // recorded as no seed, the free-queue words they publish have one runtime
+    // writer — the resident drain owner of that instance — and a failure
+    // partway through leaves buffers the `tail != 0` mark above cannot see.
+    // Refusing here precedes all three, and precedes every predecessor's
+    // records, counters and slots: the caller reports it through init and
+    // unwinds on the NotStarted path.
+    if (retain_across_runs_) {
+        LOG_ERROR(
+            "ChipSwimlane: this collector retains runs and holds no device orch-phase pool, so chip_swimlane level "
+            "%d cannot be served; the pools were built for a lower level. Profile at level %d from this Worker's "
+            "first collected run, or run it without collect_across_runs",
+            static_cast<int>(chip_swimlane_level), static_cast<int>(chip_swimlane_level)
+        );
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+
     constexpr size_t buffer_bytes = sizeof(ChipSwimlaneAicpuOrchPhaseBuffer);
     constexpr int initial_free_count = (PLATFORM_PROF_ORCH_BUFFERS_PER_THREAD < PLATFORM_PROF_SLOT_COUNT) ?
                                            PLATFORM_PROF_ORCH_BUFFERS_PER_THREAD :
