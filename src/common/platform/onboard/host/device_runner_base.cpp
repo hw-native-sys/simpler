@@ -672,6 +672,9 @@ int DeviceRunnerBase::init_kernel_context(
     rc = adopt_borrowed_device(device_id);
     if (rc != 0) return rc;
 
+    rc = ensure_onboard_kernel_hardware_events();
+    if (rc != 0) return rc;
+
     rc = kernel_exec_state_.initialize(device_id_, make_onboard_kernel_context_ops(), context_generation);
     if (rc != 0) {
         LOG_ERROR("init_kernel_context: context stream/event creation failed: %d", rc);

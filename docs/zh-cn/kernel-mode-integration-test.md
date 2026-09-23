@@ -84,6 +84,13 @@ simpler 没有调用过它们。
 | `simpler_kernel_mode_launch` | TMR 编码固定 dispatch packet；HBG 在 Host build 后生成不可变 graph template，并复制本次 HostArgs。两者均通过 binder 在三条 stream 上入队 |
 | `finalize_device` | 释放上下文拥有的资源；测试断言 committed memory 归零 |
 
+kernel init 在核对借用的设备之后、创建 stream/event 之前，选择 CANN **进程级硬件
+capture event** 模式。已有硬件设置直接复用；如果应用已显式固定为软件模式，则返回
+CANN 配置错误，并且尚未创建上下文 stream/event。设置失败后会再次查询，允许另一
+初始化调用并发地先选中硬件模式。CANN 固定使用硬件模式且不支持模式 API 的平台，
+保留其原生行为。该设置影响同进程其他框架算子，close 不会恢复；program 模式的 init
+不执行这项设置。应用应在 kernel Worker 初始化之前确定进程级 event 策略。
+
 init 期间的执行体加载会同步上下文自己的 AICPU stream，因此 init 必须在 capture 之外
 完成。TMR 与 HBG prepare 都不做 stream/event/device 同步，可以在 capture 内调用。
 HBG 的 slot 注册由 init 完成；prepare 只上传 context 自有镜像并保存注册元数据，

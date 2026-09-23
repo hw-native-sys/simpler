@@ -42,6 +42,18 @@ AICPU is a dedicated **non-hidden** stream and AICore is **hidden**. Caller is
 borrowed, and all three handles must differ. The binder validates
 distinct/non-null handles but cannot establish their creation flags.
 
+Kernel-mode initialization selects CANN's process-wide **hardware capture event**
+mode after validating the borrowed device and before creating streams or events.
+An existing hardware setting is reused. If the application explicitly fixed
+software event mode, initialization returns CANN's configuration error before
+creating context resources. A failed setter is rechecked in case another
+initializer selected hardware mode concurrently. Platforms where CANN fixes
+hardware mode and reports the mode API unsupported retain that native behavior.
+The setting affects other framework operators in the same process, survives
+context teardown, and is not changed by program-mode initialization. Configure
+any application-level event policy before initializing a kernel-mode Worker;
+kernel initialization must run outside graph capture.
+
 The owner retains device resources and function/stream/event handles until all
 executions and captured graphs end and external quiescence is established.
 HostArgs is writable exclusive staging. CANN copies it into task-owned storage

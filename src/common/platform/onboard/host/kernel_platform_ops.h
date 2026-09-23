@@ -30,3 +30,11 @@
  * the host.
  */
 KernelContextOps make_onboard_kernel_context_ops();
+
+/**
+ * Require process-wide hardware capture events before creating kernel resources.
+ * Reuses hardware mode, including CANN's fixed hardware-mode platforms. A
+ * conflicting explicit software setting or a CANN query/set failure is returned.
+ * The mode survives context teardown and is shared by every runtime in the process.
+ */
+int ensure_onboard_kernel_hardware_events() noexcept;

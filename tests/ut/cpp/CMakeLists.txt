@@ -528,6 +528,16 @@ target_link_libraries(test_capture_memcpy PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB}
 add_test(NAME test_capture_memcpy COMMAND test_capture_memcpy)
 set_tests_properties(test_capture_memcpy PROPERTIES LABELS "no_hardware")
 
+add_common_utils_test(test_kernel_event_mode common/test_kernel_event_mode.cpp)
+target_sources(test_kernel_event_mode PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/onboard/host/kernel_platform_ops.cpp)
+target_include_directories(test_kernel_event_mode PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+    ${CMAKE_SOURCE_DIR}/capture_stubs
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/onboard/host
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include)
+
 # Kernel-mode entry argument validation: shared by every host-runtime
 # component (real implementation and stub alike), so its rejection rules are
 # provable here without any device or built .so.

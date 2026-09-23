@@ -22,6 +22,9 @@
 #include "common/unified_log.h"
 #include "host/acl_error_log.h"
 
+extern "C" rtError_t rtEventWorkModeGet(uint8_t *mode);
+extern "C" rtError_t rtEventWorkModeSet(uint8_t mode);
+
 namespace {
 
 int get_current_device(void *, int *device_id) noexcept {
@@ -97,6 +100,33 @@ int destroy_event(void *, void *event) noexcept {
 }
 
 }  // namespace
+
+int ensure_onboard_kernel_hardware_events() noexcept {
+    constexpr uint8_t hardware_mode = 1;
+    uint8_t mode = 0;
+    rtError_t rc = rtEventWorkModeGet(&mode);
+    // CANN selects hardware events directly on chips without TASK_VALUE_WAIT;
+    // the event-mode query and setter both report FEATURE_NOT_SUPPORT there.
+    if (rc == ACL_ERROR_RT_FEATURE_NOT_SUPPORT) return 0;
+    if (rc != RT_ERROR_NONE) {
+        LOG_ERROR("kernel init: rtEventWorkModeGet failed: %d", static_cast<int>(rc));
+        ACL_LOG_ERROR_DETAIL(rc);
+        return static_cast<int>(rc);
+    }
+    if (mode == hardware_mode) return 0;
+
+    rc = rtEventWorkModeSet(hardware_mode);
+    if (rc == RT_ERROR_NONE) return 0;
+    // CANN rejects a second setter, including concurrent requests for the same mode.
+    if (rtEventWorkModeGet(&mode) == RT_ERROR_NONE && mode == hardware_mode) return 0;
+    LOG_ERROR(
+        "kernel init: cannot enable process-wide hardware events (rtEventWorkModeSet failed: %d); "
+        "an explicitly configured software event mode cannot be replaced",
+        static_cast<int>(rc)
+    );
+    ACL_LOG_ERROR_DETAIL(rc);
+    return static_cast<int>(rc);
+}
 
 KernelContextOps make_onboard_kernel_context_ops() {
     KernelContextOps ops{};

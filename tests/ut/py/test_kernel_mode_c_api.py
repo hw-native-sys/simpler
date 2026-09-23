@@ -705,6 +705,14 @@ def test_kernel_context_init_respects_runtime_support_on_a_borrowed_device(arch:
                 1,
             )  # fmt: skip
         assert status == 0
+        mode = ctypes.c_uint8()
+        lib.rtEventWorkModeGet.argtypes = [ctypes.POINTER(ctypes.c_uint8)]
+        lib.rtEventWorkModeGet.restype = ctypes.c_int
+        mode_status = lib.rtEventWorkModeGet(ctypes.byref(mode))
+        # CANN fixes hardware mode on chips that do not expose this query.
+        assert mode_status in (0, 207000)
+        if mode_status == 0:
+            assert mode.value == 1
         assert lib.simpler_kernel_mode_supported(ctx) == 1
         # The claim is exclusive for the context's whole life.
         assert (
