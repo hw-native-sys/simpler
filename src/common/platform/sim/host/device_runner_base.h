@@ -48,6 +48,7 @@
 #include "call_config.h"
 #include "prepare_callable_common.h"
 #include "utils/device_arena.h"
+#include "utils/retained_scheduler_storage.h"
 #include "common/kernel_args.h"
 #include "common/device_phase.h"
 #include "common/chip_swimlane_profiling.h"
@@ -230,6 +231,18 @@ public:
         uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **staging_out
     );
     void get_graph_definition_staging(uint32_t pipeline_slot, void **addr, size_t *size);
+    /**
+     * Hand one pipeline slot its retained scheduler-state storage, both sides.
+     *
+     * Same contract as the onboard runner's: grow-only per slot, host side
+     * prepared before the "device" one (host memory here too), the previous
+     * block kept when a replacement cannot be allocated, one failed-release
+     * record per slot that refuses further growth, and no clearing — the
+     * caller writes the whole range it uses before shipping it.
+     */
+    int acquire_scheduler_state_storage(
+        uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **host_out
+    );
     int acquire_sm_mirror(uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out);
     /**
      * Retain the host buffer a run assembles its device execution image in.
@@ -456,6 +469,14 @@ protected:
     void release_callable_state();
     void release_graph_definition_blocks();
 
+    /**
+     * Release every slot's retained scheduler-state storage.
+     *
+     * Returns the first failing free's code, having attempted every block, and
+     * records each outcome before the slot's entry is cleared.
+     */
+    int release_scheduler_state_storage();
+
     /** Drop every retained host SM mirror, returning its pages to the allocator. */
     void release_sm_mirrors();
     void release_run_image_stagings();
@@ -504,6 +525,11 @@ protected:
         std::vector<std::byte> staging;
     };
     std::array<RetainedGraphBlock, PTO_PIPELINE_MAX_DEPTH> graph_definition_blocks_{};
+    // Scheduler-state storage, one retained pair per pipeline slot — see
+    // HostApi acquire_scheduler_state_storage and
+    // utils/retained_scheduler_storage.h, which holds the grow, alignment and
+    // failure rules.
+    std::array<RetainedSchedulerStorage, PTO_PIPELINE_MAX_DEPTH> scheduler_state_storage_{};
     // Host mirror of the runtime shared memory, one retained buffer per pipeline
     // slot — see HostApi acquire_sm_mirror. A host-side orchestrator writes its
     // whole shared-memory image here and the bind ships the live prefix, so the

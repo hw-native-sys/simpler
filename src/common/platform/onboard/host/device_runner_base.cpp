@@ -599,6 +599,86 @@ void DeviceRunnerBase::get_graph_definition_staging(uint32_t pipeline_slot, void
     if (size != nullptr) *size = block.staging.size();
 }
 
+int DeviceRunnerBase::acquire_scheduler_state_storage(
+    uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **host_out
+) {
+    if (device_out != nullptr) *device_out = nullptr;
+    if (host_out != nullptr) *host_out = nullptr;
+    if (pipeline_slot >= scheduler_state_storage_.size()) return -1;
+    // A runner that cannot accept a run is one whose device generation is
+    // quarantined, so the previous writer of this slot's storage was never
+    // proven stopped and the storage is not handed back for overwriting.
+    if (!can_accept_run()) {
+        LOG_ERROR("scheduler-state storage: refusing slot %u on a runner that cannot accept a run", pipeline_slot);
+        return -1;
+    }
+
+    const RetainedSchedulerStorage::Status status = scheduler_state_storage_[pipeline_slot].acquire(
+        bytes, alignment,
+        [this](size_t raw_bytes) -> void * {
+            // The tracking slot is taken before the device allocation, so the
+            // bookkeeping that follows a successful one cannot fail or throw
+            // and leave an untracked block behind.
+            MemoryAllocator::Reservation reservation = mem_alloc_.begin_reservation();
+            return reservation.commit_alloc(raw_bytes);
+        },
+        [this](void *ptr) {
+            return mem_alloc_.free(ptr);
+        },
+        device_out, host_out
+    );
+    if (status == RetainedSchedulerStorage::Status::Ok) {
+        // Not a failure of this acquire: the slot kept a block it could not
+        // release, the allocator still tracks and counts it, and the slot
+        // refuses to grow until its terminal release.
+        void *held = scheduler_state_storage_[pipeline_slot].held_after_failed_release();
+        if (held != nullptr) {
+            LOG_WARN(
+                "scheduler-state storage: slot %u still holds device block %p from a failed release; the allocator "
+                "owns it and this slot refuses further growth",
+                pipeline_slot, held
+            );
+        }
+        return 0;
+    }
+    LOG_ERROR(
+        "scheduler-state storage: slot %u cannot serve %zu bytes (alignment %zu): status %u", pipeline_slot, bytes,
+        alignment, static_cast<uint32_t>(status)
+    );
+    return -1;
+}
+
+int DeviceRunnerBase::release_scheduler_state_storage() {
+    int first_error = 0;
+    uint32_t slot = 0;
+    for (RetainedSchedulerStorage &entry : scheduler_state_storage_) {
+        const int rc = entry.release([this, slot](void *ptr) {
+            const int free_rc = mem_alloc_.free(ptr);
+            if (free_rc != 0) {
+                // Recorded before the entry is cleared. The address stays in
+                // the allocator's tracking map with its bytes still committed,
+                // so reclamation is unknown rather than proven and the block
+                // reaches the allocator's own terminal sweep.
+                LOG_ERROR(
+                    "scheduler-state storage: release of slot %u device block %p failed: %d; it stays committed in "
+                    "the allocator for its terminal sweep",
+                    slot, ptr, free_rc
+                );
+            }
+            return free_rc;
+        });
+        if (rc != 0 && first_error == 0) first_error = rc;
+        ++slot;
+    }
+    return first_error;
+}
+
+void DeviceRunnerBase::abandon_scheduler_state_storage() {
+    for (RetainedSchedulerStorage &entry : scheduler_state_storage_) {
+        entry.abandon();
+    }
+}
+
 int DeviceRunnerBase::acquire_sm_mirror(uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out) {
     if (addr_out == nullptr) return -1;
     *addr_out = nullptr;
@@ -2277,6 +2357,7 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
 
     if (abandon_device_resources) {
         abandon_graph_definition_blocks();
+        abandon_scheduler_state_storage();
         retained_temp_addrs_.fill(nullptr);
         retained_temp_sizes_.fill(0);
         // Forget the mappings without unregistering: the reset invalidated them
@@ -2284,6 +2365,7 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
         (void)child_memory_host_views_.take_all();
     } else {
         release_graph_definition_blocks();
+        capture(release_scheduler_state_storage());
         clear_temporary_buffer();
     }
     // Pure host memory, so both are returned on either path — a force reset

@@ -230,6 +230,18 @@ acquire_retained_temp(void *runner_ctx, uint32_t pipeline_slot, size_t bytes, vo
     }
 }
 
+static int acquire_scheduler_state_storage(
+    void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **host_out
+) {
+    if (runner_ctx == nullptr) return -1;
+    try {
+        return static_cast<SimDeviceRunnerBase *>(runner_ctx)
+            ->acquire_scheduler_state_storage(pipeline_slot, bytes, alignment, device_out, host_out);
+    } catch (...) {
+        return -1;
+    }
+}
+
 static int acquire_graph_definition_block(
     void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **staging_out
 ) {
@@ -403,6 +415,7 @@ static const HostApiOps g_host_api_ops = {
     .acquire_retained_temp = acquire_retained_temp,
     .acquire_graph_definition_block = acquire_graph_definition_block,
     .get_graph_definition_staging = get_graph_definition_staging,
+    .acquire_scheduler_state_storage = acquire_scheduler_state_storage,
     .acquire_sm_mirror = acquire_sm_mirror,
     .acquire_run_image_staging = acquire_run_image_staging,
     .setup_static_arena = setup_static_arena_wrapper,

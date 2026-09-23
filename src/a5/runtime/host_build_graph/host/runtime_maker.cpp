@@ -408,10 +408,13 @@ static void release_run_tensor_leases(Runtime *runtime, const HostApi *api) {
 
 namespace {
 
+// What a run's scheduler state leaves behind for the readers that come after
+// its bind: where the state is on the device, the layout that describes it, and
+// the HostApi the D2H readback goes through. The storage itself belongs to the
+// runner's pipeline slot, not here, so this record owns nothing and ends with
+// the run.
 struct SchedulerStateOwner {
-    void *allocation;
     void *state_base;
-    uint64_t allocation_size;
     AicoreSchedulerLayout layout;
     const HostApi *api;
 };
@@ -966,21 +969,21 @@ struct GraphHostStateBinding {
 };
 
 // The two bootstrap words move together: a resident base surviving a legacy
-// selection would name a freed allocation, and a mode without its base would send
-// the AICore to a null context. Every selection path goes through
-// publish_scheduler_bootstrap.
-void release_scheduler_state(Runtime *runtime, const HostApi *api) {
-    if (runtime == nullptr || api == nullptr) return;
-    SchedulerStateOwner owner{};
+// selection would name storage this run no longer describes, and a mode without
+// its base would send the AICore to a null context. Every selection path goes
+// through publish_scheduler_bootstrap.
+//
+// The storage that base named belongs to the pipeline slot. What ends here is
+// this run's claim on it — the record, the bootstrap words and the handshake
+// words — and the slot's next run re-initializes and re-ships the whole range
+// before naming it again. Nothing is freed here; the slot cannot be re-entered
+// before this run has released its bindings, which is where this runs from.
+void release_scheduler_state(Runtime *runtime) {
+    if (runtime == nullptr) return;
     {
         std::scoped_lock lock(scheduler_state_owners_mutex);
-        auto it = scheduler_state_owners.find(runtime);
-        if (it != scheduler_state_owners.end()) {
-            owner = it->second;
-            scheduler_state_owners.erase(it);
-        }
+        scheduler_state_owners.erase(runtime);
     }
-    if (owner.allocation != nullptr) api->device_free(owner.allocation);
     runtime->publish_scheduler_bootstrap(0, 0);
     for (int32_t i = 0; i < runtime->get_worker_count(); ++i) {
         runtime->dev.workers[i].aicpu_ready = 0;
@@ -1003,7 +1006,7 @@ bool create_scheduler_state(
     Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
     uint64_t task_window_size, const sm_layout::SegmentOffsets &device_segments
 ) {
-    release_scheduler_state(runtime, api);
+    release_scheduler_state(runtime);
     if (total_tasks < 0 || task_window_size == 0 || static_cast<uint64_t>(total_tasks) > task_window_size) {
         LOG_ERROR(
             "A5 HBG AICore scheduler: invalid graph size tasks=%d window=%" PRIu64, total_tasks, task_window_size
@@ -1194,21 +1197,29 @@ bool create_scheduler_state(
     layout.aiv_worker_demand = aiv_worker_demand;
 
     const uint64_t allocation_size = layout.total_size + SCHEDULER_STATE_ALIGNMENT - 1;
-    void *allocation = api->device_malloc(static_cast<size_t>(allocation_size));
-    if (allocation == nullptr) {
-        LOG_ERROR("A5 HBG AICore scheduler: failed to allocate %" PRIu64 " scheduler state bytes", allocation_size);
+    // The slot's retained pair, each side aligned with at least total_size
+    // behind it. Handed over uninitialized and never carrying anything between
+    // runs: the initialization below writes this run's whole length, and the
+    // publication ships it.
+    void *device_state = nullptr;
+    void *host_base = nullptr;
+    if (api->acquire_scheduler_state_storage(
+            static_cast<size_t>(layout.total_size), static_cast<size_t>(SCHEDULER_STATE_ALIGNMENT), &device_state,
+            &host_base
+        ) != 0 ||
+        device_state == nullptr || host_base == nullptr) {
+        LOG_ERROR(
+            "A5 HBG AICore scheduler: failed to obtain %" PRIu64 " scheduler state bytes (%" PRIu64 " with alignment)",
+            layout.total_size, allocation_size
+        );
         return false;
     }
-    const uintptr_t aligned_address = (reinterpret_cast<uintptr_t>(allocation) + SCHEDULER_STATE_ALIGNMENT - 1) &
-                                      ~(static_cast<uintptr_t>(SCHEDULER_STATE_ALIGNMENT) - 1);
+    const uintptr_t aligned_address = reinterpret_cast<uintptr_t>(device_state);
 
-    std::vector<uint8_t> storage(static_cast<size_t>(allocation_size));
-    const uintptr_t host_aligned_address =
-        (reinterpret_cast<uintptr_t>(storage.data()) + SCHEDULER_STATE_ALIGNMENT - 1) &
-        ~(static_cast<uintptr_t>(SCHEDULER_STATE_ALIGNMENT) - 1);
-    void *host_base = reinterpret_cast<void *>(host_aligned_address);
+    // The only pass over this run's total_size: it zeroes and fills the whole
+    // length, which is what makes a retained block's previous contents
+    // unreachable.
     if (!scheduler_init_data_from_layout(host_base, layout)) {
-        api->device_free(allocation);
         LOG_ERROR("A5 HBG AICore scheduler: failed to initialize scheduler state");
         return false;
     }
@@ -1292,13 +1303,12 @@ bool create_scheduler_state(
     {
         std::scoped_lock lock(scheduler_state_owners_mutex);
         scheduler_state_owners.emplace(
-            runtime,
-            SchedulerStateOwner{allocation, reinterpret_cast<void *>(aligned_address), allocation_size, layout, api}
+            runtime, SchedulerStateOwner{reinterpret_cast<void *>(aligned_address), layout, api}
         );
     }
     runtime->add_pending_metadata(
         reinterpret_cast<void *>(aligned_address), host_base, static_cast<size_t>(layout.total_size),
-        HostPhaseKind::Count, {}, std::move(storage)
+        HostPhaseKind::Count, {}
     );
     LOG_INFO("A5 HBG: selected AICore Scheduler for %d tasks", total_tasks);
     return true;
@@ -2186,7 +2196,8 @@ extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
 extern "C" int copy_in_run_inputs_impl(const Runtime * /*runtime*/, const HostApi * /*api*/) { return 0; }
 
 /**
- * Release the tensor bindings the bind recorded, and the scheduler state its bind stood up.
+ * Release the tensor bindings the bind recorded, and end this run's claim on
+ * the scheduler state it published.
  *
  * Its own entry rather than the tail of the copy-back, so that reading a run's
  * results and retiring the device memory behind them are separately orderable.
@@ -2200,7 +2211,7 @@ extern "C" int release_run_bindings_impl(Runtime *runtime, const HostApi *api) {
     host_phase_trace_end(api);
     runtime->clear_pending_publication();
     release_run_tensor_leases(runtime, api);
-    release_scheduler_state(runtime, api);
+    release_scheduler_state(runtime);
     // The dispatch table is owned by bind_callable_to_runtime, which clears it
     // before replaying the active callable's addresses. The chip-callable device
     // buffer behind those addresses is pool-managed by DeviceRunner (keyed by

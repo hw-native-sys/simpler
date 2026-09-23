@@ -98,6 +98,34 @@ struct HostApiOps {
     // into it — the run's total is not known until every recording has ended, so
     // the capacity on offer is whatever the previous bind left behind.
     void (*get_graph_definition_staging)(void *runner_ctx, uint32_t pipeline_slot, void **addr, size_t *size);
+    // Runner-owned storage for one pipeline slot's device-side scheduler state,
+    // both sides of it: `device_out` receives the device block the scheduler
+    // reads and `host_out` the block the caller builds that state in before the
+    // single H2D that ships it. Both are aligned to `alignment` (a power of
+    // two) with at least `bytes` usable behind them, and the caller owns every
+    // offset inside them. Both are the aligned base rather than the allocation
+    // it sits in; nothing here hands out a pointer a free would take.
+    //
+    // Grow-only retention per slot: a request that fits the retained capacity
+    // reuses it, a larger one replaces it, and both sides are released at Worker
+    // finalization. Neither block is cleared here — the caller re-initializes
+    // and re-uploads the whole range it uses on every run, so a retained block
+    // carries nothing between runs.
+    //
+    // Reuse is the slot's, never a run's: the caller acquires during its bind,
+    // and a slot admits one run at a time, so the storage a bind receives was
+    // last used by a run of the same slot that has already released its
+    // bindings. A runner that cannot accept a run refuses this outright rather
+    // than handing back storage whose previous device writer was never proven
+    // stopped. Returns 0 on success.
+    //
+    // This table is internal to one build: it carries no version and callers
+    // index it by member, so the platform library and every runtime library
+    // that reads it are compiled and installed together. Adding an entry here
+    // therefore needs no compatibility handling and offers none.
+    int (*acquire_scheduler_state_storage)(
+        void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **host_out
+    );
     // Runner-owned host mirror of the runtime shared memory, one retained buffer
     // per pipeline slot: the block a host-side orchestrator (host_build_graph)
     // writes its shared-memory image into before the bounded H2D ships the live
@@ -259,6 +287,16 @@ public:
             return;
         }
         ops_->get_graph_definition_staging(runner_ctx_, pipeline_slot_, addr, size);
+    }
+    int acquire_scheduler_state_storage(size_t bytes, size_t alignment, void **device_out, void **host_out) const {
+        if (ops_->acquire_scheduler_state_storage == nullptr) {
+            if (device_out != nullptr) *device_out = nullptr;
+            if (host_out != nullptr) *host_out = nullptr;
+            return -1;
+        }
+        return ops_->acquire_scheduler_state_storage(
+            runner_ctx_, pipeline_slot_, bytes, alignment, device_out, host_out
+        );
     }
     int acquire_sm_mirror(size_t bytes, size_t alignment, void **addr_out) const {
         if (ops_->acquire_sm_mirror == nullptr) {

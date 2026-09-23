@@ -25,6 +25,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -192,6 +193,23 @@ struct FakeHostApi {
     std::vector<uint8_t> definition_device;
     std::vector<uint8_t> definition_staging;
     size_t definition_bytes{0};
+    // One pipeline slot's retained scheduler-state pair, as the runner holds
+    // it: grow-only, so a bind that fits the retained capacity gets the same
+    // two addresses back and allocates nothing. `grows` counts replacements,
+    // `scheduler_acquires` the requests.
+    struct SchedulerStateSlot {
+        // The raw allocation, which is what a free takes.
+        void *device{nullptr};
+        // The aligned base inside it, which is what the acquire hands out and
+        // what a run publishes. Distinct from `device` whenever malloc returns
+        // an address the alignment has to move.
+        void *device_published{nullptr};
+        std::vector<uint8_t> host;
+        size_t capacity{0};
+        int grows{0};
+    };
+    std::array<SchedulerStateSlot, PTO_PIPELINE_MAX_DEPTH> scheduler_slots{};
+    int scheduler_acquires{0};
     size_t definition_offset{0};
     int copy_count{0};
     int fail_copy_on{0};
@@ -249,6 +267,12 @@ struct FakeHostApi {
         live.clear();
         retained_addr = nullptr;
         retained_size = 0;
+        // The runner's finalize returns these; a bind never does, which is what
+        // the retention means.
+        for (SchedulerStateSlot &slot : scheduler_slots) {
+            slot = SchedulerStateSlot{};
+        }
+        scheduler_acquires = 0;
     }
 };
 
@@ -281,6 +305,15 @@ void ordinary_orch_entry(const ChipTaskArgs &) {
     MixedKernels kernels{};
     kernels.aiv0_kernel_id = 0;
     ASSERT_TRUE(g_orch_runtime->orchestrator->submit_task(kernels, args).task_id().is_valid());
+}
+
+void two_task_orch_entry(const ChipTaskArgs &) {
+    CoreTaskArgs args;
+    MixedKernels kernels{};
+    kernels.aiv0_kernel_id = 0;
+    for (int i = 0; i < 2; ++i) {
+        ASSERT_TRUE(g_orch_runtime->orchestrator->submit_task(kernels, args).task_id().is_valid());
+    }
 }
 
 void mixed_orch_entry(const ChipTaskArgs &) {
@@ -376,6 +409,33 @@ int fake_acquire_graph_definition_block(void *, uint32_t, size_t bytes, size_t a
     *stage = g_fake->definition_staging.data() + g_fake->definition_offset;
     return 0;
 }
+int fake_acquire_scheduler_state_storage(
+    void *runner_ctx, uint32_t slot, size_t bytes, size_t alignment, void **device_out, void **host_out
+) {
+    *device_out = nullptr;
+    *host_out = nullptr;
+    if (slot >= g_fake->scheduler_slots.size() || bytes == 0 || alignment == 0) return -1;
+    auto &entry = g_fake->scheduler_slots[slot];
+    ++g_fake->scheduler_acquires;
+    if (entry.device == nullptr || entry.capacity < bytes) {
+        void *grown = fake_device_malloc(runner_ctx, bytes + alignment - 1);
+        if (grown == nullptr) return -1;
+        if (entry.device != nullptr) fake_device_free(runner_ctx, entry.device);
+        entry.device = grown;
+        entry.host.assign(bytes + alignment - 1, 0);
+        entry.capacity = bytes;
+        ++entry.grows;
+    }
+    const auto align = [alignment](void *p) {
+        const auto raw = reinterpret_cast<uintptr_t>(p);
+        return reinterpret_cast<void *>((raw + alignment - 1) & ~static_cast<uintptr_t>(alignment - 1));
+    };
+    entry.device_published = align(entry.device);
+    *device_out = entry.device_published;
+    *host_out = align(entry.host.data());
+    return 0;
+}
+
 void fake_get_graph_definition_staging(void *, uint32_t, void **addr, size_t *size) {
     if (addr != nullptr) {
         *addr = g_fake->definition_bytes == 0 ? nullptr : g_fake->definition_staging.data() + g_fake->definition_offset;
@@ -425,6 +485,7 @@ const HostApiOps &fake_ops() {
         };
         r.acquire_graph_definition_block = fake_acquire_graph_definition_block;
         r.get_graph_definition_staging = fake_get_graph_definition_staging;
+        r.acquire_scheduler_state_storage = fake_acquire_scheduler_state_storage;
         return r;
     }();
     return ops;
@@ -456,9 +517,11 @@ protected:
         }
     }
 
-    // a5 keeps scheduler allocations in a runtime-address keyed owner table.
-    // Release that ownership while the runtime and its fake bank still exist;
-    // freeing the fake allocations alone leaves a stale owner for a later test.
+    // a5 keeps a runtime-address keyed record of the scheduler state a run
+    // published — where it is and how it is laid out, for the readers that come
+    // after the bind. Drop that record while the runtime and its fake bank
+    // still exist, or a later test inherits a stale one. The storage it
+    // describes is the pipeline slot's and outlives every run.
     auto cleanup_runtime(Runtime &rt) {
         return RAIIScopeGuard([this, &rt, bank = g_fake]() {
             FakeHostApi *saved = g_fake;
@@ -485,6 +548,19 @@ protected:
             g_recording_runtime = nullptr;
             g_recording = nullptr;
         });
+    }
+
+    // What may still be allocated once a run has released its bindings: every
+    // block a bind took for that run is back, and the only survivors are the
+    // scheduler-state blocks their pipeline slots retain. Compared by identity
+    // rather than by count, so a leak of any other buffer is still caught and
+    // so the surviving addresses are the ones the slots actually hold.
+    void expect_only_slot_scheduler_storage_live() const {
+        std::unordered_set<void *> retained;
+        for (const FakeHostApi::SchedulerStateSlot &slot : fake_.scheduler_slots) {
+            if (slot.device != nullptr) retained.insert(slot.device);
+        }
+        EXPECT_EQ(fake_.live, retained);
     }
 
     int bind(Runtime &rt, const ChipStorageTaskArgs &args, const ArgDirection *sig, int n) {
@@ -917,11 +993,11 @@ TEST_F(HbgBindLedgerTest, SchedulerModeChangesPublishOnlyThisRunsSources) {
             EXPECT_EQ(std::memcmp(destinations[i], snapshots[i].data(), snapshots[i].size()), 0);
         }
         EXPECT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
-        EXPECT_TRUE(fake_.live.empty());
+        expect_only_slot_scheduler_storage_live();
         EXPECT_TRUE(runtime.pending_publication().prerequisites.empty());
         if (a5) {
             // Release clears the host-authored selection, so the next upload cannot
-            // inherit a mode whose allocation this release already freed.
+            // inherit a mode whose state this run no longer describes.
             EXPECT_EQ(runtime.dev.scheduler_bootstrap.runtime_mode, 0u);
             EXPECT_EQ(runtime.dev.scheduler_bootstrap.worker_context_base, 0u);
         }
@@ -965,7 +1041,7 @@ TEST_F(HbgBindLedgerTest, SchedulerPublicationFailureAllowsFreshModeSelection) {
             EXPECT_NE(publish_run_image_impl(&runtime, &api_), 0);
             EXPECT_EQ(fake_.copy_count, failure);
             ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
-            EXPECT_TRUE(fake_.live.empty());
+            expect_only_slot_scheduler_storage_live();
             if (a5) {
                 // A failed publication must leave no selection behind for the next one.
                 EXPECT_EQ(runtime.dev.scheduler_bootstrap.runtime_mode, 0u);
@@ -998,7 +1074,7 @@ TEST_F(HbgBindLedgerTest, SchedulerPublicationFailureAllowsFreshModeSelection) {
             }
             ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
             ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
-            EXPECT_TRUE(fake_.live.empty());
+            expect_only_slot_scheduler_storage_live();
         }
     }
 }
@@ -1034,7 +1110,7 @@ TEST_F(HbgBindLedgerTest, EachMetadataFailureConsumesTheRecordAndStopsLaterWrite
             ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
             region_count = runtime.pending_publication().prerequisites.size() + 1;
             EXPECT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
-            EXPECT_TRUE(fake_.live.empty());
+            expect_only_slot_scheduler_storage_live();
         }
         for (size_t failure = 1; failure <= region_count; ++failure) {
             Runtime runtime;
@@ -1051,7 +1127,7 @@ TEST_F(HbgBindLedgerTest, EachMetadataFailureConsumesTheRecordAndStopsLaterWrite
             EXPECT_NE(publish_run_image_impl(&runtime, &api_), 0);
             EXPECT_EQ(fake_.copy_count, failure);
             EXPECT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
-            EXPECT_TRUE(fake_.live.empty());
+            expect_only_slot_scheduler_storage_live();
             fake_.fail_copy_on = 0;
         }
     }
@@ -1362,4 +1438,195 @@ TEST_F(HbgHostAccessContractTest, DisjointWriterDoesNotPreventReadyInputAccess) 
         EXPECT_EQ(input[1], write ? 0x5a : 0x17);
         if (!write) EXPECT_EQ(access_.reads.back(), 0x17u);
     }
+}
+
+// Everything below drives the a5 resident scheduler path, which only that
+// runtime stands up: a2a3 schedules on the AICPU throughout and acquires no
+// scheduler-state storage at all.
+class HbgResidentSchedulerStorageTest : public HbgBindLedgerTest {
+protected:
+    void SetUp() override {
+        HbgBindLedgerTest::SetUp();
+        if (std::strcmp(get_platform(), "a5sim") != 0) {
+            GTEST_SKIP() << "only a5 host_build_graph stands up a resident scheduler region";
+        }
+    }
+
+    // The one-entry function tables a registration would own: create_scheduler_state
+    // refuses a task whose kernel id has no registered address.
+    void install_callable_tables(Runtime &rt) {
+        callable_ = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0);
+        reinterpret_cast<CoreCallable *>(callable_.data())->set_resolved_addr(0x1000);
+        object_table_[0] = reinterpret_cast<uint64_t>(callable_.data());
+        entry_table_[0] = 0x1000;
+        rt.set_callable_tables(
+            object_table_, reinterpret_cast<uint64_t>(object_table_), reinterpret_cast<uint64_t>(entry_table_), 1
+        );
+    }
+
+    const FakeHostApi::SchedulerStateSlot &slot(uint32_t index) const { return fake_.scheduler_slots[index]; }
+
+    void *published_scheduler_target(const Runtime &rt) const {
+        const auto &prerequisites = rt.pending_publication().prerequisites;
+        return prerequisites.empty() ? nullptr : prerequisites.front().device_target;
+    }
+
+    std::vector<uint8_t> callable_;
+    uint64_t object_table_[1]{};
+    uint64_t entry_table_[1]{};
+};
+
+// The storage belongs to the pipeline slot, not to the run that used it: a
+// second run of the same shape gets the same two blocks back, and the release
+// that ends a run's bindings returns none of it.
+TEST_F(HbgResidentSchedulerStorageTest, ASameSizedRunReusesItsSlotStorageAndAllocatesNothing) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto cleanup = cleanup_runtime(runtime);
+    install_callable_tables(runtime);
+    eps_ = {ordinary_orch_entry, capture_orch_bind};
+    ChipStorageTaskArgs args;
+
+    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+    ASSERT_EQ(fake_.scheduler_acquires, 1);
+    ASSERT_EQ(slot(0).grows, 1);
+    void *const device = slot(0).device;
+    ASSERT_NE(device, nullptr);
+    void *const target = published_scheduler_target(runtime);
+    ASSERT_NE(target, nullptr);
+    EXPECT_GE(runtime.dev.scheduler_bootstrap.worker_context_base, reinterpret_cast<uint64_t>(target));
+
+    ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+    EXPECT_EQ(fake_.live.count(device), 1u) << "the slot keeps its storage past the run that used it";
+    EXPECT_EQ(slot(0).device, device);
+    EXPECT_EQ(runtime.dev.scheduler_bootstrap.worker_context_base, 0u) << "the run's claim on it ends here";
+
+    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+    EXPECT_EQ(fake_.scheduler_acquires, 2);
+    EXPECT_EQ(slot(0).grows, 1) << "a same-sized run allocates nothing";
+    EXPECT_EQ(slot(0).device, device);
+    EXPECT_EQ(published_scheduler_target(runtime), target);
+}
+
+// A wider graph needs more state than the slot retained, so the slot replaces
+// its block — and a narrower run afterwards fits what the wider one left.
+TEST_F(HbgResidentSchedulerStorageTest, AWiderRunGrowsItsSlotAndANarrowerOneReusesIt) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto cleanup = cleanup_runtime(runtime);
+    install_callable_tables(runtime);
+    ChipStorageTaskArgs args;
+
+    eps_ = {ordinary_orch_entry, capture_orch_bind};
+    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+    ASSERT_EQ(slot(0).grows, 1);
+    void *const narrow = slot(0).device;
+    const size_t narrow_capacity = slot(0).capacity;
+
+    ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+
+    eps_ = {two_task_orch_entry, capture_orch_bind};
+    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+    EXPECT_EQ(slot(0).grows, 2) << "a wider graph does not fit the retained capacity";
+    void *const wide = slot(0).device;
+    EXPECT_NE(wide, narrow);
+    EXPECT_GT(slot(0).capacity, narrow_capacity);
+    EXPECT_EQ(fake_.live.count(narrow), 0u) << "the predecessor is released once the replacement is recorded";
+    // The publication names the aligned base this acquire handed out. That base
+    // sits inside the raw allocation above and equals it only when the
+    // allocator happened to return an aligned address, so the two are asserted
+    // separately: one is what a free takes, the other what the device reads.
+    EXPECT_EQ(published_scheduler_target(runtime), slot(0).device_published);
+    EXPECT_GE(
+        static_cast<const uint8_t *>(published_scheduler_target(runtime)), static_cast<const uint8_t *>(slot(0).device)
+    );
+    EXPECT_LT(
+        static_cast<const uint8_t *>(published_scheduler_target(runtime)),
+        static_cast<const uint8_t *>(slot(0).device) + slot(0).capacity
+    );
+
+    ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+
+    eps_ = {ordinary_orch_entry, capture_orch_bind};
+    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+    EXPECT_EQ(slot(0).grows, 2) << "a narrower run reuses what the wider one left";
+    EXPECT_EQ(slot(0).device, wide);
+}
+
+// Two pipeline slots prepare at once, so their storage cannot be one block.
+TEST_F(HbgResidentSchedulerStorageTest, TwoPipelineSlotsHoldDistinctStorage) {
+    static_assert(PTO_PIPELINE_MAX_DEPTH >= 2, "this case needs two pipeline slots");
+    Runtime first;
+    Runtime second;
+    init_runtime(first);
+    init_runtime(second);
+    auto cleanup_first = cleanup_runtime(first);
+    install_callable_tables(first);
+    second.set_callable_tables(
+        object_table_, reinterpret_cast<uint64_t>(object_table_), reinterpret_cast<uint64_t>(entry_table_), 1
+    );
+    eps_ = {ordinary_orch_entry, capture_orch_bind};
+    ChipStorageTaskArgs args;
+    uint64_t win[4] = {8, 0, 0, 0};
+    HostApi other_slot{nullptr, 1, 1, 0, &fake_ops()};
+    auto cleanup_second = RAIIScopeGuard([&second, &other_slot]() {
+        EXPECT_EQ(release_run_bindings_impl(&second, &other_slot), 0);
+    });
+
+    ASSERT_EQ(bind(first, args, nullptr, 0), 0);
+    ASSERT_EQ(bind_callable_to_runtime_impl(&second, &other_slot, &args, &eps_, nullptr, 0, win, nullptr, nullptr), 0);
+
+    EXPECT_EQ(slot(0).grows, 1);
+    EXPECT_EQ(slot(1).grows, 1);
+    EXPECT_NE(slot(0).device, nullptr);
+    EXPECT_NE(slot(1).device, nullptr);
+    EXPECT_NE(slot(0).device, slot(1).device) << "one slot's state must not be the other's";
+    EXPECT_NE(first.dev.scheduler_bootstrap.worker_context_base, second.dev.scheduler_bootstrap.worker_context_base);
+}
+
+// A graph-execution run selects the legacy scheduler, which publishes no
+// context base — and the storage its predecessor retained stays untouched
+// rather than being named by a run that never initialized it.
+TEST_F(HbgResidentSchedulerStorageTest, ALegacyRunNamesNoRetainedStorage) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto cleanup = cleanup_runtime(runtime);
+    install_callable_tables(runtime);
+    ChipStorageTaskArgs args;
+
+    eps_ = {ordinary_orch_entry, capture_orch_bind};
+    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+    ASSERT_EQ(slot(0).grows, 1);
+    void *const retained = slot(0).device;
+    const uint32_t resident_mode = runtime.dev.scheduler_bootstrap.runtime_mode;
+    ASSERT_NE(resident_mode, 0u);
+    const int acquires_after_resident = fake_.scheduler_acquires;
+
+    ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+
+    // A graph-execution run, which is what selects the legacy scheduler: the
+    // orchestration records a Graph body and submits its outer task. A
+    // recording that captures no graph task would leave the resident selection
+    // in place and prove nothing here.
+    eps_ = {recording_orch_entry, capture_orch_bind};
+    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+
+    // The selection this run made, before anything about the storage: the
+    // metadata it published is a Graph Definition block rather than scheduler
+    // state, and its mode is neither unset nor the resident one.
+    const auto &pending = runtime.pending_publication();
+    ASSERT_EQ(pending.prerequisites.size(), 1u);
+    EXPECT_EQ(pending.prerequisites[0].phase, HostPhaseKind::BindGraphUpload);
+    const uint32_t legacy_mode = runtime.dev.scheduler_bootstrap.runtime_mode;
+    EXPECT_NE(legacy_mode, 0u);
+    EXPECT_NE(legacy_mode, resident_mode) << "a graph-execution run selects the legacy scheduler";
+
+    EXPECT_EQ(runtime.dev.scheduler_bootstrap.worker_context_base, 0u)
+        << "a legacy run must not borrow the storage a resident run left";
+    // Untouched, not merely unpublished: the same raw block, no growth, and no
+    // acquire at all, because the legacy branch returns before asking for it.
+    EXPECT_EQ(slot(0).device, retained);
+    EXPECT_EQ(slot(0).grows, 1);
+    EXPECT_EQ(fake_.scheduler_acquires, acquires_after_resident);
+    EXPECT_EQ(fake_.live.count(retained), 1u);
 }

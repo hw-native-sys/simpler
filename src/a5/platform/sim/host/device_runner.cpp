@@ -782,6 +782,9 @@ int DeviceRunner::finalize() {
 
     unload_executor_binaries();
     release_graph_definition_blocks();
+    // Host allocations here, so a failure has no device meaning; this
+    // finalize reports none of its releases, as its siblings above do not.
+    (void)release_scheduler_state_storage();
     release_sm_mirrors();
     release_run_image_stagings();
 

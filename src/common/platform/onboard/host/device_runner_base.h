@@ -62,6 +62,7 @@
 #include "common/dma_workspace.h"
 #include "common/chip_swimlane_profiling.h"
 #include "utils/device_arena.h"
+#include "utils/retained_scheduler_storage.h"
 #include "device_phase_capture.h"
 #include "device_runner_helpers.h"
 #include "aicpu_loader/host/load_aicpu_op.h"
@@ -362,6 +363,29 @@ public:
         uint32_t pipeline_slot, std::size_t bytes, std::size_t alignment, void **device_out, void **staging_out
     );
     void get_graph_definition_staging(uint32_t pipeline_slot, void **addr, std::size_t *size);
+    /**
+     * Hand one pipeline slot its retained scheduler-state storage, both sides.
+     *
+     * `bytes` is what this run uses; the retained capacity may exceed it, and
+     * only the caller's own length is ever initialized, uploaded or read back.
+     * Both outputs are the aligned base, never the allocation it sits in.
+     * Neither block is cleared: the caller writes the whole range it uses
+     * before shipping it.
+     *
+     * Growth prepares the host side first — the side that can fail without
+     * touching the device — and keeps the previously handed-out device block
+     * when the device allocation fails, so a failed growth leaves the slot the
+     * storage its last successful bind published into. A device block whose
+     * release fails is retained in the slot's single failed-release record,
+     * which then refuses any further growth for that slot.
+     *
+     * Refused while the runner cannot accept a run: a quarantined device is one
+     * whose previous writer was never proven stopped, so its slot's storage is
+     * not handed back for overwriting.
+     */
+    int acquire_scheduler_state_storage(
+        uint32_t pipeline_slot, std::size_t bytes, std::size_t alignment, void **device_out, void **host_out
+    );
     int acquire_sm_mirror(uint32_t pipeline_slot, std::size_t bytes, std::size_t alignment, void **addr_out);
     /**
      * Retain the host buffer a run assembles its device execution image in.
@@ -1997,6 +2021,30 @@ protected:
 
     void release_graph_definition_blocks();
 
+    /**
+     * Release every slot's retained scheduler-state storage.
+     *
+     * Returns the first failing free's code, having attempted every block —
+     * the live one and any failed-release record — so one failure cannot
+     * strand the rest. Each outcome is recorded before the slot's entry is
+     * cleared, and an address the allocator could not free stays in its
+     * tracking map with its bytes still committed, which is what hands that
+     * block to the allocator's own terminal sweep rather than dropping it.
+     * Clearing the entry afterwards is what makes a second close a no-op; it
+     * is not a claim that the bytes went back.
+     */
+    int release_scheduler_state_storage();
+
+    /**
+     * Drop every slot's retained scheduler-state storage without a device call.
+     *
+     * The fatal counterpart of release_scheduler_state_storage(): a force reset
+     * has already invalidated the device generation these addresses belong to,
+     * so the host-side bookkeeping and staging are dropped and no allocator or
+     * device function is entered.
+     */
+    void abandon_scheduler_state_storage();
+
     /** Drop every retained host SM mirror, returning its pages to the allocator. */
     void release_sm_mirrors();
     void release_run_image_stagings();
@@ -2241,6 +2289,11 @@ protected:
         std::vector<std::byte> staging;
     };
     std::array<RetainedGraphBlock, PTO_PIPELINE_MAX_DEPTH> graph_definition_blocks_{};
+    // Scheduler-state storage, one retained pair per pipeline slot — see
+    // HostApi acquire_scheduler_state_storage and utils/retained_scheduler_storage.h,
+    // which holds the grow, alignment and failure rules. One pair per slot
+    // because a slot's runs are serialized while two slots' are not.
+    std::array<RetainedSchedulerStorage, PTO_PIPELINE_MAX_DEPTH> scheduler_state_storage_{};
     // Host mirror of the runtime shared memory, one retained buffer per pipeline
     // slot — see HostApi acquire_sm_mirror. A host-side orchestrator writes its
     // whole shared-memory image here and the bind ships the live prefix, so the

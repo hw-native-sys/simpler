@@ -509,6 +509,45 @@ void SimDeviceRunnerBase::get_graph_definition_staging(uint32_t pipeline_slot, v
     if (size != nullptr) *size = block.staging.size();
 }
 
+int SimDeviceRunnerBase::acquire_scheduler_state_storage(
+    uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **host_out
+) {
+    if (device_out != nullptr) *device_out = nullptr;
+    if (host_out != nullptr) *host_out = nullptr;
+    if (pipeline_slot >= scheduler_state_storage_.size()) return -1;
+    if (!can_accept_run()) {
+        LOG_ERROR("scheduler-state storage: refusing slot %u on a runner that cannot accept a run", pipeline_slot);
+        return -1;
+    }
+    const RetainedSchedulerStorage::Status status = scheduler_state_storage_[pipeline_slot].acquire(
+        bytes, alignment,
+        [this](size_t raw_bytes) {
+            return mem_alloc_.alloc(raw_bytes);
+        },
+        [this](void *ptr) {
+            return mem_alloc_.free(ptr);
+        },
+        device_out, host_out
+    );
+    if (status == RetainedSchedulerStorage::Status::Ok) return 0;
+    LOG_ERROR(
+        "scheduler-state storage: slot %u cannot serve %zu bytes (alignment %zu): status %u", pipeline_slot, bytes,
+        alignment, static_cast<uint32_t>(status)
+    );
+    return -1;
+}
+
+int SimDeviceRunnerBase::release_scheduler_state_storage() {
+    int first_error = 0;
+    for (RetainedSchedulerStorage &entry : scheduler_state_storage_) {
+        const int rc = entry.release([this](void *ptr) {
+            return mem_alloc_.free(ptr);
+        });
+        if (rc != 0 && first_error == 0) first_error = rc;
+    }
+    return first_error;
+}
+
 int SimDeviceRunnerBase::acquire_sm_mirror(uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out) {
     if (addr_out == nullptr) return -1;
     *addr_out = nullptr;
