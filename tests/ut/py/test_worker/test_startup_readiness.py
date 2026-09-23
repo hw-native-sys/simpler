@@ -47,6 +47,7 @@ from simpler.worker import RemoteCallable, RemoteWorkerSpec, RunHandle, Worker
 from ._harness import (
     CHIP_INIT_FAILURE,
     TEST_WALL_BUDGET_S,
+    FakeWorkspaceAccounting,
     TickingClock,
     chip_callable,
     fake_chip_l3,
@@ -1728,6 +1729,13 @@ class TestLevel2Lifecycle:
         finalized = {"n": 0}
 
         class _PausingChip:
+            def __init__(self):
+                # close() reads this chip's workspace accounting before it
+                # releases anything, so the double carries the same native
+                # handle the real one does. No budget is latched here, which is
+                # the answer that lets a teardown proceed.
+                self._impl = FakeWorkspaceAccounting()
+
             def init(self, *_a, **_k):
                 entered.set()
                 assert release.wait(10.0)

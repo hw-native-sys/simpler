@@ -182,12 +182,71 @@ class _FakeChipRun:
         return False
 
 
-class _FakeChipImpl:
+# The fields `ChipWorker.workspace_report` fills for an enabled context, as the
+# native accessor builds them. Carried whole rather than narrowed to the two the
+# close gate reads, so a double cannot drift into answering a shape the real
+# accessor never produces.
+_WORKSPACE_REPORT_FIELDS = (
+    "budget_enforced",
+    "coverage_is_partial",
+    "live_blocked",
+    "limit_bytes",
+    "reserved_bytes",
+    "relinquished_bytes",
+    "quarantined_mapped_bytes",
+    "release_unconfirmed_blocks",
+    "quarantined_blocks",
+    "proof_unavailable",
+    "blocks_published",
+    "foreign_release_failures",
+    "last_foreign_release_rc",
+)
+
+
+class FakeWorkspaceAccounting:
+    """The workspace-accounting half of a native handle (``cw._impl``).
+
+    Mirrors the latch the real accessor answers from: ``"disabled"`` exactly
+    while no budget was latched, never for a context that has one. A double that
+    reported a latched budget as absent — or that answered ``"disabled"`` to any
+    caller it had no answer for — would let a teardown release the owner Buffers
+    the real accessor fences, so an absent budget is the only thing that passes
+    here.
+    """
+
+    def __init__(self) -> None:
+        # What `ChipWorker::init` latches. Zero is the default every Worker in
+        # this suite gets, and the only state that answers "disabled".
+        self.workspace_budget_bytes = 0
+        # A latched budget whose accounting cannot be read is a distinct answer
+        # from no budget, and the close gate must refuse on it.
+        self.workspace_report_readable = True
+        # Report fields a test overrides to stand a live consumer up.
+        self.workspace_fields: dict[str, int] = {}
+
+    def latch_workspace_budget(self, limit_bytes: int) -> None:
+        self.workspace_budget_bytes = int(limit_bytes or 0)
+
+    def workspace_report(self) -> tuple[str, dict[str, int] | None]:
+        if not self.workspace_budget_bytes:
+            return ("disabled", None)
+        if not self.workspace_report_readable:
+            return ("unavailable", None)
+        report: dict[str, int] = dict.fromkeys(_WORKSPACE_REPORT_FIELDS, 0)
+        report["budget_enforced"] = 1
+        report["coverage_is_partial"] = 1
+        report["limit_bytes"] = self.workspace_budget_bytes
+        report.update(self.workspace_fields)
+        return ("available", report)
+
+
+class _FakeChipImpl(FakeWorkspaceAccounting):
     """The native-handle half of :class:`FakeChipWorker` (``cw._impl``)."""
 
     supports_concurrent_native_prepare = False
 
     def __init__(self, register_error: str | None = None) -> None:
+        super().__init__()
         self._register_error = register_error
         self.submitted: list[tuple[int, Any]] = []
         self.lane_closed = False
@@ -277,11 +336,15 @@ class FakeChipWorker:
     def copy_from(self, dst: int, src: int, size: int) -> None:
         ctypes.memmove(dst, src, size)
 
-    def init(self, *_a, **_k) -> None:
+    def init(self, *_a, **kwargs) -> None:
         if self.script == "raises":
             raise RuntimeError(CHIP_INIT_FAILURE)
         if self.script == "hangs":
             time.sleep(_HANG_S)
+        # Latched here and nowhere else, as the real init does — and only on the
+        # path that returns, so a failed init leaves nothing latched the way its
+        # rollback does.
+        self._impl.latch_workspace_budget(kwargs.get("workspace_budget_bytes", 0))
 
     def _register_callable_at_slot(self, _cid: int, _target) -> None:
         pass
