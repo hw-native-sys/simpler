@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "acl/acl.h"
 #include "device_runner_helpers.h"
 
 namespace {
@@ -101,6 +102,12 @@ extern "C" rtError_t rtMemcpy(void *dst, uint64_t capacity, const void *src, uin
 }
 extern "C" rtError_t rtStreamQuery(rtStream_t) { return 0; }
 extern "C" const char *aclGetRecentErrMsg() { return nullptr; }
+// These cases drive the publication step with the launch route refused, so the
+// permit never consults a live stream; the query only has to link.
+extern "C" aclError aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus *status, aclmdlRI *) {
+    if (status != nullptr) *status = ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE;
+    return ACL_SUCCESS;
+}
 
 TEST_F(WorkersPublication, TheFirstPublicationOntoABlockCarriesTheHandshakeRegion) {
     ASSERT_EQ(publish_once(), 0);

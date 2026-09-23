@@ -22,6 +22,7 @@
 
 #include <cstring>
 
+#include "acl/acl.h"
 #include "acl/error_codes/rt_error_codes.h"
 #include "common/unified_log.h"
 #include "host/acl_error_log.h"
@@ -77,6 +78,36 @@ int query_stream_pair_error(rtStream_t aicpu_stream, rtStream_t aicore_stream) {
     const int aicpu_rc = query_stream_error(aicpu_stream, "AICPU");
     if (aicpu_rc != 0) return aicpu_rc;
     return query_stream_error(aicore_stream, "AICore");
+}
+
+bool launch_route_permitted_by_capture(int query_rc, int capture_status) {
+    // Anything but a successful "capturing nothing" routes through the
+    // descriptor. An answer the query could not give is treated as capturing:
+    // the descriptor route is always correct, so an unavailable answer costs
+    // this run a longer copy and nothing else.
+    if (query_rc != ACL_SUCCESS) return false;
+    return capture_status == static_cast<int>(ACL_MODEL_RI_CAPTURE_STATUS_NONE);
+}
+
+bool launch_entry_args_permitted(rtStream_t aicpu_stream) {
+    if (aicpu_stream == nullptr) return false;
+    aclmdlRICaptureStatus status = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    aclmdlRI model_ri = nullptr;
+    const aclError rc = aclmdlRICaptureGetInfo(aicpu_stream, &status, &model_ri);
+    if (rc != ACL_SUCCESS) {
+        LOG_INFO("aclmdlRICaptureGetInfo unavailable (%d); entry args take the descriptor route", static_cast<int>(rc));
+    }
+    return launch_route_permitted_by_capture(static_cast<int>(rc), static_cast<int>(status));
+}
+
+int publish_for_launch(KernelArgsHelper &kernel_args, rtStream_t aicpu_stream) {
+    if (kernel_args.runtime_args_published()) return 0;
+    const bool permitted = launch_entry_args_permitted(aicpu_stream);
+    const int rc = kernel_args.publish_runtime_args(permitted);
+    if (rc != 0) {
+        LOG_ERROR("publish_for_launch: this run's Runtime descriptor did not reach the device: %d", rc);
+    }
+    return rc;
 }
 
 int KernelArgsHelper::prepare_runtime_args(

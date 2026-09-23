@@ -10,35 +10,23 @@
  */
 #include "aicpu/platform_entry_args.h"
 
-#include "common/launch_entry_args.h"
+#include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS
 
 namespace {
-// Per-launch, like the register tables beside it: every launched thread writes
-// the same values, and a launch that publishes no entry region leaves the
-// source reading Descriptor so a reader takes the descriptor route.
-const void *g_entry_args_base = nullptr;
-uint32_t g_entry_args_offset = 0;
-uint32_t g_entry_tensor_count = 0;
-uint32_t g_entry_scalar_count = 0;
-uint32_t g_entry_args_source = static_cast<uint32_t>(EntryArgsSource::Descriptor);
+// One slot per gate survivor. Plain objects, because each slot has exactly one
+// writer and one reader and they are the same thread — see the header for why a
+// shared slot cannot be made correct by making it atomic.
+PlatformEntryArgs g_entry_args[MAX_GATE_THREADS];
+
+bool owns_slot(int32_t exec_idx) { return exec_idx >= 0 && exec_idx < MAX_GATE_THREADS; }
 }  // namespace
 
-void set_platform_entry_args(
-    const void *args_base, uint32_t offset, uint32_t tensors, uint32_t scalars, uint32_t source
-) {
-    g_entry_args_base = args_base;
-    g_entry_args_offset = offset;
-    g_entry_tensor_count = tensors;
-    g_entry_scalar_count = scalars;
-    g_entry_args_source = source;
+void set_platform_entry_args(int32_t exec_idx, const PlatformEntryArgs &view) {
+    if (!owns_slot(exec_idx)) return;
+    g_entry_args[exec_idx] = view;
 }
 
-const void *get_platform_entry_args_base() { return g_entry_args_base; }
-
-uint32_t get_platform_entry_args_offset() { return g_entry_args_offset; }
-
-uint32_t get_platform_entry_tensor_count() { return g_entry_tensor_count; }
-
-uint32_t get_platform_entry_scalar_count() { return g_entry_scalar_count; }
-
-uint32_t get_platform_entry_args_source() { return g_entry_args_source; }
+PlatformEntryArgs get_platform_entry_args(int32_t exec_idx) {
+    if (!owns_slot(exec_idx)) return PlatformEntryArgs{};
+    return g_entry_args[exec_idx];
+}

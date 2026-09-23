@@ -459,7 +459,7 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
     // once this run holds the stream it will submit on. What a kernel
     // submission requires is Published, which is established before the
     // transaction opens.
-    if (!prepared->kernel_args.runtime_args_prepared() && !prepared->kernel_args.runtime_args_published()) {
+    if (!prepared->kernel_args.launchable()) {
         LOG_ERROR("launch_execution: this run holds no Runtime descriptor to publish");
         outcome.rc = PTO_RUNTIME_ERR_INVALID_STATE;
         outcome.prepared = std::move(prepared);
@@ -473,7 +473,7 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
     // under this run's execution claim. A failure carries its own error out
     // with the run NotStarted, so nothing was submitted and the run stays
     // rollback-able.
-    if (const int publish_rc = publish_for_launch(*prepared, stream_aicpu_); publish_rc != 0) {
+    if (const int publish_rc = publish_for_launch(prepared->kernel_args, stream_aicpu_); publish_rc != 0) {
         outcome.rc = publish_rc;
         outcome.progress = LaunchProgress::NotStarted;
         outcome.prepared = std::move(prepared);

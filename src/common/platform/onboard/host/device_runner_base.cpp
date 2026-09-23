@@ -2504,31 +2504,6 @@ void DeviceRunnerBase::activate_launch_shape(const Runtime &runtime) {
     block_dim_ = worker_count_ / cores_per_blockdim_;
 }
 
-bool DeviceRunnerBase::launch_entry_args_permitted(rtStream_t aicpu_stream) {
-    if (aicpu_stream == nullptr) return false;
-    aclmdlRICaptureStatus status = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
-    aclmdlRI model_ri = nullptr;
-    const aclError rc = aclmdlRICaptureGetInfo(aicpu_stream, &status, &model_ri);
-    if (rc != ACL_SUCCESS) {
-        // Unknown is treated as capturing. The descriptor route is always
-        // correct, so an unavailable answer costs this run a longer copy and
-        // nothing else; it is not a run failure and is not retried.
-        LOG_INFO("aclmdlRICaptureGetInfo unavailable (%d); entry args take the descriptor route", static_cast<int>(rc));
-        return false;
-    }
-    return status == ACL_MODEL_RI_CAPTURE_STATUS_NONE;
-}
-
-int DeviceRunnerBase::publish_for_launch(PreparedExecution &prepared, rtStream_t aicpu_stream) {
-    if (prepared.kernel_args.runtime_args_published()) return 0;
-    const bool permitted = launch_entry_args_permitted(aicpu_stream);
-    const int rc = prepared.kernel_args.publish_runtime_args(permitted);
-    if (rc != 0) {
-        LOG_ERROR("publish_for_launch: this run's Runtime descriptor did not reach the device: %d", rc);
-    }
-    return rc;
-}
-
 int DeviceRunnerBase::sync_stream_pair(rtStream_t aicpu_stream, rtStream_t aicore_stream) {
     LOG_INFO("=== aclrtSynchronizeStreamWithTimeout AICPU stream ===");
     int rc = aclrtSynchronizeStreamWithTimeout(aicpu_stream, timeout_config_.stream_sync_timeout_ms);

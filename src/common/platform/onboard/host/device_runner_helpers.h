@@ -68,6 +68,29 @@ int query_stream_pair_nonblocking(rtStream_t aicpu_stream, rtStream_t aicore_str
 int query_stream_pair_error(rtStream_t aicpu_stream, rtStream_t aicore_stream);
 
 /**
+ * Whether the launch route is open on `aicpu_stream`.
+ *
+ * True only when the stream answers that it is capturing nothing. A capturing
+ * or invalidated stream, an unavailable answer, and a null stream all say no,
+ * which routes the values through the descriptor instead — the behaviour every
+ * run had before the launch route existed. Read-only: it neither readies nor
+ * retires the stream pair, and asking costs the run nothing when the answer is
+ * no.
+ *
+ * Pass the same stream handle the launch will submit on, resolved and about to
+ * be used, so the answer describes the stream that actually carries the launch.
+ */
+bool launch_entry_args_permitted(rtStream_t aicpu_stream);
+
+/**
+ * How one capture-status answer routes this run, given as its two halves so the
+ * mapping is stated once and separately from the call that obtains it.
+ *
+ * Only a successful query reporting no capture opens the launch route.
+ */
+bool launch_route_permitted_by_capture(int query_rc, int capture_status);
+
+/**
  * The device block one pipeline slot reuses across every run it prepares.
  *
  * Its size is fixed for the runner's lifetime — the runtime variant's device
@@ -203,6 +226,11 @@ struct KernelArgsHelper {
         return runtime_args_state_ == RuntimeArgsState::Prepared && args.runtime_args != nullptr;
     }
 
+    // What a launch entry admits: a run that has published, or one that still
+    // can. Both arches gate on this, so the two cannot disagree about which
+    // states reach a launch.
+    bool launchable() const { return runtime_args_prepared() || runtime_args_published(); }
+
     /**
      * The AICPU launch payload and its length for this run.
      *
@@ -288,6 +316,20 @@ private:
     // not contain the windows the plan names.
     bool build_launch_package();
 };
+
+/**
+ * This run's one descriptor publication, immediately before its launch.
+ *
+ * Asks `aicpu_stream` whether the launch route is open, then consumes the
+ * snapshot prepare captured. Returns 0 only when the copy succeeded and the run
+ * is Published — the state a kernel submission requires. A non-zero return is
+ * the copy's own error and leaves the run unpublished with no launch payload,
+ * so the caller reports it with the run NotStarted and submits nothing.
+ *
+ * Idempotent on an already-published run, which is what lets a launch path call
+ * it unconditionally.
+ */
+int publish_for_launch(KernelArgsHelper &kernel_args, rtStream_t aicpu_stream);
 
 /**
  * Release one slot's persistent device blocks and clear its bookkeeping.

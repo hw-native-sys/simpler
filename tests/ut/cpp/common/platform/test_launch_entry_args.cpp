@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "acl/acl.h"
 #include "device_runner_helpers.h"
 
 namespace {
@@ -87,6 +88,27 @@ extern "C" rtError_t rtMemcpy(void *dst, uint64_t capacity, const void *src, uin
 }
 extern "C" rtError_t rtStreamQuery(rtStream_t) { return 0; }
 extern "C" const char *aclGetRecentErrMsg() { return nullptr; }
+
+// The capture-status query the production permit asks. A case chooses the
+// answer; every other stub here stands in for the same CANN surface the
+// KernelArgsHelper cases already replace.
+namespace {
+struct CaptureAnswer {
+    aclError rc = ACL_SUCCESS;
+    aclmdlRICaptureStatus status = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    int queries = 0;
+    const void *last_stream = nullptr;
+} capture;
+}  // namespace
+
+extern "C" aclError aclmdlRICaptureGetInfo(aclrtStream stream, aclmdlRICaptureStatus *status, aclmdlRI *modelRI) {
+    ++capture.queries;
+    capture.last_stream = stream;
+    if (modelRI != nullptr) *modelRI = nullptr;
+    if (capture.rc != ACL_SUCCESS) return capture.rc;
+    if (status != nullptr) *status = capture.status;
+    return ACL_SUCCESS;
+}
 
 // A launch entry must admit a prepared run, because publication is the first
 // thing the launch does; only a kernel submission needs Published.
@@ -180,6 +202,137 @@ TEST_F(LaunchEntryArgs, ASnapshotIsPublishedAtMostOnce) {
     EXPECT_NE(publish(true), 0);
     EXPECT_NE(publish(false), 0);
     EXPECT_EQ(rts.copies, copies_after_publish);
+}
+
+// The production publication step, driven through `publish_for_launch` — the
+// same function both arches' launch paths call — with the capture query
+// answering each way it can. What the route is, is read back off the descriptor
+// that publication actually wrote.
+TEST_F(LaunchEntryArgs, EveryCaptureAnswerRoutesThroughTheProductionPublishStep) {
+    struct Answer {
+        const char *name;
+        aclError rc;
+        aclmdlRICaptureStatus status;
+        bool expect_launch_route;
+    };
+    // Unknown status: a value this build's enum does not name, which a newer
+    // CANN could return. It is not NONE, so it must not open the route.
+    const auto unknown_status = static_cast<aclmdlRICaptureStatus>(99);
+    const Answer answers[] = {
+        {"none", ACL_SUCCESS, ACL_MODEL_RI_CAPTURE_STATUS_NONE, true},
+        {"active", ACL_SUCCESS, ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE, false},
+        {"invalidated", ACL_SUCCESS, ACL_MODEL_RI_CAPTURE_STATUS_INVALIDATED, false},
+        {"unknown status", ACL_SUCCESS, unknown_status, false},
+        {"query error", -7, ACL_MODEL_RI_CAPTURE_STATUS_NONE, false},
+    };
+
+    int stream_storage = 0;
+    auto *stream = static_cast<rtStream_t>(&stream_storage);
+
+    // Initialize the block first: a first publication carries the whole prefix
+    // and stays on the descriptor whatever the query says.
+    capture = {};
+    ASSERT_EQ(prepare(), 0);
+    ASSERT_EQ(publish_for_launch(helper, stream), 0);
+    ASSERT_TRUE(slot.workers_initialized);
+
+    for (const Answer &answer : answers) {
+        SCOPED_TRACE(answer.name);
+        helper.release_run_view();
+        rts = {};
+        capture = {};
+        capture.rc = answer.rc;
+        capture.status = answer.status;
+
+        ASSERT_EQ(prepare(), 0);
+        ASSERT_EQ(publish_for_launch(helper, stream), 0);
+        EXPECT_EQ(capture.queries, 1) << "the permit asks once, and never retries";
+        EXPECT_EQ(capture.last_stream, stream) << "it must ask about the stream the launch will submit on";
+        EXPECT_TRUE(helper.runtime_args_published());
+        EXPECT_EQ(rts.copies, 1);
+
+        const bool launched = answer.expect_launch_route && launch_route_supported(runtime);
+        if (launched) {
+            EXPECT_GT(helper.launch_payload_bytes(), sizeof(KernelArgs));
+        } else {
+            EXPECT_EQ(helper.launch_payload_bytes(), sizeof(KernelArgs));
+        }
+        EXPECT_EQ(
+            helper.args.entry_args_source,
+            static_cast<uint32_t>(launched ? EntryArgsSource::LaunchEnvelope : EntryArgsSource::Descriptor)
+        );
+#ifdef SIMPLER_UT_TRB_RUNTIME
+        EXPECT_EQ(device_descriptor().entry_args_source_, helper.args.entry_args_source)
+            << "the published descriptor and the launch header must name one route";
+#endif
+    }
+}
+
+// A null stream cannot be asked, so it is not asked — and routes through the
+// descriptor, which needs no query to be correct.
+TEST_F(LaunchEntryArgs, ANullStreamIsNotQueriedAndTakesTheDescriptor) {
+    capture = {};
+    ASSERT_EQ(prepare(), 0);
+    ASSERT_EQ(publish_for_launch(helper, nullptr), 0);
+    EXPECT_EQ(capture.queries, 0);
+    EXPECT_TRUE(helper.runtime_args_published());
+    EXPECT_EQ(helper.launch_payload_bytes(), sizeof(KernelArgs));
+}
+
+// What a launch entry admits, as both arches ask it. An unpublished, unprepared
+// run is refused before anything is submitted; a failed publication returns to
+// that state.
+TEST_F(LaunchEntryArgs, LaunchAdmissionTracksThePublicationStates) {
+    int stream_storage = 0;
+    auto *stream = static_cast<rtStream_t>(&stream_storage);
+    capture = {};
+
+    EXPECT_FALSE(helper.launchable()) << "an empty helper names no descriptor to publish";
+
+    ASSERT_EQ(prepare(), 0);
+    EXPECT_TRUE(helper.launchable()) << "prepared is admitted: publication is what the launch does first";
+
+    ASSERT_EQ(publish_for_launch(helper, stream), 0);
+    EXPECT_TRUE(helper.launchable());
+    EXPECT_TRUE(helper.runtime_args_published());
+
+    // Already published: the step is idempotent and asks nothing again.
+    const int queries_before = capture.queries;
+    const int copies_before = rts.copies;
+    EXPECT_EQ(publish_for_launch(helper, stream), 0);
+    EXPECT_EQ(capture.queries, queries_before);
+    EXPECT_EQ(rts.copies, copies_before);
+
+    helper.release_run_view();
+    EXPECT_FALSE(helper.launchable());
+}
+
+// A copy that fails takes the run out of every launchable state, keeps its own
+// error, and leaves nothing that could be submitted as a kernel.
+TEST_F(LaunchEntryArgs, AFailedProductionPublishReturnsItsOwnErrorAndNoPayload) {
+    int stream_storage = 0;
+    auto *stream = static_cast<rtStream_t>(&stream_storage);
+    capture = {};
+    rts.copy_rc = -73;
+
+    ASSERT_EQ(prepare(), 0);
+    EXPECT_EQ(publish_for_launch(helper, stream), -73) << "the rc the copy returned, unchanged";
+    EXPECT_FALSE(helper.launchable()) << "an unpublished run must not reach a kernel submission";
+    EXPECT_FALSE(helper.runtime_args_published());
+    EXPECT_EQ(helper.launch_payload(), nullptr);
+    EXPECT_EQ(helper.launch_payload_bytes(), 0U);
+    EXPECT_FALSE(slot.workers_initialized);
+    EXPECT_EQ(rts.copies, 1) << "one attempt, not a retry";
+}
+
+// The routing table itself, stated once and asked directly, so a status this
+// build does not name cannot drift into opening the route.
+TEST_F(LaunchEntryArgs, OnlyASuccessfulNoCaptureAnswerOpensTheLaunchRoute) {
+    EXPECT_TRUE(launch_route_permitted_by_capture(ACL_SUCCESS, ACL_MODEL_RI_CAPTURE_STATUS_NONE));
+    EXPECT_FALSE(launch_route_permitted_by_capture(ACL_SUCCESS, ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE));
+    EXPECT_FALSE(launch_route_permitted_by_capture(ACL_SUCCESS, ACL_MODEL_RI_CAPTURE_STATUS_INVALIDATED));
+    EXPECT_FALSE(launch_route_permitted_by_capture(ACL_SUCCESS, 99));
+    EXPECT_FALSE(launch_route_permitted_by_capture(-7, ACL_MODEL_RI_CAPTURE_STATUS_NONE));
 }
 
 #ifdef SIMPLER_UT_TRB_RUNTIME

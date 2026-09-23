@@ -903,36 +903,6 @@ public:
     void activate_launch_shape(const Runtime &runtime);
 
     /**
-     * Whether this run may carry its entry values as launch arguments on
-     * `aicpu_stream`.
-     *
-     * True only when the stream answers that it is capturing nothing. A
-     * capturing or invalidated stream, an unavailable answer, and a null stream
-     * all say no, which routes the values through the descriptor instead — the
-     * behaviour every run had before the launch route existed. Read-only: it
-     * neither readies nor retires the stream pair, and asking costs the run
-     * nothing when the answer is no.
-     *
-     * Pass the same stream handle the launch will submit on, resolved and about
-     * to be used, so the answer describes the stream that actually carries the
-     * launch.
-     */
-    bool launch_entry_args_permitted(rtStream_t aicpu_stream);
-
-    struct PreparedExecution;
-
-    /**
-     * Publish this run's descriptor, once, immediately before its launch.
-     *
-     * Consumes the snapshot prepare captured, having first asked
-     * `aicpu_stream` whether the launch route is open. Returns 0 only when the
-     * copy succeeded and the run is Published — the state a kernel submission
-     * requires. A non-zero return is the copy's own error and leaves the run
-     * unpublished with no kernel submitted.
-     */
-    int publish_for_launch(PreparedExecution &prepared, rtStream_t aicpu_stream);
-
-    /**
      * Point a fresh Runtime at a previously-registered callable and complete
      * the per-run binding in one step. Installs the reference to that
      * callable's registration-owned function tables and its

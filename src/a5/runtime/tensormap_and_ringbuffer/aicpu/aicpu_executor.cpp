@@ -236,10 +236,14 @@ namespace {
 // agrees with, adopting them when it does. A descriptor-route run consumes
 // nothing: its values are already in place, and the header only has to say so.
 bool adopt_launch_entry_args(Runtime *runtime, int32_t thread_idx) {
-    const uint32_t source = get_platform_entry_args_source();
-    const uint32_t offset = get_platform_entry_args_offset();
-    const uint32_t tensors = get_platform_entry_tensor_count();
-    const uint32_t scalars = get_platform_entry_scalar_count();
+    // This thread's own slot: `thread_idx` is the gate survivor index the
+    // platform entry published under, on this same thread, so the block the
+    // view names is the one that thread still owns.
+    const PlatformEntryArgs view = get_platform_entry_args(thread_idx);
+    const uint32_t source = view.source;
+    const uint32_t offset = view.offset;
+    const uint32_t tensors = view.tensor_count;
+    const uint32_t scalars = view.scalar_count;
     // Decided before any address is formed from these values; the verdict says
     // which check refused, and Adopt is the only one that licenses the read.
     const LaunchEntryArgsVerdict verdict = classify_launch_entry_args(*runtime, source, offset, tensors, scalars);
@@ -253,7 +257,7 @@ bool adopt_launch_entry_args(Runtime *runtime, int32_t thread_idx) {
         return false;
     }
 
-    const void *base = get_platform_entry_args_base();
+    const void *base = view.args_base;
     if (base == nullptr) {
         LOG_ERROR("Thread %d: launch entry-args base is null", thread_idx);
         return false;

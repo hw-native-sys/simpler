@@ -9,21 +9,36 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * The launch package's entry-argument header, as the platform AICPU entry
- * received it.
+ * The launch package's entry-argument header, as one AICPU thread received it.
  *
- * The platform entry holds the only pointer to this launch's arguments, and the
- * runtime entry takes a `Runtime *` alone — so a runtime that reads entry values
- * from the launch package needs them forwarded, exactly as the register tables
- * and profiling bases already are.
+ * The platform entry holds the only pointer to this launch's arguments and the
+ * runtime entry takes a `Runtime *` alone, so a runtime that reads entry values
+ * from the launch package needs them forwarded — as the register tables and
+ * profiling bases already are. Globals inside the AICPU SO rather than
+ * `thread_local`, per docs/dynamic-linking.md.
  *
- * Stored here rather than handed to the runtime, so the two runtimes need no
- * agreement: one reads these, the other never calls them and keeps taking its
- * entry values from the descriptor. `set_platform_entry_args` is called once per
- * launched AICPU thread with identical values, like every setter beside it.
+ * **One slot per gate survivor, and only that survivor touches it.** Every
+ * launched thread runs the kernel entry with its *own* copy of the launch
+ * arguments, so a single shared slot would be two things at once: a write-write
+ * race between threads storing into it, and a pointer whose owner is whichever
+ * thread happened to win — possibly one the affinity gate dropped, whose copy
+ * is gone by the time a reader dereferences it. Publishing per survivor index
+ * removes both: distinct threads write distinct objects, and the thread that
+ * reads a slot is the thread that wrote it, still inside the call that owns the
+ * block. No atomic is needed because no object here is shared, and nothing is
+ * serialized on the dispatch path.
+ *
+ * `exec_idx` is `platform_aicpu_affinity_thread_idx()`, the gate's deterministic
+ * survivor position, which is also the index `AicpuExecutor::run` assigns roles
+ * by. Publish only after the gate has kept this thread: a dropped thread returns
+ * from the entry and its arguments go with it.
+ *
+ * An index the gate never issued — a variant with no filter gate, where the
+ * index reads -1 — carries no published view and reads as the descriptor route,
+ * which is what those variants use.
  *
  * Nothing here does pointer arithmetic. The base and the offset stay separate
- * until the runtime has checked the offset, the counts, and the source against
+ * until the runtime has checked the offset, the counts and the source against
  * the descriptor's own, because a payload address formed from unchecked values
  * is the thing that must not exist.
  *
@@ -34,23 +49,30 @@
 
 #include <cstdint>
 
-/**
- * Publish this launch's entry-argument header.
- *
- * @param args_base   The launch argument block the platform entry was given
- * @param offset      Byte offset of the entry region inside that block
- * @param tensors     Tensor descriptors the region carries
- * @param scalars     Scalars the region carries
- * @param source      `EntryArgsSource` as an integer; the runtime compares it
- *                    with the descriptor's own before reading anything else
- */
-void set_platform_entry_args(
-    const void *args_base, uint32_t offset, uint32_t tensors, uint32_t scalars, uint32_t source
-);
+#include "common/launch_entry_args.h"
 
-/** The launch argument block, or null when no launch published one. */
-const void *get_platform_entry_args_base();
-uint32_t get_platform_entry_args_offset();
-uint32_t get_platform_entry_tensor_count();
-uint32_t get_platform_entry_scalar_count();
-uint32_t get_platform_entry_args_source();
+/** One thread's view of the launch package's entry region. */
+struct PlatformEntryArgs {
+    const void *args_base{nullptr};
+    uint32_t offset{0};
+    uint32_t tensor_count{0};
+    uint32_t scalar_count{0};
+    uint32_t source{static_cast<uint32_t>(EntryArgsSource::Descriptor)};
+};
+
+/**
+ * Publish this thread's view, after the affinity gate has kept it.
+ *
+ * @param exec_idx  This thread's gate survivor index; an out-of-range index
+ *                  publishes nothing rather than writing a slot it does not own
+ */
+void set_platform_entry_args(int32_t exec_idx, const PlatformEntryArgs &view);
+
+/**
+ * This thread's own published view.
+ *
+ * @param exec_idx  The same index the caller published under. An index outside
+ *                  the gate's range, or one that published nothing, reads as the
+ *                  descriptor route
+ */
+PlatformEntryArgs get_platform_entry_args(int32_t exec_idx);
