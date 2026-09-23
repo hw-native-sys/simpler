@@ -1672,6 +1672,11 @@ class TestLevel2Lifecycle:
         class _PausingChip:
             def __init__(self):
                 build_count["n"] += 1
+                # The owner's close() reads this chip's workspace accounting
+                # before it releases anything, so the double carries the same
+                # native handle the real one does. No budget is latched, which
+                # is the answer that lets a teardown proceed.
+                self._impl = FakeWorkspaceAccounting()
 
             def init(self, *_a, **_k):
                 entered.set()
@@ -1685,6 +1690,7 @@ class TestLevel2Lifecycle:
 
         w = self._make_l2_with_chip(monkeypatch, _PausingChip)
         errs: list = []
+        close_result: list = []
         proceed = threading.Event()
         owner_finished = threading.Event()
         state: dict = {}
@@ -1695,7 +1701,10 @@ class TestLevel2Lifecycle:
             state["build"] = build_count["n"]
             owner_finished.set()
             proceed.wait(10.0)
-            _run_catch(w.close)  # the winning (owner) thread closes
+            # The winning (owner) thread closes, and its outcome is kept: a
+            # teardown that raised here would otherwise leave the cleanup
+            # journal and the native tree unresolved while this test passed.
+            close_result.append(_run_catch(w.close))
 
         t1 = threading.Thread(target=owner_body)
         t1.start()
@@ -1711,6 +1720,13 @@ class TestLevel2Lifecycle:
                 assert errs == [None]
                 assert state["initialized"] is True
                 assert state["build"] == 1
+                # Serialization settled; now let the owner tear the one
+                # ChipWorker down and check that it did. The finally below still
+                # releases and joins the thread if anything above failed first.
+                proceed.set()
+                t1.join(10.0)
+                assert not t1.is_alive()
+                assert close_result == [None]
         finally:
             release.set()
             proceed.set()
