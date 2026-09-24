@@ -481,10 +481,11 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
     // activity streams -- every section after the one that gave up -- while
     // leaving the already-published AicoreTasks in the one shape the reader
     // rejects.
-    std::vector<uint64_t> emitted_tasks;
-    emitted_tasks.reserve(static_cast<size_t>(owner.layout.task_count));
-    for (uint64_t task_id = 0; task_id < owner.layout.task_count; ++task_id) {
-        const SchedulerTaskTrace &trace = traces[task_id];
+    std::vector<uint64_t> emitted_traces;
+    emitted_traces.reserve(static_cast<size_t>(owner.layout.executable_subtask_count));
+    for (uint64_t trace_index = 0; trace_index < owner.layout.executable_subtask_count; ++trace_index) {
+        const SchedulerTaskTrace &trace = traces[trace_index];
+        const uint64_t task_id = trace.task_id;
         if (trace.valid == 0 || trace.kernel_start_cycles == 0 || trace.kernel_end_cycles < trace.kernel_start_cycles ||
             trace.worker_id >= SCHEDULER_WORKER_CAPACITY)
             continue;
@@ -497,15 +498,16 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
             );
             continue;
         }
-        emitted_tasks.push_back(task_id);
+        emitted_traces.push_back(trace_index);
     }
 
     std::ostringstream tasks_json;
     tasks_json << "[";
     bool first_task = true;
     const uint64_t swimlane_run_epoch = api->run_epoch();
-    for (uint64_t task_id : emitted_tasks) {
-        const SchedulerTaskTrace &trace = traces[task_id];
+    for (uint64_t trace_index : emitted_traces) {
+        const SchedulerTaskTrace &trace = traces[trace_index];
+        const uint64_t task_id = trace.task_id;
         const uint64_t receive_to_start =
             trace.ready_observe_cycles != 0 && trace.kernel_start_cycles >= trace.ready_observe_cycles ?
                 trace.kernel_start_cycles - trace.ready_observe_cycles :
@@ -530,8 +532,9 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         std::ostringstream scheduler_tasks_json;
         scheduler_tasks_json << "{\n    \"producer\": \"aicore\",\n    \"records\": [";
         bool first_scheduler_task = true;
-        for (uint64_t task_id : emitted_tasks) {
-            const SchedulerTaskTrace &trace = traces[task_id];
+        for (uint64_t trace_index : emitted_traces) {
+            const SchedulerTaskTrace &trace = traces[trace_index];
+            const uint64_t task_id = trace.task_id;
             if (!first_scheduler_task) scheduler_tasks_json << ",";
             scheduler_tasks_json << "\n      [" << trace.worker_id << ", " << task_id << ", "
                                  << trace.dispatch_end_cycles << ", " << trace.complete_start_cycles << ", "
@@ -597,8 +600,9 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
             SchedPhaseKind::Bootstrap, context.bootstrap_task_count, 0, false
         );
     }
-    for (uint64_t task_id = 0; task_id < owner.layout.task_count; ++task_id) {
-        const SchedulerTaskTrace &trace = traces[task_id];
+    for (uint64_t trace_index = 0; trace_index < owner.layout.executable_subtask_count; ++trace_index) {
+        const SchedulerTaskTrace &trace = traces[trace_index];
+        const uint64_t task_id = trace.task_id;
         if (trace.state_probe_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
             append_scheduler_record(
                 &records[trace.state_probe_scheduler_worker_id], trace.state_probe_start_cycles,
@@ -628,6 +632,8 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
                 trace.refill_loop_iter, SchedPhaseKind::Refill, 1, trace.refill_task_id
             );
         }
+    }
+    for (uint64_t task_id = 0; task_id < owner.layout.task_count; ++task_id) {
         const SchedulerTaskControl &control = controls[task_id];
         if (control.scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
             append_scheduler_record(
@@ -1043,6 +1049,7 @@ bool create_scheduler_state(
     uint64_t executable_task_count = 0;
     uint64_t executable_subtask_count = 0;
     uint64_t gang_task_count = 0;
+    uint64_t mix_task_count = 0;
     uint64_t aic_worker_demand = 0;
     uint64_t aiv_worker_demand = 0;
     int64_t legacy_shape_task_id = -1;
@@ -1156,8 +1163,7 @@ bool create_scheduler_state(
         metadata.flags = scheduler_task_metadata_flags_from_submit_state(
             metadata_active_mask, slot.task_attrs, slot.logical_block_num, fanin_count != 0, inline_dispatch_task
         );
-        metadata.logical_block_num = static_cast<uint16_t>(logical_block_num);
-        metadata.total_required_subtasks = static_cast<uint16_t>(expected_subtasks);
+        metadata.trace_index_base = static_cast<uint32_t>(executable_subtask_count);
         metadata.timing_slot = slot.task_attrs.timing_slot();
         sampled_task_timing_enabled =
             sampled_task_timing_enabled ||
@@ -1171,6 +1177,7 @@ bool create_scheduler_state(
             ++aiv_task_count;
             aiv_worker_demand = std::max<uint64_t>(aiv_worker_demand, logical_block_num * active_aiv_subtasks);
         }
+        if (scheduler_task_is_mix(metadata.flags)) ++mix_task_count;
         if (scheduler_task_is_gang(metadata.flags)) ++gang_task_count;
         executable_subtask_count += expected_subtasks;
         ++executable_task_count;
@@ -1183,7 +1190,7 @@ bool create_scheduler_state(
     if (legacy_shape_task_id >= 0) {
         select_legacy_scheduler(runtime, SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE);
         LOG_INFO(
-            "A5 HBG: retaining AICPU scheduling for task id=%" PRId64 " with MIX, SPMD, or sync-start shape",
+            "A5 HBG: retaining AICPU scheduling for task id=%" PRId64 " with SPMD or sync-start shape",
             legacy_shape_task_id
         );
         return true;
@@ -1192,7 +1199,8 @@ bool create_scheduler_state(
     AicoreSchedulerLayout layout{};
     if (!scheduler_plan_layout(
             static_cast<uint64_t>(total_tasks), aic_task_count, aiv_task_count, &layout,
-            api->chip_swimlane_level() >= static_cast<uint32_t>(ChipSwimlaneLevel::SCHED_PHASES)
+            api->chip_swimlane_level() >= static_cast<uint32_t>(ChipSwimlaneLevel::SCHED_PHASES),
+            executable_subtask_count
         ) ||
         layout.total_size > std::numeric_limits<uint64_t>::max() - (SCHEDULER_STATE_ALIGNMENT - 1)) {
         LOG_ERROR("A5 HBG AICore scheduler: scheduler state layout overflow");
@@ -1262,6 +1270,7 @@ bool create_scheduler_state(
     run_control->error_core_type = UINT64_MAX;
     auto *gang_coordinator = scheduler_state_at<SchedulerGangCoordinator>(host_base, layout.gang_coordinator_offset);
     gang_coordinator->gang_task_count = gang_task_count;
+    gang_coordinator->mix_task_count = mix_task_count;
 
     auto *contexts = scheduler_state_at<SchedulerWorkerContext>(host_base, layout.worker_contexts_offset);
     int32_t aic_rank = 0;
@@ -1303,6 +1312,17 @@ bool create_scheduler_state(
         context.task_window_last_index = task_window_size - 1;
         context.graph_task_count = static_cast<uint64_t>(total_tasks);
         context.worker_index = static_cast<uint64_t>(i);
+        for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot) {
+            const uint64_t offset = context.dispatch_payload_offset + slot * sizeof(DispatchPayload);
+            auto *payload = scheduler_state_at<DispatchPayload>(host_base, offset);
+            const uint64_t device_payload = aligned_address + offset;
+            payload->args[PAYLOAD_LOCAL_CONTEXT_INDEX] = device_payload + offsetof(DispatchPayload, local_context);
+            payload->args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = device_payload + offsetof(DispatchPayload, global_context);
+            payload->local_context.block_idx = 0;
+            payload->local_context.block_num = 1;
+            payload->local_context.async_ctx.task_token = TaskId::invalid();
+            payload->src_payload = 0;
+        }
     }
 
     runtime->publish_scheduler_bootstrap(

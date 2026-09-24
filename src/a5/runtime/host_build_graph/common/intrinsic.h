@@ -62,8 +62,8 @@
  *     issue #900 (PR #899 spmd_paged_attention_highperf); the kernel
  *     compiled, ran without error, and produced wrong output. Use
  *     `get_sub_block_id(args)` instead, which reads from the runtime's
- *     `GlobalContext.sub_block_id`. Resident graph materialization sets it
- *     from the selected AIV task subslot before every dispatch publication.
+ *     `GlobalContext.sub_block_id`. Resident Mix dispatch sets it
+ *     from the final physical AIV placement before publication.
  *
  *   - `get_block_idx()` and `get_block_num()` are not redirected to
  *     simpler's LocalContext either — use the `(args)` variants below
@@ -107,7 +107,7 @@ static constexpr int32_t PAYLOAD_GLOBAL_CONTEXT_INDEX = SPMD_GLOBAL_CONTEXT_INDE
 
 /**
  * Per-dispatch global context, stored in DispatchPayload. Resident graph
- * materialization sets sub_block_id from the selected AIV task subslot; the
+ * Mix dispatch sets sub_block_id from the final physical AIV placement; the
  * legacy scheduler seeds the equivalent per-core value during startup.
  */
 struct GlobalContext {

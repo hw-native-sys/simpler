@@ -127,12 +127,19 @@ using GraphBuffer = BasicGraphBuffer<8192>;
 inline constexpr uint64_t kFixtureCallableCount = 1024;
 
 struct FixtureStorage {
-    explicit FixtureStorage(uint64_t task_count, uint64_t workers = 2) :
+    explicit FixtureStorage(uint64_t task_count, uint64_t workers = 2, uint64_t traces_per_task = 1) :
         test_profiles(workers),
         test_contexts(workers),
         test_graphs(workers),
         local_states(workers) {
-        EXPECT_TRUE(scheduler_plan_layout(task_count, task_count, 0, &layout));
+        for (auto &local : test_contexts)
+            for (auto &lane : local.slots)
+                for (auto &slot : lane)
+                    scheduler_initialize_free_slot(&slot);
+        for (auto &lane : scheduler_local_state.slots)
+            for (auto &slot : lane)
+                scheduler_initialize_free_slot(&slot);
+        EXPECT_TRUE(scheduler_plan_layout(task_count, task_count, 0, &layout, false, task_count * traces_per_task));
         scheduler_state = std::make_unique<SchedulerStateBuffer>(layout);
         run_control = scheduler_state_at<SchedulerRunControl>(scheduler_state->base(), layout.run_control_offset);
         contexts = scheduler_state_at<SchedulerWorkerContext>(scheduler_state->base(), layout.worker_contexts_offset);
@@ -167,8 +174,7 @@ struct FixtureStorage {
             metadata[task].kernel_ids[1] = UINT16_MAX;
             metadata[task].kernel_ids[2] = UINT16_MAX;
             metadata[task].active_mask = 1;
-            metadata[task].logical_block_num = 1;
-            metadata[task].total_required_subtasks = 1;
+            metadata[task].trace_index_base = task;
             metadata[task].flags = SCHEDULER_TASK_EXECUTABLE;
         }
     }

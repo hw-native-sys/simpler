@@ -57,7 +57,7 @@ enum class SchedulerGraphResult : uint64_t {
 
 inline constexpr bool
 scheduler_resident_v0_task_shape_supported(uint32_t active_subtasks, uint32_t logical_block_num, bool sync_start) {
-    return active_subtasks == 1 && logical_block_num == 1 && !sync_start;
+    return active_subtasks >= 1 && active_subtasks <= 3 && logical_block_num == 1 && !sync_start;
 }
 
 struct SchedulerGraphView {
@@ -179,19 +179,22 @@ scheduler_classify_task_shape(const SchedulerGraphView &graph, int64_t task_id, 
     return SchedulerGraphResult::OK;
 }
 
-inline __aicore__ SchedulerGraphResult scheduler_materialize_task_payload_resolved(
-    const SchedulerGraphView &graph, const SchedulerTaskInfo &task, uint64_t function_bin_address,
-    __gm__ DispatchPayload *dispatch_payload, int32_t block_idx = 0, int32_t block_num = 1
+struct SchedulerTaskPayloadArguments {
+    __gm__ uint8_t *tensors{nullptr};
+    __gm__ uint64_t *scalars{nullptr};
+    int32_t tensor_count{0};
+    int32_t scalar_count{0};
+};
+
+inline __aicore__ SchedulerGraphResult scheduler_parse_task_payload_arguments(
+    const SchedulerGraphView &graph, int64_t task_id, SchedulerTaskPayloadArguments *arguments
 ) {
-    if (dispatch_payload == nullptr || function_bin_address == 0 || block_idx < 0 || block_num <= 0 ||
-        block_idx >= block_num) {
-        return SchedulerGraphResult::INVALID_CALLABLE;
-    }
+    if (arguments == nullptr) return SchedulerGraphResult::INVALID_ARGUMENTS;
     if (graph.reserved != 0) return SchedulerGraphResult::INVALID_ARGUMENTS;
-    if (graph.storage_address == 0 || task.task_id < 0 || static_cast<uint64_t>(task.task_id) >= graph.task_count) {
+    if (graph.storage_address == 0 || task_id < 0 || static_cast<uint64_t>(task_id) >= graph.task_count) {
         return SchedulerGraphResult::INVALID_TASK_COUNT;
     }
-    __gm__ uint8_t *payload = scheduler_graph_payload(graph, task.task_id);
+    __gm__ uint8_t *payload = scheduler_graph_payload(graph, task_id);
     int32_t tensor_count = *reinterpret_cast<__gm__ int32_t *>(payload + TASKPAYLOAD_TENSOR_COUNT_OFFSET);
     int32_t scalar_count = *reinterpret_cast<__gm__ int32_t *>(payload + TASKPAYLOAD_SCALAR_COUNT_OFFSET);
     if (tensor_count < 0 || tensor_count > MAX_TENSOR_ARGS || scalar_count < 0 || scalar_count > MAX_SCALAR_ARGS ||
@@ -206,26 +209,54 @@ inline __aicore__ SchedulerGraphResult scheduler_materialize_task_payload_resolv
     if ((tensor_count > 0 && tensors_delta == 0) || (scalar_count > 0 && scalars_delta == 0)) {
         return SchedulerGraphResult::INVALID_ARGUMENTS;
     }
-    dispatch_payload->function_bin_addr = function_bin_address;
-    __gm__ uint8_t *tensors = tensors_field + tensors_delta;
-    __gm__ uint64_t *scalars = reinterpret_cast<__gm__ uint64_t *>(scalars_field + scalars_delta);
-    int32_t n = 0;
-    for (int32_t i = 0; i < tensor_count; ++i) {
-        dispatch_payload->args[n++] =
-            reinterpret_cast<uint64_t>(tensors + static_cast<uint64_t>(i) * TASKPAYLOAD_TENSOR_STRIDE);
-    }
-    for (int32_t i = 0; i < scalar_count; ++i)
-        dispatch_payload->args[n++] = scalars[i];
-
-    dispatch_payload->src_payload = 0;
-    dispatch_payload->local_context.block_idx = block_idx;
-    dispatch_payload->local_context.block_num = block_num;
-    // The AICore scheduler has no deferred-completion slab. Mark the context
-    // non-deferred so async backend adapters take their synchronous fallback.
-    TaskId::assign(dispatch_payload->local_context.async_ctx.task_token, TaskId::invalid());
-    dispatch_payload->args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dispatch_payload->local_context);
-    dispatch_payload->args[PAYLOAD_GLOBAL_CONTEXT_INDEX] =
-        reinterpret_cast<uint64_t>(&dispatch_payload->global_context);
-    dispatch_payload->global_context.sub_block_id = task.subtask_slot == 2 ? 1 : 0;
+    arguments->tensors = tensors_field + tensors_delta;
+    arguments->scalars = reinterpret_cast<__gm__ uint64_t *>(scalars_field + scalars_delta);
+    arguments->tensor_count = tensor_count;
+    arguments->scalar_count = scalar_count;
     return SchedulerGraphResult::OK;
+}
+
+inline __aicore__ SchedulerGraphResult scheduler_materialize_task_payload_resolved(
+    const SchedulerGraphView &graph, const SchedulerTaskInfo &task, uint64_t function_bin_address,
+    __gm__ DispatchPayload *dispatch_payload, const SchedulerTaskPayloadArguments *shared_arguments = nullptr,
+    bool write_arguments = true
+) {
+    if (dispatch_payload == nullptr || function_bin_address == 0) {
+        return SchedulerGraphResult::INVALID_CALLABLE;
+    }
+    SchedulerTaskPayloadArguments parsed{};
+    if (shared_arguments == nullptr) {
+        const SchedulerGraphResult status = scheduler_parse_task_payload_arguments(graph, task.task_id, &parsed);
+        if (status != SchedulerGraphResult::OK) return status;
+        shared_arguments = &parsed;
+    }
+    dispatch_payload->function_bin_addr = function_bin_address;
+    if (write_arguments) {
+        int32_t n = 0;
+        for (int32_t i = 0; i < shared_arguments->tensor_count; ++i) {
+            dispatch_payload->args[n++] = reinterpret_cast<uint64_t>(
+                shared_arguments->tensors + static_cast<uint64_t>(i) * TASKPAYLOAD_TENSOR_STRIDE
+            );
+        }
+        for (int32_t i = 0; i < shared_arguments->scalar_count; ++i)
+            dispatch_payload->args[n++] = shared_arguments->scalars[i];
+    }
+
+    return SchedulerGraphResult::OK;
+}
+
+inline __aicore__ void scheduler_materialize_mix_arguments(
+    const SchedulerTaskPayloadArguments &arguments, __gm__ DispatchPayload *const *targets, uint8_t count
+) {
+    for (int32_t i = 0; i < arguments.tensor_count; ++i) {
+        const uint64_t value =
+            reinterpret_cast<uint64_t>(arguments.tensors + static_cast<uint64_t>(i) * TASKPAYLOAD_TENSOR_STRIDE);
+        for (uint8_t lane = 0; lane < count; ++lane)
+            targets[lane]->args[i] = value;
+    }
+    for (int32_t i = 0; i < arguments.scalar_count; ++i) {
+        const uint64_t value = arguments.scalars[i];
+        for (uint8_t lane = 0; lane < count; ++lane)
+            targets[lane]->args[arguments.tensor_count + i] = value;
+    }
 }

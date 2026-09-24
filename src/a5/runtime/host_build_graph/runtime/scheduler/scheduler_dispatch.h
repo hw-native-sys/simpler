@@ -293,7 +293,9 @@ inline __aicore__ bool scheduler_drain_deferred_aiv_to_peer(
     const int32_t peer_lane = scheduler_deferred_aiv_peer_lane(scheduler_state_base, scheduler);
     if (peer_lane < 0) return true;
     const uint64_t peer_worker_id = scheduler->config.worker_ids[static_cast<uint32_t>(peer_lane)];
-    for (uint32_t pass = 0; pass < 2 && queue->count != 0; ++pass) {
+    // Mix completions enter the main completion scan; pass 1's direct
+    // replacement is valid only for ordinary-only graphs.
+    for (uint32_t pass = 0; pass < (scheduler->has_mix ? 1U : 2U) && queue->count != 0; ++pass) {
         const uint64_t publication =
             pass == 1 ? scheduler_ssbuf_load_relaxed(
                             &ssbuf_region->lanes[static_cast<uint32_t>(peer_lane)].completion.publication

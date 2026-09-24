@@ -179,16 +179,23 @@ static void publish_aicore_task_timing(Runtime *runtime) {
     auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(scheduler_state_base, context->task_metadata_offset);
     auto *traces = scheduler_state_at<SchedulerTaskTrace>(scheduler_state_base, context->trace_cells_offset);
     cache_invalidate_range(metadata, static_cast<size_t>(context->graph_task_count) * sizeof(*metadata));
-    cache_invalidate_range(traces, static_cast<size_t>(context->graph_task_count) * sizeof(*traces));
 
     for (uint64_t task_id = 0; task_id < context->graph_task_count; ++task_id) {
         const int32_t slot = metadata[task_id].timing_slot;
         if (slot < 0 || slot >= NUM_TASK_TIMING_SLOTS) continue;
-        const uint64_t start = traces[task_id].kernel_start_cycles;
-        const uint64_t end = traces[task_id].kernel_end_cycles;
-        if (start == 0 || end <= start) continue;
-        if (start < records[slot].dispatch_cycle) records[slot].dispatch_cycle = start;
-        if (end > records[slot].finish_cycle) records[slot].finish_cycle = end;
+        if (!scheduler_task_is_executable(metadata[task_id].flags)) continue;
+        for (uint8_t subtask = 0; subtask < 3; ++subtask) {
+            if ((metadata[task_id].active_mask & (1U << subtask)) == 0) continue;
+            auto &trace = traces[scheduler_task_trace_index(
+                metadata[task_id].trace_index_base, metadata[task_id].active_mask, subtask
+            )];
+            cache_invalidate_range(&trace, sizeof(trace));
+            const uint64_t start = trace.kernel_start_cycles;
+            const uint64_t end = trace.kernel_end_cycles;
+            if (start == 0 || end <= start) continue;
+            if (start < records[slot].dispatch_cycle) records[slot].dispatch_cycle = start;
+            if (end > records[slot].finish_cycle) records[slot].finish_cycle = end;
+        }
     }
     aicpu_publish_task_timing_tail_usage(1);
 }

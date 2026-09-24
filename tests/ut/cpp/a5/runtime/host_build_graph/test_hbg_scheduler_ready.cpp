@@ -541,6 +541,18 @@ TEST(SchedulerReadyInbox, BootstrapPublishesIndependentDirectoryShards) {
     EXPECT_EQ(directory->core_types[1][1].bits, (UINT64_C(1) << 0) | (UINT64_C(1) << 6));
 }
 
+TEST(SchedulerReadyInbox, BootstrapPublishesMixDirectoryWhenPresent) {
+    FixtureStorage storage(1, 2);
+    auto *local = storage.local_context(&storage.contexts[0]);
+    local->has_mix = true;
+    auto *directory = scheduler_ready_directory_at(storage.scheduler_state->base(), local);
+    directory->bootstrap_ready_types[1] = UINT64_C(1) << SCHEDULER_MIX_QUEUE;
+    ASSERT_TRUE(scheduler_bootstrap_ready_directory_publish(storage.scheduler_state->base(), local, 2));
+    EXPECT_EQ(directory->core_types[SCHEDULER_MIX_QUEUE][0].bits, UINT64_C(1) << 1);
+    EXPECT_EQ(directory->core_types[0][0].bits, 0u);
+    EXPECT_EQ(directory->core_types[1][0].bits, 0u);
+}
+
 TEST(SchedulerReadyInbox, SparseDirectoryWrapsWithinShard) {
     FixtureStorage storage(2, 14);
     GraphBuffer graph(2);
@@ -694,13 +706,13 @@ TEST(SchedulerDispatch, RejectsUnknownTargetCoreType) {
     EXPECT_EQ(storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_INVALID_SHAPE));
 }
 
-TEST(SchedulerDispatch, WrapsGenerationAndRejectsZeroCallable) {
+TEST(SchedulerDispatch, DispatchSequenceIsIndependentOfSlotGenerationAndRejectsZeroCallable) {
     FixtureStorage storage(2, 1);
     GraphBuffer graph(2);
     graph.executable(0, 0);
     graph.executable(1, 0);
     storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIC);
-    SchedulerFreeSlotClaim slot_claim{0, 0, UINT32_MAX, 0};
+    SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
     SchedulerReadyClaim ready_claim{};
     ready_claim.task_id = 0;
 
@@ -712,7 +724,7 @@ TEST(SchedulerDispatch, WrapsGenerationAndRejectsZeroCallable) {
     EXPECT_EQ(storage.scheduler_local_state.slots[0][0].generation, 1u);
     uint32_t pending_slot = UINT32_MAX;
     uint64_t publication = 0;
-    ASSERT_TRUE(scheduler_local_ready_pop(&storage.scheduler_local_state, 0, &pending_slot, &publication));
+    ASSERT_TRUE(scheduler_local_ready_pop(&storage.scheduler_local_state, &pending_slot, &publication));
     EXPECT_EQ(pending_slot, 0u);
     EXPECT_EQ(publication, scheduler_dispatch_publication(1, SchedulerDispatchSlotState::READY));
 

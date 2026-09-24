@@ -632,6 +632,8 @@ inline constexpr uint64_t SCHEDULER_STATE_ALIGNMENT = 128;
 inline constexpr uint64_t SCHEDULER_WORKER_CAPACITY = 108;
 inline constexpr uint32_t SCHEDULER_PENDING_SLOT_COUNT = 2;
 inline constexpr uint32_t SCHEDULER_CORE_TYPE_COUNT = 2;
+inline constexpr uint32_t SCHEDULER_READY_QUEUE_COUNT = 3;
+inline constexpr uint32_t SCHEDULER_MIX_QUEUE = 2;
 inline constexpr uint32_t SCHEDULER_CLUSTER_CAPACITY = SCHEDULER_WORKER_CAPACITY / 3;
 inline constexpr uint32_t SCHEDULER_CAPACITY = SCHEDULER_CLUSTER_CAPACITY;
 inline constexpr uint32_t SCHEDULER_GANG_COHORT_COUNT = 2;
@@ -738,10 +740,16 @@ struct alignas(16) SchedulerTaskMetadata {
     uint16_t kernel_ids[3];
     uint8_t active_mask;
     uint8_t flags;
-    uint16_t logical_block_num;
-    uint16_t total_required_subtasks;
+    uint32_t trace_index_base;
     int32_t timing_slot;
 };
+
+inline __aicore__ uint32_t scheduler_task_trace_index(uint32_t trace_index_base, uint8_t active_mask, uint8_t subtask) {
+    return trace_index_base + static_cast<uint32_t>(__builtin_popcount(active_mask & ((1U << subtask) - 1)));
+}
+inline __aicore__ uint32_t scheduler_task_ready_queue(uint8_t flags, uint8_t active_mask) {
+    return (flags & SCHEDULER_TASK_MIX) != 0 ? SCHEDULER_MIX_QUEUE : ((active_mask & 1U) != 0 ? 0U : 1U);
+}
 
 inline __aicore__ bool scheduler_task_is_executable(uint8_t flags) { return (flags & SCHEDULER_TASK_EXECUTABLE) != 0; }
 
@@ -762,7 +770,7 @@ inline __aicore__ bool scheduler_task_has_predicate(uint8_t flags) {
 }
 
 inline __aicore__ bool scheduler_task_is_gang(uint8_t flags) {
-    return (flags & (SCHEDULER_TASK_MIX | SCHEDULER_TASK_SPMD)) != 0;
+    return (flags & (SCHEDULER_TASK_SYNC_START | SCHEDULER_TASK_SPMD)) != 0;
 }
 
 inline __aicore__ uint32_t scheduler_task_priority_bit(uint8_t flags) {
@@ -816,7 +824,7 @@ struct alignas(128) SchedulerGangCoordinator {
     uint64_t gang_task_count;
     uint64_t scheduler_count;
     uint64_t cohort_count;
-    uint64_t reserved0;
+    uint64_t mix_task_count;
     uint64_t owner_reserved;
 
     uint64_t admitted_count;
@@ -885,7 +893,7 @@ struct alignas(64) SchedulerReadyDirectoryShard {
 };
 
 struct alignas(128) SchedulerReadyDirectory {
-    SchedulerReadyDirectoryShard core_types[SCHEDULER_CORE_TYPE_COUNT][SCHEDULER_READY_DIRECTORY_SHARD_COUNT];
+    SchedulerReadyDirectoryShard core_types[SCHEDULER_READY_QUEUE_COUNT][SCHEDULER_READY_DIRECTORY_SHARD_COUNT];
     volatile uint64_t bootstrap_ready_types[SCHEDULER_WORKER_CAPACITY];
 };
 
@@ -1193,7 +1201,7 @@ static_assert(
 );
 static_assert(
     offsetof(SchedulerReadyDirectory, bootstrap_ready_types) ==
-        SCHEDULER_CORE_TYPE_COUNT * SCHEDULER_READY_DIRECTORY_SHARD_COUNT * 64,
+        SCHEDULER_READY_QUEUE_COUNT * SCHEDULER_READY_DIRECTORY_SHARD_COUNT * 64,
     "bootstrap flags must follow the ready directory shards"
 );
 static_assert(
@@ -1317,7 +1325,7 @@ inline bool scheduler_layout_reserve(uint64_t *cursor, uint64_t size, uint64_t a
 
 inline bool scheduler_plan_layout(
     uint64_t task_count, uint64_t aic_task_count, uint64_t aiv_task_count, AicoreSchedulerLayout *layout,
-    bool enable_activity_profiling = false
+    bool enable_activity_profiling = false, uint64_t trace_count = 0
 ) {
     if (layout == nullptr || aic_task_count > task_count || aiv_task_count > task_count) return false;
     AicoreSchedulerLayout next{};
@@ -1342,7 +1350,7 @@ inline bool scheduler_plan_layout(
         !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskMetadata, task_metadata_offset) ||
         !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskControl, task_controls_offset) ||
         !SCHEDULER_RESERVE_ARRAY(
-            SCHEDULER_CORE_TYPE_COUNT * SCHEDULER_WORKER_CAPACITY, SchedulerReadyInbox, ready_inboxes_offset
+            SCHEDULER_READY_QUEUE_COUNT * SCHEDULER_WORKER_CAPACITY, SchedulerReadyInbox, ready_inboxes_offset
         ) ||
         !scheduler_layout_reserve(
             &cursor, sizeof(SchedulerReadyDirectory), alignof(SchedulerReadyDirectory), &next.ready_directory_offset
@@ -1355,7 +1363,7 @@ inline bool scheduler_plan_layout(
             SCHEDULER_GANG_COHORT_COUNT * SCHEDULER_CLUSTER_CAPACITY, SchedulerGangParticipant, gang_participants_offset
         ) ||
         !SCHEDULER_RESERVE_ARRAY(SCHEDULER_CLUSTER_CAPACITY, SchedulerGangCommand, gang_commands_offset) ||
-        !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskTrace, trace_cells_offset) ||
+        !SCHEDULER_RESERVE_ARRAY(trace_count == 0 ? task_count : trace_count, SchedulerTaskTrace, trace_cells_offset) ||
         (enable_activity_profiling &&
          !SCHEDULER_RESERVE_ARRAY(SCHEDULER_CLUSTER_CAPACITY, SchedulerActivityBuffer, activity_buffers_offset)) ||
         !scheduler_layout_checked_align(cursor, SCHEDULER_STATE_ALIGNMENT, &next.total_size)) {
@@ -1378,7 +1386,7 @@ inline bool scheduler_init_data_from_layout(void *base, const AicoreSchedulerLay
         controls[i].waiting_producer = static_cast<int32_t>(SCHEDULER_TASK_ID_INVALID);
     }
     auto *ready = scheduler_state_at<SchedulerReadyInbox>(base, layout.ready_inboxes_offset);
-    for (uint64_t i = 0; i < SCHEDULER_CORE_TYPE_COUNT * SCHEDULER_WORKER_CAPACITY; ++i)
+    for (uint64_t i = 0; i < SCHEDULER_READY_QUEUE_COUNT * SCHEDULER_WORKER_CAPACITY; ++i)
         ready[i].head = SCHEDULER_INBOX_EMPTY;
     auto *contexts = scheduler_state_at<SchedulerWorkerContext>(base, layout.worker_contexts_offset);
     for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {

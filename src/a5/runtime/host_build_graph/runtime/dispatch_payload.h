@@ -89,18 +89,21 @@ constexpr uint32_t TASKPAYLOAD_TENSOR_STRIDE = 128;  // sizeof(simpler::hbg::Ten
  * concurrently dispatched cores.
  */
 struct alignas(64) DispatchPayload {
-    // === Cache line 0 (64B): control block, the only line written per dispatch ===
-    // function_bin_addr, local_context.{block_idx,block_num,async_ctx.task_token}
-    // and src_payload are the per-dispatch writes; async_ctx's slab pointers +
-    // capacity are cold (prefilled once at init) but ride this hot line for free.
+    // === Cache line 0 (64B): control block ===
+    // The legacy path writes function_bin_addr, local_context's block fields and
+    // task token, and src_payload per dispatch. The SSBUF ready path initializes
+    // its fixed fields in the per-run image and updates function_bin_addr (and
+    // src_payload for inline tasks) during dispatch.
+    // async_ctx's slab pointers + capacity are cold but ride this hot line.
     // Sized to exactly 64B so both dispatch paths write one control line: the
     // ready path (src_payload = 0) then also fills args[0..num_args); the gated
     // path (src_payload = &TaskPayload) leaves args[] to the idle AICore.
     uint64_t function_bin_addr; /**< Kernel entry address in GM (set by Scheduler). */
 
-    /** Per-dispatch context: block_idx/block_num (hot) + async_ctx (task_token hot,
-     *  slab pointers + capacity prefilled once at init). args[SPMD_LOCAL_CONTEXT_INDEX]
-     *  points here. */
+    /** Context for the dispatched kernel. The legacy path updates block fields
+     *  and task_token per dispatch; the SSBUF path keeps fixed values per run.
+     *  Slab pointers and capacity are prefilled once at init.
+     *  args[SPMD_LOCAL_CONTEXT_INDEX] points here. */
     LocalContext local_context;
 
     /** Early-dispatch gate AND source pointer, folded into one field. 0 = ready:

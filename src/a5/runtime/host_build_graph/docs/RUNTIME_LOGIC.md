@@ -420,7 +420,7 @@ READY with the same generation until the local Executor claims it, so the ready
 token is reconstructed from the slot. Completion generation validation still
 prevents stale notifications from freeing or refilling a pending slot.
 
-The local configuration occupies 88 bytes and the base local state 256 bytes
+The local configuration occupies 88 bytes and the base local state 376 bytes
 under the 64-bit ABI, including its optional profiling pointer. A separate
 240-byte profiling state holds six timing slots, two self-execution traces,
 worker trace caches, profiling offsets, and the loop counter/valid mask.
@@ -430,7 +430,7 @@ The host records whether any task requests sampled timing in the run control.
 Only a run with chip profiling or sampled timing enters the resident function
 specialization that allocates profiling state; the plain specialization does
 not allocate it. These functions do not inline into the common entry. The
-combined local state with profiling is 496 bytes. These sizes exclude other
+combined local state with profiling is 616 bytes. These sizes exclude other
 function locals, worker statistics and compiler spills. Compile-time assertions
 anchor the 64-bit configuration, slot, base and profiling state sizes; they do
 not establish the dynamic AICore stack high-water mark.
@@ -453,6 +453,10 @@ writeback and ready publication share a release barrier. Tokens are SPSC and
 use no SSBUF read-modify-write atomics. The Scheduler initializes every token
 before publishing the header, and each invocation validates the region.
 Self-execution uses local notifications, completion generations and trace storage.
+Each slot's embedded context pointers and constant single-block fields are
+initialized in the host-created resident payload image. Self-execution consumes
+its own payload writes after the publication barrier, without an additional
+payload invalidation on pickup. Remote Executors retain payload invalidation.
 
 The Scheduler and Executor share the SSBUF structure definitions in the same
 runtime build. Each run initializes the region before use.
@@ -487,6 +491,39 @@ The intended runs normally complete in under one second. Completion accounting
 therefore avoids periodic publication on the busy path; the continuous-busy
 timeout is an accepted limit outside that expected duration, not evidence that
 busy execution has stopped making progress.
+
+Single-block ordinary Mix uses the resident path. Each participating lane
+owns an independent GM DispatchPayload and one slot. A local six-entry tracker
+joins completions: each lane releases its slot immediately; only the final lane
+marks the task done and resolves dependencies. Kernels implement their own
+cross-lane synchronization. There is no cluster waiting-count gate or ACK state.
+
+Ordinary and Mix dispatches share a per-lane sequence in the publication word.
+Preparation reserves resources without consuming a sequence; publication commits
+it after the final lane is known. Executors consume dispatch order across both
+slots, including Scheduler self-execution. Mix prepares every participating lane
+before publishing any lane, and finishes the group's publications before the
+next Mix. Published ordinary tasks retain their position.
+One local metadata snapshot and one argument-region parse serve all lanes of a
+Mix. Shared scalar values and tensor descriptor addresses are read or computed
+once, then written into each lane's independent payload. After all payloads
+are written back, one barrier precedes their individual READY publications.
+
+Mix admission checks all participating slots and a tracker before claiming the
+ready inbox head. With ordinary deferred reservations, local Mix may be claimed
+but remote Mix cannot be stolen. Mix never enters the deferred queue. On graphs
+containing Mix, a scheduling pass consumes completions, attempts the unlocked
+direct Mix candidate, admits queued Mix, and then refills ordinary work.
+Displaced direct successors return to ready queues;
+ordinary-only graphs keep immediate direct refill. Task traces use metadata's
+32-bit base index plus the logical subtask offset, independently of placement.
+An unlocked Mix may remain a candidate within the current scheduling pass when
+no Mix work was queued at its ready-queue snapshot. Complete lane and tracker
+capacity permit direct preparation before the next queue claim; otherwise the
+candidate joins its ready queue first. Queue arrivals between that snapshot
+and a failed placement can precede the candidate after it joins the queue.
+Phase profiling records ready transitions for every active subtask. With
+profiling disabled, refill candidates do not compute trace indices.
 
 Directory queries are skipped when no unreserved FREE slot can accept
 work. Idle polling backs off from 8 to at most 32 iterations. Dispatch trace

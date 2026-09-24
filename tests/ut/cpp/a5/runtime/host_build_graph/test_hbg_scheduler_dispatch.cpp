@@ -19,7 +19,7 @@
 #include <stdexcept>
 #include <vector>
 
-#include "scheduler/scheduler_dispatch.h"
+#include "scheduler/scheduler_mix.h"
 #include "runtime_types.h"
 #include "hbg_scheduler_test_support.h"
 
@@ -111,6 +111,7 @@ void occupy_normal_slot(
     local_slot.task_id = task_id;
     local_slot.subtask_slot = 1;
     local_slot.state = SchedulerDispatchSlotState::READY;
+    local_slot.generation = ++storage.scheduler_local_state.dispatch_sequences[test_cluster_lane(scheduler, worker_id)];
     if (worker_id == scheduler.worker_index) {
         scheduler_local_ready_publish(&storage.scheduler_local_state, pending_slot);
     } else {
@@ -134,6 +135,7 @@ prepare_completed_normal_slot(FixtureStorage &storage, SchedulerWorkerContext &s
     local_slot.task_id = 0;
     local_slot.subtask_slot = 0;
     local_slot.state = SchedulerDispatchSlotState::READY;
+    local_slot.generation = ++storage.scheduler_local_state.dispatch_sequences[test_cluster_lane(scheduler, worker_id)];
     scheduler_ssbuf_store_relaxed(
         &test_ssbuf_control(storage, scheduler, worker_id, 0)->publication, local_slot.generation
     );
@@ -191,6 +193,7 @@ TEST(SchedulerClusterCompletion, AccumulatesBatchOnSuccessAndBothKindsOfErrorExi
         second.task_id = 1;
         second.subtask_slot = 0;
         second.state = SchedulerDispatchSlotState::READY;
+        second.generation = ++storage.scheduler_local_state.dispatch_sequences[0];
         auto *control =
             scheduler_task_control_at(storage.scheduler_state->base(), storage.local_context(&scheduler), 1);
         if (failure == 1) control->wake_list_head = SCHEDULER_WAKE_LIST_CLOSED;
@@ -230,6 +233,7 @@ TEST(SchedulerClusterCompletion, SpscGenerationCompletesNormalTask) {
     local_slot->subtask_slot = 0;
     storage.scheduler_local_state.set_timing_slot(0, 0, 0);
     local_slot->state = SchedulerDispatchSlotState::READY;
+    local_slot->generation = ++storage.scheduler_local_state.dispatch_sequences[0];
     scheduler_ssbuf_store_relaxed(&test_ssbuf_control(storage, scheduler, 0, 0)->publication, local_slot->generation);
     auto *executor_trace = test_ssbuf_trace(storage, scheduler, 0, 0);
     executor_trace->kernel_start_cycles = 100;
@@ -284,7 +288,7 @@ TEST(SchedulerClusterCompletion, UnprofiledSelfHandoffNeedsNoProfilingStorage) {
     ));
     uint32_t selected = UINT32_MAX;
     uint64_t publication = 0;
-    ASSERT_TRUE(scheduler_local_ready_pop(local, 0, &selected, &publication));
+    ASSERT_TRUE(scheduler_local_ready_pop(local, &selected, &publication));
     ASSERT_EQ(selected, 0u);
     EXPECT_EQ(local->timing_slot(1, selected), -1);
     local->local_completed_generations[selected] = scheduler_dispatch_generation(publication);
@@ -316,6 +320,8 @@ TEST(SchedulerClusterCompletion, SelfSlotsKeepDistinctSampledTraces) {
         slot.subtask_slot = 1;
         local->set_timing_slot(1, index, index);
         slot.state = SchedulerDispatchSlotState::READY;
+        slot.generation = ++local->dispatch_sequences[1];
+        storage.metadata[index].active_mask = 2;
         local->profiling->executor_traces[index].kernel_start_cycles = 100 + index;
         local->profiling->executor_traces[index].kernel_end_cycles = 200 + index;
         local->local_completed_generations[index] = slot.generation;
@@ -350,6 +356,7 @@ TEST(SchedulerClusterCompletion, RejectsStaleCompletionGenerationAtNamedSite) {
     slot->task_id = 0;
     local_slot->task_id = 0;
     local_slot->state = SchedulerDispatchSlotState::READY;
+    local_slot->generation = ++storage.scheduler_local_state.dispatch_sequences[0];
 
     SchedulerWakeStats wake_stats{};
     SchedulerReadyStats ready_stats{};
@@ -461,6 +468,7 @@ TEST(SchedulerClusterCompletion, PropagatesTraceToCompletionAndWokenTask) {
     local_slot->task_id = 0;
     local_slot->subtask_slot = 0;
     local_slot->state = SchedulerDispatchSlotState::READY;
+    local_slot->generation = ++storage.scheduler_local_state.dispatch_sequences[0];
     auto *executor_trace = test_ssbuf_trace(storage, scheduler, 0, 0);
     executor_trace->kernel_start_cycles = 100;
     executor_trace->kernel_end_cycles = 200;
@@ -515,6 +523,7 @@ TEST(SchedulerClusterCompletion, DirectlyRefillsCompletedSlotWhenReadyTaskExists
     auto *slot = test_slot(storage, scheduler, 0, 0);
     SchedulerLocalSlotState *local_slot = &storage.scheduler_local_state.slots[0][0];
     scheduler_initialize_free_slot(local_slot);
+    local_slot->generation = ++storage.scheduler_local_state.dispatch_sequences[0];
     const uint32_t completed_generation = local_slot->generation;
     slot->task_id = 0;
     local_slot->task_id = 0;
@@ -1145,7 +1154,7 @@ TEST(SchedulerDeferredAiv, LocalReservationsAndReadyHandoffsDoNotPollSharedState
     for (uint32_t expected_slot = 0; expected_slot < SCHEDULER_PENDING_SLOT_COUNT; ++expected_slot) {
         uint32_t pending_slot = UINT32_MAX;
         uint64_t publication = 0;
-        ASSERT_TRUE(scheduler_local_ready_pop(&scheduler_local_state, expected_slot, &pending_slot, &publication));
+        ASSERT_TRUE(scheduler_local_ready_pop(&scheduler_local_state, &pending_slot, &publication));
         EXPECT_EQ(pending_slot, expected_slot);
         EXPECT_EQ(scheduler_dispatch_state(publication), SchedulerDispatchSlotState::READY);
         EXPECT_EQ(scheduler_dispatch_generation(publication), expected_generations[expected_slot]);
@@ -1153,7 +1162,7 @@ TEST(SchedulerDeferredAiv, LocalReservationsAndReadyHandoffsDoNotPollSharedState
     EXPECT_EQ(scheduler_local_state.local_ready_mask, 0u);
 }
 
-TEST(SchedulerLocalReady, RotatesPastRepublishedLowerSlot) {
+TEST(SchedulerLocalReady, OlderDispatchPrecedesReusedLowerSlot) {
     SchedulerLocalState scheduler_local_state{};
     scheduler_local_state.config.self_lane = 1;
     scheduler_local_state.slots[1][0].generation = 1;
@@ -1167,18 +1176,19 @@ TEST(SchedulerLocalReady, RotatesPastRepublishedLowerSlot) {
 
     uint32_t pending_slot = UINT32_MAX;
     uint64_t publication = 0;
-    ASSERT_TRUE(scheduler_local_ready_pop(&scheduler_local_state, 0, &pending_slot, &publication));
+    ASSERT_TRUE(scheduler_local_ready_pop(&scheduler_local_state, &pending_slot, &publication));
     EXPECT_EQ(pending_slot, 0u);
     EXPECT_EQ(publication, slot_0_publication);
 
+    scheduler_local_state.slots[1][0].generation = 3;
     scheduler_local_ready_publish(&scheduler_local_state, 0);
-    ASSERT_TRUE(scheduler_local_ready_pop(&scheduler_local_state, 1, &pending_slot, &publication));
+    ASSERT_TRUE(scheduler_local_ready_pop(&scheduler_local_state, &pending_slot, &publication));
     EXPECT_EQ(pending_slot, 1u);
     EXPECT_EQ(publication, slot_1_publication);
 
-    ASSERT_TRUE(scheduler_local_ready_pop(&scheduler_local_state, 0, &pending_slot, &publication));
+    ASSERT_TRUE(scheduler_local_ready_pop(&scheduler_local_state, &pending_slot, &publication));
     EXPECT_EQ(pending_slot, 0u);
-    EXPECT_EQ(publication, slot_0_publication);
+    EXPECT_EQ(publication, scheduler_dispatch_publication(3, SchedulerDispatchSlotState::READY));
     EXPECT_EQ(scheduler_local_state.local_ready_mask, 0u);
 }
 
@@ -1190,9 +1200,9 @@ TEST(SchedulerLocalReady, InvalidSlotStateIsNotReconstructedAsReady) {
     scheduler_local_ready_publish(&local, 0);
     uint32_t slot = UINT32_MAX;
     uint64_t publication = 0;
-    ASSERT_TRUE(scheduler_local_ready_pop(&local, 0, &slot, &publication));
+    ASSERT_TRUE(scheduler_local_ready_pop(&local, &slot, &publication));
     EXPECT_NE(scheduler_dispatch_state(publication), SchedulerDispatchSlotState::READY);
-    EXPECT_FALSE(scheduler_local_ready_pop(&local, 0, &slot, &publication));
+    EXPECT_FALSE(scheduler_local_ready_pop(&local, &slot, &publication));
 }
 
 TEST(SchedulerDeferredAiv, PrefersNewPeerCapacityAndSelfPublishesOnlyOne) {
@@ -1331,7 +1341,7 @@ TEST(SchedulerDeferredAiv, RetiresCompletedPeerAndRefillsWithoutFreeDecision) {
     EXPECT_EQ(completed_control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
     EXPECT_EQ(storage.scheduler_local_state.pending_completed, 1u);
     EXPECT_EQ(peer_slot->task_id, 1);
-    EXPECT_EQ(peer_slot->generation, completed_generation + 1);
+    EXPECT_EQ(peer_slot->generation, 3u);
     EXPECT_EQ(peer_slot->state, SchedulerDispatchSlotState::READY);
     auto *peer_dispatch = test_ssbuf_control(storage, scheduler, 2, 0);
     const uint64_t peer_publication = scheduler_ssbuf_load_relaxed(&peer_dispatch->publication);
@@ -1430,6 +1440,31 @@ TEST(SchedulerLocalConfig, SnapshotsReadyPublicationAndReloadsOnNextRun) {
         EXPECT_EQ(next_run.profiling, nullptr);
         EXPECT_EQ(next_run.pending_completed, 0u);
     }
+}
+
+TEST(SchedulerLocalConfig, DetectsMixIndependentlyOfGangTasks) {
+    FixtureStorage storage(1, 3);
+    GraphBuffer graph_buffer(1);
+    const SchedulerGraphView graph = graph_buffer.graph();
+    configure_cached_cluster(storage, 1);
+    auto *coordinator = scheduler_state_at<SchedulerGangCoordinator>(
+        storage.scheduler_state->base(), storage.layout.gang_coordinator_offset
+    );
+    coordinator->gang_task_count = 1;
+    coordinator->mix_task_count = 0;
+    SchedulerLocalState gang_only{};
+    ASSERT_TRUE(
+        scheduler_initialize_local_config(storage.scheduler_state->base(), &storage.contexts[1], &graph, &gang_only)
+    );
+    EXPECT_FALSE(gang_only.has_mix);
+
+    coordinator->gang_task_count = 0;
+    coordinator->mix_task_count = 1;
+    SchedulerLocalState mix_only{};
+    ASSERT_TRUE(
+        scheduler_initialize_local_config(storage.scheduler_state->base(), &storage.contexts[1], &graph, &mix_only)
+    );
+    EXPECT_TRUE(mix_only.has_mix);
 }
 
 TEST(SchedulerLocalConfig, RejectsTruncatedOffsetsAndInconsistentPayloadRoutes) {
@@ -1575,3 +1610,444 @@ TEST(SchedulerNormalDispatch, NoUsableCapacityDoesNotAccessDirectory) {
 }
 
 }  // namespace
+
+namespace {
+struct MixFixture {
+    FixtureStorage storage{6, 3, 3};
+    GraphBuffer graph{6};
+    SchedulerLocalState *local;
+    uint64_t cursor{0};
+    MixFixture() {
+        configure_normal_aiv_cluster(storage, 6);
+        local = storage.local_context(&storage.contexts[1], &storage.scheduler_local_state);
+        local->has_mix = true;
+        for (uint32_t task = 0; task < 6; ++task)
+            set_task(task, 7);
+    }
+    void set_task(uint32_t task, uint8_t mask) {
+        graph.mixed(task, mask);
+        auto &metadata = storage.metadata[task];
+        metadata.active_mask = mask;
+        metadata.flags = SCHEDULER_TASK_EXECUTABLE | (__builtin_popcount(mask) > 1 ? SCHEDULER_TASK_MIX : 0);
+        metadata.trace_index_base = task * 3;
+        metadata.timing_slot = -1;
+        for (uint8_t subtask = 0; subtask < 3; ++subtask)
+            metadata.kernel_ids[subtask] = (mask & (1U << subtask)) != 0 ? 1 : UINT16_MAX;
+    }
+    void enqueue(uint32_t task) {
+        SchedulerReadyBatch batch{};
+        ASSERT_TRUE(scheduler_ready_batch_append(storage.scheduler_state->base(), local, task, &batch, nullptr));
+        ASSERT_TRUE(scheduler_ready_batch_push(
+            storage.scheduler_state->base(), local,
+            scheduler_task_ready_queue(storage.metadata[task].flags, storage.metadata[task].active_mask), &batch,
+            nullptr
+        ));
+    }
+    bool dispatch(bool steal = true) {
+        return scheduler_fill_cluster_mix_slots(
+            graph.graph(), storage.scheduler_state->base(), local, storage.run_control, &cursor, nullptr, 0, steal,
+            storage.ssbuf_region, nullptr
+        );
+    }
+    bool complete(uint32_t lane, uint32_t slot, SchedulerRefillCandidates *candidates = nullptr) {
+        local->local_ready_mask &= lane == local->config.self_lane ? ~(1U << slot) : UINT8_MAX;
+        return scheduler_service_cluster_completion_slot(
+            graph.graph(), storage.scheduler_state->base(), local, storage.run_control, lane, slot,
+            local->slots[lane][slot].generation, nullptr, nullptr, nullptr, nullptr, 0, nullptr, nullptr,
+            storage.ssbuf_region, candidates
+        );
+    }
+};
+}  // namespace
+
+TEST(SchedulerMix, MasksHaveIndependentPayloadsAndStablePhysicalContext) {
+    for (uint8_t mask : {3, 5, 6, 7}) {
+        MixFixture f;
+        f.set_task(0, mask);
+        f.enqueue(0);
+        ASSERT_TRUE(f.dispatch());
+        uint32_t published = 0;
+        uint64_t payload_addresses[3]{};
+        for (uint32_t lane = 0; lane < 3; ++lane) {
+            const auto &slot = f.local->slots[lane][0];
+            if (slot.state != SchedulerDispatchSlotState::READY) continue;
+            ++published;
+            EXPECT_EQ(slot.task_id, 0);
+            EXPECT_EQ(slot.generation, 1u);
+            auto *payload = scheduler_state_at<DispatchPayload>(
+                f.storage.scheduler_state->base(), f.local->dispatch_payload_offset(lane, 0)
+            );
+            payload_addresses[lane] = reinterpret_cast<uint64_t>(payload);
+            EXPECT_EQ(payload->function_bin_addr, 0x1000u);
+            EXPECT_EQ(payload->global_context.sub_block_id, lane == 2 ? 1 : 0);
+        }
+        EXPECT_EQ(published, static_cast<uint32_t>(__builtin_popcount(mask)));
+        for (uint32_t a = 0; a < 3; ++a)
+            for (uint32_t b = a + 1; b < 3; ++b)
+                if (payload_addresses[a] && payload_addresses[b]) EXPECT_NE(payload_addresses[a], payload_addresses[b]);
+        if (mask == 3 || mask == 5) EXPECT_EQ(f.local->slots[1][0].state, SchedulerDispatchSlotState::FREE);
+    }
+}
+
+TEST(SchedulerMix, TwoPublishedMixesReleaseEachLaneBeforeWholeTask) {
+    MixFixture f;
+    f.enqueue(0);
+    f.enqueue(1);
+    ASSERT_TRUE(f.dispatch());
+    for (uint32_t lane = 0; lane < 3; ++lane) {
+        EXPECT_EQ(f.local->slots[lane][0].task_id, 0);
+        EXPECT_EQ(f.local->slots[lane][1].task_id, 1);
+        EXPECT_EQ(f.local->slots[lane][1].generation, 2u);
+    }
+    ASSERT_TRUE(f.complete(0, 0));
+    EXPECT_EQ(f.local->slots[0][0].state, SchedulerDispatchSlotState::FREE);
+    EXPECT_EQ(f.local->pending_completed, 0u);
+    ASSERT_TRUE(f.complete(0, 1));
+    EXPECT_EQ(f.local->pending_completed, 0u);
+    EXPECT_EQ(f.local->slots[1][0].task_id, 0);
+    ASSERT_TRUE(f.complete(1, 0));
+    EXPECT_EQ(f.local->pending_completed, 0u);
+    ASSERT_TRUE(f.complete(2, 0));
+    EXPECT_EQ(f.local->pending_completed, 1u);
+    EXPECT_EQ(f.local->mix_trackers[0].task_id, SCHEDULER_TASK_ID_INVALID);
+    EXPECT_EQ(f.local->mix_trackers[1].task_id, 1);
+    EXPECT_FALSE(f.complete(2, 0));
+    EXPECT_EQ(f.local->pending_completed, 1u);
+}
+
+TEST(SchedulerMix, CapacityCheckLeavesTaskAvailableAndPreservesReservations) {
+    MixFixture f;
+    f.local->slots[0][0].state = SchedulerDispatchSlotState::FILLING;
+    f.local->slots[0][1].state = SchedulerDispatchSlotState::READY;
+    SchedulerReadyClaim candidate{};
+    candidate.task_id = 0;
+    candidate.source = SchedulerReadySource::DIRECT_RESOLVE;
+    bool progress = false;
+    ASSERT_TRUE(scheduler_publish_direct_mix_candidate(
+        f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, &candidate, nullptr, 0,
+        f.storage.ssbuf_region, &progress
+    ));
+    EXPECT_FALSE(progress);
+    EXPECT_EQ(candidate.task_id, SCHEDULER_TASK_ID_INVALID);
+    ASSERT_TRUE(f.dispatch());
+    EXPECT_EQ(f.local->dispatch_sequences[1], 0u);
+    EXPECT_EQ(f.local->slots[0][0].state, SchedulerDispatchSlotState::FILLING);
+    f.local->slots[0][1].state = SchedulerDispatchSlotState::FREE;
+    ASSERT_TRUE(f.dispatch());
+    EXPECT_EQ(f.local->slots[0][1].task_id, 0);
+    EXPECT_EQ(f.local->slots[0][0].state, SchedulerDispatchSlotState::FILLING);
+}
+
+TEST(SchedulerMix, FailedPreparationPublishesNothingAndConsumesNoSequence) {
+    MixFixture f;
+    f.storage.metadata[0].kernel_ids[2] = 2;
+    f.enqueue(0);
+    EXPECT_FALSE(f.dispatch());
+    EXPECT_NE(f.storage.run_control->scheduler_error, 0u);
+    for (uint32_t lane = 0; lane < 3; ++lane) {
+        EXPECT_EQ(f.local->dispatch_sequences[lane], 0u);
+        EXPECT_EQ(f.local->slots[lane][0].state, SchedulerDispatchSlotState::FREE);
+        EXPECT_EQ(f.storage.ssbuf_region->lanes[lane].dispatch[0].publication, 0u);
+    }
+    EXPECT_EQ(f.local->local_ready_mask, 0u);
+    EXPECT_EQ(f.local->mix_trackers[0].task_id, SCHEDULER_TASK_ID_INVALID);
+}
+
+TEST(SchedulerMix, DisplacedDirectSuccessorReturnsToReadyQueue) {
+    MixFixture f;
+    f.set_task(2, 1);
+    SchedulerRefillCandidates candidates;
+    candidates.tasks[0][0] = 2;
+    f.local->slots[0][1].state = SchedulerDispatchSlotState::FILLING;
+    f.enqueue(0);
+    ASSERT_TRUE(f.dispatch());
+    ASSERT_TRUE(scheduler_publish_refill_candidates(
+        f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, &candidates, nullptr, 0,
+        f.storage.ssbuf_region
+    ));
+    EXPECT_EQ(f.local->slots[0][0].task_id, 0);
+    SchedulerReadyClaim claim;
+    ASSERT_TRUE(scheduler_claim_ready_for_slot(
+        f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, 1, 0, &f.cursor, nullptr,
+        &claim
+    ));
+    EXPECT_EQ(claim.task_id, 2);
+    EXPECT_EQ(candidates.tasks[0][0], SCHEDULER_TASK_ID_INVALID);
+}
+
+TEST(SchedulerMix, DirectCandidateDoesNotOvertakeQueuedMix) {
+    MixFixture f;
+    f.graph.executable(2, 0, {0});
+    f.storage.metadata[2].flags |= SCHEDULER_TASK_HAS_FANIN;
+    ASSERT_EQ(
+        scheduler_route_task(
+            f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, 2, nullptr
+        ),
+        SchedulerRouteResult::WAITING
+    );
+    f.enqueue(1);
+    SchedulerReadyClaim candidate{};
+    ASSERT_TRUE(scheduler_resolve_completion(
+        f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, 0, nullptr, nullptr,
+        nullptr, 0, false, nullptr, SCHEDULER_MIX_QUEUE, &candidate
+    ));
+    EXPECT_EQ(candidate.task_id, SCHEDULER_TASK_ID_INVALID);
+    ASSERT_TRUE(f.dispatch());
+    for (uint32_t lane = 0; lane < 3; ++lane) {
+        EXPECT_EQ(f.local->slots[lane][0].task_id, 1);
+        EXPECT_EQ(f.local->slots[lane][1].task_id, 2);
+    }
+}
+
+TEST(SchedulerMix, DirectCandidatePrecedesMixQueuedAfterResolve) {
+    MixFixture f;
+    f.graph.executable(1, 0, {0});
+    f.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
+    ASSERT_EQ(
+        scheduler_route_task(
+            f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, 1, nullptr
+        ),
+        SchedulerRouteResult::WAITING
+    );
+    SchedulerReadyClaim candidate{};
+    ASSERT_TRUE(scheduler_resolve_completion(
+        f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, 0, nullptr, nullptr,
+        nullptr, 0, false, nullptr, SCHEDULER_MIX_QUEUE, &candidate
+    ));
+    ASSERT_EQ(candidate.task_id, 1);
+    f.enqueue(2);
+
+    bool progress = false;
+    ASSERT_TRUE(scheduler_fill_mix_after_completions(
+        f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, &candidate, &f.cursor,
+        nullptr, 0, true, f.storage.ssbuf_region, &progress
+    ));
+    EXPECT_TRUE(progress);
+    EXPECT_EQ(candidate.task_id, SCHEDULER_TASK_ID_INVALID);
+    for (uint32_t lane = 0; lane < 3; ++lane) {
+        EXPECT_EQ(f.local->slots[lane][0].task_id, 1);
+        EXPECT_EQ(f.local->slots[lane][1].task_id, 2);
+    }
+}
+
+TEST(SchedulerMix, DirectCandidateQueuesWhenRequiredLaneIsBusy) {
+    MixFixture f;
+    f.graph.executable(1, 0, {0});
+    f.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
+    ASSERT_EQ(
+        scheduler_route_task(
+            f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, 1, nullptr
+        ),
+        SchedulerRouteResult::WAITING
+    );
+    f.set_task(2, 3);
+    for (auto &slot : f.local->slots[2])
+        slot.state = SchedulerDispatchSlotState::FILLING;
+    SchedulerReadyClaim candidate{};
+    ASSERT_TRUE(scheduler_resolve_completion(
+        f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, 0, nullptr, nullptr,
+        nullptr, 0, false, nullptr, SCHEDULER_MIX_QUEUE, &candidate
+    ));
+    ASSERT_EQ(candidate.task_id, 1);
+    f.enqueue(2);
+
+    bool progress = false;
+    ASSERT_TRUE(scheduler_fill_mix_after_completions(
+        f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, &candidate, &f.cursor,
+        nullptr, 0, true, f.storage.ssbuf_region, &progress
+    ));
+    EXPECT_TRUE(progress);
+    EXPECT_EQ(candidate.task_id, SCHEDULER_TASK_ID_INVALID);
+    EXPECT_EQ(f.local->slots[0][0].task_id, 2);
+    EXPECT_EQ(f.local->slots[1][0].task_id, 2);
+    for (auto &slot : f.local->slots[2])
+        slot.state = SchedulerDispatchSlotState::FREE;
+    ASSERT_TRUE(f.dispatch());
+    EXPECT_EQ(f.local->slots[0][1].task_id, 1);
+    EXPECT_EQ(f.local->slots[1][1].task_id, 1);
+    EXPECT_EQ(f.local->slots[2][0].task_id, 1);
+}
+
+TEST(SchedulerMix, CompletedMixPassesUnlockedMixToDirectCandidate) {
+    MixFixture f;
+    f.graph.executable(1, 0, {0});
+    f.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
+    ASSERT_EQ(
+        scheduler_route_task(
+            f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, 1, nullptr
+        ),
+        SchedulerRouteResult::WAITING
+    );
+    f.enqueue(0);
+    ASSERT_TRUE(f.dispatch());
+    SchedulerRefillCandidates candidates;
+    ASSERT_TRUE(f.complete(0, 0, &candidates));
+    ASSERT_TRUE(f.complete(1, 0, &candidates));
+    EXPECT_EQ(candidates.mix_ready.task_id, SCHEDULER_TASK_ID_INVALID);
+    ASSERT_TRUE(f.complete(2, 0, &candidates));
+    EXPECT_EQ(candidates.mix_ready.task_id, 1);
+    ASSERT_TRUE(scheduler_publish_direct_mix_candidate(
+        f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, &candidates.mix_ready,
+        nullptr, 0, f.storage.ssbuf_region, nullptr
+    ));
+    for (uint32_t lane = 0; lane < 3; ++lane)
+        EXPECT_EQ(f.local->slots[lane][0].task_id, 1);
+}
+
+TEST(SchedulerMix, MultipleUnlockedMixesKeepWakeOrder) {
+    MixFixture f;
+    for (uint32_t task : {1U, 2U}) {
+        f.graph.executable(task, 0, {0});
+        f.storage.metadata[task].flags |= SCHEDULER_TASK_HAS_FANIN;
+        ASSERT_EQ(
+            scheduler_route_task(
+                f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, task, nullptr
+            ),
+            SchedulerRouteResult::WAITING
+        );
+    }
+    f.enqueue(0);
+    ASSERT_TRUE(f.dispatch());
+    SchedulerRefillCandidates candidates;
+    ASSERT_TRUE(f.complete(0, 0, &candidates));
+    ASSERT_TRUE(f.complete(1, 0, &candidates));
+    ASSERT_TRUE(f.complete(2, 0, &candidates));
+    EXPECT_EQ(candidates.mix_ready.task_id, SCHEDULER_TASK_ID_INVALID);
+    ASSERT_TRUE(f.dispatch());
+    for (uint32_t lane = 0; lane < 3; ++lane) {
+        EXPECT_EQ(f.local->slots[lane][0].task_id, 2);
+        EXPECT_EQ(f.local->slots[lane][1].task_id, 1);
+    }
+}
+
+TEST(SchedulerMix, LastLaneAloneResolvesDependency) {
+    MixFixture f;
+    f.set_task(1, 1);
+    f.graph.executable(1, 0, {0});
+    f.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
+    EXPECT_EQ(
+        scheduler_route_task(
+            f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, 1, nullptr
+        ),
+        SchedulerRouteResult::WAITING
+    );
+    f.enqueue(0);
+    ASSERT_TRUE(f.dispatch());
+    ASSERT_TRUE(f.complete(0, 0));
+    ASSERT_TRUE(f.complete(1, 0));
+    auto *control = scheduler_task_control_at(f.storage.scheduler_state->base(), f.local, 0);
+    EXPECT_NE(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
+    SchedulerRefillCandidates candidates;
+    ASSERT_TRUE(f.complete(2, 0, &candidates));
+    EXPECT_EQ(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
+    SchedulerReadyClaim claim;
+    ASSERT_TRUE(scheduler_claim_ready_for_slot(
+        f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, 1, 0, &f.cursor, nullptr,
+        &claim
+    ));
+    EXPECT_EQ(claim.task_id, 1);
+}
+
+TEST(SchedulerMix, PartialCompletionsAllowMoreThanTwoLiveMixes) {
+    MixFixture f;
+    f.set_task(0, 3);
+    f.set_task(1, 6);
+    f.set_task(2, 5);
+    f.set_task(3, 6);
+    f.enqueue(0);
+    f.enqueue(1);
+    ASSERT_TRUE(f.dispatch());
+    ASSERT_TRUE(f.complete(2, 0));
+    ASSERT_TRUE(f.complete(2, 1));
+    EXPECT_EQ(f.local->pending_completed, 0u);
+    f.enqueue(2);
+    f.enqueue(3);
+    ASSERT_TRUE(f.dispatch());
+    uint32_t live = 0;
+    for (const auto &tracker : f.local->mix_trackers)
+        live += tracker.task_id >= 0;
+    EXPECT_EQ(live, 4u);
+}
+
+TEST(SchedulerMix, DeferredPolicyDisallowsStealingButStillAdmitsLocalMix) {
+    MixFixture f;
+    f.local->config.scheduler_count = 2;
+    SchedulerLocalState publisher;
+    f.storage.local_context(&f.storage.contexts[1], &publisher);
+    publisher.config.scheduler_index = 1;
+    publisher.config.scheduler_count = 2;
+    SchedulerReadyBatch batch;
+    ASSERT_TRUE(scheduler_ready_batch_append(f.storage.scheduler_state->base(), &publisher, 0, &batch, nullptr));
+    ASSERT_TRUE(
+        scheduler_ready_batch_push(f.storage.scheduler_state->base(), &publisher, SCHEDULER_MIX_QUEUE, &batch, nullptr)
+    );
+    ASSERT_TRUE(f.dispatch(false));
+    EXPECT_EQ(f.local->dispatch_sequences[0], 0u);
+    f.enqueue(1);
+    ASSERT_TRUE(f.dispatch(false));
+    EXPECT_EQ(f.local->slots[0][0].task_id, 1);
+    ASSERT_TRUE(f.dispatch(true));
+    EXPECT_EQ(f.local->slots[0][1].task_id, 0);
+}
+
+TEST(SchedulerMix, DirectSuccessorUsesOtherRemainingSlot) {
+    MixFixture f;
+    f.set_task(2, 1);
+    SchedulerRefillCandidates candidates;
+    candidates.tasks[0][0] = 2;
+    f.enqueue(0);
+    ASSERT_TRUE(f.dispatch());
+    ASSERT_TRUE(scheduler_publish_refill_candidates(
+        f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, &candidates, nullptr, 0,
+        f.storage.ssbuf_region
+    ));
+    EXPECT_EQ(f.local->slots[0][0].task_id, 0);
+    EXPECT_EQ(f.local->slots[0][1].task_id, 2);
+    EXPECT_EQ(f.local->slots[0][1].generation, 2u);
+}
+
+TEST(SchedulerMix, CompletionTracesUseLogicalSubtaskRatherThanPhysicalLane) {
+    MixFixture f;
+    f.set_task(0, 3);
+    f.enqueue(0);
+    bool progress = false;
+    ASSERT_TRUE(scheduler_fill_cluster_mix_slots(
+        f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, &f.cursor, nullptr,
+        SCHEDULER_PROFILING_SCHED_PHASES_LEVEL, true, f.storage.ssbuf_region, &progress
+    ));
+    for (uint32_t lane : {0, 2}) {
+        auto &source = f.storage.ssbuf_region->lanes[lane].traces[0].payload;
+        source.kernel_start_cycles = 100 + lane;
+        source.kernel_end_cycles = 200 + lane;
+        ASSERT_TRUE(scheduler_service_cluster_completion_slot(
+            f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, lane, 0,
+            f.local->slots[lane][0].generation, nullptr, nullptr, nullptr, nullptr,
+            SCHEDULER_PROFILING_SCHED_PHASES_LEVEL, nullptr, nullptr, f.storage.ssbuf_region
+        ));
+    }
+    auto *traces =
+        scheduler_state_at<SchedulerTaskTrace>(f.storage.scheduler_state->base(), f.storage.layout.trace_cells_offset);
+    EXPECT_EQ(traces[0].kernel_start_cycles, 100u);
+    EXPECT_EQ(traces[1].kernel_start_cycles, 102u);
+    EXPECT_EQ(traces[1].worker_id, 2u);
+    EXPECT_EQ(traces[1].valid, 1u);
+    EXPECT_EQ(traces[2].valid, 0u);
+    EXPECT_EQ(f.local->pending_completed, 1u);
+}
+
+TEST(SchedulerDispatch, SequenceExhaustionDoesNotPublishOrWrap) {
+    MixFixture f;
+    f.set_task(0, 1);
+    f.local->dispatch_sequences[0] = UINT32_MAX;
+    f.local->slots[0][0].state = SchedulerDispatchSlotState::FILLING;
+    SchedulerReadyClaim ready;
+    ready.task_id = 0;
+    const auto metadata =
+        scheduler_load_dispatch_metadata(f.storage.scheduler_state->base(), f.local, ready.task_id, 0);
+    EXPECT_FALSE(scheduler_prepare_dispatch_slot(
+        f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, {0, 0, 0, 0}, ready,
+        metadata, 0, f.storage.ssbuf_region, 0
+    ));
+    EXPECT_EQ(f.local->dispatch_sequences[0], UINT32_MAX);
+    EXPECT_EQ(f.storage.ssbuf_region->lanes[0].dispatch[0].publication, 0u);
+}

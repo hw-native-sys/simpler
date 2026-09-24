@@ -70,9 +70,9 @@ TEST(AicoreSchedulerState, DistinguishesResidentAndExplicitLegacyModes) {
     EXPECT_TRUE(aicore_scheduler_runtime_mode_is_explicit_legacy(SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE));
 }
 
-TEST(AicoreSchedulerState, ResidentV0AcceptsOnlySingleLaneSingleBlockTasks) {
+TEST(AicoreSchedulerState, ResidentAcceptsSingleBlockOrdinaryMix) {
     EXPECT_TRUE(scheduler_resident_v0_task_shape_supported(1, 1, false));
-    EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(2, 1, false));
+    EXPECT_TRUE(scheduler_resident_v0_task_shape_supported(2, 1, false));
     EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(1, 2, false));
     EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(1, 1, true));
 }
@@ -300,25 +300,30 @@ TEST(SchedulerGraph, RejectsAViewWithANonZeroReservedWord) {
     );
 }
 
-TEST(SchedulerDispatchPayload, DisablesDeferredCompletionWithoutASlab) {
+TEST(SchedulerDispatchPayload, PreservesInitializedSlotContextDuringMaterialization) {
     GraphBuffer graph(1);
     graph.executable(0, 0);
     DispatchPayload payload{};
-    payload.local_context.async_ctx.task_token = TaskId::make_global(17);
+    payload.local_context.async_ctx.task_token = TaskId::invalid();
+    payload.global_context.sub_block_id = 7;
+    payload.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&payload.local_context);
+    payload.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&payload.global_context);
     SchedulerTaskInfo task{0, 1, 0, CoreType::AIC};
 
     ASSERT_EQ(
         scheduler_materialize_task_payload_resolved(graph.graph(), task, 0x1000, &payload), SchedulerGraphResult::OK
     );
     EXPECT_FALSE(payload.local_context.async_ctx.task_token.is_valid());
-    EXPECT_EQ(payload.global_context.sub_block_id, 0);
+    EXPECT_EQ(payload.global_context.sub_block_id, 7);
+    EXPECT_EQ(payload.args[PAYLOAD_LOCAL_CONTEXT_INDEX], reinterpret_cast<uint64_t>(&payload.local_context));
+    EXPECT_EQ(payload.args[PAYLOAD_GLOBAL_CONTEXT_INDEX], reinterpret_cast<uint64_t>(&payload.global_context));
 
     task.subtask_slot = 2;
     task.core_type = CoreType::AIV;
     ASSERT_EQ(
         scheduler_materialize_task_payload_resolved(graph.graph(), task, 0x1000, &payload), SchedulerGraphResult::OK
     );
-    EXPECT_EQ(payload.global_context.sub_block_id, 1);
+    EXPECT_EQ(payload.global_context.sub_block_id, 7);
 }
 
 TEST(SchedulerDispatchPayload, RejectsInvalidGraphBoundsBeforeReadingPayload) {

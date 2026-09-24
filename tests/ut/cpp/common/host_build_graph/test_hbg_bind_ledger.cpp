@@ -1024,11 +1024,11 @@ TEST_F(HbgBindLedgerTest, SchedulerModeChangesPublishOnlyThisRunsSources) {
     const bool a5 = std::strcmp(get_platform(), "a5sim") == 0;
     uint32_t resident_mode = 0;
     uint32_t graph_mode = 0;
-    // A5 selects resident for ordinary tasks and legacy for GRAPH/MIX. A2/A3
+    // A5 selects resident for ordinary/Mix tasks and legacy for GRAPH. A2/A3
     // uses AICPU scheduling throughout, with no resident scheduler region.
     for (TestOrchEntryFunc entry : {ordinary_orch_entry, recording_orch_entry, mixed_orch_entry, ordinary_orch_entry}) {
         SCOPED_TRACE(entry == recording_orch_entry ? "graph" : entry == mixed_orch_entry ? "mixed" : "ordinary");
-        const bool resident = a5 && entry == ordinary_orch_entry;
+        const bool resident = a5 && entry != recording_orch_entry;
         const bool definitions = entry == recording_orch_entry;
         fake_.copy_count = 0;
         fake_.copies.clear();
@@ -1116,7 +1116,7 @@ TEST_F(HbgBindLedgerTest, SchedulerPublicationFailureAllowsFreshModeSelection) {
     for (TestOrchEntryFunc entry : {ordinary_orch_entry, recording_orch_entry, mixed_orch_entry}) {
         SCOPED_TRACE(entry == recording_orch_entry ? "graph" : entry == mixed_orch_entry ? "mixed" : "ordinary");
         const size_t regions = 1 + static_cast<size_t>(entry == recording_orch_entry) +
-                               static_cast<size_t>(a5 && entry == ordinary_orch_entry);
+                               static_cast<size_t>(a5 && entry != recording_orch_entry);
         for (size_t failure = 1; failure <= regions; ++failure) {
             SCOPED_TRACE(failure);
             fake_.copy_count = 0;
@@ -1142,7 +1142,7 @@ TEST_F(HbgBindLedgerTest, SchedulerPublicationFailureAllowsFreshModeSelection) {
                 EXPECT_EQ(runtime.dev.scheduler_bootstrap.worker_context_base, 0u);
             }
             fake_.fail_copy_on = 0;
-            const bool definitions = entry == ordinary_orch_entry;
+            const bool definitions = entry != recording_orch_entry;
             const bool resident = a5 && !definitions;
             eps_ = {definitions ? recording_orch_entry : ordinary_orch_entry, capture_orch_bind};
             ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
