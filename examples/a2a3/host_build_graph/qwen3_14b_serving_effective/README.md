@@ -8,8 +8,11 @@ dispatches. Single- and dual-slot execution use separate Python entry points.
 ## Build the HBG artifact
 
 The input is a generated Qwen decode artifact containing the distributed host
-wrapper and one chip callable. The adapter preserves its in-core programs and
-outlines the 40-layer loop into one bounded decoder-layer Definition:
+wrapper and one chip callable. The adapter preserves the source in-core programs
+and converts the generated child runtime to `host_build_graph`. Generated artifacts
+may use either a per-layer Definition or the flat 40-layer orchestration emitted by
+the serving compiler; the latter is recorded with `graph_definition_count: 0` and
+its emitted task count:
 
 ```bash
 PYTHONPATH=/path/to/pypto/python:/path/to/simpler/python \
@@ -27,10 +30,9 @@ in-core binaries remain byte-identical.
 Both runners verify the copied metadata, orchestration source/shared library,
 and in-core binary checksums before preparing the runtime.
 
-Each decode frame executes token embedding, records one decoder-layer
-Definition, replays it for the remaining 39 layers, and executes final RMSNorm,
-LM Head, and greedy sampling. Definition record, build, and upload are per-frame
-runtime work and remain inside measured intervals.
+Each decode frame executes the generated 40-layer orchestration, then final
+RMSNorm, LM Head, and greedy sampling. For flat serving artifacts, the 279 emitted
+per-frame tasks remain in the orchestration and are validated before runtime use.
 
 ## Run the benchmark
 
