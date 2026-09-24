@@ -4,8 +4,12 @@
 这是实现与测试的设计契约；未通过真机验证前，不把“少两个 RTS task”等同于性能提升或协议完成。
 
 当前分支以 `hw-native-sys/simpler` 的 `feat/kernel-mode-integration-test` `dd32e1cc` 为基线。
-Host/sim UT 已覆盖成功轮次累进、失败不推进、旧报告等待和 program 回归；A2/A3、A5 真机
-eager/replay、缓存可见性及性能比较仍是合入前必须完成的验收，不能从 UT 推定已通过。
+Host/sim UT 覆盖成功轮次累进、失败不推进及延迟旧报告；A2/A3 onboard capture 矩阵现为 33/33
+通过，其中包含定向延迟 AICore 报告（AICore 被 gate 阻塞时直接确认旧 report 仍是 epoch 1，释放后
+第二轮推进到 epoch 2）、eager/capture 提交范围内零 memset 断言及成功轮之后故障不推进 epoch
+的观察。A5 对应测试代码已提供，observer 的 A5 编译和用例收集通过，但没有 A5
+silicon，故不报告为 onboard 通过。Program 两架构回归与性能比较尚未完成；不能由 task 数减少
+推定实际加速。
 
 ## 现有执行顺序与问题
 
@@ -43,9 +47,9 @@ init 时常驻协调块整体初始化为零。每一轮按以下规则执行：
 健康轮次的不变量是：开始时 control 的值为 `p`，所有旧 report 的 epoch 至多为 `p`；所以旧报告不能满足本轮所需的 `p + 1`。成功收尾后 control 成为 `p + 1`，形成下一轮的起点。
 即使 AICore task 先于 AICPU task 入队，两者实际启动先后不确定也不影响该不变量：成功 finalizer 必须等待所有核的本轮身份报告，因此不会在某个尚未读取 control 的正常 AICore 之前提交新 epoch。
 
-失败路径是协议的一部分。当前 finalizer 在准入或执行失败时仍写 `control.round_epoch`；直接复用这种写法会让迟启动的本轮 AICore 把新值误认成上轮编号，产生同轮错号。实现必须把轮次提交限制到成功路径。失败后若仍允许原 context 重试，就需要另一套取消及重同步协议，本设计不作这种承诺。
+失败路径是协议的一部分。finalizer 可发布错误状态，但仅当 runtime 与 cleanup 均成功时才写入 `control.round_epoch`。失败轮次保留 gate 和借用参数，禁止同一 context 重试；超时或失败本身不能证明迟到的 AICore 已停止访问资源。
 
-当前 `report_epoch` 字段已存在，但还没有生产读写。AICore、AICPU 与共享 scheduler 的改动必须仅对 kernel 模式启用；program 的 Host 置零和非零报告判断保持原行为。不能把持续跨 context 的 `KernelRoundGate` ticket 直接写作新 context 的首轮编号。
+`report_epoch` 已由 AICore 在发布身份后写入，并由 TMR scheduler 用精确的 `p + 1` 匹配后再读取身份字段。AICore、AICPU 与共享 scheduler 的改动仅对 kernel 模式启用；program 的 Host 置零和非零报告判断保持原行为。不能把持续跨 context 的 `KernelRoundGate` ticket 直接写作新 context 的首轮编号。
 
 ## 生命周期与并发硬边界
 
@@ -64,6 +68,10 @@ init 时常驻协调块整体初始化为零。每一轮按以下规则执行：
 3. 延迟 AICore 身份发布；AICPU 必须等到本轮 report，而不能凭上轮非零 `aicore_done` 开窗。
 4. Host 部分 enqueue 失败、设备准入失败、缺核及执行失败：epoch 不错误推进，后续同 context 调用被拒；旧可用资源不因失败释放过早。
 5. 新 context 和新 generation 从零重新开始；验证旧图与新 context 的资源隔离。覆盖 A2/A3 和 A5 的 onboard 路径及 program 回归。
+
+同一 context 的 eager Host 提交由提交锁串行化；ACLGraph replay 不进入该锁。跨 caller stream 或跨图 replay 必须由调用方串行提交。本 runtime 不承诺阻止外部并发 replay，也不应以并发 replay 成功用例描述受支持行为。
+
+A2/A3 ST 直接断言每个 eager launch 和 graph capture 的提交范围内没有 `aclrtMemsetAsync`；真实设备 gate 延迟 AICore 报告发布，并使用不同的第二轮标量确认第二轮确实执行；故障用例分别验证首轮失败保持 epoch=0、成功一轮后的失败保持 epoch=1。A5 对应测试代码与 A2/A3 共用用例逻辑，observer 对 A5 头文件完成编译、两项用例完成 collection，但未运行硬件时必须标记未验证。
 
 性能以“仅保留一次 reports memset”的正确实现为基线，再与零 memset 版本比较 capture 节点数及 eager/replay 的 p50、p99。
 零 memset 版本使每个 AICore 多读同一 control cache line；少一个 RTS task 不保证整体更快。若共享 control 读取成为热点，可另行评估每核自增旧 `report_epoch`，但它依赖每核每轮完整参与，不能在没有故障重同步证明时替换首版协议。

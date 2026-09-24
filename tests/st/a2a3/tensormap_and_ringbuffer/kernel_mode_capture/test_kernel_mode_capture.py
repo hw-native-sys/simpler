@@ -37,6 +37,7 @@ SCENARIOS = (
     "runtime_error_eager",
     "runtime_error_replay",
     "threaded_cross_stream_error",
+    "delayed_aicore_report",
     "cold_unsynced",
     "warm",
     "multi_callable",
@@ -64,8 +65,7 @@ SCENARIOS = (
 )
 
 
-@pytest.fixture(scope="module")
-def capture_observer(tmp_path_factory):
+def build_capture_observer(arch, tmp_path_factory):
     sdk = Path(os.environ["ASCEND_HOME_PATH"])
     include_dirs = [
         sdk / "include",
@@ -73,7 +73,7 @@ def capture_observer(tmp_path_factory):
         sdk / f"{platform.machine()}-linux/pkg_inc/runtime",
         sdk / f"{platform.machine()}-linux/pkg_inc/runtime/runtime",
         sdk / f"{platform.machine()}-linux/pkg_inc/profiling",
-        ROOT / "src/a2a3/platform/include",
+        ROOT / f"src/{arch}/platform/include",
         ROOT / "src/common/platform/include",
         ROOT / "src/common",
     ]
@@ -100,18 +100,27 @@ def capture_observer(tmp_path_factory):
     return output
 
 
+@pytest.fixture(scope="module")
+def capture_observer(tmp_path_factory):
+    return build_capture_observer("a2a3", tmp_path_factory)
+
+
 @pytest.mark.requires_hardware
 @pytest.mark.platforms(["a2a3"])
 @pytest.mark.runtime(RUNTIME)
 @pytest.mark.device_count(1)
 @pytest.mark.parametrize("scenario", SCENARIOS)
 def test_tmr_kernel_mode(st_platform, st_device_ids, scenario, capture_observer):
-    _binaries(st_platform, RUNTIME)
+    _run_onboard_scenario(st_platform, st_device_ids, scenario, capture_observer)
+
+
+def _run_onboard_scenario(arch, st_device_ids, scenario, capture_observer):
+    _binaries(arch, RUNTIME)
     device = str(st_device_ids[0])
     artifacts = ROOT / "outputs" / "kernel_mode"
     artifacts.mkdir(parents=True, exist_ok=True)
     # Forked pytest workers can recreate basetemp between cases.
-    tmp_path = Path(tempfile.mkdtemp(prefix=scenario + "-", dir=artifacts))
+    tmp_path = Path(tempfile.mkdtemp(prefix=arch + "-" + scenario + "-", dir=artifacts))
     env = dict(os.environ)
     env["LD_PRELOAD"] = str(capture_observer) + (":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else "")
     logs = tmp_path / "ascend"
@@ -120,7 +129,15 @@ def test_tmr_kernel_mode(st_platform, st_device_ids, scenario, capture_observer)
     with (tmp_path / "run.log").open("w") as log:
         try:
             result = subprocess.run(
-                [sys.executable, "-m", MODULE + ".test_kernel_mode_capture", device, scenario, str(tmp_path)],
+                [
+                    sys.executable,
+                    "-m",
+                    MODULE + ".test_kernel_mode_capture",
+                    device,
+                    scenario,
+                    str(tmp_path),
+                    arch,
+                ],
                 cwd=ROOT,
                 env=env,
                 stdout=log,
@@ -138,6 +155,8 @@ def test_tmr_kernel_mode(st_platform, st_device_ids, scenario, capture_observer)
         assert (
             "PASS threaded_cross_stream_error caller_error=1 failure_reported=1 host_reject=1 context_error=1" in output
         )
+    elif scenario == "delayed_aicore_report":
+        assert "PASS delayed_aicore_report stale_report_present=1 rounds=2 clears=0" in output
     elif scenario == "host_submit_failure":
         assert "PASS host_submit_failure host_status=-4334 retained=1" in output
     elif scenario == "close_fail_free":
@@ -150,14 +169,14 @@ def test_tmr_kernel_mode(st_platform, st_device_ids, scenario, capture_observer)
         assert f"PASS {scenario} replays=100 forbidden_sync=0" in output
 
 
-def _build_callable(build_dir, alternate=False, dag=False, execution_error=False):
+def _build_callable(build_dir, arch, alternate=False, dag=False, execution_error=False):
     from simpler.task_interface import ArgDirection, ChipCallable, CoreCallable  # noqa: PLC0415
 
     from simpler_setup.elf_parser import extract_text_section  # noqa: PLC0415
     from simpler_setup.kernel_compiler import KernelCompiler  # noqa: PLC0415
     from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415
 
-    compiler = KernelCompiler("a2a3")
+    compiler = KernelCompiler(arch)
     build_dir.mkdir()
     source = (
         Path(__file__).with_name("kernel_capture_alternate.cpp")
@@ -170,7 +189,7 @@ def _build_callable(build_dir, alternate=False, dag=False, execution_error=False
         source = Path(__file__).with_name("kernel_execution_error.cpp")
     orchestration = compiler.compile_orchestration(RUNTIME, str(source), build_dir=str(build_dir))
     incore = compiler.compile_incore(
-        str(ROOT / "examples/a2a3/tensormap_and_ringbuffer/vector_example/kernels/aiv/kernel_add_scalar.cpp"),
+        str(ROOT / f"examples/{arch}/tensormap_and_ringbuffer/vector_example/kernels/aiv/kernel_add_scalar.cpp"),
         core_type="aiv",
         pto_isa_root=ensure_pto_isa_root(),
         extra_include_dirs=compiler.get_orchestration_include_dirs(RUNTIME),
@@ -241,8 +260,20 @@ def _bind_observer_guards(observer):
     observer.capture_observer_fail_prepare.restype = None
     observer.capture_observer_fail_next_invocation.argtypes = []
     observer.capture_observer_fail_next_invocation.restype = None
-    observer.capture_observer_failure_reported.argtypes = []
+    observer.capture_observer_failure_reported.argtypes = [ctypes.c_uint64]
     observer.capture_observer_failure_reported.restype = ctypes.c_int
+    observer.capture_observer_check_round_epoch.argtypes = [ctypes.c_uint64]
+    observer.capture_observer_check_round_epoch.restype = ctypes.c_int
+    observer.capture_gate_arm.argtypes = []
+    observer.capture_gate_arm.restype = None
+    observer.capture_gate_arm_core.argtypes = []
+    observer.capture_gate_arm_core.restype = None
+    observer.capture_gate_blocked.argtypes = []
+    observer.capture_gate_blocked.restype = ctypes.c_int
+    observer.capture_gate_release.argtypes = []
+    observer.capture_gate_release.restype = None
+    observer.capture_gate_finish.argtypes = []
+    observer.capture_gate_finish.restype = ctypes.c_int
     for name in ("query_calls", "total_queries", "waits", "records", "clears", "prepare_failures"):
         function = getattr(observer, "capture_observer_" + name)
         function.argtypes = []
@@ -340,7 +371,7 @@ def _seed_tensors(io, chips):
     return pairs, initial, counter
 
 
-def _initialize(device, scenario, build_dir):
+def _initialize(device, scenario, build_dir, arch):
     from tests.st.a2a3.tensormap_and_ringbuffer.kernel_mode_capture.kernel_capture_values import (  # noqa: PLC0415
         _bind_capture_functions,
         _check,
@@ -349,6 +380,7 @@ def _initialize(device, scenario, build_dir):
     chips = [
         _build_callable(
             build_dir / "callable-a",
+            arch,
             dag=scenario in ("tmr_dag", "eager_dag"),
             execution_error=scenario.startswith("runtime_error_"),
         )
@@ -360,8 +392,8 @@ def _initialize(device, scenario, build_dir):
         "prepare_in_capture",
         "eager_multi_callable",
     ):
-        chips.append(_build_callable(build_dir / "callable-b", alternate=True))
-    lib = _load("a2a3", "onboard", RUNTIME)
+        chips.append(_build_callable(build_dir / "callable-b", arch, alternate=True))
+    lib = _load(arch, "onboard", RUNTIME)
     _bind_acl(lib)
     _check(lib.aclInit(None), "acl init")
     _check(lib.aclrtSetDevice(device), "device")
@@ -372,7 +404,7 @@ def _initialize(device, scenario, build_dir):
     ctx = lib.create_device_context()
     assert ctx
     config = _config()
-    aicpu, aicore, dispatcher = _binaries("a2a3", RUNTIME)
+    aicpu, aicore, dispatcher = _binaries(arch, RUNTIME)
     observer = _bind_capture_functions(lib)
     _bind_observer_guards(observer)
     init_args = (
@@ -597,9 +629,22 @@ def _check_host_submission_failure(scenario, observer, prepare, launch):
     os._exit(0)
 
 
-def _check_device_failure(context, scenario, launch, record_nodes, replay):
+def _check_device_failure(context, scenario, launch, record_nodes, replay, sync, io, destination, initial):
+    from tests.st.a2a3.tensormap_and_ringbuffer.kernel_mode_capture.kernel_capture_values import (  # noqa: PLC0415
+        _check,
+    )
+
     observer = context.observer
     independent_event = _working_event_on_stream(context.lib, context.streams[1])
+    expected_epoch = 0
+    expected_launches = 1
+    if scenario.startswith("device_error_"):
+        launch(0)
+        sync(context.caller)
+        io.verify(destination, [value + 1.25 for value in initial])
+        _check(observer.capture_observer_check_round_epoch(1), "successful round epoch before failure")
+        expected_epoch = 1
+        expected_launches = 2
     if scenario.startswith("device_error_"):
         observer.capture_observer_corrupt_next_invocation()
     if scenario.endswith("replay"):
@@ -612,20 +657,45 @@ def _check_device_failure(context, scenario, launch, record_nodes, replay):
     assert status != 0, "hidden AICPU error was not propagated to caller"
     assert time.monotonic() - started < 9, "failure only surfaced through timeout"
     elapsed_ms = (time.monotonic() - started) * 1000
-    reported = observer.capture_observer_failure_reported()
+    reported = observer.capture_observer_failure_reported(expected_epoch)
     assert reported == 0, f"failed round diagnostic rc={reported}"
-    assert observer.capture_observer_cpu_launches() == 1
-    assert observer.capture_observer_core_launches() == 1
+    assert observer.capture_observer_cpu_launches() == expected_launches
+    assert observer.capture_observer_core_launches() == expected_launches
     independent_status = context.lib.aclrtRecordEvent(independent_event, context.streams[1])
     assert independent_status != 0, "unrelated stream accepted new work after context failure"
     print(
         f"PASS {scenario} caller_error=1 failure_reported=1 context_error=1 "
-        f"caller_status={status} independent_status={independent_status} elapsed_ms={elapsed_ms:.3f}",
+        f"caller_status={status} independent_status={independent_status} epoch_unchanged=1 "
+        f"expected_epoch={expected_epoch} elapsed_ms={elapsed_ms:.3f}",
         flush=True,
     )
     # Failed streams/graphs retain their allocations until process teardown.
     # Stop-on-failure is not evidence that already running AICores have stopped.
     os._exit(0)
+
+
+def _check_delayed_aicore_report(context, observer, prepare, launch, sync, io, destination, initial):
+    from tests.st.a2a3.tensormap_and_ringbuffer.kernel_mode_capture.kernel_capture_values import (  # noqa: PLC0415
+        _check,
+    )
+
+    prepare(0)
+    launch(0)
+    sync(context.caller)
+    io.verify(destination, [value + 1.25 for value in initial])
+    _check(observer.capture_observer_check_round_epoch(1), "first successful round epoch")
+
+    observer.capture_gate_arm_core()
+    launch(0, scalar=2.5)
+    assert observer.capture_gate_blocked() == 1, "AICore report publication was not delayed"
+    _check(observer.capture_observer_check_round_epoch(1), "old report remains while next report is delayed")
+    observer.capture_gate_release()
+    _check(observer.capture_gate_finish(), "release delayed AICore report")
+    sync(context.caller)
+    _check(observer.capture_observer_check_round_epoch(2), "second successful round epoch")
+    io.verify(destination, [value + 2.5 for value in initial])
+    assert observer.capture_observer_clears() == 0
+    print("PASS delayed_aicore_report stale_report_present=1 rounds=2 clears=0", flush=True)
 
 
 def _check_threaded_cross_stream_failure(
@@ -698,7 +768,7 @@ def _check_threaded_cross_stream_failure(
     elapsed_ms = (time.monotonic() - started) * 1000
     assert status != 0, "hidden AICPU error was not propagated to second caller"
     assert elapsed_ms < 9000, "second caller failure only surfaced through timeout"
-    assert observer.capture_observer_failure_reported() == 0
+    assert observer.capture_observer_failure_reported(1) == 0
     assert observer.capture_observer_cpu_launches() == 2
     assert observer.capture_observer_core_launches() == 2
     first_caller_status = lib.aclrtRecordEvent(first_caller_event, context.streams[0])
@@ -757,7 +827,7 @@ def _run_graph_scenario(scenario, context, case):
     print(f"PASS {scenario} replays=100 forbidden_sync=0 host_launches={host_launches}", flush=True)
 
 
-def _run(device, scenario, build_dir):
+def _run(device, scenario, build_dir, arch):  # noqa: PLR0915 -- scenario lifecycle is intentionally sequential
     from simpler.task_interface import ChipStorageTaskArgs, ChipTensor, DataType  # noqa: PLC0415
 
     from tests.st.a2a3.tensormap_and_ringbuffer.kernel_mode_capture.kernel_capture_values import (  # noqa: PLC0415
@@ -767,7 +837,7 @@ def _run(device, scenario, build_dir):
         _TensorIO,
     )
 
-    chips, lib, streams, caller, ctx, observer = _initialize(device, scenario, build_dir)
+    chips, lib, streams, caller, ctx, observer = _initialize(device, scenario, build_dir, arch)
     context = _Context(lib, ctx, streams, caller, observer)
     allocations = []
     io = _TensorIO(lib, allocations)
@@ -807,6 +877,7 @@ def _run(device, scenario, build_dir):
         args.add_tensor(ChipTensor.make(source.value, (_COUNT,), DataType.FLOAT32, child_memory=True))
         args.add_tensor(ChipTensor.make(destination.value, (_COUNT,), DataType.FLOAT32, child_memory=True))
         args.add_scalar(ctypes.c_float(scalar / 16 if scenario in ("tmr_dag", "eager_dag") else scalar))
+        clears_before = observer.capture_observer_clears()
         observer.capture_observer_invocation_scope(1)
         try:
             guarded(
@@ -819,6 +890,7 @@ def _run(device, scenario, build_dir):
             )
         finally:
             observer.capture_observer_invocation_scope(0)
+        assert observer.capture_observer_clears() == clears_before, "TMR launch submitted an async memset"
         args.clear()
         host_launches += int(expected == 0)
 
@@ -848,7 +920,7 @@ def _run(device, scenario, build_dir):
         _check_host_submission_failure(scenario, observer, prepare, launch)
         if scenario.startswith(("device_error_", "runtime_error_")):
             prepare(0)
-            _check_device_failure(context, scenario, launch, record_nodes, replay)
+            _check_device_failure(context, scenario, launch, record_nodes, replay, sync, io, pairs[0][1], initial)
         if scenario == "threaded_cross_stream_error":
             _check_threaded_cross_stream_failure(
                 context, guarded, prepare, launch, callable_ids, pairs[0][0], pairs[0][1], io, initial
@@ -862,6 +934,10 @@ def _run(device, scenario, build_dir):
             _check_init_failure(observer, lib, ctx, prepare, launch)
             _close(lib, ctx, allocations, streams, device)
             print(f"PASS {scenario} rejected_after_failure=1 forbidden_sync=0", flush=True)
+            return
+        if scenario == "delayed_aicore_report":
+            _check_delayed_aicore_report(context, observer, prepare, launch, sync, io, pairs[0][1], initial)
+            _close(lib, ctx, allocations, streams, device)
             return
         caller = _configure(context, scenario, prepare, launch, sync, io, pairs, initial)
         context.caller = caller
@@ -929,4 +1005,4 @@ def _run(device, scenario, build_dir):
 
 
 if __name__ == "__main__":
-    _run(int(sys.argv[1]), sys.argv[2], Path(sys.argv[3]))
+    _run(int(sys.argv[1]), sys.argv[2], Path(sys.argv[3]), sys.argv[4] if len(sys.argv) > 4 else "a2a3")

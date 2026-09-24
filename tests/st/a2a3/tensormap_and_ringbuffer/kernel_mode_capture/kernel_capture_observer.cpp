@@ -28,6 +28,7 @@
 #include "tensormap_and_ringbuffer/kernel_invocation.h"
 
 extern "C" aclError capture_gate_install_if_armed(aclrtStream stream);
+extern "C" aclError capture_gate_install_core_if_armed(aclrtStream stream);
 
 namespace {
 enum class ObserverError : int {
@@ -68,6 +69,16 @@ bool fail_large_free{false};
 uint64_t failed_frees{0};
 bool corrupt_next_invocation{false};
 bool fail_next_invocation{false};
+
+template <typename Args>
+auto ffts_base_addr(const Args &args, int) -> decltype(args.ffts_base_addr) {
+    return args.ffts_base_addr;
+}
+
+template <typename Args>
+uint64_t ffts_base_addr(const Args &, ...) {
+    return 0;
+}
 
 bool fail_prepare_step(int kind) {
     if (!prepare_scope || prepare_failure != kind) return false;
@@ -303,7 +314,7 @@ extern "C" int capture_observer_check_resident() {
         note_error(ObserverError::InvalidResident);
     } else if (observer.resident_sampled &&
                (resident.runtime_args != observer.resident.runtime_args || resident.regs != observer.resident.regs ||
-                resident.ffts_base_addr != observer.resident.ffts_base_addr)) {
+                ffts_base_addr(resident, 0) != ffts_base_addr(observer.resident, 0))) {
         note_error(ObserverError::ResidentChanged);
     } else {
         observer.resident = resident;
@@ -312,7 +323,7 @@ extern "C" int capture_observer_check_resident() {
     return static_cast<int>(observer.error);
 }
 
-extern "C" int capture_observer_failure_reported() {
+extern "C" int capture_observer_failure_reported(uint64_t expected_epoch) {
     using namespace simpler::tmr;
     const auto copy = reinterpret_cast<decltype(&aclrtMemcpy)>(resolve_cann_symbol("aclrtMemcpy"));
     if (copy == nullptr || observer.core_envelope == 0) return -1;
@@ -327,11 +338,39 @@ extern "C" int capture_observer_failure_reported() {
         read(&control, descriptor.control_address, sizeof(control)) != 0)
         return -2;
     if (control.completion != static_cast<uint32_t>(TmrCompletion::Complete) || control.runtime_status == 0 ||
-        control.cleanup_status != 0 || descriptor.worker_count <= 0) {
+        control.cleanup_status != 0 || control.round_epoch != expected_epoch || descriptor.worker_count <= 0) {
         std::fprintf(
-            stderr, "failure control: completion=%u runtime=%d cleanup=%d epoch=%" PRIu64 " workers=%d\n",
-            control.completion, control.runtime_status, control.cleanup_status, control.round_epoch,
+            stderr,
+            "failure control: completion=%u runtime=%d cleanup=%d epoch=%" PRIu64 " expected=%" PRIu64 " workers=%d\n",
+            control.completion, control.runtime_status, control.cleanup_status, control.round_epoch, expected_epoch,
             descriptor.worker_count
+        );
+        return -3;
+    }
+    return 0;
+}
+
+extern "C" int capture_observer_check_round_epoch(uint64_t expected_epoch) {
+    using namespace simpler::tmr;
+    const auto copy = reinterpret_cast<decltype(&aclrtMemcpy)>(resolve_cann_symbol("aclrtMemcpy"));
+    if (copy == nullptr || observer.core_envelope == 0) return -1;
+    const auto read = [&](void *out, uint64_t address, size_t bytes) {
+        return copy(out, bytes, reinterpret_cast<const void *>(address), bytes, ACL_MEMCPY_DEVICE_TO_HOST);
+    };
+    TmrKernelAicoreArgs envelope{};
+    TmrKernelContextDescriptor descriptor{};
+    TmrLaunchControl control{};
+    TmrCoreReport first_report{};
+    if (read(&envelope, observer.core_envelope, sizeof(envelope)) != 0 ||
+        read(&descriptor, envelope.context_descriptor, sizeof(descriptor)) != 0 ||
+        read(&control, descriptor.control_address, sizeof(control)) != 0 || descriptor.worker_count <= 0 ||
+        descriptor.reports_bytes < sizeof(TmrCoreReport) ||
+        read(&first_report, descriptor.reports_address, sizeof(first_report)) != 0)
+        return -2;
+    if (control.round_epoch != expected_epoch || first_report.report_epoch != expected_epoch) {
+        std::fprintf(
+            stderr, "round epoch: control=%" PRIu64 " report=%" PRIu64 " expected=%" PRIu64 "\n", control.round_epoch,
+            first_report.report_epoch, expected_epoch
         );
         return -3;
     }
@@ -343,6 +382,10 @@ extern "C" rtError_t rtKernelLaunchWithHandleV2(
     const rtTaskCfgInfo_t *config
 ) {
     if (observer.armed && invocation_scope) observe_core(args);
+    if (invocation_scope) {
+        const auto gate_rc = capture_gate_install_core_if_armed(reinterpret_cast<aclrtStream>(stream));
+        if (gate_rc != 0) return gate_rc;
+    }
     static const auto real =
         reinterpret_cast<decltype(&rtKernelLaunchWithHandleV2)>(resolve_cann_symbol("rtKernelLaunchWithHandleV2"));
     return real == nullptr ? -4330 : real(handle, tiling_key, blocks, args, sm_desc, stream, config);
