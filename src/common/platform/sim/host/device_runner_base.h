@@ -383,14 +383,22 @@ public:
     void withdraw_unlaunched_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch) noexcept;
 
     /**
-     * Whether the swimlane collector may hold a run past its boundary. Default
-     * off, and the collector is configured here for the reason the onboard base
-     * gives.
+     * Close one run's PMU window: either today's drain and reconcile, or, when
+     * PMU retains runs, the claim-time snapshot that hands the epoch to its
+     * background writer.
+     */
+    void close_pmu_run_boundary(const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete);
+
+    /**
+     * Whether a collector may hold a run past its boundary. Default off, and
+     * both retaining collectors are configured here for the reason the onboard
+     * base gives. PMU retention is independent of swimlane's.
      */
     void set_retain_runs(bool enabled) {
         chip_swimlane_collector_.configure_retained_runs(enabled, simpler::dfx::runs::kDefaultBudgetBytes);
+        pmu_collector_.configure_retained_runs(enabled);
     }
-    bool retains_runs() const { return chip_swimlane_collector_.retains_runs(); }
+    bool retains_runs() const { return chip_swimlane_collector_.retains_runs() || pmu_collector_.retains_runs(); }
     int flush_diagnostics(int timeout_ms, std::string *error);
     void finish_retained_runs();
     /**

@@ -93,6 +93,7 @@ Common columns (in order, identical across architectures):
 | `pmu_total_cycles` | 64-bit `PMU_CNT_TOTAL` snapshot |
 | event-specific counters | Counter columns selected by the event type |
 | `event_type` | Numeric event type used for the run |
+| `run_epoch` | Which run produced the row — the process-unique run identity |
 
 The number of counter columns varies by event type — each event group
 populates a different subset of the hardware counter slots, and the
@@ -150,6 +151,73 @@ pmu_idc_aic_vec_busy_o, cube_instr_busy, scalar_instr_busy,
 mte1_instr_busy, mte2_instr_busy, mte3_instr_busy,
 icache_req, icache_miss, pmu_fix_instr_busy
 ```
+
+### 3.4 Background output across runs (`collect_across_runs`)
+
+By default a run's `pmu.csv` is finished at that run's own boundary: the host
+drains the collection queues and merges the file before the next run starts, so
+`run()` returning means the file exists.
+
+With `collect_across_runs=True` on a local level-3 `Worker` **and** PMU enabled,
+PMU keeps only the device-side reads it must take while the run still owns the
+device, and a background writer finishes the file while the next run executes.
+The device still runs one task graph at a time; what overlaps is the host's
+receipt and the merge.
+
+What changes for you:
+
+| Question | Default | `collect_across_runs=True` |
+| -------- | ------- | -------------------------- |
+| after `run()` returns | `pmu.csv` exists | it may not exist yet |
+| how to be sure it exists | nothing to do | call `Worker.flush_diagnostics()` |
+| runs awaiting publication | none | at most two; a third **fails before it is submitted** |
+| a run that produced no records | no file | no file, and that is a success only when the zero is proved |
+| a failed write | the partial file is removed | the temp files are kept as evidence, and the next run under that directory is refused until they are removed |
+
+`flush_diagnostics()` is the barrier, and its **return** is the success signal —
+not the presence of `pmu.csv`:
+
+```python
+worker = Worker(..., collect_across_runs=True)
+worker.run(...)          # pmu.csv may still be in the background
+worker.flush_diagnostics()  # raises if any closed run is incomplete
+# every run closed before the call has now published its file — except a run
+# proved to have produced no records, which has no file and is still a success
+```
+
+A PMU CSV has no column in which to say "this file is partial", so anything
+short of a proved-complete run raises rather than passing silently. A run is
+complete only when its transport cut is known and had no failed queue, its
+processing settled, its counters were readable, and `collected + dropped`
+matched the device's own total. Records the device dropped are still published —
+the rows that exist are real — but the call still raises.
+
+**A run that produced nothing writes no file, and that is success**, exactly as
+it is by default. The zero has to be proved, though: all of the device's record
+counters at zero *and* the transport cut known and settled. A run whose counters
+could not be read, or whose cut never settled, is not an empty run — it raises,
+and `pmu.csv` is absent for a different reason. So absence of the file never
+distinguishes the two; the call's return does.
+
+A failure is **sticky for the life of the device runner**: there is no
+acknowledgement API, so once one run has failed, every later
+`flush_diagnostics()` raises until the worker is closed. It survives a collector
+rebuild (a core-count change) and PMU being turned off and on again.
+`Worker.close()` runs the same flush once more, before teardown, and that is the
+last call that can report it; a failure that first happens inside the native
+teardown leaves only the log lines and the preserved temp files.
+
+Each retained run also freezes its own event type and column set at admission,
+so a run that selects a different event type cannot change the columns of a
+predecessor whose file is still being written.
+
+**Pool sizing under retention.** PMU's buffer pool is allowed to grow to twice
+the bytes it was seeded with (device plus host shadow together) while runs are
+retained, where it is otherwise unbounded. Reaching that ceiling stops further
+growth — nothing already in use is reclaimed — and the device then drops records
+as it does when a pool runs dry, which makes that run incomplete and raises from
+the flush. There is no host-memory or disk quota: disk is bounded only by the
+filesystem, and a full disk is reported as a write failure.
 
 ## 4. Capabilities
 
@@ -590,7 +658,26 @@ Notes on this constraint:
 **No `pmu.csv` produced.** Check that `--enable-pmu` was passed (or
 `SIMPLER_PMU_EVENT_TYPE` was set with the flag). Verify
 `<output_prefix>` exists in the run log; if `--rounds > 1`, PMU
-collection is suppressed by the harness.
+collection is suppressed by the harness. With
+`collect_across_runs=True` the file may simply not be finished yet —
+call `Worker.flush_diagnostics()` first (§3.4).
+
+**`flush_diagnostics()` raises but `pmu.csv` is there.** Expected, and
+the file is not the answer. A CSV has no column that can say "partial",
+so a run whose records or transport cut could not be proved complete
+publishes the rows it has *and* fails the flush. The error string names
+the run, its verdict and its counts. The failure is sticky for the
+device runner's life, so every later call raises too (§3.4).
+
+**A run is refused before it starts, with "both retained PMU runs are
+still unpublished".** Two unpublished runs is the capacity. Call
+`flush_diagnostics()` between runs, or accept that a slow disk bounds
+how fast runs may be submitted.
+
+**A run is refused with "still holds a failed run's temporary files".**
+A previous run's `pmu.csv.e<epoch>.*.tmp` files are its failure
+evidence and are never deleted for you. Read them, remove them, and the
+destination is usable again.
 
 **All counter columns are zero.** Either the platform is `a2a3sim` /
 `a5sim` (counter registers are not modelled), or the active event

@@ -11182,10 +11182,23 @@ class Worker:
 
         Only meaningful with ``collect_across_runs=True``: each chip publishes
         in the background, and this is the barrier that says *the files up
-        to here exist now*. Returns normally when every run up to the close
-        watermark has its artifact — a published partial counts, and carries
-        its verdict inside the file. Raises ``RuntimeError`` when any of them
-        left no file, when a child reports a failure, or when the wait ran out.
+        to here exist now*. Raises ``RuntimeError`` when a promised file is
+        missing, when a child reports a failure, or when the wait ran out.
+
+        What counts as success is the collector's own rule, and the two that
+        retain runs answer differently:
+
+        - the **chip swimlane** artifact carries its own verdict, so a
+          published partial counts as success — the file says it is partial.
+        - **PMU** writes a CSV, which has nowhere to record that. So a PMU run
+          whose records or transport cut could not be proved complete fails
+          this call even though its rows were published, and a PMU failure is
+          sticky for the device runner's life: once one is recorded, every
+          later call raises until the worker is closed. ``pmu.csv`` existing is
+          therefore not a success signal — this call's return is. A run proved
+          to have produced no records writes no file and is still a success,
+          which is why the file's absence does not distinguish an empty run
+          from a failed one either.
 
         Callable only with no run outstanding, and never from inside a graph
         callback: it seals whole runs, which is not something a run may do to
@@ -11196,7 +11209,9 @@ class Worker:
 
         ``timeout`` bounds the waits it is passed to and is re-checked before
         each child; it does **not** bound the untimed acquisitions — the two
-        leases and the C++ mailbox mutex — so the call can exceed it.
+        leases and the C++ mailbox mutex — so the call can exceed it. Both
+        retaining collectors are serviced inside one child's share of it, and
+        both are attempted even if the first fails.
         """
         if self.level != 3:
             raise RuntimeError("Worker.flush_diagnostics: only a level-3 worker with local chip children supports it")

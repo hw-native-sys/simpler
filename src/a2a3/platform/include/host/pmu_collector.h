@@ -46,7 +46,9 @@
 #define SRC_A2A3_PLATFORM_INCLUDE_HOST_PMU_COLLECTOR_H_
 
 #include <atomic>
+#include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -54,13 +56,17 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "common/pmu_profiling.h"
 #include "common/unified_log.h"
+#include "host/pmu_runs.h"
 #include "host/profiler_base.h"
 
 // ---------------------------------------------------------------------------
@@ -273,6 +279,102 @@ public:
      */
     bool is_initialized() const { return initialized_; }
 
+    // -----------------------------------------------------------------------
+    // Cross-run retention
+    // -----------------------------------------------------------------------
+
+    /**
+     * Whether this collector may hold a run's CSV past that run's boundary.
+     *
+     * Latched by the runner at device init from `collect_across_runs`. Default
+     * false, and with it false every path below is unreachable: the collector
+     * keeps its single-run window, its in-place merge and its per-run drain,
+     * byte for byte.
+     */
+    void configure_retained_runs(bool enabled) { retained_runs_.configure(enabled); }
+    bool retains_runs() const { return retained_runs_.retains_runs(); }
+
+    /**
+     * Admit one run, freezing everything its rows and its file depend on.
+     *
+     * Returns false — before any kernel is submitted — when both epoch slots
+     * are occupied, when the destination is owned by an open epoch or still
+     * holds a failed epoch's preserved temp files, when the path exceeds the
+     * allowance, or when the collector is fatal. A refusal must fail the run:
+     * falling back to `begin_run` would reset a store a predecessor is still
+     * publishing into.
+     */
+    bool run_begin(uint64_t run_epoch, const std::string &csv_path, PmuEventType event_type) {
+        return retained_runs_.run_begin(run_epoch, csv_path, event_type);
+    }
+
+    /**
+     * Close one run's collection window while it still holds the execution
+     * claim: snapshot the device counters and live buffers the successor's
+     * admission will zero, then arm the transport cut and hand the epoch to the
+     * writer. Does not drain and does not merge.
+     */
+    void run_close(uint64_t run_epoch, bool device_execution_complete) {
+        retained_runs_.run_close(run_epoch, device_execution_complete);
+    }
+
+    /**
+     * Give back the slot of a run that was admitted and never launched.
+     *
+     * Returns false when the reference release could not be proved; the epoch
+     * is then quarantined rather than released, exactly as a failed close is.
+     */
+    bool abandon_run(uint64_t run_epoch) { return retained_runs_.abandon_run(run_epoch); }
+
+    /**
+     * Wait for every run closed up to now to be published, then report.
+     *
+     * Always does both halves: a normal in-flight file is waited for, and the
+     * sticky error record is reported whether or not retention is currently on
+     * — a failure recorded before a collector rebuild must not vanish with it.
+     */
+    bool flush_retained_runs(int timeout_ms, std::string *error) { return retained_runs_.flush(timeout_ms, error); }
+
+    /** Stop admitting and publish what is still retained. Reports nothing. */
+    void finish_retained_runs() { retained_runs_.finish(); }
+
+    /** Counts a test can assert on without reaching into collector internals. */
+    simpler::dfx::pmu::RetainedRunStats retained_run_stats_for_test() const { return retained_runs_.stats(); }
+
+    /**
+     * Hold the background writer before it seals, so a case can prove that a
+     * row was written while a named epoch was still open. See
+     * `simpler::dfx::pmu::RetainedRuns::hold_writer_for_test`.
+     */
+    void hold_retained_writer_for_test(bool held) { retained_runs_.hold_writer_for_test(held); }
+
+    /**
+     * Deliver one already-filled buffer through the real routing path, on the
+     * caller's thread.
+     *
+     * The same call `on_buffer_collected` makes, so what it exercises is
+     * production: the epoch is resolved from the buffer's own `run_epoch` and
+     * the rows are written with that epoch's frozen columns. It exists so a
+     * case can choose the *instant* of that write, which the drain and
+     * collector threads otherwise choose for it.
+     */
+    void deliver_buffer_for_test(const void *buf_host_ptr, int core_id, int thread_idx, int collector_shard) {
+        retained_runs_.route_buffer(buf_host_ptr, core_id, thread_idx, collector_shard);
+    }
+
+    /**
+     * ProfilerBase hook: adopt the epoch table before acknowledging the
+     * reference-release request. Called on a collector shard thread while it
+     * holds no epoch reference.
+     */
+    void refresh_retained_run_view(int collector_shard) { retained_runs_.refresh_view(collector_shard); }
+
+    /**
+     * ProfilerBase hook: transport progress at a transition the background
+     * writer waits on. Cheap, and a no-op while no run is retained.
+     */
+    void note_transport_progress() { retained_runs_.note_transport_progress(); }
+
 private:
     struct alignas(64) CollectorShardCounters {
         uint64_t total_collected{0};
@@ -280,6 +382,41 @@ private:
     static_assert(
         sizeof(CollectorShardCounters) % 64 == 0, "CollectorShardCounters must not share cache lines across shards"
     );
+
+    /**
+     * The per-run configuration an epoch's rows are written with.
+     *
+     * Frozen at admission because the hot path would otherwise read the
+     * collector's mutable members, and a successor's admission changes them:
+     * a late buffer from run N would be written with N+1's event type and
+     * column set.
+     */
+    struct FrozenRunConfig {
+        PmuEventType event_type{PmuEventType::PIPE_UTILIZATION};
+        const PmuEventConfig *events{nullptr};
+    };
+    using RetainedRunTable =
+        simpler::dfx::pmu::RetainedRuns<PmuCollector, FrozenRunConfig, PmuEventType, Manager::kMaxCollectorShards>;
+    // The table drives this collector through the hooks below and reaches
+    // `ProfilerBase`'s cut and reference-release primitives through it.
+    friend class simpler::dfx::pmu::RetainedRuns<
+        PmuCollector, FrozenRunConfig, PmuEventType, Manager::kMaxCollectorShards>;
+
+    // Hooks the retained-run table calls. Each is the arch-specific half of a
+    // step whose sequencing lives in the table.
+    size_t retained_shard_count() const { return static_cast<size_t>(manager_.shard_count()); }
+    FrozenRunConfig freeze_run_config(PmuEventType event_type) const;
+    std::string build_csv_header(const FrozenRunConfig &frozen) const;
+    bool publish_run_config(PmuEventType event_type);
+    simpler::dfx::pmu::RecordProofs snapshot_run_records(bool device_execution_complete) const;
+    uint64_t buffer_run_epoch(const void *buf_host_ptr) const;
+    uint64_t buffer_record_count(const void *buf_host_ptr) const;
+    uint64_t write_buffer_rows(
+        std::ofstream &out, const FrozenRunConfig &frozen, int core_id, int thread_idx, const void *buf_host_ptr,
+        uint64_t buffer_epoch, bool *clamped
+    );
+    void install_paired_caps();
+    void release_paired_caps();
 
     bool initialized_ = false;
     int num_cores_ = 0;
@@ -324,7 +461,12 @@ private:
     bool ensure_csv_open();
     bool close_csv_shards();
     void rebuild_csv_header();
+    std::string build_csv_header(const PmuEventConfig *events) const;
     void cleanup_csv_shards();
+
+    // Constructed with a reference to this collector, so it stays a member and
+    // is never copied.
+    RetainedRunTable retained_runs_{*this};
 };
 
 // ---------------------------------------------------------------------------

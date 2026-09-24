@@ -17,6 +17,7 @@
 #include <pthread.h>
 #endif
 
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -913,8 +914,28 @@ int SimDeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &dfx
         dump_collector_.start(thread_factory);
     }
     if (dfx.pmu_enabled) {
-        pmu_collector_.begin_run(make_pmu_csv_path(dfx.output_prefix), dfx.pmu_event_type);
-        pmu_collector_.start(thread_factory);
+        // Configuration picks the path, exactly as it does for swimlane: a run
+        // a retaining collector will not admit fails here, before any kernel is
+        // submitted, rather than falling into the single-run reset that would
+        // drop a predecessor's rows.
+        if (pmu_collector_.retains_runs()) {
+            // Reader shards before admission, and only here: admitting a run
+            // waits for every shard to acknowledge the new epoch table, and a
+            // shard that has not been spawned cannot acknowledge anything.
+            pmu_collector_.start(thread_factory);
+            if (!pmu_collector_.run_begin(run_epoch, make_pmu_csv_path(dfx.output_prefix), dfx.pmu_event_type)) {
+                LOG_ERROR(
+                    "PmuCollector: run %llu was not admitted for retained collection",
+                    static_cast<unsigned long long>(run_epoch)
+                );
+                return PTO_RUNTIME_ERR_INTERNAL;
+            }
+        } else {
+            // The default path keeps its order: the window is opened, then the
+            // threads that serve it start.
+            pmu_collector_.begin_run(make_pmu_csv_path(dfx.output_prefix), dfx.pmu_event_type);
+            pmu_collector_.start(thread_factory);
+        }
     }
     if (dfx.scope_stats_enabled) {
         scope_stats_collector_.begin_run();
@@ -943,6 +964,12 @@ void SimDeviceRunnerBase::withdraw_unlaunched_collectors_for_run(const DfxRunCon
     // admitted, targetless slot that neither the writer nor a flush can see,
     // and `kMaxOpenEpochs` of them exhaust the capacity the next admission
     // waits on. Nothing may escape, for the reason the onboard base gives.
+    if (dfx.pmu_enabled && pmu_collector_.retains_runs()) {
+        // Nothing may escape a rollback path, for the reason given below.
+        try {
+            (void)pmu_collector_.abandon_run(run_epoch);
+        } catch (...) {}
+    }
     if (!dfx.chip_swimlane_enabled()) return;
     if (!chip_swimlane_collector_.retains_runs()) return;
     try {
@@ -951,11 +978,47 @@ void SimDeviceRunnerBase::withdraw_unlaunched_collectors_for_run(const DfxRunCon
 }
 
 int SimDeviceRunnerBase::flush_diagnostics(int timeout_ms, std::string *error) {
-    if (!chip_swimlane_collector_.retains_runs()) return 0;
-    return chip_swimlane_collector_.flush_retained_runs(timeout_ms, error) ? 0 : PTO_RUNTIME_ERR_INTERNAL;
+    // Both retaining collectors, inside the one call and the one budget: each
+    // is serviced with the time left rather than re-acquiring the caller's
+    // whole timeout, so the bound never doubles. Both are always attempted —
+    // the first one's failure must not hide the second's — and the call fails
+    // if either does, naming each.
+    //
+    // Deliberately not gated on `retains_runs()`: PMU keeps a sticky error
+    // record for the runner's whole life, so a failure recorded before a
+    // collector rebuild turned retention off must still be reported here.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    auto remaining_ms = [&deadline]() -> int {
+        const auto left =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+        if (left <= 0) return 0;
+        return static_cast<int>(left);
+    };
+    std::string swimlane_error;
+    std::string pmu_error;
+    bool ok = true;
+    if (chip_swimlane_collector_.retains_runs() &&
+        !chip_swimlane_collector_.flush_retained_runs(remaining_ms(), &swimlane_error)) {
+        ok = false;
+    }
+    if (!pmu_collector_.flush_retained_runs(remaining_ms(), &pmu_error)) {
+        ok = false;
+    }
+    if (ok) return 0;
+    if (error != nullptr) {
+        *error = swimlane_error;
+        if (!pmu_error.empty()) {
+            if (!error->empty()) *error += "; ";
+            *error += pmu_error;
+        }
+    }
+    return PTO_RUNTIME_ERR_INTERNAL;
 }
 
-void SimDeviceRunnerBase::finish_retained_runs() { chip_swimlane_collector_.finish_retained_runs(); }
+void SimDeviceRunnerBase::finish_retained_runs() {
+    chip_swimlane_collector_.finish_retained_runs();
+    pmu_collector_.finish_retained_runs();
+}
 
 void SimDeviceRunnerBase::write_host_phase_records_artifact(const std::string &output_prefix, uint32_t pipeline_slot) {
     if (pipeline_slot >= host_phase_runs_.size()) return;
@@ -968,6 +1031,27 @@ void SimDeviceRunnerBase::write_host_phase_records_artifact(const std::string &o
     if (!output_prefix.empty() && records.finished()) {
         (void)records.write_records_jsonl(make_host_phase_records_path(output_prefix));
     }
+}
+
+void SimDeviceRunnerBase::close_pmu_run_boundary(
+    const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete
+) {
+    if (!pmu_collector_.retains_runs()) {
+        pmu_collector_.quiesce();
+        pmu_collector_.reconcile_counters();
+        return;
+    }
+    // A retained run keeps only the run boundary's device-side reads — the
+    // per-core counters and the buffers the cores still hold — and hands the
+    // rest to the writer. No quiesce: the pipeline is shared with the
+    // successor, and draining it here is what the per-queue cut replaces.
+    //
+    // `device_execution_complete` is what the caller observed of this run's
+    // fence, and it is the whole of PMU's "this run finished" proof: the
+    // recovery path clears it, and a producer may then never have reached its
+    // own close.
+    (void)dfx;
+    pmu_collector_.run_close(run_epoch, device_execution_complete);
 }
 
 void SimDeviceRunnerBase::teardown_shared_collectors_after_run(
@@ -997,8 +1081,7 @@ void SimDeviceRunnerBase::teardown_shared_collectors_after_run(
             dump_collector_.export_dump_files();
         }
         if (dfx.pmu_enabled) {
-            pmu_collector_.quiesce();
-            pmu_collector_.reconcile_counters();
+            close_pmu_run_boundary(dfx, run_epoch, device_execution_complete);
         }
         if (dfx.scope_stats_enabled) {
             scope_stats_collector_.quiesce();
@@ -1030,8 +1113,7 @@ void SimDeviceRunnerBase::teardown_shared_collectors_after_run(
     }
 
     if (dfx.pmu_enabled) {
-        pmu_collector_.quiesce();
-        pmu_collector_.reconcile_counters();
+        close_pmu_run_boundary(dfx, run_epoch, device_execution_complete);
     }
 
     if (dfx.scope_stats_enabled) {

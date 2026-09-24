@@ -68,7 +68,13 @@ bool recycled_seed_capacity_is_sufficient(int num_cores, int thread_count, int s
 
 }  // namespace
 
-PmuCollector::~PmuCollector() { stop(); }
+PmuCollector::~PmuCollector() {
+    // The writer before the collector threads: it is the one that asks them for
+    // a reference release, so joining it second could leave it waiting on
+    // threads that are already gone.
+    retained_runs_.stop_writer();
+    stop();
+}
 
 // ---------------------------------------------------------------------------
 // init
@@ -239,7 +245,12 @@ int PmuCollector::init(
 
 void PmuCollector::start(const profiling_common::ThreadFactory &thread_factory) {
     if (shm_host_ == nullptr) return;
-    reset_collector_shards();
+    // A retaining collector owns no single-run shard state: its files, counters
+    // and header belong to an epoch, and dropping them here would reset what a
+    // predecessor is still publishing into.
+    if (!retains_runs()) {
+        reset_collector_shards();
+    }
     profiling_common::ProfilerBase<PmuCollector, PmuModule>::start(thread_factory);
 }
 
@@ -288,14 +299,9 @@ void PmuCollector::cleanup_csv_shards() {
     }
 }
 
-void PmuCollector::rebuild_csv_header() {
-    // Columns are named by the event config, so this is per-run state: a run
-    // that selects a different event type needs different column names.
+std::string PmuCollector::build_csv_header(const PmuEventConfig *events) const {
     std::string header = "thread_id,core_id,task_id,func_id,core_type,pmu_total_cycles";
-    const PmuEventConfig *evt = pmu_resolve_event_config_a5(event_type_);
-    if (evt == nullptr) {
-        evt = &PMU_EVENTS_A5_PIPE_UTIL;
-    }
+    const PmuEventConfig *evt = events != nullptr ? events : &PMU_EVENTS_A5_PIPE_UTIL;
     for (int i = 0; i < PMU_COUNTER_COUNT_A5; i++) {
         const char *name = evt->counter_names[i];
         if (name == nullptr || name[0] == '\0') {
@@ -305,7 +311,25 @@ void PmuCollector::rebuild_csv_header() {
         header += name;
     }
     header += ",event_type,run_epoch\n";
-    csv_header_ = std::move(header);
+    return header;
+}
+
+std::string PmuCollector::build_csv_header(const FrozenRunConfig &frozen) const {
+    return build_csv_header(frozen.events);
+}
+
+PmuCollector::FrozenRunConfig PmuCollector::freeze_run_config(PmuEventType event_type) const {
+    FrozenRunConfig frozen;
+    frozen.event_type = event_type;
+    frozen.events = pmu_resolve_event_config_a5(event_type);
+    if (frozen.events == nullptr) frozen.events = &PMU_EVENTS_A5_PIPE_UTIL;
+    return frozen;
+}
+
+void PmuCollector::rebuild_csv_header() {
+    // Columns are named by the event config, so this is per-run state: a run
+    // that selects a different event type needs different column names.
+    csv_header_ = build_csv_header(pmu_resolve_event_config_a5(event_type_));
 }
 
 void PmuCollector::begin_run(const std::string &csv_path, PmuEventType event_type) {
@@ -319,39 +343,60 @@ void PmuCollector::begin_run(const std::string &csv_path, PmuEventType event_typ
     }
     execution_complete_.store(false, std::memory_order_release);
     rebuild_csv_header();
+    // The single-run path keeps its behaviour: a field the device would not
+    // take is logged by `publish_field` and the run proceeds, exactly as it did
+    // before retention existed. Only a retained admission treats that as a
+    // refusal, because only it promises that the frozen host configuration and
+    // the device's agree.
+    (void)publish_run_config(event_type);
+}
 
+bool PmuCollector::publish_run_config(PmuEventType event_type) {
+    event_type_ = event_type;
     // Before the first init() there is no region; init() writes the event type
     // from the member just set. Afterwards the device needs the new value by
     // another route — one narrow field, not a bulk write-back, so it cannot race
     // the AICPU's own header fields.
-    if (shm_host_ != nullptr) {
-        PmuDataHeader *hdr = get_pmu_header(shm_host_);
-        hdr->event_type = static_cast<uint32_t>(event_type_);
-        wmb();
-        publish_field(&hdr->event_type, sizeof(hdr->event_type), "event_type");
+    if (shm_host_ == nullptr) return true;
+    bool published = true;
+    PmuDataHeader *hdr = get_pmu_header(shm_host_);
+    hdr->event_type = static_cast<uint32_t>(event_type_);
+    wmb();
+    // The device reads the event type out of this header to program its
+    // counters, so a copy the device did not take leaves it measuring the
+    // previous run's event group while the host names this run's columns.
+    // `publish_field` returns false in exactly that case.
+    published = publish_field(&hdr->event_type, sizeof(hdr->event_type), "event_type") && published;
 
-        // The per-core record counters are producer-side and never reset by the
-        // device, so they carry the previous run's totals into this run's
-        // reconcile. The three are adjacent, so one write-back per core covers
-        // them and leaves the device-owned fields beside them alone.
-        static_assert(
-            offsetof(PmuBufferState, mismatch_record_count) ==
-                offsetof(PmuBufferState, total_record_count) + 2 * sizeof(uint32_t),
-            "the three counters must stay adjacent for this single write-back to cover them"
-        );
-        // The region holds num_cores_ states (calc_pmu_data_size), so that is
-        // the bound — a wider loop writes past its end. The runner rebuilds this
-        // collector when a run's core count changes, so a resident one is never
-        // asked to reset a state it does not own.
-        for (int c = 0; c < num_cores_; c++) {
-            PmuBufferState *state = get_pmu_buffer_state(shm_host_, c);
-            state->total_record_count = 0;
-            state->dropped_record_count = 0;
-            state->mismatch_record_count = 0;
-            wmb();
-            publish_field(&state->total_record_count, 3 * sizeof(uint32_t), "record counters");
-        }
+    // The per-core record counters are producer-side and never reset by the
+    // device, so they carry the previous run's totals into this run's
+    // reconcile. The three are adjacent, so one write-back per core covers
+    // them and leaves the device-owned fields beside them alone.
+    //
+    // A retaining collector reaches here through an admission, which the
+    // predecessor's close precedes: those totals have already been snapshotted
+    // into that run's own epoch, so resetting them here destroys nothing.
+    static_assert(
+        offsetof(PmuBufferState, mismatch_record_count) ==
+            offsetof(PmuBufferState, total_record_count) + 2 * sizeof(uint32_t),
+        "the three counters must stay adjacent for this single write-back to cover them"
+    );
+    // The region holds num_cores_ states (calc_pmu_data_size), so that is
+    // the bound — a wider loop writes past its end. The runner rebuilds this
+    // collector when a run's core count changes, so a resident one is never
+    // asked to reset a state it does not own.
+    for (int c = 0; c < num_cores_; c++) {
+        PmuBufferState *state = get_pmu_buffer_state(shm_host_, c);
+        state->total_record_count = 0;
+        state->dropped_record_count = 0;
+        state->mismatch_record_count = 0;
+        wmb();
+        // A reset the device did not take carries the predecessor's totals into
+        // this run's reconcile, so its completeness comparison would be against
+        // somebody else's producer count.
+        published = publish_field(&state->total_record_count, 3 * sizeof(uint32_t), "record counters") && published;
     }
+    return published;
 }
 
 void PmuCollector::reset_collector_shards() {
@@ -517,6 +562,16 @@ bool PmuCollector::flush_collector_shards_to_csv() {
 // ---------------------------------------------------------------------------
 
 void PmuCollector::on_buffer_collected(const PmuReadyBufferInfo &info, int collector_shard) {
+    // A retaining collector routes by the buffer's own run identity, so a
+    // predecessor's late buffer lands in that run's file with that run's
+    // columns rather than in whatever run is currently admitting.
+    if (retains_runs()) {
+        retained_runs_.route_buffer(
+            info.host_buffer_ptr, static_cast<int>(info.core_index), static_cast<int>(info.thread_index),
+            collector_shard
+        );
+        return;
+    }
     append_buffer_to_csv_shard(
         static_cast<int>(info.core_index), static_cast<int>(info.thread_index), info.host_buffer_ptr, collector_shard
     );
@@ -536,6 +591,12 @@ void PmuCollector::on_buffer_collected(const PmuReadyBufferInfo &info, int colle
 
 void PmuCollector::reconcile_counters() {
     if (shm_host_ == nullptr) return;
+    // A retaining collector reconciles per epoch, at its close and in its
+    // writer: this run's counters are snapshotted there, its rows are its own
+    // shard files, and the drain path's retirement count is consumed once at
+    // teardown rather than per run. Reaching here would read a successor's
+    // counters and merge in place under a path an epoch owns.
+    if (retains_runs()) return;
     report_drain_drops();
 
     // Pull the latest BufferStates (current_buf_ptr, total/dropped/mismatch
@@ -638,9 +699,25 @@ void PmuCollector::reconcile_counters() {
 void PmuCollector::finalize(PmuUnregisterCallback unregister_cb, const PmuFreeCallback &free_cb) {
     if (!initialized_) return;
 
+    // Publish whatever the writer can still publish, for a caller that never
+    // reached `finish_retained_runs()`. Idempotent, and it reports nothing:
+    // the sticky summary is what carries a failure past this point.
+    retained_runs_.finish();
+    // Then the writer, before the threads it asks for a reference release.
+    retained_runs_.stop_writer();
+
     // Stop mgmt + collector threads if the caller didn't already (idempotent).
     stop();
-    flush_collector_shards_to_csv();
+    // Only now: the shards whose references a quarantined epoch could not prove
+    // released are joined, so its storage is unreachable by any reader. Its
+    // files stay on disk as evidence.
+    retained_runs_.release_resources();
+    retained_runs_.release_quarantined();
+    // A retaining collector has no single-run shard state to merge; the
+    // non-retained path's merge is what this is.
+    if (!retains_runs()) {
+        flush_collector_shards_to_csv();
+    }
 
     if (csv_file_.is_open()) {
         csv_file_.close();
@@ -722,4 +799,161 @@ void PmuCollector::finalize(PmuUnregisterCallback unregister_cb, const PmuFreeCa
     collector_counters_.shrink_to_fit();
     csv_shards_finalized_ = false;
     clear_memory_context();
+}
+
+// ---------------------------------------------------------------------------
+// Cross-run retention hooks
+// ---------------------------------------------------------------------------
+//
+// The sequencing lives in simpler::dfx::pmu::RetainedRuns; these are the
+// arch-specific halves it calls. The device stays serial — what overlaps a
+// successor's execution is this collector's host-side receive and the
+// background merge of a predecessor's rows.
+
+namespace {
+
+/**
+ * The device address of one field inside core `core`'s buffer state.
+ *
+ * Narrow by construction: a5's host side of the region is a shadow the
+ * framework mirrors per tick, and the free-queue cursors beside these counters
+ * are written *by the host* drain and replenish threads. Refreshing the whole
+ * state — or the whole region — would overwrite their work, so each field this
+ * snapshot reads is fetched on its own into scratch.
+ */
+const void *pmu_dev_field(void *shm_dev, int core, size_t field_offset) {
+    return reinterpret_cast<const char *>(shm_dev) + sizeof(PmuDataHeader) +
+           static_cast<size_t>(core) * sizeof(PmuBufferState) + field_offset;
+}
+
+}  // namespace
+
+simpler::dfx::pmu::RecordProofs PmuCollector::snapshot_run_records(bool device_execution_complete) const {
+    simpler::dfx::pmu::RecordProofs proofs;
+    proofs.device_execution_complete = device_execution_complete;
+    if (shm_host_ == nullptr) {
+        // No region to read, so this run's completeness is unknowable rather
+        // than zero.
+        return proofs;
+    }
+    // a5 is not SVM: `shm_host_` is a shadow, and a host fence over it says
+    // nothing about the device's own counters. So the refresh is a real D2H
+    // read, and its absence is an unreadable snapshot rather than a zero one —
+    // the same rule `reconcile_counters` has always followed before its
+    // cross-check, narrowed to the fields this reads.
+    void *shm_dev = manager_.shared_mem_dev();
+    if (shm_dev == nullptr || !copy_from_device_) {
+        LOG_ERROR("PmuCollector: no device-to-host read for the run close snapshot; counts are unknown");
+        return proofs;
+    }
+    // The three counters are adjacent, so one narrow read per core covers them
+    // and touches nothing the host owns. Order matters: the scratch below is
+    // indexed by it.
+    static_assert(
+        offsetof(PmuBufferState, mismatch_record_count) ==
+            offsetof(PmuBufferState, total_record_count) + 2 * sizeof(uint32_t),
+        "the three counters must stay adjacent for this single narrow read to cover them"
+    );
+    proofs.snapshot_readable = true;
+    for (int c = 0; c < num_cores_; c++) {
+        uint32_t counters[3] = {0, 0, 0};
+        uint64_t buf_dev = 0;
+        if (copy_from_device_(
+                counters, pmu_dev_field(shm_dev, c, offsetof(PmuBufferState, total_record_count)), sizeof(counters)
+            ) != 0 ||
+            copy_from_device_(
+                &buf_dev, pmu_dev_field(shm_dev, c, offsetof(PmuBufferState, current_buf_ptr)), sizeof(buf_dev)
+            ) != 0) {
+            // A read that failed leaves this run's accounting unprovable. It is
+            // not folded into the totals: a partial sum would compare as a
+            // balanced equation against rows that are not all there.
+            LOG_ERROR("PmuCollector: could not read core %d's record counters for the run close snapshot", c);
+            proofs.snapshot_readable = false;
+            return proofs;
+        }
+        proofs.total_device += counters[0];
+        proofs.dropped_device += counters[1];
+        proofs.mismatch_device += counters[2];
+        if (buf_dev == 0) continue;
+        // Validate the pointer against the manager before handing it to a
+        // device read: a buffer this collector does not own is not one to copy
+        // from, and its contents are then unknowable.
+        if (manager_.resolve_host_ptr(reinterpret_cast<void *>(buf_dev)) == nullptr) {
+            proofs.live_buffer_unreadable = true;
+            continue;
+        }
+        uint32_t count = 0;
+        const void *dev_count = reinterpret_cast<const char *>(buf_dev) + offsetof(PmuBuffer, count);
+        if (copy_from_device_(&count, dev_count, sizeof(count)) != 0) {
+            // The buffer a core still holds cannot be read, so whether it held
+            // records is unknowable — which is not the same as zero.
+            proofs.live_buffer_unreadable = true;
+            continue;
+        }
+        if (count != 0) proofs.unflushed_records += count;
+    }
+    return proofs;
+}
+
+uint64_t PmuCollector::buffer_run_epoch(const void *buf_host_ptr) const {
+    return reinterpret_cast<const PmuBuffer *>(buf_host_ptr)->run_epoch;
+}
+
+uint64_t PmuCollector::buffer_record_count(const void *buf_host_ptr) const {
+    uint32_t n = reinterpret_cast<const PmuBuffer *>(buf_host_ptr)->count;
+    if (n > static_cast<uint32_t>(PLATFORM_PMU_RECORDS_PER_BUFFER)) {
+        n = static_cast<uint32_t>(PLATFORM_PMU_RECORDS_PER_BUFFER);
+    }
+    return n;
+}
+
+uint64_t PmuCollector::write_buffer_rows(
+    std::ofstream &out, const FrozenRunConfig &frozen, int core_id, int thread_idx, const void *buf_host_ptr,
+    uint64_t buffer_epoch, bool *clamped
+) {
+    const PmuBuffer *buf = reinterpret_cast<const PmuBuffer *>(buf_host_ptr);
+    uint32_t n = buf->count;
+    if (n > static_cast<uint32_t>(PLATFORM_PMU_RECORDS_PER_BUFFER)) {
+        n = static_cast<uint32_t>(PLATFORM_PMU_RECORDS_PER_BUFFER);
+        if (clamped != nullptr) *clamped = true;
+    }
+    if (n == 0) return 0;
+    // Frozen at admission, so a successor's event type cannot reach these rows.
+    const PmuEventConfig *evt = frozen.events;
+    const uint32_t event_type = static_cast<uint32_t>(frozen.event_type);
+    for (uint32_t i = 0; i < n; i++) {
+        const PmuRecord &r = buf->records[i];
+        out << thread_idx << ',' << core_id << ',';
+        out << "0x" << std::hex << std::setw(16) << std::setfill('0') << r.task_id << std::dec << std::setfill(' ');
+        out << ',' << r.func_id << ',' << static_cast<int>(r.core_type) << ',' << r.pmu_total_cycles;
+        for (int k = 0; k < PMU_COUNTER_COUNT_A5; k++) {
+            const char *name = evt->counter_names[k];
+            if (name == nullptr || name[0] == '\0') {
+                continue;
+            }
+            out << ',' << r.pmu_counters[k];
+        }
+        out << ',' << event_type << ',' << buffer_epoch << '\n';
+    }
+    return n;
+}
+
+void PmuCollector::install_paired_caps() {
+    // Bound pool *growth* only: a device buffer and its non-SVM host shadow are
+    // allocated together, so the cap is a paired figure and not per side. An
+    // occupancy already above it is not reclaimed — `charge_paired` refuses the
+    // next block, and the device then drops and charges as it does when a pool
+    // runs dry.
+    for (int kind = 0; kind < PmuModule::kBufferKinds; kind++) {
+        const size_t seeded = manager_.paired_initial(kind);
+        const size_t baseline = seeded > sizeof(PmuBuffer) ? seeded : sizeof(PmuBuffer);
+        const size_t cap = baseline > SIZE_MAX / 2 ? SIZE_MAX : baseline * 2;
+        manager_.set_paired_cap(kind, cap);
+    }
+}
+
+void PmuCollector::release_paired_caps() {
+    for (int kind = 0; kind < PmuModule::kBufferKinds; kind++) {
+        manager_.set_paired_cap(kind, 0);
+    }
 }

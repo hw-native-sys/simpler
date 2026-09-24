@@ -324,21 +324,23 @@ public:
     std::size_t committed_device_memory() const { return mem_alloc_.committed_bytes(); }
 
     /**
-     * Whether the swimlane collector may hold a run past its own boundary.
+     * Whether a collector may hold a run past its own boundary.
      * Latched once at device init.
      *
-     * Default false: every collector behaves exactly as it does today, the
-     * swimlane artifact keeps its name and location, and `run()` returning
-     * still implies the file is written.
+     * Default false: every collector behaves exactly as it does today, each
+     * artifact keeps its name and location, and `run()` returning still implies
+     * the file is written.
      *
-     * The collector is configured in the same breath, because this is the one
-     * point at which the choice is known and it is before the collector's lazy
-     * `initialize()`.
+     * Both retaining collectors are configured in the same breath, because this
+     * is the one point at which the choice is known and it is before their lazy
+     * `initialize()`. PMU retention is independent of swimlane's: a run may
+     * enable either or both.
      */
     void set_retain_runs(bool enabled) {
         chip_swimlane_collector_.configure_retained_runs(enabled, simpler::dfx::runs::kDefaultBudgetBytes);
+        pmu_collector_.configure_retained_runs(enabled);
     }
-    bool retains_runs() const { return chip_swimlane_collector_.retains_runs(); }
+    bool retains_runs() const { return chip_swimlane_collector_.retains_runs() || pmu_collector_.retains_runs(); }
 
     /**
      * Publish every run closed up to now, then report.
@@ -1861,6 +1863,13 @@ protected:
      * predecessor's records.
      */
     void withdraw_unlaunched_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch) noexcept;
+
+    /**
+     * Close one run's PMU window: either today's drain and reconcile, or, when
+     * PMU retains runs, the claim-time snapshot that hands the epoch to its
+     * background writer.
+     */
+    void close_pmu_run_boundary(const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete);
 
     /**
      * Tear down the four shared diagnostics collectors after the launched

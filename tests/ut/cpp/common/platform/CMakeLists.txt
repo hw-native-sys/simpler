@@ -373,6 +373,33 @@ if(TARGET test_a5_pmu_run_identity)
     target_compile_definitions(test_a5_pmu_run_identity PRIVATE SIMPLER_TEST_PMU_ARCH_A5=1)
 endif()
 
+# Cross-run retention, off the same two sides: the real producer publishes into
+# the real collector's threads, and the background writer merges and renames.
+# Same arch discriminator as the case above, and for the same reason.
+platform_case(test_pmu_retained_runs.cpp PER_ARCH
+    SOURCES
+        ${SIMPLER_SRC}/@arch@/platform/shared/host/pmu_collector.cpp
+        ${SIMPLER_SRC}/@arch@/platform/shared/aicpu/pmu_collector_aicpu.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_run_result_base_aicpu.cpp
+        ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp)
+if(TARGET test_a5_pmu_retained_runs)
+    target_compile_definitions(test_a5_pmu_retained_runs PRIVATE SIMPLER_TEST_PMU_ARCH_A5=1)
+endif()
+
+# The two production boundaries the case above does not reach: a pending run's
+# frozen event/column set while a successor resets the live configuration, and
+# the default path's begin-before-start order. Same arch discriminator, same
+# reason.
+platform_case(test_pmu_frozen_config.cpp PER_ARCH
+    SOURCES
+        ${SIMPLER_SRC}/@arch@/platform/shared/host/pmu_collector.cpp
+        ${SIMPLER_SRC}/@arch@/platform/shared/aicpu/pmu_collector_aicpu.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_run_result_base_aicpu.cpp
+        ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp)
+if(TARGET test_a5_pmu_frozen_config)
+    target_compile_definitions(test_a5_pmu_frozen_config PRIVATE SIMPLER_TEST_PMU_ARCH_A5=1)
+endif()
+
 platform_case(test_args_dump_collector.cpp PER_ARCH
     SOURCES
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_collector.cpp
