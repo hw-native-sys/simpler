@@ -11,7 +11,14 @@
 import json
 import os
 
+from _capture_builder import Capture
+
+# Fixtures carry real ids in one layout, minted through the owning runtime's
+# test-side helper so the layout stays declared once per runtime.
+from _task_ids import tmr_task as _tmr_id  # noqa: I001
+
 from simpler_setup.tools import swimlane_converter as sc
+from simpler_setup.tools._runtime_dispatch import HBG_RUNTIME, TMR_RUNTIME, get
 from simpler_setup.tools.sched_overhead_analysis import (
     _scheduler_phases_for_report,
     _summarize_scheduler_loops,
@@ -42,6 +49,13 @@ def _task(core_id, dispatch, start, end, finish, core_type="aic"):
 
 
 def test_aicore_scheduler_runs_common_analysis_and_own_phase_breakdown(tmp_path, capsys):
+    """An AICore capture takes the AICore report, and that report renames nothing.
+
+    The phase name here is one no scheduler records. It still appears in the
+    output, which is the point: the report prints a phase under the name it was
+    recorded with, so a name from somewhere else reads as foreign rather than
+    being folded into a local one.
+    """
     perf_path = tmp_path / "chip_swimlane_records.json"
     perf_path.write_text("{}")
     deps_path = tmp_path / "deps.json"
@@ -50,8 +64,9 @@ def test_aicore_scheduler_runs_common_analysis_and_own_phase_breakdown(tmp_path,
     task["task_id"] = 1
     data = {
         "tasks": [task],
+        "runtime": TMR_RUNTIME,
         "scheduler_task_producer": "aicore",
-        "scheduler_records": [[{"phase": "ready_claim", "start_time_us": 1.0, "end_time_us": 1.5}]],
+        "scheduler_records": [[{"phase": "unrecorded_phase", "start_time_us": 1.0, "end_time_us": 1.5}]],
         "scheduler_streams": [{"producer": "aicore", "capture": {"committed": 1, "dropped": 0, "truncated": False}}],
     }
 
@@ -61,7 +76,7 @@ def test_aicore_scheduler_runs_common_analysis_and_own_phase_breakdown(tmp_path,
     assert "Part 3: Head OH" in output
     assert "Part 4: Tail OH" in output
     assert "Part 5: AICore scheduler phase breakdown" in output
-    assert "ready_claim" in output
+    assert "unrecorded_phase" in output
     assert "Part 6: Critical-path latency attribution" in output
     assert "AICPU scheduler loop breakdown" not in output
 
@@ -233,14 +248,15 @@ def test_print_distribution(capsys):
 
 
 def test_parse_scheduler_distinguishes_logical_tasks_from_finishes():
-    task_id = (1 << 32) | 7
+    task_id = _tmr_id(1, 7)
     data = {
+        "runtime": TMR_RUNTIME,
         "core_to_thread": [0, 0],
         "tasks": [
             {"task_id": task_id, "core_id": 0, "finish_time_us": 1.25},
             {"task_id": task_id, "core_id": 1, "finish_time_us": 1.75},
         ],
-        "aicpu_scheduler_phases": [
+        "scheduler_records": [
             [
                 {
                     "phase": "complete",
@@ -263,14 +279,15 @@ def test_parse_scheduler_distinguishes_logical_tasks_from_finishes():
 
 
 def test_parse_scheduler_attributes_spmd_task_to_final_finish_thread():
-    task_id = (1 << 32) | 7
+    task_id = _tmr_id(1, 7)
     data = {
+        "runtime": TMR_RUNTIME,
         "core_to_thread": [0, 1],
         "tasks": [
             {"task_id": task_id, "core_id": 0, "finish_time_us": 1.25},
             {"task_id": task_id, "core_id": 1, "finish_time_us": 1.75},
         ],
-        "aicpu_scheduler_phases": [
+        "scheduler_records": [
             [
                 {
                     "phase": "complete",
@@ -308,13 +325,18 @@ def test_parse_scheduler_attributes_spmd_task_to_final_finish_thread():
 
 def test_parse_scheduler_counts_hbg_p_thread_standalone_phases():
     data = {
-        "aicpu_scheduler_phases": [
+        "runtime": HBG_RUNTIME,
+        "scheduler_records": [
             [
-                {"phase": "resolve", "start_time_us": 1.0, "end_time_us": 2.0, "loop_iter": 7},
+                # The wire name this runtime's resolution thread actually records.
+                # Its report label is ``resolve``, which is what the assertions below
+                # read, and the discriminator is what makes the thread a resolution
+                # thread without weighing time containment.
+                {"phase": "resolve_standalone", "start_time_us": 1.0, "end_time_us": 2.0, "loop_iter": 7},
                 {"phase": "async_poll", "start_time_us": 3.0, "end_time_us": 5.0, "loop_iter": 9},
                 {"phase": "dummy", "start_time_us": 6.0, "end_time_us": 7.0, "loop_iter": 9},
             ]
-        ]
+        ],
     }
 
     threads = parse_scheduler_from_json_phases(data)
@@ -331,7 +353,8 @@ def test_parse_scheduler_counts_hbg_p_thread_standalone_phases():
 
 def test_parse_scheduler_classifies_release_as_scheduler_work():
     data = {
-        "aicpu_scheduler_phases": [
+        "runtime": TMR_RUNTIME,
+        "scheduler_records": [
             [
                 {
                     "phase": "release",
@@ -342,7 +365,7 @@ def test_parse_scheduler_classifies_release_as_scheduler_work():
                 },
                 {"phase": "resolve", "start_time_us": 2.0, "end_time_us": 3.0, "loop_iter": 8},
             ]
-        ]
+        ],
     }
 
     threads = parse_scheduler_from_json_phases(data)
@@ -354,7 +377,9 @@ def test_parse_scheduler_classifies_release_as_scheduler_work():
 
 def test_parse_scheduler_counts_aicore_flat_dispatch_phases():
     data = {
-        "aicpu_scheduler_phases": [
+        # An AICore scheduler stream: only hbg has one.
+        "runtime": HBG_RUNTIME,
+        "scheduler_records": [
             [
                 {"phase": "complete", "start_time_us": 1.0, "end_time_us": 2.0, "loop_iter": 1},
                 {"phase": "resolve", "start_time_us": 2.0, "end_time_us": 3.0, "loop_iter": 1},
@@ -363,7 +388,7 @@ def test_parse_scheduler_counts_aicore_flat_dispatch_phases():
                 {"phase": "worksteal", "start_time_us": 5.0, "end_time_us": 6.0, "loop_iter": 1},
                 {"phase": "refill", "start_time_us": 6.0, "end_time_us": 7.0, "loop_iter": 1},
             ]
-        ]
+        ],
     }
 
     threads = parse_scheduler_from_json_phases(data)
@@ -386,7 +411,8 @@ def test_parse_scheduler_counts_aicore_flat_dispatch_phases():
 
 def test_parse_scheduler_uses_explicit_hbg_resolve_discriminator_at_parent_boundary():
     data = {
-        "aicpu_scheduler_phases": [
+        "runtime": HBG_RUNTIME,
+        "scheduler_records": [
             [
                 {"phase": "dummy", "start_time_us": 1.0, "end_time_us": 2.0, "loop_iter": 1},
                 {
@@ -396,7 +422,7 @@ def test_parse_scheduler_uses_explicit_hbg_resolve_discriminator_at_parent_bound
                     "loop_iter": 2,
                 },
             ]
-        ]
+        ],
     }
 
     threads = parse_scheduler_from_json_phases(data)
@@ -407,12 +433,13 @@ def test_parse_scheduler_uses_explicit_hbg_resolve_discriminator_at_parent_bound
 
 def test_parse_scheduler_treats_legacy_resolve_touching_parent_boundary_as_standalone():
     data = {
-        "aicpu_scheduler_phases": [
+        "runtime": HBG_RUNTIME,
+        "scheduler_records": [
             [
                 {"phase": "complete", "start_time_us": 1.0, "end_time_us": 2.0, "loop_iter": 1},
                 {"phase": "resolve", "start_time_us": 2.0, "end_time_us": 2.0, "loop_iter": 2},
             ]
-        ]
+        ],
     }
 
     threads = parse_scheduler_from_json_phases(data)
@@ -422,7 +449,8 @@ def test_parse_scheduler_treats_legacy_resolve_touching_parent_boundary_as_stand
 
 def test_parse_scheduler_does_not_double_count_tmr_nested_resolve():
     data = {
-        "aicpu_scheduler_phases": [
+        "runtime": TMR_RUNTIME,
+        "scheduler_records": [
             [
                 {
                     "phase": "complete",
@@ -435,7 +463,7 @@ def test_parse_scheduler_does_not_double_count_tmr_nested_resolve():
                 {"phase": "dummy", "start_time_us": 6.0, "end_time_us": 9.0, "loop_iter": 4},
                 {"phase": "resolve", "start_time_us": 7.0, "end_time_us": 8.0, "loop_iter": 4},
             ]
-        ]
+        ],
     }
 
     threads = parse_scheduler_from_json_phases(data)
@@ -454,7 +482,8 @@ def test_parse_scheduler_does_not_double_count_tmr_resolve_starting_with_its_par
     # get_sys_cnt_aicpu() reads apart, so on a2a3's 20 ns sys-cnt tick they
     # routinely coincide. The Resolve is still nested and still excluded.
     data = {
-        "aicpu_scheduler_phases": [
+        "runtime": TMR_RUNTIME,
+        "scheduler_records": [
             [
                 {
                     "phase": "dummy",
@@ -472,7 +501,7 @@ def test_parse_scheduler_does_not_double_count_tmr_resolve_starting_with_its_par
                     "tasks_processed": 1,
                 },
             ]
-        ]
+        ],
     }
 
     threads = parse_scheduler_from_json_phases(data)
@@ -507,12 +536,41 @@ def test_scheduler_loop_summary_keeps_scheduler_and_resolution_rates_separate():
 
 
 def test_scheduler_phase_report_suppresses_absent_runtime_phases():
+    """A phase the capture never recorded gets no row, even if the runtime can emit it.
+
+    Reported under tmr, whose phases these are -- the point is the suppression,
+    not the layout.
+    """
     threads = {
         0: {"phases_seen": {"complete", "dispatch", "idle"}},
         1: {"phases_seen": {"resolve", "async_poll"}},
     }
 
-    assert _scheduler_phases_for_report(threads) == ["complete", "async_poll", "dispatch", "resolve", "idle"]
+    assert _scheduler_phases_for_report(threads, get(TMR_RUNTIME)) == [
+        "complete",
+        "async_poll",
+        "dispatch",
+        "resolve",
+        "idle",
+    ]
+
+
+def test_scheduler_phase_report_keeps_hbg_aicore_loop_order():
+    """The report lists phases in the reporting runtime's own order.
+
+    state_probe / dispatch / worksteal / refill is the order hbg's AICore
+    scheduler runs them in, so the report reads that way rather than following
+    any order shared with another runtime.
+    """
+    threads = {0: {"phases_seen": {"refill", "dispatch", "state_probe", "worksteal", "complete"}}}
+
+    assert _scheduler_phases_for_report(threads, get(HBG_RUNTIME)) == [
+        "complete",
+        "state_probe",
+        "dispatch",
+        "worksteal",
+        "refill",
+    ]
 
 
 def test_auto_select_reaches_both_the_l2_and_the_l3_capture_depths(tmp_path, monkeypatch):
@@ -547,47 +605,18 @@ def test_dag_stats_reach_a_thread_whose_stream_was_not_the_first_recorded(tmp_pa
     records = tmp_path / "chip_swimlane_records.json"
     records.write_text(
         json.dumps(
-            {
-                "chip_swimlane_level": 3,
-                "metadata": {
-                    "runtime": sc.TMR_RUNTIME,
-                    "clock_freq_hz": 1_000_000_000,
-                    "num_cores": 2,
-                    "core_types": ["aiv", "aiv"],
-                    # Both cores belong to scheduler thread 1, so thread 0 owns
-                    # none and records no phases this run.
-                    "core_to_thread": [1, 1],
-                },
-                "aicore_tasks": [[0, 7, 7, 120, 180, 10], [1, 8, 8, 130, 190, 10]],
-                "scheduler_tasks": {
-                    "producer": "aicpu",
-                    "records": [[0, 7, 115, 185], [1, 8, 125, 195]],
-                },
-                "scheduler_records": {
-                    "streams": [
-                        {
-                            "platform": "a5",
-                            "producer": "aicpu",
-                            "scheduler_id": 1,
-                            "worker_id": 1,
-                            "core_type": "aicpu",
-                            "physical_core_id": None,
-                            "capture": {"committed": 1, "dropped": 0, "truncated": False},
-                            "records": [
-                                {
-                                    "start_cycles": 100,
-                                    "end_cycles": 200,
-                                    "loop_iter": 4,
-                                    "kind": "complete",
-                                    "tasks_processed": 2,
-                                    "task_id": None,
-                                }
-                            ],
-                            "metrics": [],
-                        }
-                    ],
-                },
-            }
+            Capture(runtime=TMR_RUNTIME, level=3, clock_freq_hz=1_000_000_000, core_types=("aiv", "aiv"))
+            # Both cores belong to scheduler thread 1, so thread 0 owns none and
+            # records no phases this run.
+            .metadata(core_to_thread=[1, 1])
+            .task(
+                task_id=7, core_id=0, reg_task_id=7, start=120, end=180, dispatch=115, finish=185, receive_to_start=10
+            )
+            .task(
+                task_id=8, core_id=1, reg_task_id=8, start=130, end=190, dispatch=125, finish=195, receive_to_start=10
+            )
+            .sched_phase(thread=1, phase="complete", start=100, end=200, loop_iter=4, tasks_processed=2)
+            .build()
         )
     )
     deps = {"edges": [{"pred": 7, "succ": 8}]}

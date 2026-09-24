@@ -87,7 +87,7 @@ class TestSyncStartDrainPhases(SceneTestCase):
         perf_path = self._trace_perf_path
         assert perf_path is not None and perf_path.exists(), "chip swimlane scheduler capture is missing"
         perf = read_perf_data(perf_path)
-        phase_records = [record for thread in perf.get("aicpu_scheduler_phases", []) for record in thread]
+        phase_records = [record for thread in perf.get("scheduler_records", []) for record in thread]
         sync_start_blocks = layout[0] + layout[2] + layout[2 * (NUM_TASKS - 1)]
         phase_work = {}
         for phase in ("drain", "drain_prepare", "drain_publish"):

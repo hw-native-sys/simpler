@@ -76,14 +76,14 @@ The three arrays are indexed by `ring` (`0..3`) and should match the effective
 runtime configuration. Per-sample `ring` values show which scope-depth rings
 were actually touched by the run; they are scope records, not task counts.
 
-### Step 3 — Visualize with `scope_stats_plot.py`
+### Step 3 — Visualize with `scope_stats_plot`
 
 ```bash
-python simpler_setup/tools/scope_stats_plot.py "path/to/output_prefix"/scope_stats/scope_stats.jsonl
+python -m simpler_setup.tools.tmr.scope_stats_plot "path/to/output_prefix"/scope_stats/scope_stats.jsonl
 # writes "path/to/output_prefix"/scope_stats/scope_stats.html
 
 # or send the report elsewhere:
-python simpler_setup/tools/scope_stats_plot.py path/to/scope_stats.jsonl --out-dir /tmp/report
+python -m simpler_setup.tools.tmr.scope_stats_plot path/to/scope_stats.jsonl --out-dir /tmp/report
 ```
 
 | Argument | Required | Meaning |

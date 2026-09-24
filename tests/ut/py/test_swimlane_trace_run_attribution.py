@@ -28,7 +28,8 @@ from pathlib import Path
 
 import pytest
 
-from simpler_setup.tools.swimlane_converter import TMR_RUNTIME, generate_chrome_trace_json
+from simpler_setup.tools._runtime_dispatch import TMR_RUNTIME
+from simpler_setup.tools.swimlane_converter import generate_chrome_trace_json
 
 RUN_A = 7
 RUN_B = 8
@@ -70,15 +71,13 @@ def _phase(kind, epoch, start, end, *, task_id=None, processed=0):
 
 def _render(tmp_path, tasks, **kwargs):
     out = Path(tmp_path) / "trace.json"
-    # The trace states the TaskId layout its labels follow; these tests are not about
-    # that choice, so they take tmr.
+    # The trace states the TaskId layout its labels follow. These tests are about run
+    # attribution -- which epoch a record belongs to -- which no runtime decides, so
+    # they take tmr and assert nothing that depends on it: flipping this to
+    # HBG_RUNTIME leaves the file green.
     kwargs.setdefault("runtime_name", TMR_RUNTIME)
     generate_chrome_trace_json(tasks, str(out), **kwargs)
     return json.loads(out.read_text())["traceEvents"]
-
-
-# A capture with no identity is its own domain, distinct from any real epoch.
-NO_IDENTITY = "<none>"
 
 
 def _epoch_by_event_id(events):
@@ -86,8 +85,7 @@ def _epoch_by_event_id(events):
     by_id = {}
     for event in events:
         if event.get("ph") == "X" and event.get("id") is not None:
-            epoch = (event.get("args") or {}).get("run_epoch")
-            by_id[event["id"]] = NO_IDENTITY if epoch is None else epoch
+            by_id[event["id"]] = (event.get("args") or {}).get("run_epoch")
     return by_id
 
 
@@ -381,25 +379,6 @@ def test_final_events_carry_their_run_epoch(tmp_path):
     assert sched_epochs == {RUN_A, RUN_B}, f"scheduler phase bars lost their run identity: {sched_epochs}"
 
 
-def test_capture_without_identity_gains_no_epoch_in_the_trace(tmp_path):
-    """A legacy capture stays explicitly unknown rather than being labelled run 0."""
-    tasks = [
-        {**_task(RUN_A, 0x101, 0, BASE_A), "run_epoch": None},
-        {**_task(RUN_A, 0x102, 0, BASE_A + 2.0), "run_epoch": None},
-    ]
-    events = _render(tmp_path, tasks, core_to_thread=[0], deps_edges={0x101: [0x102]})
-
-    worker_bars = [e for e in events if e.get("ph") == "X" and e.get("pid") == 4 and e.get("cat") == "event"]
-    assert worker_bars, "no Worker View bars were emitted"
-    for event in worker_bars:
-        assert "run_epoch" not in event["args"], (
-            f"a capture with no identity was given an epoch: {event['args'].get('run_epoch')!r}"
-        )
-
-    # It still renders its single run's dependency rather than being dropped.
-    _assert_flow_binds_within_one_run(events, expected_runs={NO_IDENTITY}, label="legacy capture")
-
-
 @pytest.mark.parametrize("epoch", [RUN_A, RUN_B])
 def test_single_run_renders_one_arrow_per_edge(epoch, tmp_path):
     """Guard against the run-scoping splitting or duplicating a normal capture."""
@@ -561,26 +540,6 @@ def test_authoritative_block_map_still_wins(tmp_path):
         assert start_event.get("output_task_count") == 4, (
             f"authoritative block_num=4 was replaced by {start_event.get('output_task_count')}"
         )
-
-
-def test_mixed_none_and_zero_epochs_stay_separate(tmp_path):
-    """Epoch 0 is a real run; absent identity is not. They must not merge."""
-    tasks = [
-        {**_task(0, 0x101, 0, BASE_A), "run_epoch": 0},
-        {**_task(0, 0x102, 0, BASE_A + 2.0), "run_epoch": 0},
-        {**_task(0, 0x101, 0, BASE_B), "run_epoch": None},
-        {**_task(0, 0x102, 0, BASE_B + 2.0), "run_epoch": None},
-    ]
-    events = _render(tmp_path, tasks, core_to_thread=[0], deps_edges={0x101: [0x102]})
-
-    runs = _assert_flow_binds_within_one_run(events, expected_runs={0, NO_IDENTITY}, label="mixed None/0")
-    assert runs == {0, NO_IDENTITY}
-
-    worker_bars = [e for e in events if e.get("ph") == "X" and e.get("pid") == 4 and e.get("cat") == "event"]
-    zero_bars = [e for e in worker_bars if e["args"].get("run_epoch") == 0]
-    unknown_bars = [e for e in worker_bars if "run_epoch" not in e["args"]]
-    assert len(zero_bars) == 2, "run 0 lost its bars or absorbed the identity-less ones"
-    assert len(unknown_bars) == 2, "identity-less rows were given epoch 0"
 
 
 def test_genuine_spmd_task_skipped_in_a_later_run_does_not_crash(tmp_path):

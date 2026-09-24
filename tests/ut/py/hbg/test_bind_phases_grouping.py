@@ -15,7 +15,7 @@ express: two ranks writing one stream, whose segment bursts interleave.
 
 from __future__ import annotations
 
-from simpler_setup.tools.hbg_bind_phases import cold_binds, parse_binds
+from simpler_setup.tools.hbg.bind_phases import cold_binds, parse_binds
 
 SEGMENTS = ("args", "host_orch", "graph_upload", "arena_h2d")
 

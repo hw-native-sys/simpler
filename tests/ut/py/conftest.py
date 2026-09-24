@@ -9,14 +9,16 @@
 """Pytest configuration for Python unit tests (tests/ut/py/).
 
 Adds project directories to sys.path so that simpler_setup, task_interface,
-and host_worker modules are importable without installing the package.
+and host_worker modules are importable without installing the package, and adds
+this directory itself so test-only helper modules (e.g. ``_cpp_constant_parser``)
+are importable by bare name under ``--import-mode=importlib``.
 """
 
 import sys
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent.parent.parent
-for _d in [_ROOT, _ROOT / "python"]:
+for _d in [_ROOT, _ROOT / "python", Path(__file__).resolve().parent]:
     _s = str(_d)
     if _s not in sys.path:
         sys.path.insert(0, _s)

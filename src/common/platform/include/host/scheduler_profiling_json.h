@@ -19,40 +19,6 @@
 #include "common/scheduler_profiling.h"
 #include "host/collected_record.h"
 
-inline const char *chip_swimlane_scheduler_kind_name(ChipSwimlaneSchedPhaseKind kind) {
-    switch (kind) {
-    case ChipSwimlaneSchedPhaseKind::Complete:
-        return "complete";
-    case ChipSwimlaneSchedPhaseKind::Dispatch:
-        return "dispatch";
-    case ChipSwimlaneSchedPhaseKind::Release:
-        return "release";
-    case ChipSwimlaneSchedPhaseKind::Dummy:
-        return "dummy";
-    case ChipSwimlaneSchedPhaseKind::EarlyDispatch:
-        return "early_dispatch";
-    case ChipSwimlaneSchedPhaseKind::Resolve:
-        return "resolve";
-    case ChipSwimlaneSchedPhaseKind::ResolveStandalone:
-        return "resolve_standalone";
-    case ChipSwimlaneSchedPhaseKind::DummyTask:
-        return "dummy_task";
-    case ChipSwimlaneSchedPhaseKind::PredicatedSkip:
-        return "predicated_skip";
-    case ChipSwimlaneSchedPhaseKind::Drain:
-        return "drain";
-    case ChipSwimlaneSchedPhaseKind::DrainPrepare:
-        return "drain_prepare";
-    case ChipSwimlaneSchedPhaseKind::DrainPublish:
-        return "drain_publish";
-    case ChipSwimlaneSchedPhaseKind::AsyncPoll:
-        return "async_poll";
-    case ChipSwimlaneSchedPhaseKind::GraphPrepare:
-        return "graph_prepare";
-    }
-    return "unknown";
-}
-
 // A stream carries no runtime name of its own. The runtime is a property of the whole
 // capture -- one run compiles against one runtime -- so it is stated once, in the
 // document's metadata. Repeating it per stream would offer a reader a choice of sources
@@ -79,11 +45,9 @@ inline void chip_swimlane_write_scheduler_records(
             if (record_index != 0) out << ",";
             out << "\n        {\"start_cycles\": " << record.start_time << ", \"end_cycles\": " << record.end_time
                 << ", \"run_epoch\": " << records[record_index].run_epoch << ", \"loop_iter\": " << record.loop_iter
-                << ", \"kind\": \"" << chip_swimlane_scheduler_kind_name(record.kind)
+                << ", \"kind\": \"" << sched_phase_kind_name(record.kind)
                 << "\", \"tasks_processed\": " << record.tasks_processed << ", \"task_id\": ";
-            if (record.kind == ChipSwimlaneSchedPhaseKind::DummyTask ||
-                record.kind == ChipSwimlaneSchedPhaseKind::PredicatedSkip ||
-                record.kind == ChipSwimlaneSchedPhaseKind::GraphPrepare) {
+            if (sched_phase_carries_task_id(record.kind)) {
                 out << record.phase_data.task_id.raw;
             } else {
                 out << "null";
@@ -96,7 +60,7 @@ inline void chip_swimlane_write_scheduler_records(
             const ChipSwimlaneAicpuSchedPhaseRecord &record = records[record_index].record;
             if (record_index != 0) out << ",";
             out << "\n        {\"record_index\": " << record_index;
-            if (record.kind == ChipSwimlaneSchedPhaseKind::Dispatch) {
+            if (sched_phase_carries_pop_counters(record.kind)) {
                 out << ", \"pop_hit\": " << record.phase_data.dispatch.pop_hit
                     << ", \"pop_miss\": " << record.phase_data.dispatch.pop_miss;
             }

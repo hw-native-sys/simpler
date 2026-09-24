@@ -44,6 +44,25 @@ inline constexpr int kNumAicore = 2;
 inline constexpr int kAicpuThreads = 2;
 inline constexpr uint32_t kSchedDropped = 5;
 
+// The phase this runtime stamps a task identity on, which is what covers the
+// phase_data union's task_id arm. Each runtime has its own and they share no name --
+// hbg's is GraphPrepare, tmr's are DummyTask and PredicatedSkip -- while this header
+// is compiled once per runtime, so it asks the vocabulary's own predicate instead of
+// naming a member that exists on one side only. Scanning by value is safe because
+// each SchedPhaseKind numbers its enumerators from zero without gaps.
+inline constexpr SchedPhaseKind task_id_bearing_phase() {
+    for (uint8_t value = 0; value < 64; ++value) {
+        const auto kind = static_cast<SchedPhaseKind>(value);
+        if (sched_phase_carries_task_id(kind)) return kind;
+    }
+    return SchedPhaseKind::Complete;
+}
+static_assert(
+    sched_phase_carries_task_id(task_id_bearing_phase()),
+    "every runtime records a task identity on some phase; this fixture needs one to exercise "
+    "the phase_data union's task_id arm"
+);
+
 inline void *fixture_alloc(size_t size) { return std::calloc(1, size); }
 
 inline int fixture_free(void *ptr) {
@@ -144,7 +163,7 @@ inline void populate(ChipSwimlaneCollector &collector, PhaseBuffers &buffers, co
         record.start_time = 2000 + i;
         record.end_time = 2100 + i;
         record.loop_iter = i;
-        record.kind = i == 0 ? ChipSwimlaneSchedPhaseKind::Dispatch : ChipSwimlaneSchedPhaseKind::DummyTask;
+        record.kind = i == 0 ? SchedPhaseKind::Dispatch : task_id_bearing_phase();
         record.tasks_processed = i + 1;
         if (i == 0) {
             record.phase_data.dispatch.pop_hit = 3;
@@ -267,6 +286,13 @@ inline std::string normalize(std::string text, const std::string &runtime_name) 
     const std::string runtime_key = "\"runtime\": \"" + runtime_name + "\"";
     at = text.find(runtime_key);
     if (at != std::string::npos) text.replace(at, runtime_key.size(), "\"runtime\": \"<RUNTIME>\"");
+    // The task-bearing phase's name is this runtime's too -- hbg writes
+    // graph_prepare where tmr writes dummy_task -- so the golden holds a placeholder
+    // rather than one side's spelling. Only that phase's name is substituted; the
+    // Dispatch record beside it is compared exactly, as is every other column.
+    const std::string phase_key = std::string("\"kind\": \"") + sched_phase_kind_name(task_id_bearing_phase()) + "\"";
+    at = text.find(phase_key);
+    if (at != std::string::npos) text.replace(at, phase_key.size(), "\"kind\": \"<TASK_ID_PHASE>\"");
     return text;
 }
 

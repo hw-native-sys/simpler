@@ -19,55 +19,12 @@
 // being built: src/common/<runtime> is on that build's include path, and reaching
 // both headers from one scope is a compile error rather than a silent pick.
 #include "task_id.h"
+// The owning runtime's Scheduler phase vocabulary, resolved the same way. Which phases
+// exist, what each one means, and which of them name a task are that runtime's to
+// state, so this header holds the discriminator without knowing its values.
+#include "sched_phase_kind.h"
 
 inline constexpr const char *CHIP_SWIMLANE_ARCHITECTURE_NAME = "a2a3";
-
-/** Discriminator for Scheduler phase records.
- *
- * The roles share one enum so the on-device record carries one discriminator:
- *
- *   OUTER (mutually time-exclusive within an iteration; emit advances the
- *   phase anchor): Complete, Dispatch, Release, Dummy, EarlyDispatch,
- *   AsyncPoll, Drain, and GraphPrepare.
- *
- *   INNER (no anchor advance; Perfetto nests by containment): Resolve in the
- *   tensormap_and_ringbuffer runtime, plus DrainPrepare and DrainPublish.
- *
- *   HBG RESOLUTION-THREAD OUTER: ResolveStandalone, AsyncPoll, and Dummy. The
- *   host_build_graph runtime hands completed slots from Scheduler threads to a
- *   dedicated resolution thread, so these are standalone bars.
- *
- *   SEPARATE-LANE (Worker View rather than the Scheduler lane): DummyTask and
- *   PredicatedSkip identity markers.
- */
-enum class ChipSwimlaneSchedPhaseKind : uint32_t {
-    Complete = 0,            // Observe FINs and run completion work inline.
-                             // tasks_processed = finished subtasks + sub-block retires.
-    Dispatch = 1,            // Publish ready tasks to AICore.
-                             // tasks_processed = subtasks published.
-    Release = 2,             // Deferred-release drain.
-                             // tasks_processed = slots released.
-    Dummy = 4,               // Explicit-dummy and false-predicate drain.
-                             // tasks_processed = dummy tasks consumed.
-    EarlyDispatch = 5,       // Pre-stage a flagged producer's gated consumers.
-                             // tasks_processed = blocks staged.
-    Resolve = 6,             // Nested completion work after FIN observation.
-                             // tasks_processed = consumers visited.
-    DummyTask = 7,           // Zero-width dependency-only task identity marker.
-    Drain = 8,               // sync_start stop-the-world drain attempt.
-    DrainPrepare = 9,        // Nested sync_start staging prepare pass.
-                             // tasks_processed = subtasks prepared.
-    DrainPublish = 10,       // Nested sync_start MMIO publication pass.
-                             // tasks_processed = subtasks published.
-    AsyncPoll = 11,          // Async-engine completion polling.
-                             // tasks_processed = async subtasks completed.
-    PredicatedSkip = 12,     // Zero-width identity marker for a task retired
-                             // because its dispatch predicate was false.
-    GraphPrepare = 13,       // Bounded Graph Definition materialization slice.
-                             // tasks_processed = sub-tasks patched.
-    ResolveStandalone = 14,  // Dedicated HBG resolution-thread work.
-                             // tasks_processed = completed SPSC slots.
-};
 
 /** Queue-depth array layout: AIC=0, AIV=1, MIX=2.
  *
@@ -82,10 +39,12 @@ constexpr int CHIP_SWIMLANE_NUM_QUEUE_SHAPES = 3;
  * Position in the per-thread buffer is the thread identity. All timestamps are
  * raw system-counter cycles.
  *
- * ``phase_data`` is tagged by ``kind``: Dispatch uses ``dispatch``; DummyTask,
- * PredicatedSkip and GraphPrepare use ``task_id`` -- the first two naming the task
- * retired, GraphPrepare the outer GRAPH task whose body it materialized. Other kinds
- * store zero in the union.
+ * ``phase_data`` is tagged by ``kind``, and which member a kind selects is the owning
+ * runtime's to state rather than this header's:
+ * ``sched_phase_carries_pop_counters()`` names the kinds holding ``dispatch``,
+ * ``sched_phase_carries_task_id()`` those holding ``task_id``, and a kind answering
+ * neither stores zero in the union. Both predicates live in that runtime's
+ * sched_phase_kind.h, beside the phases they classify.
  *
  * Queue-depth snapshots use the [AIC, AIV, MIX] indexes above and capture
  * ready-queue occupancy at phase boundaries. They remain zero below
@@ -109,11 +68,16 @@ struct ChipSwimlaneAicpuSchedPhaseRecord {
         TaskId task_id;
     } phase_data;
     uint32_t loop_iter;                                             // Scheduler-loop iteration on this thread
-    ChipSwimlaneSchedPhaseKind kind;                                // Tagged-union discriminator
     uint32_t tasks_processed;                                       // Work items processed in this phase
     int16_t shared_depth_at_start[CHIP_SWIMLANE_NUM_QUEUE_SHAPES];  // Ready depths at phase entry
     int16_t shared_depth_at_end[CHIP_SWIMLANE_NUM_QUEUE_SHAPES];    // Ready depths at phase exit
-    uint32_t _pad[4];                                               // Keep the wire record at 64 bytes
+    // Tagged-union discriminator for phase_data, and the owning runtime's phase
+    // vocabulary. Last of the named fields despite discriminating a field near the
+    // top: one byte placed ahead of tasks_processed would leave three bytes the
+    // alignment forces and nothing can use, where here they fall into _pad and stay
+    // available. See sched_phase_kind.h for what the values mean.
+    SchedPhaseKind kind;
+    uint8_t _pad[19];  // Keep the wire record at 64 bytes
 };
 
 static_assert(

@@ -200,8 +200,8 @@ void SchedulerContext::complete_slot_task(
             constexpr uint64_t RESOLVE_EMIT_MIN_CYCLES = PLATFORM_PROF_SYS_CNT_FREQ / 1'000'000;
             if (resolve_t1 - resolve_t0 >= RESOLVE_EMIT_MIN_CYCLES) {
                 chip_swimlane_aicpu_record_sched_phase(
-                    thread_idx, ChipSwimlaneSchedPhaseKind::Resolve, resolve_t0, resolve_t1,
-                    chip_swimlane.sched_loop_count, consumers_resolved
+                    thread_idx, SchedPhaseKind::Resolve, resolve_t0, resolve_t1, chip_swimlane.sched_loop_count,
+                    consumers_resolved
                 );
             }
         }
@@ -537,7 +537,7 @@ SchedulerContext::SyncStartStageResult SchedulerContext::stage_sync_start_cores(
             if (sub_prof) {
                 pub_t0 = get_sys_cnt_aicpu();
                 chip_swimlane_aicpu_record_sched_phase(
-                    thread_idx, ChipSwimlaneSchedPhaseKind::DrainPrepare, prep_t0, pub_t0,
+                    thread_idx, SchedPhaseKind::DrainPrepare, prep_t0, pub_t0,
                     sched_chip_swimlane_[thread_idx].sched_loop_count, static_cast<uint32_t>(handle_count)
                 );
             }
@@ -565,7 +565,7 @@ SchedulerContext::SyncStartStageResult SchedulerContext::stage_sync_start_cores(
 #if SIMPLER_DFX
             if (sub_prof) {
                 chip_swimlane_aicpu_record_sched_phase(
-                    thread_idx, ChipSwimlaneSchedPhaseKind::DrainPublish, pub_t0, get_sys_cnt_aicpu(),
+                    thread_idx, SchedPhaseKind::DrainPublish, pub_t0, get_sys_cnt_aicpu(),
                     sched_chip_swimlane_[thread_idx].sched_loop_count, static_cast<uint32_t>(handle_count)
                 );
             }

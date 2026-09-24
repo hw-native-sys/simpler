@@ -13,13 +13,27 @@ from typing import Optional
 
 import pytest
 
+# This tool is runtime-agnostic, but its fixtures are not: a label test has to hand it
+# an id in one layout or the other. Minted through each runtime's own test-side helper
+# so the layout stays declared in one place per runtime.
+from _task_ids import hbg_param as _hbg_param  # noqa: I001
+from _task_ids import hbg_sub_task as _hbg_sub_task
+from _task_ids import tmr_task as _tmr_id
+
 from simpler_setup.tools import deps_viewer
+from simpler_setup.tools._runtime_dispatch import HBG_RUNTIME, TMR_RUNTIME
 from simpler_setup.tools.deps_viewer import _merge_task_meta_with_kernel_ids
-from simpler_setup.tools.swimlane_converter import HBG_RUNTIME, TMR_RUNTIME
 
 
 # The renderers state which TaskId layout their labels follow, so they require the
-# runtime name rather than guessing. Tests that are not about that choice take tmr.
+# runtime name rather than guessing. These wrappers supply tmr, which fixes the label
+# shape the assertions below match on (`r0t1` and friends).
+#
+# That choice is a sample, not a subject: what these tests exercise is the rendering
+# itself -- alloc/dummy marking, SPMD badges, func-name mapping, edge reduction -- none
+# of which a runtime decides. Re-running them under hbg would only re-check the label
+# shape, and each runtime's own labels are covered directly by hbg/test_tools.py and
+# tmr/test_tools.py. A test that really is about one runtime names it explicitly.
 def emit_text(*args, **kwargs):
     kwargs.setdefault("runtime_name", TMR_RUNTIME)
     return deps_viewer.emit_text(*args, **kwargs)
@@ -764,7 +778,7 @@ def _write_deps_edges(tmp_path, edges, sources=None, runtime: Optional[str] = TM
 
 def test_main_reduced_mode_drops_edge_and_prints_removed(tmp_path, capsys):
     # A(r1t1) -> B(r1t2) -> C(r1t3) plus the implied A->C shortcut.
-    ring = 1 << 32
+    ring = _tmr_id(1, 0)
     a, b, c = ring + 1, ring + 2, ring + 3
     deps_path = _write_deps_edges(tmp_path, [(a, b), (b, c), (a, c)])
     out = tmp_path / "graph.txt"
@@ -801,7 +815,7 @@ def test_main_reduced_mode_keeps_transitive_creator_reference(tmp_path, capsys):
 
 
 def test_main_full_mode_keeps_all_edges(tmp_path, capsys):
-    ring = 1 << 32
+    ring = _tmr_id(1, 0)
     a, b, c = ring + 1, ring + 2, ring + 3
     deps_path = _write_deps_edges(tmp_path, [(a, b), (b, c), (a, c)])
     out = tmp_path / "graph.txt"
@@ -813,7 +827,7 @@ def test_main_full_mode_keeps_all_edges(tmp_path, capsys):
 
 
 def test_main_html_edge_modes_keep_full_layout_and_hide_unselected_edges(tmp_path, monkeypatch):
-    ring = 1 << 32
+    ring = _tmr_id(1, 0)
     a, b, c = ring + 1, ring + 2, ring + 3
     all_edges = [(a, b), (b, c), (a, c)]
     deps_path = _write_deps_edges(tmp_path, all_edges)
@@ -864,7 +878,7 @@ def test_main_html_edge_modes_keep_full_layout_and_hide_unselected_edges(tmp_pat
 def test_main_omitted_mode_draws_only_redundant_edges(tmp_path, capsys):
     # A(r1t1) -> B(r1t2) -> C(r1t3) plus the implied A->C shortcut. omitted
     # keeps ONLY the redundant A->C edge (complement of reduced).
-    ring = 1 << 32
+    ring = _tmr_id(1, 0)
     a, b, c = ring + 1, ring + 2, ring + 3
     deps_path = _write_deps_edges(tmp_path, [(a, b), (b, c), (a, c)])
     out = tmp_path / "graph.txt"
@@ -886,7 +900,7 @@ def test_main_omitted_mode_draws_only_redundant_edges(tmp_path, capsys):
 
 
 def test_main_omitted_default_output_stem(tmp_path):
-    ring = 1 << 32
+    ring = _tmr_id(1, 0)
     a, b, c = ring + 1, ring + 2, ring + 3
     deps_path = _write_deps_edges(tmp_path, [(a, b), (b, c), (a, c)])
 
@@ -900,16 +914,6 @@ def test_main_omitted_default_output_stem(tmp_path):
 # whichever TaskId layout its runtime uses and nothing in the value says which.
 # Without that name every label falls back to the tmr layout, which is what the
 # labels meant before the key existed.
-
-
-def _hbg_sub_task(parent_id, local_id):
-    """A SUB_TASK id: space 1 in bits 63:62, parent in bits 51:32, index in the low 32."""
-    return (1 << 62) | (parent_id << 32) | local_id
-
-
-def _hbg_param(param_index):
-    """A PARAM id: space 2 in bits 63:62, parameter index in the low 32."""
-    return (2 << 62) | param_index
 
 
 def test_deps_runtime_reads_the_name_from_the_document(tmp_path):
@@ -939,10 +943,10 @@ def test_hbg_labels_name_the_parent_instead_of_a_raw_high_field():
 
 
 def test_tmr_labels_keep_the_ring_form():
-    nodes = [(2 << 32) | 100, 5]
+    nodes = [_tmr_id(2, 100), 5]
     fmt = deps_viewer._make_task_formatter(nodes, "tensormap_and_ringbuffer")
 
-    assert fmt((2 << 32) | 100) == "r2t100"
+    assert fmt(_tmr_id(2, 100)) == "r2t100"
     assert fmt(5) == "r0t5"
 
 

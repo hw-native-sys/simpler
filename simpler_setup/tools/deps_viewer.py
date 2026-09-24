@@ -71,7 +71,7 @@ import xml.etree.ElementTree as ET
 from collections import deque
 from pathlib import Path
 
-from .swimlane_converter import resolve_runtime, task_display_for
+from ._runtime_dispatch import get, normalize_task_id_int, raw_halves, resolve_runtime
 
 
 def _deps_runtime(deps_path):
@@ -95,25 +95,10 @@ def _deps_runtime(deps_path):
     return resolve_runtime(runtime, source=f"{deps_path}: runtime")
 
 
-def _normalize_task_id(v):
-    """Unsigned 64-bit task id (matches deps.json edges and chip_swimlane task_id).
-
-    Accepts ints (legacy) and strings (current schema): deps.json emits all
-    uint64 fields as quoted strings to dodge JSON-number precision loss in
-    JavaScript-based consumers, since tensor_ids (FNV hashes) and buffer
-    addresses routinely exceed Number.MAX_SAFE_INTEGER (2^53 - 1)."""
-    try:
-        t = int(v)
-    except (TypeError, ValueError):
-        return None
-    if t < 0:
-        t &= (1 << 64) - 1
-    return t
-
-
 # Same coercion semantics — alias so the call sites read as "this is a
 # tensor_id, not a task_id". Both encode 64-bit unsigned values as JSON strings.
-_normalize_tensor_id = _normalize_task_id
+_normalize_task_id = normalize_task_id_int
+_normalize_tensor_id = normalize_task_id_int
 
 
 _DTYPE_BYTES = {
@@ -156,51 +141,19 @@ def _node_id(task_id):
     tid = _normalize_task_id(task_id)
     if tid is None:
         return f"T_{task_id}"
-    high = (tid >> 32) & 0xFFFFFFFF
-    local = tid & 0xFFFFFFFF
+    high, local = raw_halves(tid)
     return f"T{high}_{local}"
 
 
 def _make_task_formatter(nodes, runtime_name):
     """Build a task-id → display-string formatter sized to the graph.
 
-    The layout comes from the runtime the document names, because nothing in a
-    task_id value says which minted it. Under ``host_build_graph`` that yields
-    ``g{parent}t{index}`` for a sub-task, ``p{index}`` for a boundary parameter and
-    ``t{local}`` for a task of the run; under ``tensormap_and_ringbuffer``, every
-    task is ``r{ring}t{local}``, including ring zero. An unnamed or unrecognised
-    runtime raises rather than defaulting — see swimlane_converter.resolve_runtime.
-
-    An HBG graph containing only GLOBAL ids drops the ``t`` prefix and displays the
-    local counters alone. TMR always retains its ring because the prefix distinguishes
-    its task-id layout from HBG's GLOBAL space.
+    The layout, and whether the whole graph's labels compress to bare counters, are
+    both the owning runtime's decision — see ``get(runtime_name).make_formatter``.
+    An unnamed or unrecognised runtime raises rather than defaulting; see
+    ``_runtime_dispatch.resolve_runtime``.
     """
-    display = task_display_for(runtime_name)
-
-    def decorated(task_id):
-        tid = _normalize_task_id(task_id)
-        if tid is None:
-            return str(task_id)
-        return display(tid)
-
-    all_bare = True
-    for n in nodes:
-        tid = _normalize_task_id(n)
-        if tid is None:
-            continue
-        if decorated(tid) != f"t{tid & 0xFFFFFFFF}":
-            all_bare = False
-            break
-
-    def fmt(task_id):
-        tid = _normalize_task_id(task_id)
-        if tid is None:
-            return str(task_id)
-        if all_bare:
-            return str(tid & 0xFFFFFFFF)
-        return decorated(tid)
-
-    return fmt
+    return get(runtime_name).make_formatter(nodes)
 
 
 def _sort_task_id_key(v):

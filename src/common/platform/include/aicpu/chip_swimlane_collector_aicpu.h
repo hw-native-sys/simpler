@@ -215,39 +215,33 @@ void chip_swimlane_aicpu_init_phase(int worker_count, int num_sched_phase_thread
  * @param shared_at_end    Per-shape sched.ready_queues[shape].size() at phase end (may be nullptr)
  */
 void chip_swimlane_aicpu_record_sched_phase(
-    int thread_idx, ChipSwimlaneSchedPhaseKind kind, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
+    int thread_idx, SchedPhaseKind kind, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
     uint32_t tasks_processed, uint32_t pop_hit = 0, uint32_t pop_miss = 0, const int16_t *shared_at_start = nullptr,
     const int16_t *shared_at_end = nullptr
 );
 
 /**
- * Record the completion point of one dependency-only dummy task.
+ * Record one phase that names the task it acted on.
  *
- * @param thread_idx     Scheduler thread that completed the task
- * @param complete_time  Timestamp sampled immediately before completion propagation
- * @param loop_iter      Current scheduler-loop iteration number
- * @param task_id        Full task identity
- */
-void chip_swimlane_aicpu_record_dummy_task(
-    int thread_idx, uint64_t complete_time, uint32_t loop_iter, uint64_t task_id
-);
-
-/**
- * Record the completion point of one task skipped by a false dispatch predicate.
+ * Which of a runtime's phases name a task is stated by that runtime
+ * (`sched_phase_carries_task_id` in its sched_phase_kind.h), so the kind comes from the
+ * caller rather than from a per-phase entry point here.
  *
- * @param thread_idx     Scheduler thread that completed the task
- * @param complete_time  Timestamp sampled immediately before completion propagation
- * @param loop_iter      Current scheduler-loop iteration number
- * @param task_id        Full task identity
+ * A zero-width marker is this function with `start_time == end_time`: naming an instant
+ * rather than an interval is the caller's way of recording, not a separate kind of
+ * record.
+ *
+ * @param thread_idx      Scheduler thread that ran the phase
+ * @param kind            This runtime's phase for the work performed
+ * @param start_time      Phase start, in system-counter cycles
+ * @param end_time        Phase end, in system-counter cycles
+ * @param loop_iter       Current scheduler-loop iteration number
+ * @param task_id         Full identity of the task this phase acted on
+ * @param tasks_processed Work items the phase handled
  */
-void chip_swimlane_aicpu_record_predicated_skip(
-    int thread_idx, uint64_t complete_time, uint32_t loop_iter, uint64_t task_id
-);
-
-/** Record one bounded Scheduler-side Graph materialization slice. */
-void chip_swimlane_aicpu_record_graph_prepare(
-    int thread_idx, uint64_t start_time, uint64_t end_time, uint32_t loop_iter, uint64_t task_id,
-    uint32_t tasks_materialized
+void chip_swimlane_aicpu_record_task_phase(
+    int thread_idx, SchedPhaseKind kind, uint64_t start_time, uint64_t end_time, uint32_t loop_iter, uint64_t task_id,
+    uint32_t tasks_processed = 1
 );
 
 /**

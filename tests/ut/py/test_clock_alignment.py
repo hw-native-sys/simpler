@@ -12,65 +12,25 @@ import json
 import sys
 
 import pytest
+from _capture_builder import Capture
 
 from simpler_setup.tools import swimlane_converter as sc
+from simpler_setup.tools._runtime_dispatch import HBG_RUNTIME
 
 
 def _capture(frequency=1_000_000_000):
     def cycle(ns):
         return 1_000_000 + ns * frequency // 1_000_000_000
 
-    return {
-        "chip_swimlane_level": 4,
-        "metadata": {
-            "runtime": sc.HBG_RUNTIME,
-            "clock_freq_hz": frequency,
-            "num_cores": 1,
-            "core_types": ["aiv"],
-            "orchestrator_source": "host",
-            "host_orchestration_origin_ns": 1_000_000,
-            "host_clock_domain_id": "test-host",
-            "host_capture": {
-                "status": "complete",
-                "expected_records": 1,
-                "recorded_records": 1,
-                "dropped_records": 0,
-                "error": None,
-            },
-        },
-        "host_orchestrator_phases": [
-            [{"submit_idx": 0, "task_id": 7, "start_host_ns": 1_000_000, "end_host_ns": 1_000_100}]
-        ],
-        "host_device_uploads": [
-            {"phase": "arena_h2d", "start_host_ns": 1_000_200, "end_host_ns": 1_000_300, "detail": 0}
-        ],
-        "aicore_tasks": [[0, 7, 1, cycle(500), cycle(600), 0]],
-        "scheduler_tasks": {"producer": "aicpu", "records": [[0, 1, cycle(400), cycle(650)]]},
-        "scheduler_records": {
-            "streams": [
-                {
-                    "platform": "a5",
-                    "producer": "aicpu",
-                    "scheduler_id": 0,
-                    "worker_id": 0,
-                    "core_type": "aicpu",
-                    "physical_core_id": None,
-                    "capture": {"committed": 1, "dropped": 0, "truncated": False},
-                    "records": [
-                        {
-                            "start_cycles": cycle(300),
-                            "end_cycles": cycle(700),
-                            "loop_iter": 1,
-                            "kind": "dispatch",
-                            "tasks_processed": 1,
-                            "task_id": None,
-                        }
-                    ],
-                    "metrics": [],
-                }
-            ],
-        },
-    }
+    return (
+        Capture(runtime=HBG_RUNTIME, level=4, clock_freq_hz=frequency)
+        .host_orchestrated(origin_ns=1_000_000, clock_domain_id="test-host")
+        .task(task_id=7, reg_task_id=1, start=cycle(500), end=cycle(600), dispatch=cycle(400), finish=cycle(650))
+        .sched_phase(phase="dispatch", start=cycle(300), end=cycle(700))
+        .host_orch_phase(task_id=7, start_ns=1_000_000, end_ns=1_000_100)
+        .host_upload(phase="arena_h2d", start_ns=1_000_200, end_ns=1_000_300)
+        .build()
+    )
 
 
 def _artifacts(tmp_path, *, frequency=1_000_000_000, logs=True, sidecar_pid=42):
@@ -168,7 +128,7 @@ def test_single_capture_skips_alignment_without_matching_windows(tmp_path, monke
     result["metadata"].pop("clock_alignment")
     assert result == original
     assert "clock alignment skipped" in capsys.readouterr().err
-    assert data["aicpu_scheduler_phases"][0][0]["start_time_us"] >= 0.3
+    assert data["scheduler_records"][0][0]["start_time_us"] >= 0.3
 
 
 def test_invalid_saved_bounds_are_not_used(tmp_path, monkeypatch):
