@@ -141,7 +141,7 @@ class TestSyncStartEarlyLocalOwner(SceneTestCase):
 
         perf = read_perf_data(perf_path)
         assert int(perf.get("chip_swimlane_level", 0)) >= 3, f"scheduler phases missing from {perf_path}"
-        phase_records = [record for thread in perf.get("aicpu_scheduler_phases", []) for record in thread]
+        phase_records = [record for thread in perf.get("scheduler_records", []) for record in thread]
         assert phase_records, f"scheduler phase capture is empty under {perf_path}"
         phase_counts = Counter(record.get("phase") for record in phase_records)
         expected_blocks = int(params["consumer_blocks"])

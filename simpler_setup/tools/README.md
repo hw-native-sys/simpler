@@ -365,8 +365,7 @@ model: [docs/dfx/sched-overhead-model.md](../../docs/dfx/sched-overhead-model.md
 
 1. **Perf profiling data** (`chip_swimlane_records_*.json`, level >= 2) from a
    `--enable-chip-swimlane` run — per-task dispatch/start/end/finish. Level >= 3
-   also supplies `scheduler_records` for the phase breakdown (legacy artifacts
-   with `aicpu_scheduler_phases` remain readable).
+   also supplies `scheduler_records` for the phase breakdown.
 2. **`deps.json`** (the task DAG) from a separate `--enable-dep-gen` run. It
    drives `ready(C) = max(producer.end)`, which is what separates scheduler
    bubbles from dependency stalls. **Required** — the tool errors without it.
@@ -491,8 +490,8 @@ runs.
 
 ```bash
 # min / median / max per segment over the warm binds, plus the control-plane total
-python -m simpler_setup.tools.hbg_bind_phases path/to/log
-python -m simpler_setup.tools.hbg_bind_phases outputs/<case>_<ts>/    # a directory of host.*.log
+python -m simpler_setup.tools.hbg.bind_phases path/to/log
+python -m simpler_setup.tools.hbg.bind_phases outputs/<case>_<ts>/    # a directory of host.*.log
 ```
 
 **A bind is one `(pid, inv)`.** A span carries both, so grouping needs no rank

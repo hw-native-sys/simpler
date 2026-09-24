@@ -41,21 +41,14 @@ from pathlib import Path
 from typing import Any
 
 from simpler_setup.tools import containment
-from simpler_setup.tools.scheduler_phase_records import (
-    canonical_sched_phase,
-    nested_resolve_record_ids,
-    scheduler_thread_role,
+from simpler_setup.tools._runtime_dispatch import (
+    LaneContext,
+    WorkerLaneContext,
+    get,
+    normalize_task_id_int,
+    resolve_runtime,
 )
 from simpler_setup.tools.strace_timing import host_process_lanes, parse_spans, span_family
-
-_AICORE_SCHEDULER_PHASE_DISPLAY_NAMES = {
-    "complete": "Completion",
-    "resolve": "Resolve",
-    "state_probe": "StateProbe",
-    "dispatch": "Dispatch",
-    "worksteal": "Worksteal",
-    "refill": "Refill",
-}
 
 
 def _func_id_to_letter(func_id):
@@ -115,246 +108,6 @@ def _scheduler_task_key(row):
     would let such a capture collide with a real run.
     """
     return (int(row[4]) if len(row) > 4 else None, int(row[0]), int(row[1]))
-
-
-def normalize_task_id_int(v):
-    """Unsigned 64-bit task id (matches host JSON / device ``task_id.raw``).
-
-    Normalizes signed values to unsigned so the high field decodes correctly.
-    Returns None if ``v`` is not convertible to int.
-    """
-    try:
-        t = int(v)
-    except (TypeError, ValueError):
-        return None
-    if t < 0:
-        t &= (1 << 64) - 1
-    return t
-
-
-def _tmr_task_display(task_id):
-    """Format a ``tensormap_and_ringbuffer`` task_id for human-readable labels.
-
-    That runtime puts a ring index in bits 39:32 and a local id in the low 32.
-
-    Returns:
-        ``r{ring}t{local}`` for every ring (for example ``r0t5`` and ``r2t100``).
-
-    For invalid or non-numeric values, returns str(task_id).
-    """
-    tid = normalize_task_id_int(task_id)
-    if tid is None:
-        return str(task_id)
-    local = tid & 0xFFFFFFFF
-    ring = (tid >> 32) & 0xFF
-    return f"r{ring}t{local}"
-
-
-def _hbg_task_display(task_id):
-    """Format a ``host_build_graph`` task_id for human-readable labels.
-
-    That runtime puts an id space in bits 63:62 (0 = GLOBAL, 1 = SUB_TASK, 2 = PARAM),
-    a sub-task's parent modular task in bits 51:32, and a local id in the low 32.
-    See src/common/host_build_graph/task_id.h.
-
-    Returns:
-        ``g{parent}t{local}`` for a sub-task: its parent modular task and own index
-        ``p{index}`` for a boundary parameter
-        ``t{local}`` for a task of the run itself
-
-    For invalid or non-numeric values, returns str(task_id).
-    """
-    tid = normalize_task_id_int(task_id)
-    if tid is None:
-        return str(task_id)
-    local = tid & 0xFFFFFFFF
-    space = (tid >> 62) & 0x3
-    if space == 1:
-        return f"g{(tid >> 32) & 0xFFFFF}t{local}"
-    if space == 2:
-        return f"p{local}"
-    return f"t{local}"
-
-
-HBG_RUNTIME = "host_build_graph"
-TMR_RUNTIME = "tensormap_and_ringbuffer"
-
-
-def resolve_runtime(runtime_name, *, source="metadata.runtime"):
-    """Validate the runtime a document names, refusing anything else.
-
-    A task_id carries whichever TaskId layout its runtime uses and nothing in the value
-    says which, so the layout is chosen from this name alone. Guessing when the name is
-    missing or unrecognised produces labels and id fields that read as valid and are
-    wrong -- an hbg sub-task decoded as tmr becomes a plausible `r3t5` with a
-    billion-scale ring -- so a name this tool does not know is an error rather than a
-    default.
-
-    Every document the repo writes names its runtime unconditionally: the swimlane
-    collector emits `metadata.runtime` (and fails to compile without
-    SIMPLER_RUNTIME_NAME), and both dep_gen writers emit a top-level `runtime`. A
-    missing name therefore means a capture from before those writers, which this tool
-    does not decode.
-
-    Public alongside task_display_for because critical_path and deps_viewer resolve
-    their own documents and must reach the same verdict this module does.
-
-    Raises:
-        ValueError: the name is absent, blank, or not a runtime this tool decodes.
-    """
-    if runtime_name in (HBG_RUNTIME, TMR_RUNTIME):
-        return runtime_name
-    if runtime_name is None or (isinstance(runtime_name, str) and not runtime_name.strip()):
-        raise ValueError(
-            f"{source} is missing; this capture predates the runtime name and its TaskId "
-            f"layout cannot be determined. Re-capture with a current build, which writes "
-            f"{HBG_RUNTIME!r} or {TMR_RUNTIME!r}."
-        )
-    raise ValueError(
-        f"{source} is {runtime_name!r}, which this tool does not decode; expected "
-        f"{HBG_RUNTIME!r} or {TMR_RUNTIME!r}. A task id has no self-describing layout, so "
-        f"an unrecognised runtime cannot be decoded by guessing."
-    )
-
-
-def task_display_for(runtime_name):
-    """Pick the task-id formatter for the runtime that minted the records.
-
-    See resolve_runtime for why an unknown name raises rather than defaulting.
-    """
-    return _hbg_task_display if resolve_runtime(runtime_name) == HBG_RUNTIME else _tmr_task_display
-
-
-def _task_id_fields_for(runtime_name):
-    """Pick the task-row id fields for the runtime that minted the records.
-
-    See resolve_runtime for why an unknown name raises rather than defaulting.
-    """
-    return _hbg_task_id_fields if resolve_runtime(runtime_name) == HBG_RUNTIME else _tmr_task_id_fields
-
-
-def _tmr_task_id_fields(task_id):
-    """The id-layout-dependent fields of a ``tensormap_and_ringbuffer`` task row."""
-    return {"ring_id": (task_id >> 32) & 0xFFFFFFFF}
-
-
-def _hbg_task_id_fields(task_id):
-    """The id-layout-dependent fields of a ``host_build_graph`` task row."""
-    space = (task_id >> 62) & 0x3
-    fields = {"id_space": space}
-    if space == 1:
-        fields["parent_task_id"] = (task_id >> 32) & 0xFFFFF
-    return fields
-
-
-def _decode_sub_task_id(task_id):
-    """Decode Scheduler-owned sub-task ids.
-
-    ``host_build_graph`` puts a materialized sub-task in id space 1 (SUB_TASK), held in
-    the top two bits, with its parent modular task in bits 51:32 and its own index in
-    the low 32; the stream-visible outer modular task stays in space 0 (GLOBAL). See
-    src/common/host_build_graph/task_id.h.
-
-    The space test reads the top two bits, so a ``tensormap_and_ringbuffer`` id -- whose
-    ring sits in bits 39:32 -- never matches, whatever its ring.
-    """
-    tid = normalize_task_id_int(task_id)
-    if tid is None or ((tid >> 62) & 0x3) != 1:
-        return None
-    return (tid >> 32) & 0xFFFFF, tid & 0xFFFFFFFF
-
-
-def _collect_graph_execution_instances(tasks, scheduler_phases):  # noqa: PLR0912
-    """Join sub-task rows to their outer GraphPrepare records.
-
-    Grouping is keyed by ``(run_epoch, outer_task_id)``, not by the outer id
-    alone. A graph re-executed in a later run reuses its task ids, so keying on
-    the id alone would fold two runs' executions into one instance whose span
-    covers both and whose row list is twice as long.
-    """
-    prepare_by_outer = defaultdict(list)
-    dummy_rows = []
-    for thread_idx, records in enumerate(scheduler_phases or []):
-        for record in records:
-            phase = record.get("phase")
-            if phase == "graph_prepare":
-                outer_task_id = normalize_task_id_int(record.get("task_id"))
-                # A graph_prepare record names the outer modular task, which is always
-                # GLOBAL. Testing the whole high word rather than the space alone is
-                # the stricter check and the one wanted here: a GLOBAL id has a zero
-                # parent and zero reserved bits too, so anything else in those bits is
-                # a corrupt record rather than a task of another space.
-                if outer_task_id is not None and (outer_task_id >> 32) == 0:
-                    prepare_by_outer[(record.get("run_epoch"), outer_task_id)].append(record)
-            elif phase == "dummy_task":
-                dummy_rows.append((record, thread_idx))
-
-    rows_by_outer = defaultdict(list)
-    for task in tasks:
-        decoded = _decode_sub_task_id(task.get("task_id"))
-        if decoded is not None:
-            outer_task_id, task_index = decoded
-            rows_by_outer[(task.get("run_epoch"), outer_task_id)].append((task, task_index))
-
-    dummy_by_outer = defaultdict(list)
-    for record, thread_idx in dummy_rows:
-        decoded = _decode_sub_task_id(record.get("task_id"))
-        if decoded is not None:
-            outer_task_id, task_index = decoded
-            dummy_by_outer[(record.get("run_epoch"), outer_task_id)].append((record, task_index, thread_idx))
-
-    instances = []
-    for group_key, prepare_records in prepare_by_outer.items():
-        run_epoch, outer_task_id = group_key
-        rows = rows_by_outer.get(group_key, [])
-        aicpu_rows = dummy_by_outer.get(group_key, [])
-        if not rows and not aicpu_rows:
-            continue
-        task_indices = {task_index for _, task_index in rows}
-        task_indices.update(task_index for _, task_index, _ in aicpu_rows)
-        starts = [
-            task.get("dispatch_time_us", _task_slice_start_us(task))
-            if task.get("dispatch_time_us", -1) >= 0
-            else _task_slice_start_us(task)
-            for task, _ in rows
-        ]
-        starts.extend(record["start_time_us"] for record, _, _ in aicpu_rows)
-        ends = [
-            task.get("finish_time_us", 0) if task.get("finish_time_us", 0) > 0 else task["end_time_us"]
-            for task, _ in rows
-        ]
-        ends.extend(record["end_time_us"] for record, _, _ in aicpu_rows)
-        prepare_start_us = min(record["start_time_us"] for record in prepare_records)
-        instances.append(
-            {
-                "outer_task_id": outer_task_id,
-                "run_epoch": run_epoch,
-                "rows": rows,
-                "aicpu_rows": aicpu_rows,
-                "visible_task_indices": sorted(task_indices),
-                "execution_start_us": min(starts),
-                "execution_end_us": max(ends),
-                "prepare_start_us": prepare_start_us,
-                "prepare_end_us": max(record["end_time_us"] for record in prepare_records),
-                "prepare_duration_us": sum(
-                    record["end_time_us"] - record["start_time_us"] for record in prepare_records
-                ),
-                "prepare_slice_count": len(prepare_records),
-            }
-        )
-
-    instances.sort(key=lambda instance: instance["prepare_start_us"])
-    lane_finish_us = []
-    for instance_idx, instance in enumerate(instances):
-        start_us = instance["prepare_start_us"]
-        lane_idx = next((idx for idx, finish_us in enumerate(lane_finish_us) if finish_us <= start_us), -1)
-        if lane_idx < 0:
-            lane_idx = len(lane_finish_us)
-            lane_finish_us.append(0.0)
-        lane_finish_us[lane_idx] = instance["execution_end_us"]
-        instance["instance_idx"] = instance_idx
-        instance["lane_idx"] = lane_idx
-    return instances
 
 
 # A scheduler thread index has to fit the runtime's `int8_t core_to_thread[]`,
@@ -660,31 +413,37 @@ def _matching_capture_host_windows(raw, spans, sidecar):
     return windows
 
 
-def _is_hbg_host_capture(raw):
-    """HBG level-3/4 captures containing Host data require clock alignment."""
+def _is_host_orchestrated_capture(raw):
+    """Whether a level-3/4 capture carries host-side orchestration data to align.
+
+    Clock alignment maps a host-orchestrated capture's device cycles onto the host
+    CLOCK_MONOTONIC axis, so what decides it is whether the capture holds host
+    orchestration records -- a property of the data, not of the runtime name. Every
+    field tested below is written only when the collector received host phase records
+    (chip_swimlane_collector.cpp), and only host_build_graph produces those today, so
+    naming that runtime here would restate what these fields already say and would
+    silently exclude any future runtime that grows the same capture.
+    """
     if raw.get("chip_swimlane_level") not in (3, 4):
         return False
     metadata = raw.get("metadata") or {}
-    has_host_capture = (
+    return (
         metadata.get("orchestrator_source") == "host"
         or bool(raw.get("host_orchestrator_phases"))
         or bool(raw.get("host_device_uploads"))
         or isinstance(metadata.get("host_capture"), dict)
     )
-    if not has_host_capture:
-        return False
-    return metadata.get("runtime") == HBG_RUNTIME
 
 
 def _prepare_capture_clock_alignment(path, host_logs=None):
-    """Return an enriched HBG capture and any available placement diagnostics.
+    """Return an enriched host-orchestrated capture and any available placement diagnostics.
 
     Explicit logs request a fresh calculation. With no override, a valid saved
     mapping is sufficient and no log or sidecar is read.
     """
     path = Path(path)
     raw = json.loads(path.read_text())
-    if not _is_hbg_host_capture(raw):
+    if not _is_host_orchestrated_capture(raw):
         return raw, None
     try:
         saved = _read_clock_alignment(raw) if host_logs is None else None
@@ -731,10 +490,10 @@ def read_perf_data(filepath, *, timeline_origin_ns=None, placement=None):
     """Read and decode performance data from a swimlane JSON file."""
     with open(filepath) as file:
         data = json.load(file)
-    return _decode_perf_data(data, timeline_origin_ns=timeline_origin_ns, placement=placement)
+    return _decode_perf_data(data, timeline_origin_ns=timeline_origin_ns, placement=placement, source=str(filepath))
 
 
-def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa: PLR0912, PLR0915
+def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=None):  # noqa: PLR0912, PLR0915
     """Decode performance data from an already-loaded swimlane document.
 
     Host dumps raw cycle-domain per-stream records plus metadata; this
@@ -766,30 +525,24 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
     is what makes the key unique once one file holds more than one run. Task
     rows and graph execution instances carry it for the same reason.
 
-    Older captures have no identity: aicore_tasks rows of 5 (v2) or 6 (v3)
-    columns, and four-column scheduler_tasks rows whose phase records lack
-    ``run_epoch``. Those parse with run_epoch = None, which means "this capture
-    did not record a run identity". It is deliberately not 0 — 0 is an epoch a
-    device can be given, so defaulting to it would make a legacy file claim to be
-    run 0 and let it collide with a real one.
+    Every row carries it: aicore_tasks rows are seven columns, scheduler_tasks
+    rows five, and each phase record has a ``run_epoch`` field. A row of any
+    other width is a producer this module does not read.
 
     Shape is read from the data, not from a version field: these artifacts are
     written by platform C++ in this repo and read by this module from the same
     checkout and the same build, so a declared version can never disagree with
     the rows it describes, and a producer wrong about its own rows would be
     wrong about the number too. Consistency *within* a stream is what is
-    enforced instead — mixed row widths, or phase records that disagree on
-    whether they carry an epoch, are rejected.
+    enforced instead — a row of the wrong width is rejected.
 
-    aicore_tasks columns (v3 schema): the trailing receive_to_start_cycles
-    is a uint32 delta = AICore-side `start_time - receive_time`, where
-    receive_time is captured immediately after AICore's
-    `read_reg(DATA_MAIN_BASE)` returns the new task_id (before the per-task
-    dcci + ack pair). Lets DFX split per-task head_OH into the
-    AICPU→AICore NoC propagation (dispatch_ts → receive_time, hardware-
-    bound) and the AICore-local dcci + ack cost (receive_time → start_time,
-    software-tunable). Archived v2 JSON without this column still parses;
-    the field is exposed as 0 for those.
+    aicore_tasks columns: the trailing receive_to_start_cycles is a uint32
+    delta = AICore-side `start_time - receive_time`, where receive_time is
+    captured immediately after AICore's `read_reg(DATA_MAIN_BASE)` returns the
+    new task_id (before the per-task dcci + ack pair). Lets DFX split per-task
+    head_OH into the AICPU→AICore NoC propagation (dispatch_ts → receive_time,
+    hardware-bound) and the AICore-local dcci + ack cost (receive_time →
+    start_time, software-tunable).
 
     ``placement`` optionally supplies a ``containment.Placement`` — where this
     capture's device clock sits on the Host CLOCK_MONOTONIC axis, derived from
@@ -806,7 +559,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
 
     Returns a dict shaped for `generate_chrome_trace_json`,
     `print_task_statistics`, and `sched_overhead_analysis`: `tasks`,
-    `scheduler_records` (plus the legacy internal alias), `aicpu_orchestrator_phases`,
+    `scheduler_records`, `aicpu_orchestrator_phases`,
     `core_to_thread`.
 
     The join logic that used to live in `export_swimlane_json` (host C++):
@@ -819,7 +572,6 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
         the freq MUST come from the host, never be hardcoded here)
       - join `scheduler_tasks.records` by `(core_id, reg_task_id)`; unmatched rows are
         dropped and counted
-      - archived JSON with `aicpu_tasks` is accepted as an AICPU-produced stream
       - level 1 accepts AICore-only task records; higher levels require Scheduler
         dispatch/finish timing for every emitted task
       - sort joined `tasks` by `task_id` (= task_token_raw)
@@ -848,31 +600,25 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
 
     aicore_rows = data.get("aicore_tasks") or []
     scheduler_task_section = data.get("scheduler_tasks")
-    legacy_aicpu_rows = data.get("aicpu_tasks")
     if scheduler_task_section is not None:
-        if legacy_aicpu_rows is not None:
-            raise ValueError("both scheduler_tasks and legacy aicpu_tasks are present")
         if not isinstance(scheduler_task_section, dict):
             raise ValueError("scheduler_tasks must be an object")
         scheduler_task_producer = scheduler_task_section.get("producer")
         if scheduler_task_producer not in ("aicpu", "aicore"):
             raise ValueError("scheduler_tasks.producer must be 'aicpu' or 'aicore'")
         scheduler_task_rows = scheduler_task_section.get("records")
+        # Width is checked per row rather than against a version field: a writer
+        # that is wrong about its own rows would be wrong about the number too,
+        # and one row of the wrong width is enough to say so.
         if not isinstance(scheduler_task_rows, list) or any(
-            not isinstance(row, list) or len(row) not in (4, 5) for row in scheduler_task_rows
+            not isinstance(row, list) or len(row) != 5 for row in scheduler_task_rows
         ):
-            raise ValueError("scheduler_tasks.records must contain four- or five-column arrays")
-        # Shape is read from the rows, not from a version field. Mixed widths in
-        # one stream mean the producer is inconsistent with itself, which is the
-        # drift a version number was supposed to catch and cannot: the writer
-        # stamps the number, so a writer that is wrong about its own rows is
-        # wrong about the number too.
-        row_widths = {len(row) for row in scheduler_task_rows}
-        if len(row_widths) > 1:
-            raise ValueError(f"scheduler_tasks.records mixes row widths {sorted(row_widths)}")
+            raise ValueError("scheduler_tasks.records must contain five-column arrays")
     else:
-        scheduler_task_rows = legacy_aicpu_rows or []
-        scheduler_task_producer = "aicpu" if legacy_aicpu_rows is not None else None
+        # No scheduler_tasks section: a level-1 capture, which times AICore
+        # execution and nothing that dispatched it.
+        scheduler_task_rows = []
+        scheduler_task_producer = None
     lifecycle_raw = data.get("aicpu_lifecycle_records") or []
     if not isinstance(lifecycle_raw, list) or any(not isinstance(record, dict) for record in lifecycle_raw):
         raise ValueError("aicpu_lifecycle_records must be an array of objects")
@@ -893,20 +639,16 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
             if not isinstance(records, list) or not isinstance(metrics, list):
                 raise ValueError(f"scheduler stream {stream_index} records/metrics must be arrays")
             # Exact-match on purpose: an unexpected or missing key is producer
-            # drift, and this is the only place that would catch it. `run_epoch`
-            # is optional only in the sense that a capture written before run
-            # identity existed lacks it; within one stream every record either
-            # has it or none does, which is checked below.
+            # drift, and this is the only place that would catch it.
             record_fields = {
                 "start_cycles",
                 "end_cycles",
+                "run_epoch",
                 "loop_iter",
                 "kind",
                 "tasks_processed",
                 "task_id",
             }
-            if records and isinstance(records[0], dict) and "run_epoch" in records[0]:
-                record_fields = record_fields | {"run_epoch"}
             merged_records = []
             for record_index, record in enumerate(records):
                 if not isinstance(record, dict) or set(record) != record_fields:
@@ -952,19 +694,10 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
             sched_phases_raw, scheduler_stream_metadata
         )
     else:
-        sched_phases_raw = data.get("aicpu_scheduler_phases") or []
-        scheduler_stream_metadata = [
-            {
-                "platform": None,
-                "producer": "aicpu",
-                "scheduler_id": index,
-                "worker_id": index,
-                "core_type": "aicpu",
-                "physical_core_id": None,
-                "capture": None,
-            }
-            for index in range(len(sched_phases_raw))
-        ]
+        # No scheduler_records section: the capture is below the level that
+        # records phases, so there are no streams to describe.
+        sched_phases_raw = []
+        scheduler_stream_metadata = []
     orch_phases_raw = data.get("aicpu_orchestrator_phases") or []
     host_orch_phases_raw = data.get("host_orchestrator_phases") or []
     raw_host_capture = metadata.get("host_capture")
@@ -978,9 +711,29 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
 
     # Which TaskId layout the records in this document carry. Resolved once here, and
     # strictly: nothing in a task_id value says which runtime minted it, so an absent or
-    # unrecognised name is refused rather than guessed at.
-    runtime_name = resolve_runtime(metadata.get("runtime"))
-    task_id_fields = _task_id_fields_for(runtime_name)
+    # unrecognised name is refused rather than guessed at. The file is named in the error
+    # because a merged multi-rank run decodes several, and "metadata.runtime is missing"
+    # alone does not say which one to re-capture.
+    runtime_name = resolve_runtime(
+        metadata.get("runtime"),
+        source=f"{source}: metadata.runtime" if source else "metadata.runtime",
+    )
+    decode_task_id_fields = get(runtime_name).task_id_fields
+
+    def task_id_fields(task_token_raw, core_id, run_epoch):
+        """This id's layout-dependent row fields, naming the row if it will not decode.
+
+        A corrupt id space raises from the owning runtime's TaskId rather than
+        rendering a plausible-looking field set (see hbg.TaskId.space). The raw value
+        is in that message; which row carried it is not, and a capture holds
+        thousands, so the row's join key is added here.
+        """
+        try:
+            return decode_task_id_fields(task_token_raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"{exc} -- carried by an aicore_tasks row with core_id={core_id}, run_epoch={run_epoch}"
+            ) from exc
 
     actual_host_record_count = sum(len(records) for records in host_orch_phases_raw)
     if isinstance(raw_host_capture, dict):
@@ -1050,22 +803,17 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
     # file holding two runs has the same core+reg_task_id twice. run_epoch is
     # what separates them, which is why it leads the key.
     #
-    # `*rest` makes three generations of row parse: v2 (5 cols, no
-    # receive_to_start_cycles), v3 (6 cols) and v4 (7 cols, + run_epoch).
-    # A pre-v4 row has no identity, and `None` records exactly that — it is
-    # never coerced to 0, which is a real epoch a device can be given.
-    # Key is (run_epoch, core_id, reg_task_id); run_epoch is None for a
-    # pre-identity capture. Spelled loosely because this module has no
-    # `from __future__ import annotations` and pyright targets 3.9.
+    # Key is (run_epoch, core_id, reg_task_id). Spelled loosely because this
+    # module has no `from __future__ import annotations` and pyright targets 3.9.
     aicore_lookup: dict[tuple, tuple[int, int, int, int]] = {}
     for row_index, row in enumerate(aicore_rows):
-        if not isinstance(row, list) or len(row) not in (5, 6, 7):
-            raise ValueError(f"aicore_tasks[{row_index}] must contain five, six or seven columns")
-        core_id, task_token_raw, reg_task_id, start_cycles, end_cycles, *rest = row
+        if not isinstance(row, list) or len(row) != 7:
+            raise ValueError(f"aicore_tasks[{row_index}] must contain seven columns")
+        core_id, task_token_raw, reg_task_id, start_cycles, end_cycles, r2s_cycles, run_epoch = row
         start_cycles = int(start_cycles)
         end_cycles = int(end_cycles)
-        r2s_cycles = int(rest[0]) if rest else 0
-        run_epoch = int(rest[1]) if len(rest) > 1 else None
+        r2s_cycles = int(r2s_cycles)
+        run_epoch = int(run_epoch)
         if not (0 < start_cycles <= end_cycles):
             raise ValueError(f"aicore_tasks[{row_index}] has invalid timing: expected 0 < start_cycles <= end_cycles")
         if not (0 <= r2s_cycles < start_cycles):
@@ -1113,17 +861,17 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
             base_time_cycles = v
 
     for row in aicore_rows:
-        # Column count varies (v2: 5, v3: 6); only the timing columns matter
-        # for base_time tracking. For v3, the per-task receive_time =
-        # start_cycles - receive_to_start_cycles is earlier than start_cycles
-        # itself; track it so Worker View task bars that start at receive_time
-        # don't land at a negative offset relative to the kernel start.
+        # Only the timing columns matter for base_time tracking. The per-task
+        # receive_time = start_cycles - receive_to_start_cycles is earlier than
+        # start_cycles itself; track it so Worker View task bars that start at
+        # receive_time don't land at a negative offset relative to the kernel
+        # start.
         start_c = int(row[3])
         end_c = int(row[4])
-        r2s_c = int(row[5]) if len(row) > 5 else 0
+        r2s_c = int(row[5])
         _track(start_c - r2s_c)
         _track(end_c)
-    for _, _, d, f, *_epoch in scheduler_task_rows:
+    for _, _, d, f, _epoch in scheduler_task_rows:
         _track(int(d))
         _track(int(f))
     for thread_records in sched_phases_raw:
@@ -1195,10 +943,10 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
 
     if scheduler_task_rows:
         for row in scheduler_task_rows:
-            core_id, reg_task_id, dispatch_cycles, finish_cycles, *epoch_rest = row
+            core_id, reg_task_id, dispatch_cycles, finish_cycles, run_epoch = row
             core_id = int(core_id)
             reg_task_id = int(reg_task_id)
-            run_epoch = int(epoch_rest[0]) if epoch_rest else None
+            run_epoch = int(run_epoch)
             ac = aicore_lookup.get((run_epoch, core_id, reg_task_id))
             if ac is None:
                 unmatched_per_core[core_id] += 1
@@ -1217,7 +965,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
                     "func_id": -1,
                     "core_id": core_id,
                     "core_type": _core_type(core_id),
-                    **task_id_fields(task_token_raw),
+                    **task_id_fields(task_token_raw, core_id, run_epoch),
                     "start_time_us": start_us,
                     "end_time_us": end_us,
                     "duration_us": end_us - start_us,
@@ -1231,9 +979,9 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
             )
     elif aicore_rows and level == 1:
         for row in aicore_rows:
-            core_id, task_token_raw, _reg_task_id, start_cycles, end_cycles, *rest = row
-            r2s_cycles = int(rest[0]) if rest else 0
-            run_epoch = int(rest[1]) if len(rest) > 1 else None
+            core_id, task_token_raw, _reg_task_id, start_cycles, end_cycles, r2s_cycles, run_epoch = row
+            r2s_cycles = int(r2s_cycles)
+            run_epoch = int(run_epoch)
             core_id = int(core_id)
             task_token_raw = int(task_token_raw)
             start_us = _to_us(int(start_cycles))
@@ -1246,7 +994,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
                     "func_id": -1,
                     "core_id": core_id,
                     "core_type": _core_type(core_id),
-                    **task_id_fields(task_token_raw),
+                    **task_id_fields(task_token_raw, core_id, run_epoch),
                     "start_time_us": start_us,
                     "end_time_us": end_us,
                     "duration_us": end_us - start_us,
@@ -1260,9 +1008,8 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
         raise ValueError(f"level {level} requires Scheduler task timing records")
 
     # Sorting by task_id alone would interleave two runs' executions of the same
-    # task. Epoch leads so each run's tasks stay contiguous; None (a pre-identity
-    # capture) sorts before any real epoch and cannot compare against one.
-    tasks.sort(key=lambda t: (t.get("run_epoch") is not None, t.get("run_epoch") or 0, int(t["task_id"])))
+    # task. Epoch leads so each run's tasks stay contiguous.
+    tasks.sort(key=lambda t: (t["run_epoch"], int(t["task_id"])))
 
     total_unmatched = sum(unmatched_per_core.values())
     if total_unmatched > 0:
@@ -1286,7 +1033,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
         out.pop("end_cycles", None)
         return out
 
-    aicpu_scheduler_phases = []
+    scheduler_records = []
     for thread_records in sched_phases_raw:
         converted = []
         for pr in thread_records:
@@ -1297,7 +1044,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
             out["phase"] = kind
             out.pop("kind", None)
             converted.append(out)
-        aicpu_scheduler_phases.append(converted)
+        scheduler_records.append(converted)
 
     aicpu_orchestrator_phases = []
     for thread_records in orch_phases_raw:
@@ -1363,9 +1110,8 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
     out["runtime"] = runtime_name
     if scheduler_task_producer is not None:
         out["scheduler_task_producer"] = scheduler_task_producer
-    if aicpu_scheduler_phases:
-        out["aicpu_scheduler_phases"] = aicpu_scheduler_phases
-        out["scheduler_records"] = aicpu_scheduler_phases
+    if scheduler_records:
+        out["scheduler_records"] = scheduler_records
         out["scheduler_streams"] = scheduler_stream_metadata
     if aicpu_orchestrator_phases:
         out["aicpu_orchestrator_phases"] = aicpu_orchestrator_phases
@@ -1598,16 +1344,16 @@ def _scheduler_slice_start_us(task):
 
 
 def _with_run_epoch(args, row):
-    """Add ``run_epoch`` to an event's args when the row carries one.
+    """Stamp an event's args with the run its record belongs to, where it has one.
 
-    Omitted rather than defaulted when the row has no identity: a capture
-    written before run identity existed genuinely does not know its run, and 0
-    is an epoch a device can really be given, so filling it in would make the
-    unknown indistinguishable from run 0.
+    Every device-side record carries one: it is the trailing column on a task
+    row and a field on every scheduler phase record. Host-side records do not
+    and never will -- a submit or an upload is timed on the Host clock, which
+    no device run bounds -- so the field is absent rather than unknown, and an
+    event drawn from one is stamped with nothing.
     """
-    run_epoch = row.get("run_epoch")
-    if run_epoch is not None:
-        args["run_epoch"] = run_epoch
+    if "run_epoch" in row:
+        args["run_epoch"] = row["run_epoch"]
     return args
 
 
@@ -1675,11 +1421,8 @@ def _execution_key(row):
     earlier run's flow then binds to a slice belonging to the later one. The
     static graph in deps.json is run-independent and stays keyed by bare
     task_id; this key is only for per-execution indexes.
-
-    ``run_epoch`` is ``None`` for a capture that recorded no identity, which
-    keeps legacy rows in their own domain rather than sharing one with run 0.
     """
-    return (row.get("run_epoch"), row["task_id"], row["core_id"])
+    return (row["run_epoch"], row["task_id"], row["core_id"])
 
 
 def _flow_anchor_rows(task_id, task_map, spmd_task_ids, slice_start, aicpu_worker_anchor_map=None):
@@ -1971,8 +1714,8 @@ def print_task_statistics(tasks, func_id_to_name=None, chip_swimlane_level=None)
             tail_overhead = finish_time - end_time
             func_stats[func_id]["tail_overheads"].append(tail_overhead)
 
-            # Head OH split (v3 schema only — falls back to absent when the
-            # AICore record came from a pre-receive_time build).
+            # Head OH split, which needs a dispatch timestamp to measure the
+            # AICPU→AICore propagation against; a level-1 capture has none.
             if "propagation_us" in task:
                 func_stats[func_id]["propagations"].append(task["propagation_us"])
 
@@ -2318,10 +2061,12 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     if verbose:
         print(f"  Unique cores: {len(unique_cores)}")
 
-    # The TaskId layout every label in this trace is formatted with. Chosen once, from
-    # the runtime the document names, because nothing in a task_id value says which
-    # runtime minted it.
-    task_display = task_display_for(runtime_name)
+    # The runtime whose DFX vocabulary this whole trace follows -- its TaskId layout,
+    # its phase names and colours, the lanes it draws. Resolved once, from the runtime
+    # the document names, because nothing in a task_id value or a phase name says which
+    # runtime produced it.
+    runtime = get(runtime_name)
+    task_display = runtime.display
 
     # Recover func_id for TASK_TIMING (level=1) records, which the host
     # emits as func_id=-1. Resolve once here against dep_gen's per-task
@@ -2336,8 +2081,6 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 resolved = resolve_func_id_from_kernel_map(task["task_id"], task.get("core_type"), deps_kernel_map)
                 if resolved >= 0:
                     task["func_id"] = resolved
-
-    graph_instances = _collect_graph_execution_instances(tasks, scheduler_phases)
 
     # Step 2: Generate JSON events
     events = []
@@ -2420,53 +2163,31 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     # consumer that then looks rows up does so in that run's own map.
     spmd_task_ids = _identify_spmd_task_ids(task_maps_by_run, deps_block_map)
 
-    if graph_instances:
-        events.append(
-            {"args": {"name": "Graph Execution"}, "cat": "__metadata", "name": "process_name", "ph": "M", "pid": 5}
+    def _marker_event_name(task_id, task_label):
+        """The label a task-bearing marker carries, resolved the same way a task bar's is.
+
+        Handed to a contributor so it does not have to know how a func_id is
+        recovered from the kernel map, nor what makes a task SPMD.
+        """
+        func_id = resolve_task_func_id_from_kernel_map(task_id, deps_kernel_map)
+        return _task_display_name(func_id, func_id_to_name, task_label, spmd=task_id in spmd_task_ids)
+
+    # The lane this runtime draws for itself, if it draws one. pid 5 and the tid
+    # block above 5000 are reserved here rather than in the contributor, so the
+    # numbering of the whole trace stays owned by one place.
+    events.extend(
+        runtime.contribute_events(
+            tasks,
+            scheduler_phases,
+            LaneContext(
+                pid=5,
+                tid_base=5000,
+                display=task_display,
+                with_run_epoch=_with_run_epoch,
+                task_slice_start_us=_task_slice_start_us,
+            ),
         )
-        events.append(
-            {"args": {"sort_index": 1}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": 5}
-        )
-        for lane_idx in sorted({instance["lane_idx"] for instance in graph_instances}):
-            events.append(
-                {
-                    "args": {"name": f"Graph_{lane_idx}"},
-                    "cat": "__metadata",
-                    "name": "thread_name",
-                    "ph": "M",
-                    "pid": 5,
-                    "tid": 5000 + lane_idx,
-                }
-            )
-        for instance in graph_instances:
-            outer_display = task_display(instance["outer_task_id"])
-            task_indices = instance["visible_task_indices"]
-            events.append(
-                {
-                    "args": _with_run_epoch(
-                        {
-                            "outer_task_id": instance["outer_task_id"],
-                            "visible_sub_task_count": len(task_indices),
-                            "visible_sub_task_local_id_min": min(task_indices),
-                            "visible_sub_task_local_id_max": max(task_indices),
-                            "prepare_slice_count": instance["prepare_slice_count"],
-                            "prepare_duration_us": instance["prepare_duration_us"],
-                            "execution_start_us": instance["execution_start_us"],
-                            "execution_duration_us": instance["execution_end_us"] - instance["execution_start_us"],
-                            "synthetic_id_layout": "space1:(outer_task_id << 32) | sub_task_local_id",
-                        },
-                        instance,
-                    ),
-                    "cat": "graph_execution",
-                    "cname": "rail_animation",
-                    "name": f"GraphExecution({outer_display}, {len(task_indices)} visible sub-tasks)",
-                    "ph": "X",
-                    "pid": 5,
-                    "tid": 5000 + instance["lane_idx"],
-                    "ts": instance["prepare_start_us"],
-                    "dur": instance["execution_end_us"] - instance["prepare_start_us"],
-                }
-            )
+    )
 
     events.append({"args": {"name": "Worker View"}, "cat": "__metadata", "name": "process_name", "ph": "M", "pid": 4})
     events.append({"args": {"sort_index": 4}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": 4})
@@ -2512,6 +2233,17 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     # another.
     aicpu_anchor_maps_by_run: dict[object, dict[int, list[dict]]] = defaultdict(lambda: defaultdict(list))
     event_id = 0
+
+    def _next_event_id():
+        """Hand out the next flow-event id, keeping one counter for the whole trace.
+
+        Flow arrows bind by this id, so a second source of them would collide
+        with the task bars numbered below.
+        """
+        nonlocal event_id
+        assigned = event_id
+        event_id += 1
+        return assigned
 
     AICPU_TID_BASE = 19000  # noqa: N806
     scheduler_thread_indices = {int(thread_idx) for thread_idx in (core_to_thread or []) if int(thread_idx) >= 0}
@@ -2732,40 +2464,26 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             {"args": {"sort_index": 2}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": 2}
         )
 
-        # Phase color mapping. The Perfetto sched lane only renders the
-        # two work phases (complete, dispatch). Idle is the wall-clock gap
-        # between consecutive work bars — Perfetto's empty-track regions
-        # already convey that visually, so we don't paint a synthetic bar
-        # for it. (Idle is still tallied numerically by
-        # sched_overhead_analysis.py Part 2 via gap reconstruction.)
-        phase_colors = {
-            # Outer phases — mutually time-exclusive within an iter
-            "complete": "good",  # green
-            "dispatch": "terrible",  # red
-            "async_poll": "yellow",  # async-wait completion polling (split from complete)
-            "release": "olive",  # deferred-release drain (on_task_release work)
-            "dummy": "grey",  # dummy_drain pass (TMR Resolve nests inside; HBG P bar is standalone)
-            "early_dispatch": "rail_animation",  # speculative early-dispatch staging
-            # sync_start stop-the-world drain: outer bar time-contains the two
-            # inner staging passes, so Perfetto nests them by depth on the track.
-            "drain": "cq_build_running",  # handle_drain_mode outer
-            "drain_prepare": "cq_build_attempt_runnable",  # inner: cluster scan + build_payload
-            "drain_publish": "cq_build_attempt_passed",  # inner: MMIO write_reg per subtask (the cohort launch)
-            "graph_prepare": "rail_animation",  # bounded Scheduler-side Definition expansion
-            "bootstrap": "rail_animation",
-            "fanin": "cq_build_running",
-            "state_probe": "cq_build_running",
-            "ready_claim": "cq_build_attempt_runnable",
-            "ready_steal": "cq_build_attempt_failed",
-            "direct_refill": "cq_build_attempt_passed",
-            "worksteal": "cq_build_attempt_failed",
-            "refill": "cq_build_attempt_passed",
-            "idle": "grey",
-            # Inner in TMR; standalone on HBG's dedicated P thread.
-            "resolve": "vsync_highlight_color",  # on_task_complete: walk consumer list
-            # Separate-lane (Worker View AICPU_N) — fallback color if it ever lands on Sched
-            "dummy_task": "grey",
-        }
+        # Phase colour mapping, and which phases the scheduler track draws as a
+        # bar. Both come whole from the runtime the document names: a phase two
+        # runtimes both emit is still two phases, and the owning runtime's entry is
+        # the one that describes it.
+        #
+        # A phase needs a colour because it is drawn, so the colour table already
+        # states the bar set; the only phases it over-states are the ones a runtime
+        # draws on another track, and each runtime names its own.
+        #
+        # `idle` is a drawn bar wherever a producer publishes one. hbg's AICore
+        # scheduler does (a SchedulerIdleRecord per spin), so that stream's idle is
+        # measured and rendered; tmr publishes none, and the idle a report shows for
+        # it is reconstructed from gaps by sched_overhead_analysis rather than drawn
+        # here.
+        phase_colors = runtime.PHASE_COLORS
+        # Only the AICore scheduler renames its phases for display, and only hbg
+        # has one -- a runtime without that producer supplies an empty mapping
+        # and every phase shows the name it was recorded with.
+        phase_display_names = runtime.PHASE_DISPLAY_NAMES
+        sched_lane_phases = frozenset(phase_colors) - runtime.MARKER_PHASES
 
         # Per-complete task-finish rows are retained as an attribution check.
         # The runtime's Complete `tasks_processed` field is the authoritative
@@ -2797,19 +2515,15 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     continue
                 finishes_per_complete[id(t_comp)] += 1
 
-        # AICPU worker-marker width — start/end on the device coincide; render
-        # as a 0.02 us sliver so Perfetto does not collapse it to a hairline.
-        AICPU_WORKER_MARKER_MIN_DUR_US = 0.02  # noqa: N806
-
         assigned_thread_indices = {
             assigned for assigned in (core_to_thread or []) if isinstance(assigned, int) and assigned >= 0
         }
         for thread_idx, thread_records in enumerate(scheduler_phases):
             tid = sched_lane_tid(thread_idx, 0)
             resolve_tid = sched_lane_tid(thread_idx, 1)
-            nested_resolve_ids = nested_resolve_record_ids(thread_records)
+            nested_resolve_ids = runtime.nested_resolve_record_ids(thread_records)
             is_resolution_thread = (
-                scheduler_thread_role(thread_records, assigned_thread_indices, thread_idx, nested_resolve_ids)
+                runtime.scheduler_thread_role(thread_records, assigned_thread_indices, thread_idx, nested_resolve_ids)
                 == "resolution"
             )
 
@@ -2853,84 +2567,30 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             # they represent DAG nodes briefly inhabiting the AICPU as a
             # virtual worker, so we route them to Worker View (pid=4) AICPU_N
             # (where N = the AICPU id of the sched thread that drained them).
+            # Dependency-only task markers do NOT live on the sched track —
+            # whether this runtime has any, and what they look like, is its own
+            # to say. They land on Worker View (pid=4) AICPU_N, so the
+            # contributor is given the tid for this thread rather than choosing
+            # one.
+            marker_events, marker_anchors = runtime.contribute_worker_lane_events(
+                thread_records,
+                thread_idx,
+                WorkerLaneContext(
+                    display=task_display,
+                    with_run_epoch=_with_run_epoch,
+                    event_name=_marker_event_name,
+                    tid=lambda idx: AICPU_TID_BASE + idx,
+                    next_event_id=_next_event_id,
+                ),
+            )
+            events.extend(marker_events)
+            for run_epoch, task_id, row in marker_anchors:
+                aicpu_anchor_maps_by_run[run_epoch][task_id].append(row)
+
             for record in thread_records:
                 raw_phase = record.get("phase", "unknown")
-                phase = canonical_sched_phase(raw_phase)
-                if phase in ("dummy_task", "predicated_skip"):
-                    start_us = record["start_time_us"]
-                    end_us = record["end_time_us"]
-                    dur = max(end_us - start_us, AICPU_WORKER_MARKER_MIN_DUR_US)
-                    task_id = normalize_task_id_int(record.get("task_id"))
-                    task_label = task_display(task_id) if task_id is not None else "unknown"
-                    if phase == "dummy_task":
-                        event_name = f"dummy({task_label})"
-                    else:
-                        func_id = resolve_task_func_id_from_kernel_map(task_id, deps_kernel_map)
-                        event_name = _task_display_name(
-                            func_id,
-                            func_id_to_name,
-                            task_label,
-                            spmd=task_id in spmd_task_ids,
-                        )
-                    event_args = {
-                        "loop_iter": record.get("loop_iter", 0),
-                        "task_id": task_id,
-                        "event-hint": event_name,
-                    }
-                    if phase == "dummy_task":
-                        event_args["phase"] = phase
-                    else:
-                        event_args["predicated_pass"] = False
-                    _with_run_epoch(event_args, record)
-                    events.append(
-                        {
-                            "args": event_args,
-                            "cat": "event",
-                            "id": event_id,
-                            "name": event_name,
-                            "ph": "X",
-                            "pid": 4,
-                            "tid": AICPU_TID_BASE + thread_idx,
-                            "ts": start_us,
-                            "dur": dur,
-                        }
-                    )
-                    if task_id is not None:
-                        aicpu_anchor_maps_by_run[record.get("run_epoch")][task_id].append(
-                            {
-                                "task_id": task_id,
-                                "run_epoch": record.get("run_epoch"),
-                                "start_time_us": start_us,
-                                "end_time_us": start_us + dur,
-                                "receive_time_us": start_us,
-                                "trace_tid": AICPU_TID_BASE + thread_idx,
-                                "event_id": event_id,
-                            }
-                        )
-                    event_id += 1
-                    continue
-                if phase not in (
-                    "complete",
-                    "async_poll",
-                    "dispatch",
-                    "release",
-                    "resolve",
-                    "early_dispatch",
-                    "dummy",
-                    "drain",
-                    "drain_prepare",
-                    "drain_publish",
-                    "graph_prepare",
-                    "bootstrap",
-                    "fanin",
-                    "state_probe",
-                    "ready_claim",
-                    "ready_steal",
-                    "direct_refill",
-                    "worksteal",
-                    "refill",
-                    "idle",
-                ):
+                phase = runtime.canonical_sched_phase(raw_phase)
+                if phase not in sched_lane_phases:
                     continue
                 start_us = record["start_time_us"]
                 end_us = record["end_time_us"]
@@ -2986,9 +2646,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         phase_args["finishes_processed"] = matched_finish_rows
                         tasks_processed = matched_finish_rows
                         phase_args["tasks_processed"] = tasks_processed
-                display_phase = (
-                    _AICORE_SCHEDULER_PHASE_DISPLAY_NAMES.get(phase, phase) if is_aicore_scheduler else phase
-                )
+                display_phase = phase_display_names.get(phase, phase) if is_aicore_scheduler else phase
                 if not is_aicore_scheduler:
                     display_name = f"{display_phase}({tasks_processed})"
                 elif task_id is not None:
@@ -3125,38 +2783,22 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 {"args": {"name": name}, "cat": "__metadata", "name": "thread_name", "ph": "M", "pid": 1, "tid": tid}
             )
 
-        # Per-task orchestrator phase bars. As of PR-X the device folds
-        # all 6 sub-step phases into one ORCH_SUBMIT record covering the
-        # submit's entire [start, end] window. Legacy per-sub-step phase
-        # strings remain in the color map so old captures still render.
+        # Per-task orchestrator phase bars. One ORCH_SUBMIT record covers a
+        # submit's entire [start, end] window; the device does not break it
+        # into sub-steps.
         orch_phase_colors = {
             "orch_submit": "rail_animation",  # purple — primary
-            # Legacy per-sub-step phases (old captures only):
-            "orch_sync": "thread_state_iowait",
-            "orch_alloc": "terrible",
-            "orch_params": "good",
-            "orch_lookup": "thread_state_running",
-            "orch_insert": "olive",
-            "orch_fanin": "rail_animation",
         }
 
         # Build the runtime task-id sets so the orch-phase loop can distinguish
         # alloc_tensors() calls from submitted tasks. deps.json remains the
         # identity source when a runtime timing record is missing.
         regular_task_ids = {int(t.get("task_id", -1)) for t in tasks}
-        dummy_task_ids = set()
-        predicated_skip_task_ids = set()
-        if scheduler_phases:
-            for thread_records in scheduler_phases:
-                for rec in thread_records:
-                    phase = rec.get("phase")
-                    if phase in ("dummy_task", "predicated_skip"):
-                        task_id = normalize_task_id_int(rec.get("task_id"))
-                        if task_id is not None:
-                            if phase == "dummy_task":
-                                dummy_task_ids.add(task_id)
-                            else:
-                                predicated_skip_task_ids.add(task_id)
+        # Which ids this runtime marked as dependency-only or predicate-skipped;
+        # a runtime that marks neither reports both as empty.
+        marker_ids = runtime.marker_task_ids(scheduler_phases)
+        dummy_task_ids = marker_ids["dummy_task"]
+        predicated_skip_task_ids = marker_ids["predicated_skip"]
         deps_dummy_task_ids = {
             task_id
             for task_id, kernel_ids in (deps_kernel_map or {}).items()
@@ -3764,9 +3406,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 flow_id += 1
 
     # Orchestrator → scheduler dispatch:
-    # Anchor each task's dispatch arrow on the end of its orch_submit record
-    # (covers the entire submit_task() span). Legacy captures with the older
-    # per-sub-step phases (orch_fanin / orch_params) are accepted as fallbacks.
+    # Anchor each task's dispatch arrow on the end of its orch_submit record,
+    # which covers the entire submit_task() span.
     cross_domain_aligned = not (
         orchestrator_source == "host"
         and timeline_metadata
@@ -3783,18 +3424,10 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 tid_k = normalize_task_id_int(task_id)
                 if tid_k is None:
                     continue
-                # First-seen orch_submit wins; legacy orch_fanin / orch_params
-                # only fill in when no orch_submit exists for that task. The
-                # explicit "not already submit→dispatch" guard preserves first-
-                # seen semantics even if a (defensive) duplicate orch_submit
-                # ever appears for the same task.
-                existing = orch_anchor_by_task.get(tid_k)
-                if phase == "orch_submit" and (existing is None or existing[2] != "submit→dispatch"):
-                    orch_anchor_by_task[tid_k] = (record, orch_idx, "submit→dispatch")
-                elif existing is None and phase == "orch_fanin":
-                    orch_anchor_by_task[tid_k] = (record, orch_idx, "fanin→dispatch")
-                elif existing is None and phase == "orch_params":
-                    orch_anchor_by_task[tid_k] = (record, orch_idx, "params→dispatch")
+                # First-seen orch_submit wins, so a (defensive) duplicate for
+                # the same task cannot move the anchor.
+                if phase == "orch_submit" and tid_k not in orch_anchor_by_task:
+                    orch_anchor_by_task[tid_k] = (record, orch_idx)
 
         if has_scheduler_task_data and orch_anchor_by_task:
             for task in tasks:
@@ -3816,7 +3449,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 if anchor is None:
                     continue
 
-                anchor_rec, orch_idx, flow_name = anchor
+                anchor_rec, orch_idx = anchor
                 anchor_us = anchor_rec["end_time_us"]
 
                 orch_tid = 4000 + orch_idx
@@ -3825,7 +3458,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     {
                         "cat": "flow",
                         "id": flow_id,
-                        "name": flow_name,
+                        "name": "submit→dispatch",
                         "ph": "s",
                         "pid": 1,
                         "tid": orch_tid,
@@ -3836,7 +3469,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     {
                         "cat": "flow",
                         "id": flow_id,
-                        "name": flow_name,
+                        "name": "submit→dispatch",
                         "ph": "f",
                         "pid": 2,
                         "tid": sched_tid,
@@ -3861,7 +3494,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     metadata = dict(timeline_metadata) if timeline_metadata else {}
     # Downstream tools (critical_path) re-format task ids from this trace alone, so it
     # has to name the runtime whose TaskId layout its labels and ids follow. Always set:
-    # task_display_for above already refused a caller that named none.
+    # resolve_runtime above already refused a caller that named none.
     metadata["runtime"] = resolve_runtime(runtime_name)
     if metadata:
         trace["metadata"] = metadata
@@ -4005,7 +3638,7 @@ def _print_verbose_data_info(data, verbose):
         max_time = max(end_times)
         print(f"  Time Range: {min_time:.3f} us - {max_time:.3f} us (span: {max_time - min_time:.3f} us)")
     print()
-    scheduler_phases = data.get("aicpu_scheduler_phases")
+    scheduler_phases = data.get("scheduler_records")
     orchestrator_phases = data.get("aicpu_orchestrator_phases")
     core_to_thread = data.get("core_to_thread")
     if scheduler_phases:
@@ -4015,10 +3648,7 @@ def _print_verbose_data_info(data, verbose):
         print(f"  Orchestrator threads: {len(orchestrator_phases)}")
         print(f"  Total orchestrator phase records: {sum(len(t) for t in orchestrator_phases)}")
         # submit_count is derivable as the number of orch_submit records (one per submit).
-        # Legacy captures fall back to orch_fanin (was last phase of submit pre-fold).
         submit_count = sum(1 for thread in orchestrator_phases for r in thread if r.get("phase") == "orch_submit")
-        if submit_count == 0:
-            submit_count = sum(1 for thread in orchestrator_phases for r in thread if r.get("phase") == "orch_fanin")
         if submit_count:
             print(f"  Orchestrator: {submit_count} tasks submitted")
     if core_to_thread:
@@ -4449,9 +4079,9 @@ def _place_rank_captures(host_log_paths, raw_inputs, identities, host_pids, pins
     captures = {rank: containment.capture_windows(raw) for rank, raw in raw_inputs.items()}
     pins = dict(pins)
     for rank, raw in raw_inputs.items():
-        if rank in pins or host_pids.get(rank) is None or not _is_hbg_host_capture(raw):
+        if rank in pins or host_pids.get(rank) is None or not _is_host_orchestrated_capture(raw):
             continue
-        # HBG Host records fall within their own chip.run invocation.
+        # Host orchestration records fall within their own chip.run invocation.
         # They disambiguate synchronous launches, whose dispatch IDs are zero.
         try:
             matches = _matching_capture_host_windows(raw, spans, {"host_pid": host_pids[rank]})
@@ -4845,7 +4475,7 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
     for rank, records_path in rank_inputs:
         placement = placements[rank]
         raw = raw_inputs[rank]
-        if _is_hbg_host_capture(raw):
+        if _is_host_orchestrated_capture(raw):
             record = _clock_alignment_record(placement)
             try:
                 _write_clock_alignment_record(records_path, raw, record)
@@ -4860,7 +4490,7 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
             artifacts["func_names"],
             args.verbose,
             orchestrator_name=artifacts["orchestrator_name"],
-            scheduler_phases=data.get("aicpu_scheduler_phases"),
+            scheduler_phases=data.get("scheduler_records"),
             scheduler_streams=data.get("scheduler_streams"),
             orchestrator_phases=data.get("aicpu_orchestrator_phases"),
             orchestrator_source=data.get("orchestrator_source"),
@@ -5011,7 +4641,7 @@ def main():
             func_names,
             args.verbose,
             orchestrator_name=orchestrator_name,
-            scheduler_phases=data.get("aicpu_scheduler_phases"),
+            scheduler_phases=data.get("scheduler_records"),
             scheduler_streams=data.get("scheduler_streams"),
             orchestrator_phases=data.get("aicpu_orchestrator_phases"),
             orchestrator_source=data.get("orchestrator_source"),

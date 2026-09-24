@@ -76,7 +76,7 @@ import sys
 from collections import deque
 from pathlib import Path
 
-from .swimlane_converter import HBG_RUNTIME, resolve_runtime
+from ._runtime_dispatch import get, resolve_runtime
 
 SOURCE_FLAGS = {
     "creator": ("wait", "retain"),
@@ -96,8 +96,8 @@ def _edge_flags(edge: dict) -> frozenset[str]:
 def _deps_runtime(path: Path) -> str:
     """The runtime a deps.json names, refusing a capture that names none.
 
-    Which TaskId layout the ids carry, which is what _scope_key needs — nothing in a
-    task_id value says which runtime minted it.
+    Which TaskId layout the ids carry, which is what scope-key grouping needs —
+    nothing in a task_id value says which runtime minted it.
 
     Raises:
         ValueError: the capture names no runtime, or one this tool does not decode.
@@ -108,27 +108,6 @@ def _deps_runtime(path: Path) -> str:
         data = None
     runtime = data.get("runtime") if isinstance(data, dict) else None
     return resolve_runtime(runtime, source=f"{path}: runtime")
-
-
-def _scope_key(task_id, runtime: str | None):
-    """The submission scope a task belongs to, for counting edges that cross one.
-
-    A scope boundary is what the runtime's bounded reachability bitmap cannot see
-    across, so the two runtimes name it in their own layouts:
-
-    - ``tensormap_and_ringbuffer``: the ring index in bits 39:32. One ring per scope
-      depth, so a differing ring is a differing scope.
-    - ``host_build_graph``: the id space plus the parent modular task. Tasks of the
-      run itself share one scope (space GLOBAL, parent 0); each modular task's body
-      is its own.
-
-    The runtime must be one of those two; see swimlane_converter.resolve_runtime for
-    why an unnamed or unrecognised one is refused rather than defaulted.
-    """
-    raw = int(task_id)
-    if resolve_runtime(runtime) == HBG_RUNTIME:
-        return ((raw >> 62) & 0x3, (raw >> 32) & 0xFFFFF)
-    return (raw >> 32) & 0xFF
 
 
 def load_wait_graph(
@@ -272,9 +251,8 @@ def simulate(path: Path, bls: list[int]) -> dict:
     pair_distances = {(p, s): seq[s] - seq[p] for (p, s) in wait_pairs}
     distances = sorted(d for d in pair_distances.values() if d >= 0)
     runtime = _deps_runtime(path)
-    cross_scope_pairs = {
-        (pred, succ) for (pred, succ) in wait_pairs if _scope_key(pred, runtime) != _scope_key(succ, runtime)
-    }
+    scope_key = get(runtime).scope_key
+    cross_scope_pairs = {(pred, succ) for (pred, succ) in wait_pairs if scope_key(pred) != scope_key(succ)}
     report: dict = {
         "file": str(path),
         "tasks": len(order),

@@ -423,7 +423,7 @@ struct SchedulerJsonRecord {
     uint64_t start_cycles;
     uint64_t end_cycles;
     uint64_t loop_iter;
-    const char *kind;
+    SchedPhaseKind kind;
     uint64_t tasks_processed;
     uint64_t task_id;
     bool has_task;
@@ -435,7 +435,7 @@ const char *scheduler_core_type_name(int32_t core_type) {
 
 void append_scheduler_record(
     std::vector<SchedulerJsonRecord> *records, uint64_t start_cycles, uint64_t end_cycles, uint64_t loop_iter,
-    const char *kind, uint64_t tasks_processed, uint64_t task_id = 0, bool has_task = true
+    SchedPhaseKind kind, uint64_t tasks_processed, uint64_t task_id = 0, bool has_task = true
 ) {
     if (records == nullptr || start_cycles == 0 || end_cycles < start_cycles) return;
     records->push_back({start_cycles, end_cycles, loop_iter, kind, tasks_processed, task_id, has_task});
@@ -590,7 +590,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         if (context.is_scheduler == 0 || context.worker_index >= SCHEDULER_WORKER_CAPACITY) continue;
         append_scheduler_record(
             &records[context.worker_index], context.bootstrap_start_cycles, context.target_bootstrap_end_cycles, 0,
-            "bootstrap", context.bootstrap_task_count, 0, false
+            SchedPhaseKind::Bootstrap, context.bootstrap_task_count, 0, false
         );
     }
     for (uint64_t task_id = 0; task_id < owner.layout.task_count; ++task_id) {
@@ -598,7 +598,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         if (trace.state_probe_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
             append_scheduler_record(
                 &records[trace.state_probe_scheduler_worker_id], trace.state_probe_start_cycles,
-                trace.state_probe_end_cycles, trace.dispatch_loop_iter, "state_probe", 1, task_id
+                trace.state_probe_end_cycles, trace.dispatch_loop_iter, SchedPhaseKind::StateProbe, 1, task_id
             );
         }
         const auto ready_source = static_cast<SchedulerReadySource>(trace.ready_source);
@@ -607,27 +607,29 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         if (trace.dispatch_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY && !refill) {
             append_scheduler_record(
                 &records[trace.dispatch_scheduler_worker_id], trace.dispatch_start_cycles, trace.dispatch_end_cycles,
-                trace.dispatch_loop_iter, ready_source == SchedulerReadySource::STOLEN ? "worksteal" : "dispatch", 1,
+                trace.dispatch_loop_iter,
+                ready_source == SchedulerReadySource::STOLEN ? SchedPhaseKind::Worksteal : SchedPhaseKind::Dispatch, 1,
                 task_id
             );
         }
         if (trace.complete_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
             append_scheduler_record(
                 &records[trace.complete_scheduler_worker_id], trace.complete_start_cycles, trace.complete_end_cycles,
-                trace.complete_loop_iter, "complete", 1, task_id
+                trace.complete_loop_iter, SchedPhaseKind::Complete, 1, task_id
             );
         }
         if (trace.refill_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
             append_scheduler_record(
                 &records[trace.refill_scheduler_worker_id], trace.refill_start_cycles, trace.refill_end_cycles,
-                trace.refill_loop_iter, "refill", 1, trace.refill_task_id
+                trace.refill_loop_iter, SchedPhaseKind::Refill, 1, trace.refill_task_id
             );
         }
         const SchedulerTaskControl &control = controls[task_id];
         if (control.scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
             append_scheduler_record(
                 &records[control.scheduler_worker_id], control.completion_resolve_start_cycles,
-                control.completion_resolve_end_cycles, control.completion_resolve_loop_iter, "resolve", 1, task_id
+                control.completion_resolve_end_cycles, control.completion_resolve_loop_iter, SchedPhaseKind::Resolve, 1,
+                task_id
             );
         }
     }
@@ -655,7 +657,8 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
             for (uint32_t index = 0; index < committed; ++index) {
                 const SchedulerIdleRecord &record = buffer.records[index];
                 append_scheduler_record(
-                    &records[worker], record.start_time, record.end_time, record.loop_iter, "idle", 0, 0, false
+                    &records[worker], record.start_time, record.end_time, record.loop_iter, SchedPhaseKind::Idle, 0, 0,
+                    false
                 );
             }
             dropped_by_worker[worker] = buffer.dropped;
@@ -672,7 +675,10 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         std::sort(records[worker].begin(), records[worker].end(), [](const auto &lhs, const auto &rhs) {
             if (lhs.start_cycles != rhs.start_cycles) return lhs.start_cycles < rhs.start_cycles;
             if (lhs.end_cycles != rhs.end_cycles) return lhs.end_cycles < rhs.end_cycles;
-            return std::strcmp(lhs.kind, rhs.kind) < 0;
+            // Ordered by the name a report spells, not by the enumerator value: the
+            // tie-break exists only to make the output deterministic, and the
+            // enumerators are numbered by producer grouping rather than alphabetically.
+            return std::strcmp(sched_phase_kind_name(lhs.kind), sched_phase_kind_name(rhs.kind)) < 0;
         });
         if (!first_stream) scheduler_json << ",";
         scheduler_json << "\n      {\"platform\": \"a5\", \"producer\": \"aicore\", "
@@ -687,7 +693,8 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
             if (index != 0) scheduler_json << ",";
             scheduler_json << "\n        {\"start_cycles\": " << record.start_cycles
                            << ", \"end_cycles\": " << record.end_cycles << ", \"run_epoch\": " << api->run_epoch()
-                           << ", \"loop_iter\": " << record.loop_iter << ", \"kind\": \"" << record.kind
+                           << ", \"loop_iter\": " << record.loop_iter << ", \"kind\": \""
+                           << sched_phase_kind_name(record.kind)
                            << "\", \"tasks_processed\": " << record.tasks_processed << ", \"task_id\": ";
             if (record.has_task) scheduler_json << record.task_id;
             else scheduler_json << "null";

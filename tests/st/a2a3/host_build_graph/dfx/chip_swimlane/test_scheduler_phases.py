@@ -69,7 +69,7 @@ class TestSchedulerPhases(SceneTestCase):
             assert perf_path.exists(), f"missing chip swimlane artifact: {perf_path}"
 
             data = read_perf_data(perf_path)
-            phase_threads = data.get("aicpu_scheduler_phases")
+            phase_threads = data.get("scheduler_records")
             assert phase_threads, "scheduler phase records are missing"
             assigned_threads = {thread_idx for thread_idx in data.get("core_to_thread", []) if thread_idx >= 0}
             resolution_threads = [

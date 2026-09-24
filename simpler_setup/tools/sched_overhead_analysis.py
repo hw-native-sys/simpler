@@ -36,27 +36,13 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from simpler_setup.tools.scheduler_phase_records import (
-    SCHED_OUTER_PHASES as _SCHED_OUTER_PHASES,
-)
-from simpler_setup.tools.scheduler_phase_records import (
-    canonical_sched_phase,
-    nested_resolve_record_ids,
-    scheduler_thread_role,
-)
+from simpler_setup.tools._runtime_dispatch import get, normalize_task_id_int, resolve_runtime
 
-
-def _to_uint64(v):
-    """Coerce a JSON-encoded uint64 (int, or string — deps.json quotes uint64s
-    so JavaScript-based consumers don't lose precision past 2^53 - 1) to a
-    Python int. Returns None when unparseable."""
-    try:
-        n = int(v)
-    except (TypeError, ValueError):
-        return None
-    if n < 0:
-        n &= (1 << 64) - 1
-    return n
+# Alias so call sites read as "this file's own uint64 coercion" without duplicating
+# it: deps.json quotes uint64s (task_id, pred/succ) as strings so JavaScript-based
+# consumers don't lose precision past 2^53 - 1, and normalize_task_id_int already
+# folds a negative Python int back to unsigned on top of that coercion.
+_to_uint64 = normalize_task_id_int
 
 
 def compute_dag_stats_from_deps(deps_data, perf_data, threads):
@@ -194,9 +180,14 @@ def parse_scheduler_from_json_phases(data):  # noqa: PLR0912
               and finishes_per_loop. Returns
               empty dict if phase data is not available.
     """
-    phases_by_thread = data.get("scheduler_records") or data.get("aicpu_scheduler_phases", [])
+    phases_by_thread = data.get("scheduler_records") or []
     if not phases_by_thread:
         return {}
+
+    # Which phases exist, which of them count as outer work, and how a Resolve is
+    # told from a nested one are all the capture's runtime's own vocabulary.
+    runtime = get(resolve_runtime(data.get("runtime")))
+    outer_phases = runtime.OUTER_PHASES
 
     # A logical task may emit one perf row per SPMD subtask/core. Select its
     # final finish row across all cores before attributing it to a scheduler
@@ -236,12 +227,13 @@ def parse_scheduler_from_json_phases(data):  # noqa: PLR0912
         # or Dummy, while HBG emits it as standalone work on the dedicated P
         # thread. Count only the latter so the P thread is not dropped without
         # double-counting TMR's nested bars.
-        outer_recs = [r for r in records if r.get("phase") in _SCHED_OUTER_PHASES]
-        nested_resolve_ids = nested_resolve_record_ids(records)
+        outer_recs = [r for r in records if r.get("phase") in outer_phases]
+        nested_resolve_ids = runtime.nested_resolve_record_ids(records)
         standalone_resolve = [
             record
             for record in records
-            if canonical_sched_phase(record.get("phase")) == "resolve" and id(record) not in nested_resolve_ids
+            if runtime.canonical_sched_phase(record.get("phase", "")) == "resolve"
+            and id(record) not in nested_resolve_ids
         ]
         work_recs = sorted(
             outer_recs + standalone_resolve,
@@ -250,7 +242,7 @@ def parse_scheduler_from_json_phases(data):  # noqa: PLR0912
         if not work_recs:
             continue
 
-        phase_us = {phase: 0.0 for phase in (*_SCHED_OUTER_PHASES, "resolve", "idle")}
+        phase_us = {phase: 0.0 for phase in (*outer_phases, "resolve", "idle")}
         total_finishes = 0
         max_loop_iter = 0
         pop_hit = 0
@@ -258,7 +250,7 @@ def parse_scheduler_from_json_phases(data):  # noqa: PLR0912
         prev_end = None
 
         for rec in work_recs:
-            phase = canonical_sched_phase(rec["phase"])
+            phase = runtime.canonical_sched_phase(rec["phase"])
             start = rec.get("start_time_us", 0)
             end = rec.get("end_time_us", 0)
             # Idle = wall-clock gap between this record and the previous
@@ -294,10 +286,10 @@ def parse_scheduler_from_json_phases(data):  # noqa: PLR0912
         finishes_per_loop = total_finishes / loops if loops > 0 else 0.0
         pop_total = pop_hit + pop_miss
         pop_hit_rate = pop_hit / pop_total * 100 if pop_total > 0 else 0.0
-        phases_seen = {canonical_sched_phase(rec["phase"]) for rec in work_recs}
+        phases_seen = {runtime.canonical_sched_phase(rec["phase"]) for rec in work_recs}
         if phase_us["idle"] > 0:
             phases_seen.add("idle")
-        role = scheduler_thread_role(records, assigned_thread_indices, tid, nested_resolve_ids)
+        role = runtime.scheduler_thread_role(records, assigned_thread_indices, tid, nested_resolve_ids)
 
         t = {
             # `completed` remains the legacy logical-task field used by the
@@ -326,7 +318,16 @@ def parse_scheduler_from_json_phases(data):  # noqa: PLR0912
 
 
 def print_aicore_scheduler_phase_breakdown(data):
-    """Print AICore Scheduler phase totals without AICPU queue assumptions."""
+    """Print AICore Scheduler phase totals without AICPU queue assumptions.
+
+    Phase names are taken as recorded. Only one producer's records can reach
+    here: the collector writes the ``scheduler_records`` section either from the
+    AICore path's published extension or from the shared AICPU writer, never
+    both, and this report runs only for the former. So no AICPU-side
+    discriminator (hbg's ``resolve_standalone``) can appear, and canonicalizing
+    would either be a no-op or -- if the two sources ever did mix -- fold a
+    foreign phase in under a name that makes it look native.
+    """
     scheduler_records = data.get("scheduler_records") or []
     scheduler_streams = data.get("scheduler_streams") or []
     totals = defaultdict(float)
@@ -334,7 +335,7 @@ def print_aicore_scheduler_phase_breakdown(data):
     dropped = 0
     for stream_index, records in enumerate(scheduler_records):
         for record in records:
-            kind = canonical_sched_phase(record.get("phase", "unknown"))
+            kind = record.get("phase", "unknown")
             totals[kind] += max(0.0, record.get("end_time_us", 0.0) - record.get("start_time_us", 0.0))
             counts[kind] += 1
         if stream_index < len(scheduler_streams):
@@ -398,10 +399,17 @@ def _summarize_scheduler_loops(threads):
     return summary
 
 
-def _scheduler_phases_for_report(threads):
-    """Return phase rows that are represented by the current capture."""
+def _scheduler_phases_for_report(threads, runtime):
+    """Return phase rows that are represented by the current capture.
+
+    The order is the runtime's own (see its OUTER_PHASES): for hbg that keeps
+    the AICore scheduler's loop -- state_probe, dispatch, worksteal, refill --
+    reading in the order it runs. ``idle`` trails both because it is the tool's
+    own reconstructed row rather than one the runtime lists.
+    """
     phases_seen = set().union(*(thread.get("phases_seen", set()) for thread in threads.values()))
-    return [phase for phase in (*_SCHED_OUTER_PHASES, "resolve", "idle") if phase in phases_seen]
+    ordered = (*runtime.OUTER_PHASES, "resolve", "idle")
+    return [phase for phase in ordered if phase in phases_seen]
 
 
 def validate_perf_tasks_for_overhead_analysis(tasks):
@@ -1030,25 +1038,22 @@ def run_analysis(  # noqa: PLR0912, PLR0915
     print(f"  FINs observed (Complete phase): {total_finishes}")
     print()
 
-    # Phase breakdown. Idle is reconstructed from gaps between work
-    # records on the same thread (no explicit idle record is emitted by
-    # the device anymore).
+    # Phase breakdown. Every phase label comes whole from the runtime the capture
+    # names: a phase two runtimes both emit is still two phases, and the owning
+    # runtime's wording is the one that describes it.
+    #
+    # ``idle`` is the exception, and it is labelled here rather than by a runtime
+    # because the *number* on that row is this tool's: it is reconstructed from the
+    # gaps between work records on a thread, not read from a record. hbg's AICore
+    # scheduler does publish measured idle records, but that producer is reported by
+    # print_aicore_scheduler_phase_breakdown, which prints raw phase names and
+    # reaches no label table -- so an idle row here is always the gap reconstruction.
+    runtime = get(resolve_runtime(data.get("runtime")))
     phase_labels = {
-        "complete": "Complete (poll handshake, completion handling)",
-        "async_poll": "AsyncPoll (async-wait completion: SDMA/RoCE/URMA/CCU)",
-        "state_probe": "StateProbe (Scheduler-local Dispatch Slot / Ready state)",
-        "dispatch": "Dispatch (pop queue, build payload, flush)",
-        "worksteal": "Worksteal (remote Inbox claim and dispatch)",
-        "refill": "Refill (completed Slot reuse)",
-        "release": "Release (deferred producer release)",
-        "dummy": "Dummy (dependency-only task resolution)",
-        "early_dispatch": "EarlyDispatch (speculative staging)",
-        "drain": "Drain (sync-start staging)",
-        "graph_prepare": "GraphPrepare (Definition expansion)",
-        "resolve": "Resolve (completion/dependency resolution)",
         "idle": "Idle (spinning, no progress — reconstructed from gaps)",
+        **runtime.PHASE_REPORT_LABELS,
     }
-    reported_phases = _scheduler_phases_for_report(threads)
+    reported_phases = _scheduler_phases_for_report(threads, runtime)
 
     # Total (us) is summed across all scheduler threads, so it can exceed the
     # wall-clock window (e.g. idle ~= n_threads x per-thread idle); "% of total"

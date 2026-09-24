@@ -45,7 +45,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .swimlane_converter import task_display_for
+from ._runtime_dispatch import get
 
 INF = float("inf")
 
@@ -477,7 +477,7 @@ def _critical_trace(trace_data, critical_task_ids: set[str]):
     # The trace names the runtime whose TaskId layout its ids follow, which is what
     # picks the formatter -- nothing in a task_id value says which runtime minted it.
     runtime_name = (trace_data.get("metadata") or {}).get("runtime") if isinstance(trace_data, dict) else None
-    task_display = task_display_for(runtime_name)
+    task_display = get(runtime_name).display
     events = [event.copy() for event in _trace_events(trace_data)]
     visible_task_ids = {
         str(event.get("args", {}).get("taskId"))
