@@ -121,9 +121,8 @@ LoopAction SchedulerContext::check_idle_fatal_error(int32_t thread_idx, SharedMe
 // Prefix on every line:
 //   [STALL thread=N idle_iterations=K] CATEGORY ...
 //
-// All scheduler threads spinning at the same idle rate hit STALL_LOG_INTERVAL
-// together, so lines with the same idle_iterations belong to one diagnostic
-// round; grep "idle_iterations=N" groups one round's output.
+// A complete snapshot is emitted only by the thread that wins the wall-clock
+// warning or shutdown latch. grep "idle_iterations=N" groups its lines.
 //
 // Categories (and which thread emits them):
 //   SUMMARY  — completed / total counts and scan totals               (thread 0 only)
@@ -312,8 +311,7 @@ void SchedulerContext::log_stall_diagnostics(
         }
         int32_t effective_total = task_count > 0 ? task_count : submitted_in_ring;
         int32_t c = completed_tasks_.load(std::memory_order_relaxed);
-        STALL_DUMP_LOG(
-            report,
+        LOG_WARN(
             "[STALL thread=%d idle_iterations=%d] SUMMARY completed=%d/%d last_progress_iteration=%d "
             "scan_ready=%d scan_waiting=%d scan_running=%d",
             thread_idx, idle_iterations, c, effective_total, last_progress_count, cnt_ready, cnt_waiting, cnt_running
@@ -355,12 +353,13 @@ void SchedulerContext::log_stall_diagnostics(
 #undef STALL_DUMP_LOG
 
 void SchedulerContext::log_shutdown_stall_snapshot(
-    int32_t trigger_thread_idx, int32_t trigger_idle_iterations, int32_t trigger_last_progress_count
+    int32_t trigger_thread_idx, int32_t trigger_idle_iterations, int32_t trigger_last_progress_count,
+    const char *reason, StallDumpReport report
 ) {
     LOG_WARN(
-        "[SHUTDOWN_SNAPSHOT trigger_thread=%d reason=scheduler_timeout idle_iterations=%d] "
-        "dumping all scheduler threads before emergency shutdown",
-        trigger_thread_idx, trigger_idle_iterations
+        "[SHUTDOWN_SNAPSHOT trigger_thread=%d reason=%s idle_iterations=%d] "
+        "dumping all scheduler threads for stall diagnosis",
+        trigger_thread_idx, reason, trigger_idle_iterations
     );
     int32_t thread_count = active_sched_threads_ > 0 ? active_sched_threads_ : aicpu_thread_num_;
     if (thread_count < 0 || thread_count > MAX_AICPU_THREADS) {
@@ -371,9 +370,11 @@ void SchedulerContext::log_shutdown_stall_snapshot(
         thread_count = thread_count < 0 ? 0 : MAX_AICPU_THREADS;
     }
     for (int32_t t = 0; t < thread_count; t++) {
-        log_stall_diagnostics(
-            t, total_tasks_, trigger_idle_iterations, trigger_last_progress_count, StallDumpReport::Shutdown
-        );
+        log_stall_diagnostics(t, total_tasks_, trigger_idle_iterations, trigger_last_progress_count, report);
+    }
+    if (sched_ != nullptr) {
+        AICoreCompletionMailbox *mailbox = rt_ != nullptr ? rt_->aicore_mailbox : nullptr;
+        sched_->async_wait_list.log_diagnostics(mailbox, reason, report == StallDumpReport::Shutdown);
     }
 }
 
@@ -464,7 +465,7 @@ int32_t SchedulerContext::handle_timeout_exit(
         header->sched_stall_detail.store(cls.detail, std::memory_order_release);
     }
     if (begin_emergency_shutdown()) {
-        log_shutdown_stall_snapshot(thread_idx, idle_iterations, last_progress_count);
+        log_shutdown_stall_snapshot(thread_idx, idle_iterations, last_progress_count, "scheduler_timeout");
 #if SIMPLER_DFX
         // Capture the in-flight kernels' partial output before signalling the
         // cores to exit, so the dump reflects the live stuck state.
@@ -1134,6 +1135,15 @@ void SchedulerContext::signal_emergency_shutdown(Runtime *runtime) {
 
 void SchedulerContext::emergency_shutdown(Runtime *runtime) {
     if (begin_emergency_shutdown()) {
+        int32_t orch_error = SIMPLER_ERROR_NONE;
+        if (sched_ != nullptr && sched_->sm_header != nullptr) {
+            orch_error = sched_->sm_header->orch_error_code.load(std::memory_order_acquire);
+        }
+        if (orch_error == SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT) {
+            log_shutdown_stall_snapshot(-1, 0, completed_tasks_.load(std::memory_order_relaxed), "tensor_data_timeout");
+        } else {
+            log_shutdown_stall_snapshot(-1, 0, completed_tasks_.load(std::memory_order_relaxed), "fatal_shutdown");
+        }
         signal_emergency_shutdown(runtime);
     }
 }
@@ -1227,6 +1237,7 @@ int32_t SchedulerContext::pre_handshake_init(
     // released to dispatch.
     completed_tasks_.store(0, std::memory_order_release);
     orchestrator_done_.store(false, std::memory_order_release);
+    stall_warning_episode_.reset();
     func_id_to_addr_ = reinterpret_cast<uint64_t *>(runtime->dev.callable_table_addr_);
     func_id_to_addr_count_ = runtime->dev.callable_table_len_;
 

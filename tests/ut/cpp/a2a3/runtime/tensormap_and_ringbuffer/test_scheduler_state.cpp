@@ -18,11 +18,97 @@
 
 #include <atomic>
 #include <cstring>
+#include <memory>
+#include <string>
 #include <thread>
 
 #include "utils/device_arena.h"
 #include "scheduler/scheduler_types.h"
 #include "scheduler/scheduler.h"
+
+TEST(StallWarningEpisodeTest, ClaimsOnceAndRearmsAfterProgress) {
+    StallWarningEpisode episode;
+    episode.reset();
+
+    uint64_t first = episode.generation();
+    EXPECT_TRUE(episode.try_claim(first));
+    EXPECT_FALSE(episode.try_claim(first));
+
+    uint64_t second = episode.note_progress();
+    EXPECT_GT(second, first);
+    EXPECT_FALSE(episode.try_claim(first));
+    EXPECT_TRUE(episode.try_claim(second));
+    EXPECT_FALSE(episode.try_claim(second));
+}
+
+TEST(StallWarningEpisodeTest, ConcurrentClaimHasOneWinner) {
+    StallWarningEpisode episode;
+    episode.reset();
+    uint64_t generation = episode.generation();
+    std::atomic<int32_t> winners{0};
+    std::thread threads[8];
+    for (auto &thread : threads) {
+        thread = std::thread([&]() {
+            if (episode.try_claim(generation)) winners.fetch_add(1, std::memory_order_relaxed);
+        });
+    }
+    for (auto &thread : threads)
+        thread.join();
+    EXPECT_EQ(winners.load(std::memory_order_relaxed), 1);
+}
+
+TEST(AsyncWaitDiagnosticsTest, SeparatesTaskBodyAndCompletionPendingAndGuardsMailboxUnderflow) {
+    auto wait_list = std::make_unique<AsyncWaitList>();
+    auto mailbox = std::make_unique<AICoreCompletionMailbox>();
+    wait_list->reset_for_reuse();
+    wait_list->count = 3;
+
+    wait_list->entries[0].task_token = TaskId::make(0, 0);
+    wait_list->entries[0].normal_done = false;
+    wait_list->entries[0].waiting_completion_count = 0;
+
+    wait_list->entries[1].task_token = TaskId::make(0, 1);
+    wait_list->entries[1].normal_done = true;
+    wait_list->entries[1].waiting_completion_count = 1;
+    wait_list->entries[1].condition_count = 1;
+    wait_list->entries[1].conditions[0].satisfied = false;
+
+    wait_list->entries[2].task_token = TaskId::make(0, 2);
+    wait_list->entries[2].normal_done = true;
+    wait_list->entries[2].waiting_completion_count = 0;
+
+    mailbox->head.store(1, std::memory_order_relaxed);
+    mailbox->tail.store(2, std::memory_order_relaxed);
+    testing::internal::CaptureStderr();
+    wait_list->log_diagnostics(mailbox.get(), "unit_test");
+    std::string output = testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(output.find("task_body_pending_entries=1"), std::string::npos);
+    EXPECT_NE(output.find("completion_pending_entries=1"), std::string::npos);
+    EXPECT_NE(output.find("settled_entries=1"), std::string::npos);
+    EXPECT_NE(output.find("mailbox_head=1 mailbox_tail=2 mailbox_pending=0"), std::string::npos);
+}
+
+TEST(AsyncWaitDiagnosticsTest, CapsDetailRowsAtSixteen) {
+    auto wait_list = std::make_unique<AsyncWaitList>();
+    wait_list->reset_for_reuse();
+    wait_list->count = 20;
+    for (int32_t i = 0; i < wait_list->count; i++) {
+        wait_list->entries[i].task_token = TaskId::make(0, static_cast<uint32_t>(i));
+        wait_list->entries[i].normal_done = false;
+    }
+
+    testing::internal::CaptureStderr();
+    wait_list->log_diagnostics(nullptr, "detail_cap");
+    std::string output = testing::internal::GetCapturedStderr();
+    const std::string marker = "[ASYNC_WAIT reason=detail_cap entry=";
+    size_t detail_count = 0;
+    for (size_t pos = 0; (pos = output.find(marker, pos)) != std::string::npos; pos += marker.size())
+        detail_count++;
+
+    EXPECT_EQ(detail_count, 16u);
+    EXPECT_NE(output.find("details=16 truncated=1"), std::string::npos);
+}
 
 TEST(SyncStartDrainAttemptTest, LateAckCannotSatisfyNextAttemptBarrier) {
     std::atomic<uint64_t> ack_tokens[3]{};

@@ -127,8 +127,10 @@ static bool wait_for_tensor_ready(
                 if (get_sys_cnt_aicpu() - t0 > TENSOR_DATA_TIMEOUT_CYCLES) {
                     orch.report_fatal(
                         SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT, caller,
-                        "Timeout (%llu cycles): producer (ring=%d, local=%d) not completed",
-                        (unsigned long long)TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
+                        "Timeout (%llu cycles): producer (ring=%d, local=%d) not completed "
+                        "[owner_task=0x%llx task_state=%d]",
+                        (unsigned long long)TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id,
+                        (unsigned long long)owner.raw, (int)slot.task_state.load(std::memory_order_relaxed)
                     );
                     failed = true;
                     return;
@@ -152,10 +154,14 @@ static bool wait_for_tensor_ready(
                     return;
                 }
                 if (get_sys_cnt_aicpu() - t0 > TENSOR_DATA_TIMEOUT_CYCLES) {
+                    uint32_t refcount = slot.fanout_refcount.load(std::memory_order_acquire) & ~FANOUT_SCOPE_BIT;
+                    uint32_t needed = slot.fanout_count & ~FANOUT_SCOPE_BIT;
                     orch.report_fatal(
                         SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT, caller,
-                        "Timeout (%llu cycles): consumers of producer (ring=%d, local=%d) not done",
-                        (unsigned long long)TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
+                        "Timeout (%llu cycles): consumers of producer (ring=%d, local=%d) not done "
+                        "[owner_task=0x%llx fanout=%u/%u]",
+                        (unsigned long long)TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id,
+                        (unsigned long long)owner.raw, refcount, needed
                     );
                     failed = true;
                     return;

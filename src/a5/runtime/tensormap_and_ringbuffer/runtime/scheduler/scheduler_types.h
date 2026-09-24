@@ -44,17 +44,11 @@
 
 constexpr int32_t MAX_AICPU_THREADS = PLATFORM_MAX_AICPU_THREADS;
 
-// Periodic cadence (in idle iterations) for emitting the per-thread STALL
-// diagnostic while no progress is being made. Purely an observability knob,
-// independent of the wall-clock timeout below: small enough to fire a few times
-// before the budget expires, large enough not to flood device_log.
-constexpr int32_t STALL_LOG_INTERVAL = 480000;
 constexpr int32_t FATAL_ERROR_CHECK_INTERVAL = 1024;  // Check orchestrator error every N idle iters
 
 // Wall-clock budget for declaring "no progress = scheduler timeout". Replaces
 // the per-thread iteration-count cap that once lived here as MAX_IDLE_ITERATIONS
-// for the fatal-latch decision; STALL_LOG_INTERVAL above keeps the per-thread
-// diagnostic cadence.
+// for the fatal-latch decision.
 //
 // Using wall-clock here is load-bearing for distributed runs: with per-thread
 // iteration counts, a pure-idle thread spinning ~115 ns/iter hits the cap in
@@ -75,16 +69,47 @@ constexpr int32_t STALL_DUMP_READY_MAX = 8;
 constexpr int32_t STALL_DUMP_WAIT_MAX = 4;
 constexpr int32_t STALL_DUMP_CORE_MAX = 8;
 
-// Which report a stall dump belongs to, and therefore what log level its lines
-// take. A periodic round fires every STALL_LOG_INTERVAL idle iterations on a run
-// that may still be making progress elsewhere, so it stays at INFO and is read by
-// raising the device log level. A shutdown snapshot fires once, on the run the
-// scheduler is about to kill, and carries the only record of what was still
-// pending — so it takes the level of the SHUTDOWN_SNAPSHOT line that announces it,
-// which the default device log level keeps.
+// Keep the existing dump-level selector even though TMR no longer schedules
+// periodic idle-loop dumps.
 enum class StallDumpReport : int32_t { Periodic, Shutdown };
 constexpr int32_t PROGRESS_VERBOSE_THRESHOLD = 10;  // log every completion for the first N tasks
 constexpr int32_t PROGRESS_LOG_INTERVAL = 250;      // log every N completions after threshold
+
+// Coordinates the half-timeout snapshot across scheduler threads. Progress
+// starts a new generation; exactly one thread may claim that generation for a
+// WARN snapshot. Keeping this independent from the final timeout latch avoids
+// changing the scheduler's existing per-thread hang decision.
+class StallWarningEpisode {
+public:
+    void reset() {
+        warned_generation_.store(0, std::memory_order_relaxed);
+        progress_generation_.store(1, std::memory_order_release);
+    }
+
+    uint64_t note_progress() { return progress_generation_.fetch_add(1, std::memory_order_acq_rel) + 1; }
+
+    uint64_t generation() const { return progress_generation_.load(std::memory_order_acquire); }
+
+    bool try_claim(uint64_t generation) {
+        if (progress_generation_.load(std::memory_order_acquire) != generation) return false;
+
+        uint64_t warned = warned_generation_.load(std::memory_order_relaxed);
+        while (warned < generation) {
+            if (warned_generation_.compare_exchange_weak(
+                    warned, generation, std::memory_order_acq_rel, std::memory_order_relaxed
+                )) {
+                // Progress racing the claim creates a new episode. Suppress the
+                // stale snapshot; the new generation remains independently claimable.
+                return progress_generation_.load(std::memory_order_acquire) == generation;
+            }
+        }
+        return false;
+    }
+
+private:
+    std::atomic<uint64_t> progress_generation_{1};
+    std::atomic<uint64_t> warned_generation_{0};
+};
 
 // =============================================================================
 // Control flow signal from cold-path helpers back to the main dispatch loop.

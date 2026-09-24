@@ -179,6 +179,7 @@ private:
     std::atomic<bool> orchestrator_done_{false};
     std::atomic<bool> completed_{false};
     std::atomic<bool> fatal_shutdown_started_{false};
+    StallWarningEpisode stall_warning_episode_;
     // Per-core retirement claim. The winner owns that core's register window
     // and return gate for the rest of the run; every other path leaves both
     // alone. Indexed by core id, reset in pre_handshake_init.
@@ -498,7 +499,8 @@ private:
     );
 
     __attribute__((noinline, cold)) void log_shutdown_stall_snapshot(
-        int32_t trigger_thread_idx, int32_t trigger_idle_iterations, int32_t trigger_last_progress_count
+        int32_t trigger_thread_idx, int32_t trigger_idle_iterations, int32_t trigger_last_progress_count,
+        const char *reason, StallDumpReport report = StallDumpReport::Shutdown
     );
 
     // Reverse lookup: given a global core_id, find which scheduler thread's
