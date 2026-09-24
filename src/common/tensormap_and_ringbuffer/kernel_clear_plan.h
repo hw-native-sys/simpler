@@ -11,7 +11,6 @@
 
 #pragma once
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -34,11 +33,6 @@ struct TmrKernelClearBinding {
     int32_t worker_count{0};
 };
 
-struct TmrKernelClearPlan {
-    uint64_t context_generation{0};
-    std::array<TmrClearRegion, 2> regions{};
-};
-
 inline bool valid_tmr_clear_binding(const TmrKernelClearBinding &binding) noexcept {
     if (binding.context_generation == 0 || binding.worker_count <= 0) return false;
     // A positive int32_t worker count times a 64-byte report fits uint64_t.
@@ -51,17 +45,6 @@ inline bool valid_tmr_clear_binding(const TmrKernelClearBinding &binding) noexce
     if (!valid_region(binding.control) || !valid_region(binding.reports)) return false;
     return binding.control.address + binding.control.bytes <= binding.reports.address ||
            binding.reports.address + binding.reports.bytes <= binding.control.address;
-}
-
-// The owner pins these regions and serializes invocations/replays before clear.
-// This plan performs no allocation, device access, or concurrency admission.
-inline bool build_tmr_kernel_clear_plan(const TmrKernelClearBinding &binding, TmrKernelClearPlan *out) noexcept {
-    if (out == nullptr || !valid_tmr_clear_binding(binding)) return false;
-    TmrKernelClearPlan candidate;
-    candidate.context_generation = binding.context_generation;
-    candidate.regions = {binding.control, binding.reports};
-    *out = candidate;
-    return true;
 }
 
 }  // namespace simpler::tmr

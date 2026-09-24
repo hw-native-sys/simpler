@@ -327,7 +327,7 @@ extern "C" int capture_observer_failure_reported() {
         read(&control, descriptor.control_address, sizeof(control)) != 0)
         return -2;
     if (control.completion != static_cast<uint32_t>(TmrCompletion::Complete) || control.runtime_status == 0 ||
-        control.cleanup_status != 0 || control.round_epoch == 0 || descriptor.worker_count <= 0) {
+        control.cleanup_status != 0 || descriptor.worker_count <= 0) {
         std::fprintf(
             stderr, "failure control: completion=%u runtime=%d cleanup=%d epoch=%" PRIu64 " workers=%d\n",
             control.completion, control.runtime_status, control.cleanup_status, control.round_epoch,

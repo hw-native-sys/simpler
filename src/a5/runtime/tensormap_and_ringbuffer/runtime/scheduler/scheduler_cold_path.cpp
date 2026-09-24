@@ -735,11 +735,20 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
         for (int32_t i = lo; i < hi; i++) {
             if (core_serviced[i]) continue;
             Handshake *hank = &all_handshakes[i];
-            if (hank->aicore_done == 0) {
+            const uint64_t report_epoch = reports_ != nullptr ? hank->report_epoch : 0;
+            if (reports_ != nullptr && report_epoch > expected_report_epoch_) {
+                handshake_failed_.store(true, std::memory_order_release);
+                return;
+            }
+            if (reports_ != nullptr ? report_epoch != expected_report_epoch_ : hank->aicore_done == 0) {
                 SPIN_WAIT_HINT();
                 continue;
             }
             rmb();
+            if (reports_ != nullptr && hank->aicore_done != static_cast<uint32_t>(i + 1)) {
+                handshake_failed_.store(true, std::memory_order_release);
+                return;
+            }
             uint32_t physical_core_id = hank->physical_core_id;
             if (physical_core_id >= max_physical_cores_count || regs[physical_core_id] == 0) {
                 LOG_ERROR(
@@ -840,11 +849,20 @@ void SchedulerContext::handshake_owned_clusters(Runtime *runtime, int32_t tidx, 
             int32_t i = owned[k];
             if (core_serviced[i]) continue;
             Handshake *hank = &all_handshakes[i];
-            if (hank->aicore_done == 0) {
+            const uint64_t report_epoch = reports_ != nullptr ? hank->report_epoch : 0;
+            if (reports_ != nullptr && report_epoch > expected_report_epoch_) {
+                handshake_failed_.store(true, std::memory_order_release);
+                return;
+            }
+            if (reports_ != nullptr ? report_epoch != expected_report_epoch_ : hank->aicore_done == 0) {
                 SPIN_WAIT_HINT();
                 continue;
             }
             rmb();
+            if (reports_ != nullptr && hank->aicore_done != static_cast<uint32_t>(i + 1)) {
+                handshake_failed_.store(true, std::memory_order_release);
+                return;
+            }
             uint32_t physical_core_id = hank->physical_core_id;
             if (physical_core_id >= max_physical_cores_count || regs[physical_core_id] == 0) {
                 LOG_ERROR(
@@ -1324,6 +1342,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime, simpler::tmr::Ca
 
 void SchedulerContext::deinit() {
     reports_ = nullptr;
+    expected_report_epoch_ = 0;
     // Reset all per-core execution state
     for (int32_t i = 0; i < RUNTIME_MAX_WORKER; i++) {
         core_exec_states_[i] = {};
