@@ -8,8 +8,16 @@ Host/sim UT 覆盖成功轮次累进、失败不推进及延迟旧报告；A2/A3
 通过，其中包含定向延迟 AICore 报告（AICore 被 gate 阻塞时直接确认旧 report 仍是 epoch 1，释放后
 第二轮推进到 epoch 2）、eager/capture 提交范围内零 memset 断言及成功轮之后故障不推进 epoch
 的观察。A5 对应测试代码已提供，observer 的 A5 编译和用例收集通过，但没有 A5
-silicon，故不报告为 onboard 通过。Program 两架构回归与性能比较尚未完成；不能由 task 数减少
-推定实际加速。
+silicon，故不报告为 onboard 通过。
+
+Program 模式 A2/A3 回归已完成：`available_aicore_counts`、`spmd_multiblock_mix`、
+`spmd_sync_start_mix_spill`、`sync_start_early_local_owner`、`spmd_sync_start_edge` 与
+`dummy_task` 全部通过，并另以 `SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE=1` 重跑一次覆盖
+`handshake_partition` 分支（现有 program ST 默认只走 `handshake_owned_clusters`）。A5 无硅片，未验证。
+
+性能方面，已实测 `aclrtMemsetAsync` 提交次数由上游基线的每次 launch 2 次降为 0 次；
+eager/replay 的 p50/p99 与 capture 图节点数仍未测量。**不能由 task 数减少推定实际加速** ——
+零 memset 版本让每个 AICore 多读一条共享 control cache line，净收益必须实测。
 
 ## 现有执行顺序与问题
 
