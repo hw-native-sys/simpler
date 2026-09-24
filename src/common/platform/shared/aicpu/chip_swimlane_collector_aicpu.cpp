@@ -1138,7 +1138,7 @@ static inline ChipSwimlaneAicpuSchedPhaseRecord *acquire_sched_phase_record(int 
 }
 
 static inline void fill_sched_phase_record(
-    ChipSwimlaneAicpuSchedPhaseRecord *record, ChipSwimlaneSchedPhaseKind kind, uint64_t start_time, uint64_t end_time,
+    ChipSwimlaneAicpuSchedPhaseRecord *record, SchedPhaseKind kind, uint64_t start_time, uint64_t end_time,
     uint32_t loop_iter, uint32_t tasks_processed, const int16_t *shared_at_start, const int16_t *shared_at_end
 ) {
     record->start_time = start_time;
@@ -1160,7 +1160,7 @@ static inline void fill_sched_phase_record(
 }
 
 void chip_swimlane_aicpu_record_sched_phase(
-    int thread_idx, ChipSwimlaneSchedPhaseKind kind, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
+    int thread_idx, SchedPhaseKind kind, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
     uint32_t tasks_processed, uint32_t pop_hit, uint32_t pop_miss, const int16_t *shared_at_start,
     const int16_t *shared_at_end
 ) {
@@ -1173,39 +1173,15 @@ void chip_swimlane_aicpu_record_sched_phase(
     record->phase_data.dispatch.pop_miss = pop_miss;
 }
 
-static void record_aicpu_worker_task(
-    int thread_idx, ChipSwimlaneSchedPhaseKind kind, uint64_t complete_time, uint32_t loop_iter, uint64_t task_id
+void chip_swimlane_aicpu_record_task_phase(
+    int thread_idx, SchedPhaseKind kind, uint64_t start_time, uint64_t end_time, uint32_t loop_iter, uint64_t task_id,
+    uint32_t tasks_processed
 ) {
     auto *record = acquire_sched_phase_record(thread_idx);
     if (record == nullptr) return;
     fill_sched_phase_record(
-        record, kind, complete_time, complete_time, loop_iter, /*tasks_processed=*/1, /*shared_at_start=*/nullptr,
+        record, kind, start_time, end_time, loop_iter, tasks_processed, /*shared_at_start=*/nullptr,
         /*shared_at_end=*/nullptr
-    );
-    record->phase_data.task_id = TaskId{task_id};
-}
-
-void chip_swimlane_aicpu_record_dummy_task(
-    int thread_idx, uint64_t complete_time, uint32_t loop_iter, uint64_t task_id
-) {
-    record_aicpu_worker_task(thread_idx, ChipSwimlaneSchedPhaseKind::DummyTask, complete_time, loop_iter, task_id);
-}
-
-void chip_swimlane_aicpu_record_predicated_skip(
-    int thread_idx, uint64_t complete_time, uint32_t loop_iter, uint64_t task_id
-) {
-    record_aicpu_worker_task(thread_idx, ChipSwimlaneSchedPhaseKind::PredicatedSkip, complete_time, loop_iter, task_id);
-}
-
-void chip_swimlane_aicpu_record_graph_prepare(
-    int thread_idx, uint64_t start_time, uint64_t end_time, uint32_t loop_iter, uint64_t task_id,
-    uint32_t tasks_materialized
-) {
-    auto *record = acquire_sched_phase_record(thread_idx);
-    if (record == nullptr) return;
-    fill_sched_phase_record(
-        record, ChipSwimlaneSchedPhaseKind::GraphPrepare, start_time, end_time, loop_iter, tasks_materialized,
-        /*shared_at_start=*/nullptr, /*shared_at_end=*/nullptr
     );
     record->phase_data.task_id = TaskId{task_id};
 }

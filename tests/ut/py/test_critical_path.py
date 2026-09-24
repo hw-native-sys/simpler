@@ -11,7 +11,7 @@
 import json
 
 from simpler_setup.tools import critical_path
-from simpler_setup.tools.swimlane_converter import TMR_RUNTIME
+from simpler_setup.tools._runtime_dispatch import TMR_RUNTIME
 
 
 def _write_rank_artifacts(rank_dir, name_map_filename):

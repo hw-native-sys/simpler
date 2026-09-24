@@ -1487,17 +1487,12 @@ def _plot_case_scope_stats(case_label: str, output_prefix: Path) -> None:
         logger.warning(f"[{case_label}] {jsonl_file} not produced; skipping scope_stats plot")
         return
 
-    import sys  # noqa: PLC0415
-    from pathlib import Path as _Path  # noqa: PLC0415
+    # Imported directly rather than through _runtime_dispatch.get(): scope_stats.jsonl
+    # has exactly one possible producer (tmr's ring-based scheduler; hbg has no ring
+    # concept for this to measure), so there is no dispatch decision to make here.
+    from .tools.tmr import scope_stats_plot  # noqa: PLC0415
 
-    tools_dir = _Path(__file__).resolve().parent / "tools"
-    sys.path.insert(0, str(tools_dir))
-    try:
-        import scope_stats_plot  # noqa: PLC0415
-
-        scope_stats_plot.process(jsonl_file)
-    finally:
-        sys.path.remove(str(tools_dir))
+    scope_stats_plot.process(jsonl_file)
 
 
 def finalize_diagnostic_outputs(

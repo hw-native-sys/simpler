@@ -17,6 +17,14 @@ Invoke via ``python -m simpler_setup.tools.<name>``:
 - ``wait_reduction_sim``   : deps.json -> bounded-bitmap WAIT reduction coverage vs full-DAG bound
 - ``dump_viewer``           : inspect args dumps
 - ``strace_timing``         : per-stage / per-round timing from [STRACE] log markers
-- ``hbg_bind_phases``       : per-segment host_build_graph bind statistics from the chip.run.bind.* spans
+- ``hbg.bind_phases``       : per-segment host_build_graph bind statistics from the chip.run.bind.* spans
 - ``phase_time_split``      : the same segments split into on-CPU and off-CPU, from per-thread CPU clocks
+
+``hbg/`` and ``tmr/`` are not CLIs but the two runtimes' private DFX vocabularies --
+each holds its own TaskId layout, phase set, label style and the lanes only it draws.
+A task id or a phase name carries no mark of which runtime produced it, so the common
+tools above resolve the runtime a document names and ask ``_runtime_dispatch.get()``
+for the implementation rather than importing either package directly. A tool that
+belongs wholly to one runtime lives inside it (``hbg.bind_phases``,
+``tmr.scope_stats_plot``).
 """

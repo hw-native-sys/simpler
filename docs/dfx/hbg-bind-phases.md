@@ -15,7 +15,7 @@ see [host_build_graph's profiling levels](../../src/a2a3/runtime/host_build_grap
 **A new lesson about measuring these phases belongs on this page.** The
 [`hbg-bind-phases`](../../.claude/skills/hbg-bind-phases/SKILL.md) skill holds the
 invocation and nothing else — it is loaded into context on every use — and
-[`hbg_bind_phases`](../../simpler_setup/tools/hbg_bind_phases.py) gets a comment
+[`hbg_bind_phases`](../../simpler_setup/tools/hbg/bind_phases.py) gets a comment
 only once the lesson is an invariant its code depends on.
 
 ## What the segments are
@@ -120,7 +120,7 @@ table — a bind's `host_orch` and `graph_upload` spans carry both.
 
 The ready-made invocation for either case lives in the
 [`hbg-bind-phases`](../../.claude/skills/hbg-bind-phases/SKILL.md) skill;
-`python -m simpler_setup.tools.hbg_bind_phases <log>` turns its log into
+`python -m simpler_setup.tools.hbg.bind_phases <log>` turns its log into
 per-segment statistics. This section is what the switches mean and why the traps
 below exist.
 

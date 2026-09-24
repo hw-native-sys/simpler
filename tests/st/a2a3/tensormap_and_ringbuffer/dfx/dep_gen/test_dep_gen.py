@@ -40,16 +40,20 @@ from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 from simpler_setup.scene_test import _outputs_dir, _sanitize_for_filename
+from simpler_setup.tools.tmr import TaskId
 
 KERNELS_BASE = "../../../../../../examples/a2a3/tensormap_and_ringbuffer/vector_example/kernels"
 
 
 def _task_id(ring: int, local: int) -> int:
-    """Encode (ring_id, local_id) → 64-bit raw matching ``TaskId::raw`` —
-    keeps the bit layout (``(ring << 32) | local``) in one place rather than
-    repeating ``1 << 32`` arithmetic at every call site.
+    """Encode (ring_id, local_id) → 64-bit raw matching ``TaskId::raw``.
+
+    The shift comes from ``tmr.TaskId``, which is the Python-side source of truth
+    for this runtime's layout. Restating it here as a literal would make this file a
+    second place the layout is declared, and a ring widened in task_id.h would leave
+    the two disagreeing with nothing to catch it.
     """
-    return (ring << 32) | local
+    return (ring << TaskId.RING_SHIFT) | local
 
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")

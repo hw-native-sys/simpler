@@ -28,10 +28,10 @@ from collections import defaultdict
 from pathlib import Path
 
 import pytest
+from _capture_builder import Capture
 
+from simpler_setup.tools._runtime_dispatch import HBG_RUNTIME, TMR_RUNTIME
 from simpler_setup.tools.swimlane_converter import (
-    HBG_RUNTIME,
-    TMR_RUNTIME,
     generate_chrome_trace_json,
     read_perf_data,
 )
@@ -150,54 +150,20 @@ def test_every_exported_row_carries_an_epoch(tmp_path, arch, runtime):
         assert row[4] in (7, 8)
 
 
-def _single_run_payload(aicore_rows, scheduler_rows):
-    return {
-        "chip_swimlane_level": 2,
-        "metadata": {
-            "runtime": TMR_RUNTIME,
-            "clock_freq_hz": 50_000_000,
-            "num_cores": 1,
-            "core_types": ["aiv"],
-        },
-        "aicore_tasks": aicore_rows,
-        "scheduler_tasks": {
-            "producer": "aicpu",
-            "records": scheduler_rows,
-        },
-    }
-
-
-def test_legacy_capture_without_identity_parses_as_one_run(tmp_path):
-    """A pre-identity file keeps its old single-run meaning and gains no fake epoch.
-
-    Six-column AICore rows and four-column scheduler rows carry no identity at
-    all. The parser reports that absence as ``None``; coercing it to 0 would be
-    wrong because 0 is an epoch a device can really be given, so a legacy file
-    would then claim to be run 0.
-    """
-    payload = _single_run_payload(
-        [[0, 0x101, 1, 1010, 1015, 2], [0, 0x102, 2, 1020, 1025, 2]],
-        [[0, 1, 1006, 1017], [0, 2, 1016, 1027]],
-    )
-    path = tmp_path / "legacy.json"
-    path.write_text(json.dumps(payload))
-
-    tasks = read_perf_data(path)["tasks"]
-    assert len(tasks) == 2
-    assert {t["run_epoch"] for t in tasks} == {None}, "a legacy capture was given a fabricated epoch"
-    assert sorted(t["task_id"] for t in tasks) == [0x101, 0x102]
-
-
 def test_duplicate_identity_within_one_run_is_still_an_error(tmp_path):
     """The negative control: the epoch widens the key, it does not soften it.
 
     Two rows with the same (run_epoch, core_id, reg_task_id) are a real defect —
     one dispatch recorded twice — and must not be silently deduplicated just
-    because the key now has three components.
+    because the key now has three components. Pinning reg_task_id is what makes
+    the collision expressible; the builder otherwise hands out distinct ones.
     """
-    payload = _single_run_payload(
-        [[0, 0x101, 1, 1010, 1015, 2, 7], [0, 0x999, 1, 1030, 1035, 2, 7]],
-        [[0, 1, 1006, 1017, 7]],
+    payload = (
+        Capture(runtime=TMR_RUNTIME)
+        .aicore_task(task_id=0x101, start=1010, end=1015, receive_to_start=2, run_epoch=7, reg_task_id=1)
+        .aicore_task(task_id=0x999, start=1030, end=1035, receive_to_start=2, run_epoch=7, reg_task_id=1)
+        .scheduler_task(reg_task_id=1, dispatch=1006, finish=1017, run_epoch=7)
+        .build()
     )
     path = tmp_path / "dup.json"
     path.write_text(json.dumps(payload))
@@ -208,9 +174,29 @@ def test_duplicate_identity_within_one_run_is_still_an_error(tmp_path):
 
 def test_same_ids_in_different_runs_are_not_a_duplicate(tmp_path):
     """The other half of that control: the identical key in two runs is legal."""
-    payload = _single_run_payload(
-        [[0, 0x101, 1, 1010, 1015, 2, 7], [0, 0x101, 1, 9010, 9015, 2, 8]],
-        [[0, 1, 1006, 1017, 7], [0, 1, 9006, 9017, 8]],
+    payload = (
+        Capture(runtime=TMR_RUNTIME)
+        .task(
+            task_id=0x101,
+            start=1010,
+            end=1015,
+            dispatch=1006,
+            finish=1017,
+            receive_to_start=2,
+            run_epoch=7,
+            reg_task_id=1,
+        )
+        .task(
+            task_id=0x101,
+            start=9010,
+            end=9015,
+            dispatch=9006,
+            finish=9017,
+            receive_to_start=2,
+            run_epoch=8,
+            reg_task_id=1,
+        )
+        .build()
     )
     path = tmp_path / "two_runs.json"
     path.write_text(json.dumps(payload))

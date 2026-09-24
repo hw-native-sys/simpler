@@ -87,7 +87,7 @@ constexpr const char *kGoldenArtifact = R"GOLDEN({
     "streams": [
       {"platform": "a2a3", "producer": "aicpu", "scheduler_id": 0, "worker_id": 0, "core_type": "aicpu", "physical_core_id": null, "capture": {"committed": 2, "dropped": 5, "truncated": true}, "records": [
         {"start_cycles": 2000, "end_cycles": 2100, "run_epoch": 7700, "loop_iter": 0, "kind": "dispatch", "tasks_processed": 1, "task_id": null},
-        {"start_cycles": 2001, "end_cycles": 2101, "run_epoch": 7700, "loop_iter": 1, "kind": "dummy_task", "tasks_processed": 2, "task_id": 20816}
+        {"start_cycles": 2001, "end_cycles": 2101, "run_epoch": 7700, "loop_iter": 1, "kind": "<TASK_ID_PHASE>", "tasks_processed": 2, "task_id": 20816}
       ], "metrics": [
         {"record_index": 0, "pop_hit": 3, "pop_miss": 4, "shared_at_start": [1,2,3], "shared_at_end": [2,3,4]},
         {"record_index": 1, "shared_at_start": [1,2,3], "shared_at_end": [2,3,4]}

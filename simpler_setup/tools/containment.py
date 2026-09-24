@@ -79,8 +79,12 @@ _CAPTURE_IDENTITY_FIELDS = ("run_id", "endpoint_dispatch_id", "pipeline_slot", "
 # `sched` brackets the whole scheduler dispatch window and its record stream
 # covers nearly all of it, while the orchestrator's per-submit records occupy
 # only part of `orch`.
+#
+# `sched` carries no document key: its bounds come from the scheduler streams, read
+# per producer because only the AICPU's bound that window, so the loop below answers
+# it directly instead of looking a key up.
 _JOIN_STREAMS = (
-    ("sched", "aicpu_scheduler_phases"),
+    ("sched", None),
     ("orch", "aicpu_orchestrator_phases"),
 )
 
@@ -372,10 +376,13 @@ def _stream_bounds(data, stream):
 
 
 def _scheduler_phase_streams(data):
-    """Yield (producer, records), preferring the structured stream format."""
+    """Yield (producer, records) for each scheduler stream the capture holds.
+
+    A capture below the level that records phases has no ``scheduler_records``
+    section at all, which is no streams rather than an error.
+    """
     section = data.get("scheduler_records")
     if section is None:
-        yield "aicpu", list(_phase_records(data.get("aicpu_scheduler_phases")))
         return
     if not isinstance(section, dict):
         raise ContainmentError("scheduler_records must be an object")
@@ -408,12 +415,10 @@ def capture_windows(data):
     cycles = []
     for row in data.get("aicore_tasks") or []:
         start_cycles, end_cycles = int(row[3]), int(row[4])
-        # A v3 row's bar opens at its receive time, which is earlier than the
-        # kernel start by `receive_to_start_cycles` (v2 rows have no column 5).
-        receive_to_start_cycles = int(row[5]) if len(row) > 5 else 0
+        # The bar opens at the task's receive time, which is earlier than the
+        # kernel start by receive_to_start_cycles.
+        receive_to_start_cycles = int(row[5])
         cycles.extend((start_cycles - receive_to_start_cycles, start_cycles, end_cycles))
-    for row in data.get("aicpu_tasks") or []:
-        cycles.extend(int(value) for value in row[2:4])
     scheduler_tasks = data.get("scheduler_tasks") or {}
     for row in scheduler_tasks.get("records") or []:
         cycles.extend(int(value) for value in row[2:4])

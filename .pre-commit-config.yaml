@@ -54,6 +54,29 @@ repos:
           language_version: python3
           files: ^tests/ut/cpp/.*\.cpp$
 
+        # Every DFX tool, plus the scene tests that read their output.
+        # tools/{hbg,tmr}/ are excluded: each owns one runtime's layout, and stating
+        # it is their whole job.
+        #
+        # tests/st/**/dfx/ is covered whole rather than by one validator's name: a
+        # dep_gen scene test builds task ids for the same tools to read, so it is
+        # subject to the same rule.
+        #
+        # tests/ut/py/ is not covered, and the reason is its contents rather than
+        # its role: it is the home of every Python unit test, so the patterns here
+        # would also match an ELF section offset, a ctypes bit pattern and an ABI
+        # magic-number splice -- none of them task ids. A hook that reports those
+        # gets switched off. Nothing there needs covering either: no test states a
+        # task_id layout, because tests/ut/py/_task_ids.py mints ids through each
+        # runtime's own mirror under tools/{hbg,tmr}/, where the layout is declared.
+        - id: check-task-id-bits
+          name: check-task-id-bits
+          entry: python tests/lint/check_task_id_bits.py
+          language: python
+          language_version: python3
+          files: ^(simpler_setup/tools/.*\.py|tests/st/.*/dfx/.*\.py)$
+          exclude: ^simpler_setup/tools/(hbg|tmr)/
+
     - repo: https://github.com/pre-commit/pre-commit-hooks
       rev: v4.6.0
       hooks:

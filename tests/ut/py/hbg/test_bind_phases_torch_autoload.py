@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import sys
 
-from simpler_setup.tools import hbg_bind_phases
+from simpler_setup.tools.hbg import bind_phases
 
 
 def _span(pid: int, inv: int, phase: str, ts: int, dur_ns: int) -> str:
@@ -47,7 +47,7 @@ def test_report_shows_each_torch_autoload_state(tmp_path, monkeypatch, capsys):
     _write_log(log, (first, first, second))
     monkeypatch.setattr(sys, "argv", ["hbg_bind_phases", str(log)])
 
-    assert hbg_bind_phases.main() == 0
+    assert bind_phases.main() == 0
 
     output = capsys.readouterr().out
     assert output.count(first) == 1
@@ -59,7 +59,7 @@ def test_report_warns_when_torch_autoload_state_is_missing(tmp_path, monkeypatch
     _write_log(log, ())
     monkeypatch.setattr(sys, "argv", ["hbg_bind_phases", str(log)])
 
-    assert hbg_bind_phases.main() == 0
+    assert bind_phases.main() == 0
 
     output = capsys.readouterr().out
     assert "no `torch_backend_autoload` record" in output
@@ -71,4 +71,4 @@ def test_parser_accepts_record_without_raw_fields(tmp_path):
     record = "torch_backend_autoload setting=0 effective=disabled torch_imported=true torch_npu_loaded=false"
     _write_log(log, (record,))
 
-    assert hbg_bind_phases.parse_torch_autoload([log]) == [record]
+    assert bind_phases.parse_torch_autoload([log]) == [record]

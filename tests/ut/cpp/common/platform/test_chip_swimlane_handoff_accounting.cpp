@@ -103,7 +103,7 @@ void complete_aicpu_tasks(int core_id, int records) {
 void record_sched_phases(int thread_idx, int records) {
     for (int i = 0; i < records; i++) {
         chip_swimlane_aicpu_record_sched_phase(
-            thread_idx, ChipSwimlaneSchedPhaseKind::Dispatch, /*start_time=*/100 + i, /*end_time=*/200 + i,
+            thread_idx, SchedPhaseKind::Dispatch, /*start_time=*/100 + i, /*end_time=*/200 + i,
             /*loop_iter=*/static_cast<uint32_t>(i), /*tasks_processed=*/1
         );
     }

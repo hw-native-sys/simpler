@@ -103,7 +103,7 @@ per-event artifact a directory; `--enable-chip-swimlane` raises
 
 ```bash
 # numbers — the segment spans are in $LOG, since no diagnostic flag is on
-python -m simpler_setup.tools.hbg_bind_phases "$LOG"
+python -m simpler_setup.tools.hbg.bind_phases "$LOG"
 
 # timeline — only an artifact newer than this run's own marker counts
 RECORDS=$(find outputs -name host_phase_records.jsonl -newer "$MARK")

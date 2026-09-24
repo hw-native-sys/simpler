@@ -45,10 +45,13 @@ that loads directly in Perfetto. For the scheduler-overhead deep-dive, capture
   `chip_swimlane_records.json` with `deps.json` from
   [`dep_gen`](dep-gen.md) at post-process time; see
   [§3.5](#35-dependency-arrows-from-dep_gen).
-- **Scheduler phases** — producer-specific per-iteration breakdown. AICPU uses mutually
-  time-exclusive **outer** phases (`complete` / `async_poll` / `dispatch` /
-  `release` / `dummy` / `early_dispatch` / `drain` / `graph_prepare`), plus
-  nested phases.
+- **Scheduler phases** — producer-specific per-iteration breakdown, and
+  **each runtime has its own vocabulary**: a name both emit is two phases that
+  share a label, not one shared phase. See
+  `src/common/{host_build_graph,tensormap_and_ringbuffer}/sched_phase_kind.h`.
+  Mutually time-exclusive **outer** phases common to both are `complete` /
+  `async_poll` / `dispatch` / `dummy` / `early_dispatch` / `drain`; `graph_prepare`
+  is `host_build_graph`'s alone and `release` is `tensormap_and_ringbuffer`'s.
   In `tensormap_and_ringbuffer`, `resolve` is nested within `complete` or
   `dummy`; in `host_build_graph`, `resolve_standalone`, `async_poll`, and
   `dummy` are standalone, mutually exclusive phases on the dedicated P
@@ -66,15 +69,19 @@ that loads directly in Perfetto. For the scheduler-overhead deep-dive, capture
   true follows the ordinary task timing path with no special argument. The
   source `predicated_skip` phase remains in `chip_swimlane_records.json` and is
   not copied into the merged Worker View event's arguments.
-  `dummy_task` is emitted by both a2a3 runtimes and by a5
-  `tensormap_and_ringbuffer`; `predicated_skip` is emitted by the a2a3 and a5
-  `tensormap_and_ringbuffer` runtimes, where predicated dispatch is
-  implemented. a5 `host_build_graph` has no dummy-task phase path. Idle
-  iterations no longer emit a record on a2a3; the host tooling reconstructs
-  idle spans from the gap between consecutive work records on the same thread.
-  See §3.2 for the full per-phase table. Legacy captures may carry `scan` /
-  `poll` / `idle` / `fanout` / `prestage` — current a2a3 builds no longer
-  emit them (PR #1079's Scan/Poll debug overlay was removed;
+  **Both markers belong to `tensormap_and_ringbuffer` alone** — on a2a3 and a5
+  alike — because only that scheduler records each drained task's identity;
+  `host_build_graph` routes dependency-only tasks through the same dummy queue
+  but records only the aggregate `dummy` phase for the drain pass. (Its
+  `rt_submit_dummy_task` is an orchestration entry point for submitting such a
+  task, not a swimlane phase.) `idle` is a **measured** record on a5
+  `host_build_graph`, whose AICore scheduler publishes a `SchedulerIdleRecord`
+  per spin; no AICPU scheduler emits one, so for those the host tooling
+  reconstructs idle spans from the gap between consecutive work records on the
+  same thread.
+  See §3.2 for the full per-phase table. The retired names `scan` / `poll` /
+  `fanout` / `prestage` are in no runtime's vocabulary and are dropped rather
+  than drawn (PR #1079's Scan/Poll debug overlay was removed;
   Fanout was renamed Resolve and now also filters out <1 µs walks;
   Prestage was renamed EarlyDispatch).
   A5 `host_build_graph` uses the AICore Scheduler as the producer and emits one
@@ -379,23 +386,23 @@ because `core_id, reg_task_id` alone is unique only *within* a run:
 `reg_task_id` restarts at 0 every run, and a graph re-executed later reuses
 its task ids. AICore is the
 canonical producer of `task_token_raw`; the Scheduler producer stamps the
-dispatch / finish timestamps and the per-core join token. Archived raw files
-with the former `aicpu_tasks` array remain readable as `producer: "aicpu"`.
-
-Captures written before run identity existed — `aicore_tasks` rows of five or
-six columns, four-column `scheduler_tasks` rows, phase records without
-`run_epoch` — still read, with `run_epoch` parsed as `None`, meaning "this file
-recorded no identity". It is deliberately not `0`: that is an epoch a device can
-really be given, so defaulting to it would let a legacy capture collide with a
-real run.
+dispatch / finish timestamps and the per-core join token.
 
 These artifacts carry no schema version. They are written by platform C++ in
 this repo and read by `swimlane_converter.py` from the same checkout and the
 same build, so a declared number could never disagree with the rows it
 describes — and a producer wrong about its own rows would stamp a wrong number
-too. Readers therefore key off the data: row width, and whether a phase record
-carries `run_epoch`. What *is* enforced is consistency within one stream, since
-a producer disagreeing with itself is the real defect.
+too. The reader therefore requires the shape those producers write: seven-column
+`aicore_tasks` rows, five-column `scheduler_tasks` rows, and a `run_epoch` on
+every phase record. A row of any other width is a producer this reader does not
+read, which is the real defect rather than an older file.
+
+**A capture taken before the run-identity writers landed (#2293, #2298) is not
+supported and there is no conversion path.** Those writers added the trailing
+`run_epoch` column to both task streams and the field to every phase record, so a
+capture from before them is rejected outright rather than read with the field
+missing. Re-capture with a current build; a saved artifact from an earlier one is
+readable only by the checkout that wrote it.
 
 #### Reader output (µs domain)
 
@@ -431,10 +438,8 @@ Note: per-task records carry **no** fanout edges. Dependency arrows
 come from a separate `deps.json` (dep_gen) joined at convert time —
 see [§3.5](#35-dependency-arrows-from-dep_gen).
 
-Phase records (per Scheduler stream, level >= 3 in raw
-`scheduler_records`—also exposed through the legacy reader alias
-`aicpu_scheduler_phases`—and level >= 4 for
-`aicpu_orchestrator_phases[]`):
+Phase records (per Scheduler stream, level >= 3 in `scheduler_records`,
+and level >= 4 for `aicpu_orchestrator_phases[]`):
 
 On disk, `streams[]` carries only the Schedulers that recorded something — a
 thread that stayed idle is omitted rather than written as an empty stream. In the
@@ -448,7 +453,7 @@ position, and keep the parallel `scheduler_streams` metadata list aligned to it.
 | Field | Meaning |
 | ----- | ------- |
 | `start_time_us` / `end_time_us` | Phase start / end timestamps in microseconds (reader-side cycle→µs conversion) |
-| `phase` | Lowercase phase name. Scheduler: see the table below. Orchestrator: `orch_submit` — one record per `submit_task()` / `alloc_tensors()` call spanning its full `[start, end]` window. Legacy per-sub-step strings (`orch_sync` / `orch_alloc` / `orch_params` / `orch_lookup` / `orch_insert` / `orch_fanin`) may appear in old captures. |
+| `phase` | Lowercase phase name. Scheduler: see the table below. Orchestrator: `orch_submit` — one record per `submit_task()` / `alloc_tensors()` call spanning its full `[start, end]` window. |
 | `loop_iter` (scheduler) / `submit_idx` (orchestrator) | Iteration / submit-call counter for the producing thread |
 | `tasks_processed` (scheduler) | Number of tasks or blocks handled by the phase; `dummy_task` and `predicated_skip` record one task |
 | `task_id` | Full runtime task id on orchestrator records, A5 HBG AICore Scheduler task phases, and scheduler `dummy_task` / `predicated_skip` records |
@@ -514,8 +519,10 @@ mode is not Refill; a completed Slot reused for a replacement task remains
 Refill regardless of its Ready source. A Ready-Inbox replacement retains its
 StateProbe, while a `DIRECT_RESOLVE` replacement proceeds directly from
 Resolve to Refill without one. The steal operation itself is included in
-StateProbe. The older `fanin`, `ready_claim`, `ready_steal`, and
-`direct_refill` records remain accepted only for existing captures.
+StateProbe. The `ready_claim`, `ready_steal` and `direct_refill` names were
+emitted by this scheduler between #2104 and #2178; no current scheduler emits
+them and nothing reads them. `fanin` names a host-side orchestration step, not a
+scheduler phase, and has never appeared in this stream.
 
 Task-bound A5 HBG Scheduler bars use the runtime task identity in their label,
 for example `StateProbe(t23)` and `Dispatch(t23)`. Bootstrap and Idle have no
@@ -544,10 +551,12 @@ The converter still emits the record's real `shared_at_end` snapshot on the
 global ready-queue counter track; only the aggregate's start-side metadata has
 the synthesized-timestamp caveat.
 
-Legacy phases (`scan` / `poll` / `idle` / `fanout` / `prestage`)
-are still parsed for old captures but current a2a3/a5 builds no
-longer emit them. Renames: `fanout` → `resolve`, `prestage` →
+Retired phase names (`scan` / `poll` / `fanout` / `prestage`) are in no
+runtime's vocabulary and nothing reads them: a record carrying one is dropped
+rather than drawn. Renames: `fanout` → `resolve`, `prestage` →
 `early_dispatch`. Removed: Scan/Poll (PR #1079 debug overlay).
+`idle` is **not** among them — a5 `host_build_graph`'s AICore scheduler emits it
+as a measured record (see §2).
 
 On disk the sched records carry a `kind` field (string-encoded
 phase name); the reader renames it to `phase` so downstream code
@@ -1177,13 +1186,15 @@ Both architectures use split phase streams:
 - `ChipSwimlaneAicpuSchedPhaseRecord` (64 B) — one record per **emitted
   phase**, not per scheduler iteration: a single iteration routinely emits
   several (e.g. Complete, AsyncPoll, Dispatch, Release, plus Resolve).
-  `ChipSwimlaneSchedPhaseKind` spans the outer phases
-  (Complete, Dispatch, Release, Dummy, EarlyDispatch, AsyncPoll, Drain,
-  GraphPrepare, ResolveStandalone), TMR's inner Resolve, the inner drain phases
-  (DrainPrepare, DrainPublish), and
-  the separate-lane markers (DummyTask, PredicatedSkip) — see §3.2 for how
-  each is rendered. Carries loop_iter + tasks_processed + pop_hit /
-  pop_miss deltas and queue-depth snapshots.
+  Its `kind` field is a `SchedPhaseKind`, and **each runtime has its own**
+  (`src/common/host_build_graph/sched_phase_kind.h`,
+  `src/common/tensormap_and_ringbuffer/sched_phase_kind.h`) — two distinct types
+  in distinct namespaces, numbered independently, so the same value means
+  different things on the two sides and nothing compares one against the other.
+  A translation unit reaches exactly one of them; a build touching both fails on
+  the trailing using-declaration rather than silently binding to whichever came
+  first. See §3.2 for how each phase is rendered. Carries loop_iter +
+  tasks_processed + pop_hit / pop_miss deltas and queue-depth snapshots.
 - `ChipSwimlaneAicpuOrchPhaseRecord` (32 B) — per-submit orchestrator
   envelope; task_id + submit_idx + start/end.
 

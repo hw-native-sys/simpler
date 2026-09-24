@@ -964,8 +964,8 @@ int32_t SchedulerContext::run_resolution_thread(Runtime *runtime, int32_t thread
     chip_swimlane.chip_swimlane_enabled = (chip_swimlane_level_ != ChipSwimlaneLevel::DISABLED);
 
     const bool record_sched_phases = chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES;
-    auto record_p_phase = [&](ChipSwimlaneSchedPhaseKind kind, uint64_t start_time, uint64_t end_time,
-                              uint32_t tasks_processed, const int16_t shared_at_start[CHIP_SWIMLANE_NUM_QUEUE_SHAPES]) {
+    auto record_p_phase = [&](SchedPhaseKind kind, uint64_t start_time, uint64_t end_time, uint32_t tasks_processed,
+                              const int16_t shared_at_start[CHIP_SWIMLANE_NUM_QUEUE_SHAPES]) {
         int16_t shared_at_end[CHIP_SWIMLANE_NUM_QUEUE_SHAPES];
         capture_shared_ready_depth(sched_, shared_at_end);
         chip_swimlane_aicpu_record_sched_phase(
@@ -983,7 +983,7 @@ int32_t SchedulerContext::run_resolution_thread(Runtime *runtime, int32_t thread
         // spin iteration.
         const simpler::hbg::AsyncPollPhaseSummary summary = async_poll_phase.flush(end_time);
         record_p_phase(
-            ChipSwimlaneSchedPhaseKind::AsyncPoll, summary.start_time, summary.end_time, summary.resolved,
+            SchedPhaseKind::AsyncPoll, summary.start_time, summary.end_time, summary.resolved,
             async_poll_shared_at_start
         );
     };
@@ -1043,7 +1043,7 @@ int32_t SchedulerContext::run_resolution_thread(Runtime *runtime, int32_t thread
 #if SIMPLER_DFX
         if (resolve_t0 != 0) {
             record_p_phase(
-                ChipSwimlaneSchedPhaseKind::ResolveStandalone, resolve_t0, get_sys_cnt_aicpu(), resolve_count,
+                SchedPhaseKind::ResolveStandalone, resolve_t0, get_sys_cnt_aicpu(), resolve_count,
                 resolve_shared_at_start
             );
         }
@@ -1135,7 +1135,7 @@ int32_t SchedulerContext::run_resolution_thread(Runtime *runtime, int32_t thread
 #if SIMPLER_DFX
             if (dummy_t0 != 0) {
                 record_p_phase(
-                    ChipSwimlaneSchedPhaseKind::Dummy, dummy_t0, get_sys_cnt_aicpu(), dummy_count, dummy_shared_at_start
+                    SchedPhaseKind::Dummy, dummy_t0, get_sys_cnt_aicpu(), dummy_count, dummy_shared_at_start
                 );
             }
 #endif
@@ -1400,7 +1400,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 int16_t phase_end_shared[CHIP_SWIMLANE_NUM_QUEUE_SHAPES];
                 capture_phase_end_fresh(phase_end_shared);
                 chip_swimlane_aicpu_record_sched_phase(
-                    thread_idx, ChipSwimlaneSchedPhaseKind::Complete, _t0_phase, _t1, chip_swimlane.sched_loop_count,
+                    thread_idx, SchedPhaseKind::Complete, _t0_phase, _t1, chip_swimlane.sched_loop_count,
                     chip_swimlane.phase_complete_count + chip_swimlane.phase_subretire_count, /*pop_hit=*/0,
                     /*pop_miss=*/0, phase_start_shared, phase_end_shared
                 );
@@ -1431,8 +1431,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             // would otherwise clutter the lane with zero-work drain(0) bars.
             if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES && drain_stage_wall != 0) {
                 chip_swimlane_aicpu_record_sched_phase(
-                    thread_idx, ChipSwimlaneSchedPhaseKind::Drain, drain_t0, get_sys_cnt_aicpu(),
-                    chip_swimlane.sched_loop_count, static_cast<uint32_t>(drain_stage_wall)
+                    thread_idx, SchedPhaseKind::Drain, drain_t0, get_sys_cnt_aicpu(), chip_swimlane.sched_loop_count,
+                    static_cast<uint32_t>(drain_stage_wall)
                 );
             }
 #else
@@ -1485,9 +1485,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #if SIMPLER_DFX
                 if (graph_prepare_t0 != 0) {
                     uint64_t graph_prepare_t1 = get_sys_cnt_aicpu();
-                    chip_swimlane_aicpu_record_graph_prepare(
-                        thread_idx, graph_prepare_t0, graph_prepare_t1, chip_swimlane.sched_loop_count, prepare_task_id,
-                        static_cast<uint32_t>(tasks_materialized)
+                    chip_swimlane_aicpu_record_task_phase(
+                        thread_idx, SchedPhaseKind::GraphPrepare, graph_prepare_t0, graph_prepare_t1,
+                        chip_swimlane.sched_loop_count, prepare_task_id, static_cast<uint32_t>(tasks_materialized)
                     );
                     _t0_phase = graph_prepare_t1;
                 }
@@ -1520,10 +1520,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             int16_t phase_end_shared[CHIP_SWIMLANE_NUM_QUEUE_SHAPES];
             capture_phase_end(phase_end_shared);
             chip_swimlane_aicpu_record_sched_phase(
-                thread_idx, ChipSwimlaneSchedPhaseKind::Dispatch, _t0_phase, dispatch_t1,
-                chip_swimlane.sched_loop_count, chip_swimlane.phase_dispatch_count,
-                static_cast<uint32_t>(pop_hit_delta), static_cast<uint32_t>(pop_miss_delta), phase_start_shared,
-                phase_end_shared
+                thread_idx, SchedPhaseKind::Dispatch, _t0_phase, dispatch_t1, chip_swimlane.sched_loop_count,
+                chip_swimlane.phase_dispatch_count, static_cast<uint32_t>(pop_hit_delta),
+                static_cast<uint32_t>(pop_miss_delta), phase_start_shared, phase_end_shared
             );
             for (int s = 0; s < CHIP_SWIMLANE_NUM_QUEUE_SHAPES; s++) {
                 phase_start_shared[s] = phase_end_shared[s];
@@ -1552,7 +1551,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         if (early_dispatch_record && staged_count > 0) {
             uint64_t early_dispatch_t1 = get_sys_cnt_aicpu();
             chip_swimlane_aicpu_record_sched_phase(
-                thread_idx, ChipSwimlaneSchedPhaseKind::EarlyDispatch, early_dispatch_t0, early_dispatch_t1,
+                thread_idx, SchedPhaseKind::EarlyDispatch, early_dispatch_t0, early_dispatch_t1,
                 sched_chip_swimlane_[thread_idx].sched_loop_count, static_cast<uint32_t>(staged_count)
             );
             // prepare_block_for_dispatch bumped phase_dispatch_count while staging;
@@ -1670,7 +1669,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             int16_t phase_end_shared[CHIP_SWIMLANE_NUM_QUEUE_SHAPES];
             capture_phase_end(phase_end_shared);
             chip_swimlane_aicpu_record_sched_phase(
-                thread_idx, ChipSwimlaneSchedPhaseKind::Dispatch, t_now, t_now, chip_swimlane.sched_loop_count, 0,
+                thread_idx, SchedPhaseKind::Dispatch, t_now, t_now, chip_swimlane.sched_loop_count, 0,
                 static_cast<uint32_t>(final_pop_hit_delta), static_cast<uint32_t>(final_pop_miss_delta),
                 phase_end_shared, phase_end_shared
             );

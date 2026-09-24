@@ -545,7 +545,7 @@ SchedulerContext::SyncStartStageResult SchedulerContext::stage_sync_start_cores(
                 // DrainPrepare bar: cluster scan happened before this lambda, so this covers the
                 // build_payload work for `claim` blocks (handle_count subtasks).
                 chip_swimlane_aicpu_record_sched_phase(
-                    thread_idx, ChipSwimlaneSchedPhaseKind::DrainPrepare, prep_t0, pub_t0,
+                    thread_idx, SchedPhaseKind::DrainPrepare, prep_t0, pub_t0,
                     sched_chip_swimlane_[thread_idx].sched_loop_count, static_cast<uint32_t>(handle_count)
                 );
             }
@@ -579,7 +579,7 @@ SchedulerContext::SyncStartStageResult SchedulerContext::stage_sync_start_cores(
             if (sub_prof) {
                 // DrainPublish bar: the MMIO write_reg per subtask (+ gated doorbell/mask record).
                 chip_swimlane_aicpu_record_sched_phase(
-                    thread_idx, ChipSwimlaneSchedPhaseKind::DrainPublish, pub_t0, get_sys_cnt_aicpu(),
+                    thread_idx, SchedPhaseKind::DrainPublish, pub_t0, get_sys_cnt_aicpu(),
                     sched_chip_swimlane_[thread_idx].sched_loop_count, static_cast<uint32_t>(handle_count)
                 );
             }

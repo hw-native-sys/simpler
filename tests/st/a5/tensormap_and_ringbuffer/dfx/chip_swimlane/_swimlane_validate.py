@@ -29,6 +29,7 @@ import sys
 from pathlib import Path
 
 from simpler_setup.scene_test import _outputs_dir, _sanitize_for_filename
+from simpler_setup.tools._runtime_dispatch import normalize_task_id_int
 from simpler_setup.tools.swimlane_converter import read_perf_data
 
 _REQUIRED_TASK_FIELDS = (
@@ -116,14 +117,14 @@ def validate_perf_artifact(
     if expected_complete_finishes is not None:
         complete_finishes = sum(
             int(record.get("tasks_processed", 0))
-            for thread_records in data.get("aicpu_scheduler_phases", [])
+            for thread_records in data.get("scheduler_records", [])
             for record in thread_records
             if record.get("phase") == "complete"
         )
         assert complete_finishes == expected_complete_finishes, (
             f"got {complete_finishes} Complete FINs, expected {expected_complete_finishes} under {perf}"
         )
-    phase_records = [record for thread_records in data.get("aicpu_scheduler_phases", []) for record in thread_records]
+    phase_records = [record for thread_records in data.get("scheduler_records", []) for record in thread_records]
     for phase in required_sched_phases:
         phase_work = sum(
             int(record.get("tasks_processed", 0)) for record in phase_records if record.get("phase") == phase
@@ -214,7 +215,7 @@ def verify_sched_overhead_differential(stdout: str, perf: dict, artifact_dir: Pa
     """
     # Oracle: pop_hit / pop_miss are the sum across all dispatch records.
     # Compares against the "Pop: hit=N, miss=M" line the script prints.
-    phases = perf.get("aicpu_scheduler_phases", [])
+    phases = perf.get("scheduler_records", [])
     oracle_pop_hit = sum(r.get("pop_hit", 0) for thr_recs in phases for r in thr_recs if r.get("phase") == "dispatch")
     oracle_pop_miss = sum(r.get("pop_miss", 0) for thr_recs in phases for r in thr_recs if r.get("phase") == "dispatch")
     pop_match = re.search(r"Pop:\s*hit=(\d+),\s*miss=(\d+)", stdout)
@@ -237,14 +238,10 @@ def verify_sched_overhead_differential(stdout: str, perf: dict, artifact_dir: Pa
         deps = json.load(f)
     unique_edges = set()
     for e in deps.get("edges", []):
-        try:
-            pred, succ = int(e["pred"]), int(e["succ"])
-        except (TypeError, ValueError, KeyError):
+        pred = normalize_task_id_int(e.get("pred"))
+        succ = normalize_task_id_int(e.get("succ"))
+        if pred is None or succ is None:
             continue
-        if pred < 0:
-            pred &= (1 << 64) - 1
-        if succ < 0:
-            succ &= (1 << 64) - 1
         unique_edges.add((pred, succ))
 
     # Per-thread oracle: a task's fanout is billed to the thread that
@@ -267,12 +264,9 @@ def verify_sched_overhead_differential(stdout: str, perf: dict, artifact_dir: Pa
             continue
         if core_to_thread[cid] < 0:
             continue
-        try:
-            tid = int(task["task_id"])
-        except (TypeError, ValueError, KeyError):
+        tid = normalize_task_id_int(task.get("task_id"))
+        if tid is None:
             continue
-        if tid < 0:
-            tid &= (1 << 64) - 1
         if tid in seen_tids:
             continue
         seen_tids.add(tid)

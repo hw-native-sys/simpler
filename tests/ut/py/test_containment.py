@@ -9,8 +9,10 @@
 # -----------------------------------------------------------------------------------------------------------
 
 import pytest
+from _capture_builder import Capture
 
 from simpler_setup.tools import containment
+from simpler_setup.tools._runtime_dispatch import HBG_RUNTIME, TMR_RUNTIME
 from simpler_setup.tools.strace_timing import parse_spans
 
 _GHZ = 1_000_000_000
@@ -55,14 +57,18 @@ def _sidecar(*, run_id, endpoint_dispatch_id, pipeline_slot=0, pipeline_generati
 
 
 def _capture(*, base=0, sched=(1_900, 1_950), tasks=((2_100, 2_200),), frequency_hz=_GHZ, **extra):
-    return {
-        "metadata": {"clock_freq_hz": frequency_hz},
-        "aicore_tasks": [[0, 7, 1, base + start, base + end, 0] for start, end in tasks],
-        "aicpu_scheduler_phases": [
-            [{"kind": "dispatch", "start_cycles": base + sched[0], "end_cycles": base + sched[1]}]
-        ],
-        **extra,
-    }
+    """A capture holding the device-clock records containment places.
+
+    ``extra`` replaces whole sections after building, for the cases about a
+    section the builder would not write or would write differently.
+    """
+    capture = Capture(runtime=TMR_RUNTIME, level=3, clock_freq_hz=frequency_hz)
+    for start, end in tasks:
+        capture.aicore_task(task_id=7, start=base + start, end=base + end)
+    capture.sched_phase(phase="dispatch", start=base + sched[0], end=base + sched[1])
+    document = capture.build()
+    document.update(extra)
+    return document
 
 
 def _window(**kwargs):
@@ -364,14 +370,22 @@ def test_host_pid_alone_still_needs_the_dispatch_when_the_process_ran_twice():
 
 
 def test_capture_windows_includes_aicore_scheduler_streams_in_extent():
-    raw = _capture()
-    raw["scheduler_records"] = {
-        "streams": [
-            {"producer": "aicpu", "records": raw.pop("aicpu_scheduler_phases")[0]},
-            {"producer": "aicore", "records": [{"start_cycles": 1800, "end_cycles": 2300}]},
-        ],
-    }
+    """An AICore stream is placed, but cannot stand in for the AICPU sched window.
+
+    The collector writes the scheduler_records section either from the AICore
+    path or from the shared AICPU writer, never both, so this is a capture whose
+    only scheduler stream is an AICore one. Its records still bound the extent
+    -- the converter draws them -- while the `sched` join stays unavailable,
+    because the window the Host log reports brackets AICPU dispatch.
+    """
+    raw = (
+        Capture(runtime=HBG_RUNTIME, level=3, clock_freq_hz=_GHZ)
+        .aicore_task(task_id=7, start=2_100, end=2_200)
+        .aicore_sched_phase(phase="dispatch", start=1_800, end=2_300)
+        .build()
+    )
+
     capture = containment.capture_windows(raw)
+
     assert capture.extent == (1800, 2300)
-    # The Host log's AICPU sched phase does not bracket AICore producers.
-    assert capture.windows["sched"] == (1900, 1950)
+    assert "sched" not in capture.windows
