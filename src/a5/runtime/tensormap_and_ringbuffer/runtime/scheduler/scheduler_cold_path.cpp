@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include "scheduler_context.h"
+#include "utils/fatal_shutdown_latch.h"
 
 #include <cinttypes>
 #include <cstdio>
@@ -66,17 +67,13 @@ LoopAction SchedulerContext::handle_orchestrator_exit(
             "completed_tasks=%d, total_tasks=%d",
             thread_idx, orch_err, completed_tasks_.load(std::memory_order_relaxed), total_tasks_
         );
-        if (!completed_.exchange(true, std::memory_order_acq_rel)) {
-            emergency_shutdown(runtime);
-        }
+        emergency_shutdown(runtime);
         return LoopAction::BREAK_LOOP;
     }
     int32_t sched_err = header->sched_error_code.load(std::memory_order_acquire);
     if (sched_err != SIMPLER_ERROR_NONE) {
         LOG_ERROR("Thread %d: Scheduler fatal error detected (code=%d)", thread_idx, sched_err);
-        if (!completed_.exchange(true, std::memory_order_acq_rel)) {
-            emergency_shutdown(runtime);
-        }
+        emergency_shutdown(runtime);
         return LoopAction::BREAK_LOOP;
     }
 
@@ -101,17 +98,13 @@ LoopAction SchedulerContext::check_idle_fatal_error(int32_t thread_idx, SharedMe
     int32_t orch_err = header->orch_error_code.load(std::memory_order_acquire);
     if (orch_err != SIMPLER_ERROR_NONE) {
         LOG_ERROR("Thread %d: Fatal error detected (code=%d), sending EXIT_SIGNAL to all cores", thread_idx, orch_err);
-        if (!completed_.exchange(true, std::memory_order_acq_rel)) {
-            emergency_shutdown(runtime);
-        }
+        emergency_shutdown(runtime);
         return LoopAction::BREAK_LOOP;
     }
     int32_t sched_err = header->sched_error_code.load(std::memory_order_acquire);
     if (sched_err != SIMPLER_ERROR_NONE) {
         LOG_ERROR("Thread %d: Scheduler fatal error detected (code=%d)", thread_idx, sched_err);
-        if (!completed_.exchange(true, std::memory_order_acq_rel)) {
-            emergency_shutdown(runtime);
-        }
+        emergency_shutdown(runtime);
         return LoopAction::BREAK_LOOP;
     }
     return LoopAction::NONE;
@@ -473,7 +466,7 @@ int32_t SchedulerContext::handle_timeout_exit(
         // sees the locators above already settled.
         header->sched_stall_detail.store(cls.detail, std::memory_order_release);
     }
-    if (!completed_.exchange(true, std::memory_order_acq_rel)) {
+    if (begin_emergency_shutdown()) {
         log_shutdown_stall_snapshot(thread_idx, idle_iterations, last_progress_count);
 #if SIMPLER_DFX
         // Capture the in-flight kernels' partial output before signalling the
@@ -499,7 +492,7 @@ int32_t SchedulerContext::handle_timeout_exit(
             );
         }
 #endif
-        emergency_shutdown(runtime);
+        signal_emergency_shutdown(runtime);
     }
 #if SIMPLER_DFX
     uint64_t sched_timeout_ts = get_sys_cnt_aicpu();
@@ -655,36 +648,104 @@ void SchedulerContext::log_chip_swimlane_summary(int32_t thread_idx, [[maybe_unu
 #endif
 
 // =============================================================================
-// Shutdown: deinit AICore regs for this thread's cores.
-// Orchestrator threads have core_trackers_[thread_idx].core_num() == 0 -> no-op.
-// platform_deinit_aicore_regs is idempotent; safe to call after early completion.
+// Shutdown: each thread retires the cores it owns, on its own way out.
+// Normal shutdown and emergency requests share the initialization/retirement
+// handoff. Only its winner can read the published group or finalize its PMU.
 // =============================================================================
 int32_t SchedulerContext::shutdown(int32_t thread_idx) {
-    const int32_t *cores = core_trackers_[thread_idx].core_ids();
-    int32_t core_num = core_trackers_[thread_idx].core_num();
-    if (core_num == 0) return 0;
+    if (!claim_retirement(thread_idx)) return 0;
 
 #if SIMPLER_DFX
-    // Restore PMU CTRL registers for this thread's cores before AICore shutdown
-    if (is_pmu_enabled()) {
-        pmu_aicpu_finalize(cores, core_num);
+    // Restore PMU CTRL registers for this thread's cores before AICore
+    // shutdown. A fatal run ends in a host-side device reset, so counters read
+    // here would not survive into the next generation.
+    if (is_pmu_enabled() && !fatal_shutdown_started_.load(std::memory_order_acquire)) {
+        pmu_aicpu_finalize(core_trackers_[thread_idx].core_ids(), core_trackers_[thread_idx].core_num());
     }
 #endif
 
-    LOG_INFO("Thread %d: Shutting down %d cores", thread_idx, core_num);
-    int32_t rc = 0;
-    for (int32_t i = 0; i < core_num; i++) {
-        int32_t core_id = cores[i];
-        uint64_t reg_addr = core_exec_states_[core_id].reg_addr;
-        if (reg_addr != 0) {
-            // Timeout means AICore is unresponsive. Log and continue deiniting remaining cores.
-            if (platform_deinit_aicore_regs(reg_addr) != 0) {
-                LOG_ERROR("Thread %d: Core %d deinit timed out", thread_idx, core_id);
-                rc = -1;
-            }
-        } else {
-            LOG_ERROR("Thread %d: Core %d has invalid register address", thread_idx, core_id);
+    return retire_owned_cores(thread_idx);
+}
+
+bool SchedulerContext::claim_retirement(int32_t owner_thread) {
+    if (owner_thread < 0 || owner_thread >= aicpu_thread_num_) return false;
+    return __atomic_fetch_or(&retirement_state_[owner_thread], RETIREMENT_REQUESTED, __ATOMIC_ACQ_REL) ==
+           RETIREMENT_READY;
+}
+
+void SchedulerContext::publish_retirement_group(int32_t owner_thread) {
+    if (__atomic_fetch_or(&retirement_state_[owner_thread], RETIREMENT_READY, __ATOMIC_ACQ_REL) ==
+        RETIREMENT_REQUESTED) {
+        (void)retire_owned_cores(owner_thread);
+    }
+}
+
+int32_t SchedulerContext::retire_thread_cores(int32_t owner_thread) {
+    return claim_retirement(owner_thread) ? retire_owned_cores(owner_thread) : 0;
+}
+
+int32_t SchedulerContext::retire_owned_cores(int32_t owner_thread) {
+    // A failed assignment can leave the tracker empty or incomplete. The
+    // barrier-free handshake has a fixed blocked partition independent of it.
+    int32_t ids[PLATFORM_MAX_CORES];
+    int32_t count = 0;
+    if (retirement_blocked_layout_) {
+        if (owner_thread >= active_sched_threads_) return 0;
+        const int32_t aic_n = cores_total_num_ / PLATFORM_CORES_PER_BLOCKDIM;
+        for (int32_t ci = owner_thread; ci < aic_n; ci += active_sched_threads_) {
+            ids[count++] = ci;
+            ids[count++] = aic_n + 2 * ci;
+            ids[count++] = aic_n + 2 * ci + 1;
         }
+    } else if (retirement_unassigned_) {
+        // The serial initializer has joined every handshake before publishing
+        // this fallback. One owner covers every initialized core on failure.
+        if (owner_thread != 0) return 0;
+        for (int32_t i = 0; i < cores_total_num_; ++i)
+            ids[count++] = i;
+    } else {
+        return retire_cores(core_trackers_[owner_thread].core_ids(), core_trackers_[owner_thread].core_num());
+    }
+    return retire_cores(ids, count);
+}
+
+int32_t SchedulerContext::retire_cores(const int32_t *core_ids, int32_t core_num) {
+    uint64_t reg_addrs[PLATFORM_MAX_CORES];
+    int32_t claimed_ids[PLATFORM_MAX_CORES];
+    size_t count = 0;
+    for (int32_t i = 0; i < core_num; ++i) {
+        const int32_t core_id = core_ids[i];
+        if (core_id < 0 || core_id >= cores_total_num_) continue;
+        if (core_exec_states_[core_id].reg_addr == 0) continue;
+        claimed_ids[count] = core_id;
+        reg_addrs[count] = core_exec_states_[core_id].reg_addr;
+        ++count;
+    }
+    if (count == 0) return 0;
+
+    // platform_retire_aicore_group fills every entry on every path it returns
+    // from, so this needs no initializer.
+    bool released[PLATFORM_MAX_CORES];
+    const int32_t rc = platform_retire_aicore_group(reg_addrs, count, platform_aicore_exit_deadline(), released);
+    if (rc != 0) {
+        // Naming the cores is the only signal an unretired core leaves: the host
+        // sees just a stream timeout.
+        for (size_t i = 0; i < count; ++i) {
+            if (!released[i]) {
+                LOG_ERROR(
+                    "AICore retirement: core %d not released (COND=0x%llx)", claimed_ids[i],
+                    static_cast<unsigned long long>(read_reg(reg_addrs[i], RegId::COND))
+                );
+            }
+        }
+    }
+    return rc;
+}
+
+int32_t SchedulerContext::retire_all_cores() {
+    int32_t rc = 0;
+    for (int32_t t = 0; t < aicpu_thread_num_; ++t) {
+        if (retire_thread_cores(t) != 0) rc = -1;
     }
     return rc;
 }
@@ -731,7 +792,7 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
     // way RegId::COND polling is.
     //
     // Servicing a core = validate its physical_core_id, then open its register
-    // window (platform_init_aicore_regs: FAST_PATH + DATA_MAIN_BASE=IDLE). That
+    // window (platform_init_aicore_regs: DATA_MAIN_BASE=IDLE). That
     // IDLE write is *also* the signal the core polls for to leave its
     // post-report wait — so opening the window IS the acknowledgement. There is
     // no separate aicpu_regs_ready ack and no second round-trip. AIC/AIV
@@ -958,6 +1019,7 @@ void SchedulerContext::assign_own_clusters(int32_t tidx) {
             CoreTracker::MAX_CLUSTERS
         );
         handshake_failed_.store(true, std::memory_order_release);
+        publish_retirement_group(tidx);
         return;
     }
     tracker.init(own_n);
@@ -1002,16 +1064,13 @@ void SchedulerContext::assign_own_clusters(int32_t tidx) {
             }
         }
     }
+    publish_retirement_group(tidx);
 }
 
 // Abort the run on a handshake failure discovered without the all-thread barrier
 // (non-DFX path): latch completion so every scheduler thread exits its dispatch
 // loop, and broadcast exit to whatever cores did come up. Idempotent.
-void SchedulerContext::abort_and_shutdown(Runtime *runtime) {
-    if (!completed_.exchange(true, std::memory_order_acq_rel)) {
-        emergency_shutdown(runtime);
-    }
-}
+void SchedulerContext::abort_and_shutdown(Runtime *runtime) { emergency_shutdown(runtime); }
 
 // Profiling-subsystem init (leader-only). pmu_aicpu_init needs every core's
 // physical_core_id, so the barrier-free init path calls this behind an
@@ -1093,23 +1152,25 @@ bool SchedulerContext::assign_cores_to_threads() {
 // Emergency shutdown: broadcast exit signal to every handshake'd core and
 // deinit their AICore register blocks. Idempotent.
 // =============================================================================
+bool SchedulerContext::begin_emergency_shutdown() {
+    return publish_fatal_shutdown(fatal_shutdown_started_, completed_);
+}
+
+void SchedulerContext::signal_emergency_shutdown(Runtime *runtime) {
+    (void)runtime;  // exit is delivered via each core's register block, not GM
+    // Sweeps every core rather than one thread's slice: a fatal run must not
+    // depend on ready owners reaching their own shutdown. Owners still in init
+    // service the request when they publish their group. The retirement
+    // writes DATA_MAIN_BASE=EXIT, which both releases a core still polling for
+    // its window to open and signals it to exit. Cores whose windows never
+    // opened (reg_addr==0) remain the host recovery path's responsibility.
+    LOG_WARN("Emergency shutdown: retiring all initialized AICores");
+    (void)retire_all_cores();
+}
+
 void SchedulerContext::emergency_shutdown(Runtime *runtime) {
-    (void)runtime;  // exit is now delivered via each core's register block, not GM
-    LOG_WARN("Emergency shutdown: sending exit signal to all initialized cores");
-    int32_t timeout_count = 0;
-    for (int32_t i = 0; i < cores_total_num_; i++) {
-        // platform_deinit_aicore_regs writes DATA_MAIN_BASE=EXIT, which both
-        // releases a core still polling for its window to open and signals it to
-        // exit. Cores never opened (reg_addr==0) are reaped by the host device
-        // reset that follows a handshake failure.
-        if (core_exec_states_[i].reg_addr != 0) {
-            if (platform_deinit_aicore_regs(core_exec_states_[i].reg_addr) != 0) {
-                timeout_count++;
-            }
-        }
-    }
-    if (timeout_count > 0) {
-        LOG_ERROR("Emergency shutdown: %d cores did not acknowledge exit", timeout_count);
+    if (begin_emergency_shutdown()) {
+        signal_emergency_shutdown(runtime);
     }
 }
 
@@ -1123,6 +1184,10 @@ int32_t SchedulerContext::pre_handshake_init(
 
     // Zero all per-core execution state before handshake
     memset(core_exec_states_, 0, sizeof(core_exec_states_));
+    // Reset before hs_setup_done_ releases any initializer or emergency caller.
+    memset(retirement_state_, 0, sizeof(retirement_state_));
+    retirement_blocked_layout_ = aicpu_thread_num > 1 && !runtime->dev.serial_orch_sched;
+    retirement_unassigned_ = false;
 
     // Wire thread/transition configuration that handshake/assign need to read.
     aicpu_thread_num_ = aicpu_thread_num;
@@ -1222,6 +1287,9 @@ int32_t SchedulerContext::pre_handshake_init(
 
 int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     if (handshake_failed_.load(std::memory_order_acquire)) {
+        retirement_unassigned_ = true;
+        for (int32_t t = 0; t < aicpu_thread_num_; ++t)
+            publish_retirement_group(t);
         emergency_shutdown(runtime);
         return -1;
     }
@@ -1249,6 +1317,10 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     LOG_INFO("Core discovery complete: %d AIC, %d AIV", aic_count_, aiv_count_);
 
     if (!assign_cores_to_threads()) {
+        retirement_unassigned_ = true;
+        for (int32_t t = 0; t < aicpu_thread_num_; ++t)
+            publish_retirement_group(t);
+        emergency_shutdown(runtime);
         return -1;
     }
 
@@ -1324,6 +1396,8 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     func_id_to_addr_ = reinterpret_cast<uint64_t *>(runtime->dev.callable_table_addr_);
     func_id_to_addr_count_ = runtime->dev.callable_table_len_;
 
+    for (int32_t t = 0; t < aicpu_thread_num_; ++t)
+        publish_retirement_group(t);
     return 0;
 }
 
@@ -1362,6 +1436,7 @@ void SchedulerContext::deinit() {
     total_tasks_ = 0;
     orchestrator_done_.store(false, std::memory_order_release);
     completed_.store(false, std::memory_order_release);
+    fatal_shutdown_started_.store(false, std::memory_order_release);
 
     // Reset core discovery and assignment state
     aic_count_ = 0;
@@ -1429,9 +1504,7 @@ void SchedulerContext::on_orchestration_done(
         orch_err = sched_->sm_header->orch_error_code.load(std::memory_order_relaxed);
     }
     if (orch_err != SIMPLER_ERROR_NONE) {
-        if (!completed_.exchange(true, std::memory_order_acq_rel)) {
-            emergency_shutdown(runtime);
-        }
+        emergency_shutdown(runtime);
     }
 
 #if SIMPLER_DFX
