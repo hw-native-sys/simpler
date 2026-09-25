@@ -11329,7 +11329,7 @@ class Worker:
         to here exist now*. Raises ``RuntimeError`` when a promised file is
         missing, when a child reports a failure, or when the wait ran out.
 
-        What counts as success is the collector's own rule, and the two that
+        What counts as success is the collector's own rule, and the three that
         retain runs answer differently:
 
         - the **chip swimlane** artifact carries its own verdict, so a
@@ -11343,6 +11343,14 @@ class Worker:
           to have produced no records writes no file and is still a success,
           which is why the file's absence does not distinguish an empty run
           from a failed one either.
+        - **args dump** publishes a payload file and a manifest per run, and
+          the manifest carries the run's verdict. A published manifest is still
+          a failure for this call when the run lost a record on the host, when
+          the device dropped one, or when its completeness could not be
+          proved — the manifest says so with ``counts_unknown``. Its failures
+          are sticky for the device runner's life too, and deleting the
+          evidence files does not clear them. A run's payload file may exist
+          and still be growing; the manifest is what publication produces.
 
         Callable only with no run outstanding, and never from inside a graph
         callback: it seals whole runs, which is not something a run may do to

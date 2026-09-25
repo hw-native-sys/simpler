@@ -961,22 +961,23 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     // drain, so sim's lifecycle entry points carry the same contract as
     // onboard's. attach_current_thread() is idempotent for a thread already
     // bound to this device.
-    int drain_rc = PTO_RUNTIME_ERR_INTERNAL;
+    DrainOutcome drain{};
     try {
-        drain_rc = state->runner->attach_current_thread(state->runner->device_id());
-        if (drain_rc != 0) {
-            LOG_ERROR("simpler_wait_run: attach_current_thread failed: %d (%s)", drain_rc, state->trace_attrs);
-        } else {
-            drain_rc = PTO_RUNTIME_ERR_INTERNAL;
-            if (state->active_execution != nullptr) {
-                drain_rc = state->runner->drain_execution(*state->active_execution);
-            }
+        const int attach_rc = state->runner->attach_current_thread(state->runner->device_id());
+        if (attach_rc != 0) {
+            drain.device_rc = attach_rc;
+            LOG_ERROR("simpler_wait_run: attach_current_thread failed: %d (%s)", attach_rc, state->trace_attrs);
+        } else if (state->active_execution != nullptr) {
+            drain = state->runner->drain_execution(*state->active_execution);
         }
     } catch (...) {
-        drain_rc = PTO_RUNTIME_ERR_INTERNAL;
+        drain = DrainOutcome{};
         LOG_ERROR("simpler_wait_run: drain threw (%s)", state->trace_attrs);
     }
-    if (state->completion_rc == 0) state->completion_rc = drain_rc;
+    // Sim records no device lifecycle facts, so the run takes the composed
+    // result: a device error first, and a diagnostics ownership failure still
+    // reaching the caller behind it.
+    if (state->completion_rc == 0) state->completion_rc = drain.combined();
     state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
     emit_native_run_runner_wall(state);
     return state->completion_rc;
@@ -1015,16 +1016,18 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         LOG_ERROR("simpler_finalize_run: attach_current_thread failed: %d (%s)", attach_rc, state->trace_attrs);
     }
     if (phase == NativeRunPhase::Running && launched) {
-        int drain_rc = attach_rc;
+        DrainOutcome drain{};
+        drain.device_rc = attach_rc;
         if (attach_rc == 0) {
-            drain_rc = PTO_RUNTIME_ERR_INTERNAL;
+            drain.device_rc = PTO_RUNTIME_ERR_INTERNAL;
             try {
-                drain_rc = state->runner->drain_execution(*state->active_execution);
+                drain = state->runner->drain_execution(*state->active_execution);
             } catch (...) {
+                drain = DrainOutcome{};
                 LOG_ERROR("simpler_finalize_run: drain_execution threw (%s)", state->trace_attrs);
             }
         }
-        if (execution_rc == 0) execution_rc = drain_rc;
+        if (execution_rc == 0) execution_rc = drain.combined();
         state->completion_rc = execution_rc;
         state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
     }

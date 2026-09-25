@@ -278,6 +278,7 @@ set(SIM_CALLABLE_POOL_SOURCES
     ${SIMPLER_COMMON_PLATFORM_DIR}/sim/host/memory_allocator.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/sim/sim_context/cpu_sim_context.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_collector.cpp
+    ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_retained_runs.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/chip_swimlane_collector.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/scope_stats_collector.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/host_phase_records.cpp
@@ -403,11 +404,37 @@ endif()
 platform_case(test_args_dump_collector.cpp PER_ARCH
     SOURCES
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_collector.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_retained_runs.cpp
+        ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp)
+
+platform_case(test_args_dump_ack_attribution.cpp PER_ARCH
+    SOURCES
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_collector.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_retained_runs.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/args_dump_aicpu.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_run_result_base_aicpu.cpp
+        ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp)
+
+platform_case(test_args_dump_ownership.cpp PER_ARCH
+    SOURCES
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_collector.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_retained_runs.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/args_dump_aicpu.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_run_result_base_aicpu.cpp
+        ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp)
+
+platform_case(test_args_dump_retained_runs.cpp PER_ARCH
+    SOURCES
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_collector.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_retained_runs.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/args_dump_aicpu.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_run_result_base_aicpu.cpp
         ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp)
 
 platform_case(test_args_dump_run_identity.cpp PER_ARCH
     SOURCES
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_collector.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_retained_runs.cpp
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/args_dump_aicpu.cpp
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_run_result_base_aicpu.cpp
         ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp)
@@ -527,6 +554,7 @@ simpler_ut_cases(platform_single_case
     test_retained_temp_bump.cpp
     test_run_completion_fence.cpp
     test_run_drain_decision.cpp
+    test_run_drain_result_separation.cpp
     test_run_outcome_decision.cpp
     test_run_shadow_consumer_evidence.cpp
     test_run_stream_pair.cpp

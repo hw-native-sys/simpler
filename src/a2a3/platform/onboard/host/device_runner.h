@@ -108,7 +108,7 @@ public:
     LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) override;
     void abandon_prepared_execution(PreparedExecution &prepared) noexcept override;
     int poll_execution(const ActiveExecution &active) override;
-    int drain_execution(ActiveExecution &active) override;
+    DrainOutcome drain_execution(ActiveExecution &active) override;
     bool can_accept_run() const override { return !device_unusable_.load(std::memory_order_acquire); }
     // provision/abandon_native_run_resources keep the base no-op: preparation
     // owns no stream, so there is nothing for a prepared run to provision or
@@ -310,7 +310,16 @@ private:
     // The kernel submission boundary is separate from the fence wait and
     // post-run teardown: launch_run() submits and drain_execution() reaps.
     LaunchTransactionResult launch_run(PreparedExecution &prepared, LaunchPermit permit);
-    int reap_run(const PreparedExecution &prepared);
+    /**
+     * Wait this run's fence, then tear its collectors down.
+     *
+     * Returns a **device** result only. A retained diagnostics close that
+     * could not prove its ownership is reported through `diagnostics_rc`
+     * instead, because the caller reads this return as evidence about the
+     * device: a non-zero here takes the unproven-completion cleanup path and
+     * can retire a proven-complete stream as unproven.
+     */
+    int reap_run(const PreparedExecution &prepared, int *diagnostics_rc);
 
     // Queue this run's own AICore boundary into its AICPU stream, ahead of the
     // AICPU boundary record that then covers the whole operator. The reservation
@@ -438,7 +447,16 @@ private:
      * collectors in a pristine, re-initializable state) and from finalize()
      * as a backstop before mem_alloc_.finalize().
      */
-    void finalize_collectors(bool abandon_device_resources = false);
+    /**
+     * Release the diagnostics collectors' shared memory.
+     *
+     * Returns non-zero when a collector's own finalize reported a failure —
+     * today only retained ArgsDump, whose last host sealing happens there,
+     * after the caller's diagnostic flush has already run. A caller folds this
+     * into its own rc only where no device error has been recorded: a device
+     * failure is the more useful diagnosis and keeps priority.
+     */
+    int finalize_collectors(bool abandon_device_resources = false);
     // Shared enable flags (`enable_chip_swimlane_`, `enable_dump_args_`,
     // `enable_pmu_`, `enable_scope_stats_`, `chip_swimlane_level_`,
     // `pmu_event_type_`, `output_prefix_`) live on `DeviceRunnerBase`.

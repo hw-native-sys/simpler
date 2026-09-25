@@ -172,8 +172,13 @@ public:
     virtual void abandon_prepared_execution(PreparedExecution &prepared) noexcept = 0;
     /** Return one of the SIMPLER_NATIVE_RUN_POLL_* values without waiting. */
     virtual int poll_execution(const ActiveExecution &active) = 0;
-    /** Wait for completion, publish DFX, and release per-run resources. */
-    virtual int drain_execution(ActiveExecution &active) = 0;
+    /**
+     * Wait for completion, publish DFX, and release per-run resources.
+     *
+     * Returns the device result and this run's diagnostics result separately;
+     * see `DrainOutcome`.
+     */
+    virtual DrainOutcome drain_execution(ActiveExecution &active) = 0;
     virtual int finalize() = 0;
     // Arms this thread's host-side dep_gen capture from the run's own config,
     // before it binds. a2a3 and a5 both override; an arch without dep_gen leaves
@@ -403,15 +408,33 @@ public:
     void close_pmu_run_boundary(const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete);
 
     /**
+     * Close one run's ArgsDump window: either today's quiesce, reconcile and
+     * export, or, when ArgsDump retains runs, the claim-time terminal read,
+     * processing proof and leftover decision that hand the run to its
+     * background writer.
+     *
+     * Returns non-zero only on the retained path, when that proof did not land
+     * inside the execution claim. Nothing unproved was read and no unprocessed
+     * payload was acknowledged, so the producer's own barrier still protects
+     * the arena — but the caller owes an error rather than a run that quietly
+     * publishes an incomplete file.
+     */
+    int close_args_dump_run_boundary(const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete);
+
+    /**
      * Whether a collector may hold a run past its boundary. Default off, and
      * both retaining collectors are configured here for the reason the onboard
      * base gives. PMU retention is independent of swimlane's.
      */
     void set_retain_runs(bool enabled) {
         chip_swimlane_collector_.configure_retained_runs(enabled, simpler::dfx::runs::kDefaultBudgetBytes);
+        dump_collector_.configure_retained_runs(enabled, simpler::dfx::runs::kDefaultBudgetBytes);
         pmu_collector_.configure_retained_runs(enabled);
     }
-    bool retains_runs() const { return chip_swimlane_collector_.retains_runs() || pmu_collector_.retains_runs(); }
+    bool retains_runs() const {
+        return chip_swimlane_collector_.retains_runs() || dump_collector_.retains_runs() ||
+               pmu_collector_.retains_runs();
+    }
     int flush_diagnostics(int timeout_ms, std::string *error);
     void finish_retained_runs();
     /**
@@ -444,7 +467,13 @@ public:
      * back, which happens only when `device_execution_complete` says the caller
      * observed this run's completion.
      */
-    void teardown_shared_collectors_after_run(
+    /**
+     * Returns non-zero when a collector's close reported an ownership failure
+     * the caller must surface — today only retained ArgsDump. A caller folds it
+     * into its own rc behind any device error, which stays the more useful
+     * diagnosis.
+     */
+    int teardown_shared_collectors_after_run(
         const DfxRunConfig &dfx, uint32_t pipeline_slot, uint64_t run_epoch, bool device_execution_complete
     );
     // Diagnostic artifact root directory (CallConfig::validate() enforces non-empty

@@ -1524,6 +1524,17 @@ class ChipWorker:
                 per-run files are written, `flush_diagnostics()` returning means
                 the background record files are published. Wait for every run,
                 then flush, then convert.
+
+                With args dump enabled this also moves that run's argument
+                *content*: its payload file and its manifest are finished in
+                the background, so `run()` returning no longer means either is
+                complete and the payload file may still be growing. Each run
+                owns an exclusive `args.e<epoch>.bin`, the manifest names it
+                through the `bin_file` field readers already use, and nothing
+                is deleted — a reused output prefix accumulates files. A run
+                that dies without an observed device fence is **not** recovered
+                on this path, which the default path does do; see
+                docs/dfx/args-dump.md.
             dfx_session: The name this option shipped under, accepted as an
                 alias. Giving both spellings different values is an error.
 

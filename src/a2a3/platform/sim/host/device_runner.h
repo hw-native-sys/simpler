@@ -41,7 +41,7 @@ public:
     LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) override;
     void abandon_prepared_execution(PreparedExecution &prepared) noexcept override;
     int poll_execution(const ActiveExecution &active) override;
-    int drain_execution(ActiveExecution &active) override;
+    DrainOutcome drain_execution(ActiveExecution &active) override;
     int finalize() override;
     // Also arms the loaded runtime's host-side graph capture, which a host-orch
     // runtime uses instead of the device collector. Defined in the .cpp so this
@@ -78,7 +78,12 @@ private:
 
     // Per-run collector teardown: releases shared memory back to mem_alloc_.
     // Idempotent. Mirrors the onboard helper.
-    void finalize_collectors();
+    /**
+     * Release the diagnostics collectors' shared memory. Returns non-zero when
+     * a collector's own finalize reported a failure — today only retained
+     * ArgsDump, whose last host sealing happens there.
+     */
+    int finalize_collectors();
 
     // a2a3 sim's dlsym'd function-pointer table. Loaded once via
     // ensure_binaries_loaded(), nulled on unload_executor_binaries().

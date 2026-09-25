@@ -96,7 +96,7 @@ public:
     }
     void abandon_prepared_execution(PreparedExecution & /*prepared*/) noexcept override {}
     int poll_execution(const ActiveExecution & /*active*/) override { return 0; }
-    int drain_execution(ActiveExecution & /*active*/) override { return 0; }
+    DrainOutcome drain_execution(ActiveExecution & /*active*/) override { return DrainOutcome::device_complete(0); }
     int finalize() override { return 0; }
     int ensure_binaries_loaded() override { return 0; }
     int invoke_device_register(const RegisterCallableArgs & /*reg_args*/) override { return 0; }

@@ -14,6 +14,8 @@
 #include <cstdint>
 #include <utility>
 
+#include "runtime_c_api.h"
+
 class DeviceRunnerBase;
 class NativeRunExecutionTestPeer;
 class RunRetentionProbePeer;
@@ -166,6 +168,34 @@ struct LaunchTransactionResult {
     LaunchReceipt receipt{};
 
     bool poisoned() const { return progress == LaunchProgress::Partial; }
+};
+
+/**
+ * What a drain established, kept as the two independent results it is.
+ *
+ * `device_rc` grades the device: the fence wait, the stream retirement and the
+ * run's own terminal record. `diagnostics_rc` grades this run's DFX ownership —
+ * whether the collectors could prove they own everything the run produced —
+ * and is reached only once the device side has finished normally.
+ *
+ * They are separate because they answer different questions and only one of
+ * them is a physical fact about the run. A caller recording device lifecycle
+ * facts, such as `WorkspaceManager::RunFact::DrainProvedComplete`, reads
+ * `device_rc`; recording the composed value would classify a run whose device
+ * work demonstrably finished as one whose completion was never proved, which
+ * permanently withholds every workspace block that run referenced. A caller
+ * reporting the run to its own caller takes `combined()`, where a device error
+ * keeps priority and a diagnostics failure still fails the run.
+ */
+struct DrainOutcome {
+    int device_rc{PTO_RUNTIME_ERR_INTERNAL};
+    int diagnostics_rc{0};
+
+    /** The run's result: the device error if there is one, else diagnostics. */
+    int combined() const { return device_rc != 0 ? device_rc : diagnostics_rc; }
+
+    static DrainOutcome device_error(int rc) { return DrainOutcome{rc, 0}; }
+    static DrainOutcome device_complete(int diagnostics_rc) { return DrainOutcome{0, diagnostics_rc}; }
 };
 
 /**

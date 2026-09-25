@@ -447,17 +447,24 @@ int DeviceRunner::poll_execution(const ActiveExecution &active) {
     });
 }
 
-int DeviceRunner::drain_execution(ActiveExecution &active) {
-    if (active.prepared == nullptr || !active.prepared->resources_owned) return PTO_RUNTIME_ERR_INTERNAL;
+DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
+    if (active.prepared == nullptr || !active.prepared->resources_owned) {
+        return DrainOutcome::device_error(PTO_RUNTIME_ERR_INTERNAL);
+    }
     PreparedExecution &prepared = *active.prepared;
     auto drain_cleanup = RAIIScopeGuard([this, &prepared]() {
         cleanup_execution(prepared, /*retire_aicore=*/true);
     });
 
-    int rc = reap_run(prepared);
+    // This run's diagnostics ownership result, kept apart from every device
+    // result below: it must not pick the cleanup path, retire a stream or
+    // reach `recover_device_or_mark_unusable`, and it is returned only once
+    // the device side has finished normally.
+    int diagnostics_rc = 0;
+    int rc = reap_run(prepared, &diagnostics_rc);
     if (rc != 0) {
         // The device/sync error remains authoritative over teardown errors.
-        return rc;
+        return DrainOutcome::device_error(rc);
     }
 
     // Both this run's boundaries completed, so every wait queued on one of them
@@ -468,18 +475,21 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
         prepared, /*boundaries_complete=*/true, static_cast<rtStream_t>(run_streams_.aicpu()),
         static_cast<rtStream_t>(run_streams_.aicore())
     );
-    if (rc != 0) return rc;
+    if (rc != 0) return DrainOutcome::device_error(rc);
 
     // A proven-complete stream is reusable until a code publication marks it
     // stale. Publish retirement so cleanup does not replace it with an
     // unproven state after the device result has already been established.
     prepared.aicore_retirement_attempted = true;
     rc = retire_run_aicore_stream(&prepared, RunStreamPair::CompletionStatus::Complete);
-    if (rc != 0) return rc;
+    if (rc != 0) return DrainOutcome::device_error(rc);
 
     // Reads device memory, so it must precede KernelArgs/runtime cleanup.
     print_handshake_results(prepared.kernel_args);
-    return 0;
+    // Every device step above completed and published its own proof, so the
+    // device half is settled here. The diagnostics half still fails the run for
+    // the caller, and says nothing about the device.
+    return DrainOutcome::device_complete(diagnostics_rc);
 }
 
 void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool retire_aicore) noexcept {
@@ -851,7 +861,7 @@ int DeviceRunner::queue_cross_run_wait(
     return record_cross_run_proof(prepared, waiter_stream);
 }
 
-int DeviceRunner::reap_run(const PreparedExecution &prepared) {
+int DeviceRunner::reap_run(const PreparedExecution &prepared, int *diagnostics_rc) {
     if (!run_streams_.ready()) {
         LOG_ERROR("reap_run: the run stream pair is not ready");
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -876,7 +886,13 @@ int DeviceRunner::reap_run(const PreparedExecution &prepared) {
         // JSON manifest, i.e. unusable for triage. reconcile/export are not
         // idempotent, so this runs only on the error return; the success path
         // still exports exactly once below.
-        teardown_shared_collectors_after_run(dfx, pipeline_slot, prepared.identity.run_epoch, false);
+        // The device error that brought this path here stays authoritative, so
+        // a diagnostics ownership failure only logs on it.
+        const int teardown_rc =
+            teardown_shared_collectors_after_run(dfx, pipeline_slot, prepared.identity.run_epoch, false);
+        if (teardown_rc != 0) {
+            LOG_ERROR("Diagnostics teardown reported %d on the error path; run error %d is kept", teardown_rc, rc);
+        }
         emit_device_dep_gen_graph(dfx);
         return rc;
     }
@@ -885,7 +901,15 @@ int DeviceRunner::reap_run(const PreparedExecution &prepared) {
 
     // Tear down collectors. stop() joins mgmt then collector in the only safe
     // order (mgmt's final-drain pass into L2 has poll as its consumer).
-    teardown_shared_collectors_after_run(dfx, pipeline_slot, prepared.identity.run_epoch, true);
+    // A retained diagnostics close that could not prove it owns this run's
+    // collected content fails the run — but it is not a device result, and this
+    // function's return is one: the caller treats any non-zero here as a device
+    // or sync error and takes the unproven-completion cleanup path, which
+    // retires a proven-complete stream as unproven and can poison the card. So
+    // it travels out of band and the caller returns it once the device side is
+    // finished.
+    const int teardown_rc = teardown_shared_collectors_after_run(dfx, pipeline_slot, prepared.identity.run_epoch, true);
+    if (teardown_rc != 0 && diagnostics_rc != nullptr) *diagnostics_rc = teardown_rc;
     emit_device_dep_gen_graph(dfx);
 
     return 0;
@@ -1227,7 +1251,14 @@ int DeviceRunner::finalize() {
             std::this_thread::sleep_for(std::chrono::milliseconds(reset_delay_ms));
         }
 
-        finalize_collectors(true);
+        // Its result cannot displace the device failure that brought this path
+        // here, so it is folded in below only if nothing about the device
+        // itself was reported. It is sticky in the collector's own summary
+        // either way.
+        const int fatal_collector_rc = finalize_collectors(true);
+        if (fatal_collector_rc != 0) {
+            LOG_ERROR("Fatal teardown: diagnostics collectors reported %d while being released", fatal_collector_rc);
+        }
 
         // force_reset_device() drains before it resets and returns 0 only when
         // its post-reset probe confirms the card, so a second pass runs against
@@ -1310,7 +1341,10 @@ int DeviceRunner::finalize() {
             device_unusable_.store(false, std::memory_order_release);
         }
         LOG_WARN("DeviceRunner finalized after fatal device failure");
-        const int fatal_rc = abandon_rc != 0 ? abandon_rc : reset_rc;
+        int fatal_rc = abandon_rc != 0 ? abandon_rc : reset_rc;
+        // Last in priority: a diagnostics failure found while releasing the
+        // collectors is reported only when the device side reported nothing.
+        if (fatal_rc == 0) fatal_rc = fatal_collector_rc;
         teardown_recorder_.finish(fatal_rc);
         return fatal_rc;
     }
@@ -1332,7 +1366,7 @@ int DeviceRunner::finalize() {
     // Cleanup performance profiling (including a2a3's dep_gen). Normally
     // already done by drain or enqueue rollback; this is the backstop
     // for the no-run-since-init case.
-    finalize_collectors();
+    const int collector_rc = finalize_collectors();
 
     // The run stream pair is this subclass's own RTS-owning member, so it is
     // released here, while RTS is live and before the device reset below — the
@@ -1344,6 +1378,10 @@ int DeviceRunner::finalize() {
     // mem_alloc_.finalize(), and cached arena sizes.
     rc = finalize_common();
     if (rc == 0) rc = stream_rc;
+    // The kernel-mode early return is about device resources this context still
+    // owns and a later close must retry, so only a device result may take it. A
+    // diagnostics failure owns nothing and is folded in further down, where it
+    // can report without diverting teardown.
     if (rc != 0 && execution_mode_latch().is_kernel()) {
         teardown_recorder_.finish(rc);
         return rc;
@@ -1410,6 +1448,10 @@ int DeviceRunner::finalize() {
     // released or abandoned, so there is nothing a later close could reach.
     device_id_ = -1;
     device_unusable_.store(false, std::memory_order_release);
+    // Last in priority, and after every device decision has been taken: a
+    // diagnostics failure found while releasing the collectors is reported only
+    // when the device side reported nothing, and it never diverts teardown.
+    if (rc == 0 && collector_rc != 0) rc = collector_rc;
     teardown_recorder_.finish(rc);
     return rc;
 }
@@ -1429,7 +1471,13 @@ int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecuti
     // against them — so the whole block runs here, where this run holds the
     // execution claim, rather than during its preparation.
     if (collector_shape_is_stale(num_aicore, aicpu_thread_num, launch_aicpu_num)) {
-        finalize_collectors();
+        // A rebuild's own release can report a diagnostics failure; it is
+        // sticky in the collector's summary, so the next flush reports it and
+        // this run is not failed for a predecessor's output.
+        const int rebuild_rc = finalize_collectors();
+        if (rebuild_rc != 0) {
+            LOG_ERROR("Collector rebuild: diagnostics collectors reported %d while being released", rebuild_rc);
+        }
     }
     latch_collector_shape(num_aicore, aicpu_thread_num, launch_aicpu_num);
 
@@ -1681,7 +1729,7 @@ int DeviceRunner::init_scope_stats(int num_threads, int device_id, KernelArgsHel
     return 0;
 }
 
-void DeviceRunner::finalize_collectors(bool abandon_device_resources) {
+int DeviceRunner::finalize_collectors(bool abandon_device_resources) {
     clear_collector_shape();
     auto healthy_unregister_cb = [](void *dev_ptr, int device_id) -> int {
         HalHostUnregisterFn fn = get_halHostUnregister();
@@ -1702,8 +1750,14 @@ void DeviceRunner::finalize_collectors(bool abandon_device_resources) {
     if (chip_swimlane_collector_.is_initialized()) {
         chip_swimlane_collector_.finalize(unregister_cb, free_cb);
     }
+    // The one collector whose finalize can discover a failure of its own:
+    // retained ArgsDump does its last host sealing here, which is after the
+    // caller's own diagnostic flush has already run and returned. Its result is
+    // carried out of this function rather than logged, and the caller keeps its
+    // first device error ahead of it.
+    int rc = 0;
     if (dump_collector_.is_initialized()) {
-        dump_collector_.finalize(unregister_cb, free_cb);
+        rc = dump_collector_.finalize(unregister_cb, free_cb);
     }
     if (pmu_collector_.is_initialized()) {
         pmu_collector_.finalize(unregister_cb, free_cb);
@@ -1714,6 +1768,7 @@ void DeviceRunner::finalize_collectors(bool abandon_device_resources) {
     if (scope_stats_collector_.is_initialized()) {
         scope_stats_collector_.finalize(unregister_cb, free_cb);
     }
+    return rc;
 }
 
 // =============================================================================

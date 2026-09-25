@@ -1452,28 +1452,29 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     // drain_execution() synchronizes and destroys streams, reads device memory
     // and frees device allocations, all of which need this thread's CANN
     // device context. rtSetDevice is idempotent on an already-attached thread.
-    int drain_rc = PTO_RUNTIME_ERR_INTERNAL;
+    DrainOutcome drain{};
     // Published before the call, so a drain that lost its attach or threw is
     // never mistaken for one that never ran.
     note_workspace_fact(state, WorkspaceManager::RunFact::DrainAttempted);
     try {
-        drain_rc = state->runner->attach_current_thread(state->runner->device_id());
-        if (drain_rc != 0) {
-            LOG_ERROR("simpler_wait_run: attach_current_thread failed: %d (%s)", drain_rc, state->trace_attrs);
-        } else {
-            drain_rc = PTO_RUNTIME_ERR_INTERNAL;
-            if (state->active_execution != nullptr) {
-                drain_rc = state->runner->drain_execution(*state->active_execution);
-            }
+        const int attach_rc = state->runner->attach_current_thread(state->runner->device_id());
+        if (attach_rc != 0) {
+            drain.device_rc = attach_rc;
+            LOG_ERROR("simpler_wait_run: attach_current_thread failed: %d (%s)", attach_rc, state->trace_attrs);
+        } else if (state->active_execution != nullptr) {
+            drain = state->runner->drain_execution(*state->active_execution);
         }
     } catch (...) {
-        drain_rc = PTO_RUNTIME_ERR_INTERNAL;
+        drain = DrainOutcome{};
         LOG_ERROR("simpler_wait_run: drain threw (%s)", state->trace_attrs);
     }
-    if (state->completion_rc == 0) state->completion_rc = drain_rc;
-    // Only a drain that returned success proves this run's device work
-    // finished; the phase below is set on every path and proves nothing.
-    if (drain_rc == 0) note_workspace_fact(state, WorkspaceManager::RunFact::DrainProvedComplete);
+    if (state->completion_rc == 0) state->completion_rc = drain.combined();
+    // The device half alone proves this run's device work finished. A
+    // diagnostics failure still fails the run above, but it is not evidence
+    // about the device, and recording it as one would leave every workspace
+    // block this run referenced permanently quarantined at context teardown.
+    // The phase below is set on every path and proves nothing.
+    if (drain.device_rc == 0) note_workspace_fact(state, WorkspaceManager::RunFact::DrainProvedComplete);
     state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
     emit_native_run_runner_wall(state);
     return state->completion_rc;
@@ -1606,18 +1607,22 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         LOG_ERROR("simpler_finalize_run: attach_current_thread failed: %d (%s)", attach_rc, state->trace_attrs);
     }
     if (phase == NativeRunPhase::Running && launched) {
-        int drain_rc = attach_rc;
+        DrainOutcome drain{};
+        drain.device_rc = attach_rc;
         note_workspace_fact(state, WorkspaceManager::RunFact::DrainAttempted);
         if (attach_rc == 0) {
-            drain_rc = PTO_RUNTIME_ERR_INTERNAL;
+            drain.device_rc = PTO_RUNTIME_ERR_INTERNAL;
             try {
-                drain_rc = state->runner->drain_execution(*state->active_execution);
+                drain = state->runner->drain_execution(*state->active_execution);
             } catch (...) {
+                drain = DrainOutcome{};
                 LOG_ERROR("simpler_finalize_run: drain_execution threw (%s)", state->trace_attrs);
             }
         }
-        if (execution_rc == 0) execution_rc = drain_rc;
-        if (drain_rc == 0) note_workspace_fact(state, WorkspaceManager::RunFact::DrainProvedComplete);
+        if (execution_rc == 0) execution_rc = drain.combined();
+        // The device half alone; see `simpler_wait_run` for why a diagnostics
+        // failure must not be read as an unproved device completion.
+        if (drain.device_rc == 0) note_workspace_fact(state, WorkspaceManager::RunFact::DrainProvedComplete);
         state->completion_rc = execution_rc;
         state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
     }

@@ -339,9 +339,13 @@ public:
      */
     void set_retain_runs(bool enabled) {
         chip_swimlane_collector_.configure_retained_runs(enabled, simpler::dfx::runs::kDefaultBudgetBytes);
+        dump_collector_.configure_retained_runs(enabled, simpler::dfx::runs::kDefaultBudgetBytes);
         pmu_collector_.configure_retained_runs(enabled);
     }
-    bool retains_runs() const { return chip_swimlane_collector_.retains_runs() || pmu_collector_.retains_runs(); }
+    bool retains_runs() const {
+        return chip_swimlane_collector_.retains_runs() || dump_collector_.retains_runs() ||
+               pmu_collector_.retains_runs();
+    }
 
     /**
      * Publish every run closed up to now, then report.
@@ -1273,8 +1277,12 @@ public:
     /**
      * Wait for the launched run, publish DFX, and release its execution
      * resources. Called on the child progress path that performed launch.
+     *
+     * Returns the device result and this run's diagnostics result separately;
+     * see `DrainOutcome` for which of them a caller owes each of its own
+     * obligations to.
      */
-    virtual int drain_execution(ActiveExecution &active) = 0;
+    virtual DrainOutcome drain_execution(ActiveExecution &active) = 0;
 
     /**
      * Cleanup all resources. Each arch's `finalize()` wraps
@@ -1896,6 +1904,20 @@ protected:
     void close_pmu_run_boundary(const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete);
 
     /**
+     * Close one run's ArgsDump window: either today's quiesce, reconcile and
+     * export, or, when ArgsDump retains runs, the claim-time terminal read,
+     * processing proof and leftover decision that hand the run to its
+     * background writer.
+     *
+     * Returns non-zero only on the retained path, when that proof did not land
+     * inside the execution claim. Nothing unproved was read and no unprocessed
+     * payload was acknowledged, so the producer's own barrier still protects
+     * the arena — but the caller owes an error rather than a run that quietly
+     * publishes an incomplete file.
+     */
+    int close_args_dump_run_boundary(const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete);
+
+    /**
      * Tear down the four shared diagnostics collectors after the launched
      * kernels have synced. Each block is gated on `dfx`, this run's own
      * configuration, and does: stop() → reconcile_counters() →
@@ -1912,7 +1934,13 @@ protected:
      * back, which happens only when `device_execution_complete` says the caller
      * observed this run's completion fence.
      */
-    void teardown_shared_collectors_after_run(
+    /**
+     * Returns non-zero when a collector's close reported an ownership failure
+     * the caller must surface — today only retained ArgsDump. A caller folds it
+     * into its own rc behind any device error, which stays the more useful
+     * diagnosis.
+     */
+    int teardown_shared_collectors_after_run(
         const DfxRunConfig &dfx, uint32_t pipeline_slot, uint64_t run_epoch, bool device_execution_complete
     );
 

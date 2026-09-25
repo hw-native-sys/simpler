@@ -600,10 +600,10 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
 
 int DeviceRunner::poll_execution(const ActiveExecution &) { return run_completion_.poll(); }
 
-int DeviceRunner::drain_execution(ActiveExecution &active) {
+DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     if (active_run_ == nullptr || active.prepared == nullptr) {
         LOG_ERROR("drain_execution called without a launched simulated run");
-        return PTO_RUNTIME_ERR_INTERNAL;
+        return DrainOutcome::device_error(PTO_RUNTIME_ERR_INTERNAL);
     }
     const DfxRunConfig &dfx = active.prepared->dfx;
     auto run_cleanup = RAIIScopeGuard([this]() {
@@ -662,14 +662,23 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
         // them: a failed run is the one whose swimlane, dumped tensors and
         // dep_gen graph are worth reading. `false` withholds only the run
         // terminal snapshot, which this run never reached.
-        teardown_shared_collectors_after_run(
+        // The runtime error that brought this path here stays authoritative, so
+        // a diagnostics ownership failure only logs on it.
+        const int error_teardown_rc = teardown_shared_collectors_after_run(
             dfx, active.prepared->pipeline_slot, active.prepared->identity.run_epoch, false
         );
+        if (error_teardown_rc != 0) {
+            LOG_ERROR("Diagnostics teardown reported %d on the error path; the run error is kept", error_teardown_rc);
+        }
         emit_device_dep_gen_graph(dfx);
-        return runtime_rc;
+        return DrainOutcome::device_error(runtime_rc);
     }
 
-    teardown_shared_collectors_after_run(
+    // A retained diagnostics close that could not prove it owns this run's
+    // collected content fails the run: the claim is released here, and a caller
+    // told the run succeeded would read files whose completeness nothing
+    // established.
+    const int teardown_rc = teardown_shared_collectors_after_run(
         dfx, active.prepared->pipeline_slot, active.prepared->identity.run_epoch, true
     );
     emit_device_dep_gen_graph(dfx);
@@ -689,7 +698,7 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
         aicore_so_path_.clear();
     }
 
-    return 0;
+    return DrainOutcome::device_complete(teardown_rc);
 }
 
 void DeviceRunner::emit_device_dep_gen_graph(const DfxRunConfig &dfx) {
@@ -774,7 +783,7 @@ int DeviceRunner::finalize() {
     // Collectors outlive every run on this runner, so this is where their device
     // resources are released — including for a runner that only ever initialized
     // them and never enqueued.
-    finalize_collectors();
+    const int collector_rc = finalize_collectors();
 
     release_callable_state();
 
@@ -825,7 +834,10 @@ int DeviceRunner::finalize() {
     worker_count_ = 0;
     last_runtime_ = nullptr;
 
-    return 0;
+    // A diagnostics failure the collector teardown discovered reaches the
+    // caller only through this return. Nothing above it reports a failure of
+    // its own here, so there is no error for it to displace.
+    return collector_rc;
 }
 
 // =============================================================================
@@ -844,7 +856,12 @@ int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecuti
     // doing this under the execution claim is what keeps the release off a live
     // predecessor's pools.
     if (collector_shape_is_stale(num_aicore, aicpu_thread_num, launch_aicpu_num)) {
-        finalize_collectors();
+        // A rebuild's own release can report a diagnostics failure; it is
+        // sticky in the collector's summary, so the next flush reports it.
+        const int rebuild_rc = finalize_collectors();
+        if (rebuild_rc != 0) {
+            LOG_ERROR("Collector rebuild: diagnostics collectors reported %d while being released", rebuild_rc);
+        }
     }
     latch_collector_shape(num_aicore, aicpu_thread_num, launch_aicpu_num);
 
@@ -1035,7 +1052,7 @@ int DeviceRunner::init_scope_stats(int num_threads) {
     return 0;
 }
 
-void DeviceRunner::finalize_collectors() {
+int DeviceRunner::finalize_collectors() {
     clear_collector_shape();
     auto free_cb = [this](void *dev_ptr) -> int {
         return mem_alloc_.free(dev_ptr);
@@ -1044,8 +1061,12 @@ void DeviceRunner::finalize_collectors() {
     if (chip_swimlane_collector_.is_initialized()) {
         chip_swimlane_collector_.finalize(nullptr, free_cb);
     }
+    // The one collector whose finalize can discover a failure of its own:
+    // retained ArgsDump does its last host sealing there, after the caller's
+    // own diagnostic flush has already run and returned.
+    int rc = 0;
     if (dump_collector_.is_initialized()) {
-        dump_collector_.finalize(nullptr, free_cb);
+        rc = dump_collector_.finalize(nullptr, free_cb);
     }
     if (pmu_collector_.is_initialized()) {
         pmu_collector_.finalize(nullptr, free_cb);
@@ -1057,4 +1078,5 @@ void DeviceRunner::finalize_collectors() {
         scope_stats_collector_.finalize(nullptr, free_cb);
         kernel_args_.scope_stats_data_base = 0;
     }
+    return rc;
 }

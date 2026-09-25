@@ -127,7 +127,11 @@ int run_retention_probe(
             // two numbers together indicate is how much of the successor the
             // synchronize had already absorbed.
             const Clock::time_point drain_start = Clock::now();
-            report->successor_drain_rc = runner.drain_execution(**active_successor_out);
+            // The report carries one code for the successor, and it becomes
+            // that run's `completion_rc`, so it takes the composed result:
+            // a device error first, with a diagnostics ownership failure still
+            // failing the run behind it.
+            report->successor_drain_rc = runner.drain_execution(**active_successor_out).combined();
             report->successor_drain_ns = elapsed_ns(drain_start);
         }
         RunRetentionProbePeer::adopt_drain_ownership(runner, prepared);

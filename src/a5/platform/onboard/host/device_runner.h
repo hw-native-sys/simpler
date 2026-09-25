@@ -100,7 +100,7 @@ public:
     LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) override;
     void abandon_prepared_execution(PreparedExecution &prepared) noexcept override;
     int poll_execution(const ActiveExecution &active) override;
-    int drain_execution(ActiveExecution &active) override;
+    DrainOutcome drain_execution(ActiveExecution &active) override;
     bool can_accept_run() const override { return !device_unusable_.load(std::memory_order_acquire); }
 
     // `set_chip_swimlane_enabled`, `set_dump_args_enabled`,
@@ -360,5 +360,14 @@ private:
     // whose init succeeded, in the only safe order (stop() joins mgmt before
     // poll). Idempotent — collectors that never initialized are skipped.
     // Does not release device memory; full release happens in finalize().
-    void finalize_collectors(bool abandon_device_resources = false);
+    /**
+     * Release the diagnostics collectors' shared memory.
+     *
+     * Returns non-zero when a collector's own finalize reported a failure —
+     * today only retained ArgsDump, whose last host sealing happens there,
+     * after the caller's diagnostic flush has already run. A caller folds this
+     * into its own rc only where no device error has been recorded: a device
+     * failure is the more useful diagnosis and keeps priority.
+     */
+    int finalize_collectors(bool abandon_device_resources = false);
 };

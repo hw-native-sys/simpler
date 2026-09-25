@@ -378,6 +378,93 @@ What you can read out of `args_dump.json` and, when present, `args.bin`:
 - **Loss accounting** — a per-record `truncated` flag plus aggregate
   `dropped_records` in the summary.
 
+### 4.1 Background output across repeated runs
+
+By default a run's dump is finished on that run's own boundary: when `run()`
+returns, both `args.bin` and `args_dump.json` are complete. With
+`Worker.init(collect_across_runs=True)` — a level-3 worker with local chip
+children, the same gate `Worker.flush_diagnostics` enforces — ArgsDump instead
+finishes one run's payload file and manifest on a background writer while the
+next run executes on the device. The device still runs one op at a time; only
+the host-side output moves.
+
+What changes for a caller:
+
+- **`run()` returning no longer means the files are complete.** Call the
+  existing `flush_diagnostics(timeout)` before reading them. It returns
+  normally only when, for every run closed before the call, both its payload
+  bytes reached its payload file and its manifest was published.
+- **Each run owns an exclusive file pair.** The payload is
+  `args.e<run_epoch>.bin` (with a `.1`, `.2`, … suffix if a name is already
+  taken, which happens only when another process reaches the same destination
+  with the same epoch number), and the manifest still names it through
+  `bin_file`. A reader takes the payload's name from the manifest, as it
+  already does.
+- **The manifest is the signal, not the payload file.** A payload file may
+  exist and still be growing; the manifest appears only at publication, by
+  atomic rename, so whichever `args_dump.json` a reader sees is always
+  consistent with the payload file it names.
+- **Nothing is deleted.** A published payload file is kept so a reader holding
+  an older manifest does not lose its bytes, and a failed run keeps its payload
+  and its `args_dump.json.<token>.tmp` as evidence. A reused output prefix
+  therefore accumulates files until you remove them, and a destination that
+  still holds a failed run's `.tmp` refuses the next run rather than publishing
+  beside evidence nobody has read.
+- **A run's boundary still does finite work.** Before it returns, the close
+  reads this run's terminal lane state and waits — bounded — for proof that
+  every buffer the run published has been received into host-owned storage.
+  That proof is what makes the leftover decision sound and what keeps the
+  successor from reusing an arena whose bytes nobody copied; a run whose proof
+  does not land **fails**, rather than quietly publishing a file whose
+  completeness nothing established.
+- **Two runs may be unpublished at once.** A third is refused *before the
+  device is handed anything*, so a slow disk fails a launch instead of silently
+  queueing behind it. The same refusal happens when a destination is owned by
+  an open run, when no exclusive name pair is available, or when the retained
+  host budget cannot admit the run's fixed state.
+- **Retained host memory is bounded.** One ArgsDump collector charges its
+  retained metadata, payload copies and queue nodes against its own
+  **256 MiB** budget, charged before each allocation and including the
+  transient peak while a metadata bucket grows. That figure is ArgsDump's
+  alone: the total host cost of diagnostics is the sum over the collectors you
+  enable. Device pool and arena sizes are unchanged.
+- **Failures are explicit and sticky.** A host-discarded record, a device-side
+  dropped record, a write failure, or a completeness this collector cannot
+  prove all fail `flush_diagnostics`, and the record survives for the runner's
+  life — removing the evidence files does not clear it. A published manifest
+  from any of those runs carries `counts_unknown: true` and a
+  `collection_verdict`, so no artifact from a lossy run reads as complete.
+  Device-side truncation keeps its existing non-failing status: it is
+  configured behaviour (`PLATFORM_DUMP_AVG_TENSOR_BYTES`), reported by
+  `truncated` and `truncated_args`, and is not host loss.
+- **Extra manifest fields, diagnostic only** — per-arg `host_discarded`, and
+  per-run `host_discarded_args`, `metadata_discarded_records`,
+  `counts_unknown` and `collection_verdict`. They explain an incomplete result;
+  they never excuse one.
+
+Two honest limits of this mode:
+
+- **A run that dies without an observed device fence is not recovered.** The
+  default path reads a hung run's un-flushed buffer back; the retained path
+  does not, because nothing there proves the device producers stopped, and
+  reading a buffer a successor may already have recycled is worse than an
+  incomplete dump. Leave `collect_across_runs` off for that investigation.
+- **A blocked disk is not a bounded wait.** `flush_diagnostics` is bounded by
+  the timeout you pass it, not by a promise that the writer finishes. It does
+  not, however, hold the *device*: the producer's arena is released once the
+  payload is in host-owned storage, so a stalled writer delays publication and
+  nothing else. Only a payload the device actually handed over takes part in
+  that release — a record recovered from a buffer it never published is output,
+  not an acknowledgement, and contributes nothing to it.
+
+The lane payload counters (`published_payload_count`,
+`completed_payload_count`) become monotonic for the collector's life on this
+path instead of being reset per run, so a predecessor's writer cannot have its
+acknowledgements zeroed by a successor's admission. The design assumes one
+collector's lifetime does not produce 2⁶⁴ payload records; admission checks the
+counters' headroom and refuses a run that is close to it, which lowers the risk
+of reaching that bound rather than proving no single run can.
+
 ## 5. Design Highlights
 
 `CoreTaskArgs::dump(...)` selection state is compiled only when

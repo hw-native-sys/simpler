@@ -623,8 +623,8 @@ int DeviceRunner::poll_execution(const ActiveExecution &active) {
     return rc;
 }
 
-int DeviceRunner::drain_execution(ActiveExecution &active) {
-    if (active.prepared == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
+    if (active.prepared == nullptr) return DrainOutcome::device_error(PTO_RUNTIME_ERR_INTERNAL);
     PreparedExecution &prepared = *active.prepared;
     const uint32_t pipeline_slot = prepared.pipeline_slot;
     if (!prepared.resources_owned || run_poll_slot_.load(std::memory_order_relaxed) != pipeline_slot) {
@@ -632,7 +632,7 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
             "drain_execution slot mismatch: requested=%u active=%u owns=%d", pipeline_slot,
             run_poll_slot_.load(std::memory_order_relaxed), static_cast<int>(prepared.resources_owned)
         );
-        return PTO_RUNTIME_ERR_INTERNAL;
+        return DrainOutcome::device_error(PTO_RUNTIME_ERR_INTERNAL);
     }
     auto drain_cleanup = RAIIScopeGuard([this, &prepared]() {
         cleanup_execution(prepared, /*launched=*/true);
@@ -651,21 +651,33 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
         if (prepared.dfx.chip_swimlane_enabled() && !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
             LOG_WARN("Runtime chip-swimlane extension publication failed");
         }
-        teardown_shared_collectors_after_run(prepared.dfx, prepared.pipeline_slot, prepared.identity.run_epoch, false);
+        // The device error that brought this path here stays authoritative, so
+        // a diagnostics ownership failure only logs on it.
+        const int teardown_rc = teardown_shared_collectors_after_run(
+            prepared.dfx, prepared.pipeline_slot, prepared.identity.run_epoch, false
+        );
+        if (teardown_rc != 0) {
+            LOG_ERROR("Diagnostics teardown reported %d on the error path; run error %d is kept", teardown_rc, rc);
+        }
         emit_device_dep_gen_graph(prepared.dfx);
-        return rc;
+        return DrainOutcome::device_error(rc);
     }
 
     read_device_wall_ns(prepared.pipeline_slot);
     if (prepared.dfx.chip_swimlane_enabled() && !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
         LOG_WARN("Runtime chip-swimlane extension publication failed");
     }
-    teardown_shared_collectors_after_run(prepared.dfx, prepared.pipeline_slot, prepared.identity.run_epoch, true);
+    // A retained diagnostics close that could not prove it owns this run's
+    // collected content fails the run: the claim is released here, and a caller
+    // told the run succeeded would read files whose completeness nothing
+    // established.
+    const int teardown_rc =
+        teardown_shared_collectors_after_run(prepared.dfx, prepared.pipeline_slot, prepared.identity.run_epoch, true);
     emit_device_dep_gen_graph(prepared.dfx);
 
     // Reads device memory, so it must precede KernelArgs/runtime cleanup.
     print_handshake_results(prepared.kernel_args);
-    return 0;
+    return DrainOutcome::device_complete(teardown_rc);
 }
 
 void DeviceRunner::emit_device_dep_gen_graph(const DfxRunConfig &dfx) {
@@ -943,7 +955,14 @@ int DeviceRunner::finalize() {
     // Stop collector threads locally, drain and force-reset the card, then
     // forget the old generation's handles.
     if (device_unusable_.load(std::memory_order_acquire)) {
-        finalize_collectors(true);
+        // Its result cannot displace the device failure that brought this path
+        // here, so it is folded in below only if nothing about the device
+        // itself was reported. It is sticky in the collector's own summary
+        // either way.
+        const int fatal_collector_rc = finalize_collectors(true);
+        if (fatal_collector_rc != 0) {
+            LOG_ERROR("Fatal teardown: diagnostics collectors reported %d while being released", fatal_collector_rc);
+        }
 
         // force_reset_device() drains before it resets and returns 0 only when
         // its post-reset probe confirms the card, so a second pass runs against
@@ -1016,7 +1035,11 @@ int DeviceRunner::finalize() {
             device_unusable_.store(false, std::memory_order_release);
         }
         LOG_WARN("DeviceRunner finalized after fatal device failure");
-        return abandon_rc != 0 ? abandon_rc : reset_rc;
+        int fatal_rc = abandon_rc != 0 ? abandon_rc : reset_rc;
+        // Last in priority: a diagnostics failure found while releasing the
+        // collectors is reported only when the device side reported nothing.
+        if (fatal_rc == 0) fatal_rc = fatal_collector_rc;
+        return fatal_rc;
     }
 
     // A kernel-mode context runs on the caller's already-current device, so
@@ -1033,12 +1056,16 @@ int DeviceRunner::finalize() {
     // Cleanup all profiling subsystems (free shm + per-buffer dev/host
     // shadows). Normally already done by drain or enqueue rollback; this is the
     // backstop for the no-run-since-init case.
-    finalize_collectors();
+    const int collector_rc = finalize_collectors();
 
     // Shared cleanup body — streams, kernel_args, callable/orch maps,
     // chip-callable buffer pool, the three arenas, device_wall,
     // mem_alloc_.finalize(), and cached arena sizes.
     rc = finalize_common();
+    // The kernel-mode early return is about device resources this context still
+    // owns and a later close must retry, so only a device result may take it. A
+    // diagnostics failure owns nothing and is folded in at the end, where it
+    // can report without diverting teardown.
     if (rc != 0 && execution_mode_latch().is_kernel()) return rc;
 
     // Reset device and finalize ACL AFTER all device memory is freed. When the
@@ -1086,12 +1113,16 @@ int DeviceRunner::finalize() {
     clear_aicpu_topology_cache();
     device_id_ = -1;
     device_unusable_.store(false, std::memory_order_release);
+    // Last in priority, and after every device decision has been taken: a
+    // diagnostics failure found while releasing the collectors is reported only
+    // when the device side reported nothing, and it never diverts teardown.
+    if (rc == 0 && collector_rc != 0) rc = collector_rc;
     return rc;
 }
 
 // `launch_aicpu_payload` and `launch_aicore_kernel` live on `DeviceRunnerBase`.
 
-void DeviceRunner::finalize_collectors(bool abandon_device_resources) {
+int DeviceRunner::finalize_collectors(bool abandon_device_resources) {
     // Release the diagnostics collectors' shared memory. Collectors survive an
     // ordinary run, so the callers of this are the paths where their pools must
     // not: drain, enqueue rollback, a run whose core / AICPU-thread counts
@@ -1104,8 +1135,14 @@ void DeviceRunner::finalize_collectors(bool abandon_device_resources) {
     if (chip_swimlane_collector_.is_initialized()) {
         chip_swimlane_collector_.finalize(/*unregister_cb=*/nullptr, free_cb);
     }
+    // The one collector whose finalize can discover a failure of its own:
+    // retained ArgsDump does its last host sealing here, which is after the
+    // caller's own diagnostic flush has already run and returned. Its result is
+    // carried out of this function rather than logged, and the caller keeps its
+    // first device error ahead of it.
+    int rc = 0;
     if (dump_collector_.is_initialized()) {
-        dump_collector_.finalize(/*unregister_cb=*/nullptr, free_cb);
+        rc = dump_collector_.finalize(/*unregister_cb=*/nullptr, free_cb);
     }
     if (pmu_collector_.is_initialized()) {
         pmu_collector_.finalize(/*unregister_cb=*/nullptr, free_cb);
@@ -1116,6 +1153,7 @@ void DeviceRunner::finalize_collectors(bool abandon_device_resources) {
     if (scope_stats_collector_.is_initialized()) {
         scope_stats_collector_.finalize(/*unregister_cb=*/nullptr, free_cb);
     }
+    return rc;
 }
 
 // The table folds in whatever register windows the driver maps at query time,
@@ -1152,7 +1190,13 @@ int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecuti
     // against them — so the whole block runs here, where this run holds the
     // execution claim, rather than during its preparation.
     if (collector_shape_is_stale(num_aicore, aicpu_thread_num, active_aicpu_num)) {
-        finalize_collectors();
+        // A rebuild's own release can report a diagnostics failure; it is
+        // sticky in the collector's summary, so the next flush reports it and
+        // this run is not failed for a predecessor's output.
+        const int rebuild_rc = finalize_collectors();
+        if (rebuild_rc != 0) {
+            LOG_ERROR("Collector rebuild: diagnostics collectors reported %d while being released", rebuild_rc);
+        }
     }
     latch_collector_shape(num_aicore, aicpu_thread_num, active_aicpu_num);
 

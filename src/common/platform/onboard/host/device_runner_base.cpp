@@ -3562,8 +3562,26 @@ int DeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &dfx, u
         }
     }
     if (dfx.dump_args_enabled()) {
-        dump_collector_.begin_run(dfx.output_prefix, dfx.dump_args_level);
-        dump_collector_.start(thread_factory);
+        // Configuration picks the path, as it does for swimlane and PMU: a run
+        // a retaining collector will not admit fails here, before any kernel is
+        // submitted, rather than falling into the single-run reset that would
+        // zero counters a predecessor's writer is still acknowledging against.
+        if (dump_collector_.retains_runs()) {
+            // Reader shards before admission: admitting a run waits for every
+            // shard to acknowledge the new run table, and a shard that has not
+            // been spawned cannot acknowledge anything.
+            dump_collector_.start(thread_factory);
+            if (!dump_collector_.run_begin(run_epoch, dfx.output_prefix, dfx.dump_args_level)) {
+                LOG_ERROR(
+                    "ArgsDump: run %llu was not admitted for retained collection",
+                    static_cast<unsigned long long>(run_epoch)
+                );
+                return PTO_RUNTIME_ERR_INTERNAL;
+            }
+        } else {
+            dump_collector_.begin_run(dfx.output_prefix, dfx.dump_args_level);
+            dump_collector_.start(thread_factory);
+        }
     }
     if (dfx.pmu_enabled) {
         // Configuration picks the path, exactly as it does for swimlane: a run
@@ -3608,6 +3626,11 @@ void DeviceRunnerBase::withdraw_unlaunched_collectors_for_run(const DfxRunConfig
             (void)pmu_collector_.abandon_run(run_epoch);
         } catch (...) {}
     }
+    if (dfx.dump_args_enabled() && dump_collector_.retains_runs()) {
+        try {
+            (void)dump_collector_.abandon_run(run_epoch);
+        } catch (...) {}
+    }
     if (!dfx.chip_swimlane_enabled()) return;
     if (!chip_swimlane_collector_.retains_runs()) return;
     // Nothing may escape a rollback path: the caller owes the layer above its
@@ -3640,9 +3663,13 @@ int DeviceRunnerBase::flush_diagnostics(int timeout_ms, std::string *error) {
     };
     std::string swimlane_error;
     std::string pmu_error;
+    std::string dump_error;
     bool ok = true;
     if (chip_swimlane_collector_.retains_runs() &&
         !chip_swimlane_collector_.flush_retained_runs(remaining_ms(), &swimlane_error)) {
+        ok = false;
+    }
+    if (!dump_collector_.flush_retained_runs(remaining_ms(), &dump_error)) {
         ok = false;
     }
     if (!pmu_collector_.flush_retained_runs(remaining_ms(), &pmu_error)) {
@@ -3651,9 +3678,10 @@ int DeviceRunnerBase::flush_diagnostics(int timeout_ms, std::string *error) {
     if (ok) return 0;
     if (error != nullptr) {
         *error = swimlane_error;
-        if (!pmu_error.empty()) {
+        for (const std::string &part : {dump_error, pmu_error}) {
+            if (part.empty()) continue;
             if (!error->empty()) *error += "; ";
-            *error += pmu_error;
+            *error += part;
         }
     }
     return PTO_RUNTIME_ERR_INTERNAL;
@@ -3661,6 +3689,7 @@ int DeviceRunnerBase::flush_diagnostics(int timeout_ms, std::string *error) {
 
 void DeviceRunnerBase::finish_retained_runs() {
     chip_swimlane_collector_.finish_retained_runs();
+    dump_collector_.finish_retained_runs();
     pmu_collector_.finish_retained_runs();
 }
 
@@ -3678,6 +3707,33 @@ void DeviceRunnerBase::write_host_phase_records_artifact(const std::string &outp
     if (!output_prefix.empty() && records.finished()) {
         (void)records.write_records_jsonl(make_host_phase_records_path(output_prefix));
     }
+}
+
+int DeviceRunnerBase::close_args_dump_run_boundary(
+    const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete
+) {
+    if (!dump_collector_.retains_runs()) {
+        dump_collector_.quiesce();
+        dump_collector_.reconcile_counters();
+        dump_collector_.export_dump_files();
+        return 0;
+    }
+    // A retained run keeps only the run boundary's device-side reads — this
+    // run's terminal lane state and, for a lane whose handover its receipt
+    // ledger can decide, an unpublished buffer's records and payload — and
+    // hands the rest to the writer. No quiesce: the pipeline is shared with the
+    // successor, and draining it here is what the per-queue cut replaces.
+    //
+    // `device_execution_complete` is what the caller observed of this run's
+    // fence, and it is the whole of this collector's "this run finished" proof:
+    // the recovery path clears it, and a producer may then never have reached
+    // its own flush — or may still be running on a card a bounded drain did not
+    // prove clean.
+    (void)dfx;
+    // Non-zero when the close could not prove this run's published buffers were
+    // processed into host-owned storage inside its execution claim. That is an
+    // ownership failure, not a file annotation, so it travels out of here.
+    return dump_collector_.run_close(run_epoch, device_execution_complete);
 }
 
 void DeviceRunnerBase::close_pmu_run_boundary(
@@ -3701,13 +3757,20 @@ void DeviceRunnerBase::close_pmu_run_boundary(
     pmu_collector_.run_close(run_epoch, device_execution_complete);
 }
 
-void DeviceRunnerBase::teardown_shared_collectors_after_run(
+int DeviceRunnerBase::teardown_shared_collectors_after_run(
     const DfxRunConfig &dfx, uint32_t pipeline_slot, uint64_t run_epoch, bool device_execution_complete
 ) {
     // Tear down collectors. stop() joins mgmt then collector in the only safe
     // order (mgmt's final-drain pass into L2 has poll as its consumer).
     // Diagnostic exports use the per-task output prefix the user set on
     // CallConfig (CallConfig::validate() enforces non-empty upstream).
+    //
+    // Only ArgsDump's close reports anything here: a retained run whose
+    // published buffers it could not prove processed inside the execution claim
+    // is an ownership failure the caller has to see, because releasing the
+    // claim past one would let the successor reuse an arena whose bytes nobody
+    // copied. Every other collector's close is void, as it was.
+    int args_dump_rc = 0;
     if (dfx.chip_swimlane_enabled() && chip_swimlane_collector_.retains_runs()) {
         // A retained run keeps the run boundary's device-side reads — terminal
         // and live counters — and hands the rest to the writer. No quiesce: the
@@ -3724,9 +3787,7 @@ void DeviceRunnerBase::teardown_shared_collectors_after_run(
         );
         write_host_phase_records_artifact(dfx.output_prefix, pipeline_slot);
         if (dfx.dump_args_enabled()) {
-            dump_collector_.quiesce();
-            dump_collector_.reconcile_counters();
-            dump_collector_.export_dump_files();
+            args_dump_rc = close_args_dump_run_boundary(dfx, run_epoch, device_execution_complete);
         }
         if (dfx.pmu_enabled) {
             close_pmu_run_boundary(dfx, run_epoch, device_execution_complete);
@@ -3736,7 +3797,7 @@ void DeviceRunnerBase::teardown_shared_collectors_after_run(
             scope_stats_collector_.reconcile_counters();
             scope_stats_collector_.write_jsonl(dfx.output_prefix);
         }
-        return;
+        return args_dump_rc;
     }
     if (dfx.chip_swimlane_enabled()) {
         chip_swimlane_collector_.quiesce();
@@ -3757,9 +3818,7 @@ void DeviceRunnerBase::teardown_shared_collectors_after_run(
     write_host_phase_records_artifact(dfx.output_prefix, pipeline_slot);
 
     if (dfx.dump_args_enabled()) {
-        dump_collector_.quiesce();
-        dump_collector_.reconcile_counters();
-        dump_collector_.export_dump_files();
+        args_dump_rc = close_args_dump_run_boundary(dfx, run_epoch, device_execution_complete);
     }
 
     if (dfx.pmu_enabled) {
@@ -3771,6 +3830,7 @@ void DeviceRunnerBase::teardown_shared_collectors_after_run(
         scope_stats_collector_.reconcile_counters();
         scope_stats_collector_.write_jsonl(dfx.output_prefix);
     }
+    return args_dump_rc;
 }
 
 bool DeviceRunnerBase::try_acquire_native_run(

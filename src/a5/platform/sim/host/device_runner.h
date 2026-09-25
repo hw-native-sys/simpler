@@ -40,7 +40,7 @@ public:
     LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) override;
     void abandon_prepared_execution(PreparedExecution &prepared) noexcept override;
     int poll_execution(const ActiveExecution &active) override;
-    int drain_execution(ActiveExecution &active) override;
+    DrainOutcome drain_execution(ActiveExecution &active) override;
     int finalize() override;
     // a5 dep_gen enablement setter, overriding the base no-op (the c_api
     // unconditionally calls it). Also arms the loaded runtime's host-side graph
@@ -79,7 +79,12 @@ private:
 
     // Per-run collector teardown: stop + release shm so a session-scoped Worker
     // can re-init collectors on the next enqueue. Matches a2a3 sim.
-    void finalize_collectors();
+    /**
+     * Release the diagnostics collectors' shared memory. Returns non-zero when
+     * a collector's own finalize reported a failure — today only retained
+     * ArgsDump, whose last host sealing happens there.
+     */
+    int finalize_collectors();
 
     // a5 publishes runtime-derived swimlane metadata that the other arches do
     // not have; the base calls this between the host-phase handoff and the
