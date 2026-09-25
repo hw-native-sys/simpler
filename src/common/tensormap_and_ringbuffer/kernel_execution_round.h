@@ -35,9 +35,7 @@ int32_t execute_kernel_round_impl(
     KernelRoundTicket ticket;
     if (!gate.join(request.launched_threads, cpu, &ticket)) return -1;
     if (ticket.launch_index == 0) {
-        auto handshake = request.handshake;
-        handshake.epoch = ticket.epoch;
-        executor.kernel_storage_attached_ = executor.kernel_storage_.attach(handshake);
+        executor.kernel_storage_attached_ = executor.kernel_storage_.attach(request.handshake);
         int32_t status = request.admission_status;
         if (!executor.kernel_storage_attached_) status = -1;
         if (status == 0) {

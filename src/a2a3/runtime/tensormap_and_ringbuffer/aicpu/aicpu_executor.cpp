@@ -996,7 +996,7 @@ int32_t AicpuExecutor::prepare_kernel_round(const simpler::tmr::KernelExecutionR
     if (!configure_orchestration_args(inputs, orch_args_cached_, orch_so_table_[cid].config_func))
         return static_cast<int32_t>(KernelDispatchStatus::InvalidArgs);
     Runtime *resident = kernel_invocation_.resident();
-    sched_ctx_.bind_handshakes(kernel_storage_.reports());
+    sched_ctx_.bind_handshakes(kernel_storage_.reports(), kernel_storage_.expected_epoch());
     const int32_t status = prepare_execution(resident, inputs);
     if (status != 0) return status;
     chip_swimlane_aicpu_record_run_boundary();

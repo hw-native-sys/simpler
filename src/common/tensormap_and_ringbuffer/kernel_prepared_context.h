@@ -161,7 +161,7 @@ inline bool make_prepared_kernel_context(
         return false;
     candidate.handshake = {
         reinterpret_cast<TmrLaunchControl *>(descriptor.control_address),
-        reinterpret_cast<TmrCoreReport *>(descriptor.reports_address), descriptor.worker_count, 0
+        reinterpret_cast<TmrCoreReport *>(descriptor.reports_address), descriptor.worker_count
     };
     for (int32_t i = 0; i < descriptor.execution_threads; ++i)
         candidate.allowed_cpus[i] = config.aicpu_allowed_cpus[i];

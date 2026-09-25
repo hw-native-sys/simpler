@@ -53,7 +53,10 @@ struct RuntimeContext;
  */
 class SchedulerContext {
 public:
-    void bind_handshakes(Handshake *reports) { reports_ = reports; }
+    void bind_handshakes(Handshake *reports, uint64_t expected_epoch) {
+        reports_ = reports;
+        expected_report_epoch_ = expected_epoch;
+    }
     bool initialization_aborted() const { return initialization_aborted_.load(std::memory_order_acquire); }
     // =========================================================================
     // Lifecycle
@@ -149,6 +152,7 @@ public:
 
 private:
     Handshake *reports_{nullptr};
+    uint64_t expected_report_epoch_{0};
     std::atomic<bool> initialization_aborted_{false};
     // =========================================================================
     // State

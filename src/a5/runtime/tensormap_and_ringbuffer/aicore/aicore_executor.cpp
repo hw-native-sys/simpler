@@ -205,12 +205,17 @@ __aicore__ static void execute_dispatch_loop(__gm__ Handshake *my_hank) {
     }
 }
 
-__aicore__ static void
-execute_worker(__gm__ Runtime *runtime, __gm__ Handshake *my_hank, int block_idx, CoreType core_type) {
+__aicore__ static void execute_worker(
+    __gm__ Runtime *runtime, __gm__ Handshake *my_hank, int block_idx, CoreType core_type, uint64_t report_epoch = 0
+) {
     my_hank->physical_core_id = get_physical_core_id();
     my_hank->core_type = core_type;
     OUT_OF_ORDER_STORE_BARRIER();
     my_hank->aicore_done = block_idx + 1;
+    if (report_epoch != 0) {
+        OUT_OF_ORDER_STORE_BARRIER();
+        my_hank->report_epoch = report_epoch;
+    }
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
     // Each launch resets this SPR; the AICPU publishes task before opening it.
@@ -233,8 +238,13 @@ __aicore__ __attribute__((weak)) void aicore_execute_kernel(
     if (block_idx < 0 || block_idx >= context->worker_count || context->worker_count > RUNTIME_MAX_WORKER ||
         context->reports_bytes != static_cast<uint64_t>(context->worker_count) * sizeof(TmrCoreReport) ||
         context->reports_address == 0 || context->reports_address > UINT64_MAX - context->reports_bytes ||
-        context->reports_address % alignof(TmrCoreReport) != 0)
+        context->reports_address % alignof(TmrCoreReport) != 0 || context->control_bytes != sizeof(TmrLaunchControl) ||
+        context->control_address == 0 || context->control_address > UINT64_MAX - context->control_bytes ||
+        context->control_address % alignof(TmrLaunchControl) != 0)
         return;
+    auto *control = reinterpret_cast<__gm__ TmrLaunchControl *>(context->control_address);
+    const uint64_t completed_epoch = load_kernel_gm_word(&control->round_epoch);
+    if (completed_epoch == UINT64_MAX) return;
     auto *reports = reinterpret_cast<__gm__ Handshake *>(context->reports_address);
-    execute_worker(runtime, &reports[block_idx], block_idx, core_type);
+    execute_worker(runtime, &reports[block_idx], block_idx, core_type, completed_epoch + 1);
 }
