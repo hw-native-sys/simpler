@@ -71,11 +71,12 @@
 #include "host/device_fault_monitor.h"
 #include "host/device_health_state.h"
 #include "host/dfx_run_config.h"
+#include "host/caller_device_buffers.h"
+#include "host/child_memory_host_view.h"
 #include "host/execution_mode_latch.h"
 #include "host/host_phase_records.h"
 #include "host/host_phase_run_state.h"
 #include "host/kernel_entry_validation.h"
-#include "host/child_memory_host_view.h"
 #include "host/kernel_execution_state.h"
 #include "host/memory_allocator.h"
 #include "host/workspace_manager.h"
@@ -358,6 +359,63 @@ public:
     void free_tensor(void *dev_ptr);
     int copy_to_device(void *dev_ptr, const void *host_ptr, std::size_t bytes);
     int copy_from_device(void *host_ptr, const void *dev_ptr, std::size_t bytes);
+
+    /**
+     * Allocate for a caller and record the allocation as theirs.
+     *
+     * The caller-facing mint. Separate from `allocate_tensor` because only what a caller minted may
+     * be named by a run's arguments: this runner's own regions — workspace, retained temporaries,
+     * arena banks — go through that one and stay unrecorded, so they cannot be borrowed.
+     */
+    void *allocate_caller_buffer(std::size_t bytes);
+
+    /**
+     * Release a caller's allocation, unless a run may still be using it.
+     *
+     * The caller keeps the right to free throughout; this only answers *now*. A refusal names the
+     * borrow that is outstanding and changes nothing, so the caller retries once its run is done.
+     *
+     * @return 0 when the allocation is gone, `PTO_RUNTIME_ERR_INVALID_STATE` when a borrow still
+     *         holds it. Nothing else: the platform free underneath is `free_tensor`, which reports
+     *         no status, so a failure inside it is not visible here and 0 means "this path did not
+     *         refuse", not "the pages are provably returned".
+     */
+    int free_caller_buffer(void *dev_ptr);
+
+    /**
+     * Take `identity`'s borrow over the caller allocations covering `spans`.
+     *
+     * All or nothing — see host/caller_device_buffers.h. A span that names no recorded caller
+     * allocation is what makes this refuse, which is the proof-of-owner the joined path needs.
+     */
+    bool borrow_caller_buffers(uint64_t identity, const CallerDeviceBuffers::Span *spans, std::size_t count);
+
+    /** Drop `identity`'s borrow, or keep it for good when its last consumer is unproven. */
+    void release_caller_buffers(uint64_t identity, bool keep);
+
+    /**
+     * Declare which caller allocations `identity` produces; see host/caller_device_buffers.h.
+     *
+     * @return false when the statement could not be recorded, which the declaring run's bind has
+     *         to treat as its own failure: an undeclared producer reads as no producer.
+     */
+    [[nodiscard]] bool declare_caller_buffer_writes(
+        uint64_t identity, const CallerDeviceBuffers::Span *spans, std::size_t count,
+        std::size_t *unresolved_out = nullptr
+    ) {
+        return caller_device_buffers_.declare_writes(identity, spans, count, unresolved_out);
+    }
+
+    /** Whether `[addr, addr + bytes)` has no readable content for `identity` yet. */
+    bool caller_buffer_written_by_other_run(uint64_t identity, uint64_t addr, uint64_t bytes) const {
+        return caller_device_buffers_.written_by_other_run(identity, addr, bytes);
+    }
+
+    /** The caller allocations this context has recorded, for teardown reporting and tests. */
+    std::size_t caller_buffer_count() const { return caller_device_buffers_.allocation_count(); }
+    std::size_t caller_buffer_borrow_count() const { return caller_device_buffers_.borrow_count(); }
+    std::size_t caller_buffer_retained_count() const { return caller_device_buffers_.retained_count(); }
+
     int device_memset(void *dev_ptr, int value, std::size_t bytes);
     void get_retained_temp_buffer(uint32_t pipeline_slot, void **addr, std::size_t *size);
     void set_retained_temp_buffer(uint32_t pipeline_slot, void *addr, std::size_t size);
@@ -2267,6 +2325,12 @@ protected:
     host::LoadAicpuOp load_aicpu_op_;
 
     MemoryAllocator mem_alloc_;
+
+    // The device allocations a caller minted through this context, and which
+    // runs still hold them — see host/caller_device_buffers.h. Only the
+    // caller-facing mint records here, so an address this runner allocated for
+    // itself is absent and cannot be named by a run's arguments.
+    CallerDeviceBuffers caller_device_buffers_;
 
     // One budget and one ownership ledger for this context's workspace
     // regions. Off unless a caller latches a budget.

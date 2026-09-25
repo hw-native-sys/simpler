@@ -167,22 +167,36 @@ static constexpr int32_t normalized_fatal_code(int32_t error_code) {
 // cascade. The CAS is load-bearing rather than decorative: a recording worker and
 // the bind thread both reach here (see OrchestratorState::fatal_code).
 // TaskAllocator::report_capacity_exhausted writes the same field under the same rule.
-static int32_t orch_mark_fatal(OrchestratorState *orch, int32_t error_code) {
+//
+// `latched_out` receives the code that owns the field after this call, whoever put it
+// there. The return value is whether *this* call put it there, and it is the only
+// answer to that question: a load before the exchange can be overtaken, and the
+// latched code cannot stand in for ownership because two reporters may carry the same
+// code. A caller that must know whether the run's failure is its own takes the bool.
+static bool orch_mark_fatal_owned(OrchestratorState *orch, int32_t error_code, int32_t *latched_out) {
     always_assert(orch != nullptr);
     const int32_t code = normalized_fatal_code(error_code);
     int32_t expected = SIMPLER_ERROR_NONE;
-    if (orch->fatal_code.compare_exchange_strong(expected, code, std::memory_order_acq_rel)) {
-        return code;
-    }
+    const bool owned = orch->fatal_code.compare_exchange_strong(expected, code, std::memory_order_acq_rel);
     // A failed exchange loads the winner's code into `expected`.
-    return expected;
+    if (latched_out != nullptr) *latched_out = owned ? code : expected;
+    return owned;
 }
 
-static void
+static int32_t orch_mark_fatal(OrchestratorState *orch, int32_t error_code) {
+    int32_t latched = SIMPLER_ERROR_NONE;
+    (void)orch_mark_fatal_owned(orch, error_code, &latched);
+    return latched;
+}
+
+// @return whether this report latched the field, i.e. whether this failure is the one
+//         the run will be judged by.
+static bool
 orch_report_fatal_v(OrchestratorState *orch, int32_t error_code, const char *func, const char *fmt, va_list args) {
     const int32_t reported = normalized_fatal_code(error_code);
     // Differs from `reported` only when an earlier fatal already owns the field.
-    const int32_t latched_code = orch_mark_fatal(orch, reported);
+    int32_t latched_code = reported;
+    const bool owned = orch_mark_fatal_owned(orch, reported, &latched_code);
 
     if (fmt == nullptr || fmt[0] == '\0') {
         if (latched_code != reported) {
@@ -190,24 +204,34 @@ orch_report_fatal_v(OrchestratorState *orch, int32_t error_code, const char *fun
         } else {
             unified_log_error(func, "FATAL(code=%d)", reported);
         }
-        return;
+        return owned;
     }
 
     std::array<char, 1024> message{};
     vsnprintf(message.data(), message.size(), fmt, args);
     if (latched_code != reported) {
         unified_log_error(func, "FATAL(code=%d, latched=%d): %s", reported, latched_code, message.data());
-        return;
+        return owned;
     }
     unified_log_error(func, "FATAL(code=%d): %s", reported, message.data());
+    return owned;
 }
 
 void OrchestratorState::report_fatal(int32_t error_code, const char *func, const char *fmt, ...) {
     auto *orch = this;
     va_list args;
     va_start(args, fmt);
-    orch_report_fatal_v(orch, error_code, func, fmt, args);
+    (void)orch_report_fatal_v(orch, error_code, func, fmt, args);
     va_end(args);
+}
+
+bool OrchestratorState::report_fatal_owned(int32_t error_code, const char *func, const char *fmt, ...) {
+    auto *orch = this;
+    va_list args;
+    va_start(args, fmt);
+    const bool owned = orch_report_fatal_v(orch, error_code, func, fmt, args);
+    va_end(args);
+    return owned;
 }
 
 bool OrchestratorState::init(void *sm_base, void *gm_heap, uint64_t heap_size, uint64_t max_tasks) {

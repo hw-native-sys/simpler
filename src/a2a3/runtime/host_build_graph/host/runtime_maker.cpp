@@ -1222,6 +1222,11 @@ extern "C" int bind_callable_to_runtime_impl(
     // the point at which a task could make it stale.
     HostTensorAccessor tensor_access(api);
 
+    // The caller device buffers this run produces, collected from the signature below and
+    // declared before orchestration runs — a concurrently preparing run asks about them from
+    // inside its own graph build, so the answer has to be in place by then.
+    std::vector<CallerBufferSpan> written_spans;
+
     // A lease recorded by an earlier bind names an offset this bind is about to
     // re-slice, so carrying one over would copy this run's bytes back to that
     // run's host pointer. Every exit path from here on leaves the ledger owned
@@ -1265,6 +1270,27 @@ extern "C" int bind_callable_to_runtime_impl(
                 LOG_ERROR("host-orch: could not claim child-memory tensor %d (0x%" PRIx64 ")", i, t.buffer.addr);
                 return PTO_RUNTIME_ERR_INTERNAL;
             }
+            // This is the one place an argument's direction is known, so it is where this run
+            // says which caller buffers it produces. Another run's host graph build asks that
+            // question before reading one; merely naming an allocation says nothing, so an input
+            // shared read-only by two runs stays readable to both.
+            //
+            // A device tensor the signature does not cover is refused. Direction is the only thing
+            // this argument's handling turns on — it is passed through rather than copied either
+            // way — so an uncovered index is an argument list the callable does not describe, and
+            // neither answer is available: declaring it would refuse a legal shared read, and not
+            // declaring it would let a concurrently preparing run read bytes nobody has produced.
+            if (signature == nullptr || i >= sig_count) {
+                LOG_ERROR(
+                    "host-orch: device tensor %d has no entry in this callable's %d-entry signature. A device "
+                    "argument is passed through by address, so its direction is the only thing its handling "
+                    "depends on -- give the callable a signature that covers every tensor it is called with",
+                    i, sig_count
+                );
+                return runtime_status_from_error_code(SIMPLER_ERROR_INVALID_ARGS);
+            }
+            const bool writes = signature[i] == ArgDirection::OUT || signature[i] == ArgDirection::INOUT;
+            if (writes) written_spans.push_back(CallerBufferSpan{t.buffer.addr, t.buffer.size});
             device_args.add_tensor(t);
             continue;
         }
@@ -1410,6 +1436,19 @@ extern "C" int bind_callable_to_runtime_impl(
         LOG_ERROR("host-orch: orchestration entry points were not resolved");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    // Before orchestration, which is the window in which a concurrently preparing run's host
+    // graph build can ask whether these bytes have a producer. Declared even when the list is
+    // empty, so a re-prepared run's previous declaration is replaced rather than left standing.
+    // A statement that could not be recorded fails the bind here: it would otherwise read to
+    // every other run as a buffer nobody produces, which is the one answer that lets a build
+    // consume bytes this run has not written yet.
+    if (!api->declare_caller_device_writes(written_spans.data(), static_cast<uint32_t>(written_spans.size()))) {
+        LOG_ERROR(
+            "%s", "host-orch: could not declare the caller device buffers this run produces, so another run's graph "
+                  "build could read them as finished; refusing the prepare instead"
+        );
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
     {
         ChipTaskArgs orch_l2;
         orch_l2.create_from_entry_storage(runtime->get_orch_args());
@@ -1421,6 +1460,8 @@ extern "C" int bind_callable_to_runtime_impl(
         const size_t view_count = tensor_access.mapping_count();
         const uint64_t view_bytes = tensor_access.mapped_bytes();
         const uint64_t device_copies = tensor_access.device_copy_count();
+        // Read before the close, which is where every other observation of this window is taken.
+        const bool tensor_access_deferred = tensor_access.dependency_wait_is_this_runs_cause();
         const BindPhaseMark view_close_phase = bind_phase_begin();
         tensor_access.close();
         {
@@ -1430,6 +1471,29 @@ extern "C" int bind_callable_to_runtime_impl(
                 device_copies
             );
             record_bind_phase(HostPhaseKind::BindHostViewClose, view_close_phase, attrs);
+        }
+        // A failed orchestration whose *first* failure was a deferred access: the access is
+        // refused to keep a value nobody has produced out of the graph, and that refusal latches
+        // the fatal which stops the run. Both halves are required, and the mark carries the first
+        // half on its own — the accessors that set it short-circuit once a fatal is latched, so an
+        // orchestration that failed for a reason of its own never reaches here and reports that
+        // reason below. A run's own error is never converted into a retry, because nothing
+        // guarantees a stateful callback raises it again.
+        //
+        // Reported as the depth-one fallback rather than as this run's error. The bytes do not
+        // exist *yet* — the declaring run is still executing — and the lane's answer to that is
+        // the one it already gives a prepared successor it cannot place: leave the run queued and
+        // prepare it again once it reaches the front, which is after its predecessor has retired
+        // and released the declaration. So the build waits for the value it needs, which is the
+        // behaviour this program had before a device argument could be enqueued early, and the
+        // live predecessor is untouched. A cleanup that cannot complete still takes precedence
+        // over this code and fails the run, which is what `cleanup_failed_prepare` grades.
+        if (total_tasks < 0 && tensor_access_deferred) {
+            LOG_INFO(
+                "%s", "host-orch: this run's graph build needs the bytes of a device argument another live run is "
+                      "still producing; preparing at depth one after that run's fence"
+            );
+            return PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE;
         }
         if (total_tasks < 0) {
             LOG_ERROR("host-orch: orchestration run failed");

@@ -105,6 +105,14 @@ hbg_case(test_hbg_bind_ledger.cpp
         # HostLogger is missing, so this takes host_log.cpp for that alone.
         ${SIMPLER_SRC}/common/log/host_log.cpp)
 
+# Which maker states the caller device buffers a run produces. a2a3's does; a5's makes no such
+# statement, so the cases covering the declaration assert the opposite fact there rather than
+# skipping. Named after the property, not the arch, so the assertions read as what they check.
+if(TARGET test_a2a3_hbg_bind_ledger)
+    target_compile_definitions(test_a2a3_hbg_bind_ledger
+        PRIVATE SIMPLER_TEST_HBG_MAKER_DECLARES_CALLER_WRITES=1)
+endif()
+
 # The scheduler pair links its arch's scheduler TUs plus the AICPU collectors
 # the scheduler raises into. a2a3 reaches the sim register shim directly; a5
 # needs a stub for the completion path its scheduler does not provide here.
@@ -149,6 +157,11 @@ simpler_ut_add_target(NAME test_async_poll_phase_accumulator
 hbg_case(test_native_run_acceptance.cpp
     SOURCES  ${HBG_COMMON_SHARED_DIR}/runtime.cpp
     INCLUDES ${SIMPLER_SRC}/common/worker)
+
+# The host accessor's refusals, over a fake HostApi table: a caller device buffer a live run still
+# holds is deferred, an address no region covers stays an invalid argument.
+hbg_case(test_host_tensor_access_deferral.cpp
+    SOURCES ${HBG_HOST_DIR}/host_tensor_access.cpp)
 
 # Everything else here is a case of this runtime with nothing beyond the
 # directory's own contract, built for both arches. Declaring one above takes it

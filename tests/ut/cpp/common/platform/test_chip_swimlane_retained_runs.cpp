@@ -634,6 +634,14 @@ TEST(ChipSwimlaneRetainedRunsTest, RunWithoutTerminalStillPublishesAndReleasesIt
     EXPECT_NE(body.find("\"processing_complete\": false"), std::string::npos) << body.substr(0, 400);
     EXPECT_NE(body.find("partial_cut_unknown"), std::string::npos);
 
+    // The artifact exists one step before the slot does: the writer publishes
+    // the file, then records the verdict, retires the cut and only then hands
+    // the slot back. So the release is waited for on its own, on the barrier the
+    // writer wakes when a slot goes free — and a cut-unknown run leaves a
+    // readable artifact, which is a verdict and not a flush failure.
+    std::string error;
+    ASSERT_TRUE(fx.collector.flush_retained_runs(8000, &error)) << error;
+
     // The slot came back: a further run is admitted without waiting.
     const auto stats = fx.collector.retained_run_stats_for_test();
     EXPECT_EQ(stats.open_slots, 0u);

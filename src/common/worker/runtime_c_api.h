@@ -494,11 +494,60 @@ size_t get_runtime_size(void);
 /** Return the required byte alignment of the opaque prepared-run storage. */
 size_t get_runtime_alignment(void);
 
-/** Allocate device memory in the given device context. */
+/**
+ * Allocate device memory in the given device context, on a caller's request.
+ *
+ * The allocation is recorded as the caller's, which is what lets a run's arguments name it and what
+ * makes `device_free_caller_buffer_ctx` able to refuse a release a run still needs. Memory the
+ * context allocates for itself does not come through here and is not nameable by a run.
+ */
 void *device_malloc_ctx(DeviceContextHandle ctx, size_t size);
 
 /** Free device memory previously allocated in the given device context. */
 void device_free_ctx(DeviceContextHandle ctx, void *dev_ptr);
+
+/**
+ * Release a caller allocation, unless a run may still be using it.
+ *
+ * The caller keeps the right to release throughout; this answers only whether now is safe. The
+ * check and the release are one step inside the context, so a borrow taken between a caller's
+ * question and its release cannot be missed.
+ *
+ * @return 0 when the allocation is gone, PTO_RUNTIME_ERR_INVALID_STATE when a borrow still holds
+ *         it — in which case nothing changed. Nothing else: the platform free underneath reports
+ *         no status, so 0 means this path did not refuse rather than that the pages are provably
+ *         returned.
+ */
+int device_free_caller_buffer_ctx(DeviceContextHandle ctx, void *dev_ptr);
+
+/** One span of a caller device allocation a run names. */
+typedef struct CallerBufferSpan {
+    uint64_t addr;
+    uint64_t bytes;
+} CallerBufferSpan;
+
+/**
+ * Take `borrow_id`'s reference on the caller allocations covering `spans`.
+ *
+ * All or nothing: a span naming no recorded caller allocation leaves no reference at all, so an
+ * address whose owner cannot be proven is refused rather than half-held. Re-borrowing under one id
+ * replaces that id's set, which is what a re-prepared run needs.
+ *
+ * @return 0 when every span resolved and the reference is held, PTO_RUNTIME_ERR_INVALID_STATE when
+ *         one did not.
+ */
+int device_borrow_caller_buffers_ctx(
+    DeviceContextHandle ctx, const CallerBufferSpan *spans, uint32_t count, uint64_t borrow_id
+);
+
+/**
+ * Drop `borrow_id`'s reference, or keep it for the process's remaining life.
+ *
+ * Nonzero `keep` is for a run whose last device consumer could not be proven finished: the device
+ * may still name those bytes and nothing later can establish otherwise, so the reference is moved
+ * beyond the reach of any release rather than merely delayed.
+ */
+void device_release_caller_buffers_ctx(DeviceContextHandle ctx, uint64_t borrow_id, int keep);
 
 /**
  * Total device HBM (bytes) currently committed by this device context's

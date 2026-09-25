@@ -270,6 +270,51 @@ uint64_t DeviceRunnerBase::retained_temp_addr(uint32_t slot_id) const {
 
 void *DeviceRunnerBase::allocate_tensor(std::size_t bytes) { return mem_alloc_.alloc(bytes); }
 
+void *DeviceRunnerBase::allocate_caller_buffer(std::size_t bytes) {
+    void *ptr = allocate_tensor(bytes);
+    if (ptr == nullptr) return nullptr;
+    try {
+        caller_device_buffers_.record(ptr, bytes);
+    } catch (...) {
+        // Recording allocates, and the entry is what makes this allocation the caller's. Without
+        // it the caller would be handed nothing while the device memory stayed committed to no
+        // one, so the allocation is rolled back and the failure reported as a failed allocation.
+        // Nothing can hold a borrow on it yet: no run has seen the address.
+        free_tensor(ptr);
+        LOG_ERROR("allocate_caller_buffer: could not record %zu bytes as a caller allocation; rolled it back", bytes);
+        return nullptr;
+    }
+    return ptr;
+}
+
+int DeviceRunnerBase::free_caller_buffer(void *dev_ptr) {
+    if (dev_ptr == nullptr) return 0;
+    // Check and forget are one step inside the table, so a borrow taken between a caller's
+    // question and its release cannot be missed, and the address leaves the table before its pages
+    // can go. An address the table never recorded is held by nothing and passes straight through,
+    // which is what keeps this from changing anything for an allocation no caller minted.
+    if (!caller_device_buffers_.forget_if_unborrowed(dev_ptr)) {
+        LOG_ERROR(
+            "free_caller_buffer: %p is still held by %zu borrowing run(s) and %zu retained "
+            "reference(s); the caller's release is refused rather than performed",
+            dev_ptr, caller_device_buffers_.borrow_count(), caller_device_buffers_.retained_count()
+        );
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    free_tensor(dev_ptr);
+    return 0;
+}
+
+bool DeviceRunnerBase::borrow_caller_buffers(
+    uint64_t identity, const CallerDeviceBuffers::Span *spans, std::size_t count
+) {
+    return caller_device_buffers_.borrow(identity, spans, count);
+}
+
+void DeviceRunnerBase::release_caller_buffers(uint64_t identity, bool keep) {
+    caller_device_buffers_.release(identity, keep);
+}
+
 void DeviceRunnerBase::free_tensor(void *dev_ptr) {
     if (dev_ptr != nullptr) {
         // Before the pages go: a mapping outliving them would hand a live host
@@ -2067,7 +2112,8 @@ int DeviceRunnerBase::bind_callable_to_runtime(
     // Per-run binding (tensor args, GM heap, SM alloc). host_orch_func_ptr is
     // non-null only on the hbg path; signature is the cached ChipCallable
     // signature_[], plumbed end-to-end for per-tensor H2D/D2H direction
-    // decisions in runtime_maker (trb consumes it, hbg ignores it). Both stay
+    // decisions in runtime_maker (trb consumes it for copy direction; hbg consumes it too, for
+    // copy direction and for the caller device buffers a run declares it produces). Both stay
     // internal to the runner now — they are no longer returned to the c_api.
     return bind_callable_to_runtime_impl(
         &runtime, api, reinterpret_cast<const ChipStorageTaskArgs *>(orch_args), state.host_orch_func_ptr,

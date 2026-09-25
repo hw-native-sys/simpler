@@ -37,6 +37,19 @@ void *device_malloc_ctx(DeviceContextHandle ctx, size_t size) { return nullptr; 
 
 void device_free_ctx(DeviceContextHandle ctx, void *dev_ptr) {}
 
+// The caller-buffer trio the loader resolves as mandatory. This fixture mints no device memory, so
+// a release has nothing to hold and a borrow can prove no owner: refusing the borrow is the honest
+// answer and is what keeps a run naming a device address off the joined path here.
+int device_free_caller_buffer_ctx(DeviceContextHandle ctx, void *dev_ptr) { return 0; }
+
+int device_borrow_caller_buffers_ctx(
+    DeviceContextHandle ctx, const CallerBufferSpan *spans, uint32_t count, uint64_t borrow_id
+) {
+    return PTO_RUNTIME_ERR_INVALID_STATE;
+}
+
+void device_release_caller_buffers_ctx(DeviceContextHandle ctx, uint64_t borrow_id, int keep) {}
+
 size_t committed_device_memory_ctx(DeviceContextHandle ctx) { return 0; }
 
 int device_memory_info_ctx(DeviceContextHandle ctx, DeviceMemoryInfo *info) { return PTO_RUNTIME_ERR_INTERNAL; }

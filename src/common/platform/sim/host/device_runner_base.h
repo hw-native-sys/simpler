@@ -57,6 +57,7 @@
 #include "common/unified_log.h"
 #include "platform_comm/comm.h"
 #include "host/execution_mode_latch.h"
+#include "host/caller_device_buffers.h"
 #include "host/memory_allocator.h"
 #include "host/chip_swimlane_collector.h"
 #include "host/dfx_run_config.h"
@@ -224,6 +225,38 @@ public:
     void free_tensor(void *dev_ptr);
     int copy_to_device(void *dev_ptr, const void *host_ptr, size_t bytes);
     int copy_from_device(void *host_ptr, const void *dev_ptr, size_t bytes);
+
+    /**
+     * Allocate for a caller and record the allocation as theirs; release it unless a run may still
+     * be using it. Same contract as the onboard runner's pair — see
+     * host/caller_device_buffers.h. A run's arguments may name only what a caller minted, so this
+     * runner's own regions keep going through `allocate_tensor` and stay unrecorded.
+     */
+    void *allocate_caller_buffer(size_t bytes);
+    int free_caller_buffer(void *dev_ptr);
+
+    bool borrow_caller_buffers(uint64_t identity, const CallerDeviceBuffers::Span *spans, size_t count);
+    void release_caller_buffers(uint64_t identity, bool keep);
+    /**
+     * Declare which caller allocations `identity` produces; see host/caller_device_buffers.h.
+     *
+     * @return false when the statement could not be recorded, which the declaring run's bind has
+     *         to treat as its own failure: an undeclared producer reads as no producer.
+     */
+    [[nodiscard]] bool declare_caller_buffer_writes(
+        uint64_t identity, const CallerDeviceBuffers::Span *spans, size_t count, size_t *unresolved_out = nullptr
+    ) {
+        return caller_device_buffers_.declare_writes(identity, spans, count, unresolved_out);
+    }
+
+    /** Whether `[addr, addr + bytes)` has no readable content for `identity` yet. */
+    bool caller_buffer_written_by_other_run(uint64_t identity, uint64_t addr, uint64_t bytes) const {
+        return caller_device_buffers_.written_by_other_run(identity, addr, bytes);
+    }
+    size_t caller_buffer_count() const { return caller_device_buffers_.allocation_count(); }
+    size_t caller_buffer_borrow_count() const { return caller_device_buffers_.borrow_count(); }
+    size_t caller_buffer_retained_count() const { return caller_device_buffers_.retained_count(); }
+
     int device_memset(void *dev_ptr, int value, size_t bytes);
     void get_retained_temp_buffer(uint32_t pipeline_slot, void **addr, size_t *size);
     void set_retained_temp_buffer(uint32_t pipeline_slot, void *addr, size_t size);
@@ -516,6 +549,9 @@ protected:
     uint64_t dma_workspace_addr_[DMA_WORKSPACE_KIND_COUNT]{};
 
     MemoryAllocator mem_alloc_;
+    // The device allocations a caller minted through this context, and which runs still hold them
+    // — see host/caller_device_buffers.h.
+    CallerDeviceBuffers caller_device_buffers_;
     std::array<void *, PTO_PIPELINE_MAX_DEPTH> retained_temp_addrs_{};
     std::array<size_t, PTO_PIPELINE_MAX_DEPTH> retained_temp_sizes_{};
     // Graph Definition storage, one retained block per pipeline slot — see

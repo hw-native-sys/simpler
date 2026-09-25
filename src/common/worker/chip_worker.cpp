@@ -27,6 +27,7 @@
 #include <limits>
 #include <mutex>
 #include <new>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -139,6 +140,12 @@ std::string format_native_run_identity(const ChipWorkerNativeRun &run) {
            " run_epoch=" + std::to_string(run.run_epoch) + ")";
 }
 
+std::string format_device_address(uint64_t addr) {
+    std::ostringstream os;
+    os << "0x" << std::hex << addr;
+    return os.str();
+}
+
 std::vector<uint8_t> read_binary_file(const std::string &path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) {
@@ -242,6 +249,12 @@ void ChipWorker::init(
         destroy_device_context_fn_ = load_symbol<DestroyDeviceContextFn>(handle, "destroy_device_context");
         device_malloc_ctx_fn_ = load_symbol<DeviceMallocCtxFn>(handle, "device_malloc_ctx");
         device_free_ctx_fn_ = load_symbol<DeviceFreeCtxFn>(handle, "device_free_ctx");
+        device_free_caller_buffer_ctx_fn_ =
+            load_symbol<DeviceFreeCallerBufferCtxFn>(handle, "device_free_caller_buffer_ctx");
+        device_borrow_caller_buffers_ctx_fn_ =
+            load_symbol<DeviceBorrowCallerBuffersCtxFn>(handle, "device_borrow_caller_buffers_ctx");
+        device_release_caller_buffers_ctx_fn_ =
+            load_symbol<DeviceReleaseCallerBuffersCtxFn>(handle, "device_release_caller_buffers_ctx");
         device_committed_memory_fn_ = load_symbol<GetCommittedDeviceMemoryFn>(handle, "committed_device_memory_ctx");
         device_memory_info_fn_ = load_symbol<GetDeviceMemoryInfoFn>(handle, "device_memory_info_ctx");
         copy_to_device_ctx_fn_ = load_symbol<CopyToDeviceCtxFn>(handle, "copy_to_device_ctx");
@@ -454,6 +467,9 @@ void ChipWorker::init(
         destroy_device_context_fn_ = nullptr;
         device_malloc_ctx_fn_ = nullptr;
         device_free_ctx_fn_ = nullptr;
+        device_free_caller_buffer_ctx_fn_ = nullptr;
+        device_borrow_caller_buffers_ctx_fn_ = nullptr;
+        device_release_caller_buffers_ctx_fn_ = nullptr;
         device_committed_memory_fn_ = nullptr;
         device_memory_info_fn_ = nullptr;
         copy_to_device_ctx_fn_ = nullptr;
@@ -524,6 +540,9 @@ void ChipWorker::init(
         destroy_device_context_fn_ = nullptr;
         device_malloc_ctx_fn_ = nullptr;
         device_free_ctx_fn_ = nullptr;
+        device_free_caller_buffer_ctx_fn_ = nullptr;
+        device_borrow_caller_buffers_ctx_fn_ = nullptr;
+        device_release_caller_buffers_ctx_fn_ = nullptr;
         device_committed_memory_fn_ = nullptr;
         device_memory_info_fn_ = nullptr;
         copy_to_device_ctx_fn_ = nullptr;
@@ -687,6 +706,9 @@ void ChipWorker::finalize() {
     destroy_device_context_fn_ = nullptr;
     device_malloc_ctx_fn_ = nullptr;
     device_free_ctx_fn_ = nullptr;
+    device_free_caller_buffer_ctx_fn_ = nullptr;
+    device_borrow_caller_buffers_ctx_fn_ = nullptr;
+    device_release_caller_buffers_ctx_fn_ = nullptr;
     device_committed_memory_fn_ = nullptr;
     device_memory_info_fn_ = nullptr;
     copy_to_device_ctx_fn_ = nullptr;
@@ -1433,7 +1455,45 @@ void ChipWorker::free(uint64_t ptr) {
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
+    // Through the guarded entry when the runtime has one: a caller allocation a run may still be
+    // reading or writing is not releasable yet, and the refusal has to reach the caller rather than
+    // be swallowed by the void-returning free. The check and the release are one step inside the
+    // device context, so a borrow taken in between cannot be missed.
+    if (device_free_caller_buffer_ctx_fn_ != nullptr) {
+        int rc = device_free_caller_buffer_ctx_fn_(device_ctx_, reinterpret_cast<void *>(ptr));
+        if (rc == PTO_RUNTIME_ERR_INVALID_STATE) {
+            throw std::runtime_error(
+                "free: device address " + format_device_address(ptr) +
+                " is still in use by a submitted run and cannot be released yet"
+            );
+        }
+        if (rc != 0) {
+            // Any other code is a failure of the release itself, not a refusal, and must not be
+            // reported as one: the address may be gone, or the context may be unusable.
+            throw std::runtime_error(
+                "free: releasing device address " + format_device_address(ptr) + " failed with code " +
+                std::to_string(rc)
+            );
+        }
+        return;
+    }
     device_free_ctx_fn_(device_ctx_, reinterpret_cast<void *>(ptr));
+}
+
+bool ChipWorker::borrow_caller_device_spans(uint64_t borrow_id, const CallerDeviceSpan *spans, size_t count) {
+    if (!initialized_ || device_borrow_caller_buffers_ctx_fn_ == nullptr) return false;
+    std::vector<CallerBufferSpan> wire(count);
+    for (size_t i = 0; i < count; ++i) {
+        wire[i] = CallerBufferSpan{spans[i].addr, spans[i].bytes};
+    }
+    return device_borrow_caller_buffers_ctx_fn_(
+               device_ctx_, wire.data(), static_cast<uint32_t>(wire.size()), borrow_id
+           ) == 0;
+}
+
+void ChipWorker::release_caller_device_borrow(uint64_t borrow_id, bool keep) noexcept {
+    if (device_release_caller_buffers_ctx_fn_ == nullptr) return;
+    device_release_caller_buffers_ctx_fn_(device_ctx_, borrow_id, keep ? 1 : 0);
 }
 
 void ChipWorker::copy_to(uint64_t dst, uint64_t src, size_t size) {

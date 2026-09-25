@@ -461,6 +461,51 @@ extern "C" int prewarm_config_impl(
 
 // One immutable function table is shared by all runners. Each HostApi value
 // binds it to a specific runner and immutable per-run slot/bank selection.
+static int
+declare_caller_device_writes(void *runner_ctx, uint64_t run_id, const CallerBufferSpan *spans, uint32_t count) {
+    if (runner_ctx == nullptr || (count != 0 && spans == nullptr)) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    try {
+        std::vector<CallerDeviceBuffers::Span> written(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            written[i] = CallerDeviceBuffers::Span{spans[i].addr, spans[i].bytes};
+        }
+        std::size_t unresolved = 0;
+        if (!static_cast<DeviceRunnerBase *>(runner_ctx)
+                 ->declare_caller_buffer_writes(run_id, written.data(), written.size(), &unresolved)) {
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        if (unresolved != 0) {
+            // Recorded, but not for every span the run named: an address this context cannot
+            // resolve to a caller mint is an unknown owner, not an absent producer. The fence is
+            // exactly as wide as what was recorded, so those bytes read as having no declared
+            // producer — which is why this is said out loud rather than skipped silently.
+            LOG_WARN(
+                "declare_caller_device_writes: %zu of %u produced span(s) name no caller allocation of this "
+                "device context; their bytes carry no readable-yet fence for a concurrently preparing run",
+                unresolved, count
+            );
+        }
+        return 0;
+    } catch (...) {
+        // Reported, never swallowed: a statement that was not recorded reads to every other run as
+        // a buffer with no producer, so proceeding would serve bytes this run has not written.
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+static int caller_device_span_written_by_other_run(void *runner_ctx, uint64_t run_id, uint64_t addr, uint64_t bytes) {
+    if (runner_ctx == nullptr) return 0;
+    try {
+        return static_cast<DeviceRunnerBase *>(runner_ctx)->caller_buffer_written_by_other_run(run_id, addr, bytes) ?
+                   1 :
+                   0;
+    } catch (...) {
+        // Unreadable is the safe answer to a question that could not be answered: refusing one
+        // access beats serving bytes a producer may not have written.
+        return 1;
+    }
+}
+
 static const HostApiOps g_host_api_ops = {
     .device_malloc = device_malloc,
     .device_free = device_free,
@@ -490,6 +535,8 @@ static const HostApiOps g_host_api_ops = {
     .host_phase_pool_finish = host_phase_pool_finish,
     .publish_chip_swimlane_extension = publish_chip_swimlane_extension,
     .get_run_result = get_run_result,
+    .declare_caller_device_writes = declare_caller_device_writes,
+    .caller_device_span_written_by_other_run = caller_device_span_written_by_other_run,
 };
 
 /* ===========================================================================
@@ -526,7 +573,7 @@ size_t get_runtime_alignment(void) { return alignof(OnboardNativeRunContext); }
 void *device_malloc_ctx(DeviceContextHandle ctx, size_t size) {
     if (ctx == NULL) return NULL;
     try {
-        return static_cast<DeviceRunnerBase *>(ctx)->allocate_tensor(size);
+        return static_cast<DeviceRunnerBase *>(ctx)->allocate_caller_buffer(size);
     } catch (...) {
         return NULL;
     }
@@ -535,7 +582,47 @@ void *device_malloc_ctx(DeviceContextHandle ctx, size_t size) {
 void device_free_ctx(DeviceContextHandle ctx, void *dev_ptr) {
     if (ctx == NULL || dev_ptr == NULL) return;
     try {
-        static_cast<DeviceRunnerBase *>(ctx)->free_tensor(dev_ptr);
+        // The same guarded release the recording mint pairs with, so this legacy entry cannot
+        // release an allocation a run may still reach, nor leave the table holding an address
+        // whose pages are gone. It returns void, so a refusal can only be logged — which is
+        // still the right outcome: not freeing is recoverable, freeing under a live borrow is
+        // not. `device_free_caller_buffer_ctx` is the entry that reports it.
+        (void)static_cast<DeviceRunnerBase *>(ctx)->free_caller_buffer(dev_ptr);
+    } catch (...) {}
+}
+
+int device_free_caller_buffer_ctx(DeviceContextHandle ctx, void *dev_ptr) {
+    if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
+    if (dev_ptr == NULL) return 0;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->free_caller_buffer(dev_ptr);
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int device_borrow_caller_buffers_ctx(
+    DeviceContextHandle ctx, const CallerBufferSpan *spans, uint32_t count, uint64_t borrow_id
+) {
+    if (ctx == NULL || borrow_id == 0) return PTO_RUNTIME_ERR_INTERNAL;
+    if (count != 0 && spans == NULL) return PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        std::vector<CallerDeviceBuffers::Span> resolved(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            resolved[i] = CallerDeviceBuffers::Span{spans[i].addr, spans[i].bytes};
+        }
+        const bool held =
+            static_cast<DeviceRunnerBase *>(ctx)->borrow_caller_buffers(borrow_id, resolved.data(), resolved.size());
+        return held ? 0 : PTO_RUNTIME_ERR_INVALID_STATE;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+void device_release_caller_buffers_ctx(DeviceContextHandle ctx, uint64_t borrow_id, int keep) {
+    if (ctx == NULL || borrow_id == 0) return;
+    try {
+        static_cast<DeviceRunnerBase *>(ctx)->release_caller_buffers(borrow_id, keep != 0);
     } catch (...) {}
 }
 

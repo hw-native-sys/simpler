@@ -24,8 +24,10 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <new>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "call_config.h"
@@ -90,9 +92,11 @@ int wait_run(void *, void *runtime) {
     return 0;
 }
 
+int g_finalize_rc{0};
+
 int finalize_run(void *, void *runtime) {
     g_events.push_back("finalize" + std::to_string(slot_of(runtime)));
-    return 0;
+    return g_finalize_rc;
 }
 
 int supports_successor(void *) { return 1; }
@@ -106,6 +110,7 @@ void prime_worker(ChipWorker &worker, unsigned launch_depth = 2) {
     g_joined_rc = 0;
     g_joined_throws = false;
     g_supports_joined = true;
+    g_finalize_rc = 0;
     g_events.clear();
     worker.launch_depth_ = launch_depth;
     worker.initialized_ = true;
@@ -150,6 +155,33 @@ ChipRun submit(
     const CallConfig &config = CallConfig{}
 ) {
     return lane.submit(1, args, config, PipelineSlotLease{slot, 0, run_id}, run_id, run_id, nullptr, 0, activate);
+}
+
+// The caller-device-buffer hooks, for the runs whose arguments name one. A lane only borrows when
+// the runtime publishes them, which is why every case above leaves them unset and keeps its
+// device-tensor runs off the joined path.
+int g_borrow_rc{0};
+bool g_borrow_throws{false};
+std::vector<uint64_t> g_borrowed;
+std::vector<std::pair<uint64_t, int>> g_released;
+
+int borrow_caller_buffers(void *, const CallerBufferSpan *, uint32_t count, uint64_t borrow_id) {
+    if (g_borrow_throws) throw std::bad_alloc();
+    if (g_borrow_rc != 0) return g_borrow_rc;
+    (void)count;
+    g_borrowed.push_back(borrow_id);
+    return 0;
+}
+
+void release_caller_buffers(void *, uint64_t borrow_id, int keep) { g_released.emplace_back(borrow_id, keep); }
+
+void prime_caller_buffers(ChipWorker &worker) {
+    g_borrow_rc = 0;
+    g_borrow_throws = false;
+    g_borrowed.clear();
+    g_released.clear();
+    worker.device_borrow_caller_buffers_ctx_fn_ = borrow_caller_buffers;
+    worker.device_release_caller_buffers_ctx_fn_ = release_caller_buffers;
 }
 
 using Events = std::vector<std::string>;
@@ -357,6 +389,159 @@ TEST(ChipRunLaneJoinedLaunchTest, AThrowingJoinedLaunchFailsOnlyThatRunAndPoison
     EXPECT_TRUE(first.wait_until(ChipRunLane::Deadline::max()));
     EXPECT_EQ(g_events, (Events{"prepare0", "launch0", "prepare1", "joined1behind0", "finalize1", "finalize0"}));
 
+    EXPECT_THROW(lane.close(), std::runtime_error);
+    worker.finalize();
+}
+
+// ---------------------------------------------------------------------------
+// Caller device buffers: what admits a device-space run, and what admission
+// does when taking the reference fails.
+// ---------------------------------------------------------------------------
+
+TEST(ChipRunLaneCallerBuffersTest, ABorrowedDeviceArgumentReachesTheDeviceEarly) {
+    ChipWorker worker;
+    prime_worker(worker);
+    prime_caller_buffers(worker);
+    ChipRunLane lane(worker);
+
+    // The reference is what makes the caller's address admissible: with it the successor's device
+    // arguments no longer keep it off the joined path.
+    ChipRun first = submit(lane, 101, 0, true, device_args());
+    ChipRun second = submit(lane, 102, 1, false, device_args());
+    second.activate();
+    EXPECT_TRUE(second.launched());
+    EXPECT_EQ(g_events, (Events{"prepare0", "launch0", "prepare1", "joined1behind0"}));
+    // One per slot, and both held while both runs are live.
+    EXPECT_EQ(g_borrowed, (std::vector<uint64_t>{1, 2}));
+    EXPECT_TRUE(g_released.empty());
+
+    g_complete[0] = true;
+    g_complete[1] = true;
+    EXPECT_TRUE(first.done());
+    EXPECT_TRUE(second.done());
+    // Each reference is given back at its own run's finalize, and given back rather than kept:
+    // the finalize succeeded, so the last consumer is proven done.
+    EXPECT_EQ(g_released, (std::vector<std::pair<uint64_t, int>>{{1, 0}, {2, 0}}));
+    lane.close();
+    worker.finalize();
+}
+
+// A predecessor whose device span has no provable owner carries no successor *preparation*
+// either, not just no joined launch. The successor's bind runs its own host graph build, which can
+// read a device argument's bytes; the only thing that keeps it off bytes the run ahead has not
+// produced is that run's declaration, and a run holding no borrow proved no span to declare.
+TEST(ChipRunLaneCallerBuffersTest, AnUnprovableFrontCarriesNoConcurrentPreparation) {
+    ChipWorker worker;
+    prime_worker(worker);
+    prime_caller_buffers(worker);
+    g_borrow_rc = PTO_RUNTIME_ERR_INVALID_STATE;
+    ChipRunLane lane(worker);
+
+    ChipRun first = submit(lane, 101, 0, true, device_args());
+    ASSERT_TRUE(first.launched());
+    ASSERT_TRUE(g_borrowed.empty()) << "the front proved no owner for its device span";
+
+    // Admitted and activated, and still not prepared: the front is launched and the backend
+    // supports concurrent preparation, so the shape is the only thing refusing it.
+    ChipRun second = submit(lane, 102, 1, true, host_args());
+    EXPECT_EQ(g_events, (Events{"prepare0", "launch0"}));
+    EXPECT_FALSE(second.launched());
+
+    // It prepares at the front instead, once the run ahead has retired.
+    g_complete[0] = true;
+    EXPECT_TRUE(first.done());
+    EXPECT_TRUE(second.launched());
+    EXPECT_EQ(g_events, (Events{"prepare0", "launch0", "finalize0", "prepare1", "launch1"}));
+
+    g_complete[1] = true;
+    EXPECT_TRUE(second.done());
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneCallerBuffersTest, AnUnprovableDeviceArgumentStaysOnTheSerialPath) {
+    ChipWorker worker;
+    prime_worker(worker);
+    prime_caller_buffers(worker);
+    g_borrow_rc = PTO_RUNTIME_ERR_INVALID_STATE;
+    ChipRunLane lane(worker);
+
+    // A refused borrow is an address whose owner this context cannot prove. The run is admitted
+    // and correct, it simply does not overlap — which is the behaviour it had before any of this.
+    ChipRun first = submit(lane, 101, 0, true, host_args());
+    ChipRun second = submit(lane, 102, 1, false, device_args());
+    second.activate();
+    EXPECT_FALSE(second.launched());
+    EXPECT_TRUE(g_borrowed.empty());
+    EXPECT_TRUE(g_released.empty()) << "no run has retired yet";
+
+    g_complete[0] = true;
+    EXPECT_TRUE(first.done());
+    EXPECT_TRUE(second.launched());
+    // Every retired run is discharged, borrow or no borrow: the release is also what drops the
+    // declaration its bind may have made, and a run whose borrow was refused can still have made
+    // one. So a release with nothing to give back is the ordinary case, not a leak.
+    EXPECT_EQ(g_released, (std::vector<std::pair<uint64_t, int>>{{1, 0}}));
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneCallerBuffersTest, AFailedBorrowLeavesNoQueuedRunBehind) {
+    ChipWorker worker;
+    prime_worker(worker);
+    prime_caller_buffers(worker);
+    ChipRunLane lane(worker);
+
+    ChipRun first = submit(lane, 101, 0, true, device_args());
+    ASSERT_TRUE(first.launched());
+    ASSERT_EQ(g_borrowed, (std::vector<uint64_t>{1}));
+
+    // Taking the reference allocates, so it can fail. The run must then fail as a run — not leave
+    // an entry queued behind the one still executing, which would make the lane's front a run
+    // nothing will ever finish.
+    g_borrow_throws = true;
+    ChipRun second = submit(lane, 102, 1, false, device_args());
+    // The handle carries the failure the borrow raised, unwrapped: admission stored this run's own
+    // error, so the caller sees what actually went wrong rather than a lane-shaped substitute.
+    EXPECT_ANY_THROW(second.activate());
+    EXPECT_FALSE(second.launched());
+    // A throw here acquired nothing and admitted nothing, so this run's identity never became
+    // live in the table and there is nothing to discharge for it.
+    EXPECT_EQ(g_borrowed, (std::vector<uint64_t>{1}));
+    EXPECT_TRUE(g_released.empty());
+    // The run ahead is untouched: still launched, still holding its own reference, and still the
+    // front — so the slot the failed run had is free for the next admission.
+    EXPECT_TRUE(first.launched());
+    g_borrow_throws = false;
+    ChipRun third = submit(lane, 103, 1, false, device_args());
+    EXPECT_EQ(g_borrowed, (std::vector<uint64_t>{1, 2}));
+
+    g_complete[0] = true;
+    g_complete[1] = true;
+    EXPECT_TRUE(first.done());
+    third.activate();
+    EXPECT_TRUE(third.done());
+    EXPECT_EQ(g_released, (std::vector<std::pair<uint64_t, int>>{{1, 0}, {2, 0}}));
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneCallerBuffersTest, AnUnprovenLastConsumerKeepsTheReference) {
+    ChipWorker worker;
+    prime_worker(worker);
+    prime_caller_buffers(worker);
+    ChipRunLane lane(worker);
+
+    ChipRun run = submit(lane, 101, 0, true, device_args());
+    ASSERT_TRUE(run.launched());
+    // A finalize that failed proves the opposite of what a release needs: the device may still
+    // name those bytes, so the reference is kept rather than handed back.
+    g_finalize_rc = -5;
+    g_complete[0] = true;
+    EXPECT_TRUE(run.done());
+    EXPECT_EQ(g_released, (std::vector<std::pair<uint64_t, int>>{{1, 1}}));
+
+    g_finalize_rc = 0;
     EXPECT_THROW(lane.close(), std::runtime_error);
     worker.finalize();
 }

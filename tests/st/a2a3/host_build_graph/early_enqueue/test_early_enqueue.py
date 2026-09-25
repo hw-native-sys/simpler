@@ -93,6 +93,7 @@ requested depth, so there it needs ``--case early_enqueue`` to select this class
 
 import contextlib
 import ctypes
+import shutil
 import tempfile
 import threading
 import time
@@ -671,6 +672,12 @@ class _EarlyEnqueueBase(SceneTestCase):
         tensor.fill_(value)
         return buffer, tensor
 
+    @staticmethod
+    def _link(value, control):
+        """One run's arithmetic: the orchestration adds the control tensor, then its first element
+        once per chain step. Composing this is what a chained device result has to show."""
+        return value + control + _CHAIN_LENGTH * control
+
     def _submit_vector(self, worker, arg_buffers, output_prefix, *, spin_iters=0):
         vector_handle = type(self)._st_chip_handles["vector"]
         vector_signature = type(self)._st_chip_handles["vector_sig"]
@@ -993,6 +1000,198 @@ class TestEarlyEnqueueDepthOneControl(_EarlyEnqueueBase):
             records: list[dict] = []
             _await_records(trace, records, _EVIDENCE_BUDGET_S, lambda seen: bool(seen))
         assert not records, f"a joined launch was recorded with launch_depth unset: {records}"
+
+
+@scene_test(level=3, runtime="host_build_graph")
+class TestDeviceResultChain(_EarlyEnqueueBase):
+    """``A(x) -> y -> B(y) -> z -> C(z)``: a successor consumes a predecessor's device output.
+
+    The same early-enqueue capability, with the intermediate results staying on the device. Each
+    successor names its predecessor's output buffer by device address alone, so the caller neither
+    waits for the predecessor nor copies the bytes anywhere, and the device still runs one whole
+    operator at a time.
+
+    What each check can see, and what it cannot:
+
+    chained    the final result is the arithmetic of all three runs composed, and each
+               intermediate is read back separately afterwards. Composition is the only way the
+               final value can be right, which is what makes this a chain rather than three runs
+               that happened to agree.
+    on device  ``y`` and ``z`` are ``alloc_child_tensor`` allocations, and the only host transfers
+               the case makes are the initial copy-in and the closing read-back. Nothing in the
+               chain round-trips, because there is no call that would.
+    enqueued   a named pair's successor completed its native submission while the identified
+               predecessor's whole-operator boundary was still unfired, and the device then ran
+               that pair one operator at a time in that order. Both come from the records the
+               two-run case above reads, through the same cursor and the same case-run filter.
+               With device arguments this is what could not happen before: the lane refused every
+               device tensor outright, whatever its owner.
+    refilled   three runs pass through two pipeline slots with no ``wait`` between submissions, so
+               the third is admitted by a retirement rather than by the caller draining anything.
+    held       while a run naming ``y`` is in flight, ``Worker.free(y)`` is refused; once the
+               chain is finished the same address releases cleanly. That pair is the borrow: the
+               caller keeps the right to release, and only *now* is unsafe.
+
+    The host build reads its control tensor's first element, so that argument stays a host buffer.
+    A device tensor in that position would be a host graph build depending on a predecessor's
+    unfinished result, which the runtime defers to depth one rather than serving — a different
+    case, and deliberately not this one.
+    """
+
+    CASES = [
+        {
+            "name": "device_chain",
+            "platforms": ["a2a3"],
+            "config": {"device_count": 1, "num_sub_workers": 0, "launch_depth": 2},
+            "params": {},
+        },
+    ]
+
+    def _run_and_validate_l3(self, worker, compiled_callables, sub_handles, case, **kwargs):
+        del kwargs
+        type(self)._st_chip_handles = compiled_callables
+        type(self)._st_sub_handles = sub_handles
+        assert str(worker._config["platform"]) in case["platforms"]  # noqa: SLF001 -- scene-test validation
+        assert worker._launch_depth == 2, (  # noqa: SLF001 -- scene-test validation
+            "this class needs a Worker at launch_depth=2; run it under pytest, or standalone "
+            "with --case device_chain so no depth-one class shares the Worker"
+        )
+        self.test_a_device_result_feeds_the_next_two_runs("a2a3", worker)
+
+    def _submit_link(self, worker, source, control, target, output_prefix):
+        """Submit one link, ``target = f(source, control)``, with the spin that widens the window.
+
+        ``source`` and ``target`` are whichever handles the caller passes — a host buffer for the
+        chain's first input and its device allocations for everything after it. The argument list
+        is built exactly as the two-run case builds its own; only the handles differ.
+        """
+        return self._submit_vector(worker, (source, control, target), output_prefix, spin_iters=_REFILL_SPIN_ITERS)
+
+    def test_a_device_result_feeds_the_next_two_runs(self, st_platform, st_worker):
+        if st_platform != "a2a3":
+            pytest.skip("the device chain is gated to a2a3 onboard host_build_graph")
+
+        worker = st_worker
+        trace = _RunTrace(worker)
+        # Before anything is submitted, so an earlier case's terminal frame identities fall below
+        # the floor and cannot be counted towards this chain.
+        case_runs = _CaseRuns(_frames(worker))
+
+        x_buffer, _ = self._tensor_from_host_buffer(worker, 2.0)
+        control_buffer, _ = self._tensor_from_host_buffer(worker, 0.5)
+        readback_buffer, readback = self._tensor_from_host_buffer(worker, 0.0)
+
+        # The caller provides every intermediate up front, which is what lets the chain pass
+        # addresses: no allocation happens between submissions.
+        intermediates = [worker.alloc_child_tensor(0, (_SIZE,), DataType.FLOAT32) for _ in range(3)]
+        y, z, w = intermediates
+        # The runs have to be *sampled* into `case_runs`: the parent holds no path from a
+        # submitted handle to the dispatch id the scheduler gave it, so a record's ends can only
+        # be recognised as this case's by having been seen in a frame at or above the floor. The
+        # sampler runs for the whole submit-and-wait window, which is the only time they are there.
+        stop = threading.Event()
+
+        def sample():
+            frames = _frames(worker)
+            while not stop.is_set():
+                case_runs.note(_coherent_snapshot(frames))
+                time.sleep(0.0005)
+
+        sampler = threading.Thread(target=sample, name="device-chain-sampler", daemon=True)
+        sampler.start()
+        # Bound before the try, so cleanup can drain whatever was admitted even when the first
+        # submission is what failed.
+        handles: list = []
+        # Not a context manager: the directory holds this case's trace destination, so it is
+        # removed only once the case has passed. A failure keeps it, and says where it is.
+        output_prefix = tempfile.mkdtemp(prefix="simpler-device-chain-")
+        try:
+            handles = [
+                self._submit_link(worker, x_buffer, control_buffer, y, output_prefix),
+                self._submit_link(worker, y, control_buffer, z, output_prefix),
+                self._submit_link(worker, z, control_buffer, w, output_prefix),
+            ]
+
+            # A launched run names `y`, so the caller's release of it is refused. Taken before
+            # any wait, which is the only point at which the window is open.
+            _wait_for_one_launched_frame(worker, timeout=30.0)
+            with pytest.raises(RuntimeError, match="still referenced by an in-flight"):
+                worker.free(y)
+
+            for handle in handles:
+                handle.wait()
+            stop.set()
+            sampler.join(timeout=5.0)
+
+            first = self._link(2.0, 0.5)
+            second = self._link(first, 0.5)
+            third = self._link(second, 0.5)
+            for handle, expected, label in ((y, first, "y"), (z, second, "z"), (w, third, "w")):
+                worker.copy_from(readback_buffer, handle)
+                assert torch.allclose(readback, torch.full((_SIZE,), expected)), (
+                    f"device result {label} is not its link of the chain: got {readback[0].item()}, "
+                    f"expected {expected}; trace kept at {output_prefix}"
+                )
+
+            # The same address releases cleanly now, which is what shows the refusal above was
+            # a window rather than a hold the caller can never discharge.
+            worker.free(y)
+            intermediates[0] = None
+
+            records: list[dict] = []
+            _await_records(
+                trace,
+                records,
+                _EVIDENCE_BUDGET_S,
+                lambda seen: bool(_established_pairs(seen, case_runs)),
+            )
+
+            established = _established_pairs(records, case_runs)
+            assert established, (
+                "no pair this chain submitted was recorded with its successor's submission complete and "
+                f"its predecessor's whole-operator boundary still unfired: records={records}, "
+                f"case runs={case_runs.sorted_keys()}; trace kept at {output_prefix}"
+            )
+
+            ordered, overlapping, within_tick, unmeasured = _whole_operator_order(trace, records, case_runs)
+            assert not overlapping, (
+                f"a chained successor's AICore stream was released before its predecessor's whole operator "
+                f"had finished: {sorted(overlapping)}; {_boundary_detail(trace, overlapping)}; "
+                f"trace kept at {output_prefix}"
+            )
+            assert ordered | within_tick, (
+                f"no chained pair has comparable whole-operator boundary readings: unmeasured={sorted(unmeasured)}; "
+                f"{_boundary_detail(trace, established)}; trace kept at {output_prefix}"
+            )
+            shutil.rmtree(output_prefix, ignore_errors=True)
+        finally:
+            stop.set()
+            sampler.join(timeout=5.0)
+            _release_chain_buffers(worker, handles, intermediates)
+
+
+def _release_chain_buffers(worker, handles, intermediates):
+    """Drain the runs, then release what is left, without replacing the caller's failure.
+
+    Freeing straight away is what a device chain must not do on an early exit: a run may still be
+    in flight, so the release is *correctly* refused, and that refusal would surface in place of
+    the assertion that actually failed — and would skip every buffer after it. So the runs are
+    waited for first, each release is attempted independently, and a failure here is reported
+    rather than raised. No reset and no retry: waiting is what makes a release legitimate, and a
+    release that still refuses is a finding to read, not something to force.
+    """
+    for handle in handles:
+        try:
+            handle.wait()
+        except Exception as error:  # noqa: BLE001 -- must not replace the caller's failure
+            print(f"[device-chain cleanup] a run did not finish: {error}")
+    for index, handle in enumerate(intermediates):
+        if handle is None:
+            continue
+        try:
+            worker.free(handle)
+        except Exception as error:  # noqa: BLE001 -- same
+            print(f"[device-chain cleanup] intermediate {index} could not be released: {error}")
 
 
 if __name__ == "__main__":

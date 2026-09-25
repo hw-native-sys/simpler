@@ -18,6 +18,7 @@
 
 #include <string.h>
 
+#include <atomic>
 #include <vector>
 
 #include "common/host_api.h"
@@ -55,7 +56,17 @@ struct HostTensorAccessor::Impl {
     // Bytes covered by `mappings`, i.e. excluding regions serving a fallback view.
     uint64_t mapped_bytes;
     uint64_t device_copy_count;
+    // This run's cause, when a graph build asked for bytes another run has not produced: published
+    // by the one access whose own fatal report latched the fatal field, and never cleared. Atomic
+    // because that access can run on a recording worker while the bind reads it afterwards.
+    std::atomic<bool> dependency_wait_cause;
 };
+
+// Why this thread's most recent refused access was refused. Per thread rather than on the
+// accessor: the reason has to belong to one access, so that the entry which made it judges its own
+// failure and cannot inherit another thread's. Written by the refusal and read by that same entry
+// immediately after, with nothing in between.
+thread_local bool t_refusal_was_dependency = false;
 
 // The region serving the whole of [dev_addr, dev_addr + bytes), or nullptr.
 // `*offset` is the span's distance from that region's base.
@@ -76,7 +87,7 @@ find_region(std::vector<HostTensorRegion> &regions, uint64_t dev_addr, uint64_t 
 }
 
 HostTensorAccessor::HostTensorAccessor(const HostApi *api) :
-    impl_(new Impl{api, {}, {}, 0, 0}) {}
+    impl_(new Impl{api, {}, {}, 0, 0, false}) {}
 
 HostTensorAccessor::~HostTensorAccessor() {
     close();
@@ -131,10 +142,35 @@ void resolve_means(const HostApi *api, HostTensorRegion *region) {
     region->means = AccessMeans::DeviceCopy;
 }
 
+// Whether this access has to be refused because the bytes are not readable yet.
+//
+// Only a child-memory region can be: every other region is backed by the caller buffer this bind
+// just copied in, whose content is the caller's. A child-memory region is the caller's device
+// buffer, and if a live run has *declared that it produces* these bytes — or a run that declared
+// them ended without being proven finished — then they have no defined content: reading them would
+// read whatever is there, which is the silent wrong value this refusal exists to prevent.
+//
+// A run that merely also names the allocation is not a producer, so two runs sharing one immutable
+// device input both read it normally. The refusal records its *reason* for this thread's access
+// and is otherwise returned: whether it becomes the run's cause is decided by the caller, which is
+// the only place the fatal publication that names the run's failure is performed.
+bool defer_access(const HostApi *api, const HostTensorRegion *region, uint64_t dev_addr, uint64_t bytes) {
+    if (region->means != AccessMeans::Unresolved && region->host_view != nullptr) return false;
+    if (!api->caller_device_span_written_by_other_run(dev_addr, bytes)) return false;
+    t_refusal_was_dependency = true;
+    return true;
+}
+
 bool HostTensorAccessor::read(uint64_t dev_addr, void *dst, uint64_t bytes) {
+    t_refusal_was_dependency = false;
     uint64_t offset = 0;
     HostTensorRegion *region = find_region(impl_->regions, dev_addr, bytes, &offset);
     if (region == nullptr) {
+        return false;
+    }
+    // Ahead of resolving a means: installing a mapping or paying a device copy for bytes this
+    // access is not allowed to observe would be work whose only result is the wrong answer.
+    if (defer_access(impl_->api, region, dev_addr, bytes)) {
         return false;
     }
     if (region->means == AccessMeans::Unresolved) {
@@ -149,9 +185,16 @@ bool HostTensorAccessor::read(uint64_t dev_addr, void *dst, uint64_t bytes) {
 }
 
 bool HostTensorAccessor::write(uint64_t dev_addr, const void *src, uint64_t bytes) {
+    t_refusal_was_dependency = false;
     uint64_t offset = 0;
     HostTensorRegion *region = find_region(impl_->regions, dev_addr, bytes, &offset);
     if (region == nullptr) {
+        return false;
+    }
+    // A write is refused on the same terms as a read. It would land in bytes another run may be
+    // producing, so the two writes would race with no order between them, and the orchestration
+    // that issued it is being discarded anyway.
+    if (defer_access(impl_->api, region, dev_addr, bytes)) {
         return false;
     }
     if (region->means == AccessMeans::Unresolved) {
@@ -175,6 +218,14 @@ uint64_t HostTensorAccessor::mapped_bytes() const noexcept { return impl_->mappe
 
 uint64_t HostTensorAccessor::device_copy_count() const noexcept { return impl_->device_copy_count; }
 
+bool HostTensorAccessor::dependency_wait_is_this_runs_cause() const noexcept {
+    return impl_->dependency_wait_cause.load(std::memory_order_acquire);
+}
+
+void HostTensorAccessor::note_dependency_wait_cause() noexcept {
+    impl_->dependency_wait_cause.store(true, std::memory_order_release);
+}
+
 void HostTensorAccessor::close() noexcept {
     for (void *dev_ptr : impl_->mappings) {
         impl_->api->unregister_device_memory_from_host(dev_ptr);
@@ -183,6 +234,8 @@ void HostTensorAccessor::close() noexcept {
     impl_->regions.clear();
     impl_->mapped_bytes = 0;
     impl_->device_copy_count = 0;
+    // Not this run's published cause: the caller reads that after closing the window, to decide
+    // whether the orchestration it just ran may be used at all.
 }
 
 bool host_tensor_read(HostTensorAccessor *accessor, uint64_t dev_addr, void *dst, uint64_t bytes) {
@@ -191,4 +244,10 @@ bool host_tensor_read(HostTensorAccessor *accessor, uint64_t dev_addr, void *dst
 
 bool host_tensor_write(HostTensorAccessor *accessor, uint64_t dev_addr, const void *src, uint64_t bytes) {
     return accessor != nullptr && accessor->write(dev_addr, src, bytes);
+}
+
+bool host_tensor_refusal_was_dependency() noexcept { return t_refusal_was_dependency; }
+
+void host_tensor_note_dependency_wait_cause(HostTensorAccessor *accessor) noexcept {
+    if (accessor != nullptr) accessor->note_dependency_wait_cause();
 }

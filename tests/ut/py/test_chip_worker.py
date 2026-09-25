@@ -184,7 +184,9 @@ def kernel_symbol_runtime(tmp_path_factory):
     build_dir = tmp_path_factory.mktemp("kernel_symbol_runtime")
     worker_headers = Path(__file__).resolve().parents[3] / "src" / "common" / "worker"
     unused_symbols = """
-        device_malloc_ctx device_free_ctx committed_device_memory_ctx device_memory_info_ctx
+        device_malloc_ctx device_free_ctx device_free_caller_buffer_ctx
+        device_borrow_caller_buffers_ctx device_release_caller_buffers_ctx
+        committed_device_memory_ctx device_memory_info_ctx
         copy_to_device_ctx copy_from_device_ctx simpler_register_callable simpler_run
         simpler_prepare_run simpler_launch_run simpler_launch_run_joined simpler_poll_run simpler_wait_run
         simpler_finalize_run supports_concurrent_native_prepare_ctx supports_joined_native_launch_ctx

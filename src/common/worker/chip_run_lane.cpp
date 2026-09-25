@@ -46,9 +46,34 @@ struct ChipRunState {
     // launches ordinarily. Without it the declined attempt would be re-issued
     // on every progress round for the rest of the predecessor's execution.
     bool joined_launch_declined{false};
+    // Every device span this run names is covered by a caller allocation of
+    // this device context, and this run holds the borrow over each. Set once at
+    // admission and cleared when the borrow is discharged, so it answers
+    // "may this run join".
+    bool device_spans_borrowed{false};
+    // This run's identity may still name something in the caller-buffer table: the borrow it took
+    // at admission, or the declaration of what it produces that its own bind made later. Set for
+    // every admitted run rather than only for one that borrowed, because the declaration is the
+    // runtime's to make and a run whose all-or-nothing borrow was refused can still have made
+    // one. Cleared when the release discharges both.
+    bool caller_references_live{false};
     std::exception_ptr error;
     std::exception_ptr poison_error;
 };
+
+/**
+ * The borrow identity for one run: its pipeline slot, offset so that it is
+ * never zero.
+ *
+ * The slot rather than a counter of the lane's own, because this identity has
+ * to be one the *runtime* can also name. A host-side orchestrator asks whether
+ * a device span it is about to read is held by a run other than its own, and
+ * the slot is what its HostApi binding already carries. A slot holds exactly
+ * one run for that run's whole lifetime — the lane refuses an occupied one —
+ * so the slot identifies the borrow holder for exactly as long as the borrow
+ * exists.
+ */
+static uint64_t borrow_identity(const ChipRunState &run) { return static_cast<uint64_t>(run.lease.slot_id) + 1; }
 
 struct ChipRunLaneState {
     explicit ChipRunLaneState(ChipWorker &worker) :
@@ -93,13 +118,21 @@ struct ChipRunLaneState {
                 continue;
             }
             if (run->phase == ChipRunState::Phase::PREPARED) {
+                bool finalized = true;
                 try {
                     worker->finalize_native_run(run->native_run);
                 } catch (...) {
+                    finalized = false;
                     const std::exception_ptr finalize_error = std::current_exception();
                     if (run->error == nullptr) run->error = finalize_error;
                     poison_with(run, finalize_error);
                 }
+                release_device_spans(run, finalized);
+            } else {
+                // Queued: it never crossed the launch boundary, so no device
+                // work of this run's can name a borrowed address and the
+                // reference is simply given back.
+                release_device_spans(run, true);
             }
             run->phase = ChipRunState::Phase::TERMINAL;
             it = fifo.erase(it);
@@ -122,9 +155,20 @@ struct ChipRunLaneState {
      * The successor's own configuration does not enter, at any level: a bind's
      * host-orchestration phase state is held per pipeline slot, and everything
      * it hands to the resident collector is published under this claim.
+     *
+     * The predecessor's shape does. A successor's preparation runs its own host
+     * graph build, which may read the bytes of a device argument, and what keeps
+     * that read off bytes this run has not produced is this run's declaration of
+     * what it produces — which covers only spans whose owner it could prove. A
+     * predecessor holding no borrow over every device span it names has no such
+     * proof, so it carries no preparation either: its successor prepares at the
+     * front, after it has retired. That is the same condition `joinable_shape`
+     * puts on the launch, applied to the earlier boundary.
      */
     bool permits_native_successor(const ChipRunState &predecessor) const {
-        return worker->supports_concurrent_native_prepare() && predecessor.phase == ChipRunState::Phase::LAUNCHED;
+        if (!worker->supports_concurrent_native_prepare()) return false;
+        if (predecessor.phase != ChipRunState::Phase::LAUNCHED) return false;
+        return joinable_shape(predecessor);
     }
 
     void prepare(const std::shared_ptr<ChipRunState> &run) {
@@ -141,14 +185,81 @@ struct ChipRunLaneState {
         if (poison == nullptr) poison = error;
     }
 
+    /**
+     * Take this run's borrow over every caller allocation its device tensors name.
+     *
+     * Allocates, so it can throw, and both callers run it inside their admission unwind: a throw
+     * here has to remove the queued entry rather than leave it behind, and `release_device_spans`
+     * discharges whatever this identity did establish, which after a throw here is nothing.
+     *
+     * No direction is recorded — `ChipStorageTaskArgs` carries no tag — so the borrow says only
+     * that this run may reach those bytes, which is what a release has to respect either way. A
+     * run whose spans do not all resolve holds none and stays on the serial path, where its
+     * address is the caller's for longer than the run.
+     *
+     * The span is the tensor's `nbytes()`, while the runtime's bind names `buffer.size` for the
+     * same tensor. Both resolve to the containing allocation, so they agree on every question
+     * either asks; they differ only for a tensor whose shape is empty while its buffer is not,
+     * which takes no borrow here and is still declared there — over-declaration, and the safe
+     * direction, since such a tensor produces no bytes.
+     */
+    void borrow_device_spans(const std::shared_ptr<ChipRunState> &run) {
+        std::vector<ChipWorker::CallerDeviceSpan> spans;
+        for (int32_t i = 0; i < run->args.tensor_count(); ++i) {
+            const auto tensor = run->args.tensor(i);
+            if (!tensor.is_device_memory()) continue;
+            const uint64_t bytes = static_cast<uint64_t>(tensor.nbytes());
+            if (bytes == 0) continue;
+            spans.push_back(ChipWorker::CallerDeviceSpan{tensor.buffer.addr, bytes});
+        }
+        if (!spans.empty()) {
+            run->device_spans_borrowed =
+                worker->borrow_caller_device_spans(borrow_identity(*run), spans.data(), spans.size());
+        }
+        // Last, and whether or not a borrow was taken: reaching here is what admits the run, and
+        // an admitted run's identity may name something in the table from here on — the borrow
+        // above where it was taken, and the declaration its own bind makes later either way. A
+        // throw above acquired nothing, so the identity stays absent and there is nothing to
+        // discharge.
+        run->caller_references_live = true;
+    }
+
+    /**
+     * Discharge this run's caller references, or keep them when its last consumer is unproven.
+     *
+     * Both of them: the borrow over the allocations its arguments name, and the declaration of
+     * which of them it produces that its own bind made. One call because they share this run's
+     * identity and its lifetime — and it runs for every admitted run, not only one that borrowed,
+     * since a run whose borrow was refused can still have declared.
+     *
+     * `proven_done` is whether the run's own finalize reported success. That call drains its
+     * device work, copies its outputs back and releases its bindings, so success is what
+     * establishes that nothing on the device can still reach these bytes or still be writing
+     * them. Failure establishes the opposite, and both facts are kept: the caller's release stays
+     * refused rather than handing back pages the device may name, and the bytes this run declared
+     * stay unreadable rather than being served mid-write.
+     */
+    void release_device_spans(const std::shared_ptr<ChipRunState> &run, bool proven_done) noexcept {
+        if (!run->caller_references_live) return;
+        worker->release_caller_device_borrow(borrow_identity(*run), !proven_done);
+        run->caller_references_live = false;
+        run->device_spans_borrowed = false;
+    }
+
     void finish(const std::shared_ptr<ChipRunState> &run) noexcept {
+        bool finalized = true;
         try {
             worker->finalize_native_run(run->native_run);
         } catch (...) {
+            finalized = false;
             const std::exception_ptr finalize_error = std::current_exception();
             if (run->error == nullptr) run->error = finalize_error;
             poison_with(run, finalize_error);
         }
+        // After the finalize, never before: that call drains the device work,
+        // copies this run's outputs back and releases its bindings, so it is
+        // the point at which the last consumer of a borrowed address is done.
+        release_device_spans(run, finalized);
         run->phase = ChipRunState::Phase::TERMINAL;
         // By identity rather than from the front. Ordinarily the front is what
         // finishes first — the device executes the launched runs in order — but
@@ -175,6 +286,7 @@ struct ChipRunLaneState {
             } else if (run->phase == ChipRunState::Phase::QUEUED) {
                 run->error = poison;
                 run->poison_error = poison;
+                release_device_spans(run, true);
                 run->phase = ChipRunState::Phase::TERMINAL;
                 fifo.pop_front();
             }
@@ -189,6 +301,7 @@ struct ChipRunLaneState {
                 prepare(run);
             } catch (...) {
                 run->error = std::current_exception();
+                release_device_spans(run, true);
                 run->phase = ChipRunState::Phase::TERMINAL;
                 fifo.pop_front();
                 return;
@@ -215,16 +328,24 @@ struct ChipRunLaneState {
     /**
      * Whether a run's own shape keeps it inside the joined-launch scope.
      *
-     * Every tensor must be host-space. A host tensor is copied into the
-     * runner-owned staging the run retains for its whole lifetime, which is
-     * what makes a run that fails while another is queued behind it safe to
-     * abandon without freeing anything the device may still read. A
-     * device-space tensor is passed through to the caller's own address, and
-     * that address's lifetime is the caller's, not this run's.
+     * A host tensor is copied into the runner-owned staging the run retains for
+     * its whole lifetime, which is what makes a run that fails while another is
+     * queued behind it safe to abandon without freeing anything the device may
+     * still read.
+     *
+     * A device tensor is the caller's address, and its lifetime is the
+     * caller's. What brings it inside the scope is the borrow: a run holds one
+     * over the caller allocation covering every device span it names, so the
+     * caller's release is refused for as long as the device may still reach
+     * those bytes. `borrowed` is therefore the question — a run whose spans did
+     * not all resolve to a caller allocation of this device context holds no
+     * borrow, and stays on the serial path where its address outlives it by
+     * construction.
      */
     static bool joinable_shape(const ChipRunState &run) {
         for (int32_t i = 0; i < run.args.tensor_count(); ++i) {
-            if (run.args.tensor(i).is_device_memory()) return false;
+            if (!run.args.tensor(i).is_device_memory()) continue;
+            if (!run.device_spans_borrowed) return false;
         }
         return true;
     }
@@ -312,6 +433,17 @@ struct ChipRunLaneState {
         }
     }
 
+    /**
+     * Prepare the queued successor while the run ahead of it executes, if it may be.
+     *
+     * A backend that reports this run cannot be prepared beside the active one leaves it queued:
+     * it keeps its slot, its borrow and whatever its aborted bind declared, nothing of the run
+     * ahead is touched, and it prepares again once it reaches the front. That is also the answer
+     * when its graph build needs bytes the run ahead has not finished producing — the value it
+     * waits for exists by the time it is at the front, which is the behaviour the same program had
+     * before a device argument could be enqueued early. One attempt only: the reasons cannot
+     * change while the run ahead is still executing.
+     */
     void prepare_successor_if_eligible(const std::shared_ptr<ChipRunState> &run) {
         if (fifo.size() != 2 || fifo.back() != run || fifo.front() == run) return;
         if (run->phase != ChipRunState::Phase::QUEUED || run->depth_one_fallback) return;
@@ -323,6 +455,7 @@ struct ChipRunLaneState {
             return;
         } catch (...) {
             run->error = std::current_exception();
+            release_device_spans(run, true);
             run->phase = ChipRunState::Phase::TERMINAL;
             fifo.pop_back();
         }
@@ -366,11 +499,13 @@ struct ChipRunLaneState {
         if (poison != nullptr && run->phase == ChipRunState::Phase::QUEUED) {
             run->error = poison;
             run->poison_error = poison;
+            release_device_spans(run, true);
             run->phase = ChipRunState::Phase::TERMINAL;
             fifo.pop_front();
             return;
         }
         if (run->phase == ChipRunState::Phase::QUEUED && !run->activated) {
+            release_device_spans(run, true);
             run->phase = ChipRunState::Phase::TERMINAL;
             fifo.pop_front();
             return;
@@ -487,12 +622,17 @@ void ChipRun::abandon() {
     auto it = std::find(lane_->fifo.begin(), lane_->fifo.end(), run_);
     if (it == lane_->fifo.end()) throw std::runtime_error("chip run lane lost an unlaunched run");
     if (run_->phase == ChipRunState::Phase::PREPARED) {
+        bool finalized = true;
         try {
             lane_->worker->finalize_native_run(run_->native_run);
         } catch (...) {
+            finalized = false;
             run_->error = std::current_exception();
             lane_->poison_with(run_, run_->error);
         }
+        lane_->release_device_spans(run_, finalized);
+    } else {
+        lane_->release_device_spans(run_, true);
     }
     run_->phase = ChipRunState::Phase::TERMINAL;
     lane_->fifo.erase(it);
@@ -575,6 +715,11 @@ ChipRun ChipRunLane::submit(
     state_->fifo.insert(position, run);
 
     try {
+        // Inside the unwind, and before anything can prepare or launch: from admission on, the
+        // caller's release of an address this run names is refused, and preparation — which is
+        // what first hands those addresses to the device — is the next statement. Borrowing
+        // allocates, so a failure here has to leave no queued entry behind.
+        state_->borrow_device_spans(run);
         if (state_->fifo.front() == run) {
             state_->launch_ready_prefix();
             if (state_->fifo.size() == 2) state_->prepare_successor_if_eligible(state_->fifo.back());
@@ -583,6 +728,15 @@ ChipRun ChipRunLane::submit(
         }
     } catch (...) {
         run->error = std::current_exception();
+        // Only what was acquired: this run threw while building its span list or taking its
+        // borrow, so it established nothing and gives nothing back. The run ahead is untouched.
+        //
+        // `proven_done` is read from the launch fence rather than asserted: admission also runs
+        // `launch_ready_prefix`, so a run that has already crossed it must not have its reference
+        // dropped as if nothing could reach those bytes. Today nothing throws after that point —
+        // `launch_ready_prefix` is noexcept — and this keeps the statement true by construction
+        // rather than by that coincidence.
+        state_->release_device_spans(run, !run->crossed_launch_fence);
         run->phase = ChipRunState::Phase::TERMINAL;
         auto it = std::find(state_->fifo.begin(), state_->fifo.end(), run);
         if (it != state_->fifo.end()) state_->fifo.erase(it);
@@ -639,6 +793,18 @@ ChipRun ChipRunLane::submit(
     run->pipeline_leased = false;
     run->activated = true;
     state_->fifo.push_back(run);
+    try {
+        state_->borrow_device_spans(run);
+    } catch (...) {
+        // This overload reports an admission failure by throwing, so the queued entry goes back
+        // out and the caller sees its own error. The run ahead keeps its own borrow, and this
+        // run's reference is discharged as proven-done only while it has not crossed the launch
+        // fence — the same rule as the other overload's unwind.
+        state_->release_device_spans(run, !run->crossed_launch_fence);
+        run->phase = ChipRunState::Phase::TERMINAL;
+        state_->fifo.pop_back();
+        throw;
+    }
     if (state_->fifo.front() == run) {
         state_->launch_ready_prefix();
     } else {

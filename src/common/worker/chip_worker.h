@@ -264,6 +264,34 @@ public:
     void copy_to(uint64_t dst, uint64_t src, size_t size);
     void copy_from(uint64_t dst, uint64_t src, size_t size);
 
+    /// One span of a caller device allocation a run names. The lane's
+    /// vocabulary for the borrow it takes on a run's behalf; the wire form it
+    /// becomes is the platform's (`CallerBufferSpan`).
+    struct CallerDeviceSpan {
+        uint64_t addr{0};
+        uint64_t bytes{0};
+    };
+
+    /// Take `borrow_id`'s reference on the caller allocations covering `spans`,
+    /// which is also the proof that this context is their owner: a span naming
+    /// no caller allocation of this device context leaves no reference at all
+    /// and answers false. Held until `release_caller_device_borrow`.
+    ///
+    /// The three `device_*_caller_buffer(s)_ctx` entries are mandatory C ABI,
+    /// like the rest of the `device_*_ctx` family: `init` resolves them with
+    /// `load_symbol`, which throws when one is missing, so a bound runtime
+    /// always has them. (The two `HostApiOps` entries this capability adds are
+    /// the optional half — those are null-guarded, and a platform publishing
+    /// neither behaves as it did.) False therefore means what the paragraph
+    /// above says — no span named a caller allocation of this context — or that
+    /// this worker holds no device context at all, which is only so before
+    /// `init` and after `finalize`.
+    bool borrow_caller_device_spans(uint64_t borrow_id, const CallerDeviceSpan *spans, size_t count);
+
+    /// Drop `borrow_id`'s reference. `keep` retains it for the process's
+    /// remaining life, for a run whose last device consumer is unproven.
+    void release_caller_device_borrow(uint64_t borrow_id, bool keep) noexcept;
+
     /// Distributed communication primitives (optional — only available when
     /// the bound runtime exports comm_*).  Wraps the backend-neutral C API
     /// defined in src/<arch>/platform/include/host/comm.h.
@@ -381,6 +409,9 @@ private:
     using DestroyDeviceContextFn = void (*)(void *);
     using DeviceMallocCtxFn = void *(*)(void *, size_t);
     using DeviceFreeCtxFn = void (*)(void *, void *);
+    using DeviceFreeCallerBufferCtxFn = decltype(&device_free_caller_buffer_ctx);
+    using DeviceBorrowCallerBuffersCtxFn = decltype(&device_borrow_caller_buffers_ctx);
+    using DeviceReleaseCallerBuffersCtxFn = decltype(&device_release_caller_buffers_ctx);
     using CopyToDeviceCtxFn = int (*)(void *, void *, const void *, size_t);
     using CopyFromDeviceCtxFn = int (*)(void *, void *, const void *, size_t);
     using GetRuntimeSizeFn = size_t (*)();
@@ -453,6 +484,9 @@ private:
     DestroyDeviceContextFn destroy_device_context_fn_ = nullptr;
     DeviceMallocCtxFn device_malloc_ctx_fn_ = nullptr;
     DeviceFreeCtxFn device_free_ctx_fn_ = nullptr;
+    DeviceFreeCallerBufferCtxFn device_free_caller_buffer_ctx_fn_ = nullptr;
+    DeviceBorrowCallerBuffersCtxFn device_borrow_caller_buffers_ctx_fn_ = nullptr;
+    DeviceReleaseCallerBuffersCtxFn device_release_caller_buffers_ctx_fn_ = nullptr;
     CopyToDeviceCtxFn copy_to_device_ctx_fn_ = nullptr;
     CopyFromDeviceCtxFn copy_from_device_ctx_fn_ = nullptr;
     GetRuntimeSizeFn get_runtime_size_fn_ = nullptr;

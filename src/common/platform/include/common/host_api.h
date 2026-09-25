@@ -220,6 +220,23 @@ struct HostApiOps {
     // this run's. See common/device_run_result.h for why the region exists and
     // for what "absent" does and does not mean.
     const void *(*get_run_result)(void *runner_ctx, uint32_t pipeline_slot, uint64_t run_epoch, size_t *bytes_out);
+    // Declare which caller device allocations this run produces. Taken from the orchestration
+    // signature, which is the only place the direction of an argument is known, so a runtime that
+    // gives a caller device tensor an output direction says so here. Holding an allocation is not
+    // producing it — see host/caller_device_buffers.h — which is why this is a separate statement
+    // from the reference the lane takes on the same spans. Zero when the statement is recorded; a
+    // non-zero code is a failure the declaring run must not continue past, since an undeclared
+    // producer reads to every other run as a buffer with no producer.
+    int (*declare_caller_device_writes)(
+        void *runner_ctx, uint64_t run_id, const struct CallerBufferSpan *spans, uint32_t count
+    );
+    // Whether [addr, addr + bytes) has no readable content for this run yet. A host-side
+    // orchestrator asks before reading a caller device tensor's bytes while building its graph: a
+    // declared producer's output has no defined content until that run finishes, and neither does
+    // an allocation a declared producer left without being proven finished. A shared immutable
+    // input has no declared producer and stays readable. Zero for a runner with no such
+    // allocation, no other declaring run, or no table at all.
+    int (*caller_device_span_written_by_other_run)(void *runner_ctx, uint64_t run_id, uint64_t addr, uint64_t bytes);
 };
 
 /**
@@ -394,7 +411,48 @@ public:
         return ops_->get_run_result(runner_ctx_, pipeline_slot_, run_epoch_, bytes_out);
     }
 
+    /**
+     * Declare which caller device allocations this run produces.
+     *
+     * Made from the orchestration signature during this run's own bind, which is the one moment
+     * an argument's direction is known here.
+     *
+     * @return true when the statement stands — including on a platform that publishes no such
+     *         entry, where there is nothing to record and no other run can be reading one. False
+     *         means the platform has the entry and could not make it, which the caller has to
+     *         treat as this run's failure rather than proceeding with an undeclared output.
+     */
+    [[nodiscard]] bool
+    declare_caller_device_writes(const struct CallerBufferSpan *spans, uint32_t count) const noexcept {
+        if (ops_->declare_caller_device_writes == nullptr) return true;
+        return ops_->declare_caller_device_writes(runner_ctx_, run_identity(), spans, count) == 0;
+    }
+
+    /**
+     * Whether `[addr, addr + bytes)` has no readable content for this run yet.
+     *
+     * Asked before reading a caller device tensor's bytes on the host while building this run's
+     * graph. True means those bytes have no defined content yet, because a *declared producer* is
+     * still live or ended unproven — not merely because another run also names the allocation,
+     * which is legal and common for a shared immutable input.
+     *
+     * False when the platform has no such query, so a backend without it behaves exactly as it
+     * did.
+     */
+    bool caller_device_span_written_by_other_run(uint64_t addr, uint64_t bytes) const noexcept {
+        if (ops_->caller_device_span_written_by_other_run == nullptr) return false;
+        return ops_->caller_device_span_written_by_other_run(runner_ctx_, run_identity(), addr, bytes) != 0;
+    }
+
 private:
+    /**
+     * This run's identity for the caller-buffer table: its pipeline slot, offset so it is never
+     * zero. A slot holds one run for that run's whole lifetime, so it names the declaring run for
+     * exactly as long as the declaration may exist, and it is the same identity the lane's
+     * reference uses.
+     */
+    uint64_t run_identity() const noexcept { return static_cast<uint64_t>(pipeline_slot_) + 1; }
+
     void *runner_ctx_{nullptr};
     uint32_t pipeline_slot_{0};
     uint32_t arena_bank_{0};

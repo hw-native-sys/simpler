@@ -11249,11 +11249,74 @@ class Worker:
                     self._record_device_alloc(handle)
         return handle
 
+    def _refuse_free_while_in_flight(self, handle: Buffer) -> None:
+        """Raise when an in-flight run still names ``handle``'s allocation.
+
+        The same three scans :meth:`release_buffer` runs, over the same sets, because the question
+        is the same one: a dispatched task may still be reading or writing these bytes. Only the API
+        differs — ``release_buffer`` closes an owner host backing, this releases a device
+        allocation — and a device allocation is the one an early-enqueued successor can still be
+        holding long after its predecessor finished.
+
+        ``_submit_mu`` is what makes the scan never land mid-callback with a half-populated touched
+        set, and it is **not** taken when this thread is already inside one of this Worker's graph
+        callbacks: that lock is held for the whole callback and is not reentrant, so taking it here
+        is a self-deadlock — and an ``orch.free`` inside a callback is exactly that caller. The
+        property the lock provides already holds there, because graph callbacks are serialized
+        against each other by that same lock, so no other callback can be running to observe a
+        partial set. A free from any other thread takes it as before.
+
+        The run *being built* is deliberately still scanned. Its own touched set is what it has
+        declared so far, so freeing a buffer it has already dispatched is refused, while the
+        allocate-then-free pattern inside one callback is untouched — that buffer reached no task.
+
+        An abandoned run keeps refusing for the Worker's remaining life, as there it is exactly
+        ``_cleanup_published`` that stops describing whether the device is done. That strands
+        nothing: ``close()`` reaps the children that own the memory.
+
+        The exemption is scoped to *this* Worker's frame, so a callback of Worker A freeing a
+        buffer of Worker B does take B's lock — correctly, since the running frame is A's. Two
+        Workers whose callbacks each free the other's buffer therefore deadlock; a caller that must
+        cross Workers inside a callback frees after it returns.
+        """
+        identity = handle.identity
+        inside_own_callback = _callback_frame_for(self) is not None
+
+        def scan_hierarchical() -> None:
+            with self._hierarchical_start_cv:
+                for run_handle in self._accepted_run_handles:
+                    if not run_handle._cleanup_published and identity in run_handle._resources.touched_identities:
+                        raise RuntimeError(f"Worker.free: {identity} is still referenced by an in-flight run")
+                for run_handle in self._abandoned_run_handles:
+                    if identity in run_handle._resources.touched_identities:
+                        raise RuntimeError(
+                            f"Worker.free: {identity} is still referenced by an abandoned run whose native "
+                            f"teardown has not completed"
+                        )
+
+        if inside_own_callback:
+            scan_hierarchical()
+        else:
+            with self._submit_mu.exclusive():
+                scan_hierarchical()
+        with self._registry_lock:
+            for touched in self._chip_run_touched_identities.values():
+                if identity in touched:
+                    raise RuntimeError(f"Worker.free: {identity} is still referenced by an in-flight L2 run")
+
     def free(self, handle: Buffer) -> None:
         """Free a device ``Buffer`` allocated by ``malloc`` / ``alloc_child_tensor``.
 
+        Refuses while any in-flight run still names this allocation, on the same terms as
+        :meth:`release_buffer` and for the same reason: a dispatched task may still read or write
+        those bytes, and with a successor's work enqueued early a predecessor's completion no
+        longer bounds how long that stays true. The chip child refuses independently — it owns the
+        address space and knows when the last consumer finished — so this is the early, cheap half
+        of one rule, not the whole of it.
+
         The operation lease is re-entrant, so an in-run ``orch.free`` that delegates here nests safely.
         """
+        self._refuse_free_while_in_flight(handle)
         if self.level != 2 and not self._chip_shms:
             self._check_chip_worker_id(0)
         # Lock selection comes from the private registration snapshot. A caller may mutate the

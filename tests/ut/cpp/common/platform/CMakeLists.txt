@@ -516,6 +516,7 @@ platform_case(test_chip_swimlane_aicore.cpp PER_ARCH PER_RUNTIME BARE
 simpler_ut_cases(platform_single_case
     test_acl_hal_device.cpp
     test_arena_replacement_transaction.cpp
+    test_caller_device_buffers.cpp
     test_device_fault_monitor.cpp
     test_device_health_state.cpp
     test_execution_mode_latch.cpp

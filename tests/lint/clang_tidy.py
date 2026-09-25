@@ -156,10 +156,39 @@ def _parse_db_path(db_file: Path) -> tuple[str, str, str, str]:
     return arch, variant, runtime_name, target
 
 
-def _reconfigure_compile_database(db_file: Path) -> None:
-    """Delete the broken target build dir and rerun CMake configure for it."""
+def _import_checkout_project() -> tuple:
+    """Import `simpler_setup` from this checkout and return the recovery entry points.
+
+    Which source tree a recovery configures is decided by that package's
+    `PROJECT_ROOT`, and only this checkout's tree is the one the databases under
+    `build/cache/` and the changed paths both name. A wheel install of this
+    project carries a second physical copy of `src/` under
+    `simpler_setup/_assets` and reports that copy as its root; the hook runs as
+    a script, so `sys.path[0]` is `tests/lint` and the repo root is otherwise
+    absent from the path, which is what lets the installed copy answer the
+    import. A database configured against it names platform sources under paths
+    no changed file matches, and compiles the checkout's own sources with both
+    copies of `src/common` on the include path — where `#pragma once` is per
+    file, so every shared type arrives twice and reads as a redefinition of
+    itself.
+    """
+    if sys.path[0] != str(_ROOT):
+        sys.path.insert(0, str(_ROOT))
+    from simpler_setup.environment import PROJECT_ROOT  # noqa: PLC0415
     from simpler_setup.platform_info import load_build_config, to_platform  # noqa: PLC0415
     from simpler_setup.runtime_compiler import RuntimeCompiler  # noqa: PLC0415
+
+    if Path(PROJECT_ROOT).resolve() != _ROOT:
+        raise RuntimeError(
+            f"simpler_setup reports its project root as {PROJECT_ROOT}, not this checkout ({_ROOT}); "
+            "a compile database configured from another source tree cannot describe these files"
+        )
+    return load_build_config, to_platform, RuntimeCompiler
+
+
+def _reconfigure_compile_database(db_file: Path) -> None:
+    """Delete the broken target build dir and rerun CMake configure for it."""
+    load_build_config, to_platform, RuntimeCompiler = _import_checkout_project()
 
     arch, variant, runtime_name, target = _parse_db_path(db_file)
     platform = to_platform(arch, variant)
@@ -234,6 +263,20 @@ def _load_compile_database(db_file: Path) -> list[dict]:
         return []
 
 
+def _publish_compile_database(db_file: Path, entries: list[dict]) -> None:
+    """Replace a database's content by rename, so no reader ever sees it empty.
+
+    Every invocation of this hook reads all of these files, and pre-commit runs
+    a hook it is not told to serialize as several processes over disjoint chunks
+    of the changed files. A write in place is therefore observable by a peer as
+    a zero-byte database, which reads as a broken cache and sends that peer
+    through a full CMake reconfigure of the target instead of a replay.
+    """
+    tmp = db_file.with_name(f"{db_file.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(entries, indent=2))
+    os.replace(tmp, db_file)
+
+
 def _build_file_index() -> dict[str, list[Path]]:
     """Return a mapping from absolute source path to the db directories that compile it.
 
@@ -242,7 +285,7 @@ def _build_file_index() -> dict[str, list[Path]]:
     Only sim variant databases are used (avoids cross-compiler sysroot issues).
 
     When a compile command carries GCC-only flags or a target-triple-prefixed
-    compiler name, the database is modified in-place so that clang-tidy can
+    compiler name, the database's content is replaced so that clang-tidy can
     replay it.
     """
     index: dict[str, list[Path]] = {}
@@ -252,7 +295,7 @@ def _build_file_index() -> dict[str, list[Path]]:
         for entry in entries:
             changed |= _rewrite_entry(entry)
         if changed:
-            db_file.write_text(json.dumps(entries, indent=2))
+            _publish_compile_database(db_file, entries)
         for entry in entries:
             filepath = entry["file"]
             index.setdefault(filepath, []).append(db_file.parent)

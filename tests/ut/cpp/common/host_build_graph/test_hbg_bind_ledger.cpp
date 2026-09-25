@@ -42,6 +42,7 @@
 #include "callable.h"
 #include "common/host_api.h"
 #include "host_build_graph/graph_host_state.h"
+#include "host_build_graph/host_tensor_access.h"
 #include "host/raii_scope_guard.h"
 #include "host_build_graph/runtime_status.h"
 #include "runtime.h"
@@ -138,6 +139,10 @@ struct HostAccessProbe {
     RuntimeContext *runtime{nullptr};
     InputProducer producer{InputProducer::None};
     bool write{false};
+    // A failure of the orchestration's own, reported before it touches any tensor — the order a
+    // real callback can take, and the one that decides whether a later refused access may speak
+    // for the run.
+    int32_t pre_fatal{0};
     std::vector<uint64_t> reads;
     int32_t error{0};
 };
@@ -148,6 +153,9 @@ void access_bind(RuntimeContext *rt) { g_access->runtime = rt; }
 
 void access_entry(const ChipTaskArgs &args) {
     RuntimeContext *rt = g_access->runtime;
+    if (g_access->pre_fatal != 0) {
+        rt->orchestrator->report_fatal(g_access->pre_fatal, "access_entry", "an independent orchestration failure");
+    }
     for (int i = 0; i < args.tensor_count(); ++i) {
         simpler::hbg::Tensor tensor = args.tensor(i).ref();
         if (g_access->producer != InputProducer::None) {
@@ -462,6 +470,66 @@ int fake_acquire_retained_temp(
     return 0;
 }
 
+// The caller-device-buffer half of the platform: what this run declared it produces, and what
+// another run is standing as having declared. Two separate pieces of state on purpose — the bind
+// under test writes the first, and the second is the fixture playing a concurrently live run.
+struct CallerDeviceWriteState {
+    std::vector<std::pair<uint64_t, uint64_t>> declared_by_this_run;
+    int declare_calls{0};
+    // What the platform's own table reports back. Non-zero stands for a table that could not
+    // record the statement, which is the failure the bind must not continue past.
+    int declare_rc{0};
+    std::vector<std::pair<uint64_t, uint64_t>> declared_by_other_run;
+    int query_calls{0};
+    // A reporter that wins the fatal field while an access is being refused — see the query fake.
+    int32_t fatal_from_query{0};
+    // Whether that winning reporter is itself another refused access, which publishes the
+    // dependency wait as the run's cause before this access's own report can.
+    bool cause_from_query{false};
+
+    bool other_run_writes(uint64_t addr, uint64_t bytes) const {
+        for (const auto &[base, size] : declared_by_other_run) {
+            if (addr >= base && addr - base <= size && bytes <= size - (addr - base)) return true;
+        }
+        return false;
+    }
+};
+
+CallerDeviceWriteState *g_writes = nullptr;
+
+int fake_declare_caller_device_writes(void *, uint64_t, const CallerBufferSpan *spans, uint32_t count) {
+    if (g_writes == nullptr) return 0;
+    ++g_writes->declare_calls;
+    if (g_writes->declare_rc != 0) return g_writes->declare_rc;
+    g_writes->declared_by_this_run.clear();
+    for (uint32_t i = 0; i < count; ++i) {
+        g_writes->declared_by_this_run.emplace_back(spans[i].addr, spans[i].bytes);
+    }
+    return 0;
+}
+
+int fake_caller_device_span_written_by_other_run(void *, uint64_t, uint64_t addr, uint64_t bytes) {
+    if (g_writes == nullptr) return 0;
+    ++g_writes->query_calls;
+    const bool refused = g_writes->other_run_writes(addr, bytes);
+    // Stands in for the reporter that wins the fatal field while this access is being refused. The
+    // real one is a recording worker on another thread, between the refusal's mark and its own
+    // report; latching it here reaches the same state at the boundary that decides whose failure
+    // the run has — the mark is about to be set and the refusal's report can then only lose the
+    // exchange — and reaches it deterministically.
+    if (refused && g_writes->fatal_from_query != 0 && g_access != nullptr && g_access->runtime != nullptr) {
+        g_access->runtime->orchestrator->report_fatal(
+            g_writes->fatal_from_query, "competing_reporter", "an independent orchestration failure"
+        );
+        // The winner is another refused access rather than an unrelated failure: it owns the
+        // publication, so the run's cause is the wait it established.
+        if (g_writes->cause_from_query) {
+            host_tensor_note_dependency_wait_cause(g_access->runtime->tensor_access);
+        }
+    }
+    return refused ? 1 : 0;
+}
+
 const HostApiOps &fake_ops() {
     static const HostApiOps ops = []() {
         HostApiOps r{};
@@ -486,9 +554,20 @@ const HostApiOps &fake_ops() {
         r.acquire_graph_definition_block = fake_acquire_graph_definition_block;
         r.get_graph_definition_staging = fake_get_graph_definition_staging;
         r.acquire_scheduler_state_storage = fake_acquire_scheduler_state_storage;
+        r.declare_caller_device_writes = fake_declare_caller_device_writes;
+        r.caller_device_span_written_by_other_run = fake_caller_device_span_written_by_other_run;
         return r;
     }();
     return ops;
+}
+
+// A caller device allocation, in the address space this bind passes through untouched. Its bytes
+// live in host storage only so the fake platform's copy hooks have somewhere to point.
+ChipTensor child_memory_tensor(std::vector<uint8_t> &storage) {
+    ChipTensor t;
+    uint32_t shape[1] = {static_cast<uint32_t>(storage.size())};
+    t.init_external(storage.data(), storage.size(), shape, 1, DataType::UINT8, AddressSpace::DEVICE);
+    return t;
 }
 
 ChipTensor host_tensor(std::vector<uint8_t> &storage) {
@@ -587,13 +666,28 @@ protected:
     void SetUp() override {
         HbgBindLedgerTest::SetUp();
         g_access = &access_;
+        g_writes = &writes_;
         eps_ = {access_entry, access_bind};
     }
     void TearDown() override {
+        g_writes = nullptr;
         g_access = nullptr;
         HbgBindLedgerTest::TearDown();
     }
+
+    // Whether the maker this target links states which caller device buffers a run produces. The
+    // statement is the a2a3 maker's; the a5 maker makes none, so nothing it prepares can make
+    // another run's build wait — which is a fact about that maker, not a gap in this file, and the
+    // cases below assert whichever of the two holds here.
+    static constexpr bool kMakerDeclaresCallerWrites =
+#if defined(SIMPLER_TEST_HBG_MAKER_DECLARES_CALLER_WRITES)
+        true;
+#else
+        false;
+#endif
+
     HostAccessProbe access_;
+    CallerDeviceWriteState writes_;
 };
 
 }  // namespace
@@ -1629,4 +1723,297 @@ TEST_F(HbgResidentSchedulerStorageTest, ALegacyRunNamesNoRetainedStorage) {
     EXPECT_EQ(slot(0).grows, 1);
     EXPECT_EQ(fake_.scheduler_acquires, acquires_after_resident);
     EXPECT_EQ(fake_.live.count(retained), 1u);
+}
+
+// ---------------------------------------------------------------------------
+// Caller device buffers and the host graph build, through the real bind.
+//
+// These drive `bind_callable_to_runtime_impl` with an orchestration that calls
+// the production `get_tensor_data`, so the path under test is the whole of it:
+// the accessor's refusal, `report_fatal`, the orchestrator's latch, the bind's
+// status and its cleanup. What they pin is that the refusal follows a *declared
+// producer* and nothing else — sharing an allocation is not a reason to refuse.
+// ---------------------------------------------------------------------------
+
+// The R2 regression guard. Two runs may take the same immutable device input and both read its
+// bytes while building their graphs; that is legal today on every runtime that prepares a
+// successor concurrently, which is all of them. Nothing about holding an allocation may make it
+// unreadable — only a declared producer may.
+TEST_F(HbgHostAccessContractTest, ASharedDeviceInputWithNoDeclaredProducerStaysReadable) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto runtime_cleanup = cleanup_runtime(runtime);
+    std::vector<uint8_t> shared(64, 0x3c);
+    ChipStorageTaskArgs args;
+    args.add_tensor(child_memory_tensor(shared));
+    ArgDirection sig[1] = {ArgDirection::IN};
+
+    ASSERT_EQ(bind(runtime, args, sig, 1), 0);
+    EXPECT_EQ(access_.error, 0);
+    ASSERT_FALSE(access_.reads.empty());
+    EXPECT_EQ(access_.reads.back(), 0x3cu);
+    // An input declares no write, so a maker that declares publishes an empty producer set — and
+    // it publishes it even so, since a previous run's set on this slot must not stand in for it.
+    EXPECT_EQ(writes_.declare_calls, kMakerDeclaresCallerWrites ? 1 : 0);
+    EXPECT_TRUE(writes_.declared_by_this_run.empty());
+}
+
+// A run that produces a caller device buffer says so, from the direction its signature carries.
+// That declaration is what another run's build reads, so it has to be in place before this bind
+// runs its orchestration.
+TEST_F(HbgHostAccessContractTest, AnOutputDeviceTensorIsDeclaredAsProducedBeforeOrchestration) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto runtime_cleanup = cleanup_runtime(runtime);
+    std::vector<uint8_t> produced(64, 0x11);
+    ChipStorageTaskArgs args;
+    args.add_tensor(child_memory_tensor(produced));
+    ArgDirection sig[1] = {ArgDirection::OUT};
+
+    ASSERT_EQ(bind(runtime, args, sig, 1), 0);
+    if (kMakerDeclaresCallerWrites) {
+        EXPECT_EQ(writes_.declare_calls, 1);
+        ASSERT_EQ(writes_.declared_by_this_run.size(), 1u);
+        EXPECT_EQ(writes_.declared_by_this_run[0].first, reinterpret_cast<uint64_t>(produced.data()));
+        EXPECT_EQ(writes_.declared_by_this_run[0].second, produced.size());
+    } else {
+        // This maker states nothing, so no other run's build is made to wait by this one.
+        EXPECT_EQ(writes_.declare_calls, 0);
+        EXPECT_TRUE(writes_.declared_by_this_run.empty());
+    }
+    // Its own declaration does not make its own argument unreadable to it.
+    EXPECT_EQ(access_.error, 0);
+}
+
+// An INOUT device tensor is produced too, so it is declared. Read-before-write is still a write.
+TEST_F(HbgHostAccessContractTest, AnInoutDeviceTensorIsDeclaredAsProduced) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto runtime_cleanup = cleanup_runtime(runtime);
+    std::vector<uint8_t> inout(64, 0x22);
+    ChipStorageTaskArgs args;
+    args.add_tensor(child_memory_tensor(inout));
+    ArgDirection sig[1] = {ArgDirection::INOUT};
+
+    ASSERT_EQ(bind(runtime, args, sig, 1), 0);
+    EXPECT_EQ(writes_.declared_by_this_run.size(), kMakerDeclaresCallerWrites ? 1u : 0u);
+}
+
+// A statement the platform could not record is never reported as made: the bind fails, ahead of
+// the orchestration that would otherwise build a graph writing bytes no other run knows about.
+TEST_F(HbgHostAccessContractTest, ADeclarationThatCannotBeRecordedFailsTheBind) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto runtime_cleanup = cleanup_runtime(runtime);
+    std::vector<uint8_t> produced(64, 0x33);
+    writes_.declare_rc = PTO_RUNTIME_ERR_INTERNAL;
+    ChipStorageTaskArgs args;
+    args.add_tensor(child_memory_tensor(produced));
+    ArgDirection sig[1] = {ArgDirection::OUT};
+
+    if (kMakerDeclaresCallerWrites) {
+        EXPECT_EQ(bind(runtime, args, sig, 1), PTO_RUNTIME_ERR_INTERNAL);
+        EXPECT_EQ(writes_.declare_calls, 1);
+        // Before orchestration: the graph build never ran, so it read nothing and latched nothing.
+        EXPECT_TRUE(access_.reads.empty());
+    } else {
+        // This maker asks the platform for no statement, so there is none to fail and the bind is
+        // unaffected by a table that would have refused one.
+        EXPECT_EQ(bind(runtime, args, sig, 1), 0);
+        EXPECT_EQ(writes_.declare_calls, 0);
+    }
+    EXPECT_EQ(access_.error, 0);
+}
+
+// The wait, end to end on the production path: another run has declared it produces this buffer,
+// this run's graph build reads it, and the bind reports the one status the lane answers by leaving
+// the run queued until that producer has retired. The value the read returned is never used,
+// because the graph it would have gone into is discarded with the bind.
+TEST_F(HbgHostAccessContractTest, ReadingADeclaredProducersDeviceOutputDefersTheBind) {
+    Runtime runtime;
+    init_runtime(runtime);
+    // The fixture's own release, which still has to succeed: that is what keeps a deferred bind
+    // from stranding this run's bindings, and what lets its status reach the lane as a deferral.
+    auto runtime_cleanup = cleanup_runtime(runtime);
+    std::vector<uint8_t> produced(64, 0x7f);
+    writes_.declared_by_other_run.emplace_back(reinterpret_cast<uint64_t>(produced.data()), produced.size());
+    ChipStorageTaskArgs args;
+    args.add_tensor(child_memory_tensor(produced));
+    ArgDirection sig[1] = {ArgDirection::IN};
+
+    const int32_t bind_status = bind(runtime, args, sig, 1);
+    EXPECT_GT(writes_.query_calls, 0);
+    if (kMakerDeclaresCallerWrites) {
+        EXPECT_EQ(bind_status, PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE);
+    } else {
+        // The refusal itself is the shared accessor's, so it fires here too — but this maker
+        // neither declares a producer nor reads the deferral mark, so the run ends with the fatal
+        // the refused access latched, exactly as it did before any of this. The same constant
+        // selects both facts because they are one maker's: the maker that states what a run
+        // produces is the maker that acts on another run's statement.
+        EXPECT_EQ(bind_status, runtime_status_from_error_code(SIMPLER_ERROR_INVALID_ARGS));
+    }
+    EXPECT_EQ(access_.error, SIMPLER_ERROR_INVALID_ARGS);
+    // The read was refused rather than served, so the orchestration observed nothing.
+    ASSERT_EQ(access_.reads.size(), 1u);
+    EXPECT_EQ(access_.reads.back(), 0u);
+}
+
+// An orchestration that failed for a reason of its own keeps that reason. The callback reports a
+// fatal first and only then reads a declared producer's device output — an order a real one can
+// take, and the one that must not be turned into a retry: nothing guarantees a stateful callback
+// raises the same failure on a second attempt, so the run's own error has to reach the caller.
+//
+// Run twice, the second time with an independent failure that carries the *same* code the refusal
+// would latch, because a status comparison alone cannot tell those two apart. What does is that
+// the accessor is never reached at all: the read short-circuits on the latched fatal, so nothing
+// asks whether the span has a producer and nothing marks this attempt as a dependency wait.
+TEST_F(HbgHostAccessContractTest, AnEarlierIndependentFatalIsNotReplacedByADeferredRead) {
+    for (const int32_t independent : {SIMPLER_ERROR_FANIN_CAPACITY_EXCEEDED, SIMPLER_ERROR_INVALID_ARGS}) {
+        SCOPED_TRACE(independent);
+        access_ = HostAccessProbe{};
+        writes_ = CallerDeviceWriteState{};
+        Runtime runtime;
+        init_runtime(runtime);
+        auto runtime_cleanup = cleanup_runtime(runtime);
+        std::vector<uint8_t> produced(64, 0x7f);
+        writes_.declared_by_other_run.emplace_back(reinterpret_cast<uint64_t>(produced.data()), produced.size());
+        access_.pre_fatal = independent;
+        ChipStorageTaskArgs args;
+        args.add_tensor(child_memory_tensor(produced));
+        ArgDirection sig[1] = {ArgDirection::IN};
+
+        EXPECT_EQ(bind(runtime, args, sig, 1), runtime_status_from_error_code(independent));
+        EXPECT_EQ(access_.error, independent);
+        EXPECT_EQ(writes_.query_calls, 0);
+        ASSERT_EQ(access_.reads.size(), 1u);
+        EXPECT_EQ(access_.reads.back(), 0u);
+    }
+}
+
+// The same rule one step later, where an entry check cannot reach: the access *is* refused, and
+// another reporter owns the run's failure by the time the refusal reports its own. Ownership is
+// taken from that report's exchange, so the refusal does not claim a run it did not stop — the
+// mark it left is withdrawn and the independent error is what the bind returns.
+//
+// Run twice, the second arm with a competitor carrying the very code the refusal reports. Nothing
+// in the log can tell those two apart (both read `FATAL(code=5)`), which is exactly why the
+// decision cannot be a code comparison; `query_calls == 1` separates this from the sequential case
+// above, where the access is never reached at all.
+TEST_F(HbgHostAccessContractTest, ARefusalThatDidNotLatchTheFatalDoesNotClaimTheRun) {
+    for (const int32_t competing : {SIMPLER_ERROR_HEAP_RING_DEADLOCK, SIMPLER_ERROR_INVALID_ARGS}) {
+        SCOPED_TRACE(competing);
+        access_ = HostAccessProbe{};
+        writes_ = CallerDeviceWriteState{};
+        Runtime runtime;
+        init_runtime(runtime);
+        auto runtime_cleanup = cleanup_runtime(runtime);
+        std::vector<uint8_t> produced(64, 0x7f);
+        writes_.declared_by_other_run.emplace_back(reinterpret_cast<uint64_t>(produced.data()), produced.size());
+        writes_.fatal_from_query = competing;
+        ChipStorageTaskArgs args;
+        args.add_tensor(child_memory_tensor(produced));
+        ArgDirection sig[1] = {ArgDirection::IN};
+
+        EXPECT_EQ(bind(runtime, args, sig, 1), runtime_status_from_error_code(competing));
+        EXPECT_EQ(access_.error, competing);
+        EXPECT_EQ(writes_.query_calls, 1);
+        ASSERT_EQ(access_.reads.size(), 1u);
+        EXPECT_EQ(access_.reads.back(), 0u);
+    }
+}
+
+// Two refused accesses, and only one of them can own the publication. The loser must not undo the
+// winner's: both were refused for the same dependency, so the run is waiting on a predecessor
+// either way, and turning that into a hard failure because of which thread got there first would
+// fail a valid program on host scheduling alone.
+//
+// The winner here is the query fake standing in for the other refused access — it both latches the
+// fatal and publishes the wait, which is what that access's own entry would do. This access then
+// loses the exchange, and the run still waits.
+TEST_F(HbgHostAccessContractTest, ARefusalThatLosesToAnotherRefusalStillLeavesTheRunWaiting) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto runtime_cleanup = cleanup_runtime(runtime);
+    std::vector<uint8_t> produced(64, 0x7f);
+    writes_.declared_by_other_run.emplace_back(reinterpret_cast<uint64_t>(produced.data()), produced.size());
+    // The same code a refused access reports, because that is what the other access reports.
+    writes_.fatal_from_query = SIMPLER_ERROR_INVALID_ARGS;
+    writes_.cause_from_query = true;
+    ChipStorageTaskArgs args;
+    args.add_tensor(child_memory_tensor(produced));
+    ArgDirection sig[1] = {ArgDirection::IN};
+
+    const int32_t bind_status = bind(runtime, args, sig, 1);
+    EXPECT_EQ(writes_.query_calls, 1);
+    EXPECT_EQ(access_.error, SIMPLER_ERROR_INVALID_ARGS);
+    if (kMakerDeclaresCallerWrites) {
+        EXPECT_EQ(bind_status, PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE);
+    } else {
+        // This maker reads no cause, so its run ends with the fatal either refusal latched.
+        EXPECT_EQ(bind_status, runtime_status_from_error_code(SIMPLER_ERROR_INVALID_ARGS));
+    }
+}
+
+// The same shape with the producer gone. A declaration only lives as long as its run, so once
+// nothing declares the buffer the identical bind succeeds and reads the bytes.
+TEST_F(HbgHostAccessContractTest, TheSameBindSucceedsOnceNoRunDeclaresTheBuffer) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto runtime_cleanup = cleanup_runtime(runtime);
+    std::vector<uint8_t> produced(64, 0x7f);
+    ChipStorageTaskArgs args;
+    args.add_tensor(child_memory_tensor(produced));
+    ArgDirection sig[1] = {ArgDirection::IN};
+
+    ASSERT_EQ(bind(runtime, args, sig, 1), 0);
+    EXPECT_EQ(access_.error, 0);
+    ASSERT_FALSE(access_.reads.empty());
+    EXPECT_EQ(access_.reads.back(), 0x7fu);
+}
+
+// A device argument the callable's signature does not cover is refused. Direction is the only
+// thing a device argument's handling turns on — it is passed through by address, never copied — so
+// an uncovered index describes an argument list the callable does not, and neither answer about it
+// is available: declaring it would refuse a legal shared read, and leaving it undeclared would let
+// a concurrently preparing run read bytes nobody has produced.
+TEST_F(HbgHostAccessContractTest, ADeviceTensorTheSignatureDoesNotCoverIsRefused) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto runtime_cleanup = cleanup_runtime(runtime);
+    std::vector<uint8_t> produced(64, 0x5e);
+    ChipStorageTaskArgs args;
+    args.add_tensor(child_memory_tensor(produced));
+
+    // One tensor, an empty signature: the same shape a caller building its own ChipCallable can
+    // register. A host argument in this position keeps its old conservative handling.
+    const int32_t bind_status = bind(runtime, args, nullptr, 0);
+    if (kMakerDeclaresCallerWrites) {
+        EXPECT_EQ(bind_status, runtime_status_from_error_code(SIMPLER_ERROR_INVALID_ARGS));
+        // Refused before the orchestration it would have gated, so no graph build observed the
+        // buffer.
+        EXPECT_TRUE(access_.reads.empty());
+    } else {
+        // This maker reads no direction for a device argument and publishes no producer, so an
+        // uncovered index is not its concern and the bind is unaffected.
+        EXPECT_EQ(bind_status, 0);
+    }
+    EXPECT_EQ(writes_.declare_calls, 0);
+}
+
+// A host-memory argument is unaffected by any declaration: its region is the caller buffer this
+// bind copied in, and the readability query is never even asked about it.
+TEST_F(HbgHostAccessContractTest, AHostArgumentIsNeverRefusedByADeclaration) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto runtime_cleanup = cleanup_runtime(runtime);
+    std::vector<uint8_t> payload(64, 0x41);
+    writes_.declared_by_other_run.emplace_back(reinterpret_cast<uint64_t>(payload.data()), payload.size());
+    ChipStorageTaskArgs args;
+    args.add_tensor(host_tensor(payload));
+    ArgDirection sig[1] = {ArgDirection::IN};
+
+    ASSERT_EQ(bind(runtime, args, sig, 1), 0);
+    EXPECT_EQ(access_.error, 0);
+    EXPECT_EQ(writes_.query_calls, 0);
 }
