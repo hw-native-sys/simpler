@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -129,20 +130,39 @@ public:
     enum class Admission : uint32_t { Open = 0, DrainOnly = 1, Closed = 2 };
 
     /**
+     * What a backend release actually achieved.
+     *
+     * Three outcomes rather than a code, because they have three different
+     * owners. The backend reports which one happened and returns; it must not
+     * call back into this manager to record it — this manager holds its own
+     * lock across the call, and a callback would re-enter it.
+     */
+    enum class ReleaseOutcome : uint32_t {
+        /** Unmapped if it had to be, and the platform freed the bytes. */
+        Freed = 0,
+        /** Still mapped into this process: the bytes must not be freed at all. */
+        StillMapped,
+        /** Unmapped, but the platform free failed: the bytes are still there. */
+        FreeFailed,
+    };
+
+    /**
      * The device allocation this manager owns blocks through.
      *
      * `acquire` must reserve its own bookkeeping before the platform call and
      * commit it without allocating afterwards; it returns nullptr on failure
-     * having changed nothing. `release` returns 0 when the bytes are gone and a
-     * non-zero platform code when they are not — in which case the backend
-     * keeps the allocation recorded, so this manager keeps charging for it
-     * rather than dropping the pointer or reporting a release that did not
-     * happen.
+     * having changed nothing.
+     *
+     * `release` unmaps before it frees and reports which of the three outcomes
+     * it reached, writing the platform code into `platform_rc` when it has one.
+     * Anything but `Freed` leaves the allocation recorded on the backend side,
+     * so this manager keeps charging for it rather than dropping the pointer or
+     * reporting a release that did not happen.
      */
     struct Backend {
         void *ctx{nullptr};
         void *(*acquire)(void *ctx, size_t bytes){nullptr};
-        int (*release)(void *ctx, void *base){nullptr};
+        ReleaseOutcome (*release)(void *ctx, void *base, int *platform_rc){nullptr};
     };
 
     /**
@@ -190,25 +210,70 @@ public:
     WorkspaceManager &operator=(const WorkspaceManager &) = delete;
 
     /**
-     * Turn the manager on with a finite budget, once.
-     *
-     * @return false when the budget is zero, when one is already latched, or
-     *         when the backend is incomplete. A refused configuration leaves
-     *         the manager off, which is the unchanged default behaviour.
+     * Why an acquire refused. Internal to the host: the caller turns it into
+     * its own log line, and no field of the public report carries it.
      */
-    bool configure(uint64_t limit_bytes, const Backend &backend) {
+    enum class AcquireRefusal : uint32_t {
+        None = 0,
+        /** Not managed, a zero request, or admission is closed. */
+        NotServing,
+        /** A finite limit is enforced and this request does not fit it. */
+        OverQuota,
+        /** Ownership of some block became unprovable, so no new block is published. */
+        Degraded,
+        /** The platform allocation itself failed. */
+        BackendFailed,
+        /** The requested size cannot be accounted without wrapping. */
+        Overflow,
+    };
+
+    /**
+     * Turn ownership management on, once, with no byte limit.
+     *
+     * A limit is a separate, optional policy (`set_limit`): managing lifetimes
+     * and capping bytes are different questions, and the first does not need
+     * the second. A manager that is on with no limit tracks, reuses and
+     * reclaims exactly as one with a limit does; it simply never refuses for
+     * capacity.
+     *
+     * @return false when management is already on or the backend is incomplete
+     */
+    bool configure(const Backend &backend) {
         std::scoped_lock lk(mu_);
-        if (enabled_ || limit_bytes == 0) return false;
+        if (enabled_) return false;
         if (backend.acquire == nullptr || backend.release == nullptr) return false;
-        limit_bytes_ = limit_bytes;
         backend_ = backend;
         enabled_ = true;
+        return true;
+    }
+
+    /**
+     * Enforce a finite byte limit on the blocks this manager owns, once.
+     *
+     * @return false when management is off, when a limit is already set, when
+     *         `limit_bytes` is zero, or when it is below what is already
+     *         charged — a limit that the current state already exceeds could
+     *         only refuse every later request while proving nothing about the
+     *         bytes already published.
+     */
+    bool set_limit(uint64_t limit_bytes) {
+        std::scoped_lock lk(mu_);
+        if (!enabled_ || has_limit_ || limit_bytes == 0) return false;
+        if (limit_bytes < reserved_bytes_) return false;
+        limit_bytes_ = limit_bytes;
+        has_limit_ = true;
         return true;
     }
 
     bool enabled() const {
         std::scoped_lock lk(mu_);
         return enabled_;
+    }
+
+    /** Whether a finite byte limit is enforced on top of management. */
+    bool limit_enforced() const {
+        std::scoped_lock lk(mu_);
+        return has_limit_;
     }
 
     /**
@@ -222,10 +287,13 @@ public:
      * @param slot       pipeline slot this plan belongs to
      * @param run_epoch  process-unique identity of the run making the plan
      */
-    void *acquire(const RegionKey &region, uint64_t run_epoch, size_t bytes) {
+    void *acquire(const RegionKey &region, uint64_t run_epoch, size_t bytes, AcquireRefusal *why = nullptr) {
         std::scoped_lock lk(mu_);
-        if (!enabled_ || bytes == 0) return nullptr;
-        if (admission_ != Admission::Open && admission_ != Admission::DrainOnly) return nullptr;
+        if (why != nullptr) *why = AcquireRefusal::None;
+        if (!enabled_ || bytes == 0) return refuse(why, AcquireRefusal::NotServing);
+        if (admission_ != Admission::Open && admission_ != Admission::DrainOnly) {
+            return refuse(why, AcquireRefusal::NotServing);
+        }
 
         for (Block &b : blocks_) {
             // A released block's address belongs to the platform again, so the
@@ -235,7 +303,7 @@ public:
             if (b.quarantined || b.release_unconfirmed) continue;
             if (b.bytes < bytes) continue;
             if (b.ref_count != 0) continue;  // capacity is not permission
-            if (!add_ref(b, run_epoch)) return nullptr;
+            if (!add_ref(b, run_epoch)) return refuse(why, AcquireRefusal::NotServing);
             // Handed out as this region's backing, so it stops being an
             // obsolete generation now rather than at publication: between the
             // two, growth elsewhere must not reclaim the block this plan is
@@ -243,7 +311,7 @@ public:
             b.current = true;
             return b.base;
         }
-        return publish_new_block(region, run_epoch, bytes);
+        return publish_new_block(region, run_epoch, bytes, why);
     }
 
     /**
@@ -265,7 +333,12 @@ public:
     bool reference(void *base, uint64_t run_epoch) {
         std::scoped_lock lk(mu_);
         Block *b = find_locked(base);
-        if (b == nullptr || b->quarantined) return false;
+        // Quarantined and release-unconfirmed are both refused, and for the
+        // same reason as in `acquire`: a caller reaching this from a capacity
+        // hit has not re-derived the block's disposition, and handing back
+        // storage whose free was attempted and failed would let a run write
+        // where the platform may already have reclaimed.
+        if (b == nullptr || b->quarantined || b->release_unconfirmed) return false;
         return add_ref(*b, run_epoch);
     }
 
@@ -364,6 +437,20 @@ public:
         if (!enabled_ || slot >= PTO_PIPELINE_MAX_DEPTH) return;
         RunRecord &r = runs_[slot];
         if (r.epoch != run_epoch) {
+            // Run epochs are minted from one process-wide counter that only
+            // ever increments, so a lower epoch on a slot is necessarily a
+            // predecessor's late fact and not a new run. Its record has been
+            // replaced by the successor's, and replacing it back would erase
+            // facts the successor has already reported.
+            //
+            // The fact still has to reach that predecessor's *references*,
+            // which are keyed by epoch and independent of this slot record:
+            // a late context destruction must still quarantine whatever the
+            // old run held, or those blocks would look reclaimable.
+            if (run_epoch < r.epoch) {
+                if (fact == RunFact::ContextDestroyed) quarantine_run_refs(run_epoch);
+                return;
+            }
             r = RunRecord{};
             r.epoch = run_epoch;
         }
@@ -442,21 +529,60 @@ public:
         int last_error = 0;
         for (Block &b : blocks_) {
             if (b.quarantined || b.ref_count != 0 || b.released || b.swept) continue;
-            const int rc = backend_.release(backend_.ctx, b.base);
-            if (rc == 0) {
-                b.released = true;
-                b.swept = true;  // accounted for here; the terminal sweep skips it
-                b.state = BlockState::ProvenUnused;
-                reserved_bytes_ -= b.bytes;
-                continue;
-            }
-            // The backend keeps a failed release recorded, so the bytes keep
-            // their owner and their charge instead of being reported as gone.
-            b.release_unconfirmed = true;
-            b.release_rc = rc;
-            b.state = BlockState::ReleaseUnconfirmed;
-            last_error = rc;
+            // A release that already failed is not attempted again here. Its
+            // bytes keep their charge and its record keeps the failure, and
+            // the terminal sweep below still gets the one further attempt that
+            // can reach a proved outcome — trying again on this ordinary path
+            // would only add a second failure to the same block.
+            if (b.release_unconfirmed) continue;
+            const int rc = apply_release_locked(b);
+            if (rc != 0) last_error = rc;
         }
+        return last_error;
+    }
+
+    /**
+     * Whether a drain would have anything to do.
+     *
+     * Cheap enough to ask on every run: one locked walk of a short vector and
+     * no device call, so a steady-state workload that reuses its current
+     * blocks pays only this.
+     */
+    bool has_reclaimable() const {
+        std::scoped_lock lk(mu_);
+        if (!enabled_) return false;
+        for (const Block &b : blocks_) {
+            if (reclaimable_locked(b)) return true;
+            if (compactable_locked(b)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Release every obsolete generation whose consumers are all finished, and
+     * drop the ledger records of blocks that are fully and provably gone.
+     *
+     * Independent of any byte limit: a generation its region has replaced, with
+     * no reference left, is reclaimable because nothing can reach it — not
+     * because the budget is tight. A region's *current* block is never taken,
+     * whatever its reference count: idle is not abandoned, and keeping it warm
+     * is what lets the next same-sized call reuse it.
+     *
+     * The caller must have this thread attached to the device, because the
+     * backend release is a device call. Nothing here retries a failure.
+     *
+     * @return the last platform code from a failed release, or 0
+     */
+    int reclaim_obsolete() {
+        std::scoped_lock lk(mu_);
+        if (!enabled_) return 0;
+        int last_error = 0;
+        for (Block &b : blocks_) {
+            if (!reclaimable_locked(b)) continue;
+            const int rc = apply_release_locked(b);
+            if (rc != 0) last_error = rc;
+        }
+        compact_locked();
         return last_error;
     }
 
@@ -540,6 +666,7 @@ public:
             b->mapping_retained = true;
             quarantined_mapped_bytes_ += b->bytes;
         }
+        degrade_locked();
         return true;
     }
 
@@ -549,9 +676,11 @@ public:
         std::scoped_lock lk(mu_);
         if (!enabled_) return false;
         SimplerWorkspaceReport r{};
-        r.budget_enforced = 1;
+        // Two different questions: this record exists because the context is
+        // managed, and this field says whether a finite limit is also enforced.
+        r.budget_enforced = has_limit_ ? 1u : 0u;
         r.coverage_is_partial = 1;
-        r.limit_bytes = limit_bytes_;
+        r.limit_bytes = has_limit_ ? limit_bytes_ : 0;
         r.reserved_bytes = reserved_bytes_;
         r.relinquished_bytes = relinquished_bytes_;
         r.quarantined_mapped_bytes = quarantined_mapped_bytes_;
@@ -658,6 +787,13 @@ private:
             b->released = true;
             b->state = BlockState::ProvenUnused;
             reserved_bytes_ -= b->bytes;
+            // The one further attempt a block whose earlier free failed is
+            // allowed reached a proved outcome, so the doubt it was carrying
+            // is over: leaving the marks would report a freed block as
+            // unconfirmed for the rest of this context's life, and would keep
+            // its record out of compaction forever.
+            b->release_unconfirmed = false;
+            b->release_rc = 0;
             return;
         }
         // A failed free is not a reclamation: the bytes keep their charge and
@@ -766,6 +902,12 @@ private:
     }
 
     void quarantine_run_refs(uint64_t epoch) {
+        // Any block this leaves quarantined is one whose last consumer can
+        // never be proved, so publishing more of them would grow the ledger
+        // with records nothing can resolve. Latched even when the run held
+        // none: the degrade is about this manager's ability to prove, and the
+        // check below records whether it actually took anything.
+        bool held_any = false;
         for (Block &b : blocks_) {
             bool held = false;
             for (uint32_t i = 0; i < b.ref_count; ++i) {
@@ -778,7 +920,9 @@ private:
             b.quarantined = true;
             drop_ref(b, epoch);
             b.state = BlockState::Quarantined;
+            held_any = true;
         }
+        if (held_any) degrade_locked();
     }
 
     /**
@@ -793,38 +937,144 @@ private:
      * failed plan preserved, which stay current; and any block the backend's
      * unmap could not clear.
      */
-    bool make_room_locked(size_t bytes) {
-        if (reserved_bytes_ + bytes <= limit_bytes_) return true;
-        for (Block &b : blocks_) {
-            if (reserved_bytes_ + bytes <= limit_bytes_) break;
-            if (b.current || b.released || b.swept) continue;
-            if (b.quarantined || b.release_unconfirmed || b.mapping_retained) continue;
-            if (b.ref_count != 0) continue;
-            if (backend_.release(backend_.ctx, b.base) != 0) {
-                // Still on the device, so still charged: reporting these bytes
-                // as reclaimed would let the budget hand them out twice.
-                b.release_unconfirmed = true;
-                b.state = BlockState::ReleaseUnconfirmed;
-                continue;
-            }
+    static void *refuse(AcquireRefusal *why, AcquireRefusal reason) {
+        if (why != nullptr) *why = reason;
+        return nullptr;
+    }
+
+    /**
+     * Ownership of some block can no longer be proved, so this manager stops
+     * publishing new ones.
+     *
+     * Nothing this manager does on its own can clear such a record. The
+     * terminal sweep is the one place a failed free can still be settled, and
+     * only there, once; a failed unmap leaves a live host address that no
+     * later attempt makes safe; and a run destroyed before its facts completed
+     * can never produce them. Without this latch each later round could
+     * publish another block and leave another record behind it, so the ledger
+     * would grow with the failures rather than stopping at them.
+     *
+     * It frees nothing, caps no bytes, and leaves blocks already proven safe
+     * reusable: only the publication of *new* blocks stops.
+     */
+    void degrade_locked() { degraded_ = true; }
+
+    /**
+     * Release one block through the backend and record what actually happened.
+     *
+     * Called with `mu_` held. The backend reports a disposition rather than
+     * calling back here, so this stays non-reentrant.
+     *
+     * @return the platform code when the bytes are still there, else 0
+     */
+    int apply_release_locked(Block &b) {
+        int platform_rc = 0;
+        const ReleaseOutcome outcome = backend_.release(backend_.ctx, b.base, &platform_rc);
+        if (outcome == ReleaseOutcome::Freed) {
             b.released = true;
             b.swept = true;  // accounted for here; the terminal sweep skips it
             b.state = BlockState::ProvenUnused;
             reserved_bytes_ -= b.bytes;
+            return 0;
+        }
+        if (outcome == ReleaseOutcome::StillMapped) {
+            // A host mapping covers the whole allocation, so these bytes can
+            // never be handed to another allocation. Quarantined rather than
+            // merely unconfirmed: this is not a free that might be retried.
+            b.quarantined = true;
+            b.state = BlockState::Quarantined;
+            if (!b.mapping_retained) {
+                b.mapping_retained = true;
+                quarantined_mapped_bytes_ += b.bytes;
+            }
+            degrade_locked();
+            return platform_rc != 0 ? platform_rc : -1;
+        }
+        // Unmapped, but the platform kept the bytes: the charge stays and the
+        // block is never offered again. Not retried here.
+        b.release_unconfirmed = true;
+        b.release_rc = platform_rc;
+        b.state = BlockState::ReleaseUnconfirmed;
+        degrade_locked();
+        return platform_rc != 0 ? platform_rc : -1;
+    }
+
+    /**
+     * Whether this record can leave the ledger.
+     *
+     * Only a block the platform has provably taken back, with nothing left to
+     * say about it: no retained mapping, no failed release code, and already
+     * accounted by whichever path released it. Everything else stays — a
+     * quarantined or unconfirmed record *is* the evidence, and the terminal
+     * sweep and `must_keep` still have to find it.
+     */
+    static bool compactable_locked(const Block &b) {
+        return b.released && b.swept && !b.mapping_retained && !b.quarantined && !b.release_unconfirmed &&
+               b.release_rc == 0 && b.ref_count == 0;
+    }
+
+    /**
+     * Drop fully released records so the ledger tracks live ownership rather
+     * than history.
+     *
+     * Safe to do under `mu_` and nowhere else: every `Block` handle in this
+     * class is a local obtained from `find_locked` inside one locked method,
+     * so no index or pointer outlives a critical section and an erase can
+     * never strand one. Block identity is (base, not released) and
+     * `find_locked` already skips released records, so an address the platform
+     * reissues to a new block cannot be matched to a record that survived —
+     * and the records that could be confused are exactly the ones erased here.
+     *
+     * Cumulative counters are deliberately untouched: `blocks_published_`,
+     * `relinquished_bytes_` and the foreign-failure tallies are the audit
+     * trail, and compaction must not make history smaller.
+     */
+    void compact_locked() {
+        blocks_.erase(
+            std::remove_if(
+                blocks_.begin(), blocks_.end(),
+                [](const Block &b) {
+                    return compactable_locked(b);
+                }
+            ),
+            blocks_.end()
+        );
+    }
+
+    /** Whether this block is an obsolete generation nothing can still be using. */
+    static bool reclaimable_locked(const Block &b) {
+        if (b.current || b.released || b.swept) return false;
+        if (b.quarantined || b.release_unconfirmed || b.mapping_retained) return false;
+        return b.ref_count == 0;
+    }
+
+    bool make_room_locked(size_t bytes) {
+        if (!has_limit_ || reserved_bytes_ + bytes <= limit_bytes_) return true;
+        for (Block &b : blocks_) {
+            if (reserved_bytes_ + bytes <= limit_bytes_) break;
+            if (!reclaimable_locked(b)) continue;
+            apply_release_locked(b);
         }
         return reserved_bytes_ + bytes <= limit_bytes_;
     }
 
-    void *publish_new_block(const RegionKey &region, uint64_t run_epoch, size_t bytes) {
-        if (reserved_bytes_ + bytes < reserved_bytes_) return nullptr;  // overflow
-        if (!make_room_locked(bytes)) return nullptr;
+    void *publish_new_block(const RegionKey &region, uint64_t run_epoch, size_t bytes, AcquireRefusal *why) {
+        if (reserved_bytes_ + bytes < reserved_bytes_) return refuse(why, AcquireRefusal::Overflow);
+        // Ownership of some block is unprovable, so nothing new is published:
+        // a new block could only add another record nothing can resolve.
+        // Checked before make_room so a reclaim cannot look like a way out.
+        if (degraded_) return refuse(why, AcquireRefusal::Degraded);
+        if (!make_room_locked(bytes)) return refuse(why, AcquireRefusal::OverQuota);
+        // Reclaiming under pressure can itself fail a release and degrade this
+        // manager, so the latch is re-read after it rather than only before.
+        if (degraded_) return refuse(why, AcquireRefusal::Degraded);
         // Both ownership records exist before the device allocation: this vector
         // may reallocate here, where nothing has been allocated on the device
         // yet, and the backend reserves its own tracking node before its own
         // platform call.
         blocks_.reserve(blocks_.size() + 1);
         void *base = backend_.acquire(backend_.ctx, bytes);
-        if (base == nullptr) return nullptr;  // published state untouched
+        if (base == nullptr) return refuse(why, AcquireRefusal::BackendFailed);  // published state untouched
         Block b;
         b.base = base;
         b.bytes = bytes;
@@ -842,6 +1092,11 @@ private:
 
     mutable std::mutex mu_;
     bool enabled_{false};
+    // A finite byte limit is optional policy on top of management; `limit_bytes_`
+    // is meaningless unless this is set, and there is no sentinel for "no limit".
+    bool has_limit_{false};
+    // Some block's ownership is unprovable, so no new block is published.
+    bool degraded_{false};
     uint64_t limit_bytes_{0};
     uint64_t reserved_bytes_{0};
     uint64_t relinquished_bytes_{0};

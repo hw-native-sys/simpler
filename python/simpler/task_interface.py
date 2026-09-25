@@ -1470,6 +1470,7 @@ class ChipWorker:
         collect_across_runs: bool | None = None,
         dfx_session: bool | None = None,
         workspace_budget_bytes: int = 0,
+        manage_workspace: bool = False,
     ):
         """Attach the calling thread to ``device_id``, load the host runtime
         library, and cache platform binaries.
@@ -1495,14 +1496,21 @@ class ChipWorker:
             log_level: Threshold (10=DEBUG, 20=INFO, 25=TIMING, 30=WARN,
                 40=ERROR, 60=NUL). Defaults to a snapshot of the simpler
                 logger via `_log.get_current_config()`.
-            workspace_budget_bytes: Finite budget for this context's workspace
-                regions — the per-slot retained temporary buffer and the three
-                pooled arena regions. 0 (the default) manages none of them and
-                leaves every allocation path unchanged. A non-zero value on a
-                module without workspace support raises rather than running
-                unmanaged. Partial accounting: external tensors, run-result and
+            workspace_budget_bytes: Finite byte budget for this context's
+                workspace regions — the per-slot retained temporary buffer and
+                the three pooled arena regions. 0 (the default) enforces no
+                budget; it does not decide whether those regions have an owner,
+                which is `manage_workspace`. A non-zero value on a module
+                without workspace support raises rather than running unmanaged.
+                Partial accounting: external tensors, run-result and
                 diagnostics regions, code and device ELF, RTS and provider
                 memory are outside it, so it is not a device-wide ceiling.
+            manage_workspace: Put those same four regions under one owner, so a
+                superseded generation is released when its last consumer
+                retires instead of at close. Internal: the in-process level-2
+                route passes it, and no public `Worker` option sets it. Ignored
+                on a simulated backend, which manages no device workspace. A
+                budget implies it.
             collect_across_runs: Let a run's records outlive its own boundary,
                 so the sealing and the file write happen while the next run
                 executes instead of at the boundary. Off when neither this nor
@@ -1561,6 +1569,7 @@ class ChipWorker:
                 "" if sdma_warmup_path is None else str(sdma_warmup_path),
                 bool(_resolve_collect_across_runs(collect_across_runs, dfx_session)),
                 int(workspace_budget_bytes),
+                bool(manage_workspace),
             )
             for slot_id, callable_obj in list(self._callable_registry.items()):
                 self._impl.register_callable(int(slot_id), callable_obj)

@@ -11,6 +11,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <map>
 #include <vector>
 
@@ -31,8 +32,8 @@ public:
         b.acquire = [](void *ctx, size_t bytes) -> void * {
             return static_cast<FakeBackend *>(ctx)->acquire(bytes);
         };
-        b.release = [](void *ctx, void *base) {
-            return static_cast<FakeBackend *>(ctx)->release(base);
+        b.release = [](void *ctx, void *base, int *platform_rc) {
+            return static_cast<FakeBackend *>(ctx)->release(base, platform_rc);
         };
         return b;
     }
@@ -43,20 +44,40 @@ public:
             fail_next_acquire = false;
             return nullptr;
         }
+        if (next_forced != nullptr) {
+            // Hands back an address the platform has already reclaimed, which
+            // is what a real allocator is free to do.
+            void *forced = next_forced;
+            next_forced = nullptr;
+            live_bytes[forced] = bytes;
+            return forced;
+        }
         next_ += 0x10000;
         live_bytes[reinterpret_cast<void *>(next_)] = bytes;
         return reinterpret_cast<void *>(next_);
     }
 
-    int release(void *base) {
+    WorkspaceManager::ReleaseOutcome release(void *base, int *platform_rc) {
         released.push_back(base);
-        if (fail_release_of == base) return -7;
+        if (fail_release_of == base) {
+            if (platform_rc != nullptr) *platform_rc = -7;
+            return WorkspaceManager::ReleaseOutcome::FreeFailed;
+        }
+        if (keep_mapped_of == base) {
+            if (platform_rc != nullptr) *platform_rc = -9;
+            return WorkspaceManager::ReleaseOutcome::StillMapped;
+        }
         live_bytes.erase(base);
-        return 0;
+        return WorkspaceManager::ReleaseOutcome::Freed;
     }
 
     bool fail_next_acquire{false};
     void *fail_release_of{nullptr};
+    // The unmap half of the pair: the range stays mapped, so the bytes are
+    // never freed and the block can never be offered again.
+    void *keep_mapped_of{nullptr};
+    // The next acquire returns exactly this address, once.
+    void *next_forced{nullptr};
     int acquire_calls{0};
     std::vector<void *> released;
     std::map<void *, size_t> live_bytes;
@@ -91,17 +112,22 @@ TEST(WorkspaceManager, DisabledUntilAFiniteBudgetIsLatched) {
     SimplerWorkspaceReport report{};
     EXPECT_FALSE(m.report(&report));
 
-    EXPECT_FALSE(m.configure(0, backend.ops()));  // a zero budget is not a budget
-    EXPECT_FALSE(m.enabled());
-    EXPECT_TRUE(m.configure(kBudget, backend.ops()));
+    EXPECT_FALSE(m.limit_enforced());
+    EXPECT_FALSE(m.set_limit(kBudget));  // a limit needs management first
+    EXPECT_TRUE(m.configure(backend.ops()));
     EXPECT_TRUE(m.enabled());
-    EXPECT_FALSE(m.configure(kBudget, backend.ops()));  // latched once
+    EXPECT_FALSE(m.configure(backend.ops()));  // latched once
+    EXPECT_FALSE(m.set_limit(0));              // a zero budget is not a budget
+    EXPECT_TRUE(m.set_limit(kBudget));
+    EXPECT_TRUE(m.limit_enforced());
+    EXPECT_FALSE(m.set_limit(kBudget));  // latched once
 }
 
 TEST(WorkspaceManager, ReuseNeedsBothCapacityAndNoRemainingConsumer) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kBudget, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kBudget));
 
     void *first = m.acquire(WorkspaceManager::staging_region(0), 1, 4096);
     ASSERT_NE(first, nullptr);
@@ -126,7 +152,8 @@ TEST(WorkspaceManager, ReuseNeedsBothCapacityAndNoRemainingConsumer) {
 TEST(WorkspaceManager, ADrainThatDidNotProveCompletionDoesNotRetire) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kBudget, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kBudget));
     void *block = m.acquire(WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmHeap), 9, 4096);
     ASSERT_NE(block, nullptr);
 
@@ -145,7 +172,8 @@ TEST(WorkspaceManager, ADrainThatDidNotProveCompletionDoesNotRetire) {
 TEST(WorkspaceManager, ARunThatSubmittedNothingRetiresWithoutADrain) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kBudget, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kBudget));
     void *block = m.acquire(WorkspaceManager::staging_region(1), 4, 4096);
     ASSERT_NE(block, nullptr);
 
@@ -163,7 +191,8 @@ TEST(WorkspaceManager, ARunThatSubmittedNothingRetiresWithoutADrain) {
 TEST(WorkspaceManager, ThreeRetainedGenerationsAllStayAccountedFor) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kBudget, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kBudget));
 
     // One region growing across three runs whose earlier consumers never
     // retire: every generation stays charged and none is dropped from the
@@ -195,7 +224,8 @@ TEST(WorkspaceManager, ThreeRetainedGenerationsAllStayAccountedFor) {
 TEST(WorkspaceManager, AnOverBudgetRequestFailsAndChangesNothing) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(8192, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(8192));
     void *held = m.acquire(WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmHeap), 1, 4096);
     ASSERT_NE(held, nullptr);
     const uint64_t charged = m.reserved_bytes();
@@ -213,7 +243,8 @@ TEST(WorkspaceManager, AnOverBudgetRequestFailsAndChangesNothing) {
 TEST(WorkspaceManager, ADeviceAllocationFailureLeavesPublishedStateIntact) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kBudget, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kBudget));
     void *held = m.acquire(WorkspaceManager::staging_region(0), 1, 4096);
     ASSERT_NE(held, nullptr);
     const uint64_t charged = m.reserved_bytes();
@@ -228,7 +259,8 @@ TEST(WorkspaceManager, ADeviceAllocationFailureLeavesPublishedStateIntact) {
 TEST(WorkspaceManager, AFailedReleaseKeepsItsOwnerAndItsCharge) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kBudget, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kBudget));
     void *block = m.acquire(WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmHeap), 5, 4096);
     ASSERT_NE(block, nullptr);
     report_launched_and_drained(m, 0, 5);
@@ -250,7 +282,8 @@ TEST(WorkspaceManager, AFailedReleaseKeepsItsOwnerAndItsCharge) {
 TEST(WorkspaceManager, ASuccessfulReleaseDropsItsChargeAndIsNotReused) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kBudget, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kBudget));
     void *block = m.acquire(WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmHeap), 5, 4096);
     ASSERT_NE(block, nullptr);
     report_launched_and_drained(m, 0, 5);
@@ -265,7 +298,8 @@ TEST(WorkspaceManager, ASuccessfulReleaseDropsItsChargeAndIsNotReused) {
 TEST(WorkspaceManager, ADestroyedContextQuarantinesTheWholeBlockItHeld) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kBudget, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kBudget));
     void *block = m.acquire(WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmHeap), 11, 4096);
     ASSERT_NE(block, nullptr);
 
@@ -295,7 +329,8 @@ TEST(WorkspaceManager, ADestroyedContextQuarantinesTheWholeBlockItHeld) {
 TEST(WorkspaceManager, ALiveDrainableConsumerIsCountedAndClearsOnRetirement) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kBudget, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kBudget));
     void *block = m.acquire(WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmHeap), 21, 4096);
     ASSERT_NE(block, nullptr);
 
@@ -323,7 +358,8 @@ TEST(WorkspaceManager, ALiveDrainableConsumerIsCountedAndClearsOnRetirement) {
 TEST(WorkspaceManager, TheSweepKeepsQuarantinedBlocksAndRecordsEveryOutcome) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kBudget, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kBudget));
     void *kept = m.acquire(WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmHeap), 31, 4096);
     void *freed = m.acquire(WorkspaceManager::staging_region(1), 32, 2048);
     ASSERT_NE(kept, nullptr);
@@ -352,7 +388,8 @@ TEST(WorkspaceManager, TheSweepKeepsQuarantinedBlocksAndRecordsEveryOutcome) {
 TEST(WorkspaceManager, ARetainedMappingIsAccountedSeparately) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kBudget, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kBudget));
     void *block = m.acquire(WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmHeap), 41, 4096);
     ASSERT_NE(block, nullptr);
     m.note_run_fact(0, 41, WorkspaceManager::RunFact::Launched);
@@ -368,7 +405,8 @@ TEST(WorkspaceManager, ARetainedMappingIsAccountedSeparately) {
 TEST(WorkspaceManager, ClosedAdmissionServesNoNewRequest) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kBudget, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kBudget));
     // A drain still admits the work already accepted, which is what lets an
     // in-progress prepare finish; a closed manager admits nothing.
     m.enter_drain_only();
@@ -380,7 +418,8 @@ TEST(WorkspaceManager, ClosedAdmissionServesNoNewRequest) {
 TEST(WorkspaceManager, TheReportNamesItsOwnCoverageAsPartial) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kBudget, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kBudget));
     SimplerWorkspaceReport report{};
     ASSERT_TRUE(m.report(&report));
     // The one field that stops a reader treating limit_bytes as a device-wide
@@ -397,7 +436,8 @@ TEST(WorkspaceManager, TheReportNamesItsOwnCoverageAsPartial) {
 TEST(WorkspaceManagerOwnership, AReleasedBlockIsNeverHandedOutAgain) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kBudget, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kBudget));
     const WorkspaceManager::RegionKey region = WorkspaceManager::staging_region(0);
 
     void *first = m.acquire(region, 1, 4096);
@@ -419,7 +459,8 @@ TEST(WorkspaceManagerOwnership, AReleasedBlockIsNeverHandedOutAgain) {
 TEST(WorkspaceManagerOwnership, OneRegionsBlockIsNeverGivenToAnother) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kBudget, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kBudget));
     const WorkspaceManager::RegionKey heap = WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmHeap);
     const WorkspaceManager::RegionKey sm = WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmSm);
 
@@ -450,7 +491,8 @@ TEST(WorkspaceManagerOwnership, OneRegionsBlockIsNeverGivenToAnother) {
 TEST(WorkspaceManagerOwnership, AReusedBlockRegistersItsNewConsumer) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kBudget, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kBudget));
     const WorkspaceManager::RegionKey region = WorkspaceManager::staging_region(0);
 
     void *block = m.acquire(region, 1, 4096);
@@ -474,7 +516,8 @@ TEST(WorkspaceManagerOwnership, AReusedBlockRegistersItsNewConsumer) {
 TEST(WorkspaceManagerOwnership, AQuarantinedBlockRefusesNewConsumers) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kBudget, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kBudget));
     void *block = m.acquire(WorkspaceManager::staging_region(0), 1, 4096);
     ASSERT_NE(block, nullptr);
     m.note_run_fact(0, 1, WorkspaceManager::RunFact::Launched);
@@ -491,7 +534,8 @@ TEST(WorkspaceManagerOwnership, AQuarantinedBlockRefusesNewConsumers) {
 TEST(WorkspaceManagerAccounting, TheTerminalSweepMovesEveryChargeExactlyOnce) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kBudget, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kBudget));
     void *kept = m.acquire(WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmHeap), 1, 4096);
     void *freed = m.acquire(WorkspaceManager::staging_region(1), 2, 2048);
     void *unconfirmed = m.acquire(WorkspaceManager::staging_region(0), 3, 1024);
@@ -537,7 +581,8 @@ TEST(WorkspaceManagerAccounting, TheTerminalSweepMovesEveryChargeExactlyOnce) {
 TEST(WorkspaceManagerAccounting, AnOrdinaryReleaseIsNotCountedTwiceByTheSweep) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kBudget, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kBudget));
     void *block = m.acquire(WorkspaceManager::staging_region(0), 1, 4096);
     ASSERT_NE(block, nullptr);
     report_launched_and_drained(m, 0, 1);
@@ -558,7 +603,8 @@ TEST(WorkspaceManagerAccounting, AnOrdinaryReleaseIsNotCountedTwiceByTheSweep) {
 TEST(WorkspaceManagerOwnership, ARunIsLiveFromItsFirstReferenceUntilItRetires) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kBudget, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kBudget));
     void *block = m.acquire(WorkspaceManager::staging_region(0), 7, 4096);
     ASSERT_NE(block, nullptr);
 
@@ -580,7 +626,8 @@ TEST(WorkspaceManagerOwnership, ARunIsLiveFromItsFirstReferenceUntilItRetires) {
 TEST(WorkspaceManagerOwnership, ALaunchedRunKeepsThatFactAgainstALateNoSubmission) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kBudget, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kBudget));
     void *block = m.acquire(WorkspaceManager::staging_region(0), 5, 4096);
     ASSERT_NE(block, nullptr);
 
@@ -613,7 +660,8 @@ void retire(WorkspaceManager &m, uint32_t slot, uint64_t epoch) {
 TEST(WorkspaceManagerLifecycle, TheContextsOwnBackingIsNoConsumerACloseMustWaitFor) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kBudget, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kBudget));
     const WorkspaceManager::RegionKey region =
         WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::RuntimePool);
 
@@ -640,7 +688,8 @@ TEST(WorkspaceManagerLifecycle, TheContextsOwnBackingIsNoConsumerACloseMustWaitF
 TEST(WorkspaceManagerLifecycle, ARunOnTheContextsBackingLeavesNothingBehindWhenItRetires) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kBudget, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kBudget));
     const WorkspaceManager::RegionKey region = WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmHeap);
 
     void *block = m.acquire(region, WorkspaceManager::kContextEpoch, 4096);
@@ -669,7 +718,8 @@ TEST(WorkspaceManagerLifecycle, ARunOnTheContextsBackingLeavesNothingBehindWhenI
 TEST(WorkspaceManagerBudget, GrowthReclaimsAnObsoleteGenerationRatherThanRefusing) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kSixMiB, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kSixMiB));
     const WorkspaceManager::RegionKey region = WorkspaceManager::staging_region(0);
 
     void *first = m.acquire(region, 1, kOneMiB);
@@ -699,7 +749,8 @@ TEST(WorkspaceManagerBudget, GrowthReclaimsAnObsoleteGenerationRatherThanRefusin
 TEST(WorkspaceManagerBudget, GrowthNeverReclaimsTheAddressAFailedPlanPreserved) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kSixMiB, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kSixMiB));
     const WorkspaceManager::RegionKey region = WorkspaceManager::staging_region(0);
 
     void *published = m.acquire(region, 1, kOneMiB);
@@ -738,7 +789,8 @@ TEST(WorkspaceManagerBudget, GrowthNeverReclaimsTheAddressAFailedPlanPreserved) 
 TEST(WorkspaceManagerBudget, AnIdleCurrentBackingIsNotEvictableForAnotherRegion) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kSixMiB, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kSixMiB));
     const WorkspaceManager::RegionKey heap = WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmHeap);
     const WorkspaceManager::RegionKey sm = WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmSm);
 
@@ -758,7 +810,8 @@ TEST(WorkspaceManagerBudget, AnIdleCurrentBackingIsNotEvictableForAnotherRegion)
 TEST(WorkspaceManagerOwnership, AnUnmappableBlockIsKeptRatherThanFreedUnderItsMapping) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kSixMiB, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kSixMiB));
     const WorkspaceManager::RegionKey region = WorkspaceManager::staging_region(0);
 
     void *mapped = m.acquire(region, 1, kOneMiB);
@@ -779,23 +832,36 @@ TEST(WorkspaceManagerOwnership, AnUnmappableBlockIsKeptRatherThanFreedUnderItsMa
     EXPECT_EQ(report.quarantined_mapped_bytes, kOneMiB);
     EXPECT_EQ(report.proof_unavailable, 1u);
 
-    // Not by an ordinary release, and not by growth's reclamation either — even
-    // once the region has republished elsewhere and left it obsolete.
+    // Not by an ordinary release: a block a host address still covers is
+    // excluded from every release path.
     EXPECT_EQ(m.release_unreferenced(), 0);
     EXPECT_TRUE(backend.released.empty());
-    void *successor = m.acquire(region, 2, kTwoMiB);
-    ASSERT_NE(successor, nullptr);
-    m.note_published(region, successor);
-    retire(m, 0, 2);
-    EXPECT_EQ(m.acquire(region, 3, kFourMiB), nullptr);
+
+    // The region cannot republish past it either, and for a stronger reason
+    // than this case once asserted. It used to publish a successor and check
+    // that growth's reclamation stepped over the mapped block; now ownership
+    // of that block is unprovable, so no new block is published at all and
+    // the mapped one can never even become an obsolete generation.
+    WorkspaceManager::AcquireRefusal why = WorkspaceManager::AcquireRefusal::None;
+    EXPECT_EQ(m.acquire(region, 2, kTwoMiB, &why), nullptr);
+    EXPECT_EQ(why, WorkspaceManager::AcquireRefusal::Degraded);
+
+    // Through all of it the bytes stay owned here and unfreed, which is the
+    // property the mapping made necessary.
     EXPECT_TRUE(backend.released.empty());
     EXPECT_TRUE(m.owns(mapped));
+    EXPECT_TRUE(m.must_keep(mapped));
+    EXPECT_EQ(m.block_state(mapped), WorkspaceManager::BlockState::Quarantined);
+    ASSERT_TRUE(m.report(&report));
+    EXPECT_EQ(report.quarantined_mapped_bytes, kOneMiB);
+    EXPECT_EQ(m.reserved_bytes(), kOneMiB);
 }
 
 TEST(WorkspaceManagerBudget, AGivenUpClaimStillWaitsForItsLastConsumer) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kSixMiB, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kSixMiB));
     const WorkspaceManager::RegionKey region = WorkspaceManager::staging_region(0);
     const WorkspaceManager::RegionKey peer = WorkspaceManager::staging_region(1);
 
@@ -825,7 +891,8 @@ TEST(WorkspaceManagerBudget, AGivenUpClaimStillWaitsForItsLastConsumer) {
 TEST(WorkspaceManagerOwnership, AGivenUpClaimLiftsNoQuarantine) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kSixMiB, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kSixMiB));
     const WorkspaceManager::RegionKey region = WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmSm);
     const WorkspaceManager::RegionKey peer = WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmHeap);
 
@@ -848,6 +915,302 @@ TEST(WorkspaceManagerOwnership, AGivenUpClaimLiftsNoQuarantine) {
 
     // And an address this manager never owned is not a claim it can end.
     EXPECT_FALSE(m.note_unpublished(reinterpret_cast<void *>(0xfeed)));
+}
+
+// Management with no byte limit — the default this contract adds. A separate
+// region per case so nothing here depends on another's leftovers.
+void publish_and_retire(
+    WorkspaceManager &m, const WorkspaceManager::RegionKey &region, uint64_t epoch, size_t bytes, void **out
+) {
+    void *block = m.acquire(region, epoch, bytes);
+    ASSERT_NE(block, nullptr);
+    m.note_published(region, block);
+    report_launched_and_drained(m, 0, epoch);
+    report_host_side_done(m, 0, epoch);
+    if (out != nullptr) *out = block;
+}
+
+TEST(WorkspaceManagerDefault, ManagementIsOnWithoutAnyByteLimit) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    EXPECT_TRUE(m.enabled());
+    EXPECT_FALSE(m.limit_enforced());
+
+    const WorkspaceManager::RegionKey region = WorkspaceManager::staging_region(0);
+    void *block = m.acquire(region, 1, 4096);
+    ASSERT_NE(block, nullptr);
+    EXPECT_EQ(m.reserved_bytes(), 4096u);
+
+    // Nothing caps it, so a request no budget would have allowed still lands.
+    void *huge = m.acquire(WorkspaceManager::staging_region(1), 2, size_t{1} << 40);
+    EXPECT_NE(huge, nullptr);
+
+    SimplerWorkspaceReport report{};
+    ASSERT_TRUE(m.report(&report));
+    // The two questions are answered separately: this record exists because
+    // the context is managed, and this field says no limit is enforced.
+    EXPECT_EQ(report.budget_enforced, 0u);
+    EXPECT_EQ(report.limit_bytes, 0u);
+    EXPECT_EQ(report.coverage_is_partial, 1u);
+    EXPECT_EQ(report.blocks_published, 2u);
+
+    WorkspaceManager::AcquireRefusal why = WorkspaceManager::AcquireRefusal::None;
+    EXPECT_EQ(m.acquire(region, 3, 0, &why), nullptr);
+    EXPECT_EQ(why, WorkspaceManager::AcquireRefusal::NotServing);
+}
+
+TEST(WorkspaceManagerDefault, ObsoleteGenerationsAreReclaimedWithNoBudgetPressure) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    const WorkspaceManager::RegionKey region = WorkspaceManager::staging_region(0);
+
+    void *first = nullptr;
+    ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, region, 1, kOneMiB, &first));
+    void *second = nullptr;
+    ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, region, 2, kTwoMiB, &second));
+    ASSERT_NE(second, first);
+    EXPECT_EQ(m.reserved_bytes(), kOneMiB + kTwoMiB);
+
+    // No limit is set, so nothing is under pressure. The first generation is
+    // reclaimed because its region republished and nothing references it.
+    EXPECT_TRUE(m.has_reclaimable());
+    EXPECT_EQ(m.reclaim_obsolete(), 0);
+    EXPECT_EQ(backend.released, std::vector<void *>{first});
+    EXPECT_EQ(m.reserved_bytes(), kTwoMiB);
+    EXPECT_TRUE(m.owns(second));
+    // Its record went with it, so the ledger tracks live ownership only.
+    EXPECT_EQ(m.block_count(), 1u);
+    EXPECT_FALSE(m.has_reclaimable());
+}
+
+TEST(WorkspaceManagerDefault, ACurrentBackingIsNeverReclaimed) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    const WorkspaceManager::RegionKey region = WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmHeap);
+
+    void *warm = nullptr;
+    ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, region, 1, kOneMiB, &warm));
+    // Idle, not abandoned: the region is still published at it, so the next
+    // same-sized call reuses it rather than paying another allocation.
+    EXPECT_FALSE(m.has_reclaimable());
+    EXPECT_EQ(m.reclaim_obsolete(), 0);
+    EXPECT_TRUE(backend.released.empty());
+    EXPECT_TRUE(m.owns(warm));
+    EXPECT_EQ(m.acquire(region, 2, kOneMiB), warm);
+}
+
+TEST(WorkspaceManagerLedger, CompactionBoundsTheLedgerAndSurvivesAReissuedAddress) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    const WorkspaceManager::RegionKey region = WorkspaceManager::staging_region(0);
+
+    void *freed = nullptr;
+    for (uint64_t gen = 1; gen <= 6; ++gen) {
+        void *block = nullptr;
+        ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, region, gen, kOneMiB * static_cast<size_t>(gen), &block));
+        if (gen == 1) freed = block;
+        EXPECT_EQ(m.reclaim_obsolete(), 0);
+    }
+    // Six generations, one live block: history does not accumulate.
+    EXPECT_EQ(m.block_count(), 1u);
+    EXPECT_EQ(backend.released.size(), 5u);
+    SimplerWorkspaceReport report{};
+    ASSERT_TRUE(m.report(&report));
+    // Compaction removes records, never the cumulative audit.
+    EXPECT_EQ(report.blocks_published, 6u);
+
+    // The platform hands back an address whose record was compacted away. It
+    // must be matched to the new block only, not resurrected as the old one.
+    ASSERT_NE(freed, nullptr);
+    backend.next_forced = freed;
+    void *reissued = m.acquire(WorkspaceManager::staging_region(1), 7, kOneMiB);
+    ASSERT_EQ(reissued, freed);
+    EXPECT_EQ(m.block_state(reissued), WorkspaceManager::BlockState::Referenced);
+    EXPECT_EQ(m.block_count(), 2u);
+}
+
+TEST(WorkspaceManagerDegraded, AFailedFreeStopsNewPublicationButNotReuse) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    const WorkspaceManager::RegionKey region = WorkspaceManager::staging_region(0);
+
+    void *stale = nullptr;
+    ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, region, 1, kOneMiB, &stale));
+    void *current = nullptr;
+    ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, region, 2, kTwoMiB, &current));
+
+    backend.fail_release_of = stale;
+    EXPECT_NE(m.reclaim_obsolete(), 0);
+    EXPECT_EQ(m.block_state(stale), WorkspaceManager::BlockState::ReleaseUnconfirmed);
+    EXPECT_TRUE(m.owns(stale));
+    EXPECT_EQ(m.reserved_bytes(), kOneMiB + kTwoMiB);
+
+    // Ownership of one block is now unprovable, so no new block is published —
+    // which is what keeps the ledger from growing one failed record per round.
+    WorkspaceManager::AcquireRefusal why = WorkspaceManager::AcquireRefusal::None;
+    EXPECT_EQ(m.acquire(WorkspaceManager::staging_region(1), 3, kOneMiB, &why), nullptr);
+    EXPECT_EQ(why, WorkspaceManager::AcquireRefusal::Degraded);
+
+    // Blocks already proven safe stay usable, so accepted work continues.
+    void *reused = m.acquire(region, 4, kOneMiB);
+    EXPECT_EQ(reused, current);
+    EXPECT_TRUE(m.reference(current, 5));
+
+    SimplerWorkspaceReport report{};
+    ASSERT_TRUE(m.report(&report));
+    EXPECT_EQ(report.release_unconfirmed_blocks, 1u);
+    EXPECT_EQ(report.quarantined_blocks, 0u);
+    EXPECT_EQ(report.proof_unavailable, 1u);
+}
+
+TEST(WorkspaceManagerDegraded, AFailedUnmapAndAFailedFreeAreDifferentDispositions) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    const WorkspaceManager::RegionKey mapped_region = WorkspaceManager::staging_region(0);
+    const WorkspaceManager::RegionKey freed_region = WorkspaceManager::staging_region(1);
+
+    void *mapped = nullptr;
+    ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, mapped_region, 1, kOneMiB, &mapped));
+    ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, mapped_region, 2, kTwoMiB, nullptr));
+    void *unfreed = nullptr;
+    ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, freed_region, 3, kOneMiB, &unfreed));
+    ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, freed_region, 4, kTwoMiB, nullptr));
+
+    backend.keep_mapped_of = mapped;
+    backend.fail_release_of = unfreed;
+    EXPECT_NE(m.reclaim_obsolete(), 0);
+
+    // Still mapped: the bytes can never be handed to another allocation, so
+    // the block is quarantined and excluded from the terminal sweep.
+    EXPECT_EQ(m.block_state(mapped), WorkspaceManager::BlockState::Quarantined);
+    EXPECT_TRUE(m.must_keep(mapped));
+    // Unmapped but not freed: the charge stays and the block is never offered
+    // again, but this is a reclamation cost rather than a live mapping.
+    EXPECT_EQ(m.block_state(unfreed), WorkspaceManager::BlockState::ReleaseUnconfirmed);
+    EXPECT_FALSE(m.must_keep(unfreed));
+
+    SimplerWorkspaceReport report{};
+    ASSERT_TRUE(m.report(&report));
+    EXPECT_EQ(report.quarantined_blocks, 1u);
+    EXPECT_EQ(report.quarantined_mapped_bytes, kOneMiB);
+    EXPECT_EQ(report.release_unconfirmed_blocks, 1u);
+}
+
+TEST(WorkspaceManagerDegraded, AnUnprovableRunStopsNewPublication) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    const WorkspaceManager::RegionKey region = WorkspaceManager::staging_region(0);
+
+    void *held = m.acquire(region, 11, kOneMiB);
+    ASSERT_NE(held, nullptr);
+    // Its context went away with facts outstanding, so its last consumer can
+    // never be proved. That record is permanent, and publishing more blocks
+    // would only add more of them.
+    m.note_run_fact(0, 11, WorkspaceManager::RunFact::ContextDestroyed);
+    EXPECT_EQ(m.block_state(held), WorkspaceManager::BlockState::Quarantined);
+
+    WorkspaceManager::AcquireRefusal why = WorkspaceManager::AcquireRefusal::None;
+    EXPECT_EQ(m.acquire(WorkspaceManager::staging_region(1), 12, kOneMiB, &why), nullptr);
+    EXPECT_EQ(why, WorkspaceManager::AcquireRefusal::Degraded);
+    // Nothing was freed to get there.
+    EXPECT_TRUE(backend.released.empty());
+    EXPECT_EQ(m.reserved_bytes(), kOneMiB);
+}
+
+TEST(WorkspaceManagerOwnership, ALateFactFromAReleasedSlotDoesNotReplaceItsSuccessor) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    const WorkspaceManager::RegionKey old_region = WorkspaceManager::staging_region(0);
+    const WorkspaceManager::RegionKey new_region = WorkspaceManager::staging_region(1);
+
+    void *predecessor_block = m.acquire(old_region, 7, kOneMiB);
+    ASSERT_NE(predecessor_block, nullptr);
+    // The slot is handed to a successor, which reports against it.
+    void *successor_block = m.acquire(new_region, 9, kOneMiB);
+    ASSERT_NE(successor_block, nullptr);
+    m.note_run_fact(0, 9, WorkspaceManager::RunFact::Launched);
+
+    // The predecessor's terminal fact arrives late, against a slot that is no
+    // longer its own. Epochs only increase, so this is recognisable.
+    m.note_run_fact(0, 7, WorkspaceManager::RunFact::ContextDestroyed);
+
+    // Its own references are still disposed of — a late destruction must not
+    // leave those blocks looking reclaimable.
+    EXPECT_EQ(m.block_state(predecessor_block), WorkspaceManager::BlockState::Quarantined);
+
+    // And the successor's record survived: a launch it reported cannot be
+    // undone by a stale "never submitted", so it does not retire.
+    m.note_run_fact(0, 9, WorkspaceManager::RunFact::NoDeviceSubmission);
+    report_host_side_done(m, 0, 9);
+    EXPECT_EQ(m.block_state(successor_block), WorkspaceManager::BlockState::Referenced);
+    EXPECT_EQ(m.live_drainable_consumers(), 1u);
+}
+
+TEST(WorkspaceManagerOwnership, AReleaseUnconfirmedBlockIsNotHandedBackByReference) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    const WorkspaceManager::RegionKey region = WorkspaceManager::staging_region(0);
+
+    void *stale = nullptr;
+    ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, region, 1, kOneMiB, &stale));
+    ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, region, 2, kTwoMiB, nullptr));
+    backend.fail_release_of = stale;
+    EXPECT_NE(m.reclaim_obsolete(), 0);
+    ASSERT_EQ(m.block_state(stale), WorkspaceManager::BlockState::ReleaseUnconfirmed);
+
+    // A caller arriving from a capacity hit has not re-derived the block's
+    // disposition. Handing back storage whose free was attempted and failed
+    // would let a run write where the platform may already have reclaimed.
+    EXPECT_FALSE(m.reference(stale, 8));
+}
+
+TEST(WorkspaceManagerDegraded, ASweepThatProvesTheFreeClearsTheEarlierDoubt) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    const WorkspaceManager::RegionKey region = WorkspaceManager::staging_region(0);
+
+    void *stale = nullptr;
+    ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, region, 1, kOneMiB, &stale));
+    ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, region, 2, kTwoMiB, nullptr));
+    backend.fail_release_of = stale;
+    EXPECT_NE(m.reclaim_obsolete(), 0);
+    ASSERT_EQ(m.block_state(stale), WorkspaceManager::BlockState::ReleaseUnconfirmed);
+
+    // The ordinary close path does not try this block again — that failure is
+    // the run boundary's and is already recorded. It still releases the other,
+    // unreferenced block, so what must not grow is this block's own attempt
+    // count rather than the total.
+    const auto attempts_on = [&backend](void *base) {
+        return std::count(backend.released.begin(), backend.released.end(), base);
+    };
+    ASSERT_EQ(attempts_on(stale), 1);
+    EXPECT_EQ(m.release_unreferenced(), 0);
+    EXPECT_EQ(attempts_on(stale), 1);
+
+    // The terminal sweep gets the one further attempt that can settle it, and
+    // when it succeeds the doubt is over: a freed block reported as
+    // unconfirmed would stay that way for the rest of the context's life and
+    // never leave the ledger.
+    {
+        WorkspaceManager::TerminalSweep sweep = m.begin_terminal_sweep();
+        EXPECT_FALSE(sweep.must_keep(stale));
+        sweep.note_result(stale, 0, /*kept=*/false);
+    }
+    EXPECT_FALSE(m.owns(stale));
+    SimplerWorkspaceReport report{};
+    ASSERT_TRUE(m.report(&report));
+    EXPECT_EQ(report.release_unconfirmed_blocks, 0u);
+    EXPECT_EQ(report.proof_unavailable, 0u);
 }
 
 }  // namespace

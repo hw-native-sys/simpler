@@ -351,6 +351,23 @@ int DeviceRunnerBase::drop_child_memory_host_view(void *alloc_base) {
 }
 
 namespace {
+const char *workspace_refusal_text(WorkspaceManager::AcquireRefusal why) {
+    switch (why) {
+    case WorkspaceManager::AcquireRefusal::OverQuota:
+        return "the configured workspace budget has no room for it";
+    case WorkspaceManager::AcquireRefusal::Degraded:
+        return "a workspace block's ownership is unprovable, so no new block is published";
+    case WorkspaceManager::AcquireRefusal::BackendFailed:
+        return "the device allocation failed";
+    case WorkspaceManager::AcquireRefusal::Overflow:
+        return "the request cannot be accounted without wrapping";
+    case WorkspaceManager::AcquireRefusal::NotServing:
+    case WorkspaceManager::AcquireRefusal::None:
+        break;
+    }
+    return "this context is not serving workspace requests";
+}
+
 // The run identity this thread's workspace requests belong to. Thread-scoped so
 // a prepared successor built on another thread cannot be charged to this one.
 struct WorkspacePlanIdentity {
@@ -412,7 +429,16 @@ void *DeviceRunnerBase::acquire_arena_backing(std::size_t size) {
     // that drives the arenas names it around each commit. Without that every
     // region of every bank would share one pool, and a growing GM heap could be
     // handed the block a still-attached shared-memory region is published at.
-    return workspace_.acquire(g_workspace_plan.region, g_workspace_plan.epoch, size);
+    WorkspaceManager::AcquireRefusal why = WorkspaceManager::AcquireRefusal::None;
+    void *base = workspace_.acquire(g_workspace_plan.region, g_workspace_plan.epoch, size, &why);
+    if (base == nullptr) {
+        LOG_ERROR(
+            "setup_static_arena: workspace refused %zu bytes for region %u/%u: %s", size,
+            static_cast<unsigned>(g_workspace_plan.region.domain), g_workspace_plan.region.index,
+            workspace_refusal_text(why)
+        );
+    }
+    return base;
 }
 
 void DeviceRunnerBase::note_arena_region_disposition(uint32_t arena_bank, ArenaRegionDisposition what, void *base) {
@@ -436,7 +462,19 @@ void DeviceRunnerBase::release_arena_backing(void *p) {
     mem_alloc_.free(p);
 }
 
-int DeviceRunnerBase::set_workspace_budget(std::uint64_t limit_bytes) {
+int DeviceRunnerBase::stage_workspace_management(std::uint64_t limit_bytes) {
+    // Staging only: nothing is installed and nothing is allocated here, so a
+    // context that never reaches `install_staged_workspace` is exactly the
+    // context it was before. The mode this entry belongs to is not latched
+    // yet, which is why the install is deferred rather than done here.
+    return workspace_staging_.record(limit_bytes, workspace_.enabled());
+}
+
+void DeviceRunnerBase::clear_staged_workspace() noexcept { workspace_staging_.clear(); }
+
+int DeviceRunnerBase::install_staged_workspace() {
+    const WorkspaceStagingRequest::Install plan = workspace_staging_.plan();
+    if (plan == WorkspaceStagingRequest::Install::Nothing) return 0;
     WorkspaceManager::Backend backend{};
     backend.ctx = this;
     backend.acquire = [](void *ctx, std::size_t bytes) -> void * {
@@ -447,20 +485,43 @@ int DeviceRunnerBase::set_workspace_budget(std::uint64_t limit_bytes) {
         MemoryAllocator::Reservation res = self->mem_alloc_.begin_reservation();
         return res.commit_alloc(bytes);
     };
-    backend.release = [](void *ctx, void *base) -> int {
+    backend.release = [](void *ctx, void *base, int *platform_rc) -> WorkspaceManager::ReleaseOutcome {
         auto *self = static_cast<DeviceRunnerBase *>(ctx);
         // Unmap first, and only free what is proven unmapped. A host mapping
         // covers the whole allocation, so freeing bytes still behind one would
         // give the next allocation a range this process holds a live host
-        // address over. A failed unmap is reported as a failed release, which
-        // keeps the block owned and charged here instead of leaving a mapping
-        // with nothing naming it.
+        // address over.
+        //
+        // The two failures are reported apart rather than collapsed into one
+        // code, because their owners differ: a range still mapped can never be
+        // freed, while a failed platform free is unmapped storage the platform
+        // kept. Reported by return value and never by calling back into the
+        // ledger, which holds its own lock across this call.
         const int unmap_rc = self->drop_child_memory_host_view(base);
-        if (unmap_rc != 0) return unmap_rc;
-        return self->mem_alloc_.free(base);
+        if (unmap_rc != 0) {
+            if (platform_rc != nullptr) *platform_rc = unmap_rc;
+            return WorkspaceManager::ReleaseOutcome::StillMapped;
+        }
+        const int free_rc = self->mem_alloc_.free(base);
+        if (free_rc != 0) {
+            if (platform_rc != nullptr) *platform_rc = free_rc;
+            return WorkspaceManager::ReleaseOutcome::FreeFailed;
+        }
+        return WorkspaceManager::ReleaseOutcome::Freed;
     };
-    if (!workspace_.configure(limit_bytes, backend)) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    if (!workspace_.configure(backend)) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (plan == WorkspaceStagingRequest::Install::ManageWithLimit &&
+        !workspace_.set_limit(workspace_staging_.limit_bytes())) {
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    }
     return 0;
+}
+
+int DeviceRunnerBase::reclaim_workspace_obsolete() {
+    // The caller owns proving this thread is attached; this only performs the
+    // device releases the ledger has already decided are safe.
+    if (!workspace_.enabled() || !workspace_.has_reclaimable()) return 0;
+    return workspace_.reclaim_obsolete();
 }
 
 bool DeviceRunnerBase::workspace_report(SimplerWorkspaceReport *out) const { return workspace_.report(out); }
@@ -506,8 +567,15 @@ int DeviceRunnerBase::acquire_retained_temp(
     // its last consumer retires, so this request takes a block of its own
     // inside the budget. A refusal leaves the slot naming the old block.
     const WorkspaceManager::RegionKey region = WorkspaceManager::staging_region(pipeline_slot);
-    void *grown = workspace_.acquire(region, g_workspace_plan.epoch, bytes);
-    if (grown == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    WorkspaceManager::AcquireRefusal why = WorkspaceManager::AcquireRefusal::None;
+    void *grown = workspace_.acquire(region, g_workspace_plan.epoch, bytes, &why);
+    if (grown == nullptr) {
+        LOG_ERROR(
+            "acquire_retained_temp: workspace refused %zu bytes for slot %u: %s; the slot keeps its previous block",
+            bytes, pipeline_slot, workspace_refusal_text(why)
+        );
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
     // The previous block keeps its address and its contents: the slot stops
     // naming it, and its earlier consumers release it when they retire.
     set_retained_temp_buffer(pipeline_slot, grown, bytes);
@@ -2473,6 +2541,12 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
             release_child_memory_host_views();
             capture(mem_alloc_.finalize());
         } else {
+            // The last drain point, for a context that submitted no further
+            // run after its obsolete generations became reclaimable. Close
+            // runs on the owner thread with the device still up, so the
+            // releases are legal here; anything this cannot prove safe falls
+            // through to the two steps below.
+            capture(reclaim_workspace_obsolete());
             // Mappings first, exactly as the unmanaged path does: the releases
             // below hand allocations back to the platform, and a host mapping
             // over one of them would outlive its pages. The ledger keeps the

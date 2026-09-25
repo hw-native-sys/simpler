@@ -532,7 +532,8 @@ simpler_ut_cases(platform_single_case
     test_run_stream_pair.cpp
     test_teardown_recorder.cpp
     test_worker_chip_orch_comm.cpp
-    test_workspace_manager.cpp)
+    test_workspace_manager.cpp
+    test_workspace_staging.cpp)
 
 # ---------------------------------------------------------------------------
 # Both axes are open in this directory and nothing about a file says which of

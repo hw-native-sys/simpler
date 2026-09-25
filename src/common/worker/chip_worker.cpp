@@ -196,7 +196,7 @@ void ChipWorker::init(
     const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
     const std::string &dispatcher_path, int device_id, const CallConfig *prewarm_config, bool enable_sdma,
     const std::string &sim_context_path, const std::string &sdma_warmup_path, bool collect_across_runs,
-    uint64_t workspace_budget_bytes
+    uint64_t workspace_budget_bytes, bool manage_workspace
 ) {
     if (finalized_) {
         throw std::runtime_error("ChipWorker already finalized; cannot reinitialize");
@@ -279,6 +279,9 @@ void ChipWorker::init(
         }
         set_workspace_budget_fn_ =
             reinterpret_cast<SimplerSetWorkspaceBudgetFn>(dlsym(handle, "simpler_set_workspace_budget_ctx"));
+        enable_workspace_management_fn_ = reinterpret_cast<SimplerEnableWorkspaceManagementFn>(
+            dlsym(handle, "simpler_enable_workspace_management_ctx")
+        );
         get_workspace_report_fn_ =
             reinterpret_cast<SimplerGetWorkspaceReportFn>(dlsym(handle, "simpler_get_workspace_report_ctx"));
         flush_diagnostics_fn_ =
@@ -423,18 +426,47 @@ void ChipWorker::init(
                 throw std::runtime_error("ChipWorker::init: retaining runs across boundaries could not be enabled");
             }
         }
-        // Both halves of the capability, resolved together: a caller that asked
-        // for a budget must fail visibly rather than run unmanaged, and the
+        // Three routes, resolved from arguments this call already has rather
+        // than from a probe:
+        //
+        //   sim         a simulated backend manages no device workspace, so
+        //               neither management nor a limit is requested and the
+        //               absence of the symbols is never examined;
+        //   unrequested a caller that asked for neither — the forked chip
+        //               child today — keeps exactly the path it had;
+        //   supported   an in-process level-2 context on a real device.
+        //
+        // On the supported route the capability is required, because a
         // teardown protection that reads the report must never be left unable
-        // to tell "no budget" from "budget whose accounting cannot be read".
-        if (workspace_budget_bytes != 0) {
-            if (set_workspace_budget_fn_ == nullptr || get_workspace_report_fn_ == nullptr) {
-                throw std::runtime_error("ChipWorker::init: this runtime module has no workspace budget support");
+        // to tell "not managed" from "managed but unreadable". Staged here and
+        // installed by simpler_init once the program-mode latch is taken.
+        const bool simulated = !sim_context_path.empty();
+        const bool wants_workspace = !simulated && (manage_workspace || workspace_budget_bytes != 0);
+        if (wants_workspace) {
+            if (get_workspace_report_fn_ == nullptr) {
+                throw std::runtime_error("ChipWorker::init: this runtime module has no workspace management support");
             }
-            if (set_workspace_budget_fn_(device_ctx_, workspace_budget_bytes) != 0) {
-                throw std::runtime_error("ChipWorker::init: workspace budget could not be enabled");
+            if (workspace_budget_bytes != 0) {
+                if (set_workspace_budget_fn_ == nullptr) {
+                    throw std::runtime_error("ChipWorker::init: this runtime module has no workspace budget support");
+                }
+                if (set_workspace_budget_fn_(device_ctx_, workspace_budget_bytes) != 0) {
+                    throw std::runtime_error("ChipWorker::init: workspace budget could not be enabled");
+                }
+                workspace_limit_latched_ = true;
+            } else {
+                if (enable_workspace_management_fn_ == nullptr) {
+                    throw std::runtime_error(
+                        "ChipWorker::init: this runtime module has no workspace management support"
+                    );
+                }
+                if (enable_workspace_management_fn_(device_ctx_) != 0) {
+                    throw std::runtime_error("ChipWorker::init: workspace management could not be enabled");
+                }
             }
-            workspace_budget_latched_ = true;
+            workspace_managed_ = true;
+        } else if (workspace_budget_bytes != 0) {
+            throw std::runtime_error("ChipWorker::init: a workspace budget is not supported on a simulated backend");
         }
         init_rc = simpler_init_fn_(
             device_ctx_, device_id, aicpu_bytes.data(), aicpu_bytes.size(), aicore_bytes.data(), aicore_bytes.size(),
@@ -449,7 +481,8 @@ void ChipWorker::init(
         // resolved and the latch must not outlive it: a later unmanaged init
         // would otherwise be unable to tell "no budget" from "a budget whose
         // accounting cannot be read" and refuse every close.
-        workspace_budget_latched_ = false;
+        workspace_managed_ = false;
+        workspace_limit_latched_ = false;
         create_device_context_fn_ = nullptr;
         destroy_device_context_fn_ = nullptr;
         device_malloc_ctx_fn_ = nullptr;
@@ -472,6 +505,7 @@ void ChipWorker::init(
         probe_run_retention_fn_ = nullptr;
         get_teardown_report_fn_ = nullptr;
         set_workspace_budget_fn_ = nullptr;
+        enable_workspace_management_fn_ = nullptr;
         get_workspace_report_fn_ = nullptr;
         supports_concurrent_native_prepare_fn_ = nullptr;
         supports_joined_native_launch_fn_ = nullptr;
@@ -519,7 +553,8 @@ void ChipWorker::init(
         destroy_device_context_fn_(device_ctx_);
         device_ctx_ = nullptr;
         // Resolved with the context, as in the catch above.
-        workspace_budget_latched_ = false;
+        workspace_managed_ = false;
+        workspace_limit_latched_ = false;
         create_device_context_fn_ = nullptr;
         destroy_device_context_fn_ = nullptr;
         device_malloc_ctx_fn_ = nullptr;
@@ -542,6 +577,7 @@ void ChipWorker::init(
         probe_run_retention_fn_ = nullptr;
         get_teardown_report_fn_ = nullptr;
         set_workspace_budget_fn_ = nullptr;
+        enable_workspace_management_fn_ = nullptr;
         get_workspace_report_fn_ = nullptr;
         supports_concurrent_native_prepare_fn_ = nullptr;
         supports_joined_native_launch_fn_ = nullptr;
@@ -608,7 +644,7 @@ void ChipWorker::capture_teardown_report_noexcept() noexcept {
 }
 
 ChipWorker::WorkspaceReportStatus ChipWorker::workspace_report(SimplerWorkspaceReport *out) const noexcept {
-    if (!workspace_budget_latched_) return WorkspaceReportStatus::Disabled;
+    if (!workspace_managed_) return WorkspaceReportStatus::Disabled;
     if (out == nullptr || device_ctx_ == nullptr || get_workspace_report_fn_ == nullptr) {
         return WorkspaceReportStatus::Unavailable;
     }
@@ -707,8 +743,10 @@ void ChipWorker::finalize() {
     // latch — and with it a readable report — for the retry. Past it, every
     // block this generation owned has been released or quarantined, so the
     // latch is resolved and must not outlive the generation that set it.
-    workspace_budget_latched_ = false;
+    workspace_managed_ = false;
+    workspace_limit_latched_ = false;
     set_workspace_budget_fn_ = nullptr;
+    enable_workspace_management_fn_ = nullptr;
     get_workspace_report_fn_ = nullptr;
     supports_concurrent_native_prepare_fn_ = nullptr;
     supports_joined_native_launch_fn_ = nullptr;

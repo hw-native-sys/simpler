@@ -8370,6 +8370,12 @@ class Worker:
             enable_sdma=bool(self._config.get("enable_sdma", False)),
             collect_across_runs=bool(self._config.get("collect_across_runs", False)),
             workspace_budget_bytes=workspace_budget,
+            # The one route whose teardown can be fenced before the public
+            # Buffer release, so the one route whose workspace lifetimes are
+            # managed by default. Not a public option: a forked chip child
+            # reaches ChipWorker.init without it and keeps its existing path
+            # until L3 has a cross-process close proof of its own.
+            manage_workspace=True,
         )
 
         # Pre-warm any registered ChipCallable so the first run(handle, …)

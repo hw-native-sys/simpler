@@ -3478,17 +3478,18 @@ NB_MODULE(_task_interface, m) {
             [](ChipWorker &self, const std::string &host_lib_path, const std::string &aicpu_path,
                const std::string &aicore_path, const std::string &dispatcher_path, int device_id,
                std::optional<CallConfig> prewarm_config, bool enable_sdma, const std::string &sim_context_path,
-               const std::string &sdma_warmup_path, bool collect_across_runs, uint64_t workspace_budget_bytes) {
+               const std::string &sdma_warmup_path, bool collect_across_runs, uint64_t workspace_budget_bytes,
+               bool manage_workspace) {
                 self.init(
                     host_lib_path, aicpu_path, aicore_path, dispatcher_path, device_id,
                     prewarm_config.has_value() ? &(*prewarm_config) : nullptr, enable_sdma, sim_context_path,
-                    sdma_warmup_path, collect_across_runs, workspace_budget_bytes
+                    sdma_warmup_path, collect_across_runs, workspace_budget_bytes, manage_workspace
                 );
             },
             nb::arg("host_lib_path"), nb::arg("aicpu_path"), nb::arg("aicore_path"), nb::arg("dispatcher_path"),
             nb::arg("device_id"), nb::arg("prewarm_config") = nb::none(), nb::arg("enable_sdma") = false,
             nb::arg("sim_context_path") = "", nb::arg("sdma_warmup_path") = "", nb::arg("collect_across_runs") = false,
-            nb::arg("workspace_budget_bytes") = 0,
+            nb::arg("workspace_budget_bytes") = 0, nb::arg("manage_workspace") = false,
             // Release the GIL for the (potentially long) native device attach so
             // another Python thread can run during it — e.g. a concurrent close()
             // observing INITIALIZING and failing fast (a GIL held for the whole
