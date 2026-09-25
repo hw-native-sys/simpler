@@ -1754,7 +1754,7 @@ ChipTensor materialize_one(const Tensor &r, nb::dict resolved) {
     // non-row-major layout (transpose / permute / step-slice), which ChipTensor expresses natively.
     return make_tensor_strided(
         reinterpret_cast<void *>(static_cast<uintptr_t>(base + r.byte_offset)), r.shapes, r.strides, r.ndims, r.dtype,
-        static_cast<AddressSpace>(addr_space)
+        static_cast<AddressSpace>(addr_space), r.transfer
     );
 }
 
@@ -2201,6 +2201,10 @@ NB_MODULE(_task_interface, m) {
     nb::enum_<AddressSpace>(m, "AddressSpace", nb::is_arithmetic())
         .value("HOST", AddressSpace::HOST)
         .value("DEVICE", AddressSpace::DEVICE);
+    nb::enum_<TensorTransfer>(m, "TensorTransfer", nb::is_arithmetic())
+        .value("NONE", TensorTransfer::NONE)
+        .value("H2D", TensorTransfer::H2D)
+        .value("D2H", TensorTransfer::D2H);
 
     nb::enum_<AccessMode>(m, "AccessMode", nb::is_arithmetic())
         .value("READ", AccessMode::READ)
@@ -2351,9 +2355,12 @@ NB_MODULE(_task_interface, m) {
         .def(
             "tensor",
             [](const BufferDescriptor &self, nb::object shapes, nb::object dtype, nb::object strides,
-               uint64_t byte_offset) -> Tensor {
+               uint64_t byte_offset, nb::object transfer) -> Tensor {
                 Tensor t{};
                 t.buffer = self;
+                t.transfer = transfer.is_none() ?
+                                 legacy_tensor_transfer(static_cast<AddressSpace>(self.address_space)) :
+                                 nb::cast<TensorTransfer>(transfer);
                 t.byte_offset = byte_offset;
                 t.dtype = static_cast<DataType>(datatype_wire_value(dtype));
                 fill_view(&t, shapes, strides);
@@ -2361,6 +2368,7 @@ NB_MODULE(_task_interface, m) {
                 return t;
             },
             nb::arg("shapes"), nb::arg("dtype"), nb::arg("strides") = nb::none(), nb::arg("byte_offset") = 0,
+            nb::kw_only(), nb::arg("transfer") = nb::none(),
             "A Tensor viewing this backing. `strides` default to contiguous (row-major) element strides."
         )
 
@@ -2402,18 +2410,23 @@ NB_MODULE(_task_interface, m) {
         .def(
             "__init__",
             [](Tensor *self, const BufferDescriptor &buffer, uint64_t byte_offset, nb::sequence shapes,
-               nb::sequence strides, nb::object dtype) {
+               nb::sequence strides, nb::object dtype, nb::object transfer) {
                 new (self) Tensor{};
                 self->buffer = buffer;
+                self->transfer = transfer.is_none() ?
+                                     legacy_tensor_transfer(static_cast<AddressSpace>(buffer.address_space)) :
+                                     nb::cast<TensorTransfer>(transfer);
                 self->byte_offset = byte_offset;
                 self->dtype = static_cast<DataType>(datatype_wire_value(dtype));
                 fill_view(self, shapes, strides);
                 validate_tensor(*self);
             },
-            nb::arg("buffer"), nb::arg("byte_offset"), nb::arg("shapes"), nb::arg("strides"), nb::arg("dtype")
+            nb::arg("buffer"), nb::arg("byte_offset"), nb::arg("shapes"), nb::arg("strides"), nb::arg("dtype"),
+            nb::kw_only(), nb::arg("transfer") = nb::none()
         )
 
         .def_ro("buffer", &Tensor::buffer)
+        .def_ro("transfer", &Tensor::transfer)
         .def_ro("byte_offset", &Tensor::byte_offset)
         .def_ro("ndims", &Tensor::ndims)
         .def_prop_ro(
@@ -2474,7 +2487,24 @@ NB_MODULE(_task_interface, m) {
 
         .def_static(
             "make",
-            [](uint64_t data, nb::tuple shapes, DataType dtype, bool child_memory) -> ChipTensor {
+            [](uint64_t data, nb::tuple shapes, DataType dtype, nb::object child_memory, nb::object address_space,
+               nb::object transfer) -> ChipTensor {
+                if (!child_memory.is_none() && (!address_space.is_none() || !transfer.is_none())) {
+                    throw std::invalid_argument(
+                        "ChipTensor.make: child_memory cannot be combined with address_space/transfer"
+                    );
+                }
+                const auto space =
+                    address_space.is_none() ?
+                        ((!child_memory.is_none() && nb::cast<bool>(child_memory)) ? AddressSpace::DEVICE :
+                                                                                     AddressSpace::HOST) :
+                        nb::cast<AddressSpace>(address_space);
+                const auto request = transfer.is_none() ? (address_space.is_none() ? legacy_tensor_transfer(space) :
+                                                                                     TensorTransfer::NONE) :
+                                                          nb::cast<TensorTransfer>(transfer);
+                if (const char *error = tensor_transfer_error(space, request)) {
+                    throw std::invalid_argument(std::string("ChipTensor.make: ") + error);
+                }
                 size_t n = nb::len(shapes);
                 if (n == 0 || n > MAX_TENSOR_DIMS)
                     throw std::invalid_argument("ChipTensor.make: shapes length must be in [1, MAX_TENSOR_DIMS]");
@@ -2484,17 +2514,14 @@ NB_MODULE(_task_interface, m) {
                 // make_tensor_external yields a contiguous ChipTensor: row-major strides,
                 // start_offset == 0, buffer.size == numel * element_size.
                 return make_tensor_external(
-                    reinterpret_cast<void *>(static_cast<uintptr_t>(data)), shp, static_cast<uint32_t>(n), dtype,
-                    child_memory ? AddressSpace::DEVICE : AddressSpace::HOST
+                    reinterpret_cast<void *>(static_cast<uintptr_t>(data)), shp, static_cast<uint32_t>(n), dtype, space,
+                    request
                 );
             },
-            // The keyword stays `child_memory` while the C++ field is `address_space`: it is the
-            // name of a u8 on the remote-L3 tensor wire (see remote_wire.cpp encode_tensor), which
-            // renaming here would not change and which this constructor decodes into.
-            nb::arg("data"), nb::arg("shapes"), nb::arg("dtype"), nb::arg("child_memory") = false,
-            "Create a contiguous ChipTensor over pre-allocated memory. Set child_memory=True when "
-            "data is a device pointer allocated by the child process (skips H2D copy in "
-            "init_runtime_impl)."
+            nb::arg("data"), nb::arg("shapes"), nb::arg("dtype"), nb::arg("child_memory") = nb::none(), nb::kw_only(),
+            nb::arg("address_space") = nb::none(), nb::arg("transfer") = nb::none(),
+            "Create a contiguous ChipTensor. Explicit address_space defaults to transfer=NONE; "
+            "legacy child_memory=False/omitted means HOST/H2D and True means DEVICE/NONE."
         )
 
         // `data` is the tensor's memory address — i.e. ChipTensor::buffer.addr.
@@ -2533,7 +2560,7 @@ NB_MODULE(_task_interface, m) {
                 // Re-establish a contiguous layout over the same buffer base.
                 self.init_external(
                     reinterpret_cast<void *>(self.buffer.addr), numel * get_element_size(self.dtype), shp,
-                    static_cast<uint32_t>(n), self.dtype, self.address_space
+                    static_cast<uint32_t>(n), self.dtype, self.address_space, self.transfer
                 );
             }
         )
@@ -2566,8 +2593,12 @@ NB_MODULE(_task_interface, m) {
             },
             [](ChipTensor &self, bool v) {
                 self.address_space = v ? AddressSpace::DEVICE : AddressSpace::HOST;
+                self.transfer = legacy_tensor_transfer(self.address_space);
             }
         )
+
+        .def_ro("address_space", &ChipTensor::address_space)
+        .def_ro("transfer", &ChipTensor::transfer)
 
         // Read-only views of the strided metadata (always contiguous for make()).
         .def_prop_ro(

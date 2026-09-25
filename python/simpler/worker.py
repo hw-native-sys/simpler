@@ -2330,7 +2330,13 @@ def _reexport_args_from_mailbox(buf, worker: Worker) -> TaskArgs:
         ref = args.tensor(i)
         h_prime = worker._reexport(ref.buffer)
         out.add_tensor(
-            h_prime.tensor(shapes=ref.shapes, dtype=ref.dtype, strides=ref.strides, byte_offset=ref.byte_offset),
+            h_prime.tensor(
+                shapes=ref.shapes,
+                dtype=ref.dtype,
+                strides=ref.strides,
+                byte_offset=ref.byte_offset,
+                transfer=ref.transfer,
+            ),
             args.tag(i),
         )
     for i in range(args.scalar_count()):

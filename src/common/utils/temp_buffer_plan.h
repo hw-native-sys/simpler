@@ -16,6 +16,19 @@
 #include "task_args.h"
 #include "utils/retained_temp_bump.h"
 
+// Returns the first unsupported argument without reading any tensor contents. HOST/NONE
+// remains representable for host leaves, but the chip binders do not consume it yet.
+inline int unsupported_program_transfer(const ChipStorageTaskArgs &args) {
+    for (int i = 0; i < args.tensor_count(); ++i) {
+        const auto &t = args.tensor(i);
+        if (tensor_transfer_error(t.address_space, t.transfer) != nullptr ||
+            (t.address_space == AddressSpace::HOST && t.transfer == TensorTransfer::NONE)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 /**
  * How many bytes of retained temporary buffer one run's device arguments need.
  *

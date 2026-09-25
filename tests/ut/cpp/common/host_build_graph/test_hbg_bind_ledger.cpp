@@ -1292,6 +1292,7 @@ TEST_F(HbgHostAccessContractTest, ChildMemoryInputUsesItsCurrentDeviceBytesDurin
     std::vector<uint8_t> device_bytes(4, 0x29);
     ChipTensor child = host_tensor(device_bytes);
     child.address_space = AddressSpace::DEVICE;
+    child.transfer = TensorTransfer::NONE;
     ChipStorageTaskArgs args;
     args.add_tensor(child);
     ArgDirection sig[] = {ArgDirection::INOUT};
@@ -1629,4 +1630,24 @@ TEST_F(HbgResidentSchedulerStorageTest, ALegacyRunNamesNoRetainedStorage) {
     EXPECT_EQ(slot(0).grows, 1);
     EXPECT_EQ(fake_.scheduler_acquires, acquires_after_resident);
     EXPECT_EQ(fake_.live.count(retained), 1u);
+}
+
+TEST_F(HbgBindLedgerTest, RejectsUnsupportedTransferBeforeReadingEarlierArguments) {
+    Runtime runtime;
+    init_runtime(runtime);
+    const uint32_t shape[] = {16};
+    // Any copy of the first input is a fault, not a weak copy-count assertion.
+    const ChipTensor first = make_tensor_external(reinterpret_cast<void *>(1), shape, 1, DataType::UINT8);
+    for (auto transfer : {TensorTransfer::NONE, TensorTransfer::D2H, static_cast<TensorTransfer>(255)}) {
+        SCOPED_TRACE(static_cast<int>(transfer));
+        ChipTensor invalid = first;
+        invalid.transfer = transfer;
+        ChipStorageTaskArgs args;
+        args.add_tensor(first);
+        args.add_tensor(invalid);
+        const ArgDirection sig[] = {ArgDirection::IN, ArgDirection::IN};
+        EXPECT_NE(bind(runtime, args, sig, 2), 0);
+        EXPECT_EQ(fake_.copy_count, 0);
+        EXPECT_TRUE(fake_.live.empty());
+    }
 }

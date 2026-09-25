@@ -56,7 +56,7 @@ enum class TensorArgType : uint8_t {
 /**
  * ChipTensor — a task argument as it arrives at the chip runtime (72 B).
  *
- * Names a resolved buffer and a strided view of it, and nothing else. A caller
+ * Names a resolved buffer, a strided view of it, and the requested transfer. A caller
  * knows where the memory is and what shape it is read in; it has no basis for
  * saying which task produced it or how its dependencies should be tracked, so
  * those fields are not here to be filled in. `Runtime::set_orch_args` adopts each
@@ -87,7 +87,8 @@ struct ChipTensor {
     uint32_t strides[MAX_TENSOR_DIMS];  // Element stride per dimension; ALWAYS > 0
     uint32_t ndims;                     // Number of dimensions used
     DataType dtype;                     // Data type of tensor elements
-    AddressSpace address_space;         // HOST (default) or DEVICE (child-managed device memory; skips H2D copy)
+    AddressSpace address_space;         // Physical location of the resolved backing
+    TensorTransfer transfer;            // Per-call request; independent of location and access grants
 
     ChipTensor() = default;
 
@@ -141,13 +142,14 @@ struct ChipTensor {
     /// strides become row-major; start_offset = 0.
     void init_external(
         void *addr, uint64_t buffer_size_bytes, const uint32_t in_shapes[], uint32_t in_ndims, DataType in_dtype,
-        AddressSpace in_address_space = AddressSpace::HOST
+        AddressSpace in_address_space, TensorTransfer in_transfer
     ) {
         always_assert(in_ndims > 0 && in_ndims <= MAX_TENSOR_DIMS);
         buffer = {reinterpret_cast<uint64_t>(addr), buffer_size_bytes};
         ndims = in_ndims;
         dtype = in_dtype;
         address_space = in_address_space;
+        transfer = in_transfer;
         start_offset = 0;
         uint32_t s = 1;
         for (int32_t i = static_cast<int32_t>(in_ndims) - 1; i >= 0; --i) {
@@ -155,6 +157,14 @@ struct ChipTensor {
             strides[i] = s;
             s *= in_shapes[i];
         }
+    }
+
+    // Existing constructors keep Program's HOST staging default at this boundary.
+    void init_external(
+        void *addr, uint64_t bytes, const uint32_t shapes[], uint32_t ndims, DataType dtype,
+        AddressSpace space = AddressSpace::HOST
+    ) {
+        init_external(addr, bytes, shapes, ndims, dtype, space, legacy_tensor_transfer(space));
     }
 
     [[nodiscard]] std::string dump() const {
@@ -188,7 +198,7 @@ static_assert(
     std::is_trivially_copyable_v<ChipTensor> && std::is_standard_layout_v<ChipTensor>,
     "ChipTensor crosses the runtime.so ABI as raw bytes"
 );
-static_assert(sizeof(ChipTensor) == 72, "ChipTensor is geometry plus a resolved address, and nothing else");
+static_assert(sizeof(ChipTensor) == 72, "ChipTensor is the 72-byte L2 argument ABI");
 
 // =============================================================================
 // ChipTensor factories — the controlled construction entries. Host-side consumers
@@ -199,15 +209,15 @@ static_assert(sizeof(ChipTensor) == 72, "ChipTensor is geometry plus a resolved 
 /// Contiguous view over pre-allocated external memory: start_offset == 0 and
 /// strides == row_major(shapes).
 inline ChipTensor make_tensor_external(
-    void *addr, const uint32_t shapes[], uint32_t ndims, DataType dtype = DataType::FLOAT32,
-    AddressSpace address_space = AddressSpace::HOST
+    void *addr, const uint32_t shapes[], uint32_t ndims, DataType dtype, AddressSpace address_space,
+    TensorTransfer transfer
 ) {
     uint64_t total = 1;
     for (uint32_t i = 0; i < ndims; i++) {
         total *= shapes[i];
     }
     ChipTensor t{};
-    t.init_external(addr, total * get_element_size(dtype), shapes, ndims, dtype, address_space);
+    t.init_external(addr, total * get_element_size(dtype), shapes, ndims, dtype, address_space, transfer);
     return t;
 }
 
@@ -215,8 +225,8 @@ inline ChipTensor make_tensor_external(
 /// `strides[]` are element strides and may be non-row-major, as from a transpose /
 /// permute / step-sliced wire Tensor. buffer.size is the element extent in bytes.
 inline ChipTensor make_tensor_strided(
-    void *addr, const uint32_t shapes[], const uint32_t strides[], uint32_t ndims, DataType dtype = DataType::FLOAT32,
-    AddressSpace address_space = AddressSpace::HOST
+    void *addr, const uint32_t shapes[], const uint32_t strides[], uint32_t ndims, DataType dtype,
+    AddressSpace address_space, TensorTransfer transfer
 ) {
     always_assert(ndims > 0 && ndims <= MAX_TENSOR_DIMS);
     ChipTensor t{};
@@ -224,6 +234,7 @@ inline ChipTensor make_tensor_strided(
     t.ndims = ndims;
     t.dtype = dtype;
     t.address_space = address_space;
+    t.transfer = transfer;
     t.start_offset = 0;
     for (uint32_t i = 0; i < ndims; i++) {
         t.shapes[i] = shapes[i];
@@ -231,4 +242,19 @@ inline ChipTensor make_tensor_strided(
     }
     t.buffer.size = t.extent_elem() * get_element_size(dtype);
     return t;
+}
+
+// Omitted transfer keeps the legacy Program default: HOST/H2D or DEVICE/NONE.
+inline ChipTensor make_tensor_external(
+    void *addr, const uint32_t shapes[], uint32_t ndims, DataType dtype = DataType::FLOAT32,
+    AddressSpace space = AddressSpace::HOST
+) {
+    return make_tensor_external(addr, shapes, ndims, dtype, space, legacy_tensor_transfer(space));
+}
+
+inline ChipTensor make_tensor_strided(
+    void *addr, const uint32_t shapes[], const uint32_t strides[], uint32_t ndims, DataType dtype = DataType::FLOAT32,
+    AddressSpace space = AddressSpace::HOST
+) {
+    return make_tensor_strided(addr, shapes, strides, ndims, dtype, space, legacy_tensor_transfer(space));
 }

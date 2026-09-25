@@ -103,7 +103,30 @@ it is the resolved `addr` + `size`. That is the whole of what materialization do
 | — | ⟂ | `buffer.addr` |
 | `byte_offset` (bytes) | ≈ | `start_offset` (elements) |
 | `shapes[5]` / `strides[5]` / `ndims` / `dtype` | = | `shapes[5]` / `strides[5]` / `ndims` / `dtype` |
-| `buffer.address_space` | = | `address_space` (still spelled `child_memory` until the wire flip) |
+| `buffer.address_space` | = | `address_space` |
+| `transfer` | = | `transfer` |
+
+`AddressSpace` describes the backing's physical HOST/DEVICE location. `TensorTransfer`
+is a separate per-argument request: `NONE` borrows storage, `H2D` requests Program-managed
+device storage, and `D2H` is reserved and rejected. Callable direction still controls
+input copies and output copy-back; H2D does not mean every argument is copied in.
+Buffer identity, import grants and `TensorArgType` access checks are unchanged.
+Two views of one backing may carry different transfer requests.
+
+Existing `buffer.tensor(...)`, `Tensor(...)` and C++ constructors that omit transfer
+keep HOST/H2D and DEVICE/NONE. Python `ChipTensor.make(..., child_memory=True)` selects
+DEVICE/NONE; false or omission keeps HOST/H2D. The explicit L2 form is
+`ChipTensor.make(..., address_space=AddressSpace.HOST, transfer=TensorTransfer.H2D)`;
+omitting transfer with explicit address_space selects NONE. `child_memory` cannot be
+combined with either explicit keyword. No compatibility flag is stored in the descriptor.
+
+Local mailbox materialization preserves transfer. Chip binders accept HOST/H2D and
+DEVICE/NONE; they reject HOST/NONE and invalid combinations before any tensor content
+copy or device allocation. Host-only leaves can use HOST/NONE. This does not change
+HBG's existing host-access implementation. Remote protocol v4 only represents the legacy
+transfer defaults: its encoder rejects other requests instead of dropping the field.
+The Tensor/ChipTensor sizes remain 144/72 bytes; the new fields consume alignment slack.
+Local endpoints must use the same build, as for every existing layout change.
 
 **Dead on the device** (`Tensor`-only): `magic` discriminates untrusted bytes at
 a decode boundary the device does not have. `identity` / `backend_kind` / `body`

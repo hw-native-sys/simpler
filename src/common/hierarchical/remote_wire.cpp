@@ -348,6 +348,10 @@ CallConfig decode_call_config(const uint8_t *data, size_t size, size_t &offset) 
 std::vector<uint8_t> encode_tensor(const Tensor &tensor) {
     const BufferDescriptor &desc = tensor.buffer;
     ensure(
+        tensor.transfer == legacy_tensor_transfer(static_cast<AddressSpace>(desc.address_space)),
+        "remote_wire: tensor transfer cannot be represented by protocol version 4"
+    );
+    ensure(
         desc.backend_kind == static_cast<uint8_t>(BackendKind::REMOTE_SIDECAR),
         "remote_wire: a remote TASK tensor must carry no local backing"
     );
@@ -413,6 +417,7 @@ Tensor decode_tensor(const uint8_t *data, size_t size, size_t &offset) {
     uint32_t dtype = get_u32(data, size, offset);
     ensure(valid_dtype(dtype), "remote_wire: unknown tensor dtype");
     tensor.dtype = static_cast<DataType>(dtype);
+    tensor.transfer = legacy_tensor_transfer(static_cast<AddressSpace>(desc.address_space));
 
     // validate_tensor is the single gate every Tensor trust boundary runs; it throws
     // std::invalid_argument, which this codec re-raises as its own std::runtime_error.

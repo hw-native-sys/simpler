@@ -115,7 +115,7 @@ from _task_interface import (
     scalar_to_uint64 as _native_scalar_to_uint64,
 )
 
-from .buffer import Buffer, Tensor
+from .buffer import Buffer, Tensor, TensorTransfer
 
 
 def _assert_bindings_match_source_tree() -> None:
@@ -194,6 +194,7 @@ __all__ = [
     "ChipTensor",
     "ChipStorageTaskArgs",
     "TensorArgType",
+    "TensorTransfer",
     "TaskArgs",
     "TaskHandle",
     "RemoteAddressSpace",

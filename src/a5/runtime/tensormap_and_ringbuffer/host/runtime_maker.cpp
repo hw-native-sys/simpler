@@ -816,6 +816,16 @@ extern "C" int bind_callable_to_runtime_impl(
         LOG_ERROR("orch_args pointer is null");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    const int unsupported_arg = unsupported_program_transfer(*orch_args);
+    if (unsupported_arg >= 0) {
+        const auto &t = orch_args->tensor(unsupported_arg);
+        const char *reason = tensor_transfer_error(t.address_space, t.transfer);
+        LOG_ERROR(
+            "bind: tensor %d address_space=%u transfer=%u: %s", unsupported_arg, static_cast<unsigned>(t.address_space),
+            static_cast<unsigned>(t.transfer), reason ? reason : "HOST/NONE is not supported by the chip binder"
+        );
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
     // trb runs orchestration on the device — there is no host-side orch
     // function pointer to invoke. The c_api signature accepts one for
     // symmetry with hbg; assert the trb-side invariant here.

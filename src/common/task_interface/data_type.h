@@ -34,12 +34,38 @@ inline constexpr bool is_supported_scalar_arg_v = std::is_arithmetic_v<std::remo
 constexpr int MAX_TENSOR_DIMS = 5;
 
 // Memory space of a backing. Orthogonal to location (local/remote, derived) and to visibility.
-// Both a `BufferDescriptor` field and byte 43 of `ChipTensor` store it, so it is shared here rather
+// Both BufferDescriptor and ChipTensor store it, so it is shared here rather
 // than owned by either.
 enum class AddressSpace : uint8_t {
     HOST = 0,
     DEVICE = 1,
 };
+
+// Per-argument request, independent of the backing's physical address space. H2D requests
+// Program-managed device storage; the callable direction decides copy-in and copy-back.
+enum class TensorTransfer : uint8_t {
+    NONE = 0,
+    H2D = 1,
+    D2H = 2,  // Reserved request; automatic D2H parameters are not supported.
+};
+
+inline constexpr TensorTransfer legacy_tensor_transfer(AddressSpace space) {
+    return space == AddressSpace::HOST ? TensorTransfer::H2D : TensorTransfer::NONE;
+}
+
+inline const char *tensor_transfer_error(AddressSpace space, TensorTransfer transfer) {
+    if (space != AddressSpace::HOST && space != AddressSpace::DEVICE) return "unknown address space";
+    switch (transfer) {
+    case TensorTransfer::NONE:
+        return nullptr;
+    case TensorTransfer::H2D:
+        return space == AddressSpace::HOST ? nullptr : "H2D requires HOST backing";
+    case TensorTransfer::D2H:
+        return "automatic D2H parameters are unsupported; use explicit copy_from";
+    default:
+        return "unknown tensor transfer";
+    }
+}
 
 /**
  * Supported data types for tensor elements

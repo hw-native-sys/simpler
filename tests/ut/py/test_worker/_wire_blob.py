@@ -32,8 +32,8 @@ _DESC_HEAD = struct.Struct("<HBBB3x")
 _DESC_TAIL = struct.Struct("<QIH2x32s")
 
 # Tensor, 144 B: buffer @0, byte_offset u64 @88, ndims u32 @96, shapes[5] @100, strides[5] @120,
-# dtype u8 @140, _pad[3].
-_TENSOR_TAIL = struct.Struct("<QI5I5IB3x")
+# dtype u8 @140, transfer u8 @141, _pad[2].
+_TENSOR_TAIL = struct.Struct("<QI5I5IBB2x")
 
 # Leading sentinel of a BufferDescriptor, frozen by buffer.h and deliberately not exported to Python
 # (no production caller needs it). Pinned here so a change to it fails a test rather than only a
@@ -54,7 +54,7 @@ def encode_tensor(t) -> bytes:
     ndims = t.ndims
     shapes = list(t.shapes) + [0] * (_MAX_TENSOR_DIMS - ndims)
     strides = list(t.strides) + [0] * (_MAX_TENSOR_DIMS - ndims)
-    view = _TENSOR_TAIL.pack(t.byte_offset, ndims, *shapes, *strides, int(t.dtype))
+    view = _TENSOR_TAIL.pack(t.byte_offset, ndims, *shapes, *strides, int(t.dtype), int(t.transfer))
     return head + identity + tail + view
 
 

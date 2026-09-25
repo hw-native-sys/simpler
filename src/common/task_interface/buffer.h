@@ -231,8 +231,11 @@ struct Tensor {
     uint32_t shapes[MAX_TENSOR_DIMS];
     uint32_t strides[MAX_TENSOR_DIMS];
     DataType dtype;
-    uint8_t _pad[3];
+    TensorTransfer transfer;  // Request belongs to the view, never to BufferDescriptor identity.
+    uint8_t _pad[2];
 };
+
+static_assert(offsetof(Tensor, transfer) == 141, "Tensor transfer is wire ABI");
 
 // Saturating u64 arithmetic. Every input below is wire-supplied, and `shapes[i]` and `strides[i]`
 // are each u32, so one product alone reaches ~2^64: an unsaturated sum would wrap to a SMALL extent
@@ -409,6 +412,9 @@ inline void validate_tensor(const Tensor &r) {
     const BufferDescriptor &h = r.buffer;
 
     validate_buffer_descriptor(h);
+    if (const char *error = tensor_transfer_error(static_cast<AddressSpace>(h.address_space), r.transfer)) {
+        throw std::invalid_argument(std::string("invalid Tensor: ") + error);
+    }
 
     if (r.ndims == 0 || r.ndims > static_cast<uint32_t>(MAX_TENSOR_DIMS)) reject("invalid Tensor: ndims out of range");
     if (r.dtype >= DataType::DATA_TYPE_NUM) reject("invalid Tensor: unknown dtype");

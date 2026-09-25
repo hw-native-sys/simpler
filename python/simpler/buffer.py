@@ -41,6 +41,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     CanonicalIdentity,
     DataType,
     Tensor,
+    TensorTransfer,
     read_args_from_blob,
 )
 
@@ -60,6 +61,7 @@ from .comm_endpoints import (
 __all__ = [
     "AccessMode",
     "AddressSpace",
+    "TensorTransfer",
     "BackendKind",
     "Buffer",
     "BufferCapability",
@@ -238,6 +240,8 @@ class Buffer:
         dtype: int | DataType,
         strides: Iterable[int] | None = None,
         byte_offset: int = 0,
+        *,
+        transfer: TensorTransfer | None = None,
     ) -> Tensor:
         """A self-describing ``Tensor`` viewing this buffer: embeds the full descriptor + the view.
 
@@ -246,8 +250,11 @@ class Buffer:
         whole buffer as a contiguous view; pass explicit element strides for a strided view.
         ``byte_offset`` must be a multiple of the dtype size (checked at materialization).
         ``dtype`` accepts a ``DataType`` enum or its int value.
+        ``transfer`` belongs to this argument, not the backing. Omission preserves the Program
+        default (HOST/H2D or DEVICE/NONE); pass ``TensorTransfer.NONE`` for a host-only argument.
+        Chip binders currently reject HOST/NONE, and remote protocol v4 only carries the defaults.
         """
-        return self.to_descriptor().tensor(shapes, dtype, strides, byte_offset)
+        return self.to_descriptor().tensor(shapes, dtype, strides, byte_offset, transfer=transfer)
 
     def close(self) -> None:
         """Release the backing. The owner unlinks it, so a later consumer map fails rather than

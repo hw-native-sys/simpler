@@ -42,6 +42,7 @@ from simpler.buffer import (
     ImportRegistry,
     MappedArg,
     Tensor,
+    TensorTransfer,
     capabilities_for_adapter,
     create_host_shared_buffer,
     intern_worker_path,
@@ -1145,3 +1146,68 @@ def test_burn_stays_consumed_when_the_caller_fails():
         caller()
     nxt = allocator.burn_identity()
     assert int(nxt.buffer_id) == 2
+
+
+@pytest.mark.parametrize("transfer", [TensorTransfer.NONE, TensorTransfer.H2D])
+def test_transfer_survives_mailbox_and_materialization_without_changing_identity(transfer):
+    from _task_interface import materialize_task_args, read_args_from_blob  # noqa: PLC0415
+
+    from tests.ut.py.test_worker._wire_blob import encode_blob  # noqa: PLC0415
+
+    descriptor = _descriptor_with_path_id(0)
+    tensor = descriptor.tensor((2,), DataType.FLOAT32, transfer=transfer)
+    other = descriptor.tensor((2,), DataType.FLOAT32, transfer=TensorTransfer.H2D)
+    assert tensor.buffer == other.buffer
+    raw = ctypes.create_string_buffer(encode_blob([tensor, other]))
+    args = read_args_from_blob(ctypes.addressof(raw), len(raw))
+    # Materialization resolves addresses; it must not read either tensor's contents.
+    resolved = {descriptor.identity: (1, int(AddressSpace.HOST))}
+    native = materialize_task_args(args, resolved)
+    assert args.tensor(0).transfer == transfer
+    assert native.tensor(0).transfer == transfer
+    assert native.tensor(1).transfer == TensorTransfer.H2D
+    assert native.tensor(0).data == native.tensor(1).data == 1
+    assert native.tensor(0).address_space == AddressSpace.HOST
+
+
+def test_chip_tensor_location_and_transfer_are_independent_of_legacy_flag():
+    legacy = ChipTensor.make(1, (2,), DataType.FLOAT32)
+    borrowed = ChipTensor.make(1, (2,), DataType.FLOAT32, child_memory=True)
+    control = ChipTensor.make(1, (2,), DataType.FLOAT32, address_space=AddressSpace.HOST)
+    assert (legacy.address_space, legacy.transfer) == (AddressSpace.HOST, TensorTransfer.H2D)
+    assert (borrowed.address_space, borrowed.transfer) == (AddressSpace.DEVICE, TensorTransfer.NONE)
+    assert (control.address_space, control.transfer) == (AddressSpace.HOST, TensorTransfer.NONE)
+    control.shapes = (1, 2)
+    assert control.transfer == TensorTransfer.NONE
+    control.child_memory = True
+    assert (control.address_space, control.transfer) == (AddressSpace.DEVICE, TensorTransfer.NONE)
+    control.child_memory = False
+    assert (control.address_space, control.transfer) == (AddressSpace.HOST, TensorTransfer.H2D)
+    with pytest.raises(ValueError, match="cannot be combined"):
+        ChipTensor.make(1, (2,), DataType.FLOAT32, child_memory=False, transfer=TensorTransfer.H2D)
+
+
+@pytest.mark.parametrize(
+    ("space", "transfer", "message"),
+    [
+        (AddressSpace.DEVICE, TensorTransfer.H2D, "H2D requires HOST"),
+        (AddressSpace.DEVICE, TensorTransfer.D2H, "D2H parameters are unsupported"),
+        (AddressSpace.HOST, TensorTransfer.D2H, "D2H parameters are unsupported"),
+    ],
+)
+def test_chip_tensor_rejects_unsupported_transfer(space, transfer, message):
+    with pytest.raises(ValueError, match=message):
+        ChipTensor.make(1, (2,), DataType.FLOAT32, address_space=space, transfer=transfer)
+
+
+def test_mailbox_rejects_unknown_transfer_instead_of_defaulting():
+    from _task_interface import read_args_from_blob  # noqa: PLC0415
+
+    from tests.ut.py.test_worker._wire_blob import encode_blob  # noqa: PLC0415
+
+    descriptor = _descriptor_with_path_id(0)
+    raw = bytearray(encode_blob([descriptor.tensor((2,), DataType.FLOAT32)]))
+    raw[8 + 141] = 255  # Tensor.transfer; ABI offset independent of the decoder.
+    blob = ctypes.create_string_buffer(bytes(raw))
+    with pytest.raises(ValueError, match="unknown tensor transfer"):
+        read_args_from_blob(ctypes.addressof(blob), len(blob))

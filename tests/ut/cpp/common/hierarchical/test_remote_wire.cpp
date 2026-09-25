@@ -37,6 +37,7 @@ Tensor remote_arg_tensor() {
     tensor.shapes[0] = 4;
     tensor.strides[0] = 1;
     tensor.dtype = DataType::UINT8;
+    tensor.transfer = TensorTransfer::H2D;
     validate_tensor(tensor);
     return tensor;
 }
@@ -386,4 +387,14 @@ TEST(RemoteWire, OrderedCommandLaneIsSingleFlight) {
     lane.finish_reply(first);
     EXPECT_FALSE(lane.in_flight());
     EXPECT_EQ(lane.begin_command(), first + 1);
+}
+
+TEST(RemoteWire, RejectsTransferThatTheProtocolWouldLose) {
+    Tensor arg = remote_arg_tensor();
+    arg.transfer = TensorTransfer::NONE;
+    EXPECT_THROW((void)remote_l3::encode_tensor(arg), std::runtime_error);
+    arg.transfer = TensorTransfer::H2D;
+    const auto encoded = remote_l3::encode_tensor(arg);
+    size_t offset = 0;
+    EXPECT_EQ(remote_l3::decode_tensor(encoded.data(), encoded.size(), offset).transfer, TensorTransfer::H2D);
 }
