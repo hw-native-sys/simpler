@@ -52,6 +52,55 @@ init 时常驻协调块整体初始化为零。每一轮按以下规则执行：
 3. AICPU 仅在 `report_epoch == p + 1` 时接受该核的本轮身份；匹配后执行读屏障，再使用身份、写 task 并开窗。旧的 `aicore_done != 0` 不能独自作为就绪条件。
 4. 所有核完成且本轮成功收尾后，唯一 finalizer 才提交 `control.round_epoch = p + 1`。失败路径可记录错误状态，但**不得推进该字段**，并必须禁止同一 context 再次执行。
 
+一轮的完整时序如下。事件边（`Start` / `AicoreStart` / `AicoreDone` / `AicpuDone` / `SerialTail`）与改动前逐条相同，
+差别只在于原先夹在 `wait Start` 和 `record AicoreStart` 之间的两次 `aclrtMemsetAsync` 不再下发。
+
+```mermaid
+sequenceDiagram
+    participant Caller as Caller stream
+    participant CPU as Hidden AICPU stream
+    participant Core as Hidden AICore stream
+    participant HBM as HBM：control / reports
+
+    Note over HBM: init：control.round_epoch = 0；所有 report_epoch = 0
+
+    Caller->>CPU: record Start；wait Start
+    CPU->>Core: record AicoreStart；wait AicoreStart
+    Note over CPU,Core: 此处不再下发 clear control / clear reports
+
+    Core->>HBM: load_kernel_gm_word(control.round_epoch) = p
+    Note over Core: p == UINT64_MAX 则直接返回，不回绕
+    CPU->>HBM: attach()：失效 control cache 后读 round_epoch = p
+    Note over CPU: p == UINT64_MAX 则 attach 失败；<br/>随后失效 reports cache，置 expected = p+1
+    Note over CPU,Core: 两者谁先运行都可以；本轮成功收尾前 p 不变
+
+    Core->>HBM: 写 physical_core_id / core_type
+    Core->>HBM: 屏障后写 aicore_done = block_idx + 1
+    Core->>HBM: 再屏障后发布 report_epoch = p + 1，dcci 写回
+
+    loop 每个核
+        CPU->>HBM: 读 report_epoch
+        alt report_epoch > p + 1
+            CPU->>CPU: handshake_failed，本轮终止
+        else report_epoch != p + 1
+            CPU->>CPU: 自旋等待（旧报告至多为 p，不会误判）
+        else report_epoch == p + 1
+            CPU->>CPU: rmb() 后校验 aicore_done == i + 1
+            CPU->>HBM: 读身份字段、写本轮 task、开窗
+        end
+    end
+
+    alt 全部核完成且 runtime/cleanup 均为 0
+        CPU->>HBM: publish_status 提交 control.round_epoch = p + 1
+        Core-->>CPU: record AicoreDone；wait AicoreDone
+        CPU-->>Caller: record AicpuDone；wait AicpuDone
+        Caller->>Caller: record SerialTail
+    else 准入 / 部分提交 / 执行失败
+        CPU->>HBM: 只写 runtime_status / cleanup_status，round_epoch 保持 p
+        Note over CPU,Core: gate 停在非 Idle，context 不可复用，<br/>不得启动下一轮
+    end
+```
+
 健康轮次的不变量是：开始时 control 的值为 `p`，所有旧 report 的 epoch 至多为 `p`；所以旧报告不能满足本轮所需的 `p + 1`。成功收尾后 control 成为 `p + 1`，形成下一轮的起点。
 即使 AICore task 先于 AICPU task 入队，两者实际启动先后不确定也不影响该不变量：成功 finalizer 必须等待所有核的本轮身份报告，因此不会在某个尚未读取 control 的正常 AICore 之前提交新 epoch。
 
