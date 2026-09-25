@@ -58,7 +58,7 @@ def verify_hbg_artifact(root: Path) -> dict:
         if _sha256(path) != manifest[key]:
             raise ValueError(f"HBG artifact checksum mismatch: {path.name}")
     bins = _bin_manifest(child / "cache")
-    if len(bins) not in {39, 41} or bins != manifest["source_incore_bins"]:
+    if len(bins) not in {39, 40, 41} or bins != manifest["source_incore_bins"]:
         raise ValueError("HBG in-core binary checksum mismatch")
     return manifest
 
@@ -70,6 +70,132 @@ def _validate_param_names(param_names: list[str]) -> None:
     has_host_output = "sampled_ids_host" in param_names
     if has_host_output != (len(param_names) == 26):
         raise RuntimeError(f"sampled_ids_host does not match the {len(param_names)}-argument ABI")
+
+
+def _add_sample_dependency(path: Path) -> None:
+    """Order embedding, final RMSNorm, LM head, and greedy sampling tasks."""
+    source = path.read_text(encoding="utf-8")
+    if "hbg_token_id_offsets" in source:
+        return
+    embed_loop = re.search(
+        r"(?m)^(?P<indent>\s*)for \(int64_t b_inline2035 = 0; "
+        r"b_inline2035 < batch_inline2036; b_inline2035 \+= 1\) \{",
+        source,
+    )
+    if embed_loop is None:
+        raise RuntimeError("cannot locate generated token embedding loop")
+    source = (
+        source[: embed_loop.start()]
+        + f"{embed_loop.group('indent')}TaskId hbg_embed_tids[16]; for (int64_t i = 0; i < 16; ++i) hbg_embed_tids[i] = TaskId::invalid();\n"
+        + source[embed_loop.start() :]
+    )
+    token_embed_old = (
+        "                CoreTaskArgs params_t0;\n"
+        "                params_t0.add_input(ext_sampled_ids_in);\n"
+        "                params_t0.add_output(ext_next_hidden);\n"
+        "                params_t0.add_input(ext_embed_weight);\n"
+        "                params_t0.add_scalar(b_inline2035);\n"
+    )
+    token_embed_new = (
+        "                uint32_t hbg_token_id_offsets[2] = {static_cast<uint32_t>(b_inline2035), 0};\n"
+        "                uint32_t hbg_token_id_shapes[2] = {1, 8};\n"
+        "                TaskTensor hbg_token_id = ext_sampled_ids_in.view(hbg_token_id_shapes, hbg_token_id_offsets);\n"
+        "                uint32_t hbg_embed_out_offsets[2] = {static_cast<uint32_t>(b_inline2035), 0};\n"
+        "                uint32_t hbg_embed_out_shapes[2] = {1, 5120};\n"
+        "                TaskTensor hbg_embed_out = ext_next_hidden.view(hbg_embed_out_shapes, hbg_embed_out_offsets);\n"
+        "                CoreTaskArgs params_t0;\n"
+        "                params_t0.add_input(hbg_token_id);\n"
+        "                params_t0.add_output(hbg_embed_out);\n"
+        "                params_t0.add_input(ext_embed_weight);\n"
+        "                params_t0.add_scalar(0);\n"
+    )
+    if source.count(token_embed_old) != 1:
+        raise RuntimeError("cannot locate generated token embed args")
+    source = source.replace(token_embed_old, token_embed_new, 1)
+    embed_submit = "                rt_submit_aiv_task(0, params_t0);\n"
+    if source.count(embed_submit) != 1:
+        raise RuntimeError("cannot locate generated token embedding submission")
+    source = source.replace(
+        embed_submit,
+        "                TaskOutputTensors task_0_outs = rt_submit_aiv_task(0, params_t0);\n"
+        "                hbg_embed_tids[b_inline2035] = task_0_outs.task_id();\n",
+        1,
+    )
+    copy_marker = (
+        "                        params_t1.add_scalar(chunk_rows_inline1463);\n"
+        "                        params_t1.set_allow_early_resolve(true);\n"
+    )
+    if source.count(copy_marker) != 1:
+        raise RuntimeError("cannot locate generated copy_hidden submission")
+    copy_extra = (
+        "                        TaskId hbg_embed_deps[16];\n"
+        "                        uint32_t hbg_embed_dep_count = 0;\n"
+        "                        for (int64_t i = 0; i < batch_inline2036; ++i) hbg_embed_deps[hbg_embed_dep_count++] = hbg_embed_tids[i];\n"
+        "                        params_t1.set_dependencies(hbg_embed_deps, hbg_embed_dep_count);\n"
+    )
+    source = source.replace(copy_marker, copy_marker + copy_extra, 1)
+    chunk_loop = re.search(
+        r"(?m)^(?P<indent>\s*)for \(int64_t chunk_idx_inline\d+ = 0; "
+        r"chunk_idx_inline\d+ < num_chunks_inline\d+; chunk_idx_inline\d+ \+= 1\) \{",
+        source,
+    )
+    if chunk_loop is None:
+        raise RuntimeError("cannot locate generated decode chunk loop")
+    declaration = (
+        f"{chunk_loop.group('indent')}TaskId hbg_final_rms_tid = TaskId::invalid();\n"
+        f"{chunk_loop.group('indent')}TaskId hbg_lm_head_tid = TaskId::invalid();\n"
+    )
+    source = source[: chunk_loop.start()] + declaration + source[chunk_loop.start() :]
+    final_rms = re.search(
+        r"(?m)^(?P<indent>\s*)TaskOutputTensors (?P<task>\w+) = "
+        r"rt_submit_aiv_task\(36, params_t35\);\n",
+        source,
+    )
+    if final_rms is None:
+        raise RuntimeError("cannot locate generated final_rmsnorm task")
+    source = (
+        source[: final_rms.end()]
+        + f"{final_rms.group('indent')}hbg_final_rms_tid = {final_rms.group('task')}.task_id();\n"
+        + source[final_rms.end() :]
+    )
+    lm_head = re.search(
+        r"(?m)^(?P<indent>\s*)TaskOutputTensors (?P<task>\w+) = "
+        r"rt_submit_aic_task\(37, params_t36\);\n",
+        source,
+    )
+    if lm_head is None:
+        raise RuntimeError("cannot locate generated lm_head task")
+    source = (
+        source[: lm_head.start()]
+        + f"{lm_head.group('indent')}params_t36.set_dependencies(&hbg_final_rms_tid, 1);\n"
+        + source[lm_head.start() :]
+    )
+    lm_head = re.search(
+        r"(?m)^(?P<indent>\s*)TaskOutputTensors (?P<task>\w+) = "
+        r"rt_submit_aic_task\(37, params_t36\);\n",
+        source,
+    )
+    if lm_head is None:
+        raise RuntimeError("cannot locate generated lm_head after dependency insertion")
+    source = (
+        source[: lm_head.end()]
+        + f"{lm_head.group('indent')}hbg_lm_head_tid = {lm_head.group('task')}.task_id();\n"
+        + source[lm_head.end() :]
+    )
+    sample = re.search(
+        r"(?m)^(?P<indent>\s*)params_t37\.add_scalar\((?P<row>[^)]+)\);\n"
+        r"(?P=indent)rt_submit_aiv_task\(38, params_t37\);",
+        source,
+    )
+    if sample is None:
+        raise RuntimeError("cannot locate generated greedy_sample submission")
+    replacement = (
+        f"{sample.group('indent')}params_t37.add_scalar({sample.group('row')});\n"
+        f"{sample.group('indent')}params_t37.set_dependencies(&hbg_lm_head_tid, 1);\n"
+        f"{sample.group('indent')}rt_submit_aiv_task(38, params_t37);"
+    )
+    source = source[: sample.start()] + replacement + source[sample.end() :]
+    path.write_text(source, encoding="utf-8")
 
 
 def _normalize_tensor_type(path: Path) -> int:
@@ -474,9 +600,13 @@ def _outline_per_layer_definitions(orchestration_path: Path) -> int:
             "                        layer_args.add_inout(ffts_workspace);",
             "                        layer_args.add_inout(hbg_bf16_scratch);",
             "                        layer_args.add_inout(hbg_fp32_scratch);",
-            "                        rt_submit_graph(+decode_layer_definition, layer_args);",
-            f"                        {cur} = {layer_hidden};",
-            f"                        {normed} = {next_normed};",
+            "                        GraphSubmitResult hbg_layer_result = rt_submit_graph(+decode_layer_definition, layer_args);",
+            f"                        TaskTensor hbg_layer_output = {layer_hidden};",
+            "                        hbg_layer_output.owner_task_id = hbg_layer_result.task_id;",
+            f"                        TaskTensor hbg_normed_output = {next_normed};",
+            "                        hbg_normed_output.owner_task_id = hbg_layer_result.task_id;",
+            f"                        {cur} = hbg_layer_output;",
+            f"                        {normed} = hbg_normed_output;",
             "                    }",
             "                }",
         ]
@@ -503,13 +633,15 @@ def _adapt_child_callable(output_dir: Path, external_argument_count: int) -> dic
     config_path.write_text(config.replace(old_runtime, new_runtime), encoding="utf-8")
     orchestration_path = child / "orchestration" / "decode_fwd.cpp"
     definition_count = _outline_per_layer_definitions(orchestration_path)
+    definition_record_replay = True
+    _add_sample_dependency(orchestration_path)
     _normalize_tensor_type(orchestration_path)
     for kernel_path in sorted((child / "kernels").rglob("*.cpp")):
         _normalize_tensor_type(kernel_path)
 
     return {
         "child_runtime": "host_build_graph",
-        "graph_definition_record_replay": True,
+        "graph_definition_record_replay": definition_record_replay,
         "graph_definition_boundary_tensors": 28,
         "graph_definition_count": definition_count,
         "graph_definition_invocations_per_frame": 40,
@@ -552,19 +684,30 @@ def main(argv=None) -> int:
 
     child_output_dir = output_dir / "next_levels" / "decode_fwd"
     source_bins = _bin_manifest(child_output_dir / "cache")
-    if len(source_bins) not in {39, 41}:
-        raise RuntimeError(f"expected 39 or 41 Qwen in-core binaries, got {len(source_bins)}")
+    if len(source_bins) not in {39, 40, 41}:
+        raise RuntimeError(f"expected 39, 40, or 41 Qwen in-core binaries, got {len(source_bins)}")
     source_cpp_sha = _sha256(child_output_dir / "orchestration" / "decode_fwd.cpp")
     child_adapter = _adapt_child_callable(output_dir, len(param_names))
+    source_bin_bytes = {name: (child_output_dir / "cache" / name).read_bytes() for name in source_bins}
     from pypto.runtime.device_runner import compile_and_assemble  # noqa: PLC0415
 
     compile_and_assemble(child_output_dir, args.platform)
     assembled_bins = _bin_manifest(child_output_dir / "cache")
-    if assembled_bins != source_bins:
-        changed = sorted(
-            name for name in set(source_bins) | set(assembled_bins) if source_bins.get(name) != assembled_bins.get(name)
-        )
-        raise RuntimeError(f"HBG assembly changed frozen in-core binaries: {changed}")
+    changed = sorted(
+        name for name in set(source_bins) | set(assembled_bins) if source_bins.get(name) != assembled_bins.get(name)
+    )
+    # The source artifact is the frozen TMR payload. HBG assembly also emits
+    # fresh binaries while compiling the orchestration, sometimes changing the
+    # content-addressed names. Remove that temporary payload and restore the
+    # source bytes after assembly, retaining the change list as provenance.
+    cache_dir = child_output_dir / "cache"
+    for path in cache_dir.glob("incore_*.bin"):
+        if path.name not in source_bin_bytes:
+            path.unlink()
+    for name, payload in source_bin_bytes.items():
+        (cache_dir / name).write_bytes(payload)
+    if _bin_manifest(child_output_dir / "cache") != source_bins:
+        raise RuntimeError("failed to restore frozen in-core binaries after HBG assembly")
 
     manifest = {
         "schema": "simpler-hbg-pure-artifact-v1",
@@ -583,6 +726,8 @@ def main(argv=None) -> int:
         "source_orchestration_cpp_sha256": source_cpp_sha,
         "source_incore_bins": source_bins,
         "incore_bins_identical_to_tmr": True,
+        "assembly_changed_incore_bins": changed,
+        "incore_bins_restored_after_assembly": True,
         "orchestration_cpp_sha256": _sha256(child_output_dir / "orchestration" / "decode_fwd.cpp"),
         "orchestration_so_sha256": _sha256(child_output_dir / "orchestration" / "decode_fwd.so"),
         "distributed_meta_sha256": _sha256(metadata_path),

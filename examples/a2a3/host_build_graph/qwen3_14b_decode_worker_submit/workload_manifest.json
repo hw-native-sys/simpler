@@ -1,0 +1,65 @@
+{
+  "model": "Qwen3-14B",
+  "precision": "BF16",
+  "batch": 16,
+  "max_seq": 5500,
+  "decode_seq_len": 3500,
+  "decode_steps": 1,
+  "sampling": {
+    "method": "not_applicable_hidden_state_fixture"
+  },
+  "fixture": {
+    "kind": "deterministic_decode_fixture",
+    "seed": 1234,
+    "prefill_kv": "deterministic_random_kv",
+    "prompt_token_ids_sha256": "8db4a9a6897a5ae237fd3806ce39b4d49a549f8faf2881d5ae5740d5e6be6bb9",
+    "prompt_sha256": "6b3e99d56ed58d58d98f149be7a68d2e454df2447414ac51f3f46da92adb9dfd",
+    "status": "runtime_fixture_only",
+    "weights": "seeded_random_layer0_replicated_40_times"
+  },
+  "kv_cache": {
+    "layout": "paged_BSND",
+    "block_size": 128,
+    "address_space": "HOST",
+    "ownership": "driver_buffers",
+    "mutable_per_run": true
+  },
+  "execution": {
+    "platform": "a2a3",
+    "runtime": "host_build_graph",
+    "worker_level": 3,
+    "endpoint": "single_local_chip",
+    "task_shape": "single_NEXT_LEVEL",
+    "depths": [
+      1,
+      2
+    ],
+    "hardware_qualified_launch_depths": [
+      1
+    ]
+  },
+  "prompt": {
+    "prompt_sha256": "6b3e99d56ed58d58d98f149be7a68d2e454df2447414ac51f3f46da92adb9dfd",
+    "prompt_token_count": 3338,
+    "prompt_token_ids_sha256": "8db4a9a6897a5ae237fd3806ce39b4d49a549f8faf2881d5ae5740d5e6be6bb9",
+    "tokenizer_sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+  },
+  "model_checksums": {
+    "model_config_json_sha256": "e73c3664ca09b10a673fef0c22e8a6b456201d49bd4713c9691f775720e8857a",
+    "model_safetensors_index_json_sha256": "62d7ad35757bae5e7baa452cb1483178b7daa50e869e923226b8da10871f7ebc",
+    "model_tokenizer_json_sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+    "model_generation_config_json_sha256": "2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2"
+  },
+  "comparison": {
+    "outputs": [
+      "out",
+      "k_cache",
+      "v_cache"
+    ],
+    "token_output": "not_exposed_by_this_decode_callable",
+    "dtype_tolerance": {
+      "rtol": 0.05,
+      "atol": 0.1
+    }
+  }
+}
