@@ -52,7 +52,7 @@ static_assert(sizeof(simpler::tmr::Tensor) == TASKPAYLOAD_TENSOR_STRIDE);
 
 namespace {
 inline constexpr int32_t DEFERRED_RELEASE_CAP = 256;
-}
+}  // namespace
 
 // The early-dispatch core bitmask (EARLY_DISPATCH_CORE_MASK_WORDS * 64 bits) must cover
 // every global core_id, and the per-core doorbell table is sized to match.
@@ -90,6 +90,53 @@ bool SchedulerContext::has_idle_in_other_threads(int32_t self_thread_idx, Resour
         }
     }
     return false;
+}
+
+bool SchedulerContext::mix_preload_target_is_near_free(int32_t thread_idx, int32_t cluster_offset) const {
+    const CoreTracker &tracker = core_trackers_[thread_idx];
+    uint64_t now = get_sys_cnt_aicpu();
+    const int32_t cores[PLATFORM_CORES_PER_BLOCKDIM] = {
+        tracker.get_aic_core_id(cluster_offset), tracker.get_aiv0_core_id(cluster_offset),
+        tracker.get_aiv1_core_id(cluster_offset)
+    };
+    // Ceiling from the runtime config (SIMPLER_MIX_PRELOAD_MAX_REMAINING_US,
+    // latched into the device config; 0 disables the gate). Read per call rather
+    // than hoisted: it is a resident global behind an extern "C" getter, which
+    // the compiler cannot hoist across the dispatch loop on its own.
+    //
+    // The gate exists because a pre-load is a hardware commitment — the block
+    // leaves the ready queue and is promoted on that cluster — so parking a
+    // short block behind a long kernel delays it by that kernel's remainder
+    // while a nearer cluster goes idle (simpler#2279: a ~30 us block waited
+    // 163-173 us behind a just-started ~190 us kernel, and 30% of rounds
+    // carried a 40-140 us tail). What the pre-load buys is the dispatch
+    // handshake it hides, roughly 1 us, which is what this ceiling balances
+    // against.
+    const int32_t max_remaining_us = get_mix_preload_max_remaining_us();
+    if (max_remaining_us <= 0) return true;
+    const uint64_t max_remaining_cycles =
+        static_cast<uint64_t>(max_remaining_us) * (PLATFORM_PROF_SYS_CNT_FREQ / 1'000'000);
+
+    uint64_t worst_remaining = 0;
+    for (int32_t core_id : cores) {
+        const CoreExecState &core = core_exec_states_[core_id];
+        ChipTaskSlotState *rs = core.running_slot_state;
+        if (rs == nullptr || core.running_reg_task_id == AICPU_TASK_INVALID) continue;  // idle: free now
+        int32_t subslot = static_cast<int32_t>(core.running_subslot);
+        if (subslot < 0 || subslot >= SUBTASK_SLOT_COUNT) continue;
+        uint32_t est = sched_->est_cycles_for(rs->task->kernel_id[subslot]);
+        if (est == 0) continue;  // no sample yet: this core cannot refuse the pre-load
+        uint64_t start = running_start_cycle_[core_id];
+        uint64_t elapsed = (start != 0 && now > start) ? (now - start) : 0;
+        uint64_t remaining = (elapsed >= est) ? 0 : est - elapsed;
+        if (remaining > worst_remaining) worst_remaining = remaining;
+    }
+    // Any core we can measure and that is far from free refuses the pre-load: the
+    // block would be parked behind it whatever the other cores are doing. A
+    // cluster whose cores are all unmeasured therefore still pre-loads, which is
+    // the previous behaviour, so a first execution (or a fresh program whose
+    // kernels have no samples yet) is unaffected.
+    return worst_remaining < max_remaining_cycles;
 }
 
 int SchedulerContext::pop_ready_tasks_batch(
@@ -198,6 +245,10 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
         core_exec_state.running_slot_state = &slot_state;
         core_exec_state.running_reg_task_id = static_cast<int32_t>(reg_task_id);
         tracker.change_core_state(core_offset);
+        // Remaining-time bookkeeping: this task's clock starts here. Unconditional
+        // — the DFX dispatch timestamp below is level-gated and, on promotion,
+        // carries the pending dispatch instead.
+        running_start_cycle_[core_id] = get_sys_cnt_aicpu();
     }
     tracker.set_pending_occupied(core_offset);
 
@@ -400,7 +451,15 @@ void SchedulerContext::dispatch_shape(
                 while (candidates.has_value()) {
                     int32_t cluster_offset = candidates.pop_first();
                     if (tracker.classify_mix_cluster(cluster_offset, cmask) == wanted) {
-                        selected_mix_clusters |= CoreTracker::BitStates(1ULL << cluster_offset);
+                        // Pending targets must be close to freeing: with none of
+                        // them close, the mask stays empty and the task returns to
+                        // the shared queue, where whichever thread frees a cluster
+                        // first picks it up. That is the only way to place a block
+                        // on the cluster that actually frees soonest — the choice
+                        // has to be deferred, not predicted.
+                        if (!is_pending || mix_preload_target_is_near_free(thread_idx, cluster_offset)) {
+                            selected_mix_clusters |= CoreTracker::BitStates(1ULL << cluster_offset);
+                        }
                     }
                 }
                 if (!selected_mix_clusters.has_value()) {

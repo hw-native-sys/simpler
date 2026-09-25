@@ -100,6 +100,14 @@ HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
         );
     }
 
+    if (parse_status.mix_preload_env_set && !parse_status.mix_preload_valid) {
+        const char *preload_env = std::getenv(SIMPLER_MIX_PRELOAD_MAX_REMAINING_US_ENV);
+        LOG_WARN(
+            "%s=%s invalid, using default %d", SIMPLER_MIX_PRELOAD_MAX_REMAINING_US_ENV, preload_env,
+            order_defaults.mix_preload_max_remaining_us
+        );
+    }
+
     bool host_timeout_env_set =
         parse_status.op_execute_env_set || parse_status.stream_sync_env_set || parse_status.scheduler_env_set;
     RuntimeTimeoutOrderStatus order_status = validate_runtime_timeout_order(cfg);
@@ -117,11 +125,16 @@ HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
             runtime_timeout_order_status_name(order_status), cfg.scheduler_timeout_ms,
             (unsigned long long)cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms
         );
+        // The pre-load ceiling is not part of the op/stream/scheduler timeout
+        // ordering, so an inconsistent timeout set does not discard it.
         return HostRuntimeTimeoutConfig{
-            order_defaults.op_execute_timeout_us, order_defaults.stream_sync_timeout_ms, scheduler_override
+            order_defaults.op_execute_timeout_us, order_defaults.stream_sync_timeout_ms, scheduler_override,
+            cfg.mix_preload_max_remaining_us
         };
     }
-    return HostRuntimeTimeoutConfig{cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms, scheduler_override};
+    return HostRuntimeTimeoutConfig{
+        cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms, scheduler_override, cfg.mix_preload_max_remaining_us
+    };
 }
 
 /**
@@ -1207,6 +1220,7 @@ int DeviceRunnerBase::ensure_aicpu_init_launched(rtStream_t control_stream) {
     // Per-device scheduler watchdog override, resolved once at attach into
     // timeout_config_. 0 -> the AICPU scheduler keeps its compile-time default.
     init_args.scheduler_timeout_ms = timeout_config_.scheduler_timeout_ms;
+    init_args.mix_preload_max_remaining_us = timeout_config_.mix_preload_max_remaining_us;
     // Publish the provisioned async-DMA workspace addresses (all-zero unless the
     // Worker opted into SDMA). ensure_dma_workspace_provisioned() runs first, so
     // this single launch carries them; the AICPU SO stays resident, and the

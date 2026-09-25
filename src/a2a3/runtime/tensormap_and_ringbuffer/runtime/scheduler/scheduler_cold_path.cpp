@@ -1387,6 +1387,10 @@ void SchedulerContext::deinit() {
     // AICPU_TASK_INVALID — so no FIN for an undispatched slot is processed, and
     // the count-gated consumer never reads entries[] past the fresh count.
 
+    // Reset the pre-load remaining-time clocks: a stale start cycle would be
+    // read as this run's elapsed time on the next one.
+    memset(running_start_cycle_, 0, sizeof(running_start_cycle_));
+
     // Reset sync-start drain coordination — a previous run that aborted mid-drain
     // would otherwise leave dirty pending/ack state for the next reuse.
     drain_state_.sync_start_pending.store(0, std::memory_order_release);
