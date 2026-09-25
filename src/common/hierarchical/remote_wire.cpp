@@ -466,6 +466,17 @@ std::vector<uint8_t> encode_remote_task_args(const RemoteTaskArgsWire &args) {
         args.remote_desc.empty() || args.remote_desc.size() == args.tensors.size(),
         "remote_wire: remote descriptor count must match tensor count"
     );
+    ensure(
+        args.transfers.empty() || args.transfers.size() == args.tensors.size(),
+        "remote_wire: transfer count must match tensor count"
+    );
+    for (size_t i = 0; i < args.transfers.size(); ++i) {
+        ensure(
+            args.transfers[i] ==
+                legacy_tensor_transfer(static_cast<AddressSpace>(args.tensors[i].buffer.address_space)),
+            "remote_wire: tensor transfer cannot be represented by protocol version 4"
+        );
+    }
     std::vector<uint8_t> out;
     put_u32(out, static_cast<uint32_t>(args.tensors.size()));
     put_u32(out, static_cast<uint32_t>(args.scalars.size()));

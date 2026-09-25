@@ -1110,3 +1110,43 @@ TEST(MpiGroupMailboxTransport, GroupProgressSubmitAndPollRoundTrip) {
     EXPECT_EQ(remote_l3::decode_frame(reply).payload, std::vector<uint8_t>({0xA1}));
     EXPECT_EQ(mailbox_state(mailbox, OFF_REQUEST_STATE), static_cast<int32_t>(RequestState::IDLE));
 }
+
+TEST(RemoteEndpoint, TransferRequestReachesTheV4GateBeforeAnyFrameIsSent) {
+    for (TensorTransfer transfer : {TensorTransfer::NONE, TensorTransfer::H2D}) {
+        SCOPED_TRACE(static_cast<int>(transfer));
+        Ring ring;
+        ring.init(1ULL << 20);
+        TaskArgs args;
+        args.add_tensor(sidecar_free_placeholder_args().tensor(0), TensorArgType::INPUT, transfer);
+        TaskSlot slot = make_slot(ring, args);
+        auto &sidecar = ring.slot_state(slot)->remote_sidecar;
+        RemoteTensorSidecar tensor_sidecar;
+        tensor_sidecar.present = true;
+        tensor_sidecar.desc.address_space = RemoteAddressSpace::HOST_INLINE;
+        tensor_sidecar.desc.owner_worker_id = 0;
+        tensor_sidecar.desc.nbytes = 1;
+        tensor_sidecar.desc.inline_payload_len = 1;
+        sidecar.tensors.push_back(tensor_sidecar);
+        sidecar.inline_payload.push_back(7);
+
+        auto *transport = new FakeRemoteTransport();
+        RemoteL3Endpoint endpoint(3, 99, "fake", std::unique_ptr<RemoteL3Transport>(transport));
+        WorkerDispatch dispatch;
+        dispatch.task_slot = slot;
+        if (transfer == TensorTransfer::NONE) {
+            try {
+                endpoint.submit_progress(&ring, dispatch);
+                ADD_FAILURE() << "v4 must not erase an explicit HOST/NONE request";
+            } catch (const std::runtime_error &error) {
+                EXPECT_NE(std::string(error.what()).find("protocol version 4"), std::string::npos);
+            }
+            EXPECT_TRUE(transport->last_frame.empty());
+        } else {
+            EXPECT_NO_THROW(endpoint.submit_progress(&ring, dispatch));
+            EXPECT_FALSE(transport->last_frame.empty());
+            WorkerEndpointProgress progress;
+            EXPECT_TRUE(endpoint.poll_progress(progress));
+        }
+        ring.shutdown();
+    }
+}

@@ -112,6 +112,9 @@ struct HelloPayload {
 
 struct RemoteTaskArgsWire {
     std::vector<Tensor> tensors;
+    // Host-side requests are checked before v4 encoding. Empty means legacy location defaults;
+    // this vector adds no bytes to the protocol, which cannot represent other requests.
+    std::vector<TensorTransfer> transfers;
     std::vector<RemoteTensorSidecar> remote_desc;
     std::vector<uint64_t> scalars;
     std::vector<uint8_t> inline_payload;

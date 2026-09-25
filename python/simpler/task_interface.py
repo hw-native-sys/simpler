@@ -115,7 +115,7 @@ from _task_interface import (
     scalar_to_uint64 as _native_scalar_to_uint64,
 )
 
-from .buffer import Buffer, Tensor
+from .buffer import Buffer, Tensor, TensorTransfer
 
 
 def _assert_bindings_match_source_tree() -> None:
@@ -194,6 +194,7 @@ __all__ = [
     "ChipTensor",
     "ChipStorageTaskArgs",
     "TensorArgType",
+    "TensorTransfer",
     "TaskArgs",
     "TaskHandle",
     "RemoteAddressSpace",
@@ -842,7 +843,9 @@ def _storage_for_remote_task_args(args: TaskArgs) -> _RemoteTaskArgsStorage:
         return storage
 
 
-def _task_args_add_tensor(self: TaskArgs, tensor, tag: TensorArgType = TensorArgType.INPUT) -> None:
+def _task_args_add_tensor(
+    self: TaskArgs, tensor, tag: TensorArgType = TensorArgType.INPUT, *, transfer: TensorTransfer | None = None
+) -> None:
     """Add a task arg. ``tensor`` is a ``simpler.buffer.Tensor`` (packable) or its packed
     bytes. A RemoteTensorRef (arg destined for a remote worker) is rewritten to a REMOTE_SIDECAR
     ``Tensor`` (no local backing) with its remote descriptor tracked in the sidecar."""
@@ -868,10 +871,10 @@ def _task_args_add_tensor(self: TaskArgs, tensor, tag: TensorArgType = TensorArg
             ),
             byte_offset=int(tensor.offset),
         )
-        _TASK_ARGS_ADD_TENSOR(self, placeholder, tag)
+        _TASK_ARGS_ADD_TENSOR(self, placeholder, tag, transfer=transfer)
         storage.sidecars.append(_sidecar_from_ref(storage, tensor))
         return
-    _TASK_ARGS_ADD_TENSOR(self, tensor, tag)
+    _TASK_ARGS_ADD_TENSOR(self, tensor, tag, transfer=transfer)
 
 
 def _task_args_clear(self: TaskArgs) -> None:

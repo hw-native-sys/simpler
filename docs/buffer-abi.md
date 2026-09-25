@@ -103,7 +103,41 @@ it is the resolved `addr` + `size`. That is the whole of what materialization do
 | — | ⟂ | `buffer.addr` |
 | `byte_offset` (bytes) | ≈ | `start_offset` (elements) |
 | `shapes[5]` / `strides[5]` / `ndims` / `dtype` | = | `shapes[5]` / `strides[5]` / `ndims` / `dtype` |
-| `buffer.address_space` | = | `address_space` (still spelled `child_memory` until the wire flip) |
+| `buffer.address_space` | = | `address_space` |
+| `TaskArgs.transfer(i)` (per-call metadata) | = | `ChipStorageTaskArgs.tensor(i).transfer` (internal ABI carrier) |
+
+`AddressSpace` describes the backing's physical HOST/DEVICE location. `Tensor` holds
+only the backing descriptor and view geometry. `TensorTransfer` belongs to each
+TaskArgs entry: `NONE` borrows storage, `H2D` requests Program-managed device storage,
+and `D2H` is reserved and rejected. Callable direction still controls input copies
+and output copy-back; H2D does not mean every argument is copied in. Buffer identity,
+import grants and `TensorArgType` access checks are unchanged.
+
+```python
+view = buffer.tensor((16,), DataType.FLOAT32)
+args.add_tensor(view, transfer=TensorTransfer.NONE)
+args.add_tensor(view, transfer=TensorTransfer.H2D)
+```
+
+The two entries above share one view and independently request transfer; neither
+changes `view`. Omitted transfer in `TaskArgs.add_tensor` or the transitional L2
+`ChipStorageTaskArgs.add_tensor` keeps HOST/H2D and DEVICE/NONE. The L2
+`ChipTensor.make(..., address_space=...)` constructor selects location only;
+`child_memory` remains a compatibility spelling and cannot be combined with
+`address_space`. Both spellings use the same add-time defaults.
+
+Mailbox slots preserve each request in byte 141, formerly reserved view padding;
+standalone Tensor values do not carry it. Re-export and L2 materialization preserve
+the request alongside the view. Chip binders accept HOST/H2D and DEVICE/NONE;
+HOST/NONE returns UNSUPPORTED, and invalid pairs return INVALID_ARGUMENT, before
+any tensor content copy or device allocation. Host-only leaves can use HOST/NONE.
+This does not change HBG's existing host-access implementation. Remote protocol v4
+represents only legacy location defaults: its encoder rejects other per-call
+requests before emitting a payload instead of silently dropping them.
+Tensor/ChipTensor sizes remain 144/72 bytes; the internal ChipTensor carrier uses
+byte 70 for the request. Local endpoints must use the same build, as for every
+existing layout change. ChipTensor remains a transitional materialized ABI carrier,
+not a second public transfer-policy model.
 
 **Dead on the device** (`Tensor`-only): `magic` discriminates untrusted bytes at
 a decode boundary the device does not have. `identity` / `backend_kind` / `body`

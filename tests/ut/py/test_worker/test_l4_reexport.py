@@ -15,6 +15,7 @@ backing L4 owns.
 No NPU device — L3 uses a SubWorker.
 """
 
+import pytest
 import torch
 from simpler.buffer import (
     AccessMode,
@@ -22,6 +23,7 @@ from simpler.buffer import (
     BackendKind,
     BufferDescriptor,
     CanonicalIdentity,
+    TensorTransfer,
 )
 from simpler.task_interface import CallConfig, TaskArgs, TensorArgType
 from simpler.worker import Worker
@@ -69,7 +71,8 @@ def test_l4_l3_reexport_to_sub():
         w4.close()
 
 
-def test_l4_l3_reexport_carries_scalars():
+@pytest.mark.parametrize("transfer", [TensorTransfer.NONE, TensorTransfer.H2D])
+def test_l4_l3_reexport_carries_scalars(transfer):
     # Re-export replaces each tensor's backing handle and nothing else: the container a nested
     # next-level child's orch fn receives is the TaskArgs the submitter built, scalars included.
     def l3_sub(args):
@@ -84,7 +87,8 @@ def test_l4_l3_reexport_carries_scalars():
         if args.scalar_count() != 2:
             raise AssertionError(f"nested child lost scalars: scalar_count={args.scalar_count()}")
         sa = TaskArgs()
-        sa.add_tensor(args.tensor(0), TensorArgType.INOUT)
+        assert args.transfer(0) == transfer
+        sa.add_tensor(args.tensor(0), TensorArgType.INOUT, transfer=args.transfer(0))
         for i in range(args.scalar_count()):
             sa.add_scalar(args.scalar(i))
         orch.submit_sub(l3_sub_handle, sa)
@@ -105,7 +109,7 @@ def test_l4_l3_reexport_carries_scalars():
 
         def l4_orch(orch, args, config):
             ta = TaskArgs()
-            ta.add_tensor(buf_h.tensor(shapes=(4,), dtype=_F32), TensorArgType.INOUT)
+            ta.add_tensor(buf_h.tensor(shapes=(4,), dtype=_F32), TensorArgType.INOUT, transfer=transfer)
             ta.add_scalar(7)
             ta.add_scalar(11)
             orch.submit_next_level(l3_orch_handle, ta, CallConfig(), worker=0)

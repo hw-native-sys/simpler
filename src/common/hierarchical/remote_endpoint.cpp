@@ -1287,6 +1287,7 @@ remote_l3::TaskPayloadWire RemoteL3Endpoint::build_task_payload(const TaskSlotSt
             throw std::runtime_error("RemoteL3Endpoint::build_task_payload: tensor submitted without remote sidecar");
         }
         payload.args.tensors.push_back(ref);
+        payload.args.transfers.push_back(a.transfer(i));
         payload.args.remote_desc.push_back(tensor_sidecar);
     }
     payload.args.scalars.reserve(static_cast<size_t>(a.scalar_count()));

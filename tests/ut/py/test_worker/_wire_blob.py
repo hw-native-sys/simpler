@@ -8,13 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """Encode a task-args blob from Python, for tests that exercise a receive path directly.
 
-Production never encodes one here: `write_blob` in `task_args.h` is the only writer, and the bound
+Production never encodes one here: `write_blob` in `task_args_wire.h` is the only writer, and the bound
 wire types expose their fields but not their bytes, which is what keeps `validate_tensor` the single
 gate on the way in. A test that wants to hand `ImportRegistry` a blob therefore has to lay the bytes
 out itself.
 
 That is a feature rather than a workaround. These formats are written from the `static_assert`s in
-`src/common/task_interface/buffer.h` and the layout comment in `task_args.h`, independently of the
+`src/common/task_interface/buffer.h` and the layout comment in `task_args_wire.h`, independently of the
 C++ that reads them, so a layout change that updates only one side fails here instead of passing by
 construction — which is exactly what a `pack()` on the bound type could not do.
 """
@@ -32,7 +32,7 @@ _DESC_HEAD = struct.Struct("<HBBB3x")
 _DESC_TAIL = struct.Struct("<QIH2x32s")
 
 # Tensor, 144 B: buffer @0, byte_offset u64 @88, ndims u32 @96, shapes[5] @100, strides[5] @120,
-# dtype u8 @140, _pad[3].
+# dtype u8 @140, _pad[3]. Invocation slots encode transfer at byte 141.
 _TENSOR_TAIL = struct.Struct("<QI5I5IB3x")
 
 # Leading sentinel of a BufferDescriptor, frozen by buffer.h and deliberately not exported to Python
@@ -58,10 +58,11 @@ def encode_tensor(t) -> bytes:
     return head + identity + tail + view
 
 
-def encode_blob(tensors=(), scalars=()) -> bytes:
+def encode_blob(tensors=(), scalars=(), transfers=None) -> bytes:
     """A task-args blob in `write_blob` format: [i32 count][i32 count][Tensor...][u64 scalar...]."""
-    return (
-        struct.pack("=ii", len(tensors), len(scalars))
-        + b"".join(encode_tensor(t) for t in tensors)
-        + struct.pack(f"<{len(scalars)}Q", *scalars)
-    )
+    slots = []
+    for i, tensor in enumerate(tensors):
+        slot = bytearray(encode_tensor(tensor))
+        slot[141] = (1 if int(tensor.buffer.address_space) == 0 else 0) if transfers is None else int(transfers[i])
+        slots.append(bytes(slot))
+    return struct.pack("=ii", len(tensors), len(scalars)) + b"".join(slots) + struct.pack(f"<{len(scalars)}Q", *scalars)
