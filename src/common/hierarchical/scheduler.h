@@ -190,7 +190,7 @@ private:
     void poison_task(TaskSlot slot, const std::string &root_message);
 
     void try_consume(TaskSlot slot);
-    void dispatch_ready();
+    void dispatch_ready(bool scan_preparable);
     void dispatch_claimed(WorkerThread *worker, WorkerDispatch dispatch, bool prepared);
     void dispatch_preparable_next_level_singles();
     NextLevelGroupDispatchResult dispatch_next_level_group(const std::optional<RunId> &run_snapshot);

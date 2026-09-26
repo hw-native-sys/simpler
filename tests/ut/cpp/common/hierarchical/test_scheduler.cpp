@@ -1335,7 +1335,7 @@ TEST(WorkerManagerTest, AdmissionRejectionsCompleteClaimedDispatchesWithoutThrow
     ASSERT_TRUE(endpoint_ptr->wait_submitted(1));
 
     EXPECT_NO_THROW(worker.dispatch_prepared(WorkerDispatch{capacity_rejected, 0}));
-    EXPECT_TRUE(worker.can_stage());
+    EXPECT_FALSE(worker.can_stage());
     EXPECT_NO_THROW(worker.dispatch(WorkerDispatch{lane_rejected, 0}));
     {
         std::unique_lock<std::mutex> lk(callback_mu);
@@ -2058,17 +2058,24 @@ struct ProgressSchedulerFixture : public ::testing::Test {
     CallConfig config;
     DeterministicProgressEndpoint *endpoint0{nullptr};
     DeterministicProgressEndpoint *endpoint1{nullptr};
+    std::vector<DeterministicProgressEndpoint *> endpoints;
+    std::atomic<uint64_t> preparable_run_query_count{0};
 
     virtual uint32_t endpoint0_capacity() const { return 2; }
+    virtual std::vector<uint32_t> endpoint_capacities() const { return {endpoint0_capacity(), 2}; }
 
     void SetUp() override {
         allocator.init(/*heap_bytes=*/1ULL << 20);
-        auto first_endpoint = std::make_unique<DeterministicProgressEndpoint>(0, endpoint0_capacity());
-        auto second_endpoint = std::make_unique<DeterministicProgressEndpoint>(1);
-        endpoint0 = first_endpoint.get();
-        endpoint1 = second_endpoint.get();
-        manager.add_next_level_endpoint(std::move(first_endpoint));
-        manager.add_next_level_endpoint(std::move(second_endpoint));
+        const std::vector<uint32_t> capacities = endpoint_capacities();
+        for (size_t worker_id = 0; worker_id < capacities.size(); ++worker_id) {
+            auto endpoint =
+                std::make_unique<DeterministicProgressEndpoint>(static_cast<int32_t>(worker_id), capacities[worker_id]);
+            endpoints.push_back(endpoint.get());
+            manager.add_next_level_endpoint(std::move(endpoint));
+        }
+        ASSERT_GE(endpoints.size(), 2u);
+        endpoint0 = endpoints[0];
+        endpoint1 = endpoints[1];
         manager.start(
             &allocator,
             [this](WorkerCompletion completion) {
@@ -2096,6 +2103,7 @@ struct ProgressSchedulerFixture : public ::testing::Test {
             return orchestrator.dispatchable_run_id();
         };
         scheduler_config.preparable_run_cb = [this] {
+            preparable_run_query_count.fetch_add(1, std::memory_order_relaxed);
             return orchestrator.preparable_run_id();
         };
         scheduler_config.on_consumed_cb = [this](TaskSlot task_slot) {
@@ -2118,6 +2126,10 @@ struct ProgressSchedulerFixture : public ::testing::Test {
 
 struct CapacityOneProgressSchedulerFixture : public ProgressSchedulerFixture {
     uint32_t endpoint0_capacity() const override { return 1; }
+};
+
+struct PartialStagingProgressSchedulerFixture : public ProgressSchedulerFixture {
+    std::vector<uint32_t> endpoint_capacities() const override { return {2, 1, 2}; }
 };
 
 TEST_F(ProgressSchedulerFixture, GroupSubmitReportsNoSingleWorkerAndNoSingleIndex) {
@@ -2180,6 +2192,102 @@ TEST_F(ProgressSchedulerFixture, SuccessorStagesButActivatesOnlyAfterFifoPromoti
     EXPECT_TRUE(orchestrator.wait_run_for(second_run, 3.0));
     if (orchestrator.run_done(first_run)) orchestrator.release_run(first_run);
     if (orchestrator.run_done(second_run)) orchestrator.release_run(second_run);
+}
+
+TEST_F(ProgressSchedulerFixture, PreparedSuccessorStagesEveryEligibleWorker) {
+    const RunId first_run = orchestrator.begin_run();
+    const SubmitResult first =
+        orchestrator.submit_next_level(C(21), single_tensor_args(0x2100, TensorArgType::OUTPUT), config, 0);
+    orchestrator.close_run_submission(first_run);
+    ASSERT_TRUE(endpoint0->wait_submitted(1));
+
+    const RunId second_run = orchestrator.begin_run();
+    const SubmitResult worker0 =
+        orchestrator.submit_next_level(C(22), single_tensor_args(0x2200, TensorArgType::OUTPUT), config, 0);
+    const SubmitResult worker1 =
+        orchestrator.submit_next_level(C(23), single_tensor_args(0x2300, TensorArgType::OUTPUT), config, 1);
+    orchestrator.close_run_submission(second_run);
+
+    ASSERT_TRUE(endpoint0->wait_submitted(2));
+    ASSERT_TRUE(endpoint1->wait_submitted(1));
+    const std::vector<WorkerDispatch> worker0_submitted = endpoint0->submitted();
+    const std::vector<WorkerDispatch> worker1_submitted = endpoint1->submitted();
+    ASSERT_EQ(worker0_submitted.size(), 2u);
+    ASSERT_EQ(worker1_submitted.size(), 1u);
+    EXPECT_EQ(worker0_submitted[0].task_slot, first.task_slot);
+    EXPECT_FALSE(worker0_submitted[0].prepare_only);
+    EXPECT_EQ(worker0_submitted[1].task_slot, worker0.task_slot);
+    EXPECT_TRUE(worker0_submitted[1].prepare_only);
+    EXPECT_EQ(worker1_submitted[0].task_slot, worker1.task_slot);
+    EXPECT_TRUE(worker1_submitted[0].prepare_only);
+    EXPECT_EQ(orchestrator.active_run_id(), first_run);
+
+    endpoint0->emit(WorkerProgressKind::ACCEPTED, worker0_submitted[0]);
+    endpoint0->emit(WorkerProgressKind::COMPLETED, worker0_submitted[0]);
+    ASSERT_TRUE(endpoint0->wait_activated(second_run));
+    ASSERT_TRUE(endpoint1->wait_activated(second_run));
+
+    endpoint0->emit(WorkerProgressKind::ACCEPTED, worker0_submitted[1]);
+    endpoint1->emit(WorkerProgressKind::ACCEPTED, worker1_submitted[0]);
+    endpoint0->emit(WorkerProgressKind::COMPLETED, worker0_submitted[1]);
+    endpoint1->emit(WorkerProgressKind::COMPLETED, worker1_submitted[0]);
+    ASSERT_TRUE(orchestrator.wait_run_for(first_run, 3.0));
+    ASSERT_TRUE(orchestrator.wait_run_for(second_run, 3.0));
+    orchestrator.release_run(first_run);
+    orchestrator.release_run(second_run);
+}
+
+TEST_F(PartialStagingProgressSchedulerFixture, UnstageableWorkerDoesNotBlockLaterEligibleWorker) {
+    DeterministicProgressEndpoint *endpoint2 = endpoints[2];
+    const RunId first_run = orchestrator.begin_run();
+    const SubmitResult first =
+        orchestrator.submit_next_level(C(24), single_tensor_args(0x2400, TensorArgType::OUTPUT), config, 1);
+    orchestrator.close_run_submission(first_run);
+    ASSERT_TRUE(endpoint1->wait_submitted(1));
+
+    const RunId second_run = orchestrator.begin_run();
+    const SubmitResult worker0 =
+        orchestrator.submit_next_level(C(25), single_tensor_args(0x2500, TensorArgType::OUTPUT), config, 0);
+    const SubmitResult worker1 =
+        orchestrator.submit_next_level(C(26), single_tensor_args(0x2600, TensorArgType::OUTPUT), config, 1);
+    const SubmitResult worker2 =
+        orchestrator.submit_next_level(C(27), single_tensor_args(0x2700, TensorArgType::OUTPUT), config, 2);
+    orchestrator.close_run_submission(second_run);
+
+    ASSERT_TRUE(endpoint0->wait_submitted(1));
+    ASSERT_TRUE(endpoint2->wait_submitted(1));
+    ASSERT_EQ(endpoint1->submitted().size(), 1u);
+    const WorkerDispatch worker0_dispatch = endpoint0->submitted().front();
+    const WorkerDispatch worker2_dispatch = endpoint2->submitted().front();
+    EXPECT_EQ(worker0_dispatch.task_slot, worker0.task_slot);
+    EXPECT_TRUE(worker0_dispatch.prepare_only);
+    EXPECT_EQ(worker2_dispatch.task_slot, worker2.task_slot);
+    EXPECT_TRUE(worker2_dispatch.prepare_only);
+    EXPECT_EQ(orchestrator.active_run_id(), first_run);
+
+    const WorkerDispatch first_dispatch = endpoint1->submitted().front();
+    EXPECT_EQ(first_dispatch.task_slot, first.task_slot);
+    endpoint1->emit(WorkerProgressKind::ACCEPTED, first_dispatch);
+    endpoint1->emit(WorkerProgressKind::COMPLETED, first_dispatch);
+
+    ASSERT_TRUE(endpoint0->wait_activated(second_run));
+    ASSERT_TRUE(endpoint2->wait_activated(second_run));
+    ASSERT_TRUE(endpoint1->wait_submitted(2));
+    const WorkerDispatch worker1_dispatch = endpoint1->submitted().back();
+    EXPECT_EQ(worker1_dispatch.task_slot, worker1.task_slot);
+    EXPECT_FALSE(worker1_dispatch.prepare_only);
+
+    endpoint0->emit(WorkerProgressKind::ACCEPTED, worker0_dispatch);
+    endpoint1->emit(WorkerProgressKind::ACCEPTED, worker1_dispatch);
+    endpoint2->emit(WorkerProgressKind::ACCEPTED, worker2_dispatch);
+    endpoint0->emit(WorkerProgressKind::COMPLETED, worker0_dispatch);
+    endpoint1->emit(WorkerProgressKind::COMPLETED, worker1_dispatch);
+    endpoint2->emit(WorkerProgressKind::COMPLETED, worker2_dispatch);
+    ASSERT_TRUE(orchestrator.wait_run_for(first_run, 3.0));
+    ASSERT_TRUE(orchestrator.wait_run_for(second_run, 3.0));
+    EXPECT_FALSE(orchestrator.run_failed(second_run));
+    orchestrator.release_run(first_run);
+    orchestrator.release_run(second_run);
 }
 
 TEST_F(ProgressSchedulerFixture, ReadySuccessorCannotExecuteBeforePendingPredecessorTail) {
@@ -2352,37 +2460,68 @@ TEST_F(ProgressSchedulerFixture, ActivatedRunReleasesTheStagingLaneForItsSuccess
     if (orchestrator.run_done(third_run)) orchestrator.release_run(third_run);
 }
 
-TEST_F(CapacityOneProgressSchedulerFixture, PublicationFailureCompletesTheClaimedSuccessor) {
-    RunId first_run = orchestrator.begin_run();
+TEST_F(CapacityOneProgressSchedulerFixture, CapacityShortageFallsBackToOrdinarySuccessorDispatch) {
+    const RunId first_run = orchestrator.begin_run();
     orchestrator.submit_next_level(C(5), single_tensor_args(0x6000, TensorArgType::OUTPUT), config, 0);
     orchestrator.close_run_submission(first_run);
-    EXPECT_TRUE(endpoint0->wait_submitted(1));
+    ASSERT_TRUE(endpoint0->wait_submitted(1));
 
-    RunId second_run = orchestrator.begin_run();
-    orchestrator.submit_next_level(C(6), single_tensor_args(0x7000, TensorArgType::OUTPUT), config, 0);
+    const RunId second_run = orchestrator.begin_run();
+    const SubmitResult second =
+        orchestrator.submit_next_level(C(6), single_tensor_args(0x7000, TensorArgType::OUTPUT), config, 0);
     orchestrator.close_run_submission(second_run);
 
-    // Wait for the scheduler to claim and reject the successor while the first
-    // dispatch still owns the endpoint's only inflight slot. This successor
-    // remains PREPARED after its task error and is not terminal until FIFO
-    // promotion, so observe its recorded failure rather than wait_run_for().
-    // Completing the first dispatch before this fence races promotion and can
-    // turn the successor into an ordinary active dispatch.
-    const auto publication_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-    while (!orchestrator.run_failed(second_run) && std::chrono::steady_clock::now() < publication_deadline) {
+    uint64_t rounds_before_fence = 0;
+    {
+        std::scoped_lock lock(scheduler.loop_mutex());
+        rounds_before_fence = scheduler.dispatch_round_count();
+        scheduler.notify_ready();
+    }
+    const auto scan_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (scheduler.dispatch_round_count() < rounds_before_fence + 2 &&
+           std::chrono::steady_clock::now() < scan_deadline) {
         std::this_thread::yield();
     }
-    ASSERT_TRUE(orchestrator.run_failed(second_run));
-    std::vector<WorkerDispatch> submitted = endpoint0->submitted();
-    ASSERT_EQ(submitted.size(), 1u) << "the rejected successor must not reach the endpoint";
-    endpoint0->emit(WorkerProgressKind::ACCEPTED, submitted[0]);
-    endpoint0->emit(WorkerProgressKind::COMPLETED, submitted[0]);
+    { std::scoped_lock lock(scheduler.loop_mutex()); }
+    ASSERT_GE(scheduler.dispatch_round_count(), rounds_before_fence + 2);
+    ASSERT_FALSE(orchestrator.run_failed(second_run));
+    ASSERT_EQ(endpoint0->submitted().size(), 1u);
+    const uint64_t preparable_queries_after_fence = preparable_run_query_count.load(std::memory_order_relaxed);
+    ASSERT_GT(preparable_queries_after_fence, 0u);
 
-    EXPECT_TRUE(orchestrator.wait_run_for(first_run, 3.0));
-    EXPECT_THROW((void)orchestrator.wait_run_for(second_run, 3.0), std::runtime_error);
+    const uint64_t rounds_before_spin = scheduler.dispatch_round_count();
+    const auto spin_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (scheduler.dispatch_round_count() < rounds_before_spin + 100 &&
+           std::chrono::steady_clock::now() < spin_deadline) {
+        std::this_thread::yield();
+    }
+    { std::scoped_lock lock(scheduler.loop_mutex()); }
+    EXPECT_GE(scheduler.dispatch_round_count(), rounds_before_spin + 100);
+    EXPECT_FALSE(orchestrator.run_failed(second_run));
+    EXPECT_EQ(endpoint0->submitted().size(), 1u)
+        << "busy-loop iterations must not repeatedly claim an unstageable successor";
+    EXPECT_EQ(preparable_run_query_count.load(std::memory_order_relaxed), preparable_queries_after_fence)
+        << "busy-loop iterations without a state change must not repeat the prepared-worker scan";
+
+    const WorkerDispatch first_dispatch = endpoint0->submitted().front();
+    endpoint0->emit(WorkerProgressKind::ACCEPTED, first_dispatch);
+    endpoint0->emit(WorkerProgressKind::COMPLETED, first_dispatch);
+    ASSERT_TRUE(endpoint0->wait_submitted(2));
+    { std::scoped_lock lock(scheduler.loop_mutex()); }
+    EXPECT_GT(preparable_run_query_count.load(std::memory_order_relaxed), preparable_queries_after_fence)
+        << "a completion must trigger another prepared-worker scan";
+    const WorkerDispatch second_dispatch = endpoint0->submitted().back();
+    EXPECT_EQ(second_dispatch.task_slot, second.task_slot);
+    EXPECT_FALSE(second_dispatch.prepare_only);
+    endpoint0->emit(WorkerProgressKind::ACCEPTED, second_dispatch);
+    endpoint0->emit(WorkerProgressKind::COMPLETED, second_dispatch);
+
+    ASSERT_TRUE(orchestrator.wait_run_for(first_run, 3.0));
+    ASSERT_TRUE(orchestrator.wait_run_for(second_run, 3.0));
+    EXPECT_FALSE(orchestrator.run_failed(second_run));
     EXPECT_TRUE(scheduler.running());
-    if (orchestrator.run_done(first_run)) orchestrator.release_run(first_run);
-    if (orchestrator.run_done(second_run)) orchestrator.release_run(second_run);
+    orchestrator.release_run(first_run);
+    orchestrator.release_run(second_run);
 }
 
 TEST_F(ProgressSchedulerFixture, PreparedSuccessorGroupRemainsQueuedUntilPromotion) {

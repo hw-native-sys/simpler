@@ -553,7 +553,9 @@ bool WorkerThread::has_staged_run(RunId run_id) const {
 
 bool WorkerThread::can_stage() const {
     std::lock_guard<std::mutex> lane_lk(lane_mu_);
-    return caps().supports_frame_staging && !lane(LaneKind::STAGED).occupied;
+    const WorkerEndpointCaps &endpoint_caps = caps();
+    return endpoint_caps.supports_frame_staging && !lane(LaneKind::STAGED).occupied &&
+           inflight_.load(std::memory_order_acquire) < endpoint_caps.max_inflight_tasks;
 }
 
 bool WorkerThread::idle() const {

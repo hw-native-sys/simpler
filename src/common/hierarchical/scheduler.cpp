@@ -265,6 +265,7 @@ void Scheduler::run() {
     uint64_t spins = 0;
 #endif
     while (true) {
+        bool wake_advanced = false;
         {
             std::unique_lock<std::mutex> lk(completion_mu_);
             auto ready = [this, &observed_wake_generation] {
@@ -278,6 +279,7 @@ void Scheduler::run() {
                     completion_cv_.wait(lk, ready);
                 }
             }
+            wake_advanced = wake_generation_ != observed_wake_generation;
             observed_wake_generation = wake_generation_;
         }
 
@@ -317,7 +319,7 @@ void Scheduler::run() {
 
         // Phase 2: dispatch ready tasks. Once teardown publishes stop, the
         // existing endpoint-owned work drains but no new slot enters a worker.
-        if (!stop_requested_.load(std::memory_order_acquire)) dispatch_ready();
+        if (!stop_requested_.load(std::memory_order_acquire)) dispatch_ready(wake_advanced || drained != 0);
 
 #if SIMPLER_HOST_STRACE
         const uint64_t dispatched = dispatched_total_.load(std::memory_order_relaxed) - dispatched_before;
@@ -470,7 +472,7 @@ void Scheduler::try_consume(TaskSlot slot) {
 // lane/capacity/stopping rejections through exactly one complete_unpublished
 // call, under the same non-throwing completion-callback contract as ordinary
 // endpoint completion.
-void Scheduler::dispatch_ready() {
+void Scheduler::dispatch_ready(bool scan_preparable) {
     dispatch_round_count_.fetch_add(1, std::memory_order_relaxed);
     std::optional<RunId> run_snapshot;
     if (cfg_.active_run_cb) {
@@ -480,7 +482,11 @@ void Scheduler::dispatch_ready() {
         cfg_.manager->activate_prepared_run(active_run);
     }
 
-    dispatch_preparable_next_level_singles();
+    // A busy endpoint keeps this loop spinning, so a full prepared-worker scan
+    // is tied to existing scheduler state-change signals rather than every
+    // iteration. Completions are included because they can make dependent
+    // tasks READY while this thread drains the completion queue.
+    if (scan_preparable) dispatch_preparable_next_level_singles();
 
     // After staging, so a run staged in this very round can be authorized in
     // it rather than waiting for the next wake. Authorization does not move the
@@ -527,8 +533,7 @@ void Scheduler::dispatch_claimed(WorkerThread *worker, WorkerDispatch dispatch, 
 void Scheduler::dispatch_preparable_next_level_singles() {
     if (!cfg_.preparable_run_cb) return;
     RunId run_id = cfg_.preparable_run_cb();
-    if (run_id == INVALID_RUN_ID || cfg_.manager->has_staged_run(run_id) ||
-        !cfg_.ready_next_level_queues->groups_empty(run_id)) {
+    if (run_id == INVALID_RUN_ID || !cfg_.ready_next_level_queues->groups_empty(run_id)) {
         return;
     }
 
@@ -551,7 +556,6 @@ void Scheduler::dispatch_preparable_next_level_singles() {
         if (cfg_.before_claim_cb) cfg_.before_claim_cb(slot);
         if (!claim_for_dispatch(state)) continue;
         dispatch_claimed(worker, WorkerDispatch{slot, 0}, /*prepared=*/true);
-        return;
     }
 }
 
