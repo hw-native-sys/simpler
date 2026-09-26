@@ -40,6 +40,8 @@ from weights import iter_kernel_weights, rope_tables
 
 from simpler_setup.torch_interop import torch_dtype_to_datatype
 
+_LAST_OUTPUT: dict[str, Path] = {}
+
 
 def metrics(actual, expected):
     actual, expected = actual.float(), expected.float()
@@ -160,6 +162,8 @@ def main():
     parser.add_argument("--kv-reference", type=Path)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
+    _LAST_OUTPUT["path"] = args.output
+    repo_root = Path(__file__).resolve().parents[4]
     torch.set_num_threads(8)
     fixture = ReferenceFixture(args.fixture)
     if not 1 <= args.steps <= fixture.steps:
@@ -182,7 +186,7 @@ def main():
         "eos_policy": "fixed dispatch count; compare all frozen tokens",
         "logit_gate": {"relative_l2_max": 0.05, "cosine_min": 0.999, "tokens": "exact"},
         "reference_sums_sha256": hashlib.sha256((args.fixture / "SHA256SUMS").read_bytes()).hexdigest(),
-        "code_head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+        "code_head": subprocess.check_output(["git", "-C", str(repo_root), "rev-parse", "HEAD"], text=True).strip(),
         "source_hashes": artifact.source_hashes,
         "steps": [],
     }
@@ -191,9 +195,11 @@ def main():
     }
     report["runtime_binaries_sha256"] = {
         str(path): hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in sorted(Path("build/lib/a2a3/onboard/host_build_graph").glob("*"))
+        for path in sorted((repo_root / "build/lib/a2a3/onboard/host_build_graph").glob("*"))
         if path.is_file()
     }
+    if not report["runtime_binaries_sha256"]:
+        raise FileNotFoundError("no host_build_graph runtime binaries found")
     report["torch_version"] = torch.__version__
     report["kv_numerical_gate"] = {
         "relative_l2_max": 0.05,
@@ -300,4 +306,14 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except BaseException as error:
+        output_path = _LAST_OUTPUT.get("path")
+        if output_path is not None:
+            result_path = output_path / "result.json"
+            if not result_path.exists():
+                result_path.write_text(
+                    json.dumps({"status": "failed", "error": f"{type(error).__name__}: {error}"}, indent=2)
+                )
+        raise

@@ -1,6 +1,10 @@
-#!/usr/bin/env python3
 # Copyright (c) PyPTO Contributors.
-# This program is free software; see the repository LICENSE for details.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OR ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 from __future__ import annotations
 
@@ -12,11 +16,10 @@ from pathlib import Path
 
 import torch
 from safetensors.torch import load_file
-
-from simpler.task_interface import TaskArgs, TensorArgType
+from simpler.task_interface import CallConfig, TaskArgs, TensorArgType
 from simpler.worker import Worker
-from simpler_setup.torch_interop import torch_dtype_to_datatype
 
+from simpler_setup.torch_interop import torch_dtype_to_datatype
 
 BATCH = 16
 HEADS = 8
@@ -78,7 +81,9 @@ def _make_kv(fixture, kind: str, pages: int) -> torch.Tensor:
     for layer, path, tensor_name in fixture.iter_kv_shards(kind):
         shard = load_file(str(path), device="cpu")[tensor_name]
         start = layer * rows_per_layer
-        result[start : start + rows_per_layer].view(pages, HEADS, PAGE, HEAD_DIM).index_copy_(0, fixture.metadata["used_page_ids"].to(torch.long), shard)
+        result[start : start + rows_per_layer].view(pages, HEADS, PAGE, HEAD_DIM).index_copy_(
+            0, fixture.metadata["used_page_ids"].to(torch.long), shard
+        )
     return result
 
 
@@ -134,7 +139,14 @@ def main() -> int:
     host_values["sampled_ids"] = torch.zeros((BATCH, 8), dtype=torch.int32)
     host_values["next_hidden"] = torch.zeros((BATCH, HIDDEN), dtype=torch.bfloat16)
 
-    worker = Worker(level=3, platform="a2a3", runtime="host_build_graph", device_ids=[args.device], num_sub_workers=0, launch_depth=1)
+    worker = Worker(
+        level=3,
+        platform="a2a3",
+        runtime="host_build_graph",
+        device_ids=[args.device],
+        num_sub_workers=0,
+        launch_depth=1,
+    )
     chip_handle = worker.register(chip)
     worker.init()
     host_buffers = {}
@@ -146,7 +158,6 @@ def main() -> int:
         host_buffers = {name: _host_buffer(worker, tensor) for name, tensor in host_values.items()}
         adapter_mod = _load(case / "standalone_adapter.py", "qwen_real_adapter")
         adapter = adapter_mod.StandaloneDecodeAdapter(fixture, golden)
-        from simpler.task_interface import CallConfig
         config = CallConfig()
         config.enable_dep_gen = False
         config.enable_chip_swimlane = 0
@@ -176,6 +187,7 @@ def main() -> int:
                     worker.copy_to(device_buffers[name], host_buffers[name])
 
             task_args = None
+
             def submit_next_level(orch, _args, cfg):
                 nonlocal task_args
                 ensure_device_buffers(orch)
@@ -187,7 +199,10 @@ def main() -> int:
             worker.copy_from(host_buffers["sampled_ids"], device_buffers["sampled_ids"])
             sampled = _view(host_buffers["sampled_ids"], (BATCH, 8), torch.int32).clone()
             adapter.complete_step(sampled)
-            print(f"step={step.index} token0={int(sampled[0,0])} expected0={int(step.expected_output_token_ids[0])}", flush=True)
+            print(
+                f"step={step.index} token0={int(sampled[0, 0])} expected0={int(step.expected_output_token_ids[0])}",
+                flush=True,
+            )
     finally:
         # close() also tears down child allocations after the child exits; explicit
         # release is best effort so a poisoned device does not mask the root failure.
