@@ -8,12 +8,18 @@
     "output_tokens": 128,
     "consumed_decode_dispatches": 127,
     "steady_skip_dispatches": 5,
-    "runtime_slots": [0, 1],
+    "runtime_slots": [
+      0,
+      1
+    ],
     "kv_backing_page_count": 691
   },
   "artifact": {
     "runtime": "host_build_graph",
-    "supported_external_argument_counts": [25, 26],
+    "supported_external_argument_counts": [
+      25,
+      26
+    ],
     "definition_count": 1,
     "definition_invocations_per_frame": 40,
     "definition_task_limit": 1024
@@ -22,5 +28,11 @@
     "prefill_fixture": "provided-by-caller",
     "decode_artifact": "generated-by-build_hbg_artifact.py",
     "model_checkpoint": "provided-by-caller"
+  },
+  "adapter": {
+    "module": "standalone_adapter.py",
+    "submission": "Worker.submit -> orch.submit_next_level",
+    "feedback": "sampled_ids output must be consumed after RunHandle completion before next_step",
+    "correctness_gate": "fixture golden token rows and KV/layout validation"
   }
 }
