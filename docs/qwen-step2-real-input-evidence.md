@@ -23,9 +23,9 @@ not establish model correctness.
 
 ## Consumer evidence
 
-The tested tree is based on `badb5e4c`, with the review working changes applied.
+The tested tree is based on the depth-one PR head `7a28eaf7`.
 The full-run report records exact consumer-source and loaded-runtime artifact
-hashes; the working changes are not represented as a published commit.
+hashes for the qualified artifact and runtime.
 
 - Baseline task `task_20260924_084843_18736539585`: all 16 first-step tokens
   matched, but logits relative L2 was about 0.9983, so numerical acceptance failed.
@@ -56,6 +56,6 @@ feedback. The capability handoff is detailed in the
 [execution map](qwen-step2-execution-map.md).
 
 These results do not establish native vLLM batching, dynamic request admission,
-A5/TMR coverage, capture/replay, or a performance improvement. The existing
-step-two PR #2447 and tracking issue #2429 should be updated only after review of
-the prepared working changes and evidence.
+A5/TMR coverage, capture/replay, or a performance improvement. The depth-one
+results and evidence are the scope of step-two PR #2447; distinct-request
+numerical qualification is tracked separately.
