@@ -15,9 +15,9 @@ Program 模式 A2/A3 回归已完成：`available_aicore_counts`、`spmd_multibl
 `dummy_task` 全部通过，并另以 `SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE=1` 重跑一次覆盖
 `handshake_partition` 分支（现有 program ST 默认只走 `handshake_owned_clusters`）。A5 无硅片，未验证。
 
-性能方面，已实测 `aclrtMemsetAsync` 提交次数由上游基线的每次 launch 2 次降为 0 次；
-eager/replay 的 p50/p99 与 capture 图节点数仍未测量。**不能由 task 数减少推定实际加速** ——
-零 memset 版本让每个 AICore 多读一条共享 control cache line，净收益必须实测。
+性能方面已测与未测的范围见「验收与性能比较」一节，其中明确区分了已观测的 decode replay
+场景与尚未覆盖的场景。**不能由 task 数减少推定实际加速** —— 零 memset 版本让每个 AICore
+多读一条共享 control cache line，单个 AICPU 节点实测反而变慢，净收益必须逐场景实测。
 
 ## 现有执行顺序与问题
 
@@ -130,5 +130,36 @@ sequenceDiagram
 
 A2/A3 ST 直接断言每个 eager launch 和 graph capture 的提交范围内没有 `aclrtMemsetAsync`；真实设备 gate 延迟 AICore 报告发布，并使用不同的第二轮标量确认第二轮确实执行；故障用例分别验证首轮失败保持 epoch=0、成功一轮后的失败保持 epoch=1。A5 对应测试代码与 A2/A3 共用用例逻辑，observer 对 A5 头文件完成编译、两项用例完成 collection，但未运行硬件时必须标记未验证。
 
-性能以“仅保留一次 reports memset”的正确实现为基线，再与零 memset 版本比较 capture 节点数及 eager/replay 的 p50、p99。
-零 memset 版本使每个 AICore 多读同一 control cache line；少一个 RTS task 不保证整体更快。若共享 control 读取成为热点，可另行评估每核自增旧 `report_epoch`，但它依赖每核每轮完整参与，不能在没有故障重同步证明时替换首版协议。
+### 已观测的性能结果
+
+一次 Qwen3-14B 整网对照（BF16、TP1、ND KV、batch 1、`FULL_DECODE_ONLY`、capture size 1、
+单卡、50 次 decode ACLGraph replay、torch profiler 默认设置、两侧 51 个输出 token 逐个一致）：
+
+- 图内清零任务由 80 个/replay 降为 0 个/replay；同一 replay 内 `AI_CORE` / `AI_VECTOR_CORE` /
+  `MIX_AIC` / `AI_CPU` 与 `EVENT_RECORD` / `EVENT_RESET` / `EVENT_WAIT` 的计数逐项不变。
+- Device span 中位数 -0.64%，replay period 中位数 -0.82%、p99 -0.86%。
+- **AICPU 节点中位数 +0.57%**，即单节点变慢；这是读共享 control 与 epoch 匹配的代价。
+- `AI_VECTOR_CORE → AI_CPU` 的空档均值由 6.332 us 降到 0.653 us。
+
+该对照的参照版本是 feat + #2442（`cd417dff`），与本分支基线 `dd32e1cc` 相差一个 #2433，
+后者只改 HBG，不经过 TMR 路径。这是该次对照的观测值，不是跨版本的通用结论。
+
+把「空档均值变化 × 出现次数」与「节点中位数变化 × 节点数」相加，得到的每轮净额与实测
+Device span 变化量级一致（约 4% 以内）。**这只说明收益量级与该处空档收缩相符，不构成严格的
+端到端因果分解**：两者都是同一次运行的观测量，中位数与均值混用、以及未计入的其他项都会影响
+这笔账。
+
+任务与事件计数逐项相同，支持的结论是「每轮的任务与事件数量未变」。**「事件依赖拓扑未变」是另一个
+更强的结论，它的依据不是计数，而是代码**：`kernel_launch_sequence.h` 本次未改动，`Clear` 步骤仍在
+序列中，仅 TMR 绑定的 `memset_handshake` 回调体变为空操作。
+
+### 尚未测量
+
+- eager launch 路径的 p50/p99（上述百分位来自 decode replay）。
+- capture 图节点数的直接计数（上述为设备侧任务数，二者相关但不等同）。
+- 其他模型、shape、batch 与并发形态。
+- 以「仅保留一次 reports memset」的正确实现为基线的三方对照——该变体尚无实现，若要量化
+  epoch 协议相对最小改动的增量收益则需另建。
+
+若共享 control 读取成为热点，可另行评估每核自增旧 `report_epoch`，但它依赖每核每轮完整参与，
+不能在没有故障重同步证明时替换首版协议。
