@@ -336,6 +336,9 @@ def _fail():
     import traceback  # noqa: PLC0415
 
     traceback.print_exc()
+    # os._exit skips interpreter shutdown, so both buffers are flushed by hand or
+    # the run log loses everything the scenario printed before it failed.
+    sys.stdout.flush()
     sys.stderr.flush()
     # Failed enqueue/capture does not establish graph-visible resource quiescence.
     os._exit(1)
@@ -679,21 +682,38 @@ def _check_delayed_aicore_report(context, observer, prepare, launch, sync, io, d
         _check,
     )
 
+    round_one = [value + 1.25 for value in initial]
+    round_two = [value + 2.5 for value in initial]
+
     prepare(0)
     launch(0)
     sync(context.caller)
-    io.verify(destination, [value + 1.25 for value in initial])
+    io.verify(destination, round_one)
     _check(observer.capture_observer_check_round_epoch(1), "first successful round epoch")
+    # Each phase is flushed so a hard kill still shows how far the round got.
+    print("STEP delayed_aicore_report round1_complete epoch=1", flush=True)
 
     observer.capture_gate_arm_core()
     launch(0, scalar=2.5)
     assert observer.capture_gate_blocked() == 1, "AICore report publication was not delayed"
+    print("STEP delayed_aicore_report gate_holding_round2_aicore", flush=True)
+
+    # The round-2 AICPU task is already submitted, so the scheduler is reading a
+    # report pool whose only populated entry still carries the round-1 epoch.
+    assert observer.capture_observer_cpu_launches() == 2, (
+        f"round 2 AICPU task was not submitted before the gate: cpu_launches={observer.capture_observer_cpu_launches()}"
+    )
     _check(observer.capture_observer_check_round_epoch(1), "old report remains while next report is delayed")
+    # Accepting the stale report would open the window and let round 2 write its
+    # output; the destination still holding round-1 values shows it did not.
+    io.verify(destination, round_one)
+    print("STEP delayed_aicore_report stale_report_rejected epoch=1 output=round1", flush=True)
+
     observer.capture_gate_release()
     _check(observer.capture_gate_finish(), "release delayed AICore report")
     sync(context.caller)
     _check(observer.capture_observer_check_round_epoch(2), "second successful round epoch")
-    io.verify(destination, [value + 2.5 for value in initial])
+    io.verify(destination, round_two)
     assert observer.capture_observer_clears() == 0
     print("PASS delayed_aicore_report stale_report_present=1 rounds=2 clears=0", flush=True)
 
