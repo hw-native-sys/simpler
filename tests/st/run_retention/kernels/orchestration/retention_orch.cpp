@@ -27,14 +27,12 @@
 
 namespace {
 
-// The successor has to still be executing when the predecessor's record is
-// read, and that read costs ~11 us. The margin is what the test measures in, so
-// it is sized for the *fastest* silicon rather than for the one this was
-// developed on: 64 tasks left a2a3 ~100 us of headroom but proved too thin on
-// a5 under a loaded runner, where the successor finished before the host could
-// look. Well inside the default 16384-slot ring window, so nothing here is near
-// an admission limit, and dependency-only tasks make each one cheap.
-constexpr int32_t kTaskCount = 1024;
+// The successor must still be executing when the predecessor's record is read.
+// A short run can finish between the device's start report and the host read,
+// making the observation inconclusive. Dependency-only tasks provide a wide
+// enough window without architecture-specific kernels; 4096 tasks remain below
+// the default 16384-slot ring window.
+constexpr int32_t kTaskCount = 4096;
 
 }  // namespace
 
