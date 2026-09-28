@@ -383,18 +383,18 @@ void WorkerThread::dispatch(WorkerDispatch d) {
     }
     SubmitDispatchResult result;
     try {
-        result = submit_dispatch(d, LaneKind::ACTIVE);
+        result = submit_dispatch(d, kActiveLane);
     } catch (const std::exception &e) {
-        release_lane_unconditional(LaneKind::ACTIVE);
+        release_lane_unconditional(kActiveLane);
         complete_unpublished(d, std::string("WorkerThread::dispatch: submit failed: ") + e.what());
         return;
     } catch (...) {
-        release_lane_unconditional(LaneKind::ACTIVE);
+        release_lane_unconditional(kActiveLane);
         complete_unpublished(d, "WorkerThread::dispatch: submit failed");
         return;
     }
     if (result == SubmitDispatchResult::SUBMITTED) return;
-    release_lane_unconditional(LaneKind::ACTIVE);
+    release_lane_unconditional(kActiveLane);
     if (result == SubmitDispatchResult::STOPPING) {
         complete_unpublished(d, "WorkerThread::dispatch: worker is stopping");
     } else {
@@ -417,35 +417,34 @@ void WorkerThread::dispatch_prepared(WorkerDispatch d) {
         complete_unpublished(d, "WorkerThread::dispatch_prepared: dispatch has no run identity");
         return;
     }
-    bool staged_lane_occupied = false;
+    size_t staged_index = 0;
     {
         std::lock_guard<std::mutex> lane_lk(lane_mu_);
-        LaneState &staged = lane(LaneKind::STAGED);
-        if (staged.occupied) {
-            staged_lane_occupied = true;
-        } else {
+        staged_index = free_staged_lane_locked();
+        if (staged_index < lanes_.size()) {
+            LaneState &staged = lane_at(staged_index);
             staged.occupied = true;
             staged.run_id = slot->run_id;
         }
     }
-    if (staged_lane_occupied) {
-        complete_unpublished(d, "WorkerThread::dispatch_prepared: worker already owns a staged run");
+    if (staged_index >= lanes_.size()) {
+        complete_unpublished(d, "WorkerThread::dispatch_prepared: worker has no free staged lane");
         return;
     }
     SubmitDispatchResult result;
     try {
-        result = submit_dispatch(d, LaneKind::STAGED, slot->run_id);
+        result = submit_dispatch(d, staged_index, slot->run_id);
     } catch (const std::exception &e) {
-        release_lane_unconditional(LaneKind::STAGED);
+        release_lane_unconditional(staged_index);
         complete_unpublished(d, std::string("WorkerThread::dispatch_prepared: submit failed: ") + e.what());
         return;
     } catch (...) {
-        release_lane_unconditional(LaneKind::STAGED);
+        release_lane_unconditional(staged_index);
         complete_unpublished(d, "WorkerThread::dispatch_prepared: submit failed");
         return;
     }
     if (result == SubmitDispatchResult::SUBMITTED) return;
-    release_lane_unconditional(LaneKind::STAGED);
+    release_lane_unconditional(staged_index);
     if (result == SubmitDispatchResult::STOPPING) {
         complete_unpublished(d, "WorkerThread::dispatch_prepared: worker is stopping");
     } else if (result == SubmitDispatchResult::CAPACITY_EXCEEDED) {
@@ -456,7 +455,7 @@ void WorkerThread::dispatch_prepared(WorkerDispatch d) {
 }
 
 WorkerThread::SubmitDispatchResult
-WorkerThread::submit_dispatch(WorkerDispatch d, LaneKind lane_kind, RunId expected_run_id) {
+WorkerThread::submit_dispatch(WorkerDispatch d, size_t lane_index, RunId expected_run_id) {
 #if SIMPLER_HOST_STRACE
     const bool trace_enabled = simpler::host_trace::enabled();
     const int64_t trace_start_ns = trace_enabled ? simpler::host_trace::now_ns() : 0;
@@ -471,7 +470,7 @@ WorkerThread::submit_dispatch(WorkerDispatch d, LaneKind lane_kind, RunId expect
     d.dispatch_id = next_dispatch_id_;
     {
         std::lock_guard<std::mutex> lane_lk(lane_mu_);
-        LaneState &dispatch_lane = lane(lane_kind);
+        LaneState &dispatch_lane = lane_at(lane_index);
         if (!dispatch_lane.occupied || dispatch_lane.dispatch_id != 0 ||
             (expected_run_id != INVALID_RUN_ID && dispatch_lane.run_id != expected_run_id)) {
             return SubmitDispatchResult::STAGED_IDENTITY_CHANGED;
@@ -518,10 +517,10 @@ bool WorkerThread::activate_prepared(RunId run_id) {
     if (shutdown_.load(std::memory_order_acquire)) return false;
     std::lock_guard<std::mutex> lane_lk(lane_mu_);
     LaneState &active = lane(LaneKind::ACTIVE);
-    LaneState &staged = lane(LaneKind::STAGED);
-    if (!staged.occupied || staged.run_id != run_id || staged.dispatch_id == 0 || active.occupied) {
-        return false;
-    }
+    const size_t staged_index = staged_lane_of_locked(run_id);
+    if (staged_index >= lanes_.size() || active.occupied) return false;
+    LaneState &staged = lane_at(staged_index);
+    if (staged.dispatch_id == 0) return false;
     active = staged;
     active.activation_requested = true;
     staged = {};
@@ -533,8 +532,10 @@ bool WorkerThread::authorize_staged_launch(RunId run_id) {
     std::lock_guard<std::mutex> admission_lk(admission_mu_);
     if (shutdown_.load(std::memory_order_acquire)) return false;
     std::lock_guard<std::mutex> lane_lk(lane_mu_);
-    LaneState &staged = lane(LaneKind::STAGED);
-    if (!staged.occupied || staged.run_id != run_id || staged.dispatch_id == 0) return false;
+    const size_t staged_index = staged_lane_of_locked(run_id);
+    if (staged_index >= lanes_.size()) return false;
+    LaneState &staged = lane_at(staged_index);
+    if (staged.dispatch_id == 0) return false;
     // Only a natively prepared frame holds work that can be ordered behind
     // another run. A validated-only one fell back to depth one at the child, and
     // a frame whose staging has not been observed yet has said nothing at all;
@@ -547,14 +548,13 @@ bool WorkerThread::authorize_staged_launch(RunId run_id) {
 
 bool WorkerThread::has_staged_run(RunId run_id) const {
     std::lock_guard<std::mutex> lane_lk(lane_mu_);
-    const LaneState &staged = lane(LaneKind::STAGED);
-    return staged.occupied && staged.run_id == run_id;
+    return staged_lane_of_locked(run_id) < lanes_.size();
 }
 
 bool WorkerThread::can_stage() const {
     std::lock_guard<std::mutex> lane_lk(lane_mu_);
     const WorkerEndpointCaps &endpoint_caps = caps();
-    return endpoint_caps.supports_frame_staging && !lane(LaneKind::STAGED).occupied &&
+    return endpoint_caps.supports_frame_staging && free_staged_lane_locked() < lanes_.size() &&
            inflight_.load(std::memory_order_acquire) < endpoint_caps.max_inflight_tasks;
 }
 
@@ -563,15 +563,15 @@ bool WorkerThread::idle() const {
     return !lane(LaneKind::ACTIVE).occupied;
 }
 
-void WorkerThread::release_lane(LaneKind kind, uint64_t dispatch_id) {
+void WorkerThread::release_lane(size_t lane_index, uint64_t dispatch_id) {
     std::lock_guard<std::mutex> lane_lk(lane_mu_);
-    LaneState &dispatch_lane = lane(kind);
+    LaneState &dispatch_lane = lane_at(lane_index);
     if (dispatch_lane.dispatch_id == dispatch_id) dispatch_lane = {};
 }
 
-void WorkerThread::release_lane_unconditional(LaneKind kind) {
+void WorkerThread::release_lane_unconditional(size_t lane_index) {
     std::lock_guard<std::mutex> lane_lk(lane_mu_);
-    lane(kind) = {};
+    lane_at(lane_index) = {};
 }
 
 void WorkerThread::complete_unpublished(WorkerDispatch dispatch, const std::string &error_message) {
@@ -612,11 +612,13 @@ void WorkerThread::progress() {
         endpoint_->request_progress_stop();
     }
 
-    // Both lanes, oldest first. Only the active lane can hold an activation
+    // Every lane, oldest first. Only the active lane can hold an activation
     // while the launch depth is one; above it, a staged run authorized to
     // launch early keeps its own lane — the predecessor still owns the active
-    // one — so its activation has to be published from there.
-    std::array<RunId, 2> activate{INVALID_RUN_ID, INVALID_RUN_ID};
+    // one — so its activation has to be published from there, and so does the
+    // one behind it when the depth allows a third.
+    std::array<RunId, PTO_PIPELINE_MAX_DEPTH> activate{};
+    activate.fill(INVALID_RUN_ID);
     {
         std::lock_guard<std::mutex> admission_lk(admission_mu_);
         if (!shutdown_.load(std::memory_order_acquire)) {
@@ -692,9 +694,9 @@ void WorkerThread::finish_progress_dispatch(const WorkerEndpointProgress &progre
         // Recording the disposition here is what lets the authorization refuse.
         {
             std::lock_guard<std::mutex> lane_lk(lane_mu_);
-            LaneState &staged = lane(LaneKind::STAGED);
-            if (staged.occupied && staged.dispatch_id == dispatch.dispatch_id) {
-                staged.preparation_disposition = progress.preparation_disposition;
+            const size_t staged_index = staged_lane_for_dispatch_locked(dispatch.dispatch_id);
+            if (staged_index < lanes_.size()) {
+                lane_at(staged_index).preparation_disposition = progress.preparation_disposition;
             }
         }
         // Announced because this is one of the two orders in which a staged run
@@ -1019,16 +1021,31 @@ bool LocalMailboxEndpoint::poll_progress(WorkerEndpointProgress &progress) {
                 (void)try_publish_activation(record, frame);
                 if (endpoint_poisoned_) break;
             }
-            if (!record.staged_reported) {
-                int32_t disposition_value = 0;
-                std::memcpy(&disposition_value, frame + MAILBOX_OFF_PREPARATION_DISPOSITION, sizeof(disposition_value));
-                const auto disposition = static_cast<MailboxPreparationDisposition>(disposition_value);
-                if (disposition != MailboxPreparationDisposition::VALIDATED_ONLY &&
-                    disposition != MailboxPreparationDisposition::NATIVE_PREPARED) {
-                    poison_progress("invalid preparation disposition at endpoint staging");
-                    break;
-                }
+            int32_t disposition_value = 0;
+            __atomic_load(
+                reinterpret_cast<const int32_t *>(frame + MAILBOX_OFF_PREPARATION_DISPOSITION), &disposition_value,
+                __ATOMIC_ACQUIRE
+            );
+            const auto disposition = static_cast<MailboxPreparationDisposition>(disposition_value);
+            if (disposition != MailboxPreparationDisposition::VALIDATED_ONLY &&
+                disposition != MailboxPreparationDisposition::NATIVE_PREPARED) {
+                poison_progress("invalid preparation disposition at endpoint staging");
+                break;
+            }
+            // Reported once when the frame stages, and once more if that staged run is *later*
+            // prepared natively: a run staged behind a predecessor that had not launched yet is
+            // validated-only at that instant and holds native preparation only after the
+            // predecessor reaches the device. The child publishes that promotion by writing this
+            // word alone — never the state word, which only this endpoint's exchange above moves
+            // out of FRAME_STAGED — so reporting the change is what keeps the run from waiting for
+            // ordinary promotion instead of the authorization it has earned. Only ever a
+            // promotion: the reverse direction would be a stale read, and is refused.
+            const bool promoted = record.staged_reported &&
+                                  record.reported_disposition == MailboxPreparationDisposition::VALIDATED_ONLY &&
+                                  disposition == MailboxPreparationDisposition::NATIVE_PREPARED;
+            if (!record.staged_reported || promoted) {
                 record.staged_reported = true;
+                record.reported_disposition = disposition;
                 progress.kind = WorkerProgressKind::FRAME_STAGED;
                 progress.dispatch = record.dispatch;
                 progress.preparation_disposition = disposition;

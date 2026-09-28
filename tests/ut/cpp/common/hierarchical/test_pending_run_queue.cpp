@@ -135,11 +135,13 @@ constexpr std::chrono::seconds kHookParkBound{30};
 // two is prepared.
 //
 // That they hold no native lease is not read out of the pool; it follows from
-// the pool having two slots and both being demonstrably held elsewhere — run
-// one is dispatchable and run two preparable, and neither predicate is
-// satisfiable without a lease.
+// this harness configuring a two-slot pool and both slots being demonstrably
+// held elsewhere — run one is dispatchable and run two preparable, and neither
+// predicate is satisfiable without a lease. The configured depth is what bounds
+// the leases, not the compile-time ceiling, which only has to be wide enough to
+// hold it.
 TEST(PendingQueue, ThirdAndFourthRunsBuildWithoutTakingNativeLeases) {
-    static_assert(PTO_PIPELINE_MAX_DEPTH == 2, "this test reasons from a two-slot native pool");
+    static_assert(PTO_PIPELINE_MAX_DEPTH >= 2, "this test reasons from a two-slot native pool");
     PendingQueueHarness h(/*depth=*/2, /*pending_depth=*/4);
 
     auto first = h.build_closed_run(0xE001);

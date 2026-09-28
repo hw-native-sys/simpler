@@ -205,6 +205,27 @@ public:
     RunId preparable_run_id() const;
 
     /**
+     * Every FIFO successor that may be prepared beside the active run, in order.
+     *
+     * The same test `preparable_run_id` applies to the first successor, applied
+     * to each one behind it as well: a run is prepared beside the run ahead of
+     * it, so the list stops at the first successor that is not yet PREPARED or
+     * holds no lease. At a granted capacity of two it holds at most the one id
+     * `preparable_run_id` reports.
+     */
+    std::vector<RunId> preparable_run_ids() const;
+
+    /**
+     * Every staged successor authorized to launch early, in FIFO order.
+     *
+     * Each entry needs every run ahead of it to have had all of its dispatches
+     * accepted, and itself to be PREPARED with a lease; the list is bounded by
+     * the configured launch depth. At depth two it holds at most the one id
+     * `early_launch_run_id` reports.
+     */
+    std::vector<RunId> early_launch_run_ids() const;
+
+    /**
      * The staged successor authorized to launch its device work while the
      * active run is still executing, or INVALID_RUN_ID when there is none.
      *
@@ -291,12 +312,17 @@ private:
     std::condition_variable runs_cv_;
     std::unordered_map<RunId, std::shared_ptr<RunState>> runs_;
     std::deque<RunId> run_fifo_;
+    // The standing default, not the layout ceiling: an Orchestrator nobody
+    // configured admits what every Orchestrator admitted before the count
+    // could be requested. `configure_pipeline_depth` is what carries a granted
+    // capacity here, and the pool is sized to the ceiling so that call can
+    // raise the admission bound without rebuilding it.
     PipelineSlotPool pipeline_slots_{PTO_PIPELINE_MAX_DEPTH};
-    uint32_t admission_depth_{PTO_PIPELINE_MAX_DEPTH};
+    uint32_t admission_depth_{kDefaultRunResourceSets};
     // How many non-terminal runs `run_fifo_` may hold. Derived from
     // `admission_depth_` unless a caller configured it, so the default admits
     // exactly the runs a lease was available for before the two budgets split.
-    uint32_t pending_run_limit_{PTO_PIPELINE_MAX_DEPTH};
+    uint32_t pending_run_limit_{kDefaultRunResourceSets};
     // How many runs may have their device work launched at once. One is the
     // serial behaviour, and at one nothing below reads
     // `early_launch_run_id_`, which stays invalid.

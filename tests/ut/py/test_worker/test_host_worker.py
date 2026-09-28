@@ -229,8 +229,20 @@ def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
             enable_sdma=False,
             collect_across_runs=False,
             manage_workspace=False,
+            requested_pipeline_depth=0,
         ):
-            events.append(("init", device_id, bins, log_level, prewarm_config, enable_sdma, collect_across_runs))
+            events.append(
+                (
+                    "init",
+                    device_id,
+                    bins,
+                    log_level,
+                    prewarm_config,
+                    enable_sdma,
+                    collect_across_runs,
+                    requested_pipeline_depth,
+                )
+            )
 
         def finalize(self) -> None:
             events.append(("finalize",))
@@ -266,7 +278,9 @@ def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
         shm.close()
         shm.unlink()
 
-    assert events[0] == ("init", 7, "bins", 25, None, False, False)
+    # A chip child asked for no particular capacity passes zero through, which is what makes the
+    # grant the runtime's standing default rather than its published maximum.
+    assert events[0] == ("init", 7, "bins", 25, None, False, False, 0)
     assert events[1][0] == "main_loop"
     assert events[1][2:] == ("a2a3", "tensormap_and_ringbuffer")
     assert events[2] == ("finalize",)

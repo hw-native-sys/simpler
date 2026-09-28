@@ -143,6 +143,16 @@ _DEVICE_SPIN_ITERS = 200_000_000
 _REFILL_SPIN_ITERS = 40_000_000
 _SIZE = 128 * 128
 _FRAME_COUNT = 2
+# The frames a three-set endpoint negotiates. Only the class that requests three sets reads this
+# many: at the default request the third frame is never published to.
+_THREE_FRAMES = 3
+# Per-run spin for the three-set refill case. Longer than the depth-two refill's, because a triple
+# needs a wider window than a pair: the third run's launch waits for the *second* run's boundary to
+# be published, so each run has to outlast two admissions rather than one. Measured on a2a3, where
+# the shorter spin left no instant with three runs launched at once.
+_THREE_RUN_REFILL_SPIN_ITERS = _DEVICE_SPIN_ITERS // 2
+# Consecutive submissions the refill case makes, as the capacity contract states it.
+_REFILL_RUNS = 16
 # How long to keep draining the children's log files after their runs have finished. The writers
 # are asynchronous, so this covers the lag between a record being accepted and written — not the
 # run itself, which has already been waited for. Exhausting it is an absence, and the caller's
@@ -193,8 +203,13 @@ def _chip_args(handles, orch_signature, *scalars):
     return args
 
 
-def _frames(worker):
-    """Each task frame's ``(address, buffer)``, for identity-carrying reads."""
+def _frames(worker, count=_FRAME_COUNT):
+    """Each task frame's ``(address, buffer)``, for identity-carrying reads.
+
+    ``count`` is how many frames this Worker's endpoint negotiated. The mailbox is laid out for
+    the ceiling, so reading past the negotiated count would sample a frame the parent never
+    publishes to.
+    """
     shm_buf = worker._chip_shms[0].buf  # noqa: SLF001 -- white-box mailbox observation
     assert shm_buf is not None
     mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(shm_buf))
@@ -203,7 +218,7 @@ def _frames(worker):
             mailbox_addr + (1 + index) * MAILBOX_FRAME_SIZE,
             shm_buf[(1 + index) * MAILBOX_FRAME_SIZE : (2 + index) * MAILBOX_FRAME_SIZE],
         )
-        for index in range(_FRAME_COUNT)
+        for index in range(count)
     ]
 
 
@@ -223,14 +238,34 @@ def _coherent_snapshot(frames):
     return [(identity, state, accepted) for identity, (state, accepted) in zip(after, samples)]
 
 
-def _two_distinct_runs_launched(snapshot):
-    """Whether the snapshot holds two different runs, both launched and both accepted."""
-    if snapshot is None:
+def _all_distinct_runs_launched(snapshot, expected):
+    """Whether the snapshot holds `expected` different runs, all launched and all accepted."""
+    if snapshot is None or len(snapshot) != expected:
         return False
     if not all(state == _TASK_LAUNCHED and accepted == _TASK_ACCEPTED for _, state, accepted in snapshot):
         return False
     identities = {identity for identity, _, _ in snapshot}
-    return len(identities) == _FRAME_COUNT
+    return len(identities) == expected
+
+
+def _two_distinct_runs_launched(snapshot):
+    """Whether the snapshot holds two different runs, both launched and both accepted."""
+    return _all_distinct_runs_launched(snapshot, _FRAME_COUNT)
+
+
+def _launched_run_keys(snapshot):
+    """The keys of every run a snapshot shows launched and accepted, or None when it is unusable."""
+    if snapshot is None:
+        return None
+    keys = set()
+    for identity, state, accepted in snapshot:
+        if state != _TASK_LAUNCHED or accepted != _TASK_ACCEPTED:
+            continue
+        key = _run_key(identity)
+        if key is None:
+            return None
+        keys.add(key)
+    return keys
 
 
 def _run_key(identity):
@@ -610,6 +645,24 @@ def _device_execution_order(trace, records, case_runs):
             bucket = ordered if behind["start"] >= ahead["end"] else overlapping
             bucket.add(pair)
     return ordered, overlapping, unmeasured
+
+
+def _chain_pairs(pairs):
+    """The pairs that form a path `a -> b -> c`, or an empty set when none do.
+
+    Two adjacent orderings over three runs are what makes a three-deep sequence provably serial:
+    one pair alone leaves the third run unplaced.
+    """
+    by_predecessor: dict = {}
+    for predecessor, successor in pairs:
+        by_predecessor.setdefault(predecessor, set()).add(successor)
+    chained = set()
+    for predecessor, successors in by_predecessor.items():
+        for successor in successors:
+            for tail in by_predecessor.get(successor, ()):
+                chained.add((predecessor, successor))
+                chained.add((successor, tail))
+    return chained
 
 
 def _chained(pairs):
@@ -1168,6 +1221,300 @@ class TestDeviceResultChain(_EarlyEnqueueBase):
             stop.set()
             sampler.join(timeout=5.0)
             _release_chain_buffers(worker, handles, intermediates)
+
+
+@scene_test(level=3, runtime="host_build_graph")
+class TestThreeRunCapacity(_EarlyEnqueueBase):
+    """At ``pipeline_depth=3`` a third run reaches the device while the first is still executing.
+
+    ``launch_depth`` alone cannot produce this: a launched run holds its resource set for its whole
+    life, so with two sets the third submission waits for a retirement however deep the launch
+    budget is. Requesting three sets is what lets the third run be prepared and accepted, and the
+    device still runs one whole operator at a time — each launch is queued behind the boundary of
+    the run immediately ahead of it.
+
+    What each check can see:
+
+    accepted   three different runs were observed launched and accepted at one instant, read from
+               a coherent mailbox snapshot, while none of them had finished.
+    ordered    the whole-operator boundaries of the pairs the children recorded do not overlap and
+               follow submission order, so three accepted runs did not become three concurrent
+               operators.
+    distinct   every run's own output is correct, so the three sets held three runs' parameters,
+               graphs and results rather than sharing any of them.
+    refilled   a run submitted after the first retired was itself observed launched alongside two
+               others, which is the freed set carrying a later run rather than one opening window.
+    """
+
+    CASES = [
+        {
+            "name": "three_run_capacity",
+            "platforms": ["a2a3"],
+            "config": {
+                "device_count": 1,
+                "num_sub_workers": 0,
+                "launch_depth": 3,
+                "pipeline_depth": 3,
+            },
+            "params": {},
+        },
+    ]
+
+    def _run_and_validate_l3(self, worker, compiled_callables, sub_handles, case, **kwargs):
+        del kwargs
+        type(self)._st_chip_handles = compiled_callables
+        type(self)._st_sub_handles = sub_handles
+        assert str(worker._config["platform"]) in case["platforms"]  # noqa: SLF001 -- scene-test validation
+        self._require_three_sets(worker)
+        self.test_three_runs_are_launched_and_accepted_at_once("a2a3", worker)
+
+    @staticmethod
+    def _require_three_sets(worker):
+        # Both paths give this class its own Worker: pytest builds one per class, and the
+        # standalone path partitions its groups by requested capacity. A Worker here at any other
+        # budget means this case is reading a Worker that is not the one it asked for.
+        assert worker._launch_depth == 3, (  # noqa: SLF001 -- scene-test validation
+            f"this class needs a Worker at launch_depth=3, got {worker._launch_depth}"  # noqa: SLF001
+        )
+        assert worker._pipeline_depth_request == 3, (  # noqa: SLF001 -- scene-test validation
+            f"this class needs a Worker at pipeline_depth=3, got {worker._pipeline_depth_request}"  # noqa: SLF001
+        )
+
+    def _observe_three_launched_runs(self, worker, timeout, case_runs):
+        """Watch for three different runs launched and accepted at once.
+
+        Returns the keys of the runs seen together, or None when the window closed without three
+        of them ever being visible at one instant. Every sampled frame's runs are recorded in
+        ``case_runs`` so the ordering records can be held to this case's own runs.
+        """
+        frames = _frames(worker, _THREE_FRAMES)
+        deadline = time.monotonic() + timeout
+        saw_any_launched = False
+        while time.monotonic() < deadline:
+            snapshot = _coherent_snapshot(frames)
+            case_runs.note(snapshot)
+            if _all_distinct_runs_launched(snapshot, _THREE_FRAMES):
+                return _launched_run_keys(snapshot)
+            if snapshot is not None:
+                launched = any(state == _TASK_LAUNCHED for _, state, _ in snapshot)
+                if launched:
+                    saw_any_launched = True
+                elif saw_any_launched:
+                    return None
+            time.sleep(0.001)
+        raise AssertionError(f"no run stayed launched long enough to sample within {timeout}s")
+
+    def _submit_three(self, worker, output_prefix, spin_iters, handles, buffers):
+        """Three runs with no wait between them, each with its own buffers and expectation.
+
+        ``handles`` and ``buffers`` belong to the caller and are appended to as each run is made,
+        so a submission that fails part way still leaves the caller holding every run already in
+        flight and the memory those runs are reading.
+        """
+        tensors = []
+        for value in (2.0, 3.0, 0.0, 5.0, 7.0, 0.0, 11.0, 13.0, 0.0):
+            buffer, tensor = self._tensor_from_host_buffer(worker, value)
+            buffers.append(buffer)
+            tensors.append(tensor)
+        expectations = []
+        for index in range(3):
+            group = buffers[index * 3 : index * 3 + 3]
+            a, b, out = tensors[index * 3 : index * 3 + 3]
+            expectations.append((out, self._expected(a, b)))
+            handles.append(self._submit_vector(worker, group, output_prefix, spin_iters=spin_iters))
+            if index == 0:
+                _wait_for_one_launched_frame(worker, 20.0)
+        return expectations
+
+    def test_three_runs_are_launched_and_accepted_at_once(self, st_platform, st_worker):
+        """Three accepted submissions, one device order, three correct results."""
+        if st_platform != "a2a3":
+            pytest.skip("three-run capacity is gated to a2a3 onboard host_build_graph")
+        self._require_three_sets(st_worker)
+        trace = _RunTrace(st_worker)
+        case_runs = _CaseRuns(_frames(st_worker, _THREE_FRAMES))
+        with tempfile.TemporaryDirectory(prefix="simpler-three-run-") as output_prefix:
+            # Held by this scope, not by the helper: a submission that fails after making one or
+            # two of the runs still leaves them drainable here, with their arguments alive.
+            handles: list = []
+            buffers: list = []
+            expectations: list = []
+            try:
+                expectations = self._submit_three(st_worker, output_prefix, _DEVICE_SPIN_ITERS, handles, buffers)
+                together = self._observe_three_launched_runs(st_worker, 60.0, case_runs)
+            finally:
+                # Before anything of this case's leaves scope, whatever the submission or the
+                # observation did: a run still in flight owns its arguments and its output buffer,
+                # and the temporary output directory is this case's too.
+                drain_failures = _drain_handles(handles, "three-run window")
+            # Reached only with no primary error, so these have nothing to hide behind.
+            assert not drain_failures, f"a run of this case did not finish: {drain_failures}"
+            for out, expected in expectations:
+                torch.testing.assert_close(out, expected)
+
+            assert together is not None, (
+                "three different runs were never observed launched and accepted at the same time, so a third "
+                "resource set never carried a run"
+            )
+            assert len(together) == _THREE_FRAMES, f"fewer than three runs were named together: {sorted(together)}"
+
+            # What the device then did with the pairs the children recorded: the ordering edge is
+            # the same one the two-run case reads, and three accepted runs must not have become
+            # three concurrent operators.
+            records: list[dict] = []
+            _await_records(
+                trace,
+                records,
+                _EVIDENCE_BUDGET_S,
+                lambda seen: len(_chain_pairs(_non_overlapping_whole_operator_pairs(trace, seen, case_runs))) >= 2,
+            )
+            assert records, (
+                f"no joined-launch record reached this process from children {trace.pids}, so nothing carried "
+                f"the ordering of the three accepted runs"
+            )
+            ordered, overlapping, within_tick, unmeasured = _whole_operator_order(trace, records, case_runs)
+            assert not overlapping, (
+                f"a joined successor's AICore stream was released before its predecessor's whole operator had "
+                f"finished: {sorted(overlapping)}; {_boundary_detail(trace, overlapping)}"
+            )
+            # Both adjacent pairs, not just one: three accepted runs are only proved serial if the
+            # second was ordered behind the first *and* the third behind the second. `_chained`
+            # keeps the pairs that form that path, so two of them over three runs is the chain.
+            non_overlapping = ordered | within_tick
+            chain = _chain_pairs(non_overlapping)
+            assert len(chain) >= 2, (
+                f"the three accepted runs were not shown ordered end to end: chained={sorted(chain)}, "
+                f"comparable={sorted(non_overlapping)}, unmeasured={sorted(unmeasured)}; "
+                f"{_boundary_detail(trace, _established_pairs(records, case_runs))}"
+            )
+            assert len({key for pair in chain for key in pair}) == _THREE_FRAMES, (
+                f"the ordered chain does not span all three runs: chained={sorted(chain)}"
+            )
+
+    def test_sixteen_runs_keep_refilling_the_sets_they_retire(self, st_platform, st_worker):
+        """Sixteen consecutive submissions that keep all three sets occupied as they turn over.
+
+        Correct results alone would pass under ordinary serial execution, so they are not the
+        evidence. What is:
+
+        three-deep  some instant showed three different runs launched and accepted at once, so the
+                    third set carried a run rather than standing idle.
+        sustained   that happened again later in the sequence, over a strictly higher frontier of
+                    dispatch ids — a run admitted after earlier ones had gone. One opening triple
+                    says the depth was reached once; a later one says it is being refilled.
+        ordered     no resource set was ever seen carrying a *lower* dispatch id than one it had
+                    already carried, so a set passes from one run to a later-submitted one.
+        distinct    every one of the sixteen runs produced its own output.
+
+        No count here bounds concurrency from above: the mailbox this reads has three frames, so
+        a fourth simultaneous run would not be visible in it at all.
+
+        What the reuse observation is: the mailbox showing a set under a second run's identity.
+        That is a physical observation of the set being handed on, and the production path only
+        hands it on after the earlier run's lifetime closed — but this case reads the handover, it
+        does not witness each step of that closure.
+        """
+        if st_platform != "a2a3":
+            pytest.skip("three-run capacity is gated to a2a3 onboard host_build_graph")
+        self._require_three_sets(st_worker)
+        case_runs = _CaseRuns(_frames(st_worker, _THREE_FRAMES))
+        frames = _frames(st_worker, _THREE_FRAMES)
+        # Every distinct set of three runs seen launched together, in the order first seen; the
+        # dispatch ids each resource set was seen carrying, in the order they appeared; and the
+        # widest set of runs ever launched at one instant.
+        triples: list[frozenset] = []
+        dispatches_by_slot: dict[int, list[int]] = {}
+        widest = 0
+        stop = threading.Event()
+
+        def sample():
+            nonlocal widest
+            while not stop.is_set():
+                snapshot = _coherent_snapshot(frames)
+                case_runs.note(snapshot)
+                keys = _launched_run_keys(snapshot)
+                if keys:
+                    widest = max(widest, len(keys))
+                    for dispatch_id, slot_id in keys:
+                        seen = dispatches_by_slot.setdefault(slot_id, [])
+                        if not seen or seen[-1] != dispatch_id:
+                            seen.append(dispatch_id)
+                    if len(keys) == _THREE_FRAMES:
+                        triple = frozenset(keys)
+                        if triple not in triples:
+                            triples.append(triple)
+                time.sleep(0.001)
+
+        sampler = threading.Thread(target=sample, daemon=True)
+        sampler.start()
+        handles: list = []
+        buffers: list = []
+        try:
+            with tempfile.TemporaryDirectory(prefix="simpler-three-run-refill-") as output_prefix:
+                expectations = []
+                try:
+                    for index in range(_REFILL_RUNS):
+                        tensors = []
+                        group = []
+                        for value in (float(index + 2), float(index + 3), 0.0):
+                            buffer, tensor = self._tensor_from_host_buffer(st_worker, value)
+                            buffers.append(buffer)
+                            group.append(buffer)
+                            tensors.append(tensor)
+                        a, b, out = tensors
+                        expectations.append((out, self._expected(a, b)))
+                        handles.append(
+                            self._submit_vector(
+                                st_worker, group, output_prefix, spin_iters=_THREE_RUN_REFILL_SPIN_ITERS
+                            )
+                        )
+                finally:
+                    # Every submitted run is drained before this case's buffers or its output
+                    # directory leave scope, whether the loop finished or a submission failed
+                    # part way.
+                    drain_failures = _drain_handles(handles, "sixteen-run refill")
+                # Reached only with no primary error, so these have nothing to hide behind.
+                assert not drain_failures, f"a run of this case did not finish: {drain_failures}"
+                for out, expected in expectations:
+                    torch.testing.assert_close(out, expected)
+        finally:
+            stop.set()
+            sampler.join(timeout=5.0)
+
+        assert len(handles) == _REFILL_RUNS, f"only {len(handles)} of {_REFILL_RUNS} runs were submitted"
+        assert widest == _THREE_FRAMES, (
+            f"the widest instant held {widest} launched run(s), so three runs were never in flight over the "
+            f"three sets this Worker was granted: per-set dispatch ids {dispatches_by_slot}"
+        )
+        frontiers = [max(dispatch_id for dispatch_id, _ in triple) for triple in triples]
+        assert len(triples) >= 2 and max(frontiers) > min(frontiers), (
+            f"three runs were never seen in flight together a second time over later identities, so the third "
+            f"set was filled once rather than refilled: frontiers={frontiers}, "
+            f"triples={[sorted(triple) for triple in triples]}"
+        )
+        regressed = {slot: ids for slot, ids in dispatches_by_slot.items() if ids != sorted(ids)}
+        assert not regressed, (
+            f"a resource set was seen carrying an earlier run after a later one, so the sets are not passing "
+            f"from one run to its successor: {regressed}"
+        )
+
+
+def _drain_handles(handles, what):
+    """Wait for every submitted run before the caller's resources leave scope.
+
+    Each is waited for independently and no failure is raised from here, so a run that failed
+    cannot replace the caller's own finding while the caller is unwinding. The failures are
+    returned instead: a caller that reaches its normal end with a non-empty list has no primary
+    error to preserve and must report these itself.
+    """
+    failures = []
+    for handle in handles:
+        try:
+            handle.wait()
+        except Exception as error:  # noqa: BLE001 -- must not replace the caller's failure
+            failures.append(str(error))
+            print(f"[{what} cleanup] a run did not finish: {error}")
+    return failures
 
 
 def _release_chain_buffers(worker, handles, intermediates):

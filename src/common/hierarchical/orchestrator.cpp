@@ -179,13 +179,18 @@ bool Orchestrator::refresh_leases_locked() {
     if (head == runs_.end()) return assigned;
     if (is_terminal(head->second->phase.load(std::memory_order_acquire))) return assigned;
     if (!acquire_lease_locked(head->second, &assigned)) return assigned;
-    if (run_fifo_.size() < 2) return assigned;
-    auto successor = runs_.find(run_fifo_[1]);
-    if (successor == runs_.end()) return assigned;
-    // Only a closed successor can be prepared, the same condition
-    // `preparable_run_id` reports on.
-    if (successor->second->phase.load(std::memory_order_acquire) != RunPhase::PREPARED) return assigned;
-    (void)acquire_lease_locked(successor->second, &assigned);
+    // Then the runs behind it, in FIFO order, for as many leases as the pool holds. The head is
+    // leased first because a successor's preparation is judged against the run ahead of it, and
+    // the walk stops at the first run that cannot take one: a lease handed past a run that has
+    // none would let a successor prepare against a predecessor the device does not yet own.
+    for (size_t index = 1; index < run_fifo_.size(); ++index) {
+        auto successor = runs_.find(run_fifo_[index]);
+        if (successor == runs_.end()) return assigned;
+        // Only a closed successor can be prepared, the same condition
+        // `preparable_run_id` reports on.
+        if (successor->second->phase.load(std::memory_order_acquire) != RunPhase::PREPARED) return assigned;
+        if (!acquire_lease_locked(successor->second, &assigned)) return assigned;
+    }
     return assigned;
 }
 
@@ -421,6 +426,49 @@ RunId Orchestrator::dispatchable_run_id() const {
 RunId Orchestrator::active_run_id() const {
     std::lock_guard<std::mutex> lk(runs_mu_);
     return active_run_id_;
+}
+
+std::vector<RunId> Orchestrator::preparable_run_ids() const {
+    std::lock_guard<std::mutex> lk(runs_mu_);
+    std::vector<RunId> ids;
+    if (!dispatchable_locked(active_run_id_) || run_fifo_.size() < 2 || run_fifo_.front() != active_run_id_) {
+        return ids;
+    }
+    // FIFO order, stopping at the first run that cannot be prepared: a run is
+    // prepared beside the one ahead of it, so nothing behind an unprepared run
+    // is preparable either.
+    for (size_t index = 1; index < run_fifo_.size(); ++index) {
+        auto it = runs_.find(run_fifo_[index]);
+        if (it == runs_.end()) break;
+        if (it->second->phase.load(std::memory_order_acquire) != RunPhase::PREPARED) break;
+        if (!pipeline_slots_.owns(it->second->lease)) break;
+        ids.push_back(it->first);
+    }
+    return ids;
+}
+
+std::vector<RunId> Orchestrator::early_launch_run_ids() const {
+    std::lock_guard<std::mutex> lk(runs_mu_);
+    std::vector<RunId> ids;
+    if (launch_depth_ < 2) return ids;
+    if (!dispatchable_locked(active_run_id_) || run_fifo_.size() < 2 || run_fifo_.front() != active_run_id_) {
+        return ids;
+    }
+    // A run may be authorized only once every run ahead of it has had all of
+    // its dispatches accepted: that is what makes the predecessor's work whole
+    // to be ordered behind. The walk stops at the first run that fails either
+    // test, so an authorization never skips a run.
+    for (size_t index = 0; index + 1 < run_fifo_.size() && ids.size() + 1 < launch_depth_; ++index) {
+        auto predecessor = runs_.find(run_fifo_[index]);
+        if (predecessor == runs_.end() || !all_dispatches_accepted(predecessor->second)) break;
+        auto candidate = runs_.find(run_fifo_[index + 1]);
+        if (candidate == runs_.end()) break;
+        const std::shared_ptr<RunState> &successor = candidate->second;
+        if (successor->phase.load(std::memory_order_acquire) != RunPhase::PREPARED) break;
+        if (!pipeline_slots_.owns(successor->lease)) break;
+        ids.push_back(successor->id);
+    }
+    return ids;
 }
 
 RunId Orchestrator::preparable_run_id() const {

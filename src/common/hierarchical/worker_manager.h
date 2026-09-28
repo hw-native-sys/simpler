@@ -96,11 +96,11 @@ bool mailbox_compare_exchange_state(char *frame, MailboxState expected, MailboxS
 // static_assert after MAILBOX_ARGS_CAPACITY). At the 256-tensor cap, wire tensors
 // occupy 36 KiB of the 64 KiB frame and leave room for scalars and protocol metadata.
 static constexpr size_t MAILBOX_FRAME_SIZE = 65536;
-static constexpr size_t MAILBOX_TASK_FRAME_COUNT = 2;
+static constexpr size_t MAILBOX_TASK_FRAME_COUNT = PTO_PIPELINE_MAX_DEPTH;
 static constexpr size_t MAILBOX_CONTROL_FRAME = 0;
 static constexpr size_t MAILBOX_FIRST_TASK_FRAME = 1;
 static constexpr size_t MAILBOX_SIZE = MAILBOX_FRAME_SIZE * (1 + MAILBOX_TASK_FRAME_COUNT);
-static constexpr uint32_t MAILBOX_TASK_PROTOCOL_VERSION = 5;
+static constexpr uint32_t MAILBOX_TASK_PROTOCOL_VERSION = 6;
 
 // Error message region lives at the mailbox tail. 256 B of headroom is
 // enough for `<ExceptionType>: <short message>` produced by the child-side
@@ -572,6 +572,12 @@ private:
         bool accepted_reported{false};
         bool activation_requested{false};
         bool activation_published{false};
+        // The disposition this frame was last reported with. A staged run may be
+        // prepared later than it was staged — its own predecessor had not
+        // launched yet when it arrived — and that promotion is published by the
+        // child into the same frame. Remembering what was reported is what lets
+        // the change be reported once more instead of being lost.
+        MailboxPreparationDisposition reported_disposition{MailboxPreparationDisposition::NONE};
         WorkerDispatch dispatch{};
         RunId run_id{INVALID_RUN_ID};
         uint64_t slot_id{0};
@@ -774,15 +780,50 @@ private:
     // Linearizes stop with endpoint publication and prepared activation.
     std::mutex admission_mu_;
     mutable std::mutex lane_mu_;
-    std::array<LaneState, 2> lanes_{};
+    // Index 0 is the active lane; the rest are staged lanes, one per run this
+    // endpoint may hold beyond the active one. A staged lane is found by the
+    // identity it carries rather than by position — the endpoint picks a mailbox
+    // frame from the run's own pipeline lease, so which staged lane a run
+    // occupies says nothing about where its frame is.
+    std::array<LaneState, PTO_PIPELINE_MAX_DEPTH> lanes_{};
     std::unordered_set<uint64_t> accepted_dispatch_ids_;
     std::unordered_map<uint64_t, std::string> accept_errors_;
 
-    SubmitDispatchResult submit_dispatch(WorkerDispatch d, LaneKind lane, RunId expected_run_id = INVALID_RUN_ID);
+    SubmitDispatchResult submit_dispatch(WorkerDispatch d, size_t lane_index, RunId expected_run_id = INVALID_RUN_ID);
+    static constexpr size_t kActiveLane = 0;
+    static constexpr size_t kFirstStagedLane = 1;
     LaneState &lane(LaneKind kind) { return lanes_[static_cast<size_t>(kind)]; }
     const LaneState &lane(LaneKind kind) const { return lanes_[static_cast<size_t>(kind)]; }
-    void release_lane(LaneKind kind, uint64_t dispatch_id);
-    void release_lane_unconditional(LaneKind kind);
+    LaneState &lane_at(size_t index) { return lanes_[index]; }
+    /** How many staged lanes this endpoint may use, bounded by what it admits at once. */
+    size_t staged_lane_count() const {
+        const uint32_t inflight_cap = caps().max_inflight_tasks;
+        const size_t usable = inflight_cap > 1 ? static_cast<size_t>(inflight_cap) : 1;
+        return (usable < lanes_.size() ? usable : lanes_.size()) - 1;
+    }
+    /** The staged lane holding `run_id`, or `lanes_.size()` when none does. */
+    size_t staged_lane_of_locked(RunId run_id) const {
+        for (size_t index = kFirstStagedLane; index < kFirstStagedLane + staged_lane_count(); ++index) {
+            if (lanes_[index].occupied && lanes_[index].run_id == run_id) return index;
+        }
+        return lanes_.size();
+    }
+    /** The staged lane holding `dispatch_id`, or `lanes_.size()` when none does. */
+    size_t staged_lane_for_dispatch_locked(uint64_t dispatch_id) const {
+        for (size_t index = kFirstStagedLane; index < kFirstStagedLane + staged_lane_count(); ++index) {
+            if (lanes_[index].occupied && lanes_[index].dispatch_id == dispatch_id) return index;
+        }
+        return lanes_.size();
+    }
+    /** A free staged lane, or `lanes_.size()` when every one is taken. */
+    size_t free_staged_lane_locked() const {
+        for (size_t index = kFirstStagedLane; index < kFirstStagedLane + staged_lane_count(); ++index) {
+            if (!lanes_[index].occupied) return index;
+        }
+        return lanes_.size();
+    }
+    void release_lane(size_t lane_index, uint64_t dispatch_id);
+    void release_lane_unconditional(size_t lane_index);
     void finish_progress_dispatch(const WorkerEndpointProgress &progress);
     void fail_submission(const WorkerDispatch &dispatch, const std::string &reason);
     void fail_progress_driver(const std::string &reason) noexcept;

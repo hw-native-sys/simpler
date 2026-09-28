@@ -1474,6 +1474,7 @@ class ChipWorker:
         dfx_session: bool | None = None,
         workspace_budget_bytes: int = 0,
         manage_workspace: bool = False,
+        requested_pipeline_depth: int = 0,
     ):
         """Attach the calling thread to ``device_id``, load the host runtime
         library, and cache platform binaries.
@@ -1517,6 +1518,16 @@ class ChipWorker:
                 Worker's forked chip children pass it, and no public `Worker`
                 option sets it. Ignored on a simulated backend, which manages
                 no device workspace. A budget implies it.
+            requested_pipeline_depth: How many native run-resource sets this
+                context may hold at once, or 0 for the standing default of
+                two — which is what every runtime granted before this
+                argument existed, so a caller who asks for nothing keeps that
+                capacity and that footprint however high the runtime's
+                published maximum goes. The granted count is the smaller of
+                what is asked and the runtime's supported maximum, and it is
+                latched here — before any per-slot storage is built or
+                prewarmed — because nothing can resize those pools
+                afterwards. `pipeline_depth` reports what was granted.
             collect_across_runs: Let a run's records outlive its own boundary,
                 so the sealing and the file write happen while the next run
                 executes instead of at the boundary. Off when neither this nor
@@ -1587,6 +1598,7 @@ class ChipWorker:
                 bool(_resolve_collect_across_runs(collect_across_runs, dfx_session)),
                 int(workspace_budget_bytes),
                 bool(manage_workspace),
+                int(requested_pipeline_depth),
             )
             for slot_id, callable_obj in list(self._callable_registry.items()):
                 self._impl.register_callable(int(slot_id), callable_obj)

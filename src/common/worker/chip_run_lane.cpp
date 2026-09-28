@@ -434,7 +434,7 @@ struct ChipRunLaneState {
     }
 
     /**
-     * Prepare the queued successor while the run ahead of it executes, if it may be.
+     * Prepare a queued run while the runs ahead of it execute, if it may be.
      *
      * A backend that reports this run cannot be prepared beside the active one leaves it queued:
      * it keeps its slot, its borrow and whatever its aborted bind declared, nothing of the run
@@ -443,11 +443,16 @@ struct ChipRunLaneState {
      * waits for exists by the time it is at the front, which is the behaviour the same program had
      * before a device argument could be enqueued early. One attempt only: the reasons cannot
      * change while the run ahead is still executing.
+     *
+     * The predecessor is the run immediately ahead in the FIFO, whatever the lane's capacity: each
+     * run is prepared beside the one it will be ordered behind, so a third run is judged against
+     * the second rather than against the front.
      */
     void prepare_successor_if_eligible(const std::shared_ptr<ChipRunState> &run) {
-        if (fifo.size() != 2 || fifo.back() != run || fifo.front() == run) return;
+        const auto position = std::find(fifo.begin(), fifo.end(), run);
+        if (position == fifo.end() || position == fifo.begin()) return;
         if (run->phase != ChipRunState::Phase::QUEUED || run->depth_one_fallback) return;
-        if (!permits_native_successor(*fifo.front())) return;
+        if (!permits_native_successor(**std::prev(position))) return;
         try {
             prepare(run);
         } catch (const ChipWorker::PreparedRunIncompatible &) {
@@ -457,7 +462,25 @@ struct ChipRunLaneState {
             run->error = std::current_exception();
             release_device_spans(run, true);
             run->phase = ChipRunState::Phase::TERMINAL;
-            fifo.pop_back();
+            auto it = std::find(fifo.begin(), fifo.end(), run);
+            if (it != fifo.end()) fifo.erase(it);
+        }
+    }
+
+    /**
+     * Offer every queued run behind the launched prefix its one preparation attempt.
+     *
+     * Front to back, because a run's eligibility is decided by the run ahead of it: preparing the
+     * second is what can make the third eligible in the same round. A run that declines keeps its
+     * place, and the walk stops at the first one that cannot be prepared — nothing behind it can
+     * be judged against a predecessor that is still queued.
+     */
+    void prepare_queued_successors() {
+        for (size_t index = 1; index < fifo.size(); ++index) {
+            const auto candidate = fifo[index];
+            if (candidate->phase != ChipRunState::Phase::QUEUED) continue;
+            prepare_successor_if_eligible(candidate);
+            if (candidate->phase == ChipRunState::Phase::QUEUED) return;
         }
     }
 
@@ -471,7 +494,10 @@ struct ChipRunLaneState {
         }
 
         launch_ready_prefix();
-        if (fifo.size() == 2 && fifo.front() == target) prepare_successor_if_eligible(fifo.back());
+        // Whatever the target is: a launch just now may have made the run behind the newly
+        // launched one eligible, and that run is judged against its own predecessor rather than
+        // against the front.
+        prepare_queued_successors();
         if (target->phase == ChipRunState::Phase::TERMINAL) {
             launch_ready_prefix();
             return true;
@@ -607,9 +633,9 @@ void ChipRun::activate() {
     }
     run_->activated = true;
     lane_->launch_ready_prefix();
-    if (lane_->fifo.size() == 2 && lane_->fifo.front() == run_) {
-        lane_->prepare_successor_if_eligible(lane_->fifo.back());
-    }
+    // Activating a queued run is what launches it, and its launch is what lets the run behind it
+    // be prepared — so this follows every activation, not only the front's.
+    lane_->prepare_queued_successors();
 }
 
 void ChipRun::abandon() {
@@ -687,7 +713,7 @@ ChipRun ChipRunLane::submit(
             throw std::runtime_error("chip run lane pipeline slot is already occupied");
         }
     }
-    if (state_->fifo.size() >= 2) {
+    if (state_->fifo.size() >= state_->generations.size()) {
         throw std::runtime_error("chip run lane capacity exceeded before native preparation");
     }
     if (!state_->fifo.empty() && state_->fifo.front()->phase == ChipRunState::Phase::LAUNCHED &&
@@ -722,7 +748,7 @@ ChipRun ChipRunLane::submit(
         state_->borrow_device_spans(run);
         if (state_->fifo.front() == run) {
             state_->launch_ready_prefix();
-            if (state_->fifo.size() == 2) state_->prepare_successor_if_eligible(state_->fifo.back());
+            state_->prepare_queued_successors();
         } else {
             state_->prepare_successor_if_eligible(run);
         }
@@ -753,13 +779,13 @@ ChipRun ChipRunLane::submit(
     if (state_->generations.empty()) throw std::runtime_error("chip run lane has no runtime slots");
 
     // Direct admission follows the runtime contract but keeps the lane as its
-    // only authority. A compatible active run may own one prepared successor;
-    // otherwise admission drains the front and retains depth-one behavior.
-    // In particular, the third submit waits here before a slot generation is
+    // only authority. A run whose predecessor permits a native successor may queue behind it up to
+    // the lane's capacity; otherwise admission drains the front and retains depth-one behavior.
+    // In particular, the submit past that capacity waits here before a slot generation is
     // minted or native preparation begins.
     while (!state_->fifo.empty()) {
         const bool has_successor_capacity =
-            state_->fifo.size() == 1 && state_->permits_native_successor(*state_->fifo.front());
+            state_->fifo.size() < state_->generations.size() && state_->permits_native_successor(*state_->fifo.back());
         if (has_successor_capacity) break;
         state_->drain_front();
         state_->require_usable();

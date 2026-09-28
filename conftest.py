@@ -1772,6 +1772,16 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
                 f"launch_depth applies to the whole Worker, so split them into one class per depth"
             )
         launch_depth = requested_depths.pop() if requested_depths else 1
+        # Same rule as the depth above, for the same reason: the resource-set count belongs to
+        # the Worker, so a class that mixes requests would hand one case a capacity it did not
+        # ask for.
+        requested_capacities = {int(c.get("config", {}).get("pipeline_depth", 0)) for c in cls.CASES}
+        if len(requested_capacities) > 1:
+            pytest.fail(
+                f"{cls.__name__} mixes pipeline_depth values {sorted(requested_capacities)} across its cases; "
+                f"pipeline_depth applies to the whole Worker, so split them into one class per capacity"
+            )
+        pipeline_depth = requested_capacities.pop() if requested_capacities else 0
         ids = device_pool.allocate(max_devices)
         if not ids:
             pytest.fail(
@@ -1788,6 +1798,7 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
             runtime=runtime,
             enable_sdma=wants_sdma,
             launch_depth=launch_depth,
+            **({"pipeline_depth": pipeline_depth} if pipeline_depth else {}),
         )
         w._st_device_id = ids[0]  # expose primary device to test_run for profiling snapshots
 

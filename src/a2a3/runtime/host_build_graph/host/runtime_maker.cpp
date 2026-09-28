@@ -114,10 +114,14 @@ extern "C" const PipelineContract *get_pipeline_contract(void) {
     // PTO_PIPELINE_GM_SM is absent because hbg has no separate shared-memory
     // region: the image is the tail of the runtime-image region, so it shares that
     // region's classification. The arena-topology check skips an absent kind.
+    // `pipeline_depth` is the maximum this runtime supports, not a configured
+    // count: every device-resident region it names carries per-run content and
+    // is selected by the caller's lease, so three runs can hold three of them.
+    // What a context actually grants is the smaller of this and the request.
     static const PipelineContract contract = {
         PTO_PIPELINE_CONTRACT_ABI_VERSION,
         4,
-        2,
+        PTO_PIPELINE_MAX_DEPTH,
         {
             {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_HOST_PER_RUN, 0},
             {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_HOST_PER_RUN, 0},

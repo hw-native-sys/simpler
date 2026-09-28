@@ -4027,25 +4027,23 @@ bool DeviceRunnerBase::try_reserve_native_run(
     std::lock_guard<std::mutex> lk(native_run_mu_);
 
     size_t occupied = 0;
-    const NativeRunReservation *existing = nullptr;
+    bool every_existing_admits_successor = true;
     for (const NativeRunReservation &reservation : native_run_reservations_) {
         if (reservation.owner == nullptr) continue;
         if (reservation.owner == owner || reservation.pipeline_slot == pipeline_slot) {
             return false;
         }
         ++occupied;
-        existing = &reservation;
+        // Each reservation already held must belong to a run that has taken the
+        // claim: a successor may prepare alongside *launched* runs, not
+        // alongside another merely prepared one. Every one of them is asked,
+        // not just the newest, because a run prepared beside two live runs is
+        // ordered behind both.
+        const bool holds_claim = native_run_claim_index(reservation.owner) < active_native_run_count_;
+        if (!reservation.permits_prepared_successor || !holds_claim) every_existing_admits_successor = false;
     }
-    if (occupied != 0) {
-        // The one reservation already held must belong to a run that has taken
-        // the claim: a successor may prepare alongside a *launched* run, not
-        // alongside another merely prepared one.
-        const bool existing_holds_claim =
-            existing != nullptr && native_run_claim_index(existing->owner) < active_native_run_count_;
-        if (!allow_prepared_successor || occupied != 1 || !existing->permits_prepared_successor ||
-            !existing_holds_claim) {
-            return false;
-        }
+    if (occupied != 0 && (!allow_prepared_successor || !every_existing_admits_successor)) {
+        return false;
     }
 
     for (NativeRunReservation &reservation : native_run_reservations_) {

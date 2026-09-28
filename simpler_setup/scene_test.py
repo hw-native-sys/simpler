@@ -51,7 +51,9 @@ logger = logging.getLogger(__name__)
 
 _compile_cache: dict[tuple, object] = {}
 
-_CASE_CONFIG_KEYS = frozenset({"aicpu_thread_num", "runtime_env", "device_count", "num_sub_workers", "launch_depth"})
+_CASE_CONFIG_KEYS = frozenset(
+    {"aicpu_thread_num", "runtime_env", "device_count", "num_sub_workers", "launch_depth", "pipeline_depth"}
+)
 _TORCH_BACKEND_AUTOLOAD_ENV = "TORCH_DEVICE_BACKEND_AUTOLOAD"
 _TORCH_BACKEND_AUTOLOAD_VALUE_LIMIT = 64
 _RUNTIME_ENV_KEYS = frozenset({"ring_task_window", "ring_heap", "ring_dep_pool"})
@@ -239,6 +241,37 @@ def _class_wants_sdma(cls) -> bool:
         if getattr(marker, "name", None) == "sdma":
             return bool(getattr(marker, "kwargs", {}).get("worker_workspace", True))
     return False
+
+
+def _class_pipeline_depth(cls, cases) -> int:
+    """The one native run-resource capacity a class asks for, or zero when it asks for none.
+
+    `pipeline_depth` belongs to the Worker and is granted before its first run, so a class whose
+    cases disagree has no single answer. The pytest fixture refuses the same mix for the same
+    reason; this is the standalone path's copy of that rule, which is why the message matches.
+    """
+    requested = {int(c.get("config", {}).get("pipeline_depth", 0)) for c in cases}
+    if len(requested) > 1:
+        raise SystemExit(
+            f"{cls.__name__} mixes pipeline_depth values {sorted(requested)} across its cases; "
+            f"pipeline_depth applies to the whole Worker, so split them into one class per capacity"
+        )
+    return requested.pop() if requested else 0
+
+
+def _standalone_worker_groups(selected_by_cls):
+    """The classes that may share one Worker, keyed by `(runtime, level, requested capacity)`.
+
+    Capacity is part of the key rather than something reconciled after grouping: a Worker's
+    `pipeline_depth` is granted once, before its first run, so classes that ask for different
+    numbers cannot share one. Partitioning here runs every class of a mixed module against the
+    capacity it asked for, instead of handing the whole module the smallest of them.
+    """
+    groups: dict[tuple[str, int, int], list[type]] = {}
+    for cls, cases in selected_by_cls.items():
+        key = (cls._st_runtime, cls._st_level, _class_pipeline_depth(cls, cases))
+        groups.setdefault(key, []).append(cls)
+    return groups
 
 
 _GOLDEN_MAX_THREADS = 8
@@ -2662,13 +2695,11 @@ class SceneTestCase:
                 sys.exit(0 if ok else 1)
 
         # ----- Inline execution (single group or child mode) -----
-        by_rt_level: dict[tuple[str, int], list[type]] = {}
-        for cls in selected_by_cls:
-            by_rt_level.setdefault((cls._st_runtime, cls._st_level), []).append(cls)
+        by_rt_level = _standalone_worker_groups(selected_by_cls)
 
         ok = True
-        for (runtime, level), group in by_rt_level.items():
-            print(f"\n=== Runtime: {runtime}  Level: {level} ===")
+        for (runtime, level, capacity), group in by_rt_level.items():
+            print(f"\n=== Runtime: {runtime}  Level: {level}  Pipeline depth: {capacity or 'default'} ===")
             worker, per_class_sub_handles, per_class_chip_handles = _create_standalone_worker(
                 group, level, args, selected_by_cls
             )
@@ -2952,6 +2983,17 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
         (c.get("config", {}).get("launch_depth", 1) for cls in group for c in selected_by_cls.get(cls, [])),
         default=1,
     )
+    # Not reconciled here: a Worker's capacity is granted once, before any run, so a group whose
+    # classes disagree has no single answer and the caller must partition instead. Zero means
+    # unset, which takes the standing default request.
+    capacities = {_class_pipeline_depth(cls, selected_by_cls.get(cls, [])) for cls in group}
+    if len(capacities) > 1:
+        raise SystemExit(
+            f"one Worker cannot serve pipeline_depth values {sorted(capacities)}: "
+            f"{', '.join(sorted(cls.__name__ for cls in group))} were grouped together, and a granted "
+            f"capacity cannot be changed once a Worker is up"
+        )
+    pipeline_depth = capacities.pop() if capacities else 0
     # Prefer the allocated list (dispatcher child mode), fall back to
     # contiguous range starting at args.device (legacy inline path).
     allocated = getattr(args, "device_ids", None)
@@ -2967,6 +3009,7 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
         runtime=first_cls._st_runtime,
         enable_sdma=any(_class_wants_sdma(c) for c in group),
         launch_depth=launch_depth,
+        **({"pipeline_depth": pipeline_depth} if pipeline_depth else {}),
     )
     # Prepare sub callables per-class to avoid name collisions.
     per_class_sub_handles: dict[type, dict] = {}

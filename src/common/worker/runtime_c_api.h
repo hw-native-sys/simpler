@@ -124,8 +124,13 @@ enum {
 enum {
     PTO_PIPELINE_CONTRACT_ABI_VERSION = 1,
     PTO_PIPELINE_MAX_RESOURCES = 8,
-    /* Ceiling on pipeline_depth once a depth above 1 is enabled. */
-    PTO_PIPELINE_MAX_DEPTH = 2,
+    /* Ceiling on pipeline_depth, and the width every per-slot array and wire
+       frame is laid out for. A context grants at most this many run resource
+       sets; what a Worker requests and what a runtime supports are both
+       clamped to it. Raising it costs static footprint — one more mailbox
+       frame per endpoint and one more entry in each per-slot array — whether
+       or not any run holds the extra set. */
+    PTO_PIPELINE_MAX_DEPTH = 3,
 };
 
 /**

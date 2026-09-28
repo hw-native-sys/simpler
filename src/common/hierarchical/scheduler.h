@@ -95,6 +95,12 @@ public:
         // that omit this callback retain the legacy unpartitioned queue path.
         std::function<RunId()> active_run_cb;
         std::function<RunId()> preparable_run_cb;
+        // Every preparable successor, in FIFO order. Set alongside
+        // `preparable_run_cb`; the single-run form stays for callers that only
+        // ever have one.
+        std::function<std::vector<RunId>()> preparable_runs_cb;
+        // Every staged successor authorized to launch early, in FIFO order.
+        std::function<std::vector<RunId>()> early_launch_runs_cb;
         // The staged successor authorized to launch its device work while the
         // active run is still executing, or INVALID_RUN_ID. Omitted by callers
         // configured at launch depth one, which authorize nothing.
@@ -193,6 +199,7 @@ private:
     void dispatch_ready(bool scan_preparable);
     void dispatch_claimed(WorkerThread *worker, WorkerDispatch dispatch, bool prepared);
     void dispatch_preparable_next_level_singles();
+    void stage_preparable_run(RunId run_id);
     NextLevelGroupDispatchResult dispatch_next_level_group(const std::optional<RunId> &run_snapshot);
     bool dispatch_next_level_singles(
         const std::unordered_set<int32_t> &reserved_worker_ids, const std::optional<RunId> &run_snapshot,

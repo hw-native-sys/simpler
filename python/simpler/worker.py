@@ -377,7 +377,7 @@ _OFF_FRAME_DISPATCH_ID = _OFF_ACCEPTED - 8
 _OFF_FRAME_TASK_SLOT = _OFF_ACCEPTED - 48
 _OFF_FRAME_GROUP_INDEX = _OFF_ACCEPTED - 56
 _OFF_FRAME_GROUP_SIZE = _OFF_ACCEPTED - 64
-_TASK_PROTOCOL_VERSION = 5
+_TASK_PROTOCOL_VERSION = 6
 # Mirrors MAILBOX_OFF_SHUTDOWN / MAILBOX_SHUTDOWN_REQUESTED: termination is a
 # sticky one-way word on the control frame, not a MailboxState. _OFF_STATE has
 # three writers (parent CONTROL_REQUEST, child CONTROL_DONE, C++
@@ -417,7 +417,7 @@ _TASK_LAUNCHED = 9
 _TASK_FAILED = 10
 _ACTIVATE = 11
 _PREPARE_READY = 12
-_TASK_FRAME_COUNT = 2
+_TASK_FRAME_COUNT = PTO_PIPELINE_MAX_DEPTH
 
 
 def _assert_mailbox_wire_constants() -> None:
@@ -497,13 +497,23 @@ _assert_mailbox_wire_constants()
 
 
 def _local_task_frame_count(platform: str, _runtime: str, pipeline_depth: int) -> int:
+    """How many task frames this endpoint uses: one per run its child may hold.
+
+    Bounded by the frames the mailbox is laid out for, which is the same
+    compile-time ceiling the granted depth is clamped to.
+    """
     if platform == "a2a3" and pipeline_depth >= 2:
-        return _TASK_FRAME_COUNT
+        return min(int(pipeline_depth), _TASK_FRAME_COUNT)
     return 1
 
 
 # `Orchestrator::configure_pipeline_depth` takes the budget as a uint32_t.
 _PENDING_RUN_DEPTH_MAX = 2**32 - 1
+
+# What a Worker requests when `pipeline_depth` is unset. Two is what every backend granted before
+# the key existed, so an unconfigured Worker keeps today's capacity and commits no third set —
+# raising a runtime's published maximum must not move this.
+_DEFAULT_PIPELINE_DEPTH_REQUEST = 2
 
 
 def _validated_pending_run_depth(config: dict, level: int) -> int:
@@ -556,14 +566,48 @@ def _validated_launch_depth(config: dict, level: int) -> int:
     return value
 
 
-def _validated_run_depths(config: dict, level: int) -> tuple[int, int]:
-    """This Worker's two run budgets, ``(pending_run_depth, launch_depth)``.
+def _validated_pipeline_depth(config: dict, level: int) -> int:
+    """How many native run-resource sets this Worker requests, validated before any side effect.
 
-    Both are validated before any startup side effect, and both are refused on a Worker below the
-    admission FIFO. They bound different things: how many runs may be admitted, and how many of
-    those may have device work launched at once.
+    One set holds everything a run owns while it is in flight — its parameters, arena bank, graph
+    definition, scheduler state, host staging, result region and completion events — so this is
+    what bounds how many runs may be prepared and accepted by the device at once. The default
+    request is two, which is what every backend granted before this key existed; a larger request
+    is honoured only where the child publishes support for it, and is refused rather than silently
+    reduced.
+
+    It is a count, not a byte budget: a set commits its storage on the first run that holds it,
+    sized by that run's own layout.
     """
-    return _validated_pending_run_depth(config, level), _validated_launch_depth(config, level)
+    if "pipeline_depth" not in config:
+        return _DEFAULT_PIPELINE_DEPTH_REQUEST
+    value = config["pipeline_depth"]
+    if level < 3:
+        raise ValueError(f"Worker pipeline_depth requires a level >= 3 Worker, got level {level}")
+    # bool is an int subclass, and True would silently mean depth one.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"Worker pipeline_depth must be an int, got {type(value).__name__}")
+    if value < 1:
+        raise ValueError(f"Worker pipeline_depth must be >= 1, got {value}")
+    if value > PTO_PIPELINE_MAX_DEPTH:
+        raise ValueError(f"Worker pipeline_depth must be <= {PTO_PIPELINE_MAX_DEPTH}, got {value}")
+    return value
+
+
+def _validated_run_depths(config: dict, level: int) -> tuple[int, int, int]:
+    """This Worker's three run budgets, ``(pipeline_depth, pending_run_depth, launch_depth)``.
+
+    All are validated before any startup side effect, and all are refused on a Worker below the
+    admission FIFO. They bound different things, and they are ordered: how many native resource
+    sets are requested, how many runs may be admitted into the logical FIFO, and how many of those
+    may have device work launched at once. The last is additionally clamped to the capacity the
+    children actually grant.
+    """
+    return (
+        _validated_pipeline_depth(config, level),
+        _validated_pending_run_depth(config, level),
+        _validated_launch_depth(config, level),
+    )
 
 
 def _shm_name(token: str, suffix: str):
@@ -2127,6 +2171,27 @@ def _read_task_frame_identity(buf: memoryview) -> tuple[int, int, int, int, int,
     )
 
 
+def _publish_native_promotion(frame_addr: int, frame_buf: memoryview, identity: tuple, disposition: int) -> bool:
+    """Publish a staged run's promotion to native preparation, writing only the disposition word.
+
+    The state word is the parent's handoff: the parent takes a staged frame by compare-exchanging
+    ``_FRAME_STAGED`` to ``_ACTIVATE``, and that command is lost if anyone else stores over it. So
+    this writes the disposition alone — the endpoint reads it on every staged poll — and the only
+    transition of the state word out of ``_FRAME_STAGED`` remains the parent's exchange. Reading
+    the state word here and storing it back would not exclude that exchange; not writing it does.
+
+    The disposition word has a single writer, this child, and its one reader takes it only while
+    the frame is staged under the identity it checks, so a write that lands after the parent's
+    exchange is never read. Returns whether the promotion was published.
+    """
+    if disposition != _NATIVE_PREPARED:
+        return False
+    if _read_task_frame_identity(frame_buf) != identity:
+        return False
+    _mailbox_store_i32(frame_addr + _OFF_PREPARATION_DISPOSITION, disposition)
+    return True
+
+
 def _config_diagnostics_any(cfg: CallConfig) -> bool:
     """Mirror of `CallConfig::diagnostics_any()`, which nanobind does not bind."""
     return bool(
@@ -3420,12 +3485,17 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                     _mailbox_store_i32(_buffer_field_addr(buf, _OFF_SHUTDOWN), _SHUTDOWN_REQUESTED)
         return code, msg
 
-    def run_two_frame_loop() -> None:  # noqa: PLR0912, PLR0915 -- one progress owner drives control and both task frames
+    # The frames this endpoint actually negotiated, never the mailbox's compile-time width: a
+    # child granted fewer sets than the layout allows must not poll — or answer on — a frame its
+    # parent will never publish to.
+    live_frame_count = max(1, min(int(task_frame_count), _TASK_FRAME_COUNT))
+
+    def run_staged_frame_loop() -> None:  # noqa: PLR0912, PLR0915 -- one progress owner drives control and every task frame
         frame_bufs = [
             buf[(1 + index) * MAILBOX_FRAME_SIZE : (2 + index) * MAILBOX_FRAME_SIZE]
-            for index in range(_TASK_FRAME_COUNT)
+            for index in range(live_frame_count)
         ]
-        frame_addrs = [mailbox_addr + (1 + index) * MAILBOX_FRAME_SIZE for index in range(_TASK_FRAME_COUNT)]
+        frame_addrs = [mailbox_addr + (1 + index) * MAILBOX_FRAME_SIZE for index in range(live_frame_count)]
 
         @dataclass
         class _StagedFrame:
@@ -3438,6 +3508,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             activated: bool
             chip_run: Any = None
             launched_published: bool = False
+            published_disposition: int = _DISPOSITION_NONE
 
         staged_frames: dict[int, _StagedFrame] = {}
 
@@ -3532,8 +3603,27 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             _mailbox_store_i32(frame.frame_addr + _OFF_PREPARATION_DISPOSITION, disposition)
             _write_error(frame.frame_buf, 0, "")
             _mailbox_store_i32(frame.frame_addr + _OFF_STATE, _FRAME_STAGED)
+            frame.published_disposition = disposition
             if frame.activated:
                 frame.chip_run.activate()
+
+        def republish_native_preparation(frame: _StagedFrame) -> None:
+            """Publish a staged run's preparation once it becomes native, not only when it staged.
+
+            A run staged behind a predecessor that has not launched yet cannot be prepared beside
+            it, so it stages validated-only and the lane prepares it later — when that predecessor
+            reaches the device. The parent caches what was published, so without this the run waits
+            for ordinary promotion instead of the early launch it has earned.
+
+            Only the disposition word is written; the state word belongs to the parent's exchange.
+            See :func:`_publish_native_promotion`.
+            """
+            if frame.published_disposition != _VALIDATED_ONLY:
+                return
+            raw = frame.chip_run.preparation_disposition
+            disposition = int(getattr(raw, "value", raw))
+            if _publish_native_promotion(frame.frame_addr, frame.frame_buf, frame.identity, disposition):
+                frame.published_disposition = disposition
 
         parent_pid = os.getppid()
         liveness_countdown = _PARENT_LIVENESS_POLL_INTERVAL
@@ -3570,7 +3660,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                             break
 
                 new_frames: list[_StagedFrame] = []
-                for index in range(_TASK_FRAME_COUNT):
+                for index in range(live_frame_count):
                     frame_state = _mailbox_load_i32(frame_addrs[index] + _OFF_STATE)
                     staged = staged_frames.get(index)
                     if staged is None:
@@ -3609,6 +3699,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                     stop_progress = False
                     for staged in sorted(staged_frames.values(), key=lambda frame: frame.identity[4]):
                         try:
+                            republish_native_preparation(staged)
                             if staged.chip_run.launched and not staged.launched_published:
                                 _mailbox_store_i32(staged.frame_addr + _OFF_STATE, _TASK_LAUNCHED)
                                 staged.launched_published = True
@@ -3680,7 +3771,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
 
     try:
         if task_frame_count >= 2:
-            run_two_frame_loop()
+            run_staged_frame_loop()
         else:
             _run_mailbox_loop(buf, state_addr, handle_task=handle_task, handle_control=handle_control)
     finally:
@@ -3706,6 +3797,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     launch_depth: int = 1,
     collect_across_runs: bool = False,
     manage_workspace: bool = False,
+    pipeline_depth_request: int = 0,
 ) -> None:
     """Runs in forked child process. Loads host_runtime.so in own address space.
 
@@ -3740,6 +3832,10 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             enable_sdma=enable_sdma,
             collect_across_runs=collect_across_runs,
             manage_workspace=manage_workspace,
+            # Before prewarm, which commits one set's storage per slot: the granted count has to
+            # be decided while nothing has been built against the old one. The parent reads back
+            # what was granted after INIT_READY and cannot change it.
+            requested_pipeline_depth=pipeline_depth_request,
         )
     except Exception as e:
         _tb.print_exc()
@@ -5097,7 +5193,10 @@ class Worker:
         # not occupy it. `launch_depth` bounds how many of those runs may have their device work
         # launched at once; 1 keeps a successor's work off the device until its predecessor is
         # terminal.
-        self._pending_run_depth, self._launch_depth = _validated_run_depths(config, int(level))
+        self._pipeline_depth_request, self._pending_run_depth, self._launch_depth = _validated_run_depths(
+            config, int(level)
+        )
+        self._pipeline_depth_requested_explicitly = "pipeline_depth" in config
         # Per-startup bookkeeping consumed by the rollback path: PIDs the barrier
         # already reaped (must not be re-SIGKILLed — the PID may be reused) and
         # PIDs that reached their serve loop (READY → asked to close gracefully
@@ -8583,7 +8682,14 @@ class Worker:
         device_ids = self._config.get("device_ids", [])
         n_sub = self._config.get("num_sub_workers", 0)
         deadline = self._startup_deadline
-        direct_chip_pipeline_depth = PTO_PIPELINE_MAX_DEPTH
+        # The default request, not the ceiling: a route with no local chip child never reaches a
+        # grant, so this value is what its orchestrator is configured with. Raising the layout
+        # ceiling must not hand such a route a capacity no child ever granted.
+        direct_chip_pipeline_depth = _DEFAULT_PIPELINE_DEPTH_REQUEST
+        # Resolved here, before any fork: an explicit request this configuration cannot serve is
+        # refused while nothing has been committed, rather than inside a child that has already
+        # begun building pools.
+        chip_pipeline_depth_request = self._requested_chip_pipeline_depth()
         chip_depths: list[int] = []
         global_nodes = self._resolved_global_nodes() if self.level >= 4 else {}
 
@@ -8705,6 +8811,7 @@ class Worker:
                             # Read from the state the fork copied, so every
                             # child of one Worker resolves it the same way.
                             manage_workspace=self._chip_children_manage_workspace(),
+                            pipeline_depth_request=chip_pipeline_depth_request,
                         )
                     except BaseException as e:  # noqa: BLE001
                         import traceback as _tb  # noqa: PLC0415
@@ -8736,9 +8843,7 @@ class Worker:
                 # INIT_READY repurposes the lease slot_id as the child's depth
                 # advertisement; task dispatch restores normal lease semantics.
                 chip_depths.append(_PIPELINE_LEASE_FMT.unpack_from(buf, _OFF_PIPELINE_LEASE)[0])
-            if any(depth <= 0 or depth > PTO_PIPELINE_MAX_DEPTH for depth in chip_depths):
-                raise RuntimeError(f"chip worker published invalid pipeline depths: {chip_depths}")
-            direct_chip_pipeline_depth = min(chip_depths)
+            direct_chip_pipeline_depth = self._granted_chip_pipeline_depth(chip_depths)
 
         # Fork next-level Worker children (L4+ with Worker children).
         # Each child process eagerly inits the inner Worker, which forks its own
@@ -12215,6 +12320,84 @@ class Worker:
                 yield
             finally:
                 held.discard(id(self))
+
+    def _granted_chip_pipeline_depth(self, per_child: list[int]) -> int:
+        """The native resource-set count every chip child granted, or a startup failure.
+
+        Each child publishes what it granted before it signalled readiness, having sized its
+        native pools to that number ahead of prewarm. This side takes the smallest and refuses to
+        continue when an explicit request is larger: nothing here can resize those pools, so a
+        caller who asked for three runs in flight would otherwise get two with no way to tell.
+        """
+        if any(depth <= 0 or depth > PTO_PIPELINE_MAX_DEPTH for depth in per_child):
+            raise RuntimeError(f"chip worker published invalid pipeline depths: {per_child}")
+        granted = min(per_child)
+        if self._pipeline_depth_requested_explicitly and granted < self._pipeline_depth_request:
+            raise RuntimeError(
+                f"Worker pipeline_depth={self._pipeline_depth_request} was requested, but this configuration grants "
+                f"{granted} (platform={self._config.get('platform')}, runtime={self._config.get('runtime')}, "
+                f"per-child grants={per_child})"
+            )
+        return granted
+
+    def _pipeline_depth_scope_refusal(self) -> str | None:
+        """Why this Worker cannot be granted more than the default capacity, or None when it can.
+
+        The supported shape is the one the contract names: a level-3 root driving exactly one
+        local chip endpoint on onboard a2a3 host_build_graph, with nothing else in the tree. Every
+        other provenance keeps the default, because no third set is negotiated or validated for it
+        in this step: a deeper level, sub-workers sharing this admission, a second endpoint, a
+        simulated platform, another runtime.
+
+        Being a *root* is a property of this Worker's own startup, not of its level. A level-3
+        Worker is a legal child of a level-4 parent, and a remote or MPI session initializes the
+        inner Worker it hosts the same way a parent does — both reach `init()` with a startup
+        deadline, which is exactly what `_is_startup_root` records. So the level test alone does
+        not establish the shape; the two tests below are what do, and they are read after `init()`
+        has decided this Worker's role. It is the same question
+        :meth:`_chip_children_manage_workspace` asks, for the same reason: what a caller of this
+        Worker can act on depends on whether this Worker's startup is its own.
+        """
+        if self._topology_parent is not None:
+            return "this Worker is attached to a parent Worker, so it is not the root of its tree"
+        if not self._is_startup_root:
+            return "this Worker is initialized by another startup, so it is not the root of its tree"
+        if int(self.level) != 3:
+            return f"level {int(self.level)} is not the level-3 root this capacity is negotiated for"
+        platform = str(self._config.get("platform", ""))
+        if platform != "a2a3":
+            return f"platform {platform!r} is not onboard a2a3"
+        runtime = str(self._config.get("runtime", ""))
+        if runtime != "host_build_graph":
+            return f"runtime {runtime!r} is not host_build_graph"
+        device_ids = list(self._config.get("device_ids", []) or [])
+        if len(device_ids) != 1:
+            return f"{len(device_ids)} local chip endpoint(s), not one"
+        if int(self._config.get("num_sub_workers", 0) or 0) != 0:
+            return "sub-workers share this Worker's admission"
+        return None
+
+    def _requested_chip_pipeline_depth(self) -> int:
+        """The capacity this Worker asks each chip child for.
+
+        A request above the default is carried only where this step supports three runs in flight;
+        anywhere else the child is asked for the default, so it grants exactly what it always did.
+        An explicit request outside that scope is refused rather than quietly reduced — the caller
+        is told at startup, before any set is committed.
+        """
+        requested = int(self._pipeline_depth_request)
+        if requested <= _DEFAULT_PIPELINE_DEPTH_REQUEST:
+            return requested
+        refusal = self._pipeline_depth_scope_refusal()
+        if refusal is None:
+            return requested
+        if self._pipeline_depth_requested_explicitly:
+            raise RuntimeError(
+                f"Worker pipeline_depth={requested} is not supported by this configuration: {refusal}. "
+                f"Three run-resource sets are negotiated for a level-3 Worker that is the root of its own "
+                f"startup, on onboard a2a3 host_build_graph, with one local chip endpoint and no other children."
+            )
+        return _DEFAULT_PIPELINE_DEPTH_REQUEST
 
     def _cleanup_bearing_predecessor(self) -> RunHandle | None:
         """A live handle whose ordered cleanup must finish before admission.

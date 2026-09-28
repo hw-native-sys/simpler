@@ -491,7 +491,15 @@ void Scheduler::dispatch_ready(bool scan_preparable) {
     // After staging, so a run staged in this very round can be authorized in
     // it rather than waiting for the next wake. Authorization does not move the
     // staged run out of its lane: the predecessor is still executing.
-    if (cfg_.early_launch_run_cb) {
+    if (cfg_.early_launch_runs_cb) {
+        // Each authorization is independent and idempotent at the lane, so the
+        // whole list is offered rather than only its head: a third run becomes
+        // authorizable once the second's dispatches are accepted, and nothing
+        // later re-announces that on its own.
+        for (RunId early_launch : cfg_.early_launch_runs_cb()) {
+            if (early_launch != INVALID_RUN_ID) (void)cfg_.manager->authorize_staged_launch(early_launch);
+        }
+    } else if (cfg_.early_launch_run_cb) {
         const RunId early_launch = cfg_.early_launch_run_cb();
         if (early_launch != INVALID_RUN_ID) (void)cfg_.manager->authorize_staged_launch(early_launch);
     }
@@ -531,8 +539,21 @@ void Scheduler::dispatch_claimed(WorkerThread *worker, WorkerDispatch dispatch, 
 }
 
 void Scheduler::dispatch_preparable_next_level_singles() {
-    if (!cfg_.preparable_run_cb) return;
-    RunId run_id = cfg_.preparable_run_cb();
+    std::vector<RunId> preparable;
+    if (cfg_.preparable_runs_cb) {
+        preparable = cfg_.preparable_runs_cb();
+    } else if (cfg_.preparable_run_cb) {
+        const RunId single = cfg_.preparable_run_cb();
+        if (single != INVALID_RUN_ID) preparable.push_back(single);
+    }
+    // In FIFO order: staging the nearer successor is what leaves the one behind
+    // it a worker to stage into.
+    for (RunId run_id : preparable) {
+        stage_preparable_run(run_id);
+    }
+}
+
+void Scheduler::stage_preparable_run(RunId run_id) {
     if (run_id == INVALID_RUN_ID || !cfg_.ready_next_level_queues->groups_empty(run_id)) {
         return;
     }

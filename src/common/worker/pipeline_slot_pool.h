@@ -22,6 +22,21 @@
 #include "runtime_c_api.h"
 
 /**
+ * How many run-resource sets a context holds when nothing configured it.
+ *
+ * Distinct from `PTO_PIPELINE_MAX_DEPTH`, which is the widest the wire layout
+ * and every per-slot array are built for. Two is what every context held
+ * before the count could be requested, so raising the ceiling moves no
+ * unconfigured context's capacity or footprint; a context that wants more says
+ * so.
+ */
+static constexpr uint32_t kDefaultRunResourceSets = 2;
+static_assert(
+    kDefaultRunResourceSets >= 1 && kDefaultRunResourceSets <= PTO_PIPELINE_MAX_DEPTH,
+    "the standing default must be a depth the layout can carry"
+);
+
+/**
  * Fixed-capacity owner of generation-safe pipeline slot leases.
  *
  * This is capability only: callers decide when admission is allowed. A

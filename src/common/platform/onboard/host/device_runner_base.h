@@ -2425,7 +2425,7 @@ protected:
     // Scheduler-state storage, one retained pair per pipeline slot — see
     // HostApi acquire_scheduler_state_storage and utils/retained_scheduler_storage.h,
     // which holds the grow, alignment and failure rules. One pair per slot
-    // because a slot's runs are serialized while two slots' are not.
+    // because a slot's runs are serialized while different slots' runs are not.
     std::array<RetainedSchedulerStorage, PTO_PIPELINE_MAX_DEPTH> scheduler_state_storage_{};
     // Host mirror of the runtime shared memory, one retained buffer per pipeline
     // slot — see HostApi acquire_sm_mirror. A host-side orchestrator writes its
@@ -2576,7 +2576,7 @@ protected:
     // Device-constant AICore MMIO register-address tables: one 8-byte entry per
     // physical sub-core, queried from the driver for `device_id_` and copied to
     // device once per device context. The addresses are a property of the card,
-    // not of a run or a pipeline slot, so every run on both slots reads the same
+    // not of a run or a pipeline slot, so every run on every slot reads the same
     // table. Committed lazily on the prepare path by the subclass's
     // `ensure_aicore_reg_table` — only the driver query is arch-specific, a2a3
     // mapping two MMIO pages and a5 one — and released in `finalize_common()`,

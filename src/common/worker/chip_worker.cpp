@@ -203,7 +203,7 @@ void ChipWorker::init(
     const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
     const std::string &dispatcher_path, int device_id, const CallConfig *prewarm_config, bool enable_sdma,
     const std::string &sim_context_path, const std::string &sdma_warmup_path, bool collect_across_runs,
-    uint64_t workspace_budget_bytes, bool manage_workspace
+    uint64_t workspace_budget_bytes, bool manage_workspace, uint32_t requested_pipeline_depth
 ) {
     if (finalized_) {
         throw std::runtime_error("ChipWorker already finalized; cannot reinitialize");
@@ -357,7 +357,17 @@ void ChipWorker::init(
         !has_serviceable_stream_topology(*contract)) {
         throw std::runtime_error("host runtime returned a PipelineContract this build cannot accept");
     }
-    const PipelineContract resolved_contract = *contract;
+    PipelineContract resolved_contract = *contract;
+    // The runtime publishes what it *supports*; this decides how much of it this
+    // context uses. A caller that asked for nothing gets the standing default
+    // rather than the maximum, so raising a runtime's published support moves no
+    // existing route's capacity or footprint. Granted here, before any per-slot
+    // storage is built or prewarmed, because nothing downstream re-derives it and
+    // no caller can resize these pools once they exist.
+    const uint32_t wanted = requested_pipeline_depth != 0 ? requested_pipeline_depth : kDefaultRunResourceSets;
+    if (wanted < resolved_contract.pipeline_depth) {
+        resolved_contract.pipeline_depth = wanted;
+    }
 
     device_ctx_ = create_device_context_fn_();
     if (device_ctx_ == nullptr) {
@@ -977,9 +987,14 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
                 );
             }
         }
-        if (occupied > 1) {
+        // Every run already here holds a live claim, checked above, so the only remaining
+        // question is whether this context granted a resource set for one more. The granted
+        // depth is that number — not a constant — and the run past it is refused rather than
+        // handed a set another run owns.
+        if (occupied + 1 > pipeline_contract_.pipeline_depth) {
             throw std::runtime_error(
-                "prepare_native_run already owns a prepared successor " + format_native_run_identity(run_identity)
+                "prepare_native_run has no free run resource set at its granted depth " +
+                format_native_run_identity(run_identity)
             );
         }
         if (admit_pipeline_generation &&

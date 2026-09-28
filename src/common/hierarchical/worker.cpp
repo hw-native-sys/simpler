@@ -200,8 +200,14 @@ void Worker::init() {
     cfg.preparable_run_cb = [this] {
         return orchestrator_.preparable_run_id();
     };
+    cfg.preparable_runs_cb = [this] {
+        return orchestrator_.preparable_run_ids();
+    };
     cfg.early_launch_run_cb = [this] {
         return orchestrator_.early_launch_run_id();
+    };
+    cfg.early_launch_runs_cb = [this] {
+        return orchestrator_.early_launch_run_ids();
     };
     cfg.on_consumed_cb = [this](TaskSlot slot) {
         orchestrator_.on_consumed(slot);

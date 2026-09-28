@@ -39,9 +39,12 @@ namespace {
 // rather than a DmaWorkspaceKind bitmask. SDMA is the only engine a caller can
 // decline, so a set was never the question being asked; every other supported
 // engine is provisioned unconditionally.
+// Appended last: `requested_pipeline_depth`, how many native run-resource sets this context may
+// hold at once. Zero takes whatever the runtime publishes; a positive value is clamped to that
+// maximum, and the grant is latched before any per-slot storage is built.
 using ExpectedChipWorkerInit = void (ChipWorker::*)(
     const std::string &, const std::string &, const std::string &, const std::string &, int, const CallConfig *, bool,
-    const std::string &, const std::string &, bool, uint64_t, bool
+    const std::string &, const std::string &, bool, uint64_t, bool, uint32_t
 );
 static_assert(
     std::is_same_v<decltype(&ChipWorker::init), ExpectedChipWorkerInit>,

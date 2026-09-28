@@ -87,11 +87,13 @@ public:
     /// the cold-start cost off the first TPREFETCH_ASYNC. Read only when
     /// `enable_sdma` is set; an empty path (or an arch that builds no such ELF)
     /// only costs that first-call latency.
+
     void init(
         const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
         const std::string &dispatcher_path, int device_id, const CallConfig *prewarm_config = nullptr,
         bool enable_sdma = false, const std::string &sim_context_path = "", const std::string &sdma_warmup_path = "",
-        bool collect_across_runs = false, uint64_t workspace_budget_bytes = 0, bool manage_workspace = false
+        bool collect_across_runs = false, uint64_t workspace_budget_bytes = 0, bool manage_workspace = false,
+        uint32_t requested_pipeline_depth = 0
     );
 
     /**

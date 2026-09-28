@@ -429,7 +429,7 @@ constexpr int PLATFORM_RUN_TERMINAL_PRODUCERS = 2 * PLATFORM_MAX_CORES + 2 * PLA
 // must not pull in the host worker API, so the pipeline depth is mirrored here
 // and cross-checked against PTO_PIPELINE_MAX_DEPTH in the host collector, where
 // both headers are visible.
-constexpr int PLATFORM_RUN_TERMINAL_BANKS = 2;
+constexpr int PLATFORM_RUN_TERMINAL_BANKS = 3;
 
 inline size_t calc_run_terminal_bank_size() {
     return static_cast<size_t>(PLATFORM_RUN_TERMINAL_PRODUCERS) * sizeof(ChipSwimlaneRunTerminal);
