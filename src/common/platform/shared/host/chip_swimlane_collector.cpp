@@ -3040,6 +3040,11 @@ bool ChipSwimlaneCollector::run_is_tombstoned(uint64_t run_epoch) const {
     return false;
 }
 
+void ChipSwimlaneCollector::record_run_tombstone(uint64_t run_epoch) {
+    const size_t cursor = tombstone_cursor_.fetch_add(1, std::memory_order_relaxed);
+    tombstones_[cursor % tombstones_.size()].store(run_epoch, std::memory_order_relaxed);
+}
+
 void ChipSwimlaneCollector::bump_control_view() {
     // Publish the table, then make every shard adopt it before returning. A
     // shard reads the control epoch before refreshing, so an ack can never
@@ -3295,6 +3300,7 @@ bool ChipSwimlaneCollector::abandon_run(uint64_t run_epoch) {
     // Withdraw admission, then wait for every shard to drop its reference —
     // the sequence a seal uses, minus the publication: this run submitted
     // nothing, so it produced no records to seal and promised no file.
+    record_run_tombstone(run_epoch);
     bucket.state.store(static_cast<int>(EpochState::Closing), std::memory_order_release);
     bool released = false;
     try {
@@ -3362,9 +3368,6 @@ void ChipSwimlaneCollector::refresh_retained_run_view(int collector_shard) {
 
 void ChipSwimlaneCollector::release_run_slot(size_t slot) {
     EpochBucket &bucket = retained_runs_[slot];
-    const uint64_t epoch = bucket.epoch.load(std::memory_order_acquire);
-    const size_t cursor = tombstone_cursor_.fetch_add(1, std::memory_order_relaxed);
-    tombstones_[cursor % tombstones_.size()].store(epoch, std::memory_order_relaxed);
     // Free the storage first, then give its bytes back: a credit ahead of the
     // release would let an admission see headroom that does not exist yet.
     bucket.pending = RunExport{};
@@ -3418,6 +3421,7 @@ bool ChipSwimlaneCollector::seal_and_publish_run(size_t slot, simpler::dfx::runs
 
     // Withdraw admission, then wait for every shard to drop its reference.
     // Nothing is moved or freed before the last ack; a timeout quarantines.
+    record_run_tombstone(epoch);
     bucket.state.store(static_cast<int>(EpochState::Closing), std::memory_order_release);
     if (!request_run_reference_release(simpler::dfx::runs::kControlAckBudgetMs)) {
         bucket.state.store(static_cast<int>(EpochState::Quarantined), std::memory_order_release);
