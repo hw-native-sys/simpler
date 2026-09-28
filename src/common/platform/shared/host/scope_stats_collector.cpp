@@ -32,6 +32,7 @@
 
 #include <cassert>
 #include <cinttypes>
+#include <new>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -42,7 +43,12 @@
 #include "host/profiling_copy.h"
 #include "../../../worker/runtime_c_api.h"
 
-ScopeStatsCollector::~ScopeStatsCollector() { stop(); }
+ScopeStatsCollector::~ScopeStatsCollector() {
+    // The writer outlives the collector threads, so it is joined here too: a
+    // joinable thread left behind at destruction terminates the process.
+    stop_writer();
+    stop();
+}
 
 // ---------------------------------------------------------------------------
 // init
@@ -71,7 +77,8 @@ int ScopeStatsCollector::init(
     set_aicpu_thread_num(num_threads);
 
     total_collected_ = 0;
-    records_.clear();
+    refused_records_ = 0;
+    (void)records_.release();
     recovered_current_buf_ = 0;
     recovered_current_total_ = 0;
     execution_complete_.store(false, std::memory_order_release);
@@ -157,9 +164,11 @@ int ScopeStatsCollector::init(
 void ScopeStatsCollector::begin_run() {
     {
         std::scoped_lock lock(records_mutex_);
-        records_.clear();
+        const size_t charged = records_.release();
+        if (charged > 0) host_budget_.credit(charged);
     }
     total_collected_ = 0;
+    refused_records_ = 0;
     recovered_current_buf_ = 0;
     recovered_current_total_ = 0;
     execution_complete_.store(false, std::memory_order_release);
@@ -183,7 +192,20 @@ void ScopeStatsCollector::begin_run() {
     publish_field(&state->dropped_record_count, 2 * sizeof(uint32_t), "record counters");
 }
 
+void ScopeStatsCollector::on_buffer_collected(const ScopeStatsReadyBufferInfo &info) {
+    // The collector thread's entry point has no exception boundary of its own
+    // — `ProfilerBase::consume` calls this directly — so one is established
+    // here. A host failure below becomes a reported, persistent diagnostic
+    // error rather than an escape that terminates the chip subprocess.
+    try {
+        append_buffer_records(info.host_buffer_ptr);
+    } catch (...) {
+        note_host_failure("a collected buffer could not be taken into host storage");
+    }
+}
+
 void ScopeStatsCollector::append_buffer_records(const void *buf_host_ptr) {
+    if (throw_in_collector_) throw std::bad_alloc();
     const ScopeStatsBuffer *buf = reinterpret_cast<const ScopeStatsBuffer *>(buf_host_ptr);
     uint32_t n = buf->count;
     if (n > static_cast<uint32_t>(PLATFORM_SCOPE_STATS_RECORDS_PER_BUFFER)) {
@@ -197,27 +219,43 @@ void ScopeStatsCollector::append_buffer_records(const void *buf_host_ptr) {
     // the pool and being re-stamped by a later run.
     const uint64_t run_epoch = buf->run_epoch;
     const uint32_t local_seq = buf->local_seq;
-    records_.reserve(records_.size() + n);
     for (uint32_t i = 0; i < n; i++) {
-        records_.push_back(CollectedScopeStatsRecord{buf->records[i], run_epoch, local_seq, 0});
+        const CollectedScopeStatsRecord record{buf->records[i], run_epoch, local_seq, 0};
+        const bool stored = records_.append(
+            record,
+            [this](size_t bytes) {
+                return charge_record_block(bytes);
+            },
+            [this](size_t bytes) {
+                host_budget_.credit(bytes);
+            }
+        );
+        if (!stored) {
+            // Counted as received and not retained: the difference is the
+            // loss this run's artifact reports. The receive path is never
+            // blocked and nothing is allocated on this branch.
+            refused_records_ += static_cast<uint64_t>(n - i);
+            total_collected_ += n;
+            return;
+        }
     }
     total_collected_ += n;
 }
 
-void ScopeStatsCollector::on_buffer_collected(const ScopeStatsReadyBufferInfo &info) {
-    append_buffer_records(info.host_buffer_ptr);
-}
-
 std::vector<CollectedScopeStatsRecord> ScopeStatsCollector::collected_records() const {
     std::scoped_lock lock(records_mutex_);
-    return records_;
+    std::vector<CollectedScopeStatsRecord> out;
+    out.reserve(records_.size());
+    for (size_t i = 0; i < records_.size(); i++)
+        out.push_back(records_[i]);
+    return out;
 }
 
 size_t ScopeStatsCollector::collected_for_run(uint64_t run_epoch) const {
     std::scoped_lock lock(records_mutex_);
     size_t n = 0;
-    for (const CollectedScopeStatsRecord &collected : records_) {
-        if (collected.run_epoch == run_epoch) n++;
+    for (size_t i = 0; i < records_.size(); i++) {
+        if (records_[i].run_epoch == run_epoch) n++;
     }
     return n;
 }
@@ -306,6 +344,136 @@ bool ScopeStatsCollector::reconcile_counters() {
 // NDJSON export
 // ---------------------------------------------------------------------------
 
+namespace {
+
+using simpler::dfx::scope_stats_runs::Collection;
+using simpler::dfx::scope_stats_runs::DeviceSnapshot;
+using simpler::dfx::scope_stats_runs::RecordBlocks;
+
+/**
+ * Bounded staging for the record lines.
+ *
+ * The bytes written are exactly what one growing `std::string` produced — the
+ * per-record `snprintf` is unchanged — but the scratch no longer scales with
+ * the record count, so it fits inside a fixed budget reservation.
+ */
+class LineSink {
+public:
+    explicit LineSink(std::FILE *fp) :
+        fp_(fp) {
+        stage_.reserve(simpler::dfx::runs::kWriterScratchBytes);
+    }
+    ~LineSink() { flush(); }
+
+    void append(const char *data, size_t n) {
+        if (stage_.size() + n > simpler::dfx::runs::kWriterScratchBytes) flush();
+        if (n > simpler::dfx::runs::kWriterScratchBytes) {
+            if (std::fwrite(data, 1, n, fp_) != n) ok_ = false;
+            return;
+        }
+        stage_.append(data, n);
+    }
+
+    void flush() {
+        if (stage_.empty()) return;
+        if (std::fwrite(stage_.data(), 1, stage_.size(), fp_) != stage_.size()) ok_ = false;
+        stage_.clear();
+    }
+
+    bool ok() const { return ok_; }
+
+private:
+    std::FILE *fp_;
+    std::string stage_;
+    bool ok_{true};
+};
+
+}  // namespace
+
+simpler::dfx::scope_stats_runs::DeviceSnapshot ScopeStatsCollector::snapshot_unchecked() const {
+    DeviceSnapshot out;
+    if (shm_host_ == nullptr) return out;
+    const ScopeStatsDataHeader *hdr = scope_stats_header();
+    const ScopeStatsBufferState *state = scope_stats_state(0);
+    out.fatal_latched = hdr->fatal_latched;
+    out.dropped_records = state->dropped_record_count;
+    out.total_records = state->total_record_count;
+    for (int r = 0; r < SCOPE_STATS_MAX_RING_DEPTH; r++) {
+        out.task_window_cap[r] = hdr->task_window_cap[r];
+        out.dep_pool_cap[r] = hdr->dep_pool_cap[r];
+        out.heap_cap[r] = hdr->heap_cap[r];
+    }
+    out.tensormap_cap = hdr->tensormap_cap;
+    out.valid = true;
+    return out;
+}
+
+int ScopeStatsCollector::render_jsonl_to(
+    std::FILE *fp, const DeviceSnapshot &device, const RecordBlocks &records, const Collection *extra
+) {
+    // Line 1: run metadata. Per-ring capacities and the tensormap capacity are
+    // run-constants, so they live here once rather than on every record.
+    std::string task_window_max;
+    std::string heap_max;
+    std::string dep_pool_max;
+    for (int r = 0; r < SCOPE_STATS_MAX_RING_DEPTH; r++) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%s%d", r == 0 ? "" : ", ", device.task_window_cap[r]);
+        task_window_max += buf;
+        std::snprintf(buf, sizeof(buf), "%s%" PRIu64, r == 0 ? "" : ", ", device.heap_cap[r]);
+        heap_max += buf;
+        std::snprintf(buf, sizeof(buf), "%s%d", r == 0 ? "" : ", ", device.dep_pool_cap[r]);
+        dep_pool_max += buf;
+    }
+    // heap_start/heap_end are monotonic cumulative bytes, not wrapping ring
+    // offsets — see docs/dfx/scope-stats.md.
+    if (std::fprintf(
+            fp,
+            "{\"fatal\": %s, \"dropped\": %u, \"total\": %u, "
+            "\"task_window_max\": [%s], \"heap_max\": [%s], \"dep_pool_max\": [%s], \"tensormap_max\": %d",
+            device.fatal_latched ? "true" : "false", device.dropped_records, device.total_records,
+            task_window_max.c_str(), heap_max.c_str(), dep_pool_max.c_str(), device.tensormap_cap
+        ) < 0) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    // Additive, and only in background mode: a default-path artifact keeps the
+    // seven keys it has today, in the same order.
+    if (extra != nullptr &&
+        std::fprintf(
+            fp,
+            ", \"collection_verdict\": \"%s\", \"counts_unknown\": %s, \"host_received_records\": %llu, "
+            "\"host_retained_records\": %llu",
+            simpler::dfx::runs::verdict_name(extra->verdict), extra->counts_unknown ? "true" : "false",
+            static_cast<unsigned long long>(extra->received), static_cast<unsigned long long>(extra->retained)
+        ) < 0) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (std::fprintf(fp, "}\n") < 0) return PTO_RUNTIME_ERR_INTERNAL;
+
+    LineSink sink(fp);
+    char line[640];
+    for (size_t i = 0; i < records.size(); i++) {
+        const CollectedScopeStatsRecord &collected = records[i];
+        const ScopeStatsRecord &rec = collected.record;
+        const int site_len = static_cast<int>(strnlen(rec.site_file_basename, sizeof(rec.site_file_basename)));
+        const char *phase = (rec.phase == SCOPE_STATS_PHASE_BEGIN) ? "begin" : "end";
+        int n = std::snprintf(
+            line, sizeof(line),
+            "{\"site\": \"%.*s:%d\", \"phase\": \"%s\", \"depth\": %d, \"ring\": %d, "
+            "\"task_window_start\": %d, \"task_window_end\": %d, "
+            "\"heap_start\": %" PRIu64 ", \"heap_end\": %" PRIu64 ", "
+            "\"dep_pool_start\": %d, \"dep_pool_end\": %d, "
+            "\"tensormap\": %d, \"run_epoch\": %" PRIu64 ", \"buf_seq\": %u}\n",
+            site_len, rec.site_file_basename, rec.site_line, phase, rec.depth, rec.ring_id, rec.task_start,
+            rec.task_end, rec.heap_start, rec.heap_end, rec.dep_pool_start, rec.dep_pool_end, rec.tensormap_used,
+            collected.run_epoch, collected.local_seq
+        );
+        if (n > 0) sink.append(line, static_cast<size_t>(n < static_cast<int>(sizeof(line)) ? n : sizeof(line) - 1));
+    }
+    sink.flush();
+    return sink.ok() ? 0 : PTO_RUNTIME_ERR_INTERNAL;
+}
+
 int ScopeStatsCollector::write_jsonl(const std::string &output_dir) {
     if (!initialized_ || shm_host_ == nullptr) return 0;
 
@@ -323,65 +491,15 @@ int ScopeStatsCollector::write_jsonl(const std::string &output_dir) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
-    const ScopeStatsDataHeader *hdr = scope_stats_header();
-    const ScopeStatsBufferState *state = scope_stats_state(0);
-
-    // Line 1: run metadata. Per-ring capacities and the tensormap capacity are
-    // run-constants, so they live here once rather than on every record.
-    std::string task_window_max;
-    std::string heap_max;
-    std::string dep_pool_max;
-    for (int r = 0; r < SCOPE_STATS_MAX_RING_DEPTH; r++) {
-        char buf[32];
-        std::snprintf(buf, sizeof(buf), "%s%d", r == 0 ? "" : ", ", hdr->task_window_cap[r]);
-        task_window_max += buf;
-        std::snprintf(buf, sizeof(buf), "%s%" PRIu64, r == 0 ? "" : ", ", hdr->heap_cap[r]);
-        heap_max += buf;
-        std::snprintf(buf, sizeof(buf), "%s%d", r == 0 ? "" : ", ", hdr->dep_pool_cap[r]);
-        dep_pool_max += buf;
-    }
-    std::fprintf(
-        fp,
-        // heap_start/heap_end are monotonic cumulative bytes, not wrapping ring
-        // offsets — see docs/dfx/scope-stats.md.
-        "{\"fatal\": %s, \"dropped\": %u, \"total\": %u, "
-        "\"task_window_max\": [%s], \"heap_max\": [%s], \"dep_pool_max\": [%s], \"tensormap_max\": %d}\n",
-        hdr->fatal_latched ? "true" : "false", state->dropped_record_count, state->total_record_count,
-        task_window_max.c_str(), heap_max.c_str(), dep_pool_max.c_str(), hdr->tensormap_cap
-    );
-
-    // Serialize every record into one in-memory buffer, then a single fwrite.
-    // The hot loop is one snprintf per record (not 6 fprintf): stdio format
-    // parsing + per-call FILE locking on ~6×N calls was the dominant host cost.
     std::scoped_lock lock(records_mutex_);
-    std::string out;
-    out.reserve(records_.size() * 448);
-    char line[640];
-    for (const CollectedScopeStatsRecord &collected : records_) {
-        const ScopeStatsRecord &rec = collected.record;
-        const int site_len = static_cast<int>(strnlen(rec.site_file_basename, sizeof(rec.site_file_basename)));
-        const char *phase = (rec.phase == SCOPE_STATS_PHASE_BEGIN) ? "begin" : "end";
-        int n = std::snprintf(
-            line, sizeof(line),
-            "{\"site\": \"%.*s:%d\", \"phase\": \"%s\", \"depth\": %d, \"ring\": %d, "
-            "\"task_window_start\": %d, \"task_window_end\": %d, "
-            "\"heap_start\": %" PRIu64 ", \"heap_end\": %" PRIu64 ", "
-            "\"dep_pool_start\": %d, \"dep_pool_end\": %d, "
-            "\"tensormap\": %d, \"run_epoch\": %" PRIu64 ", \"buf_seq\": %u}\n",
-            site_len, rec.site_file_basename, rec.site_line, phase, rec.depth, rec.ring_id, rec.task_start,
-            rec.task_end, rec.heap_start, rec.heap_end, rec.dep_pool_start, rec.dep_pool_end, rec.tensormap_used,
-            collected.run_epoch, collected.local_seq
-        );
-        if (n > 0) out.append(line, static_cast<size_t>(n < static_cast<int>(sizeof(line)) ? n : sizeof(line) - 1));
-    }
-    std::fwrite(out.data(), 1, out.size(), fp);
+    const int rc = render_jsonl_to(fp, snapshot_unchecked(), records_, nullptr);
     std::fclose(fp);
 
     LOG_INFO(
         "scope_stats: wrote %lu records (dropped=%u) to %s", static_cast<unsigned long>(records_.size()),
-        state->dropped_record_count, path.c_str()
+        scope_stats_state(0)->dropped_record_count, path.c_str()
     );
-    return 0;
+    return rc;
 }
 
 // ---------------------------------------------------------------------------
@@ -391,12 +509,17 @@ int ScopeStatsCollector::write_jsonl(const std::string &output_dir) {
 void ScopeStatsCollector::finalize(ScopeStatsUnregisterCallback unregister_cb, const ScopeStatsFreeCallback &free_cb) {
     if (!initialized_) return;
 
+    // Order matters and differs from the other retained collectors': the
+    // quarantined copies may only be freed once the collector threads that
+    // could still be appending to them are joined, and `stop()` is that join.
+    finish_retained_runs();
     stop();
+    discard_quarantined_runs();
+    stop_writer();
 
     {
         std::scoped_lock lock(records_mutex_);
-        records_.clear();
-        records_.shrink_to_fit();
+        (void)records_.release();
     }
     recovered_current_buf_ = 0;
     recovered_current_total_ = 0;

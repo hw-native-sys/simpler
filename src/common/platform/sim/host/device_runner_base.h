@@ -439,6 +439,7 @@ public:
      * background writer.
      */
     void close_pmu_run_boundary(const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete);
+    void close_scope_stats_run_boundary(const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete);
 
     /**
      * Close one run's ArgsDump window: either today's quiesce, reconcile and
@@ -463,6 +464,7 @@ public:
         chip_swimlane_collector_.configure_retained_runs(enabled, simpler::dfx::runs::kDefaultBudgetBytes);
         dump_collector_.configure_retained_runs(enabled, simpler::dfx::runs::kDefaultBudgetBytes);
         pmu_collector_.configure_retained_runs(enabled);
+        scope_stats_collector_.configure_retained_runs(enabled, simpler::dfx::runs::kDefaultBudgetBytes);
     }
     bool retains_runs() const {
         return chip_swimlane_collector_.retains_runs() || dump_collector_.retains_runs() ||

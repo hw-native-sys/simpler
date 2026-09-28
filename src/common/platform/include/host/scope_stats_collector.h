@@ -58,9 +58,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "common/platform_config.h"
@@ -68,6 +72,7 @@
 #include "common/unified_log.h"
 #include "host/collected_record.h"
 #include "host/profiler_base.h"
+#include "host/scope_stats_runs.h"
 
 // ---------------------------------------------------------------------------
 // scope_stats Module (drives BufferPoolManager<ScopeStatsModule>)
@@ -218,6 +223,78 @@ public:
     /** How many collected records belong to `run_epoch`. */
     size_t collected_for_run(uint64_t run_epoch) const;
 
+    // --- Cross-run retention -------------------------------------------------
+    //
+    // Off unless `configure_retained_runs(true, ...)` is called before init, in
+    // which case the run boundary keeps its ownership steps — the receive drain
+    // and the terminal read — and hands only the rendering and the file write
+    // to a writer thread. Every entry point below is inert with retention off.
+
+    /** Latch retention and this collector's own host byte budget. */
+    void configure_retained_runs(bool retain_across_runs, size_t budget_bytes);
+    bool retains_runs() const { return retain_across_runs_; }
+
+    /**
+     * Admit one run and open its export slot. False refuses the run, and the
+     * caller must fail it before anything reaches the device.
+     *
+     * Refused when quarantined host copies from a run whose completion could
+     * not be proved are still held — `begin_run()` would clear the very records
+     * the quarantine protects — and when both unpublished export slots are in
+     * use.
+     */
+    bool run_begin(uint64_t run_epoch, const std::string &output_prefix);
+
+    /**
+     * Close one run's boundary, under its execution claim.
+     *
+     * `device_execution_complete` is the caller's own fence observation and is
+     * the whole of this collector's completion proof. Without it, and without a
+     * terminal read every device copy reported success for, the run produces no
+     * artifact at all: nothing shared is read, the host copies are quarantined
+     * until the existing collector-thread join, and a sticky error is recorded.
+     */
+    void run_close(uint64_t run_epoch, bool device_execution_complete);
+
+    /** Give an admitted run's slot back when its launch submitted nothing. */
+    void abandon_run(uint64_t run_epoch);
+
+    /** Wait for every closed run to be published. False when any run failed. */
+    bool flush_retained_runs(int timeout_ms, std::string *error);
+
+    /** Publish everything still queued. Called before the collector threads stop. */
+    void finish_retained_runs();
+
+    /** Free quarantined host copies. Only legal once the reader threads are joined. */
+    void discard_quarantined_runs();
+
+    /** Counters a test reads instead of parsing files. */
+    struct RetainedRunStats {
+        uint64_t published{0};
+        uint64_t partial{0};
+        uint64_t counts_unknown{0};
+        uint64_t write_failed{0};
+        uint64_t quarantined{0};
+        uint64_t refused_records{0};
+        uint64_t host_failures{0};
+        size_t open_slots{0};
+        size_t charged_bytes{0};
+        bool has_error{false};
+    };
+    RetainedRunStats retained_run_stats_for_test() const;
+    /** Make the next terminal device copy report failure. */
+    void fail_terminal_copy_for_test(bool fail) { fail_terminal_copy_ = fail; }
+    /** Hold the writer before it publishes, so a test can occupy export slots. */
+    void pause_writer_for_test(bool paused);
+    /** Throw from the collector thread's append, where nothing may escape. */
+    void throw_in_collector_for_test(bool fail) { throw_in_collector_ = fail; }
+    /** Throw from the writer thread's publish, where nothing may escape. */
+    void throw_in_writer_for_test(bool fail) { throw_in_writer_ = fail; }
+    /** Fail the writer-thread construction, as a real `std::thread` can. */
+    void fail_writer_start_for_test(bool fail) { fail_writer_start_ = fail; }
+    /** Throw at the handoff, where a run's records have already left the store. */
+    void fail_handoff_for_test(bool fail) { fail_handoff_ = fail; }
+
 private:
     bool initialized_ = false;
 
@@ -226,9 +303,10 @@ private:
     // set_memory_context in init()).
     void *shm_dev_ = nullptr;
 
-    std::vector<CollectedScopeStatsRecord> records_;
+    simpler::dfx::scope_stats_runs::RecordBlocks records_;
     mutable std::mutex records_mutex_;
     uint64_t total_collected_ = 0;
+    uint64_t refused_records_ = 0;
     uint64_t recovered_current_buf_ = 0;
     uint64_t recovered_current_total_ = 0;
 
@@ -236,6 +314,102 @@ private:
     ScopeStatsBufferState *scope_stats_state(int idx = 0) const { return get_scope_stats_buffer_state(shm_host_, idx); }
 
     void append_buffer_records(const void *buf_host_ptr);
+
+    /**
+     * Render one artifact's bytes. `extra` adds the background-mode metadata
+     * keys; a null `extra` reproduces today's metadata line exactly, which is
+     * what keeps the default path's file unchanged.
+     */
+    static int render_jsonl_to(
+        std::FILE *fp, const simpler::dfx::scope_stats_runs::DeviceSnapshot &device,
+        const simpler::dfx::scope_stats_runs::RecordBlocks &records,
+        const simpler::dfx::scope_stats_runs::Collection *extra
+    );
+
+    /** Today's unchecked read of the shared header, for the default path only. */
+    simpler::dfx::scope_stats_runs::DeviceSnapshot snapshot_unchecked() const;
+
+    /**
+     * Charge one record block, or refuse it.
+     *
+     * Always true with retention off: the default path keeps today's unbounded
+     * in-memory accumulation, and only a retained run is charged.
+     */
+    bool charge_record_block(size_t bytes);
+
+    /**
+     * Record a host-side failure that belongs to the collector rather than to
+     * one run, and keep it until the runner is destroyed.
+     *
+     * Allocates nothing, so it is safe on the paths that call it precisely
+     * because an allocation has just failed.
+     */
+    void note_host_failure(const char *detail) noexcept;
+
+    // --- Cross-run retention state ------------------------------------------
+
+    // A slot is held from admission until its artifact is published, so
+    // "two unpublished exports" is a bound on what the collector is holding,
+    // not merely on what is still filling.
+    enum class SlotState : int { Free = 0, Open = 1, Publishing = 2, Quarantined = 3 };
+
+    struct Slot {
+        SlotState state{SlotState::Free};
+        uint64_t run_epoch{0};
+        std::string output_dir;
+    };
+
+    /**
+     * Copy the shared region and this run's terminal into `out`, reporting
+     * whether every device copy it needed succeeded.
+     *
+     * A false return leaves `out.valid` false. The fields a failed copy may
+     * have left behind are never published: the caller quarantines instead.
+     */
+    bool read_terminal_checked(simpler::dfx::scope_stats_runs::DeviceSnapshot *out);
+
+    /**
+     * Take the producer's unpublished current buffer, if it left one.
+     *
+     * `current_buf_ptr != 0 && count != 0` is device-written evidence that the
+     * buffer was never enqueued: publication clears the pointer immediately
+     * after a successful enqueue, and the end-of-run flush zeroes the count
+     * when its own enqueue fails. So no de-duplication bookkeeping is needed,
+     * and a published buffer is never recovered twice.
+     */
+    bool recover_unpublished_buffer_checked();
+
+    /** `run_close`'s body, wrapped by the boundary's exception guard. */
+    void run_close_locked_path(uint64_t run_epoch, bool device_execution_complete);
+
+    void quarantine_locked(uint64_t run_epoch, const char *detail);
+    void writer_loop();
+    void ensure_writer_started();
+    void stop_writer();
+    int publish_export(const simpler::dfx::scope_stats_runs::RunExport &data);
+
+    bool retain_across_runs_{false};
+    size_t retained_budget_bytes_{0};
+    bool retained_ready_{false};
+    bool fail_terminal_copy_{false};
+    bool throw_in_collector_{false};
+    bool throw_in_writer_{false};
+    bool fail_writer_start_{false};
+    bool fail_handoff_{false};
+    simpler::dfx::runs::HostBudget host_budget_;
+    simpler::dfx::runs::ErrorSummary run_errors_;
+
+    mutable std::mutex retained_mu_;
+    std::condition_variable retained_cv_;
+    Slot slots_[simpler::dfx::runs::kMaxOpenEpochs];
+    std::deque<simpler::dfx::scope_stats_runs::RunExport> write_queue_;
+    simpler::dfx::scope_stats_runs::RecordBlocks quarantined_records_;
+    bool quarantine_held_{false};
+    bool writing_{false};
+    bool writer_running_{false};
+    bool writer_paused_{false};
+    std::thread writer_;
+    RetainedRunStats stats_{};
 };
 
 #endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_SCOPE_STATS_COLLECTOR_H_

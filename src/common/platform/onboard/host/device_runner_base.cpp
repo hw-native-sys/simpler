@@ -3728,8 +3728,24 @@ int DeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &dfx, u
         }
     }
     if (dfx.scope_stats_enabled) {
-        scope_stats_collector_.begin_run();
-        scope_stats_collector_.start(thread_factory);
+        // Configuration picks the path, as it does for the other retaining
+        // collectors: a run a retaining ScopeStats will not admit fails here,
+        // before any kernel is submitted. The refusal that matters is the
+        // quarantine one — `begin_run` would clear the very records a run
+        // whose completion could not be proved is still holding.
+        if (scope_stats_collector_.retains_runs()) {
+            scope_stats_collector_.start(thread_factory);
+            if (!scope_stats_collector_.run_begin(run_epoch, dfx.output_prefix)) {
+                LOG_ERROR(
+                    "ScopeStats: run %llu was not admitted for retained collection",
+                    static_cast<unsigned long long>(run_epoch)
+                );
+                return PTO_RUNTIME_ERR_INTERNAL;
+            }
+        } else {
+            scope_stats_collector_.begin_run();
+            scope_stats_collector_.start(thread_factory);
+        }
     }
     return 0;
 }
@@ -3749,6 +3765,11 @@ void DeviceRunnerBase::withdraw_unlaunched_collectors_for_run(const DfxRunConfig
     if (dfx.dump_args_enabled() && dump_collector_.retains_runs()) {
         try {
             (void)dump_collector_.abandon_run(run_epoch);
+        } catch (...) {}
+    }
+    if (dfx.scope_stats_enabled && scope_stats_collector_.retains_runs()) {
+        try {
+            scope_stats_collector_.abandon_run(run_epoch);
         } catch (...) {}
     }
     if (!dfx.chip_swimlane_enabled()) return;
@@ -3784,6 +3805,7 @@ int DeviceRunnerBase::flush_diagnostics(int timeout_ms, std::string *error) {
     std::string swimlane_error;
     std::string pmu_error;
     std::string dump_error;
+    std::string scope_stats_error;
     bool ok = true;
     if (chip_swimlane_collector_.retains_runs() &&
         !chip_swimlane_collector_.flush_retained_runs(remaining_ms(), &swimlane_error)) {
@@ -3795,10 +3817,17 @@ int DeviceRunnerBase::flush_diagnostics(int timeout_ms, std::string *error) {
     if (!pmu_collector_.flush_retained_runs(remaining_ms(), &pmu_error)) {
         ok = false;
     }
+    // Deliberately not gated on `retains_runs()`, for the same reason PMU's arm
+    // is not: a sticky failure recorded before a collector rebuild reconfigured
+    // retention off must still be reported here. With retention never
+    // configured the call has nothing to wait for and nothing to report.
+    if (!scope_stats_collector_.flush_retained_runs(remaining_ms(), &scope_stats_error)) {
+        ok = false;
+    }
     if (ok) return 0;
     if (error != nullptr) {
         *error = swimlane_error;
-        for (const std::string &part : {dump_error, pmu_error}) {
+        for (const std::string &part : {dump_error, pmu_error, scope_stats_error}) {
             if (part.empty()) continue;
             if (!error->empty()) *error += "; ";
             *error += part;
@@ -3811,6 +3840,7 @@ void DeviceRunnerBase::finish_retained_runs() {
     chip_swimlane_collector_.finish_retained_runs();
     dump_collector_.finish_retained_runs();
     pmu_collector_.finish_retained_runs();
+    scope_stats_collector_.finish_retained_runs();
 }
 
 void DeviceRunnerBase::write_host_phase_records_artifact(const std::string &output_prefix, uint32_t pipeline_slot) {
@@ -3877,6 +3907,24 @@ void DeviceRunnerBase::close_pmu_run_boundary(
     pmu_collector_.run_close(run_epoch, device_execution_complete);
 }
 
+void DeviceRunnerBase::close_scope_stats_run_boundary(
+    const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete
+) {
+    if (!scope_stats_collector_.retains_runs()) {
+        scope_stats_collector_.quiesce();
+        scope_stats_collector_.reconcile_counters();
+        scope_stats_collector_.write_jsonl(dfx.output_prefix);
+        return;
+    }
+    // A retained run keeps the boundary's ownership steps — the receive drain
+    // and the terminal read — and hands only the rendering and the file write
+    // to the writer. `device_execution_complete` is what the caller observed of
+    // this run's fence and is the whole of this collector's completion proof:
+    // without it nothing shared is read and the run produces no artifact.
+    (void)dfx;
+    scope_stats_collector_.run_close(run_epoch, device_execution_complete);
+}
+
 int DeviceRunnerBase::teardown_shared_collectors_after_run(
     const DfxRunConfig &dfx, uint32_t pipeline_slot, uint64_t run_epoch, bool device_execution_complete
 ) {
@@ -3913,9 +3961,7 @@ int DeviceRunnerBase::teardown_shared_collectors_after_run(
             close_pmu_run_boundary(dfx, run_epoch, device_execution_complete);
         }
         if (dfx.scope_stats_enabled) {
-            scope_stats_collector_.quiesce();
-            scope_stats_collector_.reconcile_counters();
-            scope_stats_collector_.write_jsonl(dfx.output_prefix);
+            close_scope_stats_run_boundary(dfx, run_epoch, device_execution_complete);
         }
         return args_dump_rc;
     }
@@ -3946,9 +3992,7 @@ int DeviceRunnerBase::teardown_shared_collectors_after_run(
     }
 
     if (dfx.scope_stats_enabled) {
-        scope_stats_collector_.quiesce();
-        scope_stats_collector_.reconcile_counters();
-        scope_stats_collector_.write_jsonl(dfx.output_prefix);
+        close_scope_stats_run_boundary(dfx, run_epoch, device_execution_complete);
     }
     return args_dump_rc;
 }
