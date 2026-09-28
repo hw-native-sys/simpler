@@ -403,3 +403,26 @@ Single-machine (host + device) L3→L2 and L4→L3→L2 dispatch is implemented 
 verified in `a2a3sim` and onboard `a2a3`. The remote **receive**
 side and the buffer lifecycle robustness (`release_buffer`, in-flight retain /
 deferred-free) are later phases (P2).
+
+## Direct L2 invocation binding
+
+`Worker(level=2).submit` snapshots the TaskArgs views, tags, transfer requests and
+scalar values before binding. This copies descriptors and scalar values, not tensor
+payloads. Changing the caller's TaskArgs after that boundary cannot redirect the
+accepted call or change its retained Buffer identities.
+
+The snapshot uses the same submit-time grant and writable-overlap checks as L3.
+Every DEVICE_MALLOC or VMM_WINDOW argument must match a live allocation's complete
+descriptor on the target chip, including its identity and generation. A cached
+import does not authorize a revoked allocation. Rejection precedes import and
+native submission.
+
+Validation and in-flight identity registration share the device free lock. The
+reservation then protects materialization, native submission and execution through
+run finalization; a failed bind or rejected submission drops it. Free rechecks the
+reservation under that lock before revoking an allocation. This retains the
+existing fail-fast in-flight free contract, without adding deferred physical free.
+
+This boundary covers the public Worker TaskArgs path. The low-level ChipWorker
+POD compatibility entry and external borrowed-pointer construction remain separate
+migration work. It introduces no HOST/NONE chip execution or cross-side mapping.
