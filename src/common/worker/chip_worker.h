@@ -198,8 +198,9 @@ public:
 
     /** Whether one workspace report could be produced, and why not. */
     enum class WorkspaceReportStatus : uint32_t {
-        /** This context's workspace regions have no owner: sim, a chip child,
-            or any route that asked for neither management nor a budget. */
+        /** This context's workspace regions have no owner: a simulated
+            backend, or any route that asked for neither management nor a
+            budget — a chip child included, unless its parent opted in. */
         Disabled = 0,
         /** `out` carries this context's accounting. */
         Available = 1,

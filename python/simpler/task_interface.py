@@ -1506,11 +1506,14 @@ class ChipWorker:
                 diagnostics regions, code and device ELF, RTS and provider
                 memory are outside it, so it is not a device-wide ceiling.
             manage_workspace: Put those same four regions under one owner, so a
-                superseded generation is released when its last consumer
-                retires instead of at close. Internal: the in-process level-2
-                route passes it, and no public `Worker` option sets it. Ignored
-                on a simulated backend, which manages no device workspace. A
-                budget implies it.
+                superseded generation is released once its last consumer
+                retires rather than when its replacement is published, a
+                failed growth leaves the previous plan installed, and a failed
+                release is recorded instead of discarded. Internal: the
+                in-process level-2 route and a directly-closed level-3
+                Worker's forked chip children pass it, and no public `Worker`
+                option sets it. Ignored on a simulated backend, which manages
+                no device workspace. A budget implies it.
             collect_across_runs: Let a run's records outlive its own boundary,
                 so the sealing and the file write happen while the next run
                 executes instead of at the boundary. Off when neither this nor

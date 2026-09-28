@@ -228,6 +228,7 @@ def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
             prewarm_config=None,
             enable_sdma=False,
             collect_across_runs=False,
+            manage_workspace=False,
         ):
             events.append(("init", device_id, bins, log_level, prewarm_config, enable_sdma, collect_across_runs))
 

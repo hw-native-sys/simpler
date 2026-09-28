@@ -3699,6 +3699,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     chip_rank: int | None = None,
     launch_depth: int = 1,
     collect_across_runs: bool = False,
+    manage_workspace: bool = False,
 ) -> None:
     """Runs in forked child process. Loads host_runtime.so in own address space.
 
@@ -3708,6 +3709,14 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
 
     The main loop is delegated to ``_run_chip_main_loop`` — see its docstring
     for the TASK_READY / CONTROL_REQUEST / SHUTDOWN state machine.
+
+    ``manage_workspace`` gives this child's four workspace regions an owner, so
+    a superseded generation is released once its last consumer retires rather
+    than when its replacement is published. The parent decides it (see
+    ``Worker._chip_children_manage_workspace``) because whether this child's
+    close is one a caller can act on is a property of the parent's route, not
+    of anything reachable after the fork. A simulated backend resolves it away
+    inside ``ChipWorker.init``.
     """
     import traceback as _tb  # noqa: PLC0415
 
@@ -3724,6 +3733,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             prewarm_config=prewarm_config,
             enable_sdma=enable_sdma,
             collect_across_runs=collect_across_runs,
+            manage_workspace=manage_workspace,
         )
     except Exception as e:
         _tb.print_exc()
@@ -8309,6 +8319,27 @@ class Worker:
             )
         return budget
 
+    def _chip_children_manage_workspace(self) -> bool:
+        """Whether this Worker's forked chip children own their workspace regions.
+
+        True only for a level-3 Worker with ``device_ids`` that is the root of
+        its own startup epoch. ``_is_startup_root`` is that question already
+        answered: ``init()`` sets it from ``_startup_deadline is None``, which
+        is absent exactly when a caller drove ``init()`` directly, and present
+        for every Worker some other process started — a nested level-3 inside
+        an L4 next-level child, a remote session worker, an MPI group worker.
+
+        The distinction is about whose ``close()`` a refusal reaches. Those
+        descendants are closed by the loop that owns them while their parent is
+        already tearing down, so a child that fails its teardown there has
+        nobody to act on it; a directly-closed Worker reports it to its caller
+        through the reap it already performs.
+
+        Level is not tested separately: ``device_ids`` is refused above level 3
+        (:meth:`_init_hierarchical`) and no chip child is forked without it.
+        """
+        return bool(self._config.get("device_ids")) and self._is_startup_root
+
     def _check_workspace_live(self) -> None:
         """Refuse a protected teardown while workspace still has a drainable consumer.
 
@@ -8316,13 +8347,18 @@ class Worker:
         ``CleanupJournal.drive`` continues past a failing entry: an entry that
         merely sorts first would not stop the owner Buffers from being released.
 
-        Three outcomes, and the two failures are not the same. ``disabled`` means
-        no budget was ever latched, which is the default and protects nothing.
-        ``unavailable`` means one *was* latched and its accounting could not be
-        read — treating that as ``disabled`` would release the Buffers a live
-        consumer may still be reading, so it refuses instead. A context that
-        never published a block has no ownership fact to protect and is exempt
-        on that fact alone.
+        In-process level 2 only: this reads ``self._chip_worker``, and a Worker
+        whose chips are forked children has none. Those children own their own
+        regions and close them inside their own process (see
+        :meth:`_chip_children_manage_workspace`); no report crosses the fork.
+
+        Three outcomes, and the two failures are not the same. ``disabled``
+        means the four regions have no owner on this context, which protects
+        nothing. ``unavailable`` means they *are* owned and their accounting
+        could not be read — treating that as ``disabled`` would release the
+        Buffers a live consumer may still be reading, so it refuses instead. A
+        context that never published a block has no ownership fact to protect
+        and is exempt on that fact alone.
         """
         cw = self._chip_worker
         if cw is None:
@@ -8370,11 +8406,11 @@ class Worker:
             enable_sdma=bool(self._config.get("enable_sdma", False)),
             collect_across_runs=bool(self._config.get("collect_across_runs", False)),
             workspace_budget_bytes=workspace_budget,
-            # The one route whose teardown can be fenced before the public
-            # Buffer release, so the one route whose workspace lifetimes are
-            # managed by default. Not a public option: a forked chip child
-            # reaches ChipWorker.init without it and keeps its existing path
-            # until L3 has a cross-process close proof of its own.
+            # Not a public option. This route additionally fences its teardown
+            # on the live-consumer check below, which a forked chip child has
+            # no equivalent of; the child manages the same four regions and
+            # closes them inside its own process instead
+            # (_chip_children_manage_workspace).
             manage_workspace=True,
         )
 
@@ -8660,6 +8696,9 @@ class Worker:
                             chip_rank=idx,
                             launch_depth=self._launch_depth,
                             collect_across_runs=bool(self._config.get("collect_across_runs", False)),
+                            # Read from the state the fork copied, so every
+                            # child of one Worker resolves it the same way.
+                            manage_workspace=self._chip_children_manage_workspace(),
                         )
                     except BaseException as e:  # noqa: BLE001
                         import traceback as _tb  # noqa: PLC0415

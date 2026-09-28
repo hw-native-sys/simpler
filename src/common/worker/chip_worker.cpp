@@ -443,16 +443,19 @@ void ChipWorker::init(
         // than from a probe:
         //
         //   sim         a simulated backend manages no device workspace, so
-        //               neither management nor a limit is requested and the
+        //               a request is ignored rather than refused, and the
         //               absence of the symbols is never examined;
-        //   unrequested a caller that asked for neither — the forked chip
-        //               child today — keeps exactly the path it had;
-        //   supported   an in-process level-2 context on a real device.
+        //   unrequested a caller that asked for neither keeps exactly the path
+        //               it had — a chip child whose parent did not opt in
+        //               among them;
+        //   supported   a program context on a real device whose caller asked:
+        //               the in-process level-2 route, and the chip children of
+        //               a level-3 Worker its own caller inits and closes.
         //
-        // On the supported route the capability is required, because a
-        // teardown protection that reads the report must never be left unable
-        // to tell "not managed" from "managed but unreadable". Staged here and
-        // installed by simpler_init once the program-mode latch is taken.
+        // On the supported route the capability is required, because a caller
+        // that reads the report must never be left unable to tell "not
+        // managed" from "managed but unreadable". Staged here and installed by
+        // simpler_init once the program-mode latch is taken.
         const bool simulated = !sim_context_path.empty();
         const bool wants_workspace = !simulated && (manage_workspace || workspace_budget_bytes != 0);
         if (wants_workspace) {
