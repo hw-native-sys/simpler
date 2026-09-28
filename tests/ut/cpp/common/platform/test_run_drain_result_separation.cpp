@@ -59,8 +59,8 @@ public:
         b.acquire = [](void *ctx, size_t bytes) -> void * {
             return static_cast<FakeBackend *>(ctx)->acquire(bytes);
         };
-        b.release = [](void *ctx, void *base) {
-            return static_cast<FakeBackend *>(ctx)->release(base);
+        b.release = [](void *ctx, void *base, int *platform_rc) {
+            return static_cast<FakeBackend *>(ctx)->release(base, platform_rc);
         };
         return b;
     }
@@ -71,10 +71,10 @@ public:
         return reinterpret_cast<void *>(next_);
     }
 
-    int release(void *base) {
+    WorkspaceManager::ReleaseOutcome release(void *base, int * /*platform_rc*/) {
         released.push_back(base);
         live_bytes.erase(base);
-        return 0;
+        return WorkspaceManager::ReleaseOutcome::Freed;
     }
 
     std::vector<void *> released;
@@ -109,7 +109,8 @@ int settle_run(WorkspaceManager &m, const DrainOutcome &drain) {
 TEST(RunDrainResultSeparation, ADiagnosticsFailureFailsTheCallerAndStillRetiresTheRun) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kBudget, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kBudget));
     void *block = m.acquire(WorkspaceManager::staging_region(kSlot), kEpoch, 4096);
     ASSERT_NE(block, nullptr);
 
@@ -145,7 +146,8 @@ TEST(RunDrainResultSeparation, ADiagnosticsFailureFailsTheCallerAndStillRetiresT
 TEST(RunDrainResultSeparation, ADeviceErrorKeepsPriorityAndQuarantinesTheRunsBlocks) {
     FakeBackend backend;
     WorkspaceManager m;
-    ASSERT_TRUE(m.configure(kBudget, backend.ops()));
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(kBudget));
     void *block = m.acquire(WorkspaceManager::staging_region(kSlot), kEpoch, 4096);
     ASSERT_NE(block, nullptr);
 
