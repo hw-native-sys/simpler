@@ -50,7 +50,7 @@ TEST_F(ArgsDumpTest, EnableDisableAndDumpBaseRoundTrip) {
 // trip — this is the coupling the pool must not have. Exercises both the mask
 // table and the scalar-dtype table.
 TEST_F(ArgsDumpTest, HighRingTaskIdRoundTrips) {
-    const uint64_t task_id = (uint64_t{7} << 32) | 123u;
+    const TaskId task_id = TaskId::make(7, 123);
     const ArgsDumpArgMask mask = 0b1011;
     const ArgsDumpArgMask flags = 0b0010;
     const uint8_t dtypes[3] = {2, 5, 11};
@@ -76,8 +76,8 @@ TEST_F(ArgsDumpTest, HighRingTaskIdRoundTrips) {
 // Two distinct task_ids must keep independent entries (open-addressed probing
 // resolves any hash collision to separate slots).
 TEST_F(ArgsDumpTest, DistinctTaskIdsDoNotAlias) {
-    const uint64_t id_a = (uint64_t{2} << 32) | 100u;
-    const uint64_t id_b = (uint64_t{3} << 32) | 200u;
+    const TaskId id_a = TaskId::make(2, 100);
+    const TaskId id_b = TaskId::make(3, 200);
 
     set_dump_args_task_mask(id_a, 0b0001, ARGS_DUMP_ARG_MASK_NONE);
     set_dump_args_task_mask(id_b, 0b1000, ARGS_DUMP_ARG_MASK_NONE);
@@ -95,7 +95,7 @@ TEST_F(ArgsDumpTest, DistinctTaskIdsDoNotAlias) {
 TEST_F(ArgsDumpTest, UnknownTaskIdReadsNone) {
     ArgsDumpArgMask got_mask = 0xFFFF;
     ArgsDumpArgMask got_flags = 0xFFFF;
-    get_dump_args_task_masks((uint64_t{5} << 32) | 42u, &got_mask, &got_flags);
+    get_dump_args_task_masks(TaskId::make(5, 42), &got_mask, &got_flags);
     EXPECT_EQ(got_mask, ARGS_DUMP_ARG_MASK_NONE);
     EXPECT_EQ(got_flags, ARGS_DUMP_ARG_MASK_NONE);
 }
@@ -128,7 +128,7 @@ TEST_F(ArgsDumpTest, DumpRecordCorrectness) {
 
     // Record a 1-D UINT64 tensor (4 elements, contiguous).
     ArgsDumpInfo tinfo = {};
-    tinfo.task_id = 0xDEAD;
+    tinfo.task_id = TaskId::make(0, 0xDEAD);
     tinfo.role = ArgsDumpRole::INPUT;
     tinfo.stage = ArgsDumpStage::BEFORE_DISPATCH;
     tinfo.dtype = static_cast<uint8_t>(DataType::UINT64);
@@ -145,7 +145,7 @@ TEST_F(ArgsDumpTest, DumpRecordCorrectness) {
     ASSERT_EQ(dump_arg_record(0, tinfo), 0);
 
     const ArgsDumpRecord &trec = meta_buf.records[0];
-    EXPECT_EQ(trec.task_id, 0xDEAD);
+    EXPECT_EQ(trec.task_id, TaskId::make(0, 0xDEAD));
     EXPECT_EQ(trec.role, static_cast<uint8_t>(ArgsDumpRole::INPUT));
     EXPECT_EQ(trec.stage, static_cast<uint8_t>(ArgsDumpStage::BEFORE_DISPATCH));
     EXPECT_EQ(trec.dtype, static_cast<uint8_t>(DataType::UINT64));
@@ -169,7 +169,7 @@ TEST_F(ArgsDumpTest, DumpRecordCorrectness) {
 
     // Record a scalar (no arena copy; scalar_value carried inline in the record).
     ArgsDumpInfo sinfo = {};
-    sinfo.task_id = 0xBEEF;
+    sinfo.task_id = TaskId::make(0, 0xBEEF);
     sinfo.role = ArgsDumpRole::INPUT;
     sinfo.stage = ArgsDumpStage::BEFORE_DISPATCH;
     sinfo.dtype = static_cast<uint8_t>(DataType::UINT64);
@@ -182,7 +182,7 @@ TEST_F(ArgsDumpTest, DumpRecordCorrectness) {
     ASSERT_EQ(dump_arg_record(0, sinfo), 0);
 
     const ArgsDumpRecord &srec = meta_buf.records[1];
-    EXPECT_EQ(srec.task_id, 0xBEEF);
+    EXPECT_EQ(srec.task_id, TaskId::make(0, 0xBEEF));
     EXPECT_EQ(srec.kind, static_cast<uint8_t>(ArgsDumpKind::SCALAR));
     EXPECT_EQ(srec.scalar_value, 0x12345678u);
     EXPECT_EQ(srec.payload_size, 0u);
@@ -246,7 +246,7 @@ TEST_F(ArgsDumpTest, ArenaBackpressureChecksBeforePayloadOverwrite) {
         state->completed_payload_count = state->published_payload_count;
     });
 
-    info.task_id = 1;
+    info.task_id = TaskId::make(0, 1);
     info.buffer_addr = reinterpret_cast<uint64_t>(second_data);
     EXPECT_EQ(dump_arg_record(0, info), 0);
     host.join();
@@ -282,7 +282,7 @@ TEST_F(ArgsDumpTest, Level3UsesTaskMaskForTensorPayload) {
 
     set_platform_dump_base(reinterpret_cast<uint64_t>(dump_mem));
     set_dump_args_enabled(true);
-    constexpr uint64_t kTaskId = 0;
+    constexpr TaskId kTaskId = TaskId::make(0, 0);
 
     dump_args_init(1);
 

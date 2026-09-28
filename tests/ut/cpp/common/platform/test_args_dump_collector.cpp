@@ -23,6 +23,8 @@
 #include <unistd.h>
 #include <vector>
 
+#include "support/test_task_id.h"
+
 namespace {
 
 void *test_alloc(size_t size) { return std::calloc(1, size); }
@@ -62,7 +64,7 @@ TEST(ArgsDumpCollectorTest, MergesConcurrentShardRecordsIntoManifest) {
             buffer.count = kRecordsPerShard;
             for (int record = 0; record < kRecordsPerShard; record++) {
                 ArgsDumpRecord &entry = buffer.records[record];
-                entry.task_id = static_cast<uint64_t>(shard * kRecordsPerShard + record);
+                entry.task_id = simpler::ut::test_task_id(shard * kRecordsPerShard + record);
                 entry.role = static_cast<uint8_t>(ArgsDumpRole::INPUT);
                 entry.stage = static_cast<uint8_t>(ArgsDumpStage::BEFORE_DISPATCH);
                 entry.kind = static_cast<uint8_t>(ArgsDumpKind::SCALAR);
@@ -134,7 +136,7 @@ TEST(ArgsDumpCollectorTest, ArenaAckAdvancesOnlyForThreadsWhosePayloadsLanded) {
         DumpMetaBuffer &buffer = buffers[arena_index];
         buffer.count = 1;
         ArgsDumpRecord &record = buffer.records[0];
-        record.task_id = static_cast<uint64_t>(arena_index);
+        record.task_id = simpler::ut::test_task_id(arena_index);
         record.role = static_cast<uint8_t>(ArgsDumpRole::INPUT);
         record.stage = static_cast<uint8_t>(ArgsDumpStage::BEFORE_DISPATCH);
         record.kind = static_cast<uint8_t>(ArgsDumpKind::TENSOR);
@@ -251,7 +253,7 @@ TEST(ArgsDumpCollectorTest, FinalizeStopsTheWriterWhenExportIsSkipped) {
     // One collected buffer is all it takes to start the writer thread.
     DumpMetaBuffer buffer{};
     buffer.count = 1;
-    buffer.records[0].task_id = 0x1234;
+    buffer.records[0].task_id = simpler::ut::test_task_id(0x1234);
     buffer.records[0].role = static_cast<uint8_t>(ArgsDumpRole::INPUT);
     buffer.records[0].stage = static_cast<uint8_t>(ArgsDumpStage::BEFORE_DISPATCH);
     buffer.records[0].kind = static_cast<uint8_t>(ArgsDumpKind::SCALAR);

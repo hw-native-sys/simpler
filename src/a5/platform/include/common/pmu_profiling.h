@@ -36,6 +36,11 @@
 
 #include "common/core_type.h"
 #include "common/platform_config.h"
+// The owning runtime's task handle. Each runtime has its own TaskId in its own
+// namespace, and the include path resolves this bare name to whichever runtime is
+// being built: src/common/<runtime> is on that build's include path, and reaching
+// both headers from one scope is a compile error rather than a silent pick.
+#include "task_id.h"
 
 /**
  * PMU event type selector. Values match pypto's PROF_PMU_EVENT_TYPE (see
@@ -139,13 +144,12 @@ inline const PmuEventConfig *pmu_resolve_event_config_a5(PmuEventType event_type
 // =============================================================================
 
 /**
- * Per-task PMU snapshot written by AICPU after each AICore task FIN.
- *
- * AICore writes task_id / pmu_total_cycles / pmu_counters[] into the
- * dual-issue staging slot. AICPU fills func_id / core_type on commit.
+ * Per-task PMU snapshot, written by AICPU into a PmuBuffer after each AICore
+ * task FIN. It takes the counters from the AICore staging slot and adds the
+ * identity and kernel metadata only AICPU knows.
  */
 struct PmuRecord {
-    uint64_t task_id;                             // Runtime task id
+    TaskId task_id;                               // Identity, in the minting runtime's layout
     uint32_t func_id;                             // Kernel function identifier (AICPU-owned)
     CoreType core_type;                           // AIC or AIV (AICPU-owned)
     uint64_t pmu_total_cycles;                    // PMU_CNT_TOTAL (64-bit combined)
@@ -155,6 +159,25 @@ struct PmuRecord {
 // =============================================================================
 // PmuAicoreRing - Stable AICore→AICPU Staging Ring (per core, never rotated)
 // =============================================================================
+
+/**
+ * One task's counters as AICore staged them, before AICPU attaches an identity.
+ *
+ * `reg_task_id` is the per-core dispatch token AICore read from its register,
+ * not a task id: it says which dispatch these counters belong to, and AICPU
+ * matches it against the token it is completing. AICore publishes it last, so
+ * a non-matching slot is one AICore has not filled yet. Nothing here is a task
+ * identity and nothing here is AICPU-owned — both of those live in PmuRecord.
+ */
+struct PmuAicoreSlot {
+    uint64_t pmu_total_cycles;                    // PMU_CNT_TOTAL (64-bit combined)
+    uint32_t pmu_counters[PMU_COUNTER_COUNT_A5];  // PMU_CNT0..CNT9
+    uint32_t reg_task_id;                         // Per-core dispatch token; published last
+} __attribute__((aligned(64)));
+
+// One slot per cache line, which is what lets AICore commit a staged snapshot
+// with a single dcci and AICPU read the token and the counters together.
+static_assert(sizeof(PmuAicoreSlot) == 64, "PmuAicoreSlot must stay one cache line");
 
 /**
  * Per-core PMU staging ring written exclusively by AICore.
@@ -168,7 +191,7 @@ struct PmuRecord {
  * writes are decoupled from AICPU's PmuBuffer rotation.
  */
 struct PmuAicoreRing {
-    PmuRecord dual_issue_slots[PLATFORM_PMU_AICORE_RING_SIZE];
+    PmuAicoreSlot dual_issue_slots[PLATFORM_PMU_AICORE_RING_SIZE];
 } __attribute__((aligned(64)));
 
 // =============================================================================

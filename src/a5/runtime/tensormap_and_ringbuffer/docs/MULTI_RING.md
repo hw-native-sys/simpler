@@ -24,18 +24,20 @@ Inner-scope tasks can now be reclaimed independently without waiting for outer-s
 Task IDs are widened from 32-bit to 64-bit to carry the ring identity:
 
 ```text
-task_id.raw = (ring_id << 32) | local_id
+TaskId::to_uint64(task_id) == (ring_id << 32) | local_id
 ```
 
 `TaskId` is this runtime's own type, declared with its encoding in
-`src/common/tensormap_and_ringbuffer/task_id.h`:
+`src/common/tensormap_and_ringbuffer/task_id.h`. The encoding is private, so a
+factory is the only way to mint a handle and an accessor the only way to read a
+field out of one:
 
 | API | Purpose |
 | --- | ------- |
 | `TaskId::make(ring_id, local_id)` | Compose a 64-bit task ID (`TaskId`) |
-| `task_id.ring()` | Extract `ring_id` (bits 63-32) |
+| `task_id.ring()` | Extract `ring_id` (bits 39-32) |
 | `task_id.local_id()` | Extract `local_id` (bits 31-0) |
-| `task_id.raw` | Access the packed 64-bit encoding |
+| `TaskId::to_uint64(task_id)` | The packed encoding as one integer, for the uses that need a number rather than the handle: log formatting, JSON serialization, hash distribution |
 
 Type changes:
 

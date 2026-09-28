@@ -34,6 +34,7 @@
 #include "common/dep_gen.h"
 #include "common/memory_barrier.h"
 #include "host/dep_gen_collector.h"
+#include "support/test_task_id.h"
 
 namespace {
 
@@ -111,18 +112,19 @@ protected:
         dep_gen_aicpu_set_orch_thread_idx(0);
         dep_gen_aicpu_init();
         for (int i = 0; i < submits; i++) {
-            record_submit(0x1000 + static_cast<uint64_t>(i));
+            record_submit(0x1000 + static_cast<uint32_t>(i));
         }
         dep_gen_aicpu_set_orch_thread_idx(orch_idx_at_flush);
         dep_gen_aicpu_flush();
         dep_gen_aicpu_set_orch_thread_idx(0);
     }
 
-    void record_submit(uint64_t task_id_raw) {
+    void record_submit(uint32_t task_id) {
         const int32_t kernel_ids[3] = {-1, -1, -1};
         dep_gen_aicpu_record_submit(
-            task_id_raw, /*in_manual_scope=*/false, /*early_dispatch=*/false, /*tensor_count=*/0,
-            /*tensor_ptrs=*/nullptr, /*arg_types=*/nullptr, /*explicit_dep_count=*/0, /*explicit_deps_raw=*/nullptr,
+            simpler::ut::test_task_id(task_id), /*in_manual_scope=*/false, /*early_dispatch=*/false,
+            /*tensor_count=*/0,
+            /*tensor_ptrs=*/nullptr, /*arg_types=*/nullptr, /*explicit_dep_count=*/0, /*explicit_deps=*/nullptr,
             /*explicit_dep_kinds_raw=*/nullptr, kCreatorEdgeDepKinds, /*block_num=*/1, kernel_ids
         );
     }

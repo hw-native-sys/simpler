@@ -150,26 +150,26 @@ void format_core_status(
         return;
     }
     int32_t kernel = -1;
-    int64_t task_id_raw = -1;
+    TaskId task_id = TaskId::invalid();
     if (core_state && core_state->running_slot_state) {
         int32_t subslot = static_cast<int32_t>(core_state->running_subslot);
         kernel = core_state->running_slot_state->to_descriptor().kernel_id[subslot];
-        task_id_raw = static_cast<int64_t>(core_state->running_slot_state->to_descriptor().task_id.raw);
+        task_id = core_state->running_slot_state->to_descriptor().task_id;
     }
     uint64_t cond_reg = read_reg(reg_addr_for_cond, RegId::COND);
     int32_t hw_state = EXTRACT_TASK_STATE(cond_reg);
     const char *cond_reg_state_str = (hw_state == TASK_ACK_STATE) ? "ack" : "fin";
     if (hw_state == TASK_ACK_STATE) {
         snprintf(
-            buf, buf_size, "core%d(busy kernel=%d task=%" PRId64 " cond_reg_state=%s)", core_id, kernel, task_id_raw,
-            cond_reg_state_str
+            buf, buf_size, "core%d(busy kernel=%d task=0x%" PRIx64 " cond_reg_state=%s)", core_id, kernel,
+            TaskId::to_uint64(task_id), cond_reg_state_str
         );
     } else {
         snprintf(
             buf, buf_size,
-            "core%d(busy kernel=%d task=%" PRId64
+            "core%d(busy kernel=%d task=0x%" PRIx64
             " cond_reg_state=%s ANOMALY cond_tok=%d running_tok=%d pending_tok=%d)",
-            core_id, kernel, task_id_raw, cond_reg_state_str, EXTRACT_TASK_ID(cond_reg),
+            core_id, kernel, TaskId::to_uint64(task_id), cond_reg_state_str, EXTRACT_TASK_ID(cond_reg),
             core_state->running_reg_task_id, core_state->pending_reg_task_id
         );
     }
@@ -246,7 +246,7 @@ void SchedulerContext::log_stall_diagnostics(
             int32_t kid_aic = slot_state.to_descriptor().kernel_id[0];
             int32_t kid_aiv0 = slot_state.to_descriptor().kernel_id[1];
             int32_t kid_aiv1 = slot_state.to_descriptor().kernel_id[2];
-            int64_t task_id = static_cast<int64_t>(slot_state.to_descriptor().task_id.raw);
+            uint64_t task_id = TaskId::to_uint64(slot_state.to_descriptor().task_id);
             if (completed) continue;
             // The state byte has no intermediate ready/running value — a task
             // stays PENDING until it publishes PUBLISHED or COMPLETED, neither
@@ -275,7 +275,7 @@ void SchedulerContext::log_stall_diagnostics(
                 if (cnt_running > STALL_DUMP_READY_MAX) continue;
                 STALL_DUMP_LOG(
                     report,
-                    "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=%" PRId64
+                    "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=0x%" PRIx64
                     " state=RUNNING fanin_met=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d] "
                     "running_on=[owner_thread=%d cores=[%s]]",
                     thread_idx, idle_iterations, 0, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1, owner, running_on
@@ -287,7 +287,7 @@ void SchedulerContext::log_stall_diagnostics(
                 if (cnt_ready > STALL_DUMP_READY_MAX) continue;
                 STALL_DUMP_LOG(
                     report,
-                    "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=%" PRId64
+                    "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=0x%" PRIx64
                     " state=READY   fanin_met=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d]",
                     thread_idx, idle_iterations, 0, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1
                 );
@@ -297,7 +297,7 @@ void SchedulerContext::log_stall_diagnostics(
             if (cnt_waiting > STALL_DUMP_WAIT_MAX) continue;
             STALL_DUMP_LOG(
                 report,
-                "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=%" PRId64
+                "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=0x%" PRIx64
                 " state=WAIT    fanin_met=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d] missing_deps=%d",
                 thread_idx, idle_iterations, 0, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1, fi - rc
             );
@@ -1160,7 +1160,7 @@ void SchedulerContext::classify_partition(int32_t thread_idx, int32_t nthreads) 
         ChipTaskSlotState &slot = tasks.get_slot_state_by_task_id(id);
         if (slot.task_kind == TaskKind::GRAPH) {
             if (graph_execution_localize(slot) == nullptr) slot.graph_context = nullptr;
-            if (!sched_->push_graph_prepare(&slot, slot.to_descriptor().task_id.raw, thread_idx)) return;
+            if (!sched_->push_graph_prepare(&slot, slot.to_descriptor().task_id, thread_idx)) return;
         }
         int32_t state = sched_->classify_fanin_state(&slot);
         if (state < 0) {

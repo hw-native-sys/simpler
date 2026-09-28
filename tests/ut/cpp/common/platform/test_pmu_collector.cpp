@@ -11,6 +11,8 @@
 
 #include "host/pmu_collector.h"
 
+#include "support/test_task_id.h"
+
 #include <gtest/gtest.h>
 
 #include <atomic>
@@ -94,7 +96,7 @@ TEST(PmuCollectorTest, MergesConcurrentShardWritesIntoFinalCsv) {
             ready_workers.fetch_add(1, std::memory_order_release);
             while (!start_workers.load(std::memory_order_acquire)) {}
             for (int record = 0; record < kRecordsPerShard; record++) {
-                buffer.records[0].task_id = static_cast<uint64_t>(shard * kRecordsPerShard + record);
+                buffer.records[0].task_id = simpler::ut::test_task_id(shard * kRecordsPerShard + record);
                 collector.on_buffer_collected(info, shard);
             }
         });

@@ -26,13 +26,14 @@
 #include "aicore_completion_mailbox.h"
 #include "async_wait.h"
 #include "scheduler/scheduler.h"
+#include "support/test_task_id.h"
 
 namespace {
 
-// The mailbox stores a token and compares it for identity; it never decodes one,
-// and the encoding belongs to whichever runtime minted it, so any distinct 64-bit
-// value serves here.
-TaskId make_token(uint32_t local) { return TaskId{local}; }
+// The mailbox stores a token and compares it for identity; it never decodes one, so
+// any distinct handle serves here. This source is built against both runtimes, whose
+// factories differ, so the mint comes from whichever one the build resolved.
+TaskId make_token(int32_t local) { return simpler::ut::test_task_id(local); }
 
 AICoreCompletionMailbox *fresh_mailbox() {
     void *raw = ::operator new(sizeof(AICoreCompletionMailbox));
@@ -65,7 +66,7 @@ TEST(A5AICoreCompletionMailbox, PushConditionThenDrainCreatesEntry) {
     EXPECT_EQ(err, SIMPLER_ERROR_NONE);
 
     ASSERT_EQ(wait_list.count, 1);
-    EXPECT_EQ(wait_list.entries[0].task_token.raw, token.raw);
+    EXPECT_EQ(wait_list.entries[0].task_token, token);
     EXPECT_EQ(wait_list.entries[0].slot_state, nullptr);
     ASSERT_EQ(wait_list.entries[0].condition_count, 1);
     EXPECT_EQ(wait_list.entries[0].conditions[0].expected_value, 7u);
@@ -91,7 +92,7 @@ TEST(A5AICoreCompletionMailbox, PushNormalDoneCreatesEntryReadyToComplete) {
     EXPECT_EQ(err, SIMPLER_ERROR_NONE);
 
     ASSERT_EQ(wait_list.count, 1);
-    EXPECT_EQ(wait_list.entries[0].task_token.raw, token.raw);
+    EXPECT_EQ(wait_list.entries[0].task_token, token);
     EXPECT_EQ(reinterpret_cast<uint64_t>(wait_list.entries[0].slot_state), slot_addr);
     EXPECT_EQ(wait_list.entries[0].condition_count, 0);
     EXPECT_EQ(wait_list.entries[0].waiting_completion_count, 0);

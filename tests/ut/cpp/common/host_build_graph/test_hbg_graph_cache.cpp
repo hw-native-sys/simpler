@@ -992,9 +992,9 @@ TEST(GraphExecutionErrors, GraphPrepareQueueOverflowIsReported) {
     scheduler.graph_prepare_queue.dequeue_pos.store(0, std::memory_order_relaxed);
     ChipTaskSlotState graph_slots[3]{};
 
-    EXPECT_TRUE(scheduler.push_graph_prepare(&graph_slots[0], 10, 3));
-    EXPECT_TRUE(scheduler.push_graph_prepare(&graph_slots[1], 11, 3));
-    EXPECT_FALSE(scheduler.push_graph_prepare(&graph_slots[2], 12, 3));
+    EXPECT_TRUE(scheduler.push_graph_prepare(&graph_slots[0], TaskId::make_global(10), 3));
+    EXPECT_TRUE(scheduler.push_graph_prepare(&graph_slots[1], TaskId::make_global(11), 3));
+    EXPECT_FALSE(scheduler.push_graph_prepare(&graph_slots[2], TaskId::make_global(12), 3));
 
     EXPECT_EQ(header.sched_error_code.load(std::memory_order_acquire), SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
     EXPECT_EQ(header.sched_error_thread.load(std::memory_order_acquire), 3);

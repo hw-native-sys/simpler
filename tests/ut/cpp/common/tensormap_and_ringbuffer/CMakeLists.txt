@@ -91,6 +91,10 @@ tmr_case(test_dep_gen_replay.cpp
     SOURCES  ${TMR_SHARED_HOST_DIR}/dep_gen_replay.cpp
     INCLUDES ${TMR_SHARED_HOST_DIR})
 
+# TaskId is arch-agnostic (src/common/tensormap_and_ringbuffer/task_id.h) and
+# header-only, so one arch's include path exercises the whole handle.
+tmr_case(test_task_id.cpp ARCHS a2a3)
+
 tmr_case(test_trb_runtime_temp_buffer.cpp
     SOURCES
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/host/runtime_maker.cpp

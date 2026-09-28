@@ -32,17 +32,17 @@
 bool dep_gen_host_graph_enabled() { return false; }
 
 void dep_gen_host_graph_begin_task(
-    uint64_t, bool, bool, const int32_t[3], int32_t, int32_t, const TensorRef *, const TensorArgType *
+    simpler::hbg::TaskId, bool, bool, const int32_t[3], int32_t, int32_t, const TensorRef *, const TensorArgType *
 ) {}
 
 void dep_gen_host_graph_end_task() {}
 
-void dep_gen_host_graph_add_explicit_edge(uint64_t) {}
+void dep_gen_host_graph_add_explicit_edge(simpler::hbg::TaskId) {}
 
-void dep_gen_host_graph_add_creator_edge(uint64_t, int32_t, const simpler::hbg::Tensor &) {}
+void dep_gen_host_graph_add_creator_edge(simpler::hbg::TaskId, int32_t, const simpler::hbg::Tensor &) {}
 
 void dep_gen_host_graph_add_tensormap_edge(
-    uint64_t, int32_t, const simpler::hbg::Tensor &, const ChipTensorMapEntry &, OverlapStatus
+    simpler::hbg::TaskId, int32_t, const simpler::hbg::Tensor &, const ChipTensorMapEntry &, OverlapStatus
 ) {}
 
 // 0 is the "this bind records nothing" answer host_phase_trace.h documents, which

@@ -202,12 +202,11 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
     tracker.set_pending_occupied(core_offset);
 
     LOG_DEBUG(
-        "Thread %d: Dispatched %s %s task %" PRId64 " kernel_id=[%d,%d,%d] block_idx=%d/total_blocks=%d to"
+        "Thread %d: Dispatched %s %s task 0x%" PRIx64 " kernel_id=[%d,%d,%d] block_idx=%d/total_blocks=%d to"
         " core_offset=%d core_id=%d reg_task_id=%u",
-        thread_idx, to_pending ? "pending" : "idle", subslot_name(subslot),
-        static_cast<int64_t>(slot_state.task->task_id.raw), slot_state.task->kernel_id[0],
-        slot_state.task->kernel_id[1], slot_state.task->kernel_id[2], block_idx, slot_state.logical_block_num,
-        core_offset, core_id, reg_task_id
+        thread_idx, to_pending ? "pending" : "idle", subslot_name(subslot), TaskId::to_uint64(slot_state.task->task_id),
+        slot_state.task->kernel_id[0], slot_state.task->kernel_id[1], slot_state.task->kernel_id[2], block_idx,
+        slot_state.logical_block_num, core_offset, core_id, reg_task_id
     );
 
     // AICore buffer rotation lives on the dispatch path: count this dispatch
@@ -720,10 +719,11 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, ResourceShape shape, 
     if (!cores.has_value()) return 0;
 
     int32_t total_staged = 0;
-    ChipTaskSlotState *batch[CoreTracker::MAX_CLUSTERS * 3];
-    uint64_t task_id_snapshots[CoreTracker::MAX_CLUSTERS * 3];
+    EarlyStagingScratch &scratch = early_staging_[thread_idx];
+    ChipTaskSlotState **batch = scratch.batch;
+    TaskId *task_id_snapshots = scratch.task_id_snapshots;
     // Batch-pop in one queue op (fewer CAS than one pop per consumer); the pop is
-    // bounded by the shape's capacity so the stack buffer always holds it. Then for
+    // bounded by the shape's capacity so the scratch above always holds it. Then for
     // each consumer: CLAIM a range sized to THIS thread's free cores by advancing
     // next_block_idx with a CAS (atomic — next_block_idx is shared with normal
     // dispatch, which also claims it if release routes the consumer to the ready
@@ -736,7 +736,7 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, ResourceShape shape, 
     int got = sched_->early_dispatch_queues[s].pop_batch_tagged(batch, task_id_snapshots, cores.count());
     for (int bi = 0; bi < got; bi++) {
         ChipTaskSlotState *c = batch[bi];
-        if (static_cast<uint64_t>(c->task->task_id.raw) != task_id_snapshots[bi]) continue;
+        if (c->task->task_id != task_id_snapshots[bi]) continue;
         if (c->payload->early_dispatch_state.load(std::memory_order_acquire) != EARLY_DISPATCH_STAGING)
             continue;  // released
 
@@ -780,8 +780,7 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, ResourceShape shape, 
         if (start + claim < c->logical_block_num) {
             if (!sched_->early_dispatch_queues[s].push_tagged(c, task_id_snapshots[bi]))
                 LOG_DEBUG(
-                    "[EARLY_DISPATCH] queue full on re-push, consumer=%" PRId64,
-                    static_cast<int64_t>(c->task->task_id.raw)
+                    "[EARLY_DISPATCH] queue full on re-push, consumer=0x%" PRIx64, TaskId::to_uint64(c->task->task_id)
                 );
         }
         // stage_consumer_blocks fills the idle bucket (RUNNING slot) then the pend
@@ -827,10 +826,9 @@ int32_t SchedulerContext::try_early_dispatch(
     // tracker when it can hold the entire cohort; only the capacity-short case arms the
     // stop-the-world drain. Both paths force-gate every block even if producer release races
     // STAGING -> DISPATCHED. A non-STAGING pop was already released and is dropped.
-    uint64_t sync_task_id_snapshot = 0;
+    TaskId sync_task_id_snapshot = TaskId::invalid();
     if (ChipTaskSlotState *c = sched_->early_sync_start_queue.pop_tagged(&sync_task_id_snapshot)) {
-        bool current_sync_task =
-            static_cast<uint64_t>(c->task->task_id.raw) == sync_task_id_snapshot && c->task_attrs.requires_sync_start();
+        bool current_sync_task = c->task->task_id == sync_task_id_snapshot && c->task_attrs.requires_sync_start();
         if (current_sync_task && SchedulerState::try_claim_early_sync_drain(*c->payload)) {
             if (c->payload->early_dispatch_state.load(std::memory_order_seq_cst) != EARLY_DISPATCH_STAGING) {
                 sched_->cancel_early_sync_drain(*c);
@@ -1239,12 +1237,12 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                     if (dummy_slot.task_attrs.has_predicate()) {
                         chip_swimlane_aicpu_record_task_phase(
                             thread_idx, SchedPhaseKind::PredicatedSkip, dummy_resolve_t0, dummy_resolve_t0,
-                            sched_chip_swimlane_[thread_idx].sched_loop_count, dummy_slot.task->task_id.raw
+                            sched_chip_swimlane_[thread_idx].sched_loop_count, dummy_slot.task->task_id
                         );
                     } else {
                         chip_swimlane_aicpu_record_task_phase(
                             thread_idx, SchedPhaseKind::DummyTask, dummy_resolve_t0, dummy_resolve_t0,
-                            sched_chip_swimlane_[thread_idx].sched_loop_count, dummy_slot.task->task_id.raw
+                            sched_chip_swimlane_[thread_idx].sched_loop_count, dummy_slot.task->task_id
                         );
                     }
                 }

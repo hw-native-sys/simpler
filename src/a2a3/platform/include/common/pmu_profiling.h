@@ -32,6 +32,11 @@
 
 #include "common/core_type.h"
 #include "common/platform_config.h"
+// The owning runtime's task handle. Each runtime has its own TaskId in its own
+// namespace, and the include path resolves this bare name to whichever runtime is
+// being built: src/common/<runtime> is on that build's include path, and reaching
+// both headers from one scope is a compile error rather than a silent pick.
+#include "task_id.h"
 
 // DAV_2201 hardware counter count.
 constexpr int PMU_COUNTER_COUNT_A2A3 = 8;
@@ -134,7 +139,7 @@ inline const PmuEventConfig *pmu_resolve_event_config_a2a3(PmuEventType event_ty
  * Per-task PMU snapshot written by AICPU after each AICore task FIN.
  */
 struct PmuRecord {
-    uint64_t task_id;                               // Same encoding as ChipSwimlaneAicoreTaskRecord.task_token_raw
+    TaskId task_id;                                 // Identity, in the minting runtime's layout
     uint32_t func_id;                               // Kernel function identifier
     CoreType core_type;                             // AIC or AIV
     uint64_t pmu_total_cycles;                      // PMU_CNT_TOTAL (64-bit combined)

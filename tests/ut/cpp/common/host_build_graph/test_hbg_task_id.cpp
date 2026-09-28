@@ -17,11 +17,17 @@
  * GLOBAL_TASK_MAX_NUM. That guard cannot be reached through a bind -- a slot costs
  * kilobytes, so the shared-memory limit refuses such a count first -- so the
  * truncation it prevents is only observable here, at the mint.
+ *
+ * Then the handle's own surface, which holders depend on without reading a field:
+ * erasure to an integer is the encoded word, the order and the hash are consistent
+ * with equality, and assign() copies the whole handle.
  */
 
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <functional>
+#include <unordered_set>
 
 #include "host_build_graph/task_id.h"
 
@@ -107,7 +113,8 @@ TEST(HbgTaskId, ANegativeLocalIdDoesNotSignExtendOverTheFieldsAboveIt) {
 // equal to it.
 TEST(HbgTaskId, TheInvalidSentinelIsDisjointFromEverySpace) {
     EXPECT_FALSE(TaskId::invalid().is_valid());
-    EXPECT_EQ(TaskId::invalid().raw, UINT64_MAX);
+    EXPECT_EQ(TaskId::to_uint64(TaskId::invalid()), UINT64_MAX)
+        << "the sentinel's bit value is published into shared memory, where host reads it as a number";
 
     EXPECT_TRUE(TaskId::make_global(0).is_valid());
     EXPECT_TRUE(TaskId::make_sub_task(0, 0).is_valid());
@@ -137,6 +144,80 @@ TEST(HbgTaskId, TheHandleStaysAnEightBytePod) {
     static_assert(std::is_trivially_copyable_v<TaskId>);
     static_assert(std::is_standard_layout_v<TaskId>);
     EXPECT_EQ(sizeof(TaskId), 8u);
+}
+
+// to_uint64() is the encoded word itself, not a digest of it: the DFX records this
+// runtime serializes as numbers are read back by tools that decode the fields out of
+// what was written, so anything other than the identity would make them disagree.
+TEST(HbgTaskId, ErasureToAnIntegerIsTheEncodedWord) {
+    const TaskId sub_task = TaskId::make_sub_task(5, 9);
+    const uint64_t word = TaskId::to_uint64(sub_task);
+
+    EXPECT_EQ(word >> TaskId::SPACE_SHIFT, static_cast<uint64_t>(TaskId::Space::SUB_TASK));
+    EXPECT_EQ((word >> TaskId::PARENT_SHIFT) & TaskId::PARENT_MASK, 5u);
+    EXPECT_EQ(static_cast<int32_t>(word & 0xFFFFFFFFu), 9);
+
+    // Distinct handles erase to distinct words, which is what lets a record hold the
+    // number and a consumer recover the identity.
+    EXPECT_NE(TaskId::to_uint64(TaskId::make_global(1)), TaskId::to_uint64(TaskId::make_param(1)));
+    EXPECT_NE(TaskId::to_uint64(TaskId::make_sub_task(0, 1)), TaskId::to_uint64(TaskId::make_sub_task(1, 1)))
+        << "two modular tasks share a low field, so only the parent keeps their first sub-tasks apart";
+}
+
+// operator< orders by the encoded word. The order is consistent, not meaningful: a
+// caller may sort or key an ordered container with it, and may read nothing about the
+// tasks from which of two handles compares less.
+TEST(HbgTaskId, LessThanOrdersByTheEncodedWord) {
+    const TaskId lo = TaskId::make_global(1);
+    const TaskId hi = TaskId::make_global(2);
+
+    EXPECT_TRUE(lo < hi);
+    EXPECT_FALSE(hi < lo);
+    EXPECT_FALSE(lo < lo) << "a strict weak order is irreflexive, which std::sort and std::map both require";
+    EXPECT_EQ(lo < hi, TaskId::to_uint64(lo) < TaskId::to_uint64(hi));
+
+    // The spaces land in enumerator order because the space field is the top two bits.
+    EXPECT_TRUE(TaskId::make_global(0) < TaskId::make_sub_task(0, 0));
+    EXPECT_TRUE(TaskId::make_sub_task(0, 0) < TaskId::make_param(0));
+    EXPECT_TRUE(TaskId::make_param(-1) < TaskId::invalid()) << "the sentinel is the maximum of the order";
+}
+
+// std::hash agrees with operator==, the invariant an unordered container rests on: two
+// handles that compare equal must land in the same bucket. dep_gen's edge maps key on
+// the handle directly because of it.
+TEST(HbgTaskId, HashAgreesWithEquality) {
+    const std::hash<TaskId> hash;
+
+    EXPECT_EQ(hash(TaskId::make_sub_task(5, 9)), hash(TaskId::make_sub_task(5, 9)));
+    EXPECT_EQ(hash(TaskId::invalid()), hash(TaskId::invalid()));
+
+    std::unordered_set<TaskId> seen;
+    EXPECT_TRUE(seen.insert(TaskId::make_global(7)).second);
+    EXPECT_FALSE(seen.insert(TaskId::make_global(7)).second) << "an equal handle must be found, not added again";
+    EXPECT_TRUE(seen.insert(TaskId::make_param(7)).second) << "same low field, different space -- a different task";
+    EXPECT_EQ(seen.count(TaskId::make_global(7)), 1u);
+    EXPECT_EQ(seen.count(TaskId::make_global(8)), 0u);
+}
+
+// assign() copies the whole handle. It exists because ccec pins a member's implicit
+// `this` to Local Memory, so a __gm__ handle cannot be reached through operator=; the
+// host build has no such constraint, which is what lets this case check the semantics
+// the AICore instantiation relies on.
+TEST(HbgTaskId, AssignCopiesTheWholeHandle) {
+    const TaskId src = TaskId::make_sub_task(5, 9);
+    TaskId dst = TaskId::invalid();
+
+    TaskId::assign(dst, src);
+
+    EXPECT_EQ(dst, src);
+    EXPECT_EQ(TaskId::to_uint64(dst), TaskId::to_uint64(src));
+    EXPECT_EQ(dst.space(), TaskId::Space::SUB_TASK);
+    EXPECT_EQ(dst.parent_id(), 5);
+    EXPECT_EQ(dst.local_id(), 9);
+
+    // The sentinel travels like any other value; no field is treated specially.
+    TaskId::assign(dst, TaskId::invalid());
+    EXPECT_FALSE(dst.is_valid());
 }
 
 }  // namespace

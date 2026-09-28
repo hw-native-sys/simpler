@@ -138,7 +138,7 @@ void chip_swimlane_aicpu_on_aicore_ack(int core_id, int thread_idx, uint32_t reg
 /**
  * Commit an AICPU-side timing record for one completed task.
  *
- * AICore-as-producer: identity (task_token_raw) and AICore-side timing
+ * AICore-as-producer: identity (task_token) and AICore-side timing
  * (start/end) live in the per-core ChipSwimlaneAicoreTaskRecord stream;
  * core_type is published once by the host into the collector
  * (ChipSwimlaneCollector::set_core_types); func_id is resolved post-process
@@ -240,7 +240,7 @@ void chip_swimlane_aicpu_record_sched_phase(
  * @param tasks_processed Work items the phase handled
  */
 void chip_swimlane_aicpu_record_task_phase(
-    int thread_idx, SchedPhaseKind kind, uint64_t start_time, uint64_t end_time, uint32_t loop_iter, uint64_t task_id,
+    int thread_idx, SchedPhaseKind kind, uint64_t start_time, uint64_t end_time, uint32_t loop_iter, TaskId task_id,
     uint32_t tasks_processed = 1
 );
 
@@ -263,15 +263,11 @@ void chip_swimlane_aicpu_set_orch_thread_idx(int thread_idx);
  *
  * @param start_time  Submit start timestamp
  * @param end_time    Submit end timestamp
- * @param task_id     Task identifier. For tensormap_and_ringbuffer, full
- *                    encoding: (ring_id << 32) | local_id, enabling
- *                    cross-view correlation between orchestrator and
- *                    scheduler swimlanes.
+ * @param task_id     The submitted task's identity, enabling cross-view
+ *                    correlation between orchestrator and scheduler swimlanes.
  * @param submit_idx  Monotonic submit counter
  */
-void chip_swimlane_aicpu_record_orch_phase(
-    uint64_t start_time, uint64_t end_time, uint64_t task_id, uint32_t submit_idx
-);
+void chip_swimlane_aicpu_record_orch_phase(uint64_t start_time, uint64_t end_time, TaskId task_id, uint32_t submit_idx);
 
 /**
  * Write core-to-thread assignment mapping to shared memory.

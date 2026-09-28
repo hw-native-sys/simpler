@@ -169,7 +169,7 @@ struct DumpedArg {
     // identity to stamp.
     uint64_t run_epoch;
     uint32_t local_seq;  // Producing buffer's position within its own run
-    uint64_t task_id;
+    TaskId task_id;
     int32_t func_ids[ARGS_DUMP_MAX_FUNC_IDS];  // task's active-subtask set (mix membership); -1 unknown
     int32_t func_count;                        // number of valid entries in func_ids
     uint32_t arg_index;

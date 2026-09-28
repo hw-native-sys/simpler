@@ -86,7 +86,7 @@ void dep_gen_host_graph_begin_capture();
  * matching what the runtime knows at submit time.
  */
 void dep_gen_host_graph_begin_task(
-    uint64_t task_id_raw, bool in_manual_scope, bool early_dispatch, const int32_t kernel_ids[3], int32_t block_num,
+    TaskId task_id, bool in_manual_scope, bool early_dispatch, const int32_t kernel_ids[3], int32_t block_num,
     int32_t tensor_count, const TensorRef *tensors, const TensorArgType *arg_types
 );
 
@@ -98,14 +98,14 @@ void dep_gen_host_graph_begin_task(
 void dep_gen_host_graph_end_task();
 
 /** STEP 1: a dependency the caller declared via Arg::set_dependencies. */
-void dep_gen_host_graph_add_explicit_edge(uint64_t producer_raw);
+void dep_gen_host_graph_add_explicit_edge(TaskId producer);
 
 /** STEP 3 Step A: the producer that created the tensor this task consumes. */
-void dep_gen_host_graph_add_creator_edge(uint64_t producer_raw, int32_t arg_idx, const simpler::hbg::Tensor &consumer);
+void dep_gen_host_graph_add_creator_edge(TaskId producer, int32_t arg_idx, const simpler::hbg::Tensor &consumer);
 
 /** STEP 3 Step B: a tensormap producer whose written slice this task reads. */
 void dep_gen_host_graph_add_tensormap_edge(
-    uint64_t producer_raw, int32_t arg_idx, const simpler::hbg::Tensor &consumer, const ChipTensorMapEntry &entry,
+    TaskId producer, int32_t arg_idx, const simpler::hbg::Tensor &consumer, const ChipTensorMapEntry &entry,
     OverlapStatus overlap
 );
 

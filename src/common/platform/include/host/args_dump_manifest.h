@@ -184,7 +184,7 @@ inline void write_arg_json(std::ostream &json, const DumpedArg &dt) {
     std::string strides_str = dims_to_string(dt.strides, dt.ndims);
 
     json << "    {\"run_epoch\": " << dt.run_epoch << ", \"task_id\": \"0x" << std::hex << std::setfill('0')
-         << std::setw(16) << dt.task_id << std::dec << "\"";
+         << std::setw(16) << TaskId::to_uint64(dt.task_id) << std::dec << "\"";
     json << ", \"func_id\": [";
     for (int32_t f = 0; f < dt.func_count; f++) {
         if (f) json << ", ";

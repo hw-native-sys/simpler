@@ -44,6 +44,7 @@
 #include "common/args_dump.h"
 #include "common/memory_barrier.h"
 #include "host/args_dump_collector.h"
+#include "support/test_task_id.h"
 
 namespace fs = std::filesystem;
 
@@ -151,9 +152,9 @@ struct AttributionFixture {
     }
     ArgsDumpCollector::RetainedRunStats stats() const { return collector.retained_run_stats_for_test(); }
 
-    void record_tensor(uint64_t task_id, uint32_t arg_index) {
+    void record_tensor(int32_t task_id, uint32_t arg_index) {
         ArgsDumpInfo info{};
-        info.task_id = task_id;
+        info.task_id = simpler::ut::test_task_id(task_id);
         info.role = ArgsDumpRole::INPUT;
         info.stage = ArgsDumpStage::BEFORE_DISPATCH;
         info.arg_index = arg_index;
@@ -174,7 +175,7 @@ struct AttributionFixture {
         set_platform_run_result(/*region_base=*/0, epoch);
         dump_args_init(/*num_dump_threads=*/1);
         for (int i = 0; i < args; i++)
-            record_tensor(0xB00 + static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+            record_tensor(0xB00 + i, static_cast<uint32_t>(i));
     }
 
     /** One run that records `args` tensors and publishes them. */

@@ -169,26 +169,26 @@ void format_core_status(
         return;
     }
     int32_t kernel = -1;
-    int64_t task_id_raw = -1;
+    TaskId task_id = TaskId::invalid();
     if (core_state && core_state->running_slot_state) {
         int32_t subslot = static_cast<int32_t>(core_state->running_subslot);
         kernel = core_state->running_slot_state->task->kernel_id[subslot];
-        task_id_raw = static_cast<int64_t>(core_state->running_slot_state->task->task_id.raw);
+        task_id = core_state->running_slot_state->task->task_id;
     }
     uint64_t cond_reg = read_reg(reg_addr_for_cond, RegId::COND);
     int32_t hw_state = EXTRACT_TASK_STATE(cond_reg);
     const char *cond_reg_state_str = (hw_state == TASK_ACK_STATE) ? "ack" : "fin";
     if (hw_state == TASK_ACK_STATE) {
         snprintf(
-            buf, buf_size, "core%d(busy kernel=%d task=%" PRId64 " cond_reg_state=%s)", core_id, kernel, task_id_raw,
-            cond_reg_state_str
+            buf, buf_size, "core%d(busy kernel=%d task=0x%" PRIx64 " cond_reg_state=%s)", core_id, kernel,
+            TaskId::to_uint64(task_id), cond_reg_state_str
         );
     } else {
         snprintf(
             buf, buf_size,
-            "core%d(busy kernel=%d task=%" PRId64
+            "core%d(busy kernel=%d task=0x%" PRIx64
             " cond_reg_state=%s ANOMALY cond_tok=%d running_tok=%d pending_tok=%d)",
-            core_id, kernel, task_id_raw, cond_reg_state_str, EXTRACT_TASK_ID(cond_reg),
+            core_id, kernel, TaskId::to_uint64(task_id), cond_reg_state_str, EXTRACT_TASK_ID(cond_reg),
             core_state->running_reg_task_id, core_state->pending_reg_task_id
         );
     }
@@ -260,7 +260,7 @@ void SchedulerContext::log_stall_diagnostics(
                 int32_t kid_aic = slot_state.task->kernel_id[0];
                 int32_t kid_aiv0 = slot_state.task->kernel_id[1];
                 int32_t kid_aiv1 = slot_state.task->kernel_id[2];
-                int64_t task_id = static_cast<int64_t>(slot_state.task->task_id.raw);
+                uint64_t task_id = TaskId::to_uint64(slot_state.task->task_id);
                 if (st >= CHIP_TASK_COMPLETED) continue;
                 // task_state has no intermediate ready/running value — it
                 // stays PENDING until the worker stores COMPLETED. Classify
@@ -288,7 +288,7 @@ void SchedulerContext::log_stall_diagnostics(
                     if (cnt_running > STALL_DUMP_READY_MAX) continue;
                     STALL_DUMP_LOG(
                         report,
-                        "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=%" PRId64
+                        "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=0x%" PRIx64
                         " state=RUNNING fanin_refcount=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d] "
                         "running_on=[owner_thread=%d cores=[%s]]",
                         thread_idx, idle_iterations, r, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1, owner, running_on
@@ -300,7 +300,7 @@ void SchedulerContext::log_stall_diagnostics(
                     if (cnt_ready > STALL_DUMP_READY_MAX) continue;
                     STALL_DUMP_LOG(
                         report,
-                        "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=%" PRId64
+                        "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=0x%" PRIx64
                         " state=READY   fanin_refcount=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d]",
                         thread_idx, idle_iterations, r, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1
                     );
@@ -310,7 +310,7 @@ void SchedulerContext::log_stall_diagnostics(
                 if (cnt_waiting > STALL_DUMP_WAIT_MAX) continue;
                 STALL_DUMP_LOG(
                     report,
-                    "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=%" PRId64
+                    "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=0x%" PRIx64
                     " state=WAIT    fanin_refcount=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d] missing_deps=%d",
                     thread_idx, idle_iterations, r, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1, fi - rc
                 );
@@ -389,7 +389,7 @@ void SchedulerContext::log_shutdown_stall_snapshot(
 
 SchedulerContext::StallClassification SchedulerContext::classify_stall_reason() const {
     StallClassification cls{};
-    cls.stuck_task_id = -1;
+    cls.stuck_task_id = TaskId::invalid();
     cls.stuck_core = -1;
     int32_t cnt_running = 0, cnt_ready = 0, cnt_waiting = 0;
     for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
@@ -418,7 +418,7 @@ SchedulerContext::StallClassification SchedulerContext::classify_stall_reason() 
                     // Snapshot the non-atomic task pointer once: it can be null on a
                     // torn slot, and a concurrent writer may flip it mid-read.
                     TaskDescriptor *task_ptr = slot_state.task;
-                    cls.stuck_task_id = (task_ptr != nullptr) ? static_cast<int64_t>(task_ptr->task_id.raw) : -1;
+                    cls.stuck_task_id = (task_ptr != nullptr) ? task_ptr->task_id : TaskId::invalid();
                     cls.stuck_core = run_core;
                 }
                 cnt_running++;
@@ -454,9 +454,10 @@ int32_t SchedulerContext::handle_timeout_exit(
     StallClassification cls = classify_stall_reason();
     LOG_ERROR(
         "[STALL thread=%d idle_iterations=%d] TIMEOUT_EXIT after_idle_iterations=%d sub_class=%s "
-        "completed=%d/%d running=%d ready=%d waiting=%d orch_done=%d stuck_task_id=%" PRId64 " stuck_core=%d",
+        "completed=%d/%d running=%d ready=%d waiting=%d orch_done=%d stuck_task_id=0x%" PRIx64 " stuck_core=%d",
         thread_idx, idle_iterations, idle_iterations, stall_detail_name(cls.detail), cls.completed, cls.total,
-        cls.cnt_running, cls.cnt_ready, cls.cnt_waiting, cls.orch_done, cls.stuck_task_id, cls.stuck_core
+        cls.cnt_running, cls.cnt_ready, cls.cnt_waiting, cls.orch_done, TaskId::to_uint64(cls.stuck_task_id),
+        cls.stuck_core
     );
     // Only the thread that wins the code-100 latch publishes the detail/locators,
     // keeping the host-visible sub-class consistent with the latched code.

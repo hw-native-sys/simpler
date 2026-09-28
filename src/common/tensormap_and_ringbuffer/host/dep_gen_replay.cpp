@@ -168,8 +168,8 @@ const char *overlap_status_str(OverlapStatus s) {
 // in element units. Byte offset of element coords[] is
 //   (start_offset + Σ coords[i] · strides[i]) · dtype_bytes
 struct EdgeAnnot {
-    uint64_t pred;
-    uint64_t succ;
+    TaskId pred;
+    TaskId succ;
     int32_t consumer_arg_idx;  // -1 for EXPLICIT (not tied to a tensor arg)
     EdgeSource source;
     DepFlags flags;         // per-edge WAIT/RETAIN semantics carried into deps.json
@@ -218,7 +218,7 @@ struct TaskArgEntry {
 };
 
 struct TaskTableEntry {
-    uint64_t task_id;
+    TaskId task_id;
     bool in_manual_scope;
     bool early_dispatch;
     int32_t kernel_id[3];  // per-subslot {AIC, AIV0, AIV1}, -1 = inactive
@@ -349,7 +349,7 @@ bool write_deps_json(
         // pred/succ can exceed Number.MAX_SAFE_INTEGER (2^53-1), silently
         // losing precision in JS-based JSON parsers. Python consumers already
         // pass these through int(...) and don't care which form they receive.
-        out << "{\"task_id\":\"" << t.task_id << '"';
+        out << "{\"task_id\":\"" << TaskId::to_uint64(t.task_id) << '"';
         out << ",\"scope\":\"" << (t.in_manual_scope ? "manual" : "auto") << '"';
         out << ",\"early_dispatch\":" << (t.early_dispatch ? "true" : "false");
         // Per-subslot kernel ids {AIC, AIV0, AIV1}; INVALID_KERNEL_ID = -1 for
@@ -396,7 +396,7 @@ bool write_deps_json(
     for (size_t i = 0; i < edges.size(); i++) {
         if (i > 0) out << ',';
         const auto &e = edges[i];
-        out << "{\"pred\":\"" << e.pred << "\",\"succ\":\"" << e.succ << '"';
+        out << "{\"pred\":\"" << TaskId::to_uint64(e.pred) << "\",\"succ\":\"" << TaskId::to_uint64(e.succ) << '"';
         out << ",\"arg\":" << e.consumer_arg_idx;
         out << ",\"source\":\"" << edge_source_str(e.source) << '"';
         out << ",\"flags\":";
@@ -491,17 +491,17 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
     // aliasing during INOUT+COVERED remove_from_task). Same sizes feed both
     // maps so they stay in lockstep.
     int32_t task_window_sizes[CHIP_MAX_RING_DEPTH];
-    uint32_t max_local[CHIP_MAX_RING_DEPTH] = {0};
+    int32_t max_local[CHIP_MAX_RING_DEPTH] = {0};
     for (size_t i = 0; i < num_records; i++) {
-        TaskId tid{records[i].task_id};
+        TaskId tid = records[i].task_id;
         uint8_t ring = tid.ring();
-        uint32_t local = tid.local_id();
+        int32_t local = tid.local_id();
         if (ring < CHIP_MAX_RING_DEPTH && local > max_local[ring]) {
             max_local[ring] = local;
         }
     }
     for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
-        int32_t need = static_cast<int32_t>(max_local[r] + 1);
+        int32_t need = max_local[r] + 1;
         task_window_sizes[r] = ceil_pow2(need < 16 ? 16 : need);
     }
 
@@ -550,13 +550,13 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
     // into a single per-task fanin edge and OR-accumulates its flags. Both oracle
     // and annot use this same semantics so the divergence check compares the
     // (producer, flags) mapping rather than the producer-ID set alone.
-    std::unordered_map<uint64_t, DepFlags> oracle_preds;
-    std::unordered_map<uint64_t, DepFlags> annot_preds;
-    std::unordered_map<uint64_t, size_t> explicit_edge_index;
+    std::unordered_map<TaskId, DepFlags> oracle_preds;
+    std::unordered_map<TaskId, DepFlags> annot_preds;
+    std::unordered_map<TaskId, size_t> explicit_edge_index;
 
     // Scratch buffer for assembling full dep lists across overflow chains.
     // Declared outside the loop so it can be reused (clear() keeps capacity).
-    std::vector<uint64_t> full_deps_buf;
+    std::vector<TaskId> full_deps_buf;
     std::vector<uint8_t> full_kinds_buf;
 
     for (size_t rec_i = 0; rec_i < num_records; rec_i++) {
@@ -567,7 +567,7 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         // overflow's reinterpreted bytes as tensor/dep info.
         if (rec.flags & DEP_GEN_FLAG_OVERFLOW) continue;
 
-        TaskId task_id{rec.task_id};
+        TaskId task_id = rec.task_id;
         bool in_manual_scope = (rec.flags & DEP_GEN_FLAG_IN_MANUAL_SCOPE) != 0;
 
         oracle_preds.clear();
@@ -591,7 +591,7 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         // shared memory and are bounded by the writer to the array sizes, but
         // we clamp on read too so a corrupted record never drives an OOB read
         // off the end of rec.explicit_deps[64] / over->deps[524].
-        const uint64_t *deps_data;
+        const TaskId *deps_data;
         const uint8_t *kinds_data;
         int32_t dc;
         if (rec.flags & DEP_GEN_FLAG_HAS_OVERFLOW) {
@@ -600,8 +600,8 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
             uint16_t base_dc = rec.explicit_dep_count;
             if (base_dc > DEP_GEN_MAX_EXPLICIT_DEPS) {
                 LOG_ERROR(
-                    "dep_gen replay: clamping base explicit_dep_count %u > %d at rec_idx=%zu (task_id=%" PRIu64 ")",
-                    base_dc, DEP_GEN_MAX_EXPLICIT_DEPS, rec_i, rec.task_id
+                    "dep_gen replay: clamping base explicit_dep_count %u > %d at rec_idx=%zu (task_id=0x%" PRIx64 ")",
+                    base_dc, DEP_GEN_MAX_EXPLICIT_DEPS, rec_i, TaskId::to_uint64(rec.task_id)
                 );
                 base_dc = DEP_GEN_MAX_EXPLICIT_DEPS;
             }
@@ -614,16 +614,16 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
                 const DepGenRecord &maybe = records[j];
                 if (!(maybe.flags & DEP_GEN_FLAG_OVERFLOW)) {
                     LOG_ERROR(
-                        "dep_gen replay: unterminated overflow chain at rec_idx=%zu (task_id=%" PRIu64 ")", rec_i,
-                        rec.task_id
+                        "dep_gen replay: unterminated overflow chain at rec_idx=%zu (task_id=0x%" PRIx64 ")", rec_i,
+                        TaskId::to_uint64(rec.task_id)
                     );
                     break;
                 }
                 if (maybe.task_id != rec.task_id) {
                     LOG_ERROR(
-                        "dep_gen replay: orphan overflow at rec_idx=%zu (expected task_id=%" PRIu64 ", found %" PRIu64
-                        ")",
-                        j, rec.task_id, maybe.task_id
+                        "dep_gen replay: orphan overflow at rec_idx=%zu (expected task_id=0x%" PRIx64
+                        ", found 0x%" PRIx64 ")",
+                        j, TaskId::to_uint64(rec.task_id), TaskId::to_uint64(maybe.task_id)
                     );
                     break;
                 }
@@ -631,8 +631,8 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
                 uint16_t over_dc = over->dep_count;
                 if (over_dc > DEP_GEN_OVERFLOW_DEPS_PER_RECORD) {
                     LOG_ERROR(
-                        "dep_gen replay: clamping overflow dep_count %u > %d at rec_idx=%zu (task_id=%" PRIu64 ")",
-                        over_dc, DEP_GEN_OVERFLOW_DEPS_PER_RECORD, j, rec.task_id
+                        "dep_gen replay: clamping overflow dep_count %u > %d at rec_idx=%zu (task_id=0x%" PRIx64 ")",
+                        over_dc, DEP_GEN_OVERFLOW_DEPS_PER_RECORD, j, TaskId::to_uint64(rec.task_id)
                     );
                     over_dc = DEP_GEN_OVERFLOW_DEPS_PER_RECORD;
                 }
@@ -645,9 +645,9 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
             }
             if (!chain_complete) {
                 LOG_ERROR(
-                    "dep_gen replay: chain for task_id=%" PRIu64 " missing LAST_OVERFLOW marker — "
+                    "dep_gen replay: chain for task_id=0x%" PRIx64 " missing LAST_OVERFLOW marker — "
                     "using partial dep list (%zu deps)",
-                    rec.task_id, full_deps_buf.size()
+                    TaskId::to_uint64(rec.task_id), full_deps_buf.size()
                 );
             }
             deps_data = full_deps_buf.data();
@@ -659,8 +659,9 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
             uint16_t base_dc = rec.explicit_dep_count;
             if (base_dc > DEP_GEN_MAX_EXPLICIT_DEPS) {
                 LOG_ERROR(
-                    "dep_gen replay: clamping no-chain explicit_dep_count %u > %d at rec_idx=%zu (task_id=%" PRIu64 ")",
-                    base_dc, DEP_GEN_MAX_EXPLICIT_DEPS, rec_i, rec.task_id
+                    "dep_gen replay: clamping no-chain explicit_dep_count %u > %d at rec_idx=%zu (task_id=0x%" PRIx64
+                    ")",
+                    base_dc, DEP_GEN_MAX_EXPLICIT_DEPS, rec_i, TaskId::to_uint64(rec.task_id)
                 );
                 base_dc = DEP_GEN_MAX_EXPLICIT_DEPS;
             }
@@ -672,7 +673,7 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         inputs.tensors = tref_buf;
         inputs.arg_types = atype_buf;
         inputs.explicit_dep_count = dc;
-        inputs.explicit_deps = reinterpret_cast<const TaskId *>(deps_data);
+        inputs.explicit_deps = deps_data;
 
         // Register tasks[] entry (with per-arg slot info) and any unseen
         // tensors[] entries up-front. ChipTensors are registered from the
@@ -723,45 +724,48 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         // from the base record on the fast path or the gathered base+chain
         // buffer on overflow; kinds_data is its parallel semantics array.
         for (int32_t i = 0; i < dc; i++) {
-            uint64_t pred_raw = deps_data[i];
+            const TaskId pred = deps_data[i];
             const uint8_t raw_kind = kinds_data[i];
             constexpr uint8_t kKnownDepFlags = static_cast<uint8_t>(DEP_WAIT | DEP_RETAIN);
             if ((raw_kind & static_cast<uint8_t>(~kKnownDepFlags)) != 0) {
                 // Unknown semantics make the artifact untrustworthy. Reject
                 // the trace instead of emitting a plausible but altered graph.
                 LOG_ERROR(
-                    "dep_gen replay: invalid explicit dep flags 0x%02x at task_id=%" PRIu64 " dep_idx=%d", raw_kind,
-                    rec.task_id, i
+                    "dep_gen replay: invalid explicit dep flags 0x%02x at task_id=0x%" PRIx64 " dep_idx=%d", raw_kind,
+                    TaskId::to_uint64(rec.task_id), i
                 );
                 tm_oracle.destroy();
                 tm_annot.destroy();
                 return -7;
             }
             const DepFlags kind = static_cast<DepFlags>(raw_kind);
-            oracle_preds[pred_raw] |= kind;
-            bool first = annot_preds.find(pred_raw) == annot_preds.end();
-            annot_preds[pred_raw] |= kind;
+            oracle_preds[pred] |= kind;
+            bool first = annot_preds.find(pred) == annot_preds.end();
+            annot_preds[pred] |= kind;
             if (first) {
                 EdgeAnnot e{};
-                e.pred = pred_raw;
+                e.pred = pred;
                 e.succ = rec.task_id;
                 e.consumer_arg_idx = -1;
                 e.source = EdgeSource::EXPLICIT;
                 e.flags = kind;
-                explicit_edge_index.emplace(pred_raw, annot_edges.size());
+                explicit_edge_index.emplace(pred, annot_edges.size());
                 annot_edges.push_back(e);
             } else {
-                annot_edges[explicit_edge_index.at(pred_raw)].flags |= kind;
+                annot_edges[explicit_edge_index.at(pred)].flags |= kind;
             }
         }
 
         // ============ ORACLE pass — drive compute_task_fanin ============
         bool ok = compute_task_fanin(inputs, tm_oracle, in_manual_scope, [&](TaskId producer, DepFlags kind) -> bool {
-            oracle_preds[producer.raw] |= kind;
+            oracle_preds[producer] |= kind;
             return true;
         });
         if (!ok) {
-            LOG_ERROR("dep_gen replay: compute_task_fanin returned fatal at task_id=%" PRIu64, rec.task_id);
+            LOG_ERROR(
+                "dep_gen replay: compute_task_fanin returned fatal at task_id=0x%" PRIx64,
+                TaskId::to_uint64(rec.task_id)
+            );
             tm_oracle.destroy();
             tm_annot.destroy();
             return -4;
@@ -772,17 +776,17 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
             inputs, tm_annot, in_manual_scope,
             // emit_creator(producer, arg_idx, consumer_tensor)
             [&](TaskId producer, int32_t arg_idx, const simpler::tmr::Tensor &consumer) {
-                bool first = annot_preds.find(producer.raw) == annot_preds.end();
-                annot_preds[producer.raw] |= (DEP_WAIT | DEP_RETAIN);
+                bool first = annot_preds.find(producer) == annot_preds.end();
+                annot_preds[producer] |= (DEP_WAIT | DEP_RETAIN);
                 if (!first) {
-                    auto explicit_it = explicit_edge_index.find(producer.raw);
+                    auto explicit_it = explicit_edge_index.find(producer);
                     if (explicit_it != explicit_edge_index.end()) {
                         annot_edges[explicit_it->second].flags |= (DEP_WAIT | DEP_RETAIN);
                     }
                     return;  // already covered by an earlier emit on this record
                 }
                 EdgeAnnot e{};
-                e.pred = producer.raw;
+                e.pred = producer;
                 e.succ = rec.task_id;
                 e.consumer_arg_idx = arg_idx;
                 e.source = EdgeSource::CREATOR;
@@ -801,9 +805,9 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
                 // producers, both yield their own edges. The producer-id-set
                 // comparison below uses annot_preds, which dedups by pred
                 // only, matching runtime FaninBuilder semantics.
-                annot_preds[producer.raw] |= DEP_WAIT;
+                annot_preds[producer] |= DEP_WAIT;
                 EdgeAnnot e{};
-                e.pred = producer.raw;
+                e.pred = producer;
                 e.succ = rec.task_id;
                 e.consumer_arg_idx = arg_idx;
                 e.source = EdgeSource::TENSORMAP;
@@ -819,24 +823,29 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         // ============ Differential check ============
         if (oracle_preds != annot_preds) {
             LOG_ERROR(
-                "dep_gen replay: DIVERGENCE at task_id=%" PRIu64 " (rec_idx=%zu): oracle has %zu preds, annot has %zu",
-                rec.task_id, rec_i, oracle_preds.size(), annot_preds.size()
+                "dep_gen replay: DIVERGENCE at task_id=0x%" PRIx64
+                " (rec_idx=%zu): oracle has %zu preds, annot has %zu",
+                TaskId::to_uint64(rec.task_id), rec_i, oracle_preds.size(), annot_preds.size()
             );
             // Log the symmetric difference (missing preds and flag mismatches).
             for (const auto &[p, f] : oracle_preds) {
                 auto it = annot_preds.find(p);
                 if (it == annot_preds.end()) {
-                    LOG_ERROR("  only-in-oracle pred: %" PRIu64 " flags=%u", p, static_cast<unsigned>(f));
+                    LOG_ERROR(
+                        "  only-in-oracle pred: 0x%" PRIx64 " flags=%u", TaskId::to_uint64(p), static_cast<unsigned>(f)
+                    );
                 } else if (it->second != f) {
                     LOG_ERROR(
-                        "  flags mismatch pred: %" PRIu64 " oracle=%u annot=%u", p, static_cast<unsigned>(f),
-                        static_cast<unsigned>(it->second)
+                        "  flags mismatch pred: 0x%" PRIx64 " oracle=%u annot=%u", TaskId::to_uint64(p),
+                        static_cast<unsigned>(f), static_cast<unsigned>(it->second)
                     );
                 }
             }
             for (const auto &[p, f] : annot_preds) {
                 if (oracle_preds.find(p) == oracle_preds.end()) {
-                    LOG_ERROR("  only-in-annot  pred: %" PRIu64 " flags=%u", p, static_cast<unsigned>(f));
+                    LOG_ERROR(
+                        "  only-in-annot  pred: 0x%" PRIx64 " flags=%u", TaskId::to_uint64(p), static_cast<unsigned>(f)
+                    );
                 }
             }
             tm_oracle.destroy();

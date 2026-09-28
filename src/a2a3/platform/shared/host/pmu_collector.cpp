@@ -441,7 +441,8 @@ void PmuCollector::append_buffer_to_csv_shard(
     for (uint32_t i = 0; i < n; i++) {
         const PmuRecord &r = buf->records[i];
         rows << thread_idx << ',' << core_id << ',';
-        rows << "0x" << std::hex << std::setw(16) << std::setfill('0') << r.task_id << std::dec << std::setfill(' ');
+        rows << "0x" << std::hex << std::setw(16) << std::setfill('0') << TaskId::to_uint64(r.task_id) << std::dec
+             << std::setfill(' ');
         rows << ',' << r.func_id << ',' << static_cast<int>(r.core_type) << ',' << r.pmu_total_cycles;
         for (int k = 0; k < PMU_COUNTER_COUNT_A2A3; k++) {
             const char *name = evt->counter_names[k];
@@ -790,7 +791,8 @@ uint64_t PmuCollector::write_buffer_rows(
     for (uint32_t i = 0; i < n; i++) {
         const PmuRecord &r = buf->records[i];
         out << thread_idx << ',' << core_id << ',';
-        out << "0x" << std::hex << std::setw(16) << std::setfill('0') << r.task_id << std::dec << std::setfill(' ');
+        out << "0x" << std::hex << std::setw(16) << std::setfill('0') << TaskId::to_uint64(r.task_id) << std::dec
+            << std::setfill(' ');
         out << ',' << r.func_id << ',' << static_cast<int>(r.core_type) << ',' << r.pmu_total_cycles;
         for (int k = 0; k < PMU_COUNTER_COUNT_A2A3; k++) {
             const char *name = evt->counter_names[k];

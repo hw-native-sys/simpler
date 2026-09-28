@@ -2278,7 +2278,7 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
     // file size). Column order is documented in the schema comment at the top
     // of swimlane_converter.py's v2 reader.
     //
-    //   aicore_tasks: [core_id, task_token_raw, reg_task_id, start_cycles, end_cycles, receive_to_start_cycles,
+    //   aicore_tasks: [core_id, task_token, reg_task_id, start_cycles, end_cycles, receive_to_start_cycles,
     //                  run_epoch]
     //   scheduler_tasks.records: [core_id, reg_task_id, dispatch_cycles, finish_cycles, run_epoch]
     //
@@ -2301,8 +2301,8 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
                 for (const auto &collected : data.aicore_records[core_idx]) {
                     const ChipSwimlaneAicoreTaskRecord &r = collected.record;
                     if (!first) outfile << ",";
-                    outfile << "\n    [" << core_idx << ", " << r.task_token_raw << ", " << r.reg_task_id << ", "
-                            << r.start_time << ", " << r.end_time << ", " << r.receive_to_start_cycles << ", "
+                    outfile << "\n    [" << core_idx << ", " << TaskId::to_uint64(r.task_token) << ", " << r.reg_task_id
+                            << ", " << r.start_time << ", " << r.end_time << ", " << r.receive_to_start_cycles << ", "
                             << collected.run_epoch << "]";
                     first = false;
                     total++;
@@ -2359,7 +2359,8 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
                 for (const auto &collected : data.orch_phase_records[t]) {
                     const ChipSwimlaneAicpuOrchPhaseRecord &pr = collected.record;
                     if (!first) outfile << ",";
-                    outfile << "\n      {\"submit_idx\": " << pr.submit_idx << ", \"task_id\": " << pr.task_id
+                    outfile << "\n      {\"submit_idx\": " << pr.submit_idx
+                            << ", \"task_id\": " << TaskId::to_uint64(pr.task_id)
                             << ", \"start_cycles\": " << pr.start_time << ", \"end_cycles\": " << pr.end_time
                             << ", \"run_epoch\": " << collected.run_epoch << "}";
                     first = false;

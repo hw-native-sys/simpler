@@ -37,6 +37,7 @@
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "common/chip_swimlane_profiling.h"
 #include "host/chip_swimlane_collector.h"
+#include "support/test_task_id.h"
 #include "host/run_boundary.h"
 
 namespace fs = std::filesystem;
@@ -1556,7 +1557,8 @@ void record_orch_phases(int count) {
     chip_swimlane_aicpu_set_orch_thread_idx(/*thread_idx=*/0);
     for (int i = 0; i < count; i++) {
         chip_swimlane_aicpu_record_orch_phase(
-            /*start_time=*/300 + i, /*end_time=*/400 + i, /*task_id=*/static_cast<uint64_t>(i), /*submit_idx=*/i
+            /*start_time=*/300 + i, /*end_time=*/400 + i,
+            /*task_id=*/simpler::ut::test_task_id(i), /*submit_idx=*/i
         );
     }
 }

@@ -48,7 +48,7 @@ inline void chip_swimlane_write_scheduler_records(
                 << ", \"kind\": \"" << sched_phase_kind_name(record.kind)
                 << "\", \"tasks_processed\": " << record.tasks_processed << ", \"task_id\": ";
             if (sched_phase_carries_task_id(record.kind)) {
-                out << record.phase_data.task_id.raw;
+                out << TaskId::to_uint64(record.phase_data.task_id);
             } else {
                 out << "null";
             }

@@ -44,6 +44,11 @@
 
 #include "common/args_dump_task_metadata.h"
 #include "common/platform_config.h"
+// The owning runtime's task handle. Each runtime has its own TaskId in its own
+// namespace, and the include path resolves this bare name to whichever runtime is
+// being built: src/common/<runtime> is on that build's include path, and reaching
+// both headers from one scope is a compile error rather than a silent pick.
+#include "task_id.h"
 
 // =============================================================================
 // Constants
@@ -93,7 +98,7 @@ constexpr uint8_t ARGS_DUMP_MAX_FUNC_IDS = 3;
  */
 struct alignas(64) ArgsDumpRecord {
     // === Cache line 1 (64B) ===
-    uint64_t task_id;                           // TaskId encoding or plain task index
+    TaskId task_id;                             // Identity, in the minting runtime's layout
     uint8_t role;                               // ArgsDumpRole (formal callable signature)
     uint8_t stage;                              // ArgsDumpStage (before/after execution)
     uint8_t ndims;                              // Number of dimensions
@@ -300,7 +305,7 @@ struct DumpDataHeader {
  * Platform layer is agnostic to runtime-specific types (ChipTensor, TaskPayload, etc.).
  */
 struct ArgsDumpInfo {
-    uint64_t task_id;
+    TaskId task_id;
     ArgsDumpRole role;
     ArgsDumpStage stage;
     uint8_t dtype;

@@ -70,7 +70,7 @@ EXPECTED_TASKS = 5
 EXPECTED_EDGES = 6
 
 # An aicore_tasks record is
-# [core_id, task_token_raw, reg_task_id, start_cycles, end_cycles,
+# [core_id, task_token, reg_task_id, start_cycles, end_cycles,
 #  receive_to_start_cycles, run_epoch].
 RECORD_START = 3
 RECORD_END = 4

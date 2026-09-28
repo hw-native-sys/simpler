@@ -62,6 +62,11 @@
 #include "common/host_phase_kind.h"
 #include "common/platform_config.h"
 #include "common/scheduler_profiling.h"
+// The owning runtime's task handle. Each runtime has its own TaskId in its own
+// namespace, and the include path resolves this bare name to whichever runtime is
+// being built: src/common/<runtime> is on that build's include path, and reaching
+// both headers from one scope is a compile error rather than a silent pick.
+#include "task_id.h"
 
 // =============================================================================
 // chip swimlane_level — granularity ladder for the chip swimlane profiler.
@@ -91,7 +96,7 @@ enum class ChipSwimlaneLevel : uint32_t {
 
 /**
  * AICPU Scheduler timing record. The minimal AICPU-only payload after the
- * AICore-as-producer split: identity (task_token_raw, core_type) and
+ * AICore-as-producer split: identity (task_token, core_type) and
  * AICore-side timing (start/end) all live in ChipSwimlaneAicoreTaskRecord; the
  * AICPU record carries only the two timestamps the AICore side cannot produce
  * (the scheduler's dispatch/finish), plus the host-side join key against the
@@ -102,7 +107,7 @@ enum class ChipSwimlaneLevel : uint32_t {
  *   - reg_task_id   : per-core monotonic dispatch token; join key against
  *                     ChipSwimlaneAicoreTaskRecord.reg_task_id.
  *
- * Host post-processing pulls task_token_raw + start_time + end_time from
+ * Host post-processing pulls task_token + start_time + end_time from
  * the matched AICore record, derives core_type from the per-core static
  * table published via ChipSwimlaneCollector::set_core_types, and emits
  * func_id = -1 (resolved post-process by `swimlane_converter.py` from
@@ -136,20 +141,20 @@ static_assert(sizeof(ChipSwimlaneAicpuTaskRecord) == 32, "ChipSwimlaneAicpuTaskR
  * output buffer (no staging slot, no AICPU read). AICPU never touches this
  * record at TASK_TIMING (level=1); at SCHEDULE_TIMING+ the host joins it
  * against the active Scheduler producer's record stream on `reg_task_id`
- * (NOT `task_token_raw`).
+ * (NOT `task_token`).
  *
  * Two identity fields with different roles:
  *
- * - `task_token_raw` — the task identity, a `TaskId::raw` in whatever layout
- *   the minting runtime uses. Per-task unique. AICore reads it from
- *   `LocalContext.async_ctx.task_token.raw` (already in the dispatch
+ * - `task_token` — the task identity, in whatever layout the minting runtime
+ *   uses. Per-task unique. AICore reads it from
+ *   `LocalContext.async_ctx.task_token` (already in the dispatch
  *   payload's cache line). The host pulls it from here as the canonical
  *   task id at ALL levels — the AICPU record carries no
  *   identity after the slim-down (only dispatch/finish timestamps and the
  *   reg_task_id join key), so AICore is the single source of truth for
  *   task identity. NOT a join key on its own: SPMD `block_num > num_cores`,
  *   MIX cluster spread, and pipeline dual-issue all dispatch the same
- *   `task_token_raw` multiple times to the same core, each producing one
+ *   `task_token` multiple times to the same core, each producing one
  *   AICore execution record sharing the same token. The host disambiguates
  *   by `reg_task_id` below.
  *
@@ -178,7 +183,7 @@ static_assert(sizeof(ChipSwimlaneAicpuTaskRecord) == 32, "ChipSwimlaneAicpuTaskR
 struct ChipSwimlaneAicoreTaskRecord {
     uint64_t start_time;               // Post-dcci+ack timestamp (kernel begins next)
     uint64_t end_time;                 // Post-kernel timestamp
-    uint64_t task_token_raw;           // TaskId::raw — identity (NOT join key)
+    TaskId task_token;                 // identity, in the minting runtime's layout (NOT join key)
     uint32_t reg_task_id;              // Per-core dispatch token — host join key vs AICPU stream
     uint32_t receive_to_start_cycles;  // start_time - receive_time (AICore-local dcci + ack cost)
 } __attribute__((aligned(32)));
@@ -659,7 +664,7 @@ static_assert(sizeof(ChipSwimlaneDataHeader) % 64 == 0, "ChipSwimlaneDataHeader 
 struct ChipSwimlaneAicpuOrchPhaseRecord {
     uint64_t start_time;  // Submit start timestamp
     uint64_t end_time;    // Submit end timestamp
-    uint64_t task_id;     // TaskId::raw, in the minting runtime's layout
+    TaskId task_id;       // identity, in the minting runtime's layout
     uint32_t submit_idx;  // Monotonic submit counter
     uint32_t _pad;        // 32B alignment padding
 };

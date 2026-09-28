@@ -45,6 +45,7 @@
 #include "common/memory_barrier.h"
 #include "common/pmu_profiling.h"
 #include "host/pmu_collector.h"
+#include "support/test_task_id.h"
 
 // `set_platform_pmu_reg_addrs` / `get_platform_pmu_reg_addrs` live in the
 // platform register layer, whose translation unit reaches further into the
@@ -196,7 +197,7 @@ protected:
         ASSERT_NE(buf_ptr, 0u);
         auto *buf = reinterpret_cast<PmuBuffer *>(buf_ptr);
         for (int i = 0; i < n; i++) {
-            buf->records[i].task_id = 0x700 + static_cast<uint64_t>(i);
+            buf->records[i].task_id = simpler::ut::test_task_id(0x700 + i);
             buf->records[i].func_id = static_cast<uint32_t>(i);
             buf->records[i].pmu_total_cycles = 1000 + static_cast<uint64_t>(i);
         }

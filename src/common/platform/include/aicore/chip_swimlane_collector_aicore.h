@@ -80,8 +80,8 @@ chip_swimlane_aicore_reserve_task_record(__gm__ ChipSwimlaneActiveHead *head, Ch
  * commit itself runs after FIN and never reads the possibly-rotated head.
  */
 __aicore__ __attribute__((always_inline)) static inline void chip_swimlane_aicore_commit_task_record(
-    __gm__ ChipSwimlaneAicoreTaskRecord *record, uint64_t task_token_raw, uint32_t reg_task_id, uint64_t receive_time,
-    uint64_t start_time, uint64_t end_time
+    __gm__ ChipSwimlaneAicoreTaskRecord *record, const __gm__ TaskId &task_token, uint32_t reg_task_id,
+    uint64_t receive_time, uint64_t start_time, uint64_t end_time
 ) {
     if (record == nullptr) {
         return;
@@ -89,7 +89,7 @@ __aicore__ __attribute__((always_inline)) static inline void chip_swimlane_aicor
 
     record->start_time = start_time;
     record->end_time = end_time;
-    record->task_token_raw = task_token_raw;
+    TaskId::assign(record->task_token, task_token);
     record->reg_task_id = reg_task_id;
     // 32-bit delta; receive_time always precedes start_time on the same core.
     record->receive_to_start_cycles = static_cast<uint32_t>(start_time - receive_time);
@@ -102,9 +102,9 @@ __aicore__ __attribute__((always_inline)) static inline void chip_swimlane_aicor
  * Compatibility wrapper for platforms that have not moved reservation before ACK.
  */
 __aicore__ __attribute__((always_inline)) static inline void chip_swimlane_aicore_record_task(
-    __gm__ ChipSwimlaneActiveHead *head, ChipSwimlaneAicoreLocalState *local, uint64_t task_token_raw,
+    __gm__ ChipSwimlaneActiveHead *head, ChipSwimlaneAicoreLocalState *local, const __gm__ TaskId &task_token,
     uint32_t reg_task_id, uint64_t receive_time, uint64_t start_time, uint64_t end_time
 ) {
     __gm__ ChipSwimlaneAicoreTaskRecord *record = chip_swimlane_aicore_reserve_task_record(head, local);
-    chip_swimlane_aicore_commit_task_record(record, task_token_raw, reg_task_id, receive_time, start_time, end_time);
+    chip_swimlane_aicore_commit_task_record(record, task_token, reg_task_id, receive_time, start_time, end_time);
 }

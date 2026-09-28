@@ -46,6 +46,11 @@
 
 #include "arg_direction.h"  // CORE_MAX_TENSOR_ARGS
 #include "common/platform_config.h"
+// The owning runtime's task handle. Each runtime has its own TaskId in its own
+// namespace, and the include path resolves this bare name to whichever runtime is
+// being built: src/common/<runtime> is on that build's include path, and reaching
+// both headers from one scope is a compile error rather than a silent pick.
+#include "task_id.h"
 
 // =============================================================================
 // dep_gen-local capacity constants
@@ -103,11 +108,11 @@ enum DepGenRecordFlags : uint32_t {
  * blob covers exactly two cache lines instead of straddling three.
  */
 struct DepGenRecord {
-    uint64_t task_id;                                       // TaskId::raw, in the minting runtime's layout
+    TaskId task_id;                                         // identity, in the minting runtime's layout
     uint32_t flags;                                         // DepGenRecordFlags bitmask
     uint16_t tensor_count;                                  // number of valid ChipTensor slots
     uint16_t explicit_dep_count;                            // number of valid explicit_dep slots
-    uint64_t explicit_deps[DEP_GEN_MAX_EXPLICIT_DEPS];      // TaskId::raw, length = explicit_dep_count
+    TaskId explicit_deps[DEP_GEN_MAX_EXPLICIT_DEPS];        // length = explicit_dep_count
     uint8_t explicit_dep_kinds[DEP_GEN_MAX_EXPLICIT_DEPS];  // DepFlags, parallel to explicit_deps[]
     uint8_t arg_types[CORE_MAX_TENSOR_ARGS];                // TensorArgType, length = tensor_count
     int32_t kernel_id[3];  // per-subslot kernel id (AIC, AIV0, AIV1); INVALID_KERNEL_ID = -1
@@ -153,11 +158,11 @@ constexpr int DEP_GEN_OVERFLOW_DEPS_PER_RECORD = 524;
  * back to the preceding base.
  */
 struct DepGenOverflowRecord {
-    uint64_t task_id;    // mirrors base record's task_id for chain join
+    TaskId task_id;      // mirrors base record's task_id for chain join
     uint32_t flags;      // DEP_GEN_FLAG_OVERFLOW [| DEP_GEN_FLAG_LAST_OVERFLOW]
     uint16_t dep_count;  // number of valid entries in deps[]
     uint16_t _reserved;
-    uint64_t deps[DEP_GEN_OVERFLOW_DEPS_PER_RECORD];  // TaskId::raw, length = dep_count
+    TaskId deps[DEP_GEN_OVERFLOW_DEPS_PER_RECORD];    // length = dep_count
     uint8_t kinds[DEP_GEN_OVERFLOW_DEPS_PER_RECORD];  // DepFlags, parallel to deps[]
 } __attribute__((aligned(64)));
 

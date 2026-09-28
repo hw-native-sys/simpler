@@ -52,6 +52,7 @@
 #include "common/memory_barrier.h"
 #include "common/pmu_profiling.h"
 #include "host/pmu_collector.h"
+#include "support/test_task_id.h"
 
 // The platform register accessors, for the reason test_pmu_run_identity.cpp
 // gives: the two architectures define them in translation units that reach
@@ -176,7 +177,7 @@ void produce_one_run(void *shm, uint64_t epoch, int records) {
     ASSERT_NE(state->current_buf_ptr, 0u);
     auto *buf = reinterpret_cast<PmuBuffer *>(state->current_buf_ptr);
     for (int i = 0; i < records; i++) {
-        buf->records[i].task_id = 0xB00 + static_cast<uint64_t>(i);
+        buf->records[i].task_id = simpler::ut::test_task_id(0xB00 + i);
         buf->records[i].func_id = static_cast<uint32_t>(i);
         buf->records[i].pmu_total_cycles = 7000 + static_cast<uint64_t>(i);
     }
@@ -387,7 +388,7 @@ TEST(PmuFrozenConfig, ARowWrittenAfterASuccessorsResetKeepsItsOwnRunsColumns) {
     ASSERT_FALSE(held.fatal);
 
     auto late = std::make_unique<PmuBuffer>();
-    late->records[0].task_id = 0xC01;
+    late->records[0].task_id = simpler::ut::test_task_id(0xC01);
     late->records[0].func_id = 7;
     late->records[0].pmu_total_cycles = 9100;
     late->count = 1;

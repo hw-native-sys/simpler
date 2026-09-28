@@ -28,6 +28,8 @@
 #include <cstring>
 #include <vector>
 
+#include "support/test_task_id.h"
+
 namespace {
 
 // The collector stores this byte and never reads it back: DepFlags is declared
@@ -79,17 +81,17 @@ protected:
         free(shm_);
     }
 
-    void record_one_submit(uint64_t task_id_raw) { record_submit(task_id_raw, 0, nullptr, nullptr); }
+    void record_one_submit(TaskId task_id) { record_submit(task_id, 0, nullptr, nullptr); }
 
     void record_submit(
-        uint64_t task_id_raw, int explicit_dep_count, const uint64_t *explicit_deps_raw,
-        const uint8_t *explicit_dep_kinds_raw, uint8_t default_explicit_dep_kind = kCreatorEdgeDepKinds
+        TaskId task_id, int explicit_dep_count, const TaskId *explicit_deps, const uint8_t *explicit_dep_kinds_raw,
+        uint8_t default_explicit_dep_kind = kCreatorEdgeDepKinds
     ) {
         const int32_t kernel_ids[3] = {-1, -1, -1};
         dep_gen_aicpu_record_submit(
-            task_id_raw, /*in_manual_scope=*/false, /*early_dispatch=*/false, /*tensor_count=*/0,
-            /*tensor_ptrs=*/nullptr, /*arg_types=*/nullptr, explicit_dep_count, explicit_deps_raw,
-            explicit_dep_kinds_raw, default_explicit_dep_kind, /*block_num=*/1, kernel_ids
+            task_id, /*in_manual_scope=*/false, /*early_dispatch=*/false, /*tensor_count=*/0,
+            /*tensor_ptrs=*/nullptr, /*arg_types=*/nullptr, explicit_dep_count, explicit_deps, explicit_dep_kinds_raw,
+            default_explicit_dep_kind, /*block_num=*/1, kernel_ids
         );
     }
 
@@ -100,7 +102,7 @@ protected:
 };
 
 TEST_F(DepGenCollectorAicpuTest, SubmitBeforeOrchThreadIdxIsDropped) {
-    record_one_submit(0x1234);
+    record_one_submit(simpler::ut::test_task_id(0x1234));
 
     EXPECT_EQ(buffer_->count, 0u);
     EXPECT_EQ(state_->total_record_count, 1u);
@@ -115,10 +117,10 @@ TEST_F(DepGenCollectorAicpuTest, SubmitBeforeOrchThreadIdxIsDropped) {
 
 TEST_F(DepGenCollectorAicpuTest, SubmitAfterOrchThreadIdxIsRecordedAndFlushed) {
     dep_gen_aicpu_set_orch_thread_idx(0);
-    record_one_submit(0x1234);
+    record_one_submit(simpler::ut::test_task_id(0x1234));
 
     ASSERT_EQ(buffer_->count, 1u);
-    EXPECT_EQ(buffer_->records[0].task_id, 0x1234u);
+    EXPECT_EQ(buffer_->records[0].task_id, simpler::ut::test_task_id(0x1234));
     EXPECT_EQ(state_->total_record_count, 1u);
     EXPECT_EQ(state_->dropped_record_count, 0u);
 
@@ -132,12 +134,15 @@ TEST_F(DepGenCollectorAicpuTest, SubmitAfterOrchThreadIdxIsRecordedAndFlushed) {
 TEST_F(DepGenCollectorAicpuTest, NullKindsUseDefaultForEveryDependency) {
     dep_gen_aicpu_set_orch_thread_idx(0);
     constexpr int kDepCount = DEP_GEN_MAX_EXPLICIT_DEPS + 1;
-    std::vector<uint64_t> deps(kDepCount);
+    std::vector<TaskId> deps(kDepCount);
     for (int i = 0; i < kDepCount; ++i) {
-        deps[i] = 0x100u + static_cast<uint64_t>(i);
+        deps[i] = simpler::ut::test_task_id(0x100 + i);
     }
 
-    record_submit(0x1234, kDepCount, deps.data(), nullptr, /*default_explicit_dep_kind=*/3);
+    record_submit(
+        simpler::ut::test_task_id(0x1234), kDepCount, deps.data(), nullptr,
+        /*default_explicit_dep_kind=*/3
+    );
 
     ASSERT_EQ(buffer_->count, 2u);
     const DepGenRecord &record = buffer_->records[0];
@@ -156,14 +161,14 @@ TEST_F(DepGenCollectorAicpuTest, NullKindsUseDefaultForEveryDependency) {
 TEST_F(DepGenCollectorAicpuTest, MixedKindsSurviveTwoOverflowRecords) {
     dep_gen_aicpu_set_orch_thread_idx(0);
     constexpr int kDepCount = DEP_GEN_MAX_EXPLICIT_DEPS + DEP_GEN_OVERFLOW_DEPS_PER_RECORD + 1;
-    std::vector<uint64_t> deps(kDepCount);
+    std::vector<TaskId> deps(kDepCount);
     std::vector<uint8_t> kinds(kDepCount);
     for (int i = 0; i < kDepCount; ++i) {
-        deps[i] = 0x1000u + static_cast<uint64_t>(i);
+        deps[i] = simpler::ut::test_task_id(0x1000 + i);
         kinds[i] = (i % 2 == 0) ? 1u : 3u;
     }
 
-    record_submit(0x5678, kDepCount, deps.data(), kinds.data());
+    record_submit(simpler::ut::test_task_id(0x5678), kDepCount, deps.data(), kinds.data());
 
     ASSERT_EQ(buffer_->count, 3u);
     EXPECT_EQ(state_->total_record_count, 1u);

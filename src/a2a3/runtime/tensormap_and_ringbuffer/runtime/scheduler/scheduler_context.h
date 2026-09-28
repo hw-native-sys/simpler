@@ -151,6 +151,19 @@ private:
     // Cluster-ordered core trackers, one per scheduler thread
     CoreTracker core_trackers_[MAX_AICPU_THREADS];
 
+    // early_dispatch_shape's batch-pop scratch, one set per scheduler thread. The
+    // two arrays are indexed in lockstep: task_id_snapshots[i] is the tag batch[i]
+    // was queued with. Pure scratch -- pop_batch_tagged writes every element a
+    // later read touches, so nothing here carries meaning across calls or runs and
+    // deinit() leaves it alone. It lives here rather than on that function's stack
+    // so the TaskId array's default construction is paid once, at construction,
+    // instead of on every dispatch attempt that finds a free core.
+    struct EarlyStagingScratch {
+        ChipTaskSlotState *batch[CoreTracker::MAX_CLUSTERS * 3];
+        TaskId task_id_snapshots[CoreTracker::MAX_CLUSTERS * 3];
+    };
+    EarlyStagingScratch early_staging_[MAX_AICPU_THREADS];
+
     // Per-core dispatch payload storage: dual-buffer for pipelining.
     // buf_idx = reg_task_id & 1; adjacent dispatches alternate automatically.
     DispatchPayload payload_per_core_[RUNTIME_MAX_WORKER][2];
@@ -526,15 +539,15 @@ private:
     // dominant SIMPLER_STALL_DETAIL_* sub-class plus a few locator fields, which
     // handle_timeout_exit propagates to host alongside the unchanged code 100.
     struct StallClassification {
-        int32_t detail;         // SIMPLER_STALL_DETAIL_*
-        int32_t cnt_running;    // tasks observed RUNNING (on a core)
-        int32_t cnt_ready;      // fanin-satisfied but not dispatched
-        int32_t cnt_waiting;    // still waiting on fanin
-        int32_t completed;      // completed_tasks_ snapshot
-        int32_t total;          // total_tasks_ snapshot
-        int32_t orch_done;      // orchestrator_done flag (0/1)
-        int64_t stuck_task_id;  // S1: first RUNNING task's id (-1 if none)
-        int32_t stuck_core;     // S1: core hosting it (-1 if none)
+        int32_t detail;        // SIMPLER_STALL_DETAIL_*
+        int32_t cnt_running;   // tasks observed RUNNING (on a core)
+        int32_t cnt_ready;     // fanin-satisfied but not dispatched
+        int32_t cnt_waiting;   // still waiting on fanin
+        int32_t completed;     // completed_tasks_ snapshot
+        int32_t total;         // total_tasks_ snapshot
+        int32_t orch_done;     // orchestrator_done flag (0/1)
+        TaskId stuck_task_id;  // S1: first RUNNING task's id, invalid() if none
+        int32_t stuck_core;    // S1: core hosting it (-1 if none)
     };
 
     // Scan the rings once (same ground truth as log_stall_diagnostics: a slot is

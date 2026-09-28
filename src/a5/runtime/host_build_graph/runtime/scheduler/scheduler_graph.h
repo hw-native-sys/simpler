@@ -222,7 +222,7 @@ inline __aicore__ SchedulerGraphResult scheduler_materialize_task_payload_resolv
     dispatch_payload->local_context.block_num = block_num;
     // The AICore scheduler has no deferred-completion slab. Mark the context
     // non-deferred so async backend adapters take their synchronous fallback.
-    dispatch_payload->local_context.async_ctx.task_token.raw = TaskId::invalid().raw;
+    TaskId::assign(dispatch_payload->local_context.async_ctx.task_token, TaskId::invalid());
     dispatch_payload->args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dispatch_payload->local_context);
     dispatch_payload->args[PAYLOAD_GLOBAL_CONTEXT_INDEX] =
         reinterpret_cast<uint64_t>(&dispatch_payload->global_context);

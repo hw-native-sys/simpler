@@ -72,7 +72,7 @@ pmu_aicore_record_task(__gm__ PmuAicoreRing *ring, uint64_t reg_base, uint32_t t
         return;
     }
 
-    __gm__ PmuRecord *slot = &ring->dual_issue_slots[task_id % PLATFORM_PMU_AICORE_RING_SIZE];
+    __gm__ PmuAicoreSlot *slot = &ring->dual_issue_slots[task_id % PLATFORM_PMU_AICORE_RING_SIZE];
 
     // Read the 10 event counters + 64-bit cycle counter via the AICore MMIO
     // load intrinsic ld_dev(base, offset) — the only legal way for AICore to
@@ -96,9 +96,10 @@ pmu_aicore_record_task(__gm__ PmuAicoreRing *ring, uint64_t reg_base, uint32_t t
     uint64_t hi = static_cast<uint32_t>(ld_dev(pmu_base, REG_MMIO_PMU_CNT_TOTAL1_OFFSET - REL));
     slot->pmu_total_cycles = lo | (hi << 32);
 
-    // Publish task_id last so AICPU can validate the slot is ready.
+    // Publish the dispatch token last so AICPU can tell a filled slot from one
+    // this core has not reached yet.
     OUT_OF_ORDER_STORE_BARRIER();
-    slot->task_id = static_cast<uint64_t>(task_id);
+    slot->reg_task_id = task_id;
 
     // Flush cache to make data visible to AICPU.
     dcci(slot, SINGLE_CACHE_LINE, CACHELINE_OUT);

@@ -17,6 +17,8 @@
 
 #include <cstdint>
 
+#include "support/test_task_id.h"
+
 TEST(ChipSwimlaneAicoreTest, CommitUsesReservedBufferGeneration) {
     ChipSwimlaneAicoreTaskBuffer first{};
     ChipSwimlaneAicoreTaskBuffer second{};
@@ -33,14 +35,14 @@ TEST(ChipSwimlaneAicoreTest, CommitUsesReservedBufferGeneration) {
     head.current_buf_ptr = reinterpret_cast<uint64_t>(&second);
     head.current_buf_seq = 1;
 
-    chip_swimlane_aicore_commit_task_record(reserved, 0x1234, 17, 100, 120, 180);
+    chip_swimlane_aicore_commit_task_record(reserved, simpler::ut::test_task_id(0x1234), 17, 100, 120, 180);
 
-    EXPECT_EQ(first.records[0].task_token_raw, 0x1234u);
+    EXPECT_EQ(first.records[0].task_token, simpler::ut::test_task_id(0x1234));
     EXPECT_EQ(first.records[0].reg_task_id, 17u);
     EXPECT_EQ(first.records[0].start_time, 120u);
     EXPECT_EQ(first.records[0].end_time, 180u);
     EXPECT_EQ(first.records[0].receive_to_start_cycles, 20u);
-    EXPECT_EQ(second.records[0].task_token_raw, 0u);
+    EXPECT_EQ(second.records[0].task_token, TaskId{});
 
     ChipSwimlaneAicoreTaskRecord *next = chip_swimlane_aicore_reserve_task_record(&head, &local);
     EXPECT_EQ(next, &second.records[0]);
@@ -79,7 +81,7 @@ TEST(ChipSwimlaneAicoreTest, RecordIsAttributableToTheBufferItWasReservedFrom) {
     head.current_buf_ptr = reinterpret_cast<uint64_t>(&second);
     head.current_buf_seq = 1;
 
-    chip_swimlane_aicore_commit_task_record(reserved, 0x1234, 17, 100, 120, 180);
+    chip_swimlane_aicore_commit_task_record(reserved, simpler::ut::test_task_id(0x1234), 17, 100, 120, 180);
 
     // Resolve the record's run the way a consumer does — from the buffer the
     // record actually landed in — and check that this is the pre-rotation one.
@@ -93,7 +95,7 @@ TEST(ChipSwimlaneAicoreTest, RecordIsAttributableToTheBufferItWasReservedFrom) {
     // record resolves to the successor's run.
     ChipSwimlaneAicoreTaskRecord *next = chip_swimlane_aicore_reserve_task_record(&head, &local);
     ASSERT_EQ(next, &second.records[0]);
-    chip_swimlane_aicore_commit_task_record(next, 0x5678, 18, 200, 220, 280);
+    chip_swimlane_aicore_commit_task_record(next, simpler::ut::test_task_id(0x5678), 18, 200, 220, 280);
     const ChipSwimlaneAicoreTaskBuffer *next_owner = (next == &first.records[0]) ? &first : &second;
     EXPECT_EQ(next_owner, &second);
     EXPECT_EQ(next_owner->run_epoch, 22u);

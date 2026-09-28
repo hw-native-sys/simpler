@@ -57,10 +57,15 @@ class TaskId:
     def make(cls, ring_id, local_id):
         """``(ring_id << 32) | local_id``. Mirrors ``TaskId::make``.
 
-        Mirrors its truncation too: the C++ mint takes a ``uint8_t`` ring and a
-        ``uint32_t`` local id, so a value too wide for its field is silently cut rather
+        Mirrors its truncation too: the C++ mint takes a ``uint8_t`` ring and an
+        ``int32_t`` local id, so a value too wide for its field is silently cut rather
         than refused. A mirror that refused instead would make a test disagree with the
         runtime it stands in for.
+
+        The one place the two sides differ is signedness: ``local_id()`` here reports the
+        field unsigned, where C++ reports it as the ``int32_t`` its allocator counts in.
+        Every id a real run carries is a small positive counter, so the two agree over
+        the whole reachable range.
         """
         return cls(((ring_id & cls.RING_MASK) << cls.RING_SHIFT) | (local_id & cls._LOCAL_MASK))
 

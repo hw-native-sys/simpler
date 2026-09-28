@@ -74,10 +74,13 @@ void set_dump_args_enabled(bool enable);
 bool is_dump_args_enabled();
 bool is_dump_args_selective_mode();
 bool should_load_dump_args_task_masks();
-void set_dump_args_task_mask(uint64_t task_id, ArgsDumpArgMask mask, ArgsDumpArgMask flags);
-void get_dump_args_task_masks(uint64_t task_id, ArgsDumpArgMask *mask, ArgsDumpArgMask *flags);
-void set_dump_args_task_scalar_dtypes(uint64_t task_id, uint32_t scalar_count, const uint8_t *scalar_dtypes);
-bool get_dump_args_task_scalar_dtypes(uint64_t task_id, uint32_t *scalar_count, uint8_t *scalar_dtypes);
+// The per-task tables below are keyed by the task's identity, not by a number a
+// caller composed: the key is opaque to this module, and only the hash that spreads
+// it over the table's slots looks at its bits.
+void set_dump_args_task_mask(TaskId task_id, ArgsDumpArgMask mask, ArgsDumpArgMask flags);
+void get_dump_args_task_masks(TaskId task_id, ArgsDumpArgMask *mask, ArgsDumpArgMask *flags);
+void set_dump_args_task_scalar_dtypes(TaskId task_id, uint32_t scalar_count, const uint8_t *scalar_dtypes);
+bool get_dump_args_task_scalar_dtypes(TaskId task_id, uint32_t *scalar_count, uint8_t *scalar_dtypes);
 
 #ifdef __cplusplus
 }
@@ -116,7 +119,7 @@ inline void dump_args_for_task(
         dump_arg_mask = task_metadata->dump_arg_mask;
         dump_arg_flags = task_metadata->dump_arg_flags;
     } else if (should_load_dump_args_task_masks()) {
-        get_dump_args_task_masks(descriptor.task_id.raw, &dump_arg_mask, &dump_arg_flags);
+        get_dump_args_task_masks(descriptor.task_id, &dump_arg_mask, &dump_arg_flags);
     }
     if (!should_dump_task(dump_arg_mask)) {
         return;
@@ -196,7 +199,7 @@ inline void dump_args_for_task(
             info.shapes[d] = t.shapes[d];
             info.strides[d] = t.strides[d];
         }
-        info.task_id = descriptor.task_id.raw;
+        info.task_id = descriptor.task_id;
         info.arg_index = slot;
         info.role = role;
         info.stage = stage;
@@ -216,7 +219,7 @@ inline void dump_args_for_task(
         LOG_WARN(
             "Thread %d: task 0x%" PRIx64
             ": signature covers %d tensor slots but payload has %d; the rest are not dumped.",
-            thread_idx, static_cast<uint64_t>(descriptor.task_id.raw), covered_count, pl.tensor_count
+            thread_idx, TaskId::to_uint64(descriptor.task_id), covered_count, pl.tensor_count
         );
     }
 
@@ -232,7 +235,7 @@ inline void dump_args_for_task(
             has_scalar_dtypes = true;
         } else {
             has_scalar_dtypes =
-                get_dump_args_task_scalar_dtypes(descriptor.task_id.raw, &dtype_scalar_count, scalar_dtypes);
+                get_dump_args_task_scalar_dtypes(descriptor.task_id, &dtype_scalar_count, scalar_dtypes);
         }
         const uint64_t *pl_scalars = pl.scalar_data();
         for (int32_t scalar_index = 0; scalar_index < pl.scalar_count; scalar_index++) {
@@ -241,7 +244,7 @@ inline void dump_args_for_task(
                 continue;
             }
             ArgsDumpInfo info = {};
-            info.task_id = descriptor.task_id.raw;
+            info.task_id = descriptor.task_id;
             info.role = ArgsDumpRole::INPUT;
             info.stage = stage;
             info.dtype = (has_scalar_dtypes && scalar_index < static_cast<int32_t>(dtype_scalar_count)) ?
@@ -307,7 +310,7 @@ inline void dump_running_task_outputs(int32_t cores_total_num, GetRunningSlotFn 
 
 template <typename TensorInfoT>
 inline void dump_args_for_task(
-    int32_t thread_idx, uint64_t task_id, int32_t task_arg_count, const CoreCallable &callable,
+    int32_t thread_idx, TaskId task_id, int32_t task_arg_count, const CoreCallable &callable,
     const TensorInfoT *tensor_info, int32_t tensor_info_count, const uint64_t *buffer_addrs, int32_t buffer_count,
     ArgsDumpStage stage
 ) {
@@ -319,7 +322,7 @@ inline void dump_args_for_task(
             LOG_WARN(
                 "Thread %d: args dump skipped for task 0x%" PRIx64
                 ": task args (%d) smaller than callable signature (%d)",
-                thread_idx, task_id, task_arg_count, sig_count
+                thread_idx, TaskId::to_uint64(task_id), task_arg_count, sig_count
             );
         }
         return;
@@ -334,7 +337,7 @@ inline void dump_args_for_task(
             LOG_WARN(
                 "Thread %d: args dump skipped for task 0x%" PRIx64
                 ": callable tensor args (%d) do not match registered tensor info (%d)",
-                thread_idx, task_id, tensor_arg_count, tensor_info_count
+                thread_idx, TaskId::to_uint64(task_id), tensor_arg_count, tensor_info_count
             );
         }
         return;
@@ -347,7 +350,7 @@ inline void dump_args_for_task(
             LOG_WARN(
                 "Thread %d: args dump skipped for task 0x%" PRIx64
                 ": reconstructed tensor buffers (%d) do not match callable tensor args (%d)",
-                thread_idx, task_id, buffer_count, tensor_arg_count
+                thread_idx, TaskId::to_uint64(task_id), buffer_count, tensor_arg_count
             );
         }
         return;

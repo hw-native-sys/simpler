@@ -289,7 +289,7 @@ void pmu_aicpu_init(const uint32_t *physical_core_ids, int num_cores) {
 }
 
 void pmu_aicpu_complete_record(
-    int core_id, int thread_idx, uint32_t reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type
+    int core_id, int thread_idx, uint32_t reg_task_id, TaskId task_id, uint32_t func_id, CoreType core_type
 ) {
     if (s_pmu_header == nullptr || core_id < 0 || core_id >= PLATFORM_MAX_CORES) {
         return;
@@ -311,9 +311,9 @@ void pmu_aicpu_complete_record(
         wmb();
         return;
     }
-    PmuRecord *slot = &ring->dual_issue_slots[reg_task_id % PLATFORM_PMU_AICORE_RING_SIZE];
+    PmuAicoreSlot *slot = &ring->dual_issue_slots[reg_task_id % PLATFORM_PMU_AICORE_RING_SIZE];
 
-    if (static_cast<uint32_t>(slot->task_id) != reg_task_id) {
+    if (slot->reg_task_id != reg_task_id) {
         // AICore hasn't published this slot yet — hard invariant violation,
         // separate from capacity drops.
         state->mismatch_record_count += 1;

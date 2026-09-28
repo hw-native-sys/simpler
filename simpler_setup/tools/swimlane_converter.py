@@ -507,7 +507,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
             "core_types": ["aic"|"aiv", ...],   # indexed by core_id
             "core_to_thread": [<int>, ...]      # optional (level >= 3)
           },
-          "aicore_tasks": [[core_id, task_token_raw, reg_task_id, start_cycles,
+          "aicore_tasks": [[core_id, task_token, reg_task_id, start_cycles,
                             end_cycles, receive_to_start_cycles, run_epoch], ...],
           "scheduler_tasks": {
             "producer": "<aicpu|aicore>",
@@ -564,7 +564,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
 
     The join logic that used to live in `export_swimlane_json` (host C++):
 
-      - per-core `reg_task_id → (task_token_raw, start_cycles, end_cycles)` map
+      - per-core `reg_task_id → (task_token, start_cycles, end_cycles)` map
         from `aicore_tasks` (the AICore is the canonical identity producer)
       - `base_time_cycles` = min non-zero timestamp across all streams (task,
         phase, orch)
@@ -574,7 +574,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
         dropped and counted
       - level 1 accepts AICore-only task records; higher levels require Scheduler
         dispatch/finish timing for every emitted task
-      - sort joined `tasks` by `task_id` (= task_token_raw)
+      - sort joined `tasks` by `task_id` (= task_token)
       - convert phase records from `*_cycles` → `*_time_us`
 
     Raises:
@@ -720,7 +720,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
     )
     decode_task_id_fields = get(runtime_name).task_id_fields
 
-    def task_id_fields(task_token_raw, core_id, run_epoch):
+    def task_id_fields(task_token, core_id, run_epoch):
         """This id's layout-dependent row fields, naming the row if it will not decode.
 
         A corrupt id space raises from the owning runtime's TaskId rather than
@@ -729,7 +729,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
         thousands, so the row's join key is added here.
         """
         try:
-            return decode_task_id_fields(task_token_raw)
+            return decode_task_id_fields(task_token)
         except ValueError as exc:
             raise ValueError(
                 f"{exc} -- carried by an aicore_tasks row with core_id={core_id}, run_epoch={run_epoch}"
@@ -796,9 +796,9 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
     host_composite_end_us = (max(composite_timestamps) - host_origin_ns) / 1000.0 if composite_timestamps else 0.0
 
     # AICore lookup keyed by (run_epoch, core_id, reg_task_id). Two dispatches of
-    # the same task_token_raw to the same core (SPMD over-subscription, MIX
+    # the same task_token to the same core (SPMD over-subscription, MIX
     # cluster spread) each get their own reg_task_id, so core+reg_task_id is
-    # unique per dispatch *within one run* even when task_token_raw collides.
+    # unique per dispatch *within one run* even when task_token collides.
     # It is not unique across runs: reg_task_id restarts at 0 every run, so a
     # file holding two runs has the same core+reg_task_id twice. run_epoch is
     # what separates them, which is why it leads the key.
@@ -809,7 +809,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
     for row_index, row in enumerate(aicore_rows):
         if not isinstance(row, list) or len(row) != 7:
             raise ValueError(f"aicore_tasks[{row_index}] must contain seven columns")
-        core_id, task_token_raw, reg_task_id, start_cycles, end_cycles, r2s_cycles, run_epoch = row
+        core_id, task_token, reg_task_id, start_cycles, end_cycles, r2s_cycles, run_epoch = row
         start_cycles = int(start_cycles)
         end_cycles = int(end_cycles)
         r2s_cycles = int(r2s_cycles)
@@ -825,7 +825,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
         if key in aicore_lookup:
             raise ValueError(f"duplicate aicore_tasks join key: {key}")
         aicore_lookup[key] = (
-            int(task_token_raw),
+            int(task_token),
             start_cycles,
             end_cycles,
             r2s_cycles,
@@ -951,7 +951,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
             if ac is None:
                 unmatched_per_core[core_id] += 1
                 continue
-            task_token_raw, start_cycles, end_cycles, r2s_cycles = ac
+            task_token, start_cycles, end_cycles, r2s_cycles = ac
             dispatch_cycles = int(dispatch_cycles)
             finish_cycles = int(finish_cycles)
             start_us = _to_us(start_cycles)
@@ -961,11 +961,11 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
             local_setup_us = start_us - receive_us
             tasks.append(
                 {
-                    "task_id": task_token_raw,
+                    "task_id": task_token,
                     "func_id": -1,
                     "core_id": core_id,
                     "core_type": _core_type(core_id),
-                    **task_id_fields(task_token_raw, core_id, run_epoch),
+                    **task_id_fields(task_token, core_id, run_epoch),
                     "start_time_us": start_us,
                     "end_time_us": end_us,
                     "duration_us": end_us - start_us,
@@ -979,22 +979,22 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
             )
     elif aicore_rows and level == 1:
         for row in aicore_rows:
-            core_id, task_token_raw, _reg_task_id, start_cycles, end_cycles, r2s_cycles, run_epoch = row
+            core_id, task_token, _reg_task_id, start_cycles, end_cycles, r2s_cycles, run_epoch = row
             r2s_cycles = int(r2s_cycles)
             run_epoch = int(run_epoch)
             core_id = int(core_id)
-            task_token_raw = int(task_token_raw)
+            task_token = int(task_token)
             start_us = _to_us(int(start_cycles))
             end_us = _to_us(int(end_cycles))
             receive_us = _to_us(int(start_cycles) - r2s_cycles)
             local_setup_us = start_us - receive_us
             tasks.append(
                 {
-                    "task_id": task_token_raw,
+                    "task_id": task_token,
                     "func_id": -1,
                     "core_id": core_id,
                     "core_type": _core_type(core_id),
-                    **task_id_fields(task_token_raw, core_id, run_epoch),
+                    **task_id_fields(task_token, core_id, run_epoch),
                     "start_time_us": start_us,
                     "end_time_us": end_us,
                     "duration_us": end_us - start_us,
@@ -1234,7 +1234,7 @@ def load_deps_kernel_map(deps_path):
     (deps.json is the offline-joined identity source).
 
     Returns:
-        dict[int, list[int]] mapping ``task_id_raw → [aic, aiv0, aiv1]``,
+        dict[int, list[int]] mapping ``task_id → [aic, aiv0, aiv1]``,
         or ``None`` if the file is missing / unreadable / lacks the field.
         Entries without ``kernel_ids`` (pre-schema deps.json from older
         runs) are silently skipped — the caller treats a missing map as
@@ -1267,7 +1267,7 @@ def load_deps_block_map(deps_path):
     """Build a ``task_id → block_num`` map from deps.json's ``tasks[]``.
 
     Returns:
-        dict[int, int] mapping ``task_id_raw → block_num``, or ``None`` if
+        dict[int, int] mapping ``task_id → block_num``, or ``None`` if
         the file is missing / unreadable / lacks the field. Entries without
         ``block_num`` default to 1 (non-SPMD).
     """
@@ -2820,7 +2820,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 # Strip "orch_" prefix for display name
                 display_name = phase.replace("orch_", "") if phase.startswith("orch_") else phase
 
-                # The document runtime selects how the full task_id.raw value is displayed.
+                # The document runtime selects how the full encoded task id is displayed.
                 if task_id >= 0:
                     label = f"{display_name}({task_display(task_id)})"
                 else:

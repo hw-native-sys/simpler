@@ -29,9 +29,11 @@ separate process) per value. Defaults and the rationale are in
 
 ## S1: find the stuck kernel
 
-The `sub_class=` line gives you `stuck_task_id` and `stuck_core`. Map the task id
-back to your orchestration and look at that kernel for an infinite loop, a wait on
-a signal that never arrives, or simply too much work.
+The `sub_class=` line gives you `stuck_task_id` and `stuck_core`. The task id is
+printed in hex, and `0xffffffffffffffff` is the reserved sentinel meaning the
+classifier found no RUNNING task to name. Map the task id back to your
+orchestration and look at that kernel for an infinite loop, a wait on a signal
+that never arrives, or simply too much work.
 
 When the task id is not enough, the device log carries a per-task snapshot of the
 moment the scheduler gave up. It follows the `[SHUTDOWN_SNAPSHOT … reason=scheduler_timeout]`

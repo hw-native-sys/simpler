@@ -37,6 +37,18 @@ macro(platform_cases)
     simpler_ut_cases(platform_case ${ARGV})
 endmacro()
 
+# Hand a PMU case the arch discriminator it needs, for every runtime the case
+# was built against. a5 declares write_reg out-of-line with a 64-bit value
+# where a2a3 has it inline, and the headers carry no arch macro to tell them
+# apart — the counter counts are constexpr, not #defines — so the build says it.
+macro(simpler_pmu_arch_a5_define stem)
+    foreach(_rt_tag hbg tmr)
+        if(TARGET test_a5_${_rt_tag}_${stem})
+            target_compile_definitions(test_a5_${_rt_tag}_${stem} PRIVATE SIMPLER_TEST_PMU_ARCH_A5=1)
+        endif()
+    endforeach()
+endmacro()
+
 # ---------------------------------------------------------------------------
 # Cases carrying production sources of their own
 # ---------------------------------------------------------------------------
@@ -89,24 +101,24 @@ platform_case(test_scope_stats_collector.cpp PER_ARCH
         ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp
     TIER aicpu)
 
-# AICPU-side dep_gen writer. The collector stores the DepFlags byte without
-# interpreting it and reaches no runtime tree of its own, so one build per arch
-# is every build — the runtime axis does not apply to it.
-platform_case(test_dep_gen_collector_aicpu.cpp PER_ARCH
+# AICPU-side dep_gen writer. Both axes: the record it writes carries the
+# runtime's TaskId, so the case resolves its bare "task_id.h" to the runtime it
+# was built for.
+platform_case(test_dep_gen_collector_aicpu.cpp PER_ARCH PER_RUNTIME
     SOURCES
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/dep_gen_collector_aicpu.cpp
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_run_result_base_aicpu.cpp)
 
 # dep_gen run identity + buffer ownership, device producer and host collector in
 # one binary so the whole chain (acquire -> record -> flush -> host copy ->
-# return) is production code.
-platform_case(test_dep_gen_run_identity.cpp PER_ARCH
+# return) is production code. The runtime axis supplies SIMPLER_RUNTIME_NAME
+# along with the handle layout, so the case names neither for itself.
+platform_case(test_dep_gen_run_identity.cpp PER_ARCH PER_RUNTIME
     SOURCES
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/dep_gen_collector.cpp
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/dep_gen_collector_aicpu.cpp
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_run_result_base_aicpu.cpp
         ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp
-    DEFINES SIMPLER_RUNTIME_NAME="test_runtime"
     TIER aicpu)
 
 # One run's terminal record: the wire layout every arch/runtime pair publishes,
@@ -355,67 +367,51 @@ add_device_phase_capture_test(test_device_phase_capture_compile_off 0 1 0)
 
 platform_case(test_runtime_timeout_config.cpp PER_ARCH)
 
-platform_case(test_pmu_collector.cpp PER_ARCH
+# Both axes for all four PMU cases: the records they build carry the runtime's
+# TaskId, so each resolves its bare "task_id.h" to the runtime it was built for.
+platform_case(test_pmu_collector.cpp PER_ARCH PER_RUNTIME
     SOURCES
         ${SIMPLER_SRC}/@arch@/platform/shared/host/pmu_collector.cpp
         ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp)
 
-# a5 declares write_reg out-of-line with a 64-bit value where a2a3 has it
-# inline; the test supplies the missing definition and needs to know which.
-# There is no arch macro in the headers — the counter counts are constexpr,
-# not #defines — so the build says it.
-platform_case(test_pmu_run_identity.cpp PER_ARCH
+platform_case(test_pmu_run_identity.cpp PER_ARCH PER_RUNTIME
     SOURCES
         ${SIMPLER_SRC}/@arch@/platform/shared/host/pmu_collector.cpp
         ${SIMPLER_SRC}/@arch@/platform/shared/aicpu/pmu_collector_aicpu.cpp
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_run_result_base_aicpu.cpp
         ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp)
-if(TARGET test_a5_pmu_run_identity)
-    target_compile_definitions(test_a5_pmu_run_identity PRIVATE SIMPLER_TEST_PMU_ARCH_A5=1)
-endif()
+simpler_pmu_arch_a5_define(pmu_run_identity)
 
 # Cross-run retention, off the same two sides: the real producer publishes into
 # the real collector's threads, and the background writer merges and renames.
-# Same arch discriminator as the case above, and for the same reason.
-platform_case(test_pmu_retained_runs.cpp PER_ARCH
+platform_case(test_pmu_retained_runs.cpp PER_ARCH PER_RUNTIME
     SOURCES
         ${SIMPLER_SRC}/@arch@/platform/shared/host/pmu_collector.cpp
         ${SIMPLER_SRC}/@arch@/platform/shared/aicpu/pmu_collector_aicpu.cpp
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_run_result_base_aicpu.cpp
         ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp)
-if(TARGET test_a5_pmu_retained_runs)
-    target_compile_definitions(test_a5_pmu_retained_runs PRIVATE SIMPLER_TEST_PMU_ARCH_A5=1)
-endif()
+simpler_pmu_arch_a5_define(pmu_retained_runs)
 
 # The two production boundaries the case above does not reach: a pending run's
 # frozen event/column set while a successor resets the live configuration, and
-# the default path's begin-before-start order. Same arch discriminator, same
-# reason.
-platform_case(test_pmu_frozen_config.cpp PER_ARCH
+# the default path's begin-before-start order.
+platform_case(test_pmu_frozen_config.cpp PER_ARCH PER_RUNTIME
     SOURCES
         ${SIMPLER_SRC}/@arch@/platform/shared/host/pmu_collector.cpp
         ${SIMPLER_SRC}/@arch@/platform/shared/aicpu/pmu_collector_aicpu.cpp
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_run_result_base_aicpu.cpp
         ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp)
-if(TARGET test_a5_pmu_frozen_config)
-    target_compile_definitions(test_a5_pmu_frozen_config PRIVATE SIMPLER_TEST_PMU_ARCH_A5=1)
-endif()
+simpler_pmu_arch_a5_define(pmu_frozen_config)
 
-platform_case(test_args_dump_collector.cpp PER_ARCH
+# Both axes: the dump record carries the runtime's TaskId, so the case resolves
+# its bare "task_id.h" to the runtime it was built for.
+platform_case(test_args_dump_collector.cpp PER_ARCH PER_RUNTIME
     SOURCES
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_collector.cpp
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_retained_runs.cpp
         ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp)
 
-platform_case(test_args_dump_ack_attribution.cpp PER_ARCH
-    SOURCES
-        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_collector.cpp
-        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_retained_runs.cpp
-        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/args_dump_aicpu.cpp
-        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_run_result_base_aicpu.cpp
-        ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp)
-
-platform_case(test_args_dump_ownership.cpp PER_ARCH
+platform_case(test_args_dump_ack_attribution.cpp PER_ARCH PER_RUNTIME
     SOURCES
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_collector.cpp
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_retained_runs.cpp
@@ -423,7 +419,7 @@ platform_case(test_args_dump_ownership.cpp PER_ARCH
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_run_result_base_aicpu.cpp
         ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp)
 
-platform_case(test_args_dump_retained_runs.cpp PER_ARCH
+platform_case(test_args_dump_ownership.cpp PER_ARCH PER_RUNTIME
     SOURCES
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_collector.cpp
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_retained_runs.cpp
@@ -431,7 +427,15 @@ platform_case(test_args_dump_retained_runs.cpp PER_ARCH
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_run_result_base_aicpu.cpp
         ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp)
 
-platform_case(test_args_dump_run_identity.cpp PER_ARCH
+platform_case(test_args_dump_retained_runs.cpp PER_ARCH PER_RUNTIME
+    SOURCES
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_collector.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_retained_runs.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/args_dump_aicpu.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_run_result_base_aicpu.cpp
+        ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp)
+
+platform_case(test_args_dump_run_identity.cpp PER_ARCH PER_RUNTIME
     SOURCES
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_collector.cpp
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_retained_runs.cpp

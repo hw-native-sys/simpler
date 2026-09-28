@@ -62,8 +62,8 @@ static_assert(
 // (same pattern as get_sys_cnt_aicpu / chip_swimlane_aicpu_record_orch_phase below).
 extern "C" __attribute__((weak, visibility("hidden"))) bool is_dep_gen_enabled() { return false; }
 __attribute__((weak, visibility("hidden"))) void dep_gen_aicpu_record_submit(
-    uint64_t, bool, bool, int, const void *const *, const uint8_t *, int, const uint64_t *, const uint8_t *, uint8_t,
-    int, const int32_t[3]
+    TaskId, bool, bool, int, const void *const *, const uint8_t *, int, const TaskId *, const uint8_t *, uint8_t, int,
+    const int32_t[3]
 ) {}
 
 // Scope_stats enable gate, queried via the same predicate idiom as
@@ -99,7 +99,7 @@ __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { retur
 // The strong symbol from the AICPU build wins when profiling is available.
 // Also hidden to prevent HOST .so from polluting the global symbol table.
 __attribute__((weak, visibility("hidden"))) void
-chip_swimlane_aicpu_record_orch_phase(uint64_t, uint64_t, uint64_t, uint32_t) {}
+chip_swimlane_aicpu_record_orch_phase(uint64_t, uint64_t, TaskId, uint32_t) {}
 // Accumulated cycles per sub-step (only needed for ORCH_PROFILING export)
 static uint64_t g_orch_sync_cycle = 0;       // tensormap sync
 static uint64_t g_orch_alloc_cycle = 0;      // unified task+heap alloc
@@ -140,7 +140,7 @@ uint64_t g_orch_scope_end_atomic_count = 0;
 #include "aicpu/chip_swimlane_collector_aicpu.h"
 __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { return 0; }
 __attribute__((weak, visibility("hidden"))) void
-chip_swimlane_aicpu_record_orch_phase(uint64_t, uint64_t, uint64_t, uint32_t) {}
+chip_swimlane_aicpu_record_orch_phase(uint64_t, uint64_t, TaskId, uint32_t) {}
 // submit_idx needed for swimlane task_id tagging (no cycle accumulation at this level)
 static uint32_t g_orch_submit_idx = 0;
 #define CYCLE_COUNT_START()                                                            \
@@ -384,7 +384,7 @@ static bool append_fanin_or_fail(
     // once, so each dense producer emits one debug message when enabled.
     if (fanout_now == CHIP_DEP_DEGREE_DEBUG_THRESHOLD + 1) {
         LOG_DEBUG(
-            "dense dependency: task ring=%u id=%u fanout>%d [orch submit]",
+            "dense dependency: task ring=%u id=%d fanout>%d [orch submit]",
             static_cast<unsigned>(producer_task_id.ring()), producer_task_id.local_id(), CHIP_DEP_DEGREE_DEBUG_THRESHOLD
         );
     }
@@ -715,7 +715,7 @@ static bool prepare_task(
         return false;
     }
 
-    out->task_id = TaskId::make(ring_id, static_cast<uint32_t>(out->alloc_result.task_id));
+    out->task_id = TaskId::make(ring_id, out->alloc_result.task_id);
     out->slot_state = &orch->sm_header->rings[ring_id].get_slot_state_by_slot(out->alloc_result.slot);
     out->task = &orch->sm_header->rings[ring_id].task_descriptors[out->alloc_result.slot];
     out->payload = &orch->sm_header->rings[ring_id].task_payloads[out->alloc_result.slot];
@@ -1068,8 +1068,8 @@ static TaskOutputTensors submit_task_common(
         }
         const int32_t kernel_ids_capture[3] = {aic_kernel_id, aiv0_kernel_id, aiv1_kernel_id};
         dep_gen_aicpu_record_submit(
-            task_id.raw, orch->in_manual_scope(), args.allow_early_resolve(), tc, tensor_ptrs, arg_types_u8,
-            static_cast<int>(args.explicit_dep_count()), reinterpret_cast<const uint64_t *>(args.explicit_deps_data()),
+            task_id, orch->in_manual_scope(), args.allow_early_resolve(), tc, tensor_ptrs, arg_types_u8,
+            static_cast<int>(args.explicit_dep_count()), args.explicit_deps_data(),
             reinterpret_cast<const uint8_t *>(args.explicit_dep_kinds_data()),
             static_cast<uint8_t>(DEP_WAIT | DEP_RETAIN), args.launch_spec.core_num(), kernel_ids_capture
         );
@@ -1105,7 +1105,7 @@ static TaskOutputTensors submit_task_common(
         }
         uint8_t dep_ring_id = dep_task_id.ring();
         SharedMemoryRingHeader &dep_ring = orch->sm_header->rings[dep_ring_id];
-        int32_t dep_local_task_id = static_cast<int32_t>(dep_task_id.local_id());
+        int32_t dep_local_task_id = dep_task_id.local_id();
         int32_t dep_last_task_alive = dep_ring.fc.last_task_alive.load(std::memory_order_acquire);
         if (dep_local_task_id < dep_last_task_alive) {
             continue;
@@ -1129,7 +1129,7 @@ static TaskOutputTensors submit_task_common(
     auto runtime_emit = [&](TaskId producer_task_id, DepFlags kind) -> bool {
         uint8_t prod_ring = producer_task_id.ring();
         SharedMemoryRingHeader &producer_ring = orch->sm_header->rings[prod_ring];
-        int32_t prod_slot = producer_ring.get_slot_by_task_id(static_cast<int32_t>(producer_task_id.local_id()));
+        int32_t prod_slot = producer_ring.get_slot_by_task_id(producer_task_id.local_id());
         ChipTaskSlotState *prod_state = &producer_ring.get_slot_state_by_slot(prod_slot);
         return append_fanin_or_fail(
             orch, prod_ring, prod_slot, prod_state, producer_task_id, &fanin_builder, ring_id, kind
@@ -1198,7 +1198,7 @@ static TaskOutputTensors submit_task_common(
     // THRESHOLD because the count lands at its final total here.
     if (fanin_builder.count > CHIP_DEP_DEGREE_DEBUG_THRESHOLD) {
         LOG_DEBUG(
-            "dense dependency: task ring=%u id=%u fanin>%d [orch submit]", static_cast<unsigned>(task_id.ring()),
+            "dense dependency: task ring=%u id=%d fanin>%d [orch submit]", static_cast<unsigned>(task_id.ring()),
             task_id.local_id(), CHIP_DEP_DEGREE_DEBUG_THRESHOLD
         );
     }
@@ -1231,15 +1231,13 @@ static TaskOutputTensors submit_task_common(
 #if SIMPLER_DFX
     if (is_dump_args_enabled()) {
         if (args.scalar_count() > 0) {
-            set_dump_args_task_scalar_dtypes(
-                task_id.raw, static_cast<uint32_t>(args.scalar_count()), args.scalar_dtypes()
-            );
+            set_dump_args_task_scalar_dtypes(task_id, static_cast<uint32_t>(args.scalar_count()), args.scalar_dtypes());
         }
         // Preserve the existing Level-1 task/arg mask whenever dump is enabled.
         // Level 1 uses it to select records; hybrid Level 3 reuses the same mask only
         // to decide which tensors contribute payload alongside full metadata.
         if (args.dump_arg_mask() != 0) {
-            set_dump_args_task_mask(task_id.raw, args.dump_arg_mask(), args.dump_arg_index_ambiguous_mask());
+            set_dump_args_task_mask(task_id, args.dump_arg_mask(), args.dump_arg_index_ambiguous_mask());
         }
     }
 #endif
@@ -1280,7 +1278,7 @@ static TaskOutputTensors submit_task_common(
     }
 
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
-    CYCLE_COUNT_ORCH_SUBMIT_RECORD(task_id.raw);
+    CYCLE_COUNT_ORCH_SUBMIT_RECORD(task_id);
 
 #if SIMPLER_DFX
     orch->tasks_submitted++;
@@ -1504,7 +1502,7 @@ TaskOutputTensors OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
     orch->inline_completed_tasks++;
 
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
-    CYCLE_COUNT_ORCH_SUBMIT_RECORD(prepared.task_id.raw);
+    CYCLE_COUNT_ORCH_SUBMIT_RECORD(prepared.task_id);
 
 #if SIMPLER_DFX
     orch->tasks_submitted++;

@@ -241,7 +241,7 @@ TEST(SchedulerGraph, NonPowerOfTwoWindowKeepsDirectTaskIdIndexing) {
     auto &storage = image.storage;
     auto &fanins = image.fanins;
     for (size_t task = 0; task < storage.size(); ++task) {
-        storage[task].task.task_id = TaskId{task};
+        storage[task].task.task_id = TaskId::make_global(static_cast<int32_t>(task));
         for (int slot = 0; slot < 3; ++slot)
             storage[task].task.kernel_id[slot] = INVALID_KERNEL_ID;
         storage[task].payload.bind_regions(nullptr, nullptr, fanins[task].data());
@@ -304,7 +304,7 @@ TEST(SchedulerDispatchPayload, DisablesDeferredCompletionWithoutASlab) {
     GraphBuffer graph(1);
     graph.executable(0, 0);
     DispatchPayload payload{};
-    payload.local_context.async_ctx.task_token = TaskId{17};
+    payload.local_context.async_ctx.task_token = TaskId::make_global(17);
     SchedulerTaskInfo task{0, 1, 0, CoreType::AIC};
 
     ASSERT_EQ(

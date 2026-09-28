@@ -326,7 +326,7 @@ layers to be aware of:**
   },
 
   // Bulk task streams. Tuple column order is fixed.
-  //   aicore_tasks: [core_id, task_token_raw, reg_task_id,
+  //   aicore_tasks: [core_id, task_token, reg_task_id,
   //                  start_cycles, end_cycles, receive_to_start_cycles,
   //                  run_epoch]
   //   scheduler_tasks.records: [core_id, reg_task_id,
@@ -388,13 +388,13 @@ layers to be aware of:**
 
 All timestamps on disk are raw `get_sys_cnt` cycles (uint64). The
 join key between `aicore_tasks` and `scheduler_tasks.records` is
-`(run_epoch, core_id, reg_task_id)` — *not* `task_token_raw`, because SPMD
+`(run_epoch, core_id, reg_task_id)` — *not* `task_token`, because SPMD
 `block_num > num_cores` and MIX cluster spread can dispatch the same
-`task_token_raw` to the same core multiple times. `run_epoch` leads the key
+`task_token` to the same core multiple times. `run_epoch` leads the key
 because `core_id, reg_task_id` alone is unique only *within* a run:
 `reg_task_id` restarts at 0 every run, and a graph re-executed later reuses
 its task ids. AICore is the
-canonical producer of `task_token_raw`; the Scheduler producer stamps the
+canonical producer of `task_token`; the Scheduler producer stamps the
 dispatch / finish timestamps and the per-core join token.
 
 These artifacts carry no schema version. They are written by platform C++ in
@@ -420,7 +420,7 @@ microseconds, downstream code sees:
 
 | Field | Meaning |
 | ----- | ------- |
-| `task_id` | Runtime task id (`TaskId::raw`). The fields above its low 32 bits are also exposed split off, under names that differ by runtime because the layouts do — see the table below |
+| `task_id` | Runtime task id, as the handle's encoded word (`TaskId::to_uint64`). The fields above its low 32 bits are also exposed split off, under names that differ by runtime because the layouts do — see the table below |
 | `func_id` | Kernel function id. Always `-1` on disk; resolved post-process from `deps.json::tasks[].kernel_ids[3]` (see `swimlane_converter.resolve_func_id_from_kernel_map`) |
 | `core_id` / `core_type` | Runtime worker index into `metadata.core_types` and `"aic"` / `"aiv"` string. A5 HBG uses `worker_id`; the physical core ID is a separate Scheduler stream field. |
 | `start_time_us` / `end_time_us` / `duration_us` | AICore execution window in microseconds |
@@ -1192,9 +1192,9 @@ Task records are identical across architectures:
   post-process by `swimlane_converter.py` from deps.json's `kernel_ids[]` —
   neither is carried in the record.
 - `ChipSwimlaneAicoreTaskRecord` — slim AICore-only record (start_time,
-  end_time, task_token_raw, reg_task_id, receive_to_start_cycles), 32 bytes;
+  end_time, task_token, reg_task_id, receive_to_start_cycles), 32 bytes;
   AICore writes one per task into its currently-active per-core buffer.
-  `reg_task_id` is the join key; `task_token_raw` is identity only.
+  `reg_task_id` is the join key; `task_token` is identity only.
 
 Both architectures use split phase streams:
 

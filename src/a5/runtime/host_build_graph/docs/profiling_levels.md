@@ -442,7 +442,7 @@ header just like on onboard.
 | Level | Collects |
 | ----- | -------- |
 | 0 | Nothing (disabled) |
-| 1 | AICore timing only (start/end/task_token_raw) — AICPU `complete_task` is bypassed |
+| 1 | AICore timing only (start/end/task_token) — AICPU `complete_task` is bypassed |
 | 2 | + Scheduler per-task dispatch_time, finish_time |
 | 3 | + Scheduler phases (`SCHED_*`) |
 | 4 | + Orchestrator phases (full) |
@@ -493,9 +493,9 @@ Every executed task is published by exactly one of `dispatch`, `worksteal`, or
 `refill`. The converter displays these phases as Completion, Resolve,
 StateProbe, Dispatch, Worksteal, and Refill.
 
-At level 1 the AICore record carries the full `task_token_raw`
-(a `TaskId::raw`; see `src/common/host_build_graph/task_id.h`), read straight from
-`LocalContext.async_ctx.task_token.raw` inside the AICore helper —
+At level 1 the AICore record carries the full `task_token`
+(a `TaskId`; see `src/common/host_build_graph/task_id.h`), read straight from
+`LocalContext.async_ctx.task_token` inside the AICore helper —
 already in cache from the dispatch payload, so no extra GM load.
 Identity fields the AICPU side used to write at level 1 (`func_id`,
 `core_type`) are derived host-side:

@@ -44,6 +44,7 @@
 #include "common/args_dump.h"
 #include "common/memory_barrier.h"
 #include "host/args_dump_collector.h"
+#include "support/test_task_id.h"
 
 namespace {
 
@@ -126,14 +127,14 @@ protected:
         set_platform_run_result(/*region_base=*/0, epoch);
         dump_args_init(/*num_dump_threads=*/1);
         for (int i = 0; i < args; i++) {
-            record_scalar(static_cast<uint64_t>(0x500 + i), static_cast<uint32_t>(i));
+            record_scalar(static_cast<uint32_t>(0x500 + i), static_cast<uint32_t>(i));
         }
         dump_args_flush(kThreadIdx);
     }
 
-    void record_scalar(uint64_t task_id, uint32_t arg_index) {
+    void record_scalar(uint32_t task_id, uint32_t arg_index) {
         ArgsDumpInfo info{};
-        info.task_id = task_id;
+        info.task_id = simpler::ut::test_task_id(task_id);
         info.role = ArgsDumpRole::INPUT;
         info.stage = ArgsDumpStage::BEFORE_DISPATCH;
         info.arg_index = arg_index;

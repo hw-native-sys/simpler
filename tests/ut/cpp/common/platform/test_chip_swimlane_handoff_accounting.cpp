@@ -36,6 +36,7 @@
 #include "common/memory_barrier.h"
 #include "common/scheduler_profiling.h"
 #include "host/chip_swimlane_collector.h"
+#include "support/test_task_id.h"
 
 using Handoff = ChipSwimlaneCollector::HandoffVerdict;
 using Coverage = ChipSwimlaneCollector::HandoffCoverage;
@@ -269,7 +270,8 @@ TEST(ChipSwimlaneHandoffAccountingTest, OrchPhaseFlushCountsItsCommit) {
 
     for (int i = 0; i < 6; i++) {
         chip_swimlane_aicpu_record_orch_phase(
-            /*start_time=*/300 + i, /*end_time=*/400 + i, /*task_id=*/static_cast<uint64_t>(i), /*submit_idx=*/i
+            /*start_time=*/300 + i, /*end_time=*/400 + i,
+            /*task_id=*/simpler::ut::test_task_id(i), /*submit_idx=*/i
         );
     }
     chip_swimlane_aicpu_flush_orch_phase_buffer(/*thread_idx=*/0);
@@ -701,7 +703,8 @@ uint32_t orch_phase_free_depth(void *shm) {
 void record_orch_phases(int records) {
     for (int i = 0; i < records; i++) {
         chip_swimlane_aicpu_record_orch_phase(
-            /*start_time=*/300 + i, /*end_time=*/400 + i, /*task_id=*/static_cast<uint64_t>(i), /*submit_idx=*/i
+            /*start_time=*/300 + i, /*end_time=*/400 + i,
+            /*task_id=*/simpler::ut::test_task_id(i), /*submit_idx=*/i
         );
     }
 }

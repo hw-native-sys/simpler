@@ -48,6 +48,7 @@
 #include "common/memory_barrier.h"
 #include "common/pmu_profiling.h"
 #include "host/pmu_collector.h"
+#include "support/test_task_id.h"
 
 // The platform register accessors, for the reason test_pmu_run_identity.cpp
 // gives: the two architectures define them in translation units that reach
@@ -237,7 +238,7 @@ struct RetainedPmuFixture {
         ASSERT_NE(buf_ptr, 0u);
         auto *buf = reinterpret_cast<PmuBuffer *>(buf_ptr);
         for (int i = 0; i < n; i++) {
-            buf->records[i].task_id = 0x900 + static_cast<uint64_t>(i);
+            buf->records[i].task_id = simpler::ut::test_task_id(0x900 + i);
             buf->records[i].func_id = static_cast<uint32_t>(i);
             buf->records[i].pmu_total_cycles = 4000 + static_cast<uint64_t>(i);
         }
@@ -493,7 +494,7 @@ TEST(PmuRetainedRuns, ALateBufferForASealedRunIsABoundedCollectorError) {
     pmu_aicpu_init(core_ids, /*num_cores=*/1);
     auto *buf = reinterpret_cast<PmuBuffer *>(fx.state(0)->current_buf_ptr);
     ASSERT_NE(buf, nullptr);
-    buf->records[0].task_id = 0x1;
+    buf->records[0].task_id = simpler::ut::test_task_id(0x1);
     buf->count = 1;
     buf->run_epoch = 901;  // the sealed run's identity, on a live buffer
     wmb();
@@ -643,7 +644,7 @@ TEST(PmuRetainedRuns, RetentionOffKeepsTheSingleRunPath) {
     auto *state = get_pmu_buffer_state(shm, 0);
     auto *buf = reinterpret_cast<PmuBuffer *>(state->current_buf_ptr);
     ASSERT_NE(buf, nullptr);
-    buf->records[0].task_id = 0x5;
+    buf->records[0].task_id = simpler::ut::test_task_id(0x5);
     buf->count = 1;
     state->total_record_count += 1;
     wmb();

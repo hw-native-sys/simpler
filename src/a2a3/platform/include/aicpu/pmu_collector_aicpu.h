@@ -70,11 +70,11 @@ void pmu_aicpu_init(const uint32_t *physical_core_ids, int num_cores);
  *
  * @param core_id    Logical core index
  * @param thread_idx AICPU thread index (used to select the per-thread ready_queue)
- * @param task_id    task_id.raw from the completed task slot
+ * @param task_id    identity of the completed task slot
  * @param func_id    kernel_id from the completed task slot
  * @param core_type  AIC or AIV
  */
-void pmu_aicpu_record_task(int core_id, int thread_idx, uint64_t task_id, uint32_t func_id, CoreType core_type);
+void pmu_aicpu_record_task(int core_id, int thread_idx, TaskId task_id, uint32_t func_id, CoreType core_type);
 
 /**
  * Per-thread PMU buffer flush.

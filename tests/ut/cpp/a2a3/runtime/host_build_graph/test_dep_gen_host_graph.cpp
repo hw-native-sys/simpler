@@ -28,10 +28,10 @@ std::filesystem::path output_path(const char *name) {
            (std::string("simpler_dep_gen_") + name + "_" + std::to_string(::getpid()) + ".json");
 }
 
-void capture_task(uint64_t task_id, uint64_t predecessor = 0) {
+void capture_task(TaskId task_id, TaskId predecessor = TaskId::invalid()) {
     const int32_t kernel_ids[3] = {1, -1, -1};
     dep_gen_host_graph_begin_task(task_id, false, false, kernel_ids, 1, 0, nullptr, nullptr);
-    if (predecessor != 0) dep_gen_host_graph_add_explicit_edge(predecessor);
+    if (predecessor.is_valid()) dep_gen_host_graph_add_explicit_edge(predecessor);
     dep_gen_host_graph_end_task();
 }
 
@@ -47,8 +47,8 @@ TEST(DepGenHostGraphTest, EmitWritesTheGraphCapturedOnTheSameThread) {
     std::filesystem::remove(path);
     dep_gen_host_graph_set_enabled(true);
     dep_gen_host_graph_begin_capture();
-    capture_task(11);
-    capture_task(12, 11);
+    capture_task(TaskId::make_global(11));
+    capture_task(TaskId::make_global(12), TaskId::make_global(11));
 
     ASSERT_EQ(dep_gen_host_graph_emit(path.c_str()), 0);
     const std::string json = read_file(path);
@@ -63,7 +63,7 @@ TEST(DepGenHostGraphTest, EmitOnAnotherThreadWritesNothingAndReports) {
     std::filesystem::remove(path);
     dep_gen_host_graph_set_enabled(true);
     dep_gen_host_graph_begin_capture();
-    capture_task(21);
+    capture_task(TaskId::make_global(21));
 
     // The graph is thread-local: a run whose orchestration and drain land on
     // different threads emits nothing rather than a partial deps.json.
@@ -82,11 +82,11 @@ TEST(DepGenHostGraphTest, BeginCaptureClearsThePreviousRunsGraph) {
     std::filesystem::remove(path);
     dep_gen_host_graph_set_enabled(true);
     dep_gen_host_graph_begin_capture();
-    capture_task(101);
+    capture_task(TaskId::make_global(101));
 
     dep_gen_host_graph_set_enabled(true);
     dep_gen_host_graph_begin_capture();
-    capture_task(202);
+    capture_task(TaskId::make_global(202));
     ASSERT_EQ(dep_gen_host_graph_emit(path.c_str()), 0);
 
     const std::string json = read_file(path);

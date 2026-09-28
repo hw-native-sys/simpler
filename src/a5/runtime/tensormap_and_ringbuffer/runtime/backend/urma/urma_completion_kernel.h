@@ -257,7 +257,7 @@ inline __aicore__ AsyncCtx get_async_ctx(__gm__ int64_t *args) {
     ctx.completion_error_code = lc->async_ctx.completion_error_code;
     ctx.completion_entries = lc->async_ctx.completion_entries;
     ctx.completion_capacity = lc->async_ctx.completion_capacity;
-    ctx.task_token.raw = lc->async_ctx.task_token.raw;
+    TaskId::assign(ctx.task_token, lc->async_ctx.task_token);
     return ctx;
 }
 

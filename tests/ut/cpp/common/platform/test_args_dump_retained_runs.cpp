@@ -40,6 +40,7 @@
 #include "common/args_dump.h"
 #include "common/memory_barrier.h"
 #include "host/args_dump_collector.h"
+#include "support/test_task_id.h"
 
 namespace fs = std::filesystem;
 
@@ -186,13 +187,13 @@ struct RetainedArgsDumpFixture {
         set_platform_run_result(/*region_base=*/0, epoch);
         dump_args_init(/*num_dump_threads=*/1);
         for (int i = 0; i < args; i++)
-            record_tensor(0x700 + static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+            record_tensor(0x700 + i, static_cast<uint32_t>(i));
         if (flush_device) dump_args_flush(kLane);
     }
 
-    void record_tensor(uint64_t task_id, uint32_t arg_index, uint64_t elements = kTensorElements) {
+    void record_tensor(int32_t task_id, uint32_t arg_index, uint64_t elements = kTensorElements) {
         ArgsDumpInfo info{};
-        info.task_id = task_id;
+        info.task_id = simpler::ut::test_task_id(task_id);
         info.role = ArgsDumpRole::INPUT;
         info.stage = ArgsDumpStage::BEFORE_DISPATCH;
         info.arg_index = arg_index;
@@ -481,7 +482,7 @@ TEST(ArgsDumpRetainedRuns, ABudgetRefusedPayloadKeepsItsMetadataAndFailsTheFlush
     const uint64_t huge_elements = (2 * simpler::dfx::runs::kMinWorkingSetBytes) / sizeof(int32_t);
     std::vector<int32_t> huge(huge_elements, 7);
     ArgsDumpInfo info{};
-    info.task_id = 0x800;
+    info.task_id = simpler::ut::test_task_id(0x800);
     info.role = ArgsDumpRole::INPUT;
     info.stage = ArgsDumpStage::BEFORE_DISPATCH;
     info.arg_index = 0;
@@ -636,7 +637,7 @@ TEST(ArgsDumpRetainedRuns, RetentionOffKeepsTheSingleRunOutput) {
     set_platform_run_result(/*region_base=*/0, 1201);
     dump_args_init(/*num_dump_threads=*/1);
     ArgsDumpInfo info{};
-    info.task_id = 0x1200;
+    info.task_id = simpler::ut::test_task_id(0x1200);
     info.role = ArgsDumpRole::INPUT;
     info.stage = ArgsDumpStage::BEFORE_DISPATCH;
     info.kind = static_cast<uint8_t>(ArgsDumpKind::TENSOR);

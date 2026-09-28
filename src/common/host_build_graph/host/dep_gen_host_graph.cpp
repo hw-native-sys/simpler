@@ -94,8 +94,8 @@ const char *arg_type_str(TensorArgType t) {
 // in element units. Byte offset of element coords[] is
 //   (start_offset + Σ coords[i] · strides[i]) · dtype_bytes
 struct EdgeAnnot {
-    uint64_t pred;
-    uint64_t succ;
+    TaskId pred;
+    TaskId succ;
     int32_t consumer_arg_idx;  // -1 for EXPLICIT (not tied to a tensor arg)
     EdgeSource source;
     OverlapStatus overlap;  // only meaningful for TENSORMAP
@@ -141,7 +141,7 @@ struct TaskArgEntry {
 };
 
 struct TaskTableEntry {
-    uint64_t task_id;
+    TaskId task_id;
     bool in_manual_scope;
     bool early_dispatch;
     int32_t kernel_id[3];  // per-subslot {AIC, AIV0, AIV1}, -1 = inactive
@@ -207,8 +207,8 @@ struct HostGraphState {
     std::unordered_map<uint64_t, size_t> tensor_index;  // tensor_id → tensors[] idx
     std::vector<EdgeAnnot> edges;
     // Producers already named for the task currently being submitted.
-    std::unordered_set<uint64_t> task_preds;
-    uint64_t current_task_id = 0;
+    std::unordered_set<TaskId> task_preds;
+    TaskId current_task_id = TaskId::invalid();
     bool in_task = false;
 
     // Releases the previous graph's memory rather than clear()ing it: a captured
@@ -220,9 +220,9 @@ struct HostGraphState {
         std::vector<TensorTableEntry>{}.swap(tensors);
         std::unordered_map<uint64_t, size_t>{}.swap(tensor_index);
         std::vector<EdgeAnnot>{}.swap(edges);
-        std::unordered_set<uint64_t>{}.swap(task_preds);
+        std::unordered_set<TaskId>{}.swap(task_preds);
         captured = false;
-        current_task_id = 0;
+        current_task_id = TaskId::invalid();
         in_task = false;
     }
 };
@@ -292,7 +292,7 @@ bool write_deps_json(
         // pred/succ can exceed Number.MAX_SAFE_INTEGER (2^53-1), silently
         // losing precision in JS-based JSON parsers. Python consumers already
         // pass these through int(...) and don't care which form they receive.
-        out << "{\"task_id\":\"" << t.task_id << '"';
+        out << "{\"task_id\":\"" << TaskId::to_uint64(t.task_id) << '"';
         out << ",\"scope\":\"" << (t.in_manual_scope ? "manual" : "auto") << '"';
         out << ",\"early_dispatch\":" << (t.early_dispatch ? "true" : "false");
         // Per-subslot kernel ids {AIC, AIV0, AIV1}; INVALID_KERNEL_ID = -1 for
@@ -339,7 +339,7 @@ bool write_deps_json(
     for (size_t i = 0; i < edges.size(); i++) {
         if (i > 0) out << ',';
         const auto &e = edges[i];
-        out << "{\"pred\":\"" << e.pred << "\",\"succ\":\"" << e.succ << '"';
+        out << "{\"pred\":\"" << TaskId::to_uint64(e.pred) << "\",\"succ\":\"" << TaskId::to_uint64(e.succ) << '"';
         out << ",\"arg\":" << e.consumer_arg_idx;
         out << ",\"source\":\"" << edge_source_str(e.source) << '"';
         if (e.source == EdgeSource::TENSORMAP) {
@@ -378,7 +378,7 @@ bool dep_gen_host_graph_enabled() { return state().enabled; }
 void dep_gen_host_graph_begin_capture() { state().reset(); }
 
 void dep_gen_host_graph_begin_task(
-    uint64_t task_id_raw, bool in_manual_scope, bool early_dispatch, const int32_t kernel_ids[3], int32_t block_num,
+    TaskId task_id, bool in_manual_scope, bool early_dispatch, const int32_t kernel_ids[3], int32_t block_num,
     int32_t tensor_count, const TensorRef *tensors, const TensorArgType *arg_types
 ) {
     HostGraphState &s = state();
@@ -386,12 +386,12 @@ void dep_gen_host_graph_begin_task(
         return;
     }
     s.task_preds.clear();
-    s.current_task_id = task_id_raw;
+    s.current_task_id = task_id;
     s.in_task = true;
     s.captured = true;
 
     TaskTableEntry entry;
-    entry.task_id = task_id_raw;
+    entry.task_id = task_id;
     entry.in_manual_scope = in_manual_scope;
     entry.early_dispatch = early_dispatch;
     entry.kernel_id[0] = kernel_ids != nullptr ? kernel_ids[0] : -1;
@@ -434,32 +434,32 @@ void dep_gen_host_graph_begin_task(
 
 void dep_gen_host_graph_end_task() { state().in_task = false; }
 
-void dep_gen_host_graph_add_explicit_edge(uint64_t producer_raw) {
+void dep_gen_host_graph_add_explicit_edge(TaskId producer) {
     HostGraphState &s = state();
     if (!s.enabled || !s.in_task) {
         return;
     }
-    if (!s.task_preds.insert(producer_raw).second) {
+    if (!s.task_preds.insert(producer).second) {
         return;
     }
     EdgeAnnot e{};
-    e.pred = producer_raw;
+    e.pred = producer;
     e.succ = s.current_task_id;
     e.consumer_arg_idx = -1;
     e.source = EdgeSource::EXPLICIT;
     s.edges.push_back(e);
 }
 
-void dep_gen_host_graph_add_creator_edge(uint64_t producer_raw, int32_t arg_idx, const simpler::hbg::Tensor &consumer) {
+void dep_gen_host_graph_add_creator_edge(TaskId producer, int32_t arg_idx, const simpler::hbg::Tensor &consumer) {
     HostGraphState &s = state();
     if (!s.enabled || !s.in_task) {
         return;
     }
-    if (!s.task_preds.insert(producer_raw).second) {
+    if (!s.task_preds.insert(producer).second) {
         return;
     }
     EdgeAnnot e{};
-    e.pred = producer_raw;
+    e.pred = producer;
     e.succ = s.current_task_id;
     e.consumer_arg_idx = arg_idx;
     e.source = EdgeSource::CREATOR;
@@ -469,7 +469,7 @@ void dep_gen_host_graph_add_creator_edge(uint64_t producer_raw, int32_t arg_idx,
 }
 
 void dep_gen_host_graph_add_tensormap_edge(
-    uint64_t producer_raw, int32_t arg_idx, const simpler::hbg::Tensor &consumer, const ChipTensorMapEntry &entry,
+    TaskId producer, int32_t arg_idx, const simpler::hbg::Tensor &consumer, const ChipTensorMapEntry &entry,
     OverlapStatus overlap
 ) {
     HostGraphState &s = state();
@@ -478,9 +478,9 @@ void dep_gen_host_graph_add_tensormap_edge(
     }
     // Every overlapping producer slice is its own edge; the pred set is still
     // updated so a later creator/explicit edge for the same producer collapses.
-    s.task_preds.insert(producer_raw);
+    s.task_preds.insert(producer);
     EdgeAnnot e{};
-    e.pred = producer_raw;
+    e.pred = producer;
     e.succ = s.current_task_id;
     e.consumer_arg_idx = arg_idx;
     e.source = EdgeSource::TENSORMAP;

@@ -36,6 +36,7 @@
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "common/chip_swimlane_profiling.h"
 #include "host/chip_swimlane_collector.h"
+#include "support/test_task_id.h"
 
 namespace chip_swimlane_fixture {
 
@@ -129,7 +130,7 @@ inline void populate(ChipSwimlaneCollector &collector, PhaseBuffers &buffers, co
             buf->records[i].start_time = 1000 + static_cast<uint64_t>(core * 10 + i);
             buf->records[i].end_time = 1500 + static_cast<uint64_t>(core * 10 + i);
             buf->records[i].reg_task_id = static_cast<uint32_t>(i + 1);
-            buf->records[i].task_token_raw = static_cast<uint64_t>(core * 100 + i);
+            buf->records[i].task_token = simpler::ut::test_task_id(core * 100 + i);
             buf->records[i].receive_to_start_cycles = static_cast<uint32_t>(7 + i);
         }
     }
@@ -169,7 +170,7 @@ inline void populate(ChipSwimlaneCollector &collector, PhaseBuffers &buffers, co
             record.phase_data.dispatch.pop_hit = 3;
             record.phase_data.dispatch.pop_miss = 4;
         } else {
-            record.phase_data.task_id.raw = 0x5150;
+            record.phase_data.task_id = simpler::ut::test_task_id(0x5150);
         }
         for (int q = 0; q < CHIP_SWIMLANE_NUM_QUEUE_SHAPES; q++) {
             record.shared_depth_at_start[q] = static_cast<int16_t>(q + 1);
@@ -187,7 +188,7 @@ inline void populate(ChipSwimlaneCollector &collector, PhaseBuffers &buffers, co
     for (uint32_t i = 0; i < 2; i++) {
         buffers.orch->records[i].start_time = 3000 + i;
         buffers.orch->records[i].end_time = 3100 + i;
-        buffers.orch->records[i].task_id = 0x6100 + i;
+        buffers.orch->records[i].task_id = simpler::ut::test_task_id(0x6100 + i);
         buffers.orch->records[i].submit_idx = i;
     }
     deliver(collector, ProfBufferType::AICPU_ORCH_PHASE, /*index=*/0, buffers.orch);

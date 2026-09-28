@@ -520,7 +520,7 @@ GraphMaterializeResult graph_execution_materialize_slice(
             // rebind resolves against.
             const TaskId operand_owner = predicate_index >= definition.predicate_count ?
                                              TaskId::invalid() :
-                                             TaskId{predicates[predicate_index].operand.owner_task_id};
+                                             predicates[predicate_index].operand.owner_task_id;
             if (predicate_index >= definition.predicate_count ||
                 (operand_owner.space() == TaskId::Space::SUB_TASK && operand_owner.local_id() == i) ||
                 !graph_rebind_tensor(execution, predicates[predicate_index].operand, &operand) ||

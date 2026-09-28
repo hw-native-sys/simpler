@@ -50,9 +50,9 @@ TEST(DepGenReplayTest, RejectsUnknownExplicitDepFlagBits) {
     std::filesystem::remove(path);
 
     DepGenRecord record{};
-    record.task_id = TaskId::make(0, 2).raw;
+    record.task_id = TaskId::make(0, 2);
     record.explicit_dep_count = 1;
-    record.explicit_deps[0] = TaskId::make(0, 1).raw;
+    record.explicit_deps[0] = TaskId::make(0, 1);
     record.explicit_dep_kinds[0] = 0xff;
 
     EXPECT_EQ(dep_gen_replay_emit_deps_json(&record, 1, path.c_str()), -7);

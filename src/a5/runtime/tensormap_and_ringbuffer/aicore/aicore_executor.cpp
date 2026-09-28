@@ -251,14 +251,14 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                 pipe_barrier(PIPE_ALL);
             }
 
-            // Performance profiling: record task execution. task_token_raw is
+            // Performance profiling: record task execution. task_token is
             // the task identity (already in AICore cache from the dispatch
             // payload); reg_task_id is the per-core dispatch token AICore just
             // read. Host uses reg_task_id as join key vs the AICPU stream.
             if (chip_swimlane_enabled) {
-                uint64_t task_token_raw = exec_payload->local_context.async_ctx.task_token.raw;
                 chip_swimlane_aicore_commit_task_record(
-                    chip_swimlane_record, task_token_raw, task_id, receive_time, start_time, end_time
+                    chip_swimlane_record, exec_payload->local_context.async_ctx.task_token, task_id, receive_time,
+                    start_time, end_time
                 );
             }
         }

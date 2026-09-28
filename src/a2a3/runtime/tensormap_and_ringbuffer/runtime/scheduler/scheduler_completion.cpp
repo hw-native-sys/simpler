@@ -248,7 +248,7 @@ void SchedulerContext::complete_slot_task(
 
 #if SIMPLER_DFX
     // Level gate: at TASK_TIMING (level=1) the AICore record alone carries
-    // {start, end, task_token_raw}, host resolves func_id/core_type from
+    // {start, end, task_token}, host resolves func_id/core_type from
     // dep_gen / per-core mapping, and AICPU has nothing to write. Only at
     // SCHEDULE_TIMING (level=2) and above does AICPU contribute dispatch/finish
     // timestamps via complete_task. Bypassing here saves the per-completion
@@ -264,7 +264,7 @@ void SchedulerContext::complete_slot_task(
             ) != 0) {
             LOG_ERROR(
                 "Core %d: chip_swimlane_aicpu_complete_task failed for task 0x%" PRIx64, core_id,
-                static_cast<uint64_t>(slot_state.task->task_id.raw)
+                TaskId::to_uint64(slot_state.task->task_id)
             );
         }
 #if SIMPLER_SCHED_PROFILING
@@ -274,8 +274,8 @@ void SchedulerContext::complete_slot_task(
 
     if (is_pmu_enabled()) {
         pmu_aicpu_record_task(
-            core_id, thread_idx, slot_state.task->task_id.raw,
-            slot_state.task->kernel_id[static_cast<int32_t>(subslot)], hank[core_id].core_type
+            core_id, thread_idx, slot_state.task->task_id, slot_state.task->kernel_id[static_cast<int32_t>(subslot)],
+            hank[core_id].core_type
         );
     }
 #endif

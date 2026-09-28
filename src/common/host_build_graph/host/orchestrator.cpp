@@ -64,12 +64,12 @@
 // both describe an edge the same way.
 struct DepGraphAnnotate {
     void creator(int32_t arg_idx, const simpler::hbg::Tensor &consumer, TaskId producer) const {
-        dep_gen_host_graph_add_creator_edge(producer.raw, arg_idx, consumer);
+        dep_gen_host_graph_add_creator_edge(producer, arg_idx, consumer);
     }
     void tensormap(
         int32_t arg_idx, const simpler::hbg::Tensor &consumer, const ChipTensorMapEntry &entry, OverlapStatus overlap
     ) const {
-        dep_gen_host_graph_add_tensormap_edge(entry.producer_task_id.raw, arg_idx, consumer, entry, overlap);
+        dep_gen_host_graph_add_tensormap_edge(entry.producer_task_id, arg_idx, consumer, entry, overlap);
     }
 };
 
@@ -1527,9 +1527,9 @@ append_fanin_or_fail(OrchestratorState &orch, TaskId producer_task_id, int32_t *
     if (!producer_task_id.is_global()) {
         orch.report_fatal(
             SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
-            "producer task %#llx is in id space %s, not GLOBAL; host_build_graph resolves every fanin edge against "
-            "its one task table",
-            static_cast<unsigned long long>(producer_task_id.raw), producer_task_id.space_name()
+            "producer task %#" PRIx64 " is in id space %s, not GLOBAL; host_build_graph resolves every fanin edge "
+            "against its one task table",
+            TaskId::to_uint64(producer_task_id), producer_task_id.space_name()
         );
         return false;
     }
@@ -1542,8 +1542,8 @@ append_fanin_or_fail(OrchestratorState &orch, TaskId producer_task_id, int32_t *
     if (prod_local < 0 || prod_local >= orch.task_allocator.active_count()) {
         orch.report_fatal(
             SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
-            "producer task %#llx names slot %d, which this run has not submitted (%d claimed)",
-            static_cast<unsigned long long>(producer_task_id.raw), prod_local, orch.task_allocator.active_count()
+            "producer task %#" PRIx64 " names slot %d, which this run has not submitted (%d claimed)",
+            TaskId::to_uint64(producer_task_id), prod_local, orch.task_allocator.active_count()
         );
         return false;
     }
@@ -1885,7 +1885,7 @@ static TaskOutputTensors submit_task_common(
             aiv1_kernel_id,
         };
         dep_gen_host_graph_begin_task(
-            task_id.raw, orch->in_manual_scope(), args.allow_early_resolve(), kernel_ids_capture.data(),
+            task_id, orch->in_manual_scope(), args.allow_early_resolve(), kernel_ids_capture.data(),
             args.launch_spec.block_num(), args.tensor_count(), args.tensor_data(), args.tag_data()
         );
     }
@@ -1916,7 +1916,7 @@ static TaskOutputTensors submit_task_common(
             return result;
         }
         if (capture_dep_graph) {
-            dep_gen_host_graph_add_explicit_edge(dep_task_id.raw);
+            dep_gen_host_graph_add_explicit_edge(dep_task_id);
         }
         if (!append_fanin_or_fail(*orch, dep_task_id, fanin_slots, payload.fanin_count)) {
             return result;
@@ -2035,7 +2035,7 @@ static TaskOutputTensors submit_task_common(
     }
 
     ORCH_STEP_LAP(g_orch_fanin_ns);
-    ORCH_PHASE_END(HostPhaseKind::OrchSubmitTask, task_id.raw);
+    ORCH_PHASE_END(HostPhaseKind::OrchSubmitTask, TaskId::to_uint64(task_id));
 
 #if SIMPLER_DFX
     orch->tasks_submitted++;
@@ -2306,7 +2306,7 @@ bool graph_submit_outer(
             INVALID_KERNEL_ID,
         };
         dep_gen_host_graph_begin_task(
-            task_id.raw, orch->in_manual_scope(), /*early_dispatch=*/false, kernel_ids_capture.data(),
+            task_id, orch->in_manual_scope(), /*early_dispatch=*/false, kernel_ids_capture.data(),
             slot.logical_block_num, args.tensor_count(), args.tensor_data(), args.tag_data()
         );
         const bool ok =
@@ -2712,7 +2712,7 @@ TaskOutputTensors graph_record_submit_sub_task(
     // Published last: until this advances, the slot is not part of the recording, so
     // nothing that scans the recorded tasks can see the task being built.
     recording.task_count = task_index + 1;
-    ORCH_PHASE_END(HostPhaseKind::OrchRecordSubTask, task_id.raw);
+    ORCH_PHASE_END(HostPhaseKind::OrchRecordSubTask, TaskId::to_uint64(task_id));
     return result;
 }
 
@@ -2757,7 +2757,7 @@ OrchestratorState::graph_begin_inner(uint64_t graph_key, const GraphTaskArgs &ar
             )) {
             result.execute_block = false;
             result.task_id = submitted;
-            ORCH_PHASE_END(HostPhaseKind::OrchGraphSubmit, submitted.raw);
+            ORCH_PHASE_END(HostPhaseKind::OrchGraphSubmit, TaskId::to_uint64(submitted));
 #if SIMPLER_DFX
             g_orch_submit_idx++;
 #if SIMPLER_ORCH_PROFILING
@@ -2782,7 +2782,7 @@ OrchestratorState::graph_begin_inner(uint64_t graph_key, const GraphTaskArgs &ar
         if (graph_submit_pending_definition(orch, state, full_key, args, &submitted)) {
             result.execute_block = false;
             result.task_id = submitted;
-            ORCH_PHASE_END(HostPhaseKind::OrchGraphSubmit, submitted.raw);
+            ORCH_PHASE_END(HostPhaseKind::OrchGraphSubmit, TaskId::to_uint64(submitted));
 #if SIMPLER_DFX
             g_orch_submit_idx++;
 #if SIMPLER_ORCH_PROFILING
@@ -2881,7 +2881,7 @@ OrchestratorState::graph_begin_inner(uint64_t graph_key, const GraphTaskArgs &ar
         result.recording_handle = entry_ptr;
         result.params = &entry_ptr->boundary.params;
         result.task_id = submitted;
-        ORCH_PHASE_END(HostPhaseKind::OrchGraphSubmit, submitted.raw);
+        ORCH_PHASE_END(HostPhaseKind::OrchGraphSubmit, TaskId::to_uint64(submitted));
 #if SIMPLER_DFX
         g_orch_submit_idx++;
 #if SIMPLER_ORCH_PROFILING
@@ -3323,7 +3323,7 @@ TaskOutputTensors OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
     orch->inline_completed_tasks++;
 
     ORCH_STEP_LAP(g_orch_fanin_ns);
-    ORCH_PHASE_END(HostPhaseKind::OrchAllocTensors, prepared.task_id.raw);
+    ORCH_PHASE_END(HostPhaseKind::OrchAllocTensors, TaskId::to_uint64(prepared.task_id));
 
 #if SIMPLER_DFX
     orch->tasks_submitted++;

@@ -567,7 +567,12 @@ TEST(TaskIdTest, MakeAndDecode) {
 TEST(TaskIdTest, InvalidSentinel) {
     auto inv = TaskId::invalid();
     EXPECT_FALSE(inv.is_valid());
-    EXPECT_EQ(inv.raw, UINT64_MAX);
+
+    // The widest handle the mint can produce, where a live value comes closest to the
+    // sentinel: a ring id fills its 8-bit field and a negative counter fills the low
+    // word. Bits 63-40 stay zero, so no mint ever reaches it.
+    EXPECT_TRUE(TaskId::make(UINT8_MAX, -1).is_valid());
+    EXPECT_NE(TaskId::make(UINT8_MAX, -1), inv);
 }
 
 TEST(TaskIdTest, Equality) {

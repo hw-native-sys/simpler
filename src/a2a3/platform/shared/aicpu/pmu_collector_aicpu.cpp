@@ -272,7 +272,7 @@ void pmu_aicpu_init(const uint32_t *physical_core_ids, int num_cores) {
     wmb();
 }
 
-void pmu_aicpu_record_task(int core_id, int thread_idx, uint64_t task_id, uint32_t func_id, CoreType core_type) {
+void pmu_aicpu_record_task(int core_id, int thread_idx, TaskId task_id, uint32_t func_id, CoreType core_type) {
     if (s_pmu_header == nullptr || core_id < 0 || core_id >= PLATFORM_MAX_CORES) {
         return;
     }

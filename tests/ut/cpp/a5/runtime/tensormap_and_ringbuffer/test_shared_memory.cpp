@@ -96,7 +96,7 @@ TEST_F(SharedMemoryTest, HeaderInitValues) {
     EXPECT_EQ(hdr->sched_stall_cnt_ready.load(), 0);
     EXPECT_EQ(hdr->sched_stall_cnt_waiting.load(), 0);
     EXPECT_EQ(hdr->sched_stall_orch_done.load(), 0);
-    EXPECT_EQ(hdr->sched_stall_task_id.load(), -1);
+    EXPECT_EQ(hdr->sched_stall_task_id.load(), TaskId::invalid());
     EXPECT_EQ(hdr->sched_stall_core.load(), -1);
 
     for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {

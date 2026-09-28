@@ -132,7 +132,7 @@ struct AICoreCompletionMailbox {
             uint64_t new_head = h + 1;
             if (head.compare_exchange_weak(h, new_head, std::memory_order_relaxed, std::memory_order_relaxed)) {
                 AICoreCompletionMailboxMessage *slot = &entries[h & AICORE_COMPLETION_MAILBOX_MASK];
-                slot->task_token.raw = task_token.raw;
+                slot->task_token = task_token;
                 slot->addr = addr;
                 slot->backend_cookie = backend_cookie;
                 slot->expected_value = expected_value;
@@ -157,7 +157,7 @@ struct AICoreCompletionMailbox {
             uint64_t new_head = h + 1;
             if (head.compare_exchange_weak(h, new_head, std::memory_order_relaxed, std::memory_order_relaxed)) {
                 AICoreCompletionMailboxMessage *slot = &entries[h & AICORE_COMPLETION_MAILBOX_MASK];
-                slot->task_token.raw = task_token.raw;
+                slot->task_token = task_token;
                 slot->addr = slot_state_addr;
                 slot->backend_cookie = 0;
                 slot->expected_value = 0;
@@ -182,7 +182,7 @@ struct AICoreCompletionMailbox {
         if (t >= h) return false;
         AICoreCompletionMailboxMessage *slot = &entries[t & AICORE_COMPLETION_MAILBOX_MASK];
         if (slot->seq.load(std::memory_order_acquire) != t + 1) return false;
-        out.task_token.raw = slot->task_token.raw;
+        out.task_token = slot->task_token;
         out.addr = slot->addr;
         out.backend_cookie = slot->backend_cookie;
         out.expected_value = slot->expected_value;

@@ -48,7 +48,8 @@
  *                 "producer_strides":[...] (tensormap)},
  *                ...]}
  *
- *   - All task ids are ``TaskId::raw`` values (``(ring_id << 32) | local_id``).
+ *   - All task ids are encoded words (``TaskId::to_uint64``), i.e.
+ *     ``(ring_id << 32) | local_id``.
  *   - ``tensor_id`` is a stable FNV-1a hash of ``(buffer_addr, version)``.
  *   - ``buffer_numel`` is the underlying storage element count; tensor shapes
  *     are carried per-arg / per-edge alongside ``start_offset`` + ``strides``.

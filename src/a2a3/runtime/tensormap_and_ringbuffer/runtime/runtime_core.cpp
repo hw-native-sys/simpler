@@ -113,7 +113,7 @@ static bool wait_for_tensor_ready(
 
     auto wait_one_producer = [&](const ChipTaskSlotState &slot) {
         uint8_t ring_id = slot.ring_id;
-        int32_t local_id = static_cast<int32_t>(slot.task->task_id.local_id());
+        int32_t local_id = slot.task->task_id.local_id();
         uint64_t t0 = get_sys_cnt_aicpu();
         int32_t spin_count = 0;
         while (slot.task_state.load(std::memory_order_acquire) < CHIP_TASK_COMPLETED) {

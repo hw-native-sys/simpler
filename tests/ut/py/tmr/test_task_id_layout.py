@@ -27,7 +27,7 @@ _HEADER_PATH = Path(__file__).resolve().parents[4] / "src" / "common" / "tensorm
 def test_ring_shift_matches_the_cpp_header():
     header = _HEADER_PATH.read_text()
 
-    ring_shift = re.search(r"ring\(\)\s*const\s*\{\s*return[^;]*raw\s*>>\s*(\d+)", header)
+    ring_shift = re.search(r"ring\(\)\s*const\s*\{\s*return[^;]*raw_\s*>>\s*(\d+)", header)
     make_shift = re.search(r"ring_id\)\s*<<\s*(\d+)", header)
 
     assert ring_shift is not None, f"ring() accessor's shift amount not found in {_HEADER_PATH}"

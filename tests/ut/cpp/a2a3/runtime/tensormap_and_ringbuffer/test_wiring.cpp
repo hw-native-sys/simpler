@@ -486,11 +486,11 @@ TEST_F(WiringTest, BatchPushReportsFullInsteadOfSpinning) {
     init_slot(filler, CHIP_TASK_PENDING, 0, 1);
     auto &queue = sched.early_dispatch_queues[static_cast<int32_t>(filler.active_mask.to_shape())];
     for (uint64_t i = 0; i < queue.capacity; i++) {
-        ASSERT_TRUE(queue.push_tagged(&filler, i));
+        ASSERT_TRUE(queue.push_tagged(&filler, TaskId::make(0, static_cast<int32_t>(i))));
     }
 
     ChipTaskSlotState *items[1] = {&filler};
-    uint64_t tags[1] = {queue.capacity};
+    TaskId tags[1] = {TaskId::make(0, static_cast<int32_t>(queue.capacity))};
     // A full queue must end the call, not spin waiting for a consumer. Reaching
     // the next line at all is the assertion.
     EXPECT_FALSE(queue.push_batch_tagged(items, tags, 1));
@@ -505,13 +505,13 @@ TEST_F(WiringTest, BatchPushSucceedsAfterSpaceIsReclaimed) {
     init_slot(filler, CHIP_TASK_PENDING, 0, 1);
     auto &queue = sched.early_dispatch_queues[static_cast<int32_t>(filler.active_mask.to_shape())];
     for (uint64_t i = 0; i < queue.capacity; i++) {
-        ASSERT_TRUE(queue.push_tagged(&filler, i));
+        ASSERT_TRUE(queue.push_tagged(&filler, TaskId::make(0, static_cast<int32_t>(i))));
     }
     ASSERT_NE(queue.pop(), nullptr);
     ASSERT_NE(queue.pop(), nullptr);
 
     ChipTaskSlotState *items[2] = {&filler, &filler};
-    uint64_t tags[2] = {7, 8};
+    TaskId tags[2] = {TaskId::make(0, 7), TaskId::make(0, 8)};
     EXPECT_TRUE(queue.push_batch_tagged(items, tags, 2));
     EXPECT_EQ(queue.size(), queue.capacity);
 }
@@ -524,7 +524,7 @@ TEST_F(WiringTest, EarlyDispatchQueueOverflowRollsBackStagingClaim) {
     auto shape = static_cast<int32_t>(consumer.active_mask.to_shape());
     auto &queue = sched.early_dispatch_queues[shape];
     for (uint64_t i = 0; i < queue.capacity; i++) {
-        ASSERT_TRUE(queue.push_tagged(&filler, i));
+        ASSERT_TRUE(queue.push_tagged(&filler, TaskId::make(0, static_cast<int32_t>(i))));
     }
 
     sched.try_enqueue_early_dispatch_candidate(consumer);
@@ -541,7 +541,7 @@ TEST_F(WiringTest, EarlyDispatchQueueOverflowFallsBackToNormalDispatch) {
     ResourceShape shape = consumer.active_mask.to_shape();
     auto &queue = sched.early_dispatch_queues[static_cast<int32_t>(shape)];
     for (uint64_t i = 0; i < queue.capacity; i++) {
-        ASSERT_TRUE(queue.push_tagged(&filler, i));
+        ASSERT_TRUE(queue.push_tagged(&filler, TaskId::make(0, static_cast<int32_t>(i))));
     }
 
     sched.try_enqueue_early_dispatch_candidate(consumer);
@@ -563,7 +563,7 @@ TEST_F(WiringTest, EarlyDispatchSyncStartQueueOverflowFallsBackToSyncReadyQueue)
 
     auto &queue = sched.early_sync_start_queue;
     for (uint64_t i = 0; i < queue.capacity; i++) {
-        ASSERT_TRUE(queue.push_tagged(&filler, i));
+        ASSERT_TRUE(queue.push_tagged(&filler, TaskId::make(0, static_cast<int32_t>(i))));
     }
 
     sched.try_enqueue_early_dispatch_candidate(consumer);

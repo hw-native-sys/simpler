@@ -286,7 +286,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
             // Performance profiling: record task execution.
             // Two identity fields go into the record (different roles):
-            //   - task_token_raw (the full TaskId) is pulled from the dispatch
+            //   - task_token is pulled from the dispatch
             //     payload's LocalContext.async_ctx — already in AICore cache
             //     from the just-completed task, no extra GM load. Host uses
             //     it as the canonical task identity for JSON output / task-id
@@ -297,14 +297,14 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             //     against the AICPU record stream. Required for correctness
             //     under SPMD (block_num > num_cores) and MIX cluster spread,
             //     where multiple dispatches of the same task share the same
-            //     task_token_raw.
+            //     task_token.
             last_reg_val = reg_val;
             write_reg(RegId::COND, MAKE_FIN_VALUE(task_id));
 
             if (chip_swimlane_enabled) {
-                uint64_t task_token_raw = exec_payload->local_context.async_ctx.task_token.raw;
                 chip_swimlane_aicore_commit_task_record(
-                    chip_swimlane_record, task_token_raw, task_id, receive_time, start_time, end_time
+                    chip_swimlane_record, exec_payload->local_context.async_ctx.task_token, task_id, receive_time,
+                    start_time, end_time
                 );
             }
         }

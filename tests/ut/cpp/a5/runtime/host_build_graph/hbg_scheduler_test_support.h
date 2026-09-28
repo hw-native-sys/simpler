@@ -54,7 +54,7 @@ public:
         storage_ = image_->storage.data();
         fanins_ = image_->fanins.data();
         for (size_t task = 0; task < capacity_; ++task) {
-            storage_[task].task.task_id = TaskId{static_cast<uint64_t>(task)};
+            storage_[task].task.task_id = TaskId::make_global(static_cast<int32_t>(task));
             storage_[task].payload.bind_regions(
                 nullptr, nullptr, fanins_ + task * static_cast<size_t>(SCHEDULER_GRAPH_MAX_FANIN)
             );

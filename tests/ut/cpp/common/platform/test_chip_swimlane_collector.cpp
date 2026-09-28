@@ -24,6 +24,7 @@
 #include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "host/chip_swimlane_collector.h"
+#include "support/test_task_id.h"
 
 TEST(ChipSwimlaneCollectorTest, BeginRunReleasesRuntimeExtensionSlots) {
     ChipSwimlaneCollector collector;
@@ -73,7 +74,7 @@ TEST(ChipSwimlaneCollectorTest, CollectedRecordsCarryTheirRunAfterTheBufferIsReu
     buf.records[0].start_time = 1000;  // non-zero: the start_time==0 filter keeps it
     buf.records[0].end_time = 1200;
     buf.records[0].reg_task_id = 5;
-    buf.records[0].task_token_raw = 0xabc;
+    buf.records[0].task_token = simpler::ut::test_task_id(0xabc);
 
     ReadyBufferInfo info{};
     info.type = ProfBufferType::AICORE_TASK;
@@ -1020,7 +1021,7 @@ protected:
             chip_swimlane_aicpu_on_aicore_dispatch(/*core_id=*/0, /*thread_idx=*/0, reg_task_id);
             // AICore writes these on device; the host stub stands in for it so
             // the exported row comes from a real collected record.
-            buf->records[i].task_token_raw = 0x100 + reg_task_id;
+            buf->records[i].task_token = simpler::ut::test_task_id(0x100 + reg_task_id);
             buf->records[i].reg_task_id = reg_task_id;
             buf->records[i].start_time = time_base + 10 * (i + 1);
             buf->records[i].end_time = time_base + 10 * (i + 1) + 5;

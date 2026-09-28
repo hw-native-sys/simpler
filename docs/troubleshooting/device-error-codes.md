@@ -133,7 +133,7 @@ verdict plus locators, so you rarely need the device log:
 
 ```text
 [ERROR] scheduler timeout sub_class=S1:running-stalled (detail=1) completed=0/1 \
-        running=1 ready=0 waiting=0 orch_done=1 stuck_task_id=42 stuck_core=5
+        running=1 ready=0 waiting=0 orch_done=1 stuck_task_id=0x0000000100000001 stuck_core=5
 ```
 
 | Sub-class | Cause |

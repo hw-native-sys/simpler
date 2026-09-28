@@ -27,10 +27,9 @@
 
 namespace {
 
-// The mailbox stores a token and compares it for identity; it never decodes one,
-// and the encoding belongs to whichever runtime minted it, so any distinct 64-bit
-// value serves here.
-TaskId make_token(uint32_t local) { return TaskId{local}; }
+// The mailbox stores a token and compares it for identity; it never decodes one, so
+// any distinct handle serves here -- the id space it names is not read.
+TaskId make_token(int32_t local) { return TaskId::make_global(local); }
 
 // A mailbox on memory holding a prior generation's bytes, which is what the
 // pooled arena hands the AICPU: the region is never uploaded, so nothing zeroes
@@ -97,7 +96,7 @@ TEST(HbgMailboxInit, DirtyMemoryYieldsAUsableRing) {
 
     AICoreCompletionMsgView out{};
     ASSERT_TRUE(mb->try_pop(out));
-    EXPECT_EQ(out.task_token.raw, token.raw);
+    EXPECT_EQ(out.task_token, token);
     EXPECT_EQ(out.addr, 0x4000ULL);
     EXPECT_EQ(out.expected_value, 7U);
     EXPECT_FALSE(mb->try_pop(out));

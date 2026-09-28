@@ -776,7 +776,7 @@ int chip_swimlane_aicpu_complete_task(
     }
 
     // AICPU-only timing — three fields, two cache half-lines. Identity
-    // (task_token_raw, core_type) lives in the AICore record; the host
+    // (task_token, core_type) lives in the AICore record; the host
     // joins by reg_task_id. See ChipSwimlaneAicpuTaskRecord header comment.
     ChipSwimlaneAicpuTaskRecord *record = &chip_swimlane_buf->records[count];
     record->reg_task_id = reg_task_id;
@@ -1174,7 +1174,7 @@ void chip_swimlane_aicpu_record_sched_phase(
 }
 
 void chip_swimlane_aicpu_record_task_phase(
-    int thread_idx, SchedPhaseKind kind, uint64_t start_time, uint64_t end_time, uint32_t loop_iter, uint64_t task_id,
+    int thread_idx, SchedPhaseKind kind, uint64_t start_time, uint64_t end_time, uint32_t loop_iter, TaskId task_id,
     uint32_t tasks_processed
 ) {
     auto *record = acquire_sched_phase_record(thread_idx);
@@ -1183,13 +1183,13 @@ void chip_swimlane_aicpu_record_task_phase(
         record, kind, start_time, end_time, loop_iter, tasks_processed, /*shared_at_start=*/nullptr,
         /*shared_at_end=*/nullptr
     );
-    record->phase_data.task_id = TaskId{task_id};
+    record->phase_data.task_id = task_id;
 }
 
 void chip_swimlane_aicpu_set_orch_thread_idx(int thread_idx) { s_orch_thread_idx = thread_idx; }
 
 void chip_swimlane_aicpu_record_orch_phase(
-    uint64_t start_time, uint64_t end_time, uint64_t task_id, uint32_t submit_idx
+    uint64_t start_time, uint64_t end_time, TaskId task_id, uint32_t submit_idx
 ) {
     if (s_orch_thread_idx < 0 || !s_phase_initialized) return;
     // Single orch instance (dep_gen / scope_stats style): all orch records

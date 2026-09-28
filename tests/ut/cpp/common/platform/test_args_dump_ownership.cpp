@@ -46,6 +46,7 @@
 #include "common/args_dump.h"
 #include "common/memory_barrier.h"
 #include "host/args_dump_collector.h"
+#include "support/test_task_id.h"
 
 namespace fs = std::filesystem;
 
@@ -170,13 +171,13 @@ struct OwnershipFixture {
         set_platform_run_result(/*region_base=*/0, epoch);
         dump_args_init(/*num_dump_threads=*/1);
         for (int i = 0; i < args; i++)
-            record_tensor(0x900 + static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+            record_tensor(0x900 + i, static_cast<uint32_t>(i));
         dump_args_flush(kLane);
     }
 
-    void record_tensor(uint64_t task_id, uint32_t arg_index) {
+    void record_tensor(int32_t task_id, uint32_t arg_index) {
         ArgsDumpInfo info{};
-        info.task_id = task_id;
+        info.task_id = simpler::ut::test_task_id(task_id);
         info.role = ArgsDumpRole::INPUT;
         info.stage = ArgsDumpStage::BEFORE_DISPATCH;
         info.arg_index = arg_index;
@@ -264,7 +265,7 @@ TEST(ArgsDumpOwnership, ACloseReturnsOnlyAfterEveryPublishedBufferIsReceived) {
     set_platform_run_result(/*region_base=*/0, 2301);
     dump_args_init(/*num_dump_threads=*/1);
     for (int i = 0; i < kRecords; i++)
-        fx.record_tensor(0xA00 + static_cast<uint64_t>(i), static_cast<uint32_t>(i % 8));
+        fx.record_tensor(0xA00 + i, static_cast<uint32_t>(i % 8));
     dump_args_flush(kLane);
     ASSERT_GT(fx.header->queue_tails[kLane], 2u) << "the producer did not switch buffers as this case needs";
 

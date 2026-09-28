@@ -80,12 +80,12 @@ void pmu_aicpu_init(const uint32_t *physical_core_ids, int num_cores);
  * @param core_id     Logical core index
  * @param thread_idx  AICPU thread index (selects ready_queue)
  * @param reg_task_id Register dispatch token (slot match key)
- * @param task_id     Full task_id to store in the PmuRecord
+ * @param task_id     Identity to store in the PmuRecord
  * @param func_id     kernel_id from the completed task slot
  * @param core_type   AIC or AIV
  */
 void pmu_aicpu_complete_record(
-    int core_id, int thread_idx, uint32_t reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type
+    int core_id, int thread_idx, uint32_t reg_task_id, TaskId task_id, uint32_t func_id, CoreType core_type
 );
 
 /**

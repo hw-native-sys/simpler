@@ -30,6 +30,7 @@
 #pragma once
 
 #include <atomic>
+#include <cinttypes>
 #include "common/core_type.h"
 #include "utils/device_arena.h"
 #include "async_wait.h"
@@ -60,7 +61,7 @@
 struct ChipReadyQueueSlot {
     std::atomic<int64_t> sequence;
     ChipTaskSlotState *slot_state;
-    uint64_t task_id_snapshot;  // generation tag for early-dispatch queue entries
+    TaskId task_id_snapshot;  // generation tag for early-dispatch queue entries
 };
 
 /**
@@ -93,9 +94,13 @@ struct alignas(64) ChipReadyQueue {
 
     void reset_for_reuse() {}
 
-    bool push(ChipTaskSlotState *slot_state) { return push_tagged(slot_state, 0); }
+    // An untagged push carries the reserved sentinel: only the queues that pop
+    // with a tag ever read this field, and all of them push with one, so an
+    // untagged entry's tag is never compared. The sentinel says so, where a zero
+    // would have been a legitimate handle.
+    bool push(ChipTaskSlotState *slot_state) { return push_tagged(slot_state, TaskId::invalid()); }
 
-    bool push_tagged(ChipTaskSlotState *slot_state, uint64_t task_id_snapshot) {
+    bool push_tagged(ChipTaskSlotState *slot_state, TaskId task_id_snapshot) {
         uint64_t pos;
         ChipReadyQueueSlot *slot;
         while (true) {
@@ -128,7 +133,7 @@ struct alignas(64) ChipReadyQueue {
     // transient and retries, so this only spins while a peer is mid-publish.
     bool push_batch(ChipTaskSlotState **items, int count) { return push_batch_tagged(items, nullptr, count); }
 
-    bool push_batch_tagged(ChipTaskSlotState **items, const uint64_t *task_id_snapshots, int count) {
+    bool push_batch_tagged(ChipTaskSlotState **items, const TaskId *task_id_snapshots, int count) {
         if (count == 0) return true;
         if (static_cast<uint64_t>(count) > capacity) return false;
 
@@ -161,7 +166,7 @@ struct alignas(64) ChipReadyQueue {
         for (int i = 0; i < count; i++) {
             ChipReadyQueueSlot *slot = &slots[(pos + i) & mask];
             slot->slot_state = items[i];
-            slot->task_id_snapshot = task_id_snapshots == nullptr ? 0 : task_id_snapshots[i];
+            slot->task_id_snapshot = task_id_snapshots == nullptr ? TaskId::invalid() : task_id_snapshots[i];
             slot->sequence.store(static_cast<int64_t>(pos + i + 1), std::memory_order_release);
         }
         return true;
@@ -202,7 +207,9 @@ struct alignas(64) ChipReadyQueue {
         }
 
         slot->slot_state = slot_state;
-        slot->task_id_snapshot = 0;
+        // Untagged, like the push() above: the reserved sentinel, never a zero
+        // that a mint could also produce.
+        slot->task_id_snapshot = TaskId::invalid();
         slot->sequence.store(static_cast<int64_t>(pos + 1), std::memory_order_release);
         return true;
     }
@@ -210,7 +217,7 @@ struct alignas(64) ChipReadyQueue {
 
     ChipTaskSlotState *pop() { return pop_tagged(nullptr); }
 
-    ChipTaskSlotState *pop_tagged(uint64_t *task_id_snapshot) {
+    ChipTaskSlotState *pop_tagged(TaskId *task_id_snapshot) {
         // Fast-path: skip slot load when queue is clearly empty
         uint64_t d = dequeue_pos.load(std::memory_order_relaxed);
         uint64_t e = enqueue_pos.load(std::memory_order_relaxed);
@@ -294,7 +301,7 @@ struct alignas(64) ChipReadyQueue {
     // Returns actual number of items popped (may be less than max_count).
     int pop_batch(ChipTaskSlotState **out, int max_count) { return pop_batch_tagged(out, nullptr, max_count); }
 
-    int pop_batch_tagged(ChipTaskSlotState **out, uint64_t *task_id_snapshots, int max_count) {
+    int pop_batch_tagged(ChipTaskSlotState **out, TaskId *task_id_snapshots, int max_count) {
         uint64_t pos;
         int count;
         while (true) {
@@ -874,7 +881,7 @@ struct SchedulerState {
             return;
         }
         if (slot_state.payload->early_dispatch_state.load(std::memory_order_seq_cst) == EARLY_DISPATCH_STAGING) {
-            early_sync_start_queue.push_tagged(&slot_state, static_cast<uint64_t>(slot_state.task->task_id.raw));
+            early_sync_start_queue.push_tagged(&slot_state, slot_state.task->task_id);
         }
     }
 
@@ -933,7 +940,7 @@ struct SchedulerState {
             return;
         }
 
-        uint64_t task_id = static_cast<uint64_t>(consumer.task->task_id.raw);
+        const TaskId task_id = consumer.task->task_id;
         bool queued = consumer.task_attrs.requires_sync_start() ?
                           early_sync_start_queue.push_tagged(&consumer, task_id) :
                           early_dispatch_queues[static_cast<int32_t>(shape)].push_tagged(&consumer, task_id);
@@ -1479,8 +1486,8 @@ inline void AsyncWaitList::log_diagnostics(AICoreCompletionMailbox *aicore_mailb
     for (int32_t i = 0; i < count; ++i) {
         const AsyncWaitEntry &entry = entries[i];
         LOG_INFO(
-            "[ASYNC_WAIT entry=%d] task_token=%llu slot_state=0x%llx normal_done=%u conditions=%d waiting=%d", i,
-            static_cast<unsigned long long>(entry.task_token.raw),
+            "[ASYNC_WAIT entry=%d] task_token=0x%" PRIx64 " slot_state=0x%llx normal_done=%u conditions=%d waiting=%d",
+            i, TaskId::to_uint64(entry.task_token),
             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(entry.slot_state)),
             static_cast<unsigned>(entry.normal_done), entry.condition_count, entry.waiting_completion_count
         );

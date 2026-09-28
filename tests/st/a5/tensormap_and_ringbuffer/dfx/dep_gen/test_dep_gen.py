@@ -46,7 +46,7 @@ KERNELS_BASE = "../../../../../../examples/a5/tensormap_and_ringbuffer/vector_ex
 
 
 def _task_id(ring: int, local: int) -> int:
-    """Encode (ring_id, local_id) → 64-bit raw matching ``TaskId::raw``.
+    """Encode (ring_id, local_id) → the 64-bit word ``TaskId::to_uint64`` yields.
 
     The shift comes from ``tmr.TaskId``, which is the Python-side source of truth
     for this runtime's layout. Restating it here as a literal would make this file a

@@ -63,17 +63,19 @@ extern "C" void set_platform_dump_base(uint64_t dump_data_base) { g_platform_dum
 
 extern "C" uint64_t get_platform_dump_base() { return g_platform_dump_base; }
 
+// Both tables are open-addressed and mark a free slot with TaskId::invalid(), the
+// reserved sentinel no mint produces — so probing tells an unused slot from one
+// holding a real task apart by identity, with no value set aside for the purpose.
 struct DumpTaskMaskEntry {
-    uint64_t task_id;
+    TaskId task_id;
     ArgsDumpArgMask mask;
     ArgsDumpArgMask flags;
 };
 struct DumpTaskScalarDtypeEntry {
-    uint64_t task_id;
+    TaskId task_id;
     uint32_t scalar_count;
     uint8_t scalar_dtypes[32];
 };
-static constexpr uint64_t DUMP_TASK_MASK_EMPTY_TASK_ID = UINT64_MAX;
 static constexpr uint32_t DUMP_TASK_MASK_TABLE_CAPACITY = 32768;
 static DumpTaskMaskEntry *g_dump_mask_table = nullptr;
 static DumpTaskScalarDtypeEntry *g_dump_scalar_dtype_table = nullptr;
@@ -88,7 +90,7 @@ static bool ensure_dump_args_mask_table() {
         return false;
     }
     for (uint32_t i = 0; i < DUMP_TASK_MASK_TABLE_CAPACITY; i++) {
-        g_dump_mask_table[i].task_id = DUMP_TASK_MASK_EMPTY_TASK_ID;
+        g_dump_mask_table[i].task_id = TaskId::invalid();
         g_dump_mask_table[i].mask = ARGS_DUMP_ARG_MASK_NONE;
         g_dump_mask_table[i].flags = ARGS_DUMP_ARG_MASK_NONE;
     }
@@ -107,7 +109,7 @@ static bool ensure_dump_args_scalar_dtype_table() {
         return false;
     }
     for (uint32_t i = 0; i < DUMP_TASK_MASK_TABLE_CAPACITY; i++) {
-        g_dump_scalar_dtype_table[i].task_id = DUMP_TASK_MASK_EMPTY_TASK_ID;
+        g_dump_scalar_dtype_table[i].task_id = TaskId::invalid();
         g_dump_scalar_dtype_table[i].scalar_count = 0;
         memset(g_dump_scalar_dtype_table[i].scalar_dtypes, 0, sizeof(g_dump_scalar_dtype_table[i].scalar_dtypes));
     }
@@ -117,31 +119,32 @@ static bool ensure_dump_args_scalar_dtype_table() {
 static void clear_dump_args_tables() {
     if (g_dump_mask_table != nullptr) {
         for (uint32_t i = 0; i < DUMP_TASK_MASK_TABLE_CAPACITY; i++) {
-            g_dump_mask_table[i].task_id = DUMP_TASK_MASK_EMPTY_TASK_ID;
+            g_dump_mask_table[i].task_id = TaskId::invalid();
             g_dump_mask_table[i].mask = ARGS_DUMP_ARG_MASK_NONE;
             g_dump_mask_table[i].flags = ARGS_DUMP_ARG_MASK_NONE;
         }
     }
     if (g_dump_scalar_dtype_table != nullptr) {
         for (uint32_t i = 0; i < DUMP_TASK_MASK_TABLE_CAPACITY; i++) {
-            g_dump_scalar_dtype_table[i].task_id = DUMP_TASK_MASK_EMPTY_TASK_ID;
+            g_dump_scalar_dtype_table[i].task_id = TaskId::invalid();
             g_dump_scalar_dtype_table[i].scalar_count = 0;
             memset(g_dump_scalar_dtype_table[i].scalar_dtypes, 0, sizeof(g_dump_scalar_dtype_table[i].scalar_dtypes));
         }
     }
 }
 
-// task_id is an opaque 64-bit key (globally unique across rings); fold its two
-// halves so both the ring field (high 32) and the local id (low 32) reach the
-// table index. Any task_id maps to a slot — the pool is independent of runtime
-// ring depth.
-static uint32_t resolve_dump_args_task_slot(uint64_t task_id) {
-    uint64_t h = task_id ^ (task_id >> 32);
+// The key is opaque here: this module makes no claim about what any of its bits
+// mean, only that the whole of it identifies a task. Folding the two halves is what
+// gets both of them into the index, so a layout that varies its low bits and one
+// that varies its high bits both spread. Any handle maps to a slot — the pool's
+// size is independent of anything the runtime sizes.
+static uint32_t resolve_dump_args_task_slot(TaskId task_id) {
+    uint64_t h = TaskId::to_uint64(task_id);
+    h ^= h >> 32;
     return static_cast<uint32_t>(h) & (DUMP_TASK_MASK_TABLE_CAPACITY - 1);
 }
 
-extern "C" void
-set_dump_args_task_scalar_dtypes(uint64_t task_id, uint32_t scalar_count, const uint8_t *scalar_dtypes) {
+extern "C" void set_dump_args_task_scalar_dtypes(TaskId task_id, uint32_t scalar_count, const uint8_t *scalar_dtypes) {
     if (scalar_count == 0 || scalar_dtypes == nullptr) {
         return;
     }
@@ -156,7 +159,7 @@ set_dump_args_task_scalar_dtypes(uint64_t task_id, uint32_t scalar_count, const 
     for (uint32_t probe = 0; probe < DUMP_TASK_MASK_TABLE_CAPACITY; probe++) {
         DumpTaskScalarDtypeEntry &entry =
             g_dump_scalar_dtype_table[(idx + probe) & (DUMP_TASK_MASK_TABLE_CAPACITY - 1)];
-        if (entry.task_id == DUMP_TASK_MASK_EMPTY_TASK_ID || entry.task_id == task_id) {
+        if (entry.task_id == TaskId::invalid() || entry.task_id == task_id) {
             entry.task_id = task_id;
             entry.scalar_count = scalar_count;
             memcpy(entry.scalar_dtypes, scalar_dtypes, scalar_count * sizeof(uint8_t));
@@ -166,7 +169,7 @@ set_dump_args_task_scalar_dtypes(uint64_t task_id, uint32_t scalar_count, const 
     LOG_ERROR("args dump scalar dtype table is full");
 }
 
-extern "C" bool get_dump_args_task_scalar_dtypes(uint64_t task_id, uint32_t *scalar_count, uint8_t *scalar_dtypes) {
+extern "C" bool get_dump_args_task_scalar_dtypes(TaskId task_id, uint32_t *scalar_count, uint8_t *scalar_dtypes) {
     if (g_dump_scalar_dtype_table == nullptr || scalar_count == nullptr || scalar_dtypes == nullptr) {
         return false;
     }
@@ -179,7 +182,7 @@ extern "C" bool get_dump_args_task_scalar_dtypes(uint64_t task_id, uint32_t *sca
             memcpy(scalar_dtypes, entry.scalar_dtypes, entry.scalar_count * sizeof(uint8_t));
             return true;
         }
-        if (entry.task_id == DUMP_TASK_MASK_EMPTY_TASK_ID) {
+        if (entry.task_id == TaskId::invalid()) {
             return false;
         }
     }
@@ -215,7 +218,7 @@ extern "C" bool should_load_dump_args_task_masks() {
     return g_dump_args_level == DumpArgsLevel::PARTIAL || g_dump_args_level == DumpArgsLevel::HYBRID;
 }
 
-extern "C" void set_dump_args_task_mask(uint64_t task_id, ArgsDumpArgMask mask, ArgsDumpArgMask flags) {
+extern "C" void set_dump_args_task_mask(TaskId task_id, ArgsDumpArgMask mask, ArgsDumpArgMask flags) {
     if (mask == ARGS_DUMP_ARG_MASK_NONE) {
         return;
     }
@@ -225,7 +228,7 @@ extern "C" void set_dump_args_task_mask(uint64_t task_id, ArgsDumpArgMask mask, 
     uint32_t idx = resolve_dump_args_task_slot(task_id);
     for (uint32_t probe = 0; probe < DUMP_TASK_MASK_TABLE_CAPACITY; probe++) {
         DumpTaskMaskEntry &entry = g_dump_mask_table[(idx + probe) & (DUMP_TASK_MASK_TABLE_CAPACITY - 1)];
-        if (entry.task_id == DUMP_TASK_MASK_EMPTY_TASK_ID || entry.task_id == task_id) {
+        if (entry.task_id == TaskId::invalid() || entry.task_id == task_id) {
             entry.task_id = task_id;
             entry.mask = mask;
             entry.flags = flags;
@@ -235,7 +238,7 @@ extern "C" void set_dump_args_task_mask(uint64_t task_id, ArgsDumpArgMask mask, 
     LOG_ERROR("args dump selective mask table is full");
 }
 
-extern "C" void get_dump_args_task_masks(uint64_t task_id, ArgsDumpArgMask *mask, ArgsDumpArgMask *flags) {
+extern "C" void get_dump_args_task_masks(TaskId task_id, ArgsDumpArgMask *mask, ArgsDumpArgMask *flags) {
     if (mask != nullptr) {
         *mask = ARGS_DUMP_ARG_MASK_NONE;
     }
@@ -257,7 +260,7 @@ extern "C" void get_dump_args_task_masks(uint64_t task_id, ArgsDumpArgMask *mask
             }
             return;
         }
-        if (entry.task_id == DUMP_TASK_MASK_EMPTY_TASK_ID) {
+        if (entry.task_id == TaskId::invalid()) {
             return;
         }
     }

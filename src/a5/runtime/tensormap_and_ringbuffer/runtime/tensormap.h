@@ -598,7 +598,7 @@ struct ChipTensorMap {
             // reused the slot (local_id + N * window) before this cleanup ran.
             // Free only entries produced by the retiring local_id, unlinking
             // each from the chain; entries from other tasks stay linked.
-            TaskId retired_task = TaskId::make(static_cast<uint8_t>(ring_id), static_cast<uint32_t>(local_id));
+            TaskId retired_task = TaskId::make(static_cast<uint8_t>(ring_id), local_id);
             ChipTensorMapEntry *cur_entry = task_entry_heads[ring_id][task_slot];
             while (cur_entry != nullptr) {
                 ChipTensorMapEntry *next_entry = cur_entry->next_in_task;  // free_entry clears it
@@ -679,8 +679,7 @@ struct ChipTensorMap {
      * Check if entry is valid (producer has not retired)
      */
     bool entry_valid(const ChipTensorMapEntry &entry) const {
-        return static_cast<int32_t>(entry.producer_task_id.local_id()) >=
-               last_task_alives[entry.producer_task_id.ring()];
+        return entry.producer_task_id.local_id() >= last_task_alives[entry.producer_task_id.ring()];
     }
 
     void remove_entry(ChipTensorMapEntry &entry) {
@@ -698,7 +697,7 @@ struct ChipTensorMap {
         if (entry.prev_in_task == nullptr) {
             // Entry is the head of its task chain, update task_entry_heads
             int32_t ring_id = entry.producer_task_id.ring();
-            int32_t local_id = static_cast<int32_t>(entry.producer_task_id.local_id());
+            int32_t local_id = entry.producer_task_id.local_id();
             int32_t task_slot = local_id & (task_window_sizes[ring_id] - 1);
             task_entry_heads[ring_id][task_slot] = entry.next_in_task;
         } else {

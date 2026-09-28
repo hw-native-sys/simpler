@@ -32,10 +32,9 @@
 
 namespace {
 
-// The mailbox stores a token and compares it for identity; it never decodes one,
-// and the encoding belongs to whichever runtime minted it, so any distinct 64-bit
-// value serves here.
-TaskId make_token(uint32_t local) { return TaskId{local}; }
+// The mailbox stores a token and compares it for identity; it never decodes one, so
+// any distinct handle serves here -- the ring it names is not read.
+TaskId make_token(int32_t local) { return TaskId::make(0, local); }
 
 AICoreCompletionMailbox *fresh_mailbox() {
     // ~256KB heap allocation — avoid stack/BSS pressure across tests.
@@ -76,7 +75,7 @@ TEST(AICoreCompletionMailbox, PushConditionThenDrainCreatesEntry) {
     // (slot_state stays null until a TASK_NORMAL_DONE sentinel arrives, but
     // the condition is already attached).
     ASSERT_EQ(wait_list.count, 1);
-    EXPECT_EQ(wait_list.entries[0].task_token.raw, token.raw);
+    EXPECT_EQ(wait_list.entries[0].task_token, token);
     EXPECT_EQ(wait_list.entries[0].slot_state, nullptr);
     ASSERT_EQ(wait_list.entries[0].condition_count, 1);
     EXPECT_EQ(wait_list.entries[0].conditions[0].addr, kAddr);
@@ -107,7 +106,7 @@ TEST(AICoreCompletionMailbox, PushNormalDoneCreatesEntryReadyToComplete) {
     // condition" — the consumer creates an entry with waiting_count=0 and
     // normal_done=true so the next poll iteration completes it inline.
     ASSERT_EQ(wait_list.count, 1);
-    EXPECT_EQ(wait_list.entries[0].task_token.raw, token.raw);
+    EXPECT_EQ(wait_list.entries[0].task_token, token);
     EXPECT_EQ(reinterpret_cast<uint64_t>(wait_list.entries[0].slot_state), slot_addr);
     EXPECT_EQ(wait_list.entries[0].condition_count, 0);
     EXPECT_EQ(wait_list.entries[0].waiting_completion_count, 0);

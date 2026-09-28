@@ -1043,14 +1043,14 @@ extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi 
             int32_t detail = host_header.sched_stall_detail.load(std::memory_order_acquire);
             LOG_ERROR(
                 "scheduler timeout sub_class=%s (detail=%d) completed=%d/%d running=%d ready=%d waiting=%d "
-                "orch_done=%d stuck_task_id=%" PRId64 " stuck_core=%d",
+                "orch_done=%d stuck_task_id=0x%" PRIx64 " stuck_core=%d",
                 stall_detail_name(detail), detail, host_header.sched_stall_completed.load(std::memory_order_relaxed),
                 host_header.sched_stall_total.load(std::memory_order_relaxed),
                 host_header.sched_stall_cnt_running.load(std::memory_order_relaxed),
                 host_header.sched_stall_cnt_ready.load(std::memory_order_relaxed),
                 host_header.sched_stall_cnt_waiting.load(std::memory_order_relaxed),
                 host_header.sched_stall_orch_done.load(std::memory_order_relaxed),
-                host_header.sched_stall_task_id.load(std::memory_order_relaxed),
+                TaskId::to_uint64(host_header.sched_stall_task_id.load(std::memory_order_relaxed)),
                 host_header.sched_stall_core.load(std::memory_order_relaxed)
             );
         }

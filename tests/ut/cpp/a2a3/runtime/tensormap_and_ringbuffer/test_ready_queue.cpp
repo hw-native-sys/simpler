@@ -184,11 +184,11 @@ TEST_F(ReadyQueueTest, PopBatchPartial) {
 TEST_F(ReadyQueueTest, TaggedBatchPopPreservesTaskGeneration) {
     ChipTaskSlotState items[2];
     ChipTaskSlotState *input[2]{&items[0], &items[1]};
-    constexpr uint64_t queued_task_ids[2]{0x123456789abcdef0ULL, 0x0fedcba987654321ULL};
+    constexpr TaskId queued_task_ids[2]{TaskId::make(1, 0x1234), TaskId::make(2, 0x5678)};
     queue.push_batch_tagged(input, queued_task_ids, 2);
 
     ChipTaskSlotState *out[2];
-    uint64_t task_id_snapshots[2]{};
+    TaskId task_id_snapshots[2]{};
     ASSERT_EQ(queue.pop_batch_tagged(out, task_id_snapshots, 2), 2);
     EXPECT_EQ(out[0], &items[0]);
     EXPECT_EQ(out[1], &items[1]);
@@ -198,10 +198,10 @@ TEST_F(ReadyQueueTest, TaggedBatchPopPreservesTaskGeneration) {
 
 TEST_F(ReadyQueueTest, TaggedPopPreservesTaskGeneration) {
     ChipTaskSlotState item;
-    constexpr uint64_t queued_task_id = 0xfedcba9876543210ULL;
+    constexpr TaskId queued_task_id = TaskId::make(3, 0x4321);
     ASSERT_TRUE(queue.push_tagged(&item, queued_task_id));
 
-    uint64_t task_id_snapshot = 0;
+    TaskId task_id_snapshot = TaskId::invalid();
     EXPECT_EQ(queue.pop_tagged(&task_id_snapshot), &item);
     EXPECT_EQ(task_id_snapshot, queued_task_id);
 }

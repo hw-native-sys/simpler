@@ -228,7 +228,7 @@ void SchedulerContext::complete_slot_task(
 
 #if SIMPLER_DFX
     // Level gate: at TASK_TIMING (level=1) the AICore record alone carries
-    // {start, end, task_token_raw}, host resolves func_id/core_type from
+    // {start, end, task_token}, host resolves func_id/core_type from
     // dep_gen / per-core mapping, and AICPU has nothing to write. Only at
     // SCHEDULE_TIMING (level=2) and above does AICPU contribute dispatch/finish
     // timestamps via complete_task.
@@ -242,7 +242,7 @@ void SchedulerContext::complete_slot_task(
             ) != 0) {
             LOG_ERROR(
                 "Core %d: chip_swimlane_aicpu_complete_task failed for task 0x%" PRIx64, core_id,
-                static_cast<uint64_t>(slot_state.task->task_id.raw)
+                TaskId::to_uint64(slot_state.task->task_id)
             );
         }
 #if SIMPLER_SCHED_PROFILING
@@ -253,13 +253,12 @@ void SchedulerContext::complete_slot_task(
 
 #if SIMPLER_DFX
     if (is_pmu_enabled()) {
-        // Slot key must be the 32-bit register token AICore wrote into
-        // dual_issue_slots[task_id & 1].task_id (= DATA_MAIN_BASE value).
-        // task_id.raw is the full (ring_id<<32|local_id) encoding —
-        // matching on that would never hit. Pass the task identity separately
-        // for the PmuRecord.
+        // Two keys, two roles: the slot is found by the 32-bit register token
+        // AICore staged its counters under, and the identity that lands in the
+        // PmuRecord is the task's own. The token is not derivable from the
+        // handle, which is why both are passed.
         pmu_aicpu_complete_record(
-            core_id, thread_idx, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id.raw,
+            core_id, thread_idx, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id,
             slot_state.task->kernel_id[static_cast<int32_t>(subslot)], hank[core_id].core_type
         );
     }

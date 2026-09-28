@@ -207,7 +207,8 @@ silently lose precision if encoded as numbers. Python consumers pass
 these through `int(v)` which accepts either form, so the schema is
 JS-safe without burdening Python.
 
-Task ids are `TaskId::raw`. The low 32 bits are a local id; the bits above it
+Task ids are the handle's encoded word, as `TaskId::to_uint64` yields it. The low
+32 bits are a local id; the bits above it
 mean whatever the runtime that minted the record says they mean — a ring index
 in bits 39:32 (`tensormap_and_ringbuffer`, `0..CHIP_MAX_RING_DEPTH-1`), or an id
 space in bits 63:62 plus a parent task in bits 51:32 (`host_build_graph`,
@@ -256,7 +257,7 @@ Each edge is `{pred, succ}` plus annotation. Fields:
 
 | Field | Type | When present | Meaning |
 | ----- | ---- | ------------ | ------- |
-| `pred`, `succ` | uint64 (string) | always | `TaskId::raw` of producer and consumer |
+| `pred`, `succ` | uint64 (string) | always | Producer's and consumer's encoded task id (`TaskId::to_uint64`) |
 | `arg` | int32 | always | Consumer's arg-slot index; `-1` for `explicit` source |
 | `source` | string | always | `explicit` (from `explicit_deps[]`), `creator` (`owner_task_id` retention), or `tensormap` (overlap lookup hit) |
 | `flags` | string array | `tensormap_and_ringbuffer` | Subset of `["wait", "retain"]` — the edge's `DepFlags`. `wait` = ordering (readiness); `retain` = producer lifetime held until the consumer releases. `creator` edges are `["wait","retain"]`; `tensormap` edges `["wait"]`. `explicit` edges start with the per-dependency kind captured at submit time, so `CoreTaskArgsWithDeps::add_dep_wait()` emits `["wait"]` while the default dependency kind emits `["wait","retain"]`. When the same producer is also the creator of an input, replay matches runtime fanin dedup by OR-accumulating the creator's flags into the explicit edge. `DepFlags` is a `tensormap_and_ringbuffer` runtime concept — it does not exist in the host_build_graph tree — so the host-orchestrated writer omits the field rather than lagging behind it. Consumers must treat it as optional. |
