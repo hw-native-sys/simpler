@@ -189,12 +189,13 @@ Kernel 与 program 共用 `handshake_owned_clusters()` 和 `assign_own_clusters(
 轮询自己负责的 cluster，批量发布 task 指针和打开寄存器窗口，再初始化所属核的 tracker、
 payload 和 context。物理核 ID 由设备核身份指令产生，唯一性与 program 一样由平台保证；
 两种入口使用相同的 64 字节身份报告布局。Program 使用 Runtime 内嵌的报告，kernel 使用
-context 持有的独立报告区；Host 在启动前按轮清零，AICPU 在 kernel 准入时处理 DMA 清零的
-缓存可见性。AICore 写回身份后，scheduler 接受报告并执行读屏障，再发布 task 指针。
+context 持有的独立报告区。Kernel 不再逐轮清零报告区：AICore 在身份字段之后发布本轮
+`report_epoch`，AICPU 只接受与 context 成功轮次加一相符的报告，随后执行读屏障，再发布 task 指针。
 两种入口都由 AICore 读取自己的 DATA_MAIN_BASE 判断开窗，不使用额外的 GM OPEN 通知。
 正常任务循环和退出逻辑共用；A2/A3 保留 EXIT → EXITED → 关窗 → post-close release，
 A5 使用其平台既有的寄存器退出协议。A2/A3 的 release gate 由公共初始化在开窗前清零。
-本分支的报告有效性仍基于每轮清零，不声明主线非零 report_epoch 的运行身份保证。
+Program 的报告有效性仍基于 Host 在启动前清零；kernel 的轮次协议详见
+[TMR kernel 逐轮报告与清零开销](tmr-kernel-report-epoch.md)。
 
 未启用泳道图、PMU 或参数 dump 时，各 scheduler 完成本地初始化、等待 orchestrator 发布
 runtime reset 完成后即可派发，不等待其他 scheduler。这个选择按每轮的实际采集开关判断，

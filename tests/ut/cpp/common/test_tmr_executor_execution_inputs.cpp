@@ -47,6 +47,7 @@ std::atomic<int> opened_windows{0};
 std::atomic<int> closed_windows{0};
 std::atomic<uint64_t> closed_mask{0};
 std::atomic<int> register_publications{0};
+std::atomic<int> handshake_scans{0};
 std::atomic<const void *> watched_image{nullptr};
 std::atomic<int> image_invalidations{0};
 }  // namespace
@@ -71,7 +72,10 @@ extern "C" void set_platform_regs(uint64_t base) {
 }
 extern "C" uint64_t get_platform_regs() { return reinterpret_cast<uint64_t>(register_bases.data()); }
 extern "C" uint64_t get_platform_pmu_reg_addrs() { return 0; }
-uint32_t platform_get_physical_cores_count() { return PLATFORM_MAX_CORES; }
+uint32_t platform_get_physical_cores_count() {
+    ++handshake_scans;
+    return PLATFORM_MAX_CORES;
+}
 volatile uint32_t *get_reg_ptr(uint64_t base, RegId) { return reinterpret_cast<volatile uint32_t *>(base); }
 uint64_t read_reg(uint64_t base, RegId) {
     return __atomic_load_n(reinterpret_cast<uint64_t *>(base), __ATOMIC_ACQUIRE);
@@ -265,10 +269,9 @@ protected:
         opened_windows = 0;
         closed_windows = 0;
         closed_mask = 0;
-        control = {};
-        reports = {};
         for (auto &cell : register_cells)
             cell = 0;
+        const uint64_t expected_epoch = control.round_epoch + 1;
         std::vector<int32_t> allowed(execution_threads);
         for (int32_t i = 0; i < execution_threads; ++i)
             allowed[i] = 10 + i;
@@ -287,7 +290,7 @@ protected:
             EXPECT_EQ(simpler_aicpu_register_tmr_kernel_callable(&registration), 0);
         }
         request.binding = binding;
-        request.handshake = {&control, reports.data(), 3, 0};
+        request.handshake = {&control, reports.data(), 3};
         request.allowed_cpus = allowed.data();
         request.execution_threads = execution_threads;
         request.launched_threads = execution_threads + 1;
@@ -300,6 +303,7 @@ protected:
                 report.physical_core_id = invalid_reports && i == 2 ? PLATFORM_MAX_CORES : i;
                 report.core_type = i == 0 ? CoreType::AIC : CoreType::AIV;
                 __atomic_store_n(&report.aicore_done, static_cast<uint32_t>(i + 1), __ATOMIC_RELEASE);
+                __atomic_store_n(&report.report_epoch, expected_epoch, __ATOMIC_RELEASE);
             });
         }
         std::vector<int32_t> result(execution_threads + 1);
@@ -533,6 +537,7 @@ TEST_F(TmrExecutorExecutionInputsTest, PartialHandshakeFailureRetiresOpenedCores
 TEST_F(TmrExecutorExecutionInputsTest, CoordinatedRoundsRunABAWithOneFinalVerdictAndStableStorage) {
     uint64_t storage = 0;
     uint64_t invocation = 90;
+    const uint64_t first_epoch = control.round_epoch;
     for (bool serial : {false, true}) {
         resident->dev.serial_orch_sched = serial;
         for (int32_t id : {3, 4, 3}) {
@@ -546,6 +551,9 @@ TEST_F(TmrExecutorExecutionInputsTest, CoordinatedRoundsRunABAWithOneFinalVerdic
             for (int32_t result : results)
                 EXPECT_EQ(result, 0);
             EXPECT_EQ(control.runtime_status, 0);
+            EXPECT_EQ(control.round_epoch, first_epoch + invocation - 90);
+            for (const auto &report : reports)
+                EXPECT_EQ(report.report_epoch, control.round_epoch);
             EXPECT_EQ(opened_windows.load(), 3);
             EXPECT_EQ(closed_windows.load(), 3);
             EXPECT_EQ(output[0], id);
@@ -560,6 +568,43 @@ TEST_F(TmrExecutorExecutionInputsTest, CoordinatedRoundsRunABAWithOneFinalVerdic
             expect_resident_configuration(serial);
         }
     }
+}
+
+TEST_F(TmrExecutorExecutionInputsTest, PriorRoundReportsDoNotOpenWindowsBeforeNewEpoch) {
+    PreparedInvocationView callable{3, 1, 1};
+    TmrEncodingCandidate packet;
+    TmrEncodingCache cache;
+    auto args = arguments(91);
+    ASSERT_EQ(encode_tmr_invocation(args, callable, binding.identity, cache, &packet), InvocationStatus::Ok);
+    const auto first = coordinated_round({callable, {}}, packet.packet());
+    for (int32_t result : first)
+        ASSERT_EQ(result, 0);
+    ASSERT_EQ(control.round_epoch, 1u);
+    for (const auto &report : reports)
+        ASSERT_EQ(report.report_epoch, 1u);
+
+    std::atomic<bool> release_reports{false};
+    before_core_report = [&] {
+        while (!release_reports.load(std::memory_order_acquire))
+            std::this_thread::yield();
+    };
+    handshake_scans = 0;
+    std::vector<int32_t> second;
+    std::thread round([&] {
+        second = coordinated_round({callable, {}}, packet.packet());
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (handshake_scans.load() < 1 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    EXPECT_GE(handshake_scans.load(), 1);
+    for (int i = 0; i < 10000; ++i)
+        std::this_thread::yield();
+    EXPECT_EQ(opened_windows.load(), 0);
+    release_reports.store(true, std::memory_order_release);
+    round.join();
+    for (int32_t result : second)
+        EXPECT_EQ(result, 0);
+    EXPECT_EQ(control.round_epoch, 2u);
 }
 
 TEST_F(TmrExecutorExecutionInputsTest, InvalidReportsReportFailureBeforeAnyWindowOpens) {

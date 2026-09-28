@@ -26,22 +26,29 @@ void invalidate_range_impl(const void *address, size_t bytes) {
 void flush_range_impl(const void *address, size_t) { flushed = address; }
 }  // namespace aicpu_cache_maintenance
 
-TEST(TmrKernelRoundStorage, BorrowsReportsAndPublishesFinalStatusWithoutCoreAcknowledgments) {
+TEST(TmrKernelRoundStorage, UsesContextEpochAndOnlyAdvancesOnSuccess) {
     using namespace simpler::tmr;
     TmrLaunchControl control{};
+    control.round_epoch = 5;
     std::array<TmrCoreReport, 3> reports{};
     KernelRoundStorage storage;
-    ASSERT_TRUE(storage.attach({&control, reports.data(), 3, 11}));
+    ASSERT_TRUE(storage.attach({&control, reports.data(), 3}));
     EXPECT_EQ(storage.reports(), reports.data());
+    EXPECT_EQ(storage.expected_epoch(), 6u);
     EXPECT_EQ(invalidated, reports.data());
     EXPECT_EQ(invalidated_bytes, sizeof(reports));
     storage.publish_status(-19, 0);
     EXPECT_EQ(control.runtime_status, -19);
-    EXPECT_EQ(control.round_epoch, 11u);
+    EXPECT_EQ(control.round_epoch, 5u);
     EXPECT_EQ(control.completion, 1u);
     EXPECT_EQ(flushed, &control);
     for (const auto &report : reports)
         EXPECT_EQ(report.aicore_done, 0u);
+
+    ASSERT_TRUE(storage.attach({&control, reports.data(), 3}));
+    EXPECT_EQ(storage.expected_epoch(), 6u);
+    storage.publish_status(0, 0);
+    EXPECT_EQ(control.round_epoch, 6u);
 }
 
 TEST(TmrKernelRoundStorage, RejectsOverlappingAndUnalignedStorage) {
@@ -49,8 +56,9 @@ TEST(TmrKernelRoundStorage, RejectsOverlappingAndUnalignedStorage) {
     TmrLaunchControl control{};
     std::array<TmrCoreReport, 3> reports{};
     KernelRoundStorage storage;
-    EXPECT_FALSE(storage.attach({&control, reinterpret_cast<TmrCoreReport *>(&control), 1, 1}));
-    EXPECT_FALSE(storage.attach({&control, reports.data(), 3, 0}));
-    EXPECT_FALSE(storage.attach({nullptr, reports.data(), 3, 1}));
-    EXPECT_FALSE(storage.attach({&control, reports.data(), 0, 1}));
+    EXPECT_FALSE(storage.attach({&control, reinterpret_cast<TmrCoreReport *>(&control), 1}));
+    EXPECT_FALSE(storage.attach({nullptr, reports.data(), 3}));
+    EXPECT_FALSE(storage.attach({&control, reports.data(), 0}));
+    control.round_epoch = UINT64_MAX;
+    EXPECT_FALSE(storage.attach({&control, reports.data(), 3}));
 }
