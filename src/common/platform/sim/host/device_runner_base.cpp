@@ -1048,7 +1048,11 @@ int SimDeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &dfx
                 return PTO_RUNTIME_ERR_INTERNAL;
             }
         } else {
-            scope_stats_collector_.begin_run();
+            // The default path writes one file per boundary rather than a
+            // per-run artifact, and on failure it keeps the behaviour it has
+            // without the re-stamp: a run is never refused here. The helper has
+            // already logged which buffer and which run it concerns.
+            (void)scope_stats_collector_.begin_run(run_epoch);
             scope_stats_collector_.start(thread_factory);
         }
     }

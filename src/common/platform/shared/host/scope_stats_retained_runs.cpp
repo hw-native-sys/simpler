@@ -202,7 +202,20 @@ bool ScopeStatsCollector::run_begin(uint64_t run_epoch, const std::string &outpu
         note_host_failure("the background writer could not be started");
         return false;
     }
-    begin_run();
+    if (!begin_run(run_epoch)) {
+        // The device would attribute this run's records to the previous one, so
+        // the run is refused here — before any kernel is submitted — rather
+        // than publishing an artifact whose records are not all its own. Same
+        // rollback as the writer's: the slot is given back, not held by a run
+        // that will never close.
+        {
+            std::lock_guard<std::mutex> lk(retained_mu_);
+            slots_[admitted] = Slot{};
+        }
+        retained_cv_.notify_all();
+        note_host_failure("the producer's carried-over buffer could not be re-stamped for the admitted run");
+        return false;
+    }
     return true;
 }
 

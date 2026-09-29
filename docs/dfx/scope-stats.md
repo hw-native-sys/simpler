@@ -215,6 +215,19 @@ ignores them sees the same shape as before:
 | `host_received_records` | uint | Records the host took delivery of, including one recovered unpublished buffer |
 | `host_retained_records` | uint | Of those, how many the 256 MiB per-collector budget kept |
 
+A run that ends without the producer handing its last buffer over leaves that
+buffer named in `current_buf_ptr` — holding whatever records the boundary has
+just recovered, possibly none, and still stamped with the run that acquired it.
+Because the producer only re-stamps a buffer it *pops*, reusing that pointer
+would make the next run append behind those records and inherit their identity.
+Admission therefore re-stamps the buffer's 64-byte header — `count`,
+`run_epoch`, `local_seq` — for the run being admitted, so each artifact holds
+only its own records. The pointer and the free queue are left alone: the drain
+shard is the sole runtime writer of the free queue, and clearing the pointer
+would orphan a pool buffer. A header that cannot be republished to the device
+fails the admission, so no artifact is written for a run whose records the
+device could misattribute.
+
 A published file is not by itself a success: loss, a fatal and unknown counts
 each make `flush_diagnostics()` raise, and the error is sticky for the runner's
 life. A file already occupying the destination is never removed or overwritten

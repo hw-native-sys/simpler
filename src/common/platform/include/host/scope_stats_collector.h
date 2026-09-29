@@ -184,8 +184,15 @@ public:
     //
     // The collector initializes once and serves every run, so this is the only
     // point at which they are cleared; init() clears none of them, and left
-    // alone they accumulate across runs.
-    void begin_run();
+    // alone they accumulate across runs. The device's producer state is part of
+    // that: `run_epoch` is the identity a buffer the previous run left in
+    // `current_buf_ptr` is re-stamped with, so this run's records cannot inherit
+    // the previous run's.
+    //
+    // False iff such a buffer could not be made this run's, which leaves the
+    // device able to attribute this run's records to the previous one. Callers
+    // that keep per-run artifacts must refuse the run.
+    bool begin_run(uint64_t run_epoch);
 
     // Device pointer to the ScopeStatsDataHeader. Set
     // kernel_args.scope_stats_data_base to this after init().
@@ -314,6 +321,32 @@ private:
     ScopeStatsBufferState *scope_stats_state(int idx = 0) const { return get_scope_stats_buffer_state(shm_host_, idx); }
 
     void append_buffer_records(const void *buf_host_ptr);
+
+    /**
+     * Make the buffer the producer still names in `current_buf_ptr` belong to
+     * `run_epoch`, by rewriting its 64-byte header and nothing below it.
+     *
+     * A producer that reuses a non-zero `current_buf_ptr` never pops, so the
+     * engine's `claim_free` — the only writer of a buffer's `count` reset and,
+     * via `on_pop_success`, of its identity stamp — does not run. Left alone,
+     * this run would append after the previous run's records and carry its
+     * `run_epoch` and `local_seq`, which is a duplicate in one artifact and a
+     * misattribution in the other.
+     *
+     * The buffer is pool memory outside the manager's shm window, so
+     * `publish_field` cannot reach it; this publishes the header range alone
+     * rather than the whole buffer, so the records below it are never written
+     * back from the host shadow.
+     *
+     * The pointer is left in place. Clearing it would orphan a pool buffer, and
+     * pushing it back onto the free queue would make this a second runtime
+     * writer of `free_queue.tail` — the drain shard that serves the buffer's
+     * ready queue is its sole runtime writer (see `profiler_base.h`).
+     *
+     * Only ever called between runs, where the previous run's completion is
+     * proved and this run has submitted nothing, so the producer is not running.
+     */
+    bool adopt_current_buffer(uint64_t run_epoch);
 
     /**
      * Render one artifact's bytes. `extra` adds the background-mode metadata

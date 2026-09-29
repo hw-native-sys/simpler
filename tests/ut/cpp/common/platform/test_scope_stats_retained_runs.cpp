@@ -450,6 +450,79 @@ TEST(ScopeStatsRetainedRuns, ConsecutiveRunsEachPublishTheirOwnRecords) {
 }
 
 /**
+ * A recovered buffer is not the next run's to append to, empty next run or not.
+ *
+ * The producer clears `current_buf_ptr` only when it publishes, so a run that
+ * ends without its last buffer handed over leaves that buffer named — with the
+ * previous run's records still in it and the previous run's identity stamped on
+ * it. Reusing a non-zero pointer skips the pop, and the pop is the only thing
+ * that resets `count` or re-stamps the buffer, so nothing else in the producer
+ * would ever undo either. Both halves are asserted, because they fail
+ * differently: an empty second run would re-recover the first run's records
+ * into its own artifact, and a non-empty third run would append behind them.
+ *
+ * The pointer itself must survive. Clearing it would orphan a pool buffer and
+ * pushing it onto the free queue would add a second writer of a queue the
+ * drain shard owns, so what changes is the header alone.
+ */
+TEST(ScopeStatsRetainedRuns, ARecoveredBufferIsNotTheNextRunsToAppendTo) {
+    RetainedFixture fx("two-run-recovery");
+
+    // Run a: no flush, so the boundary recovers the buffer and the pointer
+    // stays behind naming it.
+    ASSERT_TRUE(fx.begin(5101, fx.root.prefix("run-a")));
+    fx.produce(5101, /*pairs=*/2, /*flush_at_end=*/false, "run-a.cpp");
+    const uint64_t carried = fx.state()->current_buf_ptr;
+    ASSERT_NE(carried, 0u) << "the producer published the buffer, so nothing is carried over";
+    ASSERT_EQ(reinterpret_cast<const ScopeStatsBuffer *>(carried)->count, 4u);
+    fx.close(5101);
+
+    // Run b produces nothing at all. Admission is what re-stamps the carried
+    // buffer, so this run owns an empty one rather than the previous run's.
+    ASSERT_TRUE(fx.begin(5102, fx.root.prefix("run-b")));
+    EXPECT_EQ(fx.state()->current_buf_ptr, carried) << "the pointer must be left in place";
+    const auto *buf = reinterpret_cast<const ScopeStatsBuffer *>(carried);
+    EXPECT_EQ(buf->count, 0u) << "run b would append behind run a's records";
+    EXPECT_EQ(buf->run_epoch, 5102u) << "run b's records would carry run a's identity";
+    fx.close(5102);
+
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+
+    // Run c appends into that same carried buffer and publishes it.
+    ASSERT_TRUE(fx.begin(5103, fx.root.prefix("run-c")));
+    ASSERT_EQ(fx.state()->current_buf_ptr, carried);
+    fx.produce(5103, /*pairs=*/3, /*flush_at_end=*/true, "run-c.cpp");
+    ASSERT_TRUE(fx.wait_for_collected(6));
+    fx.close(5103);
+    ASSERT_TRUE(fx.flush(&error)) << error;
+
+    const std::string a = read_file(fx.root.artifact("run-a"));
+    const std::string b = read_file(fx.root.artifact("run-b"));
+    const std::string c = read_file(fx.root.artifact("run-c"));
+    ASSERT_FALSE(a.empty());
+    ASSERT_FALSE(b.empty());
+    ASSERT_FALSE(c.empty());
+
+    EXPECT_EQ(record_lines(a), 4u) << "the recovery is what puts run a's records in run a's artifact";
+    EXPECT_EQ(record_lines(b), 0u) << "run b re-recovered run a's buffer";
+    EXPECT_EQ(record_lines(c), 6u) << "run c holds records that are not its own";
+    EXPECT_EQ(b.find("run-a.cpp"), std::string::npos) << "run a's records reached run b's artifact";
+    EXPECT_EQ(c.find("run-a.cpp"), std::string::npos) << "run a's records reached run c's artifact";
+    EXPECT_NE(c.find("run-c.cpp"), std::string::npos);
+
+    // The device counters and the host's received total agree for every run,
+    // which is what a duplicated append would break.
+    EXPECT_NE(a.find("\"total\": 4"), std::string::npos);
+    EXPECT_NE(a.find("\"host_received_records\": 4"), std::string::npos);
+    EXPECT_NE(b.find("\"total\": 0"), std::string::npos);
+    EXPECT_NE(b.find("\"host_received_records\": 0"), std::string::npos);
+    EXPECT_NE(c.find("\"total\": 6"), std::string::npos);
+    EXPECT_NE(c.find("\"host_received_records\": 6"), std::string::npos);
+    EXPECT_EQ(fx.collector.retained_run_stats_for_test().published, 3u);
+}
+
+/**
  * Retention off keeps the boundary write and today's metadata line exactly.
  *
  * The background-mode keys are additive, so their absence here is what proves
@@ -465,7 +538,7 @@ TEST(ScopeStatsRetainedRuns, RetentionOffKeepsTheSingleRunOutput) {
     set_platform_scope_stats_base(reinterpret_cast<uint64_t>(shm));
     scope_stats_aicpu_set_orch_thread_idx(0);
 
-    collector.begin_run();
+    collector.begin_run(4601);
     collector.start(retained_thread_factory);
     set_platform_run_result(0, 4601);
     scope_stats_set_pending_site("default.cpp", 300);

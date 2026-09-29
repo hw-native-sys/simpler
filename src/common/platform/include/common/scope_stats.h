@@ -104,11 +104,18 @@ struct ScopeStatsBuffer {
     // Header (first 64 bytes) — host copies this alone first to learn count.
     volatile uint32_t count;  // Number of valid records committed
     uint32_t _pad0;
-    // Which run's records these are, stamped once when the buffer is acquired
-    // and never rewritten while the buffer is owned. The host copies identity
+    // Which run's records these are, stamped by the producer when it acquires
+    // the buffer and immutable for as long as the device is executing: nothing
+    // rewrites it while records are being appended. The host copies identity
     // out with the records, so a host-side copy keeps its run even after the
     // device buffer has been returned to the pool and reused by a later run.
     // Zero when the producer had no run identity to stamp.
+    //
+    // A buffer the producer still holds at a run's end is the one exception,
+    // and only between runs: once that run's completion is proved and before
+    // the next launch, the host re-stamps this header for the run it is
+    // admitting, because reusing the pointer means the producer never pops and
+    // so never re-stamps it itself.
     uint64_t run_epoch;
     // Buffer generation within that run, from the producer's own rotation
     // counter. Restarts per run, so it identifies a buffer only together with
