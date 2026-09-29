@@ -295,12 +295,28 @@ int DeviceRunner::ensure_binaries_loaded() {
             return PTO_RUNTIME_ERR_INTERNAL;
         }
 
+        auto initialize_tls = reinterpret_cast<int (*)()>(dlsym(aicore_so_handle_, "initialize_aicore_tls_keys"));
+        if (initialize_tls == nullptr) {
+            LOG_ERROR("dlsym failed for initialize_aicore_tls_keys: %s", dlerror());
+            dlclose(aicore_so_handle_);
+            aicore_so_handle_ = nullptr;
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        if (int error = initialize_tls(); error != 0) {
+            LOG_ERROR("AICore SO failed to create TLS keys: %d", error);
+            dlclose(aicore_so_handle_);
+            aicore_so_handle_ = nullptr;
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+
         aicore_execute_func_ = reinterpret_cast<
             void (*)(Runtime *, int, CoreType, uint32_t, uint64_t, uint32_t, uint64_t, uint64_t, uint64_t, uint64_t)>(
             dlsym(aicore_so_handle_, "aicore_execute_wrapper")
         );
         if (aicore_execute_func_ == nullptr) {
             LOG_ERROR("dlsym failed for aicore_execute_wrapper: %s", dlerror());
+            dlclose(aicore_so_handle_);
+            aicore_so_handle_ = nullptr;
             return PTO_RUNTIME_ERR_INTERNAL;
         }
         LOG_INFO("DeviceRunner(sim): Loaded aicore_execute_wrapper from %s", aicore_so_path_.c_str());
