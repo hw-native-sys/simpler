@@ -459,9 +459,21 @@ int DeviceRunnerBase::reference_bank_arenas(
             workspace_.note_published(region, owned);
             continue;
         }
+        // `reference` returns one bool for four conditions, so the refusal
+        // names which one from state this class can already read. Without it a
+        // refusal here says only that the region has a block the ledger will
+        // not hand back, and not why.
+        const char *why = "its reference slots are full";
+        if (!workspace_.owns(owned)) {
+            why = "the ledger no longer holds it";
+        } else if (workspace_.block_state(owned) == WorkspaceManager::BlockState::Quarantined) {
+            why = "it is quarantined: a run that referenced it was destroyed without proving it finished";
+        } else if (workspace_.block_state(owned) == WorkspaceManager::BlockState::ReleaseUnconfirmed) {
+            why = "its release was attempted and the outcome is unconfirmed: ownership of the allocation is unknown";
+        }
         LOG_ERROR(
-            "setup_static_arena: bank %u region %s could not register this run as a consumer of %p", arena_bank,
-            requests[i].name, owned
+            "setup_static_arena: bank %u region %s could not register this run as a consumer of %p: %s", arena_bank,
+            requests[i].name, owned, why
         );
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -519,7 +531,11 @@ void DeviceRunnerBase::clear_staged_workspace() noexcept { workspace_staging_.cl
 
 int DeviceRunnerBase::install_staged_workspace() {
     const WorkspaceStagingRequest::Install plan = workspace_staging_.plan();
-    if (plan == WorkspaceStagingRequest::Install::Nothing) return 0;
+    // Already on: keep the ledger exactly as it stands. Reconfiguring would
+    // drop the quarantined and release-unconfirmed records this context holds
+    // because nothing proved them safe, which is the opposite of what a
+    // repeated initialization may do.
+    if (workspace_.enabled()) return 0;
     WorkspaceManager::Backend backend{};
     backend.ctx = this;
     backend.acquire = [](void *ctx, std::size_t bytes) -> void * {
@@ -2609,20 +2625,40 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
             // callbacks work through a view that assumes that lock is held, so
             // they allocate nothing, cannot throw, and cannot leave the
             // allocator's tracking map half-cleared.
-            WorkspaceManager::TerminalSweep sweep = workspace_.begin_terminal_sweep();
-            capture(mem_alloc_.finalize_except(
-                [](void *base, std::size_t /*bytes*/, void *ctx) {
-                    return static_cast<WorkspaceManager::TerminalSweep *>(ctx)->must_keep(base) ?
-                               MemoryAllocator::SweepAction::KeepIt :
-                               MemoryAllocator::SweepAction::FreeIt;
-                },
-                [](void *base, int rc, MemoryAllocator::SweepAction acted, void *ctx) {
-                    static_cast<WorkspaceManager::TerminalSweep *>(ctx)->note_result(
-                        base, rc, acted == MemoryAllocator::SweepAction::KeepIt
-                    );
-                },
-                &sweep
-            ));
+            //
+            // Scoped, because the proof below reads the report, which takes the
+            // same mutex: the sweep has to be destroyed and its lock released
+            // before that call, not merely finished.
+            int sweep_rc = 0;
+            {
+                WorkspaceManager::TerminalSweep sweep = workspace_.begin_terminal_sweep();
+                sweep_rc = mem_alloc_.finalize_except(
+                    [](void *base, std::size_t /*bytes*/, void *ctx) {
+                        return static_cast<WorkspaceManager::TerminalSweep *>(ctx)->must_keep(base) ?
+                                   MemoryAllocator::SweepAction::KeepIt :
+                                   MemoryAllocator::SweepAction::FreeIt;
+                    },
+                    [](void *base, int rc, MemoryAllocator::SweepAction acted, void *ctx) {
+                        static_cast<WorkspaceManager::TerminalSweep *>(ctx)->note_result(
+                            base, rc, acted == MemoryAllocator::SweepAction::KeepIt
+                        );
+                    },
+                    &sweep
+                );
+            }
+            capture(sweep_rc);
+            // The one place the ordinary managed cleanup can state that it
+            // completed. Read after the sweep's lock is gone, and only from
+            // the ledger's own report: every release step returned zero, the
+            // report is valid, and nothing is left quarantined or
+            // release-unconfirmed. The fatal path never enters this branch, so
+            // it can never produce this fact whatever it returns.
+            SimplerWorkspaceReport proof_report{};
+            const bool reported = workspace_.report(&proof_report);
+            if (rc == 0 && sweep_rc == 0 && reported && proof_report.quarantined_blocks == 0 &&
+                proof_report.release_unconfirmed_blocks == 0) {
+                teardown_proof_ = TeardownProof::SweptClean;
+            }
         }
     }
 

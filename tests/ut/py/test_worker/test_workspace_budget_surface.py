@@ -203,19 +203,18 @@ def _l2_with_recording_chip(monkeypatch, **extra):
     return seen
 
 
-def test_the_level_two_route_asks_for_management_and_carries_no_budget_by_default(monkeypatch):
-    """Ownership of the four regions is the default on the one route whose
-    teardown can be fenced before the public Buffer release, and it arrives
-    without a budget: the two are separate requests."""
+def test_the_level_two_route_requests_no_budget_by_default(monkeypatch):
+    """A budget is a separate, optional request. Ownership of the four regions
+    is not requested here at all: the onboard program init entry installs it."""
     seen = _l2_with_recording_chip(monkeypatch)
-    assert seen["manage_workspace"] is True
     assert seen["workspace_budget_bytes"] == 0
+    assert "manage_workspace" not in seen
 
 
 def test_an_explicit_budget_still_reaches_the_same_route(monkeypatch):
-    """A caller that sets one gets management and that limit, unchanged."""
+    """A caller that sets one gets that limit on top of the ownership the init
+    entry installs anyway."""
     seen = _l2_with_recording_chip(monkeypatch, workspace_budget_bytes=4 << 20)
-    assert seen["manage_workspace"] is True
     assert seen["workspace_budget_bytes"] == 4 << 20
 
 

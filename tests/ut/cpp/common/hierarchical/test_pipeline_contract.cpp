@@ -31,10 +31,10 @@ namespace {
 // session across this chip's runs instead of rebuilding it at every run
 // boundary; and `workspace_budget_bytes`, the finite budget that puts this
 // context's retained temporary buffer and three pooled arena regions under one
-// owner. Zero means no finite budget, which is now separate from whether those
-// four regions have an owner at all — `manage_workspace`, the last parameter,
-// is what asks for the ownership, and only the in-process level-2 route passes
-// it.
+// owner. Zero means no finite budget, which is separate from whether those
+// four regions have an owner at all: the onboard program init entry installs
+// one for every caller, so `manage_workspace`, the last parameter, is accepted
+// and ignored.
 // Retyped in place, not moved: the async-DMA parameter is `bool enable_sdma`
 // rather than a DmaWorkspaceKind bitmask. SDMA is the only engine a caller can
 // decline, so a set was never the question being asked; every other supported

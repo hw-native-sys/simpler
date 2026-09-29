@@ -67,6 +67,7 @@
 #include "device_runner_helpers.h"
 #include "aicpu_loader/host/load_aicpu_op.h"
 #include "host/arena_replacement_transaction.h"
+#include "host/teardown_proof.h"
 #include "host/workspace_staging.h"
 #include "host/chip_swimlane_collector.h"
 #include "host/device_fault_monitor.h"
@@ -478,11 +479,42 @@ public:
      */
     int stage_workspace_management(std::uint64_t limit_bytes);
 
-    /** Install what was staged. Called once, after the program-mode latch. */
+    /**
+     * Put the four workspace storage classes under this context's manager.
+     *
+     * Called by the program init entry after its mode latch and before
+     * anything takes workspace memory, so every route that reaches that entry
+     * is managed — including one that never asked. A staged limit is applied
+     * here, which is the only thing a caller still influences.
+     *
+     * Idempotent: a context whose manager is already on returns 0 without
+     * reconfiguring, because reconfiguring would discard the very records
+     * (quarantined, release-unconfirmed) that exist for want of proof.
+     *
+     * @return 0 on success; PTO_RUNTIME_ERR_INVALID_STATE when the manager
+     *         cannot be configured; PTO_RUNTIME_ERR_INVALID_ARGUMENT when a
+     *         staged limit is refused
+     */
     int install_staged_workspace();
 
     /** Forget a staging that never became an installation. */
     void clear_staged_workspace() noexcept;
+
+    /**
+     * What the last teardown of this context proved about its own completion.
+     *
+     * The rule itself is `teardown_proof.h`; these carry it on the runner that
+     * the init entry and the cleanup share. `Proven` is about the host release
+     * sequence — the device reset that follows it is attempted, not confirmed,
+     * so it asserts nothing about a device generation.
+     */
+    TeardownProof teardown_proof() const noexcept { return teardown_proof_; }
+
+    /** Record what this context's last teardown proved; see `context_lifecycle.h`. */
+    void set_teardown_proof(TeardownProof proof) noexcept { teardown_proof_ = proof; }
+
+    /** Mark this context's ownership state unproven. */
+    void mark_teardown_unresolved() noexcept { teardown_proof_ = TeardownProof::Unresolved; }
 
     /**
      * Release obsolete workspace generations whose consumers have all
@@ -2329,6 +2361,9 @@ protected:
     // Recorded by `stage_workspace_management` before init and consumed once
     // by `install_staged_workspace`; owns no device resource.
     WorkspaceStagingRequest workspace_staging_;
+    // What the last teardown proved; see `teardown_proof.h`. Owns no resource
+    // and is never published.
+    TeardownProof teardown_proof_{TeardownProof::NotAttempted};
     ExecutionModeLatch execution_mode_latch_;
     KernelExecutionState kernel_exec_state_;
     PersistentKernelArgs persistent_args_;

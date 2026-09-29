@@ -1248,4 +1248,115 @@ TEST(WorkspaceManagerDegraded, ASweepThatProvesTheFreeClearsTheEarlierDoubt) {
     EXPECT_EQ(report.proof_unavailable, 0u);
 }
 
+/**
+ * What a close may read to decide it completed, and in what order it may read
+ * it.
+ *
+ * `TerminalSweep` holds this manager's mutex for its whole lifetime and
+ * `report` takes the same mutex, so a close that wants the ledger's own verdict
+ * has to let the sweep's scope end first. This case pins that sequence and the
+ * verdict it produces on each of the two outcomes a sweep can reach.
+ */
+TEST(WorkspaceManagerLifecycle, TheLedgersVerdictIsReadableOnlyAfterTheSweepScopeEnds) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    void *proven = m.acquire(WorkspaceManager::staging_region(0), 7, kOneMiB);
+    void *unprovable = m.acquire(WorkspaceManager::staging_region(1), 7, kOneMiB);
+    ASSERT_NE(proven, nullptr);
+    ASSERT_NE(unprovable, nullptr);
+    report_launched_and_drained(m, 0, 7);
+    report_host_side_done(m, 0, 7);
+
+    // One block goes back and one cannot, which is the pair a close has to tell
+    // apart afterwards.
+    {
+        WorkspaceManager::TerminalSweep sweep = m.begin_terminal_sweep();
+        EXPECT_FALSE(sweep.must_keep(proven));
+        sweep.note_result(proven, 0, /*kept=*/false);
+        sweep.note_result(unprovable, 0, /*kept=*/true);
+    }
+
+    // Past the scope, so this call can take the lock the sweep was holding.
+    SimplerWorkspaceReport after_sweep{};
+    ASSERT_TRUE(m.report(&after_sweep));
+    EXPECT_EQ(after_sweep.quarantined_blocks, 1u);
+    EXPECT_EQ(after_sweep.release_unconfirmed_blocks, 0u);
+    // A close reading this pair sees one unproven block, so it cannot call
+    // itself complete — which is the whole point of reading it.
+    EXPECT_NE(after_sweep.quarantined_blocks + after_sweep.release_unconfirmed_blocks, 0u);
+    EXPECT_EQ(after_sweep.relinquished_bytes, kOneMiB);
+}
+
+/**
+ * The same read on a sweep that proved everything: both counts zero, which is
+ * the only ledger state a close may treat as its own completion.
+ */
+TEST(WorkspaceManagerLifecycle, AFullyProvedSweepLeavesNoUnprovenBlockBehind) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    void *block = m.acquire(WorkspaceManager::staging_region(0), 9, kOneMiB);
+    ASSERT_NE(block, nullptr);
+    report_launched_and_drained(m, 0, 9);
+    report_host_side_done(m, 0, 9);
+    EXPECT_EQ(m.release_unreferenced(), 0);
+
+    {
+        WorkspaceManager::TerminalSweep sweep = m.begin_terminal_sweep();
+        EXPECT_FALSE(sweep.must_keep(block));
+    }
+
+    SimplerWorkspaceReport after_sweep{};
+    ASSERT_TRUE(m.report(&after_sweep));
+    EXPECT_EQ(after_sweep.quarantined_blocks, 0u);
+    EXPECT_EQ(after_sweep.release_unconfirmed_blocks, 0u);
+    EXPECT_EQ(after_sweep.relinquished_bytes, 0u);
+}
+
+/**
+ * A launched run that never reports its drain cannot retire, and what that
+ * costs is the next run on its region.
+ *
+ * The fixture path that drains a run outside `simpler_wait_run` /
+ * `simpler_finalize_run` owes the facts that drain establishes: finalize skips
+ * its own drain for a run already Complete, so a fact nobody reports is a fact
+ * the run never gets. This case is the consequence — the block its successor
+ * has to reuse is quarantined — and the same sequence with the drain reported.
+ */
+TEST(WorkspaceManagerOwnership, AnUnreportedDrainQuarantinesTheRegionTheNextRunReuses) {
+    const WorkspaceManager::RegionKey region = WorkspaceManager::arena_region(1, WorkspaceManager::ArenaRegion::GmHeap);
+    for (const bool drain_reported : {false, true}) {
+        FakeBackend backend;
+        WorkspaceManager m;
+        ASSERT_TRUE(m.configure(backend.ops()));
+
+        // The first run takes the bank's gm_heap and publishes it, exactly as
+        // an arena setup does.
+        void *block = m.acquire(region, 3, kOneMiB);
+        ASSERT_NE(block, nullptr);
+        m.note_published(region, block);
+        m.note_run_fact(1, 3, WorkspaceManager::RunFact::Launched);
+        if (drain_reported) {
+            m.note_run_fact(1, 3, WorkspaceManager::RunFact::DrainAttempted);
+            m.note_run_fact(1, 3, WorkspaceManager::RunFact::DrainProvedComplete);
+        }
+        m.note_run_fact(1, 3, WorkspaceManager::RunFact::CopybackReturned);
+        m.note_run_fact(1, 3, WorkspaceManager::RunFact::BindingsReleased);
+        m.note_run_fact(1, 3, WorkspaceManager::RunFact::ContextDestroyed);
+
+        // The next run on that slot finds the region still committed, so it
+        // registers as a consumer rather than allocating.
+        const bool referenced = m.reference(block, 5);
+        EXPECT_EQ(referenced, drain_reported);
+        EXPECT_EQ(
+            m.block_state(block),
+            drain_reported ? WorkspaceManager::BlockState::Referenced : WorkspaceManager::BlockState::Quarantined
+        );
+        SimplerWorkspaceReport report{};
+        ASSERT_TRUE(m.report(&report));
+        EXPECT_EQ(report.quarantined_blocks, drain_reported ? 0u : 1u);
+    }
+}
+
 }  // namespace

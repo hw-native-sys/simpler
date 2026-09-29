@@ -544,6 +544,7 @@ simpler_ut_cases(platform_single_case
     test_acl_hal_device.cpp
     test_arena_replacement_transaction.cpp
     test_caller_device_buffers.cpp
+    test_context_lifecycle.cpp
     test_device_fault_monitor.cpp
     test_device_health_state.cpp
     test_execution_mode_latch.cpp
@@ -559,6 +560,7 @@ simpler_ut_cases(platform_single_case
     test_run_outcome_decision.cpp
     test_run_shadow_consumer_evidence.cpp
     test_run_stream_pair.cpp
+    test_teardown_proof.cpp
     test_teardown_recorder.cpp
     test_worker_chip_orch_comm.cpp
     test_workspace_manager.cpp

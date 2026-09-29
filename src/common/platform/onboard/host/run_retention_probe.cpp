@@ -75,7 +75,8 @@ bool successor_is_running(const DeviceRunnerBase::PreparedExecution &prepared) {
 int run_retention_probe(
     DeviceRunnerBase &runner, DeviceRunnerBase::ActiveExecution &active,
     std::unique_ptr<DeviceRunnerBase::PreparedExecution> &prepared_successor, const RunRetentionProbeConfig &config,
-    RunRetentionProbeReport *report, std::unique_ptr<DeviceRunnerBase::ActiveExecution> *active_successor_out
+    RunRetentionProbeReport *report, std::unique_ptr<DeviceRunnerBase::ActiveExecution> *active_successor_out,
+    DrainOutcome *successor_drain_out
 ) {
     if (report == nullptr || active_successor_out == nullptr || active.prepared == nullptr) {
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -131,8 +132,13 @@ int run_retention_probe(
             // that run's `completion_rc`, so it takes the composed result:
             // a device error first, with a diagnostics ownership failure still
             // failing the run behind it.
-            report->successor_drain_rc = runner.drain_execution(**active_successor_out).combined();
+            const DrainOutcome drain = runner.drain_execution(**active_successor_out);
+            report->successor_drain_rc = drain.combined();
             report->successor_drain_ns = elapsed_ns(drain_start);
+            // The halves kept apart, because the caller has to record a device
+            // lifecycle fact from this drain and a diagnostics ownership
+            // failure is not evidence about the device.
+            if (successor_drain_out != nullptr) *successor_drain_out = drain;
         }
         RunRetentionProbePeer::adopt_drain_ownership(runner, prepared);
     });

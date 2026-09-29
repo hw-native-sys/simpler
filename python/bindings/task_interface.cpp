@@ -3811,12 +3811,12 @@ NB_MODULE(_task_interface, m) {
                 d["last_foreign_release_rc"] = report.last_foreign_release_rc;
                 return nb::make_tuple(nb::str("available"), d);
             },
-            "This context's workspace accounting as (status, fields). status is \"disabled\" when no "
-            "budget was latched, \"unavailable\" when one was but its accounting could not be read, and "
-            "\"available\" otherwise. The two failure statuses are distinct on purpose: a caller "
-            "protecting teardown must refuse on \"unavailable\" rather than treat it as no budget. "
-            "limit_bytes covers the retained temporary buffer and the three pooled arena regions only "
-            "(coverage_is_partial is always 1), so it is not a device-wide ceiling."
+            "This context's workspace accounting as (status, fields). status is \"disabled\" when this "
+            "context manages no workspace, \"unavailable\" when it does but its accounting could not be "
+            "read, and \"available\" otherwise. The two failure statuses are distinct on purpose: a "
+            "caller protecting teardown must refuse on \"unavailable\" rather than treat it as "
+            "unmanaged. limit_bytes covers the retained temporary buffer and the three pooled arena "
+            "regions only (coverage_is_partial is always 1), so it is not a device-wide ceiling."
         )
         .def_prop_ro("pipeline_depth", &ChipWorker::pipeline_depth)
         .def_prop_ro("runtime_slot_count", &ChipWorker::runtime_slot_count)

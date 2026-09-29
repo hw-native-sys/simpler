@@ -449,29 +449,25 @@ void ChipWorker::init(
                 throw std::runtime_error("ChipWorker::init: retaining runs across boundaries could not be enabled");
             }
         }
-        // Three routes, resolved from arguments this call already has rather
-        // than from a probe:
+        // Two routes, resolved from this call's own arguments rather than from
+        // a probe:
         //
         //   sim         a simulated backend manages no device workspace, so
-        //               a request is ignored rather than refused, and the
-        //               absence of the symbols is never examined;
-        //   unrequested a caller that asked for neither keeps exactly the path
-        //               it had — a chip child whose parent did not opt in
-        //               among them;
-        //   supported   a program context on a real device whose caller asked:
-        //               the in-process level-2 route, and the chip children of
-        //               a level-3 Worker its own caller inits and closes.
+        //               nothing is requested and the absence of the symbols is
+        //               never examined;
+        //   program     `simpler_init` installs the manager itself, for every
+        //               caller, so this call asks for nothing on its own
+        //               account. What it still carries is the optional byte
+        //               limit, which is a caller's policy and has to be staged
+        //               before that install runs.
         //
-        // On the supported route the capability is required, because a caller
-        // that reads the report must never be left unable to tell "not
-        // managed" from "managed but unreadable". Staged here and installed by
-        // simpler_init once the program-mode latch is taken.
+        // `manage_workspace` is accepted and no longer decides anything: it
+        // kept this route's behaviour apart while one part of the tree was
+        // managed and the rest was not, and the install below covers both.
+        // Retained so existing callers keep compiling and calling.
         const bool simulated = !sim_context_path.empty();
-        const bool wants_workspace = !simulated && (manage_workspace || workspace_budget_bytes != 0);
-        if (wants_workspace) {
-            if (get_workspace_report_fn_ == nullptr) {
-                throw std::runtime_error("ChipWorker::init: this runtime module has no workspace management support");
-            }
+        (void)manage_workspace;
+        if (!simulated) {
             if (workspace_budget_bytes != 0) {
                 if (set_workspace_budget_fn_ == nullptr) {
                     throw std::runtime_error("ChipWorker::init: this runtime module has no workspace budget support");
@@ -480,17 +476,12 @@ void ChipWorker::init(
                     throw std::runtime_error("ChipWorker::init: workspace budget could not be enabled");
                 }
                 workspace_limit_latched_ = true;
-            } else {
-                if (enable_workspace_management_fn_ == nullptr) {
-                    throw std::runtime_error(
-                        "ChipWorker::init: this runtime module has no workspace management support"
-                    );
-                }
-                if (enable_workspace_management_fn_(device_ctx_) != 0) {
-                    throw std::runtime_error("ChipWorker::init: workspace management could not be enabled");
-                }
             }
-            workspace_managed_ = true;
+            // A module that manages the four regions is one that can report on
+            // them, and that accessor is what `workspace_report` needs to tell
+            // "not managed" from "managed but unreadable". Its absence is the
+            // only way a non-sim module can be unmanaged here.
+            workspace_managed_ = get_workspace_report_fn_ != nullptr;
         } else if (workspace_budget_bytes != 0) {
             throw std::runtime_error("ChipWorker::init: a workspace budget is not supported on a simulated backend");
         }

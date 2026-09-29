@@ -28,6 +28,7 @@
 #include "callable_protocol.h"
 #include "call_config.h"
 #include "device_runner_base.h"
+#include "host/context_lifecycle.h"
 #include "host/dep_gen_collector.h"  // make_deps_json_path
 #include "host/kernel_entry_validation.h"
 #include "host/kernel_pipeline_contract.h"
@@ -644,23 +645,43 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
     }
 }
 
+namespace {
+
+/** This runner's teardown-proof storage, for the shared lifecycle operations. */
+TeardownProofSlot proof_slot(DeviceRunnerBase *runner) {
+    TeardownProofSlot slot;
+    slot.ctx = runner;
+    slot.get = [](void *ctx) {
+        return static_cast<DeviceRunnerBase *>(ctx)->teardown_proof();
+    };
+    slot.set = [](void *ctx, TeardownProof proof) {
+        static_cast<DeviceRunnerBase *>(ctx)->set_teardown_proof(proof);
+    };
+    return slot;
+}
+
+}  // namespace
+
 int finalize_device(DeviceContextHandle ctx) {
     if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
-    try {
-        DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
-        if (runner->native_runs_outstanding()) {
-            LOG_ERROR("finalize_device: native run must be finalized first");
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-        // Publish whatever is still retained before any collector storage is
-        // released. A no-op on a collector that retains no run, which is the
-        // default.
-        runner->finish_retained_runs();
-        const int rc = runner->finalize();
-        return rc;
-    } catch (...) {
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
+    DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
+    ContextTeardownSteps steps;
+    steps.ctx = runner;
+    steps.runs_outstanding = [](void *c) {
+        const bool outstanding = static_cast<DeviceRunnerBase *>(c)->native_runs_outstanding();
+        if (outstanding) LOG_ERROR("finalize_device: native run must be finalized first");
+        return outstanding;
+    };
+    // Publish whatever is still retained before any collector storage is
+    // released. A no-op on a collector that retains no run, which is the
+    // default.
+    steps.publish_retained = [](void *c) {
+        static_cast<DeviceRunnerBase *>(c)->finish_retained_runs();
+    };
+    steps.cleanup = [](void *c) {
+        return static_cast<DeviceRunnerBase *>(c)->finalize();
+    };
+    return run_context_teardown(steps, proof_slot(runner));
 }
 
 int simpler_init(
@@ -683,35 +704,72 @@ int simpler_init(
         return latch_rc;
     }
 
-    // Immediately after the latch, and before anything allocates: this context
-    // is now known to be a program context, which is the only identity
-    // workspace management belongs to, and the eager prewarm below is the
-    // first thing that takes device memory. Installing here rather than at the
-    // staging call is what keeps a kernel context from ever being managed.
-    // Nothing has been allocated yet, so a failure returns an untouched
-    // context.
-    const int workspace_rc = runner->install_staged_workspace();
-    if (workspace_rc != 0) {
-        LOG_ERROR("simpler_init: workspace ownership management could not be installed: %d", workspace_rc);
-        runner->clear_staged_workspace();
-        return workspace_rc;
+    // Mode isolation first, then this handle's own lifecycle. The refusal
+    // below touches no resource and leaves the context exactly as it was, so a
+    // caller that goes on to close it properly keeps whatever proof that close
+    // earns. Latching PROGRAM is idempotent and therefore says nothing about
+    // whether this context is already live, which is what the check decides
+    // from instead.
+    const TeardownProofSlot slot = proof_slot(runner);
+    const ContextInitAdmission admission =
+        admit_context_init(slot, runner->native_runs_outstanding(), runner->device_id() >= 0);
+    if (admission != ContextInitAdmission::Admitted) {
+        LOG_ERROR(
+            "simpler_init: refused — this context must be finalized cleanly before it is initialized again "
+            "(reason %u, teardown proof %u, device_id %d)",
+            static_cast<unsigned>(admission), static_cast<unsigned>(runner->teardown_proof()), runner->device_id()
+        );
+        return PTO_RUNTIME_ERR_INVALID_STATE;
     }
 
+    // Admitted, so the proof is already spent: every step from here on is a
+    // post-consume one, and each exit records that this context is no longer
+    // proved.
+    //
+    // The install is what puts every route that reaches this entry — a
+    // Worker's, and a direct C caller's — under the same manager, and it runs
+    // before the eager prewarm below, which is the first thing that takes
+    // device memory. Keeping it here rather than at the staging call is what
+    // keeps a kernel context from ever being managed.
+    ContextInstallSteps install_steps;
+    install_steps.ctx = runner;
+    install_steps.install_workspace = [](void *c) {
+        auto *self = static_cast<DeviceRunnerBase *>(c);
+        const int workspace_rc = self->install_staged_workspace();
+        if (workspace_rc != 0) {
+            LOG_ERROR("simpler_init: workspace ownership management could not be installed: %d", workspace_rc);
+        }
+        return workspace_rc;
+    };
+    install_steps.clear_staging = [](void *c) {
+        static_cast<DeviceRunnerBase *>(c)->clear_staged_workspace();
+    };
     // CANN dlog must be levelled BEFORE the device context is opened
     // (rtSetDevice inside attach_current_thread): CANN snapshots the
     // device-side log session's level at context-open time, so a later
-    // dlog_setlevel is a no-op for the device side. HostLogger is already
-    // bound to the process-owned state by ChipWorker before this call. Skipped
-    // when ASCEND_GLOBAL_LOG_LEVEL is externally configured — CANN keeps that.
-    HostLogger::get_instance().configure_cann_log_level(dlog_setlevel);
+    // dlog_setlevel is a no-op for the device side. HostLogger is already bound
+    // to the process-owned state by ChipWorker before this call. Skipped when
+    // ASCEND_GLOBAL_LOG_LEVEL is externally configured — CANN keeps that.
+    install_steps.configure_logging = [](void *) {
+        HostLogger::get_instance().configure_cann_log_level(dlog_setlevel);
+    };
+    const int install_rc = run_context_install(install_steps, slot);
+    if (install_rc != 0) return install_rc;
 
+    // Every exit below is past the consume above, so each one records that
+    // this context's state is no longer proved. A caller must close it before
+    // it may initialize again.
     int rc;
     try {
         rc = runner->attach_current_thread(device_id);
     } catch (...) {
+        runner->mark_teardown_unresolved();
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    if (rc != 0) return rc;
+    if (rc != 0) {
+        runner->mark_teardown_unresolved();
+        return rc;
+    }
 
     // Transfer ownership of the executor binaries to the runner. Subsequent
     // simpler_register_callable / simpler_run invocations reuse them — no per-run
@@ -739,6 +797,7 @@ int simpler_init(
         }
         runner->set_dma_workspace_request(enable_sdma != 0, std::move(warmup_vec));
     } catch (...) {
+        runner->mark_teardown_unresolved();
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
@@ -752,9 +811,13 @@ int simpler_init(
     try {
         rc = runner->ensure_device_initialized();
     } catch (...) {
+        runner->mark_teardown_unresolved();
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    if (rc != 0) return rc;
+    if (rc != 0) {
+        runner->mark_teardown_unresolved();
+        return rc;
+    }
 
     // Prebuilt runtime-arena prewarm: the device is up, so build + cache the
     // arena for the fork-constant ring sizing now. trb provides a strong
@@ -768,9 +831,13 @@ int simpler_init(
                 prewarm_config->runtime_env.ring_dep_pool
             );
         } catch (...) {
+            runner->mark_teardown_unresolved();
             return PTO_RUNTIME_ERR_INTERNAL;
         }
-        if (rc != 0) return rc;
+        if (rc != 0) {
+            runner->mark_teardown_unresolved();
+            return rc;
+        }
     }
     return 0;
 }
@@ -1646,6 +1713,10 @@ int simpler_probe_run_retention(
     }
 
     std::unique_ptr<DeviceRunnerBase::ActiveExecution> active_successor;
+    // The fixture performs the successor's drain itself, so the facts that
+    // drain establishes are its to report. Starts as "no device evidence",
+    // which is what a successor it never launched leaves it at.
+    DrainOutcome successor_drain{};
     std::unique_ptr<DeviceRunnerBase::PreparedExecution> no_successor;
     // Passed as an lvalue so a successor the fixture never consumes — a refused
     // arm, or a launch that did not reach the device — comes back still owned by
@@ -1654,7 +1725,8 @@ int simpler_probe_run_retention(
         successor != nullptr ? successor->prepared_execution : no_successor;
     try {
         rc = run_retention_probe(
-            *state->runner, *state->active_execution, successor_prepared, *config, report, &active_successor
+            *state->runner, *state->active_execution, successor_prepared, *config, report, &active_successor,
+            &successor_drain
         );
     } catch (...) {
         LOG_ERROR("simpler_probe_run_retention: the sequence threw");
@@ -1667,6 +1739,20 @@ int simpler_probe_run_retention(
             // The fixture launched it, so the successor owns device work from
             // here. Reported for the successor's own identity, not this run's.
             note_workspace_fact(successor, WorkspaceManager::RunFact::Launched);
+            // And the fixture drained it, which is the only place that drain is
+            // performed: `simpler_finalize_run` skips its own drain for a run
+            // already Complete, so a fact this call does not report is a fact
+            // that run never gets. Without it the successor cannot retire, and
+            // `ContextDestroyed` quarantines every block it referenced —
+            // leaving the next run on its slot unable to register as a consumer
+            // of a region the arena still publishes.
+            note_workspace_fact(successor, WorkspaceManager::RunFact::DrainAttempted);
+            // The device half alone, exactly as the ordinary wait decides it: a
+            // diagnostics ownership failure still fails the run, and is not
+            // evidence that the device finished.
+            if (successor_drain.device_rc == 0) {
+                note_workspace_fact(successor, WorkspaceManager::RunFact::DrainProvedComplete);
+            }
             // The fixture drained it, so it reaches finalize in the same phase an
             // ordinary wait would leave it in. Set outright rather than only over
             // a zero: a context starts at -1 so a run that never completed cannot

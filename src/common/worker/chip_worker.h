@@ -522,6 +522,9 @@ private:
     using SimplerEnableWorkspaceManagementFn = decltype(&simpler_enable_workspace_management_ctx);
     using SimplerGetWorkspaceReportFn = decltype(&simpler_get_workspace_report_ctx);
     SimplerSetWorkspaceBudgetFn set_workspace_budget_fn_ = nullptr;
+    // Resolved for the retained compatibility entry, which a direct C caller
+    // may still invoke before init. `init` no longer calls it: the program
+    // init entry installs the manager for every caller.
     SimplerEnableWorkspaceManagementFn enable_workspace_management_fn_ = nullptr;
     SimplerGetWorkspaceReportFn get_workspace_report_fn_ = nullptr;
     // Latched when init accepted a budget. A caller protecting teardown reads

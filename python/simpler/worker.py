@@ -3797,7 +3797,6 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     chip_rank: int | None = None,
     launch_depth: int = 1,
     collect_across_runs: bool = False,
-    manage_workspace: bool = False,
     pipeline_depth_request: int = 0,
 ) -> None:
     """Runs in forked child process. Loads host_runtime.so in own address space.
@@ -3809,13 +3808,9 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     The main loop is delegated to ``_run_chip_main_loop`` — see its docstring
     for the TASK_READY / CONTROL_REQUEST / SHUTDOWN state machine.
 
-    ``manage_workspace`` gives this child's four workspace regions an owner, so
-    a superseded generation is released once its last consumer retires rather
-    than when its replacement is published. The parent decides it (see
-    ``Worker._chip_children_manage_workspace``) because whether this child's
-    close is one a caller can act on is a property of the parent's route, not
-    of anything reachable after the fork. A simulated backend resolves it away
-    inside ``ChipWorker.init``.
+    This child's four workspace regions have an owner because the onboard
+    program init entry installs one; nothing has to be carried across the fork
+    for that. A simulated backend manages no device workspace and is unchanged.
     """
     import traceback as _tb  # noqa: PLC0415
 
@@ -3832,7 +3827,6 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             prewarm_config=prewarm_config,
             enable_sdma=enable_sdma,
             collect_across_runs=collect_across_runs,
-            manage_workspace=manage_workspace,
             # Before prewarm, which commits one set's storage per slot: the granted count has to
             # be decided while nothing has been built against the old one. The parent reads back
             # what was granted after INIT_READY and cannot change it.
@@ -8425,27 +8419,6 @@ class Worker:
             )
         return budget
 
-    def _chip_children_manage_workspace(self) -> bool:
-        """Whether this Worker's forked chip children own their workspace regions.
-
-        True only for a level-3 Worker with ``device_ids`` that is the root of
-        its own startup epoch. ``_is_startup_root`` is that question already
-        answered: ``init()`` sets it from ``_startup_deadline is None``, which
-        is absent exactly when a caller drove ``init()`` directly, and present
-        for every Worker some other process started — a nested level-3 inside
-        an L4 next-level child, a remote session worker, an MPI group worker.
-
-        The distinction is about whose ``close()`` a refusal reaches. Those
-        descendants are closed by the loop that owns them while their parent is
-        already tearing down, so a child that fails its teardown there has
-        nobody to act on it; a directly-closed Worker reports it to its caller
-        through the reap it already performs.
-
-        Level is not tested separately: ``device_ids`` is refused above level 3
-        (:meth:`_init_hierarchical`) and no chip child is forked without it.
-        """
-        return bool(self._config.get("device_ids")) and self._is_startup_root
-
     def _check_workspace_live(self) -> None:
         """Refuse a protected teardown while workspace still has a drainable consumer.
 
@@ -8454,9 +8427,9 @@ class Worker:
         merely sorts first would not stop the owner Buffers from being released.
 
         In-process level 2 only: this reads ``self._chip_worker``, and a Worker
-        whose chips are forked children has none. Those children own their own
-        regions and close them inside their own process (see
-        :meth:`_chip_children_manage_workspace`); no report crosses the fork.
+        whose chips are forked children has none. Those children own the same
+        four regions and close them inside their own process; no report crosses
+        the fork.
 
         Three outcomes, and the two failures are not the same. ``disabled``
         means the four regions have no owner on this context, which protects
@@ -8512,12 +8485,6 @@ class Worker:
             enable_sdma=bool(self._config.get("enable_sdma", False)),
             collect_across_runs=bool(self._config.get("collect_across_runs", False)),
             workspace_budget_bytes=workspace_budget,
-            # Not a public option. This route additionally fences its teardown
-            # on the live-consumer check below, which a forked chip child has
-            # no equivalent of; the child manages the same four regions and
-            # closes them inside its own process instead
-            # (_chip_children_manage_workspace).
-            manage_workspace=True,
         )
 
         # Pre-warm any registered ChipCallable so the first run(handle, …)
@@ -8809,9 +8776,6 @@ class Worker:
                             chip_rank=idx,
                             launch_depth=self._launch_depth,
                             collect_across_runs=bool(self._config.get("collect_across_runs", False)),
-                            # Read from the state the fork copied, so every
-                            # child of one Worker resolves it the same way.
-                            manage_workspace=self._chip_children_manage_workspace(),
                             pipeline_depth_request=chip_pipeline_depth_request,
                         )
                     except BaseException as e:  # noqa: BLE001

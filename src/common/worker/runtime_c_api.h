@@ -595,12 +595,12 @@ int simpler_set_dfx_session_ctx(DeviceContextHandle ctx, int32_t enabled);
 /**
  * Latch a finite workspace budget on this context, once, at init.
  *
- * Asks for ownership management of the four workspace regions *and* this
- * finite limit on them; `simpler_enable_workspace_management_ctx` asks for the
- * ownership alone. Recorded here and installed by `simpler_init` once the
- * execution mode is latched, so the ledger exists before the eager prewarm
- * allocates. The first accepted request stands: a second call is refused
- * rather than replacing it.
+ * Ownership of the four workspace regions is not what this asks for: a program
+ * context gets that from `simpler_init` whether or not anyone asked. What this
+ * adds is the optional finite limit on them. Recorded here and applied by
+ * `simpler_init` once the execution mode is latched, so the limit is in place
+ * before the eager prewarm allocates. The first accepted request stands: a
+ * second call is refused rather than replacing it.
  *
  * Optional capability: a module that does not export this symbol cannot manage
  * workspace, and a caller that asked for a budget must fail rather than run
@@ -623,11 +623,14 @@ int simpler_set_workspace_budget_ctx(DeviceContextHandle ctx, uint64_t limit_byt
 /**
  * Ask for workspace ownership management with no byte limit.
  *
- * The additive half of the pair: `simpler_set_workspace_budget_ctx` asks for
- * management *and* a finite limit, and is unchanged for every caller that
- * already uses it. Both record the request and are consumed by `simpler_init`
- * once the context's execution mode is latched, so a kernel context is never
- * managed and the ledger exists before the eager prewarm allocates.
+ * Retained for compatibility and no longer necessary: `simpler_init` installs
+ * the manager on every program context, so a caller that never calls this gets
+ * the same ownership. Calling it before init still succeeds and still records a
+ * request, which only reserves the once-only slot
+ * `simpler_set_workspace_budget_ctx` also uses.
+ *
+ * A kernel context is still never managed, because the install lives in
+ * `simpler_init` and kernel mode has its own entry.
  *
  * @return 0 on success, PTO_RUNTIME_ERR_INVALID_ARGUMENT when this context has
  *         already made a request, PTO_RUNTIME_ERR_INVALID_STATE once
@@ -640,12 +643,13 @@ int simpler_enable_workspace_management_ctx(DeviceContextHandle ctx);
  *
  * `out_bytes` is the caller's `sizeof`, so a module built against a shorter
  * record is refused rather than written past. Valid output is published only
- * when the call returns 0 and `schema` is recognised; a caller that has a
- * latched budget must treat any other outcome as "unknown", never as "no
- * budget" — the two have opposite safety consequences.
+ * when the call returns 0 and `schema` is recognised; a caller protecting a
+ * teardown must treat any other outcome as "unknown", never as "not managed" —
+ * the two have opposite safety consequences.
  *
  * @return 0 on success, PTO_RUNTIME_ERR_INVALID_ARGUMENT for a null or short
- *         record, PTO_RUNTIME_ERR_UNSUPPORTED when no budget is latched.
+ *         record, PTO_RUNTIME_ERR_UNSUPPORTED on a context that manages no
+ *         workspace.
  */
 int simpler_get_workspace_report_ctx(DeviceContextHandle ctx, SimplerWorkspaceReport *out, size_t out_bytes);
 

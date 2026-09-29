@@ -1504,20 +1504,21 @@ class ChipWorker:
                 workspace regions — the per-slot retained temporary buffer and
                 the three pooled arena regions. 0 (the default) enforces no
                 budget; it does not decide whether those regions have an owner,
-                which is `manage_workspace`. A non-zero value on a module
-                without workspace support raises rather than running unmanaged.
+                which the onboard program init entry gives them for every
+                caller. A non-zero value on a module without workspace support
+                raises rather than running unmanaged.
                 Partial accounting: external tensors, run-result and
                 diagnostics regions, code and device ELF, RTS and provider
                 memory are outside it, so it is not a device-wide ceiling.
-            manage_workspace: Put those same four regions under one owner, so a
-                superseded generation is released once its last consumer
-                retires rather than when its replacement is published, a
-                failed growth leaves the previous plan installed, and a failed
-                release is recorded instead of discarded. Internal: the
-                in-process level-2 route and a directly-closed level-3
-                Worker's forked chip children pass it, and no public `Worker`
-                option sets it. Ignored on a simulated backend, which manages
-                no device workspace. A budget implies it.
+            manage_workspace: Accepted and ignored. Those same four regions are
+                put under one owner by the onboard program init entry, for
+                every caller, so nothing has to request it: a superseded
+                generation is released once its last consumer retires rather
+                than when its replacement is published, a failed growth leaves
+                the previous plan installed, and a failed release is recorded
+                instead of discarded. Kept so existing callers keep working. A
+                simulated backend manages no device workspace and is
+                unchanged.
             requested_pipeline_depth: How many native run-resource sets this
                 context may hold at once, or 0 for the standing default of
                 two — which is what every runtime granted before this

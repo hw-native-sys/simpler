@@ -143,5 +143,6 @@ public:
 int run_retention_probe(
     DeviceRunnerBase &runner, DeviceRunnerBase::ActiveExecution &active,
     std::unique_ptr<DeviceRunnerBase::PreparedExecution> &prepared_successor, const RunRetentionProbeConfig &config,
-    RunRetentionProbeReport *report, std::unique_ptr<DeviceRunnerBase::ActiveExecution> *active_successor_out
+    RunRetentionProbeReport *report, std::unique_ptr<DeviceRunnerBase::ActiveExecution> *active_successor_out,
+    DrainOutcome *successor_drain_out
 );
