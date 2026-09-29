@@ -1661,6 +1661,18 @@ void fill_view(Tensor *t, nb::handle shapes, nb::handle strides) {
         t->strides[i] = nb::cast<uint32_t>(nb::handle(stride_items[i]));
 }
 
+Tensor make_tensor_view(
+    const BufferDescriptor &buffer, nb::handle shapes, nb::handle dtype, nb::handle strides, uint64_t byte_offset
+) {
+    Tensor result{};
+    result.buffer = buffer;
+    result.byte_offset = byte_offset;
+    result.dtype = static_cast<DataType>(datatype_wire_value(dtype));
+    fill_view(&result, shapes, strides);
+    validate_tensor(result);
+    return result;
+}
+
 // The leading `ndims` entries of a wire shapes[] / strides[] array as a Python tuple. The trailing
 // entries are unused padding, so exposing them would invent dimensions the tensor does not have.
 nb::tuple dims_tuple(const uint32_t *dims, uint32_t ndims) {
@@ -2356,13 +2368,7 @@ NB_MODULE(_task_interface, m) {
             "tensor",
             [](const BufferDescriptor &self, nb::object shapes, nb::object dtype, nb::object strides,
                uint64_t byte_offset) -> Tensor {
-                Tensor t{};
-                t.buffer = self;
-                t.byte_offset = byte_offset;
-                t.dtype = static_cast<DataType>(datatype_wire_value(dtype));
-                fill_view(&t, shapes, strides);
-                validate_tensor(t);
-                return t;
+                return make_tensor_view(self, shapes, dtype, strides, byte_offset);
             },
             nb::arg("shapes"), nb::arg("dtype"), nb::arg("strides") = nb::none(), nb::arg("byte_offset") = 0,
             "A Tensor viewing this backing. `strides` default to contiguous (row-major) element strides."
@@ -2407,14 +2413,28 @@ NB_MODULE(_task_interface, m) {
             "__init__",
             [](Tensor *self, const BufferDescriptor &buffer, uint64_t byte_offset, nb::sequence shapes,
                nb::sequence strides, nb::object dtype) {
-                new (self) Tensor{};
-                self->buffer = buffer;
-                self->byte_offset = byte_offset;
-                self->dtype = static_cast<DataType>(datatype_wire_value(dtype));
-                fill_view(self, shapes, strides);
-                validate_tensor(*self);
+                new (self) Tensor(make_tensor_view(buffer, shapes, dtype, strides, byte_offset));
             },
             nb::arg("buffer"), nb::arg("byte_offset"), nb::arg("shapes"), nb::arg("strides"), nb::arg("dtype")
+        )
+
+        .def(
+            "__init__",
+            [](Tensor *self, nb::object buffer, nb::object shape, nb::object dtype, nb::object strides,
+               uint64_t byte_offset) {
+                if (!nb::isinstance<BufferDescriptor>(buffer)) {
+                    const nb::object buffer_type = nb::module_::import_("simpler.buffer").attr("Buffer");
+                    if (!nb::isinstance(buffer, buffer_type)) {
+                        throw nb::type_error("Tensor requires a Buffer or BufferDescriptor");
+                    }
+                    buffer = buffer.attr("to_descriptor")();
+                }
+                new (self)
+                    Tensor(make_tensor_view(nb::cast<BufferDescriptor>(buffer), shape, dtype, strides, byte_offset));
+            },
+            nb::arg("buffer"), nb::kw_only(), nb::arg("shape"), nb::arg("dtype"), nb::arg("strides") = nb::none(),
+            nb::arg("byte_offset") = 0,
+            "A validated view of a Buffer. Construction copies its descriptor without accessing storage."
         )
 
         .def_ro("buffer", &Tensor::buffer)

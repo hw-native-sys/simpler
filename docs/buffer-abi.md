@@ -114,7 +114,7 @@ and output copy-back; H2D does not mean every argument is copied in. Buffer iden
 import grants and `TensorArgType` access checks are unchanged.
 
 ```python
-view = buffer.tensor((16,), DataType.FLOAT32)
+view = Tensor(buffer, shape=(16,), dtype=DataType.FLOAT32)
 args.add_tensor(view, transfer=TensorTransfer.NONE)
 args.add_tensor(view, transfer=TensorTransfer.H2D)
 ```
@@ -197,8 +197,8 @@ a Python module that imports the wrong one now names a type that exists and
 behaves differently — so the mismatch surfaces where it is used.
 
 **So the split costs the user nothing to know.** You name a `Tensor`, submit it,
-and the chip's C++ orchestration receives it resolved; the type name does not
-even appear in your code — you write `buffer.tensor(shapes, dtype)` and
+and the chip's C++ orchestration receives it resolved. Build the view with
+`Tensor(buffer, shape=shapes, dtype=dtype)` and submit it with
 `args.add_tensor(t, tag)`. Resolving the address in between is the framework's
 job, and keeping the two forms as separate types is what makes that boundary a
 type change rather than a silently wrong address.
@@ -221,13 +221,25 @@ destination), and a tensor over it must be dispatched only to that worker.
 
 ## Naming a view
 
-`buffer.tensor(...)` names a view over the backing:
+`Tensor(buffer, shape=..., dtype=...)` names a view over the backing:
 
 ```python
-v = h.tensor(shapes=(M, N), dtype)                        # contiguous (row-major strides)
-v = h.tensor(shapes=(N, M), dtype, strides=(1, M))        # transposed
-v = h.tensor(shapes=(M, K), dtype, byte_offset=off)       # sub-region
+from simpler.buffer import Tensor
+
+v = Tensor(h, shape=(M, N), dtype=dtype)                     # contiguous
+v = Tensor(h, shape=(N, M), dtype=dtype, strides=(1, M))     # transposed
+v = Tensor(h, shape=(M, K), dtype=dtype, byte_offset=off)    # sub-region
 ```
+
+Construction copies the descriptor and validates the view; it neither allocates
+backing storage nor reads or transfers its contents. All views keep the same
+Buffer identity. A Tensor snapshot does not retain allocation ownership or prevent
+explicit Buffer close; submission still validates live registration. Constructing
+a new view from a closed Buffer is rejected.
+
+`buffer.tensor(shapes, dtype, ...)` is a compatibility forwarding method to this
+constructor. The existing descriptor-based constructor remains available for
+internal wire callers. Both use the same geometry validator.
 
 `strides` are **element** strides and are strictly > 0 — broadcast (stride 0) and
 negative step are unsupported, and a singleton dimension's stride is never
@@ -238,8 +250,8 @@ dtype size.
 
 ```python
 ta = TaskArgs()
-ta.add_tensor(a_h.tensor((SIZE,), DataType.FLOAT32), TensorArgType.INPUT)
-ta.add_tensor(out_h.tensor((SIZE,), DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
+ta.add_tensor(Tensor(a_h, shape=(SIZE,), dtype=DataType.FLOAT32), TensorArgType.INPUT)
+ta.add_tensor(Tensor(out_h, shape=(SIZE,), dtype=DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
 orch.submit_next_level(chip_handle, ta, cfg, worker=0)
 ```
 
@@ -385,7 +397,7 @@ completion token for a downstream task to depend on.
 ## Scope / status
 
 This page describes the memory model end to end. **The dispatch wire is
-connected**: `TaskArgs` carries the `Tensor`, `buffer.tensor(...)` reaches a
+connected**: `TaskArgs` carries the `Tensor`, `Tensor(buffer, ...)` reaches a
 consumer, and the submit-time checks above run on every submit. Still absent are
 the other allocators (`alloc_shared_tensor`, `alloc_child_tensor`), and the
 endpoint x `address_space` check inside `materialize` — a device backing resolved

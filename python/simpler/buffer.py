@@ -241,16 +241,16 @@ class Buffer:
         strides: Iterable[int] | None = None,
         byte_offset: int = 0,
     ) -> Tensor:
-        """A self-describing ``Tensor`` viewing this buffer: embeds the full descriptor + the view.
+        """Compatibility forwarding to ``Tensor(self, shape=shapes, dtype=dtype, ...)``.
 
         ``shapes`` and ``strides`` are each consumed once, so any iterable of ints will do.
         ``strides`` default to contiguous (row-major) — ``buffer.tensor(shape, dtype)`` names the
         whole buffer as a contiguous view; pass explicit element strides for a strided view.
-        ``byte_offset`` must be a multiple of the dtype size (checked at materialization).
+        ``byte_offset`` must be a multiple of the dtype size (checked at construction).
         ``dtype`` accepts a ``DataType`` enum or its int value.
         Transfer requests belong to ``TaskArgs.add_tensor(..., transfer=...)``.
         """
-        return self.to_descriptor().tensor(shapes, dtype, strides, byte_offset)
+        return Tensor(self, shape=shapes, dtype=dtype, strides=strides, byte_offset=byte_offset)
 
     def close(self) -> None:
         """Release the backing. The owner unlinks it, so a later consumer map fails rather than

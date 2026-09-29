@@ -89,6 +89,58 @@ def test_task_args_takes_the_wire_tensor():
         h.close()
 
 
+@pytest.mark.parametrize("device", [False, True])
+def test_tensor_constructor_views_buffer_without_touching_storage(device):
+    wrap = wrap_device_malloc if device else wrap_fork_inherited
+    backing = wrap(1, 64, mint_owner_instance_id(), 1)
+    view = Tensor(backing, shape=(2, 3), dtype=DataType.FLOAT32, strides=(4, 1), byte_offset=4)
+    assert view.buffer == backing.to_descriptor()
+    assert view.shapes == (2, 3) and view.strides == (4, 1) and view.byte_offset == 4
+    assert view == backing.tensor((2, 3), DataType.FLOAT32, (4, 1), 4)
+    args = TaskArgs()
+    args.add_tensor(view)
+    assert args.tensor(0) == view
+    backing.nbytes = 128
+    assert view.buffer.nbytes == 64
+    backing.close()
+    with pytest.raises(ValueError, match="released"):
+        Tensor(backing, shape=(1,), dtype=DataType.FLOAT32)
+
+
+def test_tensor_constructor_consumes_iterables_once_and_preserves_legacy_descriptor_form():
+    backing = wrap_device_malloc(1, 64, mint_owner_instance_id(), 1)
+    view = Tensor(backing, shape=iter((2, 3)), dtype=DataType.FLOAT32)
+    assert view.strides == (3, 1)
+    assert view == Tensor(backing.to_descriptor(), 0, (2, 3), (3, 1), DataType.FLOAT32)
+    assert view == Tensor(backing.to_descriptor(), shape=(2, 3), dtype=DataType.FLOAT32)
+    strided = Tensor(backing, shape=iter((2, 3)), strides=iter((4, 1)), dtype=DataType.FLOAT32)
+    assert strided.strides == (4, 1)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"shape": (17,)},
+        {"shape": (2, 3), "strides": (32, 1)},
+        {"shape": (2,), "strides": (0,)},
+        {"shape": (1,), "byte_offset": 2},
+    ],
+)
+def test_tensor_buffer_constructor_reuses_geometry_validation(kwargs):
+    backing = wrap_device_malloc(1, 64, mint_owner_instance_id(), 1)
+    with pytest.raises(ValueError):
+        Tensor(backing, dtype=DataType.FLOAT32, **kwargs)
+
+
+def test_tensor_constructor_rejects_untyped_descriptor_providers():
+    class PretendBuffer:
+        def to_descriptor(self):
+            pytest.fail("an unrelated object's method must not be called")
+
+    with pytest.raises(TypeError, match="Buffer"):
+        Tensor(PretendBuffer(), shape=(1,), dtype=DataType.FLOAT32)
+
+
 def _identity(oid=_OID, buffer_id=7, generation=2):
     return CanonicalIdentity(oid, buffer_id, generation)
 
