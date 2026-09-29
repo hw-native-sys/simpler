@@ -345,6 +345,7 @@ public:
         dump_collector_.configure_retained_runs(enabled, simpler::dfx::runs::kDefaultBudgetBytes);
         pmu_collector_.configure_retained_runs(enabled);
         scope_stats_collector_.configure_retained_runs(enabled, simpler::dfx::runs::kDefaultBudgetBytes);
+        configure_dep_gen_retention(enabled, simpler::dfx::runs::kDefaultBudgetBytes);
     }
     bool retains_runs() const {
         return chip_swimlane_collector_.retains_runs() || dump_collector_.retains_runs() ||
@@ -1433,6 +1434,31 @@ public:
      * runner shares between runs. An arch without dep_gen keeps the no-op.
      */
     virtual void arm_host_dep_gen_capture(bool /*enable*/) {}
+
+    /**
+     * Cross-run retention for the DepGen collector, which lives on the arch
+     * `DeviceRunner` rather than on this base.
+     *
+     * The base owns the latch, the flush and the teardown, so it reaches that
+     * collector through these. Defaults are no-ops, so a runner without a
+     * DepGen collector inherits today's behaviour and a runtime that captures
+     * its graph on the host is unaffected. Same ownership split as
+     * `arm_host_dep_gen_capture` above.
+     */
+    virtual void configure_dep_gen_retention(bool /*enabled*/, std::size_t /*budget_bytes*/) {}
+    virtual bool dep_gen_retains_runs() const { return false; }
+    /**
+     * Admit this run before anything is submitted. Non-zero fails the launch.
+     *
+     * A refusal here has to give back what the other collectors already
+     * admitted, or their export slots stay occupied by a run that never
+     * reaches a boundary.
+     */
+    virtual int admit_dep_gen_run(const DfxRunConfig & /*dfx*/, uint64_t /*run_epoch*/) { return 0; }
+    /** Release an admitted run whose launch submitted nothing. */
+    virtual void withdraw_dep_gen_run(uint64_t /*run_epoch*/) noexcept {}
+    virtual bool dep_gen_flush_retained(int /*timeout_ms*/, std::string * /*error*/) { return true; }
+    virtual void dep_gen_finish_retained() {}
 
     /**
      * Launch an AICPU entry with an arbitrary launch-arg payload.

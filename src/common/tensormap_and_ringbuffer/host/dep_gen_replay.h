@@ -86,17 +86,59 @@ extern "C" {
 #endif
 
 /**
+ * A budget every allocation this replay makes is charged against.
+ *
+ * `charge` is called before an allocation and refuses by returning false, at
+ * which point the replay fails rather than allocating; `credit` is called after
+ * the matching deallocation. Both the container growth transient (the new
+ * block is charged while the old one still is) and the tensormap arena go
+ * through this, so nothing the replay allocates escapes the caller's bound.
+ *
+ * A null budget means unbounded, which is what the default synchronous path
+ * passes: it has no retained budget, so only a real allocation failure stops
+ * it, exactly as before.
+ */
+struct DepGenReplayBudget {
+    void *ctx;
+    bool (*charge)(void *ctx, size_t bytes);
+    void (*credit)(void *ctx, size_t bytes);
+};
+
+/**
  * Replay an in-memory DepGenRecord stream and write deps.json.
  *
  * Per-ring task window sizes are auto-derived from the trace itself so each
- * ring's window covers its observed max local_id without slot aliasing.
+ * ring's window covers its observed max local_id without slot aliasing. Every
+ * record's layout is validated against its own kind first — a base record by
+ * its counts, an overflow slot by its `dep_count` — because the counts are
+ * device-written and a corrupted one must refuse the graph rather than size an
+ * allocation or index an array.
  *
  * @param records            Pointer to a contiguous DepGenRecord array
  *                           (typically ``DepGenCollector::window_records()->data()``).
  * @param num_records        Number of records in the array.
  * @param deps_json_path     Output path; truncated if it exists.
- * @return 0 on success; negative on error (see source for codes).
+ * @param budget             Charged against for every allocation, or null for
+ *                           unbounded.
+ * @return 0 on success, or a negative code: -1 bad arguments, -3 the replay's
+ *         working storage could not be reserved, -4 the runtime's own fanin
+ *         computation reported fatal, -5 a record layout, overflow-chain
+ *         structure or size computation was rejected, -6 the dual-pass
+ *         self-check diverged, -7 an invalid explicit dep-flag byte, -8 a
+ *         charge refusal or an unexpected host failure, -9 the file could not
+ *         be written. Every non-zero code means no graph was published — but
+ *         not that the path is untouched: this writes `deps_json_path`
+ *         directly, so a -9 raised mid-write leaves a truncated file there.
+ *         A caller for whom a partial file is indistinguishable from a
+ *         complete one must publish through a temporary of its own, which is
+ *         what the retained background writer does.
  */
+int dep_gen_replay_emit_deps_json_budgeted(
+    const struct DepGenRecord *records, size_t num_records, const char *deps_json_path,
+    const struct DepGenReplayBudget *budget
+);
+
+/** `dep_gen_replay_emit_deps_json_budgeted` with no budget. */
 int dep_gen_replay_emit_deps_json(const struct DepGenRecord *records, size_t num_records, const char *deps_json_path);
 
 #ifdef __cplusplus

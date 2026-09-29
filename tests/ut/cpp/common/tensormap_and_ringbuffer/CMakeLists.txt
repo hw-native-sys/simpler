@@ -91,6 +91,21 @@ tmr_case(test_dep_gen_replay.cpp
     SOURCES  ${TMR_SHARED_HOST_DIR}/dep_gen_replay.cpp
     INCLUDES ${TMR_SHARED_HOST_DIR})
 
+# Cross-run retention: admission, the boundary's seal, the background writer
+# and atomic publication. The device producer, the host collector and the
+# replay are all production code here, so a published deps.json is the real
+# one rather than a fixture's idea of one. Retention is this runtime's only:
+# host_build_graph builds its graph on the host and replays nothing.
+tmr_case(test_dep_gen_retained_runs.cpp
+    SOURCES
+        ${TMR_SHARED_HOST_DIR}/dep_gen_replay.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/dep_gen_collector.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/dep_gen_retained_runs.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/dep_gen_collector_aicpu.cpp
+        ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp
+    INCLUDES ${TMR_SHARED_HOST_DIR}
+    TIER aicpu)
+
 # TaskId is arch-agnostic (src/common/tensormap_and_ringbuffer/task_id.h) and
 # header-only, so one arch's include path exercises the whole handle.
 tmr_case(test_task_id.cpp ARCHS a2a3)

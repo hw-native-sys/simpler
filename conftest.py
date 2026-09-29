@@ -1790,6 +1790,10 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
 
         from simpler.worker import Worker  # noqa: PLC0415
 
+        # Cross-run retention is opt-in per class, because it changes when a
+        # diagnostic file exists: with it on, `run()` returning no longer
+        # implies the artifact is written and `flush_diagnostics()` is the
+        # barrier. Default False leaves every existing case unchanged.
         w = Worker(
             level=3,
             device_ids=ids,
@@ -1798,6 +1802,7 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
             runtime=runtime,
             enable_sdma=wants_sdma,
             launch_depth=launch_depth,
+            collect_across_runs=getattr(cls, "_st_collect_across_runs", False),
             **({"pipeline_depth": pipeline_depth} if pipeline_depth else {}),
         )
         w._st_device_id = ids[0]  # expose primary device to test_run for profiling snapshots

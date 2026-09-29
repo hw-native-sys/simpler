@@ -50,19 +50,23 @@
 #define SRC_COMMON_PLATFORM_INCLUDE_HOST_DEP_GEN_COLLECTOR_H_
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #include "common/dep_gen.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
+#include "host/dep_gen_runs.h"
 #include "host/profiler_base.h"
 
 // ---------------------------------------------------------------------------
@@ -213,7 +217,22 @@ public:
      * Called with the device quiesced, so the AICPU is not writing these and the
      * collector threads are idle.
      */
-    void begin_run();
+    bool begin_run();
+
+    /**
+     * Report what this run's boundary actually established about its transport,
+     * separately from whether the counts happened to balance.
+     *
+     * `reconcile_counters()` answers one `bool` that conflates "the comparison
+     * balanced" with "the comparison was made": a failed region copy leaves the
+     * host shadow holding the zeroes `begin_run()` wrote, which satisfies the
+     * identity for a run that collected nothing. Every distinguishable reason a
+     * graph is untrustworthy is a field here, and both modes refuse on the same
+     * set — they differ only in which channel reports it.
+     *
+     * Call after the receive drain, with the device quiesced.
+     */
+    simpler::dfx::dep_gen_runs::ReconcileReport reconcile_report();
 
     /**
      * Device pointer to the DepGenDataHeader. Set kernel_args.dep_gen_data_base
@@ -290,6 +309,74 @@ public:
      * stop() returns, which is when the caller hands them to
      * ``dep_gen_replay_emit_deps_json``.
      */
+    // --- Cross-run retention -------------------------------------------------
+    //
+    // Off unless `configure_retained_runs(true, ...)` runs before init, in
+    // which case the boundary keeps every step that touches the device — the
+    // receive drain and the terminal read — and hands the replay, the
+    // serialization and the file write to one background writer. Every entry
+    // point below is inert with retention off.
+
+    /** Latch retention and this collector's own host byte budget. */
+    void configure_retained_runs(bool retain_across_runs, size_t budget_bytes);
+    bool retains_runs() const { return retain_across_runs_; }
+
+    /**
+     * Admit one run, taking an export slot and recording the identity and the
+     * destination the writer will publish under.
+     *
+     * False refuses the run, and the caller must fail it before anything
+     * reaches the device: both unpublished slots are in use, the prefix does
+     * not fit the path allowance, the budget cannot open, or this run's device
+     * counter reset was not published. A refusal leaves no slot taken.
+     */
+    bool run_begin(uint64_t run_epoch, const std::string &output_prefix);
+
+    /**
+     * Close one run's boundary, under its execution claim.
+     *
+     * `device_execution_complete` is the caller's own fence observation and the
+     * whole of this collector's completion proof. Without it the run reads
+     * nothing shared, seals nothing and publishes nothing: the host copies are
+     * quarantined until the existing collector-thread join, and a sticky error
+     * is recorded.
+     */
+    void run_close(uint64_t run_epoch, bool device_execution_complete);
+
+    /** Give an admitted run's slot back when its launch submitted nothing. */
+    void abandon_run(uint64_t run_epoch);
+
+    /** Wait for every closed run to be published. False when any run failed. */
+    bool flush_retained_runs(int timeout_ms, std::string *error);
+
+    /** Publish everything still queued. Runs before the collector threads stop. */
+    void finish_retained_runs();
+
+    /** Free quarantined host copies. Only legal once the reader threads are joined. */
+    void discard_quarantined_runs();
+
+    /** Counters a test reads instead of parsing files. */
+    struct RetainedRunStats {
+        uint64_t published{0};
+        uint64_t refused{0};
+        uint64_t quarantined{0};
+        uint64_t host_failures{0};
+        uint64_t refused_records{0};
+        uint64_t foreign_epoch_records{0};
+        size_t open_slots{0};
+        size_t charged_bytes{0};
+        bool has_error{false};
+    };
+    RetainedRunStats retained_run_stats_for_test() const;
+    /** Hold the writer before it publishes, so a test can occupy export slots. */
+    void pause_writer_for_test(bool paused);
+    /** Make the next shared-region read report failure. */
+    void fail_region_read_for_test(bool fail) { fail_region_read_ = fail; }
+    /** Make this run's counter-reset publication report failure. */
+    void fail_counter_reset_for_test(bool fail) { fail_counter_reset_ = fail; }
+    /** Shrink the budget to the figure a test needs a charge to be refused at. */
+    void shrink_budget_for_test(size_t budget_bytes) { retained_budget_bytes_ = budget_bytes; }
+
     const std::vector<DepGenRecord> *window_records(uint64_t *run_epoch_out = nullptr) const {
         if (records_by_run_.size() > 1) return nullptr;
         if (records_by_run_.empty()) {
@@ -333,6 +420,85 @@ private:
     DepGenBufferState *dep_gen_state(int idx = 0) const { return get_dep_gen_buffer_state(shm_host_, idx); }
 
     void append_buffer_records(const void *buf_host_ptr);
+
+    // --- Cross-run retention state -------------------------------------------
+
+    // A slot is held from admission until its artifact exists, so "two
+    // unpublished exports" bounds what the collector owns rather than what is
+    // merely still filling. The run being collected holds one of the two.
+    enum class SlotState : int { Free = 0, Open = 1, Publishing = 2, Quarantined = 3 };
+
+    struct Slot {
+        SlotState state{SlotState::Free};
+        uint64_t run_epoch{0};
+        std::string output_dir;
+    };
+
+    /** Charge one record block, or refuse it. Always true with retention off. */
+    bool charge_record_block(size_t bytes);
+    /** Give a charged figure back. A no-op with retention off. */
+    void credit_record_block(size_t bytes);
+
+    /**
+     * Record a host failure that belongs to the collector rather than to one
+     * run, and keep it until the runner is destroyed.
+     *
+     * Allocates nothing, so it is safe on the paths that reach it precisely
+     * because an allocation has just failed.
+     */
+    void note_host_failure(const char *detail) noexcept;
+
+    void run_close_locked_path(uint64_t run_epoch, bool device_execution_complete);
+    void quarantine_locked(uint64_t run_epoch, const char *detail);
+    /** Publish one export: materialize, replay, then link the result into place. */
+    int publish_export(simpler::dfx::dep_gen_runs::RunExport &data);
+    void writer_loop();
+    void ensure_writer_started();
+    void stop_writer();
+    /** True while this epoch may still stamp records the collector accepts. */
+    bool epoch_admitted_locked(uint64_t run_epoch) const;
+
+    bool retain_across_runs_ = false;
+    size_t retained_budget_bytes_ = simpler::dfx::runs::kDefaultBudgetBytes;
+    bool retained_ready_ = false;
+    bool quarantine_held_ = false;
+    bool fail_region_read_ = false;
+    bool fail_counter_reset_ = false;
+
+    // Two locks, one order. `records_mutex_` owns everything the collector
+    // threads write — the retained record store, the open epoch and the
+    // receive-side counters — because the receive path is the hot one and must
+    // never wait on the writer. `retained_mu_` owns the slots, the export
+    // queue, the writer state and the stats. A path needing both takes
+    // `retained_mu_` first, and `append_buffer_records` needs only the first.
+    simpler::dfx::dep_gen_runs::RecordBlocks retained_records_;
+    uint64_t retained_epoch_ = 0;
+    bool retained_epoch_open_ = false;
+    uint64_t refused_records_ = 0;
+    uint64_t foreign_epoch_records_ = 0;
+    bool host_clamped_ = false;
+    bool reset_unpublished_ = false;
+
+    mutable std::mutex retained_mu_;
+    std::condition_variable retained_cv_;
+    Slot slots_[simpler::dfx::runs::kMaxOpenEpochs];
+    std::deque<simpler::dfx::dep_gen_runs::RunExport> queue_;
+    std::vector<simpler::dfx::dep_gen_runs::RunExport> quarantined_;
+    simpler::dfx::runs::HostBudget host_budget_;
+    simpler::dfx::runs::ErrorSummary run_errors_;
+    std::thread writer_;
+    bool writer_running_ = false;
+    bool writer_stop_ = false;
+    bool writer_paused_ = false;
+    bool writer_busy_ = false;
+
+    struct RetainedStats {
+        uint64_t published{0};
+        uint64_t refused{0};
+        uint64_t quarantined{0};
+        uint64_t host_failures{0};
+    };
+    RetainedStats stats_;
 };
 
 /**

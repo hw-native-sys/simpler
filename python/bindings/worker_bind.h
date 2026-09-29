@@ -340,10 +340,20 @@ inline void bind_worker(nb::module_ &m) {
         .def(
             "flush_diagnostics",
             [](Orchestrator &self, int worker_id, double timeout_s) {
-                DfxFlushReport report = self.flush_diagnostics(worker_id, timeout_s);
+                // The GIL is released around the native wait only, not around
+                // the whole lambda: this blocks on a child's control ack, so
+                // holding it would stop the forked children's progress
+                // threads, but `nb::make_tuple` builds Python objects and
+                // needs the GIL held. A whole-lambda `call_guard` gives the
+                // tuple no GIL at all.
+                DfxFlushReport report{};
+                {
+                    nb::gil_scoped_release released;
+                    report = self.flush_diagnostics(worker_id, timeout_s);
+                }
                 return nb::make_tuple(report.session_id, report.watermark_epoch, report.published, report.failed);
             },
-            nb::arg("worker_id"), nb::arg("timeout_s"), nb::call_guard<nb::gil_scoped_release>(),
+            nb::arg("worker_id"), nb::arg("timeout_s"),
             "Publish every diagnostic run a next-level worker has closed; raises when a promised file is missing."
         )
         .def(

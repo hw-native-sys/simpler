@@ -64,6 +64,8 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <limits>
+#include <new>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -79,6 +81,267 @@
 #include "tensor.h"
 
 namespace {
+
+// ---------------------------------------------------------------------------
+// Charged allocation
+// ---------------------------------------------------------------------------
+
+/**
+ * The budget in force for this replay. Null means unbounded.
+ *
+ * Passed by pointer through every container's allocator rather than read from a
+ * global: the replay is re-entrant in principle and a global would tie two
+ * concurrent publications together.
+ */
+struct Charger {
+    const DepGenReplayBudget *budget{nullptr};
+
+    bool charge(size_t bytes) const {
+        if (budget == nullptr || budget->charge == nullptr) return true;
+        return budget->charge(budget->ctx, bytes);
+    }
+    void credit(size_t bytes) const {
+        if (budget == nullptr || budget->credit == nullptr) return;
+        budget->credit(budget->ctx, bytes);
+    }
+};
+
+/**
+ * Allocator that charges before allocating and credits after freeing.
+ *
+ * Every container below is instantiated with this, so growth, rehash and the
+ * bucket directory are all accounted without any hand-written carving: a
+ * reallocation charges the new block while the old one is still charged, which
+ * is the transient the caller's bound has to cover, and the standard library
+ * is the one deciding sizes.
+ *
+ * A refused charge throws `std::bad_alloc`, which the entry point catches and
+ * reports as a refusal — no container is left partially grown.
+ */
+template <typename T>
+class ChargedAlloc {
+public:
+    using value_type = T;
+
+    explicit ChargedAlloc(const Charger *charger) noexcept :
+        charger_(charger) {}
+    template <typename U>
+    ChargedAlloc(const ChargedAlloc<U> &other) noexcept :
+        charger_(other.charger()) {}
+
+    const Charger *charger() const noexcept { return charger_; }
+
+    // Bytes one element occupies. A rebound allocator's value type is often
+    // itself a pointer — a node-based container's bucket array is an array of
+    // pointers — so this is deliberately the size of `T` and not of whatever
+    // `T` points at: N of them really do occupy N * sizeof(T) bytes, which is
+    // the figure the budget has to hold. Named once so the justified
+    // diagnostic is suppressed in one place rather than at every use.
+    // NOLINTNEXTLINE(bugprone-sizeof-expression)
+    static constexpr size_t kElementBytes = sizeof(T);
+
+    T *allocate(size_t n) {
+        if (n != 0 && n > std::numeric_limits<size_t>::max() / kElementBytes) throw std::bad_alloc();
+        const size_t bytes = n * kElementBytes;
+        if (charger_ != nullptr && !charger_->charge(bytes)) throw std::bad_alloc();
+        void *p = ::operator new(bytes, std::nothrow);
+        if (p == nullptr) {
+            if (charger_ != nullptr) charger_->credit(bytes);
+            throw std::bad_alloc();
+        }
+        return static_cast<T *>(p);
+    }
+
+    void deallocate(T *p, size_t n) noexcept {
+        ::operator delete(static_cast<void *>(p));
+        if (charger_ != nullptr) charger_->credit(n * kElementBytes);
+    }
+
+    template <typename U>
+    bool operator==(const ChargedAlloc<U> &other) const noexcept {
+        return charger_ == other.charger();
+    }
+    template <typename U>
+    bool operator!=(const ChargedAlloc<U> &other) const noexcept {
+        return !(*this == other);
+    }
+
+private:
+    const Charger *charger_{nullptr};
+};
+
+/** The arena backend the tensormaps allocate through, so they are charged too. */
+void *charged_arena_alloc(void *ctx, size_t size) noexcept {
+    auto *charger = static_cast<const Charger *>(ctx);
+    if (charger != nullptr && !charger->charge(size)) return nullptr;
+    void *p = std::malloc(size);
+    if (p == nullptr && charger != nullptr) charger->credit(size);
+    return p;
+}
+
+/**
+ * Frees the arena's one allocation and credits it.
+ *
+ * `DeviceArena` does not hand the size back, so the charged figure is carried
+ * beside it in the `Charger` the arena was constructed with.
+ */
+struct ArenaCharge {
+    Charger charger;
+    size_t bytes{0};
+};
+
+void *arena_alloc_recording(void *ctx, size_t size) noexcept {
+    auto *rec = static_cast<ArenaCharge *>(ctx);
+    void *p = charged_arena_alloc(&rec->charger, size);
+    if (p != nullptr) rec->bytes = size;
+    return p;
+}
+
+void arena_free_recording(void *ctx, void *ptr) noexcept {
+    auto *rec = static_cast<ArenaCharge *>(ctx);
+    std::free(ptr);
+    if (rec->bytes != 0) {
+        rec->charger.credit(rec->bytes);
+        rec->bytes = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Checked arithmetic and record-layout validation
+// ---------------------------------------------------------------------------
+
+bool checked_mul(size_t a, size_t b, size_t *out) {
+    if (a != 0 && b > std::numeric_limits<size_t>::max() / a) return false;
+    *out = a * b;
+    return true;
+}
+
+/**
+ * Largest `local_id` a task window may be sized from.
+ *
+ * `ceil_pow2` below is `int32_t`: above 2^30 the bit smear yields `0x80000000`,
+ * negative as `int32_t` and ~1.8e19 once cast to the `size_t` an arena reserve
+ * takes. The counts are device-written, so the domain is checked.
+ */
+constexpr int32_t kMaxTaskLocalId = (1 << 30) - 1;
+
+/**
+ * Validate the overflow-chain structure of the whole trace.
+ *
+ * `record_layout_valid` below checks one slot at a time, which cannot see that
+ * a chain is broken: a base marked `HAS_OVERFLOW` whose continuation is
+ * missing, mis-owned or unterminated leaves every individual record in range.
+ * The replay's chain walk used to log that and carry on with whatever prefix it
+ * had, and the dual-pass check cannot catch it — both passes are fed the same
+ * partial dependency list, so they agree. A graph built from a truncated
+ * dependency list is not this run's graph, and `deps.json` has nowhere to say
+ * so, which is why this rejects instead.
+ *
+ * Walked once, consuming each chain, so any overflow record still reached at
+ * the top level is an orphan nothing claims.
+ */
+bool chain_structure_valid(const DepGenRecord *records, size_t num_records) {
+    size_t i = 0;
+    while (i < num_records) {
+        const DepGenRecord &base = records[i];
+        if (base.flags & DEP_GEN_FLAG_OVERFLOW) {
+            LOG_ERROR(
+                "dep_gen replay: record %zu is an overflow slot no base record claims (task_id=0x%" PRIx64 ")", i,
+                TaskId::to_uint64(base.task_id)
+            );
+            return false;
+        }
+        if (base.flags & DEP_GEN_FLAG_LAST_OVERFLOW) {
+            LOG_ERROR(
+                "dep_gen replay: record %zu marks LAST_OVERFLOW without being an overflow slot (task_id=0x%" PRIx64 ")",
+                i, TaskId::to_uint64(base.task_id)
+            );
+            return false;
+        }
+        if (!(base.flags & DEP_GEN_FLAG_HAS_OVERFLOW)) {
+            i++;
+            continue;
+        }
+        // A chain is a contiguous run of overflow slots carrying the base's own
+        // task id and ending in LAST_OVERFLOW. Several legitimate segments are
+        // exactly that, so a multi-segment chain walks through here unchanged.
+        size_t j = i + 1;
+        bool terminated = false;
+        while (j < num_records) {
+            const DepGenRecord &link = records[j];
+            if (!(link.flags & DEP_GEN_FLAG_OVERFLOW)) break;
+            if (link.flags & DEP_GEN_FLAG_HAS_OVERFLOW) {
+                LOG_ERROR("dep_gen replay: record %zu is both an overflow slot and a chain owner", j);
+                return false;
+            }
+            if (link.task_id != base.task_id) break;
+            j++;
+            if (link.flags & DEP_GEN_FLAG_LAST_OVERFLOW) {
+                terminated = true;
+                break;
+            }
+        }
+        if (!terminated) {
+            LOG_ERROR(
+                "dep_gen replay: the chain owned by record %zu (task_id=0x%" PRIx64
+                ") is not terminated by a matching LAST_OVERFLOW slot — this run's dependency list is incomplete",
+                i, TaskId::to_uint64(base.task_id)
+            );
+            return false;
+        }
+        i = j;
+    }
+    return true;
+}
+
+/**
+ * Validate one slot against the layout its own flags select.
+ *
+ * An overflow slot is a reinterpret view whose `tensor_count` bytes are the
+ * overflow `dep_count`, so reading it as a base record would validate the
+ * wrong field. Each kind is parsed as itself.
+ */
+bool record_layout_valid(const DepGenRecord &r, size_t index) {
+    const TaskId tid = r.task_id;
+    if (tid.ring() >= CHIP_MAX_RING_DEPTH) {
+        LOG_ERROR(
+            "dep_gen replay: record %zu names ring %u, outside the %d ring domain", index,
+            static_cast<unsigned>(tid.ring()), CHIP_MAX_RING_DEPTH
+        );
+        return false;
+    }
+    const int32_t local = tid.local_id();
+    if (local < 0 || local > kMaxTaskLocalId) {
+        LOG_ERROR("dep_gen replay: record %zu names local id %d, outside [0, %d]", index, local, kMaxTaskLocalId);
+        return false;
+    }
+    if (r.flags & DEP_GEN_FLAG_OVERFLOW) {
+        const auto *over = reinterpret_cast<const DepGenOverflowRecord *>(&r);
+        if (over->dep_count > DEP_GEN_OVERFLOW_DEPS_PER_RECORD) {
+            LOG_ERROR(
+                "dep_gen replay: overflow slot %zu claims %u deps, above the %d it can hold", index,
+                static_cast<unsigned>(over->dep_count), DEP_GEN_OVERFLOW_DEPS_PER_RECORD
+            );
+            return false;
+        }
+        return true;
+    }
+    if (r.tensor_count > CORE_MAX_TENSOR_ARGS) {
+        LOG_ERROR(
+            "dep_gen replay: record %zu claims %u tensor args, above the %d it can hold", index,
+            static_cast<unsigned>(r.tensor_count), CORE_MAX_TENSOR_ARGS
+        );
+        return false;
+    }
+    if (r.explicit_dep_count > DEP_GEN_MAX_EXPLICIT_DEPS) {
+        LOG_ERROR(
+            "dep_gen replay: record %zu claims %u inline deps, above the %d it can hold", index,
+            static_cast<unsigned>(r.explicit_dep_count), DEP_GEN_MAX_EXPLICIT_DEPS
+        );
+        return false;
+    }
+    return true;
+}
 
 int32_t ceil_pow2(int32_t v) {
     if (v <= 1) return 1;
@@ -217,13 +480,20 @@ struct TaskArgEntry {
     uint32_t strides[MAX_TENSOR_DIMS];
 };
 
+// Every table the replay grows is charged. The aliases exist so the allocator
+// cannot be left off one of them by accident.
+template <typename T>
+using ChargedVec = std::vector<T, ChargedAlloc<T>>;
+template <typename K, typename V>
+using ChargedMap = std::unordered_map<K, V, std::hash<K>, std::equal_to<K>, ChargedAlloc<std::pair<const K, V>>>;
+
 struct TaskTableEntry {
     TaskId task_id;
     bool in_manual_scope;
     bool early_dispatch;
     int32_t kernel_id[3];  // per-subslot {AIC, AIV0, AIV1}, -1 = inactive
     uint32_t block_num;
-    std::vector<TaskArgEntry> args;
+    ChargedVec<TaskArgEntry> args;
 };
 
 const char *arg_type_str(TensorArgType t) {
@@ -266,8 +536,7 @@ uint64_t make_tensor_id(uint64_t buffer_addr, int32_t version) {
 // per-edge fields describe the slice via (start_offset, strides[]). Subsequent
 // sightings of the same (addr, version) are no-ops.
 uint64_t register_tensor(
-    std::unordered_map<uint64_t, size_t> &index_by_id, std::vector<TensorTableEntry> &table,
-    const simpler::tmr::Tensor &t
+    ChargedMap<uint64_t, size_t> &index_by_id, ChargedVec<TensorTableEntry> &table, const simpler::tmr::Tensor &t
 ) {
     uint64_t id = make_tensor_id(t.buffer.addr, t.version);
     auto it = index_by_id.find(id);
@@ -323,8 +592,8 @@ void write_uint_array(std::ofstream &out, const uint32_t *data, uint32_t n) {
 }
 
 bool write_deps_json(
-    const char *path, const std::vector<TaskTableEntry> &tasks, const std::vector<TensorTableEntry> &tensors,
-    const std::vector<EdgeAnnot> &edges
+    const char *path, const ChargedVec<TaskTableEntry> &tasks, const ChargedVec<TensorTableEntry> &tensors,
+    const ChargedVec<EdgeAnnot> &edges
 ) {
     std::ofstream out(path, std::ios::out | std::ios::trunc);
     if (!out) {
@@ -423,7 +692,18 @@ bool write_deps_json(
         out << '}';
     }
     out << "]}\n";
-    return static_cast<bool>(out);
+    // The stream's own destructor would flush and close after this function had
+    // already returned its verdict, so a small graph held entirely in the
+    // userspace buffer could report success and then lose its bytes to a write
+    // error at close. Flush and close here, and let the state afterwards be the
+    // answer: link publication controls the name, not the content.
+    out.flush();
+    out.close();
+    if (!out) {
+        LOG_ERROR("dep_gen replay: writing '%s' failed while flushing or closing it", path);
+        return false;
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -471,32 +751,42 @@ void annot_pass(
     }
 }
 
-}  // namespace
-
-extern "C" int
-dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, const char *deps_json_path) {
-    if (deps_json_path == nullptr) {
-        LOG_ERROR("dep_gen replay: null deps_json_path");
-        return -1;
+/**
+ * The body, so the entry points can turn a refused charge into a return code.
+ *
+ * `bad_alloc` is the only way a charge refusal or an allocation failure leaves
+ * here, and a caller must see a code rather than an exception: the budgeted
+ * caller is a background writer whose thread has no boundary of its own, and
+ * the unbudgeted one is reached from a C entry.
+ */
+int emit_deps_json_body(
+    const DepGenRecord *records, size_t num_records, const char *deps_json_path, const Charger &charger
+) {
+    // Every count below is device-written, so each slot is validated against
+    // the layout its own flags select before anything is sized or indexed from
+    // it. This precedes count_outputs(), which indexes arg_types[] by
+    // tensor_count with no bound of its own.
+    for (size_t i = 0; i < num_records; i++) {
+        if (!record_layout_valid(records[i], i)) return -5;
     }
-    if (num_records > 0 && records == nullptr) {
-        LOG_ERROR("dep_gen replay: num_records=%zu but records pointer is null", num_records);
-        return -1;
-    }
-    LOG_INFO("dep_gen replay: processing %zu in-memory records (dual-pass)", num_records);
+    // Chain structure is a property of the sequence, not of any one slot, so
+    // it is checked separately and before anything is sized from the trace.
+    if (!chain_structure_valid(records, num_records)) return -5;
 
     // Per-ring task window sizes — tensormap masks slot indices and requires
     // each to be a power of two. Auto-size from the records themselves so each
     // ring's window comfortably covers its observed max local_id (no slot
     // aliasing during INOUT+COVERED remove_from_task). Same sizes feed both
     // maps so they stay in lockstep.
+    // Every ring and local id is in domain by the validation above, so
+    // ceil_pow2 cannot be handed a value it turns negative.
     int32_t task_window_sizes[CHIP_MAX_RING_DEPTH];
     int32_t max_local[CHIP_MAX_RING_DEPTH] = {0};
     for (size_t i = 0; i < num_records; i++) {
         TaskId tid = records[i].task_id;
         uint8_t ring = tid.ring();
         int32_t local = tid.local_id();
-        if (ring < CHIP_MAX_RING_DEPTH && local > max_local[ring]) {
+        if (local > max_local[ring]) {
             max_local[ring] = local;
         }
     }
@@ -505,28 +795,50 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         task_window_sizes[r] = ceil_pow2(need < 16 ? 16 : need);
     }
 
-    int32_t output_count = count_outputs(records, num_records);
-    int32_t pool_size = output_count + (output_count / 10) + 64;
-    if (pool_size < CHIP_TENSORMAP_POOL_SIZE) {
-        pool_size = CHIP_TENSORMAP_POOL_SIZE;
+    // Widened deliberately: output_count is bounded by num_records x
+    // CORE_MAX_TENSOR_ARGS, which overflows int32_t for a large enough trace,
+    // and the sum would wrap before the comparison meant to raise it to the
+    // floor.
+    const int32_t output_count = count_outputs(records, num_records);
+    uint64_t pool_wide = static_cast<uint64_t>(output_count) + static_cast<uint64_t>(output_count) / 10 + 64;
+    if (pool_wide < static_cast<uint64_t>(CHIP_TENSORMAP_POOL_SIZE)) {
+        pool_wide = static_cast<uint64_t>(CHIP_TENSORMAP_POOL_SIZE);
     }
+    if (pool_wide > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
+        LOG_ERROR("dep_gen replay: tensormap pool size %" PRIu64 " exceeds the addressable pool", pool_wide);
+        return -5;
+    }
+    const int32_t pool_size = static_cast<int32_t>(pool_wide);
 
     ChipTensorMap tm_oracle;
     ChipTensorMap tm_annot;
     std::memset(&tm_oracle, 0, sizeof(tm_oracle));
     std::memset(&tm_annot, 0, sizeof(tm_annot));
 
-    // Libc-backed arena (default ctor) that owns both replay tensormaps'
-    // storage. Released by the arena destructor when this function returns.
-    DeviceArena replay_arena;
+    // Arena owning both replay tensormaps' storage, allocating through the
+    // caller's budget so the floor these two maps cost is charged like
+    // everything else. Released by the arena destructor on return, which
+    // credits the same figure.
+    ArenaCharge arena_charge{charger, 0};
+    DeviceArena replay_arena(&arena_alloc_recording, &arena_free_recording, &arena_charge);
 
     auto oracle_layout =
         ChipTensorMap::reserve_layout(replay_arena, CHIP_TENSORMAP_NUM_BUCKETS, pool_size, task_window_sizes);
     auto annot_layout =
         ChipTensorMap::reserve_layout(replay_arena, CHIP_TENSORMAP_NUM_BUCKETS, pool_size, task_window_sizes);
+    // reserve() asserts rather than returns on exceeding kMaxRegions, and
+    // asserts are compiled out of a release build, so the count is a
+    // compile-time fact here: two maps take 2 x (4 + 2 x CHIP_MAX_RING_DEPTH).
+    static_assert(
+        2 * (4 + 2 * CHIP_MAX_RING_DEPTH) <= static_cast<int>(DeviceArena::kMaxRegions),
+        "the two replay tensormaps must fit one arena's region table"
+    );
     if (replay_arena.commit() == nullptr || !tm_oracle.init_data_from_layout(oracle_layout, replay_arena) ||
         !tm_annot.init_data_from_layout(annot_layout, replay_arena)) {
-        LOG_ERROR("dep_gen replay: tensormap.init failed (buckets=%d, pool=%d)", CHIP_TENSORMAP_NUM_BUCKETS, pool_size);
+        LOG_ERROR(
+            "dep_gen replay: tensormap init failed or was refused (buckets=%d, pool=%d, bytes=%zu)",
+            CHIP_TENSORMAP_NUM_BUCKETS, pool_size, replay_arena.total_size()
+        );
         return -3;
     }
     // Replay tensormaps live entirely on host; only arena-internal pointer
@@ -534,12 +846,16 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
     tm_oracle.wire_arena_pointers(oracle_layout, replay_arena);
     tm_annot.wire_arena_pointers(annot_layout, replay_arena);
 
-    // JSON output accumulators.
-    std::vector<TaskTableEntry> task_table;
-    std::vector<TensorTableEntry> tensor_table;
-    std::unordered_map<uint64_t, size_t> tensor_index;  // tensor_id → table idx
-    std::vector<EdgeAnnot> annot_edges;
-    annot_edges.reserve(num_records * 2);
+    // JSON output accumulators. Every one is charged, and the reservation
+    // below is an opening size rather than a bound: one tensor argument can
+    // name several producers, so the edge count follows the graph and each
+    // growth charges as it happens.
+    ChargedVec<TaskTableEntry> task_table{ChargedAlloc<TaskTableEntry>(&charger)};
+    ChargedVec<TensorTableEntry> tensor_table{ChargedAlloc<TensorTableEntry>(&charger)};
+    ChargedMap<uint64_t, size_t> tensor_index{ChargedAlloc<std::pair<const uint64_t, size_t>>(&charger)};
+    ChargedVec<EdgeAnnot> annot_edges{ChargedAlloc<EdgeAnnot>(&charger)};
+    size_t opening_edges = 0;
+    if (checked_mul(num_records, 2, &opening_edges)) annot_edges.reserve(opening_edges);
 
     TensorRef tref_buf[CORE_MAX_TENSOR_ARGS];
     TensorArgType atype_buf[CORE_MAX_TENSOR_ARGS];
@@ -550,14 +866,14 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
     // into a single per-task fanin edge and OR-accumulates its flags. Both oracle
     // and annot use this same semantics so the divergence check compares the
     // (producer, flags) mapping rather than the producer-ID set alone.
-    std::unordered_map<TaskId, DepFlags> oracle_preds;
-    std::unordered_map<TaskId, DepFlags> annot_preds;
-    std::unordered_map<TaskId, size_t> explicit_edge_index;
+    ChargedMap<TaskId, DepFlags> oracle_preds{ChargedAlloc<std::pair<const TaskId, DepFlags>>(&charger)};
+    ChargedMap<TaskId, DepFlags> annot_preds{ChargedAlloc<std::pair<const TaskId, DepFlags>>(&charger)};
+    ChargedMap<TaskId, size_t> explicit_edge_index{ChargedAlloc<std::pair<const TaskId, size_t>>(&charger)};
 
     // Scratch buffer for assembling full dep lists across overflow chains.
     // Declared outside the loop so it can be reused (clear() keeps capacity).
-    std::vector<TaskId> full_deps_buf;
-    std::vector<uint8_t> full_kinds_buf;
+    ChargedVec<TaskId> full_deps_buf{ChargedAlloc<TaskId>(&charger)};
+    ChargedVec<uint8_t> full_kinds_buf{ChargedAlloc<uint8_t>(&charger)};
 
     for (size_t rec_i = 0; rec_i < num_records; rec_i++) {
         const DepGenRecord &rec = records[rec_i];
@@ -644,11 +960,15 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
                 }
             }
             if (!chain_complete) {
+                // Unreachable: `chain_structure_valid` rejected the trace
+                // before this loop could see a broken chain. Kept as a refusal
+                // rather than a log so the two can never disagree about what a
+                // partial dependency list means.
                 LOG_ERROR(
-                    "dep_gen replay: chain for task_id=0x%" PRIx64 " missing LAST_OVERFLOW marker — "
-                    "using partial dep list (%zu deps)",
-                    TaskId::to_uint64(rec.task_id), full_deps_buf.size()
+                    "dep_gen replay: chain for task_id=0x%" PRIx64 " lost its LAST_OVERFLOW marker after validation",
+                    TaskId::to_uint64(rec.task_id)
                 );
+                return -5;
             }
             deps_data = full_deps_buf.data();
             kinds_data = full_kinds_buf.data();
@@ -680,7 +1000,8 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         // consumer-side blob so raw_shapes / dtype are populated (the
         // producer-side ChipTensorMapEntry drops raw_shapes to fit in two
         // cache lines).
-        TaskTableEntry task_entry;
+        TaskTableEntry task_entry{{},        false, false,
+                                  {0, 0, 0}, 0u,    ChargedVec<TaskArgEntry>(ChargedAlloc<TaskArgEntry>(&charger))};
         task_entry.task_id = rec.task_id;
         task_entry.in_manual_scope = in_manual_scope;
         task_entry.early_dispatch = (rec.flags & DEP_GEN_FLAG_EARLY_DISPATCH) != 0;
@@ -861,12 +1182,52 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
     tm_oracle.destroy();
     tm_annot.destroy();
 
+    // Its own code: -7 already means an invalid explicit dep-flag byte, and a
+    // caller that cannot tell "the graph was rejected" from "the file could
+    // not be written" has nothing to act on.
     if (!write_deps_json(deps_json_path, task_table, tensor_table, annot_edges)) {
-        return -5;
+        return -9;
     }
     LOG_INFO(
         "dep_gen replay: wrote deps.json to %s (tasks=%zu, tensors=%zu, edges=%zu)", deps_json_path, task_table.size(),
         tensor_table.size(), annot_edges.size()
     );
     return 0;
+}
+
+}  // namespace
+
+extern "C" int dep_gen_replay_emit_deps_json_budgeted(
+    const DepGenRecord *records, size_t num_records, const char *deps_json_path, const DepGenReplayBudget *budget
+) {
+    if (deps_json_path == nullptr) {
+        LOG_ERROR("dep_gen replay: null deps_json_path");
+        return -1;
+    }
+    if (num_records > 0 && records == nullptr) {
+        LOG_ERROR("dep_gen replay: num_records=%zu but records pointer is null", num_records);
+        return -1;
+    }
+    LOG_INFO(
+        "dep_gen replay: processing %zu in-memory records (dual-pass, %s)", num_records,
+        budget == nullptr ? "unbudgeted" : "budgeted"
+    );
+    const Charger charger{budget};
+    try {
+        return emit_deps_json_body(records, num_records, deps_json_path, charger);
+    } catch (const std::bad_alloc &) {
+        // Either a charge was refused or the allocation behind it failed. Both
+        // leave no file: a graph missing edges is not this run's graph, and the
+        // format has nowhere to say so.
+        LOG_ERROR("dep_gen replay: storage for this graph was refused — deps.json not produced");
+        return -8;
+    } catch (...) {
+        LOG_ERROR("dep_gen replay: an unexpected host failure stopped this graph");
+        return -8;
+    }
+}
+
+extern "C" int
+dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, const char *deps_json_path) {
+    return dep_gen_replay_emit_deps_json_budgeted(records, num_records, deps_json_path, nullptr);
 }

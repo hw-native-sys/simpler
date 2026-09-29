@@ -162,6 +162,88 @@ The standard SceneTest path
 
 ---
 
+## 3.1 Background output (`collect_across_runs=True`)
+
+With `Worker(collect_across_runs=True)` on a level-3 worker, a
+`tensormap_and_ringbuffer` run keeps every step that touches the device on its
+own boundary — the receive drain and the terminal read — and hands the replay,
+the serialization and the file write to one background writer, so the host
+finishing run N can overlap run N+1's device execution. Device operators stay
+serial and diagnostic exclusivity is unchanged. Off by default; `host_build_graph`
+builds its graph on the host and is not affected.
+
+**`run()` returning no longer means `deps.json` exists.**
+`Worker.flush_diagnostics()` is the barrier that says the files up to that point
+are published, and `close()` publishes and joins. Both report a failed
+publication rather than reporting success over a missing file: the writer
+records a run's verdict before it makes that run's drained state observable, so
+a flush arriving between the two cannot see a settled collector with no error. Two runs may be unpublished at
+once, counting the one still collecting; a third is refused before anything is
+submitted, and the caller may flush first. Task ids are run-local, so two runs
+of the same callable repeat them — a graph is identified by the directory it is
+published under, never by its task ids.
+
+Publication is atomic: the graph is written to `deps.json.tmp` opened
+`O_CREAT|O_EXCL` and published with `link`, which never replaces an existing
+name. A destination already holding a `deps.json` therefore fails the run with
+that file untouched, and a partly written graph is never visible under the real
+name.
+
+### One whole graph, or no file
+
+`deps.json` has no metadata line and no completeness field, so there is nowhere
+to mark a partial graph. Either the whole graph is published, or no new file is
+produced for that run and an error is reported — and any file already at the
+destination is left as it was, which is not the same as this run having produced
+a graph. The refusals are: a device drop, a buffer the device still held, a
+broken count identity, a device counter at its saturation sentinel, a failed
+device read, an unresolvable in-flight buffer, a host-side record clamp, a
+record stamped with a run this collector never admitted, a counter reset that
+did not reach the device, a record whose ring or local id is out of domain, a
+refused memory charge, and a failed replay or write. In background mode these
+are sticky for the runner's life and reported by `flush_diagnostics()` and
+`close()`; a run whose device completion is unproved reads nothing shared and
+publishes nothing.
+
+### Memory
+
+Each collector has its own 256 MiB host budget for retained records and output
+work — not shared with other collectors, and not a whole-Worker limit. It covers
+the record blocks, the two export slots and their bounded path storage, a 1 MiB
+serialization reservation, alignment, and the replay's actual working storage:
+the contiguous record layout the replay indexes, the two host tensormaps (about
+17.1 MiB of floor per replay), and the task, tensor and edge tables. One tensor
+can name several producers, so edges and indexes are charged as they actually
+grow, including a reallocation's old and new blocks at once. Record blocks are
+charged before they are allocated and credited only after they are freed. The
+writer asks for a publication's working storage only once it has taken that
+export, so there is one working set at a time however many exports are sealed.
+Over-budget, out-of-domain and arithmetic-overflow conditions all refuse the
+graph rather than allocating, and no wait is introduced for storage a future
+credit might supply.
+
+Outside that budget, and separately bounded: the fixed device buffer pool
+(about 18.5 MiB), its host shadow on non-SVM platforms, and the fixed control
+region — one of each per collector per device context. Thread stacks, allocator
+metadata and system file buffers are not accounted in the application budget,
+and the output file is disk rather than host memory.
+
+### Device counters
+
+The three device counters saturate at `UINT32_MAX` instead of wrapping, and a
+counter reading it means the run passed the countable limit: its counts are
+unknown and no graph is published. This costs a compare at each increment on
+every dep_gen-enabled run, and it changes bytes in the shared AICPU image that
+`host_build_graph` also links.
+
+### With background output off
+
+The default path is unchanged in filename, location, schema and the bytes a
+clean run produces, and it still writes at the original boundary. What changed
+is that the refusals listed above now withhold the file there too, reported on
+that path's existing log channel — no sticky error is added, the run's return
+code does not change, and no 256 MiB limit applies.
+
 ## 4. Output: `deps.json`
 
 ```json

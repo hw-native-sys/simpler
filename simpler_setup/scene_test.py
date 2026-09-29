@@ -260,16 +260,26 @@ def _class_pipeline_depth(cls, cases) -> int:
 
 
 def _standalone_worker_groups(selected_by_cls):
-    """The classes that may share one Worker, keyed by `(runtime, level, requested capacity)`.
+    """The classes that may share one Worker, keyed by `(runtime, level, capacity, retention)`.
 
     Capacity is part of the key rather than something reconciled after grouping: a Worker's
     `pipeline_depth` is granted once, before its first run, so classes that ask for different
     numbers cannot share one. Partitioning here runs every class of a mixed module against the
     capacity it asked for, instead of handing the whole module the smallest of them.
+
+    Cross-run diagnostic retention is in the key for the same reason and one more: it is also
+    granted once, and it changes what `run()` returning means — with it on, a diagnostic
+    artifact is not written until `flush_diagnostics()`. A class that never asked for it must
+    not be moved onto that path by a neighbour that did.
     """
-    groups: dict[tuple[str, int, int], list[type]] = {}
+    groups: dict[tuple[str, int, int, bool], list[type]] = {}
     for cls, cases in selected_by_cls.items():
-        key = (cls._st_runtime, cls._st_level, _class_pipeline_depth(cls, cases))
+        key = (
+            cls._st_runtime,
+            cls._st_level,
+            _class_pipeline_depth(cls, cases),
+            bool(getattr(cls, "_st_collect_across_runs", False)),
+        )
         groups.setdefault(key, []).append(cls)
     return groups
 
@@ -1914,10 +1924,16 @@ def _validate_case_configs(cls: type) -> None:
             )
 
 
-def scene_test(level: int | SceneTestLevel, runtime: str):
+def scene_test(level: int | SceneTestLevel, runtime: str, collect_across_runs: bool = False):
     """Decorator marking a SceneTestCase with level and runtime.
 
     Platforms are declared per-case in CASES, not here.
+
+    ``collect_across_runs`` opts the class's Worker into cross-run diagnostic
+    retention. It changes when a diagnostic file exists — with it on, ``run()``
+    returning no longer implies the artifact is written and
+    ``flush_diagnostics()`` is the barrier — so it is off unless a case asks
+    for it. Level 3 only, which is where the option exists.
     """
     level_decorator = scene_level(level)
 
@@ -1925,6 +1941,7 @@ def scene_test(level: int | SceneTestLevel, runtime: str):
         _validate_case_configs(cls)
         level_decorator(cls)
         cls._st_runtime = runtime
+        cls._st_collect_across_runs = collect_across_runs
         cls_dir = Path(inspect.getfile(cls)).parent
         if hasattr(cls, "CALLABLE"):
             _resolve_callable_paths(cls, cls_dir)
@@ -2698,8 +2715,9 @@ class SceneTestCase:
         by_rt_level = _standalone_worker_groups(selected_by_cls)
 
         ok = True
-        for (runtime, level, capacity), group in by_rt_level.items():
-            print(f"\n=== Runtime: {runtime}  Level: {level}  Pipeline depth: {capacity or 'default'} ===")
+        for (runtime, level, capacity, retention), group in by_rt_level.items():
+            retained = "  Cross-run retention: on" if retention else ""
+            print(f"\n=== Runtime: {runtime}  Level: {level}  Pipeline depth: {capacity or 'default'}{retained} ===")
             worker, per_class_sub_handles, per_class_chip_handles = _create_standalone_worker(
                 group, level, args, selected_by_cls
             )
@@ -2994,6 +3012,18 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
             f"capacity cannot be changed once a Worker is up"
         )
     pipeline_depth = capacities.pop() if capacities else 0
+    # Not reconciled here either, and for a second reason on top of capacity's: retention changes
+    # what `run()` returning means, so neither answer is safe to pick for a class that chose the
+    # other. The caller partitions on it (see `_standalone_worker_groups`); this refusal is what a
+    # caller that grouped on runtime and level alone gets instead of a Worker.
+    retentions = {bool(getattr(cls, "_st_collect_across_runs", False)) for cls in group}
+    if len(retentions) > 1:
+        raise SystemExit(
+            f"one Worker cannot serve both cross-run retention settings: "
+            f"{', '.join(sorted(cls.__name__ for cls in group))} were grouped together, and retention "
+            f"decides whether a completed run has already written its diagnostic artifact"
+        )
+    collect_across_runs = retentions.pop() if retentions else False
     # Prefer the allocated list (dispatcher child mode), fall back to
     # contiguous range starting at args.device (legacy inline path).
     allocated = getattr(args, "device_ids", None)
@@ -3009,6 +3039,7 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
         runtime=first_cls._st_runtime,
         enable_sdma=any(_class_wants_sdma(c) for c in group),
         launch_depth=launch_depth,
+        collect_across_runs=collect_across_runs,
         **({"pipeline_depth": pipeline_depth} if pipeline_depth else {}),
     )
     # Prepare sub callables per-class to avoid name collisions.

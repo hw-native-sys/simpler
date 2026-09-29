@@ -9,11 +9,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """Which scene-test classes may share one Worker in the standalone `python test_x.py` path.
 
-A Worker's `pipeline_depth` is granted once, before its first run, and cannot be changed
-afterwards. Classes that ask for different capacities therefore cannot share a Worker, and the
-standalone dispatcher groups by runtime and level — which says nothing about capacity. This is the
-rule for that grouping; the pytest path builds one Worker per class and enforces the same
-per-class coherence in `conftest.py`.
+Two Worker properties are granted once, before the first run, and cannot be changed afterwards:
+`pipeline_depth` and cross-run diagnostic retention. Classes that disagree on either therefore
+cannot share a Worker, so both belong in the standalone dispatcher's grouping key alongside
+runtime and level. Retention carries a second reason: with it on, a completed `run()` has not
+yet written its diagnostic artifact, so a class that never asked for it must not be moved onto
+that path by a neighbour that did. This is the rule for that grouping; the pytest path builds one
+Worker per class and enforces the same per-class coherence in `conftest.py`.
 """
 
 import pytest
@@ -29,10 +31,11 @@ def _case(name, **config):
     return {"name": name, "platforms": ["a2a3"], "config": config}
 
 
-def _cls(name, runtime="host_build_graph", level=3):
+def _cls(name, runtime="host_build_graph", level=3, collect_across_runs=False):
     made = type(name, (), {})
     made._st_runtime = runtime
     made._st_level = level
+    made._st_collect_across_runs = collect_across_runs
     return made
 
 
@@ -85,8 +88,8 @@ def test_classes_asking_for_different_capacities_do_not_share_a_worker():
     groups = _standalone_worker_groups(selected)
 
     assert groups == {
-        ("host_build_graph", 3, 3): [deep],
-        ("host_build_graph", 3, 0): [shallow, control],
+        ("host_build_graph", 3, 3, False): [deep],
+        ("host_build_graph", 3, 0, False): [shallow, control],
     }
 
 
@@ -98,7 +101,7 @@ def test_classes_asking_for_the_same_capacity_still_share_one_worker():
         second: [_case("b", pipeline_depth=3)],
     }
 
-    assert _standalone_worker_groups(selected) == {("host_build_graph", 3, 3): [first, second]}
+    assert _standalone_worker_groups(selected) == {("host_build_graph", 3, 3, False): [first, second]}
 
 
 def test_runtime_and_level_still_separate_groups():
@@ -108,10 +111,37 @@ def test_runtime_and_level_still_separate_groups():
     selected = {hbg: [_case("a")], tmr: [_case("b")], level_two: [_case("c")]}
 
     assert _standalone_worker_groups(selected) == {
-        ("host_build_graph", 3, 0): [hbg],
-        ("tensormap_and_ringbuffer", 3, 0): [tmr],
-        ("host_build_graph", 2, 0): [level_two],
+        ("host_build_graph", 3, 0, False): [hbg],
+        ("tensormap_and_ringbuffer", 3, 0, False): [tmr],
+        ("host_build_graph", 2, 0, False): [level_two],
     }
+
+
+def test_classes_disagreeing_on_cross_run_retention_do_not_share_a_worker():
+    """Otherwise identical classes, one retaining diagnostics across runs and one not.
+
+    Everything else about them matches, so runtime, level and capacity alone put them in one
+    group — and the setting decides whether a returned `run()` has already written the class's
+    diagnostic artifact. Neither answer is safe for the class that chose the other.
+    """
+    retaining = _cls("TestDepGenAcrossRuns", collect_across_runs=True)
+    plain = _cls("TestDepGenSingleRun")
+    selected = {retaining: [_case("across")], plain: [_case("single")]}
+
+    assert _standalone_worker_groups(selected) == {
+        ("host_build_graph", 3, 0, True): [retaining],
+        ("host_build_graph", 3, 0, False): [plain],
+    }
+
+
+def test_a_class_that_never_declared_retention_groups_as_not_retaining():
+    # Every class the decorator built carries the attribute; one assembled by hand does not, and
+    # the absent case is the conservative one.
+    bare = type("Bare", (), {})
+    bare._st_runtime = "host_build_graph"
+    bare._st_level = 3
+
+    assert _standalone_worker_groups({bare: [_case("a")]}) == {("host_build_graph", 3, 0, False): [bare]}
 
 
 # ---------------------------------------------------------------------------
@@ -129,3 +159,12 @@ def test_building_a_worker_for_a_mixed_group_is_refused_before_any_device_is_tou
 
     with pytest.raises(SystemExit, match="one Worker cannot serve pipeline_depth values \\[0, 3\\]"):
         _create_standalone_worker([deep, shallow], 3, None, selected)
+
+
+def test_building_a_worker_for_a_retention_mixed_group_is_refused_the_same_way():
+    retaining = _cls("Retaining", collect_across_runs=True)
+    plain = _cls("Plain")
+    selected = {retaining: [_case("a")], plain: [_case("b")]}
+
+    with pytest.raises(SystemExit, match="one Worker cannot serve both cross-run retention settings"):
+        _create_standalone_worker([retaining, plain], 3, None, selected)

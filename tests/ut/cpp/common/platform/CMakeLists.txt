@@ -126,6 +126,7 @@ platform_case(test_dep_gen_collector_aicpu.cpp PER_ARCH PER_RUNTIME
 platform_case(test_dep_gen_run_identity.cpp PER_ARCH PER_RUNTIME
     SOURCES
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/dep_gen_collector.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/dep_gen_retained_runs.cpp
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/dep_gen_collector_aicpu.cpp
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_run_result_base_aicpu.cpp
         ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp

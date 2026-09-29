@@ -287,6 +287,50 @@ void DeviceRunner::arm_host_dep_gen_capture(bool enable) {
     dep_gen_host_graph_set_enabled(enable);
 }
 
+void DeviceRunner::configure_dep_gen_retention(bool enabled, std::size_t budget_bytes) {
+    dep_gen_collector_.configure_retained_runs(enabled, budget_bytes);
+}
+
+bool DeviceRunner::dep_gen_retains_runs() const { return dep_gen_collector_.retains_runs(); }
+
+int DeviceRunner::admit_dep_gen_run(const DfxRunConfig &dfx, uint64_t run_epoch) {
+    if (!dfx.dep_gen_enabled || dep_gen_host_graph_active()) return 0;
+    if (!dep_gen_collector_.retains_runs()) {
+        // Default path: the window is opened, then the threads that serve it
+        // start. A counter reset that did not reach the device withholds this
+        // run's file rather than failing the run, so the result is logged by
+        // the collector and the launch proceeds.
+        (void)dep_gen_collector_.begin_run();
+        auto thread_factory = [this](std::function<void()> fn) {
+            return create_thread(std::move(fn));
+        };
+        dep_gen_collector_.start(thread_factory);
+        return 0;
+    }
+    auto thread_factory = [this](std::function<void()> fn) {
+        return create_thread(std::move(fn));
+    };
+    dep_gen_collector_.start(thread_factory);
+    if (!dep_gen_collector_.run_begin(run_epoch, dfx.output_prefix)) {
+        LOG_ERROR(
+            "dep_gen: run %llu was not admitted for retained collection", static_cast<unsigned long long>(run_epoch)
+        );
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    return 0;
+}
+
+void DeviceRunner::withdraw_dep_gen_run(uint64_t run_epoch) noexcept {
+    if (!dep_gen_collector_.retains_runs()) return;
+    dep_gen_collector_.abandon_run(run_epoch);
+}
+
+bool DeviceRunner::dep_gen_flush_retained(int timeout_ms, std::string *error) {
+    return dep_gen_collector_.flush_retained_runs(timeout_ms, error);
+}
+
+void DeviceRunner::dep_gen_finish_retained() { dep_gen_collector_.finish_retained_runs(); }
+
 int DeviceRunner::prepare_execution(
     Runtime &runtime, const CallConfig &config, uint32_t pipeline_slot, const NativeRunIdentity &identity,
     std::unique_ptr<PreparedExecution> *prepared
@@ -501,12 +545,12 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                     collect_rc != 0) {
                     return collect_rc;
                 }
-                if (prepared->dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
-                    auto thread_factory = [this](std::function<void()> fn) {
-                        return create_thread(std::move(fn));
-                    };
-                    dep_gen_collector_.begin_run();
-                    dep_gen_collector_.start(thread_factory);
+                // Admission before any submission. A refusal gives back what the
+                // collectors above already admitted, or their export slots stay held
+                // by a run that never reaches a boundary.
+                if (int dep_rc = admit_dep_gen_run(prepared->dfx, prepared->identity.run_epoch); dep_rc != 0) {
+                    withdraw_unlaunched_collectors_for_run(prepared->dfx, prepared->identity.run_epoch);
+                    return dep_rc;
                 }
                 if (prepared->dfx.chip_swimlane_enabled() && chip_swimlane_collector_.is_initialized()) {
                     std::vector<CoreType> core_types(num_aicore);
@@ -659,7 +703,7 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
         if (teardown_rc != 0) {
             LOG_ERROR("Diagnostics teardown reported %d on the error path; run error %d is kept", teardown_rc, rc);
         }
-        emit_device_dep_gen_graph(prepared.dfx);
+        emit_device_dep_gen_graph(prepared.dfx, prepared.identity.run_epoch, false);
         return DrainOutcome::device_error(rc);
     }
 
@@ -673,22 +717,41 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     // established.
     const int teardown_rc =
         teardown_shared_collectors_after_run(prepared.dfx, prepared.pipeline_slot, prepared.identity.run_epoch, true);
-    emit_device_dep_gen_graph(prepared.dfx);
+    emit_device_dep_gen_graph(prepared.dfx, prepared.identity.run_epoch, true);
 
     // Reads device memory, so it must precede KernelArgs/runtime cleanup.
     print_handshake_results(prepared.kernel_args);
     return DrainOutcome::device_complete(teardown_rc);
 }
 
-void DeviceRunner::emit_device_dep_gen_graph(const DfxRunConfig &dfx) {
+void DeviceRunner::emit_device_dep_gen_graph(
+    const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete
+) {
     // The host-orch shape emits at the end of bind instead, where its capture
     // window closes — see `emit_host_dep_gen_graph` in c_api_shared.cpp.
     if (!dfx.dep_gen_enabled || dep_gen_host_graph_active()) return;
+    if (dep_gen_collector_.retains_runs()) {
+        // The retained path keeps the drain and the terminal read on this
+        // boundary and hands the replay, the serialization and the write to
+        // the writer. It is the whole of this run's emission — the default
+        // body below must not also run.
+        dep_gen_collector_.run_close(run_epoch, device_execution_complete);
+        return;
+    }
     dep_gen_collector_.quiesce();
     // reconcile_counters() is the completeness gate: an un-flushed device buffer
     // or a dropped record makes it false and no deps.json is written, so a run
     // that failed mid-flight yields a whole graph or none — never a partial one.
-    if (!dep_gen_collector_.reconcile_counters()) return;
+    const auto report = dep_gen_collector_.reconcile_report();
+    if (!simpler::dfx::dep_gen_runs::publishable(report)) {
+        // The same refusals the retained path takes, reported the way this
+        // path always has: a log line, no sticky error and no change to the
+        // run's return code. Withholding the file is the change — a graph
+        // whose completeness nothing established is not this run's graph, and
+        // `deps.json` has nowhere to say so.
+        LOG_ERROR("dep_gen: no graph is written for this run: %s", simpler::dfx::dep_gen_runs::first_refusal(report));
+        return;
+    }
     const std::string deps = make_deps_json_path(dfx.output_prefix);
     // One deps.json describes one graph. A window with no records still gets a
     // file — an empty graph is this run's answer, and suppressing it would make

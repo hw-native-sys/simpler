@@ -36,7 +36,12 @@
 #include "host/profiling_copy.h"
 #include "../../../worker/runtime_c_api.h"
 
-DepGenCollector::~DepGenCollector() { stop(); }
+DepGenCollector::~DepGenCollector() {
+    // The writer outlives the collector threads, so it is joined here too: a
+    // joinable thread left behind at destruction terminates the process.
+    stop_writer();
+    stop();
+}
 
 // ---------------------------------------------------------------------------
 // init
@@ -156,15 +161,28 @@ int DepGenCollector::init(
 // Record accumulation (in-memory — no disk hop)
 // ---------------------------------------------------------------------------
 
-void DepGenCollector::begin_run() {
+bool DepGenCollector::begin_run() {
     {
         std::scoped_lock lock(records_mutex_);
         records_by_run_.clear();
     }
     total_collected_ = 0;
+    reset_unpublished_ = false;
+    // A sealed export owns its own records, so this releases only what this
+    // collector still holds for a run that never sealed. The counters reset
+    // with it, under the lock that owns them.
+    size_t charged = 0;
+    {
+        std::scoped_lock lock(records_mutex_);
+        host_clamped_ = false;
+        refused_records_ = 0;
+        foreign_epoch_records_ = 0;
+        charged = retained_records_.release();
+    }
+    if (charged > 0) credit_record_block(charged);
 
     // Nothing on the device yet before the first init(); its memset covers this.
-    if (shm_host_ == nullptr) return;
+    if (shm_host_ == nullptr) return true;
 
     // The device's record counters are monotonic by contract (see dep_gen.h), so
     // they carry the previous run's totals into this one's reconcile. Zeroing
@@ -177,20 +195,43 @@ void DepGenCollector::begin_run() {
     wmb();
     // Narrow write-backs, not the region: a bulk push would clobber the
     // device-owned fields next to these (current_buf_ptr, free_queue.head).
-    publish_field(&state->total_record_count, sizeof(state->total_record_count), "total_record_count");
-    publish_field(&state->dropped_record_count, sizeof(state->dropped_record_count), "dropped_record_count");
-    publish_field(
+    // The results decide the run: a reset that never reached the device leaves
+    // this run reconciling against the previous run's totals, so the identity
+    // it reports is about two runs rather than one.
+    bool published = publish_field(&state->total_record_count, sizeof(state->total_record_count), "total_record_count");
+    published &=
+        publish_field(&state->dropped_record_count, sizeof(state->dropped_record_count), "dropped_record_count");
+    published &= publish_field(
         &state->total_overflow_record_count, sizeof(state->total_overflow_record_count), "total_overflow_record_count"
     );
+    if (fail_counter_reset_) published = false;
+    if (!published) {
+        // Sticky for this run in both modes. Retained mode refuses the
+        // admission that follows; the default path keeps its return code and
+        // withholds the file instead.
+        reset_unpublished_ = true;
+        LOG_ERROR("dep_gen: this run's device counter reset was not published — no graph will be produced for it");
+    }
+    return published;
 }
 
 void DepGenCollector::append_buffer_records(const void *buf_host_ptr) {
     const DepGenBuffer *buf = reinterpret_cast<const DepGenBuffer *>(buf_host_ptr);
+    bool clamped = false;
     uint32_t n = buf->count;
     if (n > static_cast<uint32_t>(PLATFORM_DEP_GEN_RECORDS_PER_BUFFER)) {
+        // The excess is unreadable and is not counted anywhere on the device,
+        // so the identity below would still balance over a trace missing
+        // records. Recording that the clamp fired is what makes the graph
+        // unpublishable instead of quietly short.
+        LOG_ERROR(
+            "dep_gen: a buffer claimed %u records, above the %d its slot holds — this run's graph is incomplete", n,
+            PLATFORM_DEP_GEN_RECORDS_PER_BUFFER
+        );
         n = static_cast<uint32_t>(PLATFORM_DEP_GEN_RECORDS_PER_BUFFER);
+        clamped = true;
     }
-    if (n == 0) return;
+    if (n == 0 && !clamped) return;
 
     // Read the identity before copying: it decides which run's graph these
     // records join. The device buffer goes back to the pool after this and a
@@ -198,6 +239,47 @@ void DepGenCollector::append_buffer_records(const void *buf_host_ptr) {
     const uint64_t run_epoch = buf->run_epoch;
 
     std::scoped_lock lock(records_mutex_);
+    // Every field below is this lock's, including the clamp flag the run
+    // boundary reads: they are written on collector threads and read by the
+    // boundary, so one owner rather than a plain field two locks reach.
+    if (clamped) host_clamped_ = true;
+    if (n == 0) return;
+    if (retain_across_runs_ && retained_ready_) {
+        // Grouping by whatever epoch a buffer carries is not identity: an
+        // epoch this collector never admitted names no run, and filing it
+        // under a fresh key would make a stray buffer look like a graph.
+        if (!retained_epoch_open_ || run_epoch != retained_epoch_) {
+            foreign_epoch_records_ += n;
+            LOG_ERROR(
+                "dep_gen: %u records arrived stamped 0x%llx, which is not the admitted run — this run's graph is "
+                "untrustworthy",
+                n, static_cast<unsigned long long>(run_epoch)
+            );
+            total_collected_ += n;
+            return;
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            const bool stored = retained_records_.append(
+                buf->records[i],
+                [this](size_t bytes) {
+                    return charge_record_block(bytes);
+                },
+                [this](size_t bytes) {
+                    credit_record_block(bytes);
+                }
+            );
+            if (!stored) {
+                // Counted as received and not retained. A graph missing edges
+                // is not a graph, so this run publishes nothing — but the
+                // receive path is never blocked and nothing is allocated here.
+                refused_records_ += static_cast<uint64_t>(n - i);
+                total_collected_ += n;
+                return;
+            }
+        }
+        total_collected_ += n;
+        return;
+    }
     std::vector<DepGenRecord> &run_records = records_by_run_[run_epoch];
     run_records.insert(run_records.end(), buf->records, buf->records + n);
     total_collected_ += n;
@@ -215,15 +297,29 @@ void DepGenCollector::on_buffer_collected(const DepGenReadyBufferInfo &info) {
 // reconcile_counters
 // ---------------------------------------------------------------------------
 
-bool DepGenCollector::reconcile_counters() {
-    if (shm_host_ == nullptr) return false;
+bool DepGenCollector::reconcile_counters() { return reconcile_report().clean; }
+
+simpler::dfx::dep_gen_runs::ReconcileReport DepGenCollector::reconcile_report() {
+    simpler::dfx::dep_gen_runs::ReconcileReport out;
+    if (shm_host_ == nullptr) return out;
     report_drain_drops();
 
     // mgmt thread is stopped by the caller; pull the latest BufferState
     // (current_buf_ptr, total/dropped counters) from device so the
-    // cross-check sees post-stop() values.
+    // cross-check sees post-stop() values. The result decides the run: a failed
+    // copy leaves the host shadow holding the zeroes begin_run() wrote, and
+    // the identity below would balance over a run that collected nothing.
     if (manager_.shared_mem_dev() != nullptr && shm_size_ > 0) {
-        profiling_copy_from_device(shm_host_, manager_.shared_mem_dev(), shm_size_);
+        const int rc = profiling_copy_from_device(shm_host_, manager_.shared_mem_dev(), shm_size_);
+        if (rc != 0 || fail_region_read_) {
+            LOG_ERROR("dep_gen reconcile: the shared region read failed (%d) — this run's counts are untrusted", rc);
+            out.region_read_failed = true;
+            return out;
+        }
+    } else if (fail_region_read_) {
+        LOG_ERROR("dep_gen reconcile: the shared region read failed — this run's counts are untrusted");
+        out.region_read_failed = true;
+        return out;
     }
     rmb();
 
@@ -233,16 +329,37 @@ bool DepGenCollector::reconcile_counters() {
     uint64_t buf_dev = state->current_buf_ptr;
     if (buf_dev != 0) {
         void *host_ptr = manager_.resolve_host_ptr(reinterpret_cast<void *>(buf_dev));
-        if (host_ptr != nullptr) {
-            profiling_copy_from_device(host_ptr, reinterpret_cast<void *>(buf_dev), sizeof(DepGenBuffer));
-            rmb();
-            uint32_t count = reinterpret_cast<const DepGenBuffer *>(host_ptr)->count;
-            if (count != 0) {
+        if (host_ptr == nullptr) {
+            // Skipping the check is not passing it: nothing established whether
+            // that buffer still holds records.
+            LOG_ERROR(
+                "dep_gen reconcile: the buffer the device still holds (0x%lx) has no host mapping — nothing could be "
+                "checked",
+                static_cast<unsigned long>(buf_dev)
+            );
+            out.buffer_unresolved = true;
+            clean = false;
+        } else {
+            const int rc =
+                profiling_copy_from_device(host_ptr, reinterpret_cast<void *>(buf_dev), sizeof(DepGenBuffer));
+            if (rc != 0) {
                 LOG_ERROR(
-                    "dep_gen reconcile: un-flushed buffer (current_buf_ptr=0x%lx, count=%u) — device flush failed",
-                    static_cast<unsigned long>(buf_dev), count
+                    "dep_gen reconcile: reading the buffer the device still holds (0x%lx) failed (%d)",
+                    static_cast<unsigned long>(buf_dev), rc
                 );
+                out.buffer_read_failed = true;
                 clean = false;
+            } else {
+                rmb();
+                uint32_t count = reinterpret_cast<const DepGenBuffer *>(host_ptr)->count;
+                if (count != 0) {
+                    LOG_ERROR(
+                        "dep_gen reconcile: un-flushed buffer (current_buf_ptr=0x%lx, count=%u) — device flush failed",
+                        static_cast<unsigned long>(buf_dev), count
+                    );
+                    out.unflushed_records = true;
+                    clean = false;
+                }
             }
         }
     }
@@ -251,7 +368,36 @@ bool DepGenCollector::reconcile_counters() {
     uint64_t dropped_device = state->dropped_record_count;
     uint64_t overflow_device = state->total_overflow_record_count;
 
+    out.total_device = total_device;
+    out.dropped_device = dropped_device;
+    out.overflow_device = overflow_device;
+    out.collected_host = total_collected_;
+    {
+        // Written on collector threads; the drain is quiesced by the caller, so
+        // this is a consistent read rather than a racing one.
+        std::scoped_lock lock(records_mutex_);
+        out.host_clamped = host_clamped_;
+        out.identity_foreign = foreign_epoch_records_ > 0 || refused_records_ > 0;
+    }
+    out.reset_unpublished = reset_unpublished_;
+    if (out.host_clamped || out.identity_foreign || out.reset_unpublished) clean = false;
+
+    // The saturation sentinel: the producer clamps at UINT32_MAX rather than
+    // wrapping, so a counter reading it means the run passed the countable
+    // limit and no identity over it is a proof.
+    if (total_device == UINT32_MAX || dropped_device == UINT32_MAX || overflow_device == UINT32_MAX) {
+        LOG_ERROR(
+            "dep_gen reconcile: a device counter reached its counting limit (total=%lu dropped=%lu overflow=%lu) — "
+            "this run's counts are unknown",
+            static_cast<unsigned long>(total_device), static_cast<unsigned long>(dropped_device),
+            static_cast<unsigned long>(overflow_device)
+        );
+        out.counters_unknown = true;
+        clean = false;
+    }
+
     if (dropped_device > 0) {
+        out.device_dropped = true;
         LOG_WARN(
             "dep_gen reconcile: %lu records dropped on device side (free_queue empty or ready_queue full). "
             "Increase PLATFORM_DEP_GEN_BUFFERS_PER_INSTANCE / PLATFORM_DEP_GEN_READYQUEUE_SIZE if frequent. "
@@ -264,6 +410,7 @@ bool DepGenCollector::reconcile_counters() {
     // chain expands submits into multiple slots, so the overflow counter
     // bridges the two.
     if (total_collected_ + dropped_device != total_device + overflow_device) {
+        out.identity_broken = true;
         LOG_WARN(
             "dep_gen reconcile: record count mismatch (collected=%lu + dropped=%lu != device_total=%lu + "
             "overflow=%lu, silent_loss=%ld)",
@@ -280,7 +427,8 @@ bool DepGenCollector::reconcile_counters() {
         );
     }
 
-    return clean;
+    out.clean = clean;
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +439,13 @@ void DepGenCollector::finalize(DepGenUnregisterCallback unregister_cb, const Dep
     if (!initialized_) return;
 
     stop();
+
+    // `stop()` is the reader join, so this is the first point at which the
+    // quarantined host copies are nobody's to append to. Disposing them here
+    // returns their bytes and clears the admission block a quarantine holds;
+    // it settles host storage only — the sticky diagnostic error survives, and
+    // the pooled device buffers are released below by their own proof.
+    discard_quarantined_runs();
 
     {
         std::scoped_lock lock(records_mutex_);

@@ -1095,6 +1095,14 @@ void SimDeviceRunnerBase::withdraw_unlaunched_collectors_for_run(const DfxRunCon
             scope_stats_collector_.abandon_run(run_epoch);
         } catch (...) {}
     }
+    // DepGen's admission lives on the arch runner, so it is given back through
+    // the hook. This sits with the other per-collector withdrawals and ahead of
+    // the swimlane gates below: those return early, and a run with dep_gen on
+    // and swimlane off would otherwise keep an export slot no writer and no
+    // flush can see — two of them exhaust admission for the runner's life.
+    if (dfx.dep_gen_enabled && dep_gen_retains_runs()) {
+        withdraw_dep_gen_run(run_epoch);
+    }
     if (!dfx.chip_swimlane_enabled()) return;
     if (!chip_swimlane_collector_.retains_runs()) return;
     try {
@@ -1123,6 +1131,7 @@ int SimDeviceRunnerBase::flush_diagnostics(int timeout_ms, std::string *error) {
     std::string pmu_error;
     std::string dump_error;
     std::string scope_stats_error;
+    std::string dep_gen_error;
     bool ok = true;
     if (chip_swimlane_collector_.retains_runs() &&
         !chip_swimlane_collector_.flush_retained_runs(remaining_ms(), &swimlane_error)) {
@@ -1141,10 +1150,18 @@ int SimDeviceRunnerBase::flush_diagnostics(int timeout_ms, std::string *error) {
     if (!scope_stats_collector_.flush_retained_runs(remaining_ms(), &scope_stats_error)) {
         ok = false;
     }
+    // DepGen lives on the arch runner, so it is reached through the hook. The
+    // arm is deliberately ungated, for the same reason PMU's is: a failure
+    // recorded before a collector rebuild reconfigured retention off must
+    // still be reported here, and a collector that retains nothing has
+    // nothing to wait for and nothing to report.
+    if (!dep_gen_flush_retained(remaining_ms(), &dep_gen_error)) {
+        ok = false;
+    }
     if (ok) return 0;
     if (error != nullptr) {
         *error = swimlane_error;
-        for (const std::string &part : {dump_error, pmu_error, scope_stats_error}) {
+        for (const std::string &part : {dump_error, pmu_error, scope_stats_error, dep_gen_error}) {
             if (part.empty()) continue;
             if (!error->empty()) *error += "; ";
             *error += part;
@@ -1158,6 +1175,7 @@ void SimDeviceRunnerBase::finish_retained_runs() {
     dump_collector_.finish_retained_runs();
     pmu_collector_.finish_retained_runs();
     scope_stats_collector_.finish_retained_runs();
+    dep_gen_finish_retained();
 }
 
 void SimDeviceRunnerBase::write_host_phase_records_artifact(const std::string &output_prefix, uint32_t pipeline_slot) {

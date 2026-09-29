@@ -57,6 +57,19 @@ static bool s_pre_orch_idx_drop_reported = false;
 
 static constexpr uint64_t kDepGenQueueBackpressureWaitCycles = PLATFORM_DFX_BACKPRESSURE_TIMEOUT_CYCLES;
 
+/**
+ * Saturating 32-bit accumulate.
+ *
+ * `UINT32_MAX` is the reserved "at or past the countable limit" value: the host
+ * settles a run whose counter reads it as counts-unknown. Wrapping instead
+ * would let a run that attempted 2^32 submits and dropped every one report a
+ * balanced, empty, complete graph.
+ */
+static inline void saturating_add(volatile uint32_t &counter, uint32_t by) {
+    const uint32_t current = counter;
+    counter = (by >= UINT32_MAX - current) ? UINT32_MAX : current + by;
+}
+
 extern "C" void set_platform_dep_gen_base(uint64_t dep_gen_data_base) { g_platform_dep_gen_base = dep_gen_data_base; }
 
 extern "C" uint64_t get_platform_dep_gen_base() { return g_platform_dep_gen_base; }
@@ -104,7 +117,9 @@ struct DepGenDeviceModule {
         ctx.header->queues[ctx.thread_idx][tail].buffer_seq = buffer_seq;
     }
 
-    static void account_dropped(Context, State *state, uint32_t count) { state->dropped_record_count += count; }
+    static void account_dropped(Context, State *state, uint32_t count) {
+        saturating_add(state->dropped_record_count, count);
+    }
     static void on_pop_success(Context, State *state, Buffer *buffer) {
         buffer->run_epoch = get_platform_run_result_epoch();
         buffer->local_seq = state->current_buf_seq;
@@ -208,7 +223,7 @@ void dep_gen_aicpu_record_submit(
     }
 
     // Account every attempted record so total == collected + dropped on host.
-    s_dep_gen_state->total_record_count += 1;
+    saturating_add(s_dep_gen_state->total_record_count, 1);
 
     // The ready queue a full buffer is published to is selected by
     // s_orch_thread_idx; while it is negative nothing written here can ever
@@ -223,7 +238,7 @@ void dep_gen_aicpu_record_submit(
                 "further records are dropped because no ready queue is selected"
             );
         }
-        s_dep_gen_state->dropped_record_count += 1;
+        saturating_add(s_dep_gen_state->dropped_record_count, 1);
         wmb();
         return;
     }
@@ -238,7 +253,7 @@ void dep_gen_aicpu_record_submit(
     if (cur_ptr == 0) {
         DepGenBuffer *recovered = try_pop_dep_gen_buffer(s_dep_gen_state->current_buf_seq);
         if (recovered == nullptr) {
-            s_dep_gen_state->dropped_record_count += 1;
+            saturating_add(s_dep_gen_state->dropped_record_count, 1);
             wmb();
             return;
         }
@@ -267,7 +282,7 @@ void dep_gen_aicpu_record_submit(
         if (cur_ptr == 0) {
             DepGenBuffer *recovered = try_pop_dep_gen_buffer(s_dep_gen_state->current_buf_seq);
             if (recovered == nullptr) {
-                s_dep_gen_state->dropped_record_count += 1;
+                saturating_add(s_dep_gen_state->dropped_record_count, 1);
                 wmb();
                 return;
             }
@@ -284,7 +299,7 @@ void dep_gen_aicpu_record_submit(
         // under us. Drop the record and bail rather than write past the end
         // of buf->records[].
         LOG_ERROR("dep_gen: invalid capacity %d (local_count=%u), dropping record", capacity, local_count);
-        s_dep_gen_state->dropped_record_count += 1;
+        saturating_add(s_dep_gen_state->dropped_record_count, 1);
         wmb();
         return;
     }
@@ -381,7 +396,7 @@ void dep_gen_aicpu_record_submit(
     // accounts for chain expansion. total_record_count stays "one per submit"
     // — see DepGenBufferState doc.
     if (needed > 1) {
-        s_dep_gen_state->total_overflow_record_count += static_cast<uint32_t>(needed - 1);
+        saturating_add(s_dep_gen_state->total_overflow_record_count, static_cast<uint32_t>(needed - 1));
     }
     int written = base_dc;
     for (int slot = 1; slot < needed; slot++) {
@@ -444,7 +459,7 @@ void dep_gen_aicpu_flush() {
         // run's init reuse it in place, which is the only return available to
         // AICPU.
         LOG_ERROR("dep_gen: flush failed (ready_queue full), %u records dropped", buf->count);
-        s_dep_gen_state->dropped_record_count += buf->count;
+        saturating_add(s_dep_gen_state->dropped_record_count, buf->count);
         buf->count = 0;
         wmb();
     }

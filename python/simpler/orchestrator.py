@@ -739,6 +739,26 @@ class Orchestrator:
         with self._control_admission("committed_device_memory"):
             return int(self._o.committed_device_memory(int(worker_id)))
 
+    def flush_diagnostics(self, worker_id: int, timeout_s: float) -> tuple[int, int, int, int]:
+        """Publish every diagnostic run next-level worker *worker_id* has closed.
+
+        The barrier behind `Worker.flush_diagnostics()` and `Worker.close()`:
+        with cross-run collection on, a run returning no longer means its
+        diagnostic file exists, and this is what says the files up to now do.
+        Raises when a promised file is missing.
+
+        `timeout_s` follows the native protocol unchanged — a negative value
+        means no deadline, and a zero budget on a caller that had one is
+        refused rather than turned into an unbounded wait
+        (`LocalMailboxEndpoint::control_dfx_flush`). Returns that call's
+        `(session_id, watermark_epoch, published, failed)`.
+
+        Travels the same chip control channel as every other command here, so
+        it takes the same admission.
+        """
+        with self._control_admission("flush_diagnostics"):
+            return self._o.flush_diagnostics(int(worker_id), float(timeout_s))
+
     def device_memory_info(self, worker_id: int) -> DeviceMemoryInfo:
         """Device-wide ACL_HBM_MEM free/total byte snapshot for *worker_id*."""
         with self._control_admission("device_memory_info"):

@@ -48,6 +48,12 @@ public:
     // Defined in the .cpp so this header stays free of the runtime-provided
     // capture symbols.
     void arm_host_dep_gen_capture(bool enable) override;
+    void configure_dep_gen_retention(bool enabled, std::size_t budget_bytes) override;
+    bool dep_gen_retains_runs() const override;
+    int admit_dep_gen_run(const DfxRunConfig &dfx, uint64_t run_epoch) override;
+    void withdraw_dep_gen_run(uint64_t run_epoch) noexcept override;
+    bool dep_gen_flush_retained(int timeout_ms, std::string *error) override;
+    void dep_gen_finish_retained() override;
 
 private:
     struct ActiveRun;
@@ -75,7 +81,14 @@ private:
     // error return of drain_execution: the AICPU threads are joined before
     // either, so a failed run's records are as complete as the run made them.
     // Its own reconcile is the completeness gate — see the definition.
-    void emit_device_dep_gen_graph(const DfxRunConfig &dfx);
+    /**
+     * Emit this run's dependency graph.
+     *
+     * `device_execution_complete` is the caller's own fence observation and the
+     * whole of the completion proof: without it the retained path reads nothing
+     * shared and publishes nothing.
+     */
+    void emit_device_dep_gen_graph(const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete);
 
     // Per-run collector teardown: stop + release shm so a session-scoped Worker
     // can re-init collectors on the next enqueue. Matches a2a3 sim.

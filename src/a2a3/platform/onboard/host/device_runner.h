@@ -145,6 +145,12 @@ public:
      * `DeviceRunnerBase`.
      */
     void arm_host_dep_gen_capture(bool enable) override;
+    void configure_dep_gen_retention(bool enabled, std::size_t budget_bytes) override;
+    bool dep_gen_retains_runs() const override;
+    int admit_dep_gen_run(const DfxRunConfig &dfx, uint64_t run_epoch) override;
+    void withdraw_dep_gen_run(uint64_t run_epoch) noexcept override;
+    bool dep_gen_flush_retained(int timeout_ms, std::string *error) override;
+    void dep_gen_finish_retained() override;
 
     /**
      * Cleanup all resources
@@ -337,7 +343,15 @@ private:
     // error return of reap_run: the device flushes its dep_gen buffers during
     // emergency_shutdown, so a failed run's graph is recoverable. Its own
     // reconcile is the completeness gate — see the definition.
-    void emit_device_dep_gen_graph(const DfxRunConfig &dfx);
+    /**
+     * Emit this run's dependency graph.
+     *
+     * `device_execution_complete` is the caller's own fence observation and
+     * the whole of the completion proof: without it the retained path reads
+     * nothing shared and publishes nothing, and the default path is not
+     * reached at all.
+     */
+    void emit_device_dep_gen_graph(const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete);
 
     // On an AICore launch/sync error, best-effort drain the device so a later
     // enqueue on the same DeviceRunner can recover in place; if the drain itself
