@@ -219,10 +219,15 @@ def test_an_explicit_budget_still_reaches_the_same_route(monkeypatch):
     assert seen["workspace_budget_bytes"] == 4 << 20
 
 
-def test_a_chip_child_reaches_chip_worker_init_unmanaged():
-    """The forked child calls the same entry without asking, so the default of
-    the parameter is what keeps it on its existing path until L3 has a
-    cross-process close proof of its own."""
+def test_the_management_request_is_off_unless_a_caller_asks():
+    """The parameter's default is what keeps every caller that does not ask on
+    its existing path — a descendant Worker's chip children among them.
+
+    A simulated backend is a different mechanism, not a caller that stayed
+    silent: its parent asks exactly as any other does, and `ChipWorker::init`
+    ignores the request because that backend manages no device workspace.
+    Which callers ask is covered by test_chip_workspace_management_route.py.
+    """
     import inspect  # noqa: PLC0415
 
     from simpler.task_interface import ChipWorker  # noqa: PLC0415

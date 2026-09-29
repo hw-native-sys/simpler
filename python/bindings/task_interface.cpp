@@ -1735,7 +1735,7 @@ CtypesFormat classify_ctypes_format(const char *format) {
 // Resolve one wire tensor onto a local base and build the address-bearing device POD.
 // `resolved` maps CanonicalIdentity -> (local_base, address_space); the caller populates it by
 // materializing each embedded descriptor.
-ChipTensor materialize_one(const Tensor &r, nb::dict resolved) {
+ChipTensor materialize_one(const Tensor &r, TensorTransfer transfer, nb::dict resolved) {
     uint64_t elem = get_element_size(r.dtype);
     if (elem == 0) {
         throw std::runtime_error("materialize: unknown dtype");
@@ -1754,7 +1754,7 @@ ChipTensor materialize_one(const Tensor &r, nb::dict resolved) {
     // non-row-major layout (transpose / permute / step-slice), which ChipTensor expresses natively.
     return make_tensor_strided(
         reinterpret_cast<void *>(static_cast<uintptr_t>(base + r.byte_offset)), r.shapes, r.strides, r.ndims, r.dtype,
-        static_cast<AddressSpace>(addr_space)
+        static_cast<AddressSpace>(addr_space), transfer
     );
 }
 
@@ -2201,6 +2201,10 @@ NB_MODULE(_task_interface, m) {
     nb::enum_<AddressSpace>(m, "AddressSpace", nb::is_arithmetic())
         .value("HOST", AddressSpace::HOST)
         .value("DEVICE", AddressSpace::DEVICE);
+    nb::enum_<TensorTransfer>(m, "TensorTransfer", nb::is_arithmetic())
+        .value("NONE", TensorTransfer::NONE)
+        .value("H2D", TensorTransfer::H2D)
+        .value("D2H", TensorTransfer::D2H);
 
     nb::enum_<AccessMode>(m, "AccessMode", nb::is_arithmetic())
         .value("READ", AccessMode::READ)
@@ -2474,7 +2478,20 @@ NB_MODULE(_task_interface, m) {
 
         .def_static(
             "make",
-            [](uint64_t data, nb::tuple shapes, DataType dtype, bool child_memory) -> ChipTensor {
+            [](uint64_t data, nb::tuple shapes, DataType dtype, nb::object child_memory,
+               nb::object address_space) -> ChipTensor {
+                if (!child_memory.is_none() && !address_space.is_none()) {
+                    throw std::invalid_argument("ChipTensor.make: child_memory cannot be combined with address_space");
+                }
+                const auto space =
+                    address_space.is_none() ?
+                        ((!child_memory.is_none() && nb::cast<bool>(child_memory)) ? AddressSpace::DEVICE :
+                                                                                     AddressSpace::HOST) :
+                        nb::cast<AddressSpace>(address_space);
+                const auto request = legacy_tensor_transfer(space);
+                if (const char *error = tensor_transfer_error(space, request)) {
+                    throw std::invalid_argument(std::string("ChipTensor.make: ") + error);
+                }
                 size_t n = nb::len(shapes);
                 if (n == 0 || n > MAX_TENSOR_DIMS)
                     throw std::invalid_argument("ChipTensor.make: shapes length must be in [1, MAX_TENSOR_DIMS]");
@@ -2484,17 +2501,14 @@ NB_MODULE(_task_interface, m) {
                 // make_tensor_external yields a contiguous ChipTensor: row-major strides,
                 // start_offset == 0, buffer.size == numel * element_size.
                 return make_tensor_external(
-                    reinterpret_cast<void *>(static_cast<uintptr_t>(data)), shp, static_cast<uint32_t>(n), dtype,
-                    child_memory ? AddressSpace::DEVICE : AddressSpace::HOST
+                    reinterpret_cast<void *>(static_cast<uintptr_t>(data)), shp, static_cast<uint32_t>(n), dtype, space,
+                    request
                 );
             },
-            // The keyword stays `child_memory` while the C++ field is `address_space`: it is the
-            // name of a u8 on the remote-L3 tensor wire (see remote_wire.cpp encode_tensor), which
-            // renaming here would not change and which this constructor decodes into.
-            nb::arg("data"), nb::arg("shapes"), nb::arg("dtype"), nb::arg("child_memory") = false,
-            "Create a contiguous ChipTensor over pre-allocated memory. Set child_memory=True when "
-            "data is a device pointer allocated by the child process (skips H2D copy in "
-            "init_runtime_impl)."
+            nb::arg("data"), nb::arg("shapes"), nb::arg("dtype"), nb::arg("child_memory") = nb::none(), nb::kw_only(),
+            nb::arg("address_space") = nb::none(),
+            "Create a contiguous ChipTensor. child_memory=False/omitted means HOST; True means DEVICE. "
+            "Transfer requests belong to add_tensor(), whose defaults are HOST/H2D and DEVICE/NONE."
         )
 
         // `data` is the tensor's memory address — i.e. ChipTensor::buffer.addr.
@@ -2533,7 +2547,7 @@ NB_MODULE(_task_interface, m) {
                 // Re-establish a contiguous layout over the same buffer base.
                 self.init_external(
                     reinterpret_cast<void *>(self.buffer.addr), numel * get_element_size(self.dtype), shp,
-                    static_cast<uint32_t>(n), self.dtype, self.address_space
+                    static_cast<uint32_t>(n), self.dtype, self.address_space, self.transfer
                 );
             }
         )
@@ -2566,8 +2580,11 @@ NB_MODULE(_task_interface, m) {
             },
             [](ChipTensor &self, bool v) {
                 self.address_space = v ? AddressSpace::DEVICE : AddressSpace::HOST;
+                self.transfer = legacy_tensor_transfer(self.address_space);
             }
         )
+
+        .def_ro("address_space", &ChipTensor::address_space)
 
         // Read-only views of the strided metadata (always contiguous for make()).
         .def_prop_ro(
@@ -2618,8 +2635,26 @@ NB_MODULE(_task_interface, m) {
         .def(nb::init<>())
 
         .def(
-            "add_tensor", &ChipStorageTaskArgs::add_tensor, nb::arg("t"),
-            "Add a ChipTensor. Must be called before any add_scalar()."
+            "add_tensor",
+            [](ChipStorageTaskArgs &self, const ChipTensor &t, nb::object transfer) {
+                ChipTensor arg = t;
+                arg.transfer =
+                    transfer.is_none() ? legacy_tensor_transfer(t.address_space) : nb::cast<TensorTransfer>(transfer);
+                if (const char *error = tensor_transfer_error(arg.address_space, arg.transfer)) {
+                    throw std::invalid_argument(error);
+                }
+                self.add_tensor(arg);
+            },
+            nb::arg("t"), nb::kw_only(), nb::arg("transfer") = nb::none(),
+            "Add a ChipTensor with a per-call transfer request. Defaults: HOST/H2D, DEVICE/NONE."
+        )
+        .def(
+            "transfer",
+            [](const ChipStorageTaskArgs &self, int32_t i) {
+                if (i < 0 || i >= self.tensor_count()) throw std::out_of_range("transfer index out of range");
+                return self.tensor(i).transfer;
+            },
+            nb::arg("i"), "Return the transfer request for argument i."
         )
 
         .def(
@@ -2702,14 +2737,17 @@ NB_MODULE(_task_interface, m) {
 
         .def(
             "add_tensor",
-            [](TaskArgs &self, const Tensor &t, TensorArgType tag) {
+            [](TaskArgs &self, const Tensor &t, TensorArgType tag, nb::object transfer) {
                 validate_tensor(t);
                 check_access_subset(t.buffer.access, tag);
-                self.add_tensor(t, tag);
+                const auto request = transfer.is_none() ?
+                                         legacy_tensor_transfer(static_cast<AddressSpace>(t.buffer.address_space)) :
+                                         nb::cast<TensorTransfer>(transfer);
+                self.add_tensor(t, tag, request);
             },
-            nb::arg("t"), nb::arg("tag") = TensorArgType::INPUT,
+            nb::arg("t"), nb::arg("tag") = TensorArgType::INPUT, nb::kw_only(), nb::arg("transfer") = nb::none(),
             "Add a Tensor arg (the self-describing wire view built by Buffer.tensor) with an "
-            "optional TensorArgType tag (default INPUT)."
+            "optional TensorArgType tag (default INPUT) and transfer (default HOST/H2D, DEVICE/NONE)."
         )
 
         .def(
@@ -2799,8 +2837,19 @@ NB_MODULE(_task_interface, m) {
             nb::arg("i"), nb::arg("tag"), "Set the TensorArgType tag for the tensor at index i."
         )
 
-        .def("tensor_count", &TaskArgs::tensor_count)
-        .def("scalar_count", &TaskArgs::scalar_count)
+        .def("transfer", &TaskArgs::transfer, nb::arg("i"), "Return the per-call transfer request.")
+        .def(
+            "tensor_count",
+            [](const TaskArgs &self) {
+                return self.tensor_count();
+            }
+        )
+        .def(
+            "scalar_count",
+            [](const TaskArgs &self) {
+                return self.scalar_count();
+            }
+        )
 
         .def(
             "identities",
@@ -2836,6 +2885,17 @@ NB_MODULE(_task_interface, m) {
             },
             "Return total number of arguments (tensors + scalars)."
         );
+
+    m.def(
+        "_snapshot_local_task_args",
+        [](const TaskArgs &args) {
+            std::vector<TaskArgs> snapshot{args};
+            validate_submit_args(snapshot);
+            return std::move(snapshot.front());
+        },
+        nb::arg("args"),
+        "Copy and validate one local submission's views, tags, requests and scalar values before binding."
+    );
 
     // --- ProvenanceTable ---
     // The owner's live child device allocations, as the dispatch path consumes them. The Python
@@ -3948,7 +4008,7 @@ NB_MODULE(_task_interface, m) {
         [](const TaskArgs &args, nb::dict resolved) -> ChipStorageTaskArgs {
             ChipStorageTaskArgs out;
             for (int32_t i = 0; i < args.tensor_count(); i++) {
-                out.add_tensor(materialize_one(args.tensor(i), resolved));
+                out.add_tensor(materialize_one(args.tensor(i), args.transfer(i), resolved));
             }
             for (int32_t i = 0; i < args.scalar_count(); i++) {
                 out.add_scalar(args.scalar(i));
@@ -3972,7 +4032,7 @@ NB_MODULE(_task_interface, m) {
             TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(blob_ptr), capacity);
             TaskArgs args;
             for (int32_t i = 0; i < view.tensor_count; i++) {
-                args.add_tensor(view.tensors(i));
+                args.add_tensor(view.tensors(i), TensorArgType::INPUT, view.transfer(i));
             }
             for (int32_t i = 0; i < view.scalar_count; i++) {
                 args.add_scalar(view.scalars[i]);

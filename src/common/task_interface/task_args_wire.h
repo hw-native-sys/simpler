@@ -46,15 +46,75 @@
 #include "task_args.h"
 
 // ============================================================================
-// Type aliases
+// TaskArgs — view values plus per-call request metadata
 // ============================================================================
 
 // Unified user-facing builder: vector-backed with TensorArgType tags.
 // Used by Orchestrator.submit_*; tags drive dependency inference at submit
 // time and are stripped before the args cross the dispatch boundary. The element
 // is Tensor (self-describing view; L3+ holds no C++ ChipTensor) — the L3→L2 wire
-// carries Tensors, materialized to ChipStorageTaskArgs (ChipTensor) on the L2 child.
-using TaskArgs = TaskArgsTpl<Tensor, uint64_t, 0, 0, TensorArgType>;
+// carries views plus requests, materialized to ChipStorageTaskArgs on the L2 child.
+class TaskArgs : private TaskArgsTpl<Tensor, uint64_t, 0, 0, TensorArgType> {
+    using Base = TaskArgsTpl<Tensor, uint64_t, 0, 0, TensorArgType>;
+    std::vector<TensorTransfer> transfers_;
+
+public:
+    using Base::add_dep;
+    using Base::add_dep_wait;
+    using Base::add_scalar;
+    using Base::explicit_dep;
+    using Base::explicit_dep_count;
+    using Base::explicit_dep_retain;
+    using Base::scalar;
+    using Base::scalar_count;
+    using Base::scalar_data;
+    using Base::tag;
+    using Base::tensor;
+    using Base::tensor_count;
+    using Base::tensor_data;
+
+    void add_tensor(const Tensor &t, TensorArgType tag = TensorArgType::INPUT) {
+        add_tensor(t, tag, legacy_tensor_transfer(static_cast<AddressSpace>(t.buffer.address_space)));
+    }
+
+    void add_tensor(const Tensor &t, TensorArgType tag, TensorTransfer transfer) {
+        if (const char *error = tensor_transfer_error(static_cast<AddressSpace>(t.buffer.address_space), transfer)) {
+            throw std::invalid_argument(error);
+        }
+        if (!scalars_.empty()) throw std::logic_error("TaskArgs: cannot add tensor after scalar");
+        const Tensor value = t;  // t may refer to an existing entry invalidated by reserve.
+        // Every append below is non-allocating, so allocation failure cannot separate a view
+        // from its tag or request. Growth remains geometric for large host argument lists.
+        if (tensors_.size() == tensors_.capacity() || tensors_.size() == tags_.capacity() ||
+            tensors_.size() == transfers_.capacity()) {
+            const size_t capacity = (tensors_.size() + 1) * 2;
+            tensors_.reserve(capacity);
+            tags_.reserve(capacity);
+            transfers_.reserve(capacity);
+        }
+        Base::add_tensor(value, tag);
+        transfers_.push_back(transfer);
+    }
+
+    TensorTransfer transfer(int32_t i) const {
+        const auto request = transfers_.at(static_cast<size_t>(i));
+        if (const char *error =
+                tensor_transfer_error(static_cast<AddressSpace>(tensor(i).buffer.address_space), request)) {
+            throw std::invalid_argument(error);
+        }
+        return request;
+    }
+
+    void clear() {
+        Base::clear();
+        transfers_.clear();
+    }
+};
+
+// The mailbox argument slot reserves one byte of the view padding for the invocation request.
+// Tensor itself remains a view: standalone Tensor serialization leaves all three bytes padding.
+inline constexpr size_t TASK_ARG_TRANSFER_OFFSET = offsetof(Tensor, _pad);
+static_assert(TASK_ARG_TRANSFER_OFFSET == 141, "mailbox transfer offset is wire ABI");
 
 // ============================================================================
 // TaskArgsView — zero-copy view over a wire blob
@@ -82,8 +142,20 @@ struct TaskArgsView {
         }
         Tensor t;
         std::memcpy(&t, tensor_bytes + static_cast<size_t>(i) * sizeof(Tensor), sizeof(Tensor));
+        t._pad[0] = 0;
         validate_tensor(t);
         return t;
+    }
+
+    TensorTransfer transfer(int32_t i) const {
+        const Tensor t = tensors(i);
+        const auto request = static_cast<TensorTransfer>(
+            tensor_bytes[static_cast<size_t>(i) * sizeof(Tensor) + TASK_ARG_TRANSFER_OFFSET]
+        );
+        if (const char *error = tensor_transfer_error(static_cast<AddressSpace>(t.buffer.address_space), request)) {
+            throw std::invalid_argument(error);
+        }
+        return request;
     }
 };
 
@@ -94,11 +166,11 @@ struct TaskArgsView {
 // Byte layout (tags stripped):
 //   offset 0:                 int32 tensor_count = T
 //   offset 4:                 int32 scalar_count = S
-//   offset 8:                 Tensor tensors[T]             (144 B each)
+//   offset 8:                 argument slots[T]             (144 B each; view + transfer at byte 141)
 //   offset 8 + 144T:          uint64_t scalars[S]           (8 B each)
 // total bytes used:           8 + 144T + 8S
 //
-// The element is the self-describing wire `Tensor`: it carries its backing's descriptor, so a
+// Each slot carries the self-describing `Tensor` view and its invocation transfer, so a
 // consumer resolves it with no prior handshake. A chip child materializes each one to a
 // `ChipTensor` (address-bearing) and assembles a `ChipStorageTaskArgs` for the runtime.so ABI.
 
@@ -118,6 +190,10 @@ inline void write_blob(uint8_t *dst, const TaskArgs &a) {
     std::memcpy(dst + 4, &S, sizeof(S));
     if (T > 0) {
         std::memcpy(dst + TASK_ARGS_BLOB_HEADER_SIZE, a.tensor_data(), static_cast<size_t>(T) * sizeof(Tensor));
+        for (int32_t i = 0; i < T; ++i) {
+            dst[TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(i) * sizeof(Tensor) + TASK_ARG_TRANSFER_OFFSET] =
+                static_cast<uint8_t>(a.transfer(i));
+        }
     }
     if (S > 0) {
         std::memcpy(
@@ -219,6 +295,7 @@ inline bool tag_writes(TensorArgType tag) {
 inline void validate_submit_args(const std::vector<TaskArgs> &args_list) {
     for (const TaskArgs &args : args_list) {
         for (int32_t i = 0; i < args.tensor_count(); ++i) {
+            (void)args.transfer(i);  // Mutable C++ views may have changed location since add_tensor.
             if (!access_permits(args.tensor(i).buffer.access, args.tag(i))) {
                 throw std::invalid_argument(
                     "submit: an argument's TensorArgType requests access the backing does not grant"

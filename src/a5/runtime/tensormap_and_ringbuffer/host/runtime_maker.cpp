@@ -68,6 +68,7 @@
 #include "utils/device_arena.h"
 #include "utils/retained_temp_bump.h"
 #include "utils/temp_buffer_plan.h"
+#include "utils/program_tensor_args.h"
 #include "utils/tensor_lease_copy_in.h"
 #include "utils/tensor_lease_release.h"
 #include "prepare_callable_common.h"
@@ -816,6 +817,8 @@ extern "C" int bind_callable_to_runtime_impl(
         LOG_ERROR("orch_args pointer is null");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    const int transfer_status = validate_program_tensor_transfers(orch_args);
+    if (transfer_status != 0) return transfer_status;
     // trb runs orchestration on the device — there is no host-side orch
     // function pointer to invoke. The c_api signature accepts one for
     // symmetry with hbg; assert the trb-side invariant here.

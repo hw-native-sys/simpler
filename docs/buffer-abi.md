@@ -103,7 +103,41 @@ it is the resolved `addr` + `size`. That is the whole of what materialization do
 | — | ⟂ | `buffer.addr` |
 | `byte_offset` (bytes) | ≈ | `start_offset` (elements) |
 | `shapes[5]` / `strides[5]` / `ndims` / `dtype` | = | `shapes[5]` / `strides[5]` / `ndims` / `dtype` |
-| `buffer.address_space` | = | `address_space` (still spelled `child_memory` until the wire flip) |
+| `buffer.address_space` | = | `address_space` |
+| `TaskArgs.transfer(i)` (per-call metadata) | = | `ChipStorageTaskArgs.tensor(i).transfer` (internal ABI carrier) |
+
+`AddressSpace` describes the backing's physical HOST/DEVICE location. `Tensor` holds
+only the backing descriptor and view geometry. `TensorTransfer` belongs to each
+TaskArgs entry: `NONE` borrows storage, `H2D` requests Program-managed device storage,
+and `D2H` is reserved and rejected. Callable direction still controls input copies
+and output copy-back; H2D does not mean every argument is copied in. Buffer identity,
+import grants and `TensorArgType` access checks are unchanged.
+
+```python
+view = buffer.tensor((16,), DataType.FLOAT32)
+args.add_tensor(view, transfer=TensorTransfer.NONE)
+args.add_tensor(view, transfer=TensorTransfer.H2D)
+```
+
+The two entries above share one view and independently request transfer; neither
+changes `view`. Omitted transfer in `TaskArgs.add_tensor` or the transitional L2
+`ChipStorageTaskArgs.add_tensor` keeps HOST/H2D and DEVICE/NONE. The L2
+`ChipTensor.make(..., address_space=...)` constructor selects location only;
+`child_memory` remains a compatibility spelling and cannot be combined with
+`address_space`. Both spellings use the same add-time defaults.
+
+Mailbox slots preserve each request in byte 141, formerly reserved view padding;
+standalone Tensor values do not carry it. Re-export and L2 materialization preserve
+the request alongside the view. Chip binders accept HOST/H2D and DEVICE/NONE;
+HOST/NONE returns UNSUPPORTED, and invalid pairs return INVALID_ARGUMENT, before
+any tensor content copy or device allocation. Host-only leaves can use HOST/NONE.
+This does not change HBG's existing host-access implementation. Remote protocol v4
+represents only legacy location defaults: its encoder rejects other per-call
+requests before emitting a payload instead of silently dropping them.
+Tensor/ChipTensor sizes remain 144/72 bytes; the internal ChipTensor carrier uses
+byte 70 for the request. Local endpoints must use the same build, as for every
+existing layout change. ChipTensor remains a transitional materialized ABI carrier,
+not a second public transfer-policy model.
 
 **Dead on the device** (`Tensor`-only): `magic` discriminates untrusted bytes at
 a decode boundary the device does not have. `identity` / `backend_kind` / `body`
@@ -366,6 +400,44 @@ it. `ChipTensor` survives only in `ChipStorageTaskArgs`, the POD `ChipWorker`
 consumes — an L2 worker materializes into it inside `run` before calling down.
 
 Single-machine (host + device) L3→L2 and L4→L3→L2 dispatch is implemented and
-verified in `a2a3sim` and onboard `a2a3`. The remote **receive**
-side and the buffer lifecycle robustness (`release_buffer`, in-flight retain /
-deferred-free) are later phases (P2).
+verified in `a2a3sim` and onboard `a2a3`. The remote **receive** side is a later
+phase (P2).
+
+Buffer lifecycle robustness is partly in place, and which guarantee applies
+depends on the API that releases the storage. `Worker.free` is atomic with a
+direct L2 submission's accepted-use registration — see
+[Direct L2 invocation binding](#direct-l2-invocation-binding). `release_buffer`
+and deferred physical free are still P2.
+
+## Direct L2 invocation binding
+
+`Worker(level=2).submit` snapshots the TaskArgs views, tags, transfer requests and
+scalar values before binding. This copies descriptors and scalar values, not tensor
+payloads. Changing the caller's TaskArgs after that boundary cannot redirect the
+accepted call or change its retained Buffer identities.
+
+The snapshot uses the same submit-time grant and writable-overlap checks as L3.
+Every DEVICE_MALLOC or VMM_WINDOW argument must match a live allocation's complete
+descriptor on the target chip, including its identity and generation. A cached
+import does not authorize a revoked allocation. Rejection precedes import and
+native submission.
+
+Validation and in-flight identity registration share the chip lock `Worker.free`
+holds across its own revoke, which makes the two orderings exhaustive: a
+submission that registers first makes a later free refuse, and a free that
+revokes first makes the submission reject. The reservation then protects
+materialization, native submission and execution through run finalization; a
+failed bind or rejected submission drops it. This retains the existing fail-fast
+in-flight free contract, without adding deferred physical free.
+
+`release_buffer` is **not** inside that fence. It samples the same in-flight set
+and then closes the backing, so a submission accepted between the sample and the
+close can still map an identity that release is about to unlink. Bringing host
+backing release inside the fence is part of the P2 lifecycle work above.
+
+This boundary covers the public Worker TaskArgs path. The low-level ChipWorker
+POD compatibility entry and external borrowed-pointer construction remain separate
+migration work. It introduces no HOST/NONE chip execution or cross-side mapping.
+Explicit task dependencies stay an L3 orchestration concept: a direct L2
+submission is one task, so no `TaskArgs` dependency entry reaches the chip
+through this path.

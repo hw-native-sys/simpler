@@ -27,14 +27,17 @@
 
 namespace {
 
-// The successor has to still be executing when the predecessor's record is
-// read, and that read costs ~11 us. The margin is what the test measures in, so
-// it is sized for the *fastest* silicon rather than for the one this was
-// developed on: 64 tasks left a2a3 ~100 us of headroom but proved too thin on
-// a5 under a loaded runner, where the successor finished before the host could
-// look. Well inside the default 16384-slot ring window, so nothing here is near
-// an admission limit, and dependency-only tasks make each one cheap.
-constexpr int32_t kTaskCount = 1024;
+// Scalar 0 is the task count, so the run's residency is the caller's to choose:
+// the window the test measures in is this run outlasting a ~11 us host read,
+// and how many tasks that takes is a property of the silicon and the runtime
+// the run lands on, not of this source. The caller escalates it until the
+// window is there.
+//
+// The bound is half the default 16384-slot ring task window, which the run
+// leaves at its default. A single scope cannot fill that window -- fanout
+// references are released only at scope_end, so a scope reaching the cap
+// reports SCOPE_DEADLOCK rather than running.
+constexpr int32_t kMaxTaskCount = 8192;
 
 }  // namespace
 
@@ -43,18 +46,24 @@ extern "C" {
 __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;
     return OrchestrationConfig{
-        .expected_arg_count = 0,
+        .expected_arg_count = 1,
     };
 }
 
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &orch_args) {
-    (void)orch_args;
+    const int32_t task_count = orch_args.scalar<int32_t>(0);
+    if (task_count < 1 || task_count > kMaxTaskCount) {
+        rt_report_fatal(
+            SIMPLER_ERROR_INVALID_ARGS, "retention_orch: task_count=%d outside [1, %d]", task_count, kMaxTaskCount
+        );
+        return;
+    }
 
     uint32_t shape[1] = {1};
     TensorCreateInfo ci(shape, 1, DataType::INT32);
 
     SIMPLER_SCOPE() {
-        for (int32_t i = 0; i < kTaskCount; i++) {
+        for (int32_t i = 0; i < task_count; i++) {
             CoreTaskArgs args;
             args.add_output(ci);
             rt_submit_dummy_task(args);

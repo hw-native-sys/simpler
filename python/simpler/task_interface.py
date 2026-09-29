@@ -115,7 +115,7 @@ from _task_interface import (
     scalar_to_uint64 as _native_scalar_to_uint64,
 )
 
-from .buffer import Buffer, Tensor
+from .buffer import Buffer, Tensor, TensorTransfer
 
 
 def _assert_bindings_match_source_tree() -> None:
@@ -194,6 +194,7 @@ __all__ = [
     "ChipTensor",
     "ChipStorageTaskArgs",
     "TensorArgType",
+    "TensorTransfer",
     "TaskArgs",
     "TaskHandle",
     "RemoteAddressSpace",
@@ -842,7 +843,9 @@ def _storage_for_remote_task_args(args: TaskArgs) -> _RemoteTaskArgsStorage:
         return storage
 
 
-def _task_args_add_tensor(self: TaskArgs, tensor, tag: TensorArgType = TensorArgType.INPUT) -> None:
+def _task_args_add_tensor(
+    self: TaskArgs, tensor, tag: TensorArgType = TensorArgType.INPUT, *, transfer: TensorTransfer | None = None
+) -> None:
     """Add a task arg. ``tensor`` is a ``simpler.buffer.Tensor`` (packable) or its packed
     bytes. A RemoteTensorRef (arg destined for a remote worker) is rewritten to a REMOTE_SIDECAR
     ``Tensor`` (no local backing) with its remote descriptor tracked in the sidecar."""
@@ -868,10 +871,10 @@ def _task_args_add_tensor(self: TaskArgs, tensor, tag: TensorArgType = TensorArg
             ),
             byte_offset=int(tensor.offset),
         )
-        _TASK_ARGS_ADD_TENSOR(self, placeholder, tag)
+        _TASK_ARGS_ADD_TENSOR(self, placeholder, tag, transfer=transfer)
         storage.sidecars.append(_sidecar_from_ref(storage, tensor))
         return
-    _TASK_ARGS_ADD_TENSOR(self, tensor, tag)
+    _TASK_ARGS_ADD_TENSOR(self, tensor, tag, transfer=transfer)
 
 
 def _task_args_clear(self: TaskArgs) -> None:
@@ -1506,11 +1509,14 @@ class ChipWorker:
                 diagnostics regions, code and device ELF, RTS and provider
                 memory are outside it, so it is not a device-wide ceiling.
             manage_workspace: Put those same four regions under one owner, so a
-                superseded generation is released when its last consumer
-                retires instead of at close. Internal: the in-process level-2
-                route passes it, and no public `Worker` option sets it. Ignored
-                on a simulated backend, which manages no device workspace. A
-                budget implies it.
+                superseded generation is released once its last consumer
+                retires rather than when its replacement is published, a
+                failed growth leaves the previous plan installed, and a failed
+                release is recorded instead of discarded. Internal: the
+                in-process level-2 route and a directly-closed level-3
+                Worker's forked chip children pass it, and no public `Worker`
+                option sets it. Ignored on a simulated backend, which manages
+                no device workspace. A budget implies it.
             collect_across_runs: Let a run's records outlive its own boundary,
                 so the sealing and the file write happen while the next run
                 executes instead of at the boundary. Off when neither this nor

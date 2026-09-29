@@ -142,3 +142,52 @@ TEST(ChildMemory, SkipLogicSimulation) {
     EXPECT_EQ(malloc_count, 1);
     EXPECT_EQ(passthrough_count, 1);
 }
+
+TEST(ChildMemory, TransferBelongsToEachArgumentAndSurvivesMailboxCopyAndMove) {
+    const Tensor tensor = make_wire_tensor(1, AddressSpace::HOST);
+    TaskArgs original;
+    original.add_tensor(tensor, TensorArgType::INPUT, TensorTransfer::NONE);
+    original.add_tensor(tensor, TensorArgType::INPUT, TensorTransfer::H2D);
+    original.add_scalar(42);
+    TaskArgs copy = original;
+    original.clear();
+    TaskArgs args = std::move(copy);
+    ASSERT_EQ(args.tensor_count(), 2);
+    std::vector<uint8_t> blob(task_args_blob_size(args));
+    write_blob(blob.data(), args);
+    const auto view = read_blob(blob.data(), blob.size());
+    EXPECT_EQ(view.transfer(0), TensorTransfer::NONE);
+    EXPECT_EQ(view.transfer(1), TensorTransfer::H2D);
+    EXPECT_EQ(view.tensors(0).buffer, view.tensors(1).buffer);
+    EXPECT_EQ(view.tensors(0)._pad[0], 0);
+    EXPECT_EQ(view.tensors(1)._pad[0], 0);
+    EXPECT_EQ(view.scalars[0], 42u);
+    blob[8 + 141] = 255;
+    EXPECT_THROW(view.transfer(0), std::invalid_argument);
+    args.clear();
+    args.add_tensor(tensor);
+    EXPECT_EQ(args.transfer(0), TensorTransfer::H2D);
+}
+
+TEST(ChildMemory, InvalidTransferDoesNotAppendAnArgumentAndLocationMutationIsRejected) {
+    TaskArgs args;
+    Tensor device = make_wire_tensor(1, AddressSpace::DEVICE);
+    EXPECT_THROW(args.add_tensor(device, TensorArgType::INPUT, TensorTransfer::H2D), std::invalid_argument);
+    EXPECT_THROW(args.add_tensor(device, TensorArgType::INPUT, TensorTransfer::D2H), std::invalid_argument);
+    EXPECT_EQ(args.tensor_count(), 0);
+    args.add_tensor(make_wire_tensor(2, AddressSpace::HOST));
+    args.tensor(0) = device;
+    EXPECT_THROW(validate_submit_args({args}), std::invalid_argument);
+}
+
+TEST(ChildMemory, ReusingAnOwnedViewAcrossGrowthPreservesEachRequest) {
+    TaskArgs args;
+    args.add_tensor(make_wire_tensor(1, AddressSpace::HOST));
+    for (int i = 1; i < 65; ++i) {
+        args.add_tensor(args.tensor(0), TensorArgType::INPUT, i % 2 ? TensorTransfer::NONE : TensorTransfer::H2D);
+    }
+    for (int i = 0; i < args.tensor_count(); ++i) {
+        EXPECT_EQ(args.tensor(i).buffer, args.tensor(0).buffer);
+        EXPECT_EQ(args.transfer(i), i % 2 ? TensorTransfer::NONE : TensorTransfer::H2D);
+    }
+}

@@ -387,3 +387,19 @@ TEST(RemoteWire, OrderedCommandLaneIsSingleFlight) {
     EXPECT_FALSE(lane.in_flight());
     EXPECT_EQ(lane.begin_command(), first + 1);
 }
+
+TEST(RemoteWire, RejectsTransferThatTheProtocolWouldLose) {
+    for (AddressSpace space : {AddressSpace::HOST, AddressSpace::DEVICE}) {
+        remote_l3::RemoteTaskArgsWire args;
+        Tensor arg = remote_arg_tensor();
+        arg.buffer.address_space = static_cast<uint8_t>(space);
+        args.tensors.push_back(arg);
+        args.transfers.push_back(legacy_tensor_transfer(space));
+        const auto encoded = remote_l3::encode_remote_task_args(args);
+        const auto decoded = remote_l3::decode_remote_task_args(encoded.data(), encoded.size());
+        ASSERT_EQ(decoded.tensors.size(), 1u);
+        EXPECT_EQ(decoded.tensors[0].buffer.address_space, static_cast<uint8_t>(space));
+        args.transfers[0] = space == AddressSpace::HOST ? TensorTransfer::NONE : TensorTransfer::H2D;
+        EXPECT_THROW((void)remote_l3::encode_remote_task_args(args), std::runtime_error);
+    }
+}

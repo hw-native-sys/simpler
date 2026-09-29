@@ -41,6 +41,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     CanonicalIdentity,
     DataType,
     Tensor,
+    TensorTransfer,
     read_args_from_blob,
 )
 
@@ -60,6 +61,7 @@ from .comm_endpoints import (
 __all__ = [
     "AccessMode",
     "AddressSpace",
+    "TensorTransfer",
     "BackendKind",
     "Buffer",
     "BufferCapability",
@@ -246,6 +248,7 @@ class Buffer:
         whole buffer as a contiguous view; pass explicit element strides for a strided view.
         ``byte_offset`` must be a multiple of the dtype size (checked at materialization).
         ``dtype`` accepts a ``DataType`` enum or its int value.
+        Transfer requests belong to ``TaskArgs.add_tensor(..., transfer=...)``.
         """
         return self.to_descriptor().tensor(shapes, dtype, strides, byte_offset)
 

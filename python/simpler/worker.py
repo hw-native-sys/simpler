@@ -98,6 +98,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     _read_control_copy_request,
     _region_vmm_granularity,
     _set_host_span_level_prefix,
+    _snapshot_local_task_args,
     _worker_host_mapped_region_ack_cleanup_error,
     _worker_host_mapped_region_import_onboard,
     _worker_host_mapped_region_import_sim,
@@ -2330,8 +2331,14 @@ def _reexport_args_from_mailbox(buf, worker: Worker) -> TaskArgs:
         ref = args.tensor(i)
         h_prime = worker._reexport(ref.buffer)
         out.add_tensor(
-            h_prime.tensor(shapes=ref.shapes, dtype=ref.dtype, strides=ref.strides, byte_offset=ref.byte_offset),
+            h_prime.tensor(
+                shapes=ref.shapes,
+                dtype=ref.dtype,
+                strides=ref.strides,
+                byte_offset=ref.byte_offset,
+            ),
             args.tag(i),
+            transfer=args.transfer(i),
         )
     for i in range(args.scalar_count()):
         out.add_scalar(args.scalar(i))
@@ -3699,6 +3706,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     chip_rank: int | None = None,
     launch_depth: int = 1,
     collect_across_runs: bool = False,
+    manage_workspace: bool = False,
 ) -> None:
     """Runs in forked child process. Loads host_runtime.so in own address space.
 
@@ -3708,6 +3716,14 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
 
     The main loop is delegated to ``_run_chip_main_loop`` — see its docstring
     for the TASK_READY / CONTROL_REQUEST / SHUTDOWN state machine.
+
+    ``manage_workspace`` gives this child's four workspace regions an owner, so
+    a superseded generation is released once its last consumer retires rather
+    than when its replacement is published. The parent decides it (see
+    ``Worker._chip_children_manage_workspace``) because whether this child's
+    close is one a caller can act on is a property of the parent's route, not
+    of anything reachable after the fork. A simulated backend resolves it away
+    inside ``ChipWorker.init``.
     """
     import traceback as _tb  # noqa: PLC0415
 
@@ -3724,6 +3740,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             prewarm_config=prewarm_config,
             enable_sdma=enable_sdma,
             collect_across_runs=collect_across_runs,
+            manage_workspace=manage_workspace,
         )
     except Exception as e:
         _tb.print_exc()
@@ -8309,6 +8326,27 @@ class Worker:
             )
         return budget
 
+    def _chip_children_manage_workspace(self) -> bool:
+        """Whether this Worker's forked chip children own their workspace regions.
+
+        True only for a level-3 Worker with ``device_ids`` that is the root of
+        its own startup epoch. ``_is_startup_root`` is that question already
+        answered: ``init()`` sets it from ``_startup_deadline is None``, which
+        is absent exactly when a caller drove ``init()`` directly, and present
+        for every Worker some other process started — a nested level-3 inside
+        an L4 next-level child, a remote session worker, an MPI group worker.
+
+        The distinction is about whose ``close()`` a refusal reaches. Those
+        descendants are closed by the loop that owns them while their parent is
+        already tearing down, so a child that fails its teardown there has
+        nobody to act on it; a directly-closed Worker reports it to its caller
+        through the reap it already performs.
+
+        Level is not tested separately: ``device_ids`` is refused above level 3
+        (:meth:`_init_hierarchical`) and no chip child is forked without it.
+        """
+        return bool(self._config.get("device_ids")) and self._is_startup_root
+
     def _check_workspace_live(self) -> None:
         """Refuse a protected teardown while workspace still has a drainable consumer.
 
@@ -8316,13 +8354,18 @@ class Worker:
         ``CleanupJournal.drive`` continues past a failing entry: an entry that
         merely sorts first would not stop the owner Buffers from being released.
 
-        Three outcomes, and the two failures are not the same. ``disabled`` means
-        no budget was ever latched, which is the default and protects nothing.
-        ``unavailable`` means one *was* latched and its accounting could not be
-        read — treating that as ``disabled`` would release the Buffers a live
-        consumer may still be reading, so it refuses instead. A context that
-        never published a block has no ownership fact to protect and is exempt
-        on that fact alone.
+        In-process level 2 only: this reads ``self._chip_worker``, and a Worker
+        whose chips are forked children has none. Those children own their own
+        regions and close them inside their own process (see
+        :meth:`_chip_children_manage_workspace`); no report crosses the fork.
+
+        Three outcomes, and the two failures are not the same. ``disabled``
+        means the four regions have no owner on this context, which protects
+        nothing. ``unavailable`` means they *are* owned and their accounting
+        could not be read — treating that as ``disabled`` would release the
+        Buffers a live consumer may still be reading, so it refuses instead. A
+        context that never published a block has no ownership fact to protect
+        and is exempt on that fact alone.
         """
         cw = self._chip_worker
         if cw is None:
@@ -8370,11 +8413,11 @@ class Worker:
             enable_sdma=bool(self._config.get("enable_sdma", False)),
             collect_across_runs=bool(self._config.get("collect_across_runs", False)),
             workspace_budget_bytes=workspace_budget,
-            # The one route whose teardown can be fenced before the public
-            # Buffer release, so the one route whose workspace lifetimes are
-            # managed by default. Not a public option: a forked chip child
-            # reaches ChipWorker.init without it and keeps its existing path
-            # until L3 has a cross-process close proof of its own.
+            # Not a public option. This route additionally fences its teardown
+            # on the live-consumer check below, which a forked chip child has
+            # no equivalent of; the child manages the same four regions and
+            # closes them inside its own process instead
+            # (_chip_children_manage_workspace).
             manage_workspace=True,
         )
 
@@ -8660,6 +8703,9 @@ class Worker:
                             chip_rank=idx,
                             launch_depth=self._launch_depth,
                             collect_across_runs=bool(self._config.get("collect_across_runs", False)),
+                            # Read from the state the fork copied, so every
+                            # child of one Worker resolves it the same way.
+                            manage_workspace=self._chip_children_manage_workspace(),
                         )
                     except BaseException as e:  # noqa: BLE001
                         import traceback as _tb  # noqa: PLC0415
@@ -11122,9 +11168,9 @@ class Worker:
     def _child_prov_check_dispatch_locked(self, args: Any, target_worker_id: int, *, api: str) -> None:
         """Validate device args against the worker they are dispatched to.
 
-        The caller holds ``_child_prov_lock`` and keeps holding it through the native submit, which
-        is what makes the check and the dispatch one transaction; there is deliberately no
-        lock-taking wrapper, because one would return with the authorization already expired.
+        The caller holds ``_child_prov_lock`` until native submission or an accepted-use
+        reservation is published. L2 publishes under the chip's free lock and keeps that
+        reservation through finalization; L3 holds the provenance lock through native submit.
 
         The identity carries which worker owns the allocation, so "wrong worker" is an equality on
         the registered handle rather than a lookup keyed by the pair. The descriptor sent to native
@@ -11305,6 +11351,9 @@ class Worker:
         else:
             with self._submit_mu.exclusive():
                 scan_hierarchical()
+        self._refuse_l2_free_while_in_flight(identity)
+
+    def _refuse_l2_free_while_in_flight(self, identity: CanonicalIdentity) -> None:
         with self._registry_lock:
             for touched in self._chip_run_touched_identities.values():
                 if identity in touched:
@@ -11332,6 +11381,10 @@ class Worker:
             self._check_chip_worker_id(wid)
         with self._operation_lease("free"), self._device_control_admission("free"):
             with self._child_prov_worker_lock(wid):
+                # L2 submission publishes its accepted identities under this same chip lock.
+                # The earlier fast refusal may precede that publication.
+                if self.level == 2:
+                    self._refuse_l2_free_while_in_flight(handle.identity)
                 # Safety-first commit barrier: revoke provenance BEFORE the native free so an async unwind
                 # after a successful free can never leave a freed address live. The revoke commits under
                 # ``_child_prov_lock``; the native call runs under this worker's lock only, so a free on
@@ -11819,10 +11872,17 @@ class Worker:
         ``_release_all_buffers`` calling ``Buffer.close()`` directly.
 
         The L2 check is independent (a separate run-id namespace with no callback to serialize
-        against — ``_chip_run_touched_identities`` is written atomically alongside ``_chip_runs``
-        under ``_registry_lock`` instead, see ``_submit_l2_locked``), so the two checks run
-        sequentially rather than under one shared lock. Neither is checked once ``buffer`` is already
-        closed, matching ``Buffer.close()``'s own idempotency.
+        against — ``_chip_run_touched_identities`` is published under ``_registry_lock`` when the
+        submission is accepted, before it materializes anything, see ``_submit_l2_locked``), so the
+        two checks run sequentially rather than under one shared lock. Neither is checked once
+        ``buffer`` is already closed, matching ``Buffer.close()``'s own idempotency.
+
+        Unlike ``Worker.free``, this L2 check is a sample rather than a fence: it reads the set,
+        releases ``_registry_lock``, and only then closes the backing, so a submission accepted in
+        between still maps an identity this call is about to unlink. ``free`` closes that window by
+        rechecking under the chip lock a direct L2 submission publishes beneath; there is no
+        equivalent lock spanning a host backing's close, and adding one is P2 lifecycle work
+        (``docs/buffer-abi.md``).
 
         The entry survives a failed close, so ``_release_all_buffers`` still reports the leak at
         close() rather than losing it here — the import-cache broadcast only fires once close() has
@@ -12196,16 +12256,25 @@ class Worker:
         completion fence through :meth:`RunHandle.wait`.
         """
         assert self._chip_worker is not None
-        touched = self._identities_in_args(args) if args is not None else set()
-        # Publish touched_identities BEFORE materializing, not after: release_buffer() reads this
-        # dict to decide whether a Buffer is still in flight, so if it were only written after
-        # _materialize_l2_args() (which populates self._chip_import_registry, the very cache
-        # release_buffer() pops), a release racing that window would see no entry for a run that
-        # has already cached the mapping it is about to pop out from under it.
-        with self._registry_lock:
-            self._chip_run_seq += 1
-            run_id = self._chip_run_seq
-            self._chip_run_touched_identities[run_id] = touched
+        args = _snapshot_local_task_args(TaskArgs() if args is None else args)
+        touched = self._identities_in_args(args)
+        # Device identity validation and accepted-use publication share free's chip lock.
+        # After publication, the touched set refuses free through run finalization, including
+        # materialization and a native submit that has not returned yet.
+        #
+        # Publication also precedes materialization, which is what `release_buffer` reads this
+        # dict for: `_materialize_l2_args` populates `self._chip_import_registry`, the very cache
+        # `release_buffer` pops. Published any later, a release racing that window would see no
+        # entry for a run that has already cached the mapping it is about to drop.
+        with contextlib.ExitStack() as reservation:
+            if self._names_device_allocation(args):
+                reservation.enter_context(self._child_prov_worker_lock(0))
+                reservation.enter_context(self._child_prov_lock)
+                self._child_prov_check_dispatch_locked(args, 0, api="submit")
+            with self._registry_lock:
+                self._chip_run_seq += 1
+                run_id = self._chip_run_seq
+                self._chip_run_touched_identities[run_id] = touched
         try:
             chip_args = self._materialize_l2_args(args)
             chip_run = self._chip_worker._impl._submit_chip_run_direct(callable_id, chip_args, cfg)
@@ -12215,9 +12284,8 @@ class Worker:
             raise
         with self._registry_lock:
             self._chip_runs[run_id] = chip_run
-        # chip_args is kept alive by the handle: the lane copies the args into
-        # its own storage, but the keepalive also pins the buffers the resolved
-        # descriptors point at for as long as the run can still read them.
+        # The handle owns this invocation's argument values. Storage release is fenced by
+        # the touched-identity registration until finalization, not by descriptor copies.
         return RunHandle(self, run_id, (callable_id, args, cfg, chip_args))
 
     def _chip_run_for(self, run_id: int) -> Any | None:

@@ -221,12 +221,27 @@ before the predecessor's result is read:
 **The Pending reading is the whole proof, and it is one-sided.** A read that
 waited for the successor could not have produced it, so an observed Pending
 settles the question. `Complete` does not settle the converse — the successor may
-simply have finished on its own — and no recorded quantity separates those two
+simply have finished on its own — and the drain does not separate those two
 causes: a drain costs time on an already-finished run too, which is exactly what
 the control arm's 17 µs measures. The drain column is a cross-arm comparison, not
-a per-sample discriminator. `tests/st/run_retention` therefore treats a `Complete`
-attempt as inconclusive and retries, and fails only when no attempt ever observes
-the overlap.
+a per-sample discriminator.
+
+What does separate them is the read's own cost, measured twice on the same box.
+A read that waits for the successor absorbs that successor's remaining device
+work, so it cannot come out near the same read with nothing in flight — and the
+successor's residency is the arm's to set, since the workload is a task count
+passed as an argument rather than a constant compiled into the orchestration.
+`tests/st/run_retention` therefore treats a `Complete` attempt as inconclusive,
+escalates the successor's task count so the next attempt has more window, and
+reports a `Complete` reached by a read that cost several times the unblocked
+baseline as the read-ordering regression it is. It fails as "never observed"
+only when the escalation is exhausted with every read at its ordinary cost.
+
+The escalation's ceiling is half the default 16384-slot ring task window. A
+single scope cannot fill that window — fanout references are released only at
+scope_end, so a scope reaching the cap reports `SCOPE_DEADLOCK` instead of
+running; measured on `tensormap_and_ringbuffer`, which admits 12288 tasks in one
+scope and refuses 16384.
 
 So:
 

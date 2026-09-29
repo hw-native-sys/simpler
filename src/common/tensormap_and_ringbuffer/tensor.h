@@ -419,6 +419,8 @@ struct alignas(64) Tensor {
     }
 
     /// The boundary form of this tensor: geometry and resolved address only.
+    // This conversion exports geometry and address only; it does not reconstruct a
+    // submission request. A new invocation supplies its own transfer policy.
     ChipTensor to_boundary() const {
         ChipTensor arg{};
         arg.buffer = buffer;

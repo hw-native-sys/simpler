@@ -1727,4 +1727,23 @@ private:
     void merge_epoch_store(size_t slot);
     RunExport seal_epoch_store(size_t slot);
     bool run_is_tombstoned(uint64_t run_epoch) const;
+
+    /**
+     * Enter `run_epoch` in the late-buffer classification ring.
+     *
+     * Entered before admission is withdrawn, which is what makes
+     * `late_after_seal` and `unknown_epoch` exhaustive for a closed epoch: a
+     * shard reaches the ring only when `slot_for` resolved the epoch to
+     * nothing, and that cannot happen until it has adopted a view taken after
+     * the `Closing` store this precedes. The relaxed store is published by that
+     * release store, so a shard whose acquire sees `Closing` sees the tombstone
+     * too. Ordering it the other way — after the reference-release ack — leaves
+     * a window in which a shard has already dropped the epoch from its view
+     * while the ring is still empty, and an ack does not stop that shard from
+     * popping a buffer that was queued before it.
+     *
+     * A tombstone for a still-admitting epoch is unreachable rather than wrong,
+     * since `slot_for` is consulted first and answers for it.
+     */
+    void record_run_tombstone(uint64_t run_epoch);
 };
