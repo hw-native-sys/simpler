@@ -66,17 +66,29 @@ TEST(CallerDeviceBuffers, AnInteriorSpanResolvesToItsContainingAllocation) {
     EXPECT_FALSE(buffers.resolve(kBase, 0, &allocation));
 }
 
-TEST(CallerDeviceBuffers, ABorrowIsAllOrNothing) {
-    CallerDeviceBuffers buffers;
-    buffers.record(at(kBase), kSize);
-    const CallerDeviceBuffers::Span spans[] = {span(kBase, 0x10), span(kBase + 0x100000, 0x10)};
-
-    // One unprovable span leaves no borrow at all: a caller mixing a provable buffer with an
-    // unprovable one gets the refusal rather than half a reference.
-    EXPECT_FALSE(buffers.borrow(kRunA, spans, 2));
-    EXPECT_EQ(buffers.borrow_count(), 0u);
-    EXPECT_FALSE(buffers.borrowed(at(kBase)));
-    EXPECT_TRUE(buffers.forget_if_unborrowed(at(kBase)));
+TEST(CallerDeviceBuffers, UnknownSpansRefuseJoiningButRetainKnownAllocations) {
+    for (bool unknown_first : {false, true}) {
+        for (bool keep : {false, true}) {
+            SCOPED_TRACE(unknown_first);
+            SCOPED_TRACE(keep);
+            CallerDeviceBuffers buffers;
+            buffers.record(at(kBase), kSize);
+            const auto known = span(kBase, 0x10);
+            const auto unknown = span(kBase + 0x100000, 0x10);
+            const CallerDeviceBuffers::Span spans[] = {
+                unknown_first ? unknown : known, unknown_first ? known : unknown
+            };
+            EXPECT_FALSE(buffers.borrow(kRunA, spans, 2));
+            EXPECT_EQ(buffers.borrow_count(), 1u);
+            EXPECT_FALSE(buffers.forget_if_unborrowed(at(kBase)));
+            // Only the external OUTPUT is declared; the owned INPUT needs its borrow.
+            size_t unresolved = 0;
+            EXPECT_TRUE(buffers.declare_writes(kRunA, &unknown, 1, &unresolved));
+            EXPECT_EQ(unresolved, 1u);
+            buffers.release(kRunA, keep);
+            EXPECT_EQ(buffers.forget_if_unborrowed(at(kBase)), !keep);
+        }
+    }
 }
 
 TEST(CallerDeviceBuffers, AReleaseIsRefusedWhileARunHoldsTheAllocation) {
@@ -127,6 +139,24 @@ TEST(CallerDeviceBuffers, ReBorrowingUnderOneIdentityReplacesThatIdentitysSet) {
     EXPECT_FALSE(buffers.borrowed(at(kBase)));
     EXPECT_TRUE(buffers.borrowed(at(kBase + kSize)));
     EXPECT_EQ(buffers.borrow_count(), 1u);
+}
+
+TEST(CallerDeviceBuffers, IncompleteReBorrowReplacesOrClearsThePreviousSet) {
+    for (bool has_known_span : {false, true}) {
+        SCOPED_TRACE(has_known_span);
+        CallerDeviceBuffers buffers;
+        buffers.record(at(kBase), kSize);
+        buffers.record(at(kBase + kSize), kSize);
+        const auto first = span(kBase, kSize);
+        ASSERT_TRUE(buffers.borrow(kRunA, &first, 1));
+        const CallerDeviceBuffers::Span replacement[] = {span(kBase + 0x100000, kSize), span(kBase + kSize, kSize)};
+        EXPECT_FALSE(buffers.borrow(kRunA, replacement, has_known_span ? 2 : 1));
+        EXPECT_TRUE(buffers.forget_if_unborrowed(at(kBase)));
+        EXPECT_EQ(buffers.borrowed(at(kBase + kSize)), has_known_span);
+        EXPECT_EQ(buffers.borrow_count(), has_known_span ? 1u : 0u);
+        buffers.release(kRunA, /*keep=*/false);
+        EXPECT_TRUE(buffers.forget_if_unborrowed(at(kBase + kSize)));
+    }
 }
 
 TEST(CallerDeviceBuffers, AnUnprovenLastConsumerRetainsTheAllocationForGood) {

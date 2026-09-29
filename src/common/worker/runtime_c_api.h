@@ -529,12 +529,11 @@ typedef struct CallerBufferSpan {
 /**
  * Take `borrow_id`'s reference on the caller allocations covering `spans`.
  *
- * All or nothing: a span naming no recorded caller allocation leaves no reference at all, so an
- * address whose owner cannot be proven is refused rather than half-held. Re-borrowing under one id
- * replaces that id's set, which is what a re-prepared run needs.
+ * Every known allocation is retained, including when other spans are external. Re-borrowing
+ * replaces this id's set. The caller must release the id even after incomplete coverage.
  *
- * @return 0 when every span resolved and the reference is held, PTO_RUNTIME_ERR_INVALID_STATE when
- *         one did not.
+ * @return 0 when every span resolved; PTO_RUNTIME_ERR_INVALID_STATE when any did not, so joined
+ *         admission stays refused while references to known allocations remain held.
  */
 int device_borrow_caller_buffers_ctx(
     DeviceContextHandle ctx, const CallerBufferSpan *spans, uint32_t count, uint64_t borrow_id

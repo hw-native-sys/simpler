@@ -48,14 +48,15 @@ struct ChipRunState {
     bool joined_launch_declined{false};
     // Every device span this run names is covered by a caller allocation of
     // this device context, and this run holds the borrow over each. Set once at
-    // admission and cleared when the borrow is discharged, so it answers
-    // "may this run join".
+    // admission and cleared at release, so it answers "may this run join".
+    // False can still mean partial lifetime references; caller_references_live
+    // tracks the release obligation independently of full coverage.
     bool device_spans_borrowed{false};
     // This run's identity may still name something in the caller-buffer table: the borrow it took
     // at admission, or the declaration of what it produces that its own bind made later. Set for
     // every admitted run rather than only for one that borrowed, because the declaration is the
-    // runtime's to make and a run whose all-or-nothing borrow was refused can still have made
-    // one. Cleared when the release discharges both.
+    // runtime's to make. Incomplete span coverage can also leave a partial borrow that still
+    // needs releasing. Cleared when the release discharges both.
     bool caller_references_live{false};
     std::exception_ptr error;
     std::exception_ptr poison_error;
@@ -194,8 +195,8 @@ struct ChipRunLaneState {
      *
      * No direction is recorded — `ChipStorageTaskArgs` carries no tag — so the borrow says only
      * that this run may reach those bytes, which is what a release has to respect either way. A
-     * run whose spans do not all resolve holds none and stays on the serial path, where its
-     * address is the caller's for longer than the run.
+     * run whose spans do not all resolve still holds the known allocations and stays on the
+     * serial path. Unknown external storage retains the caller's lifetime obligation.
      *
      * The span is the tensor's `nbytes()`, while the runtime's bind names `buffer.size` for the
      * same tensor. Both resolve to the containing allocation, so they agree on every question
@@ -230,7 +231,7 @@ struct ChipRunLaneState {
      * Both of them: the borrow over the allocations its arguments name, and the declaration of
      * which of them it produces that its own bind made. One call because they share this run's
      * identity and its lifetime — and it runs for every admitted run, not only one that borrowed,
-     * since a run whose borrow was refused can still have declared.
+     * since incomplete coverage can leave partial borrows as well as declarations.
      *
      * `proven_done` is whether the run's own finalize reported success. That call drains its
      * device work, copies its outputs back and releases its bindings, so success is what
@@ -337,10 +338,9 @@ struct ChipRunLaneState {
      * caller's. What brings it inside the scope is the borrow: a run holds one
      * over the caller allocation covering every device span it names, so the
      * caller's release is refused for as long as the device may still reach
-     * those bytes. `borrowed` is therefore the question — a run whose spans did
-     * not all resolve to a caller allocation of this device context holds no
-     * borrow, and stays on the serial path where its address outlives it by
-     * construction.
+     * those bytes. Joined launch requires full coverage: unresolved spans keep
+     * the run on the serial path, with their lifetime guaranteed by the caller.
+     * Known allocations remain borrowed even when coverage is incomplete.
      */
     static bool joinable_shape(const ChipRunState &run) {
         for (int32_t i = 0; i < run.args.tensor_count(); ++i) {

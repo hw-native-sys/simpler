@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "call_config.h"
+#include "host/caller_device_buffers.h"
 #include "pipeline_slot_pool.h"
 #include "runtime_c_api.h"
 #include "task_args.h"
@@ -429,7 +430,7 @@ TEST(ChipRunLaneCallerBuffersTest, ABorrowedDeviceArgumentReachesTheDeviceEarly)
 // A predecessor whose device span has no provable owner carries no successor *preparation*
 // either, not just no joined launch. The successor's bind runs its own host graph build, which can
 // read a device argument's bytes; the only thing that keeps it off bytes the run ahead has not
-// produced is that run's declaration, and a run holding no borrow proved no span to declare.
+// produced is that run's declaration; an external span has no tracked write dependency.
 TEST(ChipRunLaneCallerBuffersTest, AnUnprovableFrontCarriesNoConcurrentPreparation) {
     ChipWorker worker;
     prime_worker(worker);
@@ -544,6 +545,69 @@ TEST(ChipRunLaneCallerBuffersTest, AnUnprovenLastConsumerKeepsTheReference) {
     g_finalize_rc = 0;
     EXPECT_THROW(lane.close(), std::runtime_error);
     worker.finalize();
+}
+
+// The lane, borrow table and guarded free are real; only device execution is stubbed.
+TEST(ChipRunLaneCallerBuffersTest, MixedExternalOutputCannotDropOwnedInputOnUnprovenCompletion) {
+    for (bool external_output : {false, true}) {
+        for (bool completion_unproven : {false, true}) {
+            SCOPED_TRACE(external_output);
+            SCOPED_TRACE(completion_unproven);
+            CallerDeviceBuffers buffers;
+            buffers.record(reinterpret_cast<void *>(0x2000), 1);
+            if (!external_output) buffers.record(reinterpret_cast<void *>(0x8000), 1);
+            ChipWorker worker;
+            prime_worker(worker);
+            worker.device_ctx_ = &buffers;
+            worker.device_borrow_caller_buffers_ctx_fn_ = [](void *ctx, const CallerBufferSpan *spans, uint32_t count,
+                                                             uint64_t id) {
+                std::vector<CallerDeviceBuffers::Span> held;
+                for (uint32_t i = 0; i < count; ++i)
+                    held.push_back({spans[i].addr, spans[i].bytes});
+                return static_cast<CallerDeviceBuffers *>(ctx)->borrow(id, held.data(), held.size()) ?
+                           0 :
+                           PTO_RUNTIME_ERR_INVALID_STATE;
+            };
+            worker.device_release_caller_buffers_ctx_fn_ = [](void *ctx, uint64_t id, int keep) {
+                static_cast<CallerDeviceBuffers *>(ctx)->release(id, keep != 0);
+            };
+            worker.device_free_caller_buffer_ctx_fn_ = [](void *ctx, void *ptr) {
+                return static_cast<CallerDeviceBuffers *>(ctx)->forget_if_unborrowed(ptr) ?
+                           0 :
+                           PTO_RUNTIME_ERR_INVALID_STATE;
+            };
+            ChipRunLane lane(worker);
+            auto args = device_args();
+            auto output = args.tensor(0);
+            output.buffer.addr = 0x8000;
+            args.add_tensor(output);
+            ChipRun run = submit(lane, 101, 0, true, args);
+            ASSERT_TRUE(run.launched());
+            ChipRun successor;
+            if (external_output) {
+                successor = submit(lane, 102, 1, false, host_args());
+                successor.activate();
+                EXPECT_FALSE(successor.launched());
+                EXPECT_EQ(g_events, (Events{"prepare0", "launch0"}));
+            }
+            // HBG declares only its output; the owned input is never a write dependency.
+            const CallerDeviceBuffers::Span write[] = {{0x8000, 1}};
+            ASSERT_TRUE(buffers.declare_writes(1, write, 1));
+            EXPECT_THROW(worker.free(0x2000), std::runtime_error);
+            g_finalize_rc = completion_unproven ? -5 : 0;
+            g_complete[0] = true;
+            EXPECT_TRUE(run.done());
+            if (completion_unproven) {
+                EXPECT_THROW(worker.free(0x2000), std::runtime_error);
+                EXPECT_THROW(lane.close(), std::runtime_error);
+            } else {
+                EXPECT_NO_THROW(worker.free(0x2000));
+                EXPECT_NO_THROW(lane.close());
+            }
+            worker.device_ctx_ = nullptr;
+            worker.finalize();
+        }
+    }
 }
 
 }  // namespace

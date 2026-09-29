@@ -133,29 +133,32 @@ public:
     /**
      * Take `identity`'s borrow over every span's containing allocation.
      *
-     * All or nothing: a span that does not resolve leaves no borrow at all, so a caller that mixes
-     * a provable buffer with an unprovable one gets the refusal rather than half a reference. The
-     * previous borrow for this identity is dropped first — a re-prepared run names its spans again,
-     * and keeping both sets would leak a reference the run no longer has.
+     * Known allocations stay borrowed even when another span is external. The result reports
+     * full coverage for joined admission, not whether any lifetime references were acquired.
+     * Re-borrowing replaces this identity's set only after the new set has been collected.
      *
-     * @return true when every span resolved and the borrow is held.
+     * @return true when every span resolved; false still requires release(identity, keep).
      */
     bool borrow(uint64_t identity, const Span *spans, std::size_t count) {
         if (identity == 0) return false;
         std::scoped_lock lk(mu_);
         std::vector<uint64_t> taken;
         taken.reserve(count);
+        bool all_resolved = true;
         for (std::size_t i = 0; i < count; ++i) {
             Allocation allocation;
-            if (!resolve_locked(spans[i].addr, spans[i].bytes, &allocation)) return false;
-            taken.push_back(allocation.base);
+            if (resolve_locked(spans[i].addr, spans[i].bytes, &allocation)) {
+                taken.push_back(allocation.base);
+            } else {
+                all_resolved = false;
+            }
         }
         if (taken.empty()) {
             borrows_.erase(identity);
-            return true;
+        } else {
+            borrows_[identity] = std::move(taken);
         }
-        borrows_[identity] = std::move(taken);
-        return true;
+        return all_resolved;
     }
 
     /**
@@ -163,8 +166,8 @@ public:
      *
      * Both facts are discharged, and independently: the borrow over the allocations this run
      * named, and its declaration of which of them it produces. A run can hold either without the
-     * other — an all-or-nothing borrow may have been refused while the declaration over one
-     * resolved span stood — and a slot holds exactly one run at a time, so a later run under this
+     * other — a declaration may be recorded without an admission borrow — and a slot holds
+     * exactly one run at a time, so a later run under this
      * identity must inherit neither.
      *
      * `keep` is for a run whose last consumer could not be proven finished. It does not merely
@@ -190,7 +193,7 @@ public:
                 // Both marks, for the same reason: a consumer that may still be writing these
                 // bytes may still be reading them too, so the pages cannot go back either. The
                 // borrow usually said that already — this reaches the allocation a run declared
-                // while holding no borrow, which is what a refused all-or-nothing borrow leaves.
+                // through a declaration even if no admission borrow was taken.
                 mark_write_unproven(base);
                 mark_release_refused(base);
             }

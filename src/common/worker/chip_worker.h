@@ -277,9 +277,9 @@ public:
     };
 
     /// Take `borrow_id`'s reference on the caller allocations covering `spans`,
-    /// which is also the proof that this context is their owner: a span naming
-    /// no caller allocation of this device context leaves no reference at all
-    /// and answers false. Held until `release_caller_device_borrow`.
+    /// retaining every known allocation even if another span is external.
+    /// True proves every span's owner; false refuses joined admission but can
+    /// still hold references until `release_caller_device_borrow`.
     ///
     /// The three `device_*_caller_buffer(s)_ctx` entries are mandatory C ABI,
     /// like the rest of the `device_*_ctx` family: `init` resolves them with
@@ -287,7 +287,7 @@ public:
     /// always has them. (The two `HostApiOps` entries this capability adds are
     /// the optional half — those are null-guarded, and a platform publishing
     /// neither behaves as it did.) False therefore means what the paragraph
-    /// above says — no span named a caller allocation of this context — or that
+    /// above says — at least one span named no caller allocation of this context — or that
     /// this worker holds no device context at all, which is only so before
     /// `init` and after `finalize`.
     bool borrow_caller_device_spans(uint64_t borrow_id, const CallerDeviceSpan *spans, size_t count);
