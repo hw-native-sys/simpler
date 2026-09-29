@@ -241,7 +241,7 @@ class Buffer:
         strides: Iterable[int] | None = None,
         byte_offset: int = 0,
     ) -> Tensor:
-        """Compatibility forwarding to ``Tensor(self, shape=shapes, dtype=dtype, ...)``.
+        """Compatibility forwarding to ``Tensor(self, shapes=shapes, dtype=dtype, ...)``.
 
         ``shapes`` and ``strides`` are each consumed once, so any iterable of ints will do.
         ``strides`` default to contiguous (row-major) — ``buffer.tensor(shape, dtype)`` names the
@@ -250,7 +250,7 @@ class Buffer:
         ``dtype`` accepts a ``DataType`` enum or its int value.
         Transfer requests belong to ``TaskArgs.add_tensor(..., transfer=...)``.
         """
-        return Tensor(self, shape=shapes, dtype=dtype, strides=strides, byte_offset=byte_offset)
+        return Tensor(self, shapes=shapes, dtype=dtype, strides=strides, byte_offset=byte_offset)
 
     def close(self) -> None:
         """Release the backing. The owner unlinks it, so a later consumer map fails rather than

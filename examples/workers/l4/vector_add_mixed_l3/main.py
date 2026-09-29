@@ -28,6 +28,7 @@ from simpler.task_interface import (
     RemoteBufferHandle,
     RemoteTensorRef,
     TaskArgs,
+    Tensor,
     TensorArgType,
 )
 from simpler.worker import RemoteCallable, RemoteWorkerSpec, Worker
@@ -197,7 +198,7 @@ def _make_local_group(
         _fill_array(view, value)
         views.append(view)
         tag = TensorArgType.OUTPUT_EXISTING if index in (2, 5) else TensorArgType.INPUT
-        args.add_tensor(handle.tensor(shapes=(ELEMENTS,), dtype=DataType.FLOAT32), tag)
+        args.add_tensor(Tensor(handle, shapes=(ELEMENTS,), dtype=DataType.FLOAT32), tag)
     return (
         views,
         args,

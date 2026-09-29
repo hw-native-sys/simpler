@@ -27,6 +27,7 @@ from simpler.task_interface import (
     DataType,
     GlobalCommDomainHandle,
     TaskArgs,
+    Tensor,
     TensorArgType,
 )
 from simpler.worker import RemoteCallable, RemoteWorkerSpec, Worker
@@ -56,11 +57,11 @@ def _submit_tload_task(orch, chip_handle: CallableHandle, args: TaskArgs, cfg: C
 
     chip_args = TaskArgs()
     chip_args.add_tensor(
-        context.buffers["input"].tensor((COUNT,), DataType.FLOAT32),
+        Tensor(context.buffers["input"], shapes=(COUNT,), dtype=DataType.FLOAT32),
         TensorArgType.INPUT,
     )
     chip_args.add_tensor(
-        context.buffers["result"].tensor((COUNT,), DataType.FLOAT32),
+        Tensor(context.buffers["result"], shapes=(COUNT,), dtype=DataType.FLOAT32),
         TensorArgType.OUTPUT_EXISTING,
     )
     chip_args.add_scalar(context.domain_size)

@@ -29,7 +29,7 @@ forget it on.
 | Type | What it is | Where it lives |
 | ---- | ---------- | -------------- |
 | **`Buffer`** | An owned backing (POSIX shm / fork-COW / device malloc) with a canonical identity + lifecycle. Stays with the Worker that created it. | owner side (L3+) |
-| **`Tensor`** | A **self-describing task argument**: the full buffer descriptor embedded + a strided view `(byte_offset, shapes, strides, dtype)`. The wire element of `TaskArgs`. Carries no materialized address. | `simpler.buffer`, re-exported from `simpler.task_interface` |
+| **`Tensor`** | A **self-describing task argument**: the full buffer descriptor embedded + a strided view `(byte_offset, shapes, strides, dtype)`. The wire element of `TaskArgs`. Carries no materialized address. | `simpler.task_interface` (public import) |
 | **`ChipTensor`** | A task argument as it arrives at the chip runtime: a resolved address plus a strided view, and nothing else. Exists **only** at the L2 device-runtime boundary. | L2 leaf |
 | **`simpler::{hbg,tmr}::Tensor`** | One runtime's working form — a `ChipTensor`'s geometry plus what that runtime decided about it (producing task, overlap version, dependency treatment, derived caches). `Runtime::set_orch_args` adopts each argument into it, on the host. | inside one runtime |
 
@@ -114,7 +114,7 @@ and output copy-back; H2D does not mean every argument is copied in. Buffer iden
 import grants and `TensorArgType` access checks are unchanged.
 
 ```python
-view = Tensor(buffer, shape=(16,), dtype=DataType.FLOAT32)
+view = Tensor(buffer, shapes=(16,), dtype=DataType.FLOAT32)
 args.add_tensor(view, transfer=TensorTransfer.NONE)
 args.add_tensor(view, transfer=TensorTransfer.H2D)
 ```
@@ -198,7 +198,7 @@ behaves differently — so the mismatch surfaces where it is used.
 
 **So the split costs the user nothing to know.** You name a `Tensor`, submit it,
 and the chip's C++ orchestration receives it resolved. Build the view with
-`Tensor(buffer, shape=shapes, dtype=dtype)` and submit it with
+`Tensor(buffer, shapes=shapes, dtype=dtype)` and submit it with
 `args.add_tensor(t, tag)`. Resolving the address in between is the framework's
 job, and keeping the two forms as separate types is what makes that boundary a
 type change rather than a silently wrong address.
@@ -221,14 +221,14 @@ destination), and a tensor over it must be dispatched only to that worker.
 
 ## Naming a view
 
-`Tensor(buffer, shape=..., dtype=...)` names a view over the backing:
+`Tensor(buffer, shapes=..., dtype=...)` names a view over the backing:
 
 ```python
-from simpler.buffer import Tensor
+from simpler.task_interface import Tensor
 
-v = Tensor(h, shape=(M, N), dtype=dtype)                     # contiguous
-v = Tensor(h, shape=(N, M), dtype=dtype, strides=(1, M))     # transposed
-v = Tensor(h, shape=(M, K), dtype=dtype, byte_offset=off)    # sub-region
+v = Tensor(h, shapes=(M, N), dtype=dtype)                     # contiguous
+v = Tensor(h, shapes=(N, M), dtype=dtype, strides=(1, M))     # transposed
+v = Tensor(h, shapes=(M, K), dtype=dtype, byte_offset=off)    # sub-region
 ```
 
 Construction copies the descriptor and validates the view; it neither allocates
@@ -250,8 +250,8 @@ dtype size.
 
 ```python
 ta = TaskArgs()
-ta.add_tensor(Tensor(a_h, shape=(SIZE,), dtype=DataType.FLOAT32), TensorArgType.INPUT)
-ta.add_tensor(Tensor(out_h, shape=(SIZE,), dtype=DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
+ta.add_tensor(Tensor(a_h, shapes=(SIZE,), dtype=DataType.FLOAT32), TensorArgType.INPUT)
+ta.add_tensor(Tensor(out_h, shapes=(SIZE,), dtype=DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
 orch.submit_next_level(chip_handle, ta, cfg, worker=0)
 ```
 

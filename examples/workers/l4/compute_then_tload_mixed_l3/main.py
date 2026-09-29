@@ -27,6 +27,7 @@ from simpler.task_interface import (
     DataType,
     GlobalCommDomainHandle,
     TaskArgs,
+    Tensor,
     TensorArgType,
 )
 from simpler.worker import RemoteCallable, RemoteWorkerSpec, Worker
@@ -52,7 +53,7 @@ def _digest_from_scalars(args: TaskArgs, start: int) -> bytes:
 
 
 def _window_tensor(context, buffer_name: str):
-    return context.buffers[buffer_name].tensor((COUNT,), DataType.FLOAT32)
+    return Tensor(context.buffers[buffer_name], shapes=(COUNT,), dtype=DataType.FLOAT32)
 
 
 def _submit_compute_task(orch, chip_handle: CallableHandle, args: TaskArgs, cfg: CallConfig) -> TaskArgs:

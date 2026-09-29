@@ -2420,19 +2420,27 @@ NB_MODULE(_task_interface, m) {
 
         .def(
             "__init__",
-            [](Tensor *self, nb::object buffer, nb::object shape, nb::object dtype, nb::object strides,
-               uint64_t byte_offset) {
+            [buffer_type_ref = std::make_shared<nb::object>()](
+                Tensor *self, nb::object buffer, nb::object shapes, nb::object dtype, nb::object strides,
+                uint64_t byte_offset
+            ) {
                 if (!nb::isinstance<BufferDescriptor>(buffer)) {
-                    const nb::object buffer_type = nb::module_::import_("simpler.buffer").attr("Buffer");
+                    // simpler.buffer imports this extension; resolving Buffer during module initialization cycles.
+                    // The callable owns only a weak reference: Buffer's module also references Tensor.
+                    nb::object buffer_type = *buffer_type_ref ? (*buffer_type_ref)() : nb::none();
+                    if (buffer_type.is_none()) {
+                        buffer_type = nb::module_::import_("simpler.buffer").attr("Buffer");
+                        *buffer_type_ref = nb::weakref(buffer_type);
+                    }
                     if (!nb::isinstance(buffer, buffer_type)) {
                         throw nb::type_error("Tensor requires a Buffer or BufferDescriptor");
                     }
                     buffer = buffer.attr("to_descriptor")();
                 }
                 new (self)
-                    Tensor(make_tensor_view(nb::cast<BufferDescriptor>(buffer), shape, dtype, strides, byte_offset));
+                    Tensor(make_tensor_view(nb::cast<BufferDescriptor>(buffer), shapes, dtype, strides, byte_offset));
             },
-            nb::arg("buffer"), nb::kw_only(), nb::arg("shape"), nb::arg("dtype"), nb::arg("strides") = nb::none(),
+            nb::arg("buffer"), nb::kw_only(), nb::arg("shapes"), nb::arg("dtype"), nb::arg("strides") = nb::none(),
             nb::arg("byte_offset") = 0,
             "A validated view of a Buffer. Construction copies its descriptor without accessing storage."
         )

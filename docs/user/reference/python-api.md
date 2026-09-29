@@ -17,7 +17,7 @@ stays cheap and does not require the `_task_interface` extension.
 from simpler import Worker, trace     # or: from simpler.worker import Worker
 from simpler.task_interface import (
     ArgDirection, CallConfig, ChipCallable, CoreCallable,
-    DataType, TaskArgs, TaskHandle, TensorArgType,
+    DataType, TaskArgs, TaskHandle, Tensor, TensorArgType,
 )
 from simpler_setup import KernelCompiler, SceneTestCase, scene_test
 ```
@@ -61,11 +61,11 @@ else raises. Remote-worker and remote-memory calls require `level >= 4`.
 | Method | Notes |
 | ------ | ----- |
 | `malloc(size) -> Buffer` | L2 only; allocates on this worker's chip |
-| `alloc_child_tensor(worker_id, shapes, dtype) -> Buffer` | Allocates on an L3 worker's chip child; use `Tensor(handle, shape=shapes, dtype=dtype)` to name a task argument |
+| `alloc_child_tensor(worker_id, shapes, dtype) -> Buffer` | Allocates on an L3 worker's chip child; use `Tensor(handle, shapes=shapes, dtype=dtype)` to name a task argument |
 | `free(handle)` | Releases a device `Buffer` returned by either allocation method |
 | `copy_to(dst, src, *, dst_offset=0, src_offset=0, nbytes=None)` | H2D; `dst` is a device `Buffer`, `src` a host `Buffer` from `create_buffer` (at L2, also any torch tensor or writable buffer). `nbytes` defaults to the rest of the host side after `src_offset`, so `copy_to(dst, src)` transfers the whole host backing |
 | `copy_from(dst, src, *, dst_offset=0, src_offset=0, nbytes=None)` | D2H; `dst` is the host `Buffer` (at L2, also any writable buffer). Same defaulting, measured from `dst_offset` on the host side |
-| `create_buffer(nbytes) -> Buffer` / `Buffer.close()` | Shared host backing this Worker owns; build a view over `handle.shm.buf`, name it on the wire with `Tensor(handle, shape=shapes, dtype=dtype)` |
+| `create_buffer(nbytes) -> Buffer` / `Buffer.close()` | Shared host backing this Worker owns; build a view over `handle.shm.buf`, name it on the wire with `Tensor(handle, shapes=shapes, dtype=dtype)` |
 | `remote_malloc` / `remote_free` / `remote_copy_to` / `remote_copy_from` / `remote_export` / `remote_import` / `remote_release_import` | L4 only |
 
 A partial update names the **whole allocation plus an offset** — `copy_to(dev, src,
@@ -130,14 +130,12 @@ same orchestration run; they are opaque and cannot be constructed by the
 caller.
 
 ```python
-from simpler.buffer import Tensor
-
 args = TaskArgs()
-args.add_tensor(Tensor(device_buffer, shape=(rows, cols), dtype=DataType.FLOAT32), TensorArgType.INPUT)
+args.add_tensor(Tensor(device_buffer, shapes=(rows, cols), dtype=DataType.FLOAT32), TensorArgType.INPUT)
 ```
 
 `device_buffer` is a `Buffer` returned by `malloc` or `alloc_child_tensor`.
-`Tensor(buffer, *, shape, dtype, strides=None, byte_offset=0)` validates a view
+`Tensor(buffer, *, shapes, dtype, strides=None, byte_offset=0)` validates a view
 without allocation or transfer. `buffer.tensor(...)` remains a compatibility
 forwarder. Views carry descriptor values; they do not own the backing allocation.
 Add tensors **in signature order**, before any scalars. Use `INPUT` for an

@@ -12,12 +12,15 @@ The three wire types are the C++ structs of buffer.h bound directly, so what is 
 Python-visible contract over them — construction rejects what `validate_buffer_descriptor` rejects,
 and equality and hashing ignore wire padding. There is no public `pack`/`unpack`; the only Python
 byte path is the module-private 88-byte codec on `_task_interface`, and decode reuses the canonical
-validator. Imports come from `simpler.buffer` because that is where a caller reaches them, alongside
-the registry and the Buffer constructors that are genuinely defined there.
+validator. Buffer descriptors, registries, and backing constructors come from `simpler.buffer`;
+Tensor uses its canonical public import in `simpler.task_interface`.
 """
 
 import ctypes
 import re
+import subprocess
+import sys
+import textwrap
 import threading
 from dataclasses import replace
 from multiprocessing.shared_memory import SharedMemory
@@ -41,7 +44,6 @@ from simpler.buffer import (
     ImportContext,
     ImportRegistry,
     MappedArg,
-    Tensor,
     TensorTransfer,
     capabilities_for_adapter,
     create_host_shared_buffer,
@@ -62,7 +64,7 @@ from simpler.comm_endpoints import (
     RegionAccessReasonCode,
     buffer_adapter_candidates,
 )
-from simpler.task_interface import ChipStorageTaskArgs, ChipTensor, TaskArgs
+from simpler.task_interface import ChipStorageTaskArgs, ChipTensor, TaskArgs, Tensor
 
 _OID = bytes(range(0xA0, 0xA0 + OWNER_INSTANCE_ID_BYTES))
 
@@ -93,7 +95,7 @@ def test_task_args_takes_the_wire_tensor():
 def test_tensor_constructor_views_buffer_without_touching_storage(device):
     wrap = wrap_device_malloc if device else wrap_fork_inherited
     backing = wrap(1, 64, mint_owner_instance_id(), 1)
-    view = Tensor(backing, shape=(2, 3), dtype=DataType.FLOAT32, strides=(4, 1), byte_offset=4)
+    view = Tensor(backing, shapes=(2, 3), dtype=DataType.FLOAT32, strides=(4, 1), byte_offset=4)
     assert view.buffer == backing.to_descriptor()
     assert view.shapes == (2, 3) and view.strides == (4, 1) and view.byte_offset == 4
     assert view == backing.tensor((2, 3), DataType.FLOAT32, (4, 1), 4)
@@ -104,26 +106,26 @@ def test_tensor_constructor_views_buffer_without_touching_storage(device):
     assert view.buffer.nbytes == 64
     backing.close()
     with pytest.raises(ValueError, match="released"):
-        Tensor(backing, shape=(1,), dtype=DataType.FLOAT32)
+        Tensor(backing, shapes=(1,), dtype=DataType.FLOAT32)
 
 
 def test_tensor_constructor_consumes_iterables_once_and_preserves_legacy_descriptor_form():
     backing = wrap_device_malloc(1, 64, mint_owner_instance_id(), 1)
-    view = Tensor(backing, shape=iter((2, 3)), dtype=DataType.FLOAT32)
+    view = Tensor(backing, shapes=iter((2, 3)), dtype=DataType.FLOAT32)
     assert view.strides == (3, 1)
     assert view == Tensor(backing.to_descriptor(), 0, (2, 3), (3, 1), DataType.FLOAT32)
-    assert view == Tensor(backing.to_descriptor(), shape=(2, 3), dtype=DataType.FLOAT32)
-    strided = Tensor(backing, shape=iter((2, 3)), strides=iter((4, 1)), dtype=DataType.FLOAT32)
+    assert view == Tensor(backing.to_descriptor(), shapes=(2, 3), dtype=DataType.FLOAT32)
+    strided = Tensor(backing, shapes=iter((2, 3)), strides=iter((4, 1)), dtype=DataType.FLOAT32)
     assert strided.strides == (4, 1)
 
 
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"shape": (17,)},
-        {"shape": (2, 3), "strides": (32, 1)},
-        {"shape": (2,), "strides": (0,)},
-        {"shape": (1,), "byte_offset": 2},
+        {"shapes": (17,)},
+        {"shapes": (2, 3), "strides": (32, 1)},
+        {"shapes": (2,), "strides": (0,)},
+        {"shapes": (1,), "byte_offset": 2},
     ],
 )
 def test_tensor_buffer_constructor_reuses_geometry_validation(kwargs):
@@ -138,7 +140,48 @@ def test_tensor_constructor_rejects_untyped_descriptor_providers():
             pytest.fail("an unrelated object's method must not be called")
 
     with pytest.raises(TypeError, match="Buffer"):
-        Tensor(PretendBuffer(), shape=(1,), dtype=DataType.FLOAT32)
+        Tensor(PretendBuffer(), shapes=(1,), dtype=DataType.FLOAT32)
+
+
+def test_tensor_buffer_type_lookup_is_lazy_and_cached():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(
+                """
+                import builtins
+                original_import = builtins.__import__
+                imports = []
+                def counted_import(name, *args, **kwargs):
+                    if name == "simpler.buffer":
+                        imports.append(name)
+                    return original_import(name, *args, **kwargs)
+                builtins.__import__ = counted_import
+
+                import _task_interface
+                assert imports == [], imports
+                from simpler.buffer import mint_owner_instance_id, wrap_device_malloc
+                from simpler.task_interface import DataType, Tensor
+                backing = wrap_device_malloc(1, 64, mint_owner_instance_id(), 1)
+                imports.clear()
+                Tensor(backing.to_descriptor(), shapes=(1,), dtype=DataType.FLOAT32)
+                assert imports == [], imports
+                Tensor(backing, shapes=(1,), dtype=DataType.FLOAT32)
+                assert len(imports) == 1, imports
+                Tensor(backing, shapes=(2,), dtype=DataType.FLOAT32)
+                assert len(imports) == 1, imports
+                backing.close()
+                """
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "nanobind: leaked" not in result.stderr
 
 
 def _identity(oid=_OID, buffer_id=7, generation=2):

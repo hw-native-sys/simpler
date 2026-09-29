@@ -47,6 +47,7 @@ from simpler.task_interface import (
     CoreCallable,
     DataType,
     TaskArgs,
+    Tensor,
     TensorArgType,
 )
 from simpler.worker import Worker
@@ -164,9 +165,9 @@ def _run_one(worker: Worker, chip_handle, label: str, ring: Optional[dict]) -> N
     worker.copy_to(b_h, host_b)
 
     args = TaskArgs()
-    args.add_tensor(a_h.tensor(shapes=(N_ROWS, N_COLS), dtype=DataType.FLOAT32), TensorArgType.INPUT)
-    args.add_tensor(b_h.tensor(shapes=(N_ROWS, N_COLS), dtype=DataType.FLOAT32), TensorArgType.INPUT)
-    args.add_tensor(out_h.tensor(shapes=(N_ROWS, N_COLS), dtype=DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
+    args.add_tensor(Tensor(a_h, shapes=(N_ROWS, N_COLS), dtype=DataType.FLOAT32), TensorArgType.INPUT)
+    args.add_tensor(Tensor(b_h, shapes=(N_ROWS, N_COLS), dtype=DataType.FLOAT32), TensorArgType.INPUT)
+    args.add_tensor(Tensor(out_h, shapes=(N_ROWS, N_COLS), dtype=DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
 
     config = _make_config(ring)
     print(f"[per_task_runtime_env] run '{label}': runtime_env={config.runtime_env!r}")

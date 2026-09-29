@@ -57,6 +57,7 @@ from simpler.task_interface import (
     CoreCallable,
     DataType,
     TaskArgs,
+    Tensor,
     TensorArgType,
 )
 from simpler.worker import Worker
@@ -176,9 +177,9 @@ def run(platform: str, device_id: int) -> int:
 
             for out_h in (f1_h, f2_h):
                 ta = TaskArgs()
-                ta.add_tensor(a_h.tensor(shapes=(SIZE,), dtype=f32), TensorArgType.INPUT)
-                ta.add_tensor(w_h.tensor(shapes=(SIZE,), dtype=f32), TensorArgType.INPUT)
-                ta.add_tensor(out_h.tensor(shapes=(SIZE,), dtype=f32), TensorArgType.OUTPUT_EXISTING)
+                ta.add_tensor(Tensor(a_h, shapes=(SIZE,), dtype=f32), TensorArgType.INPUT)
+                ta.add_tensor(Tensor(w_h, shapes=(SIZE,), dtype=f32), TensorArgType.INPUT)
+                ta.add_tensor(Tensor(out_h, shapes=(SIZE,), dtype=f32), TensorArgType.OUTPUT_EXISTING)
                 orch.submit_next_level(chip_handle, ta, cfg, worker=0)
 
         print("[child_memory] running DAG (1 malloc + 1 copy_to + 2 kernel tasks)...")

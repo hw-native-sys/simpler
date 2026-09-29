@@ -46,6 +46,7 @@ from simpler.task_interface import (
     CoreCallable,
     DataType,
     TaskArgs,
+    Tensor,
     TensorArgType,
 )
 from simpler.worker import Worker
@@ -147,9 +148,9 @@ def _run(worker: Worker, chip_handle: CallableHandle):
     # --- 3. Build TaskArgs naming each buffer as a Tensor view. Order must
     # match the ``signature`` list in the ChipCallable (IN, IN, OUT). ---
     args = TaskArgs()
-    args.add_tensor(a_h.tensor(shapes=(N_ROWS, N_COLS), dtype=DataType.FLOAT32), TensorArgType.INPUT)
-    args.add_tensor(b_h.tensor(shapes=(N_ROWS, N_COLS), dtype=DataType.FLOAT32), TensorArgType.INPUT)
-    args.add_tensor(out_h.tensor(shapes=(N_ROWS, N_COLS), dtype=DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
+    args.add_tensor(Tensor(a_h, shapes=(N_ROWS, N_COLS), dtype=DataType.FLOAT32), TensorArgType.INPUT)
+    args.add_tensor(Tensor(b_h, shapes=(N_ROWS, N_COLS), dtype=DataType.FLOAT32), TensorArgType.INPUT)
+    args.add_tensor(Tensor(out_h, shapes=(N_ROWS, N_COLS), dtype=DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
 
     # --- 4. Run. CallConfig() defaults are fine for this kernel. ---
     config = CallConfig()

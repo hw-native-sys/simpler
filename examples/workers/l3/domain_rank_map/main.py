@@ -46,6 +46,7 @@ from simpler.task_interface import (  # noqa: E402
     CoreCallable,
     DataType,
     TaskArgs,
+    Tensor,
     TensorArgType,
 )
 from simpler.worker import Worker  # noqa: E402
@@ -116,7 +117,7 @@ def build_allreduce_callable(platform: str) -> ChipCallable:
 
 
 def _add_domain_scratch(args: TaskArgs, domain: ChipDomainContext) -> None:
-    args.add_tensor(domain.buffers["scratch"].tensor((COUNT,), _F32), TensorArgType.INOUT)
+    args.add_tensor(Tensor(domain.buffers["scratch"], shapes=(COUNT,), dtype=_F32), TensorArgType.INOUT)
     args.add_scalar(domain.domain_size)
     args.add_scalar(domain.device_ctx)
 

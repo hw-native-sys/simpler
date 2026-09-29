@@ -46,6 +46,7 @@ from simpler.task_interface import (  # noqa: E402
     CoreCallable,
     DataType,
     TaskArgs,
+    Tensor,
     TensorArgType,
 )
 from simpler.worker import Worker  # noqa: E402
@@ -224,7 +225,9 @@ def run(
                     a2 = TaskArgs()
                     a2.add_tensor(make_tensor_arg(worker, host_partial[i]), TensorArgType.INPUT)
                     a2.add_tensor(make_tensor_arg(worker, host_y[i]), TensorArgType.OUTPUT_EXISTING)
-                    a2.add_tensor(domain.buffers["scratch"].tensor((scratch_count,), _F32), TensorArgType.INOUT)
+                    a2.add_tensor(
+                        Tensor(domain.buffers["scratch"], shapes=(scratch_count,), dtype=_F32), TensorArgType.INOUT
+                    )
                     a2.add_scalar(domain.domain_size)
                     a2.add_scalar(domain.device_ctx)
                     allreduce_args.append(a2)
