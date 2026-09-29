@@ -114,9 +114,16 @@ jobs:
         if: inputs.manual_mode != 'only'
         run: |
           source /usr/local/Ascend/cann/set_env.sh
-          SDMA_TESTS="examples tests/st -m sdma"
+          SDMA_TESTS="examples tests/st -m 'sdma and not sdma_fault'"
           task-submit --timeout 1800 --max-time 1800 --device auto --device-num 2 \
             --run ".venv/bin/python -m pytest $SDMA_TESTS --platform a2a3 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 600"
+
+      - name: SDMA fault recovery pytest (a2a3)
+        if: inputs.manual_mode != 'only'
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          task-submit --timeout 1800 --max-time 1800 --device auto --device-num 1 \
+            --run ".venv/bin/python -m pytest tests/st -m sdma_fault --platform a2a3 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 600"
 
       - name: DFX smokes (a2a3)
         if: inputs.include_dfx_smokes

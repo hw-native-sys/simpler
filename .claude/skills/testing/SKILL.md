@@ -28,11 +28,12 @@ and will report failures that CI never sees:
 | Marker | Tests | CI behavior |
 | ------ | ----- | ----------- |
 | `@pytest.mark.manual` / `CASES[*]["manual"]` | Standalone pytest tests / individual scene-test cases; optionally scoped to a platform list | Per-PR main sweep: excluded by default on the selected platforms; dedicated DFX steps: included; `daily.yml`: full sweep with `--manual include` |
-| `@pytest.mark.sdma` | a2a3: `sdma_async_completion_demo`, `prefetch_async_demo`; a5: `sdma_async_completion_demo` | a2a3: the dedicated SDMA step; a5: included in the non-network1 sweep |
+| `@pytest.mark.sdma` | a2a3: SDMA demos; a5: `sdma_async_completion_demo` | a2a3: dedicated SDMA-demo task; a5: included in the non-network1 sweep |
+| `@pytest.mark.sdma_fault` | a2a3 `aicore_op_timeout` fault-injection case | a2a3: separate one-device task |
 
 The a2a3 SDMA demos provision 48 device-only STARS streams, which makes an
 AICore fault take ~306 s to tear down instead of ~0.3 s — so they must not
-share a sweep with the `aicore_op_timeout` fault-injection test
+share a task with the `aicore_op_timeout` fault-injection test
 ([investigations/2026-07-a2a3-sdma-fault-teardown.md](../../../docs/investigations/2026-07-a2a3-sdma-fault-teardown.md),
 issue #1425).
 
@@ -80,8 +81,11 @@ pytest examples tests/st -m "not sdma" --exclude-level 4 --platform a2a3 --devic
 # The quarantined tests, the way CI runs them — same corpus, selected by the
 # marker, run after the sweep rather than inside it. Never a path list: that is
 # what the marker replaced.
-pytest examples tests/st -m sdma \
+pytest examples tests/st -m "sdma and not sdma_fault" \
     --platform a2a3 --device <2 devs> --pto-session-timeout <timeout>
+# Run the a2a3 fault-injection case in its own task/device.
+pytest tests/st -m sdma_fault \
+    --platform a2a3 --device <1 dev> --pto-session-timeout <timeout>
 
 # A5 runs the corpus below level 4, including SDMA tests, on both host architectures.
 pytest examples tests/st --exclude-level 4 --platform a5 --device <range> \

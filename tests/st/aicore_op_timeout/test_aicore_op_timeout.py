@@ -149,6 +149,7 @@ def test_aicore_op_timeout_surfaces_as_runtime_error(st_platform, st_device_ids,
 
 
 @pytest.mark.sdma
+@pytest.mark.sdma_fault
 @pytest.mark.platforms(["a2a3"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
