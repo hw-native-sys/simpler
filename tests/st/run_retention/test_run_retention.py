@@ -28,6 +28,13 @@ boundary Pending. The retained arm shows what waiting looks like -- that
 boundary reads Complete -- so the candidate arm's Pending is a measurement with
 a demonstrated failure mode, not an untested expectation.
 
+Both arms need the successor to still be executing when the read begins, and
+that is a controlled quantity here rather than an assumed one: the successor's
+workload is a task count the arm chooses, escalated until the window is
+observed. A read is then measured against the same read with nothing in flight,
+which is what tells a read that waited apart from a successor that merely
+finished during it.
+
 Onboard only: the property is about streams, and no simulated backend has them.
 """
 
@@ -54,10 +61,32 @@ _PREDECESSOR_SLOT = 0
 _SUCCESSOR_SLOT = 1
 _GENERATION = 1
 
-# How many times the candidate arm may re-try for an overlap window. Nothing
-# pins the successor in flight, so a preempted attempt observes no overlap and
-# is uninformative rather than failing. A regression misses every attempt.
-_WINDOW_ATTEMPTS = 5
+# The task counts the successor's workload is tried at, in order. An attempt
+# says nothing unless the successor is still executing when the read begins, and
+# the count that makes that true is a property of the box: a wider chip or a
+# cheaper dispatch runs the same tasks out sooner. So the window is escalated
+# until it is there rather than fixed at one count for every silicon, and only
+# an exhausted escalation is a failure.
+#
+# The ceiling is half the default 16384-slot ring task window, which the runs
+# leave at its default. A single scope cannot fill that window: fanout
+# references are released only at scope_end, so a scope that reaches the cap
+# reports SCOPE_DEADLOCK instead of running -- measured at 16384 on
+# tensormap_and_ringbuffer, admitted at 12288.
+_WINDOW_SIZES = (1024, 4096, 8192)
+
+# Attempts allowed at each size. Nothing pins the successor in flight, so a
+# preempted attempt observes no overlap and is uninformative rather than
+# failing. A regression misses every attempt at every size.
+_ATTEMPTS_PER_SIZE = 3
+
+# A read that waited for the successor absorbed that successor's remaining
+# device work, so it cannot come out near what the same read costs with nothing
+# in flight. That is what separates the two causes of a Complete boundary after
+# the read, and the factor is loose on purpose: the separation it has to make is
+# between a ~10 us read and a run's worth of serialized tasks, not between one
+# microsecond and the next.
+_WAITED_READ_FACTOR = 4
 
 _ORCH = "retention_orch.cpp"
 
@@ -101,21 +130,29 @@ class _Fixture:
         # ordinary run settles that before any arm runs.
         self._run_once_normally()
 
-    def _prepare(self, slot: int):
+    def _prepare(self, slot: int, task_count: int):
+        args = ChipStorageTaskArgs()
+        args.add_scalar(task_count)
         return self.worker._prepare_native_run_with_pipeline_lease(
-            self.cid, ChipStorageTaskArgs(), slot_id=slot, generation=_GENERATION, config=self.config
+            self.cid, args, slot_id=slot, generation=_GENERATION, config=self.config
         )
 
     def _run_once_normally(self):
-        run = self._prepare(_PREDECESSOR_SLOT)
+        run = self._prepare(_PREDECESSOR_SLOT, _WINDOW_SIZES[0])
         self.worker._launch_native_run(run)
         self.worker._wait_native_run(run)
         self.worker._finalize_native_run(run)
 
-    def arm(self, *, launch_successor: bool = True, use_retained_sync: bool = False) -> dict:
-        predecessor = self._prepare(_PREDECESSOR_SLOT)
+    def arm(
+        self,
+        *,
+        task_count: int = _WINDOW_SIZES[0],
+        launch_successor: bool = True,
+        use_retained_sync: bool = False,
+    ) -> dict:
+        predecessor = self._prepare(_PREDECESSOR_SLOT, task_count)
         self.worker._launch_native_run(predecessor)
-        successor = self._prepare(_SUCCESSOR_SLOT)
+        successor = self._prepare(_SUCCESSOR_SLOT, task_count)
         try:
             return self.worker._probe_run_retention(
                 predecessor,
@@ -162,10 +199,24 @@ def _overlap_established(report):
     there: on fast silicon or a loaded runner it can finish between its own
     launch and the predecessor's read. That is a **precondition**, not the claim,
     so an attempt that fails it says nothing either way and is discarded rather
-    than failed. Both arms share the rule; measured on a5 CI, where the
-    successor's original workload was too short to survive a busy runner.
+    than failed. Both arms share the rule, and both answer a failed precondition
+    by escalating the successor's workload rather than by failing.
     """
     return report["successor_started"] and report["successor_completion_before_read"] == PENDING
+
+
+def _attempt_note(task_count, outcome, report):
+    """One attempt's outcome with the numbers that say which regime it is in.
+
+    The read's cost is the load-bearing one: read against the same read with
+    nothing in flight, it separates a read that waited for the successor from a
+    successor that merely finished during it. Nothing else recorded here does,
+    which is why every failure below carries these notes.
+    """
+    return (
+        f"n={task_count} {outcome} read_ns={report['record_read_ns']} "
+        f"start_ns={report['successor_start_ns']} drain_ns={report['successor_drain_ns']}"
+    )
 
 
 def _assert_predecessor_decided(report):
@@ -189,58 +240,89 @@ def check_result_reads_while_successor_runs(retention):
     A single sample can never prove the read waited. Nothing pins the successor
     in flight, so a `Complete` boundary after the read has two possible causes --
     the read waited for the successor, or the successor simply finished on its
-    own -- and **after the fact neither leaves distinguishable evidence**. Its
-    remaining drain does not separate them either: a drain costs time even when
+    own. The remaining drain does not separate them: a drain costs time even when
     the device is already done (the control arm measures exactly that, at 14 us),
     so no threshold on it can tell "still had work" from "already finished".
 
-    So this asserts the property only over repeated attempts, and never calls a
+    What does separate them is the read's own cost, measured twice on the same
+    box: a read that waits for the successor absorbs that successor's remaining
+    device work, so it cannot come out near the same read with nothing in flight.
+    The baseline is taken first, for that comparison.
+
+    So this asserts the property over escalating attempts, and never calls a
     single miss a regression:
 
       - an attempt whose overlap never existed is discarded outright;
       - an attempt observing Pending across the read is a pass, because a read
         that waited could not have produced it;
-      - an attempt observing Complete is discarded as inconclusive;
-      - all attempts inconclusive is a failure, but one reported as
-        "never observed" rather than as a proven regression, because that is
-        what the evidence supports.
+      - an attempt observing Complete is inconclusive on its own, and escalates
+        the successor's workload so the next attempt has more window;
+      - a Complete reached by a read that cost `_WAITED_READ_FACTOR` times the
+        baseline is the regression, and is reported as one;
+      - every attempt inconclusive with ordinary read costs is still a failure,
+        but one reported as "never observed" rather than as a proven regression,
+        because that is what the evidence supports.
 
     A real regression makes the read wait every time, so it exhausts the budget
     and fails. A preempted run costs one attempt.
     """
-    attempts = []
-    for _ in range(_WINDOW_ATTEMPTS):
-        report = retention.arm()
-        _assert_no_step_failed(report)
+    # What this read costs with nothing in flight, on this box. Positive by
+    # construction -- a zero would make the comparison below accuse every read.
+    baseline = retention.arm(launch_successor=False)
+    _assert_no_step_failed(baseline)
+    _assert_predecessor_decided(baseline)
+    unblocked_read_ns = baseline["record_read_ns"]
+    assert unblocked_read_ns > 0, "the baseline read reported no duration, so it measures nothing"
 
-        # Checked before any window filtering, because the predecessor's result
-        # has to be valid whatever the successor did. `_assert_no_step_failed`
-        # cannot cover this: `read_device_run_result` returns void and reports a
-        # failed copy or a stale epoch through the terminal state instead. Letting
-        # a discarded attempt skip it would hide a real retention failure behind a
-        # later attempt that happened to catch the window.
-        _assert_predecessor_decided(report)
+    notes = []
+    waited = []
+    for task_count in _WINDOW_SIZES:
+        for _ in range(_ATTEMPTS_PER_SIZE):
+            report = retention.arm(task_count=task_count)
+            _assert_no_step_failed(report)
 
-        if not _overlap_established(report):
-            attempts.append("no-overlap")
-            continue
+            # Checked before any window filtering, because the predecessor's
+            # result has to be valid whatever the successor did.
+            # `_assert_no_step_failed` cannot cover this: `read_device_run_result`
+            # returns void and reports a failed copy or a stale epoch through the
+            # terminal state instead. Letting a discarded attempt skip it would
+            # hide a real retention failure behind a later attempt that happened
+            # to catch the window.
+            _assert_predecessor_decided(report)
 
-        if report["successor_completion_after_read"] != PENDING:
-            attempts.append("completed-across-read")
-            continue
+            if not _overlap_established(report):
+                notes.append(_attempt_note(task_count, "no-overlap", report))
+                continue
 
-        # Pending across the read: the read did not wait, and the record it read
-        # decided the run.
-        return
+            if report["successor_completion_after_read"] == PENDING:
+                # Pending across the read: the read did not wait, and the record
+                # it read decided the run.
+                return
 
+            notes.append(_attempt_note(task_count, "completed-across-read", report))
+            if report["record_read_ns"] >= _WAITED_READ_FACTOR * unblocked_read_ns:
+                waited.append(notes[-1])
+
+    # A slow read is only collected, never failed on the spot: this box is
+    # shared, so one read can be slow for reasons that have nothing to do with
+    # the successor, and an attempt that later observes Pending settles the
+    # question outright. Reaching here means no attempt ever did.
+    assert not waited, (
+        f"{len(waited)} attempt(s) left the successor Complete after a read that cost at least "
+        f"{_WAITED_READ_FACTOR}x the {unblocked_read_ns} ns the same read costs with nothing in "
+        f"flight, and no attempt ever observed Pending: the read waited for the successor. "
+        f"Attempts: {waited}"
+    )
     raise AssertionError(
-        f"in {_WINDOW_ATTEMPTS} attempts the successor was never still Pending after the predecessor's "
-        f"read (attempts: {attempts}). Every attempt's predecessor result was valid, so this is about "
-        "the overlap window, not the read: 'no-overlap' means the successor finished before the read "
-        "even began, so its workload no longer outlives the read on this box; 'completed-across-read' "
-        "means either the read now waits for the successor or the successor finished during it, which "
-        "nothing recorded here distinguishes. The per-arm timings are diagnostics for that, not "
-        "evidence: a drain costs time on an already-finished run too."
+        "in "
+        f"{len(_WINDOW_SIZES) * _ATTEMPTS_PER_SIZE} attempts across successor workloads {_WINDOW_SIZES} "
+        f"the successor was never still Pending after the predecessor's read (attempts: {notes}). Every "
+        "attempt's predecessor result was valid and every read cost less than "
+        f"{_WAITED_READ_FACTOR}x the {unblocked_read_ns} ns an unblocked read costs here, so no read "
+        "waited: this is about the overlap window. 'no-overlap' means the successor finished before the "
+        "read even began; 'completed-across-read' means it finished during a read that was not "
+        "slowed by it. Its workload no longer outlives the read on this box even at "
+        f"{_WINDOW_SIZES[-1]} tasks."
     )
 
 
@@ -258,30 +340,40 @@ def check_retained_synchronize_waits_for_the_successor(retention):
     Pending -- and it is deliberately weaker than the candidate arm's claim. The
     quantitative separation between the arms lives in the probe report, not in an
     assertion.
+
+    It escalates for the same reason the candidate arm does, and stops at the
+    first workload that yields an overlap at all: the assertion is about what the
+    synchronize does once there is something to wait for, so a larger window
+    adds device time and no evidence.
     """
     usable = 0
-    for _ in range(_WINDOW_ATTEMPTS):
-        report = retention.arm(use_retained_sync=True)
-        _assert_no_step_failed(report)
-        # Before the window filter, for the reason the candidate arm gives: the
-        # predecessor's result validity does not depend on the successor, and
-        # waiting for the successor must not change what its record says.
-        _assert_predecessor_decided(report)
-        if not _overlap_established(report):
-            continue
-        usable += 1
+    notes = []
+    for task_count in _WINDOW_SIZES:
+        for _ in range(_ATTEMPTS_PER_SIZE):
+            report = retention.arm(task_count=task_count, use_retained_sync=True)
+            _assert_no_step_failed(report)
+            # Before the window filter, for the reason the candidate arm gives: the
+            # predecessor's result validity does not depend on the successor, and
+            # waiting for the successor must not change what its record says.
+            _assert_predecessor_decided(report)
+            if not _overlap_established(report):
+                notes.append(_attempt_note(task_count, "no-overlap", report))
+                continue
+            usable += 1
 
-        assert report["successor_completion_after_read"] == COMPLETE, (
-            "the whole-pair synchronize left the successor's boundary Pending, so it did not wait "
-            "for the successor and no longer controls the candidate arm's Pending observation"
-        )
-        # It also has to have actually run: a zero here would mean the arm
-        # measured nothing.
-        assert report["reference_sync_ns"] > 0
+            assert report["successor_completion_after_read"] == COMPLETE, (
+                "the whole-pair synchronize left the successor's boundary Pending, so it did not wait "
+                "for the successor and no longer controls the candidate arm's Pending observation"
+            )
+            # It also has to have actually run: a zero here would mean the arm
+            # measured nothing.
+            assert report["reference_sync_ns"] > 0
+        if usable:
+            break
 
     assert usable > 0, (
-        f"in {_WINDOW_ATTEMPTS} attempts the successor never reached the read still executing, so this "
-        "arm controlled nothing. The successor's workload no longer outlives the read on this box."
+        f"across successor workloads {_WINDOW_SIZES} the successor never reached the read still "
+        f"executing, so this arm controlled nothing (attempts: {notes})"
     )
 
 

@@ -400,6 +400,44 @@ it. `ChipTensor` survives only in `ChipStorageTaskArgs`, the POD `ChipWorker`
 consumes — an L2 worker materializes into it inside `run` before calling down.
 
 Single-machine (host + device) L3→L2 and L4→L3→L2 dispatch is implemented and
-verified in `a2a3sim` and onboard `a2a3`. The remote **receive**
-side and the buffer lifecycle robustness (`release_buffer`, in-flight retain /
-deferred-free) are later phases (P2).
+verified in `a2a3sim` and onboard `a2a3`. The remote **receive** side is a later
+phase (P2).
+
+Buffer lifecycle robustness is partly in place, and which guarantee applies
+depends on the API that releases the storage. `Worker.free` is atomic with a
+direct L2 submission's accepted-use registration — see
+[Direct L2 invocation binding](#direct-l2-invocation-binding). `release_buffer`
+and deferred physical free are still P2.
+
+## Direct L2 invocation binding
+
+`Worker(level=2).submit` snapshots the TaskArgs views, tags, transfer requests and
+scalar values before binding. This copies descriptors and scalar values, not tensor
+payloads. Changing the caller's TaskArgs after that boundary cannot redirect the
+accepted call or change its retained Buffer identities.
+
+The snapshot uses the same submit-time grant and writable-overlap checks as L3.
+Every DEVICE_MALLOC or VMM_WINDOW argument must match a live allocation's complete
+descriptor on the target chip, including its identity and generation. A cached
+import does not authorize a revoked allocation. Rejection precedes import and
+native submission.
+
+Validation and in-flight identity registration share the chip lock `Worker.free`
+holds across its own revoke, which makes the two orderings exhaustive: a
+submission that registers first makes a later free refuse, and a free that
+revokes first makes the submission reject. The reservation then protects
+materialization, native submission and execution through run finalization; a
+failed bind or rejected submission drops it. This retains the existing fail-fast
+in-flight free contract, without adding deferred physical free.
+
+`release_buffer` is **not** inside that fence. It samples the same in-flight set
+and then closes the backing, so a submission accepted between the sample and the
+close can still map an identity that release is about to unlink. Bringing host
+backing release inside the fence is part of the P2 lifecycle work above.
+
+This boundary covers the public Worker TaskArgs path. The low-level ChipWorker
+POD compatibility entry and external borrowed-pointer construction remain separate
+migration work. It introduces no HOST/NONE chip execution or cross-side mapping.
+Explicit task dependencies stay an L3 orchestration concept: a direct L2
+submission is one task, so no `TaskArgs` dependency entry reaches the chip
+through this path.

@@ -2886,6 +2886,17 @@ NB_MODULE(_task_interface, m) {
             "Return total number of arguments (tensors + scalars)."
         );
 
+    m.def(
+        "_snapshot_local_task_args",
+        [](const TaskArgs &args) {
+            std::vector<TaskArgs> snapshot{args};
+            validate_submit_args(snapshot);
+            return std::move(snapshot.front());
+        },
+        nb::arg("args"),
+        "Copy and validate one local submission's views, tags, requests and scalar values before binding."
+    );
+
     // --- ProvenanceTable ---
     // The owner's live child device allocations, as the dispatch path consumes them. The Python
     // Worker writes it alongside its own registry and reads it back only through `check_dispatch`.
