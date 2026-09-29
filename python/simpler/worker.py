@@ -11872,10 +11872,17 @@ class Worker:
         ``_release_all_buffers`` calling ``Buffer.close()`` directly.
 
         The L2 check is independent (a separate run-id namespace with no callback to serialize
-        against — ``_chip_run_touched_identities`` is written atomically alongside ``_chip_runs``
-        under ``_registry_lock`` instead, see ``_submit_l2_locked``), so the two checks run
-        sequentially rather than under one shared lock. Neither is checked once ``buffer`` is already
-        closed, matching ``Buffer.close()``'s own idempotency.
+        against — ``_chip_run_touched_identities`` is published under ``_registry_lock`` when the
+        submission is accepted, before it materializes anything, see ``_submit_l2_locked``), so the
+        two checks run sequentially rather than under one shared lock. Neither is checked once
+        ``buffer`` is already closed, matching ``Buffer.close()``'s own idempotency.
+
+        Unlike ``Worker.free``, this L2 check is a sample rather than a fence: it reads the set,
+        releases ``_registry_lock``, and only then closes the backing, so a submission accepted in
+        between still maps an identity this call is about to unlink. ``free`` closes that window by
+        rechecking under the chip lock a direct L2 submission publishes beneath; there is no
+        equivalent lock spanning a host backing's close, and adding one is P2 lifecycle work
+        (``docs/buffer-abi.md``).
 
         The entry survives a failed close, so ``_release_all_buffers`` still reports the leak at
         close() rather than losing it here — the import-cache broadcast only fires once close() has
@@ -12254,6 +12261,11 @@ class Worker:
         # Device identity validation and accepted-use publication share free's chip lock.
         # After publication, the touched set refuses free through run finalization, including
         # materialization and a native submit that has not returned yet.
+        #
+        # Publication also precedes materialization, which is what `release_buffer` reads this
+        # dict for: `_materialize_l2_args` populates `self._chip_import_registry`, the very cache
+        # `release_buffer` pops. Published any later, a release racing that window would see no
+        # entry for a run that has already cached the mapping it is about to drop.
         with contextlib.ExitStack() as reservation:
             if self._names_device_allocation(args):
                 reservation.enter_context(self._child_prov_worker_lock(0))
